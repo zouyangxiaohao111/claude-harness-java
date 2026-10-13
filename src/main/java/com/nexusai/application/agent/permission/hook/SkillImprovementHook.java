@@ -6,6 +6,7 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.hook.PostSamplingContext;
 import com.nexusai.application.agent.hook.PostSamplingHookRegistry;
 import com.nexusai.application.agent.skill.MarkdownConfigLoader;
@@ -16,7 +17,6 @@ import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.eventbus.ws.SkillImprovementSuggestionEvent;
 import com.nexusai.infra.llm.LlmProvider;
-import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.command.Command;
@@ -76,8 +76,8 @@ import java.util.stream.Collectors;
  *       findProjectSkill (SessionAgentStateRegistry + 项目级 baseDir 判定, 每次调用求值)</li>
  *   <li>CC {@code queryModelWithoutStreaming} 全局函数 → Java 用
  *       {@link SkillImprovementModelQuery} 注入 (systemPrompt, prompt, options → 响应文本;
- *       生产用 LlmProvider.chatWithOptions; systemPrompt 每次调用显式传入, options 携带 CC 查询
- *       选项 thinkingConfig disabled / temperature 0 / querySource / abort signal —
+ *       生产经统一旁路客户端 {@code LlmSideCallClient.chat} 收口（调用 + 记账）; systemPrompt 每次调用显式传入,
+ *       options 携带 CC 查询选项 thinkingConfig disabled / temperature 0 / querySource / abort signal —
  *       对齐 skillImprovement.ts:236-249, 检测器与 applier 各用各的)</li>
  *   <li>CC {@code logEvent} 全局函数 → Java {@link Telemetry#recordEvent}</li>
  * </ul>
@@ -227,7 +227,7 @@ public class SkillImprovementHook {
      *       (CC skillImprovement.ts:160-165), 此注入 writer 仅作 ctx 为 null 时回退 (测试路径)</li>
      * </ul>
      *
-     * @param providerFactory   LLM provider 工厂 (真实/ mock 分发)
+     * @param sideCallClient    统一旁路 LLM 客户端 (调用 + 记账收口; 可 null → 侧信道查询跳过返回 "")
      * @param telemetry         遥测上报
      * @param modelConfigResolver modelName → (config, providerType) 解析 (可 null → warn+skip 不落 mock)
      * @param skillRegistry     invoked skill 名 → Command 解析 (可 null → 恒 empty, 诚实降级)
@@ -238,7 +238,7 @@ public class SkillImprovementHook {
      */
     @Autowired
     public SkillImprovementHook(
-            LlmProviderFactory providerFactory,
+            @Autowired(required = false) LlmSideCallClient sideCallClient,
             Telemetry telemetry,
             @Autowired(required = false) ModelConfigResolver modelConfigResolver,
             @Autowired(required = false) SkillRegistry skillRegistry,
@@ -246,7 +246,7 @@ public class SkillImprovementHook {
             @Autowired(required = false) SkillImprovementSuggestionStore suggestionStore,
             @Value("${nexusai.skill.improvement-enabled:false}") boolean improvementEnabled) {
         this(
-                buildModelQuery(providerFactory, modelConfigResolver),
+                buildModelQuery(modelConfigResolver, sideCallClient),
                 ctx -> findProjectSkill(skillRegistry, sessionAgentStateRegistry, ctx),
                 telemetry,
                 (skillName, updates) -> {},
@@ -842,12 +842,13 @@ public class SkillImprovementHook {
      * + CC 无 mock: 查询要么成功要么抛错).
      */
     static SkillImprovementModelQuery buildModelQuery(
-            LlmProviderFactory providerFactory, ModelConfigResolver modelConfigResolver) {
-        if (providerFactory == null) {
+            ModelConfigResolver modelConfigResolver, LlmSideCallClient sideCallClient) {
+        // [usage-gateway] 统一旁路客户端缺失（测试直构 / 未接线）→ 保持原「wiring 缺失即跳过」语义
+        //   （原守卫是 providerFactory == null → 返回空查询，不落 mock）。
+        if (sideCallClient == null) {
             return (systemPrompt, prompt, options) -> "";
         }
         AtomicReference<ProviderConfig> configRef = new AtomicReference<>();
-        AtomicReference<LlmProvider> providerRef = new AtomicReference<>();
         // systemPrompt 按调用透传 (对齐 CC queryModelWithoutStreaming 每次调用独立传 systemPrompt,
         // skillImprovement.ts:233) — 不再硬编码检测器 SYSTEM_PROMPT, 检测器/applier 各用各的;
         // [P2-16] options 透传 CC 查询选项 → chatWithOptions (替代 chatWithRaw 无 options 契约)
@@ -859,7 +860,6 @@ public class SkillImprovementHook {
                     return "";
                 }
                 configRef.set(resolved.config());
-                providerRef.set(providerFactory.getProvider(resolved.config(), resolved.providerType()));
                 log.info("Skill improvement LLM 检测已接线真实 provider (baseUrl={}, type={})",
                         resolved.config().baseUrl(), resolved.providerType());
             }
@@ -881,8 +881,13 @@ public class SkillImprovementHook {
                     // [批 5b-1] 同 applyQueryOptions：(b) 类显式无值 + ≥WARN 一次性提示
                     //   （原读 AgentContext ThreadLocal；本侧信道查询跑在 commonPool 线程上读恒 null）
                     noAgentContextForRestPath("skill_improvement_model_query"));
-            String content = providerRef.get().chatWithOptions(
-                    configRef.get(), getSmallFastModel(), systemPrompt, prompt, chatOptions);
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient：本路径无 sessionId（纯 Hook 侧信道，
+            //   归因上下文按原有语义显式传 null，见上 noAgentContextForRestPath）⇒ 归属
+            //   standalone(HOOK, "skill-improvement")，config 取自 resolveSkillImprovementConfig 的解析结果。
+            String content = sideCallClient.chat(
+                    configRef.get(), getSmallFastModel(), systemPrompt, prompt, chatOptions,
+                    LlmSideCallClient.SideCallUsage.standalone(
+                            com.nexusai.infra.llm.UsageCategory.HOOK, "skill-improvement"));
             if (log.isDebugEnabled()) {
                 log.debug("Skill improvement 侧信道 LLM 查询完成: querySource={} contentLen={}",
                         chatOptions.querySource(), content == null ? 0 : content.length());

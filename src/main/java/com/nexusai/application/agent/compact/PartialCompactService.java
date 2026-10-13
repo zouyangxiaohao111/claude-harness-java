@@ -192,23 +192,6 @@ public class PartialCompactService {
     @Autowired(required = false)
     private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
 
-    /**
-     * [compact-cost] 模型计费纯函数（@Component）· partial 压缩那次 LLM 调用的 usage 折算会话
-     * 成本时使用（{@code LlmAgentLoop.accumulateCompactionSessionCost} 的 calculator 形参）。
-     *
-     * <p>WHY: 与 manual {@code /compact}（{@code ToolRegistrationConfig:2367}）同一条漏接通道
-     * —— partial 的摘要调用同样产生真实 usage（{@code PartialCompactConversation:469} 从
-     * {@code SummaryResult.usage} 透传进 {@code CompactionResult.compactionUsage}），而
-     * CC 在 {@code claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
-     * options.model)} 把它计入会话合计。此前该 usage 只被 preCompactTokenCount 等展示口径消费，
-     * <b>成本侧完全没接</b>。{@code @Autowired(required=false)} 字段注入（镜像本类
-     * settingsMapper / taskFrameworkService / planProvider 既有模式，<b>不动构造器签名</b>——
-     * 3 参 / 6 参直构测试逐位不变）；null（直构测试 / 无 bean）→ 仅累计 input/output tokens，
-     * cost/按模型桶跳过（零 NPE）。
-     */
-    @Autowired(required = false)
-    private com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator;
-
     /** 测试注入 STOMP 模板（生产走 {@code @Autowired} 字段注入 · 对齐 setPlanProvider 先例）。 */
     public void setWsTemplate(SimpMessagingTemplate wsTemplate) {
         this.wsTemplate = wsTemplate;
@@ -364,26 +347,12 @@ public class PartialCompactService {
                 throw e;
             }
 
-            // ── 5.5 [compact-cost] partial 摘要那次 LLM 调用的 usage → 会话成本/用量合计 ──
-            //   对齐 CC claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
-            //   options.model) → cost-tracker.ts:250-276 → state.ts:551-558。auto / reactive /
-            //   manual 三路均已接（LlmAgentLoop:5361/6969 · ToolRegistrationConfig:2367），partial
-            //   此前漏接。模型 = resolveCompactModel(sessionId)（本文件内 —— 与 buildContext 喂给
-            //   CompactConversationContext 的模型同一求值，即真正执行本次摘要调用的模型；价格按
-            //   模型/provider 分派，用会话主模型顶替会算错金额）。
+            // ── 5.5 [usage-gateway] partial 摘要那次 LLM 调用的 usage 现经请求网关入账 ──
+            //   本方法的摘要生产走 {@code streamCompactSummary.summarize(...)}（见 buildContext
+            //   的 summaryProducer 接线）⇒ 该 LLM 调用与 auto / reactive / manual 共用同一条记账
+            //   流程（网关 sink → 结算 → 会话账本 SessionUsageLedger，归属 UsageCategory.COMPACT）。
+            //   旧通道 LlmAgentLoop.accumulateCompactionSessionCost 已删（用户裁定：不允许两套）。
             //   ✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
-            //   位置 = partialCompactConversation 成功后、重组/落库前（仅成功路径；上方 throw
-            //   两分支为 400/500 失败路径，不计）。
-            //   <b>live == null 语义（未注册会话，如空闲会话经 REST 触发 partial）</b>：
-            //   accumulateCompactionSessionCost 首行判 state==null → no-op（不 NPE）——
-            //   本次选择「不猜、不重建 state」，与 rebuildIdleStateFromDb 的「临时 state 不注册」
-            //   同一决策（无生命周期所有者 → 注册即无界泄漏）。代价：未注册会话的这次 partial
-            //   压缩成本不入会话合计（与修复前同值，非回归）；已注册（在跑循环）会话正常入账。
-            AgentState live = sessionAgentStateRegistry != null
-                ? sessionAgentStateRegistry.get(sessionId) : null;
-            com.nexusai.application.agent.LlmAgentLoop.accumulateCompactionSessionCost(
-                live, resolveCompactModel(sessionId),
-                result.compactionUsage(), modelCostCalculator);
 
             // ── 6. direction-aware 重组（REPL.tsx:4950-4952）──
             List<ChatMessageDto> postCompact =

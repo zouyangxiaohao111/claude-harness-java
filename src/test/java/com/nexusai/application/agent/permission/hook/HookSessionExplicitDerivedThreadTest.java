@@ -387,9 +387,9 @@ class HookSessionExplicitDerivedThreadTest {
         Path project = Files.createDirectories(tmp.resolve("prod-mapping-proj"));
         SessionProjectRoot.setForSession("sess-PROD-MAP", project.toString());
         try {
-            // 生产构造（LlmProviderFactory 未装配 → modelQuery 为 warn+skip 空实现，不触达 LLM）
+            // 生产构造（[usage-gateway] LlmSideCallClient 未装配 → modelQuery 为跳过空实现，不触达 LLM）
             SkillImprovementHook hook = new SkillImprovementHook(
-                new com.nexusai.infra.llm.LlmProviderFactory(),
+                null,
                 new com.nexusai.application.agent.telemetry.Telemetry(),
                 null, null, null, null, false);
             java.lang.reflect.Field f = SkillImprovementHook.class.getDeclaredField("baseDirForSession");

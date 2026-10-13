@@ -106,6 +106,21 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
     private final Set<String> sessionModelMissingWarned = ConcurrentHashMap.newKeySet();
 
     /**
+     * [usage-gateway] 会话账本注册表（可选）· 由构造点 {@code ToolRegistrationConfig.queryLoopForkedQuery}
+     * 经 {@link #setUsageLedgerRegistry} 注入（与 {@code LlmAgentLoop} / {@code SubagentExecutor}
+     * 同款仓库范式）。fork 跑的是隔离 {@link AgentState}，若不给它装配归属 + 账本，fork 的 LLM
+     * 调用（压缩 fork / 记忆提取 / auto-dream）用量会随隔离 state 一起丢弃 → 会话金额系统性低估。
+     * 未注入（测试直构）→ 不装配，行为等价改造前。
+     */
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /** [usage-gateway] setter 注入口（仓库范式：测试 / 构造点显式注入，不用 ThreadLocal）。 */
+    public void setUsageLedgerRegistry(
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry registry) {
+        this.usageLedgerRegistry = registry;
+    }
+
+    /**
      * 构造 · 由 {@code ToolRegistrationConfig} 生产注入（与 {@code productionForkedQuery} 同位置）。
      *
      * @param sessionModelRouteResolver 会话模型直传解析（{@code ToolRegistrationConfig.sessionForkModelRoute}）
@@ -205,7 +220,42 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         //   [systemPrompt=null] fork 的模型面提示由 params.systemPrompt() 承载（CC query({
         //     systemPrompt }) 同源）；state.systemPrompt() 是 CC customSystemPrompt 语义，fork 不设。
         String forkSessionId = forkCtx != null ? forkCtx.sessionId() : null;
-        AgentState state = new AgentState(null, forkSessionId, forkAgentId(forkCtx));
+        java.util.UUID forkIdentity = forkAgentId(forkCtx);
+        AgentState state = new AgentState(null, forkSessionId, forkIdentity);
+        // ── [usage-gateway] fork 记账归属 + 会话账本绑定 ──
+        // 用户裁定：用量统计前置到请求网关，归属/账本显式挂在 state 上（组装 ModelRequest 时由
+        //   loop 盖章给网关）。fork 是隔离 AgentState（否则其调用量随隔离 state 丢弃）；
+        //   本块把「父归属派生的子归属 + 会话账本」挂上去，使 fork 的每次 LLM 调用
+        //   （含经主循环 queryLoop 的压缩 fork）都记入同一会话账目（层级：会话 → fork(COMPACT)）。
+        // 父归属解析优先级：账本已有会话根节点 → 用其归属（保留真实 depth）；否则会话根
+        //   {@code top(sessionId, sessionId, MAIN, null)}（与 LlmAgentLoop.doRun 主 agent 装配逐字一致）；
+        //   无会话（null/空白）→ {@code unknown(null)}，不伪造层级。
+        // 未注入 registry（测试直构 / 未接线）→ 不装配（行为等价改造前）。
+        if (usageLedgerRegistry != null) {
+            com.nexusai.application.agent.cost.SessionUsageLedger forkLedger =
+                usageLedgerRegistry.forSession(forkSessionId);
+            String forkUsageAgentId = com.nexusai.application.agent.subagent.AgentContext
+                .unpackAgentId(forkIdentity);
+            com.nexusai.infra.llm.UsageAttribution parentAttribution =
+                forkLedger.attributionOf(forkSessionId);
+            if (parentAttribution == null) {
+                parentAttribution = (forkSessionId != null && !forkSessionId.isBlank())
+                    ? com.nexusai.infra.llm.UsageAttribution.top(forkSessionId, forkSessionId,
+                        com.nexusai.infra.llm.UsageCategory.MAIN, null)
+                    : com.nexusai.infra.llm.UsageAttribution.unknown(null);
+            }
+            // 顺序：先挂归属再挂账本（attachUsageLedger 在归属非空时才向账本登记本节点）。
+            state.attachUsageAttribution(parentAttribution.child(forkUsageAgentId,
+                com.nexusai.infra.llm.UsageCategory.COMPACT, "compact-fork"));
+            state.attachUsageLedger(forkLedger);
+            if (log.isDebugEnabled()) {
+                log.debug("[usage-gateway] fork 记账归属已装配: sessionId={} agentId={} parentAgentId={} "
+                        + "depth={} label={} ledgerCalls={}",
+                    forkSessionId, forkUsageAgentId,
+                    state.usageAttribution().parentAgentId(), state.usageAttribution().depth(),
+                    state.usageAttribution().label(), forkLedger.totalCalls());
+            }
+        }
         if (p.maxTurns() != null) {
             // maxTurns 落地在 state（主循环轮末判）+ 透传 QueryParams（循环外消费点）
             state.maxTurns(p.maxTurns());

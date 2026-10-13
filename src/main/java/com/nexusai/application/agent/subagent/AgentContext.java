@@ -364,12 +364,36 @@ public sealed interface AgentContext {
      * @param agentIdUuid ToolUseContext.agentId（{@link #packAgentId} 产物或任意 UUID）
      * @return a+16hex（'a'+16 hex）；null → null
      */
-    public static String unpackAgentId(UUID agentIdUuid) {
+    static String unpackAgentId(UUID agentIdUuid) {
         if (agentIdUuid == null) {
             return null;
         }
         String hex = String.format("%016x", agentIdUuid.getMostSignificantBits());
         return "a" + hex;
+    }
+
+    /**
+     * agentId <b>归一</b>：UUID 串（{@code agentId.toString()}）→ a+16hex（单一身份源）；
+     * 已是 a+16hex / 会话短 id / 其他形态 → 原样；null/空白 → null。
+     *
+     * <p><b>WHY（要修的缺陷）</b>：同一 agent 的不同调用路径会传不同渲染 —— 主循环与子代理归属用
+     * a+16hex，而旁路调用点普遍传 {@code state.agentId().toString()}（UUID 形式）⇒ 账本/统计按
+     * agentId 分组时同一 agent 裂成两个节点（实测：子代理本体一行 + 它的旁路一行，费用被拆开、
+     * 前端「按代理层级」同名两行）。写入侧（{@code LlmSideCallClient}）与读取侧（{@code StatsService}
+     * 的按 agent 聚合，兼容归一前写入的历史行）共用本方法，保证「一个 agent = 一个节点」。
+     */
+    static String canonicalAgentId(String agentId) {
+        if (agentId == null || agentId.isBlank()) {
+            return null;
+        }
+        if (agentId.matches("a[0-9a-f]{16}")) {
+            return agentId;
+        }
+        if (agentId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) {
+            String hex = unpackAgentId(UUID.fromString(agentId));
+            return hex != null ? hex : agentId;
+        }
+        return agentId;
     }
 
     // ────────────────────────────────────────────────────────────────────

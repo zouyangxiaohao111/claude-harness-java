@@ -113,7 +113,8 @@ class PromptHookRealProviderTest {
             com.nexusai.application.agent.tool.AbortController ac,
             java.util.function.Consumer<Throwable> oe,
             Runnable onC, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             throw new UnsupportedOperationException();
         }
 
@@ -145,15 +146,36 @@ class PromptHookRealProviderTest {
         };
     }
 
-    private HookRegistry registryWithPromptHook(LlmProviderFactory factory, ModelConfigResolver resolver) {
+    private HookRegistry registryWithPromptHook(LlmProvider provider, LlmProviderFactory factory,
+                                                ModelConfigResolver resolver) {
         HookRegistry registry = new HookRegistry();
         StubMatcherEngine engine = new StubMatcherEngine();
         engine.setHooks(List.of(matchedPromptHook()));
         registry.setHookMatcherEngine(engine);
-        registry.setExecPromptHook(new ExecPromptHook(JSON));
+        registry.setExecPromptHook(promptHook(provider));
         registry.setLlmProviderFactory(factory);
         registry.setModelConfigResolver(resolver);
         return registry;
+    }
+
+    /**
+     * [usage-gateway] ExecPromptHook 现经统一旁路客户端发起 LLM 调用（字段注入 sideCallClient）。
+     * 本 helper 注入 mock 客户端并把调用委派给给定 provider —— 保留本文件既有 provider 桩的
+     * 调用计数 / config·options 捕获语义（断言强度不变）。
+     */
+    private ExecPromptHook promptHook(LlmProvider provider) {
+        ExecPromptHook hook = new ExecPromptHook(JSON);
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+            org.mockito.Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        org.mockito.Mockito.when(client.chat(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> provider.chatWithOptions(
+                inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                inv.getArgument(3), inv.getArgument(4)));
+        org.springframework.test.util.ReflectionTestUtils.setField(hook, "sideCallClient", client);
+        return hook;
     }
 
     private static MatchedHook matchedPromptHook() {
@@ -180,7 +202,7 @@ class PromptHookRealProviderTest {
         CapturingProvider real = new CapturingProvider();
         AtomicInteger mockCalls = new AtomicInteger();
         HookRegistry registry = registryWithPromptHook(
-            routingFactory(real, mockCalls), new StubModelConfigResolver());
+            real, routingFactory(real, mockCalls), new StubModelConfigResolver());
 
         HookResult result = registry.executeEvent(userPrompt());
 
@@ -213,7 +235,7 @@ class PromptHookRealProviderTest {
         // Java 旧实现 ChatRequestOptions.querySource 恒 null（EV-EX-023 注释事实错误）。
         CapturingProvider real = new CapturingProvider();
         HookRegistry registry = registryWithPromptHook(
-            routingFactory(real, new AtomicInteger()), new StubModelConfigResolver());
+            real, routingFactory(real, new AtomicInteger()), new StubModelConfigResolver());
 
         registry.executeEvent(userPrompt());
 
@@ -236,7 +258,7 @@ class PromptHookRealProviderTest {
         CapturingProvider real = new CapturingProvider();
         AtomicInteger mockCalls = new AtomicInteger();
         HookRegistry registry = registryWithPromptHook(
-            routingFactory(real, mockCalls), new StubModelConfigResolver(true)); // failResolve → 解析失败
+            real, routingFactory(real, mockCalls), new StubModelConfigResolver(true)); // failResolve → 解析失败
 
         HookResult result = registry.executeEvent(userPrompt());
 

@@ -5,6 +5,7 @@ import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.command.InsightsCollector;
 import com.nexusai.application.agent.compact.SnipCompactor;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.permission.sandbox.SandboxManager;
 import com.nexusai.application.agent.plugin.InstalledPluginsManager;
@@ -13,9 +14,9 @@ import com.nexusai.application.agent.skill.BundledSkills;
 import com.nexusai.application.agent.skill.PromptBlock;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.infra.llm.LlmProvider;
-import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.CommandSource;
 import com.nexusai.model.command.PromptFnContext;
@@ -63,7 +64,7 @@ import java.util.function.BooleanSupplier;
  *       行为按 snipCompact.ts:83-147 + QueryEngine.ts:337-346（slash command 经 setMessages 变更消息数组）
  *       推断 = {@link SnipCompactor#snipCompactIfNeeded(List, boolean)} 强制变体。</li>
  *   <li>btw：CC runSideQuestion（fork 上下文独立查询）无 Java 等价 fork 通道 → 退化为单轮
- *       {@link LlmProviderFactory#getProvider} + {@link LlmProvider#chatWithOptions} 旁路查询；
+ *       {@link LlmSideCallClient#chat} 旁路查询；
  *       未注入 LLM 基础设施时仅记录提问（fail loud）。</li>
  *   <li>insights：CC getPromptForCommand 生成 HTML 报告 + 长 prompt；Java 经 {@link InsightsCollector}
  *       生成 markdown 报告文本注入 prompt。source 差异：CC source='builtin'（commands.ts:570
@@ -266,14 +267,14 @@ public class CommandRegistrationConfigGroupB {
             @Autowired(required = false) SessionAgentStateRegistry sessionRegistry,
             @Autowired(required = false) SandboxManager sandboxManager,
             @Autowired(required = false) InstalledPluginsManager installedPluginsManager,
-            @Autowired(required = false) LlmProviderFactory llmProviderFactory,
+            @Autowired(required = false) LlmSideCallClient sideCallClient,
             @Autowired(required = false) ModelConfigResolver modelConfigResolver) {
         if (dispatcher == null) {
             log.warn("[CommandRegistrationConfigGroupB] UserInputDispatcher 未注入，local 命令执行 handler 注册跳过");
             return new CommandGroupBLocalSlashRegistration();
         }
         registerForceSnipHandler(dispatcher, sessionRegistry);
-        registerBtwHandler(dispatcher, sessionRegistry, llmProviderFactory, modelConfigResolver);
+        registerBtwHandler(dispatcher, sessionRegistry, sideCallClient, modelConfigResolver);
         registerSandboxHandler(dispatcher, sandboxManager);
         registerPluginHandler(dispatcher, installedPluginsManager);
         if (log.isDebugEnabled()) {
@@ -338,12 +339,12 @@ public class CommandRegistrationConfigGroupB {
      * /btw handler · 对齐 CC commands/btw/btw.tsx:229-242 call（旁路提问，不打断主对话）。
      *
      * <p><b>受控差异</b>：CC runSideQuestion fork 独立上下文查询（btw.tsx:24 + utils/sideQuestion.ts）——
-     * Java 无 fork 通道 → 退化为单轮旁路查询（{@link LlmProviderFactory#getProvider} +
-     * {@link LlmProvider#chatWithOptions}）。LLM 基础设施未注入 → 仅记录提问（fail loud）。
+     * Java 无 fork 通道 → 退化为单轮旁路查询（{@link LlmSideCallClient#chat}）。LLM 基础设施未注入
+     * → 仅记录提问（fail loud）。
      */
     private void registerBtwHandler(UserInputDispatcher dispatcher,
                                     SessionAgentStateRegistry sessionRegistry,
-                                    LlmProviderFactory llmProviderFactory,
+                                    LlmSideCallClient sideCallClient,
                                     ModelConfigResolver modelConfigResolver) {
         dispatcher.registerSlashCommand("btw", (args, sessionId, inFlightUserMessageId) -> {
             String question = args == null ? "" : args.trim();
@@ -351,8 +352,8 @@ public class CommandRegistrationConfigGroupB {
                 log.warn("[CommandRegistrationConfigGroupB] /btw 用法: /btw <你的问题>（CC btw.tsx:232-236 Usage）");
                 return;
             }
-            if (llmProviderFactory == null || modelConfigResolver == null || sessionRegistry == null) {
-                log.warn("[CommandRegistrationConfigGroupB] /btw 旁路提问基础设施未注入（LlmProviderFactory/ModelConfigResolver/"
+            if (sideCallClient == null || modelConfigResolver == null || sessionRegistry == null) {
+                log.warn("[CommandRegistrationConfigGroupB] /btw 旁路提问基础设施未注入（LlmSideCallClient/ModelConfigResolver/"
                     + "SessionAgentStateRegistry），仅记录提问: {}（受控差异，CC runSideQuestion fork 未接线）", question);
                 return;
             }
@@ -363,7 +364,6 @@ public class CommandRegistrationConfigGroupB {
                     log.warn("[CommandRegistrationConfigGroupB] /btw 模型配置不可用（model={}），仅记录提问: {}", model, question);
                     return;
                 }
-                LlmProvider provider = llmProviderFactory.getProvider(resolved.config(), resolved.providerType());
                 // [S1-T7] agent 归因上下文 = **显式 null（(b) 类「本就不需要」）**，原读
                 //   ambient 归因上下文（宿 ThreadLocal，已删载体）已删（会话态不得经 ThreadLocal 读）。
                 //   判据（读 CC 真源 + 本仓调用链）：/btw = 用户在主线程发起的**旁路单轮提问**
@@ -376,8 +376,12 @@ public class CommandRegistrationConfigGroupB {
                     + "（旁路单轮查询无 agent 执行链 · (b) 类本就不需要）: sessionId={}", sessionId);
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                     List.of(), null, null, null, null, "btw", null, 1024, null);
-                String answer = provider.chatWithOptions(resolved.config(), model,
-                    "You are a helpful assistant answering a quick side question.", question, options);
+                // [usage-gateway] /btw 旁路单轮提问改走统一旁路客户端（调用+记账）：归属来源 = handler
+                //   形参 sessionId（分派入口显式传入的真实会话标识，非伪造）。类别 SIDE_CALL · 标签 btw-side-question。
+                String answer = sideCallClient.chat(resolved.config(), model,
+                    "You are a helpful assistant answering a quick side question.", question, options,
+                    LlmSideCallClient.SideCallUsage.inSession(sessionId, null,
+                        UsageCategory.SIDE_CALL, "btw-side-question"));
                 log.info("[CommandRegistrationConfigGroupB] /btw 旁路提问回答: model={} question={} answer={}",
                     model, question, answer);
             } catch (Exception e) {

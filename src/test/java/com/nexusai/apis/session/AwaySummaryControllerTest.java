@@ -1,5 +1,6 @@
 package com.nexusai.apis.session;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.memory.AwaySummaryService;
 import com.nexusai.application.agent.memory.SessionMemoryService;
 import com.nexusai.application.agent.tool.AbortController;
@@ -106,7 +107,8 @@ class AwaySummaryControllerTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
@@ -118,6 +120,18 @@ class AwaySummaryControllerTest {
                 if (capturedOptions != null) capturedOptions.set(options);
                 if (toThrow != null) throw toThrow;
                 return response;
+            }
+        };
+    }
+
+    /** [usage-gateway] 委托型 LlmSideCallClient：chat(...) 等价改造前 provider.chatWithOptions(...)。 */
+    private static LlmSideCallClient delegating(LlmProvider provider) {
+        return new LlmSideCallClient() {
+            @Override
+            public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                               String userMessage, LlmProvider.ChatRequestOptions options,
+                               LlmSideCallClient.SideCallUsage usage) {
+                return provider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
             }
         };
     }
@@ -141,6 +155,9 @@ class AwaySummaryControllerTest {
     private MockMvc mockMvc(LlmProvider provider) {
         AwaySummaryService service = new AwaySummaryService(
             provider, ProviderConfig.empty(), new SessionMemoryService(tempDir), () -> "haiku");
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入委托桩（chat(...) → provider 桩），
+        //   保留既有桩语义（options 捕获 / 异常）与断言。
+        ReflectionTestUtils.setField(service, "sideCallClient", delegating(provider));
         AwaySummaryController controller = new AwaySummaryController();
         ReflectionTestUtils.setField(controller, "awaySummaryService", service);
         ReflectionTestUtils.setField(controller, "messageService", messageService);

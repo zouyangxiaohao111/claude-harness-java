@@ -172,7 +172,7 @@ public class CompactSettingsResolver {
     }
 
     /**
-     * 实时读 {@code settings.stream_idle_timeout_ms}（V78）· 流空闲看门狗阈值（对齐 CC
+     * 实时读 {@code settings.stream_idle_timeout_ms}（V100）· 流空闲看门狗阈值（对齐 CC
      * {@code CLAUDE_STREAM_IDLE_TIMEOUT_MS} 的 DB 承载；用户 10-10 追加要求：前端「设置→通用」页可配）。
      *
      * <p>本层只做「DB 有值（> 0）原样透出」，<b>不做 300000 下限钳制</b>——钳制在消费点

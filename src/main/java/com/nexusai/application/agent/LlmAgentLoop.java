@@ -1007,6 +1007,26 @@ public class LlmAgentLoop implements AgentLoop {
     /** [RV14B-WIRE-04] 共享配置解析器 · Haiku 站点解析真实 (config, providerType)（null → warn+skip 不落 mock）。 */
     private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
 
+    /**
+     * [usage-gateway] 旁路 LLM 单发客户端（技能目录摘要等 fire-and-forget 侧查询收口在此）。
+     * 经 setter 注入并同步静态桥（见 {@link #setSideCallClient}）：static loop 上下文无法引用实例字段。
+     */
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
+
+    /**
+     * [usage-gateway] 静态桥 LlmSideCallClient · {@code injectSkillListingForRun}/{@code loop} 为 static，
+     * 其调用的 {@link AgentLoopContext#triggerSkillCatalogHaikuSummaryAsync} 需要本 bean。
+     * null 注入保持 null（读侧「无 LLM 基建即跳过」）。
+     */
+    private static volatile com.nexusai.application.agent.cost.LlmSideCallClient staticSideCallClient;
+
+    /** [usage-gateway] setter 注入 LlmSideCallClient（{@code @Autowired(required=false)}，同步静态桥）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setSideCallClient(com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient) {
+        this.sideCallClient = sideCallClient;
+        LlmAgentLoop.staticSideCallClient = sideCallClient;
+    }
+
     // ── s05-P1-3: Todo reminder 机制 · 对齐 CC utils/attachments.ts:254-257 + 3266-3317 ──
 
     /**
@@ -1535,6 +1555,14 @@ public class LlmAgentLoop implements AgentLoop {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.nexusai.application.agent.cost.CostTracker costTracker;
 
+    /**
+     * [usage-gateway] 会话账本注册表 · run 启动时按 sessionId 绑定账本到 state，使本 run 的每次
+     * LLM 调用（含子代理 / fork / 旁路）都记入同一会话账目。null（非 Spring 单测 new）→
+     * state 无账本 → 网关跳过记账（行为等价改造前），不 NPE。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
     /** b14：StructuredOutput 仅在显式非交互会话中启用，默认交互模式。 */
     private volatile boolean nonInteractiveSession = false;
 
@@ -1720,75 +1748,6 @@ public class LlmAgentLoop implements AgentLoop {
             log.debug("[V-TOK] 会话累计: model={} costYuan={} input={} output={} buckets={}",
                 effectiveModel, state.sessionCostYuan(), state.sessionInputTokens(),
                 state.sessionOutputTokens(), state.sessionModelUsage().size());
-        }
-    }
-
-    /**
-     * [compact-cost] 压缩那次 LLM 调用的 usage → 会话成本/用量合计 · 对齐 CC
-     * {@code claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage, options.model)}
-     * → {@code cost-tracker.ts:250-276 addToTotalModelUsage} → {@code state.ts:551-558
-     * STATE.totalCostUSD += cost}。
-     *
-     * <p><b>WHY 独立入口（而非复用 accumulateSessionUsage 直接调用）</b>：压缩调用是 side call
-     * （CC {@code queryModel} 的 message_delta 分支），其 usage 只作为
-     * {@code CompactionResult.compactionUsage} 在内存返回、不进 transcript（故 boundary/summary 行
-     * token 列为 NULL —— 与 CC 一致，不改）。但 CC 的<b>成本</b>侧同样在 message_delta 分支计入
-     * 会话合计，Java 端此前只有两处遥测消费（{@code emitTenguCompactTelemetry} /
-     * {@code emitAutoCompactSucceededTelemetry}）→ 真机漏算（sess-c72a825a auto compact
-     * preTokens≈46 万未进 sessions.total_cost_yuan / model_usage_json）。本方法补上成本接线。
-     *
-     * <p><b>复用既有会话计费通道（不新造统计体系）</b>：{@code addSessionOutputTokens}（output
-     * 镜像字段，主循环同款两处 :7257/:7528）+ {@link #accumulateSessionUsage}（input/cost/按模型桶）
-     * —— 与主循环同一条链路 → ChatService message.complete 读 {@code state.sessionCostYuan()} /
-     * {@code sessionModelUsage()} → CostTracker.saveCurrentSessionCosts 落
-     * sessions.total_cost_yuan + model_usage_json（跨 turn restore/save 自动生效）。
-     *
-     * <p><b>✗ 绝不进 runUsage</b>：CC {@code result.usage}（QueryEngine.totalUsage）只在主循环
-     * message_stop 累加，压缩 side call 不计入 —— 本方法只动会话级四元组，绝不调
-     * {@code state.accumulateRunUsage}（否则 complete.usage 会多算压缩量，反而不对齐 CC）。
-     *
-     * <p><b>模型口径</b>：{@code compactModel} 必须是真正执行本次压缩调用的模型（= 建压缩上下文
-     * 时喂给 {@code CompactConversationContext} 的 model，最终经
-     * {@code StreamCompactSummary.modelSupplier} 落到 {@code summaryResult.usage} 的那次调用）。
-     * 价格按模型/provider 分派（ModelCostCalculator 的 anthropic/deepseek cache 语义不同）——
-     * 用会话主模型顶替会算错金额。
-     *
-     * <p><b>可见性 public（跨包调用）</b>：同 {@link #publishMessageUsage} 先例 —— manual {@code /compact}
-     * （{@code com.nexusai.application.agent.config.ToolRegistrationConfig}）与 partial 压缩
-     * （{@code com.nexusai.application.agent.compact.PartialCompactService}）均在 agent 子包内，
-     * 需直接调用本入口把各自那次压缩调用的 usage 并入同一会话合计（<b>不新造第二套统计</b>）。
-     * 签名/语义未变，仅放宽可见性（private static → public static）。
-     *
-     * @param state        会话累计载体（null → no-op；partial 路径未注册会话即此情形）
-     * @param compactModel 本次压缩调用实际使用的模型（null → no-op，不猜）
-     * @param usage        压缩调用 usage（null / 四字段全零 → no-op，不污染桶）
-     * @param calculator   模型计费纯函数（null → 仅累计 input/output tokens，cost/桶跳过）
-     */
-    public static void accumulateCompactionSessionCost(
-            AgentState state, String compactModel,
-            CompactConversation.TokenUsage usage,
-            com.nexusai.application.agent.cost.ModelCostCalculator calculator) {
-        if (state == null || usage == null || compactModel == null) {
-            return;
-        }
-        long cacheRead = usage.cacheReadInputTokens();
-        long cacheCreation = usage.cacheCreationInputTokens();
-        if (usage.inputTokens() <= 0 && usage.outputTokens() <= 0
-                && cacheRead <= 0 && cacheCreation <= 0) {
-            return;
-        }
-        // 主循环同款两步：output 镜像字段（:7257/:7528 addSessionOutputTokens）+
-        // input/cost/按模型桶（accumulateSessionUsage 内含 addSessionInputTokens /
-        // addSessionCostYuan / mergeSessionModelUsage）。
-        AgentUsage compactUsage = new AgentUsage(
-            usage.inputTokens(), usage.outputTokens(), cacheCreation, cacheRead,
-            null, null, null);
-        state.addSessionOutputTokens(compactUsage.outputTokens());
-        accumulateSessionUsage(state, compactModel, compactUsage, calculator);
-        if (log.isDebugEnabled()) {
-            log.debug("[compact-cost] 压缩调用 usage 已并入会话合计: model={} in={} out={} cacheRead={} cacheCreate={} sessionCostYuan={} · CC claude.ts:2361",
-                compactModel, compactUsage.inputTokens(), compactUsage.outputTokens(),
-                cacheRead, cacheCreation, state.sessionCostYuan());
         }
     }
 
@@ -2653,6 +2612,36 @@ public class LlmAgentLoop implements AgentLoop {
         //   上一轮 abort/error（不发 complete ⇒ 标记无人 consume）的残留才会被此处挡住
         //   → 防本轮 complete 谎报 compacted=true（未压缩轮假重拉）。
         state.clearTurnCompacted();
+        // ── [usage-gateway] 记账归属 + 会话账本绑定 ──
+        // 用户裁定：用量统计前置到请求网关（流式/非流式统一），归属由 AgentState 显式携带。
+        // 主 agent 归属 = 顶层节点（depth 0，agentId 取会话 id，便于账本树阅读）；
+        // 子代理 / fork / 旁路各自用父归属 child(...) 派生（见 SubagentExecutor 等 spawn 点）。
+        // 绑定后：本 run 内每次 LLM 调用（含工具轮/恢复/压缩）都经网关记入同一会话账目，
+        // 并由账本回写本 state 的会话视图字段（session*）。
+        if (usageLedgerRegistry != null && sessionId != null) {
+            com.nexusai.application.agent.cost.SessionUsageLedger ledger =
+                usageLedgerRegistry.forSession(sessionId);
+            // 跨 turn 恢复：从 sessions.usage_tree_json 读回层级快照（各 agent 桶 + 按模型 rollup），
+            // 使 message.complete / 统计接口反映跨 turn 累计（与 total_cost_yuan 同源权威）。
+            if (costTracker != null) {
+                ledger.restoreFromJson(costTracker.restoreUsageTreeJson(sessionId));
+            }
+            state.attachUsageAttribution(com.nexusai.infra.llm.UsageAttribution.top(
+                sessionId, sessionId,
+                // 归类对齐既有 D1 usage-source 机制：CronIdleExecutor / 后台化主会话任务在 run 前
+                //   置 SOURCE_BACKGROUND（MessageUsageEvent）⇒ 这些 run 的调用归 BACKGROUND，
+                //   与「用户交互回合」在统计上可区分（前端底部数字本就只统计 user 来源）。
+                com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND.equals(this.streamUsageSource)
+                    ? com.nexusai.infra.llm.UsageCategory.BACKGROUND
+                    : com.nexusai.infra.llm.UsageCategory.MAIN,
+                null));
+            state.attachUsageLedger(ledger);
+            if (log.isDebugEnabled()) {
+                log.debug("[usage-gateway] 记账归属已装配: sessionId={} agentId={} category={} ledgerCalls={}（请求网关记账入口）",
+                    sessionId, state.usageAttribution().agentId(), state.usageAttribution().category(),
+                    ledger.totalCalls());
+            }
+        }
         // [V-TOK 实施] 会话启动 restore 累计（对齐 CC restoreCostStateForSession · state.ts:704-710）：
         //   从 sessions 表 total_cost_yuan + model_usage_json 列（V48）读回 → 写 AgentState 会话累计
         //   字段，使 message.complete 的 total_cost_usd/modelUsage 反映跨 turn 累计
@@ -6454,16 +6443,10 @@ public class LlmAgentLoop implements AgentLoop {
                         // [MISS-5] emit tengu_auto_compact_succeeded · CC query.ts:478
                         // [IMP-CM-17] 结构化遥测（双发射 recordEvent + logOTelEvent · 原 log.info 文本升级）
                         emitAutoCompactSucceededTelemetry(loopTelemetry, preCompactMessages, l4Result, queryTracking);
-                        // [compact-cost] 压缩那次 LLM 调用的 usage → 会话成本/用量合计（对齐 CC
-                        //   claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
-                        //   options.model) → cost-tracker.ts:250-276 → state.ts:551-558）。
-                        //   模型 = compactEffectiveModel（本 turn 喂给 ccCtx 的模型 = CC mainLoopModel，
-                        //   即真正执行本次摘要调用的模型；StreamCompactSummary.modelSupplier 同源）。
-                        //   ✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
-                        CompactionResult autoCr = l4Result.compactionResult();
-                        accumulateCompactionSessionCost(state, compactEffectiveModel,
-                            autoCr != null ? autoCr.compactionUsage() : null,
-                            ctx.modelCostCalculator());
+                        // [usage-gateway] 压缩那次 LLM 调用的 usage 现经请求网关入账（压缩摘要内
+                        //   以真实 sessionId 盖章 UsageCategory.COMPACT → 网关 sink → 会话账本）。
+                        //   旧通道 LlmAgentLoop.accumulateCompactionSessionCost 已删（用户裁定：
+                        //   不允许两套）。✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
                         log.info("tengu_auto_compact_succeeded: originalMessageCount={} compactedMessageCount={} freed={} tokens source={} · CC query.ts:478",
                             preCompactMessages.size(), l4Result.messages().size(),
                             l4Result.tokensFreed(), l4Result.source());
@@ -7410,6 +7393,11 @@ public class LlmAgentLoop implements AgentLoop {
                 //   （用户铁律：会话态一律显式传参，回放不算合规）。
                 (params.toolUseContext() != null
                     ? params.toolUseContext().agentContext() : null),
+                // [usage-gateway] 记账归属与出口 · 由 state 显式携带（run 启动时装配；两者为 null
+                //   → 网关跳过记账，行为等价改造前）。loop() 为 static，故取值只能来自形参 state
+                //   （显式传参，不用 ThreadLocal —— 仓库铁律）。
+                state.usageAttribution(),
+                state.usageRecorder(),
                 // [流空闲看门狗] 每请求专用 control（上方构造：控制器 + forceNonStreaming + idleMs）
                 streamIdleControl
             );
@@ -8215,14 +8203,11 @@ public class LlmAgentLoop implements AgentLoop {
                                     prevRemaining, params.taskBudget().total(), measured, now);
                             }
 
-                            // [compact-cost] reactive 压缩那次 LLM 调用的 usage → 会话成本/用量合计
-                            //   （与 auto 路径同一条通道，对齐 CC claude.ts:2361
-                            //   addToTotalSessionCost → cost-tracker.ts:250-276）。snip-first 纯裁剪
-                            //   路径无 LLM 调用 → compactionUsage=null → 安全 no-op。
-                            //   ✗ 不进 runUsage（压缩是 side call）。
-                            accumulateCompactionSessionCost(state, reactiveCompactModel,
-                                compacted.compactionResult().compactionUsage(),
-                                ctx.modelCostCalculator());
+                            // [usage-gateway] reactive 压缩那次 LLM 调用的 usage 现经请求网关入账
+                            //   （压缩摘要内以真实 sessionId 盖章 UsageCategory.COMPACT → 网关
+                            //   sink → 会话账本；snip-first 纯裁剪路径无 LLM 调用则无记录）。
+                            //   旧通道 LlmAgentLoop.accumulateCompactionSessionCost 已删
+                            //   （用户裁定：不允许两套）。✗ 不进 runUsage（压缩是 side call）。
                             // [R25-3] 标记 reactive compact 已尝试 · 让 gate 防止下次 prompt-too-long 时再次 compact
                             recoveryState.markReactiveCompact();
                             // [P4-4 item3 · CC query.ts:1442] reactive compact 成功后<b>复位</b> autoCompactTracking。
@@ -8643,7 +8628,12 @@ public class LlmAgentLoop implements AgentLoop {
                 //   也应累计 input/cost）。msg.usage() 恒非 null（EMPTY 哨兵），totalTokens>0
                 //   才累计（EMPTY 全零不污染 cost/桶）。
                 if (msg.usage().totalTokens() > 0) {
-                    accumulateSessionUsage(state, effectiveModel, msg.usage(), ctx.modelCostCalculator());
+                    // [usage-gateway] 迁移门控：账本已接线（生产）→ 本次调用已由请求网关记账，
+                    //   此处不再重复累计（防双计）；未接线（老单测 new / 无 Spring）→ 保留原累计路径，
+                    //   既有测试与行为零变化。P3 收敛批次将删除本分支（届时网关覆盖全部调用面）。
+                    if (state.usageRecorder() == null) {
+                        accumulateSessionUsage(state, effectiveModel, msg.usage(), ctx.modelCostCalculator());
+                    }
                 }
                 // ══════ PR 4: 10 层权限管线过滤 ══════
                 //  · 每个 tool_call 先 PermissionPipeline.check() → Allow/Ask/Deny/Passthrough
@@ -8951,7 +8941,10 @@ public class LlmAgentLoop implements AgentLoop {
             AgentUsage turnUsage = (msg != null && msg.usage().totalTokens() > 0)
                 ? msg.usage()
                 : new AgentUsage(turnInput, turnOutput, turnCacheCreate, turnCacheRead, null, null, null);
-            accumulateSessionUsage(state, effectiveModel, turnUsage, ctx.modelCostCalculator());
+            // [usage-gateway] 同上：账本接线后由网关记账（含 T3 估算兜底由网关/provider 侧承担）
+            if (state.usageRecorder() == null) {
+                accumulateSessionUsage(state, effectiveModel, turnUsage, ctx.modelCostCalculator());
+            }
 
             // ── [V-TOK-04] Stop hooks 评估（budget check 前 · CC query.ts:1267 stop hooks -> :1308 budget check）──
             // CC 在 !needsFollowUp 分支内先跑 handleStopHooks（含 hook 执行），再 checkTokenBudget。
@@ -10677,7 +10670,8 @@ public class LlmAgentLoop implements AgentLoop {
             state.sessionId(), agentKey, decision.names().size(), decision.isInitial(),
             decision.supersedesPriorRows(), resume);
         // [R25-6] 异步 Haiku 增强摘要（fire-and-forget）· 仅有新技能（首注/增量）触发，不阻塞主链。
-        AgentLoopContext.triggerSkillCatalogHaikuSummaryAsync(ctx, state, listingText);
+        // [usage-gateway] static 上下文经静态桥取 sideCallClient（本方法为 static，无法引用实例字段）。
+        AgentLoopContext.triggerSkillCatalogHaikuSummaryAsync(ctx, state, listingText, staticSideCallClient);
     }
 
     /**
@@ -11311,7 +11305,8 @@ public class LlmAgentLoop implements AgentLoop {
      * 无 provider factory / Haiku 不可用时降级为 no-op, 不影响主链.
      */
     public void triggerSkillCatalogHaikuSummaryAsync(AgentState state, String catalogText) {
-        if (llmProviderFactory == null || state == null) return;
+        // [usage-gateway] sideCallClient 未装配（非 Spring 单测）→ 保持原「无 LLM 基建即跳过」语义。
+        if (llmProviderFactory == null || sideCallClient == null || state == null) return;
         // [RV14B-WIRE-04] 调用方线程先 resolve 真实配置（DB/settings 访问不在 ForkJoinPool 公共池），
         //   捕获进 runAsync lambda；解析失败 → warn+skip 不落 mock（对齐 CC queryHaiku 失败即无结果）。
         com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolved = resolveHaikuModelConfig();
@@ -11326,12 +11321,19 @@ public class LlmAgentLoop implements AgentLoop {
                     String prompt = "请用 1-2 句话总结当前可用技能列表的核心能力分类:\n"
                         + catalogText
                         + "\n\n只输出 1-2 句中文摘要, 不要前缀.";
-                    String summary = llmProviderFactory.getProvider(resolved.config(), resolved.providerType()).chat(
+                    // [usage-gateway] 归属来源：AgentState 形参 state —— sessionId=state.sessionId()、
+                    //   agentId=state.agentId()（UUID → String）；技能目录摘要 = 主会话派生旁路单发 → SIDE_CALL。
+                    String summary = sideCallClient.chat(
                         resolved.config(),
                         modelName,
                         "你是技能目录摘要专家. 用一句话总结可用技能的核心能力.",
-                        prompt
-                    );
+                        prompt,
+                        null,
+                        com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage.inSession(
+                            state.sessionId(),
+                            state.agentId() != null ? state.agentId().toString() : null,
+                            com.nexusai.infra.llm.UsageCategory.SIDE_CALL,
+                            "skill-catalog-summary"));
                     if (summary != null && !summary.isBlank()) {
                         state.appendAttachment(new com.nexusai.application.agent.attachment.AttachmentMessageDto(
                             null, "attachment", "skill_catalog_summary",

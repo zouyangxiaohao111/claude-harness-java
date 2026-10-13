@@ -102,6 +102,14 @@ public class WebFetchTool implements Tool {
     private ModelConfigResolver modelConfigResolver;
 
     /**
+     * [usage-gateway] 旁路 LLM 单发客户端 · fast 档二次摘要调用收口到请求网关并自动记账。
+     *
+     * <p>{@code required=false}：测试/孤立 new 场景未注入 → 调用点需容忍；生产经 Spring 注入。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
+
+    /**
      * [G20③] 二次模型摘要调用器（可注入；null → fast 档 prompter → 均不可用则回退截断）。
      *
      * <p>对齐 CC {@code queryHaiku}（WebFetchTool/utils.ts:503-514）的 Java 注入点：
@@ -588,8 +596,8 @@ public class WebFetchTool implements Tool {
      * <p>对齐 CC {@code queryHaiku}（WebFetchTool/utils.ts:503-514）：CC 真源 queryHaiku 用
      * {@code getSmallFastModel()}（model.ts:36-37）——即 <b>fast 档</b>（Haiku），非 weak 档。
      * Java 端经 {@code modelConfigResolver.resolveFastModelName("claude-haiku-4-5-20251001")}
-     * （fast→weak→固定默认 三级，ModelConfigResolver:197-223）解析，复用 {@code chatWithOptions}
-     * （对齐 HaikuToolUseSummaryGenerator）。依赖未注入 / fast 档解析失败 / 配置解析失败 → null
+     * （fast→weak→固定默认 三级，ModelConfigResolver:197-223）解析，经 {@code LlmSideCallClient.chat}
+     * 发起旁路调用（[usage-gateway] 收口记账，对齐 HaikuToolUseSummaryGenerator）。依赖未注入 / fast 档解析失败 / 配置解析失败 → null
      * （调用方回退截断，抓取不中断）。
      *
      * @param isNonInteractiveSession 是否非交互会话（透传二次模型调用 options，对齐 CC isNonInteractiveSession）
@@ -620,12 +628,17 @@ public class WebFetchTool implements Tool {
                 }
                 return null;
             }
-            LlmProvider provider = llmProviderFactory.getProvider(resolved.config(), resolved.providerType());
             LlmProvider.ChatRequestOptions options =
                 buildSecondaryModelOptions(isNonInteractiveSession, agentContext);
-            return modelPrompt -> provider.chatWithOptions(resolved.config(), modelName,
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient：本处无 ToolUseContext/sessionId（仅
+            //   agentContext 形参）⇒ 归属 standalone(SIDE_CALL, "web-fetch-summary").withAgentContext(agentContext)，
+            //   绝不伪造 sessionId。返回值/异常/超时语义与 chatWithOptions 完全一致。
+            return modelPrompt -> sideCallClient.chat(resolved.config(), modelName,
                     null /* 空 systemPrompt = CC asSystemPrompt([])，toSingleOrgBlock(null) → 无 system 字段 */,
-                    modelPrompt, options);
+                    modelPrompt, options,
+                    com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                            .standalone(com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "web-fetch-summary")
+                            .withAgentContext(agentContext));
         } catch (Exception e) {
             if (log.isWarnEnabled()) {
                 log.warn("[WebFetchTool] 构建 fast 档 prompter 失败（二次模型回退截断）: err={}", e.toString());

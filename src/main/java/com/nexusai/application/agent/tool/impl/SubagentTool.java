@@ -194,6 +194,18 @@ public class SubagentTool implements Tool {
     private com.nexusai.application.agent.loop.FeatureFlags featureFlags;
 
     /**
+     * [usage-gateway] 会话账本注册表 · 4 个 {@code new SubagentExecutor(...)} 构造站点统一经
+     * {@code executor.setUsageLedgerRegistry(本字段)} 透传（对齐 featureFlags/skillPreloader 先例：
+     * 多构造站点消费同一 Spring 单例）。
+     *
+     * <p>WHY：子代理的 LLM 用量必须并入**父会话同一账目**的子节点（此前子代理隔离 AgentState 不落库
+     * ⇒ 用量丢失）。{@code @Autowired(required=false)}：测试/手动直构未注入 → 透传 null →
+     * SubagentExecutor 不装配归属（请求网关跳过记账，行为等价改造前）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /**
      * [W2-2] settings 档位模型数据源 · subagent 档位模型（settings.subagentModelId，V25 列）。
      * {@code @Autowired(required=false)} 字段注入（对齐 featureFlags 先例）；未注入（测试/手动
      * 直构）→ 读取返回 null → AgentModelResolver 回落 env/原解析链（CC agent.ts:43-45）。
@@ -2982,6 +2994,9 @@ public class SubagentTool implements Tool {
         // [IMP-SP2-08] PROMPT_CACHE_BREAK_DETECTION 门注入 → finally cleanupAgentTracking 真实接线
         //   （对齐 CC runAgent.ts:824-826；null-safe：未注入 → feature 恒关 = 默认关行为）
         executor.setFeatureFlags(featureFlags);
+        // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全（未注入 →
+        //   SubagentExecutor 不装配归属，请求网关跳过记账，等价改造前）
+        executor.setUsageLedgerRegistry(usageLedgerRegistry);
         // [FIX-AM REQ-M-19] 生产接线：注入自定义 agent 解析器 + agent-memory 目录 →
         //   resolveAgentDefinition 命中自定义 memory agent（CC AgentTool.tsx:286 activeAgents.find）
         //   + buildAgentSystemPrompt(:1854) 生成期真实注入 agentMemoryPrompt（CC loadAgentsDir.ts:481-488）。
@@ -3284,6 +3299,9 @@ public class SubagentTool implements Tool {
                         // [IMP-SP2-08] PROMPT_CACHE_BREAK_DETECTION 门注入（异步 worker 路径同样
                         //   命中 finally cleanupAgentTracking；null-safe 默认关）
                         exec.setFeatureFlags(featureFlags);
+                        // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全
+                        //   （未注入 → SubagentExecutor 不装配归属，等价改造前）
+                        exec.setUsageLedgerRegistry(usageLedgerRegistry);
                         // OPD-TP-21: 注入 task-scoped AbortController → SubagentExecutor 决策层
                         //   override 优先（对齐 CC runAgent.ts:524-525）；killAsyncAgent abort 直达 worker
                         exec.setTaskAbortController(taskAbort);
@@ -3433,6 +3451,8 @@ public class SubagentTool implements Tool {
         // [IMP-SP2-08] PROMPT_CACHE_BREAK_DETECTION 门注入（降级 sync 路径同样命中 finally
         //   cleanupAgentTracking；null-safe 默认关）
         executor.setFeatureFlags(featureFlags);
+        // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全（同 async 路径）
+        executor.setUsageLedgerRegistry(usageLedgerRegistry);
         // [FIX-AM REQ-M-19] 生产接线：自定义 agent 解析器 + agent-memory 目录注入（降级 sync 路径）
         //   [C-方案3][DEC-C-02] 复用 executeAsync 调用线程捕获的 per-session registry（会话项目表）
         executor.setAgentDefinitionResolver(sessionRegistry::findAgent);
@@ -3823,6 +3843,9 @@ public class SubagentTool implements Tool {
                 // [IMP-SP2-08] PROMPT_CACHE_BREAK_DETECTION 门注入（resume 续跑路径同样命中
                 //   finally cleanupAgentTracking；null-safe 默认关）
                 exec.setFeatureFlags(featureFlags);
+                // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全
+                //   （resume 续跑复用原 agentId → 归属解析优先复用账本已有节点，层级不漂移）
+                exec.setUsageLedgerRegistry(usageLedgerRegistry);
                 // OPD-TP-21: 注入 task-scoped AbortController（resume 续跑同样可被 kill 中断）
                 exec.setTaskAbortController(taskAbort);
                 // [MCP-I-9 返工 R1+R2] MCP 装配：McpTransportFactory + supplier + name resolver（resume 路径）

@@ -1,0 +1,27 @@
+-- ===================================================================
+-- V99: sessions 表新增会话级层级用量/费用快照列（usage_tree_json）
+--
+-- 背景：V98 落「每 call 明细表」llm_usage_calls 后，会话级还需要一个「按树汇总」的
+--   只读快照，供会话详情/统计面板一次读出不需扫明细表。与既有 model_usage_json（V50 列）
+--   的关系是**两个不同 rollup 维度**：
+--     model_usage_json  = 按「模型名」rollup 的 8 字段用量/费用快照（扁平，模型为键）。
+--     usage_tree_json   = 按「agent 层级树」rollup 的用量/费用快照
+--                         （session → 主 agent(0) → 子代理(1) → 嵌套(2)…，节点键取
+--                          UsageAttribution.nodeKey()，含 parent/depth/category/label 维度）。
+--   ⛔ 二者不互为替换：前者仍是按模型汇总的权威列（CostTracker 语义），新列只加层级维度，
+--      读侧按需取用（旧行为不变：model_usage_json 继续写、继续读）。
+--
+-- 列：
+--   usage_tree_json TEXT 可空 = 会话级层级树 JSON 串；解析在读侧
+--     （照抄 disabled_tools V35 / todos V43 / model_usage_json V50 先例：本列仅存 JSON 串）。
+--   null = 该会话从未产出层级快照（读侧 skip / DTO null）。
+--
+-- Java 端 camelCase 字段 usageTreeJson，MyBatis-Flex 自动 snake↔camel
+--   （同 modelUsageJson V50 列范式）。
+-- 存量行 NULL 容错。
+--
+-- ⚠️ 本文件注释**不得**出现「美元符 + 左大括号」的 Flyway 占位符字面量
+--    （V73/V78/V92..V97 同款警告：application.yml 未关 flyway.placeholder-replacement，
+--     SQL 注释也在替换范围内 → Flyway 会把它当未配置占位符并解析失败）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN usage_tree_json TEXT NULL;

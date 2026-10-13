@@ -91,6 +91,10 @@ public class ExecPromptHook {
 
     private final ObjectMapper objectMapper;
 
+    /** [usage-gateway] 旁路 LLM 单发客户端（统一记账）；测试可经 ReflectionTestUtils 注入 mock。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
+
     public ExecPromptHook(ObjectMapper objectMapper) {
         this.objectMapper = objectMapper;
     }
@@ -190,13 +194,21 @@ public class ExecPromptHook {
                 }
                 return cancelled();
             }
+            // [usage-gateway] 旁路调用收口到 LlmSideCallClient：PromptLlmContext 仅携带 agentContext
+            //   （agentContext 由 HookRegistry 从父 TUC 盖章下传），无 sessionId ⇒ 归属
+            //   standalone(HOOK, "exec-prompt-hook").withAgentContext(llmContext.agentContext())；
+            //   config 仍取自 llmContext.config()。返回值/异常/超时/abort 语义与 chatWithOptions 完全一致
+            //   （options 内 abortController=combinedAbort 原样透传）。
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
-                llmContext.provider().chatWithOptions(
+                sideCallClient.chat(
                     llmContext.config(),
                     effectiveModelName,
                     SYSTEM_PROMPT,
                     processedPrompt,
-                    buildRequestOptions(llmContext, combinedAbort, messages)
+                    buildRequestOptions(llmContext, combinedAbort, messages),
+                    com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                        .standalone(com.nexusai.infra.llm.UsageCategory.HOOK, "exec-prompt-hook")
+                        .withAgentContext(llmContext.agentContext())
                 )
             );
             //    组合信号取消 → 立即唤醒 get（provider 未消费 abort 时也能及时返回 cancelled；

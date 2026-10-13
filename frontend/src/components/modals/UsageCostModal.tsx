@@ -2,8 +2,9 @@ import { useEffect, useMemo, useState } from 'react'
 import { useChatStore } from '@/stores/chatStore'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { sessionApi } from '@/api/sessions'
+import { tasksApi, type BackgroundTaskDto } from '@/api/tasks'
 import { statsApi } from '@/api/stats'
-import type { ChatMessageDto, StatsByModel, StatsResponse } from '@/api/types'
+import type { ChatMessageDto, SessionAgentUsage, SessionUsageResponse, StatsByModel, StatsResponse } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { failureReasonOf, subagentListOfSession, useSubagentStore } from '@/stores/subagentStore'
 import { SUBAGENT_STATUS_LABEL, formatSubagentStat } from '@/utils/subagentStats'
@@ -23,6 +24,96 @@ const EMPTY_MESSAGES: ChatMessageDto[] = []
 
 /** 条形图宽度百分比：v>0 时至少 2%（小值可见），否则 0（零数据不显示条）。 */
 const barPct = (v: number, max: number) => (max > 0 && v > 0 ? Math.max(2, (v / max) * 100) : 0)
+
+/** 调用类型中文名（对齐后端 UsageCategory 枚举 · 未映射的值原样显示，不吞不猜）·
+ *  下称 `CATEGORY_LABEL[x] ?? x` 直接内联使用。 */
+const CATEGORY_LABEL: Record<string, string> = {
+  MAIN: '主对话',
+  SUBAGENT: '子代理',
+  TEAMMATE: '队友',
+  COMPACT: '压缩',
+  BACKGROUND: '后台任务',
+  HOOK: 'Hook',
+  SIDE_CALL: '旁路调用',
+  CLASSIFIER: '权限分类器',
+  UNKNOWN: '未归类',
+}
+
+/**
+ * 归属标签（后端 label）→ 中文用途名。**只覆盖本仓自己生成的 slug**（旁路用途名 / 压缩标签 /
+ * 内置 agent 类型名）；用户自定义的子代理名（中文或英文）与未知新标签**原样显示**（不吞、不猜）。
+ *
+ * <p>WHY 需要它：`按代理层级` 里 `general-purpose` / `compact-fork` / `skill-catalog-summary`
+ * 这类 slug 用户看不出含义（实测反馈「名称人类不可读」）。类别维度已有 {@link CATEGORY_LABEL}，
+ * 本表只补「具体用途」这一层；渲染统一走 {@link usageNodeName}（类别 · 用途）。
+ *
+ * <p>维护：后端新增 label 字面量时在此补一行即可；漏补只会退回原样 slug，不会显示错误含义。
+ */
+const LABEL_GLOSS: Record<string, string> = {
+  // 内置子代理类型名（AgentDefinitionRegistry：built-in agents）
+  'general-purpose': '通用型',
+  'Explore': '探索型',
+  'Plan': '规划型',
+  'statusline-setup': '状态栏配置',
+  'claude-code-guide': '使用指南型',
+  // 子代理自身产生的旁路（SubagentExecutor 摘要）
+  'agent-summary': '子代理摘要',
+  // 压缩
+  'compact-fork': 'fork 摘要',
+  'compact-streaming-summary': '流式摘要',
+  // 旁路单发（LlmSideCallClient 调用点自述名）
+  'title-generation': '会话标题生成',
+  'web-search-summary': '网页搜索摘要',
+  'web-fetch-summary': '网页抓取摘要',
+  'skill-catalog-summary': '技能目录摘要',
+  'vision-analyze': '图片分析',
+  'tool-use-summary': '工具调用摘要',
+  'prompt-suggestion-fork': '提示建议',
+  'oa-review-notes': 'OA 评审笔记',
+  'memdir-relevance': '记忆相关性检索',
+  'magic-doc-update': '文档更新',
+  'btw-side-question': '旁问（/btw）',
+  'away-summary': '离开摘要',
+  'skill-improvement': '技能改进建议',
+  'permission-explainer': '权限解释',
+  'mcp-datetime-parse': 'MCP 时间解析',
+  'exec-prompt-hook': 'hook 提示执行',
+  // 权限分类器
+  'yolo-classifier-1stage': '一级判定',
+  'yolo-classifier-stage': '判定',
+}
+
+/**
+ * 节点可读名称：{@code 类别中文名 ·（用途中文名 | 原样 label）}；无 label → 只给类别名。
+ * 类别与用途同义时（如 label 恰为类别名）不重复拼接。
+ */
+const usageNodeName = (category: string, label: string | null) => {
+  const cat = CATEGORY_LABEL[category] ?? category
+  if (!label) return cat
+  const gloss = LABEL_GLOSS[label] ?? label
+  return gloss === cat ? cat : `${cat} · ${gloss}`
+}
+
+/** 质量标志小字（估算/中断/失败 · 仅列出 >0 的项；全 0 → 空串，不渲染那行）。
+ *  这三项决定「这个数能不能当账单」：估算值不可对账、中断/失败的上游可能仍计费。 */
+const usageFlagsText = (r: { estimatedCalls: number; abortedCalls: number; failedCalls: number }) => {
+  const parts: string[] = []
+  if (r.estimatedCalls > 0) parts.push(`估算 ${r.estimatedCalls} 次`)
+  if (r.abortedCalls > 0) parts.push(`中断 ${r.abortedCalls} 次`)
+  if (r.failedCalls > 0) parts.push(`失败 ${r.failedCalls} 次`)
+  return parts.join(' · ')
+}
+
+/** [usage-gateway] 记账侧行文本：{@code ¥1.23 · 13.4k tokens · 8 次模型调用}（+ 估算/中断/失败标志）。
+ *  token 合计 = input + output（cache 两列单列，不并入 —— 并入会双计；口径同统计页）。
+ *  ⛔ {@code calls} 是**模型调用次数**，与 task 事件的「次调用」（工具调用次数）不是同一个量。 */
+const ledgerUsageText = (a: SessionAgentUsage) => {
+  const parts = [`¥${a.costYuan.toFixed(2)}`,
+    `${compactNumber(a.inputTokens + a.outputTokens)} tokens`,
+    `${a.calls} 次模型调用`]
+  const flags = usageFlagsText(a)
+  return flags ? `${parts.join(' · ')} · ${flags}` : parts.join(' · ')
+}
 
 /**
  * F1/S3 · 「统计」标签页内容（GET /api/v1/stats 全量聚合 · 只读展示）
@@ -62,9 +153,29 @@ function StatsSection() {
     )
   }
 
-  const { totals, byDay, byModel } = data
+  // byCategory/byAgent 是后加的维度：老后端不返回 → 空列表（不炸整个统计页）
+  const { totals, byDay, byModel, byCategory = [], byAgent = [] } = data
   const maxDayTokens = byDay.reduce((m, d) => Math.max(m, d.tokenCount), 0)
   const maxModelTokens = byModel.reduce((m, r) => Math.max(m, modelRowTotal(r)), 0)
+  // [usage-gateway] 明细两维度的条形按**金额**取比例（问题是「谁烧钱」而非「谁 token 多」）·
+  //   全 0 金额（未配价）→ max=0 → barPct 返回 0，不显示条（不伪造比例）。
+  const maxCategoryCost = byCategory.reduce((m, r) => Math.max(m, r.costYuan), 0)
+  const maxAgentCost = byAgent.reduce((m, r) => Math.max(m, r.costYuan), 0)
+  // 层级行显示名 = 「类别 · 用途」中文；同类同用途有多个节点时追加序号（1/2/3…）区分
+  //   —— ⛔ 不用 agentId / UUID（对用户无意义）。
+  const agentNameTotals = new Map<string, number>()
+  for (const r of byAgent) {
+    const k = `${r.category}|${r.label ?? ''}`
+    agentNameTotals.set(k, (agentNameTotals.get(k) ?? 0) + 1)
+  }
+  const agentNameSeen = new Map<string, number>()
+  const agentDisplayRows = byAgent.map((r) => {
+    const k = `${r.category}|${r.label ?? ''}`
+    const idx = (agentNameSeen.get(k) ?? 0) + 1
+    agentNameSeen.set(k, idx)
+    const suffix = (agentNameTotals.get(k) ?? 1) > 1 ? `（${idx}）` : ''
+    return { row: r, name: usageNodeName(r.category, r.label) + suffix }
+  })
 
   return (
     <div className="uc-stats">
@@ -124,6 +235,67 @@ function StatsSection() {
                 {r.cacheReadInputTokens > 0 && ` · cache读 ${fmt(r.cacheReadInputTokens)}`}
                 {r.cacheCreationInputTokens > 0 && ` · cache写 ${fmt(r.cacheCreationInputTokens)}`}
               </div>
+            </div>
+          )
+        })}
+      </div>
+
+      {/* [usage-gateway] 按调用类型：**哪类调用烧钱**（llm_usage_calls 每 call 明细聚合 ·
+          条形按金额取比例）。与「按模型」互补：模型维度看不出子代理/压缩/旁路各烧了多少。 */}
+      <div className="uc-section">
+        <div className="uc-section-title">按调用类型</div>
+        {byCategory.length === 0 && <div className="uc-muted">暂无明细数据</div>}
+        {byCategory.map((r) => {
+          const flags = usageFlagsText(r)
+          return (
+            <div key={r.category} className="uc-stats-model">
+              <div className="uc-stats-bar-row">
+                <span className="uc-stats-bar-label uc-stats-model-name" title={r.category}>
+                  {CATEGORY_LABEL[r.category] ?? r.category}
+                </span>
+                <div className="uc-stats-bar">
+                  <div className="uc-stats-bar-track">
+                    <div className="uc-stats-bar-fill" style={{ width: `${barPct(r.costYuan, maxCategoryCost)}%` }} />
+                  </div>
+                  <span className="uc-stats-bar-val">
+                    ¥{r.costYuan.toFixed(2)} · {r.calls} 次 · {fmt(r.inputTokens + r.outputTokens)} tok
+                  </span>
+                </div>
+              </div>
+              {flags && <div className="uc-stats-model-detail">其中 {flags}</div>}
+            </div>
+          )
+        })}
+      </div>
+
+      {/* [usage-gateway] 按代理层级：**谁的花费**（depth 缩进还原父子链 · 后端按 depth 升序返回，
+          父在前）。名称 = 「类别 · 用途」中文（见 usageNodeName；label 是后端自述 slug，用户读不出含义）；
+          同类同用途多个节点加序号（1/2/3…）区分。⛔ 不显示 agentId / UUID —— 对用户无意义。 */}
+      <div className="uc-section">
+        <div className="uc-section-title">按代理层级</div>
+        {byAgent.length === 0 && <div className="uc-muted">暂无明细数据</div>}
+        {agentDisplayRows.map(({ row: r, name }) => {
+          const flags = usageFlagsText(r)
+          return (
+            <div key={r.agentId} className="uc-stats-model">
+              <div className="uc-stats-bar-row">
+                <span
+                  className="uc-stats-bar-label uc-stats-tree-label"
+                  style={{ paddingLeft: r.depth * 10 }}
+                  title={`${CATEGORY_LABEL[r.category] ?? r.category}${r.label ? ` · ${r.label}` : ''}`}
+                >
+                  {name}
+                </span>
+                <div className="uc-stats-bar">
+                  <div className="uc-stats-bar-track">
+                    <div className="uc-stats-bar-fill" style={{ width: `${barPct(r.costYuan, maxAgentCost)}%` }} />
+                  </div>
+                  <span className="uc-stats-bar-val">
+                    ¥{r.costYuan.toFixed(2)} · {r.calls} 次 · {fmt(r.inputTokens + r.outputTokens)} tok
+                  </span>
+                </div>
+              </div>
+              {flags && <div className="uc-stats-model-detail uc-stats-tree-detail">{flags}</div>}
             </div>
           )
         })}
@@ -199,6 +371,57 @@ export function UsageCostModal({
     () => subagentListOfSession(subagentBySession, activeSessionId),
     [subagentBySession, activeSessionId],
   )
+  // [usage-gateway] 记账侧权威用量（GET /sessions/{id}/usage）：子代理行的 token/费用/模型调用次数
+  //   来自明细表（每次 LLM 调用一行），比 task 事件的进度估算更全 —— 失败/中断路径的 task 事件常常
+  //   没有 usage（用户实测表现为「统计不可用」）。老后端无该端点 → 静默回退 task 事件统计。
+  const [sessionUsage, setSessionUsage] = useState<SessionUsageResponse | null>(null)
+  // 任务注册表（内存态 · /api/v1/tasks?sessionId=）：task_id → 子代理名称（description，与任务面板/
+  //   子代理卡同一口径）——仅记账可得、本端无实时身份的行也要显示**子代理名称**而不是类型名。
+  const [sessionTasks, setSessionTasks] = useState<BackgroundTaskDto[]>([])
+  useEffect(() => {
+    let cancelled = false
+    setSessionUsage(null)
+    setSessionTasks([])
+    sessionApi.usage(activeSessionId)
+      .then((u) => { if (!cancelled) setSessionUsage(u) })
+      .catch(() => { /* 静默：无该端点/失败 → 行内回退 task 事件统计（不阻塞弹窗） */ })
+    tasksApi.list(activeSessionId)
+      .then((t) => { if (!cancelled) setSessionTasks(t) })
+      .catch(() => { /* 静默：拿不到名称 → 回退「类别 · 用途」 */ })
+    return () => { cancelled = true }
+  }, [activeSessionId])
+
+  /** task_id → 子代理名称（任务注册表的 description）。 */
+  const taskNameByTaskId = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const t of sessionTasks) {
+      if (t.description) map.set(t.id, t.description)
+    }
+    return map
+  }, [sessionTasks])
+
+  // 关联表：task_id → 记账节点（键是运行期产生的动态 id ⇒ 用 Map，非静态字面量表；
+  //   后端已把 agentId 换算成 task_id，前端不解析 agentId 格式）
+  const usageByTaskId = useMemo(() => {
+    const map = new Map<string, SessionAgentUsage>()
+    for (const a of sessionUsage?.agents ?? []) {
+      if (a.taskId) map.set(a.taskId, a)
+    }
+    return map
+  }, [sessionUsage])
+
+  // 只有记账、没有实时身份的子代理节点（主 agent 归「当前会话」块）：刷新/换端后 subagentStore
+  //   （localStorage）可能没有这些行，但记账数据仍在 —— 照常列出。
+  //   判据 = `taskId != null`（后端只在「真 agent 任务」上给出该键：子代理/fork 的 a+16hex ↔ 任务注册表
+  //   task_id），或归类本就是子代理/队友。⛔ 不可用 category 单独判定：节点类别取该 agent **首行**，
+  //   而子代理的首行可能是它自己的旁路调用（实测：归一后子代理节点首行是 skill-catalog-summary）
+  //   ⇒ 只按类别过滤会把真子代理漏掉；同理会话根自身发起的旁路（无 taskId、类别 SIDE_CALL）不得列入。
+  const ledgerOnlyAgents = useMemo(() => {
+    const known = new Set(subagents.map((s) => s.taskId).filter((t): t is string => !!t))
+    return (sessionUsage?.agents ?? []).filter((a) => a.depth >= 1
+      && (a.taskId != null || a.category === 'SUBAGENT' || a.category === 'TEAMMATE')
+      && (!a.taskId || !known.has(a.taskId)))
+  }, [sessionUsage, subagents])
 
   return (
     <div className="uc-backdrop" onClick={onClose}>
@@ -319,13 +542,19 @@ export function UsageCostModal({
             )}
           </div>
 
-          {/* [D2] 子代理（本会话）· 只新增区块：每行 = 名字 · 状态 · tokens · 调用次数 · 时长；
-              失败行附失败原因小字（无原因文本时不渲染那行）。数据源 = /topic/tasks 的 task 事件 usage。 */}
+          {/* [D2] 子代理（本会话）· 每行 = 名字 · 状态 · tokens · 调用次数 · 时长；
+              失败行附失败原因小字（无原因文本时不渲染那行）。数据源 = /topic/tasks 的 task 事件 usage。
+              [usage-gateway] 记账侧权威值优先：按 taskId 关联 GET /sessions/{id}/usage 的 agent 节点，
+              有则用「¥ · tokens · 次模型调用」替代 task 事件的进度估算（后者失败/中断路径常缺数据，
+              实测表现为「统计不可用」）；无关联 → 照旧回退 task 事件统计。 */}
           <div className="uc-section">
             <div className="uc-section-title">子代理（本会话）</div>
-            {subagents.length === 0 && <div className="uc-muted">暂无子代理记录</div>}
+            {subagents.length === 0 && ledgerOnlyAgents.length === 0 && (
+              <div className="uc-muted">暂无子代理记录</div>
+            )}
             {subagents.map((sub) => {
-              const stats = formatSubagentStat(sub.usage)
+              const node = sub.taskId ? usageByTaskId.get(sub.taskId) : undefined
+              const stats = node ? ledgerUsageText(node) : formatSubagentStat(sub.usage)
               const reason = failureReasonOf(sub)
               return (
                 <div key={sub.taskId ?? sub.name} className="uc-subagent-item">
@@ -336,6 +565,23 @@ export function UsageCostModal({
                     </span>
                   </div>
                   {reason && <div className="uc-subagent-reason">失败原因：{reason}</div>}
+                </div>
+              )
+            })}
+            {/* 仅记账可得的子代理节点（本端没有实时身份/事件）：仍列出用量，名称走 usageNodeName
+                （类别 · 用途中文），⛔ 不伪造「运行中/已完成」—— 本端不知道它的实时状态。 */}
+            {ledgerOnlyAgents.map((a) => {
+              // 名称优先取任务注册表的 description（= 子代理名称，与其他界面同口径）；
+              //   任务已出注册表（重启/淘汰）→ 回退「类别 · 用途」中文，仍可读懂是什么
+              const taskName = a.taskId ? taskNameByTaskId.get(a.taskId) : undefined
+              return (
+                <div key={a.agentId} className="uc-subagent-item">
+                  <div className="uc-row">
+                    <span className="uc-name" title={taskName ?? a.label ?? a.category}>
+                      {taskName ? `@${taskName}` : usageNodeName(a.category, a.label)}
+                    </span>
+                    <span className="uc-tokens">{ledgerUsageText(a)}</span>
+                  </div>
                 </div>
               )
             })}

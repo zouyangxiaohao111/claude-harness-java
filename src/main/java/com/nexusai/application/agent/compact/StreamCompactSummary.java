@@ -16,14 +16,21 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.toolsearch.ToolSearchService;
+import com.nexusai.application.agent.cost.SessionUsageAccountingRegistry;
+import com.nexusai.application.agent.loop.ModelRequest;
 import com.nexusai.infra.llm.AssistantMessage;
+import com.nexusai.infra.llm.LlmInvocationGateway;
 import com.nexusai.infra.llm.LlmProvider;
+import com.nexusai.infra.llm.LlmUsageRecorder;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.UsageAttribution;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -352,6 +359,25 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
     /** [RES-C3] provider 配置解析暴露 · 等价源（partial 组装链 gate 求值复用本 bean 同源 supplier，避免第二份解析逻辑）。 */
     public Supplier<ProviderConfig> configSupplier() {
         return configSupplier;
+    }
+
+    /**
+     * [usage-gateway] 会话账本注册表（可选）· 压缩摘要两次 LLM 调用（fork 缓存共享经主循环
+     * {@code queryLoop}、流式 fallback 经本类 {@code streamOnce}）的用量都必须经请求网关
+     * {@link LlmInvocationGateway} 记入同一会话账目 —— 用户裁定：压缩必须走统一记账流程，
+     * 旧通道 {@code LlmAgentLoop.accumulateCompactionSessionCost} 已删除（不允许两套）。
+     *
+     * <p>注入：{@code ToolRegistrationConfig.streamCompactSummary} bean 构造点经
+     * {@link #setUsageLedgerRegistry}（与 {@code setForkedQuery / setTelemetry} 同款仓库范式）；
+     * Spring 亦经 {@code @Autowired(required=false)} 字段注入（本 bean 由 @Bean 方法产出，仍是
+     * 容器托管实例）。未注入（测试直构 / 未接线）→ 网关不记账，行为等价改造前的「未接线」语义。
+     */
+    @Autowired(required = false)
+    private SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /** [usage-gateway] setter 注入口（仓库范式：测试 / 构造点显式注入，不用 ThreadLocal）。 */
+    public void setUsageLedgerRegistry(SessionUsageAccountingRegistry registry) {
+        this.usageLedgerRegistry = registry;
     }
 
     /**
@@ -939,53 +965,83 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
             useGlobalCacheScope && hasMcpTool(tools));
 
         try {
-            if (provider instanceof com.nexusai.infra.llm.AnthropicSdkProvider anthropic
-                    && maxOutputTokensOverride != null) {
-                // IMP-01 L4: AnthropicSdkProvider 支持 maxOutputTokensOverride 重载
-                // (对齐 CC queryModelWithStreaming maxOutputTokensOverride · [DEC-RV-07] SDK 实现)
-                anthropic.stream(
-                    config, model, blocks, history, tools, maxOutputTokensOverride, null, null, null,
-                    chunkHandler,
-                    onAssistant,
-                    toolCall -> { /* canUseTool=deny · 摘要生产不允许工具调用 */ },
-                    reasoning -> { /* 摘要生产关闭 thinking */ },
-                    () -> { /* onStreamingFallback · Java provider 内部 fallback 通知 */ },
-                    abortController,
-                    onError,
-                    onComplete,
-                    // [C] 流式 fallback（非 fork）不设 skipCacheWrite · CC compact.ts:1194-1212
-                    //   注释明示 "The streaming fallback path (below) can safely set
-                    //   maxOutputTokensOverride since it doesn't share cache with the main thread"
-                    //   —— skipCacheWrite 只在 fork 分支（compact.ts:1229）设置；本路径对齐传 null
-                    //   （不设 = false = marker 落最后一条）。
-                    null,
-                    // [S1-T7] agent 归因上下文 = **本方法形参 ctx 携带的 ToolUseContext 显式字段**
-                    //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
-                    //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
-                    //   等价 CC agentContext.ts:170 无 invokingRequestId。
-                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null),
-                    // [流空闲看门狗] compact 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
-                    com.nexusai.infra.llm.StreamIdleControl.NONE);
+            // ════════════ [usage-gateway] 压缩摘要 LLM 调用收口到请求网关 ════════════
+            // 用户裁定：压缩的用量入账必须走统一流程（网关 sink → 结算 → 账本 + 每 call 落表，
+            // 四类结局 + T3 估算全覆盖），旧通道 LlmAgentLoop.accumulateCompactionSessionCost
+            // 已删除（不允许两套）。本方法仍产出 AssistantMessage 供调用方取摘要文本与
+            // TokenUsage（服务遥测 / boundary 行等展示口径），但**不再**据此入账 ——
+            // 入账的唯一来源 = 网关记账（见下方 usageAttribution / usageRecorder 装配）。
+            //
+            // Anthropic 专属重载分派语义保留：原实现仅「AnthropicSdkProvider 且
+            // maxOutputTokensOverride 非 null」才传覆盖值，其余分支传 null（本仓
+            // AnthropicSdkProvider 与 LlmProvider 共用同一 19 参 blocks 重载，故以「是否传覆盖值」
+            // 表达同一分派；网关 streamTo 按 thinkingConfig 分派，本路径 thinkingConfig=null →
+            // 命中 19 参 blocks 重载，覆盖值原样透传）。
+            Integer effectiveMaxOutputTokensOverride =
+                (provider instanceof com.nexusai.infra.llm.AnthropicSdkProvider
+                        && maxOutputTokensOverride != null)
+                    ? maxOutputTokensOverride
+                    : null;
+            // 归属：压缩 side call（category=COMPACT，depth 1，父 = 会话根 = sessionId）。
+            // sessionId 取本方法形参 ctx 携带的 ToolUseContext（拿不到 → unknown(null)，
+            // 不伪造层级 —— 仓库铁律：会话态一律显式传参）。
+            String compactSessionId = ctx.getToolUseContext() != null
+                ? ctx.getToolUseContext().sessionId() : null;
+            UsageAttribution usageAttribution;
+            if (compactSessionId == null || compactSessionId.isBlank()) {
+                usageAttribution = UsageAttribution.unknown(null);
             } else {
-                provider.stream(
-                    config, model, blocks, history, tools, null, null, null, null,
-                    chunkHandler,
-                    onAssistant,
-                    toolCall -> { /* canUseTool=deny · 摘要生产不允许工具调用 */ },
-                    reasoning -> { /* 摘要生产关闭 thinking */ },
-                    () -> { /* onStreamingFallback · Java provider 内部 fallback 通知 */ },
-                    abortController,
-                    onError,
-                    onComplete,
-                    null, // [C] 同上：流式 fallback 非 fork → 不设 skipCacheWrite（CC compact.ts:1229 仅 fork 分支）
-                    // [S1-T7] agent 归因上下文 = **本方法形参 ctx 携带的 ToolUseContext 显式字段**
-                    //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
-                    //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
-                    //   等价 CC agentContext.ts:170 无 invokingRequestId。
-                    (ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null),
-                    // [流空闲看门狗] fork/compact 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
-                    com.nexusai.infra.llm.StreamIdleControl.NONE);
+                usageAttribution = new UsageAttribution(
+                    compactSessionId, compactSessionId, UsageCategory.COMPACT,
+                    compactSessionId, 1, "compact-streaming-summary");
             }
+            // 记账器 = 会话账本（未注入 registry（测试直构 / 未接线）→ null → 网关不记账，
+            // 等价改造前「未接线」语义）。
+            LlmUsageRecorder usageRecorder = usageLedgerRegistry != null
+                ? usageLedgerRegistry.forSession(compactSessionId) : null;
+            // providerType（记账维度）：优先 ctx 已盖章值（AgentLoopContext.toolExecContext 经
+            // ModelConfigResolver.resolveProviderType 解析），缺失则按 provider 实例归一
+            // （工厂路由 anthropic → AnthropicSdkProvider，其余 → 非 anthropic）。
+            String providerType = ctx.getToolUseContext() != null
+                ? ctx.getToolUseContext().effectiveProviderType() : null;
+            if (providerType == null || providerType.isBlank()) {
+                providerType = provider instanceof com.nexusai.infra.llm.AnthropicSdkProvider
+                    ? "anthropic" : "openai_sdk";
+            }
+            ModelRequest request = new ModelRequest(
+                config, model, blocks,
+                QuerySource.COMPACT.canonical(),          // querySource = "compact"（CC compact.ts:1192 同源）
+                history, tools,
+                effectiveMaxOutputTokensOverride,
+                null,                                     // taskBudget · 摘要生产不注入
+                null,                                     // effortValue · 摘要生产不注入
+                null,                                     // thinkingConfig · 摘要生产关闭 thinking
+                chunkHandler,
+                onAssistant,
+                toolCall -> { /* canUseTool=deny · 摘要生产不允许工具调用 */ },
+                reasoning -> { /* 摘要生产关闭 thinking */ },
+                () -> { /* onStreamingFallback · Java provider 内部 fallback 通知 */ },
+                onError,
+                onComplete,
+                abortController,
+                // [C] 流式 fallback（非 fork）不设 skipCacheWrite · CC compact.ts:1194-1212
+                //   注释明示 "The streaming fallback path (below) can safely set
+                //   maxOutputTokensOverride since it doesn't share cache with the main thread"
+                //   —— skipCacheWrite 只在 fork 分支（compact.ts:1229）设置；本路径对齐传 null
+                //   （不设 = false = marker 落最后一条）。
+                null,
+                // [S1-T7] agent 归因上下文 = **本方法形参 ctx 携带的 ToolUseContext 显式字段**
+                //   （原读 ambient 归因上下文（宿 ThreadLocal，已删载体）；两套载体收口到
+                //   TUC 单一来源）。ctx.getToolUseContext() 为 null（测试/手工构造）时取 null，
+                //   等价 CC agentContext.ts:170 无 invokingRequestId。
+                ctx.getToolUseContext() != null ? ctx.getToolUseContext().agentContext() : null,
+                usageAttribution,
+                usageRecorder,
+                // [流空闲看门狗 · 合并] compact 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
+                com.nexusai.infra.llm.StreamIdleControl.NONE);
+            // 网关内部：建 sink → streamTo（19/20 参 blocks 重载按 thinkingConfig 分派）→
+            //   finally 结算 → 记账器落账（含中断 / 失败 / 回退四类结局）。原两分支在此收口为一次调用。
+            LlmInvocationGateway.streamWith(provider, model, providerType, request);
             // [IMP2-15 △-15] CC 无 300s 级硬超时（compact.ts 全程：靠 abortController + SDK
             //   状态，流一直持续则等待）→ future.get() 无超时等待；取消路径仍经
             //   provider abort → CancellationException → INCOMPLETE_RESPONSE。

@@ -12,7 +12,7 @@ import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * {@link CompactSettingsResolver#streamIdleTimeoutMs()} 单测（V78 列 · 流空闲看门狗阈值实时读源）。
+ * {@link CompactSettingsResolver#streamIdleTimeoutMs()} 单测（V100 列 · 流空闲看门狗阈值实时读源）。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：本方法与既有 {@code gapThresholdMinutes()} 同范式
  * ——<b>只做「DB 有值（>0）原样透出」</b>，不做下限钳制（300000 下限在消费点
@@ -22,7 +22,7 @@ import static org.mockito.Mockito.when;
  * <p>钉死三条：①null/非正 → null（未配置）；②正数原样透出（含低于 300000 的值——钳制不在此层，
  * 消费点测试负责该边界）；③不缓存（每次调用都读 DB，前端 PUT 后下一轮即生效）。
  */
-@DisplayName("[V78] CompactSettingsResolver.streamIdleTimeoutMs 实时读源")
+@DisplayName("[V100] CompactSettingsResolver.streamIdleTimeoutMs 实时读源")
 class CompactSettingsResolverStreamIdleTest {
 
     private static final int SINGLETON_ID = 1;

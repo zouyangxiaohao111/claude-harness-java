@@ -13,7 +13,7 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * {@code settings.stream_idle_timeout_ms}（V78）· SettingsDto 往返契约 + null-skip 语义。
+ * {@code settings.stream_idle_timeout_ms}（V100）· SettingsDto 往返契约 + null-skip 语义。
  *
  * <p><b>WHY（CLAUDE.md 规则九 · 测试验证意图）</b>：该字段是流空闲看门狗阈值的「前端可配」入口
  * （用户 10-10 追加要求）。三处同步（{@code SettingsDto} 分量 / {@code SettingsService.toDto} 透出 /
@@ -27,7 +27,7 @@ import static org.mockito.Mockito.when;
  * {@code @RequestBody SettingsDto}）；裸 {@code ObjectMapper} 的 FAIL_ON_UNKNOWN_PROPERTIES 默认 true，
  * 字段一旦被删就抛，比 Spring 的静默丢弃响亮。
  */
-@DisplayName("[V78] settings.stream_idle_timeout_ms 往返契约（DTO/透出/merge 三处同步）")
+@DisplayName("[V100] settings.stream_idle_timeout_ms 往返契约（DTO/透出/merge 三处同步）")
 class SettingsStreamIdleTimeoutRoundTripTest {
 
     private static final int SINGLETON_ID = 1;

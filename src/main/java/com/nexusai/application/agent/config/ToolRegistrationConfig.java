@@ -163,6 +163,18 @@ public class ToolRegistrationConfig {
     private com.nexusai.application.agent.skill.SkillDiscoveryPrefetch skillDiscoveryPrefetch;
 
     /**
+     * [usage-gateway] 会话账本注册表 · {@code subagentExecutor @Bean} 装配时经
+     * {@code executor.setUsageLedgerRegistry(本字段)} 透传——本单例承载队友（AutonomousAgentLoop
+     * executeStreaming）/ fork 技能（SkillToolImpl.executeForkedSkill）/ workflow worker 三条路径，
+     * 其 LLM 用量必须并入父会话账目的子节点。
+     *
+     * <p>{@code @Autowired(required=false)}：直构测试 / 无 bean 场景 → null → 透传 null →
+     * SubagentExecutor 不装配归属（请求网关跳过记账，行为等价改造前）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /**
      * [C-30] EXPERIMENTAL_SKILL_SEARCH feature flag · 默认全关（对齐 CC flag-off → DiscoverSkillsTool 不注册）。
      *
      * <p>required=false + 默认 {@code ALL_DISABLED}：生产无 FeatureFlags bean 注入时 flag 关闭，
@@ -195,21 +207,6 @@ public class ToolRegistrationConfig {
      */
     @Autowired(required = false)
     private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
-
-    /**
-     * [compact-cost] 模型计费纯函数（@Component）· manual {@code /compact} 压缩调用 usage 折算
-     * 会话成本时使用（{@code LlmAgentLoop.accumulateCompactionSessionCost} 的 calculator 形参）。
-     *
-     * <p>WHY: 压缩那次 LLM 调用的 usage 必须并入会话成本/用量合计（CC {@code claude.ts:2361
-     * costUSD += addToTotalSessionCost(costUSDForPart, usage, options.model)}）——auto / reactive
-     * 两路已接（{@code LlmAgentLoop:5361/6969} 经 {@code ctx.modelCostCalculator()}），manual
-     * {@code /compact} 此前漏接 → 真机漏算。{@code @Autowired(required=false)} 字段注入（镜像
-     * {@link #settingsMapper} / {@link #planProvider} 既有模式，<b>不动构造器签名</b>——直构测试
-     * 逐位不变）；null（直构测试 / 无 bean）→ 仅累计 input/output tokens，cost/按模型桶跳过
-     * （{@code accumulateCompactionSessionCost} 内既有 null 语义，零 NPE）。
-     */
-    @Autowired(required = false)
-    private com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator;
 
     /**
      * [monitor-rework] MONITOR_MCP 流式监控执行器（@Component）· MonitorTool 生产接线注入。
@@ -757,6 +754,9 @@ public class ToolRegistrationConfig {
         // [A5-2] 协议分派 mapper 注入（null 安全，SubagentExecutor 内回落 anthropic 语义）
         executor.setModelMapper(modelMapper);
         executor.setProviderMapper(providerMapper);
+        // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全（未注入 →
+        //   SubagentExecutor 不装配归属，等价改造前）
+        executor.setUsageLedgerRegistry(usageLedgerRegistry);
         if (log.isDebugEnabled()) {
             log.debug("subagentExecutor fallbackSystemPrompt ← AgentToolSection.get() (非 fork 变体, "
                     + "CC prompts.ts:319; 仅 agent 自身 prompt 空白时兜底, fork path 由 forkParentSystemPrompt 覆盖)");
@@ -1117,7 +1117,9 @@ public class ToolRegistrationConfig {
             //   modelSupplier）→ 一行回退 = 把下方 setForkedQuery 换回 productionForkedQuery。
             com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopForkedQuery,
             com.nexusai.application.agent.telemetry.Telemetry telemetry,
-            com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver) {
+            com.nexusai.application.agent.compact.CompactSettingsResolver settingsResolver,
+            @Autowired(required = false)
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry) {
 
         ForkSuppliers suppliers = buildForkSuppliers(
             llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
@@ -1141,6 +1143,10 @@ public class ToolRegistrationConfig {
         // [E-1b-2] fork 生产 seam = 主循环 queryLoop（QueryLoopForkedQuery）。回退：改回
         //   productionForkedQuery（旧实现与 seam 均保留）。
         summary.setForkedQuery(queryLoopForkedQuery);
+        // [usage-gateway] 压缩摘要 LLM 调用收口到请求网关：注入会话账本注册表，使压缩（fork 缓存
+        //   共享 + 流式 fallback 两路）的用量经网关记入同一会话账目（旧通道
+        //   LlmAgentLoop.accumulateCompactionSessionCost 已删除，不允许两套）。
+        summary.setUsageLedgerRegistry(usageLedgerRegistry);
         // [IMP-A3-2 SCS-15/17 装配缺口修复 · MG-1] CC logEvent 遥测注入（compact.ts:1214/1235/1242/1364/1379
         //   tengu_compact_cache_sharing_success/fallback/streaming_retry/failed；null 安全，Spring @Component
         //   自动注入）。对齐 MicroCompactor.setTelemetry 先例（:833）——此前未调用 → 静态槽位恒 null →
@@ -1944,17 +1950,25 @@ public class ToolRegistrationConfig {
             @Autowired(required = false) com.nexusai.repository.provider.mapper.ProviderMapper providerMapper,
             @Autowired(required = false) com.nexusai.domain.provider.ProviderService providerService,
             @Autowired(required = false) com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage,
+            @Autowired(required = false)
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry,
             @org.springframework.context.annotation.Lazy
             com.nexusai.application.agent.loop.AgentLoopContextFactory contextFactory) {
         ForkSuppliers suppliers = buildForkSuppliers(
             llmProviderFactory, modelMapper, providerMapper, providerService, configStorage);
         log.info("E-1b-2: 注册 QueryLoopForkedQuery（fork 走主循环 queryLoop · 4 调用方 6 入口 seam "
             + "切换，ProductionForkedQuery 保留可一行回退）");
-        return new com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery(
-            sessionForkModelRoute(llmProviderFactory, modelMapper, providerMapper, providerService),
-            suppliers.modelSupplier(),
-            suppliers.configSupplier(),
-            contextFactory);
+        com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery forked =
+            new com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery(
+                sessionForkModelRoute(llmProviderFactory, modelMapper, providerMapper, providerService),
+                suppliers.modelSupplier(),
+                suppliers.configSupplier(),
+                contextFactory);
+        // [usage-gateway] fork（压缩 fork / 记忆提取 / auto-dream）的用量必须并入同一会话账目：
+        //   注入会话账本注册表，fork 隔离 AgentState 在 run() 内装配归属（COMPACT / "compact-fork"）
+        //   + 会话账本，使 fork 的 LLM 调用经请求网关记入同一会话账目。
+        forked.setUsageLedgerRegistry(usageLedgerRegistry);
+        return forked;
     }
 
     /**
@@ -2641,20 +2655,11 @@ public class ToolRegistrationConfig {
             sessionId, agentId, compactAbort);
         try {
             CompactCommand.CompactCommandResult result = CompactCommand.call(args, ctx);
-            // [compact-cost] manual /compact 那次 LLM 调用的 usage → 会话成本/用量合计
-            //   （对齐 CC claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage,
-            //   options.model) → cost-tracker.ts:250-276 → state.ts:551-558）。auto / reactive
-            //   两路已接（LlmAgentLoop:5361/6969），manual 此前漏接 → 真机漏算。
-            //   模型 = resolveManualCompactModel(state)：与上方 buildCompactCommandContext 喂给
-            //   CompactConversationContext 的模型<b>同一求值</b>（真正执行本次摘要调用的模型，
-            //   价格按模型/provider 分派）——用会话主模型顶替会算错金额。
+            // [usage-gateway] manual /compact 那次 LLM 调用的 usage 现经请求网关入账：压缩摘要
+            //   （fork 缓存共享 / 流式 fallback 两路）在 StreamCompactSummary 内以真实 sessionId
+            //   盖章归属（UsageCategory.COMPACT）→ 网关 sink → 会话账本（SessionUsageLedger）。
+            //   旧通道 LlmAgentLoop.accumulateCompactionSessionCost 已删（用户裁定：不允许两套）。
             //   ✗ 不进 runUsage（压缩是 side call，CC result.usage 不含它）。
-            //   位置 = call 成功后、写回前（仅成功路径；call 抛异常 → catch 分支，不计）。
-            //   compactionUsage 为 null（SM 优先路径无 LLM 调用）→ accumulateCompactionSessionCost
-            //   内 null 守卫生效 → 安全 no-op。
-            com.nexusai.application.agent.LlmAgentLoop.accumulateCompactionSessionCost(
-                state, resolveManualCompactModel(state),
-                result.compactionResult().compactionUsage(), modelCostCalculator);
             log.info("[R1] /compact 压缩成功: session={} displayText={}",
                 sessionId, result.displayText());
             // ── 4. 结果写回会话（落库 + 内存替换）· 对齐 CC processSlashCommand.tsx:895-916 ──

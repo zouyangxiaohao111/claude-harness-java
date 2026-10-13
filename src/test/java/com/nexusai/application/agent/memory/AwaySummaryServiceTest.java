@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.memory;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.permission.hook.SkillImprovementHook;
 import com.nexusai.infra.llm.AssistantMessage;
@@ -107,7 +108,8 @@ class AwaySummaryServiceTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
@@ -125,7 +127,23 @@ class AwaySummaryServiceTest {
     }
 
     private static AwaySummaryService service(LlmProvider provider, SessionMemoryService sms) {
-        return new AwaySummaryService(provider, CFG, sms, () -> SMALL_FAST);
+        AwaySummaryService s = new AwaySummaryService(provider, CFG, sms, () -> SMALL_FAST);
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入「委托桩」把 chat(...) 原样转发到
+        //   本用例的 provider 桩，故既有桩语义（异常/取消/MockLlmProvider 反射）与断言全部保留。
+        org.springframework.test.util.ReflectionTestUtils.setField(s, "sideCallClient", sideCallClient(provider));
+        return s;
+    }
+
+    /** [usage-gateway] 委托型 LlmSideCallClient：chat(...) 转发给给定 provider 桩（等价改造前直呼）。 */
+    private static LlmSideCallClient sideCallClient(LlmProvider provider) {
+        return new LlmSideCallClient() {
+            @Override
+            public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                               String userMessage, LlmProvider.ChatRequestOptions options,
+                               LlmSideCallClient.SideCallUsage usage) {
+                return provider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+            }
+        };
     }
 
     private static String join(AwaySummaryService s, List<ChatMessageDto> msgs, AbortController signal) {
@@ -174,7 +192,8 @@ class AwaySummaryServiceTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {

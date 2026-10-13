@@ -700,6 +700,18 @@ public class SubagentExecutor {
     private com.nexusai.repository.settings.mapper.SettingsMapper settingsMapper;
 
     /**
+     * [usage-gateway] 会话账本注册表 · 子代理 run 启动时按 sessionId 取账本并把归属挂在子
+     * {@link AgentState} 上，使子代理（含嵌套子代理）的每次 LLM 调用都记入**父会话同一账目**的子节点
+     * （此前子代理用隔离 AgentState 且不落库 ⇒ 用量丢失）。
+     *
+     * <p>与 {@code LlmAgentLoop:1545 usageLedgerRegistry} 同款（主 agent 在 doRun 按同一注册表取账本）。
+     * {@code @Autowired(required=false)}：测试直构（{@code new SubagentExecutor(...)}）不注入 →
+     * 回落 null → 不装配归属（state 无账本 → 请求网关跳过记账，行为等价改造前，不 NPE）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /**
      * s18 P1-5/6: Worktree 服务 — 用于 sub-agent 隔离 (isolation=worktree).
      * 可选注入, 未注入时回退到旧 user.dir stub 行为.
      */
@@ -1097,6 +1109,19 @@ public class SubagentExecutor {
      */
     public void setFeatureFlags(com.nexusai.application.agent.loop.FeatureFlags featureFlags) {
         this.featureFlags = featureFlags;
+    }
+
+    /**
+     * [usage-gateway] 注入会话账本注册表 · 由装配方（{@code SubagentTool} 4 构造站点 /
+     * {@code ToolRegistrationConfig.subagentExecutor @Bean}）注入；测试可手动调用（仓库范式：
+     * 注入口用 setter，构造器不变）。未注入（null）→ 子代理不装配归属/账本
+     * （请求网关跳过记账，行为等价改造前）。
+     *
+     * @param registry 会话账本注册表（同会话所有 agent 共享同一账本实例）
+     */
+    public void setUsageLedgerRegistry(
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry registry) {
+        this.usageLedgerRegistry = registry;
     }
 
     /**
@@ -2526,7 +2551,9 @@ public class SubagentExecutor {
             llmProviderFactory, effectiveProviderConfig(effectiveModel), effectiveModel,
             progressTracker, sdkEventQueue,
             // [S1-T7] 本子代理的归因上下文（Step 19.8 之前已构造 · 见上方上提块）。
-            agentContext);
+            agentContext,
+            // [usage-gateway] 账本注册表透传（本方法为实例上下文，可直接读本实例字段）
+            this.usageLedgerRegistry);
         // ── Step 20: query 主循环（内联，不委托 LlmAgentLoop.run）──
         // [批 2 · B 类清理] 原此处为
         //   {@code captureCurrentProjectRoot() + setCurrentProjectRoot(同一个值)} 自赋值空转
@@ -4432,7 +4459,12 @@ public class SubagentExecutor {
             String modelName,
             AgentProgressTracker progressTracker,
             SdkEventQueue sdkEventQueue,
-            com.nexusai.application.agent.subagent.AgentContext agentContext) {
+            com.nexusai.application.agent.subagent.AgentContext agentContext,
+            // [usage-gateway] 会话账本注册表（可 null = 不记账）· 逐级显式传递到 SummarySummarizerImpl，
+            //   使「子代理周期摘要」这次非流式旁路调用的用量记入同一会话账目（此前完全不计费）。
+            //   WHY 作为形参而非读实例字段：本方法是 static seam（Pattern #14，单测直接调用），
+            //   实例字段在静态上下文不可达（用户铁律：不用 ThreadLocal 绕）。
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry) {
         if (summaryService == null || coordinatorMode == null) {
             return null;
         }
@@ -4463,6 +4495,11 @@ public class SubagentExecutor {
         // CC agentSummary.ts:46 startAgentSummarization + :68 readTranscript 用同一 sessionDir/sessionId
         SummarySummarizer summarizer = new SummarySummarizerImpl(
             sessionDir, sessionId, llmProviderFactory, providerConfig, modelName);
+        // [usage-gateway] 摘要调用（非流式旁路）也要记账：把会话账本注册表交给摘要器，
+        //   使其内部经请求网关记账（未装配 → 不记账，行为等价改造前）。
+        if (summarizer instanceof SummarySummarizerImpl impl) {
+            impl.setUsageLedgerRegistry(usageLedgerRegistry);
+        }
         // [RF-2 ①] updateCallback 由 no-op → AgentProgress 通道 · 对齐 CC updateAgentSummary
         //   （LocalAgentTask.tsx:359-407）：写入 progress.summary + 按 sdk 门发射 task_progress。
         AgentSummaryHandle handle = summaryService.start(
@@ -4668,6 +4705,60 @@ public class SubagentExecutor {
     }
 
     /**
+     * [usage-gateway] 解析子代理的记账归属 = 父节点派生的下一级 {@code child(子 agentId, SUBAGENT, label)}。
+     *
+     * <p><b>用户裁定</b>：子代理（含经它衍生的嵌套子代理）的 LLM 用量必须并入<b>父会话同一账目</b>的
+     * 子节点；归属用父节点派生以保留层级（session → 主 agent(0) → 子代理(1) → 嵌套子代理(2)…），
+     * 账本按此树聚合「费用与 token 用量的层级信息」。
+     *
+     * <p>父归属解析优先级（父节点键 = 该 agent 在账本树中的节点 id = 其 agentId 渲染）：
+     * <ol>
+     *   <li><b>发起方（spawn 上下文）节点</b>：{@code spawningTuc.agentId()} 非 null ⇒ 本子代理是由
+     *       <b>某个子代理</b>再 spawn（嵌套）⇒ 其节点键 = 父代理的 a+16hex（父代理自己的
+     *       runSubagentQueryLoop 已按同一渲染注册）⇒ 嵌套子代理拿到<b>真实 depth</b>。
+     *       （主 agent 发起时该 TUC 的 agentId 恒 null ⇒ 本候选跳过。）</li>
+     *   <li><b>本 agent 自身节点已存在</b>（resume 续跑复用原 agentId）⇒ 复用该节点归属：层级/父链
+     *       保持，且与账本 {@code attach} 的 {@code computeIfAbsent} 语义一致（不重开节点、不改树）。</li>
+     *   <li><b>会话根节点</b> = {@code UsageAttribution.top(sessionId, sessionId, MAIN, null)}
+     *       （与 {@code LlmAgentLoop.doRun} 主 agent 装配逐字一致）。</li>
+     *   <li><b>无会话</b>（null / 空白 / {@code SessionKeys.NO_SESSION} 哨兵）⇒
+     *       {@code UsageAttribution.unknown(sessionId)}，不伪造层级。</li>
+     * </ol>
+     *
+     * @param ledger          本会话账本（{@code registry.forSession(sessionId)} 产物）
+     * @param spawningTuc     发起方（spawn）TUC（构造器级 {@code parentToolUseContext}；null = standalone）
+     * @param childAgentId    子 agentId 字符串（本类既有渲染：a+16hex 优先，退化到 UUID 串）
+     * @param subagentLabel   可读标签（{@code subagentName}；拿不到则 null）
+     * @param sessionId       子代理归属会话（父会话继承值 / 无会话哨兵）
+     * @return 子归属（父归属派生；账本节点键 = {@link com.nexusai.infra.llm.UsageAttribution#nodeKey()}）
+     */
+    static com.nexusai.infra.llm.UsageAttribution subagentUsageAttribution(
+            com.nexusai.application.agent.cost.SessionUsageLedger ledger,
+            ToolUseContext spawningTuc,
+            String childAgentId,
+            String subagentLabel,
+            String sessionId) {
+        com.nexusai.infra.llm.UsageAttribution parentAttribution = null;
+        if (spawningTuc != null && spawningTuc.agentId() != null) {
+            parentAttribution = ledger.attributionOf(
+                AgentContext.unpackAgentId(spawningTuc.agentId()));
+        }
+        if (parentAttribution == null && childAgentId != null) {
+            parentAttribution = ledger.attributionOf(childAgentId);
+        }
+        if (parentAttribution == null) {
+            boolean noSession = sessionId == null || sessionId.isBlank()
+                || com.nexusai.common.SessionKeys.isNoSession(sessionId);
+            parentAttribution = noSession
+                ? com.nexusai.infra.llm.UsageAttribution.unknown(sessionId)
+                : com.nexusai.infra.llm.UsageAttribution.top(sessionId, sessionId,
+                    com.nexusai.infra.llm.UsageCategory.MAIN, null);
+        }
+        return parentAttribution.child(childAgentId,
+            com.nexusai.infra.llm.UsageCategory.SUBAGENT, subagentLabel);
+    }
+
+    /**
      * 子 Agent 查询循环 · [H7-arch Phase 2] 改调 {@link LlmAgentLoop#queryLoop}（单一循环源）。
      *
      * <p>对齐 CC {@code runAgent.ts:748}：{@code for await (const message of query({...}))} -- subagent
@@ -4735,6 +4826,33 @@ public class SubagentExecutor {
 
         // 构造 subagent AgentState（隔离 messages/turnCount/maxTurns/systemPrompt）
         AgentState state = new AgentState(agentSystemPrompt, sessionId, agentId);
+        // ── [usage-gateway] 子代理记账归属 + 会话账本绑定 ──
+        // 用户裁定：子代理用量必须并入父会话账目；归属用父节点派生以保留层级
+        // （session → 主 agent(depth 0) → 子代理(1) → 嵌套子代理(2)…），账本按此树聚合
+        // 「费用与 token 用量的层级信息」。此前子代理用隔离 AgentState 且不落库 ⇒ 用量丢失，
+        // 本块把子归属显式挂到子 state（组装 ModelRequest 时由 loop 盖章给请求网关）。
+        // 父归属解析优先级（嵌套真实 depth / resume 复用 / 会话根 / 无会话）见
+        // {@link #subagentUsageAttribution}；未注入 registry（测试/手动直构）→ 不装配（等价改造前）。
+        if (usageLedgerRegistry != null) {
+            com.nexusai.application.agent.cost.SessionUsageLedger subagentLedger =
+                usageLedgerRegistry.forSession(sessionId);
+            // 子 agentId 字符串 = 本类既有渲染（a+16hex 优先，退化到 UUID 串），不新造格式。
+            String childUsageAgentId = agentIdHex != null
+                ? agentIdHex
+                : (agentId != null ? agentId.toString() : null);
+            // 顺序：先挂归属再挂账本（attachUsageLedger 在归属非空时才向账本登记本节点）。
+            state.attachUsageAttribution(subagentUsageAttribution(
+                subagentLedger, parentToolUseContext, childUsageAgentId,
+                subagentCtx.subagentName(), sessionId));
+            state.attachUsageLedger(subagentLedger);
+            if (log.isDebugEnabled()) {
+                log.debug("[usage-gateway] 子代理记账归属已装配: sessionId={} agentId={} parentAgentId={} "
+                        + "depth={} label={} ledgerCalls={}",
+                    sessionId, childUsageAgentId,
+                    state.usageAttribution().parentAgentId(), state.usageAttribution().depth(),
+                    state.usageAttribution().label(), subagentLedger.totalCalls());
+            }
+        }
         // [C-31] fork effort 注入 · 对齐 CC SkillTool.ts:208-212（fork effort 合并进 agentDefinition）
         //   → query.ts:694（appState.effortValue 逐轮注入）。子 AgentState.effortValue 经
         //   LlmAgentLoop ModelRequest 构造（:2762 等价）自动携带到 fork LLM 请求 → AnthropicSdkProvider

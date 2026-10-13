@@ -142,7 +142,7 @@ class InvokingRequestIdExplicitCarrierTest {
                 null, null, null, null,
                 c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
                 null, e -> {}, done::countDown, null,
-                ctx /* [A#3] 显式载体 */, com.nexusai.infra.llm.StreamIdleControl.NONE)).get(20, TimeUnit.SECONDS);
+                LlmCallScope.of(ctx) /* [A#3] 显式载体 */, com.nexusai.infra.llm.StreamIdleControl.NONE)).get(20, TimeUnit.SECONDS);
 
             assertThat(done.await(10, TimeUnit.SECONDS)).as("流正常结束").isTrue();
             assertThat(obs.successAttrs)
@@ -221,7 +221,7 @@ class InvokingRequestIdExplicitCarrierTest {
                     null, null, null, null,
                     c -> {}, m -> {}, (ToolUseBlock t) -> {}, r -> {}, () -> {},
                     null, e -> {}, done::countDown, null,
-                    ctx, com.nexusai.infra.llm.StreamIdleControl.NONE)).get(20, TimeUnit.SECONDS);
+                    LlmCallScope.of(ctx), com.nexusai.infra.llm.StreamIdleControl.NONE)).get(20, TimeUnit.SECONDS);
                 assertThat(done.await(10, TimeUnit.SECONDS)).isTrue();
             }
 

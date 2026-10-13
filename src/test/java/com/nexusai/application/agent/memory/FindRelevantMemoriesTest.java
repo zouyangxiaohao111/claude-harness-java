@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.memory;
 import com.anthropic.errors.AnthropicRetryableException;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.infra.llm.LlmApiException;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
@@ -83,7 +84,9 @@ class FindRelevantMemoriesTest {
         Mockito.when(resolver.resolve(Mockito.anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        return new FindRelevantMemories(new FixedFactory(stub), "sonnet", new MemoryScanner(), resolver);
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入委托桩（chat(...) → provider 桩）。
+        return withSideCallClient(
+            new FindRelevantMemories(new FixedFactory(stub), "sonnet", new MemoryScanner(), resolver), stub);
     }
 
     private void writeMemory(Path dir, String name, String type, String desc) throws Exception {
@@ -358,7 +361,27 @@ class FindRelevantMemoriesTest {
         Mockito.when(resolver.resolve(Mockito.anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        return new FindRelevantMemories(new FixedFactory(stub), "sonnet", new MemoryScanner(), resolver);
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入委托桩（chat(...) → provider 桩）。
+        return withSideCallClient(
+            new FindRelevantMemories(new FixedFactory(stub), "sonnet", new MemoryScanner(), resolver), stub);
+    }
+
+    /** [usage-gateway] 注入委托型 LlmSideCallClient（chat(...) 转发到给定 provider 桩）。 */
+    private static FindRelevantMemories withSideCallClient(FindRelevantMemories frm, LlmProvider provider) {
+        org.springframework.test.util.ReflectionTestUtils.setField(frm, "sideCallClient", delegating(provider));
+        return frm;
+    }
+
+    /** [usage-gateway] 委托型 LlmSideCallClient：chat(...) 等价改造前 provider.chatWithOptions(...)。 */
+    private static LlmSideCallClient delegating(LlmProvider provider) {
+        return new LlmSideCallClient() {
+            @Override
+            public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                               String userMessage, LlmProvider.ChatRequestOptions options,
+                               LlmSideCallClient.SideCallUsage usage) {
+                return provider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+            }
+        };
     }
 
     @Test

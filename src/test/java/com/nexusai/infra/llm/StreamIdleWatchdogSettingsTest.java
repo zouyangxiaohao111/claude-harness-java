@@ -22,7 +22,7 @@ import static org.mockito.Mockito.when;
  * 解析核拆成包内静态方法（{@code parseEnabledSwitch} / {@code resolveIdleMs} / {@code parsePositiveLong}）
  * 以便不依赖进程 env 直接测全矩阵；{@link #idleMsReadsResolverThrough()} 另验 resolver 接线。
  */
-@DisplayName("[V78] 流空闲看门狗配置解析（env > 设置 > 默认；300s 下限；默认开）")
+@DisplayName("[V100] 流空闲看门狗配置解析（env > 设置 > 默认；300s 下限；默认开）")
 class StreamIdleWatchdogSettingsTest {
 
     @AfterEach

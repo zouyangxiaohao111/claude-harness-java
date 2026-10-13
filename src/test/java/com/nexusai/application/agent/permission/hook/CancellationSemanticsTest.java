@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.attachment.AttachmentMessageDto;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.loop.AgentLoopContextFactory;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.hook.GenericHook.HookOutcome;
@@ -89,7 +90,8 @@ class CancellationSemanticsTest {
                            AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             int idx = callCount.getAndIncrement();
             AssistantMessage am = responses.get(Math.min(idx, responses.size() - 1));
             onAssistantMessage.accept(am);
@@ -167,7 +169,8 @@ class CancellationSemanticsTest {
             java.util.function.Consumer<String> orc, Runnable osf,
             AbortController ac,
             java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             throw new UnsupportedOperationException();
         }
 
@@ -182,6 +185,25 @@ class CancellationSemanticsTest {
             capturedOptions.set(options);
             return "{\"ok\": true}";
         }
+    }
+
+    /**
+     * [usage-gateway] ExecPromptHook 现经统一旁路客户端发起 LLM 调用（字段注入 sideCallClient）。
+     * 本 helper 注入 mock 客户端并把调用委派给给定 provider —— 保留本文件既有 provider 桩的
+     * 调用计数 / 选项捕获语义（断言强度不变）。
+     */
+    private ExecPromptHook promptHook(LlmProvider provider) {
+        ExecPromptHook hook = new ExecPromptHook(JSON);
+        LlmSideCallClient client = org.mockito.Mockito.mock(LlmSideCallClient.class);
+        org.mockito.Mockito.when(client.chat(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> provider.chatWithOptions(
+                inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                inv.getArgument(3), inv.getArgument(4)));
+        org.springframework.test.util.ReflectionTestUtils.setField(hook, "sideCallClient", client);
+        return hook;
     }
 
     private LlmProviderFactory routingFactory(CapturingProvider real) {
@@ -272,7 +294,7 @@ class CancellationSemanticsTest {
             new PromptHook(PROMPT, null, null, DEFAULT_FAST_MODEL, null, null),
             null, null, null, "settings")));
         registry.setHookMatcherEngine(engine);
-        registry.setExecPromptHook(new ExecPromptHook(JSON));
+        registry.setExecPromptHook(promptHook(real));
         registry.setLlmProviderFactory(routingFactory(real));
         registry.setModelConfigResolver(new StubModelConfigResolver());
 
@@ -355,7 +377,7 @@ class CancellationSemanticsTest {
         // Java 旧实现 exec 无 signal 参（父取消完全无法表达）；新实现预检 combinedAbort →
         // 跳过 LLM 调用（provider 0 次 = 未发起任何请求）。
         CapturingProvider real = new CapturingProvider();
-        ExecPromptHook hook = new ExecPromptHook(JSON);
+        ExecPromptHook hook = promptHook(real);
         PromptHook cfg = new PromptHook(PROMPT, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
             real, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
@@ -391,7 +413,8 @@ class CancellationSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) { return ""; }
@@ -406,7 +429,7 @@ class CancellationSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(JSON);
+        ExecPromptHook hook = promptHook(slow);
         PromptHook cfg = new PromptHook(PROMPT, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
             slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);

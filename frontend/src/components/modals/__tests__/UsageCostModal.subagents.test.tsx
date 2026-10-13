@@ -23,7 +23,11 @@ import type { ChatMessageDto } from '@/api/types'
  * </ul>
  */
 
-vi.mock('@/api/sessions', () => ({ sessionApi: { list: vi.fn(() => Promise.resolve([])) } }))
+vi.mock('@/api/sessions', () => ({ sessionApi: {
+  list: vi.fn(() => Promise.resolve([])),
+  // [usage-gateway] 弹窗新增会话级用量读取；默认无记账数据（各行回退 task 事件统计）
+  usage: vi.fn(() => Promise.resolve(null)),
+} }))
 vi.mock('@/api/stats', () => ({ statsApi: { get: vi.fn(() => Promise.resolve(null)) } }))
 
 const SID = 'sess-d2'

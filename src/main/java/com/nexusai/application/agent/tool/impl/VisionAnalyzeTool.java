@@ -21,6 +21,7 @@ import com.nexusai.model.session.dto.Role;
 import com.nexusai.repository.session.entity.AttachmentRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -92,6 +93,16 @@ public class VisionAnalyzeTool implements Tool {
      * 可 null（测试 / 3 参构造）→ 恒走 image-cache 回退（现状不变）。
      */
     private final AttachmentService attachmentService;
+
+    /**
+     * [usage-gateway] 旁路 LLM 单发客户端 · 视觉模型调用收口到请求网关并自动记账。
+     *
+     * <p>本类非 {@code @Component}，经 {@code ToolRegistrationConfig} 的 {@code @Bean} 工厂构造；
+     * Spring 对 {@code @Bean} 返回对象仍执行 {@code AutowiredAnnotationBeanPostProcessor} →
+     * 字段注入有效（{@code required=false}：孤立 new 场景缺省 → 调用点需容忍，但生产恒注入）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
 
     /**
      * 3 参构造（历史调用方 / 测试零改动）→ 委托 4 参（attachmentService=null → 恒走 image-cache 回退）。
@@ -470,14 +481,13 @@ public class VisionAnalyzeTool implements Tool {
             return ToolResult.error(call.id(), "视觉模型 provider 工厂路由失败: model=" + modelName);
         }
 
-        // ── 5. 组装 user 消息 + chatWithOptions（同步 + fail-loud）──
+        // ── 5. 组装 user 消息 + 旁路调用（同步 + fail-loud）──
         String resultText;
         try {
             // 8-arg ChatRequestOptions: history/tools/outputFormat/thinkingConfig/temperature/querySource/abort/maxTokens
             if ("analyze".equals(type) && isPdf) {
                 // [v2 pdf] 懒渲染 pages → 页图 image blocks → 视觉模型（单条 user 消息 text+N image）
-                resultText = chatWithPdfPages(provider, resolved, modelName, prompt, pdfFilePath, pages, contentId,
-                    ctx != null ? ctx.agentContext() : null);
+                resultText = chatWithPdfPages(resolved, modelName, prompt, pdfFilePath, pages, contentId, ctx);
             } else if ("analyze".equals(type)) {
                 // image 单图：contentBlocks=[text, image]（text 块在前，对齐 CC prompt 数组 attachments.ts:1065-1071）
                 List<JsonNode> blocks = new ArrayList<>(2);
@@ -492,12 +502,18 @@ public class VisionAnalyzeTool implements Tool {
                         ctx != null ? ctx.agentContext() : null);
                 // ⚠️ userMessage 必须传 null：图片+prompt 已在 history 的 contentBlocks 里；
                 //    再传 userMessage 会导致连续两条 user 消息（AnthropicSdkProvider:1013-1017）
-                resultText = provider.chatWithOptions(resolved.config(), modelName, null, null, options);
+                // [usage-gateway] 旁路调用收口 LlmSideCallClient：归属取自工具形参 ctx
+                //   （sessionId=ctx.sessionId()，agentId=ctx.agentId()，agentContext=ctx.agentContext()；
+                //    ctx==null → standalone，不伪造 sessionId）。
+                resultText = sideCallClient.chat(resolved.config(), modelName, null, null, options,
+                        visionAnalyzeUsage(ctx));
             } else {
                 LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                         List.of(), null, null, null, null, "vision_analyze", null, null,
                         ctx != null ? ctx.agentContext() : null);
-                resultText = provider.chatWithOptions(resolved.config(), modelName, null, prompt, options);
+                // [usage-gateway] 同上：归属取自工具形参 ctx。
+                resultText = sideCallClient.chat(resolved.config(), modelName, null, prompt, options,
+                        visionAnalyzeUsage(ctx));
             }
         } catch (Exception e) {
             log.error("VisionAnalyzeTool 视觉模型调用失败: model={} type={} contentId={} isPdf={} 原因={}",
@@ -522,21 +538,21 @@ public class VisionAnalyzeTool implements Tool {
      * finally 递归清理。页号越界 / 超 20 页跨度 / 渲染失败 → 抛 {@link IllegalStateException}（execute 外层
      * catch → fail-loud ToolResult.error）。
      *
-     * @param provider     视觉模型 provider
-     * @param resolved     已解析 ProviderConfig（resolved.config() 供 chatWithOptions）
+     * @param resolved     已解析 ProviderConfig（resolved.config() 供旁路调用）
      * @param modelName    多模态档位模型名（日志）
      * @param prompt       主模型问题（text 块置前）
      * @param pdfFilePath  PDF 本地绝对路径（resolvePdfSourceFile 已 exists 校验）
      * @param pages        显式页号（1-based；null/空 → ≤10 页全渲染，>10 报错要求 pages）
      * @param contentId    源 contentId（日志；path 源为 -1）
-     * @param agentContext [S1-T7] agent 归因上下文（调用方 execute(call, ctx) 从 ctx.agentContext()
-     *                     显式传入；null = 无归因上下文，等价 CC agentContext.ts:170 无 invokingRequestId）
+     * @param ctx          [usage-gateway] 工具上下文（归属单一来源：sessionId=ctx.sessionId()、
+     *                     agentId=ctx.agentId()、agentContext=ctx.agentContext()；null = 无会话上下文
+     *                     → standalone 归属，不伪造 sessionId）。本方法自身无 ToolUseContext ⇒ 由调用方
+     *                     execute(call, ctx) 传入。
      * @return 视觉模型纯文本响应
      */
-    private String chatWithPdfPages(LlmProvider provider, ModelConfigResolver.ResolvedModel resolved,
+    private String chatWithPdfPages(ModelConfigResolver.ResolvedModel resolved,
                                     String modelName, String prompt, String pdfFilePath,
-                                    List<Integer> pages, long contentId,
-                                    com.nexusai.application.agent.subagent.AgentContext agentContext)
+                                    List<Integer> pages, long contentId, ToolUseContext ctx)
             throws Exception {
         Path file = Path.of(pdfFilePath);
         Integer pageCount = PdfSupport.getPDFPageCount(file);
@@ -586,18 +602,44 @@ public class VisionAnalyzeTool implements Tool {
                 Role.user, prompt, null, null, blocks, List.of(), true);
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 List.of(user), null, null, null, null, "vision_analyze", null, null,
-                // [S1-T7] agent 归因上下文 = **本方法新增形参**（原读 ambient 归因上下文
-                //   ambient，已删）。本方法（chatWithPdfPages）自身无 ToolUseContext ⇒ 由调用方
-                //   execute(call, ctx) 从 ctx.agentContext() 显式传入。
-                agentContext);
+                // [S1-T7] agent 归因上下文 = **本方法新增形参 ctx 的显式字段**（原读 ambient 归因上下文
+                //   已删）。本方法（chatWithPdfPages）自身无 ToolUseContext ⇒ 由调用方
+                //   execute(call, ctx) 从 ctx.agentContext() 传入。
+                ctx != null ? ctx.agentContext() : null);
             if (log.isDebugEnabled()) {
                 log.debug("VisionAnalyzeTool PDF 页图已组装: path={} pages={} 页图={}（送视觉模型）",
                     pdfFilePath, selected, imgBlocks.size());
             }
-            return provider.chatWithOptions(resolved.config(), modelName, null, null, options);
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient：归属取自同一 ctx（sessionId/agentId/
+            //   agentContext），ctx==null → standalone（不伪造 sessionId）。
+            return sideCallClient.chat(resolved.config(), modelName, null, null, options,
+                    visionAnalyzeUsage(ctx));
         } finally {
             deleteRecursive(tmpDir);
         }
+    }
+
+    /**
+     * [usage-gateway] 组装旁路记账归属（视觉分析调用专用）。
+     *
+     * <p>归属单一来源 = 工具形参 {@link ToolUseContext}：
+     * <ul>
+     *   <li>ctx != null → {@code inSession(sessionId=ctx.sessionId(), agentId=ctx.agentId(), ...)}
+     *       + {@code withAgentContext(ctx.agentContext())}；</li>
+     *   <li>ctx == null（无会话上下文，如静态/无 session 调用）→ {@code standalone}（不伪造 sessionId）。</li>
+     * </ul>
+     */
+    private static com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+            visionAnalyzeUsage(ToolUseContext ctx) {
+        if (ctx == null) {
+            return com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                    .standalone(com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "vision-analyze");
+        }
+        return com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                .inSession(ctx.sessionId(),
+                        ctx.agentId() != null ? ctx.agentId().toString() : null,
+                        com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "vision-analyze")
+                .withAgentContext(ctx.agentContext());
     }
 
     /**

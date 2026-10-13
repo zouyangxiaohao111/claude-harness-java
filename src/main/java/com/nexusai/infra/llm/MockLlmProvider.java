@@ -116,9 +116,13 @@ public class MockLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参类型由 AgentContext 升级为 LlmCallScope（**形参个数不变**，
+                       //   位置索引零漂移）：scope 内既有 agentContext（归因语义逐字保留）、又新增 sink
+                       //   （用量采集器）。mock 不发射归因边，但必须把 scope 透传到 worker 线程，
+                       //   否则中断/失败两个出口无法上报用量（用户裁定：流中断/取消/失败也要统计）。
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参接收（mock 无真实流可看门狗；T6 决定是否消费）
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [C] 记录 skipCacheWrite 供测试观测（mock 无 wire 层；主/子/fork 任一路径透传是否到位
         //   经 {@link #lastSkipCacheWrite()} 断言）。
         this.lastSkipCacheWrite = skipCacheWrite;
@@ -136,7 +140,7 @@ public class MockLlmProvider implements LlmProvider {
             });
         }
         doStream(history, tools, onChunk, onAssistantMessage, onError, onComplete,
-            aborted, workerRef, abortReason);
+            aborted, workerRef, abortReason, scope);   // [usage-gateway] scope 透传到 worker 线程
     }
 
     /**
@@ -165,9 +169,10 @@ public class MockLlmProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参 LlmCallScope（含 agentContext + 用量 sink）· 见 blocks 重载
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参接收（同 blocks 重载注释）
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [C] 记录 skipCacheWrite 供测试观测（同上）
         this.lastSkipCacheWrite = skipCacheWrite;
         List<ChatMessageDto> reflected = history;
@@ -201,7 +206,7 @@ public class MockLlmProvider implements LlmProvider {
             reflected, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext,   // [A#3] 显式归因上下文透传（mock 不发射该边，签名跟随）
+            scope,   // [usage-gateway] scope 透传（sink 不可在委托链上丢）
             streamIdleControl);   // [看门狗] 末参透传
     }
 
@@ -217,7 +222,10 @@ public class MockLlmProvider implements LlmProvider {
                           Runnable onComplete,
                           AtomicBoolean aborted,
                           AtomicReference<Thread> workerRef,
-                          AtomicReference<String> abortReason) {
+                          AtomicReference<String> abortReason,
+                          LlmCallScope scope) {
+        // [usage-gateway] scope 由 worker 线程闭包捕获（provider 的回调跑在 mock-llm-stream 线程，
+        //   若不在签名里透传，中断/失败出口就拿不到 sink ⇒ 取消时用量全丢）。
         if (tools != null && !tools.isEmpty()) {
             log.debug("MockLlmProvider: tools available: {}", tools.size());
         }
@@ -247,6 +255,10 @@ public class MockLlmProvider implements LlmProvider {
                     for (String c : preambleChunks) {
                         sleep(50);
                         if (aborted.get()) {
+                            // [usage-gateway] 中断出口（用户取消/超时）：mock 的 usage 是夹具声明值
+                            //   （非分块累积）⇒ 直接上报该值 + ABORTED；不报则取消路径在整条 provider
+                            //   链上零账（用户核心诉求：流中断/取消也要统计）。
+                            recordAttempt(scope, mockUsage, LlmUsagePhase.ABORTED);
                             finishAborted(onError, abortReason);
                             return;
                         }
@@ -259,6 +271,9 @@ public class MockLlmProvider implements LlmProvider {
                         onAssistantMessage.accept(new AssistantMessage(
                             acc.toString(), "tool_calls", calls, "", null, mockUsage));
                     }
+                    // [usage-gateway] 正常完成结局：onComplete 前上报结算快照（与 AssistantMessage.usage
+                    //   同源同值 mockUsage）—— 非流式/流式都经此出口，网关据此记账。
+                    LlmCallScope.recordSettled(scope, mockUsage);
                     onComplete.run();
                 } else {
                     // --- 纯文本回复 ---
@@ -267,6 +282,8 @@ public class MockLlmProvider implements LlmProvider {
                     for (String chunk : chunks) {
                         sleep(50);
                         if (aborted.get()) {
+                            // [usage-gateway] 中断出口（同 tool 分支）：mock usage 是夹具声明值 ⇒ 直接上报
+                            recordAttempt(scope, mockUsage, LlmUsagePhase.ABORTED);
                             finishAborted(onError, abortReason);
                             return;
                         }
@@ -277,14 +294,19 @@ public class MockLlmProvider implements LlmProvider {
                         onAssistantMessage.accept(new AssistantMessage(
                             acc.toString(), "stop", List.of(), "", null, mockUsage));
                     }
+                    // [usage-gateway] 正常完成结局：onComplete 前上报结算快照（同 tool 分支）
+                    LlmCallScope.recordSettled(scope, mockUsage);
                     onComplete.run();
                 }
             } catch (Throwable t) {
-                // 中断（abort interrupt worker）→ CancellationException, 非普通错误
+                // [usage-gateway] 失败/中断出口：mock 的 usage 是夹具声明值（不分块累积，与上面两个出口
+                //   同源同值）⇒ 按结局分别上报 ABORTED / FAILED，避免「失败/取消时零账」。
                 if (aborted.get() || t instanceof InterruptedException) {
+                    recordAttempt(scope, mockUsage, LlmUsagePhase.ABORTED);
                     finishAborted(onError, abortReason);
                     return;
                 }
+                recordAttempt(scope, mockUsage, LlmUsagePhase.FAILED);
                 log.error("MockLlmProvider stream failed", t);
                 onError.accept(t);
             }
@@ -387,7 +409,41 @@ public class MockLlmProvider implements LlmProvider {
         return new AssistantMessage(content, "stop", List.of(), "");
     }
 
+    /**
+     * [usage-gateway] 非流式统一入口覆写 · mock 的 usage 恒为夹具声明值（{@link #mockUsage}，与流式
+     * 出口同源同值）⇒ 直接投影为 {@link LlmInvocationResult}，并在返回前写入 sink（
+     * {@link LlmCallScope#recordSettled} 约定：有值 → UPSTREAM，零值 → UNKNOWN）。
+     *
+     * <p>WHY 必须覆写默认实现：默认实现取 {@link #chatWithOptionsMessage} 的 usage，而 mock 该方法
+     * 经 3/4 参构造器返回 ⇒ usage 恒 EMPTY，会把 {@link #setMockUsage} 注入的用量丢掉（无法观测）。
+     */
+    @Override
+    public LlmInvocationResult invoke(ProviderConfig config, String modelName, String systemPrompt,
+                                      String userMessage, LlmProvider.ChatRequestOptions options,
+                                      LlmCallScope scope) {
+        long startedAt = System.currentTimeMillis();
+        AssistantMessage msg = chatWithOptionsMessage(config, modelName, systemPrompt, userMessage, options);
+        AgentUsage usage = mockUsage != null ? mockUsage : AgentUsage.EMPTY;
+        // [usage-gateway] 返回前写 sink（非流式唯一用量出口）
+        LlmCallScope.recordSettled(scope, usage);
+        String thinking = msg.reasoning() == null || msg.reasoning().isEmpty() ? null : msg.reasoning();
+        return new LlmInvocationResult(msg.content(), msg.finishReason(), msg.toolCalls(), usage,
+            null /* id：mock 无上游消息 id */, thinking, null /* requestId：mock 无 API 请求头 */,
+            modelName, System.currentTimeMillis() - startedAt);
+    }
+
     // ============== helper ==============
+
+    /**
+     * [usage-gateway] 一次尝试结局的用量上报 · 来源按「是否真拿到 token 数值」判定（与
+     * {@link LlmCallScope#recordSettled} 同一约定）：有值 → {@link UsageTokenSource#UPSTREAM}；
+     * 零值/空 → {@link AgentUsage#EMPTY} + {@link UsageTokenSource#UNKNOWN}（不伪造估算值）。
+     */
+    private static void recordAttempt(LlmCallScope scope, AgentUsage usage, LlmUsagePhase phase) {
+        boolean hasTokens = usage != null && usage.totalTokens() > 0;
+        LlmCallScope.record(scope, hasTokens ? usage : AgentUsage.EMPTY,
+            hasTokens ? UsageTokenSource.UPSTREAM : UsageTokenSource.UNKNOWN, phase);
+    }
 
     private static void sleep(long ms) {
         try {

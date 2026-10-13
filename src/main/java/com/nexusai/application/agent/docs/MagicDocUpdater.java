@@ -9,8 +9,8 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolUseContext.ReadState;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
-import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
+import com.nexusai.infra.llm.UsageCategory;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -96,6 +96,13 @@ public class MagicDocUpdater {
     private final AtomicReference<Function<String, String>> llmCallbackOverride = new AtomicReference<>();
     /** 真实 LLM endpoint (Spring 注入). */
     private final LlmProviderFactory providerFactory;
+    /**
+     * [usage-gateway] 旁路 LLM 单发客户端 · 文档更新(magic-doc-update)旁路调用统一走它完成「调用+记账」。
+     *   Spring 字段注入（本类生产唯一构造路径是 @Autowired 构造器；测试路径经 llmCallbackOverride
+     *   短路，不触真实 LLM，故此字段在测试中可为 null）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
     /** [RV14B-WIRE-03] 共享配置解析器 · model 名 → 真实 (ProviderConfig, providerType)。 */
     private final com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
     /** 兜底模型名（字面量 "haiku" → resolver 映射 settings fast → DB 名）。 */
@@ -214,7 +221,7 @@ public class MagicDocUpdater {
             if (override != null) {
                 updated = override.apply(prompt);
             } else {
-                updated = callRealLlm(prompt);
+                updated = callRealLlm(prompt, sessionId);
             }
         } catch (Exception e) {
             return UpdateResult.failed("LLM call failed: " + e.getMessage());
@@ -296,9 +303,9 @@ public class MagicDocUpdater {
      * → DB 名，再 resolve 真实 (config, providerType)。解析失败 → <b>显式抛异常</b>（同步路径
      * 规则十二 Fail loud，调用方 updateWithContent catch → UpdateResult.failed），不落 mock。
      */
-    String callRealLlm(String prompt) {
-        if (providerFactory == null) {
-            throw new IllegalStateException("LlmProviderFactory not available (test mode)");
+    String callRealLlm(String prompt, String sessionId) {
+        if (sideCallClient == null) {
+            throw new IllegalStateException("LlmSideCallClient not available (test mode)");
         }
         com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolved = resolveModelConfig();
         if (resolved == null || resolved.config() == null || !resolved.config().isUsable()) {
@@ -307,11 +314,15 @@ public class MagicDocUpdater {
             throw new IllegalStateException("MagicDoc model config unavailable: " + model);
         }
         String modelName = resolveModelName();
-        LlmProvider provider = providerFactory.getProvider(resolved.config(), resolved.providerType());
         String systemPrompt = "You are a code documentation updater. "
             + "Update the given magic document with new information from the conversation context. "
             + "Return ONLY the updated document content with no preamble.";
-        return provider.chat(resolved.config(), modelName, systemPrompt, prompt);
+        // [usage-gateway] 旁路文档更新改走统一旁路客户端（调用+记账）：归属来源 = updateWithContent 的
+        //   sessionId 形参（生产由 MagicDocsService 从 PostSamplingContext.toolUseContext().sessionId()
+        //   显式透传的真实会话 ID，非伪造）。类别 SIDE_CALL · 标签 magic-doc-update。返回文本语义不变。
+        return sideCallClient.chat(resolved.config(), modelName, systemPrompt, prompt, null,
+            com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage.inSession(
+                sessionId, null, UsageCategory.SIDE_CALL, "magic-doc-update"));
     }
 
     /**

@@ -1,9 +1,9 @@
 package com.nexusai.application.agent.mcp;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.permission.hook.SkillImprovementHook;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.infra.llm.LlmProvider;
-import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import org.slf4j.Logger;
@@ -58,8 +58,8 @@ public class DateTimeParser {
 
     /**
      * 侧信道 LLM 查询执行器 · Java 等价 CC {@code queryModelWithoutStreaming}
-     * （claude.ts:709-723）；生产用 LlmProvider.chatWithOptions（参照
-     * {@link SkillImprovementHook} 的 buildModelQuery 模式，模型名 = getSmallFastModel）。
+     * （claude.ts:709-723）；生产经统一旁路客户端 {@link LlmSideCallClient#chat} 收口
+     * （参照 {@link SkillImprovementHook} 的 buildModelQuery 模式，模型名 = getSmallFastModel）。
      */
     @FunctionalInterface
     public interface DateTimeModelQuery {
@@ -69,13 +69,13 @@ public class DateTimeParser {
     private final DateTimeModelQuery modelQuery;
 
     /**
-     * Spring 构造 · 生产 wiring：providerFactory + modelConfigResolver 按 getSmallFastModel()
+     * Spring 构造 · 生产 wiring：统一旁路客户端 + modelConfigResolver 按 getSmallFastModel()
      * 精确匹配真实 provider（对齐 SkillImprovementHook DEC-RV-19 模式）；解析失败 → warn+skip 返回 ""。
      */
     @Autowired
-    public DateTimeParser(@Autowired(required = false) LlmProviderFactory providerFactory,
+    public DateTimeParser(@Autowired(required = false) LlmSideCallClient sideCallClient,
                           @Autowired(required = false) ModelConfigResolver modelConfigResolver) {
-        this.modelQuery = buildModelQuery(providerFactory, modelConfigResolver);
+        this.modelQuery = buildModelQuery(modelConfigResolver, sideCallClient);
     }
 
     /** 测试/注入构造 · mock DateTimeModelQuery 验证 LLM 语义。 */
@@ -223,12 +223,13 @@ public class DateTimeParser {
      * {@code getSmallFastModel()} 精确匹配 → 2 参 getProvider(config, providerType) 路由）。
      */
     static DateTimeModelQuery buildModelQuery(
-            LlmProviderFactory providerFactory, ModelConfigResolver modelConfigResolver) {
-        if (providerFactory == null) {
+            ModelConfigResolver modelConfigResolver, LlmSideCallClient sideCallClient) {
+        // [usage-gateway] 统一旁路客户端缺失（测试直构 / 未接线）→ 保持原「wiring 缺失即跳过」语义
+        //   （原守卫是 providerFactory == null → 返回空查询，不落 mock）。
+        if (sideCallClient == null) {
             return (systemPrompt, prompt, options) -> "";
         }
         AtomicReference<ProviderConfig> configRef = new AtomicReference<>();
-        AtomicReference<LlmProvider> providerRef = new AtomicReference<>();
         return (systemPrompt, prompt, options) -> {
             if (configRef.get() == null) {
                 if (modelConfigResolver == null) {
@@ -240,12 +241,16 @@ public class DateTimeParser {
                     return "";
                 }
                 configRef.set(resolved.config());
-                providerRef.set(providerFactory.getProvider(resolved.config(), resolved.providerType()));
                 log.info("DateTimeParser LLM 解析已接线真实 provider (baseUrl={}, type={})",
                     resolved.config().baseUrl(), resolved.providerType());
             }
-            String content = providerRef.get().chatWithOptions(
-                    configRef.get(), SkillImprovementHook.getSmallFastModel(), systemPrompt, prompt, options);
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient：MCP elicitation 日期解析不处于任何
+            //   agent 执行链（无 sessionId，agentContext 语义上不存在，见 queryOptions()）⇒ 归属
+            //   standalone(SIDE_CALL, "mcp-datetime-parse")。
+            String content = sideCallClient.chat(
+                    configRef.get(), SkillImprovementHook.getSmallFastModel(), systemPrompt, prompt, options,
+                    LlmSideCallClient.SideCallUsage.standalone(
+                            com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "mcp-datetime-parse"));
             return content == null ? "" : content;
         };
     }

@@ -59,6 +59,7 @@ class VisionAnalyzeToolTest {
     private ModelConfigResolver modelConfigResolver;
     private LlmProviderFactory llmProviderFactory;
     private LlmProvider provider;
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
     private VisionAnalyzeTool tool;
 
     @TempDir
@@ -70,9 +71,12 @@ class VisionAnalyzeToolTest {
         modelConfigResolver = mock(ModelConfigResolver.class);
         llmProviderFactory = mock(LlmProviderFactory.class);
         provider = mock(LlmProvider.class);
+        sideCallClient = mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
         // G5：ImageAttachmentStore 写 nexusai 自有根 → 唯一 appName 隔离（防写真实 ~/.nexusai）
         NexusaiPaths.setAppNameOverride("nexusai-test-" + configHome.getFileName());
         tool = new VisionAnalyzeTool(store, modelConfigResolver, llmProviderFactory);
+        // [usage-gateway] 手工 new 的 bean 无 Spring 字段注入 → 显式注入 mock 旁路客户端
+        org.springframework.test.util.ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
     }
 
     @AfterEach
@@ -81,14 +85,14 @@ class VisionAnalyzeToolTest {
         NexusaiPaths.setAppNameOverride(null);
     }
 
-    /** 标准成功桩：多模态模型名 + provider 解析 + factory 路由 + chat 返回文本。 */
+    /** 标准成功桩：多模态模型名 + provider 解析 + factory 路由 + [usage-gateway] sideCallClient.chat 返回文本。 */
     private void stubSuccessChain(String chatResult) {
         ProviderConfig cfg = new ProviderConfig("https://example.com", "sk-test");
         when(modelConfigResolver.resolveMultimodalModelName()).thenReturn("vision-model");
         when(modelConfigResolver.resolve("vision-model"))
             .thenReturn(new ModelConfigResolver.ResolvedModel(cfg, "anthropic"));
         when(llmProviderFactory.getProvider(cfg, "anthropic")).thenReturn(provider);
-        when(provider.chatWithOptions(eq(cfg), eq("vision-model"), isNull(), any(), any()))
+        when(sideCallClient.chat(eq(cfg), eq("vision-model"), isNull(), any(), any(), any()))
             .thenReturn(chatResult);
     }
 
@@ -148,8 +152,8 @@ class VisionAnalyzeToolTest {
         // 核心契约：捕获 chatWithOptions 的 history，验证 user 消息 contentBlocks=[text, image]
         ArgumentCaptor<LlmProvider.ChatRequestOptions> optionsCaptor =
             ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
-        verify(provider).chatWithOptions(
-            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), optionsCaptor.capture());
+        verify(sideCallClient).chat(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), optionsCaptor.capture(), any());
         LlmProvider.ChatRequestOptions sent = optionsCaptor.getValue();
         List<ChatMessageDto> history = sent.history();
         assertThat(history).hasSize(1);
@@ -342,8 +346,8 @@ class VisionAnalyzeToolTest {
 
         ArgumentCaptor<LlmProvider.ChatRequestOptions> captor =
             ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
-        verify(provider).chatWithOptions(
-            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture());
+        verify(sideCallClient).chat(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture(), any());
         List<ChatMessageDto> history = captor.getValue().history();
         assertThat(history).hasSize(1);
         assertThat(history.get(0).contentBlocks()).hasSize(2);
@@ -378,8 +382,8 @@ class VisionAnalyzeToolTest {
         // 核心契约：懒渲染只送选中页 → user 消息 contentBlocks=[text, image(页1), image(页3)]，共 3 块
         ArgumentCaptor<LlmProvider.ChatRequestOptions> captor =
             ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
-        verify(provider).chatWithOptions(
-            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture());
+        verify(sideCallClient).chat(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), captor.capture(), any());
         List<ChatMessageDto> history = captor.getValue().history();
         assertThat(history).hasSize(1);
         List<?> blocks = history.get(0).contentBlocks();

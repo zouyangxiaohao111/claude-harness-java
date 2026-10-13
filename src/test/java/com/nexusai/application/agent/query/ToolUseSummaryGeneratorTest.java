@@ -10,6 +10,7 @@ import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.loop.LoopDeps;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
@@ -87,7 +88,7 @@ class ToolUseSummaryGeneratorTest {
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
 
-        HaikuToolUseSummaryGenerator gen = new HaikuToolUseSummaryGenerator(factory, resolver);
+        HaikuToolUseSummaryGenerator gen = generatorWith(factory, resolver, provider);
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         List<ToolUseBlock> tools = List.of(new ToolUseBlock("toolu_1", "Bash", JSON.createObjectNode()));
 
@@ -117,7 +118,7 @@ class ToolUseSummaryGeneratorTest {
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
 
-        HaikuToolUseSummaryGenerator gen = new HaikuToolUseSummaryGenerator(factory, resolver);
+        HaikuToolUseSummaryGenerator gen = generatorWith(factory, resolver, provider);
         AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         List<ToolUseBlock> tools = List.of(new ToolUseBlock("toolu_9", "Bash", JSON.createObjectNode()));
 
@@ -194,7 +195,7 @@ class ToolUseSummaryGeneratorTest {
         when(resolver.resolve(anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        HaikuToolUseSummaryGenerator gen = new HaikuToolUseSummaryGenerator(factory, resolver);
+        HaikuToolUseSummaryGenerator gen = generatorWith(factory, resolver, provider);
         AgentState state = new AgentState("sys",
             "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         List<ToolUseBlock> tools =
@@ -364,6 +365,25 @@ class ToolUseSummaryGeneratorTest {
         outboundMethod.invoke(null, ctx, state, summary);
 
         Mockito.verify(wsTemplate, Mockito.never()).convertAndSend(Mockito.anyString(), Mockito.any(Object.class));
+    }
+
+    /**
+     * [usage-gateway] 构造 HaikuToolUseSummaryGenerator 并注入「委托型」LlmSideCallClient（chat(...)
+     * 原样转发到给定 provider 桩）—— 保留既有 provider 桩/verify/captor 断言语义。
+     */
+    private static HaikuToolUseSummaryGenerator generatorWith(LlmProviderFactory factory,
+                                                              ModelConfigResolver resolver,
+                                                              LlmProvider provider) {
+        HaikuToolUseSummaryGenerator gen = new HaikuToolUseSummaryGenerator(factory, resolver);
+        org.springframework.test.util.ReflectionTestUtils.setField(gen, "sideCallClient", new LlmSideCallClient() {
+            @Override
+            public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                               String userMessage, LlmProvider.ChatRequestOptions options,
+                               LlmSideCallClient.SideCallUsage usage) {
+                return provider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+            }
+        });
+        return gen;
     }
 
     /** [W9-01] 构造 type='tool_use_summary' attachment（对齐 HaikuToolUseSummaryGenerator 30 参 canonical）。 */

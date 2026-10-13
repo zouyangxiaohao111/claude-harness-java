@@ -8,7 +8,6 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmApiException;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
@@ -115,6 +114,12 @@ public class YoloClassifierImpl implements YoloClassifier {
      *  对齐 InitialPermissionModeSource（:74-75 字段注入）先例。 */
     @Autowired(required = false)
     private SettingsMapper settingsMapper;
+
+    /** [usage-gateway] 旁路 LLM 调用收口客户端（调用 + usage 记账）。Spring 装配后注入；
+     *  POJO 单测经 ReflectionTestUtils 手工注入。分类器的两个 stage 调用（2-stage XML 经
+     *  message(无 tools)/1-stage classify_result 经 message(tools+tool_choice)）统一走本客户端。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
 
     /** [prompt-align TOOLS-01] 可选 CLAUDE.md 内容读源 · 镜像 CC
      *  {@code getCachedClaudeMdContent}（bootstrap/state.ts 缓存，context.ts 填充；
@@ -422,6 +427,8 @@ public class YoloClassifierImpl implements YoloClassifier {
             }
             return YoloClassifierResult.unavailable("Classifier unavailable - blocking for safety", modelName, 1);
         }
+        // [usage-gateway] provider 解析保留为既有 fail-closed 前置守卫（工厂解析失败/不支持 → 返回
+        //   unavailable，与迁移前逐字一致）；真实调用（含 provider 解析）已收口到 sideCallClient 网关。
         LlmProvider provider = providerFactory.getProvider(resolved.config(), resolved.providerType());
         if (provider == null) {
             return YoloClassifierResult.unavailable("Classifier unavailable - blocking for safety", modelName, 1);
@@ -430,9 +437,9 @@ public class YoloClassifierImpl implements YoloClassifier {
         // 2-stage / 1-stage 分发 · CC :1111 isTwoStageClassifierEnabled()
         if (isTwoStageClassifierEnabled()) {
             String xmlSystemPrompt = promptBuilder.replaceOutputFormatWithXml(systemPrompt);
-            return classifyTwoStage(provider, resolved, modelName, xmlSystemPrompt, wrappedContent, promptLengths, ctx);
+            return classifyTwoStage(resolved, modelName, xmlSystemPrompt, wrappedContent, promptLengths, ctx);
         }
-        return classifySingleStage(provider, resolved, modelName, systemPrompt, singleStageUser, promptLengths, ctx);
+        return classifySingleStage(resolved, modelName, systemPrompt, singleStageUser, promptLengths, ctx);
     }
 
     /**
@@ -475,7 +482,6 @@ public class YoloClassifierImpl implements YoloClassifier {
      * <p>流程：stage1 fast（:768-858）→ 若 block 触发 stage2 thinking（:860-940）。
      * 结果填充 usage（extractUsage :609-618 / combineUsage :633-641，OPD-WF6-02-RV）。
      *
-     * @param provider        LLM provider
      * @param resolved        单模型真实配置
      * @param modelName       分类器模型名
      * @param xmlSystemPrompt replaceOutputFormatWithXml 后的 XML 版 system prompt
@@ -485,13 +491,13 @@ public class YoloClassifierImpl implements YoloClassifier {
      * @return 分类结果（CC shouldBlock 契约）
      */
     private YoloClassifierResult classifyTwoStage(
-            LlmProvider provider, ModelConfigResolver.ResolvedModel resolved, String modelName,
+            ModelConfigResolver.ResolvedModel resolved, String modelName,
             String xmlSystemPrompt, String wrappedContent, PromptLengths promptLengths, ToolUseContext ctx) {
         long overallStart = System.currentTimeMillis();
         StageCallOutcome stage1 = null;
         try {
             // ===== Stage 1 (fast) · CC :768-858 =====
-            StageCallOutcome s1 = runStage(provider, resolved, modelName, xmlSystemPrompt,
+            StageCallOutcome s1 = runStage(resolved, modelName, xmlSystemPrompt,
                 wrappedContent + YoloPromptBuilder.XML_S1_SUFFIX, ctx, 1);
             stage1 = s1;
             Boolean s1Block = YoloPromptBuilder.parseXmlBlock(s1.text());
@@ -511,7 +517,7 @@ public class YoloClassifierImpl implements YoloClassifier {
             }
 
             // ===== Stage 2 (thinking) · CC :860-940 · stage1 block/null → stage2 =====
-            StageCallOutcome s2 = runStage(provider, resolved, modelName, xmlSystemPrompt,
+            StageCallOutcome s2 = runStage(resolved, modelName, xmlSystemPrompt,
                 wrappedContent + YoloPromptBuilder.XML_S2_SUFFIX, ctx, 2);
             Boolean s2Block = YoloPromptBuilder.parseXmlBlock(s2.text());
             // CC :889-891 — totalUsage = combineUsage(stage1Usage, stage2Usage)（:889-891）
@@ -559,7 +565,6 @@ public class YoloClassifierImpl implements YoloClassifier {
      * 包裹，:1040-1061）→ tools=[classify_result] + tool_choice（:1151-1155）→ 解析 tool_use
      * 块（:1193-1237）→ usage（:1168-1190 extractUsage）+ context-delta 遥测日志。
      *
-     * @param provider      LLM provider
      * @param resolved      单模型真实配置
      * @param modelName     分类器模型名
      * @param systemPrompt  原样 system prompt（tool_use 输出格式）
@@ -569,7 +574,7 @@ public class YoloClassifierImpl implements YoloClassifier {
      * @return 分类结果（CC shouldBlock 契约）
      */
     private YoloClassifierResult classifySingleStage(
-            LlmProvider provider, ModelConfigResolver.ResolvedModel resolved, String modelName,
+            ModelConfigResolver.ResolvedModel resolved, String modelName,
             String systemPrompt, String userMessage, PromptLengths promptLengths, ToolUseContext ctx) {
         long overallStart = System.currentTimeMillis();
         try {
@@ -596,10 +601,10 @@ public class YoloClassifierImpl implements YoloClassifier {
                 //   归因边静默丢失。TUC 上的值由 SubagentExecutor（子代理）/
                 //   buildBaseToolUseContext（主·后台 loop）在各自线程显式盖章后随 TUC 下传。
                 ctx != null ? ctx.agentContext() : null);
-            AssistantMessage msg = callWithOptionsRetry(provider, resolved.config(), modelName,
+            LlmProvider.LlmInvocationResult msg = callWithOptionsRetry(resolved.config(), modelName,
                 systemPrompt, userMessage, options, ctx);
             long durationMs = System.currentTimeMillis() - overallStart;
-            // CC :1168-1173 usage 提取（chatWithOptionsMessage 返回 AgentUsage → ClassifierUsage）
+            // CC :1168-1173 usage 提取（旁路结果 AgentUsage → ClassifierUsage）
             ClassifierUsage usage = extractUsage(msg.usage());
             String requestId = msg.requestId();
             // CC :1193-1213 — extractToolUseBlock 找 classify_result 块；无 → block for safety
@@ -807,27 +812,12 @@ public class YoloClassifierImpl implements YoloClassifier {
     }
 
     /**
-     * [IMP-6 OPD-WF6-02-RV] usage 提取（chatWithRaw 通道）· 对齐 CC {@code extractUsage}
-     * （yoloClassifier.ts:609-618）：从 API 响应 usage 提取 4 token 字段。
-     *
-     * @param raw chatWithRaw 原始响应（usage 可为 null = provider 未暴露）
-     * @return ClassifierUsage；raw/usage 为 null → null（Java 如实暴露缺口，CC 恒有值）
-     */
-    private static ClassifierUsage extractUsage(LlmProvider.LlmRawResponse raw) {
-        if (raw == null || raw.usage() == null) {
-            return null;
-        }
-        LlmProvider.LlmUsage u = raw.usage();
-        return new ClassifierUsage(u.inputTokens(), u.outputTokens(),
-            u.cacheReadInputTokens(), u.cacheCreationInputTokens());
-    }
-
-    /**
-     * [IMP-6 OPD-WF6-02-RV] usage 提取（chatWithOptionsMessage 通道）· 对齐 CC {@code extractUsage}
+     * [IMP-6 OPD-WF6-02-RV] usage 提取（旁路结果通道）· 对齐 CC {@code extractUsage}
      * （yoloClassifier.ts:609-618）。
      *
-     * <p>Java 1-stage 经 chatWithOptionsMessage 返回 {@link AssistantMessage#usage()}
-     * （AgentUsage，零初始化 EMPTY 哨兵）；4 token 字段（long）投影到 CC ClassifierUsage（int）。
+     * <p>[usage-gateway] 迁移前分 chatWithRaw/chatWithOptionsMessage 两个重载；收口后统一从
+     * {@link LlmProvider.LlmInvocationResult#usage()}（AgentUsage，零初始化 EMPTY 哨兵）投影：
+     * 4 token 字段（long）→ CC ClassifierUsage（int）。
      *
      * @param u AgentUsage（null/EMPTY → 全零 ClassifierUsage，对齐 CC 缺省 0 语义）
      * @return ClassifierUsage（恒非 null）
@@ -1080,54 +1070,58 @@ public class YoloClassifierImpl implements YoloClassifier {
      * <p>durationMs = chatWithRaw 返回后立即测量（纯 LLM 调用，对齐 CC stage1DurationMs
      * = Date.now() - stage1Start，:796/:882）。
      *
-     * <p>[IMP-6 OPD-WF6-02-RV] usage：chatWithRaw 原始响应携带 usage（LlmRawResponse.usage，
-     * AnthropicSdkProvider 从 message.usage 提取）→ extractUsage 填充 StageCallOutcome.usage。
+     * <p>[IMP-6 OPD-WF6-02-RV] usage：旁路结果携带 usage（LlmInvocationResult.usage，网关 projections）
+     * → extractUsage 填充 StageCallOutcome.usage。
      *
      * @return (text, msgId, requestId, durationMs, usage) 五元组
      */
     private StageCallOutcome runStage(
-            LlmProvider provider, ModelConfigResolver.ResolvedModel resolved, String modelName,
+            ModelConfigResolver.ResolvedModel resolved, String modelName,
             String systemPrompt, String userMessage, ToolUseContext ctx, int stageNum) throws Exception {
         long startMs = System.currentTimeMillis();
-        LlmProvider.LlmRawResponse raw = callWithRetry(provider, resolved.config(), modelName,
+        LlmProvider.LlmInvocationResult raw = callWithRetry(resolved.config(), modelName,
             systemPrompt, userMessage, ctx);
         long durationMs = System.currentTimeMillis() - startMs;
+        // [usage-gateway] 保持旧「provider 未暴露 usage ⇒ null」语义：LlmInvocationResult.usage()
+        //   恒非 null（缺省 AgentUsage.EMPTY），故以 totalTokens()==0 视作未上报 → null
+        //   （等价旧 LlmRawResponse.usage()==null → extractUsage 返回 null）。
+        ClassifierUsage usage = (raw.usage() != null && raw.usage().totalTokens() > 0)
+            ? extractUsage(raw.usage()) : null;
         if (log.isInfoEnabled()) {
-            log.info("[YoloClassifier] stage {} chatWithRaw 提取: msgId={} requestId={} contentLen={} usage={}",
-                stageNum, raw.id(), raw.requestId(), raw.content().length(), raw.usage() != null);
+            log.info("[YoloClassifier] stage {} 调用提取: msgId={} requestId={} contentLen={} usage={}",
+                stageNum, raw.id(), raw.requestId(), raw.content().length(), usage != null);
         }
-        return new StageCallOutcome(raw.content(), raw.id(), raw.requestId(), durationMs,
-            extractUsage(raw));
+        return new StageCallOutcome(raw.content(), raw.id(), raw.requestId(), durationMs, usage);
     }
 
     /**
      * [S06 OPD-WF6-07] 分类器调用重试 · 对齐 CC sideQuery
      * {@code maxRetries: getDefaultMaxRetries()}（withRetry.ts:789-797，429/5xx）。
      *
-     * <p>Java chatWithRaw 无内置重试（实证 OPD-WF6-07）→ 本方法实现：
+     * <p>Java 旁路调用无内置重试（实证 OPD-WF6-07）→ 本方法实现：
      * 429/5xx（含 529）→ 指数退避（0.5s × 2^attempt，cap 8s）重试至多 10 次；
      * abort → 取消；其它错误（400/超时）→ 原样上抛（fail-closed，重试无意义）。
      */
-    private LlmProvider.LlmRawResponse callWithRetry(
-            LlmProvider provider, ProviderConfig config, String modelName,
+    private LlmProvider.LlmInvocationResult callWithRetry(
+            ProviderConfig config, String modelName,
             String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
-        return callWithRetryGeneric(() -> callWithAgentContext(provider, config, modelName, systemPrompt, userMessage, ctx), ctx);
+        return callWithRetryGeneric(() -> callWithAgentContext(config, modelName, systemPrompt, userMessage, ctx), ctx);
     }
 
     /**
-     * [IMP-6] 1-stage 分类器调用（chatWithOptionsMessage 通道）+ 重试 · 对齐 CC sideQuery
+     * [IMP-6] 1-stage 分类器调用（classify_result 工具协议通道）+ 重试 · 对齐 CC sideQuery
      * maxRetries=getDefaultMaxRetries()（withRetry.ts:789-797，429/5xx）。
      *
-     * <p>工具协议（tools + tool_choice）只能经 {@code chatWithOptionsMessage} 发送
-     * （chatWithRaw 无 tools 通道）；usage 从返回的 {@link AssistantMessage#usage()}
+     * <p>工具协议（tools + tool_choice）只能经 {@code chatWithOptionsMessage}/{@code sideCallClient.message}
+     * 发送（无 tools 通道的调用方无法承载）；usage 从返回的 {@link LlmProvider.LlmInvocationResult#usage()}
      * （AgentUsage）提取。
      */
-    private AssistantMessage callWithOptionsRetry(
-            LlmProvider provider, ProviderConfig config, String modelName,
+    private LlmProvider.LlmInvocationResult callWithOptionsRetry(
+            ProviderConfig config, String modelName,
             String systemPrompt, String userMessage,
             LlmProvider.ChatRequestOptions options, ToolUseContext ctx) throws Exception {
         return callWithRetryGeneric(() ->
-            callWithOptionsAgentContext(provider, config, modelName, systemPrompt, userMessage, options), ctx);
+            callWithOptionsAgentContext(config, modelName, systemPrompt, userMessage, options), ctx);
     }
 
     /**
@@ -1168,11 +1162,12 @@ public class YoloClassifierImpl implements YoloClassifier {
     }
 
     /**
-     * chatWithRaw 调用 · supplyAsync 虚拟线程不继承创建线程 ThreadLocal → 显式传 agentContext
-     * （不跨线程回放任何环境态）；超时 get(...) 兜底。
+     * 2-stage stage 调用 · [usage-gateway] 收口到 {@link com.nexusai.application.agent.cost.LlmSideCallClient}：
+     * supplyAsync 虚拟线程不继承创建线程 ThreadLocal → 显式传 agentContext（经 options 末位透传，
+     * 不跨线程回放任何环境态）；超时 get(...) 兜底。返回值/异常/超时语义与旧 chatWithRaw 通道逐字一致。
      */
-    private LlmProvider.LlmRawResponse callWithAgentContext(
-            LlmProvider provider, ProviderConfig config, String modelName,
+    private LlmProvider.LlmInvocationResult callWithAgentContext(
+            ProviderConfig config, String modelName,
             String systemPrompt, String userMessage, ToolUseContext ctx) throws Exception {
         // [批 5b-1] 归因上下文的**唯一来源 = 显式载体 ctx.agentContext()**：
         //   本方法被 callWithRetry 在 classify()/classifyTextAction() 的 commonPool worker 上调用，
@@ -1186,26 +1181,42 @@ public class YoloClassifierImpl implements YoloClassifier {
         if (log.isDebugEnabled()) {
             log.debug("YoloClassifier: stage 调用 {} (agentContext={})", modelName, agentContext != null);
         }
+        // [usage-gateway] 归属：sessionId/agentId 取自 ToolUseContext（ctx.sessionId()/ctx.agentId()）；
+        //   agentContext 经 options 末位透传（等价旧 chatWithRaw 末位形参），故 usage 用 inSession
+        //   承载会话归属、**不**再重复 withAgentContext（网关自身从 options.agentContext() 取归因边）。
+        //   options 无 tools/无 cache（等价旧 chatWithRaw：无 tools 通道、无 cache 控制）。
+        final String sessionId = ctx != null ? ctx.sessionId() : null;
+        final String agentId = (ctx != null && ctx.agentId() != null) ? ctx.agentId().toString() : null;
+        LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
+            List.of(), null, null, null, null, null, null, null, agentContext);
         return CompletableFuture.supplyAsync(() ->
-            provider.chatWithRaw(config, modelName, systemPrompt, userMessage, agentContext)
+            sideCallClient.message(config, modelName, systemPrompt, userMessage, options,
+                com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage.inSession(
+                    sessionId, agentId,
+                    com.nexusai.infra.llm.UsageCategory.CLASSIFIER, "yolo-classifier-stage"))
         ).get(timeoutSeconds, TimeUnit.SECONDS);
     }
 
     /**
-     * [IMP-6] chatWithOptionsMessage 调用 · 与 {@link #callWithAgentContext} 同构
-     * （显式传 agentContext + 超时）。
-     *
-     * <p>1-stage classify_result 工具协议的唯一发送通道（tools + tool_choice 仅本方法支持）。
+     * [IMP-6] 1-stage classify_result 调用 · [usage-gateway] 收口到
+     * {@link com.nexusai.application.agent.cost.LlmSideCallClient}（options 承载 tools + tool_choice +
+     * agentContext），超时 get(...) 兜底，语义与旧 chatWithOptionsMessage 通道逐字一致。
      */
-    private AssistantMessage callWithOptionsAgentContext(
-            LlmProvider provider, ProviderConfig config, String modelName,
+    private LlmProvider.LlmInvocationResult callWithOptionsAgentContext(
+            ProviderConfig config, String modelName,
             String systemPrompt, String userMessage,
             LlmProvider.ChatRequestOptions options) throws Exception {
         if (log.isDebugEnabled()) {
             log.debug("YoloClassifier: 1-stage classify_result 调用 {}", modelName);
         }
+        // [usage-gateway] 本方法只有 options、无 ToolUseContext 形参 ⇒ 拿不到 sessionId：归属
+        //   standalone(CLASSIFIER, "yolo-classifier-1stage")，agentContext 经 options 透传
+        //   （亦随 withAgentContext 提供归因边；网关同时从 options.agentContext() 读取）。
         return CompletableFuture.supplyAsync(() ->
-            provider.chatWithOptionsMessage(config, modelName, systemPrompt, userMessage, options)
+            sideCallClient.message(config, modelName, systemPrompt, userMessage, options,
+                com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                    .standalone(com.nexusai.infra.llm.UsageCategory.CLASSIFIER, "yolo-classifier-1stage")
+                    .withAgentContext(options != null ? options.agentContext() : null))
         ).get(timeoutSeconds, TimeUnit.SECONDS);
     }
 

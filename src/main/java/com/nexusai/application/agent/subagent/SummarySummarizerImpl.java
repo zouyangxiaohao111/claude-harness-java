@@ -71,6 +71,19 @@ public class SummarySummarizerImpl implements SummarySummarizer {
         this.modelName = modelName;
     }
 
+    /**
+     * [usage-gateway] 会话账本注册表（可选）· 由构造点 {@code SubagentExecutor} 注入，
+     * 使「子代理摘要」这次非流式旁路调用的用量/费用记入同一会话账目（此前完全不计费）。
+     * 未注入（测试直构）→ 不记账，行为等价改造前。
+     */
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
+
+    /** [usage-gateway] setter 注入口（仓库范式：测试/构造点显式注入，不用 ThreadLocal）。 */
+    public void setUsageLedgerRegistry(
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry registry) {
+        this.usageLedgerRegistry = registry;
+    }
+
     @Override
     public List<AgentMessage> readTranscript(String agentId) {
         // CC agentSummary.ts:68 getAgentTranscript(agentId)
@@ -144,7 +157,22 @@ public class SummarySummarizerImpl implements SummarySummarizer {
                 log.debug("[SummarySummarizerImpl] agent {} fork 摘要, {} 条 clean 上下文, abort={}",
                     agentId, history.size(), abortController != null);
             }
-            String summary = provider.chatWithOptions(providerConfig, modelName, null, prompt, options);
+            // [usage-gateway] 收口到请求网关（替代 provider.chatWithOptions 直呼）：
+            //   归属 = 会话根下的「子代理摘要」节点（非 query 循环的一次性旁路调用）；
+            //   账本按 sessionId 取，未注入（测试直构）→ 不记账。
+            //   等价性：网关内部仍走 provider 的 invoke → chatWithOptionsMessage → chatWithOptions，
+            //   异常/取消语义不变（CancellationException 仍由下方 catch 归一为 null）。
+            com.nexusai.infra.llm.UsageAttribution who =
+                (sessionId != null && !sessionId.isBlank())
+                    ? new com.nexusai.infra.llm.UsageAttribution(sessionId, sessionId,
+                        com.nexusai.infra.llm.UsageCategory.SUBAGENT, sessionId, 1, "agent-summary")
+                    : com.nexusai.infra.llm.UsageAttribution.unknown(null);
+            com.nexusai.application.agent.cost.SessionUsageLedger ledger = usageLedgerRegistry != null
+                ? usageLedgerRegistry.forSession(sessionId) : null;
+            String summary = com.nexusai.infra.llm.LlmInvocationGateway.invoke(
+                llmProviderFactory, null,
+                com.nexusai.infra.llm.LlmInvocationRequest.of(providerConfig, modelName, null, prompt,
+                    options, "agent_summary", who, ledger)).content();
             if (log.isDebugEnabled()) {
                 log.debug("[SummarySummarizerImpl] agent {} summary: {}", agentId,
                     summary != null ? summary.substring(0, Math.min(summary.length(), 120)) : "null");

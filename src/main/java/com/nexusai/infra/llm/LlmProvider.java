@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.prompt.CacheScope;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.model.session.dto.ChatMessageDto;
 
@@ -107,11 +108,15 @@ public interface LlmProvider {
                 // [参数位置] 追加在参数表末尾 —— 本接口 3 个重载在测试树被 Mockito 以纯 positional
                 //   索引消费（inv.getArgument(9/10/16) 等），中部插入会静默漂移既有索引；
                 //   末尾追加与之逐位兼容（同 skipCacheWrite 的既有取舍）。
-                com.nexusai.application.agent.subagent.AgentContext agentContext,
+                // [usage-gateway] 末参类型由 AgentContext 升级为 LlmCallScope（**形参个数不变**，
+                //   位置索引零漂移）：scope 内既有 agentContext（归因语义逐字保留），又新增 sink
+                //   （用量采集器，provider 在每次尝试结局写入；网关读后统一记账）——
+                //   用户裁定：用量统计前置到请求网关，流中断/取消/失败也要统计。
+                LlmCallScope scope,
                 // [流空闲看门狗 · 用户裁定 10-10] 末参追加（同上两条"末尾追加保 positional 索引"取舍）：
                 //   单次调用的看门狗控制载体（专用中止 controller + forceNonStreaming）；
                 //   无看门狗路径传 StreamIdleControl.NONE。消费点见 AnthropicSdkProvider.doStream。
-                StreamIdleControl streamIdleControl);
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl);
 
     /**
      * [CCJ-EXEC-08] 18-arg 流式 · <b>带 thinkingConfig 透传</b>（含 effortValue）。
@@ -148,8 +153,9 @@ public interface LlmProvider {
                         Consumer<Throwable> onError,
                         Runnable onComplete,
                         Boolean skipCacheWrite,
-                        com.nexusai.application.agent.subagent.AgentContext agentContext,
-                        StreamIdleControl streamIdleControl) {
+                        // [usage-gateway] 末参 LlmCallScope（含 agentContext + 用量 sink）· 见抽象重载
+                        LlmCallScope scope,
+                        com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [merge-fix] ⊕C-1 blocks 唯一发送契约：String 兼容链已删（16-arg String 委托目标不在
         //   合并接口），默认实现把 systemPrompt 折为单 block（CacheScope.NULL = 不缓存，join 恒等）
         //   路由到 blocks 抽象重载；thinkingConfig 忽略（与原有默认语义一致）。
@@ -158,7 +164,7 @@ public interface LlmProvider {
             history, tools, maxOutputTokensOverride, taskBudget, effortValue, null, /* querySource */
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext,    // [A#3] 显式归因上下文透传（virtual-thread 边界不可丢）
+            scope,   // [A#3] 显式归因上下文 + 用量 sink 透传（virtual-thread 边界不可丢）
             streamIdleControl);   // [看门狗] 末参透传
     }
 
@@ -193,18 +199,33 @@ public interface LlmProvider {
                         Consumer<Throwable> onError,
                         Runnable onComplete,
                         Boolean skipCacheWrite,
-                        com.nexusai.application.agent.subagent.AgentContext agentContext,
-                        StreamIdleControl streamIdleControl) {
+                        // [usage-gateway] 末参 LlmCallScope（含 agentContext + 用量 sink）
+                        LlmCallScope scope,
+                        com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         stream(config, modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
             onStreamingFallback, abortController, onError, onComplete, skipCacheWrite,
-            agentContext,    // [A#3] 显式归因上下文透传
+            scope,   // [A#3] 显式归因上下文 + 用量 sink 透传
             streamIdleControl);   // [看门狗] 末参透传
     }
 
     /**
      * 静态（非流式）chat completion · 用于快速模型（标题生成等）。
+     *
+     * <pre>
+     * [usage-gateway] 原 待办 的落地说明（用户 2026-10-10 手写，保留原始诉求以备查，勿删）
+     * ─────────────────────────────────────────────────────────────────────
+     * 原 待办 文本：「实现此方法的实例应当将请求后返回的用量信息纳入统计」
+     *
+     * 落地方式：本方法（返回 String、无 usage 出口）保留为**遗留便捷入口**；
+     *   用量统计统一走 {@link #invoke}（非流式唯一入口，返回完整 {@link AgentUsage}）→
+     *   请求网关 {@code LlmInvocationGateway.invoke(...)} → 账本 {@code SessionUsageLedger}。
+     *   各 provider 已在 {@code invoke} 内完成 usage 解析与上报（含 OpenAI {@code chatWithRaw}
+     *   原先恒 null 的缺口）。待旁路调用全部迁移到网关后，本方法的调用方应为 0；
+     *   若仍有调用方，说明该处用量未统计（可通过 {@code llm_usage_calls} 明细表核对）。
+     * ─────────────────────────────────────────────────────────────────────
+     * </pre>
      *
      * @param config       解密后的运行时配置（baseUrl + apiKey）
      * @param modelName    模型名
@@ -566,5 +587,82 @@ public interface LlmProvider {
                                                     ChatRequestOptions options) {
         String content = chatWithOptions(config, modelName, systemPrompt, userMessage, options);
         return new AssistantMessage(content, "stop", List.of(), "");
+    }
+
+    /**
+     * [usage-gateway] 非流式<b>统一入口</b>（请求网关调用）· 与 {@link #stream} 对称：
+     * 流式与非流式从此各只有一个网关入口，用量一律经 {@link LlmCallScope#sink()} 上报。
+     *
+     * <p><b>WHY 需要统一入口（旧状问题）</b>：非流式侧此前有 4 个方法各有不同缺口 ——
+     * {@link #chat} / {@link #chatWithOptions} 只返回 {@code String}（usage 无处可回）、
+     * {@link #chatWithRaw} 的 {@link LlmRawResponse#usage()} 只有 4 个 int 字段（且 OpenAI 实现
+     * 恒返回 null）、{@link #chatWithOptionsMessage} 返回 {@link AssistantMessage}（含 usage，
+     * 但只有 OpenAI 侧解析）。⇒ 21 处旁路调用全部「调用发生但用量丢失」。本方法把非流式收敛为
+     * 单一入口：返回完整结果（文本 + 工具块 + 完整 {@link AgentUsage} + 元数据），并把 usage 写入
+     * sink，由网关统一记账。
+     *
+     * <p><b>默认实现</b>：委托 {@link #chatWithOptionsMessage}（三 provider 均已覆写），
+     * 把其结果投影为 {@link LlmInvocationResult} 并 record 到 sink。provider 若能从更底层的响应
+     * 解析出更完整的 usage（如 Anthropic 的嵌套 cache_creation / server_tool_use），应覆写本方法。
+     *
+     * @param config       解密后的运行时配置
+     * @param modelName    模型名（调用方传入名；计费键归一化由网关/账本负责）
+     * @param systemPrompt 系统提示词（可 null）
+     * @param userMessage  单条 user 消息
+     * @param options      chat 选项（可 null）
+     * @param scope        调用作用域（agentContext + 用量 sink；可 null）
+     * @return 非流式调用结果（usage 恒非 null：无上报时为 {@link AgentUsage#EMPTY} 并标记 UNKNOWN）
+     */
+    default LlmInvocationResult invoke(ProviderConfig config,
+                                       String modelName,
+                                       String systemPrompt,
+                                       String userMessage,
+                                       ChatRequestOptions options,
+                                       LlmCallScope scope) {
+        long startedAt = System.currentTimeMillis();
+        AssistantMessage msg = chatWithOptionsMessage(config, modelName, systemPrompt, userMessage, options);
+        AgentUsage usage = msg != null ? msg.usage() : null;
+        LlmCallScope.recordSettled(scope, usage);
+        return new LlmInvocationResult(
+            msg != null ? msg.content() : "",
+            msg != null ? msg.finishReason() : null,
+            msg != null && msg.toolCalls() != null ? msg.toolCalls() : List.of(),
+            usage != null ? usage : AgentUsage.EMPTY,
+            null, null, null,                     // id / thinking / requestId（provider 未暴露 → null）
+            modelName,
+            System.currentTimeMillis() - startedAt);
+    }
+
+    /**
+     * [usage-gateway] 非流式调用结果 · 请求网关的统一返回载荷。
+     *
+     * <p>字段是既有 4 个非流式方法的<b>并集投影</b>（{@link #chat} 的文本、{@link #chatWithRaw}
+     * 的 id/thinking/requestId、{@link #chatWithOptionsMessage} 的 toolCalls、以及所有路径都缺的
+     * 完整 {@link AgentUsage}），使调用方迁移到网关时零信息损失。
+     *
+     * @param content      响应文本（可空串，恒非 null）
+     * @param finishReason 结束原因（provider 未暴露 → null）
+     * @param toolCalls    工具调用块（无 → 空列表）
+     * @param usage        完整用量（恒非 null；无上报 = {@link AgentUsage#EMPTY}）
+     * @param id           上游消息 id（可 null）
+     * @param thinking     推理内容（可 null）
+     * @param requestId    上游 request id（可 null）
+     * @param modelName    本次调用使用的模型名（调用方传入名）
+     * @param elapsedMs    调用耗时（ms）
+     */
+    record LlmInvocationResult(String content,
+                               String finishReason,
+                               List<ToolUseBlock> toolCalls,
+                               AgentUsage usage,
+                               String id,
+                               String thinking,
+                               String requestId,
+                               String modelName,
+                               long elapsedMs) {
+        public LlmInvocationResult {
+            content = content == null ? "" : content;
+            toolCalls = toolCalls == null ? List.of() : List.copyOf(toolCalls);
+            usage = usage == null ? AgentUsage.EMPTY : usage;
+        }
     }
 }

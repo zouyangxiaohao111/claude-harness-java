@@ -125,7 +125,8 @@ class SubagentSyncForegroundRegistrationTest {
             svc, coordinator, true,
             agentId.toString(), tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null, null);
+            null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle)
                 .as("sync 摘要门必须在 summaryTaskId 非 null 且 sdk=true 时命中（生产接线打通后 summaryTaskId 不再恒 null）")

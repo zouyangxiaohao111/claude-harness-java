@@ -2,6 +2,7 @@ package com.nexusai.application.agent.permission.hook;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.attachment.AttachmentMessageDto;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.permission.hook.GenericHook.HookOutcome;
 import com.nexusai.application.agent.permission.hook.GenericHook.HookResult;
 import com.nexusai.infra.llm.AssistantMessage;
@@ -36,6 +37,39 @@ class ExecPromptHookSemanticsTest {
     private final ObjectMapper objectMapper = new ObjectMapper();
     private final HookEvent hookEvent = HookEvent.userPromptSubmit("sess-1", "agent-1", "do something");
 
+    /** [usage-gateway] 当前用例 provider：旁路客户端 stub 把调用委派给它（保留既有 provider 桩语义）。 */
+    private final java.util.concurrent.atomic.AtomicReference<LlmProvider> activeProvider =
+        new java.util.concurrent.atomic.AtomicReference<>();
+
+    /**
+     * [usage-gateway] ExecPromptHook 现经统一旁路客户端发起 LLM 调用（侧信道收口 + 记账）。本 helper
+     * 注入 mock 客户端并把调用委派给 {@link #ctxOf} 登记的 provider —— 完整保留既有 provider 桩的
+     * 响应/选项捕获/异常传播语义（hook 语义：选项构建、占位符替换、outcome 分流，照旧验证）。
+     */
+    private ExecPromptHook newHook() {
+        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        LlmSideCallClient client = org.mockito.Mockito.mock(LlmSideCallClient.class);
+        org.mockito.Mockito.when(client.chat(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> activeProvider.get().chatWithOptions(
+                inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                inv.getArgument(3), inv.getArgument(4)));
+        org.springframework.test.util.ReflectionTestUtils.setField(hook, "sideCallClient", client);
+        return hook;
+    }
+
+    /** 构造 PromptLlmContext 并登记本用例 provider（[usage-gateway] provider 仅作响应来源）。 */
+    private ExecPromptHook.PromptLlmContext ctxOf(
+            LlmProvider provider, String defaultFastModel,
+            List<com.nexusai.application.agent.tool.Tool> tools,
+            com.nexusai.application.agent.subagent.AgentContext agentContext) {
+        activeProvider.set(provider);
+        return new ExecPromptHook.PromptLlmContext(
+            provider, ProviderConfig.empty(), defaultFastModel, tools, agentContext);
+    }
+
     private LlmProvider echoProvider(String response) {
         return new LlmProvider() {
             @Override public String type() { return "test"; }
@@ -52,7 +86,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (response == null) throw new RuntimeException("provider exploded");
                 return response;
@@ -76,7 +111,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (capturedUser != null) capturedUser.set(u);
                 return response;
@@ -85,10 +121,10 @@ class ExecPromptHookSemanticsTest {
     }
 
     private HookResult exec(String response, String prompt, Integer timeout) {
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook(prompt, null, timeout, null, null, null);
         ExecPromptHook.PromptLlmContext ctx =
-            new ExecPromptHook.PromptLlmContext(echoProvider(response), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+            ctxOf(echoProvider(response), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         return hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
     }
 
@@ -123,7 +159,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
@@ -136,10 +173,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("allow if safe", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            provider, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, subCtx);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            provider, DEFAULT_FAST_MODEL, null, subCtx);
 
         String testThread = Thread.currentThread().getName();
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"ls\"}", ctx, null);
@@ -164,11 +201,11 @@ class ExecPromptHookSemanticsTest {
         // WHY: CC blockingError 是 {blockingError, command} record, command=hook.prompt 供审计/UI 追溯
         // 触发阻塞的 hook 命令。旧 Java 传 null command（探查 §C 4 "blockingError.command=null 是语义 bug"）。
         String prompt = "deny if rm";
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook(prompt, null, null, null, null, null);
         ExecPromptHook.PromptLlmContext ctx =
-            new ExecPromptHook.PromptLlmContext(echoProvider("{\"ok\": false, \"reason\": \"dangerous\"}"),
-                ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+            ctxOf(echoProvider("{\"ok\": false, \"reason\": \"dangerous\"}"),
+                DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"rm\"}", ctx, null);
 
@@ -274,7 +311,7 @@ class ExecPromptHookSemanticsTest {
         assertThat(exec("garbage", "check $ARGUMENTS", null).outcome())
             .isEqualTo(HookOutcome.NON_BLOCKING_ERROR);
         // cancelled (timeout)
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, 1, null, null, null);
         LlmProvider slow = new LlmProvider() {
             @Override public String type() { return "test"; }
@@ -291,7 +328,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 try { Thread.sleep(2000); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); throw new RuntimeException(e);
@@ -300,7 +338,7 @@ class ExecPromptHookSemanticsTest {
             }
         };
         HookResult cancelled = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}",
-            new ExecPromptHook.PromptLlmContext(slow, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */), null);
+            ctxOf(slow, DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */), null);
         assertThat(cancelled.outcome()).isEqualTo(HookOutcome.CANCELLED);
     }
 
@@ -308,10 +346,10 @@ class ExecPromptHookSemanticsTest {
     @DisplayName("$ARGUMENTS 占位符替换后送入 LLM（CC :35 addArgumentsToPrompt + argumentSubstitution.ts:136）")
     void execPromptHook_argumentsPlaceholder_substituted() {
         AtomicReference<String> capturedUser = new AtomicReference<>();
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("eval input: $ARGUMENTS", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            echoProviderWithCapture(capturedUser, "{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            echoProviderWithCapture(capturedUser, "{\"ok\": true}"), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
 
@@ -345,7 +383,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -356,10 +395,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{\"tool\":\"bash\"}", ctx, null);
 
@@ -395,7 +434,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -421,10 +461,10 @@ class ExecPromptHookSemanticsTest {
             }
         };
         List<com.nexusai.application.agent.tool.Tool> parentTools = List.of(readTool);
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, parentTools, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, DEFAULT_FAST_MODEL, parentTools, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -463,7 +503,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -474,10 +515,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);  // hook.model = null
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), "", null, null /* [批 5b-1] agentContext */);   // defaultFastModel = 空串
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, "", null, null /* [批 5b-1] agentContext */);   // defaultFastModel = 空串
 
         HookResult r = hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -524,7 +565,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -536,10 +578,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("eval: $ARGUMENTS", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
         List<com.nexusai.model.session.dto.ChatMessageDto> prior =
             List.of(userMsg("prior-1"), userMsg("prior-2"));
 
@@ -572,7 +614,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -583,10 +626,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null, null);   // 6 参入口等价 null
 
@@ -639,7 +682,8 @@ class ExecPromptHookSemanticsTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new UnsupportedOperationException("chatWithOptions 必须被调用");
             }
@@ -650,10 +694,10 @@ class ExecPromptHookSemanticsTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            capturing, ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            capturing, DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, null);
 
@@ -669,10 +713,10 @@ class ExecPromptHookSemanticsTest {
     void execPromptHook_parentAbortListenerRemoved() {
         com.nexusai.application.agent.tool.AbortController parent =
             new com.nexusai.application.agent.tool.AbortController();
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook();
         PromptHook cfg = new PromptHook("check", null, null, null, null, null);
-        ExecPromptHook.PromptLlmContext ctx = new ExecPromptHook.PromptLlmContext(
-            echoProvider("{\"ok\": true}"), ProviderConfig.empty(), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
+        ExecPromptHook.PromptLlmContext ctx = ctxOf(
+            echoProvider("{\"ok\": true}"), DEFAULT_FAST_MODEL, null, null /* [批 5b-1] agentContext */);
 
         hook.exec(cfg, HOOK_NAME, hookEvent, "{}", ctx, parent);
 

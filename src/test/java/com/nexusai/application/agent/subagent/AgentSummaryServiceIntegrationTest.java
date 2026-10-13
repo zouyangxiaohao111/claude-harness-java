@@ -73,7 +73,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Runnable onStreamingFallback,
                                      com.nexusai.application.agent.tool.AbortController abortController,
                                      Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));
@@ -111,7 +112,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
                                      Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));
@@ -155,7 +157,8 @@ class AgentSummaryServiceIntegrationTest {
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
                                      Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (onChunk != null) onChunk.accept("Reading runAgent.ts");
             if (onAssistantMessage != null) {
                 onAssistantMessage.accept(new AssistantMessage("Reading runAgent.ts", "stop", List.of()));
@@ -198,6 +201,16 @@ class AgentSummaryServiceIntegrationTest {
         public LlmProvider getProvider(ProviderConfig config) {
             return provider;
         }
+        /**
+         * [usage-gateway] 2 参重载同样固定返回 —— 摘要调用已收口到请求网关
+         * （{@code LlmInvocationGateway.invoke} → {@code resolve(...)} 走 2 参 {@code getProvider(config, type)}
+         * → {@code provider.invoke} → 默认实现回落 {@code chatWithOptionsMessage} → {@code chatWithOptions}）。
+         * 若不覆写本重载：真实实现读未装配的 {@code @Autowired} 字段返回 null ⇒ 摘要被 catch 吞成 null。
+         */
+        @Override
+        public LlmProvider getProvider(ProviderConfig config, String providerType) {
+            return provider;
+        }
     }
 
     @AfterEach
@@ -224,7 +237,8 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-1", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null);
+            ProviderConfig.empty(), "test-model", null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-1");
@@ -249,7 +263,8 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-2", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null);
+            ProviderConfig.empty(), "test-model", null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNull();
             assertThat(svc.activeAgents()).doesNotContain("agent-2");
@@ -274,7 +289,8 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.BACKGROUNDED, null,
             svc, coordinator, true, "agent-sdk", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null);
+            ProviderConfig.empty(), "test-model", null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-sdk");
@@ -300,7 +316,8 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-fork", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null);
+            ProviderConfig.empty(), "test-model", null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
             assertThat(svc.activeAgents()).contains("agent-fork");

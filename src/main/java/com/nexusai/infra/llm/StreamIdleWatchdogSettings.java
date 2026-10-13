@@ -10,7 +10,7 @@ import org.slf4j.LoggerFactory;
  * <p>CC 证据：开关 {@code KT=a.CLAUDE_ENABLE_STREAM_WATCHDOG??!0}（exe 223,134,892，未设 = 开）；
  * 阈值 {@code WJt(){return Math.max(am()??0, 300000)}}（exe 216,198,281），{@code am()} 读
  * env {@code CLAUDE_STREAM_IDLE_TIMEOUT_MS}（>0 生效）否则远端配置——本仓对应层 = DB 设置
- * （V78 列，前端「设置→通用」页，用户 10-10 追加要求）。<b>300000 是下限</b>：env/设置设更低
+ * （V100 列，前端「设置→通用」页，用户 10-10 追加要求）。<b>300000 是下限</b>：env/设置设更低
  * 也会被抬到 300s（对齐 CC 原样），并打 WARN 留痕（规则十二 · 显式失败）。
  *
  * <p>解析优先级：env &gt; DB 设置 &gt; 默认 300000。

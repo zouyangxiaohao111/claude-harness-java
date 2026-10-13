@@ -72,11 +72,15 @@ class PermissionExplainerAgentContextWarnTest {
         ModelConfigResolver resolver = mock(ModelConfigResolver.class);
         AnalyticsTracker analytics = mock(AnalyticsTracker.class);
         LlmProvider provider = mock(LlmProvider.class);
+        // [usage-gateway] 旁路调用收口：桩 sideCallClient.message(...) 返回 null（不返回 tool_use）
+        //   → 方法在解析段返回 null；**不影响**本类断言的「WARN 已发出」副作用（它在 LLM 调用前）。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+            mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
 
         when(providerFactory.getProvider(any(), any())).thenReturn(provider);
         when(resolver.resolve("test-model")).thenReturn(new ModelConfigResolver.ResolvedModel(
             new ProviderConfig("https://example.com", "sk-test"), "openai_sdk"));
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any())).thenReturn(null);
+        when(sideCallClient.message(any(), any(), any(), any(), any(), any())).thenReturn(null);
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
         String sessionA = "sess-warn-a";
@@ -89,6 +93,7 @@ class PermissionExplainerAgentContextWarnTest {
         PermissionExplainer explainer =
             new PermissionExplainer(providerFactory, resolver, analytics, true);
         explainer.setSessionAgentStateRegistry(registry);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
 
         appender.list.clear();
         explainer.generatePermissionExplanation(

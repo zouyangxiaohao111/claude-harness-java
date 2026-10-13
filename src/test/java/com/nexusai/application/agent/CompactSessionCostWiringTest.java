@@ -3,9 +3,13 @@ package com.nexusai.application.agent;
 import com.nexusai.application.agent.compact.AutoCompactor;
 import com.nexusai.application.agent.compact.CompactConversation;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
+import com.nexusai.application.agent.compact.StreamCompactSummary;
 import com.nexusai.application.agent.compact.TokenEstimator;
 import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.cost.ModelCostCalculator;
+import com.nexusai.application.agent.cost.SessionUsageLedger;
+import com.nexusai.application.agent.cost.SessionUsageAccountingRegistry;
+import com.nexusai.application.agent.cost.UsageBucket;
 import com.nexusai.application.agent.loop.AgentLoopContext;
 import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.loop.LoopDeps;
@@ -14,6 +18,7 @@ import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmApiException;
+import com.nexusai.infra.llm.LlmCallScope;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ProviderConfig;
@@ -25,6 +30,7 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
 import org.mockito.stubbing.Answer;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -43,27 +49,25 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * [compact-cost] 压缩那次 LLM 调用的 usage 必须计入会话成本/用量合计（CC claude.ts:2361）。
+ * [usage-gateway · compact] 压缩那次 LLM 调用的 usage 必须经<b>请求网关</b>入会话账本
+ * （CC claude.ts:2361 的成本口径）。
  *
- * <p><b>WHY（CLAUDE.md 规则 9 · 测试验证意图）</b>：压缩调用是 side call —— CC 在
- * {@code queryModel} 的 message_delta 分支把它计入会话合计
- * （{@code claude.ts:2361 costUSD += addToTotalSessionCost(costUSDForPart, usage, options.model)}
- * → {@code cost-tracker.ts:250-276 addToTotalModelUsage} → {@code state.ts:551-558
- * STATE.totalCostUSD += cost}），两条压缩路径（fork {@code forkedAgent.ts:564} / 流式回落
- * {@code compact.ts:1331}）都命中。Java 端此前 {@code compactionUsage} 只被两个遥测点消费
- * （{@code emitTenguCompactTelemetry} / {@code emitAutoCompactSucceededTelemetry}），
- * <b>没有任何成本接线</b> → 真机漏算（sess-c72a825a auto compact preTokens≈46 万未进
- * sessions.total_cost_yuan / model_usage_json）。
+ * <p><b>WHY 改造（原 [compact-cost] 通道已删）</b>：用户裁定「压缩的用量入账必须走统一流程，
+ * 旧通道 {@code LlmAgentLoop.accumulateCompactionSessionCost} 必须删除（不允许两套）」。改造后
+ * auto / reactive 压缩的 LLM 调用（经 {@code AutoCompactor}/{@code ReactiveCompactor} 的
+ * summaryProducer = {@link StreamCompactSummary}）在 {@code StreamCompactSummary.streamOnce} 内
+ * 以真实 sessionId 盖章归属（{@code UsageCategory.COMPACT}）→ 请求网关
+ * （{@code LlmInvocationGateway.streamWith}）sink → 结算 → 会话账本
+ * （{@link SessionUsageLedger}），四类结局统一记账。本类验证该新通道（不再验证已删的旧通道）。
  *
- * <p><b>RED tooth（删掉接线 → 本类哪条断言红）</b>：
+ * <p><b>RED teeth（哪条断言红）</b>：
  * <ul>
- *   <li>{@code LlmAgentLoop} auto 成功分支的 {@code accumulateCompactionSessionCost(...)} 调用
- *       → {@link #autoCompactSuccess_addsCompactionCallToSessionCost()} 成本/桶/捕获断言全红；</li>
- *   <li>reactive 成功分支的同款调用 → {@link #reactiveCompactSuccess_addsCompactionCallToSessionCost()} 红；</li>
- *   <li>模型口径改错（传 params.modelName() / 会话主模型 / null）→
+ *   <li>压缩摘要不经网关（例如直接 {@code provider.stream} 不写 sink / 不盖 recorder）→
+ *       {@link #autoCompactSuccess_accountedViaGatewayLedger()} 的账本 calls/token/cost 断言全红；</li>
+ *   <li>reactive 分支删掉同源接线 → {@link #reactiveCompactSuccess_accountedViaGatewayLedger()} 红；</li>
+ *   <li>模型口径取错（不传 {@code modelSupplier} 的真实模型）→
  *       {@link #compactionCost_followsTheModelThatRanTheCompactionCall()} 红（金额按模型单价分派）；</li>
- *   <li>把压缩 usage 塞进 runUsage → {@link #autoCompactSuccess_addsCompactionCallToSessionCost()}
- *       的 {@code runUsage()} 零值断言红（与 CC result.usage 不含 side call 的边界）。</li>
+ *   <li>把压缩 usage 塞进 runUsage → 各用例的 {@code runUsage()} 零值断言红（side call 边界）。</li>
  * </ul>
  */
 class CompactSessionCostWiringTest {
@@ -93,46 +97,51 @@ class CompactSessionCostWiringTest {
     private record CostCall(String model, AgentUsage usage) {}
 
     // ════════════════════════════════════════════════════════════════════
-    // 1. auto 路径（LlmAgentLoop 压缩成功分支 · emitAutoCompactSucceededTelemetry 旁）
+    // 1. auto 路径（经 StreamCompactSummary → 请求网关 → 会话账本）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("auto 压缩成功：压缩调用 usage 进会话成本/用量合计（同一通道）· 不进 runUsage · CC claude.ts:2361")
-    void autoCompactSuccess_addsCompactionCallToSessionCost() {
-        AgentState state = newState();
+    @DisplayName("auto 压缩成功：压缩调用 usage 经请求网关入会话账本（COMPACT 归属）· 不进 runUsage")
+    void autoCompactSuccess_accountedViaGatewayLedger() {
+        String sessionId = "sess-auto-" + UUID.randomUUID().toString().substring(0, 8);
+        AgentState state = new AgentState("sys", sessionId, null);
         // 注：不带 assistant usage 的消息集（AutoCompactor 对「含真实 assistant usage」的会话走
         // usage-walk 阈值，本测试用注入 tokenCounter=200000 的估算路径触发自动压缩）。
         state.replaceMessages(List.of(
             message("m1", Role.user, "question-1", null, null),
             message("m2", Role.user, "question-2", null, null)));
 
-        AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
-        QueryParams callerParams0 = params(state, COMPACT_MODEL, ctx);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>(),
-            autoCompactor());
+        SessionUsageAccountingRegistry registry = ledgerRegistry(recordingCalculator());
+        StreamCompactSummary summary = summaryProvider(COMPACT_MODEL, registry);
+        AutoCompactor autoCompactor = new AutoCompactor(msgs -> 2_000_000, summary);
 
-        // ① 成本：压缩调用 4400 元入会话合计（单价 1 元/输入侧 token）
-        assertThat(state.sessionCostYuan())
-            .as("压缩调用的 usage 必须计入会话成本（CC claude.ts:2361 addToTotalSessionCost）；"
-                + "漏接线 → 0.0")
-            .isEqualTo(EXPECTED_COMPACT_COST);
-        // ② 输入 token 合计
-        assertThat(state.sessionInputTokens())
-            .as("会话 input token 合计必须含压缩调用的 1000（主循环文本回合估算 input=0）")
-            .isEqualTo(C_INPUT);
-        // ③ 按模型桶（sessions.model_usage_json 源）
-        CostTracker.ModelUsage bucket = state.sessionModelUsage().get(COMPACT_MODEL);
-        assertThat(bucket).as("model_usage_json 桶必须有压缩模型条目").isNotNull();
+        AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, null);
+        QueryParams callerParams = params(state, COMPACT_MODEL, ctx, sessionId);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            callerParams.deps().context(), callerParams, state), state, new ArrayList<>(), autoCompactor);
+
+        // ① 账本：压缩那次调用记 1 次，四通道 token 逐字段入账（COMPACT 节点 = 会话根）
+        SessionUsageLedger ledger = registry.forSession(sessionId);
+        assertThat(ledger.totalCalls())
+            .as("压缩调用必须经请求网关记入会话账本；未接线 → 0（旧通道已删，不允许两套）")
+            .isEqualTo(1L);
+        UsageBucket bucket = ledger.bucketOf(sessionId);
         assertThat(bucket.inputTokens()).isEqualTo(C_INPUT);
-        assertThat(bucket.cacheReadInputTokens()).isEqualTo(C_CACHE_READ);
-        assertThat(bucket.cacheCreationInputTokens()).isEqualTo(C_CACHE_CREATE);
-        assertThat(bucket.outputTokens())
-            .as("桶 output = 压缩调用 200 + 主循环文本回合估算（≥200）")
-            .isGreaterThanOrEqualTo(C_OUTPUT);
-        assertThat(bucket.costUSD())
-            .as("桶 costUSD 必须为压缩调用折算金额（CC addToTotalModelUsage cost 字段）")
+        assertThat(bucket.outputTokens()).isEqualTo(C_OUTPUT);
+        assertThat(bucket.cacheReadTokens()).isEqualTo(C_CACHE_READ);
+        assertThat(bucket.cacheWriteTokens()).isEqualTo(C_CACHE_CREATE);
+        assertThat(bucket.streamCalls()).isEqualTo(1L);
+        assertThat(bucket.totalCostYuan())
+            .as("成本 = ModelCostCalculator 对压缩调用 usage 的折算（单价 1 元/输入侧 token）")
             .isEqualTo(EXPECTED_COMPACT_COST);
-        // ④ 模型口径：计价调用收到的是真正执行压缩的模型
+        // ② 按模型 rollup（sessions.model_usage_json 源）
+        CostTracker.ModelUsage mu = ledger.modelUsage().get(COMPACT_MODEL);
+        assertThat(mu).as("model_usage rollup 必须有压缩模型条目").isNotNull();
+        assertThat(mu.inputTokens()).isEqualTo(C_INPUT);
+        assertThat(mu.cacheReadInputTokens()).isEqualTo(C_CACHE_READ);
+        assertThat(mu.cacheCreationInputTokens()).isEqualTo(C_CACHE_CREATE);
+        assertThat(mu.costUSD()).isEqualTo(EXPECTED_COMPACT_COST);
+        // ③ 模型口径：账本计价拿到的是真正执行压缩的模型
         assertThat(costCalls)
             .as("压缩调用必须经 ModelCostCalculator 计价，模型 = 真正执行压缩的模型")
             .anySatisfy(c -> {
@@ -142,7 +151,7 @@ class CompactSessionCostWiringTest {
                 assertThat(c.usage().cacheReadInputTokens()).isEqualTo(C_CACHE_READ);
                 assertThat(c.usage().cacheCreationInputTokens()).isEqualTo(C_CACHE_CREATE);
             });
-        // ⑤ 回归锁：runUsage（complete.usage 源）不含压缩 —— CC result.usage 只在主循环
+        // ④ 回归锁：runUsage（complete.usage 源）不含压缩 —— CC result.usage 只在主循环
         //    message_stop 累加，压缩是 side call（塞进去反而不对齐 CC）
         assertThat(state.runUsage().inputTokens()).isZero();
         assertThat(state.runUsage().outputTokens()).isZero();
@@ -151,40 +160,44 @@ class CompactSessionCostWiringTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 2. reactive 路径（LlmAgentLoop reactive 成功分支）
+    // 2. reactive 路径（同一条网关记账通道）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("reactive 压缩成功：压缩调用 usage 同样进会话成本合计（与 auto 同一通道）· CC query.ts:1134")
-    void reactiveCompactSuccess_addsCompactionCallToSessionCost() {
-        AgentState state = newState();
+    @DisplayName("reactive 压缩成功：压缩调用 usage 同样经请求网关入会话账本 · CC query.ts:1134")
+    void reactiveCompactSuccess_accountedViaGatewayLedger() {
+        String sessionId = "sess-reactive-" + UUID.randomUUID().toString().substring(0, 8);
+        AgentState state = new AgentState("sys", sessionId, null);
         preCompactMessages().forEach(state::appendMessage);
         int original = state.rawMessages().size();
 
+        SessionUsageAccountingRegistry registry = ledgerRegistry(recordingCalculator());
         ReactiveCompactor rc = new ReactiveCompactor(
-            new TokenEstimator()::estimateMessageTokens,
-            (prompt, msgs, ctx) -> new CompactConversation.SummaryResult("reactive summary", compactionUsage()));
+            new TokenEstimator()::estimateMessageTokens, summaryProvider(COMPACT_MODEL, registry));
         rc.setEnabled(true);
-        AgentLoopContext ctx = agentLoopContext(ptlOnceThenStopProvider(), rc, recordingCalculator());
+        AgentLoopContext ctx = agentLoopContext(ptlOnceThenStopProvider(), rc, null);
 
-        QueryParams callerParams1 = reactiveParams(state, COMPACT_MODEL, ctx);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state), state, new ArrayList<>());
+        QueryParams callerParams = reactiveParams(state, COMPACT_MODEL, ctx, sessionId);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            callerParams.deps().context(), callerParams, state), state, new ArrayList<>());
 
         // 前置：reactive compact 真实发生（消息被压缩）——否则本测试空转
         assertThat(state.rawMessages().size())
             .as("PTL 必须走 reactive compact（消息数下降）· CC query.ts:1138")
             .isLessThan(original);
 
-        assertThat(state.sessionCostYuan())
-            .as("reactive 压缩调用的 usage 必须计入会话成本（CC claude.ts:2361 命中两条压缩路径）；"
-                + "漏接线 → 0.0")
-            .isEqualTo(EXPECTED_COMPACT_COST);
-        assertThat(state.sessionInputTokens()).isEqualTo(C_INPUT);
-        CostTracker.ModelUsage bucket = state.sessionModelUsage().get(COMPACT_MODEL);
-        assertThat(bucket).isNotNull();
+        SessionUsageLedger ledger = registry.forSession(sessionId);
+        assertThat(ledger.totalCalls())
+            .as("reactive 压缩调用必须经请求网关记入会话账本（旧通道已删）")
+            .isEqualTo(1L);
+        UsageBucket bucket = ledger.bucketOf(sessionId);
         assertThat(bucket.inputTokens()).isEqualTo(C_INPUT);
-        assertThat(bucket.cacheReadInputTokens()).isEqualTo(C_CACHE_READ);
-        assertThat(bucket.cacheCreationInputTokens()).isEqualTo(C_CACHE_CREATE);
+        assertThat(bucket.cacheReadTokens()).isEqualTo(C_CACHE_READ);
+        assertThat(bucket.cacheWriteTokens()).isEqualTo(C_CACHE_CREATE);
+        assertThat(bucket.totalCostYuan()).isEqualTo(EXPECTED_COMPACT_COST);
+        CostTracker.ModelUsage mu = ledger.modelUsage().get(COMPACT_MODEL);
+        assertThat(mu).isNotNull();
+        assertThat(mu.inputTokens()).isEqualTo(C_INPUT);
         assertThat(costCalls)
             .as("reactive 压缩调用必须以真正执行压缩的模型计价")
             .anySatisfy(c -> {
@@ -201,28 +214,38 @@ class CompactSessionCostWiringTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("模型口径：金额按真正执行压缩的模型算 —— 换模型金额随之变（取错模型即算错）")
+    @DisplayName("模型口径：账本金额按真正执行压缩的模型算 —— 换模型金额随之变（取错模型即算错）")
     void compactionCost_followsTheModelThatRanTheCompactionCall() {
-        // ① resolveModel()=COMPACT_MODEL（单价 1 元/输入侧 token）→ 4400
-        AgentState a = newState();
+        // ① modelSupplier=COMPACT_MODEL（单价 1 元/输入侧 token）→ 4400
+        String sessionA = "sess-scope-a-" + UUID.randomUUID().toString().substring(0, 8);
+        AgentState a = new AgentState("sys", sessionA, null);
         a.replaceMessages(List.of(message("m1", Role.user, "q", null, null)));
-        AgentLoopContext ctxA = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
-        QueryParams callerParams2 = params(a, COMPACT_MODEL, ctxA);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, a), a, new ArrayList<>(), autoCompactor());
-        assertThat(a.sessionCostYuan())
+        SessionUsageAccountingRegistry regA = ledgerRegistry(recordingCalculator());
+        AgentLoopContext ctxA = agentLoopContext(plainReplyProvider(), null, null);
+        QueryParams callerA = params(a, COMPACT_MODEL, ctxA, sessionA);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            callerA.deps().context(), callerA, a), a, new ArrayList<>(),
+            new AutoCompactor(msgs -> 2_000_000, summaryProvider(COMPACT_MODEL, regA)));
+        SessionUsageLedger ledgerA = regA.forSession(sessionA);
+        assertThat(ledgerA.bucketOf(sessionA).totalCostYuan())
             .as("模型 = compact-model-a（单价 1）→ 4400")
             .isEqualTo(EXPECTED_COMPACT_COST);
-        assertThat(a.sessionModelUsage()).containsKey(COMPACT_MODEL);
-        assertThat(a.sessionModelUsage()).doesNotContainKey(TRAP_MODEL);
+        assertThat(ledgerA.modelUsage()).containsKey(COMPACT_MODEL);
+        assertThat(ledgerA.modelUsage()).doesNotContainKey(TRAP_MODEL);
 
-        // ② resolveModel()=TRAP_MODEL（单价 1000 元/输入侧 token）→ 放大 1000 倍
+        // ② modelSupplier=TRAP_MODEL（单价 1000 元/输入侧 token）→ 放大 1000 倍
         List<CostCall> callsB = new ArrayList<>(costCalls);
-        AgentState b = newState();
+        String sessionB = "sess-scope-b-" + UUID.randomUUID().toString().substring(0, 8);
+        AgentState b = new AgentState("sys", sessionB, null);
         b.replaceMessages(List.of(message("m1", Role.user, "q", null, null)));
-        AgentLoopContext ctxB = agentLoopContext(plainReplyProvider(), null, recordingCalculator(callsB));
-        QueryParams callerParams3 = params(b, TRAP_MODEL, ctxB);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams3.deps().context(), callerParams3, b), b, new ArrayList<>(), autoCompactor());
-        assertThat(b.sessionCostYuan())
+        SessionUsageAccountingRegistry regB = ledgerRegistry(recordingCalculator(callsB));
+        AgentLoopContext ctxB = agentLoopContext(plainReplyProvider(), null, null);
+        QueryParams callerB = params(b, TRAP_MODEL, ctxB, sessionB);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            callerB.deps().context(), callerB, b), b, new ArrayList<>(),
+            new AutoCompactor(msgs -> 2_000_000, summaryProvider(TRAP_MODEL, regB)));
+        SessionUsageLedger ledgerB = regB.forSession(sessionB);
+        assertThat(ledgerB.bucketOf(sessionB).totalCostYuan())
             .as("模型换成高单价的 declared-model-expensive → 金额必须随之放大（证明模型真实参与计价，"
                 + "而非写死/取会话主模型）")
             .isEqualTo(EXPECTED_COMPACT_COST * 1000.0);
@@ -232,71 +255,101 @@ class CompactSessionCostWiringTest {
                 assertThat(c.model()).isEqualTo(TRAP_MODEL);
                 assertThat(c.usage().inputTokens()).isEqualTo(C_INPUT);
             });
-        // 分桶各归各（model_usage_json）
-        assertThat(b.sessionModelUsage()).containsKey(TRAP_MODEL);
-        assertThat(b.sessionModelUsage()).doesNotContainKey(COMPACT_MODEL);
+        assertThat(ledgerB.modelUsage()).containsKey(TRAP_MODEL);
+        assertThat(ledgerB.modelUsage()).doesNotContainKey(COMPACT_MODEL);
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 4. 重复压缩：每次都计（不漏计、不重复计）
+    // 4. 重复压缩：每次都记（不漏计、不覆盖）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("重复压缩：两次压缩各自计入（累加不覆盖、不漏计）")
+    @DisplayName("重复压缩：两次压缩各自入账（累加不覆盖、不漏计）")
     void repeatedCompaction_countsEachTime() {
-        AgentState state = newState();
+        String sessionId = "sess-repeat-" + UUID.randomUUID().toString().substring(0, 8);
+        AgentState state = new AgentState("sys", sessionId, null);
         state.replaceMessages(List.of(message("m1", Role.user, "q", null, null)));
 
-        AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, recordingCalculator());
-        AutoCompactor autoCompactor = autoCompactor();
+        SessionUsageAccountingRegistry registry = ledgerRegistry(recordingCalculator());
+        StreamCompactSummary summary = summaryProvider(COMPACT_MODEL, registry);
+        AutoCompactor autoCompactor = new AutoCompactor(msgs -> 2_000_000, summary);
+        AgentLoopContext ctx = agentLoopContext(plainReplyProvider(), null, null);
 
-        QueryParams callerParams4 = params(state, COMPACT_MODEL, ctx);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams4.deps().context(), callerParams4, state), state, new ArrayList<>(), autoCompactor);
-        assertThat(state.sessionCostYuan())
+        QueryParams caller1 = params(state, COMPACT_MODEL, ctx, sessionId);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            caller1.deps().context(), caller1, state), state, new ArrayList<>(), autoCompactor);
+        SessionUsageLedger ledger = registry.forSession(sessionId);
+        assertThat(ledger.bucketOf(sessionId).totalCostYuan())
             .as("第 1 次压缩后 = 4400")
             .isEqualTo(EXPECTED_COMPACT_COST);
-        assertThat(state.sessionInputTokens()).isEqualTo(C_INPUT);
+        assertThat(ledger.bucketOf(sessionId).inputTokens()).isEqualTo(C_INPUT);
 
         // 第二次压缩：重置为普通消息集（压缩后的 boundary/summary 携带 usage → 会走 usage-walk
         // 阈值判定，与本次断言的「压缩调用触发」无关），同一 AgentState 继续累计。
         state.replaceMessages(List.of(message("m9", Role.user, "second-round", null, null)));
-        QueryParams callerParams5 = params(state, COMPACT_MODEL, ctx);
-        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams5.deps().context(), callerParams5, state), state, new ArrayList<>(), autoCompactor);
+        QueryParams caller2 = params(state, COMPACT_MODEL, ctx, sessionId);
+        LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(
+            caller2.deps().context(), caller2, state), state, new ArrayList<>(), autoCompactor);
 
-        assertThat(state.sessionCostYuan())
-            .as("第 2 次压缩必须再计一次（成本累加 8800，既不漏计也不覆盖）")
+        assertThat(ledger.bucketOf(sessionId).totalCostYuan())
+            .as("第 2 次压缩必须再记一次（成本累加 8800，既不漏计也不覆盖）")
             .isEqualTo(2 * EXPECTED_COMPACT_COST);
-        assertThat(state.sessionInputTokens())
+        assertThat(ledger.bucketOf(sessionId).inputTokens())
             .as("两次压缩 input token 各计一次 = 2000")
             .isEqualTo(2L * C_INPUT);
-        CostTracker.ModelUsage bucket = state.sessionModelUsage().get(COMPACT_MODEL);
-        assertThat(bucket).isNotNull();
-        assertThat(bucket.inputTokens())
-            .as("桶内压缩输入 token 累加（非覆盖）= 2000")
-            .isEqualTo(2L * C_INPUT);
-        assertThat(bucket.cacheReadInputTokens()).isEqualTo(2L * C_CACHE_READ);
-        assertThat(bucket.costUSD())
-            .as("桶 cost 累加 = 8800")
-            .isEqualTo(2 * EXPECTED_COMPACT_COST);
+        assertThat(ledger.totalCalls()).isEqualTo(2L);
+        CostTracker.ModelUsage mu = ledger.modelUsage().get(COMPACT_MODEL);
+        assertThat(mu).isNotNull();
+        assertThat(mu.inputTokens()).as("按模型 rollup 累加（非覆盖）= 2000").isEqualTo(2L * C_INPUT);
+        assertThat(mu.cacheReadInputTokens()).isEqualTo(2L * C_CACHE_READ);
+        assertThat(mu.costUSD()).isEqualTo(2 * EXPECTED_COMPACT_COST);
     }
 
     // ════════════════════════════════════════════════════════════════════
     // helpers
     // ════════════════════════════════════════════════════════════════════
 
-    /** 压缩调用 usage（SummaryResult.usage → CompactionResult.compactionUsage 的原料）。 */
-    private static CompactConversation.TokenUsage compactionUsage() {
-        return new CompactConversation.TokenUsage(C_INPUT, C_OUTPUT, C_CACHE_READ, C_CACHE_CREATE);
+    /**
+     * 真实 {@link StreamCompactSummary}（压缩摘要生产）· provider 桩在流内把真实 usage 写入
+     * 网关 sink（{@code LlmCallScope.recordSettled} → UPSTREAM），registry 注入 → 网关记账进会话账本。
+     * modelSupplier 决定本次压缩调用实际使用的模型（成本口径验证依赖它）。
+     */
+    private static StreamCompactSummary summaryProvider(String model, SessionUsageAccountingRegistry registry) {
+        LlmProvider provider = usageProvider();
+        StreamCompactSummary summary = new StreamCompactSummary(
+            () -> provider, () -> model, () -> ProviderConfig.empty());
+        summary.setUsageLedgerRegistry(registry);
+        return summary;
     }
 
-    /**
-     * token 计数恒 2,000,000 → 必触发 auto compact（阈值随窗口解析波动：默认 1M 窗口下
-     * threshold≈978,576；注入值取足够大以对所有窗口解析结果都越阈值，避免测试受
-     * CompactThresholdSystem 窗口默认值影响）。
-     */
-    private static AutoCompactor autoCompactor() {
-        return new AutoCompactor(msgs -> 2_000_000,
-            (p, m, ctx) -> new CompactConversation.SummaryResult("<summary>ok</summary>", compactionUsage()));
+    /** 会话账本注册表 + 记录型计费器（ReflectionTestUtils 注入 · 生产由 Spring 注入）。 */
+    private SessionUsageAccountingRegistry ledgerRegistry(ModelCostCalculator calc) {
+        SessionUsageAccountingRegistry registry = new SessionUsageAccountingRegistry();
+        ReflectionTestUtils.setField(registry, "costCalculator", calc);
+        return registry;
+    }
+
+    /** 压缩摘要 provider 桩：返回 "summary text" + 真实 usage，并把 usage 写入网关 sink。 */
+    private static LlmProvider usageProvider() {
+        LlmProvider provider = mock(LlmProvider.class);
+        AgentUsage usage = new AgentUsage(C_INPUT, C_OUTPUT, (long) C_CACHE_CREATE, (long) C_CACHE_READ,
+            null, null, null);
+        Mockito.doAnswer(inv -> {
+            Consumer<String> onChunk = inv.getArgument(9);
+            Consumer<AssistantMessage> onMsg = inv.getArgument(10);
+            Runnable onComplete = inv.getArgument(16);
+            LlmCallScope scope = inv.getArgument(18);
+            onChunk.accept("summary text");
+            if (onMsg != null) {
+                onMsg.accept(new AssistantMessage("summary text", "stop", List.of(), "", null, usage));
+            }
+            // 该次尝试结局的累计 usage 写入采集器 → 网关结算记入账本（UPSTREAM 来源）。
+            LlmCallScope.recordSettled(scope, usage);
+            onComplete.run();
+            return null;
+        }).when(provider).stream(any(), anyString(), anyList(), anyList(), any(),
+            any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any(), any());
+        return provider;
     }
 
     /**
@@ -326,24 +379,22 @@ class CompactSessionCostWiringTest {
         return calc;
     }
 
-    private static AgentState newState() {
-        return new AgentState("sys", "sess-" + UUID.randomUUID().toString().substring(0, 8), null);
-    }
-
-    private static QueryParams params(AgentState state, String resolvedModel, AgentLoopContext ctx) {
+    private static QueryParams params(AgentState state, String resolvedModel, AgentLoopContext ctx,
+                                      String sessionId) {
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(UUID.randomUUID(), sessionId),
             QuerySource.USER, TRAP_MODEL, null,
             null, null, null, null,
             deps(resolvedModel, ctx), ProviderConfig.empty());
     }
 
     /** reactive 场景：60 条历史 + 末位 assistant 带 usage（触发 PTL → reactive compact）。 */
-    private static QueryParams reactiveParams(AgentState state, String resolvedModel, AgentLoopContext ctx) {
+    private static QueryParams reactiveParams(AgentState state, String resolvedModel, AgentLoopContext ctx,
+                                              String sessionId) {
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(UUID.randomUUID(), sessionId),
             QuerySource.USER, "test-model", 8,
             null, null, null, null,
             deps(resolvedModel, ctx), ProviderConfig.empty());
@@ -362,7 +413,13 @@ class CompactSessionCostWiringTest {
         true, false, false, false, false, false, false, false, false, false, false,
         false, false, false, false, false, false, false, false, false, false, false);
 
-    /** 构造 36 组件 ctx（第 36 位 = modelCostCalculator，本批新接线依赖它的计价分派）。 */
+    /**
+     * 构造 36 组件 ctx（第 36 位 = modelCostCalculator）。
+     *
+     * <p><b>[usage-gateway] 传入 null</b>：压缩记账的计价点已内聚在 {@code SessionUsageLedger}
+     * 的 calculator（本测试经 registry 注入记录型计费器）—— ctx 的 modelCostCalculator 只服务
+     * 主循环文本回合的会话累计，本测试文本回合 usage 全零且不参与断言，传 null 避免噪声调用。
+     */
     private static AgentLoopContext agentLoopContext(LlmProviderFactory factory,
                                                      ReactiveCompactor rc, ModelCostCalculator calc) {
         return new AgentLoopContext(
@@ -379,7 +436,7 @@ class CompactSessionCostWiringTest {
 
     // ── provider 桩 ──
 
-    /** 单次调用返回 stop 纯文本（auto 路径：无 PTL，正常收尾）。 */
+    /** 单次调用返回 stop 纯文本（auto 路径：无 PTL，正常收尾；无 usage 上报）。 */
     private static LlmProviderFactory plainReplyProvider() {
         LlmProvider provider = mock(LlmProvider.class);
         Mockito.doAnswer(inv -> {

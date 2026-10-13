@@ -191,6 +191,14 @@ public class WebSearchTool implements Tool {
     @Autowired(required = false)
     private ModelConfigResolver modelConfigResolver;
 
+    /**
+     * [usage-gateway] 旁路 LLM 单发客户端 · 注释模型二次总结调用收口到请求网关并自动记账。
+     *
+     * <p>{@code required=false}：测试/孤立 new 场景未注入 → 调用点需容忍；生产经 Spring 注入。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
+
     /** 通道2 STOMP 推送 · [websearch-event 2026-08-23] {@code @Autowired(required=false)}：测试/孤立运行未注入 → 发布 no-op（warn+skip）。2026-08-23 通道2 已停用，本字段仅由 @Deprecated publishResults 引用（保留供审计）。 */
     @Autowired(required = false)
     private SimpMessagingTemplate wsTemplate;
@@ -772,8 +780,8 @@ public class WebSearchTool implements Tool {
     }
 
     /**
-     * 注释模型二次总结 · [websearch-ccalign 2026-08-23] 复用 {@code chatWithOptions} 模式（对齐
-     * {@code HaikuToolUseSummaryGenerator}），模型由 {@link #resolveCommentModelName} 决定
+     * 注释模型二次总结 · [websearch-ccalign 2026-08-23] 经 {@code LlmSideCallClient.chat} 发起旁路调用
+     * （[usage-gateway] 收口记账，对齐 {@code HaikuToolUseSummaryGenerator}），模型由 {@link #resolveCommentModelName} 决定
      * （useSmall ? fast 档 : 主循环模型，对齐 CC WebSearchTool.ts:280）。
      *
      * <p>CC 锚点：CC 模型侧二次处理经 server tool 产出的文本注释（results 中 string 项，
@@ -821,9 +829,11 @@ public class WebSearchTool implements Tool {
                     //   ThreadLocal 不可达；两套载体收口到 TUC 单一来源）。null → 等价 CC
                     //   agentContext.ts:170 无 invokingRequestId。
                     ctx != null ? ctx.agentContext() : null);
-            String summary = llmProviderFactory.getProvider(resolved.config(), resolved.providerType())
-                    .chatWithOptions(resolved.config(), modelName, SUMMARY_SYSTEM_PROMPT,
-                            buildSummaryUserPrompt(query, hits), options);
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient：归属取自工具形参 ctx
+            //   （sessionId=ctx.sessionId()，agentId=ctx.agentId()，agentContext=ctx.agentContext()；
+            //    ctx==null → standalone，不伪造 sessionId）。返回值/异常语义与 chatWithOptions 一致。
+            String summary = sideCallClient.chat(resolved.config(), modelName, SUMMARY_SYSTEM_PROMPT,
+                    buildSummaryUserPrompt(query, hits), options, webSearchSummaryUsage(ctx));
             if (summary == null || summary.isBlank()) {
                 return buildFallbackSummary(query, hits, "注释模型返回空摘要");
             }
@@ -835,6 +845,26 @@ public class WebSearchTool implements Tool {
         } catch (Exception e) {
             return buildFallbackSummary(query, hits, e.getMessage());
         }
+    }
+
+    /**
+     * [usage-gateway] 组装旁路记账归属（WebSearch 注释模型总结专用）。
+     *
+     * <p>归属单一来源 = 工具形参 {@link ToolUseContext}：ctx != null →
+     * {@code inSession(sessionId=ctx.sessionId(), agentId=ctx.agentId(), ...).withAgentContext(ctx.agentContext())}；
+     * ctx == null → {@code standalone}（不伪造 sessionId）。
+     */
+    private static com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+            webSearchSummaryUsage(ToolUseContext ctx) {
+        if (ctx == null) {
+            return com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                    .standalone(com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "web-search-summary");
+        }
+        return com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                .inSession(ctx.sessionId(),
+                        ctx.agentId() != null ? ctx.agentId().toString() : null,
+                        com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "web-search-summary")
+                .withAgentContext(ctx.agentContext());
     }
 
     /**

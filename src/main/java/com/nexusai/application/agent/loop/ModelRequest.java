@@ -111,6 +111,19 @@ public record ModelRequest(
     // 取值规则：主线程 / 无归因上下文 → null（对齐 CC 主线程 undefined，事件无该属性）；
     //   子代理 → SubagentExecutor 装入的 SubagentContext 实例。
     com.nexusai.application.agent.subagent.AgentContext agentContext,
+    // ═══════════════ [usage-gateway] 记账归属与出口（两句组，均可 null） ═══════════════
+    // 用户裁定：用量统计前置到请求网关（LlmInvocationGateway），流式/非流式统一；
+    //   归属必须「显式传参」（仓库铁律：会话态不得经 ThreadLocal/MDC 读）—— 调用方从
+    //   AgentState.usageAttribution() 取归属、从 AgentState.usageRecorder() 取记账器，
+    //   在此盖章后由网关在调用返回时（含中断/失败）统一记账。
+    //
+    // WHY 放在 ModelRequest 而不是 AgentLoopContext：ModelRequest 全仓仅 7 处构造点
+    //   （生产 1 处），加字段的低成本远低于扩 37 组件的 AgentLoopContext（后者会牵动工厂/
+    //   全量构造点/测试）；且「谁发起调用谁负责盖章」让归属来源始终可见。
+    //
+    // null 语义：两者任一为 null → 本次调用不记账（单测 / 未接线调用方零行为变化）。
+    com.nexusai.infra.llm.UsageAttribution usageAttribution,
+    com.nexusai.infra.llm.LlmUsageRecorder usageRecorder,
     // ═══════════════════ [流空闲看门狗 · 用户裁定 10-10] streamIdleControl ═══════════════════
     // 单次模型调用的看门狗控制载体 · CC original: 无入参（CC 的查询层看门狗直接持有流对象；
     //   本仓 provider 持有流对象 → 经专用 AbortController 通道下传，方案规格 §3）。
@@ -118,4 +131,15 @@ public record ModelRequest(
     // 位置 = 参数表末尾（同 skipCacheWrite/agentContext 的既有取舍：测试树 positional 索引不动）。
     com.nexusai.infra.llm.StreamIdleControl streamIdleControl
 ) {
+
+    // 删除标记
+//    /** 追加记账归属与出口（不可变拷贝）· 供 loop 在拿到 state 后盖章。 */
+//    public ModelRequest withUsage(com.nexusai.infra.llm.UsageAttribution attribution,
+//                                  com.nexusai.infra.llm.LlmUsageRecorder recorder) {
+//        return new ModelRequest(config, modelName, blocks, querySource, messages, tools,
+//            maxOutputTokensOverride, taskBudget, effortValue, thinkingConfig,
+//            onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk, onStreamingFallback,
+//            onError, onComplete, abortController, skipCacheWrite, agentContext,
+//            attribution, recorder);
+//    }
 }

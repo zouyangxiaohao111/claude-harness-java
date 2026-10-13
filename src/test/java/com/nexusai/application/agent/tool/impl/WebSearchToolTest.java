@@ -46,7 +46,6 @@ import java.util.concurrent.atomic.AtomicReference;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.anyString;
-import static org.mockito.ArgumentMatchers.nullable;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -620,11 +619,12 @@ class WebSearchToolTest {
     @Test
     @DisplayName("execute(注释模型总结成功)：useSmall=false + ctx null → 回落 fast 档，注释进 results 末项（T3）")
     void execute_commentarySummary_useSmallFalse_ctxNull_fallsBackToFast() throws Exception {
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), anyString(), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), anyString(), anyString(), any(), any()))
                 .thenReturn("Fixed fast model summary about claude code");
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         // 主循环模型不可得（ctx null）→ 回落 fast 档（resolveFastModelName，fast→weak→固定默认 三级）
         when(resolver.resolveFastModelName(FAST_FALLBACK)).thenReturn("claude-fast-4-5");
@@ -634,6 +634,7 @@ class WebSearchToolTest {
 
         SearchEngine spy = twoHitSpy();
         WebSearchTool tool = new WebSearchTool(new WebFetchTool(), spy, factory, resolver);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult<?> result = tool.execute(
                 new ToolUseBlock("ws-w1", "WebSearch",
@@ -654,8 +655,8 @@ class WebSearchToolTest {
         ArgumentCaptor<String> userPromptCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<LlmProvider.ChatRequestOptions> optionsCaptor =
                 ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
-        verify(provider).chatWithOptions(any(), modelCaptor.capture(), anyString(),
-                userPromptCaptor.capture(), optionsCaptor.capture());
+        verify(sideCallClient).chat(any(), modelCaptor.capture(), anyString(),
+                userPromptCaptor.capture(), optionsCaptor.capture(), any());
         assertThat(modelCaptor.getValue())
                 .as("ctx null → 主循环不可得，回落 fast 档（CC useHaiku ? fast : mainLoop）")
                 .isEqualTo("claude-fast-4-5");
@@ -670,11 +671,12 @@ class WebSearchToolTest {
     @Test
     @DisplayName("execute(注释模型总结成功)：useSmall=true（DB settings.websearchUseSmallModel）→ fast 档（T3）")
     void execute_commentarySummary_useSmallTrue_usesFastTier() throws Exception {
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), anyString(), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), anyString(), anyString(), any(), any()))
                 .thenReturn("Fixed fast model summary about claude code");
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         when(resolver.resolveFastModelName(FAST_FALLBACK)).thenReturn("claude-fast-4-5");
         when(resolver.resolve("claude-fast-4-5")).thenReturn(
@@ -690,6 +692,7 @@ class WebSearchToolTest {
         SearchEngine spy = twoHitSpy();
         WebSearchTool tool = new WebSearchTool(new WebFetchTool(), spy, factory, resolver);
         ReflectionTestUtils.setField(tool, "settingsMapper", settingsMapper);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult<?> result = tool.execute(
                 new ToolUseBlock("ws-w2", "WebSearch",
@@ -701,7 +704,7 @@ class WebSearchToolTest {
                 .isEqualTo("Fixed fast model summary about claude code");
 
         ArgumentCaptor<String> modelCaptor = ArgumentCaptor.forClass(String.class);
-        verify(provider).chatWithOptions(any(), modelCaptor.capture(), anyString(), anyString(), any());
+        verify(sideCallClient).chat(any(), modelCaptor.capture(), anyString(), anyString(), any(), any());
         assertThat(modelCaptor.getValue())
                 .as("useSmall=true（CC tengu_plum_vx3）→ 必须用 fast 档而非主循环模型")
                 .isEqualTo("claude-fast-4-5");
@@ -710,11 +713,12 @@ class WebSearchToolTest {
     @Test
     @DisplayName("execute(注释模型总结成功)：useSmall=false + SessionAgentStateRegistry 注入 → 主循环模型（T3）")
     void execute_commentarySummary_useSmallFalse_usesMainLoopModel() throws Exception {
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), anyString(), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), anyString(), anyString(), any(), any()))
                 .thenReturn("Fixed mainloop model summary about claude code");
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         when(resolver.resolve("claude-main-4-6")).thenReturn(
                 new ModelConfigResolver.ResolvedModel(
@@ -729,6 +733,7 @@ class WebSearchToolTest {
         SearchEngine spy = twoHitSpy();
         WebSearchTool tool = new WebSearchTool(new WebFetchTool(), spy, factory, resolver);
         ReflectionTestUtils.setField(tool, "sessionAgentStateRegistry", registry);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult<?> result = tool.execute(
                 new ToolUseBlock("ws-w3", "WebSearch",
@@ -740,7 +745,7 @@ class WebSearchToolTest {
                 .isEqualTo("Fixed mainloop model summary about claude code");
 
         ArgumentCaptor<String> modelCaptor = ArgumentCaptor.forClass(String.class);
-        verify(provider).chatWithOptions(any(), modelCaptor.capture(), anyString(), anyString(), any());
+        verify(sideCallClient).chat(any(), modelCaptor.capture(), anyString(), anyString(), any(), any());
         assertThat(modelCaptor.getValue())
                 .as("useSmall=false + registry 注入 → 必须用主循环模型（CC mainLoopModel, WebSearchTool.ts:280）")
                 .isEqualTo("claude-main-4-6");
@@ -774,11 +779,12 @@ class WebSearchToolTest {
     @Test
     @DisplayName("execute(降级：注释模型调用失败)：chatWithOptions 抛异常 → 简单摘要兜底，搜索不中断")
     void execute_commentarySummary_degradesOnCallFailure() throws Exception {
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), anyString(), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), anyString(), anyString(), any(), any()))
                 .thenThrow(new RuntimeException("model down"));
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         when(resolver.resolveFastModelName(FAST_FALLBACK)).thenReturn("claude-fast-4-5");
         when(resolver.resolve("claude-fast-4-5")).thenReturn(
@@ -787,6 +793,7 @@ class WebSearchToolTest {
 
         SearchEngine spy = twoHitSpy();
         WebSearchTool tool = new WebSearchTool(new WebFetchTool(), spy, factory, resolver);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult<?> result = tool.execute(
                 new ToolUseBlock("ws-w5", "WebSearch",

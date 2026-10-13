@@ -366,7 +366,8 @@ class CoordinatorModeUnifiedGateTest {
         return SubagentExecutor.maybeStartSummary(
             path, null, svc, coordinator, false, "unified-gate-agent", tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null, null);
+            null, null, null,
+            null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
     }
 
     private static ScheduledExecutorService newScheduler() {

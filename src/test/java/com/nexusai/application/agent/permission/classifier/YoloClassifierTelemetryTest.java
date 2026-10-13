@@ -2,7 +2,6 @@ package com.nexusai.application.agent.permission.classifier;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentToolResult;
@@ -14,7 +13,6 @@ import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.telemetry.Telemetry;
-import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -35,7 +33,6 @@ import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
-import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -167,24 +164,21 @@ class YoloClassifierTelemetryTest {
     void classifySync_carriesStageMsgIdsAndThinking() throws Exception {
         // stage1 <block>yes</block> → 触发 stage2；stage2 带 <thinking> + <block>no</block>
         // [S06] stage 区分经 userMessage 后缀（XML_S1_SUFFIX / XML_S2_SUFFIX），非 modelName（单模型 ⊕-08）
-        LlmProvider fakeProvider = new FakeLlmProvider() {
-            @Override
-            public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                if (userMessage.contains("Err on the side of blocking")) {
-                    // stage 1 (fast): block → 触发 stage 2
-                    return new LlmRawResponse(
-                        "<block>yes</block>",
-                        "msg_stage1_real", null, "req_stage1");
-                }
-                // stage 2 (thinking): no + thinking（parseXmlThinking 仅 XML，⊕-06）
-                return new LlmRawResponse(
-                    "<thinking>thinking from stage2 raw</thinking><block>no</block><reason>blocked after thinking</reason>",
-                    "msg_stage2_real", null, "req_stage2");
+        // [usage-gateway] 旁路调用收口：桩 sideCallClient.message(...)（userMessage=第 4 参）。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            String userMessage = inv.getArgument(3);
+            if (userMessage.contains("Err on the side of blocking")) {
+                // stage 1 (fast): block → 触发 stage 2
+                return new LlmProvider.LlmInvocationResult(
+                    "<block>yes</block>", null, List.of(), AgentUsage.EMPTY,
+                    "msg_stage1_real", null, "req_stage1", null, 0L);
             }
-        };
-        YoloClassifierImpl classifier = newClassifier(fakeProvider);
+            // stage 2 (thinking): no + thinking（parseXmlThinking 仅 XML，⊕-06）
+            return new LlmProvider.LlmInvocationResult(
+                "<thinking>thinking from stage2 raw</thinking><block>no</block><reason>blocked after thinking</reason>",
+                null, List.of(), AgentUsage.EMPTY, "msg_stage2_real", null, "req_stage2", null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifier(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(), null)
@@ -223,17 +217,12 @@ class YoloClassifierTelemetryTest {
         List<ChatMessageDto> transcript = List.of(userMsg, asstMsg);
 
         // stage1 <block>no</block> → 单 stage 放行（fast allow）
-        LlmProvider fakeProvider = new FakeLlmProvider() {
-            @Override
-            public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                return new LlmRawResponse(
-                    "<block>no</block>",
-                    "msg_stage1_hi", null, "req_stage1");
-            }
-        };
-        YoloClassifierImpl classifier = newClassifier(fakeProvider);
+        // [usage-gateway] 桩 sideCallClient.message(...) 返回 fast allow XML。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv ->
+            new LlmProvider.LlmInvocationResult(
+                "<block>no</block>", null, List.of(), AgentUsage.EMPTY,
+                "msg_stage1_hi", null, "req_stage1", null, 0L));
+        YoloClassifierImpl classifier = newClassifier(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, transcript, null)
@@ -279,19 +268,34 @@ class YoloClassifierTelemetryTest {
     }
 
     /**
+     * [usage-gateway] 桩 sideCallClient.message(...)（返回 LlmInvocationResult）。
+     * 参数序：0=config, 1=modelName, 2=systemPrompt, 3=userMessage, 4=options, 5=usage。
+     */
+    private static com.nexusai.application.agent.cost.LlmSideCallClient mockSideCallClient(
+            org.mockito.stubbing.Answer<LlmProvider.LlmInvocationResult> answer) throws Exception {
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+            Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        Mockito.when(client.message(Mockito.any(), Mockito.any(), Mockito.any(),
+            Mockito.any(), Mockito.any(), Mockito.any())).thenAnswer(answer);
+        return client;
+    }
+
+    /**
      * 构造真实 YoloClassifierImpl (真实 promptBuilder/tokenEstimator, mock providerFactory).
-     * 单模型（⊕-08）显式传入 "claude-fast"，fake provider 经 userMessage 后缀区分 stage。
+     * 单模型（⊕-08）显式传入 "claude-fast"，stage 区分经桩的 sideCallClient.message 内 userMessage 后缀。
      *
      * <p>[RV14B-WIRE-01] 注入 stub ModelConfigResolver（按 modelId 返回真实 config）+ 2 参
-     * getProvider(config, providerType) stub。
+     * getProvider(config, providerType) stub（provider 解析保留为 fail-closed 前置守卫）。
      */
-    private YoloClassifierImpl newClassifier(LlmProvider fakeProvider) {
+    private YoloClassifierImpl newClassifier(
+            com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient) {
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         Mockito.when(resolver.resolve(Mockito.anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class))).thenReturn(fakeProvider);
+        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class)))
+            .thenReturn(Mockito.mock(LlmProvider.class));
         YoloClassifierImpl classifier = new YoloClassifierImpl(
             new YoloPromptBuilder(),
             new YoloTokenEstimator(),
@@ -299,8 +303,9 @@ class YoloClassifierTelemetryTest {
             "claude-fast",
             30,
             resolver,
-            true /* two-stage XML：本测试 fake LLM 返回 CC 2-stage XML <block> 协议（OPD-WF6-01 重构） */
+            true /* two-stage XML：本测试桩返回 CC 2-stage XML <block> 协议（OPD-WF6-01 重构） */
         );
+        org.springframework.test.util.ReflectionTestUtils.setField(classifier, "sideCallClient", sideCallClient);
         // [OPD-24 G1] 注入带 toAutoClassifierInput override 的 Bash stub —— 否则 default ''
         //   使 action 投影为空 → 短路 ALLOW 不进 LLM（本测试验证真实 LLM 路径必须投影非空）。
         classifier.setToolRegistry(bashProjectionRegistry());
@@ -311,13 +316,20 @@ class YoloClassifierTelemetryTest {
      * [IMP-6 OPD-WF6-01-RV] 构造 1-stage 分类器（twoStageClassifier=false）· 与
      * {@link #newClassifier} 同构，仅 two-stage 开关为 false（对齐 CC 默认 1-stage）。
      */
-    private YoloClassifierImpl newClassifierOneStage(LlmProvider fakeProvider) {
+    private YoloClassifierImpl newClassifierOneStage(
+            com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient) {
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
+        // [usage-gateway 修复] 1-stage 断言「tool_choice 必须强制 classify_result」（CC :1152-1155）⇒
+        //   fixture 必须是 anthropic 协议：生产对非 anthropic providerType 刻意不传 forced named
+        //   tool_choice（deepseek 推理模式 400，"Thinking mode does not support this tool_choice"，
+        //   YoloClassifierImpl:583-591 isAnthropicProtocol 门），故此前的 "openai_sdk" fixture 与
+        //   本组断言自相矛盾（该不一致先于本次签名改造存在）。
         Mockito.when(resolver.resolve(Mockito.anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
-                new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class))).thenReturn(fakeProvider);
+                new ProviderConfig("http://fake.local", "sk-test"), "anthropic"));
+        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class)))
+            .thenReturn(Mockito.mock(LlmProvider.class));
         YoloClassifierImpl classifier = new YoloClassifierImpl(
             new YoloPromptBuilder(),
             new YoloTokenEstimator(),
@@ -327,6 +339,7 @@ class YoloClassifierTelemetryTest {
             resolver,
             false
         );
+        org.springframework.test.util.ReflectionTestUtils.setField(classifier, "sideCallClient", sideCallClient);
         classifier.setToolRegistry(bashProjectionRegistry());
         return classifier;
     }
@@ -361,23 +374,20 @@ class YoloClassifierTelemetryTest {
         + "（chatWithOptionsMessage + tools + tool_choice，CC yoloClassifier.ts:1131-1305）")
     void classifyOneStage_usesClassifyResultToolProtocol() throws Exception {
         AtomicReference<LlmProvider.ChatRequestOptions> capturedOptions = new AtomicReference<>();
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                           String systemPrompt, String userMessage,
-                                                           LlmProvider.ChatRequestOptions options) {
-                capturedOptions.set(options);
-                JsonNode input = new ObjectMapper().createObjectNode()
-                    .put("thinking", "allowed because read-only")
-                    .put("shouldBlock", false)
-                    .put("reason", "read-only ls");
-                // AgentUsage 7 参便捷构造：inputTokens/outputTokens/cacheCreationInputTokens/cacheReadInputTokens/...
-                return new AssistantMessage("", "tool_calls",
-                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
-                    "", null, new AgentUsage(100L, 50L, 7L, 9L, null, null, null), null);
-            }
-        };
-        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        // [usage-gateway] 桩 sideCallClient.message(...) 返回含 classify_result tool_use 块的旁路结果
+        //   （options = 第 5 参，用于断言工具协议）。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            capturedOptions.set(inv.getArgument(4));
+            JsonNode input = new ObjectMapper().createObjectNode()
+                .put("thinking", "allowed because read-only")
+                .put("shouldBlock", false)
+                .put("reason", "read-only ls");
+            // AgentUsage 7 参便捷构造：input/output/cacheCreation/cacheRead
+            return new LlmProvider.LlmInvocationResult("", "tool_calls",
+                List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                new AgentUsage(100L, 50L, 7L, 9L, null, null, null), "id_1", null, null, null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(), null)
@@ -400,16 +410,10 @@ class YoloClassifierTelemetryTest {
     @Test
     @DisplayName("IMP-6 OPD-WF6-01-RV: 1-stage 无 classify_result tool_use 块 → block for safety（CC :1198-1212）")
     void classifyOneStage_noToolUseBlock_blocksForSafety() throws Exception {
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                           String systemPrompt, String userMessage,
-                                                           LlmProvider.ChatRequestOptions options) {
-                return new AssistantMessage("I decline to use tools", "stop",
-                    List.of(), "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
-            }
-        };
-        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv ->
+            new LlmProvider.LlmInvocationResult("I decline to use tools", "stop", List.of(),
+                new AgentUsage(1L, 1L, 0L, 0L, null, null, null), "id_1", null, null, null, 0L));
+        YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(), null)
@@ -423,21 +427,16 @@ class YoloClassifierTelemetryTest {
     @Test
     @DisplayName("IMP-6 OPD-WF6-01-RV: 1-stage classify_result schema 非法（shouldBlock 非布尔）→ block for safety（CC :1220-1236）")
     void classifyOneStage_invalidSchema_blocksForSafety() throws Exception {
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                           String systemPrompt, String userMessage,
-                                                           LlmProvider.ChatRequestOptions options) {
-                JsonNode input = new ObjectMapper().createObjectNode()
-                    .put("thinking", "reasoning")
-                    .put("shouldBlock", "yes")  // 字符串而非布尔 → zod 解析失败
-                    .put("reason", "blocked");
-                return new AssistantMessage("", "tool_calls",
-                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
-                    "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
-            }
-        };
-        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            JsonNode input = new ObjectMapper().createObjectNode()
+                .put("thinking", "reasoning")
+                .put("shouldBlock", "yes")  // 字符串而非布尔 → zod 解析失败
+                .put("reason", "blocked");
+            return new LlmProvider.LlmInvocationResult("", "tool_calls",
+                List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                new AgentUsage(1L, 1L, 0L, 0L, null, null, null), "id_1", null, null, null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(), null)
@@ -453,22 +452,23 @@ class YoloClassifierTelemetryTest {
     @Test
     @DisplayName("IMP-6 OPD-WF6-02-RV: 2-stage usage 填充（extractUsage stage1/stage2 + combineUsage 汇总，CC :797/:883/:889-891）")
     void classifyTwoStage_carriesUsage() throws Exception {
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                if (userMessage.contains("Err on the side of blocking")) {
-                    // stage1 <block>yes</block> + usage (100, 20, 5, 3)
-                    return new LlmRawResponse("<block>yes</block>", "msg_s1_usage", "th1", "req_s1_usage",
-                        new LlmProvider.LlmUsage(100, 20, 5, 3));
-                }
-                // stage2 <block>no</block> + usage (50, 10, 2, 1)
-                return new LlmRawResponse("<block>no</block><reason>usage ok</reason>", "msg_s2_usage", "th2", "req_s2_usage",
-                    new LlmProvider.LlmUsage(50, 10, 2, 1));
+        // [usage-gateway] 桩 sideCallClient.message(...) 返回带 usage 的 stage XML
+        //   （AgentUsage 7 参：input/output/cacheCreation/cacheRead）。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            String userMessage = inv.getArgument(3);
+            if (userMessage.contains("Err on the side of blocking")) {
+                // stage1 <block>yes</block> + usage (input 100, output 20, cacheRead 5, cacheCreation 3)
+                return new LlmProvider.LlmInvocationResult("<block>yes</block>", null, List.of(),
+                    new AgentUsage(100L, 20L, 3L, 5L, null, null, null),
+                    "msg_s1_usage", "th1", "req_s1_usage", null, 0L);
             }
-        };
-        YoloClassifierImpl classifier = newClassifier(fake);
+            // stage2 <block>no</block> + usage (input 50, output 10, cacheRead 2, cacheCreation 1)
+            return new LlmProvider.LlmInvocationResult(
+                "<block>no</block><reason>usage ok</reason>", null, List.of(),
+                new AgentUsage(50L, 10L, 1L, 2L, null, null, null),
+                "msg_s2_usage", "th2", "req_s2_usage", null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifier(sideCallClient);
         JsonNode input = new ObjectMapper().createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(), null)
@@ -621,25 +621,21 @@ class YoloClassifierTelemetryTest {
     void classifyOneStage_agentContext_crossesCommonPoolWorker() throws Exception {
         AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
         AtomicReference<String> threadName = new AtomicReference<>();
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                           String systemPrompt, String userMessage,
-                                                           LlmProvider.ChatRequestOptions options) {
-                captured.set(options);
-                threadName.set(Thread.currentThread().getName());
-                // [S1-T7-2] ambient 归因载体已整体删除 ⇒ 「worker 线程读不到 ambient」由**编译期**保证
-                //   （无该 API 可调）+ T19 守卫（断言载体在 main 彻底不存在），无需也无法在运行期断言。
-                JsonNode input = new ObjectMapper().createObjectNode()
-                    .put("thinking", "read-only")
-                    .put("shouldBlock", false)
-                    .put("reason", "read-only ls");
-                return new AssistantMessage("", "tool_calls",
-                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
-                    "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
-            }
-        };
-        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        // [usage-gateway] 桩 sideCallClient.message(...)；options=第 5 参（携带 agentContext）。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            captured.set(inv.getArgument(4));
+            threadName.set(Thread.currentThread().getName());
+            // [S1-T7-2] ambient 归因载体已整体删除 ⇒ 「worker 线程读不到 ambient」由**编译期**保证
+            //   （无该 API 可调）+ T19 守卫（断言载体在 main 彻底不存在），无需也无法在运行期断言。
+            JsonNode input = new ObjectMapper().createObjectNode()
+                .put("thinking", "read-only")
+                .put("shouldBlock", false)
+                .put("reason", "read-only ls");
+            return new LlmProvider.LlmInvocationResult("", "tool_calls",
+                List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                new AgentUsage(1L, 1L, 0L, 0L, null, null, null), "id_1", null, null, null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
 
         // ── 写入端：TUC 显式盖章（生产由 SubagentExecutor / buildBaseToolUseContext 执行）──
         com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
@@ -670,20 +666,15 @@ class YoloClassifierTelemetryTest {
     @DisplayName("[批 5b-1] 正向对照：TUC 未盖章 → provider 收到 null（即使提交线程 ambient 有值）")
     void classifyOneStage_noStampOnTuc_providerGetsNull() throws Exception {
         AtomicReference<LlmProvider.ChatRequestOptions> captured = new AtomicReference<>();
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                           String systemPrompt, String userMessage,
-                                                           LlmProvider.ChatRequestOptions options) {
-                captured.set(options);
-                JsonNode input = new ObjectMapper().createObjectNode()
-                    .put("thinking", "read-only").put("shouldBlock", false).put("reason", "ok");
-                return new AssistantMessage("", "tool_calls",
-                    List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
-                    "", null, new AgentUsage(1L, 1L, 0L, 0L, null, null, null), null);
-            }
-        };
-        YoloClassifierImpl classifier = newClassifierOneStage(fake);
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            captured.set(inv.getArgument(4));
+            JsonNode input = new ObjectMapper().createObjectNode()
+                .put("thinking", "read-only").put("shouldBlock", false).put("reason", "ok");
+            return new LlmProvider.LlmInvocationResult("", "tool_calls",
+                List.of(new ToolUseBlock("call_1", YoloPromptBuilder.CLASSIFY_RESULT_TOOL_NAME, input)),
+                new AgentUsage(1L, 1L, 0L, 0L, null, null, null), "id_1", null, null, null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
         ToolUseContext plainTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x");   // 未盖章
 
         // [S1-T7-2] 改锚：原用「提交线程 ambient 有值」构造负向对照，但 ambient 载体已整体删除
@@ -707,19 +698,17 @@ class YoloClassifierTelemetryTest {
     void classifyTwoStage_agentContext_crossesCommonPoolWorker() throws Exception {
         AtomicReference<com.nexusai.application.agent.subagent.AgentContext> seen = new AtomicReference<>();
         AtomicReference<String> threadName = new AtomicReference<>();
-        LlmProvider fake = new FakeLlmProvider() {
-            @Override
-            public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                              String systemPrompt, String userMessage,
-                                              com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                if (seen.get() == null) {   // 只记第一次（stage 1）
-                    seen.set(agentContext);
-                    threadName.set(Thread.currentThread().getName());
-                }
-                return new LlmRawResponse("<block>no</block>", "msg_s1", null, "req_s1");
+        // [usage-gateway] 桩 sideCallClient.message(...)；agentContext 经 options（第 5 参）透传。
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = mockSideCallClient(inv -> {
+            LlmProvider.ChatRequestOptions options = inv.getArgument(4);
+            if (seen.get() == null) {   // 只记第一次（stage 1）
+                seen.set(options != null ? options.agentContext() : null);
+                threadName.set(Thread.currentThread().getName());
             }
-        };
-        YoloClassifierImpl classifier = newClassifier(fake);   // two-stage
+            return new LlmProvider.LlmInvocationResult("<block>no</block>", null, List.of(),
+                AgentUsage.EMPTY, "msg_s1", null, "req_s1", null, 0L);
+        });
+        YoloClassifierImpl classifier = newClassifier(sideCallClient);   // two-stage
         com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
             new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
                 "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_2", "resume");
@@ -736,32 +725,6 @@ class YoloClassifierTelemetryTest {
         assertThat(seen.get())
             .as("chatWithRaw 收到 TUC 上盖的同一实例")
             .isSameAs(subCtx);
-    }
-
-    /**
-     * 最小 fake LlmProvider: chat/stream 抛错, 仅 chatWithRaw 可用
-     * (YoloClassifier 唯一调用通道, M3.2 对齐 CC sideQuery).
-     */
-    private abstract static class FakeLlmProvider implements LlmProvider {
-        @Override public String type() { return "fake"; }
-        @Override public String chat(ProviderConfig config, String modelName,
-                                     String systemPrompt, String userMessage) {
-            throw new UnsupportedOperationException("YoloClassifier 路径必须走 chatWithRaw (M3.2)");
-        }
-        @Override public void stream(ProviderConfig config, String modelName,
-                                     List<com.nexusai.application.agent.prompt.SystemPromptBlock> systemPromptBlocks,
-                                     List<ChatMessageDto> history, ArrayNode tools,
-                                     Integer maxOutputTokensOverride,
-                                     com.nexusai.infra.llm.TaskBudgetParam taskBudget,
-                                     String effortValue, String querySource,
-                                     Consumer<String> onToken, Consumer<AssistantMessage> onMessage,
-                                     Consumer<ToolUseBlock> onToolCallComplete,
-                                     Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
-                                     com.nexusai.application.agent.tool.AbortController abortController,
-                                     Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
-            throw new UnsupportedOperationException("YoloClassifier 路径不使用 stream");
-        }
     }
 
     /**

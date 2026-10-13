@@ -96,6 +96,15 @@ public class SessionRecord {
      */
     private String modelUsageJson;
     /**
+     * 会话级层级用量/费用快照（V99 列 usage_tree_json，TEXT 可空）· 按「agent 层级树」
+     * （session → 主 agent(0) → 子代理(1) → 嵌套(2)…，节点键取 UsageAttribution.nodeKey()）
+     * rollup 的 JSON 串。与 model_usage_json（V50 列，按模型名 rollup）是两个不同维度：
+     * 后者仍是按模型汇总的权威列、行为不变；本列只加层级维度，读侧按需取用。
+     * String 存 JSON（照抄 modelUsageJson V50 / disabledTools V35 / todos V43 先例：
+     * 本列仅存 JSON 串、解析在读侧）。可空：null = 该会话从未产出层级快照（读侧 skip / DTO null）。
+     */
+    private String usageTreeJson;
+    /**
      * 会话级 loop 模式系统提示覆盖（V57 列 loop_mode_override，TEXT 可空）· CC original:
      * overrideSystemPrompt（systemPrompt.ts:56-58 早退——override 非空 → 直接
      * asSystemPrompt([overrideSystemPrompt]) 替换全部系统提示，--loop CLI 运行模式承载）。
@@ -216,6 +225,9 @@ public class SessionRecord {
     public void setTotalCostYuan(Double totalCostYuan) { this.totalCostYuan = totalCostYuan; }
     public String getModelUsageJson() { return modelUsageJson; }
     public void setModelUsageJson(String modelUsageJson) { this.modelUsageJson = modelUsageJson; }
+    // [usage-tree V99] 会话级层级用量/费用快照 getter/setter（V99 会话列 usage_tree_json，MyBatis-Flex snake↔camel 映射）
+    public String getUsageTreeJson() { return usageTreeJson; }
+    public void setUsageTreeJson(String usageTreeJson) { this.usageTreeJson = usageTreeJson; }
     // [prompt-align G0-02 V57] 会话级门控 3 列 getter/setter（V57 会话列，MyBatis-Flex snake↔camel 映射）
     public String getLoopModeOverride() { return loopModeOverride; }
     public void setLoopModeOverride(String loopModeOverride) { this.loopModeOverride = loopModeOverride; }

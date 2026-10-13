@@ -2,7 +2,6 @@ package com.nexusai.application.agent.permission.classifier;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.AbortController;
@@ -12,13 +11,10 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
-import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
-import com.nexusai.infra.llm.TaskBudgetParam;
-import com.nexusai.model.session.dto.ChatMessageDto;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.mockito.Mockito;
@@ -30,7 +26,6 @@ import java.util.Map;
 import java.util.UUID;
 import java.util.concurrent.CancellationException;
 import java.util.concurrent.TimeUnit;
-import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -57,8 +52,7 @@ class YoloClassifierErrorDumpPathTest {
     @Test
     @DisplayName("[P3] 2-stage 分类器错误 → 结果携带 errorDumpPath 且 dump 文件存在（CC :961-985）")
     void twoStageError_producesErrorDumpPath() throws Exception {
-        LlmProvider throwingProvider = fakeProviderThrowing();
-        YoloClassifierImpl classifier = newClassifier(throwingProvider);
+        YoloClassifierImpl classifier = newClassifier(new RuntimeException("classifier api exploded"));
         JsonNode input = JSON.createObjectNode().put("command", "ls -la");
 
         YoloClassifierResult result = classifier.classify("Bash", input, List.of(),
@@ -79,8 +73,7 @@ class YoloClassifierErrorDumpPathTest {
     @Test
     @DisplayName("[P3] abort 分类器错误 → 不携带 errorDumpPath（CC :945-952 abort 分支无 dump）")
     void abortError_noErrorDumpPath() throws Exception {
-        LlmProvider throwingProvider = fakeProviderThrowing();
-        YoloClassifierImpl classifier = newClassifier(throwingProvider);
+        YoloClassifierImpl classifier = newClassifier(new RuntimeException("classifier api exploded"));
         JsonNode input = JSON.createObjectNode().put("command", "ls -la");
 
         // 已 abort 的 AbortController → classify 预检短路（不发起 LLM 调用）
@@ -102,8 +95,7 @@ class YoloClassifierErrorDumpPathTest {
         // [P3 返工] 旧实现把 dumpErrorPrompts 作为 handleStageError 参数预执行 —— abort 异常也会
         //   触发 dump 文件落盘；CC :941-953 catch 开头先判 signal.aborted → abort 分支不 dump。
         //   WHY：abort 是用户主动取消，无诊断价值，不应在 temp 目录产生 /share 收集文件。
-        LlmProvider abortProvider = fakeProviderThrowingCancellation();
-        YoloClassifierImpl classifier = newClassifier(abortProvider);
+        YoloClassifierImpl classifier = newClassifier(new CancellationException("aborted mid-call"));
         JsonNode input = JSON.createObjectNode().put("command", "ls -la");
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
@@ -127,8 +119,7 @@ class YoloClassifierErrorDumpPathTest {
     @Test
     @DisplayName("[P3 返工] 1-stage catch 内 abort → 无 dump 副作用（CC :1261-1269 先判 abort 再 dump）")
     void singleStageCatchAbort_noDumpSideEffect() throws Exception {
-        LlmProvider abortProvider = fakeProviderThrowingCancellation();
-        YoloClassifierImpl classifier = newClassifierSingleStage(abortProvider);
+        YoloClassifierImpl classifier = newClassifierSingleStage(new CancellationException("aborted mid-call (1-stage)"));
         JsonNode input = JSON.createObjectNode().put("command", "ls -la");
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
@@ -161,94 +152,32 @@ class YoloClassifierErrorDumpPathTest {
             null, PermissionMode.DEFAULT);
     }
 
-    /**
-     * chatWithRaw / chatWithOptionsMessage 抛 CancellationException 的 fake provider
-     * （模拟调用中 abort → catch 内 CancellationException 路径，CC :941 signal.aborted）。
-     */
-    private static LlmProvider fakeProviderThrowingCancellation() {
-        return new LlmProvider() {
-            @Override public String type() { return "fake"; }
-            @Override public String chat(ProviderConfig config, String modelName,
-                                         String systemPrompt, String userMessage) {
-                throw new UnsupportedOperationException("应走 chatWithRaw");
-            }
-            @Override public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                                        String systemPrompt, String userMessage,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                throw new CancellationException("aborted mid-call");
-            }
-            @Override public AssistantMessage chatWithOptionsMessage(ProviderConfig config,
-                                                                     String modelName,
-                                                                     String systemPrompt,
-                                                                     String userMessage,
-                                                                     ChatRequestOptions options) {
-                throw new CancellationException("aborted mid-call (1-stage)");
-            }
-            @Override public void stream(ProviderConfig config, String modelName,
-                                         List<com.nexusai.application.agent.prompt.SystemPromptBlock> systemPromptBlocks,
-                                         List<ChatMessageDto> history, ArrayNode tools,
-                                         Integer maxOutputTokensOverride,
-                                         TaskBudgetParam taskBudget,
-                                         String effortValue, String querySource,
-                                         Consumer<String> onToken, Consumer<AssistantMessage> onMessage,
-                                         Consumer<ToolUseBlock> onToolCallComplete,
-                                         Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
-                                         AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
-                throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
-            }
-        };
-    }
-
-    /** chatWithRaw 抛 RuntimeException 的 fake provider（触发非 abort 分类错误）。 */
-    private static LlmProvider fakeProviderThrowing() {
-        return new LlmProvider() {
-            @Override public String type() { return "fake"; }
-            @Override public String chat(ProviderConfig config, String modelName,
-                                         String systemPrompt, String userMessage) {
-                throw new UnsupportedOperationException("应走 chatWithRaw");
-            }
-            @Override public LlmRawResponse chatWithRaw(ProviderConfig config, String modelName,
-                                                        String systemPrompt, String userMessage,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext) {
-                throw new RuntimeException("classifier api exploded");
-            }
-            @Override public void stream(ProviderConfig config, String modelName,
-                                         List<com.nexusai.application.agent.prompt.SystemPromptBlock> systemPromptBlocks,
-                                         List<ChatMessageDto> history, ArrayNode tools,
-                                         Integer maxOutputTokensOverride,
-                                         TaskBudgetParam taskBudget,
-                                         String effortValue, String querySource,
-                                         Consumer<String> onToken, Consumer<AssistantMessage> onMessage,
-                                         Consumer<ToolUseBlock> onToolCallComplete,
-                                         Consumer<String> onReasoningChunk, Runnable onStreamingFallback,
-                                         AbortController abortController,
-                                         Consumer<Throwable> onError, Runnable onDone, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
-                throw new UnsupportedOperationException("YoloClassifier 不使用 stream");
-            }
-        };
-    }
-
-    /** 构造真实 YoloClassifierImpl（2-stage）· 同 YoloClassifierTelemetryTest.newClassifier。 */
-    private static YoloClassifierImpl newClassifier(LlmProvider fakeProvider) {
-        return newClassifier(fakeProvider, true);
+    /** 构造真实 YoloClassifierImpl（2-stage）· [usage-gateway] 分类器经 sideCallClient 发调用。 */
+    private static YoloClassifierImpl newClassifier(Throwable callFailure) {
+        return newClassifier(callFailure, true);
     }
 
     /** 构造真实 YoloClassifierImpl（1-stage 回退 · OPD-WF6-01-RV 默认无 twoStageClassifier 配置）。 */
-    private static YoloClassifierImpl newClassifierSingleStage(LlmProvider fakeProvider) {
-        return newClassifier(fakeProvider, false);
+    private static YoloClassifierImpl newClassifierSingleStage(Throwable callFailure) {
+        return newClassifier(callFailure, false);
     }
 
-    /** 构造真实 YoloClassifierImpl · twoStage 开关（CC isTwoStageClassifierEnabled()）。 */
-    private static YoloClassifierImpl newClassifier(LlmProvider fakeProvider, boolean twoStage) {
+    /** 构造真实 YoloClassifierImpl · twoStage 开关（CC isTwoStageClassifierEnabled()）。
+     *  [usage-gateway] 旁路调用收口后：桩 {@code sideCallClient.message(...)} 抛指定异常
+     *  （等价旧 fake provider 的 chatWithRaw/chatWithOptionsMessage 抛异常）。 */
+    private static YoloClassifierImpl newClassifier(Throwable callFailure, boolean twoStage) {
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         Mockito.when(resolver.resolve(Mockito.anyString())).thenReturn(
             new ModelConfigResolver.ResolvedModel(
                 new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk"));
-        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class))).thenReturn(fakeProvider);
+        // provider 解析保留（fail-closed 前置守卫）→ 返回非 null mock；真实调用已收口 sideCallClient
+        Mockito.when(factory.getProvider(Mockito.any(), Mockito.nullable(String.class)))
+            .thenReturn(Mockito.mock(LlmProvider.class));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+            Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        Mockito.when(sideCallClient.message(Mockito.any(), Mockito.any(), Mockito.any(),
+            Mockito.any(), Mockito.any(), Mockito.any())).thenThrow(callFailure);
         YoloClassifierImpl classifier = new YoloClassifierImpl(
             new YoloPromptBuilder(),
             new YoloTokenEstimator(),
@@ -257,6 +186,7 @@ class YoloClassifierErrorDumpPathTest {
             30,
             resolver,
             twoStage);
+        org.springframework.test.util.ReflectionTestUtils.setField(classifier, "sideCallClient", sideCallClient);
         // [OPD-24 G1] 注入 Bash stub 投影（否则 action 为空 → 短路 ALLOW 不进 LLM 错误路径）
         classifier.setToolRegistry(bashProjectionRegistry());
         return classifier;

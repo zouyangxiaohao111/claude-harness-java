@@ -833,10 +833,20 @@ public record AgentLoopContext(
     //   SkillListingSentRegistry.decide(...)（键 sessionId+agentKey，跨 run 存活），注入消息构造见
     //   skillListingMessage(...)。
 
-    /** skill catalog 异步 Haiku 摘要 · static 化自 LlmAgentLoop#triggerSkillCatalogHaikuSummaryAsync。 */
-    public static void triggerSkillCatalogHaikuSummaryAsync(AgentLoopContext ctx, AgentState state, String catalogText) {
+    /**
+     * skill catalog 异步 Haiku 摘要 · static 化自 LlmAgentLoop#triggerSkillCatalogHaikuSummaryAsync。
+     *
+     * <p>[usage-gateway] 旁路单发收口：本 static 方法无 Spring 字段可用 ⇒ 由调用方（LlmAgentLoop 实例，
+     * bean）把 {@code LlmSideCallClient} 显式传参进来；归属从 {@link AgentState} 形参取
+     * （sessionId={@code state.sessionId()}、agentId={@code state.agentId()}），类别 SIDE_CALL
+     * （技能目录摘要 = 主会话派生的旁路调用）。
+     */
+    public static void triggerSkillCatalogHaikuSummaryAsync(AgentLoopContext ctx, AgentState state,
+                                                            String catalogText,
+                                                            com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient) {
         LlmProviderFactory llmProviderFactory = ctx.llmProviderFactory();
-        if (llmProviderFactory == null || state == null) return;
+        // [usage-gateway] sideCallClient 未装配（非 Spring 单测）→ 保持原「无 LLM 基建即跳过」语义。
+        if (llmProviderFactory == null || sideCallClient == null || state == null) return;
         // [RV14B-WIRE-04] 调用方线程先 resolve 真实配置（DB/settings 访问不在 ForkJoinPool 公共池），
         //   捕获进 runAsync lambda；解析失败 → warn+skip 不落 mock（对齐 CC queryHaiku 失败即无结果）。
         com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolved = resolveHaikuModelConfig(ctx);
@@ -851,12 +861,19 @@ public record AgentLoopContext(
                     String prompt = "请用 1-2 句话总结当前可用技能列表的核心能力分类:\n"
                         + catalogText
                         + "\n\n只输出 1-2 句中文摘要, 不要前缀.";
-                    String summary = llmProviderFactory.getProvider(resolved.config(), resolved.providerType()).chat(
+                    // [usage-gateway] 归属来源：AgentState 形参 state —— sessionId=state.sessionId()、
+                    //   agentId=state.agentId()（UUID → String）；技能目录摘要 = 主会话派生旁路单发 → SIDE_CALL。
+                    String summary = sideCallClient.chat(
                         resolved.config(),
                         modelName,
                         "你是技能目录摘要专家. 用一句话总结可用技能的核心能力.",
-                        prompt
-                    );
+                        prompt,
+                        null,
+                        com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage.inSession(
+                            state.sessionId(),
+                            state.agentId() != null ? state.agentId().toString() : null,
+                            com.nexusai.infra.llm.UsageCategory.SIDE_CALL,
+                            "skill-catalog-summary"));
                     if (summary != null && !summary.isBlank()) {
                         state.appendAttachment(new com.nexusai.application.agent.attachment.AttachmentMessageDto(
                             null, "attachment", "skill_catalog_summary",

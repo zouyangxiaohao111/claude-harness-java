@@ -1,5 +1,5 @@
 import { api } from './rest'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest } from './types'
+import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionUsageResponse } from './types'
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
@@ -16,4 +16,10 @@ export const sessionApi = {
       method: 'PATCH',
       body: { enabled } satisfies SessionToolPatchRequest,
     }),
+  /**
+   * [usage-gateway] 会话级用量明细（GET /sessions/{id}/usage · 记账侧权威值）。
+   * 供「用量与花费」弹窗「子代理（本会话）」行按 taskId 关联；老后端无该端点 → 抛错，
+   * 调用方静默回退 task 事件统计（不得因此阻塞弹窗）。
+   */
+  usage: (id: string) => api<SessionUsageResponse>(`/sessions/${encodeURIComponent(id)}/usage`),
 }

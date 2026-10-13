@@ -20,7 +20,6 @@ import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.eventbus.ws.SkillImprovementSuggestionEvent;
 import com.nexusai.infra.llm.LlmProvider;
-import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -108,10 +107,10 @@ class SkillImprovementHookTest {
                 null, null);
     }
 
-    /** 生产构造 helper · 对齐 Spring 7 参构造 (resolver/skillRegistry/sessionRegistry 可注入). */
+    /** 生产构造 helper · 对齐 Spring 7 参构造 (sideCallClient/resolver/skillRegistry/sessionRegistry 可注入). */
     private static SkillImprovementHook productionHook(SkillRegistry registry,
                                                        SessionAgentStateRegistry sessionRegistry) {
-        return new SkillImprovementHook(new LlmProviderFactory(), new Telemetry(), null,
+        return new SkillImprovementHook(null /* [usage-gateway] sideCallClient 未接线 → 侧信道跳过 */, new Telemetry(), null,
                 registry, sessionRegistry, null, false);
     }
 
@@ -458,7 +457,7 @@ class SkillImprovementHookTest {
         sessionRegistry.register(sessionId, state);
 
         SkillImprovementHook hook = new SkillImprovementHook(
-                new LlmProviderFactory(), new Telemetry(), null,
+                null /* [usage-gateway] sideCallClient 未接线 → 侧信道跳过 */, new Telemetry(), null,
                 new SkillRegistry(skillsRoot.toString()), sessionRegistry, null, false);
 
         PostSamplingContext ctx = contextWithTuc(QuerySource.REPL_MAIN_THREAD,
@@ -761,35 +760,38 @@ class SkillImprovementHookTest {
     @DisplayName("buildModelQuery: ModelConfigResolver 未注入 → warn+skip 返回 \"\", 不落 mock (DEC-RV-19)")
     void buildModelQuery_resolverNull_skipsNotMock() {
         SkillImprovementHook.SkillImprovementModelQuery q =
-                SkillImprovementHook.buildModelQuery(new LlmProviderFactory(), null);
+                SkillImprovementHook.buildModelQuery(null,
+                        mock(com.nexusai.application.agent.cost.LlmSideCallClient.class));
         assertThat(q.query("sys", "prompt", SkillImprovementHook.applyQueryOptions())).isEqualTo("");
     }
 
     /**
-     * WHY (规则九 · 验证意图): DEC-RV-19 核心 — config 必须<b>按模型名匹配的 providerType</b>
-     * 喂 2 参 {@code getProvider(config, providerType)}, 而非旧 1 参恒 openai_sdk.
-     * resolver 返回 (config, type="anthropic") → 工厂必须以 ("anthropic") 路由
-     * (对齐 CC: 模型名决定唯一 client). 若回归 1 参调用, verify 变红.
+     * WHY (规则九 · 验证意图): DEC-RV-19 核心 — config 必须来自<b>按模型名匹配的解析结果</b>,
+     * 而非旧"任意首个 enabled provider"。[usage-gateway] 改造后 provider 路由内聚到
+     * {@code LlmSideCallClient}/请求网关，本类契约 = 以 resolver 解析出的 config + getSmallFastModel()
+     * 调旁路客户端；若回归旧解析路径或传错模型名，verify 变红。
      */
     @Test
-    @DisplayName("buildModelQuery: resolver 成功 → 2 参 getProvider 按模型匹配 providerType (DEC-RV-19)")
+    @DisplayName("buildModelQuery: resolver 成功 → 以模型匹配解析出的 config 调旁路客户端 (DEC-RV-19)")
     void buildModelQuery_resolverSuccess_usesModelMatchedProviderType() {
         ModelConfigResolver resolver = mock(ModelConfigResolver.class);
         when(resolver.resolve(anyString())).thenReturn(
                 new ModelConfigResolver.ResolvedModel(
                         new ProviderConfig("https://api.anthropic.com", "sk-test"), "anthropic"));
-        LlmProviderFactory factory = mock(LlmProviderFactory.class);
-        LlmProvider provider = mock(LlmProvider.class);
-        when(factory.getProvider(any(ProviderConfig.class), anyString())).thenReturn(provider);
-        when(provider.chatWithOptions(any(), any(), any(), any(), any())).thenReturn("rewritten");
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+                mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(client.chat(any(), any(), any(), any(), any(), any())).thenReturn("rewritten");
 
         SkillImprovementHook.SkillImprovementModelQuery q =
-                SkillImprovementHook.buildModelQuery(factory, resolver);
+                SkillImprovementHook.buildModelQuery(resolver, client);
         String resp = q.query("sys", "prompt", SkillImprovementHook.applyQueryOptions());
 
         assertThat(resp).isEqualTo("rewritten");
-        // 2 参路由: providerType 必须来自 resolver (模型匹配), 非 1 参默认 openai_sdk
-        verify(factory).getProvider(eq(new ProviderConfig("https://api.anthropic.com", "sk-test")), eq("anthropic"));
+        // [usage-gateway] config 必须来自 resolver 的模型名匹配结果（非旧"任意首个 enabled provider"）
+        //   + 模型名 = getSmallFastModel；原 2 参 getProvider 路由已内聚到 LlmSideCallClient/网关，
+        //   本类契约改为「以解析出的 config + 小快模型名调旁路客户端」（断言强度不变）。
+        verify(client).chat(eq(new ProviderConfig("https://api.anthropic.com", "sk-test")),
+                eq(SkillImprovementHook.getSmallFastModel()), eq("sys"), eq("prompt"), any(), any());
     }
 
     // ════════════════════════════════════════════════════════════════════

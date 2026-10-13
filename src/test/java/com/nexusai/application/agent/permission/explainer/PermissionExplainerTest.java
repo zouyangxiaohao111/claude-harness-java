@@ -20,7 +20,6 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -83,6 +82,24 @@ class PermissionExplainerTest {
             new ProviderConfig("https://example.com", "sk-test"), "openai_sdk");
     }
 
+    /** [usage-gateway] 桩 sideCallClient.message(...) 返回给定旁路结果（含 tool_use 块）。 */
+    private static com.nexusai.application.agent.cost.LlmSideCallClient sideCallReturning(
+            LlmProvider.LlmInvocationResult result) {
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+            mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(client.message(any(), any(), any(), any(), any(), any())).thenReturn(result);
+        return client;
+    }
+
+    /** [usage-gateway] 桩 sideCallClient.message(...) 抛异常（异常 → null 无降级路径）。 */
+    private static com.nexusai.application.agent.cost.LlmSideCallClient sideCallThrowing(
+            RuntimeException failure) {
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+            mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(client.message(any(), any(), any(), any(), any(), any())).thenThrow(failure);
+        return client;
+    }
+
     private static ChatMessageDto assistant(String content) {
         return new ChatMessageDto(null, null, Role.assistant, null, content,
             null, null, null, null, null, null, null, null, null, null,
@@ -129,12 +146,14 @@ class PermissionExplainerTest {
         when(providerFactory.getProvider(any(), any())).thenReturn(provider);
         when(resolver.resolve("test-model")).thenReturn(usableResolved());
         ToolUseBlock toolUse = new ToolUseBlock("toolu_1", "explain_command", fourFieldInput());
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenReturn(new AssistantMessage("", "tool_calls", List.of(toolUse), ""));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = sideCallReturning(
+            new LlmProvider.LlmInvocationResult("", "tool_calls", List.of(toolUse),
+                com.nexusai.application.agent.tool.AgentUsage.EMPTY, "id", null, null, null, 0L));
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PermissionExplainer explainer =
             explainerWithMainLoopModel(true, providerFactory, resolver, analytics, "test-model", sessionId);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "Bash", JSON.createObjectNode(), null, null, null);
 
@@ -163,12 +182,14 @@ class PermissionExplainerTest {
         missingRisk.put("explanation", "x");
         missingRisk.put("reasoning", "y");
         ToolUseBlock toolUse = new ToolUseBlock("toolu_1", "explain_command", missingRisk);
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenReturn(new AssistantMessage("", "tool_calls", List.of(toolUse), ""));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = sideCallReturning(
+            new LlmProvider.LlmInvocationResult("", "tool_calls", List.of(toolUse),
+                com.nexusai.application.agent.tool.AgentUsage.EMPTY, "id", null, null, null, 0L));
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PermissionExplainer explainer =
             explainerWithMainLoopModel(true, providerFactory, resolver, analytics, "test-model", sessionId);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "Bash", JSON.createObjectNode(), null, null, null);
 
@@ -192,14 +213,16 @@ class PermissionExplainerTest {
         when(providerFactory.getProvider(any(), any())).thenReturn(provider);
         when(resolver.resolve("test-model")).thenReturn(usableResolved());
         ToolUseBlock toolUse = new ToolUseBlock("toolu_1", "explain_command", fourFieldInput());
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenReturn(new AssistantMessage("", "tool_calls", List.of(toolUse), ""));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = sideCallReturning(
+            new LlmProvider.LlmInvocationResult("", "tool_calls", List.of(toolUse),
+                com.nexusai.application.agent.tool.AgentUsage.EMPTY, "id", null, null, null, 0L));
 
         // F3C-MODEL：reach telemetry 路径必须先解析会话主循环模型（CC getMainLoopModel() 恒可解析，
         //   Java 等价=注入会话态 currentModel），否则 resolveMainLoopModelName(null) 早退 null（无降级）。
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PermissionExplainer explainer =
             explainerWithMainLoopModel(true, providerFactory, resolver, analytics, "test-model", sessionId);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "mcp__github__create_issue", JSON.createObjectNode(), null, null, null);
 
@@ -231,14 +254,16 @@ class PermissionExplainerTest {
         missingRisk.put("explanation", "x");
         missingRisk.put("reasoning", "y");
         ToolUseBlock toolUse = new ToolUseBlock("toolu_1", "explain_command", missingRisk);
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenReturn(new AssistantMessage("", "tool_calls", List.of(toolUse), ""));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = sideCallReturning(
+            new LlmProvider.LlmInvocationResult("", "tool_calls", List.of(toolUse),
+                com.nexusai.application.agent.tool.AgentUsage.EMPTY, "id", null, null, null, 0L));
 
         // F3C-MODEL：reach telemetry 路径必须先解析会话主循环模型（CC getMainLoopModel() 恒可解析，
         //   Java 等价=注入会话态 currentModel），否则 resolveMainLoopModelName(null) 早退 null（无降级）。
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PermissionExplainer explainer =
             explainerWithMainLoopModel(true, providerFactory, resolver, analytics, "test-model", sessionId);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "mcp__github__create_issue", JSON.createObjectNode(), null, null, null);
 
@@ -266,12 +291,13 @@ class PermissionExplainerTest {
 
         when(providerFactory.getProvider(any(), any())).thenReturn(provider);
         when(resolver.resolve("test-model")).thenReturn(usableResolved());
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenThrow(new RuntimeException("provider down"));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+            sideCallThrowing(new RuntimeException("provider down"));
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PermissionExplainer explainer =
             explainerWithMainLoopModel(true, providerFactory, resolver, analytics, "test-model", sessionId);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "Bash", JSON.createObjectNode(), null, null, null);
 
@@ -375,12 +401,14 @@ class PermissionExplainerTest {
         when(providerFactory.getProvider(any(), any())).thenReturn(provider);
         when(resolver.resolve("claude-sonnet-4-5")).thenReturn(usableResolved());
         ToolUseBlock toolUse = new ToolUseBlock("toolu_1", "explain_command", fourFieldInput());
-        when(provider.chatWithOptionsMessage(any(), any(), any(), any(), any()))
-            .thenReturn(new AssistantMessage("", "tool_calls", List.of(toolUse), ""));
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient = sideCallReturning(
+            new LlmProvider.LlmInvocationResult("", "tool_calls", List.of(toolUse),
+                com.nexusai.application.agent.tool.AgentUsage.EMPTY, "id", null, null, null, 0L));
 
         // modelNameOverride 置空 → 模型源走会话主循环模型（AgentState.currentModel = CC options.mainLoopModel）
         PermissionExplainer explainer = new PermissionExplainer(providerFactory, resolver, analytics, true);
         explainer.setSessionAgentStateRegistry(registry);
+        org.springframework.test.util.ReflectionTestUtils.setField(explainer, "sideCallClient", sideCallClient);
 
         PermissionExplanation result = explainer.generatePermissionExplanation(
             sessionId, "Bash", JSON.createObjectNode(), null, null, null);

@@ -3,11 +3,13 @@ package com.nexusai.application.agent.memory;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.infra.llm.LlmApiException;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -73,6 +75,10 @@ public class FindRelevantMemories {
     public record RelevantMemory(String path, long mtimeMs) {}
 
     private final ObjectMapper objectMapper = new ObjectMapper();
+    /**
+     * LLM provider 工厂 · [usage-gateway] 旁路调用已收口到 {@link #sideCallClient}（后者自行解析
+     * provider），本字段不再被调用；保留以维持生产 @Bean（ToolRegistrationConfig）与既有构造签名。
+     */
     private final LlmProviderFactory providerFactory;
     private final String sideModel;
     private final MemoryScanner scanner;
@@ -85,6 +91,16 @@ public class FindRelevantMemories {
      * 不落 mock（RV14B-GATE-01）。
      */
     private final com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
+
+    /**
+     * [usage-gateway] 旁路 LLM 收口客户端（调用 + 归属 + 记账）· 生产 @Bean 由 Spring 字段注入。
+     *
+     * <p>原实现经 {@code providerFactory.getProvider(...).chatWithOptions(...)} 直呼（无记账）；
+     * 现由 {@link LlmSideCallClient#chat} 收口（内部解析 provider）。{@code required=false}：测试/
+     * 孤立构造不注入即为 null（此时 side-query 抛 NPE → 落入既有 catch → 返回空列表）。
+     */
+    @Autowired(required = false)
+    private LlmSideCallClient sideCallClient;
 
     /**
      * @param providerFactory     LLM provider 工厂
@@ -224,7 +240,6 @@ public class FindRelevantMemories {
                 return List.of();
             }
             String modelName = resolveSideModelName();
-            LlmProvider provider = providerFactory.getProvider(resolved.config(), resolved.providerType());
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 List.of(), null,
                 LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(schema),
@@ -238,8 +253,13 @@ public class FindRelevantMemories {
             // MEM-02/G-22：sideQuery.ts:115-128 maxRetries=2 —— SDK 客户端级重试
             // （408/409/429/5xx + 连接错误；claude.ts:1781 主链 maxRetries:0 的 Java provider 无
             // 客户端重试 → 本处调用点手工重试等价）。abort 优先：取消后不发起/不重试。
-            String rawJson = chatWithOptionsWithRetry(provider, resolved.config(), modelName,
-                SELECT_MEMORIES_SYSTEM_PROMPT, userMessage, options);
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient（替代 providerFactory.getProvider(...).chatWithOptions，
+            //   补记账）。归属来源：本路径**无 sessionId 形参**（只有 agentContext）→ standalone
+            //   （sessionId/agentId 均 null，绝不伪造）+ withAgentContext(agentContext)。
+            String rawJson = chatWithOptionsWithRetry(sideCallClient, resolved.config(), modelName,
+                SELECT_MEMORIES_SYSTEM_PROMPT, userMessage, options,
+                LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, "memdir-relevance")
+                    .withAgentContext(agentContext));
             return parseSelectedMemories(rawJson).stream()
                 .filter(validFilenames::contains)
                 .toList();
@@ -258,14 +278,20 @@ public class FindRelevantMemories {
         }
     }
 
-    /** CC sideQuery maxRetries=2 等价 · 瞬时 5xx/429（SDK 重试状态集 408/409/429/≥500）重试至多 2 次。 */
+    /**
+     * CC sideQuery maxRetries=2 等价 · 瞬时 5xx/429（SDK 重试状态集 408/409/429/≥500）重试至多 2 次。
+     *
+     * <p>[usage-gateway] 调用收口到 {@link LlmSideCallClient#chat}（替代原 provider 形参）；重试/
+     * 退避/abort 预检/异常分类逻辑逐字不变。
+     */
     private static String chatWithOptionsWithRetry(
-            LlmProvider provider,
+            LlmSideCallClient sideCallClient,
             ProviderConfig config,
             String modelName,
             String systemPrompt,
             String userMessage,
-            LlmProvider.ChatRequestOptions options) {
+            LlmProvider.ChatRequestOptions options,
+            LlmSideCallClient.SideCallUsage usage) {
         int maxRetries = 2;   // CC sideQuery.ts:116 maxRetries = 2
         for (int attempt = 0; ; attempt++) {
             // abort 预检（CC SDK signal.throwIfAborted 请求前等价）：取消后不再发起调用
@@ -274,7 +300,7 @@ public class FindRelevantMemories {
                 throw new CancellationException("side-query aborted before attempt " + (attempt + 1));
             }
             try {
-                return provider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+                return sideCallClient.chat(config, modelName, systemPrompt, userMessage, options, usage);
             } catch (Exception e) {
                 // F2-MEM-02（返工）：catch 面从 LlmApiException 扩展为全 Exception —— 生产 provider
                 //   异常包装面（AnthropicSdkProvider.chatWithOptions:976 全异常包 RuntimeException；

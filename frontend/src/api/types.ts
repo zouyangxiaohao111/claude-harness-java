@@ -699,11 +699,135 @@ export interface StatsTotals {
   tokenCount: number
   costYuan: number
 }
+
+/**
+ * 按调用类型聚合单条（后端 StatsService.CategoryStat · 数据源 `llm_usage_calls` 每 call 明细表）。
+ *
+ * <p>与 byModel 的区别：byModel 回答「哪些模型烧钱」，本维度回答「**哪类调用**烧钱」
+ * （主对话 / 子代理 / 压缩 / 后台 / 旁路 …）—— 旧单点统计看不到子代理与旁路调用。
+ *
+ * <p>质量标志（estimated/aborted/failed）单独计数：`estimatedCalls` 的 token 是估算值
+ * （不可当账单），`abortedCalls` 是被取消/流中断的尝试（上游可能仍计费），`failedCalls` 是失败尝试。
+ */
+export interface StatsByCategory {
+  /** 调用类型（后端 UsageCategory 枚举名：MAIN/SUBAGENT/TEAMMATE/COMPACT/BACKGROUND/HOOK/SIDE_CALL/CLASSIFIER/UNKNOWN） */
+  category: string
+  /** 明细行数（每次尝试一行，含失败/中断尝试） */
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  /** 缓存读 token（**不含在 inputTokens 内**时才有意义 · 展示单列，不计入行 token 合计以防双计） */
+  cacheReadTokens: number
+  /** 缓存写 token（同上） */
+  cacheWriteTokens: number
+  costYuan: number
+  /** token 数为估算（provider 未上报 usage）的调用数 · 不可当账单 */
+  estimatedCalls: number
+  /** 被取消 / 流中断的调用数 */
+  abortedCalls: number
+  /** 失败的调用数 */
+  failedCalls: number
+  streamCalls: number
+  nonStreamCalls: number
+}
+
+/**
+ * 按 agent 层级聚合单条（后端 StatsService.AgentStat · 数据源同 byCategory）。
+ *
+ * <p>`parentAgentId` + `depth` 表达层级：可直接重建「会话 → 主 agent → 子代理 → 嵌套子代理 / 旁路」
+ * 的花费树（后端按 depth 升序返回，父在前）。
+ */
+export interface StatsByAgent {
+  agentId: string
+  /** 该 agent 的调用类型（同 StatsByCategory.category） */
+  category: string
+  /** 父 agent id（主 agent / 无父为 null） */
+  parentAgentId: string | null
+  /** 层级深度（主 agent = 0） */
+  depth: number
+  /** 归属标签（后端归属链上的 label · 可为 null，此时展示类型名） */
+  label: string | null
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costYuan: number
+  estimatedCalls: number
+  abortedCalls: number
+  failedCalls: number
+  streamCalls: number
+  nonStreamCalls: number
+}
+
+/**
+ * 会话级用量总计（后端 `StatsService.SessionUsageTotals` · `GET /api/v1/sessions/{id}/usage`）。
+ *
+ * <p>`elapsedMs` = 各次尝试**模型调用耗时**求和 —— ⛔ 不是任务墙钟时长（task 事件的
+ * `duration_ms` 才是），两者不得混用同一展示标签。
+ */
+export interface SessionUsageTotals {
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costYuan: number
+  elapsedMs: number
+  estimatedCalls: number
+  abortedCalls: number
+  failedCalls: number
+  streamCalls: number
+  nonStreamCalls: number
+}
+
+/**
+ * 会话内单个 agent 节点的用量（后端 `StatsService.SessionAgentUsage`）。
+ *
+ * <p>`taskId` 是**关联键**：等于 task 事件的 `task_id`（后端由 agentId 确定性换算，
+ * 前端不得自行解析 agentId 格式）；无法换算（主 agent / 无会话哨兵）→ null。
+ * `calls` 是**模型调用次数**（不是工具调用次数）；`elapsedMs` 是模型调用耗时（非任务墙钟时长）。
+ */
+export interface SessionAgentUsage {
+  agentId: string
+  taskId: string | null
+  category: string
+  parentAgentId: string | null
+  parentTaskId: string | null
+  depth: number
+  label: string | null
+  calls: number
+  inputTokens: number
+  outputTokens: number
+  cacheReadTokens: number
+  cacheWriteTokens: number
+  costYuan: number
+  elapsedMs: number
+  estimatedCalls: number
+  abortedCalls: number
+  failedCalls: number
+  streamCalls: number
+  nonStreamCalls: number
+}
+
+/** GET /api/v1/sessions/{id}/usage 响应（会话级用量明细 · 记账侧权威值）。 */
+export interface SessionUsageResponse {
+  sessionId: string
+  totals: SessionUsageTotals
+  byCategory: StatsByCategory[]
+  agents: SessionAgentUsage[]
+}
+
 /** GET /api/v1/stats 响应 */
 export interface StatsResponse {
   totals: StatsTotals
   byDay: StatsByDay[]
   byModel: StatsByModel[]
+  /** 按调用类型（llm_usage_calls 明细聚合）。**可选**：后端明细表维度是后加的，
+   *  老后端不返回该字段 → 前端按空列表处理（不是「零花费」，是「该后端无此维度」）；新后端恒有（无记录=空数组）。 */
+  byCategory?: StatsByCategory[]
+  /** 按 agent 层级（llm_usage_calls 明细聚合 · 同上，可选） */
+  byAgent?: StatsByAgent[]
 }
 
 // ---- Team 协作（/api/v1/teams · 对齐后端 TeamController）----

@@ -9,6 +9,7 @@ import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.compact.BoundaryReader;
 import com.nexusai.application.agent.compact.ContextUsageCalculator;
 import com.nexusai.application.agent.compact.SqliteBusyRetry;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.agent.tasks.QueueEventPublisher;
@@ -43,6 +44,7 @@ import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ModelNameResolver;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.session.dto.AttachmentRequest;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -149,6 +151,9 @@ public class ChatService {
     @Autowired private ProviderMapper providerMapper;
     @Autowired private SettingsMapper settingsMapper;
     @Autowired private LlmProviderFactory llmProviderFactory;
+    // [usage-gateway] 旁路 LLM 单发客户端 · 标题生成(auto_title)等旁路调用统一走它完成「调用+记账」。
+    //   required=false 容错直接 new ChatService() 的单测（null 时由调用处 NPE 显式暴露，不静默）。
+    @Autowired(required = false) private LlmSideCallClient sideCallClient;
     @Autowired private ModelConfigResolver modelConfigResolver;
     @Autowired private ProviderService providerService;
     @Autowired private ToolRegistry toolRegistry;
@@ -2521,7 +2526,7 @@ public class ChatService {
             if (doCount1) {
                 String userContent = extractFirstUserContent(session.getId());
                 String input = userContent != null ? userContent : "(无内容)";
-                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName),
+                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName, session.getId()),
                     0, userMessageId, wsTemplate);
                 if (log.isInfoEnabled()) {
                     log.info("[ChatService] 标题 count1 生成{} session={} userCount={} title={}",
@@ -2533,7 +2538,7 @@ public class ChatService {
             if (doCount3) {
                 String convText = extractConversationTextTail(session.getId());
                 String input = (convText != null && !convText.isBlank()) ? convText : "(无内容)";
-                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName),
+                boolean ok = applyGeneratedTitle(session, generateTitleText(input, fastModelName, session.getId()),
                     2, userMessageId, wsTemplate);
                 if (log.isInfoEnabled()) {
                     log.info("[ChatService] 标题 count3 刷新{} session={} userCount={} title={}",
@@ -2553,17 +2558,13 @@ public class ChatService {
      *
      * @return 非 null 非 blank 的标题（生成失败回落"新会话"占位）
      */
-    private String generateTitleText(String input, String fastModelName) {
+    private String generateTitleText(String input, String fastModelName, String sessionId) {
         ProviderConfig config;
-        String providerType;
         try {
             config = buildConfigForModel(fastModelName);
-            providerType = providerTypeForModel(fastModelName);
         } catch (Exception e) {
             config = ProviderConfig.empty();
-            providerType = "openai_compatible";
         }
-        LlmProvider titleProvider = llmProviderFactory.getProvider(config, providerType);
         String prompt = "用 5-10 个字总结: " + input;
         String newTitle;
         try {
@@ -2596,13 +2597,19 @@ public class ChatService {
             //   在本路径**结构上不存在**（CC 侧同处亦无 subagent ALS 作用域）；显式 null 保留
             //   CC agentContext.ts:170「无 invokingRequestId」语义。
             //   ⚠️ 每次调用都发 WARN（非一次性闸）——一次性闸会让多会话下第 2 个会话的缺值不可观测。
-            //   （本方法 generateTitleText 无 sessionId 形参 —— 侧信道调用不需要会话键，故日志不携带）
+            //   （[usage-gateway] generateTitleText 现接收显式 sessionId 形参：**只用于旁路调用记账归属**，
+            //    不改变 agentContext 语义 —— auto_title 结构上仍无 agent 执行链，agentContext 恒 null）
             log.warn("ChatService auto_title agent 归因上下文显式为空 (null)"
                 + "（会话标题生成无 agent 执行链 · (b) 类本就不需要）");
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
                 List.of(), null, LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(titleSchema),
                 null, null, "auto_title", null, null, null, null, null, null, null, null, null, null);
-            String titleJson = titleProvider.chatWithOptions(config, fastModelName, titlePrompt, prompt, options);
+            // [usage-gateway] 旁路标题生成改走统一旁路客户端（调用+记账）：归属 sessionId 取自唯一调用方
+            //   maybeGenerateTitle 透传的 session.getId()（本方法自身无会话上下文，故显式形参传入；
+            //   真实 sessionId，非伪造）。类别 SIDE_CALL · 标签 title-generation。返回值语义（文本）不变。
+            String titleJson = sideCallClient.chat(config, fastModelName, titlePrompt, prompt, options,
+                LlmSideCallClient.SideCallUsage.inSession(sessionId, null,
+                    UsageCategory.SIDE_CALL, "title-generation"));
             newTitle = (titleJson != null && !titleJson.isBlank())
                 ? JSON.readTree(titleJson).path("title").asText(null) : null;
         } catch (Exception ex) {

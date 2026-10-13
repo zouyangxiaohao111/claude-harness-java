@@ -5,6 +5,7 @@ import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
 import com.nexusai.domain.session.SessionService;
+import com.nexusai.domain.stats.StatsService;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
@@ -18,6 +19,14 @@ import java.util.List;
 public class SessionController {
 
     @Autowired private SessionService sessionService;
+
+    /**
+     * [usage-gateway] 会话级用量聚合（{@code GET /{id}/usage}）· 用量明细的 owner 是 stats 域
+     * （与全量统计同一数据源 {@code llm_usage_calls} 与同一聚合口径），此处只做请求映射。
+     * {@code required=false}：非 Spring 单测无 bean → null，端点调用会 NPE 但不影响其他用例。
+     */
+    @Autowired(required = false)
+    private StatsService statsService;
 
     /**
      * [IMP-1 R4] bypassPermissions 数据库开关登录重读 · 对齐 CC {@code /login} 后
@@ -46,6 +55,25 @@ public class SessionController {
     @GetMapping("/{id}")
     public SessionDto get(@PathVariable String id) {
         return sessionService.getById(id);
+    }
+
+    /**
+     * [usage-gateway] 会话级用量明细（前端「用量与花费」弹窗「用量」页「子代理（本会话）」行的
+     * 权威数据源）· {@code GET /api/v1/sessions/{id}/usage}。
+     *
+     * <p>返回 {@code {sessionId, totals, byCategory, agents}}：{@code agents[]} 每个节点含
+     * {@code agentId}（明细表身份渲染）、{@code taskId}（= 任务注册表 / task 事件的 {@code task_id}，
+     * 供前端精确关联；不可换算 → null）、{@code category/parentAgentId/parentTaskId/depth/label}、
+     * token 四通道、{@code costYuan}、{@code calls}（**模型调用次数**）、{@code elapsedMs}
+     * （模型调用耗时求和，⛔ 不是任务墙钟时长）与估算/中断/失败计数。
+     *
+     * <p>空会话 / 无明细 → totals 全零 + 空列表（200，fail-soft）；sessionId 空白 → 400
+     * （{@link com.nexusai.infra.exception.GlobalExceptionHandler} 把 {@code ValidationException}
+     * 映射为 400，与 ops 线手写校验先例一致）。
+     */
+    @GetMapping("/{id}/usage")
+    public StatsService.SessionUsage usage(@PathVariable String id) {
+        return statsService.sessionUsage(id);
     }
 
     /**

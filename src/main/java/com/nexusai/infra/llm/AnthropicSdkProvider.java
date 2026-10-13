@@ -325,10 +325,14 @@ public class AnthropicSdkProvider implements LlmProvider {
                        // [A#3 tuc-invoking-req] 显式 agent 归因上下文（null = 主线程 / 无归因）·
                        //   本方法跑在 STREAM_EXECUTOR 虚拟线程（LlmAgentLoop:6604），AgentContext
                        //   ThreadLocal 不可达 ⇒ 必须由调用方（ModelCaller，上下文有效线程）显式下传。
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参类型由 AgentContext 升级为 LlmCallScope（**形参个数不变**，
+                       //   位置索引零漂移）：scope 内既有 agentContext（归因语义逐字保留，内部统一经
+                       //   LlmCallScope.agentContextOf 取出），又新增 sink —— 每次尝试结局（结算/中断/
+                       //   失败）都要写用量快照，用户裁定「流中断/取消/失败也要统计实际开销」。
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参 · T4 在 doStream 内消费（注册关流监听 + stall 映射）；
                        //   本批（T3）先接签名、零行为。
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
             abortController.onCancel(ac -> {
@@ -348,7 +352,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             }
             boolean ok = runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
                 maxOutputTokensOverride, taskBudget, effortValue, null, aborted, null,
-                onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+                onAssistantMessage, onComplete, skipCacheWrite, scope,
                 null, false);   // [Wn] 强制入口不启用封顶（非 stall 来源）
             if (ok) {
                 return;
@@ -360,7 +364,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             taskBudget, effortValue, querySource,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite, agentContext,
+            onStreamingFallback, aborted, onError, onComplete, skipCacheWrite, scope,
             streamIdleControl);   // [看门狗] 末参透传
     }
 
@@ -406,16 +410,25 @@ public class AnthropicSdkProvider implements LlmProvider {
                           Consumer<Throwable> onError,
                           Runnable onComplete,
                           Boolean skipCacheWrite,
-                          com.nexusai.application.agent.subagent.AgentContext agentContext,
+                          LlmCallScope scope,
                           // [流空闲看门狗] doStream 消费：注册关流监听 + 读循环后 stall 判定 + catch 映射
                           StreamIdleControl streamIdleControl) {
+        // [usage-gateway] 归因上下文逐字保留：内部原有 agentContext 消费点语义不变，只是取值源由形参
+        //   改为 scope.agentContext()（null 作用域安全 ⇒ 无 sink/无归因时行为与替换前一致）。
+        AgentContext agentContext = LlmCallScope.agentContextOf(scope);
         if (config == null || !config.isUsable()) {
+            // [usage-gateway] 尝试结局之一（请求未发出，无任何 usage 数据）—— 如实报 EMPTY+UNKNOWN+FAILED，
+            //   不伪造估算值；快照下游按 hasTokens() 过滤零值行。
+            recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.FAILED);
             onError.accept(new IllegalStateException(
                 "AnthropicSdkProvider.stream called without usable ProviderConfig"));
             return;
         }
 
         long streamStartMs = System.currentTimeMillis(); // [A-13] per-LLM-call durationMs 起点 · CC logging.ts start
+        // [usage-gateway] StreamState 提升到 try 之外：中断 / 失败出口要读「该次尝试已累积的 usage」
+        //   （abort 时 message_start 事件已填 input/cache/output），声明在 try 内则 catch 不可达。
+        StreamState state = new StreamState();
 
         // [流空闲看门狗 · 对齐 CC 2.1.296（规格 §2-§3）]
         //   · stalledByWatchdog：看门狗触发标记（abort 监听置位；实际解阻塞由读超时完成，
@@ -427,7 +440,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         AtomicBoolean anyBlockFinished = new AtomicBoolean(false);
 
         // [看门狗] state 提前声明（catch 侧的 stall 映射要读 finishReason；try 内局部变量对 catch 不可见）
-        StreamState state = new StreamState();
+        //   —— 与上方 [usage-gateway] 的提前声明合并为同一处（两次声明同位置、同一意图）。
 
         try {
             // [provider-custom-headers 任务 6] 主链 sessionId 来源 = history（DB 真值，必中）。
@@ -475,6 +488,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             String requestId = rawResp.requestId().orElse(null);
 
             // 逐事件消费 · [H13-GAP-4 v3] 迭代器 + aborted 事件边界检查
+            //   （state 已在 try 外声明：中断/失败出口需读已累积 usage，见 [usage-gateway]）
             state.requestId = requestId;   // [看门狗] state 已在 try 前声明
             if (log.isDebugEnabled()) {
                 log.debug("AnthropicSdkProvider 流式捕获 request_id={} · CC claude.ts:1834 streamRequestId=result.request_id",
@@ -537,6 +551,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                     history == null ? 0 : history.size(),
                     new java.util.concurrent.CancellationException("stream aborted"),
                     querySource, streamStartMs), agentContext);
+                // [usage-gateway] abort 出口 = 一次尝试结局（本分支跳过 onAssistantMessage/onComplete，
+                //   否则被中断调用在上游已计费的 token 全丢）。Anthropic 协议下 message_start 事件起
+                //   state 就已填 input/cache/output（mapStreamEvent），故直接上报已累积值 → UPSTREAM；
+                //   若在 message_start 前就中断（零值）则记 UNKNOWN（不谎报来源）。WHY 必须报：
+                //   用户裁定「流中断/取消时也要统计实际开销」= mid-stream abort 上游仍会按已生成 token 计费。
+                recordAttempt(scope, usageOfState(state), LlmUsagePhase.ABORTED);
                 log.info("AnthropicSdkProvider stream aborted: SDK 流消费已中断, 跳过 onComplete");
                 return;
             }
@@ -577,6 +597,10 @@ public class AnthropicSdkProvider implements LlmProvider {
             // [A-13] per-LLM-call 流式成功事件 · CC claude.ts:2858 logAPISuccessAndDuration
             emitApiTerminalEvent("tengu_api_success", apiSuccessAttrs(modelName,
                 history == null ? 0 : history.size(), state, querySource, streamStartMs), agentContext);
+            // [usage-gateway] 正常完成结局：onComplete 前上报结算快照（onComplete 之后的代码不再执行
+            //   —— loop 侧 onComplete 可能触发下一次调用/收尾）。usage 取 usageOfState（与
+            //   buildAssistantMessage 同一映射，单一事实源），有值 → UPSTREAM。
+            LlmCallScope.recordSettled(scope, usageOfState(state));
             onComplete.run();
         } catch (Exception e) {
             // [流空闲看门狗] stall 优先于一切分类：不走通用流式→非流式回退（那是 5xx/连接类错误的
@@ -593,8 +617,15 @@ public class AnthropicSdkProvider implements LlmProvider {
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName,
                 history == null ? 0 : history.size(), translated, querySource, streamStartMs), agentContext);
             if (aborted != null && aborted.get()) {
+                // [usage-gateway] 中断（中断信号引发的异常）同样是一次尝试结局 ⇒ 上报已累积用量快照，
+                //   否则取消路径的 upstream 计费无账可对（用户核心诉求：取消也要统计）。
+                recordAttempt(scope, usageOfState(state), LlmUsagePhase.ABORTED);
                 return;
             }
+            // [usage-gateway] 流式尝试失败（即「回退前的那次尝试」）：上游可能已为该次尝试计费 ⇒ 必报
+            //   FAILED 快照。若随后非流式回退成功，还会再落一条 SETTLED（见 nonStreamingFallback）——
+            //   两条快照=两次尝试分别记账，是设计预期（LlmUsageSink 快照语义：按尝试各落一行，求和入账）。
+            recordAttempt(scope, usageOfState(state), LlmUsagePhase.FAILED);
             // [P-1] 流式 SDK 异常先翻译 → LlmApiException（保留 headers）· CC claude.ts:2501/2451
             //   throw streamingError 恒为 APIError（headers 是重试链载荷 withRetry.ts:519-528/:814-822）；
             //   Java raw AnthropicServiceException 使 shouldUseNonStreamingFallback / nonStreamingFallback
@@ -618,7 +649,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                         && laePm.status() >= 500 && laePm.status() < 600 && laePm.status() != 529);
                 if (runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
                     maxOutputTokensOverride, taskBudget, effortValue, translated, aborted,
-                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+                    onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, scope,
                     wnRln, wnPmClass && wnOutlasted)) {
                     return;
                 }
@@ -820,10 +851,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                                          Consumer<AssistantMessage> onAssistantMessage,
                                          Runnable onComplete,
                                          Boolean skipCacheWrite,
-                                         com.nexusai.application.agent.subagent.AgentContext agentContext) {
+                                         LlmCallScope scope) {
+        // [usage-gateway] scope 整份透传（归因 + 记账出口同源；由 runNonStreamingWithRetries 内部
+        //   一次性取 agentContext）。
         return runNonStreamingWithRetries(config, modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, streamingError, aborted,
-            onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, agentContext,
+            onStreamingFallback, onAssistantMessage, onComplete, skipCacheWrite, scope,
             null, false);   // [Wn] 兼容包装：不启用封顶（新调用点直接走 runNonStreamingWithRetries）
     }
 
@@ -845,10 +878,17 @@ public class AnthropicSdkProvider implements LlmProvider {
                                          Consumer<AssistantMessage> onAssistantMessage,
                                          Runnable onComplete,
                                          Boolean skipCacheWrite,
-                                         com.nexusai.application.agent.subagent.AgentContext agentContext,
+                                         // [usage-gateway 合并] 末参由 AgentContext 升级为 LlmCallScope：
+                                         //   本方法体内既有「归因」消费（nonStreamingSend / emitApiTerminalEvent）
+                                         //   又有「用量结算」消费（recordSettled / recordAttempt），
+                                         //   两处同源 ⇒ 与 doStream 同一取舍（类型替换保 positional 索引）。
+                                         LlmCallScope scope,
                                          // [Wn] 见 resolveNonStreamingTimeoutRetryBudget；
                                          //   null/false = 本机制不介入（forceNonStreaming 入口即此）
                                          Long nonStreamingTimeoutMs, boolean failedStreamOutlastedTimeout) {
+        // [usage-gateway] 归因上下文逐字保留：消费点不变，取值源由 scope.agentContext() 一次性取出
+        //   （null 作用域安全 ⇒ 无 sink/无归因时行为与替换前一致）。
+        AgentContext agentContext = LlmCallScope.agentContextOf(scope);
         // [Wn 封顶] 对齐 CC exe 223,010,874（预算 -1=不介入；env 与门控只读一次）
         int wnBudget = nonStreamingTimeoutMs != null
             ? resolveNonStreamingTimeoutRetryBudget(System.getenv("CLAUDE_CODE_NONSTREAMING_TIMEOUT_RETRIES"),
@@ -882,6 +922,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                 AssistantMessage msg = nonStreamingSend(config, modelName, systemPromptBlocks,
                     history, tools, maxOutputTokensOverride, taskBudget, effortValue, attemptStartMs,
                     skipCacheWrite, agentContext);
+                // [usage-gateway] 回退尝试成功（B.4 流式回退非流式）：上报该次非流式结果的 usage。
+                //   与失败流式尝试的 FAILED 快照各自一条，是预期行为——上游对两次尝试都可能已计费，
+                //   账本按「尝试」逐条入账（用户裁定：中断/失败也要统计实际开销）。
+                LlmCallScope.recordSettled(scope, msg.usage());
                 if (onAssistantMessage != null) {
                     onAssistantMessage.accept(msg);
                 }
@@ -893,11 +937,18 @@ public class AnthropicSdkProvider implements LlmProvider {
                 return true;
             } catch (Throwable e2) {
                 if (aborted != null && aborted.get()) {
+                    // [usage-gateway] 该次非流式尝试已在途被取消 → ABORTED 快照；非流式 create 抛错时
+                    //   拿不到任何 usage 数据 ⇒ EMPTY+UNKNOWN（不伪造估算值，下游按 hasTokens() 过滤）。
+                    recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.ABORTED);
                     return false;
                 }
                 if (e2 instanceof java.util.concurrent.CancellationException) {
+                    recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.ABORTED);
                     return false;
                 }
+                // [usage-gateway] 该次非流式尝试失败 → FAILED 快照（每次尝试 = 一次真实 LLM 调用，
+                //   上游可能已计费；重试循环里每次失败各落一行，账本按尝试求和）。
+                recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.FAILED);
                 // [P-1] catch 顶部翻译 SDK 异常 → LlmApiException（保留 headers）· CC withRetry.ts:331-334/:377-382
                 //   raw AnthropicServiceException 使下方 is529Error / isRetryable（ErrorClassifier
                 //   LlmApiException instanceof 类型闸）与 retry-after 提取（extractRetryAfterSeconds 仅认
@@ -1493,16 +1544,33 @@ public class AnthropicSdkProvider implements LlmProvider {
         return textBuf.toString();
      }
     /**
-     * [WF3-04 explainer] 带选项非流式 chat · 返回完整 AssistantMessage（含 tool_use 块）。
+     * [usage-gateway] 非流式带选项单次调用的完整产物（内部载体）·
+     * {@link #chatWithOptionsMessage}（既有 AssistantMessage 投影）与 {@link #invoke}（网关完整结果 +
+     * sink 上报）<b>共用同一次请求</b> —— 为统计用量再发一次调用或复制整段请求构造都是错的。
      *
-     * <p>对齐 CC sideQuery 返回 content blocks（permissionExplainer.ts:178-186）。强制
-     * {@code tool_choice} 下 LLM 以 tool_use 作答，文本 content 为空 —— 本方法经
-     * {@link #buildAssistantMessageFromMessage} 提取 tool_use 块供 explainer 读取结构化输入。
+     * @param message   既有投影（content / finishReason / toolCalls / usage 全在）
+     * @param messageId 上游消息 id（CC assistantMessage.id · msg_xxx）
+     * @param requestId API request_id 头（CC _request_id · req_xxx）；无头 → null
+     * @param elapsedMs 本次请求耗时（ms）
      */
-    @Override
-    public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                   String systemPrompt, String userMessage,
-                                                   LlmProvider.ChatRequestOptions options) {
+    private record NonStreamOutcome(AssistantMessage message, String messageId, String requestId,
+                                    long elapsedMs) {
+    }
+
+    /**
+     * [usage-gateway] 非流式带选项请求体构造 + 执行（chatWithOptionsMessage / invoke 的单一实现）。
+     *
+     * <p>行为与原 {@code chatWithOptionsMessage} 逐字一致（回调触发时机/次数、异常翻译、abort 预检
+     * 均不变）；仅两点：① 走 {@code withRawResponse()} 取 request_id 头（与 chatWithRaw 同款，
+     * <b>wire 零变化</b>，只多一次 header 读取）；② 回收耗时供 {@link #invoke} 的 elapsedMs。
+     *
+     * <p>对齐 CC sideQuery 返回 content blocks（permissionExplainer.ts:178-186）：强制
+     * {@code tool_choice} 下 LLM 以 tool_use 作答，文本 content 为空 —— usage/toolCalls 经
+     * {@link #buildAssistantMessageFromMessage} 提取（usage 已在此解析，invoke 直接复用）。
+     */
+    private NonStreamOutcome createWithOptions(ProviderConfig config, String modelName,
+                                               String systemPrompt, String userMessage,
+                                               LlmProvider.ChatRequestOptions options) {
         if (config == null || !config.isUsable()) {
             throw new IllegalStateException(
                 "AnthropicSdkProvider.chatWithOptionsMessage called without usable ProviderConfig");
@@ -1553,7 +1621,11 @@ public class AnthropicSdkProvider implements LlmProvider {
             params = adjustParamsForNonStreaming(params);
             params = applyToolChoice(params, options);
 
-            Message message = client.messages().create(params);
+            // [usage-gateway] withRawResponse 取 request_id 头（CC claude.ts:1832 withResponse →
+            //   _request_id · req_xxx）· 与 chatWithRaw 同款：wire 与 create() 逐字节相同，仅多读响应头。
+            HttpResponseFor<Message> raw = client.messages().withRawResponse().create(params);
+            String requestId = raw.requestId().orElse(null);
+            Message message = raw.parse();
             AssistantMessage msg = buildAssistantMessageFromMessage(message);
             if (log.isInfoEnabled()) {
                 log.info("[AnthropicSdkProvider] chatWithOptionsMessage: model={} contentLen={} toolCalls={} querySource={}",
@@ -1565,13 +1637,48 @@ public class AnthropicSdkProvider implements LlmProvider {
             // [A-13] per-LLM-call 非流式成功事件（chat 系列，带 usage 全字段）· CC claude.ts:2858
             emitApiTerminalEvent("tengu_api_success", nonStreamApiSuccessAttrs(modelName, history.size(),
                 msg.usage(), msg.finishReason(), options != null ? options.querySource() : null, chatStartMs), agentContext);
-            return msg;
+            return new NonStreamOutcome(msg, message.id(), requestId,
+                System.currentTimeMillis() - chatStartMs);
         } catch (Exception e) {
             log.error("AnthropicSdkProvider.chatWithOptionsMessage failed: {}", e.toString());
             emitApiTerminalEvent("tengu_api_error", apiErrorAttrs(modelName, history.size(), e,
                 options != null ? options.querySource() : null, chatStartMs), agentContext);
             throw new RuntimeException("Anthropic chatWithOptionsMessage failed: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * [WF3-04 explainer] 带选项非流式 chat · 返回完整 AssistantMessage（含 tool_use 块）。
+     *
+     * <p>[usage-gateway] 本方法语义零变化（含 usage）：实际请求已抽到 {@link #createWithOptions}
+     * —— 与 {@link #invoke} 共用同一次调用，避免为统计用量重复构造请求。
+     */
+    @Override
+    public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
+                                                   String systemPrompt, String userMessage,
+                                                   LlmProvider.ChatRequestOptions options) {
+        return createWithOptions(config, modelName, systemPrompt, userMessage, options).message();
+    }
+
+    /**
+     * [usage-gateway] 非流式统一入口覆写 · 在接口默认实现（仅投影 chatWithOptionsMessage）之上补齐
+     * 上游元数据（message id / request_id / thinking/reasoning），并在返回前把 usage 写入 sink
+     * （复用 {@link LlmCallScope#recordSettled} 约定：有值 → UPSTREAM，零值/空 → UNKNOWN）。
+     *
+     * <p>WHY 覆写：默认实现丢弃 id/requestId（网关无 traceId 可归因），thinking 也为 null；
+     * 而 Anthropic 响应同时携带三者，属既有能力，覆写零额外请求即可补齐。
+     */
+    @Override
+    public LlmInvocationResult invoke(ProviderConfig config, String modelName, String systemPrompt,
+                                      String userMessage, LlmProvider.ChatRequestOptions options,
+                                      LlmCallScope scope) {
+        NonStreamOutcome out = createWithOptions(config, modelName, systemPrompt, userMessage, options);
+        AssistantMessage msg = out.message();
+        // [usage-gateway] 返回前写 sink（非流式唯一用量出口；恒有 AgentUsage，无上报时 = EMPTY）
+        LlmCallScope.recordSettled(scope, msg.usage());
+        String thinking = msg.reasoning() == null || msg.reasoning().isEmpty() ? null : msg.reasoning();
+        return new LlmInvocationResult(msg.content(), msg.finishReason(), msg.toolCalls(), msg.usage(),
+            out.messageId(), thinking, out.requestId(), modelName, out.elapsedMs());
     }
 
     /** [Anthropic-SDK T-AN-01] anthropic-java 异常 → LlmApiException（P-1 类型化分类 · Kind.IMAGE 判定）·
@@ -3332,11 +3439,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         //   (server_tool_use/service_tier/cache_creation · CC agentToolUtils.ts:243-255)
         //   [OD-01 provider 接线] + 累计 cache_deleted_input_tokens（CC message.usage 顶层字段，
         //   microCompact.ts:374；非 agentToolResultSchema 7 子字段，经 AgentUsage 扩展承载）
-        AgentUsage usage = new AgentUsage(
-            state.inputTokens, state.outputTokens,
-            state.cacheCreationInputTokens, state.cacheReadInputTokens,
-            state.serverToolUse, state.serviceTier, state.cacheCreation,
-            "", List.of(), "standard", state.cacheDeletedInputTokens);
+        AgentUsage usage = usageOfState(state);   // [usage-gateway] 抽为单一事实源（中断/失败出口同映射）
         if (log.isDebugEnabled()) {
             log.debug("AnthropicSdkProvider 流式完成 usage: {} · CC finalizeAgentTool usage 透传 (agentToolUtils.ts:355)",
                 usage);
@@ -3354,6 +3457,40 @@ public class AnthropicSdkProvider implements LlmProvider {
             usage,
             state.requestId
         );
+    }
+
+    /**
+     * [usage-gateway] {@link StreamState} → {@link AgentUsage} 投影 · {@link #buildAssistantMessage}
+     * 的 usage 单一事实源：正常完成（recordSettled）与中断/失败（record ABORTED/FAILED）三个出口
+     * 共用同一映射，保证「结算快照」与「部分累积快照」同源同义（否则两处字段映射会各自漂移）。
+     *
+     * <p>嵌套 3 字段（server_tool_use / service_tier / cache_creation）只由 message_start 事件填充
+     * （CC claude.ts:2947-2963 updateUsage），中断时若已过 message_start 亦随之带出。
+     */
+    static AgentUsage usageOfState(StreamState state) {
+        return new AgentUsage(
+            state.inputTokens, state.outputTokens,
+            state.cacheCreationInputTokens, state.cacheReadInputTokens,
+            state.serverToolUse, state.serviceTier, state.cacheCreation,
+            "", List.of(), "standard", state.cacheDeletedInputTokens);
+    }
+
+    /**
+     * [usage-gateway] 一次尝试结局的用量上报 · 来源按「是否真拿到 token 数值」判定（与
+     * {@link LlmCallScope#recordSettled} 同一约定）：有值 → {@link UsageTokenSource#UPSTREAM}
+     * （可与账单对账）；零值/空 → {@link AgentUsage#EMPTY} + {@link UsageTokenSource#UNKNOWN}
+     * —— <b>绝不伪造估算值</b>（用户裁定：宁可标 UNKNOWN，也不填假数）。
+     *
+     * <p>WHY 单独抽出：中断 / 失败 / 结算三个出口共用同一判据，单点维护才不会三处漂移。
+     *
+     * @param scope 调用作用域（null / sink=null → {@link LlmCallScope#record} 内静默 no-op）
+     * @param usage 该次尝试已累积的用量（可 null）
+     * @param phase 尝试结局（ABORTED / FAILED；结算请直接用 {@link LlmCallScope#recordSettled}）
+     */
+    private static void recordAttempt(LlmCallScope scope, AgentUsage usage, LlmUsagePhase phase) {
+        boolean hasTokens = usage != null && usage.totalTokens() > 0;
+        LlmCallScope.record(scope, hasTokens ? usage : AgentUsage.EMPTY,
+            hasTokens ? UsageTokenSource.UPSTREAM : UsageTokenSource.UNKNOWN, phase);
     }
 
     /**

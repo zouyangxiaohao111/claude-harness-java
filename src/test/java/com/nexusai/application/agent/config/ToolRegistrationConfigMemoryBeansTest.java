@@ -401,6 +401,7 @@ class ToolRegistrationConfigMemoryBeansTest {
         return config.queryLoopForkedQuery(
             Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
             null, null, null, null,
+            /*usageLedgerRegistry*/ null,
             new com.nexusai.application.agent.loop.AgentLoopContextFactory());
     }
 

@@ -80,7 +80,8 @@ class AgentSummaryActivityProvenanceTest {
                                      Runnable onStreamingFallback,
                                      AbortController abortController,
                                      Consumer<Throwable> onError, Runnable onComplete, Boolean skipCacheWrite,
-                                     com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                                     com.nexusai.infra.llm.LlmCallScope scope,
+                                     com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             if (onChunk != null) onChunk.accept(novel());
             if (onComplete != null) onComplete.run();
         }
@@ -96,6 +97,8 @@ class AgentSummaryActivityProvenanceTest {
         private final LlmProvider provider;
         FixedFactory(LlmProvider provider) { this.provider = provider; }
         @Override public LlmProvider getProvider(ProviderConfig config) { return provider; }
+        /** [usage-gateway] 2 参重载同样固定返回：摘要调用已收口到请求网关（走 2 参解析）。 */
+        @Override public LlmProvider getProvider(ProviderConfig config, String providerType) { return provider; }
     }
 
     @Test

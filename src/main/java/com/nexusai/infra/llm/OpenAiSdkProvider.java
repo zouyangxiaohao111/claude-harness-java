@@ -139,9 +139,13 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参类型由 AgentContext 升级为 LlmCallScope（**形参个数不变**，
+                       //   位置索引零漂移）：scope 内既有 agentContext（归因语义逐字保留）、又新增 sink
+                       //   （用量采集器）—— 每次尝试结局（结算/中断/失败）都要写快照，用户裁定
+                       //   「流中断/取消/失败也要统计实际开销」。OpenAI 侧本类不发射归因边，签名跟随。
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参 · T6 消费（OpenAI 通道看门狗接线）；本批（T3）先接签名。
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（wire 无 marker 语义 · openai-compatible 端点无 prompt cache
         //   条目写入移位的对应物 → 忽略，行为零改动）。CC 侧本参数只在 Anthropic 通道
         //   claude.ts:3243 markerIndex 消费。
@@ -161,7 +165,7 @@ public class OpenAiSdkProvider implements LlmProvider {
             .collect(Collectors.joining("\n\n"));
         doStream(config, modelName, joined, history, tools, effortValue, null,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete,
+            onStreamingFallback, aborted, onError, onComplete, scope,   // [usage-gateway] scope 透传（含 sink）
             streamIdleControl);   // [看门狗] 末参透传
     }
 
@@ -192,9 +196,10 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参 LlmCallScope（含 agentContext + 用量 sink）· 见 blocks 重载
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参接收（T6 消费）
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         AtomicBoolean aborted = new AtomicBoolean(false);
         if (abortController != null) {
@@ -207,7 +212,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         }
         doStream(config, modelName, systemPrompt, history, tools, effortValue, thinkingConfig,
             onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            onStreamingFallback, aborted, onError, onComplete,
+            onStreamingFallback, aborted, onError, onComplete, scope,   // [usage-gateway] scope 透传（含 sink）
             streamIdleControl);   // [看门狗] 末参透传
     }
 
@@ -238,9 +243,10 @@ public class OpenAiSdkProvider implements LlmProvider {
                        Consumer<Throwable> onError,
                        Runnable onComplete,
                        Boolean skipCacheWrite,
-                       com.nexusai.application.agent.subagent.AgentContext agentContext,
+                       // [usage-gateway] 末参 LlmCallScope（含 agentContext + 用量 sink）· 见 blocks 重载
+                       LlmCallScope scope,
                        // [流空闲看门狗] 末参接收（T6 消费）
-                       StreamIdleControl streamIdleControl) {
+                       com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         // [C] skipCacheWrite 签名跟随（openai-compatible 无 prompt cache marker 语义 → 忽略）
         String joined = systemPromptBlocks == null ? null : systemPromptBlocks.stream()
             .filter(java.util.Objects::nonNull)
@@ -250,7 +256,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         stream(config, modelName, joined, history, tools, maxOutputTokensOverride, taskBudget,
             effortValue, thinkingConfig, onChunk, onAssistantMessage, onToolCallComplete,
             onReasoningChunk, onStreamingFallback, abortController, onError, onComplete,
-            skipCacheWrite, agentContext, streamIdleControl);   // [A#3] 显式归因上下文透传（OpenAI 侧不发射该边，签名跟随）+ [看门狗] 末参透传
+            skipCacheWrite, scope, streamIdleControl);   // [usage-gateway] scope 透传（sink 不可在委托链上丢）+ [看门狗] 末参透传
     }
 
     /** 流式核心 · SDK createStreaming + 迭代器消费（[H13-GAP-4 v3] chunk 边界检查 aborted）. */
@@ -269,13 +275,19 @@ public class OpenAiSdkProvider implements LlmProvider {
                           AtomicBoolean aborted,
                           Consumer<Throwable> onError,
                           Runnable onComplete,
+                          LlmCallScope scope,
                           // [流空闲看门狗] 末参（读超时武装 + 触发标记 + stall 映射）
-                          StreamIdleControl streamIdleControl) {
+                          com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
         if (config == null || !config.isUsable()) {
+            // [usage-gateway] 尝试结局之一（请求未发出，无任何 usage 数据）—— 如实报 EMPTY+UNKNOWN+FAILED
+            //   （不伪造估算值；下游按 LlmUsageSnapshot.hasTokens() 过滤零值行）。
+            recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.FAILED);
             onError.accept(new IllegalStateException(
                 "OpenAiSdkProvider.stream 调用时 ProviderConfig 不可用"));
             return;
         }
+        // [usage-gateway] StreamState 提升到 try 之外：中断 / 失败出口要读「该次尝试已累积的 usage」
+        //   （final chunk 携带 usage；abort/异常时可能已有部分累积），声明在 try 内则 catch 不可达。
         // [流空闲看门狗 · 判决矩阵「降级非流式」] 对齐 CC retryWithoutStreaming（exe 223,028,125 Kke）
         //   · 与 AnthropicSdkProvider 同形：跳过流式直接走非流式发送（复用流式失败回退的重试壳；
         //   不触发 onStreamingFallback——CC 该路径同样不发 fallback 通知，exe 223,167,514 无 dh 调用）。
@@ -340,6 +352,7 @@ public class OpenAiSdkProvider implements LlmProvider {
             StreamResponse<ChatCompletionChunk> response =
                 client.chat().completions().createStreaming(params);
 
+            // [usage-gateway] state 已在 try 之外声明（中断/失败出口需读已累积 usage）
             // [看门狗] 触发标记监听（⛔ 不调 close()——同 SDK 家族的 close 死锁实证见 Anthropic 侧探针）
             if (streamIdleControl != null && streamIdleControl.watchdogController() != null) {
                 streamIdleControl.watchdogController().onCancel(ac -> {
@@ -413,6 +426,11 @@ public class OpenAiSdkProvider implements LlmProvider {
 
             // abort 后不触发 onAssistantMessage / onComplete（onError 已由 abort listener 发出）
             if (aborted != null && aborted.get()) {
+                // [usage-gateway] abort 出口 = 一次尝试结局（本分支跳过 onAssistantMessage/onComplete），
+                //   必须上报，否则被中断调用在上游已计费的 token 无账可对。OpenAI 协议的 usage 只在
+                //   final chunk 落地（stream_options.include_usage=true），abort 时通常尚未收到 ⇒
+                //   无数据可用：如实报 EMPTY+UNKNOWN（**不伪造估算值**，下游按 hasTokens() 过滤）。
+                recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.ABORTED);
                 log.info("OpenAiSdkProvider stream aborted: SDK 流消费已中断, 跳过 onComplete");
                 return;
             }
@@ -447,11 +465,21 @@ public class OpenAiSdkProvider implements LlmProvider {
             } catch (Exception closeErr) {
                 log.warn("OpenAI SDK 响应关闭失败: {}", closeErr.toString());
             }
+            // [usage-gateway] 正常完成结局：onComplete 前上报结算快照（onComplete 之后的代码不再执行 ——
+            //   loop 侧 onComplete 会触发收尾/下一次调用）。usage 取 usageOfState（与
+            //   buildAssistantMessage 同一映射，单一事实源），有值 → UPSTREAM。
+            LlmCallScope.recordSettled(scope, usageOfState(state));
             onComplete.run();
         } catch (Exception e) {
             if (aborted != null && aborted.get()) {
+                // [usage-gateway] 中断引发的异常同样是一次尝试结局（abort 出口）：OpenAI abort 时无 usage
+                //   数据 → EMPTY+UNKNOWN（与上方 abort 早退分支同一约定，不伪造估算值）。
+                recordAttempt(scope, AgentUsage.EMPTY, LlmUsagePhase.ABORTED);
                 return; // abort 已发出 onError, 不重复报错
             }
+            // [usage-gateway] 流式尝试失败（含已累积的部分用量，如 final chunk 已到达后 parse 异常）：
+            //   上游可能已为该次尝试计费 ⇒ 必报 FAILED 快照。有累积值 → UPSTREAM，零值 → UNKNOWN。
+            recordAttempt(scope, usageOfState(state), LlmUsagePhase.FAILED);
             // [看门狗] stall 优先于一切分类：不走通用错误路径，也不走非流式回退——stall 交循环层
             //   判决矩阵（降级/重试/终局）；若先落到下方 [stream-integrity] 回退，判决矩阵将永远
             //   收不到 stall（读超时是 IOException，shouldUseNonStreamingFallback 会判 true）。
@@ -735,7 +763,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                     responseId, fallbackReqId, content.length(),
                     thinking != null ? thinking.length() : 0);
             }
-            return new LlmRawResponse(content, responseId, thinking, fallbackReqId);
+            // [usage-gateway] usage 恒 null 缺口收口：非流式 ChatCompletion 响应本就在 resp.usage() 里
+            //   携带 prompt/completion/cache 数据（extractUsage 已支持 DeepSeek 顶层 cache 字段），
+            //   旧实现丢弃 ⇒ 网关拿不到分类器等侧查询的 token 成本。此处补上投影（AgentUsage → 4 int）。
+            LlmProvider.LlmUsage rawUsage = toLlmUsage(extractUsage(resp));
+            return new LlmRawResponse(content, responseId, thinking, fallbackReqId, rawUsage);
         } catch (Exception e) {
             log.error("OpenAiSdkProvider.chatWithRaw failed: {}", e.toString());
             throw translateSdkError(e);
@@ -819,20 +851,31 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /**
-     * [WF3-04 explainer] 带选项非流式 chat · 返回完整 AssistantMessage（含 tool_use 块）。
+     * [usage-gateway] 非流式带选项单次调用的完整产物（内部载体）·
+     * {@link #chatWithOptionsMessage}（既有 AssistantMessage 投影）与 {@link #invoke}（网关完整结果 +
+     * sink 上报）<b>共用同一次请求</b> —— 为统计用量再发一次调用或复制整段请求构造都是错的。
      *
-     * <p>对齐 CC sideQuery 返回 content blocks（permissionExplainer.ts:178-186）。强制
-     * {@code tool_choice} 下 LLM 以 tool_use 作答，文本 content 为空 —— 本方法额外提取
-     * {@code message.toolCalls()} 供 explainer 读取结构化输入。
+     * @param message   既有投影（content / finishReason / toolCalls / usage 全在）
+     * @param response  原始 ChatCompletion（invoke 需要根 id 与 reasoning 字段）
+     * @param elapsedMs 本次请求耗时（ms）
      */
-    @Override
-    public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
-                                                   String systemPrompt, String userMessage,
-                                                   LlmProvider.ChatRequestOptions options) {
+    private record NonStreamOutcome(AssistantMessage message, ChatCompletion response, long elapsedMs) {
+    }
+
+    /**
+     * [usage-gateway] 非流式带选项请求体构造 + 执行（chatWithOptionsMessage / invoke 的单一实现）。
+     *
+     * <p>行为与原 {@code chatWithOptionsMessage} 逐字一致（回调触发时机/次数、异常翻译、abort 预检
+     * 均不变）；仅多回收耗时供 {@link #invoke} 的 elapsedMs。
+     */
+    private NonStreamOutcome createWithOptions(ProviderConfig config, String modelName,
+                                               String systemPrompt, String userMessage,
+                                               LlmProvider.ChatRequestOptions options) {
         if (config == null || !config.isUsable()) {
             throw new IllegalStateException(
                 "OpenAiSdkProvider.chatWithOptionsMessage 调用时 ProviderConfig 不可用");
         }
+        long callStartMs = System.currentTimeMillis();   // [usage-gateway] invoke 的 elapsedMs 起点
         try {
             List<ChatMessageDto> history = new ArrayList<>();
             if (options != null && options.history() != null) {
@@ -885,11 +928,52 @@ public class OpenAiSdkProvider implements LlmProvider {
                     modelName, content.length(), toolCalls.size(),
                     options != null ? options.querySource() : null, usage);
             }
-            return new AssistantMessage(content, finishReason, toolCalls, "", null, usage);
+            AssistantMessage msg = new AssistantMessage(content, finishReason, toolCalls, "", null, usage);
+            return new NonStreamOutcome(msg, resp, System.currentTimeMillis() - callStartMs);
         } catch (Exception e) {
             log.error("OpenAiSdkProvider.chatWithOptionsMessage failed: {}", e.toString());
             throw translateSdkError(e);
         }
+    }
+
+    /**
+     * [WF3-04 explainer] 带选项非流式 chat · 返回完整 AssistantMessage（含 tool_use 块）。
+     *
+     * <p>对齐 CC sideQuery 返回 content blocks（permissionExplainer.ts:178-186）。强制
+     * {@code tool_choice} 下 LLM 以 tool_use 作答，文本 content 为空 —— toolCalls 供 explainer
+     * 读取结构化输入。
+     *
+     * <p>[usage-gateway] 本方法语义零变化（含 usage）：实际请求已抽到 {@link #createWithOptions}
+     * —— 与 {@link #invoke} 共用同一次调用，避免为统计用量重复构造请求。
+     */
+    @Override
+    public AssistantMessage chatWithOptionsMessage(ProviderConfig config, String modelName,
+                                                   String systemPrompt, String userMessage,
+                                                   LlmProvider.ChatRequestOptions options) {
+        return createWithOptions(config, modelName, systemPrompt, userMessage, options).message();
+    }
+
+    /**
+     * [usage-gateway] 非流式统一入口覆写 · 在接口默认实现（仅投影 chatWithOptionsMessage）之上补齐
+     * 上游元数据（根 id / reasoning），并在返回前把 usage 写入 sink（复用
+     * {@link LlmCallScope#recordSettled} 约定：有值 → UPSTREAM，零值/空 → UNKNOWN）。
+     *
+     * <p>requestId 仍为 null：openai-java 0.25.0 无 withRawResponse（R-REQ-1，见 chatWithRaw 同款缺口），
+     * 无显式来源 ⇒ 按「不自行发明」规则置 null（CC 无归因上下文语义）。
+     */
+    @Override
+    public LlmInvocationResult invoke(ProviderConfig config, String modelName, String systemPrompt,
+                                      String userMessage, LlmProvider.ChatRequestOptions options,
+                                      LlmCallScope scope) {
+        NonStreamOutcome out = createWithOptions(config, modelName, systemPrompt, userMessage, options);
+        AssistantMessage msg = out.message();
+        // [usage-gateway] 返回前写 sink（非流式唯一用量出口；恒有 AgentUsage，无上报时 = EMPTY）
+        LlmCallScope.recordSettled(scope, msg.usage());
+        ChatCompletion resp = out.response();
+        String responseId = resp == null || resp.id() == null || resp.id().isBlank() ? null : resp.id();
+        return new LlmInvocationResult(msg.content(), msg.finishReason(), msg.toolCalls(), msg.usage(),
+            responseId, extractThinking(resp), null /* requestId：SDK 0.25.0 无 withRawResponse，不臆造 */,
+            modelName, out.elapsedMs());
     }
 
     /**
@@ -1604,6 +1688,32 @@ public class OpenAiSdkProvider implements LlmProvider {
         return new AgentUsage(u.promptTokens(), u.completionTokens(), cacheCreation, cacheRead, null, null, null);
     }
 
+    /**
+     * [usage-gateway] {@link AgentUsage} → {@link LlmProvider.LlmUsage}（4 int）投影 ·
+     * {@link #chatWithRaw} 的 usage 通道（CC yoloClassifier.ts:609-618 extractUsage 形状）。
+     *
+     * <p>long → int 走饱和收敛（token 数实际不超 int 上限；异常输入不至于溢出为负数）；
+     * nullable cache 字段（OpenAI 缺省解析为 0，理论上可 null）→ 0，对齐 CC {@code ?? 0} 兜底。
+     *
+     * @param usage 非流式解析结果（可 null = 响应无 usage）
+     * @return LlmUsage；usage 为 null → null（LlmRawResponse.usage 允许 null：无上报通道）
+     */
+    static LlmProvider.LlmUsage toLlmUsage(AgentUsage usage) {
+        if (usage == null) {
+            return null;
+        }
+        return new LlmProvider.LlmUsage(
+            saturatedInt(usage.inputTokens()),
+            saturatedInt(usage.outputTokens()),
+            saturatedInt(usage.cacheReadInputTokens()),
+            saturatedInt(usage.cacheCreationInputTokens()));
+    }
+
+    /** [usage-gateway] long → int 饱和转换（负值 → 0，超上限 → Integer.MAX_VALUE）· toLlmUsage 专用。 */
+    private static int saturatedInt(long v) {
+        return (int) Math.min(Integer.MAX_VALUE, Math.max(0L, v));
+    }
+
     /** [AM-CC-20260825] JsonValue → long（DeepSeek cache 字段读取；extractThinking 同款 toString 模式）·
      *  数值原样解析；字符串剥引号；非法 → 0。 */
     private static long jsonValueLong(JsonValue v) {
@@ -1840,9 +1950,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         //   （非流式 extractUsage 已于 2026-08-25 接入，本处补流式对称）。
         // [R32-06] OpenAI usage 无 server_tool_use / service_tier / cache_creation 等价 → 嵌套 3 字段
         //   恒 null, 如实暴露缺口 (S4-2b), 不伪造 (对齐 CC agentToolUtils.ts:243-255 仅 Anthropic 有)
-        AgentUsage usage = new AgentUsage(
-            state.inputTokens, state.outputTokens, state.cacheCreationInputTokens, state.cacheReadInputTokens,
-            null, null, null); // server_tool_use / service_tier / cache_creation 无 OpenAI 等价 → null (S4-2b)
+        AgentUsage usage = usageOfState(state);   // [usage-gateway] 抽为单一事实源（中断/失败出口同映射）
         if (log.isDebugEnabled()) {
             log.debug("OpenAiSdkProvider 流式完成 usage: {} · CC message.usage 透传", usage);
         }
@@ -1870,6 +1978,35 @@ public class OpenAiSdkProvider implements LlmProvider {
             usage,
             state.requestId
         );
+    }
+
+    /**
+     * [usage-gateway] {@link OpenAiStreamState} → {@link AgentUsage} 投影 · {@link #buildAssistantMessage}
+     * 的 usage 单一事实源：正常完成（recordSettled）与中断/失败（record ABORTED/FAILED）三个出口
+     * 共用同一映射，避免字段映射在多处各自漂移。
+     *
+     * <p>[B2-R1/R2] cache_creation_input_tokens 由 DeepSeek 顶层 {@code prompt_cache_miss_tokens} 填充
+     * （parseChunk 已接入）；OpenAI 无 server_tool_use / service_tier / cache_creation 等价 ⇒ 嵌套
+     * 3 字段恒 null（如实暴露缺口 S4-2b，不伪造）。
+     */
+    static AgentUsage usageOfState(OpenAiStreamState state) {
+        return new AgentUsage(
+            state.inputTokens, state.outputTokens, state.cacheCreationInputTokens, state.cacheReadInputTokens,
+            null, null, null);
+    }
+
+    /**
+     * [usage-gateway] 一次尝试结局的用量上报 · 来源按「是否真拿到 token 数值」判定（与
+     * {@link LlmCallScope#recordSettled} 同一约定）：有值 → {@link UsageTokenSource#UPSTREAM}
+     * （可与账单对账）；零值/空 → {@link AgentUsage#EMPTY} + {@link UsageTokenSource#UNKNOWN}
+     * —— <b>绝不伪造估算值</b>（用户裁定：宁可标 UNKNOWN 也不填假数）。
+     *
+     * <p>WHY 单独抽出：中断 / 失败 / 结算三个出口共用同一判据，单点维护才不会三处漂移。
+     */
+    private static void recordAttempt(LlmCallScope scope, AgentUsage usage, LlmUsagePhase phase) {
+        boolean hasTokens = usage != null && usage.totalTokens() > 0;
+        LlmCallScope.record(scope, hasTokens ? usage : AgentUsage.EMPTY,
+            hasTokens ? UsageTokenSource.UPSTREAM : UsageTokenSource.UNKNOWN, phase);
     }
 
     /**

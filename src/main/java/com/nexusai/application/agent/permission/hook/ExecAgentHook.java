@@ -424,6 +424,10 @@ public class ExecAgentHook {
                         //   ModelRequest 由主循环请求派生，归因上下文同样必须原样带过（漏拷贝会让
                         //   hook 触发的 LLM 调用在 provider 侧丢 invokingRequestId）。
                         request.agentContext(),
+                        // [usage-gateway] 记账归属与出口同样必须逐字段拷贝 —— 漏拷贝会让 hook agent
+                        //   触发的 LLM 调用（经 LlmAgentLoop.queryLoop → ModelCaller → 网关）失去归属
+                        //   而整条漏记（本类 2026-10-10 改造的「无遗漏统计」目标）。
+                        request.usageAttribution(), request.usageRecorder(),
                         // [流空闲看门狗] streamIdleControl 逐字段拷贝透传（拷贝式构造函数，漏拷即静默丢参）
                         request.streamIdleControl());
                     return ModelCaller.call(context(), countingRequest);

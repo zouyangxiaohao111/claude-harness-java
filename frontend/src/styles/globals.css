@@ -8275,6 +8275,9 @@ html {
 .uc-stats-bar-row { display: flex; align-items: center; gap: 8px; padding: 4px 0; font-size: 12px; color: #2D2D2D; }
 .uc-stats-bar-label { flex-shrink: 0; width: 92px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--font-mono); font-size: 11px; color: #666; }
 .uc-stats-model-name { max-width: 140px; }
+/* 按代理层级：名称是「类别 · 用途」中文（比模型名长），标签列加宽，明细行左缩进同步（136+8） */
+.uc-stats-tree-label { width: 168px; }
+.uc-stats-tree-detail { padding-left: 176px; }
 .uc-stats-bar { flex: 1; min-width: 0; display: flex; align-items: center; gap: 8px; }
 .uc-stats-bar-track { flex: 1; height: 10px; background: #F0F0F0; border-radius: 5px; overflow: hidden; }
 .uc-stats-bar-fill { height: 100%; background: linear-gradient(90deg, #FFB48A, #FF7A3D); border-radius: 5px; transition: width 200ms var(--ease); }

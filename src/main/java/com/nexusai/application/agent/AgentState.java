@@ -7,6 +7,7 @@ import com.nexusai.application.agent.hook.CollapseHookSummaries;
 import com.nexusai.application.agent.recovery.RecoveryState;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.tool.impl.TodoWriteTool;
 import com.nexusai.application.agent.tool.impl.TodoWriteTool.TodoItem;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
@@ -84,6 +85,25 @@ import java.util.UUID;
  * {@link com.nexusai.application.agent.permission.ToolPermissionContext}。旧构造器
  * {@link #AgentState(String)} 保留 —— 不传 sessionId 时权限系统会抛 IllegalArgumentException。
  */
+// ═══════════════════════════════════════════════════════════════════════════════
+// [usage-gateway] 原 待办 的落地说明（用户 2026-10-10 手写于类注释，保留原始诉求以备查，勿删）
+//   原 待办 文本：
+//     「com/nexusai/application/agent/loop/ModelCaller.java:93
+//       想个方法实现在 modelCaller 中知道是哪个 agentState 发起的请求以正确跟踪用量统计」
+//
+//   落地方式（本条痛点的答案就在本类新增的引用字段上）：
+//   1. 「ModelCaller 怎么知道是哪个 AgentState」⇒ 不靠 ambient 存储，靠**显式传参**：
+//      AgentState 持有 usageAttribution（会话/agent/归类/父子/深度）与 usageLedger（会话账本），
+//      组装 ModelRequest 时由 loop 盖章（见 LlmAgentLoop 中 `state.usageAttribution()` /
+//      `state.usageRecorder()` 两参），网关据此知道「哪次调用属于哪个 agent」。
+//   2. 「正确跟踪用量统计」⇒ 记账不再由调用方各自累加（旧 accumulateSessionUsage 已由请求网关
+//      取代），而是网关统一归集到 SessionUsageLedger，再回写本类的会话视图字段
+//      （sessionInputTokens/sessionOutputTokens/sessionCostYuan/sessionModelUsage）。
+//   3. 「层级与会话信息」⇒ usageAttribution 的 parentAgentId + depth 与 usageSelfBucket() /
+//      usageChildrenBuckets() / usageRollupBucket() 共同给出「自身构成 + 子级拆分 + 会话合计」。
+//   约束：上述引用字段一律 @JsonIgnore local-only（与 BudgetTracker 红线同源），
+//      绝不进 STOMP / outbound DTO / LLM 请求 payload。
+// ═══════════════════════════════════════════════════════════════════════════════
 public class AgentState {
 
     /** [R32-b15 Stage 2 C5] lineage 操作日志. */
@@ -1255,6 +1275,90 @@ public class AgentState {
             inc.contextWindow(),      // CC 取 last
             inc.maxOutputTokens());   // CC 取 last
         this.sessionModelUsage.put(model, merged);
+    }
+
+    // ═══════════════════ [usage-gateway] 记账归属与会话账本引用 ═══════════════════
+    /**
+     * [usage-gateway] 本 agent 的记账归属（会话 / agent / 归类 / 父子 / 深度 / 标签）·
+     * 用户要求「AgentState 添加必要的引用以方便聚合和归类统计，体现层级信息」的落点。
+     *
+     * <p>由 run 启动时显式装配（主 agent = {@code LlmAgentLoop.doRun}；
+     * 子代理 = {@code SubagentExecutor} 用父归属派生 {@code child(...)}），随后在组装
+     * {@link com.nexusai.application.agent.loop.ModelRequest} 时盖章（显式传参，不用
+     * ThreadLocal —— 仓库铁律）。
+     */
+    @JsonIgnore
+    private com.nexusai.infra.llm.UsageAttribution usageAttribution;
+
+    /**
+     * [usage-gateway] 会话账本引用（同会话的主 agent / 子代理 / fork / 后台任务共享同一实例）。
+     *
+     * <p>用途：请求网关记账后由账本聚合，本 agent 可经 {@link #usageSelfBucket()} /
+     * {@link #usageChildrenBuckets()} 读取「自身构成」与「子 agent 拆分」；
+     * 会话合计（本类的 session* 视图字段）也由记账器从账本回写。
+     *
+     * <p><b>local-only 约束（BudgetTracker 架构红线）</b>：{@code @JsonIgnore} —— 进程内引用，
+     * 绝不序列化到 outbound DTO / STOMP / WebSocket / EventPublisher payload，绝不写入 LLM 请求 payload。
+     */
+    @JsonIgnore
+    private transient com.nexusai.application.agent.cost.SessionUsageLedger usageLedger;
+
+    /** [usage-gateway] 装配记账归属（run 启动一次；null → 不改变既有值）。 */
+    public void attachUsageAttribution(com.nexusai.infra.llm.UsageAttribution attribution) {
+        if (attribution != null) {
+            this.usageAttribution = attribution;
+        }
+    }
+
+    /** [usage-gateway] 绑定会话账本（run 启动一次；null → 不改变既有值）。 */
+    public void attachUsageLedger(com.nexusai.application.agent.cost.SessionUsageLedger ledger) {
+        if (ledger != null) {
+            this.usageLedger = ledger;
+            if (this.usageAttribution != null) {
+                ledger.attach(this.usageAttribution, this);
+            }
+        }
+    }
+
+    /** [usage-gateway] 本 agent 记账归属（未装配 → null = 本次调用不记账）。 */
+    public com.nexusai.infra.llm.UsageAttribution usageAttribution() {
+        return this.usageAttribution;
+    }
+
+    /** [usage-gateway] 会话账本引用（未绑定 → null）。 */
+    public com.nexusai.application.agent.cost.SessionUsageLedger usageLedger() {
+        return this.usageLedger;
+    }
+
+    /**
+     * [usage-gateway] 记账出口 · 供 loop 在组装 {@code ModelRequest} 时盖章。
+     * 未绑定账本 → null（网关据此跳过记账，行为等价改造前）。
+     */
+    public com.nexusai.infra.llm.LlmUsageRecorder usageRecorder() {
+        return this.usageLedger;
+    }
+
+    /** [usage-gateway] 本 agent 自身的用量/费用构成（未绑定账本 → 空桶）。 */
+    public com.nexusai.application.agent.cost.UsageBucket usageSelfBucket() {
+        if (this.usageLedger == null || this.usageAttribution == null) {
+            return com.nexusai.application.agent.cost.UsageBucket.empty();
+        }
+        return this.usageLedger.bucketOf(this.usageAttribution.nodeKey());
+    }
+
+    /** [usage-gateway] 子 agent / 下级调用的构成拆分（未绑定账本 → 空表）。 */
+    public Map<String, com.nexusai.application.agent.cost.UsageBucket> usageChildrenBuckets() {
+        if (this.usageLedger == null || this.usageAttribution == null) {
+            return Map.of();
+        }
+        return this.usageLedger.childrenOf(this.usageAttribution.nodeKey());
+    }
+
+    /** [usage-gateway] 会话整体构成（未绑定账本 → 空桶）。 */
+    public com.nexusai.application.agent.cost.UsageBucket usageRollupBucket() {
+        return this.usageLedger == null
+            ? com.nexusai.application.agent.cost.UsageBucket.empty()
+            : this.usageLedger.rollup();
     }
 
     /**

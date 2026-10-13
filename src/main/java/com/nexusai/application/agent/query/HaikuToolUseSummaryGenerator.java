@@ -4,10 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.attachment.AttachmentMessageDto;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import org.slf4j.Logger;
@@ -87,6 +89,15 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
     private final LlmProviderFactory llmProviderFactory;
     /** [RV14B-WIRE-04] 共享配置解析器 · Haiku 模型名 → 真实 (config, providerType)（null → warn+skip 不落 mock）。 */
     private final ModelConfigResolver modelConfigResolver;
+
+    /**
+     * [usage-gateway] 旁路 LLM 收口客户端（调用 + 归属 + 记账）· {@code @Component} 生产字段注入。
+     *
+     * <p>原实现经 {@code llmProviderFactory.getProvider(...).chatWithOptions(...)} 直呼（无记账）；
+     * 现由 {@link LlmSideCallClient#chat} 收口。{@code required=false}：测试/孤立构造不注入即 null。
+     */
+    @Autowired(required = false)
+    private LlmSideCallClient sideCallClient;
 
     public HaikuToolUseSummaryGenerator(LlmProviderFactory llmProviderFactory) {
         this(llmProviderFactory, null);
@@ -207,12 +218,17 @@ public class HaikuToolUseSummaryGenerator implements ToolUseSummaryGenerator {
                 //   本路径由调用方（LlmAgentLoop tool_use_summary 生产点）从 TUC 显式下传；
                 //   主循环语义 = null（对齐 CC 主线程 undefined，见 CC query.ts:1469 !agentId 门）。
                 isNonInteractiveSession, agentContext); // CC :77 isNonInteractiveSession 透传
-            return llmProviderFactory.getProvider(resolved.config(), resolved.providerType()).chatWithOptions(
+            // [usage-gateway] 旁路调用收口 LlmSideCallClient（替代 llmProviderFactory.getProvider(...).chatWithOptions，
+            //   补记账）。归属来源：本路径**无 sessionId**（仅有显式 agentContext 形参）→ standalone
+            //   （sessionId/agentId 均 null，绝不伪造）+ withAgentContext(agentContext)。
+            return sideCallClient.chat(
                 resolved.config(),
                 modelName,
                 SYSTEM_PROMPT,
                 userPrompt,
-                options
+                options,
+                LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, "tool-use-summary")
+                    .withAgentContext(agentContext)
             );
         } catch (Exception e) {
             return null;

@@ -8,7 +8,6 @@ import com.nexusai.application.agent.api.AnalyticsTracker;
 import com.nexusai.application.agent.telemetry.McpServerToolSanitizer;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -82,6 +81,11 @@ public class PermissionExplainer {
     private final LlmProviderFactory providerFactory;
     private final ModelConfigResolver modelConfigResolver;
     private final AnalyticsTracker analyticsTracker;
+
+    /** [usage-gateway] 旁路 LLM 调用收口客户端（调用 + usage 记账）；Spring 装配后注入，
+     *  POJO 单测经 ReflectionTestUtils 手工注入。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
     /** CC original: permissionExplainerEnabled !== false（默认开）。 */
     private final boolean enabled;
 
@@ -172,6 +176,8 @@ public class PermissionExplainer {
                 log.warn("权限解释器: 模型 {} 配置解析失败/不可用，返回 null（对齐 CC 无降级）", modelName);
                 return null;
             }
+            // [usage-gateway] provider 解析保留为既有前置步骤（工厂解析失败/不支持 → 异常 fail-closed
+            //   早退，行为与迁移前逐字一致）；实际 LLM 调用已收口到 sideCallClient 网关。
             final LlmProvider provider =
                 providerFactory.getProvider(resolved.config(), resolved.providerType());
 
@@ -230,8 +236,17 @@ public class PermissionExplainer {
                 null);
             warnAgentContextExplicitlyNull(sessionId);
 
-            final AssistantMessage msg = provider.chatWithOptionsMessage(
-                resolved.config(), modelName, SYSTEM_PROMPT, userPrompt, options);
+            // [usage-gateway] 旁路调用收口到 LlmSideCallClient：本方法有 sessionId 形参但无 agent
+            //   执行链（options 末位 agentContext 显式 null，见上方结构性论证）⇒ 归属
+            //   inSession(sessionId, null, SIDE_CALL, "permission-explainer")（agentId 缺省 null，
+            //   绝不伪造）。返回值（tool_use 块）/异常/abort 语义与旧 chatWithOptionsMessage 通道
+            //   逐字一致（options 原样透传）。provider 解析（providerFactory.getProvider）保留为
+            //   既有前置解析步骤，行为不变。
+            final LlmProvider.LlmInvocationResult msg = sideCallClient.message(
+                resolved.config(), modelName, SYSTEM_PROMPT, userPrompt, options,
+                com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage.inSession(
+                    sessionId, null,
+                    com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "permission-explainer"));
 
             final long latencyMs = System.currentTimeMillis() - startTime;
             if (log.isDebugEnabled()) {

@@ -6,6 +6,7 @@ import com.nexusai.apis.export.ExportController;
 import com.nexusai.application.agent.agent.SessionCwdHolder;
 import com.nexusai.application.agent.subagent.ResumeService;
 import com.nexusai.application.chat.ChatService;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -236,20 +237,20 @@ class SeqNullsLastReadPathsRealSqliteTest {
         seed("u1", U1, SEQ_U1, "user", REAL_CWD);
         seed("d1", D1, null, "user", DIRTY_CWD);
 
-        LlmProvider provider = mock(LlmProvider.class);
-        LlmProviderFactory factory = mock(LlmProviderFactory.class);
+        LlmSideCallClient sideCallClient = mock(LlmSideCallClient.class);
         ModelConfigResolver resolver = mock(ModelConfigResolver.class);
         when(resolver.resolveFastModelName(anyString())).thenReturn("mock-fast");
-        when(factory.getProvider(any(ProviderConfig.class), anyString())).thenReturn(provider);
-        when(provider.chatWithOptions(any(ProviderConfig.class), anyString(), anyString(), anyString(),
-            any(LlmProvider.ChatRequestOptions.class))).thenReturn("{\"title\":\"修复登录按钮\"}");
+        // [usage-gateway] 标题生成改走 LlmSideCallClient（旁路客户端）：桩其 chat 返回结构化 JSON 标题。
+        when(sideCallClient.chat(any(ProviderConfig.class), anyString(), anyString(), anyString(),
+            any(LlmProvider.ChatRequestOptions.class),
+            any(LlmSideCallClient.SideCallUsage.class))).thenReturn("{\"title\":\"修复登录按钮\"}");
 
         ChatService chatService = new ChatService();
         ReflectionTestUtils.setField(chatService, "messageMapper", messageMapper);
         ReflectionTestUtils.setField(chatService, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(chatService, "toolCallMapper", toolCallMapper);
         ReflectionTestUtils.setField(chatService, "modelConfigResolver", resolver);
-        ReflectionTestUtils.setField(chatService, "llmProviderFactory", factory);
+        ReflectionTestUtils.setField(chatService, "sideCallClient", sideCallClient);
 
         SessionRecord s = new SessionRecord();
         s.setId(session);
@@ -262,8 +263,9 @@ class SeqNullsLastReadPathsRealSqliteTest {
 
         // THEN：喂给模型的 userMessage 含真实首条用户消息原文、<不>含脏行内容
         ArgumentCaptor<String> userMessage = ArgumentCaptor.forClass(String.class);
-        verify(provider).chatWithOptions(any(ProviderConfig.class), anyString(), anyString(),
-            userMessage.capture(), any(LlmProvider.ChatRequestOptions.class));
+        verify(sideCallClient).chat(any(ProviderConfig.class), anyString(), anyString(),
+            userMessage.capture(), any(LlmProvider.ChatRequestOptions.class),
+            any(LlmSideCallClient.SideCallUsage.class));
         assertThat(userMessage.getValue())
             .as("标题输入 = 真实首条用户消息（count1 语义：最早那条 title-worthy 用户消息）")
             .contains(U1);

@@ -1,14 +1,17 @@
 package com.nexusai.application.agent.memory;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.infra.llm.LlmApiException;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.Role;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
@@ -59,7 +62,13 @@ public class AwaySummaryService {
     /** CC awaySummary.ts:16 — RECENT_MESSAGE_WINDOW = 30（30 条 ≈ 15 轮，防止 prompt too long）。 */
     public static final int RECENT_MESSAGE_WINDOW = 30;
 
-    /** llmInvoker 载体（CC queryModelWithoutStreaming → Java chatWithOptions）· FIX-CL 改惰性解析（生产 @Bean）。 */
+    /**
+     * llmInvoker 载体（CC queryModelWithoutStreaming → Java chatWithOptions）· FIX-CL 改惰性解析（生产 @Bean）。
+     *
+     * <p>[usage-gateway] 旁路调用已收口到 {@link #sideCallClient}（后者自行解析 provider），本
+     * supplier 不再被调用；保留形参/字段以维持生产 @Bean（ToolRegistrationConfig）与既有构造签名，
+     * 避免改动接线契约。
+     */
     private final Supplier<LlmProvider> llmProviderSupplier;
 
     /** provider 运行时配置（baseUrl + apiKey）· FIX-CL 改惰性解析（生产 @Bean）。 */
@@ -71,6 +80,16 @@ public class AwaySummaryService {
 
     /** small-fast 模型供应器 · CC original: getSmallFastModel()（model.ts:36-38）。 */
     private final Supplier<String> smallFastModelSupplier;
+
+    /**
+     * 旁路 LLM 收口客户端（调用 + 归属 + 记账）· 生产 @Bean 由 Spring 字段注入。
+     *
+     * <p>[usage-gateway] 原实现直呼 {@code provider.chatWithOptions(...)}（无记账）；改由
+     * {@link LlmSideCallClient#chat} 收口。{@code required=false} 与仓库其它旁路点一致（测试/孤立
+     * 构造不注入即为 null）。
+     */
+    @Autowired(required = false)
+    private LlmSideCallClient sideCallClient;
 
     /** 具体 provider/config 构造（测试/直构）· 包装为常量 supplier。 */
     public AwaySummaryService(
@@ -162,11 +181,15 @@ public class AwaySummaryService {
 
                 // CC :41-57 — queryModelWithoutStreaming options（querySource/skipCacheWrite/small-fast/thinking-disabled）
                 LlmProvider.ChatRequestOptions options = buildAwaySummaryOptions(recent, signal);
-                // FIX-CL：provider/config 惰性解析（每次调用取最新，对齐 ProductionForkedQuery 模式）
-                LlmProvider provider = llmProviderSupplier.get();
+                // FIX-CL：config 惰性解析（每次调用取最新，对齐 ProductionForkedQuery 模式）
                 ProviderConfig config = providerConfigSupplier.get();
-                String content = provider.chatWithOptions(
-                    config, smallFastModelSupplier.get(), null, null, options);
+                // [usage-gateway] 旁路 LLM 收口（替代 provider.chatWithOptions，补记账）：归属 =
+                //   本方法 sessionId 形参（REST 载体 resolveSessionId 解析出的当前会话 ID，单轨）；
+                //   本路径无 agentId（无 agent 上下文，见 buildAwaySummaryOptions 注释）→ 传 null。
+                String content = sideCallClient.chat(
+                    config, smallFastModelSupplier.get(), null, null, options,
+                    LlmSideCallClient.SideCallUsage.inSession(
+                        sessionId, null, UsageCategory.SIDE_CALL, "away-summary"));
                 if (log.isDebugEnabled()) {
                     log.debug("[AwaySummary] LLM 调用完成: querySource=away_summary skipCacheWrite=true "
                             + "model={} contentLen={}",

@@ -281,7 +281,8 @@ class HookRegistryDispatchTest {
                                          AbortController abortController,
                                          java.util.function.Consumer<Throwable> onError,
                                          Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
             @Override public String chat(ProviderConfig config, String modelName, String systemPrompt, String userMessage) {
@@ -291,6 +292,26 @@ class HookRegistryDispatchTest {
                 return response;
             }
         };
+    }
+
+    /**
+     * [usage-gateway] ExecPromptHook 现经统一旁路客户端发起 LLM 调用（字段注入 sideCallClient）。
+     * 本 helper 注入 mock 客户端，按 hook 传入的 config 经同一工厂取 provider 后委派调用 ——
+     * 保留 chatProvider 的返回内容 / 调用计数语义（dispatch 断言不变）。
+     */
+    private ExecPromptHook execPromptHookWithSideCall(LlmProviderFactory factory) {
+        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        com.nexusai.application.agent.cost.LlmSideCallClient client =
+            org.mockito.Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        org.mockito.Mockito.when(client.chat(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> factory.getProvider(inv.getArgument(0), "openai_compatible")
+                .chatWithOptions(inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                    inv.getArgument(3), inv.getArgument(4)));
+        org.springframework.test.util.ReflectionTestUtils.setField(hook, "sideCallClient", client);
+        return hook;
     }
 
     private static MatchedHook matched(HookCommand hook) {
@@ -360,7 +381,7 @@ class HookRegistryDispatchTest {
         };
         HookRegistry registry = new HookRegistry();
         registry.setHookMatcherEngine(engine);
-        registry.setExecPromptHook(new ExecPromptHook(objectMapper));
+        registry.setExecPromptHook(execPromptHookWithSideCall(factory));
         registry.setModelConfigResolver(new StubModelConfigResolver());
         registry.setLlmProviderFactory(factory);
 
@@ -620,7 +641,7 @@ class HookRegistryDispatchTest {
         HookRegistry registry = new HookRegistry();
         registry.setHookMatcherEngine(engine);
         registry.setModelConfigResolver(new StubModelConfigResolver());
-        registry.setExecPromptHook(new ExecPromptHook(objectMapper));
+        registry.setExecPromptHook(execPromptHookWithSideCall(factory));
         registry.setLlmProviderFactory(factory);
 
         HookResult result = registry.executeEvent(userPrompt());

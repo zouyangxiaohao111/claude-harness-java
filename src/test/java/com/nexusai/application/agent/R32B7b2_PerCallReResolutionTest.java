@@ -298,7 +298,8 @@ class R32B7b2_PerCallReResolutionTest {
                            com.nexusai.application.agent.tool.AbortController abortController,
                            java.util.function.Consumer<Throwable> onError,
                            Runnable onComplete, Boolean skipCacheWrite,
-                com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                com.nexusai.infra.llm.LlmCallScope scope,
+                com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
             // 真实 run() 流: 记录 model + 模拟一次纯文本响应 (无 tool_calls → NORMAL 退出)
             recordedModels.add(modelName);
             streamCallCount++;

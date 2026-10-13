@@ -10,6 +10,7 @@ import com.nexusai.application.agent.compact.CompactThresholdSystem;
 import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.compact.ReactiveCompactor;
 import com.nexusai.application.agent.compact.TokenEstimator;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.diff.TraceRecorder;
 import com.nexusai.application.agent.memory.AutoDreamConsolidator;
 import com.nexusai.application.agent.memory.ExtractMemoriesAgent;
@@ -40,6 +41,7 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelNameResolver;
+import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.repository.provider.entity.ModelRecord;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
@@ -121,6 +123,8 @@ public class AgentLoopContextFactory {
     @Autowired(required = false) private ToolUseSummaryGenerator toolUseSummaryGenerator;
     // [RV14B-WIRE-04] 共享配置解析器 · Haiku 站点解析真实 (config, providerType)（null → 站点 warn+skip）
     @Autowired(required = false) private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
+    // [usage-gateway] 旁路 LLM 单发客户端 · prompt-suggestion / speculation fork 走它完成「调用+记账」
+    @Autowired(required = false) private LlmSideCallClient sideCallClient;
 
     // ── D5 4 组件成员 bean ──
     @Autowired(required = false) private Telemetry telemetry;
@@ -232,7 +236,7 @@ public class AgentLoopContextFactory {
 
     /** [IMP-GP-03] haiku 静态 chat · 对齐 AgentLoopContext.resolveHaikuModelConfig（fast 模型解析）。 */
     private String runHaikuFork(String userMessage, java.util.Map<String, Object> params) {
-        if (llmProviderFactory == null || modelConfigResolver == null) {
+        if (sideCallClient == null || modelConfigResolver == null) {
             return null;
         }
         String modelName = modelConfigResolver.resolveFastModelName("claude-haiku-4-5-20251001");
@@ -245,8 +249,11 @@ public class AgentLoopContextFactory {
         }
         Object sys = params != null ? params.get("system_prompt") : null;
         String system = sys != null ? sys.toString() : PromptSuggestion.SUGGESTION_PROMPT;
-        return llmProviderFactory.getProvider(resolved.config(), resolved.providerType())
-            .chat(resolved.config(), modelName, system, userMessage);
+        // [usage-gateway] prompt-suggestion / speculation fork（主会话派生的侧查询）无会话上下文载体
+        //   （params 仅含 system_prompt，无 sessionId/AgentState）⇒ standalone 归属（⛔ 不伪造 sessionId）。
+        //   类别 SIDE_CALL · 标签 prompt-suggestion-fork。返回文本语义不变。
+        return sideCallClient.chat(resolved.config(), modelName, system, userMessage, null,
+            LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, "prompt-suggestion-fork"));
     }
 
     /** [IMP-GP-03] speculation 状态内存 store（web 后端无 AppState；进程级单例即可）。 */

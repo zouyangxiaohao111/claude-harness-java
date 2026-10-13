@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.memory;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.FileStateCache;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -71,6 +72,23 @@ class MemoryPrefetcherTest {
         }
     }
 
+    /**
+     * [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入「委托桩」把 chat(...) 转发到等价的
+     * side-query provider 桩（stub 响应语义不变）。
+     */
+    private static FindRelevantMemories injectSideCall(FindRelevantMemories frm) {
+        org.springframework.test.util.ReflectionTestUtils.setField(frm, "sideCallClient",
+            new LlmSideCallClient() {
+                @Override
+                public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                                   String userMessage, LlmProvider.ChatRequestOptions options,
+                                   LlmSideCallClient.SideCallUsage usage) {
+                    return new StubProvider().chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+                }
+            });
+        return frm;
+    }
+
     private static ChatMessageDto userMsg(String content) {
         return new ChatMessageDto(
             UUID.randomUUID().toString(), null, Role.user, "user", content, null,
@@ -94,7 +112,7 @@ class MemoryPrefetcherTest {
             () -> memDir.toString(),
             () -> null);
         return new MemoryPrefetcher(
-            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+            injectSideCall(new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
                 // [RV14B-WIRE-02] stub resolver：字面量 → DB 名 → 真实 config（side-query 不再恒 mock）
                 new ModelConfigResolver() {
                     @Override
@@ -106,7 +124,7 @@ class MemoryPrefetcherTest {
                         return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
                             new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
                     }
-                }),
+                })),
             paths,
             new MemoryAge(),
             () -> true,
@@ -126,7 +144,7 @@ class MemoryPrefetcherTest {
             () -> null,                // override 必须 null（否则绕开 eligibility 判定）
             () -> null);
         return new MemoryPrefetcher(
-            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+            injectSideCall(new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
                 new ModelConfigResolver() {
                     @Override
                     public String resolveFastModelName(String fallbackModelName) {
@@ -137,7 +155,7 @@ class MemoryPrefetcherTest {
                         return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
                             new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
                     }
-                }),
+                })),
             paths,
             new MemoryAge(),
             () -> true,
@@ -166,7 +184,7 @@ class MemoryPrefetcherTest {
                 () -> true,                                                // isAutoMemoryEnabled
                 com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault());
         return new MemoryPrefetcher(
-            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+            injectSideCall(new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
                 new ModelConfigResolver() {
                     @Override
                     public String resolveFastModelName(String fallbackModelName) {
@@ -177,7 +195,7 @@ class MemoryPrefetcherTest {
                         return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
                             new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
                     }
-                }),
+                })),
             paths,
             new MemoryAge(),
             () -> true,
@@ -215,7 +233,7 @@ class MemoryPrefetcherTest {
                 () -> true,
                 com.nexusai.application.agent.memory.MemoryPromptBuilder.productionDefault());
         return new MemoryPrefetcher(
-            new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
+            injectSideCall(new FindRelevantMemories(new FixedFactory(new StubProvider()), "sonnet", new MemoryScanner(),
                 new ModelConfigResolver() {
                     @Override
                     public String resolveFastModelName(String fallbackModelName) {
@@ -227,7 +245,7 @@ class MemoryPrefetcherTest {
                         return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
                             new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
                     }
-                }),
+                })),
             paths,
             new MemoryAge(),
             () -> true,

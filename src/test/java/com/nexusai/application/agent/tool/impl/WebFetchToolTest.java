@@ -423,11 +423,12 @@ class WebFetchToolTest {
         // WHY: websearch-ccalign T6 目标——applyPromptToMarkdown 走真实二次模型摘要（对齐 CC queryHaiku），
         //      CC 真源 queryHaiku 用 getSmallFastModel()（model.ts:36-37）= Haiku（fast 档），
         //      非 weak 档。mock LlmProviderFactory 返回固定摘要必须原样进入 result；模型必须用 fast 档。
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), nullable(String.class), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), nullable(String.class), anyString(), any(), any()))
                 .thenReturn("Fixed fast model summary about fetched page");
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         // fast 档：resolveFastModelName（fast→weak→固定默认 三级）→ DB models.name
         when(resolver.resolveFastModelName("claude-haiku-4-5-20251001")).thenReturn("claude-fast-4-5");
@@ -439,6 +440,7 @@ class WebFetchToolTest {
         String url = "https://127.0.0.1:" + httpsServer.getAddress().getPort() + "/";
         WebFetchSecurity security = new WebFetchSecurity(trustAllClient(), "http://127.0.0.1:1/domain_info", true);
         WebFetchTool tool = new WebFetchTool(security, factory, resolver);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult result = tool.execute(call(url));
 
@@ -455,8 +457,8 @@ class WebFetchToolTest {
         ArgumentCaptor<String> userPromptCaptor = ArgumentCaptor.forClass(String.class);
         ArgumentCaptor<LlmProvider.ChatRequestOptions> optionsCaptor =
                 ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
-        verify(provider).chatWithOptions(any(), modelCaptor.capture(), nullable(String.class),
-                userPromptCaptor.capture(), optionsCaptor.capture());
+        verify(sideCallClient).chat(any(), modelCaptor.capture(), nullable(String.class),
+                userPromptCaptor.capture(), optionsCaptor.capture(), any());
         assertThat(modelCaptor.getValue())
                 .as("二次模型必须用 fast 档（CC getSmallFastModel = Haiku，model.ts:36-37）而非 weak 档")
                 .isEqualTo("claude-fast-4-5");
@@ -499,11 +501,12 @@ class WebFetchToolTest {
     @DisplayName("execute(降级：二次模型调用失败)：chatWithOptions 抛异常 → 回退截断，抓取不中断（T6）")
     void execute_secondaryModelSummary_degradesOnCallFailure() throws Exception {
         // WHY: T6 降级纪律——二次模型调用失败时抓取不中断，回退截断（warn 日志标注降级）。
-        LlmProvider provider = Mockito.mock(LlmProvider.class);
-        when(provider.chatWithOptions(any(), anyString(), nullable(String.class), anyString(), any()))
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient（原 provider.chatWithOptions）
+        com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient =
+                Mockito.mock(com.nexusai.application.agent.cost.LlmSideCallClient.class);
+        when(sideCallClient.chat(any(), anyString(), nullable(String.class), anyString(), any(), any()))
                 .thenThrow(new RuntimeException("fast model down"));
         LlmProviderFactory factory = Mockito.mock(LlmProviderFactory.class);
-        when(factory.getProvider(any(), nullable(String.class))).thenReturn(provider);
         ModelConfigResolver resolver = Mockito.mock(ModelConfigResolver.class);
         when(resolver.resolveFastModelName("claude-haiku-4-5-20251001")).thenReturn("claude-fast-4-5");
         when(resolver.resolve("claude-fast-4-5")).thenReturn(
@@ -514,6 +517,7 @@ class WebFetchToolTest {
         String url = "https://127.0.0.1:" + httpsServer.getAddress().getPort() + "/";
         WebFetchSecurity security = new WebFetchSecurity(trustAllClient(), "http://127.0.0.1:1/domain_info", true);
         WebFetchTool tool = new WebFetchTool(security, factory, resolver);
+        ReflectionTestUtils.setField(tool, "sideCallClient", sideCallClient);
 
         AgentToolResult result = tool.execute(call(url));
 

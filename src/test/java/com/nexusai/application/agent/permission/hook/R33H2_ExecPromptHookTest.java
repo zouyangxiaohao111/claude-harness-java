@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.permission.hook;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.application.agent.permission.hook.GenericHook.HookOutcome;
 import com.nexusai.application.agent.permission.hook.GenericHook.HookResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -79,7 +80,8 @@ class R33H2_ExecPromptHookTest {
                                com.nexusai.application.agent.tool.AbortController abortController,
                                java.util.function.Consumer<Throwable> onError,
                                Runnable onComplete, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) {
                 throw new UnsupportedOperationException();
             }
 
@@ -96,7 +98,26 @@ class R33H2_ExecPromptHookTest {
                 return chatResponse;
             }
         };
-        return new ExecPromptHook(objectMapper);
+        return newHook(mockProvider);
+    }
+
+    /**
+     * [usage-gateway] ExecPromptHook 现经统一旁路客户端发起 LLM 调用（字段注入 sideCallClient）。
+     * 本 helper 注入 mock 客户端并把调用委派给给定 provider —— 保留既有 provider 桩的响应/异常/
+     * 延迟语义，各 outcome 断言照旧。
+     */
+    private ExecPromptHook newHook(LlmProvider provider) {
+        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        LlmSideCallClient client = org.mockito.Mockito.mock(LlmSideCallClient.class);
+        org.mockito.Mockito.when(client.chat(
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any(),
+                org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> provider.chatWithOptions(
+                inv.getArgument(0), inv.getArgument(1), inv.getArgument(2),
+                inv.getArgument(3), inv.getArgument(4)));
+        org.springframework.test.util.ReflectionTestUtils.setField(hook, "sideCallClient", client);
+        return hook;
     }
 
     private ExecPromptHook.PromptLlmContext ctx(LlmProvider provider) {
@@ -120,7 +141,8 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 if (capturedUser != null) capturedUser.set(u);
                 return response;
@@ -132,7 +154,7 @@ class R33H2_ExecPromptHookTest {
     @DisplayName("ok=true → outcome=success (CC execPromptHook.ts:172)")
     void okTrue_returnsSuccess() {
         LlmProvider p = echoProvider(null, "{\"ok\": true}");
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
 
         HookResult r = hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"bash\"}", ctx(p), null);
@@ -145,7 +167,7 @@ class R33H2_ExecPromptHookTest {
     @DisplayName("ok=false → outcome=blocking + preventContinuation + stopReason=reason (CC :154-167)")
     void okFalse_returnsBlockingWithReason() {
         LlmProvider p = echoProvider(null, "{\"ok\": false, \"reason\": \"dangerous\"}");
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
 
         HookResult r = hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"rm\"}", ctx(p), null);
@@ -159,7 +181,7 @@ class R33H2_ExecPromptHookTest {
     @DisplayName("JSON 解析失败 → outcome=non_blocking_error (CC :118)")
     void jsonParseFailure_returnsNonBlockingError() {
         LlmProvider p = echoProvider(null, "not a json at all");
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
 
         HookResult r = hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"bash\"}", ctx(p), null);
@@ -171,7 +193,7 @@ class R33H2_ExecPromptHookTest {
     @DisplayName("schema 校验失败 (ok 非 boolean) → outcome=non_blocking_error (CC :138)")
     void schemaValidationFailure_returnsNonBlockingError() {
         LlmProvider p = echoProvider(null, "{\"ok\": \"yes\"}");
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
 
         HookResult r = hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"bash\"}", ctx(p), null);
@@ -198,7 +220,8 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 try { Thread.sleep(2000); } catch (InterruptedException e) {
                     Thread.currentThread().interrupt(); throw new RuntimeException(e);
@@ -206,7 +229,7 @@ class R33H2_ExecPromptHookTest {
                 return "{\"ok\": true}";
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, 1, null, null, null);
 
         long start = System.currentTimeMillis();
@@ -237,12 +260,13 @@ class R33H2_ExecPromptHookTest {
                 java.util.function.Consumer<String> orc, Runnable osf,
                 com.nexusai.application.agent.tool.AbortController ac,
                 java.util.function.Consumer<Throwable> oe, Runnable onC, Boolean skipCacheWrite,
-                    com.nexusai.application.agent.subagent.AgentContext agentContext, com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
+                    com.nexusai.infra.llm.LlmCallScope scope,
+                    com.nexusai.infra.llm.StreamIdleControl streamIdleControl) { throw new UnsupportedOperationException(); }
             @Override public String chat(ProviderConfig c, String m, String s, String u) {
                 throw new RuntimeException("provider exploded");
             }
         };
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("check $ARGUMENTS", null, null, null, null, null);
 
         HookResult r = hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"bash\"}", ctx(p), null);
@@ -255,7 +279,7 @@ class R33H2_ExecPromptHookTest {
     void argumentsPlaceholder_substituted() {
         AtomicReference<String> capturedUser = new AtomicReference<>();
         LlmProvider p = echoProvider(capturedUser, "{\"ok\": true}");
-        ExecPromptHook hook = new ExecPromptHook(objectMapper);
+        ExecPromptHook hook = newHook(p);
         PromptHook cfg = new PromptHook("eval input: $ARGUMENTS", null, null, null, null, null);
 
         hook.exec(cfg, HOOK_NAME(), hookEvent, "{\"tool\":\"bash\"}", ctx(p), null);

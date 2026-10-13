@@ -1,7 +1,7 @@
 package com.nexusai.application.chat;
 
+import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.infra.llm.LlmProvider;
-import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.Role;
@@ -35,8 +35,8 @@ import static org.mockito.Mockito.when;
  * 成功后停闸（:377）、显式命名永不覆盖（:350）、失败可重试（haikuTitleAttemptedRef）。
  *
  * <p>纯单测：{@code new ChatService()} + {@link ReflectionTestUtils} 注入 mock
- * MessageMapper / SessionMapper / ModelConfigResolver / LlmProviderFactory；Haiku 用 mock
- * LlmProvider（不真调 LLM）；wsTemplate=null（sendAndLog null 守卫仅落库不推送）。
+ * MessageMapper / SessionMapper / ModelConfigResolver / LlmSideCallClient；Haiku 用 mock
+ * LlmSideCallClient（不真调 LLM）；wsTemplate=null（sendAndLog null 守卫仅落库不推送）。
  * buildConfigForModel 未注入 DB → 抛异常落 ProviderConfig.empty() 兜底（生产对齐 G-9）。
  */
 @DisplayName("[title-cc-align] maybeGenerateTitle 行为（FIX-1/2/3 + FIX-4）")
@@ -45,8 +45,7 @@ class ChatServiceTitleGenerationCcTest {
     private ChatService service;
     private MessageMapper messageMapper;
     private SessionMapper sessionMapper;
-    private LlmProviderFactory llmProviderFactory;
-    private LlmProvider provider;
+    private LlmSideCallClient sideCallClient;
 
     @BeforeEach
     void setUp() {
@@ -54,15 +53,14 @@ class ChatServiceTitleGenerationCcTest {
         messageMapper = mock(MessageMapper.class);
         sessionMapper = mock(SessionMapper.class);
         ModelConfigResolver modelConfigResolver = mock(ModelConfigResolver.class);
-        llmProviderFactory = mock(LlmProviderFactory.class);
-        provider = mock(LlmProvider.class);
+        sideCallClient = mock(LlmSideCallClient.class);
         ReflectionTestUtils.setField(service, "messageMapper", messageMapper);
         ReflectionTestUtils.setField(service, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(service, "modelConfigResolver", modelConfigResolver);
-        ReflectionTestUtils.setField(service, "llmProviderFactory", llmProviderFactory);
+        // [usage-gateway] 标题生成改走 LlmSideCallClient（旁路客户端）；直构 ChatService 后经反射注入 mock。
+        ReflectionTestUtils.setField(service, "sideCallClient", sideCallClient);
         // 弱档小快模型解析成功（未配置会静默跳过，测试必须显式解析到 fast 模型）
         when(modelConfigResolver.resolveFastModelName(anyString())).thenReturn("mock-fast");
-        when(llmProviderFactory.getProvider(any(ProviderConfig.class), anyString())).thenReturn(provider);
     }
 
     // ─────────────────────────── helpers ───────────────────────────
@@ -88,14 +86,16 @@ class ChatServiceTitleGenerationCcTest {
 
     /** Haiku mock 恒返回结构化 JSON 标题（成功路径）。 */
     private void stubHaiku(String json) {
-        when(provider.chatWithOptions(any(ProviderConfig.class), anyString(), anyString(), anyString(),
-            any(LlmProvider.ChatRequestOptions.class))).thenReturn(json);
+        when(sideCallClient.chat(any(ProviderConfig.class), anyString(), anyString(), anyString(),
+            any(LlmProvider.ChatRequestOptions.class),
+            any(LlmSideCallClient.SideCallUsage.class))).thenReturn(json);
     }
 
     /** Haiku mock 抛异常（生成失败路径 → generateTitleText 回落"新会话"占位）。 */
     private void stubHaikuFail(RuntimeException e) {
-        when(provider.chatWithOptions(any(ProviderConfig.class), anyString(), anyString(), anyString(),
-            any(LlmProvider.ChatRequestOptions.class))).thenThrow(e);
+        when(sideCallClient.chat(any(ProviderConfig.class), anyString(), anyString(), anyString(),
+            any(LlmProvider.ChatRequestOptions.class),
+            any(LlmSideCallClient.SideCallUsage.class))).thenThrow(e);
     }
 
     // ─────────────────────────── 测试用例 ───────────────────────────
@@ -205,8 +205,9 @@ class ChatServiceTitleGenerationCcTest {
             userMsg("m1", "A", false),
             userMsg("m2", "B", false),
             userMsg("m3", "C", false)));
-        when(provider.chatWithOptions(any(ProviderConfig.class), anyString(), anyString(), anyString(),
-            any(LlmProvider.ChatRequestOptions.class))).thenAnswer(inv -> {
+        when(sideCallClient.chat(any(ProviderConfig.class), anyString(), anyString(), anyString(),
+            any(LlmProvider.ChatRequestOptions.class),
+            any(LlmSideCallClient.SideCallUsage.class))).thenAnswer(inv -> {
             String userMessage = inv.getArgument(3);
             // count1 输入 = 首条消息原文 "A"（"用 5-10 个字总结: A"）；count3 输入 = 会话尾部全文（更长）→ 精确匹配区分
             if ("用 5-10 个字总结: A".equals(userMessage)) {

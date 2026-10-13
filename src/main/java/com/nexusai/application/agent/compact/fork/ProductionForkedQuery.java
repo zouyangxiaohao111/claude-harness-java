@@ -640,7 +640,9 @@ public class ProductionForkedQuery implements RunForkedAgent.ForkedQuery {
                 //   [S1-T18] 取值来源改为 **fork 上下文的显式字段**（单一来源），原读
                 //   已删的 ambient 归因读（宿 ThreadLocal）—— 该 ambient 在 fork 的发送线程上
                 //   结构性地不可靠（详见 RunForkedAgent.run 的盖章点 javadoc）。
-                agentContext,
+                // [usage-gateway] 末参升级为 LlmCallScope（形参个数不变）；fork 用量仍走既有
+                //   ForkUsage 通道（登记：待收口到请求网关后改为携带 sink 记账）。
+                com.nexusai.infra.llm.LlmCallScope.of(agentContext),
                 // [流空闲看门狗] fork 直呼路径无等待段驱动看门狗 → NONE（规格 §3）
                 com.nexusai.infra.llm.StreamIdleControl.NONE);
             // [IMP-GAP04 △-15] §7-10 默认裁决对齐 CC（CC 无 300s 硬超时，forkedAgent.ts query()

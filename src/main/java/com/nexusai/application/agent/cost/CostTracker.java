@@ -208,13 +208,39 @@ public class CostTracker {
             log.warn("[CostTracker] saveCurrentSessionCosts 跳过: 会话不存在 sessionId={}", sessionId);
             return;
         }
-        s.setTotalCostYuan(state.sessionCostYuan());
-        s.setModelUsageJson(JSON.toJSONString(state.sessionModelUsage()));
+        // [usage-gateway] 账本优先：账本覆盖全部调用面（主 agent + 子代理 + fork + 后台 + 旁路），
+        //   而 state 的会话字段是账本回写的**视图**；仅当账本不可用/尚无调用时才回落到视图值，
+        //   保持改造前单测（无 Spring / 无账本）行为逐字不变。
+        com.nexusai.application.agent.cost.SessionUsageLedger ledger = state.usageLedger();
+        if (ledger != null && ledger.totalCalls() > 0) {
+            s.setTotalCostYuan(ledger.totalCostYuan());
+            s.setModelUsageJson(JSON.toJSONString(ledger.modelUsage()));
+            s.setUsageTreeJson(ledger.snapshotJson());
+        } else {
+            s.setTotalCostYuan(state.sessionCostYuan());
+            s.setModelUsageJson(JSON.toJSONString(state.sessionModelUsage()));
+        }
         sessionMapper.update(s);
         if (log.isDebugEnabled()) {
-            log.debug("[CostTracker] saveCurrentSessionCosts 已保存: sessionId={} totalCostYuan={} buckets={}",
-                sessionId, state.sessionCostYuan(), state.sessionModelUsage().size());
+            log.debug("[CostTracker] saveCurrentSessionCosts 已保存: sessionId={} totalCostYuan={} buckets={} ledgerCalls={}",
+                sessionId, s.getTotalCostYuan(),
+                ledger != null ? ledger.modelUsage().size() : state.sessionModelUsage().size(),
+                ledger != null ? ledger.totalCalls() : 0L);
         }
+    }
+
+    /**
+     * [usage-gateway] 读 {@code sessions.usage_tree_json}（会话级层级用量快照）·
+     * 供 {@code LlmAgentLoop.doRun} 在会话启动时恢复账本（跨 turn 权威）。
+     *
+     * <p>sessionMapper null（非 Spring 单测）/ 会话不存在 / 列 NULL → null（调用方跳过恢复）。
+     */
+    public String restoreUsageTreeJson(String sessionId) {
+        if (sessionMapper == null || sessionId == null) {
+            return null;
+        }
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        return s != null ? s.getUsageTreeJson() : null;
     }
 
     /** sessions.model_usage_json 列 → 桶 Map · null/空白/解析失败 → 空（fail-soft，对齐 SessionService parseTodos）。 */

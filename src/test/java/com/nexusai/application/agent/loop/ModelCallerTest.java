@@ -77,7 +77,8 @@ class ModelCallerTest {
         ArrayNode tools = new ObjectMapper().createArrayNode();
         List<ChatMessageDto> messages = List.of();
         Consumer<String> onChunk = c -> {};
-        Consumer<AssistantMessage> onMsg = m -> {};
+        java.util.List<AssistantMessage> onMsgSeen = new ArrayList<>();
+        Consumer<AssistantMessage> onMsg = onMsgSeen::add;
         Consumer<ToolUseBlock> onTool = t -> {};
         Consumer<String> onReasoning = r -> {};
         Runnable onFallback = () -> {};
@@ -90,7 +91,7 @@ class ModelCallerTest {
                 "a0123456789abcdef", null, "Explore", true, "req-delegate", "spawn");
         ModelRequest request = new ModelRequest(config, "m1", null, null, messages, tools,
             null, null, null, null,
-            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null, null, subagentCtx, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            onChunk, onMsg, onTool, onReasoning, onFallback, onError, onComplete, null, null, subagentCtx, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
@@ -106,16 +107,29 @@ class ModelCallerTest {
         assertThat(captured.get(7)).isNull();
         assertThat(captured.get(8)).isNull();
         assertThat(captured.get(9)).isSameAs(onChunk);
-        assertThat(captured.get(10)).isSameAs(onMsg);
+        // [usage-gateway] onAssistantMessage 由网关包装（捕获末条消息用于结算）：身份不再透传，
+        //   语义等价断言 ⇒ 包装后的回调必须仍把消息原样投递给调用方传入的 onMsg。
+        @SuppressWarnings("unchecked")
+        Consumer<AssistantMessage> wrappedOnMsg = (Consumer<AssistantMessage>) captured.get(10);
+        AssistantMessage probe = new AssistantMessage("probe", "stop", List.of());
+        wrappedOnMsg.accept(probe);
+        assertThat(onMsgSeen)
+            .as("onAssistantMessage 经网关包装后仍投递给调用方回调（语义不变）")
+            .containsExactly(probe);
         assertThat(captured.get(11)).isSameAs(onTool);
         assertThat(captured.get(12)).isSameAs(onReasoning);
         assertThat(captured.get(13)).isSameAs(onFallback);
         assertThat(captured.get(14)).isNull();
         assertThat(captured.get(15)).isSameAs(onError);
         assertThat(captured.get(16)).isSameAs(onComplete);
-        // [A#3 tuc-invoking-req] 索引 18 = agentContext：必须 isSameAs（同一实例 → provider 侧
-        //   attachInvokingRequestEdge 消费的正是 loop 线程装入的那份稀疏边状态）
+        // [A#3 tuc-invoking-req][usage-gateway] 索引 18 = LlmCallScope：末参类型由 AgentContext
+        //   升级为 LlmCallScope（形参个数不变），归因上下文必须仍是同一实例（provider 侧
+        //   attachInvokingRequestEdge 消费的正是 loop 线程装入的那份稀疏边状态）。
         assertThat(captured.get(18))
+            .as("[A#3] 末参必须是 LlmCallScope（用量网关统一载体）")
+            .isInstanceOf(com.nexusai.infra.llm.LlmCallScope.class);
+        assertThat(com.nexusai.infra.llm.LlmCallScope.agentContextOf(
+                (com.nexusai.infra.llm.LlmCallScope) captured.get(18)))
             .as("[A#3] agentContext 必须逐字段透传（显式载体，越过 STREAM_EXECUTOR 线程边界）")
             .isSameAs(subagentCtx);
     }
@@ -141,7 +155,7 @@ class ModelCallerTest {
         ProviderConfig config = new ProviderConfig("http://base", "k");
         ModelRequest request = new ModelRequest(config, "m1", null, null, List.of(), null,
             null, new com.nexusai.infra.llm.TaskBudgetParam(200_000, 165_000), null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
         ModelResponse resp = ModelCaller.call(ctx, request);
 
@@ -171,7 +185,7 @@ class ModelCallerTest {
         };
         ModelRequest request = new ModelRequest(ProviderConfig.empty(), "m1", null, null, List.of(),
             null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
         deps.callModel(request);
 
@@ -263,7 +277,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://deepseek", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
         ModelCaller.call(ctx, request);
 
@@ -294,7 +308,7 @@ class ModelCallerTest {
         ModelRequest request = new ModelRequest(new ProviderConfig("http://base", "k"),
             "deepseek/deepseek-v4-flash", null, null, List.of(), null,
             null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
 
         ModelCaller.call(ctx, request);
 
@@ -333,7 +347,7 @@ class ModelCallerTest {
                 com.nexusai.application.agent.prompt.CacheScope.NULL));
         ModelRequest request = new ModelRequest(config, "m1", blocks, "repl_main_thread",
             List.of(), null, null, null, null, null,
-            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
+            c -> {}, m -> {}, t -> {}, r -> {}, () -> {}, e -> {}, () -> {}, null, null, null, null, null, com.nexusai.infra.llm.StreamIdleControl.NONE);
         ModelResponse resp = ModelCaller.call(ctx, request);
 
         assertThat(resp).isEqualTo(ModelResponse.SUBMITTED);

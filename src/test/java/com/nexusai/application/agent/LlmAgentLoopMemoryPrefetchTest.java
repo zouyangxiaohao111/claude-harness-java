@@ -109,8 +109,7 @@ class LlmAgentLoopMemoryPrefetchTest {
             () -> memDir.toString(),
             () -> memDir.toString(),
             () -> null);
-        return new MemoryPrefetcher(
-            new FindRelevantMemories(sideFactory, "sonnet", new MemoryScanner(),
+        FindRelevantMemories findRelevantMemories = new FindRelevantMemories(sideFactory, "sonnet", new MemoryScanner(),
                 new ModelConfigResolver() {
                     @Override
                     public String resolveFastModelName(String fallbackModelName) {
@@ -122,7 +121,20 @@ class LlmAgentLoopMemoryPrefetchTest {
                         return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
                             new ProviderConfig("http://fake.local", "sk-test"), "openai_sdk");
                     }
-                }),
+                });
+        // [usage-gateway] 旁路调用已收口 LlmSideCallClient：注入「委托桩」把 chat(...) 转发到同一
+        //   sideProvider 实例（保留 sideQueryCalls / latch 观测语义）。
+        org.springframework.test.util.ReflectionTestUtils.setField(findRelevantMemories, "sideCallClient",
+            new com.nexusai.application.agent.cost.LlmSideCallClient() {
+                @Override
+                public String chat(ProviderConfig config, String modelName, String systemPrompt,
+                                   String userMessage, LlmProvider.ChatRequestOptions options,
+                                   com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage usage) {
+                    return sideProvider.chatWithOptions(config, modelName, systemPrompt, userMessage, options);
+                }
+            });
+        return new MemoryPrefetcher(
+            findRelevantMemories,
             paths,
             new MemoryAge(),
             () -> true,
