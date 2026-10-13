@@ -1273,20 +1273,18 @@ public class BashTool implements Tool {
                         log.debug("BashTool: 前台任务输出目录创建失败: {}", e.toString());
                     }
                 }
-                BackgroundTask fgTask = new BackgroundTask(
-                    taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
-                    abbreviate(command, 100), call.id(),
-                    System.currentTimeMillis(), null, null, outputFile, 0L, false,
-                    null, false).withSessionId(sessionId);
+                BackgroundTask fgTask = buildForegroundTask(
+                    taskId, command, call.id(), outputFile, sessionId, ctx);
                 foregroundRunner = new LocalBashTaskRunner();
                 // G5-1/G5-2 桥接：adoptForegroundProcess 让 BackgroundTaskRunner 的
                 //   backgroundExistingForegroundTask 守卫（runner.isProcessAlive）能看到本前台 Process。
                 foregroundRunner.adoptForegroundProcess(process);
                 foregroundTaskId = backgroundTaskRunner.registerForeground(fgTask, foregroundRunner);
-                if (log.isDebugEnabled()) {
-                    log.debug("BashTool: 前台任务已登记 taskId={}（G1-2 registerForeground, LocalShellTask.tsx:259-287）",
-                        foregroundTaskId);
-                }
+                // [数据流日志] 前台登记必须带 agentId —— 归属写入点只此一处，日志无 agentId 时
+                //   「回执被谁截走」无法从日志回溯（本次排查即因此走弯路）。形态对齐 executeBackground
+                //   的 `BashTool: background task {} spawned, ..., agentId={}`。
+                log.info("BashTool: 前台任务已登记 taskId={}, agentId={}（G1-2 registerForeground, LocalShellTask.tsx:259-287）",
+                    foregroundTaskId, fgTask.agentId());
 
                 // G5-2: 15s 自动后台定时器 · 仅 G1-3 全门通过才启动（对齐 CC BashTool.tsx:976-982）。
                 if (autoBgEligible) {
@@ -2814,6 +2812,42 @@ public class BashTool implements Tool {
 
     private static String abbreviate(String s, int max) {
         return s == null ? "" : (s.length() > max ? s.substring(0, max) + "..." : s);
+    }
+
+    /**
+     * [coordinator-align] 前台 bash 任务构造 · 自 {@link #execute} G5-2 登记段<b>提取</b>出的
+     * 唯一构造点（构造原样搬出、ctx 参数化），供单测直断「调用方 ctx.agentId 非 null ⇒
+     * 登记出的 task 必须携带它」。
+     *
+     * <p><b>WHY 归属必须带上</b>：CC registerForeground 的 taskState 从 input 解构 agentId 装入
+     * （LocalShellTask.tsx:266 解构 → :283 {@code agentId}），前台登记那一刻就是该 task 归属的
+     * <b>唯一写入点</b>——后续转后台完成/失败读回 {@code prevTask.agentId} 入队（:430/:470）、
+     * stall advisory 直接透传（:89-94）、kill 侧 {@code killShellTasksForAgent} 按
+     * {@code task.agentId === agentId} 收尸（killShellTasks.ts:62）。
+     *
+     * <p>Java 侧 fgTask 由本方法构造，第 12 参（BackgroundTask.agentId）若写死 null ⇒
+     * 该 task 与主会话任务<b>长得一模一样</b> ⇒ 完成回执入队时 agentId=null ⇒
+     * NotificationQueue.drainForQuery 主线程规则（只捞 agentId==null，NotificationQueue.java:775
+     * ← query.ts:1574）把子代理后台命令的回执截给主会话（上报现象）。
+     *
+     * @param taskId    任务 id（TaskIdGenerator 生成）
+     * @param command   原始命令（超长截断到 100，对齐改前 {@code abbreviate(command, 100)}）
+     * @param toolUseId 关联 tool_use block id
+     * @param outputFile 任务输出文件路径
+     * @param sessionId 创建该任务的会话（withSessionId 透传，通知归属会话）
+     * @param ctx       调用方上下文 · 归属 agentId 唯一来源（可 null：1 参 dispatch 兼容路径）
+     * @return 登记用前台 task（isBackgrounded=false）
+     */
+    static BackgroundTask buildForegroundTask(String taskId, String command, String toolUseId,
+                                              String outputFile, String sessionId,
+                                              ToolUseContext ctx) {
+        // 归属语义 / CC 行号 / ctx==null 与 isBackgrounded 的不变量：见本方法 javadoc（[coordinator-align]）
+        UUID taskAgentId = ctx != null ? ctx.agentId() : null;
+        return new BackgroundTask(
+            taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
+            abbreviate(command, 100), toolUseId,
+            System.currentTimeMillis(), null, null, outputFile, 0L, false,
+            taskAgentId, false).withSessionId(sessionId);
     }
 
     /**
