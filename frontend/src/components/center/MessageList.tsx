@@ -1075,10 +1075,10 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           font-family: inherit;
           line-height: 1.5;
           text-align: left;
-          box-shadow: 0 1px 3px rgba(20,20,19,.08), 0 1px 2px rgba(20,20,19,.04);
+          box-shadow: 0 1px 3px rgba(20,24,31,.08), 0 1px 2px rgba(20,24,31,.04);
           transition: box-shadow .15s ease;
         }
-        .user-attach-file:hover { box-shadow: 0 6px 16px rgba(20,20,19,.14), 0 2px 6px rgba(20,20,19,.08); }
+        .user-attach-file:hover { box-shadow: 0 6px 16px rgba(20,24,31,.14), 0 2px 6px rgba(20,24,31,.08); }
         .user-attach-file .uaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* 类型徽标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
         .uaf-badge {
@@ -1117,13 +1117,13 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         .system-notice .sn-icon { color: var(--accent); font-size: 13px; line-height: 1; }
         /* 覆盖 globals.css 的 .msg .delete-btn 绝对定位，改由 flex 容器排布 */
         .msg .msg-hover-actions .delete-btn { position: static; }
-        /* 删除按钮醒目：橙边框/文字 + 淡橙底（危险删除语义 · 对齐项目 accent #FF7A3D） */
+        /* 删除按钮醒目：橙边框/文字 + 淡橙底（危险删除语义 · 对齐项目 accent #0f5fd4） */
         .msg .msg-hover-actions .delete-btn {
-          border-color: #FF7A3D;
-          color: #FF7A3D;
-          background: #FFF3EB;
+          border-color: #0f5fd4;
+          color: #0f5fd4;
+          background: #eaf2fe;
         }
-        .msg .msg-hover-actions .delete-btn:hover { background: #FF7A3D; color: #fff; }
+        .msg .msg-hover-actions .delete-btn:hover { background: #0f5fd4; color: #fff; }
         /* tool_use_summary 摘要行：居中弱化窄行（工具批 · 不进模型上下文） */
         .msg.tool-use-summary {
           display: flex;

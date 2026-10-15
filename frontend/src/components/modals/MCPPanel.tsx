@@ -115,7 +115,7 @@ const parseJsonObject = (raw: string): Record<string, string> | undefined | null
 /**
  * MCPPanel · 按设计稿「功能4」+ 后端 MCP 契约（McpServerController / McpCreateRequest 11 字段）重构
  *
- * <p>顶部「添加新服务器」表单卡（橙底 #FFF3EB）：名称 + 传输类型 select（切换联动 Command /
+ * <p>顶部「添加新服务器」表单卡（橙底 #eaf2fe）：名称 + 传输类型 select（切换联动 Command /
  * URL+Headers+OAuth）+ 作用域。下方「已配置的服务器」列表：transport / scope / approvalStatus /
  * status / 连接状态（预留）徽标 + enabled 开关 + 启停/测试/去授权(预留)/编辑/删除。
  * <p>导入 .mcp.json + 待审批弹窗（approve/reject）。CRUD 复用 useMcp hook。
@@ -408,7 +408,7 @@ export function MCPPanel({ mcpApi, showToast }: MCPPanelProps) {
         </div>
       </div>
 
-      {/* ── 添加 / 编辑 服务器表单卡（设计稿「功能4」· 橙底 #FFF3EB） ── */}
+      {/* ── 添加 / 编辑 服务器表单卡（设计稿「功能4」· 橙底 #eaf2fe） ── */}
       <div className="mcp-add-card">
         <div className="mcp-add-title">{editing ? '编辑服务器' : '添加新服务器'}</div>
         {!editing && (

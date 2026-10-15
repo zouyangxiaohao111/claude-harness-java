@@ -5,7 +5,7 @@ import { SessionToolsPanel } from './SessionToolsPanel'
 import { CatArtBody } from '../startup/CatArt'
 import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
-import type { AttachmentRequest, SessionDto, ChatMessageDto, Provider } from '@/api/types'
+import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
 import { AgentSelector } from './AgentSelector'
 import { isTauri } from '@tauri-apps/api/core'
@@ -128,13 +128,6 @@ interface ComposerProps {
   onSelectProject: () => void
   /** 当前模型名（发送键旁胶囊展示） */
   currentModel: string
-  /**
-   * Provider 列表（后端权威 `type` 字段）· [缓存%判据修复 2026-10-10] 供判定当前模型是否 Anthropic
-   * 协议（`provider.type === 'anthropic'`）——此前按 `provider/model` 前缀**名字猜**，自定义命名的
-   * ant provider（如 ds-zcw）判 false → 用错公式（真三小票数据算出「缓存 3386%」）。缺省 undefined
-   * → 判据回落 false（不猜，与旧行为兼容）。
-   */
-  providers?: Provider[]
   /** 当前会话权限模式（会话覆盖 ?? 全局默认 ?? 'default' · App 解析后传入） */
   permissionMode: PermissionMode
   /** 切换会话权限模式（App 调 sessionApi.update({permissionMode}) · 会话覆盖全局） */
@@ -169,6 +162,8 @@ interface ComposerProps {
   localRead?: boolean
   /** 当前会话主线程 agent（null/空串 = 默认模式，胶囊显示「技能市场」入口） */
   currentAgent?: string | null
+  /** 清除当前专家（胶囊悬停 ▾→× 点击触发；由 App 走 handleAgentChange(null)） */
+  onClearAgent?: () => void
   /** 点击顶部 agent 胶囊 → 打开技能市场弹窗（App 持有 showMarket state） */
   onOpenMarket?: () => void
 }
@@ -231,7 +226,7 @@ function renderHighlighted(text: string, onChipRemove?: (token: string) => void)
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, providers, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onOpenMarket }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, onOpenMarket }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -260,68 +255,40 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   //   （不推 message.usage），无需过滤。
   const usageScan = useMemo(() => [...msgs, ...liveBlocks], [msgs, liveBlocks])
   const ctxInfo = useMemo(() => resolveCtxInfo(usageScan), [usageScan])
-  // F1 · 缓存利用率（参考 deepseek-harness 缓存概念）：按 provider 分派——
-  //   anthropic（claude）：cache_read / (input + cache_read + cache_creation)，input 不含 cache hit；
-  //   deepseek（openai 协议）：input_tokens 已含 cache hit（input==H+M），直接 cache_read / input
-  //   （真实命中率；按 anthropic 公式会算成真实的一半 ~40% 假象）。
-  //   [缓存%判据修复 2026-10-10] 「是否 Anthropic 协议」从「provider 名前缀猜」改为查 providers 列表的
-  //   权威 type 字段（后端 ProviderDto.type）——自定义命名的 ant provider（如 ds-zcw）此前名判 false →
-  //   走 cr/input → 真三小票数据（input=未命中增量、cr=命中的历史）算出 3386%；查表后走
-  //   cr/(input+cr+cc) 正确。列表缺失 / 查不到 → false（回落旧行为，不猜）。
-  //   取最近一条带 usage 的 assistant 消息（complete 事件 usage 透传 · tokenWarning.tokenUsage 仅 number 无缓存细分）
-  const isClaudeProvider = useMemo(() => {
-    const prefix = (currentModel ?? '').split('/')[0]?.trim().toLowerCase()
-    if (!prefix || !providers) return false
-    const p = providers.find((x) => (x.name ?? '').trim().toLowerCase() === prefix)
-    return p?.type === 'anthropic'
-  }, [currentModel, providers])
-  const cacheRateInfo = useMemo(() => {
+  // F1 · 缓存利用率：**消费后端权威命中率**（事件顶层 `cache_hit_rate` · **0-1 比率**）。
+  //   [V101 口径上收] 删除前端「按 provider type 自行分派算法」的旧实现（anthropic → cr/(input+cr+cc)；
+  //   openai/deepseek → cr/input）：该分派已在后端 ContextUsageCalculator.computeCacheHitRate 单点，
+  //   前端重复实现必然漂移（历史教训：自定义命名 ant provider 名判 → 算出 3383%）。
+  //   取数 = 最近一条带该值的消息/流式块（该条 assistant **自身**命中率，message.usage 事件透传）。
+  //   缺值（后端 NON_NULL 省略）→ 不显示，⛔ 不臆造 0（仓内约定见 utils/subagentStats.ts:14）。
+  const turnCacheRate = useMemo(() => {
     const scanned = usageScan
     for (let i = scanned.length - 1; i >= 0; i--) {
-      const u = scanned[i]?.usage
-      if (!u) continue
-      const cr = u.cache_read_input_tokens ?? 0
-      const ci = u.input_tokens ?? 0
-      const cc = u.cache_creation_input_tokens ?? 0
-      if (isClaudeProvider) {
-        const total = ci + cc + cr
-        if (total > 0) return { rate: Math.round((cr / total) * 100), read: cr }
-      } else if (ci > 0) {
-        return { rate: Math.round((cr / ci) * 100), read: cr }
-      }
+      const r = scanned[i]?.cacheHitRate
+      if (r != null) return r
     }
     return null
-  }, [usageScan, isClaudeProvider])
-  // [缓存%双显示 2026-10-10 用户裁定] 第二个数：**会话累计**命中率（deepseek-harness 官方口径）。
-  //   口径 = 「命中之和 ÷ 输入之和」（按轮大小加权，不是挑某一轮）；数据源 = 最近一条 assistant 的
-  //   modelUsage（会话按模型累计快照 · 每轮 complete 更新 + 落库 model_usage_json，F5 后仍在；含
-  //   用户轮与 cron/任务通知唤醒的主会话轮；子代理/fork 结构性不进该累计）→ **每轮回复都会推动本数**
-  //   （含后台触发的自动轮，不依赖用户输入——用户裁定的「不能停止」要求）。
-  //   公式沿用 0.1.32 协议分派：anthropic 语义 = Σcr/(Σinput+Σcr+Σcc)（与官方三桶同构）；
-  //   openai 语义 = Σcr/Σinput（其 input 已含命中，套三桶会双计成 ~50% 假象）。
-  const lastMsg = useMemo(() => {
+  }, [usageScan])
+  // [缓存%双显示] 第二个数：**会话累计**命中率。优先级：
+  //   ① 最近一条 assistant 消息上的 `sessionCacheHitRate`（message.complete 事件顶层 `cache_hit_rate` 透传 ·
+  //      实时最新 · 0-1 比率）；
+  //   ② F5/重拉态：消息行来自 DB（无该字段）→ 回退**当前活动会话** SessionDto.cacheHitRate
+  //      （后端由 sessions.model_usage_json 派生 · 与 sessions 列表同源刷新，见 UsageCostModal 的会话来源）。
+  //   ⛔ 不回退 modelUsage 自算（本次已删除前端协议分派）；两者皆缺 → null → 整段不渲染（不臆造 0）。
+  const sessionCacheRate = useMemo(() => {
     for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'assistant') return msgs[i]
+      const r = msgs[i]?.sessionCacheHitRate
+      if (r != null) return r
     }
-    return null
-  }, [msgs])
-  const sessionCacheRateInfo = useMemo(() => {
-    const mu = lastMsg?.modelUsage
-    if (!mu) return null
-    let ci = 0
-    let cr = 0
-    let cc = 0
-    for (const u of Object.values(mu)) {
-      ci += u.inputTokens ?? 0
-      cr += u.cacheReadInputTokens ?? 0
-      cc += u.cacheCreationInputTokens ?? 0
-    }
-    if (isClaudeProvider) {
-      const total = ci + cc + cr
-      return total > 0 ? Math.round((cr / total) * 100) : null
-    }
-    return ci > 0 ? Math.round((cr / ci) * 100) : null
-  }, [lastMsg, isClaudeProvider])
+    return sessionUsage?.cacheHitRate ?? null
+  }, [msgs, sessionUsage])
+  // 两个口径各自独立判定（只有一个也照常显示那一个）；两个都缺 → 整个缓存 span 不渲染。
+  //   warn 配色沿用旧判据（< 50% 视为偏低）· 基数 = 本回合优先、退累计。
+  const cacheWarnBase = turnCacheRate ?? sessionCacheRate
+  const cacheText = [
+    turnCacheRate != null ? `缓存 ${Math.round(turnCacheRate * 100)}%（本回合）` : null,
+    sessionCacheRate != null ? `${Math.round(sessionCacheRate * 100)}%（累计）` : null,
+  ].filter((s): s is string => s != null).join(' · ')
   // F4 · 最近一条 assistant 消息 t/s 速度（output_tokens × 1000 / decode_ms · footer 展示）。
   //   扫描源 = [...msgs, ...liveBlocks]：live 块在 message.usage（assistant 流式结束）即挂 usage/decode_ms，
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
@@ -929,6 +896,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           <AgentSelector
             currentAgent={currentAgent}
             onOpen={() => { if (onOpenMarket) onOpenMarket() }}
+            onClear={onClearAgent}
           />
           {/* 输入框上方右缘操作组（右对齐输入框右缘）：回到底部（离底时）+ 停止所有（运行中） */}
           <div className="composer-top-actions">
@@ -1275,10 +1243,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   {ctxInfo.pct != null ? `（${ctxInfo.pct}%）` : ''}
                 </span>
               )}
-              {cacheRateInfo && (
-                <span className={`hu-cache${cacheRateInfo.rate >= 50 ? '' : ' warn'}`} title={`本回合缓存读取 ${compactNumber(cacheRateInfo.read)} tokens`}>
-                  · 缓存 {cacheRateInfo.rate}%（本回合）
-                  {sessionCacheRateInfo != null && ` · ${sessionCacheRateInfo}%（累计）`}
+              {cacheWarnBase != null && (
+                <span
+                  className={`hu-cache${Math.round(cacheWarnBase * 100) >= 50 ? '' : ' warn'}`}
+                  title="缓存命中率（后端记账口径 · 0-1）：本回合 = 最近一条回复自身；累计 = 本会话"
+                >
+                  · {cacheText}
                 </span>
               )}
               {sessionUsage?.totalCostYuan != null && sessionUsage.totalCostYuan > 0 && <span className="hu-cost">· ¥{sessionUsage.totalCostYuan.toFixed(2)}</span>}

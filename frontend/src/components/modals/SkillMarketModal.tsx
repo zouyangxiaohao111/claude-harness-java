@@ -47,7 +47,7 @@ const MARKET_SOURCES: { id: MarketSourceId; label: string }[] = [
 ]
 
 /** 头像兜底色板（图标 URL 缺失时用名字首字 + 色块） */
-const AVATAR_COLORS = ['#CC785C', '#5B8DC9', '#5DB872', '#7B61FF', '#C99417', '#4A6CF7', '#C77B5C', '#D9534F']
+const AVATAR_COLORS = ['#0f5fd4', '#5B8DC9', '#5DB872', '#7B61FF', '#C99417', '#4A6CF7', '#0a49a8', '#D9534F']
 function colorOf(name: string): string {
   let h = 0
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0

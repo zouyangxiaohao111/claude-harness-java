@@ -811,6 +811,8 @@ export function useChatSocket(
           percentLeft: evt.percentLeft ?? null,
           // [D1 usage-source] 来源标记透传到块（底部数字只统计「用户自己的请求」；缺省按 user 计）
           usageSource: evt.source ?? null,
+          // [V101] 该条自身缓存命中率（事件顶层 cache_hit_rate · 0-1 比率）→ 底部「本回合」
+          cacheHitRate: evt.cache_hit_rate ?? null,
         })
       }
     } else if (isComplete(evt)) {
@@ -830,6 +832,8 @@ export function useChatSocket(
         // F4 t/s 速度：decode_ms（usage.decode_ms · 首 token→完成）与 contextWindow 透传到块消息
         decodeMs: evt.usage?.decode_ms ?? null,
         contextWindow: evt.contextWindow ?? null,
+        // [V101] 会话累计缓存命中率（事件顶层 cache_hit_rate · 0-1 比率）→ 块消息 sessionCacheHitRate
+        sessionCacheHitRate: evt.cache_hit_rate ?? null,
       })
       // [sm-boundary-reload] 本轮有压缩落库成功（compacted=true）→ finalize 之后触发收尾重拉（对账层）：
       //   即时层 message.insert 只推 boundary 行；重拉补齐 summary 等其余新行。⛔ 位置必须在 finalizeBlocks
@@ -839,21 +843,16 @@ export function useChatSocket(
       //   横幅（对齐 CC：重试成功即消失；此前仅 onClose 手动关闭，残留导致「已完成仍显示重试」）
       st.setRetry(null)
       // 会话 token/金额汇总（底部 footer · F5 恢复源）：complete 事件携带会话累计（total_cost_usd=累计金额、
-      //   modelUsage=各模型累计 token）→ 覆盖更新当前会话 SessionDto（非累加 —— 后端已是跨 turn 累计值）
-      if (evt.total_cost_usd != null || evt.modelUsage != null) {
-        let totalTokens = 0
-        if (evt.modelUsage) {
-          for (const m of Object.values(evt.modelUsage)) {
-            totalTokens += (m.inputTokens ?? 0) + (m.outputTokens ?? 0)
-          }
-        }
-        if (evt.total_cost_usd != null || totalTokens > 0) {
-          st.updateSessionUsage(sid, {
-            // 0/无 usage 的失败轮不得覆盖：cost 只在 >0 时更新（避免把已持久化累计清成 0）
-            totalCostYuan: evt.total_cost_usd != null && evt.total_cost_usd > 0 ? evt.total_cost_usd : undefined,
-            totalTokens: totalTokens > 0 ? totalTokens : undefined,
-          })
-        }
+      //   total_tokens=累计 tokens）→ 覆盖更新当前会话 SessionDto（非累加 —— 后端已是跨 turn 累计值）。
+      //   [V101] total_tokens 取代原「自行对 modelUsage 逐模型 input+output 求和」：那个和是前端拼装，
+      //   与后端记账（llm_usage_calls 明细）口径可能不一致；total_tokens 语义 = input+output（不含 cache），
+      //   与原求和的语义一致。无该键（NON_NULL 省略 / 老后端）→ 不覆盖，沿用本地已有值（不臆造 0）。
+      if (evt.total_cost_usd != null || evt.total_tokens != null) {
+        st.updateSessionUsage(sid, {
+          // 0/无 usage 的失败轮不得覆盖：cost 只在 >0 时更新（避免把已持久化累计清成 0）
+          totalCostYuan: evt.total_cost_usd != null && evt.total_cost_usd > 0 ? evt.total_cost_usd : undefined,
+          totalTokens: evt.total_tokens != null && evt.total_tokens > 0 ? evt.total_tokens : undefined,
+        })
       }
       // [断连恢复] 若本 turn 期间 WS 被服务端强杀过 → 断连窗口内 chunk/complete 推给零订阅者已丢
       //   （STOMP simple broker topic 非持久,无重放）→ 触发 App 按 sid 权威重拉 GET /messages 补偿缺口:

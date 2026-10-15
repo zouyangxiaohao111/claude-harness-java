@@ -670,34 +670,93 @@ export interface SessionDto {
    *  再回落 feature+env）；true = 本会话强制协调者；false = 本会话强制普通（压过全局开）。
    *  「A 会话是协调者、B 会话不是」的唯一载体（后端 PromptAlignSettingsResolver 逐次按 sessionId 读） */
   coordinatorMode?: boolean | null
+  /** [V101] 会话累计缓存命中率（**0-1 比率** · 后端由 `sessions.model_usage_json` 派生，与 usage 记账同源）·
+   *  底部「X%（累计）」的**重拉回退源**（实时优先用 complete 事件透传值）；无数据 = null → 不渲染，⛔ 不臆造 0。 */
+  cacheHitRate?: number | null
 }
 export type SessionGroup = 'current' | 'today' | 'yesterday' | 'week'
 
 // ---- 用量统计（S3 · 对齐后端 GET /api/v1/stats StatsResponse）----
-/** 按天聚合单条（后端 StatsController byDay · date=yyyy-MM-dd · 会话创建日归组） */
+// [V101 读侧重构] 数据源 = `llm_usage_calls` 明细表（唯一真源，聚合下推 SQL，无 rollup 表）；
+//   金额一律**元**（后端字段名 costYuan；旧 byModel.costUSD 与 anthropic 标志已删除）。
+
+/** 按天聚合单条（后端 StatsService byDay · date=yyyy-MM-dd = **调用发生日**）·
+ *  [V101] 归组口径从「会话创建日」改为 `started_at` 的本地日期（同一批调用按实际发生日归组，
+ *  与区间过滤同源）；区间过滤可依赖字符串比较（started_at 统一 ISO-8601 带偏移写入，见 V101 裁定）。 */
 export interface StatsByDay {
   date: string
+  /** 该日明细行数（llm_usage_calls 每 call 一行，含失败/中断尝试） */
+  calls: number
   tokenCount: number
   costYuan: number
 }
-/** 按模型聚合单条（后端 StatsController byModel · model=模型全名 provider/model） */
+/** 按模型聚合单条（后端 StatsService byModel · model=模型全名 provider/model · 数据源同 byDay）。 */
 export interface StatsByModel {
   model: string
+  /** 明细行数（每次 LLM 调用一行） */
+  calls: number
   inputTokens: number
   outputTokens: number
+  /** 缓存读 token（**单列展示**；是否已含在 inputTokens 内由后端按 provider 协议判定，前端不再自行分派） */
   cacheReadInputTokens: number
   cacheCreationInputTokens: number
-  costUSD: number
-  /** 该模型是否 Anthropic provider（后端 ContextUsageCalculator.isAnthropic 判定）·
-   *  true=total 按 4 项和（input 不含 cache hit）；false（deepseek input 已含 cache hit）= 仅 input+output，
-   *  4 项和会双计 cache */
-  anthropic: boolean
+  /** 该行 token 合计（**后端单点给出**）。[V101] 前端删除「按 provider type 自行分派 anthropic/deepseek
+   *  四则运算」的旧逻辑（`modelRowTotal`）：算法上收到后端 ContextUsageCalculator，前端重复实现只会漂移。 */
+  totalTokens: number
+  /** 该模型花费（元）· == costInput + costOutput + costCacheRead + costCacheWrite */
+  costYuan: number
+  /** 成本分项（元）：输入 / 输出 / 缓存读（命中·省钱的那部分）/ 缓存写；无价格配置时为 0（非 null） */
+  costInput: number
+  costOutput: number
+  costCacheRead: number
+  costCacheWrite: number
+  /** 缓存命中率 **0-1 比率**（后端协议分派单点）· 分母为 0（无 prompt token）时后端给 **null**
+   *  → 展示侧不渲染（不臆造 0）。 */
+  cacheHitRate: number | null
 }
-/** 全量总览（后端 StatsController totals · 全会话聚合） */
+/** 全量总览（后端 StatsService totals · `llm_usage_calls` 明细聚合 · 全会话）。 */
 export interface StatsTotals {
   sessionCount: number
+  /** 明细行数（每次 LLM 调用一行，含失败/中断尝试） */
+  calls: number
   tokenCount: number
+  inputTokens: number
+  outputTokens: number
+  /** 缓存读 token（单列；并入 token 合计会双计 → 保持分列展示） */
+  cacheReadTokens: number
+  /** 缓存写 token（同上） */
+  cacheWriteTokens: number
+  /** 总花费（元）· == costInput + costOutput + costCacheRead + costCacheWrite + legacyCostYuan */
   costYuan: number
+  /** 成本分项（元 · 恒有值，无数据 = 0.0）：输入 / 输出 / 缓存读 / 缓存写 */
+  costInput: number
+  costOutput: number
+  costCacheRead: number
+  costCacheWrite: number
+  /** 输入侧「无缓存价」对照成本（元 · 后端分项口径，用于算缓存到底省了多少） */
+  costNoCacheInput: number
+  /** 缓存节省金额（元 · 缓存读链路相对按无缓存价计费省下的钱 · 后端口径）· 0 = 无节省（不渲染该卡） */
+  cacheSavingsYuan: number
+  /** 缓存命中率 **0-1 比率**（后端协议分派）· 分母为 0 时 null → 不渲染 */
+  cacheHitRate: number | null
+  /** token 数为估算（provider 未上报 usage）的调用数 · 不可当账单 */
+  estimatedCalls: number
+  /** 被取消 / 流中断的调用数 */
+  abortedCalls: number
+  /** 失败的调用数 */
+  failedCalls: number
+  /** [V101] 历史行数（分项列为 NULL 的 LEGACY 行）· 单列统计，**不摊分、不伪造** */
+  legacyCalls: number
+  /** [V101] 历史行金额合计（元）· 与分项口径分开呈现（有值才显示） */
+  legacyCostYuan: number
+}
+/** GET /api/v1/stats 的时间区间（`from`/`to` = ISO-8601 带偏移文本，与 `started_at` 同格式/同字典序，
+ *  区间过滤 = 字符串比较 → 可用 idx_llm_usage_calls_started_at）。null = 该端未传（全量）。 */
+export interface StatsRange {
+  from: string | null
+  to: string | null
+  /** 本次请求是否带区间过滤（false = 全量查询，页面上所有数字均为全量） */
+  filtered: boolean
 }
 
 /**
@@ -745,7 +804,8 @@ export interface StatsByAgent {
   parentAgentId: string | null
   /** 层级深度（主 agent = 0） */
   depth: number
-  /** 归属标签（后端归属链上的 label · 可为 null，此时展示类型名） */
+  /** 归属标签（后端归属链上的 label · 可为 null，此时展示类型名）。**子代理/fork/队友节点 = 该次
+   *  任务的名称**（CC AgentTool `description`，与任务注册表同源），取不到才回落 agent 类型名。 */
   label: string | null
   calls: number
   inputTokens: number
@@ -779,6 +839,18 @@ export interface SessionUsageTotals {
   failedCalls: number
   streamCalls: number
   nonStreamCalls: number
+  // [V101] 末尾新增（既有字段名与顺序不变）：成本分项与缓存口径（分项列可空 → null 不渲染，不臆造 0）
+  costInput?: number | null
+  costOutput?: number | null
+  costCacheRead?: number | null
+  costCacheWrite?: number | null
+  costNoCacheInput?: number | null
+  /** 缓存节省金额（元 · 后端口径） */
+  cacheSavingsYuan?: number | null
+  /** 缓存命中率 **0-1 比率**（后端协议分派；分母 0 → null） */
+  cacheHitRate?: number | null
+  /** V101 前的历史行数（分项列为 NULL 的行 · 单列统计，不摊分） */
+  legacyCalls?: number | null
 }
 
 /**
@@ -808,6 +880,16 @@ export interface SessionAgentUsage {
   failedCalls: number
   streamCalls: number
   nonStreamCalls: number
+  // [V101] 末尾新增（既有字段名与顺序不变 · 行级成本分项与缓存口径）：分项列可空 → null 不渲染
+  costInput?: number | null
+  costOutput?: number | null
+  costCacheRead?: number | null
+  costCacheWrite?: number | null
+  costNoCacheInput?: number | null
+  cacheSavingsYuan?: number | null
+  /** 缓存命中率 **0-1 比率**（分母 0 → null） */
+  cacheHitRate?: number | null
+  legacyCalls?: number | null
 }
 
 /** GET /api/v1/sessions/{id}/usage 响应（会话级用量明细 · 记账侧权威值）。 */
@@ -818,8 +900,10 @@ export interface SessionUsageResponse {
   agents: SessionAgentUsage[]
 }
 
-/** GET /api/v1/stats 响应 */
+/** GET /api/v1/stats?from=&to= 响应（**明细表 `llm_usage_calls` 为唯一真源** · 聚合下推 SQL）。 */
 export interface StatsResponse {
+  /** 本次查询的时间区间（from/to 为空 = 全量；filtered=false 时页面数字均为全量口径） */
+  range: StatsRange
   totals: StatsTotals
   byDay: StatsByDay[]
   byModel: StatsByModel[]
@@ -1198,6 +1282,12 @@ export interface ChatMessageDto {
   totalCostUsd?: number | null
   /** complete 事件透传：按模型 usage 快照（会话累计） */
   modelUsage?: Record<string, ModelUsageEntry> | null
+  /** [V101] 本条 assistant **自身**的缓存命中率（0-1 比率 · `message.usage` 事件顶层 `cache_hit_rate`
+   *  经流式块透传 · 只在前端内存，不入 DB）· 缺省 = 后端无该值 → 底部不显示「本回合」（⛔ 不臆造 0）。 */
+  cacheHitRate?: number | null
+  /** [V101] **会话累计**缓存命中率（0-1 比率 · `message.complete` 事件顶层 `cache_hit_rate` 透传）·
+   *  缺省 = 不显示「累计」（不臆造 0）。 */
+  sessionCacheHitRate?: number | null
   /** complete 事件透传：上下文已用 tokens（**快照口径** · 协议分派） */
   contextTokensUsed?: number | null
   /** complete 事件透传：**窗口相对**剩余百分比（快照口径 · 与 token_warning 的阈值相对口径不同源） */
@@ -1363,6 +1453,13 @@ export interface MessageCompleteEvent extends StreamEventBase {
   total_cost_usd?: number | null
   /** 按模型 usage 快照（会话累计 · camelCase） */
   modelUsage?: Record<string, ModelUsageEntry> | null
+  /** [V101] 会话累计 tokens（**input+output，不含 cache** · 与 sessions 表 totalTokens 同口径）·
+   *  前端据此更新底部「累计 tokens」——⛔ 不再自行对 modelUsage 求和（本地拼装 ≠ 记账口径）。
+   *  无数据（NON_NULL）时键省略 → 沿用本地已有值，不得臆造 0。 */
+  total_tokens?: number | null
+  /** [V101] 会话累计缓存命中率（**0-1 比率** · 逐模型桶按各自协议判定后 Σ命中/Σ分母）·
+   *  无数据时键省略 → 不渲染（不臆造 0）。 */
+  cache_hit_rate?: number | null
   /** 本轮耗时（Java turn 墙钟近似 · 仅展示） */
   duration_ms?: number | null
   /** 本轮轮数 */
@@ -1399,6 +1496,9 @@ export interface MessageUsageEvent extends StreamEventBase {
   contextTokensUsed?: number | null
   /** **窗口相对**剩余百分比（0-100 · 无 usage 时省略 · 负数 clamp 0） */
   percentLeft?: number | null
+  /** [V101] 该条 assistant 消息**自身**的缓存命中率（**0-1 比率** · 后端协议分派单点）·
+   *  无数据（NON_NULL）时键被省略 → 展示侧不渲染，⛔ 不臆造 0。 */
+  cache_hit_rate?: number | null
 }
 export interface MessageErrorEvent extends StreamEventBase {
   type: 'message.error'

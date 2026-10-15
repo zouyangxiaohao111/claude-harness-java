@@ -235,7 +235,7 @@ export function DialogOpsModal({
         .dops-backdrop {
           position: fixed;
           inset: 0;
-          background: rgba(20, 20, 19, 0.32);
+          background: rgba(20,24,31, 0.32);
           backdrop-filter: blur(4px);
           z-index: 500;
           display: flex;
@@ -300,9 +300,9 @@ export function DialogOpsModal({
         }
         .dops-tab:hover { color: var(--ink); background: var(--surface-2); }
         .dops-tab.active {
-          color: #FF7A3D;
+          color: #0f5fd4;
           background: var(--accent-soft);
-          border-color: rgba(255, 122, 61, 0.4);
+          border-color: rgba(15,95,212, 0.4);
         }
         .dops-body {
           margin-top: 14px;
@@ -360,14 +360,14 @@ export function DialogOpsModal({
         .ms-item:hover, .trim-item:hover { background: var(--surface-1); color: var(--ink); }
         .ms-item.active, .trim-item.active {
           background: var(--accent-soft);
-          border-color: #FF7A3D;
+          border-color: #0f5fd4;
           color: var(--ink);
         }
         .ms-item .ms-role, .trim-item .trim-role {
           flex-shrink: 0;
           font-size: 11px;
           font-weight: 600;
-          color: #FF7A3D;
+          color: #0f5fd4;
           min-width: 30px;
         }
         .ms-item .ms-text, .trim-item .trim-text {
@@ -379,7 +379,7 @@ export function DialogOpsModal({
         .ms-dir { margin-top: 10px; font-size: 12.5px; color: var(--ink-muted); }
         .ms-dir-title { font-weight: 600; color: var(--ink); margin-bottom: 8px; font-size: 13px; }
         .ms-dir-opt { display: flex !important; align-items: flex-start !important; gap: 8px !important; padding: 6px 0; cursor: pointer; }
-        .ms-dir-opt input { margin-top: 2px; accent-color: #FF7A3D; }
+        .ms-dir-opt input { margin-top: 2px; accent-color: #0f5fd4; }
         .ms-dir-opt > span { display: flex; flex-direction: column; gap: 2px; }
         .ms-dir-opt b { color: var(--ink); font-weight: 600; }
         .ms-dir-desc { font-size: 11.5px; color: var(--ink-muted); line-height: 1.5; }
@@ -393,7 +393,7 @@ export function DialogOpsModal({
           font-weight: 700;
           color: var(--ink);
         }
-        .trim-head .trim-warn-icon { color: #FF7A3D; font-size: 16px; }
+        .trim-head .trim-warn-icon { color: #0f5fd4; font-size: 16px; }
         .trim-hint {
           margin-top: 8px;
           font-size: 12.5px;
@@ -430,7 +430,7 @@ export function DialogOpsModal({
         .trim-preview-title {
           font-size: 12px;
           font-weight: 700;
-          color: #FF7A3D;
+          color: #0f5fd4;
           margin-bottom: 6px;
         }
         .trim-preview-row {
@@ -441,7 +441,7 @@ export function DialogOpsModal({
           color: var(--ink-muted);
           overflow: hidden;
         }
-        .trim-preview-row .trim-role { color: #FF7A3D; font-size: 11px; font-weight: 600; flex-shrink: 0; }
+        .trim-preview-row .trim-role { color: #0f5fd4; font-size: 11px; font-weight: 600; flex-shrink: 0; }
         .trim-preview-row .trim-text {
           overflow: hidden;
           text-overflow: ellipsis;
@@ -470,7 +470,7 @@ export function DialogOpsModal({
         }
         .ms-cancel:hover, .trim-cancel:hover { border-color: var(--ink-muted); color: var(--ink); }
         .ms-confirm, .trim-confirm {
-          background: linear-gradient(135deg, #FF9A5C 0%, #FF7A3D 55%, #E65C00 100%);
+          background: linear-gradient(135deg, #2672d8 0%, #0f5fd4 55%, #0a49a8 100%);
           color: #fff;
           border: none;
           padding: 8px 18px;
@@ -478,10 +478,10 @@ export function DialogOpsModal({
           font-size: 13px;
           font-weight: 600;
           cursor: pointer;
-          box-shadow: 0 4px 12px rgba(255, 122, 61, 0.2);
+          box-shadow: 0 4px 12px rgba(15,95,212, 0.2);
           transition: all 0.15s var(--ease);
         }
-        .ms-confirm:hover, .trim-confirm:hover { background: #E65C00; transform: translateY(-1px); }
+        .ms-confirm:hover, .trim-confirm:hover { background: #0a49a8; transform: translateY(-1px); }
         .ms-confirm:disabled, .trim-confirm:disabled { opacity: 0.5; cursor: not-allowed; transform: none; box-shadow: none; }
         .ms-cancel kbd, .trim-cancel kbd, .ms-confirm kbd, .trim-confirm kbd {
           font-family: var(--font-mono);

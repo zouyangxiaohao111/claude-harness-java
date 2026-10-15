@@ -145,8 +145,8 @@ export function LaunchGate({ children }: LaunchGateProps) {
       <div className="cl-stage">
         <div className="cl-errCard" role="alert">
           <svg className="cl-errIcon" viewBox="0 0 24 24" fill="none" aria-hidden="true">
-            <circle cx="12" cy="12" r="10" fill="#FF7A3D" opacity="0.14" />
-            <path d="M12 7v6M12 16.5v.01" stroke="#E65C00" strokeWidth="2" strokeLinecap="round" />
+            <circle cx="12" cy="12" r="10" fill="#0f5fd4" opacity="0.14" />
+            <path d="M12 7v6M12 16.5v.01" stroke="#0a49a8" strokeWidth="2" strokeLinecap="round" />
           </svg>
           <div className="cl-errTitle">本地引擎未能启动</div>
           <div className="cl-errMsg">{errorMsg}</div>

@@ -37,7 +37,7 @@ function CloseIcon() {
 /**
  * CLAUDE.md 外部 include 审批弹窗（功能3）。
  * 结构对齐设计稿：overlay / modal / icon(📄) / title / desc / file-list(file-item) / btn-group(btn-reject · btn-allow)。
- * 底部按钮：拒绝灰底、确认允许橙渐变 #FF7A3D。
+ * 底部按钮：拒绝灰底、确认允许橙渐变 #0f5fd4。
  * 提交走 POST /api/v1/claude-md/include-approval；失败 fail loud（ApiError.userMessage() 内联展示，弹窗不关闭）。
  */
 export function IncludeApprovalModal({ files, sessionId, onApprove, onClose }: IncludeApprovalModalProps) {

@@ -10,10 +10,10 @@
 import type { SVGProps } from 'react'
 
 /** 橙猫主色（v7 --cat1） */
-export const CAT_BODY_COLOR = '#FF7A3D'
+export const CAT_BODY_COLOR = '#0f5fd4'
 
 /** 尾巴深橙（v7 --cat2） */
-export const CAT_TAIL_COLOR = '#E65C00'
+export const CAT_TAIL_COLOR = '#0a49a8'
 
 /** 橙猫 body（含双耳圆身）· 尺寸交给 className 控制（loader 用宽 ~74px） */
 export function CatArtBody(props: SVGProps<SVGSVGElement>) {

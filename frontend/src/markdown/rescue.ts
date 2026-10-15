@@ -393,7 +393,7 @@ function splitPoints(line: string, hashes: number): number[] {
   // 2) 围栏：``` 前拆
   const f = body.indexOf('```')
   if (f >= 0) pts.push(hashes + f)
-  // 3) 行内第二标题号：# 后不跟 [A-Za-z0-9]（排除 #FF7A45 / #include 这类）、不在行内代码内
+  // 3) 行内第二标题号：# 后不跟 [A-Za-z0-9]（排除 #0f5fd4 / #include 这类）、不在行内代码内
   const h2 = /#{1,6}(?!#)(?=[^\s\d#])/.exec(body)
   if (h2 !== null) {
     const after = body[h2.index + h2[0].length] ?? ''

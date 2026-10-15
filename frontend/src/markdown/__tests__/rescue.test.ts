@@ -337,11 +337,11 @@ describe('rescue · P1.5 拆行抢救（判据来自全库评估原型；语料�
 })
 
 describe('rescue · P1.5 误拆防护（原型约束：不拆不该拆的）', () => {
-  it('颜色值 `#FF7A45`（# 后跟字母数字）不是第二个标题号 → 不拆', () => {
-    const short = '##这版基准 `#FF7A45`/`#F97316` 亮橙\n'
+  it('颜色值 `#0f5fd4`（# 后跟字母数字）不是第二个标题号 → 不拆', () => {
+    const short = '##这版基准 `#0f5fd4`/`#0a49a8` 亮橙\n'
     expect(passGlue(short).src).toBe(short)
     // 真库 msg 36e9e71b 原行（长、含 ** 与多处颜色值）
-    const real = '##这版的基准是你给的文件**视觉100%沿用你的 `场景选择中心-mock.html`**：`#FF7A45`/`#F97316`亮橙、`#FAF7F1`米白侧栏、`#FDFBF7`画布、三列场景卡、圆角14px、hover上浮。我没有自造任何配色。\n'
+    const real = '##这版的基准是你给的文件**视觉100%沿用你的 `场景选择中心-mock.html`**：`#0f5fd4`/`#0a49a8`亮橙、`#eff5fe`米白侧栏、`#f7faff`画布、三列场景卡、圆角14px、hover上浮。我没有自造任何配色。\n'
     expect(passGlue(real).src).toBe(real)
   })
 

@@ -30,7 +30,8 @@ import type { SessionAgentUsage, SessionUsageResponse } from '@/api/types'
  *   <li>把回退分支删掉（恒用记账文本，无数据时渲染空/0）→ 「无关联回退」与「老后端」用例红；</li>
  *   <li>`ledgerOnlyAgents` 丢掉 `depth >= 1` 过滤 → 「主 agent 不得出现」红；</li>
  *   <li>不做去重 → 「已在实时身份里的节点不得重复」红；</li>
- *   <li>把仅记账行的名称换回类型名（`usageNodeName`）→ 「显示子代理名称」用例红。</li>
+ *   <li>把仅记账行的名称改成「类别 · 用途」（即删掉 `AGENT_NAME_FIRST` 名称优先分支）→
+ *       「回退子代理名称」用例红（行首又变成一排「子代理 ·」）。</li>
  * </ul>
  */
 
@@ -175,7 +176,7 @@ describe('[usage-gateway] 用量页 · 子代理行接记账数据', () => {
     expect(text).toContain('¥0.30 · 330 tokens · 1 次模型调用')
   })
 
-  it('任务已出注册表（重启/淘汰）→ 回退「类别 · 用途」中文（不得显示空白或 id）', async () => {
+  it('任务已出注册表（重启/淘汰）→ 回退**子代理名称**（label 中文），不得显示空白或 id', async () => {
     hoisted.usage = usagePayload([
       agentNode({ agentId: 'a48afc67b6604cf17', taskId: '48afc67b-6604-cf17-0000-000000000000',
         category: 'SUBAGENT', label: 'general-purpose' }),
@@ -184,7 +185,9 @@ describe('[usage-gateway] 用量页 · 子代理行接记账数据', () => {
     await mount()
 
     const text = container.textContent ?? ''
-    expect(text).toContain('子代理 · 通用型')
+    // [修复] 子代理行名 = 子代理名称（不再以「子代理 ·」开头 —— 一排同前缀读不出是谁）
+    expect(text).toContain('通用型')
+    expect(text).not.toContain('子代理 · 通用型')
     expect(text).not.toMatch(/[0-9a-f]{8}-[0-9a-f]{4}/)
   })
 
@@ -217,9 +220,10 @@ describe('[usage-gateway] 用量页 · 子代理行接记账数据', () => {
     await mount()
 
     const text = container.textContent ?? ''
-    // 仅记账节点列出：名称 = 「类别 · 用途」中文（label 未映射 → 原样），用量紧随其后；
+    // 仅记账节点列出：名称 = **子代理名称**（label 未映射 → 原样），用量紧随其后；
     // ⛔ 不显示「运行中/已完成」（本端不知道实时状态）
-    expect(text).toContain('子代理 · bob')
+    expect(text).toContain('bob')
+    expect(text).not.toContain('子代理 · bob')
     expect(text).toContain('¥0.50 · 220 tokens · 2 次模型调用')
     expect(text).not.toContain('已完成')
     // 已关联的节点不重复：@alice 只出现一次

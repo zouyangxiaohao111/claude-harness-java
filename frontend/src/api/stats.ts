@@ -3,7 +3,10 @@ import type { StatsResponse } from './types'
 
 /**
  * 用量统计 API（S3 · GET /api/v1/stats）
- * 后端 StatsController：全量聚合 totals + 按天 byDay + 按模型 byModel。
+ * [V101] 后端读侧重构：数据源 = `llm_usage_calls` 明细表（唯一真源，聚合下推 SQL，无 rollup 表）。
+ * 响应 = `range`（本次查询区间）+ `totals`（含成本分项/缓存节省/命中率 + LEGACY 历史行单列）+
+ * `byDay`（按调用发生日）+ `byModel`（totalTokens/costYuan/分项/cacheHitRate）+ byCategory/byAgent。
+ * 端点支持 `?from=&to=` 区间过滤（本页当前只取全量，`range` 供展示/对账）。
  * 失败抛 ApiError，由调用方（UsageCostModal「统计」标签页）自行容错。
  */
 export const statsApi = {

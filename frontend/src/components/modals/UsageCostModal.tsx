@@ -4,7 +4,7 @@ import { resolveCtxInfo } from '@/utils/contextUsage'
 import { sessionApi } from '@/api/sessions'
 import { tasksApi, type BackgroundTaskDto } from '@/api/tasks'
 import { statsApi } from '@/api/stats'
-import type { ChatMessageDto, SessionAgentUsage, SessionUsageResponse, StatsByModel, StatsResponse } from '@/api/types'
+import type { ChatMessageDto, SessionAgentUsage, SessionUsageResponse, StatsByAgent, StatsResponse } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { failureReasonOf, subagentListOfSession, useSubagentStore } from '@/stores/subagentStore'
 import { SUBAGENT_STATUS_LABEL, formatSubagentStat } from '@/utils/subagentStats'
@@ -12,12 +12,9 @@ import { SUBAGENT_STATUS_LABEL, formatSubagentStat } from '@/utils/subagentStats
 /** 千位以上紧凑显示（按模型明细/上下文条用 · 对齐 ContextAnalyzeModal fmt） */
 const fmt = (n: number) => (n >= 1000 ? `${(n / 1000).toFixed(1)}k` : String(n))
 
-/** byModel 行 token 总计 · 按 provider 分派（后端 byModel 每行 anthropic 标志）：
- *  anthropic（claude）4 项和（input 不含 cache hit）；deepseek（openai 协议）input 已含 cache hit，
- *  只能 input+output，4 项和会双计 cache。 */
-const modelRowTotal = (r: StatsByModel) => r.anthropic
-  ? r.inputTokens + r.outputTokens + r.cacheReadInputTokens + r.cacheCreationInputTokens
-  : r.inputTokens + r.outputTokens
+// [V101] 原 `modelRowTotal`（按后端 anthropic 标志在「4 项和 / input+output」之间分派）已删除：
+//   token 合计由后端 byModel.totalTokens 给出（算法单点在 ContextUsageCalculator），前端不再自行分派，
+//   金额同理改用 byModel.costYuan（旧 costUSD 字段已从契约删除）。
 
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
@@ -41,11 +38,17 @@ const CATEGORY_LABEL: Record<string, string> = {
 
 /**
  * 归属标签（后端 label）→ 中文用途名。**只覆盖本仓自己生成的 slug**（旁路用途名 / 压缩标签 /
- * 内置 agent 类型名）；用户自定义的子代理名（中文或英文）与未知新标签**原样显示**（不吞、不猜）。
+ * 回落档的 agent 类型名）；用户自定义的子代理名（中文或英文，即任务名）与未知新标签
+ * **原样显示**（不吞、不猜）。
  *
  * <p>WHY 需要它：`按代理层级` 里 `general-purpose` / `compact-fork` / `skill-catalog-summary`
  * 这类 slug 用户看不出含义（实测反馈「名称人类不可读」）。类别维度已有 {@link CATEGORY_LABEL}，
  * 本表只补「具体用途」这一层；渲染统一走 {@link usageNodeName}（类别 · 用途）。
+ *
+ * <p><b>子代理行的主流形态是「任务名」而非本表</b>：后端 {@code label} 对子代理/fork/队友节点已改为
+ * **该次任务的名称**（CC AgentTool {@code description}，与任务注册表同源），中文任务名在本表**没有条目
+ * ⇒ 原样显示**（这正是想要的效果）。本表里 {@code general-purpose} / {@code Explore} / {@code Plan}
+ * 等条目只在**取不到任务名**的回落档（teammate / fork-skill / workflow 路径）才会命中。
  *
  * <p>维护：后端新增 label 字面量时在此补一行即可；漏补只会退回原样 slug，不会显示错误含义。
  */
@@ -83,15 +86,73 @@ const LABEL_GLOSS: Record<string, string> = {
   'yolo-classifier-stage': '判定',
 }
 
+/** 子代理 / 队友节点：行名**名称优先**（用户裁定）。
+ *  WHY：这两类的 label 恒为 **agent 名**（后端 label = subagentName），「子代理 · 通用型」把类别
+ *  顶在行首，用户扫一眼只能看到一排「子代理 ·」、读不出**是哪个**子代理；而「旁路调用 · 会话标题生成」
+ *  这类 label 是用途 slug，脱离类别读不懂 ⇒ 只对这两类改成名称优先，其余保持「类别 · 用途」。 */
+const AGENT_NAME_FIRST: Record<string, true> = { SUBAGENT: true, TEAMMATE: true }
+
 /**
- * 节点可读名称：{@code 类别中文名 ·（用途中文名 | 原样 label）}；无 label → 只给类别名。
+ * 节点可读名称：子代理/队友 → {@code（用途中文名 | 原样 label）}；其余 →
+ * {@code 类别中文名 ·（用途中文名 | 原样 label）}；无 label → 只给类别名。
  * 类别与用途同义时（如 label 恰为类别名）不重复拼接。
  */
 const usageNodeName = (category: string, label: string | null) => {
   const cat = CATEGORY_LABEL[category] ?? category
   if (!label) return cat
   const gloss = LABEL_GLOSS[label] ?? label
-  return gloss === cat ? cat : `${cat} · ${gloss}`
+  if (gloss === cat) return cat
+  return AGENT_NAME_FIRST[category] === true ? gloss : `${cat} · ${gloss}`
+}
+
+/**
+ * [修复 · 按代理层级树] `byAgent` → **深度优先的树序**（真正的父子结构）。
+ *
+ * <h2>WHY（用户实测的缺陷）</h2>
+ * 全局统计把**所有会话**的 agent 混在一张 `byAgent` 里；后端按 `depth` 升序返回（父在前），
+ * 而渲染端此前只做 `paddingLeft: depth * 10` 缩进 ⇒ 所有主会话排前面、所有子代理排后面，
+ * **每个子代理看起来都挂在最后一个主会话下面**（用户实测：「其他主会话派生的子请求始终挂在
+ * 最后一个主会话之下」）。缩进不能代替结构 —— 必须按 `parentAgentId` 建树再前序展开。
+ *
+ * <h2>边界</h2>
+ * <ul>
+ *   <li>父不在本列表（该父在本区间内一次调用都没有）→ 该节点当**根**（缩进 0），
+ *       ⛔ 不挂到无关节点下（挂错父比不缩进更误导）；</li>
+ *   <li>自环（parent == self）/ 环 → `visited` 兜断，且**兜断后仍要出现**（否则等于静默丢数据）；</li>
+ *   <li>同层按金额降序（后端同层顺序是 SQL 分组序，不确定 ⇒ 前端定序，保证稳定可读）。</li>
+ * </ul>
+ *
+ * @param rows 后端 `byAgent`（任意顺序）
+ * @returns 前序展开的 `{row, treeDepth}`（`treeDepth` 由树结构算出，**不用后端 depth** ——
+ *          父缺失被提为根时后端 depth 仍写着 1，照抄会缩进出一个不存在的父）
+ */
+function buildAgentTree(rows: StatsByAgent[]): { row: StatsByAgent; treeDepth: number }[] {
+  const byId = new Map<string, StatsByAgent>()
+  for (const r of rows) byId.set(r.agentId, r)
+  const children = new Map<string, StatsByAgent[]>()
+  const roots: StatsByAgent[] = []
+  for (const r of rows) {
+    const pid = r.parentAgentId
+    if (pid != null && pid !== r.agentId && byId.has(pid)) {
+      const bucket = children.get(pid)
+      if (bucket) bucket.push(r)
+      else children.set(pid, [r])
+    } else {
+      roots.push(r)
+    }
+  }
+  const out: { row: StatsByAgent; treeDepth: number }[] = []
+  const visited = new Set<string>()
+  const visit = (r: StatsByAgent, depth: number) => {
+    if (visited.has(r.agentId)) return
+    visited.add(r.agentId)
+    out.push({ row: r, treeDepth: depth })
+    const kids = children.get(r.agentId)
+    if (kids) for (const k of [...kids].sort((a, b) => b.costYuan - a.costYuan)) visit(k, depth + 1)
+  }
+  for (const r of [...roots].sort((a, b) => b.costYuan - a.costYuan)) visit(r, 0)
+  for (const r of rows) if (!visited.has(r.agentId)) visit(r, 0)
+  return out
 }
 
 /** 质量标志小字（估算/中断/失败 · 仅列出 >0 的项；全 0 → 空串，不渲染那行）。
@@ -117,8 +178,11 @@ const ledgerUsageText = (a: SessionAgentUsage) => {
 
 /**
  * F1/S3 · 「统计」标签页内容（GET /api/v1/stats 全量聚合 · 只读展示）
- * 总览卡片（会话数/tokens/金额）+ 按天条形图（date · token 相对比例）+ 按模型条形图
- * （model · input/output/cache 拆解 · 纯 CSS div 宽度百分比，无图表库）。
+ * 总览卡片（会话数/tokens/金额）+ [V101] 缓存卡（节省金额/命中率）+ [V101] 成本分解
+ * （输入/输出/缓存读/缓存写 · 不可分项单列）+ 按调用发生日条形图（date · token 相对比例）+
+ * 按模型条形图（model · input/output/cache 拆解 · 纯 CSS div 宽度百分比，无图表库）。
+ * [V101] 数据源 = `llm_usage_calls` 明细表（唯一真源）；token 合计/金额/命中率一律用后端值，
+ * 前端不再按 provider 协议做四则运算；缺值（null / 0）不渲染，⛔ 不臆造 0。
  * 打开时拉取；loading 占位 / 失败显示重试按钮（不阻塞用量标签页）。
  */
 function StatsSection() {
@@ -156,25 +220,31 @@ function StatsSection() {
   // byCategory/byAgent 是后加的维度：老后端不返回 → 空列表（不炸整个统计页）
   const { totals, byDay, byModel, byCategory = [], byAgent = [] } = data
   const maxDayTokens = byDay.reduce((m, d) => Math.max(m, d.tokenCount), 0)
-  const maxModelTokens = byModel.reduce((m, r) => Math.max(m, modelRowTotal(r)), 0)
+  // [V101] 按模型 token 合计 = 后端 totalTokens（协议分派已上收后端）；金额 = costYuan（元）
+  const maxModelTokens = byModel.reduce((m, r) => Math.max(m, r.totalTokens), 0)
+  // [V101] 成本分项四分量（元）：全 0（未配价 / 全是 V101 前历史行）→ 整块不渲染（不摆一排 ¥0.00）
+  const breakdownTotal = totals.costInput + totals.costOutput + totals.costCacheRead + totals.costCacheWrite
   // [usage-gateway] 明细两维度的条形按**金额**取比例（问题是「谁烧钱」而非「谁 token 多」）·
   //   全 0 金额（未配价）→ max=0 → barPct 返回 0，不显示条（不伪造比例）。
   const maxCategoryCost = byCategory.reduce((m, r) => Math.max(m, r.costYuan), 0)
   const maxAgentCost = byAgent.reduce((m, r) => Math.max(m, r.costYuan), 0)
-  // 层级行显示名 = 「类别 · 用途」中文；同类同用途有多个节点时追加序号（1/2/3…）区分
+  // 层级行 = **按 parentAgentId 建树后的前序序**（缩进由树结构给出，见 buildAgentTree 的 WHY：
+  //   按后端 depth 升序 + 纯缩进会让所有子代理看起来挂在最后一个主会话下）。
+  // 显示名 = 「类别 · 用途」中文（子代理/队友为**名称优先**）；同类同名多节点加序号（1/2/3…）区分
   //   —— ⛔ 不用 agentId / UUID（对用户无意义）。
+  const agentTree = buildAgentTree(byAgent)
   const agentNameTotals = new Map<string, number>()
-  for (const r of byAgent) {
+  for (const { row: r } of agentTree) {
     const k = `${r.category}|${r.label ?? ''}`
     agentNameTotals.set(k, (agentNameTotals.get(k) ?? 0) + 1)
   }
   const agentNameSeen = new Map<string, number>()
-  const agentDisplayRows = byAgent.map((r) => {
+  const agentDisplayRows = agentTree.map(({ row: r, treeDepth }) => {
     const k = `${r.category}|${r.label ?? ''}`
     const idx = (agentNameSeen.get(k) ?? 0) + 1
     agentNameSeen.set(k, idx)
     const suffix = (agentNameTotals.get(k) ?? 1) > 1 ? `（${idx}）` : ''
-    return { row: r, name: usageNodeName(r.category, r.label) + suffix }
+    return { row: r, treeDepth, name: usageNodeName(r.category, r.label) + suffix }
   })
 
   return (
@@ -196,9 +266,73 @@ function StatsSection() {
         </div>
       </div>
 
-      {/* 按天：date + token 相对比例条形图 + 金额 */}
+      {/* [V101] 缓存维度（后端权威值）：省了多少钱 + 命中率（0-1 比率 → 整数百分比）。
+          判定：cacheSavingsYuan 恒有值（0 = 没省到 → 不摆卡）；cacheHitRate 分母为 0 时后端给 null → 不渲染
+          （⛔ 缺值不臆造 0 · 仓内约定见 utils/subagentStats.ts:14）。 */}
+      {(totals.cacheSavingsYuan > 0 || totals.cacheHitRate != null) && (
+        <div className="uc-stats-overview">
+          {totals.cacheSavingsYuan > 0 && (
+            <div className="uc-stats-card">
+              <span className="uc-stats-card-value uc-stats-savings">¥{totals.cacheSavingsYuan.toFixed(2)}</span>
+              <span className="uc-stats-card-label">缓存节省</span>
+            </div>
+          )}
+          {totals.cacheHitRate != null && (
+            <div className="uc-stats-card">
+              <span className="uc-stats-card-value">{Math.round(totals.cacheHitRate * 100)}%</span>
+              <span className="uc-stats-card-label">缓存命中率</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* [V101] 成本分解：输入 / 输出 / 缓存读 / 缓存写 四分量（元 · 后端分项，和 == 总金额）。
+          四分量全 0（未配价 / 全是 V101 前历史行）→ 不渲染该块；历史行（分项列为 NULL 的 LEGACY 行）
+          单列一行呈现，**不摊分、不伪造**，有值才显示。 */}
+      {(breakdownTotal > 0 || totals.legacyCostYuan > 0) && (
+        <div className="uc-section">
+          <div className="uc-sub-title">成本分解</div>
+          {breakdownTotal > 0 && (
+            <>
+              {totals.costInput > 0 && (
+                <div className="uc-row">
+                  <span className="uc-name">输入</span>
+                  <span className="uc-tokens">¥{totals.costInput.toFixed(2)}</span>
+                </div>
+              )}
+              {totals.costOutput > 0 && (
+                <div className="uc-row">
+                  <span className="uc-name">输出</span>
+                  <span className="uc-tokens">¥{totals.costOutput.toFixed(2)}</span>
+                </div>
+              )}
+              {totals.costCacheRead > 0 && (
+                <div className="uc-row">
+                  <span className="uc-name">缓存读</span>
+                  <span className="uc-tokens">¥{totals.costCacheRead.toFixed(2)}</span>
+                </div>
+              )}
+              {totals.costCacheWrite > 0 && (
+                <div className="uc-row">
+                  <span className="uc-name">缓存写</span>
+                  <span className="uc-tokens">¥{totals.costCacheWrite.toFixed(2)}</span>
+                </div>
+              )}
+            </>
+          )}
+          {totals.legacyCostYuan > 0 && (
+            <div className="uc-row">
+              <span className="uc-name">不可分项（V101 前历史行）</span>
+              <span className="uc-tokens">¥{totals.legacyCostYuan.toFixed(2)} · {totals.legacyCalls} 次</span>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* 按调用发生日：date + token 相对比例条形图 + 金额（[V101] 归组口径 = started_at 的本地日期，
+          与会话创建日无关；区间过滤同源） */}
       <div className="uc-section">
-        <div className="uc-section-title">按天</div>
+        <div className="uc-section-title">按调用发生日</div>
         {byDay.length === 0 && <div className="uc-muted">暂无数据</div>}
         {byDay.map((d) => (
           <div key={d.date} className="uc-stats-bar-row">
@@ -213,31 +347,30 @@ function StatsSection() {
         ))}
       </div>
 
-      {/* 按模型：model + input/output/cache 拆解 + 金额（token 相对比例条形图） */}
+      {/* 按模型：model + input/output/cache 拆解 + 金额（token 相对比例条形图）·
+          [V101] token 合计/金额/命中率全部用后端值（totalTokens / costYuan / cacheHitRate）。 */}
       <div className="uc-section">
         <div className="uc-section-title">按模型</div>
         {byModel.length === 0 && <div className="uc-muted">暂无数据</div>}
-        {byModel.map((r) => {
-          const total = modelRowTotal(r)
-          return (
-            <div key={r.model} className="uc-stats-model">
-              <div className="uc-stats-bar-row">
-                <span className="uc-stats-bar-label uc-stats-model-name" title={r.model}>{r.model}</span>
-                <div className="uc-stats-bar">
-                  <div className="uc-stats-bar-track">
-                    <div className="uc-stats-bar-fill" style={{ width: `${barPct(total, maxModelTokens)}%` }} />
-                  </div>
-                  <span className="uc-stats-bar-val">{fmt(total)} tok · ¥{r.costUSD.toFixed(2)}</span>
+        {byModel.map((r) => (
+          <div key={r.model} className="uc-stats-model">
+            <div className="uc-stats-bar-row">
+              <span className="uc-stats-bar-label uc-stats-model-name" title={r.model}>{r.model}</span>
+              <div className="uc-stats-bar">
+                <div className="uc-stats-bar-track">
+                  <div className="uc-stats-bar-fill" style={{ width: `${barPct(r.totalTokens, maxModelTokens)}%` }} />
                 </div>
-              </div>
-              <div className="uc-stats-model-detail">
-                in {fmt(r.inputTokens)} · out {fmt(r.outputTokens)}
-                {r.cacheReadInputTokens > 0 && ` · cache读 ${fmt(r.cacheReadInputTokens)}`}
-                {r.cacheCreationInputTokens > 0 && ` · cache写 ${fmt(r.cacheCreationInputTokens)}`}
+                <span className="uc-stats-bar-val">{fmt(r.totalTokens)} tok · ¥{r.costYuan.toFixed(2)}</span>
               </div>
             </div>
-          )
-        })}
+            <div className="uc-stats-model-detail">
+              in {fmt(r.inputTokens)} · out {fmt(r.outputTokens)}
+              {r.cacheReadInputTokens > 0 && ` · cache读 ${fmt(r.cacheReadInputTokens)}`}
+              {r.cacheCreationInputTokens > 0 && ` · cache写 ${fmt(r.cacheCreationInputTokens)}`}
+              {r.cacheHitRate != null && ` · 缓存命中 ${Math.round(r.cacheHitRate * 100)}%`}
+            </div>
+          </div>
+        ))}
       </div>
 
       {/* [usage-gateway] 按调用类型：**哪类调用烧钱**（llm_usage_calls 每 call 明细聚合 ·
@@ -274,14 +407,14 @@ function StatsSection() {
       <div className="uc-section">
         <div className="uc-section-title">按代理层级</div>
         {byAgent.length === 0 && <div className="uc-muted">暂无明细数据</div>}
-        {agentDisplayRows.map(({ row: r, name }) => {
+        {agentDisplayRows.map(({ row: r, treeDepth, name }) => {
           const flags = usageFlagsText(r)
           return (
             <div key={r.agentId} className="uc-stats-model">
               <div className="uc-stats-bar-row">
                 <span
                   className="uc-stats-bar-label uc-stats-tree-label"
-                  style={{ paddingLeft: r.depth * 10 }}
+                  style={{ paddingLeft: treeDepth * 10 }}
                   title={`${CATEGORY_LABEL[r.category] ?? r.category}${r.label ? ` · ${r.label}` : ''}`}
                 >
                   {name}

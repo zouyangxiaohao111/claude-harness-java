@@ -23,10 +23,10 @@ export function CatLoader() {
 
         {/* 4 条横线（去竖线）模拟墙 · 浅暖灰 */}
         <svg className="cl-wall" viewBox="0 0 500 126" aria-hidden="true">
-          <line stroke="#D8CDBA" strokeWidth="7" x1="50" y1="3" x2="450" y2="3" />
-          <line stroke="#D8CDBA" strokeWidth="7" x1="100" y1="85" x2="400" y2="85" />
-          <line stroke="#D8CDBA" strokeWidth="7" x1="125" y1="122" x2="375" y2="122" />
-          <line stroke="#D8CDBA" strokeWidth="7" x1="0" y1="43" x2="500" y2="43" />
+          <line stroke="#c6d2e0" strokeWidth="7" x1="50" y1="3" x2="450" y2="3" />
+          <line stroke="#c6d2e0" strokeWidth="7" x1="100" y1="85" x2="400" y2="85" />
+          <line stroke="#c6d2e0" strokeWidth="7" x1="125" y1="122" x2="375" y2="122" />
+          <line stroke="#c6d2e0" strokeWidth="7" x1="0" y1="43" x2="500" y2="43" />
         </svg>
 
         <div className="cl-boot">

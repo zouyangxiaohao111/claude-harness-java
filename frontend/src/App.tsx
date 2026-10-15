@@ -1994,7 +1994,6 @@ function App() {
             boundProjectId={activeSession.mainProjectId}
             onSelectProject={() => void handleSelectProjectFolder()}
             currentModel={activeSession.modelName ?? ''}
-            providers={providersApi.list}
             effortLevel={activeSession.effortLevel ?? 'high'}
             ultracodeEnabled={activeSession.ultracodeEnabled}
             bareMode={activeSession.bareMode}
@@ -2003,6 +2002,7 @@ function App() {
             onOpenEffort={() => setShowEffort(true)}
             sessionId={activeSessionId ?? ''}
             currentAgent={currentAgent}
+            onClearAgent={() => void handleAgentChange(null)}
             onOpenMarket={() => setShowMarket(true)}
             empty={storeMessages.length === 0 && !hasStream}
             onOpenUsageCost={() => setShowUsageCost(true)}
