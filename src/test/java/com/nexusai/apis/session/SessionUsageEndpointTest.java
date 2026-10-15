@@ -62,15 +62,19 @@ class SessionUsageEndpointTest {
 
     private static StatsService.SessionUsage sample() {
         StatsService.SessionUsageTotals totals = new StatsService.SessionUsageTotals(
-            3, 400, 40, 100, 0, 1.23, 700, 1, 1, 0, 3, 0);
+            3, 400, 40, 100, 0, 1.23, 700, 1, 1, 0, 3, 0,
+            // [cache-savings] 末尾 8 字段（分项费用 / 缓存节省 / 命中率 / LEGACY 行数）
+            0.5, 0.4, 0.2, 0.0, 2.0, 1.3, 0.25, 1);
         StatsService.CategoryStat cat = new StatsService.CategoryStat(
             "SUBAGENT", 3, 400, 40, 100, 0, 1.23, 1, 1, 0, 3, 0);
         StatsService.SessionAgentUsage main = new StatsService.SessionAgentUsage(
             SID, null, "MAIN", null, null, 0, null,
-            1, 100, 10, 0, 0, 1.0, 200, 0, 0, 0, 1, 0);
+            1, 100, 10, 0, 0, 1.0, 200, 0, 0, 0, 1, 0,
+            0.4, 0.3, 0.17, 0.0, 1.5, 0.63, 0.5, 1);
         StatsService.SessionAgentUsage child = new StatsService.SessionAgentUsage(
             "a0123456789abcdef", "01234567-89ab-cdef-0000-000000000000", "SUBAGENT", SID, null, 1, "alice",
-            2, 300, 30, 100, 0, 0.23, 500, 1, 1, 0, 2, 0);
+            2, 300, 30, 100, 0, 0.23, 500, 1, 1, 0, 2, 0,
+            0.1, 0.1, 0.03, 0.0, 0.5, 0.37, 0.75, 0);
         return new StatsService.SessionUsage(SID, totals, List.of(cat), List.of(main, child));
     }
 
@@ -95,6 +99,15 @@ class SessionUsageEndpointTest {
             .andExpect(jsonPath("$.totals.failedCalls").value(0))
             .andExpect(jsonPath("$.totals.streamCalls").value(3))
             .andExpect(jsonPath("$.totals.nonStreamCalls").value(0))
+            // [cache-savings] 分项费用 / 缓存节省 / 命中率 / LEGACY 行数（前端「缓存省了多少钱」直接上屏）
+            .andExpect(jsonPath("$.totals.costInput").value(0.5))
+            .andExpect(jsonPath("$.totals.costOutput").value(0.4))
+            .andExpect(jsonPath("$.totals.costCacheRead").value(0.2))
+            .andExpect(jsonPath("$.totals.costCacheWrite").value(0.0))
+            .andExpect(jsonPath("$.totals.costNoCacheInput").value(2.0))
+            .andExpect(jsonPath("$.totals.cacheSavingsYuan").value(1.3))
+            .andExpect(jsonPath("$.totals.cacheHitRate").value(0.25))
+            .andExpect(jsonPath("$.totals.legacyCalls").value(1))
             // byCategory（与统计页同一口径）
             .andExpect(jsonPath("$.byCategory[0].category").value("SUBAGENT"))
             .andExpect(jsonPath("$.byCategory[0].calls").value(3))
@@ -121,7 +134,16 @@ class SessionUsageEndpointTest {
             .andExpect(jsonPath("$.agents[1].abortedCalls").value(1))
             .andExpect(jsonPath("$.agents[1].failedCalls").value(0))
             .andExpect(jsonPath("$.agents[1].streamCalls").value(2))
-            .andExpect(jsonPath("$.agents[1].nonStreamCalls").value(0));
+            .andExpect(jsonPath("$.agents[1].nonStreamCalls").value(0))
+            // [cache-savings] 每个 agent 节点的分项/节省/命中率/LEGACY 行数（同 totals 八键，逐节点口径）
+            .andExpect(jsonPath("$.agents[1].costInput").value(0.1))
+            .andExpect(jsonPath("$.agents[1].costOutput").value(0.1))
+            .andExpect(jsonPath("$.agents[1].costCacheRead").value(0.03))
+            .andExpect(jsonPath("$.agents[1].costCacheWrite").value(0.0))
+            .andExpect(jsonPath("$.agents[1].costNoCacheInput").value(0.5))
+            .andExpect(jsonPath("$.agents[1].cacheSavingsYuan").value(0.37))
+            .andExpect(jsonPath("$.agents[1].cacheHitRate").value(0.75))
+            .andExpect(jsonPath("$.agents[1].legacyCalls").value(0));
     }
 
     @Test
@@ -138,7 +160,8 @@ class SessionUsageEndpointTest {
     @DisplayName("空会话（无明细）→ 200 + 空列表（fail-soft：前端弹窗不得因此显示加载失败）")
     void emptySessionIsOkWithEmptyLists() throws Exception {
         when(statsService.sessionUsage(SID)).thenReturn(new StatsService.SessionUsage(
-            SID, new StatsService.SessionUsageTotals(0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0),
+            SID, new StatsService.SessionUsageTotals(0, 0, 0, 0, 0, 0.0, 0, 0, 0, 0, 0, 0,
+                0.0, 0.0, 0.0, 0.0, 0.0, 0.0, null, 0),
             List.of(), List.of()));
 
         mockMvc.perform(get("/api/v1/sessions/{id}/usage", SID).accept(MediaType.APPLICATION_JSON))

@@ -60,12 +60,26 @@ public class MessageUsageEvent extends StreamEvent {
     private final long contextTokensUsed;
     /** 上下文余量百分比（0-100，Integer 可空）· null → NON_NULL 省略。 */
     private final Integer percentLeft;
+    /**
+     * [cache-savings] <b>该条 assistant 消息自己</b>的缓存命中率（0-1 比率，Double 可空）·
+     * null → NON_NULL 省略（前端按「不显示」处理）。
+     *
+     * <p><b>口径单点</b>：{@link com.nexusai.application.agent.cost.CacheHitRate#of}
+     * （anthropic → (input+cacheRead+cacheCreation) 为分母；非 anthropic → input（已含 cache hit）；
+     * 分母 0 → null，⛔ 不输出 NaN/Infinity）。
+     *
+     * <p><b>⛔ 与 complete 事件同名字段语义不同</b>：本字段 = <b>本条消息</b>的命中率；
+     * {@code MessageCompleteEvent.cache_hit_rate} = <b>会话累计</b>命中率（逐模型桶加总）。
+     * 二者不得互相冒充（前端分别用于「本条气泡」与「会话级统计」）。
+     */
+    @com.fasterxml.jackson.annotation.JsonProperty("cache_hit_rate")
+    private final Double cacheHitRate;
 
     public MessageUsageEvent(String sessionId, String userMessageId, String assistantMessageId,
                              MessageUsageDto usage, long contextWindow, long contextTokensUsed,
                              Integer percentLeft) {
         this(sessionId, userMessageId, assistantMessageId, usage, contextWindow, contextTokensUsed,
-            percentLeft, null);
+            percentLeft, null, null);
     }
 
     /**
@@ -76,6 +90,19 @@ public class MessageUsageEvent extends StreamEvent {
     public MessageUsageEvent(String sessionId, String userMessageId, String assistantMessageId,
                              MessageUsageDto usage, long contextWindow, long contextTokensUsed,
                              Integer percentLeft, String source) {
+        this(sessionId, userMessageId, assistantMessageId, usage, contextWindow, contextTokensUsed,
+            percentLeft, source, null);
+    }
+
+    /**
+     * [cache-savings] 全参构造器（additive；8 参重载保留 → 既有调用方零改动，净新增字段默认 null 省略）。
+     *
+     * @param source        来源标记（null = 不标记 → 字段省略）
+     * @param cacheHitRate  本条消息缓存命中率（0-1 比率；null = 无数据 → NON_NULL 省略）
+     */
+    public MessageUsageEvent(String sessionId, String userMessageId, String assistantMessageId,
+                             MessageUsageDto usage, long contextWindow, long contextTokensUsed,
+                             Integer percentLeft, String source, Double cacheHitRate) {
         super("message.usage", sessionId, userMessageId);
         this.assistantMessageId = assistantMessageId;
         this.usage = usage;
@@ -83,6 +110,7 @@ public class MessageUsageEvent extends StreamEvent {
         this.contextWindow = contextWindow;
         this.contextTokensUsed = contextTokensUsed;
         this.percentLeft = percentLeft;
+        this.cacheHitRate = cacheHitRate;
     }
 
     /**
@@ -113,7 +141,20 @@ public class MessageUsageEvent extends StreamEvent {
                                        MessageUsageDto usage, long contextWindow, long contextTokensUsed,
                                        Integer percentLeft, String source) {
         return new MessageUsageEvent(sessionId, userMessageId, assistantMessageId,
-            usage, contextWindow, contextTokensUsed, percentLeft, source);
+            usage, contextWindow, contextTokensUsed, percentLeft, source, null);
+    }
+
+    /**
+     * [cache-savings] 带来源 + 命中率的静态工厂（additive · 8 参重载保留）。
+     *
+     * @param source        来源标记（null → 不标记，字段省略）
+     * @param cacheHitRate  本条消息缓存命中率（0-1 比率；null → NON_NULL 省略）
+     */
+    public static MessageUsageEvent of(String sessionId, String userMessageId, String assistantMessageId,
+                                       MessageUsageDto usage, long contextWindow, long contextTokensUsed,
+                                       Integer percentLeft, String source, Double cacheHitRate) {
+        return new MessageUsageEvent(sessionId, userMessageId, assistantMessageId,
+            usage, contextWindow, contextTokensUsed, percentLeft, source, cacheHitRate);
     }
 
     public String getAssistantMessageId() { return assistantMessageId; }
@@ -123,4 +164,9 @@ public class MessageUsageEvent extends StreamEvent {
     public long getContextWindow() { return contextWindow; }
     public long getContextTokensUsed() { return contextTokensUsed; }
     public Integer getPercentLeft() { return percentLeft; }
+    /**
+     * [cache-savings] 本条 assistant 消息自身的缓存命中率（0-1 比率）·
+     * null = 无数据 / 分母 0（@JsonInclude NON_NULL → 键省略）。
+     */
+    public Double getCacheHitRate() { return cacheHitRate; }
 }

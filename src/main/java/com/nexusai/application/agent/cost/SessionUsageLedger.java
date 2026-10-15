@@ -400,7 +400,8 @@ public class SessionUsageLedger implements com.nexusai.infra.llm.LlmUsageRecorde
      * 记一次调用尝试（网关入口）· 三件事，顺序固定：
      * <ol>
      *   <li><b>计价</b>：{@link ModelCostCalculator}（DB 价优先 + 高峰/空闲档）折算人民币元 ——
-     *       全仓唯一计价点，口径与改造前 {@code ModelCostCalculator.calculateCostYuan} 一致；</li>
+     *       全仓唯一计价点，口径与改造前 {@code ModelCostCalculator.calculateCostYuan} 一致
+     *       （V101 起经 {@code price(...)} 一次取回总额 + 分项，分项随记录落 {@code cost_*} 列）；</li>
      *   <li><b>明细落表</b>：{@code llm_usage_calls} 一行/尝试（用户裁定「每个 call 落表」），
      *       失败 → WARN + 计数并继续（LLM 调用链绝不因统计失败而中断）；</li>
      *   <li><b>账本聚合 + 会话视图回写</b>：进本账本（按 agent 分层），并把结果回写到主
@@ -413,12 +414,17 @@ public class SessionUsageLedger implements com.nexusai.infra.llm.LlmUsageRecorde
             return;
         }
         boolean peak = costCalculator != null && costCalculator.isPeakHour();
-        double costYuan = costCalculator != null
-            ? costCalculator.calculateCostYuan(call.modelName(), call.usage(), peak)
-            : 0.0;
+        // [V101 分项] 计价<b>单点</b>：一次 price(...) 同时给出总额与分项，⛔ 不再分别调用
+        //   calculateCostYuan + price（两套算路必然漂；calculateCostYuan 现已是 price(...).totalYuan() 视图）。
+        ModelCostCalculator.CostBreakdown breakdown = costCalculator != null
+            ? costCalculator.price(call.modelName(), call.usage(), peak)
+            : null;
+        double costYuan = breakdown != null ? breakdown.totalYuan() : 0.0;
         int contextWindow = costCalculator != null ? costCalculator.contextWindowFor(call.modelName()) : 0;
         long maxOutputTokens = costCalculator != null ? costCalculator.maxOutputFor(call.modelName()) : 0L;
-        LlmCallRecord enriched = call.withCost(costYuan, peak);
+        // 分项随记录传到落表点（persist）：PRICED = 分项齐全；计价器缺失（breakdown null）→ 走
+        //   无分项重载，落表记 LEGACY（⛔ 不伪造分项）。
+        LlmCallRecord enriched = call.withCost(breakdown, peak);
 
         persist(enriched);
         record(enriched, costYuan, peak, contextWindow, maxOutputTokens);
@@ -462,7 +468,8 @@ public class SessionUsageLedger implements com.nexusai.infra.llm.LlmUsageRecorde
         }
     }
 
-    /** 明细落表（MyBatis-Flex insert；异常 → WARN + 计数，绝不外抛）。 */
+    /** 明细落表（MyBatis-Flex insert；异常 → WARN + 计数，绝不外抛）。
+     *  V101：同时落费用分项五列 + {@code cost_detail_source}（PRICED/LEGACY，见各列注释）。 */
     private void persist(LlmCallRecord call) {
         if (usageCallMapper == null) {
             return;
@@ -494,10 +501,31 @@ public class SessionUsageLedger implements com.nexusai.infra.llm.LlmUsageRecorde
             rec.setCacheCreationInputTokens(u != null && u.cacheCreationInputTokens() != null
                 ? saturatedInt(u.cacheCreationInputTokens()) : null);
             rec.setCostYuan(call.costYuan());
+            // [V101 费用分项] 分项五列 + 来源：
+            //   PRICED = 计价点（ModelCostCalculator.price(...)）本次调用算出分项 → 五列齐全；
+            //   LEGACY = 无分项来源（V101 之前的历史行 / 计价器缺失）→ 五列留 NULL，读侧单列统计，
+            //            ⛔ 不摊分、不按比例倒推（伪造分项 = 让「缓存省了多少」变成编出来的数）。
+            ModelCostCalculator.CostBreakdown detail = call.costBreakdown();
+            if (detail != null) {
+                rec.setCostInput(detail.inputYuan());
+                rec.setCostOutput(detail.outputYuan());
+                rec.setCostCacheRead(detail.cacheReadYuan());
+                rec.setCostCacheWrite(detail.cacheWriteYuan());
+                rec.setCostNoCacheInput(detail.noCacheInputYuan());
+                rec.setCostDetailSource("PRICED");
+            } else {
+                rec.setCostDetailSource("LEGACY");
+            }
             rec.setPeakHour(call.peakHour() ? 1 : 0);
             rec.setStatus(call.status());
             rec.setErrorKind(call.errorKind());
-            rec.setStartedAt(java.time.Instant.ofEpochMilli(call.startedAtMs()).toString());
+            // [V101 · DM1 时间列裁定] 业务时间列 = ISO-8601 <b>带偏移</b>文本（本地时区，应用显式写入）：
+            //   ⛔ 不用 Instant.ofEpochMilli(...).toString() —— UTC 'Z' 结尾时同秒内
+            //   "...38Z"(0x5A=90) 与 "...38.645Z"(0x2E=46) 的字典序与时间序相反，
+            //   区间过滤（started_at 字符串比较 + idx_llm_usage_calls_started_at）会错序。
+            //   本地带偏移后 '+' (0x2B=43) < '.' (0x2E=46) < 数字 ⇒ 同偏移下字典序 == 时间序。
+            rec.setStartedAt(java.time.OffsetDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(call.startedAtMs()), java.time.ZoneId.systemDefault()).toString());
             rec.setElapsedMs(saturatedInt(call.elapsedMs()));
             // [usage-gateway · 2026-10-12 修真 bug] 必须用 insertSelective（跳过 null 列），⛔ 不可用 insert：
             //   V98 的 created_at 是 NOT NULL DEFAULT CURRENT_TIMESTAMP，而本账本不设该列（行写入时刻由 DB 给）。

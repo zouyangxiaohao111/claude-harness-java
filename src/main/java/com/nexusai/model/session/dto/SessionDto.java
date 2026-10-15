@@ -84,5 +84,18 @@ public record SessionDto(
      * null = 该会话未设置（回落全局 settings.coordinator_mode_enabled → 再回落 feature && env）；
      * true = 本会话强制协调者；false = 本会话强制普通（压过全局开）。前端会话级读写本字段。
      */
-    Boolean coordinatorMode
+    Boolean coordinatorMode,
+    /**
+     * [cache-savings] 会话累计缓存命中率（0-1 比率，可空）· 由 {@code sessions.model_usage_json}
+     * 逐模型桶派生（口径单点 = {@link com.nexusai.application.agent.cost.CacheHitRate#ofModels}；
+     * 每桶用<b>该桶自己的模型名</b>判定 anthropic 后分子分母分别加总）。
+     *
+     * <p><b>WHY 后端给（⛔ 前端不得自算）</b>：前端删掉自算后，F5 重拉（消息从 DB 重新加载、没有实时
+     * STOMP 事件）会让底部「缓存%」掉成「不显示」—— 这是相对现状的行为回退。会话读取路径由此字段补上，
+     * 使重拉后仍有值（数据源是已落库的 rollup，不需要事件重放）。
+     *
+     * <p>null = 无 {@code model_usage_json} / 解析失败 / 分母为 0（⛔ 不输出 NaN/Infinity、不臆造 0，
+     * 前端按「不显示」处理）。
+     */
+    Double cacheHitRate
 ) {}

@@ -2,6 +2,8 @@ package com.nexusai.application.project;
 
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.application.agent.cost.CacheHitRate;
+import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.model.project.dto.ProjectBindRequest;
@@ -45,6 +47,14 @@ public class ProjectSessionBindingService {
     @Autowired private ProjectMapper projectMapper;
     // [T8/D6] 项目级 .claude → .nexusai 一次性导入器（首个绑定会话触发 · 幂等不覆盖）
     @Autowired private ClaudeToNexusaiMigrator claudeToNexusaiMigrator;
+
+    /**
+     * [cache-savings] 模型/provider mapper · {@code SessionDto.cacheHitRate} 的协议分派原料
+     * （口径单点 = {@link CacheHitRate#ofModels}）。best-effort，required=false：
+     * 未注入（单测直构）→ 非 anthropic 语义回落，不抛。
+     */
+    @Autowired(required = false) private com.nexusai.repository.provider.mapper.ModelMapper modelMapper;
+    @Autowired(required = false) private com.nexusai.repository.provider.mapper.ProviderMapper providerMapper;
 
     // [IMPL-10] DEL-CCE-04: hookRegistry（CwdChanged 发射）字段已删除（伪事件发射随删除）。
 
@@ -133,7 +143,7 @@ public class ProjectSessionBindingService {
      * 不再直接引 SessionMapper，所以搬到 application service 里。
      * 未来若 domain.session 有 SessionDtoConverter 可改为调用它。
      */
-    private static SessionDto toSessionDto(SessionRecord s) {
+    private SessionDto toSessionDto(SessionRecord s) {
         return new SessionDto(
             s.getId(),
             s.getModelTag() != null ? ModelTag.valueOf(s.getModelTag()) : null,
@@ -163,7 +173,11 @@ public class ProjectSessionBindingService {
             // [SP-03] 会话指定主线程 agent 透出（V58 列 main_thread_agent；null = 未指定，agent 分支休眠）
             s.getMainThreadAgent(),
             // [coordinator-session V75] 会话级 coordinator 模式透出（0/1 → Boolean，null = 未设置）
-            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null
+            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null,
+            // [cache-savings] 会话累计缓存命中率（与 SessionService.toDto 同口径同源：
+            //   model_usage_json 逐模型桶派生 · 口径单点 CacheHitRate.ofModels；无数据/解析失败/分母 0 → null）
+            CacheHitRate.ofModels(CostTracker.parseModelUsageJson(s.getModelUsageJson()),
+                modelMapper, providerMapper)
         );
     }
 

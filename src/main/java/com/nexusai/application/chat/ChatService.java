@@ -1206,6 +1206,13 @@ public class ChatService {
         //   —— true = 本 turn 有压缩结果落库成功 → 前端收尾后重拉尾页补「已压缩」分割线（对账层；
         //   即时层 = compactPersistListener 同点推的 message.insert boundary 行）。
         boolean turnCompacted = state.consumeTurnCompacted();
+        // [cache-savings] 会话累计缓存命中率 · 口径单点 = CacheHitRate.ofModels（逐模型桶按该桶
+        //   自己的模型名判定 anthropic，分子分母分别加总后一次相除）——⛔ 不用单条消息 usage 冒充
+        //   累计值；分母合计 0 / 无桶 → null（NON_NULL 省略，前端按「不显示」处理）。
+        Double completeCacheHitRate = com.nexusai.application.agent.cost.CacheHitRate.ofModels(
+            state.sessionModelUsage(), modelMapper, providerMapper);
+        // [cache-savings] 会话累计总 token = input + output（不含 cache，与前端 useChatSocket 既有语义一致）。
+        long completeTotalTokens = state.sessionInputTokens() + state.sessionOutputTokens();
         sendAndLog(wsTemplate, streamTopic,
             // [merge] 保留 effectiveEventUserMessageId（排队 flow userMessageId 双通道一致）+ V-TOK 真实 usage 装配
             new MessageCompleteEvent(sessionId, effectiveEventUserMessageId(state, userMessageId), resolvedAssistantId,
@@ -1218,7 +1225,7 @@ public class ChatService {
                 completeDurationMs,
                 state.turnCount(),
                 completeContextWindow, completeContextUsed, completePercentLeft,
-                turnCompacted),
+                turnCompacted, completeCacheHitRate, completeTotalTokens),
             "complete finishReason=" + state.finishReason()
                 + " content=" + abbreviate(finalContent, 80)
                 + " reasoningLen=" + (finalReasoning == null ? 0 : finalReasoning.length()));

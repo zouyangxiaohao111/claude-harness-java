@@ -141,6 +141,7 @@ class ExportControllerTranscriptFlagsTest {
         return new SessionDto(SESSION, ModelTag.DS, "test-model", "导出示例", "刚刚", SessionGroup.current,
             null, null, null, OffsetDateTime.now(), OffsetDateTime.now(),
             null, null, null, null, null, null, null, null, null,
-            null);   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
+            null,   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
+            null);   // cacheHitRate（[cache-savings]，本 fixture 未设 → null）
     }
 }

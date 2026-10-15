@@ -19,7 +19,9 @@ package com.nexusai.infra.llm;
  * @param category      归类维度（聚合键之一）
  * @param parentAgentId 父 agent id（null = 顶层，即主 agent 自身或独立旁路）
  * @param depth         层级深度（0 = 顶层 agent；子代理 1；嵌套子代理 2…）
- * @param label         可读标签（subagentName / skill 名 / cron workload / 旁路用途名；可 null）
+ * @param label         可读标签（可 null）：**子代理/fork/队友 = 该次任务的名称**（CC AgentTool
+ *                      {@code description}；取不到则回落 agent 类型名），旁路 = 用途 slug，
+ *                      压缩 = 压缩标签，cron = workload 名
  */
 public record UsageAttribution(
         String sessionId,

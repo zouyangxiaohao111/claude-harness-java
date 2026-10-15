@@ -1,5 +1,6 @@
 package com.nexusai.infra.llm;
 
+import com.nexusai.application.agent.cost.ModelCostCalculator;
 import com.nexusai.application.agent.tool.AgentUsage;
 
 /**
@@ -24,6 +25,8 @@ import com.nexusai.application.agent.tool.AgentUsage;
  * @param usage           该次尝试的累计 usage（EMPTY = 无可用数值）
  * @param costYuan        该次尝试折算费用（元；{@code ESTIMATED} 时同样是估算值）
  * @param peakHour        计价时段（true = 高峰档）
+ * @param costBreakdown   V101 费用分项（{@code null} = 无分项来源：网关产出后未经计价点
+ *                        {@code ModelCostCalculator.price(...)} —— 落表时该行记 {@code LEGACY}）
  * @param status          调用状态短标签（{@code ok} / {@code aborted} / {@code error}）
  * @param errorKind       错误类别（可 null；仅 status != ok 时填）
  * @param startedAtMs     调用开始时刻（epoch ms）
@@ -42,6 +45,7 @@ public record LlmCallRecord(
         AgentUsage usage,
         double costYuan,
         boolean peakHour,
+        ModelCostCalculator.CostBreakdown costBreakdown,
         String status,
         String errorKind,
         long startedAtMs,
@@ -68,12 +72,32 @@ public record LlmCallRecord(
      * 补齐计价结果（网关产出时不带价格 —— 计价依赖 models 表价格与时段档，属应用层账本职责；
      * 记账器算完后用本方法得到最终可落库记录）。
      *
+     * <p><b>V101</b>：本重载<b>不带分项</b>（{@code costBreakdown = null}）→ 落表记
+     * {@code cost_detail_source='LEGACY'}。带分项的路径见
+     * {@link #withCost(ModelCostCalculator.CostBreakdown, boolean)}（账本走它）。
+     *
      * @param costYuan 本次尝试折算费用（元）
      * @param peakHour 是否高峰档
      */
     public LlmCallRecord withCost(double costYuan, boolean peakHour) {
         return new LlmCallRecord(callId, attribution, modelName, sdkModelName, providerType, querySource,
-            stream, phase, tokenSource, usage, costYuan, peakHour, status, errorKind, startedAtMs, elapsedMs);
+            stream, phase, tokenSource, usage, costYuan, peakHour, null, status, errorKind, startedAtMs, elapsedMs);
+    }
+
+    /**
+     * V101 · 用<b>计价点的分项</b>补齐记录：总额取自 {@code breakdown.totalYuan()}（单一公式点
+     * {@code ModelCostCalculator.price(...)}，⛔ 不由调用方另算），分项本身随记录传到落表点。
+     *
+     * @param breakdown 分项（{@code null} → 退化为不带分项，仅置时段档）
+     * @param peakHour  是否高峰档
+     */
+    public LlmCallRecord withCost(ModelCostCalculator.CostBreakdown breakdown, boolean peakHour) {
+        if (breakdown == null) {
+            return withCost(costYuan, peakHour);
+        }
+        return new LlmCallRecord(callId, attribution, modelName, sdkModelName, providerType, querySource,
+            stream, phase, tokenSource, usage, breakdown.totalYuan(), peakHour, breakdown,
+            status, errorKind, startedAtMs, elapsedMs);
     }
 
     /**
@@ -81,6 +105,7 @@ public record LlmCallRecord(
      */
     public LlmCallRecord withPeakHour(boolean peakHour) {
         return new LlmCallRecord(callId, attribution, modelName, sdkModelName, providerType, querySource,
-            stream, phase, tokenSource, usage, costYuan, peakHour, status, errorKind, startedAtMs, elapsedMs);
+            stream, phase, tokenSource, usage, costYuan, peakHour, costBreakdown, status, errorKind,
+            startedAtMs, elapsedMs);
     }
 }

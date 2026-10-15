@@ -97,6 +97,27 @@ public class MessageCompleteEvent extends StreamEvent {
      * {@code message.insert}）。恒出站（primitive，NON_NULL 不省略）→ 旧前端忽略未知字段即可。
      */
     private final boolean compacted;
+    /**
+     * [cache-savings] <b>会话累计</b>缓存命中率（0-1 比率，Double 可空）· 键名 `cache_hit_rate`；
+     * null → NON_NULL 省略（前端按「不显示」处理）。
+     *
+     * <p><b>口径单点</b>：{@link com.nexusai.application.agent.cost.CacheHitRate#ofModels}
+     * （逐模型桶用该桶自己的模型名判定 anthropic，分子分母分别加总后一次相除）—— 装配点用
+     * {@code AgentState.sessionModelUsage()}，⛔ 不得用单条消息的 usage 冒充累计值。
+     *
+     * <p><b>⛔ 与 message.usage 同名字段语义不同</b>：那边是<b>该条消息</b>的命中率。
+     */
+    @JsonProperty("cache_hit_rate")
+    private final Double cacheHitRate;
+    /**
+     * [cache-savings] 会话累计总 token（{@code sessionInputTokens + sessionOutputTokens}，
+     * <b>不含 cache</b>）· 键名 `total_tokens`；null = 未装配 → NON_NULL 省略。
+     *
+     * <p><b>WHY 不含 cache</b>：与前端既有语义一致（nexusai front `useChatSocket.ts:876-881`
+     * 用同口径算「上下文/累计 token」），⛔ 改口径会让底部数字在 F5 前后跳变。
+     */
+    @JsonProperty("total_tokens")
+    private final Long totalTokens;
 
     public MessageCompleteEvent(String sessionId, String userMessageId,
                                 String assistantMessageId, String content, String reasoning,
@@ -138,6 +159,28 @@ public class MessageCompleteEvent extends StreamEvent {
                                 long durationMs, int numTurns,
                                 long contextWindow, long contextTokensUsed, Integer percentLeft,
                                 boolean compacted) {
+        this(sessionId, userMessageId, assistantMessageId, content, reasoning, finishReason,
+            inputTokens, outputTokens, reasoningDurationMs,
+            usage, totalCostUsd, modelUsage, durationMs, numTurns,
+            contextWindow, contextTokensUsed, percentLeft, compacted, null, null);
+    }
+
+    /**
+     * [cache-savings] 全参构造器（additive；18 参重载保留 → 既有调用方零改动，两个新字段默认 null 省略）。
+     *
+     * @param compacted    本轮是否发生过落库成功的压缩（见 {@link #isCompacted()}）
+     * @param cacheHitRate 会话累计缓存命中率（0-1 比率；null = 无数据 → NON_NULL 省略）
+     * @param totalTokens  会话累计总 token（input+output，<b>不含 cache</b>；null = 未装配 → 省略）
+     */
+    public MessageCompleteEvent(String sessionId, String userMessageId,
+                                String assistantMessageId, String content, String reasoning,
+                                String finishReason, Integer inputTokens, Integer outputTokens,
+                                Long reasoningDurationMs,
+                                MessageUsageDto usage, double totalCostUsd,
+                                Map<String, CostTracker.ModelUsage> modelUsage,
+                                long durationMs, int numTurns,
+                                long contextWindow, long contextTokensUsed, Integer percentLeft,
+                                boolean compacted, Double cacheHitRate, Long totalTokens) {
         super("message.complete", sessionId, userMessageId);
         this.assistantMessageId = assistantMessageId;
         this.content = content;
@@ -155,6 +198,8 @@ public class MessageCompleteEvent extends StreamEvent {
         this.contextTokensUsed = contextTokensUsed;
         this.percentLeft = percentLeft;
         this.compacted = compacted;
+        this.cacheHitRate = cacheHitRate;
+        this.totalTokens = totalTokens;
     }
 
     public String getAssistantMessageId() { return assistantMessageId; }
@@ -173,4 +218,11 @@ public class MessageCompleteEvent extends StreamEvent {
     public long getContextTokensUsed() { return contextTokensUsed; }
     public Integer getPercentLeft() { return percentLeft; }
     public boolean isCompacted() { return compacted; }
+    /**
+     * [cache-savings] 会话累计缓存命中率（0-1 比率）· null = 无数据 / 分母 0
+     * （@JsonInclude NON_NULL → 键省略，前端按「不显示」处理）。
+     */
+    public Double getCacheHitRate() { return cacheHitRate; }
+    /** [cache-savings] 会话累计总 token（input+output，不含 cache）· null = 未装配（键省略）。 */
+    public Long getTotalTokens() { return totalTokens; }
 }

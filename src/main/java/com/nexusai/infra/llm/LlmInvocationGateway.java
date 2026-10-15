@@ -231,7 +231,7 @@ public final class LlmInvocationGateway {
             request.modelName(), resolved == null ? request.modelName() : resolved.sdkModelName(),
             resolved == null ? request.providerType() : resolved.providerType(),
             request.querySource(), stream, phase, source,
-            usage != null ? usage : AgentUsage.EMPTY, 0.0, false, status, errorKind, startedAt, elapsed));
+            usage != null ? usage : AgentUsage.EMPTY, 0.0, false, null, status, errorKind, startedAt, elapsed));
     }
 
     private static LlmCallRecord build(ModelRequest request, Resolved resolved, AgentUsage usage,
@@ -240,7 +240,7 @@ public final class LlmInvocationGateway {
         return new LlmCallRecord(LlmCallRecord.newCallId(), request.usageAttribution(),
             request.modelName(), resolved.sdkModelName(), resolved.providerType(),
             request.querySource(), stream, phase, source,
-            usage != null ? usage : AgentUsage.EMPTY, 0.0, false, status, errorKind, startedAt, elapsed);
+            usage != null ? usage : AgentUsage.EMPTY, 0.0, false, null, status, errorKind, startedAt, elapsed);
     }
 
     /** 状态短标签：异常优先，其次按尝试结局（SETTLED=ok / ABORTED=aborted / FAILED=error）。 */

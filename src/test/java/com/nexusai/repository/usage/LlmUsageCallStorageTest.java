@@ -98,11 +98,18 @@ class LlmUsageCallStorageTest {
         }
     }
 
-    /** 计价替身：固定 1.23 元 / 高峰档（只为让落表用例断言到非零金额与非零标志）。 */
+    /**
+     * 计价替身：固定 1.23 元 / 高峰档（只为让落表用例断言到非零金额与非零标志）。
+     *
+     * <p>V101：账本已改为单点 {@code price(...)}（总额 = {@code breakdown.totalYuan()}），故桩必须打在
+     * {@code price} 上并把分项也填齐（{@code calculateCostYuan} 的旧桩会返回 null → 落表变 LEGACY +
+     * 金额 0 → 本类所有 cost==1.23 断言红）。分项四项之和恰为总额，与 V101 不变式一致。
+     */
     private static ModelCostCalculator fixedPriceCalculator() {
         ModelCostCalculator calc = mock(ModelCostCalculator.class);
         when(calc.isPeakHour()).thenReturn(true);
-        when(calc.calculateCostYuan(any(), any(), anyBoolean())).thenReturn(1.23);
+        when(calc.price(any(), any(), anyBoolean()))
+            .thenReturn(new ModelCostCalculator.CostBreakdown(1.0, 0.2, 0.02, 0.01, 1.23, 1.5));
         when(calc.contextWindowFor(any())).thenReturn(200_000);
         when(calc.maxOutputFor(any())).thenReturn(8_192L);
         return calc;
@@ -117,7 +124,7 @@ class LlmUsageCallStorageTest {
                                             AgentUsage u, long elapsedMs) {
         return new LlmCallRecord(callId, who, modelName, modelName + "-sdk", "anthropic",
             "USER", true, LlmUsagePhase.SETTLED, UsageTokenSource.UPSTREAM, u,
-            0.0, false, "ok", null, 1_700_000_000_000L, elapsedMs);
+            0.0, false, null, "ok", null, 1_700_000_000_000L, elapsedMs);
     }
 
     @Test
@@ -169,7 +176,7 @@ class LlmUsageCallStorageTest {
         String callId = LlmCallRecord.newCallId();
         LlmCallRecord aborted = new LlmCallRecord(callId, who, "m", "m-sdk", "openai",
             "SUBAGENT", false, LlmUsagePhase.ABORTED, UsageTokenSource.UNKNOWN,
-            usage(0, 0, null, null), 0.0, false, "aborted", "AbortException", 1_700_000_000_000L, 250L);
+            usage(0, 0, null, null), 0.0, false, null, "aborted", "AbortException", 1_700_000_000_000L, 250L);
 
         ledger.record(aborted);
 
@@ -199,10 +206,9 @@ class LlmUsageCallStorageTest {
             usage(200, 20, null, null), 100L));
         ledger.record(new LlmCallRecord(LlmCallRecord.newCallId(), child, "m", "m-sdk", "openai",
             "SUBAGENT", true, LlmUsagePhase.ABORTED, UsageTokenSource.ESTIMATED,
-            usage(50, 5, null, null), 0.0, false, "aborted", null, 1_700_000_000_000L, 90L));
+            usage(50, 5, null, null), 0.0, false, null, "aborted", null, 1_700_000_000_000L, 90L));
 
         StatsService stats = new StatsService();
-        ReflectionTestUtils.setField(stats, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(stats, "usageCallMapper", mapper);
 
         StatsService.StatsResult result = stats.aggregate();
@@ -256,7 +262,6 @@ class LlmUsageCallStorageTest {
         ledger.record(streamCall(LlmCallRecord.newCallId(), subagent, "m", usage(100, 10, null, null), 100L));
 
         StatsService stats = new StatsService();
-        ReflectionTestUtils.setField(stats, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(stats, "usageCallMapper", mapper);
 
         StatsService.SessionAgentUsage node = stats.sessionUsage(SESSION).agents().stream()
@@ -290,7 +295,6 @@ class LlmUsageCallStorageTest {
             "m", usage(300, 30, null, null), 300L));
 
         StatsService stats = new StatsService();
-        ReflectionTestUtils.setField(stats, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(stats, "usageCallMapper", mapper);
 
         // 夹具只造了子代理的两行（本体 hex + 旁路 UUID）→ 归并后应当**只有 1 个节点**：
@@ -331,7 +335,6 @@ class LlmUsageCallStorageTest {
             usage(9999, 999, null, null), 100L));
 
         StatsService stats = new StatsService();
-        ReflectionTestUtils.setField(stats, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(stats, "usageCallMapper", mapper);
 
         StatsService.SessionUsage usage = stats.sessionUsage(SESSION);

@@ -63,7 +63,7 @@ class SessionUsageLedgerAccountingTest {
         return new LlmCallRecord(LlmCallRecord.newCallId(), who, model, model, "openai_sdk",
             "test", stream, phase, source,
             usage,
-            0.0, false, phase == LlmUsagePhase.SETTLED ? "ok" : "error", null,
+            0.0, false, null, phase == LlmUsagePhase.SETTLED ? "ok" : "error", null,
             System.currentTimeMillis(), 12L);
     }
 

@@ -4728,7 +4728,11 @@ public class SubagentExecutor {
      * @param ledger          本会话账本（{@code registry.forSession(sessionId)} 产物）
      * @param spawningTuc     发起方（spawn）TUC（构造器级 {@code parentToolUseContext}；null = standalone）
      * @param childAgentId    子 agentId 字符串（本类既有渲染：a+16hex 优先，退化到 UUID 串）
-     * @param subagentLabel   可读标签（{@code subagentName}；拿不到则 null）
+     * @param taskDescription 子代理**任务名**（CC {@code AgentTool} 的 {@code description}：3-5 词任务短名
+     *                        —— 与任务注册表 {@code registerSyncForeground(agentId, summaryDescription,…)}
+     *                        同源 ⇒ 前端「统计/用量」两页显示同一个名字）；拿不到则 null/空白
+     * @param subagentName    子代理**类型**名（{@code general-purpose} / {@code Explore} / {@code Plan}…）；
+     *                        仅作 taskDescription 缺失时的回退
      * @param sessionId       子代理归属会话（父会话继承值 / 无会话哨兵）
      * @return 子归属（父归属派生；账本节点键 = {@link com.nexusai.infra.llm.UsageAttribution#nodeKey()}）
      */
@@ -4736,7 +4740,8 @@ public class SubagentExecutor {
             com.nexusai.application.agent.cost.SessionUsageLedger ledger,
             ToolUseContext spawningTuc,
             String childAgentId,
-            String subagentLabel,
+            String taskDescription,
+            String subagentName,
             String sessionId) {
         com.nexusai.infra.llm.UsageAttribution parentAttribution = null;
         if (spawningTuc != null && spawningTuc.agentId() != null) {
@@ -4754,8 +4759,17 @@ public class SubagentExecutor {
                 : com.nexusai.infra.llm.UsageAttribution.top(sessionId, sessionId,
                     com.nexusai.infra.llm.UsageCategory.MAIN, null);
         }
+        // [usage-label] 归属 label = **具体任务名**（见上 @param taskDescription）。
+        //   WHY 不能直接用 subagentName：它是 agent **类型**名（general-purpose / Explore / Plan…），
+        //   同一会话可跑多个同型子代理 ⇒ 「按代理层级」行名全一样（实测渲染成「通用型」「探索型」），
+        //   用户读不出是哪一个（实测反馈：应显示具体名称而不是 xx 型）。
+        //   taskDescription 缺失（teammate / fork-skill / workflow 三条走共享单例的路径不设该字段）
+        //   → 回落类型名，⛔ 不伪造空串。
+        String usageLabel = taskDescription != null && !taskDescription.isBlank()
+            ? taskDescription
+            : subagentName;
         return parentAttribution.child(childAgentId,
-            com.nexusai.infra.llm.UsageCategory.SUBAGENT, subagentLabel);
+            com.nexusai.infra.llm.UsageCategory.SUBAGENT, usageLabel);
     }
 
     /**
@@ -4841,9 +4855,13 @@ public class SubagentExecutor {
                 ? agentIdHex
                 : (agentId != null ? agentId.toString() : null);
             // 顺序：先挂归属再挂账本（attachUsageLedger 在归属非空时才向账本登记本节点）。
+            // [usage-label] 第 4 参 = 本次子代理的**具体任务名**（summaryDescription = CC AgentTool
+            //   description，由 SubagentTool 在 execute 前设入）；第 5 参 = 类型名（回退用）。
+            //   ⚠️ 只有 SubagentTool 会 setSummaryDescription，且它每次 new 本类（单次执行）⇒ 无跨调用残留；
+            //   走共享单例的 teammate / fork-skill / workflow 路径该字段恒 null ⇒ 回落类型名。
             state.attachUsageAttribution(subagentUsageAttribution(
                 subagentLedger, parentToolUseContext, childUsageAgentId,
-                subagentCtx.subagentName(), sessionId));
+                summaryDescription, subagentCtx.subagentName(), sessionId));
             state.attachUsageLedger(subagentLedger);
             if (log.isDebugEnabled()) {
                 log.debug("[usage-gateway] 子代理记账归属已装配: sessionId={} agentId={} parentAgentId={} "

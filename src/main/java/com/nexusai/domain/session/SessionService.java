@@ -3,6 +3,8 @@ package com.nexusai.domain.session;
 import com.alibaba.fastjson2.JSON;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.compact.MicroCompactor;
+import com.nexusai.application.agent.cost.CacheHitRate;
+import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.hook.SkillImprovementSuggestionStore;
 import com.nexusai.application.agent.subagent.AgentDefinitionRegistry;
@@ -23,6 +25,8 @@ import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.session.mapper.SessionMapper;
+import com.nexusai.repository.provider.mapper.ModelMapper;
+import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
@@ -99,6 +103,17 @@ public class SessionService {
     @Autowired(required = false)
     @Lazy
     private SubagentTool subagentTool;
+
+    /**
+     * [cache-savings] 模型/provider mapper · 会话读取路径派生 {@code SessionDto.cacheHitRate} 的
+     * 协议分派原料（anthropic 分母含 cache 两项；deepseek/openai 的 input 已含 cache hit）。
+     * best-effort，required=false：非 Spring 单测（直构 service）未注入 → 非 anthropic 语义回落，不抛。
+     * ⛔ 不另造取 mapper 的路径（口径单点 = {@link com.nexusai.application.agent.cost.CacheHitRate}）。
+     */
+    @Autowired(required = false)
+    private ModelMapper modelMapper;
+    @Autowired(required = false)
+    private ProviderMapper providerMapper;
 
     /**
      * 会话列表 · 全量查询 + <b>显式定序</b>：{@code updated_at DESC, id ASC}。
@@ -738,7 +753,7 @@ public class SessionService {
         return prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
     }
 
-    private static SessionDto toDto(SessionRecord s) {
+    private SessionDto toDto(SessionRecord s) {
         return new SessionDto(
             s.getId(),
             s.getModelTag() != null ? ModelTag.valueOf(s.getModelTag()) : null,
@@ -770,8 +785,24 @@ public class SessionService {
             s.getMainThreadAgent(),
             // [coordinator-session V75] 会话级 coordinator 模式透出（0/1 → Boolean，null 保持 null =
             //   未设置回落下一层；与 PATCH 写侧构成对称契约）
-            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null
+            s.getCoordinatorMode() != null ? s.getCoordinatorMode() != 0 : null,
+            // [cache-savings] 会话累计缓存命中率（F5 重拉后前端底部「缓存%」的取数口）·
+            //   由 model_usage_json（派生视图，只读不改写）逐模型桶派生，口径单点 = CacheHitRate.ofModels
+            //   （每桶按自己的模型名判 anthropic）；无数据 / 解析失败 / 分母 0 → null（⛔ 不臆造 0）。
+            cacheHitRateOf(s.getModelUsageJson())
         );
+    }
+
+    /**
+     * [cache-savings] {@code model_usage_json} → 会话累计缓存命中率（可空）。
+     *
+     * <p>解析复用 {@link CostTracker#parseModelUsageJson}（fail-soft：null/空白/解析失败 → 空 Map），
+     * 计算复用 {@link CacheHitRate#ofModels}（⛔ 本方法不得自带公式，否则与 STOMP 实时帧 /
+     * 统计页出现第二套口径）。空 Map → null。
+     */
+    private Double cacheHitRateOf(String modelUsageJson) {
+        return CacheHitRate.ofModels(CostTracker.parseModelUsageJson(modelUsageJson),
+            modelMapper, providerMapper);
     }
 
     /**

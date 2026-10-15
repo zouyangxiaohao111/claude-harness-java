@@ -243,8 +243,16 @@ public class CostTracker {
         return s != null ? s.getUsageTreeJson() : null;
     }
 
-    /** sessions.model_usage_json 列 → 桶 Map · null/空白/解析失败 → 空（fail-soft，对齐 SessionService parseTodos）。 */
-    private static Map<String, ModelUsage> parseModelUsageJson(String json) {
+    /**
+     * sessions.model_usage_json 列 → 桶 Map · null/空白/解析失败 → 空（fail-soft，对齐 SessionService parseTodos）。
+     *
+     * <p>[cache-savings] {@code public static}：会话读取路径（{@code SessionService.toDto} /
+     * {@code ProjectSessionBindingService.toSessionDto}）派生 {@code SessionDto.cacheHitRate} 时复用本解析
+     * ——⛔ 不再造第二套 model_usage_json 解析（字段名/容错一旦分叉，同一份库数据会解析出两个不同结果）。
+     * 解析失败返回<b>空 Map</b>（调用方 {@code CacheHitRate.ofModels} 对空 Map 返回 null =
+     * 前端「不显示」，⛔ 不臆造 0）。
+     */
+    public static Map<String, ModelUsage> parseModelUsageJson(String json) {
         if (json == null || json.isBlank()) {
             return new LinkedHashMap<>();
         }

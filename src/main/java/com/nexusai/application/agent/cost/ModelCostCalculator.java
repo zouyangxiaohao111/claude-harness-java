@@ -35,6 +35,11 @@ import java.time.ZonedDateTime;
  * {@code (input/1e6)*inputPk + (output/1e6)*outputPk + (cacheRead/1e6)*cacheReadPk
  *  + (cacheCreation/1e6)*cacheWritePk}；webSearchRequests 不计（DeepSeek 无 web search 计费，×0）。
  *
+ * <p><b>V101 费用分项（{@link CostBreakdown}）</b>：{@link #price} 是本类<b>唯一公式点</b>——
+ * {@link #calculateCostYuan} 已改为「委托 {@code price(...).totalYuan()}」，⛔ 不可另写一套总额公式
+ * （两套公式必然漂）。分项写入 {@code llm_usage_calls} 的 {@code cost_*} 五列，供读侧回答
+ * 「缓存省了多少钱」：反事实项 {@link CostBreakdown#noCacheInputYuan()} <b>不计入</b>总额。
+ *
  * <p>{@code @Autowired(required = false)} 双点注入（仿 tokenBudgetChecker）：非 Spring 单测
  * new 时 modelMapper/providerMapper 为 null → 回落内置通用默认档，不 NPE。
  */
@@ -59,6 +64,32 @@ public class ModelCostCalculator {
     public static final PriceTier DEFAULT_UNKNOWN_MODEL_TIER =
         new PriceTier(3.0, 1.5, 9.0, 4.5, 0.10, 0.05, 3.0, 1.5, 1_048_576L, 384_000L);
 
+    /**
+     * 单次调用的费用<b>分项</b>（元）· V101 明细表 {@code llm_usage_calls.cost_*} 五列 + 总额的载体。
+     *
+     * <p><b>不变式（可断言）</b>：{@link #totalYuan()} == {@link #inputYuan()} + {@link #outputYuan()}
+     * + {@link #cacheReadYuan()} + {@link #cacheWriteYuan()}；且 {@code totalYuan()} 与既有
+     * {@link #calculateCostYuan} 同参同值（回归守护：后者已委托 {@link #price}）。
+     *
+     * <p><b>{@link #noCacheInputYuan()} 是反事实诊断项，不计入总额</b>：该轮若一次 cache 都没有
+     * （命中/写入都按 input 全价）input 侧要花多少。读侧「缓存省了多少钱」=
+     * {@code noCacheInputYuan − (inputYuan + cacheReadYuan + cacheWriteYuan)}：
+     * anthropic = 命中×(全价−命中价) + 写入×(全价−写入价)；非 anthropic（input 已含命中）=
+     * 命中×(全价−命中价)。⛔ 本类不摊分、不伪造分项。
+     *
+     * @param inputYuan        输入侧实付（anthropic = 全部 input 全价；非 anthropic = 扣命中后的 miss 全价）
+     * @param outputYuan       输出侧实付（两分支同式）
+     * @param cacheReadYuan    cache 命中（读）实付
+     * @param cacheWriteYuan   cache 写入实付（仅 anthropic；非 anthropic = 0.0）
+     * @param totalYuan        总额 = 上述四项之和（== {@link #calculateCostYuan} 同参结果）
+     * @param noCacheInputYuan 反事实项：无任何 cache 时 input 侧的全价（不计入 {@code totalYuan}）
+     */
+    public record CostBreakdown(double inputYuan, double outputYuan, double cacheReadYuan,
+                                double cacheWriteYuan, double totalYuan, double noCacheInputYuan) {}
+
+    /** 全零分项（usage 缺失时用；record 不可变，可安全共享）。 */
+    private static final CostBreakdown ZERO_BREAKDOWN = new CostBreakdown(0.0, 0.0, 0.0, 0.0, 0.0, 0.0);
+
     @Autowired(required = false) private ModelMapper modelMapper;
     @Autowired(required = false) private ProviderMapper providerMapper;
 
@@ -70,10 +101,8 @@ public class ModelCostCalculator {
      * @param isPeak true=高峰档 / false=空闲档
      */
     public double calculateCostYuan(String model, AgentUsage usage, boolean isPeak) {
-        if (usage == null) return 0.0;
-        long cacheRead = usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L;
-        long cacheCreation = usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L;
-        return calculateCostYuan(model, usage.inputTokens(), usage.outputTokens(), cacheRead, cacheCreation, isPeak);
+        // V101：总额统一取自唯一公式点 price(...)（usage == null → 全零分项 → 0.0）
+        return price(model, usage, isPeak).totalYuan();
     }
 
     /**
@@ -93,9 +122,59 @@ public class ModelCostCalculator {
      * <b>价语义（用户确认）</b>: input_price=miss 全价、cache_read_price=hit 折价、cache_write 对
      * deepseek 忽略。DB 全 NULL 时内置默认档 3.0/0.10 即此语义；日后配价按此填。
      * mapper 不可得（非 Spring new / 模型不可判定）→ isAnthropic false → deepseek 语义（input 含 cache）。
+     *
+     * <p><b>V101</b>：本方法已改为「{@code price(...).totalYuan()}」的<b>总额视图</b> ——
+     * 公式本体只有一处（{@link #price(String, long, long, long, long, boolean)}），⛔ 不可在此重写公式。
      */
     public double calculateCostYuan(String model, long inputTokens, long outputTokens,
                                     long cacheRead, long cacheCreation, boolean isPeak) {
+        return price(model, inputTokens, outputTokens, cacheRead, cacheCreation, isPeak).totalYuan();
+    }
+
+    /**
+     * <b>V101 分项计价</b>（{@link AgentUsage} 入口）· 委托标量重载，usage 缺失 → 全零分项（不猜价格）。
+     *
+     * @param model  生效模型名（DB 价 / 内置默认解析用）
+     * @param usage  provider 上报的 usage（null → 全零分项）
+     * @param isPeak true=高峰档 / false=空闲档
+     */
+    public CostBreakdown price(String model, AgentUsage usage, boolean isPeak) {
+        if (usage == null) {
+            return ZERO_BREAKDOWN;
+        }
+        long cacheRead = usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L;
+        long cacheCreation = usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L;
+        return price(model, usage.inputTokens(), usage.outputTokens(), cacheRead, cacheCreation, isPeak);
+    }
+
+    /**
+     * <b>V101 唯一公式点</b>：按 token 四通道 + 时段档算出费用分项（元）。
+     *
+     * <p>价格档与分派口径由 {@link #resolveTier}（DB 价优先 → 内置通用默认档）与
+     * {@link ContextUsageCalculator#isAnthropic} 决定，语义与改造前 {@link #calculateCostYuan}
+     * <b>逐字一致</b>（后者现为本方法总额的视图）：
+     * <ul>
+     *   <li><b>anthropic</b>（CC {@code modelCost.ts} tokensToUSDCost 4 项式）：
+     *       {@code inputYuan = input/1e6*P_in}、{@code outputYuan = output/1e6*P_out}、
+     *       {@code cacheReadYuan = cacheRead/1e6*P_cr}、{@code cacheWriteYuan = cacheCreation/1e6*P_cw}；
+     *       {@code noCacheInputYuan = (input + cacheRead + cacheCreation)/1e6*P_in}
+     *       （反事实：无 cache 时 input 侧全价）；</li>
+     *   <li><b>非 anthropic（deepseek/openai，input 已含 cache hit）</b>：
+     *       {@code miss = max(0, input - cacheRead)}、{@code inputYuan = miss/1e6*P_in}、
+     *       {@code cacheWriteYuan = 0.0}（deepseek 无 cache_write 档）、
+     *       {@code noCacheInputYuan = input/1e6*P_in}。</li>
+     * </ul>
+     * 总额恒为四项之和（{@code noCacheInputYuan} ⛔ 不计入）。
+     *
+     * @param model         生效模型名
+     * @param inputTokens   输入 token（非 anthropic 时已含 cache 命中）
+     * @param outputTokens  输出 token
+     * @param cacheRead     cache 命中（读）token
+     * @param cacheCreation cache 写入 token
+     * @param isPeak        true=高峰档 / false=空闲档
+     */
+    public CostBreakdown price(String model, long inputTokens, long outputTokens,
+                               long cacheRead, long cacheCreation, boolean isPeak) {
         PriceTier tier = resolveTier(model);
         double inputPrice = isPeak ? tier.inputPricePeak() : tier.inputPriceOffpeak();
         double outputPrice = isPeak ? tier.outputPricePeak() : tier.outputPriceOffpeak();
@@ -103,16 +182,26 @@ public class ModelCostCalculator {
         double cacheWritePrice = isPeak ? tier.cacheWritePricePeak() : tier.cacheWritePriceOffpeak();
         boolean anthropic = ContextUsageCalculator.isAnthropic(this.modelMapper, this.providerMapper, model);
         if (anthropic) {
-            return (inputTokens / 1e6) * inputPrice
-                + (outputTokens / 1e6) * outputPrice
-                + (cacheRead / 1e6) * cacheReadPrice
-                + (cacheCreation / 1e6) * cacheWritePrice;
+            double inputYuan = (inputTokens / 1e6) * inputPrice;
+            double outputYuan = (outputTokens / 1e6) * outputPrice;
+            double cacheReadYuan = (cacheRead / 1e6) * cacheReadPrice;
+            double cacheWriteYuan = (cacheCreation / 1e6) * cacheWritePrice;
+            double totalYuan = inputYuan + outputYuan + cacheReadYuan + cacheWriteYuan;
+            double noCacheInputYuan = ((inputTokens + cacheRead + cacheCreation) / 1e6) * inputPrice;
+            return new CostBreakdown(inputYuan, outputYuan, cacheReadYuan, cacheWriteYuan,
+                totalYuan, noCacheInputYuan);
         }
-        // 非 anthropic（deepseek/openai）：input 已含 cache hit → 先扣命中按 miss 全价，命中折价，忽略 cache_write
+        // 非 anthropic（deepseek/openai）：input 已含 cache hit → 先扣命中按 miss 全价，命中折价，
+        // 忽略 cache_write（deepseek 无该档；cacheWriteYuan 记 0.0 而非 null —— PRICED 行的分项列齐全）
         long missTokens = Math.max(0L, inputTokens - cacheRead);
-        return (missTokens / 1e6) * inputPrice
-            + (outputTokens / 1e6) * outputPrice
-            + (cacheRead / 1e6) * cacheReadPrice;
+        double inputYuan = (missTokens / 1e6) * inputPrice;
+        double outputYuan = (outputTokens / 1e6) * outputPrice;
+        double cacheReadYuan = (cacheRead / 1e6) * cacheReadPrice;
+        double cacheWriteYuan = 0.0;
+        double totalYuan = inputYuan + outputYuan + cacheReadYuan + cacheWriteYuan;
+        double noCacheInputYuan = (inputTokens / 1e6) * inputPrice;
+        return new CostBreakdown(inputYuan, outputYuan, cacheReadYuan, cacheWriteYuan,
+            totalYuan, noCacheInputYuan);
     }
 
     /**

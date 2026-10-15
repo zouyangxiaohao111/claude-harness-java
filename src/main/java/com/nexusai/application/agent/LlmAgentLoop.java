@@ -1807,13 +1807,22 @@ public class LlmAgentLoop implements AgentLoop {
             budgetBeans != null ? budgetBeans.modelMapper() : null,
             budgetBeans != null ? budgetBeans.providerMapper() : null,
             effectiveModel, usage);
+        // [cache-savings] 本条消息自身的缓存命中率 · 口径单点 = CacheHitRate.of
+        //   （anthropic 分母含 cache 两项；非 anthropic input 已含 cache hit；分母 0 → null）。
+        //   mapper 与上方 snapshot 同源（ctx.tokenBudgetBeans()），⛔ 不新开取 mapper 的路径。
+        Double cacheHitRate = com.nexusai.application.agent.cost.CacheHitRate.of(
+            effectiveModel, usage,
+            budgetBeans != null ? budgetBeans.modelMapper() : null,
+            budgetBeans != null ? budgetBeans.providerMapper() : null);
         com.nexusai.eventbus.ws.MessageUsageEvent event =
             com.nexusai.eventbus.ws.MessageUsageEvent.of(
                 ctx.streamSessionId(), userMessageId, assistantMessageId,
                 com.nexusai.eventbus.ws.MessageUsageDto.from(usage, decodeMs),
                 snapshot.contextWindow(), snapshot.contextTokensUsed(), snapshot.percentLeft(),
                 // [D1 usage-source] run 级来源标记（state 盖章 · 缺省 "user"）→ 前端底部数字只统计 user 来源
-                state.usageSource());
+                state.usageSource(),
+                // [cache-savings] 本条消息命中率（null → NON_NULL 省略）
+                cacheHitRate);
         ws.convertAndSend(topic, event);
         if (log.isInfoEnabled()) {
             // [OBS2] 补打 topic：usage 与 chunk 走的是同一个 stream topic（ctx.streamTopic()），

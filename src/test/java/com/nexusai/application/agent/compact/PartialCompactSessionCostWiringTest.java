@@ -235,7 +235,8 @@ class PartialCompactSessionCostWiringTest {
         when(calc.isPeakHour()).thenReturn(false);
         when(calc.contextWindowFor(anyString())).thenReturn(200_000);
         when(calc.maxOutputFor(anyString())).thenReturn(8_192L);
-        when(calc.calculateCostYuan(anyString(), any(AgentUsage.class), anyBoolean())).thenAnswer(inv -> {
+        // V101：账本计价点 = price(...)（总额 = breakdown.totalYuan()）→ 替身的金额放 inputYuan，其余分项 0。
+        when(calc.price(anyString(), any(AgentUsage.class), anyBoolean())).thenAnswer(inv -> {
             String model = inv.getArgument(0);
             AgentUsage u = inv.getArgument(1);
             costCalls.add(new CostCall(model, u));
@@ -243,7 +244,8 @@ class PartialCompactSessionCostWiringTest {
             long inputSide = u.inputTokens()
                 + (u.cacheReadInputTokens() != null ? u.cacheReadInputTokens() : 0L)
                 + (u.cacheCreationInputTokens() != null ? u.cacheCreationInputTokens() : 0L);
-            return unit * inputSide;
+            double amount = unit * inputSide;
+            return new ModelCostCalculator.CostBreakdown(amount, 0.0, 0.0, 0.0, amount, amount);
         });
         return calc;
     }
