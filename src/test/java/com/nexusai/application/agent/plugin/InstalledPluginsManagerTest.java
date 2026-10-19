@@ -629,4 +629,38 @@ class InstalledPluginsManagerTest {
         assertFalse(merged.plugins().containsKey("cc-only@anthropic"),
             "DB plugin_claude_fallback=false → 不得回落实 CC 安装记录（V61 开关迁移 DB 后语义保留）");
     }
+
+    @Test
+    void manifest_skills_paths_parse_array_and_drop_invalid() throws Exception {
+        // WHY: 系列技能（skills/<系列>/<技能>/SKILL.md）默认扫描不到，必须靠 manifest.skills
+        //   把 <系列> 声明为附加技能根（CC pluginLoader.ts:1565-1583）；数组形式要逐项校验，
+        //   越界（../../escape）与不存在（./missing）必须丢弃（CC validatePluginPaths 同语义）。
+        Path root = tempDir.resolve("plugin-root");
+        Files.createDirectories(root.resolve(".claude-plugin"));
+        Files.createDirectories(root.resolve("series-a"));
+        Files.createDirectories(root.resolve("series-b"));
+        Files.writeString(root.resolve(".claude-plugin/plugin.json"),
+            "{\"name\":\"p\",\"skills\":[\"./series-a\",\"./series-b\",\"./missing\",\"../../escape\"]}");
+
+        List<String> paths = InstalledPluginsManager.manifestComponentPaths(root, "skills");
+
+        assertEquals(2, paths.size(), "只保留存在且在插件根内的两项");
+        assertTrue(paths.get(0).endsWith("series-a"));
+        assertTrue(paths.get(1).endsWith("series-b"));
+    }
+
+    @Test
+    void manifest_skills_paths_accepts_single_string_form() throws Exception {
+        // WHY: CC manifest.skills 允许字符串或数组两种写法（pluginLoader.ts:1567-1570）；
+        //   只支持数组会让单系列插件静默丢失附加技能根。
+        Path root = tempDir.resolve("plugin-root-string");
+        Files.createDirectories(root.resolve("only-series"));
+        Files.writeString(root.resolve("plugin.json"),
+            "{\"name\":\"p\",\"skills\":\"./only-series\"}");
+
+        List<String> paths = InstalledPluginsManager.manifestComponentPaths(root, "skills");
+
+        assertEquals(1, paths.size());
+        assertTrue(paths.get(0).endsWith("only-series"));
+    }
 }

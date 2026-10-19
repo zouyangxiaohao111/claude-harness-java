@@ -355,8 +355,9 @@ public final class LoadPluginCommands {
     /**
      * 从技能目录加载技能 · 对齐 CC loadSkillsFromDirectory（loadPluginCommands.ts:687-838）。
      *
-     * <p>skillsPath 自身含 SKILL.md → 直接技能（name=plugin:basename(skillsPath)，CC :699-757）；
-     * 否则扫描子目录，含 SKILL.md 者逐个加载（name=plugin:entryName，CC :759-835）。
+     * <p>skillsPath 自身含 SKILL.md → 直接技能（name=plugin:&lt;frontmatter.name|basename(skillsPath)&gt;，
+     * CC 2.1.296 :699-757）；否则扫描子目录，含 SKILL.md 者逐个加载（name=plugin:entryName，CC :759-835）。
+     * 技能名中的非 [A-Za-z0-9_-] 字符统一替换为 '-'（CC 2.1.296 :726/:806），目录内按名字排序（CC :838）。
      */
     private static void loadSkillsFromDirectory(Path skillsPath, String pluginName, Path pluginPath,
                                                 String sourceName, Set<String> loadedPaths,
@@ -367,7 +368,7 @@ public final class LoadPluginCommands {
         Path directSkill = skillsPath.resolve("SKILL.md");
         if (Files.isRegularFile(directSkill)) {
             if (loadedPaths.add(directSkill.toAbsolutePath().toString())) {
-                loadSkillFile(directSkill, pluginName, pluginPath, sourceName, all);
+                loadSkillFile(directSkill, pluginName, pluginPath, sourceName, true, all);
             }
             return;
         }
@@ -378,6 +379,7 @@ public final class LoadPluginCommands {
             log.warn("[LoadPluginCommands] 扫描技能目录失败: {} (plugin={}): {}", skillsPath, pluginName, e.getMessage());
             return;
         }
+        List<Command> local = new ArrayList<>();
         for (Path entry : entries) {
             if (!Files.isDirectory(entry) && !Files.isSymbolicLink(entry)) {
                 continue;
@@ -387,19 +389,28 @@ public final class LoadPluginCommands {
                 continue;
             }
             if (loadedPaths.add(skillFile.toAbsolutePath().toString())) {
-                loadSkillFile(skillFile, pluginName, pluginPath, sourceName, all);
+                loadSkillFile(skillFile, pluginName, pluginPath, sourceName, false, local);
             }
         }
+        // CC 2.1.296 :838 — 同一技能目录内按技能名排序（localeCompare 语义）
+        local.sort(java.util.Comparator.comparing(Command::getName));
+        all.addAll(local);
     }
 
     /**
-     * 单个技能文件加载 · 对齐 CC loadPluginCommands.ts:720-757（direct）与 :800-835（子目录）。
+     * 单个技能文件加载 · 对齐 CC 2.1.296（direct :699-757 / 子目录 :759-835）。
      *
-     * <p>技能名 = {@code plugin:basename(技能目录)}（CC :726/:806），isSkill=true + isSkillMode=true
-     * → loadedFrom='plugin'、progressMessage='loading'（CC :316/:322）。
+     * <ul>
+     *   <li>direct（skillsPath 自身含 SKILL.md）：技能名优先 frontmatter.name（以 "plugin:" 开头则剥前缀），
+     *       为空才回落 basename(skillsPath)（CC :726）</li>
+     *   <li>子目录：技能名 = 目录名（CC :806）</li>
+     *   <li>两者最后统一做 [^A-Za-z0-9_-] → '-' 规范化（CC :726/:806）</li>
+     * </ul>
+     *
+     * <p>isSkill=true + isSkillMode=true → loadedFrom='plugin'、progressMessage='loading'（CC :316/:322）。
      */
     private static void loadSkillFile(Path skillFile, String pluginName, Path pluginPath, String sourceName,
-                                      List<Command> all) {
+                                      boolean directSkill, List<Command> all) {
         String raw;
         try {
             raw = Files.readString(skillFile, StandardCharsets.UTF_8);
@@ -410,7 +421,18 @@ public final class LoadPluginCommands {
         Map<String, Object> fm = PARSER.parse(raw);
         String content = PARSER.extractBody(raw);
         Path dir = skillFile.getParent();
-        String base = dir != null ? dir.getFileName().toString() : "";
+        String base;
+        if (directSkill) {
+            Object fmName = fm.get("name");
+            String name = fmName instanceof String s ? s.trim() : "";
+            if (name.startsWith(pluginName + ":")) {
+                name = name.substring(pluginName.length() + 1);
+            }
+            base = !name.isEmpty() ? name : (dir != null ? dir.getFileName().toString() : "");
+        } else {
+            base = dir != null ? dir.getFileName().toString() : "";
+        }
+        base = base.replaceAll("[^A-Za-z0-9_-]", "-");
         String skillName = pluginName + ":" + base;
         Command c = createPluginCommand(skillName, skillFile, fm, content, pluginName, pluginPath,
             sourceName, true, true);

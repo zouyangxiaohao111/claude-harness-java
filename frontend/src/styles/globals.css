@@ -9330,8 +9330,8 @@ html {
 }
 .sm-card:hover {
   transform: translateY(-2px);
-  box-shadow: 0 12px 28px rgba(120, 90, 50, 0.12), 0 2px 6px rgba(0, 0, 0, 0.05);
-  border-color: var(--hairline-strong, #E2E2E2);
+  box-shadow: 0 12px 28px rgba(15, 95, 212, 0.14), 0 2px 6px rgba(0, 0, 0, 0.05);
+  border-color: var(--accent-soft-strong, #D8E6FC);
 }
 
 /* ---- 专家双列大卡 ---- */
@@ -9419,8 +9419,8 @@ html {
 
 /* 描述 2 行截断（webkit line-clamp · 兼容 WebView2/Chromium） */
 .sm-desc {
-  font-size: 12px;
-  line-height: 1.5;
+  font-size: 12.5px;
+  line-height: 1.55;
   color: var(--ink-muted, #2c3440);
   display: -webkit-box;
   -webkit-line-clamp: 2;
@@ -9473,19 +9473,17 @@ html {
 .sm-shuffle:hover { background: var(--accent-soft, rgba(15,95,212, 0.12)); }
 .sm-shuffle:disabled { opacity: 0.4; cursor: default; }
 
-/* 精选：横条（超出横向滚动） */
-.sm-skill-row { display: flex; gap: 10px; overflow-x: auto; padding: 2px 2px 8px; }
-.sm-skill-row .sm-mini-card { flex: 0 0 190px; }
-
-/* 技能/连接器 3 列小卡 */
+/* 技能/连接器：宽屏 3 列、窄窗自动 2 列（对齐 workbuddy 版式并按弹窗宽度自适应） */
 .sm-skill-grid,
 .sm-connector-grid {
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
-  gap: 10px;
-  align-items: start;
+  grid-template-columns: repeat(auto-fill, minmax(280px, 1fr));
+  gap: 12px;
+  align-items: stretch;
 }
-.sm-mini-card { padding: 11px 12px; display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.sm-mini-card { padding: 13px 14px; display: flex; flex-direction: column; gap: 8px; min-width: 0; min-height: 116px; }
+/* 区块标题右侧「N 个技能」计数 */
+.sm-result-count { margin-left: auto; font-size: 11px; color: var(--ink-faint, #9aa3b2); white-space: nowrap; }
 .sm-mini-card.installed { background: rgba(93, 184, 114, 0.04); border-color: rgba(93, 184, 114, 0.35); }
 .sm-mini-head { display: flex; align-items: center; gap: 8px; min-width: 0; }
 .sm-mini-name {
@@ -9507,6 +9505,21 @@ html {
   padding: 1px 8px;
   border-radius: var(--r-pill, 9999px);
 }
+/* [2026-10-19] 已安装技能卡操作区：「已安装」+「召唤」并排；召唤 = 写入 /技能命令名 到输入框 */
+.sm-mini-actions { display: inline-flex; align-items: center; gap: 6px; flex-shrink: 0; }
+.sm-summon-btn {
+  border: 1px solid var(--accent, #0f5fd4);
+  background: var(--accent, #0f5fd4);
+  color: #FFFFFF;
+  font-size: 10px;
+  font-weight: 600;
+  padding: 2px 10px;
+  border-radius: var(--r-pill, 9999px);
+  cursor: pointer;
+  font-family: inherit;
+  transition: background .15s ease, border-color .15s ease;
+}
+.sm-summon-btn:hover { background: var(--accent-hover, #0a49a8); border-color: var(--accent-hover, #0a49a8); }
 .sm-plus-btn {
   flex-shrink: 0;
   width: 20px;
@@ -10004,6 +10017,55 @@ html {
   background: rgba(15,95,212,.24);
   box-shadow: 0 0 0 1px var(--accent, #0f5fd4), 0 3px 10px rgba(20,24,31,.20);
 }
+
+/* [2026-10-19] 输入框内「/技能/命令」前缀 chip（补全选中后可视化；底层仍是 /xxxx 文本协议）。
+   ⛔ 不加 border/padding、不动 font 属性（会改变高亮层与 textarea 的对齐/字宽）——沿用 @chip 的
+   box-shadow 描边手法；删除 × 用绝对定位（不占排版宽度，hover 出现，避免文字跳动）。 */
+/* [2026-10-19 v3 · 对齐用户截图] 输入框内「/技能/命令」前缀 chip：浅灰圆角 pill、× 常显在左侧、
+   无边框无阴影（背景本身完整，不会被输入框容器裁剪）。
+   ⚠️ 高亮层与 textarea 是双层叠加（textarea 文字可见）：chip 的 padding 必须用**等量负 margin**
+   抵消 ⇒ 文字起点与流占位与 textarea 逐字一致（否则重影错位），而 pill 背景仍可向两侧铺开；
+   × 放在左侧 padding 区（斜杠前缀总在行首，左侧无字符，不会遮挡文字），命中区=整块 chip。 */
+/* [v5 · 2026-10-19 用户裁定] ①灰底恰好包裹显示名（中文名）长度，不随命令名变长；②× 悬停才显示且加大。
+   实现：chip=透明流容器（phantom 撑出与 textarea 逐字相同的宽度 ⇒ 光标/后续文字对齐）；
+   visual=绝对定位、收缩包裹「显示名」，背景圆角画在这里（宽度由内容决定，shrink-to-fit）；
+   悬停时 visual 向左展开 padding 给 × 腾位（左缘不动，不越输入框边界）；
+   textarea 文字已交还高亮层渲染 ⇒ 命令名原文不会从 pill 外露出。 */
+.composer .input-box .input-slash-chip {
+  position: relative;
+  display: inline-flex;
+  pointer-events: none; /* 流容器不接事件：原宽区域（pill 之外）不可点击，避免误删 */
+}
+.composer .input-box .input-slash-chip .input-slash-chip-phantom { color: transparent; }
+.composer .input-box .input-slash-chip .input-slash-chip-visual {
+  position: absolute;
+  left: 0; top: 0; bottom: 0;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 2px 0 6px; /* 手动 /命令：token 余量约 8.7px（"/" 4.7 + 尾空格 4）⇒ 左 6 让 "/" 完整落在灰底内，右 2 不压后续字 */
+  background: #eceef2;
+  border-radius: 999px;
+  white-space: nowrap;
+  cursor: pointer;
+  pointer-events: auto;
+  transition: background .15s ease, padding-left .15s ease;
+}
+/* [2026-10-19] 召唤 chip（显示名）：尾部带 5 个空格（20px），左右内边距各 10px（左右对称），
+   全部落在空格区 ⇒ pill 右缘刚好不压后续首字。⛔ 与 Composer.tsx SUMMON_TRAILING_SPACES 成对修改。 */
+.composer .input-box .input-slash-chip .input-slash-chip-visual--alias { padding: 0 10px; }
+.composer .input-box .input-slash-chip .input-slash-chip-visual:hover { background: #dfe3ea; padding-left: 20px; }
+.composer .input-box .input-slash-chip .input-slash-chip-visual--alias:hover { padding-left: 22px; }
+.composer .input-box .input-slash-chip .input-slash-chip-visual--alias .input-slash-chip-x { left: 8px; }
+.composer .input-box .input-slash-chip .input-slash-chip-label { color: var(--ink, #1d2530); }
+.composer .input-box .input-slash-chip .input-slash-chip-x {
+  position: absolute;
+  left: 4px; top: 50%; transform: translateY(-50%);
+  width: 14px; height: 14px; line-height: 14px; text-align: center;
+  font-size: 15px; font-weight: 400; color: #5f6875;
+  opacity: 0; pointer-events: none;
+  transition: opacity .12s ease;
+}
+.composer .input-box .input-slash-chip .input-slash-chip-visual:hover .input-slash-chip-x { opacity: 1; }
 
 /* [2026-09-07] 轨迹行点击看完整内容 */
 .trace-record.clickable { cursor: pointer; }

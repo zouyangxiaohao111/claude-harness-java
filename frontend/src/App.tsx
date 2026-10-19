@@ -54,7 +54,7 @@ import { RetryBanner } from '@/components/center/RetryBanner'
 import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
 import { CompactProgressBar } from '@/components/center/CompactProgressBar'
 import { NotificationBanner } from '@/components/center/NotificationBanner'
-import { Composer } from '@/components/center/Composer'
+import { Composer, SUMMON_TRAILING_SPACES } from '@/components/center/Composer'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
@@ -157,6 +157,11 @@ function App() {
 
   // ---- 技能市场弹窗（Composer 顶部 agent 胶囊点击触发 · App 持有开关 + 渲染 SkillMarketModal）----
   const [showMarket, setShowMarket] = useState(false)
+  /** 斜杠前缀 chip 的显示别名（召唤技能时携带中文显示名；Composer 仅在前缀名匹配时使用） */
+  const [slashAlias, setSlashAlias] = useState<{ name: string; display: string } | null>(null)
+  /** sendMessage 内读取最新别名的 ref（避免把 alias 加进 useCallback 依赖列表） */
+  const slashAliasRef = useRef<{ name: string; display: string } | null>(null)
+  slashAliasRef.current = slashAlias
 
   // ---- local UI state (kept tiny) ----
   // 中心区视图：'chat' 对话 / 'trace' 轨迹（dsh 式记录列表）
@@ -1611,7 +1616,14 @@ function App() {
 
   // ---- composer ----
   const sendMessage = useCallback(async (attachments?: AttachmentRequest[]) => {
-    const text = composerText.trim()
+    let text = composerText.trim()
+    // [v6 · 2026-10-19] 召唤技能的输入框文本 = 中文显示名 ⇒ 发送时先还原为真实斜杠命令
+    // （下面的命令分发/执行逻辑依赖 "/" 开头，必须先于它还原）。
+    const alias = slashAliasRef.current
+    if (alias && alias.display !== alias.name) {
+      if (text === alias.display) text = '/' + alias.name
+      else if (text.startsWith(alias.display + ' ')) text = '/' + alias.name + ' ' + text.slice(alias.display.length + 1)
+    }
     // 允许纯图片附件发送（无文字时 content 传空串）；完全无内容不发
     if ((!text && !attachments?.length) || !activeSessionId) return
     // 新 user 消息 → 清除上一轮 API 错误卡（错误卡属上一轮对话 · message.error 已渲染在消息流）
@@ -2003,6 +2015,7 @@ function App() {
             sessionId={activeSessionId ?? ''}
             currentAgent={currentAgent}
             onClearAgent={() => void handleAgentChange(null)}
+            slashAlias={slashAlias}
             onOpenMarket={() => setShowMarket(true)}
             empty={storeMessages.length === 0 && !hasStream}
             onOpenUsageCost={() => setShowUsageCost(true)}
@@ -2124,6 +2137,19 @@ function App() {
           onClose={() => setShowMarket(false)}
           onUseLocalAgent={handleMarketUseLocal}
           onUseRemoteExpert={(e) => void handleMarketUseRemote(e)}
+          onSummonSkill={(cmd, display) => {
+            setShowMarket(false)
+            // 有中文显示名 → 输入框用显示名本身（发送时还原为 /命令名）；否则维持 /命令名
+            if (display) {
+              setComposerText(`${display}${SUMMON_TRAILING_SPACES}`)
+              setSlashAlias({ name: cmd, display })
+            } else {
+              setComposerText(`/${cmd} `)
+              setSlashAlias(null)
+            }
+            // 召唤后聚焦输入框，用户可以接着输入（等弹窗关闭后再聚焦）
+            setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 60)
+          }}
           showToast={showToast}
         />
       )}

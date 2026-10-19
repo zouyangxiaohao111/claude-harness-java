@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
+import { commandApi } from '@/api/command'
 import { marketApi } from '@/api/market'
 import type {
   AgentListItem,
@@ -37,7 +38,7 @@ export type MarketSourceId = 'tencent-workbuddy' | 'jianke-market' | 'local'
 /** 建科数字插件市场（自建 MinIO）· 内置固定地址（用户拍板 2026-09-17）。
  *  指向 marketplace.json 索引（几 KB）——看列表只拉索引；装插件时后端按 source 只下载
  *  对应插件包 plugin.zip（按需，上千插件不整包下载）。公网入口 netHost 任意网络可达。 */
-const JIANKE_MARKET_URL = 'http://101.68.93.109:9102/nexusai/marketplace/marketplace.json'
+const JIANKE_MARKET_URL = 'http://192.168.20.125:9000/nexusai/marketplace/marketplace.json'
 
 /** 市场来源下拉（多源：建科数字插件市场 / 腾讯 workbuddy / 本地 · 建科默认排首） */
 const MARKET_SOURCES: { id: MarketSourceId; label: string }[] = [
@@ -48,6 +49,15 @@ const MARKET_SOURCES: { id: MarketSourceId; label: string }[] = [
 
 /** 头像兜底色板（图标 URL 缺失时用名字首字 + 色块） */
 const AVATAR_COLORS = ['#0f5fd4', '#5B8DC9', '#5DB872', '#7B61FF', '#C99417', '#4A6CF7', '#0a49a8', '#D9534F']
+
+/** 分类标签中文化（服务端 tags 是英文；未命中的原样展示） */
+const CATEGORY_LABELS: Record<string, string> = {
+  docs: '写作', writing: '写作',
+  review: '审查', quality: '质量', compliance: '合规', report: '报告',
+  design: '设计', architecture: '架构',
+  ppt: '演示', pptx: '演示', presentation: '演示',
+  svn: 'SVN', data: '数据', analyst: '分析', engineering: '工程',
+}
 function colorOf(name: string): string {
   let h = 0
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
@@ -73,7 +83,7 @@ interface ExpertCard {
   inUse: boolean
 }
 
-export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUseLocalAgent, onUseRemoteExpert, showToast }: {
+export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUseLocalAgent, onUseRemoteExpert, onSummonSkill, showToast }: {
   /** 当前会话 id（/agents/list + /market/* + POST use 需要） */
   sessionId: string
   /** 当前会话主线程 agent（null/空串=默认模式 · 专家卡「使用中」判定 + 使用后胶囊回显） */
@@ -86,6 +96,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   onUseLocalAgent?: (agentType: string) => void
   /** 使用远端专家（marketId）→ App 调 marketApi.useExpert + 刷新 currentAgent + 关弹窗 + toast */
   onUseRemoteExpert?: (expert: MarketExpert) => void
+  /** 召唤已安装技能（技能命令名 + 中文显示名）→ App 关弹窗 + 把「/命令名 」写入输入框（2026-10-19 用户需求） */
+  onSummonSkill?: (commandName: string, displayName?: string) => void
   /** 轻提示 */
   showToast: (msg: string, type?: 'success' | 'info') => void
 }) {
@@ -115,7 +127,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   })
   const toMarketSkill = (p: ExternalMarketPlugin): MarketSkill => ({
     marketId: p.name, name: p.name, displayName: p.displayName, description: p.description,
-    categories: p.category ? [p.category] : [], remote: true,
+    // 分类胶囊取「category + tags」（过滤掉内部标记 skill 后就是 docs/review/design/ppt…）
+    categories: [p.category ?? '', ...(p.tags ?? [])].filter(Boolean), remote: true,
   })
   const toMarketConnector = (p: ExternalMarketPlugin): MarketConnector => ({
     marketId: p.name, name: p.displayName || p.name, authType: p.tags?.[0], remote: true,
@@ -200,22 +213,24 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     return () => { cancelled = true }
   }, [sessionId, source])
 
-  // ---- 已安装计数（顶栏 · =preinstalled 或 isConnected 或本地已装专家数）----
+  // ---- 已安装计数（顶栏 · =preinstalled / 已装插件 / isConnected / 本地已装专家数）----
   const installedCount = tab === 'expert'
     ? localAgents.length + experts.filter((e) => e.preinstalled).length
     : tab === 'skill'
-      ? skills.filter((s) => s.preinstalled).length
+      ? skills.filter((s) => s.preinstalled || installed.has(s.marketId)).length
       : connectors.filter((c) => c.isConnected).length
 
-  // ---- 技能分类胶囊（从返回 categories 聚合 + 全部）----
+  // ---- 技能分类胶囊（category + tags → 中文标签，按显示名去重；`skill` 是内部标记不展示）----
   const skillCategories = useMemo(() => {
-    const all: string[] = []
+    const labels: string[] = []
     for (const s of skills) {
       for (const c of s.categories ?? []) {
-        if (c && !all.includes(c)) all.push(c)
+        if (!c || c === 'skill') continue
+        const label = CATEGORY_LABELS[c] ?? c
+        if (!labels.includes(label)) labels.push(label)
       }
     }
-    return all
+    return labels
   }, [skills])
   const [cat, setCat] = useState<string>('全部')
 
@@ -284,6 +299,45 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     }
   }
 
+  // ---- 召唤已安装技能：把「/技能真实注册名 」交给 App 写入输入框（Composer 侧渲染为可删 chip）----
+  //   2026-10-19 用户需求：安装成功后可直接选择召唤，输入框以斜杠前缀展示且可悬停删除。
+  //   注册名不猜规则（⛔ 不做 zjky- 前缀裁剪——有些技能名本身就以 zjky 开头、市场标识与注册名不同源）：
+  //   已装技能必然出现在后端命令目录里（实测 detection-report-reviewer 案例），实时拉取后按
+  //   「命令名 === 市场名 或 市场名以它结尾」匹配（多个候选取最长），匹配不到则中止并提示。
+  const summonSkill = async (skill: MarketSkill) => {
+    if (busy) {
+      showToast('对话进行中，请等当前轮完成后再召唤技能', 'info')
+      return
+    }
+    if (!onSummonSkill) {
+      showToast('当前环境不支持召唤，请手动在输入框输入斜杠命令', 'info')
+      return
+    }
+    let cmd: string | null = null
+    try {
+      const list = await commandApi.list(false, sessionId || undefined)
+      const names = list.map((c) => c.name)
+      const lm = skill.marketId.toLowerCase()
+      // 插件技能的真实注册名 =「插件名:技能目录名」（LoadPluginCommands.loadSkillFile：
+      // skillName = pluginName + ':' + basename）⇒ 优先按 <marketId>: 前缀匹配；
+      // 其后兼容「命令名 === 市场名」与「市场名以命令名结尾」两种旧形态。
+      cmd =
+        names.find((n) => n.toLowerCase().startsWith(lm + ':')) ??
+        names.find((n) => n.toLowerCase() === lm) ??
+        names
+          .filter((n) => lm.endsWith(n.toLowerCase()))
+          .sort((a, b) => b.length - a.length)[0] ??
+        null
+    } catch {
+      cmd = null
+    }
+    if (!cmd) {
+      showToast('该技能未注册成斜杠命令（安装包缺少 skills/<名称>/SKILL.md 结构），请检查插件安装', 'info')
+      return
+    }
+    onSummonSkill(cmd, skill.displayName || undefined)
+  }
+
   // ---- 使用已安装的插件专家（agentType = <插件名>:<agent名> · 从 pluginAgents 匹配）----
   const useInstalledPlugin = (pluginName: string) => {
     const agent = pluginAgents.find((a) => a.agentType.startsWith(`${pluginName}:`))
@@ -317,7 +371,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   // ---- 技能过滤（分类胶囊 + 搜索）----
   const filteredSkills = useMemo(() => {
     return skills.filter((s) => {
-      if (cat !== '全部' && !(s.categories ?? []).includes(cat)) return false
+      if (cat !== '全部' && !(s.categories ?? []).some((c) => (CATEGORY_LABELS[c] ?? c) === cat)) return false
       return matchAny(s.displayName, s.name, s.description)
     })
   }, [skills, cat, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -333,13 +387,6 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const toggleMark = (kind: string, id: string) =>
     setMarked((prev) => { const n = new Set(prev); const k = markKey(kind, id); if (n.has(k)) n.delete(k); else n.add(k); return n })
   const isMarked = (kind: string, id: string) => marked.has(markKey(kind, id))
-
-  // ---- 精选技能横条：换一换占位（从过滤结果按窗口滚动取一段）----
-  const [featOffset, setFeatOffset] = useState(0)
-  const FEAT_SHOW = 6
-  const featured = filteredSkills.length <= FEAT_SHOW
-    ? filteredSkills
-    : Array.from({ length: FEAT_SHOW }, (_, i) => filteredSkills[(featOffset + i) % filteredSkills.length])
 
   // ---- 头像（远端 icon URL → img；缺失/本地 → 色块）----
   const renderAvatar = (c: { iconUrl: string | null; iconColor: string; iconText: string; name: string }) => (
@@ -472,54 +519,73 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
 
               {tab === 'skill' && (
                 <div className="sm-skill-wrap">
-                  {/* 分类胶囊一行 */}
+                  {/* 分类胶囊 + 计数：始终常驻（筛选后结果变少也不会失去退回“全部”的入口） */}
                   <div className="sm-cat-row">
                     {['全部', ...skillCategories].map((c) => (
-                      <button key={c} className={`sm-cat${cat === c ? ' active' : ''}`} onClick={() => setCat(c)}>{c}</button>
+                      <button key={c} className={`sm-cat${cat === c ? ' active' : ''}`} onClick={() => setCat(c)}>
+                        {c}
+                      </button>
                     ))}
+                    <span className="sm-result-count">{filteredSkills.length} 个技能</span>
                   </div>
 
-                  {/* 精选技能区（标题 + 换一换占位 → 横条滚动取段） */}
-                  <div className="sm-section-head">
-                    <span className="sm-section-title">精选技能</span>
-                    <button className="sm-shuffle" onClick={() => setFeatOffset((o) => (o + FEAT_SHOW) % Math.max(filteredSkills.length, 1))} disabled={filteredSkills.length === 0}>
-                      换一换
-                    </button>
-                  </div>
-                  {featured.length === 0 ? (
-                    <div className="sm-empty small">{keyword ? '没有匹配的技能' : '暂无可用技能'}</div>
-                  ) : (
-                    <div className="sm-skill-row">
-                      {featured.map((s) => (
-                        <SkillMiniCard
-                          key={`feat-${s.marketId}`}
-                          skill={s}
-                          marked={isMarked('skill', s.marketId)}
-                          onMark={() => toggleMark('skill', s.marketId)}
-                          onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
-                        />
-                      ))}
-                    </div>
-                  )}
-
-                  {/* 推荐区（3 列小卡） */}
-                  <div className="sm-section-head">
-                    <span className="sm-section-title">推荐</span>
-                  </div>
                   {filteredSkills.length === 0 ? (
                     <div className="sm-empty small">{keyword ? '没有匹配的技能' : '暂无可用技能'}</div>
-                  ) : (
+                  ) : cat !== '全部' || keyword ? (
+                    /* 筛选/搜索态：单一网格（不再分区，避免精选区只剩 3 个造成误解） */
                     <div className="sm-skill-grid">
                       {filteredSkills.map((s) => (
                         <SkillMiniCard
-                          key={`rec-${s.marketId}`}
+                          key={`flt-${s.marketId}`}
                           skill={s}
                           marked={isMarked('skill', s.marketId)}
                           onMark={() => toggleMark('skill', s.marketId)}
                           onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
+                          installedNow={installed.has(s.marketId)}
+                          onSummon={() => summonSkill(s)}
                         />
                       ))}
                     </div>
+                  ) : (
+                    /* 默认态：精选前 3 + 推荐其余（两区不重复） */
+                    <>
+                      <div className="sm-section-head">
+                        <span className="sm-section-title">精选技能</span>
+                      </div>
+                      <div className="sm-skill-grid">
+                        {filteredSkills.slice(0, 3).map((s) => (
+                          <SkillMiniCard
+                            key={`feat-${s.marketId}`}
+                            skill={s}
+                            marked={isMarked('skill', s.marketId)}
+                            onMark={() => toggleMark('skill', s.marketId)}
+                            onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
+                            installedNow={installed.has(s.marketId)}
+                            onSummon={() => summonSkill(s)}
+                          />
+                        ))}
+                      </div>
+                      {filteredSkills.length > 3 && (
+                        <>
+                          <div className="sm-section-head">
+                            <span className="sm-section-title">推荐</span>
+                          </div>
+                          <div className="sm-skill-grid">
+                            {filteredSkills.slice(3).map((s) => (
+                              <SkillMiniCard
+                                key={`rec-${s.marketId}`}
+                                skill={s}
+                                marked={isMarked('skill', s.marketId)}
+                                onMark={() => toggleMark('skill', s.marketId)}
+                                onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
+                                installedNow={installed.has(s.marketId)}
+                                onSummon={() => summonSkill(s)}
+                              />
+                            ))}
+                          </div>
+                        </>
+                      )}
+                    </>
                   )}
                 </div>
               )}
@@ -574,27 +640,47 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   )
 }
 
-/** 技能小卡（精选横条 + 推荐网格共用）· 3 列小卡：图标 + 名 + 描述 2 行截断 + 右上「+」。
- *  onInstall 存在（建科市场来源）→ 「+」调安装；否则维持骨架 UI 高亮（onMark）。 */
-function SkillMiniCard({ skill, marked, onMark, onInstall }: {
+/** 技能小卡（精选横条 + 推荐网格共用）· 3 列小卡：图标 + 名 + 描述 2 行截断 + 右上操作区。
+ *  未安装：建科市场来源「+」调安装 / 骨架来源 UI 高亮（onMark）；
+ *  已安装（preinstalled 或本次刚装成功 installedNow）：显示「已安装」+「召唤」——
+ *  召唤 = 把 /技能命令名 写入输入框（2026-10-19 用户需求：安装成功可直接选择召唤）。 */
+function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false, onSummon }: {
   skill: MarketSkill
   marked: boolean
   onMark: () => void
   onInstall?: (marketId: string) => void
+  /** 本次会话内安装成功（installed Set 命中；与服务端 preinstalled 合并判定） */
+  installedNow?: boolean
+  /** 召唤到输入框（仅已安装卡提供） */
+  onSummon?: () => void
 }) {
   const nm = skill.displayName || skill.name || skill.marketId
+  const installed = !!skill.preinstalled || installedNow
   return (
-    <div className={`sm-card sm-mini-card${skill.preinstalled ? ' installed' : ''}`}>
+    <div className={`sm-card sm-mini-card${installed ? ' installed' : ''}`}>
       <div className="sm-mini-head">
         {skill.icon
           ? <img className="sm-avatar sm-avatar-img sm-avatar-sm" src={skill.icon} alt={nm} loading="lazy" />
           : <span className="sm-avatar sm-avatar-sm" style={{ background: colorOf(nm) }}>{(nm ?? '?').charAt(0).toUpperCase()}</span>}
         <span className="sm-mini-name" title={nm}>{nm}</span>
-        {skill.preinstalled
-          ? <span className="sm-installed-mark">已安装</span>
+        {installed
+          ? (
+              <span className="sm-mini-actions">
+                <span className="sm-installed-mark">已安装</span>
+                {onSummon && (
+                  <button
+                    className="sm-summon-btn"
+                    onClick={onSummon}
+                    title={`召唤到输入框：/${skill.name || skill.marketId}`}
+                  >
+                    召唤
+                  </button>
+                )}
+              </span>
+            )
           : onInstall
             ? (
-                <button className="sm-plus-btn" onClick={() => onInstall(skill.marketId)} title="安装">
+                <button className="sm-plus-btn" onClick={() => onInstall(skill.marketId)} title={`安装 ${nm}`}>
                   +
                 </button>
               )

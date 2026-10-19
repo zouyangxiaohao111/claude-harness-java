@@ -164,6 +164,8 @@ interface ComposerProps {
   currentAgent?: string | null
   /** 清除当前专家（胶囊悬停 ▾→× 点击触发；由 App 走 handleAgentChange(null)） */
   onClearAgent?: () => void
+  /** 斜杠前缀 chip 的显示别名（召唤技能时带中文显示名；仅当前缀名匹配时生效） */
+  slashAlias?: { name: string; display: string } | null
   /** 点击顶部 agent 胶囊 → 打开技能市场弹窗（App 持有 showMarket state） */
   onOpenMarket?: () => void
 }
@@ -201,14 +203,62 @@ function renderBudget(text: string): ReactNode[] {
   return out
 }
 
-// 把输入文本拆成「普通片段(+budget 高亮) + @引用 chip」
-// @引用 chip 渲染在「高亮层」（textArea 之上、透明副本）里 → 鼠标 hover/点击命中 chip 本体；
-// 视觉样式由 .input-at-chip（globals.css）提供（阴影框 · hover 加深阴影 · 点击移除）。
-function renderHighlighted(text: string, onChipRemove?: (token: string) => void): ReactNode[] {
+// 斜杠技能/命令前缀：匹配「开头 /名称 + 尾随空白」= 补全选中后的已选态（输入中的半截不匹配，交给补全菜单）。
+// [2026-10-19 用户裁定] 技能选择沿用 /xxxx 文本协议，但前端在高亮层把它可视化成一个 chip（可点删除）。
+const SLASH_PREFIX_RE = /^\/([A-Za-z0-9_:.-]+)(\s+)/
+
+// 把输入文本拆成「普通片段(+budget 高亮) + @引用 chip + /技能前缀 chip」
+// chip 渲染在「高亮层」（textArea 之上、透明副本）里 → 鼠标 hover/点击命中 chip 本体；
+// 视觉样式由 .input-at-chip / .input-slash-chip（globals.css）提供（阴影框 · hover 加深阴影 · 点击移除）。
+/**
+ * 召唤写入的尾随空格（5 个 = 20px）：pill 的左右内边距（10px + 10px）恰好落在这段空格里，
+ * 右缘既不压后续首字、也不留多余空隙。⛔ 与 globals.css `.input-slash-chip-visual--alias` 成对修改。
+ */
+export const SUMMON_TRAILING_SPACES = '     '
+
+function renderHighlighted(
+  text: string,
+  onChipRemove?: (token: string) => void,
+  slashAlias?: { name: string; display: string } | null,
+): ReactNode[] {
   const nodes: ReactNode[] = []
   let last = 0
+  // [v6 · 2026-10-19] 两种前缀，chip 展示的**就是真实文本**（宽度一致 ⇒ 后续文字紧贴、光标对齐）：
+  // ① 召唤来的技能：输入框真实文本 = 中文显示名（发送时由 App 还原为 /命令名）；
+  // ② 手动输入的 /命令：真实文本 = /命令名。
+  let chip: { token: string; label: string; fromAlias: boolean } | null = null
+  if (slashAlias && slashAlias.display && text.startsWith(slashAlias.display + SUMMON_TRAILING_SPACES)) {
+    chip = { token: slashAlias.display + SUMMON_TRAILING_SPACES, label: slashAlias.display, fromAlias: true }
+  } else {
+    const slash = text.match(SLASH_PREFIX_RE)
+    if (slash) chip = { token: slash[0], label: slash[1], fromAlias: false }
+  }
+  if (chip) {
+    // 透明占位 = 真实前缀原文（含 "/" 与尾空格），保证流宽与 textarea 逐字符一致
+    const phantomText = text.slice(0, chip.token.length)
+    nodes.push(
+      <span key="slash-prefix" className="input-slash-chip">
+        <span className="input-slash-chip-phantom" aria-hidden="true" style={{ color: 'transparent' }}>
+          {phantomText}
+        </span>
+        {/* 视觉层：absolute 收缩包裹「× + 名称」，背景恰好包裹文字；点击删除挂在这里 */}
+        <span
+          className={`input-slash-chip-visual${chip.fromAlias ? ' input-slash-chip-visual--alias' : ''}`}
+          title="点击移除技能/命令"
+          onClick={() => onChipRemove?.(chip!.token)}
+        >
+          <span className="input-slash-chip-x" aria-hidden="true">
+            ×
+          </span>
+          <span className="input-slash-chip-label">{chip.label}</span>
+        </span>
+      </span>,
+    )
+    last = chip.token.length
+  }
   for (const m of text.matchAll(AT_TOKEN_RE)) {
     const idx = m.index ?? 0
+    if (idx < last) continue
     if (idx > last) nodes.push(...renderBudget(text.slice(last, idx)))
     nodes.push(
       <span
@@ -226,7 +276,7 @@ function renderHighlighted(text: string, onChipRemove?: (token: string) => void)
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, onOpenMarket }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -948,7 +998,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 ...HIGHLIGHT_TEXT_STYLE,
               }}
             >
-              {renderHighlighted(composerText, removeAtChip)}
+              {renderHighlighted(composerText, removeAtChip, slashAlias)}
             </div>
             <textarea
               ref={textareaRef}
@@ -1017,11 +1067,14 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 }
               }}
               style={{
+                ...HIGHLIGHT_TEXT_STYLE,
                 position: 'relative',
                 background: 'transparent',
-                color: 'var(--ink)',
                 zIndex: 1,
-                ...HIGHLIGHT_TEXT_STYLE,
+                // [v6] 文字由 textarea 显示（高亮层仅画 chip 装饰、色为 transparent）；
+                // chip 的可见文字是 visual 层 label（与真实文本同字同位置重叠渲染）。
+                color: 'var(--ink)',
+                caretColor: 'var(--ink)',
               }}
             ></textarea>
             {cmdMatches && (

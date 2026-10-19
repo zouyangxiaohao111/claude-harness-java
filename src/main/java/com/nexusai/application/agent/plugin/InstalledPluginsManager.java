@@ -687,6 +687,9 @@ public class InstalledPluginsManager {
         Path commandsPath = dirExists(base, "commands");
         Path skillsPath = dirExists(base, "skills");
         Path outputStylesPath = dirExists(base, "output-styles");
+        // [对齐 CC 2.1.296 pluginLoader.ts:1565-1583] manifest.skills（字符串或数组）=
+        //   附加技能根（如 "./skills/<系列>"，让 skills/<系列>/<技能>/SKILL.md 这种分组结构可加载）。
+        List<String> skillsPaths = manifestComponentPaths(base, "skills");
         return new InstalledRecord(
             name,
             pi.version(),
@@ -699,7 +702,7 @@ public class InstalledPluginsManager {
             installPath,
             parseEpoch(pi.lastUpdated()),
             pi.gitCommitSha(),
-            commandsPath, List.of(), skillsPath, List.of(), outputStylesPath, List.of(), Map.of());
+            commandsPath, List.of(), skillsPath, skillsPaths, outputStylesPath, List.of(), Map.of());
     }
 
     /** <code>&lt;base&gt;/child</code> 存在且为目录 → 返回路径，否则 null（CC pathExists 等价）。 */
@@ -709,6 +712,65 @@ public class InstalledPluginsManager {
         }
         Path p = base.resolve(child);
         return Files.isDirectory(p) ? p : null;
+    }
+
+    /**
+     * manifest 附加组件路径 · 对齐 CC pluginLoader.ts:1565-1583（{@code manifest.skills}）。
+     *
+     * <p>字段支持字符串或数组；每个路径相对插件根 resolve，越界（不在插件根内）或不存在则丢弃
+     * （CC {@code validatePluginPaths} 同语义）。manifest 优先读取 {@code .claude-plugin/plugin.json}，
+     * 否则 {@code plugin.json}。
+     */
+    static List<String> manifestComponentPaths(Path base, String field) {
+        if (base == null) {
+            return List.of();
+        }
+        Path dotClaudeManifest = base.resolve(".claude-plugin").resolve("plugin.json");
+        Path manifest = Files.isRegularFile(dotClaudeManifest) ? dotClaudeManifest : base.resolve("plugin.json");
+        if (!Files.isRegularFile(manifest)) {
+            return List.of();
+        }
+        try {
+            JsonNode root = JSON.readTree(Files.readString(manifest));
+            JsonNode node = root != null ? root.get(field) : null;
+            if (node == null) {
+                return List.of();
+            }
+            List<String> out = new ArrayList<>();
+            if (node.isArray()) {
+                for (JsonNode item : node) {
+                    addManifestPath(base, item, out, field, manifest);
+                }
+            } else {
+                addManifestPath(base, node, out, field, manifest);
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[InstalledPluginsManager] manifest 附加 {} 路径: {}（manifest={}）", field, out, manifest);
+            }
+            return List.copyOf(out);
+        } catch (Exception e) {
+            log.warn("[InstalledPluginsManager] 读取 manifest 附加 {} 路径失败: {}: {}", field, manifest, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /** 单个 manifest 路径：文本 → 相对插件根 resolve → 越界/不存在丢弃。 */
+    private static void addManifestPath(Path base, JsonNode item, List<String> out,
+                                        String field, Path manifest) {
+        if (item == null || !item.isTextual()) {
+            return;
+        }
+        String raw = item.asText().trim();
+        if (raw.isEmpty()) {
+            return;
+        }
+        Path baseNorm = base.normalize();
+        Path resolved = baseNorm.resolve(raw).normalize();
+        if (!resolved.startsWith(baseNorm) || !Files.exists(resolved)) {
+            log.warn("[InstalledPluginsManager] manifest {} 路径无效（越界或不存在）: {}（manifest={}）", field, raw, manifest);
+            return;
+        }
+        out.add(resolved.toString());
     }
 
     /** 内存 → V2 视图（供 hasPendingUpdates 与磁盘比对）。 */

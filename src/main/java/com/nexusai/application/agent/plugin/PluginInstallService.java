@@ -11,7 +11,10 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Service;
 
 import java.io.IOException;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.StandardCopyOption;
 import java.util.Map;
 
 /**
@@ -145,6 +148,7 @@ public class PluginInstallService {
             if (!marketplaceUrl.isEmpty()) {
                 // 刷新索引（几 KB）：覆盖缓存 marketplace.json，保证 source 与远端一致
                 new MarketplaceHttpDownloader().downloadMarketplace(marketplaceUrl, null, existing.installLocation());
+                syncManifestToDotClaude(existing.installLocation());
                 if (log.isDebugEnabled()) {
                     log.debug("[PluginInstall] 已刷新市场索引 {}（{}）", marketName, existing.installLocation());
                 }
@@ -161,10 +165,29 @@ public class PluginInstallService {
         if (after == null) {
             throw new IOException("市场物化失败: " + marketName);
         }
+        syncManifestToDotClaude(after.installLocation());
         if (log.isInfoEnabled()) {
             log.info("[PluginInstall] 市场索引已物化: {} → {}", marketName, after.installLocation());
         }
         return after.installLocation();
+    }
+
+    /**
+     * 同步市场索引到 CC 规范读取路径。
+     *
+     * <p>下载器写 {@code <market>/marketplace.json}，而 {@link PluginMarketplace} 的缓存读取用
+     * {@code <market>/.claude-plugin/marketplace.json}。两份不同步时：磁盘上新清单已含某插件，
+     * 安装仍按旧清单报「市场 'zjky-market' 中没有插件: xxx」（2026-10-19 实测
+     * zjky-software-design-skill-chain 安装失败）。
+     */
+    private static void syncManifestToDotClaude(String installLocation) throws IOException {
+        Path root = Paths.get(installLocation, "marketplace.json");
+        if (!Files.isRegularFile(root)) {
+            return;
+        }
+        Path dotClaudeDir = Paths.get(installLocation, ".claude-plugin");
+        Files.createDirectories(dotClaudeDir);
+        Files.copy(root, dotClaudeDir.resolve("marketplace.json"), StandardCopyOption.REPLACE_EXISTING);
     }
 
     /**

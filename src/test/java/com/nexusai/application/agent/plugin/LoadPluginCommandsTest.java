@@ -134,6 +134,66 @@ class LoadPluginCommandsTest {
     }
 
     @Test
+    @DisplayName("direct SKILL.md：frontmatter.name 优先于 basename(skillsPath)（CC 2.1.296 :726）")
+    void skills_directory_direct_skill_md_prefers_frontmatter_name() throws Exception {
+        // WHY: CC 2.1.296 起 direct 技能名优先取 frontmatter.name（以 "plugin:" 开头则剥前缀），
+        //   否则 skills/SKILL.md 会注册成 "plugin:skills" 这种无意义、且与其它插件撞名的命令。
+        Path skillsDir = tempDir.resolve("named-plugin").resolve("skills");
+        Files.createDirectories(skillsDir);
+        Files.writeString(skillsDir.resolve("SKILL.md"),
+            "---\nname: doc-writer\ndescription: direct skill\n---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            plugin("named-plugin", skillsDir.getParent())), false);
+
+        assertThat(skills.stream().map(Command::getName))
+            .as("direct SKILL.md + frontmatter.name → plugin:name（CC 2.1.296 :726）")
+            .containsExactly("named-plugin:doc-writer");
+    }
+
+    @Test
+    @DisplayName("技能目录名非 [A-Za-z0-9_-] 字符 → '-'（CC 2.1.296 :806）")
+    void skills_directory_normalizes_entry_name() throws Exception {
+        // WHY: 命令名要被斜杠补全/前端正则消费；CC 2.1.296 对目录名做 [^a-zA-Z0-9_-] → '-'，
+        //   否则 "focus.skill" 这类目录会注册出前端无法匹配的命令名。
+        Path skillsDir = tempDir.resolve("norm-plugin").resolve("skills");
+        Files.createDirectories(skillsDir.resolve("focus.skill"));
+        Files.writeString(skillsDir.resolve("focus.skill/SKILL.md"),
+            "---\ndescription: x\n---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            plugin("norm-plugin", skillsDir.getParent())), false);
+
+        assertThat(skills.stream().map(Command::getName))
+            .as("目录名 focus.skill → 命令名 plugin:focus-skill（CC 2.1.296 :806）")
+            .containsExactly("norm-plugin:focus-skill");
+    }
+
+    @Test
+    @DisplayName("skillsPaths 附加根：skills/<系列>/<技能>/SKILL.md 可加载（CC pluginLoader.ts:1565-1583）")
+    void skills_paths_load_series_directory() throws Exception {
+        // WHY: 系列技能（skills/zjkycode/craft-studio/SKILL.md）在默认 skillsPath 下扫不到
+        //   （只扫一层）；manifest 把 "./skills/zjkycode" 声明为附加技能根后，其直接子目录才是技能。
+        Path pluginRoot = tempDir.resolve("series-plugin");
+        Path seriesRoot = pluginRoot.resolve("skills").resolve("zjkycode");
+        Files.createDirectories(seriesRoot.resolve("craft-studio"));
+        Files.writeString(seriesRoot.resolve("craft-studio/SKILL.md"),
+            "---\ndescription: x\n---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            new PluginLoader.LoadedPlugin("series-plugin", PluginLoader.InstallSource.PATH,
+                pluginRoot, System.currentTimeMillis(), true,
+                null, List.of(),
+                null, List.of(),
+                null, List.of(seriesRoot.toString()),
+                null, List.of())), false);
+
+        assertThat(skills.stream().map(Command::getName))
+            .as("附加根 → 技能名仍是 plugin:直接子目录名（前缀不是系列名）")
+            .containsExactly("series-plugin:craft-studio");
+    }
+
+    @Test
     @DisplayName("commandsPaths 附加路径：单 .md 文件按 plugin:basename 命名（loadPluginCommands.ts:504-587）")
     void commands_paths_single_file() throws Exception {
         // WHY: CC :541-543 — 无 commandsMetadata 匹配时单文件命令名回退 plugin:basename(.md 去后缀)
