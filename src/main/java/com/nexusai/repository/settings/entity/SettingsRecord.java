@@ -81,6 +81,10 @@ public class SettingsRecord {
     //   websearchDomainCheckUrl——MyBatis-Flex camelCase→snake 精确映射 websearch_domain_check_url，
     //   同 :60-62 教训（webSearchDomainCheckUrl 会映射到 web_search_domain_check_url，列不存在）。
     private String websearchDomainCheckUrl;
+    // [V102] webfetch_engine ↔ webfetchEngine：WebFetch 抓取引擎（null/空/builtin → 内置本地抓取；
+    //   deepseek → DeepSeek POST /v1/tools/fetch，服务端抓取返回 Markdown）。命名小写 w 与 V37 家族一致
+    //   （webfetchEngine → webfetch_engine 精确映射，避免 We... 大写映射到不存在的 webfetch_engine 变体）。
+    private String webfetchEngine;
     // [agent-swarms-setting V42] agent_swarms_enabled ↔ agentSwarmsEnabled：前端「环境配置」Agent Swarms
     //   开关（设置页开关 → TaskSystemConfig.isAgentSwarmsEnabled() 判定链 OR settings）。
     //   命名：MyBatis-Flex camelCase→snake 精确映射 agentSwarmsEnabled → agent_swarms_enabled
@@ -319,6 +323,9 @@ public class SettingsRecord {
     // [websearch-domaincheck V39] websearch_domain_check_url ↔ websearchDomainCheckUrl（MyBatis-Flex snake↔camel 映射）
     public String getWebsearchDomainCheckUrl() { return websearchDomainCheckUrl; }
     public void setWebsearchDomainCheckUrl(String websearchDomainCheckUrl) { this.websearchDomainCheckUrl = websearchDomainCheckUrl; }
+    // [V102] webfetch_engine ↔ webfetchEngine（WebFetch 抓取引擎：null/空/builtin / deepseek）
+    public String getWebfetchEngine() { return webfetchEngine; }
+    public void setWebfetchEngine(String webfetchEngine) { this.webfetchEngine = webfetchEngine; }
     // [agent-swarms-setting V42] agent_swarms_enabled ↔ agentSwarmsEnabled（MyBatis-Flex snake↔camel 映射）
     public Boolean getAgentSwarmsEnabled() { return agentSwarmsEnabled; }
     public void setAgentSwarmsEnabled(Boolean agentSwarmsEnabled) { this.agentSwarmsEnabled = agentSwarmsEnabled; }

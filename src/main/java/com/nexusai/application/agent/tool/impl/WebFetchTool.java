@@ -11,7 +11,9 @@ import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolResultStorage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.tool.impl.web.DeepSeekFetchEngine;
 import com.nexusai.domain.settings.SettingsService;
+import com.nexusai.model.settings.dto.SettingsDto;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
@@ -239,6 +241,58 @@ public class WebFetchTool implements Tool {
     }
 
     /**
+     * 当前 WebFetch 抓取引擎（V102 settings.webfetch_engine）。
+     *
+     * <p>null / 空串 / {@code builtin} → 内置本地抓取（现有行为）；{@code deepseek} →
+     * DeepSeek {@code POST /v1/tools/fetch}（服务端抓取并返回 Markdown）。settings 读取失败按内置处理
+     * 并 warn（不静默改成远端抓取）。
+     */
+    private String currentFetchEngine() {
+        if (settingsService == null) {
+            return "builtin";
+        }
+        try {
+            String e = settingsService.get().webfetchEngine();
+            return (e == null || e.isBlank()) ? "builtin" : e.trim().toLowerCase(java.util.Locale.ROOT);
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[WebFetchTool] settings 读取失败，fetch 引擎按内置处理: err={}", e.getMessage());
+            }
+            return "builtin";
+        }
+    }
+
+    /**
+     * DeepSeek Fetch 分支 · 对齐官方 {@code POST /v1/tools/fetch}（{@code {url} → {title, content(markdown)}}）。
+     *
+     * <p>复用 {@link #handleFetched} 的摘要/截断/输出组装（contentType 固定 text/markdown，
+     * 因此非预批准站点仍走二次模型摘要）。key/base 复用 settings 的 apiKey / websearchBaseUrl
+     * （切到 DeepSeek 引擎时填对应值；base 留空 → {@link DeepSeekFetchEngine#DEFAULT_BASE_URL}）。
+     */
+    private AgentToolResult executeDeepSeekFetch(ToolUseBlock call, String url, String prompt,
+                                                 ToolUseContext ctx) {
+        long start = System.currentTimeMillis();
+        try {
+            SettingsDto s = settingsService != null ? settingsService.get() : null;
+            String key = s != null && s.apiKey() != null ? s.apiKey() : "";
+            String base = s != null && s.websearchBaseUrl() != null && !s.websearchBaseUrl().isBlank()
+                ? s.websearchBaseUrl().trim() : DeepSeekFetchEngine.DEFAULT_BASE_URL;
+            String proxy = s != null ? s.proxy() : null;
+            DeepSeekFetchEngine.Page page = new DeepSeekFetchEngine(base, key, proxy, null).fetch(url);
+            String content = page.content() == null ? "" : page.content();
+            WebFetchSecurity.FetchedContent fc = new WebFetchSecurity.FetchedContent(
+                content, content.getBytes(StandardCharsets.UTF_8).length, 200, "OK",
+                "text/markdown", null, null);
+            boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
+            return handleFetched(call, url, prompt, fc, start, isNonInteractive,
+                ctx != null ? ctx.agentContext() : null);
+        } catch (Exception e) {
+            log.warn("[WebFetchTool] DeepSeek 抓取失败: url={} err={}", url, e.getMessage());
+            return ToolResult.error(call.id(), "fetch failed: " + e.getMessage());
+        }
+    }
+
+    /**
      * [websearch-domaincheck] 当前域预检端点源（DB settings.websearch_domain_check_url，V39 列）· 跳过预检语义。
      *
      * <p>{@link SettingsService} 未注入（测试/孤立运行）→ null（默认跳过预检）；{@code get()}
@@ -436,6 +490,11 @@ public class WebFetchTool implements Tool {
         }
         if (!url.startsWith("http://") && !url.startsWith("https://")) {
             return ToolResult.error(call.id(), "url must use http or https scheme: " + url);
+        }
+
+        // [V102] 抓取引擎选择：deepseek → 服务端抓取（返回 Markdown）；其余 → 内置本地抓取。
+        if ("deepseek".equals(currentFetchEngine())) {
+            return executeDeepSeekFetch(call, url, prompt, ctx);
         }
 
         long start = System.currentTimeMillis();

@@ -2,6 +2,20 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.40] - 2026-10-21
+
+### 新增
+- 新增 DeepSeek 搜索与抓取引擎（设置 → 环境配置 → WebSearch 可选）：
+  · 搜索：DeepSeek `/v1/tools/search`，`count` / `need_content` / `ori_question` 由模型按需决定（均有默认值）
+  · 抓取：DeepSeek `/v1/tools/fetch`，服务端抓取并返回 Markdown
+- 技能市场页面改版：精选/推荐 3 列布局、分类中文化并去重、已安装计数修正。
+
+### 修复
+- 新机器首次启动自动创建配置根目录（SQLite 不建父目录导致 Flyway 连库失败）。
+- 插件安装成功后自动刷新命令注册表（修复召唤报「该技能未注册成斜杠命令」）。
+- 技能市场安装失败：市场索引下载/物化后同步 `.claude-plugin/marketplace.json`。
+- 插件技能加载对齐 CC 2.1.296：manifest.skills 附加根、目录名规范化、frontmatter.name 优先、目录内排序。
+
 ## [0.1.39] - 2026-10-20
 
 ### 修复

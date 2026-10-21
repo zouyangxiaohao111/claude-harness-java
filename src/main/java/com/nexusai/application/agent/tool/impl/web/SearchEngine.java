@@ -42,11 +42,22 @@ public interface SearchEngine {
      * @param allowedDomains 仅包含这些域的结果（可选）
      * @param blockedDomains 永不包含这些域的结果（可选）
      */
-    record SearchRequest(String query, List<String> allowedDomains, List<String> blockedDomains) {
+    record SearchRequest(String query, List<String> allowedDomains, List<String> blockedDomains,
+                         Integer count, Boolean needContent, String oriQuestion) {
 
         public SearchRequest {
             allowedDomains = allowedDomains == null ? List.of() : List.copyOf(allowedDomains);
             blockedDomains = blockedDomains == null ? List.of() : List.copyOf(blockedDomains);
+        }
+
+        /**
+         * 兼容构造（CC 对齐的旧签名）：DeepSeek 扩展参数缺省。
+         *
+         * <p>CC inputSchema 只有 {@code query/allowed_domains/blocked_domains}；count / need_content /
+         * ori_question 是 DeepSeek Search 特有参数（用户裁定：让模型自行决定），其它引擎忽略。
+         */
+        public SearchRequest(String query, List<String> allowedDomains, List<String> blockedDomains) {
+            this(query, allowedDomains, blockedDomains, null, null, null);
         }
     }
 }

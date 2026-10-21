@@ -1,0 +1,14 @@
+-- ===================================================================
+-- V102: settings 表新增 webfetch_engine 列（WebFetch 抓取引擎选择）
+--
+-- 背景：DeepSeek 提供 POST /v1/tools/fetch（服务端抓取网页并返回 Markdown），
+--   作为 WebFetch 的可选引擎接入，与内置本地抓取（WebFetchSecurity）并列。
+--
+-- 取值：
+--   null / '' / 'builtin' → 内置本地抓取（现有行为，零变化）
+--   'deepseek'            → DeepSeek Fetch API（Bearer = settings.api_key）
+--
+-- 消费点：WebFetchTool.execute 读本列选择引擎；前端「环境配置」页提供下拉。
+-- 与 websearch_engine 相互独立：可单独选择搜索/抓取引擎组合。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN webfetch_engine TEXT;

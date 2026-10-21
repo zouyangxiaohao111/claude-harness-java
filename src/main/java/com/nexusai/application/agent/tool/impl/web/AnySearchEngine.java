@@ -115,7 +115,10 @@ public class AnySearchEngine implements SearchEngine {
     public List<SearchHit> search(SearchRequest request) {
         ObjectNode body = MAPPER.createObjectNode();
         body.put("query", request.query());
-        body.put("max_results", ANYSEARCH_MAX_RESULTS);
+        // [V102] 模型显式 count 时透传（anysearch 允许 1-10）；否则沿用引擎默认
+        int maxResults = request.count() == null ? ANYSEARCH_MAX_RESULTS
+            : Math.max(1, Math.min(10, request.count()));
+        body.put("max_results", maxResults);
         if (!request.allowedDomains().isEmpty()) {
             ArrayNode allowed = body.putArray("allowed_domains");
             request.allowedDomains().forEach(allowed::add);

@@ -185,5 +185,8 @@ public record SettingsDto(
     // [V100 stream-idle-watchdog] 流空闲超时毫秒（settings.stream_idle_timeout_ms 列，前端「设置→通用」页可配；
     //   null/<=0 = 未配置 → env(CLAUDE_STREAM_IDLE_TIMEOUT_MS)/默认 300000；有效下限 300000）。
     //   ⚠️ 三处必须同步（同上）：① 本字段 ② SettingsService.toDto 透出 ③ SettingsService.update 的 merge 分支。
-    Integer streamIdleTimeoutMs
+    Integer streamIdleTimeoutMs,
+    // [V102] WebFetch 抓取引擎（null/空/'builtin' → 内置本地抓取；'deepseek' → DeepSeek /v1/tools/fetch）。
+    //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
+    String webfetchEngine
 ) {}

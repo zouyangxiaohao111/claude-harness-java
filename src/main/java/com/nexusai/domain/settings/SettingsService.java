@@ -175,6 +175,8 @@ public class SettingsService {
         if (req.websearchBaseUrl() != null) s.setWebsearchBaseUrl(req.websearchBaseUrl());
         // [websearch-domaincheck V39] 域预检端点 merge（null = 不覆盖，对齐既有 merge；空 → 跳过预检）
         if (req.websearchDomainCheckUrl() != null) s.setWebsearchDomainCheckUrl(req.websearchDomainCheckUrl());
+        // [V102] WebFetch 抓取引擎 merge（null = 不覆盖；空/'builtin' → 内置本地抓取）
+        if (req.webfetchEngine() != null) s.setWebfetchEngine(req.webfetchEngine());
         // [agent-swarms-setting V42] Agent Swarms 开关 merge（null = 不覆盖，对齐既有 merge；写库后尾部同步静态覆盖）
         if (req.agentSwarmsEnabled() != null) s.setAgentSwarmsEnabled(req.agentSwarmsEnabled());
         // [V44] 全局默认权限模式 merge（null = 不覆盖，对齐既有 merge）：写侧 isSettable 校验——
@@ -481,7 +483,9 @@ public class SettingsService {
             s.getAllowDynamicHeaderValues(),
             // [V100 stream-idle-watchdog] streamIdleTimeoutMs DB 列透出（V100 列 stream_idle_timeout_ms；
             //   null/<=0 = 未配置 → StreamIdleWatchdogSettings 回落 env/默认 300000；有效下限 300000）
-            s.getStreamIdleTimeoutMs()
+            s.getStreamIdleTimeoutMs(),
+            // [V102] WebFetch 抓取引擎透出（null → WebFetchTool 内置本地抓取）
+            s.getWebfetchEngine()
         );
     }
 

@@ -50,6 +50,8 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const [wsApiKey, setWsApiKey] = useState<string>(settings?.apiKey ?? '')
   const [wsBaseUrl, setWsBaseUrl] = useState<string>(settings?.websearchBaseUrl ?? '')
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
+  // WebFetch 抓取引擎（V102 · builtin / deepseek）
+  const [wsFetchEngine, setWsFetchEngine] = useState<string>(settings?.webfetchEngine ?? 'builtin')
   // 协调者模式（settings.coordinatorModeEnabled · 未配置 = 关闭）
   const [coordinatorModeOn, setCoordinatorModeOn] = useState<boolean>(settings?.coordinatorModeEnabled ?? false)
   // away-summary 门控（localStorage · 两开关都开才触发 blur 摘要；后端 features API 补后接入）
@@ -70,7 +72,8 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     setWsApiKey(settings?.apiKey ?? '')
     setWsBaseUrl(settings?.websearchBaseUrl ?? '')
     setWsDomainCheckUrl(settings?.websearchDomainCheckUrl ?? '')
-  }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl])
+    setWsFetchEngine(settings?.webfetchEngine ?? 'builtin')
+  }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl, settings?.webfetchEngine])
 
   // 协调者模式草稿 ← settings（后端异步加载后回填）
   useEffect(() => {
@@ -532,8 +535,27 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
           >
             <option value="anysearch">anysearch</option>
             <option value="duckduckgo">duckduckgo</option>
+            <option value="deepseek">deepseek</option>
           </select>
           <button className="envc-save" onClick={() => void onSaveSettings({ websearchEngine: wsEngine })}>保存</button>
+        </div>
+      </div>
+
+      <div className="envc-row">
+        <div className="envc-label-group">
+          <span className="envc-name">抓取引擎</span>
+          <span className="envc-desc">WebFetch 使用哪个引擎抓取网页（默认内置本地抓取）</span>
+        </div>
+        <div className="envc-control">
+          <select
+            className="settings-input"
+            value={wsFetchEngine}
+            onChange={(e) => setWsFetchEngine(e.target.value)}
+          >
+            <option value="builtin">内置（本地抓取）</option>
+            <option value="deepseek">deepseek（服务端抓取）</option>
+          </select>
+          <button className="envc-save" onClick={() => void onSaveSettings({ webfetchEngine: wsFetchEngine })}>保存</button>
         </div>
       </div>
 

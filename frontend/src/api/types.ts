@@ -425,6 +425,8 @@ export interface AppSettings {
   websearchBaseUrl?: string | null
   /** WebSearch 域预检端点（空 → 跳过预检） */
   websearchDomainCheckUrl?: string | null
+  /** WebFetch 抓取引擎（builtin=内置本地抓取 / deepseek=DeepSeek /v1/tools/fetch；空=builtin） */
+  webfetchEngine?: string | null
   /** Agent Swarms 功能开关（设置页「环境配置」模块写 · 后端 TaskSystemConfig.isAgentSwarmsEnabled 读） */
   agentSwarmsEnabled?: boolean | null
   /** 协调者模式开关（设置页「环境配置」模块写 · 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读；未配置/null → 关闭） */

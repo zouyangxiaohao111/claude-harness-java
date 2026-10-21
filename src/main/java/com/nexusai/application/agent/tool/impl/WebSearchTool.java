@@ -15,6 +15,7 @@ import com.nexusai.application.agent.tool.ToolResultBlockParam;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.web.AnySearchEngine;
+import com.nexusai.application.agent.tool.impl.web.DeepSeekSearchEngine;
 import com.nexusai.application.agent.tool.impl.web.DuckDuckGoEngine;
 import com.nexusai.application.agent.tool.impl.web.SearchEngine;
 import com.nexusai.application.agent.tool.impl.web.SearchEngine.SearchHit;
@@ -480,6 +481,26 @@ public class WebSearchTool implements Tool {
         blockedDomains.put("items", JsonNodeFactory.instance.objectNode().put("type", "string"));
         blockedDomains.put("description", "Never include search results from these domains");
 
+        // [V102 DeepSeek Search 扩展] 以下 3 个参数仅 deepseek 引擎生效，其它引擎忽略。
+        //   用户裁定（2026-10-21）：count / need_content / ori_question 交给模型按需决定。
+        ObjectNode count = props.putObject("count");
+        count.put("type", "integer");
+        count.put("minimum", 1);
+        count.put("maximum", 50);
+        count.put("description", "Number of results to return (1-50, default 8). "
+            + "Only honored by the deepseek search engine; other engines ignore it.");
+
+        ObjectNode needContent = props.putObject("need_content");
+        needContent.put("type", "boolean");
+        needContent.put("description", "Whether to include full page content in results (default false). "
+            + "Only honored by the deepseek search engine; prefer WebFetch when you need page content.");
+
+        ObjectNode oriQuestion = props.putObject("ori_question");
+        oriQuestion.put("type", "string");
+        oriQuestion.put("maxLength", 128);
+        oriQuestion.put("description", "The user's original question that triggered this search, "
+            + "which helps the engine understand intent. Only honored by the deepseek engine.");
+
         schema.putArray("required").add("query");
         schema.put("additionalProperties", false);
         return schema;
@@ -616,16 +637,23 @@ public class WebSearchTool implements Tool {
         String query = readString(input, "query");
         List<String> allowed = readStringList(input, "allowed_domains");
         List<String> blocked = readStringList(input, "blocked_domains");
+        // [V102] DeepSeek 扩展参数（用户裁定：模型自行决定；其它引擎忽略）
+        Integer requestedCount = readInt(input, "count");
+        Boolean needContent = readBoolean(input, "need_content");
+        String oriQuestion = readString(input, "ori_question");
         if (query == null || query.isBlank()) {
             return ToolResult.error(call.id(), "missing required input: query");
         }
         SearchEngine engine = resolveEngine();
         long start = System.nanoTime();
         try {
-            List<SearchHit> hits = engine.search(new SearchRequest(query, allowed, blocked));
-            // 内部上限（D-TR-H1-06 删 max_results 输入；DEFAULT_RESULTS 对齐 CC max_uses=8 语义）
-            if (hits.size() > DEFAULT_RESULTS) {
-                hits = new ArrayList<>(hits.subList(0, DEFAULT_RESULTS));
+            List<SearchHit> hits = engine.search(new SearchRequest(query, allowed, blocked,
+                requestedCount, needContent, oriQuestion));
+            // 结果上限：模型显式 count（1~50）优先；否则沿用 CC max_uses=8 语义
+            int maxResults = requestedCount == null ? DEFAULT_RESULTS
+                : Math.max(1, Math.min(50, requestedCount));
+            if (hits.size() > maxResults) {
+                hits = new ArrayList<>(hits.subList(0, maxResults));
             }
             double durationSeconds = (System.nanoTime() - start) / 1_000_000_000.0;
             // 原始 hits 日志记录（测试/调试；LLM 返回经 results 数组 hits 块 + 注释文本，G19/G20 保留日志）
@@ -985,6 +1013,19 @@ public class WebSearchTool implements Tool {
         if ("duckduckgo".equals(engine)) {
             return duckDuckGoEngine;
         }
+        if ("deepseek".equals(engine)) {
+            // [V102] DeepSeek Search：key 必须由用户配置（⛔ 不回落 anysearch 内置 key——那会把
+            //   anysearch 的 key 发给 DeepSeek，既无效也泄露）；未配置 → 请求 401（fail-loud，不静默换引擎）。
+            //   base 默认 DeepSeek，可经 websearch_base_url 覆盖（切引擎时前端同字段填写）。
+            String dsKey = settings != null && settings.getApiKey() != null ? settings.getApiKey() : "";
+            String dsBase = settings != null && settings.getWebsearchBaseUrl() != null
+                && !settings.getWebsearchBaseUrl().isBlank()
+                ? settings.getWebsearchBaseUrl().trim() : DeepSeekSearchEngine.DEFAULT_BASE_URL;
+            if (dsKey.isBlank() && log.isWarnEnabled()) {
+                log.warn("[WebSearchTool] engine=deepseek 但 settings.api_key 为空——请求将返回 401，请先在设置中填写 DeepSeek API Key");
+            }
+            return new DeepSeekSearchEngine(dsBase, dsKey, readProxy(settings), null);
+        }
         if (!"anysearch".equals(engine)) {
             log.warn("[WebSearchTool] 未知搜索引擎 engine='{}'，回退 anysearch", engine);
         }
@@ -1022,5 +1063,23 @@ public class WebSearchTool implements Tool {
             return null;
         }
         return input.get(key).asText();
+    }
+
+    /** 可选整数参数（DeepSeek count）· 非数字 → null（不猜默认值）。 */
+    private static Integer readInt(JsonNode input, String key) {
+        if (input == null || !input.has(key) || input.get(key).isNull()) {
+            return null;
+        }
+        JsonNode n = input.get(key);
+        return n.isNumber() ? n.asInt() : null;
+    }
+
+    /** 可选布尔参数（DeepSeek need_content）· 非布尔 → null。 */
+    private static Boolean readBoolean(JsonNode input, String key) {
+        if (input == null || !input.has(key) || input.get(key).isNull()) {
+            return null;
+        }
+        JsonNode n = input.get(key);
+        return n.isBoolean() ? n.asBoolean() : null;
     }
 }
