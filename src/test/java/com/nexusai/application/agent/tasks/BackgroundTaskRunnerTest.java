@@ -310,12 +310,11 @@ class BackgroundTaskRunnerTest {
     }
 
     @Test
-    @DisplayName("completeAsyncAgent 写入 summary 到五层 outputFile（父目录自动创建，CC ensureOutputDir）")
-    void completeAsyncAgent_writesSummaryToHierarchicalOutputFile() throws Exception {
-        // WHY: CC ensureOutputDir mkdir recursive（diskOutput.ts:65-67）——五层格式父目录
-        //   .../{sessionId}/tasks 不再天然存在，Java appendToOutputFile 必须写前建父目录。
-        //   否则 completeAsyncAgent 写 summary 时 ENOENT（旧平铺 /tmp 父目录恒在无需此步）。
-        // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
+    @DisplayName("async agent 不把 summary 写进 output（CC：output 软链到 transcript，全程不写内容）")
+    void asyncAgent_doesNotAppendSummaryToOutput() throws Exception {
+        // WHY（2026-10-21 对齐 CC/CCB 实证）：LocalAgentTask 注册时 initTaskOutputAsSymlink
+        //   把 output 软链到该 agent 的 transcript，任务结束只把路径拼进通知文本。
+        //   若这里仍 append summary，会把一段纯文本塞进 transcript 的 .jsonl，破坏记录格式。
         String sessionId = "sess-write-" + UUID.randomUUID().toString().substring(0, 8);
         UUID agentId = UUID.randomUUID();
         String taskId = agentId.toString();
@@ -326,13 +325,15 @@ class BackgroundTaskRunnerTest {
             AsyncAgentResult.success("总结文本", 3, 120L, taskId, 42L, AgentUsage.EMPTY));
 
         Path outputPath = Path.of(task.outputFile());
-        assertThat(outputPath).as("summary 必须已写入分层 outputFile").exists();
-        String content = Files.readString(outputPath);
-        assertThat(content).contains("总结文本");
-        // 父目录五层结构存在（.../{sessionId}/tasks）
-        assertThat(outputPath.getParent()).isNotNull();
+        // 路径结构仍是 CC 五层（.../{sessionId}/tasks/{taskId}.output）
         assertThat(outputPath.getParent().getFileName().toString()).isEqualTo("tasks");
-        // 清理临时产物
+        // 关键断言：没有把「总结文本」写进 output（软链指向 transcript 时读到的也是记录，不是摘要）
+        if (Files.exists(outputPath) && !Files.isSymbolicLink(outputPath)) {
+            String content = Files.readString(outputPath);
+            assertThat(content)
+                .as("output 不得再被写入 summary（CC 无 appendToOutputFile 行为）")
+                .doesNotContain("总结文本");
+        }
         Files.deleteIfExists(outputPath);
         Files.deleteIfExists(outputPath.getParent());
     }

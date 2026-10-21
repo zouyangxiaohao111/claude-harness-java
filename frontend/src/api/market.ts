@@ -37,4 +37,108 @@ export const marketApi = {
   /** 已安装且启用的插件名列表 · GET /api/plugins/installed（「已安装」标记初始化） */
   listInstalled: () =>
     api<string[]>(`/plugins/installed`, {}, MARKET_BASE),
+  /**
+   * 已安装插件明细（含内容指纹）· GET /api/plugins/installed/detail
+   * 用途：市场条目指纹 ≠ 本地指纹 ⇒ 即使名称、版本都相同也显示「更新」。
+   */
+  listInstalledDetails: () =>
+    api<InstalledPluginDetail[]>(`/plugins/installed/detail`, {}, MARKET_BASE),
+  /**
+   * 安装进度 · GET /api/plugins/install/progress?pluginId=
+   * 后端无记录或终态过期 → 204 空体（api() 返回 undefined），前端据此停止轮询。
+   */
+  getInstallProgress: (pluginId: string) =>
+    api<InstallProgress | undefined>(
+      `/plugins/install/progress${buildQs({ pluginId })}`, {}, MARKET_BASE),
+
+  // ── 市场管理（设置页「市场管理」）────────────────────────────────────
+
+  /** 市场清单（含每个插件的全部历史版本）· GET /api/market/manage/list */
+  manageList: () => api<MarketManifest>(`/market/manage/list`, {}, MARKET_BASE),
+
+  /** 上架本地目录 · POST /api/market/manage/publish（版本留空 = 自动 patch+1） */
+  publishPlugin: (body: PublishPluginRequest) =>
+    api<PublishPluginResult>(`/market/manage/publish`, { method: 'POST', body }, MARKET_BASE),
+
+  /** 回滚到历史版本 · POST /api/market/manage/rollback（只改清单指向，不删包） */
+  rollbackPlugin: (name: string, version: string) =>
+    api<PublishPluginResult>(
+      `/market/manage/rollback${buildQs({ name, version })}`, { method: 'POST' }, MARKET_BASE),
+}
+
+// ── 市场管理（上架 / 版本历史 / 回滚）────────────────────────────────────
+
+/** 单个插件的某个历史版本 */
+export interface MarketVersionEntry {
+  version: string
+  source: string
+  fingerprint: string
+  publishedAt: string
+  size?: number
+}
+
+/** 市场清单条目（后端 MarketPublishService 维护） */
+export interface MarketManagedPlugin {
+  name: string
+  displayName?: string
+  description?: string
+  /** 当前生效版本 */
+  version?: string
+  category?: string
+  /** 当前生效版本的市场相对目录（如 skills/doc-writer/0.1.1） */
+  source?: string
+  /** 内容指纹 sha256:...· 用于判断「内容有没有变」 */
+  fingerprint?: string
+  updatedAt?: string
+  /** 全部历史版本（不删包，可回滚） */
+  versions?: MarketVersionEntry[]
+}
+
+/** 市场清单 */
+export interface MarketManifest {
+  name?: string
+  version?: string
+  plugins: MarketManagedPlugin[]
+}
+
+/** 上架请求 */
+export interface PublishPluginRequest {
+  sourcePath: string
+  name?: string
+  displayName?: string
+  description?: string
+  category?: 'skill' | 'expert' | 'connector'
+  tags?: string[]
+  /** 留空 → 自动 patch +1 */
+  version?: string
+}
+
+/** 上架 / 回滚结果 */
+export interface PublishPluginResult {
+  status: 'ok' | 'unchanged' | 'failed'
+  message: string
+  name?: string
+  version?: string
+  source?: string
+  fingerprint?: string
+  size?: number
+}
+
+/** 已安装插件明细（后端 PluginInstallService.InstalledPluginDetail） */
+export interface InstalledPluginDetail {
+  name: string
+  version?: string | null
+  installPath?: string | null
+  /** 本地安装目录的内容指纹；不可读时为空 */
+  fingerprint?: string | null
+}
+
+/** 安装进度快照（后端 PluginInstallProgressTracker.Progress）· percent 0~100 */
+export interface InstallProgress {
+  pluginId: string
+  /** PREPARING / DOWNLOADING / EXTRACTING / INSTALLING / REFRESHING / DONE / FAILED */
+  stage: string
+  percent: number
+  message: string
+  updatedAt: number
 }

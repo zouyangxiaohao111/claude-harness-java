@@ -188,5 +188,10 @@ public record SettingsDto(
     Integer streamIdleTimeoutMs,
     // [V102] WebFetch 抓取引擎（null/空/'builtin' → 内置本地抓取；'deepseek' → DeepSeek /v1/tools/fetch）。
     //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
-    String webfetchEngine
+    String webfetchEngine,
+    // [V103] 市场管理员模式（settings.market_admin_enabled 0/1，默认关）。
+    //   用户裁定 2026-10-21：普通用户不该看到「市场管理」（版本历史/回滚/全量清单），
+    //   但**上架**所有人可用（市场弹窗「＋ 添加」）。登录权限上线前先用本开关收口。
+    //   ⚠️ 三处必须同步（同 webfetchEngine）：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
+    Boolean marketAdminEnabled
 ) {}

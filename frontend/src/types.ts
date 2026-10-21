@@ -131,6 +131,7 @@ export type SettingsTab =
   | 'schedules'
   | 'hooks'
   | 'business'
+  | 'market'
   | 'advanced'
 
 export interface ContextMenuState {

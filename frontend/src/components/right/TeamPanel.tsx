@@ -4,12 +4,18 @@ import { teamsApi } from '@/api/teams'
 import { featuresApi } from '@/api/features'
 import { ApiError } from '@/api/rest'
 import { useTeamStore } from '@/stores/teamStore'
-import { subagentColor, type SessionTeamContext } from '@/api/types'
+import { subagentColor, type SessionTeamContext, type TeamMemberDto } from '@/api/types'
 import { FormModal } from '@/components/ui/FormModal'
 
 interface TeamPanelProps {
   sessionId: string | null
   showToast: (msg: string, type?: 'success' | 'info') => void
+  /** 折叠分组已提供标题 → 不再渲染自身标题行（避免「TEAM 协作」重复两遍） */
+  hideHeader?: boolean
+  /** 上报成员数给折叠组（0 → 该组折叠成一行） */
+  onCount?: (n: number) => void
+  /** 在右栏打开该成员的对话（F2） */
+  onViewMember?: (agentId: string, name: string, active: boolean) => void
 }
 
 const PlusIcon = ({ size = 12 }: { size?: number }) => (
@@ -50,7 +56,7 @@ function tsOf(ts: string): number {
  * 数据流：sessionApi.get → teamContext（门控）→ teamsApi.get 拉详情；
  * 实时消息/状态由 useChatSocket 订阅 /topic/sessions/{leadSessionId}/team-* 写入 useTeamStore 消费。
  */
-export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
+export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, onViewMember }: TeamPanelProps) {
   const teamName = useTeamStore((s) => s.teamName)
   const team = useTeamStore((s) => s.team)
   const messages = useTeamStore((s) => s.messages)
@@ -71,6 +77,8 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
   const [showCreate, setShowCreate] = useState(false)
   const [showAddMember, setShowAddMember] = useState(false)
   const [inboxOpen, setInboxOpen] = useState(false)
+  /** 成员详情（点击成员行打开 · 用户 2026-10-21） */
+  const [detailMember, setDetailMember] = useState<TeamMemberDto | null>(null)
   // 常驻展示（对齐子代理运行状况 · 无折叠）
 
   // Agent Swarms 门控：挂载时读 features.agentSwarms 初始化 store（后端未开 → 面板隐藏）
@@ -251,17 +259,22 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
 
   // 门控：swarm 功能开启（features.agentSwarms）+ 会话 teamContext 非 null（本会话绑团队）或 store 已有团队详情
   const hasTeam = agentSwarms && (teamContext != null || team != null)
+  // [D2] 上报成员数：无团队 → 0（折叠组只占一行）
+  const memberCount = hasTeam
+    ? (team?.members?.length ?? Object.keys(teamContext?.teammates ?? {}).length)
+    : 0
+  useEffect(() => { onCount?.(memberCount) }, [memberCount, onCount])
 
   return (
     <>
-      <div className="task-group-title async-title">
+      {!hideHeader && <div className="task-group-title async-title">
         <span>Team 协作</span>
         {agentSwarms && !hasTeam && !loading && (
           <span className="team-add" title="创建团队" onClick={(e) => { e.stopPropagation(); setShowCreate(true) }}>
             <PlusIcon size={11} />
           </span>
         )}
-      </div>
+      </div>}
 
       {loading ? (
         <div className="right-empty">加载中…</div>
@@ -280,7 +293,7 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
             </div>
             <div className="team-members">
               {(team?.members ?? []).map((m) => (
-                <div key={m.agentId} className="team-member">
+                <div key={m.agentId} className="team-member clickable" onClick={() => setDetailMember(m)} title="查看成员详情">
                   <span className="avatar" style={{ background: m.color ?? subagentColor(m.name) }}>
                     {m.name.slice(0, 1).toUpperCase()}
                   </span>
@@ -326,8 +339,13 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
           )}
         </>
       ) : (
-        <div className="right-empty">
-          {agentSwarms ? '暂无团队 · 点击右上角 + 创建' : 'Agent Swarms 未开启 · 去设置-环境配置开启'}
+        <div className="team-empty-add">
+          {agentSwarms && (
+            <button className="team-add-circle" title="创建团队" onClick={() => setShowCreate(true)}>+</button>
+          )}
+          <div className="todo-empty">
+            {agentSwarms ? '暂无团队' : 'Agent Swarms 未开启 · 去设置-环境配置开启'}
+          </div>
         </div>
       )}
 
@@ -372,6 +390,71 @@ export function TeamPanel({ sessionId, showToast }: TeamPanelProps) {
           onCancel={() => setShowAddMember(false)}
         />
       )}
+      {detailMember && (
+        <TeamMemberModal
+          member={detailMember}
+          onView={onViewMember ? () => { const m = detailMember; setDetailMember(null); onViewMember(m.agentId, m.name, !!m.isActive) } : undefined}
+          leadAgentId={team?.leadAgentId ?? teamContext?.leadAgentId ?? null}
+          onClose={() => setDetailMember(null)}
+        />
+      )}
     </>
+  )
+}
+
+/**
+ * TEAM 成员详情弹窗（用户 2026-10-21：成员行要能点开）。
+ *
+ * <p>字段全部来自 TeamMemberDto：name / agentType / model / color / isActive / mode。
+ * 「查看对话」跳转由外层（右栏对话视图）承接 —— 这里只负责展示与关闭。
+ */
+function TeamMemberModal({ member, leadAgentId, onClose, onView }: {
+  member: TeamMemberDto
+  leadAgentId: string | null
+  onClose: () => void
+  /** 查看该成员的对话（右栏切换） */
+  onView?: () => void
+}) {
+  return (
+    <div className="overlay-backdrop" onClick={onClose}>
+      <div className="subagent-modal task-detail" onClick={(e) => e.stopPropagation()}>
+        <div className="sam-head">
+          <span className="sam-title">
+            <span className="avatar" style={{ background: member.color ?? subagentColor(member.name), display: 'inline-flex', width: 20, height: 20, borderRadius: 6, alignItems: 'center', justifyContent: 'center', color: '#fff', fontSize: 11, marginRight: 8 }}>
+              {member.name.slice(0, 1).toUpperCase()}
+            </span>
+            @{member.name}
+          </span>
+          <button type="button" className="sam-close" onClick={onClose} aria-label="关闭">
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 3L9 9M9 3L3 9" /></svg>
+          </button>
+        </div>
+        <div className="sam-list task-detail-body">
+          <div className="td-meta">
+            <span className={`td-badge ${member.isActive ? 'in_progress' : 'pending'}`}>
+              {member.isActive ? '活跃' : '离线'}
+            </span>
+            <span className="td-id">{member.agentType ?? 'agent'}</span>
+            {member.agentId === leadAgentId && <span className="td-id">队长</span>}
+            {member.mode && <span className="td-id">{member.mode}</span>}
+          </div>
+          {member.model && (
+            <div className="td-sec">
+              <div className="td-label">模型</div>
+              <div className="td-val td-mono">{member.model}</div>
+            </div>
+          )}
+          <div className="td-sec">
+            <div className="td-label">成员 ID</div>
+            <div className="td-val td-mono">{member.agentId}</div>
+          </div>
+          {onView && (
+            <div className="td-actions">
+              <button className="td-link" onClick={onView}>查看对话 ›</button>
+            </div>
+          )}
+        </div>
+      </div>
+    </div>
   )
 }

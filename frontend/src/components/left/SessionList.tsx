@@ -84,7 +84,12 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     return (
       <div className="left left-rail-collapsed">
         <button className="rail-collapse-btn rail-expand" title="展开会话栏" aria-label="展开会话栏" onClick={onToggleCollapse}>
-          <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><path d="M5 2.5L10 7L5 11.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
+          {/* 折叠态也用面板图标（不再用 ">" 箭头）：图标本身就是「侧栏」语义，
+              折叠前后形状一致，用户不用重新认一遍。 */}
+          <svg viewBox="0 0 16 14" fill="none" width="15" height="14">
+            <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
+            <line x1="6" y1="1.4" x2="6" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+          </svg>
         </button>
         <button className="new-session-btn rail-new" title="新建会话" onClick={() => onCreateSession?.()}><PlusIcon size={13} /></button>
       </div>
@@ -117,7 +122,11 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
       {/* 左栏面板内折叠开关（顶格 · 无文字标签 · 对齐 deepseek-harness logoRow 样式） */}
       <div className="left-rail-head">
         <button className="rail-collapse-btn" title="收起会话栏" aria-label="收起会话栏" onClick={onToggleCollapse}>
-          <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><line x1="2" y1="3.6" x2="12" y2="3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="7" x2="12" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="10.4" x2="12" y2="10.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
+          {/* 面板图标（圆角矩形 + 左栏分隔线）· 参考 Open Design 侧栏开关的形态 */}
+          <svg viewBox="0 0 16 14" fill="none" width="15" height="14">
+            <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
+            <line x1="6" y1="1.4" x2="6" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+          </svg>
         </button>
       </div>
       {/* 新会话按钮（工作区上方，居中 · 设计稿 v7） */}

@@ -102,6 +102,89 @@ fn log_file() -> PathBuf {
     data_dir().join("logs").join("backend.log")
 }
 
+/// 单个活跃日志文件的滚动阈值（64MB）。超过即归档，避免长时间常驻把盘写满。
+pub(crate) const LOG_ROLL_MAX_BYTES: u64 = 64 * 1024 * 1024;
+
+/// 归档保留份数（按文件名时间戳保留最新 N 份，其余删除）。
+pub(crate) const LOG_ROLL_KEEP: usize = 3;
+
+/// 日志滚动：活跃文件超过 [`LOG_ROLL_MAX_BYTES`] → 改名为 `<stem>-<时间戳>.log`，并清理旧归档。
+///
+/// <p><b>时机约束</b>：Windows 下被进程持有的文件无法 rename ⇒ `backend.log`（javaw 的
+/// stdout/stderr 句柄）**只能在 spawn 之前**轮转；`frontend.log`（每次 append 后即关闭）
+/// 可在运行期任意时刻轮转。
+///
+/// <p>为何需要：这两份日志由壳侧**直接 append**，logback 的 SizeAndTimeBasedRollingPolicy
+/// 管不到它们 —— 旧实现下 `backend.log` 单文件可达 GB 级（用户实测 4G）。
+pub(crate) fn rotate_log_if_oversized(path: &std::path::Path) {
+    rotate_if_oversized_with(path, LOG_ROLL_MAX_BYTES, LOG_ROLL_KEEP);
+}
+
+/// [`rotate_log_if_oversized`] 的参数化实现（阈值/保留份数可注入 → 单测用小阈值即可覆盖真实分支）。
+pub(crate) fn rotate_if_oversized_with(path: &std::path::Path, max_bytes: u64, keep: usize) {
+    let size = match std::fs::metadata(path) {
+        Ok(m) => m.len(),
+        Err(_) => return, // 不存在 / 不可读 → 无需轮转
+    };
+    if size <= max_bytes {
+        return;
+    }
+    let parent = path.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("backend");
+    let stamp = utc_timestamp().replace([' ', ':'], "-");
+    // 同一秒内滚两次（或系统时钟回拨）会撞名 —— 不处理就会静默覆盖上一份归档（丢日志）
+    let mut archived = parent.join(format!("{stem}-{stamp}.log"));
+    let mut seq = 2;
+    while archived.exists() {
+        archived = parent.join(format!("{stem}-{stamp}-{seq}.log"));
+        seq += 1;
+    }
+    match std::fs::rename(path, &archived) {
+        Ok(()) => eprintln!(
+            "[log-roll] {} 已达 {size} 字节，归档为 {}",
+            path.display(),
+            archived.display()
+        ),
+        Err(e) => {
+            // 显式失败：轮转失败不等于可以继续无界追加，但也不能因此阻断启动
+            eprintln!("[log-roll] 归档 {} 失败：{e}", path.display());
+            return;
+        }
+    }
+    prune_old_archives(parent, stem, keep);
+}
+
+/// 清理 `{parent}/{stem}-*.log`：按文件名排序（时间戳可字典序比较），只留最新 `keep` 份。
+fn prune_old_archives(parent: &std::path::Path, stem: &str, keep: usize) {
+    let prefix = format!("{stem}-");
+    let mut archives: Vec<PathBuf> = match std::fs::read_dir(parent) {
+        Ok(rd) => rd
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| {
+                p.file_name()
+                    .and_then(|n| n.to_str())
+                    .map(|n| n.starts_with(&prefix) && n.ends_with(".log"))
+                    .unwrap_or(false)
+            })
+            .collect(),
+        Err(_) => return,
+    };
+    if archives.len() <= keep {
+        return;
+    }
+    archives.sort();
+    let remove_count = archives.len() - keep;
+    for old in archives.into_iter().take(remove_count) {
+        if let Err(e) = std::fs::remove_file(&old) {
+            eprintln!("[log-roll] 删除旧归档 {} 失败：{e}", old.display());
+        }
+    }
+}
+
 /// 本会话自启后端 pid 的持久化文件（`{data_dir}/backend.pid`）。
 /// 用途：正常关窗/退出时按内存 pid 整树回收；Tauri 被强杀/崩溃丢失该 pid 时，
 /// 下次启动经 [`cleanup_stale_backend_pid`] 做“身份校验后”的跨启动兜底清理。
@@ -296,12 +379,16 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
         ));
     }
 
-    // 4) 数据目录先就绪，日志文件追加打开
+    // 4) 数据目录先就绪。
+    //
+    // 日志口径（用户裁定 2026-10-21）：业务日志由 logback 写 info/warn/error.log（自带滚动），
+    // prod profile 下不再挂 STDOUT ⇒ java 的 stdout 只剩 Spring banner，没有保留价值 → 直接丢弃。
+    // stderr 仍落 backend.log：它承载 JVM/原生层的致命信息（启动早期失败、OutOfMemory 摘要等），
+    // 这些刻意不经 logback，丢了就只能看到「应用没起来」而查不到原因；量极小，且带滚动兜底。
     ensure_data_dirs()?;
     let log = log_file();
-    // stdout / stderr 各自独立 File handle 打开同一个 log（append+create）：
-    // 两个 Stdio 分别接管一个句柄，避免同一句柄被两处持有
-    let stdout_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
+    // 必须在打开句柄**之前**轮转：javaw 一旦持有 stderr 句柄，Windows 下就无法 rename
+    rotate_log_if_oversized(&log);
     let stderr_file = std::fs::OpenOptions::new().create(true).append(true).open(&log)?;
 
     // 5) spawn：工作目录 = 数据根（应用相对路径产物落 .nexusai），prod profile
@@ -312,9 +399,11 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
         .arg("--spring.profiles.active=prod")
         .current_dir(&data_root)
         // stdin 置空：防止 console 子进程（即便 javaw 也常继承父句柄）因继承 stdin
-        // 而被分配 / 附着控制台；stdout/stderr 仍重定向 backend.log（父传句柄，javaw 下同样可写盘）
+        // 而被分配 / 附着控制台。
+        // stdout 丢弃（prod 已无 console 日志，只剩 Spring banner，无保留价值）；
+        // stderr 仍落 backend.log（JVM/原生层致命信息不经 logback，丢了就查不到启动失败原因）。
         .stdin(Stdio::null())
-        .stdout(Stdio::from(stdout_file))
+        .stdout(Stdio::null())
         .stderr(Stdio::from(stderr_file))
         .spawn()?;
 
@@ -369,4 +458,79 @@ pub fn kill_process_tree(pid: u32) {
     }
     // 本次 kill 的目标即本会话自启后端（pid 文件只写过自启 pid）→ 顺带清 pid 记录
     clear_backend_pid();
+}
+
+#[cfg(test)]
+mod log_roll_tests {
+    use super::*;
+
+    /// 唯一临时目录（std 无 tempfile 依赖 —— 本仓 Cargo 只允许既有依赖）。
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "nexusai-logroll-{tag}-{}-{}",
+            std::process::id(),
+            utc_timestamp().replace([' ', ':'], "-")
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("建临时目录");
+        dir
+    }
+
+    /// 超过阈值 → 活跃文件被归档（内容不丢），且活跃路径不再存在（下次 append 从空开始）。
+    /// WHY：这份日志由壳侧直接 append，logback 的滚动策略管不到 —— 没有本函数就会无界增长。
+    #[test]
+    fn oversized_log_is_archived_and_trimmed_to_keep() {
+        let dir = temp_dir("roll");
+        let active = dir.join("backend.log");
+        std::fs::write(&active, vec![b'x'; 200]).unwrap();
+
+        // 预置 2 份旧归档 → 连同本次新归档共 3 份，keep=3 时全部保留
+        std::fs::write(dir.join("backend-2026-01-01-00-00-00.log"), b"old1").unwrap();
+        std::fs::write(dir.join("backend-2026-01-02-00-00-00.log"), b"old2").unwrap();
+
+        rotate_if_oversized_with(&active, 100, 3);
+
+        assert!(!active.exists(), "归档后活跃文件必须不存在（否则会继续在同一文件上叠加）");
+        let archives: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("backend-") && n.ends_with(".log"))
+            .collect();
+        assert_eq!(archives.len(), 3, "两次旧归档 + 本次新归档 = 3，实得：{archives:?}");
+
+        // 再滚一次（4 份）→ keep=3 必须删掉最旧的一份
+        std::fs::write(&active, vec![b'y'; 200]).unwrap();
+        rotate_if_oversized_with(&active, 100, 3);
+        let after: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with("backend-") && n.ends_with(".log"))
+            .collect();
+        assert_eq!(after.len(), 3, "保留份数必须封顶，实得：{after:?}");
+        assert!(
+            after.iter().all(|n| n != "backend-2026-01-01-00-00-00.log"),
+            "最旧归档必须被删除，实得：{after:?}"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 未超阈值 / 文件不存在 → 完全不动（不能在正常启动时把活跃日志改名）。
+    #[test]
+    fn small_or_missing_log_is_untouched() {
+        let dir = temp_dir("noop");
+        let active = dir.join("backend.log");
+        std::fs::write(&active, b"small").unwrap();
+
+        rotate_if_oversized_with(&active, 1024, 3);
+        assert!(active.exists(), "未超阈值不得归档");
+
+        let missing = dir.join("missing.log");
+        rotate_if_oversized_with(&missing, 1, 3);
+        assert!(!missing.exists(), "不存在的文件不得被创建");
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

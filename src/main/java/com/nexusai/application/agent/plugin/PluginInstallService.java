@@ -15,6 +15,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -52,6 +53,14 @@ public class PluginInstallService {
     @Autowired(required = false)
     private com.nexusai.application.agent.tool.impl.SubagentTool subagentTool;
 
+    /** 命令/技能注册表（惰性，避免装配期循环依赖）· 安装成功后清缓存，新插件技能立即可召唤。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.skill.SkillRegistry skillRegistry;
+
+    /** 安装进度台账（前端环形进度圈轮询数据源）。 */
+    @Autowired
+    private PluginInstallProgressTracker progressTracker;
+
     /**
      * 安装插件（前端调用）。
      *
@@ -68,6 +77,7 @@ public class PluginInstallService {
             ? "" : req.marketplaceUrl().trim();
 
         try {
+            progressTracker.begin(pluginId);
             // 1. 确保市场索引物化（下载 marketplace.json，几 KB；已物化则复用缓存目录）
             String marketName = PluginIdentifier.parse(pluginId).marketplace();
             String installLocation = ensureMarketplace(marketplaceUrl, marketName);
@@ -76,6 +86,7 @@ public class PluginInstallService {
             if (!marketplaceUrl.isEmpty()) {
                 downloadTargetPlugin(marketplaceUrl, pluginId, installLocation);
             }
+            progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.EXTRACTING, 80, "解压完成");
 
             // 3. 装配安装链并安装
             PluginInstaller installer = new PluginInstaller();
@@ -86,19 +97,31 @@ public class PluginInstallService {
             PluginOperations ops = new PluginOperations();
             ops.wireInstallation(marketplaceManager, installer);
 
+            progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.INSTALLING, 85, "安装注册");
             PluginOperations.InstallResult r = ops.installPlugin(pluginId, scope);
             if (r.success()) {
+                progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.REFRESHING, 95, "刷新技能与命令");
                 refreshPlugins();
+                progressTracker.done(pluginId);
+            } else {
+                progressTracker.fail(pluginId, r.message());
             }
             if (log.isInfoEnabled()) {
                 log.info("[PluginInstall] 安装结果 success={} plugin={} msg={}", r.success(), pluginId, r.message());
             }
             return new PluginInstallResult(r.success(), r.message(), r.pluginId(), r.pluginName(), r.scope());
         } catch (IllegalArgumentException e) {
+            progressTracker.fail(pluginId, "非法参数: " + e.getMessage());
             return new PluginInstallResult(false, "非法参数: " + e.getMessage(), null, null, null);
         } catch (IOException e) {
             log.error("[PluginInstall] 安装失败 plugin={}: {}", pluginId, e.getMessage());
+            progressTracker.fail(pluginId, "安装失败（" + e.getMessage() + "）");
             return new PluginInstallResult(false, "安装失败（" + e.getMessage() + "）", null, null, null);
+        } catch (RuntimeException e) {
+            // 显式失败：运行时异常不吞（原逻辑交由上层 500），但进度台账必须落终态，
+            // 否则前端轮询会一直停在中间百分比，看不出安装已经失败。
+            progressTracker.fail(pluginId, "安装异常: " + e.getMessage());
+            throw e;
         }
     }
 
@@ -114,6 +137,50 @@ public class PluginInstallService {
             .toList();
     }
 
+    /**
+     * 已安装插件的明细（含**内容指纹**）· 前端「市场里有更新」判定数据源。
+     *
+     * <p>为什么要指纹而不是版本号：市场与本地可能同名同版本、但内容已被重新上架
+     * （用户 2026-10-21：「名称一致 但是指纹不一致 需要显示更新」）。版本号相同不代表内容相同，
+     * 只有按内容算出的 SHA-256 能判定。
+     *
+     * @return 已启用插件明细（name/version/installPath/fingerprint）；目录不可读时 fingerprint=null
+     */
+    public List<InstalledPluginDetail> listInstalledDetails() {
+        List<InstalledPluginDetail> out = new java.util.ArrayList<>();
+        for (InstalledPluginsManager.InstalledRecord rec : installedPluginsManager.list()) {
+            if (rec == null || !rec.enabled()) {
+                continue;
+            }
+            String fp = null;
+            String path = rec.installPath();
+            if (path != null && !path.isBlank()) {
+                try {
+                    java.nio.file.Path dir = java.nio.file.Paths.get(path);
+                    if (java.nio.file.Files.isDirectory(dir)) {
+                        fp = com.nexusai.application.market.MarketPublishService.fingerprint(dir);
+                    }
+                } catch (Exception e) {
+                    log.warn("[PluginInstall] 计算已装插件指纹失败 plugin={} path={}: {}",
+                        rec.name(), path, e.getMessage());
+                }
+            }
+            out.add(new InstalledPluginDetail(rec.name(), rec.version(), path, fp));
+        }
+        return out;
+    }
+
+    /**
+     * 已安装插件明细。
+     *
+     * @param name        插件名（市场条目名）
+     * @param version     已装版本
+     * @param installPath 安装目录
+     * @param fingerprint 内容指纹 {@code sha256:...}（不可读时为 null）
+     */
+    public record InstalledPluginDetail(String name, String version, String installPath, String fingerprint) {
+    }
+
     /** 装完触发插件刷新：PluginLoader feed 缓存失效 + <b>重新扫描插件 agents 并入 registry</b>
      *  + per-cwd registry 重建。让插件 agents/commands/skills 立即可见（否则要重启后端才生效）。
      *  失败仅 warn 不阻断。 */
@@ -127,6 +194,12 @@ public class PluginInstallService {
                 // 装完后必须重新扫描插件 agents 并入，再清 registry 缓存让 per-cwd registry 重建时合并。
                 subagentTool.mergePluginAgents();
                 subagentTool.clearRegistryCache();
+            }
+            if (skillRegistry != null) {
+                // 清命令聚合三层缓存（allCommands/modelInvocable/slashToolSkills）：
+                // 否则 GET /api/command 仍返回安装前的列表，前端「召唤」会报
+                // 「该技能未注册成斜杠命令」，必须重启后端才恢复。
+                skillRegistry.refresh();
             }
             if (log.isInfoEnabled()) {
                 log.info("[PluginInstall] 插件缓存已刷新（agents/commands/skills 重载）");
@@ -221,7 +294,8 @@ public class PluginInstallService {
         String base = marketplaceUrl.substring(0, marketplaceUrl.lastIndexOf('/') + 1);
         String pluginUrl = base + source + "/plugin.zip";
         java.nio.file.Path target = Paths.get(installLocation, source);
-        new MarketplaceHttpDownloader().downloadArchive(pluginUrl, null, target.toString());
+        new MarketplaceHttpDownloader().downloadArchive(pluginUrl, null, target.toString(),
+            (read, total) -> progressTracker.downloading(pluginId, read, total));
         if (log.isInfoEnabled()) {
             log.info("[PluginInstall] 已按需下载插件包 {} → {}", pluginName, target);
         }

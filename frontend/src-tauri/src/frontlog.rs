@@ -123,6 +123,9 @@ fn append_line(line: &str) -> Result<(), String> {
     let write = || -> std::io::Result<()> {
         backend::ensure_data_dirs()?;
         let path = log_file();
+        // 运行期滚动：本文件每次写完即关闭句柄，可在任意时刻 rename
+        // （backend.log 被 javaw 持有，只能在 spawn 前轮转——见 backend::rotate_log_if_oversized）
+        backend::rotate_log_if_oversized(&path);
         let mut f = std::fs::OpenOptions::new()
             .create(true)
             .append(true)

@@ -117,6 +117,24 @@ public class ScheduleService {
     @Autowired(required = false)
     private Telemetry telemetry;
 
+    /**
+     * 按会话过滤的定时任务列表（用户 2026-10-21：「肯定需要按会话过滤」）。
+     *
+     * <p>口径：返回 {@code sessionId} 匹配本会话的任务 + {@code sessionId=null} 的**全局 durable** 任务
+     * ——CC 的 cron 分 SESSION（绑定会话）与 DURABLE（全局常驻）两类，右栏要看「与我相关的全部」，
+     * 只显示会话任务会漏掉全局任务。
+     *
+     * @param sessionId 会话 ID；空白 → 等价 {@link #listAll()}（保持旧契约）
+     */
+    public List<ScheduleDto> listBySession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return listAll();
+        }
+        return listAll().stream()
+            .filter(d -> d.sessionId() == null || sessionId.equals(d.sessionId()))
+            .toList();
+    }
+
     public List<ScheduleDto> listAll() {
         List<ScheduleRecord> all = scheduleMapper.selectAll();
         // F5 修复 (follow-up.md F5): 反查 sessionJobs 以补充 scope/sessionId (对齐 getById line 95-100).

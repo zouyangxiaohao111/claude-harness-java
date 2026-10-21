@@ -59,9 +59,16 @@ public class ScheduleController {
 
     @Autowired private ScheduleService scheduleService;
 
+    /**
+     * 定时任务列表 · 可选 {@code ?sessionId=} 按会话过滤（含全局 durable 任务）。
+     *
+     * @param sessionId 会话 ID（缺省 → 全部，保持旧契约）
+     */
     @GetMapping
-    public List<ScheduleDto> list() {
-        return scheduleService.listAll();
+    public List<ScheduleDto> list(
+            @org.springframework.web.bind.annotation.RequestParam(name = "sessionId", required = false)
+            String sessionId) {
+        return scheduleService.listBySession(sessionId);
     }
 
     @GetMapping("/{id}")

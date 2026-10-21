@@ -263,7 +263,9 @@ function App() {
     let currentW = startW
     const move = (ev: MouseEvent) => {
       // resizer 在右栏左边缘：往左拖（clientX 减小）→ 右栏变宽
-      currentW = Math.max(220, Math.min(640, startW - (ev.clientX - startX)))
+      // 上限从固定 640 改为「视口 70%」（用户 2026-10-21：拖到 640 就卡住不合理）
+      const maxW = Math.max(420, Math.round(window.innerWidth * 0.7))
+      currentW = Math.max(220, Math.min(maxW, startW - (ev.clientX - startX)))
       appEl.style.setProperty('--right-w', `${currentW}px`)
     }
     const up = () => {
@@ -278,7 +280,7 @@ function App() {
   useEffect(() => {
     const saved = localStorage.getItem('nexusai-right-w')
     if (saved) {
-      const w = Math.max(220, Math.min(640, parseInt(saved, 10) || 300))
+      const w = Math.max(220, Math.min(Math.max(420, Math.round(window.innerWidth * 0.7)), parseInt(saved, 10) || 300))
       const appEl = document.querySelector('.app') as HTMLElement | null
       if (appEl) appEl.style.setProperty('--right-w', `${w}px`)
     }
@@ -1819,28 +1821,21 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [ui.showSearchPalette, uiDispatch])
 
+  // 折叠列宽用内联兜底：样式表里存在多条 `.app.right-collapsed`（0 / 44px）历史覆盖，
+  // 一旦被别的规则抢先，右栏会收成 0 宽 → 按钮找不回来。内联优先级最高。
+  // ⛔ 折叠态第三列只留 36px：右栏**不展示内容面板**，只剩一个裸按钮（用户裁定）。
   return (
-    <div className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}`}>
+    <div
+      className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}`}
+      style={(rightCollapsed || leftCollapsed)
+        ? { gridTemplateColumns: `${leftCollapsed ? 48 : 260}px 1fr ${rightCollapsed ? 36 : 'var(--right-w)'}` }
+        : undefined}
+    >
       <div className="topbar">
         <TitleBar />
         <MenuBar
           openSettings={() => uiDispatch({ type: 'TOGGLE_SETTINGS' })}
         />
-        {/* 右栏折叠开关（顶部导航栏右侧 · 左栏开关在左栏面板内） */}
-        <div className="topbar-panel-toggles">
-          <button
-            className="rail-collapse-btn"
-            title={rightCollapsed ? '展开上下文面板' : '收起上下文面板'}
-            aria-label={rightCollapsed ? '展开上下文面板' : '收起上下文面板'}
-            onClick={() => setRightCollapsed((v) => !v)}
-          >
-            {rightCollapsed ? (
-              <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><path d="M9 2.5L4 7L9 11.5" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round" /></svg>
-            ) : (
-              <svg viewBox="0 0 14 14" fill="none" width="14" height="14"><line x1="2" y1="3.6" x2="12" y2="3.6" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="7" x2="12" y2="7" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /><line x1="2" y1="10.4" x2="12" y2="10.4" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" /></svg>
-            )}
-          </button>
-        </div>
       </div>
       <SessionList
         sessions={storeSessions}
@@ -2039,6 +2034,8 @@ function App() {
         openSettingsAt={openSettingsAt}
         flashingProject={sessionProject.flashing}
         onRollbackFile={rollbackChangedFile}
+        onToggleCollapse={() => setRightCollapsed((v) => !v)}
+        collapsed={rightCollapsed}
       />
       {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport；折叠时由窄 rail 展开，不显示 resizer） */}
       {!rightCollapsed && <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />}

@@ -5,9 +5,9 @@
 
     <!-- 外部可配项（application.yml logging.* 注入；未配置回落默认） -->
     <springProperty scope="context" name="log-file-path" source="logging.file.path" defaultValue="logs"/>
-    <springProperty scope="context" name="log-rolling-max-file-size" source="logging.logback.rollingpolicy.max-file-size" defaultValue="100MB"/>
-    <springProperty scope="context" name="log-rolling-total-size-cap" source="logging.logback.rollingpolicy.total-size-cap" defaultValue="1GB"/>
-    <springProperty scope="context" name="log-rolling-max-history" source="logging.logback.rollingpolicy.max-history" defaultValue="30"/>
+    <springProperty scope="context" name="log-rolling-max-file-size" source="logging.logback.rollingpolicy.max-file-size" defaultValue="32MB"/>
+    <springProperty scope="context" name="log-rolling-total-size-cap" source="logging.logback.rollingpolicy.total-size-cap" defaultValue="512MB"/>
+    <springProperty scope="context" name="log-rolling-max-history" source="logging.logback.rollingpolicy.max-history" defaultValue="14"/>
     <springProperty scope="context" name="log-rolling-clean-history-on-start" source="logging.logback.rollingpolicy.clean-history-on-start" defaultValue="false"/>
 
     <!-- 控制台格式：%highlight 颜色（INFO 绿/WARN 黄/ERROR 红，logback 自带，不依赖 SkyWalking）
@@ -23,13 +23,17 @@
     <property name="PATTERN_FILE"
               value="%d{yyyy-MM-dd HH:mm:ss.SSS} %-5level [%thread] %logger{40} - %msg%n${LOG_EXCEPTION_CONVERSION_WORD:-%ex}"/>
 
-    <!-- 控制台 Appender（人类 + AI 友好，带颜色） -->
-    <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
-        <encoder>
-            <pattern>${PATTERN_CONSOLE}</pattern>
-            <charset>UTF-8</charset>
-        </encoder>
-    </appender>
+    <!-- 控制台 Appender（人类 + AI 友好，带颜色）· 仅非 prod 定义：
+         prod 下不定义它，logback 才不会打 "Appender named [STDOUT] not referenced" 告警，
+         也不会有人在 root 里误引用回去而重新撑大 backend.log。 -->
+    <springProfile name="!prod">
+        <appender name="STDOUT" class="ch.qos.logback.core.ConsoleAppender">
+            <encoder>
+                <pattern>${PATTERN_CONSOLE}</pattern>
+                <charset>UTF-8</charset>
+            </encoder>
+        </appender>
+    </springProfile>
 
     <!-- 文件 Appender：INFO 全量（含 debug/warn/error） -->
     <appender name="FILE_INFO" class="ch.qos.logback.core.rolling.RollingFileAppender">
@@ -120,11 +124,30 @@
     <logger name="com.zaxxer.hikari" level="WARN"/>
     <logger name="org.apache.catalina" level="WARN"/>
 
-    <root level="INFO">
-        <appender-ref ref="STDOUT"/>
-        <appender-ref ref="ASYNC_INFO"/>
-        <appender-ref ref="ASYNC_WARN"/>
-        <appender-ref ref="ASYNC_ERROR"/>
-    </root>
+    <!-- ==================================================================
+         prod（桌面版）不挂 STDOUT —— 这是 backend.log 膨胀到 GB 的根因：
+         Tauri 壳把 java 的 stdout/stderr 直接 append 到 logs/backend.log，
+         且那份文件**没有任何滚动**。STDOUT 挂在 root 上 ⇒ 每条日志在
+         info.log 与 backend.log 各写一份，桌面应用常驻数天即可涨到 GB 级。
+         关掉 console 后 backend.log 只收 JVM banner / 未捕获 stderr（KB 级）。
+
+         dev（默认 profile）保留控制台，开发者照旧在终端看色彩日志。
+         ================================================================== -->
+    <springProfile name="!prod">
+        <root level="INFO">
+            <appender-ref ref="STDOUT"/>
+            <appender-ref ref="ASYNC_INFO"/>
+            <appender-ref ref="ASYNC_WARN"/>
+            <appender-ref ref="ASYNC_ERROR"/>
+        </root>
+    </springProfile>
+
+    <springProfile name="prod">
+        <root level="INFO">
+            <appender-ref ref="ASYNC_INFO"/>
+            <appender-ref ref="ASYNC_WARN"/>
+            <appender-ref ref="ASYNC_ERROR"/>
+        </root>
+    </springProfile>
 
 </configuration>

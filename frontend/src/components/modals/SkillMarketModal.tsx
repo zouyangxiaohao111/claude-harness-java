@@ -2,7 +2,8 @@ import { useEffect, useMemo, useState } from 'react'
 import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
 import { commandApi } from '@/api/command'
-import { marketApi } from '@/api/market'
+import { marketApi, type InstallProgress } from '@/api/market'
+import { selectProjectFolder } from '@/utils/projectFolder'
 import type {
   AgentListItem,
   ExternalMarketPlugin,
@@ -105,9 +106,21 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const [source, setSource] = useState<MarketSourceId>('jianke-market')
   const [q, setQ] = useState('')
   const [srcOpen, setSrcOpen] = useState(false)
+  // 「＋ 添加」下拉开合 + 上架弹窗分类（null=不显示上架弹窗）
+  const [addOpen, setAddOpen] = useState(false)
+  const [publishCat, setPublishCat] = useState<'skill' | 'expert' | null>(null)
+  // 上架成功后自增 → 触发市场列表重新加载（否则新上架的条目要关掉弹窗再打开才出现）
+  const [reloadKey, setReloadKey] = useState(0)
 
   // ---- 建科市场安装态（前端记忆已装插件名，安装成功后标记「已安装」）----
   const [installed, setInstalled] = useState<Set<string>>(new Set())
+  // 已装插件的本地内容指纹（key=插件名）· 与市场指纹比对判定「有更新」
+  const [installedFp, setInstalledFp] = useState<Record<string, string>>({})
+  // 安装中的市场 id 集合：按钮就地转圈 + 禁用重复点击（安装是下载 + 解包，耗时可达数秒，
+  // 没有反馈时用户会以为没点上而反复点，产生并发安装）。
+  const [installing, setInstalling] = useState<Set<string>>(new Set())
+  // 安装进度（key=市场插件名）· 轮询 /api/plugins/install/progress 得到真实百分比
+  const [progress, setProgress] = useState<Record<string, InstallProgress>>({})
   const [marketName, setMarketName] = useState('zjky-market')
   // 远程下载的插件专家（source='plugin'）· 供建科市场「使用」按钮定位 agentType（不混入本地来源）
   const [pluginAgents, setPluginAgents] = useState<AgentListItem[]>([])
@@ -129,6 +142,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     marketId: p.name, name: p.name, displayName: p.displayName, description: p.description,
     // 分类胶囊取「category + tags」（过滤掉内部标记 skill 后就是 docs/review/design/ppt…）
     categories: [p.category ?? '', ...(p.tags ?? [])].filter(Boolean), remote: true,
+    fingerprint: p.fingerprint,
   })
   const toMarketConnector = (p: ExternalMarketPlugin): MarketConnector => ({
     marketId: p.name, name: p.displayName || p.name, authType: p.tags?.[0], remote: true,
@@ -146,6 +160,16 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       if (cancelled) return
       if (names && names.length > 0) setInstalled(new Set(names))
     }).catch(() => { /* 查询失败静默：标记为空，安装仍可用 */ })
+
+    // 本地指纹（判定「市场有更新」）：市场条目指纹 ≠ 本地安装目录指纹 ⇒ 显示更新
+    void marketApi.listInstalledDetails().then((list) => {
+      if (cancelled) return
+      const map: Record<string, string> = {}
+      for (const d of list ?? []) {
+        if (d.name && d.fingerprint) map[d.name] = d.fingerprint
+      }
+      setInstalledFp(map)
+    }).catch(() => { /* 指纹不可得 → 不显示更新提示（不影响安装） */ })
 
     if (source === 'local') {
       // 本地来源：仅本地 agents（专家 Tab；技能/连接器无数据）。pluginAgents 一并记录（供「使用」定位）
@@ -211,7 +235,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       done()
     })
     return () => { cancelled = true }
-  }, [sessionId, source])
+  }, [sessionId, source, reloadKey])
 
   // ---- 已安装计数（顶栏 · =preinstalled / 已装插件 / isConnected / 本地已装专家数）----
   const installedCount = tab === 'expert'
@@ -277,14 +301,32 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   }, [localAgents, experts, currentAgent, keyword, source]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- 安装建科市场插件（POST /api/plugins/install · 后端自动 reconcile 市场 + 安装链）----
+  /**
+   * 市场里有更新？名称相同、指纹不同即算 —— 版本号可能没变（重新上架覆盖内容），
+   * 所以只认内容指纹（用户裁定 2026-10-21）。
+   */
+  const hasUpdate = (marketId: string, marketFp?: string | null) =>
+    !!marketFp && !!installedFp[marketId] && marketFp !== installedFp[marketId]
+
   const installMarketPlugin = async (pluginName: string) => {
     if (busy) {
       showToast('对话进行中，请稍后再安装', 'info')
       return
     }
+    // 同一插件已在安装中 → 直接忽略（按钮虽已禁用，键盘/连点仍可能进来）
+    if (installing.has(pluginName)) return
+    const pluginId = `${pluginName}@${marketName}`
+    setInstalling((prev) => new Set(prev).add(pluginName))
+    setProgress((prev) => ({ ...prev, [pluginName]: { pluginId, stage: 'PREPARING', percent: 2, message: '准备市场索引', updatedAt: Date.now() } }))
+    // 安装是同步 POST，拿不到中间态 → 轮询后端进度台账（下载段是真实字节比率）
+    const timer = window.setInterval(() => {
+      void marketApi.getInstallProgress(pluginId)
+        .then((p) => { if (p) setProgress((prev) => ({ ...prev, [pluginName]: p })) })
+        .catch(() => { /* 轮询失败不打扰用户：主流程的结果 toast 才是权威 */ })
+    }, 400)
     try {
       const r = await marketApi.installPlugin({
-        pluginId: `${pluginName}@${marketName}`,
+        pluginId,
         marketplaceUrl: JIANKE_MARKET_URL,
         scope: 'user',
       })
@@ -296,6 +338,22 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       }
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    } finally {
+      window.clearInterval(timer)
+      // 进度圈保留片刻再收：小包（几十 KB）0.2s 就装完，立即复位会让用户完全看不到进度。
+      // 期间按钮保持禁用，避免在 100% 未收尾时又点一次。
+      window.setTimeout(() => {
+        setInstalling((prev) => {
+          const next = new Set(prev)
+          next.delete(pluginName)
+          return next
+        })
+        setProgress((prev) => {
+          const next = { ...prev }
+          delete next[pluginName]
+          return next
+        })
+      }, 800)
     }
   }
 
@@ -425,9 +483,34 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
           <div className="sm-installed" title="已安装 = 本地已装专家 / 远端预装（preinstalled）/ 已连接连接器">
             已安装 <span className="sm-installed-n">{installedCount}</span>
           </div>
-          <button className="sm-add-btn" onClick={() => showToast('「添加」为占位入口（后续接自定义安装/上架）', 'info')} title="添加（占位）">
-            ＋ 添加
-          </button>
+          {/* [2026-10-21] 「＋ 添加」下拉：上传技能 / 上传专家 / 创建技能。
+              对齐 WorkBuddy 的「添加技能」菜单；差异：我们额外支持上架专家（用户要求）。 */}
+          <div className="sm-add">
+            <button className="sm-add-btn" onClick={() => setAddOpen((v) => !v)} title="添加">
+              ＋ 添加
+            </button>
+            {addOpen && (
+              <div className="sm-add-menu">
+                <div className="sm-add-item" onClick={() => { setAddOpen(false); setPublishCat('skill') }}>
+                  上传技能
+                </div>
+                <div className="sm-add-item" onClick={() => { setAddOpen(false); setPublishCat('expert') }}>
+                  上传专家
+                </div>
+                <div className="sm-add-item" onClick={() => {
+                  setAddOpen(false)
+                  // 创建技能交给内置 skill-creator（已有能力，不重复造轮子）
+                  if (onSummonSkill) {
+                    onSummonSkill('skill-creator', '创建技能')
+                  } else {
+                    showToast('请先在输入框输入 /skill-creator 创建技能', 'info')
+                  }
+                }}>
+                  创建技能
+                </div>
+              </div>
+            )}
+          </div>
         </div>
 
         {/* ===== 次顶栏：Tab 分段 + 搜索 ===== */}
@@ -492,7 +575,16 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                                 <button className="sm-use-btn" onClick={() => useInstalledPlugin(c.marketId)} title={`使用 ${c.name} 驱动会话`}>使用</button>
                               </div>
                             ) : (
-                              <button className="sm-use-btn" onClick={() => void installMarketPlugin(c.marketId)} title={`安装 ${c.name}`}>安装</button>
+                              <button
+                                className={`sm-use-btn${installing.has(c.marketId) ? ' installing' : ''}`}
+                                disabled={installing.has(c.marketId)}
+                                onClick={() => void installMarketPlugin(c.marketId)}
+                                title={installing.has(c.marketId) ? `正在安装 ${c.name}…` : `安装 ${c.name}`}
+                              >
+                                {installing.has(c.marketId)
+                                  ? <><RingProgress percent={progress[c.marketId]?.percent ?? 0} /><span>{progress[c.marketId]?.percent ?? 0}%</span></>
+                                  : '安装'}
+                              </button>
                             )
                           ) : (
                             <button
@@ -543,6 +635,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
                           installedNow={installed.has(s.marketId)}
                           onSummon={() => summonSkill(s)}
+                          installing={installing.has(s.marketId)}
+                          installPercent={progress[s.marketId]?.percent ?? 0}
+                          hasUpdate={hasUpdate(s.marketId, s.fingerprint)}
                         />
                       ))}
                     </div>
@@ -562,6 +657,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                             onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
                             installedNow={installed.has(s.marketId)}
                             onSummon={() => summonSkill(s)}
+                            installing={installing.has(s.marketId)}
+                            installPercent={progress[s.marketId]?.percent ?? 0}
+                            hasUpdate={hasUpdate(s.marketId, s.fingerprint)}
                           />
                         ))}
                       </div>
@@ -580,6 +678,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                                 onInstall={source === 'jianke-market' ? (id) => void installMarketPlugin(id) : undefined}
                                 installedNow={installed.has(s.marketId)}
                                 onSummon={() => summonSkill(s)}
+                                installing={installing.has(s.marketId)}
+                                installPercent={progress[s.marketId]?.percent ?? 0}
+                                hasUpdate={hasUpdate(s.marketId, s.fingerprint)}
                               />
                             ))}
                           </div>
@@ -607,12 +708,14 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                               : source === 'jianke-market'
                                 ? (
                                     <button
-                                      className={`sm-plus-btn${installed.has(c.marketId) ? ' marked' : ''}`}
-                                      disabled={installed.has(c.marketId)}
+                                      className={`sm-plus-btn${installed.has(c.marketId) ? ' marked' : ''}${installing.has(c.marketId) ? ' installing' : ''}`}
+                                      disabled={installed.has(c.marketId) || installing.has(c.marketId)}
                                       onClick={() => void installMarketPlugin(c.marketId)}
-                                      title={installed.has(c.marketId) ? '已安装' : '安装'}
+                                      title={installed.has(c.marketId) ? '已安装' : installing.has(c.marketId) ? '正在安装…' : '安装'}
                                     >
-                                      {installed.has(c.marketId) ? '✓' : '+'}
+                                      {installing.has(c.marketId)
+                                        ? <RingProgress percent={progress[c.marketId]?.percent ?? 0} />
+                                        : installed.has(c.marketId) ? '✓' : '+'}
                                     </button>
                                   )
                                 : (
@@ -635,6 +738,16 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
             </>
           )}
         </div>
+
+        {/* 上架弹窗（上传技能 / 上传专家）· 上架成功后重新拉市场列表 */}
+        {publishCat && (
+          <PublishDialog
+            category={publishCat}
+            onClose={() => setPublishCat(null)}
+            onDone={() => { setPublishCat(null); setReloadKey((k) => k + 1) }}
+            showToast={showToast}
+          />
+        )}
       </div>
     </div>
   )
@@ -644,13 +757,155 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
  *  未安装：建科市场来源「+」调安装 / 骨架来源 UI 高亮（onMark）；
  *  已安装（preinstalled 或本次刚装成功 installedNow）：显示「已安装」+「召唤」——
  *  召唤 = 把 /技能命令名 写入输入框（2026-10-19 用户需求：安装成功可直接选择召唤）。 */
-function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false, onSummon }: {
+/**
+ * 上架弹窗：把本地技能 / 专家目录发布到市场。
+ *
+ * <p>调用 `POST /api/market/manage/publish`；普通用户即可用（不需要市场管理员模式）。
+ * 版本留空 → 后端自动 patch +1；内容指纹未变 → 返回 unchanged，不产生重复版本。
+ */
+function PublishDialog({ category, onClose, onDone, showToast }: {
+  category: 'skill' | 'expert'
+  onClose: () => void
+  onDone: () => void
+  showToast: (msg: string, type?: 'success' | 'info') => void
+}) {
+  const [dir, setDir] = useState('')
+  const [name, setName] = useState('')
+  const [displayName, setDisplayName] = useState('')
+  const [description, setDescription] = useState('')
+  const [tags, setTags] = useState('')
+  const [version, setVersion] = useState('')
+  const [busy, setBusy] = useState(false)
+  const label = category === 'expert' ? '专家' : '技能'
+
+  const pick = async () => {
+    const sel = await selectProjectFolder(`选择要上架的${label}目录`)
+    if (!sel) return
+    setDir(sel.path)
+    if (!name) {
+      setName(sel.path.split(/[\\/]/).filter(Boolean).pop() ?? '')
+    }
+  }
+
+  const submit = async () => {
+    if (!dir.trim()) {
+      showToast('请先选择要上架的目录', 'info')
+      return
+    }
+    setBusy(true)
+    try {
+      const r = await marketApi.publishPlugin({
+        sourcePath: dir.trim(),
+        category,
+        name: name.trim() || undefined,
+        displayName: displayName.trim() || undefined,
+        description: description.trim() || undefined,
+        tags: tags.split(/[,，\s]+/).map((t) => t.trim()).filter(Boolean),
+        version: version.trim() || undefined,
+      })
+      if (r.status === 'ok') {
+        showToast(`已上架 ${r.name} v${r.version}`, 'success')
+        onDone()
+      } else if (r.status === 'unchanged') {
+        showToast(`内容没有变化，未创建新版本（当前 v${r.version}）`, 'info')
+      } else {
+        showToast(r.message || '上架失败', 'info')
+      }
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    } finally {
+      setBusy(false)
+    }
+  }
+
+  return (
+    <div className="sm-publish-mask" onClick={onClose}>
+      <div className="sm-publish" onClick={(e) => e.stopPropagation()}>
+        <div className="sm-publish-head">
+          <span>上传{label}</span>
+          <button className="sm-icon-btn" onClick={onClose} title="关闭">✕</button>
+        </div>
+        <div className="sm-publish-body">
+          <label>本地目录</label>
+          <div className="sm-publish-inline">
+            <input className="settings-input" value={dir} onChange={(e) => setDir(e.target.value)}
+              placeholder={category === 'expert' ? 'C:\\...\\agents\\my-expert' : 'C:\\...\\.nexusai\\skills\\my-skill'} />
+            <button className="sm-publish-btn" onClick={() => void pick()}>选择…</button>
+          </div>
+          <div className="sm-publish-hint">
+            {category === 'expert'
+              ? '目录里要有 agents/ 或 plugin.json'
+              : '目录里要有 SKILL.md（或 plugin.json / skills/）'}
+          </div>
+
+          <div className="sm-publish-row">
+            <div>
+              <label>市场名称</label>
+              <input className="settings-input" value={name} onChange={(e) => setName(e.target.value)}
+                placeholder="留空取目录名" />
+            </div>
+            <div>
+              <label>版本</label>
+              <input className="settings-input" value={version} onChange={(e) => setVersion(e.target.value)}
+                placeholder="留空自动 +1" />
+            </div>
+          </div>
+          <label>展示名称</label>
+          <input className="settings-input" value={displayName} onChange={(e) => setDisplayName(e.target.value)}
+            placeholder={`显示在${label}卡片上的名字`} />
+          <label>描述</label>
+          <input className="settings-input" value={description} onChange={(e) => setDescription(e.target.value)}
+            placeholder="一句话说明它做什么" />
+          <label>标签</label>
+          <input className="settings-input" value={tags} onChange={(e) => setTags(e.target.value)}
+            placeholder="逗号或空格分隔" />
+        </div>
+        <div className="sm-publish-foot">
+          <button className="sm-publish-btn" onClick={onClose}>取消</button>
+          <button className="sm-publish-btn primary" disabled={busy} onClick={() => void submit()}>
+            {busy ? '上架中…' : '上架到市场'}
+          </button>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 环形进度圈（conic-gradient）· 用于安装按钮原位显示真实百分比。
+ *
+ * <p>口径：0~100；下载段来自后端按 Content-Length 统计的字节比率，解压/注册段是阶段值。
+ */
+function RingProgress({ percent }: { percent: number }) {
+  const pct = Math.max(0, Math.min(100, Math.round(percent || 0)))
+  const deg = pct * 3.6
+  return (
+    <span
+      className="sm-ring"
+      role="progressbar"
+      aria-valuenow={pct}
+      aria-valuemin={0}
+      aria-valuemax={100}
+      style={{ background: `conic-gradient(var(--accent, #0f5fd4) ${deg}deg, var(--hairline-strong, #E2E2E2) ${deg}deg)` }}
+    >
+      <span className="sm-ring-hole" />
+    </span>
+  )
+}
+
+function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false, installing = false, installPercent = 0, hasUpdate = false, onSummon }: {
   skill: MarketSkill
   marked: boolean
   onMark: () => void
   onInstall?: (marketId: string) => void
   /** 本次会话内安装成功（installed Set 命中；与服务端 preinstalled 合并判定） */
   installedNow?: boolean
+  /** 正在安装（下载 + 解包中）→ 按钮显示环形进度并禁用，避免连点触发并发安装 */
+  installing?: boolean
+  /** 安装进度百分比（0~100）· 只有下载段是真实字节比率 */
+  installPercent?: number
+  /** 市场内容指纹与本地已装指纹不同（名称/版本可能都一样）→ 显示「可更新」 */
+  hasUpdate?: boolean
   /** 召唤到输入框（仅已安装卡提供） */
   onSummon?: () => void
 }) {
@@ -666,7 +921,19 @@ function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false,
         {installed
           ? (
               <span className="sm-mini-actions">
-                <span className="sm-installed-mark">已安装</span>
+                <span className={`sm-installed-mark${hasUpdate ? ' stale' : ''}`}>
+                  {hasUpdate ? '可更新' : '已安装'}
+                </span>
+                {hasUpdate && onInstall && (
+                  <button
+                    className="sm-update-btn"
+                    disabled={installing}
+                    onClick={() => onInstall(skill.marketId)}
+                    title="市场内容与本地不同，点击更新"
+                  >
+                    {installing ? <RingProgress percent={installPercent} /> : '更新'}
+                  </button>
+                )}
                 {onSummon && (
                   <button
                     className="sm-summon-btn"
@@ -680,8 +947,13 @@ function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false,
             )
           : onInstall
             ? (
-                <button className="sm-plus-btn" onClick={() => onInstall(skill.marketId)} title={`安装 ${nm}`}>
-                  +
+                <button
+                  className={`sm-plus-btn${installing ? ' installing' : ''}`}
+                  disabled={installing}
+                  onClick={() => onInstall(skill.marketId)}
+                  title={installing ? `正在安装 ${nm}… ${installPercent}%` : `安装 ${nm}`}
+                >
+                  {installing ? <RingProgress percent={installPercent} /> : '+'}
                 </button>
               )
             : <button className={`sm-plus-btn${marked ? ' marked' : ''}`} onClick={onMark} title="安装（骨架：UI 占位）">{marked ? '✓' : '+'}</button>}

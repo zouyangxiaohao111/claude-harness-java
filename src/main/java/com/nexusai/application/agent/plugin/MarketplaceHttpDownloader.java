@@ -109,6 +109,20 @@ public class MarketplaceHttpDownloader {
      * @throws IOException 下载失败 / 非 200 / 非 zip
      */
     public void downloadArchive(String url, Map<String, String> headers, String targetDir) throws IOException {
+        downloadArchive(url, headers, targetDir, null);
+    }
+
+    /**
+     * 下载单个 marketplace 插件包（带字节进度回调）。
+     *
+     * @param url        插件包 URL（如 {@code <base>/<source>/plugin.zip}）
+     * @param headers    额外请求头（可 null）
+     * @param targetDir  解压目标目录（不存在则创建）
+     * @param onProgress 进度回调 {@code (已读字节, 总字节)}；总字节未知时为 -1（可 null）
+     * @throws IOException 非 200 / 非 zip / 解压失败
+     */
+    public void downloadArchive(String url, Map<String, String> headers, String targetDir,
+                                java.util.function.BiConsumer<Long, Long> onProgress) throws IOException {
         Path dir = Paths.get(targetDir);
         Files.createDirectories(dir);
         Path tempFile = Files.createTempFile("nexusai-plugin-", ".tmp");
@@ -119,10 +133,39 @@ public class MarketplaceHttpDownloader {
             if (headers != null) {
                 headers.forEach(b::header);
             }
-            HttpResponse<Path> resp = httpClient.send(b.build(), HttpResponse.BodyHandlers.ofFile(tempFile));
-            int sc = resp.statusCode();
-            if (sc != 200) {
-                throw new IOException("插件包下载失败（HTTP " + sc + "）: " + redact(url));
+            if (onProgress == null) {
+                HttpResponse<Path> resp = httpClient.send(b.build(), HttpResponse.BodyHandlers.ofFile(tempFile));
+                int sc = resp.statusCode();
+                if (sc != 200) {
+                    throw new IOException("插件包下载失败（HTTP " + sc + "）: " + redact(url));
+                }
+            } else {
+                // 有进度回调 → 流式读取，按 Content-Length 推进（ofFile 一次性落盘拿不到中间态）
+                HttpResponse<InputStream> resp = httpClient.send(b.build(),
+                    HttpResponse.BodyHandlers.ofInputStream());
+                int sc = resp.statusCode();
+                if (sc != 200) {
+                    throw new IOException("插件包下载失败（HTTP " + sc + "）: " + redact(url));
+                }
+                long total = resp.headers().firstValueAsLong("content-length").orElse(-1L);
+                long read = 0L;
+                long lastReport = 0L;
+                try (InputStream in = resp.body();
+                     java.io.OutputStream out = Files.newOutputStream(tempFile)) {
+                    byte[] buf = new byte[64 * 1024];
+                    int n;
+                    while ((n = in.read(buf)) > 0) {
+                        out.write(buf, 0, n);
+                        read += n;
+                        long now = System.currentTimeMillis();
+                        // 节流：≥120ms 或读完才回调，避免小包把台账刷爆
+                        if (now - lastReport >= 120L) {
+                            lastReport = now;
+                            onProgress.accept(read, total);
+                        }
+                    }
+                }
+                onProgress.accept(read, total);
             }
             if (!isZip(tempFile)) {
                 throw new IOException("插件包不是 zip（无法解压）: " + redact(url));

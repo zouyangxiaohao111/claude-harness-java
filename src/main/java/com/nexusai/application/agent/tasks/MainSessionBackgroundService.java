@@ -380,51 +380,10 @@ public class MainSessionBackgroundService {
      * @return 输出文件路径（symlink 成功或 fallback 普通文件）
      */
     public String initTaskOutputAsSymlink(String taskId, Path sessionDir, String sessionId, Path targetPath) {
-        Path outputDir = sessionDir.resolve(sessionId).resolve("tasks");
-        Path outputPath = outputDir.resolve(taskId + ".output");
-        try {
-            Files.createDirectories(outputDir);
-            try {
-                Files.createSymbolicLink(outputPath, targetPath);
-                log.info("主会话后台化输出 symlink 已创建: output={} -> target={}", outputPath, targetPath);
-                return outputPath.toString();
-            } catch (Exception e) {
-                // 已存在 / symlink 不支持 / RuntimeException（如无效 target）→ unlink 重试。
-                // CC diskOutput.ts:440-442 为裸 catch {}（catch-all），Java 以 catch Exception 等价。
-                log.warn("symlink 创建失败，尝试 unlink 重试: {}: {}", outputPath, e.getMessage());
-                try {
-                    Files.deleteIfExists(outputPath);
-                    Files.createSymbolicLink(outputPath, targetPath);
-                    log.info("主会话后台化输出 symlink 重试成功: output={}", outputPath);
-                    return outputPath.toString();
-                } catch (Exception e2) {
-                    // 再失败 → initTaskOutput fallback（CC :445-447，外层裸 catch(error)）
-                    log.warn("symlink 重试失败，fallback 普通文件: {}", e2.getMessage());
-                    return writeFallbackOutput(outputPath);
-                }
-            }
-        } catch (Exception e) {
-            log.warn("输出目录创建失败: {}", e.getMessage());
-            return writeFallbackOutput(outputPath);
-        }
+        // 实现已抽到 TaskOutputSymlink（子代理 LocalAgentTask 与主会话后台化共用同一份语义）
+        return TaskOutputSymlink.initTaskOutputAsSymlink(taskId, sessionDir.resolve(sessionId).resolve("tasks"), targetPath);
     }
 
-    private String writeFallbackOutput(Path outputPath) {
-        try {
-            Files.createDirectories(outputPath.getParent());
-            // CC diskOutput.ts:400-421 initTaskOutput —— O_EXCL（win32 'wx'）：
-            //   以 CREATE_NEW 新建空文件；若路径已存在（含攻击者预置 symlink）则失败，
-            //   绝不跟随 symlink / 截断目标（diskOutput.ts:17-18 SECURITY 承诺）。
-            try (java.nio.channels.FileChannel ignored = java.nio.channels.FileChannel.open(
-                    outputPath, Set.of(StandardOpenOption.CREATE_NEW, StandardOpenOption.WRITE))) {
-                // 空文件即已创建
-            }
-            return outputPath.toString();
-        } catch (Exception e) {
-            log.error("fallback 输出文件创建失败: {}", e.getMessage());
-            return outputPath.toString();
-        }
-    }
 
     /**
      * 启动主会话后台化派生查询 · 对齐 CC {@code startBackgroundSession}（LocalMainSessionTask.ts:338-479）。

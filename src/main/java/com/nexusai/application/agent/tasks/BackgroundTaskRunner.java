@@ -697,6 +697,18 @@ public class BackgroundTaskRunner {
         // 方案B: outputFile 对齐 CC 五层 {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output
         //   （CC LocalAgentTask.tsx:488 createTaskStateBase → Task.ts:121 getTaskOutputPath）
         String outputFile = taskOutputPath(createSessionId, taskId);
+        // [2026-10-21 对齐 CC LocalAgentTask.tsx:540/:608] output **软链到该 agent 的 transcript**：
+        //   CC/CCB 双方核实——注册时 initTaskOutputAsSymlink，之后全程不往 output 写内容，
+        //   主代理 Read output 等于读完整执行记录。失败自动回退空文件，不阻断注册。
+        try {
+            Path sessionDir = com.nexusai.application.agent.tool.SessionStorage.sessionProjectDir(createSessionId);
+            Path transcriptTarget = com.nexusai.application.agent.subagent.AgentTranscript
+                .getTranscriptPath(sessionDir, createSessionId, taskId);
+            outputFile = TaskOutputSymlink.initTaskOutputAsSymlink(
+                taskId, Paths.get(taskOutputDir(createSessionId)), transcriptTarget);
+        } catch (Exception e) {
+            log.warn("子代理 output symlink 初始化失败（保留普通路径）: taskId={} err={}", taskId, e.getMessage());
+        }
         // Phase 4 (cron-notify): 透传创建会话 sessionId（SubagentTool 从父循环 TUC 提取，
         // 与 spawn 同源）——终态通知（transitionToTerminal/enqueueAgentNotification/killAsyncAgent）
         // 在 worker 线程执行，MDC 已丢，须注册时透传存在 task 上。
@@ -2206,9 +2218,8 @@ public class BackgroundTaskRunner {
         if (snapshot == null) {
             throw new IllegalStateException("task not found: " + taskId);
         }
-        if (result != null) {
-            appendToOutputFile(snapshot.outputFile(), result);
-        }
+        // ⛔ 不再往 outputFile 写 summary：CC/CCB 的 LocalAgentTask 把 output 软链到 transcript，
+        //   全程不写内容（只把路径拼进通知）。若继续 append，会往 transcript 的 .jsonl 里塞非法行。
         // 用 ConcurrentHashMap.computeIfPresent 保证读-改-写原子 (vs get+put race)
         AtomicReference<BackgroundTask> ref = new AtomicReference<>();
         AtomicBoolean advanced = new AtomicBoolean(false);
@@ -2286,33 +2297,6 @@ public class BackgroundTaskRunner {
         return finalTask;
     }
 
-    /**
-     * 追加 result 到 outputFile · async agent worker 完成后写入 final assistant message.
-     * 文件不存在时创建; 已存在时 append 保留 worker 累积输出.
-     *
-     * <p><b>方案B 对齐</b>：outputFile 为 CC 五层
-     * {@code {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output}，
-     * 父目录（.../{sessionId}/tasks）不再天然存在 —— 写前 {@code createDirectories} 建父目录
-     * （对齐 CC ensureOutputDir，diskOutput.ts:65-67 mkdir recursive）。旧平铺 /tmp 路径父目录恒在，
-     * 无需此步。
-     */
-    private void appendToOutputFile(String path, AsyncAgentResult result) {
-        if (path == null || path.isBlank() || result.summary() == null || result.summary().isEmpty()) return;
-        try {
-            Path outputPath = Paths.get(path);
-            if (outputPath.getParent() != null) {
-                Files.createDirectories(outputPath.getParent());
-            }
-            Files.writeString(outputPath, result.summary(),
-                StandardOpenOption.CREATE, StandardOpenOption.APPEND);
-            if (log.isDebugEnabled()) {
-                log.debug("BackgroundTaskRunner.appendToOutputFile: summary 已追加到 outputFile path={}", path);
-            }
-        } catch (Exception e) {
-            log.warn("BackgroundTaskRunner.appendToOutputFile: 写 outputFile 失败 path={} 错误={}",
-                path, e.getMessage());
-        }
-    }
 
     /**
      * Phase 3: TaskOutput 阻塞查询 · 对齐 CC TaskOutputTool.tsx:118-143.

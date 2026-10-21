@@ -174,8 +174,45 @@ public final class BuiltInCommands {
             "Initialize a new CLAUDE.md file with codebase documentation",
             null, null, false, null);
         c.setProgressMessage("analyzing your codebase");
+        // [2026-10-21 用户裁定：/init 对齐 CC] 原先只暴露元数据、prompt 文本不迁移 ⇒ 命令是空壳
+        // （点了没有任何产物）。现补齐正文：斜杠拦截器经 SkillContentLoader 读到 content 后
+        // 作为 user message 注入，与 CC getPromptForCommand() 返回单条 text 块等价。
+        c.setContent(INIT_PROMPT);
         return c;
     }
+
+    /**
+     * /init 提示词 · CC original: {@code commands/init.ts:7-38 OLD_INIT_PROMPT}。
+     *
+     * <p>取 OLD 版（而非 NEW_INIT_PROMPT）的依据：CC 里 NEW_INIT 受
+     * {@code feature('NEW_INIT') && (USER_TYPE==='ant' || CLAUDE_CODE_NEW_INIT)} 双重门控，
+     * 发行版默认走 OLD；NexusAI 没有该 feature 开关，对齐默认行为。
+     *
+     * <p>文本逐字对齐 CC（含「不要编造章节」「已存在则建议改进」等约束）——这些约束正是
+     * 防止产出臃肿/幻觉式 CLAUDE.md 的关键，删改会直接改变生成质量。
+     */
+    private static final String INIT_PROMPT = """
+        Please analyze this codebase and create a CLAUDE.md file, which will be given to future instances of Claude Code to operate in this repository.
+
+        What to add:
+        1. Commands that will be commonly used, such as how to build, lint, and run tests. Include the necessary commands to develop in this codebase, such as how to run a single test.
+        2. High-level code architecture and structure so that future instances can be productive more quickly. Focus on the "big picture" architecture that requires reading multiple files to understand.
+
+        Usage notes:
+        - If there's already a CLAUDE.md, suggest improvements to it.
+        - When you make the initial CLAUDE.md, do not repeat yourself and do not include obvious instructions like "Provide helpful error messages to users", "Write unit tests for all new utilities", "Never include sensitive information (API keys, tokens) in code or commits".
+        - Avoid listing every component or file structure that can be easily discovered.
+        - Don't include generic development practices.
+        - If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (in .github/copilot-instructions.md), make sure to include the important parts.
+        - If there is a README.md, make sure to include the important parts.
+        - Do not make up information such as "Common Development Tasks", "Tips for Development", "Support and Documentation" unless this is expressly included in other files that you read.
+        - Be sure to prefix the file with the following text:
+
+        ```
+        # CLAUDE.md
+
+        This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
+        ```""";
 
     /**
      * /memory · CC original: commands/memory/index.ts:3-8
@@ -303,6 +340,9 @@ public final class BuiltInCommands {
         clone.setIsHidden(c.getIsHidden());
         clone.setImmediate(c.getImmediate());
         clone.setProgressMessage(c.getProgressMessage());
+        // prompt 正文必须随副本一起走：否则 getAll()/getByName() 返回的副本 content 为 null，
+        // /init 这类只靠内置 content 的 prompt 命令会退化成空壳（2026-10-21 修）
+        clone.setContent(c.getContent());
         clone.setIsEnabled(c.getIsEnabled());
         clone.setSource(c.getSource());
         clone.setBuiltin(c.getBuiltin());

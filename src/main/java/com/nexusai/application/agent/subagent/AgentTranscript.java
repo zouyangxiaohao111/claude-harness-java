@@ -27,6 +27,18 @@ import java.util.stream.Collectors;
 public class AgentTranscript {
 
     private static final Logger log = LoggerFactory.getLogger(AgentTranscript.class);
+
+    /**
+     * 子代理 id 列表缓存（key = sessionDir + sessionId，TTL 8s）。
+     *
+     * <p>WHY：单会话可达 5513 个 transcript 文件，每次请求都要 stat 全部取 mtime 排序，
+     * 实测 1.6~1.8s。列表本身变化很慢（新子代理才会有新文件），缓存几秒即可把重复请求降到毫秒级。
+     */
+    private static final long LIST_CACHE_TTL_MS = 60_000L;
+    private static final java.util.concurrent.ConcurrentHashMap<String, CachedIdList> LIST_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    private record CachedIdList(List<String> ids, long at) {}
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /**
@@ -56,6 +68,141 @@ public class AgentTranscript {
         return sessionDir.resolve(sessionId)
             .resolve("subagents")
             .resolve("agent-" + agentId + ".jsonl");
+    }
+
+    /**
+     * 列出某会话**已落盘**的子代理 agentId（按 transcript 文件 mtime 倒序）。
+     *
+     * <p>为什么需要：右栏「子代理运行状况」原先只接 STOMP 实时事件 + `/tasks` REST 补录，
+     * 而 `/tasks` 只含进程内的后台任务（重启即丢）⇒ 历史会话永远是空的。CC 的
+     * `subagents/` 目录就是这些记录的唯一真源，必须能列出来。
+     *
+     * <p>只返回文件名里的 id 部分（去 `agent-` 前缀与 `.jsonl` 后缀）；不读文件内容
+     * （历史会话可能有数千个，逐个解析会拖垮接口）。
+     *
+     * @param sessionDir 会话根目录
+     * @param sessionId  会话 ID
+     * @param limit      最多返回条数（<=0 → 全部；生产建议 50 以内）
+     * @return agentId 列表（最新在前）
+     */
+    public static List<String> listAgentIds(Path sessionDir, String sessionId, int limit) {
+        // 缓存键带**目录 mtime**：目录没变（没有新增/删除 transcript）就直接命中，
+        // 不靠固定 TTL 反复重扫 5513 个文件（实测首次 2.4s，命中 5ms）。
+        String dirStamp = "";
+        try {
+            Path subDir = sessionDir.resolve(sessionId).resolve("subagents");
+            if (Files.isDirectory(subDir)) {
+                dirStamp = String.valueOf(Files.getLastModifiedTime(subDir).toMillis());
+            }
+        } catch (Exception ignore) {
+            // 取不到目录时间 → 退化为仅 TTL 判据
+        }
+        String cacheKey = sessionDir + "|" + sessionId + "|" + dirStamp;
+        CachedIdList cached = LIST_CACHE.get(cacheKey);
+        long now = System.currentTimeMillis();
+        if (cached != null && now - cached.at() < LIST_CACHE_TTL_MS) {
+            List<String> ids = cached.ids();
+            return limit > 0 && ids.size() > limit ? ids.subList(0, limit) : ids;
+        }
+        List<String> all = listAgentIdsUncached(sessionDir, sessionId);
+        LIST_CACHE.put(cacheKey, new CachedIdList(all, now));
+        return limit > 0 && all.size() > limit ? all.subList(0, limit) : all;
+    }
+
+    /** 缓存失效（测试/显式刷新用）。 */
+    public static void clearListCache() {
+        LIST_CACHE.clear();
+    }
+
+    private static List<String> listAgentIdsUncached(Path sessionDir, String sessionId) {
+        Path dir = sessionDir.resolve(sessionId).resolve("subagents");
+        if (!Files.isDirectory(dir)) {
+            return List.of();
+        }
+        try (var stream = Files.list(dir)) {
+            var files = stream
+                .filter(p -> {
+                    String n = p.getFileName().toString();
+                    return n.startsWith("agent-") && n.endsWith(".jsonl");
+                })
+                .sorted((a, b) -> {
+                    try {
+                        return Files.getLastModifiedTime(b).compareTo(Files.getLastModifiedTime(a));
+                    } catch (IOException e) {
+                        return 0;
+                    }
+                });
+            var ids = files.map(p -> {
+                String n = p.getFileName().toString();
+                return n.substring("agent-".length(), n.length() - ".jsonl".length());
+            });
+            return ids.toList();
+        } catch (IOException e) {
+            log.warn("列子代理 transcript 目录失败: {}: {}", dir, e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
+     * 从 transcript **末行**推断子代理结局（meta.json 里没有状态字段，CC 也没有）。
+     *
+     * <p>口径（保守，拿不到就 unknown，不编造）：
+     * <ul>
+     *   <li>末条消息 role=assistant 且正文/思考非空 → {@code completed}</li>
+     *   <li>末条带 {@code isError=true}（tool 结果失败 / API 错误）→ {@code failed}</li>
+     *   <li>末条是 tool / user（没有最终答复）→ {@code incomplete}（未正常收尾）</li>
+     *   <li>空文件 / 解析失败 → {@code unknown}</li>
+     * </ul>
+     *
+     * <p>性能：只读文件末尾 8KB（单文件可达数 MB，不能整读）。
+     *
+     * @return {@code completed} / {@code failed} / {@code unknown}
+     */
+    public static String inferStatus(Path sessionDir, String sessionId, String agentId) {
+        Path file = getTranscriptPath(sessionDir, sessionId, agentId);
+        if (!Files.isRegularFile(file)) {
+            return "unknown";
+        }
+        try {
+            long size = Files.size(file);
+            int readLen = (int) Math.min(size, 8192L);
+            byte[] buf = new byte[readLen];
+            try (java.io.RandomAccessFile raf = new java.io.RandomAccessFile(file.toFile(), "r")) {
+                raf.seek(size - readLen);
+                raf.readFully(buf);
+            }
+            String tail = new String(buf, java.nio.charset.StandardCharsets.UTF_8);
+            String[] lines = tail.split("\\n");
+            for (int i = lines.length - 1; i >= 0; i--) {
+                String line = lines[i].trim();
+                if (line.isEmpty() || !line.startsWith("{")) {
+                    continue;
+                }
+                try {
+                    JsonNode node = JSON.readTree(line);
+                    if (node.has("isError") && node.path("isError").asBoolean(false)) {
+                        return "failed";
+                    }
+                    String role = node.path("role").asText("");
+                    boolean hasBody = !node.path("content").asText("").isBlank()
+                        || !node.path("reasoning").asText("").isBlank();
+                    if ("assistant".equals(role) && hasBody) {
+                        return "completed";
+                    }
+                    if ("tool".equals(role) || "user".equals(role)) {
+                        // 末条是工具结果 / 用户输入 ⇒ 没有最终助手答复 = 未正常收尾
+                        //（实测历史会话大量如此：跑完最后一批工具后进程结束，没有收尾文本）
+                        return "incomplete";
+                    }
+                } catch (Exception ignore) {
+                    // 末行可能被截断（不是完整 JSON）→ 继续往上找
+                }
+            }
+            return "unknown";
+        } catch (Exception e) {
+            log.debug("推断子代理状态失败 agentId={}: {}", agentId, e.getMessage());
+            return "unknown";
+        }
     }
 
     /**
@@ -467,8 +614,10 @@ public class AgentTranscript {
                         ? tc.path("arguments").asText() : null));
             }
         }
+        String reasoning = node.has("reasoning") && !node.get("reasoning").isNull()
+            ? node.path("reasoning").asText(null) : null;
         return new AgentMessage(role, content, isApiError, agentId, isSidechain,
-            uuid, parentUuid, toolCalls, toolCallId, timestamp);
+            uuid, parentUuid, toolCalls, toolCallId, timestamp, reasoning);
     }
 
     /**

@@ -1793,51 +1793,89 @@ public class McpServerService {
         return prefix + "-" + UUID.randomUUID().toString().substring(0, 8);
     }
 
-    private static String serializeArgs(List<String> args) {
+    /**
+     * 序列化 args（DB 列存 JSON 数组）。
+     *
+     * <p>⚠️ 历史缺陷（2026-10-21 修）：旧实现手写 JSON 转义（{@code \ → \\}），而
+     * {@code deserializeArgs} **只剥引号不反转义** ⇒ 任何含反斜杠的参数（Windows 路径、
+     * 命名管道 {@code \\.\pipe\...}）读回后全部变成双反斜杠，子进程收到的路径/管道名是错的。
+     * 典型症状：MCP server 添加成功、test 通过，但真正启动后连不上（Open Design 案例）。
+     * 现改为 Jackson 真序列化，读侧同样真解析 —— 旧库存量数据随之自愈（见 deserializeArgs）。
+     */
+    static String serializeArgs(List<String> args) {
         if (args == null || args.isEmpty()) return null;
-        StringBuilder sb = new StringBuilder("[");
-        boolean first = true;
-        for (String a : args) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(a == null ? "" : a.replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-            first = false;
+        try {
+            return JSON.writeValueAsString(args);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("序列化 MCP args 失败", e);
         }
-        return sb.append("]").toString();
     }
 
-    private static List<String> deserializeArgs(String json) {
+    static List<String> deserializeArgs(String json) {
         if (json == null || json.isBlank()) return null;
         String s = json.trim();
-        if (s.startsWith("[") && s.endsWith("]")) s = s.substring(1, s.length() - 1);
-        if (s.isBlank()) return List.of();
+        if (!s.startsWith("[")) {
+            return List.of();
+        }
+        try {
+            List<String> parsed = JSON.readValue(s, new TypeReference<List<String>>() { });
+            return parsed == null ? List.of() : parsed;
+        } catch (Exception e) {
+            // 历史脏数据（旧手写转义可能产生非法 JSON）：退旧规则解析，至少不丢参数
+            log.warn("[McpServerService] args 不是合法 JSON，按旧规则解析（历史数据）: {}", e.getMessage());
+            return legacySplitArgs(s);
+        }
+    }
+
+    /** 旧版 args 解析（仅作历史脏数据兜底 · 不反转义，与旧行为逐字一致）。 */
+    private static List<String> legacySplitArgs(String s) {
+        String body = s.startsWith("[") && s.endsWith("]") ? s.substring(1, s.length() - 1) : s;
+        if (body.isBlank()) return List.of();
         List<String> result = new ArrayList<>();
-        for (String part : s.split(",")) {
+        for (String part : body.split(",")) {
             String t = part.trim().replaceAll("^\"|\"$", "");
             if (!t.isEmpty()) result.add(t);
         }
         return result;
     }
 
-    private static String serializeEnv(Map<String, String> env) {
+    /**
+     * 序列化 env（DB 列存 JSON 对象）。
+     *
+     * <p>⚠️ 与 {@link #serializeArgs} 同一个历史缺陷：旧实现手写转义 + 旧解析不反转义 ⇒
+     * env 值里的反斜杠（Windows 路径、{@code \\.\pipe\...}）与转义引号（{@code [\"--headless\"]}）
+     * 读回后全部走样 —— 子进程拿到的环境变量是错的。现改为 Jackson 真序列化。
+     */
+    static String serializeEnv(Map<String, String> env) {
         if (env == null || env.isEmpty()) return null;
-        StringBuilder sb = new StringBuilder("{");
-        boolean first = true;
-        for (Map.Entry<String, String> e : env.entrySet()) {
-            if (!first) sb.append(",");
-            sb.append("\"").append(e.getKey().replace("\\", "\\\\").replace("\"", "\\\"")).append("\":\"")
-              .append(e.getValue() == null ? "" : e.getValue().replace("\\", "\\\\").replace("\"", "\\\"")).append("\"");
-            first = false;
+        try {
+            return JSON.writeValueAsString(env);
+        } catch (JsonProcessingException e) {
+            throw new IllegalStateException("序列化 MCP env 失败", e);
         }
-        return sb.append("}").toString();
     }
 
-    private static Map<String, String> deserializeEnv(String json) {
+    static Map<String, String> deserializeEnv(String json) {
         if (json == null || json.isBlank()) return null;
         String s = json.trim();
-        if (s.startsWith("{") && s.endsWith("}")) s = s.substring(1, s.length() - 1);
-        if (s.isBlank()) return new HashMap<>();
+        if (!s.startsWith("{")) {
+            return new HashMap<>();
+        }
+        try {
+            Map<String, String> parsed = JSON.readValue(s, new TypeReference<Map<String, String>>() { });
+            return parsed == null ? new HashMap<>() : parsed;
+        } catch (Exception e) {
+            log.warn("[McpServerService] env 不是合法 JSON，按旧规则解析（历史数据）: {}", e.getMessage());
+            return legacySplitEnv(s);
+        }
+    }
+
+    /** 旧版 env 解析（仅作历史脏数据兜底 · 不反转义，与旧行为逐字一致）。 */
+    private static Map<String, String> legacySplitEnv(String s) {
+        String body = s.startsWith("{") && s.endsWith("}") ? s.substring(1, s.length() - 1) : s;
+        if (body.isBlank()) return new HashMap<>();
         Map<String, String> result = new HashMap<>();
-        for (String pair : s.split(",")) {
+        for (String pair : body.split(",")) {
             int idx = pair.indexOf(':');
             if (idx < 0) continue;
             String key = pair.substring(0, idx).trim().replaceAll("^\"|\"$", "");

@@ -228,7 +228,7 @@ interface MessageListProps {
 }
 
 /** 工具调用卡片 · FNT-TC-01：消息级 matchedRule（后端 ChatMessageDto 顶层出站）→ 显示「已自动批准（规则X）」徽标；无数据静默 */
-function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string }) {
+export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string }) {
   // 工具卡片默认折叠（用户手动点击展开 IN/OUT）· 对齐 Harness ToolRow；组件本地展开态
   const [expanded, setExpanded] = useState(false)
   const rule = matchedRule
@@ -520,7 +520,7 @@ function ContentGuard({ text, className, onRunHtml }: { text: string; className:
   )
 }
 
-function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessageDto; onDelete: (id: string) => void; onRunHtml?: (code: string) => void; onOpenRefFile?: (path: string) => void }) {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: ChatMessageDto; onDelete: (id: string) => void; onRunHtml?: (code: string) => void; onOpenRefFile?: (path: string) => void }) {
   const isUser = msg.role === 'user'
   // F25 · model_fallback_warning：role=system + subtype='informational' 的消息按「模型降级」提示渲染
   const isFallback = msg.role === 'system' && msg.subtype === 'informational'

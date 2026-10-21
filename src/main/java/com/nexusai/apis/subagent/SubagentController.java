@@ -16,6 +16,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
 
@@ -48,6 +49,53 @@ public class SubagentController {
      */
     @Autowired(required = false)
     private BackgroundTaskRunner backgroundTaskRunner;
+
+    /**
+     * 会话的子代理摘要列表 · {@code GET /api/v1/sessions/{sessionId}/subagents?limit=50}
+     *
+     * <p>历史会话的 transcript 只活在磁盘 `subagents/agent-*.jsonl`（CC 同构），
+     * 而 `/tasks` 只有进程内的后台任务（重启即丢）—— 这个端点补上「看得见历史子代理」。
+     * 按文件 mtime 倒序，默认 50 条（实测单会话可达 5513 个，不能全量）。
+     *
+     * @param sessionId 会话 ID
+     * @param limit     最多返回条数（默认 50，<=0 表示不限制）
+     */
+    @GetMapping
+    public List<SubagentSummary> listSubagents(
+            @PathVariable String sessionId,
+            @RequestParam(name = "limit", defaultValue = "50") int limit) {
+        Path sessionDir = ResumeService.resolveSessionDir(sessionId);
+        List<String> ids = AgentTranscript.listAgentIds(sessionDir, sessionId, limit);
+        List<SubagentSummary> out = new java.util.ArrayList<>(ids.size());
+        for (String agentId : ids) {
+            String agentType = null;
+            String description = null;
+            try {
+                java.util.Optional<AgentTranscript.AgentMetadata> meta =
+                    AgentTranscript.readMetadata(sessionDir, sessionId, agentId);
+                if (meta.isPresent()) {
+                    agentType = meta.get().agentType();
+                    description = meta.get().description();
+                }
+            } catch (Exception e) {
+                log.debug("读子代理 meta 失败 agentId={}: {}", agentId, e.getMessage());
+            }
+            String status = AgentTranscript.inferStatus(sessionDir, sessionId, agentId);
+            out.add(new SubagentSummary(agentId, agentType, description, status));
+        }
+        log.info("[SubagentController] 列出会话子代理 sessionId={} limit={} → {} 条", sessionId, limit, out.size());
+        return out;
+    }
+
+    /**
+     * 子代理摘要（右栏历史列表用）。
+     *
+     * @param agentId     transcript 文件名里的 id（a+16hex）
+     * @param agentType   agent 类型（meta.json，可能为空）
+     * @param description 任务描述（meta.json，可能为空）
+     * @param status      结局推断（completed/failed/unknown · 读 transcript 末行，meta 里没有此字段）
+     */
+    public record SubagentSummary(String agentId, String agentType, String description, String status) {}
 
     /** GET /api/v1/sessions/{sessionId}/subagents/{agentId}/transcript · 子代理完整执行记录（消息链）。 */
     @GetMapping("/{agentId}/transcript")

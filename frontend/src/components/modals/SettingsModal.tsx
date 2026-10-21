@@ -14,6 +14,7 @@ import { BusinessPanel } from './BusinessPanel'
 import { EnvConfigPanel } from '../settings/EnvConfigPanel'
 import { PluginPanel } from '../settings/PluginPanel'
 import { ModelSettingsPanel } from '../settings/ModelSettingsPanel'
+import { MarketManagePanel } from '../settings/MarketManagePanel'
 import type { Provider, AppSettings } from '@/api/types'
 import type { UseProviders } from '@/hooks/useProviders'
 import type { UseSkills } from '@/hooks/useSkills'
@@ -77,8 +78,14 @@ const NAV_ITEMS: { id: SettingsTab; label: string; section: 'core' | 'tools' | '
   { id: 'schedules',  label: '定时任务', section: 'tools' },
   { id: 'hooks',      label: 'Hooks',   section: 'tools' },
   { id: 'business',   label: '业务',   section: 'tools' },
+  { id: 'market',     label: '市场管理', section: 'tools' },
   { id: 'advanced',   label: '高级',   section: 'misc' },
 ]
+
+/** 「市场管理」只给管理员看：普通用户能上架（市场弹窗），但看不到版本/回滚面板。 */
+function visibleNavItems(marketAdminEnabled?: boolean | null) {
+  return NAV_ITEMS.filter((n) => n.id !== 'market' || !!marketAdminEnabled)
+}
 
 export function SettingsModal({
   settingsTab,
@@ -106,6 +113,9 @@ export function SettingsModal({
   onOpenMemoryEditor,
   sessionId,
 }: SettingsModalProps) {
+  // 导航项按「市场管理员模式」过滤：关 → 不显示「市场管理」（普通用户只上架、不管理）
+  const navItems = visibleNavItems(appSettings?.marketAdminEnabled)
+
   // 挂载时从后端读全局设置并初始化（仅当后端有值时覆盖本地默认；读取失败 toast 提示）
   useEffect(() => {
     let cancelled = false
@@ -179,15 +189,15 @@ export function SettingsModal({
         <div className="settings-body">
           <div className="settings-tabs">
             <div className="settings-nav-section">基础</div>
-            {NAV_ITEMS.filter((n) => n.section === 'core').map((n) => (
+            {navItems.filter((n) => n.section === 'core').map((n) => (
               <NavItem key={n.id} n={n} current={settingsTab} setSettingsTab={setSettingsTab} />
             ))}
             <div className="settings-nav-section">工具</div>
-            {NAV_ITEMS.filter((n) => n.section === 'tools').map((n) => (
+            {navItems.filter((n) => n.section === 'tools').map((n) => (
               <NavItem key={n.id} n={n} current={settingsTab} setSettingsTab={setSettingsTab} />
             ))}
             <div className="settings-nav-section">其他</div>
-            {NAV_ITEMS.filter((n) => n.section === 'misc').map((n) => (
+            {navItems.filter((n) => n.section === 'misc').map((n) => (
               <NavItem key={n.id} n={n} current={settingsTab} setSettingsTab={setSettingsTab} />
             ))}
           </div>
@@ -325,6 +335,8 @@ export function SettingsModal({
               </>
             )}
             {settingsTab === 'business' && <BusinessPanel showToast={showToast} />}
+            {/* 市场管理：上架本地技能 / 查看版本历史 / 回滚（用户裁定 2026-10-21） */}
+            {settingsTab === 'market' && <MarketManagePanel showToast={showToast} />}
             {settingsTab === 'advanced' && (
               <>
                 <div className="settings-row">
@@ -346,6 +358,27 @@ export function SettingsModal({
                         // appSettings 会保持陈旧 —— 而本弹窗「关闭即卸载」（App.tsx 的 {showSettings && …}），
                         // 重开时以陈旧值为初值 → 开关显示与后端相反。失败提示由 App 的 onSaveSettings 兜住。
                         void onSaveSettings({ allowDynamicHeaderValues: e.target.checked })
+                      }}
+                    />
+                    <span></span>
+                  </label>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">市场管理员模式</div>
+                    <div className="settings-row-desc">
+                      显示「市场管理」（全部插件 / 版本历史 / 回滚）。关闭时只能上架，不能管理。
+                    </div>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      checked={!!appSettings?.marketAdminEnabled}
+                      onChange={(e) => {
+                        // 必须走 onSaveSettings（与上面「按会话展开请求头占位符」同理）：
+                        // appSettings 是唯一真源，直接调 settingsApi 会让开关状态与后端不同步
+                        void onSaveSettings({ marketAdminEnabled: e.target.checked })
+                        setSettingsTab(e.target.checked ? 'market' : 'advanced')
                       }}
                     />
                     <span></span>

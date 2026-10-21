@@ -85,7 +85,8 @@ export function useSchedules(activeSessionId?: string | null): UseSchedules {
     setLoading(true)
     setError(null)
     try {
-      const data = await scheduleApi.list()
+      // 按会话过滤（含全局 durable）· 用户 2026-10-21
+      const data = await scheduleApi.list(activeSessionId ?? undefined)
       // 内容守卫 + 按 id 去重：轮询数据未变则不 setList —— 新数组引用会触发 RightPanel 任务 tab
       // 整块重渲染（TeamPanel/AsyncTasks/Workflow 全部）→ 2s 刷新卡顿（对齐 AsyncTasksPanel:58 同款守卫）
       const deduped = data.filter((s, i, arr) => arr.findIndex((x) => x.id === s.id) === i)
@@ -97,7 +98,7 @@ export function useSchedules(activeSessionId?: string | null): UseSchedules {
     } finally {
       setLoading(false)
     }
-  }, [])
+  }, [activeSessionId])
 
   // 挂载时自动 fetch + 2s 轮询：定时任务可由 AI（CronCreateTool）在对话中创建/删除，前端仅挂载
   //   refresh 一次会一直空（联调实测 2026-08-27）→ 轮询对齐 AsyncTasksPanel，AI 变更 2s 内显示

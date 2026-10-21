@@ -11,7 +11,9 @@ import type {
 } from './types'
 
 export const scheduleApi = {
-  list: () => api<Schedule[]>('/schedules'),
+  /** 列表 · 传 sessionId 时按会话过滤（含全局 durable 任务） */
+  list: (sessionId?: string) =>
+    api<Schedule[]>(sessionId ? `/schedules?sessionId=${encodeURIComponent(sessionId)}` : '/schedules'),
   create: (req: CreateScheduleRequest) =>
     api<Schedule>('/schedules', { method: 'POST', body: req }),
   update: (id: string, req: UpdateScheduleRequest) =>

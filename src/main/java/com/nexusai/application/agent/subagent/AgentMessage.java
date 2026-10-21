@@ -39,7 +39,10 @@ public record AgentMessage(
     //   WHY 需要：compact_boundary 的 parentUuid=null（CC :1391-1407「truncates --continue chain
     //   at compact boundary」）⇒ 压缩后文件里存在**两条链头**，「取最新 leaf」只能靠时间戳判先后。
     //   null = 该条无时间信息（legacy 转录 / 非 chatMessageToMap 写入的消息）。
-    String timestamp
+    String timestamp,
+    // [2026-10-21] 思考内容 · CC original: msg.reasoning（子代理转录里的 thinking 文本）
+    //   原先解析时被丢弃 ⇒ 右栏对话视图看不到思考，而主对话能看到。
+    String reasoning
 ) {
     /** CC original: tool_use 块 id/name/input (messages.ts:2795 block.id / block.name). */
     public record ToolCallInfo(String id, String name, String arguments) {}
@@ -59,10 +62,18 @@ public record AgentMessage(
                         boolean isSidechain, String uuid, String parentUuid,
                         List<ToolCallInfo> toolCalls, String toolCallId) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, null);
+            toolCalls, toolCallId, null, null);
+    }
+
+    /** 兼容构造（含 timestamp，无 reasoning）· 既有测试/调用方沿用 10 参。 */
+    public AgentMessage(String role, String content, boolean isApiError, String agentId,
+                        boolean isSidechain, String uuid, String parentUuid,
+                        List<ToolCallInfo> toolCalls, String toolCallId, String timestamp) {
+        this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
+            toolCalls, toolCallId, timestamp, null);
     }
 
     public static AgentMessage of(String role, String content) {
-        return new AgentMessage(role, content, false, null, false, null, null, List.of(), null);
+        return new AgentMessage(role, content, false, null, false, null, null, List.<ToolCallInfo>of(), null, null, null);
     }
 }

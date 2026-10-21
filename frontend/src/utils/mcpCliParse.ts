@@ -141,11 +141,97 @@ function addHeader(headers: Record<string, string>, raw: string): void {
  * 形态 A（claude mcp add ...）：解析 name + flags（--transport/--scope/-s/--env/--header/--）+ command|url。
  * 形态 B（纯命令）：command=首 token，argsStr=其余，type=stdio、scope=project，name=deriveMcpName。
  */
+/**
+ * 解析 `claude mcp add-json [--scope user] <name> '<json>'`（用户 2026-10-21 实测缺失）。
+ *
+ * <p>这是 CC 的另一种添加形态：直接把整段 server 配置（command/args/env 或 url/headers）
+ * 作为 JSON 字符串传入。若不单独识别，`add-json` 会被当成服务器名、`claude` 被当成 command
+ * （截图里的错误形态）。
+ *
+ * @param rest `add-json` 之后的 token
+ */
+function parseAddJson(rest: string[]): ParseResult {
+  let scope: Scope = 'project'
+  const positionals: string[] = []
+  for (let k = 0; k < rest.length; k++) {
+    const t = rest[k]
+    if (t === '--scope') {
+      const v = rest[k + 1]
+      if (isScope(v)) { scope = v; k++ }
+      continue
+    }
+    const mScope = /^--scope=(.+)$/.exec(t)
+    if (mScope) {
+      if (isScope(mScope[1])) scope = mScope[1]
+      continue
+    }
+    positionals.push(t)
+  }
+  const [name, jsonText] = positionals
+  if (!name) return { ok: false, error: 'add-json 缺少服务器名称' }
+  if (!jsonText) return { ok: false, error: 'add-json 缺少 JSON 配置（需用引号包住整段 JSON）' }
+
+  let cfg: Record<string, unknown>
+  try {
+    const parsed = JSON.parse(jsonText)
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
+      return { ok: false, error: 'add-json 的 JSON 必须是对象' }
+    }
+    cfg = parsed as Record<string, unknown>
+  } catch (e) {
+    return { ok: false, error: `add-json 的 JSON 解析失败：${e instanceof Error ? e.message : String(e)}` }
+  }
+
+  const url = typeof cfg.url === 'string' ? cfg.url : ''
+  const typeRaw = typeof cfg.type === 'string' ? cfg.type : ''
+  const type: Transport = isTransport(typeRaw) ? typeRaw : (url ? 'http' : 'stdio')
+
+  if (type === 'stdio') {
+    const command = typeof cfg.command === 'string' ? cfg.command : ''
+    if (!command) return { ok: false, error: 'add-json 缺少 command（stdio 服务器必需）' }
+    const args = Array.isArray(cfg.args) ? cfg.args.map((x) => String(x)) : []
+    const env = (cfg.env && typeof cfg.env === 'object' && !Array.isArray(cfg.env))
+      ? Object.entries(cfg.env as Record<string, unknown>).map(([k, v]) => `${k}=${v == null ? '' : String(v)}`)
+      : []
+    return {
+      ok: true,
+      form: {
+        name, type, scope, command,
+        argsStr: args.join(' '),
+        envStr: env.join('\n'),
+        url: '', headersJson: '',
+      },
+    }
+  }
+
+  if (!url) return { ok: false, error: `${type} 服务器必须提供 url` }
+  const headers = (cfg.headers && typeof cfg.headers === 'object' && !Array.isArray(cfg.headers))
+    ? cfg.headers
+    : {}
+  return {
+    ok: true,
+    form: {
+      name, type, scope, command: '', argsStr: '', envStr: '',
+      url,
+      headersJson: Object.keys(headers as Record<string, unknown>).length
+        ? JSON.stringify(headers, null, 2) : '',
+    },
+  }
+}
+
 export function parseMcpCommandLine(line: string): ParseResult {
   const trimmed = line.trim()
   if (!trimmed) return { ok: false, error: '请先粘贴一行命令' }
   const tokens = tokenizeShell(trimmed)
   if (tokens.length === 0) return { ok: false, error: '请先粘贴一行命令' }
+
+  // 形态 C：`claude mcp add-json [--scope user] <name> '<json>'`（整段 JSON 形态）
+  if (tokens[0] === 'claude' && tokens[1] === 'mcp' && tokens[2] === 'add-json') {
+    return parseAddJson(tokens.slice(3))
+  }
+  if (tokens[0] === 'add-json') {
+    return parseAddJson(tokens.slice(1))
+  }
 
   // 形态 A 前缀消费：`claude mcp add` 完整前缀，或省略后的 `add <name> ...`
   let isFormA = false

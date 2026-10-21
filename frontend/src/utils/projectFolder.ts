@@ -9,11 +9,11 @@ import { open } from '@tauri-apps/plugin-dialog'
  *
  * @returns 选中文件夹的绝对路径；取消/失败返回 null
  */
-export async function selectProjectFolder(): Promise<{ path: string; isTauri: boolean } | null> {
+export async function selectProjectFolder(title = '选择项目文件夹'): Promise<{ path: string; isTauri: boolean } | null> {
   // Tauri 环境（__TAURI_INTERNALS__ 存在）
   if (typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window) {
     try {
-      const selected = await open({ directory: true, multiple: false, title: '选择项目文件夹' })
+      const selected = await open({ directory: true, multiple: false, title })
       if (typeof selected === 'string' && selected) {
         return { path: selected, isTauri: true }
       }

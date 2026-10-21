@@ -214,7 +214,7 @@ const SLASH_PREFIX_RE = /^\/([A-Za-z0-9_:.-]+)(\s+)/
  * 召唤写入的尾随空格（5 个 = 20px）：pill 的左右内边距（10px + 10px）恰好落在这段空格里，
  * 右缘既不压后续首字、也不留多余空隙。⛔ 与 globals.css `.input-slash-chip-visual--alias` 成对修改。
  */
-export const SUMMON_TRAILING_SPACES = '     '
+export const SUMMON_TRAILING_SPACES = '      '
 
 function renderHighlighted(
   text: string,

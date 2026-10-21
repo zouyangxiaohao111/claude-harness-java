@@ -3,10 +3,13 @@ import type { SettingsTab, Project, SessionFile } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
 import { tasksApi } from '@/api/tasks'
-import { subagentApi } from '@/api/subagents'
+import { subagentApi, type SubagentSummary } from '@/api/subagents'
 import { ApiError } from '@/api/rest'
+import { subagentColor } from '@/api/types'
 import type { AgentTranscriptMessage, Schedule, ScheduleKind, WorkflowRunDto } from '@/api/types'
 import { useSchedules } from '@/hooks/useSchedules'
+import { CollapsibleGroup } from './CollapsibleGroup'
+import { AgentTranscriptView } from './AgentTranscriptView'
 import { cronToHuman } from '@/components/modals/SchedulesPanel'
 import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
 import { formatDurationMs, formatSubagentStat } from '@/utils/subagentStats'
@@ -29,10 +32,12 @@ function formatActTime(ts: number): string {
 }
 
 /** 子代理卡片（现代规范 · 头像色块 + 状态标签 + 点击展开活动时间线 + 「详细」看完整执行记录） */
-function SubagentCard({ id, onKill, sessionId }: {
+function SubagentCard({ id, onKill, sessionId, onView }: {
   id: SubagentIdentity
   onKill?: (id: SubagentIdentity) => void
   sessionId: string | null
+  /** 在**右栏**打开该 agent 的对话（F2 · 不是弹窗） */
+  onView?: (id: SubagentIdentity) => void
 }) {
   const [open, setOpen] = useState(false)
   const [detailOpen, setDetailOpen] = useState(false)
@@ -77,7 +82,16 @@ function SubagentCard({ id, onKill, sessionId }: {
         </svg>
       </div>
       {/* [D3] 统计行（新增）：33.6k tokens · 5 次调用 · 39.5s */}
-      <div className="sc-stats">{statsText ?? '统计不可用'}</div>
+      <div className="sc-stats">
+        {statsText ?? '统计不可用'}
+        {onView && id.taskId && (
+          <button
+            className="sc-view"
+            onClick={(e) => { e.stopPropagation(); onView(id) }}
+            title="在右栏查看对话"
+          >对话 ›</button>
+        )}
+      </div>
       {open && (
         <div className="sc-timeline">
           {id.activities.map((a, i) => (
@@ -97,12 +111,13 @@ function SubagentCard({ id, onKill, sessionId }: {
 }
 
 /** 子代理分组弹窗（三态模块点开 · 现代化：遮罩 + 居中卡片 + 清单滚动） */
-function SubagentModal({ filter, subs, onClose, onKill, sessionId }: {
+function SubagentModal({ filter, subs, onClose, onKill, sessionId, onView }: {
   filter: 'running' | 'done' | 'stopped'
   subs: SubagentIdentity[]
   onClose: () => void
   onKill?: (id: SubagentIdentity) => void
   sessionId: string | null
+  onView?: (id: SubagentIdentity) => void
 }) {
   const title = filter === 'running' ? '进行中的子代理' : filter === 'done' ? '已完成的子代理' : '已停止的子代理'
   return (
@@ -118,7 +133,7 @@ function SubagentModal({ filter, subs, onClose, onKill, sessionId }: {
           {subs.length === 0 ? (
             <div className="sam-empty">暂无</div>
           ) : (
-            subs.map((id) => <SubagentCard key={id.taskId ?? id.name} id={id} onKill={onKill} sessionId={sessionId} />)
+            subs.map((id) => <SubagentCard key={id.taskId ?? id.name} id={id} onKill={onKill} sessionId={sessionId} onView={onView} />)
           )}
         </div>
       </div>
@@ -126,50 +141,6 @@ function SubagentModal({ filter, subs, onClose, onKill, sessionId }: {
   )
 }
 
-/** 定时任务三态弹窗（对齐子代理弹窗样式 · subagent-modal） */
-function ScheduleModal({ filter, schedules, onClose }: {
-  filter: 'ok' | 'error' | 'none'
-  schedules: Schedule[]
-  onClose: () => void
-}) {
-  const shown = filter === 'ok'
-    ? schedules.filter((s) => s.lastRunStatus === 'ok')
-    : filter === 'error'
-      ? schedules.filter((s) => s.lastRunStatus === 'error')
-      : schedules.filter((s) => !s.lastRunStatus || s.lastRunStatus === 'none')
-  const titleLabel = filter === 'ok' ? '正常' : filter === 'error' ? '异常' : '未运行'
-  const [selected, setSelected] = useState<Schedule | null>(null)
-  return (
-    <div className="overlay-backdrop" onClick={onClose}>
-      <div className="subagent-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="sam-head">
-          <span className="sam-title">定时任务 · {titleLabel}<span className="sam-count">{shown.length}</span></span>
-          <button type="button" className="sam-close" onClick={onClose} aria-label="关闭">
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 3L9 9M9 3L3 9" /></svg>
-          </button>
-        </div>
-        <div className="sam-list">
-          {shown.length === 0 ? (
-            <div className="sam-empty">暂无</div>
-          ) : shown.map((s) => (
-            <div key={s.id} className="schedule-item" title="查看详情" onClick={() => setSelected(s)}>
-              <div className="head">
-                <span className={`status ${s.lastRunStatus === 'ok' ? 'ok' : s.lastRunStatus === 'error' ? 'error' : 'none'}`}></span>
-                <span className="name">{s.name}</span>
-                <span className="kind">{s.kind}</span>
-              </div>
-              <div className="detail">
-                <span className={`last-status${s.lastRunStatus === 'error' ? ' err' : ''}`}>{s.lastRunStatus ?? '—'}</span>
-                {s.cron ? ` · ${s.cron}` : s.runAt ? ` · ${s.runAt}` : s.intervalSeconds ? ` · 每 ${s.intervalSeconds}s` : ''}
-              </div>
-            </div>
-          ))}
-        </div>
-      </div>
-      {selected && <ScheduleDetailModal schedule={selected} onClose={() => setSelected(null)} />}
-    </div>
-  )
-}
 
 /** 定时任务详情弹窗（点开列表项 → 完整配置/上次运行 · 复用 subagent-modal 弹窗样式） */
 function ScheduleDetailModal({ schedule, onClose }: {
@@ -304,6 +275,10 @@ interface RightPanelProps {
   flashingProject: string | null
   /** 回滚本会话改动（App 二次确认 + 调 revert REST + 刷新列表） */
   onRollbackFile: (path: string) => void
+  /** 收起右栏：图标轨最顶部（文件上方）的面板按钮 */
+  onToggleCollapse?: () => void
+  /** 折叠态（与左栏同一套做法：不卸载组件，只渲染窄条 + 展开按钮） */
+  collapsed?: boolean
 }
 
 const PlusIcon = ({ size = 12 }: { size?: number }) => (
@@ -457,14 +432,82 @@ export function RightPanel({
   openSettingsAt,
   flashingProject,
   onRollbackFile,
+  onToggleCollapse,
+  collapsed = false,
 }: RightPanelProps) {
+  // [2026-10-21] 折叠态：参照左栏（SessionList 的 collapsed 分支）——只渲染窄条 + 展开按钮
+  if (collapsed) {
+    return (
+      <div
+        className="right right-rail-collapsed"
+        /* 内联兜底：折叠窄条的宽度/方向/背景不依赖样式表（历史上 `.right` 被改成 row-reverse、
+           且 `.app.right-collapsed .right` 有 display:none / flex 两条互相覆盖的规则） */
+        /* 用户裁定：折叠后**不展示右侧面板**，只在原位置留一个裸按钮（无背景条、无边框） */
+        style={{
+          display: 'flex',
+          flexDirection: 'column',
+          alignItems: 'center',
+          justifyContent: 'flex-start',
+          paddingTop: 12,
+          background: 'transparent',
+          border: 'none',
+          boxShadow: 'none',
+          overflow: 'visible',
+        }}
+      >
+        <button
+          className="rail-collapse-btn"
+          onClick={onToggleCollapse}
+          title="展开上下文面板"
+          aria-label="展开上下文面板"
+        >
+          <svg viewBox="0 0 16 14" fill="none" width="15" height="14">
+            <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
+            <line x1="10" y1="1.4" x2="10" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+          </svg>
+        </button>
+      </div>
+    )
+  }
+
   // 「文件」tab 数据 = 本会话 agent 改动文件（chatStore.changedFiles · files.changed 事件/GET /files 写入 · 无=[]零态）
   const files = useChatStore((s) => s.changedFiles[activeSessionId ?? ''] ?? EMPTY_FILES)
   // 任务 tab 数据：定时任务（真实后端）+ 子代理身份（/topic/tasks 事件登记）
   // [cwd3] 传本面板的 activeSessionId：定时任务创建必须带会话锚（见 useSchedules javadoc）。
   const schedules = useSchedules(activeSessionId)
+  /** 右栏对话视图（F2）：点子代理/成员 → 内容区切换成该 agent 的执行记录 */
+  const [viewing, setViewing] = useState<{ agentId: string; name: string; subtitle?: string; active: boolean } | null>(null)
+  /** 历史子代理（磁盘 transcript 目录 · 切会话重拉）：补上「重启后 /tasks 里没有」的那部分 */
+  const [historySubs, setHistorySubs] = useState<SubagentSummary[]>([])
+  /** 历史子代理分页（默认 5 条 · 用户 2026-10-21：默认 5 条可翻页） */
+  const [historyLimit, setHistoryLimit] = useState(5)
+  /** ⤢ 扩大：右栏向左覆盖中间对话区（用户 2026-10-21：不要弹窗） */
+  const [expandedView, setExpandedView] = useState(false)
   const subagentIdentities = useSubagentStore((s) => s.bySession[activeSessionId ?? ''] ?? EMPTY_IDENTITY_MAP)
   const tasksCount = schedules.list.length + Object.keys(subagentIdentities).length
+  // [F2] 进入 agent 对话视图 → 右栏临时加宽到 420（退出恢复用户原宽度）
+  useEffect(() => {
+    if (!viewing) return
+    const root = document.documentElement
+    const prev = root.style.getPropertyValue('--right-w')
+    // 进入对话视图 420；用户仍可用 resizer 拖拽（resizer 改的就是这个变量）。
+    // ⤢ 全屏走 CSS fixed 覆盖，不再动 grid。
+    if (!expandedView) root.style.setProperty('--right-w', '420px')
+    return () => {
+      if (prev) root.style.setProperty('--right-w', prev)
+      else root.style.removeProperty('--right-w')
+    }
+  }, [viewing, expandedView])
+
+  // 切会话 → 拉该会话的历史子代理（磁盘真源）；失败静默（不影响实时数据）
+  useEffect(() => {
+    if (!activeSessionId) { setHistorySubs([]); return }
+    let cancelled = false
+    subagentApi.list(activeSessionId, historyLimit)
+      .then((list) => { if (!cancelled) setHistorySubs(list ?? []) })
+      .catch(() => { if (!cancelled) setHistorySubs([]) })
+    return () => { cancelled = true }
+  }, [activeSessionId, historyLimit])
 
   // Workflow 运行：任务 tab 激活时拉一次 + 4s 轮询（后端 WorkflowController）
   const [workflowRuns, setWorkflowRuns] = useState<WorkflowRunDto[]>([])
@@ -473,8 +516,13 @@ export function RightPanel({
   const [runDetail, setRunDetail] = useState<WorkflowRunDto | null>(null)
   // 子代理三态模块弹窗过滤（进行中/已完成/已停止 · null=关闭）
   const [saFilter, setSaFilter] = useState<'running' | 'done' | 'stopped' | null>(null)
+  // [D2] 折叠分组计数（子组件上报）：为 0 只占一行，有数据自动展开
+  const [teamCount, setTeamCount] = useState<number>(0)
+  const [todoCount, setTodoCount] = useState<number>(0)
+  const [asyncCount, setAsyncCount] = useState<number>(0)
   /** 定时任务三态弹窗过滤（正常/异常/未运行 · null=关闭） */
-  const [scheduleFilter, setScheduleFilter] = useState<'ok' | 'error' | 'none' | null>(null)
+  /** 定时任务详情（点行打开 · 复用已有 ScheduleDetailModal） */
+  const [detailSchedule, setDetailSchedule] = useState<Schedule | null>(null)
   /** 停止子代理任务（卡片 ⏹ · /tasks/{id}/kill） */
   const handleKillSubagent = async (id: SubagentIdentity) => {
     if (!id.taskId) return
@@ -584,20 +632,82 @@ export function RightPanel({
     })
   }
 
+  // 当前 tab 的面板标题与计数（图标轨只有图标，标题放内容区顶部）
+  const tabTitle = rightTab === 'files' ? '文件' : rightTab === 'tasks' ? '任务' : '项目'
+  const tabCount = rightTab === 'files' ? files.length : rightTab === 'tasks' ? tasksCount : (mainProject.name ? 1 : 0)
+
   return (
-    <div className="right">
-      <div className="right-tabs">
-        <div className={`right-tab ${rightTab === 'files' ? 'active' : ''}`} onClick={() => setRightTab('files')}>
-          文件 <span className="count">{files.length}</span>
-        </div>
-        <div className={`right-tab ${rightTab === 'tasks' ? 'active' : ''}`} onClick={() => setRightTab('tasks')}>
-          任务 <span className="count">{tasksCount}</span>
-        </div>
-        <div className={`right-tab ${rightTab === 'projects' ? 'active' : ''}`} onClick={() => setRightTab('projects')}>
-          项目 <span className="count">{mainProject.name ? 1 : 0}</span>
-        </div>
+    <div className={`right${expandedView ? ' right-fullscreen' : ''}`}>
+      {/* [2026-10-21] 图标轨贴**右边缘**（用户裁定）：导航在右、内容在左，VS Code 活动栏语义 */}
+      <div className="right-rail">
+        {/* 收起按钮放在**文件上方**（与其它图标同一列、同一个 rail 容器）；无边框无阴影 */}
+        {onToggleCollapse && (
+          <button
+            className="right-rail-btn right-rail-collapse"
+            onClick={onToggleCollapse}
+            title="收起上下文面板"
+            aria-label="收起上下文面板"
+          >
+            <svg viewBox="0 0 16 14" fill="none" width="15" height="14">
+              <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
+              <line x1="10" y1="1.4" x2="10" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
+        <button
+          className={`right-rail-btn${rightTab === 'files' ? ' on' : ''}`}
+          onClick={() => setRightTab('files')}
+          title="文件"
+          aria-label="文件"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <path d="M3 2.6h6.2L13 6.4V13a.8.8 0 0 1-.8.8H3.8a.8.8 0 0 1-.8-.8V3.4A.8.8 0 0 1 3.8 2.6Z" strokeLinejoin="round" />
+            <path d="M9 2.8v3.8h3.8" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <button
+          className={`right-rail-btn${rightTab === 'tasks' ? ' on' : ''}`}
+          onClick={() => setRightTab('tasks')}
+          title="任务"
+          aria-label="任务"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <rect x="2.6" y="2.6" width="10.8" height="10.8" rx="2.2" />
+            <path d="M5.4 8.2l1.7 1.7 3.5-3.6" strokeLinecap="round" strokeLinejoin="round" />
+          </svg>
+        </button>
+        <button
+          className={`right-rail-btn${rightTab === 'projects' ? ' on' : ''}`}
+          onClick={() => setRightTab('projects')}
+          title="项目"
+          aria-label="项目"
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+            <rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.8" />
+            <path d="M2.4 6.2h11.2" strokeLinecap="round" />
+          </svg>
+        </button>
       </div>
-      <div className="right-body">
+      <div className="right-main">
+        {viewing ? (
+          <AgentTranscriptView
+            sessionId={activeSessionId}
+            agentId={viewing.agentId}
+            name={viewing.name}
+            subtitle={viewing.subtitle}
+            active={viewing.active}
+            onBack={() => { setViewing(null); setExpandedView(false) }}
+            expanded={expandedView}
+            onExpand={() => setExpandedView((v) => !v)}
+            showToast={showToast}
+          />
+        ) : (
+        <>
+        <div className="right-title">
+          <span>{tabTitle}</span>
+          {tabCount > 0 && <span className="right-title-count">· {tabCount}</span>}
+        </div>
+        <div className="right-body">
         {rightTab === 'files' && (
           <>
             {files.length === 0 ? (
@@ -635,14 +745,22 @@ export function RightPanel({
         {rightTab === 'tasks' && (
           <>
             {/* 任务模块卡片（独立模块阴影展示 · 对齐输入框 .input-box） */}
-            <div className="task-module-card">
-              {activeSessionId && <TeamPanel sessionId={activeSessionId} showToast={showToast} />}
-            </div>
-            <div className="task-module-card">
-              {activeSessionId && <TodoPanel sessionId={activeSessionId} showToast={showToast} />}
-            </div>
-            <div className="task-module-card">
-            <div className="task-group-title">子代理运行状况</div>
+            {/* [2026-10-21 D2] 六个模块 → 折叠分组：为 0 的组只占一行，有数据自动展开 */}
+            <CollapsibleGroup title="TEAM 协作" count={teamCount}>
+              {activeSessionId && (
+                <TeamPanel
+                  sessionId={activeSessionId}
+                  showToast={showToast}
+                  hideHeader
+                  onCount={setTeamCount}
+                  onViewMember={(agentId, name, active) => setViewing({ agentId, name, subtitle: active ? '运行中' : '离线', active })}
+                />
+              )}
+            </CollapsibleGroup>
+            {/* keepMounted：切换会话要立刻重拉任务（折叠即卸载 ⇒ TodoPanel 不轮询 ⇒ 计数恒 0） */}
+            <CollapsibleGroup title="任务清单" count={todoCount} keepMounted>
+              {activeSessionId && <TodoPanel sessionId={activeSessionId} showToast={showToast} hideHeader onCount={setTodoCount} />}
+            </CollapsibleGroup>
             {(() => {
               // 子代理身份去重：同一 toolUseId/taskId 双键指向同一对象，按 taskId 去重
               //   （按 name 会误并同名成员——并行探索成员 description 相同 → 3 个只显 2 个）
@@ -658,19 +776,87 @@ export function RightPanel({
               const running = subs.filter((id) => id.status === 'running')
               const done = subs.filter((id) => id.status === 'done')
               const stopped = subs.filter((id) => id.status === 'failed' || id.status === 'stopped')
-              const renderStat = (label: string, list: SubagentIdentity[], filter: 'running' | 'done' | 'stopped') => (
-                <div className={`sa-stat ${filter}`} onClick={() => setSaFilter(filter)} title={`查看${label}（${list.length}）`}>
-                  <span className="sa-count">{list.length}</span>
-                  <span className="sa-label">{label}</span>
-                </div>
-              )
+              // [D2] 展开态 = 行式列表（用户 2026-10-21：按设计稿，不要三张 0 卡片）
+              // 历史项（磁盘 transcript）：实时里已有的按 taskId 去重（两者键不同源，能对上就排除）
+              const liveIds = new Set(subs.map((x) => x.taskId).filter(Boolean) as string[])
+              const hist = historySubs.filter((h) => !liveIds.has(h.agentId))
+              const totalCount = subs.length + hist.length
+              const statusLabel = (st: SubagentIdentity['status']) =>
+                st === 'running' ? '运行中' : st === 'done' ? '已完成' : st === 'failed' ? '失败' : '已停止'
               return (
-                <>
-                  <div className="subagent-stats">
-                    {renderStat('进行中', running, 'running')}
-                    {renderStat('已完成', done, 'done')}
-                    {renderStat('已停止', stopped, 'stopped')}
-                  </div>
+                <CollapsibleGroup title="子代理运行状况" count={totalCount}>
+                  {totalCount === 0 ? (
+                    <div className="todo-empty">暂无子代理</div>
+                  ) : (
+                    <div className="todo-rows">
+                      {subs.map((id) => (
+                        <div
+                          key={id.taskId ?? id.name}
+                          className={`todo-row ${id.status === 'running' ? 'in-progress' : ''}`}
+                          onClick={() => {
+                            if (!id.taskId) return
+                            setViewing({
+                              agentId: id.taskId,
+                              name: id.name,
+                              subtitle: statusLabel(id.status),
+                              active: id.status === 'running',
+                            })
+                          }}
+                          title="查看该子代理的对话"
+                        >
+                          <span className={`todo-row-dot ${id.status === 'running' ? 'in_progress' : id.status === 'done' ? 'completed' : 'pending'}`} />
+                          <span className="todo-row-main">
+                            <span className="todo-row-title">{id.name}</span>
+                            <span className="todo-row-sub">
+                              {statusLabel(id.status)}
+                              {id.currentTool ? ` · ${id.currentTool}` : ''}
+                              {id.taskType ? ` · ${id.taskType}` : ''}
+                            </span>
+                          </span>
+                          <span className="todo-row-arrow">›</span>
+                        </div>
+                      ))}
+                      {hist.map((h) => {
+                        const title = h.description || h.agentType || h.agentId
+                        return (
+                          <div
+                            key={`h-${h.agentId}`}
+                            className="todo-row sub-row"
+                            onClick={() => setViewing({
+                              agentId: h.agentId,
+                              name: h.agentType || '子代理',
+                              subtitle: '历史记录',
+                              active: false,
+                            })}
+                            title={title}
+                          >
+                            <span className="sub-avatar" style={{ background: subagentColor(title) }}>
+                              {(h.agentType || 'A').charAt(0).toUpperCase()}
+                            </span>
+                            <span className="todo-row-main">
+                              <span className="todo-row-title one-line">{title}</span>
+                              <span className="todo-row-sub">
+                                {h.agentType || 'agent'} · 历史记录
+                              </span>
+                            </span>
+                            <span className={`sub-status ${h.status || 'unknown'}`}>
+                              {h.status === 'completed' ? '已完成'
+                                : h.status === 'failed' ? '失败'
+                                : h.status === 'incomplete' ? '未收尾'
+                                : '未知'}
+                            </span>
+                            <span className="todo-row-arrow">›</span>
+                          </div>
+                        )
+                      })}
+                      {historySubs.length >= historyLimit && (
+                        <button
+                          className="sub-more"
+                          onClick={() => setHistoryLimit((n) => n + 20)}
+                        >查看更多</button>
+                      )}
+                    </div>
+                  )}
                   {saFilter && (
                     <SubagentModal
                       filter={saFilter}
@@ -678,59 +864,70 @@ export function RightPanel({
                       onClose={() => setSaFilter(null)}
                       onKill={handleKillSubagent}
                       sessionId={activeSessionId}
+                      onView={(id) => {
+                        if (!id.taskId) return
+                        setSaFilter(null)
+                        setViewing({
+                          agentId: id.taskId,
+                          name: id.name,
+                          subtitle: id.status === 'running' ? '运行中' : id.status === 'done' ? '已完成' : '已停止',
+                          active: id.status === 'running',
+                        })
+                      }}
                     />
                   )}
-                </>
+                </CollapsibleGroup>
               )
             })()}
-            </div>
 
-            <div className="task-module-card">
-              <AsyncTasksPanel activeSessionId={activeSessionId} showToast={showToast} />
-            </div>
+            {/* keepMounted：异步面板负责把 REST 里的 local_agent/teammate 补录进 subagentStore，
+                折叠即卸载会让「子代理运行状况」永远为空（2026-10-21 实测） */}
+            <CollapsibleGroup title="异步任务" count={asyncCount} keepMounted>
+              <AsyncTasksPanel activeSessionId={activeSessionId} showToast={showToast} hideHeader onCount={setAsyncCount} />
+            </CollapsibleGroup>
 
-            <div className="task-module-card">
-              <div className="task-group-title">
-                <span>定时任务</span>
+            <CollapsibleGroup
+              title="定时任务"
+              count={schedules.list.length}
+              action={(
                 <span className="add-schedule" title="添加定时任务" onClick={() => openSettingsAt('schedules')}>
                   <PlusIcon size={11} />
                 </span>
-              </div>
+              )}
+            >
               {schedules.loading ? (
-                <div className="right-empty">加载中…</div>
-              ) : (() => {
-                // 定时任务三态（对齐子代理运行状况）：正常=ok · 异常=error · 未运行=none/null
-                const ok = schedules.list.filter((s) => s.lastRunStatus === 'ok')
-                const err = schedules.list.filter((s) => s.lastRunStatus === 'error')
-                const none = schedules.list.filter((s) => !s.lastRunStatus || s.lastRunStatus === 'none')
-                const stat = (label: string, list: Schedule[], filter: 'ok' | 'error' | 'none') => (
-                  <div className={`sa-stat ${filter}`} onClick={() => setScheduleFilter(filter)} title={`查看${label}（${list.length}）`}>
-                    <span className="sa-count">{list.length}</span>
-                    <span className="sa-label">{label}</span>
-                  </div>
-                )
-                return (
-                  <>
-                    <div className="subagent-stats">
-                      {stat('正常', ok, 'ok')}
-                      {stat('异常', err, 'error')}
-                      {stat('未运行', none, 'none')}
-                    </div>
-                    {scheduleFilter && (
-                      <ScheduleModal filter={scheduleFilter} schedules={schedules.list} onClose={() => setScheduleFilter(null)} />
-                    )}
-                  </>
-                )
-              })()}
-            </div>
+                <div className="todo-empty">加载中…</div>
+              ) : schedules.list.length === 0 ? (
+                <div className="todo-empty">暂无定时任务</div>
+              ) : (
+                <div className="todo-rows">
+                  {schedules.list.map((sc) => {
+                    const status = sc.lastRunStatus === 'ok' ? '正常' : sc.lastRunStatus === 'error' ? '异常' : '未运行'
+                    const dot = sc.lastRunStatus === 'ok' ? 'completed' : sc.lastRunStatus === 'error' ? 'pending' : 'pending'
+                    return (
+                      <div key={sc.id} className="todo-row" onClick={() => setDetailSchedule(sc)} title="查看定时任务详情">
+                        <span className={`todo-row-dot ${dot}`} />
+                        <span className="todo-row-main">
+                          <span className="todo-row-title">{sc.name}</span>
+                          <span className="todo-row-sub">{status}{sc.lastRunAt ? ` · 上次 ${sc.lastRunAt}` : ''}</span>
+                        </span>
+                        <span className="todo-row-arrow">›</span>
+                      </div>
+                    )
+                  })}
+                </div>
+              )}
+            </CollapsibleGroup>
+            {detailSchedule && (
+              <ScheduleDetailModal schedule={detailSchedule} onClose={() => setDetailSchedule(null)} />
+            )}
 
             {/* Workflow 运行（REST 拉取 + 4s 轮询） */}
-            <div className="task-module-card">
-            <div className="task-group-title"><span>Workflow 运行</span></div>
+            <CollapsibleGroup title="Workflow 运行" count={workflowRuns.length}>
             {workflowLoading ? (
               <div className="right-empty">加载中…</div>
             ) : workflowRuns.length === 0 ? (
-              <div className="right-empty">暂无 workflow 运行</div>
+              <div className="todo-empty">暂无 workflow 运行</div>
             ) : (
               workflowRuns.map((r) => {
                 const meta = WORKFLOW_STATUS_META[r.status]
@@ -798,7 +995,7 @@ export function RightPanel({
                 )
               })
             )}
-            </div>
+            </CollapsibleGroup>
           </>
         )}
 
@@ -852,6 +1049,9 @@ export function RightPanel({
               <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>
             )}
           </>
+        )}
+        </div>
+        </>
         )}
       </div>
     </div>

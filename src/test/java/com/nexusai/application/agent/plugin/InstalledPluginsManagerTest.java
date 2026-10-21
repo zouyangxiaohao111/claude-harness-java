@@ -663,4 +663,25 @@ class InstalledPluginsManagerTest {
         assertEquals(1, paths.size());
         assertTrue(paths.get(0).endsWith("only-series"));
     }
+
+    @Test
+    void addInstalledPlugin_probes_component_paths_for_immediate_use() throws Exception {
+        // WHY（规则九）：安装完成当场就要能召唤技能。运行期注册若不带 skillsPath，
+        //   LoadPluginCommands.loadSkills 扫空 ⇒ 前端报「该技能未注册成斜杠命令」，
+        //   且 PluginInstallService.refreshPlugins 刷新也救不回来（只有重启后端才生效）。
+        //   因此注册路径必须与启动载盘（fromPluginInstallation）同样做组件目录探测。
+        Path installRoot = tempDir.resolve("cache/market/p/0.1.0");
+        Files.createDirectories(installRoot.resolve("skills/demo"));
+        Files.writeString(installRoot.resolve("skills/demo/SKILL.md"), "# demo");
+
+        manager.initialize();
+        manager.addInstalledPlugin("p", "0.1.0", System.currentTimeMillis(),
+            installRoot.toString(), null, "user", null);
+
+        InstalledPluginsManager.InstalledRecord rec = manager.list().stream()
+            .filter(r -> "p".equals(r.name())).findFirst().orElseThrow();
+        assertNotNull(rec.skillsPath(), "运行期注册必须探测 <插件根>/skills（否则装完不可召唤）");
+        assertEquals("skills", rec.skillsPath().getFileName().toString());
+        assertNull(rec.commandsPath(), "无 commands 目录时保持 null（CC auto-detect 语义）");
+    }
 }

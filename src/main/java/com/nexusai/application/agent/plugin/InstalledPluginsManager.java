@@ -581,8 +581,17 @@ public class InstalledPluginsManager {
                 defaultAgentsPath = agentsDir;
             }
         }
+        // [安装即可用修复] 运行期注册与启动期载盘（{@link #fromPluginInstallation}）必须走**同一套**
+        // 组件路径探测，否则新装插件的 skillsPath/commandsPath 恒 null ⇒
+        // LoadPluginCommands.loadSkills 扫空 ⇒ 召唤报「该技能未注册成斜杠命令」，且
+        // PluginInstallService.refreshPlugins 刷新后仍拿不到路径（只有重启后端才从文件读回）。
+        // 现按 CC pluginLoader.ts:1370-1395 + 1565-1583 auto-detect：<base>/commands、/skills、
+        // /output-styles 存在即注册 + manifest 附加路径。
         InstalledRecord rec = new InstalledRecord(name, version, "marketplace", true, installedAt,
-            installPathPath, defaultAgentsPath, projectPath, installPath, installedAt, gitCommitSha);
+            installPathPath, defaultAgentsPath, projectPath, installPath, installedAt, gitCommitSha,
+            dirExists(installPathPath, "commands"), List.of(),
+            dirExists(installPathPath, "skills"), manifestComponentPaths(installPathPath, "skills"),
+            dirExists(installPathPath, "output-styles"), List.of(), Map.of());
         installed.put(name, rec);
         writeThrough(rec);
         if (log.isInfoEnabled()) {

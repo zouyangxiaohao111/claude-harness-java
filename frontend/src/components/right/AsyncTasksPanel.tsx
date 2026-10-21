@@ -20,14 +20,22 @@ const TASK_STATUS_LABEL: Record<string, string> = {
   pending: '等待', running: '运行中', completed: '已完成', failed: '失败', killed: '已停止',
 }
 
-export function AsyncTasksPanel({ activeSessionId, showToast }: {
+export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false, onCount }: {
   activeSessionId: string | null
   showToast: (msg: string, type?: 'success' | 'info') => void
+  /** 折叠分组已提供标题 → 不再渲染自身标题行 */
+  hideHeader?: boolean
+  /** 上报任务数给折叠组（0 → 该组折叠成一行） */
+  onCount?: (n: number) => void
 }) {
   const [asyncTasks, setAsyncTasks] = useState<BackgroundTaskDto[]>([])
+  // [D2] 上报任务数给折叠组（0 → 折叠成一行）
+  useEffect(() => { onCount?.(asyncTasks.length) }, [asyncTasks.length, onCount])
   const [asyncTasksOpen, setAsyncTasksOpen] = useState(false)
   /** 三态弹窗过滤（进行中/已完成/已停止 · 对齐子代理运行状况点开查看） */
   const [statFilter, setStatFilter] = useState<'running' | 'done' | 'stopped' | null>(null)
+  /** 单个异步任务详情（点击列表行打开 · 用户 2026-10-21） */
+  const [detail, setDetail] = useState<BackgroundTaskDto | null>(null)
   // 常驻展示（对齐子代理运行状况 · 无折叠）：2s 轮询始终执行 REST 兜底补录，子代理实时恢复
 
   // [刀 2c] 「缺席即删」宽限期计数：key = `${sessionId}|${taskId}` → 连续未出现在 REST 清单的次数。
@@ -127,17 +135,6 @@ export function AsyncTasksPanel({ activeSessionId, showToast }: {
   // running 优先排序
   const sortedTasks = [...asyncTasks].sort((a, b) =>
     (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1))
-  // 三态统计（对齐子代理运行状况）：进行中=pending+running · 已完成=completed · 已停止=failed+killed
-  const runningTasks = sortedTasks.filter((t) => t.status === 'pending' || t.status === 'running')
-  const doneTasks = sortedTasks.filter((t) => t.status === 'completed')
-  const stoppedTasks = sortedTasks.filter((t) => t.status === 'failed' || t.status === 'killed')
-  const renderStat = (label: string, list: BackgroundTaskDto[], filter: 'running' | 'done' | 'stopped') => (
-    <div className={`sa-stat ${filter}`} onClick={() => { setStatFilter(filter); setAsyncTasksOpen(true); load() }} title={`查看${label}（${list.length}）`}>
-      <span className="sa-count">{list.length}</span>
-      <span className="sa-label">{label}</span>
-    </div>
-  )
-
   const handleKillTask = async (taskId: string) => {
     try {
       const res = await tasksApi.killTask(taskId)
@@ -191,32 +188,56 @@ export function AsyncTasksPanel({ activeSessionId, showToast }: {
 
   return (
     <>
-      <div className="task-group-title async-title">
+      {!hideHeader && <div className="task-group-title async-title">
         <span>异步任务</span>
         <span className="task-actions" onClick={(e) => e.stopPropagation()}>
           <button className="stop-all" onClick={() => { if (confirm('停止当前会话全部异步任务？')) void handleStopAll() }}>全部停止</button>
         </span>
-      </div>
-      {/* 常驻三态统计（对齐子代理运行状况 · 无任务也显示 0 0 0） */}
-      <div className="subagent-stats">
-        {renderStat('进行中', runningTasks, 'running')}
-        {renderStat('已完成', doneTasks, 'done')}
-        {renderStat('已停止', stoppedTasks, 'stopped')}
-      </div>
+      </div>}
+      {/* [D2] 展开态 = 行式列表（用户 2026-10-21：按设计稿，不要三张 0 卡片） */}
+      {sortedTasks.length === 0 ? (
+        <div className="todo-empty">暂无异步任务</div>
+      ) : (
+        <div className="todo-rows">
+          {sortedTasks.map((t) => {
+            const running = t.status === 'running' || t.status === 'pending'
+            const statusLabel = TASK_STATUS_LABEL[t.status] ?? t.status
+            const typeLabel = TASK_TYPE_LABEL[t.type] ?? t.type
+            return (
+              <div key={t.id} className="todo-row" onClick={() => setDetail(t)} title="查看任务详情">
+                <span className={`todo-row-dot ${running ? 'in_progress' : t.status === 'completed' ? 'completed' : 'pending'}`} />
+                <span className="todo-row-main">
+                  <span className="todo-row-title">{t.description || typeLabel}</span>
+                  <span className="todo-row-sub">{typeLabel} · {statusLabel}</span>
+                </span>
+                <span className="todo-row-arrow">›</span>
+              </div>
+            )
+          })}
+        </div>
+      )}
+      {detail && (
+        <AsyncTaskDetailModal task={detail} onClose={() => setDetail(null)} onKill={handleKillTask} />
+      )}
       {asyncTasksOpen && statFilter && (
-        <AsyncTasksDialog tasks={sortedTasks} filter={statFilter} onClose={() => { setAsyncTasksOpen(false); setStatFilter(null) }} onKill={handleKillTask} onStopAll={handleStopAll} />
+        <AsyncTasksDialog tasks={sortedTasks} filter={statFilter}
+          onClose={() => { setAsyncTasksOpen(false); setStatFilter(null) }}
+          onKill={handleKillTask} onStopAll={handleStopAll}
+          onOpen={(t) => { setAsyncTasksOpen(false); setStatFilter(null); setDetail(t) }} />
       )}
     </>
   )
 }
 
 /** 异步任务清单弹窗（三态过滤 · 对齐子代理运行状况点开查看） */
-function AsyncTasksDialog({ tasks, filter, onClose, onKill, onStopAll }: {
+function AsyncTasksDialog({ tasks, filter, onClose, onKill, onStopAll, onOpen }: {
   tasks: BackgroundTaskDto[]
   filter: 'running' | 'done' | 'stopped'
   onClose: () => void
   onKill: (taskId: string) => void
   onStopAll: () => void
+  /** 点击某条任务 → 打开详情（用户 2026-10-21） */
+  onOpen: (task: BackgroundTaskDto) => void
 }) {
   const shown = filter === 'running'
     ? tasks.filter((t) => t.status === 'pending' || t.status === 'running')
@@ -243,7 +264,7 @@ function AsyncTasksDialog({ tasks, filter, onClose, onKill, onStopAll }: {
             {shown.length === 0 ? (
               <div className="sam-empty">暂无</div>
             ) : shown.map((t) => (
-              <div key={t.id} className={`async-task-row ${t.status}`}>
+              <div key={t.id} className={`async-task-row ${t.status} clickable`} onClick={() => onOpen(t)} title="查看任务详情">
                 <span className={`at-type ${t.type}`}>{TASK_TYPE_LABEL[t.type] ?? t.type}</span>
                 <span className="at-status">{TASK_STATUS_LABEL[t.status] ?? t.status}</span>
                 <span className="at-desc" title={t.description}>{t.description}</span>
@@ -253,6 +274,79 @@ function AsyncTasksDialog({ tasks, filter, onClose, onKill, onStopAll }: {
               </div>
             ))}
           </div>
+        </div>
+      </div>
+    </div>
+  )
+}
+
+/**
+ * 异步任务详情弹窗（用户 2026-10-21：列表项要能点开）。
+ *
+ * <p>字段全部来自 BackgroundTaskDto：type / status / description / startTime / endTime /
+ * agentId / toolUseId / isBackgrounded。**不展示「日志输出」**——DTO 里没有该字段，
+ * 硬塞只能伪造；要看输出请回会话里那条工具调用。
+ */
+function AsyncTaskDetailModal({ task, onClose, onKill }: {
+  task: BackgroundTaskDto
+  onClose: () => void
+  onKill: (taskId: string) => void
+}) {
+  const running = task.status === 'running' || task.status === 'pending'
+  const elapsed = task.endTime != null
+    ? task.endTime - task.startTime
+    : Date.now() - task.startTime
+  const fmt = (ms: number) => {
+    if (ms < 1000) return `${ms}ms`
+    const s = Math.floor(ms / 1000)
+    if (s < 60) return `${s} 秒`
+    const m = Math.floor(s / 60)
+    return `${m} 分 ${s % 60} 秒`
+  }
+  const typeLabel = TASK_TYPE_LABEL[task.type] ?? task.type
+  const statusLabel = TASK_STATUS_LABEL[task.status] ?? task.status
+  return (
+    <div className="overlay-backdrop" onClick={onClose}>
+      <div className="subagent-modal task-detail" onClick={(e) => e.stopPropagation()}>
+        <div className="sam-head">
+          <span className="sam-title">{task.description || typeLabel}</span>
+          <button type="button" className="sam-close" onClick={onClose} aria-label="关闭">
+            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 3L9 9M9 3L3 9" /></svg>
+          </button>
+        </div>
+        <div className="sam-list task-detail-body">
+          <div className="td-meta">
+            <span className={`td-badge ${running ? 'in_progress' : task.status === 'completed' ? 'completed' : 'pending'}`}>
+              {statusLabel}
+            </span>
+            <span className="td-id">{typeLabel}</span>
+            {task.isBackgrounded && <span className="td-id">后台</span>}
+          </div>
+          <div className="td-sec">
+            <div className="td-label">{running ? '已运行' : '耗时'}</div>
+            <div className="td-val">{fmt(Math.max(0, elapsed))}</div>
+          </div>
+          <div className="td-sec">
+            <div className="td-label">开始时间</div>
+            <div className="td-val">{new Date(task.startTime).toLocaleString()}</div>
+          </div>
+          {task.agentId && (
+            <div className="td-sec">
+              <div className="td-label">执行者</div>
+              <div className="td-val td-mono">{task.agentId}</div>
+            </div>
+          )}
+          {task.toolUseId && (
+            <div className="td-sec">
+              <div className="td-label">工具调用</div>
+              <div className="td-val td-mono">{task.toolUseId}</div>
+            </div>
+          )}
+          {running && (
+            <div className="td-actions">
+              <button className="td-danger" onClick={() => { onKill(task.id); onClose() }}>停止任务</button>
+            </div>
+          )}
         </div>
       </div>
     </div>

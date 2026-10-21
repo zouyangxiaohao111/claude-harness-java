@@ -85,6 +85,10 @@ public class SettingsRecord {
     //   deepseek → DeepSeek POST /v1/tools/fetch，服务端抓取返回 Markdown）。命名小写 w 与 V37 家族一致
     //   （webfetchEngine → webfetch_engine 精确映射，避免 We... 大写映射到不存在的 webfetch_engine 变体）。
     private String webfetchEngine;
+    // [V103] market_admin_enabled ↔ marketAdminEnabled：市场管理员模式（默认关）。
+    //   true → 设置页显示「市场管理」（全量清单/版本历史/回滚）；false/null → 隐藏。
+    //   上架能力不受此开关影响（市场弹窗「＋ 添加」所有人可用，用户裁定 2026-10-21）。
+    private Boolean marketAdminEnabled;
     // [agent-swarms-setting V42] agent_swarms_enabled ↔ agentSwarmsEnabled：前端「环境配置」Agent Swarms
     //   开关（设置页开关 → TaskSystemConfig.isAgentSwarmsEnabled() 判定链 OR settings）。
     //   命名：MyBatis-Flex camelCase→snake 精确映射 agentSwarmsEnabled → agent_swarms_enabled
@@ -326,6 +330,9 @@ public class SettingsRecord {
     // [V102] webfetch_engine ↔ webfetchEngine（WebFetch 抓取引擎：null/空/builtin / deepseek）
     public String getWebfetchEngine() { return webfetchEngine; }
     public void setWebfetchEngine(String webfetchEngine) { this.webfetchEngine = webfetchEngine; }
+
+    public Boolean getMarketAdminEnabled() { return marketAdminEnabled; }
+    public void setMarketAdminEnabled(Boolean marketAdminEnabled) { this.marketAdminEnabled = marketAdminEnabled; }
     // [agent-swarms-setting V42] agent_swarms_enabled ↔ agentSwarmsEnabled（MyBatis-Flex snake↔camel 映射）
     public Boolean getAgentSwarmsEnabled() { return agentSwarmsEnabled; }
     public void setAgentSwarmsEnabled(Boolean agentSwarmsEnabled) { this.agentSwarmsEnabled = agentSwarmsEnabled; }

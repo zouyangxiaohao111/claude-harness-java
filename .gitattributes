@@ -1,0 +1,3 @@
+# Flyway 迁移脚本按**原始字节**入库：迁移一旦被任何库应用，checksum 即冻结
+# （改一个字节/换行风格 ⇒ 整库拒绝启动）。⛔ 不得让 Git 做 CRLF 转换。
+src/main/resources/db/migration/*.sql -text

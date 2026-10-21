@@ -427,6 +427,8 @@ export interface AppSettings {
   websearchDomainCheckUrl?: string | null
   /** WebFetch 抓取引擎（builtin=内置本地抓取 / deepseek=DeepSeek /v1/tools/fetch；空=builtin） */
   webfetchEngine?: string | null
+  /** 市场管理员模式（默认关）· true 才在设置页显示「市场管理」；上架能力不受影响 */
+  marketAdminEnabled?: boolean | null
   /** Agent Swarms 功能开关（设置页「环境配置」模块写 · 后端 TaskSystemConfig.isAgentSwarmsEnabled 读） */
   agentSwarmsEnabled?: boolean | null
   /** 协调者模式开关（设置页「环境配置」模块写 · 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读；未配置/null → 关闭） */
@@ -1051,6 +1053,8 @@ export interface MarketSkill {
   /** 是否已内置预装 */
   preinstalled?: boolean | null
   remote?: boolean
+  /** 市场条目内容指纹（与本地已装目录指纹比对 → 判定「有更新」） */
+  fingerprint?: string | null
 }
 /** GET /api/market/connector 单条（后端 MarketConnectorDto · 远端连接器） */
 export interface MarketConnector {
@@ -1090,6 +1094,8 @@ export interface ExternalMarketPlugin {
   tags?: string[] | null
   /** 创建时间（ISO 8601） */
   createdAt?: string | null
+  /** 内容指纹 sha256:...（上架时写入；较早的数据可能为空） */
+  fingerprint?: string | null
 }
 /** GET /api/market/external 响应（后端 ExternalMarketDto · 自建 MinIO 市场） */
 export interface ExternalMarket {
@@ -1856,6 +1862,8 @@ export interface AgentTranscriptMessage {
   toolCalls?: { id: string; name: string; arguments: string }[] | null
   /** tool_result 消息的 tool_use id */
   toolCallId: string | null
+  /** 思考内容（CC msg.reasoning · 子代理转录里原样保存，后端 2026-10-21 起透出） */
+  reasoning?: string | null
 }
 
 /**
