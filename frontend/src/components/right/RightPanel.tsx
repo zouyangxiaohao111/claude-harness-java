@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { memo, useEffect, useState } from 'react'
 import type { SettingsTab, Project, SessionFile } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
@@ -301,7 +301,7 @@ const NewFileSvg = () => (
   </svg>
 )
 
-export function RightPanel({
+export const RightPanel = memo(function RightPanel({
   activeSessionId,
   mainProject,
   rightTab,
@@ -966,4 +966,4 @@ export function RightPanel({
       </div>
     </div>
   )
-}
+})

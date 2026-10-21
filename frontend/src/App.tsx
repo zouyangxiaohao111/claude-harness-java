@@ -8,7 +8,7 @@ import {
   getDiffFor,
   brandTagFromName,
 } from '@/data'
-import type { Project, Session, SettingsTab, ModelTag, DiffFile } from '@/types'
+import type { Project, Session, SettingsTab, ModelTag, DiffFile, RightTab } from '@/types'
 import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert, PivotCandidateDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
@@ -986,14 +986,20 @@ function App() {
     ? (realProjects.find((p) => p.id === activeSession.mainProjectId) ?? null)
     : null
   // 会话绑定项目反查真实项目；缺省回退 perSessionProjects（会话创建时记录）→ 空项目（「未绑定项目」零态）
-  const sessionProject = boundProject
-    ? { main: boundProject, subs: [], expanded: {}, flashing: null }
-    : (perSessionProjects[activeSessionId] ?? {
-        main: EMPTY_PROJECT,
-        subs: [],
-        expanded: {},
-        flashing: null,
-      })
+  // 引用稳定：流式每个 chunk 都会让 App 重渲染；若这里每次新建对象，下传 RightPanel 的
+  //   mainProject/flashingProject 引用恒变 ⇒ 右栏 memo 失效、每个 chunk 重渲染整棵右栏树
+  //   （表现为「后台都输出完了，前端还在慢慢打字」）。
+  const sessionProject = useMemo(
+    () => (boundProject
+      ? { main: boundProject, subs: [], expanded: {}, flashing: null }
+      : (perSessionProjects[activeSessionId] ?? {
+          main: EMPTY_PROJECT,
+          subs: [],
+          expanded: {},
+          flashing: null,
+        })),
+    [boundProject, perSessionProjects, activeSessionId],
+  )
 
   // ---- session handlers ----
   const switchSession = useCallback(
@@ -1463,6 +1469,13 @@ function App() {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }, [setSessions, storeSessions, showToast])
+
+  // 右栏 memo 化配套：这两个回调若内联，每次渲染都是新引用 ⇒ memo 恒失效。
+  const setRightTabCb = useCallback(
+    (t: RightTab) => uiDispatch({ type: 'SET_RIGHT_TAB', tab: t }),
+    [uiDispatch],
+  )
+  const toggleRightCollapsed = useCallback(() => setRightCollapsed((v) => !v), [])
 
   const openSettingsAt = useCallback(
     (tab: SettingsTab) => {
@@ -2026,7 +2039,7 @@ function App() {
         activeSessionId={activeSessionId}
         mainProject={sessionProject.main}
         rightTab={ui.rightTab}
-        setRightTab={(t) => uiDispatch({ type: 'SET_RIGHT_TAB', tab: t })}
+        setRightTab={setRightTabCb}
         onOpenFileRow={openChangedFileDiff}
         onOpenFile={openProjectFile}
         onQuoteFile={insertReference}
@@ -2034,7 +2047,7 @@ function App() {
         openSettingsAt={openSettingsAt}
         flashingProject={sessionProject.flashing}
         onRollbackFile={rollbackChangedFile}
-        onToggleCollapse={() => setRightCollapsed((v) => !v)}
+        onToggleCollapse={toggleRightCollapsed}
         collapsed={rightCollapsed}
       />
       {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport；折叠时由窄 rail 展开，不显示 resizer） */}

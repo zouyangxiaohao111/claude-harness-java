@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import { tasksApi } from '@/api/tasks'
 import { ApiError } from '@/api/rest'
 import type { TodoStatus, TaskListSnapshotDto } from '@/api/types'
@@ -30,28 +30,36 @@ interface TodoItemView {
 }
 
 export function TodoPanel({ sessionId, showToast, hideHeader = false, onCount }: TodoPanelProps) {
-  const [snapshot, setSnapshot] = useState<TaskListSnapshotDto | null>(null)
+  /**
+   * 快照与其所属会话**绑定存储**（2026-10-21 用户实测「切会话任务清单不跟着变」）。
+   *
+   * <p>原实现只存 data：切换会话后新请求返回前（或请求失败时）一直显示**上一会话**的任务，
+   * 视觉上就是「没按会话过滤」。把 sid 一起存、渲染时比对 ⇒ 切会话立即视为空，
+   * 不需要额外 setState（也就不会让折叠组的计数闪一下 0）。
+   */
+  const [snapshotState, setSnapshotState] = useState<{ sid: string; data: TaskListSnapshotDto } | null>(null)
+  const snapshot = snapshotState && snapshotState.sid === sessionId ? snapshotState.data : null
+  /** showToast 走 ref：否则父组件每次渲染的新函数引用会让轮询 effect 反复重建 */
+  const showToastRef = useRef(showToast)
+  useEffect(() => { showToastRef.current = showToast })
   const [filter, setFilter] = useState<TodoStatus | null>(null)
   /** 任务详情（点击任务行打开 · 用户 2026-10-21 要求「任务列表能点开详情」） */
   const [detail, setDetail] = useState<TodoItemView | null>(null)
 
   // 挂载 + sessionId 变化：2s 轮询合并端点（V2 TaskCreate / V1 TodoWrite 互斥，非空方显示）
   useEffect(() => {
-    if (!sessionId) {
-      setSnapshot(null)
-      return
-    }
+    if (!sessionId) return
     let cancelled = false
-    const fetch = () => {
+    const tick = () => {
       tasksApi
         .listSnapshot(sessionId)
-        .then((snap) => { if (!cancelled) setSnapshot(snap) })
-        .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
+        .then((snap) => { if (!cancelled) setSnapshotState({ sid: sessionId, data: snap }) })
+        .catch((e) => { if (!cancelled) showToastRef.current(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     }
-    fetch()
-    const timer = window.setInterval(fetch, 2000)
+    tick()
+    const timer = window.setInterval(tick, 2000)
     return () => { cancelled = true; window.clearInterval(timer) }
-  }, [sessionId, showToast])
+  }, [sessionId])
 
   const v2 = snapshot?.v2Tasks ?? []
   const v1 = snapshot?.v1Todos ?? []
