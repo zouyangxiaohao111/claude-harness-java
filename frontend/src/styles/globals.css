@@ -10829,7 +10829,14 @@ html {
   padding: 1px 7px; border-radius: 999px; margin-left: 6px;
   color: var(--ink-faint, #9aa3b2); background: var(--surface-2, #eff2f8);
 }
+.sub-status.running { color: #0f5fd4; background: rgba(15,95,212,.12); }
 .sub-status.completed { color: #2d6e3d; background: rgba(93,184,114,.14); }
 .sub-status.failed { color: #c03439; background: rgba(229,72,77,.12); }
-
+.sub-status.stopped { color: #5b6472; background: rgba(91,100,114,.12); }
 .sub-status.incomplete { color: #b45309; background: rgba(180,83,9,.10); }
+
+/* 进行中的子代理行：淡蓝底 + 左侧强调条（用户 2026-10-21：要能一眼看出谁在跑） */
+.todo-row.in-progress {
+  background: var(--accent-soft, rgba(15,95,212,.06));
+  box-shadow: inset 2px 0 0 var(--accent, #0f5fd4);
+}

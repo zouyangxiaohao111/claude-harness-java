@@ -84,6 +84,23 @@ public interface WorkflowService {
     List<RunProgress> listRuns();
 
     /**
+     * 按**会话/项目**过滤的 run 列表（右栏面板用）· 2026-10-21 用户实测：
+     * 面板原先调 {@link #loadPersistedRuns()} + {@link #listRuns()}，二者都走**进程默认** runsDir
+     * ⇒ 在「租赁系统」会话里会看到 nexusai 项目的 workflow（跨项目串台）。
+     *
+     * <p>实现口径：先按该会话 projectRoot 解析出的 runsDir 水合（幂等），再返回
+     * 「该目录下的历史 run ∪ 内存中仍在 RUNNING 的 run」（运行中的 run 尚未落盘，只能按状态保留）。
+     *
+     * <p>默认实现回落到 {@link #listRuns()}（测试 Fake 无需改动）；生产实现覆盖。
+     *
+     * @param sessionId 会话 ID；null/空白 → 退回进程默认（与旧行为一致）
+     * @return RunProgress 列表（按 updatedAt 降序）
+     */
+    default List<RunProgress> listRunsForSession(String sessionId) {
+        return listRuns();
+    }
+
+    /**
      * 按 runId 取进度 · CC original: {@code getRun(runId)} (service.ts:86)。
      *
      * @param runId 目标 run id

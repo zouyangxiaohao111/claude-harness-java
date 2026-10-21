@@ -10,6 +10,7 @@ import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
 import org.springframework.web.bind.annotation.RestController;
 
 import java.util.List;
@@ -57,13 +58,15 @@ public class WorkflowController {
      * @return WorkflowRunDto 列表（运行中 + 历史）
      */
     @GetMapping("/runs")
-    public List<WorkflowRunDto> listRuns() {
-        // 先水合磁盘历史（进程单例只扫一次，幂等；失败 log + 重置 flag 允许重试）· CC service.ts:290-309
-        workflowService.loadPersistedRuns();
-        List<RunProgress> runs = workflowService.listRuns();
+    public List<WorkflowRunDto> listRuns(
+            @RequestParam(name = "sessionId", required = false) String sessionId) {
+        // [2026-10-21 用户实测] 面板必须按会话/项目过滤：原实现固定水合**进程默认** runsDir
+        //   → 「租赁系统」会话里看到 nexusai 项目的 workflow（跨项目串台）。
+        //   传 sessionId → 按该会话 projectRoot 的 runsDir 过滤；不传 → 保持旧行为（进程默认）。
+        List<RunProgress> runs = workflowService.listRunsForSession(sessionId);
         if (log.isDebugEnabled()) {
-            log.debug("WorkflowController.listRuns: 返回 {} 个 run（含历史水合，对齐 CC service.ts:290-309 + store.list）",
-                    runs.size());
+            log.debug("WorkflowController.listRuns: sessionId={} 返回 {} 个 run（磁盘水合 + store，按项目过滤）",
+                    sessionId, runs.size());
         }
         return runs.stream().map(WorkflowRunDto::from).toList();
     }

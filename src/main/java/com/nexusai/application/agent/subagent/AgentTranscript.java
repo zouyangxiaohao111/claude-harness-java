@@ -10,6 +10,7 @@ import java.io.IOException;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.StandardOpenOption;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.*;
@@ -112,6 +113,30 @@ public class AgentTranscript {
     /** 缓存失效（测试/显式刷新用）。 */
     public static void clearListCache() {
         LIST_CACHE.clear();
+    }
+
+    /**
+     * transcript 文件的**创建时间**（epoch millis）· 右栏列表按创建时间倒序用。
+     *
+     * <p>为什么不用 mtime：mtime = 最后一次追加时间（进行中的子代理会一直变），
+     * 用户要的是「谁先派出去的」。Windows/NTFS 提供 creationTime；
+     * 文件系统不支持时退化为 mtime，两者都取不到返回 {@code null}（前端保持原相对顺序）。
+     *
+     * @param sessionDir 会话根目录（{@link ResumeService#resolveSessionDir} 同源）
+     * @param sessionId  会话 ID
+     * @param agentId    transcript 文件名里的 id（a+16hex）
+     */
+    public static Long fileCreatedAt(Path sessionDir, String sessionId, String agentId) {
+        Path f = sessionDir.resolve(sessionId).resolve("subagents").resolve("agent-" + agentId + ".jsonl");
+        try {
+            return Files.readAttributes(f, BasicFileAttributes.class).creationTime().toMillis();
+        } catch (IOException e) {
+            try {
+                return Files.getLastModifiedTime(f).toMillis();
+            } catch (IOException ignore) {
+                return null;
+            }
+        }
     }
 
     private static List<String> listAgentIdsUncached(Path sessionDir, String sessionId) {

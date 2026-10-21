@@ -81,7 +81,8 @@ public class SubagentController {
                 log.debug("读子代理 meta 失败 agentId={}: {}", agentId, e.getMessage());
             }
             String status = AgentTranscript.inferStatus(sessionDir, sessionId, agentId);
-            out.add(new SubagentSummary(agentId, agentType, description, status));
+            Long createdAt = AgentTranscript.fileCreatedAt(sessionDir, sessionId, agentId);
+            out.add(new SubagentSummary(agentId, agentType, description, status, createdAt));
         }
         log.info("[SubagentController] 列出会话子代理 sessionId={} limit={} → {} 条", sessionId, limit, out.size());
         return out;
@@ -94,8 +95,10 @@ public class SubagentController {
      * @param agentType   agent 类型（meta.json，可能为空）
      * @param description 任务描述（meta.json，可能为空）
      * @param status      结局推断（completed/failed/unknown · 读 transcript 末行，meta 里没有此字段）
+     * @param createdAt   transcript 文件创建时间（epoch millis · 右栏按创建时间倒序；取不到为 null）
      */
-    public record SubagentSummary(String agentId, String agentType, String description, String status) {}
+    public record SubagentSummary(String agentId, String agentType, String description, String status,
+                                  Long createdAt) {}
 
     /** GET /api/v1/sessions/{sessionId}/subagents/{agentId}/transcript · 子代理完整执行记录（消息链）。 */
     @GetMapping("/{agentId}/transcript")

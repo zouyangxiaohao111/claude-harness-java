@@ -31,9 +31,6 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
   const [asyncTasks, setAsyncTasks] = useState<BackgroundTaskDto[]>([])
   // [D2] 上报任务数给折叠组（0 → 折叠成一行）
   useEffect(() => { onCount?.(asyncTasks.length) }, [asyncTasks.length, onCount])
-  const [asyncTasksOpen, setAsyncTasksOpen] = useState(false)
-  /** 三态弹窗过滤（进行中/已完成/已停止 · 对齐子代理运行状况点开查看） */
-  const [statFilter, setStatFilter] = useState<'running' | 'done' | 'stopped' | null>(null)
   /** 单个异步任务详情（点击列表行打开 · 用户 2026-10-21） */
   const [detail, setDetail] = useState<BackgroundTaskDto | null>(null)
   // 常驻展示（对齐子代理运行状况 · 无折叠）：2s 轮询始终执行 REST 兜底补录，子代理实时恢复
@@ -210,6 +207,14 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
                   <span className="todo-row-title">{t.description || typeLabel}</span>
                   <span className="todo-row-sub">{typeLabel} · {statusLabel}</span>
                 </span>
+                {/* 停止入口随三态弹窗删除后迁到行内（仅运行中/待运行） */}
+                {running && (
+                  <button
+                    className="at-kill"
+                    title="停止任务"
+                    onClick={(e) => { e.stopPropagation(); void handleKillTask(t.id) }}
+                  >⏹</button>
+                )}
                 <span className="todo-row-arrow">›</span>
               </div>
             )
@@ -219,66 +224,10 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
       {detail && (
         <AsyncTaskDetailModal task={detail} onClose={() => setDetail(null)} onKill={handleKillTask} />
       )}
-      {asyncTasksOpen && statFilter && (
-        <AsyncTasksDialog tasks={sortedTasks} filter={statFilter}
-          onClose={() => { setAsyncTasksOpen(false); setStatFilter(null) }}
-          onKill={handleKillTask} onStopAll={handleStopAll}
-          onOpen={(t) => { setAsyncTasksOpen(false); setStatFilter(null); setDetail(t) }} />
-      )}
     </>
   )
 }
 
-/** 异步任务清单弹窗（三态过滤 · 对齐子代理运行状况点开查看） */
-function AsyncTasksDialog({ tasks, filter, onClose, onKill, onStopAll, onOpen }: {
-  tasks: BackgroundTaskDto[]
-  filter: 'running' | 'done' | 'stopped'
-  onClose: () => void
-  onKill: (taskId: string) => void
-  onStopAll: () => void
-  /** 点击某条任务 → 打开详情（用户 2026-10-21） */
-  onOpen: (task: BackgroundTaskDto) => void
-}) {
-  const shown = filter === 'running'
-    ? tasks.filter((t) => t.status === 'pending' || t.status === 'running')
-    : filter === 'done'
-      ? tasks.filter((t) => t.status === 'completed')
-      : tasks.filter((t) => t.status === 'failed' || t.status === 'killed')
-  const running = shown.filter((t) => t.status === 'running')
-  const titleLabel = filter === 'running' ? '进行中' : filter === 'done' ? '已完成' : '已停止'
-  return (
-    <div className="overlay-backdrop" onClick={onClose}>
-      <div className="subagent-modal" onClick={(e) => e.stopPropagation()}>
-        <div className="sam-head">
-          <span className="sam-title">异步任务 · {titleLabel}<span className="sam-count">{shown.length}</span></span>
-          <button type="button" className="sam-close" onClick={onClose} aria-label="关闭">
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M3 3L9 9M9 3L3 9" /></svg>
-          </button>
-        </div>
-        <div className="sam-list">
-          <div className="async-tasks-summary">
-            <span>⚡ {running.length} 运行中 · 共 {shown.length} 个</span>
-            <button className="stop-all" onClick={() => { if (confirm('停止当前会话全部异步任务？')) onStopAll() }}>全部停止</button>
-          </div>
-          <div className="async-tasks-list">
-            {shown.length === 0 ? (
-              <div className="sam-empty">暂无</div>
-            ) : shown.map((t) => (
-              <div key={t.id} className={`async-task-row ${t.status} clickable`} onClick={() => onOpen(t)} title="查看任务详情">
-                <span className={`at-type ${t.type}`}>{TASK_TYPE_LABEL[t.type] ?? t.type}</span>
-                <span className="at-status">{TASK_STATUS_LABEL[t.status] ?? t.status}</span>
-                <span className="at-desc" title={t.description}>{t.description}</span>
-                {t.status === 'running' && (
-                  <button className="at-kill" title="停止任务" onClick={() => onKill(t.id)}>⏹</button>
-                )}
-              </div>
-            ))}
-          </div>
-        </div>
-      </div>
-    </div>
-  )
-}
 
 /**
  * 异步任务详情弹窗（用户 2026-10-21：列表项要能点开）。

@@ -121,9 +121,7 @@ describe('[刀 1b/2a/2c] AsyncTasksPanel 子代理卡片三条收敛出口', () 
     await mount()
     expect(bucket()['a-1'], '前置：REST 兜底补录应已登记该子代理').toBeTruthy()
 
-    // 打开「进行中」弹窗 → 行内 ⏹
-    click(container.querySelector('.sa-stat.running'))
-    await flush()
+    // 2026-10-21 三态弹窗/卡片已删除：AsyncTasksPanel 的 ⏹ 直接在行内
     const killBtn = container.querySelector('.at-kill')
     // 关键：点 ⏹ 的同一时点，后端清单已不含该任务（404 的语义 = 任务确实没了）
     currentList = []
@@ -159,8 +157,6 @@ describe('[刀 1b/2a/2c] AsyncTasksPanel 子代理卡片三条收敛出口', () 
     await mount()
     expect(bucket()['a-1'], '前置：REST 兜底补录应已登记该子代理').toBeTruthy()
 
-    click(container.querySelector('.sa-stat.running'))
-    await flush()
     const killBtn = container.querySelector('.at-kill')
     currentList = [] // 点 ⏹ 的同一时点，后端清单已不含该任务（409 的语义 = 已非运行态）
     await act(async () => { click(killBtn) })

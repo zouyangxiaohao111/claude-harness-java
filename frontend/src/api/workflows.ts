@@ -6,8 +6,14 @@ import { api } from './rest'
 import type { WorkflowRunDto } from './types'
 
 export const workflowApi = {
-  /** 全部 run（挂载时调用 · 水合历史，按 updatedAt 降序） */
-  listRuns: () => api<WorkflowRunDto[]>('/workflows/runs'),
+  /**
+   * run 列表（按 updatedAt 降序）。
+   *
+   * <p>必须带 sessionId：后端按该会话项目的 workflow 目录过滤。
+   * 不传 → 进程默认目录（旧的跨项目串台行为），仅无会话场景使用。
+   */
+  listRuns: (sessionId?: string | null) =>
+    api<WorkflowRunDto[]>(`/workflows/runs${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`),
   /** 单个 run 详情（点开时调用 · 未命中 → 404） */
   getRun: (runId: string) =>
     api<WorkflowRunDto>(`/workflows/runs/${encodeURIComponent(runId)}`),

@@ -42,7 +42,7 @@ vi.mock('@/api/workflows', () => ({
   workflowApi: { listRuns: vi.fn(() => Promise.resolve([])), killRun: vi.fn(), getRun: vi.fn() },
 }))
 vi.mock('@/api/projects', () => ({ projectApi: {} }))
-vi.mock('@/api/subagents', () => ({ subagentApi: {} }))
+vi.mock('@/api/subagents', () => ({ subagentApi: { list: async () => [] } }))
 vi.mock('@/hooks/useSchedules', () => ({ useSchedules: () => ({ list: [], loading: false }) }))
 vi.mock('@/components/modals/SchedulesPanel', () => ({ cronToHuman: () => '' }))
 // 三个邻接面板与本次改动无关 → 置空，隔离出「子代理运行状况」这一块
@@ -102,9 +102,7 @@ describe('[刀 2b] RightPanel 停止子代理：会话桶正确 + 409 也收敛'
       )
     })
     await flush()
-    // 打开「进行中」三态弹窗 → 卡片行内的 ⏹
-    click(container.querySelector('.sa-stat.running'))
-    await flush()
+    // 2026-10-21 三态弹窗已删除：停止入口迁到「子代理运行状况」行内（running 行才渲染 ⏹）
     return container.querySelector('.subagent-kill')
   }
 

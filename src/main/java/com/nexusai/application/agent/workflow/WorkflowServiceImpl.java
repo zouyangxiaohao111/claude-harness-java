@@ -328,6 +328,47 @@ public final class WorkflowServiceImpl implements WorkflowService {
         return store.list();
     }
 
+    /**
+     * 按会话/项目过滤的 run 列表（面板用）· 见接口 javadoc。
+     *
+     * <p>WHY 不能直接 {@code store.list()}：store 是<b>进程级</b>单例，既含本会话项目的历史，
+     * 也含先前被 {@link #loadPersistedRuns()} 从<b>进程默认</b> runsDir 水合进来的别的项目的 run
+     * ⇒ 面板在「租赁系统」会话里会看到 nexusai 的 workflow（2026-10-21 用户实测）。
+     *
+     * <p>运行中的 run 尚未落盘（persistence 只在终态写 state.json）→ 按状态保留，
+     * 不能让正在跑的 workflow 从面板消失。
+     */
+    @Override
+    public List<RunProgress> listRunsForSession(@Nullable String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            loadPersistedRuns();
+            return listRuns();
+        }
+        String runsDir = runsDirResolver.apply(sessionId);
+        java.util.Set<String> idsOnDisk = new java.util.LinkedHashSet<>();
+        try {
+            for (RunProgress persisted : persistence.listPersistedRuns(runsDir, LOAD_PERSISTED_LIMIT)) {
+                idsOnDisk.add(persisted.runId());
+                store.hydrate(persisted); // 幂等：store.hydrate 跳过已存在 runId（内存优先）
+            }
+        } catch (Exception e) {
+            // 扫描失败不阻断面板（与 loadPersistedRuns 同策略）：只返回内存中运行中的 run
+            log.warn("[workflow warn] listRunsForSession 扫描失败 session={} runsDir={}: {}",
+                    sessionId, runsDir, e.getMessage());
+        }
+        List<RunProgress> out = new java.util.ArrayList<>();
+        for (RunProgress run : store.list()) {
+            if (idsOnDisk.contains(run.runId()) || run.status() == RunProgress.Status.RUNNING) {
+                out.add(run);
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("listRunsForSession: session={} runsDir={} 命中 {} 个 run（磁盘 {} 个）",
+                    sessionId, runsDir, out.size(), idsOnDisk.size());
+        }
+        return out;
+    }
+
     @Override
     public RunProgress getRun(String runId) {
         return store.get(runId);

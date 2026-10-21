@@ -11,6 +11,8 @@ export interface SubagentSummary {
   description?: string | null
   /** 结局推断（completed / failed / unknown · 后端读 transcript 末行） */
   status?: string | null
+  /** transcript 文件创建时间（epoch millis · 列表按它倒序；取不到为 null） */
+  createdAt?: number | null
 }
 
 /** 子代理详情 API（transcript 完整执行记录 · GET /sessions/{sid}/subagents/{agentId}/transcript） */
