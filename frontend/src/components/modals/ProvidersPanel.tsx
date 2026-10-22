@@ -38,6 +38,8 @@ const EMPTY_MODEL: Model = {
   temperature: 1.0,
   topP: null,
   think: '',
+  /** 模型级额外请求体（JSON 对象字符串）· 空 = 无额外参数 */
+  extraBody: '',
   enabled: true,
   maxContextTokens: null,
 }
@@ -176,6 +178,8 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       temperature: m.temperature,
       topP: m.topP,
       think: m.think || null,
+      // [2026-10-22] 模型级额外请求体（逐键合并进请求体；空 → null 不写）
+      extraBody: m.extraBody || null,
       enabled: m.enabled,
     }
     void wrap(async () => {
@@ -196,6 +200,8 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       temperature: m.temperature,
       topP: m.topP,
       think: m.think || null,
+      // [2026-10-22] 模型级额外请求体（逐键合并进请求体；空 → null 不写）
+      extraBody: m.extraBody || null,
       enabled: m.enabled,
     }
     void wrap(async () => {

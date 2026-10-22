@@ -22,6 +22,7 @@ import com.nexusai.domain.session.MessageService;
 import com.nexusai.eventbus.ws.MessagePermissionRequestEvent;
 import com.nexusai.eventbus.ws.PermissionExplanationEvent;
 import com.nexusai.model.session.dto.ChatMessageDto;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.UUID;
@@ -205,6 +206,23 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      */
     private final Map<String, CompletableFuture<PermissionResult>> pending =
         new ConcurrentHashMap<>();
+
+    /**
+     * [2026-10-22 会话状态同步 · 对齐 dsh PendingQuestion carrier] 会话 → (requestId → 请求事件快照)。
+     *
+     * <p>WHY：权限/提问此前只走一次性 STOMP 推送 —— 若该会话当时**不在前端订阅集合**里
+     * （非当前会话且无活跃流），事件被静默丢弃，用户既看不到黄点、切回会话也不会再弹
+     * （实测：AskUserQuestion 在 sess-df8b40c2 等待 12 分钟后被 Deny）。
+     * dsh 把 pending 作为**会话视图节点**随快照下发；本仓等价物 = 这份快照 +
+     * {@code GET /sessions/{id}/state} 让前端切会话/重连时补拉。
+     *
+     * <p>生命周期：prompt() 推送成功即写入；onResponse / abort / 推送失败 / 被覆盖时移除。
+     */
+    private final Map<String, Map<String, MessagePermissionRequestEvent>> pendingBySession =
+        new ConcurrentHashMap<>();
+
+    /** requestId → 归属会话（移除快照时定位用 · 与会话 map 同步增删）。 */
+    private final Map<String, String> pendingSessionOf = new ConcurrentHashMap<>();
 
     /**
      * [canUseTool v3] 每请求的原子 claim 守卫 · 对齐 CC createResolveOnce.claim()
@@ -674,6 +692,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             ctx.abortController().onCancel(ac -> {
                 // 幂等: future.complete 二次调用被忽略; pending.remove 重复执行无害
                 pending.remove(requestId);
+                removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
                 raceClaims.remove(requestId);
                 if (claimed.compareAndSet(false, true)) {
                     future.complete(new PermissionResult.Deny(
@@ -725,6 +744,11 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 isClassifierFeatureEnabled()
             );
             ws.convertAndSend(topic, event);
+            // [会话状态同步] 推送同时留快照 —— 供切会话/重连时 GET /sessions/{id}/state 补拉
+            //   （事件本身是即时的：订阅缺失/断线期间到达的请求否则永久不可见）
+            pendingBySession.computeIfAbsent(deliverySessionId, k -> new ConcurrentHashMap<>())
+                .put(requestId, event);
+            pendingSessionOf.put(requestId, deliverySessionId);
             // [2026-08-26 AskUserQuestion 诊断] 记录推送的 toolInput 是否含 questions——
             //   前端 AskUserForm 靠 toolInput.questions 渲染选择题（缺失→通用授权弹窗）
             if (log.isInfoEnabled()) {
@@ -737,6 +761,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         } catch (Exception e) {
             // STOMP 推送失败 —— 立即 deny（不能让 loop 永久阻塞）
             pending.remove(requestId);
+            removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
             raceClaims.remove(requestId);
             log.error("PERMISSION STOMP push failed: requestId={}", requestId, e);
             return new PermissionResult.Deny(
@@ -784,6 +809,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         } finally {
             // 清理 —— 即使 onResponse 已 remove，这里 remove 也是 idempotent
             pending.remove(requestId);
+            removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
             raceClaims.remove(requestId);
             promptInputs.remove(requestId);
             promptContexts.remove(requestId);
@@ -1791,6 +1817,40 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     }
 
     /**
+     * 清掉某请求的会话状态快照 · pending future 已终结 / 被覆盖 / 推送失败时同步调用。
+     */
+    private void removePendingSnapshot(String requestId) {
+        String sid = pendingSessionOf.remove(requestId);
+        if (sid == null) return;
+        Map<String, MessagePermissionRequestEvent> m = pendingBySession.get(sid);
+        if (m == null) return;
+        m.remove(requestId);
+        if (m.isEmpty()) pendingBySession.remove(sid);
+    }
+
+    /**
+     * 某会话当前**仍在等待用户**的权限/提问请求快照 · 对齐 dsh 的 PendingQuestion 会话载体。
+     *
+     * <p>供 {@code GET /api/v1/sessions/{id}/state} 在**切会话 / 重连**时补拉：请求本体是即时
+     * STOMP 事件，订阅缺失（非当前会话且无活跃流）或断线期间到达的请求不会重放 —— 只有这里能找回。
+     * 顺带剔除 future 已终结的残留（pending 里没有该 requestId）作双保险。
+     *
+     * @param sessionId 目标会话（short id）
+     * @return 待处理请求事件列表（与 STOMP 事件同形，前端可直接 enqueue）；无 → 空列表
+     */
+    public List<MessagePermissionRequestEvent> listPendingForSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return List.of();
+        Map<String, MessagePermissionRequestEvent> m = pendingBySession.get(sessionId);
+        if (m == null) return List.of();
+        m.entrySet().removeIf(e -> !pending.containsKey(e.getKey()));
+        if (m.isEmpty()) {
+            pendingBySession.remove(sessionId);
+            return List.of();
+        }
+        return new ArrayList<>(m.values());
+    }
+
+    /**
      * [R32-b9] STOMP 响应回调 · 完成对应 future (含 acceptFeedback + contentBlocks)。
      *
      * <p>[Session S16] 兼容重载 · 无 updatedPermissions（旧前端/旧测试语义）→ null。
@@ -1846,6 +1906,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * @param answers            [FIX-E] AskUserQuestion 答案（{questionText: optionLabel}；可为 null）
      * @param annotations        [FIX-E] 每问注解（preview/notes；可为 null）
      */
+
     public void onResponse(String requestId, String decision,
                            List<JsonNode> updatedPermissions,
                            String acceptFeedback, List<JsonNode> contentBlocks,
@@ -1855,6 +1916,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             return;
         }
         CompletableFuture<PermissionResult> future = pending.remove(requestId);
+        removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
         AtomicBoolean claimed = raceClaims.remove(requestId);
         // [FIX-E askuser-answers] 用 remove 返回值捕获 originalInput —— 修复已存在 bug：
         //   原实现 promptInputs.remove(requestId) 先于 promptInputs.get(requestId) 读取

@@ -3,6 +3,9 @@ import react from '@vitejs/plugin-react'
 import path from 'path'
 
 const host = process.env.TAURI_DEV_HOST
+/** [e2e] 独立环境可覆盖：dev 端口与后端目标（e2e 用 5174 → 3460，绝不占用日常 3000/3458）。 */
+const devPort = Number(process.env.NEXUSAI_DEV_PORT) || 3000
+const apiTarget = process.env.NEXUSAI_API_TARGET || 'http://localhost:3458'
 
 export default defineConfig({
   plugins: [react()],
@@ -17,7 +20,7 @@ export default defineConfig({
   },
   clearScreen: false,
   server: {
-    port: 3000,
+    port: devPort,
     strictPort: true,
     host: host || false,
     hmr: host
@@ -32,9 +35,9 @@ export default defineConfig({
     //   否则 STOMP 连不上 → socket.ts 的原生 WS 会一直失败并降级 SockJS，SockJS 也失败则整条会话流断。
     //   打包版不走本 proxy（WebView 用绝对地址，见 base.ts 分环境说明）。
     proxy: {
-      '/api': { target: 'http://localhost:3458', changeOrigin: true },
-      '/ws': { target: 'http://localhost:3458', changeOrigin: true, ws: true },
-      '/ws-sockjs': { target: 'http://localhost:3458', changeOrigin: true, ws: true },
+      '/api': { target: apiTarget, changeOrigin: true },
+      '/ws': { target: apiTarget, changeOrigin: true, ws: true },
+      '/ws-sockjs': { target: apiTarget, changeOrigin: true, ws: true },
     },
     watch: {
       ignored: ['**/src-tauri/**'],

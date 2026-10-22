@@ -77,6 +77,8 @@ public class ModelService {
         m.setCacheWritePricePeak(req.cacheWritePricePeak() != null ? req.cacheWritePricePeak().doubleValue() : null);
         m.setCacheWritePriceOffpeak(req.cacheWritePriceOffpeak() != null ? req.cacheWritePriceOffpeak().doubleValue() : null);
         m.setThink(req.think() != null ? req.think() : "");
+        // [2026-10-22 extraBody] 模型级额外请求体（JSON 字符串）· 空/未传 → 空串（运行期按空处理）
+        m.setExtraBody(req.extraBody() != null ? req.extraBody() : "");
         m.setEnabled(req.enabled() == null ? Boolean.TRUE : req.enabled());
         m.setCreatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
         if (log.isDebugEnabled()) {
@@ -110,6 +112,8 @@ public class ModelService {
         if (req.cacheWritePricePeak() != null) m.setCacheWritePricePeak(req.cacheWritePricePeak().doubleValue());
         if (req.cacheWritePriceOffpeak() != null) m.setCacheWritePriceOffpeak(req.cacheWritePriceOffpeak().doubleValue());
         if (req.think() != null) m.setThink(req.think());
+        // [2026-10-22 extraBody] PATCH 语义：null = 不改；非 null（含空串清空）才写
+        if (req.extraBody() != null) m.setExtraBody(req.extraBody());
         if (req.enabled() != null) m.setEnabled(req.enabled());
         if (log.isDebugEnabled()) {
             log.debug("[ModelService] update 模型级窗口: model={} maxContextTokens={} (PATCH 语义: 请求 null 不改)",
@@ -142,7 +146,9 @@ public class ModelService {
             m.getCacheReadPricePeak() != null ? BigDecimal.valueOf(m.getCacheReadPricePeak()) : null,
             m.getCacheReadPriceOffpeak() != null ? BigDecimal.valueOf(m.getCacheReadPriceOffpeak()) : null,
             m.getCacheWritePricePeak() != null ? BigDecimal.valueOf(m.getCacheWritePricePeak()) : null,
-            m.getCacheWritePriceOffpeak() != null ? BigDecimal.valueOf(m.getCacheWritePriceOffpeak()) : null);
+            m.getCacheWritePriceOffpeak() != null ? BigDecimal.valueOf(m.getCacheWritePriceOffpeak()) : null,
+            // [2026-10-22 extraBody] 模型级额外请求体（JSON 字符串）原样回显
+            m.getExtraBody());
     }
 
     private static String generateId(String prefix) { return prefix + "-" + UUID.randomUUID().toString().substring(0, 8); }

@@ -39,10 +39,11 @@ const TYPE_OPTIONS: { value: ModelType; label: string }[] = [
 
 export function ModelFormModal({ initial, providerName, onSave, onCancel, onDelete }: ModelFormModalProps) {
   const handleSave = (m: Model) => {
-    // Clean up: trim think (which now also covers extraBody per v1 design)
+    // think 保持原语义（trim）；extraBody 独立通道：trim 空串即「无额外参数」
     onSave({
       ...m,
       think: (m.think ?? '').trim(),
+      extraBody: (m.extraBody ?? '').trim(),
     })
   }
 
@@ -93,21 +94,21 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
             ],
           ],
         },
-        /* 高级 · JSON（隐藏保留：需要时取消注释）
         {
-          title: '高级 · JSON',
+          // [2026-10-22] 模型级「额外请求体」：后端逐键合并进请求体（只增/覆盖同名键，不替换整包）。
+          //   think 字段保持原样（不动），本字段是独立通道。
+          title: '高级 · 额外请求体（extraBody）',
           fields: [
             {
               type: 'json',
-              name: 'think',
-              label: 'think · 思考 / 请求体 JSON',
+              name: 'extraBody',
+              label: 'extraBody · 额外请求体 JSON',
               placeholder: '{"reasoning": true}',
-              hint: 'v1 合一：智谱 {"type":"enabled","clear_thinking":false} · DeepSeek {"reasoning":true} · 其他 {"custom_param":"value"} · 后端按 provider 类型自动拆到 think / extraBody',
+              hint: '按 key 合并进请求体 · 例：DeepSeek {"reasoning":true} · 智谱 {"thinking":{"type":"enabled"}} · 自定义参数直接写 key',
               rows: 3,
             },
           ],
         },
-        */
         {
           title: '行为',
           fields: [

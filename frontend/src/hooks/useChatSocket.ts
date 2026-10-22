@@ -1,6 +1,7 @@
 import { useEffect, useRef } from 'react'
 import { Client, type StompSubscription } from '@stomp/stompjs'
-import { useChatStore } from '../stores/chatStore'
+import { useChatStore, type PermissionRequestItem } from '../stores/chatStore'
+import { sessionApi, type PermissionEventPayload } from '../api/sessions'
 import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
@@ -143,6 +144,60 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
  *  模块级（非 hook ref）：subscribePermTopics 是模块级函数；生命周期随 perm 订阅（hook 内增删清理）。 */
 const bridgeDismissSubs = new Map<string, StompSubscription>()
 
+/**
+ * 权限事件 → 入队项（[2026-10-22] 从 subscribePermTopics 内联提取）。
+ *
+ * <p>STOMP `/permission-requests` 事件与会话状态 `pendingPermissions` **同形**，两处共用同一归一化，
+ * 避免「补拉路径」与「实时路径」字段漂移（bridge 的 displayInput / suggestions 归一 / leader inbox
+ * 都是易漏点）。未入队 → AskUserForm 拿不到 questions、或「始终允许」永远不出现。
+ */
+function toPermissionItem(
+  raw: PermissionEventPayload,
+  sid: string,
+  kind: PermissionRequestItem['kind'],
+): PermissionRequestItem {
+  // C1 · leader inbox：reason.reason==='leader_inbox'；worker 名优先取后端补的 workerName
+  const isLeaderInbox = raw.reason?.reason === 'leader_inbox'
+  const workerName = isLeaderInbox ? (raw.workerName ?? extractWorkerName(raw.description)) : null
+  // bridge 事件字段 = displayInput（后端 BridgePermissionRequestEvent），非 toolInput
+  const toolInput = kind === 'bridge' ? (raw.displayInput ?? raw.toolInput) : raw.toolInput
+  const suggestions = Array.isArray(raw.suggestions) && raw.suggestions.length > 0
+    ? (raw.suggestions as PermissionRequestItem['suggestions']) : null
+  return {
+    kind, sessionId: sid, requestId: raw.requestId,
+    // [问答收敛] 保留工具调用 id（回答后给对应卡片打「已回答 · 等待结果」）
+    toolUseId: raw.toolUseId ?? null,
+    toolName: raw.toolName ?? '',
+    description: raw.description, reason: raw.reason, warning: raw.warning, toolInput,
+    isLeaderInbox, workerName, workerBadgeColor: raw.workerBadgeColor ?? null,
+    timestampMs: raw.timestampMs, suggestions,
+  }
+}
+
+/**
+ * 会话状态补拉 · 对齐 dsh「宿主在每次打开/切换会话时重放未回答的 pending」（stable rpcId replay）。
+ *
+ * <p>为什么必须有：权限请求本体是**一次性 STOMP 推送**。请求到达时若该会话不在前端订阅集合
+ * （非当前会话且无活跃流），事件被静默丢弃 —— 用户看不到黄点、切回也不会弹
+ * （实测 AskUserQuestion 在 sess-df8b40c2 等 12 分钟后被 Deny）。这里按 requestId 去重后补入队。
+ *
+ * <p>老后端无该端点 → 静默（catch 为空）；空列表 → 无变化（该会话本就没有待回答交互）。
+ */
+function replayPendingPermissions(sid: string): void {
+  void sessionApi.state(sid)
+    .then((st) => {
+      const list = st?.pendingPermissions ?? []
+      if (list.length === 0) return
+      const store = useChatStore.getState()
+      for (const raw of list) {
+        if (!raw?.requestId) continue
+        if (store.permissionQueue.some((r) => r.requestId === raw.requestId)) continue
+        store.enqueuePermission(toPermissionItem(raw, sid, 'message'))
+      }
+    })
+    .catch(() => { /* 老后端无该端点 / 网络失败 → 静默（不影响实时通道） */ })
+}
+
 /** 订阅单会话 3 种权限 topics（message/bridge/channel）→ 入队。
  *  多会话各订阅各的；弹窗由 App 过滤当前会话（非本会话不默认弹，侧栏黄点提示）。
  *  导出仅供测试直接驱动（归一化字段清单是本模块唯一的入队点，改错无编译期约束）。 */
@@ -159,17 +214,7 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
       const st = useChatStore.getState()
       // TEMP 诊断（联调 §38）：确认权限事件到达 + 订阅键（sessionId 匹配检查）
       console.debug(`[perm] ${kind} event on ${topic}`, { requestId: raw.requestId, toolName: raw.toolName, sessionId: sid })
-      // C1 · leader inbox 请求：reason.reason==='leader_inbox'（后端 LeaderPermissionConfirmBridge 推送）；
-      //   worker 名优先取后端补的 workerName，未补前从 description 提取（不保证存在）
-      const isLeaderInbox = raw.reason?.reason === 'leader_inbox'
-      const workerName = isLeaderInbox ? (raw.workerName ?? extractWorkerName(raw.description)) : null
-      // bridge 事件字段 = displayInput（后端 BridgePermissionRequestEvent），非 toolInput —— 不修则
-      //   AskUserForm extractQuestions 拿不到 questions → 回退「需要权限」通用弹窗（双弹窗根因之一）
-      const toolInput = kind === 'bridge' ? (raw.displayInput ?? raw.toolInput) : raw.toolInput
-      // [批 A3] suggestions 原样透传（后端已按 CC 形状序列化）：此前未入队 → 弹窗拿不到
-      //   一键授权建议（「始终允许」永远不出现）。空数组/null 归一为 null（弹窗侧判空不渲染）。
-      const suggestions = Array.isArray(raw.suggestions) && raw.suggestions.length > 0 ? raw.suggestions : null
-      st.enqueuePermission({ kind, sessionId: sid, requestId: raw.requestId, toolName: raw.toolName, description: raw.description, reason: raw.reason, warning: raw.warning, toolInput, isLeaderInbox, workerName, workerBadgeColor: raw.workerBadgeColor ?? null, timestampMs: raw.timestampMs, suggestions })
+      st.enqueuePermission(toPermissionItem(raw, sid, kind))
       console.debug('[perm] queued, queueLen=', st.permissionQueue.length, raw.requestId)
       // 后端无限等待用户响应（2026-08-24 移除 30s 自动超时；用户取消会话 → user_abort）
     })
@@ -216,11 +261,27 @@ export function useChatSocket(
    *   重拉尾页补对账层（即时层 = 同点推送的 message.insert boundary 行；同 id 幂等收敛不重复）。
    *   App 侧注册既有 handleReconnectReload（复用同一重拉实现，不新写一套）。 */
   onCompactedReload?: (sid: string) => void,
+  /**
+   * [会话状态同步 · 2026-10-22] 需要**实时**监听权限/提问的会话 id 集合（通常 = 会话列表）。
+   *
+   * <p>WHY：权限请求只推 `/topic/sessions/{sid}/permission-requests`。原实现只订阅「当前会话 +
+   * 有活跃流的会话」⇒ 其它会话的请求到达时无订阅者、事件被丢弃 → 侧栏没有黄点、切回也不弹
+   * （实测 AskUserQuestion 在 sess-df8b40c2 等 12 分钟后被 Deny）。
+   * 这里对名单内每个会话补订阅**一个** message topic（bridge/channel 仍按需），开销 = 会话数 × 1。
+   *
+   * <p>缺省 `[]` → 只监听当前会话（旧行为，测试/嵌入方零改动）。
+   */
+  knownSessionIds?: string[],
 ) {
   const clientRef = useRef<Client | null>(null)
   const setConnection = useChatStore((s) => s.setConnection)
   /** 当前会话团队 leadSessionId（STOMP 订阅键 · TeamPanel 从 teamContext 写入） */
   const leadSessionId = useTeamStore((s) => s.leadSessionId)
+  // [会话状态同步] 已知会话的 message 权限 topic 订阅（每个会话仅 1 个 topic · 供侧栏黄点）
+  const watchSubsRef = useRef<Map<string, StompSubscription>>(new Map())
+  /** 名单经 ref 读最新值（onConnect 闭包用） */
+  const knownSessionIdsRef = useRef<string[]>(knownSessionIds ?? [])
+  knownSessionIdsRef.current = knownSessionIds ?? []
   // 多会话订阅：sessionId -> stream sub / permission subs（activeStreams 增删时动态增删）
   const activeStreamsRef = useRef(activeStreams)
   activeStreamsRef.current = activeStreams
@@ -414,6 +475,28 @@ export function useChatSocket(
    * 当前会话常驻订阅后：后端主动推流（cron/Ask 续跑）前端实时收到。complete 到达时
    * onSessionDone 幂等移除 activeStreams（不在则 no-op），常驻订阅保留供下次主动推流。
    */
+  /**
+   * [会话状态同步] 为「已知会话」补订 `/permission-requests`（只 message 一种 topic，幂等）。
+   *
+   * <p>当前会话已由 {@link subscribePermTopics} 订阅 3 种 topic（permSubsRef 有记录）→ 跳过；
+   * 其余会话只订 1 个，用于**实时黄点**。断线由 onConnect 重建（map 在 clearSubscriptions 清空）。
+   */
+  function syncKnownPermSubscriptions(client: Client): void {
+    if (!client?.connected) return
+    for (const sid of knownSessionIdsRef.current) {
+      if (!sid || permSubsRef.current.has(sid) || watchSubsRef.current.has(sid)) continue
+      watchSubsRef.current.set(sid, client.subscribe(`/topic/sessions/${sid}/permission-requests`, (msg) => {
+        try {
+          const raw = JSON.parse(msg.body) as PermissionEventPayload
+          if (!raw?.requestId) return
+          const st = useChatStore.getState()
+          if (st.permissionQueue.some((r) => r.requestId === raw.requestId)) return
+          st.enqueuePermission(toPermissionItem(raw, sid, 'message'))
+        } catch { /* 非法载荷忽略 */ }
+      }))
+    }
+  }
+
   function ensureSessionStream(client: Client, sid: string) {
     if (!sid || streamSubsRef.current.has(sid)) return
     const topic = `/topic/sessions/${sid}/stream`
@@ -431,6 +514,7 @@ export function useChatSocket(
       sessionScopedSubsRef.current = []
       sessionLevelSubsRef.current.clear()
       streamSubsRef.current.clear()
+      watchSubsRef.current.clear() // [会话状态同步] 断线后订阅随连接失效，map 须清空以便重订
       permSubsRef.current.clear()
       bridgeDismissSubs.clear()
       teamSubsRef.current = null
@@ -452,6 +536,8 @@ export function useChatSocket(
       // 当前会话 scoped 订阅（用 ref 读最新 sessionId）
       const sid = sessionIdRef.current
       if (sid) {
+        // [会话状态同步] 重连后同样补拉当前会话的 pending（断线期间到达的请求不会重放）
+        replayPendingPermissions(sid)
         sessionScopedSubsRef.current = subscribeCurrentSessionScoped(client, sid)
         // 会话级常驻订阅（token-warning / queue）
         subscribeSessionLevel(client, sid)
@@ -464,6 +550,8 @@ export function useChatSocket(
       }
       // 多会话订阅：对每个活跃会话订阅 stream + 权限 topics（动态增删 · 见 syncAllStreams）
       syncAllStreams(client)
+      // [会话状态同步] 连接建立/重连 → 为已知会话补订 permission-requests（实时黄点）
+      syncKnownPermSubscriptions(client)
       // 后台任务 SDK 事件通道（/topic/tasks）：drain 出站为 JSON 数组；tool_use_summary 为单对象
       client.subscribe(TASKS_TOPIC, (msg) => {
         const raw = JSON.parse(msg.body)
@@ -531,8 +619,19 @@ export function useChatSocket(
     subscribeStatusTopic(client, sessionId)
     // cron/Ask 实时流：新会话 stream topic 常驻订阅
     ensureSessionStream(client, sessionId)
+    // [会话状态同步 · dsh host replay 等价物] 切回会话时补拉未回答的 pending 权限/提问：
+    //   请求若在该会话「不在订阅集合」期间到达，事件已丢、后端仍在等 → 只有状态接口能找回。
+    //   该会话没有 pending → 列表为空、无任何变化（对齐「没有 ask 时也自动变化」的语义）。
+    replayPendingPermissions(sessionId)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionId])
+
+  // [会话状态同步] 会话列表变化 → 为新增会话补订 permission-requests（幂等；已订阅会话跳过）
+  useEffect(() => {
+    const client = clientRef.current
+    if (client?.connected) syncKnownPermSubscriptions(client)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [knownSessionIds])
 
   // activeStreams 变化（新会话发送登记 / 会话 complete 移除）→ 动态增删 stream + 权限订阅
   useEffect(() => {

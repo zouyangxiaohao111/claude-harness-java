@@ -441,7 +441,8 @@ class ExecAgentHookSemanticsTest {
         //   enabled + model 匹配 provider → ProviderConfig(baseUrl, 解密 apiKey) → loop 真实可用。
         ModelDto model = new ModelDto("m1", DEFAULT_FAST_MODEL, null, null, null, null,
             null, null, null, null, true, null,
-            null, null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null,
+            null /* extraBody（V104） */);
         ProviderDto provider = new ProviderDto("p1", "provider-1", ProviderType.openai_compatible,
             "http://llm.local", null, Map.of(), true, List.of(model), null, null);
         ProviderService ps = new ProviderService() {

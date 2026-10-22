@@ -34,3 +34,8 @@ npm-debug.log*
 !extension/popup.html
 .claude/worktrees/
 scripts/.minio-credentials.json
+
+# Playwright e2e
+/test-results/
+/playwright-report/
+/blob-report/

@@ -23,6 +23,13 @@ public class ModelRecord {
     private Double temperature;
     private Double topP;
     private String think;
+    /**
+     * 模型级额外请求体（JSON 对象字符串）· V104 列 extra_body。
+     *
+     * <p>请求构造时**逐键合并**进 body（只增/覆盖同名键，不替换整包）；空 / 非对象 JSON
+     * → 视为无额外参数（fail-soft，不阻断请求）。与 {@code think} 字段互不影响。
+     */
+    private String extraBody;
     private Boolean enabled;
     private String createdAt;
     private Integer maxContextTokens;
@@ -91,6 +98,7 @@ public class ModelRecord {
         m.setCacheWritePricePeak(cacheWritePricePeak);
         m.setCacheWritePriceOffpeak(cacheWritePriceOffpeak);
         m.setThink(think);
+        m.setExtraBody(extraBody);
         m.setEnabled(enabled);
         m.setCreatedAt(createdAt);
         return m;
@@ -120,6 +128,7 @@ public class ModelRecord {
         r.setCacheWritePricePeak(m.getCacheWritePricePeak());
         r.setCacheWritePriceOffpeak(m.getCacheWritePriceOffpeak());
         r.setThink(m.getThink());
+        r.setExtraBody(m.getExtraBody());
         r.setEnabled(m.getEnabled());
         r.setCreatedAt(m.getCreatedAt());
         return r;
@@ -147,6 +156,8 @@ public class ModelRecord {
     public void setTopP(Double topP) { this.topP = topP; }
     public String getThink() { return think; }
     public void setThink(String think) { this.think = think; }
+    public String getExtraBody() { return extraBody; }
+    public void setExtraBody(String extraBody) { this.extraBody = extraBody; }
     public Boolean getEnabled() { return enabled; }
     public void setEnabled(Boolean enabled) { this.enabled = enabled; }
     public String getCreatedAt() { return createdAt; }

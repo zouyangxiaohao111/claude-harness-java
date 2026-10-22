@@ -99,6 +99,11 @@ export interface PermissionRequestItem {
   isLeaderInbox?: boolean
   /** worker 名（后端补 workerName 字段后透传；未补前从 description 提取，可能为空）· C1 */
   workerName?: string | null
+  /**
+   * [2026-10-22 问答收敛] 事件携带的工具调用 id（requestId 通常相同）。
+   * 回答后据此给对应工具卡打「已回答 · 等待结果」标记 —— tool_result 事件缺失时卡片不会停在「执行中」。
+   */
+  toolUseId?: string | null
   /** 服务端推送时间戳（毫秒 · 对齐 MessagePermissionRequestEvent.timestampMs · 等待时长基准） */
   timestampMs?: number
   /** worker 徽标颜色（leader inbox 请求 · 后端 #132 补 workerBadgeColor · 可 null 回落默认） */
@@ -190,6 +195,15 @@ export interface ChatState {
   addToolCall: (sessionId: string, assistantMessageId: string, tool: ToolCallDto) => void
   /** 契约 #6：tool_result 按 toolCallId 匹配卡片填 result/isError（跨块遍历） */
   fillToolResult: (sessionId: string, toolCallId: string, result: string | null, isError: boolean | null) => void
+  /**
+   * [2026-10-22 问答收敛 · 对齐 dsh question/resolved] 标记某工具调用「问答已回答、等待工具结果」。
+   * 卡片据此显示「已回答 · 等待结果」而不是继续转圈；`tool_result` 到达时自动清除。
+   */
+  markToolAnswered: (sessionId: string, toolCallId: string) => void
+  /** 清除「已回答」标记（tool_result 到达 / 手动收敛时调用；幂等） */
+  clearToolAnswered: (toolCallId: string) => void
+  /** toolCallId → { sessionId, ts } · 已回答但结果未到的工具调用 */
+  answeredToolCalls: Record<string, { sessionId: string; ts: number }>
   /** message.usage（消息级完成、非 turn 终态）：按 assistantMessageId 定位块挂 usage/上下文快照
    *  （lastIndexOf 取最新轮）；找不到 no-op（纯工具轮无块 → 由下一条 assistant / complete 兜底） */
   applyMessageUsage: (sessionId: string, assistantMessageId: string | null | undefined, meta?: {
@@ -267,6 +281,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
 
   conversationIds: {},
   permissionQueue: [],
+  // [2026-10-22 问答收敛] 已回答、等待 tool_result 的工具调用（toolCallId → 会话/时间）
+  answeredToolCalls: {},
   connection: 'idle',
   agentStatus: 'idle',
   serverRunning: {},   // [C6] sessionId -> 服务端 run 存活（键缺失 = 未查过/未在跑 ⇒ 一律 false）
@@ -451,8 +467,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     return { streams: { ...st.streams, [sessionId]: next } }
   }),
   fillToolResult: (sessionId, toolCallId, result, isError) => set((st) => {
+    // [2026-10-22 问答收敛] 工具结果到达 ⇒ 清除「已回答」标记（无论块是否还在：块已收口时也要清）
+    let answeredCleared = st.answeredToolCalls
+    if (st.answeredToolCalls[toolCallId] != null) {
+      answeredCleared = { ...st.answeredToolCalls }
+      delete answeredCleared[toolCallId]
+    }
     const blocks = st.streams[sessionId]
-    if (!blocks) return st
+    if (!blocks) return answeredCleared === st.answeredToolCalls ? st : { answeredToolCalls: answeredCleared }
     let changed = false
     const next = blocks.map((b) => {
       const ti = b.toolCalls.findIndex((t) => t.id === toolCallId)
@@ -462,7 +484,18 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       tc[ti] = { ...tc[ti], result: result ?? tc[ti].result, isError: isError ?? tc[ti].isError }
       return { ...b, toolCalls: tc }
     })
-    return changed ? { streams: { ...st.streams, [sessionId]: next } } : st
+    if (!changed) return answeredCleared === st.answeredToolCalls ? st : { answeredToolCalls: answeredCleared }
+    return { streams: { ...st.streams, [sessionId]: next }, answeredToolCalls: answeredCleared }
+  }),
+  markToolAnswered: (sessionId, toolCallId) => set((st) => {
+    if (!toolCallId) return st
+    return { answeredToolCalls: { ...st.answeredToolCalls, [toolCallId]: { sessionId, ts: Date.now() } } }
+  }),
+  clearToolAnswered: (toolCallId) => set((st) => {
+    if (toolCallId == null || st.answeredToolCalls[toolCallId] == null) return st
+    const next = { ...st.answeredToolCalls }
+    delete next[toolCallId]
+    return { answeredToolCalls: next }
   }),
   applyMessageUsage: (sessionId, assistantMessageId, meta = {}) => set((st) => {
     // message.usage（消息级完成）：按块 id 定位挂 usage/上下文快照。lastIndexOf 取最新轮；

@@ -277,7 +277,10 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
   //   settled 历史里 result==null 且非 error = 孤儿(工具被取消/中断/结果缺失) → 显示"已中断"，不永久转圈。
   //   runningFront(转后台按钮) 仅 live 卡有效 —— settled 孤儿不再触发 tasksApi.list 轮询/不再有陈旧"转后台"
   //   （同时消除"任务已结束仍可点转后台→后端 400 静默"的陈旧卡）。
-  const interrupted = !hasResult && !tool.isError && !live
+  // [2026-10-22 问答收敛] 已回答、等待结果：AskUserQuestion 类工具回答后、tool_result 到达前，
+  //   卡片显示「已回答 · 等待结果」而不是「执行中」（事件缺失时也不再判为「已中断」）。
+  const answered = useChatStore((s) => (tool.id ? s.answeredToolCalls[tool.id] != null : false))
+  const interrupted = !hasResult && !tool.isError && !live && !answered
   const runningFront = live && !hasResult && !tool.isError
   const [bgTaskId, setBgTaskId] = useState<string | null>(null)
   useEffect(() => {
@@ -315,7 +318,7 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
           </span>
         )}
         <span className={`status ${tool.isError ? 'error' : hasResult ? 'done' : interrupted ? 'interrupted' : 'running'}`}>
-          {tool.isError ? '失败' : hasResult ? '已完成' : interrupted ? '已中断' : '执行中'}
+          {tool.isError ? '失败' : hasResult ? '已完成' : answered ? '已回答 · 等待结果' : interrupted ? '已中断' : '执行中'}
         </span>
         {bgTaskId && (
           <span role="button" className="tc-bg" onClick={(e) => { e.stopPropagation(); e.preventDefault(); void doBackground() }} title="转到后台继续运行（Ctrl+B）">
@@ -928,18 +931,33 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     //   streamOrder 变(块增删)才重算;content 逐帧 append 时 useChatStore.getState() 读到最新 userMessageId,
     //   但本 memo 不会因 content 重跑(依赖只有 messages/streamIds/sessionId)。
     const live = sessionId ? (useChatStore.getState().streams[sessionId] ?? []) : []
-    const arr: { key: string; items: ({ kind: 'msg'; m: ChatMessageDto } | { kind: 'blk'; sid: string; blockId: string })[] }[] = []
+    /**
+     * [2026-10-22 结构对齐 dsh · anchorSeq 排序] 每个渲染项带单调 anchorSeq，渲染时**统一按序号排序**，
+     * 不再让「组首次出现的位置」决定行序（dsh chat-snapshot-builder.ts:135 orderedVisible 同款）。
+     *
+     * <p>WHY：原实现按 userMessageId 建组、组序 = key 首次出现位置。流式块冻结的 userMessageId 一旦
+     * 指向上一轮（本轮 user 尚未落历史 / 后台通知唤醒），整块就被插进那段历史中间 —— 用户实测
+     * 「实时打字插在历史工具消息之前，后面又冒出更晚的历史」。
+     * 序号规则：历史 = 过滤后序列的递增序号；流式块 = LIVE_SEQ_BASE + 块序（恒大于任何历史）；
+     * err 卡片 = 所属组最大序号 + 0.5（紧跟该组）。prepend 更早历史后序号重算，相对顺序天然正确。
+     */
+    type RowItem = { kind: 'msg'; m: ChatMessageDto } | { kind: 'blk'; sid: string; blockId: string }
+    const arr: { key: string; items: { item: RowItem; seq: number }[]; maxSeq: number }[] = []
     const order = new Map<string, number>()
-    const push = (key: string, item: (typeof arr)[number]['items'][number]) => {
+    const push = (key: string, item: RowItem, seq: number) => {
       let idx = order.get(key)
-      if (idx === undefined) { idx = arr.length; order.set(key, idx); arr.push({ key, items: [] }) }
-      arr[idx].items.push(item)
+      if (idx === undefined) { idx = arr.length; order.set(key, idx); arr.push({ key, items: [], maxSeq: seq }) }
+      arr[idx].items.push({ item, seq })
+      if (seq > arr[idx].maxSeq) arr[idx].maxSeq = seq
     }
+    /** 流式块序号基准：远大于历史序号（历史条数上限 1e9 不可能达到）⇒ 进行中的输出恒在末尾。 */
+    const LIVE_SEQ_BASE = 1_000_000_000
     // [brief-align] 含 SendUserMessage 的轮次里丢掉冗余助手正文 · 对齐 CC components/Messages.tsx:169-206
     //   dropTextInBriefTurns（transcript 模式绕过：本仓轨迹 tab 直读 store，不经本函数 —— 同 CC）。
     // [sm-boundary-reload] 轮键在序列上前向解析（与 capTailTurns 前向趟同源）：无锚行（compact boundary
     //   等）归组到【最近前置有锚行】的键 —— 否则 boundary 自成一键、被排到本轮流式块之后（分割线错位）。
     let anchor: string | null = null
+    let historySeq = 0
     for (const m of dropTextInBriefTurns(messages)) {
       // 轮归属与过滤判据的【唯一真源】= stores/messageTurns（与 chatStore 的窗口裁剪同源，防两处漂移）。
       //   原实现把三条 continue 与轮键内联在此、store 另写一份 —— 一旦漂移，「渲染出来的轮」与
@@ -947,17 +965,20 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (!isDialogueRow(m)) continue
       // ⚠️ 只被【有锚行】推进（无锚行不得把自己的键当锚传给后面 —— 与 turnKeyOf 的兜底语义配对）
       if (m.userMessageId) anchor = m.userMessageId
-      push(turnKeyOf(m, anchor), { kind: 'msg', m })
+      // 序号 = 过滤后序列的递增位次（prepend 更早历史后重算，相对顺序不变）
+      push(turnKeyOf(m, anchor), { kind: 'msg', m }, ++historySeq)
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append
     //   后到达的 chunk 覆盖。缺失（旧块/未带）回落 assistantMessageId 独立流。
     //   行条目只带 (sid, blockId) —— 具体内容由每行 StreamBlockRow 自订 selectStreamBlock。
-    for (const blockId of streamIds) {
+    for (let i = 0; i < streamIds.length; i++) {
+      const blockId = streamIds[i]
       const b = live.find((x) => x.assistantMessageId === blockId)
       if (!b) continue
       const key = b.userMessageId ?? b.assistantMessageId ?? 'stream'
-      push(key, { kind: 'blk', sid: sessionId, blockId })
+      // [anchorSeq] 流式块序号恒大于所有历史（不再依赖 userMessageId 首次出现的位置）
+      push(key, { kind: 'blk', sid: sessionId, blockId }, LIVE_SEQ_BASE + i)
     }
     return arr
   }, [messages, streamIds, sessionId])
@@ -966,20 +987,24 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   //     更早历史 = 顶部显式按钮（hasMore 时）→ onLoadOlder（App 拉前页 prependMessages + commit 后滚高补偿）。----
   // 线性渲染行（保时间序：组内顺序即全局消息序；组尾 err 卡片跟随其组）→ 全量渲染已加载窗口
   const flatRows = useMemo(() => {
+    // [anchorSeq 排序] 收集全部行（含 anchorSeq）→ 统一排序（相等序号按 key 兜底，排序稳定）。
+    //   组结构仅保留 err 卡片归属语义，**不再决定行序**（对齐 dsh orderedVisible）。
     const rows: (
-      | { key: string; kind: 'msg'; m: ChatMessageDto }
-      | { key: string; kind: 'blk'; sid: string; blockId: string }
-      | { key: string; kind: 'err'; err: ApiFlowError }
+      | { key: string; kind: 'msg'; m: ChatMessageDto; seq: number }
+      | { key: string; kind: 'blk'; sid: string; blockId: string; seq: number }
+      | { key: string; kind: 'err'; err: ApiFlowError; seq: number }
     )[] = []
     for (const g of groups) {
       for (const it of g.items) {
-        rows.push(it.kind === 'msg'
-          ? { key: rowKey(it.m.id), kind: 'msg', m: it.m }
-          : { key: it.blockId, kind: 'blk', sid: it.sid, blockId: it.blockId })
+        rows.push(it.item.kind === 'msg'
+          ? { key: rowKey(it.item.m.id), kind: 'msg', m: it.item.m, seq: it.seq }
+          : { key: it.item.blockId, kind: 'blk', sid: it.item.sid, blockId: it.item.blockId, seq: it.seq })
       }
       const gErr = apiErrorMap.get(g.key)
-      if (gErr) rows.push({ key: `err:${g.key}`, kind: 'err', err: gErr })
+      // err 卡片紧跟所属组（组内最大序号 + 0.5，不会越过下一组）
+      if (gErr) rows.push({ key: `err:${g.key}`, kind: 'err', err: gErr, seq: g.maxSeq + 0.5 })
     }
+    rows.sort((a, b) => (a.seq - b.seq) || a.key.localeCompare(b.key))
     return rows
   }, [groups, apiErrorMap, rowKey])
   // 【根因·「加载更早」跳底】原依赖是 [messages[0]?.id]，注释称「会话内容首条 id 变化 → 滚到底」。

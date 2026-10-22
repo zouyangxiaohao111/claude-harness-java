@@ -22,7 +22,25 @@ import java.util.Map;
  *                     <b>敏感头过滤与占位符展开都不在这一层</b>：注入侧统一由
  *                     {@link ProviderHeaderInjector} 单点处理（防御存量脏数据）。
  */
-public record ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders) {
+public record ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders,
+                             Map<String, Object> extraBody) {
+
+    /**
+     * 模型级额外请求体（{@code extraBody}）· 2026-10-22。
+     *
+     * <p>来源：{@code models.extra_body}（JSON 对象字符串，前端「额外请求体」可编辑）。
+     * 语义 = **逐键合并进请求体**（{@code putAdditionalBodyProperty}），只增/覆盖同名键，
+     * ⛔ 不替换整个 body；与系统生成的字段（max_tokens / temperature / reasoning_effort…）
+     * 同名时以本 map 为准。空 map → 无额外参数。
+     */
+    public ProviderConfig {
+        extraBody = extraBody == null ? Map.of() : Map.copyOf(extraBody);
+    }
+
+    /** 兼容构造：无额外请求体（既有 3 参调用点零改动）。 */
+    public ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders) {
+        this(baseUrl, apiKey, extraHeaders, Map.of());
+    }
 
     /**
      * 便捷构造：无自定义 header。

@@ -339,6 +339,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                 //   同源：同一 config.extraHeaders() + 同一谓词 ProviderHeaderInjector.isInjectableHeader）
                 //   ⇒ 探针行 hdrs=0 即指认「这条请求零自定义 header 出去」（fork 家族也走本路径 ⇒ 全覆盖）。
                 ProviderHeaderInjector.injectableCount(config.extraHeaders()));
+            // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖）
+            params = applyExtraBody(params, config);
 
             String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
             if (log.isDebugEnabled()) {
@@ -674,6 +676,8 @@ public class OpenAiSdkProvider implements LlmProvider {
             sdkModelName(modelName), systemPrompt, history, tools,
             null, thinkingDisabled, null, effortValue, null,
             false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
+        // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖）
+        params = applyExtraBody(params, config);
         ChatCompletion resp = client.chat().completions().create(params);
         String content = extractContent(resp);
         List<ToolUseBlock> tools2 = extractToolCalls(resp);
@@ -736,6 +740,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                 //   includeUsage=false / streamingMainChain=false 与原先经 9-param 链式落到 11-param 时的
                 //   取值逐字相同 ⇒ 只多个日志字段，wire 零变化。
                 false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
+            // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖）
+            params = applyExtraBody(params, config);
             ChatCompletion resp = client.chat().completions().create(params);
 
             String content = extractContent(resp);
@@ -832,6 +838,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                 //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
                 false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
             // [WF3-04 explainer] 强制 tool_choice（CC options.tool_choice）→ named function choice
+            // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖；系统 tool_choice 随后覆盖同名键）
+            params = applyExtraBody(params, config);
             params = applyToolChoice(params, options);
             ChatCompletion resp = client.chat().completions().create(params);
 
@@ -912,6 +920,8 @@ public class OpenAiSdkProvider implements LlmProvider {
                 // [D 可观测性] 同上：显式走 12-param 主实现并带注入 header 数（原为经 9-param 链式落到
                 //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
                 false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
+            // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖；系统 tool_choice 随后覆盖同名键）
+            params = applyExtraBody(params, config);
             params = applyToolChoice(params, options);
             ChatCompletion resp = client.chat().completions().create(params);
 
@@ -1004,6 +1014,35 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /** [WF3-04 explainer] tool_choice 投影 · CC {type:'tool', name} → OpenAI named function choice。 */
+    /**
+     * [2026-10-22] 把模型级「额外请求体」（{@code models.extra_body}）逐键合并进请求参数。
+     *
+     * <p>语义 = {@code putAdditionalBodyProperty}：<b>只增/覆盖同名键，不替换整个 body</b>。
+     * 与系统生成的字段（max_tokens / temperature / reasoning_effort / response_format …）同名时
+     * 以模型配置为准（用户显式定制优先）。空 map / null config → 原样返回（零开销、wire 不变）。
+     *
+     * <p>为什么放在 build 之后而不是 buildRequestParams 内部：buildRequestParams 有 5 个重载、
+     * 多个调用点，加形参会连锁改签名；{@code toBuilder()} 是 SDK 官方支持的增量修改口。
+     *
+     * @param params 已构建的请求参数（可 null）
+     * @param config 模型配置（其 {@code extraBody} 来自 models.extra_body）
+     * @return 合并后的参数；无额外字段时返回原引用
+     */
+    static ChatCompletionCreateParams applyExtraBody(ChatCompletionCreateParams params, ProviderConfig config) {
+        if (params == null || config == null || config.extraBody() == null || config.extraBody().isEmpty()) {
+            return params;
+        }
+        ChatCompletionCreateParams.Builder b = params.toBuilder();
+        for (Map.Entry<String, Object> e : config.extraBody().entrySet()) {
+            b.putAdditionalBodyProperty(e.getKey(), JsonValue.from(e.getValue()));
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[OpenAiSdkProvider] 合并模型级 extraBody: keys={}（只增/覆盖，不替换整包）",
+                config.extraBody().keySet());
+        }
+        return b.build();
+    }
+
     private static ChatCompletionCreateParams applyToolChoice(
             ChatCompletionCreateParams params, LlmProvider.ChatRequestOptions options) {
         LlmProvider.ChatRequestOptions.ToolChoice tc = options != null ? options.toolChoice() : null;

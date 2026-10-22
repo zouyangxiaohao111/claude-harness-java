@@ -966,7 +966,10 @@ function App() {
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
   // [sm-boundary-reload] onCompactedReload 注册同一 handleReconnectReload（复用既有重拉实现，不新写一套）：
   //   压缩落库成功（complete.compacted=true）→ finalize 后收尾重拉尾页补对账层（即时层 = message.insert 插行）。
-  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload, handleReconnectReload)
+  // [会话状态同步] 实时监听「所有已知会话」的权限/提问（不止当前会话）——否则别的会话发起的
+  //   AskUserQuestion 到达时无订阅者、事件被丢弃（侧栏无黄点，切回也不弹）。
+  const knownSessionIds = useMemo(() => storeSessions.map((s) => s.id), [storeSessions])
+  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload, handleReconnectReload, knownSessionIds)
 
   // ---- away-summary：blur 5min 触发，REST 摘要回插为系统消息 ----
   useAwaySummary(activeSessionId, (text) => {
@@ -1966,12 +1969,17 @@ function App() {
               const targetSession = currentPermission.sessionId ?? activeSessionId
               // permissionUpdates 仅「一键授权」档位携带（原样回传后端 suggestions）；允许/拒绝为 undefined
               if (clientRef.current) sendPermissionResponse(clientRef.current, targetSession, currentPermission.kind, id, d, { answers, annotations, permissionUpdates })
+              // [2026-10-22 问答收敛] 已回答 → 给对应工具卡打「已回答 · 等待结果」标记；
+              //   tool_result 到达时由 fillToolResult 自动清除（事件缺失时不再无限「执行中」）
+              useChatStore.getState().markToolAnswered(targetSession, currentPermission.toolUseId ?? id)
               dequeuePermission(id)
             }}
             onAbort={() => {
               // 中止权限请求（对齐 CC Ctrl+C onReject · 用户放弃决策 → deny + dequeue，解除 worker 等待）
               const targetSession = currentPermission.sessionId ?? activeSessionId
               if (clientRef.current) sendPermissionResponse(clientRef.current, targetSession, currentPermission.kind, currentPermission.requestId, 'deny', {})
+              // [问答收敛] 中止/拒绝同样要收敛卡片状态（否则卡片停在「执行中」）
+              useChatStore.getState().markToolAnswered(targetSession, currentPermission.toolUseId ?? currentPermission.requestId)
               dequeuePermission(currentPermission.requestId)
             }}
           />

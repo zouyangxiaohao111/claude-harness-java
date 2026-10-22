@@ -64,6 +64,13 @@ public class Model {
      */
     private Double cacheWritePriceOffpeak;
     private String think;
+    /**
+     * 模型级额外请求体（JSON 对象字符串）· models.extra_body（V104）。
+     *
+     * <p>构造 LLM 请求时逐键合并进 body（只增/覆盖同名键，不替换整包）；空/非对象 → 无额外参数。
+     * 与 {@link #think} 互不影响（think 保持原语义）。
+     */
+    private String extraBody;
     private Boolean enabled;
     private String createdAt;
 
@@ -107,6 +114,8 @@ public class Model {
     public void setCacheWritePriceOffpeak(Double cacheWritePriceOffpeak) { this.cacheWritePriceOffpeak = cacheWritePriceOffpeak; }
     public String getThink() { return think; }
     public void setThink(String think) { this.think = think; }
+    public String getExtraBody() { return extraBody; }
+    public void setExtraBody(String extraBody) { this.extraBody = extraBody; }
     public Boolean getEnabled() { return enabled; }
     public void setEnabled(Boolean enabled) { this.enabled = enabled; }
     public String getCreatedAt() { return createdAt; }

@@ -58,6 +58,12 @@ export interface Model {
   temperature: number | null
   topP: number | null
   think: string | null
+  /**
+   * 模型级「额外请求体」（JSON 对象字符串 · models.extra_body，V104）。
+   * 后端构造请求时逐键合并进 body（只增/覆盖同名键，不替换整包）；空 = 无额外参数。
+   * 与 think 互不影响。
+   */
+  extraBody?: string | null
   enabled: boolean
   /** 模型级上下文窗口（models.max_context_tokens 列 · 影响压缩阈值计算） */
   maxContextTokens: number | null
@@ -75,6 +81,8 @@ export interface CreateModelRequest {
   temperature?: number | null
   topP?: number | null
   think?: string | null
+  /** 模型级额外请求体（JSON 对象字符串 · models.extra_body）· 逐键合并进请求体 */
+  extraBody?: string | null
   enabled?: boolean
 }
 
@@ -89,6 +97,8 @@ export interface UpdateModelRequest {
   temperature?: number | null
   topP?: number | null
   think?: string | null
+  /** 模型级额外请求体（JSON 对象字符串 · PATCH 语义：null 不更新，空串显式清空） */
+  extraBody?: string | null
   enabled?: boolean
   // tag 锁定：不在此
 }

@@ -14,7 +14,9 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import jakarta.annotation.PostConstruct;
+import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Map;
 
 /**
  * 共享配置解析器 · modelName → (ProviderConfig, providerType) 单一来源。
@@ -118,8 +120,12 @@ public class ModelConfigResolver {
         // [provider-custom-headers 任务 6] extraHeaders 随 ProviderConfig 一起流动（配置期已知，
         //   与 baseUrl/apiKey 同源）。DB 列是 JSON 字符串 → 过 deserializeHeaders 转 Map；未配置 → null。
         //   注入侧由 ProviderHeaderInjector 单点展开/过滤（本处不做校验）。
+        // [2026-10-22 extraBody 打通] models.extra_body（JSON 对象字符串）→ ProviderConfig.extraBody。
+        //   此前该列没有任何 provider 读取（只存不读），前端填了不生效。解析失败/非对象 → 空 map
+        //   （fail-soft：不阻断请求，只记 warn）。
+        Map<String, Object> extraBody = parseExtraBody(model.getExtraBody(), modelName);
         return new ResolvedModel(new ProviderConfig(provider.getBaseUrl(), rawKey,
-            ProviderService.deserializeHeaders(provider.getExtraHeaders())), providerType);
+            ProviderService.deserializeHeaders(provider.getExtraHeaders()), extraBody), providerType);
     }
 
     /**
@@ -292,11 +298,16 @@ public class ModelConfigResolver {
             //   "provider/model"，ModelPickerModal.tsx:115 fullName=providerName/modelName）
             ModelRecord byName = ModelNameResolver.resolve(modelMapper, providerMapper, raw);
             if (byName != null && Boolean.TRUE.equals(byName.getEnabled())) {
+                // [2026-10-22 绑定不漂移] 返回**全名**（provider/model）而不是裸名：
+                //   下游（VisionAnalyzeTool / 档位 config / 别名展开）会再解析一次，裸名走「按 name
+                //   取第一条」→ 多 provider 同名时换 provider，或（本批 fail-loud 之后）直接匹配失败。
+                //   实测：vision_analyze 报「视觉模型 'deepseek-flash' 无匹配的 enabled provider/apiKey」。
+                String full = ModelNameResolver.toFullName(providerMapper, byName);
                 if (log.isDebugEnabled()) {
                     log.debug("[ModelConfigResolver] settings 档位模型全名反查命中: raw={} → name={}（[W6-1][FN2] 全名反查唯一路径）",
-                        raw, byName.getName());
+                        raw, full);
                 }
-                return byName.getName();
+                return full;
             }
             if (log.isDebugEnabled()) {
                 log.debug("[ModelConfigResolver] settings 档位模型 {} 未命中 enabled model，返回 null（回落默认，[W6-1][FN2]）",
@@ -385,5 +396,40 @@ public class ModelConfigResolver {
     /** models.name 精确匹配 enabled model · W1-2 统一走全名解析器（providerName/modelName 联合查, 无 / 回退按 name 查第一条）。 */
     private ModelRecord findEnabledModelByName(String modelName) {
         return ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+    }
+
+    /** extra_body 解析用 Jackson（静态 · 与 PromptCaching 等同类工具类风格一致）。 */
+    private static final com.fasterxml.jackson.databind.ObjectMapper EXTRA_BODY_JSON =
+        new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /**
+     * 解析 {@code models.extra_body}（JSON 对象字符串）→ 请求体额外字段 map · 2026-10-22。
+     *
+     * <p>fail-soft：空 / 非对象 / 非法 JSON → 空 map + warn（绝不阻断请求）。
+     * 值为任意 JSON 值（布尔/数字/字符串/对象/数组），由 provider 侧原样放进请求体。
+     *
+     * @param json      models.extra_body 列值（可为 null/空白）
+     * @param modelName 用于日志定位的模型名（全名）
+     * @return 有序 map（保持 JSON 书写顺序，便于排查）
+     */
+    @SuppressWarnings("unchecked")
+    private static Map<String, Object> parseExtraBody(String json, String modelName) {
+        if (json == null || json.isBlank()) {
+            return Map.of();
+        }
+        try {
+            Object parsed = EXTRA_BODY_JSON.readValue(json, Object.class);
+            if (!(parsed instanceof Map<?, ?> map)) {
+                log.warn("[ModelConfigResolver] extra_body 不是 JSON 对象，已忽略 model={} value={}", modelName, json);
+                return Map.of();
+            }
+            Map<String, Object> out = new LinkedHashMap<>();
+            ((Map<Object, Object>) map).forEach((k, v) -> out.put(String.valueOf(k), v));
+            return out;
+        } catch (Exception e) {
+            log.warn("[ModelConfigResolver] extra_body 解析失败，已忽略 model={} err={} json={}",
+                modelName, e.getMessage(), json);
+            return Map.of();
+        }
     }
 }

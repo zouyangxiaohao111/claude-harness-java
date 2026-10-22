@@ -1,0 +1,13 @@
+-- 模型级「额外请求体」（extraBody）· 2026-10-22
+--
+-- 用途：部分 OpenAI 兼容端点需要非标准字段（如 DeepSeek {"reasoning":true}、
+--       各家自定义开关）。此前前端只能写进 models.think，而 think 从未被任何
+--       LLM provider 消费（只存不读）⇒ 配置不生效。
+--
+-- 语义：本列存 JSON 对象字符串。请求构造时**逐键合并**进请求体
+--       （putAdditionalBodyProperty），只增/覆盖同名键，**不替换**整个 body；
+--       与系统生成的字段（max_tokens / temperature / reasoning_effort …）同名时以本列为准。
+--       不填 / 空串 / 非对象 JSON → 视为无额外参数（fail-soft，不阻断请求）。
+--
+-- think 列保持原语义不动。
+ALTER TABLE models ADD COLUMN extra_body TEXT;

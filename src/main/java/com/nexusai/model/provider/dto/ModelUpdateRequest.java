@@ -30,5 +30,12 @@ public record ModelUpdateRequest(
     /** 缓存写入输入价格（高峰档，元/百万 tokens；PATCH 语义：null 不改）· CC original: {@code ModelCosts.promptCacheWriteTokens} (modelCost.ts:27-33) */
     BigDecimal cacheWritePricePeak,
     /** 缓存写入输入价格（空闲档，元/百万 tokens；PATCH 语义：null 不改）· CC original: {@code ModelCosts.promptCacheWriteTokens} (modelCost.ts:27-33) */
-    BigDecimal cacheWritePriceOffpeak
+    BigDecimal cacheWritePriceOffpeak,
+    /**
+     * 模型级额外请求体（JSON 对象字符串）· models.extra_body（V104）。
+     *
+     * <p>请求构造时**逐键合并**进 body（只增/覆盖同名键，不替换整包）；空 / 非对象 → 无额外参数。
+     * 与 {@code think} 互不影响。
+     */
+    String extraBody
 ) {}
