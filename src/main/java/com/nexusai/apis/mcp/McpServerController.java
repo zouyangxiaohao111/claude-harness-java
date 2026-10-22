@@ -118,12 +118,21 @@ public class McpServerController {
     @PostMapping("/{id}/start")
     public ResponseEntity<McpServerDto> start(@PathVariable String id,
                                               @RequestParam(value = "sessionId", required = false) String sessionId) {
-        if (sessionId == null || sessionId.isBlank()) {
-            log.warn("[McpServerController] POST /api/v1/mcp/{}/start 缺少会话标识 ?sessionId= → 400"
-                + "（批 3b：会话态显式传参，不再回落 MDC）", id);
-            throw new com.nexusai.infra.exception.ValidationException("sessionId is required (POST /api/v1/mcp/{id}/start)");
+        // [2026-10-22 契约放宽] ?sessionId= 由「必填」改为「可选」：
+        //   sessionId 的**唯一**用途是 claude/channel 白名单（门序[3]）与 channel handler 的会话归属；
+        //   不声明 channel 能力的 server（绝大多数）根本用不上它 ⇒ 硬必填等于让所有 MCP 启动都依赖
+        //   「当前有活动会话」，设置页在无会话时必然 400（实测）。
+        //   缺省语义与既有「无会话路径」（startEnabledBatch 启动预取 / 惰性重连传 null）一致：
+        //   channel 门序[3] 恒 SESSION skip（fail-closed，不注册 channel handler），**工具照常可用**。
+        //   ⛔ 不回落 MDC（批 3b 已移除该路径）；显式传了才用，没传就是没有 channel 上下文。
+        boolean hasSession = sessionId != null && !sessionId.isBlank();
+        if (log.isDebugEnabled()) {
+            log.debug("[McpServerController] POST /api/v1/mcp/{}/start sessionId={}（{}）", id,
+                hasSession ? sessionId : "<none>",
+                hasSession ? "channel 白名单按该会话判定" : "无会话 → channel 门序[3] fail-closed，工具不受影响");
         }
-        return ResponseEntity.status(HttpStatus.ACCEPTED).body(mcpServerService.start(id, sessionId));
+        return ResponseEntity.status(HttpStatus.ACCEPTED)
+            .body(mcpServerService.start(id, hasSession ? sessionId : null));
     }
 
     @PostMapping("/{id}/stop")

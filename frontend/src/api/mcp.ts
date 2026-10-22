@@ -41,9 +41,17 @@ export const mcpApi = {
   /** 审批拒绝（→ rejected + enabled=false） */
   reject: (id: string) =>
     api<McpServer>(`/mcp/${encodeURIComponent(id)}/reject`, { method: 'POST' }),
-  /** 启动 MCP server（202 + 更新后 DTO）· 对齐 POST /mcp/{id}/start（pending/disabled 抛 409 Conflict） */
-  start: (id: string) =>
-    api<McpServer>(`/mcp/${encodeURIComponent(id)}/start`, { method: 'POST' }),
+  /**
+   * 启动 MCP server（202 + 更新后 DTO）· 对齐 POST /mcp/{id}/start（pending/disabled 抛 409 Conflict）。
+   *
+   * <p>`sessionId` **可选**：仅用于 `claude/channel` 能力白名单（门序[3]）与 channel handler 归属。
+   * 传了 → 按该会话判定；不传 → 该次连接不注册 channel handler（fail-closed），**工具照常可用**。
+   */
+  start: (id: string, sessionId?: string | null) =>
+    api<McpServer>(
+      `/mcp/${encodeURIComponent(id)}/start${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`,
+      { method: 'POST' },
+    ),
   /** 停止 MCP server（202 + 更新后 DTO）· 对齐 POST /mcp/{id}/stop */
   stop: (id: string) =>
     api<McpServer>(`/mcp/${encodeURIComponent(id)}/stop`, { method: 'POST' }),

@@ -324,7 +324,7 @@ export function SettingsModal({
             )}
             {settingsTab === 'providers' && <ProvidersPanel providers={providers} providersApi={providersApi} showToast={showToast} />}
             {settingsTab === 'skills' && <SkillsPanel skillsApi={skillsApi} showToast={showToast} />}
-            {settingsTab === 'mcp' && <MCPPanel mcpApi={mcpApi} showToast={showToast} />}
+            {settingsTab === 'mcp' && <MCPPanel mcpApi={mcpApi} showToast={showToast} sessionId={sessionId} />}
             {settingsTab === 'database' && <DatabasePanel databasesApi={databasesApi} showToast={showToast} />}
             {settingsTab === 'schedules' && <SchedulesPanel schedulesApi={schedulesApi} showToast={showToast} />}
             {settingsTab === 'hooks' && (

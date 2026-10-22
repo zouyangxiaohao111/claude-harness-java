@@ -10,6 +10,12 @@ interface MCPPanelProps {
   /** 真实后端 CRUD API */
   mcpApi: UseMcp
   showToast: (msg: string, type?: 'success' | 'info') => void
+  /**
+   * 当前活动会话 id · **启动 server 时必传**（后端 POST /mcp/{id}/start 的 `?sessionId=` 必填；
+   * 缺值返 400 "sessionId is required"）。无会话（设置页在未选中会话时打开）→ null，此时启动按钮
+   * 显式报错而不是发一个必 400 的请求。
+   */
+  sessionId?: string | null
 }
 
 type Transport = 'stdio' | 'sse' | 'http'
@@ -120,7 +126,7 @@ const parseJsonObject = (raw: string): Record<string, string> | undefined | null
  * status / 连接状态（预留）徽标 + enabled 开关 + 启停/测试/去授权(预留)/编辑/删除。
  * <p>导入 .mcp.json + 待审批弹窗（approve/reject）。CRUD 复用 useMcp hook。
  */
-export function MCPPanel({ mcpApi, showToast }: MCPPanelProps) {
+export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps) {
   const { list, loading, error, refresh, createMcp, updateMcp, deleteMcp, toggleMcp } = mcpApi
 
   const [form, setForm] = useState<McpFormState>(EMPTY_FORM)
@@ -270,10 +276,12 @@ export function MCPPanel({ mcpApi, showToast }: MCPPanelProps) {
   }
 
   const onStart = (m: McpServer) => {
+    // sessionId 可选：有活动会话就带上（声明 claude/channel 的 server 才用得到它，决定 channel 白名单）；
+    // 没有会话也能启动 —— 后端对该次连接 fail-closed 跳过 channel handler，工具照常可用。
     void wrap(async () => {
       // start 端点有 enabled 门（disabled → 409）：未启用先 PATCH enabled=true（后端自动 start），已启用直接调 start
       if (!m.enabled) await toggleMcp(m.id, true)
-      else await mcpRestApi.start(m.id)
+      else await mcpRestApi.start(m.id, sessionId)
       await refresh()
     }, `已启动: ${m.userFacingName ?? m.name}`)
   }

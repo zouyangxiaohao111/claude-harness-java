@@ -2,6 +2,14 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.47] - 2026-10-22
+
+### 修复
+- **启动 MCP server 报错**「sessionId is required (POST /api/v1/mcp/{id}/start)」：
+  设置页在没有活动会话时无法启动任何 MCP server。
+  · 该参数只用于 `claude/channel` 能力白名单，未声明该能力的 server 用不到它；
+    现改为可选 —— 不传时跳过 channel 能力（工具照常可用），有会话时仍按会话判定。
+
 ## [0.1.46] - 2026-10-22
 
 ### 修复
