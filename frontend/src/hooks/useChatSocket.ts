@@ -774,10 +774,18 @@ export function useChatSocket(
     } else if (isToolCall(evt)) {
       // TEMP 诊断：tool_call 目标 id vs 现有流式块 ids（确认是否同源匹配）
       console.debug('[tool_call] match?', { toolName: evt.toolName, callId: evt.toolCallId, target: evt.assistantMessageId, blockIds: (st.streams[sid] ?? []).map((b) => b.assistantMessageId) })
+      // [2026-10-22 修复：工具卡片静默丢失] 块只由 chunk 分支建立（ensureStreamBlock），而 tool_call
+      //   可能**先于本轮首个 chunk** 到达（模型直接调工具 / 纯工具轮 / chunk 仍在 rAF 缓冲未 flush）。
+      //   此时 addToolCall 因找不到目标块直接 return st ⇒ 卡片被丢弃且无重放，界面缺这张卡，
+      //   直到 F5 从 REST 拉历史才出现（用户实测「Bash 在跑但前端没有卡片」）。
+      //   两步修：① 先把缓冲里的增量 flush（若本轮已有 chunk，块立刻建出来）；② 确保目标块存在
+      //   （幂等：已存在 → no-op；不存在 → 用事件自身的 assistantMessageId 建块 = 正确轮次，
+      //   不改「id 不匹配就忽略」的防挂错轮语义——这里建用的就是事件 id）。
+      flushStreamAppends()
+      const callBlockId = evt.assistantMessageId ?? 'msg-stream'
+      st.ensureStreamBlock(sid, callBlockId, null)
       // 契约 #6：回放推 tool_call → 按块 id 精确挂工具卡片（arguments Map → JSON 字符串对齐 ToolCallDto.arguments）。
-      //   后端同源前 tool_call.assistantMessageId=落库 id ≠ 流式 turnAssistantId → 匹配不到块则不挂（不挂错轮）；
-      //   后端落库 id 统一 turnAssistantId 后自动精确归属，前端无需改动。
-      st.addToolCall(sid, evt.assistantMessageId ?? 'msg-stream', {
+      st.addToolCall(sid, callBlockId, {
         id: evt.toolCallId ?? null,
         name: evt.toolName ?? null,
         arguments: evt.arguments ? JSON.stringify(evt.arguments) : null,
