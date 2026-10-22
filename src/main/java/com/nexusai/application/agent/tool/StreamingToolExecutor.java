@@ -3708,7 +3708,7 @@ public class StreamingToolExecutor {
         }
         Map<String, Object> args = convertInputToMap(t.call.input());
         try {
-            ts.wsTemplate().convertAndSend(ts.streamTopic(),
+            com.nexusai.eventbus.ws.StreamEventSeq.send(ts.wsTemplate(), ts.streamTopic(),
                 new MessageToolCallEvent(ts.sessionId(), ts.userMessageId(),
                     assistantId, t.call.id(), t.call.name(), args));
             if (log.isDebugEnabled()) {
@@ -3784,7 +3784,7 @@ public class StreamingToolExecutor {
             result = briefJson != null ? briefJson : truncateResult(rawData);
         }
         try {
-            ts.wsTemplate().convertAndSend(ts.streamTopic(),
+            com.nexusai.eventbus.ws.StreamEventSeq.send(ts.wsTemplate(), ts.streamTopic(),
                 new MessageToolResultEvent(ts.sessionId(), ts.userMessageId(),
                     assistantId, t.call.id(), result, t.isError));
             if (log.isDebugEnabled()) {

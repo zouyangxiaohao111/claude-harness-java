@@ -37,7 +37,7 @@ function renderUserRefText(text: string, onOpen?: (path: string) => void): React
 }
 import { parseAnsiLines, type AnsiLine } from '@/utils/ansi'
 import { useSubagentStore } from '@/stores/subagentStore'
-import { useChatStore, selectStreamIds, selectStreamBlock } from '@/stores/chatStore'
+import { useChatStore, selectStreamIds, selectStreamBlock, LIVE_SEQ_BASE } from '@/stores/chatStore'
 import type { ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
 import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePreview'
@@ -576,9 +576,9 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: Chat
   const showSubagent = !isUser && !isFallback && (isSubagent || subagentId != null)
   // F30/F33 · finishReason 退出角标文案（stop/未知值 → null 不渲染）
   const exitLabel = FINISH_REASON_LABEL[msg.finishReason ?? ''] ?? null
-  // 37 · thinking 耗时（ms → 秒取整）；无耗时 → 标题不追加时长
+  // 37 · thinking 耗时（ms → 秒，保留 1 位小数 · 对齐 dsh「思考过程 7.3s」）；无耗时 → 不追加
   const reasoningLabel = msg.reasoningDurationMs != null && msg.reasoningDurationMs > 0
-    ? `（用时 ${Math.round(msg.reasoningDurationMs / 1000)}s）`
+    ? ` ${(msg.reasoningDurationMs / 1000).toFixed(1)}s`
     : ''
   // CHK-8 · output_token_usage attachment（后端 F37 已实施）：优先走附件三值（turn/session/budget），
   // 无附件则回落到 msg.outputTokens（优雅降级）。对齐 CC messages.ts:4077-4089。
@@ -722,8 +722,12 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile }: { msg: Chat
             {cleanReasoning(msg.reasoning) && (
               <div className={`thinking-wrap${showReasoning ? ' open' : ''}`}>
                 <button className="thinking-toggle" onClick={() => setShowReasoning((v) => !v)}>
-                  <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
-                  <span>已思考{reasoningLabel}</span>
+                  {/* [样式对齐 dsh] 思考图标 + 文案 + 折叠箭头 */}
+                  <svg className="thinking-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+                    <path d="M8 2.2v2.6M8 11.2v2.6M2.2 8h2.6M11.2 8h2.6M4.1 4.1l1.8 1.8M10.1 10.1l1.8 1.8M11.9 4.1l-1.8 1.8M5.9 10.1l-1.8 1.8" strokeLinecap="round" />
+                  </svg>
+                  <span>思考过程{reasoningLabel}</span>
+                  <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
                 </button>
                 {showReasoning && <div className="thinking-body">{cleanReasoning(msg.reasoning)}</div>}
               </div>
@@ -791,8 +795,23 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
   const b = useChatStore(selectStreamBlock(sessionId, blockId))
   // [bug-101] 流式思考块收起：行内本地态（此前父级 Record 存收起态，整表重渲；行内自持语义不变）
-  const [collapsed, setCollapsed] = useState(false)
+  // [2026-10-22 完成后自动收起] 进行中展开（看得到正在想什么），**本轮结束即收起**为一行
+  //   「思考过程」；用户仍可点击重新展开（图 58 → 图 59 的诉求）。
+  const [collapsed, setCollapsed] = useState(!isStreamingTail)
+  useEffect(() => {
+    if (!isStreamingTail) setCollapsed(true)
+  }, [isStreamingTail])
   if (!b) return null
+  // [样式对齐 dsh] 进行中显示「思考中·· {tokens}」；完成显示「思考过程」
+  // [2026-10-22 用户裁定 · 修订] 思考中后面的数字用**输出 tokens**（message.usage.output_tokens）：
+  //   流式期间每次 usage 事件带来新的累计输出值 ⇒ 数字随打字机滚动递增（"47 → 312 → 1.2k …"）。
+  //   ⛔ 前端不做任何求和/估算（后端给多少显示多少）；无 usage → 只显示「思考中」+ 波浪点。
+  const streamTokens = b.usage?.output_tokens ?? null
+  const tokenLabel = streamTokens == null
+    ? null
+    : streamTokens >= 1000 ? `${(streamTokens / 1000).toFixed(1)}k tokens` : `${streamTokens} tokens`
+  /** 进行中：思考中 + 三点波浪（+ 后端 tokens）；完成：思考过程。 */
+  const thinkingRunning = isStreamingTail
   return (
     <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}`}>
       <div className="avatar">N</div>
@@ -801,8 +820,18 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
         {cleanReasoning(b.reasoning) && (
           <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
             <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
-              <svg viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
-              <span>正在思考…</span>
+              {/* [样式对齐 dsh] 思考图标 + 文案 + 折叠箭头（箭头单独 class ⇒ open 时只转箭头） */}
+              <svg className="thinking-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+                <path d="M8 2.2v2.6M8 11.2v2.6M2.2 8h2.6M11.2 8h2.6M4.1 4.1l1.8 1.8M10.1 10.1l1.8 1.8M11.9 4.1l-1.8 1.8M5.9 10.1l-1.8 1.8" strokeLinecap="round" />
+              </svg>
+              <span>{thinkingRunning ? '思考中' : '思考过程'}</span>
+              {thinkingRunning && (
+                <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+              )}
+              {thinkingRunning && tokenLabel != null && streamTokens != null && streamTokens > 0 && (
+                <span className="thinking-tokens">{tokenLabel}</span>
+              )}
+              <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
             </button>
             {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
           </div>
@@ -938,7 +967,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
      * <p>WHY：原实现按 userMessageId 建组、组序 = key 首次出现位置。流式块冻结的 userMessageId 一旦
      * 指向上一轮（本轮 user 尚未落历史 / 后台通知唤醒），整块就被插进那段历史中间 —— 用户实测
      * 「实时打字插在历史工具消息之前，后面又冒出更晚的历史」。
-     * 序号规则：历史 = 过滤后序列的递增序号；流式块 = LIVE_SEQ_BASE + 块序（恒大于任何历史）；
+     * 序号规则：历史 = 过滤后序列的递增序号；**流式区**（实时块 + 本轮中途追加的行，如排队消息被
+     * 消费时的正式 user 行）= LIVE_SEQ_BASE + 到达号（由 chatStore 在追加/建块时盖章）——
+     * 于是「已输出的实时内容 < 中途追加的 user 行 < 之后的实时块」，与 dsh 事件 seq 同序；
      * err 卡片 = 所属组最大序号 + 0.5（紧跟该组）。prepend 更早历史后序号重算，相对顺序天然正确。
      */
     type RowItem = { kind: 'msg'; m: ChatMessageDto } | { kind: 'blk'; sid: string; blockId: string }
@@ -950,8 +981,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       arr[idx].items.push({ item, seq })
       if (seq > arr[idx].maxSeq) arr[idx].maxSeq = seq
     }
-    /** 流式块序号基准：远大于历史序号（历史条数上限 1e9 不可能达到）⇒ 进行中的输出恒在末尾。 */
-    const LIVE_SEQ_BASE = 1_000_000_000
+    /** 流式区序号基准（见 chatStore.LIVE_SEQ_BASE）：远大于历史位次 ⇒ 流式区恒在已落库内容之后。 */
     // [brief-align] 含 SendUserMessage 的轮次里丢掉冗余助手正文 · 对齐 CC components/Messages.tsx:169-206
     //   dropTextInBriefTurns（transcript 模式绕过：本仓轨迹 tab 直读 store，不经本函数 —— 同 CC）。
     // [sm-boundary-reload] 轮键在序列上前向解析（与 capTailTurns 前向趟同源）：无锚行（compact boundary
@@ -965,8 +995,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (!isDialogueRow(m)) continue
       // ⚠️ 只被【有锚行】推进（无锚行不得把自己的键当锚传给后面 —— 与 turnKeyOf 的兜底语义配对）
       if (m.userMessageId) anchor = m.userMessageId
-      // 序号 = 过滤后序列的递增位次（prepend 更早历史后重算，相对顺序不变）
-      push(turnKeyOf(m, anchor), { kind: 'msg', m }, ++historySeq)
+      // 序号 = 过滤后序列的递增位次（prepend 更早历史后重算，相对顺序不变）；
+      //   流式区到达号优先（本轮中途追加的排队 user 行 / 已 finalize 的块行）
+      push(turnKeyOf(m, anchor), { kind: 'msg', m }, m.renderSeq ?? ++historySeq)
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append
@@ -977,8 +1008,8 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       const b = live.find((x) => x.assistantMessageId === blockId)
       if (!b) continue
       const key = b.userMessageId ?? b.assistantMessageId ?? 'stream'
-      // [anchorSeq] 流式块序号恒大于所有历史（不再依赖 userMessageId 首次出现的位置）
-      push(key, { kind: 'blk', sid: sessionId, blockId }, LIVE_SEQ_BASE + i)
+      // [anchorSeq] 块 = 建立时盖的流式区到达号（缺省旧块 → 基准 + 块序），恒大于所有历史
+      push(key, { kind: 'blk', sid: sessionId, blockId }, b.renderSeq ?? LIVE_SEQ_BASE + i)
     }
     return arr
   }, [messages, streamIds, sessionId])

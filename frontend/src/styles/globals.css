@@ -1879,10 +1879,24 @@ html {
 }
 .thinking-toggle:hover { color: #777; }
 .thinking-toggle svg { width: 12px; height: 12px; fill: none; stroke: currentColor; stroke-width: 2; transition: transform 0.3s ease; }
-.thinking-wrap.open .thinking-toggle svg { transform: rotate(90deg); }
-/* 思考中占位（发送后立即显示 · 消除空白间隙 · 脉冲提示起效果） */
-.msg.assistant.streaming .thinking-toggle { animation: thinking-pulse 1.6s ease-in-out infinite; }
-@keyframes thinking-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.45; } }
+/* [样式对齐 dsh] 思考图标不随开合旋转；只有箭头（.thinking-caret）转 */
+.thinking-toggle .thinking-icon { width: 11px; height: 11px; stroke-width: 1.2; opacity: .85; }
+.thinking-wrap.open .thinking-toggle .thinking-caret { transform: rotate(90deg); }
+/* [2026-10-22 用户裁定] 不再整行闪烁；「思考中」后的三点做波浪跳动 */
+.wave-dots { display: inline-flex; align-items: center; gap: 2.5px; margin-left: 2px; }
+.wave-dots i {
+  width: 2.5px; height: 2.5px; border-radius: 50%;
+  background: currentColor; display: inline-block;
+  animation: dot-wave 1.2s ease-in-out infinite;
+}
+.wave-dots i:nth-child(2) { animation-delay: .15s; }
+.wave-dots i:nth-child(3) { animation-delay: .3s; }
+@keyframes dot-wave {
+  0%, 60%, 100% { transform: translateY(0); opacity: .5; }
+  30% { transform: translateY(-3px); opacity: 1; }
+}
+/* tokens 数字（后端每次 usage 事件推进 · 前端不求和） */
+.thinking-tokens { margin-left: 5px; font-variant-numeric: tabular-nums; }
 /* 核心：极浅灰字体 + 极淡分割线（无背景） */
 .thinking-body {
   border-left: 2px solid #E2E2E2;

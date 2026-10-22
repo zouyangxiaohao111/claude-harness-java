@@ -1284,7 +1284,7 @@ public class ChatService {
             }
             return;
         }
-        ws.convertAndSend(topic, evt);
+        com.nexusai.eventbus.ws.StreamEventSeq.send(ws, topic, evt);
         log.info("STOMP → type={} {}", evt.getType(), summary);
     }
 

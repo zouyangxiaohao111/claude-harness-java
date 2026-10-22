@@ -1291,6 +1291,14 @@ export interface ChatMessageDto {
   imagePasteIds?: string[] | null
   /** 所属 flow 的用户消息 id（user 消息=自身 id；assistant/tool=发起它的用户消息 id · 前端按此分组锚定消息链） */
   userMessageId?: string | null
+  /**
+   * [排队行序 2026-10-23] 流式区到达序号（仅前端内存，不入 DB）。
+   *
+   * <p>本轮有实时块时追加的历史行（排队消息被消费、busy 用户消息推送等）由 chatStore 盖上
+   * `LIVE_SEQ_BASE + 到达号`，使它们排在「到达时已输出的实时内容」之后、「之后建立的块」之前。
+   * 缺省（重拉/落库行）→ 渲染按数组位次（DB 顺序即位置）。
+   */
+  renderSeq?: number
   /** complete 事件透传：本轮真实 usage（snake_case · 无上报省略） */
   usage?: MessageUsageDto | null
   /** [D1 usage-source] 本条 usage 的来源标记（message.usage 事件的 source 经流式块透传 · 只在前端内存，
@@ -1395,6 +1403,12 @@ export interface StreamEventBase {
   sessionId?: string | null
   userMessageId?: string | null
   ts?: number            // epoch 毫秒
+  /**
+   * [2026-10-22 对齐 dsh] 会话内单调事件序号（后端 StreamEventSeq 分配，1 起）。
+   * 前端据此检测丢帧缺口：`seq > 已见最大 + 1` → 缓冲 + 重拉尾页补齐。
+   * 0/缺失 = 旧后端或非会话事件（跳过缺口检测）。
+   */
+  seq?: number
 }
 export interface MessageChunkEvent extends StreamEventBase {
   type: 'message.chunk'

@@ -7237,7 +7237,7 @@ public class LlmAgentLoop implements AgentLoop {
                         System.currentTimeMillis(), java.util.Map.of("len", chunk.length())));
                     // Phase 6·s02.6: 真流式 content (LLM 还在写时立即推 STOMP)
                     if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                        ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                        com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                             com.nexusai.eventbus.ws.MessageChunkEvent.of(
                                 ctx.streamSessionId(), turnUserMessageId,
                                 turnAssistantId,
@@ -7352,7 +7352,7 @@ public class LlmAgentLoop implements AgentLoop {
                     }
                     reasoningBuf.append(reasoningChunk);
                     if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                        ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                        com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                             com.nexusai.eventbus.ws.MessageChunkEvent.ofReasoning(
                                 ctx.streamSessionId(), turnUserMessageId,
                                 turnAssistantId,
@@ -8331,7 +8331,7 @@ public class LlmAgentLoop implements AgentLoop {
                 //   打字机停、消息空、无提示。补发 message.error（与 withRetry 重试耗尽路径 :6971 同款模式）。
                 //   wsTemplate 为 null（非流式）时跳过。
                 if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                    ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                    com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                         com.nexusai.eventbus.ws.MessageErrorEvent.of(
                             ctx.streamSessionId(),
                             state.lastUserMessageId() != null ? state.lastUserMessageId() : ctx.streamUserMessageId(),
@@ -9342,7 +9342,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   参考 :4608/:5255 注释 turnAssistantId）。wsTemplate 为 null（非流式）时跳过，
             //   对齐现有 :4389 模式。
             if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                     com.nexusai.eventbus.ws.MessageErrorEvent.of(
                         ctx.streamSessionId(),
                         state.lastUserMessageId() != null ? state.lastUserMessageId() : ctx.streamUserMessageId(),
@@ -10206,7 +10206,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   [OD-D5] 公共段覆盖 build 带图分支（原实现漏带图气泡——build 分支 append 后未推，
             //   前端 busy 图消息无原文气泡）。
             if (busyQueued && ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                     new com.nexusai.eventbus.ws.MessageUserEvent(
                         state.sessionId(), item.uuid(), item.uuid(), item.value(), false));
             }
@@ -12759,7 +12759,7 @@ public class LlmAgentLoop implements AgentLoop {
         // 事件流载荷：ApiRetryEvent 推送（QueryEngine.ts:943-955 SDK 载荷等价；transcript 不含重试通知）
         if (ctx != null && ctx.wsTemplate() != null && ctx.streamTopic() != null) {
             try {
-                ctx.wsTemplate().convertAndSend(ctx.streamTopic(),
+                com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                     com.nexusai.eventbus.ws.ApiRetryEvent.of(
                         ctx.streamSessionId(), ctx.streamUserMessageId(), sys));
             } catch (Exception e) {

@@ -37,6 +37,16 @@ public abstract class StreamEvent {
     @JsonProperty("ts")
     private final long timestamp;
 
+    /**
+     * [2026-10-22 流事件序号 · 对齐 dsh seq] 会话内单调递增事件序号（1 起）。
+     *
+     * <p>前端据此检测**丢帧缺口**（收到 seq > 已见最大 + 1）→ 缓冲后续事件并重拉尾页补齐
+     * （dsh `acceptLiveEvent` / `repairGap`，runtime/src/client/sessions/session.ts:679-733）。
+     * 0 = 未分配（非渠道/测试直构）。
+     */
+    @JsonProperty("seq")
+    private long seq;
+
     protected StreamEvent(String type, String sessionId, String userMessageId) {
         this.type = type;
         this.sessionId = sessionId;
@@ -45,6 +55,10 @@ public abstract class StreamEvent {
     }
 
     public String getType() { return type; }
+    public long getSeq() { return seq; }
+    /** 由 {@link StreamEventSeq} 在发送前统一赋值（幂等：已分配则不覆盖）。 */
+    public void setSeq(long seq) { this.seq = seq; }
+
     public String getSessionId() { return sessionId; }
     public String getUserMessageId() { return userMessageId; }
     public long getTimestamp() { return timestamp; }

@@ -501,7 +501,7 @@ export function useChatSocket(
     if (!sid || streamSubsRef.current.has(sid)) return
     const topic = `/topic/sessions/${sid}/stream`
     console.debug('[sub] stream subscribe（当前会话常驻）', { sid, topic })
-    streamSubsRef.current.set(sid, subscribeStream(client, topic, (evt) => dispatchEvent(evt, topic)))
+    streamSubsRef.current.set(sid, subscribeStream(client, topic, (evt) => acceptStreamEvent(evt, topic)))
   }
 
   // ---- STOMP client 单例（mount 一次创建，sessionId 变化不重建 → 原会话订阅常驻不丢）----
@@ -619,6 +619,12 @@ export function useChatSocket(
     subscribeStatusTopic(client, sessionId)
     // cron/Ask 实时流：新会话 stream topic 常驻订阅
     ensureSessionStream(client, sessionId)
+    // [2026-10-22 切回补拉] 该会话**仍在运行**（切走期间事件可能因订阅/断线缺口丢失）→
+    //   立即按 REST 重拉尾页，切回即可见最新内容（等价 F5，但不重载页面）。
+    //   ⛔ 只重拉 messages（onReconnectReload → loadTailWindow）；不触碰权限队列/弹窗状态。
+    if (activeStreamsRef.current[sessionId]) {
+      onReconnectReloadRef.current?.(sessionId)
+    }
     // [会话状态同步 · dsh host replay 等价物] 切回会话时补拉未回答的 pending 权限/提问：
     //   请求若在该会话「不在订阅集合」期间到达，事件已丢、后端仍在等 → 只有状态接口能找回。
     //   该会话没有 pending → 列表为空、无任何变化（对齐「没有 ask 时也自动变化」的语义）。
@@ -654,7 +660,7 @@ export function useChatSocket(
         const topic = `/topic/sessions/${sid}/stream`
         // TEMP 诊断：确认会话级单 topic 订阅建立（sid 对应 B 会话应出现）
         console.debug('[sub] stream subscribe', { sid, topic })
-        streamSubsRef.current.set(sid, subscribeStream(client, topic, (evt) => dispatchEvent(evt, topic)))
+        streamSubsRef.current.set(sid, subscribeStream(client, topic, (evt) => acceptStreamEvent(evt, topic)))
       }
       if (!permSubsRef.current.has(sid)) {
         console.debug('[sub] perm subscribe', { sid })
@@ -826,6 +832,84 @@ export function useChatSocket(
         break
       }
       // session_state_changed 暂不映射通知
+    }
+  }
+
+  // ─────────────────────── [2026-10-22 流事件 seq 缺口修复 · 对齐 dsh] ───────────────────────
+  /** sessionId → 已处理的最大事件 seq（0 = 尚未见到） */
+  const lastSeqRef = useRef<Map<string, number>>(new Map())
+  /** 缺口修复期间到达的事件（按到达顺序缓冲，修复完成后按 seq 拼接） */
+  const liveBufferRef = useRef<Array<{ evt: StreamEvent; topic?: string }>>([])
+  /** 修复进行中：新事件一律进缓冲，避免与重拉的历史交错（dsh stitching 同义） */
+  const stitchingRef = useRef(false)
+
+  /**
+   * 流事件入口（stream topic 回调）· 对齐 dsh `acceptLiveEvent`（session.ts:679-733）：
+   * - 无 seq（旧后端/非会话事件）→ 直接处理，不参与缺口检测
+   * - 修复进行中 → 缓冲
+   * - 重复帧（seq ≤ 已见）→ 丢弃；若「远小于已见值」判定为后端重启（计数器归零）→ 重置放行
+   * - seq 缺口（> 已见 + 1）→ 缓冲 + 触发 repair（重拉尾页），⛔ 绝不带洞追加
+   * - 连续 → 正常分派并推进已见最大
+   */
+  function acceptStreamEvent(evt: StreamEvent, topic?: string): void {
+    const sid = evt.sessionId ?? sessionIdRef.current ?? ''
+    const seq = typeof evt.seq === 'number' ? evt.seq : 0
+    if (!sid || !seq) {
+      dispatchEvent(evt, topic)
+      return
+    }
+    if (stitchingRef.current) {
+      liveBufferRef.current.push({ evt, topic })
+      return
+    }
+    const last = lastSeqRef.current.get(sid) ?? 0
+    if (seq <= last) {
+      // 后端重启（进程内计数器从 1 重来）⇒ 已见值远大于当前帧：重置窗口，按新序号继续。
+      // 判据两条：① 收到 seq=1 且此前已见过更大值（精确：同一进程内 seq 只增不减）
+      //           ② 远小于已见值（兜底：重启后首个可见帧可能已不是 1）
+      // ⛔ 不重置会把重启后的内容当「重复帧」永久丢弃。
+      if ((seq === 1 && last > 1) || last - seq > 100) {
+        lastSeqRef.current.set(sid, seq - 1)
+      } else {
+        return  // 重复帧
+      }
+    }
+    if (seq > (lastSeqRef.current.get(sid) ?? 0) + 1) {
+      liveBufferRef.current.push({ evt, topic })
+      void repairStreamGap(sid)
+      return
+    }
+    lastSeqRef.current.set(sid, seq)
+    dispatchEvent(evt, topic)
+  }
+
+  /**
+   * 缺口修复（resync-lite）· 对齐 dsh `repairGap`：重拉尾页（onReconnectReload）→
+   * 把缓冲事件按 seq 拼回去。UI 不闪 loading；期间新事件继续进缓冲。
+   */
+  async function repairStreamGap(sid: string): Promise<void> {
+    if (stitchingRef.current) return
+    stitchingRef.current = true
+    try {
+      await onReconnectReloadRef.current?.(sid)
+    } catch {
+      // 静默：下次事件/重连会再次触发修复（不 toast 打扰）
+    } finally {
+      stitchingRef.current = false
+      const buf = liveBufferRef.current
+      liveBufferRef.current = []
+      buf.sort((a, b) => (a.evt.seq ?? 0) - (b.evt.seq ?? 0))
+      for (const it of buf) {
+        // ⚠️ 缓冲是全局的：修复某个会话时，其它会话到达的帧也会在缓冲里 —— 序号必须按
+        //    **帧自身归属** 的会话推进，不能一律记到本次修复的 sid（否则污染别会话的窗口）。
+        const itemSid = it.evt.sessionId ?? sid
+        const s = it.evt.seq ?? 0
+        if (s > 0) {
+          if (s <= (lastSeqRef.current.get(itemSid) ?? 0)) continue
+          lastSeqRef.current.set(itemSid, s)
+        }
+        dispatchEvent(it.evt, it.topic)
+      }
     }
   }
 
