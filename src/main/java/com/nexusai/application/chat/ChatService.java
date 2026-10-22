@@ -2414,7 +2414,11 @@ public class ChatService {
             }
             // [R-1 P0 修复] settings 存全名/裸名 → 全名反查而非 id 直查（对齐 CronIdleExecutor.resolveMainModelName:546-548）
             ModelRecord m = ModelNameResolver.resolve(modelMapper, providerMapper, s.getMainModelName());
-            String name = (m != null && Boolean.TRUE.equals(m.getEnabled())) ? m.getName() : null;
+            // [2026-10-22 绑定不漂移] 返回**全名**（provider/model）而不是裸名：下游 buildConfigForModel /
+            //   providerTypeForModel 会再解析一次，裸名走「按 name 取第一条」兼容路径，可能换到另一个
+            //   provider 的同名模型（实测夜间落到 ds-zcw-openai 的失效 key，整轮 401）。
+            String name = (m != null && Boolean.TRUE.equals(m.getEnabled()))
+                ? ModelNameResolver.toFullName(providerMapper, m) : null;
             // [W2-2] 中档（主模型）解析命中数据流日志 · CC getMainLoopModel settings 层（model.ts:92-98）
             if (log.isDebugEnabled()) {
                 log.debug("[ChatService] 中档主模型 settings.mainModelName 全名反查: raw={} → name={}",

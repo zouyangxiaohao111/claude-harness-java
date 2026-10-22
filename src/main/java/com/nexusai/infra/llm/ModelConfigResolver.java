@@ -86,7 +86,11 @@ public class ModelConfigResolver {
         }
         ModelRecord model = findEnabledModelByName(modelName);
         if (model == null) {
-            log.warn("[ModelConfigResolver] enabled model 未命中 modelName={}，跳过（warn+skip）", modelName);
+            // [2026-10-22 根治] 提到 ERROR：未命中的常见成因是「裸名歧义被 fail-loud 拒绝」
+            //   （多个 provider 提供同名模型）或模型被禁用；静默 warn 会让调用方悄悄回落 mock，
+            //   用户只看到「主代理不动」。日志必须一眼可见。
+            log.error("[ModelConfigResolver] enabled model 未命中 modelName={} → 跳过（若为裸名，请改用全名 provider/model）",
+                modelName);
             return null;
         }
         ProviderRecord provider = providerMapper.selectOneById(model.getProviderId());

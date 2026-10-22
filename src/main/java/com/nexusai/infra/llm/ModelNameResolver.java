@@ -317,6 +317,27 @@ public final class ModelNameResolver {
                 .orderBy("provider_id", true)
                 .orderBy("id", true));
         ModelRecord model = (ms != null && !ms.isEmpty()) ? ms.get(0) : null;
+        // [2026-10-22 根治 · 裸名歧义 fail-loud] 裸名命中多个 provider 的同名模型时**拒绝解析**，
+        //   不再按 provider_id 字典序「猜一个」。
+        //   WHY：该顺序与「key 是否有效 / 用户原本想用哪个」无关。实测（2026-10-21 夜间
+        //   sess-aa022bdf）：{@code deepseek-flash} 同时存在于 deepseek / ds-zcw / ds-zcw-openai，
+        //   字典序选中 ds-zcw-openai（key 已失效）⇒ 主会话被通知唤醒的 32 轮全部 HTTP 401，
+        //   子进程侧一切正常、界面上「主代理一动不动」。
+        //   ⛔ 静默选错 provider 比明确失败更危险：错误被推迟到调用外部 API 时才以 401 暴露，
+        //   且用户无从判断是 key 问题还是模型问题。
+        //   正确姿势：配置里一律写全名 {@code provider/model}（前端模型选择器已如此，
+        //   settings/sessions 存量数据亦为全名）；裸名只在「全库唯一」时继续兼容。
+        if (ms != null && ms.size() > 1) {
+            StringBuilder providers = new StringBuilder();
+            for (ModelRecord m : ms) {
+                if (providers.length() > 0) providers.append(", ");
+                providers.append(m.getProviderId()).append(':').append(m.getId());
+            }
+            log.error("[ModelNameResolver] 裸名歧义，拒绝解析(fail-loud): modelName={} 命中 {} 个 enabled 模型 [{}]"
+                    + " —— 请改用全名 provider/model（如 deepseek/{}）",
+                modelName, ms.size(), providers, modelName);
+            return null;
+        }
         // [T1] 查表容忍 [1m] 后缀：原键未命中且原键尾部带 [1m] 时，用剥后键【同语义】重查一次。
         //   语义 = 精确键优先、剥后缀键兜底（确定性）：
         //     · 表内确实存在字面量 "foo[1m]" 行 → 第一次即命中，行为与修复前逐字节相同（零回归）；
@@ -335,6 +356,18 @@ public final class ModelNameResolver {
                         .eq("enabled", true)
                         .orderBy("provider_id", true)
                         .orderBy("id", true));
+                // [2026-10-22 根治] 剥 [1m] 后同样适用「裸名多命中 ⇒ fail-loud」，不猜 provider。
+                if (msStripped != null && msStripped.size() > 1) {
+                    StringBuilder providers = new StringBuilder();
+                    for (ModelRecord m : msStripped) {
+                        if (providers.length() > 0) providers.append(", ");
+                        providers.append(m.getProviderId()).append(':').append(m.getId());
+                    }
+                    log.error("[ModelNameResolver] 裸名歧义（[1m] 剥离后），拒绝解析(fail-loud): 原键={} 查键={} "
+                            + "命中 {} 个 enabled 模型 [{}] —— 请改用全名 provider/model",
+                        modelName, stripped, msStripped.size(), providers);
+                    return null;
+                }
                 model = (msStripped != null && !msStripped.isEmpty()) ? msStripped.get(0) : null;
                 if (model != null) {
                     // 数据流日志：原键 → 实际查询键 → 命中 modelId（[1m] 只影响查询键，返回值仍是 DB 原记录）
@@ -353,6 +386,46 @@ public final class ModelNameResolver {
                 modelName, model.getId());
         }
         return model;
+    }
+
+    /**
+     * 由已解析的 ModelRecord 还原**全名**（{@code providerName/modelName}）· 2026-10-22 修复。
+     *
+     * <p>WHY：{@link #resolve} 出来的 ModelRecord 已经绑定 provider；若调用方只把裸名
+     * （{@code model.getName()}）回传下游再解析一次，会重新走「按 name 取第一条」的兼容路径，
+     * 可能命中**另一个** provider 的同名模型。实测（2026-10-21 夜间）：settings 存
+     * {@code deepseek/deepseek-flash}，CronIdleExecutor 回传裸名 {@code deepseek-flash}，
+     * 二次解析落到字典序更小的 {@code ds-zcw-openai}，其失效 key 导致主会话每轮 401、
+     * 子代理完成通知虽已注入却整轮失败。
+     *
+     * <p>边界：模型名本身含 '/'（Bedrock ARN / Azure 部署 ID）→ 不拼前缀、原样返回
+     * （{@link #parseFullName} 会把首段当非 provider 前缀整体透传）；provider 缺失 / 名为空
+     * / 名含 '/' → 退回裸名（保持旧行为）。
+     *
+     * @param providerMapper 提供商 mapper（null → 退回裸名）
+     * @param model          已解析的模型记录（null → null）
+     * @return 全名 {@code provider/model}；无法安全拼接时返回裸名
+     */
+    public static String toFullName(ProviderMapper providerMapper, ModelRecord model) {
+        if (model == null) {
+            return null;
+        }
+        String name = model.getName();
+        if (name == null || name.isBlank() || name.indexOf('/') >= 0 || providerMapper == null) {
+            return name;
+        }
+        try {
+            ProviderRecord provider = providerMapper.selectOneById(model.getProviderId());
+            if (provider == null || provider.getName() == null || provider.getName().isBlank()
+                    || provider.getName().indexOf('/') >= 0) {
+                return name;
+            }
+            return provider.getName() + "/" + name;
+        } catch (Exception e) {
+            log.debug("[ModelNameResolver] toFullName 查询 provider 失败: modelId={} err={}",
+                model.getId(), e.getMessage());
+            return name;
+        }
     }
 
     /**

@@ -1424,8 +1424,10 @@ public class CronIdleExecutor {
         if (maxTokensHandler != null) loop.setMaxTokensHandler(maxTokensHandler);
         if (transientErrorHandler != null) loop.setTransientErrorHandler(transientErrorHandler);
         // 无 WS streamContext → headless run（streamTopic=null，run() 容忍）
-        com.nexusai.infra.llm.ProviderConfig config = resolveMainConfig();
-        String modelName = resolveMainModelName();
+        // [2026-10-22] 传本命令的目标会话：会话里选过模型（sessions.model_name）时优先用它，
+        //   否则回落 settings 默认（原实现只读 settings，后台唤醒会忽略用户在会话里的模型选择）。
+        com.nexusai.infra.llm.ProviderConfig config = resolveMainConfig(cmd.sessionId());
+        String modelName = resolveMainModelName(cmd.sessionId());
         // [P2 · slash 消费兜底] 技能级 model 覆盖（CC processSlashCommand.tsx:917 model: command.model）
         if (modelOverride != null && !modelOverride.isBlank()) {
             log.info("CronIdleExecutor: slash 技能级 model 覆盖: {} → {}（对齐 CC processSlashCommand.tsx:917）",
@@ -2046,21 +2048,60 @@ public class CronIdleExecutor {
         return sessionId;
     }
 
-    /** 主模型名 — settings.main_model_id → enabled model name（对齐 ChatService:514-515）。 */
-    private String resolveMainModelName() {
-        if (settingsMapper == null || modelMapper == null) return null;
-        SettingsRecord s = settingsMapper.selectOneById(SETTINGS_SINGLETON_ID);
-        String mainRaw = s != null ? s.getMainModelName() : null;
+    /**
+     * 主模型名 — **会话 override 优先** → settings.main_model_name → 解析成全名。
+     *
+     * <p>[2026-10-22 修复] 原实现只读 settings：用户在会话里选了别的模型（sessions.model_name），
+     * 后台子代理完成通知唤醒主会话时仍用 settings 默认模型（用户实测「对话选了其他模型，
+     * 子代理通知却用设置里的默认配置」）。语义对齐 {@code ChatService.resolveModelNameForSession}
+     * 的四层链（请求体 → **会话 override** → settings → DEFAULT_MODEL）：本执行器无"请求体"层，
+     * 从会话层开始。
+     *
+     * @param sessionId 目标会话（QueueItem.sessionId；null/哨兵 → 跳过会话层，走 settings）
+     */
+    private String resolveMainModelName(String sessionId) {
+        if (modelMapper == null) return null;
+        String mainRaw = null;
+        // 1) 会话 override（sessions.model_name · 存量已是全名）
+        if (sessionId != null && !sessionId.isBlank() && sessionMapper != null
+                && !SessionKeys.isNoSession(sessionId)) {
+            try {
+                SessionRecord sess = sessionMapper.selectOneById(sessionId);
+                if (sess != null && sess.getModelName() != null && !sess.getModelName().isBlank()) {
+                    mainRaw = sess.getModelName();
+                    if (log.isDebugEnabled()) {
+                        log.debug("CronIdleExecutor: 主模型取会话 override session={} model={}", sessionId, mainRaw);
+                    }
+                }
+            } catch (Exception e) {
+                log.debug("CronIdleExecutor: 读会话 override 失败 session={} err={}", sessionId, e.getMessage());
+            }
+        } else if (log.isDebugEnabled()) {
+            // 命令无会话锚（sessionId=null / 哨兵 / mapper 未注入）→ 本来就没有会话 override 可言，
+            // 回落 settings 是唯一正确语义（与 ChatService 四层链「无会话层」一致）。
+            log.debug("CronIdleExecutor: 命令无会话锚 session={} → 主模型回落 settings 默认", sessionId);
+        }
+        // 2) settings 默认
+        if (mainRaw == null) {
+            if (settingsMapper == null) return null;
+            SettingsRecord s = settingsMapper.selectOneById(SETTINGS_SINGLETON_ID);
+            mainRaw = s != null ? s.getMainModelName() : null;
+        }
         if (mainRaw == null || mainRaw.isBlank()) return null;
         // [全名化] settings 存全名/裸名（V28 RENAME main_model_id→main_model_name），走全名反查而非 selectOneById（id 直查会 miss）
         ModelRecord m = com.nexusai.infra.llm.ModelNameResolver.resolve(modelMapper, providerMapper, mainRaw);
-        return (m != null && Boolean.TRUE.equals(m.getEnabled())) ? m.getName() : null;
+        // [2026-10-22 绑定不漂移] 返回**全名**（provider/model）而不是裸名：下游 resolveMainConfig →
+        //   ModelConfigResolver.resolve(name) 会再解析一次，裸名走「按 name 取第一条」兼容路径，
+        //   可能换到另一个 provider 的同名模型（实测夜间落到 ds-zcw-openai 的失效 key，整轮 401）。
+        //   全名让第二次解析命中同一个 provider（ModelNameResolver 精确路径）。
+        return (m != null && Boolean.TRUE.equals(m.getEnabled()))
+            ? com.nexusai.infra.llm.ModelNameResolver.toFullName(providerMapper, m) : null;
     }
 
     /** 主模型 config — ModelConfigResolver.resolve（任一步不可用 → null → run() 走 mock，仅 warn）。 */
-    private com.nexusai.infra.llm.ProviderConfig resolveMainConfig() {
+    private com.nexusai.infra.llm.ProviderConfig resolveMainConfig(String sessionId) {
         if (modelConfigResolver == null) return null;
-        String modelName = resolveMainModelName();
+        String modelName = resolveMainModelName(sessionId);
         if (modelName == null) return null;
         ModelConfigResolver.ResolvedModel resolved = modelConfigResolver.resolve(modelName);
         return resolved != null ? resolved.config() : null;
