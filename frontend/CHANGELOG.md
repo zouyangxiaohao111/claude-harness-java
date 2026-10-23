@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.51] - 2026-10-23
+
+### Fixed
+
+- 专家（主线程 agent）的 `tools:` 白名单在主线程不生效，模型仍能使用未列出的工具；现按会话绑定 agent 生效，并新增专属工具机制（仅白名单点名可见）。后端批次，前端零改动。
+
 ## [0.1.50] - 2026-10-23
 
 ### 修复

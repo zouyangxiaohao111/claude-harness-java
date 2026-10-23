@@ -109,6 +109,15 @@ public class ToolRegistry {
     private final java.util.Set<String> mcpToolNames = new java.util.LinkedHashSet<>();
 
     /**
+     * [agent-tool-scope] 专属工具名集合 · 标注 {@link ExclusiveTool} 的工具在注册时登记。
+     *
+     * <p><b>只影响装配期可见性，不影响注册</b>：专属工具照常进 {@link #tools} 全局表，
+     * 但默认池/通配池装配时会被 {@link AgentToolPolicy} 剔除，只有被
+     * {@code AgentDefinition.tools} 逐名点名才返回。判定唯一来源 = {@link ToolScope#of(Tool)}。
+     */
+    private final java.util.Set<String> exclusiveToolNames = new java.util.LinkedHashSet<>();
+
+    /**
      * <b>[IMP-C4 REQ-G3-2-5] 显式工具序</b> · 对齐 CC {@code tools.ts:194-250 getAllBaseTools()}
      * 的显式 46+ 位次工具序（prompt-cache 稳定不变量，01 §1.1 不变量3）。
      *
@@ -278,7 +287,13 @@ public class ToolRegistry {
             log.warn("ToolRegistry: tool '{}' already registered, overwriting", tool.name());
         }
         tools.put(tool.name(), tool);
-        log.debug("ToolRegistry: registered '{}'", tool.name());
+        // [agent-tool-scope] 专属工具登记（同名覆盖时以最后一次注册为准）
+        if (ToolScope.of(tool) == ToolScope.EXCLUSIVE) {
+            exclusiveToolNames.add(tool.name());
+        } else {
+            exclusiveToolNames.remove(tool.name());
+        }
+        log.debug("ToolRegistry: registered '{}' (scope={})", tool.name(), ToolScope.of(tool));
 
         // P1.2: register 时同步建立 alias 反向映射 (CC Tool.ts:368-371 toolMatchesName 语义)
         List<String> aliases = tool.aliases();
@@ -349,6 +364,7 @@ public class ToolRegistry {
         if (name == null) return false;
         Tool t = tools.remove(name);
         if (t != null) {
+            exclusiveToolNames.remove(name);
             // 主名移除: 同步清掉该 tool 的所有 alias (CC 源配套清, 不留 dangling alias)
             List<String> aliases = t.aliases();
             if (aliases != null) {
@@ -478,6 +494,24 @@ public class ToolRegistry {
 
     public int size() {
         return tools.size();
+    }
+
+    /**
+     * [agent-tool-scope] 该工具名是否为专属工具（{@link ExclusiveTool}）。
+     *
+     * <p>供工具列表 DTO / 诊断使用；装配期过滤请直接用 {@link AgentToolPolicy}
+     * （它对 {@link Tool} 实例判定，避免同名 alias 歧义）。
+     *
+     * @param name 工具主名（null → false）
+     * @return true = 专属工具
+     */
+    public boolean isExclusive(String name) {
+        return name != null && exclusiveToolNames.contains(name);
+    }
+
+    /** [agent-tool-scope] 当前 registry 内专属工具名快照（只读）。 */
+    public java.util.Set<String> exclusiveToolNames() {
+        return java.util.Collections.unmodifiableSet(exclusiveToolNames);
     }
 
     /**

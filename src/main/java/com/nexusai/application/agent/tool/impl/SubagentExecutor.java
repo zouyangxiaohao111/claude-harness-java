@@ -3883,7 +3883,18 @@ public class SubagentExecutor {
         boolean hasWildcard = agentDefinition.tools().isEmpty() || agentDefinition.usesAllTools();
         List<String> toolNames = agentDefinition.tools().orElse(List.of());
         if (hasWildcard) {
-            return filtered;
+            // [agent-tool-scope] 专属工具不进通配池：只有 AgentDefinition.tools 逐名点名才可见。
+            //   与主线程 LlmAgentLoop.applySessionAgentToolPolicy 共用同一判定（ToolScope 单一来源）。
+            //   显式列表分支不需改：by-name 解析天然允许点名专属工具。
+            List<Tool> commonOnly = new ArrayList<>(filtered.stream()
+                    .filter(t -> com.nexusai.application.agent.tool.ToolScope.of(t)
+                            == com.nexusai.application.agent.tool.ToolScope.COMMON)
+                    .toList());
+            if (log.isDebugEnabled() && commonOnly.size() != filtered.size()) {
+                log.debug("[SubagentExecutor] 通配池隐藏 {} 个专属工具 agent={}",
+                        filtered.size() - commonOnly.size(), agentDefinition.agentType());
+            }
+            return commonOnly;
         }
         // CC :175-216: by-name 解析 (availableToolMap 查表 + valid/invalid 拆分)
         List<Tool> resolved = new ArrayList<>();

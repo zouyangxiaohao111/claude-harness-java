@@ -4746,6 +4746,16 @@ public class LlmAgentLoop implements AgentLoop {
             log.debug("[LlmAgentLoop] turn={} per-turn TUC tools refreshed: mcp={} pool={}",
                 state.turnCount(), mcpTools.size(), poolSize);
         }
+        // [agent-tool-scope] 主线程 agent 白名单/专属工具必须在「同一份 per-turn 池」上落地：
+        //   schema 侧 llmToolsArray → sessionVisibleTools 与执行侧 StreamingToolExecutor 都读
+        //   tuc.availableTools()。只过滤 schema 不过滤执行 ⇒ 历史 tool_call / 模型幻觉仍可执行
+        //   模型「看不见」的工具。两处调用同一纯函数，幂等（第二次解析结果相同）。
+        if (ref[0] != null && ref[0].sessionId() != null
+                && isTopLevelLoopSource(params.querySource())) {
+            List<Tool> scoped = applySessionAgentToolPolicy(
+                    ref[0].sessionId(), ref[0].availableTools());
+            ref[0] = ref[0].withAvailableTools(scoped);
+        }
         return ref[0];
     }
 
@@ -13233,7 +13243,68 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
         }
+        // [agent-tool-scope] 主线程 agent 工具白名单（用户 2026-10-23 裁定）· 对齐 CC
+        //   REPL.tsx:1089/:2919 resolveAgentTools(mainThreadAgentDefinition, merged, false, true)。
+        //   仅顶层循环生效：子代理走 SubagentExecutor.resolveAgentTools 的同源策略，避免双过滤；
+        //   hook/compact 等非主线程来源不读会话 agent 列（其工具池由各自装配链决定）。
+        //   顺序 = 权限链（bare/deny/coordinator/会话禁用）之后 —— 白名单不能复活被权限挡掉的工具。
+        if (available != null && tuc != null && tuc.sessionId() != null
+                && isTopLevelLoopSource(querySource)) {
+            available = applySessionAgentToolPolicy(tuc.sessionId(), available);
+        }
         return available;
+    }
+
+    /**
+     * [agent-tool-scope] 会话主线程 agent 的工具策略 · 白名单唯一接入点。
+     *
+     * <p>三种输入对应三种结果：
+     * <ul>
+     *   <li>会话没绑定 {@code main_thread_agent} → 默认池（剔除专属工具 + disallowedTools）；</li>
+     *   <li>绑定了但 registry 未命中（类型已删/未接线）→ 默认池 + WARN（对齐 CC
+     *       {@code mainThreadAgentDefinition} 非空才参与，找不到即回落无 agent 语义）；</li>
+     *   <li>命中 → 按 {@code tools} 显式名单<b>替换</b>工具池（CC resolveAgentTools by-name 语义）。</li>
+     * </ul>
+     *
+     * <p>⚠️ 每轮求值：会话切 agent / 改白名单下一轮即生效，不做进程级缓存（多会话并发安全）。
+     *
+     * @param sessionId     会话 id（非空，调用方已判）
+     * @param available     已过 bare/deny/coordinator/会话禁用的当轮工具池
+     * @return 最终可见工具列表
+     */
+    private static List<Tool> applySessionAgentToolPolicy(String sessionId, List<Tool> available) {
+        java.util.Optional<java.util.List<String>> noList = java.util.Optional.empty();
+        com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
+        String agentType = row != null ? row.getMainThreadAgent() : null;
+        if (agentType == null || agentType.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[LlmAgentLoop] 会话未绑定主线程 agent → 默认池装配（隐藏专属工具）: session={} 池 {}",
+                        sessionId, available.size());
+            }
+            return com.nexusai.application.agent.tool.AgentToolPolicy.apply(available, noList, noList);
+        }
+        com.nexusai.application.agent.tool.impl.SubagentTool subagentTool = findSubagentTool();
+        if (subagentTool == null) {
+            log.warn("[LlmAgentLoop] 会话绑定了主线程 agent 但 SubagentTool 未接线，无法解析定义"
+                    + " → 按默认池装配（专属工具隐藏）: session={} agent={}", sessionId, agentType);
+            return com.nexusai.application.agent.tool.AgentToolPolicy.apply(available, noList, noList);
+        }
+        com.nexusai.application.agent.subagent.AgentDefinition def =
+                subagentTool.agentRegistry(sessionId).findAgent(agentType.trim());
+        if (def == null) {
+            log.warn("[LlmAgentLoop] 会话主线程 agent 未命中 registry → 按默认池装配（专属工具隐藏）: "
+                    + "session={} agent={}", sessionId, agentType);
+            return com.nexusai.application.agent.tool.AgentToolPolicy.apply(available, noList, noList);
+        }
+        java.util.List<Tool> resolved =
+                com.nexusai.application.agent.tool.AgentToolPolicy.apply(
+                        available, def.tools(), def.disallowedTools());
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] 主线程 agent 工具白名单生效: session={} agent={} 池 {}→{}（tools 声明 {} 项）",
+                    sessionId, agentType, available.size(), resolved.size(),
+                    def.tools().map(java.util.List::size).orElse(-1));
+        }
+        return resolved;
     }
 
     /**
