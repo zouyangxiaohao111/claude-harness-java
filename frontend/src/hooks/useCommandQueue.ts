@@ -23,6 +23,9 @@ import type { AttachmentRequest } from '../api/types'
  */
 export const NON_EDITABLE_MODES: ReadonlySet<string> = new Set(['task-notification'])
 
+/** 稳定的空列表（按会话分桶后，缺键的会话共用同一个引用，避免每次渲染造新数组）。 */
+const EMPTY_QUEUE: QueuedCommand[] = []
+
 /** CC `isPromptInputModeEditable(mode) = !NON_EDITABLE_MODES.has(mode)`（:347-351）。 */
 export function isPromptInputModeEditable(mode?: string): boolean {
   return !NON_EDITABLE_MODES.has(String(mode ?? ''))
@@ -73,14 +76,23 @@ export interface UseCommandQueue {
    * @return `{text, attachments}`；失败/无响应 → null（调用方保持现状，不放任输入框被清空）
    */
   popEditable: (sessionId: string, currentInput?: string) => Promise<PoppedQueueInput | null>
-  /** 预留：后端 B5 队列出站事件到达时写入本地（订阅通道接好后调用） */
-  setQueued: (cmds: QueuedCommand[]) => void
+  /** 写入**指定会话**的排队快照（[2026-10-23] 按 sid 分桶：多会话并行时互不覆盖） */
+  setQueued: (sessionId: string, cmds: QueuedCommand[]) => void
   /** 清空（会话切换/断连） */
   clear: () => void
 }
 
-export function useCommandQueue(): UseCommandQueue {
-  const [queuedCommands, setQueuedCommands] = useState<QueuedCommand[]>([])
+/**
+ * @param sessionId 当前展示的会话 —— 排队框**按会话隔离**（[2026-10-23] 见 {@link UseCommandQueue.setQueued}）
+ */
+export function useCommandQueue(sessionId?: string | null): UseCommandQueue {
+  // [2026-10-23 跨会话串台修复] 排队快照按 sessionId 分桶。
+  //   WHY：后端 `/topic/sessions/{sid}/queue` 是会话级 topic，而前端给**每个活跃会话**都订阅了
+  //   （多会话并行）；原实现只有一个全局 `queuedCommands`、setQueued 还把 sid 丢掉 ⇒ 后到的会话
+  //   快照覆盖当前会话的排队框（A 窗口里显示 B 的排队命令/系统通知）。切会话时清空只是把它
+  //   从「显示别人的」降级成「显示空的」，且会把另一会话真实在排队的项一起抹掉。
+  const [bySid, setBySid] = useState<Record<string, QueuedCommand[]>>({})
+  const queuedCommands = (sessionId ? bySid[sessionId] : undefined) ?? EMPTY_QUEUE
   const hasEditable = queuedCommands.some((c) => c.isEditable)
 
   const popEditable = useCallback(async (sessionId: string, currentInput?: string): Promise<PoppedQueueInput | null> => {
@@ -98,7 +110,7 @@ export function useCommandQueue(): UseCommandQueue {
       //   （对齐 CC :480-481 `commandQueue.push(...nonEditable)` —— 不是清空整条队列）。
       //   ⛔ 判据与后端谓词同源：`isQueuedCommandEditable`（若这里写 `!c.isEditable` 也等价，
       //   但两处判据会漂移 —— 本 hook 的 isEditable 字段即由该函数生成，见 useChatSocket）。
-      setQueuedCommands((prev) => prev.filter((c) => !isQueuedCommandEditable(c)))
+      setBySid((prev) => ({ ...prev, [sessionId]: (prev[sessionId] ?? []).filter((c) => !isQueuedCommandEditable(c)) }))
       return { text: res.text ?? '', attachments: res.attachments ?? [] }
     } catch (err) {
       // 优雅降级但**不静默**：后端 B4 未接 / 网络失败 → 输入框保持原样（绝不半途清空），
@@ -108,8 +120,12 @@ export function useCommandQueue(): UseCommandQueue {
     }
   }, [])
 
-  const setQueued = useCallback((cmds: QueuedCommand[]) => setQueuedCommands(cmds), [])
-  const clear = useCallback(() => setQueuedCommands([]), [])
+  /** 写入**该 sid 自己**的排队快照（缺 sid 的快照直接丢弃 — 来源不明就不猜会话）。 */
+  const setQueued = useCallback((sid: string, cmds: QueuedCommand[]) => {
+    if (!sid) return
+    setBySid((prev) => (prev[sid] === cmds ? prev : { ...prev, [sid]: cmds }))
+  }, [])
+  const clear = useCallback(() => setBySid((prev) => (Object.keys(prev).length === 0 ? prev : {})), [])
 
   return { queuedCommands, hasEditable, popEditable, setQueued, clear }
 }

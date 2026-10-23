@@ -122,19 +122,21 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
       const evt = JSON.parse(msg.body) as TeamStatusEvent
       const st = useTeamStore.getState()
       if (evt.eventType === 'deleted') {
-        st.clear()
+        // 团队解散 → 只删**该 lead** 的桶（其它会话的团队缓存不受影响）
+        st.clear(leadSessionId)
       } else if (evt.eventType === 'created' || evt.eventType === 'member_joined' || evt.eventType === 'member_left') {
         // created（团队创建）/ member_joined / member_left（成员增删）→ 以响应为准刷新详情 + 保留订阅键
         st.setTeamName(evt.teamName, leadSessionId)
         // [批 3a] sessionId 必传：订阅键 leadSessionId 即该 team 的 lead 会话（后端按它做会话隔离校验）
-        teamsApi.get(evt.teamName, leadSessionId).then(st.setTeam).catch(() => {})
+        teamsApi.get(evt.teamName, leadSessionId).then((team) => st.setTeam(leadSessionId, team)).catch(() => {})
       }
     } catch { /* 非法载荷忽略 */ }
   })
   const messages = client.subscribe(`/topic/sessions/${leadSessionId}/team-messages`, (msg) => {
     try {
       const evt = JSON.parse(msg.body) as TeammateMessageEvent
-      useTeamStore.getState().addMessage(evt)
+      // [2026-10-23] 按订阅键（lead 会话）入桶 —— 原实现追加进全局数组，多会话并行时串台
+      useTeamStore.getState().addMessage(leadSessionId, evt)
     } catch { /* 非法载荷忽略 */ }
   })
   return { status, messages }
@@ -231,6 +233,35 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
     bridgeDismissSubs.set(sid, dismiss)
   }
   return subs
+}
+
+/**
+ * 从会话级 topic 解析会话 id：`/topic/sessions/{sid}`、`/topic/sessions/{sid}/stream|status|…`。
+ * 非会话 topic（如 `/topic/tasks`）→ null。
+ */
+function sessionIdOfTopic(topic?: string): string | null {
+  if (!topic) return null
+  const m = /^\/topic\/sessions\/([^/]+)(?:\/|$)/.exec(topic)
+  return m ? decodeURIComponent(m[1]) : null
+}
+
+/**
+ * 事件归属会话（**topic 优先**）· [2026-10-23 跨会话串台修复]。
+ *
+ * <p>WHY：「这一帧属于哪个会话」的唯一权威是**投递通道**（订阅的 topic 本身就编码了 sid），
+ * 载荷里的 `sessionId` 只是冗余标注。原实现反着来 —— 先看载荷，载荷缺失才回落到
+ * **当前活动会话** ⇒ 任一缺 `sessionId` 的帧（后台/旁路/旧后端）都会写进当前会话的 store，
+ * 表现为「另一个会话的内容混进了当前会话」，且 F5（只重拉 messages、不清 streams）也去不掉。
+ *
+ * <p>两处不一致（topic 说 A、载荷说 B）时不静默：按 topic 归位并留痕，便于抓上游写错的一侧。
+ */
+function resolveEventSid(evt: StreamEvent, topic: string | undefined, fallback: string | null): string {
+  const topicSid = sessionIdOfTopic(topic)
+  const evtSid = evt.sessionId ?? null
+  if (topicSid && evtSid && topicSid !== evtSid) {
+    console.warn('[stream] 会话归属不一致（以 topic 为准）', { topicSid, evtSid, type: evt.type })
+  }
+  return topicSid ?? evtSid ?? fallback ?? ''
 }
 
 /**
@@ -852,7 +883,7 @@ export function useChatSocket(
    * - 连续 → 正常分派并推进已见最大
    */
   function acceptStreamEvent(evt: StreamEvent, topic?: string): void {
-    const sid = evt.sessionId ?? sessionIdRef.current ?? ''
+    const sid = resolveEventSid(evt, topic, sessionIdRef.current)
     const seq = typeof evt.seq === 'number' ? evt.seq : 0
     if (!sid || !seq) {
       dispatchEvent(evt, topic)
@@ -902,7 +933,7 @@ export function useChatSocket(
       for (const it of buf) {
         // ⚠️ 缓冲是全局的：修复某个会话时，其它会话到达的帧也会在缓冲里 —— 序号必须按
         //    **帧自身归属** 的会话推进，不能一律记到本次修复的 sid（否则污染别会话的窗口）。
-        const itemSid = it.evt.sessionId ?? sid
+        const itemSid = resolveEventSid(it.evt, it.topic, sid)
         const s = it.evt.seq ?? 0
         if (s > 0) {
           if (s <= (lastSeqRef.current.get(itemSid) ?? 0)) continue
@@ -920,8 +951,9 @@ export function useChatSocket(
     noteInboundFrame(evt.type)
     // TEMP 诊断（多会话联调）：事件流全量 + tool_call 块 id 匹配检查
     console.debug('[stream]', evt.type, { sessionId: evt.sessionId ?? sessionId, assistantMessageId: (evt as { assistantMessageId?: string }).assistantMessageId })
-    // 多会话分发：事件归属会话优先取 evt.sessionId（切走会话的事件仍落到原会话 streams）
-    const sid = evt.sessionId ?? sessionId ?? ''
+    // 多会话分发：归属会话 = **投递 topic**（其 sid 是权威）→ 载荷 sessionId → 当前会话兜底。
+    //   [2026-10-23] 原顺序（载荷优先、缺失回落当前会话）会把缺 sessionId 的帧写进当前会话。
+    const sid = resolveEventSid(evt, topic, sessionId)
     if (isPushedUser(evt)) {
       // P0 排队消息气泡：message.user 按事件携带的 isMeta 分流（不再一刀切硬编码占位）——
       //   isMeta=false（普通用户消息，含 busy-queued 排队插队注入）→ 渲染正式 user 气泡（进消息列表，id 判重）；

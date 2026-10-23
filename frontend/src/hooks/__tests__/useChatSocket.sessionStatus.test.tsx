@@ -54,10 +54,13 @@ const SID = 'sess-c6-status'
 const OTHER = 'sess-c6-other'
 const STREAM_TOPIC = `/topic/sessions/${SID}/stream`
 
-/** 打进一条 session.status（载荷形状 = 后端 SessionStatusEvent）。 */
+/** 打进一条 session.status（载荷形状 = 后端 SessionStatusEvent）。
+ *  [2026-10-23] 事件归属以**投递 topic** 为准 ⇒ 打给哪个会话就走它自己的通道：
+ *  当前会话（SID）走它常驻的 stream topic；其它会话（模拟多会话并行）走它自己的 stream topic。 */
 function pushSessionStatus(status: string, sessionId: string = SID) {
-  const sub = fakeClient.subscriptions.find((s) => s.destination === STREAM_TOPIC)
-  if (!sub) throw new Error('前置失败：会话 stream topic 未订阅 —— 假 client 未记录到订阅回调')
+  const topic = sessionId === SID ? STREAM_TOPIC : `/topic/sessions/${sessionId}/stream`
+  const sub = fakeClient.subscriptions.find((s) => s.destination === topic)
+  if (!sub) throw new Error(`前置失败：${topic} 未订阅 —— 假 client 未记录到订阅回调`)
   act(() => { sub.cb({ body: JSON.stringify({ type: 'session.status', status, sessionId }) }) })
 }
 
@@ -68,8 +71,9 @@ let container: HTMLDivElement | undefined
 let root: Root | undefined
 
 function Host() {
-  // 真 hook（只换了传输层）：sessionId = 当前会话，events 从它的订阅回调进
-  useChatSocket(SID, {}, undefined, undefined, undefined, undefined, () => {})
+  // 真 hook（只换了传输层）：sessionId = 当前会话；OTHER 作为**并行活跃会话**登记
+  //   （多会话并行是「按会话键控」用例的前提：它自己那条 stream topic 会被订阅）
+  useChatSocket(SID, { [OTHER]: `/topic/sessions/${OTHER}/stream` }, undefined, undefined, undefined, undefined, () => {})
   return null
 }
 

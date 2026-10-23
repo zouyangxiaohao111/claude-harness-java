@@ -168,7 +168,9 @@ function App() {
   const [centerView, setCenterView] = useState<'chat' | 'trace'>('chat')
   const [composerText, setComposerText] = useState('')
   // F19/#3 排队命令状态机（后端 B4/B5 未接时恒空，优雅降级）
-  const commandQueue = useCommandQueue()
+  // [2026-10-23] 传当前会话：排队快照按会话分桶（多会话并行时 B 的 queue.changed 不得覆盖 A 的排队框）。
+  //   此处与 :385 的 activeSessionId 同源（sessionR.activeSession），沿用 :133 的写法避免提升 const。
+  const commandQueue = useCommandQueue(sessionR.activeSession)
   // `currentModel` is derived from the active session's `modelName` —
   // every tab (session) carries its own main agent model, and switching
   // tabs changes the chat header / menubar automatically.
@@ -922,8 +924,10 @@ function App() {
   }, [])
 
   // 排队命令出站回调（B5）：queue.changed → 刷新排队框；queue.drained → append 正式气泡 + 登记新 streamTopic
-  const handleQueueChanged = useCallback((_sid: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => {
-    commandQueue.setQueued(commands)
+  const handleQueueChanged = useCallback((sid: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => {
+    // [2026-10-23] sid 必须带上：每个活跃会话都有自己的 queue topic，丢掉 sid 会让
+    //   后到达的快照覆盖当前会话的排队框（跨会话串台）。
+    commandQueue.setQueued(sid, commands)
   }, [commandQueue])
   const handleQueueDrained = useCallback((sid: string, drained: DrainedQueueItem[]) => {
     if (drained.length === 0) return
@@ -1012,8 +1016,8 @@ function App() {
       // 已激活会话重复点击 → no-op（防快速连点把「切换清空+重拉+整列表重渲染」排队压主线程 → 卡死）
       if (sessionId === activeSessionId) return
       sessionDispatch({ type: 'SWITCH', sessionId })
-      // 排队命令按会话隔离：切会话 → 清空排队框（否则显示上个会话的排队命令）
-      commandQueue.clear()
+      // [2026-10-23] 不再「切会话清空排队框」——useCommandQueue 已按会话分桶，直接显示目标会话
+      //   自己的快照即可；清空会把另一会话**真实在排队**的项一起抹掉。
       if (!sessionR.openSessions.includes(sessionId)) {
         sessionDispatch({ type: 'ADD_TAB', tabId: sessionId })
         showToast(`已打开: ${s.title}`, 'success')
@@ -1021,7 +1025,7 @@ function App() {
         showToast(`已切换到: ${s.title}`, 'success')
       }
     },
-    [sessions, sessionR.openSessions, sessionDispatch, showToast, commandQueue, activeSessionId],
+    [sessions, sessionR.openSessions, sessionDispatch, showToast, activeSessionId],
   )
 
   // ---- delete session（后端删 + 本地清 store + 切到下一个会话）----

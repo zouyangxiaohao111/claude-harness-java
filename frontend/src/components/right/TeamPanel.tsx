@@ -3,7 +3,7 @@ import { sessionApi } from '@/api/sessions'
 import { teamsApi } from '@/api/teams'
 import { featuresApi } from '@/api/features'
 import { ApiError } from '@/api/rest'
-import { useTeamStore } from '@/stores/teamStore'
+import { teamSliceOf, useTeamStore } from '@/stores/teamStore'
 import { subagentColor, type SessionTeamContext, type TeamMemberDto } from '@/api/types'
 import { FormModal } from '@/components/ui/FormModal'
 
@@ -57,11 +57,11 @@ function tsOf(ts: string): number {
  * 实时消息/状态由 useChatSocket 订阅 /topic/sessions/{leadSessionId}/team-* 写入 useTeamStore 消费。
  */
 export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, onViewMember }: TeamPanelProps) {
-  const teamName = useTeamStore((s) => s.teamName)
-  const team = useTeamStore((s) => s.team)
-  const messages = useTeamStore((s) => s.messages)
-  const unread = useTeamStore((s) => s.unread)
-  const inbox = useTeamStore((s) => s.inbox)
+  // [2026-10-23] 团队态按 lead 会话分桶：只读「当前指针指向的那个团队」的切片，
+  //   其它会话的团队缓存留在 store 里（切回时不重拉、也不互相覆盖）。
+  const leadSessionId = useTeamStore((s) => s.leadSessionId)
+  const slice = useTeamStore((s) => teamSliceOf(s, s.leadSessionId))
+  const { teamName, team, messages, unread, inbox } = slice
   const setTeamName = useTeamStore((s) => s.setTeamName)
   const setTeam = useTeamStore((s) => s.setTeam)
   const setInbox = useTeamStore((s) => s.setInbox)
@@ -90,14 +90,16 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
   }, [])
 
   // 挂载 + sessionId 变化：拉会话 → 读 teamContext → 有 team 再拉详情
-  // 注意：不在开头无条件 clearTeam —— tab 切换重挂载时保留 store 里的消息流/未读数；
-  //      会话无 team / 切换团队时由 setTeamName 或 clearTeam 兜底重置。
+  // [2026-10-23] 开始时只**清指针**（不删桶）：多会话各有一份团队缓存，切回时不重拉；
+  //   清指针也顺带消掉「切到非团队会话的瞬间先闪出上一个会话团队」。
+  //   会话无 team / 切换团队时由 setTeamName 或 clearTeam 兜底重置。
   // 拉取会话 teamContext → 有 team 再拉详情（门控 + 订阅键）。成员增删/团队变化靠
   //   STOMP member_joined/created 实时刷新 + 4s 轮询兜底（防推送丢失/后端成员未落 config）。
   useEffect(() => {
+    // 先解绑当前指针（桶保留）—— 等下面拉到本会话的 teamContext 再重新指向
+    clearTeam()
     if (!sessionId) {
       setTeamContext(null)
-      clearTeam()
       return
     }
     let cancelled = false
@@ -116,11 +118,12 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
           const name = tc?.teamName ?? null
           if (name) {
             // 方案3：STOMP 订阅键 = leadSessionId（创建团队的会话），从 teamContext 透出
-            setTeamName(name, tc?.leadSessionId ?? null)
+            const lead = tc?.leadSessionId ?? null
+            setTeamName(name, lead)
             // 详情拉取失败不阻塞：状态卡仍可凭 teamName/leadAgentId 渲染
-            teamsApi.get(name, sid).then(setTeam).catch(() => {})
+            teamsApi.get(name, sid).then((t) => setTeam(lead, t)).catch(() => {})
           } else {
-            // 会话无 team（非团队会话 / 后端已清 teamContext）→ 清空团队态
+            // 会话无 team（非团队会话 / 后端已清 teamContext）→ 只解绑指针，保留其它团队缓存
             clearTeam()
           }
         })
@@ -163,8 +166,9 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
       })
       setShowCreate(false)
       // 后端重名自动换名 → 以响应名为准；leadSessionId 透出 → STOMP 订阅键
-      setTeamName(created.name, created.leadSessionId ?? sessionId)
-      setTeam(created)
+      const lead = created.leadSessionId ?? sessionId
+      setTeamName(created.name, lead)
+      setTeam(lead, created)
       // 空态创建：teamContext 门控同步置为非 null，立即渲染状态卡
       setTeamContext({ teamName: created.name, leadAgentId: created.leadAgentId, leadSessionId: created.leadSessionId ?? sessionId })
       showToast(`团队「${created.name}」已创建`, 'success')
@@ -179,7 +183,7 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
     if (!confirm('解散团队？活跃成员会先收到关闭请求')) return
     try {
       await teamsApi.remove(teamName, sessionId)
-      clearTeam()
+      clearTeam(leadSessionId)
       setTeamContext(null)
       showToast('团队已解散', 'success')
     } catch (e) {
@@ -192,7 +196,7 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
     if (!teamName) return
     try {
       const updated = await teamsApi.removeMember(teamName, agentId)
-      setTeam(updated)
+      setTeam(leadSessionId, updated)
       showToast('已移除成员', 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
@@ -208,7 +212,7 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
       showToast(`已停止 @${agentId.split('@')[0]}`, 'success')
       // kill 后成员从 config 移除 → 刷新团队详情
       const updated = await teamsApi.get(teamName, sessionId)
-      setTeam(updated)
+      setTeam(leadSessionId, updated)
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
@@ -229,7 +233,7 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
         subagentType: v.subagentType?.trim() || 'general-purpose',
         prompt: v.prompt?.trim() || undefined,
       })
-      setTeam(updated)
+      setTeam(leadSessionId, updated)
       setShowAddMember(false)
       showToast(`已启动成员 @${name}`, 'success')
     } catch (e) {
@@ -252,8 +256,8 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
     const next = !inboxOpen
     setInboxOpen(next)
     if (next && teamName) {
-      teamsApi.inbox(teamName).then(setInbox).catch(() => {})
-      markAllRead()
+      teamsApi.inbox(teamName).then((list) => setInbox(leadSessionId, list)).catch(() => {})
+      markAllRead(leadSessionId)
     }
   }
 
