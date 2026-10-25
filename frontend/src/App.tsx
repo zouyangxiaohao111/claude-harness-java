@@ -84,6 +84,11 @@ import { DiffModal } from '@/components/modals/DiffModal'
 import { FileViewModal } from '@/components/modals/FileViewModal'
 import { openStandalone, previewKindOfPath, basenameOf } from '@/utils/standalonePreview'
 
+/** 会话主模型只允许对话类；embedding/rerank 等非对话模型不能被选为会话模型。
+ *  空 type 按历史对话模型兼容（老数据没有 type 值）。 */
+const CHAT_MODEL_TYPES = new Set(['chat', 'text', 'vision', 'multimodal'])
+const isChatModelType = (t?: string | null) => !t || CHAT_MODEL_TYPES.has(t.toLowerCase())
+
 /** Per-session project state: main, subs, expanded toggles, transient flash. */
 interface SessionProjectState {
   main: Project
@@ -1076,7 +1081,8 @@ function App() {
     if (main) {
       for (const p of providersApi.list) {
         if (!p.enabled) continue
-        const hit = p.models.find((m) => m.enabled && `${p.name}/${m.name}` === main)
+        const hit = p.models.find((m) => m.enabled && isChatModelType(m.type)
+          && `${p.name}/${m.name}` === main)
         if (hit) {
           // [半动态 KIMI] 存储 tag 是 DS 兜底时，若品牌能从模型全名推断（如 kimi/moonshot）→ 用推断值，
           // 避免「选了 kimi 却发 model=DS」；已存明确标签（CL/GP/QW/KIMI）则尊重
@@ -1085,9 +1091,11 @@ function App() {
         }
       }
     }
-    // 2) 回落第一个 enabled provider 的第一个 enabled model
-    const firstEnabled = providersApi.list.find((p) => p.enabled && p.models.length > 0)
-    const m = firstEnabled?.models.find((x) => x.enabled) ?? firstEnabled?.models[0]
+    // 2) 回落第一个 enabled provider 的第一个 enabled「对话类」模型
+    //    ⛔ 不能只看 enabled：embedding/rerank 模型排在前时会成为新会话默认模型（聊天必失败）
+    const firstEnabled = providersApi.list.find((p) => p.enabled
+      && p.models.some((x) => x.enabled && isChatModelType(x.type)))
+    const m = firstEnabled?.models.find((x) => x.enabled && isChatModelType(x.type))
     if (m && firstEnabled) return { tag: m.tag, name: `${firstEnabled.name}/${m.name}` }
     // 3) 回落当前会话
     if (activeSession?.modelName) return { tag: (activeSession.model ?? 'DS') as ModelTag, name: activeSession.modelName }

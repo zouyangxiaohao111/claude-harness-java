@@ -34,6 +34,26 @@ public class ModelRecord {
     private String createdAt;
     private Integer maxContextTokens;
     /**
+     * 向量维度（仅 {@code type=embedding} 生效）· V200 列 {@code embedding_dimensions}。
+     * null = 请求不携带 {@code dimensions}，由服务端使用模型默认维度。
+     */
+    private Integer embeddingDimensions;
+    /**
+     * 单次 embedding 请求文本条数上限 · V200 列 {@code embedding_batch_size}。
+     * null/≤0 = 10（百炼单请求上限）。
+     */
+    private Integer embeddingBatchSize;
+    /**
+     * 重排默认返回条数（仅 {@code type=rerank} 生效）· V200 列 {@code rerank_top_n}。
+     * null = 请求不携带 {@code top_n}（服务端默认）。
+     */
+    private Integer rerankTopN;
+    /**
+     * 重排默认指令（仅 {@code type=rerank} 生效）· V200 列 {@code rerank_instruct}。
+     * null/空 = 不发送 {@code instruct}。
+     */
+    private String rerankInstruct;
+    /**
      * 输入 tokens 价格（高峰档，元/百万 tokens）· CC original: {@code ModelCosts.inputTokens}
      * (modelCost.ts:27-33) —— V47 列 input_price_peak。可空 = 未配置 → 运行时回落内置默认。
      */
@@ -88,6 +108,11 @@ public class ModelRecord {
         m.setTopP(topP);
         // W2-1: 模型级上下文窗口（models.max_context_tokens）映射进领域对象（此前死列零接线）
         m.setMaxContextTokens(maxContextTokens);
+        // [V200] 向量嵌入配置 → 领域对象
+        m.setEmbeddingDimensions(embeddingDimensions);
+        m.setEmbeddingBatchSize(embeddingBatchSize);
+        m.setRerankTopN(rerankTopN);
+        m.setRerankInstruct(rerankInstruct);
         // [V-TOK 实施] 价格 8 列 → 领域对象（与 toDomain 对称，ModelCostCalculator 读）
         m.setInputPricePeak(inputPricePeak);
         m.setInputPriceOffpeak(inputPriceOffpeak);
@@ -118,6 +143,11 @@ public class ModelRecord {
         r.setTopP(m.getTopP());
         // W2-1: 领域对象 → models.max_context_tokens 列（与 toDomain 对称）
         r.setMaxContextTokens(m.getMaxContextTokens());
+        // [V200] 领域对象 → 向量嵌入配置（与 toDomain 对称）
+        r.setEmbeddingDimensions(m.getEmbeddingDimensions());
+        r.setEmbeddingBatchSize(m.getEmbeddingBatchSize());
+        r.setRerankTopN(m.getRerankTopN());
+        r.setRerankInstruct(m.getRerankInstruct());
         // [V-TOK 实施] 领域对象 → 价格 8 列（与 toDomain 对称）
         r.setInputPricePeak(m.getInputPricePeak());
         r.setInputPriceOffpeak(m.getInputPriceOffpeak());
@@ -164,6 +194,14 @@ public class ModelRecord {
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public Integer getMaxContextTokens() { return maxContextTokens; }
     public void setMaxContextTokens(Integer maxContextTokens) { this.maxContextTokens = maxContextTokens; }
+    public Integer getEmbeddingDimensions() { return embeddingDimensions; }
+    public void setEmbeddingDimensions(Integer embeddingDimensions) { this.embeddingDimensions = embeddingDimensions; }
+    public Integer getEmbeddingBatchSize() { return embeddingBatchSize; }
+    public void setEmbeddingBatchSize(Integer embeddingBatchSize) { this.embeddingBatchSize = embeddingBatchSize; }
+    public Integer getRerankTopN() { return rerankTopN; }
+    public void setRerankTopN(Integer rerankTopN) { this.rerankTopN = rerankTopN; }
+    public String getRerankInstruct() { return rerankInstruct; }
+    public void setRerankInstruct(String rerankInstruct) { this.rerankInstruct = rerankInstruct; }
     public Double getInputPricePeak() { return inputPricePeak; }
     public void setInputPricePeak(Double inputPricePeak) { this.inputPricePeak = inputPricePeak; }
     public Double getInputPriceOffpeak() { return inputPriceOffpeak; }

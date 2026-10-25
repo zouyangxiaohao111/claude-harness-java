@@ -79,6 +79,11 @@ public class ModelService {
         m.setThink(req.think() != null ? req.think() : "");
         // [2026-10-22 extraBody] 模型级额外请求体（JSON 字符串）· 空/未传 → 空串（运行期按空处理）
         m.setExtraBody(req.extraBody() != null ? req.extraBody() : "");
+        // [V200] 向量嵌入配置（仅 type=embedding 有意义；null = 用服务端默认）
+        m.setEmbeddingDimensions(req.embeddingDimensions());
+        m.setEmbeddingBatchSize(req.embeddingBatchSize());
+        m.setRerankTopN(req.rerankTopN());
+        m.setRerankInstruct(req.rerankInstruct());
         m.setEnabled(req.enabled() == null ? Boolean.TRUE : req.enabled());
         m.setCreatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
         if (log.isDebugEnabled()) {
@@ -114,6 +119,11 @@ public class ModelService {
         if (req.think() != null) m.setThink(req.think());
         // [2026-10-22 extraBody] PATCH 语义：null = 不改；非 null（含空串清空）才写
         if (req.extraBody() != null) m.setExtraBody(req.extraBody());
+        // [V200] PATCH 语义：null 不改
+        if (req.embeddingDimensions() != null) m.setEmbeddingDimensions(req.embeddingDimensions());
+        if (req.embeddingBatchSize() != null) m.setEmbeddingBatchSize(req.embeddingBatchSize());
+        if (req.rerankTopN() != null) m.setRerankTopN(req.rerankTopN());
+        if (req.rerankInstruct() != null) m.setRerankInstruct(req.rerankInstruct());
         if (req.enabled() != null) m.setEnabled(req.enabled());
         if (log.isDebugEnabled()) {
             log.debug("[ModelService] update 模型级窗口: model={} maxContextTokens={} (PATCH 语义: 请求 null 不改)",
@@ -148,7 +158,12 @@ public class ModelService {
             m.getCacheWritePricePeak() != null ? BigDecimal.valueOf(m.getCacheWritePricePeak()) : null,
             m.getCacheWritePriceOffpeak() != null ? BigDecimal.valueOf(m.getCacheWritePriceOffpeak()) : null,
             // [2026-10-22 extraBody] 模型级额外请求体（JSON 字符串）原样回显
-            m.getExtraBody());
+            m.getExtraBody(),
+            // [V200] 向量嵌入 + 重排配置
+            m.getEmbeddingDimensions(),
+            m.getEmbeddingBatchSize(),
+            m.getRerankTopN(),
+            m.getRerankInstruct());
     }
 
     private static String generateId(String prefix) { return prefix + "-" + UUID.randomUUID().toString().substring(0, 8); }

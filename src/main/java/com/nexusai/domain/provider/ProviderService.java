@@ -411,7 +411,12 @@ public class ProviderService {
             m.getCacheWritePricePeak() != null ? BigDecimal.valueOf(m.getCacheWritePricePeak()) : null,
             m.getCacheWritePriceOffpeak() != null ? BigDecimal.valueOf(m.getCacheWritePriceOffpeak()) : null,
             // [2026-10-22 extraBody] 模型级额外请求体（JSON 字符串）原样回显
-            m.getExtraBody());
+            m.getExtraBody(),
+            // [V200] 向量嵌入 + 重排配置
+            m.getEmbeddingDimensions(),
+            m.getEmbeddingBatchSize(),
+            m.getRerankTopN(),
+            m.getRerankInstruct());
     }
 
     private static String generateId(String prefix) { return prefix + "-" + UUID.randomUUID().toString().substring(0, 8); }

@@ -18,6 +18,9 @@ const TYPE_FILTERS = ['全部', '对话', '多模态', '视频', '语音/TTS'] a
  * 只配置当前会话主模型（写 session.model_name），不写全局 settings。
  * 全局模型档位配置在 设置页 → 模型。
  */
+/** 会话主模型只允许对话类；embedding/rerank/audio/image_generation 等一律不出现在本选择器。 */
+const CHAT_MODEL_TYPES = new Set(['chat', 'text', 'vision', 'multimodal'])
+
 export function ModelPickerModal({ providers, activeSessionModelName, close, pickCurrent }: ModelPickerModalProps) {
   const [search, setSearch] = useState('')
   const [typeFilter, setTypeFilter] = useState<string>('全部')
@@ -25,9 +28,13 @@ export function ModelPickerModal({ providers, activeSessionModelName, close, pic
   const filteredModels = (p: Provider) => {
     const q = search.trim().toLowerCase()
     return p.models.filter((m) => {
+      const t = (m.type ?? '').toLowerCase()
+      // 基础门：非对话类型不能作为会话主模型（此前"全部"会把 emb/rerank 也列出来，
+      // 选中后请求发到 /chat/completions 才由服务端报错）。
+      // 空 type 按历史对话模型兼容（老数据没有 type 列/值），不能误隐藏。
+      if (t && !CHAT_MODEL_TYPES.has(t)) return false
       if (typeFilter !== '全部') {
-        const t = m.type.toLowerCase()
-        if (typeFilter === '对话' && !(t.includes('chat') || t.includes('text'))) return false
+        if (typeFilter === '对话' && t && !(t.includes('chat') || t.includes('text'))) return false
         if (typeFilter === '多模态' && !t.includes('multimodal')) return false
         if (typeFilter === '视频' && !t.includes('image') && !t.includes('video')) return false
         if (typeFilter === '语音/TTS' && !t.includes('audio') && !t.includes('tts')) return false

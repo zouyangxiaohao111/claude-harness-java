@@ -442,7 +442,9 @@ class ExecAgentHookSemanticsTest {
         ModelDto model = new ModelDto("m1", DEFAULT_FAST_MODEL, null, null, null, null,
             null, null, null, null, true, null,
             null, null, null, null, null, null, null, null,
-            null /* extraBody（V104） */);
+            null, /* extraBody（V104） */
+            null, null, /* embeddingDimensions / embeddingBatchSize（V200） */
+            null, null /* rerankTopN / rerankInstruct（V200） */);
         ProviderDto provider = new ProviderDto("p1", "provider-1", ProviderType.openai_compatible,
             "http://llm.local", null, Map.of(), true, List.of(model), null, null);
         ProviderService ps = new ProviderService() {

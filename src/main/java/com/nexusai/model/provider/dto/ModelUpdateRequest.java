@@ -37,5 +37,13 @@ public record ModelUpdateRequest(
      * <p>请求构造时**逐键合并**进 body（只增/覆盖同名键，不替换整包）；空 / 非对象 → 无额外参数。
      * 与 {@code think} 互不影响。
      */
-    String extraBody
+    String extraBody,
+    /** 向量维度（仅 type=embedding 生效）· PATCH 语义：null 不改 */
+    Integer embeddingDimensions,
+    /** 单次 embedding 请求文本条数上限 · PATCH 语义：null 不改 */
+    Integer embeddingBatchSize,
+    /** 重排默认返回条数 · PATCH 语义：null 不改 */
+    Integer rerankTopN,
+    /** 重排默认指令 · PATCH 语义：null 不改，空串显式清空 */
+    String rerankInstruct
 ) {}

@@ -95,6 +95,27 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
           ],
         },
         {
+          // [embedding-provider 2026-10-26] 向量嵌入专用配置（仅 type=embedding 生效）。
+          //   维度/批大小落在 models.embedding_dimensions / embedding_batch_size（V200）。
+          title: '向量嵌入（仅 Embedding 类型生效）',
+          rows: [
+            [
+              { type: 'number', name: 'embeddingDimensions', label: '向量维度', nullable: true, placeholder: '1024', hint: '百炼 text-embedding-v4：2048/1536/1024/768/512/256/128/64 · 留空=服务端默认' },
+              { type: 'number', name: 'embeddingBatchSize', label: '批大小', nullable: true, placeholder: '10', hint: '单次请求最多几条文本 · 百炼上限 10 · 留空=10' },
+            ],
+          ],
+        },
+        {
+          // [embedding-provider 2026-10-26] 重排专用配置（仅 type=rerank 生效）。
+          //   topN / instruct 落在 models.rerank_top_n / rerank_instruct（V200）；
+          //   请求体显式传值优先于这里的默认值。
+          title: '重排序（仅 Rerank 类型生效）',
+          fields: [
+            { type: 'number', name: 'rerankTopN', label: '默认 topN', nullable: true, placeholder: '10', hint: '请求未传 topN 时使用 · 超过候选数会自动收敛 · 留空=不发送（服务端默认）' },
+            { type: 'text', name: 'rerankInstruct', label: '默认指令 instruct', placeholder: 'Given a web search query, retrieve relevant passages that answer the query.', hint: 'qwen3-rerank 支持 · 留空=不发送（可被请求覆盖）' },
+          ],
+        },
+        {
           // [2026-10-22] 模型级「额外请求体」：后端逐键合并进请求体（只增/覆盖同名键，不替换整包）。
           //   think 字段保持原样（不动），本字段是独立通道。
           title: '高级 · 额外请求体（extraBody）',

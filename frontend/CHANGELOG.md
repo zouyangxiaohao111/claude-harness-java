@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.52] - 2026-10-26
+
+### Added
+
+- 模型表单新增向量嵌入（维度/批大小）与重排序（topN/instruct）配置；会话模型选择器与新建会话默认模型只选对话类，避免 embedding/rerank 模型被当聊天模型使用。
+
 ## [0.1.51] - 2026-10-23
 
 ### Fixed

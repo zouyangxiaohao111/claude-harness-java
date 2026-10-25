@@ -24,6 +24,20 @@ public class Model {
      */
     private Integer maxContextTokens;
     /**
+     * 向量维度（仅 {@code type=embedding} 生效）· V200 列 {@code embedding_dimensions}。
+     * null = 不发送 {@code dimensions}，用服务端默认维度。
+     */
+    private Integer embeddingDimensions;
+    /**
+     * 单次 embedding 请求文本条数上限 · V200 列 {@code embedding_batch_size}。
+     * null/≤0 = 10（百炼单请求上限）。
+     */
+    private Integer embeddingBatchSize;
+    /** 重排默认返回条数（仅 type=rerank 生效）· V200 列 rerank_top_n；null = 服务端默认。 */
+    private Integer rerankTopN;
+    /** 重排默认指令（仅 type=rerank 生效）· V200 列 rerank_instruct；null/空 = 不发送。 */
+    private String rerankInstruct;
+    /**
      * 输入 tokens 价格（高峰档，元/百万 tokens）· CC original: {@code ModelCosts.inputTokens}
      * (modelCost.ts:27-33)。可空 = 未配置 → ModelCostCalculator 回落内置默认。
      */
@@ -96,6 +110,14 @@ public class Model {
     public void setTopP(Double topP) { this.topP = topP; }
     public Integer getMaxContextTokens() { return maxContextTokens; }
     public void setMaxContextTokens(Integer maxContextTokens) { this.maxContextTokens = maxContextTokens; }
+    public Integer getEmbeddingDimensions() { return embeddingDimensions; }
+    public void setEmbeddingDimensions(Integer embeddingDimensions) { this.embeddingDimensions = embeddingDimensions; }
+    public Integer getEmbeddingBatchSize() { return embeddingBatchSize; }
+    public void setEmbeddingBatchSize(Integer embeddingBatchSize) { this.embeddingBatchSize = embeddingBatchSize; }
+    public Integer getRerankTopN() { return rerankTopN; }
+    public void setRerankTopN(Integer rerankTopN) { this.rerankTopN = rerankTopN; }
+    public String getRerankInstruct() { return rerankInstruct; }
+    public void setRerankInstruct(String rerankInstruct) { this.rerankInstruct = rerankInstruct; }
     public Double getInputPricePeak() { return inputPricePeak; }
     public void setInputPricePeak(Double inputPricePeak) { this.inputPricePeak = inputPricePeak; }
     public Double getInputPriceOffpeak() { return inputPriceOffpeak; }

@@ -67,6 +67,14 @@ export interface Model {
   enabled: boolean
   /** 模型级上下文窗口（models.max_context_tokens 列 · 影响压缩阈值计算） */
   maxContextTokens: number | null
+  /** 向量维度（仅 type=embedding 生效 · models.embedding_dimensions，V200）；null = 服务端默认 */
+  embeddingDimensions?: number | null
+  /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效 · models.embedding_batch_size）；null/≤0 = 10 */
+  embeddingBatchSize?: number | null
+  /** 重排默认返回条数（仅 type=rerank 生效 · models.rerank_top_n）；null = 服务端默认 */
+  rerankTopN?: number | null
+  /** 重排默认指令（仅 type=rerank 生效 · models.rerank_instruct）；null/空 = 不发送 */
+  rerankInstruct?: string | null
 }
 
 export interface CreateModelRequest {
@@ -83,6 +91,14 @@ export interface CreateModelRequest {
   think?: string | null
   /** 模型级额外请求体（JSON 对象字符串 · models.extra_body）· 逐键合并进请求体 */
   extraBody?: string | null
+  /** 向量维度（仅 type=embedding 生效）；null = 服务端默认 */
+  embeddingDimensions?: number | null
+  /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效）；null/≤0 = 10 */
+  embeddingBatchSize?: number | null
+  /** 重排默认返回条数（仅 type=rerank 生效）；null = 服务端默认 */
+  rerankTopN?: number | null
+  /** 重排默认指令（仅 type=rerank 生效）；null/空 = 不发送 */
+  rerankInstruct?: string | null
   enabled?: boolean
 }
 
@@ -99,6 +115,14 @@ export interface UpdateModelRequest {
   think?: string | null
   /** 模型级额外请求体（JSON 对象字符串 · PATCH 语义：null 不更新，空串显式清空） */
   extraBody?: string | null
+  /** 向量维度（仅 type=embedding 生效）· PATCH 语义：null 不更新 */
+  embeddingDimensions?: number | null
+  /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效）· PATCH 语义：null 不更新 */
+  embeddingBatchSize?: number | null
+  /** 重排默认返回条数（仅 type=rerank 生效）· PATCH 语义：null 不更新 */
+  rerankTopN?: number | null
+  /** 重排默认指令（仅 type=rerank 生效）· PATCH 语义：null 不更新，空串显式清空 */
+  rerankInstruct?: string | null
   enabled?: boolean
   // tag 锁定：不在此
 }

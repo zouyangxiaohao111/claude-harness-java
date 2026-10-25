@@ -2270,6 +2270,13 @@ public class ChatService {
         }
         ModelRecord model = findEnabledModelByName(modelName);
         if (model == null) throw new IllegalStateException("No enabled model for: " + modelName);
+        // [embedding-provider 2026-10-26] 对话链路只接受对话类模型：embedding/rerank 模型
+        //   被选成会话主模型时，此前会发到 /chat/completions 由服务端报 404/400（用户难懂）。
+        //   这里前置成明确 400；向量/重排走各自的服务（EmbeddingService / 未来的 RerankService）。
+        if ("embedding".equals(model.getType()) || "rerank".equals(model.getType())) {
+            throw new ValidationException("模型 " + model.getName() + " 的类型为 "
+                + model.getType() + "，不能用于对话");
+        }
         ProviderRecord provider = providerMapper.selectOneById(model.getProviderId());
         if (provider == null) throw new IllegalStateException(
             "Provider " + model.getProviderId() + " not found");

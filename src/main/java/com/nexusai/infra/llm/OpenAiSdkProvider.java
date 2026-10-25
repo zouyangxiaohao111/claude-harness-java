@@ -1122,7 +1122,7 @@ public class OpenAiSdkProvider implements LlmProvider {
      * @param sessionId 本次请求的会话 ID（见 {@link SessionIdResolver}）；
      *                  null → 占位符落 {@link DynamicHeaderExpander#STATIC_FALLBACK}
      */
-    static OpenAIClient buildClient(ProviderConfig config, String sessionId) {
+    public static OpenAIClient buildClient(ProviderConfig config, String sessionId) {
         return buildClient(config, sessionId, null);
     }
 

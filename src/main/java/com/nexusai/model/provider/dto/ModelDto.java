@@ -39,5 +39,13 @@ public record ModelDto(
      * <p>请求构造时**逐键合并**进 body（只增/覆盖同名键，不替换整包）；空 / 非对象 → 无额外参数。
      * 与 {@code think} 互不影响。
      */
-    String extraBody
+    String extraBody,
+    /** 向量维度（仅 type=embedding 生效）· models.embedding_dimensions（V200）；null = 服务端默认 */
+    Integer embeddingDimensions,
+    /** 单次 embedding 请求文本条数上限 · models.embedding_batch_size（V200）；null/≤0 = 10 */
+    Integer embeddingBatchSize,
+    /** 重排默认返回条数（仅 type=rerank 生效）· models.rerank_top_n（V200）；null = 服务端默认 */
+    Integer rerankTopN,
+    /** 重排默认指令（仅 type=rerank 生效）· models.rerank_instruct（V200）；null/空 = 不发送 */
+    String rerankInstruct
 ) {}
