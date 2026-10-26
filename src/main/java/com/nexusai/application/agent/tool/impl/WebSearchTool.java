@@ -427,10 +427,10 @@ public class WebSearchTool implements Tool {
         String currentMonthYear = DateTimeFormatter.ofPattern("MMMM yyyy", Locale.US)
                 .format(LocalDate.now());
         return """
-                - Allows Claude to search the web and use the results to inform responses
+                - Allows NexusAI to search the web and use the results to inform responses
                 - Provides up-to-date information for current events and recent data
                 - Returns search result information formatted as search result blocks, including links as markdown hyperlinks
-                - Use this tool for accessing information beyond Claude's knowledge cutoff
+                - Use this tool for accessing information beyond NexusAI's knowledge cutoff
                 - Searches are performed automatically within a single API call
 
                 CRITICAL REQUIREMENT - You MUST follow this:

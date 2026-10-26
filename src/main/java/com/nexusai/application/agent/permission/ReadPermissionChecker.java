@@ -201,7 +201,7 @@ public class ReadPermissionChecker {
                         path, pathToCheck);
                 }
                 return new PermissionResult.Ask(
-                    "Claude 请求读取 UNC 网络路径 " + path + "，需用户确认",
+                    "NexusAI 请求读取 UNC 网络路径 " + path + "，需用户确认",
                     new PermissionDecisionReason.Other("UNC path detected"),
                     List.of(), path, input, null, false, null, List.of());
             }
@@ -251,7 +251,7 @@ public class ReadPermissionChecker {
                         RuleQuery.ruleToString(askRule), path, pathToCheck);
                 }
                 return new PermissionResult.Ask(
-                    "Claude 请求读取 " + path + "，权限规则要求确认",
+                    "NexusAI 请求读取 " + path + "，权限规则要求确认",
                     new PermissionDecisionReason.Rule(askRule),
                     List.of(), path, input, null, false, null, List.of());
             }
@@ -358,7 +358,7 @@ public class ReadPermissionChecker {
             log.debug("[ReadPermissionChecker] 兜底 → ask: path={} suggestions={}", path, readSuggestions);
         }
         return new PermissionResult.Ask(
-            "Claude 请求读取 " + path + "，需要用户授权",
+            "NexusAI 请求读取 " + path + "，需要用户授权",
             new PermissionDecisionReason.WorkingDir("Path is outside allowed working directories"),
             readSuggestions, path, input, null, false, null, List.of());
     }

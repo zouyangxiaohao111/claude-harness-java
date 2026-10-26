@@ -330,7 +330,7 @@ public final class BrowserToolRegistry {
                     },
                     "showWatermark": {
                       "type": "boolean",
-                      "description": "Show Claude logo watermark (default: true)"
+                      "description": "Show NexusAI logo watermark (default: true)"
                     },
                     "quality": {
                       "type": "number",

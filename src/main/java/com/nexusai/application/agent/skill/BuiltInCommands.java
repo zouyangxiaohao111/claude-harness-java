@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.skill;
 
+import com.nexusai.application.agent.init.InitCommand;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.CommandSource;
 
@@ -158,75 +159,39 @@ public final class BuiltInCommands {
     }
 
     /**
-     * /init · CC original: commands/init.ts:226-254
-     * {@code {type:'prompt', name:'init', get description(){...}, contentLength:0,
-     * progressMessage:'analyzing your codebase', source:'builtin',
-     * async getPromptForCommand(){...}}}。
-     * <p>description 在 CC 为动态 getter（feature NEW_INIT && (USER_TYPE==='ant' || CLAUDE_CODE_NEW_INIT)
-     * 时 'Initialize new CLAUDE.md file(s) and optional skills/hooks...'，否则 'Initialize a new CLAUDE.md
-     * file with codebase documentation'）；web 默认非 ant → 取后者（init.ts:230-234）。
-     * progressMessage='analyzing your codebase'（init.ts:237）。
-     * <p><b>prompt 文本不迁移到后端</b>（DEC-9 concern）：CC getPromptForCommand 返回 OLD/NEW_INIT_PROMPT
-     * 长文本（init.ts:239-253），web 端 React 触发 init 自行生成，Java 仅暴露元数据。
+     * /init · 对齐 CCB {@code commands/init.ts}（NEW_INIT_PROMPT）· 2026-10-26 用户裁定。
+     *
+     * <p><b>为什么切到 NEW 分支</b>：CC 的 NEW_INIT 受
+     * {@code feature('NEW_INIT') && (USER_TYPE==='ant' || CLAUDE_CODE_NEW_INIT)} 门控，发行版默认
+     * 走 OLD（只生成 CLAUDE.md）。OLD 不含任何技能安装指令 ⇒ 模型不知道 skills 目录、无法安装技能。
+     * NEW 版显式给出 {@code .nexusai/skills/<skill-name>/SKILL.md} 等路径，正是本仓需要的
+     * 「AI 知道 skill 位置并能安装」链路。
+     *
+     * <p><b>单点来源</b>：提示词正文统一由 {@link InitCommand} 提供（NEW/OLD + appName 动态替换），
+     * 本类不再保留副本（旧 INIT_PROMPT 已删，避免两套文本漂移）。
      */
     private static Command init() {
-        Command c = builtin("init", "prompt",
-            "Initialize a new CLAUDE.md file with codebase documentation",
-            null, null, false, null);
-        c.setProgressMessage("analyzing your codebase");
-        // [2026-10-21 用户裁定：/init 对齐 CC] 原先只暴露元数据、prompt 文本不迁移 ⇒ 命令是空壳
-        // （点了没有任何产物）。现补齐正文：斜杠拦截器经 SkillContentLoader 读到 content 后
-        // 作为 user message 注入，与 CC getPromptForCommand() 返回单条 text 块等价。
-        c.setContent(INIT_PROMPT);
+        // NexusAI 无 feature('NEW_INIT')/USER_TYPE 开关 ⇒ 常量启用 NEW 分支（用户裁定对齐 CCB）。
+        InitCommand init = new InitCommand(() -> true, () -> "web", () -> true, null);
+        Command c = builtin("init", "prompt", init.description(), null, null, false, null);
+        c.setProgressMessage(init.progressMessage());
+        c.setContent(init.getPrompt());
         return c;
     }
 
     /**
-     * /init 提示词 · CC original: {@code commands/init.ts:7-38 OLD_INIT_PROMPT}。
-     *
-     * <p>取 OLD 版（而非 NEW_INIT_PROMPT）的依据：CC 里 NEW_INIT 受
-     * {@code feature('NEW_INIT') && (USER_TYPE==='ant' || CLAUDE_CODE_NEW_INIT)} 双重门控，
-     * 发行版默认走 OLD；NexusAI 没有该 feature 开关，对齐默认行为。
-     *
-     * <p>文本逐字对齐 CC（含「不要编造章节」「已存在则建议改进」等约束）——这些约束正是
-     * 防止产出臃肿/幻觉式 CLAUDE.md 的关键，删改会直接改变生成质量。
-     */
-    private static final String INIT_PROMPT = """
-        Please analyze this codebase and create a CLAUDE.md file, which will be given to future instances of Claude Code to operate in this repository.
-
-        What to add:
-        1. Commands that will be commonly used, such as how to build, lint, and run tests. Include the necessary commands to develop in this codebase, such as how to run a single test.
-        2. High-level code architecture and structure so that future instances can be productive more quickly. Focus on the "big picture" architecture that requires reading multiple files to understand.
-
-        Usage notes:
-        - If there's already a CLAUDE.md, suggest improvements to it.
-        - When you make the initial CLAUDE.md, do not repeat yourself and do not include obvious instructions like "Provide helpful error messages to users", "Write unit tests for all new utilities", "Never include sensitive information (API keys, tokens) in code or commits".
-        - Avoid listing every component or file structure that can be easily discovered.
-        - Don't include generic development practices.
-        - If there are Cursor rules (in .cursor/rules/ or .cursorrules) or Copilot rules (in .github/copilot-instructions.md), make sure to include the important parts.
-        - If there is a README.md, make sure to include the important parts.
-        - Do not make up information such as "Common Development Tasks", "Tips for Development", "Support and Documentation" unless this is expressly included in other files that you read.
-        - Be sure to prefix the file with the following text:
-
-        ```
-        # CLAUDE.md
-
-        This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
-        ```""";
-
-    /**
      * /memory · CC original: commands/memory/index.ts:3-8
-     * {@code {type:'local-jsx', name:'memory', description:'Edit Claude memory files',
+     * {@code {type:'local-jsx', name:'memory', description:'Edit NexusAI memory files',
      * load:()=>import('./memory.js')}}。
      */
     private static Command memory() {
-        return builtin("memory", "local-jsx", "Edit Claude memory files",
+        return builtin("memory", "local-jsx", "Edit NexusAI memory files",
             null, null, false, null);
     }
 
     /**
      * /model · CC original: commands/model/index.ts:5-16
-     * {@code {type:'local-jsx', name:'model', get description(){return 'Set the AI model for Claude Code
+     * {@code {type:'local-jsx', name:'model', get description(){return 'Set the AI model for NexusAI
      * (currently ...)'}, argumentHint:'[model]', get immediate(){return
      * shouldInferenceConfigCommandBeImmediate()}, load:()=>import('./model.js')}}。
      * <p>description 在 CC 为动态 getter（内嵌当前模型名 renderModelName(getMainLoopModel())，model/index.ts:8-10）；
@@ -237,7 +202,7 @@ public final class BuiltInCommands {
      */
     private static Command model() {
         Command c = builtin("model", "local-jsx",
-            "Set the AI model for Claude Code",
+            "Set the AI model for NexusAI",
             null, "[model]", false, null);
         c.setImmediate(Boolean.FALSE);
         return c;

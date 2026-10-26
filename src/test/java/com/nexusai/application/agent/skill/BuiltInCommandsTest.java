@@ -107,23 +107,21 @@ class BuiltInCommandsTest {
     }
 
     @Test
-    @DisplayName("/init 必须带 CC 原文 prompt（空壳 = 点了没有任何产物 · init.ts:7-38 OLD_INIT_PROMPT）")
+    @DisplayName("/init 必须带 CCB NEW prompt（2026-10-26 裁定：含 skills 安装路径 · init.ts NEW_INIT_PROMPT）")
     void init_carries_cc_prompt_text() {
         // WHY（规则九）：/init 的价值全在提示词本身 —— 元数据齐全但 content 为空时，
-        // 命令能出现在面板、能点、却什么都不发生。同时锁住三条关键约束句：
-        // 「已存在则建议改进」「不要编造章节」「文件头固定前缀」，删掉任何一条都会让
-        // 生成结果退化成通用的、充满套话的 CLAUDE.md。
+        // 命令能出现在面板、能点、却什么都不发生。切到 CCB NEW 后还要锁住三条关键约束：
+        // ① 技能写到 skills/<name>/SKILL.md（模型据此安装技能）；② CLAUDE.md 先问再写；
+        // ③ 文件头固定前缀（缺了模型会把说明当正文）。
         Command init = byName(BuiltInCommands.getAll(), "init");
         assertThat(init.getContent())
             .as("init.content 不能为空")
             .isNotBlank()
-            .contains("analyze this codebase and create a CLAUDE.md")
-            .contains("If there's already a CLAUDE.md, suggest improvements to it")
-            .contains("Do not make up information")
-            .contains("This file provides guidance to Claude Code");
-        assertThat(init.getContent().trim())
-            .as("结尾必须是三反引号围栏（前缀说明是代码块，缺失会让模型把说明当正文）")
-            .endsWith("```");
+            .contains("Set up a minimal CLAUDE.md")
+            .contains("skills/<skill-name>/SKILL.md")
+            .contains("CLAUDE.local.md")
+            .contains("Do not silently overwrite")
+            .contains("This file provides guidance to NexusAI");
     }
 
     @Test

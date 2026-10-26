@@ -148,7 +148,7 @@ public class ExecAgentHook {
 
     /** CC execAgentHook.ts:107-116 systemPrompt 验证任务描述（无强制调用句 — [CCJ-EXEC-16] 已删除）. */
     private static final String SYSTEM_PROMPT_HEAD = """
-        You are verifying a stop condition in Claude Code. Your task is to verify that the agent completed the given plan.""";
+        You are verifying a stop condition in NexusAI. Your task is to verify that the agent completed the given plan.""";
     private static final String SYSTEM_PROMPT_TAIL = """
 
         Use the available tools to inspect the codebase and verify the condition.

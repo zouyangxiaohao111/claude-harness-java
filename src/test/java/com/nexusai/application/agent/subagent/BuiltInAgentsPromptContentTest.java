@@ -148,23 +148,19 @@ class BuiltInAgentsPromptContentTest {
     // ── R1d 字节长度守卫（对齐 CC 运行时 UTF-8 字节数）──────────────────────
 
     @Test
-    @DisplayName("statusline SPECIFIC 字节长度守卫 6993")
+    @DisplayName("statusline SPECIFIC 字节长度守卫 6955（2026-10-26 去 Claude 化后）")
     void statusline_prompt_byte_length_guard() throws Exception {
         // WHY（守卫未变）：防止未来无意截断 / 增删行导致全文漂移。
-        // 本守卫的**语义 = 「与 CC STATUSLINE_SYSTEM_PROMPT 运行时文本（含尾随空白占位符还原、
-        // ${TOOL_NAME} 还原）逐字节一致」** ⇒ 非恰为基准值即红（⛔ 不放宽成区间）。
-        //
-        // ⚠️ [H2] 新基准 = 6993（原 7001）。旧值 = **CC 原文**运行时长度（本轮实测 CC 侧
-        //   = 7001B，与旧期望逐字节吻合 ⇒ 反证旧值确实是「CC 原文口径」）；
-        //   Java 侧因**产品品牌/路径改名**偏离 −8B，实测（本轮 dump 逐行差分，合计逐行闭合）：
-        //     · BuiltInAgents 首行 2×  Claude Code → NexusAI  = −4 ×2 = −8
-        //     · 第 48 行  1×          Claude Code → NexusAI  = −4
-        //     · ~/.claude → ~/.nexusai（4 行各 1 处）        = +1 ×4 = +4
-        //                              ────────────────────────────────
-        //                              合计                    = −8 ⇒ 7001 − 8 = 6993 ✔
-        //   （`NexusAI` = 7B 而 `Claude Code` = 11B ⇒ 每次 −4；`.nexusai` = 8B 而 `.claude` = 7B ⇒ 每次 +1）
-        // ⛔ 未删守卫、未放宽为范围 —— 仅把基准值更新为新实测值并留全差额来源。
-        assertThat(statuslineSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(6993);
+        // 2026-10-26 用户裁定「不要百分百复刻，Claude → NexusAI」后，本守卫的口径从
+        // 「与 CC STATUSLINE_SYSTEM_PROMPT 逐字节一致」改为「与 NexusAI 当前运行时文本一致」。
+        // ⚠️ 新基准 = 6955（原 6993，−38B）。差额来源（逐项已核）：
+        //   · 示例模型 id  `claude-3-5-sonnet-20241022` → `deepseek-v3.2`
+        //   · 示例展示名    `Claude 3.5 Sonnet` → `DeepSeek-V3`
+        //   · Claude.ai 专属订阅段落（rate_limits 描述 + 5 小时用量示例）改写为
+        //     「环境提供 rate_limits 时才展示」的中性描述
+        //   · 其余 `Claude` → `NexusAI`（每处 +1；`Claude` 6B → `NexusAI` 7B）
+        // ⛔ 未删守卫、未放宽为范围 —— 仅把基准值更新为新实测值。
+        assertThat(statuslineSpecific().getBytes(StandardCharsets.UTF_8).length).isEqualTo(6955);
     }
 
     @Test

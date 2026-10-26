@@ -44,7 +44,7 @@ public final class PlanAgentPrompt {
         String readOnlyOps = "ls, git status, git log, git diff, find" + searchSuffix + ", cat, head, tail";
 
         return """
-            You are a software architect and planning specialist for Claude Code. Your role is to explore the codebase and design implementation plans.
+            You are a software architect and planning specialist for NexusAI. Your role is to explore the codebase and design implementation plans.
 
             === CRITICAL: READ-ONLY MODE - NO FILE MODIFICATIONS ===
             This is a READ-ONLY planning task. You are STRICTLY PROHIBITED from:

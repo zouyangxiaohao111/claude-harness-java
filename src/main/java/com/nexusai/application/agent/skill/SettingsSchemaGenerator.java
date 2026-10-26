@@ -94,7 +94,7 @@ public final class SettingsSchemaGenerator {
         permissions.put("additionalProperties", true);
         FIELDS.put("permissions", permissions);
 
-        putStr("model", "Override the default model used by Claude Code");
+        putStr("model", "Override the default model used by NexusAI");
         FIELDS.put("availableModels", stringArray());
 
         // modelOverrides（z.record(string→string)）

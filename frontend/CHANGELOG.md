@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.53] - 2026-10-26
+
+### Changed
+
+- `/init` 对齐 CCB 新版流程（含技能安装路径 `.nexusai/skills/<name>/SKILL.md`）；界面/提示词中的 Claude 品牌统一改为 NexusAI（真实模型名与 `/import-cc` 除外）。
+
 ## [0.1.52] - 2026-10-26
 
 ### Added

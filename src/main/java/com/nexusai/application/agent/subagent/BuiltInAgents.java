@@ -142,8 +142,8 @@ public class BuiltInAgents {
              "transcript_path": "string", // Path to the conversation transcript
              "cwd": "string",         // Current working directory
              "model": {
-               "id": "string",           // Model ID (e.g., "claude-3-5-sonnet-20241022")
-               "display_name": "string"  // Display name (e.g., "Claude 3.5 Sonnet")
+               "id": "string",           // Model ID (e.g., "deepseek-v3.2")
+               "display_name": "string"  // Display name (e.g., "DeepSeek-V3")
              },
              "workspace": {
                "current_dir": "string",  // Current working directory path
@@ -167,7 +167,7 @@ public class BuiltInAgents {
                "used_percentage": number | null,      // Pre-calculated: % of context used (0-100), null if no messages yet
                "remaining_percentage": number | null  // Pre-calculated: % of context remaining (0-100), null if no messages yet
              },
-             "rate_limits": {             // Optional: Claude.ai subscription usage limits. Only present for subscribers after first API response.
+             "rate_limits": {             // Optional: subscription usage limits, if the environment provides them.
                "five_hour": {             // Optional: 5-hour session limit (may be absent)
                  "used_percentage": number,   // Percentage of limit used (0-100)
                  "resets_at": number          // Unix epoch seconds when this window resets
@@ -180,7 +180,7 @@ public class BuiltInAgents {
              "vim": {                     // Optional, only present when vim mode is enabled
                "mode": "INSERT" | "NORMAL"  // Current vim editor mode
              },
-             "agent": {                    // Optional, only present when Claude is started with --agent flag
+             "agent": {                    // Optional, only present when the session is bound to an agent
                "name": "string",           // Agent name (e.g., "code-architect", "test-runner")
                "type": "string"            // Optional: Agent type identifier
              },
@@ -188,7 +188,7 @@ public class BuiltInAgents {
                "name": "string",           // Worktree name/slug (e.g., "my-feature")
                "path": "string",           // Full path to the worktree directory
                "branch": "string",         // Optional: Git branch name for the worktree
-               "original_cwd": "string",   // The directory Claude was in before entering the worktree
+               "original_cwd": "string",   // The directory NexusAI was in before entering the worktree
                "original_branch": "string" // Optional: Branch that was checked out before entering the worktree
              }
            }
@@ -207,7 +207,7 @@ public class BuiltInAgents {
            Or to display context used percentage:
            - input=$(cat); used=$(echo "$input" | jq -r '.context_window.used_percentage // empty'); [ -n "$used" ] && echo "Context: $used% used"
         
-           To display Claude.ai subscription rate limit usage (5-hour session limit):
+           To display subscription rate-limit usage when the statusline JSON provides rate_limits:
            - input=$(cat); pct=$(echo "$input" | jq -r '.rate_limits.five_hour.used_percentage // empty'); [ -n "$pct" ] && printf "5h: %.0f%%" "$pct"
         
            To display both 5-hour and 7-day limits when available:
@@ -231,7 +231,7 @@ public class BuiltInAgents {
         - Return a summary of what was configured, including the name of the script file if used
         - If the script includes git commands, they should skip optional locks
         - IMPORTANT: At the end of your response, inform the parent agent that this "statusline-setup" agent must be used for further status line changes.
-          Also ensure that the user is informed that they can ask Claude to continue to make changes to the status line.
+          Also ensure that the user is informed that they can ask NexusAI to continue to make changes to the status line.
         """.replace("<<TRAIL_2SP>>", "  ")
            .replace("<<TRAIL_3SP>>", "   ")
            .replace("<<TRAIL_1SP>>", " ");

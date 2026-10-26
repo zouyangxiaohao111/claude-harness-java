@@ -179,7 +179,7 @@ class RegistrarPromptCopyTest {
     void updateConfigHooksDocsContainsFullCcSections() {
         assertThat(UpdateConfigSkillRegistrar.HOOKS_DOCS)
             .as("CC updateConfig.ts:144 Stop 完整 purpose（clear/resume/compact）")
-            .contains("Run when Claude stops (including clear, resume, compact)")
+            .contains("Run when NexusAI stops (including clear, resume, compact)")
             .as("CC updateConfig.ts:150 Common tool matchers")
             .contains("**Common tool matchers:**")
             .as("CC updateConfig.ts:163/:169 prompt/agent hook 适用事件")

@@ -34,7 +34,7 @@ import java.util.Map;
  * 视觉分析工具 · 自建工具（CC 无对应）· 代理视觉模型（任务 VisionAnalyze 方案定稿）。
  *
  * <p><b>CC 无对应（铁律：只信 CC 实际 TS 源码行为）</b>：CC 多模态为<b>模型内建能力</b>
- * （FileReadTool/prompt.ts:40 "Claude Code is a multimodal LLM"），无「多模态工具」路由。
+ * （FileReadTool/prompt.ts:40 "NexusAI is a multimodal LLM"），无「多模态工具」路由。
  * Java 后端主模型不支持多模态（type=multimodal/vision 缺失）时，主模型收到「多模态提示
  * （含缓存 id）」→ 调用本工具 → 工具读 {@link ImageAttachmentStore} 缓存 → 把图片 + prompt
  * 发给独立视觉模型（settings.multimodalModelName）→ 返回<b>纯文本</b>给主模型。

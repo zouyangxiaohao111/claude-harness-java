@@ -65,7 +65,7 @@ public final class InitVerifiersCommand {
            - Check MCP configuration (.mcp.json) for browser automation tools:
              - Playwright MCP server
              - Chrome DevTools MCP server
-             - Claude Chrome Extension MCP (browser-use via Claude's Chrome extension)
+             - NexusAI Chrome Extension MCP (browser-use via NexusAI's Chrome extension)
            - For Python projects, check for playwright, pytest-playwright
 
         ## Phase 2: Verification Tool Setup
@@ -83,7 +83,7 @@ public final class InitVerifiersCommand {
            - Options to offer:
              - **Playwright** (Recommended) - Full browser automation library, works headless, great for CI
              - **Chrome DevTools MCP** - Uses Chrome DevTools Protocol via MCP
-             - **Claude Chrome Extension** - Uses the Claude Chrome extension for browser interaction (requires the extension installed in Chrome)
+             - **NexusAI Chrome Extension** - Uses the NexusAI Chrome extension for browser interaction (requires the extension installed in Chrome)
              - **None** - Skip browser automation (will use basic HTTP checks only)
 
         3. **If user chooses to install Playwright**, run the appropriate command based on package manager:
@@ -92,10 +92,10 @@ public final class InitVerifiersCommand {
            - For pnpm: `pnpm add -D @playwright/test && pnpm exec playwright install`
            - For bun: `bun add -D @playwright/test && bun playwright install`
 
-        4. **If user chooses Chrome DevTools MCP or Claude Chrome Extension**:
+        4. **If user chooses Chrome DevTools MCP or NexusAI Chrome Extension**:
            - These require MCP server configuration rather than package installation
            - Ask if they want you to add the MCP server configuration to .mcp.json
-           - For Claude Chrome Extension, inform them they need the extension installed from the Chrome Web Store
+           - For the NexusAI Chrome Extension, inform them they need the extension installed from the Chrome Web Store
 
         5. **MCP Server Setup** (if applicable):
            - If user selected an MCP-based option, configure the appropriate entry in .mcp.json
@@ -173,7 +173,7 @@ public final class InitVerifiersCommand {
 
         ## Phase 4: Generate Verifier Skill
 
-        **All verifier skills are created in the project root's `.nexusai/skills/` directory.** This ensures they are automatically loaded when Claude runs in the project.
+        **All verifier skills are created in the project root's `.nexusai/skills/` directory.** This ensures they are automatically loaded when NexusAI runs in the project.
 
         Write the skill file to `.nexusai/skills/<verifier-name>/SKILL.md`.
 

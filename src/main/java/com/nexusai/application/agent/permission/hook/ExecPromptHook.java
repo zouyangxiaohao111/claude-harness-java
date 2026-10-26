@@ -83,7 +83,7 @@ public class ExecPromptHook {
      * JSON 输出约束由 outputFormat json_schema 承担）。
      */
     private static final String SYSTEM_PROMPT = """
-        You are evaluating a hook in Claude Code.
+        You are evaluating a hook in NexusAI.
 
         Your response must be a JSON object matching one of the following schemas:
         1. If the condition is met, return: {"ok": true}

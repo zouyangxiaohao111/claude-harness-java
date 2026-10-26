@@ -8473,7 +8473,7 @@ public class LlmAgentLoop implements AgentLoop {
                 //   pending 复位（:1241 undefined）之前取当前请求的实际 max_tokens（CC claude.ts:2272
                 //   ${maxOutputTokens} = 本请求 resolve 值）；RECOVERY 重试列表与耗尽 surface 共用。
                 String maxTokensErrorContent = com.nexusai.application.agent.api.ApiErrors.API_ERROR_MESSAGE_PREFIX
-                    + ": Claude's response exceeded the "
+                    + ": NexusAI's response exceeded the "
                     + AgentLoopContext.resolveRecoveryMaxTokens(effectiveModel, pendingMaxOutputTokensOverride)
                     + " output token maximum. To configure this behavior, adjust the maxOutputTokens setting (settings.maxOutputTokens).";
                 if (mtResult.recoverable()) {

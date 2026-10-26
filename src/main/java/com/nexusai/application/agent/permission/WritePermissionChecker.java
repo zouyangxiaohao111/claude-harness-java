@@ -389,7 +389,7 @@ public class WritePermissionChecker {
                         RuleQuery.ruleToString(askRule), path, pathToCheck);
                 }
                 return new PermissionResult.Ask(
-                    "Claude 请求编辑 " + path + "，权限规则要求确认",
+                    "NexusAI 请求编辑 " + path + "，权限规则要求确认",
                     new PermissionDecisionReason.Rule(askRule),
                     List.of(), path, input, null, false, null, List.of());
             }
@@ -436,7 +436,7 @@ public class WritePermissionChecker {
                 path, inWorkingDir, writeSuggestions);
         }
         return new PermissionResult.Ask(
-            "Claude 请求编辑 " + path + "，需要用户授权",
+            "NexusAI 请求编辑 " + path + "，需要用户授权",
             inWorkingDir
                 ? new PermissionDecisionReason.Other("default ask for write inside working dir")
                 : new PermissionDecisionReason.WorkingDir("Path is outside allowed working directories"),
@@ -662,7 +662,7 @@ public class WritePermissionChecker {
                         rawPath, pathToCheck);
                 }
                 return new PermissionResult.Ask(
-                    "Claude 请求写入 " + rawPath + "，但尚未授权",
+                    "NexusAI 请求写入 " + rawPath + "，但尚未授权",
                     new PermissionDecisionReason.SafetyCheck("Claude config file path", true),
                     safetySuggestions, rawPath, null, null, false, null, List.of());
             }
@@ -699,7 +699,7 @@ public class WritePermissionChecker {
                     rawPath, pathToCheck);
             }
             return new PermissionResult.Ask(
-                "Claude 请求编辑 " + rawPath + "，属敏感文件",
+                "NexusAI 请求编辑 " + rawPath + "，属敏感文件",
                 new PermissionDecisionReason.SafetyCheck("Path is a sensitive file", true),
                 safetySuggestions, rawPath, null, null, false, null, List.of());
         }

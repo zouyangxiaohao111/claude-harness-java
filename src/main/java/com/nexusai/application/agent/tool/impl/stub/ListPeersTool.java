@@ -89,7 +89,7 @@ public class ListPeersTool implements Tool {
     @Override
     public String prompt() {
         return """
-                List active Claude Code sessions that can receive messages via SendMessage.
+                List active NexusAI sessions that can receive messages via SendMessage.
 
                 Returns an array of peers with their addresses. Use these addresses as the `to` field in SendMessage:
                 - `"uds:/path/to.sock"` — local sessions on the same machine (Unix Domain Socket)

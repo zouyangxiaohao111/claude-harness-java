@@ -750,7 +750,7 @@ public class ChatService {
 
         // [P5-①] userInvocable=false 拒绝消息 · 对齐 CC processSlashCommand.tsx:526-548：
         //   输入以 "/" 开头 → findCommand → userInvocable===false → 推第二条 user 可见消息
-        //   （"只能由 Claude 调用"）+ status idle，不启动 LlmAgentLoop（CC shouldQuery:false）。
+        //   （"只能由 NexusAI 调用"）+ status idle，不启动 LlmAgentLoop（CC shouldQuery:false）。
         //   命中即 return（拒绝路径终结）；未命中/userInvocable!=false → 回落正常 LLM 路径。
         if (rejectNonUserInvocable(sessionId, req != null ? req.content() : null, userMessageId, wsTemplate)) {
             return;

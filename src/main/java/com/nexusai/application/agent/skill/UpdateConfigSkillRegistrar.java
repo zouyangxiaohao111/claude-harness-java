@@ -47,7 +47,7 @@ public final class UpdateConfigSkillRegistrar {
         "Use this skill to configure the NexusAI harness via settings.json. "
             + "Automated behaviors (\"from now on when X\", \"each time X\", \"whenever X\", "
             + "\"before/after X\") require hooks configured in settings.json - the harness "
-            + "executes these, not Claude, so memory/preferences cannot fulfill them. "
+            + "executes these, not NexusAI, so memory/preferences cannot fulfill them. "
             + "Also use for: permissions (\"allow X\", \"add permission\", \"move permission to\"), "
             + "env vars (\"set X=Y\"), hook troubleshooting, or any changes to "
             + "settings.json/settings.local.json files. Examples: \"allow npm commands\", "
@@ -277,7 +277,7 @@ public final class UpdateConfigSkillRegistrar {
         | PostToolUse | Tool name | Run after successful tool |
         | PostToolUseFailure | Tool name | Run after tool fails |
         | Notification | Notification type | Run on notifications |
-        | Stop | - | Run when Claude stops (including clear, resume, compact) |
+        | Stop | - | Run when NexusAI stops (including clear, resume, compact) |
         | PreCompact | "manual"/"auto" | Before compaction |
         | PostCompact | "manual"/"auto" | After compaction (receives summary) |
         | UserPromptSubmit | - | When user submits |
@@ -521,7 +521,7 @@ public final class UpdateConfigSkillRegistrar {
 
         ### Adding a Hook
 
-        User: "Format my code after Claude writes it"
+        User: "Format my code after NexusAI writes it"
 
         1. **Clarify**: Which formatter? (prettier, gofmt, etc.)
         2. **Read**: `.nexusai/settings.json` (or create if missing)

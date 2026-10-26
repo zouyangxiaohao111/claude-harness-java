@@ -135,7 +135,7 @@ public class CommandRegistrationConfigCInfoSettings {
      * isEnabled=checkStatsigFeatureGate_CACHED_MAY_BE_STALE('tengu_thinkback')）。
      */
     private void registerThinkBackMetadata() {
-        registerLocalMetadataC("think-back", "local-jsx", "Your 2025 Claude Code Year in Review", null,
+        registerLocalMetadataC("think-back", "local-jsx", "Your 2025 NexusAI Year in Review", null,
             CommandRegistrationConfigCInfoSettings::thinkBackFeatureEnabled, false, false, null);
     }
 

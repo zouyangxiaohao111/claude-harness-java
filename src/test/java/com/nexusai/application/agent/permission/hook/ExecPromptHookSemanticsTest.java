@@ -704,7 +704,7 @@ class ExecPromptHookSemanticsTest {
         assertThat(capturedSystem.get())
             .as("CCJ-EXEC-11: 无旧附加句（JSON 约束由 outputFormat json_schema 承担）")
             .doesNotContain("Return ONLY the JSON object")
-            .contains("You are evaluating a hook in Claude Code.")
+            .contains("You are evaluating a hook in NexusAI.")
             .contains("{\"ok\": false, \"reason\": \"Reason for why it is not met\"}");
     }
 

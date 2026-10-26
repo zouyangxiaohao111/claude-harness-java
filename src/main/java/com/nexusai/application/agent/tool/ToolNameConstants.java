@@ -190,7 +190,7 @@ public final class ToolNameConstants {
      * 视觉分析工具名 · 自建工具（任务 VisionAnalyze）。
      *
      * <p><b>CC 无对应</b>：CC 多模态为<b>模型内建能力</b>（FileReadTool 读图 → 模型直接
-     * 视觉理解，prompt.ts:40 "Claude Code is a multimodal LLM"），不存在「多模态工具」。
+     * 视觉理解，prompt.ts:40 "NexusAI is a multimodal LLM"），不存在「多模态工具」。
      * Java 后端主模型不支持多模态（type=multimodal/vision 缺失）时，主模型收到
      * 「多模态提示（含缓存 id）」→ 调用本工具 → 读 ImageAttachmentStore 缓存 → 图片+prompt
      * 发给独立视觉模型（settings.multimodalModelName）→ 返回纯文本（图片以占位符表示）。

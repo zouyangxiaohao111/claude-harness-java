@@ -1329,7 +1329,7 @@ public final class McpAuth {
                     + serverName + "'");
         }
         ClientRegistrationRequest request = new ClientRegistrationRequest(
-            "Claude Code (" + serverName + ")",
+            "NexusAI (" + serverName + ")",
             java.util.List.of(redirectUri),
             java.util.List.of("authorization_code", "refresh_token"),
             java.util.List.of("code"),

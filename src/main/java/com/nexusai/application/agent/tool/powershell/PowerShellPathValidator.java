@@ -392,7 +392,7 @@ public final class PowerShellPathValidator {
                 if (log.isDebugEnabled()) {
                     log.debug("PowerShellPathValidator: 重定向目标 Edit deny 阻断 target={}", r.target());
                 }
-                return deny("输出重定向到 '" + v.resolvedPath() + "' 被阻断。为安全起见，Claude Code 仅可写入本会话允许的工作目录内的文件",
+                return deny("输出重定向到 '" + v.resolvedPath() + "' 被阻断。为安全起见，NexusAI 仅可写入本会话允许的工作目录内的文件",
                     new PermissionDecisionReason.Rule(v.rule()));
             }
             if (firstAsk == null) {
@@ -808,7 +808,7 @@ public final class PowerShellPathValidator {
         }
         // 5. 不在任何允许范围
         return new PathCheck(false, resolvedPath,
-            "为安全起见，Claude Code 仅可访问本会话允许的工作目录内的文件：'" + resolvedPath + "' 在范围外", null);
+            "为安全起见，NexusAI 仅可访问本会话允许的工作目录内的文件：'" + resolvedPath + "' 在范围外", null);
     }
 
     /** auto-edit 路径安全检查（紧凑版）· 对齐 CC filesystem.ts:620-665 + WritePermissionChecker.checkPathSafetyForAutoEdit。 */
