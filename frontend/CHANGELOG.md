@@ -2,6 +2,16 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.54] - 2026-10-26
+
+### Added
+
+- `/install-skill`：按关键词搜索建科院市场技能；支持从 GitHub / raw SKILL.md / zip / 任意 marketplace.json 安装（安装前确认、不执行包脚本）。
+
+### Fixed
+
+- 场景版「检查更新」误用通用版更新源（会下载并安装通用版安装包）：场景版改读 `nexusai/updater-scene/latest.json`，设置未加载前不检查；场景发布用 `--scene`（跳过 GitHub）。
+
 ## [0.1.53] - 2026-10-26
 
 ### Changed
