@@ -358,4 +358,30 @@ class MarketplaceConfigTest {
         assertThat(example.path("installLocation").asText())
             .isEqualTo("/home/u/.claude/plugins/marketplaces/example");
     }
+
+    @Test
+    @DisplayName("官方 marketplace owner 为对象时仍可解析（2026-10-26 日志实测的解析失败回归）")
+    void marketplaceManifest_acceptsObjectOwner() throws Exception {
+        // WHY（规则九）：官方 anthropics-claude-plugins-official 的 marketplace.json 里
+        //   owner = {"name": "...", "email": "..."}（对象）。旧 record 把 owner 声明成 String
+        //   ⇒ Jackson 抛 "Cannot deserialize value of type java.lang.String from Object value"，
+        //   官方市场每次启动安装/刷新都失败。owner 改为 JsonNode 后两种形态都兼容。
+        String json = """
+            {
+              "name": "anthropics-claude-plugins-official",
+              "owner": {"name": "Anthropic", "email": "support@anthropic.com"},
+              "plugins": [
+                {"name": "demo", "source": {"source": "github", "repo": "anthropics/demo"}}
+              ]
+            }
+            """;
+
+        PluginMarketplace.Marketplace m = new com.fasterxml.jackson.databind.ObjectMapper()
+            .readValue(json, PluginMarketplace.Marketplace.class);
+
+        assertThat(m.name()).isEqualTo("anthropics-claude-plugins-official");
+        assertThat(m.owner().path("name").asText()).isEqualTo("Anthropic");
+        assertThat(m.plugins()).hasSize(1);
+        assertThat(m.plugins().get(0).source().path("repo").asText()).isEqualTo("anthropics/demo");
+    }
 }

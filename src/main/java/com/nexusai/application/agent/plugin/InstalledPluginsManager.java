@@ -590,7 +590,7 @@ public class InstalledPluginsManager {
         InstalledRecord rec = new InstalledRecord(name, version, "marketplace", true, installedAt,
             installPathPath, defaultAgentsPath, projectPath, installPath, installedAt, gitCommitSha,
             dirExists(installPathPath, "commands"), List.of(),
-            dirExists(installPathPath, "skills"), manifestComponentPaths(installPathPath, "skills"),
+            skillsPathFor(installPathPath), manifestComponentPaths(installPathPath, "skills"),
             dirExists(installPathPath, "output-styles"), List.of(), Map.of());
         installed.put(name, rec);
         writeThrough(rec);
@@ -694,7 +694,7 @@ public class InstalledPluginsManager {
         //   空 → zjkycode 等插件技能命令（/zjkycode:brainstorming）不进入 GET /api/command，前端 /z
         //   斜杠补全按 pluginName 前缀匹配失败（CC 插件技能命令名 = pluginName:skillName）。
         Path commandsPath = dirExists(base, "commands");
-        Path skillsPath = dirExists(base, "skills");
+        Path skillsPath = skillsPathFor(base);
         Path outputStylesPath = dirExists(base, "output-styles");
         // [对齐 CC 2.1.296 pluginLoader.ts:1565-1583] manifest.skills（字符串或数组）=
         //   附加技能根（如 "./skills/<系列>"，让 skills/<系列>/<技能>/SKILL.md 这种分组结构可加载）。
@@ -712,6 +712,27 @@ public class InstalledPluginsManager {
             parseEpoch(pi.lastUpdated()),
             pi.gitCommitSha(),
             commandsPath, List.of(), skillsPath, skillsPaths, outputStylesPath, List.of(), Map.of());
+    }
+
+    /**
+     * 技能根探测：优先 {@code <base>/skills}；不存在但插件根有 {@code SKILL.md} 时回落到插件根。
+     *
+     * <p><b>WHY</b>（2026-10-26 用户实测「召唤」报「该技能未注册成斜杠命令」）：市场里的单技能包
+     * 打包时把 {@code SKILL.md} 放在包根（{@code MarketPublishService.buildZip} 按相对路径打包），
+     * 安装后目录是 {@code <插件根>/SKILL.md}，而不是 {@code <插件根>/skills/<名称>/SKILL.md}。
+     * 旧实现只探测 {@code skills/} 目录 ⇒ skillsPath=null ⇒ {@code LoadPluginCommands.loadSkills}
+     * 扫空 ⇒ 命令目录里没有该技能。{@code loadSkillsFromDirectory} 本就支持「skillsPath 自身含
+     * SKILL.md」的直载形态，所以这里只需把 skillsPath 回落到插件根，已装插件无需迁移。
+     */
+    private static Path skillsPathFor(Path base) {
+        Path skills = dirExists(base, "skills");
+        if (skills != null) {
+            return skills;
+        }
+        if (base != null && Files.isRegularFile(base.resolve("SKILL.md"))) {
+            return base;
+        }
+        return null;
     }
 
     /** <code>&lt;base&gt;/child</code> 存在且为目录 → 返回路径，否则 null（CC pathExists 等价）。 */

@@ -40,7 +40,10 @@ class PluginBlocklistTest {
         for (String n : pluginNames) {
             entries.add(new Entry(n, null, null, null, null, null, null));
         }
-        return new Marketplace("marketplace-mock", "anthropics", entries, forceRemove, null, List.of());
+        // owner 现在是 JsonNode（官方 manifest 为对象形态）；测试用字符串节点等价旧值。
+        return new Marketplace("marketplace-mock",
+            com.fasterxml.jackson.databind.node.TextNode.valueOf("anthropics"),
+            entries, forceRemove, null, List.of());
     }
 
     private static Map<String, List<Installation>> installed(String pluginId, String... scopes) {

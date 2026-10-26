@@ -65,7 +65,12 @@ public class SkillController {
 
     /** {@link #list(boolean, String)} 主体 · 会话标识由包装层**显式传入**（批 3c：不再经 MDC 载体）。 */
     private List<CommandDto> listInternal(boolean reload, String sessionId) {
-        if (reload) commandService.rescanFromFilesystem();
+        if (reload) {
+            commandService.rescanFromFilesystem();
+            // 同 CommandController：reload 必须同时清 SkillRegistry memoize，
+            // 否则手动安装到 skills 目录的技能要重启后端才可见。
+            skillRegistry.refresh();
+        }
         List<Command> registryCommands = skillRegistry.getAllCommands(sessionId);
         Map<String, Command> byName = new LinkedHashMap<>();
         for (Command c : registryCommands) {

@@ -55,7 +55,7 @@ vi.mock('@/api/sessions', () => ({
 }))
 vi.mock('@/api/sessionFiles', () => ({ sessionFilesApi: { list: vi.fn(async () => []), diff: vi.fn(), revert: vi.fn() } }))
 vi.mock('@/api/projects', () => ({ projectApi: { list: vi.fn(async () => []), create: vi.fn(), bind: vi.fn() } }))
-vi.mock('@/api/market', () => ({ marketApi: { useExpert: vi.fn() } }))
+vi.mock('@/api/market', () => ({ marketApi: {} }))
 vi.mock('@/api/command', () => ({ commandApi: { list: vi.fn(async () => []), executeBuiltin: vi.fn() } }))
 vi.mock('@/api/tasks', () => ({ tasksApi: { stopAllTasks: vi.fn(), backgroundAll: vi.fn() } }))
 vi.mock('@/api/attachment', () => ({ attachmentApi: { config: vi.fn(async () => ({ localRead: false })) } }))

@@ -9,10 +9,9 @@ import {
   brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile, RightTab } from '@/types'
-import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, MarketExpert, PivotCandidateDto } from '@/api/types'
+import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
-import { marketApi } from '@/api/market'
 import { projectApi, type ProjectDto } from '@/api/projects'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import { isAbsolutePath, normalizePath } from '@/utils/path'
@@ -1453,26 +1452,12 @@ function App() {
   }, [activeSessionId, setSessions, storeSessions, showToast])
 
   // ---- 技能市场：使用专家（SkillMarketModal 回调）----
-  // 本地专家 → 复用 handleAgentChange（现有 PATCH mainThreadAgent 链路）+ 关弹窗；
-  // 远端专家 → marketApi.useExpert（后端构造成本地 agent + 设会话 mainThreadAgent）→ store 同步 + 关弹窗 + toast。
+  // 本地专家 → 复用 handleAgentChange（现有 PATCH mainThreadAgent 链路）+ 关弹窗。
+  // 建科市场专家 → 在弹窗内直接走插件安装（installMarketPlugin），不再经过 App。
   const handleMarketUseLocal = useCallback((agentType: string) => {
     setShowMarket(false)
     void handleAgentChange(agentType)
   }, [handleAgentChange])
-
-  const handleMarketUseRemote = useCallback(async (expert: MarketExpert) => {
-    if (!activeSessionId) return
-    try {
-      const r = await marketApi.useExpert(activeSessionId, expert.marketId)
-      // 用 useChatStore.getState() 取最新会话列表（避免闭包 stale）
-      const st = useChatStore.getState()
-      setSessions(st.sessions.map((s) => (s.id === activeSessionId ? { ...s, mainThreadAgent: r.mainThreadAgent } : s)))
-      setShowMarket(false)
-      showToast(`已使用 ${r.displayName || expert.displayName || expert.agentName || r.mainThreadAgent} 驱动会话`, 'success')
-    } catch (e) {
-      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
-    }
-  }, [activeSessionId, setSessions, showToast])
 
   // 会话重命名（会话栏 ⋯ → 重命名）：PATCH 后端 title + 本地同步
   const renameSession = useCallback(async (id: string, title: string) => {
@@ -1606,6 +1591,20 @@ function App() {
       .catch(() => {})
     return () => { alive = false }
   }, [activeSessionId])
+  // 同上：斜杠菜单打开时刷新一次命令名集合 —— 手动安装技能后，发送侧也要立刻认得 /新技能，
+  // 否则会被当成普通消息发出去。reload=true 清后端 SkillRegistry memoize。
+  const slashMenuOpen = composerText.startsWith('/') && !composerText.includes(' ')
+  const prevSlashMenuOpenRef = useRef(false)
+  useEffect(() => {
+    const opened = slashMenuOpen && !prevSlashMenuOpenRef.current
+    prevSlashMenuOpenRef.current = slashMenuOpen
+    if (!opened) return
+    let alive = true
+    commandApi.list(true, activeSessionId ?? undefined)
+      .then((cs) => { if (alive) setRemoteCmdNames(new Set(cs.map((c) => c.name))) })
+      .catch(() => { /* 静默：旧集合仍可判断内置命令 */ })
+    return () => { alive = false }
+  }, [slashMenuOpen, activeSessionId])
 
   // ---- 内置命令执行：统一走 executeBuiltin，成功/失败均显式反馈（fail loud）----
   // [P2-8] args：`/compact 用中文总结` 这类带参内置命令的尾部文本（命令名之后的全部内容）。
@@ -2166,7 +2165,6 @@ function App() {
           busy={turnRunning}
           onClose={() => setShowMarket(false)}
           onUseLocalAgent={handleMarketUseLocal}
-          onUseRemoteExpert={(e) => void handleMarketUseRemote(e)}
           onSummonSkill={(cmd, display) => {
             setShowMarket(false)
             // 有中文显示名 → 输入框用显示名本身（发送时还原为 /命令名）；否则维持 /命令名

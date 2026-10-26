@@ -123,54 +123,94 @@ public class MarketplaceHttpDownloader {
      */
     public void downloadArchive(String url, Map<String, String> headers, String targetDir,
                                 java.util.function.BiConsumer<Long, Long> onProgress) throws IOException {
-        Path dir = Paths.get(targetDir);
+        Path dir = Paths.get(targetDir).toAbsolutePath();
         Files.createDirectories(dir);
-        Path tempFile = Files.createTempFile("nexusai-plugin-", ".tmp");
+        // 断点续传：固定 .part 路径（同一插件的同一版本目录 ⇒ 同一 URL），失败保留、成功后删除。
+        // 旧实现用 createTempFile 随机名且 finally 必删 ⇒ 网络一断就从头再来。
+        Path partFile = partFileFor(dir);
+        boolean extracted = false;
         try {
-            HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
-                .timeout(Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS))
-                .GET();
-            if (headers != null) {
-                headers.forEach(b::header);
+            long existing = Files.isRegularFile(partFile) ? Files.size(partFile) : 0L;
+            if (existing > 0) {
+                log.info("[MarketplaceHttpDownloader] 发现未完成下载 {}（{} 字节），尝试断点续传: {}",
+                    partFile.getFileName(), existing, redact(url));
             }
-            if (onProgress == null) {
-                HttpResponse<Path> resp = httpClient.send(b.build(), HttpResponse.BodyHandlers.ofFile(tempFile));
-                int sc = resp.statusCode();
-                if (sc != 200) {
-                    throw new IOException("插件包下载失败（HTTP " + sc + "）: " + redact(url));
+            long total = -1L;
+            long written = 0L;
+            // 416（本地残片 >= 服务端资源长度：资源已更新，或上次下完但解压失败）→ 清残片重下一次
+            for (int attempt = 0; attempt < 2; attempt++) {
+                HttpRequest.Builder b = HttpRequest.newBuilder(URI.create(url))
+                    .timeout(Duration.ofSeconds(DOWNLOAD_TIMEOUT_SECONDS))
+                    .GET();
+                if (headers != null) {
+                    headers.forEach(b::header);
                 }
-            } else {
-                // 有进度回调 → 流式读取，按 Content-Length 推进（ofFile 一次性落盘拿不到中间态）
+                if (existing > 0) {
+                    b.header("Range", "bytes=" + existing + "-");
+                }
                 HttpResponse<InputStream> resp = httpClient.send(b.build(),
                     HttpResponse.BodyHandlers.ofInputStream());
                 int sc = resp.statusCode();
-                if (sc != 200) {
+                if (sc == 416 && existing > 0) {
+                    resp.body().close();
+                    Files.deleteIfExists(partFile);
+                    log.info("[MarketplaceHttpDownloader] 断点区间无效（HTTP 416），清理残片后从 0 重下: {}",
+                        redact(url));
+                    existing = 0L;
+                    continue;
+                }
+                if (sc != 200 && sc != 206) {
+                    resp.body().close();
                     throw new IOException("插件包下载失败（HTTP " + sc + "）: " + redact(url));
                 }
-                long total = resp.headers().firstValueAsLong("content-length").orElse(-1L);
-                long read = 0L;
+                boolean append = sc == 206 && existing > 0;
+                if (append) {
+                    // 防御：服务端若没按请求的起点返回（个别代理会回 206 但从 0 开始），
+                    // 继续 append 会拼出坏包 ⇒ 按「覆盖写」处理。
+                    long rangeStart = contentRangeStart(resp).orElse(existing);
+                    if (rangeStart != existing) {
+                        log.warn("[MarketplaceHttpDownloader] 服务端返回区间起点 {} 与本地残片 {} 不一致，改为从 0 重下: {}",
+                            rangeStart, existing, redact(url));
+                        append = false;
+                    }
+                }
+                if (sc == 206) {
+                    total = contentRangeTotal(resp).orElse(-1L);
+                } else {
+                    // 服务端忽略 Range（或首次下载）→ 覆盖写，语义与旧实现一致
+                    total = resp.headers().firstValueAsLong("content-length").orElse(-1L);
+                }
+                long offset = append ? existing : 0L;
+                written = 0L;
                 long lastReport = 0L;
                 try (InputStream in = resp.body();
-                     java.io.OutputStream out = Files.newOutputStream(tempFile)) {
+                     java.io.OutputStream out = openPartFile(partFile, append)) {
                     byte[] buf = new byte[64 * 1024];
                     int n;
                     while ((n = in.read(buf)) > 0) {
                         out.write(buf, 0, n);
-                        read += n;
+                        written += n;
                         long now = System.currentTimeMillis();
                         // 节流：≥120ms 或读完才回调，避免小包把台账刷爆
-                        if (now - lastReport >= 120L) {
+                        if (onProgress != null && now - lastReport >= 120L) {
                             lastReport = now;
-                            onProgress.accept(read, total);
+                            // 续传时回调「本地已落盘总字节」而不是本次读取量 —— 否则进度会从 0 重跳
+                            onProgress.accept(offset + written, total);
                         }
                     }
                 }
-                onProgress.accept(read, total);
+                if (onProgress != null) {
+                    onProgress.accept(offset + written, total);
+                }
+                break;
             }
-            if (!isZip(tempFile)) {
+            if (!isZip(partFile)) {
+                // 非 zip = 内容不可用（错误页/截断），残片留着只会让下次续传出错
+                Files.deleteIfExists(partFile);
                 throw new IOException("插件包不是 zip（无法解压）: " + redact(url));
             }
-            extractZip(tempFile, dir);
+            extractZip(partFile, dir);
+            extracted = true;
             if (log.isInfoEnabled()) {
                 log.info("[MarketplaceHttpDownloader] 插件包已解压 {} → {}", redact(url), dir);
             }
@@ -178,11 +218,88 @@ public class MarketplaceHttpDownloader {
             Thread.currentThread().interrupt();
             throw new IOException("插件包下载被中断: " + redact(url), e);
         } finally {
-            try {
-                Files.deleteIfExists(tempFile);
-            } catch (IOException ignored) {
-                // best-effort
+            if (extracted) {
+                try {
+                    Files.deleteIfExists(partFile);
+                } catch (IOException ignored) {
+                    // best-effort
+                }
+            } else if (Files.isRegularFile(partFile)) {
+                // 保留残片供下次续传（解压失败也保留；下次 Range 命中 416 会自动从 0 重下）
+                if (log.isInfoEnabled()) {
+                    log.info("[MarketplaceHttpDownloader] 下载未完成，保留断点文件供续传: {}（{} 字节）",
+                        partFile.getFileName(), sizeOrZero(partFile));
+                }
             }
+        }
+    }
+
+    /** 断点文件路径：与目标目录同级（不污染解压目录），名字由目录名派生 ⇒ 同一插件版本稳定复用。 */
+    static Path partFileFor(Path targetDir) {
+        Path parent = targetDir.getParent();
+        if (parent == null) {
+            parent = targetDir.toAbsolutePath().getParent();
+        }
+        String name = targetDir.getFileName() != null ? targetDir.getFileName().toString() : "plugin";
+        return (parent != null ? parent : targetDir).resolve("." + name + ".plugin.zip.part");
+    }
+
+    /** 续传追加 / 全新覆盖。 */
+    private static java.io.OutputStream openPartFile(Path partFile, boolean append) throws IOException {
+        if (append) {
+            return Files.newOutputStream(partFile,
+                java.nio.file.StandardOpenOption.CREATE, java.nio.file.StandardOpenOption.APPEND);
+        }
+        return Files.newOutputStream(partFile,
+            java.nio.file.StandardOpenOption.CREATE,
+            java.nio.file.StandardOpenOption.TRUNCATE_EXISTING,
+            java.nio.file.StandardOpenOption.WRITE);
+    }
+
+    /** 解析 {@code Content-Range: bytes 0-1023/4096} 的起始字节；缺失/格式错 → empty。 */
+    private static java.util.OptionalLong contentRangeStart(HttpResponse<?> resp) {
+        String value = resp.headers().firstValue("content-range").orElse(null);
+        if (value == null) {
+            return java.util.OptionalLong.empty();
+        }
+        int space = value.indexOf(' ');
+        int dash = value.indexOf('-', space + 1);
+        if (space < 0 || dash < 0) {
+            return java.util.OptionalLong.empty();
+        }
+        try {
+            return java.util.OptionalLong.of(Long.parseLong(value.substring(space + 1, dash).trim()));
+        } catch (NumberFormatException e) {
+            return java.util.OptionalLong.empty();
+        }
+    }
+
+    /** 解析 {@code Content-Range: bytes 0-1023/4096} 的总长度；缺失/通配 {@code *} → empty。 */
+    private static java.util.OptionalLong contentRangeTotal(HttpResponse<?> resp) {
+        String value = resp.headers().firstValue("content-range").orElse(null);
+        if (value == null) {
+            return java.util.OptionalLong.empty();
+        }
+        int slash = value.lastIndexOf('/');
+        if (slash < 0 || slash == value.length() - 1) {
+            return java.util.OptionalLong.empty();
+        }
+        String total = value.substring(slash + 1).trim();
+        if ("*".equals(total)) {
+            return java.util.OptionalLong.empty();
+        }
+        try {
+            return java.util.OptionalLong.of(Long.parseLong(total));
+        } catch (NumberFormatException e) {
+            return java.util.OptionalLong.empty();
+        }
+    }
+
+    private static long sizeOrZero(Path file) {
+        try {
+            return Files.size(file);
+        } catch (IOException e) {
+            return 0L;
         }
     }
 

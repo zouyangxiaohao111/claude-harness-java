@@ -1,8 +1,8 @@
 import { useEffect, useMemo, useState } from 'react'
 import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
-import { commandApi } from '@/api/command'
-import { marketApi, type InstallProgress } from '@/api/market'
+import { commandApi, type CommandDto } from '@/api/command'
+import { marketApi, type InstallProgress, type InstalledPluginDetail } from '@/api/market'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import type {
   AgentListItem,
@@ -13,13 +13,13 @@ import type {
 } from '@/api/types'
 
 /**
- * 技能市场弹窗（骨架版 · v3 mockup 结构确认）。
+ * 技能市场弹窗。
  * 三种 Tab：专家（本地 + 远端混排大卡）/ 技能（分类胶囊 + 精选横条 + 推荐 3 列小卡）/ 连接器（3 列小卡）。
- * 三种来源（左上角下拉切换）：腾讯 workbuddy（/api/market/* 远端）/ 建科数字插件市场（自建 MinIO，
- *   /api/market/external 解析 marketplace.json，按 category 分流）/ 本地（仅 /agents/list）。
- * - 专家「使用」：本地 agentType → App 走现有 PATCH mainThreadAgent；腾讯远端 marketId →
- *   marketApi.useExpert；建科市场专家需安装插件（当前仅展示，按钮提示开发中）。
- * - 技能/连接器「+」：骨架仅 UI 高亮（不做真实安装）。
+ * 两种来源（左上角下拉切换）：建科数字插件市场（自建 MinIO，/api/market/external 解析
+ *   marketplace.json，按 category 分流）/ 本地（/agents/list + /api/command 本地技能 + 已装插件）。
+ * - 专家「使用」：本地 agentType → App 走现有 PATCH mainThreadAgent；建科市场专家 → 安装插件。
+ * - 技能/连接器「+」：建科市场走真实安装；本地来源只展示已装内容。
+ * ⛔ 腾讯 workbuddy 源已按用户 2026-10-26 裁定删除。
  */
 
 /** Tab 类型 */
@@ -33,18 +33,17 @@ const SEARCH_PLACEHOLDERS: Record<MarketTab, string> = {
   connector: '搜索连接器名 / 说明',
 }
 
-/** 市场来源 id · 决定市场弹窗的数据源（腾讯 workbuddy / 自建 MinIO / 本地） */
-export type MarketSourceId = 'tencent-workbuddy' | 'jianke-market' | 'local'
+/** 市场来源 id · 决定市场弹窗的数据源（自建 MinIO / 本地） */
+export type MarketSourceId = 'jianke-market' | 'local'
 
 /** 建科数字插件市场（自建 MinIO）· 内置固定地址（用户拍板 2026-09-17）。
  *  指向 marketplace.json 索引（几 KB）——看列表只拉索引；装插件时后端按 source 只下载
  *  对应插件包 plugin.zip（按需，上千插件不整包下载）。公网入口 netHost 任意网络可达。 */
 const JIANKE_MARKET_URL = 'http://192.168.20.125:9000/nexusai/marketplace/marketplace.json'
 
-/** 市场来源下拉（多源：建科数字插件市场 / 腾讯 workbuddy / 本地 · 建科默认排首） */
+/** 市场来源下拉（建科数字插件市场 / 本地 · 建科默认排首） */
 const MARKET_SOURCES: { id: MarketSourceId; label: string }[] = [
   { id: 'jianke-market', label: '建科数字插件市场' },
-  { id: 'tencent-workbuddy', label: '腾讯 workbuddy' },
   { id: 'local', label: '本地' },
 ]
 
@@ -84,7 +83,7 @@ interface ExpertCard {
   inUse: boolean
 }
 
-export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUseLocalAgent, onUseRemoteExpert, onSummonSkill, showToast }: {
+export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUseLocalAgent, onSummonSkill, showToast }: {
   /** 当前会话 id（/agents/list + /market/* + POST use 需要） */
   sessionId: string
   /** 当前会话主线程 agent（null/空串=默认模式 · 专家卡「使用中」判定 + 使用后胶囊回显） */
@@ -95,8 +94,6 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   onClose: () => void
   /** 使用本地专家（agentType）→ App 调现有 handleAgentChange（PATCH mainThreadAgent）并关弹窗 */
   onUseLocalAgent?: (agentType: string) => void
-  /** 使用远端专家（marketId）→ App 调 marketApi.useExpert + 刷新 currentAgent + 关弹窗 + toast */
-  onUseRemoteExpert?: (expert: MarketExpert) => void
   /** 召唤已安装技能（技能命令名 + 中文显示名）→ App 关弹窗 + 把「/命令名 」写入输入框（2026-10-19 用户需求） */
   onSummonSkill?: (commandName: string, displayName?: string) => void
   /** 轻提示 */
@@ -124,6 +121,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const [marketName, setMarketName] = useState('zjky-market')
   // 远程下载的插件专家（source='plugin'）· 供建科市场「使用」按钮定位 agentType（不混入本地来源）
   const [pluginAgents, setPluginAgents] = useState<AgentListItem[]>([])
+  // 已安装插件明细（「本地」来源展示；含版本/安装路径）
+  const [pluginDetails, setPluginDetails] = useState<InstalledPluginDetail[]>([])
 
   // ---- 数据（按来源加载 · Promise.allSettled 容错：单个源失败不影响其余渲染）----
   const [localAgents, setLocalAgents] = useState<AgentListItem[]>([])
@@ -148,6 +147,20 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     marketId: p.name, name: p.displayName || p.name, authType: p.tags?.[0], remote: true,
   })
 
+  // 本地已安装技能来源：用户级 / 项目级 / 插件级（排除内置/捆绑 —— 数量大且不是用户装的）。
+  // 「本地」来源过去只列专家；技能与插件从未展示（用户 2026-10-26 反馈），这里补齐。
+  const LOCAL_SKILL_SOURCES = new Set(['USER', 'PROJECT_SETTINGS', 'PLUGIN'])
+  const isLocalSkill = (c: CommandDto) => !!c.source && LOCAL_SKILL_SOURCES.has(c.source)
+  const toLocalSkill = (c: CommandDto): MarketSkill => ({
+    marketId: c.name,
+    name: c.name,
+    displayName: c.name,
+    description: c.description ?? '',
+    categories: [c.pluginName ? `插件 · ${c.pluginName}` : (c.source === 'PROJECT_SETTINGS' ? '项目' : '用户')],
+    preinstalled: true,
+    remote: false,
+  })
+
   useEffect(() => {
     let cancelled = false
     setLoading(true)
@@ -164,6 +177,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     // 本地指纹（判定「市场有更新」）：市场条目指纹 ≠ 本地安装目录指纹 ⇒ 显示更新
     void marketApi.listInstalledDetails().then((list) => {
       if (cancelled) return
+      setPluginDetails(list ?? [])
       const map: Record<string, string> = {}
       for (const d of list ?? []) {
         if (d.name && d.fingerprint) map[d.name] = d.fingerprint
@@ -172,20 +186,28 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     }).catch(() => { /* 指纹不可得 → 不显示更新提示（不影响安装） */ })
 
     if (source === 'local') {
-      // 本地来源：仅本地 agents（专家 Tab；技能/连接器无数据）。pluginAgents 一并记录（供「使用」定位）
-      void agentApi.listAgents(sessionId)
-        .then((ag) => {
-          if (cancelled) return
-          setLocalAgents(ag)
-          setPluginAgents(ag.filter((a) => a.source === 'plugin'))
-          setExperts([]); setSkills([]); setConnectors([])
-        })
-        .catch((e) => {
-          if (cancelled) return
-          setLoadError(`本地专家加载失败：${formatFail(e)}`)
-          setLocalAgents([]); setExperts([]); setSkills([]); setConnectors([])
-        })
-        .finally(done)
+      // 本地来源：专家（本地 agents）+ 本地技能（用户/项目/插件命令）。插件明细在公共段已加载。
+      // commandApi.list(true) 让后端先清 SkillRegistry memoize —— 手动拷进 skills 目录的技能即时可见。
+      void Promise.allSettled([
+        agentApi.listAgents(sessionId),
+        commandApi.list(true, sessionId),
+      ]).then(([agR, cmdR]) => {
+        if (cancelled) return
+        if (agR.status === 'fulfilled') {
+          setLocalAgents(agR.value)
+          setPluginAgents(agR.value.filter((a) => a.source === 'plugin'))
+        } else {
+          setLocalAgents([]); setPluginAgents([])
+        }
+        setSkills(cmdR.status === 'fulfilled'
+          ? cmdR.value.filter(isLocalSkill).map(toLocalSkill)
+          : [])
+        setExperts([]); setConnectors([])
+        const failed = [agR, cmdR].filter((r): r is PromiseRejectedResult => r.status === 'rejected')
+        setLoadError(failed.length
+          ? `部分本地数据加载失败（已尽力展示可用项）：${failed.map((r) => formatFail(r.reason)).join('；')}`
+          : null)
+      }).finally(done)
       return () => { cancelled = true }
     }
 
@@ -214,26 +236,6 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       return () => { cancelled = true }
     }
 
-    // 腾讯 workbuddy：本地 agents + 远端 expert/skill/connector（现有 4 路）
-    void Promise.allSettled([
-      agentApi.listAgents(sessionId),
-      marketApi.listExperts(sessionId),
-      marketApi.listSkills(sessionId),
-      marketApi.listConnectors(sessionId),
-    ]).then(([localR, exR, skR, coR]) => {
-      if (cancelled) return
-      const locals = localR.status === 'fulfilled' ? localR.value : []
-      setLocalAgents(locals)
-      setPluginAgents(locals.filter((a) => a.source === 'plugin'))
-      setExperts(exR.status === 'fulfilled' ? exR.value : [])
-      setSkills(skR.status === 'fulfilled' ? skR.value : [])
-      setConnectors(coR.status === 'fulfilled' ? coR.value : [])
-      const failed = [localR, exR, skR, coR].filter((r): r is PromiseRejectedResult => r.status === 'rejected')
-      setLoadError(failed.length
-        ? `部分数据加载失败（已尽力展示可用项）：${failed.map((r) => formatFail(r.reason)).join('；')}`
-        : null)
-      done()
-    })
     return () => { cancelled = true }
   }, [sessionId, source, reloadKey])
 
@@ -390,7 +392,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       cmd = null
     }
     if (!cmd) {
-      showToast('该技能未注册成斜杠命令（安装包缺少 skills/<名称>/SKILL.md 结构），请检查插件安装', 'info')
+      showToast('该技能还没有注册成斜杠命令（可能仍在加载），请稍后重试或检查插件安装', 'info')
       return
     }
     onSummonSkill(cmd, skill.displayName || undefined)
@@ -406,7 +408,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     onUseLocalAgent?.(agent.agentType)
   }
 
-  // ---- 使用专家（本地走 PATCH · 腾讯远端走 marketApi.useExpert · 建科市场走 installMarketPlugin）----
+  // ---- 使用专家（本地走 PATCH · 建科市场走 installMarketPlugin）----
   const handleUse = (card: ExpertCard) => {
     if (busy) {
       showToast('对话进行中，请等当前轮完成后切换专家', 'info')
@@ -420,9 +422,6 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     if (card.kind === 'local') {
       const a = localAgents.find((x) => x.agentType === card.name)
       if (a) onUseLocalAgent?.(a.agentType)
-    } else {
-      const e = experts.find((x) => x.marketId === card.key.replace(/^remote:/, ''))
-      if (e) onUseRemoteExpert?.(e)
     }
   }
 
@@ -433,6 +432,11 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       return matchAny(s.displayName, s.name, s.description)
     })
   }, [skills, cat, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
+
+  // ---- 本地已安装插件过滤（仅「本地」来源展示）----
+  const filteredPlugins = useMemo(() => {
+    return pluginDetails.filter((p) => matchAny(p.name, p.version))
+  }, [pluginDetails, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- 连接器过滤（搜索）----
   const filteredConnectors = useMemo(() => {
@@ -463,7 +467,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
               <path d="M2.5 2.5l7 7M9.5 2.5l-7 7" />
             </svg>
           </button>
-          {/* 市场源下拉（腾讯 workbuddy / 建科数字插件市场 / 本地） */}
+          {/* 市场源下拉（建科数字插件市场 / 本地） */}
           <div className="sm-source">
             <button className="sm-source-btn" onClick={() => setSrcOpen((v) => !v)} title="切换市场来源">
               <span className="sm-source-label">{MARKET_SOURCES.find((s) => s.id === source)?.label ?? '来源'}</span>
@@ -611,6 +615,12 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
 
               {tab === 'skill' && (
                 <div className="sm-skill-wrap">
+                  {source === 'local' && (
+                    <div className="sm-section-head">
+                      <span className="sm-section-title">本地技能（已安装）</span>
+                      <span className="sm-result-count">{filteredSkills.length} 个</span>
+                    </div>
+                  )}
                   {/* 分类胶囊 + 计数：始终常驻（筛选后结果变少也不会失去退回“全部”的入口） */}
                   <div className="sm-cat-row">
                     {['全部', ...skillCategories].map((c) => (
@@ -622,8 +632,10 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                   </div>
 
                   {filteredSkills.length === 0 ? (
-                    <div className="sm-empty small">{keyword ? '没有匹配的技能' : '暂无可用技能'}</div>
-                  ) : cat !== '全部' || keyword ? (
+                    <div className="sm-empty small">
+                      {keyword ? '没有匹配的技能' : (source === 'local' ? '暂无本地技能' : '暂无可用技能')}
+                    </div>
+                  ) : cat !== '全部' || keyword || source === 'local' ? (
                     /* 筛选/搜索态：单一网格（不再分区，避免精选区只剩 3 个造成误解） */
                     <div className="sm-skill-grid">
                       {filteredSkills.map((s) => (
@@ -687,6 +699,31 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                         </>
                       )}
                     </>
+                  )}
+
+                  {source === 'local' && filteredPlugins.length > 0 && (
+                    <div className="sm-local-plugins">
+                      <div className="sm-section-head">
+                        <span className="sm-section-title">已安装插件</span>
+                        <span className="sm-result-count">{filteredPlugins.length} 个</span>
+                      </div>
+                      <div className="sm-skill-grid">
+                        {filteredPlugins.map((p) => (
+                          <div key={p.name} className="sm-card sm-mini-card">
+                            <div className="sm-mini-head">
+                              <span className="sm-avatar sm-avatar-sm" style={{ background: colorOf(p.name) }}>
+                                {p.name.charAt(0).toUpperCase()}
+                              </span>
+                              <span className="sm-mini-name" title={p.installPath ?? p.name}>{p.name}</span>
+                              <span className="sm-installed-mark">已安装</span>
+                            </div>
+                            <div className="sm-desc two">
+                              版本 {p.version || '未知'}{p.installPath ? ` · ${p.installPath}` : ''}
+                            </div>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
                   )}
                 </div>
               )}
@@ -959,6 +996,24 @@ function SkillMiniCard({ skill, marked, onMark, onInstall, installedNow = false,
             : <button className={`sm-plus-btn${marked ? ' marked' : ''}`} onClick={onMark} title="安装（骨架：UI 占位）">{marked ? '✓' : '+'}</button>}
       </div>
       {skill.description && <div className="sm-desc two">{skill.description}</div>}
+      {installing && (
+        <div className="sm-install-line">
+          <div
+            className="sm-install-bar"
+            role="progressbar"
+            aria-valuenow={Math.round(installPercent || 0)}
+            aria-valuemin={0}
+            aria-valuemax={100}
+            title={`正在安装 ${nm}… ${Math.round(installPercent || 0)}%`}
+          >
+            <span
+              className="sm-install-bar-fill"
+              style={{ width: `${Math.max(2, Math.min(100, installPercent || 0))}%` }}
+            />
+          </div>
+          <span className="sm-install-pct">{Math.round(installPercent || 0)}%</span>
+        </div>
+      )}
     </div>
   )
 }

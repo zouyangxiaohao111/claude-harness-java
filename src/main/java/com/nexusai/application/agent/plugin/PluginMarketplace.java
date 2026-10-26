@@ -58,12 +58,17 @@ public final class PluginMarketplace {
     /**
      * marketplace 本体 · CC {@code PluginMarketplaceSchema}（schemas.ts:1293-1330）。
      * name 必填；owner 必填但读取宽松（缺失不抛）；plugins 默认空表（对齐 CC find 空数组安全）。
+     *
+     * <p><b>owner 用 {@link JsonNode}</b>：官方 marketplace 的 owner 是对象
+     * （{@code {"name":"Anthropic","email":"..."}}），旧实现声明为 String ⇒ Jackson 抛
+     * 「Cannot deserialize value of type java.lang.String from Object value」，
+     * 官方市场每次启动解析失败（2026-10-26 日志实测）。JsonNode 同时兼容字符串与对象。
      */
     @JsonIgnoreProperties(ignoreUnknown = true)
     @JsonInclude(JsonInclude.Include.NON_NULL)
     public record Marketplace(
         @JsonProperty("name") String name,
-        @JsonProperty("owner") String owner,
+        @JsonProperty("owner") JsonNode owner,
         @JsonProperty("plugins") List<Entry> plugins,
         @JsonProperty("forceRemoveDeletedPlugins") Boolean forceRemoveDeletedPlugins,
         @JsonProperty("metadata") Metadata metadata,

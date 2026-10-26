@@ -1041,9 +1041,9 @@ export interface AgentListItem {
   color?: string | null
 }
 
-// ---- 技能市场（GET/POST /api/market/* · 后端 MarketController 代理腾讯 workbuddy 市场 · remote=true 表示远端市场项）----
-/** GET /api/market/expert?page&page_size 单条（后端 MarketExpertDto · 远端专家）
- *  字段对齐：marketId=市场源侧唯一 id；useCount 原始数字 / useCountDisplay 展示用文案（如「12.6万次使用」）。 */
+// ---- 技能市场（外部 marketplace.json + 本地技能/插件 · remote=true 表示外部市场项）----
+/** 市场专家卡片视图（由外部 market 的 ExternalMarketPlugin 映射 · 腾讯 workbuddy 源已删除）
+ *  marketId=安装定位标识；useCount 原始数字 / useCountDisplay 展示用文案（如「12.6万次使用」）。 */
 export interface MarketExpert {
   /** 市场源侧唯一 id（POST use 路径段用） */
   marketId: string
@@ -1072,7 +1072,7 @@ export interface MarketExpert {
   /** 远端来源标识 */
   remote?: boolean
 }
-/** GET /api/market/skill 单条（后端 MarketSkillDto · 远端技能） */
+/** 市场技能卡片视图（外部 marketplace / 本地技能共用） */
 export interface MarketSkill {
   marketId: string
   /** 技能命令名（如 todo-write） */
@@ -1090,7 +1090,7 @@ export interface MarketSkill {
   /** 市场条目内容指纹（与本地已装目录指纹比对 → 判定「有更新」） */
   fingerprint?: string | null
 }
-/** GET /api/market/connector 单条（后端 MarketConnectorDto · 远端连接器） */
+/** 市场连接器卡片视图（外部 marketplace） */
 export interface MarketConnector {
   marketId: string
   /** 连接器名（如「Notion」「GitHub」） */
@@ -1104,13 +1104,6 @@ export interface MarketConnector {
   /** 是否已连接（「已安装」判定） */
   isConnected?: boolean | null
   remote?: boolean
-}
-/** POST /api/market/expert/{marketId}/use 响应（后端已构造本地 agent + 设会话 mainThreadAgent） */
-export interface MarketUseExpertResult {
-  /** 会话新主线程 agent（本地 expert agentType） */
-  mainThreadAgent: string
-  /** 展示名（toast「已使用 X 驱动会话」） */
-  displayName?: string | null
 }
 /** GET /api/market/external 单插件（后端 ExternalPluginDto · 自建 MinIO 市场插件） */
 export interface ExternalMarketPlugin {

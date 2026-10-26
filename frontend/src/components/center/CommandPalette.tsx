@@ -208,7 +208,8 @@ export function CommandPalette({ onClose, onExecute, sessionId }: CommandPalette
     let alive = true
     // [TL-W1 P4] sessionId 直传后端（REST 线程解析会话绑定项目 → project 级命令进面板）；
     //   切会话（sessionId 变）→ 重新拉取，避免上一个会话的项目命令滞留。
-    commandApi.list(false, sessionId ?? undefined).then((cs) => { if (alive) setSkillCommands(cs) }).catch(() => {})
+    // reload=true：打开面板时重新扫描（用户可能刚手动安装/删除技能；后端会同时清 SkillRegistry 缓存）
+    commandApi.list(true, sessionId ?? undefined).then((cs) => { if (alive) setSkillCommands(cs) }).catch(() => {})
     return () => { alive = false }
   }, [sessionId])
   // 合并命令目录：后端 builtins 优先（带 type），技能命令其次，本地 COMMAND_ITEMS 补充

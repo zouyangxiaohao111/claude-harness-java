@@ -41,6 +41,15 @@ import java.util.zip.ZipOutputStream;
  *
  * <p><b>指纹口径</b>：按「排序后的相对路径 + 文件字节」逐文件算 SHA-256，
  * <b>不</b>用 zip 字节 —— zip 条目自带 mtime/压缩实现差异，同样内容重打包会得到不同 hash。
+ *
+ * <p><b>包规范（2026-10-26 用户裁定）</b>：
+ * <ul>
+ *   <li>裸技能包（源目录没有 {@code plugin.json}）在 zip 内自动补
+ *       {@code .claude-plugin/plugin.json}（name/version/description + generatedBy 标记），
+ *       让安装目录自描述版本；生成文件不参与指纹（否则市场/本地指纹永远不等 ⇒ 永远显示「可更新」）。</li>
+ *   <li>打包与指纹统一排除 {@code __pycache__}/.git/node_modules/.DS_Store/*.pyc，
+ *       避免把构建垃圾发布出去。</li>
+ * </ul>
  */
 @Service
 public class MarketPublishService {
@@ -53,6 +62,11 @@ public class MarketPublishService {
     private static final String MANIFEST_KEY = KEY_PREFIX + "/marketplace.json";
     private static final DateTimeFormatter ISO =
         DateTimeFormatter.ofPattern("yyyy-MM-dd'T'HH:mm:ss'Z'").withZone(ZoneOffset.UTC);
+
+    /** 自动生成的插件清单（仅当源目录没有用户 plugin.json 时写入 zip）。 */
+    static final String GENERATED_MANIFEST_PATH = ".claude-plugin/plugin.json";
+    static final String GENERATED_MARKER_FIELD = "generatedBy";
+    static final String GENERATED_MARKER_VALUE = "nexusai-publish";
 
     private final MinioUploader uploader;
 
@@ -92,7 +106,7 @@ public class MarketPublishService {
         }
 
         try {
-            byte[] zip = buildZip(dir);
+            // 无变化判定只看用户内容指纹（不含自动生成的 plugin.json）
             String fingerprint = fingerprint(dir);
             ObjectNode manifest = readManifest();
             ArrayNode plugins = (ArrayNode) manifest.withArray("plugins");
@@ -105,6 +119,8 @@ public class MarketPublishService {
 
             String currentVersion = existing != null ? existing.path("version").asText("0.1.0") : null;
             String version = resolveVersion(req.version(), currentVersion);
+            // 版本确定后再打包：裸技能包需要把 version 写进自动生成的 plugin.json
+            byte[] zip = buildZip(dir, dirName, version, req.description());
             String source = categoryDir(category) + "/" + dirName + "/" + version;
             String now = ISO.format(Instant.now());
 
@@ -221,15 +237,17 @@ public class MarketPublishService {
         };
     }
 
-    /** 打包：目录下全部文件（排除 plugin.zip），相对路径，按名排序保证稳定。 */
+    /** 打包（兼容旧调用）：不带自动 plugin.json。 */
     static byte[] buildZip(Path dir) throws IOException {
-        List<Path> files;
-        try (var stream = Files.walk(dir)) {
-            files = stream.filter(Files::isRegularFile)
-                .filter(p -> !"plugin.zip".equals(p.getFileName().toString()))
-                .sorted(Comparator.comparing(p -> dir.relativize(p).toString()))
-                .toList();
-        }
+        return buildZip(dir, null, null, null);
+    }
+
+    /**
+     * 打包：排除构建垃圾 / 旧包 / 自动生成清单；源目录没有用户 plugin.json 时补一份
+     * {@code .claude-plugin/plugin.json}（name/version/description + generatedBy 标记）。
+     */
+    static byte[] buildZip(Path dir, String pluginName, String version, String description) throws IOException {
+        List<Path> files = publishableFiles(dir);
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(bos, StandardCharsets.UTF_8)) {
             for (Path f : files) {
@@ -240,19 +258,28 @@ public class MarketPublishService {
                 zos.write(Files.readAllBytes(f));
                 zos.closeEntry();
             }
+            if (pluginName != null && !pluginName.isBlank() && version != null && !version.isBlank()
+                    && !hasUserPluginManifest(dir)) {
+                ObjectNode generated = JSON.createObjectNode();
+                generated.put("name", pluginName);
+                generated.put("version", version);
+                if (description != null && !description.isBlank()) {
+                    generated.put("description", description);
+                }
+                generated.put(GENERATED_MARKER_FIELD, GENERATED_MARKER_VALUE);
+                ZipEntry entry = new ZipEntry(GENERATED_MANIFEST_PATH);
+                entry.setTime(0L);
+                zos.putNextEntry(entry);
+                zos.write(JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(generated));
+                zos.closeEntry();
+            }
         }
         return bos.toByteArray();
     }
 
     /** 内容指纹：排序后的「相对路径 + 文件字节」逐个喂进 SHA-256（不依赖 zip 元数据）。 */
     public static String fingerprint(Path dir) throws IOException {
-        List<Path> files;
-        try (var stream = Files.walk(dir)) {
-            files = stream.filter(Files::isRegularFile)
-                .filter(p -> !"plugin.zip".equals(p.getFileName().toString()))
-                .sorted(Comparator.comparing(p -> dir.relativize(p).toString()))
-                .toList();
-        }
+        List<Path> files = publishableFiles(dir);
         MessageDigest md;
         try {
             md = MessageDigest.getInstance("SHA-256");
@@ -270,6 +297,57 @@ public class MarketPublishService {
             sb.append(String.format(Locale.ROOT, "%02x", b));
         }
         return sb.toString();
+    }
+
+    /** 打包/指纹共用的文件集：排序 + 排除构建垃圾 / 旧包 / 自动生成清单。 */
+    private static List<Path> publishableFiles(Path dir) throws IOException {
+        try (var stream = Files.walk(dir)) {
+            return stream.filter(Files::isRegularFile)
+                .filter(p -> isPublishable(dir, p))
+                .sorted(Comparator.comparing(p -> dir.relativize(p).toString()))
+                .toList();
+        }
+    }
+
+    /** 是否进入包/指纹：排除 .git、node_modules、__pycache__、.DS_Store、*.pyc、旧 plugin.zip。 */
+    private static boolean isPublishable(Path root, Path file) {
+        Path relPath = root.relativize(file);
+        for (Path seg : relPath) {
+            String s = seg.toString();
+            if (s.equals(".git") || s.equals("node_modules") || s.equals("__pycache__") || s.equals(".DS_Store")) {
+                return false;
+            }
+        }
+        String rel = relPath.toString().replace('\\', '/');
+        if (rel.equals("plugin.zip") || rel.endsWith(".pyc")) {
+            return false;
+        }
+        return !isGeneratedManifest(root, file);
+    }
+
+    /** 源目录是否已有用户自己的 plugin.json（自动生成的标记清单不算，会用新版本重新生成）。 */
+    private static boolean hasUserPluginManifest(Path dir) {
+        for (String rel : List.of(GENERATED_MANIFEST_PATH, "plugin.json")) {
+            Path f = dir.resolve(rel);
+            if (Files.isRegularFile(f) && !isGeneratedManifest(dir, f)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 自动生成的清单带 generatedBy 标记；指纹必须忽略它，否则市场/本地指纹永远不等。 */
+    private static boolean isGeneratedManifest(Path root, Path file) {
+        String rel = root.relativize(file).toString().replace('\\', '/');
+        if (!GENERATED_MANIFEST_PATH.equals(rel)) {
+            return false;
+        }
+        try {
+            JsonNode n = JSON.readTree(Files.readAllBytes(file));
+            return GENERATED_MARKER_VALUE.equals(n.path(GENERATED_MARKER_FIELD).asText());
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** 版本决策：手填优先；未填 → patch +1；无历史 → 0.1.0。 */

@@ -5,10 +5,12 @@ import org.slf4j.LoggerFactory;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
-import java.nio.file.NoSuchFileException;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
@@ -405,11 +407,7 @@ public class MarketplaceSyncService {
         }
 
         try {
-            Files.walk(Paths.get(cachePath))
-                .sorted(java.util.Comparator.reverseOrder())
-                .forEach(p -> p.toFile().delete());
-        } catch (NoSuchFileException e) {
-            // ENOENT —— 全新安装，无需清理
+            deleteRecursively(Paths.get(cachePath));
         } catch (IOException rmError) {
             throw new IOException(
                 "Failed to clean up existing marketplace directory. Please manually delete "
@@ -421,15 +419,55 @@ public class MarketplaceSyncService {
         if (!clone.ok()) {
             // clone 失败清理部分目录（best-effort），下次调用自动检测
             try {
-                Path cp = Paths.get(cachePath);
-                if (Files.exists(cp)) {
-                    Files.walk(cp).sorted(java.util.Comparator.reverseOrder())
-                        .forEach(p -> p.toFile().delete());
-                }
+                deleteRecursively(Paths.get(cachePath));
             } catch (Exception ignored) {
                 // best-effort
             }
             throw new IOException("Failed to clone marketplace repository: " + clone.stderr());
+        }
+    }
+
+    /**
+     * 递归删除目录并校验结果。
+     *
+     * <p><b>WHY</b>（2026-10-26 用户提供的日志实测）：旧实现用
+     * {@code Files.walk(...).forEach(p -> p.toFile().delete())} —— Windows 上
+     * {@link java.io.File#delete()} 对非空目录/只读文件<b>静默返回 false</b>，
+     * 旧 marketplace 目录原地留下，随后 {@code git clone} 必然报
+     * 「destination path ... already exists and is not an empty directory」，
+     * 启动期每次 reconcile 都失败。改为逐项删除 + 去只读位 + 删后校验，失败即抛（fail-loud）。
+     */
+    private static void deleteRecursively(Path root) throws IOException {
+        if (!Files.exists(root)) {
+            return;
+        }
+        Files.walkFileTree(root, new SimpleFileVisitor<Path>() {
+            @Override
+            public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                // Windows 只读文件（.git/objects 常见）先去掉只读位，否则 delete 失败
+                file.toFile().setWritable(true);
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult visitFileFailed(Path file, IOException exc) throws IOException {
+                file.toFile().setWritable(true);
+                Files.deleteIfExists(file);
+                return FileVisitResult.CONTINUE;
+            }
+
+            @Override
+            public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                if (exc != null) {
+                    throw exc;
+                }
+                Files.deleteIfExists(dir);
+                return FileVisitResult.CONTINUE;
+            }
+        });
+        if (Files.exists(root)) {
+            throw new IOException("目录删除后仍存在（可能被其他进程占用）: " + root);
         }
     }
 

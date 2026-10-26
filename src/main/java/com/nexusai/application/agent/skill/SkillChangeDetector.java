@@ -397,7 +397,20 @@ public class SkillChangeDetector implements ApplicationRunner {
         //   与加载侧 SkillsLoader 双目录用户源同源（~/.{appName} + ~/.claude）
         Path nexusaiUserConfigHome = Path.of(NexusaiPaths.getAppConfigHomeDir());
         // 1. nexusai user skills ~/.{appName}/skills（自有根优先，T3）
-        addIfDirectory(paths, nexusaiUserConfigHome.resolve("skills"));
+        Path nexusaiUserSkills = nexusaiUserConfigHome.resolve("skills");
+        // WHY（2026-10-26 用户实测「手动安装 skill 没被感知」）：watcher 只登记启动时**已存在**的目录。
+        //   全新安装可能还没有 ~/.nexusai/skills；用户之后手动拷技能进去将永远不触发 reload。
+        //   配置根已存在（= 应用已初始化）时兜底创建用户技能根（只建 user 级，不碰项目目录）；
+        //   配置根本身不存在则不凭空创建（测试/未初始化环境保持「缺失路径跳过」语义）。
+        if (Files.isDirectory(nexusaiUserConfigHome)) {
+            try {
+                Files.createDirectories(nexusaiUserSkills);
+            } catch (IOException e) {
+                log.warn("[SkillChangeDetector] 创建用户技能根失败（后续手动安装可能无法热加载）: {} - {}",
+                    nexusaiUserSkills, e.toString());
+            }
+        }
+        addIfDirectory(paths, nexusaiUserSkills);
         // 2. nexusai user commands ~/.{appName}/commands（自有根优先，T3）
         addIfDirectory(paths, nexusaiUserConfigHome.resolve("commands"));
         // 3. user skills getClaudeConfigHomeDir()/skills（CC :176-184，claude 回落）

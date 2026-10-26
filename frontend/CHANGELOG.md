@@ -2,6 +2,24 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.55] - 2026-10-26
+
+### Added
+
+- 技能市场「本地」来源可查看已安装技能与插件；手动拷贝到 `~/.nexusai/skills` 的技能无需重启，输入 `/` 即可补全。
+- 插件安装支持断点续传（HTTP Range）与卡片进度条；裸技能包自动补 `.claude-plugin/plugin.json`（name/version）。
+- 全新安装默认配置：minimax（内网版带默认 key）+ deepseek（无 key），9 个模型档位默认指向 minimax。
+
+### Fixed
+
+- 点击「召唤」报「该技能未注册成斜杠命令」：包根 `SKILL.md` 的技能包现在能被正确注册。
+- 官方 marketplace 自动安装失败（owner 为对象解析失败 / 旧目录清理不彻底）。
+- 插件市场缓存遗留整包副本；发布包排除 `__pycache__`/`.git`/`node_modules`。
+
+### Removed
+
+- 腾讯 workbuddy 市场源（前端来源、后端代理端点与凭证读取）。
+
 ## [0.1.54] - 2026-10-26
 
 ### Added

@@ -1,0 +1,5 @@
+{
+  "providers": [
+    { "name": "minimax", "apiKey": "sk-test-only-1234567890" }
+  ]
+}

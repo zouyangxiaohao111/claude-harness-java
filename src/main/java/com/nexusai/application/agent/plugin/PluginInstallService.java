@@ -83,8 +83,9 @@ public class PluginInstallService {
             String installLocation = ensureMarketplace(marketplaceUrl, marketName);
 
             // 2. 按需下载目标插件（source 目录下的 plugin.zip）→ 缓存市场目录对应位置
+            java.nio.file.Path downloadedSource = null;
             if (!marketplaceUrl.isEmpty()) {
-                downloadTargetPlugin(marketplaceUrl, pluginId, installLocation);
+                downloadedSource = downloadTargetPlugin(marketplaceUrl, pluginId, installLocation);
             }
             progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.EXTRACTING, 80, "解压完成");
 
@@ -100,6 +101,8 @@ public class PluginInstallService {
             progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.INSTALLING, 85, "安装注册");
             PluginOperations.InstallResult r = ops.installPlugin(pluginId, scope);
             if (r.success()) {
+                // 安装成功后清掉市场缓存里的解压副本（真正安装目录在 plugins/cache/<market>/<plugin>/<version>）
+                cleanupDownloadedSource(downloadedSource, installLocation, pluginId);
                 progressTracker.stage(pluginId, PluginInstallProgressTracker.Stage.REFRESHING, 95, "刷新技能与命令");
                 refreshPlugins();
                 progressTracker.done(pluginId);
@@ -268,7 +271,8 @@ public class PluginInstallService {
      * 拼接 {@code <base>/<source>/plugin.zip}，下载解压到缓存市场目录的 source 位置。
      * 只下载目标插件一个包（几十 KB），不碰其他插件。
      */
-    private void downloadTargetPlugin(String marketplaceUrl, String pluginId, String installLocation) throws IOException {
+    private java.nio.file.Path downloadTargetPlugin(String marketplaceUrl, String pluginId,
+                                                    String installLocation) throws IOException {
         PluginIdentifier.Parsed id = PluginIdentifier.parse(pluginId);
         String marketName = id.marketplace();
         String pluginName = id.name();
@@ -298,6 +302,37 @@ public class PluginInstallService {
             (read, total) -> progressTracker.downloading(pluginId, read, total));
         if (log.isInfoEnabled()) {
             log.info("[PluginInstall] 已按需下载插件包 {} → {}", pluginName, target);
+        }
+        return target;
+    }
+
+    /**
+     * 安装成功后清理市场缓存里的解压副本。
+     *
+     * <p><b>WHY</b>（2026-10-26 用户实测）：插件真正安装目录是
+     * {@code plugins/cache/<market>/<plugin>/<version>}；{@code plugins/marketplaces/<market>/<source>}
+     * 只是下载中转。不清理会每装一个版本就在市场缓存里留一份整包（与已装目录重复占用）。
+     * 只删本次下载且确认位于市场缓存根内的目录；失败仅 warn，不影响安装结果。
+     */
+    private void cleanupDownloadedSource(java.nio.file.Path downloadedSource,
+                                         String installLocation, String pluginId) {
+        if (downloadedSource == null) {
+            return;
+        }
+        try {
+            java.nio.file.Path root = Paths.get(installLocation).toAbsolutePath().normalize();
+            java.nio.file.Path target = downloadedSource.toAbsolutePath().normalize();
+            if (!target.startsWith(root)) {
+                log.warn("[PluginInstall] 跳过清理：下载目录不在市场缓存内 target={} root={}", target, root);
+                return;
+            }
+            PluginInstaller.deleteRecursively(target);
+            if (log.isInfoEnabled()) {
+                log.info("[PluginInstall] 已清理市场缓存解压副本 plugin={} path={}", pluginId, target);
+            }
+        } catch (Exception e) {
+            log.warn("[PluginInstall] 清理市场缓存解压副本失败（不影响安装） plugin={} path={}: {}",
+                pluginId, downloadedSource, e.getMessage());
         }
     }
 }

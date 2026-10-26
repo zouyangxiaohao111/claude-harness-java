@@ -384,6 +384,21 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     commandApi.list(false, sessionId ?? undefined).then((cs) => { if (alive) setRemoteCommands(cs) }).catch(() => {})
     return () => { alive = false }
   }, [sessionId])
+  // 打开斜杠菜单时重新拉取：用户可能在应用运行期间手动安装/删除技能（拷到 ~/.nexusai/skills），
+  // 只按 sessionId 拉一次会让补全一直停在旧列表。reload=true 让后端同时清 SkillRegistry memoize
+  // —— 仅 rescan DB 不足以看到新放的技能。
+  const slashOpen = composerText.startsWith('/') && !composerText.includes(' ')
+  const prevSlashOpenRef = useRef(false)
+  useEffect(() => {
+    const opened = slashOpen && !prevSlashOpenRef.current
+    prevSlashOpenRef.current = slashOpen
+    if (!opened) return
+    let alive = true
+    commandApi.list(true, sessionId ?? undefined)
+      .then((cs) => { if (alive) setRemoteCommands(cs) })
+      .catch(() => { /* 静默：保留旧列表仍可输入 */ })
+    return () => { alive = false }
+  }, [slashOpen, sessionId])
   const cmdMatches = useMemo(() => {
     const t = composerText
     if (!t.startsWith('/') || t.includes(' ')) return null

@@ -265,6 +265,8 @@ class SkillChangeDetectorTest {
         Path nonexistentHome = tempDir.resolve("no-such-home");
         detector.setUserHomeDir(nonexistentHome);
         detector.setProjectDir(tempDir); // 空 tempDir → 无 .claude/skills
+        // nexusai 自有根也隔离到不存在的 appName（否则会盯上开发机真实的 ~/.nexusai/skills）。
+        NexusaiPaths.setAppNameOverride("nexusai-test-" + tempDir.getFileName());
 
         assertThat(detector.getWatchablePaths())
             .as("所有候选路径不存在 → 空列表 (fs.stat 跳过缺失)")

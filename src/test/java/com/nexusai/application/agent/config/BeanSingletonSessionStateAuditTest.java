@@ -172,10 +172,9 @@ class BeanSingletonSessionStateAuditTest {
      *       （批 A2b 引入的装配字段，已同步登记进 {@link #TIER1_REGISTERED}，理由见该处注释）、
      *       {@code LocalSettingsGitignore#BiFunction gitExec} / {@code #Predicate dirIsInGitRepoFn} /
      *       {@code #Supplier globalGitignorePathSupplier}（批 A4c P4 引入的装配点，无状态）；</li>
-     *   <li><b>其它批次 11 条</b>：{@code McpServerService} 三个 {@code BooleanSupplier *Gate}（feature 门）、
+     *   <li><b>其它批次 10 条</b>：{@code McpServerService} 三个 {@code BooleanSupplier *Gate}（feature 门）、
      *       {@code NexusProperties#Encryption encryption} / {@code #Set openaiReasoningField} 与
      *       {@code ApiAccessLogProperties#boolean enabled} / {@code #List excludeUris}（配置属性绑定）、
-     *       {@code WorkbuddyMarketService#long lastTencentCallMs}（调用节流时间戳，进程级）、
      *       {@code AnthropicSdkProvider#PromptCacheBreakDetection promptCacheBreak}（provider 级缓存态）、
      *       {@code MockLlmProvider#AgentUsage mockUsage} / {@code #Boolean lastSkipCacheWrite}（测试 mock）。</li>
      * </ol>

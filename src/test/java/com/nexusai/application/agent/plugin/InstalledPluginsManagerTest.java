@@ -684,4 +684,35 @@ class InstalledPluginsManagerTest {
         assertEquals("skills", rec.skillsPath().getFileName().toString());
         assertNull(rec.commandsPath(), "无 commands 目录时保持 null（CC auto-detect 语义）");
     }
+
+    @Test
+    void addInstalledPlugin_fallsBackToPluginRootForBareSkillMd() throws Exception {
+        // WHY（规则九 · 2026-10-26 用户实测）：市场里的单技能包把 SKILL.md 放在包根，
+        //   安装后是 <插件根>/SKILL.md，没有 skills/ 子目录。旧实现只探测 <插件根>/skills
+        //   ⇒ skillsPath=null ⇒ LoadPluginCommands.loadSkills 扫空 ⇒ 前端「召唤」报
+        //   「该技能未注册成斜杠命令」。loadSkillsFromDirectory 本就支持直载 skillsPath 下的
+        //   SKILL.md，因此 skillsPath 必须回落到插件根 —— 运行期注册与重启载盘两条路径都要回落，
+        //   否则重启后召唤再次失效。
+        Path installRoot = tempDir.resolve("cache/market/skills/bare-skill/1.0.0");
+        Files.createDirectories(installRoot);
+        Files.writeString(installRoot.resolve("SKILL.md"),
+            "---\nname: bare-skill\ndescription: demo\n---\n# demo");
+
+        manager.initialize();
+        manager.addInstalledPlugin("bare-skill", "1.0.0", System.currentTimeMillis(),
+            installRoot.toString(), null, "user", null);
+
+        InstalledPluginsManager.InstalledRecord rec = manager.list().stream()
+            .filter(r -> "bare-skill".equals(r.name())).findFirst().orElseThrow();
+        assertEquals(installRoot, rec.skillsPath(), "包根有 SKILL.md 时 skillsPath 必须回落到插件根");
+
+        // 重启载盘走 fromPluginInstallation（另一条路径），必须同样回落
+        InstalledPluginsFileStore store2 = new InstalledPluginsFileStore();
+        InstalledPluginsManager manager2 = new InstalledPluginsManager();
+        manager2.setFileStore(store2);
+        manager2.initialize();
+        InstalledPluginsManager.InstalledRecord reloaded = manager2.get("bare-skill");
+        assertNotNull(reloaded, "重启后必须读回已装技能包");
+        assertEquals(installRoot, reloaded.skillsPath(), "重启读回也必须回落（否则重启后召唤再次失效）");
+    }
 }

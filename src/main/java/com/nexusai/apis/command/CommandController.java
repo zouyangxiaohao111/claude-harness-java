@@ -233,7 +233,13 @@ public class CommandController {
 
     /** {@link #list(boolean, String, String)} 主体 · 会话标识**显式透传**至技能源解析。 */
     private List<CommandDto> listInternal(boolean reload, String clientEnvHeader, String sessionId) {
-        if (reload) commandService.rescanFromFilesystem();
+        if (reload) {
+            commandService.rescanFromFilesystem();
+            // reload=true 的契约是「重新扫描」：SkillRegistry 三层 memoize（allCommands /
+            // modelInvocable / slashToolSkills）也必须失效，否则用户手动拷进 ~/.nexusai/skills
+            // 的技能仍然不可见（斜杠补全按 reload=true 拉取时尤其明显）。
+            skillRegistry.refresh();
+        }
         ClientEnv clientEnv = ClientEnv.fromHeader(clientEnvHeader);
         List<Command> domain = mergedSkillCommands(sessionId);
         List<Command> filtered = skillRegistry.filterByClientEnv(domain, clientEnv);

@@ -21,6 +21,7 @@
     "core:window:allow-create",
     "core:webview:allow-create-webview-window",
     "dialog:allow-open",
+    "dialog:allow-confirm",
     "fs:allow-read-file",
     "fs:allow-write-text-file",
     "fs:allow-stat",

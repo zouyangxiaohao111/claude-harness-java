@@ -2,7 +2,7 @@
  * 主线程 agent（专家）胶囊 · Composer 顶部。
  * 语义变化（技能市场骨架）：点开不再展开下拉，改为触发打开 SkillMarketModal（技能市场弹窗，
  * App 持有 showMarket state 并渲染弹窗）。选中/使用 agent 在弹窗内完成，会话 mainThreadAgent 由
- * App 的 handleAgentChange（本地 PATCH）或 marketApi.useExpert（远端）写入后回传 currentAgent。
+ * App 的 handleAgentChange（本地 PATCH；建科市场专家走插件安装）写入后回传 currentAgent。
  * 胶囊文案：已选 → 显示 agentType；未选 → 「技能市场」入口。
  * 清除入口（2026-10-15，用户裁定「悬停出 × 可删」）：已选 agent 时，悬停胶囊把 ▾ 切换为 × ——
  *   点击走 onClear（App → handleAgentChange(null)，mainThreadAgent 清空回默认模式），
