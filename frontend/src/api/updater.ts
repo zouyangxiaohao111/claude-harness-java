@@ -22,6 +22,25 @@ export const DEFAULT_UPDATER_SOURCES = [
   'https://github.com/zouyangxiaohao111/claude-harness-java/releases/latest/download/latest.json',
 ]
 
+/**
+ * 场景版（appName=nexusai-scene）专用更新源：只走 MinIO 的 `updater-scene` 前缀。
+ * ⛔ 不含 GitHub（场景产物只上 MinIO，见 scene-branch-svn-only-not-github）。
+ * ⛔ 绝不能沿用通用版的 `updater/latest.json`——否则场景版会下载并安装**通用版安装包**。
+ */
+export const SCENE_UPDATER_SOURCES = [
+  'http://192.168.20.125:9000/nexusai/updater-scene/latest.json',
+]
+
+/**
+ * 按 appName 选择更新源。
+ *
+ * @param appName 后端 GET /settings 的只读 appName（nexusai / nexusai-scene）
+ * @returns 场景版 → {@link SCENE_UPDATER_SOURCES}；通用版/null → {@link DEFAULT_UPDATER_SOURCES}
+ */
+export function updaterSourcesFor(appName?: string | null): string[] {
+  return appName === 'nexusai-scene' ? SCENE_UPDATER_SOURCES : DEFAULT_UPDATER_SOURCES
+}
+
 export function updateCheck(currentVersion: string, sources?: string[]): Promise<UpdateInfo> {
   return invoke<UpdateInfo>('update_check', {
     currentVersion,

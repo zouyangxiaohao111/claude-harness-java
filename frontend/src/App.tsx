@@ -2253,7 +2253,7 @@ function App() {
         />
       )}
       <Toast toast={ui.toast} />
-      <UpdateCenter />
+      <UpdateCenter appName={appSettings?.appName ?? null} />
     </div>
   )
 }

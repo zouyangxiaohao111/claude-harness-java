@@ -8,6 +8,7 @@ import {
   updateInstall,
   onUpdateProgress,
   onUpdateReady,
+  updaterSourcesFor,
   type UpdateInfo,
 } from '@/api/updater'
 
@@ -18,7 +19,7 @@ type Stage = 'idle' | 'checking' | 'found' | 'notes' | 'dl' | 'ready' | 'fail' |
  * 状态机对应 docs/.../autoupdate.html（latest 化：对外只说“有新版本”，真实版本在说明/关于）。
  * dev(浏览器) 无 Tauri → 不渲染。
  */
-export function UpdateCenter() {
+export function UpdateCenter({ appName }: { appName?: string | null }) {
   const tauri = typeof window !== 'undefined' && '__TAURI_INTERNALS__' in window
   const [stage, setStage] = useState<Stage>('idle')
   const [current, setCurrent] = useState('')
@@ -34,13 +35,18 @@ export function UpdateCenter() {
    *  （启动 3s 自动检查）→ 只在「发现新版本」时自动弹窗，无新版 / 检查失败均静默留在 idle，不打扰用户。 */
   const check = useCallback(async (manual = false) => {
     if (busy.current) return
+    // 设置未加载 ⇒ 不知道是通用版还是场景版：⛔ 不能用默认源猜（场景版会装成通用版）
+    if (!appName) {
+      if (manual) { setErr('设置尚未加载，请稍后再试'); setStage('fail') }
+      return
+    }
     busy.current = true
     if (manual) setStage('checking')   // 自动检查：先留在 idle，避免「检查中」弹窗闪一下
     setErr('')
     try {
       const ver = current || (await invoke<string>('app_version'))
       setCurrent(ver)
-      const found = await updateCheck(ver)
+      const found = await updateCheck(ver, updaterSourcesFor(appName))
       if (found.available) {
         setInfo(found)
         setStage('found')
@@ -54,17 +60,18 @@ export function UpdateCenter() {
     } finally {
       busy.current = false
     }
-  }, [current])
+  }, [current, appName])
 
   useEffect(() => {
-    if (!tauri) return
+    // appName 未就绪时不排程：等设置到达后本 effect 重跑，再决定用哪套更新源
+    if (!tauri || !appName) return
     let unsub: Array<() => void> = []
     onUpdateProgress((done, total) => { setDlDone(done); setDlTotal(total ?? null) }).then((u) => unsub.push(u))
     onUpdateReady((path) => { setReadyPath(path); setStage('ready') }).then((u) => unsub.push(u))
     // 启动约 3s 后自动检查一次（只此一次；进入任何状态即取消，避免打断下载）
     autoTimer.current = setTimeout(() => void check(), 3000)
     return () => { if (autoTimer.current) clearTimeout(autoTimer.current); unsub.forEach((f) => f()) }
-  }, [tauri, check])
+  }, [tauri, check, appName])
 
   // 一旦离开 idle（手动打开/下载等）取消待触发的自动检查
   useEffect(() => {

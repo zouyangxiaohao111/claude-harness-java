@@ -188,6 +188,7 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
         registerStuckSkill();          // CC :34（ant 门控）
         registerUltracodeSkill();      // CC bundled/index.ts:39（ultracode.ts:219，无条件注册，无 isEnabled gate）
         registerImportCcSkill();       // NexusAI 扩展 · /import-cc 一键导入 CC 技能/插件（无条件注册，无 isEnabled gate）
+        registerInstallSkill();        // NexusAI 扩展 · /install-skill 从插件市场浏览并安装技能（无条件注册）
         registerCronListSkill();       // CC bundled/index.ts:40（cronManage.ts:8，isEnabled=isKairosCronEnabled）
         registerCronDeleteSkill();     // CC bundled/index.ts:41（cronManage.ts:27，isEnabled=isKairosCronEnabled）
         // CC :35-45 KAIROS|KAIROS_DREAM(dream) / :41-45 REVIEW_ARTIFACT(hunter) — DEC-15 空壳不注册
@@ -359,6 +360,13 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
         // 无 feature 门控）——纯提示型 skill，指导模型把 ~/.claude 技能/插件复制到 ~/.nexusai +
         // enabledPlugins 落 DB + 关插件双读。对齐 registerUltracodeSkill 注册位（无条件、userInvocable=true）。
         registerSkill("import-cc", () -> new ImportCcSkillRegistrar().register(this::register));
+    }
+
+    private void registerInstallSkill() {
+        // /install-skill · NexusAI 扩展（非 CC bundled）：模型可浏览市场清单并安装技能；
+        //   提示词强制 AskUserQuestion 确认、不执行包内脚本、安装落点由注册期注入
+        //   （{configHome}/skills 与 .{appName}/skills，均在 SkillChangeDetector 监听集合内）。
+        registerSkill("install-skill", () -> register(new InstallSkillRegistrar().register()));
     }
 
     private void registerCronListSkill() {
