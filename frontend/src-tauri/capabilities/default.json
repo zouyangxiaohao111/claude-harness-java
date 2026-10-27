@@ -22,6 +22,7 @@
     "core:webview:allow-create-webview-window",
     "dialog:allow-open",
     "dialog:allow-confirm",
+    "opener:allow-reveal-item-in-dir",
     "fs:allow-read-file",
     "fs:allow-write-text-file",
     "fs:allow-stat",

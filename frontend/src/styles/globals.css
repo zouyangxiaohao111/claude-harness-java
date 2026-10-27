@@ -984,6 +984,42 @@ html {
   margin: 4px 0;
 }
 
+/* 项目文件树右键菜单 + 新建/重命名弹窗 */
+.file-tree-menu { min-width: 192px; padding: 4px 0; }
+.file-op-dialog {
+  width: 340px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  box-shadow: 0 8px 32px rgba(20,24,31, 0.12), 0 2px 8px rgba(20,24,31, 0.06);
+  padding: 16px;
+}
+.file-op-title { font-size: 13px; font-weight: 600; color: var(--ink); margin-bottom: 6px; }
+.file-op-hint {
+  font-size: 11px;
+  color: var(--ink-faint);
+  margin-bottom: 10px;
+  word-break: break-all;
+}
+.file-op-dialog .settings-input { width: 100%; box-sizing: border-box; }
+.file-op-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 14px; }
+.file-op-btn {
+  border: 1px solid var(--hairline-strong);
+  background: var(--surface-1);
+  color: var(--ink);
+  font-size: 12px;
+  padding: 5px 14px;
+  border-radius: var(--r-pill, 9999px);
+  cursor: pointer;
+  font-family: inherit;
+}
+.file-op-btn:hover { background: var(--surface-2); }
+.file-op-btn.primary {
+  background: var(--accent, #0f5fd4);
+  border-color: var(--accent, #0f5fd4);
+  color: #FFFFFF;
+}
+
 /* Flash animation for swapped main project */
 @keyframes flashAccent {
   0% { border-color: var(--accent); box-shadow: 0 0 8px var(--accent-soft); }

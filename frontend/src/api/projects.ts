@@ -66,4 +66,18 @@ export const projectApi = {
   /** 项目文件写入（Monaco 编辑保存 · PUT body 复用 FileContent.content） */
   write: (id: string, path: string, content: string) =>
     api<FileContent>(`/projects/${encodeURIComponent(id)}/file?path=${encodeURIComponent(path)}`, { method: 'PUT', body: { content } }),
+
+  // ── 文件树右键菜单写操作（后端 ProjectService.createEntry/renameEntry/deleteEntry）──
+
+  /** 新建文件/文件夹（父目录必须存在；重名 → 409） */
+  createEntry: (id: string, path: string, type: 'file' | 'dir') =>
+    api<void>(`/projects/${encodeURIComponent(id)}/entries`, { method: 'POST', body: { path, type } }),
+
+  /** 重命名（只允许同目录内改名；重名 → 409） */
+  renameEntry: (id: string, path: string, newName: string) =>
+    api<void>(`/projects/${encodeURIComponent(id)}/entries`, { method: 'PATCH', body: { path, newName } }),
+
+  /** 删除文件/目录（目录递归；项目根不可删） */
+  deleteEntry: (id: string, path: string) =>
+    api<void>(`/projects/${encodeURIComponent(id)}/entries?path=${encodeURIComponent(path)}`, { method: 'DELETE' }),
 }

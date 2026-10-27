@@ -7,6 +7,8 @@ import com.nexusai.model.project.dto.FileNodeDto;
 import com.nexusai.model.project.dto.ProjectBindRequest;
 import com.nexusai.model.project.dto.ProjectCreateRequest;
 import com.nexusai.model.project.dto.ProjectDto;
+import com.nexusai.model.project.dto.ProjectEntryCreateRequest;
+import com.nexusai.model.project.dto.ProjectEntryRenameRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -46,6 +48,29 @@ public class ProjectController {
     /** 项目文件树（IDE 项目结构视图 · git ls-files 组装）。 */
     @GetMapping("/api/v1/projects/{id}/files")
     public List<FileNodeDto> files(@PathVariable String id) { return projectService.listFiles(id); }
+
+    /** 项目文件树：新建文件/文件夹（父目录必须存在；重名 → 409）。 */
+    @PostMapping("/api/v1/projects/{id}/entries")
+    @ResponseStatus(HttpStatus.CREATED)
+    public void createEntry(@PathVariable String id, @Valid @RequestBody ProjectEntryCreateRequest req) {
+        boolean dir = req.type() != null
+            && ("dir".equalsIgnoreCase(req.type()) || "folder".equalsIgnoreCase(req.type()));
+        projectService.createEntry(id, req.path(), dir);
+    }
+
+    /** 项目文件树：重命名（只允许同目录内改名；重名 → 409）。 */
+    @PatchMapping("/api/v1/projects/{id}/entries")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void renameEntry(@PathVariable String id, @Valid @RequestBody ProjectEntryRenameRequest req) {
+        projectService.renameEntry(id, req.path(), req.newName());
+    }
+
+    /** 项目文件树：删除（目录递归；拒绝删除项目根）。 */
+    @DeleteMapping("/api/v1/projects/{id}/entries")
+    @ResponseStatus(HttpStatus.NO_CONTENT)
+    public void deleteEntry(@PathVariable String id, @RequestParam String path) {
+        projectService.deleteEntry(id, path);
+    }
 
     /** 项目文件内容（前端文件树点击查看真实内容 · 防路径穿越）。 */
     @GetMapping("/api/v1/projects/{id}/file")

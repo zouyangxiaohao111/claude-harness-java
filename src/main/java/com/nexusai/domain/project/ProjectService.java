@@ -1,6 +1,7 @@
 package com.nexusai.domain.project;
 
 import com.nexusai.application.agent.worktree.GitCommandRunner;
+import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.project.dto.FileContentDto;
@@ -16,10 +17,14 @@ import org.springframework.stereotype.Service;
 
 import java.io.IOException;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.FileVisitResult;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
+import java.nio.file.LinkOption;
 import java.nio.file.Path;
 import java.nio.file.Paths;
+import java.nio.file.SimpleFileVisitor;
+import java.nio.file.attribute.BasicFileAttributes;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -205,6 +210,139 @@ public class ProjectService {
             log.warn("readFileBytes: 读取失败 project={} path={} err={}", id, relativePath, e.getMessage());
             throw new NotFoundException("文件读取失败");
         }
+    }
+
+    // ============== 文件树写操作（新建/重命名/删除）==============
+
+    /**
+     * 新建文件或目录（前端项目文件树右键菜单）。
+     *
+     * <p>安全：相对路径经 {@link #resolveProjectFile} 防穿越；父目录必须已存在且在同一项目内；
+     * 目标已存在 → 409（绝不覆盖）。
+     *
+     * @param id           项目 id
+     * @param relativePath 项目内相对路径（/ 分隔）
+     * @param dir          true=目录，false=文件
+     */
+    public void createEntry(String id, String relativePath, boolean dir) {
+        Path root = requireProjectRoot(id);
+        String rel = requireRelativePath(relativePath);
+        Path resolved = resolveProjectFile(root, rel);
+        if (resolved.equals(root)) {
+            throw new ValidationException("不能把项目根目录当作新建目标");
+        }
+        Path parent = resolved.getParent();
+        if (parent == null || !Files.isDirectory(parent)) {
+            throw new ValidationException("父目录不存在：" + parent);
+        }
+        if (Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
+            throw new ConflictException("同名文件或目录已存在：" + rel);
+        }
+        try {
+            if (dir) {
+                Files.createDirectory(resolved);
+            } else {
+                Files.createFile(resolved);
+            }
+            log.info("[ProjectFileOps] 新建{} project={} path={}", dir ? "目录" : "文件", id, rel);
+        } catch (IOException e) {
+            log.warn("[ProjectFileOps] 新建失败 project={} path={} err={}", id, rel, e.getMessage());
+            throw new ValidationException("新建失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 重命名文件/目录（只允许同目录内改名；目标已存在 → 409，绝不覆盖）。
+     */
+    public void renameEntry(String id, String relativePath, String newName) {
+        Path root = requireProjectRoot(id);
+        String rel = requireRelativePath(relativePath);
+        Path resolved = resolveProjectFile(root, rel);
+        if (resolved.equals(root)) {
+            throw new ValidationException("不能重命名项目根目录");
+        }
+        if (!Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
+            throw new NotFoundException("文件或目录不存在：" + rel);
+        }
+        String name = newName == null ? "" : newName.trim();
+        if (name.isEmpty() || name.equals(".") || name.equals("..")
+                || name.contains("/") || name.contains("\\")) {
+            throw new ValidationException("新名称非法：" + newName);
+        }
+        Path target = resolved.resolveSibling(name).normalize();
+        if (!target.startsWith(root)) {
+            throw new ValidationException("新名称越界");
+        }
+        if (Files.exists(target, LinkOption.NOFOLLOW_LINKS)) {
+            throw new ConflictException("同名文件或目录已存在：" + name);
+        }
+        try {
+            Files.move(resolved, target);
+            log.info("[ProjectFileOps] 重命名 project={} from={} to={}", id, rel, name);
+        } catch (IOException e) {
+            log.warn("[ProjectFileOps] 重命名失败 project={} path={} err={}", id, rel, e.getMessage());
+            throw new ValidationException("重命名失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 删除文件/目录（目录递归删除；⛔ 拒绝删除项目根）。
+     */
+    public void deleteEntry(String id, String relativePath) {
+        Path root = requireProjectRoot(id);
+        String rel = requireRelativePath(relativePath);
+        Path resolved = resolveProjectFile(root, rel);
+        if (resolved.equals(root)) {
+            throw new ValidationException("不能删除项目根目录");
+        }
+        if (!Files.exists(resolved, LinkOption.NOFOLLOW_LINKS)) {
+            throw new NotFoundException("文件或目录不存在：" + rel);
+        }
+        try {
+            if (Files.isDirectory(resolved, LinkOption.NOFOLLOW_LINKS)) {
+                Files.walkFileTree(resolved, new SimpleFileVisitor<>() {
+                    @Override
+                    public FileVisitResult visitFile(Path file, BasicFileAttributes attrs) throws IOException {
+                        Files.deleteIfExists(file);
+                        return FileVisitResult.CONTINUE;
+                    }
+
+                    @Override
+                    public FileVisitResult postVisitDirectory(Path dir, IOException exc) throws IOException {
+                        if (exc != null) throw exc;
+                        Files.deleteIfExists(dir);
+                        return FileVisitResult.CONTINUE;
+                    }
+                });
+            } else {
+                Files.deleteIfExists(resolved);
+            }
+            log.info("[ProjectFileOps] 删除 project={} path={}", id, rel);
+        } catch (IOException e) {
+            log.warn("[ProjectFileOps] 删除失败 project={} path={} err={}", id, rel, e.getMessage());
+            throw new ValidationException("删除失败：" + e.getMessage());
+        }
+    }
+
+    private Path requireProjectRoot(String id) {
+        ProjectRecord p = projectMapper.selectOneById(id);
+        if (p == null) throw new NotFoundException("Project " + id + " not found");
+        String projectPath = p.getPath();
+        if (projectPath == null || projectPath.isBlank()) {
+            throw new NotFoundException("Project " + id + " 无 path");
+        }
+        Path root = Paths.get(projectPath).toAbsolutePath().normalize();
+        if (!Files.isDirectory(root)) {
+            throw new NotFoundException("项目目录不存在：" + projectPath);
+        }
+        return root;
+    }
+
+    private static String requireRelativePath(String relativePath) {
+        if (relativePath == null || relativePath.isBlank()) {
+            throw new ValidationException("路径不能为空");
+        }
+        return relativePath.trim().replace('\\', '/');
     }
 
     /**

@@ -1,4 +1,6 @@
 import { memo, useEffect, useState } from 'react'
+import type { MouseEvent as ReactMouseEvent } from 'react'
+import { isTauri } from '@tauri-apps/api/core'
 import type { SettingsTab, Project, SessionFile } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
@@ -185,6 +187,12 @@ const summarizeJson = (v: unknown) => {
   return s && s.length > 60 ? `${s.slice(0, 60)}…` : (s ?? '')
 }
 
+/** 文件树右键菜单状态（fixed 定位，左键文件打开、右键菜单） */
+type FileMenuState = { x: number; y: number; node: FileNode }
+type FileOpDialogState =
+  | { kind: 'newFile' | 'newDir'; node: FileNode; title: string }
+  | { kind: 'rename'; node: FileNode; title: string }
+
 /** 文件树单节点 · IDE 风格：目录可展开/折叠，文件点击查看 */
 function FileTreeNode({
   node,
@@ -193,6 +201,7 @@ function FileTreeNode({
   onToggle,
   onOpen,
   onQuote,
+  onMenu,
 }: {
   node: FileNode
   depth: number
@@ -200,6 +209,7 @@ function FileTreeNode({
   onToggle: (path: string) => void
   onOpen: (path: string) => void
   onQuote: (path: string) => void
+  onMenu: (e: ReactMouseEvent, node: FileNode) => void
 }) {
   const isDir = node.type === 'dir'
   const expanded = isDir ? expandedDirs.has(node.path) : false
@@ -211,11 +221,11 @@ function FileTreeNode({
         style={{ paddingLeft }}
         onClick={() => (isDir ? onToggle(node.path) : onOpen(node.path))}
         onContextMenu={(e) => {
-          if (isDir) return
           e.preventDefault()
-          onQuote(node.path)
+          e.stopPropagation()
+          onMenu(e, node)
         }}
-        title={isDir ? node.path : `${node.path} · 左键查看 · 右键引用到对话`}
+        title={isDir ? `${node.path} · 右键菜单` : `${node.path} · 左键查看 · 右键菜单`}
       >
         {isDir ? (
           <span className={`chev ${expanded ? 'open' : ''}`}>
@@ -250,6 +260,7 @@ function FileTreeNode({
               onToggle={onToggle}
               onOpen={onOpen}
               onQuote={onQuote}
+              onMenu={onMenu}
             />
           ))}
         </div>
@@ -265,12 +276,14 @@ function ProjectFileTree({
   onToggle,
   onOpen,
   onQuote,
+  onMenu,
 }: {
   nodes: FileNode[]
   expandedDirs: Set<string>
   onToggle: (path: string) => void
   onOpen: (path: string) => void
   onQuote: (path: string) => void
+  onMenu: (e: ReactMouseEvent, node: FileNode) => void
 }) {
   if (nodes.length === 0) {
     return <div className="right-empty">该项目暂无文件（非 git 仓库？）</div>
@@ -278,8 +291,70 @@ function ProjectFileTree({
   return (
     <div className="file-tree">
       {nodes.map((n) => (
-        <FileTreeNode key={n.path} node={n} depth={0} expandedDirs={expandedDirs} onToggle={onToggle} onOpen={onOpen} onQuote={onQuote} />
+        <FileTreeNode key={n.path} node={n} depth={0} expandedDirs={expandedDirs} onToggle={onToggle} onOpen={onOpen} onQuote={onQuote} onMenu={onMenu} />
       ))}
+    </div>
+  )
+}
+
+/** 文件树右键菜单（复用 project-context-menu 样式） */
+function FileTreeContextMenu({ menu, onAction }: {
+  menu: FileMenuState
+  onAction: (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'rename' | 'delete') => void
+}) {
+  return (
+    <div
+      className="project-context-menu file-tree-menu"
+      style={{ left: menu.x, top: menu.y }}
+      onMouseDown={(e) => e.stopPropagation()}
+      onContextMenu={(e) => e.preventDefault()}
+    >
+      <div className="ctx-menu-item" onClick={() => onAction('newFile')}>新建文件…</div>
+      <div className="ctx-menu-item" onClick={() => onAction('newDir')}>新建文件夹…</div>
+      <div className="ctx-menu-item" onClick={() => onAction('reveal')}>在文件资源管理器中显示</div>
+      <div className="ctx-menu-divider"></div>
+      <div className="ctx-menu-item" onClick={() => onAction('quote')}>添加到对话</div>
+      <div className="ctx-menu-divider"></div>
+      <div className="ctx-menu-item" onClick={() => onAction('copy')}>复制路径</div>
+      <div className="ctx-menu-item" onClick={() => onAction('rename')}>重命名</div>
+      <div className="ctx-menu-item danger" onClick={() => onAction('delete')}>删除</div>
+    </div>
+  )
+}
+
+/** 新建/重命名单行输入弹窗（不用 window.prompt：Tauri WebView 支持不稳定） */
+function FileOpDialog({ state, onCancel, onConfirm }: {
+  state: FileOpDialogState
+  onCancel: () => void
+  onConfirm: (value: string) => void
+}) {
+  const [value, setValue] = useState(state.kind === 'rename' ? state.node.name : '')
+  useEffect(() => {
+    setValue(state.kind === 'rename' ? state.node.name : '')
+  }, [state])
+  return (
+    <div className="overlay-backdrop" onClick={onCancel}>
+      <div className="file-op-dialog" onClick={(e) => e.stopPropagation()}>
+        <div className="file-op-title">{state.title}</div>
+        <div className="file-op-hint">
+          {state.kind === 'rename' ? `重命名 ${state.node.path}` : `位置：${state.node.type === 'dir' ? state.node.path : (state.node.path.split('/').slice(0, -1).join('/') || '项目根')}/`}
+        </div>
+        <input
+          className="settings-input"
+          autoFocus
+          value={value}
+          onChange={(e) => setValue(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') onConfirm(value)
+            if (e.key === 'Escape') onCancel()
+          }}
+          placeholder={state.kind === 'rename' ? '新名称' : (state.kind === 'newDir' ? '文件夹名' : '文件名')}
+        />
+        <div className="file-op-actions">
+          <button className="file-op-btn" onClick={onCancel}>取消</button>
+          <button className="file-op-btn primary" onClick={() => onConfirm(value)}>确定</button>
+        </div>
+      </div>
     </div>
   )
 }
@@ -507,6 +582,11 @@ export const RightPanel = memo(function RightPanel({
   const [fileTreeError, setFileTreeError] = useState(false)
   // 展开的目录 path 集合
   const [expandedDirs, setExpandedDirs] = useState<Set<string>>(new Set())
+  // 文件树写操作后自增 → 重新拉取（保留展开集合）
+  const [fileTreeReload, setFileTreeReload] = useState(0)
+  const [fileMenu, setFileMenu] = useState<FileMenuState | null>(null)
+  const [opDialog, setOpDialog] = useState<FileOpDialogState | null>(null)
+  const refreshFileTree = () => setFileTreeReload((v) => v + 1)
   useEffect(() => {
     let alive = true
     const id = main.id
@@ -519,7 +599,20 @@ export const RightPanel = memo(function RightPanel({
       .then((nodes) => { if (alive) { setFileTree(nodes); setFileTreeLoading(false) } })
       .catch(() => { if (alive) { setFileTreeError(true); setFileTreeLoading(false) } })
     return () => { alive = false }
-  }, [main.id])
+  }, [main.id, fileTreeReload])
+
+  // 右键菜单：点击空白 / Esc 关闭（菜单自身 onMouseDown stopPropagation）
+  useEffect(() => {
+    if (!fileMenu) return
+    const close = () => setFileMenu(null)
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [fileMenu])
 
   const toggleDir = (path: string) => {
     setExpandedDirs((prev) => {
@@ -527,6 +620,101 @@ export const RightPanel = memo(function RightPanel({
       if (next.has(path)) next.delete(path); else next.add(path)
       return next
     })
+  }
+
+  const absolutePathOf = (node: FileNode) => {
+    const root = (main.path || '').replace(/[\\/]+$/, '')
+    return root ? `${root}/${node.path}` : node.path
+  }
+
+  const copyEntryPath = async (node: FileNode) => {
+    try {
+      await navigator.clipboard.writeText(absolutePathOf(node))
+      showToast('已复制路径', 'info')
+    } catch {
+      showToast(absolutePathOf(node), 'info')
+    }
+  }
+
+  const revealEntry = async (node: FileNode) => {
+    const abs = absolutePathOf(node)
+    if (isTauri()) {
+      try {
+        const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
+        await revealItemInDir(abs)
+      } catch (e) {
+        showToast(`打开文件资源管理器失败：${e instanceof Error ? e.message : String(e)}`, 'info')
+      }
+      return
+    }
+    // 浏览器/e2e：无桌面壳，复制路径兜底
+    try { await navigator.clipboard.writeText(abs) } catch { /* ignore */ }
+    showToast('浏览器环境无法打开资源管理器，已复制路径', 'info')
+  }
+
+  const deleteEntry = async (node: FileNode) => {
+    if (!main.id) return
+    if (!window.confirm(`删除 ${node.path}${node.type === 'dir' ? '（目录会递归删除）' : ''}？`)) return
+    try {
+      await projectApi.deleteEntry(main.id, node.path)
+      showToast('已删除', 'success')
+      refreshFileTree()
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }
+
+  const openFileMenu = (e: ReactMouseEvent, node: FileNode) => {
+    const MENU_W = 214
+    const MENU_H = 236
+    setFileMenu({
+      x: Math.max(0, Math.min(e.clientX, window.innerWidth - MENU_W)),
+      y: Math.max(0, Math.min(e.clientY, window.innerHeight - MENU_H)),
+      node,
+    })
+  }
+
+  const onFileMenuAction = (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'rename' | 'delete') => {
+    const node = fileMenu?.node
+    if (!node) return
+    setFileMenu(null)
+    switch (action) {
+      case 'newFile': setOpDialog({ kind: 'newFile', node, title: '新建文件' }); break
+      case 'newDir': setOpDialog({ kind: 'newDir', node, title: '新建文件夹' }); break
+      case 'reveal': void revealEntry(node); break
+      case 'quote': onQuoteFile(node.path); showToast('已添加到对话', 'success'); break
+      case 'copy': void copyEntryPath(node); break
+      case 'rename': setOpDialog({ kind: 'rename', node, title: '重命名' }); break
+      case 'delete': void deleteEntry(node); break
+    }
+  }
+
+  const confirmFileOp = async (value: string) => {
+    const dlg = opDialog
+    if (!dlg) return
+    if (!main.id) {
+      showToast('未绑定项目，无法操作文件', 'info')
+      return
+    }
+    const name = value.trim()
+    if (!name || name.includes('/') || name.includes('\\')) {
+      showToast('名称不能为空，且不能包含路径分隔符', 'info')
+      return
+    }
+    try {
+      if (dlg.kind === 'rename') {
+        await projectApi.renameEntry(main.id, dlg.node.path, name)
+        showToast('已重命名', 'success')
+      } else {
+        const base = dlg.node.type === 'dir' ? dlg.node.path : dlg.node.path.split('/').slice(0, -1).join('/')
+        await projectApi.createEntry(main.id, base ? `${base}/${name}` : name, dlg.kind === 'newDir' ? 'dir' : 'file')
+        showToast(dlg.kind === 'newDir' ? '已新建文件夹' : '已新建文件', 'success')
+      }
+      setOpDialog(null)
+      refreshFileTree()
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
   }
 
   // 当前 tab 的面板标题与计数（图标轨只有图标，标题放内容区顶部）
@@ -951,9 +1139,23 @@ export const RightPanel = memo(function RightPanel({
                     onToggle={toggleDir}
                     onOpen={(path) => main.id ? onOpenFile(main.id, path) : undefined}
                     onQuote={(path) => onQuoteFile(path)}
+                    onMenu={openFileMenu}
                   />
                 )}
-                <div className="right-hint">↑ 点击查看 · 目录展开 · 文件右键「引用到对话」</div>
+                <div className="right-hint">↑ 点击查看 · 目录展开 · 右键新建/重命名/删除</div>
+                {fileMenu && (
+                  <FileTreeContextMenu
+                    menu={fileMenu}
+                    onAction={onFileMenuAction}
+                  />
+                )}
+                {opDialog && (
+                  <FileOpDialog
+                    state={opDialog}
+                    onCancel={() => setOpDialog(null)}
+                    onConfirm={confirmFileOp}
+                  />
+                )}
               </>
             ) : (
               <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>

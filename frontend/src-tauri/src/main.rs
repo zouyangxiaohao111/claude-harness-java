@@ -249,6 +249,7 @@ fn main() {
         .manage(BackendState(std::sync::Mutex::new(None)))
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             chrome_extension_dir,
             chrome_extension_zip_path,
