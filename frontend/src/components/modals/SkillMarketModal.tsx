@@ -365,10 +365,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   //   已装技能必然出现在后端命令目录里（实测 detection-report-reviewer 案例），实时拉取后按
   //   「命令名 === 市场名 或 市场名以它结尾」匹配（多个候选取最长），匹配不到则中止并提示。
   const summonSkill = async (skill: MarketSkill) => {
-    if (busy) {
-      showToast('对话进行中，请等当前轮完成后再召唤技能', 'info')
-      return
-    }
+    // ⭐ 召唤 ≠ 对话：只把斜杠命令写进输入框（不发送、不切 agent），对话进行中也可以操作。
+    //   ⛔ 不要用 busy 互斥（用户 2026-10-27 明确：召唤与对话是两码事）。
     if (!onSummonSkill) {
       showToast('当前环境不支持召唤，请手动在输入框输入斜杠命令', 'info')
       return

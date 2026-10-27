@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.59] - 2026-10-27
+
+### Fixed
+
+- 召唤技能不再要求对话空闲：召唤只把斜杠命令写进输入框（不发送、不切 agent），对话进行中也可操作。
+
 ## [0.1.58] - 2026-10-27
 
 ### Fixed
