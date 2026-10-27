@@ -7,7 +7,8 @@ public record ModelDto(
     String id,
     String name,
     String alias,
-    ModelTag tag,
+    /** [D5] tag 自由文本（读路径 {@code ModelTags.parse} 安全解析：脏值 → null 不抛） */
+    String tag,
     String desc,
     ModelType type,
     Integer maxTokens,

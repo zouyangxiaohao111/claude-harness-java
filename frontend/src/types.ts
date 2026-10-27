@@ -35,7 +35,11 @@ export interface DiffFile {
   hunks: DiffHunk[]
 }
 
-export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW' | 'KIMI'
+/**
+ * Model tag · [D5] 自由文本（1-8 位大写字母/数字），不再是 5 值枚举。
+ * 历史值 `DS/CL/GP/QW/KIMI` 保留品牌色，其余（`MM`/`OR`/`GRO`…）走 `tagToClass` 哈希配色。
+ */
+export type ModelTag = string
 
 /**
  * 与 Java 端 `config.provider.model.ModelConfig.ModelType` 枚举一一对应

@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.NexusAiApplication;
 import com.nexusai.domain.session.SessionService;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionGroup;
 import com.nexusai.repository.session.entity.SessionRecord;
@@ -92,7 +91,7 @@ class SessionListOrderIntegrationTest {
     private static SessionRecord rec(String id, String updatedAt) {
         SessionRecord r = new SessionRecord();
         r.setId(id);
-        r.setModelTag(ModelTag.DS.name());
+        r.setModelTag("DS");
         r.setTitle(id);
         r.setTime("现在");
         r.setSessionGroup(SessionGroup.current.name());

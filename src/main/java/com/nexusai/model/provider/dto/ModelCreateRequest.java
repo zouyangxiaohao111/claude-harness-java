@@ -6,7 +6,8 @@ import java.math.BigDecimal;
 public record ModelCreateRequest(
     String name,
     String alias,
-    ModelTag tag,
+    /** [D5] tag 自由文本（写路径 {@code ModelTags.normalize} 校验：1-8 位大写字母/数字，非法 400） */
+    String tag,
     String desc,
     ModelType type,
     Integer maxTokens,

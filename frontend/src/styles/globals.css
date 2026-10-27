@@ -68,6 +68,13 @@
   --model-qwen: #7B61FF;
   --model-kimi: #E8618C;
   --model-other: #64748B;
+  /* [D5] tag 自由文本哈希配色调色板（tagToClass → t1…t6 · hash(tag) % 6） */
+  --model-slot-1: #4A6CF7;
+  --model-slot-2: #10A37F;
+  --model-slot-3: #E8618C;
+  --model-slot-4: #7B61FF;
+  --model-slot-5: #E0823C;
+  --model-slot-6: #0A9AA8;
 
   /* Border Radius 圆角 */
   --window-radius: 10px;
@@ -1135,6 +1142,14 @@ html {
 .model-tag.qw { background: var(--model-qwen); }
 .model-tag.kimi { background: var(--model-kimi); }
 .model-tag.other { background: var(--model-other); }
+/* [D5] 自由文本 tag 哈希槽（tagToClass 对非历史 5 值返回 t1…t6）
+   ⚠️ 不给 .tab-tag 上色：tab chip 从未定义过 tag 色（.tab-tag 无 color:white），补色会连带改观感。 */
+.model-tag.t1 { background: var(--model-slot-1); }
+.model-tag.t2 { background: var(--model-slot-2); }
+.model-tag.t3 { background: var(--model-slot-3); }
+.model-tag.t4 { background: var(--model-slot-4); }
+.model-tag.t5 { background: var(--model-slot-5); }
+.model-tag.t6 { background: var(--model-slot-6); }
 
 .session-item .title {
   flex: 1;

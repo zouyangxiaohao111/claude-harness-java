@@ -2,12 +2,16 @@ package com.nexusai.model.session.dto;
 
 import java.time.OffsetDateTime;
 import java.util.Map;
-import com.nexusai.model.provider.dto.ModelTag;
 
 /** 响应：Session 完整信息 */
 public record SessionDto(
     String id,
-    ModelTag model,
+    /**
+     * 会话选中的模型 tag（{@code sessions.model_tag} 列）· [D5] 自由文本（1-8 位大写字母/数字，
+     * 如 {@code DS}/{@code MM}），不再是 5 值枚举 —— 读路径经 {@code ModelTags.parse} 安全解析
+     * （历史脏值 → null，绝不 500）。前端按字符串哈希配色。
+     */
+    String model,
     String modelName,
     String title,
     String time,

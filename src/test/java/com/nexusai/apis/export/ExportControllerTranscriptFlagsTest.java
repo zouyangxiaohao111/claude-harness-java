@@ -2,7 +2,6 @@ package com.nexusai.apis.export;
 
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.domain.session.SessionService;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionGroup;
 import com.nexusai.repository.session.entity.MessageRecord;
@@ -138,7 +137,7 @@ class ExportControllerTranscriptFlagsTest {
     }
 
     private static SessionDto sessionDto() {
-        return new SessionDto(SESSION, ModelTag.DS, "test-model", "导出示例", "刚刚", SessionGroup.current,
+        return new SessionDto(SESSION, "DS", "test-model", "导出示例", "刚刚", SessionGroup.current,
             null, null, null, OffsetDateTime.now(), OffsetDateTime.now(),
             null, null, null, null, null, null, null, null, null,
             null,   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）

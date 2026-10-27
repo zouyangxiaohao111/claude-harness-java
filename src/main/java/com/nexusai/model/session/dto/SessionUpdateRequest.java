@@ -1,11 +1,13 @@
 package com.nexusai.model.session.dto;
 
-import com.nexusai.model.provider.dto.ModelTag;
-
 /** PATCH /api/v1/sessions/{id} 请求 · 全字段可选 */
 public record SessionUpdateRequest(
     String title,
-    ModelTag model,
+    /**
+     * 模型 tag（自由文本 · [D5] 不再是 5 值枚举）· null = 不改动。写路径经
+     * {@code ModelTags.normalize} 校验（1-8 位大写字母/数字），非法值 fail-loud 400。
+     */
+    String model,
     String modelName,
     String mainProjectId,
     Boolean bareMode,               // 可选 · 会话级 bare（精简）模式开关（V33 列 bare_mode）；null = 不改动
@@ -23,7 +25,7 @@ public record SessionUpdateRequest(
      * modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent)}）——不传 coordinatorMode
      * 即「不改动本列」。Jackson 反序列化仍走规范构造器（本构造器无注解、非 property-based creator）。
      */
-    public SessionUpdateRequest(String title, ModelTag model, String modelName, String mainProjectId,
+    public SessionUpdateRequest(String title, String model, String modelName, String mainProjectId,
                                 Boolean bareMode, String permissionMode, String mainThreadAgent) {
         this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent, null);
     }

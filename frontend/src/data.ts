@@ -411,7 +411,16 @@ export const trackItems: { dot: 'running' | 'ok' | 'warn'; name: string; time: s
 
 /* ---------- pure helpers (replace inline condition chains) ---------- */
 
-/** Map a model tag like "DS" to the CSS class suffix (e.g. "ds"). 未知 tag → 中性兜底（不再误标 DS 色）。 */
+/** tag 哈希配色的调色板槽数（对应 globals.css 的 `.model-tag.t1…t6`）。 */
+const TAG_SLOT_COUNT = 6
+
+/**
+ * Map a model tag to the CSS class suffix。
+ *
+ * 历史 5 值（DS/CL/GP/QW/KIMI）保留各自的品牌色；其余自由文本 tag（`MM`/`OR`/`GRO`…）按
+ * `hash(tag) % 6` 落入 `t1…t6` 槽（[D5] tag 自由文本 + 哈希配色）——同一 tag 恒定同色，
+ * 新增 provider 无需改代码。空 tag → 中性兜底 `other`。
+ */
 export const tagToClass = (tag: string): string => {
   switch (tag) {
     case 'DS':
@@ -424,8 +433,13 @@ export const tagToClass = (tag: string): string => {
       return 'qw'
     case 'KIMI':
       return 'kimi'
-    default:
-      return 'other'
+    default: {
+      if (!tag) return 'other'
+      // djb2 变体：足够分散且实现极短（tag 只用于展示，不要求抗碰撞）
+      let h = 5381
+      for (let i = 0; i < tag.length; i++) h = ((h << 5) + h + tag.charCodeAt(i)) | 0
+      return `t${(Math.abs(h) % TAG_SLOT_COUNT) + 1}`
+    }
   }
 }
 

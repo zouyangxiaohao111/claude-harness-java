@@ -7,7 +7,6 @@ import com.nexusai.domain.oauth_account.AccountOAuthTokenService;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
 import com.nexusai.infra.security.BearerTokenAuthFilter;
 import com.nexusai.model.oauth_account.AccountOAuthToken;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionGroup;
@@ -75,7 +74,7 @@ class SessionControllerTest {
     private static SessionDto session(String id, String title, int messageCount) {
         return new SessionDto(
             id,
-            ModelTag.DS,
+            "DS",
             "deepseek-chat",
             title,
             "刚刚",
@@ -96,6 +95,26 @@ class SessionControllerTest {
             null,    // mainThreadAgent（SP-03 会话指定主线程 agent，本 fixture 未设 → null）
             null,    // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
             null);   // cacheHitRate（[cache-savings]，本 fixture 未设 → null）
+    }
+
+    @Test
+    @DisplayName("[D5] POST /api/v1/sessions 带 tag=MM → 201（Jackson 不再按 5 值枚举拒收）")
+    void create_acceptsFreeTextTag() throws Exception {
+        // WHY（2026-10-27 事故回报）：出厂预设 minimax 的 tag 是 MM，前端选中该模型新建会话 →
+        //   请求体 `"model":"MM"`。DTO 字段若退回 `ModelTag` 枚举，Jackson 在反序列化阶段就 400
+        //   （`not one of the values accepted for Enum class: [CL, KIMI, QW, DS, GP]`）。
+        when(sessionService.create(any())).thenReturn(session("sess-mm", "minimax 会话", 0));
+
+        mockMvc.perform(post("/api/v1/sessions")
+                .contentType(APPLICATION_JSON)
+                .content("{\"title\":\"minimax 会话\",\"model\":\"MM\",\"mainProjectId\":\"proj-1\"}"))
+            .andExpect(status().isCreated())
+            .andExpect(jsonPath("$.id").value("sess-mm"));
+
+        ArgumentCaptor<SessionCreateRequest> captor = ArgumentCaptor.forClass(SessionCreateRequest.class);
+        verify(sessionService).create(captor.capture());
+        assertEquals("MM", captor.getValue().model(),
+            "请求体 tag 原样进 service（规范化在 service 写路径做）");
     }
 
     @Test
@@ -140,7 +159,7 @@ class SessionControllerTest {
         teamContext.put("leadAgentId", "team-lead@research-team");
         teamContext.put("teammates", new LinkedHashMap<>());
         when(sessionService.getById("sess-9")).thenReturn(
-            new SessionDto("sess-9", ModelTag.DS, "deepseek-chat", "需求分析", "刚刚",
+            new SessionDto("sess-9", "DS", "deepseek-chat", "需求分析", "刚刚",
                 SessionGroup.current, null, null, 12, OffsetDateTime.now(), OffsetDateTime.now(),
                 null, null, null, teamContext, null, null, null, null, null, null, null));
 
@@ -158,7 +177,7 @@ class SessionControllerTest {
         //   complete 事件只在会话进行中实时推，刷新后须 GET 恢复）。变异点：SessionDto 不加字段 /
         //   toDto 不回填 → 响应无 totalCostYuan/totalTokens → 前端刷新后累计归零展示错乱。
         when(sessionService.getById("sess-9")).thenReturn(
-            new SessionDto("sess-9", ModelTag.DS, "deepseek-chat", "需求分析", "刚刚",
+            new SessionDto("sess-9", "DS", "deepseek-chat", "需求分析", "刚刚",
                 SessionGroup.current, null, null, 12, OffsetDateTime.now(), OffsetDateTime.now(),
                 null, null, null, null, null, null, 0.0123, 1500L, null, null, null));
 

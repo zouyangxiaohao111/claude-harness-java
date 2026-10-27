@@ -1,6 +1,5 @@
 package com.nexusai.model.session.dto;
 
-import com.nexusai.model.provider.dto.ModelTag;
 import jakarta.validation.constraints.NotBlank;
 
 /**
@@ -17,7 +16,13 @@ import jakarta.validation.constraints.NotBlank;
  */
 public record SessionCreateRequest(
     String title,
-    ModelTag model,                 // 缺省后端默认 DS
+    /**
+     * 模型 tag（自由文本 · [D5] 不再是 5 值枚举）。缺省后端默认 {@code DS}；写路径经
+     * {@code ModelTags.normalize} 校验（1-8 位大写字母/数字），非法值 fail-loud 400。
+     * <p>⛔ 不要退回 {@code ModelTag} 枚举：出厂预设已带 {@code MM}（MiniMax），
+     * Jackson 对未知枚举名直接 400（2026-10-27 事故：`not one of the values accepted for Enum class`）。
+     */
+    String model,
     String modelName,               // 可选 · 仅显式传入时落库 sessions.model_name（会话 override）；缺省 null，读时运行时解析
     @NotBlank String mainProjectId, // 必填 · 会话绑定项目 id（V1:52 sessions.main_project_id）；空/空白 ⇒ 400
     Boolean bareMode                // 可选 · 会话级 bare（精简）模式开关（V33 列 bare_mode）；null = 不设置（回落 env/默认 false）

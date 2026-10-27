@@ -11,7 +11,6 @@ import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionGroup;
@@ -461,7 +460,7 @@ class SeqNullsLastReadPathsRealSqliteTest {
     }
 
     private static SessionDto sessionDto() {
-        return new SessionDto("sess-x", ModelTag.DS, "test-model", "导出示例", "刚刚", SessionGroup.current,
+        return new SessionDto("sess-x", "DS", "test-model", "导出示例", "刚刚", SessionGroup.current,
             null, null, null, OffsetDateTime.now(), OffsetDateTime.now(),
             null, null, null, null, null, null, null, null, null,
             null,   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）

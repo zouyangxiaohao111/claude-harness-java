@@ -58,7 +58,7 @@ public class ModelService {
         m.setProviderId(providerId);
         m.setName(req.name());
         m.setAlias(req.alias());
-        m.setTag(req.tag().name());
+        m.setTag(ModelTags.normalize(req.tag()));   // [D5] 写路径校验（1-8 位大写字母/数字，非法 400）
         m.setDescription(req.desc() != null ? req.desc() : "");
         m.setType(req.type().name());
         m.setMaxTokens(req.maxTokens() != null ? req.maxTokens() : 384000); // 默认 384K 输出上限（用户拍板）
@@ -141,7 +141,7 @@ public class ModelService {
 
     private ModelDto toDto(Model m) {
         return new ModelDto(m.getId(), m.getName(), m.getAlias(),
-            m.getTag() != null ? ModelTag.valueOf(m.getTag()) : null,
+            ModelTags.parse(m.getTag()),   // [D5] 读路径安全解析：脏 tag → null 不抛
             m.getDescription(), m.getType() != null ? ModelType.valueOf(m.getType()) : null,
             m.getMaxTokens(),
             m.getTemperature() != null ? BigDecimal.valueOf(m.getTemperature()) : null,

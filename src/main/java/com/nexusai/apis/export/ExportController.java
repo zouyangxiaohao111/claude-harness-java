@@ -128,7 +128,7 @@ public class ExportController {
             sb.append("**Created**: ").append(session.createdAt().toString()).append("\n");
         }
         if (session.model() != null) {
-            sb.append("**Tag**: ").append(session.model().name()).append("\n");
+            sb.append("**Tag**: ").append(session.model()).append("\n");   // [D5] tag 已是自由文本 String
         }
         sb.append("**Messages**: ").append(messages.size()).append("\n\n");
         sb.append("---\n\n");

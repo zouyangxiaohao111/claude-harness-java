@@ -5,7 +5,6 @@ import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
 import com.nexusai.model.session.dto.PartialCompactRequest;
@@ -294,7 +293,7 @@ class PartialCompactModelWiringTest {
     }
 
     private static SessionDto sessionDto(String modelName) {
-        return new SessionDto(SESSION, ModelTag.DS, modelName, "title", "现在", SessionGroup.current,
+        return new SessionDto(SESSION, "DS", modelName, "title", "现在", SessionGroup.current,
             null, null, 0, OffsetDateTime.now(), OffsetDateTime.now(),
             null, null, null, null, null, null, null, null, null,
             null,   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）

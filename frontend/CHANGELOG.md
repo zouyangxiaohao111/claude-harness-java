@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.62] - 2026-10-27
+
+### Fixed
+
+- 选中 minimax（tag `MM`）新建会话返回 400/读取会话 500：tag 已改自由文本，前端 `ModelTag` 类型随之放宽为 `string`，未知 tag 的标识色改走 `hash(tag) % 6` 调色板（历史 `DS/CL/GP/QW/KIMI` 保留原品牌色）；新增 `data.tag.test.ts` 守护。（来源：SVN r49336 / WangTianwei）
+
 ## [0.1.61] - 2026-10-27
 
 ### Fixed

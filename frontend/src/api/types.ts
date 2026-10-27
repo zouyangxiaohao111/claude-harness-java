@@ -41,7 +41,8 @@ export interface UpdateProviderRequest {
 }
 
 // ---- Model ----
-export type ModelTag = 'DS' | 'CL' | 'GP' | 'QW' | 'KIMI'
+/** Model tag · [D5] 自由文本（1-8 位大写字母/数字）· 历史 5 值保留品牌色，其余哈希配色。 */
+export type ModelTag = string
 export type ModelType =
   | 'chat' | 'text' | 'vision' | 'multimodal'
   | 'image_generation' | 'embedding' | 'audio' | 'rerank' | 'moderation'

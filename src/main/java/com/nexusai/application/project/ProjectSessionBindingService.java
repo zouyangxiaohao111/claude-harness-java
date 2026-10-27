@@ -15,7 +15,7 @@ import com.nexusai.repository.session.mapper.MessageMapper;
 import com.nexusai.repository.session.mapper.SessionFileMapper;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.model.session.dto.SessionGroup;
-import com.nexusai.model.provider.dto.ModelTag;
+import com.nexusai.model.provider.dto.ModelTags;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -146,7 +146,7 @@ public class ProjectSessionBindingService {
     private SessionDto toSessionDto(SessionRecord s) {
         return new SessionDto(
             s.getId(),
-            s.getModelTag() != null ? ModelTag.valueOf(s.getModelTag()) : null,
+            ModelTags.parse(s.getModelTag()),   // [D5] 读路径安全解析，脏 tag → null 不抛
             s.getModelName(),
             s.getTitle(),
             s.getTime(),

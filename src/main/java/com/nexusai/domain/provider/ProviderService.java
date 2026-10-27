@@ -8,7 +8,6 @@ import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.infra.llm.DynamicHeaderExpander;
 import com.nexusai.infra.llm.ProviderHeaderInjector;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.provider.dto.ModelType;
 import com.nexusai.model.provider.dto.ProviderType;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
@@ -394,7 +393,7 @@ public class ProviderService {
 
     private ModelDto toModelDto(Model m) {
         return new ModelDto(m.getId(), m.getName(), m.getAlias(),
-            m.getTag() != null ? ModelTag.valueOf(m.getTag()) : null,
+            ModelTags.parse(m.getTag()),   // [D5] 读路径安全解析：脏 tag → null 不抛
             m.getDescription(), m.getType() != null ? ModelType.valueOf(m.getType()) : null,
             m.getMaxTokens(),
             m.getTemperature() != null ? BigDecimal.valueOf(m.getTemperature()) : null,

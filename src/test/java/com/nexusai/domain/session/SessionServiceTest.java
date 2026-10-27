@@ -2,7 +2,6 @@ package com.nexusai.domain.session;
 
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.infra.exception.ValidationException;
-import com.nexusai.model.provider.dto.ModelTag;
 import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
@@ -119,7 +118,7 @@ class SessionServiceTest {
         // WHY: 前端「精简模式」开关在创建会话时传入 → 必须落库（V33 列），否则该会话 bare 判定无源可读。
         // [S3 · F-03a] 第 4 参（mainProjectId）由 null 改为真实 id：mainProjectId 必填后 null 会被
         //   服务层档二守卫拒成 400，本用例意图是 bareMode 落库，不该被项目契约拦下。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "proj-1", true);
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", "DS", null, "proj-1", true);
 
         SessionDto dto = service.create(req);
 
@@ -138,7 +137,7 @@ class SessionServiceTest {
     void create_nullBareModeStaysNull() {
         // WHY: bareMode 是可选开关（null = 该会话未显式设置），不得强塞默认值——判定回落 env/配置/false。
         // [S3 · F-03a] 同 create_persistsBareModeTrue：mainProjectId 补真实 id（必填契约）。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "proj-1", null);
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", "DS", null, "proj-1", null);
 
         SessionDto dto = service.create(req);
 
@@ -163,7 +162,7 @@ class SessionServiceTest {
         //   不可构造；否则「会话在、项目空」这个 CC 状态空间里不存在的态（CC 启动即冻结 projectRoot）
         //   仍会被造出来，转由使用侧（CwdResolution）兜底 —— 那正是 F-03b 的存在理由。
         // RED: 删掉 SessionService.create 的 mainProjectId 守卫 ⇒ 本用例不抛异常 → 红。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, null, null);
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", "DS", null, null, null);
 
         assertThatThrownBy(() -> service.create(req))
             .as("mainProjectId=null ⇒ 服务层 fail loud（ValidationException → GlobalExceptionHandler 400）")
@@ -178,7 +177,7 @@ class SessionServiceTest {
         //   「非 null 即合法」会让 '' 落库（SessionService:181 原样写入）⇒ 读数侧按「空即未绑定」判定
         //   （ToolRegistrationConfig）⇒ 守卫空转。本用例是该判据在服务层的唯一鉴别装置。
         // RED: 把守卫判据从 isBlank 改成 ==null ⇒ 本用例不抛 → 红。
-        SessionCreateRequest req = new SessionCreateRequest("需求分析", ModelTag.DS, null, "   ", null);
+        SessionCreateRequest req = new SessionCreateRequest("需求分析", "DS", null, "   ", null);
 
         assertThatThrownBy(() -> service.create(req))
             .as("mainProjectId 纯空白 ⇒ 同样 400（@NotNull 挡不住的那一态）")
@@ -231,7 +230,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setBareMode(1);
@@ -249,7 +248,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         when(sessionMapper.selectOneById("sess-1")).thenReturn(record);
@@ -265,13 +264,13 @@ class SessionServiceTest {
         // WHY: 前端会话列表需要每会话 bare 开关状态（可批量显示/区分精简会话）。
         SessionRecord on = new SessionRecord();
         on.setId("sess-1");
-        on.setModelTag(ModelTag.DS.name());
+        on.setModelTag("DS");
         on.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         on.setMessageCount(0);
         on.setBareMode(1);
         SessionRecord off = new SessionRecord();
         off.setId("sess-2");
-        off.setModelTag(ModelTag.DS.name());
+        off.setModelTag("DS");
         off.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         off.setMessageCount(0);
         off.setBareMode(0);
@@ -384,7 +383,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setTeamContext("{\"teamName\":\"research-team\",\"teamFilePath\":\"/tmp/teams/research-team/config.json\","
@@ -405,13 +404,13 @@ class SessionServiceTest {
         // WHY: [P2] GET /sessions 列表也返回 teamContext——前端会话列表可批量显示 team 状态。
         SessionRecord withTeam = new SessionRecord();
         withTeam.setId("sess-1");
-        withTeam.setModelTag(ModelTag.DS.name());
+        withTeam.setModelTag("DS");
         withTeam.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withTeam.setMessageCount(0);
         withTeam.setTeamContext("{\"teamName\":\"research-team\"}");
         SessionRecord withoutTeam = new SessionRecord();
         withoutTeam.setId("sess-2");
-        withoutTeam.setModelTag(ModelTag.DS.name());
+        withoutTeam.setModelTag("DS");
         withoutTeam.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withoutTeam.setMessageCount(0);
         // 同 list_toDtoExposesBareMode：查询已改 selectListByQuery（排序由 DB 执行），本测试只验逐行映射
@@ -468,7 +467,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setTodos("{\"sess-1\":[{\"content\":\"A\",\"status\":\"in_progress\",\"activeForm\":\"Doing A\"}]}");
@@ -491,7 +490,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         when(sessionMapper.selectOneById("sess-1")).thenReturn(record);
@@ -508,7 +507,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setTodos("not-json{");
@@ -638,7 +637,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setPermissionMode("acceptEdits");
@@ -660,7 +659,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         record.setTotalCostYuan(0.0123);
@@ -683,14 +682,14 @@ class SessionServiceTest {
         // WHY: 前端会话列表 footer 批量展示 token/金额——每会话各自累计（null = 从未有 usage 落库）。
         SessionRecord withData = new SessionRecord();
         withData.setId("sess-1");
-        withData.setModelTag(ModelTag.DS.name());
+        withData.setModelTag("DS");
         withData.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withData.setMessageCount(0);
         withData.setTotalCostYuan(0.5);
         withData.setModelUsageJson("{\"deepseek-v4-flash\":{\"inputTokens\":200,\"outputTokens\":100}}");
         SessionRecord withoutData = new SessionRecord();
         withoutData.setId("sess-2");
-        withoutData.setModelTag(ModelTag.DS.name());
+        withoutData.setModelTag("DS");
         withoutData.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         withoutData.setMessageCount(0);
         // 同 list_toDtoExposesBareMode：查询已改 selectListByQuery（排序由 DB 执行），本测试只验逐行映射
@@ -793,7 +792,7 @@ class SessionServiceTest {
         SessionRecord record = new SessionRecord();
         record.setId("sess-1");
         record.setTitle("t");
-        record.setModelTag(ModelTag.DS.name());
+        record.setModelTag("DS");
         record.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
         record.setMessageCount(0);
         when(sessionMapper.selectOneById("sess-1")).thenReturn(record);
@@ -801,5 +800,73 @@ class SessionServiceTest {
         assertThat(service.getById("sess-1").coordinatorMode())
             .as("列 NULL → DTO null（未设置，非 false）")
             .isNull();
+    }
+
+    // ── [D5] tag 自由文本（2026-10-27 事故：出厂预设 minimax tag=MM → 会话接口 400/500）──────────
+    // 背景：出厂预设 `factory-preset.json` 自带 `"tag": "MM"`，而 `sessions.model_tag` 列本就是无约束
+    //   TEXT。旧实现把 DTO 字段声明为 5 值枚举 `ModelTag`：请求体 `"model":"MM"` 被 Jackson 直接拒成
+    //   400（`not one of the values accepted for Enum class`），库里的 MM 读出时 `valueOf` 抛
+    //   IllegalArgumentException → 500。方向（用户拍板）：tag 自由文本，写路径校验、读路径安全解析。
+
+    @Test
+    @DisplayName("[D5] create 带 tag=MM → 落库原样（不再受 5 值枚举约束）")
+    void create_freeTextTagPersists() {
+        // RED：DTO 字段回到 `ModelTag` 枚举 ⇒ 本用例编译期就写不出 "MM"（运行时则由 Jackson 400）。
+        SessionDto dto = service.create(new SessionCreateRequest("minimax 会话", "MM", "MiniMax-M3.1-Flash-Preview", "proj-1", null));
+
+        ArgumentCaptor<SessionRecord> captor = ArgumentCaptor.forClass(SessionRecord.class);
+        verify(sessionMapper).insert(captor.capture());
+        assertThat(captor.getValue().getModelTag())
+            .as("create 落库 model_tag=MM（自由文本，不再 valueOf 枚举）")
+            .isEqualTo("MM");
+        assertThat(dto.model()).as("create 回显 tag=MM").isEqualTo("MM");
+    }
+
+    @Test
+    @DisplayName("[D5] create/update 的 tag 走 ModelTags.normalize（trim + 大写），非法值 400")
+    void createAndUpdate_tagNormalizedAndRejected() {
+        // 写路径保留 fail-loud：脏 tag 不静默落库（读路径才放宽为「warn + null」）。
+        service.create(new SessionCreateRequest("t", " mm ", null, "proj-1", null));
+        ArgumentCaptor<SessionRecord> captor = ArgumentCaptor.forClass(SessionRecord.class);
+        verify(sessionMapper).insert(captor.capture());
+        assertThat(captor.getValue().getModelTag()).as("写路径规范化：' mm ' → 'MM'").isEqualTo("MM");
+
+        assertThatThrownBy(() -> service.create(new SessionCreateRequest("t", "toolongtag", null, "proj-1", null)))
+            .as("超过 8 位 ⇒ ValidationException → 400")
+            .isInstanceOf(ValidationException.class);
+
+        SessionRecord existing = new SessionRecord();
+        existing.setId("sess-1");
+        existing.setTitle("t");
+        existing.setModelTag("DS");
+        existing.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
+        existing.setMessageCount(0);
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(existing);
+
+        service.update("sess-1", new SessionUpdateRequest(null, "gro", null, null, null, null, null));
+        assertThat(existing.getModelTag()).as("update 写路径同款规范化：'gro' → 'GRO'").isEqualTo("GRO");
+    }
+
+    @Test
+    @DisplayName("[D5] getById 读出任意 tag 原样透出；脏值 warn + null，绝不抛")
+    void read_dirtyAndFreeTextTagsNeverThrow() {
+        // RED：读路径改回 `ModelTag.valueOf` ⇒ MM 用例抛 IllegalArgumentException（列表接口 500）。
+        SessionRecord mm = new SessionRecord();
+        mm.setId("sess-1");
+        mm.setTitle("t");
+        mm.setModelTag("MM");
+        mm.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
+        mm.setMessageCount(0);
+        when(sessionMapper.selectOneById("sess-1")).thenReturn(mm);
+        assertThat(service.getById("sess-1").model()).as("MM 原样透出（前端按字符串哈希配色）").isEqualTo("MM");
+
+        SessionRecord dirty = new SessionRecord();
+        dirty.setId("sess-2");
+        dirty.setTitle("t");
+        dirty.setModelTag("a b");   // 历史脏值：含空格，非 [A-Z0-9]{1,8}
+        dirty.setSessionGroup(com.nexusai.model.session.dto.SessionGroup.current.name());
+        dirty.setMessageCount(0);
+        when(sessionMapper.selectOneById("sess-2")).thenReturn(dirty);
+        assertThat(service.getById("sess-2").model()).as("脏 tag → null（warn 不抛）").isNull();
     }
 }

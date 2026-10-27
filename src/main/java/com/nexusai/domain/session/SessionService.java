@@ -14,7 +14,7 @@ import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.impl.SubagentTool;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.common.SessionKeys;
-import com.nexusai.model.provider.dto.ModelTag;
+import com.nexusai.model.provider.dto.ModelTags;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import com.nexusai.model.session.dto.SessionCreateRequest;
@@ -202,7 +202,9 @@ public class SessionService {
 
         SessionRecord s = new SessionRecord();
         s.setId(generateId("sess"));
-        s.setModelTag((req.model() != null ? req.model() : ModelTag.DS).name());
+        // [D5] tag 自由文本：缺省默认 DS（保持默认路径行为不漂移），非法值经 ModelTags.normalize
+        //   fail-loud 400（1-8 位大写字母/数字，如 MM / OR / GRO）。
+        s.setModelTag(req.model() != null ? ModelTags.normalize(req.model()) : ModelTags.DEFAULT);
         s.setModelName(hasModelName ? req.modelName() : null);
         s.setTitle(hasTitle ? req.title() : req.modelName());
         // [title-cc-align V66] 显式命名标志 · 对齐 CC initialName → hasExplicitTitle=true
@@ -237,7 +239,8 @@ public class SessionService {
             s.setTitle(req.title());
             s.setTitleExplicit(1);
         }
-        if (req.model() != null) s.setModelTag(req.model().name());
+        // [D5] 写路径与 create 同一套校验（非法值 fail-loud 400，不静默落脏值）
+        if (req.model() != null) s.setModelTag(ModelTags.normalize(req.model()));
         if (req.modelName() != null) s.setModelName(req.modelName());
         if (req.mainProjectId() != null) s.setMainProjectId(req.mainProjectId());
         // [V33] bare（精简）模式会话级开关：PATCH 语义，仅显式传入时更新（null 不改动）
@@ -756,7 +759,9 @@ public class SessionService {
     private SessionDto toDto(SessionRecord s) {
         return new SessionDto(
             s.getId(),
-            s.getModelTag() != null ? ModelTag.valueOf(s.getModelTag()) : null,
+            // [D5] 读路径安全解析：历史脏 tag（非法格式）warn 后返回 null，绝不抛 —— 一行脏数据
+            //   不得让会话列表/详情 500（原 ModelTag.valueOf 对 MM 等新 tag 直接 IllegalArgumentException）。
+            ModelTags.parse(s.getModelTag()),
             s.getModelName(),
             s.getTitle(),
             s.getTime(),
