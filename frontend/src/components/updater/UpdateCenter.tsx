@@ -155,10 +155,10 @@ export function UpdateCenter({ appName }: { appName?: string | null }) {
               )}
 
               {stage === 'ready' && (
-                <p className="ud-muted">下载完成并已校验。重启后即可用上新版本——请先保存手头工作。</p>
+                <p className="ud-muted">下载完成并已校验。点击后静默覆盖安装并自动重启，不会卸载重装，数据保留。</p>
               )}
 
-              {stage === 'installing' && <p className="ud-muted">正在启动安装器…应用即将自动重启。</p>}
+              {stage === 'installing' && <p className="ud-muted">正在静默安装并自动重启（无安装向导）…</p>}
 
               {stage === 'latest' && <p className="ud-muted">没有更新的版本。</p>}
 
@@ -182,7 +182,7 @@ export function UpdateCenter({ appName }: { appName?: string | null }) {
               {stage === 'ready' && (
                 <>
                   <button className="ud-btn ghost" onClick={close}>稍后提醒</button>
-                  <button className="ud-btn primary" onClick={() => void install()}>重启并安装</button>
+                  <button className="ud-btn primary" onClick={() => void install()}>立即更新并重启</button>
                 </>
               )}
               {(stage === 'fail' || stage === 'latest') && (

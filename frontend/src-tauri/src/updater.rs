@@ -68,6 +68,35 @@ fn http() -> ureq::Agent {
         .build()
 }
 
+/// 下载专用 agent：⛔ 不能用 `http()` 的 3s **整请求总超时** —— 179MB 安装包必然超时。
+/// 连接 15s、单次 read 120s（连接停滞才中断）；总时长不设上限。
+fn http_download() -> ureq::Agent {
+    ureq::AgentBuilder::new()
+        .timeout_connect(Duration::from_secs(15))
+        .timeout_read(Duration::from_secs(120))
+        .build()
+}
+
+/// 解析 `Content-Range: bytes 100-199/2000` 的总长度；通配 `*` / 非法 → None。
+fn content_range_total(value: &str) -> Option<u64> {
+    value.rsplit('/').next()?.trim().parse::<u64>().ok()
+}
+
+/// 对最终落盘文件做 SHA-256（续传后必须覆盖完整文件，不能只哈希本次新增字节）。
+fn sha256_file(path: &std::path::Path) -> Result<String, String> {
+    let mut file = std::fs::File::open(path).map_err(|e| e.to_string())?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf).map_err(|e| e.to_string())?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(hex_digest(&hasher.finalize()))
+}
+
 #[tauri::command]
 pub async fn update_check(
     current_version: String,
@@ -174,32 +203,66 @@ pub async fn update_download(info: UpdateInfo, app: AppHandle) -> Result<String,
         let dir = std::env::temp_dir().join("nexusai-update");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
         let path = dir.join(format!("NexusAI_{}_x64-setup.exe", info.version));
-        let resp = http()
-            .get(&info.url)
-            .call()
-            .map_err(|e| format!("下载失败: {e}"))?;
+
+        // 断点续传：上次失败留下的完整/半截文件直接 Range 续传；服务端忽略 Range 则从头覆盖。
+        let mut existing = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
+        let mut retried = false;
+        let (resp, append, offset) = loop {
+            let req = if existing > 0 {
+                http_download()
+                    .get(&info.url)
+                    .set("Range", &format!("bytes={existing}-"))
+            } else {
+                http_download().get(&info.url)
+            };
+            match req.call() {
+                Ok(r) => {
+                    let append = existing > 0 && r.status() == 206;
+                    let offset = if append { existing } else { 0 };
+                    break (r, append, offset);
+                }
+                Err(ureq::Error::Status(416, _)) if existing > 0 && !retried => {
+                    // 残片已到末尾（或资源已换）：清残片后从 0 重下一次
+                    let _ = std::fs::remove_file(&path);
+                    existing = 0;
+                    retried = true;
+                }
+                Err(e) => return Err(format!("下载失败: {e}")),
+            }
+        };
+
         let total = resp
-            .header("Content-Length")
-            .and_then(|v| v.parse::<u64>().ok());
+            .header("Content-Range")
+            .and_then(content_range_total)
+            .or_else(|| {
+                resp.header("Content-Length")
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .map(|len| len + offset)
+            });
         let mut src = resp.into_reader();
-        let mut out = std::io::BufWriter::new(
-            std::fs::File::create(&path).map_err(|e| e.to_string())?,
-        );
-        let mut hasher = Sha256::new();
+        let mut out = std::io::BufWriter::new(if append {
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&path)
+                .map_err(|e| e.to_string())?
+        } else {
+            std::fs::File::create(&path).map_err(|e| e.to_string())?
+        });
         let mut buf = [0u8; 64 * 1024];
-        let mut done: u64 = 0;
+        let mut done: u64 = offset;
         loop {
             let n = src.read(&mut buf).map_err(|e| e.to_string())?;
             if n == 0 {
                 break;
             }
-            hasher.update(&buf[..n]);
             std::io::Write::write_all(&mut out, &buf[..n]).map_err(|e| e.to_string())?;
             done += n as u64;
             let _ = app.emit("update://progress", serde_json::json!({ "done": done, "total": total }));
         }
         std::io::Write::flush(&mut out).map_err(|e| e.to_string())?;
-        let hex = hex_digest(&hasher.finalize());
+
+        // ⛔ 必须哈希**最终文件**：续传时只哈希本次新增字节会漏掉前半段。
+        let hex = sha256_file(&path)?;
         if !info.sha256.is_empty() && !hex.eq_ignore_ascii_case(&info.sha256) {
             let _ = std::fs::remove_file(&path);
             return Err(format!("sha256 校验失败（期望 {} 实得 {}）", info.sha256, hex));
@@ -230,15 +293,42 @@ pub fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
+/// 静默安装命令行（Windows NSIS）：延迟约 2.5s → `/S` 无向导覆盖安装 → `/R` 装完自动重启。
+///
+/// <p>延迟的目的：让前端 `getCurrentWindow().close()` 先走 `main.rs` 的正常关窗路径
+/// （`CloseRequested` → `kill_process_tree(backend_pid)` 回收 Java 后端）。否则 NSIS 静默模式
+/// 会直接 kill 主进程，后端仍占用 `backend/nexusai-backend.jar` ⇒ 覆盖安装失败。
+fn installer_command_line(path: &str) -> String {
+    format!(
+        "ping -n 4 127.0.0.1 >NUL & start \"\" \"{}\" /S /R",
+        path.replace('"', "")
+    )
+}
+
+#[cfg(target_os = "windows")]
+fn spawn_silent_installer(path: &str) -> Result<(), String> {
+    crate::backend::silent_command("cmd")
+        .args(["/C", &installer_command_line(path)])
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动静默安装器失败: {e}"))
+}
+
+#[cfg(not(target_os = "windows"))]
+fn spawn_silent_installer(path: &str) -> Result<(), String> {
+    std::process::Command::new(path)
+        .arg("-S")
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("启动安装器失败: {e}"))
+}
+
 #[tauri::command]
 pub fn update_install(path: String, app: AppHandle) -> Result<(), String> {
     let _ = app.emit("update://installing", ());
-    // 运行安装包（暂用带向导模式便于可见/调试；定稿可切 /S 静默覆盖，保留数据目录）。
-    // spawn 后由前端短暂延迟关窗退出，安装器接管（UAC 或向导会接管前台）。
-    std::process::Command::new(&path)
-        .spawn()
-        .map_err(|e| format!("启动安装器失败: {e}"))?;
-    Ok(())
+    // ⭐ 无感升级：静默覆盖安装（/S）+ 装完自动重启（/R），不再弹 NSIS 卸载/安装向导。
+    // 数据目录（~/.nexusai）与安装目录分离，覆盖安装不影响用户数据。
+    spawn_silent_installer(&path)
 }
 
 fn hex_digest(d: &[u8]) -> String {
@@ -414,5 +504,43 @@ mod tests {
             "⛔ Cargo.toml 与 tauri.conf.json 的 version 必须一致（发版时**两个都要改**）。\
              不一致会导致：Cargo.lock/crate 版本、与安装包版本、与 app_version 三者语义分叉。"
         );
+    }
+
+    #[test]
+    fn content_range_total_parses_standard_form() {
+        assert_eq!(content_range_total("bytes 100-199/2000"), Some(2000));
+        assert_eq!(content_range_total("bytes 0-0/1"), Some(1));
+        assert_eq!(content_range_total("bytes 0-199/*"), None);
+        assert_eq!(content_range_total("garbage"), None);
+    }
+
+    #[test]
+    fn installer_command_line_is_silent_and_relaunches() {
+        let line = installer_command_line(r"C:\tmp\NexusAI_0.1.57_x64-setup.exe");
+        assert!(line.contains("ping -n 4"), "必须先延迟，让关窗路径回收后端：{line}");
+        assert!(line.contains("/S"), "必须静默安装（不弹 NSIS 向导）：{line}");
+        assert!(line.contains("/R"), "装完必须自动重启：{line}");
+        assert!(
+            line.contains(r#""C:\tmp\NexusAI_0.1.57_x64-setup.exe""#),
+            "安装包路径必须带引号（允许空格）：{line}"
+        );
+    }
+
+    #[test]
+    fn sha256_file_hashes_whole_file() {
+        let path = std::env::temp_dir().join(format!(
+            "nexusai-updater-sha-{}-{}.tmp",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, b"abc").expect("write temp");
+        assert_eq!(
+            sha256_file(&path).expect("hash"),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 }

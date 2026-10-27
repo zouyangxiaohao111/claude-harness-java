@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.57] - 2026-10-27
+
+### Fixed
+
+- 无感升级：更新改为静默覆盖安装（`/S`）并自动重启（`/R`），不再弹出卸载/安装向导；启动安装器前等待应用与后端进程退出，避免 `nexusai-client.exe` / `nexusai-backend.jar` 被占用导致 “Error opening file for writing”。
+- 更新下载修复 3 秒整请求总超时（179MB 安装包必然失败），改为长超时 + HTTP Range 断点续传，并对最终文件整体做 sha256 校验。
+
 ## [0.1.56] - 2026-10-27
 
 ### Added
