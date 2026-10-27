@@ -298,17 +298,29 @@ pub fn app_version(app: tauri::AppHandle) -> String {
 /// <p>延迟的目的：让前端 `getCurrentWindow().close()` 先走 `main.rs` 的正常关窗路径
 /// （`CloseRequested` → `kill_process_tree(backend_pid)` 回收 Java 后端）。否则 NSIS 静默模式
 /// 会直接 kill 主进程，后端仍占用 `backend/nexusai-backend.jar` ⇒ 覆盖安装失败。
-fn installer_command_line(path: &str) -> String {
-    format!(
-        "ping -n 4 127.0.0.1 >NUL & start \"\" \"{}\" /S /R",
-        path.replace('"', "")
-    )
+fn installer_command_line(path: &str, app_exe: &str) -> String {
+    let installer = path.replace('"', "");
+    let app = app_exe.replace('"', "");
+    if app.is_empty() {
+        // 取不到当前 exe（极罕见）：至少完成安装，不尝试重启
+        format!("ping -n 4 127.0.0.1 >NUL & start \"\" /wait \"{installer}\" /S")
+    } else {
+        // ⛔ 不给安装器传 `/R`：它的 RunAsUser 重启分支在部分机器上会报
+        //    「Windows 找不到 '\\' 文件」（2026-10-27 用户实测）。
+        //    改为 `start /wait` 等安装器退出后，由本命令自己启动当前 exe。
+        format!(
+            "ping -n 4 127.0.0.1 >NUL & start \"\" /wait \"{installer}\" /S & start \"\" \"{app}\""
+        )
+    }
 }
 
 #[cfg(target_os = "windows")]
 fn spawn_silent_installer(path: &str) -> Result<(), String> {
+    let app_exe = std::env::current_exe()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     crate::backend::silent_command("cmd")
-        .args(["/C", &installer_command_line(path)])
+        .args(["/C", &installer_command_line(path, &app_exe)])
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("启动静默安装器失败: {e}"))
@@ -326,7 +338,7 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
 #[tauri::command]
 pub fn update_install(path: String, app: AppHandle) -> Result<(), String> {
     let _ = app.emit("update://installing", ());
-    // ⭐ 无感升级：静默覆盖安装（/S）+ 装完自动重启（/R），不再弹 NSIS 卸载/安装向导。
+    // ⭐ 无感升级：静默覆盖安装（/S）；安装器退出后由 cmd 包装器重启当前 exe。
     // 数据目录（~/.nexusai）与安装目录分离，覆盖安装不影响用户数据。
     spawn_silent_installer(&path)
 }
@@ -516,13 +528,24 @@ mod tests {
 
     #[test]
     fn installer_command_line_is_silent_and_relaunches() {
-        let line = installer_command_line(r"C:\tmp\NexusAI_0.1.57_x64-setup.exe");
+        let line = installer_command_line(
+            r"C:\tmp\NexusAI_0.1.60_x64-setup.exe",
+            r"D:\software\NexusAI\nexusai-client.exe",
+        );
         assert!(line.contains("ping -n 4"), "必须先延迟，让关窗路径回收后端：{line}");
         assert!(line.contains("/S"), "必须静默安装（不弹 NSIS 向导）：{line}");
-        assert!(line.contains("/R"), "装完必须自动重启：{line}");
+        assert!(line.contains("/wait"), "必须等安装器退出后再重启：{line}");
         assert!(
-            line.contains(r#""C:\tmp\NexusAI_0.1.57_x64-setup.exe""#),
+            !line.contains("/R"),
+            "⛔ 不传 NSIS /R（其 RunAsUser 重启分支会报找不到 '\\\\' 文件）：{line}"
+        );
+        assert!(
+            line.contains(r#""C:\tmp\NexusAI_0.1.60_x64-setup.exe""#),
             "安装包路径必须带引号（允许空格）：{line}"
+        );
+        assert!(
+            line.contains(r#""D:\software\NexusAI\nexusai-client.exe""#),
+            "安装完必须自行重启当前 exe：{line}"
         );
     }
 

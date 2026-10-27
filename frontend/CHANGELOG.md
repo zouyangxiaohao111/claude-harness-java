@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.60] - 2026-10-27
+
+### Fixed
+
+- 静默安装完成后由更新器自行重启应用（`start /wait` 等安装器退出后启动当前 exe），不再依赖 NSIS `/R`，修复部分机器上安装完后弹「Windows 找不到 '\' 文件」。
+
 ## [0.1.59] - 2026-10-27
 
 ### Fixed
