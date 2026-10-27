@@ -293,7 +293,10 @@ pub fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-/// 静默安装命令行（Windows NSIS）：延迟约 2.5s → `/S` 无向导覆盖安装 → `/R` 装完自动重启。
+/// 静默安装命令行（Windows NSIS）：延迟约 2.5s → `/S` 无向导覆盖安装 → 安装器退出后启动当前 exe。
+///
+/// <p>⛔ 调用方必须用 `CommandExt::raw_arg` 原样传这行；不能 `.args(["/C", line])`
+/// （Rust 会把内部引号转义成 `\"`，cmd.exe 不认 ⇒「Windows 找不到 '\\' 文件」）。
 ///
 /// <p>延迟的目的：让前端 `getCurrentWindow().close()` 先走 `main.rs` 的正常关窗路径
 /// （`CloseRequested` → `kill_process_tree(backend_pid)` 回收 Java 后端）。否则 NSIS 静默模式
@@ -316,11 +319,16 @@ fn installer_command_line(path: &str, app_exe: &str) -> String {
 
 #[cfg(target_os = "windows")]
 fn spawn_silent_installer(path: &str) -> Result<(), String> {
+    // ⭐ raw_arg：cmd 的命令行必须**原样**传。若用 `.args(["/C", line])`，Rust 的 Windows
+    //    参数引用会把内部引号转义成 `\"`，而 cmd.exe 不认 `\"` ⇒ `start` 把反斜杠当程序名
+    //    ⇒ 弹「Windows 找不到 '\\' 文件」（2026-10-27 用户实测；即使已经去掉 NSIS `/R`）。
+    use std::os::windows::process::CommandExt;
     let app_exe = std::env::current_exe()
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
     crate::backend::silent_command("cmd")
-        .args(["/C", &installer_command_line(path, &app_exe)])
+        .arg("/C")
+        .raw_arg(installer_command_line(path, &app_exe))
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("启动静默安装器失败: {e}"))
@@ -546,6 +554,44 @@ mod tests {
         assert!(
             line.contains(r#""D:\software\NexusAI\nexusai-client.exe""#),
             "安装完必须自行重启当前 exe：{line}"
+        );
+    }
+
+    /// 回归守护（2026-10-27 用户实测：「Windows 找不到 '\\' 文件」）：
+    /// `.args(["/C", line])` 会让 Rust 把内部引号转义成 `\"`，cmd.exe 不认 ⇒ start 解析错。
+    /// 用 `raw_arg` 原样传命令行，cmd 才能正确看到 `start "" /wait "..." /S`。
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn raw_arg_preserves_cmd_quotes() {
+        use std::os::windows::process::CommandExt;
+
+        // 只 echo，不启动任何程序：验证 cmd 实际收到的引号形态。
+        let line = r#"echo start "" /wait "C:\tmp\NexusAI_x64-setup.exe" /S & echo start "" "D:\software\NexusAI\nexusai-client.exe""#;
+
+        let out = std::process::Command::new("cmd")
+            .arg("/C")
+            .raw_arg(line)
+            .output()
+            .expect("cmd raw_arg");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            stdout.contains(r#"start "" /wait "C:\tmp\NexusAI_x64-setup.exe" /S"#),
+            "raw_arg 必须原样保留安装器路径引号：{stdout}"
+        );
+        assert!(
+            stdout.contains(r#"start "" "D:\software\NexusAI\nexusai-client.exe""#),
+            "raw_arg 必须原样保留重启路径引号：{stdout}"
+        );
+
+        // 反面对照：走 .args(["/C", line]) 必须复现 `\"`（防止测试假绿）。
+        let bad = std::process::Command::new("cmd")
+            .args(["/C", line])
+            .output()
+            .expect("cmd args");
+        let bad_stdout = String::from_utf8_lossy(&bad.stdout);
+        assert!(
+            bad_stdout.contains(r#"\""#),
+            "对照组必须复现 Rust 的引号转义（否则本测试没有判别力）：{bad_stdout}"
         );
     }
 

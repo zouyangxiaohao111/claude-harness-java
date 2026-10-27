@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.63] - 2026-10-27
+
+### Fixed
+
+- 无感更新仍弹「Windows 找不到 '\\' 文件」：`cmd /C` 的命令行改用 `CommandExt::raw_arg` **原样**传入。旧实现 `.args(["/C", line])` 会被 Rust 转义成 `start \"\" /wait \"...\"`，cmd.exe 不认 `\"` ⇒ `start` 把反斜杠当程序名。新增 Rust 回归测试 `raw_arg_preserves_cmd_quotes`（含反面对照）。⚠️ 0.1.60/0.1.62 运行的是旧 updater，需手动安装一次 0.1.63 才能恢复自更新。
+
 ## [0.1.62] - 2026-10-27
 
 ### Fixed
