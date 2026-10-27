@@ -83,6 +83,19 @@ function cleanReasoning(s?: string | null): string {
   return s.replace(/(?:null)+/g, '').trim()
 }
 
+/**
+ * 流式 token 估算（仅用于「思考中」的实时数字）· 对齐 CC 2.1.296 spinner 口径：
+ *   CC `XQr(e)=Math.ceil(e.length/4)` 用 thinking_delta 字符数估 thinking tokens；
+ *   正文 delta 走 `onUpdateLength: po += len/4`；两者累加即输出 tokens 估算。
+ * provider 的 usage 只在流末尾（OpenAI final chunk / Anthropic message_delta）才出现，
+ * 思考过程中的 reasoning delta 不带 usage ⇒ 只能按字数估；message.usage.output_tokens
+ * 到达后改用权威值（数字前的 "~" 随之消失）。
+ */
+function estimateStreamTokens(reasoning: string, content: string): number {
+  const len = (reasoning?.length ?? 0) + (content?.length ?? 0)
+  return len > 0 ? Math.ceil(len / 4) : 0
+}
+
 /** 对话正文 markdown 走增量 mdast 渲染器（@/markdown/MarkdownText，双态 streaming/settled）。 */
 
 /** 流式 API 错误卡（message.error → 对话流助手回复位置渲染 · 对齐 CC assistant API error / isApiErrorMessage 展示） */
@@ -803,21 +816,27 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   }, [isStreamingTail])
   if (!b) return null
   // [样式对齐 dsh] 进行中显示「思考中·· {tokens}」；完成显示「思考过程」
-  // [2026-10-22 用户裁定 · 修订] 思考中后面的数字用**输出 tokens**（message.usage.output_tokens）：
-  //   流式期间每次 usage 事件带来新的累计输出值 ⇒ 数字随打字机滚动递增（"47 → 312 → 1.2k …"）。
-  //   ⛔ 前端不做任何求和/估算（后端给多少显示多少）；无 usage → 只显示「思考中」+ 波浪点。
-  const streamTokens = b.usage?.output_tokens ?? null
-  const tokenLabel = streamTokens == null
+  // [2026-10-27 用户要求 · 修订] usage 只在一条 assistant 消息**结束时**上报（reasoning delta 不带
+  //   usage），所以思考过程中先按已收到的 reasoning/正文**字数/4**估算输出 tokens（CC 同口径），
+  //   数字才会随 delta 递增；message.usage.output_tokens 到达后改用权威值。估算值前加 "~" 明示非精确值。
+  //   （旧规则「前端不做估算」因用户要求「思考过程中也要有数字」而放宽，仅限这个显示位。）
+  const reasoningText = cleanReasoning(b.reasoning)
+  const authoritativeTokens = b.usage?.output_tokens ?? null
+  const estimatedTokens = estimateStreamTokens(reasoningText, b.content ?? '')
+  const streamTokens = authoritativeTokens ?? (estimatedTokens > 0 ? estimatedTokens : null)
+  const isEstimate = authoritativeTokens == null
+  const tokenText = streamTokens == null
     ? null
     : streamTokens >= 1000 ? `${(streamTokens / 1000).toFixed(1)}k tokens` : `${streamTokens} tokens`
-  /** 进行中：思考中 + 三点波浪（+ 后端 tokens）；完成：思考过程。 */
+  const tokenLabel = tokenText == null ? null : `${isEstimate ? '~' : ''}${tokenText}`
+  /** 进行中：思考中 + 三点波浪（+ tokens）；完成：思考过程。 */
   const thinkingRunning = isStreamingTail
   return (
     <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}`}>
       <div className="avatar">N</div>
       <div className="body">
         <div className="author">nexus</div>
-        {cleanReasoning(b.reasoning) && (
+        {reasoningText && (
           <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
             <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
               {/* [样式对齐 dsh] 思考图标 + 文案 + 折叠箭头（箭头单独 class ⇒ open 时只转箭头） */}
@@ -833,7 +852,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
               )}
               <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
             </button>
-            {!collapsed && <div className="thinking-body">{cleanReasoning(b.reasoning)}</div>}
+            {!collapsed && <div className="thinking-body">{reasoningText}</div>}
           </div>
         )}
         {/* 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含

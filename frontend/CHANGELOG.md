@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.61] - 2026-10-27
+
+### Fixed
+
+- 思考中的 token 数实时递增：provider 的 usage 只在流末尾上报，旧实现要等消息结束才显示数字；现按 CC 2.1.296 同口径用已收到的 reasoning/正文**字数/4** 估算，`message.usage.output_tokens` 到达后切换为权威值（估算阶段显示 `~N tokens`）。
+
 ## [0.1.60] - 2026-10-27
 
 ### Fixed
