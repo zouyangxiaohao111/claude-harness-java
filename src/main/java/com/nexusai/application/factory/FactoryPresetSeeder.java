@@ -141,7 +141,9 @@ public class FactoryPresetSeeder implements ApplicationRunner {
     public boolean seedIfFresh() {
         List<ProviderRecord> existing = providerMapper.selectAll();
         if (!existing.isEmpty()) {
-            log.info("[FactoryPresetSeeder] providers 表非空(count={})，判定非全新库，跳过出厂预设写入（不覆盖老用户数据）", existing.size());
+            // 已有库：⛔ 不覆盖任何现有 provider/models/settings；只做加法补全 minimax（无 key）。
+            ensureMinimaxProvider(existing);
+            log.info("[FactoryPresetSeeder] providers 表非空(count={})，跳过出厂预设写入（不覆盖老用户数据）；已确保 minimax provider/model 存在（不写 key）", existing.size());
             return false;
         }
 
@@ -155,6 +157,68 @@ public class FactoryPresetSeeder implements ApplicationRunner {
         log.info("[FactoryPresetSeeder] 全新库出厂预设写入完成：provider {} 个, model {} 个, settings {}",
             providerIdByName.size(), insertedModels, settingsApplied ? "已 merge" : "无预设键");
         return true;
+    }
+
+    /**
+     * 已有库的最小补全：只确保 minimax provider 与其预设模型存在，
+     * <b>不覆盖任何已有行、不写 key、不动 settings</b>。
+     *
+     * <p><b>WHY（用户 2026-10-27）</b>：老库（已有 deepseek 等 provider）走不到全新库分支；
+     * 新版本增加 minimax 默认配置后，老用户升级上来仍看不到 minimax。这里只做加法：
+     * provider 缺失则补 provider（无 key），模型缺失则补模型；provider 已存在（即使 disabled）
+     * 一律不改 —— 用户明确要求「已经安装的不要覆盖已有配置」。
+     */
+    private void ensureMinimaxProvider(List<ProviderRecord> existing) {
+        JsonNode root = readPreset();
+        JsonNode minimaxNode = null;
+        for (JsonNode p : root.path("providers")) {
+            if ("minimax".equalsIgnoreCase(p.path("name").asText())) {
+                minimaxNode = p;
+                break;
+            }
+        }
+        if (minimaxNode == null) {
+            log.warn("[FactoryPresetSeeder] 出厂预设缺少 minimax provider，跳过已有库补全");
+            return;
+        }
+        String name = minimaxNode.path("name").asText();
+        ProviderRecord minimax = existing.stream()
+            .filter(p -> name.equalsIgnoreCase(p.getName()))
+            .findFirst().orElse(null);
+        String providerId;
+        if (minimax == null) {
+            // 深拷贝并移除任何 apiKey：已有库补全绝不写 key
+            ObjectNode copy = minimaxNode.deepCopy();
+            copy.remove("apiKey");
+            ArrayNode one = objectMapper.createArrayNode().add(copy);
+            providerId = insertProviders(one).get(name);
+            if (providerId == null) {
+                log.warn("[FactoryPresetSeeder] minimax provider 插入失败，跳过模型补全");
+                return;
+            }
+            log.info("[FactoryPresetSeeder] 已有库补全 minimax provider（无 key，不覆盖已有 provider）");
+        } else {
+            providerId = minimax.getId();
+        }
+        List<ModelRecord> existingModels = modelMapper.selectAll();
+        String now = OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        int added = 0;
+        for (JsonNode m : root.path("models")) {
+            if (!name.equalsIgnoreCase(m.path("provider").asText())) {
+                continue;
+            }
+            String modelName = m.path("name").asText(null);
+            if (modelName == null || modelName.isBlank()) {
+                continue;
+            }
+            boolean exists = existingModels != null && existingModels.stream()
+                .anyMatch(em -> providerId.equals(em.getProviderId()) && modelName.equals(em.getName()));
+            if (!exists && insertModel(m, providerId, now)) {
+                added++;
+            }
+        }
+        log.info("[FactoryPresetSeeder] 已有库 minimax 补全完成：provider 新增={} model 新增={}（不写 key）",
+            minimax == null, added);
     }
 
     // ============== providers ==============
@@ -238,30 +302,42 @@ public class FactoryPresetSeeder implements ApplicationRunner {
                 log.warn("[FactoryPresetSeeder] models[] provider='{}' 不在本次预设 providers 内，跳过模型 '{}'", providerName, name);
                 continue;
             }
-            ModelRecord rec = new ModelRecord();
-            rec.setId(generateId("model"));
-            rec.setProviderId(providerId);
-            rec.setName(name);
-            rec.setTag(m.path("tag").asText("DS"));
-            rec.setType(m.path("type").asText("chat"));
-            // 可选：上下文/输出上限（缺省不写，沿用 provider 侧默认）。
-            // minimax 这类 1M 窗口模型必须带上，否则前端/压缩器会按硬编码兜底（200k）误判窗口。
-            if (m.hasNonNull("maxTokens")) {
-                rec.setMaxTokens(m.path("maxTokens").asInt());
-            }
-            if (m.hasNonNull("maxContextTokens")) {
-                rec.setMaxContextTokens(m.path("maxContextTokens").asInt());
-            }
-            rec.setEnabled(m.path("enabled").asBoolean(true));
-            rec.setCreatedAt(now);
-            modelMapper.insertSelective(rec);
-            count++;
-            if (log.isDebugEnabled()) {
-                log.debug("[FactoryPresetSeeder] 插入出厂 model: providerId={} name={} tag={} type={} enabled={}",
-                    providerId, name, rec.getTag(), rec.getType(), rec.getEnabled());
+            if (insertModel(m, providerId, now)) {
+                count++;
             }
         }
         return count;
+    }
+
+    /** 插入单条模型（调用方负责存在性去重）。返回是否插入。 */
+    private boolean insertModel(JsonNode m, String providerId, String now) {
+        String name = m.path("name").asText(null);
+        if (name == null || name.isBlank()) {
+            log.warn("[FactoryPresetSeeder] model 缺 name，跳过: {}", m);
+            return false;
+        }
+        ModelRecord rec = new ModelRecord();
+        rec.setId(generateId("model"));
+        rec.setProviderId(providerId);
+        rec.setName(name);
+        rec.setTag(m.path("tag").asText("DS"));
+        rec.setType(m.path("type").asText("chat"));
+        // 可选：上下文/输出上限（缺省不写，沿用 provider 侧默认）。
+        // minimax 这类 1M 窗口模型必须带上，否则前端/压缩器会按硬编码兜底（200k）误判窗口。
+        if (m.hasNonNull("maxTokens")) {
+            rec.setMaxTokens(m.path("maxTokens").asInt());
+        }
+        if (m.hasNonNull("maxContextTokens")) {
+            rec.setMaxContextTokens(m.path("maxContextTokens").asInt());
+        }
+        rec.setEnabled(m.path("enabled").asBoolean(true));
+        rec.setCreatedAt(now);
+        modelMapper.insertSelective(rec);
+        if (log.isDebugEnabled()) {
+            log.debug("[FactoryPresetSeeder] 插入出厂 model: providerId={} name={} tag={} type={} enabled={}",
+                providerId, name, rec.getTag(), rec.getType(), rec.getEnabled());
+        }
+        return true;
     }
 
     // ============== settings ==============

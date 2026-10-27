@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.58] - 2026-10-27
+
+### Fixed
+
+- 模型配置表单按模型类型切换配置页：chat/text/vision/multimodal → 生成参数；embedding → 向量嵌入（维度/批大小）；rerank → 重排序（topN/instruct）。切换类型即时生效，保存时清理不属于当前类型的专用参数。
+- 已有库升级后自动补全 minimax provider 与其模型（**不写 key、不覆盖已有 provider/models/settings**）；全新库仍按出厂预设（内网包带默认 key / GitHub 包无 key）。
+
 ## [0.1.57] - 2026-10-27
 
 ### Fixed

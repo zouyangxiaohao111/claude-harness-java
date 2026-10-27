@@ -2,9 +2,11 @@
  * ModelFormModal — edit a single ModelInfo entry.
  * Used by ProvidersPanel for the nested models list.
  *
- * Layout: 3 sections (基础 / 类型 / 生成参数 / 行为) with 2-up grids for
- * generation params. topP: number | null is reconciled in `handleSave` so
- * an empty input maps to null (provider default).
+ * Layout: sections are filtered by the selected model type —
+ * chat-like (chat/text/vision/multimodal/…) shows 生成参数；
+ * embedding shows 向量嵌入；rerank shows 重排序。
+ * topP: number | null is reconciled in `handleSave` so an empty input maps to null
+ * (provider default).
  */
 import { FormModal } from './FormModal'
 import type { Model, ModelType } from '@/api/types'
@@ -38,12 +40,24 @@ const TYPE_OPTIONS: { value: ModelType; label: string }[] = [
 ]
 
 export function ModelFormModal({ initial, providerName, onSave, onCancel, onDelete }: ModelFormModalProps) {
+  // 三套配置页：embedding / rerank 各一套，其余（chat/text/vision/multimodal/…）共用生成参数。
+  const isEmbedding = (v: Record<string, any>) => v.type === 'embedding'
+  const isRerank = (v: Record<string, any>) => v.type === 'rerank'
+  const isChatLike = (v: Record<string, any>) => !isEmbedding(v) && !isRerank(v)
+
   const handleSave = (m: Model) => {
+    const emb = m.type === 'embedding'
+    const rr = m.type === 'rerank'
     // think 保持原语义（trim）；extraBody 独立通道：trim 空串即「无额外参数」
     onSave({
       ...m,
       think: (m.think ?? '').trim(),
       extraBody: (m.extraBody ?? '').trim(),
+      // 类型切换后清掉不属于当前类型的专用参数，避免「页面上看不到却仍落库」
+      embeddingDimensions: emb ? m.embeddingDimensions : null,
+      embeddingBatchSize: emb ? m.embeddingBatchSize : null,
+      rerankTopN: rr ? m.rerankTopN : null,
+      rerankInstruct: rr ? m.rerankInstruct : null,
     })
   }
 
@@ -83,6 +97,7 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
         },
         {
           title: '生成参数',
+          visibleWhen: isChatLike,
           rows: [
             [
               { type: 'number', name: 'maxTokens', label: 'max tokens', nullable: true, placeholder: '384000', hint: '单次最大输出 token 数 · 留空=384000' },
@@ -98,6 +113,7 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
           // [embedding-provider 2026-10-26] 向量嵌入专用配置（仅 type=embedding 生效）。
           //   维度/批大小落在 models.embedding_dimensions / embedding_batch_size（V200）。
           title: '向量嵌入（仅 Embedding 类型生效）',
+          visibleWhen: isEmbedding,
           rows: [
             [
               { type: 'number', name: 'embeddingDimensions', label: '向量维度', nullable: true, placeholder: '1024', hint: '百炼 text-embedding-v4：2048/1536/1024/768/512/256/128/64 · 留空=服务端默认' },
@@ -110,6 +126,7 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
           //   topN / instruct 落在 models.rerank_top_n / rerank_instruct（V200）；
           //   请求体显式传值优先于这里的默认值。
           title: '重排序（仅 Rerank 类型生效）',
+          visibleWhen: isRerank,
           fields: [
             { type: 'number', name: 'rerankTopN', label: '默认 topN', nullable: true, placeholder: '10', hint: '请求未传 topN 时使用 · 超过候选数会自动收敛 · 留空=不发送（服务端默认）' },
             { type: 'text', name: 'rerankInstruct', label: '默认指令 instruct', placeholder: 'Given a web search query, retrieve relevant passages that answer the query.', hint: 'qwen3-rerank 支持 · 留空=不发送（可被请求覆盖）' },

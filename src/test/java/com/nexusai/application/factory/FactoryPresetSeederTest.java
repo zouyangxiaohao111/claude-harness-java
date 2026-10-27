@@ -195,13 +195,52 @@ class FactoryPresetSeederTest {
     @Test
     @DisplayName("老库（providers 非空）→ 跳过预设，零写入零覆盖")
     void nonEmptyProviders_skipsPreset() throws Exception {
-        when(providerMapper.selectAll()).thenReturn(List.of(new ProviderRecord()));
+        ProviderRecord minimax = new ProviderRecord();
+        minimax.setId("prov-minimax");
+        minimax.setName("minimax");
+        ModelRecord minimaxModel = new ModelRecord();
+        minimaxModel.setProviderId("prov-minimax");
+        minimaxModel.setName("MiniMax-M3.1-Flash-Preview");
+        when(providerMapper.selectAll()).thenReturn(List.of(minimax));
+        when(modelMapper.selectAll()).thenReturn(List.of(minimaxModel));
 
         boolean seeded = newSeeder().seedIfFresh();
 
-        assertThat(seeded).as("已有任何 provider 即老库，绝不执行预设").isFalse();
+        assertThat(seeded).as("已有任何 provider 即老库，绝不执行完整预设").isFalse();
         verify(providerMapper, never()).insertSelective(any());
         verify(modelMapper, never()).insertSelective(any());
+        verify(settingsMapper, never()).update(any());
+        verify(settingsMapper, never()).insertSelective(any());
+    }
+
+    @Test
+    @DisplayName("老库只有 deepseek → 只补 minimax provider + 模型，不写 key，不动 settings")
+    void existingDeepseek_addsMinimaxWithoutKey() throws Exception {
+        ProviderRecord deepseek = new ProviderRecord();
+        deepseek.setId("prov-deepseek");
+        deepseek.setName("deepseek");
+        when(providerMapper.selectAll()).thenReturn(List.of(deepseek));
+        when(modelMapper.selectAll()).thenReturn(List.of());
+
+        boolean seeded = newSeeder().seedIfFresh();
+
+        assertThat(seeded).as("老库仍不执行完整出厂预设").isFalse();
+
+        ArgumentCaptor<ProviderRecord> providerCaptor = ArgumentCaptor.forClass(ProviderRecord.class);
+        verify(providerMapper).insertSelective(providerCaptor.capture());
+        ProviderRecord minimax = providerCaptor.getValue();
+        assertThat(minimax.getName()).isEqualTo("minimax");
+        assertThat(minimax.getBaseUrl()).isEqualTo("https://api.minimax.cn/v1");
+        assertThat(minimax.getApiKeyMasked()).as("已有库补全不写 key").isEmpty();
+        assertThat(minimax.getApiKeyEncrypted()).as("已有库补全不写 key").isNull();
+
+        ArgumentCaptor<ModelRecord> modelCaptor = ArgumentCaptor.forClass(ModelRecord.class);
+        verify(modelMapper).insertSelective(modelCaptor.capture());
+        ModelRecord model = modelCaptor.getValue();
+        assertThat(model.getProviderId()).isEqualTo(minimax.getId());
+        assertThat(model.getName()).isEqualTo("MiniMax-M3.1-Flash-Preview");
+        assertThat(model.getMaxContextTokens()).isEqualTo(1048576);
+
         verify(settingsMapper, never()).update(any());
         verify(settingsMapper, never()).insertSelective(any());
     }

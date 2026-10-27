@@ -44,6 +44,11 @@ export interface FormSection {
   action?: { label: string; onClick: () => void }
   fields?: FormField[]
   rows?: FormField[][]
+  /**
+   * 按当前表单值决定整节是否渲染（返回 false 时隐藏）。
+   * 用途：同一表单按「类型」切换配置页（如 chat / embedding / rerank 各显示各自的参数）。
+   */
+  visibleWhen?: (values: Record<string, any>) => boolean
 }
 
 interface FormModalProps<T extends Record<string, any>> {
@@ -301,7 +306,7 @@ export function FormModal<T extends Record<string, any>>({
           {subtitle && <span className="fm-subtitle">{subtitle}</span>}
         </div>
         <div className="fm-body">
-          {sections.map((section, si) => {
+          {sections.filter((section) => !section.visibleWhen || section.visibleWhen(values)).map((section, si) => {
             const layout: FormField[][] = section.rows ?? (section.fields ?? []).map((f) => [f])
             return (
               <div key={si}>
