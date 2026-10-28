@@ -7,7 +7,7 @@
     "frontendDist": "../dist",
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "npm run build && node scripts/prepare-backend.mjs && node scripts/make-extension-zip.mjs"
+    "beforeBuildCommand": "node scripts/prepare-error-report.mjs && npm run build && node scripts/prepare-backend.mjs && node scripts/make-extension-zip.mjs"
   },
   "app": {
     "macOSPrivateApi": true,

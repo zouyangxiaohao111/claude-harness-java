@@ -22,8 +22,11 @@ use tauri::AppHandle;
 
 type HmacSha256 = Hmac<Sha256>;
 
-/// 编译期内网配置（JSON）。GitHub 包无此环境变量 ⇒ None。
-const CONFIG_JSON: Option<&str> = option_env!("NEXUSAI_ERROR_REPORT_CONFIG");
+// 编译期内网配置（JSON）：由 scripts/prepare-error-report.mjs 在构建前写入同目录的
+// error_report_config.rs（默认 None；内网构建写成 Some(JSON)）。
+// ⛔ 不要改回 option_env!/build.rs：Tauri CLI 调 cargo 时环境变量传不进构建，
+//    2026-10-28 实测内网包会静默变成「未配置上报」。
+include!("error_report_config.rs");
 
 #[derive(Deserialize, Clone)]
 #[serde(rename_all = "camelCase")]
