@@ -9750,6 +9750,16 @@ html {
 .cl-errMsg{font-size:13px;color:#5f6875;line-height:1.6;word-break:break-word}
 .cl-errHint{margin-top:8px;font-size:12px;color:#9aa3b2;line-height:1.7}
 
+/* 启动错误上报（用户勾选同意后才上传） */
+.cl-report{margin-top:12px;padding-top:12px;border-top:1px solid #eef2f8;width:100%;display:flex;flex-direction:column;gap:8px;text-align:left}
+.cl-report-consent{display:flex;align-items:flex-start;gap:6px;font-size:11.5px;color:#7b8494;line-height:1.6;cursor:pointer}
+.cl-report-consent input{margin-top:2px;flex:none}
+.cl-report-actions{display:flex;align-items:center;gap:8px;flex-wrap:wrap}
+.cl-report-btn{border:0;border-radius:8px;padding:7px 12px;font-size:12px;font-weight:600;color:#fff;background:#0a49a8;cursor:pointer}
+.cl-report-btn:disabled{opacity:.45;cursor:not-allowed}
+.cl-report-hint{font-size:11px;color:#9aa3b2}
+.cl-report-error{font-size:11px;color:#c2410c;word-break:break-word}
+
 /* 主界面淡入（放大完成后切换 App 的入场） */
 .cl-enter{animation:cl-enter .4s var(--ease) both}
 @keyframes cl-enter{from{opacity:0;transform:scale(.985)}to{opacity:1;transform:none}}

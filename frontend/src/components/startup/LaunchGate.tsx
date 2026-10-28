@@ -36,6 +36,43 @@ interface LaunchGateProps {
 export function LaunchGate({ children }: LaunchGateProps) {
   const [status, setStatus] = useState<GateStatus>('booting')
   const [errorMsg, setErrorMsg] = useState('')
+  /** 当前构建是否配置了错误上报（内网包 true；GitHub 包 false → 按钮禁用/提示未配置）。 */
+  const [reportCapable, setReportCapable] = useState<boolean | null>(null)
+  const [reportConsent, setReportConsent] = useState(false)
+  const [reportState, setReportState] = useState<'idle' | 'sending' | 'sent' | 'error'>('idle')
+  const [reportMsg, setReportMsg] = useState('')
+
+  useEffect(() => {
+    if (status !== 'error') return
+    let alive = true
+    void (async () => {
+      try {
+        const { invoke } = await import('@tauri-apps/api/core')
+        const ok = await invoke<boolean>('report_capability')
+        if (alive) setReportCapable(!!ok)
+      } catch {
+        if (alive) setReportCapable(false)
+      }
+    })()
+    return () => {
+      alive = false
+    }
+  }, [status])
+
+  /** 用户勾选同意并点击后才调用；⛔ 不做自动上报。 */
+  const submitStartupReport = async () => {
+    if (reportState === 'sending' || reportState === 'sent') return
+    setReportState('sending')
+    setReportMsg('')
+    try {
+      const { invoke } = await import('@tauri-apps/api/core')
+      await invoke<string>('report_startup_error', { message: errorMsg })
+      setReportState('sent')
+    } catch (e) {
+      setReportState('error')
+      setReportMsg(e instanceof Error ? e.message : String(e))
+    }
+  }
 
   useEffect(() => {
     let alive = true
@@ -157,6 +194,36 @@ export function LaunchGate({ children }: LaunchGateProps) {
             请查看 {`~/${cachedConfigDirLabel()}/logs/backend.log`} 了解原因；
             <br />
             如持续失败，请关闭应用后重新打开。
+          </div>
+
+          <div className="cl-report">
+            <label className="cl-report-consent">
+              <input
+                type="checkbox"
+                checked={reportConsent}
+                disabled={reportCapable !== true || reportState === 'sending' || reportState === 'sent'}
+                onChange={(e) => setReportConsent(e.target.checked)}
+              />
+              <span>我同意上报启动错误日志（仅 backend.log / tauri-launcher.log，不含会话内容）</span>
+            </label>
+            <div className="cl-report-actions">
+              <button
+                type="button"
+                className="cl-report-btn"
+                disabled={
+                  reportCapable !== true ||
+                  !reportConsent ||
+                  reportState === 'sending' ||
+                  reportState === 'sent'
+                }
+                onClick={() => void submitStartupReport()}
+              >
+                {reportState === 'sent' ? '已上报' : reportState === 'sending' ? '正在上报…' : '同意并上报'}
+              </button>
+              {reportCapable === false && <span className="cl-report-hint">当前版本未配置错误上报</span>}
+              {reportState === 'sent' && <span className="cl-report-hint">感谢反馈</span>}
+              {reportState === 'error' && <span className="cl-report-error">上报失败：{reportMsg}</span>}
+            </div>
           </div>
         </div>
       </div>

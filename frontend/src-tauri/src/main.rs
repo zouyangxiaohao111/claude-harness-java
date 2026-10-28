@@ -9,6 +9,8 @@ use tauri::{Emitter, Manager};
 mod backend;
 /// 自动更新（多源 latest.json 检查 / 下载 sha256 / NSIS 安装）。
 mod updater;
+/// 启动错误上报（仅内网包；用户勾选同意后才上传到 MinIO）。
+mod error_report;
 /// 前端日志 / 心跳落盘（OBS1）：前端错误与每 10s 心跳经 IPC 落到 `{data_dir}/logs/frontend.log`。
 mod frontlog;
 
@@ -259,6 +261,8 @@ fn main() {
             updater::update_check,
             updater::update_download,
             updater::update_install,
+            error_report::report_capability,
+            error_report::report_startup_error,
             frontlog::frontend_log,
             frontlog::frontend_heartbeat
         ])
@@ -336,14 +340,17 @@ fn main() {
                             backend::log_launcher(&msg);
                             eprintln!("[backend-launcher] {}", msg);
                         } else {
-                            // release：捆绑后端缺失属部署错误 → 显式失败（fail loud）
+                            // release：捆绑后端缺失/无法启动属部署错误 → fail loud，但**保留窗口**
+                            // 让 LaunchGate 显示错误卡并提供「上报错误日志」（用户 2026-10-28 要求）。
+                            // ⛔ 不再 `return Err`：setup 返回 Err 会直接结束应用，前端拿不到错误卡。
                             let msg = format!(
                                 "本地后端启动失败：{}（请查看 {}/logs/backend.log）",
                                 e,
                                 backend::data_dir().display()
                             );
                             backend::log_launcher(&msg);
-                            return Err(msg.into());
+                            eprintln!("[backend-launcher] {}", msg);
+                            let _ = handle.emit("backend-error", msg);
                         }
                     }
                 }

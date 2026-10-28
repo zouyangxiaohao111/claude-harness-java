@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.64] - 2026-10-28
+
+### Added
+
+- 启动错误上报：后端起不来时，LaunchGate 错误卡提供「同意并上报」；仅在用户勾选同意后上传 `backend.log` + `tauri-launcher.log` + 版本/OS/安装路径/时间到 MinIO（只写 key，仅内网包启用；不含 `info.log`/`error.log`，用户名脱敏）。GitHub 包未配置上报能力。
+- release 下后端 spawn 失败不再直接退出应用，保留错误卡以便用户上报。
+
 ## [0.1.63] - 2026-10-27
 
 ### Fixed
