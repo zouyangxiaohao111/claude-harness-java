@@ -2093,8 +2093,13 @@ public class ToolRegistrationConfig {
                 return raw;
             }
             try {
+                // [2026-10-29] 本处是「SDK 发送名翻译」（与 ModelConfigResolver.resolveSdkModelName 同语义），
+                //   不是选模型 ⇒ 走宽松解析：裸名歧义返回 null，回落下方「原始值透传」，
+                //   输出与 resolve 的 fail-loud 分支逐字相同（都是裸名），只是不再往选模型护栏的
+                //   ERROR 上刷日志。⛔ 下方 configSupplier / providerTypeSupplier 是选 provider（路由），
+                //   仍走 resolve（fail-loud）。
                 com.nexusai.repository.provider.entity.ModelRecord rec =
-                    com.nexusai.infra.llm.ModelNameResolver.resolve(modelMapper, providerMapper, raw);
+                    com.nexusai.infra.llm.ModelNameResolver.resolveQuiet(modelMapper, providerMapper, raw);
                 String bare = rec != null && rec.getName() != null ? rec.getName() : null;
                 if (bare != null && !bare.isBlank()) {
                     if (log.isDebugEnabled()) {

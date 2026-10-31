@@ -339,6 +339,12 @@ class OutboundWireProjectionWireFidelityTest {
             toolPair("tc-1", "工具输出", null, List.of(textBlock("甲"))),
             toolPair("tc-1", "工具输出", null, List.of(textBlockWithExtraKey("甲", "cache_control"))),
             "tool text 块的非 wire 键被忽略");
+        // ⑬ tool：image 块（CU 截图）经「紧随的 role=user 承载消息」上 wire ⇒ 截图字节变化
+        //     必须被投影分辨（截图每轮都变 ⇒ 探针判绿 = 假阴性）
+        assertSameDiscrimination(
+            toolPair("tc-1", "工具输出", null, List.of(imageBlockBase64("QUJDRA=="))),
+            toolPair("tc-1", "工具输出", null, List.of(imageBlockBase64("RUZHSA=="))),
+            "tool image 块经承载消息上 wire");
     }
 
     // ═══════════════════════════════ 脚手架 ═══════════════════════════════
@@ -442,6 +448,17 @@ class OutboundWireProjectionWireFidelityTest {
         ObjectNode b = JSON.createObjectNode();
         b.put("type", "image");
         b.put("url", url);
+        return b;
+    }
+
+    /** base64 形态的 image 块（CU 截图形态：{@code source:{type:base64, media_type, data}}）。 */
+    private static JsonNode imageBlockBase64(String base64) {
+        ObjectNode b = JSON.createObjectNode();
+        b.put("type", "image");
+        ObjectNode source = b.putObject("source");
+        source.put("type", "base64");
+        source.put("media_type", "image/jpeg");
+        source.put("data", base64);
         return b;
     }
 

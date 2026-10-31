@@ -350,6 +350,18 @@ nexusai:
     #   flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig nexusai-in-chrome skill 门控叠加
     #   （false → skill 不注册，防「skill 提示用工具但工具不存在」空转）。后期转常态后改默认 true。
     browser-mcp: true
+    # [CU-PoC → Phase 1c] computer-use 总开关 · Phase 0 的 2 个工具（mcp__computer-use__screenshot /
+    #   mcp__computer-use__left_click）+ Phase 1a 的 request_access + Phase 1c 的 4 个
+    #   （type / key / wait / list_granted_applications），默认 true ⇒ 工具注册（模型可见）。
+    #   [2026-10-31 用户裁定] 默认开启 —— 本仓是常驻应用，computer-use 作为常驻能力默认对模型可见。
+    #   出处：CC feature('CHICAGO_MCP') —— CCB 2.8.4 侧 DEFAULTS.enabled = true（默认构建里就是开的）；
+    #   本仓此前为 false（出包安全选择），现按裁定改为 true ⇒ 与该出处口径一致，差异消除。
+    #   ⚠️ 开启 ≠ 可控桌面：模型可见 mcp__computer-use__* 工具，但实际操作仍需 request_access 授权
+    #   （会话级授权 + 应用白名单 + read/click/full 三档 tier + 三个默认全关的授权位
+    #   clipboardRead / clipboardWrite / systemKeyCombos）；mcp__computer-use__* 走免弹窗模型
+    #   （权限自决 Allow，授权由 request_access 一次承担）。
+    #   ComputerUseToolConfig 读此 flag（false → 空 List → ToolRegistry 注册 no-op）。
+    computer-use: true
     # [2026-09-01 → V61 迁移 DB] 插件双读开关已迁移为 DB settings.plugin_claude_fallback
     #   （前端「插件设置」页可配；null = 回落默认 true）。本 yml 键已废弃——仅保留占位，
     #   实际消费点 InstalledPluginsManager / InstalledPluginsFileStore 改读 DB 列。
@@ -376,6 +388,39 @@ nexusai:
     #   消费点 CoordinatorMode(Environment)（CoordinatorMode.java:85）读取本键；缺失 = getProperty 返回
     #   null → isTruthy(null)=false → isCoordinatorMode() 恒早返 false（静默，无异常无日志），故本键必须存在。
     coordinator-mode: false
+
+  # ---------------------------------------------------------------
+  # [CU Phase 1a] computer-use 子开关（10 个里的 9 个：7 个 CCB 对齐 + 2 个本仓特有）·
+  #   对齐 CCB 2.8.4 src/utils/computerUse/gates.ts:11-20 的 DEFAULTS。
+  #   ⛔ 不能放在 feature: 下 —— nexusai.feature.computer-use 已是**标量**（总开关），
+  #      YAML 同键不能既是标量又是映射（重复键 ⇒ 解析失败/后者覆盖）。
+  #   总开关 = nexusai.feature.computer-use（默认 true：2026-10-31 用户裁定「常驻应用」；
+  #   与 CCB DEFAULTS.enabled = true 一致）。
+  #   其中 7 个取值与 CCB 的 DEFAULTS 一致；Phase 1c 已逐个核实 CCB 在 Windows 的实际行为，
+  #   生效范围见 ComputerUseGates 类 javadoc 的「Phase 1c 生效状态」表。
+  computer-use:
+    # 9×9 逐字节陈旧性校验（点击前）· CCB 默认 false
+    pixel-validation: false
+    # 多行 type 走剪贴板快路径 · CCB 默认 true
+    clipboard-paste-multiline: true
+    # 鼠标缓动（60fps ease-out-cubic）· CCB 默认 true
+    mouse-animation: true
+    # 动作前隐藏非授权窗口 · CCB 默认 true
+    hide-before-action: true
+    # 多显示器自动选屏 · CCB 默认 true
+    auto-target-display: true
+    # 剪贴板守卫（点击档应用前台时暂存并清空剪贴板）· CCB 默认 true
+    clipboard-guard: true
+    # 坐标模式：pixels | normalized_0_100 · CCB 默认 pixels
+    coordinate-mode: pixels
+    # 视觉 grounding 降级路径（主模型确定不支持视觉时改走 grounding）· 本仓特有（CCB 无对应）
+    # 默认 false：降级会把坐标模式强制切到 normalized_0_100（降级只产出百分比坐标），
+    # 影响主链路坐标约定 ⇒ 未实测精度前保持关闭。PoC 端点与此开关无关。
+    grounding-fallback-enabled: false
+    # 视觉 grounding 手工 PoC 端点（POST /api/v1/computer-use/grounding-poc）
+    # 默认 true（2026-10-31 用户裁定：跑视觉 grounding 真 key PoC）⇒ 端点可用；
+    # 置 false ⇒ 端点 404。开启后可手工量「视觉模型定位坐标」的像素误差。
+    grounding-poc-enabled: true
 
   # ---------------------------------------------------------------
   # [ODF-A3] bare 模式统一判定 · Java 独有增强（CC envUtils.ts:60-65 无对应配置）
@@ -504,7 +549,7 @@ springdoc:
 server:
   port: 3458
 
-# 日志（logback-spring.xml：控制台 %highlight 颜色 + 文件滚动 + 异步；无 SkyWalking）
-logging:
-  file:
-    path: logs
+# 日志路径按 profile 拆分（本文件不再承载）：
+#   dev  → application-dev.yml（相对路径 logs，由进程工作目录决定）
+#   prod → application-prod.yml（${user.home}/.${spring.application.name}/logs）
+# logback-spring.xml 的 defaultValue 仍是 logs（无 profile 时兜底，行为不变）。

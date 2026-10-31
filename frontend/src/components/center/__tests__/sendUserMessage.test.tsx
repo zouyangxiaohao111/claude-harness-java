@@ -189,6 +189,10 @@ describe('SendUserMessage 正文渲染（CC BriefTool 对齐）', () => {
       ] as ToolCallDto[],
     }
     await mount([user, notes, bash])
+    // [轮次中间过程折叠] 本轮已结束 → 中间工具卡默认收起；展开整轮后再验证 Bash 卡仍在。
+    const turnToggle = container.querySelector<HTMLButtonElement>('.turn-process-toggle')
+    expect(turnToggle).not.toBeNull()
+    await act(async () => { turnToggle!.click() })
 
     // 冗余正文消失
     expect(container.textContent).not.toContain('工作笔记')

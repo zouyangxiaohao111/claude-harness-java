@@ -472,7 +472,7 @@ const emptyAddForm = (kind: ScheduleKind): AddFormValue => ({
   ...(kind === 'interval' ? { intervalSeconds: 3600 } : {}),
 })
 
-function ScheduleAddModal({
+export function ScheduleAddModal({
   kind,
   onChangeKind,
   onSave,

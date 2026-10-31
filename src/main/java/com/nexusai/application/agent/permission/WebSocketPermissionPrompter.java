@@ -225,6 +225,23 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     private final Map<String, String> pendingSessionOf = new ConcurrentHashMap<>();
 
     /**
+     * [刷新重放 · 三通道] 会话 → (owner requestId → 通道快照列表) · <b>bridge / channel</b> 通道
+     * 的待审批请求快照。
+     *
+     * <p><b>WHY 存在</b>：此前只有 message 通道的请求会被 {@code GET /sessions/{id}/state} 重放
+     * ⇒ bridge（CCR / claude.ai 式远程弹窗）/ channel（Telegram / iMessage / Discord 中继）两条
+     * 通道的待审批请求在用户<b>刷新页面后消失</b>（用户看不到、也没法批准/拒绝）。
+     *
+     * <p><b>生命周期</b>：与同一次待审批的 message 快照<b>同生共死</b>（同一 owner requestId）
+     * ⇒ 用户响应 / abort / 推送失败时由 {@link #removePendingSnapshot(String)} 一并清除。
+     *
+     * <p><b>key = owner requestId（tool_use id）</b> ⇒ 与 message 快照同键 ⇒ 前端按 requestId
+     * 去重后只显示一个弹窗（message 快照字段最全，排在前面）。
+     */
+    private final Map<String, Map<String, List<PendingPermissionSnapshot>>> pendingChannelBySession =
+        new ConcurrentHashMap<>();
+
+    /**
      * [canUseTool v3] 每请求的原子 claim 守卫 · 对齐 CC createResolveOnce.claim()
      * （PermissionContext.ts:75-94）。value = AtomicBoolean（false=未 claim，true=已 claim）。
      *
@@ -730,6 +747,11 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             List<PermissionUpdate> suggestions = details != null ? details.suggestions() : List.of();
             String blockedPath = details != null ? details.blockedPath() : null;
             String warning = renderPermissionWarning(tool, input);
+            // [Phase 1b · D] computer-use 审批面板数据：非 CU 请求 ⇒ null（前端走普通分支）。
+            //   数据源 = 工具入参里 Phase 1a 就地注入的 resolvedApps + reason + 三个授权位。
+            com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse =
+                com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                    tool.name(), input);
             MessagePermissionRequestEvent event = MessagePermissionRequestEvent.of(
                 eventSessionId,
                 requestId,
@@ -741,6 +763,8 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 suggestions,
                 blockedPath,
                 warning,
+                null,   // workerBadgeColor（主 loop 弹窗无 worker badge；既有 11 参工厂同款）
+                computerUse,
                 isClassifierFeatureEnabled()
             );
             ws.convertAndSend(topic, event);
@@ -1530,6 +1554,22 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
             return;
         }
+        // [刷新重放 · 三通道] 登记 bridge 通道的待审批快照 —— 此前只重放 message 通道 ⇒
+        //   bridge 通道的请求在用户刷新页面后消失（看不到、也没法批准/拒绝）。
+        //   快照的 requestId = owner requestId（tool_use id）⇒ 前端补拉后按 message 通道归一化，
+        //   用户的允许/拒绝能命中 prompter 的 pending future（用 bridge UUID 会查不到 → 工具挂起）。
+        String bridgeDeliverySessionId = owningSessionId(ctx);
+        registerChannelSnapshot(bridgeDeliverySessionId, requestId, PendingPermissionSnapshot.fromBridge(
+            bridgeDeliverySessionId, requestId, bridgeRequestId,
+            resolveToolUseId(ctx, requestId), tool.name(), input,
+            details != null ? details.description() : null,
+            details != null ? details.suggestions() : List.of(),
+            details != null ? details.blockedPath() : null,
+            renderPermissionWarning(tool, input),
+            com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                tool.name(), input),
+            System.currentTimeMillis()));
+
         Runnable unsubscribe = bridgeCallbacks.onResponse(bridgeRequestId, response -> {
             if (claimed.compareAndSet(false, true)) {
                 if ("allow".equals(response.behavior())) {
@@ -1626,6 +1666,23 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
             return;
         }
+        // [刷新重放 · 三通道] 登记 channel 通道的待审批快照（此前只重放 message 通道 ⇒
+        //   channel 通道的请求在用户刷新页面后消失）。
+        //   toolInput = 完整入参（channel 通道只推 200 字符截断预览；快照带全量 ⇒ 弹窗可渲染），
+        //   inputPreview = 截断预览（channel 通道字段名 · 与出站事件同形）。
+        String channelDeliverySessionId = owningSessionId(ctx);
+        registerChannelSnapshot(channelDeliverySessionId, requestId, PendingPermissionSnapshot.fromChannel(
+            channelDeliverySessionId, requestId, channelRequestId,
+            resolveToolUseId(ctx, requestId), tool.name(), input,
+            ChannelPermissionCallbacks.truncateForPreview(input),
+            details != null ? details.description() : null,
+            details != null ? details.suggestions() : List.of(),
+            details != null ? details.blockedPath() : null,
+            renderPermissionWarning(tool, input),
+            com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                tool.name(), input),
+            System.currentTimeMillis()));
+
         Runnable unsubscribe = channelCallbacks.onResponse(channelRequestId, response -> {
             if (claimed.compareAndSet(false, true)) {
                 if ("allow".equals(response.behavior())) {
@@ -1823,9 +1880,17 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         String sid = pendingSessionOf.remove(requestId);
         if (sid == null) return;
         Map<String, MessagePermissionRequestEvent> m = pendingBySession.get(sid);
-        if (m == null) return;
-        m.remove(requestId);
-        if (m.isEmpty()) pendingBySession.remove(sid);
+        if (m != null) {
+            m.remove(requestId);
+            if (m.isEmpty()) pendingBySession.remove(sid);
+        }
+        // [刷新重放 · 三通道] bridge / channel 快照与 message 快照同生命周期（同一 owner
+        //   requestId）⇒ 一并清除，避免用户已响应后重放里还挂着幽灵请求。
+        Map<String, List<PendingPermissionSnapshot>> cm = pendingChannelBySession.get(sid);
+        if (cm != null) {
+            cm.remove(requestId);
+            if (cm.isEmpty()) pendingChannelBySession.remove(sid);
+        }
     }
 
     /**
@@ -1848,6 +1913,66 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             return List.of();
         }
         return new ArrayList<>(m.values());
+    }
+
+    /**
+     * [刷新重放 · 三通道] 某会话当前仍在等待用户的待审批请求快照（<b>message / bridge / channel
+     * 三通道统一形状</b>）· 供 {@code GET /api/v1/sessions/{id}/state} 在切会话 / 重连（F5）时重放。
+     *
+     * <p><b>WHY</b>：权限请求本体是<b>一次性 STOMP 推送</b> —— 订阅缺失或断线期间到达的请求
+     * 永久不可见。此前只重放 message 通道 ⇒ bridge（CCR / claude.ai 式远程弹窗）/ channel
+     * （Telegram / iMessage / Discord 中继）两条通道的待审批请求在用户刷新后<b>消失</b>。
+     *
+     * <p><b>返回内容</b>：
+     * <ul>
+     *   <li>message 通道快照（{@link #listPendingForSession(String)} · 逐字段转成统一形状）；</li>
+     *   <li>bridge / channel 通道快照（owner requestId 命中 pending future 才保留 · 双保险剔除残留）。</li>
+     * </ul>
+     *
+     * <p>⚠️ 三条通道的快照<b>共用同一个 requestId</b>（同一次待审批 = 同一个 owner requestId）
+     * ⇒ 前端按 requestId 去重后只显示一个弹窗（message 快照在前、字段最全）。
+     *
+     * @param sessionId 目标会话（short id）
+     * @return 待处理请求快照列表（无 → 空列表）
+     */
+    public List<PendingPermissionSnapshot> listPendingSnapshots(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) return List.of();
+        List<PendingPermissionSnapshot> out = new ArrayList<>();
+        for (MessagePermissionRequestEvent e : listPendingForSession(sessionId)) {
+            out.add(PendingPermissionSnapshot.fromMessage(e));
+        }
+        Map<String, List<PendingPermissionSnapshot>> cm = pendingChannelBySession.get(sessionId);
+        if (cm == null) return out;
+        // 双保险：owner requestId 的 pending future 已终结 ⇒ 快照是残留，剔除（与 message 通道同规则）
+        cm.entrySet().removeIf(e -> !pending.containsKey(e.getKey()));
+        for (List<PendingPermissionSnapshot> list : cm.values()) {
+            out.addAll(list);
+        }
+        if (cm.isEmpty()) pendingChannelBySession.remove(sessionId);
+        return out;
+    }
+
+    /**
+     * [刷新重放 · 三通道] 登记一条通道（bridge / channel）的待审批快照。
+     *
+     * @param sessionId      投递会话（= teammate 请求归因到的 Leader 会话）
+     * @param ownerRequestId owner requestId（tool_use id · 与 message 快照同键 ⇒ 同生命周期）
+     * @param snapshot       通道快照
+     */
+    private void registerChannelSnapshot(String sessionId, String ownerRequestId,
+                                         PendingPermissionSnapshot snapshot) {
+        if (sessionId == null || sessionId.isBlank()
+            || ownerRequestId == null || ownerRequestId.isBlank() || snapshot == null) {
+            return;
+        }
+        pendingChannelBySession
+            .computeIfAbsent(sessionId, k -> new ConcurrentHashMap<>())
+            .computeIfAbsent(ownerRequestId, k -> new java.util.concurrent.CopyOnWriteArrayList<>())
+            .add(snapshot);
+        if (log.isInfoEnabled()) {
+            log.info("PERMISSION 通道快照登记（刷新重放）: session={} requestId={} channel={} channelRequestId={}",
+                sessionId, ownerRequestId, snapshot.channel(), snapshot.channelRequestId());
+        }
     }
 
     /**

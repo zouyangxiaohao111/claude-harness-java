@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from 'react'
 import { tasksApi, type BackgroundTaskDto } from '@/api/tasks'
 import { ApiError } from '@/api/rest'
 import { useSubagentStore } from '@/stores/subagentStore'
+import { RunMoreButton, capRunRows } from './CollapsibleGroup'
 
 /**
  * 异步任务清单面板（任务 tab 内嵌模块 · 独立组件隔离轮询）。
@@ -20,13 +21,18 @@ const TASK_STATUS_LABEL: Record<string, string> = {
   pending: '等待', running: '运行中', completed: '已完成', failed: '失败', killed: '已停止',
 }
 
-export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false, onCount }: {
+export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false, onCount, maxRows = 0, showAll = false, onToggleShowAll }: {
   activeSessionId: string | null
   showToast: (msg: string, type?: 'success' | 'info') => void
   /** 折叠分组已提供标题 → 不再渲染自身标题行 */
   hideHeader?: boolean
   /** 上报任务数给折叠组（0 → 该组折叠成一行） */
   onCount?: (n: number) => void
+  /** 最多渲染的已完成任务数（0 = 不截断 · 进行中/待运行永远全显示） */
+  maxRows?: number
+  /** 是否展开全部（由父级统一控制 · 与运行 tab 其它分组共用） */
+  showAll?: boolean
+  onToggleShowAll?: () => void
 }) {
   const [asyncTasks, setAsyncTasks] = useState<BackgroundTaskDto[]>([])
   // [D2] 上报任务数给折叠组（0 → 折叠成一行）
@@ -132,6 +138,10 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
   // running 优先排序
   const sortedTasks = [...asyncTasks].sort((a, b) =>
     (a.status === 'running' ? 0 : 1) - (b.status === 'running' ? 0 : 1))
+  // 抽屉「运行」tab：已完成任务最多 maxRows 条，进行中/待运行永远全显示
+  const { shown: shownTasks, over: tasksOver } = capRunRows(
+    sortedTasks, (t) => t.status === 'running' || t.status === 'pending', showAll, maxRows,
+  )
   const handleKillTask = async (taskId: string) => {
     try {
       const res = await tasksApi.killTask(taskId)
@@ -191,12 +201,18 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
           <button className="stop-all" onClick={() => { if (confirm('停止当前会话全部异步任务？')) void handleStopAll() }}>全部停止</button>
         </span>
       </div>}
+      {/* 抽屉里 hideHeader 不渲染标题；只要有进行中/待运行任务，就保留「停止全部」入口 */}
+      {hideHeader && sortedTasks.some((t) => t.status === 'running' || t.status === 'pending') && (
+        <div className="async-stop-all-row">
+          <button className="stop-all" onClick={() => { if (confirm('停止当前会话全部异步任务？')) void handleStopAll() }}>停止全部</button>
+        </div>
+      )}
       {/* [D2] 展开态 = 行式列表（用户 2026-10-21：按设计稿，不要三张 0 卡片） */}
       {sortedTasks.length === 0 ? (
         <div className="todo-empty">暂无异步任务</div>
       ) : (
         <div className="todo-rows">
-          {sortedTasks.map((t) => {
+          {shownTasks.map((t) => {
             const running = t.status === 'running' || t.status === 'pending'
             const statusLabel = TASK_STATUS_LABEL[t.status] ?? t.status
             const typeLabel = TASK_TYPE_LABEL[t.type] ?? t.type
@@ -204,7 +220,10 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
               <div key={t.id} className="todo-row" onClick={() => setDetail(t)} title="查看任务详情">
                 <span className={`todo-row-dot ${running ? 'in_progress' : t.status === 'completed' ? 'completed' : 'pending'}`} />
                 <span className="todo-row-main">
-                  <span className="todo-row-title">{t.description || typeLabel}</span>
+                  {/* 长命令单行截断（hover 看全）：整条命令当标题会把卡片撑成 3-4 行 */}
+                  <span className="todo-row-title one-line" title={t.description || typeLabel}>
+                    {t.description || typeLabel}
+                  </span>
                   <span className="todo-row-sub">{typeLabel} · {statusLabel}</span>
                 </span>
                 {/* 停止入口随三态弹窗删除后迁到行内（仅运行中/待运行） */}
@@ -219,6 +238,7 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
               </div>
             )
           })}
+          <RunMoreButton over={tasksOver} showAll={showAll} onToggle={() => onToggleShowAll?.()} />
         </div>
       )}
       {detail && (

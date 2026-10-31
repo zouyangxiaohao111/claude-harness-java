@@ -86,6 +86,18 @@ public class SessionService {
     @Autowired(required = false) private com.nexusai.application.agent.SessionAgentStateRegistry sessionAgentStateRegistry;
     // [Phase2 · session-file-panel-collapse-atfile] 会话删除 → 释放该会话改动文件记录（内存 + 快照落盘）
     @Autowired(required = false) private com.nexusai.application.session.SessionFilesRecorder sessionFilesRecorder;
+    // [artifact-archive 2026-10-29] 会话删除 → 清理该会话的产物归档目录
+    //   （{configHome}/artifacts/{sessionId}）。归档是本应用自己复制的交付物副本，会话没了就没有
+    //   任何入口能再访问它们 ⇒ 不清理会随会话数无界占盘。
+    //   best-effort，required=false：plain JUnit 直构 service 未注入 → null → 跳过，不阻塞删除主流程。
+    //   domain.session → application.session 单向依赖（与 sessionFilesRecorder 同向）。
+    @Autowired(required = false)
+    private com.nexusai.application.session.SessionArtifactService sessionArtifactService;
+    // [terminal 2026-10-29] 会话删除 → 关闭该会话全部集成终端（PTY 进程随后端 kill，否则常驻 JVM 会
+    //   残留 shell / dev server 子进程）。best-effort，required=false（plain JUnit 直构 service 未注入
+    //   → null → 跳过，不阻塞删除主流程）。domain.session → application.terminal 单向依赖。
+    @Autowired(required = false)
+    private com.nexusai.application.terminal.TerminalService terminalService;
     // [S1 轨 III] 会话删除 → 回收按 sessionId 键控的两处 agent 层表（DenialTracker 计数槽 /
     //   ClaudemdEngine eager-load one-shot 态）。best-effort，required=false（null → 跳过）。
     @Autowired(required = false)
@@ -537,6 +549,36 @@ public class SessionService {
         messageMapper.deleteByQuery(QueryWrapper.create().eq("session_id", id));
         sessionFileMapper.deleteByQuery(QueryWrapper.create().eq("session_id", id));
         sessionMapper.deleteById(id);
+        // [artifact-archive 2026-10-29] 会话行已删成功（上面 deleteById）→ 再清产物：先删行、再删盘。
+        //   · 先删行：V205 的 session_artifact 没有 FK 级联，不在应用层删就永久留孤儿行；
+        //   · 后删盘：行删失败仍继续删盘（副本已无任何入口可访问，留着纯占盘）；
+        //   · 相对「会话行」都是后置动作：会话行删失败会向上抛，此时不动产物（避免行还在但副本没了）。
+        //   本类是唯一会话删除入口（SessionController DELETE /{id} → 这里），
+        //   ⛔ 若将来新增批量删除端点，必须复用本方法才能保证清理。
+        //   best-effort：两个方法自身全 try/catch，这里再兜一层防未接线/意外实现。
+        if (sessionArtifactService != null) {
+            try {
+                sessionArtifactService.deleteRows(id);
+            } catch (Exception e) {
+                log.warn("[SessionService] delete: deleteRows 失败 session={}: {}", id, e.toString());
+            }
+            try {
+                sessionArtifactService.purgeSessionFiles(id);
+            } catch (Exception e) {
+                log.warn("[SessionService] delete: purgeSessionFiles 失败 session={}: {}", id, e.toString());
+            }
+        }
+        // [terminal 2026-10-29] 会话删除 → 关闭该会话的全部集成终端（PTY 进程 + 读线程）。
+        //   CC 一进程一会话，会话结束即进程退出、PTY 随进程消亡；Java 常驻 JVM 必须显式 kill，
+        //   否则每个「开过终端又删掉会话」都会残留 shell / dev server 子进程（端口占用 + 内存）。
+        //   独立 try/catch + required=false：未接线/未启动过终端 ⇒ no-op，不阻塞删 DB 主流程。
+        if (terminalService != null) {
+            try {
+                terminalService.closeSession(id);
+            } catch (Exception e) {
+                log.warn("[SessionService] delete: closeSession(terminal) 失败 session={}: {}", id, e.toString());
+            }
+        }
     }
 
     /**

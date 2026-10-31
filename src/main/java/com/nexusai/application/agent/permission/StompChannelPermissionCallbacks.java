@@ -102,9 +102,15 @@ public class StompChannelPermissionCallbacks implements ChannelPermissionCallbac
         }
         // input_preview 截断到 200 字符 — CC truncateForPreview（channelPermissions.ts:160-167），
         // phone-sized JSON 预览（Write(5KB-file) 不刷屏）。
+        // [Phase 1d] computer-use 审批面板数据：**必须由发布方直传** —— 事件里只有
+        //   inputPreview（截断到 200 字符的 JSON 串）⇒ 无法反解 resolvedApps。
+        //   数据源 = displayInput（工具入参同一实例，含 Phase 1a 就地注入的 resolvedApps）。
+        com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse =
+            com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                toolName, displayInput);
         ChannelPermissionRequestEvent event = ChannelPermissionRequestEvent.of(
             sessionId, requestId, toolName, description,
-            truncateForPreview(displayInput));
+            ChannelPermissionCallbacks.truncateForPreview(displayInput), computerUse);
         try {
             ws.convertAndSend(topicFor(sessionId), event);
             if (log.isInfoEnabled()) {
@@ -139,13 +145,7 @@ public class StompChannelPermissionCallbacks implements ChannelPermissionCallbac
         return true;
     }
 
-    /** CC truncateForPreview — JSON 预览 200 字符（channelPermissions.ts:160-167）。 */
-    private static String truncateForPreview(JsonNode input) {
-        try {
-            String s = input == null ? "" : input.toString();
-            return s.length() > 200 ? s.substring(0, 200) + "…" : s;
-        } catch (Exception e) {
-            return "(unserializable)";
-        }
-    }
+    /** CC truncateForPreview — JSON 预览 200 字符（channelPermissions.ts:160-167）。
+     *  单点实现见 {@link ChannelPermissionCallbacks#truncateForPreview(JsonNode)}（出站事件与
+     *  会话状态重放快照共用同一套截断规则 ⇒ 不会两处漂移）。 */
 }

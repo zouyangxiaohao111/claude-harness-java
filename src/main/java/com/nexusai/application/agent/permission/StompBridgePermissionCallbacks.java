@@ -82,9 +82,14 @@ public class StompBridgePermissionCallbacks implements BridgePermissionCallbacks
                 requestId);
             return;
         }
+        // [Phase 1d] computer-use 审批面板数据：非 CU 请求 ⇒ null（远程表面走普通弹窗分支）。
+        //   数据源 = displayInput（工具入参同一实例，含 Phase 1a 就地注入的 resolvedApps）。
+        com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse =
+            com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                toolName, displayInput);
         BridgePermissionRequestEvent event = BridgePermissionRequestEvent.of(
             sessionId, requestId, toolName, displayInput, toolUseId,
-            description, suggestions, blockedPath);
+            description, suggestions, blockedPath, computerUse);
         try {
             ws.convertAndSend(topicFor(sessionId), event);
             if (log.isInfoEnabled()) {

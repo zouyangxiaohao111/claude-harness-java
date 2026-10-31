@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type ReactNode } from 'react'
 import { sessionApi } from '@/api/sessions'
 import { teamsApi } from '@/api/teams'
 import { featuresApi } from '@/api/features'
@@ -16,6 +16,11 @@ interface TeamPanelProps {
   onCount?: (n: number) => void
   /** 在右栏打开该成员的对话（F2） */
   onViewMember?: (agentId: string, name: string, active: boolean) => void
+  /**
+   * 空态由父级统一渲染（抽屉视觉统一 · 用户 2026-10-28）。
+   * 参数 = 打开「创建团队」弹窗（复用现有入口，不新增业务逻辑）；仅 Agent Swarms 开启时调用。
+   */
+  renderEmpty?: (onCreate: () => void) => ReactNode
 }
 
 const PlusIcon = ({ size = 12 }: { size?: number }) => (
@@ -56,7 +61,7 @@ function tsOf(ts: string): number {
  * 数据流：sessionApi.get → teamContext（门控）→ teamsApi.get 拉详情；
  * 实时消息/状态由 useChatSocket 订阅 /topic/sessions/{leadSessionId}/team-* 写入 useTeamStore 消费。
  */
-export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, onViewMember }: TeamPanelProps) {
+export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, onViewMember, renderEmpty }: TeamPanelProps) {
   // [2026-10-23] 团队态按 lead 会话分桶：只读「当前指针指向的那个团队」的切片，
   //   其它会话的团队缓存留在 store 里（切回时不重拉、也不互相覆盖）。
   const leadSessionId = useTeamStore((s) => s.leadSessionId)
@@ -342,6 +347,8 @@ export function TeamPanel({ sessionId, showToast, hideHeader = false, onCount, o
             </div>
           )}
         </>
+      ) : agentSwarms && renderEmpty ? (
+        renderEmpty(() => setShowCreate(true))
       ) : (
         <div className="team-empty-add">
           {agentSwarms && (

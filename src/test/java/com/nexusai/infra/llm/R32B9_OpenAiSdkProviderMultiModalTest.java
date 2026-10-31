@@ -26,9 +26,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  * {@link OpenAiSdkProvider#buildSdkMessages} 的 SDK wire（与 Anthropic buildMessageParams 同构）。
  * <b>SDK 0.25.0 API 约束（grep javap 实证）</b>：
  * <ul>
- *   <li>tool 消息 content 数组仅支持 {@code ChatCompletionContentPartText} → image/document 块被跳过
- *       （受控残留 R-T-1，warn 日志）；acceptFeedback / text 块正常序列化；[IT-6] structuredOutput
- *       不再序列化（停发模型，走 structured_output attachment 通道）</li>
+ *   <li>tool 消息 content 数组仅支持 {@code ChatCompletionContentPartText} → image 块<b>无法在 tool
+ *       消息内表达</b>（受控残留 R-T-1）⇒ 改由<b>紧随的独立 role=user 承载消息</b>送达（CU 修复：
+ *       image_url part，模型侧看得到图）；document 块被跳过（warn 日志）；acceptFeedback / text 块
+ *       正常序列化；[IT-6] structuredOutput 不再序列化（停发模型，走 structured_output attachment 通道）</li>
  *   <li>user 消息无 document part → document 块跳过（受控残留 R-U-1）；image → image_url / text → text</li>
  * </ul>
  */
@@ -84,8 +85,8 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
     }
 
     @Test
-    @DisplayName("role=tool + image contentBlocks → image 块跳过（SDK 0.25.0 tool content 仅 text part · R-T-1），text 块正常渲染")
-    void roleToolWithImageBlock_imageSkipped() throws Exception {
+    @DisplayName("role=tool + image contentBlocks → tool 消息本体仅 text part（R-T-1 结构限制），image 块改由紧随的 role=user 承载消息送达（CU 修复）")
+    void roleToolWithImageBlock_carriedByUserMessage() throws Exception {
         List<JsonNode> blocks = new ArrayList<>();
         blocks.add(JSON.readTree(
             "{\"type\":\"image\",\"source\":{\"type\":\"url\",\"url\":\"http://example.com/x.png\"}}"));
@@ -96,7 +97,8 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
 
         JsonNode content = body.get("content");
         assertThat(content.isArray()).isTrue();
-        // text(content) + text(附加说明)；image_url 不得出现（R-T-1 受控残留）
+        // text(content) + text(附加说明)；image_url 不得出现在 tool 消息本体里
+        // （SDK 0.25.0 tool content 收不了 image part · R-T-1）
         assertThat(content.size()).isEqualTo(2);
         for (JsonNode part : content) {
             assertThat(part.get("type").asText())
@@ -104,6 +106,15 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
                 .isEqualTo("text");
         }
         assertThat(content.get(1).get("text").asText()).isEqualTo("附加说明");
+
+        // [CU 修复] image 块并未被丢弃：改由紧随 tool 段之后的独立 role=user 承载消息送达模型
+        JsonNode full = sdkWire(List.of(ownerOf(msg), msg));
+        assertThat(full.size()).as("assistant + tool + 承载消息 = 3 条").isEqualTo(3);
+        JsonNode carrier = full.get(2);
+        assertThat(carrier.get("role").asText()).isEqualTo("user");
+        JsonNode part = carrier.get("content").get(0);
+        assertThat(part.get("type").asText()).isEqualTo("image_url");
+        assertThat(part.get("image_url").get("url").asText()).isEqualTo("http://example.com/x.png");
     }
 
     @Test
@@ -208,12 +219,16 @@ class R32B9_OpenAiSdkProviderMultiModalTest {
      * 应答前置 assistant.tool_calls）。
      */
     private static JsonNode toolWire(ChatMessageDto toolMsg) throws Exception {
-        ChatMessageDto owner = new ChatMessageDto(
+        return sdkWire(List.of(ownerOf(toolMsg), toolMsg)).get(1);
+    }
+
+    /** 前置 owning assistant（tool_calls 含同 id）—— tool 消息协议上必须应答前置 tool_call。 */
+    private static ChatMessageDto ownerOf(ChatMessageDto toolMsg) {
+        return new ChatMessageDto(
             "asst-owner", "sess-1", Role.assistant, "assistant", "",
             null, List.of(new ToolCallDto(toolMsg.toolCallId(), "test_tool", "{}", null, false)),
             null, null, null, null, OffsetDateTime.now(), null, null,
             null, null, null);
-        return sdkWire(List.of(owner, toolMsg)).get(1);
     }
 
     /** [OpenAI-SDK 迁移] 生产 SDK wire：buildSdkMessages → ObjectMappers 序列化 JsonNode。 */

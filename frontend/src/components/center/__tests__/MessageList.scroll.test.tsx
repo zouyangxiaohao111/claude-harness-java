@@ -7,7 +7,7 @@ import { useChatStore } from '@/stores/chatStore'
 import type { ChatMessageDto } from '@/api/types'
 
 /** 复刻 App 的取数方式：messages 必须来自 store 订阅（App 传 storeMessages）——否则 prepend 后
- *  messages 首条 id 不变化，测不出「首条 id 变化触发重置」这条根因路径。 */
+ *  列表不重渲，测不出「加载更多后视图仍在原处」。 */
 const EMPTY: ChatMessageDto[] = []
 function Harness({ sid, onLoadOlder }: { sid: string; onLoadOlder: (s: string) => void }) {
   const messages = useChatStore((s) => s.messages[sid] ?? EMPTY)
@@ -18,16 +18,17 @@ function Harness({ sid, onLoadOlder }: { sid: string; onLoadOlder: (s: string) =
 }
 
 /**
- * [滚动回归·可变异验证] 「点『加载更早』后视图直接跳到底部」的根因：
- *   MessageList 原有一个 useEffect 依赖 [messages[0]?.id]（注释称「首条 id 变化 = 切换会话 → 滚到底」），
- *   而 prependMessages 把更早页 unshift 到数组头部 → messages[0].id 必然变化 → 该 effect 误触发，
- *   setTimeout(0) 的 stickBottom()（scrollTop = scrollHeight）在 loadOlderClick 的 rAF 高度补偿之后执行
- *   （宏任务晚于动画帧；即便反过来，已到底部再 += Δ 也被钳在底部）→ scrollTop 被写成 scrollHeight = 跳底。
+ * [滚动回归·累积式窗口] 两条互相抵消的老问题一起钉住（用户 2026-10-29 裁定）：
+ *   ① 「点加载更早 → 跳到底」：reset 判据曾是 `[messages[0]?.id]`，而 prepend 必然改首条 id ⇒
+ *      被当成「切会话」写 `scrollTop = scrollHeight`。现在 reset 判据是【会话身份】，prepend 不触发。
+ *   ② 「替换式滑窗把中间轮丢掉」：现在 prepend 是**累积**，已加载轮全部保留；
+ *      视口位置由「锚点行 id + rect.top 差值」补偿（⛔ 不用 scrollHeight 差值）。
  *
- *   本用例锁死修复后的不变量：点「加载更早」→ 视图【锚定】在原阅读位置（scrollTop 只按新增高度补偿，
- *   而不是跳到 scrollHeight）。若有人把依赖改回 [messages[0]?.id]，断言收到的会是 scrollHeight（跳底）→ 失败。
+ *   不变量：点「加载更多」后 scrollTop **保持不变**（既不是 0，也不是 scrollHeight），
+ *   且新旧行同时留在 DOM 里。
  *
- * jsdom 无布局引擎：手动给滚动容器定义 scrollTop/scrollHeight/clientHeight（jsdom 原生值恒 0）。
+ * jsdom 无布局引擎：手动给滚动容器定义 scrollTop/scrollHeight/clientHeight（jsdom 原生值恒 0）；
+ * rect 全为 0 ⇒ 锚点补偿差值 = 0（等价于「没有真实位移」，正是本测试要钉的「不归零、不跳底」）。
  */
 
 /** 最小 ChatMessageDto（避免每例重复造全字段）。 */
@@ -41,7 +42,7 @@ function baseMsg(id: string, role: 'user' | 'assistant', sessionId: string): Cha
   }
 }
 
-describe('MessageList 「加载更早」不跳底（根因回归）', () => {
+describe('MessageList 「加载更多」= 累积 prepend：不跳底、不归零、不丢已加载轮', () => {
   let container: HTMLDivElement
   let root: Root
   let scrollTop = 0
@@ -55,7 +56,7 @@ describe('MessageList 「加载更早」不跳底（根因回归）', () => {
     container = document.createElement('div')
     document.body.appendChild(container)
     // MessageList 的滚动容器 = streamWrapRef.current.parentElement = 本 container。
-    // scrollHeight 随消息条数增长（模拟 prepend 后内容变高）；clientHeight 固定 400 → 上滚后离底。
+    // scrollHeight 随消息条数增长（模拟 prepend 后内容变高）；clientHeight 固定 400。
     Object.defineProperty(container, 'scrollTop', { get: () => scrollTop, set: (v: number) => { scrollTop = v }, configurable: true })
     Object.defineProperty(container, 'scrollHeight', { get: () => BASE + rowCount() * PER_ROW, configurable: true })
     Object.defineProperty(container, 'clientHeight', { get: () => 400, configurable: true })
@@ -68,7 +69,7 @@ describe('MessageList 「加载更早」不跳底（根因回归）', () => {
     container.remove()
   })
 
-  it('点「加载更早」后 scrollTop = 原位置 + 新增高度（锚定），而非跳到 scrollHeight（跳底）', async () => {
+  it('点「加载更多」后 scrollTop 保持用户位置（不归零、不跳底），新旧行同时存在', async () => {
     const head = [baseMsg('a1', 'user', SID), baseMsg('a2', 'assistant', SID)]
     useChatStore.setState({
       messages: { [SID]: head }, hasMore: { [SID]: true },
@@ -80,24 +81,24 @@ describe('MessageList 「加载更早」不跳底（根因回归）', () => {
     await act(async () => {
       root.render(<Harness sid={SID} onLoadOlder={onLoadOlder} />)
     })
-    // 冲掉挂载期 effect 的 setTimeout(stickBottom)（挂载即贴底，符合预期）
+    // 冲掉挂载期 effect 的 setTimeout(贴底收敛)（挂载即贴底，符合预期）
     await act(async () => { await new Promise((r) => setTimeout(r, 20)) })
 
-    // 模拟用户上滚到历史位置：scrollTop=100，且派发 scroll 事件让 nearBottomRef=false（离底 500px > 阈值 60）
+    // 模拟用户上滚：scrollTop=100，派发 scroll 让 nearBottomRef=false（离底 500px > 阈值 60）
     scrollTop = 100
     await act(async () => { container.dispatchEvent(new Event('scroll')) })
-    const prevH = container.scrollHeight // = 800 + 2*100 = 1000
 
-    // 点顶部「加载更早」→ loadOlderClick：记录 prevH → onLoadOlder(prepend) → rAF 补 scrollTop += Δ
     const btn = container.querySelector('.ml-load-older') as HTMLButtonElement | null
     expect(btn).not.toBeNull()
     await act(async () => { btn!.click(); await new Promise((r) => setTimeout(r, 40)) })
 
-    // 不变量：锚定在原阅读位置（100 + 新增高度 2*100 = 300），而【不是】跳到底部 scrollHeight = 1200
-    expect(scrollTop).toBe(100 + (container.scrollHeight - prevH))
-    expect(scrollTop).toBe(300)
+    // 不变量：用户位置保持 100；既不是跳到底（scrollHeight=800+4*100=1200），也不是被归零（替换式旧行为）
+    expect(scrollTop).toBe(100)
     expect(scrollTop).not.toBe(container.scrollHeight)
-    // 更早页确实并入窗口（修复不得以牺牲「加载更早」功能为代价）
+    expect(scrollTop).not.toBe(0)
+    // 累积断言：更早页并入 store，且旧行仍留在 DOM（没有被替换式窗口卸载）
     expect(useChatStore.getState().messages[SID]?.some((m) => m.id === 'h1')).toBe(true)
+    expect(container.querySelector('[data-msg-id="h1"]')).not.toBeNull()
+    expect(container.querySelector('[data-msg-id="a1"]')).not.toBeNull()
   })
 })

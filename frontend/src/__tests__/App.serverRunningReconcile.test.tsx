@@ -43,7 +43,7 @@ vi.mock('@/api/chat', () => ({
   chatApi: {
     sessionRunning: vi.fn(() => new Promise(() => {})),   // 默认永不返回：本文件只驱动 store 边沿
     messageCount: vi.fn(async () => ({ total: 0 })),
-    listMessagesPage: vi.fn(async () => ({ messages: [], hasMore: false, total: 0 })),
+    listTurns: vi.fn(async () => ({ messages: [], hasMore: false, firstTurnId: null, lastTurnId: null })),
     listMessages: vi.fn(async () => []),
     fetchImagesBatch: vi.fn(async () => ({})),
     send: vi.fn(async () => ({ queued: false, userMessageId: 'msg-user-sent', streamTopic: '/topic/sessions/sess-app-reconcile/stream' })),

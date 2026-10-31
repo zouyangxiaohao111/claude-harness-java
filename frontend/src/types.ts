@@ -120,7 +120,7 @@ export interface Toast {
 export type ThemeMode = 'light' | 'dark' | 'auto'
 export type FontSize = 'small' | 'medium' | 'large'
 
-export type RightTab = 'files' | 'tasks' | 'projects'
+export type RightTab = 'files' | 'tasks' | 'projects' | 'terminal'
 
 /** Settings navigation tabs (P2 expands from 4 → 8). */
 export type SettingsTab =

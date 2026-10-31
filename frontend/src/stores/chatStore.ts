@@ -1,8 +1,7 @@
 import { create } from 'zustand'
-import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate } from '../api/types'
+import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate, ComputerUseApproval } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
-import { capTailTurns } from './messageTurns'
 
 /**
  * [snip-persist] 从消息列表解析 snip_boundary 的 {@code snipMetadata.removedUuids}（合并去重）。
@@ -26,15 +25,16 @@ export function collectRemovedUuids(msgs: ChatMessageDto[] | null | undefined): 
   return Array.from(new Set(ids))
 }
 
-// ── [有界窗口] messages[sessionId] 窗口上限 = 最近 MESSAGE_WINDOW_TURNS 个【对话轮】──
-// 沿革：原实现 messages 只增不减（finalizeBlocks / appendMetaUser / addToolUseSummary / expirePermission
-//   四条追加路径无一裁剪）→ 长会话下无限涨（WebView2 renderer 实测 1.2GB）。先补了「按条裁 300」，
-//   但用户实测「窗口没遵循 50、随对话不断增大」—— 因为 300 条远大于 50，且一旦点过「加载更早」，
-//   extendedWindow 会让上限【永久】变成 500 条（该键只在删会话时清）。
-// 现语义（用户 2026-09-23 裁定）：窗口 = **最近 50 个对话轮**（user+assistant 记一轮；tool 行 / 纯 meta
-//   行不计轮），新消息进来即从头部挤出最老的一轮（LRU）→ 挤出的**真卸载**出 store，回看时由顶部
-//   「加载更早」重新向服务端拉。轮判据的**唯一真源**在 ./messageTurns（与 MessageList 渲染分组同源）。
-export const MESSAGE_WINDOW_TURNS = 50
+// ── [折叠显示 · 不再丢弃] 追加路径**不裁剪**已加载轮 ──
+// 沿革：早先为控内存做过「追加时按轮 LRU 从头部挤出最老一轮」，挤出的轮**真卸载**出 store（回看要重新
+//   向服务端拉）。用户 2026-10-29 裁定推翻该语义：「不应该挤掉而是折叠显示」——
+//   ① 已加载的轮**永不因为新消息而消失**（store 只增不减，本文件所有追加路径一律不裁剪）；
+//   ② 早于「默认展开窗口」的轮由渲染层（components/center/MessageList.tsx 的折叠行）**折叠成一行**
+//      「已折叠 N 轮对话（点击展开）」，折叠态不渲染 DOM，点击后本地展开（不发请求）；
+//   ③ F5 / 打开会话仍由 App 首屏 listTurns({turns:3}) 决定初始窗口 ⇒ 刷新后自然回到默认 3 轮。
+// ⚠️ 内存代价用户已知情接受：单会话内消息数组不再有上界。capTailTurns（./messageTurns）保留为通用工具，
+//   ⛔ 但追加路径不得再用它删数据。
+
 
 // [图片缓存有界] 每会话图片缓存条数上限。base64 图（缩略图/粘贴图）单条可达数百 KB～数 MB，
 //   原实现只合并 {...old, ...new} 从不删、无上限 → 删了会话图片仍驻留。按会话封顶，超出按
@@ -92,6 +92,10 @@ export interface StreamBlock {
   /** 所属 flow 的用户消息 id（chunk 事件透传 · 前端按此分组锚定消息链，工具轮挂主气泡下） */
   userMessageId?: string | null
   reasoning: string
+  /** 首次收到 reasoning chunk 的墙钟时间（ms）· 流式思考耗时起点（仅用于完成态展示） */
+  reasoningStartedAt?: number | null
+  /** 最后一个 reasoning chunk 的时间（ms）· null = 尚未结束（仍在思考） */
+  reasoningEndedAt?: number | null
   content: string
   /** 工具卡片（回放推 tool_call 挂入 · 契约 #6；arguments 已在前端 JSON.stringify 转字符串） */
   toolCalls: ToolCallDto[]
@@ -156,11 +160,21 @@ export interface PermissionRequestItem {
   /** 一键授权建议（后端 PermissionPromptDetails.suggestions）· 弹窗按 destination 渲染第三档，
    *  点选后**原样**回传 updatedPermissions（前端不做结构转换）。空/缺省 → 不渲染第三档。 */
   suggestions?: PermissionUpdate[] | null
+  /**
+   * 桌面控制授权载荷（后端算好的应用清单 + 授权范围文案 + 被请求的额外能力）。
+   * null/缺省 ⇒ 不是桌面控制请求（走普通 allow/deny 分支）。
+   *
+   * <p>⭐ 本字段在 `toPermissionItem`（useChatSocket.ts）里手抄 —— 那里是**手写字段清单**，
+   * 漏抄**没有任何编译期约束**，且补拉路径与实时路径**共用**它 ⇒ 症状 = 切会话 / F5 后
+   * 授权范围消失。改这份清单时务必同步抄本字段（已有单测锁死，见
+   * front/src/api/__tests__/computerUseApproval.test.ts 与 useChatSocket.pendingReplay.test.tsx）。
+   */
+  computerUse?: ComputerUseApproval | null
 }
 
 export interface ChatState {
   sessions: SessionDto[]
-  messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息（有界窗口：尾页 + 向上 prepend，created_at 序）
+  messages: Record<string, ChatMessageDto[]>          // sessionId -> 历史消息（首屏尾页 + prepend 更早页 + 本地追加；created_at 序，只增不裁）
   /** [window-paging] 会话是否有更早历史（GET /messages/page hasMore · 列表顶部「加载更早」按钮显隐） */
   hasMore: Record<string, boolean>
   /** [trace-count] 会话消息总数（GET /messages/page total · DB sessions.messageCount 非 meta 口径）· 轨迹 tab 徽标全量 */
@@ -213,13 +227,13 @@ export interface ChatState {
   /** 会话 token/金额汇总实时更新（complete 事件 → 覆盖会话累计 · 底部 footer 展示） */
   updateSessionUsage: (sessionId: string, usage: { totalCostYuan?: number | null; totalTokens?: number | null }) => void
   setMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
-  /** [有界窗口] 尾部【追加】消息并裁剪（保留最近 N 个对话轮，整轮裁剪）。凡「在既有消息后接新消息」一律
-   *  走本方法，不要自行 `setMessages([...prev, ...new])` —— 那条路绕过裁剪、是内存无界的漏洞口。
-   *  与 setMessages 的区别：setMessages = 服务端整表替换（有界，头部可能是 compact 摘要，不裁剪）；
-   *  appendMessages = 本地追加（无界，必须裁剪，头部最老的先走）。 */
+  /** [折叠显示 · 不再丢弃] 尾部【追加】消息（**不裁剪、不丢弃任何已加载轮**）。凡「在既有消息后接新消息」
+   *  一律走本方法，不要自行 `setMessages([...prev, ...new])`（那条路会绕过 snippedIds 解析等口径）。
+   *  与 setMessages 的区别：setMessages = 服务端整表替换（App 首屏 / 重拉）；
+   *  appendMessages = 本地追加（只增，折叠由渲染层负责 —— 见 MessageList 的折叠行）。 */
   appendMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
   /** [sm-boundary-reload] 服务端插入行（STOMP message.insert 事件 · 压缩 boundary 行落库即推）：
-   *  **id 幂等**（同 id 已存在 → 跳过）+ 插列表尾 + 有界窗口。与收尾重拉（setMessages 整表替换）
+   *  **id 幂等**（同 id 已存在 → 跳过）+ 插列表尾。与收尾重拉（setMessages 整表替换）
    *  天然收敛 —— 同 id 覆盖/跳过，不产生重复行（对齐 addStopHookSummary 的幂等插入语义）。 */
   insertServerMessages: (sessionId: string, rows: ChatMessageDto[]) => void
   /** [snip-persist] 合并被裁剪消息 id（STOMP message.boundary 实时 → 会话 snippedIds） */
@@ -363,15 +377,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       const merged = Array.from(new Set([...(st.snippedIds[sessionId] ?? []), ...boundaryIds]))
       snippedIds = { ...st.snippedIds, [sessionId]: merged }
     }
-    // [有界窗口] setMessages 是【整表替换】而非追加路径：数据源是服务端尾页(≤50)或 partial-compact /
-    //   trim 的归一化结果，头部可能是 compact 摘要/boundary 标记，头部裁剪会误删「已压缩」标记 →
-    //   故此处【不裁剪】。凡本地「往尾部接消息」一律改用 appendMessages（见下），二者分工明确。
+    // setMessages 是【整表替换】而非追加路径：数据源是 App 首屏 / 重拉（最近 3 轮）或 partial-compact /
+    //   trim 的归一化结果，头部可能是 compact 摘要/boundary 标记 → 整表照收、不做任何裁剪。
+    //   凡本地「往尾部接消息」一律改用 appendMessages（见下），二者分工明确。
     return { messages: { ...st.messages, [sessionId]: msgs }, snippedIds }
   }),
-  // [有界窗口] 本地尾部追加 → 统一走 capTail（保留最近 N 个对话轮，整轮裁剪）。这是 App 三条追加路径
-  //   （queue.drained 排队气泡 / away-summary 回插 / 发送成功乐观 user 气泡）的唯一入口：它们原先各自
-  //   `setMessages([...prev, new])` 绕过了 setMessages 的不裁剪设计 → 其中 away-summary 由 blur 触发、
-  //   不保证随后有 finalize 兜底，在会话生命周期内只增不减（内存无界漏洞）。收敛到本方法根治。
+  // [折叠显示 · 不再丢弃] 本地尾部追加：**只增不裁**。这是 App 三条追加路径
+  //   （queue.drained 排队气泡 / away-summary 回插 / 发送成功乐观 user 气泡）的唯一入口。
+  //   ⛔ 不在这里删最老轮 —— 用户 2026-10-29 裁定「不应该挤掉而是折叠显示」，折叠由渲染层实现。
   appendMessages: (sessionId, msgs) => set((st) => {
     if (!msgs?.length) return st
     // [排队行序] 本轮正在流式（queue.drained 消费排队消息就会走到这里）→ 盖流式区到达号，
@@ -379,12 +392,12 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const { rows, liveSeq } = stampLiveRows(st, sessionId, msgs)
     const prev = st.messages[sessionId] ?? []
     return {
-      messages: { ...st.messages, [sessionId]: capTailTurns([...prev, ...rows], MESSAGE_WINDOW_TURNS) },
+      messages: { ...st.messages, [sessionId]: [...prev, ...rows] },
       liveSeq,
     }
   }),
   // [sm-boundary-reload] 服务端插入行（message.insert 事件 = 压缩 boundary 行落库即推）：id 幂等 +
-  //   插列表尾 + 有界窗口。⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）。
+  //   插列表尾（只增不裁）。⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）。
   //   与重拉（setMessages 整表替换）天然收敛：同 id 跳过，不产生重复行。
   insertServerMessages: (sessionId, rows) => set((st) => {
     const msgs = st.messages[sessionId] ?? []
@@ -394,9 +407,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // 插列表尾（当前点）：boundary 行落库即最新时序，非 flow 锚定（无 userMessageId 归属）
     // [排队行序] 落库即推的行同样按「到达时刻」定位（本轮流式中到达 → 排在已输出内容之后）
     const stamped = stampLiveRows(st, sessionId, fresh)
-    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    // [折叠显示 · 不再丢弃] 追加路径只增不裁（早先轮由渲染层折叠，不在这里删）
     return {
-      messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, ...stamped.rows], MESSAGE_WINDOW_TURNS) },
+      messages: { ...st.messages, [sessionId]: [...msgs, ...stamped.rows] },
       liveSeq: stamped.liveSeq,
     }
   }),
@@ -472,6 +485,20 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   })),
   ensureStreamBlock: (sessionId, assistantMessageId, userMessageId) => set((st) => {
     const blocks = st.streams[sessionId]
+    const orderIds = st.streamOrder[sessionId] ?? []
+    // [2026-10-29 重复渲染根因] 幂等判据必须是「**任意位置**已存在」，不能只看最后一块：
+    //   最新轮递增时，同一 assistantMessageId 的 chunk 可能在「中间又建了新块」之后再次到达
+    //   （last 已不是它）⇒ 旧实现会再 push 一个同 id ⇒ streamOrder 出现重复 id
+    //   ⇒ 渲染两行同 key：多个 `N nexus`、思考块点击状态丢失（点开立刻被重建回去）。
+    if (orderIds.includes(assistantMessageId)) {
+      const bi = (blocks ?? []).findIndex((b) => b.assistantMessageId === assistantMessageId)
+      if (bi >= 0 && !blocks![bi].userMessageId && userMessageId) {
+        const next = [...(blocks ?? [])]
+        next[bi] = { ...next[bi], userMessageId }
+        return { streams: { ...st.streams, [sessionId]: next } }
+      }
+      return st
+    }
     const last = blocks && blocks.length > 0 ? blocks[blocks.length - 1] : undefined
     console.debug('[esb]', { blockId: assistantMessageId?.slice(0, 12), uid: userMessageId, existing: last?.assistantMessageId?.slice(0, 12), existingUid: last?.userMessageId })
     if (last && last.assistantMessageId === assistantMessageId) {
@@ -492,12 +519,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const n = (st.liveSeq[sessionId] ?? 0) + 1
     const nb: StreamBlock = {
       assistantMessageId, userMessageId: userMessageId ?? null, reasoning: '', content: '', toolCalls: [],
+      // [思考耗时] 未开始思考 → 起止皆 null（首片 reasoning 记起点，正文/工具到达补终点）
+      reasoningStartedAt: null, reasoningEndedAt: null,
       renderSeq: LIVE_SEQ_BASE + n,
     }
-    const ids = st.streamOrder[sessionId] ?? []
     return {
       streams: { ...st.streams, [sessionId]: [...(blocks ?? []), nb] },
-      streamOrder: { ...st.streamOrder, [sessionId]: [...ids, assistantMessageId] },
+      streamOrder: { ...st.streamOrder, [sessionId]: [...orderIds, assistantMessageId] },
       liveSeq: { ...st.liveSeq, [sessionId]: n },
     }
   }),
@@ -507,7 +535,12 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const idx = blocks.map((b) => b.assistantMessageId).lastIndexOf(assistantMessageId)
     if (idx < 0) return st
     const next = [...blocks]
-    next[idx] = { ...next[idx], content: next[idx].content + delta }
+    const cur = next[idx]
+    next[idx] = {
+      ...cur, content: cur.content + delta,
+      // [思考耗时] 正文开始 = 思考阶段结束：仅在「已有思考且尚未收口」时补终点（不覆盖首片已记的值）
+      reasoningEndedAt: cur.reasoning !== '' && cur.reasoningEndedAt == null ? Date.now() : cur.reasoningEndedAt,
+    }
     return {
       streams: { ...st.streams, [sessionId]: next },
       streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
@@ -519,7 +552,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const idx = blocks.map((b) => b.assistantMessageId).lastIndexOf(assistantMessageId)
     if (idx < 0) return st
     const next = [...blocks]
-    next[idx] = { ...next[idx], reasoning: next[idx].reasoning + reasoning }
+    // [思考耗时] 首片记起点、每片刷「最近一次思考活动」；终点由正文/工具到达时补齐（见 appendChunk/addToolCall）
+    const now = Date.now()
+    const cur = next[idx]
+    next[idx] = {
+      ...cur, reasoning: cur.reasoning + reasoning,
+      reasoningStartedAt: cur.reasoningStartedAt ?? now, reasoningEndedAt: now,
+    }
     return {
       streams: { ...st.streams, [sessionId]: next },
       streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
@@ -533,7 +572,12 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const idx = blocks.map((b) => b.assistantMessageId).lastIndexOf(assistantMessageId)
     if (idx < 0) return st
     const next = [...blocks]
-    next[idx] = { ...next[idx], toolCalls: [...next[idx].toolCalls, tool] }
+    const cur = next[idx]
+    next[idx] = {
+      ...cur, toolCalls: [...cur.toolCalls, tool],
+      // [思考耗时] 工具调用到达 = 思考阶段结束（同上：仅补一次，不覆盖已有值）
+      reasoningEndedAt: cur.reasoning !== '' && cur.reasoningEndedAt == null ? Date.now() : cur.reasoningEndedAt,
+    }
     return { streams: { ...st.streams, [sessionId]: next } }
   }),
   fillToolResult: (sessionId, toolCallId, result, isError) => set((st) => {
@@ -646,8 +690,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const { [sessionId]: _drop, ...rest } = st.streams
     const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
-    // [有界窗口] 块转消息是追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
-    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: capTailTurns(ordered, MESSAGE_WINDOW_TURNS) } }
+    // [折叠显示 · 不再丢弃] 块转消息是追加路径 → 只增不裁（折叠由渲染层负责）
+    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: ordered } }
   }),
   clearStream: (sessionId) => set((st) => {
     const { [sessionId]: _drop, ...rest } = st.streams
@@ -665,14 +709,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const msgs = st.messages[sessionId] ?? []
     return {
       permissionQueue: st.permissionQueue.filter(r => r.requestId !== requestId),
-      // [有界窗口] 超时留痕也是追加路径 → 统一裁剪
-      messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, {
+      // [折叠显示 · 不再丢弃] 超时留痕也是追加路径 → 只增不裁
+      messages: { ...st.messages, [sessionId]: [...msgs, {
         id: `perm-${requestId}`, sessionId, role: 'system', author: 'system',
         content: `工具 ${req.toolName} 请求权限，已超时（自动拒绝）`,
         reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null,
         reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null, subtype: 'permission_timeout',
         isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null,
-      }], MESSAGE_WINDOW_TURNS) },
+      }] },
     }
   }),
   setRetry: (retry) => set({ retry }),
@@ -716,9 +760,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     // [排队行序] 本轮有实时块 → 同 appendMessages 盖流式区到达号（busy 排队 message.user 走这里）
     const stamped = stampLiveRows(st, sessionId, [metaMsg])
-    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
+    // [折叠显示 · 不再丢弃] 追加路径只增不裁
     return {
-      messages: { ...st.messages, [sessionId]: capTailTurns([...msgs, ...stamped.rows], MESSAGE_WINDOW_TURNS) },
+      messages: { ...st.messages, [sessionId]: [...msgs, ...stamped.rows] },
       liveSeq: stamped.liveSeq,
     }
   }),
@@ -743,8 +787,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const next = [...msgs]
     next.splice(insertAt, 0, summaryRow)
-    // [有界窗口] 追加路径 → 统一裁剪（保留最近 N 个对话轮，整轮裁剪）
-    return { messages: { ...st.messages, [sessionId]: capTailTurns(next, MESSAGE_WINDOW_TURNS) } }
+    // [折叠显示 · 不再丢弃] 追加路径只增不裁
+    return { messages: { ...st.messages, [sessionId]: next } }
   }),
   // [P2-15] Stop hook 摘要实时行（/topic/tasks 事件）：元数据型内容（hook 计数/错误/阻止原因）→
   //   行内挂 payload（不是正文），MessageList 走独立摘要行渲染分支（不得当普通气泡）。
@@ -771,7 +815,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const next = [...msgs]
     next.splice(insertAt, 0, row)
-    return { messages: { ...st.messages, [sessionId]: capTailTurns(next, MESSAGE_WINDOW_TURNS) } }
+    // [折叠显示 · 不再丢弃] 追加路径只增不裁
+    return { messages: { ...st.messages, [sessionId]: next } }
   }),
   setHasMore: (sessionId, hasMore) => set((st) => ({
     hasMore: { ...st.hasMore, [sessionId]: hasMore },
@@ -790,9 +835,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       : st.snippedIds
     // 头部 unshift：older 更早 → 拼在 existing 前保持 created_at 时序（overlap id 以 existing 为准）
     const merged = fresh.length === 0 ? existing : [...fresh, ...existing]
-    // [窗口=最近 50 轮] prepend 是【用户显式行为】，此处**不施加轮窗口裁剪** ——
-    //   若这里也按 50 轮裁，刚加载的更早页会被同一次裁剪立刻舍掉，按钮点了等于没反应。
-    //   窗口收敛交给追加路径（append 类）：下一条新消息进来时按 50 轮从头部挤出最老的一轮（LRU）。
+    // prepend 是【用户显式行为】，此处**不施加任何轮窗口裁剪** —— 更早页原样进窗口头部。
+    //   [折叠显示 · 不再丢弃] 追加路径同样不裁（见本文件头注释）：已加载的轮只增不减，
+    //   「默认只显示最近 3 轮」由渲染层的折叠行表达（MessageList）。
     return {
       messages: { ...st.messages, [sessionId]: merged },
       snippedIds,

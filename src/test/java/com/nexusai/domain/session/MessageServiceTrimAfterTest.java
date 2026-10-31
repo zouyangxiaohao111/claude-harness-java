@@ -11,6 +11,7 @@ import com.nexusai.repository.session.mapper.ToolCallMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.OffsetDateTime;
@@ -21,23 +22,26 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
-import org.mockito.ArgumentCaptor;
 import static org.mockito.Mockito.times;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
- * [gap28] MessageService.trimSessionAfter 意图测试 · 对话裁剪（删 pivot 起全部后续消息）。
+ * [gap28 · 性能改造] MessageService.trimSessionAfter 意图测试 · 对话裁剪（删 pivot 起全部后续消息）。
  *
  * <p><b>WHY（CLAUDE.md 规则九）</b>: CC rewindConversationTo（REPL.tsx:3661-3699）在<b>前端内存</b>
  * {@code setMessages(prev.slice(0, messageIndex))} 裁剪 —— Java 无前端内存，裁剪必须落 DB
  * （模型上下文来自 DB transcript，LlmAgentLoop 经 listRawForTranscript 加载），本方法即 DB 等价物。
- * 变异点：
+ *
+ * <p><b>本次改造</b>: 由「全量读出 + 逐条重插」（O(N)）改为「定位 seq + 区间删除」（O(log N) + DELETE），
+ * 语义（删哪些 / 留哪些 / 轮序）必须<b>逐条等价</b>。变异点：
  * <ul>
  *   <li>删 pivot 区间错误（保留 pivot 而非丢弃）→ 模型上下文含 pivot → 红</li>
- *   <li>pivot 定位跨会话误匹配（用 getById 而非当前会话列表）→ 错删另一会话消息 → 红</li>
+ *   <li>pivot 定位跨会话误匹配（用 getById 而非限定 session_id）→ 错删另一会话消息 → 红</li>
  *   <li>pivot / session 不存在静默返回 → 前端无法区分「已删」与「未删」→ 红</li>
  *   <li>tool_calls 未级联清 → 孤儿 tool_call 残留 → 红</li>
+ *   <li>区间谓词漏掉 {@code seq IS NULL} → NULL 行（读侧 NULLS LAST 排在 pivot 之后）残留 → 红</li>
+ *   <li>退回「删全表 + 重插」（保留段被重写）→ 会话万级消息时裁剪要跑数十秒 → 红（本用例断言不重插）</li>
  * </ul>
  */
 class MessageServiceTrimAfterTest {
@@ -56,13 +60,17 @@ class MessageServiceTrimAfterTest {
         ReflectionTestUtils.setField(service, "messageMapper", messageMapper);
         ReflectionTestUtils.setField(service, "sessionMapper", sessionMapper);
         ReflectionTestUtils.setField(service, "toolCallMapper", toolCallMapper);
-        // session 存在（listRawForTranscript / replaceSessionMessages 双重校验共用）
+        // session 存在（session 校验）
         when(sessionMapper.selectOneById(any())).thenReturn(new SessionRecord());
-        // 每条消息 toDto 的 tool_calls 查询 → 空（简化）
+        // 每条消息 toDto 的 tool_calls 查询 → 空（慢路径兜底用例才需要）
         when(toolCallMapper.selectListByQuery(any())).thenReturn(List.of());
     }
 
     private static MessageRecord message(String id, String sessionId, String content) {
+        return message(id, sessionId, content, null);
+    }
+
+    private static MessageRecord message(String id, String sessionId, String content, Long seq) {
         MessageRecord m = new MessageRecord();
         m.setId(id);
         m.setSessionId(sessionId);
@@ -76,58 +84,76 @@ class MessageServiceTrimAfterTest {
         m.setInputTokens(null);
         m.setOutputTokens(null);
         m.setCreatedAt(OffsetDateTime.now().toString());
+        m.setSeq(seq);
         return m;
     }
 
-    private void givenMessages(List<MessageRecord> records) {
-        when(messageMapper.selectListByQuery(any())).thenReturn(records);
+    /** pivot 定位命中（一次查询取 seq） */
+    private void givenPivot(MessageRecord pivot) {
+        when(messageMapper.selectOneByQuery(any())).thenReturn(pivot);
     }
 
     @Test
-    @DisplayName("trimSessionAfter 删 pivot 起全部（含 pivot）→ 返回 pivot 之前消息，DB 全量替换")
-    void trim_keepsBeforePivot() {
-        // WHY: CC slice(0, messageIndex)（REPL.tsx:3671）保留 pivot 之前、丢弃 pivot（含）及其后。
-        //   变异点：保留 pivot 本身 → 返回列表多一条 → 红。
-        givenMessages(List.of(
-            message("m1", "sess-1", "第一问"),
-            message("m2", "sess-1", "第二问"),
-            message("m3", "sess-1", "第三问")));
+    @DisplayName("裁剪 = 区间删除（seq >= pivot ∪ seq IS NULL）：不再全量重写，返回删掉的条数")
+    void trim_deletesRangeWithoutRewrite() {
+        // WHY: 改造前是「全量读出 + 删全表 + 逐条重插」——会话 2.5 万条消息时该 DELETE 要跑数秒到
+        //   数十秒，前端「编辑重发」卡在「发送中」。变异点：改回全量重写 → 本用例的
+        //   「零 insert + 区间 DELETE 谓词」断言红。
+        givenPivot(message("m2", "sess-1", "第二问", 200L));
+        when(messageMapper.deleteByQuery(any())).thenReturn(2);
 
-        List<ChatMessageDto> kept = service.trimSessionAfter("sess-1", "m2");
+        int deleted = service.trimSessionAfter("sess-1", "m2");
 
-        // 保留 [m1]，丢弃 [m2, m3]
-        assertThat(kept).hasSize(1);
-        assertThat(kept.get(0).id()).isEqualTo("m1");
-        // 走「删全部 + 重插」路径（replaceSessionMessages）——tool_calls 显式级联清除。
-        //   ⚠️ [裁剪 bug] tool_calls 表无 session_id 列（V1：id/message_id/...），必须按 message_id
-        //   IN (该 session 的 messages.id) 子查询删，不能 eq("session_id")（SQLITE_ERROR no such column）。
+        assertThat(deleted).as("返回本次裁掉的消息条数（pivot 起全部，含 pivot 自身）").isEqualTo(2);
+        // 保留段<b>原地保留</b>：不重插任何消息（改造前会 insert N 条）
+        verify(messageMapper, never()).insert(any(MessageRecord.class));
+        // 区间 DELETE 谓词：pivot 及其后 = {seq >= pivotSeq} ∪ {seq IS NULL}
+        //   （seq IS NULL 必须在内：读侧 seq ASC NULLS LAST ⇒ NULL 行恒在 pivot 之后）
+        ArgumentCaptor<QueryWrapper> msgCaptor = ArgumentCaptor.forClass(QueryWrapper.class);
+        verify(messageMapper).deleteByQuery(msgCaptor.capture());
+        String msgSql = String.valueOf(msgCaptor.getValue().toSQL());
+        assertThat(msgSql)
+            .as("区间删除谓词必须含 seq >= 边界与 seq IS NULL 两段")
+            .contains("seq >=")
+            .contains("IS NULL");
+        assertThat(msgSql)
+            .as("区间删除必须限定 session_id（不得跨会话删）")
+            .contains("session_id =");
+    }
+
+    @Test
+    @DisplayName("tool_calls 子表随区间一并清理（按 message_id 子查询，tool_calls 表无 session_id 列）")
+    void trim_cleansToolCalls() {
+        // WHY: tool_calls 是唯一以 message_id 为外键的子表（V1 schema）。不显式清 → 孤儿 tool_call
+        //   残留（FK CASCADE 需 PRAGMA foreign_keys=on 才生效，显式删更稳，与 replaceSessionMessages
+        //   口径一致）。变异点：不删 tool_calls / 按 session_id 删（该列不存在 → SQLITE_ERROR）→ 红。
+        givenPivot(message("m2", "sess-1", "第二问", 200L));
+        when(messageMapper.deleteByQuery(any())).thenReturn(2);
+
+        service.trimSessionAfter("sess-1", "m2");
+
         ArgumentCaptor<QueryWrapper> tcCaptor = ArgumentCaptor.forClass(QueryWrapper.class);
         verify(toolCallMapper).deleteByQuery(tcCaptor.capture());
         String tcSql = String.valueOf(tcCaptor.getValue().toSQL());
         assertThat(tcSql)
             .as("tool_calls 删除必须经 message_id 子查询（无 session_id 列）")
             .contains("message_id IN (SELECT id FROM messages WHERE session_id =");
-        // 裸删 "DELETE FROM tool_calls WHERE session_id = ?"（无子查询）→ no such column 500
-        assertThat(tcSql.trim())
-            .as("不得直接按 tool_calls.session_id 删（该列不存在）")
-            .doesNotStartWith("DELETE FROM  WHERE session_id");
-        verify(messageMapper).deleteByQuery(any());
-        // 仅重插保留段（1 条）
-        verify(messageMapper, times(1)).insert(any(MessageRecord.class));
+        assertThat(tcSql)
+            .as("tool_calls 的删除范围必须与消息删除范围一致（含 seq IS NULL 段）")
+            .contains("seq >=")
+            .contains("IS NULL");
     }
 
     @Test
-    @DisplayName("pivot 是首条 → 返回空列表（全删，语义 = CC slice(0,0)）")
-    void trim_pivotFirst_returnsEmpty() {
-        // WHY: 裁剪到第一条消息 → 之前无消息 → 空列表（前端 setMessages([])）。
-        //   变异点：返回非空 / 抛异常 → 前端无法展示空会话 → 红。
-        givenMessages(List.of(
-            message("m1", "sess-1", "第一问"),
-            message("m2", "sess-1", "第二问")));
+    @DisplayName("pivot 是首条 → 区间删除覆盖全会话（谓词以 pivot 的 seq 为下界，条数 = 全删）")
+    void trim_pivotFirst_deletesAll() {
+        // WHY: 裁剪到第一条消息 → 之前无消息 → 全删（CC slice(0,0)）。变异点：保留首条 → 红。
+        givenPivot(message("m1", "sess-1", "第一问", 100L));
+        when(messageMapper.deleteByQuery(any())).thenReturn(3);
 
-        List<ChatMessageDto> kept = service.trimSessionAfter("sess-1", "m1");
+        int deleted = service.trimSessionAfter("sess-1", "m1");
 
-        assertThat(kept).isEmpty();
+        assertThat(deleted).isEqualTo(3);
         verify(messageMapper, never()).insert(any(MessageRecord.class));
     }
 
@@ -136,12 +162,13 @@ class MessageServiceTrimAfterTest {
     void trim_pivotMissing_throwsNotFound() {
         // WHY: 前端需区分「已删」与「没删成」；pivot 不存在静默返回会掩盖前端误传。
         //   变异点：未抛 → 前端当成功处理 → 红。
-        givenMessages(List.of(message("m1", "sess-1", "第一问")));
+        givenPivot(null);
 
         assertThatThrownBy(() -> service.trimSessionAfter("sess-1", "ghost"))
             .isInstanceOf(NotFoundException.class)
             .hasMessageContaining("ghost");
         verify(messageMapper, never()).deleteByQuery(any());
+        verify(toolCallMapper, never()).deleteByQuery(any());
     }
 
     @Test
@@ -153,57 +180,53 @@ class MessageServiceTrimAfterTest {
         assertThatThrownBy(() -> service.trimSessionAfter("ghost-session", "m1"))
             .isInstanceOf(NotFoundException.class)
             .hasMessageContaining("ghost-session");
-        verify(messageMapper, never()).selectListByQuery(any());
+        verify(messageMapper, never()).deleteByQuery(any());
+        verify(messageMapper, never()).selectOneByQuery(any());
     }
 
     @Test
-    @DisplayName("pivot 必须命中当前会话消息列表（跨会话同 id 不误删）")
+    @DisplayName("pivot 必须命中当前会话消息（跨会话同 id 不误删：定位查询限定 session_id）")
     void trim_pivotOnlyMatchesCurrentSession() {
-        // WHY: pivot 定位用当前会话列表（listRawForTranscript :59-71）而非 getById —— 消息 id 可能跨会话
-        //   重复，getById 会命中另一会话消息 → 错删。变异点：改用 getById → 本会话 pivot 不存在却
-        //   定位成功（/ 或错误删除）→ 红。
-        givenMessages(List.of(message("m1", "sess-1", "第一问")));
+        // WHY: pivot 定位必须在「当前会话」内匹配（改造前 = listRawForTranscript 结果集内按 id 匹配；
+        //   改造后 = 同一条 WHERE 的等价投影：session_id + id）。消息 id 可能跨会话重复，
+        //   getById 会命中另一会话消息 → 错删。变异点：改用 getById / 去掉 session_id 条件 → 红。
+        givenPivot(null); // 本会话内查不到 m2（另一会话才有 id=m2 的消息）→ 必须 404
 
-        // 另一会话也有 id=m2 的消息，但本会话列表无 m2 → 必须 404
         assertThatThrownBy(() -> service.trimSessionAfter("sess-1", "m2"))
             .isInstanceOf(NotFoundException.class)
             .hasMessageContaining("m2");
+        verify(messageMapper, never()).deleteByQuery(any());
+
+        // 定位查询本身必须带 session_id 条件（防止实现漂移成 getById）
+        ArgumentCaptor<QueryWrapper> qwCaptor = ArgumentCaptor.forClass(QueryWrapper.class);
+        verify(messageMapper).selectOneByQuery(qwCaptor.capture());
+        String sql = String.valueOf(qwCaptor.getValue().toSQL());
+        assertThat(sql).contains("session_id").contains("id");
     }
 
     @Test
-    @DisplayName("裁剪后顺序保持 created_at ASC（重插保序，与 listRawForTranscript 一致）")
-    void trim_preservesOrder() {
-        // WHY: 重插 created_at=base.plusNanos(i) 保序（replaceSessionMessages :238）——裁剪后列表
-        //   顺序必须与 listRawForTranscript 一致，否则前端 setMessages 顺序错乱。
-        givenMessages(List.of(
-            message("m1", "sess-1", "第一问"),
-            message("m2", "sess-1", "第二问"),
-            message("m3", "sess-1", "第三问"),
-            message("m4", "sess-1", "第四问")));
+    @DisplayName("[慢路径兜底] pivot 行 seq 为空（位置键未落 = 数据异常）→ 回落全量重写，语义与改造前一致")
+    void trim_pivotSeqNull_fallsBackToFullRewrite() {
+        // WHY: 读侧排序 seq ASC NULLS LAST 下 NULL 行之间相对序未定义 ⇒ 「pivot（NULL 行）及其后」
+        //   无法用区间谓词表达。此时必须走全量重写（改造前语义），不能误删/漏删。
+        //   变异点：把 NULL 行当 seq=0 处理（会把 NULL 行全删）→ 本用例断言的保留条数红。
+        givenPivot(message("m2", "sess-1", "第二问", null));
+        when(messageMapper.selectListByQuery(any())).thenReturn(List.of(
+            message("m1", "sess-1", "第一问", 100L),
+            message("m2", "sess-1", "第二问", null),
+            message("m3", "sess-1", "第三问", null)));
 
-        List<ChatMessageDto> kept = service.trimSessionAfter("sess-1", "m3");
+        int deleted = service.trimSessionAfter("sess-1", "m2");
 
-        assertThat(kept).hasSize(2);
-        assertThat(kept.get(0).id()).isEqualTo("m1");
-        assertThat(kept.get(1).id()).isEqualTo("m2");
-    }
-
-    @Test
-    @DisplayName("裁剪保留消息经 replaceSessionMessages 重插 + toDto 读回仍携带 reasoningDurationMs（V41 列 round-trip 保真）")
-    void trim_keepsReasoningDurationMsRoundTrip() {
-        // WHY (CLAUDE.md 规则 9 · 测试验证意图): reasoningDurationMs（V41 列）必须贯穿写侧
-        //   （replaceSessionMessages）与读侧（toDto）。裁剪走「删全部 + 重插」路径——重插 rec 与
-        //   归一化 DTO 若丢该字段，前端 setMessages（REPL.tsx:3673）后历史耗时丢失。变异点：
-        //   replaceSessionMessages 不 set / toDto 不回填 → 读回 null → 红。
-        givenMessages(List.of(
-            message("m1", "sess-1", "第一问"),
-            message("m2", "sess-1", "第二问")));
-
-        List<ChatMessageDto> kept = service.trimSessionAfter("sess-1", "m2");
-
-        assertThat(kept).hasSize(1);
-        assertThat(kept.get(0).reasoningDurationMs())
-            .as("裁剪后幸存消息经 replaceSessionMessages 重插 + toDto 读回必须保留 reasoningDurationMs（V41 列 round-trip）")
-            .isEqualTo(1200L);
+        // keep = [m1]（pivot 之前）→ 删 2 条
+        assertThat(deleted).isEqualTo(2);
+        // 慢路径 = 全量重写：保留段被重插 1 条
+        verify(messageMapper, times(1)).insert(any(MessageRecord.class));
+        // 慢路径走 replaceSessionMessages 的「删全表」（谓词里没有 seq 边界 ⇒ 不是区间删除）
+        ArgumentCaptor<QueryWrapper> msgCaptor = ArgumentCaptor.forClass(QueryWrapper.class);
+        verify(messageMapper).deleteByQuery(msgCaptor.capture());
+        assertThat(String.valueOf(msgCaptor.getValue().toSQL()))
+            .as("慢路径是删全表重插（无 seq 边界），不是区间删除")
+            .doesNotContain("seq >=");
     }
 }

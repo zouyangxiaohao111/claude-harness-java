@@ -179,6 +179,9 @@ public class LeaderPermissionConfirmBridge {
                 null,                     // blockedPath
                 null,                     // warning
                 entry.workerBadgeColor(), // workerBadgeColor（前端渲染彩色徽标，WorkerBadge.tsx:8）
+                // [Phase 1b · D] computer-use 审批面板数据（非 CU 请求 ⇒ null ⇒ 前端走普通分支）
+                com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload.fromToolInput(
+                    entry.toolName(), toolInput),
                 false);                   // classifierFeatureEnabled
             ws.convertAndSend("/topic/sessions/" + leaderSessionId + "/permission-requests", event);
             log.info("[LeaderPermissionConfirmBridge] 已推送权限请求到 leader 会话 {}: tool={} worker={} color={}",

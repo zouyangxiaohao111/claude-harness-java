@@ -1,0 +1,47 @@
+-- ===================================================================
+-- V250: sessions 表加 computer_use_grants（会话级 computer-use 授权位 · Phase 1a）
+--
+-- 背景：CCB 2.8.4 的 computer-use 授权位（AppGrant + CuGrantFlags）活在**进程内存**
+--   （src/utils/computerUse/wrapper.tsx:104-124 的 computerUseMcpState.allowedApps /
+--   grantFlags）。本仓 Web 端每个 HTTP send 都是新的 LlmAgentLoop（prototype 作用域）
+--   ⇒ 进程内存态活不过下一条用户消息 ⇒ 必须落到 sessions 表列
+--   （multi-session-vs-cc-single-session 铁律：todos V43 / effort_level V31 /
+--   session_permission_rules V75 同款范式）。
+--
+-- computer_use_grants TEXT（JSON 对象，可空；null = 该会话无任何 computer-use 授权）：
+--   规范形（读写共用同一对函数 ComputerUseGrants.toJson / parse）：
+--     {"apps":[{"appId":"chrome","displayName":"Chrome","grantedAt":1750000000000,"tier":"read"}],
+--      "flags":{"clipboardRead":false,"clipboardWrite":false,"systemKeyCombos":false}}
+--   apps[] 逐字对齐 CCB packages/@ant/computer-use-mcp/src/types.ts:58-66 的 AppGrant：
+--     appId       = 授权键（Windows 归一为**可执行文件名**：basename 去 .exe 小写），
+--                   对齐 CCB 的 bundleId 角色（授权键与前台判定键同一命名空间 ——
+--                   CCB 在 Windows 拿 exe 全路径比对白名单，属 CCB 自身缺陷，见
+--                   ComputerUseAppPolicy 的 javadoc）
+--     displayName = 展示名（模型请求里给的应用名）
+--     grantedAt   = 授予时刻（epoch 毫秒；CCB types.ts:62 同义）
+--     tier        = 'read' | 'click' | 'full'（CCB types.ts:64-65；缺省 = 'full'）
+--   flags 逐字对齐 CCB types.ts:69-84 的 CuGrantFlags + DEFAULT_GRANT_FLAGS（全 false）：
+--     clipboardRead / clipboardWrite / systemKeyCombos
+--     ⛔ 合并语义 = **truthy-only 只增不减**（CCB packages/@ant/computer-use-mcp/src/
+--     mcpServer.ts:58-77 mergePermissionResponse）—— 后一次 request_access 不能撤销
+--     先前的剪贴板授权。
+--
+-- 解析失败 → 降级为空授权 + warn（不抛），照抄 SessionService.getDisabledTools
+--   （domain/session/SessionService.java:612-629）的 fail-soft 读法。
+--
+-- ⚠️⚠️ 号段分工（**主线 computer-use 迁移固定用 V250+ 号段**）：
+--   场景分支（feat/scene-fusion）占用 **V201–V208**（agri 批次）并可继续 **V209–V249**；
+--   主线 computer-use 用 **V250+**；两段不得交叉。
+--   为什么必须隔离：场景分支**持有 master 的迁移文件**（它已 merge master，V200/V205 同款）
+--   ⇒ 若主线与场景分支取到同一个版本号，场景分支下次 merge master 后**同一 jar 内会出现
+--   两个同号文件** ⇒ Flyway 在 classpath 扫描阶段（早于任何数据库比对）直接抛
+--   "Found more than one migration with version N" ⇒ **整库起不来**。
+--   本仓已因此踩坑两次（V75 / V78 撞号），故号段必须**预留**而非「取当前最大号 + 1」：
+--   场景分支的 agri 批次正活跃开发（当前已到 V208），它下一批极可能就取 V209/V210 ⇒
+--   主线必须跳到 V250+ 留出缓冲带。
+--
+-- ⚠️ 本文件注释**不得**出现「美元符 + 左大括号」的 Flyway 占位符字面量
+--    （application.yml 未关 flyway.placeholder-replacement，SQL 注释也在替换范围内
+--     ⇒ Flyway 会把它当未配置占位符并解析失败）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN computer_use_grants TEXT;

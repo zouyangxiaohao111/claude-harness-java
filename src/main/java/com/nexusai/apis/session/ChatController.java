@@ -9,6 +9,7 @@ import com.nexusai.model.session.dto.PivotCandidateDto;
 import com.nexusai.model.session.dto.QueuePopRequest;
 import com.nexusai.model.session.dto.QueuePopResponse;
 import com.nexusai.model.session.dto.SendMessageRequest;
+import com.nexusai.model.session.dto.TrimAfterResponse;
 import com.nexusai.application.chat.ChatService;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.compact.PartialCompactService;
@@ -36,6 +37,7 @@ import java.util.UUID;
  * - POST   /api/v1/sessions/{sessionId}/messages                       → 202 created (Phase 5: 真实异步流)
  * - DELETE /api/v1/sessions/{sessionId}/messages/{messageId}           → 204
  * - DELETE /api/v1/sessions/{sessionId}/messages/after/{messageId}     → 200 (gap28 对话裁剪：删 pivot 起全部 + 旋转 conversationId)
+ * - GET    /api/v1/sessions/{sessionId}/messages/turns?beforeTurnId=&turns=2 → 200 (turn-paging 按轮分页)
  * - POST   /api/v1/sessions/{sessionId}/cancel                         → 202 (Phase 5: 真取消 in-progress 流)
  * - POST   /api/v1/sessions/{sessionId}/partial-compact                → 200 (OD-14 D-1 partial 压缩)
  *
@@ -92,6 +94,37 @@ public class ChatController {
 
     /** [window-paging] /messages/page 响应体 · total = 会话消息总数（DB sessions.messageCount 非 meta 口径）。 */
     public record PageResp(List<ChatMessageDto> messages, boolean hasMore, int total) {}
+
+    /**
+     * [turn-paging] 按<b>轮</b>分页 · GET /sessions/{sessionId}/messages/turns?beforeTurnId=&turns=2。
+     *
+     * <p><b>WHY</b>：条数分页（{@code /messages/page}，150 条/页）在「一轮几百条 tool 消息」的数据形态下
+     * 会把整页填成同一轮 ⇒ 首屏连一轮都显示不全。本端点以「轮」为页单位，<b>整轮返回、绝不切断</b>：
+     * 一轮 = 一条真正的用户提问（判据与前端 {@code isUserTurnRow} 同口径）+ 它之后、下一条用户提问之前的
+     * 所有 assistant / tool / 思考 / boundary 段；{@code messages} 含每轮起点用户消息本身。
+     *
+     * <p><b>语义</b>：{@code beforeTurnId} 省略/null → 最近 {@code turns} 轮；给定 → 它<b>之前</b>的
+     * {@code turns} 轮（<b>不含</b>该轮）。{@code turns} 缺省 2、上限 10。{@code hasMore} = 返回区间之前
+     * 是否还有更早的用户提问（前端据此继续向上翻）。
+     *
+     * <p><b>错误</b>：会话不存在 → 404；{@code beforeTurnId} 不存在于该会话 / 不是用户提问行 → 400
+     * （{@code ValidationException} → GlobalExceptionHandler），绝不静默返回空页。
+     *
+     * <p><b>出站折叠</b>：与 {@code /messages/page} 同走 {@link TeammateMessageFoldingChain#collapse}
+     * （teammate shutdown 批折叠），保证两个端点对同一批行的渲染口径一致。
+     */
+    @GetMapping("/messages/turns")
+    public TurnsResp turns(@PathVariable String sessionId,
+                           @RequestParam(required = false, defaultValue = "2") int turns,
+                           @RequestParam(required = false) String beforeTurnId) {
+        MessageService.TurnPage page = messageService.listMessagesByTurns(sessionId, beforeTurnId, turns);
+        return new TurnsResp(TeammateMessageFoldingChain.collapse(page.messages()),
+            page.hasMore(), page.firstTurnId(), page.lastTurnId());
+    }
+
+    /** [turn-paging] /messages/turns 响应体 · messages 按 seq 升序（时间正序）；firstTurnId/lastTurnId = 窗口首末轮的用户提问 id。 */
+    public record TurnsResp(List<ChatMessageDto> messages, boolean hasMore,
+                            String firstTurnId, String lastTurnId) {}
 
     /**
      * [dialog-ops-pivot] 对话操作弹窗（压缩/裁剪）候选 · GET /sessions/{sessionId}/messages/pivot-candidates。
@@ -275,8 +308,13 @@ public class ChatController {
      * <p><b>语义（对齐 CC rewindConversationTo，REPL.tsx:3661-3699）</b>: 删除 pivot 消息
      * （含）起全部后续消息（{@code setMessages(prev.slice(0, messageIndex))}，REPL.tsx:3671），
      * 并旋转 conversationId（{@code setConversationId(randomUUID())}，REPL.tsx:3673）——
-     * 前端可 {@code setMessages} + 刷新 row key。响应结构复用 {@link PartialCompactResponse}
-     * （messages + conversationId，对齐 CC REPL.tsx:4964/4971 同款）。
+     * 前端刷新 row key 并<b>重拉窗口</b>（GET /messages/turns）。
+     *
+     * <p><b>响应（轻量 · 破坏性契约变更）</b>: 返回 {@link TrimAfterResponse}
+     * （{@code conversationId} + {@code deletedCount}），<b>不再回传全量 messages</b> ——
+     * 改造前回传的是「裁剪后剩余消息 DTO 全量」（会话万级消息 = 几万条 JSON），序列化 + 传输
+     * 本身就是裁剪卡顿的一环。前端改为裁剪后重拉窗口（按轮分页，毫秒级）。
+     * ⚠️ {@link PartialCompactResponse} <b>未被改动</b>（partial 压缩端点仍在用）。
      *
      * <p><b>in-flight 并发处置（owner 拍板 · 默认 cancel-first）</b>: 先
      * {@code chatService.cancelSession(sessionId, wsTemplate)} 再 trim —— 对齐 CC
@@ -285,27 +323,27 @@ public class ChatController {
      * cancel first (idempotent)」），否则本 turn 流式追加会与裁剪竞态。
      *
      * <p><b>错误翻译</b>: pivot 不存在 → 404；session 不存在 → 404（MessageService.trimSessionAfter
-     * NotFoundException，GlobalExceptionHandler 转 404）；首条 pivot → 200 空列表（全删）。
+     * NotFoundException，GlobalExceptionHandler 转 404）；首条 pivot → 200（deletedCount = 全删条数）。
      *
      * @param sessionId 会话 ID（路径变量）
      * @param messageId 裁剪 pivot 消息 ID（含 pivot 起全部删除）
-     * @return 200 裁剪后剩余消息列表 + 新 conversationId（前端 setMessages + row key 刷新）
+     * @return 200 新 conversationId + 本次裁掉的消息条数
      */
     @DeleteMapping("/messages/after/{messageId}")
-    public PartialCompactResponse trimAfter(@PathVariable String sessionId,
-                                            @PathVariable String messageId) {
+    public TrimAfterResponse trimAfter(@PathVariable String sessionId,
+                                       @PathVariable String messageId) {
         // cancel-first（幂等，对齐 CC REPL.tsx:3777-3780）——裁剪前取消 in-flight 流，
         // 防本 turn 消息追加与裁剪竞态。
         chatService.cancelSession(sessionId, wsTemplate);
-        List<ChatMessageDto> kept = messageService.trimSessionAfter(sessionId, messageId);
+        int deleted = messageService.trimSessionAfter(sessionId, messageId);
         String newCid = UUID.randomUUID().toString();
         sessionService.updateConversationId(sessionId, newCid);
         if (log.isInfoEnabled()) {
-            log.info("ChatController.trimAfter: session={} pivot={} 裁剪完成，剩余消息={}，"
+            log.info("ChatController.trimAfter: session={} pivot={} 裁剪完成，删除 {} 条消息，"
                     + "conversationId 旋转={}（gap28 · CC REPL.tsx:3671/3673）",
-                sessionId, messageId, kept.size(), newCid);
+                sessionId, messageId, deleted, newCid);
         }
-        return new PartialCompactResponse(kept, newCid);
+        return new TrimAfterResponse(newCid, deleted);
     }
 
     /**

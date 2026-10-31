@@ -46,6 +46,8 @@ import java.time.ZonedDateTime;
 @Component
 public class ModelCostCalculator {
 
+    private static final org.slf4j.Logger log = org.slf4j.LoggerFactory.getLogger(ModelCostCalculator.class);
+
     /** 单模型双档价格（元/百万 tokens）+ 窗口/输出上限。 */
     public record PriceTier(
         double inputPricePeak,
@@ -139,12 +141,31 @@ public class ModelCostCalculator {
      * @param isPeak true=高峰档 / false=空闲档
      */
     public CostBreakdown price(String model, AgentUsage usage, boolean isPeak) {
+        return price(model, usage, isPeak, null);
+    }
+
+    /**
+     * <b>V101 分项计价</b> · 带<b>本次调用实际 provider 类型</b>的重载（计费链路专用）。
+     *
+     * <p><b>WHY</b>：{@code LlmCallRecord.modelName} 可能是裸名（历史兼容 / 旁路调用只拿到
+     * SDK 裸名），而全库多个 provider 可有同名模型。计费只需要「这个模型的价格档」，不该走
+     * 选模型链路的 fail-loud；给定 {@code providerType} 后按
+     * {@link ModelNameResolver#resolveByProvider} 限定到该类型下 enabled provider 的模型行，
+     * 唯一命中用 DB 价，否则回落内置默认档（不猜、不报 ERROR）。
+     *
+     * @param model        生效模型名（全名或裸名）
+     * @param usage        provider 上报的 usage（null → 全零分项）
+     * @param isPeak       true=高峰档 / false=空闲档
+     * @param providerType 本次调用实际 provider 类型（空 → 通用解析）
+     */
+    public CostBreakdown price(String model, AgentUsage usage, boolean isPeak, String providerType) {
         if (usage == null) {
             return ZERO_BREAKDOWN;
         }
         long cacheRead = usage.cacheReadInputTokens() != null ? usage.cacheReadInputTokens() : 0L;
         long cacheCreation = usage.cacheCreationInputTokens() != null ? usage.cacheCreationInputTokens() : 0L;
-        return price(model, usage.inputTokens(), usage.outputTokens(), cacheRead, cacheCreation, isPeak);
+        return price(model, usage.inputTokens(), usage.outputTokens(), cacheRead, cacheCreation, isPeak,
+            providerType);
     }
 
     /**
@@ -175,12 +196,31 @@ public class ModelCostCalculator {
      */
     public CostBreakdown price(String model, long inputTokens, long outputTokens,
                                long cacheRead, long cacheCreation, boolean isPeak) {
-        PriceTier tier = resolveTier(model);
+        return price(model, inputTokens, outputTokens, cacheRead, cacheCreation, isPeak, null);
+    }
+
+    /**
+     * <b>V101 唯一公式点</b>（带 provider 类型）· 语义同 6 参重载，价格档与协议分派都按
+     * {@code providerType} 限定（见 {@link #resolveTier(String, String)} 与
+     * {@link ContextUsageCalculator#isAnthropic(ModelMapper, ProviderMapper, String, String)}）。
+     *
+     * @param model         生效模型名
+     * @param inputTokens   输入 token（非 anthropic 时已含 cache 命中）
+     * @param outputTokens  输出 token
+     * @param cacheRead     cache 命中（读）token
+     * @param cacheCreation cache 写入 token
+     * @param isPeak        true=高峰档 / false=空闲档
+     * @param providerType  本次调用实际 provider 类型（空 → 通用解析）
+     */
+    public CostBreakdown price(String model, long inputTokens, long outputTokens,
+                               long cacheRead, long cacheCreation, boolean isPeak, String providerType) {
+        PriceTier tier = resolveTier(model, providerType);
         double inputPrice = isPeak ? tier.inputPricePeak() : tier.inputPriceOffpeak();
         double outputPrice = isPeak ? tier.outputPricePeak() : tier.outputPriceOffpeak();
         double cacheReadPrice = isPeak ? tier.cacheReadPricePeak() : tier.cacheReadPriceOffpeak();
         double cacheWritePrice = isPeak ? tier.cacheWritePricePeak() : tier.cacheWritePriceOffpeak();
-        boolean anthropic = ContextUsageCalculator.isAnthropic(this.modelMapper, this.providerMapper, model);
+        boolean anthropic = ContextUsageCalculator.isAnthropic(this.modelMapper, this.providerMapper, model,
+            providerType);
         if (anthropic) {
             double inputYuan = (inputTokens / 1e6) * inputPrice;
             double outputYuan = (outputTokens / 1e6) * outputPrice;
@@ -206,14 +246,37 @@ public class ModelCostCalculator {
 
     /**
      * 解析生效价格档：DB 价优先（models 表已配置）→ 内置通用默认档兜底。
-     * 模型名规范化走 {@link ModelNameResolver#resolve}（对齐 ChatService findEnabledModelByName）。
+     *
+     * <p>[2026-10-29] 模型名规范化走 {@link ModelNameResolver#resolveQuiet}（<b>不是</b>选模型链路
+     * 的 {@code resolve}）：计费只关心价格档，裸名歧义时回调默认档即可，不该刷 ERROR。
+     * 能拿到本次调用 provider 类型的调用方请走 {@link #resolveTier(String, String)}。
      */
     public PriceTier resolveTier(String model) {
+        return resolveTier(model, null);
+    }
+
+    /**
+     * 解析生效价格档（带本次调用实际 provider 类型）· 计费链路推荐入口。
+     *
+     * <p>价格键解析走 {@link ModelNameResolver#resolveByProvider}：裸名只在
+     * {@code providerType} 下 enabled provider 的模型行里找，唯一命中 → DB 价；0 / 多命中 →
+     * 内置通用默认档（⛔ 不猜、不 fail-loud）。⛔ 选模型链路的 fail-loud 不受影响
+     * （它走 {@code ModelNameResolver.resolve}）。
+     *
+     * @param model        生效模型名（全名或裸名）
+     * @param providerType 本次调用实际 provider 类型（空 → 通用宽松解析）
+     */
+    public PriceTier resolveTier(String model, String providerType) {
         PriceTier builtin = DEFAULT_UNKNOWN_MODEL_TIER;
         if (modelMapper != null && model != null) {
-            ModelRecord record = ModelNameResolver.resolve(modelMapper, providerMapper, model);
+            ModelRecord record = ModelNameResolver.resolveByProvider(modelMapper, providerMapper, model, providerType);
             // 锚定 input_price_peak：该模型已在 models 表显式配置价格 → DB 档优先（单列 null 回落内置通用默认档）
             if (record != null && record.getInputPricePeak() != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[ModelCostCalculator] 价格档来源=DB: model={} providerType={} modelId={} providerId={}"
+                            + " inputPricePeak={}",
+                        model, providerType, record.getId(), record.getProviderId(), record.getInputPricePeak());
+                }
                 return new PriceTier(
                     record.getInputPricePeak(),
                     orD(record.getInputPriceOffpeak(), builtin.inputPriceOffpeak()),
@@ -225,6 +288,11 @@ public class ModelCostCalculator {
                     orD(record.getCacheWritePriceOffpeak(), builtin.cacheWritePriceOffpeak()),
                     record.getMaxContextTokens() != null ? record.getMaxContextTokens() : builtin.contextWindow(),
                     builtin.maxOutputTokens());
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelCostCalculator] 价格档来源=内置默认档（模型未配置价 / 裸名歧义 / 未命中）:"
+                        + " model={} providerType={} recordPresent={}",
+                    model, providerType, record != null);
             }
         }
         return builtin;
@@ -254,11 +322,24 @@ public class ModelCostCalculator {
 
     /** modelUsage 桶的 contextWindow（未知模型回退通用默认档 1M）。 */
     public int contextWindowFor(String model) {
-        return (int) resolveTier(model).contextWindow();
+        return contextWindowFor(model, null);
+    }
+
+    /**
+     * modelUsage 桶的 contextWindow（带 provider 类型）· 与 {@link #resolveTier(String, String)}
+     * 同源，供计费/统计链路避免裸名歧义刷屏。
+     */
+    public int contextWindowFor(String model, String providerType) {
+        return (int) resolveTier(model, providerType).contextWindow();
     }
 
     /** modelUsage 桶的 maxOutputTokens（未知模型回退通用默认档 384K）。 */
     public long maxOutputFor(String model) {
-        return resolveTier(model).maxOutputTokens();
+        return maxOutputFor(model, null);
+    }
+
+    /** modelUsage 桶的 maxOutputTokens（带 provider 类型）· 同 {@link #resolveTier(String, String)}。 */
+    public long maxOutputFor(String model, String providerType) {
+        return resolveTier(model, providerType).maxOutputTokens();
     }
 }

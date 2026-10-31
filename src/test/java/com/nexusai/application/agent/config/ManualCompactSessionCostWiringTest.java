@@ -269,10 +269,12 @@ class ManualCompactSessionCostWiringTest {
     private ModelCostCalculator recordingCalculator() {
         ModelCostCalculator calc = mock(ModelCostCalculator.class);
         when(calc.isPeakHour()).thenReturn(false);
-        when(calc.contextWindowFor(anyString())).thenReturn(200_000);
-        when(calc.maxOutputFor(anyString())).thenReturn(8_192L);
+        // [2026-10-29] 账本带 providerType 调用 → 2 参重载（providerType 可 null，用 any() 匹配）
+        when(calc.contextWindowFor(anyString(), any())).thenReturn(200_000);
+        when(calc.maxOutputFor(anyString(), any())).thenReturn(8_192L);
         // V101：账本计价点 = price(...)（总额 = breakdown.totalYuan()）→ 替身的金额放 inputYuan，其余分项 0。
-        when(calc.price(anyString(), any(AgentUsage.class), anyBoolean())).thenAnswer(inv -> {
+        // [2026-10-29] 账本计价点带 providerType → 4 参重载（providerType 可 null）
+        when(calc.price(anyString(), any(AgentUsage.class), anyBoolean(), any())).thenAnswer(inv -> {
             String model = inv.getArgument(0);
             AgentUsage u = inv.getArgument(1);
             costCalls.add(new CostCall(model, u));

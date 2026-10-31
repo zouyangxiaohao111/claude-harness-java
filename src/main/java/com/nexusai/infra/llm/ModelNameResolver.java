@@ -389,6 +389,302 @@ public final class ModelNameResolver {
     }
 
     /**
+     * 宽松解析 · <b>只用于计费 / 上下文统计 / 能力查询 / SDK 发送名翻译，⛔ 不得用于选模型</b>。
+     *
+     * <p><b>与 {@link #resolve} 的关系</b>：解析结果逐条一致（全名精确路径、G-5 不透明名透传、
+     * [1m] 剥离重查、裸名歧义返回 null 全部相同），<b>唯一差别是日志级别</b>——裸名歧义与
+     * 未命中只打 DEBUG，不打 ERROR/WARN。
+     *
+     * <p><b>WHY</b>：{@link #resolve} 的「裸名歧义 → ERROR + null」是<b>选模型链路</b>的护栏
+     * （2026-10-22 用户明确要求：裸名命中多个 provider 时拒绝静默选错，见 resolve 内注释）。
+     * 但同一解析器也被计费（{@code ModelCostCalculator.resolveTier}）、上下文统计
+     * （{@code ContextUsageCalculator}）、能力查询（{@code resolveMaxTokens} / 图片能力）、
+     * SDK 发送名翻译（{@code ModelConfigResolver.resolveSdkModelName}）复用：
+     * 这些场景<b>拿不到调用方 provider 身份</b>，且调用方本来就会在 null 时回落默认档/原始值 ——
+     * 把「选模型的拒绝」记成 ERROR 只会刷屏、没有任何决策价值。
+     * 实测（2026-10-29 backend error.log）：单日 1968 条同一裸名歧义（{@code deepseek-flash}），
+     * 全部来自上述非选择路径。
+     *
+     * <p><b>为什么另起方法而不改 {@link #resolve}</b>：选模型护栏的语义由用户明确要求，
+     * 任何改动都可能把「拒绝静默选错」降级为「静默选错」。两条路径物理隔离，护栏不可能被
+     * 统计/计费改动误伤。
+     *
+     * @param modelMapper    模型 mapper（null → null）
+     * @param providerMapper 提供商 mapper（null → 直接走按 name 兼容路径）
+     * @param modelName      模型全名（providerName/modelName）或裸模型名
+     * @return enabled ModelRecord；裸名歧义 / 未命中 → null（调用方回落默认档）
+     */
+    public static ModelRecord resolveQuiet(ModelMapper modelMapper, ProviderMapper providerMapper,
+                                           String modelName) {
+        if (modelMapper == null || modelName == null || modelName.isBlank()) {
+            return null;
+        }
+        String expanded = expandAlias(modelName);
+        if (expanded != null && !expanded.equals(modelName)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [宽松解析] 别名展开: {} → {}（G-4）", modelName, expanded);
+            }
+            modelName = expanded;
+        }
+        if (providerMapper != null) {
+            ParsedModelName parsed = parseFullName(modelName);
+            if (parsed != null) {
+                ProviderRecord provider = providerMapper.selectOneByQuery(
+                    QueryWrapper.create().eq("name", parsed.providerName()));
+                if (provider != null) {
+                    ModelRecord hit = modelMapper.selectOneByQuery(
+                        QueryWrapper.create()
+                            .eq("name", parsed.modelName())
+                            .eq("provider_id", provider.getId())
+                            .eq("enabled", true));
+                    if (hit == null) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("[ModelNameResolver] [宽松解析] 全名未命中: 提供商 {} 下无 enabled 模型 {}"
+                                    + "（统计/计费路径，回落调用方默认值）",
+                                parsed.providerName(), parsed.modelName());
+                        }
+                        return null;
+                    }
+                    if (log.isDebugEnabled()) {
+                        log.debug("[ModelNameResolver] [宽松解析] 全名命中: fullName={} modelId={}",
+                            modelName, hit.getId());
+                    }
+                    return hit;
+                }
+                // G-5：首段非 provider 前缀 → '/' 是模型名一部分（ARN / 部署 ID）→ 整体透传
+                if (log.isDebugEnabled()) {
+                    log.debug("[ModelNameResolver] [宽松解析] 首段非 provider 前缀, 整体透传: modelName={}", modelName);
+                }
+            }
+        }
+        return legacyQuiet(modelMapper, modelName);
+    }
+
+    /**
+     * 按 provider 限定解析 · <b>计费专用</b>（调用方已知本次调用实际走的是哪个 provider 类型）。
+     *
+     * <p>语义：
+     * <ol>
+     *   <li>全名 {@code provider/model} → 与 {@link #resolveQuiet} 相同的精确联合查询（provider 名唯一，
+     *       不需要类型过滤）；</li>
+     *   <li>裸名 + {@code providerType} → 只在 <b>该 type 且 enabled 的 provider</b> 名下的 enabled
+     *       模型里找：唯一命中 → 返回；0 / 多命中 → null（调用方回落内置默认档）；</li>
+     *   <li>{@code providerType} 为空 → 退回 {@link #resolveQuiet}（通用解析，语义同 {@link #resolve}
+     *       但不打 ERROR）。</li>
+     * </ol>
+     *
+     * <p><b>WHY 按「type + enabled」过滤</b>：{@code LlmCallRecord.providerType()} 是本次调用
+     * <b>实际生效</b>的 provider 协议类型（{@code providers.type}）。disabled provider 不可能是
+     * 一次真实调用的来源（{@code ModelConfigResolver.resolve} 对 disabled provider 直接
+     * warn+skip），把它的同名模型行算进候选只会制造假歧义 —— 实测本机三行
+     * {@code deepseek-flash} 里两行挂在已停用的 {@code ds-zcw} / {@code ds-zcw-openai} 上，
+     * 真正在用的只有 {@code deepseek} 一行。
+     *
+     * <p><b>不削弱选模型护栏</b>：本方法只被 {@code ModelCostCalculator} 调用；选模型链路仍走
+     * {@link #resolve}（多命中 ERROR + null）。另外即使过滤后仍多命中，这里也返回 null 而不是
+     * 「挑一个」，计费会按内置默认档计价，不会把费用记到错误的模型行上。
+     *
+     * @param modelMapper    模型 mapper（null → null）
+     * @param providerMapper 提供商 mapper（null → 无法限定，返回 null）
+     * @param modelName      模型全名（providerName/modelName）或裸模型名
+     * @param providerType   provider 类型（{@code openai_compatible} / {@code anthropic} …；空 → 通用解析）
+     * @return 唯一命中的 enabled ModelRecord；0 / 多命中 → null
+     */
+    public static ModelRecord resolveByProvider(ModelMapper modelMapper, ProviderMapper providerMapper,
+                                                String modelName, String providerType) {
+        if (modelMapper == null || modelName == null || modelName.isBlank()) {
+            return null;
+        }
+        String expanded = expandAlias(modelName);
+        if (expanded != null && !expanded.equals(modelName)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] 别名展开: {} → {}（G-4）", modelName, expanded);
+            }
+            modelName = expanded;
+        }
+        if (providerType == null || providerType.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] 无 providerType → 退回宽松解析: modelName={}",
+                    modelName);
+            }
+            return resolveQuiet(modelMapper, providerMapper, modelName);
+        }
+        // 全名：provider 名唯一 → 直接精确联合查（等价宽松解析的全名分支）
+        if (providerMapper != null) {
+            ParsedModelName parsed = parseFullName(modelName);
+            if (parsed != null) {
+                ProviderRecord provider = providerMapper.selectOneByQuery(
+                    QueryWrapper.create().eq("name", parsed.providerName()));
+                if (provider != null) {
+                    ModelRecord hit = modelMapper.selectOneByQuery(
+                        QueryWrapper.create()
+                            .eq("name", parsed.modelName())
+                            .eq("provider_id", provider.getId())
+                            .eq("enabled", true));
+                    if (hit == null && log.isDebugEnabled()) {
+                        log.debug("[ModelNameResolver] [按 provider 限定] 全名未命中: 提供商 {} 下无 enabled 模型 {}",
+                            parsed.providerName(), parsed.modelName());
+                    }
+                    return hit;
+                }
+                if (log.isDebugEnabled()) {
+                    log.debug("[ModelNameResolver] [按 provider 限定] 首段非 provider 前缀, 整体透传: modelName={}",
+                        modelName);
+                }
+            }
+        }
+        // 裸名：按 provider 类型 + enabled 限定候选
+        ModelRecord hit = scopedBareHit(modelMapper, providerMapper, modelName, providerType);
+        if (hit == null) {
+            String stripped = strip1mTag(modelName);
+            if (stripped != null && !stripped.equals(modelName)) {
+                hit = scopedBareHit(modelMapper, providerMapper, stripped, providerType);
+                if (hit != null) {
+                    log.info("[ModelNameResolver] [按 provider 限定] [1m] 后缀剥离查表命中: 原键={} → 查键={} modelId={}"
+                            + "（只改查询键，不回写任何字段）",
+                        modelName, stripped, hit.getId());
+                }
+            }
+        }
+        return hit;
+    }
+
+    /** 裸名 + providerType 唯一命中（0 / 多命中 → null，DEBUG 说明原因）。 */
+    private static ModelRecord scopedBareHit(ModelMapper modelMapper, ProviderMapper providerMapper,
+                                             String name, String providerType) {
+        if (providerMapper == null) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] providerMapper 缺失, 无法按 type 限定: modelName={}", name);
+            }
+            return null;
+        }
+        List<ModelRecord> rows = modelMapper.selectListByQuery(
+            QueryWrapper.create()
+                .eq("name", name)
+                .eq("enabled", true)
+                .orderBy("provider_id", true)
+                .orderBy("id", true));
+        if (rows == null || rows.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] 裸名无 enabled 模型: modelName={}", name);
+            }
+            return null;
+        }
+        // providers.type + enabled 过滤（disabled provider 不可能是真实调用来源 → 不算候选）
+        List<ProviderRecord> providers = providerMapper.selectListByQuery(
+            QueryWrapper.create()
+                .eq("type", providerType)
+                .eq("enabled", true));
+        if (providers == null || providers.isEmpty()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] providerType={} 下无 enabled provider, modelName={} → null",
+                    providerType, name);
+            }
+            return null;
+        }
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        for (ProviderRecord p : providers) {
+            if (p != null && p.getId() != null) {
+                ids.add(p.getId());
+            }
+        }
+        List<ModelRecord> scoped = new java.util.ArrayList<>();
+        for (ModelRecord m : rows) {
+            if (m != null && m.getProviderId() != null && ids.contains(m.getProviderId())) {
+                scoped.add(m);
+            }
+        }
+        if (scoped.size() == 1) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] 唯一命中: modelName={} providerType={} modelId={}"
+                        + " providerId={}",
+                    name, providerType, scoped.get(0).getId(), scoped.get(0).getProviderId());
+            }
+            return scoped.get(0);
+        }
+        if (log.isDebugEnabled()) {
+            if (scoped.isEmpty()) {
+                log.debug("[ModelNameResolver] [按 provider 限定] 裸名不在 providerType={} 的 enabled provider 下: modelName={}"
+                        + " → null（计费回落内置默认档）", providerType, name);
+            } else {
+                StringBuilder providersDesc = new StringBuilder();
+                for (ModelRecord m : scoped) {
+                    if (providersDesc.length() > 0) providersDesc.append(", ");
+                    providersDesc.append(m.getProviderId()).append(':').append(m.getId());
+                }
+                log.debug("[ModelNameResolver] [按 provider 限定] 同 providerType 内仍歧义: modelName={} providerType={}"
+                        + " 命中 {} 个 [{}] → null（计费回落内置默认档，不猜）",
+                    name, providerType, scoped.size(), providersDesc);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 历史兼容路径的「静默版」· 返回值与 {@link #resolve} 的历史兼容分支逐条一致，
+     * 但裸名歧义只打 DEBUG（不 fail-loud、不返回「猜一个」的结果）。
+     */
+    private static ModelRecord legacyQuiet(ModelMapper modelMapper, String modelName) {
+        List<ModelRecord> ms = modelMapper.selectListByQuery(
+            QueryWrapper.create()
+                .eq("name", modelName)
+                .eq("enabled", true)
+                .orderBy("provider_id", true)
+                .orderBy("id", true));
+        if (ms != null && ms.size() > 1) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelNameResolver] [宽松解析] 裸名歧义 → null（不猜 provider；统计/计费路径回落默认值）:"
+                        + " modelName={} 命中 {} 个 [{}]",
+                    modelName, ms.size(), describeProviders(ms));
+            }
+            return null;
+        }
+        ModelRecord model = (ms != null && !ms.isEmpty()) ? ms.get(0) : null;
+        if (model == null) {
+            String stripped = strip1mTag(modelName);
+            if (stripped != null && !stripped.equals(modelName)) {
+                List<ModelRecord> msStripped = modelMapper.selectListByQuery(
+                    QueryWrapper.create()
+                        .eq("name", stripped)
+                        .eq("enabled", true)
+                        .orderBy("provider_id", true)
+                        .orderBy("id", true));
+                if (msStripped != null && msStripped.size() > 1) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[ModelNameResolver] [宽松解析] [1m] 剥离后裸名歧义 → null: 原键={} 查键={} 命中 {} 个 [{}]",
+                            modelName, stripped, msStripped.size(), describeProviders(msStripped));
+                    }
+                    return null;
+                }
+                model = (msStripped != null && !msStripped.isEmpty()) ? msStripped.get(0) : null;
+                if (model != null && log.isDebugEnabled()) {
+                    log.debug("[ModelNameResolver] [宽松解析] [1m] 后缀剥离查表命中: 原键={} → 查键={} modelId={}",
+                        modelName, stripped, model.getId());
+                }
+            }
+        }
+        if (log.isDebugEnabled()) {
+            if (model == null) {
+                log.debug("[ModelNameResolver] [宽松解析] 历史兼容路径未命中: modelName={}", modelName);
+            } else {
+                log.debug("[ModelNameResolver] [宽松解析] 历史兼容路径命中(裸名): modelName={} modelId={}",
+                    modelName, model.getId());
+            }
+        }
+        return model;
+    }
+
+    /** 候选模型按 {@code providerId:modelId} 拼接（仅日志用）。 */
+    private static String describeProviders(List<ModelRecord> models) {
+        StringBuilder sb = new StringBuilder();
+        for (ModelRecord m : models) {
+            if (sb.length() > 0) sb.append(", ");
+            sb.append(m.getProviderId()).append(':').append(m.getId());
+        }
+        return sb.toString();
+    }
+
+    /**
      * 由已解析的 ModelRecord 还原**全名**（{@code providerName/modelName}）· 2026-10-22 修复。
      *
      * <p>WHY：{@link #resolve} 出来的 ModelRecord 已经绑定 provider；若调用方只把裸名
@@ -445,7 +741,11 @@ public final class ModelNameResolver {
             return null;
         }
         try {
-            ModelRecord model = resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] 能力查询走「宽松解析」：provider 层拿到的是 SDK 裸名（openai/anthropic
+            //   协议要求裸名），多 provider 同名时 {@link #resolve} 会打 ERROR —— 但这里既不是选模型、
+            //   也拿不到调用方 provider 身份，null 的既有结果（不发 max_tokens）已经是对的。
+            //   ⛔ 选模型链路仍走 resolve（fail-loud 不变）。
+            ModelRecord model = resolveQuiet(modelMapper, providerMapper, modelName);
             Integer maxTokens = model != null ? model.getMaxTokens() : null;
             if (maxTokens == null || maxTokens <= 0) {
                 if (log.isDebugEnabled()) {

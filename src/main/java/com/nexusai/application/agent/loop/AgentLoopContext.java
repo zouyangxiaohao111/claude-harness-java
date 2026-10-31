@@ -934,7 +934,8 @@ public record AgentLoopContext(
         ProviderMapper providerMapper = ctx.tokenBudgetBeans() != null ? ctx.tokenBudgetBeans().providerMapper() : null;
         if (modelName != null && !modelName.isBlank() && modelMapper != null && providerMapper != null) {
             // W1-2: 统一走全名解析器（providerName/modelName 联合查, 无 / 回退按 name 查第一条）
-            ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] token budget 是上下文统计口径（不是选模型）→ 宽松解析，裸名歧义不打 ERROR
+            ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             // W2-1: 模型级窗口优先（models.max_context_tokens）——provider 级不再读取（探查确认死源）
             if (model != null && model.getMaxContextTokens() != null) {
                 if (log.isDebugEnabled()) {

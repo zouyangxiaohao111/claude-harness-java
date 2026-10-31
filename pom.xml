@@ -44,6 +44,11 @@
         <!-- [impl-I-6] Spring AI BOM · 入站 MCP server（Spring AI 接管 /mcp，替代自研 JSON-RPC 骨架）。
              Q-23 拍板（open-decisions.md L58）：用 spring-ai-starter-mcp-server-webmvc 暴露 ToolRegistry 工具。 -->
         <spring-ai.version>1.1.2</spring-ai.version>
+        <!-- [CU-PoC] JNA 5.17.0 · computer-use Phase 0 技术验证。
+             本机 m2 已有版本中最新者即 JNA 5.17.0（与本工程 JDK 25 兼容）。
+             此前 JNA 仅为 io.methvin:directory-watcher 的传递依赖（Windows 路径不加载其 native），
+             jna-platform 未声明 —— 故本次显式声明。 -->
+        <jna.version>5.17.0</jna.version>
     </properties>
 
     <dependencyManagement>
@@ -218,6 +223,20 @@
             <version>0.18.0</version>
         </dependency>
 
+        <!-- [CU-PoC] net.java.dev.jna:jna + net.java.dev.jna:jna-platform 5.17.0 · computer-use 直调 Win32（截图/点击）。
+             本仓具名真实成功直调 user32/gdi32（不中 shell-out），语义对齐 CCB computer-use-input win32 backend。
+             jna-platform 依赖 WinDef.HDC/HBITMAP/HMONITOR 等类型；jna 主体提供 Native.load 与结构调用。 -->
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna</artifactId>
+            <version>${jna.version}</version>
+        </dependency>
+        <dependency>
+            <groupId>net.java.dev.jna</groupId>
+            <artifactId>jna-platform</artifactId>
+            <version>${jna.version}</version>
+        </dependency>
+
         <!-- [impl-I-6] Spring AI MCP server（WebMVC transport）· Q-23 拍板：
              自研 JSON-RPC 骨架 McpServerEndpoint 由 Spring AI 自带端点接管 /mcp
              （application.yml protocol=streamable → 单端点 /mcp；若用 SSE 默认协议则 /sse + /mcp/message）。
@@ -241,6 +260,20 @@
             <groupId>org.junit.platform</groupId>
             <artifactId>junit-platform-launcher</artifactId>
             <scope>test</scope>
+        </dependency>
+
+        <!-- [terminal] 集成终端 PTY（跨平台：Windows ConPTY / macOS·Linux forkpty）。
+             排除 purejavacomm：该传递依赖在 Maven Central 缺失且只服务串口。 -->
+        <dependency>
+            <groupId>org.jetbrains.pty4j</groupId>
+            <artifactId>pty4j</artifactId>
+            <version>0.12.13</version>
+            <exclusions>
+                <exclusion>
+                    <groupId>org.jetbrains.pty4j</groupId>
+                    <artifactId>purejavacomm</artifactId>
+                </exclusion>
+            </exclusions>
         </dependency>
     </dependencies>
 

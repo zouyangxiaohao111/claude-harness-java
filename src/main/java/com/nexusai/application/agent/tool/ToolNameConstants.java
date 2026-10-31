@@ -363,6 +363,12 @@ public final class ToolNameConstants {
      * 删除对象: 06-deletion-manifest DC-A1-03（验证: grep "SOURCE_TO_CONSTANT\|ALL_NAMES" src/main 0 命中）。
      */
 
+    // ── Terminal tools（自建 · 对齐 Codex 桌面版终端设计 · CC 无对应）──
+    public static final String TERMINAL_LIST_TOOL_NAME = "terminal_list";
+    public static final String TERMINAL_READ_TOOL_NAME = "terminal_read";
+    public static final String TERMINAL_CREATE_TOOL_NAME = "terminal_create";
+    public static final String TERMINAL_WRITE_TOOL_NAME = "terminal_write";
+
     private ToolNameConstants() {
         // 常量容器
     }

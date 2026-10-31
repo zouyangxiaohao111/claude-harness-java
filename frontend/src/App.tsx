@@ -18,6 +18,8 @@ import { isAbsolutePath, normalizePath } from '@/utils/path'
 import { compareSessions } from '@/utils/sessionOrder'
 import { resolveNewSessionProjectId } from '@/utils/newSessionProject'
 import { chatApi } from '@/api/chat'
+import { artifactsApi, type SessionArtifacts, type SessionArtifactDto } from '@/api/artifacts'
+import { usageTurnsApi, type TurnUsageDto } from '@/api/usageTurns'
 import { commandApi } from '@/api/command'
 import { tasksApi } from '@/api/tasks'
 import { settingsApi } from '@/api/settings'
@@ -30,6 +32,7 @@ import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedU
 import { computeTurnRunning } from '@/utils/turnRunning'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
 import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
+import { isUserTurnRow } from '@/stores/messageTurns'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
 import { sendPermissionResponse } from '@/api/socket'
@@ -54,6 +57,8 @@ import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
 import { CompactProgressBar } from '@/components/center/CompactProgressBar'
 import { NotificationBanner } from '@/components/center/NotificationBanner'
 import { Composer, SUMMON_TRAILING_SPACES } from '@/components/center/Composer'
+import { WorkspaceHeader } from '@/components/center/WorkspaceHeader'
+import { SchedulesPage } from '@/components/center/SchedulesPage'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
@@ -64,6 +69,7 @@ import { RightPanel } from '@/components/right/RightPanel'
 import { ProjectContextMenu } from '@/components/right/ProjectContextMenu'
 import { SearchPalette } from '@/components/modals/SearchPalette'
 import { SettingsModal } from '@/components/modals/SettingsModal'
+import { BasicSettingsModal } from '@/components/modals/BasicSettingsModal'
 import { TourOverlay } from '@/components/startup/tour/TourOverlay'
 import { ModelPickerModal } from '@/components/modals/ModelPickerModal'
 import { TierInheritModal } from '@/components/modals/TierInheritModal'
@@ -81,6 +87,7 @@ import { UpdateCenter } from '@/components/updater/UpdateCenter'
 // 桌面 Tauri 本地加载快，换取「点开 diff 零拉取零等待」（放弃此前 L5 懒加载拆分）。
 import { DiffModal } from '@/components/modals/DiffModal'
 import { FileViewModal } from '@/components/modals/FileViewModal'
+import { ArtifactPreviewModal } from '@/components/modals/ArtifactPreviewModal'
 import { openStandalone, previewKindOfPath, basenameOf } from '@/utils/standalonePreview'
 
 /** 会话主模型只允许对话类；embedding/rerank 等非对话模型不能被选为会话模型。
@@ -110,6 +117,13 @@ const EMPTY_PROJECT: Project = { id: '', name: '', branch: '', dirty: 0, agents:
 const EMPTY_MESSAGES: ChatMessageDto[] = []
 /** [snip-persist] 空裁剪 id 列表常量（避免选择器每次新建 [] → 引用变化触发重渲染） */
 const EMPTY_SNIPPED_IDS: string[] = []
+/** 稳定空产物列表（artifacts 接口未就绪 / 切会话重置时兜底 · 避免每次新建对象引用） */
+const EMPTY_ARTIFACTS: SessionArtifacts = { deliverables: [], sources: [] }
+/**
+ * 右栏形态：改版后右栏恒为**抽屉**（默认收起、不占三栏列宽，宽度/拖拽条由 RightPanel 自带）。
+ * ⇒ 宿主这条「右栏拖拽 resizer」不再挂载（它改的是 `--right-w`，抽屉不消费）。
+ */
+const RIGHT_PANEL_DRAWER = true
 
 function toSession(d: SessionDto): Session {
   return {
@@ -243,6 +257,19 @@ function App() {
   const [dialogOpsCandidates, setDialogOpsCandidates] = useState<PivotCandidateDto[]>([])
   const [dialogOpsLoading, setDialogOpsLoading] = useState(false)
   const [dialogOpsError, setDialogOpsError] = useState<string | null>(null)
+  // [历史提问] 主区头部「历史提问」面板：候选 = 本会话**全部** user 消息（不经 compact 边界过滤）。
+  //   与上方 dialogOpsCandidates（当前上下文可见）分属两条口径，不复用。
+  const [historyQuestions, setHistoryQuestions] = useState<PivotCandidateDto[]>([])
+  const [showHistoryPanel, setShowHistoryPanel] = useState(false)
+  const [historyLoading, setHistoryLoading] = useState(false)
+  const [historyError, setHistoryError] = useState<string | null>(null)
+  const historyReqSeq = useRef(0)
+  // 主区页面：对话 / 定时任务（定时任务在主区换页，不弹设置弹窗）
+  const [workspacePage, setWorkspacePage] = useState<'chat' | 'schedules'>('chat')
+  // 右栏抽屉开合（改版后右栏默认收起，由头部面板按钮 / 消息底部入口打开）
+  const [rightDrawerOpen, setRightDrawerOpen] = useState(false)
+  // 基础设置（左下角用户行 → 轻量四项弹窗）
+  const [showBasicSettings, setShowBasicSettings] = useState(false)
   // 命令面板（/ 未命中或 ⌘K 触发）
   const [showCommandPalette, setShowCommandPalette] = useState(false)
   // FNT-SUB-02：/agents 命令 → 打开子代理面板（而非 executeBuiltin）
@@ -253,6 +280,8 @@ function App() {
   const [attachmentLocalRead, setAttachmentLocalRead] = useState(false)
   // 项目文件树点击查看（真实文件内容）
   const [openFile, setOpenFile] = useState<{ projectId: string; path: string } | null>(null)
+  // [产物预览] 浏览器通道：产物 = 归档副本（不在项目根内）⇒ 走 /artifacts/{id}/content 只读预览
+  const [previewArtifact, setPreviewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto } | null>(null)
 
   // ---- refs ----
   const modelDropdownRef = useRef<HTMLDivElement>(null)
@@ -474,6 +503,84 @@ function App() {
   //   即发送键变停止，取消目标天然一致（见 stopStreaming 的取消会话取值）。
   const activeCompact = useChatStore(selectCompact(activeSessionId))
   const compactActive = activeCompact.visible && activeCompact.status === 'running'
+
+  // ---- [产物/来源] 后端轮末异步抽取结果（GET /sessions/{id}/artifacts · 只读）----
+  //   抽取在【轮末异步】跑 ⇒ 数据会晚几秒出现；只拉当前会话，切会话即重置。
+  const [sessionArtifacts, setSessionArtifacts] = useState<SessionArtifacts>(EMPTY_ARTIFACTS)
+  const artifactsSessionRef = useRef<string | null>(null)
+  artifactsSessionRef.current = activeSessionId
+  /** 拉取本会话产物（失败静默保持旧值：抽取未就绪 / 后端老版本都不该弹提示） */
+  const reloadArtifacts = useCallback(async (sessionId: string) => {
+    try {
+      const r = await artifactsApi.list(sessionId)
+      if (artifactsSessionRef.current !== sessionId) return // 已切到别的会话 → 丢弃迟到响应
+      setSessionArtifacts({
+        deliverables: Array.isArray(r?.deliverables) ? r.deliverables : [],
+        sources: Array.isArray(r?.sources) ? r.sources : [],
+      })
+    } catch { /* 静默：保持旧值 */ }
+  }, [])
+  // a) 切会话 → 重置并立刻拉一次
+  useEffect(() => {
+    setSessionArtifacts(EMPTY_ARTIFACTS)
+    if (!activeSessionId) return
+    void reloadArtifacts(activeSessionId)
+  }, [activeSessionId, reloadArtifacts])
+  // b) 每 15 秒轮询（只在该会话有内容时；切会话/会话空 → 清理定时器）
+  const hasSessionContent = !!activeSessionId && storeMessages.length > 0
+  useEffect(() => {
+    if (!activeSessionId || !hasSessionContent) return
+    const timer = window.setInterval(() => { void reloadArtifacts(activeSessionId) }, 15000)
+    return () => window.clearInterval(timer)
+  }, [activeSessionId, hasSessionContent, reloadArtifacts])
+  // c) 轮次结束（serverRunning true → false）→ 延迟 3 秒再拉（给后端轮末抽取留时间）
+  const prevServerRunningRef = useRef(serverRunning)
+  useEffect(() => {
+    const prev = prevServerRunningRef.current
+    prevServerRunningRef.current = serverRunning
+    if (!prev || serverRunning || !activeSessionId) return
+    const timer = window.setTimeout(() => { void reloadArtifacts(activeSessionId) }, 3000)
+    return () => window.clearTimeout(timer)
+  }, [serverRunning, activeSessionId, reloadArtifacts])
+  // ---- [历史轮用量] 后端按轮聚合的真实用量（GET /sessions/{id}/usage/turns · 只读）----
+  //   旧轮消息在 DB 里没有 token（真实用量在 llm_usage_calls）→ MessageList 的轮底部用量行据此补缺。
+  //   ⚠️ 老后端把「路径不存在」映射成 500（不是 404）⇒ 任何非 2xx 都静默，不按状态码区分。
+  const [turnUsageByUser, setTurnUsageByUser] = useState<Map<string, TurnUsageDto>>(new Map())
+  const turnUsageSessionRef = useRef<string | null>(null)
+  turnUsageSessionRef.current = activeSessionId
+  const reloadTurnUsage = useCallback((sid: string) => {
+    usageTurnsApi.list(sid)
+      .then((r) => {
+        if (turnUsageSessionRef.current !== sid) return // 已切到别的会话 → 丢弃迟到响应
+        const map = new Map<string, TurnUsageDto>()
+        for (const t of r?.turns ?? []) {
+          if (t?.userMessageId) map.set(t.userMessageId, t)
+        }
+        setTurnUsageByUser(map)
+      })
+      .catch(() => { /* 静默：接口不可用 → 保持空 Map（轮底部保持原文案） */ })
+  }, [])
+  useEffect(() => {
+    setTurnUsageByUser(new Map())
+    if (activeSessionId) reloadTurnUsage(activeSessionId)
+  }, [activeSessionId, reloadTurnUsage])
+  // [2026-10-29] 轮末重拉：后端把该轮用量写进 llm_usage_calls，且 /usage/turns 有 10s 缓存
+  //   ⇒ 只靠「切会话拉一次」时，轮次刚结束就 F5 会拿到「不含这一轮」的旧结果且永不刷新
+  //   （现象：刷新后 token 消失）。与 artifacts 同策略：收口后延迟 3s 再拉一次。
+  useEffect(() => {
+    if (!activeSessionId || serverRunning) return
+    const t = window.setTimeout(() => reloadTurnUsage(activeSessionId), 3000)
+    return () => window.clearTimeout(t)
+  }, [serverRunning, activeSessionId, reloadTurnUsage])
+  // 主区「新建任务态」= 无消息且无流式（与 Composer 的 empty 同一口径）。
+  const workspaceEmpty = storeMessages.length === 0 && !hasStream
+  // 主区标题：未选中会话 / 空会话 = null（不显示）；有消息的会话用会话标题，空标题回落「新会话」。
+  const workspaceTitle = activeSessionId && !workspaceEmpty
+    ? (activeSession.title?.trim() || '新会话')
+    : null
+  // 主区停在定时任务页（对话面仍挂载，由 CSS 按 .workspace-surface[data-page="schedules"] 隐藏
+  //   —— 输入草稿与附件不因换页丢失）。
+  const showSchedulesPage = workspacePage === 'schedules'
   // 运行中会话集合（有 stream = 运行中），供左侧栏状态图标。
   // [流式性能] 从 streamOrder 读键集：content 推进不换引用 → 不会每 chunk 重渲；块增删（会话开始/结束流式）才更新。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
@@ -511,25 +618,24 @@ function App() {
 
   // ---- 合并「对话操作」：双击 Esc 触发弹窗（压缩 tab；消息非空且非 loading）----
   const setMessages = useChatStore((s) => s.setMessages)
-  // [window-paging] 有界历史窗口每页条数（对齐 deepseek 默认 50）
-  const HISTORY_PAGE_SIZE = 50
-  /** [window-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/page 尾页，不再全量拉。 */
+  // [turn-paging] 分页单位 = **轮**（一轮 = 一条真正的用户提问行 + 其后的全部助手/工具内容，整轮不切断）。
+  //   条数分页（150 条/页）在「一轮几百条 tool 消息」的数据形态下会把整页填成同一轮 ⇒ 首屏连一轮都显示不全。
+  /** [turn-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/turns 最近 3 轮，不再全量拉。
+   *  消息总数（轨迹徽标）由 /messages/count 的 5s 轮询单独维护，本端点不返回 total。 */
   const loadTailWindow = useCallback(async (sid: string) => {
-    const { messages, hasMore, total } = await chatApi.listMessagesPage(sid, { limit: HISTORY_PAGE_SIZE })
+    const { messages, hasMore } = await chatApi.listTurns(sid, { turns: 3 })
     setMessages(sid, messages)
     useChatStore.getState().setHasMore(sid, hasMore)
-    useChatStore.getState().setMsgTotal(sid, total)   // [trace-count] 徽标全量 = DB 非 meta 消息总数
   }, [setMessages])
-  /** [window-paging] 向上翻页「加载更早」：以窗口首条为 beforeMessageId 取更早一页 prepend（保持时序 + 幂等去重）。 */
+  /** [turn-paging] 向上翻页「加载更多」：以窗口内**最早一轮的用户提问 id** 为 beforeTurnId 再拉 2 轮 prepend
+   *  （整轮返回 + 幂等去重）。⚠️ 不能用窗口首条消息 id：它可能是 boundary / system / 半截轮的残留行，
+   *  后端对「不是用户提问行」的 beforeTurnId 直接 400（不静默返回空页）。 */
   const handleLoadOlder = useCallback(async (sid: string) => {
     const st = useChatStore.getState()
-    const first = (st.messages[sid] ?? [])[0]
-    if (!first?.id) return
+    const firstTurn = (st.messages[sid] ?? []).find((m) => isUserTurnRow(m))
+    if (!firstTurn?.id) return
     try {
-      const { messages, hasMore } = await chatApi.listMessagesPage(sid, {
-        limit: HISTORY_PAGE_SIZE,
-        beforeMessageId: first.id,
-      })
+      const { messages, hasMore } = await chatApi.listTurns(sid, { turns: 2, beforeTurnId: firstTurn.id })
       st.prependMessages(sid, messages, hasMore)
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
@@ -552,7 +658,7 @@ function App() {
       //   · 轨迹「已裁剪」pill 的缺口是确定的 —— traceMessages 拿到全量（boundary + 被裁消息都在），
       //     但 snippedIds 只由 STOMP 实时 / setMessages 解析填充，F5（冷启动）后为空 → pill 不渲染
       //     （P2-19 取证②）。本行用同一份全量补齐 snippedIds。
-      //   · 聊天区角标：被裁消息落在当前窗口时才需要角标，而尾页窗口（loadTailWindow 只拉 50 条）
+      //   · 聊天区角标：被裁消息落在当前窗口时才需要角标，而尾页窗口（loadTailWindow 只拉最近 3 轮）
       //     可能不含 boundary → setMessages 的解析为空（补上后不再依赖「boundary 是否落在加载页」）。
       //   位置在过期守卫【之前】：snippedIds 是会话级既成事实，与「此刻是否仍停在轨迹 tab」无关；
       //   过期守卫只约束 traceMessages 这个 UI 副本（快速切走不得回灌）。
@@ -681,6 +787,33 @@ function App() {
     }
   }, [])
 
+  /** 历史提问：拉当前会话**全部** user 消息（不经过 compact 边界过滤，保证「应该很多」）。 */
+  const loadHistoryQuestions = useCallback(async (sid: string) => {
+    const seq = ++historyReqSeq.current
+    setHistoryQuestions([])
+    setHistoryLoading(true)
+    setHistoryError(null)
+    try {
+      const msgs = await chatApi.listMessages(sid)
+      if (seq !== historyReqSeq.current || activeSessionIdRef.current !== sid) return
+      const qs = msgs
+        .filter((m) => m.role === 'user' && !m.isMeta)
+        .map((m) => ({
+          id: m.id,
+          createdAt: m.time ?? '',
+          previewSource: m.content ?? '',
+          removedAfter: 0,
+        }))
+        .reverse()
+      setHistoryQuestions(qs)
+    } catch (e) {
+      if (seq !== historyReqSeq.current || activeSessionIdRef.current !== sid) return
+      setHistoryError(e instanceof ApiError ? e.userMessage() : String(e))
+    } finally {
+      if (seq === historyReqSeq.current) setHistoryLoading(false)
+    }
+  }, [])
+
   // ---- Ctrl+B：当前会话前台任务全部转后台（对齐 CC task:background · 主线程可继续对话）----
   useEffect(() => {
     const onBg = (e: KeyboardEvent) => {
@@ -701,6 +834,13 @@ function App() {
       if (e.key !== 'Escape') return
       // 命令面板打开时 Esc 交由其自身关闭，避免双击误触发对话操作弹窗
       if (showCommandPalette) return
+      // 弹层打开时 Esc 只交给弹层自身关闭（基础设置 / 历史提问各自有 useEscapeKey）
+      if (showBasicSettings || showHistoryPanel) return
+      // 主区停在定时任务页：Esc 先回对话页（不卡在任务页），不再触发停流 / 连按判定。
+      if (showSchedulesPage) {
+        setWorkspacePage('chat')
+        return
+      }
       const now = Date.now()
       // turn 运行中（activeStreams 含本会话 = 已登记，含 thinking 阶段）：Esc 一次停当前流式；
       //   3s 内第二次停当前会话所有任务（对齐 CC useCancelRequest killAllAgents 连按确认 · KILL_AGENTS_CONFIRM_WINDOW_MS=3000）
@@ -738,7 +878,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [canOpenDialogOps, showCommandPalette, turnRunning, stopStreaming, handleStopAll, loadDialogOpsCandidates])
+  }, [canOpenDialogOps, showCommandPalette, showBasicSettings, showHistoryPanel, showSchedulesPage, turnRunning, stopStreaming, handleStopAll, loadDialogOpsCandidates])
 
   const handleConfirmCompact = useCallback(async (messageId: string, direction: 'from' | 'up_to') => {
     if (!activeSessionId) return
@@ -754,19 +894,21 @@ function App() {
     }
   }, [activeSessionId, setMessages, setConversationId, showToast])
 
-  // ---- 对话裁剪：DELETE 删 pivot 起全部消息 + 旋转 conversationId（响应 messages 已归一化直接覆盖）----
+  // ---- 对话裁剪：DELETE 删 pivot 起全部消息 + 旋转 conversationId（响应轻量：{conversationId, deletedCount}）
+  //   裁剪后**重拉窗口**（loadTailWindow = GET /messages/turns 按轮分页，毫秒级）——
+  //   后端不再回传全量 messages（万级消息 = 几万条 JSON，序列化/传输本身是卡顿的一环）。
   const handleTrimAfter = useCallback(async (messageId: string) => {
     if (!activeSessionId) return
     try {
       const resp = await chatApi.trimAfter(activeSessionId, messageId)
-      setMessages(activeSessionId, resp.messages)
       if (resp.conversationId) setConversationId(activeSessionId, resp.conversationId)
+      await loadTailWindow(activeSessionId)
       setShowDialogOps(false)
       showToast('已裁剪，此消息及其之后的对话已删除', 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
-  }, [activeSessionId, setMessages, setConversationId, showToast])
+  }, [activeSessionId, setConversationId, loadTailWindow, showToast])
 
   // [window-paging] 重拉当前会话（无 toast · complete 回调 + F5 共用）：查看通道 = 尾页窗口（对齐 deepseek，
   //   不再全量）。Trace 全程由 loadTraceFull 单独全量拉（见上方依赖 centerView 的 effect / 渲染用 traceMessages）。
@@ -822,13 +964,12 @@ function App() {
     let cancelled = false
     const cached = useChatStore.getState().messages[activeSessionId]
     if (Array.isArray(cached) && cached.length > 0) return
-    // [window-paging] 无缓存 → 尾页（有界窗口，不再全量；hasMore 供顶部「加载更早」）
-    chatApi.listMessagesPage(activeSessionId, { limit: HISTORY_PAGE_SIZE })
-      .then(({ messages, hasMore, total }) => {
+    // [turn-paging] 无缓存 → 最近 3 轮（有界窗口，不再全量；hasMore 供顶部「加载更多」）
+    chatApi.listTurns(activeSessionId, { turns: 3 })
+      .then(({ messages, hasMore }) => {
         if (cancelled) return
         setMessages(activeSessionId, messages)
         useChatStore.getState().setHasMore(activeSessionId, hasMore)
-        useChatStore.getState().setMsgTotal(activeSessionId, total)   // [trace-count] 徽标全量 = DB 非 meta 消息总数
       })
       .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     return () => { cancelled = true }
@@ -1477,6 +1618,84 @@ function App() {
   )
   const toggleRightCollapsed = useCallback(() => setRightCollapsed((v) => !v), [])
 
+  // ---- 主区头部的通用动作（WorkspaceHeader）----
+  // 历史提问：打开时拉候选（全部 user 消息）；「压缩 / 裁剪」仍走既有 DialogOpsModal
+  //   （不另造第二条执行路径，确认/后果提示等既有能力原样保留）。
+  const toggleHistoryPanel = useCallback(() => {
+    if (!showHistoryPanel && activeSessionId) {
+      void loadHistoryQuestions(activeSessionId)
+      // 压缩/裁剪弹窗仍用「当前上下文可见」候选，单独加载
+      void loadDialogOpsCandidates(activeSessionId)
+    }
+    setShowHistoryPanel((v) => !v)
+  }, [showHistoryPanel, activeSessionId, loadHistoryQuestions, loadDialogOpsCandidates])
+  const closeHistoryPanel = useCallback(() => setShowHistoryPanel(false), [])
+  // [历史提问跳转] 跳转目标 + 递增 nonce（同一行重复点击也重新定位）；目标任务由 MessageList 完成
+  //   定位 + 短暂高亮（不在已加载窗口时先复用 onLoadOlder 补拉更早页）。
+  const historyJumpSeq = useRef(0)
+  const [historyJump, setHistoryJump] = useState<{ id: string; nonce: number } | null>(null)
+  /**
+   * [历史提问跳转] 关闭面板并把目标交给 MessageList：定位 + 短暂高亮。
+   */
+  const handleHistoryJump = useCallback((messageId: string) => {
+    setShowHistoryPanel(false)
+    setHistoryJump({ id: messageId, nonce: ++historyJumpSeq.current })
+  }, [])
+  const openHistoryOps = useCallback((tab: 'compact' | 'trim') => {
+    // 与双击 Esc 同一道闸：对话进行中 / 有草稿时不允许压缩/裁剪（避免从面板绕过既有保护）。
+    if (!canOpenDialogOps) {
+      showToast('对话进行中或有未发送内容，暂不能压缩/裁剪', 'info')
+      return
+    }
+    setDialogOpsTab(tab)
+    // 历史面板可能只加载了全量提问；打开压缩/裁剪前补拉「当前上下文可见」候选
+    if (activeSessionId) void loadDialogOpsCandidates(activeSessionId)
+    setShowDialogOps(true)
+    setShowHistoryPanel(false)
+  }, [canOpenDialogOps, showToast, activeSessionId, loadDialogOpsCandidates])
+  /** 主区标题保存：复用会话重命名（PATCH title + 本地同步）。 */
+  const handleWorkspaceRename = useCallback((title: string) => {
+    if (activeSessionId) void renameSession(activeSessionId, title)
+  }, [activeSessionId, renameSession])
+  /** 轨迹入口：进入 trace；再次点击返回对话（tab 行已移除，必须留回路）。
+   *  已在轨迹视图时再点 = 手动重试全量拉取（沿用原「轨迹」tab 的同一条兜底语义）。 */
+  const handleWorkspaceTrace = useCallback(() => {
+    if (centerView === 'trace') {
+      if (activeSessionId) void loadTraceFull(activeSessionId)
+      return
+    }
+    setCenterView('trace')
+  }, [centerView, activeSessionId, loadTraceFull])
+  const handleWorkspaceSearch = useCallback(() => {
+    if (!ui.showSearchPalette) uiDispatch({ type: 'TOGGLE_SEARCH' })
+  }, [ui.showSearchPalette, uiDispatch])
+  const handleWorkspaceShare = useCallback(() => showToast('分享功能建设中', 'info'), [showToast])
+  // 切会话 / 新建 → 历史提问面板回到关闭态（候选属于上一个会话），跳转目标一并作废
+  useEffect(() => { setShowHistoryPanel(false); setHistoryJump(null) }, [activeSessionId])
+
+  /**
+   * [任务结束入口] 助手消息底部链接（产物 / 变更 / 来源）→ 打开右栏抽屉并切到对应 tab。
+   *
+   * <p>⚠️ master 的 `RightTab` 只覆盖图标轨的 files/tasks/projects/terminal；抽屉新增的
+   * artifacts / sources 值由 RightPanel 内部按更宽的联合渲染 ⇒ 此处用窄类型出口收敛。
+   */
+  const openRightTab = useCallback((tab: 'artifacts' | 'files' | 'sources') => {
+    uiDispatch({ type: 'SET_RIGHT_TAB', tab: tab as RightTab })
+    setRightDrawerOpen(true)
+  }, [uiDispatch])
+
+  /** 左下角用户行 → 基础设置。若完整设置正开着（理论不可达，防御）先收起。 */
+  const openBasicSettings = useCallback(() => {
+    if (ui.showSettings) uiDispatch({ type: 'CLOSE_SETTINGS' })
+    setShowBasicSettings(true)
+  }, [ui.showSettings, uiDispatch])
+
+  /** 基础设置「高级设置」→ 关闭基础设置，打开现有完整设置（内部实现一行不改）。 */
+  const openAdvancedSettings = useCallback(() => {
+    setShowBasicSettings(false)
+    if (!ui.showSettings) uiDispatch({ type: 'TOGGLE_SETTINGS' })
+  }, [ui.showSettings, uiDispatch])
+
   const openSettingsAt = useCallback(
     (tab: SettingsTab) => {
       settingsDispatch({ type: 'SET_SETTINGS_TAB', tab })
@@ -1571,6 +1790,45 @@ function App() {
     openProjectFile(pid, path)
   }, [activeSession?.mainProjectId, openProjectFile, showToast])
 
+  // [产物/来源] 产物行点击 → 打开该产物的本地文件
+  //   localPath 是**归档副本的绝对路径**（{configHome}/artifacts/<sessionId>/…，未绑定项目的会话也有）：
+  //   - Tauri：直接交给系统默认程序；
+  //   - 浏览器/dev：⚠️ 副本不在任何项目根内 ⇒ ⛔ 不能走 openRefFile/openProjectFile（必报「文件路径非法」），
+  //     改走会话产物内容接口（GET /sessions/{sid}/artifacts/{aid}/content）只读预览。
+  const openArtifact = useCallback(async (a: SessionArtifactDto) => {
+    const path = a.localPath
+    if (!path) return
+    const { isTauri } = await import('@tauri-apps/api/core')
+    if (isTauri()) {
+      try {
+        const { openPath } = await import('@tauri-apps/plugin-opener')
+        await openPath(path)
+        return
+      } catch { /* 桌面打开失败 → 回落浏览器预览通道 */ }
+    }
+    if (!activeSessionId) {
+      showToast('无法打开产物：未选中会话', 'info')
+      return
+    }
+    try {
+      const c = await artifactsApi.content(activeSessionId, a.id)
+      if (c.binary) {
+        try { await navigator.clipboard.writeText(path) } catch { /* 剪贴板被拒不影响提示 */ }
+        showToast('二进制产物无法在浏览器预览，路径已复制', 'success')
+        return
+      }
+      setPreviewArtifact({ sessionId: activeSessionId, artifact: a })
+    } catch (e) {
+      if (e instanceof ApiError) {
+        if (e.status === 404) showToast('产物文件不存在（可能已被删除）', 'info')
+        else if (e.status === 400) showToast('产物路径非法', 'info')
+        else showToast(e.userMessage(), 'info')
+      } else {
+        showToast('打开产物失败', 'info')
+      }
+    }
+  }, [activeSessionId, showToast])
+
   // [Phase3 @引用] 项目树右键「引用到对话」/ 未来其它入口 → 把 @path 插进输入框（与输入框 @ 补全同效）
   const insertReference = useCallback((path: string) => {
     setComposerText((prev) => {
@@ -1644,8 +1902,16 @@ function App() {
   }, [showToast, activeSessionId, reloadMessages])
 
   // ---- composer ----
-  const sendMessage = useCallback(async (attachments?: AttachmentRequest[]) => {
-    let text = composerText.trim()
+  /**
+   * 发消息。
+   *
+   * @param attachments 附件
+   * @param textOverride 显式文本（**编辑重发用**：重发的文本不在 composerText 里，
+   *   而 composerText 是闭包旧值 ⇒ 先 setComposerText 再调本函数会读到旧文本、发出空消息）。
+   *   省略 = 用输入框当前草稿（所有既有调用点行为不变）。
+   */
+  const sendMessage = useCallback(async (attachments?: AttachmentRequest[], textOverride?: string) => {
+    let text = (textOverride ?? composerText).trim()
     // [v6 · 2026-10-19] 召唤技能的输入框文本 = 中文显示名 ⇒ 发送时先还原为真实斜杠命令
     // （下面的命令分发/执行逻辑依赖 "/" 开头，必须先于它还原）。
     const alias = slashAliasRef.current
@@ -1787,6 +2053,35 @@ function App() {
     }
   }, [composerText, activeSessionId, activeSession, showToast, runBuiltin])
 
+  // ---- [用户消息编辑重发] 裁剪该消息起全部对话 → 用新文本重发（复用 trimAfter + sendMessage）----
+  //   顺序固定（性能改造后）：① trimAfter（后端 cancel-first + **区间删除**，毫秒级）
+  //   → ② 落新 conversationId + **重拉窗口**（loadTailWindow）→ ③ 退出编辑态（onTrimmed 回调）
+  //   → ④ 走**普通发送路径**（乐观气泡 + 登记 activeStreams ⇒ 消息区出现「思考中…」）。
+  //   ⚠️ 编辑态只覆盖「裁剪」这一小段：裁剪一完成就退出编辑态，不再让用户盯着「发送中…」。
+  //   ⚠️ 顺序要点：重拉窗口必须在发送之前（setMessages 会整体替换消息数组 ⇒ 晚于发送就会把
+  //   乐观气泡冲掉）；退出编辑态放在重拉之后（pivot 气泡此时已从 store 移除 ⇒ 不会闪一下原文）。
+  //   任一步失败 → toast 具体原因并 throw，让气泡保持编辑态（草稿不丢）。
+  //   sendMessage 的引用随 composerText 每敲一键变化 ⇒ 走 ref 取最新值，本回调自身引用保持稳定，
+  //   否则会把 MessageList 的 memo 打穿（打字时整表重渲，见 MessageList.tsx 末尾的稳定性契约）。
+  const sendMessageRef = useRef(sendMessage)
+  useEffect(() => { sendMessageRef.current = sendMessage })
+  const handleEditResend = useCallback(async (messageId: string, newText: string, onTrimmed?: () => void) => {
+    if (!activeSessionId) return
+    try {
+      const resp = await chatApi.trimAfter(activeSessionId, messageId)
+      // F10：裁剪后后端返回新 conversationId（row key 刷新），落 store
+      if (resp.conversationId) setConversationId(activeSessionId, resp.conversationId)
+      // 重拉窗口（裁剪后剩余内容 = 按轮分页的最近 3 轮；不再依赖响应里的全量 messages）
+      await loadTailWindow(activeSessionId)
+      // 裁剪完成 ⇒ 立刻退出编辑态（编辑态只覆盖裁剪这一小段）
+      onTrimmed?.()
+      await sendMessageRef.current(undefined, newText)
+    } catch (e) {
+      showToast('编辑并重新发送失败：' + (e instanceof ApiError ? e.userMessage() : String(e)), 'info')
+      throw e
+    }
+  }, [activeSessionId, setConversationId, loadTailWindow, showToast])
+
   // ---- 停止生成：点「停止」/ Esc → 调 /cancel，成功后清空本地流式态 ----
   // ---- 删除消息：后端 DELETE + 本地 store 同步移除 ----
   const handleDeleteMessage = useCallback(async (messageId: string) => {
@@ -1824,6 +2119,8 @@ function App() {
   useEscapeKey(ui.showAddPanel, () => { uiDispatch({ type: 'CLOSE_ADD_PANEL' }); projectDispatch({ type: 'SET_ADD_SEARCH', value: '' }) })
   useEscapeKey(ui.showSearchPalette, () => { uiDispatch({ type: 'CLOSE_SEARCH' }); uiDispatch({ type: 'SET_SEARCH_QUERY', value: '' }) })
   useEscapeKey(ui.showSettings, () => uiDispatch({ type: 'CLOSE_SETTINGS' }))
+  useEscapeKey(showBasicSettings, () => setShowBasicSettings(false))
+  useEscapeKey(showHistoryPanel, () => setShowHistoryPanel(false))
   useEscapeKey(!!ui.diffFile, () => { uiDispatch({ type: 'SET_DIFF', file: null }); setLiveDiff(null) })
   useEscapeKey(showModelPicker, () => setShowModelPicker(false))
   useEscapeKey(showAgentsPanel, () => setShowAgentsPanel(false))
@@ -1853,7 +2150,8 @@ function App() {
   // ⛔ 折叠态第三列只留 36px：右栏**不展示内容面板**，只剩一个裸按钮（用户裁定）。
   return (
     <div
-      className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}`}
+      className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}${rightDrawerOpen ? ' right-drawer-open' : ''} workspace-surface`}
+      data-page={showSchedulesPage ? 'schedules' : 'chat'}
       style={(rightCollapsed || leftCollapsed)
         ? { gridTemplateColumns: `${leftCollapsed ? 48 : 260}px 1fr ${rightCollapsed ? 36 : 'var(--right-w)'}` }
         : undefined}
@@ -1866,6 +2164,8 @@ function App() {
       </div>
       <SessionList
         sessions={storeSessions}
+        // [2026-10-29] 默认折叠所有分组，只自动展开当前会话所在组（用户裁定：不要一进来全展开）
+        groupsDefaultCollapsed
         activeSession={activeSessionId}
         switchSession={switchSession}
         projectPathFor={(pid) => {
@@ -1920,12 +2220,19 @@ function App() {
             }
           })()
         }}
-        onCreateSession={() => void handleNewSession()}
+        // 新建会话：先回对话页再建（否则建完还停在定时任务页，用户看不到新会话）
+        onCreateSession={() => { setWorkspacePage('chat'); void handleNewSession() }}
+        // 左栏「定时任务」→ 主区换页（走现有 useSchedules，不弹设置）
+        onOpenSchedules={() => setWorkspacePage('schedules')}
+        schedulesActive={showSchedulesPage}
         onOpenAgentMarket={() => setShowMarket(true)}
         onOpenKnowledgeBase={() => showToast('知识库建设中，敬请期待', 'info')}
         doneUnreadIds={doneUnreadIds}
         onAddWorkspace={() => void handleAddWorkspace()}
-        onOpenSettings={() => uiDispatch({ type: 'TOGGLE_SETTINGS' })}
+        onOpenSettings={openBasicSettings}
+        // 左栏改版：任务区标题、磨玻璃、底部用户区、搜索入口、定时任务入口
+        workspaceRedesign
+        onOpenSearch={handleWorkspaceSearch}
         onDeleteSession={handleDeleteSession}
         onRenameSession={renameSession}
         runningSessionIds={runningSessionIds}
@@ -1934,35 +2241,43 @@ function App() {
         collapsed={leftCollapsed}
       />
       <div className="center">
+        {/* 定时任务页：主区换页而不是弹设置。对话面仍挂载、由 CSS 隐藏，
+            避免换页丢掉 Composer 的草稿/附件状态。 */}
+        {showSchedulesPage && (
+          <SchedulesPage schedulesApi={schedulesApi} showToast={showToast} />
+        )}
         {/* 无会话：不插空态页 —— 保留原首页（Composer welcome hero + 左栏「新建会话」），右栏各 tab 显示 0/空态 */}
-        <div className="center-tabs">
-          <button className={`center-tab ${centerView === 'chat' ? 'active' : ''}`} onClick={() => setCenterView('chat')}>
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M1.5 3C1.5 2.5 1.8 2.2 2.3 2.2H4L4.8 3.4H9.7C10.2 3.4 10.5 3.7 10.5 4.2V9C10.5 9.5 10.2 9.8 9.7 9.8H2.3C1.8 9.8 1.5 9.5 1.5 9V3Z"/></svg>
-            对话
-          </button>
-          <button
-            className={`center-tab ${centerView === 'trace' ? 'active' : ''}`}
-            onClick={() => {
-              // [Trace 释放·去旁路] 进入轨迹不再在此处发请求：全量加载由依赖 centerView 的 effect 单点负责，
-              //   否则进入时 onClick + effect 会重复发两条全量请求（本就冗余）。已在轨迹视图时再点 = 手动
-              //   重试（保留原「手动再点兜底」语义）；loadTraceFull 已内建过期守卫，此调用同样不可能绕过。
-              if (centerView === 'trace') {
-                if (activeSessionId) void loadTraceFull(activeSessionId)
-              } else {
-                setCenterView('trace')
-              }
-            }}
-          >
-            <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M6 1L6 9M6 9L3 6M6 9L9 6M3 11H9"/></svg>
-            轨迹
-            <span className="count-badge">{activeMsgTotal ?? storeMessages.filter((m) => !m.isMeta).length}</span>
-          </button>
-        </div>
+        {/* 主区头部（左栏改版）：任务标题（可编辑）+ 搜索/分享/轨迹/历史提问/面板开合。 */}
+        <WorkspaceHeader
+          title={workspaceTitle}
+          isWork={false}
+          onRename={handleWorkspaceRename}
+          onSearch={handleWorkspaceSearch}
+          onShare={handleWorkspaceShare}
+          onTrace={handleWorkspaceTrace}
+          traceActive={centerView === 'trace'}
+          traceCount={activeMsgTotal}
+          onHistory={toggleHistoryPanel}
+          history={{
+            open: showHistoryPanel,
+            loading: historyLoading,
+            error: historyError,
+            candidates: historyQuestions,
+            onClose: closeHistoryPanel,
+            onRetry: () => { if (activeSessionId) void loadHistoryQuestions(activeSessionId) },
+            onJump: handleHistoryJump,
+            onCompact: () => openHistoryOps('compact'),
+            onTrim: () => openHistoryOps('trim'),
+          }}
+          showPanelToggle
+          rightCollapsed={!rightDrawerOpen}
+          onTogglePanel={() => setRightDrawerOpen((v) => !v)}
+        />
         <div className="stream">
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} />
           )}
         </div>
         {currentPermission && (
@@ -2061,6 +2376,8 @@ function App() {
         setRightTab={setRightTabCb}
         onOpenFileRow={openChangedFileDiff}
         onOpenFile={openProjectFile}
+        artifacts={sessionArtifacts}
+        onOpenArtifact={openArtifact}
         onQuoteFile={insertReference}
         showToast={showToast}
         openSettingsAt={openSettingsAt}
@@ -2068,9 +2385,19 @@ function App() {
         onRollbackFile={rollbackChangedFile}
         onToggleCollapse={toggleRightCollapsed}
         collapsed={rightCollapsed}
+        // 改版后右栏是默认收起的抽屉（不占列宽）⇒ 用抽屉自带的 × / Esc 关闭，不再有「收起成窄条」
+        drawer={RIGHT_PANEL_DRAWER}
+        drawerOpen={rightDrawerOpen}
+        onDrawerClose={() => setRightDrawerOpen(false)}
+        // 「终端」tab 复用既有 STOMP 连接（不新开连接）
+        socketClientRef={clientRef}
+        // 抽屉的 tab 集合：通用 tab（不含任何场景专属 tab）。'tasks' 无抽屉文案，
+        //   RightPanel 会按 DRAWER_TAB_LABEL 过滤掉，保留以对齐图标轨的 tab 口径。
+        visibleTabs={['files', 'tasks', 'projects', 'artifacts', 'sources', 'team', 'run', 'terminal']}
       />
-      {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport；折叠时由窄 rail 展开，不显示 resizer） */}
-      {!rightCollapsed && <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />}
+      {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport）
+          改版后右栏是抽屉（宽度由抽屉自身 `--right-drawer-w` 决定、不占三栏列宽）⇒ 不渲染该 resizer。 */}
+      {!RIGHT_PANEL_DRAWER && !rightCollapsed && <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />}
 
       {/* Diff / 文件查看（monaco 已静态入主包，点开即用） */}
       {(liveDiff ?? currentDiff) && (
@@ -2084,6 +2411,13 @@ function App() {
           projectId={openFile.projectId}
           path={openFile.path}
           close={() => setOpenFile(null)}
+        />
+      )}
+      {previewArtifact && (
+        <ArtifactPreviewModal
+          sessionId={previewArtifact.sessionId}
+          artifact={previewArtifact.artifact}
+          close={() => setPreviewArtifact(null)}
         />
       )}
       {showEffort && (
@@ -2182,6 +2516,22 @@ function App() {
         />
       )}
       <SkillSurvey />
+      {/* 基础设置（左下角用户行）：轻量四项 + 「高级设置」→ 现有完整设置 */}
+      {showBasicSettings && (
+        <BasicSettingsModal
+          theme={settings.theme}
+          setTheme={(t) => settingsDispatch({ type: 'SET_THEME', theme: t })}
+          fontSize={settings.fontSize}
+          setFontSize={(s) => settingsDispatch({ type: 'SET_FONT_SIZE', size: s })}
+          dataDir={
+            appSettings?.configHome
+              ?? (appSettings?.appName ? `~/.${appSettings.appName}` : '~/.nexusai')
+          }
+          onOpenAdvanced={openAdvancedSettings}
+          close={() => setShowBasicSettings(false)}
+          showToast={showToast}
+        />
+      )}
       {ui.showSettings && (
         <SettingsModal
           settingsTab={settings.settingsTab}

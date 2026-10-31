@@ -182,6 +182,24 @@ public class SessionRecord {
      * 0 = 本会话强制普通（压过全局开）—— 这正是「A 会话是协调者、B 会话不是」的载体。
      */
     private Integer coordinatorMode;
+    /**
+     * 会话级 computer-use 授权位（V250 列 computer_use_grants，TEXT JSON 对象，可空）·
+     * CC original: appState.computerUseMcpState.{allowedApps, grantFlags}
+     * （CCB 2.8.4 src/utils/computerUse/wrapper.tsx:104-124 的 setAppState 写回）。
+     * <p>CCB 该状态活在<b>长驻进程内存</b>里 ⇒ 本仓 Web 端每 send 新建 LlmAgentLoop
+     * （prototype 作用域）⇒ 内存态活不过下一条用户消息 ⇒ 必须由会话列承载
+     * （multi-session-vs-cc-single-session 铁律：todos V43 / effort_level V31 /
+     * session_permission_rules V75 同款范式）。
+     * <p>规范形 {"apps":[{"appId","displayName","grantedAt","tier"}],
+     * "flags":{"clipboardRead","clipboardWrite","systemKeyCombos"}}；
+     * appId = 归一后的可执行文件名（Windows 无 bundle id）。
+     * <p>⛔ 授权位合并 = <b>truthy-only 只增不减</b>（后一次 request_access 不能撤销先前的
+     * 剪贴板授权；CCB packages/@ant/computer-use-mcp/src/mcpServer.ts:58-77）。
+     * <p>可空：null = 该会话无任何 computer-use 授权（读侧降级为空授权 + WARN，不抛）。
+     * 读写解析放 ComputerUseGrants.toJson / parse（照抄 disabledTools L51 先例：
+     * 本列仅存 JSON 串、解析在读侧）。
+     */
+    private String computerUseGrants;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -247,4 +265,7 @@ public class SessionRecord {
     // [coordinator-session V75] 会话级 coordinator 模式 getter/setter（V75 会话列 coordinator_mode，MyBatis-Flex snake↔camel 映射）
     public Integer getCoordinatorMode() { return coordinatorMode; }
     public void setCoordinatorMode(Integer coordinatorMode) { this.coordinatorMode = coordinatorMode; }
+    // [computer-use Phase 1a V250] 会话级 computer-use 授权位 getter/setter（V250 会话列 computer_use_grants，MyBatis-Flex snake↔camel 映射）
+    public String getComputerUseGrants() { return computerUseGrants; }
+    public void setComputerUseGrants(String computerUseGrants) { this.computerUseGrants = computerUseGrants; }
 }

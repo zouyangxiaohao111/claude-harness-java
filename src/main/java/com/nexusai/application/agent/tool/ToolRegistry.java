@@ -75,6 +75,21 @@ public class ToolRegistry {
     private List<Tool> browserMcpTools;
 
     /**
+     * [CU-PoC] computer-use 工具 @Bean（{@code List<Tool>}）。
+     *
+     * <p>同 {@link #browserMcpTools} 通道：{@code ComputerUseToolConfig} @Bean 构建
+     * {@code mcp__computer-use__screenshot} / {@code mcp__computer-use__left_click} 两个工具，
+     * 经本字段显式注入后在 {@link #init()} 内 {@link #registerAll(List)} 逐个注册。
+     * {@code @Lazy} 破循环（同 browserMcpTools 先例，延迟到 ApplicationReadyEvent 解析）。
+     *
+     * <p>开关 {@code nexusai.feature.computer-use} 默认 false ⇒ 该 @Bean 返回空 List
+     * ⇒ 本字段注入空 List ⇒ 注册 no-op（模型看不到 mcp__computer-use__*）。
+     */
+    @Lazy
+    @Resource(name = "computerUseTools")
+    private List<Tool> computerUseTools;
+
+    /**
      * H7-arch Phase 3: 跳过 SPECIAL_TOOLS 过滤 · 对齐 CC execAgentHook.ts:93-105
      * hook agent 工具集手工构建（父工具过滤 + StructuredOutput，无 SPECIAL_TOOLS 排除）。
      *
@@ -261,6 +276,18 @@ public class ToolRegistry {
             log.info("ToolRegistry: browserMcpTools registerAll 完成，当前总计 {} 工具", tools.size());
         } else if (log.isDebugEnabled()) {
             log.debug("ToolRegistry: browserMcpTools @Bean 为空或未接线，跳过（nexusai-in-chrome 工具未注册）");
+        }
+
+        // [CU-PoC] 显式注册 computerUseTools @Bean（List<Tool>）内的 computer-use 工具。
+        // 同 browserMcpTools 通道：ComputerUseToolConfig @Bean 构建 mcp__computer-use__* 工具，
+        // 开关 nexusai.feature.computer-use 默认 false ⇒ @Bean 返回空 List ⇒ 本处 no-op。
+        if (computerUseTools != null && !computerUseTools.isEmpty()) {
+            log.info("ToolRegistry: init 接线 computerUseTools @Bean（List<Tool>），共 {} 个工具: {}",
+                computerUseTools.size(), computerUseTools.stream().map(Tool::name).toList());
+            registerAll(sortByCcOrder(computerUseTools));
+            log.info("ToolRegistry: computerUseTools registerAll 完成，当前总计 {} 工具", tools.size());
+        } else if (log.isDebugEnabled()) {
+            log.debug("ToolRegistry: computerUseTools @Bean 为空或未接线，跳过（mcp__computer-use__* 工具未注册）");
         }
 
         if (!tools.isEmpty()) {

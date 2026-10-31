@@ -1,7 +1,7 @@
 package com.nexusai.apis.permission;
 
+import com.nexusai.application.agent.permission.PendingPermissionSnapshot;
 import com.nexusai.application.agent.permission.WebSocketPermissionPrompter;
-import com.nexusai.eventbus.ws.MessagePermissionRequestEvent;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -22,6 +22,12 @@ import java.util.List;
  *
  * <p>当前承载：{@code pendingPermissions}（待回答的权限/提问，与 STOMP 事件同形，前端可直接入队）。
  * 后续会话级运行状态可在此扩展（接口名按「会话状态」而非「权限」命名）。
+ *
+ * <p><b>[刷新重放 · 三通道]</b>：本仓有三条权限通道（message 主通道 / bridge 远程弹窗 /
+ * channel 通道中继）把同一个待审批请求推给不同表面 ⇒ 快照必须<b>三通道齐备</b>：
+ * 此前只重放 message 通道 ⇒ bridge / channel 通道的待审批请求在用户<b>刷新页面</b>后消失
+ * （用户看不到、也没法批准/拒绝）。三条通道的快照统一成 {@link PendingPermissionSnapshot}
+ * 形状（前端 {@code PermissionEventPayload} 逐字段可消费）。
  */
 @RestController
 @RequestMapping("/api/v1/sessions/{sessionId}/state")
@@ -41,9 +47,9 @@ public class SessionStateController {
      */
     @GetMapping
     public SessionStateDto state(@PathVariable String sessionId) {
-        List<MessagePermissionRequestEvent> pending = prompter == null
+        List<PendingPermissionSnapshot> pending = prompter == null
             ? List.of()
-            : prompter.listPendingForSession(sessionId);
+            : prompter.listPendingSnapshots(sessionId);
         if (log.isDebugEnabled()) {
             log.debug("[SessionStateController] session={} pendingPermissions={}", sessionId, pending.size());
         }
@@ -54,7 +60,9 @@ public class SessionStateController {
      * 会话运行时状态快照。
      *
      * @param sessionId          会话 id
-     * @param pendingPermissions 仍在等待用户回答的权限/提问请求（与 STOMP 事件同形）
+     * @param pendingPermissions 仍在等待用户回答的权限/提问请求（<b>三通道统一形状</b> ·
+     *                           message / bridge / channel 三条通道的待审批请求都在这里 ·
+     *                           见 {@link PendingPermissionSnapshot}）
      */
-    public record SessionStateDto(String sessionId, List<MessagePermissionRequestEvent> pendingPermissions) {}
+    public record SessionStateDto(String sessionId, List<PendingPermissionSnapshot> pendingPermissions) {}
 }

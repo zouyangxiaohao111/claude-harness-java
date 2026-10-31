@@ -136,4 +136,32 @@ describe('[会话状态同步] pending 补拉 + 已知会话订阅', () => {
     expect(q).toHaveLength(1)
     expect(q[0].sessionId).toBe(OTHER)
   })
+
+  it('⭐ 补拉的桌面控制请求 ⇒ computerUse 原样保留（防 F5 / 切会话后授权范围消失）', async () => {
+    // WHY：补拉路径与实时路径**共用** `toPermissionItem`（手写字段清单）⇒ 漏抄 computerUse
+    //   的症状不是报错，而是「F5 后弹窗退回普通 allow/deny、用户看不到授权范围」。
+    //   这条断言把「补拉路径也带 computerUse」钉死。
+    const computerUse = {
+      apps: [{ appId: 'chrome', displayName: 'Chrome', tier: 'read', tierLabel: '只能查看', alreadyGranted: false, notInstalled: false }],
+      reason: '查报表',
+      requestedFlags: ['clipboardRead'],
+      flagLabels: { clipboardRead: '允许读取剪贴板' },
+    }
+    stateMock.mockResolvedValue({
+      sessionId: SID,
+      pendingPermissions: [{
+        requestId: 'r-cu-replay',
+        toolName: 'mcp__computer-use__request_access',
+        computerUse,
+        timestampMs: 1,
+      }],
+    })
+
+    await mount()
+
+    const queued = useChatStore.getState().permissionQueue.find((r) => r.requestId === 'r-cu-replay')
+    expect(queued, '补拉的权限请求未入队').toBeTruthy()
+    expect(queued!.computerUse).toEqual(computerUse)
+    expect(queued!.computerUse!.apps![0].tierLabel).toBe('只能查看')
+  })
 })

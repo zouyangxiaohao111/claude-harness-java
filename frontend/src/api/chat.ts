@@ -1,5 +1,5 @@
 import { api, BASE_URL } from './rest'
-import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, PivotCandidateDto, QueuePopResponse, SendMessageRequest } from './types'
+import type { ChatMessageDto, MessageCreatedResponse, PartialCompactRequest, PartialCompactResponse, PivotCandidateDto, QueuePopResponse, SendMessageRequest, TrimAfterResponse } from './types'
 
 export const chatApi = {
   listMessages: (sessionId: string) =>
@@ -11,6 +11,13 @@ export const chatApi = {
     api<{ messages: ChatMessageDto[]; hasMore: boolean; total: number }>(
       `/sessions/${encodeURIComponent(sessionId)}/messages/page?limit=${opts?.limit ?? 50}`
         + (opts?.beforeMessageId ? `&beforeMessageId=${encodeURIComponent(opts.beforeMessageId)}` : '')),
+  /** [turn-paging] 按**轮**分页：turns 缺省 2（后端同缺省，上限 10）；beforeTurnId 省略 = 最近 turns 轮，
+   *  给定 = 它**之前**的 turns 轮（不含该轮）。整轮返回、绝不切断（巨型轮一次返回几百条是正常形态）。
+   *  hasMore = 返回区间之前是否还有更早的用户提问；firstTurnId/lastTurnId = 窗口首末轮的用户提问 id。 */
+  listTurns: (sessionId: string, opts?: { turns?: number; beforeTurnId?: string }) =>
+    api<{ messages: ChatMessageDto[]; hasMore: boolean; firstTurnId: string | null; lastTurnId: string | null }>(
+      `/sessions/${encodeURIComponent(sessionId)}/messages/turns?turns=${opts?.turns ?? 2}`
+        + (opts?.beforeTurnId ? `&beforeTurnId=${encodeURIComponent(opts.beforeTurnId)}` : '')),
   /** [trace-count] 会话消息总数（轻量 GET /messages/count · DB sessions.messageCount 非 meta 口径 · 轨迹徽标轮询用） */
   messageCount: (sessionId: string) =>
     api<{ total: number }>(`/sessions/${encodeURIComponent(sessionId)}/messages/count`),
@@ -22,9 +29,10 @@ export const chatApi = {
     api<MessageCreatedResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages`, { method: 'POST', body: req }),
   removeMessage: (sessionId: string, messageId: string) =>
     api<void>(`/sessions/${encodeURIComponent(sessionId)}/messages/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
-  /** 对话裁剪：删除 pivot 起全部消息并旋转 conversationId（后端已实现 · 前端直接 setMessages + 刷新 row key） */
+  /** 对话裁剪：删除 pivot 起全部消息并旋转 conversationId（后端区间删除 · 前端拿到新 conversationId
+   *  后**重拉窗口**（GET /messages/turns），不再依赖响应里的全量 messages） */
   trimAfter: (sessionId: string, messageId: string) =>
-    api<PartialCompactResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages/after/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
+    api<TrimAfterResponse>(`/sessions/${encodeURIComponent(sessionId)}/messages/after/${encodeURIComponent(messageId)}`, { method: 'DELETE' }),
   cancel: (sessionId: string) =>
     api<void>(`/sessions/${encodeURIComponent(sessionId)}/cancel`, { method: 'POST' }),
   /** [C6] 会话服务端运行态（GET /sessions/{id}/running → {running}）—— 停止键可见性的权威源。

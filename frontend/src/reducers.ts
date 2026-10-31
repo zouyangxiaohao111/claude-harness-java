@@ -9,7 +9,7 @@
 
 import { useReducer } from 'react'
 import type { Dispatch } from 'react'
-import type { ContextMenuState, Project, SettingsTab, ThemeMode, FontSize } from './types'
+import type { ContextMenuState, Project, RightTab, SettingsTab, ThemeMode, FontSize } from './types'
 import { allProjects } from './data'
 
 /* ------------------------------------------------------------------ */
@@ -155,7 +155,7 @@ export type UIAction =
   | { type: 'CLOSE_SETTINGS' }
   | { type: 'TOGGLE_MODEL_DROPDOWN' }
   | { type: 'CLOSE_MODEL_DROPDOWN' }
-  | { type: 'SET_RIGHT_TAB'; tab: 'files' | 'tasks' | 'projects' }
+  | { type: 'SET_RIGHT_TAB'; tab: RightTab }
   | { type: 'SET_DIFF'; file: string | null }
   | { type: 'OPEN_CONTEXT_MENU'; menu: ContextMenuState }
   | { type: 'CLOSE_CONTEXT_MENU' }
@@ -167,7 +167,7 @@ export interface UIState {
   showSearchPalette: boolean
   showSettings: boolean
   showModelDropdown: boolean
-  rightTab: 'files' | 'tasks' | 'projects'
+  rightTab: RightTab
   diffFile: string | null
   contextMenu: ContextMenuState | null
   toast: { msg: string; type: 'success' | 'info' } | null

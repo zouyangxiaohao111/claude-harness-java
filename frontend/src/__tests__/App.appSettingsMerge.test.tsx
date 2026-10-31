@@ -39,7 +39,7 @@ vi.mock('@/api/chat', () => ({
   chatApi: {
     sessionRunning: vi.fn(() => new Promise(() => {})),
     messageCount: vi.fn(async () => ({ total: 0 })),
-    listMessagesPage: vi.fn(async () => ({ messages: [], hasMore: false, total: 0 })),
+    listTurns: vi.fn(async () => ({ messages: [], hasMore: false, firstTurnId: null, lastTurnId: null })),
     listMessages: vi.fn(async () => []),
     fetchImagesBatch: vi.fn(async () => ({})),
     send: vi.fn(),

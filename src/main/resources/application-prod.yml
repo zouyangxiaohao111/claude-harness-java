@@ -5,3 +5,10 @@ spring:
     #   ${user.home}/.nexusai/nexusai.db（主线零变化）；appName=nexusai-scene ⇒
     #   ${user.home}/.nexusai-scene/nexusai.db。仅覆盖 url，其余继承主配置。
     url: "jdbc:sqlite:${user.home}/.${spring.application.name}/nexusai.db?journal_mode=WAL&synchronous=NORMAL&foreign_keys=on&busy_timeout=5000"
+
+logging:
+  file:
+    # 通用生产日志：${user.home}/.${spring.application.name}/logs。
+    # 通用版 appName=nexusai ⇒ ${user.home}/.nexusai/logs（与 Rust 壳 backend::data_dir() 同一根）。
+    # ⛔ 不写死 .nexusai：路径一律由 appName 派生（改 appName 即改根目录）。
+    path: ${user.home}/.${spring.application.name}/logs

@@ -52,8 +52,11 @@ import java.util.List;
  *       （仅 id/name 非空白的项；{@code type=function}；{@code function.arguments}）</td>
  *       <td>{@code role} + {@code content} + 有则 {@code toolCalls}</td></tr>
  *   <tr><td>tool</td><td>{@code tool_call_id} + {@code content}（标量 <b>或</b> parts 数组：
- *       {@code acceptFeedback} 非空或含 text 块时走 parts）</td>
- *       <td>{@code role} + {@code toolCallId} + {@code content}（同一条二选一分支）</td></tr>
+ *       {@code acceptFeedback} 非空或含 text 块时走 parts）<b>+ {@code carrierContent}
+ *       （image 块经「紧随的 role=user 承载消息」上 wire，见 {@code OpenAiSdkProvider
+ *       .toSdkImageCarrierMessage}）</b></td>
+ *       <td>{@code role} + {@code toolCallId} + {@code content}（同一条二选一分支）
+ *       <b>+ {@code carrierContent}（有 image 块时）</b></td></tr>
  * </table>
  * <ul>
  *   <li>⭐ <b>⛔ 不许对所有 role 恒带「全部字段」（旧实现）</b>：wire 的 user 分支<b>从不读</b>
@@ -219,12 +222,20 @@ public final class OutboundWireProjection {
      * content 走 parts 数组（{@code [非空正文] + [acceptFeedback] + [各 text 块文字]}）；
      * 否则回落标量 {@code content(text)}。⇒ 该 role 的 {@code acceptFeedback} / text 块
      * <b>确实上 wire</b>（与 user 相反），故必须进投影。
+     *
+     * <p>⭐ <b>image 块（CU 截图）另走承载消息</b>：openai-java 0.25.0 的 tool content 数组收不了
+     * image part（{@code R-T-1}）⇒ wire 上 image 落在<b>紧随 tool 段之后的独立 role=user 消息</b>
+     * （{@code OpenAiSdkProvider.toSdkImageCarrierMessage}）。本投影把该贡献登记在
+     * {@code carrierContent} 键下 ⇒ 截图字节一变，投影必变（否则头部探针对「截图每次都不同」这一
+     * 最典型的真实漂移恒判绿 = 假阴性）。与 wire 的等价性判据见
+     * {@code OutboundWireProjectionWireFidelityTest}。
      */
     private static void projectToolRole(ChatMessageDto m, ObjectNode node) {
         // wire：toolCallId null/空白 ⇒ 整条被丢弃（yield null ⇒ 不进请求体）。该形态在探针/投影
         //   路径【不可达】：入参已过 ToolResultPairingRepair（OpenAiSdkProvider.buildRequestParams
         //   :799-800 / projectMessages 内），无 id 的 tool 结果已被剥离（ToolResultPairingRepair:270-278）。
-        if (m.toolCallId() == null || m.toolCallId().isBlank()) {
+        boolean survives = m.toolCallId() != null && !m.toolCallId().isBlank();
+        if (!survives) {
             log.warn("线级投影 role=tool：toolCallId 为空 —— wire 会整条丢弃；探针路径本应不可达（上游配对修复已剥离）");
         }
         node.put("toolCallId", m.toolCallId() == null ? "" : m.toolCallId());
@@ -254,9 +265,55 @@ public final class OutboundWireProjection {
                     + " —— 对齐 wire 的 contentOfArrayOfContentParts", parts.size(), hasFeedback);
             }
             node.set("content", parts);
-            return;
+        } else {
+            node.put("content", text);
         }
-        node.put("content", text);
+        // [CU 修复] image 块经 role=user 承载消息上 wire ⇒ 投影登记该贡献（tool 消息被丢弃时不登记）。
+        if (survives) {
+            ArrayNode carrier = renderToolImageCarrierParts(m.contentBlocks());
+            if (carrier != null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("线级投影 role=tool：image 块经 role=user 承载消息上 wire（{} 个 part）"
+                        + " ⇒ 投影登记 carrierContent", carrier.size());
+                }
+                node.set("carrierContent", carrier);
+            }
+        }
+    }
+
+    /**
+     * role=tool 的 image 块 → 承载消息的 content part 数组 · 与 wire
+     * {@code OpenAiSdkProvider.toSdkToolImageParts} <b>逐分支同构</b>。
+     *
+     * <p>⭐ <b>URL 解析不另写一份</b>：直接调 {@code OpenAiSdkProvider.resolveImageUrl}
+     * （同包纯函数）= wire 的同一实现 ⇒ 不会因两份规则漂移而产生新的假判据。
+     *
+     * <p>⛔ 只取 {@code type=image} 块（text 块留在 tool 消息本体 · document 块 SDK 无 part 类型
+     * 仍被跳过 · R-U-1）；url 不可解析的 image 块与 wire 同步跳过。
+     *
+     * @return 至少 1 个 part 时返回数组；否则 {@code null}（= wire 不产生承载消息）
+     */
+    private static ArrayNode renderToolImageCarrierParts(List<?> contentBlocks) {
+        if (contentBlocks == null || contentBlocks.isEmpty()) {
+            return null;
+        }
+        ArrayNode parts = JSON.createArrayNode();
+        for (Object blockObj : contentBlocks) {
+            if (!(blockObj instanceof JsonNode block) || !block.isObject()) {
+                continue;   // wire 同款：非 JsonNode 对象块直接跳过
+            }
+            if (!"image".equals(block.path("type").asText())) {
+                continue;   // wire 同款：只收 image 块
+            }
+            String url = OpenAiSdkProvider.resolveImageUrl(block);
+            if (url != null) {
+                parts.addObject().put("type", "image_url")
+                    .putObject("image_url").put("url", url);
+            } else if (log.isDebugEnabled()) {
+                log.debug("线级投影 role=tool：image 块无可用 url ⇒ 与 wire 同步跳过（R-U-1 受控残留）");
+            }
+        }
+        return parts.isEmpty() ? null : parts;
     }
 
     /**

@@ -416,12 +416,18 @@ public class SessionUsageLedger implements com.nexusai.infra.llm.LlmUsageRecorde
         boolean peak = costCalculator != null && costCalculator.isPeakHour();
         // [V101 分项] 计价<b>单点</b>：一次 price(...) 同时给出总额与分项，⛔ 不再分别调用
         //   calculateCostYuan + price（两套算路必然漂；calculateCostYuan 现已是 price(...).totalYuan() 视图）。
+        // [2026-10-29 裸名歧义] 计价/窗口/输出上限三处都带上本次调用<b>实际 provider 类型</b>
+        //   （LlmCallRecord.providerType）：计费只按「该类型下 enabled provider」的模型行取价，
+        //   裸名多 provider 同名时回落内置默认档，⛔ 不再走选模型链路的 fail-loud ERROR。
+        String providerType = call.providerType();
         ModelCostCalculator.CostBreakdown breakdown = costCalculator != null
-            ? costCalculator.price(call.modelName(), call.usage(), peak)
+            ? costCalculator.price(call.modelName(), call.usage(), peak, providerType)
             : null;
         double costYuan = breakdown != null ? breakdown.totalYuan() : 0.0;
-        int contextWindow = costCalculator != null ? costCalculator.contextWindowFor(call.modelName()) : 0;
-        long maxOutputTokens = costCalculator != null ? costCalculator.maxOutputFor(call.modelName()) : 0L;
+        int contextWindow = costCalculator != null
+            ? costCalculator.contextWindowFor(call.modelName(), providerType) : 0;
+        long maxOutputTokens = costCalculator != null
+            ? costCalculator.maxOutputFor(call.modelName(), providerType) : 0L;
         // 分项随记录传到落表点（persist）：PRICED = 分项齐全；计价器缺失（breakdown null）→ 走
         //   无分项重载，落表记 LEGACY（⛔ 不伪造分项）。
         LlmCallRecord enriched = call.withCost(breakdown, peak);

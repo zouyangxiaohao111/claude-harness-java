@@ -1,0 +1,21 @@
+# =====================================================================
+# 开发 profile（application.yml 的 spring.profiles.default=dev ⇒ 无显式 profile 时生效）
+# ---------------------------------------------------------------------
+# 也可显式选择：--spring.profiles.active=dev / SPRING_PROFILES_ACTIVE=dev；
+#   Tauri 壳自启后端时可用 NEXUSAI_BACKEND_PROFILE=dev 覆盖壳侧默认的 prod/scene。
+#
+# 日志：相对路径 logs —— 由进程工作目录决定：
+#   IDE 启动（cwd=backend/）        ⇒ <repo>/backend/logs
+#   Tauri 壳自启（cwd={data_dir}）  ⇒ {data_dir}/logs（场景版即 ~/.nexusai-scene/logs）
+# =====================================================================
+logging:
+  file:
+    path: logs
+
+# ---------------------------------------------------------------------
+# ⛔ 本文件不设 spring.datasource.url：
+#   application.yml 的 appName 动态库（${user.home}/.${spring.application.name}/nexusai.db）
+#   已是本地开发默认；而 application-local.yml（gitignored 的本机覆盖，经 spring.config.import
+#   叠加）需要能覆盖它 —— worktree 正是用它把 DB 隔离到自己的目录。
+#   profile 配置优先级高于 import：这里一写 url 就会把本机隔离覆盖掉。
+# ---------------------------------------------------------------------

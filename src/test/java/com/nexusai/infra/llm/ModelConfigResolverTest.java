@@ -109,12 +109,8 @@ class ModelConfigResolverTest {
         deepseek.setName("deepseek");
         when(providerMapper.selectOneByQuery(any())).thenReturn(deepseek);
 
-        ModelRecord model = new ModelRecord();
-        model.setProviderId("p-ds");
-        model.setName("deepseek-v4-flash");   // DB models.name = 裸名
-        model.setEnabled(true);
-        when(modelMapper.selectOneByQuery(any())).thenReturn(model);
-
+        // [2026-10-29] 新实现：首段是已注册 provider 名 → 纯字符串剥前缀，**不再查 models**
+        //   （查库才会因「多 provider 同名」撞歧义）。故这里不再 stub modelMapper。
         String bare = resolver.resolveSdkModelName("deepseek/deepseek-v4-flash");
 
         assertThat(bare)
@@ -140,7 +136,7 @@ class ModelConfigResolverTest {
     @Test
     @DisplayName("[FIX-STRIP-PREFIX] resolveSdkModelName: 未命中 → null（调用方回落原始值透传）")
     void resolveSdkModelName_notFound_returnsNull() {
-        when(modelMapper.selectListByQuery(any())).thenReturn(List.of());
+        // [2026-10-29] 首段不是已注册 provider ⇒ 直接 null（调用方回落原值），不查 models。
         assertThat(resolver.resolveSdkModelName("unknown/deepseek-v4-flash"))
             .as("未命中返回 null（CC 未知名直接传 API，失败即失败，不伪造裸名）")
             .isNull();

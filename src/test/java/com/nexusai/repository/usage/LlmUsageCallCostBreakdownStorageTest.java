@@ -96,10 +96,11 @@ class LlmUsageCallCostBreakdownStorageTest {
     private static ModelCostCalculator fixedPriceCalculator() {
         ModelCostCalculator calc = mock(ModelCostCalculator.class);
         when(calc.isPeakHour()).thenReturn(true);
-        when(calc.price(any(), any(), anyBoolean()))
+        // [2026-10-29] 账本改带 providerType 调用 → 桩打在 4 参 price / 2 参窗口·输出上限上
+        when(calc.price(any(), any(), anyBoolean(), any()))
             .thenReturn(new ModelCostCalculator.CostBreakdown(1.0, 0.2, 0.02, 0.01, 1.23, 1.5));
-        when(calc.contextWindowFor(any())).thenReturn(200_000);
-        when(calc.maxOutputFor(any())).thenReturn(8_192L);
+        when(calc.contextWindowFor(any(), any())).thenReturn(200_000);
+        when(calc.maxOutputFor(any(), any())).thenReturn(8_192L);
         return calc;
     }
 

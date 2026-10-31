@@ -53,6 +53,28 @@ export function createSocketClient(): Client {
   return client
 }
 
+/**
+ * 连接建立（含重连）监听表 —— 给「不归 useChatSocket 管、但需要连接可用后才订阅」的组件用
+ * （如集成终端：STOMP 订阅在断线时随连接失效，重连后必须重订）。
+ *
+ * <p>⛔ 不要直接覆盖 {@code client.onConnect}：那一个回调已被 useChatSocket 占用，
+ * 组件覆盖会让整条会话流/权限 topic 永久停摆。
+ */
+const connectListeners = new Set<() => void>()
+
+/** 登记「连接可用」回调，返回反登记函数（组件卸载时调用）。 */
+export function onSocketConnect(cb: () => void): () => void {
+  connectListeners.add(cb)
+  return () => { connectListeners.delete(cb) }
+}
+
+/** 由 useChatSocket 的 onConnect 调用（含重连）。单个监听抛错不影响其它监听。 */
+export function notifySocketConnect(): void {
+  for (const cb of connectListeners) {
+    try { cb() } catch { /* 忽略单个监听异常 */ }
+  }
+}
+
 /** 订阅 stream topic，把 body 解析后回调 onMessage；返回订阅句柄（多会话动态增删 unsubscribe 用） */
 export function subscribeStream(client: Client, topic: string, onMessage: (evt: StreamEvent) => void): StompSubscription {
   return client.subscribe(topic, (msg: IMessage) => {

@@ -1396,6 +1396,17 @@ export interface MessageCreatedResponse { userMessageId: string; assistantMessag
 export interface PartialCompactRequest { messageId: string; direction?: 'from' | 'up_to'; feedback?: string }
 export interface PartialCompactResponse { messages: ChatMessageDto[]; conversationId: string }
 
+// ---- 对话裁剪（DELETE /messages/after/{messageId}）· 轻量响应 ----
+// ⚠️ 破坏性契约变更：裁剪端点**不再回传全量 messages**（会话万级消息 = 几万条 JSON，序列化/传输
+//   本身就是裁剪卡顿的一环）。前端改为裁剪后**重拉窗口**（GET /messages/turns 按轮分页，毫秒级）。
+//   PartialCompactResponse 本身未被改动（partial 压缩端点仍在用）。
+export interface TrimAfterResponse {
+  /** 旋转后的新 conversationId（消息 row key 前缀 → 整列表 remount） */
+  conversationId: string
+  /** 本次裁掉的消息条数（pivot 起全部，含 pivot 自身） */
+  deletedCount: number
+}
+
 // ---- STOMP 事件全集（基类 type/sessionId/userMessageId/ts） ----
 export type StreamEventType =
   | 'message.chunk' | 'message.complete' | 'message.usage' | 'message.error' | 'message.cancelled' | 'message.user'
@@ -1672,6 +1683,44 @@ export type PermissionUpdate =
   | PermissionUpdateSetModeWire
   | PermissionUpdateDirectoriesWire
 
+// ---- 桌面控制授权载荷（computerUse）· 线格式 ----
+//
+// WHY 单独一份类型：审批气泡要在「允许/拒绝」之外展示**每个应用的授权范围**
+// （只查看 / 可点击 / 完全操作）与**被请求的额外能力**（剪贴板读写等）。
+// 授权语义一律由后端算好并给成**大白话文案**（tierLabel / flagLabels），
+// 前端只渲染、不做「read/click/full → 中文」的映射（映射规则是后端的业务语义，
+// 前端另写一份必然漂移）。
+//
+// ⚠️ `tier` 是机器值（read/click/full）：仅供调试/排障，**不得**直接展示给用户。
+
+/** 桌面控制 · 单个应用条目 */
+export interface ComputerUseApp {
+  /** 应用标识（授权键） */
+  appId: string
+  /** 展示名 */
+  displayName: string
+  /** 授权范围机器值（read/click/full）· 仅排障用，不展示 */
+  tier?: string
+  /** 授权范围的大白话文案（后端给 · 原样渲染） */
+  tierLabel?: string
+  /** 本次会话此前已授权 */
+  alreadyGranted?: boolean
+  /** 目标应用未安装 */
+  notInstalled?: boolean
+}
+
+/** 桌面控制授权载荷（一次请求 = 一整组应用 + 一组额外能力） */
+export interface ComputerUseApproval {
+  /** 被请求的应用清单 */
+  apps?: ComputerUseApp[] | null
+  /** 模型给用户看的一句话理由 */
+  reason?: string | null
+  /** 被请求的额外能力（**只含被请求的**；前端只渲染这些） */
+  requestedFlags?: string[] | null
+  /** 额外能力 → 大白话文案（后端给 · 原样渲染） */
+  flagLabels?: Record<string, string> | null
+}
+
 export interface PermissionRequestEvent extends StreamEventBase {
   type: 'permission.request'
   requestId: string
@@ -1686,6 +1735,8 @@ export interface PermissionRequestEvent extends StreamEventBase {
   blockedPath?: string | null
   /** AskUser 问题（便捷访问；实际 wire 位置在 toolInput.questions，解析 toolInput 获得） */
   questions?: AskUserQuestion[]
+  /** 桌面控制授权载荷 · null/缺省 ⇒ 不是桌面控制请求（走普通审批分支） */
+  computerUse?: ComputerUseApproval | null
 }
 /** 压缩警告抑制态（对齐 CC compactWarningStore/TokenWarning · STOMP token_warning）
  *

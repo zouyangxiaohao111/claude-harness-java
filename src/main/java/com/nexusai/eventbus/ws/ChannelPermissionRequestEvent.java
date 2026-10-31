@@ -29,9 +29,29 @@ public class ChannelPermissionRequestEvent {
     private final String toolName;
     private final String description;
     private final String inputPreview;
+
+    /**
+     * [Phase 1d] computer-use 审批面板数据（<b>可空</b>）· 与
+     * {@link MessagePermissionRequestEvent#getComputerUse()} <b>同形状</b>。
+     *
+     * <p><b>WHY 必须由发布方直传</b>：本事件只带 {@code inputPreview}（<b>截断到 200 字符的
+     * JSON 字符串</b>，CC {@code truncateForPreview}）⇒ <b>无法</b>从事件字段反解出
+     * {@code resolvedApps}（JSON 预览很可能已被截断）⇒ 只能由发布方
+     * （{@code StompChannelPermissionCallbacks}）在构造事件前算好塞进来。
+     *
+     * <p><b>null ⇒ 不是 CU 请求</b> ⇒ 通道表面走普通权限分支
+     * （{@code @JsonInclude(NON_NULL)} ⇒ 字段被省略，前端/通道表面向后兼容）。
+     *
+     * @see com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload
+     */
+    private final com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse;
+
     private final long timestampMs;
 
     /**
+     * ⛔ <b>既有构造器逐字保留</b>（向后兼容）⇒ 既有调用点零改动；
+     * {@code computerUse} 缺省 ⇒ null（@JsonInclude NON_NULL 省略字段）。
+     *
      * @param sessionId    目标 session（出站 topic 路由）
      * @param requestId    短请求 ID（shortRequestId(toolUseId) 产物）
      * @param toolName     工具名
@@ -44,15 +64,31 @@ public class ChannelPermissionRequestEvent {
                                          String description,
                                          String inputPreview,
                                          long timestampMs) {
+        this(sessionId, requestId, toolName, description, inputPreview, null, timestampMs);
+    }
+
+    /**
+     * [Phase 1d] 完整构造器 · 含 computerUse。
+     *
+     * @param computerUse computer-use 审批面板数据（可 null ⇒ 非 CU 请求 ⇒ 省略字段）
+     */
+    public ChannelPermissionRequestEvent(String sessionId,
+                                         String requestId,
+                                         String toolName,
+                                         String description,
+                                         String inputPreview,
+                                         com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse,
+                                         long timestampMs) {
         this.sessionId = sessionId;
         this.requestId = requestId;
         this.toolName = toolName;
         this.description = description;
         this.inputPreview = inputPreview;
+        this.computerUse = computerUse;
         this.timestampMs = timestampMs;
     }
 
-    /** 当前时间戳便捷工厂。 */
+    /** 当前时间戳便捷工厂（既有 5 参形态 · 逐字保留）。 */
     public static ChannelPermissionRequestEvent of(String sessionId,
                                                    String requestId,
                                                    String toolName,
@@ -63,10 +99,34 @@ public class ChannelPermissionRequestEvent {
             Instant.now().toEpochMilli());
     }
 
+    /**
+     * [Phase 1d] 当前时间戳便捷工厂 · 含 computerUse。
+     *
+     * @param computerUse computer-use 审批面板数据（可 null ⇒ 非 CU 请求 ⇒ 省略字段）
+     */
+    public static ChannelPermissionRequestEvent of(String sessionId,
+                                                   String requestId,
+                                                   String toolName,
+                                                   String description,
+                                                   String inputPreview,
+                                                   com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse) {
+        return new ChannelPermissionRequestEvent(
+            sessionId, requestId, toolName, description, inputPreview, computerUse,
+            Instant.now().toEpochMilli());
+    }
+
     public String getSessionId() { return sessionId; }
     public String getRequestId() { return requestId; }
     public String getToolName() { return toolName; }
     public String getDescription() { return description; }
     public String getInputPreview() { return inputPreview; }
+    /**
+     * [Phase 1d] computer-use 审批面板数据（null ⇒ 非 CU 请求 ⇒ 字段被省略）。
+     *
+     * @return CU 面板载荷（可 null）
+     */
+    public com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload getComputerUse() {
+        return computerUse;
+    }
     public long getTimestampMs() { return timestampMs; }
 }

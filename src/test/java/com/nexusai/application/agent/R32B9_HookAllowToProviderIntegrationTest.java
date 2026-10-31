@@ -194,7 +194,7 @@ class R32B9_HookAllowToProviderIntegrationTest {
     }
 
     @Test
-    @DisplayName("[端到端] STOMP Allow + image → OpenAI payload 含 text 块（image 跳过 R-T-1 · [OpenAI-SDK 迁移]）")
+    @DisplayName("[端到端] STOMP Allow + image → OpenAI payload：tool 消息仅 text 块（R-T-1 结构限制），image 由紧随的 role=user 承载消息送达（CU 修复）")
     void endToEndOpenAiImageAndFeedback() throws Exception {
         // Step 1: STOMP inbound
         String stompPayload = """
@@ -240,9 +240,18 @@ class R32B9_HookAllowToProviderIntegrationTest {
         }
         assertThat(hasTextContent).as("原始 tool content text part").isTrue();
         assertThat(hasImageUrl)
-            .as("[OpenAI-SDK] R-T-1 · SDK 0.25.0 tool content 仅支持 text part → image_url 不出现（受控残留，图片走 Anthropic 路径）")
+            .as("[OpenAI-SDK] R-T-1 · SDK 0.25.0 tool content 仅支持 text part → image_url 不出现在 tool 消息本体里")
             .isFalse();
         assertThat(hasFeedbackText).as("acceptFeedback 独立 text part (Fix E)").isTrue();
+
+        // [CU 修复] image 并未被丢弃：改由紧随 tool 段之后的独立 role=user 承载消息送达模型
+        // （改动前整条 payload 里都没有这张图 ⇒ 模型看不见）
+        assertThat(body.size()).as("assistant + tool + 承载消息 = 3 条").isEqualTo(3);
+        JsonNode carrier = body.get(2);
+        assertThat(carrier.get("role").asText()).isEqualTo("user");
+        JsonNode carrierPart = carrier.get("content").get(0);
+        assertThat(carrierPart.get("type").asText()).isEqualTo("image_url");
+        assertThat(carrierPart.get("image_url").get("url").asText()).isEqualTo("http://x/y.png");
     }
 
     @Test

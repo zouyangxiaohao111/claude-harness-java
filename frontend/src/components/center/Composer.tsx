@@ -7,7 +7,6 @@ import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
 import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
-import { AgentSelector } from './AgentSelector'
 import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
@@ -160,14 +159,14 @@ interface ComposerProps {
   onHardStop?: () => void
   /** local-read 附件模式（前后端同机）：>5MB 拖拽附件传本地 path 由后端读盘，不 upload */
   localRead?: boolean
-  /** 当前会话主线程 agent（null/空串 = 默认模式，胶囊显示「技能市场」入口） */
+  /** 当前会话主线程 agent（null/空串 = 默认模式，左下角不显示专家胶囊） */
   currentAgent?: string | null
-  /** 清除当前专家（胶囊悬停 ▾→× 点击触发；由 App 走 handleAgentChange(null)） */
+  /** 清除当前专家（专家胶囊悬停出 × 点击触发；由 App 走 handleAgentChange(null)） */
   onClearAgent?: () => void
   /** 斜杠前缀 chip 的显示别名（召唤技能时带中文显示名；仅当前缀名匹配时生效） */
   slashAlias?: { name: string; display: string } | null
-  /** 点击顶部 agent 胶囊 → 打开技能市场弹窗（App 持有 showMarket state） */
-  onOpenMarket?: () => void
+  /** 左下角 + 菜单「专家/技能/连接器」→ 打开技能市场弹窗并切到对应 tab（App 持有 showMarket state） */
+  onOpenMarket?: (tab?: 'expert' | 'skill' | 'connector') => void
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -215,6 +214,19 @@ const SLASH_PREFIX_RE = /^\/([A-Za-z0-9_:.-]+)(\s+)/
  * 右缘既不压后续首字、也不留多余空隙。⛔ 与 globals.css `.input-slash-chip-visual--alias` 成对修改。
  */
 export const SUMMON_TRAILING_SPACES = '      '
+
+/**
+ * 当前输入开头那段「技能/命令 chip」的字符长度（0 = 没有 chip）。
+ * <p>chip 是**真实文本**（别名显示名 + 尾随空格，或 /命令名 + 空格），所以退格默认会逐字删 ——
+ * 本函数供键盘处理判断「光标是否贴着 chip」，用于整块删除（用户 2026-10-29 裁定）。
+ */
+function slashChipLength(text: string, slashAlias?: { name: string; display: string } | null): number {
+  if (slashAlias?.display && text.startsWith(slashAlias.display + SUMMON_TRAILING_SPACES)) {
+    return slashAlias.display.length + SUMMON_TRAILING_SPACES.length
+  }
+  const m = text.match(SLASH_PREFIX_RE)
+  return m ? m[0].length : 0
+}
 
 function renderHighlighted(
   text: string,
@@ -543,6 +555,21 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [permOpen])
+  // 左下角 + 菜单（添加文件 / 模式 / 专家 / 技能 / 连接器）：点击外部收起
+  const [plusOpen, setPlusOpen] = useState(false)
+  // 「模式」子菜单展开态（simple/full 两个可选项 · 关菜单时一并复位）
+  const [plusModeOpen, setPlusModeOpen] = useState(false)
+  const plusRef = useRef<HTMLDivElement>(null)
+  /** 关闭 + 菜单：子菜单展开态一并复位，避免下次打开仍留展开态。 */
+  const closePlusMenu = () => { setPlusOpen(false); setPlusModeOpen(false) }
+  useEffect(() => {
+    if (!plusOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (plusRef.current && !plusRef.current.contains(e.target as Node)) closePlusMenu()
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [plusOpen])
 
   // 会话工具面板（功能2：禁用/恢复 · 会话级临时禁用）；点击外部 / Esc 收起
   const [toolsOpen, setToolsOpen] = useState(false)
@@ -745,6 +772,17 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
       }
     }
     fileInputRef.current?.click()
+  }
+
+  /** + 菜单「模式」：展开 simple/full 两个可选项（不再盲切 · 同一 modeLocked 锁定规则）。 */
+  const pickModeFromMenu = (m: 'simple' | 'full') => {
+    if (modeLocked) {
+      showToast('对话进行中不可切换模式（仅新会话可切换）', 'info')
+      return
+    }
+    onModeChange?.(m === 'simple')
+    showToast(`已切换到 ${m} 模式`, 'info')
+    closePlusMenu()
   }
 
   // Tauri 拖拽事件：WebView 拦截浏览器 drop，改由 onDragDropEvent 拿文件真实路径
@@ -957,12 +995,6 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               </div>
             )}
           </div>
-          {/* V58 主线程 agent（专家）胶囊 · 显示当前驱动 agent · 放「模式」下拉右侧 · 点开技能市场 */}
-          <AgentSelector
-            currentAgent={currentAgent}
-            onOpen={() => { if (onOpenMarket) onOpenMarket() }}
-            onClear={onClearAgent}
-          />
           {/* 输入框上方右缘操作组（右对齐输入框右缘）：回到底部（离底时）+ 停止所有（运行中） */}
           <div className="composer-top-actions">
             {showToBottom && (
@@ -1052,6 +1084,28 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                     const keepPlugin = composerText.slice(1).includes(':') && !!cmd.pluginName
                     setComposerText(`/${keepPlugin ? `${cmd.pluginName}:` : ''}${cmd.name} `)
                     setCmdIndex(0)
+                    return
+                  }
+                }
+                // [2026-10-29 用户裁定] 召唤/选择的技能 chip 是真实文本前缀 ⇒ 退格 / Delete 必须**整块删除**，
+                //   否则视觉上会「先掉高亮阴影，再逐字删名称」（尾随空格先被吃掉 → chip 失配）。
+                if (!atMatches && !cmdMatches && (e.key === 'Backspace' || e.key === 'Delete')) {
+                  const chipLen = slashChipLength(composerText, slashAlias)
+                  const el = e.currentTarget
+                  const selStart = el.selectionStart
+                  const selEnd = el.selectionEnd
+                  const hitChip = chipLen > 0 && selStart === selEnd && (
+                    e.key === 'Backspace'
+                      ? selStart > 0 && selStart <= chipLen
+                      : selStart < chipLen
+                  )
+                  if (hitChip) {
+                    e.preventDefault()
+                    // chip 恒在文本开头（SLASH_PREFIX_RE / 别名前缀都是锚定 ^ 的）
+                    setComposerText(composerText.slice(chipLen))
+                    requestAnimationFrame(() => {
+                      try { el.setSelectionRange(0, 0) } catch { /* 卸载竞态：忽略 */ }
+                    })
                     return
                   }
                 }
@@ -1166,12 +1220,123 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   e.target.value = ''
                 }}
               />
-              <div className="tool-chip" onClick={() => void handleAddFiles()}>
-                <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                  <path d="M6 2V10M2 6H10" />
-                </svg>
-                <span>附件{attachments.length > 0 ? ` (${attachments.length})` : ''}</span>
+              {/* 左下角「+」：统一收纳 添加文件 / 模式 / 专家 / 技能 / 连接器 */}
+              <div className="plus-wrap" ref={plusRef}>
+                <button
+                  type="button"
+                  className={`plus-btn${plusOpen ? ' active' : ''}`}
+                  title="添加文件、模式、专家、技能、连接器"
+                  aria-label="添加文件、模式、专家、技能、连接器"
+                  aria-expanded={plusOpen}
+                  onClick={() => { if (plusOpen) closePlusMenu(); else setPlusOpen(true) }}
+                >
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                    <path d="M6 2V10M2 6H10" />
+                  </svg>
+                </button>
+                {plusOpen && (
+                  <div className="plus-menu" role="menu">
+                    <button type="button" className="plus-item" role="menuitem" onClick={() => { closePlusMenu(); void handleAddFiles() }}>
+                      <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                        <path d="M8.2 2.2L4 6.4a1.8 1.8 0 0 0 2.5 2.5L10.7 5a3 3 0 0 0-4.2-4.2L2.4 4.9a4.2 4.2 0 0 0 5.9 5.9l3.5-3.5" />
+                      </svg>
+                      <span>添加文件</span><span className="plus-chev">›</span>
+                    </button>
+                    <div className="plus-sep" />
+                    {/* 模式：右侧 flyout（不再是盲切一项；modeLocked 时只提示不切换） */}
+                    <div className="plus-sub-anchor">
+                      <button
+                        type="button"
+                        className="plus-item"
+                        role="menuitem"
+                        aria-expanded={plusModeOpen}
+                        onClick={() => setPlusModeOpen((v) => !v)}
+                      >
+                        <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                          <path d="M2 4h6M10 4h2M2 10h2M6 10h6" />
+                          <circle cx="8.6" cy="4" r="1.4" />
+                          <circle cx="4.6" cy="10" r="1.4" />
+                        </svg>
+                        <span>模式</span><span className="plus-chev">{mode} ›</span>
+                      </button>
+                      {/* 展开后可选：点哪项切哪项（modeLocked 时仍走锁定提示，不盲切） */}
+                      {plusModeOpen && (
+                        <div className="plus-submode" role="group" aria-label="模式选择">
+                          {(['simple', 'full'] as const).map((m) => (
+                            <button
+                              key={m}
+                              type="button"
+                              role="menuitemradio"
+                              aria-checked={mode === m}
+                              className={`plus-subitem${mode === m ? ' selected' : ''}`}
+                              onClick={() => pickModeFromMenu(m)}
+                            >
+                              <span className="plus-check" aria-hidden="true">
+                                {mode === m && (
+                                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2">
+                                    <path d="M2.5 6.2l2.3 2.3 4.7-4.7" strokeLinecap="round" strokeLinejoin="round" />
+                                  </svg>
+                                )}
+                              </span>
+                              <span>{m === 'simple' ? '简单模式' : '完整模式'}</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                    {/* 专家：复用现有技能市场弹窗（专家 tab） */}
+                    {onOpenMarket && (
+                      <button type="button" className="plus-item" role="menuitem" onClick={() => { closePlusMenu(); onOpenMarket?.('expert') }}>
+                        <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                          <circle cx="7" cy="5" r="2.4" />
+                          <path d="M2.4 12c.6-2.2 2.4-3.4 4.6-3.4s4 1.2 4.6 3.4" />
+                        </svg>
+                        <span>专家</span><span className="plus-chev">›</span>
+                      </button>
+                    )}
+                    {/* 技能：与专家同一个技能市场弹窗，默认切到「技能」tab */}
+                    {onOpenMarket && (
+                      <button type="button" className="plus-item" role="menuitem" onClick={() => { closePlusMenu(); onOpenMarket?.('skill') }}>
+                        <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                          <path d="M2.5 12L9 5.5" />
+                          <path d="M9.5 2l.6 1.6 1.6.6-1.6.6-.6 1.6-.6-1.6L7.3 4.2l1.6-.6z" />
+                        </svg>
+                        <span>技能</span><span className="plus-chev">›</span>
+                      </button>
+                    )}
+                    {/* 连接器：同一个技能市场弹窗，默认切到「连接器」tab */}
+                    {onOpenMarket && (
+                      <button type="button" className="plus-item" role="menuitem" onClick={() => { closePlusMenu(); onOpenMarket?.('connector') }}>
+                        <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                          <path d="M5.6 8.4a2 2 0 0 0 2.8 0l1.6-1.6a2 2 0 0 0-2.8-2.8L6.5 4.7" />
+                          <path d="M8.4 5.6a2 2 0 0 0-2.8 0L4 7.2a2 2 0 0 0 2.8 2.8l.7-.7" />
+                        </svg>
+                        <span>连接器</span><span className="plus-chev">›</span>
+                      </button>
+                    )}
+                  </div>
+                )}
               </div>
+              {/* 当前专家：绿色胶囊（在 + 右侧）· hover 出 × 清除（App → handleAgentChange(null)） */}
+              {currentAgent && currentAgent.trim() && (
+                <span className="agent-pill" title={`当前专家：${currentAgent}`}>
+                  {onClearAgent && (
+                    <span
+                      className="agent-pill-x"
+                      role="button"
+                      aria-label="移除专家"
+                      title="移除专家（回到默认模式）"
+                      onClick={(e) => { e.stopPropagation(); onClearAgent() }}
+                    >×</span>
+                  )}
+                  <span className="agent-pill-ava" aria-hidden="true">
+                    <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M2.5 6.2l2.2 2.2 4.8-4.8" />
+                    </svg>
+                  </span>
+                  <span className="agent-pill-name">{currentAgent}</span>
+                </span>
+              )}
               {/* ⭐ 释放点②（清空）：`clear()` 与键的具体形态无关 ⇒ 改键后无需改动（逐字核过） */}
               {attachments.length > 0 && (
                 <button className="tool-chip" onClick={() => { addedKeysRef.current.clear(); setAttachments([]); showToast('已清空附件', 'info') }} title="清空附件">
@@ -1292,9 +1457,6 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           </div>
         </div>
         <div className="hint">
-          <span className="hint-shortcuts">
-            <kbd>↵</kbd> 发送 · <kbd>⇧↵</kbd> / <kbd>⌥↵</kbd> 换行 · <kbd>/</kbd> 调出命令 · <kbd>Esc</kbd> 停止/取消
-          </span>
           {/* F1 · hint-usage 包可点击（打开 UsageCostModal）· tokens 标注「累计」· 附当前上下文条 */}
           {onOpenUsageCost && (
             <span

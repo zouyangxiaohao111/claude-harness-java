@@ -3,6 +3,7 @@ import { JsonBlock } from '@/markdown/JsonBlock'
 import type { PermissionRequestItem } from '@/stores/chatStore'
 import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion, PermissionUpdate } from '@/api/types'
 import { buildSuggestionOptions } from './permissionSuggestionLabels'
+import { ComputerUseApprovalError, ComputerUseApprovalPanel, isComputerUseTool } from './ComputerUseApprovalPanel'
 
 interface Props {
   request: PermissionRequestItem
@@ -89,6 +90,34 @@ export function PermissionBubble({ request, onDecision, onAbort, projectLabel, s
     () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel, selfDirName),
     [request.suggestions, request.toolName, projectLabel, selfDirName],
   )
+  // [桌面控制审批面板] 后端带 computerUse ⇒ 渲染应用清单 + 授权范围（整组授予）。
+  //   插在普通分支之前：该请求**没有** questions，且普通分支会把它当成「允许执行这个工具」——
+  //   那样用户看不到要控制哪些应用、能控制到什么程度。
+  if (request.computerUse) {
+    // AskUser / CU 路径都不支持「一键授权档位」（那是规则，不是应用授权）——后端若给这条路径带了
+    //   suggestions，不静默吞掉，留痕。
+    if (suggestionOptions.length > 0) {
+      console.warn('[perm] 桌面控制弹窗收到 suggestions，本路径不支持一键授权档位，已忽略', request.requestId)
+    }
+    return (
+      <ComputerUseApprovalPanel
+        request={request}
+        onDecision={(id, decision) => onDecision(id, decision)}
+        onAbort={onAbort}
+      />
+    )
+  }
+  // ⛔ fail-loud：桌面控制的授权请求却**没有** computerUse ⇒ 不得回落普通分支放行
+  //   （普通分支只显示工具名 ⇒ 用户看不到「要控制哪些应用、能控制到什么程度」就点「允许」= 盲授权）。
+  if (isComputerUseTool(request.toolName)) {
+    return (
+      <ComputerUseApprovalError
+        request={request}
+        onDecision={(id, decision) => onDecision(id, decision)}
+        onAbort={onAbort}
+      />
+    )
+  }
   // 无 questions → 保持原 allow/deny 弹窗（+ 中止按钮）
   if (questions.length === 0) {
     return (

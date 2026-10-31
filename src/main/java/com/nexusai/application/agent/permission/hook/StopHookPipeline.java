@@ -34,9 +34,12 @@ import java.util.function.Consumer;
  * <ul>
  *   <li>saveCacheSafeParams — Java 无 cache-safe params / forked agent 快照通道</li>
  *   <li>classifyAndWriteState — Java 无 CLAUDE_JOB_DIR / jobs/classifier 对应物</li>
- *   <li>cleanupComputerUseAfterTurn — Java 无 CHICAGO_MCP / computerUse 对应物</li>
+ *   <li>cleanupComputerUseAfterTurn — <b>[Phase 1a 已落地]</b>：computer-use 锁已存在
+ *       （{@code computer_use_lock} 单行表 + 进程内 ReentrantLock），本阶段改为
+ *       <b>真释放会话锁</b>（主线程专属 + 失败静默，对齐 CCB
+ *       {@code src/query/stopHooks.ts:168-182}）</li>
  * </ul>
- * 三者按 CC 门控判断后仅日志记录, 绝不假实现。
+ * 前两者按 CC 门控判断后仅日志记录, 绝不假实现。
  *
  * <p>[IMPL-10] DEL-TH-06: 主消费追踪（trackStopHookResult/hookCount 0/1 近似 +
  * stop_hook_summary 生成器）已删除 — CC stopHooks.ts:175-333 是逐 progress 消息累计，
@@ -380,20 +383,80 @@ public final class StopHookPipeline {
      * isLockHeldLocally()===false → 无 exit notification，且子代理不启动 CU 会话 → 纯跳过。
      * 主线程清理失败必须静默（CC try/catch 空 catch —— dogfooding cleanup 非关键路径）。
      *
-     * <p>Java 无 CHICAGO_MCP / computerUse 基础设施 → 门控判断通过后仅日志说明未启用。
+     * <p>本重载<b>无会话 id</b> ⇒ 只做门控判断，不释放任何锁（保留给旧调用方 / 单测）。
      *
      * @param agentId 子代理 id（null = 主线程）
-     * @return true = CC 门控通过（主线程，本应清理, Java 无基础设施跳过）
+     * @return true = CC 门控通过（主线程）；false = 子代理跳过
      */
     public static boolean cleanupComputerUseAfterTurn(String agentId) {
+        return cleanupComputerUseAfterTurn(agentId, null);
+    }
+
+    /**
+     * 阶段 5 · 对齐 CC stopHooks.ts:164-173 · <b>真释放会话锁</b>（Phase 1a）。
+     *
+     * <p><b>CCB 真源</b>（{@code src/query/stopHooks.ts:168-182}）：
+     * <pre>
+     * // chicago MCP: auto-unhide + lock release at turn end.
+     * // Main thread only — the CU lock is a process-wide module-level variable,
+     * // so a subagent's stopHooks releasing it leaves the main thread's cleanup
+     * // seeing isLockHeldLocally()===false → no exit notification, and unhides
+     * // mid-turn. Subagents don't start CU sessions so this is a pure skip.
+     * if (feature('CHICAGO_MCP') &amp;&amp; !toolUseContext.agentId) {
+     *   try {
+     *     const { cleanupComputerUseAfterTurn } = await import('../utils/computerUse/cleanup.js')
+     *     await cleanupComputerUseAfterTurn(toolUseContext)
+     *   } catch {
+     *     // Failures are silent — this is dogfooding cleanup, not critical path
+     *   }
+     * }
+     * </pre>
+     *
+     * <p><b>本仓实现</b>：主线程（{@code agentId == null}）在轮末释放本会话持有的
+     * computer-use 锁（{@link com.nexusai.application.agent.computeruse.ComputerUseLockService#release(String)}，
+     * DB 单行表 CAS，跨进程安全）。子代理<b>纯跳过</b>（保留原有分支）。
+     *
+     * <p><b>失败静默</b>：释放失败（DB 异常 / 未持锁 / 未装配锁服务）⇒ 只留 debug 日志，
+     * <b>绝不抛</b>（CCB 的空 catch 语义 —— 轮末清理非关键路径）。
+     *
+     * @param agentId   子代理 id（null = 主线程）
+     * @param sessionId 会话 id（可空 = 无会话腿 ⇒ 只做门控判断）
+     * @return true = 主线程门控通过；false = 子代理跳过
+     */
+    public static boolean cleanupComputerUseAfterTurn(String agentId, String sessionId) {
         if (agentId != null) {
             if (log.isDebugEnabled()) {
                 log.debug("STOP_HOOK cleanupComputerUseAfterTurn 跳过 (子代理 agentId={})", agentId);
             }
             return false;
         }
-        log.info("STOP_HOOK cleanupComputerUseAfterTurn gate 通过 (agentId=null), 但 Java 无 CHICAGO_MCP "
-            + "基础设施, 跳过实际清理 · CC stopHooks.ts:164-173");
+        if (sessionId == null || sessionId.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("STOP_HOOK cleanupComputerUseAfterTurn 门控通过 (主线程) 但无 sessionId ⇒ 不释放锁");
+            }
+            return true;
+        }
+        try {
+            com.nexusai.application.agent.computeruse.ComputerUseLockService lockService =
+                    com.nexusai.application.agent.computeruse.ComputerUseLockService.current();
+            if (lockService == null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("STOP_HOOK cleanupComputerUseAfterTurn: computer-use 未启用（无锁服务）⇒ 跳过");
+                }
+                return true;
+            }
+            boolean released = lockService.release(sessionId);
+            if (log.isInfoEnabled()) {
+                log.info("STOP_HOOK cleanupComputerUseAfterTurn: computer-use 锁释放结果={} (session={})",
+                        released, sessionId);
+            }
+        } catch (Throwable t) {
+            // 失败静默（CCB stopHooks.ts:179-181 的空 catch 语义）
+            if (log.isDebugEnabled()) {
+                log.debug("STOP_HOOK cleanupComputerUseAfterTurn 释放 computer-use 锁失败（静默）: session={} err={}",
+                        sessionId, t.toString());
+            }
+        }
         return true;
     }
 

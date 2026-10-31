@@ -112,6 +112,31 @@ public class MessagePermissionRequestEvent extends StreamEvent {
      */
     private final String workerBadgeColor;
 
+    /**
+     * [Phase 1b · D] computer-use 审批面板数据（<b>可空</b>）。
+     *
+     * <p><b>形状（前端契约）</b>：
+     * <pre>
+     * "computerUse": {
+     *   "apps": [ { "appId": "chrome", "displayName": "Chrome",
+     *               "tier": "read", "tierLabel": "只能查看",
+     *               "alreadyGranted": false, "notInstalled": false } ],
+     *   "reason": "模型给的理由",
+     *   "requestedFlags": ["clipboardRead"],
+     *   "flagLabels": { "clipboardRead": "允许读取剪贴板" }
+     * }
+     * </pre>
+     *
+     * <p><b>null ⇒ 不是 CU 请求</b> ⇒ 前端走普通权限弹窗分支（@JsonInclude NON_NULL 省略字段）。
+     *
+     * <p><b>与 CCB 的差异</b>：CCB 的等价物是其 React 面板组件
+     * （{@code ComputerUseApproval.tsx}）内部计算；本仓改为<b>后端一次算好推给前端</b>
+     * （档位依赖后端的应用分类表 ⇒ 前端拿不到）。
+     *
+     * @see com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload
+     */
+    private final com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse;
+
     /** 服务端推送时间戳（毫秒） */
     private final long timestampMs;
 
@@ -187,6 +212,31 @@ public class MessagePermissionRequestEvent extends StreamEvent {
                                          String warning,
                                          String workerBadgeColor,
                                          long timestampMs) {
+        this(sessionId, requestId, toolUseId, toolName, toolInput, reason,
+            description, suggestions, blockedPath, warning, workerBadgeColor, null, timestampMs);
+    }
+
+    /**
+     * [Phase 1b · D] 完整构造器 · 含 warning + workerBadgeColor + <b>computerUse</b>。
+     *
+     * <p>⛔ <b>既有构造器全部保留</b>（12 参 / 11 参 / 10 参 / 7 参 版本逐字不动）
+     * ⇒ 既有调用点零改动；新字段只在本重载里出现，缺省 ⇒ null（@JsonInclude NON_NULL 省略字段）。
+     *
+     * @param computerUse computer-use 审批面板数据（可 null ⇒ 非 CU 请求）
+     */
+    public MessagePermissionRequestEvent(String sessionId,
+                                         String requestId,
+                                         String toolUseId,
+                                         String toolName,
+                                         JsonNode toolInput,
+                                         PermissionDecisionReasonDto reason,
+                                         String description,
+                                         java.util.List<com.nexusai.application.agent.permission.PermissionUpdate> suggestions,
+                                         String blockedPath,
+                                         String warning,
+                                         String workerBadgeColor,
+                                         com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse,
+                                         long timestampMs) {
         // type="permission.request" · 区别于 message.* 流事件，避免和 message 流混淆
         super("permission.request", sessionId, null);
         this.requestId = requestId;
@@ -199,6 +249,7 @@ public class MessagePermissionRequestEvent extends StreamEvent {
         this.blockedPath = blockedPath;
         this.warning = warning;
         this.workerBadgeColor = workerBadgeColor;
+        this.computerUse = computerUse;
         this.timestampMs = timestampMs;
     }
 
@@ -212,6 +263,14 @@ public class MessagePermissionRequestEvent extends StreamEvent {
     public String getBlockedPath() { return blockedPath; }
     public String getWarning() { return warning; }
     public String getWorkerBadgeColor() { return workerBadgeColor; }
+    /**
+     * [Phase 1b · D] computer-use 审批面板数据（null ⇒ 非 CU 请求 ⇒ 前端走普通分支）。
+     *
+     * @return CU 面板载荷（可 null）
+     */
+    public com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload getComputerUse() {
+        return computerUse;
+    }
     public long getTimestampMs() { return timestampMs; }
 
     /**
@@ -408,6 +467,38 @@ public class MessagePermissionRequestEvent extends StreamEvent {
             sessionId, requestId, toolUseId, toolName, toolInput,
             toDto(reason, classifierFeatureEnabled), description, suggestions, blockedPath, warning,
             workerBadgeColor,
+            Instant.now().toEpochMilli()
+        );
+    }
+
+    /**
+     * [Phase 1b · D] 完整静态工厂 · 含 warning + workerBadgeColor + <b>computerUse</b>。
+     *
+     * <p>⛔ 既有工厂（12 参 / 11 参 / 10 参 / 5 参 版本）逐字保留 ⇒ 既有调用点零改动。
+     *
+     * @param toolUseId               工具调用 ID（CC tool_use_id；可 null）
+     * @param warning                 [G21] 权限弹窗渲染文本（可 null → 省略字段）
+     * @param workerBadgeColor        [perm-timeout #132] worker 徽标色（可 null → 省略字段）
+     * @param computerUse             [Phase 1b · D] CU 审批面板数据（可 null → 非 CU 请求）
+     * @param classifierFeatureEnabled serializeDecisionReason classifier 门控
+     */
+    public static MessagePermissionRequestEvent of(String sessionId,
+                                                    String requestId,
+                                                    String toolUseId,
+                                                    String toolName,
+                                                    JsonNode toolInput,
+                                                    com.nexusai.application.agent.permission.PermissionDecisionReason reason,
+                                                    String description,
+                                                    List<com.nexusai.application.agent.permission.PermissionUpdate> suggestions,
+                                                    String blockedPath,
+                                                    String warning,
+                                                    String workerBadgeColor,
+                                                    com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse,
+                                                    boolean classifierFeatureEnabled) {
+        return new MessagePermissionRequestEvent(
+            sessionId, requestId, toolUseId, toolName, toolInput,
+            toDto(reason, classifierFeatureEnabled), description, suggestions, blockedPath, warning,
+            workerBadgeColor, computerUse,
             Instant.now().toEpochMilli()
         );
     }

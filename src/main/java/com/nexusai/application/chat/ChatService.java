@@ -32,6 +32,7 @@ import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.worktree.WorktreeCwdTracker;
+import com.nexusai.application.session.SessionArtifactService;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.domain.provider.ProviderService;
 import com.nexusai.domain.schedule.ScheduleService;
@@ -68,6 +69,7 @@ import com.nexusai.repository.settings.mapper.SettingsMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Qualifier;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.scheduling.annotation.Async;
@@ -86,7 +88,9 @@ import java.util.List;
 import java.util.Map;
 import java.util.Base64;
 import java.util.UUID;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executor;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.stream.Collectors;
 
@@ -236,9 +240,40 @@ public class ChatService {
     //   （镜像 CC processSlashCommand 全流程；内部注入 SkillRegistry + UserInputDispatcher）。
     //   required=false 容错直构测试（null → slash 拦截跳过，普通 prompt 不变）。
     @Autowired(required = false) private SlashCommandInterceptor slashInterceptor;
+    // [artifact-extract] 产物/来源异步抽取（轮末触发，fire-and-forget）· required=false 容错直构单测
+    //   （null → 跳过抽取，对话不受影响）。
+    @Autowired(required = false) private SessionArtifactService sessionArtifactService;
 
     /** sessionId → 当前 in-progress 任务。 */
     private final ConcurrentHashMap<String, ChatTask> inProgress = new ConcurrentHashMap<>();
+
+    // ───────────── [title-two-phase] 标题两次总结 ─────────────
+    // 1) 用户提问落库后 → 立即用该条消息异步生成（fire-and-forget，不阻塞发送主流程）；
+    // 2) 本轮结束 → 用完整会话内容再总结一次并置 titleExplicit=2（第二次覆盖第一次，之后停闸）。
+    // 竞态：第 1 次可能比第 2 次慢。两次「应用」都进同一把条带锁并在锁内**重读会话**再判资格，
+    //   故慢的第 1 次回来时看到 titleExplicit=2 → 跳过，不会把完整标题回退成首条摘要。
+
+    /** [title-two-phase] 即时标题摘要执行器 · 复用 chatExecutor 虚拟线程（与 processUserMessage 同池）。 */
+    @Autowired(required = false)
+    @Qualifier("chatExecutor")
+    private Executor titleExecutor;
+
+    /** [title-two-phase] 标题落库条带锁（sessionId 哈希 → 32 段）· 只护「重读 + 更新」临界区。 */
+    private static final Object[] TITLE_WRITE_LOCKS = createTitleWriteLocks();
+
+    private static Object[] createTitleWriteLocks() {
+        Object[] locks = new Object[32];
+        for (int i = 0; i < locks.length; i++) {
+            locks[i] = new Object();
+        }
+        return locks;
+    }
+
+    /** [title-two-phase] 会话的条带锁（同 session 的第 1/第 2 次标题写入互斥）。 */
+    private static Object titleWriteLock(String sessionId) {
+        int h = sessionId == null ? 0 : sessionId.hashCode();
+        return TITLE_WRITE_LOCKS[Math.floorMod(h, TITLE_WRITE_LOCKS.length)];
+    }
 
     /**
      * [IMP2-10 · MISS-2 · OD-13] 主会话入口 taskBudget 解析。
@@ -305,6 +340,15 @@ public class ChatService {
         //      reflector MAJOR-2/5）——登记仍由 drain 消费点逐项 registerRunPromptImages /
         //      registerRunPromptPdfs 即时消费即清；本处只做「校验 + 附件表注册得 contentId」。
         java.util.List<AttachmentRequest> busyAttachments = busyQueuedResolvedAttachments(sessionId, req);
+        // [busy 气泡图片] 入队前定稿图片 image-cache id（与 drain 的 pastedImagesFromAttachments 同一规则），
+        //   并把这份 id 随队列携带 → queue.drained 出站 → 前端 live 气泡按 id 去 image-cache 拉图。
+        //   WHY 必须在入队时定稿：直传 base64 图请求体里没有 contentId，id 原本在 drain 时才分配（雪花）；
+        //   若入队不分配、drain 再分配，两次雪花不同 ⇒ 前端拿到 image-cache 里不存在的 id（图仍不显示）。
+        //   本步骤把 id 写回附件 contentId ⇒ drain 解析同一数字 id，落库 image_paste_ids 与队列项逐字相同。
+        LlmAgentLoop.BusyImageAttachments busyImages =
+            LlmAgentLoop.prepareBusyQueuedImageAttachments(busyAttachments);
+        busyAttachments = busyImages.attachments();
+        java.util.List<String> busyImagePasteIds = busyImages.imagePasteIds();
         // [busy 附件快照] 非图片附件快照（V63 user_attachments）随队列携带 —— busy 消息的 user 行不在
         //   controller 落库（busy 分支只入队），而在 drain 时点由 ChatService.persistAppendedMessage
         //   user 分支 createQueuedUserMessage(...， m.userAttachments()) 落库 ⇒ 快照必须经队列带到落库点，
@@ -329,14 +373,17 @@ public class ChatService {
         notificationQueue.enqueue(new NotificationQueue.QueueItem(
             content, NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
             null, userMessageId, false, "busy-queued", false, null, sessionId,
-            null /* boundProject */, null /* scheduleId */, busyAttachments, busyUserAttachments));
+            null /* boundProject */, null /* scheduleId */, busyAttachments, busyUserAttachments,
+            busyImagePasteIds.isEmpty() ? null : busyImagePasteIds));
         if (log.isInfoEnabled()) {
-            log.info("QUEUE busy 携附件: session={} uuid={} attachments={} userAttachments={}"
+            log.info("QUEUE busy 携附件: session={} uuid={} attachments={} userAttachments={} imagePasteIds={}"
                     + "（入队不裁剪：已通过校验/解析的附件随队列携带，drain 消费点逐项注册；未过校验项已在入队处 "
                     + "warn 拦下。busy 附件快照：非图片项（含 path 附件解析后 contentId）随队列携带 → drain 落库 "
-                    + "V63 列，F5 重拉气泡附件胶囊 + 预览 url）",
+                    + "V63 列，F5 重拉气泡附件胶囊 + 预览 url。busy 气泡图片：imagePasteIds 随队列携带 → "
+                    + "queue.drained 出站 → 前端 live 气泡按 id 拉图）",
                 sessionId, userMessageId, busyAttachments == null ? 0 : busyAttachments.size(),
-                busyUserAttachments == null ? 0 : busyUserAttachments.size());
+                busyUserAttachments == null ? 0 : busyUserAttachments.size(),
+                busyImagePasteIds == null ? 0 : busyImagePasteIds.size());
         }
         queueEventPublisher.emitChanged(sessionId);
     }
@@ -850,6 +897,12 @@ public class ChatService {
             return;
         }
 
+        // [title-two-phase] 第一次总结：controller 已把该条 user 消息落库（ChatController.send:170）⇒
+        //   立即异步用这条提问生成/更新标题，让左栏不必等整轮跑完。fire-and-forget：任何失败只留日志，
+        //   不影响对话主流程；轮末的第二次总结会用完整内容覆盖它。
+        startImmediateTitleGeneration(sessionId, userMessageId,
+            req != null ? req.content() : null, wsTemplate);
+
         // [IMP-G] G26③ AskUserQuestion previewFormat 会话建立接线：读 CLAUDE_CODE_QUESTION_PREVIEW_FORMAT
         // env，仅当配置值合法（'markdown'|'html'）才 set（CC main.tsx:835-843 合法值分支；Java Web
         // 后端非 CC CLI 客户端，不套用 CLI 默认 markdown 分支）。幂等：静态值与会话无关，多会话
@@ -1141,8 +1194,16 @@ public class ChatService {
             inProgress.remove(sessionId, task);
         }
 
-        // 9) 标题生成（首条）
-        maybeGenerateTitle(session, userMessageId, finalContent, wsTemplate);
+        // 9) 标题第二次总结：用本轮完整会话内容刷新（覆盖第一次的「首条提问摘要」）并置
+        //   titleExplicit=2 停闸（不每轮刷）；/rename 的 explicit=1 仍不覆盖。失败不影响对话。
+        refreshTitleAfterTurn(sessionId, userMessageId, finalContent, wsTemplate);
+
+        // 9.1) [artifact-extract] 产物/来源抽取：fire-and-forget，与本轮收尾彻底解耦
+        //   （已在 finally / status=idle 之后，⛔ 不阻塞任何出站事件）。服务内部自带防抖 +
+        //   全流程 try/catch，失败只 WARN —— 对话永远不会因它失败或变慢。
+        if (sessionArtifactService != null) {
+            sessionArtifactService.scheduleExtract(sessionId);
+        }
 
         log.info("DONE: turns={} exit={}", state.turnCount(), state.exitReason());
     }
@@ -2477,6 +2538,148 @@ public class ChatService {
     }
 
     // ─────────────────────────── 标题生成 ───────────────────────────
+
+    /**
+     * [title-two-phase] 第一次总结 · 用户提问落库后立即用**该条用户消息**生成/更新标题。
+     *
+     * <p>触发点：{@link #processUserMessage} 在 slash 非查询型分支之后（此时 controller 已
+     * {@code createUserMessage} 落库）。**fire-and-forget**：提交到 chatExecutor 虚拟线程，失败只
+     * 记 WARN，不阻塞发送主流程、不影响对话。
+     *
+     * <p>资格：{@code titleExplicit ∈ {null, 0}} 且标题仍是默认占位 —— 已有自动标题时不重刷（避免
+     * 每条提问都把标题改一遍）；用户 /rename（=1）与轮末刷新后（=2）永不覆盖。
+     *
+     * <p>与第二次的竞态由 {@link #titleWriteLock} + 锁内重读保证：若轮末刷新先完成（=2），本次迟到的
+     * 首条摘要会被丢弃，不会把完整标题回退成一句话摘要。
+     */
+    private void startImmediateTitleGeneration(String sessionId, String userMessageId,
+                                               String userContent, SimpMessagingTemplate wsTemplate) {
+        if (sessionId == null || userContent == null || userContent.isBlank()) {
+            return;
+        }
+        Runnable job = () -> generateTitleFromUserMessage(sessionId, userMessageId, userContent, wsTemplate);
+        Executor executor = titleExecutor;
+        if (executor != null) {
+            try {
+                executor.execute(job);
+                return;
+            } catch (Exception e) {
+                // 执行器拒绝（如关闭中）→ 回落 commonPool，仍保持异步不阻塞发送
+                log.warn("[title-two-phase] 即时标题任务提交失败，回落 CompletableFuture session={}: {}",
+                    sessionId, e.toString());
+            }
+        }
+        CompletableFuture.runAsync(job);
+    }
+
+    /** [title-two-phase] 第一次总结的任务体（在异步线程执行；异常自吞并留痕，不向对话主链传播）。 */
+    private void generateTitleFromUserMessage(String sessionId, String userMessageId,
+                                              String userContent, SimpMessagingTemplate wsTemplate) {
+        try {
+            SessionRecord snapshot = sessionMapper.selectOneById(sessionId);
+            if (snapshot == null) {
+                log.warn("[title-two-phase] 第一次总结跳过：会话不存在 session={}", sessionId);
+                return;
+            }
+            if (!isAutoTitleEligible(snapshot)
+                    || !isDefaultTitle(snapshot.getTitle(), snapshot.getModelName())) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[title-two-phase] 第一次总结跳过：标题非默认或已停闸 session={} explicit={} title={}",
+                        sessionId, snapshot.getTitleExplicit(), snapshot.getTitle());
+                }
+                return;
+            }
+            String fastModelName = modelConfigResolver.resolveFastModelName("claude-haiku-4-5-20251001");
+            if (fastModelName == null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[title-two-phase] 第一次总结跳过：fastModelName 未配置 session={}", sessionId);
+                }
+                return;
+            }
+            String newTitle = generateTitleText(userContent, fastModelName, sessionId);
+            synchronized (titleWriteLock(sessionId)) {
+                // 锁内重读：与轮末第二次刷新 / 用户 /rename 的写入串行，按最新状态重新判资格
+                SessionRecord latest = sessionMapper.selectOneById(sessionId);
+                if (latest == null || !isAutoTitleEligible(latest)
+                        || !isDefaultTitle(latest.getTitle(), latest.getModelName())) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[title-two-phase] 第一次总结丢弃（已被第二次刷新或 /rename 抢先）session={} explicit={}",
+                            sessionId, latest != null ? latest.getTitleExplicit() : null);
+                    }
+                    return;
+                }
+                boolean ok = applyGeneratedTitle(latest, newTitle, 0, userMessageId, wsTemplate);
+                log.info("[ChatService] 标题第一次总结（提问即时）{} session={} title={}",
+                    ok ? "成功" : "失败（保持原标题与 titleExplicit 不变，可重试）",
+                    sessionId, latest.getTitle());
+            }
+        } catch (Exception e) {
+            // 显式留痕但不影响对话（fire-and-forget 的唯一职责是标题）
+            log.warn("[title-two-phase] 第一次总结失败（不影响对话） session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    /**
+     * [title-two-phase] 第二次总结 · 本轮结束后用**完整会话内容**刷新标题并置 {@code titleExplicit=2}。
+     *
+     * <p>与旧 count3 的差别：不再要求 {@code userCount>=3} —— 本轮结束即刷新（第一次已由
+     * {@link #startImmediateTitleGeneration} 用首条提问生成，这里覆盖它）。**停闸语义不变**：
+     * 成功置 2 后后续轮次（及第一次总结）都不再自动刷新，避免每轮刷。
+     *
+     * <p>失败（回落"新会话"占位）不落库不置位，保持可重试；{@code titleExplicit=1}（/rename）永不覆盖。
+     */
+    private void refreshTitleAfterTurn(String sessionId, String userMessageId,
+                                       String assistantFinalContent, SimpMessagingTemplate wsTemplate) {
+        try {
+            SessionRecord snapshot = sessionMapper.selectOneById(sessionId);
+            if (snapshot == null) {
+                log.warn("[title-two-phase] 第二次总结跳过：会话不存在 session={}", sessionId);
+                return;
+            }
+            if (!isAutoTitleEligible(snapshot)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[title-two-phase] 第二次总结跳过：显式命名或已刷新 session={} explicit={}",
+                        sessionId, snapshot.getTitleExplicit());
+                }
+                return;
+            }
+            String fastModelName = modelConfigResolver.resolveFastModelName("claude-haiku-4-5-20251001");
+            if (fastModelName == null) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[title-two-phase] 第二次总结跳过：fastModelName 未配置 session={}", sessionId);
+                }
+                return;
+            }
+            String convText = extractConversationTextTail(sessionId);
+            String input = (convText != null && !convText.isBlank())
+                ? convText
+                : (assistantFinalContent != null && !assistantFinalContent.isBlank() ? assistantFinalContent : "(无内容)");
+            String newTitle = generateTitleText(input, fastModelName, sessionId);
+            synchronized (titleWriteLock(sessionId)) {
+                // 锁内重读：本轮期间用户可能 /rename（=1），或被并发的第一次总结写入（=0 仍可刷新）
+                SessionRecord latest = sessionMapper.selectOneById(sessionId);
+                if (latest == null || !isAutoTitleEligible(latest)) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[title-two-phase] 第二次总结跳过：锁内最新状态已停闸 session={} explicit={}",
+                            sessionId, latest != null ? latest.getTitleExplicit() : null);
+                    }
+                    return;
+                }
+                boolean ok = applyGeneratedTitle(latest, newTitle, 2, userMessageId, wsTemplate);
+                log.info("[ChatService] 标题第二次总结（轮末完整内容）{} session={} title={}",
+                    ok ? "成功（titleExplicit=2，不再自动刷新）" : "失败（保持原标题与 titleExplicit 不变，可重试）",
+                    sessionId, latest.getTitle());
+            }
+        } catch (Exception e) {
+            log.warn("[title-two-phase] 第二次总结失败（不影响对话） session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    /** [title-two-phase] 自动标题资格 = 未显式命名（非 1）且未自动刷新（非 2）。 */
+    private static boolean isAutoTitleEligible(SessionRecord session) {
+        Integer titleExplicit = session.getTitleExplicit();
+        return titleExplicit == null || titleExplicit == 0;
+    }
 
     /**
      * [title-cc-align] 标题生成（对齐 CC initReplBridge.ts:349-378 onUserMessage 的 count1+count3

@@ -19,9 +19,10 @@ import java.util.Map;
  *   <li>{@code queue.changed}：{type, sessionId, commands:[{uuid, content, mode, priority, isMeta}]}
  *       —— 入队/出队/清空后推快照（仅 busy 排队路径 + pop/cancel 时调用，空闲发送不闪排队框）</li>
  *   <li>{@code queue.drained}：{type, sessionId, drained:[{uuid, content, mode, streamTopic,
- *       userAttachments?}], commands:[...剩余]} —— 消费 busy-queued 项时推（[streamTopic-session-level]
- *       drained[].streamTopic 恒为会话级 {@code /topic/sessions/{sid}/stream}，前端已在会话 topic
- *       单一订阅，uuid+content 供渲染 queued-user 气泡）
+ *       userAttachments?, imagePasteIds?}], commands:[...剩余]} —— 消费 busy-queued 项时推
+ *       （[streamTopic-session-level] drained[].streamTopic 恒为会话级
+ *       {@code /topic/sessions/{sid}/stream}，前端已在会话 topic 单一订阅，uuid+content 供渲染
+ *       queued-user 气泡）
  *       <p>[busy 气泡附件胶囊] {@code drained[].userAttachments} = 该排队消息的<b>非图片附件快照</b>
  *       （{type, filename, mediaType, contentId, url}），仅在队列项携带快照时出站（key 缺失 = 无附件）。
  *       <b>WHY</b>：busy 消息的气泡由前端在 drained 时点 append —— 原载荷只有 uuid+content ⇒ 气泡
@@ -29,7 +30,14 @@ import java.util.Map;
  *       刚发的 Word/Excel/视频。数据一直在队列项里，只是没出站 ⇒ 本字段把它带上。
  *       ⛔ 权威源必须是后端快照（{@code QueueItem.userAttachments}，即 resolveAttachments 之后的
  *       <b>已解析列表</b>）：path 附件在<b>原始请求体</b>里只有 path、没有 contentId ⇒ 前端自算必得
- *       url=null（点了没反应），且与 F5 后两态不一致。</li>
+ *       url=null（点了没反应），且与 F5 后两态不一致。
+ *       <p>[busy 气泡图片] {@code drained[].imagePasteIds} = 该排队消息的<b>图片 id 列表</b>（= 落库
+ *       {@code messages.image_paste_ids} 同一份），仅在非空时出站（key 缺失 = 无图片）。
+ *       <b>WHY</b>：同一窗口下图片也丢 —— 气泡由 drained 时点构造，原载荷没有图片 id ⇒ 气泡
+ *       imagePasteIds 为空 → {@code MessageList} 的 userImages 为空（图不显示），F5 重拉（读侧
+ *       {@code MessageService.toDto} 有 parseStringList(image_paste_ids)）才恢复。id 在
+ *       {@code ChatService.enqueueBusyPrompt} 入队时用与 drain 同一规则定稿（写回附件 contentId），
+ *       ⇒ 本字段与落库逐字相同，前端按 id 去 image-cache 拉图即可。</li>
  * </ul>
  *
  * <p>fail-soft：wsTemplate 缺失（无 WebSocket 场景）→ 跳过推送；命令过滤按 sessionId 精确匹配
@@ -116,6 +124,15 @@ public class QueueEventPublisher {
                         com.nexusai.domain.session.MessageService.resolveAttachmentUrls(
                             c.userAttachments(), sessionId));
                 }
+                // [busy 气泡图片] 该排队消息的图片 id（= 落库 image_paste_ids 同一份）→ 前端 drained 时点
+                //   构造的 live 气泡据此去 image-cache 批量拉图。缺它 = 气泡 imagePasteIds 空 → 图不显示，
+                //   必须 F5 重拉才出现（读侧 toDto 有 parseStringList(image_paste_ids)）。
+                //   非空才出站（与 userAttachments 同规则：缺键 = 无图片，不伪造空数组）。
+                //   ⭐ id 在入队时已定稿（ChatService.enqueueBusyPrompt → prepareBusyQueuedImageAttachments，
+                //   写回附件 contentId）⇒ 本字段与 drain 落库的 image_paste_ids 逐字相同，前端拉到的是同一批图。
+                if (c.imagePasteIds() != null && !c.imagePasteIds().isEmpty()) {
+                    m.put("imagePasteIds", c.imagePasteIds());
+                }
                 return m;
             })
             .toList();
@@ -133,12 +150,14 @@ public class QueueEventPublisher {
                 "drained", drainedPayload, "commands", remaining));
         if (log.isDebugEnabled()) {
             // [busy 气泡附件胶囊] 数据流观测：出站了几条快照、每条几个附件（前端 live 气泡胶囊的来源）
-            log.debug("QueueEventPublisher.emitDrained: session={} drained={} 附件快照条数={} 明细={}",
+            log.debug("QueueEventPublisher.emitDrained: session={} drained={} 附件快照条数={} 图片id条数={} 明细={}",
                 sessionId, drained.size(),
                 drainedPayload.stream().filter(m -> m.containsKey("userAttachments")).count(),
+                drainedPayload.stream().filter(m -> m.containsKey("imagePasteIds")).count(),
                 drainedPayload.stream()
                     .map(m -> m.get("uuid") + ":"
-                        + (m.containsKey("userAttachments") ? "有附件" : "无附件"))
+                        + (m.containsKey("userAttachments") ? "有附件" : "无附件")
+                        + (m.containsKey("imagePasteIds") ? "+有图" : "+无图"))
                     .collect(java.util.stream.Collectors.joining(",")));
         }
     }

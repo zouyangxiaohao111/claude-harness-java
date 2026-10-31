@@ -86,6 +86,57 @@ describe('buildDrainedUserMessages：drained 事件（含后端快照）→ 带�
   })
 })
 
+describe('[busy 气泡图片] drained 事件 imagePasteIds → 气泡（live 出图的唯一来源）', () => {
+  it('⭐ 事件带 imagePasteIds ⇒ 气泡逐字搬运（MessageList 据此取 imageCache 出图，不再等 F5）', () => {
+    const msgs = buildDrainedUserMessages(
+      'sess-1',
+      [{ uuid: 'q1', content: '看这张图', userAttachments: null, imagePasteIds: ['2115683316836499456'] }],
+      new Set(),
+    )
+    expect(msgs[0].imagePasteIds).toEqual(['2115683316836499456'])
+  })
+
+  it('事件不带 / null / 空数组 ⇒ 气泡 imagePasteIds=null（不伪造空数组）', () => {
+    for (const wire of [undefined, null, [] as string[]]) {
+      const [msg] = buildDrainedUserMessages(
+        'sess-1', [{ uuid: 'q1', content: 'x', userAttachments: null, imagePasteIds: wire }], new Set(),
+      )
+      expect(msg.imagePasteIds, `wire=${JSON.stringify(wire)}`).toBeNull()
+    }
+  })
+
+  it('⭐ 端到端：后端出站 JSON（imagePasteIds）→ live 气泡带 id（与 F5 读侧 toDto 同一字段）', () => {
+    const wirePayload = JSON.parse(JSON.stringify({
+      type: 'queue.drained',
+      sessionId: 'sess-1',
+      drained: [{
+        uuid: 'msg-queued-img', content: '看这张图', mode: 'prompt',
+        streamTopic: '/topic/sessions/sess-1/stream',
+        imagePasteIds: ['2115683316836499456'],
+      }],
+      commands: [],
+    })) as { drained: Record<string, unknown>[] }
+
+    const msgs = buildDrainedUserMessages('sess-1', parseDrainedQueueItems(wirePayload.drained), new Set())
+
+    expect(msgs[0].imagePasteIds).toEqual(['2115683316836499456'])
+    expect(msgs[0].userAttachments).toBeNull()
+  })
+
+  it('parseDrainedQueueItems 图片 id 容错：缺键/null/非数组/空数组/非字符串项 → null 或过滤', () => {
+    const [missing] = parseDrainedQueueItems([{ uuid: 'q1', content: 'x' }])
+    expect(missing.imagePasteIds).toBeNull()
+    const [explicitNull] = parseDrainedQueueItems([{ uuid: 'q1', content: 'x', imagePasteIds: null }])
+    expect(explicitNull.imagePasteIds).toBeNull()
+    const [notArray] = parseDrainedQueueItems([{ uuid: 'q1', content: 'x', imagePasteIds: 'oops' }])
+    expect(notArray.imagePasteIds).toBeNull()
+    const [empty] = parseDrainedQueueItems([{ uuid: 'q1', content: 'x', imagePasteIds: [] }])
+    expect(empty.imagePasteIds).toBeNull()
+    const [mixed] = parseDrainedQueueItems([{ uuid: 'q1', content: 'x', imagePasteIds: ['7', 8, '', null] }])
+    expect(mixed.imagePasteIds).toEqual(['7'])
+  })
+})
+
 describe('parseDrainedQueueItems：原始 STOMP 载荷 → 归一（这一跳此前不可单测）', () => {
   it('⭐ 端到端：后端出站 JSON → live 气泡胶囊（path 附件 contentId 非空 + url 可点 = 与 F5 一致）', () => {
     // 后端 QueueEventPublisher.emitDrained 实际出站的形状（Jackson 序列化 UserAttachmentInfo record）

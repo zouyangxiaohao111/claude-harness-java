@@ -1,5 +1,47 @@
 import { useState, type ReactNode } from 'react'
 
+/** 「运行」tab 每组默认最多渲染的已完成/历史条数（进行中不受限 · 用户 2026-10-28 裁定） */
+export const RUN_ROW_CAP = 5
+
+/**
+ * 运行 tab 分组折叠：进行中条目永远全显示，其余最多 {@code cap} 条。
+ *
+ * <p>{@code cap <= 0} 表示不截断（图标轨沿用原分页/不分页）。
+ * 返回的 {@code over} = 被折叠掉的条数（0 → 不渲染「查看更多」）。
+ */
+export function capRunRows<T>(list: T[], isActive: (x: T) => boolean, showAll: boolean, cap: number): {
+  shown: T[]
+  over: number
+} {
+  if (cap <= 0) return { shown: list, over: 0 }
+  const over = Math.max(0, list.filter((x) => !isActive(x)).length - cap)
+  if (showAll || over === 0) return { shown: list, over }
+  const shown: T[] = []
+  let budget = cap
+  for (const x of list) {
+    const active = isActive(x)
+    if (active || budget > 0) {
+      shown.push(x)
+      if (!active) budget -= 1
+    }
+  }
+  return { shown, over }
+}
+
+/** 运行 tab 各分组底部的「查看更多（还有 N 条）/ 收起」 */
+export function RunMoreButton({ over, showAll, onToggle }: {
+  over: number
+  showAll: boolean
+  onToggle: () => void
+}) {
+  if (over <= 0) return null
+  return (
+    <button type="button" className="run-more" onClick={onToggle}>
+      {showAll ? '收起' : `查看更多（还有 ${over} 条）`}
+    </button>
+  )
+}
+
 /**
  * 右栏任务页的折叠分组（2026-10-21 用户裁定 D2）。
  *

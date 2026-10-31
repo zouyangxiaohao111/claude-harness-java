@@ -60,7 +60,14 @@ import java.util.function.Consumer;
  * <p><b>受控残留（SDK 0.25.0 API 约束，grep javap 实证）</b>：
  * <ul>
  *   <li>R-T-1：tool 消息 content 数组仅支持 {@code ChatCompletionContentPartText} → tool 结果中的
- *       image/document 块被跳过（warn 日志）；acceptFeedback / text 块正常序列化。
+ *       image 块<b>无法在 tool 消息内表达</b>（javap 实证：{@code contentOfArrayOfContentParts} 的
+ *       形参被钉死为 {@code List<ChatCompletionContentPartText>}；{@code ChatCompletionContentPart}
+ *       联合类型虽有 {@code ofImageUrl}，但 tool 侧入口不收它）⇒ 改走<b>等价替代通道</b>：
+ *       tool 消息本体形状逐字不变（文本照旧），image 块由<b>紧随其后的独立 role=user 消息</b>承载
+ *       （{@code image_url} part · {@link #toSdkImageCarrierMessage}）—— 与 Anthropic 通道
+ *       「tool_result.content 内嵌 image」等价，模型侧同样看得到图。
+ *       document 块仍被跳过（SDK 0.25.0 无 document content part · R-U-1 同源限制，warn 日志）；
+ *       acceptFeedback / text 块正常序列化。
  *       [IT-6] structuredOutput 不再序列化（停发模型）→ 载荷走 structured_output attachment 通道</li>
  *   <li>R-U-1：user 消息无 document content part（SDK 0.25.0 无 document 类型）→ document 块跳过；
  *       image → image_url / text → text 正常渲染</li>
@@ -1286,12 +1293,9 @@ public class OpenAiSdkProvider implements LlmProvider {
                 log.debug("OpenAiSdkProvider 发送边界配对修复: {} → {} 条（悬挂 tool_use/孤儿 tool_result）",
                     history.size(), outbound.size());
             }
-            for (ChatMessageDto m : outbound) {
-                ChatCompletionMessageParam param = toSdkMessage(m);
-                if (param != null) {
-                    b.addMessage(param);
-                    sentMessageCount++;
-                }
+            for (ChatCompletionMessageParam param : toSdkMessageParams(outbound)) {
+                b.addMessage(param);
+                sentMessageCount++;
             }
         }
         // [G4] strict 模型层门控（OpenAI · Java 多 provider 扩展 ⊕）：flag && model != null && 白名单。
@@ -1393,15 +1397,90 @@ public class OpenAiSdkProvider implements LlmProvider {
      * 由 ToolResultApplier 产出 structured_output attachment）。
      */
     public static List<ChatCompletionMessageParam> buildSdkMessages(List<ChatMessageDto> history) {
-        List<ChatCompletionMessageParam> msgs = new ArrayList<>();
-        if (history == null) return msgs;
+        if (history == null) return new ArrayList<>();
         // [P1 发送边界配对修复] 与 buildRequestParams(:660) 同源同语义 —— 测试驱动路径与生产路径
         //   共用 ToolResultPairingRepair.ensureToolResultPairing（CC claude.ts:1324 唯一调用点同款）。
-        for (ChatMessageDto m : ToolResultPairingRepair.ensureToolResultPairing(history)) {
+        return toSdkMessageParams(ToolResultPairingRepair.ensureToolResultPairing(history));
+    }
+
+    /**
+     * [CU 修复 · R-T-1 绕道] 出站消息列表 → SDK 消息列表（tool 结果里的 image 块由紧随的
+     * {@code role=user} 承载消息送达）。
+     *
+     * <p><b>WHY 需要绕道</b>：openai-java 0.25.0 的 {@code ChatCompletionToolMessageParam} 的
+     * content 数组<b>只接受</b> {@code ChatCompletionContentPartText}（javap 实证：
+     * {@code contentOfArrayOfContentParts(List<ChatCompletionContentPartText>)}）⇒ image part
+     * <b>结构上</b>无法放进 tool 消息（R-T-1）。而 {@code role=user} 消息的 content 数组收全类型
+     * {@code ChatCompletionContentPart}（含 {@code ofImageUrl}）—— 本仓 PDF 页图（P-AL-01）已在用该通道。
+     *
+     * <p><b>落位规则</b>：image 承载消息插在<b>整段连续 tool 消息之后</b>（下一条非 tool 消息之前），
+     * ⛔ 不插在 tool 消息<b>中间</b>——OpenAI 兼容端点要求「assistant(tool_calls) 之后紧跟应答每个
+     * tool_call_id 的 tool 消息」，中间插一条 user 会被判 400（见
+     * {@link ToolResultPairingRepair} 头注的 ant 端点同款约束）。故本方法按「连续 tool 段」聚合
+     * image 块，段末统一冲刷一条承载消息。
+     *
+     * <p>⭐ <b>两条出站路径共用本方法</b>（生产 {@link #buildRequestParams} + 测试驱动
+     * {@link #buildSdkMessages}）⇒ wire 形状恒等，不会出现「生产丢图 / 测试不丢图」的分裂。
+     */
+    static List<ChatCompletionMessageParam> toSdkMessageParams(List<ChatMessageDto> repaired) {
+        List<ChatCompletionMessageParam> msgs = new ArrayList<>();
+        if (repaired == null) return msgs;
+        // 待冲刷的 image part（来自本段连续 tool 消息）—— 段末统一作为一条 role=user 承载消息送出
+        List<ChatCompletionContentPart> pendingImages = new ArrayList<>();
+        for (ChatMessageDto m : repaired) {
+            boolean isTool = m != null && m.role() == Role.tool;
+            if (!isTool && !pendingImages.isEmpty()) {
+                msgs.add(toSdkImageCarrierMessage(pendingImages));
+                pendingImages.clear();
+            }
             ChatCompletionMessageParam param = toSdkMessage(m);
             if (param != null) msgs.add(param);
+            // ⛔ 只收「真的上了 wire 的 tool 消息」的 image（tool 消息被丢弃 ⇒ 其 image 一并不承载）
+            if (isTool && param != null) {
+                pendingImages.addAll(toSdkToolImageParts(m));
+            }
+        }
+        if (!pendingImages.isEmpty()) {
+            msgs.add(toSdkImageCarrierMessage(pendingImages));
+            pendingImages.clear();
         }
         return msgs;
+    }
+
+    /**
+     * [CU 修复 · R-T-1 绕道] tool 结果的 image 块 → 承载消息的 content part 列表。
+     *
+     * <p>⭐ <b>复用 {@link #toSdkUserContentPart}</b>（本仓「块 → SDK content part」的唯一实现：
+     * image → {@code ofImageUrl}，base64 → {@code data:<media>;base64,<data>}，url → 原样）⇒ 与
+     * role=user 通道（PDF 页图 P-AL-01）逐字同款，无第二套 URL 解析口径。
+     * ⛔ 只取 {@code type=image} 块（text 块仍留在 tool 消息本体 · document 块 SDK 无 part 类型
+     * 仍跳过 · R-U-1）。
+     */
+    static List<ChatCompletionContentPart> toSdkToolImageParts(ChatMessageDto m) {
+        List<ChatCompletionContentPart> parts = new ArrayList<>();
+        if (m == null || m.contentBlocks() == null) return parts;
+        for (Object blockObj : m.contentBlocks()) {
+            if (!(blockObj instanceof JsonNode block) || !block.isObject()) continue;
+            if (!"image".equals(block.path("type").asText())) continue;
+            ChatCompletionContentPart part = toSdkUserContentPart(block);
+            if (part == null) continue;
+            parts.add(part);
+        }
+        return parts;
+    }
+
+    /**
+     * [CU 修复 · R-T-1 绕道] image part 列表 → 一条 {@code role=user} 承载消息。
+     *
+     * <p>⭐ 与 Anthropic 通道的等价性：Anthropic 侧 image 块作为 tool_result 的<b>同级块</b>落在
+     * 同一条 user 消息里（{@code AnthropicSdkProvider.appendSdkContentBlock}）⇒ 模型侧「这张图属于上一个
+     * 工具结果」的语义在两条通道上一致。
+     */
+    private static ChatCompletionMessageParam toSdkImageCarrierMessage(List<ChatCompletionContentPart> imageParts) {
+        return ChatCompletionMessageParam.ofUser(
+            ChatCompletionUserMessageParam.builder()
+                .contentOfArrayOfContentParts(new ArrayList<>(imageParts))
+                .build());
     }
 
     static ChatCompletionMessageParam toSdkMessage(ChatMessageDto m) {
@@ -1529,6 +1608,14 @@ public class OpenAiSdkProvider implements LlmProvider {
                                 if (log.isDebugEnabled()) {
                                     log.debug("OpenAiSdkProvider role=tool 跳过 tool_reference 块（OpenAI 协议无 tool_reference 原生块 · 回退 content 文本 · N/A 登记）tool_name={}",
                                         block.has("tool_name") ? block.get("tool_name").asText() : null);
+                                }
+                            } else if ("image".equals(btype)) {
+                                // [CU 修复 · R-T-1 绕道] image 块不在 tool 消息本体里（SDK 0.25.0
+                                //   tool content 数组只收 ChatCompletionContentPartText · javap 实证）
+                                //   ⇒ 由紧随的独立 role=user 承载消息送出（toSdkImageCarrierMessage）
+                                //   ⇒ 这里只做留痕，不算「跳过」。
+                                if (log.isDebugEnabled()) {
+                                    log.debug("OpenAiSdkProvider role=tool image 块改由 role=user 承载消息送达（R-T-1 绕道 · 非跳过）");
                                 }
                             } else {
                                 log.warn("OpenAiSdkProvider role=tool 跳过 {} 块（SDK 0.25.0 tool content 仅支持 text part · R-T-1 受控残留）",

@@ -202,7 +202,8 @@ public final class ContextUsageCalculator {
             return CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         try {
-            ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] 上下文窗口是统计/展示口径，不是选模型 → 宽松解析（裸名歧义不打 ERROR）
+            ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             if (model != null && model.getMaxContextTokens() != null && model.getMaxContextTokens() > 0) {
                 return model.getMaxContextTokens();
             }
@@ -233,11 +234,39 @@ public final class ContextUsageCalculator {
      * @return provider.type == "anthropic"
      */
     public static boolean isAnthropic(ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
+        return isAnthropic(modelMapper, providerMapper, modelName, null);
+    }
+
+    /**
+     * 模型名 → 是否 Anthropic provider（<b>已知本次调用 provider 类型时的重载</b>）。
+     *
+     * <p>给定 {@code providerType} 时直接按类型判定（{@code "anthropic".equals(providerType)}），
+     * 不做 DB 反查 —— 计费/上下文快照的调用方（{@code LlmCallRecord.providerType()}）本来就持有
+     * 真实类型，反查只会引入一次多余的 resolve，并可能在裸名歧义时打 ERROR（而返回值最终还是
+     * 取决于类型）。{@code providerType} 为空 → 退回按模型名反查的 3 参重载。
+     *
+     * @param modelMapper    模型 mapper（3 参回落路径用）
+     * @param providerMapper 提供商 mapper（3 参回落路径用）
+     * @param modelName      模型名（3 参回落路径用）
+     * @param providerType   provider 类型（{@code anthropic} / {@code openai_compatible} …；空 → 反查）
+     * @return provider.type == "anthropic"
+     */
+    public static boolean isAnthropic(ModelMapper modelMapper, ProviderMapper providerMapper,
+                                      String modelName, String providerType) {
+        if (providerType != null && !providerType.isBlank()) {
+            boolean anthropic = "anthropic".equals(providerType);
+            if (log.isDebugEnabled()) {
+                log.debug("[ContextUsageCalculator] 协议判定来源=providerType: model={} providerType={} anthropic={}",
+                    modelName, providerType, anthropic);
+            }
+            return anthropic;
+        }
         if (modelName == null || modelName.isBlank() || modelMapper == null || providerMapper == null) {
             return false;
         }
         try {
-            ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] 统计/展示路径走宽松解析：裸名歧义不再打 ERROR（选模型链路才 fail-loud）
+            ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             if (model == null) {
                 if (log.isDebugEnabled()) {
                     log.debug("[ContextUsageCalculator] 模型不可判定, 按非 Anthropic（input-only）: model={}",

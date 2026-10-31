@@ -49,7 +49,9 @@ public final class ModelCapabilityResolver {
             return false;
         }
         try {
-            ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] 能力查询走宽松解析（不是选模型）：裸名多 provider 同名时返回 null →
+            //   保守 false（多模态工具路由），不再打选模型链路的 fail-loud ERROR。
+            ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             if (model == null) {
                 if (log.isDebugEnabled()) {
                     log.debug("[ModelCapabilityResolver] 图片能力判定: modelName={} 未命中 enabled model → false（保守）", modelName);

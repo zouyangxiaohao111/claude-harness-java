@@ -4,11 +4,14 @@ import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.computeruse.ComputerUseMcpContent;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.tool.AgentToolResult;
+import com.nexusai.application.agent.tool.ContentBlockParam;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
+import com.nexusai.application.agent.tool.ToolResultBlockParam;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
@@ -18,6 +21,7 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.Base64;
+import java.util.List;
 import java.util.Map;
 import java.util.UUID;
 
@@ -31,6 +35,12 @@ import java.util.UUID;
  *
  * <p><b>本阶段范围</b>：工具面 —— 模型可见可调、入参校验、通道转发预留。真实浏览器动作执行
  * （click/type/navigate/console/network 等）由后续 WS 批次在 {@link BrowserChannel} 实现内落地。
+ *
+ * <p><b>[Phase 1b · C] 截图送达模型</b>：改前截图被降级成「已保存到本地路径」的<b>纯文本指针</b>
+ * ⇒ <b>模型看不到画面</b>；改后截图以 <b>image content block</b>（base64）随 tool_result 送达，
+ * 与 computer-use 截图同款映射（{@link ComputerUseMcpContent#toApiBlocks}，
+ * CCB {@code src/utils/computerUse/wrapper.tsx:302-318}）。无截图的工具
+ * ⇒ <b>纯文本结果形状逐字不变</b>。
  */
 final class BrowserMcpTool implements Tool {
 
@@ -176,11 +186,16 @@ final class BrowserMcpTool implements Tool {
         }
         try {
             String result = ch.send(sessionId, toolName, args);
-            // 截图类大 base64 不直接给模型（纯噪音 + 巨 token）：落盘为文件，tool_result 给指针
-            result = persistScreenshotIfPresent(result, sessionId);
+            // [Phase 1b · C] 截图类大 base64：落盘为文件 + **以 image content block 送达模型**
+            //   （改前只给「已保存到本地路径」的文本指针 ⇒ 模型看不到画面 —— 本批修掉的缺陷）。
+            //   无截图 / 非 dataUrl / 落盘失败 ⇒ 返回 null ⇒ 纯文本结果形状逐字不变。
+            BrowserMcpScreenshotPayload payload = persistScreenshotIfPresent(result, sessionId);
             if (log.isDebugEnabled()) {
-                log.debug("BrowserMcpTool: {} 转发成功（channel 返回 {} 字符）", name,
-                    result == null ? 0 : result.length());
+                log.debug("BrowserMcpTool: {} 转发成功（channel 返回 {} 字符，截图载荷={}）", name,
+                    result == null ? 0 : result.length(), payload != null);
+            }
+            if (payload != null) {
+                return ToolResult.success(call.id(), payload);
             }
             return ToolResult.success(call.id(), result);
         } catch (Exception e) {
@@ -190,39 +205,104 @@ final class BrowserMcpTool implements Tool {
     }
 
     /**
-     * 截图落盘处理：扩展返回的截图结果含 {@code dataUrl}（base64 图）→ 解码写文件，
-     * tool_result 改为「保存路径 + 体积」等指针，不再把整段 base64 回给模型。
-     * 非截图 / 非 dataUrl / 落盘失败 → 原样返回。
+     * 截图结果的 tool_result 载荷 · <b>文本摘要 + image content block</b>。
+     *
+     * <p><b>WHY 单独一个载荷类型</b>：无截图时必须<b>逐字保持</b>既有纯文本结果形状
+     * （{@code ToolResult.success(call.id(), "<原始 JSON 串>")}）⇒ 截图场景才需要
+     * 「文本 + image 块」的双通道载体。
+     *
+     * @param text    文本摘要（JSON 串；<b>不含 base64</b>）
+     * @param content MCP content blocks（text 块 + image 块）
+     */
+    record BrowserMcpScreenshotPayload(String text, List<ComputerUseMcpContent> content) {
+
+        BrowserMcpScreenshotPayload {
+            content = content == null ? List.of() : List.copyOf(content);
+        }
+
+        /** 摘要（不含 base64）—— 默认渲染器兜底路径（{@code String.valueOf(data)}）不会泄漏 base64。 */
+        @Override
+        public String toString() {
+            return text == null ? "" : text;
+        }
+    }
+
+    /**
+     * tool_result → image content block（对齐 CU 截图同款）。
+     *
+     * <p>映射规则逐字复用 {@link ComputerUseMcpContent#toApiBlocks}
+     * （CCB {@code src/utils/computerUse/wrapper.tsx:302-318} 的「MCP content → API block」映射）
+     * ⇒ 产出 {@code {type:'image', source:{type:'base64', media_type, data}}}，
+     * 与本仓唯一在役的 image block 生产者 {@code ReadFileTool.java:1404-1418} 同款。
+     *
+     * <p>⛔ 纯文本结果（无截图）⇒ 走 {@link Tool} 默认兜底 ⇒ <b>形状逐字不变</b>。
+     */
+    @Override
+    public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result,
+                                                          String toolUseId,
+                                                          boolean isError) {
+        if (!isError
+                && result instanceof ToolResult<?> tr
+                && tr.data() instanceof BrowserMcpScreenshotPayload payload
+                && !payload.content().isEmpty()) {
+            List<ContentBlockParam> blocks = ComputerUseMcpContent.toApiBlocks(payload.content());
+            if (!blocks.isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("BrowserMcpTool: {} 产出 image block: toolUseId={} 块数={}",
+                        name, toolUseId, blocks.size());
+                }
+                return ToolResultBlockParam.blocksContent(toolUseId, blocks);
+            }
+        }
+        return Tool.super.mapToToolResultBlockParam(result, toolUseId, isError);
+    }
+
+    /**
+     * 截图处理：扩展返回的截图结果含 {@code dataUrl}（base64 图）→ 解码写文件，
+     * <b>并以 image content block 随 tool_result 送达模型</b>。
+     * 非截图 / 非 dataUrl / 落盘失败 → 返回 {@code null}（⇒ 调用方走纯文本路径，形状不变）。
+     *
+     * <p><b>[Phase 1b · C] 行为变更（如实标注）</b>：改前本方法把截图换成「保存路径 + 体积」的
+     * <b>纯文本指针</b>（note 明写「若需模型看该图请走视觉/读文件通道读取，不要用 base64」）
+     * ⇒ <b>模型根本看不到那张图</b>。改后截图<b>真的进模型上下文</b>
+     * （image block · base64）⇒ <b>token 消耗上升</b>（量级见交付报告）。
      *
      * <p>存储目录：{tmp}/nexusai-browser-shots/&lt;sessionId&gt;/shot-*.png|jpeg
      * （跨层约定：后续前端展示图片需经 HTTP 资源端点映射该目录，另议）。
+     *
+     * @param result    扩展返回的原始结果串
+     * @param sessionId 会话 id（落盘目录分桶）
+     * @return 截图载荷（无截图 ⇒ null）
      */
-    private String persistScreenshotIfPresent(String result, String sessionId) {
+    private BrowserMcpScreenshotPayload persistScreenshotIfPresent(String result, String sessionId) {
         if (result == null || result.isEmpty()) {
-            return result;
+            return null;
         }
         JsonNode node;
         try {
             node = JSON.readTree(result);
         } catch (Exception e) {
-            return result;
+            return null;
         }
         if (node == null || !node.isObject()) {
-            return result;
+            return null;
         }
         JsonNode dataUrlNode = node.get("dataUrl");
         if (dataUrlNode == null || !dataUrlNode.isTextual()) {
-            return result;
+            return null;
         }
         String dataUrl = dataUrlNode.asText();
         if (!dataUrl.startsWith("data:image/")) {
-            return result;
+            return null;
         }
         int comma = dataUrl.indexOf(',');
         if (comma < 0) {
-            return result;
+            return null;
         }
-        String ext = dataUrl.regionMatches(true, 0, "data:image/png", 0, "data:image/png".length())
+        String mimeType = dataUrl.substring("data:".length(), dataUrl.indexOf(';') > 0
+                ? dataUrl.indexOf(';')
+                : comma);
+        String ext = mimeType.regionMatches(true, 0, "image/png", 0, "image/png".length())
                 ? "png" : "jpeg";
         try {
             byte[] bytes = Base64.getDecoder().decode(dataUrl.substring(comma + 1));
@@ -236,21 +316,27 @@ final class BrowserMcpTool implements Tool {
                     + UUID.randomUUID().toString().substring(0, 8) + "." + ext);
             Files.write(file, bytes);
             if (log.isInfoEnabled()) {
-                log.info("BrowserMcpTool: 截图已落盘 {}（{} 字节，原 base64 {} 字符，tool_result 不再回传 base64）",
-                    file.toAbsolutePath(), bytes.length, dataUrl.length());
+                log.info("BrowserMcpTool: 截图已落盘 {}（{} 字节，{}），并以 image block 送达模型",
+                    file.toAbsolutePath(), bytes.length, mimeType);
             }
             ObjectNode summary = JSON.createObjectNode();
             summary.put("ok", true);
             summary.put("action", node.path("action").asText("screenshot"));
             summary.put("savedTo", file.toAbsolutePath().toString());
             summary.put("bytes", bytes.length);
-            summary.put("note", "截图已保存到本地文件路径 savedTo；若需模型看该图请走视觉/读文件通道读取，不要用 base64");
-            return JSON.writeValueAsString(summary);
+            summary.put("note", "截图已保存到本地文件路径 savedTo；图片本体已随本结果一并送达，可直接查看。");
+            String text = JSON.writeValueAsString(summary);
+            // ⛔ base64 只进 image block（不进文本摘要）—— 文本通道留 base64 是纯噪音 + 巨 token。
+            String base64 = dataUrl.substring(comma + 1);
+            return new BrowserMcpScreenshotPayload(
+                    text,
+                    List.of(ComputerUseMcpContent.text(text),
+                            ComputerUseMcpContent.image(base64, mimeType)));
         } catch (Exception e) {
             if (log.isWarnEnabled()) {
                 log.warn("BrowserMcpTool: 截图落盘失败，退回原结果（含 base64）: {}", e.getMessage());
             }
-            return result;
+            return null;
         }
     }
 

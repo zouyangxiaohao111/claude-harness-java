@@ -78,4 +78,24 @@ public interface ChannelPermissionCallbacks {
      * （{@code behavior} / {@code fromServer}）。
      */
     record ChannelResponse(String behavior, String fromServer) {}
+
+    /**
+     * CC truncateForPreview — JSON 预览截断到 200 字符（channelPermissions.ts:160-167）·
+     * phone-sized（Write(5KB-file) 不刷屏）。
+     *
+     * <p><b>WHY 放在接口上（static）</b>：出站事件（{@code inputPreview}）与会话状态重放快照
+     * （{@link PendingPermissionSnapshot#inputPreview()}）必须用<b>同一套</b>截断规则 ⇒ 单点实现，
+     * 避免两处漂移（生产实现与快照各写一份 ⇒ 预览长度不一致）。
+     *
+     * @param input 工具入参（可 null）
+     * @return 截断后的 JSON 字符串（不可序列化时返回 {@code "(unserializable)"}）
+     */
+    static String truncateForPreview(JsonNode input) {
+        try {
+            String s = input == null ? "" : input.toString();
+            return s.length() > 200 ? s.substring(0, 200) + "…" : s;
+        } catch (Exception e) {
+            return "(unserializable)";
+        }
+    }
 }

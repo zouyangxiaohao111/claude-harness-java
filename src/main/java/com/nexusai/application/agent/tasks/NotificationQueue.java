@@ -210,8 +210,38 @@ public class NotificationQueue {
          * 仅 busy-queued 携（{@code ChatService.enqueueBusyPrompt} 构造）；其余 workload 恒 null。
          * null = 无附件（纯文本，落库列恒 NULL，零变化）。
          */
-        @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments
+        @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments,
+        /**
+         * [busy 气泡图片] 该排队消息的图片 id 列表（= 落库 V46 {@code image_paste_ids} 同一份 id）·
+         * 前端在 {@code queue.drained} 时点构造的 live 气泡据此去 image-cache 批量拉图
+         * （{@code MessageList} userImages ← {@code imageCache[sessionId][id]}；缺它 = 气泡无图，须 F5）。
+         *
+         * <p><b>WHY 必须在入队时定稿</b>：busy 消息的图片 id 在 drain 时由
+         * {@code LlmAgentLoop.pastedImagesFromAttachments} 分配（直传 base64 图无 contentId → 雪花 id）。
+         * 若入队不分配、drain 再分配，两次雪花不同 ⇒ 前端拿到的是 image-cache 里不存在的 id（图仍不显示）。
+         * 故 {@code ChatService.enqueueBusyPrompt} 入队前先用<b>同一方法</b>
+         * （{@code LlmAgentLoop.prepareBusyQueuedImageAttachments}）分配一次并写回附件 contentId ——
+         * 附件列表成为唯一 id 源，drain 解析同一数字 id，落库列与本字段逐字相同。
+         *
+         * <p>口径：仅 base64 非空图片（与 drain 侧 registerRunPromptImages 剔除 base64 空图同门）、
+         * 按序去重（同 buildUserMessageWithImages 收集规则）。仅 busy-queued 携；其余 workload 恒 null
+         * = 无图片（前端「缺键 = 无图」，不伪造空数组）。
+         */
+        @Nullable List<String> imagePasteIds
     ) {
+        /**
+         * 14-arg 兼容构造（imagePasteIds=null）— [busy 气泡附件胶囊] 既有 14 参 canonical 调用方零改动
+         * （仅 busy-queued 携图片 id；其余构造点留空 = 无图片）。
+         */
+        public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
+                         @Nullable String uuid, boolean isMeta, @Nullable String workload,
+                         boolean skipSlashCommands, @Nullable MessageOrigin origin,
+                         @Nullable String sessionId, @Nullable String boundProject,
+                         @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments,
+                         @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments) {
+            this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
+                sessionId, boundProject, scheduleId, attachments, userAttachments, null);
+        }
         /**
          * 13-arg 兼容构造（userAttachments=null）— [busy 附件快照] 既有 13 参 canonical 调用方零改动
          * （仅 busy-queued 携快照；其余构造点留空 = 无附件快照）。
@@ -222,7 +252,7 @@ public class NotificationQueue {
                          @Nullable String sessionId, @Nullable String boundProject,
                          @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments) {
             this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
-                sessionId, boundProject, scheduleId, attachments, null);
+                sessionId, boundProject, scheduleId, attachments, null, null);
         }
         /**
          * 12-arg 兼容构造（attachments=null）— [OD-D5] 既有 canonical 调用方零改动
@@ -405,9 +435,12 @@ public class NotificationQueue {
         // 归组/诊断（NotificationQueue 唯一消费点 = 日志），per-task 虚拟会话键机制已删（master a6dce0b0）
         // [OD-D5] attachments 透传（busy-queued 携图）：priority==null 路径逐字段重建必须保留附件，
         //   否则忙时排队带图消息经 normalizePriority（priority 缺省补 NEXT）丢图（reflector MAJOR-2）。
+        // [busy 附件快照/气泡图片] userAttachments + imagePasteIds 同样逐字段透传：重建丢弃它们 ⇒
+        //   drain 落库 V63 快照与 queue.drained 气泡图片 id 双双丢失（与本方法上方 attachments 同一红线）。
         return new QueueItem(item.value(), item.mode(), fallback, item.agentId(),
             item.uuid(), item.isMeta(), item.workload(), item.skipSlashCommands(), item.origin(),
-            item.sessionId(), item.boundProject(), item.scheduleId(), item.attachments());
+            item.sessionId(), item.boundProject(), item.scheduleId(), item.attachments(),
+            item.userAttachments(), item.imagePasteIds());
     }
 
     /** debug 日志用 origin 描述（channel → "channel:server"，null → "null"）。 */

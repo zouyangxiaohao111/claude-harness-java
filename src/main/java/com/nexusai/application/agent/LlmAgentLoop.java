@@ -9404,7 +9404,9 @@ public class LlmAgentLoop implements AgentLoop {
         StopHookPipeline.executePromptSuggestion(bareMode, ctx.promptSuggestion(),
             com.nexusai.application.agent.api.PromptSuggestion.SuggestionContext.fromMessages(
                 state.modelView(), sugAppState));
-        StopHookPipeline.cleanupComputerUseAfterTurn(mainAgentId);
+        // [Phase 1a] 传入 sessionId ⇒ 轮末真释放本会话持有的 computer-use 锁
+        // （主线程专属 + 失败静默，对齐 CCB src/query/stopHooks.ts:168-182）。
+        StopHookPipeline.cleanupComputerUseAfterTurn(mainAgentId, state.sessionId());
         // [V-TOK-04] stop hooks 已在 do-while 纯文本分支 budget check 前评估 -> 跳过避免双触发
 
         if (ctx.hookRegistry() != null && !stopHooksEvaluated) {
@@ -11089,7 +11091,8 @@ public class LlmAgentLoop implements AgentLoop {
         }
         if (modelName != null && !modelName.isBlank() && modelMapper != null && providerMapper != null) {
             // W1-2: 统一走全名解析器（providerName/modelName 联合查, 无 / 回退按 name 查第一条）
-            ModelRecord model = ModelNameResolver.resolve(modelMapper, providerMapper, modelName);
+            // [2026-10-29] token budget 是统计口径（不是选模型）→ 宽松解析，裸名歧义不打 ERROR
+            ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             // W2-1: 模型级窗口优先（models.max_context_tokens）——provider 级不再读取（探查确认死源）
             if (model != null && model.getMaxContextTokens() != null) {
                 if (log.isDebugEnabled()) {
@@ -14834,6 +14837,68 @@ public class LlmAgentLoop implements AgentLoop {
         }
         return images;
     }
+
+    /**
+     * [busy 气泡图片] 入队期定稿 busy-queued 图片附件的 image-cache id —— 返回「id 已写回 contentId 的
+     * 附件列表」+「该消息的 imagePasteIds」。
+     *
+     * <p><b>WHY（缺陷 2026-10-29 实测）</b>：busy 排队消息的气泡由前端在 {@code queue.drained} 时点
+     * 构造（{@code buildDrainedUserMessages}），必须带与落库一致的 imagePasteIds 才能去 image-cache
+     * 拉图（{@code MessageList} userImages）。而直传 base64 图在请求体里<b>没有 contentId</b>，id 原本
+     * 在 drain 时由 {@link #pastedImagesFromAttachments} 现分配（雪花）—— 若入队时另分配一份，两次
+     * 雪花不同 ⇒ 前端拿到 image-cache 里不存在的 id，<b>图仍不显示</b>。
+     * 故入队前用<b>同一方法</b>分配一次并写回附件 contentId：drain 的 pastedImagesFromAttachments
+     * 解析同一数字 id，{@code createQueuedUserMessage} 落库的 image_paste_ids 与本字段逐字相同
+     * （附件列表是唯一 id 源）。本方法纯函数（不落盘、不改 store）。
+     *
+     * <p>imagePasteIds 口径与 drain 落库侧一致：只收 base64 非空图片（registerRunPromptImages 的
+     * 「剔除 base64 空图」门 —— 附件表/path 大图不属于 image-cache id 空间），按序去重
+     * （buildUserMessageWithImages 收集侧同规则）。
+     *
+     * @param attachments 已解析附件列表（{@code ChatService.busyQueuedResolvedAttachments} 输出；可 null/空）
+     * @return id 已定稿的附件 + 该消息 imagePasteIds（无图 → 空列表）
+     */
+    public static BusyImageAttachments prepareBusyQueuedImageAttachments(List<AttachmentRequest> attachments) {
+        if (attachments == null || attachments.isEmpty()) {
+            return new BusyImageAttachments(attachments == null ? List.of() : attachments, List.of());
+        }
+        List<ImageAttachmentStore.PastedImage> images = pastedImagesFromAttachments(attachments);
+        if (images.isEmpty()) {
+            return new BusyImageAttachments(attachments, List.of());
+        }
+        // id 写回：图片附件按序遍历，与 pastedImagesFromAttachments 的过滤口径/顺序一一对应；
+        //   已有数字 contentId（粘贴缓存/附件表 id）→ 原样保留，只有直传 base64 无 id 的才写回新分配的雪花。
+        List<AttachmentRequest> rewritten = new ArrayList<>(attachments.size());
+        int imageIdx = 0;
+        for (AttachmentRequest att : attachments) {
+            if (att == null || !isImageAttachment(att)) {
+                rewritten.add(att);
+                continue;
+            }
+            long id = images.get(imageIdx++).id();
+            if (parseAttachmentContentId(att) != null) {
+                rewritten.add(att);
+            } else {
+                rewritten.add(new AttachmentRequest(att.type(), String.valueOf(id), att.filename(),
+                    att.mediaType(), att.base64(), att.path()));
+            }
+        }
+        // 与 buildUserMessageWithImages 的收集口径对齐：base64 非空图片才进 image_paste_ids，按序去重
+        java.util.LinkedHashSet<String> imagePasteIds = new java.util.LinkedHashSet<>();
+        for (ImageAttachmentStore.PastedImage img : images) {
+            if (img.base64() != null && !img.base64().isBlank()) {
+                imagePasteIds.add(String.valueOf(img.id()));
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[busy 气泡图片] 入队期定稿 image-cache id: 附件={} 图片={} imagePasteIds={}",
+                attachments.size(), images.size(), imagePasteIds);
+        }
+        return new BusyImageAttachments(rewritten, List.copyOf(imagePasteIds));
+    }
+
+    /** [busy 气泡图片] {@link #prepareBusyQueuedImageAttachments} 产物：id 已定稿的附件 + imagePasteIds。 */
+    public record BusyImageAttachments(List<AttachmentRequest> attachments, List<String> imagePasteIds) {}
 
     /** [F1] 是否为 image 附件（type=image 或 mediaType=image/*，与 MediaLimitGuard.isImage 一致）。 */
     private static boolean isImageAttachment(AttachmentRequest att) {

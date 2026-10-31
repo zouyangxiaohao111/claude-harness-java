@@ -314,8 +314,9 @@ class LlmAgentLoopReactiveCompactAbortTest {
     private static ModelCostCalculator costCalculator() {
         ModelCostCalculator calc = mock(ModelCostCalculator.class);
         when(calc.isPeakHour()).thenReturn(false);
-        when(calc.contextWindowFor(anyString())).thenReturn(200_000);
-        when(calc.maxOutputFor(anyString())).thenReturn(8_192L);
+        // [2026-10-29] 账本带 providerType 调用 → 2 参重载（providerType 可 null，用 any() 匹配）
+        when(calc.contextWindowFor(anyString(), any())).thenReturn(200_000);
+        when(calc.maxOutputFor(anyString(), any())).thenReturn(8_192L);
         when(calc.calculateCostYuan(anyString(), any(AgentUsage.class), anyBoolean())).thenReturn(0.0);
         return calc;
     }

@@ -1,16 +1,17 @@
 import { memo, useEffect, useState } from 'react'
-import type { MouseEvent as ReactMouseEvent } from 'react'
+import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
-import type { SettingsTab, Project, SessionFile } from '@/types'
+import type { SettingsTab, Project, SessionFile, RightTab } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
 import { workflowApi } from '@/api/workflows'
 import { tasksApi } from '@/api/tasks'
 import { subagentApi, type SubagentSummary } from '@/api/subagents'
 import { ApiError } from '@/api/rest'
-import { subagentColor } from '@/api/types'
+import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
+import { formatFileSize } from '@/utils/format'
 import type { Schedule, ScheduleKind, WorkflowRunDto } from '@/api/types'
 import { useSchedules } from '@/hooks/useSchedules'
-import { CollapsibleGroup } from './CollapsibleGroup'
+import { CollapsibleGroup, RUN_ROW_CAP, RunMoreButton, capRunRows } from './CollapsibleGroup'
 import { AgentTranscriptView } from './AgentTranscriptView'
 import { cronToHuman } from '@/components/modals/SchedulesPanel'
 import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
@@ -18,8 +19,37 @@ import { TeamPanel } from '@/components/right/TeamPanel'
 import { TodoPanel } from '@/components/right/TodoPanel'
 import { AsyncTasksPanel } from '@/components/right/AsyncTasksPanel'
 import { useChatStore } from '@/stores/chatStore'
+import { TerminalPanel } from '@/components/right/TerminalPanel'
+import type { Client } from '@stomp/stompjs'
 
-type RightTab = 'files' | 'tasks' | 'projects'
+/**
+ * 抽屉形态新增的 tab：产物 / 来源 / 团队 / 运行 / 终端。
+ *
+ * <p>`@/types` 的 {@link RightTab} 目前只覆盖图标轨的三个 tab；本组件在内部按更宽的联合渲染抽屉，
+ * 新增值通过 {@link RightPanelProps.setRightTab} 的窄类型出口收敛。
+ */
+type PanelTab = RightTab | 'artifacts' | 'sources' | 'team' | 'run' | 'terminal'
+
+/**
+ * 省略 `visibleTabs` 时渲染的 tab 集合（图标轨 / 编程助手 / Work 通用等常规场景）。
+ */
+const DEFAULT_TABS: PanelTab[] = ['files', 'tasks', 'projects']
+/**
+ * 抽屉形态的 tab 文案（WORK / CODING 改版 · 2026-10-28）。
+ *
+ * <p>只有出现在本表里的 tab 才会在抽屉里渲染 —— 抽屉的 tab 集合由 App 的 `visibleTabs` 显式给定
+ * （WORK = 项目/产物/变更/来源/团队；CODING 额外一个「运行」），旧图标轨的 files/tasks/projects
+ * 语义在此被复用：files→变更（changedFiles）、projects→项目、team→团队、run→运行。
+ */
+const DRAWER_TAB_LABEL: Partial<Record<PanelTab, string>> = {
+  projects: '项目',
+  artifacts: '产物',
+  files: '变更',
+  sources: '来源',
+  team: '团队',
+  run: '运行',
+  terminal: '终端',
+}
 
 /** 稳定空身份 map（selector 兜底用 · 避免 `?? {}` 每次新对象触发 zustand 无限重渲染） */
 const EMPTY_IDENTITY_MAP: Record<string, SubagentIdentity> = {}
@@ -38,6 +68,8 @@ const HISTORY_FETCH_LIMIT = 50
 type SaFilter = 'all' | 'running' | 'completed' | 'incomplete'
 /** 单行结局（归一化：实时 done 与历史 completed 视为同一态） */
 type SaKind = 'running' | 'completed' | 'failed' | 'stopped' | 'incomplete' | 'unknown'
+/** 「运行」tab 分组键（每组独立控制「查看更多 / 收起」） */
+type RunGroupKey = 'subagent' | 'workflow' | 'async' | 'schedule'
 
 const SA_KIND_LABEL: Record<SaKind, string> = {
   running: '进行中',
@@ -144,12 +176,16 @@ interface RightPanelProps {
   activeSessionId: string | null
   /** 会话绑定项目（「项目」tab · App 从 sessionProject 取 · 未绑定=空项目 → 未绑定零态） */
   mainProject: Project
-  rightTab: RightTab
+  rightTab: PanelTab
   setRightTab: (t: RightTab) => void
   /** 改动文件行点击 → 打开真实 diff（App 拉 REST /files/diff 喂 DiffModal） */
   onOpenFileRow: (path: string) => void
   /** 项目文件树点击文件 → 打开真实内容查看（App 处理） */
   onOpenFile: (projectId: string, path: string) => void
+  /** 「产物 / 来源」= 后端轮末异步抽取结果（省略 = 空态，抽到之前也是空） */
+  artifacts?: SessionArtifacts
+  /** 产物行点击 → 打开该产物的本地文件（App 处理 · 与 @引用预览同一条通路） */
+  onOpenArtifact?: (a: SessionArtifactDto) => void
   /** [Phase3] 文件树右键「引用到对话」→ 插入 @path 到输入框（App 处理 · 与 @ 补全同效） */
   onQuoteFile: (path: string) => void
   showToast: (msg: string, type?: 'success' | 'info') => void
@@ -162,6 +198,29 @@ interface RightPanelProps {
   onToggleCollapse?: () => void
   /** 折叠态（与左栏同一套做法：不卸载组件，只渲染窄条 + 展开按钮） */
   collapsed?: boolean
+  /**
+   * 只渲染这些 tab（省略 = DEFAULT_TABS）。
+   *
+   * <p>抽屉形态的 tab 集合由 App 显式指定（产物/来源/团队/运行/终端等）。
+   */
+  visibleTabs?: PanelTab[]
+  /**
+   * 抽屉形态（WORK / CODING 改版 · 2026-10-28）：横向 tabs + 右上角 ×，absolute 定位
+   * `translateX` 开合，**不占三栏列宽**（语义见设计稿 `.right` / `.right-tabs`）。
+   *
+   * <p>与图标轨（`drawer=false`）互斥；关闭态组件仍挂载（只是滑出屏幕外），
+   * 这样子代理/Workflow 轮询与抽屉内其它状态在开合之间保持一致。
+   */
+  drawer?: boolean
+  /** 抽屉是否展开（`drawer=true` 时由 App 控制） */
+  drawerOpen?: boolean
+  /** 抽屉右上角 × / Esc 关闭（App 把 drawerOpen 置 false） */
+  onDrawerClose?: () => void
+  /**
+   * 「终端」tab 复用的 STOMP 连接（App 的 useChatSocket clientRef）。
+   * 省略 = 终端只显示历史与输入、不订阅实时输出（嵌入方/测试）。
+   */
+  socketClientRef?: { current: Client | null }
 }
 
 const PlusIcon = ({ size = 12 }: { size?: number }) => (
@@ -185,6 +244,22 @@ const summarizeJson = (v: unknown) => {
   if (v == null) return ''
   const s = typeof v === 'string' ? v : JSON.stringify(v)
   return s && s.length > 60 ? `${s.slice(0, 60)}…` : (s ?? '')
+}
+/** 运行时长：运行中用 now，终态用 updatedAt（均为后端既有字段） */
+const fmtRunDuration = (r: WorkflowRunDto) => {
+  const ms = Math.max(0, (r.status === 'running' ? Date.now() : r.updatedAt) - r.startedAt)
+  if (ms < 1000) return `${ms}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(1)}s`
+  const s = Math.floor(ms / 1000)
+  return `${Math.floor(s / 60)}m ${s % 60}s`
+}
+/** 结果归一：returnValue 自带布尔 ok 就用它，否则回落状态文案（不编造字段） */
+const runResultLabel = (r: WorkflowRunDto) => {
+  const v = r.returnValue
+  if (v && typeof v === 'object' && 'ok' in v && typeof (v as { ok?: unknown }).ok === 'boolean') {
+    return `ok:${(v as { ok: boolean }).ok}`
+  }
+  return WORKFLOW_STATUS_META[r.status].label
 }
 
 /** 文件树右键菜单状态（fixed 定位，左键文件打开、右键菜单） */
@@ -300,7 +375,7 @@ function ProjectFileTree({
 /** 文件树右键菜单（复用 project-context-menu 样式） */
 function FileTreeContextMenu({ menu, onAction }: {
   menu: FileMenuState
-  onAction: (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'rename' | 'delete') => void
+  onAction: (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'refresh' | 'rename' | 'delete') => void
 }) {
   return (
     <div
@@ -316,6 +391,7 @@ function FileTreeContextMenu({ menu, onAction }: {
       <div className="ctx-menu-item" onClick={() => onAction('quote')}>添加到对话</div>
       <div className="ctx-menu-divider"></div>
       <div className="ctx-menu-item" onClick={() => onAction('copy')}>复制路径</div>
+      <div className="ctx-menu-item" onClick={() => onAction('refresh')}>刷新</div>
       <div className="ctx-menu-item" onClick={() => onAction('rename')}>重命名</div>
       <div className="ctx-menu-item danger" onClick={() => onAction('delete')}>删除</div>
     </div>
@@ -376,6 +452,62 @@ const NewFileSvg = () => (
   </svg>
 )
 
+/** 运行 tab 子代理图标（线性人形 · 底色/描色由 .sub-icon.<kind> 决定） */
+const SUBAGENT_ICON_SVG = (
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+    <circle cx="12" cy="8" r="3.2" />
+    <path d="M5 20c.9-3.2 3.6-5 7-5s6.1 1.8 7 5" />
+  </svg>
+)
+
+/** 抽屉空态图标（线性 SVG · 与项目图标同一 stroke 风格） */
+const EMPTY_ICON_SVG: Record<'file' | 'link' | 'team', ReactNode> = {
+  file: (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M5.2 2.8h6.1L15 6.5v10.7H5.2z" />
+      <path d="M11.1 2.9v3.7h3.8" />
+    </svg>
+  ),
+  link: (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <path d="M8.4 11.6l3.2-3.2" />
+      <path d="M9.3 6.6l1.3-1.3a3 3 0 0 1 4.2 4.2l-1.3 1.3" />
+      <path d="M10.7 13.4l-1.3 1.3a3 3 0 0 1-4.2-4.2l1.3-1.3" />
+    </svg>
+  ),
+  team: (
+    <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+      <circle cx="7.4" cy="7" r="2.5" />
+      <path d="M2.9 15.4c.5-2.6 2.1-4 4.5-4s4 1.4 4.5 4" />
+      <path d="M12.6 5.2a2.4 2.4 0 0 1 0 4.6" />
+      <path d="M14 11.6c1.7.3 2.8 1.6 3.2 3.8" />
+    </svg>
+  ),
+}
+
+/** 来源行副标题：从 url 取域名（解析失败回落原串） */
+function hostOf(url: string | null): string {
+  if (!url) return ''
+  try { return new URL(url).hostname } catch { return url }
+}
+
+/** 抽屉空态：图标 + 标题 + 说明（可选动作）· 用户 2026-10-28 裁定不要虚线框 */
+function DrawerEmpty({ icon, title, desc, action }: {
+  icon: 'file' | 'link' | 'team'
+  title: string
+  desc: string
+  action?: ReactNode
+}) {
+  return (
+    <div className="right-empty-rich">
+      <span className="re-icon" aria-hidden="true">{EMPTY_ICON_SVG[icon]}</span>
+      <div className="re-title">{title}</div>
+      <div className="re-desc">{desc}</div>
+      {action}
+    </div>
+  )
+}
+
 export const RightPanel = memo(function RightPanel({
   activeSessionId,
   mainProject,
@@ -383,6 +515,8 @@ export const RightPanel = memo(function RightPanel({
   setRightTab,
   onOpenFileRow,
   onOpenFile,
+  artifacts,
+  onOpenArtifact,
   onQuoteFile,
   showToast,
   openSettingsAt,
@@ -390,6 +524,11 @@ export const RightPanel = memo(function RightPanel({
   onRollbackFile,
   onToggleCollapse,
   collapsed = false,
+  visibleTabs,
+  drawer = false,
+  drawerOpen = false,
+  onDrawerClose,
+  socketClientRef,
 }: RightPanelProps) {
   // [2026-10-21] 折叠态：参照左栏（SessionList 的 collapsed 分支）——只渲染窄条 + 展开按钮
   if (collapsed) {
@@ -444,8 +583,38 @@ export const RightPanel = memo(function RightPanel({
   const [visibleLimit, setVisibleLimit] = useState(SA_PAGE_SIZE)
   /** 子代理列表筛选胶囊：全部 / 进行中 / 已完成 / 未完成（失败+停止+未收尾+未知） */
   const [saListFilter, setSaListFilter] = useState<SaFilter>('all')
+  /** 「运行」tab 各分组是否展开全部（按组独立 · 每组默认只出 5 条 · 进行中不限 · 用户 2026-10-28 裁定） */
+  const [runShowAllByGroup, setRunShowAllByGroup] = useState<Record<string, boolean>>({})
+  const runShowAll = (key: RunGroupKey) => !!runShowAllByGroup[key]
+  const toggleRunShowAll = (key: RunGroupKey) =>
+    setRunShowAllByGroup((v) => ({ ...v, [key]: !v[key] }))
   /** ⤢ 扩大：右栏向左覆盖中间对话区（用户 2026-10-21：不要弹窗） */
   const [expandedView, setExpandedView] = useState(false)
+  /** 抽屉宽度（可拖拽左缘调整；持久化 localStorage） */
+  const [drawerW, setDrawerW] = useState<number>(() => {
+    const saved = typeof localStorage !== 'undefined' ? Number(localStorage.getItem('nexusai-right-drawer-w')) : 0
+    return Number.isFinite(saved) && saved >= 320 ? saved : 384
+  })
+  useEffect(() => {
+    const appEl = document.querySelector('.app') as HTMLElement | null
+    appEl?.style.setProperty('--right-drawer-w', `${drawerW}px`)
+    try { localStorage.setItem('nexusai-right-drawer-w', String(drawerW)) } catch { /* ignore */ }
+  }, [drawerW])
+  const startDrawerResize = (e: ReactMouseEvent) => {
+    e.preventDefault()
+    const startX = e.clientX
+    const startW = drawerW
+    const move = (ev: MouseEvent) => {
+      const maxW = Math.max(420, Math.round(window.innerWidth * 0.7))
+      setDrawerW(Math.max(320, Math.min(maxW, startW - (ev.clientX - startX))))
+    }
+    const up = () => {
+      document.removeEventListener('mousemove', move)
+      document.removeEventListener('mouseup', up)
+    }
+    document.addEventListener('mousemove', move)
+    document.addEventListener('mouseup', up)
+  }
   const subagentIdentities = useSubagentStore((s) => s.bySession[activeSessionId ?? ''] ?? EMPTY_IDENTITY_MAP)
   const tasksCount = schedules.list.length + Object.keys(subagentIdentities).length
   // [F2] 进入 agent 对话视图 → 右栏临时加宽到 420（退出恢复用户原宽度）
@@ -484,7 +653,7 @@ export const RightPanel = memo(function RightPanel({
   const [expandedRunId, setExpandedRunId] = useState<string | null>(null)
   const [runDetail, setRunDetail] = useState<WorkflowRunDto | null>(null)
   // [D2] 折叠分组计数（子组件上报）：为 0 只占一行，有数据自动展开
-  const [teamCount, setTeamCount] = useState<number>(0)
+  const [, setTeamCount] = useState<number>(0)
   const [todoCount, setTodoCount] = useState<number>(0)
   const [asyncCount, setAsyncCount] = useState<number>(0)
   /** 定时任务三态弹窗过滤（正常/异常/未运行 · null=关闭） */
@@ -540,7 +709,8 @@ export const RightPanel = memo(function RightPanel({
     }
   }
   useEffect(() => {
-    if (rightTab !== 'tasks') return
+    // 「运行」抽屉 tab 与旧「任务」tab 同源（子代理 / Workflow / 异步 / 定时四组共用同一份数据）
+    if (rightTab !== 'tasks' && rightTab !== 'run') return
     // 切会话先清空：否则会拿上一项目（甚至另一项目）的 run 列表闪 2 秒
     setWorkflowRuns([])
     setExpandedRunId(null)
@@ -591,6 +761,8 @@ export const RightPanel = memo(function RightPanel({
     let alive = true
     const id = main.id
     if (!id) { setFileTree(null); return }
+    // 只在「项目」tab 拉树；切走再切回、或抽屉重新打开时都会重拉，避免拿到旧列表。
+    if (rightTab !== 'projects') return
     setFileTreeLoading(true)
     setFileTreeError(false)
     setFileTree(null)
@@ -599,7 +771,7 @@ export const RightPanel = memo(function RightPanel({
       .then((nodes) => { if (alive) { setFileTree(nodes); setFileTreeLoading(false) } })
       .catch(() => { if (alive) { setFileTreeError(true); setFileTreeLoading(false) } })
     return () => { alive = false }
-  }, [main.id, fileTreeReload])
+  }, [main.id, fileTreeReload, rightTab, drawerOpen])
 
   // 右键菜单：点击空白 / Esc 关闭（菜单自身 onMouseDown stopPropagation）
   useEffect(() => {
@@ -674,7 +846,7 @@ export const RightPanel = memo(function RightPanel({
     })
   }
 
-  const onFileMenuAction = (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'rename' | 'delete') => {
+  const onFileMenuAction = (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'refresh' | 'rename' | 'delete') => {
     const node = fileMenu?.node
     if (!node) return
     setFileMenu(null)
@@ -684,6 +856,7 @@ export const RightPanel = memo(function RightPanel({
       case 'reveal': void revealEntry(node); break
       case 'quote': onQuoteFile(node.path); showToast('已添加到对话', 'success'); break
       case 'copy': void copyEntryPath(node); break
+      case 'refresh': refreshFileTree(); break
       case 'rename': setOpDialog({ kind: 'rename', node, title: '重命名' }); break
       case 'delete': void deleteEntry(node); break
     }
@@ -718,8 +891,615 @@ export const RightPanel = memo(function RightPanel({
   }
 
   // 当前 tab 的面板标题与计数（图标轨只有图标，标题放内容区顶部）
-  const tabTitle = rightTab === 'files' ? '文件' : rightTab === 'tasks' ? '任务' : '项目'
-  const tabCount = rightTab === 'files' ? files.length : rightTab === 'tasks' ? tasksCount : (mainProject.name ? 1 : 0)
+  // 本场景实际渲染的 tab 集合：显式给了 visibleTabs 就用它，否则 DEFAULT_TABS。
+  const tabs = visibleTabs ?? DEFAULT_TABS
+  // 实际高亮的 tab：rightTab 不在本场景集合里时（切场景后的首帧）兜底到集合首个。
+  const shownTab: PanelTab = tabs.includes(rightTab) ? rightTab : (tabs[0] ?? rightTab)
+  /** 抽屉 tab 可能超出 @/types 的 RightTab 联合（types 尚未并入），调用处统一收敛到该 setter */
+  const setTab = (t: PanelTab) => setRightTab(t as RightTab)
+  const tabTitle = shownTab === 'files' ? '文件'
+    : shownTab === 'tasks' ? '任务'
+    : '项目'
+  const tabCount = shownTab === 'files' ? files.length
+    : shownTab === 'tasks' ? tasksCount
+    : (mainProject.name ? 1 : 0)
+
+  // ==================================================================
+  //  内容区块（2026-10-28 WORK / CODING 抽屉改版）
+  //  图标轨（其余场景）与右侧抽屉（WORK / CODING）共用同一份 JSX / 数据 /
+  //  停止入口 —— 抽屉只是换了外层容器与 tab 呈现，不复制任何任务逻辑。
+  // ==================================================================
+
+  /** 「变更」= 本会话改动文件（点行看真实 diff，行内可回滚） */
+  const filesSection = (
+    <>
+      {files.length === 0 ? (
+        <div className="right-empty">该会话暂无文件变更</div>
+      ) : (
+        files.map((f) => (
+          <div key={f.path} className="file-row">
+            <span className="file-main" title="查看真实 diff" onClick={() => onOpenFileRow(f.path)}>
+              <span className="icon">{f.isNew ? <NewFileSvg /> : <FileSvg />}</span>
+              <span className="name">{f.name}</span>
+              <span className="stats-line">
+                {f.adds > 0 && <span className="add">+{f.adds}</span>}
+                {f.dels > 0 && <span className="del">−{f.dels}</span>}
+              </span>
+            </span>
+            <span className="file-actions">
+              <button
+                className="file-action-btn rollback"
+                title="回滚到本会话改动前"
+                onClick={(e) => { e.stopPropagation(); onRollbackFile(f.path) }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ width: 14, height: 14 }}>
+                  <path d="M3.5 8C3.5 5 5.5 3 8 3C9.5 3 10.8 3.7 11.6 4.8" strokeLinecap="round" strokeLinejoin="round" />
+                  <path d="M12 2.5V5H9.5" strokeLinecap="round" strokeLinejoin="round" />
+                </svg>
+              </button>
+            </span>
+          </div>
+        ))
+      )}
+      {files.length > 0 && <div className="right-hint">↑ 点击文件查看本会话真实 diff · Esc 关闭</div>}
+    </>
+  )
+
+  /** [产物口径 2026-10-28 用户纠正] 产物 ≠ 修改的文件：只放后端轮末异步抽取出的最终交付物。 */
+  const deliverables = artifacts?.deliverables ?? []
+  const artifactsSection = (
+    <>
+      {deliverables.length === 0 ? (
+        <DrawerEmpty
+          icon="file"
+          title="任务结束后自动整理交付物"
+          desc="这里只放你最终要的结果文件（报告 / 文档 / 设计稿 / 导出物），不包含中间代码。"
+        />
+      ) : (
+        deliverables.map((a) => (
+          <div
+            key={a.id}
+            className="file-row"
+            title={a.localPath ?? a.title}
+            onClick={() => onOpenArtifact?.(a)}
+          >
+            <span className="file-main">
+              <span className="icon">{EMPTY_ICON_SVG.file}</span>
+              <span className="file-stack">
+                <span className="name">{a.title}</span>
+                <span className="file-sub">
+                  {[a.sizeBytes != null ? formatFileSize(a.sizeBytes) : '', a.summary ?? '']
+                    .filter(Boolean).join(' · ')}
+                </span>
+              </span>
+            </span>
+            <span className="todo-row-arrow">›</span>
+          </div>
+        ))
+      )}
+    </>
+  )
+
+  /** 「来源」= 本轮引用的外部资料（后端抽取 · 点击用系统浏览器打开） */
+  const sources = artifacts?.sources ?? []
+  const openSource = async (a: SessionArtifactDto) => {
+    // 无 url 的来源（本地文件型）→ 回落到产物打开通路
+    if (!a.url) { onOpenArtifact?.(a); return }
+    if (isTauri()) {
+      try {
+        const { openUrl } = await import('@tauri-apps/plugin-opener')
+        await openUrl(a.url)
+      } catch (e) {
+        showToast(`打开链接失败：${e instanceof Error ? e.message : String(e)}`, 'info')
+      }
+      return
+    }
+    window.open(a.url, '_blank', 'noopener')
+  }
+  const sourcesSection = sources.length === 0 ? (
+    <DrawerEmpty
+      icon="link"
+      title="本轮没有引用外部资料"
+      desc="引用 @文件、知识库、网页搜索或用户提供的 URL 后，会在这里列出。"
+    />
+  ) : (
+    <>
+      {sources.map((a) => (
+        <div key={a.id} className="file-row" title={a.url ?? a.title} onClick={() => void openSource(a)}>
+          <span className="file-main">
+            <span className="icon">{EMPTY_ICON_SVG.link}</span>
+            <span className="file-stack">
+              <span className="name">{a.title}</span>
+              <span className="file-sub">
+                {[hostOf(a.url), a.summary ?? ''].filter(Boolean).join(' · ')}
+              </span>
+            </span>
+          </span>
+          <span className="todo-row-arrow">›</span>
+        </div>
+      ))}
+    </>
+  )
+
+  /** 「项目」= 现有项目卡 + 项目文件树（右键菜单 / 新建重命名弹窗复用同一份状态） */
+  const projectsSection = (
+    <>
+      {main.id ? (
+        <>
+          {/* 单项目模式（设计稿 v3）：项目卡 + 文件树，无主次/无切换/无绑定新项目 */}
+          <div className="ctx-label" style={{ paddingLeft: 0 }}>当前项目</div>
+          <div className={`main-card single ${flashingProject === main.name ? 'flash' : ''}`}>
+            <div className="icon"><FolderSvg /></div>
+            <div className="info">
+              <div className="name-row">
+                <span className="name">{main.name}</span>
+              </div>
+              <div className="meta">
+                <span>{main.branch}</span>
+                <span style={{ color: 'var(--ink-faint)' }}>·</span>
+                {main.dirty > 0 && (
+                  <>
+                    <span className="dirty">{main.dirty} 未提交</span>
+                    <span style={{ color: 'var(--ink-faint)' }}>·</span>
+                  </>
+                )}
+                <span>{main.agents} agents</span>
+              </div>
+            </div>
+            {main.agents > 0 && <div className="status-dot" title="agents 运行中"></div>}
+          </div>
+
+          {/* 项目文件树（IDE 项目结构 · 设计稿 v3） */}
+          <div className="sub-header">
+            <span>项目文件</span>
+          </div>
+          {fileTreeLoading ? (
+            <div className="right-empty">加载文件树…</div>
+          ) : fileTreeError ? (
+            <div className="right-hint" style={{ color: 'var(--warning)' }}>文件树加载失败</div>
+          ) : (
+            <ProjectFileTree
+              nodes={fileTree ?? []}
+              expandedDirs={expandedDirs}
+              onToggle={toggleDir}
+              onOpen={(path) => main.id ? onOpenFile(main.id, path) : undefined}
+              onQuote={(path) => onQuoteFile(path)}
+              onMenu={openFileMenu}
+            />
+          )}
+          <div className="right-hint">↑ 点击查看 · 目录展开 · 右键新建/重命名/删除</div>
+          {fileMenu && (
+            <FileTreeContextMenu
+              menu={fileMenu}
+              onAction={onFileMenuAction}
+            />
+          )}
+          {opDialog && (
+            <FileOpDialog
+              state={opDialog}
+              onCancel={() => setOpDialog(null)}
+              onConfirm={confirmFileOp}
+            />
+          )}
+        </>
+      ) : (
+        <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>
+      )}
+    </>
+  )
+
+  /** 「团队」= 现有 TeamPanel（抽屉里是独立 tab，图标轨里是折叠分组） */
+  const teamSection = (
+    <div className="team-section">
+      {activeSessionId && (
+        <TeamPanel
+          sessionId={activeSessionId}
+          showToast={showToast}
+          hideHeader
+          onCount={setTeamCount}
+          onViewMember={(agentId, name, active) => setViewing({ agentId, name, subtitle: active ? '运行中' : '离线', active })}
+          renderEmpty={(onCreate) => (
+            <DrawerEmpty
+              icon="team"
+              title="暂无团队"
+              desc="创建一个团队后，可以并行分派子代理，成员状态与收件箱会显示在这里。"
+              action={<button className="re-action" type="button" onClick={onCreate}>+ 创建团队</button>}
+            />
+          )}
+        />
+      )}
+    </div>
+  )
+
+  /** 任务清单（仅图标轨的「任务」tab 保留；抽屉的「运行」口径不含它） */
+  const todoSection = (
+    // keepMounted：切换会话要立刻重拉任务（折叠即卸载 ⇒ TodoPanel 不轮询 ⇒ 计数恒 0）
+    <CollapsibleGroup title="任务清单" count={todoCount} keepMounted>
+      {activeSessionId && <TodoPanel sessionId={activeSessionId} showToast={showToast} hideHeader onCount={setTodoCount} />}
+    </CollapsibleGroup>
+  )
+
+  /** 子代理运行状况（实时 + 历史混排 · 行内停止 · 点行看执行记录） */
+  const subagentSection = (() => {
+    // 子代理身份去重：同一 toolUseId/taskId 双键指向同一对象，按 taskId 去重
+    //   （按 name 会误并同名成员——并行探索成员 description 相同 → 3 个只显 2 个）
+    const seen = new Set<string>()
+    const subs = Object.values(subagentIdentities).filter((id) => {
+      const key = id.taskId ?? id.name
+      if (seen.has(key)) return false
+      seen.add(key)
+      return true
+    })
+    // 历史项（磁盘 transcript）：实时里已有的按 taskId 去重（两者键不同源，能对上就排除）
+    const liveIds = new Set(subs.map((x) => x.taskId).filter(Boolean) as string[])
+    const hist = historySubs.filter((h) => !liveIds.has(h.agentId))
+    const totalCount = subs.length + hist.length
+
+    // ---- 统一行模型：实时 + 历史混排 ----
+    const rows: SaRow[] = []
+    for (const id of subs) {
+      rows.push({
+        key: `l-${id.taskId ?? id.name}`,
+        title: id.name || '子代理',
+        meta: [id.taskType, id.currentTool].filter(Boolean).join(' · '),
+        kind: toSaKind(id.status),
+        // activities[0] = 启动事件（store 里唯一可靠的创建时间锚）
+        ts: id.activities[0]?.ts ?? 0,
+        live: id,
+      })
+    }
+    for (const h of hist) {
+      const title = h.description || h.agentType || h.agentId
+      rows.push({
+        key: `h-${h.agentId}`,
+        title,
+        meta: h.agentType || 'agent',
+        kind: toSaKind(h.status),
+        ts: h.createdAt ?? 0,
+        hist: h,
+      })
+    }
+    rows.sort((a, b) => {
+      const ra = a.kind === 'running' ? 0 : 1
+      const rb = b.kind === 'running' ? 0 : 1
+      if (ra !== rb) return ra - rb
+      return b.ts - a.ts
+    })
+    const isIncomplete = (k: SaKind) => k !== 'running' && k !== 'completed'
+    const filtered = rows.filter((r) =>
+      saListFilter === 'all' ? true
+        : saListFilter === 'running' ? r.kind === 'running'
+        : saListFilter === 'completed' ? r.kind === 'completed'
+        : isIncomplete(r.kind))
+    // 抽屉「运行」tab 每组最多 5 条（进行中永远全显示）；图标轨沿用原分页
+    const capped = drawer
+      ? capRunRows(filtered, (r) => r.kind === 'running', runShowAll('subagent'), RUN_ROW_CAP)
+      : null
+    const shown = capped ? capped.shown : filtered.slice(0, visibleLimit)
+    const chip = (key: SaFilter, label: string, n: number) => (
+      <button
+        key={key}
+        className={`todo-chip${saListFilter === key ? ' on' : ''}`}
+        onClick={() => { setSaListFilter(key); setVisibleLimit(SA_PAGE_SIZE) }}
+      >
+        {label} {n}
+      </button>
+    )
+    return (
+      <CollapsibleGroup title="子代理运行状况" count={totalCount}>
+        {totalCount === 0 ? (
+          <div className="todo-empty">暂无子代理</div>
+        ) : (
+          <>
+            <div className="todo-chips">
+              {chip('all', '全部', rows.length)}
+              {chip('running', '进行中', rows.filter((r) => r.kind === 'running').length)}
+              {chip('completed', '已完成', rows.filter((r) => r.kind === 'completed').length)}
+              {chip('incomplete', '未完成', rows.filter((r) => isIncomplete(r.kind)).length)}
+            </div>
+            {filtered.length === 0 ? (
+              <div className="todo-empty">没有符合条件的子代理</div>
+            ) : (
+              <div className="todo-rows">
+                {shown.map((r) => {
+                  const agentId = r.live?.taskId ?? r.hist?.agentId
+                  return (
+                    <div
+                      key={r.key}
+                      className={`todo-row${r.kind === 'running' ? ' in-progress' : ''}`}
+                      onClick={() => {
+                        if (!agentId) return
+                        setViewing({
+                          agentId,
+                          name: r.live ? r.live.name : (r.hist?.agentType || '子代理'),
+                          subtitle: SA_KIND_LABEL[r.kind],
+                          active: r.kind === 'running',
+                        })
+                      }}
+                      title="查看该子代理的对话"
+                    >
+                      {/* 状态图标（原型 .ric）：颜色承担状态，右侧只留状态文字 */}
+                      <span className={`subagent-icon ${r.kind}`} title={SA_KIND_LABEL[r.kind]} aria-hidden="true">
+                        {SUBAGENT_ICON_SVG}
+                      </span>
+                      <span className="todo-row-main">
+                        <span className="todo-row-title one-line">{r.title}</span>
+                        <span className="todo-row-sub">{r.meta || '子代理'}</span>
+                      </span>
+                      <span className={`sub-status ${r.kind}`}>{SA_KIND_LABEL[r.kind]}</span>
+                      {/* 停止入口随三态弹窗删除后迁到行内（仅运行中且有 taskId） */}
+                      {r.kind === 'running' && r.live?.taskId && (
+                        <button
+                          className="subagent-kill"
+                          title="停止任务"
+                          onClick={(e) => { e.stopPropagation(); void handleKillSubagent(r.live!) }}
+                        >⏹</button>
+                      )}
+                      <span className="todo-row-arrow">›</span>
+                    </div>
+                  )
+                })}
+                {drawer ? (
+                  <RunMoreButton over={capped?.over ?? 0} showAll={runShowAll('subagent')} onToggle={() => toggleRunShowAll('subagent')} />
+                ) : filtered.length > visibleLimit && (
+                  <button
+                    className="sub-more"
+                    onClick={() => setVisibleLimit((n) => n + SA_PAGE_SIZE)}
+                  >查看更多（还有 {filtered.length - visibleLimit} 条）</button>
+                )}
+              </div>
+            )}
+          </>
+        )}
+      </CollapsibleGroup>
+    )
+  })()
+
+  /** 异步任务（后台命令 / 子代理 / 队友 / workflow 监视） */
+  const asyncSection = (
+    // keepMounted：异步面板负责把 REST 里的 local_agent/teammate 补录进 subagentStore，
+    // 折叠即卸载会让「子代理运行状况」永远为空（2026-10-21 实测）
+    <CollapsibleGroup title="异步任务" count={asyncCount} keepMounted>
+      <AsyncTasksPanel
+        activeSessionId={activeSessionId}
+        showToast={showToast}
+        hideHeader
+        onCount={setAsyncCount}
+        maxRows={drawer ? RUN_ROW_CAP : 0}
+        showAll={runShowAll('async')}
+        onToggleShowAll={() => toggleRunShowAll('async')}
+      />
+    </CollapsibleGroup>
+  )
+
+  /** 定时任务（详情弹窗随组渲染）· 定时任务无「进行中」态，全部按历史截断 */
+  const { shown: shownSchedules, over: schedulesOver } = capRunRows(
+    schedules.list, () => false, runShowAll('schedule'), drawer ? RUN_ROW_CAP : 0,
+  )
+  const scheduleSection = (
+    <>
+      <CollapsibleGroup
+        title="定时任务"
+        count={schedules.list.length}
+        action={(
+          <span className="add-schedule" title="添加定时任务" onClick={() => openSettingsAt('schedules')}>
+            <PlusIcon size={11} />
+          </span>
+        )}
+      >
+        {schedules.loading ? (
+          <div className="todo-empty">加载中…</div>
+        ) : schedules.list.length === 0 ? (
+          <div className="todo-empty">暂无定时任务</div>
+        ) : (
+          <div className="todo-rows">
+            {shownSchedules.map((sc) => {
+              const status = sc.lastRunStatus === 'ok' ? '正常' : sc.lastRunStatus === 'error' ? '异常' : '未运行'
+              const dot = sc.lastRunStatus === 'ok' ? 'completed' : sc.lastRunStatus === 'error' ? 'pending' : 'pending'
+              return (
+                <div key={sc.id} className="todo-row" onClick={() => setDetailSchedule(sc)} title="查看定时任务详情">
+                  <span className={`todo-row-dot ${dot}`} />
+                  <span className="todo-row-main">
+                    <span className="todo-row-title">{sc.name}</span>
+                    <span className="todo-row-sub">{status}{sc.lastRunAt ? ` · 上次 ${sc.lastRunAt}` : ''}</span>
+                  </span>
+                  <span className="todo-row-arrow">›</span>
+                </div>
+              )
+            })}
+            <RunMoreButton over={schedulesOver} showAll={runShowAll('schedule')} onToggle={() => toggleRunShowAll('schedule')} />
+          </div>
+        )}
+      </CollapsibleGroup>
+      {detailSchedule && (
+        <ScheduleDetailModal schedule={detailSchedule} onClose={() => setDetailSchedule(null)} />
+      )}
+    </>
+  )
+
+  /** Workflow 运行（REST + 轮询；运行中可停止，点卡展开阶段树）· 运行中不参与截断 */
+  const { shown: shownRuns, over: runsOver } = capRunRows(
+    workflowRuns, (r) => r.status === 'running', runShowAll('workflow'), drawer ? RUN_ROW_CAP : 0,
+  )
+  const workflowSection = (
+    <CollapsibleGroup title="Workflow 运行" count={workflowRuns.length}>
+      {workflowLoading ? (
+        <div className="right-empty">加载中…</div>
+      ) : workflowRuns.length === 0 ? (
+        <div className="todo-empty">暂无 workflow 运行</div>
+      ) : (
+        <>
+        {shownRuns.map((r) => {
+          const meta = WORKFLOW_STATUS_META[r.status]
+          const phaseIdx = r.currentPhase && r.declaredPhases?.length
+            ? r.declaredPhases.indexOf(r.currentPhase) + 1
+            : null
+          const toolCount = (r.agents ?? []).reduce((s, a) => s + (a.toolCount ?? 0), 0)
+          const tokenCount = (r.agents ?? []).reduce((s, a) => s + (a.tokenCount ?? 0), 0)
+          const expanded = expandedRunId === r.runId
+          // 收起态一行摘要（后端字段拼装 · 拿不到的段落不显示）
+          const stepCount = r.declaredPhases?.length || r.phases?.length || 0
+          const summaryParts = [
+            ...(r.status === 'running' ? [] : [runResultLabel(r)]),
+            ...(stepCount > 0 ? [`${stepCount} 步`] : []),
+            fmtRunDuration(r),
+          ]
+          const summary = `${r.status === 'running' ? '进行中' : '结果'}：${summaryParts.join(' · ')}`
+          const hasRaw = r.returnValue !== undefined
+          return (
+            <div
+              key={r.runId}
+              className={`workflow-card ${expanded ? ' expanded' : ''}`}
+              onClick={() => void toggleRunDetail(r.runId)}
+            >
+              <div className="workflow-head">
+                <span className="workflow-dot" style={{ background: meta.dot }} />
+                <span className="workflow-name">{r.workflowName}</span>
+                <span className="workflow-status">{meta.label}</span>
+                {r.status === 'running' && (
+                  <button className="workflow-kill" title="停止运行" onClick={(e) => { e.stopPropagation(); void killRun(r.runId) }}>⏹ 停止</button>
+                )}
+              </div>
+              <div className="workflow-meta">
+                {[
+                  phaseIdx ? `阶段 ${r.currentPhase} (${phaseIdx}/${r.declaredPhases.length})` : null,
+                  `${r.agentCount} agents`,
+                  `工具 ${toolCount}`,
+                  `tokens ${fmtTokens(tokenCount)}`,
+                ].filter(Boolean).join(' · ')}
+              </div>
+              <div className="workflow-summary">
+                {summary}
+                {hasRaw && (expanded ? '（点击收起原始输出）' : '（点击查看原始输出）')}
+              </div>
+              {r.status === 'failed' && r.error && <div className="workflow-error">✗ {r.error}</div>}
+              {/* 原始返回只在展开态显示（收起态用上面的摘要行） */}
+              {expanded && hasRaw && (
+                <div className="workflow-return">返回: {summarizeJson(r.returnValue)}</div>
+              )}
+              {expanded && runDetail && runDetail.runId === r.runId && (
+                <div className="workflow-detail">
+                  {runDetail.phases?.length > 0 && (
+                    <div className="workflow-phases">
+                      {runDetail.phases.map((p, i) => (
+                        <div key={i} className={`workflow-phase ${p.status === 'done' ? 'done' : 'running'}`}>
+                          {p.status === 'done' ? '✓' : '●'} {p.title}
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                  {runDetail.agents?.length > 0 && (
+                    <div className="workflow-agents">
+                      {runDetail.agents.map((a) => (
+                        <div key={a.id} className="workflow-agent">
+                          <span className="wa-dot" style={{ background: a.status === 'done' ? 'var(--success)' : 'var(--accent)' }} />
+                          <span className="wa-label">{a.label ?? 'agent'}</span>
+                          <span className="wa-phase">{a.phase ?? ''}</span>
+                          <span className="wa-count">
+                            {a.toolCount ? `tools ${a.toolCount}` : ''}
+                            {a.tokenCount ? ` · ${fmtTokens(a.tokenCount)}` : ''}
+                          </span>
+                        </div>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+          )
+        })}
+        <RunMoreButton over={runsOver} showAll={runShowAll('workflow')} onToggle={() => toggleRunShowAll('workflow')} />
+        </>
+      )}
+    </CollapsibleGroup>
+  )
+
+  /**
+   * 「运行」= 子代理 / Workflow / 异步任务 / 定时任务（用户 2026-10-28 裁定的分组顺序）。
+   * 团队有独立 tab，任务清单仅在图标轨的「任务」tab 中保留。
+   */
+  const runSection = (
+    <>
+      {subagentSection}
+      {workflowSection}
+      {asyncSection}
+      {scheduleSection}
+    </>
+  )
+
+  /** 「运行」徽标 = 进行中的子代理 + 进行中的 Workflow（子代理按 taskId/name 去重，双键同对象只算一个） */
+  const runningSubagentKeys = new Set(
+    Object.values(subagentIdentities)
+      .filter((id) => id.status === 'running')
+      .map((id) => id.taskId ?? id.name),
+  )
+  const runActiveCount =
+    runningSubagentKeys.size +
+    workflowRuns.filter((r) => r.status === 'running').length
+
+  /** 抽屉里实际渲染的 tab（未登记文案的 tab 不出现） */
+  const drawerTabs = tabs.filter((t) => DRAWER_TAB_LABEL[t])
+
+  // Esc 关闭抽屉（与原型一致）。抽屉关闭时只是滑出屏外、组件仍挂载，故仅在展开态监听。
+  useEffect(() => {
+    if (!drawer || !drawerOpen) return
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') onDrawerClose?.() }
+    document.addEventListener('keydown', onKey)
+    return () => document.removeEventListener('keydown', onKey)
+  }, [drawer, drawerOpen, onDrawerClose])
+
+  // ---- 抽屉形态（WORK / CODING）：横向 tabs + 右上角 ×，absolute + transform 开合 ----
+  if (drawer) {
+    return (
+      <div className={`right right-drawer${drawerOpen ? ' open' : ''}${expandedView ? ' right-fullscreen' : ''}`} style={{ width: drawerW }}>
+        <div className="right-drawer-resizer" onMouseDown={startDrawerResize} title="拖拽调整宽度" />
+        <div className="right-drawer-tabs">
+          {drawerTabs.map((t) => (
+            <button
+              key={t}
+              type="button"
+              className={`rtab${shownTab === t ? ' on' : ''}`}
+              onClick={() => setTab(t)}
+            >
+              {DRAWER_TAB_LABEL[t]}
+              {t === 'run' && runActiveCount > 0 && <span className="rt-badge">{runActiveCount}</span>}
+            </button>
+          ))}
+          <button className="right-close" type="button" onClick={onDrawerClose} title="关闭" aria-label="关闭">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round">
+              <path d="M6 6l12 12M18 6L6 18" />
+            </svg>
+          </button>
+        </div>
+        {/* 终端要占满整个抽屉高度（xterm 自适应依赖容器真高度）→ 该 tab 去掉 body 的滚动与内边距 */}
+        <div className={`right-drawer-body${shownTab === 'terminal' && !viewing ? ' term-body' : ''}`}>
+          {viewing ? (
+            <AgentTranscriptView
+              sessionId={activeSessionId}
+              agentId={viewing.agentId}
+              name={viewing.name}
+              subtitle={viewing.subtitle}
+              active={viewing.active}
+              onBack={() => setViewing(null)}
+              showToast={showToast}
+            />
+          ) : shownTab === 'projects' ? projectsSection
+            : shownTab === 'files' ? filesSection
+            : shownTab === 'artifacts' ? artifactsSection
+            : shownTab === 'sources' ? sourcesSection
+            : shownTab === 'team' ? teamSection
+            : shownTab === 'run' ? runSection
+            : shownTab === 'terminal' ? (
+              activeSessionId
+                // key=sessionId：切会话必须重新挂载（清掉旧会话的 xterm 实例并重拉列表）
+                ? <TerminalPanel key={activeSessionId} sessionId={activeSessionId} clientRef={socketClientRef} showToast={showToast} />
+                : <div className="right-empty">请先打开一个会话</div>
+            )
+            : <div className="right-empty">暂无内容</div>}
+        </div>
+      </div>
+    )
+  }
 
   return (
     <div className={`right${expandedView ? ' right-fullscreen' : ''}`}>
@@ -739,39 +1519,45 @@ export const RightPanel = memo(function RightPanel({
             </svg>
           </button>
         )}
-        <button
-          className={`right-rail-btn${rightTab === 'files' ? ' on' : ''}`}
-          onClick={() => setRightTab('files')}
-          title="文件"
-          aria-label="文件"
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <path d="M3 2.6h6.2L13 6.4V13a.8.8 0 0 1-.8.8H3.8a.8.8 0 0 1-.8-.8V3.4A.8.8 0 0 1 3.8 2.6Z" strokeLinejoin="round" />
-            <path d="M9 2.8v3.8h3.8" strokeLinejoin="round" />
-          </svg>
-        </button>
-        <button
-          className={`right-rail-btn${rightTab === 'tasks' ? ' on' : ''}`}
-          onClick={() => setRightTab('tasks')}
-          title="任务"
-          aria-label="任务"
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <rect x="2.6" y="2.6" width="10.8" height="10.8" rx="2.2" />
-            <path d="M5.4 8.2l1.7 1.7 3.5-3.6" strokeLinecap="round" strokeLinejoin="round" />
-          </svg>
-        </button>
-        <button
-          className={`right-rail-btn${rightTab === 'projects' ? ' on' : ''}`}
-          onClick={() => setRightTab('projects')}
-          title="项目"
-          aria-label="项目"
-        >
-          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
-            <rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.8" />
-            <path d="M2.4 6.2h11.2" strokeLinecap="round" />
-          </svg>
-        </button>
+        {tabs.includes('files') && (
+          <button
+            className={`right-rail-btn${shownTab === 'files' ? ' on' : ''}`}
+            onClick={() => setRightTab('files')}
+            title="文件"
+            aria-label="文件"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <path d="M3 2.6h6.2L13 6.4V13a.8.8 0 0 1-.8.8H3.8a.8.8 0 0 1-.8-.8V3.4A.8.8 0 0 1 3.8 2.6Z" strokeLinejoin="round" />
+              <path d="M9 2.8v3.8h3.8" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
+        {tabs.includes('tasks') && (
+          <button
+            className={`right-rail-btn${shownTab === 'tasks' ? ' on' : ''}`}
+            onClick={() => setRightTab('tasks')}
+            title="任务"
+            aria-label="任务"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <rect x="2.6" y="2.6" width="10.8" height="10.8" rx="2.2" />
+              <path d="M5.4 8.2l1.7 1.7 3.5-3.6" strokeLinecap="round" strokeLinejoin="round" />
+            </svg>
+          </button>
+        )}
+        {tabs.includes('projects') && (
+          <button
+            className={`right-rail-btn${shownTab === 'projects' ? ' on' : ''}`}
+            onClick={() => setRightTab('projects')}
+            title="项目"
+            aria-label="项目"
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.5">
+              <rect x="2.4" y="3.2" width="11.2" height="9.6" rx="1.8" />
+              <path d="M2.4 6.2h11.2" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
       </div>
       <div className="right-main">
         {viewing ? (
@@ -793,375 +1579,20 @@ export const RightPanel = memo(function RightPanel({
           {tabCount > 0 && <span className="right-title-count">· {tabCount}</span>}
         </div>
         <div className="right-body">
-        {rightTab === 'files' && (
+        {shownTab === 'files' && filesSection}
+
+        {shownTab === 'tasks' && (
           <>
-            {files.length === 0 ? (
-              <div className="right-empty">该会话暂无文件变更</div>
-            ) : (
-              files.map((f) => (
-                <div key={f.path} className="file-row">
-                  <span className="file-main" title="查看真实 diff" onClick={() => onOpenFileRow(f.path)}>
-                    <span className="icon">{f.isNew ? <NewFileSvg /> : <FileSvg />}</span>
-                    <span className="name">{f.name}</span>
-                    <span className="stats-line">
-                      {f.adds > 0 && <span className="add">+{f.adds}</span>}
-                      {f.dels > 0 && <span className="del">−{f.dels}</span>}
-                    </span>
-                  </span>
-                  <span className="file-actions">
-                    <button
-                      className="file-action-btn rollback"
-                      title="回滚到本会话改动前"
-                      onClick={(e) => { e.stopPropagation(); onRollbackFile(f.path) }}
-                    >
-                      <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.8" style={{ width: 14, height: 14 }}>
-                        <path d="M3.5 8C3.5 5 5.5 3 8 3C9.5 3 10.8 3.7 11.6 4.8" strokeLinecap="round" strokeLinejoin="round" />
-                        <path d="M12 2.5V5H9.5" strokeLinecap="round" strokeLinejoin="round" />
-                      </svg>
-                    </button>
-                  </span>
-                </div>
-              ))
-            )}
-            {files.length > 0 && <div className="right-hint">↑ 点击文件查看本会话真实 diff · Esc 关闭</div>}
+            {teamSection}
+            {todoSection}
+            {subagentSection}
+            {asyncSection}
+            {scheduleSection}
+            {workflowSection}
           </>
         )}
 
-        {rightTab === 'tasks' && (
-          <>
-            {/* 任务模块卡片（独立模块阴影展示 · 对齐输入框 .input-box） */}
-            {/* [2026-10-21 D2] 六个模块 → 折叠分组：为 0 的组只占一行，有数据自动展开 */}
-            <CollapsibleGroup title="TEAM 协作" count={teamCount}>
-              {activeSessionId && (
-                <TeamPanel
-                  sessionId={activeSessionId}
-                  showToast={showToast}
-                  hideHeader
-                  onCount={setTeamCount}
-                  onViewMember={(agentId, name, active) => setViewing({ agentId, name, subtitle: active ? '运行中' : '离线', active })}
-                />
-              )}
-            </CollapsibleGroup>
-            {/* keepMounted：切换会话要立刻重拉任务（折叠即卸载 ⇒ TodoPanel 不轮询 ⇒ 计数恒 0） */}
-            <CollapsibleGroup title="任务清单" count={todoCount} keepMounted>
-              {activeSessionId && <TodoPanel sessionId={activeSessionId} showToast={showToast} hideHeader onCount={setTodoCount} />}
-            </CollapsibleGroup>
-            {(() => {
-              // 子代理身份去重：同一 toolUseId/taskId 双键指向同一对象，按 taskId 去重
-              //   （按 name 会误并同名成员——并行探索成员 description 相同 → 3 个只显 2 个）
-              const seen = new Set<string>()
-              const subs = Object.values(subagentIdentities).filter((id) => {
-                const key = id.taskId ?? id.name
-                if (seen.has(key)) return false
-                seen.add(key)
-                return true
-              })
-              // [D2] 展开态 = 行式列表（用户 2026-10-21：按设计稿，不要三张 0 卡片）
-              // 历史项（磁盘 transcript）：实时里已有的按 taskId 去重（两者键不同源，能对上就排除）
-              const liveIds = new Set(subs.map((x) => x.taskId).filter(Boolean) as string[])
-              const hist = historySubs.filter((h) => !liveIds.has(h.agentId))
-              const totalCount = subs.length + hist.length
-
-              // ---- 统一行模型：实时 + 历史混排（用户 2026-10-21 三次反馈的核心）----
-              //   ① 颜色：两种来源统一用彩色头像 + 彩色状态徽章（此前实时行只有 7px 灰点）
-              //   ② 排序：进行中优先，其余按**创建时间**倒序（历史时间是后端 fileCreatedAt）
-              //   ③ 过滤：全部 / 进行中 / 已完成 / 未完成（失败+已停止+未收尾+未知）
-              const rows: SaRow[] = []
-              for (const id of subs) {
-                rows.push({
-                  key: `l-${id.taskId ?? id.name}`,
-                  title: id.name || '子代理',
-                  meta: [id.taskType, id.currentTool].filter(Boolean).join(' · '),
-                  kind: toSaKind(id.status),
-                  // activities[0] = 启动事件（store 里唯一可靠的创建时间锚）
-                  ts: id.activities[0]?.ts ?? 0,
-                  live: id,
-                })
-              }
-              for (const h of hist) {
-                const title = h.description || h.agentType || h.agentId
-                rows.push({
-                  key: `h-${h.agentId}`,
-                  title,
-                  meta: h.agentType || 'agent',
-                  kind: toSaKind(h.status),
-                  ts: h.createdAt ?? 0,
-                  hist: h,
-                })
-              }
-              rows.sort((a, b) => {
-                const ra = a.kind === 'running' ? 0 : 1
-                const rb = b.kind === 'running' ? 0 : 1
-                if (ra !== rb) return ra - rb
-                return b.ts - a.ts
-              })
-              const isIncomplete = (k: SaKind) => k !== 'running' && k !== 'completed'
-              const filtered = rows.filter((r) =>
-                saListFilter === 'all' ? true
-                  : saListFilter === 'running' ? r.kind === 'running'
-                  : saListFilter === 'completed' ? r.kind === 'completed'
-                  : isIncomplete(r.kind))
-              const shown = filtered.slice(0, visibleLimit)
-              const chip = (key: SaFilter, label: string, n: number) => (
-                <button
-                  key={key}
-                  className={`todo-chip${saListFilter === key ? ' on' : ''}`}
-                  onClick={() => { setSaListFilter(key); setVisibleLimit(SA_PAGE_SIZE) }}
-                >
-                  {label} {n}
-                </button>
-              )
-              return (
-                <CollapsibleGroup title="子代理运行状况" count={totalCount}>
-                  {totalCount === 0 ? (
-                    <div className="todo-empty">暂无子代理</div>
-                  ) : (
-                    <>
-                      <div className="todo-chips">
-                        {chip('all', '全部', rows.length)}
-                        {chip('running', '进行中', rows.filter((r) => r.kind === 'running').length)}
-                        {chip('completed', '已完成', rows.filter((r) => r.kind === 'completed').length)}
-                        {chip('incomplete', '未完成', rows.filter((r) => isIncomplete(r.kind)).length)}
-                      </div>
-                      {filtered.length === 0 ? (
-                        <div className="todo-empty">没有符合条件的子代理</div>
-                      ) : (
-                        <div className="todo-rows">
-                          {shown.map((r) => {
-                            const agentId = r.live?.taskId ?? r.hist?.agentId
-                            return (
-                              <div
-                                key={r.key}
-                                className={`todo-row${r.kind === 'running' ? ' in-progress' : ''}`}
-                                onClick={() => {
-                                  if (!agentId) return
-                                  setViewing({
-                                    agentId,
-                                    name: r.live ? r.live.name : (r.hist?.agentType || '子代理'),
-                                    subtitle: SA_KIND_LABEL[r.kind],
-                                    active: r.kind === 'running',
-                                  })
-                                }}
-                                title="查看该子代理的对话"
-                              >
-                                <span className="sub-avatar" style={{ background: r.live?.color || subagentColor(r.title) }}>
-                                  {r.title.charAt(0).toUpperCase()}
-                                </span>
-                                <span className="todo-row-main">
-                                  <span className="todo-row-title one-line">{r.title}</span>
-                                  <span className="todo-row-sub">{r.meta || '子代理'}</span>
-                                </span>
-                                <span className={`sub-status ${r.kind}`}>{SA_KIND_LABEL[r.kind]}</span>
-                                {/* 停止入口随三态弹窗删除后迁到行内（仅运行中且有 taskId） */}
-                                {r.kind === 'running' && r.live?.taskId && (
-                                  <button
-                                    className="subagent-kill"
-                                    title="停止任务"
-                                    onClick={(e) => { e.stopPropagation(); void handleKillSubagent(r.live!) }}
-                                  >⏹</button>
-                                )}
-                                <span className="todo-row-arrow">›</span>
-                              </div>
-                            )
-                          })}
-                          {filtered.length > visibleLimit && (
-                            <button
-                              className="sub-more"
-                              onClick={() => setVisibleLimit((n) => n + SA_PAGE_SIZE)}
-                            >查看更多（还有 {filtered.length - visibleLimit} 条）</button>
-                          )}
-                        </div>
-                      )}
-                    </>
-                  )}
-                </CollapsibleGroup>
-              )
-            })()}
-
-            {/* keepMounted：异步面板负责把 REST 里的 local_agent/teammate 补录进 subagentStore，
-                折叠即卸载会让「子代理运行状况」永远为空（2026-10-21 实测） */}
-            <CollapsibleGroup title="异步任务" count={asyncCount} keepMounted>
-              <AsyncTasksPanel activeSessionId={activeSessionId} showToast={showToast} hideHeader onCount={setAsyncCount} />
-            </CollapsibleGroup>
-
-            <CollapsibleGroup
-              title="定时任务"
-              count={schedules.list.length}
-              action={(
-                <span className="add-schedule" title="添加定时任务" onClick={() => openSettingsAt('schedules')}>
-                  <PlusIcon size={11} />
-                </span>
-              )}
-            >
-              {schedules.loading ? (
-                <div className="todo-empty">加载中…</div>
-              ) : schedules.list.length === 0 ? (
-                <div className="todo-empty">暂无定时任务</div>
-              ) : (
-                <div className="todo-rows">
-                  {schedules.list.map((sc) => {
-                    const status = sc.lastRunStatus === 'ok' ? '正常' : sc.lastRunStatus === 'error' ? '异常' : '未运行'
-                    const dot = sc.lastRunStatus === 'ok' ? 'completed' : sc.lastRunStatus === 'error' ? 'pending' : 'pending'
-                    return (
-                      <div key={sc.id} className="todo-row" onClick={() => setDetailSchedule(sc)} title="查看定时任务详情">
-                        <span className={`todo-row-dot ${dot}`} />
-                        <span className="todo-row-main">
-                          <span className="todo-row-title">{sc.name}</span>
-                          <span className="todo-row-sub">{status}{sc.lastRunAt ? ` · 上次 ${sc.lastRunAt}` : ''}</span>
-                        </span>
-                        <span className="todo-row-arrow">›</span>
-                      </div>
-                    )
-                  })}
-                </div>
-              )}
-            </CollapsibleGroup>
-            {detailSchedule && (
-              <ScheduleDetailModal schedule={detailSchedule} onClose={() => setDetailSchedule(null)} />
-            )}
-
-            {/* Workflow 运行（REST 拉取 + 4s 轮询） */}
-            <CollapsibleGroup title="Workflow 运行" count={workflowRuns.length}>
-            {workflowLoading ? (
-              <div className="right-empty">加载中…</div>
-            ) : workflowRuns.length === 0 ? (
-              <div className="todo-empty">暂无 workflow 运行</div>
-            ) : (
-              workflowRuns.map((r) => {
-                const meta = WORKFLOW_STATUS_META[r.status]
-                const phaseIdx = r.currentPhase && r.declaredPhases?.length
-                  ? r.declaredPhases.indexOf(r.currentPhase) + 1
-                  : null
-                const toolCount = (r.agents ?? []).reduce((s, a) => s + (a.toolCount ?? 0), 0)
-                const tokenCount = (r.agents ?? []).reduce((s, a) => s + (a.tokenCount ?? 0), 0)
-                const expanded = expandedRunId === r.runId
-                return (
-                  <div
-                    key={r.runId}
-                    className={`workflow-card ${expanded ? 'expanded' : ''}`}
-                    onClick={() => void toggleRunDetail(r.runId)}
-                  >
-                    <div className="workflow-head">
-                      <span className="workflow-dot" style={{ background: meta.dot }} />
-                      <span className="workflow-name">{r.workflowName}</span>
-                      <span className="workflow-status">{meta.label}</span>
-                      {r.status === 'running' && (
-                        <button className="workflow-kill" title="停止运行" onClick={(e) => { e.stopPropagation(); void killRun(r.runId) }}>⏹ 停止</button>
-                      )}
-                    </div>
-                    <div className="workflow-meta">
-                      {phaseIdx
-                        ? `阶段: ${r.currentPhase} (${phaseIdx}/${r.declaredPhases.length})`
-                        : `${r.agentCount} agents`}
-                    </div>
-                    <div className="workflow-stats">
-                      {r.agentCount} agents · 工具 {toolCount} · tokens {fmtTokens(tokenCount)}
-                    </div>
-                    {r.status === 'failed' && r.error && <div className="workflow-error">✗ {r.error}</div>}
-                    {r.status === 'completed' && r.returnValue !== undefined && (
-                      <div className="workflow-return">返回: {summarizeJson(r.returnValue)}</div>
-                    )}
-                    {expanded && runDetail && runDetail.runId === r.runId && (
-                      <div className="workflow-detail">
-                        {runDetail.phases?.length > 0 && (
-                          <div className="workflow-phases">
-                            {runDetail.phases.map((p, i) => (
-                              <div key={i} className={`workflow-phase ${p.status === 'done' ? 'done' : 'running'}`}>
-                                {p.status === 'done' ? '✓' : '●'} {p.title}
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                        {runDetail.agents?.length > 0 && (
-                          <div className="workflow-agents">
-                            {runDetail.agents.map((a) => (
-                              <div key={a.id} className="workflow-agent">
-                                <span className="wa-dot" style={{ background: a.status === 'done' ? 'var(--success)' : 'var(--accent)' }} />
-                                <span className="wa-label">{a.label ?? 'agent'}</span>
-                                <span className="wa-phase">{a.phase ?? ''}</span>
-                                <span className="wa-count">
-                                  {a.toolCount ? `tools ${a.toolCount}` : ''}
-                                  {a.tokenCount ? ` · ${fmtTokens(a.tokenCount)}` : ''}
-                                </span>
-                              </div>
-                            ))}
-                          </div>
-                        )}
-                      </div>
-                    )}
-                  </div>
-                )
-              })
-            )}
-            </CollapsibleGroup>
-          </>
-        )}
-
-        {rightTab === 'projects' && (
-          <>
-            {main.id ? (
-              <>
-                {/* 单项目模式（设计稿 v3）：项目卡 + 文件树，无主次/无切换/无绑定新项目 */}
-                <div className="ctx-label" style={{ paddingLeft: 0 }}>当前项目</div>
-                <div className={`main-card single ${flashingProject === main.name ? 'flash' : ''}`}>
-                  <div className="icon"><FolderSvg /></div>
-                  <div className="info">
-                    <div className="name-row">
-                      <span className="name">{main.name}</span>
-                    </div>
-                    <div className="meta">
-                      <span>{main.branch}</span>
-                      <span style={{ color: 'var(--ink-faint)' }}>·</span>
-                      {main.dirty > 0 && (
-                        <>
-                          <span className="dirty">{main.dirty} 未提交</span>
-                          <span style={{ color: 'var(--ink-faint)' }}>·</span>
-                        </>
-                      )}
-                      <span>{main.agents} agents</span>
-                    </div>
-                  </div>
-                  {main.agents > 0 && <div className="status-dot" title="agents 运行中"></div>}
-                </div>
-
-                {/* 项目文件树（IDE 项目结构 · 设计稿 v3） */}
-                <div className="sub-header">
-                  <span>项目文件</span>
-                </div>
-                {fileTreeLoading ? (
-                  <div className="right-empty">加载文件树…</div>
-                ) : fileTreeError ? (
-                  <div className="right-hint" style={{ color: 'var(--warning)' }}>文件树加载失败</div>
-                ) : (
-                  <ProjectFileTree
-                    nodes={fileTree ?? []}
-                    expandedDirs={expandedDirs}
-                    onToggle={toggleDir}
-                    onOpen={(path) => main.id ? onOpenFile(main.id, path) : undefined}
-                    onQuote={(path) => onQuoteFile(path)}
-                    onMenu={openFileMenu}
-                  />
-                )}
-                <div className="right-hint">↑ 点击查看 · 目录展开 · 右键新建/重命名/删除</div>
-                {fileMenu && (
-                  <FileTreeContextMenu
-                    menu={fileMenu}
-                    onAction={onFileMenuAction}
-                  />
-                )}
-                {opDialog && (
-                  <FileOpDialog
-                    state={opDialog}
-                    onCancel={() => setOpDialog(null)}
-                    onConfirm={confirmFileOp}
-                  />
-                )}
-              </>
-            ) : (
-              <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>
-            )}
-          </>
-        )}
+        {shownTab === 'projects' && projectsSection}
         </div>
         </>
         )}

@@ -83,6 +83,9 @@ describe('AnsiOutput 工具卡折叠（前 8 + 后 8）', () => {
           onLoadOlder={() => {}} onNearBottomChange={() => {}} />,
       )
     })
+    // [轮次中间过程折叠] 历史轮次默认收起工具卡 → 先展开整轮，再进入 ToolCard 自身的折叠测试。
+    const turnToggle = container.querySelector<HTMLButtonElement>('.turn-process-toggle')
+    if (turnToggle) await act(async () => { turnToggle.click() })
     const head = container.querySelector<HTMLButtonElement>('.tool-card .head')
     expect(head).not.toBeNull()
     await act(async () => { head!.click() })

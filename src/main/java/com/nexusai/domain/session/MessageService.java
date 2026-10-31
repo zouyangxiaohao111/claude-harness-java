@@ -14,6 +14,7 @@ import com.nexusai.model.session.dto.SendMessageRequest;
 import com.nexusai.model.session.dto.AttachmentRequest;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.infra.exception.NotFoundException;
+import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import com.fasterxml.jackson.core.type.TypeReference;
 import com.fasterxml.jackson.databind.ObjectMapper;
@@ -58,7 +59,8 @@ import com.nexusai.application.agent.session.SessionResumeDeserializer;
  * - getById：单查
  * - createUserMessage：持久化用户消息 + 自增 sessions.messageCount
  * - delete：单删
- * - replaceSessionMessages：全量替换会话消息（partial 压缩写回）
+ * - trimSessionAfter：对话裁剪（定位 pivot 的 seq + 区间删除；返回删掉的条数）
+ * - replaceSessionMessages：全量替换会话消息（partial 压缩写回；<b>当前唯一生产调用方 = 裁剪慢路径兜底</b>）
  *
  * Phase 4 stub：不调 LLM；只持久化用户消息并返回
  * assistantMessageId = "msg-stub-pending"，streamTopic 形如
@@ -761,6 +763,129 @@ public class MessageService {
      *  （sessions.messageCount · 非 meta 口径）——前端轨迹 tab 徽标全量用，避免拿「已加载页」条数当全量。 */
     public record PageResult(List<ChatMessageDto> messages, boolean hasMore, int total) {}
 
+    /** [turn-paging] 轮分页响应 · {messages(seq ASC 含每轮起点用户消息), hasMore, firstTurnId, lastTurnId}。 */
+    public record TurnPage(List<ChatMessageDto> messages, boolean hasMore,
+                           String firstTurnId, String lastTurnId) {}
+
+    /**
+     * [turn-paging] 按<b>轮</b>分页读取会话消息 · GET /sessions/{sessionId}/messages/turns。
+     *
+     * <p><b>WHY</b>：原 {@link #listPageBySession} 按「条数」分页，而数据形态是「一轮可能几百条 tool
+     * 消息」—— 实测某会话尾页 150 条全落在同一轮里，首屏连一轮都显示不全。本方法以「轮」为页单位：
+     * <b>整轮返回、绝不切断</b>（一轮 = 一条真正的用户提问 + 它之后、下一条用户提问之前的所有
+     * assistant / tool / 思考 / boundary 段；{@code messages} 含每轮起点用户消息本身）。
+     *
+     * <p><b>两次查询、不读全量进内存</b>：
+     * <ol>
+     *   <li><b>锚点扫描</b>（轻量）：只读最小列集
+     *       （id/seq/role/author/subtype/is_meta/is_compact_summary，不读 content/reasoning），
+     *       走 {@code idx_messages_session_seq}（{@code seq ASC NULLS LAST} 不产生 TEMP B-TREE），
+     *       Java 侧用 {@link TurnPaging#isUserTurnRow}（与前端 {@code isUserTurnRow} 同口径）筛出轮锚点；</li>
+     *   <li><b>取行</b>：把轮窗口换算成 seq 半开区间 {@code [from, to)} 下推 SQL，<b>无 LIMIT</b>
+     *       ⇒ 巨型轮整轮返回不被截断；排序片段与 {@link #listPageBySession} 同为
+     *       {@link #SEQ_ASC_NULLS_LAST_ORDER}（seq 位置序，NULL 排末尾）。</li>
+     * </ol>
+     *
+     * <p><b>seq 为 NULL 的行</b>：位置键未落 = 数据异常（新写入已被 V71 触发器拦截）。它们无法参与
+     * seq 区间算术 ⇒ 既不作锚点（{@link #warnNullSeqIfAny} ERROR 留痕），也<b>不会</b>被带区间的页取到；
+     * 仅在「窗口覆盖到会话起点且到下界无上界」时随 {@code NULLS LAST} 排在末尾（与
+     * {@link #listRawForTranscript} 同处置：不冒充真实位置）。
+     *
+     * @param sessionId    会话 id（DB 键 "sess-xxx"；空/不存在 → {@link NotFoundException}）
+     * @param beforeTurnId 轮游标（可为 null/blank = 最近 N 轮）；<b>不含</b>该轮本身
+     * @param turns        轮数（{@code <=0} → 2；{@code >10} → 10）
+     * @return {messages(seq ASC), hasMore, firstTurnId, lastTurnId}
+     * @throws NotFoundException   sessionId 为空 / 会话不存在
+     * @throws com.nexusai.infra.exception.ValidationException beforeTurnId 不存在于该会话 / 不是用户提问行（→ 400）
+     */
+    public TurnPage listMessagesByTurns(String sessionId, String beforeTurnId, int turns) {
+        // [fail loud] 对齐 listPageBySession：sessionId 空则 eq("session_id", null) 会被
+        //   QueryColumnBehavior(IGNORE_NULL) 静默丢弃 → 退化成跨会话扫描（越权 + 顺序错乱）。
+        if (sessionId == null || sessionId.isBlank()) {
+            throw new NotFoundException("Session " + sessionId + " not found（sessionId 为空：拒绝跨会话轮分页）");
+        }
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        long t0 = System.currentTimeMillis();
+        int turnCount = TurnPaging.normalizeTurns(turns);
+
+        // 1) 锚点扫描：最小列集（轻量；不查 tool_calls、不读 content）
+        List<MessageRecord> anchorRows = messageMapper.selectListByQuery(QueryWrapper.create()
+            .select("id", "seq", "role", "author", "subtype", "is_meta", "is_compact_summary")
+            .where("session_id = ?", sessionId)
+            .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER));
+        warnNullSeqIfAny(sessionId, "listMessagesByTurns.anchors", anchorRows);
+
+        List<TurnPaging.TurnAnchor> anchors = TurnPaging.anchorsOf(anchorRows);
+        int nullSeqTurnRows = TurnPaging.countNullSeqTurnRows(anchorRows);
+        if (nullSeqTurnRows > 0) {
+            log.warn("[turn-paging] 会话 {} 有 {} 条用户提问行 seq 为 NULL，未计入轮锚点（位置键未落 = 数据异常）",
+                sessionId, nullSeqTurnRows);
+        }
+
+        // 2) 游标精确报错：区分「消息不存在/不属于该会话」与「存在但不是用户提问行」，
+        //    两者都 400（ValidationException）——绝不静默返回空页（前端会误判「到底了」）
+        if (beforeTurnId != null && !beforeTurnId.isBlank()
+                && TurnPaging.indexOfTurn(anchors, beforeTurnId) < 0) {
+            MessageRecord any = messageMapper.selectOneByQuery(QueryWrapper.create()
+                .select("id").eq("session_id", sessionId).eq("id", beforeTurnId));
+            if (any == null) {
+                throw new ValidationException(
+                    "[turn-paging] beforeTurnId " + beforeTurnId + " 不存在于会话 " + sessionId
+                        + "（按轮分页无法定位；不静默返回空页）");
+            }
+            throw new ValidationException(
+                "[turn-paging] beforeTurnId " + beforeTurnId + " 不是用户提问行（不是轮起点，按轮分页无法定位）"
+                    + "：session=" + sessionId);
+        }
+
+        TurnPaging.TurnWindow win = TurnPaging.resolveWindow(anchors, beforeTurnId, turnCount);
+        if (win.isEmpty()) {
+            if (log.isInfoEnabled()) {
+                log.info("[turn-paging] 轮分页: session={} 请求轮数={} beforeTurnId={} → 空窗口"
+                        + "（轮锚点总数={}，无更早的轮）返回 0 条 hasMore={}",
+                    sessionId, turnCount, beforeTurnId, anchors.size(), win.hasMore());
+            }
+            return new TurnPage(List.of(), win.hasMore(), win.firstTurnId(), win.lastTurnId());
+        }
+
+        // 3) 取行：seq 半开区间下推（无 LIMIT ⇒ 巨型轮整轮返回）
+        QueryWrapper qw = QueryWrapper.create().eq("session_id", sessionId);
+        if (win.seqFromInclusive() != null) {
+            qw.ge("seq", win.seqFromInclusive());
+        }
+        if (win.seqToExclusive() != null) {
+            qw.lt("seq", win.seqToExclusive());
+        }
+        qw.orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER);
+        List<MessageRecord> rows = messageMapper.selectListByQuery(qw);
+        warnNullSeqIfAny(sessionId, "listMessagesByTurns.rows", rows);
+        List<ChatMessageDto> result = new ArrayList<>(rows.size());
+        for (MessageRecord m : rows) {
+            result.add(toDto(m));
+        }
+        // 尾页（窗口覆盖到最后一轮）才补上下文快照 —— 与 listPageBySession 尾页口径一致
+        if (win.endIndex() == anchors.size()) {
+            applyContextSnapshotToLastAssistant(result, sessionId);
+        }
+        if (result.isEmpty()) {
+            // 窗口非空却取不到行 = 锚点行在两次查询之间被删（并发裁剪）；如实留痕，不静默
+            log.warn("[turn-paging] 轮分页: session={} 轮窗口[{}, {}) 锚点存在但行区间取到 0 条"
+                    + "（疑似并发删除锚点行）firstTurnId={} lastTurnId={}",
+                sessionId, win.startIndex(), win.endIndex(), win.firstTurnId(), win.lastTurnId());
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[turn-paging] 轮分页: session={} 请求轮数={} beforeTurnId={} → 轮窗口[{}, {})"
+                    + " 锚点总数={} 返回 {} 条 hasMore={} firstTurnId={} lastTurnId={} seq=[{}, {}) 耗时={}ms",
+                sessionId, turnCount, beforeTurnId, win.startIndex(), win.endIndex(), anchors.size(),
+                result.size(), win.hasMore(), win.firstTurnId(), win.lastTurnId(),
+                win.seqFromInclusive(), win.seqToExclusive(), System.currentTimeMillis() - t0);
+        }
+        return new TurnPage(result, win.hasMore(), win.firstTurnId(), win.lastTurnId());
+    }
+
     /** [dialog-ops-pivot] 预览源文窗口（字符）：与前端 plainPreview.ts PREVIEW_SOURCE_CHARACTERS 同值单点约定。 */
     private static final int PREVIEW_SOURCE_CHARACTERS = 2048;
 
@@ -1194,7 +1319,8 @@ public class MessageService {
             return com.nexusai.application.agent.compact.CompactConstants.CONTEXT_WINDOW_UNCONFIGURED_DEFAULT;
         }
         try {
-            ModelRecord modelRecord = ModelNameResolver.resolve(modelMapper, providerMapper, model);
+            // [2026-10-29] 重拉快照的窗口是统计/展示口径 → 宽松解析（裸名歧义不打选模型链路的 ERROR）
+            ModelRecord modelRecord = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, model);
             if (modelRecord != null && modelRecord.getMaxContextTokens() != null
                     && modelRecord.getMaxContextTokens() > 0) {
                 return modelRecord.getMaxContextTokens();
@@ -1622,26 +1748,97 @@ public class MessageService {
      *
      * <p><b>WHY（gap28 前端缺口 §28）</b>: 前端「裁剪到某点」需删除 pivot 之后全部消息且
      * 被删消息<b>不进模型上下文</b>——模型上下文来自 DB transcript（LlmAgentLoop.run 经
-     * listRawForTranscript 加载），故本方法 DB 删 + 重插保留段即等价 CC 前端 setMessages 裁剪。
+     * listRawForTranscript 加载），故本方法 DB 删即等价 CC 前端 setMessages 裁剪。
      * conversationId 旋转由调用方（ChatController 裁剪端点）负责，对齐 CC REPL.tsx:3673
      * {@code setConversationId(randomUUID())}。
      *
-     * <p><b>实现</b>: 复用 {@link #replaceSessionMessages}「删全部 + 重插」路径
-     * （toolCallMapper/messageMapper deleteByQuery + 保序重插 created_at={@link #nextCreatedAt} 单调取号），
-     * 最小新增、无新 SQL；tool_calls 随消息级联清除（replace 路径已显式删 toolCall）。
+     * <p><b>实现（性能改造：O(N) 全量读写 → 定位 + 区间删除）</b>:
+     * <ol>
+     *   <li><b>轻量定位 pivot</b>：一次 {@code selectOneByQuery(session_id, id)} 取该行的
+     *       {@code seq}（会话内位置键）。口径与改造前<b>完全一致</b>：pivot 必须命中「当前会话」的
+     *       消息（跨会话同 id 不误匹配 —— 改造前是在 listRawForTranscript 结果集内按 id 匹配，
+     *       改造后是同一条 WHERE 的等价投影）。</li>
+     *   <li><b>区间删除</b>：一条 {@code DELETE FROM messages WHERE session_id=? AND
+     *       (seq >= ? OR seq IS NULL)}。为什么 {@code seq IS NULL} 也要删：读侧
+     *       {@link #listRawForTranscript} 的排序是 {@code seq ASC NULLS LAST}
+     *       （{@link #SEQ_ASC_NULLS_LAST_ORDER}）——NULL 行恒排在全部非 NULL 行<b>之后</b>，
+     *       即 pivot（seq 非 NULL）之后 ⇒ 必须同批删除。这与改造前「keep = 结果集 [0, pivotIndex)」
+     *       的切片结果<b>逐行等价</b>（非 NULL 行：seq &lt; pivotSeq 保留；NULL 行：全部在 pivot 之后）。</li>
+     *   <li><b>子表清理</b>：tool_calls（唯一以 message_id 为外键的子表，V1 schema）按
+     *       {@code message_id IN (SELECT id FROM messages WHERE <同一谓词>)} 显式删 —— 与
+     *       {@link #replaceSessionMessages} 的清理口径一致（tool_calls 表<b>无</b> session_id 列，
+     *       不能按 session_id 删）。tool_result 消息（role=tool 行）本身也是 messages 行，
+     *       由区间删除一并覆盖。</li>
+     * </ol>
+     *
+     * <p><b>WHY 改造</b>: 改造前走「全量读出 + 逐条重插」（listRawForTranscript 全量读 + 每条
+     * 再查 tool_calls + replaceSessionMessages 删全表重插）——会话 2.5 万条消息时该 DELETE 要跑
+     * 数秒到数十秒，前端「编辑重发」一直卡在「发送中」。区间删除走 {@code idx_messages_session_seq}
+     * 索引，只删真正要删的尾段，代价与会话总长无关。
+     *
+     * <p><b>保留段的差异（逐条核对，均为「更少写」而非「更少删」）</b>: 改造前保留段会被
+     * replaceSessionMessages <b>删掉重插</b>（id 保留，但 seq / created_at 被重新取号、少数未映射
+     * 列丢失）；本实现<b>原地保留</b>保留段（seq / created_at / 全部列原样）——删除集合与改造前
+     * 完全一致，保留集合是改造前的超集（列更全）。轮序不变（保留段 seq 相对序原样，追加行 seq
+     * 仍由 {@link #nextSeq} 单调取号，必大于保留段最大值）。
+     *
+     * <p><b>[慢路径兜底]</b>: pivot 行自身 seq 为空（位置键未落 = V70 前遗留行）时，「pivot 及其后」
+     * 无法用区间表达（NULL 行之间的相对序未定义）⇒ 回落 {@link #trimSessionAfterByFullRewrite}
+     * 全量重写路径（语义与改造前逐条一致）。V71 已回填存量 NULL 并用触发器挡住新 NULL ⇒ 极少触发。
      *
      * @param sessionId      会话 ID（DB 键，如 "sess-xxx"）
      * @param pivotMessageId 裁剪 pivot 消息 ID（该消息本身及其后全部删除）
-     * @return 裁剪后剩余消息列表（空列表 = pivot 是首条 / 全删，前端 setMessages 权威回填）
+     * @return 被裁掉的消息条数（pivot 起全部，含 pivot 自身）
      * @throws NotFoundException session 不存在 / pivot 消息不存在（对齐 delete :115 语义）
      */
     @Transactional
-    public List<ChatMessageDto> trimSessionAfter(String sessionId, String pivotMessageId) {
+    public int trimSessionAfter(String sessionId, String pivotMessageId) {
+        long t0 = System.nanoTime();
         if (sessionMapper.selectOneById(sessionId) == null) {
             throw new NotFoundException("Session " + sessionId + " not found");
         }
-        // pivot 定位必须在「当前会话消息列表」内匹配（created_at ASC 序），而非 getById——
-        // 避免跨会话消息 id 误匹配（对齐 listRawForTranscript :59-71 同源读取）。
+        // [轻量定位 pivot] 一次查询取 seq；WHERE 带 session_id ⇒ 跨会话同 id 不误匹配
+        //   （口径同改造前「在 listRawForTranscript 结果集内按 id 匹配」——同一 WHERE 的等价投影）。
+        MessageRecord pivot = messageMapper.selectOneByQuery(
+            QueryWrapper.create().eq("session_id", sessionId).eq("id", pivotMessageId));
+        if (pivot == null) {
+            throw new NotFoundException("Message " + pivotMessageId + " not found");
+        }
+        Long pivotSeq = pivot.getSeq();
+        if (pivotSeq == null) {
+            // [慢路径兜底] pivot 行 seq 为空 ⇒ 区间谓词无法表达「pivot 及其后」⇒ 回落全量重写。
+            log.warn("[MessageService] trimSessionAfter: session={} pivot={} 的 seq 为空"
+                    + "（位置键未落 = 数据异常）→ 回落全量重写慢路径（语义与区间路径一致）",
+                sessionId, pivotMessageId);
+            return trimSessionAfterByFullRewrite(sessionId, pivotMessageId, t0);
+        }
+        // 1. tool_calls 子表清理（先子后母，与 replaceSessionMessages 口径一致）。
+        //    ⚠️ tool_calls 表无 session_id 列（V1：id/message_id/tool_name/arguments/result/
+        //    is_error/created_at）⇒ 必须按 message_id 子查询删，不能 eq("session_id")。
+        toolCallMapper.deleteByQuery(QueryWrapper.create()
+            .where("message_id IN (SELECT id FROM messages WHERE session_id = ?"
+                + " AND (seq >= ? OR seq IS NULL))", sessionId, pivotSeq));
+        // 2. 区间删除消息（pivot 及其后 = {seq >= pivotSeq} ∪ {seq IS NULL}）。
+        int deleted = messageMapper.deleteByQuery(QueryWrapper.create()
+            .where("session_id = ? AND (seq >= ? OR seq IS NULL)", sessionId, pivotSeq));
+        long costMs = (System.nanoTime() - t0) / 1_000_000L;
+        log.info("[MessageService] trimSessionAfter: session={} pivot={} 区间删除 {} 条消息"
+                + "（seq >= {} ∪ seq IS NULL，含 pivot 自身），耗时 {} ms",
+            sessionId, pivotMessageId, deleted, pivotSeq, costMs);
+        return deleted;
+    }
+
+    /**
+     * [慢路径兜底] pivot 行 seq 为空（位置键未落）时的裁剪：全量读出 + 全量重写
+     * （改造前的实现，语义逐条一致 —— 保留 pivot 之前、丢弃 pivot 及其后，轮序不变）。
+     *
+     * <p>WHY 保留这条路：读侧排序是 {@code seq ASC NULLS LAST}，NULL 行之间相对序未定义 ⇒
+     * 「pivot（NULL 行）及其后」无法用区间谓词表达。V71 触发器已挡住新 NULL 行（写入口）、
+     * V71 回填已清掉存量 NULL ⇒ 该路径只在数据异常时触发（并有 WARN 日志）。
+     *
+     * @return 被裁掉的消息条数
+     */
+    private int trimSessionAfterByFullRewrite(String sessionId, String pivotMessageId, long t0) {
         List<ChatMessageDto> all = listRawForTranscript(sessionId);
         int pivotIndex = -1;
         for (int i = 0; i < all.size(); i++) {
@@ -1655,12 +1852,13 @@ public class MessageService {
         }
         // keep = [0, pivotIndex)（含 pivot 丢弃，对齐 CC slice(0, messageIndex) REPL.tsx:3671）
         List<ChatMessageDto> keep = new ArrayList<>(all.subList(0, pivotIndex));
-        if (log.isInfoEnabled()) {
-            log.info("[MessageService] trimSessionAfter: session={} pivot={} 裁剪 {}→{} 条消息"
-                    + "（含 pivot 及其后丢弃，对齐 CC REPL.tsx:3671 slice(0, messageIndex)）",
-                sessionId, pivotMessageId, all.size(), keep.size());
-        }
-        return replaceSessionMessages(sessionId, keep);
+        replaceSessionMessages(sessionId, keep);
+        int deleted = all.size() - keep.size();
+        long costMs = (System.nanoTime() - t0) / 1_000_000L;
+        log.info("[MessageService] trimSessionAfter(慢路径): session={} pivot={} 全量重写裁剪 {} 条消息"
+                + "（保留 {} 条），耗时 {} ms",
+            sessionId, pivotMessageId, deleted, keep.size(), costMs);
+        return deleted;
     }
 
     /**
@@ -1883,7 +2081,7 @@ public class MessageService {
             //   created_at 此处仅保时间序不倒挂）· [created_at 单调分配器]
             //   逐条取号（调用顺序 = 数组序），同时把本会话分配槽推进到 ≥ 重插值 → 后续任何写路径
             //   （实时落库 / compact 追加）恒晚于本次重插行（跨 writer 单调；旧 base.plusNanos(i) 用
-            //   独立时间基，与分配槽不同源可倒挂 —— 本方法仅剩 trimSessionAfter 调用）。
+            //   独立时间基，与分配槽不同源可倒挂 —— 本方法当前仅剩裁剪慢路径兜底调用）。
             rec.setCreatedAt(nextCreatedAt(sessionId).toString());
             rec.setToolCallId(dto.toolCallId());
             rec.setSubtype(dto.subtype());

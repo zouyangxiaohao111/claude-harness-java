@@ -2,11 +2,11 @@ import { useEffect, useRef } from 'react'
 import { Client, type StompSubscription } from '@stomp/stompjs'
 import { useChatStore, type PermissionRequestItem } from '../stores/chatStore'
 import { sessionApi, type PermissionEventPayload } from '../api/sessions'
-import { createSocketClient, subscribeStream, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
+import { createSocketClient, subscribeStream, notifySocketConnect, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
-import type { StreamEvent, TaskEvent, TaskEventUsage, SessionStatusEvent, SessionTitleEvent, TeamStatusEvent, TeammateMessageEvent, TodoItem } from '../api/types'
+import type { StreamEvent, TaskEvent, TaskEventUsage, SessionStatusEvent, SessionTitleEvent, TeamStatusEvent, TeammateMessageEvent, TodoItem, ComputerUseApproval } from '../api/types'
 import type { SubagentUsageStat } from '../utils/subagentStats'
 import type { SessionFile } from '../types'
 import { useTeamStore } from '../stores/teamStore'
@@ -147,17 +147,34 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
 const bridgeDismissSubs = new Map<string, StompSubscription>()
 
 /**
+ * 归一化产物的**收紧类型**：与 {@link PermissionRequestItem} 同形，但 `computerUse` **必填**。
+ *
+ * <p>WHY 需要它：{@link PermissionRequestItem.computerUse} 是**可选**字段 ⇒ 若归一化时漏抄，
+ * TypeScript **不会报错**（手写字段清单的经典缺口）⇒ 症状 = 三条通道（message/bridge/channel
+ * 共用本函数）一起退化成普通 allow/deny 弹窗，用户看不到「要控制哪些应用、能控制到什么程度」。
+ * 把返回类型收紧成「`computerUse` 必填」⇒ **漏抄即编译失败**，三条通道再也无法漂移。
+ *
+ * <p>可赋给 {@link PermissionRequestItem}（交集类型是它的子类型）⇒ 调用方零改动。
+ */
+type NormalizedPermission = PermissionRequestItem & { computerUse: ComputerUseApproval | null }
+
+/**
  * 权限事件 → 入队项（[2026-10-22] 从 subscribePermTopics 内联提取）。
  *
  * <p>STOMP `/permission-requests` 事件与会话状态 `pendingPermissions` **同形**，两处共用同一归一化，
  * 避免「补拉路径」与「实时路径」字段漂移（bridge 的 displayInput / suggestions 归一 / leader inbox
  * 都是易漏点）。未入队 → AskUserForm 拿不到 questions、或「始终允许」永远不出现。
+ *
+ * <p>⭐ **三条通道（message / bridge / channel）共用本函数** —— 实测核实，非假设：
+ * {@link subscribePermTopics} 把三个 topic 归一到同一个 `toPermissionItem`（只按 kind 改
+ * toolInput 的取字段名）。⇒ 本函数是**唯一**的入队归一化点，三条通道的字段行为天然一致，
+ * 不存在「bridge 走一套、channel 走另一套」的分支漂移。
  */
 function toPermissionItem(
   raw: PermissionEventPayload,
   sid: string,
   kind: PermissionRequestItem['kind'],
-): PermissionRequestItem {
+): NormalizedPermission {
   // C1 · leader inbox：reason.reason==='leader_inbox'；worker 名优先取后端补的 workerName
   const isLeaderInbox = raw.reason?.reason === 'leader_inbox'
   const workerName = isLeaderInbox ? (raw.workerName ?? extractWorkerName(raw.description)) : null
@@ -173,6 +190,15 @@ function toPermissionItem(
     description: raw.description, reason: raw.reason, warning: raw.warning, toolInput,
     isLeaderInbox, workerName, workerBadgeColor: raw.workerBadgeColor ?? null,
     timestampMs: raw.timestampMs, suggestions,
+    // [桌面控制审批面板] 后端算好的应用清单 + 授权范围文案。
+    //   ⚠️ 本函数是**手写字段清单** ⇒ 漏抄本字段没有任何编译期约束；且补拉路径与实时路径
+    //   **共用本函数** ⇒ 漏抄的症状 = 切会话 / F5 后授权范围消失（普通 allow/deny 弹窗）。
+    //   ✅ 已用**收紧返回类型** {@link NormalizedPermission}（computerUse 必填）补上编译期约束：
+    //   漏抄本行 ⇒ `tsc` 立即报错，不再靠人眼盯手抄清单。
+    //   已有单测锁死（front/src/api/__tests__/computerUseApproval.test.ts 实时路径 +
+    //   useChatSocket.pendingReplay.test.tsx 补拉路径 +
+    //   useChatSocket.computerUseChannels.test.tsx **三通道** message/bridge/channel）。
+    computerUse: raw.computerUse ?? null,
   }
 }
 
@@ -212,7 +238,10 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
   const subs = {} as { message: StompSubscription; bridge: StompSubscription; channel: StompSubscription }
   topics.forEach(({ kind, topic }) => {
     subs[kind] = client.subscribe(topic, (msg) => {
-      const raw = JSON.parse(msg.body)
+      // ⭐ 解析结果**标注线格式类型**（不是 any）⇒ 三条通道的字段名由 `PermissionEventPayload`
+      //   统一约束：后端改字段名（如 computerUse）时**编译期**报错，而不是静默丢字段
+      //   ⇒ 症状（授权范围消失 / 命中 fail-loud）不会以「编译全绿但线上坏」的形式出现。
+      const raw = JSON.parse(msg.body) as PermissionEventPayload
       const st = useChatStore.getState()
       // TEMP 诊断（联调 §38）：确认权限事件到达 + 订阅键（sessionId 匹配检查）
       console.debug(`[perm] ${kind} event on ${topic}`, { requestId: raw.requestId, toolName: raw.toolName, sessionId: sid })
@@ -564,6 +593,8 @@ export function useChatSocket(
     }
     client.onConnect = () => {
       setConnection('connected')
+      // 连接可用（含重连）→ 通知组件级订阅者（如终端面板：断线后订阅随连接失效，需重订）
+      notifySocketConnect()
       // 当前会话 scoped 订阅（用 ref 读最新 sessionId）
       const sid = sessionIdRef.current
       if (sid) {

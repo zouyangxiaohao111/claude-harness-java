@@ -23,9 +23,24 @@
  *
  * <b>边界（如实登记）</b>：事件**不带** `userAttachments` 键 = 该排队项无附件快照（纯文本 busy）⇒
  * 气泡 `userAttachments` 为 `null`，不伪造空数组。后端在「非空才出站」这一点上已保证。
+ *
+ * <b>[busy 气泡图片] 同窗口的图片缺陷</b>：drained 载荷此前也没有图片 id ⇒ 气泡 `imagePasteIds`
+ * 为空 → `MessageList` 的 userImages 为空（图不显示），F5 重拉才出现。现后端 `drained[].imagePasteIds`
+ * 出站（= 落库 `image_paste_ids` 同一份，入队时定稿），本模块原样搬到气泡；取图沿用既有两条路：
+ * `App.tsx` 批量拉图 effect（依赖 `storeMessages`，append 后即触发）+ `imageCache[sessionId][id]`。
  */
 
 import type { ChatMessageDto } from '@/api/types'
+
+/**
+ * 事件快照 → 气泡 `imagePasteIds`（纯搬运；`null`/空 → `null`，与 `userAttachments` 同规则，
+ * 不伪造空数组 —— `MessageList` 的 userImages 只按非空 id 取图）。
+ */
+function toImagePasteIds(wire: readonly unknown[] | null | undefined): string[] | null {
+  if (!wire || wire.length === 0) return null
+  const ids = wire.filter((id): id is string => typeof id === 'string' && id.length > 0)
+  return ids.length > 0 ? ids : null
+}
 
 /**
  * 事件快照项 → 气泡附件胶囊（结构 = `ChatMessageDto['userAttachments']` 元素）。
@@ -47,6 +62,12 @@ export interface DrainedQueueItem {
   content: string
   /** 后端权威快照；**键缺失/null = 无附件快照**（纯文本 busy / 非 busy workload） */
   userAttachments: readonly UserAttachmentCapsule[] | null
+  /**
+   * [busy 气泡图片] 该排队消息的图片 id（= 后端落库 `image_paste_ids` 同一份）。
+   * **键缺失/null/空 = 无图片**（纯文本 busy / 非 busy workload）。
+   * 气泡据此去 `imageCache[sessionId][id]` 取图（App.tsx 批量拉图 effect 按它 miss 补拉）。
+   */
+  imagePasteIds?: readonly string[] | null
 }
 
 /** 事件快照 → 气泡胶囊（纯搬运；`null`/空 → `null`，绝不伪造空数组）。 */
@@ -90,6 +111,8 @@ export function parseDrainedQueueItems(raw: readonly Record<string, unknown>[]):
           url: a.url != null ? String(a.url) : null,
         }))
       : null,
+    // [busy 气泡图片] 同规则归一：缺键 / null / 非数组 / 空数组 / 无有效字符串 → null
+    imagePasteIds: toImagePasteIds(Array.isArray(d.imagePasteIds) ? d.imagePasteIds : null),
   }))
 }
 
@@ -118,6 +141,9 @@ export function buildDrainedUserMessages(
         toolCallId: null, assistantMessageId: null, userMessageId: msgId, subtype: null, isMeta: false, isApiErrorMessage: false,
         apiError: null, error: null, errorDetails: null, matchedRule: null,
         userAttachments: toCapsules(d.userAttachments),
+        // [busy 气泡图片] 后端权威 id 原样搬到气泡：App.tsx 批量拉图 effect 依赖 storeMessages，
+        //   appendMessages 后自动按这些 id 补拉 image-cache → MessageList userImages 出图（不再等 F5）
+        imagePasteIds: toImagePasteIds(d.imagePasteIds),
       }
     })
 }

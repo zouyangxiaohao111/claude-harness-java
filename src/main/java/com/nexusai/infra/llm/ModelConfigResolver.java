@@ -139,6 +139,15 @@ public class ModelConfigResolver {
      * {@code getName()}（裸名）回传，由 {@link com.nexusai.application.agent.loop.ModelCaller} 等
      * provider.stream 调用点替换发送名（CC 端 model 恒为裸名，无 provider 前缀概念）。
      *
+     * <p><b>[2026-10-29] 走宽松解析（{@link ModelNameResolver#resolveQuiet}），⛔ 不是选模型</b>：
+     * 本方法只做「把调用方已选定的模型名翻译成 SDK 需要的裸名」，<b>不承担选模型决策</b> ——
+     * 裸名多 provider 同名时返回 null，调用方回落<b>原始值</b>（原始值本身就是裸名，正是要发给
+     * SDK 的形态），结果与旧行为逐字相同，只是不再把「选模型护栏的 ERROR」记到这条翻译路径上。
+     * 实测（2026-10-29 18:15 backend）：{@code OpenAiSdkProvider.doStream} 对
+     * {@link com.nexusai.infra.llm.LlmInvocationGateway} 已剥好前缀的裸名<b>二次解析</b>，
+     * 每次请求固定打一条裸名歧义 ERROR；SDK 名翻译不需要 provider 身份，故用宽松解析。
+     * ⛔ 选模型入口（{@link #resolve}）仍走 {@link ModelNameResolver#resolve}（fail-loud 不变）。
+     *
      * @param modelName 模型全名（providerName/modelName）或裸模型名
      * @return DB models.name（裸名）；未命中 / 不可用 → null
      */
@@ -146,7 +155,29 @@ public class ModelConfigResolver {
         if (modelName == null || modelName.isBlank()) {
             return null;
         }
-        ModelRecord model = findEnabledModelByName(modelName);
+        // [2026-10-29 用户裁定] 全名 → 剥前缀，⛔ 不再拿裸名回查 models（那是歧义来源）：
+        //   上游契约是 providerName/modelName，SDK 只吃后半段。
+        //   ⚠️ 裸名自身也可能含 '/'（如 meta-llama/Llama-3）⇒ 只有**第一段是已注册 provider 名**
+        //   才剥（providers.name 唯一约束，无歧义）；否则按裸名处理，绝不误伤第三方名字。
+        int slash = modelName.indexOf('/');
+        if (slash > 0 && slash < modelName.length() - 1) {
+            String first = modelName.substring(0, slash);
+            if (isKnownProviderName(first)) {
+                String bare = modelName.substring(slash + 1);
+                if (log.isDebugEnabled()) {
+                    log.debug("[ModelConfigResolver] resolveSdkModelName 全名剥前缀: provider={} → SDK 名 {}", first, bare);
+                }
+                return bare;
+            }
+            // 未知前缀：按旧语义返回 null（调用方回落**原始值**；若原始值本身是含 '/' 的第三方裸名，
+            // 回落正好就是 SDK 需要的形态）。
+            if (log.isDebugEnabled()) {
+                log.debug("[ModelConfigResolver] resolveSdkModelName 首段 {}/ 不是已注册 provider → null（调用方回落原值）", first);
+            }
+            return null;
+        }
+        // 无前缀：可能是 DB 裸名或别名（如 haiku）→ 宽松解析展开；未命中回落 null（调用方用原值）
+        ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
         if (model == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[ModelConfigResolver] resolveSdkModelName 未命中 modelName={} → null（调用方回落原始值）",
@@ -234,6 +265,24 @@ public class ModelConfigResolver {
                 fallbackModelName);
         }
         return fallbackModelName;
+    }
+
+    /** provider 名缓存（providers.name 有唯一约束 ⇒ 命中即确定，不会歧义） */
+    private final java.util.Set<String> knownProviderNames = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    private boolean isKnownProviderName(String name) {
+        if (name == null || name.isBlank()) return false;
+        if (knownProviderNames.contains(name)) return true;
+        try {
+            var found = providerMapper.selectOneByQuery(com.mybatisflex.core.query.QueryWrapper.create().eq("name", name).limit(1));
+            if (found != null) {
+                knownProviderNames.add(name);
+                return true;
+            }
+        } catch (RuntimeException e) {
+            log.debug("[ModelConfigResolver] provider 名查询失败（按裸名处理）: {}", e.toString());
+        }
+        return false;
     }
 
     /**
