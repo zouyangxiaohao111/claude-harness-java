@@ -414,9 +414,30 @@ nexusai:
     # 坐标模式：pixels | normalized_0_100 · CCB 默认 pixels
     coordinate-mode: pixels
     # 视觉 grounding 降级路径（主模型确定不支持视觉时改走 grounding）· 本仓特有（CCB 无对应）
-    # 默认 false：降级会把坐标模式强制切到 normalized_0_100（降级只产出百分比坐标），
-    # 影响主链路坐标约定 ⇒ 未实测精度前保持关闭。PoC 端点与此开关无关。
-    grounding-fallback-enabled: false
+    # [2026-10-31 用户裁定] 默认开启 —— 降级只影响「主模型【确定不支持视觉】」的情形；
+    #   主模型能看图时仍走 CCB 原路径（把图直接送给主模型，精度更高、grounding 零调用）；
+    #   视觉能力判不出（undetermined）时保持现状：放行出图、grounding 不接管。
+    # ⭐ 降级走【pixels 模式】（与主链路同制式）：视觉模型看到的就是 CU 送出的那张缩放图
+    #   ⇒ 它回的「图上像素」天然等于 CCB pixels 制式 ⇒ 【不再】把坐标模式切成 normalized_0_100。
+    #   （历史：2026-10-31 之前降级只产出百分比坐标，故当时会强制切模式；pixels 化后该覆盖已移除。）
+    grounding-fallback-enabled: true
+    # ── grounding 三条护栏（2026-10-31）────────────────────────────────────────────
+    # 护栏① 目标描述唯一性 + 返回 target 一致性检查：在 ComputerUseGroundingService 内
+    #   （模型自报的目标名与请求描述不一致 ⇒ fail loud）。规则见 ComputerUseGroundingTargetMatch。
+    # 护栏② 点击前落点校验：对落点区域二次截图，与首次截图的同一区域做像素级比对，
+    #   差异超阈值 ⇒ 拒绝点击。阈值可配（见下）。⚠️ 无 GUI 环境可置 false。
+    #   区域边长单位 = 【图像像素】（模型看到的那张图的像素）。
+    grounding-region-verify-enabled: true
+    grounding-region-size: 60
+    # 平均绝对差阈值（灰度 0-255）：同一区域二次抓图的噪声地板远低于此值；
+    #   内容确实变了（控件换位/换样/被遮挡）时远高于此值。
+    grounding-region-mad-threshold: 15.0
+    # 差异像素占比阈值（0.0-1.0）：单像素灰度差 ≥ 40 记为「变了」。
+    grounding-region-diff-ratio-threshold: 0.35
+    # 护栏③ 系统性偏移补偿（单位 = 屏幕物理像素；默认 0 = 不启用 ⇒ 行为不变）。
+    #   PoC 实测误差偏右下（dx∈[-5.5,+19.5]、dy∈[+1.5,+11.5]），可按实测填入。
+    grounding-offset-x: 0.0
+    grounding-offset-y: 0.0
     # 视觉 grounding 手工 PoC 端点（POST /api/v1/computer-use/grounding-poc）
     # 默认 true（2026-10-31 用户裁定：跑视觉 grounding 真 key PoC）⇒ 端点可用；
     # 置 false ⇒ 端点 404。开启后可手工量「视觉模型定位坐标」的像素误差。

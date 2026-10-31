@@ -251,7 +251,24 @@ public class ComputerUseToolConfig {
             com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver,
             com.nexusai.infra.llm.LlmProviderFactory llmProviderFactory,
             com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient) {
-        return new ComputerUseGroundingService(modelConfigResolver, llmProviderFactory, sideCallClient);
+        // 护栏③ · 系统性偏移补偿（默认 0 = 不启用 ⇒ 行为不变）
+        double offsetX = gates != null ? gates.groundingOffsetX() : 0.0d;
+        double offsetY = gates != null ? gates.groundingOffsetY() : 0.0d;
+        return new ComputerUseGroundingService(modelConfigResolver, llmProviderFactory, sideCallClient,
+                offsetX, offsetY);
+    }
+
+    /**
+     * [Phase 1e] grounding <b>定位帧存储</b>（会话级）。
+     *
+     * <p>护栏②（点击前落点校验）要把「首次截图的同一区域」与「此刻屏幕的同一区域」比对
+     * ⇒ 必须把首次那张图留下来（只在内存，不落盘）。
+     *
+     * @return 定位帧存储实例
+     */
+    @Bean
+    public ComputerUseGroundingStore computerUseGroundingStore() {
+        return new ComputerUseGroundingStore();
     }
 
     /**
@@ -290,6 +307,30 @@ public class ComputerUseToolConfig {
     }
 
     /**
+     * 构建 computer-use 工具集合（<b>兼容重载</b> · 无定位帧存储 ⇒ 护栏② 不生效）。
+     *
+     * @param geometryStore 几何快照存储
+     * @param grantStore    会话授权位存储
+     * @param lockService   跨会话锁服务
+     * @param visionCapability 视觉能力判定
+     * @param groundingService grounding 降级服务
+     * @param mouseState    会话级「左键按住」状态
+     * @param displayStore  会话级「选中的显示器」存储
+     * @return 工具列表（开关关闭时为空 List）
+     */
+    public List<Tool> computerUseTools(ComputerUseGeometryStore geometryStore,
+                                       ComputerUseGrantStore grantStore,
+                                       ComputerUseLockService lockService,
+                                       ComputerUseVisionCapability visionCapability,
+                                       ComputerUseGroundingService groundingService,
+                                       ComputerUseMouseState mouseState,
+                                       ComputerUseDisplayStore displayStore,
+                                       ComputerUseWindowBindingStore bindingStore) {
+        return computerUseTools(geometryStore, grantStore, lockService, visionCapability,
+                groundingService, mouseState, displayStore, bindingStore, null);
+    }
+
+    /**
      * 构建 computer-use 工具集合。
      *
      * <p><b>工具清单 = 35 个</b>（CCB 全集，顺序逐字对齐 CCB
@@ -307,6 +348,7 @@ public class ComputerUseToolConfig {
      * @param mouseState    [Phase 2a] 会话级「左键按住」状态（null ⇒ 新建一个 ⇒
      *                       仅单测兼容路径会走到；生产由 Spring 注入单例）
      * @param displayStore  [Phase 2a] 会话级「选中的显示器」存储（null ⇒ 新建一个）
+     * @param groundingStore [Phase 1e] grounding 定位帧存储（护栏② 用；null ⇒ 落点校验跳过）
      * @return 工具列表（开关关闭时为空 List）
      */
     @Bean
@@ -317,7 +359,8 @@ public class ComputerUseToolConfig {
                                        ComputerUseGroundingService groundingService,
                                        ComputerUseMouseState mouseState,
                                        ComputerUseDisplayStore displayStore,
-                                       ComputerUseWindowBindingStore bindingStore) {
+                                       ComputerUseWindowBindingStore bindingStore,
+                                       ComputerUseGroundingStore groundingStore) {
         if (!computerUseEnabled) {
             if (log.isInfoEnabled()) {
                 log.info("nexusai.feature.computer-use=false → mcp__computer-use__* 工具不注册（默认关，需 yml true）");
@@ -362,17 +405,17 @@ public class ComputerUseToolConfig {
         ComputerUseDisplayStore effectiveDisplayStore =
                 displayStore != null ? displayStore : new ComputerUseDisplayStore();
         // [Phase 1c] 坐标模式：来自子开关且【首次读取即冻结】（CCB gates.ts:66-72）
-        ComputerUseCoordinateMode coordinateMode = coordinateMode();
+        ComputerUseCoordinateMode coordinateMode = resolveCoordinateMode();
         // [Phase 1e] grounding 降级路径只在【开关打开】时接线（默认关 ⇒ 生产语义不变）。
-        //   降级路径只能产出百分比坐标 ⇒ 坐标模式强制 normalized_0_100（否则「描述说像素、
-        //   实际按百分比换算」会让模型点错位置 —— CCB tools.ts:5-10 的同源不变量）。
+        //   ⭐ 降级路径【不再】覆盖坐标模式：2026-10-31 起 grounding 回的是【图像像素坐标】
+        //   （模型看到的就是 CU 送出的那张缩放图 ⇒ 天然是 CCB pixels 制式）
+        //   ⇒ 降级路径与主路径统一用 pixels（描述与换算同源 ⇒ 模型不会点错空间）。
         boolean groundingEnabled = gates != null && gates.groundingFallbackEnabled();
         ComputerUseGroundingService effectiveGrounding = groundingEnabled ? groundingService : null;
-        if (groundingEnabled && coordinateMode != ComputerUseCoordinateMode.NORMALIZED_0_100) {
-            log.warn("[computer-use] grounding 降级已开启 ⇒ 坐标模式强制切到 normalized_0_100"
-                    + "（原={}）—— 降级路径只产出百分比坐标，描述与换算必须同源", coordinateMode.wire());
-            coordinateMode = ComputerUseCoordinateMode.NORMALIZED_0_100;
-        }
+        // 护栏② · 落点校验参数（开关默认开；无 grounding 帧时自然跳过）
+        ComputerUseRegionVerifyConfig regionVerifyConfig = gates != null
+                ? gates.regionVerifyConfig()
+                : ComputerUseRegionVerifyConfig.disabled();
         ComputerUseForegroundAppResolver foregroundAppResolver = platform.foregroundAppResolver();
         // ── [Phase 2b] Windows 专属能力的依赖 ──
         // ⚠️ macOS 上这些依赖<b>不存在</b>（窗口枚举 / UIA / 浮层 / 终端都是 Windows 专属）
@@ -411,16 +454,20 @@ public class ComputerUseToolConfig {
                 new ComputerUseRequestAccessTool(grantStore, lockService),
                 // [Phase 1b · A] 截图工具带视觉能力闸（主模型不支持视觉 ⇒ fail loud，不发图）
                 // [Phase 1e] 降级路径开启时：闸判「确定不支持」⇒ 改走 grounding（不回图）
-                new ComputerUseScreenshotTool(capturer, geometryStore, visionCapability, effectiveGrounding),
+                // [护栏②] grounding 命中后把「首次截图」存进定位帧存储（供点击前比对）
+                new ComputerUseScreenshotTool(capturer, geometryStore, visionCapability,
+                        effectiveGrounding, groundingStore),
                 // [Phase 2a] 区域放大截图（只读；按 region 原分辨率重抓）
                 new ComputerUseZoomTool(capturer, geometryStore, coordinateMode),
                 // [Phase 1a] 接授权体系 ⇒ 点击工具自带档位门控（CCB runInputActionGates）
                 // [Phase 1b · A] 点击工具同样带视觉能力闸（看不到图 ⇒ 坐标无来源 ⇒ 明确报错）
-                // [Phase 1e] 降级路径生效时：放行 + 切百分比态换算
+                // [Phase 1e] 降级路径生效时：放行（坐标模式【不再】被切百分比态）
+                // [护栏②] 降级路径点击前做落点区域二次比对（变了 ⇒ 拒绝点击）
                 // [Phase 1c] 坐标描述随【冻结的】坐标模式生成（一态一文案）
                 new ComputerUseLeftClickTool(capturer, mouse, geometryStore,
                         coordinateMode, grantStore, foregroundAppResolver,
-                        visionCapability, effectiveGrounding, clickRouter),
+                        visionCapability, effectiveGrounding, clickRouter,
+                        groundingStore, regionVerifyConfig),
                 // [Phase 2a] 点击变体（左/右/中键 × 1/2/3 次）
                 new ComputerUseDoubleClickTool(mouseActions, geometryStore,
                         coordinateMode, grantStore, foregroundAppResolver),
@@ -522,9 +569,12 @@ public class ComputerUseToolConfig {
     /**
      * 冻结后的坐标模式。
      *
+     * <p>⭐ <b>降级路径【不再】覆盖它</b>（2026-10-31）：grounding 现在回的是<b>图像像素坐标</b>
+     * （pixels 制式）⇒ 降级与主路径同源 ⇒ 这里<b>只读冻结值</b>，不做任何模式切换。
+     *
      * @return 坐标模式（子开关未注入 ⇒ {@link ComputerUseCoordinateMode#PIXELS}）
      */
-    private ComputerUseCoordinateMode coordinateMode() {
+    ComputerUseCoordinateMode resolveCoordinateMode() {
         if (gates == null) {
             return ComputerUseCoordinateMode.PIXELS;
         }

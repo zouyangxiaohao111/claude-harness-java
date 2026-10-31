@@ -46,9 +46,10 @@ import java.util.List;
  * <b>且</b>降级开关已打开（{@code nexusai.computer-use.grounding-fallback-enabled=true}
  * ⇒ 生产注入 {@link ComputerUseGroundingService}）时，<b>不再直接报错</b>：
  * 改为把截图交给<b>本仓配置的视觉模型</b>（{@code settings.multimodal_model_name}）做
- * <b>grounding</b>，产出<b>归一化（百分比）坐标</b>并以<b>文本</b>回给主模型。
- * <br>⚠️ 降级路径只用百分比坐标（主模型看不到图 ⇒ 没有像素参照）⇒ 点击侧同步按
- * {@code normalized_0_100} 换算（见 {@link ComputerUseLeftClickTool}）。
+ * <b>grounding</b>，产出<b>图像像素坐标</b>并以<b>文本</b>回给主模型。
+ * <br>⭐ 2026-10-31 起降级路径与主路径<b>统一用 {@code pixels}</b>（模型看到的就是这张缩放图
+ * ⇒ 它回的「图上像素」天然是 CCB pixels 制式）⇒ 点击侧<b>不再</b>切百分比态
+ * （见 {@link ComputerUseLeftClickTool}）。
  * <br>⚠️ 视觉闸判<b>确定支持</b> ⇒ 仍走<b>CCB 原路径</b>（把图直接送给主模型，优先级更高、
  * 精度更高）；判<b>判不出</b> ⇒ <b>保持现状：放行</b>（宁可让端点报错也不把图藏起来）。
  */
@@ -83,6 +84,9 @@ public final class ComputerUseScreenshotTool implements Tool {
      *  <p>[Phase 1e] 新增可选 {@code target}：<b>仅在 grounding 降级路径</b>（主模型确定
      *  不支持视觉）下被消费 —— 它是「要定位的界面元素描述」，供视觉模型做 grounding。
      *  <b>主模型支持视觉时该参数被忽略</b>（不影响 CCB 原路径）。
+     *
+     *  <p>⭐ 2026-10-31 起：降级路径回的是<b>图像像素坐标</b>（与 {@code pixels} 模式同制式）
+     *  ⇒ 描述文案同步改为「pixel coordinates on the screenshot image」。
      */
     private static final String INPUT_SCHEMA = """
             {
@@ -90,7 +94,7 @@ public final class ComputerUseScreenshotTool implements Tool {
               "properties": {
                 "target": {
                   "type": "string",
-                  "description": "Optional. Describe the UI element you want located on the screen (e.g. \\"the Save button\\"). Only used when the current model cannot see images: the configured vision model will locate it and return normalized (percentage) coordinates. Ignored when the model can see images directly."
+                  "description": "Optional. Describe the UI element you want located on the screen (e.g. \\"the Save button\\"). Only used when the current model cannot see images: the configured vision model will locate it and return pixel coordinates on the screenshot image. Ignored when the model can see images directly."
                 }
               }
             }
@@ -100,6 +104,8 @@ public final class ComputerUseScreenshotTool implements Tool {
     private final ComputerUseGeometryStore geometryStore;
     private final ComputerUseVisionCapability visionCapability;
     private final ComputerUseGroundingService groundingService;
+    /** 护栏② · 定位帧存储（供点击前落点校验比对「首次截图的同一区域」；null ⇒ 不存帧）。 */
+    private final ComputerUseGroundingStore groundingStore;
 
     /**
      * PoC / 单测构造器 · <b>不做视觉闸</b>（无模型上下文可判）。
@@ -142,6 +148,24 @@ public final class ComputerUseScreenshotTool implements Tool {
                                      ComputerUseGeometryStore geometryStore,
                                      ComputerUseVisionCapability visionCapability,
                                      ComputerUseGroundingService groundingService) {
+        this(capturer, geometryStore, visionCapability, groundingService, null);
+    }
+
+    /**
+     * 生产构造器 · <b>带视觉能力闸 + grounding 降级服务 + 定位帧存储</b>（护栏②）。
+     *
+     * @param capturer         截屏器（JNA）
+     * @param geometryStore    几何快照存储（供点击工具按「截图时刻」换算）
+     * @param visionCapability 视觉能力判定（可 null ⇒ 不做闸）
+     * @param groundingService grounding 降级服务（<b>null ⇒ 降级路径关闭</b> ⇒ 视觉闸判
+     *                         「确定不支持」时维持 fail loud 报错；非 null ⇒ 走 grounding）
+     * @param groundingStore   定位帧存储（null ⇒ 不存帧 ⇒ 点击前落点校验跳过）
+     */
+    public ComputerUseScreenshotTool(ComputerUseScreenCapturer capturer,
+                                     ComputerUseGeometryStore geometryStore,
+                                     ComputerUseVisionCapability visionCapability,
+                                     ComputerUseGroundingService groundingService,
+                                     ComputerUseGroundingStore groundingStore) {
         if (capturer == null || geometryStore == null) {
             throw new IllegalArgumentException("ComputerUseScreenshotTool 依赖不能为空");
         }
@@ -149,6 +173,7 @@ public final class ComputerUseScreenshotTool implements Tool {
         this.geometryStore = geometryStore;
         this.visionCapability = visionCapability;
         this.groundingService = groundingService;
+        this.groundingStore = groundingStore;
     }
 
     @Override
@@ -306,40 +331,54 @@ public final class ComputerUseScreenshotTool implements Tool {
             return ToolResult.error(call.id(), outcome.errorMessage());
         }
 
-        String text = renderGroundingText(outcome, geometry);
+        // 护栏② · 留下「首次截图」这一帧（点击前落点校验要比对同一区域）
+        if (groundingStore != null) {
+            groundingStore.put(sessionId, new ComputerUseGroundingFrame(
+                    capture, outcome.xPixels(), outcome.yPixels(), outcome.target()));
+        }
+
+        String text = renderGroundingText(outcome, geometry, capture.imageWidth(), capture.imageHeight());
         if (log.isInfoEnabled()) {
-            log.info("[computer-use] {} grounding 命中: target={} → x={}% y={}% · 快照显示 {}x{} · session={}",
-                    TOOL_NAME, outcome.target(), outcome.xPercent(), outcome.yPercent(),
+            log.info("[computer-use] {} grounding 命中: target={} → 图像像素 ({},{}) · 图像 {}x{} "
+                            + "· 快照显示 {}x{} · session={}",
+                    TOOL_NAME, outcome.target(), outcome.xPixels(), outcome.yPixels(),
+                    capture.imageWidth(), capture.imageHeight(),
                     geometry.displayWidth(), geometry.displayHeight(), sessionId);
         }
         return ToolResult.success(call.id(), text);
     }
 
     /**
-     * grounding 结果文本 · <b>含目标描述 + 百分比坐标 + 误差预期提示</b>（Phase 1e 要求）。
+     * grounding 结果文本 · <b>含目标描述 + 图像像素坐标 + 屏幕参考坐标 + 误差预期提示</b>。
+     *
+     * <p><b>⭐ 坐标语义</b>：2026-10-31 起降级路径与主路径<b>统一用 {@code pixels}</b> ⇒
+     * 回给主模型的必须是<b>图像像素坐标</b>（模型照抄进 {@code left_click} 的 coordinate）
+     * ⇒ 换算由既有 {@link ComputerUseCoordinateScaler} 的 pixels 分支负责
+     * （本方法只<b>附带</b>显示一个屏幕参考值，不参与换算）。
      *
      * <p><b>误差预期的诚实口径</b>：本仓<b>无法</b>预先知道视觉模型的定位误差
-     * ⇒ 只给<b>可计算</b>的部分（1% 对应多少物理像素 = 显示宽 / 100），
-     * 并明确告知「这是二手定位、不是主模型直接读图」+ 建议点击后复核。
+     * ⇒ 明确告知「这是二手定位、不是主模型直接读图」+ 建议点击后复核。
      *
-     * @param outcome  grounding 结果
-     * @param geometry 截图时刻的几何快照
+     * @param outcome      grounding 结果
+     * @param geometry     截图时刻的几何快照
+     * @param imageWidth   本次截图的图像宽
+     * @param imageHeight  本次截图的图像高
      * @return 文本结果
      */
     private static String renderGroundingText(ComputerUseGroundingService.GroundingOutcome outcome,
-                                               ComputerUseScreenshotGeometry geometry) {
-        double x = outcome.xPercent();
-        double y = outcome.yPercent();
-        int pixelX = (int) Math.round((x / 100.0) * geometry.displayWidth()) + geometry.originX();
-        int pixelY = (int) Math.round((y / 100.0) * geometry.displayHeight()) + geometry.originY();
-        double pxPerPercent = geometry.displayWidth() / 100.0d;
+                                               ComputerUseScreenshotGeometry geometry,
+                                               int imageWidth, int imageHeight) {
+        double x = outcome.xPixels();
+        double y = outcome.yPixels();
+        int[] screen = ComputerUseCoordinateScaler.scaleCoord(
+                x, y, ComputerUseCoordinateMode.PIXELS, geometry);
         return "已在屏幕上定位到「" + outcome.target() + "」。\n"
-                + "归一化坐标（百分比，0-100）：x = " + trimNumber(x) + ", y = " + trimNumber(y) + "\n"
+                + "截图图像尺寸：" + imageWidth + " × " + imageHeight + " 像素\n"
+                + "图像像素坐标（在这张截图上）：x = " + trimNumber(x) + ", y = " + trimNumber(y) + "\n"
                 + "参考屏幕像素（按本次截图时的显示几何 " + geometry.displayWidth() + "x" + geometry.displayHeight()
-                + " 换算）：约 (" + pixelX + ", " + pixelY + ")\n"
-                + "⚠️ 这是视觉模型看图二次定位的结果，不是当前模型直接读图得到的坐标，存在偏差；"
-                + "坐标粒度 1% 约等于 " + trimNumber(pxPerPercent) + " 像素。\n"
-                + "请用上面的百分比坐标调用 left_click（coordinate 传 [x, y]），点击后再截一次图确认结果。";
+                + " 换算）：约 (" + screen[0] + ", " + screen[1] + ")\n"
+                + "⚠️ 这是视觉模型看图二次定位的结果，不是当前模型直接读图得到的坐标，存在偏差。\n"
+                + "请用上面的【图像像素坐标】调用 left_click（coordinate 传 [x, y]），点击后再截一次图确认结果。";
     }
 
     /** 去掉多余的尾零（12.50 → 12.5；12.00 → 12）。 */

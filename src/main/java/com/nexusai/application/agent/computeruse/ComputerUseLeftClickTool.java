@@ -53,11 +53,15 @@ import java.util.List;
  *
  * <p><b>[Phase 1e] grounding 降级路径</b>：当视觉闸判<b>确定不支持</b>视觉、但
  * <b>降级开关已打开</b>（生产注入 {@link ComputerUseGroundingService}）时，
- * 坐标<b>来源</b> = 截图工具的 grounding 结果（视觉模型给的<b>归一化百分比坐标</b>）
- * ⇒ 本工具<b>不再报错</b>，并把换算切到 {@code normalized_0_100}
- * （主模型看不到图 ⇒ 没有像素参照 ⇒ 百分比是唯一可用约定）。
- * <br>⛔ 降级路径下仍<b>必须</b>有截图时刻的几何快照（否则百分比换算无依据）⇒
+ * 坐标<b>来源</b> = 截图工具的 grounding 结果（视觉模型给的<b>图像像素坐标</b>）
+ * ⇒ 本工具<b>不再报错</b>。
+ * <br>⭐ 2026-10-31 起：降级路径<b>不再</b>把换算切成 {@code normalized_0_100} ——
+ * 视觉模型看到的就是 CU 送出的那张缩放图 ⇒ 它回的「图上像素」天然是 CCB {@code pixels}
+ * 制式 ⇒ 与主路径<b>统一用 pixels</b>（描述与换算同源）。
+ * <br>⛔ 降级路径下仍<b>必须</b>有截图时刻的几何快照（否则像素换算无依据）⇒
  * 无快照 ⇒ fail loud（不放行）。
+ * <br>⭐ <b>护栏②（落点校验）</b>：降级路径在<b>真正点击之前</b>会对落点区域做二次截图比对
+ * （见 {@link #verifyLandingPoint}）⇒ 区域已变 ⇒ <b>拒绝点击</b>并回明确错误。
  */
 public final class ComputerUseLeftClickTool implements Tool {
 
@@ -127,6 +131,10 @@ public final class ComputerUseLeftClickTool implements Tool {
     private final ComputerUseGroundingService groundingService;
     /** [Phase 2b] 点击路由（窗口定向 / 全局注入 + 修饰键）；null ⇒ 恒全局注入且不支持修饰键。 */
     private final ComputerUseClickRouter clickRouter;
+    /** 护栏② · 定位帧存储（null ⇒ 无帧 ⇒ 落点校验跳过）。 */
+    private final ComputerUseGroundingStore groundingStore;
+    /** 护栏② · 落点校验参数（null ⇒ 不校验）。 */
+    private final ComputerUseRegionVerifyConfig regionVerifyConfig;
 
     /**
      * PoC 构造器（<b>不接授权体系</b>）· 保留给 Phase 0 的单测与 PoC 路径。
@@ -253,6 +261,36 @@ public final class ComputerUseLeftClickTool implements Tool {
                                     ComputerUseVisionCapability visionCapability,
                                     ComputerUseGroundingService groundingService,
                                     ComputerUseClickRouter clickRouter) {
+        this(capturer, mouse, geometryStore, coordinateMode, grantStore, foregroundAppResolver,
+                visionCapability, groundingService, clickRouter, null, null);
+    }
+
+    /**
+     * 生产构造器 · <b>带点击路由 + 护栏②（落点校验）</b>。
+     *
+     * @param capturer             截屏实现（<b>护栏② 用它做二次区域抓取</b>）
+     * @param mouse                鼠标实现（全局注入路线）
+     * @param geometryStore        截图几何快照存储
+     * @param coordinateMode       坐标模式（<b>降级路径【不再】覆盖它</b> —— 两态统一 pixels）
+     * @param grantStore           会话授权位读写（null ⇒ 不做档位门控）
+     * @param foregroundAppResolver 前台应用解析（null ⇒ 门控不生效）
+     * @param visionCapability     视觉能力判定（可 null ⇒ 不做闸）
+     * @param groundingService     grounding 降级服务（<b>null ⇒ 降级路径关闭</b>）
+     * @param clickRouter          点击路由（null ⇒ 恒全局注入且不支持修饰键）
+     * @param groundingStore       护栏② · 定位帧存储（null ⇒ 不做落点校验）
+     * @param regionVerifyConfig   护栏② · 落点校验参数（null ⇒ 不做落点校验）
+     */
+    public ComputerUseLeftClickTool(ComputerUseScreenCapturer capturer,
+                                    ComputerUseMouse mouse,
+                                    ComputerUseGeometryStore geometryStore,
+                                    ComputerUseCoordinateMode coordinateMode,
+                                    ComputerUseGrantStore grantStore,
+                                    ComputerUseForegroundAppResolver foregroundAppResolver,
+                                    ComputerUseVisionCapability visionCapability,
+                                    ComputerUseGroundingService groundingService,
+                                    ComputerUseClickRouter clickRouter,
+                                    ComputerUseGroundingStore groundingStore,
+                                    ComputerUseRegionVerifyConfig regionVerifyConfig) {
         if (capturer == null || mouse == null || geometryStore == null) {
             throw new IllegalArgumentException("ComputerUseLeftClickTool 依赖不能为空");
         }
@@ -265,6 +303,8 @@ public final class ComputerUseLeftClickTool implements Tool {
         this.visionCapability = visionCapability;
         this.groundingService = groundingService;
         this.clickRouter = clickRouter;
+        this.groundingStore = groundingStore;
+        this.regionVerifyConfig = regionVerifyConfig;
     }
 
     @Override
@@ -350,10 +390,10 @@ public final class ComputerUseLeftClickTool implements Tool {
                 return ToolResult.error(call.id(), rejection);
             }
         }
-        // 降级路径只能用百分比坐标（主模型看不到图 ⇒ 无像素参照）。
-        ComputerUseCoordinateMode effectiveMode = groundingActive
-                ? ComputerUseCoordinateMode.NORMALIZED_0_100
-                : coordinateMode;
+        // ⭐ 坐标模式：降级路径与主路径【统一】（2026-10-31）——
+        //   降级路径的坐标来源是 grounding 给的【图像像素】坐标（模型看到的就是那张缩放图
+        //   ⇒ 天然是 CCB pixels 制式）⇒ 绝不切百分比态（切了会让描述与换算不同源）。
+        ComputerUseCoordinateMode effectiveMode = coordinateMode;
         JsonNode input = call.input();
         JsonNode coordinate = input.path("coordinate");
         if (!coordinate.isArray() || coordinate.size() != 2
@@ -427,6 +467,16 @@ public final class ComputerUseLeftClickTool implements Tool {
         }
 
         boolean windowTargeted = clickRouter != null && clickRouter.isWindowTargeted(sessionId);
+        // ── 护栏② · 点击前落点校验（只在 grounding 降级路径生效：该路径才有「首次截图」可比对）──
+        //   WHY：grounding 报坐标 → 模型思考 → 本次点击之间隔着时间 ⇒ 屏幕可能已变
+        //   ⇒ 此时按旧坐标点 = 点在模型没看过的地方 ⇒ 二次截图比对，差异超阈值 ⇒ 拒绝点击。
+        if (groundingActive) {
+            String rejection = verifyLandingPoint(sessionId, point);
+            if (rejection != null) {
+                log.warn("[computer-use] {} 拒绝执行（护栏② 落点校验未通过）: {}", TOOL_NAME, rejection);
+                return ToolResult.error(call.id(), rejection);
+            }
+        }
         try {
             if (windowTargeted) {
                 // 窗口定向：SendMessage 到绑定 HWND（不动真实鼠标、不抢焦点）
@@ -462,5 +512,65 @@ public final class ComputerUseLeftClickTool implements Tool {
 
         // CCB toolCalls.ts:2504 成功文案逐字对齐："Clicked."
         return ToolResult.success(call.id(), "Clicked.");
+    }
+
+    /**
+     * 护栏② · 点击前落点校验（<b>本仓特有</b> · CCB 无对应）。
+     *
+     * <p><b>流程</b>：拿「首次 grounding 定位帧」的同区域 ↔ 此刻屏幕的同区域做像素级比对
+     * ⇒ 差异超阈值 ⇒ 返回拒绝文案（模型可见）⇒ <b>绝不点击</b>。
+     *
+     * <p><b>⚠️ 跳过条件</b>（都记日志，不静默）：
+     * <ul>
+     *   <li>护栏② 开关关闭（{@code nexusai.computer-use.grounding-region-verify-enabled=false}）；</li>
+     *   <li>没有定位帧（本次会话没走过 grounding）；</li>
+     *   <li><b>二次抓图本身失败</b>（无桌面 / GDI 抖动）⇒ 无法判定「变了」⇒ 跳过
+     *       （对齐 CCB {@code pixelCompare.ts} 的 “Skip on any internal error” 口径）。</li>
+     * </ul>
+     * <p>注意：只有「<b>检出差异</b>」才拒绝点击；「检不出」不等于「变了」。
+     *
+     * @param sessionId   会话 id
+     * @param screenPoint 已换算好的屏幕坐标（{@code int[]{x, y}}）
+     * @return 拒绝理由（null ⇒ 放行）
+     */
+    private String verifyLandingPoint(String sessionId, int[] screenPoint) {
+        if (regionVerifyConfig == null || !regionVerifyConfig.enabled()) {
+            return null;
+        }
+        if (groundingStore == null || capturer == null) {
+            return null;
+        }
+        ComputerUseGroundingFrame frame = groundingStore.get(sessionId);
+        if (frame == null) {
+            if (log.isInfoEnabled()) {
+                log.info("[computer-use] 护栏② 落点校验跳过：本会话没有 grounding 定位帧");
+            }
+            return null;
+        }
+        try {
+            ComputerUseScreenshotGeometry geometry = frame.geometry();
+            // 屏幕坐标 → 该帧的图像像素坐标（与 scaler 同一套几何 ⇒ 可逆）
+            double imageX = (screenPoint[0] - geometry.originX()) / geometry.scaleX();
+            double imageY = (screenPoint[1] - geometry.originY()) / geometry.scaleY();
+            ComputerUseGroundingRegionVerifier.RegionDiff diff =
+                    ComputerUseGroundingRegionVerifier.measure(
+                            capturer, frame, imageX, imageY, regionVerifyConfig.regionSize());
+            boolean changed = diff.changed(
+                    regionVerifyConfig.madThreshold(), regionVerifyConfig.diffRatioThreshold());
+            if (log.isInfoEnabled()) {
+                log.info("[computer-use] 护栏② 落点校验: 屏幕 ({},{}) → 图像 ({},{}) · {} · 判定={}",
+                        screenPoint[0], screenPoint[1], imageX, imageY, diff.describe(),
+                        changed ? "已变化（拒绝点击）" : "未变化（放行）");
+            }
+            if (changed) {
+                return "目标区域已变化，可能不是要找的元素，已中止点击。"
+                        + "（落点区域比对：" + diff.describe() + "）"
+                        + "请重新截图确认目标位置后再点击。";
+            }
+            return null;
+        } catch (Exception e) {
+            log.warn("[computer-use] 护栏② 落点校验无法执行（跳过，不阻断点击）: {}", e.toString());
+            return null;
+        }
     }
 }

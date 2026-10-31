@@ -26,8 +26,11 @@ import static org.mockito.Mockito.when;
  * 一个「大概是」的坐标 = 点在未知位置 = 误操作（可能点到「删除」按钮）。
  * ⇒ 本测试锁死一条铁律：<b>除了「解析成功且坐标合法」这一条路，其余全部 fail loud</b>。
  *
- * <p>五种失败各自必须给出<b>可区分</b>的错误文案（模型据此自纠：换描述 / 换模型 / 重试），
+ * <p>各类失败各自必须给出<b>可区分</b>的错误文案（模型据此自纠：换描述 / 换模型 / 重试），
  * 且<b>一律不返回坐标</b>。
+ *
+ * <p>⭐ 2026-10-31 起坐标语义 = <b>图像像素</b>（pixels 制式）⇒ 本测试的假截图用
+ * <b>1456×819</b>（1920 屏预缩放后的真实尺寸），断言域为「图像像素」而非 0–100。
  */
 class ComputerUseGroundingServiceTest {
 
@@ -38,10 +41,10 @@ class ComputerUseGroundingServiceTest {
 
     private ProviderConfig cfg;
 
-    /** 假截图（32x24 蓝图 · 1x1 JPEG magic 头即可 · grounding 只用 base64 + 尺寸）。 */
+    /** 假截图（1456×819 · 32x24 蓝图 · 1x1 JPEG magic 头即可 · grounding 只用 base64 + 尺寸）。 */
     private static ComputerUseCaptureResult capture() {
         return new ComputerUseCaptureResult(new byte[]{(byte) 0xFF, (byte) 0xD8, (byte) 0xFF},
-                "image/jpeg", 32, 24, 100, 100, 0, 0, 1.0d, 100, 100);
+                "image/jpeg", 1456, 819, 1920, 1080, 0, 0, 1.0d, 1920, 1080);
     }
 
     @BeforeEach
@@ -64,17 +67,17 @@ class ComputerUseGroundingServiceTest {
     }
 
     @Test
-    @DisplayName("成功路径：结构化 JSON ⇒ FOUND + 百分比坐标")
-    void successParsesPercentCoordinates() {
-        stubChain("{\"found\": true, \"x\": 12.5, \"y\": 40.0, \"target\": \"保存按钮\"}");
+    @DisplayName("成功路径：结构化 JSON ⇒ FOUND + 图像像素坐标")
+    void successParsesPixelCoordinates() {
+        stubChain("{\"found\": true, \"x\": 880, \"y\": 120, \"target\": \"保存按钮\"}");
 
         ComputerUseGroundingService.GroundingOutcome outcome =
                 service.ground(capture(), "保存按钮", null);
 
         assertThat(outcome.found()).isTrue();
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.FOUND);
-        assertThat(outcome.xPercent()).isEqualTo(12.5d);
-        assertThat(outcome.yPercent()).isEqualTo(40.0d);
+        assertThat(outcome.xPixels()).isEqualTo(880d);
+        assertThat(outcome.yPixels()).isEqualTo(120d);
         assertThat(outcome.target()).isEqualTo("保存按钮");
         assertThat(outcome.errorMessage()).isNull();
     }
@@ -82,14 +85,14 @@ class ComputerUseGroundingServiceTest {
     @Test
     @DisplayName("围栏 JSON 也能解析（模型爱加 ```json 围栏）")
     void successAcceptsFencedJson() {
-        stubChain("```json\n{\"found\": true, \"x\": 50, \"y\": 50}\n```");
+        stubChain("```json\n{\"found\": true, \"x\": 700, \"y\": 400, \"target\": \"目标\"}\n```");
 
         ComputerUseGroundingService.GroundingOutcome outcome =
                 service.ground(capture(), "目标", null);
 
         assertThat(outcome.found()).isTrue();
-        assertThat(outcome.xPercent()).isEqualTo(50d);
-        assertThat(outcome.yPercent()).isEqualTo(50d);
+        assertThat(outcome.xPixels()).isEqualTo(700d);
+        assertThat(outcome.yPixels()).isEqualTo(400d);
     }
 
     @Test
@@ -102,8 +105,8 @@ class ComputerUseGroundingServiceTest {
 
         assertThat(outcome.found()).isFalse();
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.NOT_FOUND);
-        assertThat(outcome.xPercent()).isNull();
-        assertThat(outcome.yPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
+        assertThat(outcome.yPixels()).isNull();
         assertThat(outcome.errorMessage()).contains("没有找到");
     }
 
@@ -117,7 +120,7 @@ class ComputerUseGroundingServiceTest {
 
         assertThat(outcome.found()).isFalse();
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.PARSE_FAILED);
-        assertThat(outcome.xPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
         assertThat(outcome.errorMessage()).contains("无法解析");
     }
 
@@ -130,33 +133,33 @@ class ComputerUseGroundingServiceTest {
                 service.ground(capture(), "保存按钮", null);
 
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.PARSE_FAILED);
-        assertThat(outcome.xPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
     }
 
     @Test
-    @DisplayName("坐标越界（>100 或 <0）⇒ OUT_OF_RANGE（明确文案 + 不返回坐标）")
+    @DisplayName("坐标越界（超出图像像素范围）⇒ OUT_OF_RANGE（明确文案 + 不返回坐标）")
     void outOfRangeCoordinatesAreRejected() {
-        stubChain("{\"found\": true, \"x\": 180, \"y\": 40}");
+        stubChain("{\"found\": true, \"x\": 1600, \"y\": 40, \"target\": \"保存按钮\"}");
 
         ComputerUseGroundingService.GroundingOutcome outcome =
                 service.ground(capture(), "保存按钮", null);
 
         assertThat(outcome.found()).isFalse();
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.OUT_OF_RANGE);
-        assertThat(outcome.xPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
         assertThat(outcome.errorMessage()).contains("越界");
     }
 
     @Test
     @DisplayName("坐标不是数字 ⇒ PARSE_FAILED（绝不把字符串当坐标）")
     void nonNumericCoordinatesAreParseFailed() {
-        stubChain("{\"found\": true, \"x\": \"left\", \"y\": 40}");
+        stubChain("{\"found\": true, \"x\": \"left\", \"y\": 40, \"target\": \"保存按钮\"}");
 
         ComputerUseGroundingService.GroundingOutcome outcome =
                 service.ground(capture(), "保存按钮", null);
 
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.PARSE_FAILED);
-        assertThat(outcome.xPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
     }
 
     @Test
@@ -201,36 +204,50 @@ class ComputerUseGroundingServiceTest {
 
         assertThat(outcome.status()).isEqualTo(ComputerUseGroundingService.Status.CALL_FAILED);
         assertThat(outcome.errorMessage()).contains("调用视觉模型失败");
-        assertThat(outcome.xPercent()).isNull();
+        assertThat(outcome.xPixels()).isNull();
     }
 
     @Test
-    @DisplayName("prompt 要求结构化 JSON + 百分比坐标（模板契约）")
-    void promptDemandsStructuredPercentJson() {
-        String prompt = ComputerUseGroundingService.PROMPT_TEMPLATE.formatted("保存按钮");
+    @DisplayName("prompt 要求结构化 JSON + 图像像素坐标（模板契约）")
+    void promptDemandsStructuredPixelJson() {
+        String prompt = ComputerUseGroundingService.PROMPT_TEMPLATE.formatted(
+                "保存按钮", 1456, 819, 1455, 818);
 
         assertThat(prompt).contains("\"found\": true");
         assertThat(prompt).contains("\"x\": 0, \"y\": 0");
-        assertThat(prompt).contains("百分比");
-        assertThat(prompt).contains("0 到 100");
+        assertThat(prompt).contains("像素坐标");
         assertThat(prompt).contains("保存按钮");
+        assertThat(prompt).as("⛔ 必须明确禁止输出百分比（否则模型会按 0-100 回）")
+                .contains("不要输出百分比");
     }
 
     @Test
-    @DisplayName("五种失败的错误文案互不相同（模型要能据此自纠）")
+    @DisplayName("各类失败的错误文案互不相同（模型要能据此自纠）")
     void failureMessagesAreDistinguishable() {
         String notFound = new ComputerUseGroundingService.GroundingOutcome(
-                ComputerUseGroundingService.Status.NOT_FOUND, null, null, "T", null).errorMessage();
+                ComputerUseGroundingService.Status.NOT_FOUND, null, null, null, null, "T", null)
+                .errorMessage();
         String parseFailed = new ComputerUseGroundingService.GroundingOutcome(
-                ComputerUseGroundingService.Status.PARSE_FAILED, null, null, "T", null).errorMessage();
+                ComputerUseGroundingService.Status.PARSE_FAILED, null, null, null, null, "T", null)
+                .errorMessage();
         String outOfRange = new ComputerUseGroundingService.GroundingOutcome(
-                ComputerUseGroundingService.Status.OUT_OF_RANGE, null, null, "T", "x=180").errorMessage();
+                ComputerUseGroundingService.Status.OUT_OF_RANGE, null, null, null, null, "T", "x=180")
+                .errorMessage();
+        String percentMismatch = new ComputerUseGroundingService.GroundingOutcome(
+                ComputerUseGroundingService.Status.PERCENT_PIXEL_MISMATCH,
+                null, null, null, null, "T", "x=1 y=2").errorMessage();
+        String targetMismatch = new ComputerUseGroundingService.GroundingOutcome(
+                ComputerUseGroundingService.Status.TARGET_MISMATCH, null, null, null, null, "T", "a vs b")
+                .errorMessage();
         String unavailable = new ComputerUseGroundingService.GroundingOutcome(
-                ComputerUseGroundingService.Status.MODEL_UNAVAILABLE, null, null, "T", "no key").errorMessage();
+                ComputerUseGroundingService.Status.MODEL_UNAVAILABLE, null, null, null, null, "T", "no key")
+                .errorMessage();
         String callFailed = new ComputerUseGroundingService.GroundingOutcome(
-                ComputerUseGroundingService.Status.CALL_FAILED, null, null, "T", "boom").errorMessage();
+                ComputerUseGroundingService.Status.CALL_FAILED, null, null, null, null, "T", "boom")
+                .errorMessage();
 
-        assertThat(List.of(notFound, parseFailed, outOfRange, unavailable, callFailed))
+        assertThat(List.of(notFound, parseFailed, outOfRange, percentMismatch, targetMismatch,
+                unavailable, callFailed))
                 .doesNotHaveDuplicates();
     }
 }

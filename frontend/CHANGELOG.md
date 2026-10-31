@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.65] - 2026-10-31
+
+### Added
+
+- computer-use：桌面控制工具（35 个，工具名 `mcp__computer-use__*`）+ 授权审批面板（面板里显示每个应用被授权到什么程度；授权信息缺失时直接拒绝放行，不会盲授权）。
+- 浏览器工具的截图现在真正进入模型上下文（此前只回一个本地文件路径指针，模型看不到画面）。
+
 ## [0.1.64] - 2026-10-28
 
 ### Added

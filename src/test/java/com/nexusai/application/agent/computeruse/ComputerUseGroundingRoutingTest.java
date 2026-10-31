@@ -163,10 +163,10 @@ class ComputerUseGroundingRoutingTest {
     }
 
     @Test
-    @DisplayName("主模型确定不支持 + 降级开启 ⇒ 走 grounding ⇒ 回【百分比坐标文本】，不回图")
-    void unsupportedVisionGroundsAndReturnsPercentText() {
+    @DisplayName("主模型确定不支持 + 降级开启 ⇒ 走 grounding ⇒ 回【图像像素坐标文本】，不回图")
+    void unsupportedVisionGroundsAndReturnsPixelText() {
         FakeCapturer capturer = new FakeCapturer();
-        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 12.5, \"y\": 40, \"target\": \"保存按钮\"}");
+        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 728, \"y\": 409, \"target\": \"保存按钮\"}");
         ComputerUseScreenshotTool tool = new ComputerUseScreenshotTool(
                 capturer, new ComputerUseGeometryStore(), unsupported(), vision.service());
 
@@ -178,9 +178,9 @@ class ComputerUseGroundingRoutingTest {
         assertThat(data).isInstanceOf(String.class);
         String text = data.toString();
         assertThat(text).contains("保存按钮");
-        assertThat(text).contains("12.5");
-        assertThat(text).contains("40");
-        assertThat(text).contains("百分比");
+        assertThat(text).contains("728");
+        assertThat(text).contains("409");
+        assertThat(text).contains("图像像素坐标");
         assertThat(text).as("必须提示这是二手定位（误差预期提示）").contains("偏差");
         assertThat(vision.calls).isEqualTo(1);
     }
@@ -268,25 +268,25 @@ class ComputerUseGroundingRoutingTest {
     // ─────────────────────────── 点击工具 · 降级态换算 ───────────────────────────
 
     @Test
-    @DisplayName("降级态：点击按【百分比】换算（12.5% / 40% → 屏幕 240 / 432）")
-    void clickInGroundingModeUsesNormalizedCoordinates() {
+    @DisplayName("降级态：点击按【像素】换算（728 / 409.5 → 屏幕 960 / 540）")
+    void clickInGroundingModeUsesPixelCoordinates() {
         ComputerUseGeometryStore store = new ComputerUseGeometryStore();
         store.put(SESSION, new ComputerUseScreenshotGeometry(1456, 819, 1920, 1080, 0, 0));
         RecordingMouse mouse = new RecordingMouse();
-        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 12.5, \"y\": 40}");
+        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 728, \"y\": 409}");
         ComputerUseLeftClickTool tool = new ComputerUseLeftClickTool(
                 new FakeCapturer(), mouse, store, ComputerUseCoordinateMode.PIXELS, null, null,
                 unsupported(), vision.service());
 
         ObjectNode input = JSON.createObjectNode();
-        input.putArray("coordinate").add(12.5d).add(40d);
+        input.putArray("coordinate").add(728d).add(409.5d);
         var result = tool.execute(new ToolUseBlock("call-1", tool.name(), input),
                 ctxWithModel("deepseek/deepseek-chat"));
 
         assertThat(((ToolResult<?>) result).data()).isEqualTo("Clicked.");
         assertThat(mouse.clicks).hasSize(1);
-        // 12.5% * 1920 = 240；40% * 1080 = 432
-        assertThat(mouse.clicks.get(0)).containsExactly(240, 432);
+        // pixels 态：728 × (1920/1456) = 960；409.5 × (1080/819) = 540
+        assertThat(mouse.clicks.get(0)).containsExactly(960, 540);
     }
 
     @Test
@@ -295,13 +295,13 @@ class ComputerUseGroundingRoutingTest {
         ComputerUseGeometryStore store = new ComputerUseGeometryStore();
         store.put(SESSION, new ComputerUseScreenshotGeometry(1456, 819, 1920, 1080, 0, 0));
         RecordingMouse mouse = new RecordingMouse();
-        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 12.5, \"y\": 40}");
+        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 728, \"y\": 409}");
         ComputerUseLeftClickTool tool = new ComputerUseLeftClickTool(
                 new FakeCapturer(), mouse, store, ComputerUseCoordinateMode.PIXELS, null, null,
                 unsupported(), vision.service());
 
         ObjectNode input = JSON.createObjectNode();
-        input.putArray("coordinate").add(12.5d).add(40d);
+        input.putArray("coordinate").add(728d).add(409.5d);
         tool.execute(new ToolUseBlock("call-1", tool.name(), input),
                 ctxWithModel("deepseek/deepseek-chat"));
 
@@ -334,13 +334,13 @@ class ComputerUseGroundingRoutingTest {
     @DisplayName("降级态但无截图快照 ⇒ 保守不放行（不猜坐标）")
     void clickInGroundingModeWithoutSnapshotFailsLoud() {
         RecordingMouse mouse = new RecordingMouse();
-        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 12.5, \"y\": 40}");
+        FakeVision vision = new FakeVision("{\"found\": true, \"x\": 728, \"y\": 409}");
         ComputerUseLeftClickTool tool = new ComputerUseLeftClickTool(
                 new FakeCapturer(), mouse, new ComputerUseGeometryStore(),
                 ComputerUseCoordinateMode.PIXELS, null, null, unsupported(), vision.service());
 
         ObjectNode input = JSON.createObjectNode();
-        input.putArray("coordinate").add(12.5d).add(40d);
+        input.putArray("coordinate").add(728d).add(409.5d);
         var result = tool.execute(new ToolUseBlock("call-1", tool.name(), input),
                 ctxWithModel("deepseek/deepseek-chat"));
 

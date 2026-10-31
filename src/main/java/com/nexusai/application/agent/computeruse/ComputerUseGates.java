@@ -14,7 +14,8 @@ import org.slf4j.LoggerFactory;
  * （{@code nexusai.computer-use.grounding-fallback-enabled}，默认 <b>false</b>）——
  * <b>CCB 无对应</b>（CCB 的 computer-use 假定主模型恒为能看图的 Claude）。
  * 打开后：主模型<b>确定不支持</b>视觉时，截图工具改走
- * {@link ComputerUseGroundingService}（视觉模型 grounding ⇒ 归一化百分比坐标），
+ * {@link ComputerUseGroundingService}（视觉模型 grounding ⇒ <b>图像像素坐标</b>，
+ * 与主链路的 {@code pixels} 模式同制式 ⇒ <b>不改变坐标模式</b>），
  * 而不是直接报错。
  *
  * <p><b>CCB 原形状</b>：
@@ -128,18 +129,47 @@ public class ComputerUseGates {
      *
      * <p><b>WHY 需要</b>：主模型不支持视觉时，CU 截图对它是「黑盒」⇒ 点击坐标没有来源。
      * 打开本开关 ⇒ 截图工具改走 {@link ComputerUseGroundingService}：把截图交给本仓配置的
-     * 视觉模型（{@code settings.multimodal_model_name}）定位目标，回<b>归一化百分比坐标</b>。
+     * 视觉模型（{@code settings.multimodal_model_name}）定位目标，回<b>图像像素坐标</b>。
+     *
+     * <p><b>⭐ 开启后【不再】改变坐标模式</b>：降级路径与主路径<b>统一用 {@code pixels}</b> ——
+     * 模型看到的那张图就是 CU 送出的那张缩放图 ⇒ 它回的「图上像素」天然就是 CCB
+     * {@code pixels} 制式（{@code tools.ts:22-23}）⇒ 无需再切成百分比
+     * （2026-10-31 用户裁定：视觉模型是多模态的，应像主模型一样走 pixels 模式）。
      *
      * <p><b>默认 false</b>：①CCB 无此路径（默认行为应对齐）；②降级路径的定位精度取决于
      * 视觉模型，<b>默认关</b> ⇒ 生产语义不变（视觉闸判「确定不支持」时仍 fail loud 报错）。
-     *
-     * <p><b>开启后的连带效应</b>：降级路径只能用百分比坐标 ⇒ 装配层会把坐标模式
-     * <b>强制</b>切到 {@code normalized_0_100}（见
-     * {@code ComputerUseToolConfig#computerUseTools}）—— 否则「工具描述说像素、实际按百分比
-     * 换算」会让模型点错位置（CCB {@code tools.ts:5-10} 的「描述与换算必须同源」不变量）。
      */
     @Value("${nexusai.computer-use.grounding-fallback-enabled:false}")
     private boolean groundingFallbackEnabled;
+
+    /**
+     * 护栏② · <b>点击前落点校验</b>开关（<b>本仓特有</b> · CCB 无对应）。
+     *
+     * <p>默认 <b>true</b>：对 grounding 降级路径的落点区域做二次截图比对，
+     * 差异超阈值 ⇒ 拒绝点击。⚠️ 无 GUI 环境（headless / CI）可置 false。
+     */
+    @Value("${nexusai.computer-use.grounding-region-verify-enabled:true}")
+    private boolean groundingRegionVerifyEnabled;
+
+    /** 护栏② · 比对区域边长（<b>图像像素</b>；默认 60）。 */
+    @Value("${nexusai.computer-use.grounding-region-size:60}")
+    private int groundingRegionSize;
+
+    /** 护栏② · 平均绝对差（MAD）阈值（灰度 0–255；默认 15）。 */
+    @Value("${nexusai.computer-use.grounding-region-mad-threshold:15.0}")
+    private double groundingRegionMadThreshold;
+
+    /** 护栏② · 差异像素占比阈值（0.0–1.0；默认 0.35）。 */
+    @Value("${nexusai.computer-use.grounding-region-diff-ratio-threshold:0.35}")
+    private double groundingRegionDiffRatioThreshold;
+
+    /** 护栏③ · 系统性偏移补偿 X（<b>屏幕物理像素</b>；默认 0 = 不启用）。 */
+    @Value("${nexusai.computer-use.grounding-offset-x:0.0}")
+    private double groundingOffsetX;
+
+    /** 护栏③ · 系统性偏移补偿 Y（<b>屏幕物理像素</b>；默认 0 = 不启用）。 */
+    @Value("${nexusai.computer-use.grounding-offset-y:0.0}")
+    private double groundingOffsetY;
 
     /**
      * 冻结后的坐标模式（首次读取即冻结 · CCB {@code gates.ts:66-72} 的
@@ -238,5 +268,36 @@ public class ComputerUseGates {
      */
     public boolean groundingFallbackEnabled() {
         return groundingFallbackEnabled;
+    }
+
+    /**
+     * 护栏② · 落点校验参数（组装成 {@link ComputerUseRegionVerifyConfig} 交给点击工具）。
+     *
+     * @return 护栏② 参数
+     */
+    public ComputerUseRegionVerifyConfig regionVerifyConfig() {
+        return new ComputerUseRegionVerifyConfig(
+                groundingRegionVerifyEnabled,
+                groundingRegionSize,
+                groundingRegionMadThreshold,
+                groundingRegionDiffRatioThreshold);
+    }
+
+    /**
+     * 护栏③ · 系统性偏移补偿 X（<b>屏幕物理像素</b>；0 = 不启用）。
+     *
+     * @return 偏移 X
+     */
+    public double groundingOffsetX() {
+        return groundingOffsetX;
+    }
+
+    /**
+     * 护栏③ · 系统性偏移补偿 Y（<b>屏幕物理像素</b>；0 = 不启用）。
+     *
+     * @return 偏移 Y
+     */
+    public double groundingOffsetY() {
+        return groundingOffsetY;
     }
 }
