@@ -126,6 +126,32 @@ public class McpToolPool {
     private final Map<String, JsonRpcMcpClient.Capabilities> serverCapabilities = new ConcurrentHashMap<>();
 
     /**
+     * [CU-MCP] 会话型内建 MCP server 名单 · 这些 server 的 {@code tools/call} 请求会随带
+     * {@link McpCallContext} 信封（sessionId / agentId / 模型名）。
+     *
+     * <p><b>WHY</b>：MCP {@code tools/call} 的 params 只有 {@code name} + {@code arguments}
+     * （无会话标识）。computer-use 的工具实现必须拿到 {@code ToolUseContext}
+     * （{@code ctx.sessionId()} 决定授权位 / 几何快照分桶，
+     * {@code ctx.effectiveModelName()} 决定视觉能力闸）⇒ 需显式透传会话态
+     * （对齐本仓铁律「会话态一律显式传参，不经 ThreadLocal/MDC」）。
+     * <br>外部 MCP server <b>不</b>登记 ⇒ 走标准 params ⇒ 对第三方零影响。
+     */
+    private final java.util.Set<String> sessionAwareServers = ConcurrentHashMap.newKeySet();
+
+    /**
+     * [CU-MCP] per-server 权限自决委托表 · server 名 → (裸工具名 → 委托工具)。
+     *
+     * <p><b>WHY</b>：{@link McpServerTool#checkPermissions} 默认恒返 {@code Passthrough}
+     * （⇒ 第 3 层转 Ask ⇒ 弹窗）。computer-use 的免弹窗语义要求
+     * 「CU 工具放行 + {@code request_access} 仍走 Ask」⇒ 必须把权限自决<b>交回底层工具</b>
+     * （底层 CU 工具自表态：普通工具 {@code Allow}、{@code request_access} {@code Passthrough}）。
+     * <br>⛔ <b>不用 allow rule 实现</b>：{@code CheckLayer2b_ToolAlwaysAllowed} 是
+     * 「首个命中即返回、无 deny 优先」⇒ 给 {@code mcp__computer-use__*} 注入 allow rule
+     * 会把 {@code request_access} 一起放行（授权唯一入口失效）。
+     */
+    private final Map<String, Map<String, Tool>> serverToolPermissionDelegates = new ConcurrentHashMap<>();
+
+    /**
      * [RES-L2 · C8] per-server instructions · 对齐 CC {@code ConnectedMCPServer.instructions}
      * (types.ts:189) + {@code client.getInstructions()} (client.ts:1160).
      *
@@ -2033,13 +2059,86 @@ public class McpToolPool {
     static final int MAX_SESSION_RETRIES = 1;
 
     /**
+     * 登记会话型内建 MCP server · 其 {@code tools/call} 请求会随带 {@link McpCallContext} 信封。
+     *
+     * @param serverName server 名（如 {@code computer-use}）
+     */
+    public void registerSessionAwareServer(String serverName) {
+        if (serverName == null || serverName.isBlank()) {
+            throw new IllegalArgumentException("serverName is required");
+        }
+        sessionAwareServers.add(serverName);
+        log.info("[McpToolPool] 登记会话型 MCP server: {}", serverName);
+    }
+
+    /**
+     * 判定 server 是否为会话型（{@code tools/call} 带会话信封）。
+     *
+     * @param serverName server 名
+     * @return true = 会话型
+     */
+    public boolean isSessionAwareServer(String serverName) {
+        return serverName != null && sessionAwareServers.contains(serverName);
+    }
+
+    /**
+     * 登记 per-tool 权限自决委托 · 该 server 的该工具的 {@code checkPermissions}
+     * 交回委托工具自表态（对齐 {@code CheckLayer1c_ToolCheck} 的「工具自决」通道）。
+     *
+     * @param serverName server 名
+     * @param toolName   <b>裸</b>工具名（如 {@code request_access}；不含 {@code mcp__server__} 前缀）
+     * @param delegate   委托工具（其 {@code checkPermissions} 会被调用）
+     */
+    public void registerToolPermissionDelegate(String serverName, String toolName, Tool delegate) {
+        if (serverName == null || serverName.isBlank() || toolName == null || toolName.isBlank()) {
+            throw new IllegalArgumentException("serverName / toolName are required");
+        }
+        if (delegate == null) {
+            throw new IllegalArgumentException("delegate is required");
+        }
+        serverToolPermissionDelegates
+                .computeIfAbsent(serverName, k -> new ConcurrentHashMap<>())
+                .put(toolName, delegate);
+        log.info("[McpToolPool] 登记权限自决委托: server={} tool={}", serverName, toolName);
+    }
+
+    /**
+     * 取 per-tool 权限自决委托。
+     *
+     * @param serverName server 名
+     * @param toolName   裸工具名
+     * @return 委托工具；未登记 ⇒ null
+     */
+    public Tool resolvePermissionDelegate(String serverName, String toolName) {
+        Map<String, Tool> byTool = serverToolPermissionDelegates.get(serverName);
+        return byTool == null ? null : byTool.get(toolName);
+    }
+
+    /**
      * 调用 MCP 工具 (CC client.ts tools/call) · 对齐 CC call() 主循环的
      * MAX_SESSION_RETRIES=1 同调用内会话过期重试（client.ts:1859-1922）。
      *
      * @return 服务端 isError + content blocks (对齐 CC CallToolResult)
      */
     public CompletableFuture<JsonNode> callTool(String serverName, String toolName, Map<String, Object> args) {
-        return callToolAttempt(serverName, toolName, args == null ? Map.of() : args, 0);
+        return callToolAttempt(serverName, toolName, args == null ? Map.of() : args, 0, null);
+    }
+
+    /**
+     * 调用 MCP 工具（会话型 server）· 请求随带 {@link McpCallContext} 信封。
+     *
+     * <p>信封放在 {@code tools/call} params 的<b>同级</b>键（{@link McpCallContext#PARAM_NAME}），
+     * <b>不塞进 {@code arguments}</b> ⇒ 工具入参 schema 保持纯净。
+     *
+     * @param serverName  MCP server 名
+     * @param toolName    工具名
+     * @param args        工具入参
+     * @param callContext 会话信封（null ⇒ 不带）
+     * @return 服务端 isError + content blocks
+     */
+    public CompletableFuture<JsonNode> callTool(String serverName, String toolName, Map<String, Object> args,
+                                                 McpCallContext callContext) {
+        return callToolAttempt(serverName, toolName, args == null ? Map.of() : args, 0, callContext);
     }
 
     /**
@@ -2058,10 +2157,12 @@ public class McpToolPool {
      * @param toolName   工具名
      * @param args       工具参数（已保证非 null）
      * @param attempt    当前尝试序号（0 起；会话过期重试时递增）
+     * @param callContext 会话信封（null ⇒ 不带；会话型 server 才有）
      * @return tools/call 结果 future（同调用重试在内部串行完成后以最终结果/最终错误完成）
      */
     private CompletableFuture<JsonNode> callToolAttempt(String serverName, String toolName,
-                                                        Map<String, Object> args, int attempt) {
+                                                        Map<String, Object> args, int attempt,
+                                                        McpCallContext callContext) {
         McpTransport transport;
         try {
             // [impl-I-4 T1] 改走 ensureConnectedClient：CLOSED/会话过期 → 惰性重连；
@@ -2079,10 +2180,14 @@ public class McpToolPool {
         // 不关闭 transport（CC 语义 client.ts:3073-3089）。
         long timeoutMs = effectiveToolTimeoutMs();
         long progressIntervalMs = effectiveProgressLogIntervalMs();
-        CompletableFuture<JsonNode> callFuture = transport.sendRequest("tools/call", Map.of(
-            "name", toolName,
-            "arguments", args
-        ));
+        Map<String, Object> callParams = new java.util.LinkedHashMap<>();
+        callParams.put("name", toolName);
+        callParams.put("arguments", args);
+        if (callContext != null) {
+            // [CU-MCP] 会话信封放在 params 同级键（不污染 arguments ⇒ 工具入参 schema 纯净）
+            callParams.put(McpCallContext.PARAM_NAME, callContext.toWire());
+        }
+        CompletableFuture<JsonNode> callFuture = transport.sendRequest("tools/call", callParams);
         CompletableFuture<JsonNode> timeoutFuture = new CompletableFuture<>();
         ScheduledFuture<?> timeoutTask = toolCallScheduler.schedule(() ->
             timeoutFuture.completeExceptionally(new IllegalStateException(
@@ -2115,7 +2220,7 @@ public class McpToolPool {
                         // 对齐 CC client.ts:1913-1922：attempt < MAX_SESSION_RETRIES → continue 重试
                         log.info("[McpToolPool] {} 会话过期（404+-32001），已清连接缓存，同调用内重试 "
                             + "attempt#{}→{} tool={}", serverName, attempt, attempt + 1, toolName);
-                        return callToolAttempt(serverName, toolName, args, attempt + 1);
+                        return callToolAttempt(serverName, toolName, args, attempt + 1, callContext);
                     }
                     log.info("[McpToolPool] {} 会话过期重试仍失败（attempt={} 已达 MAX_SESSION_RETRIES={}），"
                         + "抛原错误 tool={}", serverName, attempt, MAX_SESSION_RETRIES, toolName);
@@ -3080,7 +3185,10 @@ public class McpToolPool {
         // 保留真实工具名）；stdio/sdk → command 为可执行名 → normalizeOfficial → null → 非官方 fail-closed。
         McpTransport.TransportConfig cfg = serverConfigs.get(serverName);
         String serverUrl = cfg != null ? cfg.command() : null;
+        // [CU-MCP] 权限自决委托（内建 server 用）· 未登记 ⇒ null ⇒ McpServerTool 保持
+        // 「Passthrough → Ask」的默认 MCP 语义（外部 server 行为零变化）。
+        Tool permissionDelegate = resolvePermissionDelegate(serverName, toolName);
         return new McpServerTool(serverName, toolName, mcpToolName, inputSchema,
-            annotations, meta, description, serverUrl, this);
+            annotations, meta, description, serverUrl, this, permissionDelegate);
     }
 }

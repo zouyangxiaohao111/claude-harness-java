@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.computeruse;
 
+import com.nexusai.application.agent.mcp.McpStringUtils;
 /**
  * {@code mcp__computer-use__right_click} · 右键工具（对齐 CCB 2.8.4
  * {@code packages/@ant/computer-use-mcp/src/tools.ts:285-297}）。
@@ -35,7 +36,8 @@ package com.nexusai.application.agent.computeruse;
 public final class ComputerUseRightClickTool extends ComputerUseClickVariantTool {
 
     /** 工具全名 · CCB {@code setup.ts:17-21} 要求固定为 {@code mcp__computer-use__<tool>}。 */
-    public static final String TOOL_NAME = "mcp__computer-use__right_click";
+    public static final String TOOL_NAME = McpStringUtils.buildMcpToolName(
+            ComputerUseMcpServer.SERVER_NAME, "right_click");
 
     /** 工具描述 · 逐字对齐 CCB {@code tools.ts:287}。 */
     private static final String DESCRIPTION = buildDescription(

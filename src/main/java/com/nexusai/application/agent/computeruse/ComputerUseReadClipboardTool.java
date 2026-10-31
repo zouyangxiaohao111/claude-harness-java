@@ -3,6 +3,7 @@ package com.nexusai.application.agent.computeruse;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.mcp.McpStringUtils;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.tool.AgentToolResult;
@@ -63,7 +64,8 @@ public final class ComputerUseReadClipboardTool implements Tool {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** 工具全名 · CCB {@code setup.ts:17-21} 要求固定为 {@code mcp__computer-use__<tool>}。 */
-    public static final String TOOL_NAME = "mcp__computer-use__read_clipboard";
+    public static final String TOOL_NAME = McpStringUtils.buildMcpToolName(
+            ComputerUseMcpServer.SERVER_NAME, "read_clipboard");
 
     /** 工具描述 · 逐字对齐 CCB {@code tools.ts:874-875}。 */
     private static final String DESCRIPTION =

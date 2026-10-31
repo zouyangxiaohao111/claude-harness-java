@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.computeruse;
 
+import java.util.Arrays;
+import java.util.Comparator;
 import java.util.HashSet;
 import java.util.Set;
 
@@ -21,22 +23,51 @@ import java.util.Set;
  * <br><b>WHY 需要</b>：PoC 真机实测（2026-10-31）—— 请求用英文、模型回填中文
  * （"关闭"）时，<b>字符级相似度恒为 0</b> ⇒ 护栏会把「找对了」的定位误判为失败
  * （实测 7 次成功采样里被误拦 1 次）⇒ 跨语言同义词展开后，语义相同即放行。
- * <p><b>通过</b>（任一成立）：
+ *
+ * <p><b>按顺序判定</b>（先命中先返回）：
  * <ol>
- *   <li><b>相等</b>：归一化 + 展开后两串完全相同；</li>
- *   <li><b>方向性豁免</b>：模型回填的串是<b>请求串的子串</b>且长度 ≥
- *       {@value #MIN_ABBREVIATION_LEN} —— 典型场景：请求「记事本右上角的最小化按钮」、
- *       模型回填「最小化」⇒ <b>同一个目标</b>的简称 ⇒ 放行；</li>
- *   <li><b>字符集合 Jaccard ≥ {@value #JACCARD_THRESHOLD}</b>（{@link #jaccard(String, String)}）。</li>
+ *   <li><b>规则 A · 相等</b>：归一化 + 展开后两串完全相同 ⇒ 通过；</li>
+ *   <li><b>规则 0 · 互斥语义</b>：模型回填的串里出现了<b>请求里没有的另一个控件语义词</b>
+ *       ⇒ <b>判错控件</b> ⇒ <b>失败</b>（例：请求「确定」/ 回填「确定取消」⇒ 引入 cancel 语义 ⇒ 拦下）；
+ *       <br>⭐ 这一条是<b>互斥语义的守门人</b>（「关闭」vs「最小化」vs「最大化」必须仍能区分）；</li>
+ *   <li><b>规则 B · 简称豁免（单向）</b>：模型回填的串是<b>请求串的子串</b>且长度 ≥
+ *       {@value #MIN_ABBREVIATION_LEN} ⇒ 通过（典型：请求「记事本右上角的最小化按钮」、
+ *       模型回填「最小化」⇒ 同一个目标的简称）；</li>
+ *   <li><b>规则 C · 核心词覆盖</b>（2026-11-01 新增 · 修<b>假阴性</b>）—— 见下节；</li>
+ *   <li><b>规则 D · 字符集合 Jaccard ≥ {@value #JACCARD_THRESHOLD}</b>
+ *       （{@link #jaccard(String, String)}）⇒ 通过。</li>
  * </ol>
  * <p><b>不通过</b>（⇒ fail loud）：以上都不成立。
  *
- * <h2>WHY 豁免是【单向】的（重要）</h2>
- * <p>规则 ② 只豁免「<b>模型回填得比请求更短</b>」的方向；反方向（模型回填得<b>更长</b>，
- * 如请求「确定」而模型回填「确定取消」）<b>不豁免</b> ⇒ 只能靠规则 ③ 的 Jaccard 过 ⇒
- * 「确定」/「确定取消」的 Jaccard = 2/4 = 0.5 &lt; {@value #JACCARD_THRESHOLD} ⇒ <b>拦下</b>。
- * <p>理由：模型回填得<b>更长</b>通常意味着它匹配到的是一个<b>更大的复合元素</b>
- * （例如请求「关闭」却匹配到「关闭所有标签页」），那正是「指错相邻控件」的形态 ⇒ 宁可失败。
+ * <h2>规则 C · 核心词覆盖（2026-11-01 新增 · 修假阴性）</h2>
+ * <p><b>WHY（实测缺陷）</b>：2026-11-01 真机端到端实测（原图组 10 次采样）里，
+ * <b>3 次有效定位被护栏① 误拦</b>（{@code TARGET_MISMATCH}）—— <b>白丢 3 次有效定位</b>。
+ * <br>典型实例：请求「<b>记事本窗口标题栏最右侧的关闭按钮</b>」vs 模型回填「<b>记事本窗口关闭按钮</b>」
+ * ⇒ <b>语义完全正确</b>（模型只是<b>省略了方位修饰</b>），却被规则 B（子串不成立：请求中间多了
+ * 「标题栏最右侧的」）与规则 D（Jaccard ≈ 0.55 &lt; 0.6）<b>双双拦下</b>。
+ *
+ * <p><b>规则内容（可解释 · 逐条）</b>：
+ * <ol>
+ *   <li><b>前提</b>：两边的<b>控件语义词集合完全相同且非空</b>
+ *       （{@link #controlConcepts(String)}）⇒ <b>模型指的必然是同一个控件</b>
+ *       （互斥语义已被规则 0 拦死 ⇒ 这里不可能是「关闭 vs 最小化」那种错控件）；</li>
+ *   <li><b>核心串</b>：把归一化串里的<b>弱化词</b>剥掉（{@link #stripIgnorable(String)}）——
+ *       弱化词 = <b>容器 / 区域</b>（窗口、界面、屏幕、标题栏、菜单栏、工具栏、状态栏、标签栏、
+ *       面板、页面、对话框、弹窗、区域、边框）+ <b>方位 / 位置</b>（最右侧、最左侧、右上角、左上角、
+ *       右下角、左下角、右侧、左侧、上方、下方、顶部、底部、中间、里面、内部、外部、附近、旁边 …）
+ *       + <b>语气 / 动作</b>（点击、单击、双击、帮我、请、我想要、需要、麻烦 …）
+ *       + <b>助词</b>（的、了、着）⇒ 这些词<b>只描述「在哪 / 怎么点」，不改变「是哪个控件」</b>；</li>
+ *   <li><b>判定</b>：<b>核心串(回填) ⊆ 核心串(请求)</b>（<b>单向</b>：回填不得比请求多出核心内容）
+ *       ⇒ 通过。</li>
+ * </ol>
+ *
+ * <p><b>WHY 单向</b>：与规则 B 同款理由 —— 回填比请求<b>长</b>通常意味着它匹配到的是一个
+ * <b>更大的复合元素</b>（请求「关闭」却回填「关闭所有标签页」）⇒ 那正是「指错相邻控件」的形态
+ * ⇒ 宁可失败。
+ *
+ * <p><b>WHY 不下调 Jaccard 阈值</b>：阈值下调到 0 会让「完全不同语义的串」也蒙混过关
+ * （例：请求「关闭」/ 回填「关闭所有标签页」字符集合高度重合）。规则 C 是<b>有解释的定向放宽</b>
+ * （剥掉弱化词后比较核心），不是把闸门整体放松 ⇒ {@link #JACCARD_THRESHOLD} <b>保持 0.6 不变</b>。
  *
  * <p><b>与 CCB 的差异</b>：CCB 2.8.4 <b>没有</b> grounding 服务、也没有这条一致性检查
  * ⇒ 属<b>本仓增强</b>。
@@ -46,9 +77,10 @@ public final class ComputerUseGroundingTargetMatch {
     /**
      * 字符集合 Jaccard 阈值 · {@value}。
      *
-     * <p><b>取值依据</b>：请求「确定」/ 模型回填「确定取消」⇒ Jaccard = |{确,定}| / |{确,定,取,消}|
-     * = 2/4 = 0.5 ⇒ 必须被拦下 ⇒ 阈值须 &gt; 0.5；而请求「保存按钮」/ 模型回填「保存按钮图标」
-     * ⇒ 走规则 ②（子串豁免）不依赖本阈值 ⇒ 取 0.6（留 0.1 的安全余量给「同义改写」）。
+     * <p><b>取值依据</b>：请求「确定」/ 模型回填「确定取消」⇒ 回填引入 cancel 语义 ⇒ 由
+     * <b>规则 0</b> 拦下（⛔ 不依赖本阈值）；本阈值负责兜住「<b>没有控件语义词</b>的领域专有名词」
+     * （例：请求「提交订单」/ 回填「提交订单确认」）。
+     * <br>取 0.6：留 0.1 的安全余量给「同义改写」；<b>2026-11-01 未下调</b>（假阴性改由规则 C 定向修）。
      */
     public static final double JACCARD_THRESHOLD = 0.6d;
 
@@ -93,6 +125,36 @@ public final class ComputerUseGroundingTargetMatch {
             {"zoom", "放大"},
     };
 
+    /**
+     * <b>弱化词</b>表（规则 C 用）· 只描述「在哪 / 怎么点」，<b>不改变「是哪个控件」</b>。
+     *
+     * <p>⚠️ 边界：<b>不</b>包含任何<b>控件语义词</b>（关闭 / 最小化 / 最大化 / 保存 …）⇒
+     * 剥弱化词<b>不会</b>把「关闭按钮」削成「最小化按钮」那种 ⇒ 互斥语义始终可区分。
+     */
+    private static final String[] IGNORABLE_WORDS = {
+            // ── 容器 / 区域 ──
+            "标题栏", "菜单栏", "工具栏", "状态栏", "标签栏",
+            "对话框", "弹窗", "窗口", "界面", "屏幕", "页面", "面板", "区域", "边框",
+            // ── 方位 / 位置 ──
+            "最右侧", "最左侧", "最上面", "最下面",
+            "右上角", "左上角", "右下角", "左下角",
+            "右侧", "左侧", "上方", "下方", "顶部", "底部",
+            "中间", "里面", "内部", "外部", "附近", "旁边",
+            "上面", "下面", "左边", "右边",
+            // ── 语气 / 动作 ──
+            "点击", "单击", "双击", "按一下", "点一下", "按下",
+            "帮我", "我想要", "需要", "麻烦", "请", "这个", "那个", "一个",
+            // ── 助词 ──
+            "的", "了", "着",
+    };
+
+    /**
+     * 弱化词表（<b>按长度降序</b>）· 保证「最长匹配优先」。
+     *
+     * <p>WHY 要排序：先剥「最右侧」再剥「右侧」，否则「最右侧」会被削成「最」留下残渣。
+     */
+    private static final String[] IGNORABLE_WORDS_LONGEST_FIRST = buildLongestFirst();
+
     private ComputerUseGroundingTargetMatch() {
         throw new AssertionError("utility class");
     }
@@ -115,6 +177,7 @@ public final class ComputerUseGroundingTargetMatch {
             // 有一边归一化后为空 ⇒ 无法判定 ⇒ 保守判不一致（fail loud，绝不放行）
             return false;
         }
+        // ── 规则 A：完全相等 ──
         if (r.equals(e)) {
             return true;
         }
@@ -123,17 +186,93 @@ public final class ComputerUseGroundingTargetMatch {
         Set<String> requestGroups = controlConcepts(rRaw);
         Set<String> echoGroups = controlConcepts(eRaw);
         if (!requestGroups.isEmpty() && !echoGroups.isEmpty()) {
-            Set<String> extra = new java.util.HashSet<>(echoGroups);
+            Set<String> extra = new HashSet<>(echoGroups);
             extra.removeAll(requestGroups);
             if (!extra.isEmpty()) {
                 return false;
             }
         }
+        // ── 规则 B：方向性豁免（模型回填的是请求的子串 = 同一目标的简称 / 局部名）──
         if (e.length() >= MIN_ABBREVIATION_LEN && r.contains(e)) {
-            // 方向性豁免：模型回填的是请求的子串（同一目标的简称 / 局部名）
             return true;
         }
+        // ── 规则 C：核心词覆盖（剥掉弱化词后比较核心控件词）──
+        if (coreCovered(requestGroups, echoGroups, r, e)) {
+            return true;
+        }
+        // ── 规则 D：字符集合 Jaccard ──
         return jaccard(r, e) >= JACCARD_THRESHOLD;
+    }
+
+    /**
+     * 规则 C 的判定。
+     *
+     * <p><b>前提</b>：两边的控件语义词集合<b>完全相同且非空</b> ⇒ 模型指的必然是同一个控件
+     * （互斥语义已在规则 0 拦下 ⇒ 这里只可能是「同一个控件的不同措辞」）。
+     * <p><b>判定</b>：剥掉弱化词后的<b>核心串(回填) ⊆ 核心串(请求)</b>（单向）。
+     *
+     * @param requestGroups 请求命中的控件语义词
+     * @param echoGroups    回填命中的控件语义词
+     * @param r             归一化后的请求串
+     * @param e             归一化后的回填串
+     * @return true = 核心词覆盖 ⇒ 放行
+     */
+    private static boolean coreCovered(Set<String> requestGroups, Set<String> echoGroups,
+                                       String r, String e) {
+        if (requestGroups.isEmpty() || !requestGroups.equals(echoGroups)) {
+            return false;
+        }
+        String rCore = stripIgnorable(r);
+        String eCore = stripIgnorable(e);
+        if (rCore.isEmpty() || eCore.isEmpty()) {
+            return false;
+        }
+        return rCore.contains(eCore);
+    }
+
+    /**
+     * 剥掉<b>弱化词</b>（容器 / 方位 / 语气 / 助词）· 规则 C 的核心串。
+     *
+     * <p>WHY 需要：请求常写成「记事本窗口<b>标题栏最右侧的</b>关闭按钮」，模型回填写成
+     * 「记事本窗口关闭按钮」⇒ 两者<b>语义相同</b>但字符串不相等、也不是子串
+     * ⇒ 剥掉只描述「在哪 / 怎么点」的词后，核心控件词就一致了。
+     *
+     * @param normalized 已归一化（去空白去标点）的串
+     * @return 剥掉弱化词后的核心串
+     */
+    public static String stripIgnorable(String normalized) {
+        if (normalized == null || normalized.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder(normalized.length());
+        int i = 0;
+        while (i < normalized.length()) {
+            int matched = 0;
+            for (String word : IGNORABLE_WORDS_LONGEST_FIRST) {
+                if (normalized.startsWith(word, i)) {
+                    matched = word.length();
+                    break;
+                }
+            }
+            if (matched > 0) {
+                i += matched;
+                continue;
+            }
+            sb.append(normalized.charAt(i));
+            i++;
+        }
+        return sb.toString();
+    }
+
+    /**
+     * 弱化词表按长度降序（最长匹配优先）。
+     *
+     * @return 排序后的弱化词数组
+     */
+    private static String[] buildLongestFirst() {
+        String[] copy = IGNORABLE_WORDS.clone();
+        Arrays.sort(copy, Comparator.comparingInt(String::length).reversed());
+        return copy;
     }
 
     /**
@@ -143,7 +282,7 @@ public final class ComputerUseGroundingTargetMatch {
      * @return 命中的规范词集合（可能为空）
      */
     public static Set<String> controlConcepts(String expanded) {
-        Set<String> out = new java.util.HashSet<>();
+        Set<String> out = new HashSet<>();
         if (expanded == null || expanded.isEmpty()) {
             return out;
         }

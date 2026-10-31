@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.computeruse;
 
+import com.nexusai.application.agent.mcp.McpStringUtils;
 /**
  * {@code mcp__computer-use__middle_click} · 中键（滚轮按下）工具（对齐 CCB 2.8.4
  * {@code packages/@ant/computer-use-mcp/src/tools.ts:298-310}）。
@@ -33,7 +34,8 @@ package com.nexusai.application.agent.computeruse;
 public final class ComputerUseMiddleClickTool extends ComputerUseClickVariantTool {
 
     /** 工具全名 · CCB {@code setup.ts:17-21} 要求固定为 {@code mcp__computer-use__<tool>}。 */
-    public static final String TOOL_NAME = "mcp__computer-use__middle_click";
+    public static final String TOOL_NAME = McpStringUtils.buildMcpToolName(
+            ComputerUseMcpServer.SERVER_NAME, "middle_click");
 
     /** 工具描述 · 逐字对齐 CCB {@code tools.ts:300}。 */
     private static final String DESCRIPTION = buildDescription(

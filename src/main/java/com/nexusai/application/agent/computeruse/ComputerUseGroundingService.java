@@ -35,6 +35,22 @@ import java.util.List;
  * {@code vision_analyze} 是<b>主模型原文直传</b>（通用「看这张图」），本服务要的是
  * <b>结构化坐标</b> ⇒ 必须自带 grounding 模板 + 严格解析 + 严格校验。
  *
+ * <h2>⭐ 输出预算与 thinking（2026-11-01 实测加固）</h2>
+ * <p><b>实测事实</b>：视觉模型可能是 <b>thinking 模型</b>（{@code deepseek-flash} 实测即如此）
+ * ⇒ 不给 {@code max_tokens} 上限时，思考链会吃光预算，响应变成
+ * {@code stop_reason=max_tokens, output_tokens=1200, len=0} ⇒ <b>正文为空</b>（实测 1/5 发生）。
+ * <p><b>本服务的两条对策</b>：
+ * <ol>
+ *   <li><b>显式给足 max_tokens</b>（{@link #DEFAULT_MAX_TOKENS} = 4096，重试 {@link #RETRY_MAX_TOKENS} = 8192）
+ *       ⇒ 让 thinking 有余量，同时<b>封顶</b>（grounding 只要一个短 JSON）；</li>
+ *   <li><b>在这条专用链路上关闭 thinking</b>（{@code ThinkingConfig.disabled()}）——
+ *       grounding 只要「找到/没找到 + 坐标」，<b>不需要推理链</b>；thinking 只会吃预算、
+ *       并有机会把坐标推理得更随意。openai-compatible 端点下发 {@code thinking:{type:'disabled'}}
+ *       （DeepSeek 系官方约定的关闭方式）；⛔ Anthropic 端点不消费该字段 ⇒ 无副作用。</li>
+ * </ol>
+ * <p><b>⭐ 绝不猜坐标</b>：空输出 / 解析失败 ⇒ <b>重试一次</b>（重试时放宽 max_tokens）；
+ * 连续两次都失败 ⇒ <b>fail loud</b>（{@link Status#PARSE_FAILED}，带明确文案）。
+ *
  * <h2>⭐ 坐标一律【图像像素】（与主链路 pixels 语义同制式）</h2>
  * <p>CU 截图抓的是 1920×1080，但送进视觉模型的是<b>预缩放后</b>的图（如 1456×819）
  * ⇒ <b>模型看到的那张图就是缩放图</b> ⇒ 它回的「图上像素坐标」<b>天然等于</b> CCB
@@ -77,6 +93,45 @@ public final class ComputerUseGroundingService {
     public static final double PERCENT_PIXEL_TOLERANCE = 0.03d;
 
     /**
+     * grounding 首次尝试的<b>输出预算</b>（max_tokens）· 默认 {@value}。
+     *
+     * <p><b>WHY 必须显式给</b>（实测 2026-10-31，真实 API）：<b>deepseek-flash 是 thinking 模型</b>，
+     * 不给上限时思考链会吃光预算 ⇒ 响应 {@code stop_reason=max_tokens, output_tokens=1200, len=0}
+     * ⇒ <b>返回空</b>（实测 1/5 发生）。grounding 只要一个几十 token 的 JSON ⇒ 4096 足够让
+     * thinking 有余量、又能<b>封顶</b>（不让模型自由发挥长篇）。
+     *
+     * <p><b>WHY 不直接用 DB {@code models.max_tokens}</b>：那一列在本仓是<b>模型级</b>上限
+     * （本机所有模型都填了 384000）⇒ 直接下发会被上游拒（超出模型真实 max_output_tokens）。
+     * ⇒ 本服务<b>自己</b>定一个专用预算，并按模型上限<b>向下收敛</b>
+     * （见 {@link #effectiveMaxTokens(String, int)}）。
+     */
+    public static final int DEFAULT_MAX_TOKENS = 4096;
+
+    /**
+     * grounding <b>重试</b>时的输出预算（max_tokens）· 默认 {@value}。
+     *
+     * <p>第一次拿到<b>空输出</b>（thinking 吃光预算的典型症状）时放宽预算再试一次。
+     * 8192 = DeepSeek 系 openai-compatible 端点的 max_tokens 上限（文档值）⇒ 不会撞 400。
+     */
+    public static final int RETRY_MAX_TOKENS = 8192;
+
+    /**
+     * grounding 输出预算的<b>硬天花板</b> · {@value}。
+     *
+     * <p>grounding 的产物只有一个短 JSON ⇒ 超过这个数的预算毫无意义，只会放大「思考链吃掉全部预算」
+     * 的风险面。<b>同时</b>保证不会超过主流 openai-compatible 端点的 max_tokens 上限（8192）。
+     */
+    public static final int MAX_TOKENS_CEILING = 8192;
+
+    /**
+     * grounding 输出预算的<b>下限</b> · {@value}。
+     *
+     * <p>模型级上限被配得极小时（{@code models.max_tokens} &lt; 512）仍保底给 512
+     * ⇒ 否则一个短 JSON 都写不完，必然空输出。
+     */
+    public static final int MIN_MAX_TOKENS = 512;
+
+    /**
      * grounding prompt 模板 · <b>本仓新增</b>（CCB 无对应；{@code vision_analyze} 也没有）。
      *
      * <p><b>WHY 要求结构化 JSON</b>：下游要做的是「拿到坐标就点」⇒ 必须有可机器解析的
@@ -116,6 +171,12 @@ public final class ComputerUseGroundingService {
     private final double offsetX;
     /** 护栏③ · 系统性偏移补偿 Y（<b>屏幕物理像素</b>；默认 0 = 不启用）。 */
     private final double offsetY;
+    /** 首次尝试的输出预算（max_tokens）。 */
+    private final int maxTokens;
+    /** 重试时的输出预算（max_tokens）· 比首次更宽。 */
+    private final int retryMaxTokens;
+    /** 是否在这条<b>专用链路</b>上关闭 thinking（见 {@link #PROMPT_TEMPLATE} 上方说明）。 */
+    private final boolean disableThinking;
 
     /**
      * @param modelConfigResolver 多模态档位模型名 + ProviderConfig 解析（{@code settings.multimodal_model_name}）
@@ -141,11 +202,35 @@ public final class ComputerUseGroundingService {
                                        LlmProviderFactory llmProviderFactory,
                                        LlmSideCallClient sideCallClient,
                                        double offsetX, double offsetY) {
+        this(modelConfigResolver, llmProviderFactory, sideCallClient, offsetX, offsetY,
+                DEFAULT_MAX_TOKENS, RETRY_MAX_TOKENS, true);
+    }
+
+    /**
+     * 完整构造器（带护栏③ 偏移 + 输出预算 + thinking 开关）。
+     *
+     * @param modelConfigResolver 多模态档位模型名 + ProviderConfig 解析
+     * @param llmProviderFactory  provider 工厂
+     * @param sideCallClient      旁路单发客户端
+     * @param offsetX             偏移补偿 X（<b>屏幕物理像素</b>；0 = 不启用）
+     * @param offsetY             偏移补偿 Y（<b>屏幕物理像素</b>；0 = 不启用）
+     * @param maxTokens           首次尝试的输出预算（max_tokens）
+     * @param retryMaxTokens      重试时的输出预算（max_tokens）
+     * @param disableThinking     是否关闭 thinking（true = 只发 {@code thinking:{type:'disabled'}}）
+     */
+    public ComputerUseGroundingService(ModelConfigResolver modelConfigResolver,
+                                       LlmProviderFactory llmProviderFactory,
+                                       LlmSideCallClient sideCallClient,
+                                       double offsetX, double offsetY,
+                                       int maxTokens, int retryMaxTokens, boolean disableThinking) {
         this.modelConfigResolver = modelConfigResolver;
         this.llmProviderFactory = llmProviderFactory;
         this.sideCallClient = sideCallClient;
         this.offsetX = offsetX;
         this.offsetY = offsetY;
+        this.maxTokens = maxTokens <= 0 ? DEFAULT_MAX_TOKENS : maxTokens;
+        this.retryMaxTokens = retryMaxTokens <= 0 ? RETRY_MAX_TOKENS : retryMaxTokens;
+        this.disableThinking = disableThinking;
     }
 
     /**
@@ -214,7 +299,7 @@ public final class ComputerUseGroundingService {
                 case PARSE_FAILED ->
                         "视觉模型返回的定位结果无法解析成约定的 JSON 坐标格式"
                                 + (detail == null || detail.isBlank() ? "" : "（原始输出：" + detail + "）")
-                                + "。已中止本次定位，不会返回猜测的坐标，请重试。";
+                                + "。已重试 1 次仍失败，已中止本次定位，不会返回猜测的坐标，请重试。";
                 case OUT_OF_RANGE ->
                         "视觉模型返回的坐标越界"
                                 + (detail == null || detail.isBlank() ? "" : "（" + detail + "）")
@@ -298,49 +383,150 @@ public final class ComputerUseGroundingService {
                     "旁路调用客户端未装配");
         }
 
-        // ── 3. 组装 user 消息（text + image）→ 旁路单发 ──
+        // ── 3. 组装 user 消息（text + image）→ 旁路单发（空输出 / 解析失败 ⇒ 重试一次）──
         //    ⛔ prompt 必须带上【本次图像的宽高】—— 否则模型无法给出像素坐标。
         int imageWidth = capture.imageWidth();
         int imageHeight = capture.imageHeight();
         String prompt = PROMPT_TEMPLATE.formatted(
                 target.trim(), imageWidth, imageHeight,
                 Math.max(0, imageWidth - 1), Math.max(0, imageHeight - 1));
-        String raw;
-        try {
-            List<JsonNode> blocks = new ArrayList<>(2);
-            blocks.add(textBlock(prompt));
-            blocks.add(com.nexusai.application.agent.LlmAgentLoop.imageContentBlock(
-                    capture.mediaType(), capture.base64()));
-            ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
-                    Role.user, prompt, null, null, blocks, List.of(), true);
-            LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
-                    List.of(user), null, null, null, null, USAGE_LABEL, null, null,
-                    ctx != null ? ctx.agentContext() : null);
-            LlmSideCallClient.SideCallUsage usage = ctx != null
-                    ? LlmSideCallClient.SideCallUsage.inSession(
-                            ctx.sessionId(),
-                            ctx.agentId() == null ? null : ctx.agentId().toString(),
-                            UsageCategory.SIDE_CALL, USAGE_LABEL)
-                            .withAgentContext(ctx.agentContext())
-                    : LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, USAGE_LABEL);
-            raw = sideCallClient.chat(resolved.config(), modelName, null, null, options, usage);
-        } catch (Exception e) {
-            log.error("[computer-use] grounding: 视觉模型调用失败 model={} target={} err={}",
-                    modelName, target, e.toString());
-            return new GroundingOutcome(Status.CALL_FAILED, null, null, null, null, target, e.getMessage());
+
+        LlmSideCallClient.SideCallUsage usage = ctx != null
+                ? LlmSideCallClient.SideCallUsage.inSession(
+                        ctx.sessionId(),
+                        ctx.agentId() == null ? null : ctx.agentId().toString(),
+                        UsageCategory.SIDE_CALL, USAGE_LABEL)
+                        .withAgentContext(ctx.agentContext())
+                : LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, USAGE_LABEL);
+
+        // ── 3a. 重试循环（最多 2 次尝试）──────────────────────────────────────────
+        //  WHY 重试：实测 deepseek-flash 的 thinking 会吃光预算 ⇒ 返回**空**（len=0）；
+        //            第一次空 ⇒ 放宽 max_tokens 再试一次（失败仍空 ⇒ 明确报错，绝不猜坐标）。
+        int budgetFirst = effectiveMaxTokens(modelName, maxTokens);
+        int budgetRetry = effectiveMaxTokens(modelName, retryMaxTokens);
+        String lastDetail = null;
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            int budget = attempt == 1 ? budgetFirst : budgetRetry;
+            String raw;
+            try {
+                raw = callVisionModel(resolved, modelName, prompt, capture, budget, usage, ctx);
+            } catch (Exception e) {
+                // ⛔ 异常（网络/限流/上游 5xx）**不重试**：立即失败 loudly，避免放大限流压力。
+                log.error("[computer-use] grounding: 视觉模型调用失败 model={} target={} attempt={}/2 err={}",
+                        modelName, target, attempt, e.toString());
+                return new GroundingOutcome(Status.CALL_FAILED, null, null, null, null, target, e.getMessage());
+            }
+
+            if (raw == null || raw.isBlank()) {
+                lastDetail = "（空输出）";
+                log.warn("[computer-use] grounding: 第 {}/2 次视觉模型返回空输出 model={} max_tokens={}"
+                                + "（thinking 吃光预算的典型症状）",
+                        attempt, modelName, budget);
+                continue;
+            }
+
+            // ── 4. 宽松 JSON 解析 + 严格校验（像素域 + 护栏① + 百分比互校）──
+            GroundingOutcome outcome = parse(raw, target, imageWidth, imageHeight);
+            if (outcome.status() == Status.PARSE_FAILED) {
+                // 解析失败也重试一次（模型偶发输出散文/半截 JSON）
+                lastDetail = outcome.detail();
+                log.warn("[computer-use] grounding: 第 {}/2 次视觉模型输出解析失败 model={} max_tokens={} detail={}",
+                        attempt, modelName, budget, outcome.detail());
+                continue;
+            }
+            if (!outcome.found()) {
+                // NOT_FOUND / OUT_OF_RANGE / PERCENT_PIXEL_MISMATCH / TARGET_MISMATCH
+                //   —— 模型<b>确实给了答案</b>，只是答案不合法或被护栏拦下 ⇒ 不重试，直接 fail loud。
+                return outcome;
+            }
+            // ── 5. 护栏③：系统性偏移补偿（默认 0 = 不启用 ⇒ 行为不变）──
+            return applyOffset(outcome, capture);
         }
 
-        if (raw == null || raw.isBlank()) {
-            return new GroundingOutcome(Status.PARSE_FAILED, null, null, null, null, target, "（空输出）");
-        }
+        // 两次都没拿到可解析的坐标 ⇒ fail loud（⛔ 绝不返回猜测坐标）
+        log.warn("[computer-use] grounding: 连续 2 次未得到可解析坐标 model={} target={} lastDetail={}",
+                modelName, target, lastDetail);
+        return new GroundingOutcome(Status.PARSE_FAILED, null, null, null, null, target,
+                "已重试 1 次仍失败：" + lastDetail);
+    }
 
-        // ── 4. 宽松 JSON 解析 + 严格校验（像素域 + 护栏① + 百分比互校）──
-        GroundingOutcome outcome = parse(raw, target, imageWidth, imageHeight);
-        if (!outcome.found()) {
-            return outcome;
+    /**
+     * 单次视觉模型调用（带显式 max_tokens + 可选关闭 thinking）。
+     *
+     * <p><b>⭐ 为什么 grounding 这条链路要【显式给 max_tokens】</b>：
+     * 视觉模型可能是 <b>thinking 模型</b>（deepseek-flash 实测即如此）⇒ 不给上限时思考链吃光预算
+     * ⇒ 响应 {@code stop_reason=max_tokens} 且<b>正文为空</b>（实测 1/5 发生）⇒ grounding 拿不到坐标。
+     *
+     * <p><b>⭐ 为什么在这条链路【关闭 thinking】</b>：grounding 只要一个「找到 / 没找到 + 坐标」的短 JSON，
+     * <b>不需要推理链</b>；thinking 只会①吃预算、②有机会把坐标推理得更"随意"。
+     * 请求层关闭方式 = {@code ThinkingConfig.disabled()} ⇒ openai-compatible 端点下发
+     * {@code thinking:{type:'disabled'}}（DeepSeek 系官方约定的关闭方式）。
+     * ⛔ Anthropic 端点<b>不消费</b>该字段（{@code AnthropicSdkProvider} 的非流式路径恒用 adaptive）
+     * ⇒ 传它对 Anthropic 无副作用、也不会 400。
+     *
+     * @param resolved  已解析的模型配置
+     * @param modelName 模型名（记账 + 日志）
+     * @param prompt    grounding prompt（含图像宽高）
+     * @param capture   截图（提供图像载荷与尺寸）
+     * @param budget    本次尝试的 max_tokens
+     * @param usage     记账归属
+     * @param ctx       工具上下文（可空）
+     * @return 模型原始输出文本
+     */
+    private String callVisionModel(ModelConfigResolver.ResolvedModel resolved,
+                                   String modelName,
+                                   String prompt,
+                                   ComputerUseCaptureResult capture,
+                                   int budget,
+                                   LlmSideCallClient.SideCallUsage usage,
+                                   ToolUseContext ctx) {
+        List<JsonNode> blocks = new ArrayList<>(2);
+        blocks.add(textBlock(prompt));
+        blocks.add(com.nexusai.application.agent.LlmAgentLoop.imageContentBlock(
+                capture.mediaType(), capture.base64()));
+        ChatMessageDto user = com.nexusai.application.agent.LlmAgentLoop.toMessage(
+                Role.user, prompt, null, null, blocks, List.of(), true);
+        LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
+                List.of(user), null, null,
+                disableThinking ? LlmProvider.ChatRequestOptions.ThinkingConfig.disabled() : null,
+                null, USAGE_LABEL, null, budget,
+                ctx != null ? ctx.agentContext() : null);
+        if (log.isInfoEnabled()) {
+            log.info("[computer-use] grounding: 调用视觉模型 model={} max_tokens={} thinking={} 图像 {}x{}",
+                    modelName, budget, disableThinking ? "disabled" : "default",
+                    capture.imageWidth(), capture.imageHeight());
         }
-        // ── 5. 护栏③：系统性偏移补偿（默认 0 = 不启用 ⇒ 行为不变）──
-        return applyOffset(outcome, capture);
+        return sideCallClient.chat(resolved.config(), modelName, null, null, options, usage);
+    }
+
+    /**
+     * 实际下发的 max_tokens · <b>向下收敛</b>（绝不超出模型自己的上限）。
+     *
+     * <p>收敛链：{@code min(请求值, MAX_TOKENS_CEILING, models.max_tokens)}，再保底 {@code MIN_MAX_TOKENS}。
+     * <ul>
+     *   <li>请求值 = 本服务专用预算（默认 4096 / 重试 8192）；</li>
+     *   <li>{@code MAX_TOKENS_CEILING} = 8192（主流 openai-compatible 端点的 max_tokens 上限）；</li>
+     *   <li>{@code models.max_tokens} = DB 里模型自己的输出上限（前端可配）⇒ <b>不能超过它</b>。</li>
+     * </ul>
+     *
+     * @param modelName 模型名（用于查模型级上限）
+     * @param requested 本服务请求的预算
+     * @return 实际下发的 max_tokens
+     */
+    private int effectiveMaxTokens(String modelName, int requested) {
+        int effective = Math.min(requested, MAX_TOKENS_CEILING);
+        Integer modelMax = modelConfigResolver == null ? null : modelConfigResolver.resolveMaxTokens(modelName);
+        if (modelMax != null && modelMax > 0) {
+            effective = Math.min(effective, modelMax);
+        }
+        if (effective < MIN_MAX_TOKENS) {
+            effective = MIN_MAX_TOKENS;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[computer-use] grounding: max_tokens 收敛 requested={} ceiling={} 模型上限={} ⇒ 实际={}",
+                    requested, MAX_TOKENS_CEILING, modelMax, effective);
+        }
+        return effective;
     }
 
     /**

@@ -48,9 +48,11 @@ import java.util.Iterator;
  * </pre>
  * 也就是说：<b>模型看到的图像尺寸必须等于 {@code ScreenshotResult.width/height}</b>，
  * 否则模型给的坐标落在被服务端二次缩放过的空间里，{@code scaleCoord} 的比例就错了。
- * <p>本实现默认 {@link #PRE_SIZE_TO_API_TARGET} = true（即采用 macOS 的预缩放语义），
+ * <p>本实现默认 <b>预缩放 = true</b>（即采用 macOS 的预缩放语义），
  * 因为本 PoC 的成败标准正是「模型给的坐标能真点到」；把它改成 false 即逐字复现 CCB 的
- * Windows 行为（原始物理像素、不缩放），便于 Phase 1 做 A/B 对照。
+ * Windows 行为（原始物理像素、不缩放），便于做 A/B 对照。
+ * <br>⚠️ 开关的<b>实测代价</b>见 {@link #preSizeToApiTarget} 字段注释（压缩省 42% token，
+ * 但同目标定位误差 avg 4.4px → 15.1px）。
  *
  * <h2>坐标空间自洽性</h2>
  * <p>截图像素与点击坐标必须落在<b>同一个</b>坐标系里。本实现抓取主显示器在虚拟屏幕坐标中的
@@ -68,14 +70,37 @@ public final class Win32ScreenCapturer implements ComputerUseScreenCapturer {
     public static final String MEDIA_TYPE = "image/jpeg";
 
     /**
-     * 是否把截图预缩放到 {@link ComputerUseApiResize#targetImageSize} 的输出尺寸。
+     * 是否把截图预缩放到 {@link ComputerUseApiResize#targetImageSize} 的输出尺寸（<b>可配</b>）。
      *
-     * <p>{@code true} = CCB macOS 语义（{@code executor.ts:468-492}）—— 模型看到的尺寸 == 记录的尺寸，
-     * {@code scaleCoord} 的比例成立。
+     * <p>{@code true}（<b>默认</b>）= CCB macOS 语义（{@code executor.ts:468-492}）——
+     * 模型看到的尺寸 == 记录的尺寸，{@code scaleCoord} 的比例成立。
      * <br>{@code false} = CCB Windows 语义（{@code executorCrossPlatform.ts} 不 import imageResize）——
-     * 输出原始物理像素；此时模型若被 API 二次缩放，坐标比例会失配（CCB 现存缺口）。
+     * 输出原始物理像素。
+     *
+     * <p><b>⚠️ 实测代价（本机 2026-11-01 真机 A/B · 同一个目标 · 各 10 次采样）</b>：
+     * <ul>
+     *   <li><b>压缩</b>（1920×1080 → 1456×819）：图像 token 由 <b>2691 降到 1560（省 42%）</b>，
+     *       但<b>定位精度下降</b>；</li>
+     *   <li><b>原图</b>（1920×1080）：图像 token <b>2691（+72%）</b>，定位<b>更准</b>。</li>
+     * </ul>
+     * <p><b>两组实测数据</b>（同一目标、同一真值）：
+     * <ul>
+     *   <li><b>120px 目标</b>（用户 2026-11-01 实测）：误差 <b>avg 4.4px（原图）→ 15.1px（压缩）</b>
+     *       = <b>3.4×</b>；</li>
+     *   <li><b>10px 的「✕」字形</b>（本批 2026-11-01 实测 · 记事本 caption 关闭按钮）：
+     *       误差 <b>avg 11.4px（原图，命中正确按钮的 6 次）→ 39.2px（压缩，10/10 命中）</b>
+     *       ⇒ <b>目标越小，压缩的精度代价越大</b>。</li>
+     * </ul>
+     * ⇒ <b>默认值 true（压缩）</b> = <b>严格 CCB 口径</b>（省 42% token）；
+     * <b>若「定位精度优先 / 目标很小 / token 不敏感」⇒ 置 false 发原图</b>。
+     *
+     * <p><b>⚠️ 不变式（无论开关如何都成立）</b>：<b>我们自己钉死尺寸、后续任何一环都不再压</b> ——
+     * 本类记录的图像尺寸（{@code imageWidth/imageHeight}）<b>恒等于</b>实际编码并送给模型的图像尺寸。
+     * <br>⚠️ 但要注意：置 false 时送出去的是 1920×1080（&gt; 1568 长边）⇒ <b>会越过 CCB 的 token 预算</b>
+     * ⇒ 某些上游（如 Anthropic）会<b>服务端二次缩放</b> ⇒ 那时坐标空间会与记录尺寸脱节。
+     * 本仓库实测的 {@code deepseek-flash} <b>不自带压缩</b>（两变体坐标各自落在正确空间）⇒ 该开关对它安全。
      */
-    public static final boolean PRE_SIZE_TO_API_TARGET = true;
+    private final boolean preSizeToApiTarget;
 
     private final Win32Native.User32 user32 = Win32Native.User32.INSTANCE;
     private final Win32Native.Gdi32 gdi32 = Win32Native.Gdi32.INSTANCE;
@@ -83,9 +108,61 @@ public final class Win32ScreenCapturer implements ComputerUseScreenCapturer {
     /** DPI 感知是否已生效（静态一次）。 */
     private static volatile Boolean dpiAware;
 
+    /** 预缩放 = true（严格 CCB 口径，默认）。 */
     public Win32ScreenCapturer() {
+        this(true);
+    }
+
+    /**
+     * @param preSizeToApiTarget 是否预缩放到 {@link ComputerUseApiResize#targetImageSize} 的输出尺寸
+     *                           （true = 严格 CCB 口径；false = 发原图，token 成本显著上升）
+     */
+    public Win32ScreenCapturer(boolean preSizeToApiTarget) {
+        this.preSizeToApiTarget = preSizeToApiTarget;
         Win32Native.assertStructLayout();
         ensureDpiAwareness();
+    }
+
+    /**
+     * @return 是否预缩放（true = 缩到 token 预算内的最大解；false = 原图）
+     */
+    public boolean preSizeToApiTarget() {
+        return preSizeToApiTarget;
+    }
+
+    /**
+     * 输出尺寸决策（<b>纯函数</b> · 可单测）。
+     *
+     * <p>⭐ 不变式落点：<b>这里定出来的尺寸，就是记录下来、也送给模型的那张图的尺寸</b>
+     * ⇒ 后续任何一环都不得再压。
+     * <br>⭐ <b>Windows 与 macOS 共用同一实现</b>（{@link ComputerUseApiResize#resolveOutputSize}）
+     * ⇒ 两平台的尺寸语义天然一致（同一个开关、同一个不变式）。
+     *
+     * @param physW             捕获区物理宽
+     * @param physH             捕获区物理高
+     * @param preSizeToApiTarget 是否预缩放
+     * @return {@code int[]{输出宽, 输出高}}
+     */
+    static int[] resolveOutputSize(int physW, int physH, boolean preSizeToApiTarget) {
+        return ComputerUseApiResize.resolveOutputSize(physW, physH, preSizeToApiTarget);
+    }
+
+    /**
+     * 关掉预缩放后图像 token 的增幅（百分比 · 日志用）。
+     *
+     * @param physW 捕获区物理宽
+     * @param physH 捕获区物理高
+     * @return 增幅百分比（原图为基准）；无法计算 ⇒ 0
+     */
+    private static int extraTokenPercent(int physW, int physH) {
+        int[] compressed = ComputerUseApiResize.targetImageSize(physW, physH);
+        int compressedTokens = ComputerUseApiResize.nTokensForImg(
+                compressed[0], compressed[1], ComputerUseApiResize.PX_PER_TOKEN);
+        int rawTokens = ComputerUseApiResize.nTokensForImg(physW, physH, ComputerUseApiResize.PX_PER_TOKEN);
+        if (compressedTokens <= 0) {
+            return 0;
+        }
+        return (int) Math.round((rawTokens - compressedTokens) * 100.0d / compressedTokens);
     }
 
     /**
@@ -300,9 +377,7 @@ public final class Win32ScreenCapturer implements ComputerUseScreenCapturer {
                                             int originX, int originY,
                                             double scaleFactor, int logicalW, int logicalH,
                                             String what) throws Exception {
-        int[] target = PRE_SIZE_TO_API_TARGET
-                ? ComputerUseApiResize.targetImageSize(physW, physH)
-                : new int[]{physW, physH};
+        int[] target = resolveOutputSize(physW, physH, preSizeToApiTarget);
         BufferedImage out = (target[0] == img.getWidth() && target[1] == img.getHeight())
                 ? img
                 : scaleTo(img, target[0], target[1]);
@@ -310,9 +385,18 @@ public final class Win32ScreenCapturer implements ComputerUseScreenCapturer {
 
         if (log.isInfoEnabled()) {
             log.info("[computer-use] {}捕获完成: 捕获区 {}x{}（origin {}x{}）· scaleFactor={} · 图像 {}x{} · "
-                            + "JPEG {} 字节 · mediaType={} · 预缩放={}",
+                            + "JPEG {} 字节 · mediaType={} · 预缩放={} · 图像token≈{}",
                     what, physW, physH, originX, originY, scaleFactor, target[0], target[1],
-                    jpeg.length, MEDIA_TYPE, PRE_SIZE_TO_API_TARGET);
+                    jpeg.length, MEDIA_TYPE, preSizeToApiTarget,
+                    ComputerUseApiResize.nTokensForImg(target[0], target[1], ComputerUseApiResize.PX_PER_TOKEN));
+        }
+        if (!preSizeToApiTarget && log.isWarnEnabled()) {
+            log.warn("[computer-use] {}捕获: 预缩放已关闭 ⇒ 发原图 {}x{}（图像token≈{}，比压缩版多约 {}%）"
+                            + "· ⛔ token 成本显著上升，且依赖上游【不】做服务端二次缩放"
+                            + "（本机实测 deepseek-flash 不压缩；Anthropic 系会压 ⇒ 坐标空间会失配）",
+                    what, target[0], target[1],
+                    ComputerUseApiResize.nTokensForImg(target[0], target[1], ComputerUseApiResize.PX_PER_TOKEN),
+                    extraTokenPercent(physW, physH));
         }
 
         return new ComputerUseCaptureResult(

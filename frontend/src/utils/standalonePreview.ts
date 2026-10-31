@@ -36,6 +36,8 @@ export interface StandalonePayload {
   item?: StandaloneAttachment
   /** 项目文件（docx/xlsx/pdf/image/video/audio 走后端 raw 端点） */
   project?: { id: string; path: string }
+  /** 会话产物（docx/xlsx/pdf/image 走后端 artifacts/{id}/raw 端点取字节/源） */
+  artifact?: { sessionId: string; artifactId: string }
   /** html：内联内容（对话代码块运行 / FileViewModal 运行） */
   code?: string
 }

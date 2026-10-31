@@ -13548,3 +13548,137 @@ html {
   border-radius: 8px;
   background: #fff;
 }
+
+/* ===== [2026-10-31] 产物卡片（ArtifactCards · 右栏「产物」tab 与正文下方**同一套**）=====
+   设计稿：.zjkycode/brainstorm/left-sidebar/content/artifact-cards-design.html
+   （3 列网格 · 图标 42px · 文件名 2 行截断 · 大小 · 悬停上浮 1px + 阴影 · 右上角浮出操作按钮） */
+.artifact-cards {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 9px;
+  min-width: 0;
+}
+
+/* 右栏窄栏：同样的 3 列，留白更紧 */
+.artifact-cards.compact { gap: 7px; }
+.artifact-cards.compact .artifact-card { padding: 9px 6px 8px; gap: 6px; }
+
+.artifact-card {
+  position: relative;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 7px;
+  padding: 11px 8px 9px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 11px;
+  cursor: pointer;
+  transition: box-shadow 150ms var(--ease), transform 150ms var(--ease), border-color 150ms var(--ease);
+}
+
+.artifact-card:hover {
+  border-color: var(--hairline-strong);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.08);
+  transform: translateY(-1px);
+}
+
+.artifact-card:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+
+/* 图标底色（按类型 · 设计稿「图标总表」） */
+.ac-ico {
+  width: 42px;
+  height: 42px;
+  border-radius: 11px;
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+}
+.ac-ico.k-html { background: rgba(15, 95, 212, 0.10); color: var(--accent); }
+.ac-ico.k-docx { background: rgba(15, 95, 212, 0.10); color: #2b579a; }
+.ac-ico.k-pptx { background: rgba(255, 149, 0, 0.12); color: #d24726; }
+.ac-ico.k-xlsx { background: rgba(93, 184, 114, 0.12); color: var(--success-dark); }
+.ac-ico.k-pdf { background: rgba(198, 69, 69, 0.10); color: var(--error-dark); }
+.ac-ico.k-md { background: rgba(123, 97, 255, 0.10); color: #6b4fd8; }
+.ac-ico.k-img { background: rgba(93, 184, 114, 0.12); color: var(--success-dark); }
+.ac-ico.k-file { background: var(--surface-2); color: var(--ink-tertiary); }
+
+/* 文件名（2 行截断） */
+.ac-name {
+  width: 100%;
+  font-size: 11.5px;
+  line-height: 1.35;
+  color: var(--ink);
+  text-align: center;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+
+.ac-size {
+  font-size: 10px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 右上角悬停浮出的操作按钮（「在浏览器中打开」仅 html / 「编辑」仅文本类） */
+.ac-actions {
+  position: absolute;
+  top: 5px;
+  right: 5px;
+  display: flex;
+  gap: 2px;
+  opacity: 0;
+  transition: opacity 120ms var(--ease);
+}
+.artifact-card:hover .ac-actions,
+.artifact-card:focus-within .ac-actions { opacity: 1; }
+
+.ac-act {
+  width: 22px;
+  height: 22px;
+  display: grid;
+  place-items: center;
+  padding: 0;
+  border: none;
+  border-radius: 6px;
+  background: rgba(255, 255, 255, 0.9);
+  color: var(--ink-tertiary);
+  cursor: pointer;
+}
+.ac-act:hover { background: var(--surface-2); color: var(--ink); }
+.ac-act svg { width: 13px; height: 13px; }
+
+/* 产物预览弹窗：头部操作区 + 文本编辑框（ArtifactPreviewModal） */
+.artifact-modal-actions {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+
+.artifact-modal-editor {
+  width: 100%;
+  min-height: 50vh;
+  padding: 12px 14px;
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline-strong);
+  border-radius: 8px;
+  resize: vertical;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+.artifact-modal-editor:focus {
+  outline: none;
+  border-color: var(--accent);
+}

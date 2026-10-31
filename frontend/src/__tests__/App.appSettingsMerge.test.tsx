@@ -71,6 +71,8 @@ vi.mock('@/utils/projectFolder', () => ({ selectProjectFolder: vi.fn(async () =>
 vi.mock('@/utils/debugLog', () => ({ debugLog: vi.fn(async () => {}) }))
 vi.mock('@/components/modals/DiffModal', () => ({ DiffModal: () => null }))
 vi.mock('@/components/modals/FileViewModal', () => ({ FileViewModal: () => null }))
+// 产物 html 查看器同样静态引 monaco（与 FileViewModal 同一套交互）⇒ jsdom 里必须一并桩掉
+vi.mock('@/components/modals/ArtifactViewModal', () => ({ ArtifactViewModal: () => null }))
 
 // 与本次接线无关的业务 hook → 空实现。
 // ⚠️ **不 mock `@/hooks/useTierInheritGuide`**：本批要钉的正是它的 apply() → onSettingsUpdated 那条线。

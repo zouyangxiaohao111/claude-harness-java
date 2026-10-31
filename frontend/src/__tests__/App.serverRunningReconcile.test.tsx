@@ -78,6 +78,8 @@ vi.mock('@/utils/debugLog', () => ({ debugLog: vi.fn(async () => {}) }))
 //   （document.queryCommandSupported 未实现）—— 与本次接线无关，整体桩掉（它们只在点开 diff/文件时渲染）
 vi.mock('@/components/modals/DiffModal', () => ({ DiffModal: () => null }))
 vi.mock('@/components/modals/FileViewModal', () => ({ FileViewModal: () => null }))
+// 产物 html 查看器同样静态引 monaco（与 FileViewModal 同一套交互）⇒ jsdom 里必须一并桩掉
+vi.mock('@/components/modals/ArtifactViewModal', () => ({ ArtifactViewModal: () => null }))
 
 // 与本次接线无关的业务 hook → 空实现（各自需要一整套后端夹具，且不参与服务端运行态对账）
 vi.mock('@/hooks/useChatSocket', () => ({ useChatSocket: () => ({ clientRef: { current: null } }) }))

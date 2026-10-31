@@ -12,6 +12,7 @@ import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.infra.llm.UsageCategory;
+import com.nexusai.model.session.dto.ArtifactContentUpdateResponse;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.SessionArtifactDto;
 import com.nexusai.model.session.dto.ToolCallDto;
@@ -34,6 +35,7 @@ import java.nio.charset.CharsetDecoder;
 import java.nio.charset.CoderResult;
 import java.nio.charset.CodingErrorAction;
 import java.nio.charset.StandardCharsets;
+import java.nio.file.AtomicMoveNotSupportedException;
 import java.nio.file.Files;
 import java.nio.file.InvalidPathException;
 import java.nio.file.Path;
@@ -45,7 +47,6 @@ import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.LinkedHashMap;
 import java.util.List;
-import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.UUID;
@@ -131,14 +132,15 @@ public class SessionArtifactService {
     static final int CONTENT_MAX_BYTES = 512 * 1024;
 
     /**
-     * 文本类扩展名（小写，不含点）。命中即按文本读（UTF-8 → GB18030 回落）；
-     * 未命中一律按二进制处理（{@code binary=true} + {@code content=null}，⛔ 不返回 base64）。
+     * 原始字节下发 / 文本写回的单文件上限（50MB）。
+     *
+     * <p><b>WHY 取 50MB</b>：与 {@link #ARCHIVE_MAX_MB}（归档副本上限）对齐 —— 归档成功的产物副本
+     * 天然 ≤50MB，所以这个上限只在「归档失败、{@code local_path} 回落到用户原文件」时才可能触发；
+     * 那种情况下文件可能是任意大小 ⛔ 不能无界读进内存（打爆响应体与前端内存）。
+     * 与 {@code ProjectService.readFileBytes} 的 100MB 不同：本仓项目文件通道服务的是用户自选目录，
+     * 而产物通道服务的是「我们自己归档的副本」，50MB 已覆盖绝大多数交付物（docx / pdf / xlsx）。
      */
-    private static final Set<String> TEXT_EXTENSIONS = Set.of(
-            "md", "markdown", "txt", "text", "log", "csv", "tsv",
-            "html", "htm", "xml", "json", "jsonl", "yaml", "yml", "toml", "ini", "properties",
-            "js", "jsx", "ts", "tsx", "css", "scss", "java", "kt", "py", "rb", "go", "rs",
-            "c", "h", "cpp", "hpp", "sh", "bat", "ps1", "sql", "rst", "svg");
+    static final long RAW_MAX_BYTES = 50L * 1024L * 1024L;
 
     /** 工具入参里表示「文件路径」的键（Write/Edit/Read 等工具的实际字段名集合）。 */
     private static final String[] PATH_ARG_KEYS = {
@@ -253,7 +255,7 @@ public class SessionArtifactService {
     /** {@link #list(String)} 的分桶结果（Controller 直接序列化出站）。 */
     public record ArtifactBuckets(List<SessionArtifactDto> deliverables, List<SessionArtifactDto> sources) {}
 
-    // ───────────────────────── 产物内容预览（浏览器通道） ─────────────────────────
+    // ───────────────────────── 产物文件通道（预览 / 原始字节 / 编辑） ─────────────────────────
 
     /**
      * 产物内容预览出站形状（Controller 直接序列化）。
@@ -291,28 +293,8 @@ public class SessionArtifactService {
      * @throws ValidationException 路径非法（越出本会话归档目录）
      */
     public ArtifactContent readContent(String sessionId, String artifactId) {
-        if (sessionId == null || sessionId.isBlank() || artifactId == null || artifactId.isBlank()) {
-            throw new NotFoundException("产物不存在");
-        }
-        if (artifactMapper == null) {
-            log.warn("[artifact-content] SessionArtifactMapper 未装配，无法读取产物 session={} artifactId={}",
-                    sessionId, artifactId);
-            throw new NotFoundException("产物不存在");
-        }
-        SessionArtifactRecord row = artifactMapper.selectOneByQuery(
-                QueryWrapper.create().eq("id", artifactId));
-        if (row == null || !sessionId.equals(row.getSessionId())) {
-            log.warn("[artifact-content] 产物不存在或不属于该会话 session={} artifactId={}", sessionId, artifactId);
-            throw new NotFoundException("产物不存在");
-        }
-        String localPath = row.getLocalPath();
-        if (localPath == null || localPath.isBlank()) {
-            // 来源类条目（local_path 恒 null）；或产物行从未归档成功
-            log.warn("[artifact-content] 产物无本地路径 session={} artifactId={} kind={}",
-                    sessionId, artifactId, row.getKind());
-            throw new NotFoundException("产物文件不存在（可能已被删除）");
-        }
-        return readArtifactFile(sessionId, artifactId, localPath);
+        SessionArtifactRecord row = requireOwnedArtifact(sessionId, artifactId, "artifact-content");
+        return readArtifactFile(sessionId, artifactId, row.getLocalPath());
     }
 
     /**
@@ -326,42 +308,11 @@ public class SessionArtifactService {
      * @return {@link ArtifactContent}
      */
     static ArtifactContent readArtifactFile(String sessionId, String artifactId, String localPath) {
-        Path sessionDir = sessionArtifactsDir(sessionId);
-        Path resolved;
-        try {
-            resolved = Paths.get(localPath).toAbsolutePath().normalize();
-        } catch (InvalidPathException e) {
-            log.warn("[artifact-content] 产物路径非法（无法解析） session={} artifactId={} path={}",
-                    sessionId, artifactId, localPath);
-            throw new ValidationException("产物路径非法");
-        }
-        // ⛔ 这一行就是安全边界：产物只允许读本会话归档目录内的文件
-        if (!resolved.startsWith(sessionDir)) {
-            log.warn("[artifact-content] 拒绝读取：产物路径不在本会话归档目录内 session={} artifactId={} path={} dir={}",
-                    sessionId, artifactId, resolved, sessionDir);
-            throw new ValidationException("产物路径非法");
-        }
-        if (!Files.isRegularFile(resolved)) {
-            log.warn("[artifact-content] 产物文件不存在 session={} artifactId={} path={}",
-                    sessionId, artifactId, resolved);
-            throw new NotFoundException("产物文件不存在（可能已被删除）");
-        }
-        // 符号链接防越界：目录内若被塞进指向目录外的链接，上面的文本路径 startsWith 拦不住
-        try {
-            if (!resolved.toRealPath().startsWith(sessionDir.toRealPath())) {
-                log.warn("[artifact-content] 拒绝读取：产物符号链接指向归档目录之外 session={} artifactId={} path={}",
-                        sessionId, artifactId, resolved);
-                throw new ValidationException("产物路径非法");
-            }
-        } catch (IOException e) {
-            log.warn("[artifact-content] 产物路径解析失败 session={} artifactId={} path={} err={}",
-                    sessionId, artifactId, resolved, e.toString());
-            throw new NotFoundException("产物文件不存在（可能已被删除）");
-        }
+        Path resolved = resolveArtifactPath(sessionId, artifactId, localPath);
 
         String fileName = resolved.getFileName() == null ? "" : resolved.getFileName().toString();
-        String ext = extensionOf(fileName);
-        String mime = mimeOf(ext);
+        String ext = ArtifactFileKind.extensionOf(fileName);
+        String mime = ArtifactFileKind.mimeOf(ext);
         long size;
         try {
             size = Files.size(resolved);
@@ -370,7 +321,7 @@ public class SessionArtifactService {
                     sessionId, artifactId, resolved, e.toString());
             throw new NotFoundException("产物文件不存在（可能已被删除）");
         }
-        if (!TEXT_EXTENSIONS.contains(ext)) {
+        if (!ArtifactFileKind.isText(ext)) {
             log.info("[artifact-content] 读取产物内容完成（二进制不预览） session={} artifactId={} 字节数={} 类型={}",
                     sessionId, artifactId, size, mime);
             return new ArtifactContent(null, mime, size, false, true);
@@ -388,6 +339,253 @@ public class SessionArtifactService {
         log.info("[artifact-content] 读取产物内容成功 session={} artifactId={} 字节数={} 截断={} 类型={}",
                 sessionId, artifactId, size, truncated, mime);
         return new ArtifactContent(content, mime, size, truncated, false);
+    }
+
+    /**
+     * 取「属于该会话」的一条产物行 —— 归属校验的唯一入口（三个产物端点共用）。
+     *
+     * <p><b>WHY 必须比对 {@code session_id}</b>：{@code artifactId} 是全局唯一串，只按 id 查到行
+     * 并不够 —— 无鉴权形态下，A 会话拿着 B 会话的 artifactId 就能读到 B 的产物文件。
+     * 不属于该会话一律 404（不暴露「存在但属于别人」）。
+     *
+     * @param logTag 日志前缀（{@code artifact-content} / {@code artifact-raw} / {@code artifact-edit}）
+     * @return 该会话名下的产物行（一定有 {@code local_path}）
+     * @throws NotFoundException 产物行不存在 / 不属于该会话 / 无本地路径
+     */
+    private SessionArtifactRecord requireOwnedArtifact(String sessionId, String artifactId, String logTag) {
+        if (sessionId == null || sessionId.isBlank() || artifactId == null || artifactId.isBlank()) {
+            throw new NotFoundException("产物不存在");
+        }
+        if (artifactMapper == null) {
+            log.warn("[{}] SessionArtifactMapper 未装配，无法读取产物 session={} artifactId={}",
+                    logTag, sessionId, artifactId);
+            throw new NotFoundException("产物不存在");
+        }
+        SessionArtifactRecord row = artifactMapper.selectOneByQuery(
+                QueryWrapper.create().eq("id", artifactId));
+        if (row == null || !sessionId.equals(row.getSessionId())) {
+            log.warn("[{}] 产物不存在或不属于该会话 session={} artifactId={}", logTag, sessionId, artifactId);
+            throw new NotFoundException("产物不存在");
+        }
+        String localPath = row.getLocalPath();
+        if (localPath == null || localPath.isBlank()) {
+            // 来源类条目（local_path 恒 null）；或产物行从未归档成功
+            log.warn("[{}] 产物无本地路径 session={} artifactId={} kind={}",
+                    logTag, sessionId, artifactId, row.getKind());
+            throw new NotFoundException("产物文件不存在（可能已被删除）");
+        }
+        return row;
+    }
+
+    /**
+     * 产物路径校验（安全边界 · 三个产物端点共用同一口径，⛔ 不各写一份）。
+     *
+     * <p>两道边界：
+     * <ol>
+     *   <li><b>文本路径</b>：{@code toAbsolutePath().normalize()} 后必须落在
+     *       {@code {configHome}/artifacts/{sessionId}} 内，否则 400；</li>
+     *   <li><b>符号链接</b>：再叠一层 {@code toRealPath()} —— 目录内若被塞进指向目录外的链接，
+     *       文本路径的 {@code startsWith} 拦不住，必须按解析后的真实路径再判一次，否则 400。</li>
+     * </ol>
+     *
+     * @return 校验通过的绝对路径
+     * @throws ValidationException 路径非法（越出本会话归档目录 / 符号链接越界）
+     * @throws NotFoundException   文件不存在 / 已删除
+     */
+    static Path resolveArtifactPath(String sessionId, String artifactId, String localPath) {
+        Path sessionDir = sessionArtifactsDir(sessionId);
+        Path resolved;
+        try {
+            resolved = Paths.get(localPath).toAbsolutePath().normalize();
+        } catch (InvalidPathException e) {
+            log.warn("[artifact-file] 产物路径非法（无法解析） session={} artifactId={} path={}",
+                    sessionId, artifactId, localPath);
+            throw new ValidationException("产物路径非法");
+        }
+        // ⛔ 这一行就是安全边界：产物只允许读本会话归档目录内的文件
+        if (!resolved.startsWith(sessionDir)) {
+            log.warn("[artifact-file] 拒绝访问：产物路径不在本会话归档目录内 session={} artifactId={} path={} dir={}",
+                    sessionId, artifactId, resolved, sessionDir);
+            throw new ValidationException("产物路径非法");
+        }
+        if (!Files.isRegularFile(resolved)) {
+            log.warn("[artifact-file] 产物文件不存在 session={} artifactId={} path={}",
+                    sessionId, artifactId, resolved);
+            throw new NotFoundException("产物文件不存在（可能已被删除）");
+        }
+        // 符号链接防越界：目录内若被塞进指向目录外的链接，上面的文本路径 startsWith 拦不住
+        try {
+            if (!resolved.toRealPath().startsWith(sessionDir.toRealPath())) {
+                log.warn("[artifact-file] 拒绝访问：产物符号链接指向归档目录之外 session={} artifactId={} path={}",
+                        sessionId, artifactId, resolved);
+                throw new ValidationException("产物路径非法");
+            }
+        } catch (IOException e) {
+            log.warn("[artifact-file] 产物路径解析失败 session={} artifactId={} path={} err={}",
+                    sessionId, artifactId, resolved, e.toString());
+            throw new NotFoundException("产物文件不存在（可能已被删除）");
+        }
+        return resolved;
+    }
+
+    /**
+     * 产物原始字节出站（Controller 直接序列化）。
+     *
+     * @param bytes      文件原始字节
+     * @param fileName   展示用文件名（DB 行 title；空则用副本 basename）
+     * @param contentType HTTP Content-Type（{@link ArtifactFileKind#contentTypeOf(String)}）
+     * @param size       文件字节数
+     */
+    public record ArtifactRaw(byte[] bytes, String fileName, String contentType, long size) {}
+
+    /**
+     * 读取产物原始字节 · GET /api/v1/sessions/{sessionId}/artifacts/{artifactId}/raw。
+     *
+     * <p><b>WHY 需要它</b>：{@code /content} 只下发文本（二进制只回 {@code binary=true}）⇒
+     * docx / pdf / xlsx / 图片在浏览器里根本打不开（用户报「异常」）。本端点下发原始字节，
+     * 浏览器按 {@code Content-Type} 直接渲染 / 下载。
+     *
+     * <p><b>安全边界与 {@code /content} 完全同款</b>（归属 404 / 目录越界 400 / 符号链接 400），
+     * ⛔ 只读：不写库、不改文件。
+     *
+     * @throws NotFoundException   产物行不存在 / 不属于该会话 / 文件已不存在
+     * @throws ValidationException 路径非法 / 超过 {@link #RAW_MAX_BYTES}
+     */
+    public ArtifactRaw readRaw(String sessionId, String artifactId) {
+        SessionArtifactRecord row = requireOwnedArtifact(sessionId, artifactId, "artifact-raw");
+        Path resolved = resolveArtifactPath(sessionId, artifactId, row.getLocalPath());
+        long size;
+        try {
+            size = Files.size(resolved);
+        } catch (IOException e) {
+            log.warn("[artifact-raw] 产物大小读取失败 session={} artifactId={} path={} err={}",
+                    sessionId, artifactId, resolved, e.toString());
+            throw new NotFoundException("产物文件不存在（可能已被删除）");
+        }
+        if (size > RAW_MAX_BYTES) {
+            log.warn("[artifact-raw] 产物过大，拒绝下发 session={} artifactId={} size={} 上限字节={}",
+                    sessionId, artifactId, size, RAW_MAX_BYTES);
+            throw new ValidationException("产物超过 " + (RAW_MAX_BYTES / 1024 / 1024) + "MB 上限，无法预览");
+        }
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(resolved);
+        } catch (IOException e) {
+            log.warn("[artifact-raw] 产物读取失败 session={} artifactId={} path={} err={}",
+                    sessionId, artifactId, resolved, e.toString());
+            throw new NotFoundException("产物文件不存在（可能已被删除）");
+        }
+        // MIME 按「文件真实扩展名」判定（不是 title —— title 是展示名，可能压根没有扩展名）
+        String ext = ArtifactFileKind.extensionOf(resolved.getFileName() == null
+                ? "" : resolved.getFileName().toString());
+        String contentType = ArtifactFileKind.contentTypeOf(ext);
+        String fileName = displayFileName(row, resolved);
+        log.info("[artifact-raw] 下发产物原始字节 session={} artifactId={} 字节数={} 类型={} 文件名={}",
+                sessionId, artifactId, bytes.length, contentType, fileName);
+        return new ArtifactRaw(bytes, fileName, contentType, bytes.length);
+    }
+
+    /**
+     * 展示用文件名：DB 行 {@code title}（空则用副本 basename）。
+     *
+     * <p>WHY 用 title：它是模型抽取时给的「用户视角的名字」（如「季度报告.docx」），
+     * 比 {@code {hash12}-{basename}} 的副本名可读。⛔ 头里做 percent 编码（RFC 5987），
+     * 控制字符 / 换行被编码掉 ⇒ 不会有头注入。
+     */
+    private static String displayFileName(SessionArtifactRecord row, Path resolved) {
+        String title = row.getTitle();
+        if (title != null && !title.isBlank()) {
+            return title.trim();
+        }
+        Path fileName = resolved.getFileName();
+        return fileName == null ? "" : fileName.toString();
+    }
+
+    /**
+     * 文本编辑写回 · PUT /api/v1/sessions/{sessionId}/artifacts/{artifactId}/content。
+     *
+     * <p><b>WHY 只能改文本类</b>：{@code docx / xlsx / pdf / 图片} 是二进制，写进去的字符串
+     * 会把文件当场写坏（用户以为保存成功，其实交付物已损坏）⇒ 二进制一律 400。
+     * 判据与 {@code /content}、{@code /raw} 共用 {@link ArtifactFileKind#isText(String)}（单一真源）。
+     *
+     * <p><b>原子写</b>：先写同目录临时文件，再 {@code Files.move(..., ATOMIC_MOVE, REPLACE_EXISTING)}
+     * 覆盖 —— 写一半失败不会留下半截文件（用户读到的要么是旧内容要么是新内容）。
+     *
+     * <p>⛔ 只写这一个文件 + 更新这一行的 {@code size_bytes} / {@code updated_at}，不碰别的产物。
+     *
+     * @param content 新内容（UTF-8 文本；空串合法 = 清空文件；null = 参数缺失 ⇒ 400）
+     * @return {id, sizeBytes, updatedAt}
+     * @throws NotFoundException   产物行不存在 / 不属于该会话 / 文件已不存在
+     * @throws ValidationException 路径非法 / 非文本类 / 内容过大
+     */
+    public ArtifactContentUpdateResponse writeTextContent(String sessionId, String artifactId, String content) {
+        SessionArtifactRecord row = requireOwnedArtifact(sessionId, artifactId, "artifact-edit");
+        if (content == null) {
+            throw new ValidationException("产物内容不能为空（content 必填）");
+        }
+        Path resolved = resolveArtifactPath(sessionId, artifactId, row.getLocalPath());
+        String fileName = resolved.getFileName() == null ? "" : resolved.getFileName().toString();
+        String ext = ArtifactFileKind.extensionOf(fileName);
+        if (!ArtifactFileKind.isText(ext)) {
+            log.warn("[artifact-edit] 非文本产物，拒绝写回 session={} artifactId={} 扩展名={}",
+                    sessionId, artifactId, ext);
+            throw new ValidationException("该产物类型不支持文本编辑");
+        }
+        byte[] bytes = content.getBytes(StandardCharsets.UTF_8);
+        if (bytes.length > RAW_MAX_BYTES) {
+            log.warn("[artifact-edit] 内容过大，拒绝写回 session={} artifactId={} 字节数={} 上限字节={}",
+                    sessionId, artifactId, bytes.length, RAW_MAX_BYTES);
+            throw new ValidationException("内容超过 " + (RAW_MAX_BYTES / 1024 / 1024) + "MB 上限，无法保存");
+        }
+        writeAtomically(resolved, bytes);
+        long newSize = bytes.length;
+        String now = OffsetDateTime.now().toString();
+        row.setSizeBytes(newSize);
+        row.setUpdatedAt(now);
+        // ignoreNulls=true：只更新非空列（size_bytes / updated_at），url / source_message_id 等
+        // 本来就是 null 的列保持 null（MyBatis-Flex 默认忽略 null 字段，语义正好对上）。
+        artifactMapper.update(row, true);
+        log.info("[artifact-edit] 写回产物内容成功 session={} artifactId={} 字节数={} 路径={}",
+                sessionId, artifactId, newSize, resolved);
+        return new ArtifactContentUpdateResponse(row.getId(), newSize, now);
+    }
+
+    /**
+     * 原子写（同目录临时文件 → 原子改名覆盖）。
+     *
+     * <p><b>WHY 临时文件放同目录</b>：原子改名要求源与目标在<b>同一文件系统</b> ⇒ 临时文件必须落在
+     * 目标所在目录（写系统临时目录再 move 会退化成「复制 + 删除」，中途崩溃就留半截文件）。
+     *
+     * <p>失败路径：临时文件一律在 finally 里清掉 ⇔ 不留半截文件；目标文件要么是旧内容、要么是新内容。
+     */
+    private static void writeAtomically(Path target, byte[] bytes) {
+        Path dir = target.getParent();
+        Path tmp = null;
+        try {
+            tmp = Files.createTempFile(dir, ".artifact-edit-", ".tmp");
+            Files.write(tmp, bytes);
+            try {
+                Files.move(tmp, target, StandardCopyOption.ATOMIC_MOVE, StandardCopyOption.REPLACE_EXISTING);
+                tmp = null;
+            } catch (AtomicMoveNotSupportedException e) {
+                // 极少数文件系统不支持原子改名：同目录 rename 退化为普通 move（仍不会留半截文件）
+                log.warn("[artifact-edit] 当前文件系统不支持原子改名，退化为普通移动 path={} err={}",
+                        target, e.toString());
+                Files.move(tmp, target, StandardCopyOption.REPLACE_EXISTING);
+                tmp = null;
+            }
+        } catch (IOException e) {
+            log.warn("[artifact-edit] 产物写入失败 path={} err={}", target, e.toString());
+            throw new IllegalStateException("产物写入失败：" + e.getMessage(), e);
+        } finally {
+            if (tmp != null) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException e) {
+                    log.warn("[artifact-edit] 清理临时文件失败（忽略）path={} err={}", tmp, e.toString());
+                }
+            }
+        }
     }
 
     /**
@@ -432,31 +630,6 @@ public class SessionArtifactService {
         }
         out.flip();
         return out.toString();
-    }
-
-    /** 扩展名（小写、不含点）；无扩展名 → 空串。 */
-    private static String extensionOf(String fileName) {
-        int dot = fileName.lastIndexOf('.');
-        if (dot < 0 || dot == fileName.length() - 1) {
-            return "";
-        }
-        return fileName.substring(dot + 1).toLowerCase(Locale.ROOT);
-    }
-
-    /** 扩展名 → MIME（未识别 → application/octet-stream）。 */
-    private static String mimeOf(String ext) {
-        return switch (ext) {
-            case "md", "markdown" -> "text/markdown";
-            case "html", "htm" -> "text/html";
-            case "csv" -> "text/csv";
-            case "tsv" -> "text/tab-separated-values";
-            case "css" -> "text/css";
-            case "js", "jsx" -> "text/javascript";
-            case "json", "jsonl" -> "application/json";
-            case "xml" -> "application/xml";
-            case "svg" -> "image/svg+xml";
-            default -> TEXT_EXTENSIONS.contains(ext) ? "text/plain" : "application/octet-stream";
-        };
     }
 
     /**

@@ -41,12 +41,21 @@ import java.util.List;
  *
  * <h2>尺寸链</h2>
  * <ul>
- *   <li>整屏：PNG 原生像素 → 按 {@link ComputerUseApiResize#targetImageSize(int, int)}
- *       缩到长边 ≤1568 ⇒ <b>模型看到的图像尺寸 == 记录的 imageWidth/Height</b>
- *       （与 Windows 侧同款不变式）。</li>
+ *   <li>整屏：PNG 原生像素 → 按 {@link #resolveOutputSize(int, int, boolean)} 决定输出尺寸
+ *       （开关 true ⇒ 按 {@link ComputerUseApiResize#targetImageSize(int, int)}
+ *       缩到长边 ≤1568；开关 false ⇒ 原图）⇒ <b>模型看到的图像尺寸 == 记录的 imageWidth/Height</b>
+ *       （与 Windows 侧同款不变式 · <b>同一个开关</b>）。</li>
  *   <li>区域（zoom）：<b>原分辨率</b>（不缩到 1568）—— 与 {@link Win32ScreenCapturer#captureRegion}
  *       同款（zoom 的语义就是「看清小字」）。</li>
  * </ul>
+ *
+ * <h2>预缩放开关（2026-11-01 · 与 Windows 侧并轨）</h2>
+ * <p>开关 = {@code nexusai.computer-use.screenshot-pre-size-to-api-target}（默认 <b>true</b>）。
+ * <br><b>WHY 要并轨</b>：本仓的截图尺寸开关原先<b>只有 Windows 侧接了</b>，
+ * macOS 侧<b>恒预缩放</b> ⇒ 同一个配置在两个平台上语义不同（换平台 ⇒ token 成本与坐标空间
+ * 悄悄变样）⇒ 两边统一走 {@link ComputerUseApiResize#resolveOutputSize(int, int, boolean)}。
+ * <br>⚠️ <b>运行时未验证</b>：本机是 Windows ⇒ macOS 侧只做到「<b>编译通过 + 纯单测</b>」
+ * （假执行器断言尺寸计算），<b>真实 macOS 上的截图尺寸行为未在真机验证过</b>。
  *
  * <h2>⚠️ 单位</h2>
  * <p>本仓工具体系的坐标空间是<b>屏幕像素</b>；{@code screencapture -R} 的矩形用的是
@@ -65,9 +74,29 @@ public final class MacOsScreenCapturer implements ComputerUseScreenCapturer {
     private final MacOsDisplays displays;
     private final MacOsTccChecker tcc;
 
-    /** 生产构造器（真起进程）。 */
+    /**
+     * 是否把整屏截图预缩放到 {@link ComputerUseApiResize#targetImageSize(int, int)} 的输出尺寸
+     * （<b>可配</b> · 与 Windows 侧同一个开关）。
+     *
+     * <p>{@code true}（<b>默认</b>）= 缩到长边 ≤1568 且图像 token ≤1568
+     * ⇒ 模型看到的尺寸 == 记录的尺寸（坐标链不变式成立）。
+     * <br>{@code false} = 发原图（token 成本显著上升；定位更准 —— 见
+     * {@link Win32ScreenCapturer} 的实测数据）。
+     */
+    private final boolean preSizeToApiTarget;
+
+    /** 生产构造器（真起进程 · 预缩放 = true）。 */
     public MacOsScreenCapturer() {
-        this(ComputerUseProcessRunner.REAL, new MacOsDisplays(), new MacOsTccChecker());
+        this(ComputerUseProcessRunner.REAL, new MacOsDisplays(), new MacOsTccChecker(), true);
+    }
+
+    /**
+     * 生产构造器（真起进程 · 可指定预缩放开关）。
+     *
+     * @param preSizeToApiTarget 是否预缩放（true = 缩到 token 预算内的最大解；false = 原图）
+     */
+    public MacOsScreenCapturer(boolean preSizeToApiTarget) {
+        this(ComputerUseProcessRunner.REAL, new MacOsDisplays(), new MacOsTccChecker(), preSizeToApiTarget);
     }
 
     /**
@@ -76,12 +105,48 @@ public final class MacOsScreenCapturer implements ComputerUseScreenCapturer {
      * @param tcc      TCC 授权检查（屏幕录制）
      */
     public MacOsScreenCapturer(ComputerUseProcessRunner runner, MacOsDisplays displays, MacOsTccChecker tcc) {
+        this(runner, displays, tcc, true);
+    }
+
+    /**
+     * @param runner             外部命令执行器
+     * @param displays           显示器几何来源（像素 ↔ 点换算）
+     * @param tcc                TCC 授权检查（屏幕录制）
+     * @param preSizeToApiTarget 是否预缩放（true = 缩到 token 预算内的最大解；false = 原图）
+     */
+    public MacOsScreenCapturer(ComputerUseProcessRunner runner, MacOsDisplays displays, MacOsTccChecker tcc,
+                               boolean preSizeToApiTarget) {
         if (runner == null || displays == null || tcc == null) {
             throw new IllegalArgumentException("[computer-use] MacOsScreenCapturer 依赖不能为空");
         }
         this.runner = runner;
         this.displays = displays;
         this.tcc = tcc;
+        this.preSizeToApiTarget = preSizeToApiTarget;
+    }
+
+    /**
+     * @return 是否预缩放（true = 缩到 token 预算内的最大解；false = 原图）
+     */
+    public boolean preSizeToApiTarget() {
+        return preSizeToApiTarget;
+    }
+
+    /**
+     * 输出尺寸决策（<b>纯函数</b> · 可单测）。
+     *
+     * <p>⭐ 不变式落点：<b>这里定出来的尺寸，就是记录下来、也送给模型的那张图的尺寸</b>
+     * ⇒ 后续任何一环都不得再压。
+     * <br>⭐ 与 Windows 侧<b>共用同一实现</b>（{@link ComputerUseApiResize#resolveOutputSize}）
+     * ⇒ 两平台的尺寸语义天然一致。
+     *
+     * @param physW             捕获区物理宽
+     * @param physH             捕获区物理高
+     * @param preSizeToApiTarget 是否预缩放
+     * @return {@code int[]{输出宽, 输出高}}
+     */
+    static int[] resolveOutputSize(int physW, int physH, boolean preSizeToApiTarget) {
+        return ComputerUseApiResize.resolveOutputSize(physW, physH, preSizeToApiTarget);
     }
 
     @Override
@@ -92,7 +157,7 @@ public final class MacOsScreenCapturer implements ComputerUseScreenCapturer {
         int physW = img.getWidth();
         int physH = img.getHeight();
         double scaleFactor = displays.pixelsPerPoint();
-        int[] target = ComputerUseApiResize.targetImageSize(physW, physH);
+        int[] target = resolveOutputSize(physW, physH, preSizeToApiTarget);
         BufferedImage out = (target[0] == physW && target[1] == physH)
                 ? img
                 : ComputerUseImageCodec.scaleTo(img, target[0], target[1]);
@@ -101,8 +166,16 @@ public final class MacOsScreenCapturer implements ComputerUseScreenCapturer {
         int logicalH = Math.max(1, (int) Math.round(physH / scaleFactor));
         if (log.isInfoEnabled()) {
             log.info("[computer-use] macOS 整屏捕获完成: 捕获区 {}x{} · 图像 {}x{} · scaleFactor={} · "
-                            + "JPEG {} 字节 · mediaType={}",
-                    physW, physH, target[0], target[1], scaleFactor, jpeg.length, MEDIA_TYPE);
+                            + "JPEG {} 字节 · mediaType={} · 预缩放={} · 图像token≈{}",
+                    physW, physH, target[0], target[1], scaleFactor, jpeg.length, MEDIA_TYPE,
+                    preSizeToApiTarget,
+                    ComputerUseApiResize.nTokensForImg(target[0], target[1], ComputerUseApiResize.PX_PER_TOKEN));
+        }
+        if (!preSizeToApiTarget && log.isWarnEnabled()) {
+            log.warn("[computer-use] macOS 整屏捕获: 预缩放已关闭 ⇒ 发原图 {}x{}（图像token≈{}）"
+                            + "· ⛔ token 成本显著上升，且依赖上游【不】做服务端二次缩放",
+                    target[0], target[1],
+                    ComputerUseApiResize.nTokensForImg(target[0], target[1], ComputerUseApiResize.PX_PER_TOKEN));
         }
         return new ComputerUseCaptureResult(jpeg, MEDIA_TYPE, target[0], target[1],
                 physW, physH, 0, 0, scaleFactor, logicalW, logicalH);

@@ -1,4 +1,4 @@
-import { api } from './rest'
+import { api, parseProblem, BASE_URL } from './rest'
 
 /**
  * 会话产物 / 来源（后端轮末异步抽取写 session_artifact · 只读接口）。
@@ -39,10 +39,48 @@ export interface ArtifactContent {
   binary: boolean
 }
 
+/**
+ * 产物原始字节端点（**绝对**地址）。
+ *
+ * <p>dev 下 {@link BASE_URL} 是相对路径（走 vite proxy）⇒ 补页源 origin；
+ * 打包版 {@link BASE_URL} 已是绝对地址（Tauri WebView 里相对路径指向 WebView 自己 ⇒ 全废）。
+ * 「在浏览器中打开」要交给系统浏览器（openUrl），必须是绝对地址 ⇒ 统一在这里收口。
+ */
+export function artifactRawUrl(sessionId: string, artifactId: string): string {
+  const path = `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/raw`
+  if (BASE_URL.startsWith('http')) return `${BASE_URL}${path}`
+  const origin = typeof location !== 'undefined' ? location.origin : ''
+  return `${origin}${BASE_URL}${path}`
+}
+
+/** 保存产物内容后的返回（写回归档副本，不动项目源文件）。 */
+export interface ArtifactSaveResult {
+  id: string
+  sizeBytes: number
+  updatedAt: string
+}
+
 export const artifactsApi = {
   list: (sessionId: string) =>
     api<SessionArtifacts>(`/sessions/${encodeURIComponent(sessionId)}/artifacts`),
   content: (sessionId: string, artifactId: string) =>
     api<ArtifactContent>(
       `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`),
+  /**
+   * 产物原始字节（GET .../artifacts/{id}/raw）。
+   *
+   * <p>⛔ **不走 `api()`**：那个封装强制 JSON 解析，raw 返回的是二进制（docx/xlsx/pdf/图片）
+   * ⇒ 只能拿到 Response 自己 arrayBuffer / blob。
+   */
+  raw: async (sessionId: string, artifactId: string): Promise<Response> => {
+    const res = await fetch(artifactRawUrl(sessionId, artifactId), { headers: { Accept: '*/*' } })
+    if (!res.ok) throw await parseProblem(res)
+    return res
+  },
+  /** 写回产物内容（PUT .../artifacts/{id}/content · body `{content}`）→ 写回归档副本。 */
+  saveContent: (sessionId: string, artifactId: string, content: string) =>
+    api<ArtifactSaveResult>(
+      `/sessions/${encodeURIComponent(sessionId)}/artifacts/${encodeURIComponent(artifactId)}/content`,
+      { method: 'PUT', body: { content } },
+    ),
 }

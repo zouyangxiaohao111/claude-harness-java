@@ -61,6 +61,30 @@ public final class ComputerUseApiResize {
     }
 
     /**
+     * <b>输出尺寸决策</b>（纯函数 · Windows / macOS <b>共用</b>）。
+     *
+     * <p>⭐ 不变式落点：<b>这里定出来的尺寸，就是记录下来、也送给模型的那张图的尺寸</b>
+     * ⇒ 后续任何一环都不得再压（预缩放开关开或关都成立）。
+     *
+     * <p>开关语义（{@code nexusai.computer-use.screenshot-pre-size-to-api-target}）：
+     * <ul>
+     *   <li>{@code true}（默认）= 缩到 {@link #targetImageSize(int, int)} 的输出尺寸
+     *       ⇒ 长边 ≤ {@value #MAX_TARGET_PX} 且图像 token ≤ {@value #MAX_TARGET_TOKENS}；</li>
+     *   <li>{@code false} = <b>原图尺寸</b>（不缩）⇒ token 成本显著上升，定位更准。</li>
+     * </ul>
+     *
+     * @param width             输入宽（物理像素）
+     * @param height            输入高（物理像素）
+     * @param preSizeToApiTarget 是否预缩放
+     * @return {@code int[]{输出宽, 输出高}}
+     */
+    public static int[] resolveOutputSize(int width, int height, boolean preSizeToApiTarget) {
+        return preSizeToApiTarget
+                ? targetImageSize(width, height)
+                : new int[]{width, height};
+    }
+
+    /**
      * 目标尺寸 · 对齐 CCB {@code imageResize.ts:60-108}（生产参数 {@link #PX_PER_TOKEN} /
      * {@link #MAX_TARGET_PX} / {@link #MAX_TARGET_TOKENS}）。
      *

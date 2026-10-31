@@ -88,6 +88,8 @@ import { UpdateCenter } from '@/components/updater/UpdateCenter'
 import { DiffModal } from '@/components/modals/DiffModal'
 import { FileViewModal } from '@/components/modals/FileViewModal'
 import { ArtifactPreviewModal } from '@/components/modals/ArtifactPreviewModal'
+import { ArtifactViewModal } from '@/components/modals/ArtifactViewModal'
+import { artifactOpenActionOf, openArtifactRawInBrowser } from '@/utils/artifactOpen'
 import { openStandalone, previewKindOfPath, basenameOf } from '@/utils/standalonePreview'
 
 /** 会话主模型只允许对话类；embedding/rerank 等非对话模型不能被选为会话模型。
@@ -281,7 +283,9 @@ function App() {
   // 项目文件树点击查看（真实文件内容）
   const [openFile, setOpenFile] = useState<{ projectId: string; path: string } | null>(null)
   // [产物预览] 浏览器通道：产物 = 归档副本（不在项目根内）⇒ 走 /artifacts/{id}/content 只读预览
-  const [previewArtifact, setPreviewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto } | null>(null)
+  const [previewArtifact, setPreviewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto; initialEdit?: boolean } | null>(null)
+  // [产物预览 · html] Monaco 查看/编辑/保存 + 运行（与项目文件 FileViewModal 同一套交互 · 数据源不同）
+  const [viewArtifact, setViewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto; initialEdit?: boolean } | null>(null)
 
   // ---- refs ----
   const modelDropdownRef = useRef<HTMLDivElement>(null)
@@ -1790,43 +1794,76 @@ function App() {
     openProjectFile(pid, path)
   }, [activeSession?.mainProjectId, openProjectFile, showToast])
 
-  // [产物/来源] 产物行点击 → 打开该产物的本地文件
-  //   localPath 是**归档副本的绝对路径**（{configHome}/artifacts/<sessionId>/…，未绑定项目的会话也有）：
-  //   - Tauri：直接交给系统默认程序；
-  //   - 浏览器/dev：⚠️ 副本不在任何项目根内 ⇒ ⛔ 不能走 openRefFile/openProjectFile（必报「文件路径非法」），
-  //     改走会话产物内容接口（GET /sessions/{sid}/artifacts/{aid}/content）只读预览。
+  // [产物/来源] 产物卡点击 → **按类型分发**的统一打开函数（右栏「产物」tab 与正文下方共用同一个）。
+  //   ⛔ 不能走 openRefFile/openProjectFile：产物的 localPath 是**归档副本**的绝对路径
+  //      （{configHome}/artifacts/<sessionId>/…），不在任何项目根内 ⇒ 必报「文件路径非法」。
+  //   分发口径（用户 2026-10-31 裁定）：
+  //     html          → ArtifactViewModal（Monaco 查看/编辑/保存 + 运行 + 在浏览器中打开）
+  //     docx/xlsx/pdf/img → 现有渲染（独立预览窗：DocxPreview / ExcelPreview / PdfPreview / 图片）
+  //     md/其它文本    → ArtifactPreviewModal（Markdown 渲染 + 编辑保存）
+  //     其它二进制      → 提示「该类型暂不支持预览」+ 复制路径（Tauri 下交给系统默认程序）
   const openArtifact = useCallback(async (a: SessionArtifactDto) => {
-    const path = a.localPath
-    if (!path) return
-    const { isTauri } = await import('@tauri-apps/api/core')
-    if (isTauri()) {
-      try {
-        const { openPath } = await import('@tauri-apps/plugin-opener')
-        await openPath(path)
-        return
-      } catch { /* 桌面打开失败 → 回落浏览器预览通道 */ }
-    }
     if (!activeSessionId) {
       showToast('无法打开产物：未选中会话', 'info')
       return
     }
+    const action = artifactOpenActionOf(a.title)
+    if (action.kind === 'view-html') {
+      setViewArtifact({ sessionId: activeSessionId, artifact: a })
+      return
+    }
+    if (action.kind === 'standalone') {
+      openStandalone({
+        type: action.previewType,
+        title: a.title,
+        artifact: { sessionId: activeSessionId, artifactId: a.id },
+      })
+      return
+    }
+    if (action.kind === 'preview-text') {
+      setPreviewArtifact({ sessionId: activeSessionId, artifact: a })
+      return
+    }
+    // 其它二进制（pptx / zip / …）：浏览器里没有对应渲染器 ⇒ 复制路径 + 提示；
+    // Tauri 桌面端可以交给系统默认程序（.pptx → Office），保留这条既有能力。
+    const path = a.localPath
     try {
-      const c = await artifactsApi.content(activeSessionId, a.id)
-      if (c.binary) {
-        try { await navigator.clipboard.writeText(path) } catch { /* 剪贴板被拒不影响提示 */ }
-        showToast('二进制产物无法在浏览器预览，路径已复制', 'success')
+      const { isTauri } = await import('@tauri-apps/api/core')
+      if (isTauri() && path) {
+        const { openPath } = await import('@tauri-apps/plugin-opener')
+        await openPath(path)
         return
       }
-      setPreviewArtifact({ sessionId: activeSessionId, artifact: a })
-    } catch (e) {
-      if (e instanceof ApiError) {
-        if (e.status === 404) showToast('产物文件不存在（可能已被删除）', 'info')
-        else if (e.status === 400) showToast('产物路径非法', 'info')
-        else showToast(e.userMessage(), 'info')
-      } else {
-        showToast('打开产物失败', 'info')
-      }
+    } catch { /* 桌面打开失败 → 回落复制路径 */ }
+    if (path) {
+      try { await navigator.clipboard.writeText(path) } catch { /* 剪贴板被拒不影响提示 */ }
     }
+    showToast('该类型暂不支持预览，产物路径已复制', 'info')
+  }, [activeSessionId, showToast])
+
+  // [产物卡 · 在浏览器中打开] **只有 html 有**这个入口 → raw 端点（后端未上线时降级复制路径）
+  const openArtifactInBrowser = useCallback(async (a: SessionArtifactDto) => {
+    if (!activeSessionId) return
+    const ok = await openArtifactRawInBrowser(activeSessionId, a.id)
+    if (ok) return
+    const path = a.localPath
+    if (path) {
+      try { await navigator.clipboard.writeText(path) } catch { /* 剪贴板被拒不影响提示 */ }
+    }
+    showToast('产物原始地址暂不可用，路径已复制', 'info')
+  }, [activeSessionId, showToast])
+
+  // [产物卡 · 编辑] 仅文本类产物有该入口 → html 走 Monaco 视图（直接进编辑态），其余走 Markdown/原文预览视图
+  const editArtifact = useCallback((a: SessionArtifactDto) => {
+    if (!activeSessionId) {
+      showToast('无法编辑产物：未选中会话', 'info')
+      return
+    }
+    if (artifactOpenActionOf(a.title).kind === 'view-html') {
+      setViewArtifact({ sessionId: activeSessionId, artifact: a, initialEdit: true })
+      return
+    }
+    setPreviewArtifact({ sessionId: activeSessionId, artifact: a, initialEdit: true })
   }, [activeSessionId, showToast])
 
   // [Phase3 @引用] 项目树右键「引用到对话」/ 未来其它入口 → 把 @path 插进输入框（与输入框 @ 补全同效）
@@ -2277,7 +2314,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} />
           )}
         </div>
         {currentPermission && (
@@ -2378,6 +2415,8 @@ function App() {
         onOpenFile={openProjectFile}
         artifacts={sessionArtifacts}
         onOpenArtifact={openArtifact}
+        onEditArtifact={editArtifact}
+        onOpenArtifactInBrowser={openArtifactInBrowser}
         onQuoteFile={insertReference}
         showToast={showToast}
         openSettingsAt={openSettingsAt}
@@ -2417,7 +2456,17 @@ function App() {
         <ArtifactPreviewModal
           sessionId={previewArtifact.sessionId}
           artifact={previewArtifact.artifact}
+          initialEdit={previewArtifact.initialEdit}
           close={() => setPreviewArtifact(null)}
+        />
+      )}
+      {/* [产物 · html] Monaco 查看/编辑/保存 + 运行 + 在浏览器中打开（与项目文件 FileViewModal 同一套交互） */}
+      {viewArtifact && (
+        <ArtifactViewModal
+          sessionId={viewArtifact.sessionId}
+          artifact={viewArtifact.artifact}
+          initialEdit={viewArtifact.initialEdit}
+          close={() => setViewArtifact(null)}
         />
       )}
       {showEffort && (

@@ -3,6 +3,7 @@ package com.nexusai.apis.computeruse;
 import com.nexusai.application.agent.computeruse.ComputerUseCaptureResult;
 import com.nexusai.application.agent.computeruse.ComputerUseCoordinateMode;
 import com.nexusai.application.agent.computeruse.ComputerUseCoordinateScaler;
+import com.nexusai.application.agent.computeruse.ComputerUseGates;
 import com.nexusai.application.agent.computeruse.ComputerUseGroundingFrame;
 import com.nexusai.application.agent.computeruse.ComputerUseGroundingRegionVerifier;
 import com.nexusai.application.agent.computeruse.ComputerUseGroundingService;
@@ -12,6 +13,7 @@ import com.nexusai.application.agent.computeruse.Win32ScreenCapturer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.ObjectProvider;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
@@ -66,15 +68,21 @@ public class ComputerUseGroundingPocController {
 
     private final ComputerUseGroundingService groundingService;
 
+    /** 子开关（截图预缩放等）· 可空（单测/孤立装配时按默认走）。 */
+    private final ComputerUseGates gates;
+
     /** 截屏器（JNA native）· <b>懒加载</b>：端点未被调用时不加载 user32/gdi32。 */
     private volatile ComputerUseScreenCapturer capturer;
 
     /**
      * @param groundingService grounding 服务（视觉模型旁路调用）
+     * @param gates           computer-use 子开关（截图预缩放开关）
      */
     @Autowired
-    public ComputerUseGroundingPocController(ComputerUseGroundingService groundingService) {
+    public ComputerUseGroundingPocController(ComputerUseGroundingService groundingService,
+                                             ObjectProvider<ComputerUseGates> gates) {
         this.groundingService = groundingService;
+        this.gates = gates.getIfAvailable();
     }
 
     /**
@@ -241,10 +249,22 @@ public class ComputerUseGroundingPocController {
         }
         synchronized (this) {
             if (capturer == null) {
-                capturer = new Win32ScreenCapturer();
+                capturer = new Win32ScreenCapturer(preSizeToApiTarget());
             }
             return capturer;
         }
+    }
+
+    /**
+     * 截图预缩放开关（{@code nexusai.computer-use.screenshot-pre-size-to-api-target}）。
+     *
+     * <p>默认 <b>true</b>（严格 CCB 口径）；置 false ⇒ 发原图（token 成本显著上升）。
+     * ⛔ 开关在<b>进程启动时</b>读一次（{@code @Value}）⇒ A/B 对照需<b>重启后端</b>。
+     *
+     * @return true = 预缩放
+     */
+    private boolean preSizeToApiTarget() {
+        return gates == null || gates.screenshotPreSizeToApiTarget();
     }
 
     /** 保留两位小数（读数友好）。 */

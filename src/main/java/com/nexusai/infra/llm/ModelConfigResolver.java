@@ -68,6 +68,26 @@ public class ModelConfigResolver {
     }
 
     /**
+     * 模型级 <b>max_tokens（输出上限）</b> · DB {@code models.max_tokens} 列（前端可配）。
+     *
+     * <p><b>WHY 需要它</b>：旁路调用若要<b>显式</b>给 max_tokens，必须知道「不能超过模型自己的
+     * 输出上限」——否则会给出一个模型根本不接受的数字（上游 400）。
+     * <br>取值来源与 {@link com.nexusai.infra.llm.OpenAiSdkProvider} 的默认回落<b>同一列</b>
+     * （{@link ModelNameResolver#resolveMaxTokens}）⇒ 两处口径一致，不会各说各话。
+     *
+     * <p>未命中 / 未配置 / 无效 / 异常 → null（调用方按「未知上限」处理，不要臆造）。
+     *
+     * @param modelName 模型全名（providerName/modelName）或裸模型名
+     * @return models.max_tokens（&gt;0）；未命中 → null
+     */
+    public Integer resolveMaxTokens(String modelName) {
+        if (modelName == null || modelName.isBlank()) {
+            return null;
+        }
+        return ModelNameResolver.resolveMaxTokens(modelMapper, providerMapper, modelName);
+    }
+
+    /**
      * modelName → 真实 (config, providerType)。
      *
      * <p>任一步不可用 → warn + 返回 null（<b>不构造 mock</b>）：

@@ -237,7 +237,9 @@ class SessionArtifactContentTest {
 
         assertThat(c.binary()).isTrue();
         assertThat(c.content()).isNull();
-        assertThat(c.mime()).isEqualTo("application/octet-stream");
+        // mime 按扩展名给真实类型（png → image/png）：/raw 用同一个表出 Content-Type，
+        // 浏览器才能把图片按图片渲染（给 octet-stream 会让浏览器当下载文件而不是显示图片）。
+        assertThat(c.mime()).isEqualTo("image/png");
         assertThat(c.size()).isEqualTo(png.length);
         assertThat(c.truncated()).isFalse();
     }

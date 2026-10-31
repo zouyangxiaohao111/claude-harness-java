@@ -97,6 +97,17 @@ public final class ComputerUsePlatform {
     }
 
     /**
+     * 按当前操作系统装配（可指定截图<b>预缩放</b>开关）。
+     *
+     * @param preSizeToApiTarget 截图是否预缩放（true = 严格 CCB 口径；false = 发原图）
+     * @return 平台实例
+     * @throws UnsupportedOperationException 当前操作系统不支持 computer-use
+     */
+    public static ComputerUsePlatform detect(boolean preSizeToApiTarget) {
+        return of(detect(System.getProperty("os.name")), preSizeToApiTarget);
+    }
+
+    /**
      * 按给定 {@code os.name} 判定平台种类。
      *
      * @param osName {@code System.getProperty("os.name")} 的值（可 null）
@@ -114,19 +125,32 @@ public final class ComputerUsePlatform {
     }
 
     /**
-     * 按平台种类装配。
+     * 按平台种类装配（截图<b>预缩放 = true</b> · 严格 CCB 口径 · 默认）。
      *
      * @param kind 平台种类
      * @return 平台实例
      * @throws UnsupportedOperationException 平台不支持
      */
     public static ComputerUsePlatform of(Kind kind) {
+        return of(kind, true);
+    }
+
+    /**
+     * 按平台种类装配（可指定截图<b>预缩放</b>开关）。
+     *
+     * @param kind               平台种类
+     * @param preSizeToApiTarget 截图是否预缩放到 token 预算内的最大解
+     *                           （true = 严格 CCB 口径；false = 发原图，token 成本显著上升）
+     * @return 平台实例
+     * @throws UnsupportedOperationException 平台不支持
+     */
+    public static ComputerUsePlatform of(Kind kind, boolean preSizeToApiTarget) {
         Kind resolved = kind == null ? Kind.UNSUPPORTED : kind;
         switch (resolved) {
             case WINDOWS -> {
                 return new ComputerUsePlatform(
                         resolved,
-                        new Win32ScreenCapturer(),
+                        new Win32ScreenCapturer(preSizeToApiTarget),
                         new Win32Mouse(),
                         new Win32Keyboard(),
                         new Win32Cursor(),
@@ -139,7 +163,7 @@ public final class ComputerUsePlatform {
             case MACOS -> {
                 return new ComputerUsePlatform(
                         resolved,
-                        new MacOsScreenCapturer(),
+                        new MacOsScreenCapturer(preSizeToApiTarget),
                         new MacOsMouse(),
                         new MacOsKeyboard(),
                         new MacOsCursor(),

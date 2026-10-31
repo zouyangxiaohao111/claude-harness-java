@@ -8,10 +8,10 @@ import { tasksApi } from '@/api/tasks'
 import { subagentApi, type SubagentSummary } from '@/api/subagents'
 import { ApiError } from '@/api/rest'
 import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
-import { formatFileSize } from '@/utils/format'
 import type { Schedule, ScheduleKind, WorkflowRunDto } from '@/api/types'
 import { useSchedules } from '@/hooks/useSchedules'
 import { CollapsibleGroup, RUN_ROW_CAP, RunMoreButton, capRunRows } from './CollapsibleGroup'
+import { ArtifactCards } from './ArtifactCards'
 import { AgentTranscriptView } from './AgentTranscriptView'
 import { cronToHuman } from '@/components/modals/SchedulesPanel'
 import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
@@ -184,8 +184,12 @@ interface RightPanelProps {
   onOpenFile: (projectId: string, path: string) => void
   /** 「产物 / 来源」= 后端轮末异步抽取结果（省略 = 空态，抽到之前也是空） */
   artifacts?: SessionArtifacts
-  /** 产物行点击 → 打开该产物的本地文件（App 处理 · 与 @引用预览同一条通路） */
+  /** 产物行点击 → 打开该产物（App 处理 · 按类型分发的统一打开函数） */
   onOpenArtifact?: (a: SessionArtifactDto) => void
+  /** 产物卡「编辑」→ 打开可编辑预览（仅文本类产物有该入口 · App 处理） */
+  onEditArtifact?: (a: SessionArtifactDto) => void
+  /** 产物卡「在浏览器中打开」→ 系统浏览器打开 raw 端点（仅 html 产物有该入口 · App 处理） */
+  onOpenArtifactInBrowser?: (a: SessionArtifactDto) => void
   /** [Phase3] 文件树右键「引用到对话」→ 插入 @path 到输入框（App 处理 · 与 @ 补全同效） */
   onQuoteFile: (path: string) => void
   showToast: (msg: string, type?: 'success' | 'info') => void
@@ -517,6 +521,8 @@ export const RightPanel = memo(function RightPanel({
   onOpenFile,
   artifacts,
   onOpenArtifact,
+  onEditArtifact,
+  onOpenArtifactInBrowser,
   onQuoteFile,
   showToast,
   openSettingsAt,
@@ -956,26 +962,15 @@ export const RightPanel = memo(function RightPanel({
           desc="这里只放你最终要的结果文件（报告 / 文档 / 设计稿 / 导出物），不包含中间代码。"
         />
       ) : (
-        deliverables.map((a) => (
-          <div
-            key={a.id}
-            className="file-row"
-            title={a.localPath ?? a.title}
-            onClick={() => onOpenArtifact?.(a)}
-          >
-            <span className="file-main">
-              <span className="icon">{EMPTY_ICON_SVG.file}</span>
-              <span className="file-stack">
-                <span className="name">{a.title}</span>
-                <span className="file-sub">
-                  {[a.sizeBytes != null ? formatFileSize(a.sizeBytes) : '', a.summary ?? '']
-                    .filter(Boolean).join(' · ')}
-                </span>
-              </span>
-            </span>
-            <span className="todo-row-arrow">›</span>
-          </div>
-        ))
+        /* [2026-10-31 产物卡片改版] 3 列网格卡片（按类型图标）· 与正文下方同一套组件/同一套图标/
+           同一个点击处理函数（App.openArtifact） */
+        <ArtifactCards
+          items={deliverables}
+          onOpen={onOpenArtifact}
+          onEdit={onEditArtifact}
+          onOpenInBrowser={onOpenArtifactInBrowser}
+          compact
+        />
       )}
     </>
   )

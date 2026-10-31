@@ -1,5 +1,8 @@
 package com.nexusai.application.agent.computeruse;
 
+import com.nexusai.application.agent.mcp.McpStringUtils;
+import com.nexusai.application.agent.mcp.McpToolPool;
+import com.nexusai.application.agent.mcp.McpTransportFactory;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.repository.session.mapper.SessionMapper;
 
@@ -12,6 +15,7 @@ import org.springframework.context.annotation.Configuration;
 import javax.sql.DataSource;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * computer-use 工具注册配置 · Phase 0 的 2 个工具
@@ -41,17 +45,21 @@ import java.util.List;
  * ⇒ 与 CCB 一致（CCB 的 {@code caps.platform === 'win32' ? [...] : []} 条件块
  * ⇒ <b>CCB 的 macOS 工具面也是 24 个</b>）。
  *
- * <p><b>注册通道</b>：与 {@code BrowserMcpToolConfig}（{@code :46-60}）同款 —— 本 {@code @Bean}
- * 返回类型是 {@code List<Tool>}（非 {@code Tool}），Spring 集合注入 {@code @Autowired List<Tool>}
- * 不展开其元素 → 由 {@link com.nexusai.application.agent.tool.ToolRegistry} 以
- * {@code @Resource(name = "computerUseTools")} 显式注入并在 {@code init()} 内
- * {@code registerAll(...)} 逐个注册。
+ * <p><b>注册通道（[CU-MCP] 2026-11-01 改为真 in-process MCP server）</b>：本类的
+ * {@code computerUseMcpServer} {@code @Bean} 持有 35 个工具实现，由
+ * {@link com.nexusai.application.agent.tool.ToolRegistry} 以
+ * {@code @Resource(name = "computerUseMcpServer")} 注入后在 {@code init()} 内触发
+ * {@link ComputerUseMcpServer#assembleMcpTools()} ⇒ <b>真 MCP 协议往返</b>
+ * （initialize + tools/list）⇒ 产出 {@code McpServerTool} 包装注册进注册表。
+ * <br>⚠️ <b>旧的「{@code @Bean List<Tool> computerUseTools} 直注册」路径已移除</b>
+ * （避免双注册：同一批工具既直注册又经 MCP 注册 ⇒ 模型可见工具重复）。
  *
- * <p><b>总开关</b>：yml {@code nexusai.feature.computer-use}（<b>默认 false</b>）。
- * false → 返回空 List ⇒ 所有 {@code mcp__computer-use__*} 工具<b>不注册</b>
+ * <p><b>总开关</b>：yml {@code nexusai.feature.computer-use}。
+ * false → 工具列表为空 ⇒ server 标记 disabled ⇒ {@code tools/list} 返回空列表
+ * ⇒ 所有 {@code mcp__computer-use__*} 工具<b>不注册</b>
  * ⇒ 模型 tools 列表里没有它们（与 {@code BrowserMcpToolConfig} 的 {@code browser-mcp} 门同款行为）。
  *
- * <p><b>为什么默认 false</b>：computer-use 能控制用户桌面 —— 生产默认关，
+ * <p><b>为什么默认关</b>：computer-use 能控制用户桌面 —— 生产默认关，
  * 对齐 CC 的 {@code feature('CHICAGO_MCP')} 生产默认 false 口径。
  * （CCB 的 GrowthBook 开关默认 true，是本仓<b>有意的出包安全选择</b>，非行为缺陷。）
  *
@@ -254,8 +262,13 @@ public class ComputerUseToolConfig {
         // 护栏③ · 系统性偏移补偿（默认 0 = 不启用 ⇒ 行为不变）
         double offsetX = gates != null ? gates.groundingOffsetX() : 0.0d;
         double offsetY = gates != null ? gates.groundingOffsetY() : 0.0d;
+        // grounding 专用链路关闭 thinking（默认 true；逃生舱 = yml 置 false）
+        boolean disableThinking = gates == null || gates.groundingDisableThinking();
         return new ComputerUseGroundingService(modelConfigResolver, llmProviderFactory, sideCallClient,
-                offsetX, offsetY);
+                offsetX, offsetY,
+                ComputerUseGroundingService.DEFAULT_MAX_TOKENS,
+                ComputerUseGroundingService.RETRY_MAX_TOKENS,
+                disableThinking);
     }
 
     /**
@@ -339,6 +352,13 @@ public class ComputerUseToolConfig {
      * {@code caps.platform === 'win32' ? [...] : []} 条件块（{@code tools.ts:420-836}）一致：
      * {@code open_application} 之后、{@code switch_display} 之前）。
      *
+     * <p>⚠️ <b>不再是 {@code @Bean}</b>（[CU-MCP] 2026-11-01）：computer-use 改走
+     * <b>真 in-process MCP server</b> ⇒ 工具由 {@link ComputerUseMcpServer} 持有并在
+     * {@code tools/call} 时派发，<b>不再</b>作为 {@code List<Tool>} bean 直注册进 ToolRegistry
+     * （避免双注册：同一批工具既直注册又经 MCP 注册 ⇒ 模型可见工具重复）。
+     * <br>本方法保留为 public（单测直接调用，见 {@code ComputerUseToolConfigTest} /
+     * {@code ComputerUseToolSurfaceTest} / {@code ComputerUseMacOsToolSurfaceTest}）。
+     *
      * @param geometryStore 几何快照存储
      * @param grantStore    会话授权位存储
      * @param lockService   跨会话锁服务
@@ -351,8 +371,39 @@ public class ComputerUseToolConfig {
      * @param groundingStore [Phase 1e] grounding 定位帧存储（护栏② 用；null ⇒ 落点校验跳过）
      * @return 工具列表（开关关闭时为空 List）
      */
-    @Bean
     public List<Tool> computerUseTools(ComputerUseGeometryStore geometryStore,
+                                       ComputerUseGrantStore grantStore,
+                                       ComputerUseLockService lockService,
+                                       ComputerUseVisionCapability visionCapability,
+                                       ComputerUseGroundingService groundingService,
+                                       ComputerUseMouseState mouseState,
+                                       ComputerUseDisplayStore displayStore,
+                                       ComputerUseWindowBindingStore bindingStore,
+                                       ComputerUseGroundingStore groundingStore) {
+        return buildToolBundle(geometryStore, grantStore, lockService, visionCapability,
+                groundingService, mouseState, displayStore, bindingStore, groundingStore).tools();
+    }
+
+    /**
+     * 构建 computer-use 工具集合 + 解析出的平台。
+     *
+     * <p><b>WHY 单独一个方法</b>：[CU-MCP] 的 MCP server bean 需要<b>同一个</b>平台实例
+     * 来决定工具面（Windows 35 / macOS 24）与能力记录的 {@code platform} 字段
+     * ⇒ 二次调用 {@code resolvePlatform()} 会<b>二次加载 JNA</b>（Windows 侧）且可能与
+     * 工具面判定漂移 ⇒ 一次性构建、同时产出两者。
+     *
+     * @param geometryStore 几何快照存储
+     * @param grantStore    会话授权位存储
+     * @param lockService   跨会话锁服务
+     * @param visionCapability 视觉能力判定
+     * @param groundingService grounding 降级服务
+     * @param mouseState    会话级「左键按住」状态
+     * @param displayStore  会话级「选中的显示器」存储
+     * @param bindingStore  会话级窗口绑定存储
+     * @param groundingStore grounding 定位帧存储
+     * @return 工具集合 + 平台（开关关闭 ⇒ 平台 null + 空工具列表）
+     */
+    private ComputerUseToolBundle buildToolBundle(ComputerUseGeometryStore geometryStore,
                                        ComputerUseGrantStore grantStore,
                                        ComputerUseLockService lockService,
                                        ComputerUseVisionCapability visionCapability,
@@ -365,7 +416,7 @@ public class ComputerUseToolConfig {
             if (log.isInfoEnabled()) {
                 log.info("nexusai.feature.computer-use=false → mcp__computer-use__* 工具不注册（默认关，需 yml true）");
             }
-            return List.of();
+            return new ComputerUseToolBundle(null, List.of());
         }
         if (grantStore == null || lockService == null) {
             throw new IllegalStateException(
@@ -546,11 +597,20 @@ public class ComputerUseToolConfig {
                 new ComputerUseBatchTool(keyboard, mouseActions, cursor, animator, capturer,
                         geometryStore, coordinateMode, grantStore, foregroundAppResolver,
                         effectiveMouseState, ComputerUseSleeper.REAL)));
-        log.info("注册 {} 个 computer-use 工具 → ToolRegistry: {}（视觉闸={} · 坐标模式={} · grounding降级={}）",
+        log.info("注册 {} 个 computer-use 工具 → MCP server: {}（视觉闸={} · 坐标模式={} · grounding降级={}）",
                 tools.size(), tools.stream().map(Tool::name).toList(),
                 visionCapability != null ? "已接线" : "未接线", coordinateMode.wire(),
                 groundingEnabled ? "已开启" : "已关闭");
-        return tools;
+        return new ComputerUseToolBundle(platform, tools);
+    }
+
+    /**
+     * 工具集合 + 平台 · {@link #buildToolBundle} 的返回体。
+     *
+     * @param platform 解析出的平台（开关关闭 ⇒ null）
+     * @param tools    工具列表
+     */
+    private record ComputerUseToolBundle(ComputerUsePlatform platform, List<Tool> tools) {
     }
 
     /**
@@ -563,7 +623,128 @@ public class ComputerUseToolConfig {
      * @return 平台实例
      */
     protected ComputerUsePlatform resolvePlatform() {
-        return ComputerUsePlatform.detect();
+        return ComputerUsePlatform.detect(screenshotPreSizeToApiTarget());
+    }
+
+    /**
+     * 截图预缩放开关（{@code nexusai.computer-use.screenshot-pre-size-to-api-target}）。
+     *
+     * <p>默认 <b>true</b> = 严格 CCB 口径（缩到 token 预算内的最大解）。
+     * 置 false ⇒ 发原图（token 成本显著上升；实测同目标定位误差 avg 4.4px → 15.1px）。
+     *
+     * @return true = 预缩放
+     */
+    protected boolean screenshotPreSizeToApiTarget() {
+        return gates == null || gates.screenshotPreSizeToApiTarget();
+    }
+
+    /**
+     * computer-use 的 <b>真 in-process MCP server</b> bean · [CU-MCP] 2026-11-01。
+     *
+     * <p><b>取代</b>旧的「{@code @Bean List<Tool> computerUseTools} 直注册」路径：
+     * <ul>
+     *   <li>本 bean 持有 35 个工具实现（<b>业务语义零改动</b>），并把它们交给
+     *       {@link ComputerUseMcpServer}；</li>
+     *   <li>server 由 {@code ToolRegistry.init()}（ApplicationReadyEvent）触发
+     *       {@link ComputerUseMcpServer#assembleMcpTools()} 装配 ⇒
+     *       <b>真 MCP 协议往返</b>（initialize + tools/list）⇒ 产出
+     *       {@code McpServerTool} 包装（工具名由
+     *       {@link com.nexusai.application.agent.mcp.McpStringUtils#buildMcpToolName} 生成）；</li>
+     *   <li>工具在 builtin <b>之后</b>注册 ⇒ 保持「builtin 前缀 + MCP 后缀」分区不变式（S-3）。</li>
+     * </ul>
+     *
+     * <p><b>模型可见工具名逐字不变</b>：{@code mcp__computer-use__<tool>}（与旧直注册路径同）。
+     *
+     * <p><b>开关</b>：{@code nexusai.feature.computer-use}（默认 true）关闭 ⇒
+     * 工具列表为空 ⇒ server 标记 disabled ⇒ {@code tools/list} 返回空列表 ⇒ 工具不出现。
+     *
+     * @param geometryStore 几何快照存储
+     * @param grantStore    会话授权位存储
+     * @param lockService   跨会话锁服务
+     * @param visionCapability 视觉能力判定
+     * @param groundingService grounding 降级服务
+     * @param mouseState    会话级「左键按住」状态
+     * @param displayStore  会话级「选中的显示器」存储
+     * @param bindingStore  会话级窗口绑定存储
+     * @param groundingStore grounding 定位帧存储
+     * @param transportFactory MCP transport 工厂（登记进程内 server）
+     * @param mcpToolPool   MCP 工具池（装配 + 工具注册）· <b>{@code @Lazy} 破循环</b>
+     *                      （toolRegistry → 本 bean → mcpToolPool → toolRegistry；
+     *                      代理在装配期（ApplicationReadyEvent）才解析）
+     * @return computer-use MCP server
+     */
+    @Bean
+    public ComputerUseMcpServer computerUseMcpServer(ComputerUseGeometryStore geometryStore,
+                                                     ComputerUseGrantStore grantStore,
+                                                     ComputerUseLockService lockService,
+                                                     ComputerUseVisionCapability visionCapability,
+                                                     ComputerUseGroundingService groundingService,
+                                                     ComputerUseMouseState mouseState,
+                                                     ComputerUseDisplayStore displayStore,
+                                                     ComputerUseWindowBindingStore bindingStore,
+                                                     ComputerUseGroundingStore groundingStore,
+                                                     McpTransportFactory transportFactory,
+                                                     @org.springframework.context.annotation.Lazy McpToolPool mcpToolPool) {
+        ComputerUseToolBundle bundle = buildToolBundle(geometryStore, grantStore, lockService,
+                visionCapability, groundingService, mouseState, displayStore, bindingStore, groundingStore);
+        // 能力记录：platform 决定 Windows 专属 11 个工具是否下发（与工具面同源 ⇒ 同一个 platform 实例）
+        ComputerUseCapabilities capabilities = new ComputerUseCapabilities(
+                ComputerUseRequestAccessResult.SCREENSHOT_FILTERING,
+                platformKey(bundle.platform()),
+                false);
+        ComputerUseMcpServer server = ComputerUseMcpServer.createComputerUseMcpServer(
+                capabilities,
+                resolveCoordinateMode(),
+                null,
+                byBareToolName(bundle.tools()),
+                bundle.tools().isEmpty(),
+                ComputerUseSessionContext::of);
+        server.setMcpToolPool(mcpToolPool);
+        server.setTransportFactory(transportFactory);
+        return server;
+    }
+
+    /**
+     * 平台 → CCB 能力记录的 {@code platform} 取值。
+     *
+     * <p>CCB {@code src/utils/computerUse/common.ts:54-63}：
+     * {@code 'win32' | 'linux' | 'darwin'}（{@code process.platform} 映射）。
+     *
+     * @param platform 平台实例（null ⇒ 开关关闭 ⇒ 回落 {@code "linux"}，无工具下发）
+     * @return CCB 平台键
+     */
+    private static String platformKey(ComputerUsePlatform platform) {
+        if (platform == null) {
+            return "linux";
+        }
+        return switch (platform.kind()) {
+            case WINDOWS -> "win32";
+            case MACOS -> "darwin";
+            case UNSUPPORTED -> "linux";
+        };
+    }
+
+    /**
+     * 工具列表 → <b>裸工具名</b> → 工具 的映射（MCP {@code tools/call} 的 name 是裸名）。
+     *
+     * <p>裸名取自工具自身的 {@code name()}（形如 {@code mcp__computer-use__screenshot}）
+     * 经 {@link McpStringUtils#mcpInfoFromString} 解析 ⇒ <b>单一事实来源</b>，
+     * 不另建名字表（避免两处漂移）。
+     *
+     * @param tools 工具列表
+     * @return 裸工具名 → 工具
+     */
+    private static Map<String, Tool> byBareToolName(List<Tool> tools) {
+        Map<String, Tool> map = new java.util.LinkedHashMap<>();
+        for (Tool tool : tools) {
+            McpStringUtils.McpInfo info = McpStringUtils.mcpInfoFromString(tool.name());
+            if (info == null || info.toolName() == null) {
+                throw new IllegalStateException(
+                        "[computer-use] 工具名不是合法 MCP 名（无法解析裸工具名）: " + tool.name());
+            }
+            map.put(info.toolName(), tool);
+        }
+        return map;
     }
 
     /**

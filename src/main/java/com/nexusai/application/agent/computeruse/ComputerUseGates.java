@@ -172,6 +172,45 @@ public class ComputerUseGates {
     private double groundingOffsetY;
 
     /**
+     * 截图<b>预缩放</b>开关（默认 <b>true</b> = 严格 CCB 口径）。
+     *
+     * <p>{@code true} = 缩到 {@link ComputerUseApiResize#targetImageSize} 的输出尺寸
+     * （1920×1080 → 1456×819，图像 token 2691 → 1560，<b>省 42%</b>）；
+     * <br>{@code false} = <b>发原图</b>（1920×1080，图像 token 2691，<b>+72%</b>）。
+     *
+     * <p><b>⚠️ 实测代价</b>（本机 2026-11-01 真机 A/B · 同一个目标 · 各 10 次采样）：
+     * <b>压缩会降低定位精度</b> ——
+     * <ul>
+     *   <li>120px 目标：误差 <b>avg 4.4px（原图）→ 15.1px（压缩）</b>（3.4×）；</li>
+     *   <li>10px 的「✕」字形：误差 <b>avg 11.4px（原图）→ 39.2px（压缩）</b>
+     *       ⇒ <b>目标越小，压缩的精度代价越大</b>。</li>
+     * </ul>
+     * ⇒ 默认 <b>true</b>（严格 CCB 口径 · 省 42% token）；
+     * <b>「定位精度优先 / 目标很小 / token 不敏感」⇒ 置 false 发原图</b>。
+     *
+     * <p><b>⚠️ 不变式（无论开关如何都成立）</b>：我们自己钉死尺寸、后续任何一环都不再压 ⇒
+     * 服务端记录的图像尺寸 <b>恒等于</b>送给模型的图像尺寸。
+     * <br>⚠️ 但置 false 时送出的是 &gt; 1568 长边的原图 ⇒ 某些上游（Anthropic 系）会
+     * <b>服务端二次缩放</b> ⇒ 那时坐标空间与记录尺寸脱节。本机实测 {@code deepseek-flash}
+     * <b>不自带压缩</b> ⇒ 对它安全。
+     */
+    @Value("${nexusai.computer-use.screenshot-pre-size-to-api-target:true}")
+    private boolean screenshotPreSizeToApiTarget;
+
+    /**
+     * grounding 专用链路是否<b>关闭 thinking</b>（默认 <b>true</b>）。
+     *
+     * <p><b>WHY</b>：grounding 只要「找到/没找到 + 坐标」的短 JSON，<b>不需要推理链</b>；
+     * 而 thinking 会吃光输出预算（实测 deepseek-flash 因 thinking 返回空正文，1/5 发生）
+     * ⇒ 在这条<b>专用链路</b>上关掉最稳。
+     * <br>实现：请求层 {@code ThinkingConfig.disabled()} ⇒ openai-compatible 端点下发
+     * {@code thinking:{type:'disabled'}}（DeepSeek 系官方约定）；⛔ Anthropic 端点不消费该字段 ⇒ 无副作用。
+     * <br><b>逃生舱</b>：若某个上游拒绝该字段（400），置 false 即回到「不显式关闭」的老行为。
+     */
+    @Value("${nexusai.computer-use.grounding-disable-thinking:true}")
+    private boolean groundingDisableThinking;
+
+    /**
      * 冻结后的坐标模式（首次读取即冻结 · CCB {@code gates.ts:66-72} 的
      * {@code frozenCoordinateMode}）。
      */
@@ -299,5 +338,23 @@ public class ComputerUseGates {
      */
     public double groundingOffsetY() {
         return groundingOffsetY;
+    }
+
+    /**
+     * 截图预缩放开关（默认 true = 严格 CCB 口径；false = 发原图，token 成本显著上升）。
+     *
+     * @return true = 预缩放到 token 预算内的最大解
+     */
+    public boolean screenshotPreSizeToApiTarget() {
+        return screenshotPreSizeToApiTarget;
+    }
+
+    /**
+     * grounding 专用链路是否关闭 thinking（默认 true）。
+     *
+     * @return true = 下发 {@code thinking:{type:'disabled'}}
+     */
+    public boolean groundingDisableThinking() {
+        return groundingDisableThinking;
     }
 }

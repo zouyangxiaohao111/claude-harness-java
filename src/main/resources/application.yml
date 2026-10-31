@@ -442,6 +442,23 @@ nexusai:
     # 默认 true（2026-10-31 用户裁定：跑视觉 grounding 真 key PoC）⇒ 端点可用；
     # 置 false ⇒ 端点 404。开启后可手工量「视觉模型定位坐标」的像素误差。
     grounding-poc-enabled: true
+    # ── 2026-11-01 grounding 加固（实测 deepseek-flash）+ 截图尺寸开关 ────────────────
+    # grounding 专用链路【关闭 thinking】：grounding 只要「找到/没找到 + 坐标」的短 JSON，
+    #   不需要推理链；thinking 会吃光输出预算（实测 deepseek-flash 因 thinking 返回空正文，1/5 发生）
+    #   ⇒ 下发 thinking:{type:'disabled'}（DeepSeek 系官方约定的关闭方式）。
+    #   ⛔ Anthropic 端点不消费该字段 ⇒ 无副作用。逃生舱：上游拒绝该字段时置 false。
+    grounding-disable-thinking: true
+    # 截图预缩放开关：true = 严格 CCB 口径（缩到 token 预算内的最大解，1920×1080 → 1456×819，
+    #   图像 token 2691 → 1560，省 42%）；false = 发原图（图像 token 2691，+72%）。
+    # ⚠️ 实测代价（本机真机 A/B · 同一个目标 · 各 10 次采样）：
+    #   压缩【降低定位精度】—— 120px 目标：误差 avg 4.4px(原图) → 15.1px(压缩)（3.4×）；
+    #   10px 的「✕」字形：误差 avg 11.4px(原图) → 39.2px(压缩) ⇒ 目标越小代价越大。
+    #   ⇒ 默认 true（严格 CCB 口径 · 省 token）；「精度优先 / 目标很小 / token 不敏感」⇒ 置 false。
+    # ⭐ 不变式（无论开关如何都成立）：我们自己钉死尺寸、后续任何一环都不再压
+    #   ⇒ 服务端记录的图像尺寸恒等于送给模型的图像尺寸。
+    # ⚠️ 置 false 时送出 > 1568 长边的原图 ⇒ 依赖上游【不】做服务端二次缩放
+    #   （本机实测 deepseek-flash 不压缩；Anthropic 系会压 ⇒ 坐标空间会失配）。
+    screenshot-pre-size-to-api-target: true
 
   # ---------------------------------------------------------------
   # [ODF-A3] bare 模式统一判定 · Java 独有增强（CC envUtils.ts:60-65 无对应配置）

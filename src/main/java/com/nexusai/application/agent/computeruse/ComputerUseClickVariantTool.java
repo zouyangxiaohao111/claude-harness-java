@@ -2,6 +2,7 @@ package com.nexusai.application.agent.computeruse;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.application.agent.mcp.McpStringUtils;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.tool.AgentToolResult;
@@ -68,7 +69,8 @@ public abstract class ComputerUseClickVariantTool implements Tool {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /** 工具全名前缀（CCB {@code setup.ts:17-21} 要求固定为 {@code mcp__computer-use__<tool>}）。 */
-    public static final String TOOL_NAME_PREFIX = "mcp__computer-use__";
+    public static final String TOOL_NAME_PREFIX =
+            McpStringUtils.getMcpPrefix(ComputerUseMcpServer.SERVER_NAME);
 
     /**
      * 输入 schema 模板 · 对齐 CCB {@code tools.ts:140-146}（{@code coordinateTuple}）

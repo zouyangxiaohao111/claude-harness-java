@@ -13,6 +13,7 @@ import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
 // [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
+import { ArtifactCards } from '@/components/right/ArtifactCards'
 
 /** 稳定空文件列表（changedFiles 零态 selector 兜底 · 避免每次新数组引用触发无限重渲染） */
 const NO_CHANGED_FILES: SessionFile[] = []
@@ -366,6 +367,12 @@ interface MessageListProps {
   onOpenRightTab?: (tab: 'artifacts' | 'files' | 'sources') => void
   /** [产物/来源] 本会话产物（后端轮末异步抽取）：正文产物卡片 + 「查看所有产物 (N)」计数 */
   artifacts?: SessionArtifacts
+  /** [产物卡片] 点产物卡 → 按类型分发的统一打开函数（App.openArtifact · 与右栏**同一个**） */
+  onOpenArtifact?: (a: SessionArtifactDto) => void
+  /** [产物卡片] 点「编辑」→ 打开可编辑预览（仅文本类产物有该入口） */
+  onEditArtifact?: (a: SessionArtifactDto) => void
+  /** [产物卡片] 点「在浏览器中打开」→ 系统浏览器打开 raw 端点（仅 html 产物有该入口） */
+  onOpenArtifactInBrowser?: (a: SessionArtifactDto) => void
   /** [历史轮用量] 后端按轮聚合的真实用量（键 = 发起该轮的 userMessageId · 只补消息级无 token 的轮） */
   turnUsageFallback?: Map<string, TurnUsageDto>
   /** [用户消息编辑重发] 用户气泡 hover 铅笔 → 裁剪该消息起全部对话并用新文本重发（App 注入）。
@@ -883,42 +890,24 @@ function formatTurnUsageLabel(u: TurnUsageSummary): string | null {
   return parts.length > 0 ? parts.join(' · ') : null
 }
 
-/** 正文产物卡片图标（文件线条 · 与右栏空态同一描边风格） */
-const ARTIFACT_ICON_SVG = (
-  <svg viewBox="0 0 20 20" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-    <path d="M5.2 2.8h6.1L15 6.5v10.7H5.2z" />
-    <path d="M11.1 2.9v3.7h3.8" />
-  </svg>
-)
-
-/** [产物卡片] 本轮交付物（最多 3 条 · 超出部分走 TurnFooter 的「查看所有产物」）：
- *  整块可点 → 打开本地文件；无 localPath 的产物不绑定点击（不假装能打开）。 */
-function TurnArtifacts({ items, onOpen }: {
+/** [产物卡片] 本轮交付物（**最多 3 张** · 超出部分走 TurnFooter 的「查看所有产物」）。
+ *
+ *  <p>[2026-10-31 产物卡片改版] 与右栏「产物」tab **同一套**卡片组件 / 同一套按类型图标 /
+ *  **同一个点击处理函数**（App.openArtifact）⇒ 用户在正文与右栏看到的是完全一致的产物入口。 */
+function TurnArtifacts({ items, onOpen, onEdit, onOpenInBrowser }: {
   items: SessionArtifactDto[]
-  onOpen?: (path: string) => void
+  onOpen?: (a: SessionArtifactDto) => void
+  onEdit?: (a: SessionArtifactDto) => void
+  onOpenInBrowser?: (a: SessionArtifactDto) => void
 }) {
-  const shown = items.slice(0, 3)
   return (
     <div className="msg-artifacts">
-      {shown.map((a) => {
-        const path = a.localPath
-        const sub = [a.sizeBytes != null ? formatFileSize(a.sizeBytes) : '', a.summary ?? '']
-          .filter(Boolean).join(' · ')
-        return (
-          <div
-            key={a.id}
-            className={`msg-artifact${path ? ' clickable' : ''}`}
-            title={path ?? a.title}
-            onClick={path ? () => onOpen?.(path) : undefined}
-          >
-            <span className="ma-icon" aria-hidden="true">{ARTIFACT_ICON_SVG}</span>
-            <span className="ma-main">
-              <span className="ma-name">{a.title}</span>
-              {sub && <span className="ma-sub">{sub}</span>}
-            </span>
-          </div>
-        )
-      })}
+      <ArtifactCards
+        items={items.slice(0, 3)}
+        onOpen={onOpen}
+        onEdit={onEdit}
+        onOpenInBrowser={onOpenInBrowser}
+      />
     </div>
   )
 }
@@ -1559,7 +1548,7 @@ const FOLD_DEFAULT_TURNS = 3
 /** 稳定空集合（折叠态零态；模块级同引用 ⇒ 不触发无谓重渲）*/
 const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, turnUsageFallback, onEditResend }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
@@ -2224,7 +2213,14 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         ? cached.node
         : (
           <>
-            {withArtifacts && <TurnArtifacts items={deliverables} onOpen={onOpenRefFile} />}
+            {withArtifacts && (
+              <TurnArtifacts
+                items={deliverables}
+                onOpen={onOpenArtifact}
+                onEdit={onEditArtifact}
+                onOpenInBrowser={onOpenArtifactInBrowser}
+              />
+            )}
             {(usageLabel || withLinks) && (
               <TurnFooter artifactCount={artifactCount} changeCount={changeCount}
                 onOpen={withLinks ? onOpenRightTab : undefined} usageLabel={usageLabel} />
@@ -2237,7 +2233,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     footerCacheRef.current = nextCache
     return result
   }, [flatRows, activeTurnKeys, usageLabelByTurn, lastAssistantId, turnEnded, artifactCount, changeCount,
-      onOpenRightTab, deliverables, artifactsSig, onOpenRefFile])
+      onOpenRightTab, deliverables, artifactsSig, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser])
   /** 用户手动展开/收起的历史轮次（缺省 = 已结束轮次收起、进行中轮次展开）。 */
   const [processOpenByTurn, setProcessOpenByTurn] = useState<Record<string, boolean>>({})
   const toggleTurnProcess = useCallback((key: string, open: boolean) => {

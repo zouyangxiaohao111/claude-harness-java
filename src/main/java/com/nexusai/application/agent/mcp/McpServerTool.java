@@ -75,11 +75,22 @@ class McpServerTool implements Tool {
     /** CC original: searchHint (client.ts:1779-1783) · 空白折叠后的搜索提示，非 string 时为 null. */
     private final String searchHint;
     private final McpToolPool pool;
+    /**
+     * [CU-MCP] 权限自决委托工具（可空）· 内建 server（computer-use）用它把
+     * {@code checkPermissions} 交回底层工具自表态。
+     *
+     * <p><b>WHY</b>：默认 MCP 语义是「工具不表态 → Passthrough → 第 3 层转 Ask」（弹窗）。
+     * computer-use 的免弹窗语义要求「CU 工具放行 + {@code request_access} 仍走 Ask」
+     * ⇒ 委托给底层 CU 工具（普通工具 {@code Allow} / {@code request_access} {@code Passthrough}）。
+     * <br>⛔ 不用 allow rule 实现（{@code CheckLayer2b_ToolAlwaysAllowed} 首个命中即返回
+     * ⇒ 会把 {@code request_access} 一起放行）。
+     */
+    private final Tool permissionDelegate;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
     /**
-     * 9 参构造器（package-private，仅 McpToolPool.wrapMcpTool 调用，DIM-11）。
+     * 10 参构造器（package-private，仅 McpToolPool.wrapMcpTool 调用，DIM-11）。
      *
      * @param serverName  MCP server 名（如 "filesystem"）
      * @param toolName    MCP server 上的 tool 名（如 "Read"）
@@ -96,10 +107,12 @@ class McpServerTool implements Tool {
      *                    实现已随 D-B10-02 删除，serverUrl 由 McpToolPool.wrapMcpTool
      *                    从 TransportConfig.command 提取，语义不变）
      * @param pool        全局 MCP 注册池（callTool 委托目标）
+     * @param permissionDelegate 权限自决委托工具（可空 ⇒ 保持默认 Passthrough 语义）
      */
     McpServerTool(String serverName, String toolName, String mcpToolName,
                   JsonNode inputSchema, JsonNode annotations, JsonNode meta,
-                  String description, String serverUrl, McpToolPool pool) {
+                  String description, String serverUrl, McpToolPool pool,
+                  Tool permissionDelegate) {
         this.serverName = serverName;
         this.toolName = toolName;
         this.mcpToolName = mcpToolName;
@@ -110,6 +123,30 @@ class McpServerTool implements Tool {
         this.serverUrl = serverUrl;
         this.searchHint = extractSearchHint(meta);
         this.pool = pool;
+        this.permissionDelegate = permissionDelegate;
+    }
+
+    /**
+     * 9 参兼容构造器（无权限自决委托 ⇒ 保持默认 MCP 语义：Passthrough → Ask）。
+     *
+     * <p>[CU-MCP] 10 参构造器新增了 {@code permissionDelegate}；本重载保留旧签名
+     * ⇒ 既有单测（{@code McpServerToolTest} 等）零改动。
+     *
+     * @param serverName  MCP server 名
+     * @param toolName    MCP server 上的 tool 名
+     * @param mcpToolName 注册到 tool 系统的名字
+     * @param inputSchema MCP 返回的 input JSON Schema
+     * @param annotations MCP tools/list 返回的 annotations 节点
+     * @param meta        MCP tools/list 返回的 _meta 节点
+     * @param description MCP tools/list 返回的 description
+     * @param serverUrl   MCP server base URL
+     * @param pool        全局 MCP 注册池
+     */
+    McpServerTool(String serverName, String toolName, String mcpToolName,
+                  JsonNode inputSchema, JsonNode annotations, JsonNode meta,
+                  String description, String serverUrl, McpToolPool pool) {
+        this(serverName, toolName, mcpToolName, inputSchema, annotations, meta,
+                description, serverUrl, pool, null);
     }
 
     @Override
@@ -212,6 +249,18 @@ class McpServerTool implements Tool {
      */
     @Override
     public PermissionResult checkPermissions(JsonNode input, ToolUseContext ctx) {
+        // [CU-MCP] 内建 server 的权限自决委托：把 checkPermissions 交回底层工具自表态。
+        //   computer-use：普通 CU 工具自表态 Allow（⇒ 第 3 层原样透传 ⇒ 免弹窗），
+        //   request_access 自表态 Passthrough（⇒ 第 3 层转 Ask ⇒ 审批唯一入口仍是它）。
+        if (permissionDelegate != null) {
+            PermissionResult delegated = permissionDelegate.checkPermissions(input, ctx);
+            if (log.isDebugEnabled()) {
+                log.debug("[McpServerTool] 权限自决委托: server={} tool={} → {}",
+                    serverName, toolName,
+                    delegated == null ? "null" : delegated.getClass().getSimpleName());
+            }
+            return delegated;
+        }
         if (log.isDebugEnabled()) {
             log.debug("MCP 工具 checkPermissions → Passthrough + addRules 建议: server={} tool={} mcpToolName={}",
                 serverName, toolName, mcpToolName);
@@ -491,9 +540,14 @@ class McpServerTool implements Tool {
             // [impl-I-4 T6] URL elicitation 重试包装：-32042 → 状态机两阶段；decline/cancel → decline 文本
             // （fail-closed，前端未接线 auto-decline）。对齐 CC callMCPToolWithUrlElicitationRetry
             // （client.ts:2813-3027）。
+            // [CU-MCP] 会话型 server（computer-use）随带会话信封（sessionId / agentId / 模型名）——
+            //   MCP tools/call 的 params 无会话标识，CU 工具必须拿到 ToolUseContext 才能定位
+            //   会话级授权位与截图几何。信封放在 params 同级键，不污染 arguments。
+            McpCallContext callContext = pool.isSessionAwareServer(serverName)
+                ? McpCallContext.from(ctx) : null;
             McpElicitationStateMachine.ElicitationOutcome outcome = pool.elicitationMachine()
                 .callWithElicitationRetry(serverName, toolName,
-                    () -> pool.callTool(serverName, toolName, args));
+                    () -> pool.callTool(serverName, toolName, args, callContext));
             if (outcome.declined()) {
                 // [impl-I-4 F5 rework] CC callMCPToolWithUrlElicitationRetry 对 decline 返回
                 // `{ content: "URL elicitation was declined..." }` —— 正常 content（isError 未设/非错误），

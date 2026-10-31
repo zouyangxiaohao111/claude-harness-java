@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react'
 import { BASE_URL } from '@/api/rest'
+import { artifactRawUrl } from '@/api/artifacts'
 import type { StandalonePayload } from '@/utils/standalonePreview'
 
 export interface PreviewContent {
@@ -56,11 +57,14 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
     setUrl(undefined)
     if (!payload) { setCode(undefined); return }
 
-    if (payload.type === 'html') { setCode(payload.code); return }
-
     const item = payload.item
     const project = payload.project
-    // 字节源：附件 path/base64/url 或项目 raw 端点
+    const artifact = payload.artifact
+
+    // html：内联 code 直接给；html 产物 → 取 raw 端点的文本
+    if (payload.type === 'html' && !artifact) { setCode(payload.code); return }
+
+    // 字节源：附件 path/base64/url、项目 raw 端点、或产物 raw 端点
     const readBytes = async (): Promise<Uint8Array> => {
       if (item) {
         if (item.path) {
@@ -77,6 +81,11 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
       }
       if (project) {
         const res = await fetch(projectRawUrl(project.id, project.path))
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return new Uint8Array(await res.arrayBuffer())
+      }
+      if (artifact) {
+        const res = await fetch(artifactRawUrl(artifact.sessionId, artifact.artifactId))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         return new Uint8Array(await res.arrayBuffer())
       }
@@ -110,6 +119,17 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
             setBytes(await readBytes())
           } else {
             if (!cancelled) setUrl(projectRawUrl(project.id, project.path))
+          }
+        } else if (artifact) {
+          if (payload.type === 'html') {
+            const res = await fetch(artifactRawUrl(artifact.sessionId, artifact.artifactId))
+            if (!res.ok) throw new Error(`HTTP ${res.status}`)
+            const text = await res.text()
+            if (!cancelled) setCode(text)
+          } else if (isByteKind) {
+            setBytes(await readBytes())
+          } else {
+            if (!cancelled) setUrl(artifactRawUrl(artifact.sessionId, artifact.artifactId))
           }
         } else {
           throw new Error('暂不支持预览该内容')
