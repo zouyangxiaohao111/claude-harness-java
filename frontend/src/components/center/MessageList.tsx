@@ -621,10 +621,20 @@ export function ToolGroup({ tools, matchedRule, sessionId, title, live = false }
   const first = tools[0]!
   const firstName = cleanToolName(first.name)
   const argFull = toolArgSummary(first.arguments)
-  const argShort = shortToolArgSummary(first.arguments)
-  const fallback = argShort ? `${firstName}: ${argShort}` : firstName
-  const label = title?.trim() || fallback || `并行 ${tools.length} 个工具`
-  const tip = title?.trim() || (argFull ? `${firstName}: ${argFull}` : firstName) || `并行 ${tools.length} 个工具`
+  /**
+   * [2026-11-03 用户实测「切换会话后同一个工具显示两遍」]
+   *
+   * <p><b>根因</b>：组头的兜底标题原先取「首个工具名 + 参数摘要」，而 body 里又渲染了
+   * **全部**工具（含第一个）⇒ 第一个工具在视觉上出现两遍（截图：外层组头
+   * `✓ Bash: find . -name "*.java"` + 内层首项 `✓ Bash find . -name "*.java"`）。
+   *
+   * <p><b>修法</b>：组头兜底标题改为「首个工具名 + 并行 N 个」这种**概括**表述 ——
+   * 不再复述首个工具的参数（参数在 body 的子项里能看到）。
+   * 有 `tool_use_summary` 文本时（`title`）不受影响 —— 那是后端给的独立摘要。
+   */
+  const fallback = `并行 ${tools.length} 个工具`
+  const label = title?.trim() || `${firstName} · ${fallback}`
+  const tip = title?.trim() || (argFull ? `${firstName}: ${argFull}` : firstName) || fallback
   // 聚合状态：任一失败 → ✗；有未完成（live=执行中 / 已结束=中断）→ ⊙/⊘；否则 ✓
   const anyError = tools.some((t) => t.isError)
   const anyPending = tools.some((t) => t.result == null && !t.isError)
@@ -2515,13 +2525,82 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     if (keys.size === 0 && !turnEnded && liveTurnFallback) keys.add(liveTurnFallback)
     return keys
   }, [streamIds, sessionId, messages, turnEnded, flatRows])
-  /** [轮次消息头合并] 进行中轮次是否已有 assistant 行（消息或流式块）：有则末尾「思考中…」占位
-   *  不再重复消息头（同轮只留首段那一个）。 */
-  const activeTurnHasAssistantRow = useMemo(
-    () => flatRows.some((row) => row.kind !== 'err' && activeTurnKeys.has(row.turnKey)
-      && (row.kind === 'blk' || row.m.role === 'assistant')),
-    [flatRows, activeTurnKeys],
-  )
+  /**
+   * [2026-11-03 用户实测「当前轮次发送用户消息被消费后『正在执行』不立即展示（全新发送没问题）」]
+   *
+   * <p><b>根因：`thinking` 是会话级判据，不是轮次级。</b>
+   * `thinking = turnRunning && !hasStream` 里的 `hasStream` 看的是**整个会话**有没有块。
+   * <ul>
+   *   <li>全新发送：还没有任何块 ⇒ `hasStream=false` ⇒ `thinking=true` ⇒ 占位出现（正常）；</li>
+   *   <li>中途消息被消费：**旧轮还在跑、它的块还在 `streams`** ⇒ `hasStream=true`
+   *       ⇒ `thinking=false` ⇒ 占位不渲染；而新轮此刻只有 user 行、没有任何 assistant 行
+   *       ⇒ 落库行与流式块两个落点都不成立 ⇒ **新轮下面一条「正在执行」都没有**。</li>
+   * </ul>
+   *
+   * <p><b>修法：判据下沉到「最新那一轮」</b>。只要会话仍在跑（`!turnEnded`）且
+   * **最新一条 user 提问所在轮还没有任何 assistant 行**，就由占位承载状态行 ——
+   * 与「会话里有没有别轮的块」无关。
+   */
+  const latestTurnKey = useMemo(() => {
+    for (let i = messages.length - 1; i >= 0; i--) {
+      const m = messages[i]!
+      if (isUserTurnRow(m)) return m.id
+    }
+    return null
+  }, [messages])
+  /**
+   * 最新一轮是否已有**属于它自己**的 assistant 行（决定占位要不要承载状态行）。
+   *
+   * <p><b>⛔ 两个都试过、都不行的判据</b>：
+   * <ul>
+   *   <li>按 `row.turnKey === latestTurnKey`：`groups` 会把旧轮的块**吸附到最新轮**
+   *       （执行中排队时为让用户看到输出），turnKey 被改写 ⇒ 误判；</li>
+   *   <li>按 `flatRows` 行序（提问行之后有没有 assistant/blk）：**块的 anchorSeq 恒为
+   *       `LIVE_SEQ_BASE + n`（10 亿+）**，永远排在历史行之后 ⇒ 旧块必然落在「提问行之后」
+   *       ⇒ 同样误判（实测：DOM 里旧轮行已被折叠，只剩最新提问 + 旧块）。</li>
+   * </ul>
+   *
+   * <p><b>可用的判据只剩 uid</b>（块冻结的归属，不随吸附改变）：
+   * <ul>
+   *   <li>落库段 `m.userMessageId === latestTurnKey` ⇒ 是；</li>
+   *   <li>块 uid `=== latestTurnKey` ⇒ 是（本轮建的）；</li>
+   *   <li>块 uid 非 null 且 `!== latestTurnKey` ⇒ **不是**（旧轮残留，吸附只是显示层）；</li>
+   *   <li>块 uid 为 null ⇒ 算「不是」：`tool_call` 建的块不带 uid（`ensureStreamBlock(…,null)`），
+   *       它更可能是**旧轮的**残留；判成「是」会让新轮彻底没有状态行（用户实测的缺陷），
+   *       判成「不是」最坏只是与旧块各画一条 —— 而那一条由下面的显式互斥挡住。</li>
+   * </ul>
+   */
+  const latestTurnHasAssistantRow = useMemo(() => {
+    if (latestTurnKey == null) return false
+    const live = sessionId ? (useChatStore.getState().streams[sessionId] ?? []) : []
+    return flatRows.some((row) => {
+      if (row.kind === 'err') return false
+      if (row.kind === 'msg') {
+        // 落库行：用 turnKey。`turnKeyOf` 是 messages 的前向趟，**不受** groups 的
+        //   「块吸附」影响 ⇒ 稳定；且 transcript 这类没有 uid 的数据也能正确归属
+        //   （无 uid 时 turnKeyOf 会用最近一条 user 提问兜底）。
+        return row.m.role === 'assistant' && row.turnKey === latestTurnKey
+      }
+      // 流式块：**必须用块冻结的 uid 严格判定**（吸附会改写 turnKey）。
+      //   uid 为 null（tool_call 建的块）⇒ **不算**本轮已有内容 —— 那种块更可能是旧轮
+      //   残留；判成「有」会让新轮彻底没有状态行（用户实测的缺陷）。
+      const b = live.find((x) => x.assistantMessageId === row.blockId)
+      return b != null && b.userMessageId != null && b.userMessageId === latestTurnKey
+    })
+  }, [flatRows, latestTurnKey, sessionId])
+  /**
+   * 「末尾占位」是否渲染：会话仍在跑、且**最新一轮还没有任何 assistant 行**。
+   *
+   * <p>两条来路都覆盖：
+   * <ul>
+   *   <li>全新发送 → `thinking=true`；</li>
+   *   <li>中途消息被消费 → `thinking=false`（旧轮的块让 hasStream 为真），但 `!turnEnded`
+   *       + 新轮无 assistant 行 ⇒ 依然要出现。</li>
+   * </ul>
+   * 同一轮一旦有了 assistant 行（首个 chunk 建块 / 落库段到达）⇒ 让位给那一行的状态行，
+   * 保证**一轮恒一条**。
+   */
+  const showPendingPlaceholder = latestTurnKey != null && !latestTurnHasAssistantRow && (thinking || !turnEnded)
   // ---- [折叠显示 · 2026-10-29 用户裁定] 比默认窗口更早的已加载轮 → 折叠成一行 ----
   //   判据三段（与轮分组同一前向趟 orderedTurnKeys，切点绝不落在一轮中间）：
   //   ① 只取**头部连续前缀**：遇到「已展开 / 进行中」的轮即停 —— 保证折叠行（画在最上面）与折叠内容
@@ -2951,6 +3030,22 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   }
   // 流式尾块 id（给行打「streaming」尾态 class · 只在块增删时变化）
   const lastStreamId = streamIds.length > 0 ? streamIds[streamIds.length - 1] : undefined
+  /**
+   * [2026-11-03] 「思考中」占位上「正在执行 · 时长」的时长来源。
+   *
+   * <p>取**当前轮**（activeTurnKeys 里那一轮）的起点（该轮 user 消息 createdAt），
+   * 与 Message 里的 `liveTurnMs` 同口径。取不到就显示空（不显示时长，不显示 0）。
+   */
+  /**
+   * ⚠️ 时长取**最新那一轮**的起点，不是 `activeTurnKeys` 里的任意一轮：
+   *   中途消费时 `activeTurnKeys` 里还挂着**旧轮**（旧轮的块还在 streams）⇒ 取它会显示旧轮的
+   *   累计时长（用户会看到新消息下面是「正在执行 · 57m20s」，明显不对）。
+   */
+  const placeholderDuration = (() => {
+    if (!showPendingPlaceholder || latestTurnKey == null) return null
+    const s = turnStartByKey.get(latestTurnKey)
+    return s == null ? null : formatTurnDuration(Math.max(0, nowTick - s))
+  })()
   return (
     <>
     <div className="stream-inner" ref={streamWrapRef}>
@@ -3715,7 +3810,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               //   一旦 assistant 落库，落点自动切回落库段（见 processHeaderIdByTurn），一轮恒一处。
               showProcessHeader={!turnsWithPersistedAssistant.has(row.turnKey)
                 && firstAssistantRowKeys.has(row.key)
-                && activeTurnKeys.has(row.turnKey)}
+                && activeTurnKeys.has(row.turnKey)
+                // [2026-11-03] 与末尾占位**互斥**：占位正在承载状态行时（最新一轮还没有
+                //   「属于它自己」的 assistant 行），这个块多半是**旧轮的残留**（uid=null 的
+                //   tool_call 块，或已被吸附的旧块）⇒ 它不该再画一条，否则一轮两条。
+                //   判据直接复用 showPendingPlaceholder，与占位侧同一个真源。
+                && !showPendingPlaceholder}
               liveTurnMs={(() => {
                 if (!activeTurnKeys.has(row.turnKey)) return null
                 const st = turnStartByKey.get(row.turnKey)
@@ -3728,12 +3828,49 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       {/* 无 flow 锚定的错误（userMessageId/assistantMessageId 均缺失）→ 兜底渲染在末尾 */}
       {(() => { const err = apiErrorMap.get('global'); return err ? <ApiErrorCard key="err-global" err={err} /> : null })()}
       {/* 回到最底部（离底时显示 · 对齐 deepseek-harness ChatView toBottom） */}
-      {/* 思考中占位：turn 运行中且无流式块（thinking/重试等待期）→ 发送后立即显示 nexus 思考中，消除空白间隙 */}
-      {thinking && (
+      {/* [2026-11-03 用户实测「发送后『正在执行』没渲染，等模型回复后才出现」]
+          本占位原先只有一句「思考中…」⇒ 用户看到的是**空白**（没有状态行、没有扫光条），
+          直到首个 chunk 到达建了流式块，状态行才有承载位置。
+          ⇒ 这里补上「正在执行 · 时长」状态行 + 扫光条（与 Message 里的那套同款、同 class），
+          让「发送后立刻」就能看见还在跑。
+
+          ⚠️ [2026-11-03 用户实测「一个下面一个上面，两个正在执行」] **状态行/扫光条必须与本轮
+          已有的 assistant 行互斥**：`thinking`（= turnRunning && !hasStream）在「本轮已有落库
+          assistant、模型正在憋下一段」时同样成立 —— 此时那道落库行自己会渲染状态行
+          （`processHeaderIdByTurn` 命中 ⇒ `isRunningTurn` ⇒ 「正在执行」）。
+          占位再画一条 = 同一轮两条（实测 running=2/scan=2、两条时长完全相同）。
+
+          ⇒ 判据用 `latestTurnHasAssistantRow`：**最新那一轮**已有任何 assistant 行
+          （落库行或流式块）时，状态行让给那一行 —— 一轮恒一条。
+          最新那一轮什么都还没有时（false）才由占位承载。
+
+          ⚠️ [2026-11-03 用户实测「中途发送消息被消费后『正在执行』不立即展示」]
+          这里**原来用会话级的 `thinking && streamIds.length === 0`** —— 中途消费时旧轮的块
+          还挂在 streams 里 ⇒ `streamIds.length > 0` 且 `thinking=false` ⇒ 整个占位不渲染
+          ⇒ 新轮下面一条「正在执行」都没有。现改用 {@link showPendingPlaceholder}（按轮判定）。 */}
+      {(showPendingPlaceholder || thinking) && (
         <div className="msg assistant streaming">
-          {activeTurnHasAssistantRow ? <div className="avatar-gutter" aria-hidden /> : <div className="avatar">N</div>}
+          {latestTurnHasAssistantRow ? <div className="avatar-gutter" aria-hidden /> : <div className="avatar">N</div>}
           <div className="body">
-            {!activeTurnHasAssistantRow && <div className="author">nexus</div>}
+            {!latestTurnHasAssistantRow && <div className="author">nexus</div>}
+            {showPendingPlaceholder && (
+              <>
+                {/* 状态行：与 Message 里的 `.turn-process-toggle.running` 同款（同 class ⇒ 同观感） */}
+                <button
+                  type="button"
+                  className="turn-process-toggle running static"
+                  role="status"
+                  aria-live="polite"
+                >
+                  <span className="turn-process-status">正在执行</span>
+                  <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+                  {placeholderDuration && (
+                    <span className="turn-process-dur">· {placeholderDuration}</span>
+                  )}
+                </button>
+                <div className="exec-scan-line" aria-hidden="true" />
+              </>
+            )}
             <div className="thinking-wrap open">
               <div className="thinking-toggle">
                 <span>思考中…</span>

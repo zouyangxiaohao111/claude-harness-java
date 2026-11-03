@@ -1295,21 +1295,40 @@ function App() {
       prev[sid] ? prev : { ...prev, [sid]: `/topic/sessions/${sid}/stream` }
     ))
     /**
-     * [2026-11-03 用户方案「被消费后直接查当前轮次，做一次无感 F5」]
+     * [2026-11-03 用户裁定「消费后要重拉，等价于 F5」]
      *
-     * <p><b>为什么需要</b>：消费瞬间本地 `messages` 是**增量拼出来的**（乐观气泡 + 历史残留），
-     * 轮次边界与后端权威不一致 ⇒ 折叠窗口按轮算，算出的「当前轮」可能是错的，历史剪不干净
-     * （用户实测「中途发送消息被消费后历史没减除，F5 后解决」）。F5 之所以能修，就是因为它拿的是
-     * 后端权威窗口 —— 这里把同一件事提前到消费点做，用户无感。
+     * <p><b>为什么必须重拉</b>：消费瞬间本地 `messages` 是**增量拼出来的**（乐观气泡 + 历史残留），
+     * 而 `streams` 里还躺着**上一轮的流式块**。两者轮次边界不一致 ⇒
+     *   · `hasStream`（会话级）被旧块顶着恒真 ⇒ `thinking` 恒假 ⇒ 占位不渲染；
+     *   · 旧块被 `groups` 的「吸附最新轮」改挂，而 `activeTurnKeys` 仍按块冻结 uid 算旧轮
+     *     ⇒ 两处轮次不一致 ⇒ 块的 `showProcessHeader` 也不成立。
+     * 两条路全断 ⇒ 新一轮下面**一条「正在执行」都没有**（用户实测的缺陷）。
      *
-     * <p><b>为什么重拉不会打坏正在流式的块</b>：`setMessages` 只整表替换 `messages`，**不碰
-     * `streams`**；正在输出的块仍在原处，渲染层「同 id 二选一」保证不与刚落库的行重复。
+     * <p><b>为什么是「清 streams + 换 messages」而不是只换 messages</b>：
+     * 真 F5 之所以能修，是因为页面重载后 store **整个是空的** —— `messages` 与 `streams`
+     * **一起**回到后端权威态。上一版只替换了 `messages`、把 `streams` 留着，
+     * 于是两块数据的时间线不一致，这正是它失效的原因。故这里显式补齐 `clearStream`。
      *
-     * <p><b>为什么静默</b>：本地已 append 了权威气泡，重拉失败不该打扰用户；下一轮 complete /
-     * 手动 F5 仍是兜底。
+     * <p><b>为什么不用 `location.reload()`</b>：重载会让正在生成的内容**永久丢一段**
+     * （重连前的 chunk 推给了零订阅者），还会断 WebSocket、白屏、丢输入框与滚动位置。
+     * 本处做的是**同一件事的局部版**：只重置这一条会话的两个数据源，连接与界面都不动。
+     *
+     * <p><b>顺序：先拉成功，再清块</b>（都要成功才生效）——
+     *   拉取失败时**什么都不动**（保留现有流式态），不会出现「块被清了、消息又没回来」
+     *   这种最坏情况。两个 store 写落在同一个 async 续体里 ⇒ React 合批 ⇒ 一次渲染完成，
+     *   不会有「旧块 + 新消息」并存的中间帧。
+     *   新一轮的 chunk 到达时会重新建块（`ensureStreamBlock` 惰性建），不受影响。
+     *
+     * <p><b>代价（如实登记）</b>：正在流式显示、但后端尚未落库的最后一小段会短暂回退，
+     * 然后随新 chunk 重新长出来。真 F5 同样如此。
      */
-    void loadTailWindow(sid).catch(() => { /* 静默：本地气泡已在，后续 complete / F5 兜底 */ })
-  }, [loadTailWindow])
+    void (async () => {
+      try {
+        await loadTailWindow(sid)
+        clearStream(sid)
+      } catch { /* 静默：拉取失败则保留现状，等 complete / 手动 F5 兜底 */ }
+    })()
+  }, [clearStream, loadTailWindow])
 
   // [断连恢复] WS 被服务端强杀（send time limit 超时）断连后,重连第一个 message.complete → 按事件 sid 权威
   //   重拉 GET /messages 补偿缺口（DB 已逐条落库 realtime-persist）。reloadMessages 锁 activeSessionId
@@ -2357,6 +2376,21 @@ function App() {
     }
     setComposerText('')
     try {
+      // [2026-11-03 用户实测「发送后『正在执行』要立刻渲染，别等模型回复」]
+      //   **在 await 之前登记 activeStreams** —— 否则从「点发送」到「响应回来」这段空窗里，
+      //   `computeTurnRunning` 三路全假（streamRegistered=false / hasStream=false /
+      //   serverRunning 取决于 status 帧是否已到）⇒ `turnEnded` 短暂为 true ⇒
+      //   「正在执行」状态行与扫光条**不渲染**；等首个 chunk 建了块才出现 ⇒ 用户看到「空白一段」。
+      //
+      //   topic 预置为**会话级常量** `/topic/sessions/{sid}/stream`（后端 streamTopic(sessionId)
+      //   的字面量，见 ChatService.streamTopic）—— 与响应回来的 resp.streamTopic 必然相同，
+      //   所以 await 之后那次 setActiveStreams 只是**同值覆盖**，不产生额外副作用。
+      //   ⚠️ 提前登记不会导致重复订阅：useChatSocket.ensureSessionStream 按 sid 幂等
+      //   （streamSubsRef.current.has(sid) → 直接 return）。
+      streamRegGenRef.current[activeSessionId] = (streamRegGenRef.current[activeSessionId] ?? 0) + 1
+      setActiveStreams((prev) => (
+        prev[activeSessionId] ? prev : { ...prev, [activeSessionId]: `/topic/sessions/${activeSessionId}/stream` }
+      ))
       // F20：attachments（PDF 绝对路径字符串数组）透传给后端，服务端 PDFBox 解析
       const resp = await chatApi.send(activeSessionId, { content: text, attachments })
       const st = useChatStore.getState()
@@ -2367,6 +2401,12 @@ function App() {
         // [busy 气泡附件胶囊] 排队时【不】插气泡、也不缓存附件 —— 气泡的附件胶囊由后端权威快照
         //   随 queue.drained 事件带来（前端不按请求体自算：path 附件请求体无 contentId ⇒ 会得到
         //   不可点的胶囊，且与 F5 后不一致）。见 handleQueueDrained。
+        //
+        // [2026-11-03] **撤销发送前的预登记**：排队意味着「本轮还在跑」，旧轮的登记必须留着
+        //   （它就是收旧轮 chunk 的通道）。预登记只多加了轮次号 —— 这里退回去，
+        //   否则 reclaimStreamRegistration 的判据（登记晚于最近一次 true ⇒ 不收）会把旧轮的收口
+        //   误判成「上一轮的」⇒ 旧轮登记永不回收 ⇒ 停止键卡住。
+        streamRegGenRef.current[activeSessionId] = Math.max(0, (streamRegGenRef.current[activeSessionId] ?? 1) - 1)
         if (showToast) showToast('消息已排队，当前轮结束后自动发送', 'info')
         return
       }
@@ -2408,9 +2448,24 @@ function App() {
       // 登记活跃流式会话（useChatSocket 订阅所有 activeStreams · 切走不取消，事件持续接收）
       // [C6 · 轮次判据] 登记即开新一轮：轮次号 +1（在 updater **外**自增 —— updater 可能被 React 重复调用）。
       //   收口回调据「本轮次号 ≤ 最近一次 true 的轮次号」判定该边沿是否属于本轮（见 reclaimStreamRegistration）。
-      streamRegGenRef.current[activeSessionId] = (streamRegGenRef.current[activeSessionId] ?? 0) + 1
+      // [2026-11-03] 轮次号已在**发送前**自增过（为了让「正在执行」立刻出现）⇒ 这里**不再自增**，
+      //   否则一轮会被算成两轮 ⇒ reclaimStreamRegistration 的判据（登记晚于最近一次 true ⇒ 不收）
+      //   会把本轮的收口误判成「上一轮的」⇒ 登记永不回收 ⇒ 停止键卡住。
+      //   topic 用 resp.streamTopic 覆盖（与预置的会话级常量同值 ⇒ 实质是幂等写）。
       setActiveStreams((prev) => ({ ...prev, [activeSessionId]: resp.streamTopic }))
     } catch (e) {
+      // [2026-11-03] **回滚发送前的预登记**：发送失败时后端根本没有 run，
+      //   若不撤销，`activeStreams` 会永远挂着这个 sid ⇒ 停止键常驻「停止」且点下去没东西可停。
+      //   （实测：发送失败后 composer 一直显示「停止」而会话是空的。）
+      //   与排队分支同一处理：退掉预加的轮次号 + 移除登记（**只移除本次自己加的那个**：
+      //   若发送前该 sid 已经在跑，`prev[sid]` 本来就有值，此时不该删）。
+      streamRegGenRef.current[activeSessionId] = Math.max(0, (streamRegGenRef.current[activeSessionId] ?? 1) - 1)
+      setActiveStreams((prev) => {
+        if (!prev[activeSessionId]) return prev
+        const next = { ...prev }
+        delete next[activeSessionId]
+        return next
+      })
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }, [composerText, activeSessionId, activeSession, showToast, runBuiltin])

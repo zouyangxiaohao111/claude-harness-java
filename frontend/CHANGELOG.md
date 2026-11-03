@@ -2,7 +2,7 @@
 
 All notable changes to NexusAI will be documented in this file.
 
-## [Unreleased]
+## [0.1.66] - 2026-11-03
 
 ### Added
 
@@ -129,12 +129,11 @@ All notable changes to NexusAI will be documented in this file.
   承载「已完成」开关的那一行永不丢弃。
 - **macOS 粘贴截图发送后不显示、必须 F5 才出现**（两条腿都修）：① `image_paste_ids` 的图要等后端 run 起来、`registerRunPromptImages` 分配 id 并写进 image-cache 后才可读（实测建行→回写约 0.9s），原实现只拉一次、miss 就永不重试 → 改为有界退避重试（400/1200/3000ms，仍缺则本会话内放弃，不再请求风暴）；② 重拉会整表替换，把只在本地存在的 `imageData`（base64，DB 不存）冲掉，而后端此时可能还没回写 id ⇒ 按 id 把本地 base64 续接到新行（后端已给 `imagePasteIds` 时不覆盖）。
 
-## [0.1.65] - 2026-10-31
 
-### Added
-
+### 合并发布：原 0.1.65（2026-10-31，从未发布）内容
 - computer-use：桌面控制工具（35 个，工具名 `mcp__computer-use__*`）+ 授权审批面板（面板里显示每个应用被授权到什么程度；授权信息缺失时直接拒绝放行，不会盲授权）。
 - 浏览器工具的截图现在真正进入模型上下文（此前只回一个本地文件路径指针，模型看不到画面）。
+
 
 ## [0.1.64] - 2026-10-28
 
