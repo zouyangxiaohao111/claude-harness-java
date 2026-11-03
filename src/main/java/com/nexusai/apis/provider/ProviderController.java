@@ -36,4 +36,17 @@ public class ProviderController {
 
     @PostMapping("/{id}/test")
     public TestConnectionResponse test(@PathVariable String id) { return providerService.test(id); }
+
+    /**
+     * 拉取提供商的远端模型清单（{@code GET {baseUrl}/models}）。
+     *
+     * <p><b>WHY 与本地已存模型列表分开</b>：{@code GET /providers/{id}} 返回的是**库里已配置**的模型
+     * （本应用的持久化结果）；本端点返回的是**提供商当前支持**的清单（外部事实，供导入用）。
+     * 两者语义不同 ⇒ 路径用 {@code /models/remote} 区分，避免前端误用。
+     *
+     * <p><b>失败不抛异常</b>（返回 {@code ok=false} + 中文原因）：拉取是「尽力而为」的辅助动作，
+     * 失败时前端要能退回手动添加，而不是弹一个 5xx。
+     */
+    @GetMapping("/{id}/models/remote")
+    public RemoteModelsResponse remoteModels(@PathVariable String id) { return providerService.fetchRemoteModels(id); }
 }

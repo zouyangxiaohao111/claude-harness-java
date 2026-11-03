@@ -1,6 +1,7 @@
 package com.nexusai.domain.provider;
 
 import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.infra.exception.ConflictException;
@@ -55,6 +56,8 @@ public class ProviderService {
     @Autowired private CryptoUtil cryptoUtil;
     @Autowired private SettingsMapper settingsMapper;
     @Autowired private SessionMapper sessionMapper;
+    /** 拉取远端模型清单时解析各家 /models 响应（键名不一，见 parseRemoteModels） */
+    @Autowired private ObjectMapper objectMapper;
 
     private static final int SETTINGS_SINGLETON_ID = 1;
 
@@ -235,51 +238,10 @@ public class ProviderService {
         HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
         long t0 = System.nanoTime();
         try {
-            HttpRequest.Builder rb = HttpRequest.newBuilder()
-                .uri(URI.create(testUrl))
-                .timeout(Duration.ofSeconds(15))
-                .header("Accept", "application/json");
-
-            // [provider-custom-headers 任务 8 · 修 B3] 该 provider 的自定义 header 也要上到「测试连接」。
-            //
-            // 此处**复用注入侧单点** ProviderHeaderInjector.apply，不另写一套展开/过滤逻辑（R7 前科：
-            // 同一能力两套判据）。apply 内部做的两件事恰好都是这里需要的：
-            //   ① DynamicHeaderExpander.expandAll(..., gateEnabled()) —— 占位符展开 + 读 settings 开关；
-            //   ② 禁止清单防御性过滤（存量脏数据可能含凭据头/受限头）。
-            // 也正是靠 ① 的封装，本类**无需触碰** gateEnabled()——它是 infra 包的 package-private
-            // （ProviderHeaderInjector.java:73），而本类在 domain 包，跨包取不到；由 apply 内部读即可。
-            //
-            // ⚠️ 第三参 sessionId **恒传 null，不要改成读 裸 MDC 的 sessionId()**（规范 §6.7 / T3 实测）：
-            //   · ProviderController.test(:38) 的签名是 test(@PathVariable String id)，**无 sessionId 入参**；
-            //   · 而 裸 MDC 的 sessionId() 读的就是线程局部 MDC，本仓没有 Filter 写 MDC，该线程上它可能是
-            //     **上一个请求残留的、别的会话的 sessionId**（MemoryController:143 / TaskController:145 /
-            //     TeamController:95 三处 setSession 均无 clear，Tomcat 线程复用下真实存在）。
-            //   · 读它会把 **A 会话的亲和 id 发给 B 会话的测试连接请求**；而本方法打的是 {baseUrl}/models 的
-            //     **一次性 GET**，亲和性对它本就毫无意义。
-            //   → 落 STATIC_FALLBACK（nexusai-static）零损失、零风险。
-            ProviderHeaderInjector.apply(rb::header, deserializeHeaders(p.getExtraHeaders()), null);
-
-            // 内置 Authorization 放在 apply **之后**，且用 setHeader。
-            //
-            // ⚠️ 为什么必须是 setHeader 而不是 header（2026-09-13 JDK 25.0.3 桩实测）：
-            //   · `header(name,value)` 是**追加**语义：同名调用两次 → 线上实际发出 [FIRST, SECOND]，
-            //     两个值都在，**不构成覆盖**；
-            //   · 只有 `setHeader(name,value)` 才是**替换**语义（实测 header();setHeader() → [SECOND]）。
-            //   所以「先加用户 header、再设内置」这个**顺序本身**并不能让内置的赢 —— 换个语义才有用。
-            //
-            // 今天本行**不改变任何可观测行为**：正常路径下用户配不进 authorization（写侧
-            // validateExtraHeaders 按 D5 拒绝 → 400），存量脏值也在上一步 apply 内部被禁止清单
-            // 跳过（并 warn），故冲突根本到不了这一行。
-            //
-            // 它是**对未来的防御**：一旦禁止清单放宽到不再含 authorization（例如有人把它移出
-            // FORBIDDEN_HEADER_NAMES），只有 setHeader 能让内置凭据真正覆盖用户配置的；用 header()
-            // 则会让脏值与真凭据并列上线（服务器取哪个不确定 → 静默的凭据劫持）。
-            //
-            // 守护方式：本行的效果**无法用行为测试证伪**（唯一能触发的场景被禁止清单拦住了），
-            // 故改用**源码级断言**钉住，见 ProviderTestConnectionHeadersTest#builtinAuthorizationMustUseSetHeader。
-            rb.setHeader("Authorization", "Bearer " + apiKey);
-
-            HttpRequest req = rb.GET().build();
+            // 请求组装复用 buildModelsRequest（与 fetchRemoteModels 单一真源）——
+            //   原本这段逻辑内联在此，自定义 header 注入 / Authorization 覆盖 / sessionId 恒 null
+            //   三处细节的 WHY 全部搬进了那个方法的 javadoc（⚠️ 别再拆回两套判据）。
+            HttpRequest req = buildModelsRequest(r, p, apiKey, testUrl).GET().build();
             HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
             long latencyMs = (System.nanoTime() - t0) / 1_000_000L;
             int sc = resp.statusCode();
@@ -297,6 +259,166 @@ public class ProviderService {
             log.warn("Provider {} test failed: {}", id, e.toString());
             return new TestConnectionResponse(false, latencyMs, "Unknown error: " + e.getMessage(), null);
         }
+    }
+
+    // ───────────────────────── 拉取远端模型清单 ─────────────────────────
+
+    /**
+     * 拉取提供商的远端模型清单（{@code GET {baseUrl}/models}）。
+     *
+     * <p><b>WHY 复用 test() 的请求构造</b>：{@code test()} 已经把「自定义请求头 + Authorization +
+     * 超时」这套组装跑通了（见其上方注释里的 B3 修复）。另写一套 ⇒ 自定义请求头会漏、鉴权头会漏、
+     * 超时行为不一致 —— 本仓前科：同一能力两套判据必然漂移。故抽 {@link #buildModelsRequest} 单一真源。
+     *
+     * <p><b>失败不抛异常</b>：拉模型是辅助动作，失败要让用户能退回手动添加。
+     *
+     * @param id provider id
+     * @return 归一化后的清单；失败时 {@code ok=false} + 中文原因
+     */
+    public RemoteModelsResponse fetchRemoteModels(String id) {
+        ProviderRecord r = providerMapper.selectOneById(id);
+        if (r == null) throw new NotFoundException("Provider " + id + " not found");
+        Provider p = r.toDomain();
+        String apiKey;
+        try {
+            apiKey = cryptoUtil.decrypt(p.getApiKeyEncrypted());
+        } catch (Exception e) {
+            log.warn("Provider {} key decryption failed: {}", id, e.getMessage());
+            return new RemoteModelsResponse(false, List.of(), "无法解密 API key：" + e.getMessage());
+        }
+        String url = (p.getBaseUrl() == null ? "" : p.getBaseUrl()).trim();
+        if (url.endsWith("/")) url = url.substring(0, url.length() - 1);
+        String modelsUrl = url + "/models";
+        try {
+            HttpClient client = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+            HttpRequest req = buildModelsRequest(r, p, apiKey, modelsUrl).build();
+            HttpResponse<String> resp = client.send(req, HttpResponse.BodyHandlers.ofString());
+            int sc = resp.statusCode();
+            if (sc == 401 || sc == 403) {
+                return new RemoteModelsResponse(false, List.of(), "鉴权失败：API Key 无效");
+            }
+            if (sc == 404) {
+                return new RemoteModelsResponse(false, List.of(), "该提供商未提供模型列表接口（404）");
+            }
+            if (sc < 200 || sc >= 300) {
+                return new RemoteModelsResponse(false, List.of(), "HTTP " + sc);
+            }
+            List<RemoteModelDto> models = parseRemoteModels(resp.body());
+            return new RemoteModelsResponse(true, models,
+                "读取到 " + models.size() + " 个模型");
+        } catch (java.net.ConnectException ce) {
+            return new RemoteModelsResponse(false, List.of(), "无法连接 " + modelsUrl + "：" + ce.getMessage());
+        } catch (Exception e) {
+            log.warn("Provider {} fetchRemoteModels failed: {}", id, e.toString());
+            return new RemoteModelsResponse(false, List.of(), "读取失败：" + e.getMessage());
+        }
+    }
+
+    /**
+     * 组装 {@code GET {baseUrl}/models} 请求 —— <b>test() 与 fetchRemoteModels() 共用的单一真源</b>。
+     *
+     * <p>⚠️ 保持与 test() 完全一致的两处细节（勿动）：
+     * <ul>
+     *   <li>自定义 header 走 {@code ProviderHeaderInjector.apply}（含占位符展开 + 禁止清单过滤）；
+     *       内置 Authorization 必须在 apply <b>之后</b>用 {@code setHeader} 覆盖
+     *       （{@code header()} 是追加语义 ⇒ 用户配的 authorization 会与内置凭据并列上线）。</li>
+     *   <li>第三参 sessionId <b>恒传 null</b>：本请求是一次性 GET，亲和性无意义；
+     *       读线程局部 MDC 会把 A 会话的 id 发给 B 会话。</li>
+     * </ul>
+     */
+    private HttpRequest.Builder buildModelsRequest(ProviderRecord r, Provider p, String apiKey, String url) {
+        HttpRequest.Builder rb = HttpRequest.newBuilder()
+            .uri(URI.create(url))
+            .timeout(Duration.ofSeconds(15))
+            .header("Accept", "application/json");
+        ProviderHeaderInjector.apply(rb::header, deserializeHeaders(p.getExtraHeaders()), null);
+        rb.setHeader("Authorization", "Bearer " + apiKey);
+        return rb;
+    }
+
+    /**
+     * 解析各家 {@code /models} 响应 → 归一化的 {@link RemoteModelDto} 列表。
+     *
+     * <p><b>各家形状（实测 2026-11-03）</b>：
+     * <ul>
+     *   <li>标准 OpenAI：{@code data:[{id, object, created, owned_by}]} —— 无窗口/输出上限信息</li>
+     *   <li>DeepSeek：{@code data:[{id, name, context_window, max_output_tokens, input_modalities}]}</li>
+     *   <li>OpenRouter：{@code data:[{id, name, context_length, top_provider:{context_length, max_completion_tokens}}]}</li>
+     *   <li>Anthropic：{@code data:[{id, display_name}]}</li>
+     * </ul>
+     *
+     * <p>⚠️ <b>键名多路尝试</b>：只认一个键名 = 只支持一家（实测三家三种叫法）。
+     *
+     * <p>⚠️ 解析失败**不抛异常**，返回空列表 + 日志：拉模型是尽力而为的动作。
+     */
+    private List<RemoteModelDto> parseRemoteModels(String body) {
+        if (body == null || body.isBlank()) return List.of();
+        try {
+            JsonNode root = objectMapper.readTree(body);
+            JsonNode data = root.has("data") ? root.get("data") : root;
+            if (!data.isArray()) return List.of();
+            List<RemoteModelDto> out = new ArrayList<>();
+            Set<String> seen = new HashSet<>();
+            for (JsonNode item : data) {
+                if (!item.isObject()) continue;
+                String id = text(item, "id");
+                if (id == null || id.isBlank()) continue;
+                if (!seen.add(id)) continue;   // 同一批里 id 重复 → 只留一条
+                String name = firstText(item, "name", "display_name");
+                Integer ctx = firstInt(item, "context_window", "context_length", "max_context_length");
+                if (ctx == null) {
+                    JsonNode tp = item.get("top_provider");
+                    if (tp != null && tp.isObject()) ctx = firstInt(tp, "context_length");
+                }
+                Integer maxOut = firstInt(item, "max_output_tokens", "max_tokens");
+                if (maxOut == null) {
+                    JsonNode tp = item.get("top_provider");
+                    if (tp != null && tp.isObject()) maxOut = firstInt(tp, "max_completion_tokens");
+                }
+                out.add(new RemoteModelDto(id, name, ctx, maxOut));
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("parseRemoteModels failed: {}", e.toString());
+            return List.of();
+        }
+    }
+
+    /** 取字符串字段（null/空白视为无）。 */
+    private static String text(JsonNode node, String field) {
+        JsonNode v = node.get(field);
+        return v == null || v.isNull() ? null : v.asText();
+    }
+
+    /** 取第一个非空字符串字段。 */
+    private static String firstText(JsonNode node, String... fields) {
+        for (String f : fields) {
+            String v = text(node, f);
+            if (v != null && !v.isBlank()) return v;
+        }
+        return null;
+    }
+
+    /**
+     * 取第一个非空整数字段。
+     *
+     * <p>⚠️ 用 {@code canConvertToInt()} 判型而非 {@code asInt()}：后者对非数字文本静默返回 0
+     * ⇒ 一个「无此字段」会变成「窗口=0」这种致命错值（0 会让压缩阈值失效）。
+     */
+    private static Integer firstInt(JsonNode node, String... fields) {
+        for (String f : fields) {
+            JsonNode v = node.get(f);
+            if (v == null || v.isNull()) continue;
+            if (v.isNumber() && v.canConvertToInt()) return v.asInt();
+            if (v.isTextual()) {
+                try {
+                    return Integer.valueOf(v.asText().trim());
+                } catch (NumberFormatException ignore) {
+                    // 非数字文本 → 视为无此字段，继续试下一个键名
+                }
+            }
+        }
+        return null;
     }
 
     public String getDecryptedApiKey(String providerId) {

@@ -1,8 +1,9 @@
-import { useState } from 'react'
+import { useRef, useState } from 'react'
 import type { Model, Provider } from '@/api/types'
 import { Icon } from '@/icons'
 import { FormModal, type FormSection } from '@/components/ui/FormModal'
 import { ModelFormModal } from '@/components/ui/ModelFormModal'
+import { ImportModelsModal } from '@/components/modals/ImportModelsModal'
 import { KvEditor } from '@/components/common/KvEditor'
 import { brandTagFromName, tagToClass } from '@/data'
 import type { UseProviders } from '@/hooks/useProviders'
@@ -123,6 +124,8 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
   const [addingProvider, setAddingProvider] = useState(false)
   const [editingModel, setEditingModel] = useState<{ providerId: string; model: Model } | null>(null)
   const [addingModelFor, setAddingModelFor] = useState<{ providerId: string; prefillName: string } | null>(null)
+  /** 拉取远端模型并导入（保存提供商后自动打开 · 见 onAddProvider） */
+  const [importingModelsFor, setImportingModelsFor] = useState<Provider | null>(null)
   const [pending, setPending] = useState(false)
 
   // ---- Provider CRUD 包装（带错误处理 + toast） ----
@@ -192,7 +195,31 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       setAddingProvider(false)
       // L4b-2 首启引导信号：带 created 详情（内含 models），引导据此判断是否需补插「添加模型」步
       window.dispatchEvent(new CustomEvent('nexusai:provider-saved', { detail: created }))
+      // [2026-11-03 用户裁定] **保存后不自动拉模型** —— 保存就保存，导入是另一个明确动作
+      //   （用户原话：「点击导入模型 自动导入 保存就跟之前一样 不要自动触发吧」）。
+      //   用户要的是「表单里有个『导入模型』按钮，想用就点」⇒ 按钮在表单的 footer 上，
+      //   见 addingProvider 的 footerActions。
+      //
+      //   ⚠️ 但**点了「导入模型」**时是要保存 + 拉取的（拉取端点按 provider id ⇒ 得先有 id）。
+      //   那条路径在 onAddProviderAndImport 里。
+      if (importAfterSaveRef.current) {
+        importAfterSaveRef.current = false
+        setImportingModelsFor(created)
+      }
     }, `已添加: ${p.name}`)
+  }
+
+  /**
+   * 「导入模型」按钮：**先保存提供商 → 立刻打开导入弹窗**（拉取端点按 provider id ⇒ 必须先有 id）。
+   *
+   * <p>⚠️ 与「保存」按钮的行为差异：保存 = 只存；导入模型 = 存完接着拉清单。
+   * 两者都走同一个 `onAddProvider`（避免两套建提供商的逻辑漂移），靠
+   * {@link importAfterSaveRef} 这个「一次性意图」标记区分。
+   */
+  const importAfterSaveRef = useRef(false)
+  const onAddProviderAndImport = (p: Provider) => {
+    importAfterSaveRef.current = true
+    onAddProvider(p)
   }
 
   // Model CRUD
@@ -314,11 +341,22 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
             ))
           )}
 
-          <button
-            className="add-model-btn"
-            data-tour="add-model"
-            onClick={() => setAddingModelFor({ providerId: p.id, prefillName: firstModelNameHint(p) })}
-          >+ 添加模型</button>
+          <div className="provider-model-actions">
+            {/* [2026-11-03] 「从提供商读取」：拉远端清单批量导入（比逐个手填快得多） */}
+            <button
+              className="add-model-btn"
+              title="从提供商读取可用模型并批量导入"
+              onClick={() => {
+                const target = list.find((x) => x.id === p.id)
+                if (target) setImportingModelsFor(target)
+              }}
+            >从提供商读取</button>
+            <button
+              className="add-model-btn"
+              data-tour="add-model"
+              onClick={() => setAddingModelFor({ providerId: p.id, prefillName: firstModelNameHint(p) })}
+            >+ 添加模型</button>
+          </div>
         </div>
       ))}
 
@@ -377,6 +415,17 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
           ]}
           onSave={onAddProvider}
           onCancel={() => setAddingProvider(false)}
+          // [2026-11-03] 「导入模型」= 保存后接着拉远端清单并批量导入。
+          //   与「保存」并列放在 footer（不是 body 末尾）—— 用户要能一眼看见并点到它。
+          footerActions={(values) => (
+            <button
+              type="button"
+              className="fm-btn"
+              disabled={pending}
+              title="保存这个提供商，并读取它的可用模型清单供你勾选导入"
+              onClick={() => onAddProviderAndImport(values)}
+            >导入模型</button>
+          )}
         />
       )}
 
@@ -407,6 +456,16 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
           mode="create"
           onSave={(m) => onAddModel(addingModelFor.providerId, m)}
           onCancel={() => setAddingModelFor(null)}
+        />
+      )}
+
+      {/* [2026-11-03] 拉取远端模型清单并导入（保存提供商后自动打开；失败仍可退回手动添加） */}
+      {importingModelsFor && (
+        <ImportModelsModal
+          provider={importingModelsFor}
+          createModel={createModel}
+          onClose={() => setImportingModelsFor(null)}
+          showToast={showToast}
         />
       )}
     </div>

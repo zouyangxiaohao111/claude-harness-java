@@ -122,6 +122,17 @@ interface FormModalProps<T extends Record<string, any>> {
   onSave: (v: T) => void
   onCancel: () => void
   extra?: ReactNode
+  /**
+   * [2026-11-03] footer 左侧的**次要动作按钮组**（排在「取消 / 保存」左边）。
+   *
+   * <p>与 `extra` 的区别：`extra` 会在 body 末尾**和** footer 各渲染一次（历史行为，
+   * 用于纯展示内容）；本 prop 只在 footer 渲染一次，用于「添加提供商」这种
+   * 「保存之外还有另一个动作」的场景 —— 用户要能看见并点到它，而不是藏在 body 末尾。
+   *
+   * <p>⛔ 必须是**函数**（拿得到 `values`）而不是元素：「导入模型」这类按钮需要读取
+   * 表单当前填写的内容（baseUrl / apiKey 等）才能干活 —— 元素形式拿不到值。
+   */
+  footerActions?: (values: T) => ReactNode
   destructiveLabel?: string
   onDestructive?: () => void
 }
@@ -427,6 +438,7 @@ export function FormModal<T extends Record<string, any>>({
   onSave,
   onCancel,
   extra,
+  footerActions,
   destructiveLabel,
   onDestructive,
 }: FormModalProps<T>) {
@@ -547,6 +559,7 @@ export function FormModal<T extends Record<string, any>>({
             </button>
           )}
           <span className="spacer"></span>
+          {footerActions?.(values)}
           {extra}
           <button className="fm-btn" onClick={onCancel}>取消</button>
           <button className="fm-btn primary" onClick={() => onSave(values)}>保存</button>

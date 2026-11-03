@@ -1235,7 +1235,22 @@ function App() {
       delete next[sid]
       return next
     })
-  }, [])
+    /**
+     * [2026-11-03 用户要求「跑完也应该重新拉一下」]
+     *
+     * <p><b>WHY</b>：执行中本地是「流式块 + 增量拼出的 messages」，与后端权威窗口可能不一致
+     * （排队的 user 行、空壳 assistant 段、轮次边界）。收口后用后端权威窗口做一次对齐，
+     * 用户就不必靠 F5 才能看到正确顺序与历史折叠。与 `handleQueueDrained` 末尾的
+     * 「消费后无感重拉」同一思路，两点合起来覆盖「起轮 / 收口」两端。
+     *
+     * <p><b>为什么不会打坏刚定稿的内容</b>：`setMessages` 只整表替换 `messages`，不碰 `streams`
+     * （此时块已被 `finalizeBlocks` 清空）；轮末用量行来自独立的 `/usage/turns`（
+     * `turnUsageFallback`），不随 `messages` 重拉丢失。
+     *
+     * <p><b>为什么静默</b>：失败不该打断用户；下一次 complete / 切会话 / 手动 F5 仍可兜底。
+     */
+    void loadTailWindow(sid).catch(() => { /* 静默：后续切会话 / F5 兜底 */ })
+  }, [loadTailWindow])
 
   // 排队命令出站回调（B5）：queue.changed → 刷新排队框；queue.drained → append 正式气泡 + 登记新 streamTopic
   const handleQueueChanged = useCallback((sid: string, commands: { content: string; mode: string; isEditable: boolean; isMeta?: boolean }[]) => {
@@ -1262,7 +1277,39 @@ function App() {
       st.appendMessages(sid, msgs)
       void debugLog(`[drained-append] sid=${sid} uids=${msgs.map((m) => m.userMessageId ?? m.id).join(',')} contents=${msgs.map((m) => m.content?.slice(0, 10) ?? '').join(',')} attach=${msgs.map((m) => m.userAttachments?.length ?? 0).join(',')}`)
     }
-  }, [])
+    // [2026-11-03 用户实测「当前轮次补充用户消息、消费后历史锁定时灵时不灵」]
+    //   **queue.drained = 新一轮的起点 ⇒ 必须在这里登记 activeStreams。**
+    //
+    //   <b>原实现的洞</b>：这里只 append 用户气泡（见上方注释「activeStreams 里 sid 仍在 →
+    //   无需重新订阅」）—— 该假设只在「旧轮还没收口」时成立。而实际时序常是：
+    //     旧轮 complete → handleSessionDone 删掉登记 → queue.drained 才到
+    //   ⇒ 新一轮起轮瞬间 `computeTurnRunning` 三路全假（streamRegistered=false /
+    //   hasStream=false（新一轮还没吐 chunk）/ serverRunning 取决于 status=thinking 帧是否已到）
+    //   ⇒ `turnEnded` 短暂为 true ⇒ 折叠窗口从 RUNNING_FOLD_TURNS(1) 恢复到 FOLD_DEFAULT_TURNS(2)
+    //   ⇒ **历史整段露出**；下一个 chunk 到达又锁回去 —— 正是用户说的「时灵时不灵」。
+    //
+    //   与 sendMessage 同款：轮次号 +1（供 reclaimStreamRegistration 的轮次判据使用）。
+    //   ⚠️ 已有登记时不覆盖（旧轮仍在跑时保持它原来的 topic，语义与 sendMessage 一致）。
+    streamRegGenRef.current[sid] = (streamRegGenRef.current[sid] ?? 0) + 1
+    setActiveStreams((prev) => (
+      prev[sid] ? prev : { ...prev, [sid]: `/topic/sessions/${sid}/stream` }
+    ))
+    /**
+     * [2026-11-03 用户方案「被消费后直接查当前轮次，做一次无感 F5」]
+     *
+     * <p><b>为什么需要</b>：消费瞬间本地 `messages` 是**增量拼出来的**（乐观气泡 + 历史残留），
+     * 轮次边界与后端权威不一致 ⇒ 折叠窗口按轮算，算出的「当前轮」可能是错的，历史剪不干净
+     * （用户实测「中途发送消息被消费后历史没减除，F5 后解决」）。F5 之所以能修，就是因为它拿的是
+     * 后端权威窗口 —— 这里把同一件事提前到消费点做，用户无感。
+     *
+     * <p><b>为什么重拉不会打坏正在流式的块</b>：`setMessages` 只整表替换 `messages`，**不碰
+     * `streams`**；正在输出的块仍在原处，渲染层「同 id 二选一」保证不与刚落库的行重复。
+     *
+     * <p><b>为什么静默</b>：本地已 append 了权威气泡，重拉失败不该打扰用户；下一轮 complete /
+     * 手动 F5 仍是兜底。
+     */
+    void loadTailWindow(sid).catch(() => { /* 静默：本地气泡已在，后续 complete / F5 兜底 */ })
+  }, [loadTailWindow])
 
   // [断连恢复] WS 被服务端强杀（send time limit 超时）断连后,重连第一个 message.complete → 按事件 sid 权威
   //   重拉 GET /messages 补偿缺口（DB 已逐条落库 realtime-persist）。reloadMessages 锁 activeSessionId

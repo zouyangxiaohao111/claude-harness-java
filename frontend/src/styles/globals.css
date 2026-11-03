@@ -1485,18 +1485,36 @@ html {
   border-collapse: collapse;
   margin: 10px 0;
   font-size: 13px;
+  /* [2026-11-03 表格行高] 祖先 .msg .content 是 16px/28px（见 1402 行），此处只改字号不改行高
+     ⇒ 13px 的字被撑在 28px 行高里（字高:行高 = 1:2.15，正常是 1:1.5）⇒ 表格整体发松。
+     这里按字号重设，⛔ 不动祖先（16/28 是 2026-10-09 对齐 dsh 的正文口径）。 */
+  line-height: 1.55;
   max-width: 100%;
   display: block;
   overflow-x: auto;
 }
 .msg .content.md th, .msg .content.md td {
   border: 1px solid var(--hairline);
-  padding: 6px 10px;
+  padding: 8px 12px;
   text-align: left;
+  line-height: 1.55;
+  /* 长路径/长内容换行时，同排其它格不会被顶到中间 */
+  vertical-align: top;
 }
 .msg .content.md th {
-  background: var(--surface-2);
+  /* [2026-11-03 用户选定 · 品牌淡蓝表头] 原来的 surface-2 灰底在深浅两主题下都偏"抽"，
+     改用品牌色：淡蓝底 + 品牌蓝字，与 accent 系控件同源。 */
+  background: var(--accent-soft);
+  color: var(--accent);
   font-weight: 600;
+  white-space: nowrap;
+  border-bottom: 1px solid var(--accent-soft-strong);
+}
+/* 深色下 --accent(#0f5fd4) 压在深底上对比不足 → 用浅蓝；底色也提一档不透明度 */
+.app[data-theme="dark"] .msg .content.md th {
+  background: rgba(91, 155, 255, 0.16);
+  color: #79aeff;
+  border-bottom-color: rgba(91, 155, 255, 0.34);
 }
 .msg .content.md hr {
   border: none;
@@ -6334,6 +6352,142 @@ html {
 }
 
 /* ================================================================ */
+/*  ImportModelsModal — 拉取远端模型清单并批量导入                  */
+/*  外壳复用 .fm-backdrop / .fm-modal / .fm-header / .fm-body /    */
+/*  .fm-footer（与「添加模型」等弹窗同一套），只加列表与状态行。      */
+/* ================================================================ */
+.im-modal { width: 720px; }
+
+/* 状态行：加载中 / 成功 / 失败 */
+.im-status {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 12.5px;
+  color: var(--ink-subtle);
+  padding: 10px 14px;
+  border-radius: 8px;
+  background: var(--surface-2);
+}
+.im-status.ok { background: var(--success-soft); color: var(--success-dark); }
+.im-status.error { background: var(--error-soft); color: var(--error-dark); }
+.im-spin {
+  width: 13px;
+  height: 13px;
+  border-radius: 50%;
+  border: 2px solid var(--hairline-strong);
+  border-top-color: var(--accent);
+  animation: im-spin 0.7s linear infinite;
+  flex-shrink: 0;
+}
+@keyframes im-spin { to { transform: rotate(360deg); } }
+
+/* 工具条：批量操作 + 搜索 + 计数 */
+.im-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 2px;
+}
+.im-toolbar .fm-btn { padding: 4px 10px; font-size: 12px; }
+.im-search {
+  flex: 1;
+  min-width: 120px;
+  padding: 5px 10px;
+  font-size: 12.5px;
+}
+.im-count {
+  font-size: 11.5px;
+  color: var(--ink-faint);
+  font-family: var(--font-mono);
+  white-space: nowrap;
+}
+
+/* 模型行 */
+.im-list { display: flex; flex-direction: column; gap: 4px; }
+.im-row {
+  border: 1px solid var(--hairline);
+  border-radius: 8px;
+  padding: 8px 10px;
+  transition: border-color 140ms var(--ease), background 140ms var(--ease);
+}
+.im-row:hover { border-color: var(--hairline-strong); }
+.im-row.on { border-color: var(--accent-soft-strong); background: var(--accent-soft); }
+.im-row.skipped { opacity: 0.55; }
+.im-row-main { display: flex; align-items: center; gap: 8px; min-width: 0; }
+.im-row-main input[type="checkbox"] { width: 14px; height: 14px; accent-color: var(--accent); cursor: pointer; flex-shrink: 0; }
+.im-name {
+  font-size: 12.5px;
+  color: var(--ink-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+.im-id {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: var(--ink-faint);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 200px;
+}
+.im-type { font-size: 11px; color: var(--ink-tertiary); white-space: nowrap; }
+.im-badge {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+  background: var(--surface-3);
+  padding: 1px 7px;
+  border-radius: 99px;
+  white-space: nowrap;
+}
+.im-badge.src { background: transparent; color: var(--ink-faint); padding-left: 0; }
+.im-expand {
+  margin-left: auto;
+  font-size: 11.5px;
+  color: var(--ink-tertiary);
+  background: transparent;
+  border: none;
+  padding: 2px 6px;
+  border-radius: 4px;
+  cursor: pointer;
+  white-space: nowrap;
+}
+.im-expand:hover { background: var(--surface-3); color: var(--ink-muted); }
+
+/* 展开的字段编辑 */
+.im-edit {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed var(--hairline-strong);
+}
+.im-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px 14px;
+}
+.im-grid .fm-field { display: flex; flex-direction: column; gap: 3px; }
+.im-grid .fm-field-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--ink-tertiary);
+}
+/* 值来源标记：接口给的 vs 默认值 —— 上下文窗口直接决定压缩阈值，
+   用户看到 1M 会以为是真的 ⇒ 必须区分来源。 */
+.im-src {
+  font-size: 10px;
+  padding: 0 6px;
+  border-radius: 99px;
+  font-weight: 500;
+}
+.im-src.api { background: var(--success-soft); color: var(--success-dark); }
+.im-src.def { background: var(--warning-soft); color: var(--warning); }
+
+/* ================================================================ */
 /*  PermissionBubble — 权限弹窗容器（普通 allow/deny + AskUser 交互）    */
 /*  渲染在 .center flex 列（stream 与 composer 之间），始终可见。      */
 /* ================================================================ */
@@ -8287,6 +8441,10 @@ html {
    此前此处重复定义 .icon-btn:hover ⇒ 把删除按钮的危险色覆盖成蓝色。 */
 .add-model-btn { width: 100%; padding: 10px; border: 2px dashed #DDD; border-radius: 8px; background: transparent; color: #888; cursor: pointer; font-size: 13px; font-weight: 500; transition: 0.2s; margin-top: 10px; }
 .add-model-btn:hover { border-color: #0f5fd4; color: #0f5fd4; background: #eaf2fe; }
+/* [2026-11-03] 「从提供商读取」与「+ 添加模型」并排 —— 两个都是"往这个提供商加模型"的入口，
+   挨在一起比上下堆叠更容易被看到。宽度各半，避免第一个按钮独占整行。 */
+.provider-model-actions { display: flex; gap: 8px; margin-top: 10px; }
+.provider-model-actions .add-model-btn { margin-top: 0; flex: 1; }
 
 /* ===== 主界面三栏重构（对齐设置页原型 · 白底 + 橙主题 #0f5fd4/#0a49a8） ===== */
 /* 顶栏：纯白 + 发丝线 */

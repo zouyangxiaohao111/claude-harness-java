@@ -11,6 +11,7 @@ import type {
   CreateModelRequest,
   UpdateModelRequest,
   TestConnectionResponse,
+  RemoteModelsResponse,
 } from './types'
 
 export const providerApi = {
@@ -30,6 +31,15 @@ export const providerApi = {
 
   test: (id: string) =>
     api<TestConnectionResponse>(`/providers/${encodeURIComponent(id)}/test`, { method: 'POST' }),
+
+  /**
+   * 拉取提供商的**远端**模型清单（`GET {baseUrl}/models`）。
+   *
+   * <p>⚠️ 与 {@link providerApi.listModels} 语义不同：后者是**库里已配置**的模型（持久化结果），
+   * 本方法是**提供商当前支持**的清单（外部事实，供导入用）。路径用 `/models/remote` 区分。
+   */
+  remoteModels: (id: string) =>
+    api<RemoteModelsResponse>(`/providers/${encodeURIComponent(id)}/models/remote`),
 
   // ---- Model CRUD ----
   listModels: (providerId: string) =>

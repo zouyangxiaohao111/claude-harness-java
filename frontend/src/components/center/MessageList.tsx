@@ -227,15 +227,23 @@ function cleanToolName(name: string | null): string {
  *     头会跑到问题上面）；
  *  ② 否则（null / 窗口外的旧 id / 与落库段不同源）⇒ **最近一条 user 消息 id** —— 与落库 assistant 段
  *     同轮，同一轮只留一个 `N nexus` 头。
+ *
+ *  ⚠️ [2026-11-03 用户实测「F5 后上一轮的过程消息被并进当前用户消息」] `②` 的回落对
+ *  「块的 userMessageId 为 null」是**错**的：F5 / 切会话重建的块全部 uid=null（实测 46/46），
+ *  回落把**上一轮**的整段过程吸附到最新提问下面 ⇒ 顺序错、且折叠窗口按轮算因而锁不住。
+ *  故调用方应先用 `messages` 里同 id 的落库行补出归属（见 `groups` 内的 `blockOwner`）。
  */
 function blockTurnKey(
   blockUserId: string | null | undefined,
-  userTurnIds: Set<string>,
   latestUserTurnId: string | null,
   fallback: string,
 ): string {
-  if (blockUserId && userTurnIds.has(blockUserId)) return blockUserId
-  return latestUserTurnId ?? blockUserId ?? fallback
+  // [2026-11-03 用户实测「F5 后上一轮的过程被并进当前用户消息」] 块自带 uid 时**永远用它**——
+  //   即便它不在当前 `messages` 窗口内。那种 uid 指向的是**窗口外的旧轮**（F5 重连回放的老块），
+  //   回落「最新轮」会把整段历史过程挂到当前提问下面（实测 15 块被并入）。
+  //   窗口外的键由 foldedTurnKeys 单独折叠（见该处），不会以「多一个 nexus 头」的形式露出来。
+  if (blockUserId) return blockUserId
+  return latestUserTurnId ?? fallback
 }
 
 /** 当前窗口内的 user 消息 id 集 + 最近一条 user 消息 id（`groups` 与 `activeTurnKeys` 共用同一口径）。
@@ -2034,6 +2042,24 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       stickBottomSettled()
     }
   }, [scrollSignal])
+  /**
+   * [2026-11-03 用户实测「轮次完成后跳到用户消息位置，应该拉到最底」]
+   *
+   * <p><b>机制</b>：轮次收口时 `turnEnded` false→true ⇒ 折叠窗口从 `RUNNING_FOLD_TURNS`(1)
+   * 恢复到 `FOLD_DEFAULT_TURNS`(2) ⇒ **上方插入整轮历史**。但此刻 `messages` / `lastMsgId`
+   * 并没有变化（变的只是渲染窗口）⇒ 上面两个滚底 effect 一个都不触发
+   * ⇒ 内容被往下推而 `scrollTop` 不动 ⇒ 视觉上「跳回了用户消息那里」。
+   *
+   * <p><b>修法</b>：`turnEnded` 翻成 true 时，若用户原本就贴底（`nearBottomRef`）则重新贴底。
+   * ⛔ 不无条件滚底 —— 正在往上翻历史的用户不该被拽回来。
+   */
+  const prevTurnEndedRef = useRef(turnEnded)
+  useEffect(() => {
+    if (prevTurnEndedRef.current === turnEnded) return
+    prevTurnEndedRef.current = turnEnded
+    if (turnEnded && nearBottomRef.current) stickBottomSettled()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [turnEnded])
   // 按 userMessageId 分组渲染（消息链锚定）：每组 = 一个 flow（user 消息 + 其 assistant/工具流）。
   //   排队场景 user2/AI回复2 独立 group → 顺序正确（对齐 GET /messages 后端出站链）。
   //   userMessageId 缺失（旧数据/流式前）fallback：user 用自身 id，stream 块用 assistantMessageId。
@@ -2084,6 +2110,48 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     //   与 stores/messageTurns.turnKeyByRowId 同一兜底（单点真源的同一个 helper）。
     let lastMsgTurnKey: string | null = headAnchorKeyOf(dropTextInBriefTurns(messages).filter(isDialogueRow))
     let historySeq = 0
+    /**
+     * [2026-11-03 用户实测「F5 / 切走再切回后同一段渲染两份、多个 nexus 头」]
+     *
+     * <p><b>根因（真机实测）</b>：REST `GET /messages/turns` 返回的 assistant 行 id，与 STOMP
+     * 流式块的 `assistantMessageId` **是同一批**（后端落库 id 与推流 id 同源）。切会话重拉把已落库
+     * 行灌进 `messages`，同时 STOMP 仍在吐 chunk 建块 ⇒ 同一 id 在 `messages` 与 `streams` 两侧
+     * 各存在一条 ⇒ 下面两个 push 循环各画一份（实测重合 15 个 id，DOM 上 15 个消息行 + 15 个块）。
+     *
+     * <p><b>为什么修在这里而不是 store</b>：前三次修法都改 `ensureStreamBlock` 的建块路径（按
+     * 「已落库」不建块 / 合并灌初值），而该函数是**所有路径共用**的 —— 一拦就连正常发送的实时
+     * 输出也一起挡死（用户实测「消息不自动添加」「现在不实时更新了」）。渲染层是唯一一处
+     * 「只影响已落库那条副本、不影响建块与推流」的位置。
+     *
+     * <p><b>为什么守卫写「不比落库行少」而不是「块有内容」</b>：块可能刚建立尚无内容（首 chunk
+     * 未到），此时落库行才是唯一有内容的来源 —— 跳过它会白屏一截。
+     *
+     * <p>⛔ <b>不要在这里做「谁更全就选谁」</b>：那样在「块暂时短于落库行」时会**两份都渲**
+     * （行没被跳过、块也照渲）—— 2026-11-03 用户实测「F5 后无限重复」正是此形态。这里必须是
+     * **严格二选一**：只要同 id 有块，行一律让位。
+     *
+     * <p><b>为什么让位的是行而不是块</b>：块是**活**的（chunk 持续增长），行是**静止**的快照。
+     * 反向让位（块空时渲行）会让区块之后永不重画 —— `groups` 的依赖是
+     * `[messages, streamIds, sessionId]`，不含块内容，块从空变满不会触发重算 ⇒ 用户看到文字冻结
+     * （正是 14:30 那次修法的失败形态）。让位给块则最坏只是「行有内容、块刚建还没吐字」的极短
+     * 真空窗，下一个 chunk 即填上。
+     *
+     * <p>⚠️ `lastMsgTurnKey = key` 必须在跳过**之前**执行 —— 轮键推进不受抑制影响，保证后续
+     * 行（tool 行 / 下一个 assistant 段）的归属与未跳过时完全一致。
+     */
+    const streamIdSet = new Set(streamIds)
+    /**
+     * [2026-11-03 用户实测「消费排队消息后顺序变成 user/user/…/nexus，F5 才对」]
+     *
+     * <p><b>根因</b>：重拉（F5 / 切会话 / 消费后无感重拉）回来的行没有 `renderSeq`
+     * ⇒ 序号退化成 `++historySeq`(1,2,3…)；而流式块的序号是 `LIVE_SEQ_BASE + n`（10 亿+）
+     * ⇒ **所有块都被排到全部消息之后**，于是「两个用户气泡在上、nexus 在下」。
+     * F5 之所以正常：它连 `streams` 一起清空，全部按 DB 序渲染。
+     *
+     * <p><b>修法</b>：块若已有同 id 的落库行，就用**那一行在库里的位置**作序号 —— 渲染的仍是
+     * 块（活内容），但位置跟后端权威顺序走。DB 序即后端出站链序，与 F5 完全一致。
+     */
+    const msgSeqById = new Map<string, number>()
     for (const m of dropTextInBriefTurns(messages)) {
       if (!isDialogueRow(m)) continue
       // 只有真正的用户提问行才开新轮（tool_use_summary / 压缩摘要这类 role=user 的系统产物不开）
@@ -2093,7 +2161,13 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       // 轮键单点 = messageTurns.turnKeyOf（当前轮优先；段自身 userMessageId 指向后台/系统消息时不采信）
       const key: string = turnKeyOf(m, turnId ?? lastMsgTurnKey)
       lastMsgTurnKey = key
-      push(key, { kind: 'msg', m }, m.renderSeq ?? ++historySeq)
+      // ⚠️ 序号必须在「跳过」**之前**算：被跳过的 assistant 行仍然占一个库内位次，
+      //   对应的块要靠它定位（否则块又会被排到末尾）。
+      const seq = m.renderSeq ?? ++historySeq
+      if (m.id) msgSeqById.set(m.id, seq)
+      // [同 id 双份] 该 assistant 行已有对应流式块 ⇒ 一律由块那一路渲染（严格二选一）
+      if (m.role === 'assistant' && m.id && streamIdSet.has(m.id)) continue
+      push(key, { kind: 'msg', m }, seq)
     }
     // streaming 块归属：用【冻结】的块 userMessageId（首 chunk 建立时确定，对应后端 DB 落库逐条推进
     //   的「位置」语义 —— 用户1 任务轮归用户1、排队 append 后的轮归排队）。冻结保证不被排队 append
@@ -2102,6 +2176,22 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     const { ids: userTurnIds, latest: latestUserTurnId } = collectUserTurnIds(messages)
     // 兜底顺序：最近一条 user 提问行 → 最后一条可见消息行所属轮（窗口内已无提问行时）
     const liveTurnFallback = latestUserTurnId ?? lastMsgTurnKey
+    /**
+     * [2026-11-03 用户实测「F5 后上一轮的过程消息被并进当前用户消息、顺序错」]
+     *
+     * <p><b>实测</b>：F5 / 切会话重建的流式块 **全部 uid=null**（46/46），因为它们由
+     * `tool_call` 事件建块（该事件不带 userMessageId）。而 `messages` 里同一
+     * `assistantMessageId` 的落库行**带着权威归属**（`userMessageId = msg-queued-fc6/ f8a…`）。
+     * 旧逻辑把 uid 为空的块一律吸附到「最新 user 消息」，于是上一轮整段过程被挂到当前提问下面。
+     *
+     * <p><b>修法</b>：落库行 id → 其 `userMessageId` 建索引；块自身 uid 缺失时用它补出归属。
+     * 补出来的归属**不再吸附到最新轮** —— 落库行说的才是真的，历史轮的残留块必须留在历史轮，
+     * 才能被折叠窗口（执行中只留 1 轮）真正剪掉。
+     */
+    const ownerByAssistantId = new Map<string, string>()
+    for (const m of messages) {
+      if (m.role === 'assistant' && m.id && m.userMessageId) ownerByAssistantId.set(m.id, m.userMessageId)
+    }
     // [2026-10-29] 块 id 去重（双保险）：store 已修「任意位置幂等」，但历史内存态/异常路径可能仍带重复 id。
     //   React key = blockId，重复 ⇒ 两行同 key ⇒ 折叠状态被反复重建（思考/所有工具都点不开）。
     const seenBlockIds = new Set<string>()
@@ -2111,8 +2201,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       seenBlockIds.add(blockId)
       const b = live.find((x) => x.assistantMessageId === blockId)
       if (!b) continue
+      // [落库行权威归属] 块自身 uid 缺失 / 窗口外的旧 id → 用同 id 落库行补
+      const rowOwner = b.assistantMessageId ? ownerByAssistantId.get(b.assistantMessageId) : undefined
+      const owner = b.userMessageId ?? rowOwner
       // [轮键] 与落库 assistant 段同口径（见 blockTurnKey）：冻结 id 认不出 ⇒ 归当前轮
-      const baseKey = blockTurnKey(b.userMessageId, userTurnIds, liveTurnFallback, b.assistantMessageId ?? 'stream')
+      const baseKey = blockTurnKey(owner, liveTurnFallback, b.assistantMessageId ?? 'stream')
       // [2026-11-02 用户裁定「执行中又发一条 ⇒ 只留新用户气泡」] 流式块若归属**旧轮**，
       //   而其后已经出现了更新的用户提问（执行中被排队），则块应吸附到**最新那轮**。
       //
@@ -2121,11 +2214,18 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       //   动它会破坏那个契约。这里只调整**显示归属**：块的内容仍属旧轮，但它此刻代表
       //   「当前正在产生的新内容」，必须跟着最新提问显示，否则折叠旧轮时会把实时输出一起藏掉
       //   （实测：执行中排队后，用户完全看不到输出）。
-      const key = userTurnIds.has(baseKey)
+      //
+      // ⚠️ [2026-11-03] **有落库行归属时禁止吸附**：那种块不是「正在产生的新内容」，
+      //   而是历史轮已定稿的过程段（F5 后被 REST 拉回来的）。吸附会把它们混进当前轮，
+      //   折叠按轮生效 ⇒ 永远剪不掉（用户实测「上一轮过程被并进当前提问」）。
+      const key = rowOwner == null && userTurnIds.has(baseKey)
         ? (liveTurnFallback && baseKey !== liveTurnFallback ? liveTurnFallback : baseKey)
         : baseKey
       // [anchorSeq] 块 = 建立时盖的流式区到达号（缺省旧块 → 基准 + 块序），恒大于所有历史
-      push(key, { kind: 'blk', sid: sessionId, blockId }, b.renderSeq ?? LIVE_SEQ_BASE + i)
+      // [2026-11-03] 但若该块已有同 id 的落库行，则**采用落库行的库内位次** —— 否则重拉后
+      //   行是 1,2,3 而块是 10 亿+ ⇒ 块整体跳到末尾（用户实测「user/user/…/nexus」顺序错）。
+      const persistedSeq = b.assistantMessageId ? msgSeqById.get(b.assistantMessageId) : undefined
+      push(key, { kind: 'blk', sid: sessionId, blockId }, persistedSeq ?? b.renderSeq ?? LIVE_SEQ_BASE + i)
     }
     return arr
   }, [messages, streamIds, sessionId])
@@ -2403,13 +2503,13 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     const keys = new Set<string>()
     const live = sessionId ? (useChatStore.getState().streams[sessionId] ?? []) : []
     // 与 groups 同一轮键口径：块冻结 id 认不出 ⇒ 归当前轮（同轮只留一个 N nexus 头）
-    const { ids: userTurnIds, latest: latestUserTurnId } = collectUserTurnIds(messages)
+    const { latest: latestUserTurnId } = collectUserTurnIds(messages)
     const lastRow = flatRows.length > 0 ? flatRows[flatRows.length - 1]! : null
     const liveTurnFallback = latestUserTurnId ?? (lastRow && lastRow.kind !== 'err' ? lastRow.turnKey : null)
     for (const blockId of streamIds) {
       const b = live.find((x) => x.assistantMessageId === blockId)
       if (!b) continue
-      keys.add(blockTurnKey(b.userMessageId, userTurnIds, liveTurnFallback, b.assistantMessageId ?? 'stream'))
+      keys.add(blockTurnKey(b.userMessageId, liveTurnFallback, b.assistantMessageId ?? 'stream'))
     }
     // 无块但 turn 仍在跑（等待/重试）：当前轮 = 最新提问行 / 最后一条可见行所属轮
     if (keys.size === 0 && !turnEnded && liveTurnFallback) keys.add(liveTurnFallback)
@@ -2477,8 +2577,49 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (turnEnded && revealedFoldKeys.has(k)) break
       folded.push(k)
     }
+    /**
+     * [2026-11-03 用户实测「中途消费补发消息后历史没减除，F5 才对」]
+     *
+     * <p><b>缺口</b>：上面的 `keys` 只来自 `orderedTurnKeys(messages)` —— 而**窗口外的
+     * 流式块**（F5 重连回放 / 消费排队消息后残留的旧轮块）其 uid 根本不在 `messages` 里
+     * （实测：块 uid = `msg-c29ebc4c`，窗口内 user 行是 `msg-queued-*`）。这些键既不进
+     * `keys`，也就永远进不了 `folded` ⇒ 它们的 DOM 一直留着 = 「历史没被减除」。
+     *
+     * <p><b>修法</b>：执行中（`!turnEnded`）把「不在窗口内的块轮键」一并折起。判据只认
+     * **块的 uid**（`groups` 用同一口径算出的 turnKey），不看内容 —— 完成态（`turnEnded`）
+     * 不折，保证轮末历史照常恢复可见。
+     */
+    if (!turnEnded) {
+      const inWindow = new Set(keys)
+      const { latest: latestUserTurnId } = collectUserTurnIds(messages)
+      const liveBlocks = sessionId ? (useChatStore.getState().streams[sessionId] ?? []) : []
+      /**
+       * ⛔ [2026-11-03 用户实测「中间发消息时正在执行 / 扫光条偶发不显示」]
+       *
+       * <p><b>成因</b>：排队消费起新轮时，新一轮的块先到、而它的 user 行还没进 `messages`
+       * （queue.drained 的 append 与 chunk 到达是两条独立路径）。此时 `latestUserTurnId` 还是
+       * **上一轮**的 id ⇒ 新一轮的块被判成「窗口外的旧轮」⇒ 整轮被折叠 ⇒ 正在执行 / 扫光条全没了。
+       *
+       * <p><b>判据</b>：**最后一个流式块所属的轮永远不折** —— 它就是当前正在产出的那一轮，
+       * 与它有没有 user 行无关。
+       */
+      const lastBlock = streamIds.length > 0 ? liveBlocks.find((x) => x.assistantMessageId === streamIds[streamIds.length - 1]) : undefined
+      const runningTurnKey = lastBlock?.userMessageId ?? null
+      // ⛔ 窗口里没有任何 user 行（首屏未拉回 / 本轮 user 尚未到达）⇒ 无从判断谁「更早」，
+      //   一律不折 —— 否则会把正在输出的整轮藏掉（实测：thinkingTokens 两例白屏）。
+      if (latestUserTurnId != null) {
+        for (const blockId of streamIds) {
+          const b = liveBlocks.find((x) => x.assistantMessageId === blockId)
+          if (!b?.userMessageId) continue
+          if (b.userMessageId === latestUserTurnId) continue
+          if (b.userMessageId === runningTurnKey) continue
+          if (inWindow.has(b.userMessageId)) continue
+          if (!folded.includes(b.userMessageId)) folded.push(b.userMessageId)
+        }
+      }
+    }
     return folded
-  }, [messages, revealedFoldKeys, activeTurnKeys, turnEnded])
+  }, [messages, revealedFoldKeys, activeTurnKeys, turnEnded, streamIds, sessionId])
   const foldedSet = useMemo(() => new Set(foldedTurnKeys), [foldedTurnKeys])
   /** 折叠区内的轮**不渲染 DOM**（既留数据又不占渲染）；点击折叠行后它们才出现。 */
   const visibleRows = useMemo(

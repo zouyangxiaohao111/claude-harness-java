@@ -143,7 +143,7 @@ public class VisionAnalyzeTool implements Tool {
 
     @Override
     public String description() {
-        return "代理视觉模型分析：把图片/PDF 页与指令发给独立视觉模型（settings.multimodalModelName）"
+        return "代理视觉模型分析：把图片/PDF 页与指令发给独立视觉模型"
                 + "分析，返回纯文本结果。type=analyze 读源（source 二选一：contentId=附件表 contentId，"
                 + "path=文件系统路径）+ contentType=image|pdf（pdf 支持 pages 显式页号数组 [1,2,3]）→ 视觉"
                 + "模型分析；type=suggest 纯 prompt 建议（不读图）。返回文本以 [image/…] 占位符代替二进制，"

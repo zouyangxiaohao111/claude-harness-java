@@ -150,6 +150,26 @@ export interface TestConnectionResponse {
   details: Record<string, unknown> | null
 }
 
+/**
+ * 远端提供商的**一个模型**（后端已把各家键名归一化）。
+ *
+ * <p>⚠️ `contextWindow` / `maxOutputTokens` 为 null = **提供商没给**（标准 OpenAI 形态就是如此）
+ * ⇒ 前端落默认值并在界面上标出「默认值」，⛔ 不能把 null 当 0（0 会让压缩阈值失效）。
+ */
+export interface RemoteModel {
+  id: string
+  name: string | null
+  contextWindow: number | null
+  maxOutputTokens: number | null
+}
+
+/** 拉取远端模型清单的结果（失败不抛异常 ⇒ ok=false + 中文原因，前端保留手动添加入口）。 */
+export interface RemoteModelsResponse {
+  ok: boolean
+  models: RemoteModel[]
+  message: string
+}
+
 // ---- Skill ----
 export interface Skill {
   id: string
