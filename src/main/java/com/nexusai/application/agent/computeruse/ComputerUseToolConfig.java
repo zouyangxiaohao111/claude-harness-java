@@ -489,10 +489,21 @@ public class ComputerUseToolConfig {
             terminalLauncher = new Win32TerminalLauncher();
             // pid → 应用授权键（绑定窗口的档位门控用）
             processAppResolver = new Win32ProcessAppResolver();
+        } else if (platform.kind() == ComputerUsePlatform.Kind.MACOS) {
+            // ── [macOS AX] 语义树观察 / 元素操作（对齐 dsh 的 AX 优先路线）──
+            //   macOS 不需要 windowOps / 窗口绑定：AX 树从「前台应用 pid」开始，
+            //   动作走 AXPress / AXValue，不涉及坐标与窗口句柄。
+            uiaService = new MacOsUiaService();
         }
         // 绑定窗口存储（会话级；null ⇒ 新建一个兼容路径）
         ComputerUseWindowBindingStore effectiveBindingStore =
                 bindingStore != null ? bindingStore : new ComputerUseWindowBindingStore();
+        // [macOS AX] 观察存储（会话级；observationId + index 绑定 + 陈旧拒绝）
+        //   ⚠️ 必须<b>同一实例</b>传给 observe 与 click_element / type_into_element，
+        //   否则 observe 写入的观察动作侧读不到（dsh 的 service 单例同理）。
+        ComputerUseUiSnapshotStore effectiveSnapshotStore = new ComputerUseUiSnapshotStore();
+        // 敏感动作的一次性确认令牌存储（进程内；一次性 + TTL，对齐 dsh confirmations.ts）
+        ComputerUseConfirmationStore effectiveConfirmationStore = new ComputerUseConfirmationStore();
         // 点击路由（窗口定向 / 全局注入 + 修饰键）
         //   macOS 上 windowOps = null ⇒ 恒走全局注入（本仓 macOS 无窗口绑定语义）
         ComputerUseClickRouter clickRouter =
@@ -543,19 +554,47 @@ public class ComputerUseToolConfig {
                         grantStore, foregroundAppResolver, effectiveMouseState),
                 // [Phase 2a] 启动 / 置前应用（必须在会话白名单里；无档位门控）
                 new ComputerUseOpenApplicationTool(appLauncher, grantStore, displayProvider)));
-        // ── [Phase 2b] Windows 专属 11 个工具（<b>仅 Windows 注册</b>）──
+        // ── [macOS AX] 元素级工具（两平台共用 · 见下方注册）──
+        //   ⚠️ 与 CCB 的差异（如实标注）：CCB 把 click_element / type_into_element 放在
+        //   `caps.platform === 'win32'` 条件块里（tools.ts:420-836）⇒ CCB 的 macOS 没有
+        //   元素级操作。本仓在 macOS 上用 Accessibility 实现了同一契约
+        //   （dsh 的路线：AX 优先、observationId + index 绑定）。
+        //   ⇒ Windows 仍要求先 bind 窗口（UIA 需要 hwnd），macOS 不需要。
+        if (uiaService != null) {
+            tools.add(new ComputerUseObserveTool(uiaService, effectiveSnapshotStore,
+                    platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null));
+            tools.add(new ComputerUseClickElementTool(uiaService, windowOps, effectiveBindingStore,
+                    effectiveSnapshotStore, effectiveConfirmationStore));
+            tools.add(new ComputerUseTypeIntoElementTool(uiaService, windowOps, effectiveBindingStore,
+                    effectiveSnapshotStore, effectiveConfirmationStore));
+            // ── [macOS AX] 任意 AX 动作 + 条件等待（dsh computer_perform_action / computer_wait）──
+            //   Windows 侧无等价实现（UIA 动作集不是统一名字空间；条件等待需轮询 AX 树）
+            //   ⇒ 仅在实现了对应能力的平台注册（避免注册「永远调不通」的工具）。
+            if (platform.kind() == ComputerUsePlatform.Kind.MACOS) {
+                tools.add(new ComputerUsePerformActionTool(uiaService, effectiveSnapshotStore,
+                        effectiveConfirmationStore));
+                tools.add(new ComputerUseWaitForConditionTool(uiaService));
+            }
+        }
+        // ── 敏感动作的一次性确认（两平台共用 · dsh computer_confirm）──
+        //   与 request_access 同一套 STOMP 审批气泡通道（Passthrough ⇒ 第 3 层转 Ask）。
+        tools.add(new ComputerUseConfirmTool(effectiveConfirmationStore, effectiveSnapshotStore));
+        // ── [macOS] 运行中应用列表（dsh computer_list_apps：带 pid / 前台标记 / 授权状态）──
+        //   Windows 侧暂不提供（本仓 Windows 的应用枚举走 CCB 的 request_access 路径）。
+        if (platform.kind() == ComputerUsePlatform.Kind.MACOS) {
+            tools.add(new ComputerUseListAppsTool(new MacOsAppCatalog(), grantStore, new MacOsTccChecker()));
+        }
+        // ── [Phase 2b] Windows 专属工具（<b>仅 Windows 注册</b>）──
         //   与 CCB 一致：CCB 把它们放在 `caps.platform === 'win32' ? [...] : []` 条件块里
         //   （packages/@ant/computer-use-mcp/src/tools.ts:420-836）
-        //   ⇒ <b>CCB 的 macOS 工具面 = 24 个</b>（35 − 11）。
+        //   ⚠️ 本仓已把 click_element / type_into_element 提出来（macOS 也有实现），
+        //      故 macOS 工具面 = CCB 的 24 个 + observe + 上述 2 个 = 27 个。
         if (platform.supportsWindowsOnlyTools()) {
             tools.addAll(List.of(
                 //   （位置逐字对齐 CCB tools.ts:420-836 的 win32 条件块：
                 //    紧跟 open_application 之后、switch_display 之前）
                 // [Phase 2b] 窗口管理（ShowWindow / SetWindowPos / WM_CLOSE / 置前）
                 new ComputerUseWindowManagementTool(windowOps, effectiveBindingStore),
-                // [Phase 2b] UIA 元素点击 / 元素输入（InvokePattern / ValuePattern）
-                new ComputerUseClickElementTool(uiaService, windowOps, effectiveBindingStore),
-                new ComputerUseTypeIntoElementTool(uiaService, windowOps, effectiveBindingStore),
                 // [Phase 2b] 打开终端并启动 agent CLI（绑定新终端窗口）
                 new ComputerUseOpenTerminalTool(terminalLauncher, windowOps, effectiveBindingStore,
                         ComputerUseSleeper.REAL),

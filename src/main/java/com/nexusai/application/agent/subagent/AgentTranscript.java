@@ -43,6 +43,27 @@ public class AgentTranscript {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /**
+     * 转录增量推送口（STOMP）· 由 {@link SubagentTranscriptStreamer} 在 Spring 启动时安装。
+     *
+     * <p>WHY 放在本类：所有子代理 transcript 的写入（{@code SubagentExecutor} 逐消息录制、
+     * tool result 录制、压缩落盘）**都经过** {@link #recordSidechainTranscript} —— 这是唯一漏斗。
+     * 在别处推送必然漏路径。
+     *
+     * <p>null = 未接线（单元测试直构 / 非 Spring 环境）→ 不推送，行为与改造前逐位一致。
+     */
+    @FunctionalInterface
+    public interface IncrementSink {
+        void publish(String sessionId, String agentId, List<Map<String, Object>> messages);
+    }
+
+    private static volatile IncrementSink incrementSink;
+
+    /** 安装增量推送口（Spring 组件在 {@code @PostConstruct} 调用；测试可替换）。 */
+    public static void setIncrementSink(IncrementSink sink) {
+        incrementSink = sink;
+    }
+
+    /**
      * Agent 元数据 · 对齐 CC AgentMetadata（sessionStorage.ts:264-272）
      *
      * <p>[#25 删字段] 原 Java 扩展 model 字段已删除（open-decisions F2 #25 删字段改现算）——
@@ -338,8 +359,27 @@ public class AgentTranscript {
                 log.debug("已记录 {} 条消息 agent={} (startingParentUuid={})",
                     messages.size(), agentId, startingParentUuid);
             }
+            // 落盘成功后才推实时增量（前端按 uuid 幂等去重；先推后写会在写失败时留下幽灵消息）
+            publishIncrement(sessionId, agentId, messages);
         } catch (IOException e) {
             log.warn("记录 sidechain transcript 失败: {}", e.getMessage());
+        }
+    }
+
+    /**
+     * 推送本次写入的消息（已 enrich 的同一批 map，与落盘内容逐位一致）。
+     *
+     * <p>推送失败绝不影响落盘：transcript 是权威源，STOMP 只是实时性优化。
+     */
+    private static void publishIncrement(String sessionId, String agentId, List<Map<String, Object>> messages) {
+        IncrementSink sink = incrementSink;
+        if (sink == null || sessionId == null || agentId == null || messages == null || messages.isEmpty()) {
+            return;
+        }
+        try {
+            sink.publish(sessionId, agentId, messages);
+        } catch (Exception e) {
+            log.warn("推送 transcript 增量失败 session={} agent={}: {}", sessionId, agentId, e.getMessage());
         }
     }
 
@@ -641,8 +681,16 @@ public class AgentTranscript {
         }
         String reasoning = node.has("reasoning") && !node.get("reasoning").isNull()
             ? node.path("reasoning").asText(null) : null;
+        // [2026-11-02] 系统注入三件套 · CC original: msg.isMeta / msg.author / msg.type(subtype)
+        //   旧转录无这些键 → false / null（= CC undefined，非双轨）。
+        boolean isMeta = node.path("isMeta").asBoolean(false);
+        String author = node.has("author") && !node.get("author").isNull()
+            ? node.path("author").asText(null) : null;
+        String subtype = node.has("subtype") && !node.get("subtype").isNull()
+            ? node.path("subtype").asText(null) : null;
         return new AgentMessage(role, content, isApiError, agentId, isSidechain,
-            uuid, parentUuid, toolCalls, toolCallId, timestamp, reasoning);
+            uuid, parentUuid, toolCalls, toolCallId, timestamp, reasoning,
+            isMeta, author, subtype);
     }
 
     /**

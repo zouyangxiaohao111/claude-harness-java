@@ -158,7 +158,12 @@ public interface GenericHook {
         String initialUserMessage,
         java.util.List<String> watchPaths,
         ElicitationResponse elicitationResponse,
-        ElicitationResponse elicitationResultResponse
+        ElicitationResponse elicitationResultResponse,
+        // ─── [goal V253] 第 20 字段 impossible · 对齐 CC v2.1.212 stop-condition 评估器 ───
+        //   CC 侧：ok=false + impossible=true → outcome='success' + impossible:true + stopReason
+        //   （条件根本不可能达成 ⇒ 交还控制权，而不是继续 block 到撞连续 block 上限）。
+        //   本仓普通 prompt hook 不产出该值（null = 不适用）；只有 stop-condition 分支会置 true。
+        Boolean impossible
         // ─── [IMP-DA-01 TY-01] 第 19 字段 allBlockingErrors 已删除 · 对齐 CC HookResult 无此字段 ───
         //   CC executeHooks 逐结果 yield blockingError (hooks.ts:2759-2763) →
         //   runPostToolUseHooks 逐 result.blockingError 产独立 hook_blocking_error 附件
@@ -180,6 +185,32 @@ public interface GenericHook {
         }
 
         /**
+         * [goal V253] 18 参转发构造器 · 现有全部构造点零改动。
+         *
+         * <p>WHY: {@code HookResult} 是 record（现 18 字段，第 19 个 allBlockingErrors 已删），
+         * 全仓 **90 处构造点 / 26 个文件**（HookRegistry 23 / GenericHook 6 / ExecPromptHook 4 /
+         * ExecAgentHook 4 / CommandHookExecutor 6 / HookOutputParser 1 + 测试侧若干）。
+         * 直接加第 19 个字段会让这 90 处全部编译失败 ⇒ 用转发构造器承接（impossible=null）。
+         *
+         * <p>这是<b>纯追加</b>，不是「破约留兼容壳」：唯一真源仍是 record 的全部字段，
+         * 转发构造器只是让旧调用点不必立刻补一个 null。
+         */
+        public HookResult(boolean preventContinuation, HookBlockingError blockingError,
+                          java.util.List<String> systemMessages, java.util.List<String> additionalContexts,
+                          Object message, Map<String, Object> updatedInput, Object updatedMCPToolOutput,
+                          Boolean retry, String hookPermissionDecisionReason,
+                          HookOutcome outcome, String stopReason, PermissionBehavior permissionBehavior,
+                          PermissionRequestResult permissionRequestResult, HookCommand hook,
+                          String initialUserMessage, java.util.List<String> watchPaths,
+                          ElicitationResponse elicitationResponse, ElicitationResponse elicitationResultResponse) {
+            this(preventContinuation, blockingError, systemMessages, additionalContexts,
+                message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
+                outcome, stopReason, permissionBehavior, permissionRequestResult, hook,
+                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
+                null);
+        }
+
+        /**
          * [Session S07] wither: 回填 permissionRequestResult · 对齐 CC hooks.ts:2882-2886
          * {@code yield { permissionRequestResult }} 顶层产出.
          *
@@ -197,7 +228,8 @@ public interface GenericHook {
             return new HookResult(preventContinuation, blockingError, systemMessages, additionalContexts,
                 message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
                 outcome, stopReason, permissionBehavior, prr, hook,
-                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse);
+                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
+                impossible);   // [goal V253] 透传 impossible（wither 不得丢字段）
         }
 
         /**
@@ -213,7 +245,8 @@ public interface GenericHook {
             return new HookResult(preventContinuation, blockingError, systemMessages, additionalContexts,
                 message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
                 outcome, stopReason, permissionBehavior, permissionRequestResult, hook,
-                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse);
+                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
+                impossible);   // [goal V253] 透传 impossible（wither 不得丢字段）
         }
 
         /**

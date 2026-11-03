@@ -1508,13 +1508,15 @@ public class ReadFileTool implements Tool {
         //   deepseek=chat → false）。模型支持图片 → 走 CC :895-946 正常页图 image blocks 送达；文本模型
         //   → 不发 image block 给不支持图片的模型（deepseek 400 根因防线），错误引导派多模态子代理。
         String mainLoopModel = resolveMainLoopModel(ctx);
-        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+        ReadDirectCapability capability = readDirectCapability(mainLoopModel);
+        if (capability != ReadDirectCapability.DIRECT) {
             if (log.isInfoEnabled()) {
-                log.info("ReadFileTool: PDF pages 文本模型门控提前触发 path={} pages={} model={}"
+                log.info("ReadFileTool: PDF pages 门控提前触发 path={} pages={} model={} 原因={}"
                         + "（fail-loud error，不渲染页图 / 不发 image block 给不支持图片的模型）",
-                    relPath, pages, mainLoopModel);
+                    relPath, pages, mainLoopModel, capability);
             }
-            return textModelPdfUnsupported(call, file, relPath, mainLoopModel, "PDF 页图（pages=" + pages + "）");
+            return textModelPdfUnsupported(call, file, relPath, mainLoopModel,
+                "PDF 页图（pages=" + pages + "）", capability);
         }
         // CC :896-899 parsePDFPageRange(pages) — 非法字符串 → null → 全量提取（parsedRange ?? undefined）
         PdfPageRange.Range parsedRange = PdfPageRange.parse(pages).orElse(null);
@@ -1582,13 +1584,14 @@ public class ReadFileTool implements Tool {
         //   ctx.effectiveModelName）→ PdfSupport.isPDFSupported 3 参（modelMapper 注入 →
         //   ModelCapabilityResolver.supportsImage，deepseek=chat → false；null → 回落 1 参 CC 契约）。
         String mainLoopModel = resolveMainLoopModel(ctx);
-        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+        ReadDirectCapability capability = readDirectCapability(mainLoopModel);
+        if (capability != ReadDirectCapability.DIRECT) {
             if (log.isInfoEnabled()) {
-                log.info("ReadFileTool: PDF 全读文本模型门控提前触发 path={} model={}"
+                log.info("ReadFileTool: PDF 全读门控提前触发 path={} model={} 原因={}"
                         + "（fail-loud error，不渲染页图 / 不发 document block 给不支持图片的模型）",
-                    relPath, mainLoopModel);
+                    relPath, mainLoopModel, capability);
             }
-            return textModelPdfUnsupported(call, file, relPath, mainLoopModel, "完整 PDF");
+            return textModelPdfUnsupported(call, file, relPath, mainLoopModel, "完整 PDF", capability);
         }
         long fileSize;
         try {
@@ -1664,14 +1667,26 @@ public class ReadFileTool implements Tool {
      * @param relPath   相对显示路径（错误文案含 path，模型可指代该文件）
      * @param modelName 当前不支持 image/PDF 的模型名（resolveMainLoopModel 结果；可 null → "未知"）
      * @param scope     读取范围文案（"完整 PDF" / "PDF 页图（pages=…）"，区分全读/页读）
+     * @param capability 直给失败原因（三态）⇒ 决定文案说「模型不支持」还是「当前格式不支持」
      * @return fail-loud {@link ToolResult#error}
      */
     private ToolResult textModelPdfUnsupported(ToolUseBlock call, Path file, String relPath,
-                                               String modelName, String scope) {
+                                               String modelName, String scope,
+                                               ReadDirectCapability capability) {
         String absPath = file == null ? relPath : file.toString();
-        StringBuilder msg = new StringBuilder("Error: 当前模型不支持 image/PDF 视觉（model=")
-            .append(modelName == null ? "未知" : modelName)
-            .append("），无法直接读取 ").append(scope).append("（path=").append(relPath).append("）。");
+        StringBuilder msg = new StringBuilder("Error: ");
+        if (capability == ReadDirectCapability.FORMAT_NO_DIRECT) {
+            // [2026-11-01 用户裁定] 区分「模型不是多模态」与「格式不开放直给通道」——
+            // 用户原话：「我配置的 deepseek-v4.1-flash 本身支持多模态的 用的是 openai 格式」
+            msg.append("当前 provider 格式（").append(providerFormatLabel(modelName))
+                .append("）不支持 Read 直发 PDF（model=").append(modelName == null ? "未知" : modelName)
+                .append(" 本身支持多模态，但当前 Read 直给通道只对 anthropic 格式开放）")
+                .append("，无法直接读取 ").append(scope).append("（path=").append(relPath).append("）。");
+        } else {
+            msg.append("当前模型不支持 image/PDF 视觉（model=")
+                .append(modelName == null ? "未知" : modelName)
+                .append("），无法直接读取 ").append(scope).append("（path=").append(relPath).append("）。");
+        }
         // [vision-cc-align 2026-09-03] 递归根因修复：删「派多模态子代理」引导（fork 继承文本模型 → Read 再
         //   触发本门控 → 无限递归）。改为引导 vision_analyze 直达（工具内部自己调多模态档位模型，懒渲染 pages，
         //   返回纯文本）——主模型闭环，无需子代理。
@@ -1691,15 +1706,28 @@ public class ReadFileTool implements Tool {
      * @param relPath   相对显示路径（错误文案含 path）
      * @param modelName 当前不支持 image 的模型名（可 null → "未知"）
      * @param ext       图片扩展名（如 .png，文案标注类型）
+     * @param capability 直给失败原因（三态）⇒ 决定文案说「模型不支持」还是「当前格式不支持」
      * @return fail-loud {@link ToolResult#error}
      */
     private ToolResult textModelImageUnsupported(ToolUseBlock call, Path file, String relPath,
-                                                 String modelName, String ext) {
+                                                 String modelName, String ext,
+                                                 ReadDirectCapability capability) {
         String absPath = file == null ? relPath : file.toString();
-        StringBuilder msg = new StringBuilder("Error: 当前模型不支持 Read 直接显示图像（model=")
-            .append(modelName == null ? "未知" : modelName)
-            .append(ext == null ? "" : ", type=" + ext)
-            .append("，path=").append(relPath).append("）。");
+        StringBuilder msg = new StringBuilder("Error: ");
+        if (capability == ReadDirectCapability.FORMAT_NO_DIRECT) {
+            // [2026-11-01 用户裁定] 区分「模型不是多模态」与「格式不开放直给通道」——
+            // 用户原话：「我配置的 deepseek-v4.1-flash 本身支持多模态的 用的是 openai 格式」
+            msg.append("当前 provider 格式（").append(providerFormatLabel(modelName))
+                .append("）不支持 Read 读图（model=").append(modelName == null ? "未知" : modelName)
+                .append(" 本身支持多模态，但当前 Read 直给通道只对 anthropic 格式开放")
+                .append(ext == null ? "" : ", type=" + ext)
+                .append("，path=").append(relPath).append("）。");
+        } else {
+            msg.append("当前模型不支持 Read 直接显示图像（model=")
+                .append(modelName == null ? "未知" : modelName)
+                .append(ext == null ? "" : ", type=" + ext)
+                .append("，path=").append(relPath).append("）。");
+        }
         msg.append("如需查看图像内容，请调用 vision_analyze(type=analyze, path=").append(absPath)
             .append(", prompt=你想了解什么)。vision_analyze 会读取该图并调用多模态档位模型分析，返回纯文本结果。");
         return ToolResult.error(call.id(), msg.toString());
@@ -1750,14 +1778,62 @@ public class ReadFileTool implements Tool {
      * @param modelName 当前主模型名（resolveMainLoopModel 结果；可 null）
      * @return true = Read 图/PDF 结果可直接送达该模型
      */
-    private boolean canModelViewReadResultDirectly(String modelName) {
+    /**
+     * Read 直给能力三态 · <b>失败原因要能说清楚</b>（⛔ 不能笼统说「模型不支持」）。
+     *
+     * <p>[2026-11-01 用户裁定] 用户原话：「我配置的 deepseek-v4.1-flash 本身支持多模态的 用的是 openai 格式」
+     * ⇒ 旧文案「当前模型不支持 Read 直接显示图像」把<b>格式限制</b>说成了<b>模型能力不足</b>，
+     * 与事实不符（该模型 {@code models.type=multimodal}，确实是多模态）⇒ 门禁行为不变，
+     * 但文案要分清「模型不是多模态」与「模型多模态但当前 provider 格式不开放直给通道」。
+     */
+    private enum ReadDirectCapability {
+        /** 可直给（模型多模态 + provider 格式开放直给通道）。 */
+        DIRECT,
+        /** 模型本身不是多模态（文本模型）⇒ 任何格式都读不到图。 */
+        MODEL_NO_IMAGE,
+        /** 模型本身多模态，但当前 provider 格式（如 {@code openai_compatible}）不开放 Read 直给通道。 */
+        FORMAT_NO_DIRECT
+    }
+
+    /**
+     * 当前主循环模型的 Read 直给能力（三态）。
+     *
+     * @param modelName 当前主模型名（可 null）
+     * @return {@link ReadDirectCapability}
+     */
+    private ReadDirectCapability readDirectCapability(String modelName) {
         if (modelMapper == null || providerMapper == null) {
-            return PdfSupport.isPDFSupported(modelName);
+            return PdfSupport.isPDFSupported(modelName)
+                ? ReadDirectCapability.DIRECT
+                : ReadDirectCapability.MODEL_NO_IMAGE;
+        }
+        boolean imageCapable = PdfSupport.isPDFSupported(modelMapper, providerMapper, modelName);
+        if (!imageCapable) {
+            return ReadDirectCapability.MODEL_NO_IMAGE;
         }
         boolean antDirectFormat = com.nexusai.application.agent.compact.ContextUsageCalculator.isAnthropic(
             modelMapper, providerMapper, modelName);
-        boolean imageCapable = PdfSupport.isPDFSupported(modelMapper, providerMapper, modelName);
-        return antDirectFormat && imageCapable;
+        return antDirectFormat
+            ? ReadDirectCapability.DIRECT
+            : ReadDirectCapability.FORMAT_NO_DIRECT;
+    }
+
+    /**
+     * 当前模型的 provider 格式（失败文案用；未知 → 「未知格式」）。
+     *
+     * <p>走 {@link com.nexusai.application.agent.compact.ContextUsageCalculator#providerType}
+     * 单一真源（model → providerId → provider.type），⛔ 不在这里另写一遍 resolve 链。
+     */
+    private String providerFormatLabel(String modelName) {
+        String type = com.nexusai.application.agent.compact.ContextUsageCalculator.providerType(
+            modelMapper, providerMapper, modelName);
+        if (type == null || type.isBlank()) {
+            return "未知格式";
+        }
+        if ("openai_compatible".equals(type)) {
+            return "openai 兼容格式（openai_compatible）";
+        }
+        return type;
     }
 
     /**
@@ -1923,17 +1999,19 @@ public class ReadFileTool implements Tool {
                                      String ext, ToolUseContext ctx, int maxTokens) throws Exception {
         // [vision-cc-align 2026-09-03] 文本模型门控前置（对齐 dispatchPdfPages 提前门控）：openai-completions
         //   deepseek / ant 文本模型下 Read 图 image block 会被 provider 丢弃（R-T-1）→ 模型反复 Read 空图死循环。
-        //   直给判定 = canModelViewReadResultDirectly（ant/response 直给格式 && supportsImage 多模态）——
+        //   直给判定 = readDirectCapability（ant/response 直给格式 && supportsImage 多模态）——
         //   deepseek-vision-exp 虽标多模态但 completions 格式不走 Read 直给 → 同样引导。直给 →
         //   现行为 image block；否则 fail-loud 引导 vision_analyze(path)（不读文件、不发 image block）。
+        //   [2026-11-01] 门禁行为不变，但失败文案按三态区分「模型不是多模态」/「格式不开放直给通道」。
         String mainLoopModel = resolveMainLoopModel(ctx);
-        if (!canModelViewReadResultDirectly(mainLoopModel)) {
+        ReadDirectCapability capability = readDirectCapability(mainLoopModel);
+        if (capability != ReadDirectCapability.DIRECT) {
             if (log.isInfoEnabled()) {
-                log.info("ReadFileTool: 图片文本模型门控前置触发 path={} model={}"
+                log.info("ReadFileTool: 图片门控前置触发 path={} model={} 原因={}"
                         + "（fail-loud 引导 vision_analyze(path)，不读文件 / 不发 image block 给不支持图片的模型）",
-                    relPath, mainLoopModel);
+                    relPath, mainLoopModel, capability);
             }
-            return textModelImageUnsupported(call, file, relPath, mainLoopModel, ext);
+            return textModelImageUnsupported(call, file, relPath, mainLoopModel, ext, capability);
         }
         byte[] bytes = Files.readAllBytes(file);
         long originalSize = bytes.length;

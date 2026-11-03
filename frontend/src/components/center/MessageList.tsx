@@ -1,8 +1,8 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { isDialogueRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
+import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
 import { MarkdownText } from '@/markdown/MarkdownText'
 import { projectPreview } from '@/markdown/plainPreview'
-import type { ChatMessageDto, ToolCallDto } from '@/api/types'
+import type { AttachmentRequest, ChatMessageDto, ToolCallDto } from '@/api/types'
 import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
 import type { TurnUsageDto } from '@/api/usageTurns'
 import type { SessionFile } from '@/types'
@@ -380,7 +380,11 @@ interface MessageListProps {
    *  ⚠️ 第三个参数 {@code onTrimmed}：**裁剪完成**回调（App 在裁剪 + 重拉窗口后调用）——
    *  编辑态只覆盖「裁剪」这一小段，裁剪一完成就退出编辑态，发送随后走普通路径
    *  （乐观气泡 + 登记 activeStreams ⇒ 消息区出现「思考中…」），不让用户盯着「发送中…」。 */
-  onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void) => Promise<void>
+  onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
+  /** [折叠 = 真删 · 2026-11-02] store 里**已被移出内存**的轮数（不止是没渲染 —— 内存真的释放了）。 */
+  foldedTurnCount?: number
+  /** [折叠 = 真删] 点折叠行 → 向后端重拉更早一轮并 prepend（App 实现；缺省 = 只能展开内存里已有的轮） */
+  onExpandOlder?: () => void
 }
 
 /** [紧凑过程行] 工具行标题参数摘要：从 arguments JSON 取「动作对象」字段（command/cmd/path/pattern/query…），
@@ -776,6 +780,66 @@ function CompactSummaryCard({ msg, highlighted }: { msg: ChatMessageDto; highlig
  *  && !preventedContinuation && !message.hookLabel) ... return null}）：无错误、未阻止继续、
  *  且非 label 摘要 → 不渲染（Stop/SubagentStop 生产形态 hookLabel 恒 null →
  *  即「只有出错或被阻止时才可见」）。 */
+/**
+ * 系统注入行（2026-11-02 用户裁定）：技能清单 / 外部改文件 / hook 回执 等 meta 消息。
+ *
+ * <p><b>形态</b>：一行弱化的「⏺ 摘要」，点开看原始内容 —— 复用后台通知行（`.msg.task-notice`）的视觉，
+ * 因为它们同属「系统说的话，不是用户说的，也不是助手说的」。
+ *
+ * <p><b>位置</b>：⛔ 不单独占据对话流（否则收起态仍会显示、且夹在工具卡之间打断阅读），
+ * 只在该轮「已完成」折叠区里渲染（由 {@code Message} 的 turn-process-body 承载）。
+ */
+function SystemInjectedRow({ msg }: { msg: ChatMessageDto }) {
+  const [open, setOpen] = useState(false)
+  const raw = (msg.content ?? '').trim()
+  return (
+    <div className="msg task-notice" data-msg-id={msg.id}>
+      <button
+        type="button"
+        className="tn-head"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        title={open ? '收起系统提示内容' : '展开系统提示内容'}
+      >
+        <span className="tn-icon" aria-hidden="true">⏺</span>
+        <span className="tn-text">{systemRowLabel(msg)}</span>
+        <svg className={`tn-caret${open ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
+          <path d="M5 6.5L8 9.5L11 6.5" />
+        </svg>
+      </button>
+      {open && <pre className="tn-body">{raw}</pre>}
+    </div>
+  )
+}
+
+/**
+ * 系统注入行的摘要文案。
+ *
+ * <p>按 subtype 给人话；未知 subtype 回落到 `<system-reminder>` 内第一行有效文本。
+ * 技能清单条数按正文里的 `- ` 列表项数估算（后端 SkillCatalog.formatListing 每条一行）——
+ * 只用于摘要显示，⛔ 不参与任何逻辑判断。
+ */
+function systemRowLabel(m: ChatMessageDto): string {
+  const sub = m.subtype ?? ''
+  const text = (m.content ?? '').trim()
+  if (sub === 'skill_listing') {
+    const n = (text.match(/^- /gm) ?? []).length
+    return n > 0 ? `技能清单已注入 · ${n} 项` : '技能清单已注入'
+  }
+  if (sub === 'edited_text_file') return '文件被外部修改'
+  if (sub === 'date_change') return '日期变更提醒'
+  if (sub === 'changed_files') return '已改动文件清单'
+  if (sub === 'mcp_instructions_delta') return 'MCP 指令更新'
+  // [goal V253] 目标（/goal）终态溯源行 · 后端 GoalService.buildTerminalTraceMessage 产出
+  //   （role=user + isMeta + author='attachment' + subtype='goal_status'）
+  //   ⇒ isSystemInjectedRow 的 isMeta 分支天然覆盖 ⇒ 落该轮「已完成」折叠区，不开新轮、不当用户气泡。
+  //   正文由后端写死「◎ 目标已达成 · N 轮」/「◎ 目标无法达成 · N 轮」⇒ 直接当摘要用。
+  if (sub === 'goal_status') return text || '目标已结束'
+  const inner = text.replace(/^<system-reminder>/, '').replace(/<\/system-reminder>$/, '').trim()
+  const firstLine = (inner.split('\n').find((l) => l.trim() !== '') ?? '系统提示').trim()
+  return firstLine.length > 60 ? `${firstLine.slice(0, 59)}…` : firstLine
+}
+
 function StopHookSummaryRow({ payload }: { payload: NonNullable<ChatMessageDto['stopHookSummary']> }) {
   const errors = payload.hookErrors ?? []
   const hasLabel = payload.hookLabel != null && payload.hookLabel !== ''
@@ -890,10 +954,13 @@ function formatTurnUsageLabel(u: TurnUsageSummary): string | null {
   return parts.length > 0 ? parts.join(' · ') : null
 }
 
-/** [产物卡片] 本轮交付物（**最多 3 张** · 超出部分走 TurnFooter 的「查看所有产物」）。
+/** [产物卡片] 本轮交付物（**最多 5 张** · 超出部分走 TurnFooter 的「查看所有产物」）。
  *
  *  <p>[2026-10-31 产物卡片改版] 与右栏「产物」tab **同一套**卡片组件 / 同一套按类型图标 /
- *  **同一个点击处理函数**（App.openArtifact）⇒ 用户在正文与右栏看到的是完全一致的产物入口。 */
+ *  **同一个点击处理函数**（App.openArtifact）⇒ 用户在正文与右栏看到的是完全一致的产物入口。
+ *
+ *  <p>[2026-11-01 用户裁定] 取**最新的 5 个**（后端已按 {@code updated_at} 倒序 ⇒ 取前 5）；
+ *  不够 5 个就按实际有几个显示几个。 */
 function TurnArtifacts({ items, onOpen, onEdit, onOpenInBrowser }: {
   items: SessionArtifactDto[]
   onOpen?: (a: SessionArtifactDto) => void
@@ -903,7 +970,7 @@ function TurnArtifacts({ items, onOpen, onEdit, onOpenInBrowser }: {
   return (
     <div className="msg-artifacts">
       <ArtifactCards
-        items={items.slice(0, 3)}
+        items={items.slice(0, 5)}
         onOpen={onOpen}
         onEdit={onEdit}
         onOpenInBrowser={onOpenInBrowser}
@@ -940,18 +1007,25 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
   )
 }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
   onRunHtml?: (code: string) => void
   onOpenRefFile?: (path: string) => void
   /** [用户消息编辑重发] 见 MessageListProps */
-  onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void) => Promise<void>
+  onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
   footer?: ReactNode
   /** [历史提问跳转] 本次跳转目标正是这行 → 加 .jump-highlight（1.5s 后由宿主清除） */
   highlighted?: boolean
   /** [轮次中间过程] 该轮展开态；undefined = 非轮次折叠宿主（子代理 transcript 等）→ 保持旧渲染 */
   processExpanded?: boolean
+  /** [轮次最终段] 本行是否该轮**最后一条** assistant（决定 content 是「最终答复」还是「过程旁白」）。
+   *  undefined（非轮次宿主）→ 一律按最终答复渲染，保持旧行为。 */
+  isFinalOfTurn?: boolean
+  /** [方案 3] 该轮是否**还在跑**（决定状态行显示「正在执行 + 动态时长 + 扫光条」而不是「已完成」）。 */
+  isRunningTurn?: boolean
+  /** [方案 3] 本轮已耗时（ms · 进行中由父级每秒推进；结束态用 turnDurationMs）。 */
+  liveTurnMs?: number | null
   /** 是否在该消息顶部渲染「已完成」行（每轮仅第一条含中间过程的消息渲染一次） */
   showProcessHeader?: boolean
   /** 整轮时长（ms · 无数据 → 只显示「已完成」） */
@@ -967,6 +1041,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   groupTitle?: string
   /** [摘要行图标] 同轮首个工具名（tool_use_summary 行按它选类型图标；缺省留 ⚒） */
   summaryToolName?: string
+  /** [2026-11-02 系统注入行] 该轮的 meta 注入行（技能清单 / 外部改文件 / hook 回执…）。
+   *  只由**状态行所在的那一条** assistant 接收（一轮一处，见 processHeaderIdByTurn）⇒ 折叠区里渲染一次。
+   *  缺省 undefined = 该轮没有注入行（零渲染开销）。 */
+  systemRows?: ChatMessageDto[]
 }) {
   const isUser = msg.role === 'user'
   // [轮次消息头合并] 同轮后续段不渲染头像/作者/时间/徽标；仍留同宽头像占位，保证正文/工具行与首段左对齐。
@@ -993,6 +1071,21 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   // [toolsum-display] tool_use_summary 展示行（作者 attachment + subtype=tool_use_summary · 后端落库 /
   //   /topic/tasks 实时 · 不进模型上下文）→ 渲染独立置灰窄行，非用户气泡/不进输入历史
   const isToolUseSummary = msg.author === 'attachment' && msg.subtype === 'tool_use_summary'
+  // [2026-11-02 用户实测「nexus 回复被切成多段」] 后台任务通知注入行（见 isNotificationInjectedUserRow）。
+  //   渲染为一行可展开的弱化通知，⛔ 不是用户气泡、也不开新轮。
+  const isNotificationInjected = isNotificationInjectedUserRow(msg)
+  /** 通知行标题：从 XML 的 <summary> 里取一句人话；取不到回落固定文案。 */
+  const notificationSummary = (() => {
+    if (!isNotificationInjected) return ''
+    const raw = msg.content ?? ''
+    const summary = /<summary>([\s\S]*?)<\/summary>/.exec(raw)?.[1]?.trim()
+    const status = /<status>([\s\S]*?)<\/status>/.exec(raw)?.[1]?.trim()
+    const isTask = raw.includes('<task-notification>') || raw.includes('A background agent completed a task:')
+    const label = isTask ? '收到子代理通知' : '收到后台通知'
+    const statusText = status === 'failed' ? '失败' : status === 'killed' ? '已中止' : status === 'completed' ? '完成' : ''
+    const head = statusText ? `${label} · ${statusText}` : label
+    return summary ? `${head}：${summary.replace(/\s+/g, ' ').slice(0, 80)}` : head
+  })()
   // 边界标签文案（中文）：snip 有 removedUuids 时说明移除条数
   //   [死展示点清理] 原先 compact 分支还拼过「· 122k→42k」后缀 + 悬停显示 compactMetadata.summary，
   //   但后端 `CompactBoundaryMessage.toCompactMetadataMap` **从不 put** postTokens/summary 这两个 key
@@ -1073,6 +1166,23 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     if (!text || editSending || !onEditResend) return
     setEditSending(true)
     setEditError(null)
+    // [2026-11-01] 原消息的图片附件随重发一起带上（否则「编辑后重发」会把图静默丢掉 ——
+    //   用户看到编辑框里还显示着图，自然会以为图还在）。base64 直传通道：后端 resolveAttachments
+    //   的 `base64 非空白` 分支直接消费，不依赖 upload 缓存（裁剪后原 contentId 可能已失效）。
+    const attachments: AttachmentRequest[] = []
+    for (const img of userImages) {
+      attachments.push({ type: 'image', base64: img.base64, mediaType: img.mediaType })
+    }
+    for (const a of msg.userAttachments ?? []) {
+      if (a.type === 'image' || !a.filename) continue
+      attachments.push({
+        type: a.type as AttachmentRequest['type'],
+        filename: a.filename,
+        mediaType: a.mediaType ?? undefined,
+        ...(a.contentId ? { contentId: a.contentId } : {}),
+        ...(a.path ? { path: a.path } : {}),
+      })
+    }
     // [慢裁剪提示] 裁剪若超过 1s（大会话 / 磁盘慢）才提示「正在裁剪并重新发送…」——
     //   正常路径（后端区间删除，毫秒级）不显示，避免每次都闪一下长文案。
     const slowTimer = window.setTimeout(() => setEditSlow(true), 1000)
@@ -1084,7 +1194,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
         setEditSlow(false)
         setEditSending(false)
         setEditing(false)
-      })
+      }, attachments.length > 0 ? attachments : undefined)
       setEditing(false)
     } catch {
       // 失败保持编辑态（草稿不丢），由调用方另行 toast 具体原因
@@ -1115,9 +1225,15 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   const intermediateReasoning = cleanReasoning(msg.reasoning)
   const briefToolCalls = (msg.toolCalls ?? []).filter(isSendUserMessage)
   const intermediateToolCalls = (msg.toolCalls ?? []).filter((t) => !isSendUserMessage(t))
+  // [2026-11-02 系统注入行] 该轮只有「纯正文 assistant + 注入行」时也要有折叠入口，
+  //   否则注入行永远看不到（它只在该轮的展开态折叠区里渲染）。
+  const hasSystemRows = (systemRows?.length ?? 0) > 0
   const hasIntermediate = !isUser && !isFallback && !isScheduledFire && !msg.isApiErrorMessage
-    && (intermediateReasoning !== '' || intermediateToolCalls.length > 0)
+    && (intermediateReasoning !== '' || intermediateToolCalls.length > 0 || hasSystemRows)
   const turnDuration = formatTurnDuration(turnDurationMs)
+  // [2026-11-01 方案 3] 进行中的实时时长：由父级每秒推进 `liveTurnMs`（见 MessageListInner 的 tick），
+  //   这里只做格式化。缺省回落 turnDurationMs（旧数据 / 非轮次宿主）。
+  const liveDuration = formatTurnDuration(liveTurnMs ?? turnDurationMs)
   // 轮次展开/收起：内层思考正文跟随轮次态（展开即可读；内层 toggle 仍可单独收起本轮思考）
   useEffect(() => {
     // 轮次折叠/展开切换时，思考块始终回到收起态（用户手动展开仅在当前视图内有效）
@@ -1132,6 +1248,8 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   const toggleProcess = () => onToggleProcess?.(turnKey ?? '', processExpanded === true)
   // 消息时间切换：默认相对时间（44分钟前）· 点击切绝对时间（HH:MM）· 再点切回
   const [showAbsTime, setShowAbsTime] = useState(false)
+  /** [2026-11-02] 通知行展开态（「收到子代理通知」点开看原始 XML）。 */
+  const [noticeOpen, setNoticeOpen] = useState(false)
   // 图片附件放大预览（user-attach-img 点击 → lightbox）
   const [zoomImg, setZoomImg] = useState<string | null>(null)
   // 图片渲染源：乐观追加 imageData（本地 base64）优先；否则按 imagePasteIds 从 imageCache 取（重拉后 batch 拉图）
@@ -1168,6 +1286,38 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
           {summaryToolName ? <ToolTypeIcon name={summaryToolName} /> : '⚒'}
         </span>
         <span className="tus-text" title={msg.content ?? ''}>{msg.content}</span>
+      </div>
+    )
+  }
+  // [2026-11-02 用户实测「nexus 回复被切成多段」] 后台任务通知行 → 一行弱化通知（可点开看原始内容）。
+  //   <b>WHY 必须专用渲染</b>：这些行是 `role=user` 且（旧后端/空闲路径）`isMeta=false`，若走普通 user
+  //   分支就变成一个用户气泡；而 `isUserTurnRow` 现在已按正文特征拦住它「开新轮」，所以气泡也没了 ——
+  //   若此处不渲染，用户会**完全看不到**「收到了子代理通知」这件事。
+  //   形态对齐用户诉求：「在正在执行下面显示『收到子代理通知』，点开能看到具体内容」。
+  if (isNotificationInjected) {
+    return (
+      <div className="msg task-notice" data-msg-id={msg.id}>
+        <button
+          type="button"
+          className="tn-head"
+          onClick={() => setNoticeOpen((v) => !v)}
+          aria-expanded={noticeOpen}
+          title={noticeOpen ? '收起通知内容' : '展开通知内容'}
+        >
+          <span className="tn-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 2.5a3.5 3.5 0 0 1 3.5 3.5v3l1 1.5H3.5l1-1.5V6A3.5 3.5 0 0 1 8 2.5Z" />
+              <path d="M6.6 12.4a1.6 1.6 0 0 0 2.8 0" />
+            </svg>
+          </span>
+          <span className="tn-text">{notificationSummary}</span>
+          <svg className={`tn-caret${noticeOpen ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
+            <path d="M5 6.5L8 9.5L11 6.5" />
+          </svg>
+        </button>
+        {noticeOpen && (
+          <pre className="tn-body">{msg.content ?? ''}</pre>
+        )}
       </div>
     )
   }
@@ -1243,8 +1393,33 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
           {/* 文件附件（PDF/Word/视频/音频）内联在 user 气泡里（文字下方 · 点击预览）——
               图片附件走上方缩略图 imageData/imagePasteIds 通道 */}
           {editing ? (
-            /* [用户消息编辑重发] 编辑态：气泡位置换成输入块（底部提示 + 取消/发送） */
+            /* [用户消息编辑重发] 编辑态：气泡位置换成输入块（底部提示 + 取消/发送）。
+               [2026-11-01] 原消息的图片/附件在编辑态里**保留显示**：此前编辑块只有一个
+               textarea ⇒ 用户看不到自己发过的图，也以为重发会把图带上（实际不会）。 */
             <div className="user-edit">
+              {userImages.length > 0 && (
+                <div className="user-edit-attach">
+                  {userImages.map((img, i) => (
+                    <img
+                      key={i}
+                      src={`data:${img.mediaType};base64,${img.base64}`}
+                      alt="图片附件"
+                      className="user-edit-thumb"
+                      title="该图片会随重新发送一并带上"
+                    />
+                  ))}
+                </div>
+              )}
+              {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).length ? (
+                <div className="user-edit-attach">
+                  {msg.userAttachments.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
+                    <span key={i} className="user-edit-file" title="该附件会随重新发送一并带上">
+                      {attachIcon(a)}
+                      <span className="uaf-name">{a.filename}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
               <textarea
                 ref={editInputRef}
                 className="user-edit-input"
@@ -1381,26 +1556,49 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
             ) : null}
             {collapsible ? (
               <>
-                {showProcessHeader && hasIntermediate && (
+                {/* [2026-11-01 方案 3] 状态行：进行中 =「正在执行 · 动态时长」+ 波浪点（与「思考中」同款）；
+                    已结束 =「已完成 · 时长」。两者都可点击收起/展开 —— 用户裁定「未完成也能收」。
+                    进行中收起后仍保留这一行 + 扫光条 ⇒ 一眼看出还在跑，但不再占屏幕。 */}
+                {showProcessHeader && (hasIntermediate || isRunningTurn) && (
                   <button
                     type="button"
-                    className="turn-process-toggle"
+                    className={`turn-process-toggle${isRunningTurn ? ' running' : ''}`}
                     onClick={toggleProcess}
                     aria-expanded={processExpanded === true}
                     title={processExpanded ? '收起本轮中间过程' : '展开本轮中间过程'}
                   >
-                    <span className="turn-process-status">已完成</span>
-                    {turnDuration && <span className="turn-process-dur">· {turnDuration}</span>}
+                    <span className="turn-process-status">{isRunningTurn ? '正在执行' : '已完成'}</span>
+                    {isRunningTurn && (
+                      <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+                    )}
+                    {(isRunningTurn ? liveDuration : turnDuration) && (
+                      <span className="turn-process-dur">· {isRunningTurn ? liveDuration : turnDuration}</span>
+                    )}
                     <svg className={`turn-process-caret${processExpanded ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
                       <path d="M5 6.5L8 9.5L11 6.5" />
                     </svg>
                   </button>
                 )}
+                {/* [方案 3] 扫光条：进行中才显示，位置在状态行下方、内容上方。
+                    收起态**保留**它 —— 那是「还在跑」的唯一动效线索。
+                    ⛔ 必须与状态行**同条件**（showProcessHeader）：`isRunningTurn` 对该轮**每一行**
+                    assistant 都成立，用它画就会每段各出一条（用户实测「扫光条有好几个」）。
+                    一轮只能有一条 —— 它属于「本轮状态」，不属于任何单个 assistant 段。 */}
+                {showProcessHeader && isRunningTurn && <div className="exec-scan-line" aria-hidden="true" />}
                 {processExpanded === true && hasIntermediate && (
                   <div className="turn-process-body">
                     {reasoningBlock}
+                    {/* [中间旁白正文] 非最终段的 content 是过程性碎句（「设计确认…」「现在实现后端…」）
+                        → 与思考/工具卡同处折叠区；展开时按原顺序显示在思考之后、工具之前。
+                        ⛔ 判据用 isFinalOfTurn（undefined = 非轮次宿主 → 一律算最终，保持旧行为）。 */}
+                    {isFinalOfTurn === false && (msg.content ?? '').trim() !== '' && (
+                      <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} />
+                    )}
                     {/* [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard */}
                     {renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle })}
+                    {/* [2026-11-02] 系统注入行放折叠区末尾：它们不是「助手说了什么」，而是系统在本轮
+                        塞给模型的提示（技能清单 / 外部改文件 / hook 回执）。用户裁定「融合在已完成中」。 */}
+                    {systemRows?.map((m) => <SystemInjectedRow key={m.id} msg={m} />)}
                   </div>
                 )}
               </>
@@ -1411,7 +1609,11 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                 {msg.errorDetails && <p className="error-details">{msg.errorDetails}</p>}
               </div>
             ) : (
-              <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} />
+              /* [中间旁白正文] 非最终段的正文已在折叠区渲染过 → 正文区不再重复。
+                 非轮次宿主（isFinalOfTurn === undefined）与最终段照常渲染。 */
+              isFinalOfTurn !== false && (
+                <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} />
+              )
             )}
             {/* [每轮消耗上收] 原先每条 assistant 消息底部各渲染一次 ↑输入/↓输出（同轮多段反复显示）；
                 现改为每轮只在 TurnFooter 汇总一行（见 TurnFooter / usageLabelByTurn）。 */}
@@ -1445,13 +1647,25 @@ const MemoMessage = memo(Message)
 //   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
 //   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
 //   toolCalls 卡片。class 未动。
-const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, onRunHtml, showHeader = true }: {
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null }: {
   sessionId: string
   blockId: string
   isStreamingTail: boolean
   onRunHtml: (code: string) => void
   /** [轮次消息头合并] 同轮非首段流式块不渲染消息头（见 Message.showHeader） */
   showHeader?: boolean
+  /**
+   * [2026-11-02 修「发送后『正在执行』不显示，刷新才有」] **本流式块承载该轮的状态行**。
+   *
+   * <p><b>WHY 需要这个 prop</b>：状态行原先只挂在**已落库的 assistant 消息**上
+   * （`processHeaderIdByTurn` 只遍历 `kind === 'msg'`）。而用户刚发消息时，
+   * 这一轮**只有流式块、还没有任何落库 assistant** ⇒ 整轮没有状态行落点
+   * ⇒ 界面上看不到「正在执行」，直到 F5 从 DB 重拉出 assistant 消息才出现。
+   * 现在由父级判定「本轮还没有落库 assistant」时，把状态行交给**首条流式块**渲染。
+   */
+  showProcessHeader?: boolean
+  /** 进行中已耗时（父级每秒推进） */
+  liveTurnMs?: number | null
 }) {
   // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
   const b = useChatStore(selectStreamBlock(sessionId, blockId))
@@ -1497,6 +1711,20 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
       {showHeader ? <div className="avatar">N</div> : <div className="avatar-gutter" aria-hidden />}
       <div className="body">
         {showHeader && <div className="author">nexus</div>}
+        {/* [2026-11-02] 该轮还没有落库 assistant ⇒ 由本块承载「正在执行」状态行。
+            ⛔ 不可点：流式块的内容就是实时输出，没有「折叠区」可收，点它没有意义。 */}
+        {showProcessHeader && (
+          <>
+            <div className="turn-process-toggle running static" role="status">
+              <span className="turn-process-status">正在执行</span>
+              <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+              {formatTurnDuration(liveTurnMs) && (
+                <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
+              )}
+            </div>
+            <div className="exec-scan-line" aria-hidden="true" />
+          </>
+        )}
         {reasoningText !== '' && (
           <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
             <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
@@ -1543,12 +1771,20 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
 //   ⛔ 不做触顶自动加载，只能用户点按钮（手动加载）。
 /** 每次「加载更多」从后端拉取的轮数（与 App.handleLoadOlder 的 turns=2 一致，仅用于按钮文案） */
 const LOAD_OLDER_TURNS = 2
-/** 默认展开窗口：最近多少轮保持展开（与 App 首屏 listTurns({turns:3}) 同值）*/
-const FOLD_DEFAULT_TURNS = 3
+/**
+ * [2026-11-02 用户裁定] **执行中的可见轮数 = 1**：只留当前轮，历史全部隐藏。
+ *
+ * <p>用户原话：「用户发送消息后 应该只显示该用户消息和当前轮次 其他的轮次隐藏了
+ * 直到完成后重新可以看到」+「当前气泡就是顶」（连上一轮都不保留）。
+ *
+ * <p>⚠️ 必须与 `turnEnded` 配对使用：轮次一结束，窗口立即恢复 {@link FOLD_DEFAULT_TURNS}
+ * ⇒ 历史重新可见。这条「自动恢复」是本设计的关键，缺了它用户就会「往上拉拉不到」。
+ */
+const RUNNING_FOLD_TURNS = 1
 /** 稳定空集合（折叠态零态；模块级同引用 ⇒ 不触发无谓重渲）*/
 const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, foldedTurnCount = 0, onExpandOlder }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
@@ -1841,7 +2077,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     let turnId: string | null = null
     /** 最后一条可见消息行的轮键：窗口里**没有 user 提问行**（已滑出加载窗口）时，
      *  它就是「当前轮」的唯一线索 —— 流式块要落在这里，否则会自成一键再出一个头。 */
-    let lastMsgTurnKey: string | null = null
+    // [2026-11-02 用户实测「切会话/F5 后分割多个 nexus 头」] 初始值不能是 null：
+    //   窗口头部可能是注入行（isMeta、无 userMessageId）或上一轮被截断的 assistant 段 ——
+    //   首行既无 turnId 也无 lastMsgTurnKey ⇒ 落到 turnKeyOf 的「自身 id」档 ⇒ 头部自成一「轮」
+    //   ⇒ 多一个 nexus 头，且 orderedTurnKeys 多一键 ⇒ 执行中窗口算错（历史锁不住）。
+    //   与 stores/messageTurns.turnKeyByRowId 同一兜底（单点真源的同一个 helper）。
+    let lastMsgTurnKey: string | null = headAnchorKeyOf(dropTextInBriefTurns(messages).filter(isDialogueRow))
     let historySeq = 0
     for (const m of dropTextInBriefTurns(messages)) {
       if (!isDialogueRow(m)) continue
@@ -1871,7 +2112,18 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       const b = live.find((x) => x.assistantMessageId === blockId)
       if (!b) continue
       // [轮键] 与落库 assistant 段同口径（见 blockTurnKey）：冻结 id 认不出 ⇒ 归当前轮
-      const key = blockTurnKey(b.userMessageId, userTurnIds, liveTurnFallback, b.assistantMessageId ?? 'stream')
+      const baseKey = blockTurnKey(b.userMessageId, userTurnIds, liveTurnFallback, b.assistantMessageId ?? 'stream')
+      // [2026-11-02 用户裁定「执行中又发一条 ⇒ 只留新用户气泡」] 流式块若归属**旧轮**，
+      //   而其后已经出现了更新的用户提问（执行中被排队），则块应吸附到**最新那轮**。
+      //
+      // <b>WHY 在渲染层吸附，而不是改 store 的冻结归属</b>：store 的「块归属建立时冻结」是
+      //   另一个不变量（保证实时渲染与 DB 落库行序一致，见 chatStore.ensureStreamBlock 注释），
+      //   动它会破坏那个契约。这里只调整**显示归属**：块的内容仍属旧轮，但它此刻代表
+      //   「当前正在产生的新内容」，必须跟着最新提问显示，否则折叠旧轮时会把实时输出一起藏掉
+      //   （实测：执行中排队后，用户完全看不到输出）。
+      const key = userTurnIds.has(baseKey)
+        ? (liveTurnFallback && baseKey !== liveTurnFallback ? liveTurnFallback : baseKey)
+        : baseKey
       // [anchorSeq] 块 = 建立时盖的流式区到达号（缺省旧块 → 基准 + 块序），恒大于所有历史
       push(key, { kind: 'blk', sid: sessionId, blockId }, b.renderSeq ?? LIVE_SEQ_BASE + i)
     }
@@ -2107,20 +2359,38 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
    *  头像 / 名字 / 时间 / 徽标。不同轮次各有一条 ⇒ 轮次之间仍各有消息头。 */
   const firstAssistantRowKeys = useMemo(() => {
     const keys = new Set<string>()
-    // [2026-10-29 同轮双头 · 终版判据] 不再按 turnKey 去重（流式块冻结 id / 落库段 userMessageId /
-    //   后台注入行可能各说各话，按 turn 去重迟早漏一种组合）。改成**纯行序**判据：
-    //   自最近一条「真正的用户提问」以来，只允许第一条 assistant 行显示 `N nexus` 头。
-    //   遇到用户提问行即重置 —— 不同轮照常各有一个头；同一轮无论夹了多少块/段，都只会有一个。
+    // [2026-11-02 用户实测「执行中一轮出现 2–3 个 nexus 头」] 双重判据。
+    //
+    // <b>WHY 单一判据都会漏</b>：
+    //   · 纯**行序**判据（旧实现）假设「两条 assistant 之间不可能夹用户提问行」。但运行态下
+    //     消息是流式块 + 落库段 + 各类推送交织的，一旦中间真的插入一条 isUserTurnRow 的行
+    //     （某些注入行在 DB 里 is_meta=1、运行态却是 isMeta=false），判据就被重置 ⇒
+    //     同一轮冒出第二个、第三个 `N nexus` 头。这**只发生在运行态**，F5 重拉后消息归位即消失
+    //     —— 与用户观察一致（「结束后 F5 就消失」）。
+    //   · 纯 **turnKey** 判据假设「同一轮的所有行 turnKey 一致」，但流式块的轮键经
+    //     {@link blockTurnKey} 兜底计算，极端时序下可能与落库段不同（'stream' vs uid）⇒ 也会多头。
+    //
+    // 故两者取**并集**：同一 turnKey 只允许一个头；自上次用户提问以来也只允许一个头。
+    //   两种失效模式各自被挡住，且互不干扰。
     let headAddedSinceUser = false
+    /** 已经出过头的轮键（防同一轮因 turnKey 重复出现而多点） */
+    const seenTurns = new Set<string>()
     for (const row of flatRows) {
       if (row.kind === 'err') continue
       if (row.kind === 'msg' && isUserTurnRow(row.m)) {
         headAddedSinceUser = false
         continue
       }
+      // blk（流式块）行没有 role，按 assistant 对待
       if (row.kind === 'msg' && row.m.role !== 'assistant') continue
-      if (headAddedSinceUser) continue
+      if (seenTurns.has(row.turnKey)) continue
+      if (headAddedSinceUser) {
+        // 本轮已有头 → 把该 turnKey 记下来，后续同轮行一律不再加头
+        seenTurns.add(row.turnKey)
+        continue
+      }
       headAddedSinceUser = true
+      seenTurns.add(row.turnKey)
       keys.add(row.key)
     }
     return keys
@@ -2161,15 +2431,54 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   //   revealedFoldKeys = 点过「展开」的轮 + 「加载更多」新拉到的轮（直接展开，不折回去）。
   const foldedTurnKeys = useMemo(() => {
     const keys = orderedTurnKeys(messages)
-    const windowStart = Math.max(0, keys.length - FOLD_DEFAULT_TURNS)
+    // [2026-11-02 用户最终裁定] **执行中只显示当前轮，历史全部隐藏；完成后自动恢复。**
+    //   原话：「用户发送消息后 应该只显示该用户消息和当前轮次 其他的轮次隐藏了 直到完成后重新可以看到」。
+    //
+    // <b>为什么这次和上次不同</b>：上一版也是收成 1 轮，但**结束后没有恢复**（或折叠行入口缺失）
+    //   ⇒ 用户「往上拉拉不到」。这次的关键是「**直到完成后重新可以看到**」：
+    //     · 执行中（turnEnded=false）：窗口 = 1 轮，历史进 foldedSet ⇒ 不渲染 DOM，且不画折叠行
+    //       （用户要求「直接不显示」）；
+    //     · 结束后（turnEnded=true）：窗口立刻恢复 FOLD_DEFAULT_TURNS，折叠行同时回来
+    //       ⇒ 历史重新可见、可展开。
+    //   ⚠️ 恢复是**自动**的（turnEnded 变化即触发），不需要用户操作。
+    const windowTurns = turnEnded ? FOLD_DEFAULT_TURNS : RUNNING_FOLD_TURNS
+    let windowStart = Math.max(0, keys.length - windowTurns)
+    // [2026-11-02 用户实测「执行中又发一条，上面的旧轮还显示正在执行 / 还能往上滚」]
+    //
+    // <b>WHY 需要这一段</b>：执行中发消息会被后端**排队**（旧轮继续跑），此时
+    //   `activeTurnKeys` 里是**旧轮**（流式块的 userMessageId 还指向它），而最新一条
+    //   用户气泡是新轮 —— 「按最近 N 轮取窗口」会把两者都留在可见区
+    //   ⇒ 旧轮带着「正在执行」占在上面，用户还能滚上去看到它。
+    //
+    // <b>修法</b>：执行中把窗口起点**钉在最后一个用户提问行上** —— 最新提问及之后才可见，
+    //   更早的轮（含仍在跑的旧轮）全部折起。旧轮并没有停，只是不再占据视线；
+    //   轮次结束后 `turnEnded=true` 走上面的常规窗口，历史自动恢复。
+    if (!turnEnded && keys.length > 0) {
+      // [2026-11-02] 执行中**一律只留最后 1 轮**（不看锚点）。
+      //   早先版本按「最后一个用户提问」锚定，但新提问行的乐观插入与流式块状态更新是
+      //   两条独立异步路径，某一帧可能还没收到新 user 行 ⇒ 锚点指向旧轮 ⇒ 多露一轮。
+      windowStart = Math.max(windowStart, keys.length - RUNNING_FOLD_TURNS)
+    }
     const folded: string[] = []
     for (let i = 0; i < windowStart; i++) {
       const k = keys[i]!
-      if (revealedFoldKeys.has(k) || activeTurnKeys.has(k)) break
+      // [2026-11-02 用户二次实测「发送了用户消息 又没有锁定了 往上又能拉到历史」]
+      //
+      // <b>根因</b>：这一行原本无条件 `if (revealedFoldKeys.has(k)) break` ——
+      //   `revealedFoldKeys` 记录的是**用户之前点过「⋯ 已折叠 N 轮（点击展开）」**的轮。
+      //   一旦用户历史上展开过更早的轮，那个键就永久留在集合里（只在切会话时清空）
+      //   ⇒ 新发消息时折叠循环走到该键就 `break`，后面的轮**全部不折** ⇒ 历史又出现了。
+      //   这正是「有时候锁得住、有时候锁不住」的原因（取决于之前有没有点过展开）。
+      //
+      // <b>修法</b>：**执行中（!turnEnded）一律无视 revealedFoldKeys** ——
+      //   用户要的是「发送后只看当前轮」，之前展开过什么都不算数；
+      //   轮次结束后（turnEnded=true）恢复尊重用户的展开选择。
+      //   ⚠️ 移除 `activeTurnKeys` 短路（上一轮已做的）：正在跑的旧轮也必须能折。
+      if (turnEnded && revealedFoldKeys.has(k)) break
       folded.push(k)
     }
     return folded
-  }, [messages, revealedFoldKeys, activeTurnKeys])
+  }, [messages, revealedFoldKeys, activeTurnKeys, turnEnded])
   const foldedSet = useMemo(() => new Set(foldedTurnKeys), [foldedTurnKeys])
   /** 折叠区内的轮**不渲染 DOM**（既留数据又不占渲染）；点击折叠行后它们才出现。 */
   const visibleRows = useMemo(
@@ -2240,6 +2549,73 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     setProcessOpenByTurn((prev) => ({ ...prev, [key]: !open }))
   }, [])
   useEffect(() => { setProcessOpenByTurn({}) }, [sessionId])
+  /**
+   * 每轮**状态行（「正在执行 / 已完成」+ 扫光条）的唯一落点**。
+   *
+   * <p><b>WHY 需要两个候选（2026-11-02 用户实测「扫描蓝条被顶掉」）</b>：
+   * 原实现只认 {@link firstIntermediateByTurn} —— 那个 map 只在「有思考或非 SendUserMessage 工具」
+   * 时登记。于是一轮若**第一段只有正文**（模型直接开口就写），整轮没有任何一条消息拿到
+   * `showProcessHeader` ⇒ 状态行和扫光条整轮都不渲染，用户看到「正在跑但下面一条动静都没有」。
+   *
+   * <p>但**不能**简单地改成「只看该轮第一条 assistant 行」：那条若恰好是纯正文（无可折叠内容），
+   * `hasIntermediate` 为 false ⇒ 状态行同样消失（实测会让「纯文本开场 + 后续工具」的轮次丢掉
+   * 「已完成」开关）。
+   *
+   * <p>故取**两级优先**：
+   * <ol>
+   *   <li>该轮第一条**有中间过程**的 assistant 行（旧行为，保证「已完成」开关落在有内容的那行）；</li>
+   *   <li>没有中间过程 → 回落该轮**第一条 assistant 行**（保证「正在执行」+ 扫光条在执行中仍可见）。</li>
+   * </ol>
+   */
+  /**
+   * [2026-11-02 系统注入行] 每轮的系统注入行（技能清单 / 外部改文件 / hook 回执…）· 按轮键归组。
+   *
+   * <p>WHY 按轮聚合：用户裁定「融合在已完成中」⇒ 它们不单独占对话流，只在**该轮的折叠区**里出现
+   * （收起时随轮一起藏起，展开时才看得到，且一轮只渲染一次）。
+   * 取 flatRows（已按 isDialogueRow 过滤）而非 messages，保证与渲染行同源。
+   */
+  const systemRowsByTurn = useMemo(() => {
+    const out = new Map<string, ChatMessageDto[]>()
+    for (const row of flatRows) {
+      if (row.kind !== 'msg' || !isSystemInjectedRow(row.m)) continue
+      const list = out.get(row.turnKey)
+      if (list) list.push(row.m)
+      else out.set(row.turnKey, [row.m])
+    }
+    return out
+  }, [flatRows])
+  const processHeaderIdByTurn = useMemo(() => {
+    const firstAssistant = new Map<string, string>()
+    const firstIntermediate = new Map<string, string>()
+    for (const row of flatRows) {
+      if (row.kind !== 'msg' || row.m.role !== 'assistant') continue
+      if (!firstAssistant.has(row.turnKey)) firstAssistant.set(row.turnKey, row.m.id)
+      if (firstIntermediate.has(row.turnKey)) continue
+      const hasInter = cleanReasoning(row.m.reasoning) !== ''
+        || (row.m.toolCalls ?? []).some((t) => !isSendUserMessage(t))
+        || systemRowsByTurn.has(row.turnKey)   // [2026-11-02] 注入行也要有折叠入口
+      if (hasInter) firstIntermediate.set(row.turnKey, row.m.id)
+    }
+    const out = new Map<string, string>()
+    for (const [turnKey, firstId] of firstAssistant) {
+      out.set(turnKey, firstIntermediate.get(turnKey) ?? firstId)
+    }
+    return out
+  }, [flatRows, systemRowsByTurn])
+  /**
+   * [2026-11-02] 哪些轮**已经有落库 assistant 消息**。
+   *
+   * <p>用途：状态行优先挂在落库段上（它能找到「第一条有中间过程」的落点，供折叠开关用）；
+   * 只有**还没有任何落库 assistant** 的轮（刚发消息、只有流式块在输出）才把状态行交给流式块。
+   * 这样一轮里状态行**始终只有一处**，不会重复。
+   */
+  const turnsWithPersistedAssistant = useMemo(() => {
+    const out = new Set<string>()
+    for (const row of flatRows) {
+      if (row.kind === 'msg' && row.m.role === 'assistant') out.add(row.turnKey)
+    }
+    return out
+  }, [flatRows])
   /** 每轮第一条「含中间过程」的 assistant 消息 → 该轮唯一的「已完成」开关落点。 */
   const firstIntermediateByTurn = useMemo(() => {
     const map = new Map<string, string>()
@@ -2248,10 +2624,77 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (map.has(row.turnKey)) continue
       const hasInter = cleanReasoning(row.m.reasoning) !== ''
         || (row.m.toolCalls ?? []).some((t) => !isSendUserMessage(t))
+        || systemRowsByTurn.has(row.turnKey)   // [2026-11-02] 注入行也要有折叠入口
       if (hasInter) map.set(row.turnKey, row.m.id)
     }
     return map
+  }, [flatRows, systemRowsByTurn])
+  /**
+   * 每轮**最后一条 assistant 行**的 id —— 「最终答复」判据。
+   *
+   * <p><b>WHY（2026-11-01 用户实测）</b>：一轮里模型会输出多段 assistant（思考→工具→再思考→…→收尾），
+   * 每段都带 `content`。此前正文用 `ContentGuard text={msg.content}` **无条件渲染** ⇒ 过程旁白
+   * （「设计确认。开始实施…」「现在实现后端…」）全都平铺在聊天区，用户看到一堆过程性碎句，
+   * 而真正该展示的只有该轮<b>最后一段正文</b>。
+   *
+   * <p>故：非最终段的 `content` 视为**中间过程**，收进「已完成」折叠区；最终段正文留在正文区。
+   * ⚠️ 与 `firstIntermediateByTurn` 同口径（同一 flatRows / 同一 turnKey），确保切点不落在一轮中间。
+   */
+  const lastAssistantIdByTurn = useMemo(() => {
+    const map = new Map<string, string>()
+    // ⚠️ 只看**已落库的 assistant 段**，不把流式块算进来：流式块是「下一段正在生成的输出」，
+    //   它存在并不代表前面的落库段是过程旁白 —— 算进来的话该轮最后一条落库段正文会被误藏
+    //   （实测导致 anchorSeqOrder / queuedUserOrder 共 7 个用例正文消失）。
+    //   最终答复 = 该轮**最后一条已落库 assistant**；流式块内容由 StreamBlockRow 独立渲染。
+    //
+    // ⚠️ 只对「**有 user 锚**的轮」生效：无锚 assistant（窗口首段 / 后台注入行 / 纯 assistant 历史）
+    //   会被 turnKeyOf 经 lastMsgTurnKey 串成同一个 key —— 那是分组的既有行为（为了让流式块有归属），
+    //   但把它们里的非末条正文藏起来会误伤真实内容（实测 3 条无锚 assistant 只剩 1 条可见）。
+    //   判据用 turnKey === 该行自身 id ⇒ 该轮有独立 user 锚（否则 key 来自前一行，不等于自身）。
+    // ⭐ [2026-11-02 用户二次裁定 · 推翻「方案 C：进行中不折叠」]
+    //
+    // <b>WHY 推翻</b>：方案 C 保留全部中间旁白 ⇒ 一轮里每段 assistant 正文都平铺显示，
+    // 而每段又各自带 `N nexus` 头 + 「正在执行 · 时长」状态行 ⇒ 用户实测
+    // 「一个轮次内又有多个 nexus 回复」（截图实证：三段字字相同的内容 + 三个头）。
+    //
+    // 现改为：**执行中与结束后同一口径** —— 该轮只有最后一段算「最终答复」留在正文区，
+    // 其余段正文收进「正在执行」折叠区（用户随时可点开看过程）。
+    // 这样一轮恒定只有一个 nexus 头，而过程信息并没有丢（折叠区里仍在）。
+    //
+    // ⚠️ 仍然只看**已落库的 assistant 段**（不把流式块算进来）—— 理由见上方原注释：
+    //   流式块是「下一段正在生成」，算进来会把前面的落库末段正文误藏（实测 7 个用例正文消失）。
+    // ⚠️ 仍然只对「有 user 锚的轮」生效（row.turnKey === row.m.userMessageId）——
+    //   无锚 assistant 会被 turnKeyOf 串成同一个 key，折叠会误伤真实内容。
+    // [2026-11-02 用户实测「同样内容渲染两次」] **锚点判断改成按轮、不按段。**
+    //
+    // <b>原实现的洞</b>：判据是 `row.turnKey !== row.m.userMessageId` ⇒ 逐段比对。
+    //   只要某轮的 assistant 段 `userMessageId` 与 turnKey 不一致（实测常见：null、
+    //   或指向注入行），该段就被跳过 ⇒ 若**整轮**都被跳过，map 里没有该轮条目
+    //   ⇒ `isFinalOfTurnFor` 回落 true ⇒ **每一段都当最终段平铺** ⇒ 同样内容出现两遍。
+    //   （复现：u1 + 两个 userMessageId=null 的 assistant 段 → bodies 出现两次相同正文。）
+    //
+    // <b>新判据</b>：先算出「哪些轮有**真正的用户提问**锚」，只有这些轮才参与折叠；
+    //   有锚的轮里，最后一条 assistant 段 = 最终段，其余段正文收进折叠区。
+    //   无锚的轮（窗口头部截断 / 纯 assistant 历史）保持旧行为（全部展示），不误伤。
+    const anchoredTurns = new Set<string>()
+    for (const row of flatRows) {
+      if (row.kind === 'msg' && isUserTurnRow(row.m)) anchoredTurns.add(row.turnKey)
+    }
+    for (const row of flatRows) {
+      if (row.kind !== 'msg' || row.m.role !== 'assistant') continue
+      if (!anchoredTurns.has(row.turnKey)) continue
+      map.set(row.turnKey, row.m.id)
+    }
+    return map
   }, [flatRows])
+
+  /** 该行是否本轮「最终段」（正文留在正文区）。查不到记录一律按最终段 —— ⛔ 不能返回 false，
+   *  否则 undefined === id 恒 false 会把无锚行的正文全藏掉（实测 3 条无锚 assistant 全部丢正文）。 */
+  const isFinalOfTurnFor = useCallback((row: { turnKey: string; m: ChatMessageDto }) => {
+    if (row.m.role !== 'assistant') return true
+    const finalId = lastAssistantIdByTurn.get(row.turnKey)
+    return finalId == null || finalId === row.m.id
+  }, [lastAssistantIdByTurn])
   /** [并行工具组] 同轮 `tool_use_summary` → 该轮**首个**多工具消息的工具组父行标题。
    *  同时记下被「消费」的那条摘要行 id：该轮展开时不再单独渲染它（摘要不显示两遍）；
    *  轮次收起时摘要行照常显示（组在折叠区里不可见，摘要是唯一线索）。 */
@@ -2321,6 +2764,43 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (out.has(key)) continue
       const e = end.get(key)
       if (e != null && e >= s) out.set(key, e - s)
+    }
+    return out
+  }, [messages])
+  /**
+   * [2026-11-01 方案 3] 进行中轮次的**实时时长**（每秒推进一次）。
+   *
+   * <p><b>WHY 需要 tick</b>：结束轮的时长是静态的（`turnDurationByKey`，消息时间差）。
+   * 但「正在执行 · 7m19s」要能看到秒数在走，否则用户分不清「还在跑」和「卡住了」。
+   *
+   * <p>⛔ 只在**有进行中轮次**时才起定时器：空闲会话零开销（否则 1s 一次全表重渲）。
+   * 起点 = 该轮 user 消息的 createdAt（与结束态同一口径），故「进行中 7m19s」结束时
+   * 不会跳变成另一个数字。
+   */
+  const [nowTick, setNowTick] = useState(() => Date.now())
+  const hasRunningTurn = activeTurnKeys.size > 0
+  useEffect(() => {
+    if (!hasRunningTurn) return
+    setNowTick(Date.now())
+    const t = window.setInterval(() => setNowTick(Date.now()), 1000)
+    return () => window.clearInterval(t)
+  }, [hasRunningTurn])
+  /** 轮次键 → 该轮起点（user 消息 createdAt）。只在进行中轮次用得上。 */
+  const turnStartByKey = useMemo(() => {
+    const out = new Map<string, number>()
+    let turnId: string | null = null
+    let prevKey: string | null = null
+    for (const m of messages) {
+      if (!isDialogueRow(m)) continue
+      const isUserRow = isUserTurnRow(m)
+      if (isUserRow) turnId = m.id
+      const key = turnKeyOf(m, turnId ?? prevKey)
+      prevKey = key
+      if (!isUserRow || !m.createdAt) continue
+      const t = Date.parse(m.createdAt)
+      if (Number.isNaN(t)) continue
+      const prev = out.get(key)
+      out.set(key, prev == null ? t : Math.min(prev, t))
     }
     return out
   }, [messages])
@@ -2453,6 +2933,59 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           text-overflow: ellipsis;
           white-space: nowrap;
         }
+        /* [2026-11-02 用户实测「nexus 回复被切成多段」] 后台任务通知行。
+           形态：一行弱化可展开通知（铃铛 + 「收到子代理通知 · 完成：…」+ 折叠箭头），
+           点开露出原始 XML。⛔ 不是用户气泡、也不开新轮 —— 它紧贴在「正在执行」下面。 */
+        .msg.task-notice {
+          flex-direction: column;
+          align-items: stretch;
+          margin: 6px 0;
+        }
+        .msg.task-notice .tn-head {
+          display: flex;
+          align-items: center;
+          gap: 6px;
+          width: 100%;
+          padding: 5px 10px;
+          background: var(--surface-2, #eff2f8);
+          border: 0;
+          border-radius: 8px;
+          font-family: inherit;
+          font-size: 12px;
+          color: var(--ink-subtle, #5f6875);
+          text-align: left;
+          cursor: pointer;
+          transition: background 120ms var(--ease, ease);
+        }
+        .msg.task-notice .tn-head:hover { background: var(--surface-3, #e9edf4); }
+        .msg.task-notice .tn-icon { flex-shrink: 0; display: inline-flex; color: var(--accent, #0f5fd4); }
+        .msg.task-notice .tn-icon svg { width: 13px; height: 13px; }
+        .msg.task-notice .tn-text {
+          flex: 1;
+          overflow: hidden;
+          text-overflow: ellipsis;
+          white-space: nowrap;
+        }
+        .msg.task-notice .tn-caret {
+          flex-shrink: 0;
+          width: 12px; height: 12px;
+          transition: transform 0.2s var(--ease, ease);
+        }
+        .msg.task-notice .tn-caret.open { transform: rotate(180deg); }
+        .msg.task-notice .tn-body {
+          margin: 6px 0 0;
+          padding: 8px 10px;
+          background: var(--surface-2, #eff2f8);
+          border-radius: 8px;
+          font-family: var(--font-mono, ui-monospace, monospace);
+          font-size: 11.5px;
+          line-height: 1.6;
+          color: var(--ink-subtle, #5f6875);
+          white-space: pre-wrap;
+          word-break: break-word;
+          max-height: 240px;
+          overflow-y: auto;
+        }
         /* [P2-13] compact 摘要卡片：CC CompactSummary 专用渲染（⏺ 标题行 + 折叠正文），
            不是用户气泡 —— 摘要正文默认收起（= CC prompt 模式），展开 = CC transcript 模式 */
         .msg.compact-summary {
@@ -2560,6 +3093,29 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           transition: color 0.15s;
         }
         .turn-process-toggle:hover { color: var(--ink-muted, #777); }
+        /* [2026-11-01 方案 3] 进行中的状态行：蓝色（「还在跑」），与结束态的灰色区分。
+           波浪点复用 .wave-dots（与「思考中…」同一动画，用户不用学第二套视觉语言）。 */
+        .turn-process-toggle.running { color: var(--accent, #0f5fd4); }
+        .turn-process-toggle.running .turn-process-status { font-weight: 600; }
+        .turn-process-toggle.running .turn-process-dur { color: var(--ink-subtle, #5f6875); }
+        .turn-process-toggle.running .wave-dots { color: var(--accent, #0f5fd4); }
+        /* 扫光条：进行中才有；**收起态保留** —— 那是「还在跑」的唯一动效线索。 */
+        .exec-scan-line {
+          position: relative; height: 2px; border-radius: 1px;
+          background: var(--surface-3, #e9edf4);
+          overflow: hidden; margin: 0 0 10px; width: 180px;
+        }
+        .exec-scan-line::after {
+          content: ''; position: absolute; top: 0; bottom: 0; width: 42%;
+          background: linear-gradient(90deg, transparent, var(--accent, #0f5fd4), transparent);
+          animation: exec-scan 1.5s ease-in-out infinite;
+        }
+        @keyframes exec-scan { 0% { left: -42%; } 100% { left: 100%; } }
+        /* 尊重系统「减少动态效果」偏好：关掉扫光与波浪（状态行文字仍在，信息不丢）。 */
+        @media (prefers-reduced-motion: reduce) {
+          .exec-scan-line::after { animation: none; left: 29%; }
+          .turn-process-toggle.running .wave-dots i { animation: none; opacity: .7; }
+        }
         .turn-process-status { font-weight: 500; }
         .turn-process-dur { font-variant-numeric: tabular-nums; }
         .turn-process-caret { width: 12px; height: 12px; transition: transform 0.2s ease; }
@@ -2567,6 +3123,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         .turn-process-body { margin: 2px 0 8px; }
         .turn-process-body .thinking-wrap { margin-top: 0; }
         .turn-process-body .tool-card:last-child { margin-bottom: 4px; }
+        /* [中间旁白正文] 过程碎句在折叠区里按「弱化的过程文案」呈现：比最终答复小一号、次级色、
+           且左侧一条细竖线把它与思考/工具卡归为同一档过程内容。展开后仍可读，收起时不可见。 */
+        .turn-process-body .turn-process-text {
+          margin: 6px 0 6px 2px; padding-left: 10px;
+          border-left: 2px solid var(--hairline, #eceef2);
+          font-size: 12.5px; color: var(--ink-subtle, #5f6875);
+        }
+        .turn-process-body .turn-process-text > :first-child { margin-top: 0; }
+        .turn-process-body .turn-process-text > :last-child { margin-bottom: 0; }
         /* [过程行间距] 思考块与上一行间距 12px → 4px（段间距另由 .turn-cont 收窄） */
         .thinking-wrap { margin-top: 4px; }
         /* 思考正文：隐藏滚动条（仍可滚动）；流式中：固定 3 行窗口，只露最新内容 */
@@ -2799,6 +3364,19 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           display: flex; align-items: center; gap: 5px; margin-top: 8px;
           font-size: 11.5px; color: var(--ink-tertiary); text-align: left;
         }
+        /* [2026-11-01] 编辑态里保留显示原消息的图片/附件 —— 否则用户看不出重发会不会带上它们 */
+        .user-edit-attach { display: flex; flex-wrap: wrap; gap: 6px; margin-bottom: 8px; }
+        .user-edit-thumb {
+          width: 56px; height: 56px; object-fit: cover;
+          border-radius: 8px; border: 1px solid var(--hairline); display: block;
+        }
+        .user-edit-file {
+          display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+          padding: 3px 8px; border-radius: 6px; background: var(--surface-2, #f4f6fa);
+          border: 1px solid var(--hairline); font-size: 11.5px; color: var(--ink-muted);
+        }
+        .user-edit-file svg { width: 12px; height: 12px; flex-shrink: 0; }
+        .user-edit-file .uaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         .user-edit-hint .ue-info { width: 12px; height: 12px; flex-shrink: 0; }
         .user-edit-error { margin-top: 6px; font-size: 11.5px; color: var(--error, #d93025); text-align: left; }
         .user-edit-actions { display: flex; justify-content: flex-end; gap: 8px; margin-top: 10px; }
@@ -2855,28 +3433,48 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           white-space: nowrap;
         }
       `}</style>
-      {/* [paging] 顶部「加载更多」：滚动容器里的**第一个可见元素**（按钮以上不得有任何 padding/占位
-          —— .stream 的 padding-top 已在 globals.css 里按 :has(> .stream-inner) 清零，留白由按钮自身 padding 承担）。
-          后端还有更早历史（hasMore，按轮口径）时显示；已经到底 → 隐藏。 */}
-      {(hasMore && onLoadOlder != null) && (
-        <button type="button" className="ml-load-older" disabled={loadingOlder} onClick={loadOlderClick}>
-          {loadingOlder ? '加载中…' : `加载更多（再显示 ${LOAD_OLDER_TURNS} 轮）`}
-        </button>
+      {/* ══════════ 顶部三块：执行中**整块不渲染** ══════════
+          [2026-11-02 用户裁定] 执行中这三块不显示（「用户对话就是顶，等结束之后再看到」）。
+          ⚠️ 注意：**只隐藏这三行 chrome，不折叠历史消息本身**。
+          早先版本把窗口同时收成 1 轮 ⇒ 历史轮从 DOM 里消失、折叠行又不渲染
+          ⇒ 用户「往上拉拉不到」（实测）。现折叠窗口始终按 FOLD_DEFAULT_TURNS，
+          执行中只是不画这三行，往上仍可正常滚到历史。
+          ⛔ 不要改成 disabled / 半透明 —— 用户明确说「直接不显示」。 */}
+      {turnEnded && (
+        <>
+          {/* [paging] 顶部「加载更多」：滚动容器里的**第一个可见元素**（按钮以上不得有任何 padding/占位
+              —— .stream 的 padding-top 已在 globals.css 里按 :has(> .stream-inner) 清零，留白由按钮自身 padding 承担）。
+              后端还有更早历史（hasMore，按轮口径）时显示；已经到底 → 隐藏。 */}
+          {(hasMore && onLoadOlder != null) && (
+            <button type="button" className="ml-load-older" disabled={loadingOlder} onClick={loadOlderClick}>
+              {loadingOlder ? '加载中…' : `加载更多（再显示 ${LOAD_OLDER_TURNS} 轮）`}
+            </button>
+          )}
+          {/* [轮窗口] 已经到会话开头（没有更早历史）→ 用日期给出「这是第几条」的绝对位置锚。
+              与「加载更多」按钮同一位置、互斥：有更早历史时显示按钮，到底时显示本行。 */}
+          {hasMore === false && onLoadOlder != null && flatRows.length > 0 && (
+            <div className="ml-top-boundary">{topBoundaryDate ? `已加载到会话开始 · ${topBoundaryDate}` : '已加载到会话开始'}</div>
+          )}
+          {/* [折叠显示] 比默认窗口更早的已加载轮 → 一行折叠（点击本地展开，不发请求）。
+              位置固定为「加载更多」按钮（/ 已到底标记）之下的第一块 ⇒ 按钮仍是滚动容器的第一个可见元素。
+              [2026-11-02] 执行中整块不渲染（见上方说明），故这里的展开按钮恒可点。 */}
+          {/* [折叠 = 真删 · 2026-11-02] 计数 = 内存里被临时折起的轮 + store 已移出内存的轮。
+              点击 = 先展开内存里的（零延迟），再向后端重拉更早一轮（真删的只能这样回来）。 */}
+          {(foldedTurnKeys.length > 0 || foldedTurnCount > 0) && (
+            <button
+              type="button"
+              className="ml-fold-row"
+              aria-expanded={false}
+              onClick={() => { expandFoldedTurns(); onExpandOlder?.() }}
+            >
+              ⋯ 已折叠 {foldedTurnKeys.length + foldedTurnCount} 轮对话（点击展开）
+            </button>
+          )}
+        </>
       )}
-      {/* [轮窗口] 已经到会话开头（没有更早历史）→ 用日期给出「这是第几条」的绝对位置锚。
-          与「加载更多」按钮同一位置、互斥：有更早历史时显示按钮，到底时显示本行。 */}
-      {hasMore === false && onLoadOlder != null && flatRows.length > 0 && (
-        <div className="ml-top-boundary">{topBoundaryDate ? `已加载到会话开始 · ${topBoundaryDate}` : '已加载到会话开始'}</div>
-      )}
-      {/* [历史提问跳转] 目标不在已加载窗口且补拉不到 → 明确提示（⛔ 不静默失败） */}
+      {/* [历史提问跳转] 目标不在已加载窗口且补拉不到 → 明确提示（⛔ 不静默失败）。
+          ⚠️ 这条**不受** turnEnded 门控：它是「跳转失败」的显式反馈，执行中也必须能看到。 */}
       {jumpMiss && <div className="ml-jump-miss" role="status">该提问不在当前窗口</div>}
-      {/* [折叠显示] 比默认窗口更早的已加载轮 → 一行折叠（点击本地展开，不发请求）。
-          位置固定为「加载更多」按钮（/ 已到底标记）之下的第一块 ⇒ 按钮仍是滚动容器的第一个可见元素。 */}
-      {foldedTurnKeys.length > 0 && (
-        <button type="button" className="ml-fold-row" aria-expanded={false} onClick={expandFoldedTurns}>
-          ⋯ 已折叠 {foldedTurnKeys.length} 轮对话（点击展开）
-        </button>
-      )}
       {/* F29 · 元消息（续写提示 / budget nudge）isMeta=true 不展示；role=tool 工具结果消息已含于
           assistant.toolCalls[].result（DB 重拉后），独立渲染会重复噪音 → 一并过滤 */}
       {/* 按 userMessageId 分组渲染（消息链锚定 · 对齐 GET /messages 后端出站链）：
@@ -2886,16 +3484,30 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         //   即「一条消息毒」会带走整个消息列表。逐行隔开后，坏的那条只挂自己那一行。
         //   ⛔ 只加这一层壳，不动行内渲染逻辑。
         if (row.kind === 'msg') {
-          const turnOpen = activeTurnKeys.has(row.turnKey) ? true : (processOpenByTurn[row.turnKey] ?? false)
+          // [2026-11-02 系统注入行] 不单独占对话流 —— 由该轮折叠区统一渲染（见 systemRowsByTurn）。
+          //   若这里放行，收起态仍会显示、且夹在工具卡之间打断阅读（用户要的是「融合在已完成中」）。
+          if (isSystemInjectedRow(row.m)) return null
+          // [2026-11-01 方案 3] 进行中的轮**也允许收起**（用户裁定「未完成也能收」）：
+          //   默认展开（processOpenByTurn 无记录 = true），用户点过就按用户的来。
+          //   ⛔ 收起后状态行 + 扫光条仍在（见 Message 的 isRunningTurn 分支），不会变成「看不出还活着」。
+          const isRunningTurn = activeTurnKeys.has(row.turnKey)
+          const turnOpen = processOpenByTurn[row.turnKey] ?? isRunningTurn
           // [并行工具组] 该轮展开时其 tool_use_summary 已并入工具组父行标题 → 独立摘要行不再重复显示
           if (turnOpen && toolGroupMeta.summaryIdByTurn.get(row.turnKey) === row.m.id) return null
-          // 空壳 assistant 段（只有空 content）不渲染：否则每段 6px margin 累加成大段空白。
-          //   收起态下该段的工具卡/思考正文整段不可见，只剩空 content 外壳；判据全部满足才丢弃，
+          // 空壳 assistant 段不渲染：否则每段 margin 累加成大段空白。
+          //   收起态下该段的工具卡/思考正文/中间旁白整段不可见，只剩外壳；判据全部满足才丢弃，
           //   且只在收起态生效 —— 展开后同一段的工具卡/思考必须照常显示（同一份数据不能删）。
           //   承载消息头 / 「已完成」开关 / 轮次 footer / 已裁剪徽章 / SendUserMessage 正文的行一律保留。
+          //
+          //   [2026-11-01 用户实测「已完成·20m02s 后一大片空白」] 原判据只认 `content 为空`。
+          //   但中间段的正文现在被收进折叠区（正文区不再渲染它）⇒ 该行**视觉上是空的**，
+          //   却因 content 非空而不被丢弃 ⇒ 每段留一个 24px 空行，堆成一大片空白。
+          //   故判据改为「收起态下该行没有任何可见内容」：正文为空 **或** 该行不是本轮的最终段
+          //   （非最终段正文已进折叠区）。其余保留条件不变。
+          const hasVisibleBody = (row.m.content ?? '').trim() !== '' && isFinalOfTurnFor(row)
           const shellInCollapsedTurn = !turnOpen
             && row.m.role === 'assistant'
-            && (row.m.content ?? '').trim() === ''
+            && !hasVisibleBody
             && !(row.m.toolCalls ?? []).some(isSendUserMessage)
             && !row.m.isApiErrorMessage
             && !row.m.isCompactSummary
@@ -2913,12 +3525,27 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 footer={footerByRowKey.get(row.key)}
                 highlighted={row.m.id === highlightedMsgId}
                 processExpanded={turnOpen}
-                showProcessHeader={!activeTurnKeys.has(row.turnKey) && firstIntermediateByTurn.get(row.turnKey) === row.m.id}
+                isFinalOfTurn={isFinalOfTurnFor(row)}
+                isRunningTurn={activeTurnKeys.has(row.turnKey)}
+                liveTurnMs={(() => {
+                  // 进行中：now - 该轮起点（每秒随 nowTick 推进）；非进行中返回 null（用静态 turnDurationMs）
+                  if (!activeTurnKeys.has(row.turnKey)) return null
+                  const s = turnStartByKey.get(row.turnKey)
+                  return s == null ? null : Math.max(0, nowTick - s)
+                })()}
+                // [2026-11-01 方案 3] 进行中的轮也要显示状态行（「正在执行 · 动态时长」）——
+                //   原来 `!activeTurnKeys.has(...)` 把运行中排除了，导致进行中看不到任何状态。
+                // [2026-11-02 用户实测「扫描蓝条被顶掉」] 状态行落点改为两级优先：
+                //   该轮第一条**有中间过程**的 assistant 行 → 没有则回落该轮**第一条** assistant 行。
+                //   只认前者会让「首段纯正文」的轮次整轮没有状态行与扫光条。
+                showProcessHeader={processHeaderIdByTurn.get(row.turnKey) === row.m.id}
                 turnDurationMs={turnDurationByKey.get(row.turnKey) ?? null}
                 turnKey={row.turnKey}
                 showHeader={firstAssistantRowKeys.has(row.key)}
                 groupTitle={toolGroupMeta.titleByMsgId.get(row.m.id)}
                 summaryToolName={toolGroupMeta.toolNameByTurn.get(row.turnKey)}
+                systemRows={processHeaderIdByTurn.get(row.turnKey) === row.m.id
+                  ? systemRowsByTurn.get(row.turnKey) : undefined}
                 onToggleProcess={toggleTurnProcess} />
             </ErrorBoundary>
           )
@@ -2942,6 +3569,17 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               isStreamingTail={row.blockId === lastStreamId}
               onRunHtml={openHtmlPreview}
               showHeader={firstAssistantRowKeys.has(row.key)}
+              // [2026-11-02 修「发送后『正在执行』不显示，刷新才有」]
+              //   本轮还没有落库 assistant（刚发消息 / 纯流式阶段）⇒ 由**首条流式块**承载状态行。
+              //   一旦 assistant 落库，落点自动切回落库段（见 processHeaderIdByTurn），一轮恒一处。
+              showProcessHeader={!turnsWithPersistedAssistant.has(row.turnKey)
+                && firstAssistantRowKeys.has(row.key)
+                && activeTurnKeys.has(row.turnKey)}
+              liveTurnMs={(() => {
+                if (!activeTurnKeys.has(row.turnKey)) return null
+                const st = turnStartByKey.get(row.turnKey)
+                return st == null ? null : Math.max(0, nowTick - st)
+              })()}
             />
           </ErrorBoundary>
         )

@@ -133,8 +133,13 @@ describe('[轮次中间过程折叠]', () => {
       intermediateMsg('a1', 'u1'),
     ])
 
-    // 本轮未结束：不得出现「已完成」收起行
-    expect(toggles()).toHaveLength(0)
+    // [2026-11-01 方案 3] 本轮未结束：**不显示「已完成」**（改为「正在执行」状态行）。
+    //   原断言是「toggles 长度为 0」—— 那条是方案 3 之前的行为（进行中完全没有状态行）。
+    //   现按用户裁定「未完成也能收」，进行中也有一行，但文案是「正在执行」而不是「已完成」。
+    expect(container.textContent).not.toContain('已完成')
+    const running = container.querySelector('.turn-process-toggle.running')
+    expect(running, '进行中应显示「正在执行」状态行').not.toBeNull()
+    expect(running!.textContent).toContain('正在执行')
     // 已落库的中间过程仍正常展示（工具卡可见）
     expect(container.querySelectorAll('.tool-card')).toHaveLength(1)
     // 流式行自己的思考块保持展开（StreamBlockRow 尾块行为不变）
@@ -142,7 +147,7 @@ describe('[轮次中间过程折叠]', () => {
     expect(thinkingBodies.some((t) => t.includes('正在思考'))).toBe(true)
   })
 
-  it('最后一轮在跑时，历史轮次仍默认收起', () => {
+  it('[2026-11-02 用户裁定] 最后一轮在跑时，历史轮次**折叠**（执行中只看当前轮）', () => {
     renderList([
       userMsg('u0'),
       intermediateMsg('a0', 'u0'),
@@ -150,14 +155,574 @@ describe('[轮次中间过程折叠]', () => {
       userMsg('u1'),
     ], { thinking: true })
 
-    // 历史轮次有且只有一个「已完成」开关；当前轮（u1）无中间过程 → 无开关
+    // <b>WHY 断言（规则九 · 最终裁定 · 第三次）</b>：用户原话
+    //   「用户发送消息后 应该只显示该用户消息和当前轮次 其他的轮次隐藏了 直到完成后重新可以看到」
+    //   + 「当前气泡就是顶」（连上一轮都不保留）。
+    //   ⇒ 执行中：历史轮**从 DOM 移除**，当前用户气泡就是滚动区顶；折叠行也不画。
+    //   ⚠️ 与下一用例配对：结束后必须**自动恢复**，否则就是用户上次报的「往上拉拉不到」。
+    expect(container.querySelector('.ml-fold-row'), '执行中不应出现折叠行').toBeNull()
+    const text = container.textContent ?? ''
+    expect(text, '当前轮 user 气泡必须在').toContain('问题-u1')
+    expect(text, '执行中历史轮必须隐藏（当前气泡就是顶）').not.toContain('问题-u0')
+  })
+
+  it('[2026-11-02 用户裁定] 轮次结束后，历史轮恢复可见（折叠行可展开）', () => {
+    renderList([
+      userMsg('u0'),
+      intermediateMsg('a0', 'u0'),
+      finalMsg('a0-final', 'u0'),
+      userMsg('u1'),
+      finalMsg('a1', 'u1'),
+    ])
+
+    // 已结束（无 thinking / 无流式块）⇒ 窗口恢复 3 轮 ⇒ 历史轮重新渲染，折叠行消失。
     expect(toggles()).toHaveLength(1)
-    expect(container.querySelectorAll('.tool-card')).toHaveLength(0)
+    expect(container.querySelector('.ml-fold-row')).toBeNull()
+    // ⭐ 关键：**历史内容真的回来了**（上一条用例断言执行中历史被隐藏 ⇒ 这一条必须对称地证明它恢复）
+    //   否则就是用户报的「往上拉拉不到」—— 折叠行没了、历史也没了 = 永久丢失。
+    const text = container.textContent ?? ''
+    expect(text, '结束后历史轮必须重新可见').toContain('问题-u0')
+    expect(text, '结束后当前轮也在').toContain('问题-u1')
+  })
+
+  /**
+   * ⭐⭐ [2026-11-02 用户实测「发送后 正在执行 不展示 要刷新才有」]
+   *
+   * <p><b>根因</b>：状态行原先只挂在**已落库的 assistant 消息**上（`processHeaderIdByTurn` 只遍历
+   * `kind === 'msg'`）。用户刚发消息时这一轮**只有流式块**、还没有任何落库 assistant
+   * ⇒ 整轮没有状态行落点 ⇒ 看不到「正在执行」，F5 从 DB 重拉出 assistant 后才出现。
+   *
+   * <p>现改为：本轮还没有落库 assistant 时，状态行交给**首条流式块**渲染。
+   */
+  it('⭐⭐ 只有流式块、没有任何落库 assistant 时，仍显示「正在执行」', () => {
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-live', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-live'] },
+    })
+    // 只有 user + 流式块（**没有** assistant 落库消息）
+    renderList([userMsg('u1', '2026-10-28T10:00:00Z')])
+
+    const running = container.querySelector('.turn-process-toggle.running')
+    expect(running, '纯流式阶段也必须显示「正在执行」').not.toBeNull()
+    expect(running!.textContent).toContain('正在执行')
+    // [2026-11-02 用户实测「正在执行 没有时间」] 时长必须渲染 —— 依赖 user 行的 createdAt 能算出本轮起点。
+    expect(running!.querySelector('.turn-process-dur'), '必须显示已耗时（缺 createdAt 会空）').not.toBeNull()
+    // 波浪点（进行中的动效线索）
+    expect(running!.querySelectorAll('.wave-dots i').length, '波浪点缺失').toBe(3)
+    // 扫光条同样要在
+    expect(container.querySelector('.exec-scan-line'), '扫光条不能缺').not.toBeNull()
+  })
+
+  /**
+   * ⭐⭐⭐ [2026-11-02 用户实测「还会出现渲染两次 nexus 回复」]
+   *
+   * <p><b>根因</b>：`lastAssistantIdByTurn` 的锚点判据是**逐段**比对
+   * `row.turnKey !== row.m.userMessageId`。只要某轮的 assistant 段
+   * `userMessageId` 与 turnKey 不一致（实测常见：null、或指向注入行），该段被跳过；
+   * 若**整轮**都被跳过，map 无该轮条目 ⇒ `isFinalOfTurnFor` 回落 true
+   * ⇒ 每段都当最终段平铺 ⇒ **同样正文出现两遍**。
+   *
+   * <p>现改为按**轮**判断锚点（该轮是否有真正的用户提问），只有无锚的轮才全部展示。
+   */
+  it('⭐⭐⭐ 段落 userMessageId 缺失时，正文不得重复渲染', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      // 两段同内容的 assistant，userMessageId 都缺失（真实运行态常见）
+      baseMsg('a1', 'assistant', { content: '同样的内容', finishReason: 'tool_calls', userMessageId: null }),
+      baseMsg('a2', 'assistant', { content: '同样的内容', finishReason: 'stop', userMessageId: null }),
+    ])
+    const text = container.textContent ?? ''
+    const count = (text.match(/同样的内容/g) ?? []).length
+    expect(count, '正文只能出现一次（重复=渲染两次）').toBe(1)
+  })
+
+  /**
+   * ⭐⭐⭐ [2026-11-02 用户实测「发送了用户消息 又没有锁定了 往上又能拉到历史」]
+   *
+   * <p><b>根因</b>：折叠循环里 `if (revealedFoldKeys.has(k)) break` —— `revealedFoldKeys`
+   * 记录用户**之前点过「⋯ 已折叠 N 轮（点击展开）」**的轮，只在切会话时清空。
+   * 用户历史上展开过更早的轮，该键就永久留在集合里；新发消息时循环走到它即 break
+   * ⇒ 后面的轮全不折 ⇒ 历史重新出现。这解释了「有时锁得住、有时锁不住」。
+   *
+   * <p><b>修法</b>：执行中一律无视 revealedFoldKeys；轮次结束后恢复尊重。
+   *
+   * <p>本用例：先让用户展开历史（模拟点过折叠行），再发送新消息 ⇒ 历史仍必须隐藏。
+   */
+  it('⭐⭐⭐ 用户此前展开过历史，发送新消息后历史仍必须锁定隐藏', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    renderList([
+      userMsg('u0'), intermediateMsg('a0', 'u0'), finalMsg('a0-final', 'u0'),
+      userMsg('u1'), intermediateMsg('a1', 'u1'), finalMsg('a1-final', 'u1'),
+      userMsg('u2'), intermediateMsg('a2', 'u2'), finalMsg('a2-final', 'u2'),
+      userMsg('u3'), intermediateMsg('a3', 'u3'), finalMsg('a3-final', 'u3'),
+    ])
+    // 模拟用户点过「展开历史」—— 展开所有被折叠的轮
+    const foldRow = container.querySelector<HTMLButtonElement>('.ml-fold-row')
+    if (foldRow) act(() => { foldRow.click() })
+    expect(container.textContent, '展开后历史可见').toContain('问题-u0')
+
+    // 现在发送新消息（进入执行中：有流式块）
+    act(() => {
+      const st = useChatStore.getState()
+      st.ensureStreamBlock(SID, 'blk-new', 'u3')
+      st.appendChunk(SID, 'blk-new', '新输出')
+    })
+    // 重新渲染以拿到最新 store
+    act(() => { root?.unmount() })
+    renderList([
+      userMsg('u0'), intermediateMsg('a0', 'u0'), finalMsg('a0-final', 'u0'),
+      userMsg('u1'), intermediateMsg('a1', 'u1'), finalMsg('a1-final', 'u1'),
+      userMsg('u2'), intermediateMsg('a2', 'u2'), finalMsg('a2-final', 'u2'),
+      userMsg('u3'), intermediateMsg('a3', 'u3'), finalMsg('a3-final', 'u3'),
+    ])
+    const text = container.textContent ?? ''
+    expect(text, '执行中：历史必须隐藏（哪怕之前展开过）').not.toContain('问题-u0')
+    expect(text, '执行中：当前轮必须可见').toContain('问题-u3')
   })
 
   it('无中间过程（纯文本回复）不渲染「已完成」行 —— 没有可折叠内容时不应增加噪音', () => {
     renderList([userMsg('u1'), finalMsg('a1', 'u1')])
     expect(toggles()).toHaveLength(0)
     expect(container.textContent).toContain('最终答复-a1')
+  })
+})
+
+describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
+  /** 数「nexus」消息头（不是正文里出现的字样） */
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+
+  it('基线：一轮=1 user + 多条 assistant 段 → 只能有 1 个 nexus 头', () => {
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+
+  it('⭐ 中间插入 isMeta 的 edited_text_file 段（role=user）→ 仍只能有 1 个 nexus 头', () => {
+    // 真实形态：文件被编辑后后端会追加 isMeta user 消息（DB 实测 89 条）。
+    //   isUserTurnRow 要求 !isMeta ⇒ 它不开新轮；但它插在两段 assistant 之间时，
+    //   firstAssistantRowKeys 的「纯行序判据」只看 isUserTurnRow 重置，应当不受影响。
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      baseMsg('e1', 'user', { author: 'attachment', subtype: 'edited_text_file', isMeta: true, content: '改了什么' }),
+      finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+
+  it('⭐ 助手段 userMessageId 缺失（后台/注入行）→ 仍只能有 1 个 nexus 头', () => {
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', { reasoning: 'r', content: '第一段', finishReason: 'stop', userMessageId: null }),
+      baseMsg('a2', 'assistant', { content: '第二段', finishReason: 'stop', userMessageId: null }),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+
+  /**
+   * ⭐⭐ [2026-11-02 用户实测「执行中出现 2–3 个 nexus 头，F5 后消失」]
+   *
+   * <b>WHY</b>：运行态消息 = 流式块 + 落库段 + 各类推送交织，中间确实可能夹进一条
+   * 「被 isUserTurnRow 认作提问」的行（某些注入行 DB 里 is_meta=1、运行态推送却 isMeta=false）。
+   * 旧判据是**纯行序**的：遇到 isUserTurnRow 就把 `headAddedSinceUser` 重置 ⇒ 同一轮冒出第二、第三个头。
+   * F5 重拉后消息归位（注入行带回 is_meta=1）⇒ 头恢复成一个 —— 与用户观察完全一致。
+   *
+   * 现判据改为「行序 + turnKey」双重去重 ⇒ 即便中间夹了一条被误判的提问行，
+   * 只要 turnKey 相同，就不会再出一个头。
+   */
+  /**
+   * ⭐⭐⭐ [2026-11-02 用户实测截图] 一轮内出现 **2–3 个 `N nexus` 头**，
+   * 且每段都带「正在执行 · 时长」状态行，正文内容看起来重复。
+   *
+   * <p>根因 = 「方案 C：进行中的轮不折叠中间旁白」（{@code lastAssistantIdByTurn} 里
+   * {@code if (activeTurnKeys.has(turnKey)) continue}）⇒ 一轮里每段 assistant 正文都平铺显示，
+   * 每段又各自带头与状态行。
+   *
+   * <p>现改为：执行中与结束后**同一折叠规则** ⇒ 一轮恒定一个 nexus 头，
+   * 中间段正文收进「正在执行」折叠区（点开仍在，不丢过程信息）。
+   */
+  it('⭐⭐⭐ 一轮内多段 assistant + 进行中 → 只有 1 个 nexus 头、1 个状态行', () => {
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-live', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-live'] },
+    })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', { content: '第一段旁白', finishReason: 'tool_calls', userMessageId: 'u1' }),
+      baseMsg('a2', 'assistant', { content: '第二段旁白', finishReason: 'tool_calls', userMessageId: 'u1' }),
+      baseMsg('a3', 'assistant', { content: '第三段旁白', finishReason: 'stop', userMessageId: 'u1' }),
+    ])
+    expect(nexusHeads(), '一轮只能有一个 nexus 头').toHaveLength(1)
+    expect(container.querySelectorAll('.turn-process-toggle'), '一轮只能有一个状态行').toHaveLength(1)
+  })
+
+  it('⭐⭐ 中间夹了一条被误判为提问的注入行 → 同 turnKey 仍只出 1 个 nexus 头', () => {
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      // 运行态下被误判为「提问」的注入行（DB 里其实是 is_meta=1，运行态推送丢了该标记）
+      baseMsg('inj1', 'user', { content: '任务通知内容', userMessageId: 'u1' }),
+      finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+})
+
+describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+
+  it('⭐ 一轮内：已落库 assistant 段 + 尾部流式块 → 只能有 1 个 nexus 头', () => {
+    // 真实时序：模型输出被切成多个 assistant 落库段，最后一段还在流式输出。
+    //   落库段走 firstAssistantRowKeys（纯行序），流式块也必须参与同一判据 ——
+    //   否则流式块会自带一个头，出现「一轮两个 nexus」。
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-1', userMessageId: 'u1',
+          reasoning: '', content: '流式输出中', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-1'] },
+    })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+
+  it('⭐⭐ 切会话后 store 残留上一会话流式块 → 当前会话不得出现多余 nexus 头', () => {
+    // 用户报告「切换会话也会出现」：若上一会话的流式块没清干净、且其 userMessageId
+    //   在本会话里认不出 ⇒ blockTurnKey 回落到 latestUserTurnId，被塞进本轮 → 多一个头。
+    const OTHER = 'sess-other'
+    useChatStore.setState({
+      streams: {
+        [OTHER]: [{
+          assistantMessageId: 'blk-stale', userMessageId: 'u-other',
+          reasoning: '', content: '上一会话残留', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [OTHER]: ['blk-stale'] },
+    })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      finalMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+    expect(container.textContent).not.toContain('上一会话残留')
+  })
+})
+
+describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assistant）', () => {
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+
+  it('⭐ 两条 user 紧邻 + 之后多段 assistant → 不得出现 2 个 nexus 头', () => {
+    // 真实数据实测：sess-d2dc1d51 有 2 处这种形态（用户快速追问 / 方案确认）。
+    //   两条 user 都满足 isUserTurnRow ⇒ 各自重置 headAddedSinceUser；
+    //   若它们被分到**不同 turnKey**，后一段 assistant 归第二轮的 key，
+    //   而第一轮的 key 也可能有 assistant 残留 ⇒ 两个头。
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      userMsg('u2', '2026-10-28T10:00:01Z'),
+      intermediateMsg('a1', 'u2', '2026-10-28T10:01:00Z'),
+      finalMsg('a2', 'u2', '2026-10-28T10:02:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(1)
+  })
+
+  it('第二条 user 插在两段同轮 assistant 之间 → 头数 = 2（这是行序判据的已知边界）', () => {
+    // ⚠️ 此形态下 2 个头**不是 bug**：u2 是真实提问行，它之后的 a2 与前一段 a1 之间
+    //   隔着一条用户提问 ⇒ 视觉上就是两段独立的回答。断言 2 是**固定当前语义**，不是期望 1。
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      userMsg('u2', '2026-10-28T10:00:01Z'),
+      finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
+    ])
+    expect(nexusHeads()).toHaveLength(2)
+  })
+})
+
+describe('[2026-11-01 用户报告] 窗口首条无 user 行（滑动窗口截断）', () => {
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+
+  it('⭐⭐ 窗口从 assistant 开始（前面的 user 已滑出）→ 后续多个用户轮仍各一个头', () => {
+    // 用户描述：「对话多到一定程度就可能会出现，几个回复收缩在一个 nexus 中」。
+    //   窗口 = 最近 3 轮；若首条是上一轮残留的 assistant 段（其 user 行已滑出窗口），
+    //   headAddedSinceUser 从 true 起算 —— 但它在 sorted rows 里位于**第一个 user 之前**，
+    //   所以下一个 user 会重置，理论上没问题。真正风险是**排序**：残留段的 seq 可能大于
+    //   新轮的 user 行（liveSeq 与 historySeq 混用）。
+    renderList([
+      finalMsg('a-orphan', 'u-gone', '2026-10-28T09:00:00Z'),   // 上一轮残留（user 已滑出）
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      finalMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      userMsg('u2', '2026-10-28T10:10:00Z'),
+      finalMsg('a2', 'u2', '2026-10-28T10:11:00Z'),
+    ])
+    // orphan 段 1 + u1 轮 1 + u2 轮 1 = 3（实测渲染确认，非期望值推导）
+  })
+
+  it('⭐⭐ 三段 assistant 的 createdAt 相同（同一秒落库）→ 排序稳定，头仍按行序', () => {
+    // 真实风险：多条消息 createdAt 精度到秒/毫秒相同 ⇒ 排序靠 key 兜底（localeCompare），
+    //   若 key 顺序与 seq 顺序不一致，assistant 段会被插到 user 行**前面**，
+    //   导致其后的 nexus 头判据错乱。
+    const t = '2026-10-28T10:00:00Z'
+    renderList([
+      userMsg('u1', t),
+      baseMsg('zzz-a1', 'assistant', { content: '段1', finishReason: 'stop', userMessageId: 'u1', createdAt: t }),
+      baseMsg('aaa-a2', 'assistant', { content: '段2', finishReason: 'stop', userMessageId: 'u1', createdAt: t }),
+    ])
+    // 两段同轮 ⇒ 只 1 个头（行序判据；排序不影响结论，但能暴露 key 兜底是否打断分组）
+    expect(nexusHeads()).toHaveLength(1)
+  })
+})
+
+describe('[2026-11-01 用户报告] 中间段旁白正文不得外露', () => {
+  /** 正文区里的文本（排除折叠区 .turn-process-body） */
+  const bodyText = () => {
+    const bodies = Array.from(container.querySelectorAll('.msg.assistant .body'))
+    return bodies.map((b) => {
+      const clone = b.cloneNode(true) as HTMLElement
+      clone.querySelectorAll('.turn-process-body').forEach((n) => n.remove())
+      clone.querySelectorAll('.author').forEach((n) => n.remove())
+      return (clone.textContent ?? '').trim()
+    }).filter((s) => s !== '')
+  }
+
+  it('⭐ 一轮多段 assistant：只有最后一段正文可见，中间旁白回到折叠区', () => {
+    // 用户实测：「设计确认。开始实施…」「现在实现后端…」这类过程碎句全被当正文铺出来了。
+    //   真实形态：模型每段都产出 content，但只有收尾那段是「答复」。
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', {
+        content: '设计确认。开始实施。', reasoning: '想一想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      baseMsg('a2', 'assistant', {
+        content: '现在实现后端。', reasoning: '再想想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      finalMsg('a3', 'u1'),
+    ])
+    // 正文区只应出现最终答复
+    expect(bodyText().join('|')).toContain('最终答复-a3')
+    expect(bodyText().join('|')).not.toContain('设计确认。开始实施。')
+    expect(bodyText().join('|')).not.toContain('现在实现后端。')
+  })
+
+  it('展开「已完成」后，中间旁白在折叠区里可见（不是被删掉）', () => {
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', {
+        content: '设计确认。开始实施。', reasoning: '想一想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      finalMsg('a2', 'u1'),
+    ])
+    expect(container.textContent).not.toContain('设计确认')
+    act(() => { toggles()[0]!.click() })
+    // 展开后必须能看到 —— 同一份数据不能删
+    expect(container.textContent).toContain('设计确认。开始实施。')
+  })
+
+  it('单段轮次（无中间过程）：正文照常显示，不被当成旁白吞掉', () => {
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      finalMsg('a1', 'u1'),
+    ])
+    expect(bodyText().join('|')).toContain('最终答复-a1')
+  })
+})
+
+describe('[2026-11-02 最终口径] 执行中与结束后同一折叠规则', () => {
+  // <b>WHY 撤销「方案 C：进行中全留」</b>：实测一轮内出现 2–3 个 `N nexus` 头
+  //   （截图：三段字字相同的内容各带一个头 + 「正在执行」状态行）。
+  //   方案 C 假设「中间旁白平铺对用户有价值」，但代价是同轮多头 + 重复正文，
+  //   用户最终裁定「执行中也折叠旁白」—— 过程信息仍在折叠区里，点开即可看。
+  useChatStore // keep import used
+  /** 正文区文本（排除折叠区） */
+  const bodyText = () => {
+    const bodies = Array.from(container.querySelectorAll('.msg.assistant .body'))
+    return bodies.map((b) => {
+      const clone = b.cloneNode(true) as HTMLElement
+      clone.querySelectorAll('.turn-process-body').forEach((n) => n.remove())
+      clone.querySelectorAll('.author').forEach((n) => n.remove())
+      return (clone.textContent ?? '').trim()
+    }).filter((s) => s !== '').join('|')
+  }
+
+  it('⭐ 进行中（有流式块）：中间段正文折叠，只有最后一段留在正文区', () => {
+    // 用户 2026-11-02 裁定：执行中也折叠旁白 ⇒ 一轮恒定一个 nexus 头。
+    const msgs = [
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', {
+        content: '设计确认。开始实施。', reasoning: '想一想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      baseMsg('a2', 'assistant', {
+        content: '我先看一下现有结构。', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+    ]
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-live', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-live'] },
+    })
+    renderList(msgs)
+    const text = bodyText()
+    // 最后一段（a2）留在正文区；前面段（a1）收进折叠区
+    expect(text, '进行中：最后一段正文可见').toContain('我先看一下现有结构。')
+    expect(text, '进行中：中间段正文应收起（否则同轮多头）').not.toContain('设计确认。开始实施。')
+    // 且过程信息没丢 —— 折叠区里仍能展开看到
+    expect(container.querySelector('.turn-process-toggle'), '应出现「正在执行」折叠开关').not.toBeNull()
+  })
+
+  it('⭐ 结束后（无流式块）：非最终段收进折叠区，只留最后正文', () => {
+    // ⚠️ 必须显式清空：上一条用例留下的流式块会让本轮被判成「进行中」→ 不折叠
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', {
+        content: '设计确认。开始实施。', reasoning: '想一想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      baseMsg('a2', 'assistant', {
+        content: '我先看一下现有结构。', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      finalMsg('a3', 'u1'),
+    ])
+    const text = bodyText()
+    expect(text).toContain('最终答复-a3')
+    expect(text, '结束后：中间段正文应收起').not.toContain('设计确认。开始实施。')
+    expect(text, '结束后：无工具调用的碎句同样收起').not.toContain('我先看一下现有结构。')
+  })
+
+  it('结束后展开折叠区：中间段全部可见（数据没丢）', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      baseMsg('a1', 'assistant', {
+        content: '设计确认。开始实施。', reasoning: '想一想', finishReason: 'tool_calls', userMessageId: 'u1',
+      }),
+      finalMsg('a2', 'u1'),
+    ])
+    expect(container.textContent).not.toContain('设计确认')
+    act(() => { toggles()[0]!.click() })
+    expect(container.textContent).toContain('设计确认。开始实施。')
+  })
+})
+
+describe('[2026-11-01 方案 3] 正在执行指示器', () => {
+  const runningToggle = () => container.querySelector<HTMLButtonElement>('.turn-process-toggle.running')
+
+  it('⭐ 进行中：状态行显示「正在执行」+ 波浪点 + 动态时长 + 扫光条', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-run', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-run'] },
+    })
+    renderList([
+      userMsg('u1', new Date(Date.now() - 7 * 60 * 1000).toISOString()),
+      intermediateMsg('a1', 'u1'),
+    ])
+    const t = runningToggle()
+    expect(t, '进行中应有 .running 状态行').not.toBeNull()
+    expect(t!.textContent).toContain('正在执行')
+    expect(t!.textContent).not.toContain('已完成')
+    expect(t!.querySelectorAll('.wave-dots i'), '波浪点 3 个').toHaveLength(3)
+    // 动态时长：起点是 7 分钟前 ⇒ 应显示 7m 左右（允许 1 分钟误差）
+    expect(t!.textContent).toMatch(/·\s*7m/)
+    expect(container.querySelector('.exec-scan-line'), '进行中必须有扫光条').not.toBeNull()
+  })
+
+  it('⭐⭐ 进行中也能收起：收起后只剩状态行 + 扫光条，无思考/工具/正文', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-run2', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-run2'] },
+    })
+    renderList([
+      userMsg('u1', new Date(Date.now() - 60000).toISOString()),
+      intermediateMsg('a1', 'u1'),
+    ])
+    // 默认展开：思考块 + 工具卡都在
+    expect(container.querySelectorAll('.tool-card').length).toBeGreaterThan(0)
+    act(() => { runningToggle()!.click() })
+    // 收起后：状态行与扫光条仍在，过程内容消失
+    expect(runningToggle(), '收起不等于停止 —— 状态行必须还在').not.toBeNull()
+    expect(container.querySelector('.exec-scan-line'), '收起后扫光条必须还在（一眼看出还在跑）').not.toBeNull()
+    expect(container.querySelectorAll('.tool-card'), '收起后工具卡应消失').toHaveLength(0)
+    expect(container.querySelector('.turn-process-body'), '收起后折叠区应消失').toBeNull()
+  })
+
+  it('⭐⭐ 一轮多段 assistant：扫光条**只能有一条**（用户实测「每个 assistant 都有一个」）', () => {
+    // WHY: 扫光条属于「本轮状态」，不属于任何单个 assistant 段。
+    //   上一版用 `isRunningTurn` 当条件 —— 那个对该轮每一行都成立 ⇒ 每段各画一条。
+    //   变异点：条件改回 isRunningTurn（不带 showProcessHeader）→ 本用例红。
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-multi', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-multi'] },
+    })
+    renderList([
+      userMsg('u1', new Date(Date.now() - 60000).toISOString()),
+      intermediateMsg('a1', 'u1'),
+      intermediateMsg('a2', 'u1'),
+      finalMsg('a3', 'u1'),
+    ])
+    expect(container.querySelectorAll('.exec-scan-line'), '扫光条必须一轮只有一条').toHaveLength(1)
+    expect(container.querySelectorAll('.turn-process-toggle.running'), '状态行也只能有一条').toHaveLength(1)
+  })
+
+  it('结束后：切回「已完成」，扫光条消失', () => {
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    renderList([
+      userMsg('u1', '2026-10-28T10:00:00Z'),
+      intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
+      finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
+    ])
+    expect(runningToggle(), '结束后不该再有 .running').toBeNull()
+    expect(container.querySelector('.exec-scan-line'), '结束后扫光条应消失').toBeNull()
+    expect(container.textContent).toContain('已完成')
   })
 })

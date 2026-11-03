@@ -58,6 +58,8 @@ describe('[历史提问跳转] 定位 + 高亮', () => {
     Object.defineProperty(HTMLElement.prototype, 'scrollIntoView', { value: scrollSpy, configurable: true, writable: true })
     useChatStore.setState({
       messages: {}, streams: {}, streamOrder: {}, streamTicks: {}, snippedIds: {}, apiErrors: {},
+      // [折叠 = 真删] 新增字段，不重置会跨用例泄漏（表现为「目标不在窗口」）
+      foldedTurnCounts: {},
       changedFiles: {}, hasMore: {}, liveSeq: {},
     })
   })

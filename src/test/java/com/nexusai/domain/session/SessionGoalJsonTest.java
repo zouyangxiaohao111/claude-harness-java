@@ -1,0 +1,165 @@
+package com.nexusai.domain.session;
+
+import org.junit.jupiter.api.DisplayName;
+import org.junit.jupiter.api.Test;
+
+import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
+
+/**
+ * [goal V253] SessionGoal JSON 往返 + fail-soft 降级测试。
+ *
+ * <p>WHY: {@code sessions.goal} 列是「当前快照」的唯一真源（恢复时读它而不是反推
+ * transcript —— 压缩会剪掉旧的 goal attachment，反推会丢目标）。
+ * ⇒ 往返必须无损、坏数据必须降级为「无目标」而不是抛异常。
+ */
+@DisplayName("[goal V253] SessionGoal JSON 往返与降级")
+class SessionGoalJsonTest {
+
+    // ════════════════════════════════════════════════════════════════════
+    // 往返
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("往返：6 字段全部无损")
+    void roundTrip_allFields() {
+        SessionGoal g = new SessionGoal(
+            "e2e/login.spec.ts 全部通过，且不修改测试断言",
+            SessionGoal.Phase.ACTIVE, 2, 1762300000000L, 145320L,
+            "尚未满足 — transcript 里只有单测通过");
+
+        String json = SessionGoal.toJson(g);
+        SessionGoal back = SessionGoal.fromJson(json);
+
+        assertThat(back).isNotNull();
+        assertThat(back.condition()).isEqualTo(g.condition());
+        assertThat(back.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+        assertThat(back.iterations()).isEqualTo(2);
+        assertThat(back.setAt()).isEqualTo(1762300000000L);
+        assertThat(back.tokensAtStart()).isEqualTo(145320L);
+        assertThat(back.lastReason()).isEqualTo(g.lastReason());
+    }
+
+    @Test
+    @DisplayName("往返：lastReason 为 null 时不写该键（对齐 CC undefined 省略）")
+    void roundTrip_nullReason_omitsKey() {
+        SessionGoal g = new SessionGoal("cond", SessionGoal.Phase.ACTIVE, 0, 1L, 2L, null);
+        String json = SessionGoal.toJson(g);
+        assertThat(json).doesNotContain("lastReason");
+
+        SessionGoal back = SessionGoal.fromJson(json);
+        assertThat(back).isNotNull();
+        assertThat(back.lastReason()).isNull();
+    }
+
+    @Test
+    @DisplayName("三态 phase 均可往返")
+    void roundTrip_allPhases() {
+        for (SessionGoal.Phase p : SessionGoal.Phase.values()) {
+            SessionGoal back = SessionGoal.fromJson(
+                SessionGoal.toJson(new SessionGoal("c", p, 1, 1L, 1L, "r")));
+            assertThat(back).as("phase=%s 往返", p).isNotNull();
+            assertThat(back.phase()).isEqualTo(p);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // fail-soft 降级（对齐 SessionService.getDisabledTools / TodoWriteTool.todosJsonToMap）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("降级：null / 空白 / 非对象 / 坏 JSON → null（= 无目标），不抛")
+    void fromJson_invalid_returnsNull() {
+        assertThat(SessionGoal.fromJson(null)).isNull();
+        assertThat(SessionGoal.fromJson("")).isNull();
+        assertThat(SessionGoal.fromJson("   ")).isNull();
+        assertThat(SessionGoal.fromJson("not json at all")).isNull();
+        assertThat(SessionGoal.fromJson("[1,2,3]")).isNull();
+        assertThat(SessionGoal.fromJson("42")).isNull();
+    }
+
+    @Test
+    @DisplayName("降级：缺 condition → null")
+    void fromJson_missingCondition_returnsNull() {
+        assertThat(SessionGoal.fromJson("{\"phase\":\"active\",\"iterations\":1}")).isNull();
+        assertThat(SessionGoal.fromJson("{\"condition\":\"\",\"phase\":\"active\"}")).isNull();
+        assertThat(SessionGoal.fromJson("{\"condition\":\"   \"}")).isNull();
+    }
+
+    @Test
+    @DisplayName("降级：缺 phase 视为 ACTIVE；缺计数取默认值")
+    void fromJson_missingFields_defaults() {
+        SessionGoal g = SessionGoal.fromJson("{\"condition\":\"c\"}");
+        assertThat(g).isNotNull();
+        assertThat(g.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+        assertThat(g.iterations()).isZero();
+        assertThat(g.setAt()).isZero();
+        assertThat(g.tokensAtStart()).isZero();
+        assertThat(g.lastReason()).isNull();
+    }
+
+    @Test
+    @DisplayName("降级：未知 phase → ACTIVE（fail-soft，不抛）")
+    void fromJson_unknownPhase_fallsBackToActive() {
+        SessionGoal g = SessionGoal.fromJson("{\"condition\":\"c\",\"phase\":\"paused\"}");
+        assertThat(g).isNotNull();
+        assertThat(g.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 构造与不变式
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("构造：空 condition 拒绝（非法目标不该落库）")
+    void constructor_blankCondition_throws() {
+        assertThatThrownBy(() -> new SessionGoal(null, SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null))
+            .isInstanceOf(IllegalArgumentException.class);
+        assertThatThrownBy(() -> new SessionGoal("  ", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null))
+            .isInstanceOf(IllegalArgumentException.class);
+    }
+
+    @Test
+    @DisplayName("构造：负 iterations 归零；null phase 归 ACTIVE")
+    void constructor_normalizes() {
+        SessionGoal g = new SessionGoal("c", null, -5, 0L, 0L, null);
+        assertThat(g.iterations()).isZero();
+        assertThat(g.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+    }
+
+    @Test
+    @DisplayName("上限常量 = 4000（对齐 CC bor=4000）")
+    void maxConditionLength_is4000() {
+        assertThat(SessionGoal.MAX_CONDITION_LENGTH).isEqualTo(4000);
+    }
+
+    @Test
+    @DisplayName("toJson(null) → null（列存 null = 无目标）")
+    void toJson_null_returnsNull() {
+        assertThat(SessionGoal.toJson(null)).isNull();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // wither
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("wither：withReason / withPhase / withIterations 只改目标字段")
+    void withers_changeOnlyTargetField() {
+        SessionGoal g = new SessionGoal("c", SessionGoal.Phase.ACTIVE, 1, 10L, 20L, "old");
+        assertThat(g.withReason("new").lastReason()).isEqualTo("new");
+        assertThat(g.withReason("new").condition()).isEqualTo("c");
+        assertThat(g.withPhase(SessionGoal.Phase.IMPOSSIBLE).phase())
+            .isEqualTo(SessionGoal.Phase.IMPOSSIBLE);
+        assertThat(g.withIterations(5).iterations()).isEqualTo(5);
+        assertThat(g.withIterations(5).setAt()).isEqualTo(10L);
+    }
+
+    @Test
+    @DisplayName("isActive：仅 ACTIVE 为真")
+    void isActive_onlyForActive() {
+        assertThat(new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null).isActive()).isTrue();
+        assertThat(new SessionGoal("c", SessionGoal.Phase.ACHIEVED, 0, 0L, 0L, null).isActive()).isFalse();
+        assertThat(new SessionGoal("c", SessionGoal.Phase.IMPOSSIBLE, 0, 0L, 0L, null).isActive()).isFalse();
+    }
+}

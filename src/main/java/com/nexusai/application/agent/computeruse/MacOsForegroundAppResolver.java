@@ -6,6 +6,8 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+
 /**
  * macOS 前台应用解析器（JXA + NSWorkspace）· computer-use 的档位门控数据源。
  *
@@ -52,23 +54,45 @@ public final class MacOsForegroundAppResolver implements ComputerUseForegroundAp
 
     @Override
     public String currentAppId() {
+        List<String> aliases = currentAppAliases();
+        return aliases.isEmpty() ? null : aliases.get(0);
+    }
+
+    /**
+     * 前台应用的<b>全部授权键别名</b>：{@code [bundleId 归一, displayName 归一]}（去重、去空）。
+     *
+     * <h2>WHY 必须两个都给</h2>
+     * <p>macOS 的显示名<b>随系统语言变化</b>（中文系统 {@code Finder} ⇒ 「访达」），而 bundle id
+     * 是稳定的。授权时模型可能给英文名（{@code Finder}）、bundle id、或本地化名，三种都该认。
+     * <br>只按 displayName 匹配是本仓旧实现的缺陷：实测授权 {@code Finder} 后，中文系统前台
+     * 报「访达」⇒ 精确匹配必然 miss ⇒ 所有输入动作被误拦。
+     * <p>⇒ 门控（{@link ComputerUseInputGate}）按「命中任一别名即授权」判定。
+     *
+     * @return 别名列表；取不到前台应用 ⇒ 空列表（调用方放行）
+     */
+    @Override
+    public List<String> currentAppAliases() {
         try {
             String raw = MacOsExec.jxa(runner, MacOsJxa.frontmostApplication());
             JsonNode node = JSON.readTree(raw);
             if (node == null || !node.isObject()) {
-                return null;
+                return List.of();
             }
-            String displayName = node.path("displayName").asText("");
-            if (displayName.isBlank()) {
-                // 显示名取不到 ⇒ 退回 bundle id（同样是稳定标识）
-                String bundleId = node.path("bundleId").asText("");
-                return bundleId.isBlank() ? null : ComputerUseAppPolicy.normalizeAppKey(bundleId);
+            // LinkedHashSet：保序（bundleId 在前 = currentAppId() 返回稳定键）+ 去重
+            java.util.Set<String> aliases = new java.util.LinkedHashSet<>();
+            String bundleId = ComputerUseAppPolicy.normalizeAppKey(node.path("bundleId").asText(""));
+            if (!bundleId.isBlank()) {
+                aliases.add(bundleId);
             }
-            return ComputerUseAppPolicy.normalizeAppKey(displayName);
+            String displayName = ComputerUseAppPolicy.normalizeAppKey(node.path("displayName").asText(""));
+            if (!displayName.isBlank()) {
+                aliases.add(displayName);
+            }
+            return List.copyOf(aliases);
         } catch (Throwable t) {
-            // 取不到前台应用 ⇒ 按 CCB toolCalls.ts:502-506 的语义放行（返回 null）
+            // 取不到前台应用 ⇒ 按 CCB toolCalls.ts:502-506 的语义放行（返回空）
             log.warn("[computer-use] 取 macOS 前台应用失败（按 CCB 语义放行）: {}", t.toString());
-            return null;
+            return List.of();
         }
     }
 }

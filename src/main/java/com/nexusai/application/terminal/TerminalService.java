@@ -163,10 +163,14 @@ public class TerminalService {
                 // 但显式设置可避免 pty4j 在部分平台给出 null 的 getErrorStream）。
                 .setRedirectErrorStream(true)
                 .start();
-        } catch (Exception e) {
+        } catch (Exception | LinkageError e) {
+            // ⛔ 必须连 LinkageError 一起接：`NoClassDefFoundError` / `ExceptionInInitializerError`
+            //   是 **Error 不是 Exception** ⇒ 只 catch Exception 会让它裸奔到容器层
+            //   （用户侧看到的是 `ServletException: Handler dispatch failed: java.lang.NoClassDefFoundError…`
+            //   一坨栈，且完全看不出真因）。
             log.error("[TerminalService] 终端启动失败: session={} shell={} cwd={} err={}",
                 sessionId, resolvedShell, cwd, e.toString());
-            throw new IllegalStateException("终端启动失败: " + e.getMessage(), e);
+            throw new IllegalStateException(describePtyStartFailure(e), e);
         }
 
         TerminalSession session = new TerminalSession(sessionId, terminalId, resolvedShell, cwd, c, r,
@@ -176,6 +180,37 @@ public class TerminalService {
         log.info("[TerminalService] 创建终端: session={} terminal={} shell={} cwd={} size={}x{} pid={}",
             sessionId, terminalId, resolvedShell, cwd, c, r, safePid(process));
         return session.info();
+    }
+
+    /**
+     * PTY 启动失败的可读描述（把「原生库加载失败」翻译成「哪个平台的哪条路径缺什么」）。
+     *
+     * <p><b>WHY 要单独分一类</b>：Unix 上 pty4j 要从 jar 里解出原生库
+     * （{@code resources/com/pty4j/native/darwin/{libpty.dylib,pty4j-unix-spawn-helper}}）
+     * 再 {@code dlopen}/exec 它。这一步失败抛的是 {@link LinkageError}（{@code UnsatisfiedLinkError}
+     * / {@code ExceptionInInitializerError}），消息里只有一句 {@code Native library ... cannot be loaded}
+     * 或 {@code Could not initialize class com.pty4j.util.ExtractedNative} —— 用户完全看不出
+     * 「是原生库没落地，不是 shell 配错了」。Windows 走 winpty/ConPTY 的 dll+exe，同样可能踩到。
+     *
+     * <p>⛔ 这里只做「如实转述 + 指出缺什么」，不静默吞异常，也不假装能修。
+     *
+     * @param e 启动异常（Exception 或 LinkageError）
+     * @return 面向用户的中文描述
+     */
+    private static String describePtyStartFailure(Throwable e) {
+        for (Throwable t = e; t != null; t = t.getCause()) {
+            String msg = t.getMessage() == null ? "" : t.getMessage();
+            if (t instanceof UnsatisfiedLinkError
+                || msg.contains("Native library")
+                || msg.contains("ExtractedNative")
+                || msg.contains("PtyHelpers")) {
+                return "终端启动失败：PTY 原生库加载失败（当前平台的 "
+                    + System.getProperty("os.name") + "/" + System.getProperty("os.arch")
+                    + " 不受支持，或原生库被拦截）。原始错误：" + msg;
+            }
+        }
+        String msg = e.getMessage();
+        return "终端启动失败: " + (msg == null ? e.toString() : msg);
     }
 
     // ───────────────────────── 能力查询 ─────────────────────────

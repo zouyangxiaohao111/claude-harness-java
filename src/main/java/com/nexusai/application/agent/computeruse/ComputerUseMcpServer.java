@@ -376,9 +376,23 @@ public final class ComputerUseMcpServer implements McpServerToolProvider {
         Object data = result == null ? null : result.data();
         List<Map<String, Object>> content = new ArrayList<>();
         if (data instanceof ComputerUseScreenshotResult shot) {
-            // 截图：只发 image content block；几何元数据留在会话级 store（不进 wire）
+            // 截图：发 image content block；几何元数据留在会话级 store（不进 wire）
             for (ComputerUseMcpContent item : shot.content()) {
                 content.add(toWireContent(item));
+            }
+            // ⭐ 附一条 text 说明「图上像素 → 点击坐标」的换算因子（对齐 dsh 截图 Artifact 的 pixelScale）
+            //   dsh 的原文理由（service.ts:98-103）：截图按窗口 backing scale 拍（Retina 2 倍），
+            //   而点击坐标是「点」⇒ 从图上读到的像素必须除以 pixelScale，否则会落在两倍偏移处。
+            //   ⛔ 之前本仓只发图、不发这个因子 ⇒ 模型只能盲猜坐标（这就是「视觉闭环断」的另一半原因）。
+            String pixelNote = shot.pixelScaleOrZero() > 0
+                    ? "Screenshot is " + shot.imageWidth() + "x" + shot.imageHeight()
+                            + " px for a " + shot.displayWidth() + "x" + shot.displayHeight()
+                            + " px display area. pixelScale=" + shot.pixelScaleOrZero()
+                            + " (divide a pixel coordinate read off this image by pixelScale to get"
+                            + " the click coordinate)."
+                    : null;
+            if (pixelNote != null) {
+                content.add(Map.of("type", "text", "text", pixelNote));
             }
         } else if (data instanceof ComputerUseMcpContent item) {
             content.add(toWireContent(item));

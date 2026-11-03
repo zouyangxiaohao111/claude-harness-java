@@ -407,6 +407,46 @@ public record AttachmentMessageDto(
     }
 
     /**
+     * [goal V253] goal_status attachment 工厂 · 对齐 CC claude.exe v2.1.212 的
+     * {@code a7u()}（{@code {type:'goal_status', met, sentinel, condition}}）。
+     *
+     * <p><b>WHY 用 structuredData 承载载荷而不加 record 字段</b>：本 record 是 55 分量
+     * record、7 个构造器、跨 26 个文件 ⇒ 加字段会让全部构造点编译失败（实测踩过）。
+     * 复用已有的 {@code structuredData}（Map）分量 + 8 参构造器 ⇒ <b>零 record 改动</b>。
+     *
+     * <p><b>语义分工</b>（与 CC 同构）：
+     * <ul>
+     *   <li>{@code sessions.goal} 列 = <b>当前状态</b>（恢复时读它，反推 transcript 会被压缩剪掉）</li>
+     *   <li>messages 里的 goal_status attachment = <b>历史记录</b>（transcript append-only）</li>
+     * </ul>
+     *
+     * @param condition 目标条件原文
+     * @param met       是否达成（false = 未达成；sentinel 行传 false）
+     * @param sentinel  是否为 sentinel（设定 / 清除的标记行，非评估结果）
+     * @param reason    评估器给出的 reason（可 null）
+     * @param iterations 已评估轮数（可 null）
+     */
+    public static AttachmentMessageDto goalStatus(String condition, boolean met, boolean sentinel,
+                                                  String reason, Integer iterations) {
+        Map<String, Object> data = new java.util.LinkedHashMap<>();
+        data.put("condition", condition == null ? "" : condition);
+        data.put("met", met);
+        data.put("sentinel", sentinel);
+        if (reason != null && !reason.isBlank()) {
+            data.put("reason", reason);
+        }
+        if (iterations != null) {
+            data.put("iterations", iterations);
+        }
+        String content = sentinel
+            ? (met ? "Goal cleared" : "Goal set: " + condition)
+            : (met ? "Goal achieved" : "Goal not met");
+        return new AttachmentMessageDto(
+            null, "attachment", "goal_status", content,
+            null, null, null, data);
+    }
+
+    /**
      * output_token_usage attachment 工厂 · 对齐 CC {@code getOutputTokenUsageAttachment()}
      * (utils/attachments.ts:3828-3844) 载荷 {@code {type:'output_token_usage', turn, session, budget}}。
      *

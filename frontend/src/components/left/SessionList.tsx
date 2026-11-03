@@ -140,35 +140,11 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     setExpandedGroups((prev) => (prev.has(activeGroupKey) ? prev : new Set(prev).add(activeGroupKey)))
   }, [groupsDefaultCollapsed, flatHistory, activeGroupKey, activeSession])
 
-  // [对齐 deepseek-harness] 收起 = 窄 rail（不消失）：始终能再展开
+  // [2026-11-01 用户二次裁定] 收起 = **完全隐藏**（不是窄 rail）。
+  //   展开入口已移到顶栏红绿灯右侧（TitleBar 的 .topbar-side-toggle）⇒ 这里不再渲染任何东西：
+  //   此前保留的 `+` / 定时任务 / 技能市场 / 知识库 四个按钮在 0 宽列里仍会露出一半（用户实测「左边还有 + 等残留」）。
   if (collapsed) {
-    return (
-      <div className={`left left-rail-collapsed${workspaceRedesign ? ' left-workspace' : ''}`}>
-        <button className="rail-collapse-btn rail-expand" title="展开会话栏" aria-label="展开会话栏" onClick={onToggleCollapse}>
-          {/* 折叠态也用面板图标（不再用 ">" 箭头）：图标本身就是「侧栏」语义，
-              折叠前后形状一致，用户不用重新认一遍。 */}
-          <svg viewBox="0 0 16 14" fill="none" width="18" height="16">
-            <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
-            <line x1="6" y1="1.4" x2="6" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
-          </svg>
-        </button>
-        <button className="new-session-btn rail-new" title="新建会话" onClick={() => onCreateSession?.()}><PlusIcon size={13} /></button>
-        {/* 改版收起态：保留导航图标（定时任务 / 技能市场 / 知识库） */}
-        {workspaceRedesign && (
-          <div className="rail-nav">
-            <button className="rail-nav-btn" title="定时任务" aria-label="定时任务" onClick={() => onOpenSchedules?.()}>
-              <svg viewBox="0 0 24 24" className="i" fill="none" stroke="currentColor" strokeWidth="1.6"><circle cx="12" cy="12" r="8.4" /><path d="M12 7v5l3 2" strokeLinecap="round" /></svg>
-            </button>
-            <button className="rail-nav-btn" title="技能市场" aria-label="技能市场" onClick={() => onOpenAgentMarket?.()}>
-              <svg viewBox="0 0 24 24" className="i" fill="none" stroke="currentColor" strokeWidth="1.6"><path d="M4 20L15 9" strokeLinecap="round" /><path d="M14 4l1 2.6L17.6 8 15 9l-1 2.6L13 9l-2.6-1L13 6.4 14 4z" strokeLinejoin="round" /></svg>
-            </button>
-            <button className="rail-nav-btn" title="知识库" aria-label="知识库" onClick={() => onOpenKnowledgeBase?.()}>
-              <svg viewBox="0 0 24 24" className="i" fill="none" stroke="currentColor" strokeWidth="1.6"><ellipse cx="12" cy="5.8" rx="7.5" ry="3" /><path d="M4.5 5.8v12.4c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3V5.8" /><path d="M4.5 12c0 1.7 3.4 3 7.5 3s7.5-1.3 7.5-3" /></svg>
-            </button>
-          </div>
-        )}
-      </div>
-    )
+    return null
   }
 
   // 按 mainProjectId 分组；flatHistory 下全部归入单一隐式组 ⇒ 平铺、无分组标题。

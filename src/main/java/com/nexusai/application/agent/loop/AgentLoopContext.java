@@ -194,8 +194,32 @@ public record AgentLoopContext(
         // [G1 接线] auto 压缩器 · 同 microCompactor。接线后 loop 内 rcOwnsBlocking /
         //   collapseOwnsBlocking 的 `autoCompactor != null` 生产恒真 ⇒ 与 CC query.ts:633 的全局
         //   isAutoCompactEnabled() 行为等价（子代理不再被 blocking 预检硬退）。测试路径仍 null ⇒ 保持 null-safe。
-        AutoCompactor autoCompactor
+        AutoCompactor autoCompactor,
+        // [goal V253] 目标（/goal）服务 · 对齐 CC claude.exe v2.1.212 的 goal 机制。
+        //   loop() 是 static 方法，拿不到 LlmAgentLoop 的实例字段 ⇒ 经 ctx 传递。
+        //
+        //   <p><b>WHY 存 ObjectProvider 而不是实例</b>：GoalService 依赖 SessionService，
+        //   而 SessionService → ChatService → … → AgentLoopContextFactory → 本 record
+        //   ⇒ 直接持实例会形成 Spring 启动期循环依赖
+        //   （「Relying upon circular references is discouraged and they are prohibited by default」）。
+        //   ⇒ 存 provider，运行时 getIfAvailable() 懒解析。
+        //   可空：未接线 / 单测 → null ⇒ 目标机制整体不生效（老路径行为不变）。
+        org.springframework.beans.factory.ObjectProvider<com.nexusai.application.agent.goal.GoalService> goalServiceProvider,
+        // [goal V253] 任务框架服务 · 「该会话是否还有未完成后台工作」的探针
+        //   （TaskFrameworkService.hasPendingBackgroundWork）。同款懒解析理由（它在同一条深链上）。
+        //   可空：未接线 → 跳过门控（等价「无后台工作」，评估照常进行）。
+        org.springframework.beans.factory.ObjectProvider<com.nexusai.application.agent.tasks.TaskFrameworkService> taskFrameworkServiceProvider
 ) {
+
+    /** [goal V253] 目标服务（懒解析；未接线 → null ⇒ 目标机制不生效）。 */
+    public com.nexusai.application.agent.goal.GoalService goalService() {
+        return goalServiceProvider == null ? null : goalServiceProvider.getIfAvailable();
+    }
+
+    /** [goal V253] 任务框架服务（懒解析；未接线 → null ⇒ 跳过后台门控）。 */
+    public com.nexusai.application.agent.tasks.TaskFrameworkService taskFrameworkService() {
+        return taskFrameworkServiceProvider == null ? null : taskFrameworkServiceProvider.getIfAvailable();
+    }
     private static final Logger log = LoggerFactory.getLogger(AgentLoopContext.class);
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -275,7 +299,73 @@ public record AgentLoopContext(
             null, // queueEventPublisher（32 参 compat 不传 → null · 非 Spring fallback 跳过排队事件出站）
             null, // modelCostCalculator（32 参 compat 不传 → null · 非 Spring 单测跳过计费累计）
             null, // [G1] microCompactor（32 参 compat 不传 → null · 无压缩器，行为同接线前）
-            null); // [G1] autoCompactor（32 参 compat 不传 → null · 无压缩器，行为同接线前）
+            null, // [G1] autoCompactor（32 参 compat 不传 → null · 无压缩器，行为同接线前）
+            null, // [goal V253] goalServiceProvider（compat 不传 → null · 目标机制不生效）
+            null); // [goal V253] taskFrameworkServiceProvider（compat 不传 → null · 跳过后台门控）
+    }
+
+    /**
+     * [goal V253] 35 参兼容构造器 · 承接「加了 goalService / taskFrameworkService 之前」的
+     * canonical 调用形态（goalService / taskFrameworkService 默认 null）。
+     *
+     * <p>WHY 需要它：{@code AgentLoopContext} 是 record，全仓 **55 处构造点 / 48 个文件**
+     * （生产 2 + 测试 53）。直接加字段会让这 55 处全部编译失败 ⇒ 用转发构造器承接，
+     * 既有调用点零改动（与 {@code GenericHook.HookResult} 的 18 参转发构造器同款做法）。
+     */
+    public AgentLoopContext(
+            ToolRegistry toolRegistry,
+            HookRegistry hookRegistry,
+            McpServerService mcpServerService,
+            NotificationQueue notificationQueue,
+            CommandLifecycleNotifier commandLifecycleNotifier,
+            SkillCatalog skillCatalog,
+            MemoryPrefetcher memoryPrefetcher,
+            MemoryStorage memoryStorage,
+            TokenBudgetChecker tokenBudgetChecker,
+            QueryConfig queryConfig,
+            LlmProviderFactory llmProviderFactory,
+            TransientErrorHandler transientErrorHandler,
+            MaxTokensHandler maxTokensHandler,
+            ExtractMemoriesAgent extractMemoriesAgent,
+            AutoDreamConsolidator autoDreamConsolidator,
+            SimpMessagingTemplate wsTemplate,
+            String streamTopic,
+            String streamSessionId,
+            String streamUserMessageId,
+            FeatureFlags featureFlags,
+            ReactiveCompactor reactiveCompactor,
+            ContextCollapse contextCollapse,
+            SkillDiscoveryPrefetch skillDiscoveryPrefetch,
+            SkillSearchPrefetch skillSearchPrefetch,
+            ToolUseSummaryGenerator toolUseSummaryGenerator,
+            ToolExecutionBeans toolExecutionBeans,
+            TokenBudgetBeans tokenBudgetBeans,
+            EventBridge eventBridge,
+            PermissionContextBuilder permissionContextBuilder,
+            PromptSuggestion promptSuggestion,
+            LoopSessionState sessionState,
+            com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine,
+            com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver,
+            SdkEventQueue sdkEventQueue,
+            QueueEventPublisher queueEventPublisher,
+            com.nexusai.application.agent.cost.ModelCostCalculator modelCostCalculator,
+            MicroCompactor microCompactor,
+            AutoCompactor autoCompactor) {
+        this(toolRegistry, hookRegistry, mcpServerService,
+            notificationQueue, commandLifecycleNotifier,
+            skillCatalog, memoryPrefetcher, memoryStorage, tokenBudgetChecker,
+            queryConfig, llmProviderFactory,
+            transientErrorHandler, maxTokensHandler,
+            extractMemoriesAgent, autoDreamConsolidator, wsTemplate, streamTopic,
+            streamSessionId, streamUserMessageId,
+            featureFlags, reactiveCompactor, contextCollapse, skillDiscoveryPrefetch,
+            skillSearchPrefetch, toolUseSummaryGenerator,
+            toolExecutionBeans, tokenBudgetBeans, eventBridge, permissionContextBuilder,
+            promptSuggestion, sessionState, claudemdEngine,
+            modelConfigResolver, sdkEventQueue, queueEventPublisher,
+            modelCostCalculator, microCompactor, autoCompactor,
+            null, // [goal V253] goalServiceProvider（35 参 compat 不传 → null）
+            null); // [goal V253] taskFrameworkServiceProvider（35 参 compat 不传 → null）
     }
     // [IMP-15] max_output_tokens 接线 · 对齐 CC claude.ts getMaxOutputTokensForModel + query.ts max_output_tokens_escalate
     // ════════════════════════════════════════════════════════════════════
@@ -2125,7 +2215,10 @@ public record AgentLoopContext(
         //   计时值由外层 run() 算好经 handleToolCallsTurn 第 15 参传入（null = 无 reasoning）。
         com.nexusai.model.session.dto.ChatMessageDto assistantToolCallsMsg =
             LlmAgentLoop.assistantMessageWithToolCalls(
-                assistantText, toolCallDtos, msg.reasoning(), turnAssistantId)
+                // [2026-11-01 可观测性] 传真实 sessionId —— 此前硬编码 null ⇒ 下游
+                //   ToolResultPairingRepair 告警打 session=null，运维无法定位会话（纯字段补充，
+                //   不参与任何判定：配对逻辑不读 sessionId）。
+                assistantText, toolCallDtos, msg.reasoning(), turnAssistantId, state.sessionId())
                 .withUsage(msg.usage())
                 // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
                 .withUsageCache(

@@ -36,3 +36,29 @@ export function formatFileSize(sizeInBytes: number): string {
   const gb = mb / 1024
   return `${gb.toFixed(1).replace(/\.0$/, '')}GB`
 }
+
+/**
+ * 市场统计数字显示（使用量 / 下载量）· **万为单位，后缀 `w`**。
+ *
+ * <p>用户 2026-11-01 拍板：与参考图一致用 `w`，不用「万」/「k」。
+ * 例：6156400 → `615.64w`；42500 → `4.25w`；9999 → `9999`（< 1 万不换算）。
+ *
+ * <p><b>⚠️ 与 {@link compactNumber} 分开的两个理由</b>：
+ * <ol>
+ *   <li>单位不同 —— compactNumber 走 k/m（token 计数的国际惯例），
+ *       市场统计走中文用户习惯的「万」；两者混用会出现「1.5m 次使用」这种看不懂的写法。</li>
+ *   <li>精度不同 —— token 计数保留 1 位小数即可（1.3k），统计量级大且要显得精确，保留 2 位。</li>
+ * </ol>
+ *
+ * <p><b>入参契约</b>：后端下发<b>原始整数</b>（如 6156400），绝不传「615.64w」这种展示串。
+ * 传 null/undefined → 返回 null，调用方据此<b>整项不渲染</b>
+ * （⛔ 不是渲染 0 —— 「无数据」与「0 次使用」是两回事）。
+ */
+export function formatCountW(n: number | null | undefined): string | null {
+  if (n === null || n === undefined || !Number.isFinite(n)) return null
+  const abs = Math.abs(n)
+  if (abs < 10_000) return String(Math.round(n))
+  const w = n / 10_000
+  // 两位小数并去掉尾随 0：615.64w / 4.25w / 12w（12.00 → 12）
+  return `${w.toFixed(2).replace(/\.?0+$/, '')}w`
+}

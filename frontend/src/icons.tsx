@@ -29,6 +29,7 @@ function makeIcon(
   children: React.ReactNode,
   defaultSize: number,
   defaultViewBox = '0 0 14 14',
+  defaultStrokeWidth = 1.5,
 ) {
   const Comp = ({ size, className, style }: IconProps) => {
     const finalSize = size ?? defaultSize
@@ -39,7 +40,7 @@ function makeIcon(
         viewBox={defaultViewBox}
         fill="none"
         stroke="currentColor"
-        strokeWidth={1.5}
+        strokeWidth={defaultStrokeWidth}
         className={className ? `svg-icon ${className}` : 'svg-icon'}
         style={style}
       >
@@ -198,6 +199,41 @@ export const Icon = {
 
   /** 12x12 two vertical bars — diff side-by-side toggle. */
   Bars: makeIcon(<path d="M1 1H5V11H1ZM7 1H11V11H7Z" />, 12, '0 0 12 12'),
+
+  /**
+   * 24x24 描边铅笔 · 「编辑」动作。
+   *
+   * <p><b>为什么是 24 视框</b>：此前的「编辑」图标是 14×14 视框里画的<b>实心四边形</b>
+   * （<code>M9 2L12 5L5 12H2V9L9 2Z</code>），缩到 12px 后笔尖糊成一团，认不出是铅笔。
+   * 24 视框的 Lucide 路径缩到 15px 时有效描边约 1.4px —— 轮廓清晰、笔尖可辨。
+   */
+  Edit: makeIcon(
+    <>
+      <path d="M12 20h9" />
+      <path d="M16.5 3.5a2.12 2.12 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z" />
+    </>,
+    15,
+    '0 0 24 24',
+    1.8,
+  ),
+
+  /**
+   * 24x24 描边垃圾桶 · 「删除 / 移除」动作。
+   *
+   * <p>与 {@link Icon.Edit} 同族（24 视框 / 1.8 描边），两者视觉重量一致；
+   * 配合 CSS 的 hover 语义色（编辑=蓝、删除=红）区分危险性。
+   */
+  Trash: makeIcon(
+    <>
+      <path d="M3 6h18" />
+      <path d="M8 6V4a1 1 0 0 1 1-1h6a1 1 0 0 1 1 1v2" />
+      <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+      <path d="M10 11v6M14 11v6" />
+    </>,
+    15,
+    '0 0 24 24',
+    1.8,
+  ),
 
   /** 12x12 square — diff unified toggle. */
   Box: makeIcon(<path d="M1 1H11V11H1Z" />, 12, '0 0 12 12'),

@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { FormModal } from '@/components/ui/FormModal'
+import { Icon } from '@/icons'
 import { ApiError } from '@/api/rest'
 import type {
   Schedule,
@@ -53,12 +54,6 @@ const SCOPE_LABEL: Record<ScheduleScope, string> = {
   DURABLE: '持久',
   SESSION: '仅本会话',
 }
-
-const EditIcon = () => (
-  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-    <path d="M9 2L12 5L5 12H2V9L9 2Z" />
-  </svg>
-)
 
 /* ------------------------------------------------------------------ */
 /*  F29：cron 串 → 人类可读文案（简单实现，未识别回退原文）              */
@@ -311,7 +306,7 @@ export function SchedulesPanel({ schedulesApi, showToast }: SchedulesPanelProps)
                 onClick={() => setEditing(s)}
                 disabled={pending}
               >
-                <EditIcon />
+                <Icon.Edit />
               </button>
               <button
                 className="skill-remove"
@@ -319,7 +314,7 @@ export function SchedulesPanel({ schedulesApi, showToast }: SchedulesPanelProps)
                 title="删除"
                 disabled={pending}
               >
-                ×
+                <Icon.Trash />
               </button>
             </div>
           </div>

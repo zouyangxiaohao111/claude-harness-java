@@ -76,7 +76,7 @@ let root: Root
 describe('[sm-boundary-reload] boundary 行渲染归组序（分割线必须在流式回复之前）', () => {
   beforeEach(() => {
     (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
-    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, streamTicks: {}, snippedIds: {}, apiErrors: {} })
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, streamTicks: {}, snippedIds: {}, apiErrors: {}, foldedTurnCounts: {} })
     container = document.createElement('div')
     document.body.appendChild(container)
     root = createRoot(container)
@@ -123,6 +123,12 @@ describe('[sm-boundary-reload] boundary 行渲染归组序（分割线必须在�
       useChatStore.getState().appendChunk(SID, 'blk-1', '流式正文')
     })
 
-    expectDomOrder(container, ['旧用户消息', '旧回复正文', '新用户消息', BOUNDARY_LABEL, '流式正文'])
+    // <b>WHY 断言（规则九 · 最终裁定 · 第三次）</b>：执行中只显示当前轮（历史从 DOM 移除）。
+    //   本条要守的核心意图不变：boundary 行（userMessageId=null）必须归属**当前轮**，
+    //   渲染在「新用户消息」之后、「流式正文」之前 —— 若归组键回退成旧实现，
+    //   boundary 会自成一键并被排到流式块之后。历史轮被隐藏是另一条独立裁定。
+    expect(container.querySelector('.ml-fold-row'), '执行中不应出现折叠行').toBeNull()
+    expectDomOrder(container, ['新用户消息', BOUNDARY_LABEL, '流式正文'])
+    expect(container.textContent, '执行中历史轮隐藏').not.toContain('旧用户消息')
   })
 })

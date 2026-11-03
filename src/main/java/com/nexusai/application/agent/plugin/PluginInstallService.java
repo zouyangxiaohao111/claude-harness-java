@@ -184,6 +184,63 @@ public class PluginInstallService {
     public record InstalledPluginDetail(String name, String version, String installPath, String fingerprint) {
     }
 
+    /**
+     * 卸载插件（[2026-11-01 skill-market v4] 「⋯ → 卸载」的落地入口）。
+     *
+     * <p><b>为什么在这里实现而不是复用 {@code PluginOperations.uninstallPlugin}</b>：
+     * 那个方法是 <b>L4 占位 stub</b>（见 {@code PluginBlocklist:251} 的注释：「未接真实文件卸载」），
+     * 调它不会真的删磁盘文件。本方法走<b>真实卸载链</b>：
+     * 删安装目录 → 移除 {@code installed_plugins.json} 记录 → 刷新插件缓存。
+     *
+     * <p><b>⚠️ 破坏性操作</b>：{@code Files.walk} 逆序删整棵目录，不可恢复。
+     * 调用方（Controller / 前端）必须已获得用户二次确认。
+     *
+     * @param name 插件名（市场条目名）
+     * @return 卸载结果（success + 中文 message）
+     */
+    public PluginInstallResult uninstall(String name) {
+        if (name == null || name.isBlank()) {
+            return new PluginInstallResult(false, "插件名不能为空", null, name, null);
+        }
+        InstalledPluginsManager.InstalledRecord rec = installedPluginsManager.list().stream()
+            .filter(r -> r != null && name.equals(r.name()))
+            .findFirst().orElse(null);
+        if (rec == null) {
+            if (log.isInfoEnabled()) {
+                log.info("[PluginInstall] 卸载跳过：未找到已安装记录 name={}", name);
+            }
+            return new PluginInstallResult(false, "未找到已安装的插件：" + name, null, name, null);
+        }
+        String path = rec.installPath();
+        if (path != null && !path.isBlank()) {
+            try {
+                java.nio.file.Path dir = java.nio.file.Paths.get(path);
+                // 目录不存在 → 视为已清理（幂等），继续移除安装记录
+                if (java.nio.file.Files.isDirectory(dir)) {
+                    try (java.util.stream.Stream<java.nio.file.Path> walk = java.nio.file.Files.walk(dir)) {
+                        // 逆序删除：先文件后目录（walk 是前序遍历，reverseOrder 保证子项先删）
+                        walk.sorted(java.util.Comparator.reverseOrder()).forEach(p -> p.toFile().delete());
+                    }
+                }
+                if (log.isInfoEnabled()) {
+                    log.info("[PluginInstall] 卸载插件 name={} 目录={} 已删除", name, path);
+                }
+            } catch (java.io.IOException e) {
+                log.error("[PluginInstall] 卸载插件失败 name={} path={}: {}", name, path, e.getMessage());
+                return new PluginInstallResult(false, "删除插件目录失败：" + e.getMessage(), null, name, null);
+            }
+        }
+        try {
+            // 既有的数据面卸载（移除内存记录 + installed_plugins.json 条目）
+            installedPluginsManager.uninstall(name);
+        } catch (Exception e) {
+            log.warn("[PluginInstall] 移除安装记录失败 name={}: {}", name, e.getMessage());
+        }
+        // 卸载后同样要刷新（否则技能/命令仍留在内存注册表里）
+        refreshPlugins();
+        return new PluginInstallResult(true, "已卸载 " + name, null, name, null);
+    }
+
     /** 装完触发插件刷新：PluginLoader feed 缓存失效 + <b>重新扫描插件 agents 并入 registry</b>
      *  + per-cwd registry 重建。让插件 agents/commands/skills 立即可见（否则要重启后端才生效）。
      *  失败仅 warn 不阻断。 */

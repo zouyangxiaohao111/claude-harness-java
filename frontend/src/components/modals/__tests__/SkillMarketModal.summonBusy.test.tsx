@@ -77,25 +77,27 @@ describe('SkillMarketModal · 召唤不因对话进行中被互斥', () => {
     })
     await flush()
 
-    // 切到本地来源（本地技能自带「召唤」按钮）
-    const sourceBtn = container!.querySelector('.sm-source-btn') as HTMLButtonElement
-    expect(sourceBtn).toBeTruthy()
-    act(() => { sourceBtn.click() })
-    const local = Array.from(container!.querySelectorAll('.sm-source-item'))
-      .find((el) => el.textContent === '本地') as HTMLElement | undefined
-    expect(local).toBeTruthy()
-    act(() => { local!.click() })
-    await flush()
-
     // 技能 Tab（默认是专家 Tab）
-    const skillTab = Array.from(container!.querySelectorAll('.sm-tab'))
-      .find((el) => el.textContent === '技能') as HTMLElement | undefined
+    // [2026-11-01 v4] 一级 tab 类名 sm-tab → sm-tab-flat（改成 Apple 下划线样式），
+    //   且顶栏「市场源下拉」已删除 —— 本机/市场改成技能 tab 内的**子 tab**。
+    const skillTab = Array.from(container!.querySelectorAll('.sm-tab-flat'))
+      .find((el) => (el.textContent ?? '').includes('技能')) as HTMLElement | undefined
     expect(skillTab).toBeTruthy()
     act(() => { skillTab!.click() })
     await flush()
 
-    const summon = container!.querySelector('.sm-summon-btn') as HTMLButtonElement
-    expect(summon).toBeTruthy()
+    // 切到「本机已装」子 tab（本机技能自带「召唤」按钮）
+    const localSubtab = Array.from(container!.querySelectorAll('.sm-subtab'))
+      .find((el) => (el.textContent ?? '').includes('本机已装')) as HTMLElement | undefined
+    expect(localSubtab, '未找到「本机已装」子 tab').toBeTruthy()
+    act(() => { localSubtab!.click() })
+    await flush()
+
+    // [2026-11-01 v4] 卡片改 Apple 风格：类名 sm-summon-btn → sk-summon，
+    //   且操作区默认 opacity:0（hover 才浮现）。按钮**仍在 DOM 里**（用 opacity 而非
+    //   display:none 就是为了保住占位），所以可以直接取到并点击。
+    const summon = container!.querySelector('.sk-summon') as HTMLButtonElement
+    expect(summon, '未找到召唤按钮').toBeTruthy()
     act(() => { summon.click() })
     await flush()
 

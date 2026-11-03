@@ -138,6 +138,9 @@ export function buildDrainedUserMessages(
       return {
         id: msgId, sessionId, role: 'user' as const, author: '你', content: d.content,
         reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null,
+        // [2026-11-02 修「正在执行没有时间」] 与 App.sendMessage 的乐观气泡同一理由：
+        //   MessageList.turnStartByKey 用 user 行 createdAt 算本轮起点，缺了就算不出时长。
+        createdAt: new Date().toISOString(),
         toolCallId: null, assistantMessageId: null, userMessageId: msgId, subtype: null, isMeta: false, isApiErrorMessage: false,
         apiError: null, error: null, errorDetails: null, matchedRule: null,
         userAttachments: toCapsules(d.userAttachments),

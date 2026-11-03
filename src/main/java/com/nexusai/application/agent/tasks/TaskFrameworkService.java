@@ -151,6 +151,41 @@ public class TaskFrameworkService {
     }
 
     /**
+     * [goal V253] 该会话是否有<b>尚未完成</b>的后台任务（local_agent / local_bash 等）。
+     *
+     * <p><b>WHY 需要</b>：目标（/goal）的评估器只能在「后台工作都归位」时判停 ——
+     * 对齐 CC claude.exe v2.1.212 的 goal 门控：
+     * {@code if (taskRegistry.all() 有未完成的 local_agent/remote_agent/local_bash)
+     * → 摘掉 goal hook，本轮不评估，等后台归位后再评估}。
+     * 不做这个门控 ⇒ 评估器在子代理还没跑完时就判「未达成」⇒ 白烧一轮 LLM，
+     * 且 reason 会误导模型（「证据不足」其实只是「还没跑完」）。
+     *
+     * <p>会话归属取 {@link BackgroundTask#sessionId()}（Phase 4 cron-notify 建立的归属槽）。
+     * 判定「未完成」= {@code !status.isTerminal()}（CC Task.ts:27-29 isTerminalTaskStatus：
+     * completed / failed / killed 才是终态）。
+     *
+     * @param sessionId 会话 ID（null/空 → false）
+     * @return true = 该会话还有后台工作在跑
+     */
+    public boolean hasPendingBackgroundWork(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        for (BackgroundTask t : store.values()) {
+            if (t == null) {
+                continue;
+            }
+            if (!sessionId.equals(t.sessionId())) {
+                continue;
+            }
+            if (t.status() != null && !t.status().isTerminal()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
      * 更新主会话后台任务完整载体（CC updateTaskState 的 main-session 通道）。
      *
      * <p>调用方（completeMainSessionTask 等）在更新 BackgroundTask 投影时同步传本方法更新全量载体，

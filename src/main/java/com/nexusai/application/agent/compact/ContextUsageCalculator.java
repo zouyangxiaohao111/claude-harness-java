@@ -261,31 +261,57 @@ public final class ContextUsageCalculator {
             }
             return anthropic;
         }
+        String resolvedType = providerType(modelMapper, providerMapper, modelName);
+        boolean anthropic = "anthropic".equals(resolvedType);
+        if (log.isDebugEnabled()) {
+            log.debug("[ContextUsageCalculator] 模型→provider 判定: model={} type={} anthropic={}",
+                modelName, resolvedType, anthropic);
+        }
+        return anthropic;
+    }
+
+    /**
+     * 模型名 → provider 类型（{@code anthropic} / {@code openai_compatible} …）· <b>单一真源</b>。
+     *
+     * <p>{@link #isAnthropic(ModelMapper, ProviderMapper, String)} 的判定链就是
+     * {@code model → providerId → provider.type} ⇒ 本方法是那条链的<b>唯一定义处</b>，
+     * isAnthropic 只在其上做一次字符串比较；需要「格式名」的调用方（如 Read 读图门禁的失败原因文案，
+     * 要能说清「当前 openai 兼容格式不支持 Read 读图」而不是笼统说「模型不支持」）也直接用它
+     * ⇒ ⛔ 不再各自复制一遍 resolve 链。
+     *
+     * @param modelMapper    模型 mapper（null → null）
+     * @param providerMapper 提供商 mapper（null → null）
+     * @param modelName      模型全名（providerName/modelName）或裸名（null/blank → null）
+     * @return provider.type；模型/提供商不可判定或异常 → null（⛔ 不猜、不回落成某个默认格式）
+     */
+    public static String providerType(ModelMapper modelMapper, ProviderMapper providerMapper, String modelName) {
         if (modelName == null || modelName.isBlank() || modelMapper == null || providerMapper == null) {
-            return false;
+            if (log.isDebugEnabled()) {
+                log.debug("[ContextUsageCalculator] provider 类型判定: 入参不可用(modelMapper={} modelName={}) → 未知",
+                    modelMapper != null, modelName);
+            }
+            return null;
         }
         try {
             // [2026-10-29] 统计/展示路径走宽松解析：裸名歧义不再打 ERROR（选模型链路才 fail-loud）
             ModelRecord model = ModelNameResolver.resolveQuiet(modelMapper, providerMapper, modelName);
             if (model == null) {
                 if (log.isDebugEnabled()) {
-                    log.debug("[ContextUsageCalculator] 模型不可判定, 按非 Anthropic（input-only）: model={}",
-                        modelName);
+                    log.debug("[ContextUsageCalculator] 模型不可判定, provider 类型未知: model={}", modelName);
                 }
-                return false;
+                return null;
             }
             ProviderRecord provider = providerMapper.selectOneById(model.getProviderId());
-            boolean anthropic = provider != null && "anthropic".equals(provider.getType());
+            String type = provider == null ? null : provider.getType();
             if (log.isDebugEnabled()) {
-                log.debug("[ContextUsageCalculator] 模型→provider 判定: model={} providerId={} type={} anthropic={}",
-                    modelName, model.getProviderId(), provider != null ? provider.getType() : null, anthropic);
+                log.debug("[ContextUsageCalculator] 模型→provider 判定: model={} providerId={} type={}",
+                    modelName, model.getProviderId(), type);
             }
-            return anthropic;
+            return type;
         } catch (Exception e) {
-            log.warn("[ContextUsageCalculator] 模型→provider 判定失败, 按非 Anthropic（input-only）回落: "
-                    + "model={} err={}",
+            log.warn("[ContextUsageCalculator] 模型→provider 判定失败, 类型未知: model={} err={}",
                 modelName, e.toString());
-            return false;
+            return null;
         }
     }
 }

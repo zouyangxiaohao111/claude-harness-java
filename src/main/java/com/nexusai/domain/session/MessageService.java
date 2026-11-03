@@ -1739,6 +1739,15 @@ public class MessageService {
         // tool_calls 的 FK ON DELETE CASCADE 会连带清，这里显式删一次更稳
         toolCallMapper.deleteByQuery(QueryWrapper.create().eq("message_id", id));
         messageMapper.deleteById(id);
+        // [2026-11-01] 单条删除同样可能删掉某个 boundary 的 preservedSegment 引用行 ——
+        //   与 trim / replace 同一缺陷（见 clearPreservedSegmentsPointingAtDeletedRows 的 WHY）。
+        //   ⚠️ 删的是 boundary 行本身时不必清理（那条 metadata 随行一起没了），但本方法拿不到
+        //   「删的是不是 boundary」的判据也不必特判：清理方法只看「还有没有 boundary 指向已删行」，
+        //   boundary 已被删则它不在扫描结果里，自然 no-op。
+        String sessionId = m.getSessionId();
+        if (sessionId != null && !sessionId.isBlank()) {
+            clearPreservedSegmentsPointingAtDeletedRows(sessionId, "delete");
+        }
     }
 
     /**
@@ -1821,11 +1830,86 @@ public class MessageService {
         // 2. 区间删除消息（pivot 及其后 = {seq >= pivotSeq} ∪ {seq IS NULL}）。
         int deleted = messageMapper.deleteByQuery(QueryWrapper.create()
             .where("session_id = ? AND (seq >= ? OR seq IS NULL)", sessionId, pivotSeq));
+        // 3. 悬挂接线图收口（[2026-11-01]）——必须在删除**之后**，判据是「这些行还在不在」。
+        int cleared = clearPreservedSegmentsPointingAtDeletedRows(sessionId, "trimSessionAfter");
         long costMs = (System.nanoTime() - t0) / 1_000_000L;
         log.info("[MessageService] trimSessionAfter: session={} pivot={} 区间删除 {} 条消息"
-                + "（seq >= {} ∪ seq IS NULL，含 pivot 自身），耗时 {} ms",
-            sessionId, pivotMessageId, deleted, pivotSeq, costMs);
+                + "（seq >= {} ∪ seq IS NULL，含 pivot 自身）· 清理悬挂保留段 {} 个 boundary，耗时 {} ms",
+            sessionId, pivotMessageId, deleted, pivotSeq, cleared, costMs);
         return deleted;
+    }
+
+    /**
+     * 清掉「指向已删行」的 compact boundary 保留段（preservedSegment）—— 写侧根因修复。
+     *
+     * <p><b>WHY（2026-11-01 用户实测）</b>：{@code preservedSegment{headUuid, anchorUuid, tailUuid}}
+     * 是压缩时记下的「保留段接线图」，读侧 {@code BoundaryReader.applyPreservedSegmentRelink} 靠它在
+     * 切片后把 kept 行接回 anchor 之后。而 {@link #trimSessionAfter} / {@link #replaceSessionMessages}
+     * 删行时<b>从不回头看这张图</b> ⇒ 一旦裁剪把 head/tail/anchor 之一删掉，boundary 上就留下
+     * <b>悬挂指针</b>：读侧每次投影都判「区间不合法」→ 整段 kept 放弃重挂（压缩白做）+ 每轮刷 ERROR。
+     * 本机实证：某会话 trim 掉 pivot {@code fc566adb…} 后，boundary 的 tailUuid 正指向它，此后该会话
+     * 每次读上下文都报错。
+     *
+     * <p><b>处置</b>：只要 head / anchor / tail <b>任一</b>已不在库，整段 {@code preservedSegment}
+     * 从 compactMetadata 里摘除（其余元数据原样保留）。为什么整段摘而不是「收窄区间」：接线图描述的是
+     * 一个连续区间与它的锚点，缺任一端就无法确定 kept 段边界，收窄等于臆造一段用户没保留的内容。
+     * 摘除后的行为 = 「无保留段」= 读侧原样返回切片（与全量压缩同路径），<b>不会</b>少加载任何仍在库的消息。
+     *
+     * <p>⛔ 本方法只删 metadata 里的一段，绝不删消息、不改 seq（排序权威只有 seq，红线不变）。
+     *
+     * @param sessionId 会话 id
+     * @param reason    调用来源（日志用）
+     * @return 被清理的 boundary 数量
+     */
+    private int clearPreservedSegmentsPointingAtDeletedRows(String sessionId, String reason) {
+        List<MessageRecord> boundaries = messageMapper.selectListByQuery(QueryWrapper.create()
+            .select("id", "compact_metadata")
+            .where("session_id = ? AND subtype = 'compact_boundary' AND compact_metadata IS NOT NULL",
+                sessionId));
+        if (boundaries.isEmpty()) {
+            return 0;
+        }
+        int cleared = 0;
+        for (MessageRecord b : boundaries) {
+            Map<String, Object> meta = parseMap(b.getCompactMetadata());
+            if (meta == null) {
+                continue;
+            }
+            Object segObj = meta.get("preservedSegment");
+            if (!(segObj instanceof Map<?, ?> seg)) {
+                continue;
+            }
+            List<String> refs = new ArrayList<>(3);
+            for (String key : new String[]{"headUuid", "anchorUuid", "tailUuid"}) {
+                Object v = seg.get(key);
+                if (v instanceof String s && !s.isBlank()) {
+                    refs.add(s);
+                }
+            }
+            if (refs.isEmpty()) {
+                continue;
+            }
+            // 任一被引用行已不在库 ⇒ 悬挂
+            long alive = messageMapper.selectCountByQuery(QueryWrapper.create()
+                .eq("session_id", sessionId)
+                .in("id", refs));
+            if (alive == refs.size()) {
+                continue;
+            }
+            Map<String, Object> next = new java.util.LinkedHashMap<>(meta);
+            next.remove("preservedSegment");
+            MessageRecord patch = new MessageRecord();
+            patch.setId(b.getId());
+            patch.setCompactMetadata(serializeMap(next));
+            messageMapper.update(patch);
+            cleared++;
+            log.warn("[MessageService] {}: 清理悬挂保留段 boundaryId={} —— 接线图引用 {} 行中有 {} 行已被删除"
+                    + "（head={} anchor={} tail={}）⇒ 摘除 preservedSegment（读侧按「无保留段」处理，"
+                    + "不再每次投影都放弃重挂并刷 ERROR）",
+                reason, b.getId(), refs.size(), refs.size() - alive,
+                seg.get("headUuid"), seg.get("anchorUuid"), seg.get("tailUuid"));
+        }
+        return cleared;
     }
 
     /**
@@ -2143,9 +2227,15 @@ public class MessageService {
                 .withIsCompactSummary(dto.isCompactSummary())       // [V70] 写后回传保真
                 .withIsVisibleInTranscriptOnly(dto.isVisibleInTranscriptOnly())); // [V70] 写后回传保真
         }
+        // [2026-11-01] 全量替换本质是「删全表 + 重插」⇒ 被丢弃的行可能正是某个 boundary 的
+        //   preservedSegment 接线图引用（partial 压缩写回路径与 trim 同源缺陷，见
+        //   clearPreservedSegmentsPointingAtDeletedRows 的 WHY）。必须在重插之后收口 ——
+        //   判据是「引用行现在还在不在库」，放前面会把刚刚重插回来的 kept 行误判成缺失。
+        int cleared = clearPreservedSegmentsPointingAtDeletedRows(sessionId, "replaceSessionMessages");
         if (log.isDebugEnabled()) {
-            log.debug("[MessageService] replaceSessionMessages: 完成重插 {} 条（保序 + id 去重 {} 条）",
-                normalized.size(), sources.size() - normalized.size());
+            log.debug("[MessageService] replaceSessionMessages: 完成重插 {} 条（保序 + id 去重 {} 条）"
+                + "· 清理悬挂保留段 {} 个 boundary",
+                normalized.size(), sources.size() - normalized.size(), cleared);
         }
         return normalized;
     }

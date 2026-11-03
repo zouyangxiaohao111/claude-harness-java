@@ -12,7 +12,11 @@ import { closeWindow, isWindowMaximized, minimizeWindow, onMaximizeChange, toggl
  *
  * Zoom（绿色）按钮：双击标题栏 / 点击均切换最大化；isMaximized 时图标切换为「还原」。
  */
-export function TitleBar() {
+export function TitleBar({ onToggleSidebar, sidebarCollapsed }: {
+  /** 左栏收起/展开（用户裁定：按钮放在红绿灯右侧，紧挨着「x -」） */
+  onToggleSidebar?: () => void
+  sidebarCollapsed?: boolean
+} = {}) {
   const [maximized, setMaximized] = useState(false)
 
   // 初始化查询 + 订阅最大化状态变化
@@ -55,19 +59,42 @@ export function TitleBar() {
           title={maximized ? '还原窗口' : '最大化窗口'}
           aria-label={maximized ? '还原窗口' : '最大化窗口'}
         >
+          {/* [2026-11-02 用户裁定] 用 **macOS 原生缩放图标**：左上 + 右下两个对角三角形。
+              旧实现是单个圆角矩形（最大化）/两个小方块（还原）—— 用户明确说「不是这个口」。
+              展开态 = 两三角向外张开（↖↘），还原态 = 两三角向内收拢，与 macOS 绿钮逐字一致。 */}
           {maximized ? (
-            // 还原图标：两个小方块
-            <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
-              <rect x="1.5" y="3" width="5.5" height="5.5" rx="0.5" />
-              <path d="M3.5 3V2.5C3.5 2.2 3.7 2 4 2H7.5C7.8 2 8 2.2 8 2.5V6C8 6.3 7.8 6.5 7.5 6.5H7" />
+            // 还原：对角三角形换到「右上 + 左下」—— 与最大化态成镜像，一眼区分
+            <svg viewBox="0 0 10 10" fill="currentColor" aria-hidden="true">
+              <path d="M8.4 1.6v4.4h-4.4z" />
+              <path d="M1.6 8.4V4h4.4z" />
             </svg>
           ) : (
-            // 最大化图标：单个大方块
-            <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.2" strokeLinejoin="round">
-              <rect x="1.5" y="1.5" width="7" height="7" rx="0.5" />
+            // 最大化：左上 + 右下 两个对角三角形（macOS 绿钮标准形）
+            <svg viewBox="0 0 10 10" fill="currentColor" aria-hidden="true">
+              <path d="M1.6 1.6h4.4L1.6 6z" />
+              <path d="M8.4 8.4H4l4.4-4.4z" />
             </svg>
           )}
         </button>
+        {/* [2026-11-01 用户裁定] 左栏开合按钮放在红绿灯右侧，紧挨着「x -」三个点。
+            此前 `.topbar-side-toggle` 只有样式、从未渲染 —— 收起后按钮消失的根因之一。
+            ⚠️ **只在收起态显示**：展开时左栏头部本来就有自己的收起按钮（`.rail-collapse-btn`），
+            两个同时出现会重复（用户实测「点击展开后没消失」）。 */}
+        {onToggleSidebar && sidebarCollapsed && (
+          <button
+            type="button"
+            className="topbar-side-toggle"
+            onClick={onToggleSidebar}
+            title={sidebarCollapsed ? '展开会话栏' : '收起会话栏'}
+            aria-label={sidebarCollapsed ? '展开会话栏' : '收起会话栏'}
+            aria-expanded={!sidebarCollapsed}
+          >
+            <svg viewBox="0 0 16 14" fill="none" width="16" height="14">
+              <rect x="1.1" y="1.1" width="13.8" height="11.8" rx="2.6" stroke="currentColor" strokeWidth="1.35" />
+              <line x1="6" y1="1.4" x2="6" y2="12.6" stroke="currentColor" strokeWidth="1.35" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
       </div>
       <span className="app-name">NexusAI</span>
     </div>

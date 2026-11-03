@@ -1,6 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { artifactOpenActionOf, artifactRawReachable, openArtifactRawInBrowser } from '@/utils/artifactOpen'
+import { isTextArtifact } from '@/utils/artifactKind'
 
 /**
  * 意图：
@@ -68,24 +69,66 @@ describe('openArtifactRawInBrowser', () => {
 
 describe('artifactOpenActionOf（kind → 打开方式 · 用户裁定的分发口径）', () => {
   it('html ⇒ 走我们现有的 html 预览（源码查看/编辑/保存/运行）', () => {
-    expect(artifactOpenActionOf('a.html')).toEqual({ kind: 'view-html' })
-    expect(artifactOpenActionOf('a.htm')).toEqual({ kind: 'view-html' })
+    expect(artifactOpenActionOf({ title: 'a.html' })).toEqual({ kind: 'view-html' })
+    expect(artifactOpenActionOf({ title: 'a.htm' })).toEqual({ kind: 'view-html' })
   })
 
   it('docx/xlsx/pdf/图片 ⇒ 走**现有渲染**（独立预览窗）', () => {
-    expect(artifactOpenActionOf('a.docx')).toEqual({ kind: 'standalone', previewType: 'docx' })
-    expect(artifactOpenActionOf('a.xlsx')).toEqual({ kind: 'standalone', previewType: 'xlsx' })
-    expect(artifactOpenActionOf('a.pdf')).toEqual({ kind: 'standalone', previewType: 'pdf' })
-    expect(artifactOpenActionOf('a.png')).toEqual({ kind: 'standalone', previewType: 'image' })
+    expect(artifactOpenActionOf({ title: 'a.docx' })).toEqual({ kind: 'standalone', previewType: 'docx' })
+    expect(artifactOpenActionOf({ title: 'a.xlsx' })).toEqual({ kind: 'standalone', previewType: 'xlsx' })
+    expect(artifactOpenActionOf({ title: 'a.pdf' })).toEqual({ kind: 'standalone', previewType: 'pdf' })
+    expect(artifactOpenActionOf({ title: 'a.png' })).toEqual({ kind: 'standalone', previewType: 'image' })
   })
 
   it('md / 其它文本 ⇒ Markdown 预览 + 编辑保存', () => {
-    expect(artifactOpenActionOf('a.md')).toEqual({ kind: 'preview-text' })
-    expect(artifactOpenActionOf('a.json')).toEqual({ kind: 'preview-text' })
+    expect(artifactOpenActionOf({ title: 'a.md' })).toEqual({ kind: 'preview-text' })
+    expect(artifactOpenActionOf({ title: 'a.json' })).toEqual({ kind: 'preview-text' })
   })
 
   it('其它二进制（pptx/zip…）⇒ 提示暂不支持 + 复制路径（不假装能预览）', () => {
-    expect(artifactOpenActionOf('a.pptx')).toEqual({ kind: 'unsupported' })
-    expect(artifactOpenActionOf('a.zip')).toEqual({ kind: 'unsupported' })
+    expect(artifactOpenActionOf({ title: 'a.pptx' })).toEqual({ kind: 'unsupported' })
+    expect(artifactOpenActionOf({ title: 'a.zip' })).toEqual({ kind: 'unsupported' })
+  })
+
+  it('[2026-11-01] 标题没有扩展名时，按**归档文件真实扩展名**判（否则 html 产物点不开）', () => {
+    // 实测：抽取出来的交付物标题大多不带后缀（"农污查询理解与主体词改造方案（A"），
+    // 真源是 localPath（.../122ae3f9cd31-agri-react-thinking-and-ask-user.html）
+    expect(artifactOpenActionOf({ title: '农污查询理解与主体词改造方案（A' })).toEqual({ kind: 'unsupported' })
+    expect(
+      artifactOpenActionOf({
+        title: '农污查询理解与主体词改造方案（A',
+        localPath: 'C:/Users/WIN/.nexusai/artifacts/sess-1/122ae3f9cd31-agri-react-thinking-and-ask-user.html',
+      }),
+    ).toEqual({ kind: 'view-html' })
+    // 路径是 .md ⇒ 文本预览（不是 unsupported）
+    expect(
+      artifactOpenActionOf({
+        title: '农污软件设计包',
+        localPath: 'C:/Users/WIN/.nexusai/artifacts/sess-1/d3a7fe16a781-agri-query-fix.md',
+      }),
+    ).toEqual({ kind: 'preview-text' })
+  })
+
+  it('[2026-11-01] 目录产物 ⇒ open-directory（既不能预览也不能编辑，点开 = 打开所在目录）', () => {
+    // 实测：真库里有 deliverable 的 local_path 指向目录（目录不会被归档 ⇒ 路径在归档目录外）
+    expect(
+      artifactOpenActionOf({
+        title: '农污软件设计包（docs/software-design-agri）',
+        localPath: 'D:/code/ai_project/nexusai/.nexusai/worktrees/scene-fusion/docs/software-design-agri',
+        directory: true,
+      }),
+    ).toEqual({ kind: 'open-directory' })
+  })
+
+  it('[2026-11-01] 目录标记优先于扩展名（目录没有扩展名 ⇒ 不能落进 unsupported/file）', () => {
+    // 即使路径看起来像 .md，directory=true 也必须走 open-directory
+    expect(
+      artifactOpenActionOf({ title: '设计包', localPath: 'C:/artifacts/s1/design', directory: true }),
+    ).toEqual({ kind: 'open-directory' })
+  })
+
+  it('[2026-11-01] 目录不是文本 ⇒ 不可编辑（后端 PUT /content 对目录直接 400）', () => {
+    expect(isTextArtifact({ title: '设计包', directory: true })).toBe(false)
+    expect(isTextArtifact({ title: '设计包', localPath: 'C:/artifacts/s1/design', directory: true })).toBe(false)
   })
 })

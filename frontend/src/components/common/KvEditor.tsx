@@ -21,6 +21,7 @@
  * <p><b>全空产出 `{}`（不是 `null`）</b>：`{}` = 显式清空、缺字段/null = 不触碰，两者不可互换。
  */
 import { useEffect, useRef, useState } from 'react'
+import { Icon } from '@/icons'
 
 /** 本批唯一占位符。大小写敏感（`String#includes` 语义），与后端 SESSION_ID_TOKEN 一致。 */
 const SESSION_ID_TOKEN = '${session_id}'
@@ -235,13 +236,11 @@ export function KvEditor({
             />
             <button
               type="button"
-              className="icon-btn"
+              className="icon-btn icon-btn-del"
               title="删除此行"
               onClick={() => commit(rows.filter((r) => r.id !== row.id))}
             >
-              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-                <path d="M4 4L10 10M10 4L4 10" />
-              </svg>
+              <Icon.Trash />
             </button>
             {messages.length > 0 && (
               <div className="fm-field-hint error" style={{ alignSelf: 'center' }}>

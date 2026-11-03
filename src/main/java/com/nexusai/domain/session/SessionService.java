@@ -653,6 +653,57 @@ public class SessionService {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // [goal V253] 会话级目标状态（V253 列 goal）· 对齐 CC appState.activeGoal
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 读取会话级目标状态（V253 列 goal，TEXT JSON 对象）· CC original: appState.activeGoal。
+     *
+     * <p><b>WHY 必须落列</b>：CC 的 activeGoal 活在进程内存（单进程 CLI）；本仓 Web 端每 send
+     * 新建 LlmAgentLoop（prototype 作用域）⇒ 内存态活不过下一条用户消息 ⇒ 必须由会话列承载
+     * （multi-session-vs-cc-single-session 铁律：todos V43 / disabled_tools V35 /
+     * team_context V40 / computer_use_grants V250 同款范式）。
+     *
+     * <p>fail-soft：列 null / 解析失败 → <b>null（= 无目标）</b>，不抛
+     * （对齐 {@link #getDisabledTools} 的降级读法）。
+     *
+     * @param sessionId 会话 ID（DB 键）
+     * @return 目标状态；无目标 → null
+     */
+    public SessionGoal getGoal(String sessionId) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        SessionGoal goal = SessionGoal.fromJson(s.getGoal());
+        if (goal == null && s.getGoal() != null && !s.getGoal().isBlank()) {
+            log.warn("[SessionService] getGoal 解析失败（降级为无目标）session={}", sessionId);
+        }
+        return goal;
+    }
+
+    /**
+     * 写入会话级目标状态（V253 列 goal）。
+     *
+     * <p>null → 存 null（列 = 无目标）；非 null → JSON 串。session 不存在 → NotFoundException。
+     *
+     * @param sessionId 会话 ID（DB 键）
+     * @param goal      目标状态（null = 清除目标）
+     * @throws NotFoundException session 不存在
+     */
+    public void setGoal(String sessionId, SessionGoal goal) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) throw new NotFoundException("Session " + sessionId + " not found");
+        s.setGoal(SessionGoal.toJson(goal));
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] setGoal: session={} phase={} iterations={}",
+                    sessionId, goal == null ? "none" : goal.phase(), goal == null ? 0 : goal.iterations());
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // [A4] 会话级 teamContext（V39 列 team_context）· 对齐 CC appState.teamContext
     // ════════════════════════════════════════════════════════════════════
 

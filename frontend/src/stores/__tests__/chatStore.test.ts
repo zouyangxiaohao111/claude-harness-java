@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 import { createChatStore, IMAGE_CACHE_MAX_PER_SESSION } from '../chatStore'
+import { FOLD_DEFAULT_TURNS } from '../messageTurns'
 import type { ChatMessageDto } from '../../api/types'
 
 /** 测试用最小 ChatMessageDto（避免每个用例重复造全字段）。 */
@@ -309,52 +310,60 @@ describe('chatStore hasMore / prependMessages（[window-paging] 有界历史窗�
   })
 })
 
-// [折叠显示 · 2026-10-29 用户裁定] 追加路径**不再丢弃已加载轮**。
-// 沿革：早先为控内存做过「追加时按对话轮 LRU 从头部挤出最老一轮」（挤出 = 真卸载，回看要重新向服务端拉）。
-//   用户推翻该语义：「在追加新消息时会把最老的已加载轮挤掉。不应该挤掉而是折叠显示」⇒
-//   ① store 只增不减（chatStore 所有追加路径一律不裁）；
-//   ② 「默认只显示最近 3 轮」改由**渲染层折叠行**表达（MessageList 的 .ml-fold-row）；
-//   ③ 刷新后回到默认 3 轮靠 App 首屏 listTurns({turns:3})，与 store 无关。
-// 本组守住新不变量：**追加任何一条消息，既有轮一条都不能少（含最早一条）**——
-//   谁把 capTailTurns 加回追加路径，下面的「最早 id 仍在」断言立即失败。
-describe('chatStore 追加路径不丢弃已加载轮（折叠显示 · 用户 2026-10-29 裁定）', () => {
-  const many = (n: number, sid = 'sess-1', prefix = 'm') =>
-    Array.from({ length: n }, (_, i) => baseMsg(`${prefix}${i}`, sid))
+// [折叠 = 真删 · 2026-11-02 用户裁定（推翻 2026-10-29）]
+//
+// 沿革：2026-10-29 裁定「不应该挤掉而是折叠显示」⇒ store 只增不减、靠渲染层折叠行遮住。
+//   2026-11-02 用户实测长会话卡顿后推翻：「随着对话变多会卡顿，不应该默认显示 2 轮次、收起来的
+//   会话默认不渲染吗；另外会话收起来代表内存删除，展开就是重新获取后端的会话，不是取 store 的；
+//   F5 应该也是这样」。
+//
+// WHY 只藏 DOM 不够：MessageList 的 foldedSet 虽不渲染，但 groups / flatRows / turnKeyByRowId /
+//   turnUsage / footerByRowKey 等十几处 useMemo 每轮都要扫全部已加载消息 —— 消息越多越慢。
+//
+// 本组守住新不变量：
+//   ① 追加任何消息后，内存里**只留最近 FOLD_DEFAULT_TURNS 轮**，且**整轮不切半**；
+//   ② 被移出的真实轮数累加进 foldedTurnCounts（渲染层「已折叠 N 轮」），且 hasMore 置 true；
+//   ③ setMessages（服务端整表替换）照收不裁 —— 调用方已按 N 轮取数，折叠计数归零。
+describe('chatStore 折叠 = 真删（内存只留最近 N 轮 · 用户 2026-11-02 裁定）', () => {
+  const KEEP = FOLD_DEFAULT_TURNS
 
-  it('append 新消息后最早一轮的 id 仍在（WHY：挤掉 = 用户看不到这一轮，折叠才是要的行为）', () => {
+  it('append 新轮后：内存只剩最近 N 轮，被移出的轮计入 foldedTurnCounts（WHY：卡顿根因是全部消息每轮全扫）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', turnSeqs(3))                    // 首屏 = 最近 3 轮
-    const oldest = s.getState().messages['sess-1']![0]!.id
-    s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', 'n'))  // 追加第 4 轮
+    s.getState().setMessages('sess-1', turnSeqs(KEEP))
+    s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', 'n'))   // 追加第 N+1 轮
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs.some((m) => m.id === oldest)).toBe(true)                // 最早一轮没被挤掉
-    expect(msgs).toHaveLength(8)                                       // 4 轮 × 2 行（只增不减）
-    expect(msgs[msgs.length - 1]!.id).toBe('n0-a')
+    expect(msgs).toHaveLength(KEEP * 2)                                 // 内存有界（2 轮 × 2 行）
+    expect(msgs.some((m) => m.id === 't0')).toBe(false)                 // 最早一轮已移出内存
+    expect(s.getState().foldedTurnCounts['sess-1']).toBe(1)             // 但计入「已折叠」
+    expect(s.getState().hasMore['sess-1']).toBe(true)                   // 且知道还能往回拉
+    expect(msgs[msgs.length - 1]!.id).toBe('n0-a')                      // 新内容在
   })
 
-  it('连续追加 200 轮：条数线性增长、最早一条始终在（WHY：内存上界改由渲染层折叠承担）', () => {
+  it('连续追加 200 轮：内存条数**有界**，折叠计数随移出轮数增长（WHY：这就是卡顿修复的本体）', () => {
     const s = createChatStore()
     s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', 'first'))
     for (let i = 0; i < 200; i++) s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', `x${i}`))
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(201 * 2)
-    expect(msgs[0]!.id).toBe('first0')
-    expect(msgs[msgs.length - 1]!.id).toBe('x1990-a')
+    expect(msgs.length).toBeLessThanOrEqual(KEEP * 2)                   // ⛔ 不再线性增长
+    expect(msgs[msgs.length - 1]!.id).toBe('x1990-a')                   // 最新一轮在
+    // 201 轮里保留 KEEP 轮 ⇒ 移出 201 - KEEP 轮
+    expect(s.getState().foldedTurnCounts['sess-1']).toBe(201 - KEEP)
   })
 
-  it('单次批量追加同样不丢既有行（WHY：queue.drained 一次可回插多条）', () => {
+  it('单次批量追加也不切半轮（WHY：一轮几百条 tool 消息是正常形态，切半会渲染出残轮）', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', turnSeqs(3))
+    s.getState().setMessages('sess-1', turnSeqs(KEEP))
     s.getState().appendMessages('sess-1', turnSeqs(150, 'sess-1', 'b'))
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(3 * 2 + 150 * 2)
-    expect(msgs[0]!.id).toBe('t0')       // 首屏那 3 轮原样都在（含最早一条）
-    expect(msgs[1]!.id).toBe('t0-a')     // 整轮保留，不切半
+    expect(msgs).toHaveLength(KEEP * 2)
+    // 最后一行人与其 user 行必须成对（整轮保留）
+    expect(msgs[msgs.length - 1]!.id).toBe('b149-a')
+    expect(msgs.some((m) => m.id === 'b149')).toBe(true)
   })
 
-  it('finalizeBlocks / appendMetaUser / expirePermission 追加后既有历史一条不少', () => {
+  it('finalizeBlocks / appendMetaUser / 权限留痕 追加的新行都在，且内存仍有界', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(50))
+    s.getState().setMessages('sess-1', turnSeqs(KEEP))
     s.getState().ensureStreamBlock('sess-1', 'turn-x')
     s.getState().appendChunk('sess-1', 'turn-x', '正文')
     s.getState().finalizeBlocks('sess-1')
@@ -362,46 +371,74 @@ describe('chatStore 追加路径不丢弃已加载轮（折叠显示 · 用户 2
     s.getState().enqueuePermission({ kind: 'message', sessionId: 'sess-1', requestId: 'r1', toolName: 'edit' })
     s.getState().expirePermission('sess-1', 'r1')
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs.some((m) => m.id === 'm0')).toBe(true)      // 最早一条仍在
     expect(msgs.some((m) => m.id === 'turn-x')).toBe(true)  // 块落库行在
     expect(msgs.some((m) => m.id === 'u-new')).toBe(true)   // 元消息行在
     expect(msgs.some((m) => m.id === 'perm-r1')).toBe(true) // 权限超时留痕在
     expect(msgs[msgs.length - 1]!.id).toBe('perm-r1')
+    expect(msgs.length).toBeLessThanOrEqual((KEEP + 1) * 2 + 3)  // 有界（容忍尾部附加行）
   })
 
-  it('insertServerMessages / addToolUseSummary / addStopHookSummary 追加后既有历史一条不少', () => {
+  it('insertServerMessages / addToolUseSummary / addStopHookSummary 的新行不丢', () => {
     const s = createChatStore()
-    s.getState().setMessages('sess-1', turnSeqs(3))
+    s.getState().setMessages('sess-1', turnSeqs(KEEP))
     s.getState().insertServerMessages('sess-1', [
       { ...baseMsg('b1'), role: 'system', author: 'system', subtype: 'compact_boundary' },
     ])
-    s.getState().addToolUseSummary('sess-1', { id: 'sum1', content: '/tool ok', userMessageId: 't2' })
+    s.getState().addToolUseSummary('sess-1', { id: 'sum1', content: '/tool ok', userMessageId: `t${KEEP - 1}` })
     s.getState().addStopHookSummary('sess-1', {
-      id: 'sh1', userMessageId: 't2',
+      id: 'sh1', userMessageId: `t${KEEP - 1}`,
       payload: { hookCount: 1, hookErrors: [], preventedContinuation: false },
     })
     const msgs = s.getState().messages['sess-1'] ?? []
-    for (const id of ['t0', 't0-a', 'b1', 'sum1', 'sh1']) {
+    for (const id of ['b1', 'sum1', 'sh1']) {
       expect(msgs.some((m) => m.id === id), `${id} 不应被追加路径丢弃`).toBe(true)
     }
   })
 
-  it('setMessages（服务端整表替换）照收不裁（WHY：头部可能是 compact 摘要 / boundary 标记，裁了会误删标记）', () => {
+  it('setMessages（服务端整表替换）照收不裁，且折叠计数归零（WHY：调用方已按 N 轮取数）', () => {
     const s = createChatStore()
     s.getState().setMessages('sess-1', turnSeqs(80))     // 80 轮 = 160 条
     expect(s.getState().messages['sess-1']).toHaveLength(160)
+    expect(s.getState().foldedTurnCounts['sess-1']).toBe(0)
   })
 
-  it('prepend 更早页原样进窗口头部，且随后的 append 不再把它挤掉', () => {
+  it('appendMessages 同 id 幂等：重复追加不产生重复行（WHY：用户实测整轮内容重复十几次）', () => {
+    // 意图：本入口是「重拉 / 重放 / 乐观气泡」的共用尾部追加路径，此前**无 id 去重**。
+    //   同一条消息被追加两次（queue.drained 重复投递、乐观气泡与回放同 id 各来一次）时，
+    //   messages 里会出现同 id 两行 ⇒ 渲染层 row key 相同 ⇒ 整块内容重复显示、同一提问被算成两轮。
+    //   语义与 finalizeBlocks 的 dupIdx 一致：已存在则**原地替换**（保位置、不重插）。
     const s = createChatStore()
-    s.getState().setMessages('sess-1', many(50))
-    s.getState().prependMessages('sess-1', many(50, 'sess-1', 'old'), true)
-    s.getState().appendMessages('sess-1', [baseMsg('new1')])
+    s.getState().appendMessages('sess-1', [baseMsg('q1')])
+    s.getState().appendMessages('sess-1', [baseMsg('q1')])
+    s.getState().appendMessages('sess-1', [baseMsg('a1'), baseMsg('a1')])
     const msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs).toHaveLength(50 + 50 + 1)
-    expect(msgs[0]!.id).toBe('old0')                     // 更早页仍在头部（未被挤掉）
-    expect(msgs.some((m) => m.id === 'm0')).toBe(true)   // 原窗口首条也在
-    expect(msgs[msgs.length - 1]!.id).toBe('new1')
+    expect(msgs.map((m) => m.id)).toEqual(['q1', 'a1'])   // 重复 id 只保留一行，位置不变
+  })
+
+  it('revealOlderTurns：展开折叠行 → 更早的轮回到头部，折叠计数扣减（WHY：展开=重新取后端）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', turnSeqs(2, 'sess-1', 'cur'))
+    // 模拟「后端拉回更早 2 轮」
+    s.getState().revealOlderTurns('sess-1', turnSeqs(2, 'sess-1', 'old'))
+    const msgs = s.getState().messages['sess-1'] ?? []
+    expect(msgs).toHaveLength(8)                                  // 2 旧轮 + 2 现轮
+    expect(msgs[0]!.id).toBe('old0')                              // 更早的轮在头部
+    // 折叠计数从 3 → 1（拉回 2 轮）
+    s.getState().revealOlderTurns('sess-1', turnSeqs(1, 'sess-1', 'older'))
+    expect(s.getState().messages['sess-1']).toHaveLength(10)
+  })
+
+  it('pruneFoldedTurns：显式裁剪到 N 轮并累计折叠数（WHY：收口入口可被测试与调用方直接用）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', turnSeqs(6))
+    expect(s.getState().messages['sess-1']).toHaveLength(12)
+    s.getState().pruneFoldedTurns('sess-1', 2)
+    expect(s.getState().messages['sess-1']).toHaveLength(4)        // 只留 2 轮
+    expect(s.getState().foldedTurnCounts['sess-1']).toBe(4)        // 移出 4 轮
+    expect(s.getState().hasMore['sess-1']).toBe(true)
+    // 幂等：再裁一次没有可删的 → 计数不变
+    s.getState().pruneFoldedTurns('sess-1', 2)
+    expect(s.getState().foldedTurnCounts['sess-1']).toBe(4)
   })
 })
 
@@ -477,20 +514,58 @@ describe('[sm-boundary-reload] insertServerMessages（message.insert 即时插�
     expect(msgs.filter((m) => m.id === 'b1')).toHaveLength(1)
   })
 
-  it('插入后追加新轮不挤出任何既有行（boundary 随其所属轮，历史一条不少）', () => {
+  it('boundary 行随其所属轮保留；追加新轮时内存按轮裁剪（2026-11-02 折叠=真删）', () => {
     const s = createChatStore()
     s.getState().setMessages('sess-1', turnSeqs(50))     // 已加载 50 轮（t0..t49）
     s.getState().insertServerMessages('sess-1', [boundaryRow()])
     let msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs.some((m) => m.id === 't0')).toBe(true)    // boundary 不占轮、不挤掉最老真实轮
-    expect(msgs[msgs.length - 1]?.id).toBe('b1')
-    // 再来一条真实轮（user+assistant）→ 既有轮一条都不能少（折叠由渲染层负责）
+    expect(msgs[msgs.length - 1]?.id).toBe('b1')          // 插入的行在尾部
+    // 再来一条真实轮（user+assistant）→ 内存裁到最近 N 轮，但**尾部**的 boundary 不丢
     s.getState().appendMessages('sess-1', turnSeqs(1, 'sess-1', 'z'))
     msgs = s.getState().messages['sess-1'] ?? []
-    expect(msgs.some((m) => m.id === 't0')).toBe(true)    // 最老一轮仍在（⛔ 不再 LRU 挤出）
-    expect(msgs.some((m) => m.id === 'b1')).toBe(true)    // boundary 随其所属轮保留
-    expect(msgs[msgs.length - 1]?.id).toBe('z0-a')
-    // 50 轮 × 2 行 + 1 条 boundary + 新 1 轮 × 2 行（只增不减）
-    expect(msgs).toHaveLength(50 * 2 + 1 + 2)
+    expect(msgs.some((m) => m.id === 'b1')).toBe(true)     // boundary 随其所属轮保留（在尾部）
+    expect(msgs[msgs.length - 1]?.id).toBe('z0-a')         // 新轮在
+    expect(msgs.some((m) => m.id === 't0')).toBe(false)    // 最老轮已移出内存（真删）
+    expect(s.getState().foldedTurnCounts['sess-1']).toBeGreaterThan(0)
+    expect(msgs.length).toBeLessThanOrEqual(FOLD_DEFAULT_TURNS * 2 + 1)
+  })
+})
+
+describe('setMessages 保留本地 imageData（修「截图发送后不显示、F5 才出现」第二条腿）', () => {
+  /**
+   * WHY：整表替换会丢掉只在本地存在的 `imageData`（base64，DB 不存该字段）。而重拉可能发生在后端
+   * 回写 `image_paste_ids` **之前**（实测建行→回写约 0.9s）—— 那一刻新行既无 imageData 也无
+   * imagePasteIds ⇒ 图彻底消失，用户感知就是「必须 F5」。变异点：删掉续接逻辑 → 本用例红。
+   */
+  it('⭐ 重拉回来的同 id 行缺图 ⇒ 把本地乐观 imageData 续接上', () => {
+    const s = createChatStore()
+    const local: ChatMessageDto = { ...baseMsg('m1'), imageData: [{ base64: 'AAA', mediaType: 'image/png' }] }
+    s.getState().setMessages('sess-1', [local])
+    // 重拉：后端尚未回写 image_paste_ids ⇒ 该行两个图片字段都是空
+    s.getState().setMessages('sess-1', [{ ...baseMsg('m1'), imagePasteIds: [] }])
+    const got = (s.getState().messages['sess-1'] ?? [])[0]
+    expect(got?.imageData, '本地 base64 必须续接（否则图整段消失，只能等 F5）').toEqual([
+      { base64: 'AAA', mediaType: 'image/png' },
+    ])
+  })
+
+  it('后端已回写 imagePasteIds ⇒ 用读侧渠道，不覆盖本地 imageData（渲染源优先级不变）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [
+      { ...baseMsg('m1'), imageData: [{ base64: 'AAA', mediaType: 'image/png' }] },
+    ])
+    s.getState().setMessages('sess-1', [{ ...baseMsg('m1'), imagePasteIds: ['123'] }])
+    const got = (s.getState().messages['sess-1'] ?? [])[0]
+    expect(got?.imagePasteIds).toEqual(['123'])
+    expect(got?.imageData, '已是权威 id 列表 ⇒ 不塞回 base64（避免双份内存）').toBeUndefined()
+  })
+
+  it('本地没有 imageData 的行原样返回（不凭空造字段）', () => {
+    const s = createChatStore()
+    s.getState().setMessages('sess-1', [baseMsg('m1')])
+    s.getState().setMessages('sess-1', [{ ...baseMsg('m1'), content: '新内容' }])
+    const got = (s.getState().messages['sess-1'] ?? [])[0]
+    expect(got?.imageData).toBeUndefined()
+    expect(got?.content).toBe('新内容')
   })
 })

@@ -450,6 +450,21 @@ public class CommandController {
             }
             return executeCompactBuiltin(sessionIdParam, null);
         }
+        // [goal V253] /goal 显式路由 · 对齐 CC claude.exe v2.1.212 的 goal 斜杠命令。
+        //   WHY 显式路由（不走通用薄触发分支）：通用分支只回命令元数据 ⇒ 「/goal 真的设了目标吗」
+        //   这件事没有任何事实支撑（与 P2-18 的 /compact 同款教训 —— 前端报「已执行 /goal」
+        //   但目标从未设定）。现委托到字面端点同一执行体（该端点才有 args 字段 ——
+        //   通用端点的 ResumeExecuteRequest 会把 args 静默丢弃）。
+        //   语义：无参 = 显示当前目标；clear/stop/off/reset/none/cancel = 清空；其余 = 设定条件。
+        if ("goal".equals(hit.getName())) {
+            if (log.isDebugEnabled()) {
+                log.debug("[CommandController] executeBuiltin({}) 显式路由 → executeGoalBuiltin"
+                    + "（不依赖 literal 路由优先级；goal V253）", name);
+            }
+            // ⚠️ 通用端点的请求体类型是 ResumeExecuteRequest（无 args 字段）⇒ 条件文本会丢。
+            //   故此处只传 null args（等价「无参数 = 显示当前目标」）；**设定条件必须走字面端点**。
+            return executeGoalBuiltin(sessionIdParam, null);
+        }
         // ⚠⚠ 以下 /clear 历史分支自 2026-09-11（P0-0/N1 决策）起【不可达】——上方 fail-loud 门已对 clear
         //   （含别名 reset/new）抛 ConflictException，本分支永不进入。清理链按决策【保留不删】（删除属另一
         //   决策，仅登记，见审计 §零 P0-0 / §12.4 N1）——请勿在此新增依赖；恢复 /clear 须先经用户拍板并
@@ -732,6 +747,59 @@ public class CommandController {
         }
         if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
             return "/compact 压缩完成（无文本结果）。";
+        }
+        return r.value();
+    }
+
+    /**
+     * [goal V253] {@code /goal} 执行端点 · 对齐 CC claude.exe v2.1.212 的 goal 斜杠命令。
+     *
+     * <p><b>WHY 独立字面端点</b>（与 /compact 同款教训，见上方 P2-18 注释）：通用端点的请求体
+     * 类型是 {@link ResumeExecuteRequest}（只有 agentId/prompt）⇒ 前端传的 {@code {args:"目标条件"}}
+     * 会被 Jackson <b>静默丢弃</b> ⇒ 「/goal e2e 全绿」的<b>条件文本会丢</b>，目标会被设成空。
+     * 独立 DTO {@link com.nexusai.model.command.dto.GoalExecuteRequest} 才有 args 字段。
+     *
+     * <p>语义（CC）：
+     * <ul>
+     *   <li>无参 → 显示当前目标（{@code Goal active: <c> (N turns)} / {@code No goal set}）</li>
+     *   <li>{@code clear|stop|off|reset|none|cancel}（大小写不敏感）→ 清空</li>
+     *   <li>其余 → 设定条件（上限 4000 字符，超长拒绝并回报实际长度）</li>
+     * </ul>
+     *
+     * @param sessionIdParam query {@code ?sessionId=}（必填，缺 ⇒ 400）
+     * @param request        请求体 {@code {args}}（可选；null/空 = 无参数 = 显示当前目标）
+     * @return 人话文本（纯 text/plain，避免与通用端点的 JSON 返回冲突）
+     */
+    @PostMapping(path = "/builtins/goal/execute", produces = "text/plain;charset=UTF-8")
+    public String executeGoalBuiltin(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestBody(required = false) com.nexusai.model.command.dto.GoalExecuteRequest request) {
+        if (userInputDispatcher == null) {
+            log.error("[CommandController] executeGoalBuiltin: UserInputDispatcher 未注入"
+                + "（非容器上下文），无法执行 /goal");
+            throw new IllegalStateException("UserInputDispatcher not wired into CommandController");
+        }
+        String sessionId = sessionIdParam;
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[CommandController] executeGoalBuiltin: 缺少会话标识 ?sessionId= → 400");
+            throw new ValidationException(
+                "sessionId is required (POST /api/command/builtins/goal/execute)");
+        }
+        String args = request != null ? request.args() : null;
+        String input = (args == null || args.isBlank()) ? "/goal" : "/goal " + args.trim();
+        if (log.isDebugEnabled()) {
+            log.debug("[CommandController] executeGoalBuiltin: dispatch input='{}' session={}",
+                input, sessionId);
+        }
+        com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
+            userInputDispatcher.dispatchResult(input, sessionId, null);
+        if (r == null) {
+            log.error("[CommandController] executeGoalBuiltin: /goal handler 未注册"
+                + "（dispatchResult null；GoalCommandRegistrationConfig 未执行？）");
+            return "/goal 无法执行：/goal 命令未注册。";
+        }
+        if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
+            return "/goal 已执行（无文本结果）。";
         }
         return r.value();
     }

@@ -78,16 +78,31 @@ public class ExecPromptHook {
         1, r -> { Thread t = new Thread(r, "exec-prompt-hook-timeout"); t.setDaemon(true); return t; });
 
     /**
-     * CC systemPrompt · 逐字对齐 execPromptHook.ts:64-70（无附加句 —
-     * CCJ-EXEC-11 删除旧 'Return ONLY the JSON object, no other text.' 尾部附加句，
-     * JSON 输出约束由 outputFormat json_schema 承担）。
+     * CC systemPrompt · 逐字对齐 claude.exe v2.1.212 的 stop-condition 评估器
+     * （{@code execPromptHook} 的 Stop/SubagentStop 分支 systemPrompt）。
+     *
+     * <p><b>[goal V253] 从两态升级为三态</b>：旧实现只有 {@code {ok:true}} / {@code {ok:false,reason}}，
+     * 缺 {@code impossible} 分支，且缺「只认 transcript 证据」「assistant 自称不可能只是证据不是证明」
+     * 两条关键约束 ⇒ 目标模式（/goal）在「条件根本不可能达成」时会永远卡着，模型无路可走。
+     *
+     * <p>CC v2.1.212 的三条硬约束（逐字保留，这是它区别于普通 hook 评估器的关键）：
+     * <ul>
+     *   <li>transcript 里没有清晰证据 ⇒ 返回 {@code {"ok":false,"reason":"insufficient evidence in transcript"}}</li>
+     *   <li>{@code impossible} 只允许「自相矛盾 / 依赖不可用资源 / 已穷尽合理办法并明确说做不到」</li>
+     *   <li>「assistant 声称目标不可能只是证据不是证明，要独立确认」；「不要因为还没到或进展慢就用 impossible」</li>
+     * </ul>
      */
     private static final String SYSTEM_PROMPT = """
-        You are evaluating a hook in NexusAI.
+        You are evaluating a stop-condition hook in NexusAI. Read the conversation transcript carefully, then judge whether the user-provided condition is satisfied.
 
-        Your response must be a JSON object matching one of the following schemas:
-        1. If the condition is met, return: {"ok": true}
-        2. If the condition is not met, return: {"ok": false, "reason": "Reason for why it is not met"}""";
+        Your response must be a JSON object with one of these shapes:
+        - {"ok": true, "reason": "<quote evidence from the transcript that satisfies the condition>"}
+        - {"ok": false, "reason": "<quote what is missing or what blocks the condition>"}
+        - {"ok": false, "impossible": true, "reason": "<explain why the condition can never be satisfied>"}
+
+        Always include a "reason" field, quoting specific text from the transcript whenever possible. If the transcript does not contain clear evidence that the condition is satisfied, return {"ok": false, "reason": "insufficient evidence in transcript"}.
+
+        Only use {"ok": false, "impossible": true} when the condition is genuinely unachievable in this session — for example: the condition is self-contradictory, it depends on a resource or capability that is unavailable, or the assistant has explicitly tried, exhausted reasonable approaches, and stated it cannot be done. Apply your own judgment when deciding this — the assistant claiming the goal is impossible is evidence, not proof; independently confirm the condition is genuinely unachievable rather than deferring to the assistant's self-assessment. Do not use it just because the goal has not been reached yet or because progress is slow. When in doubt, return {"ok": false} without "impossible".""";
 
     private final ObjectMapper objectMapper;
 
@@ -269,12 +284,24 @@ public class ExecPromptHook {
                 return nonBlockingError(hookName, effectiveToolUseID, hookEvent,
                     "Schema validation failed: " + schemaError, trimmed);
             }
-            // 7. 按 ok 分流 · 对齐 CC execPromptHook.ts:154-172
+            // 7. 按 ok 分流 · 对齐 CC v2.1.212 stop-condition 评估器
             boolean ok = json.path("ok").asBoolean();
             JsonNode reasonNode = json.path("reason");
             String reason = reasonNode.isMissingNode() ? null : reasonNode.asText(null);
+            // [goal V253] impossible 分支 · 对齐 CC v2.1.212：
+            //   ok=false + impossible=true → hook_success + impossible 标记（**不是** blocking）
+            //   —— 条件根本不可能达成时交还控制权，而不是无限 block 到撞 8 次上限。
+            boolean impossible = json.path("impossible").asBoolean(false);
 
             if (!ok) {
+                if (impossible) {
+                    // impossible → success + impossible 标记 · CC v2.1.212 stop-condition 分支
+                    if (log.isInfoEnabled()) {
+                        log.info("ExecPromptHook: hook={} 条件不可能达成, outcome=success, impossible=true, reason={}",
+                            hookName, reason);
+                    }
+                    return successWithImpossible(hookName, effectiveToolUseID, hookEvent, reason);
+                }
                 // ok=false → blocking + preventContinuation + stopReason · 对齐 CC :154-167
                 // [CCJ-EXEC-15] reason 缺失 → blockingError 文本按 CC 模板字面量拼 'undefined'，
                 //   stopReason = parsed.data.reason 原样（可 null；旧实现兜底 'Prompt hook condition was not met'）
@@ -332,12 +359,14 @@ public class ExecPromptHook {
     private LlmProvider.ChatRequestOptions buildRequestOptions(PromptLlmContext llmContext,
                                                                AbortController combinedAbort,
                                                                List<ChatMessageDto> messages) {
-        // CC :89-97 schema {ok:boolean, reason?:string} (hookResponseSchema 一致)
+        // CC v2.1.212 schema {ok:boolean, reason?:string, impossible?:boolean}
         com.fasterxml.jackson.databind.node.ObjectNode schema = objectMapper.createObjectNode();
         schema.put("type", "object");
         ObjectNode props = schema.putObject("properties");
         props.putObject("ok").put("type", "boolean");
         props.putObject("reason").put("type", "string");
+        // [goal V253] impossible 可选布尔（CC v2.1.212：只在 ok=false 时有意义）
+        props.putObject("impossible").put("type", "boolean");
         schema.putArray("required").add("ok");
         // [IT-5] 广告 additionalProperties=false 保留 · 逐字对齐 CC execPromptHook.ts:96
         // 手写 outputFormat schema（provider 端 json_schema 校验，不经 ToolInputValidator；
@@ -399,6 +428,28 @@ public class ExecPromptHook {
             null, null,                                                              // updatedInput, updatedMCPToolOutput
             null, null,                                                              // retry, hookPermissionDecisionReason
             HookOutcome.SUCCESS, null, null, null, null, null, null, null, null);                                  // outcome, stopReason, permissionBehavior, permissionRequestResult, hook, +4 awaiting
+    }
+
+    /**
+     * success + impossible 标记 · [goal V253] 对齐 CC v2.1.212 的 impossible 分支。
+     *
+     * <p>CC 该分支返回 {@code outcome:'success', impossible:true, stopReason:reason} ——
+     * 「条件根本不可能达成」时<b>交还控制权</b>而不是继续 block。若仍走 blocking，
+     * 目标会一直卡到撞连续 block 上限，模型陷入「明知道做不到还在试」的死循环。
+     *
+     * @param stopReason 评估器给出的 reason（CC 侧即 goal 的 lastReason）
+     */
+    private HookResult successWithImpossible(String hookName, String effectiveToolUseID,
+                                             HookEvent hookEvent, String stopReason) {
+        return new HookResult(
+            false, null, null, null,
+            AttachmentMessageDto.hookSuccess(hookName, effectiveToolUseID, hookEvent.type().name()),
+            null, null,
+            null, null,
+            HookOutcome.SUCCESS,
+            stopReason,                                        // stopReason = 评估器 reason
+            null, null, null, null, null, null, null,
+            Boolean.TRUE);                                     // impossible = true
     }
 
     /**
@@ -467,8 +518,9 @@ public class ExecPromptHook {
     }
 
     /**
-     * 校验 hook 响应 schema · 对齐 CC hookHelpers.ts:16-24 hookResponseSchema (Zod).
-     * {@code {ok: boolean, reason?: string}}；reason:null 判非法（CCJ-EXEC-12）。
+     * 校验 hook 响应 schema · 对齐 CC v2.1.212 stop-condition 评估器的
+     * {@code hookResponseSchema}：{@code {ok: boolean, reason?: string, impossible?: boolean}}；
+     * reason:null 判非法（CCJ-EXEC-12）。
      *
      * @return null 表示校验通过; 非 null 为错误描述
      */
@@ -486,6 +538,13 @@ public class ExecPromptHook {
         //   旧实现 isNull() 放行（→ success/blocking 分流），语义偏移。
         if (!reasonNode.isMissingNode() && !reasonNode.isTextual()) {
             return "reason must be string, got " + reasonNode.getNodeType();
+        }
+        // [goal V253] impossible 可选布尔 · 对齐 CC v2.1.212 的
+        //   {@code impossible: z.boolean().optional().describe("Whether the condition can never be
+        //   satisfied (only meaningful when ok is false)")}
+        JsonNode impossibleNode = json.path("impossible");
+        if (!impossibleNode.isMissingNode() && !impossibleNode.isBoolean()) {
+            return "impossible must be boolean, got " + impossibleNode.getNodeType();
         }
         return null;
     }

@@ -26,6 +26,13 @@ export const marketApi = {
   listInstalled: () =>
     api<string[]>(`/plugins/installed`, {}, MARKET_BASE),
   /**
+   * 卸载插件 · DELETE /api/plugins/{name}（[2026-11-01 skill-market v4] 「⋯ → 卸载」）。
+   *
+   * <p>⚠️ <b>破坏性且不可恢复</b>（后端真实删除安装目录）。调用前必须二次确认。
+   */
+  uninstallPlugin: (name: string) =>
+    api<PluginInstallResult>(`/plugins/${encodeURIComponent(name)}`, { method: 'DELETE' }, MARKET_BASE),
+  /**
    * 已安装插件明细（含内容指纹）· GET /api/plugins/installed/detail
    * 用途：市场条目指纹 ≠ 本地指纹 ⇒ 即使名称、版本都相同也显示「更新」。
    */

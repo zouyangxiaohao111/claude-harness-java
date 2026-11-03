@@ -230,6 +230,23 @@ public class ChatService {
     //   loop.run() 返回后 :299 检查，已删会话 in-flight turn 仍继续跑并推 STOMP 至已删 topic
     //   （探查 S4 目标击穿）。best-effort，required=false。
     @Autowired(required = false) private SessionAgentStateRegistry sessionAgentStateRegistry;
+    /**
+     * [goal V253] 目标（/goal）服务 · 供 {@link #restoreGoalForResume} 恢复目标 + 重挂 Stop hook。
+     * 可空：未接线 → 目标机制不生效（老路径行为不变）。
+     */
+    /**
+     * [goal V253] 目标（/goal）服务 · 供 {@link #restoreGoalForResume} 恢复目标 + 重挂 Stop hook。
+     *
+     * <p><b>WHY 用 ObjectProvider 而不是直接注入</b>：直接注入会形成 Spring 循环依赖
+     * {@code ChatService → GoalService → SessionService → ChatService}
+     * （SessionService 在删会话时要回调 ChatService.cancelSession）⇒ 启动期直接失败：
+     * {@code Relying upon circular references is discouraged and they are prohibited by default}。
+     *
+     * <p>⇒ {@link ObjectProvider} 延迟解析：启动期不建立依赖边，运行时才取 bean。
+     * 可空：未接线 → 目标机制不生效（老路径行为不变）。
+     */
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<com.nexusai.application.agent.goal.GoalService> goalServiceProvider;
     // [P5-①/②] SkillRegistry · userInvocable=false 拒绝 + immediate local-jsx busy 优先判定用
     //   （对齐 CC getCommand / findCommand，SkillRegistry.java:1204-1215 三维匹配）。
     @Autowired(required = false) private SkillRegistry skillRegistry;
@@ -913,6 +930,12 @@ public class ChatService {
         //   （对齐 CC sessionRestore.ts:332-366 restoreWorktreeForResume）
         restoreWorktreeForResume(sessionId);
 
+        // [goal V253] resume 恢复：目标（/goal）从 sessions.goal 列读回并重挂 prompt Stop hook
+        //   （对齐 CC claude.exe v2.1.212 的 restoreGoalFromTranscript —— 但真源读**列**而非反推
+        //   transcript：压缩会剪掉旧的 goal attachment，反推会丢目标）。
+        //   已达成 / 已放弃的目标不复活；恢复时重置 setAt / tokensAtStart 基线（CC 同款）。
+        restoreGoalForResume(sessionId);
+
         String modelName = resolveModelNameForSession(session, req != null ? req.modelName() : null);
         // [P1 · slash-align] 技能级 model 覆盖（prompt 型命令 command.model，CC :917）
         if (slashModelOverride != null) {
@@ -938,6 +961,14 @@ public class ChatService {
         ChatTask task = new ChatTask(sessionId, userMessageId,
             "msg-pending-" + UUID.randomUUID().toString().substring(0, 8));
         inProgress.put(sessionId, task);
+
+        // [产物轮内监看 · 2026-11-03] 本轮开始 → 每 2s 扫一次交付物目录。
+        //   WHY：提示词允许「技能要求固定位置时生成后复制」，而 cp/脚本复制**不经任何写盘钩子**
+        //   ⇒ 否则只能等轮末抽取，而前端自动展开的门控是「本轮仍在跑」⇒ 永不重叠（用户实测）。
+        //   ⛔ 只覆盖「本轮执行中」：自动展开只在这段时间有意义，轮末的产物卡由用户自己点。
+        if (sessionArtifactService != null) {
+            sessionArtifactService.startTurnWatch(sessionId);
+        }
 
         // 3) 解析 provider
         ProviderConfig config;
@@ -1192,6 +1223,11 @@ public class ChatService {
                 SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
                 idleWhy);
             inProgress.remove(sessionId, task);
+            // [产物轮内监看] 与 startTurnWatch 成对收口 —— 否则定时任务跨轮常驻，
+            //   已结束的轮仍会继续自动展开产物面板。
+            if (sessionArtifactService != null) {
+                sessionArtifactService.stopTurnWatch(sessionId);
+            }
         }
 
         // 9) 标题第二次总结：用本轮完整会话内容刷新（覆盖第一次的「首条提问摘要」）并置
@@ -4187,6 +4223,43 @@ public class ChatService {
                 sessionKey, worktreePathStr));
         log.info("[ChatService] resume 恢复 worktree cwd: session={} worktreePath={} originalCwd={}",
                 sessionId, worktreePathStr, worktreePathStr);
+    }
+
+    /**
+     * [goal V253] resume 恢复目标（/goal）· 对齐 CC claude.exe v2.1.212 的
+     * {@code restoreGoalFromTranscript}。
+     *
+     * <p><b>与 CC 的差异（有意为之）</b>：CC 从 transcript 反推（扫消息找最后一条
+     * {@code goal_status} 附件），本仓从 {@code sessions.goal} 列读 —— 因为<b>压缩会剪掉旧的
+     * goal attachment</b>，一旦「目标设定」那条落在压缩边界之前，CC 式反推就再也恢复不出来。
+     * 列独立于消息生命周期 ⇒ 恢复永远可靠。
+     *
+     * <p>CC 的其余语义逐条对齐：
+     * <ul>
+     *   <li>内存已 armed 且条件一致 ⇒ 跳过（fresh 守卫，防重复挂 hook）</li>
+     *   <li>目标已 met / failed（phase ≠ active）⇒ <b>不</b>复活</li>
+     *   <li>恢复时<b>重置</b> {@code iterations=0} / {@code setAt=now} / {@code tokensAtStart=当前}</li>
+     * </ul>
+     */
+    private void restoreGoalForResume(String sessionId) {
+        com.nexusai.application.agent.goal.GoalService goalService =
+            goalServiceProvider != null ? goalServiceProvider.getIfAvailable() : null;
+        if (goalService == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            long outputTokens = 0L;
+            if (sessionAgentStateRegistry != null) {
+                com.nexusai.application.agent.AgentState st = sessionAgentStateRegistry.get(sessionId);
+                if (st != null) {
+                    outputTokens = st.sessionOutputTokens();
+                }
+            }
+            goalService.restoreForResume(sessionId, outputTokens);
+        } catch (Exception e) {
+            log.warn("[ChatService] resume 恢复目标失败（不影响本轮对话）session={}: {}",
+                sessionId, e.toString());
+        }
     }
 
     /**

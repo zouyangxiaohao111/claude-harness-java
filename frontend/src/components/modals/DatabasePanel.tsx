@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { FormModal } from '@/components/ui/FormModal'
+import { Icon } from '@/icons'
 import { ApiError } from '@/api/rest'
 import type {
   DatabaseConnection,
@@ -15,6 +16,7 @@ interface DatabasePanelProps {
   showToast: (msg: string, type?: 'success' | 'info') => void
 }
 
+/** 数据库类型选项（分段控件 · 4 项横排）。 */
 const TYPE_OPTIONS: { value: DatabaseType; label: string }[] = [
   { value: 'postgres', label: 'PostgreSQL' },
   { value: 'mysql', label: 'MySQL' },
@@ -70,12 +72,6 @@ const toForm = (d: DatabaseConnection): DbFormValue => ({
   user: d.user,
   password: '',
 })
-
-const EditIcon = () => (
-  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-    <path d="M9 2L12 5L5 12H2V9L9 2Z" />
-  </svg>
-)
 
 /**
  * DatabasePanel · Phase C3 联调版
@@ -227,7 +223,7 @@ export function DatabasePanel({ databasesApi, showToast }: DatabasePanelProps) {
               onClick={() => setEditing(d)}
               disabled={pending}
             >
-              <EditIcon />
+              <Icon.Edit />
             </button>
             <button
               className="skill-remove"
@@ -235,7 +231,7 @@ export function DatabasePanel({ databasesApi, showToast }: DatabasePanelProps) {
               title="移除"
               disabled={pending}
             >
-              ×
+              <Icon.Trash />
             </button>
           </div>
         </div>
@@ -251,7 +247,7 @@ export function DatabasePanel({ databasesApi, showToast }: DatabasePanelProps) {
               title: '基础信息',
               fields: [
                 { type: 'text', name: 'name', label: '连接名称' },
-                { type: 'select', name: 'type', label: '类型', options: TYPE_OPTIONS },
+                { type: 'radio-segments', name: 'type', label: '类型', options: TYPE_OPTIONS },
               ],
             },
             {
@@ -280,7 +276,7 @@ export function DatabasePanel({ databasesApi, showToast }: DatabasePanelProps) {
               title: '基础信息',
               fields: [
                 { type: 'text', name: 'name', label: '连接名称', placeholder: 'e.g. 生产 DB' },
-                { type: 'select', name: 'type', label: '类型', options: TYPE_OPTIONS },
+                { type: 'radio-segments', name: 'type', label: '类型', options: TYPE_OPTIONS },
               ],
             },
             {

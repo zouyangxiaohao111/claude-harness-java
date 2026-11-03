@@ -28,7 +28,7 @@ function render(type: Model['type']) {
     root!.render(
       <ModelFormModal
         initial={{ ...BASE, type }}
-        providerName="Provider"
+        providerTag="DS"
         onSave={() => {}}
         onCancel={() => {}}
       />,
@@ -71,16 +71,25 @@ describe('ModelFormModal · 类型切换配置页', () => {
     expect(text).toContain('重排序（仅 Rerank 类型生效）')
   })
 
-  it('切换 select 类型 → 配置页即时切换', () => {
+  it('切换模型类型 → 配置页即时切换', () => {
     render('chat')
-    const select = container!.querySelector('.fm-select') as HTMLSelectElement
-    expect(select).toBeTruthy()
+    // [2026-10-31] 模型类型从原生 <select> 改为卡片式单选（radio-cards）——
+    //   「切换类型后下方参数区立即跟着换」是本用例锁的意图，交互载体从 select 换成卡片。
+    const cards = Array.from(container!.querySelectorAll<HTMLElement>('.fm-radio-item.card'))
+    const embedding = cards.find((c) => (c.textContent ?? '').includes('Embedding'))
+    expect(embedding, '模型类型选项卡未渲染').toBeTruthy()
     act(() => {
-      select.value = 'embedding'
-      select.dispatchEvent(new Event('change', { bubbles: true }))
+      embedding!.dispatchEvent(new MouseEvent('click', { bubbles: true }))
     })
     const text = container!.textContent ?? ''
     expect(text).toContain('向量嵌入（仅 Embedding 类型生效）')
     expect(text).not.toContain('生成参数')
+  })
+
+  it('模型类型不再用原生 select（原生下拉把能力类型藏在一行文字后面）', () => {
+    render('chat')
+    expect(container!.querySelector('.fm-select')).toBeNull()
+    // 9 个类型选项全部摊在一屏可见
+    expect(container!.querySelectorAll('.fm-radio-item.card').length).toBe(9)
   })
 })

@@ -200,6 +200,24 @@ public class SessionRecord {
      * 本列仅存 JSON 串、解析在读侧）。
      */
     private String computerUseGrants;
+    /**
+     * 会话级目标状态（V253 列 goal，TEXT JSON 对象，可空）· CC original: appState.activeGoal
+     * （claude.exe v2.1.212 {@code activeGoal:{condition, iterations, setAt, tokensAtStart}}）。
+     * <p>CC 的 activeGoal 活在<b>长驻进程内存</b>里（单进程 CLI）⇒ 本仓 Web 端每 send
+     * 新建 LlmAgentLoop（prototype 作用域）⇒ 内存态活不过下一条用户消息 ⇒ 必须由会话列承载
+     * （multi-session-vs-cc-single-session 铁律：todos V43 / effort_level V31 /
+     * disabled_tools V35 / team_context V40 / computer_use_grants V250 同款范式）。
+     * <p>规范形 {"condition":"…","phase":"active","iterations":2,"setAt":…,
+     * "tokensAtStart":…,"lastReason":"…"}；phase ∈ active|achieved|impossible
+     * （<b>没有</b> DSH 的 paused/blocked —— 那是它缺评估器的补偿机制）。
+     * <p>⛔ 本列只存<b>当前快照</b>，不存历史。历史/审计在 messages 的 goal_status 附件里
+     * （transcript 本来就 append-only）。恢复时读本列而非反推 transcript ——
+     * 压缩会剪掉旧的 goal attachment，反推会丢目标。
+     * <p>可空：null = 该会话无目标（读侧降级为 null + WARN，不抛）。
+     * 读写解析放 SessionGoal.toJson / fromJson（照抄 disabledTools L51 先例：
+     * 本列仅存 JSON 串、解析在读侧）。
+     */
+    private String goal;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -268,4 +286,7 @@ public class SessionRecord {
     // [computer-use Phase 1a V250] 会话级 computer-use 授权位 getter/setter（V250 会话列 computer_use_grants，MyBatis-Flex snake↔camel 映射）
     public String getComputerUseGrants() { return computerUseGrants; }
     public void setComputerUseGrants(String computerUseGrants) { this.computerUseGrants = computerUseGrants; }
+    // [goal V253] 会话级目标状态 getter/setter（V253 会话列 goal，MyBatis-Flex snake↔camel 映射）
+    public String getGoal() { return goal; }
+    public void setGoal(String goal) { this.goal = goal; }
 }

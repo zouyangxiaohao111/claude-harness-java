@@ -21,14 +21,21 @@ import type { UIAction } from './reducers'
 
 /**
  * Build a `showToast(msg, type)` function bound to a UI reducer dispatch.
- * Mirrors the original 2-second auto-dismiss behaviour exactly (no timer
- * cancellation, to stay bug-for-bug compatible with the prior implementation).
+ *
+ * <p>展示时长：成功类 2000ms；错误/信息类（含发送失败原因）<b>6000ms</b>。
+ *
+ * <p><b>WHY 分开计时（2026-11-01 用户反馈「发送失败一闪而逝」）</b>：此前一律 2s ——
+ * 「已保存」这类一句话提示 2s 足够，但「编辑并重新发送失败：&lt;后端原因&gt;」往往两三十个字，
+ * 2 秒根本读不完，用户只看到闪了一下，不知道发生了什么、更不知道该怎么处理。
+ * 失败信息的价值全在「能读完」⇒ 按类型给时长，而不是一刀切。
+ *
+ * <p>返回值（计时器 id）可忽略：既有调用点全部按 fire-and-forget 使用。
  */
 export function useToastDispatcher(dispatch: Dispatch<UIAction>) {
   return useCallback(
     (msg: string, type: ToastType = 'info') => {
       dispatch({ type: 'SHOW_TOAST', msg, toastType: type })
-      window.setTimeout(() => dispatch({ type: 'HIDE_TOAST' }), 2000)
+      window.setTimeout(() => dispatch({ type: 'HIDE_TOAST' }), type === 'success' ? 2000 : 6000)
     },
     [dispatch],
   )

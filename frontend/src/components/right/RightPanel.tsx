@@ -1477,6 +1477,7 @@ export const RightPanel = memo(function RightPanel({
               active={viewing.active}
               onBack={() => setViewing(null)}
               showToast={showToast}
+              clientRef={socketClientRef}
             />
           ) : shownTab === 'projects' ? projectsSection
             : shownTab === 'files' ? filesSection
@@ -1566,6 +1567,7 @@ export const RightPanel = memo(function RightPanel({
             expanded={expandedView}
             onExpand={() => setExpandedView((v) => !v)}
             showToast={showToast}
+            clientRef={socketClientRef}
           />
         ) : (
         <>

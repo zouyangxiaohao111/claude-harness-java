@@ -42,7 +42,20 @@ public record AgentMessage(
     String timestamp,
     // [2026-10-21] 思考内容 · CC original: msg.reasoning（子代理转录里的 thinking 文本）
     //   原先解析时被丢弃 ⇒ 右栏对话视图看不到思考，而主对话能看到。
-    String reasoning
+    String reasoning,
+    // [2026-11-02] 系统注入行三件套 · CC original: msg.isMeta / msg.author / msg.type(subtype)
+    //
+    //   WHY（用户实测「<system-reminder> 被渲染成用户气泡，应该显示为系统提示」）：
+    //   transcript 此前**完全没有**这三个字段 ⇒ 消费侧（右栏 AgentTranscriptView）无法区分
+    //   「用户真打的字」与「系统注入的 meta 行」（skill_listing / edited_text_file / date_change /
+    //   changed_files / hook 回执 …）。它们在 DTO 里都是 role=user，于是右栏把技能清单这种
+    //   几 KB 的系统提示渲染成了一条用户气泡。
+    //
+    //   写入侧 {@code SubagentExecutor.chatMessageToMap} 与读侧 {@link AgentTranscript#parseMessageNode}
+    //   同步补齐；缺省值（旧转录无这些键）= false / null，与 CC undefined 同义（非双轨）。
+    boolean isMeta,
+    String author,
+    String subtype
 ) {
     /** CC original: tool_use 块 id/name/input (messages.ts:2795 block.id / block.name). */
     public record ToolCallInfo(String id, String name, String arguments) {}
@@ -62,7 +75,7 @@ public record AgentMessage(
                         boolean isSidechain, String uuid, String parentUuid,
                         List<ToolCallInfo> toolCalls, String toolCallId) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, null, null);
+            toolCalls, toolCallId, null, null, false, null, null);
     }
 
     /** 兼容构造（含 timestamp，无 reasoning）· 既有测试/调用方沿用 10 参。 */
@@ -70,10 +83,20 @@ public record AgentMessage(
                         boolean isSidechain, String uuid, String parentUuid,
                         List<ToolCallInfo> toolCalls, String toolCallId, String timestamp) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, timestamp, null);
+            toolCalls, toolCallId, timestamp, null, false, null, null);
+    }
+
+    /** 兼容构造（含 timestamp + reasoning，无系统注入三件套）· 11 参。 */
+    public AgentMessage(String role, String content, boolean isApiError, String agentId,
+                        boolean isSidechain, String uuid, String parentUuid,
+                        List<ToolCallInfo> toolCalls, String toolCallId, String timestamp,
+                        String reasoning) {
+        this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
+            toolCalls, toolCallId, timestamp, reasoning, false, null, null);
     }
 
     public static AgentMessage of(String role, String content) {
-        return new AgentMessage(role, content, false, null, false, null, null, List.<ToolCallInfo>of(), null, null, null);
+        return new AgentMessage(role, content, false, null, false, null, null,
+            List.<ToolCallInfo>of(), null, null, null, false, null, null);
     }
 }

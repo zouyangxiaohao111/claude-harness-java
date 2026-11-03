@@ -11,7 +11,7 @@ import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
  * [产物卡片] 会话最后一条 assistant 下方展示后端抽取的交付物。
  *
  * <b>WHY（规则九 · 测试验证意图）</b>：产物是「最终交付物」，不是过程文件 —— 用户只在**本轮结束时**、
- * 在**正文末尾**看到最多 3 张成果卡片，超出部分交给「查看所有产物 (N)」入口。
+ * 在**正文末尾**看到最多 5 张成果卡片（取**最新**的），超出部分交给「查看所有产物 (N)」入口。
  *
  * <p>[2026-10-31 产物卡片改版] 正文卡片与右栏「产物」tab 是**同一套**组件（{@code ArtifactCards}）：
  *   · 断言落在 {@code .artifact-card} / {@code .ac-name} / {@code .ac-size}（同一套 DOM），
@@ -37,7 +37,7 @@ const userMsg = (id: string): ChatMessageDto => ({ ...baseMsg(id, 'user', '用�
 const assistantMsg = (id: string): ChatMessageDto => baseMsg(id, 'assistant', `助手回复 ${id}`)
 
 function art(id: string, title: string, localPath: string | null, sizeBytes: number | null = 2048): SessionArtifactDto {
-  return { id, kind: 'deliverable', title, localPath, url: null, sizeBytes, summary: null, updatedAt: null }
+  return { id, kind: 'deliverable', title, localPath, url: null, sizeBytes, summary: null, updatedAt: null, directory: false }
 }
 
 let container: HTMLDivElement
@@ -70,7 +70,7 @@ const click = (el: Element) => act(() => {
   el.dispatchEvent(new MouseEvent('click', { bubbles: true }))
 })
 
-describe('[产物卡片] 正文最多 3 张 + 全量计数', () => {
+describe('[产物卡片] 正文最多 5 张（最新）+ 全量计数', () => {
   beforeEach(() => {
     (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
     useChatStore.setState({
@@ -87,27 +87,40 @@ describe('[产物卡片] 正文最多 3 张 + 全量计数', () => {
     root = undefined as unknown as Root
   })
 
-  it('4 条产物 → 正文只渲染 3 张，计数仍是 4', () => {
+  it('7 条产物 → 正文只渲染最新的 5 张，计数仍是 7', () => {
     const deliverables = [
       art('a1', '报告.html', 'D:/out/报告.html'),
       art('a2', '清单.xlsx', 'D:/out/清单.xlsx'),
       art('a3', '图纸.pdf', 'D:/out/图纸.pdf'),
       art('a4', '附录.docx', 'D:/out/附录.docx'),
+      art('a5', '附件.md', 'D:/out/附件.md'),
+      art('a6', '源码.zip', 'D:/out/源码.zip'),
+      art('a7', '封面.png', 'D:/out/封面.png'),
     ]
     renderList([userMsg('u1'), assistantMsg('m1')], { deliverables, sources: [] })
     const cards = container.querySelectorAll('.artifact-card')
-    expect(cards).toHaveLength(3)
+    expect(cards).toHaveLength(5)
+    // 后端已按 updated_at 倒序 ⇒ 正文取的就是**最新**的 5 个
     expect(Array.from(cards).map((c) => c.querySelector('.ac-name')?.textContent))
-      .toEqual(['报告.html', '清单.xlsx', '图纸.pdf'])
+      .toEqual(['报告.html', '清单.xlsx', '图纸.pdf', '附录.docx', '附件.md'])
     // 卡片区在 TurnFooter 之前（同一 wrapper 内，卡片先出现）
     const artifactsBox = container.querySelector('.msg-artifacts')
     const footer = container.querySelector('.msg-links')
     expect(artifactsBox).not.toBeNull()
     expect(footer).not.toBeNull()
     expect(artifactsBox!.compareDocumentPosition(footer!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
-    expect(footer!.textContent).toContain('(4)')
+    expect(footer!.textContent).toContain('(7)')
     // 大小一行（无 summary 时只有大小）
     expect(cards[0]!.querySelector('.ac-size')?.textContent).toBe('2KB')
+  })
+
+  it('不足 5 个 → 按实际有几个显示几个（不补位、不留空卡）', () => {
+    const deliverables = [
+      art('a1', '报告.html', 'D:/out/报告.html'),
+      art('a2', '清单.xlsx', 'D:/out/清单.xlsx'),
+    ]
+    renderList([userMsg('u1'), assistantMsg('m1')], { deliverables, sources: [] })
+    expect(container.querySelectorAll('.artifact-card')).toHaveLength(2)
   })
 
   it('点卡片 → 回调产物 DTO（与右栏同一个按类型分发的打开函数）', () => {

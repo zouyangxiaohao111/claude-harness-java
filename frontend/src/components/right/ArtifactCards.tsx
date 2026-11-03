@@ -51,6 +51,8 @@ const KIND_ICON: Record<ArtifactKind, ReactNode> = {
     </>
   ),
   file: (<>{PageShape}<path d="M9 12.4h6M9 15.4h6M9 18.4h4" /></>),
+  /** 目录（文件夹线框 · 与其它图标同规格：24×24 viewBox · stroke 1.6 · currentColor） */
+  dir: (<path d="M3.4 7.4a2 2 0 0 1 2-2h3.4l2 2.4h7.4a2 2 0 0 1 2 2v8.4a2 2 0 0 1-2 2H5.4a2 2 0 0 1-2-2z" />),
 }
 
 /** 产物类型图标（底色分色由 CSS 的 `.ac-ico.k-<kind>` 决定）。 */
@@ -89,6 +91,8 @@ export interface ArtifactCardsProps {
  *
  * <p>「在浏览器中打开」**只有 html 有**（其它类型不是网页，外链打开无意义）；
  * 「编辑」**只有文本类有**（二进制 PUT /content 会 400 ⇒ 不给假入口）。
+ * <p><b>目录产物</b>（后端 {@code directory=true}）：文件夹图标 + 大小行写「目录」，
+ * 既不给「编辑」也不给「在浏览器中打开」（目录既不能预览也不能编辑）。
  */
 export const ArtifactCards = memo(function ArtifactCards({
   items,
@@ -101,8 +105,8 @@ export const ArtifactCards = memo(function ArtifactCards({
   return (
     <div className={`artifact-cards${compact ? ' compact' : ''}`}>
       {items.map((a) => {
-        const kind = artifactKindOf(a.title)
-        const editable = isTextArtifact(a.title)
+        const kind = artifactKindOf(a)
+        const editable = isTextArtifact(a)
         const showBrowser = kind === 'html' && !!onOpenInBrowser
         const showEdit = editable && !!onEdit
         return (
@@ -117,6 +121,18 @@ export const ArtifactCards = memo(function ArtifactCards({
               if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen?.(a) }
             }}
           >
+            <span className={`ac-ico k-${kind}`}>
+              <ArtifactKindIcon kind={kind} />
+            </span>
+            <span className="ac-text">
+              <span className="ac-name" title={a.title}>{a.title}</span>
+              {/* 目录没有大小（sizeBytes 恒 null）⇒ 大小行写「目录」，别留空 */}
+              {kind === 'dir' ? (
+                <span className="ac-size">目录</span>
+              ) : a.sizeBytes != null ? (
+                <span className="ac-size">{formatFileSize(a.sizeBytes)}</span>
+              ) : null}
+            </span>
             {(showBrowser || showEdit) && (
               <span className="ac-actions">
                 {showBrowser && (
@@ -149,13 +165,6 @@ export const ArtifactCards = memo(function ArtifactCards({
                 )}
               </span>
             )}
-            <span className={`ac-ico k-${kind}`}>
-              <ArtifactKindIcon kind={kind} />
-            </span>
-            <span className="ac-name" title={a.title}>{a.title}</span>
-            <span className="ac-size">
-              {a.sizeBytes != null ? formatFileSize(a.sizeBytes) : ''}
-            </span>
           </div>
         )
       })}

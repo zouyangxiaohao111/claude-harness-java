@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.computeruse;
 
+import java.util.List;
+
 /**
  * 输入动作的<b>前台应用白名单 + 档位</b>门控 · computer-use 各输入工具共用。
  *
@@ -43,16 +45,25 @@ public final class ComputerUseInputGate {
             // 未接授权体系（PoC / 单测路径）⇒ 不门控
             return null;
         }
-        String foregroundAppId = foregroundAppResolver.currentAppId();
-        if (foregroundAppId == null || foregroundAppId.isBlank()) {
+        // 前台应用的<b>全部等价键</b>（Windows 只有 exe 名；macOS 有 bundleId + 本地化显示名）
+        List<String> foregroundAliases = foregroundAppResolver.currentAppAliases();
+        if (foregroundAliases.isEmpty()) {
             // CCB toolCalls.ts:502-506 —— 取不到前台应用 ⇒ 放行
             return null;
         }
         ComputerUseGrants grants = grantStore.read(sessionId);
-        ComputerUseGrant grant = grants.findByAppId(foregroundAppId);
+        // 「命中任一别名即授权」：macOS 上授权名可能是 Finder / 访达 / com.apple.finder 之一
+        ComputerUseGrant grant = null;
+        for (String alias : foregroundAliases) {
+            grant = grants.findByAppId(alias);
+            if (grant != null) {
+                break;
+            }
+        }
         if (grant == null) {
             // CCB toolCalls.ts:578-583
-            return "\"" + foregroundAppId + "\" is not in the allowed applications and is currently in front. "
+            return "\"" + String.join("\" / \"", foregroundAliases)
+                    + "\" is not in the allowed applications and is currently in front. "
                     + "Take a new screenshot — it may have appeared since your last one.";
         }
         if (!ComputerUseTierGate.tierSatisfies(grant.tier(), actionKind)) {

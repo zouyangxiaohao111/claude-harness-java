@@ -5402,8 +5402,12 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 hookName, modelName, resolution.provider().type(), resolution.config().baseUrl());
         }
         // [IMPL-06 OD-EX-04] attachment 注入 command/durationMs · 对齐 CC hooks.ts:2241-2250
+        // [goal V253] withHook(promptHook) · 让消费端能识别「这个结果来自 prompt 型 hook」。
+        //   目标（/goal）的达成判据依赖它：必须确认是 **prompt hook 返回 SUCCESS**，
+        //   而不是「没有 blockingError」（门控跳过 / 评估器报错时同样没有 blockingError）。
         return injectHookCommandAndDuration(
-            executor.exec(promptHook, hookName, event, jsonInput, llmContext, parentAbort, messages),
+            executor.exec(promptHook, hookName, event, jsonInput, llmContext, parentAbort, messages)
+                .withHook(promptHook),
             hookCommandFor(promptHook), hookStartMs);
     }
 
@@ -5595,11 +5599,14 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         AttachmentMessageDto enriched =
             AttachmentMessageDto.withCommandAndDuration(att, hookCommand,
                 System.currentTimeMillis() - hookStartMs);
+        // [goal V253] 必须透传 impossible —— 18 参构造器会把它置 null。
+        // 丢失 ⇒ 评估器判「不可能达成」的结果被降级成普通 success ⇒ 目标永不停。
         return new GenericHook.HookResult(result.preventContinuation(), result.blockingError(),
             result.systemMessages(), result.additionalContexts(), enriched,
             result.updatedInput(), result.updatedMCPToolOutput(), result.retry(),
             result.hookPermissionDecisionReason(), result.outcome(), result.stopReason(),
-            result.permissionBehavior(), null, result.hook(), null, null, null, null);
+            result.permissionBehavior(), null, result.hook(), null, null, null, null,
+            result.impossible());
     }
 
     /** CC getHookDisplayText 等价（hooksSettings.ts:68-90）· statusMessage 优先，缺省 prompt/url/command. */

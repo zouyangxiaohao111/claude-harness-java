@@ -159,20 +159,25 @@ class ComputerUseWindowsToolsTest {
     }
 
     @Test
-    @DisplayName("click_element / type_into_element 的选择器字段逐字对齐 CCB（name/role/automationId）")
+    @DisplayName("click_element / type_into_element 保留 CCB 三项选择器，并新增 dsh 风格观察绑定参数")
     void elementToolSelectorsAreExact() {
         ComputerUsePhase2bFakes.FakeUiaService uia = new ComputerUsePhase2bFakes.FakeUiaService();
         ComputerUsePhase2bFakes.RecordingWindowOps ops = new ComputerUsePhase2bFakes.RecordingWindowOps();
         ComputerUseWindowBindingStore store = new ComputerUseWindowBindingStore();
 
+        // WHY：CCB 的三项（name/role/automationId）必须继续存在（Windows 用法不变）；
+        // 新增的 observationId/index/targetHandle/allowRebind 是 macOS 的 AX 观察绑定
+        // （dsh 语义：元素序号只属于那一次 observation）。
         JsonNode click = new ComputerUseClickElementTool(uia, ops, store).inputSchema();
         assertThat(click.path("properties").fieldNames()).toIterable()
-                .containsExactlyInAnyOrder("name", "role", "automationId");
+                .contains("name", "role", "automationId",
+                        "observationId", "index", "targetHandle", "allowRebind");
         assertThat(click.path("required")).isEmpty();
 
         JsonNode type = new ComputerUseTypeIntoElementTool(uia, ops, store).inputSchema();
         assertThat(type.path("properties").fieldNames()).toIterable()
-                .containsExactlyInAnyOrder("name", "role", "automationId", "text");
+                .contains("name", "role", "automationId", "text",
+                        "observationId", "index", "targetHandle", "allowRebind");
         assertThat(type.path("required")).extracting(JsonNode::asText).containsExactly("text");
     }
 

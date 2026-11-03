@@ -1,5 +1,6 @@
 import { useEffect, useRef } from 'react'
 import { Client, type StompSubscription } from '@stomp/stompjs'
+import { parseGoalPayload } from '@/utils/goalState'
 import { useChatStore, type PermissionRequestItem } from '../stores/chatStore'
 import { sessionApi, type PermissionEventPayload } from '../api/sessions'
 import { createSocketClient, subscribeStream, notifySocketConnect, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
@@ -332,6 +333,15 @@ export function useChatSocket(
    * <p>缺省 `[]` → 只监听当前会话（旧行为，测试/嵌入方零改动）。
    */
   knownSessionIds?: string[],
+  /**
+   * [产物实时推送 2026-11-02] 后端产物抽取完成推了 `/topic/sessions/{sid}/artifact`
+   * → 回调 App 立即重拉产物列表（不再等 15 秒轮询）。
+   *
+   * <p>只做「踢一脚」：不解析载荷里的字段（后端 DTO 会演进），重拉 list 才是唯一权威口径，
+   * 与既有「轮末 3 秒补拉」走同一条 {@code reloadArtifacts} 路径。
+   * ⚠️ 必须放在参数表**末尾**：调用方全用位置参数，插在中间会让后续实参整体错位。
+   */
+  onArtifactPush?: (sid: string) => void,
 ) {
   const clientRef = useRef<Client | null>(null)
   const setConnection = useChatStore((s) => s.setConnection)
@@ -347,6 +357,9 @@ export function useChatSocket(
   activeStreamsRef.current = activeStreams
   // onSessionDone 经 ref 转发（effect/闭包不捕获过期回调）
   const onSessionDoneRef = useRef(onSessionDone)
+  /** [产物实时推送] 同款 ref 转发（订阅闭包建立于连接时，不能捕获过期回调） */
+  const onArtifactPushRef = useRef(onArtifactPush)
+  onArtifactPushRef.current = onArtifactPush
   onSessionDoneRef.current = onSessionDone
   // onQueueDrained 经 ref 转发
   const onQueueDrainedRef = useRef(onQueueDrained)
@@ -376,7 +389,7 @@ export function useChatSocket(
   const statusSubsRef = useRef<Map<string, StompSubscription>>(new Map())
   /** 会话级常驻订阅登记：sid -> { token, queue }（token-warning / queue 按 sid 常驻 ——
    *   切走后原会话排队消费（queue.drained）/ 压缩警告仍需收；不随 sessionId 重订，同 stream/perm 模式）。 */
-  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription; compact: StompSubscription; files: StompSubscription }>>(new Map())
+  const sessionLevelSubsRef = useRef<Map<string, { token: StompSubscription; queue: StompSubscription; compact: StompSubscription; files: StompSubscription; artifact: StompSubscription; goal: StompSubscription }>>(new Map())
   /** 当前会话 scoped 订阅句柄（team/todo/skill —— 随 sessionId 切换重订；
    *   stream/perm/status/token-warning/queue 按 sid 常驻不在此列）。sessionId 变化时先退订再订阅，client 单例不重建。 */
   const sessionScopedSubsRef = useRef<StompSubscription[]>([])
@@ -479,6 +492,12 @@ export function useChatSocket(
         })
       }
     })
+    // [产物实时推送 2026-11-02] 后端抽取完成即推 → 立即重拉产物列表（不再等 15 秒轮询）。
+    //   只做「踢一脚」：拿到的载荷不带完整字段演进保证，重拉 list 才是唯一权威口径
+    //   （与既有轮末 3 秒补拉同一条路径，避免两处各自解析 DTO 而漂移）。
+    const artifact = client.subscribe(`/topic/sessions/${sid}/artifact`, () => {
+      onArtifactPushRef.current?.(sid)
+    })
     // 压缩进度（compact-progress · 按 sid 常驻）：manual/auto /compact 进行中 → 驱动输入框上方进度横幅 + 发送键变停止
     const compact = client.subscribe(`/topic/sessions/${sid}/compact-progress`, (msg) => {
       let raw: Record<string, unknown>
@@ -522,7 +541,18 @@ export function useChatSocket(
         useChatStore.getState().setChangedFiles(sid, toChangedSessionFiles(raw))
       }
     })
-    sessionLevelSubsRef.current.set(sid, { token, queue, compact, files })
+    // [goal V253] 目标状态推送（goal.changed · 会话级 topic）→ 直接写 chatStore.goal[sessionId]
+    //   ⚠️ 归一判据单点 = utils/goalState.parseGoalPayload（字段缺失/类型不对 → null ⇒ 不渲染坏 UI）。
+    //   前端**不自己推断** phase（那会重演 DSH「activation 失真」的坑：进程内状态重启后 disarm，
+    //   UI 直读会误判「在跑」）。
+    const goal = client.subscribe(`/topic/sessions/${sid}/goal`, (msg) => {
+      let raw: Record<string, unknown>
+      try { raw = JSON.parse(msg.body) } catch { return }
+      if (raw.type !== 'goal.changed') return
+      const payload = parseGoalPayload(raw.goal)
+      useChatStore.getState().setGoal(sid, payload)
+    })
+    sessionLevelSubsRef.current.set(sid, { token, queue, compact, files, artifact, goal })
   }
 
   /**
@@ -642,7 +672,7 @@ export function useChatSocket(
       // client 单例 unmount 时清理（会话级 scoped 订阅 + 按 sid 常驻订阅）
       for (const sub of sessionScopedSubsRef.current) sub.unsubscribe()
       sessionScopedSubsRef.current = []
-      for (const sub of sessionLevelSubsRef.current.values()) { sub.token.unsubscribe(); sub.queue.unsubscribe(); sub.compact.unsubscribe(); sub.files.unsubscribe() }
+      for (const sub of sessionLevelSubsRef.current.values()) { sub.token.unsubscribe(); sub.queue.unsubscribe(); sub.compact.unsubscribe(); sub.files.unsubscribe(); sub.artifact.unsubscribe() }
       sessionLevelSubsRef.current.clear()
       streamSubsRef.current.clear()
       permSubsRef.current.clear()

@@ -142,6 +142,19 @@ public class SessionArtifactService {
      */
     static final long RAW_MAX_BYTES = 50L * 1024L * 1024L;
 
+    /**
+     * 会产出来源的网络工具名（按名字匹配，大小写/前缀不敏感）。
+     *
+     * <p><b>WHY 用工具结果而不是 LLM 判断</b>（2026-11-02 用户裁定「来源从 websearch 和 webfetch
+     * 能拿到啊，不需要了」）：这两个工具的**结果里天然带 url**（WebSearch 的 hits 是
+     * {@code {title,url}}、WebFetch 的 outputSchema 有 {@code url} 字段）⇒
+     * 直接读结果就是确定性来源，不需要再让模型读一遍会话去「猜」哪些链接值得记录。
+     *
+     * <p>⛔ 与「交付物」不同：来源**没有磁盘文件**可扫，只能来自工具结果。所以这条通道
+     * 是来源功能的**唯一**确定性来源（LLM 抽取那条路随之可退）。
+     */
+    private static final String[] SOURCE_TOOL_KEYWORDS = {"websearch", "web_search", "webfetch", "web_fetch"};
+
     /** 工具入参里表示「文件路径」的键（Write/Edit/Read 等工具的实际字段名集合）。 */
     private static final String[] PATH_ARG_KEYS = {
             "file_path", "path", "notebook_path", "filePath",
@@ -182,6 +195,28 @@ public class SessionArtifactService {
 
     @Autowired private SessionArtifactMapper artifactMapper;
 
+    /**
+     * [产物实时推送 2026-11-02] STOMP 会话级 topic 的发送器。
+     *
+     * <p><b>WHY 需要</b>：抽取是**轮末异步**的，此前前端只能靠 15 秒轮询感知新产物 ⇒
+     * 「Agent 写完 html 立刻在右侧看到」做不到（最坏延迟 15s）。
+     * 推送后前端即时插入列表 → 侧栏随之自动展开 ⇒ 真正的「写完就出现」。
+     *
+     * <p>{@code @Autowired(required = false)} 字段注入（镜像 PartialCompactService 既有模式，
+     * **不动构造器签名** —— 直构单测逐位不变）：非 STOMP 运行时为 null ⇒ 不推送，
+     * 抽取照常完成，仅退化为轮询（与无 wsTemplate 时的其它链路同款降级）。
+     */
+    @Autowired(required = false) private org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate;
+
+    /** 测试注入 STOMP 模板（生产走 {@code @Autowired} 字段注入）。 */
+    public void setWsTemplate(org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate) {
+        this.wsTemplate = wsTemplate;
+    }
+
+    /** 产物 topic 后缀 · 与 compact-progress 同构：{@code /topic/sessions/{sid}/artifact}。 */
+    public static final String TOPIC_PREFIX = "/topic/sessions/";
+    public static final String TOPIC_SUFFIX = "/artifact";
+
     /** 会话消息读取（全量内部通道）· required=false 容错直接构造的单测。 */
     @Autowired(required = false) private MessageService messageService;
 
@@ -193,6 +228,19 @@ public class SessionArtifactService {
     /** 抽取开关（nexusai.artifacts.extract-enabled，默认 true）· 字段初值 true = 非 Spring 直构默认开。 */
     @Value("${nexusai.artifacts.extract-enabled:true}")
     private boolean extractEnabled = true;
+
+    /**
+     * **LLM 抽取**开关（nexusai.artifacts.llm-extract-enabled，默认 <b>false</b>）。
+     *
+     * <p><b>WHY 默认关</b>（2026-11-02 用户裁定）：交付物改由「扫固定目录」收集、来源改由
+     * 「读 WebSearch/WebFetch 结果」收集后，两条都是**确定性**通道，覆盖了绝大多数场景 ⇒
+     * 轮末那次旁路模型调用（读整段会话猜路径/猜链接）变成纯兜底，不值得每轮都花。
+     *
+     * <p>保留开关而不是删代码：{@code extractNow} 里那条路径覆盖「文件写在目录外」的残余情况，
+     * 需要时可以临时打开验证/补数据。
+     */
+    @Value("${nexusai.artifacts.llm-extract-enabled:false}")
+    private boolean llmExtractEnabled = false;
 
     /**
      * 产物归档开关（nexusai.artifacts.archive-enabled，默认 true）。
@@ -212,6 +260,34 @@ public class SessionArtifactService {
         t.setDaemon(true);
         return t;
     });
+
+    /**
+     * 轮内产物目录监看调度器 · 1 条 daemon 线程。
+     *
+     * <p><b>WHY 单独一条</b>：{@link #executor} 是抽取专用池；轮内扫描是轻量 `Files.list`，
+     * 两者混用一个池时，长抽取会把扫描饿死（扫描要按 2s 节拍才有「实时」含义）。
+     */
+    private final java.util.concurrent.ScheduledExecutorService turnWatchScheduler =
+        java.util.concurrent.Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "session-artifact-turn-watch");
+            t.setDaemon(true);
+            return t;
+        });
+
+    /** 轮内监看扫描节拍（毫秒）· 见 {@link #startTurnWatch}。 */
+    private static final long TURN_WATCH_INTERVAL_MS = 2000L;
+
+    /**
+     * 轮内监看状态 · sessionId → (定时任务, 已见文件签名)。
+     *
+     * <p><b>为什么需要签名去重</b>：{@link #upsert} **无条件**推 STOMP（没有「未变更」分支），
+     * 若每 2s 对目录里所有文件重跑一遍 {@link #saveDeliverable}，就会每 2s 重推一次
+     * ⇒ 前端每次推送都把产物面板切回最新那一个（用户正在看 A，却被弹回 B）。
+     * 故扫描时先比对 `size:mtime`，只有真正变过的文件才入库+推送。
+     */
+    private final Map<String, TurnWatch> turnWatches = new ConcurrentHashMap<>();
+
+    private record TurnWatch(java.util.concurrent.ScheduledFuture<?> future, Map<String, String> signatures) {}
 
     /** 每会话上次触发时刻（防抖）· sessionId → epoch millis。 */
     private final Map<String, Long> lastRun = new ConcurrentHashMap<>();
@@ -240,9 +316,9 @@ public class SessionArtifactService {
         if (rows != null) {
             for (SessionArtifactRecord row : rows) {
                 if (KIND_DELIVERABLE.equals(row.getKind())) {
-                    deliverables.add(SessionArtifactDto.from(row));
+                    deliverables.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath())));
                 } else if (KIND_SOURCE.equals(row.getKind())) {
-                    sources.add(SessionArtifactDto.from(row));
+                    sources.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath())));
                 } else if (log.isDebugEnabled()) {
                     log.debug("[artifact-extract] 忽略未知 kind={} id={}（存量脏行不抛错）",
                             row.getKind(), row.getId());
@@ -308,6 +384,14 @@ public class SessionArtifactService {
      * @return {@link ArtifactContent}
      */
     static ArtifactContent readArtifactFile(String sessionId, String artifactId, String localPath) {
+        // ⛔ 必须先判「是不是目录」：目录**不会被归档**（archiveFile 只复制普通文件）
+        // ⇒ 它的路径必然在会话归档目录之外 ⇒ 不先判就会先撞上「产物路径非法」，
+        //    而真相是「它是目录」⇒ 错误信息必须诚实。
+        if (isDirectoryArtifact(localPath)) {
+            log.warn("[artifact-file] 该产物是目录，无法预览 session={} artifactId={} path={}",
+                    sessionId, artifactId, localPath);
+            throw new ValidationException("该产物是目录，无法预览");
+        }
         Path resolved = resolveArtifactPath(sessionId, artifactId, localPath);
 
         String fileName = resolved.getFileName() == null ? "" : resolved.getFileName().toString();
@@ -375,6 +459,30 @@ public class SessionArtifactService {
             throw new NotFoundException("产物文件不存在（可能已被删除）");
         }
         return row;
+    }
+
+    /**
+     * 产物 {@code local_path} 是否指向<b>目录</b>（**读时判定 · 不落库**）。
+     *
+     * <p><b>WHY 要单独判</b>：目录**不会被归档**（{@link #archiveFile} 只复制普通文件）
+     * ⇒ 它的路径必然落在 {@code {configHome}/artifacts/{sessionId}} 之外
+     * ⇒ 直接走路径校验只会得到「产物路径非法」，而真相是「它是目录」⇒ 三个产物端点
+     * 必须先判这一条，才能给出诚实的错误信息（前端也要靠它画文件夹图标）。
+     *
+     * @param localPath 产物本地路径（空 → false；路径无法解析 → false，⛔ 吞异常时不当成 true）
+     */
+    static boolean isDirectoryArtifact(String localPath) {
+        if (localPath == null || localPath.isBlank()) {
+            return false;
+        }
+        try {
+            return Files.isDirectory(Paths.get(localPath));
+        } catch (InvalidPathException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[artifact-file] 产物路径无法解析（不按目录处理） path={}", localPath);
+            }
+            return false;
+        }
     }
 
     /**
@@ -453,6 +561,13 @@ public class SessionArtifactService {
      */
     public ArtifactRaw readRaw(String sessionId, String artifactId) {
         SessionArtifactRecord row = requireOwnedArtifact(sessionId, artifactId, "artifact-raw");
+        // ⛔ 先判「是不是目录」：目录没被归档 ⇒ 路径必然在归档目录外 ⇒ 不先判只会得到
+        //    误导性的「产物路径非法」。
+        if (isDirectoryArtifact(row.getLocalPath())) {
+            log.warn("[artifact-raw] 该产物是目录，无法预览 session={} artifactId={} path={}",
+                    sessionId, artifactId, row.getLocalPath());
+            throw new ValidationException("该产物是目录，无法预览");
+        }
         Path resolved = resolveArtifactPath(sessionId, artifactId, row.getLocalPath());
         long size;
         try {
@@ -520,6 +635,13 @@ public class SessionArtifactService {
      */
     public ArtifactContentUpdateResponse writeTextContent(String sessionId, String artifactId, String content) {
         SessionArtifactRecord row = requireOwnedArtifact(sessionId, artifactId, "artifact-edit");
+        // ⛔ 先判「是不是目录」：目录没被归档 ⇒ 路径必然在归档目录外 ⇒ 不先判只会得到
+        //    误导性的「产物路径非法」。
+        if (isDirectoryArtifact(row.getLocalPath())) {
+            log.warn("[artifact-edit] 该产物是目录，无法编辑 session={} artifactId={} path={}",
+                    sessionId, artifactId, row.getLocalPath());
+            throw new ValidationException("该产物是目录，无法编辑");
+        }
         if (content == null) {
             throw new ValidationException("产物内容不能为空（content 必填）");
         }
@@ -696,7 +818,35 @@ public class SessionArtifactService {
             if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
                 return;
             }
+            // ══════════ 确定性通道（不花模型钱，永远开）══════════
+            // [2026-11-02 做法 A] 交付物：扫 Agent 按提示词写入的固定目录。
+            //   ⚠️ 不受 llmExtractEnabled 影响 —— 这是纯文件系统操作，与「要不要调模型」无关。
+            try {
+                syncDeliverablesFromDir(sessionId);
+            } catch (Throwable t) {
+                log.warn("[artifact-extract] 交付物目录扫描异常 session={}: {}", sessionId, t.toString());
+            }
             List<ChatMessageDto> messages = readNonMetaMessages(sessionId);
+            // [2026-11-02] 来源**兜底扫描**：工具已在抓取/搜索成功时当场入库
+            //   （WebSearchTool.recordSources / WebFetchTool.recordSource）。这里再扫一遍是为了
+            //   补「升级前产生的历史工具结果」与「工具注入缺失（单测直构）时漏掉的」——
+            //   幂等（按 title upsert）⇒ 正常路径下这里 0 新增，不会重复。
+            try {
+                syncSourcesFromToolResults(sessionId, messages);
+            } catch (Throwable t) {
+                log.warn("[artifact-extract] 工具结果来源兜底收集异常 session={}: {}", sessionId, t.toString());
+            }
+            // ══════════ LLM 通道（可选，默认关）══════════
+            // [2026-11-02] 两条确定性通道上线后，LLM 抽取降级为**兜底**：
+            //   覆盖「文件写在目录外 / 来源不是这两个工具产出」的残余情况。
+            //   默认关闭以省一次模型调用；需要时把 nexusai.artifacts.llm-extract-enabled 置 true。
+            if (!llmExtractEnabled) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-extract] LLM 抽取已关闭（nexusai.artifacts.llm-extract-enabled=false），"
+                            + "仅用确定性通道 session={}", sessionId);
+                }
+                return;
+            }
             if (messages.isEmpty()) {
                 if (log.isDebugEnabled()) {
                     log.debug("[artifact-extract] 会话无非 meta 消息，跳过 session={}", sessionId);
@@ -877,6 +1027,43 @@ public class SessionArtifactService {
      *
      * @return true = 已入库；false = 被丢弃
      */
+    /**
+     * 源码 / 构建产物扩展名黑名单（**确定性**判定，不依赖模型）。
+     *
+     * <p><b>WHY 需要这一层</b>：抽取提示词里已经写明「⛔ 排除源码改动」，
+     * 但模型偶尔仍把 `Foo.java`、`bar.tsx` 当作「交付物」报上来（概率问题，不是能力问题）。
+     * 规则五的边界正是这里：**「什么算交付物」交模型判断（提示词），「这个扩展名绝对不是」交代码**。
+     *
+     * <p>判据取**归档副本的真实文件名**（{@code localPath}）而非 title —— 标题经常没有扩展名。
+     */
+    private static final java.util.Set<String> SOURCE_CODE_EXTENSIONS = java.util.Set.of(
+            // JVM / 后端
+            "java", "kt", "kts", "scala", "groovy", "class", "jar", "war",
+            // 前端 / JS 生态
+            "ts", "tsx", "js", "jsx", "mjs", "cjs", "vue", "svelte", "css", "scss", "sass", "less",
+            // 脚本 / 其它语言（⚠️ py 曾漏 —— 单测 SessionArtifactSourceCodeFilterTest 抓到）
+            "py", "pyw", "pyi", "ipynb", "rb", "php", "pl", "pm", "lua", "r", "jl", "dart",
+            "hs", "ml", "ex", "exs", "erl", "clj", "nim", "zig", "f90",
+            // 系统 / 脚本 / 编译
+            "c", "h", "cpp", "hpp", "cc", "cs", "go", "rs", "swift", "m", "mm",
+            "sh", "bash", "zsh", "fish", "bat", "cmd", "ps1", "asm", "s",
+            // 声明 / 协议 / 基础设施
+            "tf", "proto", "graphql", "gql", "tfvars", "hcl", "cmake", "mk", "gradle", "bzl",
+            // 构建 / 依赖锁（⚠️ json/yaml/xml **不在此列** —— 配置与接口契约本身常是交付物）
+            // 测试 / 构建中间产物
+            "log", "tmp", "cache", "map", "d", "o", "a", "so", "dylib", "dll", "exe"
+    );
+
+    /** 该文件是否是源码 / 构建中间产物（是 ⇒ 不能当交付物）。 */
+    private static boolean isSourceCodeFile(java.nio.file.Path path) {
+        String name = path.getFileName() == null ? "" : path.getFileName().toString();
+        int dot = name.lastIndexOf('.');
+        if (dot <= 0 || dot == name.length() - 1) {
+            return false;   // 无扩展名（目录 / 纯文本）→ 不算源码，交给后续逻辑判
+        }
+        return SOURCE_CODE_EXTENSIONS.contains(name.substring(dot + 1).toLowerCase());
+    }
+
     private boolean saveDeliverable(String sessionId, SessionArtifactParser.ParsedArtifact item,
                                     String cwd, String now) {
         String title = clip(item.title(), TITLE_MAX);
@@ -896,6 +1083,14 @@ public class SessionArtifactService {
                 log.debug("[artifact-extract] 丢弃无法解析的产物路径 session={} title={} path={}",
                         sessionId, title, rawPath);
             }
+            return false;
+        }
+        // [2026-11-02 用户实测「代码之类的不能当做产物」] **确定性过滤**：提示词已明确要求排除源码，
+        //   但模型仍会偶发把 .java / .ts 改动当成交付物报上来（提示词是判断层，不能保证 100%）。
+        //   这里按扩展名再拦一道 —— 规则五：确定性转换交给代码，不指望模型每次都听话。
+        if (isSourceCodeFile(resolved)) {
+            log.info("[artifact-extract] 丢弃源码文件（不是交付物） session={} title={} path={}",
+                    sessionId, title, resolved);
             return false;
         }
         if (!Files.exists(resolved)) {
@@ -922,7 +1117,10 @@ public class SessionArtifactService {
         // 复制成功 ⇒ localPath = 副本（不依赖用户目录）；失败/超限/目录/符号链接 ⇒ 回落原路径
         // （条目仍在列表上，只是仍旧语义）。⛔ 归档失败绝不能让整条抽取失败。
         String localPath = resolved.toString();
-        if (archiveEnabled) {
+        // [2026-11-02 交付物目录] 文件**已经在自有产物目录内**（Agent 按提示词直接写进 deliverables/）
+        // ⇒ 跳过归档复制。否则会把自己复制成 {hash}-xxx.docx，与原件并列出现两个条目（自我复制）。
+        boolean alreadyInArtifactStore = resolved.startsWith(artifactsRoot());
+        if (archiveEnabled && !alreadyInArtifactStore) {
             Path archived = archiveFile(resolved, sessionId, ARCHIVE_MAX_MB);
             if (archived != null) {
                 localPath = archived.toString();
@@ -989,6 +1187,8 @@ public class SessionArtifactService {
                     log.debug("[artifact-extract] UPSERT 更新 session={} kind={} title={} path={} url={}",
                             sessionId, kind, title, localPath, url);
                 }
+                // [产物实时推送] 内容变了 → 推给前端（前端按 id 幂等更新，不重复插行）
+                pushArtifactUpsert(sessionId, existing, false);
                 return;
             }
             SessionArtifactRecord row = new SessionArtifactRecord();
@@ -1009,6 +1209,8 @@ public class SessionArtifactService {
                 log.debug("[artifact-extract] UPSERT 新增 session={} kind={} title={} path={} url={}",
                         sessionId, kind, title, localPath, url);
             }
+            // [产物实时推送] 新产物 → 前端即时插入并按需自动展开侧栏
+            pushArtifactUpsert(sessionId, row, true);
         } catch (Exception e) {
             log.warn("[artifact-extract] 入库失败（跳过该条，不影响其它条目） session={} kind={} title={}: {}",
                     sessionId, kind, title, e.toString());
@@ -1032,6 +1234,32 @@ public class SessionArtifactService {
     static Path artifactsRoot() {
         return Paths.get(NexusaiPaths.getAppConfigHomeDir(), ARTIFACTS_DIR_NAME)
                 .toAbsolutePath().normalize();
+    }
+
+    /** 交付物目录名（会话产物目录下的子目录，Agent 按系统提示词写入这里）。 */
+    public static final String DELIVERABLES_DIR_NAME = "deliverables";
+
+    /**
+     * 会话交付物目录：{@code {artifactsRoot}/{sessionId}/deliverables}。
+     *
+     * <p><b>WHY 单独一个子目录</b>（2026-11-02 用户裁定「做法 A：提示词约定固定目录 + 后端自己扫」）：
+     * 现有 {@code {artifactsRoot}/{sessionId}/} 里放的是**事后归档副本**（{@code {hash}-{name}.{ext}}），
+     * 文件名被打乱、且是抽取链路自己生成的 ⇒ 无法作为「Agent 主动放文件的地方」。
+     * 加一层 {@code deliverables/} 后语义清晰：
+     * <ul>
+     *   <li>Agent 按提示词**直接写**进这里，文件名保持用户可读；</li>
+     *   <li>后端**扫这个目录**就知道本次会话有哪些交付物 ⇒ ⛔ 不需要模型回报路径，
+     *       也不需要从工具入参里猜（Bash 脚本写的文件正是靠这一条才收得到）。</li>
+     * </ul>
+     *
+     * <p>⛔ 该目录必须留在 artifactsRoot 之内：归档逻辑遇到「已经在自有目录里」的文件会跳过复制
+     * （见 {@code saveDeliverable}），避免自我复制出 {@code {hash}-xxx.docx} 的重复副本。
+     *
+     * @param sessionId 会话 id（空白 → {@code unknown}，与 {@link #sessionArtifactsDir} 同口径）
+     * @return 交付物目录绝对路径（不保证已存在）
+     */
+    public static Path deliverablesDir(String sessionId) {
+        return sessionArtifactsDir(sessionId).resolve(DELIVERABLES_DIR_NAME);
     }
 
     /**
@@ -1212,6 +1440,441 @@ public class SessionArtifactService {
      * @param oldLocalPath 旧行的 local_path（null / 空 → 无副本可清）
      * @param newLocalPath 本次要写入的 local_path（与旧值相同 → 同名覆盖，无需清理）
      */
+    /**
+     * [产物实时推送 2026-11-02] 把一条产物 upsert 推给该会话的前端。
+     *
+     * <p><b>失败绝不冒泡</b>：推送是旁路增强，出错只能退化为「靠 15 秒轮询发现」，
+     * ⛔ 不能让 STOMP 异常把已成功的入库回滚或打断后续条目的抽取。
+     *
+     * <p>载荷字段与 {@code SessionArtifactDto} 对齐（前端直接复用同一接口类型插入列表）：
+     * {@code {action:'upsert', artifact:{...}}}；{@code action} 预留给将来的删除事件。
+     *
+     * @param created true = 新插入（前端据此判断「要不要自动展开侧栏」），false = 更新已有行
+     */
+    private void pushArtifactUpsert(String sessionId, SessionArtifactRecord row, boolean created) {
+        if (wsTemplate == null || sessionId == null || sessionId.isBlank() || row == null) return;
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode node = JSON.createObjectNode();
+            node.put("action", "upsert");
+            node.put("created", created);
+            node.put("sessionId", sessionId);
+            com.fasterxml.jackson.databind.node.ObjectNode a = node.putObject("artifact");
+            a.put("id", row.getId());
+            a.put("kind", row.getKind());
+            a.put("title", row.getTitle());
+            a.put("localPath", row.getLocalPath());
+            a.put("url", row.getUrl());
+            if (row.getSizeBytes() == null) a.putNull("sizeBytes"); else a.put("sizeBytes", row.getSizeBytes());
+            a.put("summary", row.getSummary());
+            a.put("updatedAt", row.getUpdatedAt());
+            // 目录判定是**读时**做的（不落库）⇒ 推送时按路径补一次，与 list 接口口径一致
+            a.put("directory", row.getLocalPath() != null && Files.isDirectory(toPathQuietly(row.getLocalPath())));
+            wsTemplate.convertAndSend(TOPIC_PREFIX + sessionId + TOPIC_SUFFIX, node.toString());
+            if (log.isDebugEnabled()) {
+                log.debug("[artifact-extract] 实时推送 session={} id={} created={} title={}",
+                        sessionId, row.getId(), created, row.getTitle());
+            }
+        } catch (Throwable t) {
+            // ⛔ 只 WARN：推送失败不影响已入库的数据，前端仍能靠轮询拿到
+            log.warn("[artifact-extract] 实时推送失败（不影响入库，前端可轮询补偿） session={} id={}: {}",
+                    sessionId, row == null ? null : row.getId(), t.toString());
+        }
+    }
+
+    /** 宽松路径解析（非法路径 → null，不抛）。 */
+    private static java.nio.file.Path toPathQuietly(String p) {
+        try {
+            return java.nio.file.Paths.get(p);
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /**
+     * 扫描会话交付物目录 → 逐条入库（**确定性收集**，不经过任何模型）。
+     *
+     * <p><b>WHY（2026-11-02 用户裁定「做法 A：固定目录 + 后端自己查」）</b>：
+     * 原链路只有「轮末旁路 LLM 读会话猜路径」一条，而 Bash 脚本生成的文件**根本猜不到**
+     * （{@code BashTool} 的入参是 {@code command}，不是路径键 → {@code extractPathFromArguments} 恒 null）。
+     * 改为「Agent 按系统提示词把交付物写进固定目录 → 后端扫目录」后：
+     * <ul>
+     *   <li>脚本产物也能收到（只要写进目录）；</li>
+     *   <li>不消耗模型调用；</li>
+     *   <li>目录本身就是声明 ⇒ ⛔ 不需要模型回报路径，也没有「它忘了回报」这种失败模式。</li>
+     * </ul>
+     *
+     * <p><b>幂等</b>：以文件名为 title 走既有 {@code upsert}（键 = session_id + kind + title），
+     * 同一文件被改写（重新生成）只会更新 size/时间，不会产生第二行。
+     *
+     * <p><b>容错</b>：目录不存在 = 本轮没有交付物（正常情况）；任何 IO 异常只 WARN，
+     * ⛔ 绝不冒泡（抽取是旁路，不能影响对话）。
+     *
+     * @param sessionId 会话 id
+     * @return 本次新入库/更新的条数（用于日志与测试断言）
+     */
+    public int syncDeliverablesFromDir(String sessionId) {
+        if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
+            return 0;
+        }
+        Path dir = deliverablesDir(sessionId);
+        if (!Files.isDirectory(dir)) {
+            return 0;   // 本轮没往目录里写东西 —— 正常，不是错误
+        }
+        int saved = 0;
+        String now = OffsetDateTime.now().toString();
+        try (Stream<Path> files = Files.list(dir)) {
+            for (Path file : files.sorted().toList()) {
+                try {
+                    if (!Files.isRegularFile(file)) {
+                        continue;
+                    }
+                    // 源码黑名单复用同一条判据：即便模型把 .py 写进了目录也不收
+                    if (isSourceCodeFile(file)) {
+                        if (log.isDebugEnabled()) {
+                            log.debug("[artifact-scan] 跳过源码文件 session={} file={}", sessionId, file.getFileName());
+                        }
+                        continue;
+                    }
+                    String name = file.getFileName() == null ? null : file.getFileName().toString();
+                    if (name == null || name.isBlank()) {
+                        continue;
+                    }
+                    var item = new SessionArtifactParser.ParsedArtifact(name, file.toString(), null, null);
+                    if (saveDeliverable(sessionId, item, dir.toString(), now)) {
+                        saved++;
+                    }
+                } catch (Throwable t) {
+                    log.warn("[artifact-scan] 单条处理失败（跳过，不影响其它） session={} file={}: {}",
+                            sessionId, file, t.toString());
+                }
+            }
+        } catch (Throwable t) {
+            log.warn("[artifact-scan] 扫描交付物目录失败（不影响对话） session={} dir={}: {}",
+                    sessionId, dir, t.toString());
+        }
+        if (saved > 0) {
+            log.info("[artifact-scan] 交付物目录扫描完成 session={} dir={} 入库/更新={} 条", sessionId, dir, saved);
+        }
+        return saved;
+    }
+
+    /**
+     * 写盘瞬间同步单条产物（**供 {@code SessionFilesRecorder} 在工具写盘时调用**）。
+     *
+     * <p><b>WHY 需要这个入口</b>（2026-11-02 用户实测「编辑过程中侧栏没有自动展开」）：
+     * 推送此前只在 {@link #scheduleExtract} 里发生，而它挂在 {@code ChatService} 的**轮末**
+     * （{@code status=idle} 之后）。日志实测：每次 {@code [artifact-scan]} 都紧跟
+     * {@code STOMP → status=idle} —— 即<b>整轮执行期间零推送</b>。
+     * 而前端「自动展开」的门控恰好是「本轮仍在跑」（{@code turnRunningRef.current}）⇒
+     * 那个分支<b>结构上永不成立</b>：等到推送到达，轮次早已结束，门控刚把面板按回去。
+     *
+     * <p>本方法在**文件真正落盘的那一刻**跑一遍：只处理「路径在 {@link #deliverablesDir}
+     * 之下」的那一个文件（{@link #syncDeliverablesFromDir} 是整目录扫，用它会把每写一个文件
+     * 变成整目录重扫）。走 {@link #saveDeliverable} 同一入库 + {@link #pushArtifactUpsert} 同一推送，
+     * 保证与轮末抽取逐字段一致（幂等 UPSERT，重复不产生第二行）。
+     *
+     * <p><b>绝不抛</b>：写盘已经成功，告警/实时性都不能反过来影响它。
+     *
+     * @param sessionId 会话 id（null/空白 → 直接返回）
+     * @param absPath   刚写入的绝对路径
+     * @return true = 已作为产物入库并推送；false = 不在产物目录 / 被过滤 / 未启用
+     */
+    public boolean syncDeliverableForPath(String sessionId, String absPath) {
+        if (!extractEnabled || sessionId == null || sessionId.isBlank() || absPath == null || absPath.isBlank()) {
+            return false;
+        }
+        try {
+            Path dir = deliverablesDir(sessionId).toAbsolutePath().normalize();
+            Path file = Path.of(absPath).toAbsolutePath().normalize();
+            // 双重严格（与 syncDeliverablesFromDir 同口径）：必须在产物目录**之下**，且不是目录本身
+            if (!file.startsWith(dir) || file.equals(dir) || !Files.isRegularFile(file)) {
+                return false;
+            }
+            String name = file.getFileName() == null ? null : file.getFileName().toString();
+            if (name == null || name.isBlank()) {
+                return false;
+            }
+            var item = new SessionArtifactParser.ParsedArtifact(name, file.toString(), null, null);
+            boolean saved = saveDeliverable(sessionId, item, dir.toString(), OffsetDateTime.now().toString());
+            if (saved && log.isInfoEnabled()) {
+                log.info("[artifact-scan] 写盘即入库 session={} file={}（轮中实时推送）", sessionId, name);
+            }
+            return saved;
+        } catch (Throwable t) {
+            log.warn("[artifact-scan] 写盘即入库失败（不影响写盘） session={} path={}: {}",
+                    sessionId, absPath, t.toString());
+            return false;
+        }
+    }
+
+    /**
+     * 开始「轮内监看」该会话的交付物目录（**每 {@value #TURN_WATCH_INTERVAL_MS}ms 扫一次**）。
+     *
+     * <p><b>WHY 需要它</b>（2026-11-03 用户提问「copy 了是不是要写监听器，不然怎么动态感知」）：
+     * 提示词允许「按技能要求在原位置生成 → 再复制到产物目录」，而 <b>cp / 脚本复制不经过任何
+     * 写盘钩子</b>（{@code SessionFilesRecorder} 只覆盖 Write/Edit 工具）⇒ 此前复制进来的文件
+     * 只能等轮末抽取，而前端「自动展开产物面板」的门控是「本轮仍在跑」⇒ 又是永不重叠。
+     *
+     * <p><b>为什么是「轮内」而不是常驻监听</b>：
+     * <ul>
+     *   <li>自动展开只在本轮执行中有意义（轮末的产物卡由用户自己点）⇒ 扫描窗口与之天然对齐；</li>
+     *   <li>常驻 WatchService 要为每个会话动态注册/注销（macOS kqueue 不递归），生命周期与
+     *       泄漏面都更复杂；而这里每次只 `Files.list` 一个目录，几个文件的量级。</li>
+     * </ul>
+     *
+     * <p><b>幂等</b>：只扫 `size:mtime` 变化的文件（见 {@link #turnWatches} 的 WHY），
+     * 未变更不入库、不推送。重复调用 startTurnWatch 不会叠加任务。
+     *
+     * @param sessionId 会话 id（null/空白 / 开关关闭 → no-op）
+     */
+    public void startTurnWatch(String sessionId) {
+        if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        turnWatches.compute(sessionId, (sid, existing) -> {
+            if (existing != null) {
+                return existing;   // 已在监看（同一轮重复触发）→ 不叠加
+            }
+            Map<String, String> signatures = new ConcurrentHashMap<>();
+            var future = turnWatchScheduler.scheduleWithFixedDelay(
+                () -> scanTurnWatchedDir(sid, signatures),
+                TURN_WATCH_INTERVAL_MS, TURN_WATCH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+            if (log.isDebugEnabled()) {
+                log.debug("[artifact-watch] 开始轮内监看 session={} 间隔={}ms", sid, TURN_WATCH_INTERVAL_MS);
+            }
+            return new TurnWatch(future, signatures);
+        });
+    }
+
+    /**
+     * 结束该会话的轮内监看（**轮次收口必达点**）。
+     *
+     * <p>幂等：没有在监看 → no-op。**必须**与 {@link #startTurnWatch} 成对调用，
+     * 否则定时任务会跨轮常驻（虽然只做目录 list，但每 2s 一次、且会让「已结束的轮」
+     * 继续自动展开产物面板）。
+     *
+     * @param sessionId 会话 id
+     */
+    public void stopTurnWatch(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        TurnWatch w = turnWatches.remove(sessionId);
+        if (w != null) {
+            w.future().cancel(false);
+            if (log.isDebugEnabled()) {
+                log.debug("[artifact-watch] 结束轮内监看 session={}", sessionId);
+            }
+        }
+    }
+
+    /** 单次扫描：只处理 `size:mtime` 变过的文件（未变 ⇒ 不入库、不推送）。 */
+    private void scanTurnWatchedDir(String sessionId, Map<String, String> signatures) {
+        try {
+            Path dir = deliverablesDir(sessionId);
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+            java.util.Set<String> present = new java.util.HashSet<>();
+            try (Stream<Path> files = Files.list(dir)) {
+                for (Path file : files.toList()) {
+                    if (!Files.isRegularFile(file)) {
+                        continue;
+                    }
+                    String name = file.getFileName() == null ? null : file.getFileName().toString();
+                    if (name == null || name.isBlank()) {
+                        continue;
+                    }
+                    present.add(name);
+                    String sig;
+                    try {
+                        sig = Files.size(file) + ":" + Files.getLastModifiedTime(file).toMillis();
+                    } catch (Exception e) {
+                        continue;   // 读不到 stat → 下一拍再试（文件可能正在被写）
+                    }
+                    String prev = signatures.put(name, sig);
+                    if (sig.equals(prev)) {
+                        continue;   // 未变更 → ⛔ 不重复入库/推送
+                    }
+                    syncDeliverableForPath(sessionId, file.toString());
+                }
+            }
+            // 文件被删掉 → 忘掉签名，之后同名重建能再次触发
+            signatures.keySet().retainAll(present);
+        } catch (Throwable t) {
+            // 轮内扫描失败只降级（下一拍继续），⛔ 绝不能影响对话
+            log.warn("[artifact-watch] 轮内扫描失败 session={}: {}", sessionId, t.toString());
+        }
+    }
+
+    /**
+     * 记录一条来源（**供工具在抓取成功时当场调用**）。
+     *
+     * <p><b>WHY 需要这个公开入口</b>（2026-11-02 用户裁定「在 websearch / webfetch 中就存好当前」）：
+     * 工具本来就持有 url（入参就是它），当场入库比「轮末回头扫消息再解析结果 JSON」更直接、
+     * 更快（前端即时可见）、也不依赖「结果 JSON 是什么形状」这个假设。
+     *
+     * <p>幂等：以 title 为键 upsert（同 url 多次抓到只留一行）。
+     *
+     * @param sessionId 会话 id（null/空白 → 直接返回，不报错）
+     * @param title     展示标题（通常传 url 或页面标题）
+     * @param url       来源链接（必须是 http(s)，否则 {@link #saveSource} 会丢弃）
+     * @param summary   可选摘要
+     * @return true = 已入库/更新；false = 被丢弃（参数不合格）
+     */
+    public boolean recordSource(String sessionId, String title, String url, String summary) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        return saveSource(sessionId,
+                new SessionArtifactParser.ParsedArtifact(title, null, url, summary),
+                OffsetDateTime.now().toString());
+    }
+
+    /**
+     * 从网络工具（WebSearch / WebFetch）的**结果**里抽取来源并入库（确定性，不经过任何模型）。
+     *
+     * <p><b>WHY（2026-11-02 用户裁定）</b>：用户原话「来源 我们从 websearch 和 webfetch 能拿到啊」。
+     * 这两个工具的结果本来就带 URL：
+     * <ul>
+     *   <li>WebSearch：{@code {query, results:[{tool_use_id, content:[{title,url}]}, "注释"]}}；</li>
+     *   <li>WebFetch：{@code {bytes, code, codeText, result, durationMs, url}}。</li>
+     * </ul>
+     * ⇒ 直接读结果里的 url 就是**确定性**来源，不需要再让模型读一遍会话「猜」哪些链接值得记。
+     *
+     * <p><b>只认 http(s)</b>：内部工具跳转地址 / 相对路径没有意义（用户点不开），
+     * 与 {@code saveSource} 的「url 必填」口径一致。
+     *
+     * <p><b>幂等</b>：以 url 为 title 走既有 {@code upsert}（键 = session_id + kind + title）
+     * ⇒ 同一个链接被搜到多次也只留一行；title 优先用工具报的页面标题。
+     *
+     * <p><b>容错</b>：结果不是 JSON / 结构不认识 ⇒ 跳过该条（⛔ 不抛、不猜）。
+     *
+     * @param sessionId 会话 id
+     * @param messages  本轮消息（含 toolCalls，从中找网络工具结果）
+     * @return 本次新入库/更新的来源条数
+     */
+    public int syncSourcesFromToolResults(String sessionId, List<ChatMessageDto> messages) {
+        if (sessionId == null || sessionId.isBlank() || messages == null || messages.isEmpty()) {
+            return 0;
+        }
+        String now = OffsetDateTime.now().toString();
+        int saved = 0;
+        for (ChatMessageDto m : messages) {
+            List<ToolCallDto> calls = m.toolCalls();
+            if (calls == null || calls.isEmpty()) {
+                continue;
+            }
+            for (ToolCallDto tc : calls) {
+                if (!isSourceTool(tc.name())) {
+                    continue;
+                }
+                try {
+                    saved += extractUrls(tc.result()).size() > 0
+                            ? saveExtractedSources(sessionId, extractUrls(tc.result()), now)
+                            : 0;
+                } catch (Throwable t) {
+                    log.warn("[artifact-sources] 单条工具结果解析失败（跳过） session={} tool={}: {}",
+                            sessionId, tc.name(), t.toString());
+                }
+            }
+        }
+        if (saved > 0) {
+            log.info("[artifact-sources] 从网络工具结果收集到来源 session={} 条数={}", sessionId, saved);
+        }
+        return saved;
+    }
+
+    /** 工具名是否是「会产出来源」的网络工具（大小写/前缀不敏感）。 */
+    private static boolean isSourceTool(String name) {
+        if (name == null || name.isBlank()) {
+            return false;
+        }
+        String n = name.toLowerCase();
+        // mcp__server__webfetch 这类前缀也命中（子串匹配）
+        for (String kw : SOURCE_TOOL_KEYWORDS) {
+            if (n.contains(kw)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 从一条工具结果 JSON 里收集 {title, url} 对（去重按 url）。 */
+    private List<SessionArtifactParser.ParsedArtifact> extractUrls(String result) {
+        if (result == null || result.isBlank()) {
+            return List.of();
+        }
+        JsonNode root;
+        try {
+            root = JSON.readTree(result);
+        } catch (Exception e) {
+            return List.of();   // 非 JSON（纯文本错误信息等）→ 无来源
+        }
+        if (root == null || root.isNull()) {
+            return List.of();
+        }
+        // url → title（后面的覆盖前面的：同一 url 后出现的标题通常更准）
+        Map<String, String> found = new LinkedHashMap<>();
+        collectUrlPairs(root, found);
+        if (found.isEmpty()) {
+            return List.of();
+        }
+        List<SessionArtifactParser.ParsedArtifact> out = new ArrayList<>(found.size());
+        for (Map.Entry<String, String> e : found.entrySet()) {
+            out.add(new SessionArtifactParser.ParsedArtifact(e.getValue(), null, e.getKey(), null));
+        }
+        return out;
+    }
+
+    /**
+     * 递归收集 {@code {title, url}} 形状的节点。
+     *
+     * <p>刻意做成**形状匹配**而不是按固定路径取：WebSearch 的 hits 嵌在
+     * {@code results[].content[]}，WebFetch 的 url 在顶层 —— 两处形状不同，
+     * 但「同一个对象里既有 url 又有 title」是它们的共同点。
+     */
+    private void collectUrlPairs(JsonNode node, Map<String, String> out) {
+        if (node == null) {
+            return;
+        }
+        if (node.isObject()) {
+            String url = firstTextual(node, "url");
+            if (url != null && isHttpUrl(url)) {
+                String title = firstTextual(node, "title");
+                out.put(url, title != null && !title.isBlank() ? title : url);
+            }
+            node.elements().forEachRemaining(child -> collectUrlPairs(child, out));
+            return;
+        }
+        if (node.isArray()) {
+            node.elements().forEachRemaining(child -> collectUrlPairs(child, out));
+        }
+    }
+
+    /** 取对象里第一个命中的文本字段。 */
+    private static String firstTextual(JsonNode obj, String key) {
+        JsonNode v = obj.get(key);
+        return v != null && v.isTextual() && !v.asText().isBlank() ? v.asText().trim() : null;
+    }
+
+    /** 只收 http(s) 绝对地址（内部跳转 / 相对路径用户点不开）。 */
+    private static boolean isHttpUrl(String url) {
+        String u = url.toLowerCase();
+        return u.startsWith("http://") || u.startsWith("https://");
+    }
+
+    /** 逐条入库（复用 saveSource 的清洗与幂等）。 */
+    private int saveExtractedSources(String sessionId, List<SessionArtifactParser.ParsedArtifact> items, String now) {
+        int n = 0;
+        for (SessionArtifactParser.ParsedArtifact item : items) {
+            if (saveSource(sessionId, item, now)) {
+                n++;
+            }
+        }
+        return n;
+    }
+
     private void cleanupReplacedCopy(String sessionId, String existingId,
                                      String oldLocalPath, String newLocalPath) {
         if (oldLocalPath == null || oldLocalPath.isBlank() || oldLocalPath.equals(newLocalPath)) {
@@ -1474,6 +2137,11 @@ public class SessionArtifactService {
     /** 容器关闭时收掉线程池（daemon 线程不会阻止 JVM 退出，这里只是及时释放）。 */
     @PreDestroy
     public void shutdown() {
+        for (TurnWatch w : turnWatches.values()) {
+            w.future().cancel(false);
+        }
+        turnWatches.clear();
+        turnWatchScheduler.shutdownNow();
         executor.shutdownNow();
     }
 }

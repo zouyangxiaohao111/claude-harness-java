@@ -11,6 +11,7 @@
         <relativePath/>
     </parent>
 
+
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
     <version>0.1.65</version>
@@ -262,18 +263,20 @@
             <scope>test</scope>
         </dependency>
 
-        <!-- [terminal] 集成终端 PTY（跨平台：Windows ConPTY / macOS·Linux forkpty）。
-             排除 purejavacomm：该传递依赖在 Maven Central 缺失且只服务串口。 -->
+        <!-- [terminal] 集成终端 PTY（跨平台：Windows winpty/ConPTY / macOS·Linux forkpty）。
+             ⚠️ 必须是 0.13.0+：0.12.x 的 com.pty4j.unix.PtyHelpers 静态初始化要读
+             jtermios.JTermios 的 23 个 POSIX 常量，而 jtermios 来自 org.jetbrains.pty4j:purejavacomm
+             —— 该构件从未发布到 Maven Central、JetBrains 的 pty4j 仓库也已下线（404）⇒ 只能 exclude
+             ⇒ macOS/Linux 首次创建终端即 ExceptionInInitializerError（真因 NoClassDefFoundError:
+             jtermios/JTermios），之后每次都是 "Could not initialize class com.pty4j.unix.PtyHelpers"。
+             0.14.0 的 PtyHelpers 已零 jtermios 引用（javap 全量核对），purejavacomm 也从 POM 移除，
+             传递依赖（kotlin-stdlib/annotations/slf4j/jna）全部可从 Maven Central 取得。
+             原生库 resources/com/pty4j/native/darwin/{libpty.dylib,pty4j-unix-spawn-helper}
+             是 x86_64 + arm64 fat 二进制（minos 11.0，两片均有签名）⇒ Intel / Apple Silicon 通用。 -->
         <dependency>
             <groupId>org.jetbrains.pty4j</groupId>
             <artifactId>pty4j</artifactId>
-            <version>0.12.13</version>
-            <exclusions>
-                <exclusion>
-                    <groupId>org.jetbrains.pty4j</groupId>
-                    <artifactId>purejavacomm</artifactId>
-                </exclusion>
-            </exclusions>
+            <version>0.14.0</version>
         </dependency>
     </dependencies>
 

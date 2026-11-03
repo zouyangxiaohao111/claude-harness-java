@@ -36,10 +36,64 @@ public record ComputerUseScreenshotResult(
         int originX,
         int originY,
         long byteLength,
-        double scaleFactor) {
+        double scaleFactor,
+        double pixelScale) {
 
     public ComputerUseScreenshotResult {
         content = content == null ? List.of() : List.copyOf(content);
+    }
+
+    /**
+     * 兼容构造（无 {@code pixelScale}）· 由 {@code pixelScale} 反推。
+     *
+     * @param content      图片内容
+     * @param mediaType    MIME
+     * @param imageWidth   图像宽
+     * @param imageHeight  图像高
+     * @param displayWidth 显示宽（物理像素）
+     * @param displayHeight 显示高
+     * @param originX      虚拟屏幕原点 X
+     * @param originY      虚拟屏幕原点 Y
+     * @param byteLength   字节数
+     * @param scaleFactor  显示缩放比（像素/点）
+     */
+    public ComputerUseScreenshotResult(List<ComputerUseMcpContent> content,
+                                       String mediaType,
+                                       int imageWidth,
+                                       int imageHeight,
+                                       int displayWidth,
+                                       int displayHeight,
+                                       int originX,
+                                       int originY,
+                                       long byteLength,
+                                       double scaleFactor) {
+        this(content, mediaType, imageWidth, imageHeight, displayWidth, displayHeight,
+                originX, originY, byteLength, scaleFactor, 0d);
+    }
+
+    /**
+     * <b>截图像素 → 窗口点</b> 的换算因子（对齐 dsh {@code ComputerAppSummary} / 截图 Artifact
+     * 的 {@code pixelScale}）。
+     *
+     * <h2>WHY 需要它</h2>
+     * <p>macOS 的截图按<b>窗口的 backing scale</b>拍（Retina 上通常是 2 倍），
+     * 而元素 frame、窗口坐标、点击坐标都 speaking <b>点</b>。
+     * ⇒ 模型从图上读到的像素坐标，<b>必须除以这个因子</b>才是点击坐标，
+     * 否则会落在两倍偏移处（dsh {@code service.ts:98-103} 注释原文：
+     * “A coordinate read off the screenshot therefore lands at twice its intended offset
+     * unless it is divided by {@code pixelScale}”）。
+     *
+     * <h2>与 {@code scaleFactor} 的区别（别混）</h2>
+     * <ul>
+     *   <li>{@code scaleFactor} = <b>显示</b>缩放比（物理像素/点，Retina 2）；</li>
+     *   <li>{@code pixelScale} = <b>这张图</b>的像素/点 ——
+     *       还要叠加本仓的「缩到 ≤1568」步骤 ⇒ 它<b>不等于</b> scaleFactor。</li>
+     * </ul>
+     *
+     * @return 换算因子（图上像素 ÷ 该值 = 点）；无法确定时返回 0（表示未知）
+     */
+    public double pixelScaleOrZero() {
+        return pixelScale;
     }
 
     /** 几何快照 · 供点击工具的 {@code scaleCoord} 使用。 */

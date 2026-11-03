@@ -38,6 +38,8 @@ vi.mock('@/api/settings', () => ({
 const LABEL = '按会话展开请求头占位符'
 
 function noop(): void {}
+/** 异步 noop（档位解绑回调返回 Promise） */
+async function noopAsync(): Promise<void> {}
 
 /** App 传下来的 onSaveSettings（写 appSettings 的唯一正常路径）。 */
 let onSave: Mock<(req: UpdateSettingsRequest) => Promise<void>>
@@ -57,7 +59,6 @@ function render(root: Root, settings: AppSettings | null) {
         models={[]}
         providers={[]}
         providersApi={{} as never}
-        skillsApi={{} as never}
         mcpApi={{} as never}
         databasesApi={{} as never}
         schedulesApi={{} as never}
@@ -65,9 +66,10 @@ function render(root: Root, settings: AppSettings | null) {
         showToast={noop}
         appSettings={settings}
         onSaveSettings={onSave}
-        fastModel={null}
-        pickFast={noop}
-        clearFast={noop}
+        onBindModelTier={noop}
+        onBindAllModelTiers={noopAsync}
+        onClearModelTier={noopAsync}
+        onClearAllModelTiers={noopAsync}
         onOpenMemoryEditor={noop}
       />,
     )

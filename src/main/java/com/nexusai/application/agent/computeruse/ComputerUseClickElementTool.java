@@ -71,11 +71,27 @@ public final class ComputerUseClickElementTool implements Tool {
                     + "Prefer this over left_click when the element name is visible in the accessibility snapshot. "
                     + "Falls back to BoundingRect center-click if InvokePattern is not supported.";
 
-    /** 输入 schema · 逐字对齐 CCB {@code tools.ts:483-503}。 */
+    /** 输入 schema（CCB 三项 + 本仓新增 dsh 风格观察绑定参数）。 */
     private static final String INPUT_SCHEMA = """
             {
               "type": "object",
               "properties": {
+                "observationId": {
+                  "type": "string",
+                  "description": "observationId from the most recent observe. Required on macOS; element indexes belong only to that observation."
+                },
+                "index": {
+                  "type": "integer",
+                  "description": "Element index from that observe output (the [#N] prefix)."
+                },
+                "targetHandle": {
+                  "type": "string",
+                  "description": "Opaque handle from observe. Required when allowRebind is true."
+                },
+                "allowRebind": {
+                  "type": "boolean",
+                  "description": "Allow deterministic rebinding by locator inside the same process/window when the tree reordered harmlessly."
+                },
                 "name": {
                   "type": "string",
                   "description": "Accessible name of the element (e.g. \\"Save\\", \\"File\\", \\"Search...\\"). Case-insensitive partial match."
@@ -86,7 +102,15 @@ public final class ComputerUseClickElementTool implements Tool {
                 },
                 "automationId": {
                   "type": "string",
-                  "description": "Exact automationId from the accessibility snapshot. Most precise selector."
+                  "description": "Exact automationId from the accessibility snapshot. Most precise selector on Windows."
+                },
+                "sensitive": {
+                  "type": "boolean",
+                  "description": "Set true for an action classified as high impact or sensitive. Requires a confirmationToken from confirm."
+                },
+                "confirmationToken": {
+                  "type": "string",
+                  "description": "One-use token from confirm for this exact action."
                 }
               },
               "required": []
@@ -96,18 +120,55 @@ public final class ComputerUseClickElementTool implements Tool {
     private final ComputerUseUiaService uiaService;
     private final ComputerUseWindowOps windowOps;
     private final ComputerUseWindowBindingStore bindingStore;
+    private final ComputerUseUiSnapshotStore snapshotStore;
+    private final ComputerUseConfirmationStore confirmationStore;
 
     /**
+     * @param uiaService    UIA/AX 服务
+     * @param windowOps     窗口操作原语（仅 Windows 的回落路径需要；macOS 传 null）
+     * @param bindingStore  绑定窗口存储（仅 Windows 需要；macOS 传 null）
+     * @param snapshotStore 观察存储（observationId + index 解析）
+     * @param confirmationStore 敏感动作令牌存储（可空 ⇒ 敏感动作一律拒绝）
+     */
+    public ComputerUseClickElementTool(ComputerUseUiaService uiaService,
+                                       ComputerUseWindowOps windowOps,
+                                       ComputerUseWindowBindingStore bindingStore,
+                                       ComputerUseUiSnapshotStore snapshotStore,
+                                       ComputerUseConfirmationStore confirmationStore) {
+        this.uiaService = uiaService;
+        this.windowOps = windowOps;
+        this.bindingStore = bindingStore;
+        this.snapshotStore = snapshotStore;
+        this.confirmationStore = confirmationStore;
+    }
+
+    /**
+     * 兼容构造（无观察存储）：{@code observationId / index / targetHandle} 路径不可用，
+     * 只能走 {@code name / role / automationId} 现查 —— 即 Windows 的既有用法。
+     *
      * @param uiaService   UIA 服务
-     * @param windowOps    窗口操作原语（回落路径的窗口定向点击）
+     * @param windowOps    窗口操作原语
      * @param bindingStore 绑定窗口存储
      */
     public ComputerUseClickElementTool(ComputerUseUiaService uiaService,
                                        ComputerUseWindowOps windowOps,
                                        ComputerUseWindowBindingStore bindingStore) {
-        this.uiaService = uiaService;
-        this.windowOps = windowOps;
-        this.bindingStore = bindingStore;
+        this(uiaService, windowOps, bindingStore, null, null);
+    }
+
+    /**
+     * 兼容构造（有观察存储、无令牌存储）：敏感动作一律被拒（保守）。
+     *
+     * @param uiaService    UIA 服务
+     * @param windowOps     窗口操作原语
+     * @param bindingStore  绑定窗口存储
+     * @param snapshotStore 观察存储
+     */
+    public ComputerUseClickElementTool(ComputerUseUiaService uiaService,
+                                       ComputerUseWindowOps windowOps,
+                                       ComputerUseWindowBindingStore bindingStore,
+                                       ComputerUseUiSnapshotStore snapshotStore) {
+        this(uiaService, windowOps, bindingStore, snapshotStore, null);
     }
 
     @Override
@@ -161,63 +222,210 @@ public final class ComputerUseClickElementTool implements Tool {
     @Override
     public AgentToolResult<?> execute(ToolUseBlock call, ToolUseContext ctx) {
         JsonNode input = call.input();
+        String observationId = input.path("observationId").isTextual()
+                ? input.path("observationId").asText() : null;
+        int index = input.path("index").asInt(-1);
+        String handle = input.path("targetHandle").isTextual()
+                ? input.path("targetHandle").asText() : null;
+        boolean allowRebind = input.path("allowRebind").asBoolean(false);
         String name = input.path("name").isTextual() ? input.path("name").asText() : null;
         String role = input.path("role").isTextual() ? input.path("role").asText() : null;
         String automationId = input.path("automationId").isTextual() ? input.path("automationId").asText() : null;
-        if ((name == null || name.isEmpty())
+        boolean sensitive = input.path("sensitive").asBoolean(false);
+        String confirmationToken = input.path("confirmationToken").isTextual()
+                ? input.path("confirmationToken").asText() : null;
+        if (index < 0
+                && (handle == null || handle.isEmpty())
+                && (name == null || name.isEmpty())
                 && (role == null || role.isEmpty())
                 && (automationId == null || automationId.isEmpty())) {
-            // CCB toolCalls.ts:3329-3332
+            // CCB toolCalls.ts:3329-3332（本仓额外允许 index / targetHandle）
             return ToolResult.error(call.id(),
-                    "At least one of name, role, or automationId is required.");
+                    "At least one of index, targetHandle, name, role, or automationId is required.");
         }
 
         String sessionId = ctx != null ? ctx.sessionId() : null;
-        ComputerUseWindowBinding binding = bindingStore != null ? bindingStore.get(sessionId) : null;
-        if (binding == null) {
+
+        // 敏感动作的一次性确认（dsh confirmations.ts:89-113）——在任何动作之前
+        ComputerUseSensitiveGate.Gate gate = ComputerUseSensitiveGate.check(
+                confirmationStore, snapshotStore, sessionId, sensitive, confirmationToken,
+                observationId, index, handle, "click", null);
+        if (!gate.allowed()) {
+            return ToolResult.error(call.id(), gate.rejection());
+        }
+
+        boolean needsBinding = uiaService.requiresBoundWindow();
+        ComputerUseWindowBinding binding = needsBinding && bindingStore != null
+                ? bindingStore.get(sessionId) : null;
+        if (needsBinding && binding == null) {
             // CCB executorCrossPlatform.ts:1052-1055
             return ToolResult.error(call.id(),
                     "click_element is only available on Windows with a bound window.");
         }
-        long hwnd = binding.hwnd();
+        long hwnd = needsBinding ? binding.hwnd() : 0L;
 
         try {
-            ComputerUseAccessibilitySnapshot snapshot =
-                    uiaService.captureSnapshot(hwnd, Win32UiaService.DEFAULT_MAX_DEPTH);
-            ComputerUseAccessibilityNode node =
-                    ComputerUseAccessibilitySnapshot.findNode(snapshot.nodes(), name, role, automationId);
-            if (node == null) {
-                // CCB toolCalls.ts:3336-3340
-                return ToolResult.error(call.id(),
-                        "Element not found: " + describe(name, role, automationId)
-                                + ". Take a screenshot to see current GUI elements.");
+            // 路径 1：observationId + index/targetHandle（dsh 语义 · macOS 主路径）
+            String targetId;
+            String expectedStateHash = null;
+            ComputerUseUiSnapshotStore.ObservedElement observed = null;
+            if (observationId != null || index >= 0 || (handle != null && !handle.isEmpty())) {
+                ComputerUseElementResolver.Resolution resolution =
+                        ComputerUseElementResolver.resolveObserved(
+                                snapshotStore, sessionId, observationId, index, handle, allowRebind, "click");
+                if (resolution.failed()) {
+                    return ToolResult.error(call.id(), resolution.errorCode() + ": " + resolution.error());
+                }
+                observed = resolution.element();
+                targetId = resolution.locator();
+                // dsh expectedStateHash：动作前校验树没变（macOS 的 locator 是树序派生的）
+                expectedStateHash = resolution.stateHash();
+
+                // dsh service.ts:509-513 —— 允许重绑且提供了 targetHandle 时：
+                //   重新 observe 一次，用新树做三级解析（exact → native-id → semantic）
+                if (allowRebind && handle != null && !handle.isEmpty() && snapshotStore != null) {
+                    ComputerUseUiSnapshotStore.Observation original = snapshotStore.require(sessionId, observationId);
+                    ComputerUseAccessibilitySnapshot freshSnapshot =
+                            uiaService.captureSnapshot(hwnd, MacOsUiaService.DEFAULT_MAX_DEPTH);
+                    List<ComputerUseUiSnapshotStore.ObservedElement> freshElements =
+                            ComputerUseObserveTool.toObservedElements(freshSnapshot.nodes());
+                    long now = System.currentTimeMillis();
+                    ComputerUseUiSnapshotStore.Observation fresh = new ComputerUseUiSnapshotStore.Observation(
+                            "fresh", sessionId, freshSnapshot.appName(), freshSnapshot.bundleId(),
+                            freshSnapshot.pid(), freshSnapshot.windowTitle(), now, Long.MAX_VALUE,
+                            freshSnapshot.stateHash(), "full", freshSnapshot.text(),
+                            freshSnapshot.truncated(), freshElements, 1);
+                    boolean sameApp = original != null
+                            && original.bundleId().equals(fresh.bundleId())
+                            && original.pid() == fresh.pid();
+                    boolean sameWindow = original != null
+                            && original.windowTitle().equals(fresh.windowTitle());
+                    ComputerUseTargetResolver.Resolution target = ComputerUseElementResolver.rebind(
+                            original, fresh, observed, true, sameApp, sameWindow);
+                    if (target.failed()) {
+                        // 敏感动作遇到重绑 ⇒ 一次性确认失效（dsh service.ts:516-521）
+                        if (sensitive && confirmationToken != null) {
+                            confirmationStore.invalidate(sessionId, confirmationToken);
+                        }
+                        return ToolResult.error(call.id(),
+                                target.errorCode() + ": " + target.error());
+                    }
+                    if (target.targetChanged() && sensitive && confirmationToken != null) {
+                        confirmationStore.invalidate(sessionId, confirmationToken);
+                        return ToolResult.error(call.id(),
+                                "COMPUTER_TARGET_REBIND_REQUIRES_CONFIRMATION: the sensitive target rebound to a "
+                                        + "fresh element; observe the current UI and request a new one-use "
+                                        + "confirmation before acting");
+                    }
+                    observed = target.element();
+                    targetId = observed.locator();
+                    expectedStateHash = fresh.stateHash();
+                }
+
+                return clickAndReport(call, hwnd, needsBinding, targetId,
+                        labelOfObserved(observed, index, name, role, automationId), observed,
+                        expectedStateHash);
+            } else if (automationId != null && !automationId.isEmpty()) {
+                targetId = automationId;
+            } else {
+                // 路径 2：name/role 现查（Windows 主用；macOS 也可用）
+                ComputerUseAccessibilitySnapshot snapshot =
+                        uiaService.captureSnapshot(hwnd, MacOsUiaService.DEFAULT_MAX_DEPTH);
+                ComputerUseAccessibilityNode found =
+                        ComputerUseAccessibilitySnapshot.findNode(snapshot.nodes(), name, role, automationId);
+                if (found == null) {
+                    // CCB toolCalls.ts:3336-3340
+                    return ToolResult.error(call.id(),
+                            "Element not found: " + describe(name, role, automationId)
+                                    + ". Call observe (or take a screenshot) to see current GUI elements.");
+                }
+                targetId = found.automationId().isEmpty() ? found.locator() : found.automationId();
+                if (targetId.isEmpty()) {
+                    return ToolResult.error(call.id(),
+                            "Element has no usable locator: " + describe(name, role, automationId));
+                }
+                // ⚠️ 必须把找到的节点坐标带进回落路径（Windows 的 BoundingRect 中心点击依赖它）
+                return clickAndReport(call, hwnd, needsBinding, targetId,
+                        labelOfObserved(null, index, name, role, automationId), fromNode(found), null);
             }
 
-            // 优先 InvokePattern（CCB executorCrossPlatform.ts:1071-1074）
-            if (!node.automationId().isEmpty()
-                    && uiaService.invokeElement(hwnd, node.automationId())) {
-                return ToolResult.success(call.id(),
-                        "Clicked element: " + describe(name, role, automationId));
-            }
-
-            // 回落：BoundingRect 中心点 + 窗口定向点击（CCB executorCrossPlatform.ts:1076-1084）
-            int[] center = node.center();
-            int[] client = windowOps.screenToClient(hwnd, center[0], center[1]);
-            windowOps.sendClick(hwnd, client[0], client[1], false);
-
-            if (log.isInfoEnabled()) {
-                log.info("[computer-use] {} 回落中心点击: element=\"{}\" screen=({},{}) client=({},{})",
-                        TOOL_NAME, node.name(), center[0], center[1], client[0], client[1]);
-            }
-            return ToolResult.success(call.id(),
-                    "Clicked element: " + describe(name, role, automationId));
+            return clickAndReport(call, hwnd, needsBinding, targetId,
+                    labelOfObserved(observed, index, name, role, automationId), observed, null);
         } catch (Exception e) {
-            log.error("[computer-use] {} 执行失败: name={} role={} automationId={} err={}",
-                    TOOL_NAME, name, role, automationId, e.getMessage(), e);
+            log.error("[computer-use] {} 执行失败: index={} name={} role={} automationId={} err={}",
+                    TOOL_NAME, index, name, role, automationId, e.getMessage(), e);
             return ToolResult.error(call.id(), "元素点击失败: " + e.getMessage());
         }
     }
 
+    /**
+     * 执行点击（AXPress 优先；Windows 才回落坐标）+ 动作后<b>新观察</b>
+     * （对齐 dsh 动作结果里必带 {@code observation}：模型不用再单独 observe）。
+     */
+    private AgentToolResult<?> clickAndReport(ToolUseBlock call,
+                                              long hwnd,
+                                              boolean needsBinding,
+                                              String targetId,
+                                              String label,
+                                              ComputerUseUiSnapshotStore.ObservedElement observed,
+                                              String expectedStateHash) {
+        boolean pressed = expectedStateHash == null
+                ? uiaService.invokeElement(hwnd, targetId)
+                : uiaService.invokeElement(hwnd, targetId, expectedStateHash);
+        if (!pressed) {
+            if (!needsBinding && windowOps == null) {
+                return ToolResult.error(call.id(),
+                        "Element cannot be pressed via accessibility (no AXPress). macOS has no "
+                                + "coordinate fallback for observer-only elements — use screenshot + "
+                                + "left_click if the element is drawn without accessibility support.");
+            }
+            if (observed == null || !observed.hasBounds()) {
+                return ToolResult.error(call.id(),
+                        "Element could not be pressed and has no usable bounds for a fallback click: " + label);
+            }
+            int centerX = observed.x() + Math.round(observed.width() / 2f);
+            int centerY = observed.y() + Math.round(observed.height() / 2f);
+            int[] client = windowOps.screenToClient(hwnd, centerX, centerY);
+            windowOps.sendClick(hwnd, client[0], client[1], false);
+            if (log.isInfoEnabled()) {
+                log.info("[computer-use] {} 回落中心点击: element=\"{}\" screen=({},{}) client=({},{})",
+                        TOOL_NAME, label, centerX, centerY, client[0], client[1]);
+            }
+        }
+        return ToolResult.success(call.id(), "Clicked element: " + label);
+    }
+
+    /** 节点 → 观察元素（只为把坐标带进回落路径；Windows 的 name/role 现查路径用）。 */
+    private static ComputerUseUiSnapshotStore.ObservedElement fromNode(ComputerUseAccessibilityNode node) {
+        if (node == null) {
+            return null;
+        }
+        return new ComputerUseUiSnapshotStore.ObservedElement(
+                node.index(), "", node.locator(), node.role(), node.name(), node.value(),
+                node.enabled(), node.actions(), node.x(), node.y(), node.width(), node.height());
+    }
+
+    /** 目标描述（优先用观察元素里的真实角色/名字，回落到请求参数）。 */
+    private static String labelOfObserved(ComputerUseUiSnapshotStore.ObservedElement observed,
+                                          int index,
+                                          String name,
+                                          String role,
+                                          String automationId) {
+        if (observed != null) {
+            StringBuilder sb = new StringBuilder();
+            if (index >= 0) {
+                sb.append('#').append(index).append(' ');
+            }
+            sb.append(observed.role());
+            if (!observed.name().isEmpty()) {
+                sb.append(" \"").append(observed.name()).append('"');
+            }
+            return sb.toString().trim();
+        }
+        return describe(name, role, automationId);
+    }
+
+    /** 目标描述（优先用观察快照里的真实角色/名字，回落到请求参数）。 */
     /** 元素描述（CCB {@code toolCalls.ts:3338} / {@code :3343} 的同款拼接）。 */
     private static String describe(String name, String role, String automationId) {
         StringBuilder sb = new StringBuilder();

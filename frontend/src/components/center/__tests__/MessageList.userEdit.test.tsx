@@ -4,7 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { MessageList } from '../MessageList'
 import { useChatStore } from '@/stores/chatStore'
-import type { ChatMessageDto } from '@/api/types'
+import type { AttachmentRequest, ChatMessageDto } from '@/api/types'
 
 /**
  * [用户消息编辑重发] 用户气泡 hover 显示时间 + 编辑/复制；点铅笔进编辑态，底部提示「编辑后将从此处
@@ -120,8 +120,9 @@ describe('[用户消息编辑重发]', () => {
     await act(async () => { sendBtn()!.click() })
 
     expect(onEditResend).toHaveBeenCalledTimes(1)
-    // 第三个参数 = 「裁剪完成」回调（App 在裁剪 + 重拉窗口后调用 ⇒ 立刻退出编辑态）
-    expect(onEditResend).toHaveBeenCalledWith('u1', '改写后的问题', expect.any(Function))
+    // 第三个参数 = 「裁剪完成」回调（App 在裁剪 + 重拉窗口后调用 ⇒ 立刻退出编辑态）；
+    // 第四个参数 = 随重发一起带上的原消息附件（本用例无附件 ⇒ undefined）
+    expect(onEditResend).toHaveBeenCalledWith('u1', '改写后的问题', expect.any(Function), undefined)
     // 成功 → 回到普通气泡
     expect(textarea()).toBeNull()
     expect(container.querySelector('.user-bubble')).not.toBeNull()
@@ -216,5 +217,37 @@ describe('[用户消息编辑重发]', () => {
 
     expect(textarea()).toBeNull()
     expect(container.querySelector('.user-bubble')!.textContent).toContain('原问题')
+  })
+
+  /**
+   * [2026-11-01] 编辑重发必须**带上原消息的图片**。
+   *
+   * <p><b>WHY</b>：用户编辑一条带图的消息时，编辑框里能看到图（我们特意保留显示）⇒ 自然
+   * 认为重发会把图带上。若只发文本，图片会被静默丢掉 —— 这是最难被发现的静默数据丢失。
+   *
+   * <p>变异自证：submitEdit 不构造 attachments / 不传第 4 参 → 本用例红。
+   */
+  it('编辑带图的消息 → 编辑框里显示原图，重发时把图片作为附件带上', async () => {
+    const onEditResend = vi.fn(async () => {})
+    const withImage: ChatMessageDto = {
+      ...userMsg('u1', '看这张图'),
+      imageData: [{ base64: 'AAAA', mediaType: 'image/png' }],
+    }
+    renderList([withImage], onEditResend)
+    hover()
+    act(() => { editBtn()!.click() })
+
+    // 编辑态仍能看到原图（否则用户以为图没了 / 或以为还在但其实要丢）
+    const thumbs = container.querySelectorAll('.user-edit-thumb')
+    expect(thumbs.length).toBe(1)
+
+    typeInto(textarea()!, '看这张图（改）')
+    await act(async () => { sendBtn()!.click() })
+
+    expect(onEditResend).toHaveBeenCalledTimes(1)
+    const call = onEditResend.mock.calls[0] as unknown as [string, string, () => void, AttachmentRequest[]]
+    expect(call[0]).toBe('u1')
+    expect(call[1]).toBe('看这张图（改）')
+    expect(call[3]).toEqual([{ type: 'image', base64: 'AAAA', mediaType: 'image/png' }])
   })
 })

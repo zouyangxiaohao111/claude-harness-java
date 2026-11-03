@@ -109,6 +109,10 @@ class MacOsComputerUseBackendTest {
             if (script.contains("AXIsProcessTrusted")) {
                 return ok("true");
             }
+            // 剪贴板粘贴脚本：输出单行 JSON（restored + pasted）
+            if (script.contains("NSPasteboard")) {
+                return ok("{\"restored\":true,\"pasted\":true,\"snapshotItems\":1}");
+            }
             if (script.contains("CGPreflightScreenCaptureAccess")) {
                 return ok("true");
             }
@@ -238,20 +242,24 @@ class MacOsComputerUseBackendTest {
     }
 
     @Test
-    @DisplayName("文本注入走 CoreGraphics Unicode 通道（CGEventSetUnicodeString），无特殊键语义")
-    void typeCharUsesUnicodeChannel() throws Exception {
+    @DisplayName("文本注入走剪贴板 + ⌘V（CoreGraphics 的 unicode 通道在 JXA 下不可用）")
+    void typeCharUsesClipboardPaste() throws Exception {
         FakeRunner runner = defaultRunner();
         MacOsKeyboard keyboard = new MacOsKeyboard(runner, tcc(runner));
 
         keyboard.typeChar('+');
 
-        List<String> scripts = runner.scriptsContaining("CGEventSetUnicodeString");
+        // WHY：JXA 桥里既没有 CGEventSetUnicodeString，正式名 CGEventKeyboardSetUnicodeString
+        // 也传不进 UniChar*（实测传 "BBB" 打出 "aaa"）⇒ 唯一可行路径是剪贴板 + ⌘V。
+        List<String> scripts = runner.scriptsContaining("NSPasteboard");
         assertThat(scripts).hasSize(1);
-        // '+' 在 AppleScript keystroke 里无特殊含义，但本仓走 Unicode 直投 ⇒ 更稳
         assertThat(scripts.get(0))
-                .contains("$.CGEventCreateKeyboardEvent(null, 0, true)")
-                .contains("$.CGEventSetUnicodeString(d, '+')")
-                .contains("$.CGEventPost($.kCGHIDEventTap, d)");
+                .contains("pb.setStringForType")
+                .contains("$.CGEventCreateKeyboardEvent(null, 9, true)")   // 9 = 'v'
+                .contains("$.kCGEventFlagMaskCommand")
+                .contains("writeObjects");                                 // 还原快照
+        // ⛔ 不得再调用不存在的 CGEventSetUnicodeString
+        assertThat(runner.scriptsContaining("CGEventSetUnicodeString")).isEmpty();
     }
 
     // ══════════════════════════════════════════════════════════════════
@@ -326,12 +334,17 @@ class MacOsComputerUseBackendTest {
     }
 
     @Test
-    @DisplayName("前台应用：喂固定 JSON ⇒ 解析出归一后的授权键（与授权表同命名空间）")
+    @DisplayName("前台应用：解析出 bundleId 优先的稳定键 + 显示名别名")
     void frontmostAppIsParsed() {
         FakeRunner runner = defaultRunner();
         MacOsForegroundAppResolver resolver = new MacOsForegroundAppResolver(runner);
 
-        assertThat(resolver.currentAppId()).isEqualTo("google chrome");
+        // WHY bundleId 优先：显示名随系统语言变化（中文系统 "Finder" → 「访达」），
+        // 只按显示名做精确匹配会在非英文系统上必然 miss（实测所有输入动作被误拦）。
+        // ⇒ 主键取稳定的 bundleId，显示名作为等价别名一并给出。
+        assertThat(resolver.currentAppId()).isEqualTo("com.google.chrome");
+        assertThat(resolver.currentAppAliases())
+                .containsExactly("com.google.chrome", "google chrome");
     }
 
     @Test

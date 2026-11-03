@@ -267,6 +267,12 @@ public final class ComputerUseScreenshotTool implements Tool {
         List<ComputerUseMcpContent> content = List.of(
                 ComputerUseMcpContent.image(capture.base64(), capture.mediaType()));
 
+        // pixelScale = 这张图的像素 / 窗口点（对齐 dsh 截图 Artifact 的 pixelScale）
+        //   ⚠️ 不等于 capture.scaleFactor()：本仓截图还会「缩到 ≤1568」（ComputerUseApiResize）
+        //   ⇒ 模型从图上读到的坐标要先除以这个因子，才是点击用的点坐标。
+        double pixelScale = capture.logicalWidth() > 0
+                ? (double) capture.imageWidth() / capture.logicalWidth()
+                : 0d;
         ComputerUseScreenshotResult payload = new ComputerUseScreenshotResult(
                 content,
                 capture.mediaType(),
@@ -277,14 +283,16 @@ public final class ComputerUseScreenshotTool implements Tool {
                 capture.originX(),
                 capture.originY(),
                 capture.jpegBytes().length,
-                capture.scaleFactor());
+                capture.scaleFactor(),
+                pixelScale);
 
         if (log.isInfoEnabled()) {
-            log.info("[computer-use] {} 完成: 图像 {}x{} · 显示 {}x{} · origin ({},{}) · {} 字节 · session={}",
+            log.info("[computer-use] {} 完成: 图像 {}x{} · 显示 {}x{} · origin ({},{}) · {} 字节 · "
+                            + "pixelScale={} · session={}",
                     TOOL_NAME, capture.imageWidth(), capture.imageHeight(),
                     capture.displayWidth(), capture.displayHeight(),
                     capture.originX(), capture.originY(),
-                    capture.jpegBytes().length, sessionId);
+                    capture.jpegBytes().length, pixelScale, sessionId);
         }
 
         return ToolResult.success(call.id(), payload);

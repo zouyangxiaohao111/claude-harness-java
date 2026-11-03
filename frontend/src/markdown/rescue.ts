@@ -347,7 +347,10 @@ const GLUED_HEADING = /^(#{1,6})(?!#)(\S.*)$/
  * 此处与先期原型有一处**有意分歧**（原型保留 `/[：；]\s*$/` 拒绝）。
  * 只留三类拒绝（其余形态一律补空格）：
  * - `#6…`：单井号 + 紧跟数字 —— 引用编号不是标题；
- * - 含 `。`：像正文（`##环境：已具备…可以跑。（风险点：…`）；
+ * - `。` 出现在**行中**：像正文（`##环境：已具备…可以跑。（风险点：…`）；
+ *   [2026-11-02 用户裁定] **行尾句号不再拒绝** —— 用户原话「`##需要你做的这` / `###xxx`
+ *   这种的都修复一下」，真库实测 19 条裸标题行是「句号收尾的标题」（`##①项目 MD文档没有
+ *   预览根因：…。`），只有 4 条是真正文；旧判据把整类标题一并拒绝 ⇒ 主会话里裸露 `##`；
  * - 残余粘连（含 `|` / 三反引号串 / `#`）：该由 P1 / P1.5 先拆开再判 ——
  *   整行直接补空格会把表格、围栏或下一个标题一起并进标题文本。
  */
@@ -357,7 +360,8 @@ export function headingFix(line: string): { fixed: string } | { reject: string }
   const hashes = m[1]!
   const rest = m[2]!
   if (hashes.length === 1 && /^\d/.test(rest)) return { reject: 'single-hash-digit' }
-  if (rest.includes('。')) return { reject: 'contains-。' }
+  // 只拒「句号夹在行中」的；行尾句号是标题的正常收尾（见上方 2026-11-02 裁定）
+  if (/。\s*\S/.test(rest)) return { reject: 'contains-。' }
   // 残余粘连三道（同一族：行内还有没拆的块级标记）
   if (rest.includes('|')) return { reject: 'contains-|' }
   if (/#/.test(rest)) return { reject: 'contains-embedded-hash' }

@@ -154,6 +154,22 @@ public class AgentLoopContextFactory {
     //   则翻包」派生拿到实例）。required=false：单测 / 非 Spring 场景无 bean → null → 等价接线前。
     @Autowired(required = false) private AutoCompactor autoCompactor;
     @Autowired(required = false) private MicroCompactor microCompactor;
+    /**
+     * [goal V253] 目标（/goal）服务 · 装进 ctx 供 loop() 的 stop-hook 段消费
+     * （后台门控 / 未达成回写 / 终态处理）。
+     *
+     * <p><b>WHY 用 ObjectProvider</b>：本工厂处在一条很深的依赖链上
+     * （SubagentExecutor → SpawnInProcess → BackgroundTaskRunner → BashTool → … → CommandController），
+     * 而 GoalService → SessionService → ChatService → … 会绕回本工厂 ⇒ 直接持实例 ⇒
+     * Spring 启动期循环依赖失败。⇒ 存 provider，ctx 运行时懒解析。
+     */
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<com.nexusai.application.agent.goal.GoalService> goalServiceProvider;
+    /**
+     * [goal V253] 任务框架服务 · 「该会话是否还有未完成后台工作」的探针来源。同款懒解析理由。
+     */
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<com.nexusai.application.agent.tasks.TaskFrameworkService> taskFrameworkServiceProvider;
     @Autowired(required = false) private ApplicationEventPublisher eventPublisher;
     @Autowired(required = false) private TraceRecorder traceRecorder;
     @Autowired(required = false) private PermissionContextBuilder permissionContextBuilder;
@@ -484,7 +500,10 @@ public class AgentLoopContextFactory {
             modelCostCalculator,
             // [G1 接线] 顺序必须与 record 分量顺序一致（microCompactor 在前、autoCompactor 在后）。
             microCompactor,
-            autoCompactor);
+            autoCompactor,
+            // [goal V253] 目标服务 + 任务框架服务（后台门控探针）· 顺序同 record 分量。
+            goalServiceProvider,
+            taskFrameworkServiceProvider);
     }
 
     /**

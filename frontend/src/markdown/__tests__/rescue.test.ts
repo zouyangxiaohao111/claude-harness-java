@@ -401,6 +401,19 @@ describe('rescue · P1.5 与下游树的对应（拆行改文本 ⇒ 旧树必�
 })
 
 describe('rescue · P2 标题规则（判据 = 原型 healHeading，2026-10-09 放宽）', () => {
+
+  it('行尾句号是标题收尾，不再拒绝；句中句号仍当正文（2026-11-02 用户裁定）', () => {
+    // WHY：用户原话「`##需要你做的这` / `###xxx` 这种的都修复一下」。
+    //   真库实测（127 条 assistant / 376 个裸标题行）：句号在**行尾**的 19 条全是标题
+    //   （`##①项目 MD文档没有预览根因：…。`），句号夹在行中的仅 4 条才是正文。
+    //   旧判据 `rest.includes('。')` 把整类标题一并拒绝 ⇒ 主会话里裸露 `##`。
+    expect(headingFix('##需要你做的这两处改动都在后端：必须重启后端才生效。'))
+      .toEqual({ fixed: '## 需要你做的这两处改动都在后端：必须重启后端才生效。' })
+    expect(headingFix('###xxx。')).toEqual({ fixed: '### xxx。' })
+    // 对照：句号后面还有正文 ⇒ 仍拒绝（那是一段话，不是标题）
+    expect(headingFix('##环境：已具备。风险点：并发')).toEqual({ reject: 'contains-。' })
+  })
+
   it('CJK 开头、短 → 补空格（编号标题同样补：数字起始只挡拆行，不挡补空格）', () => {
     expect(headingFix('##一句话结论')).toEqual({ fixed: '## 一句话结论' })
     expect(headingFix('##1.内置工具')).toEqual({ fixed: '## 1.内置工具' })

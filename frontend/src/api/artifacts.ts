@@ -15,6 +15,13 @@ export interface SessionArtifactDto {
   sizeBytes: number | null
   summary: string | null
   updatedAt: string | null
+  /**
+   * `localPath` 指向的是**目录**而不是文件（后端**读时判定**，不落库）。
+   *
+   * <p>目录不会被归档 ⇒ 路径不在会话归档目录内 ⇒ 不能预览/不能编辑，
+   * 前端要画文件夹图标、大小行写「目录」、点击 = 打开所在目录（桌面）/ 复制路径（浏览器）。
+   */
+  directory: boolean
 }
 
 export interface SessionArtifacts {

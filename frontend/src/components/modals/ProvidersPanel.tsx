@@ -1,9 +1,10 @@
 import { useState } from 'react'
 import type { Model, Provider } from '@/api/types'
+import { Icon } from '@/icons'
 import { FormModal, type FormSection } from '@/components/ui/FormModal'
 import { ModelFormModal } from '@/components/ui/ModelFormModal'
 import { KvEditor } from '@/components/common/KvEditor'
-import { tagToClass } from '@/data'
+import { brandTagFromName, tagToClass } from '@/data'
 import type { UseProviders } from '@/hooks/useProviders'
 import { ApiError } from '@/api/rest'
 import type { CreateModelRequest, CreateProviderRequest, UpdateModelRequest, UpdateProviderRequest } from '@/api/types'
@@ -51,12 +52,40 @@ const firstModelNameHint = (p: Provider): string => {
   return isAnthropic ? 'claude-sonnet-4-5' : ''
 }
 
+/**
+ * 新模型的 tag（提供商标识）。
+ *
+ * <p>[2026-11-01] 「提供商标识」只读块已从模型弹窗移除 ⇒ tag 不再由表单携带固定默认值
+ * （那会给任何 provider 加模型都写成 `DS`）。改按 provider 名推断品牌，
+ * 再退化到模型名，最后才用历史默认值。
+ */
+const tagForNewModel = (providerName: string, modelName: string, fallback: string): string =>
+  brandTagFromName(providerName) ?? brandTagFromName(modelName) ?? fallback
 
-const EditIcon = () => (
-  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-    <path d="M9 2L12 5L5 12H2V9L9 2Z" />
-  </svg>
-)
+
+/**
+ * 协议类型选项（分段控件 · 三种模式）。
+ *
+ * <p><b>为什么不用原生下拉 + 原始枚举值</b>：此前下拉里直接写着 `openai_compatible` ——
+ * 那是给程序看的 wire 值，用户根本不知道它是什么。分段控件给出中文名 + 端点路径，
+ * wire 值仍是枚举本身（后端契约不变）。
+ *
+ * <p><b>三种模式</b>：
+ * <ul>
+ *   <li><b>OpenAI 兼容</b> —— /v1/chat/completions（绝大多数第三方网关）</li>
+ *   <li><b>Anthropic 原生</b> —— /v1/messages（Claude 官方或原生兼容端点）</li>
+ *   <li><b>OpenAI Responses</b> —— /v1/responses。
+ *       ⚠️ <b>当前后端未实现</b>（后端 {@code ProviderType} 枚举无此值，
+ *       {@code ProviderService.toProviderDto} 走 {@code ProviderType.valueOf(...)}
+ *       ⇒ 真提交会 500）⇒ 界面上<b>显示但置灰不可选</b>，让用户知道「有这一种、只是还没支持」，
+ *       而不是把整条能力从界面上抹掉。</li>
+ * </ul>
+ */
+const PROTOCOL_OPTIONS = [
+  { value: 'openai_compatible', label: 'OpenAI 兼容', desc: '/v1/chat/completions' },
+  { value: 'anthropic', label: 'Anthropic 原生', desc: '/v1/messages' },
+  { value: 'openai_response', label: 'OpenAI Responses', desc: '/v1/responses · 暂不支持', disabled: true },
+]
 
 /**
  * 「自定义请求头」section（新建 / 编辑共用）。
@@ -189,10 +218,12 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
   }
 
   const onAddModel = (providerId: string, m: Model) => {
+    const providerName = list.find((x) => x.id === providerId)?.name ?? ''
     const req: CreateModelRequest = {
       name: m.name,
       alias: m.alias || null,
-      tag: m.tag,
+      // [2026-11-01] 提供商标识不再由表单提供 ⇒ 按 provider / 模型名推断品牌
+      tag: tagForNewModel(providerName, m.name, m.tag),
       desc: m.desc,
       type: m.type,
       maxTokens: m.maxTokens,
@@ -258,9 +289,9 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
               </div>
             </div>
             <div className={`toggle ${p.enabled ? 'active' : ''}`} onClick={() => onToggle(p.id, p.enabled)} title={p.enabled ? '停用' : '启用'} />
-            <button className="icon-btn" title="编辑提供商" onClick={() => setEditingProvider(p)}><EditIcon /></button>
-            <button className="icon-btn" title="删除提供商" onClick={() => onRemoveProvider(p.id)}>
-              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 13, height: 13 }}><path d="M4 4L10 10M10 4L4 10" /></svg>
+            <button className="icon-btn icon-btn-edit" title="编辑提供商" onClick={() => setEditingProvider(p)}><Icon.Edit /></button>
+            <button className="icon-btn icon-btn-del" title="删除提供商" onClick={() => onRemoveProvider(p.id)}>
+              <Icon.Trash />
             </button>
           </div>
 
@@ -274,9 +305,9 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
                   <span className="model-name">{m.name}</span>
                 </div>
                 <div className="model-actions">
-                  <button className="icon-btn" title="编辑模型" onClick={() => setEditingModel({ providerId: p.id, model: m })}><EditIcon /></button>
-                  <button className="icon-btn" title="移除模型" onClick={() => onRemoveModel(p.id, m.id)}>
-                    <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}><path d="M4 4L10 10M10 4L4 10" /></svg>
+                  <button className="icon-btn icon-btn-edit" title="编辑模型" onClick={() => setEditingModel({ providerId: p.id, model: m })}><Icon.Edit /></button>
+                  <button className="icon-btn icon-btn-del" title="移除模型" onClick={() => onRemoveModel(p.id, m.id)}>
+                    <Icon.Trash />
                   </button>
                 </div>
               </div>
@@ -301,10 +332,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
               title: '基础信息',
               fields: [
                 { type: 'text', name: 'name', label: '名称', placeholder: 'e.g. DeepSeek' },
-                { type: 'select', name: 'type', label: '协议类型', options: [
-                  { value: 'openai_compatible', label: 'openai_compatible' },
-                  { value: 'anthropic', label: 'anthropic' },
-                ], hint: 'baseUrl 含 api.anthropic.com 会推断为 anthropic' },
+                { type: 'radio-segments', name: 'type', label: '协议类型', options: PROTOCOL_OPTIONS, hint: '决定请求走哪个 API 端点 · baseUrl 含 api.anthropic.com 会自动推断为 Anthropic' },
                 { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.example.com/v1' },
                 { type: 'password', name: 'apiKeyMasked', label: 'API Key', placeholder: 'sk-****abcd', hint: '完整 key，后端脱敏后存储' },
               ],
@@ -334,10 +362,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
               title: '基础信息',
               fields: [
                 { type: 'text', name: 'name', label: '名称', placeholder: 'e.g. OpenAI' },
-                { type: 'select', name: 'type', label: '协议类型', options: [
-                  { value: 'openai_compatible', label: 'openai_compatible' },
-                  { value: 'anthropic', label: 'anthropic' },
-                ], hint: 'baseUrl 含 api.anthropic.com 会推断为 anthropic' },
+                { type: 'radio-segments', name: 'type', label: '协议类型', options: PROTOCOL_OPTIONS, hint: '决定请求走哪个 API 端点 · baseUrl 含 api.anthropic.com 会自动推断为 Anthropic' },
                 { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.openai.com/v1' },
                 { type: 'password', name: 'apiKeyMasked', label: 'API Key', placeholder: 'sk-****abcd' },
               ],
@@ -358,7 +383,10 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       {editingModel && (
         <ModelFormModal
           initial={editingModel.model}
-          providerName={list.find((x) => x.id === editingModel.providerId)?.name}
+          providerTag={editingModel.model.tag
+            || brandTagFromName(list.find((x) => x.id === editingModel.providerId)?.name ?? '')
+            || undefined}
+          mode="edit"
           onSave={(m) => onSaveModel(editingModel.providerId, m)}
           onCancel={() => setEditingModel(null)}
           onDelete={() => {
@@ -371,7 +399,12 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       {addingModelFor && (
         <ModelFormModal
           initial={{ ...EMPTY_MODEL, name: addingModelFor.prefillName }}
-          providerName={list.find((x) => x.id === addingModelFor.providerId)?.name}
+          providerTag={tagForNewModel(
+            list.find((x) => x.id === addingModelFor.providerId)?.name ?? '',
+            addingModelFor.prefillName,
+            EMPTY_MODEL.tag,
+          )}
+          mode="create"
           onSave={(m) => onAddModel(addingModelFor.providerId, m)}
           onCancel={() => setAddingModelFor(null)}
         />

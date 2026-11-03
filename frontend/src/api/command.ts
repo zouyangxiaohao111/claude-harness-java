@@ -55,8 +55,24 @@ export const commandApi = {
   //   旧实现「缺值 → 后端读 RequestContext.sessionId()」，而 MDC 第三态会读到上一请求残留的**别的
   //   会话** id ⇒ /clear 等会话级命令的副作用作用到别的会话上。TS 侧同步收紧为 required，让编译器
   //   在每个调用点强制把关（而非运行期才发现 400）。
+  //
+  // [2026-11-02 修 · /compact 报 JSON 解析异常] Accept 必须放宽。
+  //   `POST /builtins/compact/execute` 在后端有两个入口，返回类型**不同**：
+  //     · 通用入口（本函数默认走的 `/builtins/{name}/execute`）→ 返回 Command 元数据（JSON）；
+  //     · `/compact` 的**字面端点** → `produces="text/plain;charset=UTF-8"`，返回纯文本。
+  //   Spring 里字面路由优先，所以 /compact 实际命中纯文本端点 ⇒ `Accept: application/json`
+  //   协商失败 ⇒ 406（错误体是 HTML）⇒ 前端 JSON.parse 抛 `Unexpected token 'W'`。
+  //   ⇒ 这里统一发 `*/*`：不会收紧任何响应类型，两种入口都能正常接收。
   executeBuiltin: (name: string, sessionId: string, req?: unknown) =>
     api<unknown>(
       `/builtins/${encodeURIComponent(name)}/execute?sessionId=${encodeURIComponent(sessionId)}`,
-      { method: 'POST', body: req ?? undefined }, CMD_BASE),
+      { method: 'POST', body: req ?? undefined, accept: '*/*' }, CMD_BASE),
+  // [goal V253] /goal 独立端点 · 通用端点的请求体是 ResumeExecuteRequest（无 args 字段）
+  //   ⇒ args 会被 Jackson 静默丢弃 ⇒ 条件文本丢失。故走字面端点（与 /compact 同款做法）。
+  //   ⚠️ Accept 必须 '*/*'：该端点 produces=text/plain（字面路由优先于 {name} 路径变量），
+  //   发 application/json 会 406（错误体是 HTML）⇒ JSON.parse 抛 'Unexpected token'。
+  executeGoal: (sessionId: string, args?: string) =>
+    api<string>(
+      `/builtins/goal/execute?sessionId=${encodeURIComponent(sessionId)}`,
+      { method: 'POST', body: args ? { args } : undefined, accept: '*/*' }, CMD_BASE),
 }

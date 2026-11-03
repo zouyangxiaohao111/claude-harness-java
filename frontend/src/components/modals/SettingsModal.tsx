@@ -2,10 +2,9 @@ import { useEffect, useState } from 'react'
 import type { FontSize, ModelInfo, SettingsTab, ThemeMode } from '@/types'
 import { settingsApi } from '@/api/settings'
 import { ApiError } from '@/api/rest'
-import type { UpdateSettingsRequest } from '@/api/types'
+import type { ModelTierRole, UpdateSettingsRequest } from '@/api/types'
 import { LanguagePickerModal, languageDisplayName } from './LanguagePickerModal'
 import { ProvidersPanel } from './ProvidersPanel'
-import { SkillsPanel } from './SkillsPanel'
 import { MCPPanel } from './MCPPanel'
 import { DatabasePanel } from './DatabasePanel'
 import { SchedulesPanel } from './SchedulesPanel'
@@ -17,7 +16,6 @@ import { ModelSettingsPanel } from '../settings/ModelSettingsPanel'
 import { MarketManagePanel } from '../settings/MarketManagePanel'
 import type { Provider, AppSettings } from '@/api/types'
 import type { UseProviders } from '@/hooks/useProviders'
-import type { UseSkills } from '@/hooks/useSkills'
 import type { UseMcp } from '@/hooks/useMcp'
 import type { UseDatabases } from '@/hooks/useDatabases'
 import type { UseSchedules } from '@/hooks/useSchedules'
@@ -35,7 +33,6 @@ interface SettingsModalProps {
   // P7: 真实后端联调 — 传 hook 而非只传 list
   providers: Provider[]
   providersApi: UseProviders
-  skillsApi: UseSkills
   mcpApi: UseMcp
   databasesApi: UseDatabases
   schedulesApi: UseSchedules
@@ -44,10 +41,14 @@ interface SettingsModalProps {
   /** 环境配置（设置页「环境配置」tab：压缩窗口/自动记忆/away 门控） */
   appSettings: AppSettings | null
   onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
-  /** 全局模型配置（设置页「模型」tab：快速/档位角色） */
-  fastModel: string | null
-  pickFast: (providerName: string, modelName: string) => void
-  clearFast: () => void
+  /** 全局模型配置（设置页「模型」tab：档位角色绑定/解绑） */
+  onBindModelTier: (role: ModelTierRole, fullName: string) => void
+  /** 一键把某个模型写进所有通用档位（不含 TTS / ASR） */
+  onBindAllModelTiers: (fullName: string) => Promise<void>
+  /** 解除单个档位绑定（DELETE 端点 · PUT 的 merge 表达不了「清空」） */
+  onClearModelTier: (role: ModelTierRole) => Promise<void>
+  /** 解除全部档位绑定（「一键清除所有已配置的模型」） */
+  onClearAllModelTiers: () => Promise<void>
   /** 打开记忆编辑器（设置页「环境配置」tab「记忆」模块入口；独立弹窗，z-index 高于本弹窗） */
   onOpenMemoryEditor: () => void
   /** [批 3a] 当前活动会话 id：hook 列表 / 记忆配置（dreamStatus 为 per-project）后端口已必填
@@ -72,7 +73,6 @@ const NAV_ITEMS: { id: SettingsTab; label: string; section: 'core' | 'tools' | '
   { id: 'env',        label: '环境配置', section: 'core' },
   { id: 'model',      label: '模型',   section: 'core' },
   { id: 'providers',  label: '提供商', section: 'tools' },
-  { id: 'skills',     label: '技能',   section: 'tools' },
   { id: 'mcp',        label: 'MCP',   section: 'tools' },
   { id: 'database',   label: '数据库', section: 'tools' },
   { id: 'schedules',  label: '定时任务', section: 'tools' },
@@ -99,7 +99,6 @@ export function SettingsModal({
   models,
   providers,
   providersApi,
-  skillsApi,
   mcpApi,
   databasesApi,
   schedulesApi,
@@ -107,9 +106,10 @@ export function SettingsModal({
   showToast,
   appSettings,
   onSaveSettings,
-  fastModel,
-  pickFast,
-  clearFast,
+  onBindModelTier,
+  onBindAllModelTiers,
+  onClearModelTier,
+  onClearAllModelTiers,
   onOpenMemoryEditor,
   sessionId,
 }: SettingsModalProps) {
@@ -315,15 +315,14 @@ export function SettingsModal({
               <ModelSettingsPanel
                 providers={providers}
                 settings={appSettings}
-                onSaveSettings={onSaveSettings}
-                fastModel={fastModel}
-                pickFast={pickFast}
-                clearFast={clearFast}
+                onBindTier={onBindModelTier}
+                onBindAllTiers={onBindAllModelTiers}
+                onClearTier={onClearModelTier}
+                onClearAllTiers={onClearAllModelTiers}
                 onOpenProviders={() => setSettingsTab('providers')}
               />
             )}
             {settingsTab === 'providers' && <ProvidersPanel providers={providers} providersApi={providersApi} showToast={showToast} />}
-            {settingsTab === 'skills' && <SkillsPanel skillsApi={skillsApi} showToast={showToast} />}
             {settingsTab === 'mcp' && <MCPPanel mcpApi={mcpApi} showToast={showToast} sessionId={sessionId} />}
             {settingsTab === 'database' && <DatabasePanel databasesApi={databasesApi} showToast={showToast} />}
             {settingsTab === 'schedules' && <SchedulesPanel schedulesApi={schedulesApi} showToast={showToast} />}

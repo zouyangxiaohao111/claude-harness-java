@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import { FormModal } from '@/components/ui/FormModal'
+import { Icon } from '@/icons'
 import { ApiError } from '@/api/rest'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
 import type { CreateMcpRequest, McpOAuthRequest, McpServer, McpStatus } from '@/api/types'
@@ -608,8 +609,10 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
         <div className="fm-model-empty" style={{ padding: '12px 14px', textAlign: 'left' }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
             <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink)' }}>导入明细</span>
-            <button className="skill-remove" onClick={() => setImportDetail(null)} title="关闭">
-              ×
+            {/* 「关闭明细」是中性动作，不是破坏性操作 ⇒ 用普通 icon-btn + 关闭图标，
+                不复用 .skill-remove（那是删除语义 · hover 红色警示）。 */}
+            <button className="icon-btn" onClick={() => setImportDetail(null)} title="关闭">
+              <Icon.CloseLg />
             </button>
           </div>
           {importDetail.blocked.length > 0 && (

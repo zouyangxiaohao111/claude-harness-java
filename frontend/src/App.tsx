@@ -9,7 +9,7 @@ import {
   brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile, RightTab } from '@/types'
-import type { AppSettings, AttachmentRequest, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
+import type { AppSettings, AttachmentRequest, ModelTierRole, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
 import { projectApi, type ProjectDto } from '@/api/projects'
@@ -30,15 +30,14 @@ import { debugLog } from '@/utils/debugLog'
 import { rememberAppName } from '@/utils/appNameCache'
 import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
 import { computeTurnRunning } from '@/utils/turnRunning'
+import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
 import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
-import { isUserTurnRow } from '@/stores/messageTurns'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { useAwaySummary } from '@/hooks/useAwaySummary'
 import { sendPermissionResponse } from '@/api/socket'
 import { useClickOutside, useEscapeKey, useTheme, useFontSize, useAnimations, useToastDispatcher } from '@/hooks'
 import { useProviders } from '@/hooks/useProviders'
-import { useSkills } from '@/hooks/useSkills'
 import { useMcp } from '@/hooks/useMcp'
 import { useDatabases } from '@/hooks/useDatabases'
 import { useSchedules } from '@/hooks/useSchedules'
@@ -66,6 +65,7 @@ import { AgentsPanel } from '@/components/center/AgentsPanel'
 import { ChromePanel } from '@/components/center/ChromePanel'
 import { SkillSurvey } from '@/components/center/SkillSurvey'
 import { RightPanel } from '@/components/right/RightPanel'
+import { ArtifactDock } from '@/components/right/ArtifactDock'
 import { ProjectContextMenu } from '@/components/right/ProjectContextMenu'
 import { SearchPalette } from '@/components/modals/SearchPalette'
 import { SettingsModal } from '@/components/modals/SettingsModal'
@@ -127,6 +127,36 @@ const EMPTY_ARTIFACTS: SessionArtifacts = { deliverables: [], sources: [] }
  */
 const RIGHT_PANEL_DRAWER = true
 
+/**
+ * 档位角色 → AppSettings 字段名（写 settings 列用）。
+ *
+ * <p><b>单一来源</b>：档位的 wire key 与后端 `ModelTierRole` 枚举一一对应；
+ * 「档位 → settings 列」的映射只此一份（面板与 App 都从这里取，避免两处各写一遍而漂移）。
+ */
+const TIER_FIELD_BY_ROLE: Record<ModelTierRole, keyof AppSettings> = {
+  main: 'mainModelName',
+  fast: 'fastModelName',
+  strong: 'strongModelName',
+  medium: 'mediumModelName',
+  weak: 'weakModelName',
+  subagent: 'subagentModelName',
+  fallback: 'fallbackModelName',
+  multimodal: 'multimodalModelName',
+  tts: 'ttsModelName',
+  asr: 'asrModelName',
+  classifier: 'classifierModel',
+}
+
+/**
+ * 「一键配置到全部档位」覆盖的角色：全部 − TTS / ASR。
+ *
+ * <p>TTS（语音合成）与 ASR（语音转文字）是专用模型，把通用对话模型写进去只会得到配错的档位。
+ * 与 `ModelSettingsPanel.APPLY_ALL_ROLES` 保持一致（面板负责展示、App 负责写库）。
+ */
+const APPLY_ALL_TIER_ROLES: ModelTierRole[] = [
+  'main', 'strong', 'fast', 'subagent', 'weak', 'medium', 'multimodal', 'fallback', 'classifier',
+]
+
 function toSession(d: SessionDto): Session {
   return {
     id: d.id,
@@ -150,7 +180,6 @@ function App() {
   const providersApi = useProviders()
   // [TL-W1 P4] 传当前会话 id（= 下方 activeSessionId = sessionR.activeSession，此处尚未解构故直接用
   //   同一源）：技能列表按会话绑定项目解析，并在切会话时重拉（不传 = 后端无会话上下文）。
-  const skillsApi = useSkills(sessionR.activeSession)
   const mcpApi = useMcp()
   const databasesApi = useDatabases()
   // [cwd3] 传当前会话 id（与 :348 的 activeSessionId 同源 = sessionR.activeSession）：定时任务的
@@ -194,9 +223,11 @@ function App() {
   // `currentModel` is derived from the active session's `modelName` —
   // every tab (session) carries its own main agent model, and switching
   // tabs changes the chat header / menubar automatically.
-  // `fastModel` stays global (matches Java `AgentDefaults.fastModel` —
-  // used for title generation, lightweight tasks across all sessions).
-  const [fastModel, setFastModel] = useState<string | null>(null)
+  //
+  // [2026-10-31] 快速模型（全局档位 · Java `AgentDefaults.fastModel`）**不再在本组件持有 state**：
+  // 唯一真相源 = appSettings.fastModelName（后端 settings 单例行）。此前另存了一份 state 再由
+  // effect 从 settings 同步 —— 两份真相源必然漂移（实测：清除按钮只清 state 不落库 ⇒ 刷新后绑定复活）。
+  // 现改为由面板直接读 settings，写入走 onSaveSettings → applyAppSettings → 界面自动更新。
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [showEffort, setShowEffort] = useState(false)
   // [Phase2] 真实 diff（改动文件行点击拉 REST · 取代 mock getDiffFor 演示；close/Esc 时清空）
@@ -286,6 +317,28 @@ function App() {
   const [previewArtifact, setPreviewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto; initialEdit?: boolean } | null>(null)
   // [产物预览 · html] Monaco 查看/编辑/保存 + 运行（与项目文件 FileViewModal 同一套交互 · 数据源不同）
   const [viewArtifact, setViewArtifact] = useState<{ sessionId: string; artifact: SessionArtifactDto; initialEdit?: boolean } | null>(null)
+  /**
+   * [产物独立侧栏 2026-11-02 用户裁定] 只服务「产物自动打开」这一个场景的右侧面板。
+   *
+   * <p><b>WHY 不复用 RightPanel 抽屉</b>：抽屉是七个 tab 的导航器，产物只是其中一格；
+   * 而实时预览要的是「单个产物沉浸查看」。两者混在一起用户永远要确认「我在看哪条栏」。
+   * 抽屉保持原样（浏览全部会话资源），本面板只在产物落地时打开（跟进刚生成的那一个）。
+   */
+  const [dockArtifact, setDockArtifact] = useState<SessionArtifactDto | null>(null)
+  const [dockWidth, setDockWidth] = useState<number>(() => {
+    const saved = typeof localStorage !== 'undefined' ? Number(localStorage.getItem('nexusai-artifact-dock-w')) : 0
+    return Number.isFinite(saved) && saved >= 320 ? saved : 460
+  })
+  useEffect(() => {
+    try { localStorage.setItem('nexusai-artifact-dock-w', String(dockWidth)) } catch { /* 隐私模式忽略 */ }
+  }, [dockWidth])
+  /**
+   * 用户是否**手动收起过**产物侧栏。
+   *
+   * <p>自动弹出的规则（用户裁定「自动打开」但也要能收起）：用户刚明确表示「我不想看」时，
+   * 新产物不再自动把面板弹回去 —— 只在聊天流里留产物卡，点了才开。否则侧栏变成关不掉的东西。
+   */
+  const dockUserClosedRef = useRef(false)
 
   // ---- refs ----
   const modelDropdownRef = useRef<HTMLDivElement>(null)
@@ -394,11 +447,6 @@ function App() {
     }
   }, [showToast, applyAppSettings])
 
-  // 快速模型初始值从后端 settings.fastModelName 读（刷新后恢复全局快速模型配置）
-  useEffect(() => {
-    if (appSettings?.fastModelName) setFastModel(appSettings.fastModelName)
-  }, [appSettings?.fastModelName])
-
   // ---- 挂载时从后端拉取会话列表 ----
   // 无 demo 播种：列表空 → activeSession 保持 ''（右栏文件=0、不再渲染演示假文件，首页保持原 welcome hero）；
   // 列表非空 → 自动切到第一个真实会话（真实 id）。
@@ -473,21 +521,63 @@ function App() {
   //   每行 StreamBlockRow（selectStreamBlock）。此处只用于 turnRunning / thinking / Composer.empty 的「有无流式块」。
   const streamBlockCount = useChatStore((s) => (activeSessionId ? (s.streamOrder[activeSessionId]?.length ?? 0) : 0))
   const hasStream = streamBlockCount > 0
-  // 重拉后按 imagePasteIds 批量拉图显示缩略图（后端 POST /attachments/image/batch · 本地缓存优先，
+  // 按 imagePasteIds 批量拉图显示缩略图（后端 POST /attachments/image/batch · 本地缓存优先，
   //   乐观追加 imageData 已本地有 base64 无需再拉；miss 的 batch 拉取后写缓存供 MessageList 渲染）
+  //
+  // [2026-11-01 修复「截图发送后不显示、F5 才出现」] 原实现只发**一次**请求，miss 的 id 拿不到就
+  //   永久不重试。而 `image_paste_ids` 的图要等后端 run 起来、`registerRunPromptImages` 分配 id 并
+  //   `storeWithId` 写进 image-cache **之后**才可读（本机实测：建行 10:31:03.896 → 回写 id 10:31:04.766）。
+  //   排队（busy）路径更极端：queue.drained 时点就构造气泡（已带 id），但落盘要等 drain 后的 run
+  //   —— 此刻批量拉图必然 miss，缓存留空且再无触发点 ⇒ 只能 F5（F5 时图已在盘上）。
+  //   现改为**有界重试**：拿到部分就写缓存，仍有缺口则按退避再拉，直到补齐或次数用完。
+  //   ⛔ 不用轮询：次数有上限，缺图是短暂的「还没落盘」，不是永久缺失。
+  /** 缺图重试的退避间隔（ms）。见上方 WHY：图要等后端 run 落盘才可读，单次请求必然 miss。 */
+  const IMAGE_FETCH_RETRY_DELAYS = [400, 1200, 3000] as const
+  /** 重试用尽的 id（永久失效：image-cache 200 上限逐出 / 删图 / 跨机器）。不记下来 ⇒ 每次
+   *  storeMessages 变化（每轮 complete）都会对它重跑 4 次请求，形成无意义请求风暴。 */
+  const imageFetchGaveUpRef = useRef<Set<string>>(new Set())
   useEffect(() => {
     if (!activeSessionId) return
-    const cached = useChatStore.getState().imageCache[activeSessionId] ?? {}
+    const sid = activeSessionId
+    const cached = useChatStore.getState().imageCache[sid] ?? {}
+    const gaveUp = imageFetchGaveUpRef.current
     const miss: string[] = []
     for (const m of storeMessages) {
       for (const id of m.imagePasteIds ?? []) {
-        if (id && !cached[id] && !miss.includes(id)) miss.push(id)
+        if (id && !cached[id] && !gaveUp.has(id) && !miss.includes(id)) miss.push(id)
       }
     }
     if (miss.length === 0) return
-    chatApi.fetchImagesBatch(activeSessionId, miss)
-      .then((imgs) => { if (imgs && Object.keys(imgs).length) useChatStore.getState().setImageCache(activeSessionId, imgs) })
-      .catch(() => { /* 后端 batch 端点未就绪时静默（重拉后无图，同现状） */ })
+    let cancelled = false
+    let timer: number | undefined
+    const stillMissing = () => {
+      const now = useChatStore.getState().imageCache[sid] ?? {}
+      return miss.filter((id) => !now[id])
+    }
+    const attempt = (round: number) => {
+      const ids = stillMissing()
+      if (ids.length === 0) return
+      chatApi.fetchImagesBatch(sid, ids)
+        .then((imgs) => {
+          if (cancelled) return
+          if (imgs && Object.keys(imgs).length) useChatStore.getState().setImageCache(sid, imgs)
+          // 后端图尚未落盘（见上方 WHY）⇒ 按退避重试；取到全部或次数用完即止
+          const left = stillMissing()
+          if (left.length > 0) {
+            if (round < IMAGE_FETCH_RETRY_DELAYS.length) {
+              timer = window.setTimeout(() => attempt(round + 1), IMAGE_FETCH_RETRY_DELAYS[round])
+            } else {
+              // 次数用尽：这些 id 在本会话内不再尝试（避免每轮重拉的请求风暴）。
+              // 图真被逐出/删除时前端无图可显 —— 这是既成事实，不是本修复能变出来的。
+              for (const id of left) gaveUp.add(id)
+              console.warn(`[image-fetch] ${left.length} 个图片 id 多次重试仍未取到，本次会话内不再重试:`, left)
+            }
+          }
+        })
+        .catch(() => { /* 后端 batch 端点未就绪时静默（重拉后无图，同现状） */ })
+    }
+    attempt(0)
+    return () => { cancelled = true; if (timer) window.clearTimeout(timer) }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId, storeMessages])
   // turn 运行中判定：activeStreams 含本会话 = turn 已登记（含 thinking 阶段，此时 streams 空）。
@@ -501,6 +591,15 @@ function App() {
     hasStream,
     serverRunning,
   })
+  /**
+   * [2026-11-02] turnRunning 的 ref 镜像 —— 供**异步回调**读当前值。
+   *
+   * <p>WHY：`handleArtifactPush` 是在 STOMP 订阅闭包里被调用的（建立于连接时），
+   * 若直接闭包捕获 `turnRunning` 会拿到**建立那一刻的旧值**（恒 false）⇒ 门控失效。
+   * 用 ref 读「此刻」的运行态。
+   */
+  const turnRunningRef = useRef(turnRunning)
+  turnRunningRef.current = turnRunning
   // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
   // [多会话隔离 2026-09-11] 只看【当前活动会话】的进度：原实现读全局单对象 → A 压缩中切到 B，
   //   B 的发送键变停止（且点击取消的是 B）。此处与 CompactProgressBar 用同一键 → 键出现即横幅出现、
@@ -513,16 +612,32 @@ function App() {
   const [sessionArtifacts, setSessionArtifacts] = useState<SessionArtifacts>(EMPTY_ARTIFACTS)
   const artifactsSessionRef = useRef<string | null>(null)
   artifactsSessionRef.current = activeSessionId
-  /** 拉取本会话产物（失败静默保持旧值：抽取未就绪 / 后端老版本都不该弹提示） */
-  const reloadArtifacts = useCallback(async (sessionId: string) => {
+  /**
+   * 拉取本会话产物（失败静默保持旧值：抽取未就绪 / 后端老版本都不该弹提示）。
+   *
+   * @returns 成功时返回**本品类（时间倒序）**，供推送回调直接挑最新一条自动打开；
+   *          失败 / 已切走会话 → null（调用方据此不再弹面板）。
+   */
+  const reloadArtifacts = useCallback(async (sessionId: string): Promise<SessionArtifactDto[] | null> => {
     try {
       const r = await artifactsApi.list(sessionId)
-      if (artifactsSessionRef.current !== sessionId) return // 已切到别的会话 → 丢弃迟到响应
+      if (artifactsSessionRef.current !== sessionId) return null // 已切到别的会话 → 丢弃迟到响应
+      // [2026-11-01 用户裁定] 产物按**时间倒序**（新 → 旧）。
+      // 后端 list 已按 updated_at 倒序，这里再排一次是**兜底**：排序是用户可见的硬约定，
+      // ⛔ 不能只依赖「后端某天改成别的顺序」；同时给 updatedAt 缺失的旧行一个稳定次序。
+      const byTimeDesc = <T extends { updatedAt: string | null }>(rows: T[]): T[] =>
+        [...rows].sort((x, y) => {
+          const tx = x.updatedAt ? Date.parse(x.updatedAt) : 0
+          const ty = y.updatedAt ? Date.parse(y.updatedAt) : 0
+          return ty - tx
+        })
+      const deliverables = byTimeDesc(Array.isArray(r?.deliverables) ? r.deliverables : [])
       setSessionArtifacts({
-        deliverables: Array.isArray(r?.deliverables) ? r.deliverables : [],
-        sources: Array.isArray(r?.sources) ? r.sources : [],
+        deliverables,
+        sources: byTimeDesc(Array.isArray(r?.sources) ? r.sources : []),
       })
-    } catch { /* 静默：保持旧值 */ }
+      return deliverables
+    } catch { return null /* 静默：保持旧值 */ }
   }, [])
   // a) 切会话 → 重置并立刻拉一次
   useEffect(() => {
@@ -537,6 +652,26 @@ function App() {
     const timer = window.setInterval(() => { void reloadArtifacts(activeSessionId) }, 15000)
     return () => window.clearInterval(timer)
   }, [activeSessionId, hasSessionContent, reloadArtifacts])
+  // d) [产物侧栏 2026-11-02] 有新产物落地 → 自动打开侧栏并聚焦到它。
+  //
+  //    规则（[2026-11-02 用户二次裁定，收紧]）：
+  //      · **只有后端推送**（/topic/sessions/{sid}/artifact）才自动打开；
+  //      · 切会话 / 首屏拉取 / 15 秒轮询发现新产物 → **都不打开**（用户明确要求
+  //        「切换会话不要默认展开最新的产物」）；
+  //      · 用户**手动收起过** → 连推送也不弹回（否则侧栏关不掉）。
+  //
+  //    ⚠️ 为什么不能靠「列表里出现了没见过的 id」来判断：切会话时列表整个换一遍，
+  //      那条判据必然把该会话的历史产物全都当成「新出现的」⇒ 一进会话就弹出最新产物。
+  //      故必须由**推送这条事件本身**触发。
+  /** 标记「当前这次 setDockArtifact 是推送触发的」，本轮结束后复位（供调试/后续扩展）。 */
+  const dockAutoOpenRef = useRef(false)
+
+  // 切会话 → 关掉产物侧栏 + 复位「用户已收起」标记（每会话独立）
+  useEffect(() => {
+    setDockArtifact(null)
+    dockUserClosedRef.current = false
+  }, [activeSessionId])
+
   // c) 轮次结束（serverRunning true → false）→ 延迟 3 秒再拉（给后端轮末抽取留时间）
   const prevServerRunningRef = useRef(serverRunning)
   useEffect(() => {
@@ -627,7 +762,8 @@ function App() {
   /** [turn-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/turns 最近 3 轮，不再全量拉。
    *  消息总数（轨迹徽标）由 /messages/count 的 5s 轮询单独维护，本端点不返回 total。 */
   const loadTailWindow = useCallback(async (sid: string) => {
-    const { messages, hasMore } = await chatApi.listTurns(sid, { turns: 3 })
+    // [折叠 = 真删 · 2026-11-02] 首屏/切会话/F5 只拉 FOLD_DEFAULT_TURNS 轮（与内存裁剪同源）
+    const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
     setMessages(sid, messages)
     useChatStore.getState().setHasMore(sid, hasMore)
   }, [setMessages])
@@ -645,6 +781,34 @@ function App() {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }, [showToast])
+  /**
+   * [折叠 = 真删 · 2026-11-02] 点「⋯ 已折叠 N 轮对话」→ 向后端**重拉**更早的轮（不是从 store 取）。
+   *
+   * <p>用户裁定：「会话收起来代表内存删除，展开就是重新获取后端的会话，不是取 store 的；F5 也应该
+   * 是这样」。store 里那些轮已经不在了（`pruneFoldedTurns` 真删），所以这里必须走网络 ——
+   * 与「加载更多」同一个端点（`listTurns` 按 beforeTurnId 向前翻），只是入口不同。
+   *
+   * <p>失败不静默：提示 + 保持折叠行可见（用户可再点一次）。
+   */
+  const handleExpandOlder = useCallback(async (sid: string) => {
+    const st = useChatStore.getState()
+    const msgs = st.messages[sid] ?? []
+    // 窗口内**最早一轮的用户提问 id** —— 后端对非提问行 beforeTurnId 直接 400，不能传窗口首条消息 id。
+    const firstAsk = msgs.find((m) => isUserTurnRow(m))
+    if (!firstAsk?.id) return
+    try {
+      const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS, beforeTurnId: firstAsk.id })
+      if (messages.length === 0) {
+        useChatStore.getState().setHasMore(sid, hasMore)
+        return
+      }
+      useChatStore.getState().revealOlderTurns(sid, messages)
+      useChatStore.getState().setHasMore(sid, hasMore)
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [showToast])
+
   // [window-paging] Trace 全程：会话全量消息（独立于聊天有界窗口 storeMessages · 用户拍板「Trace 就是全程」）。
   const [traceMessages, setTraceMessages] = useState<Awaited<ReturnType<typeof chatApi.listMessages>>>([])
   // [Trace 释放·内建过期守卫] 上一版把「取消守卫」做成可选入参交调用方 opt-in（isCancelled?）——那只是
@@ -695,6 +859,8 @@ function App() {
   const setConversationId = useChatStore((s) => s.setConversationId)
   // 会话当前 conversationId（partial 压缩/裁剪后旋转）：作消息 row key 前缀，整列表 remount
   const conversationId = useChatStore((s) => s.conversationIds[activeSessionId])
+  /** [折叠 = 真删] 该会话已移出内存的轮数（渲染层「已折叠 N 轮」文案 + 展开入口） */
+  const foldedTurnCount = useChatStore((s) => (activeSessionId ? (s.foldedTurnCounts[activeSessionId] ?? 0) : 0))
   // F8 门控：消息非空 && 输入框为空（composerText 无有效内容）&& 非 loading
   const canOpenDialogOps = storeMessages.length > 0 && !turnRunning && !composerText.trim()
   // 停止后静默重拉当前会话（显示已停止 → 立即反映停止后真实状态 · 等同「轨迹点击」刷新：
@@ -941,7 +1107,6 @@ function App() {
         // F5 刷新当前设置菜单页（对应 hook refresh；无 hook 的 tab 回落刷新会话历史）
         switch (settings.settingsTab) {
           case 'providers': void providersApi.refresh(); break
-          case 'skills': void skillsApi.refresh(); break
           case 'mcp': void mcpApi.refresh(); break
           case 'database': void databasesApi.refresh(); break
           case 'schedules': void schedulesApi.refresh(); break
@@ -954,7 +1119,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [ui, settings.settingsTab, providersApi, skillsApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
+  }, [ui, settings.settingsTab, providersApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
 
   // ---- 历史回放：会话切换 —— 有常驻缓存直接复用；仅从未载入的会话才 GET 初始化 ----
   // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻、切回不重拉」：messages/streams 已常驻
@@ -969,7 +1134,7 @@ function App() {
     const cached = useChatStore.getState().messages[activeSessionId]
     if (Array.isArray(cached) && cached.length > 0) return
     // [turn-paging] 无缓存 → 最近 3 轮（有界窗口，不再全量；hasMore 供顶部「加载更多」）
-    chatApi.listTurns(activeSessionId, { turns: 3 })
+    chatApi.listTurns(activeSessionId, { turns: FOLD_DEFAULT_TURNS })
       .then(({ messages, hasMore }) => {
         if (cancelled) return
         setMessages(activeSessionId, messages)
@@ -1122,7 +1287,34 @@ function App() {
   // [会话状态同步] 实时监听「所有已知会话」的权限/提问（不止当前会话）——否则别的会话发起的
   //   AskUserQuestion 到达时无订阅者、事件被丢弃（侧栏无黄点，切回也不弹）。
   const knownSessionIds = useMemo(() => storeSessions.map((s) => s.id), [storeSessions])
-  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload, handleReconnectReload, knownSessionIds)
+  /**
+   * [产物实时推送 2026-11-02] 后端抽取完成即推 → 立刻重拉产物列表（不再等 15 秒轮询）**并按需自动打开侧栏**。
+   *
+   * <p><b>WHY 自动打开只在这里</b>：用户二次裁定「只有后端推送时再回默认打开」「切换会话不要默认展开」。
+   * 切会话 / 首屏 / 轮询都会重新拉列表，但它们**不是**「刚刚有产物落地」⇒ 不能弹面板。
+   * 推送才是唯一可信的「新生成了」信号。
+   */
+  const handleArtifactPush = useCallback((sid: string) => {
+    void (async () => {
+      const list = await reloadArtifacts(sid)
+      // [2026-11-02 用户二次裁定] **只在「执行过程中」自动打开**，轮次结束后不打开。
+      //   原话：「为什么结束轮次默认打开产物 产物只是在编辑过程中才会实时推送打开
+      //   结束后不打开 显示在正文下方 由用户自己点击」。
+      //   WHY：结束时产物卡已经出现在正文下方（`TurnArtifacts`），自动弹面板会**盖住**用户
+      //   正在读的结论，且打断对话 —— 那时用户的注意力在「结果说了什么」，不是「文件长什么样」。
+      //   执行中相反：产物刚落地的瞬间用户正等着看效果，实时展开才是他要的。
+      if (!turnRunningRef.current) return
+      // 用户主动收起过 → 不抢他的控制权（否则下一个产物又把面板弹回来，等于关不掉）
+      if (dockUserClosedRef.current) return
+      if (sid !== activeSessionId) return            // 别的会话的推送不该弹本会话的面板
+      const newest = list?.[0]                      // 后端已按 updated_at 倒序
+      if (!newest) return
+      dockAutoOpenRef.current = true
+      setDockArtifact(newest)
+    })()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [activeSessionId])
+  const { clientRef } = useChatSocket(activeSessionId, activeStreams, showToast, handleSessionDone, handleQueueDrained, handleQueueChanged, handleReconnectReload, handleReconnectReload, knownSessionIds, handleArtifactPush)
 
   // ---- away-summary：blur 5min 触发，REST 摘要回插为系统消息 ----
   useAwaySummary(activeSessionId, (text) => {
@@ -1522,21 +1714,83 @@ function App() {
     [activeSessionId, showToast, setSessions, storeSessions],
   )
 
-  const pickFastModel = useCallback(
-    (providerName: string, modelName: string) => {
-      setFastModel(modelName)
-      // 持久化到后端 settings.fastModelName（快速模型全局 · 配置落库刷新不丢）
-      void onSaveSettings({ fastModelName: modelName })
-      showToast(`快速模型 → ${modelName}（${providerName} · 轻量任务用）`, 'success')
+  // [2026-10-31] 档位绑定 / 解绑的三个动作。
+  //
+  // ① bindModelTier —— 走 PUT（写非 null 值 ⇒ 后端 merge 覆盖）。传的是**全名**（provider/model）：
+  //    后端按全名反查（settingsTierModelName），传裸名会在多 provider 同名时歧义。
+  // ② clearModelTier —— 走独立 DELETE 端点。⛔ 不能用 PUT 传 null：后端 merge 契约是
+  //    「null = 不覆盖」，传 null 会被当成「这次别动这个字段」⇒ **绑定清不掉**
+  //    （这正是 2026-10-31 前「清除快速模型」按钮只清本地 state、刷新后复活的原因）。
+  // ③ clearAllModelTiers —— 「一键清除所有已配置的模型」。
+  //
+  // ⚠️ 成功后一律经 applyAppSettings 刷新（App.tsx 的注释明确警告过「不要另写一份合并」）。
+
+  /** 档位中文名（与 ModelSettingsPanel 的档位定义同源，用于 toast 文案）。 */
+  const TIER_LABEL: Record<ModelTierRole, string> = {
+    main: '主模型', fast: '快速模型', strong: '最强模型', medium: '中等模型',
+    weak: '弱模型', subagent: '子代理', fallback: '降级模型',
+    multimodal: '多模态模型', tts: 'TTS', asr: 'ASR', classifier: '权限分类器',
+  }
+
+  const bindModelTier = useCallback(
+    (role: ModelTierRole, fullName: string) => {
+      const field = TIER_FIELD_BY_ROLE[role]
+      void onSaveSettings({ [field]: fullName } as UpdateSettingsRequest)
+      showToast(`${TIER_LABEL[role]} → ${fullName}`, 'success')
     },
     [onSaveSettings, showToast],
   )
 
-  const clearFastModel = useCallback(() => {
-    setFastModel(null)
-    const fallback = activeSession?.modelName ?? '主模型'
-    showToast(`快速模型已清除 · 回退到 ${fallback}`, 'info')
-  }, [activeSession, showToast])
+  /**
+   * 一键把某个模型写进所有「通用」档位（不含 TTS / ASR）。
+   *
+   * <p><b>一次 PUT 而不是 N 次</b>：settings 的 PUT 天然支持多字段合并 ⇒ 9 档一次写完；
+   * 分 9 次发请求既慢又可能半成功（中间失败会留下「一部分档位已改」的脏状态）。
+   *
+   * <p>⚠️ 不复用 `onSaveSettings`：它会吞掉异常（仅 toast），调用方会误以为成功并再报一次
+   * 「已配置」—— 必须像 `clearModelTier` 一样自己发请求，失败时 rethrow 给面板收尾。
+   */
+  const bindAllModelTiers = useCallback(
+    async (fullName: string) => {
+      const req = Object.fromEntries(
+        APPLY_ALL_TIER_ROLES.map((role) => [TIER_FIELD_BY_ROLE[role], fullName]),
+      ) as UpdateSettingsRequest
+      try {
+        const updated = await settingsApi.update(req)
+        applyAppSettings(updated)
+        showToast(`已配置 ${APPLY_ALL_TIER_ROLES.length} 个档位 → ${fullName}`, 'success')
+      } catch (e) {
+        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+        throw e
+      }
+    },
+    [applyAppSettings, showToast],
+  )
+
+  const clearModelTier = useCallback(
+    async (role: ModelTierRole) => {
+      try {
+        const updated = await settingsApi.clearModelTier(role)
+        applyAppSettings(updated)
+        showToast(`${TIER_LABEL[role]}已清除`, 'info')
+      } catch (e) {
+        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+        throw e   // 交给调用方（面板的 pending 状态）收尾
+      }
+    },
+    [applyAppSettings, showToast],
+  )
+
+  const clearAllModelTiers = useCallback(async () => {
+    try {
+      const updated = await settingsApi.clearAllModelTiers()
+      applyAppSettings(updated)
+      showToast('已清除全部模型档位绑定', 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      throw e
+    }
+  }, [applyAppSettings, showToast])
 
   // 会话级 effort：/effort 命令写当前会话（V31 effort_level + V32 ultracode_enabled）
   const saveEffort = useCallback(async (v: NonNullable<SessionDto['effortLevel']> | 'ultracode') => {
@@ -1661,15 +1915,14 @@ function App() {
   const handleWorkspaceRename = useCallback((title: string) => {
     if (activeSessionId) void renameSession(activeSessionId, title)
   }, [activeSessionId, renameSession])
-  /** 轨迹入口：进入 trace；再次点击返回对话（tab 行已移除，必须留回路）。
-   *  已在轨迹视图时再点 = 手动重试全量拉取（沿用原「轨迹」tab 的同一条兜底语义）。 */
+  /** 轨迹入口：进入 trace；已在 trace 时再点 = 返回对话（tab 行已移除，必须留回路）。
+   *
+   *  <p>⚠️ 旧实现第二分支只重试 {@code loadTraceFull} 然后 return，<b>全仓没有任何
+   *  {@code setCenterView('chat')}</b> ⇒ 进了轨迹就再也回不去（tooltip 却写着「返回对话」）。
+   *  进入时的全量拉取已由依赖 {@code centerView} 的 effect 承担，此处只需纯 toggle。 */
   const handleWorkspaceTrace = useCallback(() => {
-    if (centerView === 'trace') {
-      if (activeSessionId) void loadTraceFull(activeSessionId)
-      return
-    }
-    setCenterView('trace')
-  }, [centerView, activeSessionId, loadTraceFull])
+    setCenterView((v) => (v === 'trace' ? 'chat' : 'trace'))
+  }, [])
   const handleWorkspaceSearch = useCallback(() => {
     if (!ui.showSearchPalette) uiDispatch({ type: 'TOGGLE_SEARCH' })
   }, [ui.showSearchPalette, uiDispatch])
@@ -1798,6 +2051,7 @@ function App() {
   //   ⛔ 不能走 openRefFile/openProjectFile：产物的 localPath 是**归档副本**的绝对路径
   //      （{configHome}/artifacts/<sessionId>/…），不在任何项目根内 ⇒ 必报「文件路径非法」。
   //   分发口径（用户 2026-10-31 裁定）：
+  //     目录           → 桌面端打开所在目录（资源管理器）/ 浏览器端复制路径 + 说明
   //     html          → ArtifactViewModal（Monaco 查看/编辑/保存 + 运行 + 在浏览器中打开）
   //     docx/xlsx/pdf/img → 现有渲染（独立预览窗：DocxPreview / ExcelPreview / PdfPreview / 图片）
   //     md/其它文本    → ArtifactPreviewModal（Markdown 渲染 + 编辑保存）
@@ -1807,7 +2061,24 @@ function App() {
       showToast('无法打开产物：未选中会话', 'info')
       return
     }
-    const action = artifactOpenActionOf(a.title)
+    const action = artifactOpenActionOf(a)
+    if (action.kind === 'open-directory') {
+      // 目录：不能预览也不能编辑 ⇒ 桌面端交给系统打开所在目录，浏览器端复制路径让用户自己开
+      const dirPath = a.localPath
+      try {
+        const { isTauri } = await import('@tauri-apps/api/core')
+        if (isTauri() && dirPath) {
+          const { openPath } = await import('@tauri-apps/plugin-opener')
+          await openPath(dirPath)
+          return
+        }
+      } catch { /* 桌面打开失败 → 回落复制路径 */ }
+      if (dirPath) {
+        try { await navigator.clipboard.writeText(dirPath) } catch { /* 剪贴板被拒不影响提示 */ }
+      }
+      showToast('该产物是目录，路径已复制，请在文件管理器中打开', 'info')
+      return
+    }
     if (action.kind === 'view-html') {
       setViewArtifact({ sessionId: activeSessionId, artifact: a })
       return
@@ -1859,7 +2130,7 @@ function App() {
       showToast('无法编辑产物：未选中会话', 'info')
       return
     }
-    if (artifactOpenActionOf(a.title).kind === 'view-html') {
+    if (artifactOpenActionOf(a).kind === 'view-html') {
       setViewArtifact({ sessionId: activeSessionId, artifact: a, initialEdit: true })
       return
     }
@@ -1914,6 +2185,13 @@ function App() {
       return
     }
     try {
+      // [goal V253] /goal 走独立端点：通用端点的请求体是 ResumeExecuteRequest（无 args 字段）
+      //   ⇒ args 会被静默丢弃 ⇒ 条件文本丢失。独立端点的 GoalExecuteRequest 才有 args。
+      if (name === 'goal') {
+        const goalText = await commandApi.executeGoal(activeSessionId, args)
+        showToast(typeof goalText === 'string' && goalText.trim() ? goalText.trim() : '已执行 /goal', 'success')
+        return
+      }
       // [批 3a] 必传 activeSessionId：后端口已改必填（缺值 400），会话级内置命令（/compact 等）的
       //   会话锚定全靠它 —— 不再由后端读 MDC 兜底（MDC 第三态会读到别的会话的 id）。
       // 透传 args：/compact 自定义指令（后端 CompactExecuteRequest{args}）；其余命令忽略该字段
@@ -2075,7 +2353,7 @@ function App() {
       // [有界窗口] 发送成功的乐观 user 气泡是追加路径 → appendMessages（内部 capTail）统一裁剪；
       //   勿用 setMessages([...prev, new])（不裁剪，是内存无界的漏洞口）。
       st.appendMessages(activeSessionId, [
-        { id: resp.userMessageId, sessionId: activeSessionId, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
+        { id: resp.userMessageId, sessionId: activeSessionId, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, /* [2026-11-02 修「正在执行没有时间」] 乐观气泡必须带 createdAt —— MessageList 的 turnStartByKey 靠它算本轮起点，缺了就算不出时长（`formatTurnDuration(null)` → 空） */ createdAt: new Date().toISOString(), toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
       ])
       // 注意：发送时【不】clearStream —— 正常流程上一轮 complete 已清 streams（finalizeBlocks 返回 rest）；
       //   若发送时 clearStream，会触发 wasRunning 检测「streams 从有到无」→ 误移除刚登记的 activeStreams
@@ -2102,7 +2380,12 @@ function App() {
   //   否则会把 MessageList 的 memo 打穿（打字时整表重渲，见 MessageList.tsx 末尾的稳定性契约）。
   const sendMessageRef = useRef(sendMessage)
   useEffect(() => { sendMessageRef.current = sendMessage })
-  const handleEditResend = useCallback(async (messageId: string, newText: string, onTrimmed?: () => void) => {
+  const handleEditResend = useCallback(async (
+    messageId: string,
+    newText: string,
+    onTrimmed?: () => void,
+    attachments?: AttachmentRequest[],
+  ) => {
     if (!activeSessionId) return
     try {
       const resp = await chatApi.trimAfter(activeSessionId, messageId)
@@ -2112,7 +2395,9 @@ function App() {
       await loadTailWindow(activeSessionId)
       // 裁剪完成 ⇒ 立刻退出编辑态（编辑态只覆盖裁剪这一小段）
       onTrimmed?.()
-      await sendMessageRef.current(undefined, newText)
+      // [2026-11-01] 原消息的附件随重发一起带上：否则「编辑后重发」会静默丢图
+      //   （用户在编辑框里还看得见图，自然以为图还在）。
+      await sendMessageRef.current(attachments, newText)
     } catch (e) {
       showToast('编辑并重新发送失败：' + (e instanceof ApiError ? e.userMessage() : String(e)), 'info')
       throw e
@@ -2187,14 +2472,28 @@ function App() {
   // ⛔ 折叠态第三列只留 36px：右栏**不展示内容面板**，只剩一个裸按钮（用户裁定）。
   return (
     <div
-      className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}${rightDrawerOpen ? ' right-drawer-open' : ''} workspace-surface`}
+      className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}${rightDrawerOpen ? ' right-drawer-open' : ''}${dockArtifact ? ' artifact-dock-open' : ''} workspace-surface`}
       data-page={showSchedulesPage ? 'schedules' : 'chat'}
-      style={(rightCollapsed || leftCollapsed)
-        ? { gridTemplateColumns: `${leftCollapsed ? 48 : 260}px 1fr ${rightCollapsed ? 36 : 'var(--right-w)'}` }
-        : undefined}
+      style={{
+        // [产物侧栏 2026-11-02] 面板宽度写到根节点上：CSS 的 `.artifact-dock-open` 读这个变量
+        //   决定第三列列宽（真正压缩中栏，不是覆盖）。
+        ...({ '--artifact-dock-w': `${dockWidth}px` } as React.CSSProperties),
+        // ⚠️ 内联样式优先级最高，CSS 里的 left-collapsed 规则盖不住它。
+        //   左栏收起 = **0 宽**（完全隐藏，用户 2026-11-01 二次裁定），不再是 48px rail。
+        //   ⚠️ 第三列必须用 workspace 布局的 `--right-col`（右栏是抽屉、收起时占 0），
+        //      用旧的 `--right-w`(300px) 会在「收起左栏」时凭空把右栏撑出 300px ——
+        //      即用户报的「收起后右边冒出毛玻璃影」的第二个来源。
+        ...((rightCollapsed || leftCollapsed)
+          ? { gridTemplateColumns: `${leftCollapsed ? 0 : 260}px 1fr var(--right-col)` }
+          : null),
+      }}
     >
       <div className="topbar">
-        <TitleBar />
+        {/* 左栏开合按钮在红绿灯右侧（TitleBar 内部渲染） */}
+        <TitleBar
+          onToggleSidebar={() => setLeftCollapsed((v) => !v)}
+          sidebarCollapsed={leftCollapsed}
+        />
         <MenuBar
           openSettings={() => uiDispatch({ type: 'TOGGLE_SETTINGS' })}
         />
@@ -2314,7 +2613,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }} />
           )}
         </div>
         {currentPermission && (
@@ -2434,6 +2733,24 @@ function App() {
         //   RightPanel 会按 DRAWER_TAB_LABEL 过滤掉，保留以对齐图标轨的 tab 口径。
         visibleTabs={['files', 'tasks', 'projects', 'artifacts', 'sources', 'team', 'run', 'terminal']}
       />
+      {/* [产物独立侧栏 2026-11-02] 只服务「产物自动打开」。与上面的 RightPanel 抽屉**并存**：
+          抽屉浏览全部会话资源，本面板跟进刚生成的那一个产物。「全屏」回落到原来的模态框。 */}
+      {dockArtifact && activeSessionId && (
+        <ArtifactDock
+          sessionId={activeSessionId}
+          artifact={dockArtifact}
+          items={sessionArtifacts.deliverables}
+          onSelect={(a) => setDockArtifact(a)}
+          onClose={() => {
+            // 用户手动收起 → 记住这个意图，新产物不再自动弹回来
+            dockUserClosedRef.current = true
+            setDockArtifact(null)
+          }}
+          onExpand={(a) => void openArtifact(a)}
+          width={dockWidth}
+          onWidthChange={setDockWidth}
+        />
+      )}
       {/* 右栏拖拽 resizer（.app 层，fixed 相对 viewport）
           改版后右栏是抽屉（宽度由抽屉自身 `--right-drawer-w` 决定、不占三栏列宽）⇒ 不渲染该 resizer。 */}
       {!RIGHT_PANEL_DRAWER && !rightCollapsed && <div className="right-resizer" ref={resizerRef} onMouseDown={handleResizeStart} />}
@@ -2594,15 +2911,15 @@ function App() {
           models={models}
           providers={providersApi.list}
           providersApi={providersApi}
-          skillsApi={skillsApi}
           mcpApi={mcpApi}
           databasesApi={databasesApi}
           schedulesApi={schedulesApi}
           appSettings={appSettings}
           onSaveSettings={onSaveSettings}
-          fastModel={fastModel}
-          pickFast={pickFastModel}
-          clearFast={clearFastModel}
+          onBindModelTier={bindModelTier}
+          onBindAllModelTiers={bindAllModelTiers}
+          onClearModelTier={clearModelTier}
+          onClearAllModelTiers={clearAllModelTiers}
           onOpenMemoryEditor={() => setShowMemoryEditor(true)}
           sessionId={activeSessionId}
           close={() => uiDispatch({ type: 'CLOSE_SETTINGS' })}

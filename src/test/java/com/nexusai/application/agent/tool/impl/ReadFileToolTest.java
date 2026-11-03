@@ -914,6 +914,53 @@ class ReadFileToolTest {
     }
 
     @Test
+    @DisplayName("[2026-11-01] openai 兼容格式 + 多模态模型 → 读图 fail-loud，文案说清「当前 openai 兼容格式不支持 Read 读图」并引导 vision_analyze")
+    void openAiFormatMultimodalModel_imageErrorNamesFormatNotModel(@TempDir Path workspace) throws Exception {
+        // 用户原话：「我配置的 deepseek-v4.1-flash 本身支持多模态的 用的是 openai 格式」⇒
+        // 旧文案「当前模型不支持 Read 直接显示图像」把**格式限制**说成了**模型能力不足**（与事实不符）
+        Files.write(workspace.resolve("shot.png"),
+            new byte[]{(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0, 0, 0, 0});
+        ReadFileTool tool = toolWithModelAndProviderType(workspace, "multimodal", "openai_compatible",
+            "deepseek-v4.1-flash");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "deepseek-v4.1-flash");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("shot.png"), ctx);
+
+        assertThat(result.data())
+            .as("多模态 + openai 兼容格式 → 引导文本 data（不发 image block）")
+            .isInstanceOf(String.class);
+        String data = (String) result.data();
+        assertThat(data)
+            .as("文案要点名**当前格式**（openai 兼容）+ 说清模型本身多模态 + 引导 vision_analyze；⛔ 不再说「模型不支持」")
+            .contains("当前 provider 格式")
+            .contains("openai 兼容格式")
+            .contains("不支持 Read 读图")
+            .contains("本身支持多模态")
+            .contains("vision_analyze(type=analyze, path=")
+            .doesNotContain("当前模型不支持 Read 直接显示图像");
+        assertThat(LlmAgentLoop.isToolErrorData(result.data()))
+            .as("error 文案以 'Error: ' 识别前缀开头 → is_error=true（fail loud）")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("[2026-11-01] 文本模型（type=chat）+ openai 兼容格式 → 文案仍说「当前模型不支持」（模型能力不足，不是格式问题）")
+    void textModelOpenAiFormat_imageErrorStillSaysModelUnsupported(@TempDir Path workspace) throws Exception {
+        Files.write(workspace.resolve("shot.png"),
+            new byte[]{(byte) 0x89, 'P', 'N', 'G', '\r', '\n', 0x1A, '\n', 0, 0, 0, 0});
+        ReadFileTool tool = toolWithModelAndProviderType(workspace, "chat", "openai_compatible", "deepseek-chat");
+        ToolUseContext ctx = ctxWithSessionAndModel(workspace, "deepseek-chat");
+
+        ToolResult result = (ToolResult) tool.execute(callWith("shot.png"), ctx);
+
+        String data = (String) result.data();
+        assertThat(data)
+            .as("文本模型 ⇒ 旧文案保留（模型确实不支持图片）")
+            .contains("当前模型不支持 Read 直接显示图像")
+            .contains("vision_analyze(type=analyze, path=");
+    }
+
+    @Test
     @DisplayName("[pdf-vision-align 纠正] 文本模型 + pages=1-2 → fail-loud error（不发 image block —— 原 bug：渲染页图发 deepseek → 400）")
     void textModelPdfPages_returnsFailLoudError(@TempDir Path workspace) throws Exception {
         writeRealPdf(workspace, "doc.pdf", 3);
@@ -1014,14 +1061,26 @@ class ReadFileToolTest {
      *  ant 直给格式 && supportsImage（canModelViewReadResultDirectly 经 ContextUsageCalculator.isAnthropic
      *  查 provider.type==anthropic）——vision 测试（type=multimodal, claude-sonnet-4-6）须真 ant 才直给。 */
     private static ReadFileTool toolWithModelType(Path workspace, String type, String modelName) {
+        return toolWithModelAndProviderType(workspace, type, "anthropic", modelName);
+    }
+
+    /**
+     * [2026-11-01] 同上，但 provider 格式可指定（{@code anthropic} / {@code openai_compatible} …）。
+     *
+     * <p>WHY 需要：Read 直给门禁是「provider 直给格式 ∧ 模型多模态」⇒ 文案要能区分
+     * 「模型不是多模态」与「模型多模态但 openai 兼容格式不开放直给通道」⇒ 必须能造出
+     * 「多模态 + openai_compatible」这一组合。
+     */
+    private static ReadFileTool toolWithModelAndProviderType(Path workspace, String modelType,
+                                                             String providerType, String modelName) {
         ReadFileTool tool = toolFor(workspace);
         ModelMapper modelMapper = Mockito.mock(ModelMapper.class);
-        when(modelMapper.selectListByQuery(any())).thenReturn(List.of(modelRecordOfType(type, modelName)));
+        when(modelMapper.selectListByQuery(any())).thenReturn(List.of(modelRecordOfType(modelType, modelName)));
         tool.setModelMapper(modelMapper);
         ProviderMapper providerMapper = Mockito.mock(ProviderMapper.class);
         ProviderRecord provider = new ProviderRecord();
         provider.setId("p1");
-        provider.setType("anthropic");
+        provider.setType(providerType);
         when(providerMapper.selectOneById(any())).thenReturn(provider);
         tool.setProviderMapper(providerMapper);
         return tool;
@@ -1093,7 +1152,10 @@ class ReadFileToolTest {
             .isInstanceOf(String.class);
         String data = (String) result.data();
         assertThat(data)
-            .contains("Error: 当前模型不支持 image/PDF 视觉")
+            // [2026-11-01] 文案按三态区分：模型**多模态**但格式不开放直给 ⇒ 说「当前 provider 格式不支持」，
+            //   不再说「当前模型不支持」（那会把格式限制说成模型能力不足，与事实不符）
+            .contains("Error: 当前 provider 格式")
+            .contains("不支持 Read 直发 PDF")
             .contains("model=deepseek-vision-exp")
             .contains("vision_analyze(type=analyze, contentType=pdf, path=")
             .doesNotContain("image blocks");

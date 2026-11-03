@@ -144,10 +144,13 @@ class SystemPromptAssemblerTest {
                 "output_style",
                 "mcp_instructions",
                 "scratchpad",
+                // [2026-11-02 做法 A] 本仓自建段（非 CC）：交付物固定目录指引。
+                //   位置固定在 scratchpad 之后 —— 两者都是「会话级目录」类指引，相邻便于阅读。
+                "artifacts_guidance",
                 "frc",
                 "summarize_tool_results"
             );
-        assertThat(sections).as("10 条全部 cacheBreak=false（对齐 CC 2.1.278：cacheBreak:true 计数 0）")
+        assertThat(sections).as("全部 cacheBreak=false（对齐 CC 2.1.278：cacheBreak:true 计数 0）")
             .filteredOn(SystemPromptSection::cacheBreak)
             .isEmpty();
         assertThat(sections).as("3 feature-gated（numeric_length_anchors/token_budget/brief）门控关时不注册")
@@ -173,6 +176,7 @@ class SystemPromptAssemblerTest {
                 "output_style",
                 "mcp_instructions",
                 "scratchpad",
+                "artifacts_guidance",
                 "frc",
                 "summarize_tool_results",
                 "token_budget"

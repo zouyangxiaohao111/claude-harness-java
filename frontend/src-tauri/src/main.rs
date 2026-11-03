@@ -269,15 +269,42 @@ fn main() {
         .setup(|app| {
             // ===== 启动期小窗（承载 loader）+ 就绪放大交给前端 =====
             // 背景：后端冷启动实测可能 >8s（首次 Flyway 全量迁移 / c3p0 / Quartz bean 初始化）。
-            // 若窗口初始就是 85% 大窗，首帧将长时间空白/白屏。故启动期用 460x400 小窗承载 loader，
-            // 前端收到 backend-ready 事件后自驱放大到显示器 85%（放大权在前端，L2 前端实现）。
-            // 注：460x400 小于 tauri.conf.json 的 minWidth/minHeight(960x600)，先临时下调最小尺寸，
+            // 若窗口初始就是 85% 大窗，首帧将长时间空白/白屏。故启动期用 420x420 小正方形窗承载 loader，
+            // 前端收到 backend-ready 事件后自驱放放大到显示器 85%（放大权在前端，L2 前端实现）。
+            // 注：420x420 小于 tauri.conf.json 的 minWidth/minHeight(960x600)，先临时下调最小尺寸，
             //     否则 set_size 会被系统 clamp 回 960x600，小窗不生效；前端放大后如需恢复
             //     960x600 下限，由前端 setMinSize 再设回（后端就绪前保持小窗由壳保证）。
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = window.set_min_size(Some(tauri::PhysicalSize::new(460, 400)));
-                let _ = window.set_size(tauri::PhysicalSize::new(460, 400));
-                let _ = window.center();
+                // [2026-11-02 用户实测「启动动画在左上角、且被截断」] 两个根因：
+                //   ① `PhysicalSize` 是**物理像素**：Retina 屏 460×400 物理 ≈ 230×200 逻辑点，
+                //      而 `.cl-scene` 内容本身就要 230px 宽（猫 + 墙 200px）⇒ 一放就裁。
+                //      改用 `LogicalSize`（逻辑点），与 CSS 的 px 同一坐标系。
+                //   ② `set_size` 在 macOS 上是**异步生效**的，紧接着 `center()` 会按旧尺寸算位置
+                //      ⇒ 小窗被摆在左上角。故先 `set_min_size` + `set_size`，再让后台线程稍等
+                //      settle 后 `center()`（一次性，不轮询）。
+                //   ③ [2026-11-02 第二轮] 放大动画改为「中心钉死、四边外扩」后，小窗自身也必须在正中，
+                //      否则初始偏左上 ⇒ 整段动画仍看着是从左上角长出来。
+                //      `center()` 依赖「当前 outer_size」，而 set_size 异步 ⇒ 改成按显示器几何**直接算位置**，
+                //      完全不依赖 set_size 何时生效（原 120ms sleep + center 的猜测性等待一并去掉）。
+                // [2026-11-02 第三轮] 用户预期「显示小小的正方形 + 猫咪动画，结束时往四角放大」
+                //   ⇒ 小窗改成正方形（420x420 逻辑点）。⚠️ W 与 H 必须相等，且与前端的放大起点无关
+                //   （前端读 outerSize 作起点，不写死尺寸）。
+                const SPLASH_W: f64 = 420.0;
+                const SPLASH_H: f64 = 420.0;
+                let _ = window.set_min_size(Some(tauri::LogicalSize::new(SPLASH_W, SPLASH_H)));
+                let _ = window.set_size(tauri::LogicalSize::new(SPLASH_W, SPLASH_H));
+                if let Ok(Some(monitor)) = window.primary_monitor() {
+                    // Monitor 给出的是物理像素，换算成逻辑点后再算偏移，避免 Retina 下偏一半
+                    let scale = monitor.scale_factor();
+                    let mon_w = monitor.size().width as f64 / scale;
+                    let mon_h = monitor.size().height as f64 / scale;
+                    let mon_x = monitor.position().x as f64 / scale;
+                    let mon_y = monitor.position().y as f64 / scale;
+                    let _ = window.set_position(tauri::LogicalPosition::new(
+                        mon_x + (mon_w - SPLASH_W) / 2.0,
+                        mon_y + (mon_h - SPLASH_H) / 2.0,
+                    ));
+                }
             }
 
             // ===== 后端进程生命周期（T12）=====

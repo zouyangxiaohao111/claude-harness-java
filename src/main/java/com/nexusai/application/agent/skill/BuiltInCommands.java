@@ -46,7 +46,8 @@ import java.util.function.BooleanSupplier;
 public final class BuiltInCommands {
 
     private static final List<Command> COMMANDS = List.of(
-        clear(), compact(), config(), help(), init(), memory(), model(), outputStyle(), resume(), session(), effort()
+        clear(), compact(), config(), help(), init(), memory(), model(), outputStyle(), resume(), session(), effort(),
+        goal()
     );
 
     /**
@@ -264,6 +265,27 @@ public final class BuiltInCommands {
             null, "[low|medium|high|max|auto]", false, null);
         c.setImmediate(Boolean.FALSE);
         return c;
+    }
+
+    /**
+     * /goal · CC original: claude.exe v2.1.212 的 goal 斜杠命令
+     * （{@code {type:"local-jsx", name:"goal", description:"Set a goal Claude checks before stopping",
+     * argumentHint:"[<condition> | clear]", immediate:true}}）。
+     *
+     * <p>CC 的 /goal 语义：
+     * <ul>
+     *   <li>无参 → 显示 {@code Goal active: <c> (N turns)} / {@code No goal set}</li>
+     *   <li>{@code clear|stop|off|reset|none|cancel}（大小写不敏感）→ 清空目标</li>
+     *   <li>其余 → 设定目标条件（上限 4000 字符，超长拒绝）</li>
+     * </ul>
+     *
+     * <p>本仓实现：{@code type='local'}（web 端无 JSX 渲染面，走 UserInputDispatcher 的
+     * result handler 回 {@code <local-command-stdout>} 文本，对齐 /compact 的既有范式）。
+     */
+    private static Command goal() {
+        return builtin("goal", "local",
+            "Set a goal Claude keeps working toward until the condition is met",
+            null, "<condition> | clear", false, null);
     }
 
     /**

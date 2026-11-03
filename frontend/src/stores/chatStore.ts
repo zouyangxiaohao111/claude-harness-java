@@ -2,6 +2,8 @@ import { create } from 'zustand'
 import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate, ComputerUseApproval } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
+import { EMPTY_GOAL, type GoalUiState } from '../utils/goalState'
+import { FOLD_DEFAULT_TURNS, capTailTurns, isUserTurnRow } from './messageTurns'
 
 /**
  * [snip-persist] 从消息列表解析 snip_boundary 的 {@code snipMetadata.removedUuids}（合并去重）。
@@ -25,16 +27,50 @@ export function collectRemovedUuids(msgs: ChatMessageDto[] | null | undefined): 
   return Array.from(new Set(ids))
 }
 
-// ── [折叠显示 · 不再丢弃] 追加路径**不裁剪**已加载轮 ──
-// 沿革：早先为控内存做过「追加时按轮 LRU 从头部挤出最老一轮」，挤出的轮**真卸载**出 store（回看要重新
-//   向服务端拉）。用户 2026-10-29 裁定推翻该语义：「不应该挤掉而是折叠显示」——
-//   ① 已加载的轮**永不因为新消息而消失**（store 只增不减，本文件所有追加路径一律不裁剪）；
-//   ② 早于「默认展开窗口」的轮由渲染层（components/center/MessageList.tsx 的折叠行）**折叠成一行**
-//      「已折叠 N 轮对话（点击展开）」，折叠态不渲染 DOM，点击后本地展开（不发请求）；
-//   ③ F5 / 打开会话仍由 App 首屏 listTurns({turns:3}) 决定初始窗口 ⇒ 刷新后自然回到默认 3 轮。
-// ⚠️ 内存代价用户已知情接受：单会话内消息数组不再有上界。capTailTurns（./messageTurns）保留为通用工具，
-//   ⛔ 但追加路径不得再用它删数据。
+// ── [折叠 = 真删] 内存只保留最近 FOLD_DEFAULT_TURNS 轮 ──
+//
+// <b>2026-11-02 用户裁定（推翻 2026-10-29 的「只增不裁」）</b>：原话「随着对话变多会卡顿，不应该默认
+// 显示 2 轮次、收起来的会话默认不渲染吗；另外会话收起来代表内存删除，展开就是重新获取后端的会话，
+// 不是取 store 的；F5 应该也是这样」。
+//
+// WHY 必须真删（不是渲染层折叠就够）：`MessageList` 的 `foldedSet` 虽然不渲染 DOM，但
+// `groups` / `flatRows` / `turnKeyByRowId` / `turnUsage` / `footerByRowKey` 等十几处 useMemo
+// **每轮都要对全部已加载消息扫一遍** ⇒ 消息越多越慢，这才是卡顿主因。只藏 DOM 治不了它。
+//
+// 现行语义（三处必须同源，见 {@link FOLD_DEFAULT_TURNS}）：
+//   ① 内存里**只留最近 N 轮**（{@link ChatState.pruneFoldedTurns}，在所有追加入口后执行）；
+//   ② 删掉的轮数记在 {@link ChatState.foldedTurnCounts}，渲染层据此画「⋯ 已折叠 N 轮对话」；
+//   ③ 展开 = **向后端重拉**那一页（{@link ChatState.revealOlderTurns}），不是从 store 取；
+//   ④ F5 / 打开会话同样只拉 N 轮 ⇒ 运行态与刷新态表现一致（旧实现「切回来有缓存、F5 重拉」
+//      两套行为不一致，正是「切会话/F5 表现不同」的根源之一）。
+//
+// ⚠️ 仍然**整轮**保留，绝不切断（`capTailTurns` 的同一不变量）：一轮几百条 tool 消息是正常形态。
 
+
+/**
+ * [折叠 = 真删] 把消息裁剪到最近 `keepTurns` 整轮（纯函数 · 所有追加入口共用）。
+ *
+ * <p>复用 {@link capTailTurns}（已实现「整轮保留 / 非对话行沿用最近前置对话行的键」两条不变量），
+ * 本函数只负责两件 capTailTurns 不做的事：
+ * <ol>
+ *   <li>报告**删掉了几轮**（只数含真实用户提问的行 —— 与后端 `listTurns` 的分页单位同口径，
+ *       窗口头部被截断的半轮不计入，否则计数会随着每次裁剪越加越大）；</li>
+ *   <li>未超限时返回**同一引用**，让调用方零成本跳过（避免每次都换数组引用触发重渲）。</li>
+ * </ol>
+ *
+ * @param msgs      该会话当前消息（时间序）
+ * @param keepTurns 保留轮数
+ * @returns `kept` = 保留的消息（未超限时就是入参本身）；`droppedTurns` = 被移出内存的真实轮数
+ */
+function pruneToTurns(msgs: ChatMessageDto[], keepTurns: number): { kept: ChatMessageDto[]; droppedTurns: number } {
+  if (keepTurns <= 0 || msgs.length === 0) return { kept: msgs, droppedTurns: 0 }
+  const kept = capTailTurns(msgs, keepTurns)
+  if (kept === msgs) return { kept: msgs, droppedTurns: 0 }
+  const dropped = msgs.slice(0, msgs.length - kept.length)
+  const questions = new Set<string>()
+  for (const m of dropped) if (isUserTurnRow(m)) questions.add(m.id)
+  return { kept, droppedTurns: questions.size }
+}
 
 // [图片缓存有界] 每会话图片缓存条数上限。base64 图（缩略图/粘贴图）单条可达数百 KB～数 MB，
 //   原实现只合并 {...old, ...new} 从不删、无上限 → 删了会话图片仍驻留。按会话封顶，超出按
@@ -218,6 +254,11 @@ export interface ChatState {
    *  同 tokenWarning：后端 compact-progress 是会话级 topic，本仓多会话并行 → 必须按键隔离，
    *  否则「A 压缩中切到 B」会显示 A 的进度、并把 B 的发送键变成停止（取消错会话）。 */
   compact: Record<string, CompactUiState>
+  /** [goal V253 · 按会话键控] 目标（/goal）状态（sessionId -> 目标 · 键不存在 = 该会话无目标）。
+   *  后端推的是会话级 topic（/topic/sessions/{sid}/goal）→ 与 compact / tokenWarning 同款必须按键隔离，
+   *  否则「A 会话在追目标、切到 B」时 B 会显示 A 的目标。
+   *  ⚠️ 展示层必须走 selectGoal(sessionId) 取值，**不要**直接读整张表（见 utils/turnRunning.ts 的同款约束）。 */
+  goal: Record<string, GoalUiState>
   /** 会话 API 错误（message.error → 对话流错误卡 · key=sessionId） */
   apiErrors: Record<string, ApiFlowError[]>
   // actions
@@ -309,6 +350,9 @@ export interface ChatState {
   setCompact: (sessionId: string, c: CompactUiState) => void
   /** 删除某会话的压缩进度键（完成态渐隐到期 / 删会话 · 不留残留键）。读取侧自动回落 EMPTY_COMPACT。 */
   clearCompact: (sessionId: string) => void
+  /** [goal V253] 更新某会话的目标（/goal）状态（null = 该会话无目标 / 已清除）。
+   *  只影响该 sessionId 的键（多会话并行各自独立）。 */
+  setGoal: (sessionId: string, g: GoalUiState | null) => void
   /** message.error → 记录会话 API 错误（对话流错误卡） */
   addApiError: (sessionId: string, err: ApiFlowError) => void
   /** 清空会话 API 错误（新 user 消息发送时调用 · 错误卡属上一轮） */
@@ -328,6 +372,34 @@ export interface ChatState {
   /** [window-paging] 向上翻页：更早一页 prepend 到该会话窗口头部（created_at 时序；幂等去重 overlap id；
    *  snip_boundary 并入 snippedIds 照常标注）+ 更新 hasMore */
   prependMessages: (sessionId: string, older: ChatMessageDto[], hasMore: boolean) => void
+  /**
+   * [折叠 = 真删 · 2026-11-02] 该会话**已被移出内存**的轮数（渲染层「⋯ 已折叠 N 轮对话」用）。
+   *
+   * <p>只统计**含真实用户提问**的整轮（{@link isUserTurnRow}）—— 与后端 `listTurns` 的分页单位同口径，
+   * 展开时按这个数回退；窗口头部被截断的半轮不计入（否则每次裁剪/重拉都会把数字越加越大）。
+   */
+  foldedTurnCounts: Record<string, number>
+  /**
+   * [折叠 = 真删] 把内存裁剪到最近 `keepTurns` 轮（整轮，绝不切断），并把删掉的轮数累加进
+   * {@link ChatState.foldedTurnCounts}，同时置 `hasMore=true`（本地就有更早历史可回拉）。
+   *
+   * <p>所有**追加入口**在写完 messages 后调用（{@link ChatState.appendMessages} /
+   * {@link ChatState.insertServerMessages} / {@link ChatState.finalizeBlocks}）。
+   *
+   * @param sessionId  会话 id
+   * @param keepTurns  保留轮数（缺省 {@link FOLD_DEFAULT_TURNS}）
+   */
+  pruneFoldedTurns: (sessionId: string, keepTurns?: number) => void
+  /**
+   * [折叠 = 真删] 展开：把后端重拉回来的更早一轮/几轮 prepend 进窗口，并**扣减**已折叠轮数。
+   *
+   * <p>⛔ 与 {@link ChatState.prependMessages} 的区别：后者是「加载更多」的通用 prepend（不改折叠计数），
+   * 本方法专供「点折叠行」——调用方已向后端拉到数据，这里只负责把计数对齐。
+   *
+   * @param sessionId 会话 id
+   * @param older     后端返回的更早消息（整轮）
+   */
+  revealOlderTurns: (sessionId: string, older: ChatMessageDto[]) => void
 }
 
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
@@ -342,6 +414,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   streamTicks: {},          // [chat-switch-stream-align] 会话流式活动节拍（appendChunk/Reasoning 递增 · 滚底按会话隔离）
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
   liveSeq: {},             // [排队行序] 流式区到达序号（实时块 + 本轮中途追加的行共用）
+  foldedTurnCounts: {},    // [折叠 = 真删] 会话 -> 已移出内存的轮数（渲染层「已折叠 N 轮」）
 
   conversationIds: {},
   permissionQueue: [],
@@ -353,6 +426,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   retry: null,
   tokenWarning: {},   // [按会话键控] sessionId -> token_warning（键不存在 = 无警告）
   compact: {},        // [按会话键控] sessionId -> 压缩进度（键不存在 = 该会话无在飞压缩）
+  goal: {},           // [goal V253 · 按会话键控] sessionId -> 目标（键不存在 = 该会话无目标）
   apiErrors: {},
   setSessions: (sessions) => set({ sessions }),
   setChangedFiles: (sessionId, files) => set((st) => ({
@@ -380,7 +454,36 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // setMessages 是【整表替换】而非追加路径：数据源是 App 首屏 / 重拉（最近 3 轮）或 partial-compact /
     //   trim 的归一化结果，头部可能是 compact 摘要/boundary 标记 → 整表照收、不做任何裁剪。
     //   凡本地「往尾部接消息」一律改用 appendMessages（见下），二者分工明确。
-    return { messages: { ...st.messages, [sessionId]: msgs }, snippedIds }
+    //
+    // [2026-11-01 修复「截图发送后不显示、F5 才出现」的第二条腿] 整表替换会把本地乐观气泡上的
+    //   `imageData`（base64，DB 不存该字段）一起冲掉。而重拉可能发生在后端回写 `image_paste_ids`
+    //   **之前**（实测建行→回写约 0.9s 间隔）—— 此时新行既无 imageData 也无 imagePasteIds ⇒ 图彻底消失，
+    //   只能等下一次重拉（用户感知即「F5 才出现」）。故按 id 把本地已有的 imageData 续接到新行上：
+    //   后端行已带 imagePasteIds 时不覆盖（读侧渠道优先，imageData 只是补位）。
+    const prevMsgs = st.messages[sessionId] ?? []
+    let merged = msgs
+    if (prevMsgs.length > 0) {
+      const imageDataById = new Map<string, NonNullable<ChatMessageDto['imageData']>>()
+      for (const m of prevMsgs) {
+        if (m.imageData?.length) imageDataById.set(m.id, m.imageData)
+      }
+      if (imageDataById.size > 0) {
+        let patched = false
+        merged = msgs.map((m) => {
+          if (m.imageData?.length || (m.imagePasteIds?.length ?? 0) > 0) return m
+          const keep = imageDataById.get(m.id)
+          if (!keep) return m
+          patched = true
+          return { ...m, imageData: keep }
+        })
+        if (!patched) merged = msgs
+      }
+    }
+    // [折叠 = 真删] 服务端整表替换 = 全新窗口（首屏 / 切会话 / 重拉）⇒ 折叠计数归零。
+    //   ⛔ 不在这里再 prune：调用方已按 FOLD_DEFAULT_TURNS 取数（App.loadTailWindow），
+    //   在此二次裁剪会把「用户刚展开的那几轮」重新删掉。
+    return { messages: { ...st.messages, [sessionId]: merged }, snippedIds,
+      foldedTurnCounts: { ...st.foldedTurnCounts, [sessionId]: 0 } }
   }),
   // [折叠显示 · 不再丢弃] 本地尾部追加：**只增不裁**。这是 App 三条追加路径
   //   （queue.drained 排队气泡 / away-summary 回插 / 发送成功乐观 user 气泡）的唯一入口。
@@ -391,9 +494,28 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     //   否则该 user 行会排到本轮已输出的实时内容之前。
     const { rows, liveSeq } = stampLiveRows(st, sessionId, msgs)
     const prev = st.messages[sessionId] ?? []
+    // [id 幂等 · 2026-11-02 用户实测「同一轮内容整块重复十几次」]
+    //   WHY：本入口此前**无 id 去重**（下方 insertServerMessages 的注释早已点出这条风险：
+    //   「⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）」）。
+    //   执行中若同一批行被追加两次（queue.drained 重复投递 / 乐观气泡与回放同一 id 各来一次），
+    //   `messages` 里就有同 id 的两行 ⇒ 渲染层按 id 生成 row key，同 key 多行 ⇒
+    //   **整块内容重复显示**，且轮次口径失效（同一提问被当成两轮）。
+    //   语义与 finalizeBlocks 的 dupIdx 一致：已存在则**原地替换**（保位置、不重插）。
+    const next = [...prev]
+    for (const row of rows) {
+      const dupIdx = row.id ? next.findIndex((m) => m.id === row.id) : -1
+      if (dupIdx >= 0) next[dupIdx] = row
+      else next.push(row)
+    }
+    // [折叠 = 真删] 追加后裁到最近 N 轮（内存真的释放，不只是不渲染）
+    const { kept, droppedTurns } = pruneToTurns(next, FOLD_DEFAULT_TURNS)
     return {
-      messages: { ...st.messages, [sessionId]: [...prev, ...rows] },
+      messages: { ...st.messages, [sessionId]: kept },
       liveSeq,
+      foldedTurnCounts: droppedTurns > 0
+        ? { ...st.foldedTurnCounts, [sessionId]: (st.foldedTurnCounts[sessionId] ?? 0) + droppedTurns }
+        : st.foldedTurnCounts,
+      hasMore: droppedTurns > 0 ? { ...st.hasMore, [sessionId]: true } : st.hasMore,
     }
   }),
   // [sm-boundary-reload] 服务端插入行（message.insert 事件 = 压缩 boundary 行落库即推）：id 幂等 +
@@ -407,10 +529,15 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // 插列表尾（当前点）：boundary 行落库即最新时序，非 flow 锚定（无 userMessageId 归属）
     // [排队行序] 落库即推的行同样按「到达时刻」定位（本轮流式中到达 → 排在已输出内容之后）
     const stamped = stampLiveRows(st, sessionId, fresh)
-    // [折叠显示 · 不再丢弃] 追加路径只增不裁（早先轮由渲染层折叠，不在这里删）
+    // [折叠 = 真删] 与 appendMessages 同一收口（2026-11-02 推翻「只增不裁」）
+    const { kept, droppedTurns } = pruneToTurns([...msgs, ...stamped.rows], FOLD_DEFAULT_TURNS)
     return {
-      messages: { ...st.messages, [sessionId]: [...msgs, ...stamped.rows] },
+      messages: { ...st.messages, [sessionId]: kept },
       liveSeq: stamped.liveSeq,
+      foldedTurnCounts: droppedTurns > 0
+        ? { ...st.foldedTurnCounts, [sessionId]: (st.foldedTurnCounts[sessionId] ?? 0) + droppedTurns }
+        : st.foldedTurnCounts,
+      hasMore: droppedTurns > 0 ? { ...st.hasMore, [sessionId]: true } : st.hasMore,
     }
   }),
   /** [snip-persist] STOMP message.boundary 实时合并被裁剪消息 id（会话级 snippedIds） */
@@ -456,6 +583,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // [按会话键控] 压缩进度 / 压缩警告也是会话级键：删会话一并释放（否则该键永不再被读，纯残留）
     const compact = { ...st.compact }
     const tokenWarning = { ...st.tokenWarning }
+    // [goal V253] 目标态同属会话级键：删会话一并释放（会话 id 不复用，残留无意义）
+    const goal = { ...st.goal }
     // [C6] 服务端运行态同属会话级键：删会话一并释放
     const serverRunning = { ...st.serverRunning }
     // [排队行序] 流式区到达号也是会话级键：删会话一并释放（会话 id 不复用，残留无意义）
@@ -475,7 +604,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete tokenWarning[sessionId]
     delete serverRunning[sessionId]
     delete liveSeq[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning, liveSeq }
+    delete goal[sessionId]
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning, liveSeq, goal }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
@@ -690,8 +820,17 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const { [sessionId]: _drop, ...rest } = st.streams
     const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
-    // [折叠显示 · 不再丢弃] 块转消息是追加路径 → 只增不裁（折叠由渲染层负责）
-    return { streams: rest, streamOrder: restOrder, messages: { ...st.messages, [sessionId]: ordered } }
+    // [折叠 = 真删] 块转消息也是追加路径 → 同一收口
+    const { kept, droppedTurns } = pruneToTurns(ordered, FOLD_DEFAULT_TURNS)
+    return {
+      streams: rest,
+      streamOrder: restOrder,
+      messages: { ...st.messages, [sessionId]: kept },
+      foldedTurnCounts: droppedTurns > 0
+        ? { ...st.foldedTurnCounts, [sessionId]: (st.foldedTurnCounts[sessionId] ?? 0) + droppedTurns }
+        : st.foldedTurnCounts,
+      hasMore: droppedTurns > 0 ? { ...st.hasMore, [sessionId]: true } : st.hasMore,
+    }
   }),
   clearStream: (sessionId) => set((st) => {
     const { [sessionId]: _drop, ...rest } = st.streams
@@ -736,6 +875,15 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (!st.compact[sessionId]) return st
     const { [sessionId]: _drop, ...rest } = st.compact
     return { compact: rest }
+  }),
+  // [goal V253 · 按会话键控] 目标（/goal）状态。
+  //   null → 删该会话的键（目标已清除 / 达成后淡出完毕）；非 null → 覆盖该会话那一份。
+  //   ⚠️ 绝不触碰其它会话的键（多会话并行各自独立 —— 同 compact / tokenWarning 的铁律）。
+  setGoal: (sessionId, g) => set((st) => {
+    const goal = { ...st.goal }
+    if (g == null) delete goal[sessionId]
+    else goal[sessionId] = g
+    return { goal }
   }),
   addApiError: (sessionId, err) => set((st) => ({
     apiErrors: { ...st.apiErrors, [sessionId]: [...(st.apiErrors[sessionId] ?? []), err] },
@@ -844,6 +992,35 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       hasMore: { ...st.hasMore, [sessionId]: hasMore },
     }
   }),
+  // [折叠 = 真删 · 2026-11-02] 显式裁剪（供需要主动收口的调用方 / 测试直接用）
+  pruneFoldedTurns: (sessionId, keepTurns = FOLD_DEFAULT_TURNS) => set((st) => {
+    const msgs = st.messages[sessionId] ?? []
+    const { kept, droppedTurns } = pruneToTurns(msgs, keepTurns)
+    if (droppedTurns === 0) return st
+    return {
+      messages: { ...st.messages, [sessionId]: kept },
+      foldedTurnCounts: { ...st.foldedTurnCounts, [sessionId]: (st.foldedTurnCounts[sessionId] ?? 0) + droppedTurns },
+      hasMore: { ...st.hasMore, [sessionId]: true },
+    }
+  }),
+  // [折叠 = 真删] 展开折叠行：后端拉回更早的轮 → prepend + 扣减折叠计数
+  revealOlderTurns: (sessionId, older) => set((st) => {
+    const existing = st.messages[sessionId] ?? []
+    const existingIds = new Set(existing.map((m) => m.id))
+    const fresh = (older ?? []).filter((m) => m && m.id && !existingIds.has(m.id))
+    if (fresh.length === 0) return st
+    const gained = new Set(fresh.filter(isUserTurnRow).map((m) => m.id)).size
+    const prevCount = st.foldedTurnCounts[sessionId] ?? 0
+    return {
+      messages: { ...st.messages, [sessionId]: [...fresh, ...existing] },
+      snippedIds: (() => {
+        const boundaryIds = collectRemovedUuids(fresh)
+        if (boundaryIds.length === 0) return st.snippedIds
+        return { ...st.snippedIds, [sessionId]: Array.from(new Set([...(st.snippedIds[sessionId] ?? []), ...boundaryIds])) }
+      })(),
+      foldedTurnCounts: { ...st.foldedTurnCounts, [sessionId]: Math.max(0, prevCount - gained) },
+    }
+  }),
 }))
 
 export const useChatStore = createChatStoreCreator()
@@ -891,4 +1068,15 @@ export function selectCompact(sessionId: string | null | undefined): (s: ChatSta
  */
 export function selectTokenWarning(sessionId: string | null | undefined): (s: ChatState) => TokenWarningEvent | null {
   return (s) => (sessionId ? (s.tokenWarning[sessionId] ?? null) : null)
+}
+
+/**
+ * [goal V253] 订阅「某会话的目标（/goal）状态」。键不存在 → null（该会话无目标）。
+ * 用法：`useChatStore(selectGoal(activeSessionId))`。
+ *
+ * <p>⚠️ 同 compact / tokenWarning 的铁律：**必须**按 sessionId 取值。
+ * 直接读整张表会让 A 会话的目标出现在 B（多会话并行）。
+ */
+export function selectGoal(sessionId: string | null | undefined): (s: ChatState) => GoalUiState | null {
+  return (s) => (sessionId ? (s.goal[sessionId] ?? EMPTY_GOAL) : EMPTY_GOAL)
 }

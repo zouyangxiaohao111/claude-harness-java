@@ -119,6 +119,21 @@ public final class BoundaryReader {
     private static final String SEG_TAIL_UUID = "tailUuid";
 
     /**
+     * 已报过 ERROR 的坏接线图签名（{@code boundaryId|headUuid|tailUuid}）。
+     *
+     * <p><b>WHY</b>：{@link #getMessagesAfterCompactBoundary} 在每次 post-sampling hook 都会跑，
+     * 同一条悬挂 preservedSegment（写侧删行后未校正，见 2026-11-01 修复）会一轮刷几十行 ERROR，
+     * 把真错误淹掉。本集合只负责「同一张坏接线图只 ERROR 一次」，不改变任何投影行为。
+     * 有界（{@value #MAX_REPORTED_BROKEN_SEGMENTS}）—— 超过即整体清空，避免长跑进程无限增长；
+     * 清空后最坏情况是各坏接线图再各报一次，可接受。
+     */
+    private static final Set<String> REPORTED_BROKEN_SEGMENTS =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 坏接线图签名集合上限（见 {@link #REPORTED_BROKEN_SEGMENTS}）。 */
+    private static final int MAX_REPORTED_BROKEN_SEGMENTS = 512;
+
+    /**
      * [2026-08-18] HISTORY_SNIP 门静态槽 · 默认全关。
      *
      * <p>与 {@link MicroCompactor} / {@link StreamCompactSummary} 同模式（static volatile + 测试
@@ -454,10 +469,28 @@ public final class BoundaryReader {
             // CC 对照：applyPreservedSegmentRelinks 的 tail→head 走链校验失败 → logEvent
             //   ('tengu_relink_walk_broken') 并直接 return（:1921-1932）。本仓等价判据 =
             //   「head/tail 都在列表里，且 head 不晚于 tail」（无链，故只能校验区间合法）。
-            log.error("保留段重挂: head/tail 无法在消息列表内解析成合法区间，放弃重挂（不硬拼）: "
-                    + "boundaryId={} headUuid={}(idx={}) tailUuid={}(idx={}) 列表={} 条"
-                    + "（CC sessionStorage.ts:1921-1932 走链失败同义：宁可少加载也不剪错）",
-                boundary.id(), headUuid, headIdx, tailUuid, tailIdx, full.size());
+            //
+            // [2026-11-01 降噪] 本方法在每次 post-sampling hook 都会调（一轮几十次），同一条坏
+            //   boundary 会刷几十行 ERROR 把真错误淹掉（本机实测单会话单 boundary 刷了上百行）。
+            //   ⇒ 同一接线图（boundaryId + head + tail）只 ERROR 一次，其余降 DEBUG。
+            //   ⛔ 仍然留痕，不静默：首次出现必是 ERROR。
+            //   根因在写侧（trimSessionAfter / replaceSessionMessages 删行后未校正 preservedSegment），
+            //   本处只是「旧数据不再刷屏」，治不了悬挂指针本身。
+            String signature = boundary.id() + "|" + headUuid + "|" + tailUuid;
+            if (REPORTED_BROKEN_SEGMENTS.size() > MAX_REPORTED_BROKEN_SEGMENTS) {
+                REPORTED_BROKEN_SEGMENTS.clear();
+            }
+            if (REPORTED_BROKEN_SEGMENTS.add(signature)) {
+                log.error("保留段重挂: head/tail 无法在消息列表内解析成合法区间，放弃重挂（不硬拼）: "
+                        + "boundaryId={} headUuid={}(idx={}) tailUuid={}(idx={}) 列表={} 条"
+                        + "（CC sessionStorage.ts:1921-1932 走链失败同义：宁可少加载也不剪错；"
+                        + "同一界线图后续不再重复报 ERROR）",
+                    boundary.id(), headUuid, headIdx, tailUuid, tailIdx, full.size());
+            } else if (log.isDebugEnabled()) {
+                log.debug("保留段重挂: 同一接线图已报过 ERROR，本次降级留痕: boundaryId={} "
+                        + "headUuid={}(idx={}) tailUuid={}(idx={})",
+                    boundary.id(), headUuid, headIdx, tailUuid, tailIdx);
+            }
             return sliced;
         }
         if (tailIdx >= boundaryIndex) {

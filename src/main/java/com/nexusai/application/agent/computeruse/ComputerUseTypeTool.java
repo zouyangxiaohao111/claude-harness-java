@@ -238,9 +238,13 @@ public final class ComputerUseTypeTool implements Tool {
     /**
      * 注入一个字形簇。
      *
-     * <p>换行 / 制表符走按键（{@link ComputerUseKeyEvent#named}）；其余按码点逐个
-     * {@link ComputerUseKeyboard#typeChar(int)} 注入（一个 emoji 簇的多个码点会按序注入，
-     * 由目标应用自行合成）。
+     * <p>换行 / 制表符走按键（{@link ComputerUseKeyEvent#named}）；其余<b>攒成一段连续文本</b>
+     * 后一次走 {@link ComputerUseKeyboard#typeText(String)}。
+     *
+     * <p><b>WHY 攒段而不是逐簇</b>：macOS 的唯一可行注入路径是「剪贴板 + ⌘V」
+     * （CoreGraphics 在 JXA 下注入不了任意 Unicode）⇒ 逐簇调用会把「写剪贴板 → ⌘V → 还原剪贴板」
+     * 做 N 遍，既慢又反复扰动用户剪贴板。Windows 的默认 {@code typeText} 实现仍是逐码点
+     * {@link ComputerUseKeyboard#typeChar(int)} ⇒ <b>Windows 侧行为逐字节不变</b>。
      *
      * @param grapheme 字形簇（非空）
      * @throws Exception 注入失败
@@ -254,12 +258,7 @@ public final class ComputerUseTypeTool implements Tool {
             pressAndRelease("tab");
             return;
         }
-        int i = 0;
-        while (i < grapheme.length()) {
-            int codePoint = grapheme.codePointAt(i);
-            keyboard.typeChar(codePoint);
-            i += Character.charCount(codePoint);
-        }
+        keyboard.typeText(grapheme);
     }
 
     /**

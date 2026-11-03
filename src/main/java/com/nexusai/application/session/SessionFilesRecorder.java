@@ -76,6 +76,18 @@ public class SessionFilesRecorder {
     @Autowired(required = false)
     private SimpMessagingTemplate wsTemplate;
 
+    /**
+     * 产物服务 · 供**写盘瞬间**把落在 {@code artifacts/<sid>/deliverables/} 下的文件立刻入库+推送。
+     *
+     * <p>WHY：产物推送此前只在轮末（{@code ChatService → scheduleExtract}）发生，而前端「自动展开
+     * 产物面板」的门控是「本轮仍在跑」⇒ 两者**结构上永不同时成立**，用户实测「编辑过程中侧栏没有
+     * 自动展开」。本字段让写盘那一刻就推。
+     *
+     * <p>依赖方向单向（Artifact 不依赖本类）⇒ 无循环。测试直构不注入 → null，行为等价改造前。
+     */
+    @Autowired(required = false)
+    private SessionArtifactService sessionArtifactService;
+
     public void setWsTemplate(SimpMessagingTemplate wsTemplate) {
         this.wsTemplate = wsTemplate;
     }
@@ -121,6 +133,12 @@ public class SessionFilesRecorder {
             e.adds = net[0];
             e.dels = net[1];
             publish(sessionId);
+            // [产物实时推送 · 2026-11-02] 若这次写的就是产物目录里的文件 → 当场入库并推 artifact 事件。
+            //   ⛔ 必须在这里（写盘唯一漏斗）而不是各工具里：Write / Edit 都经本方法，
+            //   放工具里必然漏一条路径。异常已被 syncDeliverableForPath 内部吞掉。
+            if (sessionArtifactService != null) {
+                sessionArtifactService.syncDeliverableForPath(sessionId, e.absPath);
+            }
         } catch (Exception ex) {
             log.warn("SessionFilesRecorder: record 失败（不影响写盘） sessionId={} path={} cause={}",
                 sessionId, relPath, ex.toString());

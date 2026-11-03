@@ -80,12 +80,13 @@ vi.mock('@/components/modals/DiffModal', () => ({ DiffModal: () => null }))
 vi.mock('@/components/modals/FileViewModal', () => ({ FileViewModal: () => null }))
 // 产物 html 查看器同样静态引 monaco（与 FileViewModal 同一套交互）⇒ jsdom 里必须一并桩掉
 vi.mock('@/components/modals/ArtifactViewModal', () => ({ ArtifactViewModal: () => null }))
+// [2026-11-02] 产物独立侧栏同样静态引 monaco（与 ArtifactViewModal 同一套渲染）⇒ 一并桩掉
+vi.mock('@/components/right/ArtifactDock', () => ({ ArtifactDock: () => null }))
 
 // 与本次接线无关的业务 hook → 空实现（各自需要一整套后端夹具，且不参与服务端运行态对账）
 vi.mock('@/hooks/useChatSocket', () => ({ useChatSocket: () => ({ clientRef: { current: null } }) }))
 vi.mock('@/hooks/useAwaySummary', () => ({ useAwaySummary: () => {} }))
 vi.mock('@/hooks/useProviders', () => ({ useProviders: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
-vi.mock('@/hooks/useSkills', () => ({ useSkills: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
 vi.mock('@/hooks/useMcp', () => ({ useMcp: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
 vi.mock('@/hooks/useDatabases', () => ({ useDatabases: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
 vi.mock('@/hooks/useSchedules', () => ({ useSchedules: () => ({ list: [], loading: false, error: null, refresh: async () => {}, canCreate: false }) }))

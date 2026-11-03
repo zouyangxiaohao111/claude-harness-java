@@ -38,6 +38,32 @@ public interface ComputerUseKeyboard {
     void typeChar(int codePoint) throws Exception;
 
     /**
+     * 注入一段<b>不含换行 / 制表符</b>的文本（整段路径，可选覆写）。
+     *
+     * <h2>WHY 需要整段入口</h2>
+     * <p>Windows 的 {@code KEYEVENTF_UNICODE} 逐字符注入就够了，默认实现即按码点循环
+     * {@link #typeChar(int)}。但 <b>macOS 无法用 CoreGraphics 注入任意 Unicode</b>
+     * （JXA 桥传不进 {@code UniChar*}，实测传 "BBB" 会按 keyCode 0 打出 "aaa"）
+     * ⇒ macOS 必须走「剪贴板 + ⌘V」，而<b>逐字符粘贴的代价是每字符一次全量剪贴板写回</b>
+     * ⇒ 需要「整段一次」的入口。
+     *
+     * <p>调用方（{@link ComputerUseTypeTool}）保证入参<b>不含</b> {@code \n} / {@code \r} / {@code \t}
+     * —— 那些必须走按键语义（CCB {@code toolCalls.ts:2548-2565}：URL 栏与终端不认
+     * Unicode 换行，模型的「提交/执行」意图会丢失）。
+     *
+     * @param text 要注入的文本（非空、无换行/制表符）
+     * @throws Exception 注入失败（fail loud）
+     */
+    default void typeText(String text) throws Exception {
+        int i = 0;
+        while (i < text.length()) {
+            int codePoint = text.codePointAt(i);
+            typeChar(codePoint);
+            i += Character.charCount(codePoint);
+        }
+    }
+
+    /**
      * 派发一个按键事件（按下 / 抬起）。
      *
      * <p>组合键的<b>派发顺序</b>由上层（{@link ComputerUseKeyCombo}）算好，

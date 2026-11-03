@@ -42,14 +42,36 @@ package com.nexusai.application.agent.computeruse;
 public interface ComputerUseUiaService {
 
     /**
+     * 元素定位是否需要<b>预先绑定窗口</b>。
+     *
+     * <h2>WHY 需要这个区分</h2>
+     * <p>两个平台定位元素的<b>锚点</b>不同：
+     * <ul>
+     *   <li><b>Windows</b>：UIA 树从<b>窗口句柄</b>（{@code AutomationElement::FromHandle}）开始，
+     *       没有绑定窗口就无法确定「操作哪个窗口」⇒ 必须<b>先 bind</b>；
+     *       名字/角色可能在多个窗口里重名。</li>
+     *   <li><b>macOS</b>：AX 树从<b>进程</b>（{@code AXUIElementCreateApplication(pid)}）开始，
+     *       再取<b>前台窗口</b>（{@code AXFocusedWindow} / {@code AXMainWindow}）——
+     *       <b>不需要句柄</b>，而且前台应用本来就是门控判定用的同一对象
+     *       ⇒ 绑定窗口是多余状态（dsh 的 macOS 实现同样按 bundle id + pid 选目标，
+     *       不要求先 bind）。</li>
+     * </ul>
+     *
+     * @return true = 调用方必须先绑定窗口（Windows）；false = 无需绑定（macOS）
+     */
+    default boolean requiresBoundWindow() {
+        return true;
+    }
+
+    /**
      * 抓取窗口的 UI Automation 树并格式化成模型可读的紧凑文本。
      *
      * <p>逐字对齐 CCB {@code win32/accessibilitySnapshot.ts:44-145}：
      * 深度 4 + 交互型白名单 + 不可见元素丢弃。
      *
-     * @param hwnd    窗口句柄
+     * @param hwnd    窗口句柄（<b>macOS 忽略此参数</b>，用前台应用窗口；见 {@link #requiresBoundWindow()}）
      * @param maxDepth 最大遍历深度（CCB 默认 4）
-     * @return 快照（窗口无元素 ⇒ {@link ComputerUseAccessibilitySnapshot#empty()}）
+     * @return 快照（窗口无元素 ⇒ {@link ComputerUseAccessibilitySnapshot#empty()})
      * @throws RuntimeException UIA 通道失败（<b>显式失败</b>，不静默吞异常）
      */
     ComputerUseAccessibilitySnapshot captureSnapshot(long hwnd, int maxDepth);
@@ -64,6 +86,60 @@ public interface ComputerUseUiaService {
      * @return true = 已触发 Invoke；false = 元素不存在或不支持 InvokePattern
      */
     boolean invokeElement(long hwnd, String automationId);
+
+    /**
+     * 带<b>陈旧校验</b>的点击（dsh {@code expectedStateHash} 语义）。
+     *
+     * <p>观察（{@code observe}）时记下整树状态指纹；动作时后端重新计算并与期望值比对，
+     * <b>不一致即拒绝</b> —— 界面变了还按旧序号操作，会打到别的控件上。
+     *
+     * <p>默认实现忽略哈希、退化为 {@link #invokeElement(long, String)}：
+     * Windows 的 UIA 用 {@code AutomationId} 精确定位，不依赖「树序」，故无需该校验。
+     *
+     * @param hwnd              窗口句柄（macOS 忽略）
+     * @param automationId      定位键（macOS = locator 路径）
+     * @param expectedStateHash 期望状态指纹（null / 空 ⇒ 不校验）
+     * @return true = 已触发
+     */
+    default boolean invokeElement(long hwnd, String automationId, String expectedStateHash) {
+        return invokeElement(hwnd, automationId);
+    }
+
+    /**
+     * 按条件等待 AX 状态满足（对齐 dsh {@code computer_wait}）。
+     *
+     * <p>默认实现：不支持（返回 {@code null}）—— Windows 侧暂不提供条件等待。
+     *
+     * @param hwnd         窗口句柄（macOS 忽略）
+     * @param text         条件：树文本包含该子串（大小写不敏感；可空）
+     * @param elementRole  条件：存在该角色的元素（可空）
+     * @param elementTitle 条件：存在该标题/名字的元素（可空）
+     * @param timeoutMs    超时（毫秒）
+     * @return 等待结束时的快照；超时未满足 ⇒ 返回最后一次快照（调用方据
+     *         {@code satisfies} 判断）；不支持 ⇒ {@code null}
+     */
+    default ComputerUseAccessibilitySnapshot waitForCondition(long hwnd,
+                                                              String text,
+                                                              String elementRole,
+                                                              String elementTitle,
+                                                              long timeoutMs) {
+        return null;
+    }
+
+    /**
+     * 执行元素声明的<b>任意</b> Accessibility 动作（对齐 dsh {@code computer_perform_action}）。
+     *
+     * <p>默认实现：Windows 的 UIA 没有等价物（动作集是 {@code Invoke}/{@code Expand}… 的模式，
+     * 不是统一的名字空间）⇒ 默认返回 {@code false}，由 macOS 实现覆写。
+     *
+     * @param hwnd    窗口句柄（macOS 忽略）
+     * @param locator 定位键（macOS = 路径；Windows = AutomationId）
+     * @param action  动作名（如 {@code AXPress} / {@code AXExpand}）
+     * @return true = 动作已执行
+     */
+    default boolean performAction(long hwnd, String locator, String action) {
+        return false;
+    }
 
     /**
      * 用 {@code ValuePattern} 设置元素的值。

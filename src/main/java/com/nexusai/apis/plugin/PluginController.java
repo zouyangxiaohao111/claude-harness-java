@@ -5,7 +5,9 @@ import com.nexusai.application.agent.plugin.PluginInstallService;
 import com.nexusai.model.market.dto.PluginInstallRequest;
 import com.nexusai.model.market.dto.PluginInstallResult;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
@@ -68,5 +70,18 @@ public class PluginController {
         return p == null
             ? org.springframework.http.ResponseEntity.noContent().build()
             : org.springframework.http.ResponseEntity.ok(p);
+    }
+
+    /**
+     * 卸载插件（[2026-11-01 skill-market v4] 前端「⋯ → 卸载」）。
+     *
+     * <p><b>⚠️ 破坏性</b>：真实删除安装目录（不可恢复）。前端必须二次确认后才调用。
+     *
+     * @param name 插件名（市场条目名）
+     * @return 卸载结果（success + 中文 message）
+     */
+    @DeleteMapping("/{name}")
+    public PluginInstallResult uninstall(@PathVariable String name) {
+        return pluginInstallService.uninstall(name);
     }
 }

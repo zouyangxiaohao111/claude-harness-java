@@ -4,7 +4,21 @@
  */
 
 // ---- Provider ----
+/**
+ * 提供商协议类型（后端 `ProviderType` 枚举的子集）。
+ *
+ * <p>⚠️ `openai_response`（OpenAI Responses API · /v1/responses）**当前后端未实现** ——
+ * 后端 `ProviderType` 枚举无此值，`ProviderService.toProviderDto` 走 `ProviderType.valueOf(...)`
+ * ⇒ 真发出去会 500。故：
+ * <ul>
+ *   <li>界面上**显示**这一模式（让用户知道存在，只是暂不支持）但**置灰不可选**；</li>
+ *   <li>本类型里**不含**它 —— 它只是 UI 层的展示项，值永远不会被提交。</li>
+ * </ul>
+ */
 export type ProviderType = 'openai_compatible' | 'anthropic'
+
+/** 协议类型下拉/分段控件的**展示项**（含未实现模式）· 与 ProviderType 区分开。 */
+export type ProviderProtocolOption = ProviderType | 'openai_response'
 
 /** 后端响应：ProviderDto（含嵌套 models） */
 export interface Provider {
@@ -547,6 +561,20 @@ export interface AppSettings {
  *  写回去」在编译期就报错，而不是静默被后端丢弃（F2）。 */
 export type UpdateSettingsRequest = Partial<Omit<AppSettings, 'appName' | 'configHome'>>
 
+/**
+ * 模型档位角色（settings 的 11 个「档位模型」字段）。
+ *
+ * <p><b>wire 名 = 后端 `ModelTierRole` 枚举的 wire</b>（`main` / `fast` / …）——
+ * 前后端各有一份类型，但**值必须一一对应**，前端不得自行另起一套 key。
+ *
+ * <p><b>为什么需要独立的一层</b>：`PUT /settings` 的 merge 契约是「`null` = 不覆盖」
+ * ⇒ 用 PUT **无法**表达「把某个档位清空」。清空走独立的 DELETE 端点
+ * （`DELETE /settings/model-tiers/{role}`），语义与覆盖相反。
+ */
+export type ModelTierRole =
+  | 'main' | 'fast' | 'strong' | 'medium' | 'weak' | 'subagent'
+  | 'fallback' | 'multimodal' | 'tts' | 'asr' | 'classifier'
+
 // ---- /context analyze（后端 ContextAnalyzeController）----
 export interface ContextAnalyzeRequest {
   customSystemPrompt?: string
@@ -1072,6 +1100,15 @@ export interface MarketExpert {
   featured?: boolean | null
   /** 远端来源标识 */
   remote?: boolean
+  // ---- [skill-market v4 2026-11-01] 开发者（useCount 上方已存在，不重复声明）----
+  /** 开发者名（后端缺省填「数字公司开发组」） */
+  authorName?: string | null
+  /** 是否认证发布者 */
+  authorVerified?: boolean | null
+  /** 开发者头像 URL */
+  authorAvatarUrl?: string | null
+  /** 开发者邮箱 */
+  authorEmail?: string | null
 }
 /** 市场技能卡片视图（外部 marketplace / 本地技能共用） */
 export interface MarketSkill {
@@ -1090,6 +1127,21 @@ export interface MarketSkill {
   remote?: boolean
   /** 市场条目内容指纹（与本地已装目录指纹比对 → 判定「有更新」） */
   fingerprint?: string | null
+  /** 版本号（详情页「版本」格 · 本机技能无此信息时为 null） */
+  version?: string | null
+  // ---- [skill-market v4 2026-11-01] 统计与开发者（卡片/详情页展示）----
+  /** 使用次数（原始整数 · null = 市场无此项统计 ⇒ 不渲染，⛔ 不显示 0） */
+  useCount?: number | null
+  /** 下载次数（同上） */
+  downloadCount?: number | null
+  /** 开发者名（后端保证非空 —— 缺省填「数字公司开发组」） */
+  authorName?: string | null
+  /** 是否认证发布者（true 才渲染认证图标） */
+  authorVerified?: boolean | null
+  /** 开发者头像 URL（null → 用名字首字母色块） */
+  authorAvatarUrl?: string | null
+  /** 开发者邮箱（详情页「关于开发者」展示） */
+  authorEmail?: string | null
 }
 /** 市场连接器卡片视图（外部 marketplace） */
 export interface MarketConnector {
@@ -1124,6 +1176,20 @@ export interface ExternalMarketPlugin {
   createdAt?: string | null
   /** 内容指纹 sha256:...（上架时写入；较早的数据可能为空） */
   fingerprint?: string | null
+  // ---- [skill-market v4 2026-11-01] 市场真实统计（来自 stats.json · 原始整数）----
+  /** 使用次数 · null = 市场无此项统计 */
+  useCount?: number | null
+  /** 下载次数 · null = 市场无此项统计 */
+  downloadCount?: number | null
+  // ---- [skill-market v4 2026-11-01] 开发者（后端缺省填「数字公司开发组」）----
+  /** 开发者名（后端保证非空） */
+  authorName?: string | null
+  /** 是否认证发布者 */
+  authorVerified?: boolean | null
+  /** 开发者头像 URL（null → 首字母色块） */
+  authorAvatarUrl?: string | null
+  /** 开发者邮箱 */
+  authorEmail?: string | null
 }
 /** GET /api/market/external 响应（后端 ExternalMarketDto · 自建 MinIO 市场） */
 export interface ExternalMarket {
@@ -1957,6 +2023,17 @@ export interface AgentTranscriptMessage {
   toolCallId: string | null
   /** 思考内容（CC msg.reasoning · 子代理转录里原样保存，后端 2026-10-21 起透出） */
   reasoning?: string | null
+  /** 转录节点写入时间（ISO-8601 带偏移 · 后端 AgentMessage.timestamp；无则 null）
+   *  —— 复用到主对话渲染时喂 `createdAt`/`time`，才有「已完成 · 时长」与消息头时间。 */
+  timestamp?: string | null
+  /** 是否系统注入的 meta 行（技能清单 / 外部改文件 / hook 回执…）· 后端 2026-11-02 起透出。
+   *  ⛔ 不传 = false：旧转录没有该字段，那些历史记录里的 meta 行仍会被当普通 user 消息
+   *  （只影响历史只读，新写入的都有）。 */
+  isMeta?: boolean
+  /** 作者（'attachment' / 'system' / null）· 与主对话 ChatMessageDto.author 同义。 */
+  author?: string | null
+  /** 注入 subtype（skill_listing / edited_text_file / …）· 用于摘要文案。 */
+  subtype?: string | null
 }
 
 /**

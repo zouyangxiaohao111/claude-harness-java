@@ -11,6 +11,7 @@ import { isTauri } from '@tauri-apps/api/core'
 import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
 import { COMMAND_ITEMS, isDisabledCommand } from './CommandPalette'
+import { GoalHead } from './GoalHead'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
@@ -392,7 +393,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   useEffect(() => {
     let alive = true
     // [TL-W1 P4] sessionId 直传后端（REST 线程按会话解析绑定项目 → project 级命令进补全）；
-    //   切会话 → 重新拉取（避免上一个会话的项目命令滞留；同源 /skills 见 useSkills）。
+    //   切会话 → 重新拉取（避免上一个会话的项目命令滞留；同源 /skills 端点）。
     commandApi.list(false, sessionId ?? undefined).then((cs) => { if (alive) setRemoteCommands(cs) }).catch(() => {})
     return () => { alive = false }
   }, [sessionId])
@@ -944,10 +945,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           </div>
         </div>
       )}
-      {/* F19/#3 排队命令条（输入框上方，后端 B5 未接恒空隐藏） */}
-      {/* 「编辑」按钮与 Esc 走同一个入口（文本 + 附件一起拉回） */}
-      <QueuedCommandsBar queuedCommands={queuedCommands} onEdit={() => void handlePopEditable()} />
       <div className="composer-inner">
+        {/* F19/#3 排队命令条（输入框上方，后端 B5 未接恒空隐藏） */}
+        {/* 「编辑」按钮与 Esc 走同一个入口（文本 + 附件一起拉回） */}
+        {/* [goal V253 形态重做] 移进 .composer-inner —— 原先在它<b>外面</b>（兄弟节点）⇒ 通栏， */}
+        {/*   与缩进 85% 的输入框左缘差 42px / 右缘差 128px（几何错位，不是配色问题）。 */}
+        <QueuedCommandsBar queuedCommands={queuedCommands} onEdit={() => void handlePopEditable()} />
         {/* 输入框上方一行：左=项目绑定，右=模型选择器（设计稿 v7） */}
         <div className="composer-top">
           <div
@@ -1026,6 +1029,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
             )}
           </div>
         </div>
+        {/* [goal V253] 目标头 · 贴在输入框顶部内缘（不是 App 层横幅 —— 目标是常驻身份，不是告警） */}
+        <GoalHead sessionId={sessionId ?? null} />
         <div className="input-box">
           <div style={{ position: 'relative' }}>
             <div
@@ -1339,7 +1344,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               )}
               {/* ⭐ 释放点②（清空）：`clear()` 与键的具体形态无关 ⇒ 改键后无需改动（逐字核过） */}
               {attachments.length > 0 && (
-                <button className="tool-chip" onClick={() => { addedKeysRef.current.clear(); setAttachments([]); showToast('已清空附件', 'info') }} title="清空附件">
+                <button className="tool-chip text-only" onClick={() => { addedKeysRef.current.clear(); setAttachments([]); showToast('已清空附件', 'info') }} title="清空附件">
                   <span>清空</span>
                 </button>
               )}

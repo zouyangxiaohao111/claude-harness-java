@@ -96,19 +96,21 @@ export function useFirstRunGuide(opts: UseFirstRunGuideOptions): FirstRunGuide {
     desc: '这个提供商还没有可用的模型。点它卡片上的「＋ 添加模型」，把「模型名称」填成你账号真实支持的模型 id，例如 claude-sonnet-4-5 / deepseek-chat。保存后我带你绑定档位。',
   }), [])
 
-  /** ③ 模型档位步（主/最强/快速/弱/子代理）：canNext 每次渲染求值时读 ref → settings 变化后 App 重渲染即刷新禁用态 */
+  /** ③ 模型档位步（主/最强/快速/弱/子代理）：canNext 每次渲染求值时读 ref → settings 变化后 App 重渲染即刷新禁用态
+   *  ⚠️ 2026-10-31：模型页改为主从双栏后，档位在**左列清单**、模型在**右列列表**（同屏）。
+   *     `data-tour` 锚点已迁到左列的档位行上；文案同步改成「点档位 → 右侧点模型」，否则与界面不符。 */
   const buildModelPhaseSteps = useCallback((): TourStep[] => [
     {
       getTarget: () => document.querySelector('[data-tour="role-main"]'),
       title: '绑定主模型',
-      desc: '主模型是日常对话的默认主力。先点一下这张「主模型」卡片，再从下方模型列表点选一个模型，看到「已配置」后即可继续。',
+      desc: '主模型是日常对话的默认主力。先点一下左边的「主模型」档位，再从右边模型列表点选一个模型，看到「已配置」后即可继续。',
       nextLabel: '下一步',
       canNext: () => !!appSettingsRef.current?.mainModelName,
     },
     {
       getTarget: () => document.querySelector('[data-tour="role-strong"]'),
       title: '最强模型（可选）',
-      desc: '遇到复杂规划或高难度推理时，可以让它来负责。点卡片再点选一个模型即可绑定；暂时不配也行。',
+      desc: '遇到复杂规划或高难度推理时，可以让它来负责。点档位再在右边点选一个模型即可绑定；暂时不配也行。',
       nextLabel: '下一步',
     },
     {

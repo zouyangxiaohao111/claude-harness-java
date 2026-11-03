@@ -295,9 +295,16 @@ class ComputerUseMcpServerTest {
         assertThat(callResult.path("isError").asBoolean()).isFalse();
         JsonNode content = callResult.path("content");
         assertThat(content.isArray()).isTrue();
-        assertThat(content).hasSize(1);
+        // ⭐ 2 块而不是 1 块：图像块 + 紧跟一条 pixelScale 说明（dsh 截图 Artifact 的同名字段）。
+        //   WHY 必须有那条文本：模型从图上读到的坐标是**图像像素**，必须除以 pixelScale 才是
+        //   窗口/屏幕坐标；只发图不发因子 ⇒ 模型只能盲猜（本仓踩过，落在两倍偏移处）。
+        assertThat(content).hasSize(2);
         assertThat(content.get(0).path("type").asText()).isEqualTo("image");
         assertThat(content.get(0).path("mimeType").asText()).isEqualTo("image/jpeg");
+        assertThat(content.get(1).path("type").asText()).isEqualTo("text");
+        assertThat(content.get(1).path("text").asText())
+                .contains("pixelScale")
+                .contains("divide a pixel coordinate");
 
         byte[] decoded = Base64.getDecoder().decode(content.get(0).path("data").asText());
         assertThat(decoded).hasSize(TINY_JPEG.length);

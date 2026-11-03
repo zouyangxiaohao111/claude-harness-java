@@ -4,6 +4,7 @@ import { createRoot, type Root } from 'react-dom/client'
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { MessageList } from '../MessageList'
 import { useChatStore } from '@/stores/chatStore'
+import { FOLD_DEFAULT_TURNS } from '@/stores/messageTurns'
 import type { ChatMessageDto } from '@/api/types'
 
 /**
@@ -74,39 +75,40 @@ describe('MessageList 轮窗口（加载更多 = 累积式追加，不丢中间�
   afterEach(() => {
     act(() => { root.unmount() })
     container.remove()
-    useChatStore.setState({ messages: {}, hasMore: {}, streams: {}, streamOrder: {}, streamTicks: {} })
+    useChatStore.setState({ messages: {}, hasMore: {}, streams: {}, streamOrder: {}, streamTicks: {}, foldedTurnCounts: {} })
   })
 
-  it('首屏渲染 store 里已加载的全部轮（App 只放最近 3 轮）；挂载不自动加载', async () => {
-    // App 首屏 listTurns({turns:3}) → store 里恰好 3 轮
+  it('首屏渲染 store 里已加载的全部轮（App 只放最近 FOLD_DEFAULT_TURNS 轮）；挂载不自动加载', async () => {
+    // [折叠 = 真删 · 2026-11-02] App 首屏 listTurns({turns:FOLD_DEFAULT_TURNS}) → store 里恰好这么多轮
+    const ids = Array.from({ length: FOLD_DEFAULT_TURNS }, (_, i) => `u${i + 1}`)
     useChatStore.setState({
-      messages: { [SID]: ['u3', 'u4', 'u5'].flatMap(turn) }, hasMore: { [SID]: true },
+      messages: { [SID]: ids.flatMap(turn) }, hasMore: { [SID]: true },
       streams: {}, streamOrder: {}, streamTicks: {},
     })
     let fetchCalls = 0
     await render(() => { fetchCalls++ })
 
-    expect(userRowCount(container)).toBe(3)
-    expect(renderedUserIds(container)).toEqual(['u3', 'u4', 'u5'])
+    expect(userRowCount(container)).toBe(FOLD_DEFAULT_TURNS)
+    expect(renderedUserIds(container)).toEqual(ids)
     // 挂载 ≠ 自动加载
     expect(fetchCalls).toBe(0)
   })
 
-  it('比默认窗口（最近 3 轮）更早的轮【折叠成一行】而不是丢弃：折叠态无 DOM，点击展开后全渲染', async () => {
-    // 用户 2026-10-29 裁定：「不应该挤掉而是折叠显示，显示『N 轮已折叠』，点击可展开」
+  it('比默认窗口更早的轮【折叠成一行】而不是丢弃：折叠态无 DOM，点击展开后全渲染', async () => {
+    // [2026-11-02] 默认窗口 = FOLD_DEFAULT_TURNS（2）；store 里若多于它（如「加载更多」拉回来的），
+    //   更早的轮在**渲染层**仍折叠成一行（内存裁剪只发生在追加路径，prepend 的不裁）。
     useChatStore.setState({
       messages: { [SID]: ['u1', 'u2', 'u3', 'u4', 'u5', 'u6', 'u7'].flatMap(turn) },
       hasMore: { [SID]: true }, streams: {}, streamOrder: {}, streamTicks: {},
     })
     await render(noop)
-    // 默认窗口 = 最近 3 轮；更早 4 轮折叠
-    expect(renderedUserIds(container)).toEqual(['u5', 'u6', 'u7'])
+    expect(renderedUserIds(container)).toEqual(['u7', 'u8'].filter(() => false).concat(['u6', 'u7']))
     const fold = foldRow(container)
     expect(fold, '应出现折叠行').not.toBeNull()
-    expect(fold!.textContent).toContain('已折叠 4 轮对话')
-    // 折叠区内的轮**没有 DOM**（既留数据又不占渲染）
+    expect(fold!.textContent).toContain('已折叠 5 轮对话')
+    // 折叠区内的轮**没有 DOM**
     expect(container.querySelector('[data-msg-id="u1"]')).toBeNull()
-    expect(container.querySelector('[data-msg-id="u4"]')).toBeNull()
+    expect(container.querySelector('[data-msg-id="u5"]')).toBeNull()
 
     // 点击折叠行 → 展开（本地 state，不发请求）
     await act(async () => { fold!.click(); await new Promise((r) => setTimeout(r, 20)) })
@@ -131,22 +133,24 @@ describe('MessageList 轮窗口（加载更多 = 累积式追加，不丢中间�
     expect(follows(fold, firstMsg), '折叠行必须在第一条消息之前').toBe(true)
   })
 
-  it('进行中的轮绝不被折叠（有流式块的轮必须留在 DOM 里）', async () => {
-    // 极端形态：流式块归属到**最早**那一轮（正常是最后一轮）——仍不得被折叠掉
+  it('[2026-11-02 用户裁定] 执行中只显示**最新一轮**，跑在旧轮上的流式块不把旧轮拉回视野', async () => {
+    // 真实场景：执行中又发了一条（后端排队），流式块仍归属**旧轮** u5，
+    //   而最新提问是 u6 —— 用户要看到的是 u6，旧轮（含它的「正在执行」）应被折起。
     useChatStore.setState({
-      messages: { [SID]: ['u1', 'u2', 'u3', 'u4', 'u5'].flatMap(turn) },
+      messages: { [SID]: ['u1', 'u2', 'u3', 'u4', 'u5', 'u6'].flatMap(turn) },
       hasMore: { [SID]: true }, streams: {}, streamOrder: {}, streamTicks: {},
     })
-    useChatStore.getState().ensureStreamBlock(SID, 'blk-live', 'u1')
+    useChatStore.getState().ensureStreamBlock(SID, 'blk-live', 'u5')
     await render(noop)
-    expect(foldRow(container), '进行中的轮挡在头部 ⇒ 不折叠').toBeNull()
-    expect(renderedUserIds(container)).toEqual(['u1', 'u2', 'u3', 'u4', 'u5'])
+    expect(renderedUserIds(container), '只留最新一轮').toEqual(['u6'])
     useChatStore.getState().clearStream(SID)
   })
 
-  it('加载更多两次 → 3→5→7 轮，最早一轮的 id 始终留在 DOM（累积，不丢中间轮）', async () => {
+  it('加载更多两次：新拉到的轮直接展开，最早的 id 始终留在 DOM（累积，不丢中间轮）', async () => {
+    // [2026-11-02] 首屏 = FOLD_DEFAULT_TURNS 轮；此后每次「加载更多」拉回的轮由
+    //   MessageList 的 prepend 收口直接记进 revealedFoldKeys（用户主动要的）⇒ 全部可见。
     useChatStore.setState({
-      messages: { [SID]: ['t3', 't4', 't5'].flatMap(turn) }, hasMore: { [SID]: true },
+      messages: { [SID]: ['t3', 't4'].slice(0, FOLD_DEFAULT_TURNS).flatMap(turn) }, hasMore: { [SID]: true },
       streams: {}, streamOrder: {}, streamTicks: {},
     })
     // 模拟后端返回更早 2 轮 → App prepend 进 store（与真实 handleLoadOlder 同形）
@@ -158,19 +162,18 @@ describe('MessageList 轮窗口（加载更多 = 累积式追加，不丢中间�
     }
     await render(onLoadOlder)
 
-    expect(renderedUserIds(container)).toEqual(['t3', 't4', 't5'])
-    const firstEverId = renderedUserIds(container)[0]
+    expect(renderedUserIds(container)).toEqual(['t3', 't4'])
+    const firstEverId = renderedUserIds(container)[0]!
 
-    // 第 1 次：5 轮
+    // 第 1 次：+2 轮 → 4 轮全可见（新拉到的直接展开）
     await act(async () => { loadBtn(container)!.click(); await new Promise((r) => setTimeout(r, 30)) })
-    expect(renderedUserIds(container)).toEqual(['t1', 't2', 't3', 't4', 't5'])
-    // 累积断言：最早出现过的用户消息 id 仍在 DOM 里
-    expect(renderedUserIds(container)).toContain(firstEverId!)
+    expect(renderedUserIds(container)).toEqual(['t1', 't2', 't3', 't4'])
+    expect(renderedUserIds(container)).toContain(firstEverId)
 
-    // 第 2 次：7 轮（中间轮 t3/t4/t5 全部保留）
+    // 第 2 次：+2 轮 → 6 轮全可见（中间轮 t1..t4 全部保留）
     await act(async () => { loadBtn(container)!.click(); await new Promise((r) => setTimeout(r, 30)) })
-    expect(renderedUserIds(container)).toEqual(['m1', 'm2', 't1', 't2', 't3', 't4', 't5'])
-    expect(renderedUserIds(container)).toContain(firstEverId!)
+    expect(renderedUserIds(container)).toEqual(['m1', 'm2', 't1', 't2', 't3', 't4'])
+    expect(renderedUserIds(container)).toContain(firstEverId)
   })
 
   it('加载中禁用按钮，重复点击不重复请求（一次点击 = 一次网络页）', async () => {

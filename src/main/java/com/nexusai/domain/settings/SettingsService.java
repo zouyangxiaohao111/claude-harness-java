@@ -2,6 +2,7 @@ package com.nexusai.domain.settings;
 
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.model.settings.dto.FontSize;
+import com.nexusai.model.settings.dto.ModelTierRole;
 import com.nexusai.model.settings.dto.SettingsDto;
 import com.nexusai.model.settings.dto.Theme;
 import com.nexusai.repository.settings.entity.SettingsRecord;
@@ -314,6 +315,126 @@ public class SettingsService {
         SettingsDto dto = toDto(s);
         TaskSystemConfig.setAgentSwarmsSettingsOverride(dto.agentSwarmsEnabled());
         return dto;
+    }
+
+    // ============== 模型档位清空（DELETE 语义 · 与 update 的 merge 契约相反） ==============
+
+    /**
+     * 清除<b>单个</b>模型档位的绑定（把对应列置 NULL）。
+     *
+     * <p><b>为什么必须独立于 update</b>：{@link #update} 的 merge 契约是「{@code null} = 不覆盖」
+     * （前端传 {@code null} 表示「这次别动这个字段」）⇒ 用 PUT <b>无法</b>表达「把字段清空」。
+     * 清空与覆盖<b>语义相反</b>，混在同一条通道里必然出 bug，故独立成 DELETE 端点。
+     *
+     * <p><b>幂等</b>：档位本就未配置时直接返回当前 DTO，不报错、不写库。
+     *
+     * @param role 档位（{@link com.nexusai.model.settings.dto.ModelTierRole}）；null → 抛 ValidationException
+     * @return 清空后的 settings DTO（前端经 mergeSettings 合并回 state）
+     */
+    public SettingsDto clearModelTier(ModelTierRole role) {
+        if (role == null) {
+            throw new ValidationException("档位非法（允许 " + String.join("/", ModelTierRole.wireNames()) + "）");
+        }
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
+
+        String old = readTierValue(s, role);
+        if (old == null || old.isBlank()) {
+            // 幂等：本就未配置 → 不写库（避免无谓 UPDATE + updated_at 抖动）
+            if (log.isInfoEnabled()) {
+                log.info("[SettingsService] 清除模型档位 {}：本就未配置，无需写库", role.wire());
+            }
+            return toDto(s);
+        }
+
+        writeTierValue(s, role, null);
+        // ⚠️ 必须 update(s, false) —— ignoreNulls=false **显式写 NULL**：
+        //   mybatis-flex update(entity) 默认忽略 null 字段（NOT_NULL 策略）⇒ 目标列会被 SET 跳过
+        //   ⇒ DB 残留原值，「清除」根本没生效（实测：DELETE 返回已清空，回读 DB 仍是旧值）。
+        //   对齐 SessionService.setTeamContext:755-762 的清空写法。
+        //   ⚠️ 不能用「稀疏 patch + updateByQuery(patch,false,qw)」：false 会把 patch 所有 null 字段
+        //   写 NULL，settings 里非空约束列会炸 ⇒ 这里用 selectOneById 出来的**完整实体**，
+        //   只置目标列为 null，其余列保留 DB 原值。
+        settingsMapper.update(s, false);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] 清除模型档位 {}：原值 {} → NULL（已落库）", role.wire(), old);
+        }
+        SettingsDto dto = toDto(s);
+        TaskSystemConfig.setAgentSwarmsSettingsOverride(dto.agentSwarmsEnabled());
+        return dto;
+    }
+
+    /**
+     * 清除<b>全部</b>模型档位的绑定（前端「一键清除全部已配置的模型」）。
+     *
+     * <p>逐档位判定「原本有值才置 NULL」→ 只写真正变了的列，且返回值精确反映清空结果。
+     * 全部本就未配置时<b>不写库</b>（幂等）。
+     *
+     * @return 清空后的 settings DTO
+     */
+    public SettingsDto clearAllModelTiers() {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
+
+        int cleared = 0;
+        for (ModelTierRole role : ModelTierRole.values()) {
+            String old = readTierValue(s, role);
+            if (old != null && !old.isBlank()) {
+                writeTierValue(s, role, null);
+                cleared++;
+            }
+        }
+        if (cleared > 0) {
+            // ⚠️ update(s, false) —— ignoreNulls=false 显式写 NULL（理由同 clearModelTier：
+            //   默认 update(entity) 忽略 null 字段 ⇒ 清空列被跳过 ⇒ DB 残留旧值）。
+            settingsMapper.update(s, false);
+            if (log.isInfoEnabled()) {
+                log.info("[SettingsService] 一键清除全部模型档位：已清空 {} 个档位（已落库）", cleared);
+            }
+        } else {
+            if (log.isInfoEnabled()) {
+                log.info("[SettingsService] 一键清除全部模型档位：全部本就未配置，无需写库");
+            }
+        }
+        SettingsDto dto = toDto(s);
+        TaskSystemConfig.setAgentSwarmsSettingsOverride(dto.agentSwarmsEnabled());
+        return dto;
+    }
+
+    /** 读档位列当前值（null = 未配置）。 */
+    private static String readTierValue(SettingsRecord s, ModelTierRole role) {
+        switch (role) {
+            case MAIN: return s.getMainModelName();
+            case FAST: return s.getFastModelName();
+            case STRONG: return s.getStrongModelName();
+            case MEDIUM: return s.getMediumModelName();
+            case WEAK: return s.getWeakModelName();
+            case SUBAGENT: return s.getSubagentModelName();
+            case FALLBACK: return s.getFallbackModelName();
+            case MULTIMODAL: return s.getMultimodalModelName();
+            case TTS: return s.getTtsModelName();
+            case ASR: return s.getAsrModelName();
+            case CLASSIFIER: return s.getClassifierModel();
+            default: return null;
+        }
+    }
+
+    /** 写档位列（value = null ⇒ 置 NULL）。 */
+    private static void writeTierValue(SettingsRecord s, ModelTierRole role, String value) {
+        switch (role) {
+            case MAIN: s.setMainModelName(value); break;
+            case FAST: s.setFastModelName(value); break;
+            case STRONG: s.setStrongModelName(value); break;
+            case MEDIUM: s.setMediumModelName(value); break;
+            case WEAK: s.setWeakModelName(value); break;
+            case SUBAGENT: s.setSubagentModelName(value); break;
+            case FALLBACK: s.setFallbackModelName(value); break;
+            case MULTIMODAL: s.setMultimodalModelName(value); break;
+            case TTS: s.setTtsModelName(value); break;
+            case ASR: s.setAsrModelName(value); break;
+            case CLASSIFIER: s.setClassifierModel(value); break;
+            default: throw new ValidationException("档位非法（未知 role: " + role + "）");
+        }
     }
 
     /** [agent-swarms-global] 实时读 settings 单例行 agentSwarmsEnabled（全局配置，每次调用读 DB）。行缺失/异常 → null（不覆盖 CC 原链）。 */

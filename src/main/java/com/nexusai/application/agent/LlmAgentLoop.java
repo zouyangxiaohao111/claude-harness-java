@@ -439,6 +439,9 @@ public class LlmAgentLoop implements AgentLoop {
      */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private HookRegistry hookRegistry;
+    // [goal V253] 目标（/goal）服务与任务框架服务**经 AgentLoopContext 传递**（loop() 是 static
+    //   方法，拿不到本类实例字段）—— 见 AgentLoopContext.goalService() / taskFrameworkService()。
+    //   ctx.goalService() 为 null ⇒ 目标机制整体不生效（老路径行为不变）。
     /**
      * [IMP-RS-01 DEL-01e 补回] prompt 回调工厂 (未绑定) · 对齐 CC {@code context.requestPrompt}
      * (REPL.tsx:2520, {@code feature('HOOK_PROMPTS') ? requestPrompt : undefined}) — UserPromptSubmit
@@ -9132,8 +9135,25 @@ public class LlmAgentLoop implements AgentLoop {
                     //   :283-294 abort 早返）。[D10 双视图] 选边 = modelView()（模型面）：
                     //   CC executeStopHooks 的 messages 源 = messagesForQuery（query.ts:1558）
                     //   → execPromptHook 会话历史 prepend 的必须是**投影面**（§14 同款，见下方同名调用点）。
-                    HookRegistry.StopHookCollectResult loopStopCollect =
-                        ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.modelView());
+                    // [goal V253] 后台任务门控 · 对齐 CC claude.exe v2.1.212 的 goal 门控：
+                    //   CC 在评估前检查「后台工作是否都归位」，未归位则**当轮物理摘掉 goal hook**
+                    //   （finally 再挂回）⇒ 本轮不评估，等后台归位后的下一轮才判。
+                    //   本仓等价实现 = 摘掉 goal 的 prompt Stop hook → 执行 Stop hooks（此时 goal
+                    //   hook 已不在注册表里，不会被评估）→ finally 挂回。
+                    if (ctx.goalService() != null && ctx.taskFrameworkService() != null
+                        && ctx.taskFrameworkService().hasPendingBackgroundWork(state.sessionId())) {
+                        ctx.goalService().deferEvaluationForBackground(state.sessionId());
+                    }
+                    HookRegistry.StopHookCollectResult loopStopCollect;
+                    try {
+                        loopStopCollect =
+                            ctx.hookRegistry().executeStopHooksCollecting(stopEvent, stopParentTuc, state.modelView());
+                    } finally {
+                        // CC 同款：评估窗口结束即复原 goal hook（下一轮后台归位后会真正评估）
+                        if (ctx.goalService() != null) {
+                            ctx.goalService().resumeDeferredEvaluation(state.sessionId());
+                        }
+                    }
                     stopHooksEvaluated = true;
                     if (loopStopCollect != null && !loopStopCollect.results().isEmpty()) {
                         boolean stopAborted = params.toolUseContext() != null
@@ -9165,7 +9185,28 @@ public class LlmAgentLoop implements AgentLoop {
                             //   旧 executeEvent 折叠只注入首条，第 2+ blockingError 静默丢失
                             java.util.List<String> blockingTexts = new java.util.ArrayList<>();
                             for (GenericHook.HookResult r : loopStopCollect.results()) {
-                                if (r != null && r.blockingError() != null) {
+                                if (r == null) {
+                                    continue;
+                                }
+                                // [goal V253] impossible 消费 · 对齐 CC claude.exe v2.1.212：
+                                //   ok=false + impossible=true → outcome=success + impossible 标记
+                                //   （**不是** blocking）⇒ 目标停止推进、交还控制权，等用户处理。
+                                //   若不在此消费，impossible 结果会被静默吞掉（既不 block 也不改目标状态）
+                                //   ⇒ 目标永远挂在 active 态，UI 显示「还在追」但实际已停。
+                                if (Boolean.TRUE.equals(r.impossible())) {
+                                    if (ctx.goalService() != null) {
+                                        com.nexusai.domain.session.SessionGoal g =
+                                            ctx.goalService().recordImpossible(state.sessionId());
+                                        // [goal V253] 溯源行落进本轮「已完成」折叠区（理由同达成分支）
+                                        if (g != null) {
+                                            state.appendMessage(ctx.goalService().buildTerminalTraceMessage(g));
+                                        }
+                                        log.info("[goal] 评估器判定条件不可能达成 → 目标停止推进（session={}）",
+                                            state.sessionId());
+                                    }
+                                    continue;
+                                }
+                                if (r.blockingError() != null) {
                                     // [hooks_v3 5-8/5-W4-1] Stop 阻塞文案前缀 · CC getStopHookMessage
                                     //   'Stop hook feedback:\n' 前缀（hooks.ts:1894-1896）。blockingTexts
                                     //   集合仅作 !isEmpty() 重入门控，前缀化不影响门控语义。
@@ -9179,6 +9220,35 @@ public class LlmAgentLoop implements AgentLoop {
                                     //   实时落库 + 前端渲染成用户自己的气泡（污染 lastUserMessageId 归属）。
                                     //   模型面不受影响（isMeta 与 isVisibleInTranscriptOnly 一样绝不用于模型侧过滤）。
                                     state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
+                                    // [goal V253] 未达成回写 · 对齐 CC：iterations++ + lastReason=reason
+                                    //   （reason 即注入下一轮的那句话，也是 UI 目标头「最近一次判定」的来源）
+                                    if (ctx.goalService() != null) {
+                                        ctx.goalService().recordNotMet(state.sessionId(), r.stopReason());
+                                    }
+                                }
+                            }
+                            // [goal V253] 达成消费 · 对齐 CC：ok=true（success 且无 blockingError）
+                            //   ⇒ 目标达成、摘 hook。
+                            //   ⚠️ 判据必须精确：不能用「没有 blockingError」当达成 ——
+                            //   goal hook 被后台门控摘掉、或评估器报错（non_blocking_error）时，
+                            //   同样「没有 blockingError」，但那不是达成。必须存在一个
+                            //   **PromptHook 型**的 SUCCESS 结果（goal hook 的载体）。
+                            if (ctx.goalService() != null && ctx.goalService().hasActiveGoal(state.sessionId())) {
+                                boolean goalHookMet = loopStopCollect.results().stream()
+                                    .filter(java.util.Objects::nonNull)
+                                    .anyMatch(r -> r.hook() instanceof com.nexusai.application.agent.permission.hook.PromptHook
+                                        && r.outcome() == GenericHook.HookOutcome.SUCCESS
+                                        && !Boolean.TRUE.equals(r.impossible()));
+                                if (goalHookMet) {
+                                    com.nexusai.domain.session.SessionGoal g =
+                                        ctx.goalService().recordAchieved(state.sessionId());
+                                    // [goal V253] 溯源行落进本轮「已完成」折叠区
+                                    //   （role=user + isMeta + author='attachment' + subtype='goal_status'
+                                    //    ⇒ 前端 isSystemInjectedRow 天然覆盖，不开新轮、不当用户气泡）
+                                    if (g != null) {
+                                        state.appendMessage(ctx.goalService().buildTerminalTraceMessage(g));
+                                    }
+                                    log.info("[goal] 评估器判定条件已满足 → 目标达成（session={}）", state.sessionId());
                                 }
                             }
                             // [IMP-HOOKS-S5 D-11 ①] hookCount>0 → stop_hook_summary + hookErrors 通知
@@ -15148,10 +15218,30 @@ public class LlmAgentLoop implements AgentLoop {
                                                                List<ToolCallDto> toolCalls,
                                                                String reasoning,
                                                                String turnAssistantId) {
+        return assistantMessageWithToolCalls(content, toolCalls, reasoning, turnAssistantId, null);
+    }
+
+    /**
+     * 带 sessionId 的重载 · <b>纯可观测性</b>（2026-11-01）。
+     *
+     * <p><b>WHY</b>：本方法产出的 assistant 消息是<b>运行期内存构造</b>的（不是 DB 直读），原先
+     * {@code sessionId} 硬编码 null ⇒ 下游 {@code ToolResultPairingRepair} 的告警打出
+     * {@code session=null}，运维看日志无法判断是哪个会话出的问题（用户实测就这么被卡住：
+     * 报「配对修复」却不知道属于哪个会话）。传真实 sessionId 后告警可直接定位。
+     *
+     * <p>⛔ 只加字段，<b>不改任何判定</b>：{@code ToolResultPairingRepair} 的配对逻辑完全不读
+     * sessionId；落库路径也另有 sessionId 来源（{@code createQueuedUserMessage} 等）。故本改动对
+     * 模型上下文 / 出站 wire / DB 均零影响。
+     */
+    public static ChatMessageDto assistantMessageWithToolCalls(String content,
+                                                               List<ToolCallDto> toolCalls,
+                                                               String reasoning,
+                                                               String turnAssistantId,
+                                                               String sessionId) {
         String id = turnAssistantId != null ? turnAssistantId : UUID.randomUUID().toString();
         return new ChatMessageDto(
             id,
-            null,
+            sessionId,
             Role.assistant,
             "assistant",
             content == null ? "" : content,

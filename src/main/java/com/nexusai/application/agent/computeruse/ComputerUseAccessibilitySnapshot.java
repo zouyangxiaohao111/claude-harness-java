@@ -35,7 +35,48 @@ import java.util.List;
 public record ComputerUseAccessibilitySnapshot(
         String text,
         List<ComputerUseAccessibilityNode> nodes,
-        long timestamp) {
+        long timestamp,
+        String appName,
+        String bundleId,
+        long pid,
+        String windowTitle,
+        String stateHash,
+        boolean truncated) {
+
+    /**
+     * 兼容构造（无应用身份）· Windows 侧 / 既有单测沿用。
+     *
+     * @param text      紧凑文本
+     * @param nodes     节点树
+     * @param timestamp 时刻
+     */
+    public ComputerUseAccessibilitySnapshot(String text, List<ComputerUseAccessibilityNode> nodes,
+                                            long timestamp) {
+        this(text, nodes, timestamp, "", "", 0L, "", "", false);
+    }
+
+    /**
+     * 无应用身份的兼容工厂（与三参构造等价，供需要显式调用的位置使用）。
+     *
+     * @param text      紧凑文本
+     * @param nodes     节点树
+     * @param timestamp 时刻
+     * @return 快照
+     */
+    public static ComputerUseAccessibilitySnapshot of(String text,
+                                                     List<ComputerUseAccessibilityNode> nodes,
+                                                     long timestamp) {
+        return new ComputerUseAccessibilitySnapshot(text, nodes, timestamp);
+    }
+
+    public ComputerUseAccessibilitySnapshot {
+        text = text == null ? "" : text;
+        nodes = nodes == null ? List.of() : List.copyOf(nodes);
+        appName = appName == null ? "" : appName;
+        bundleId = bundleId == null ? "" : bundleId;
+        windowTitle = windowTitle == null ? "" : windowTitle;
+        stateHash = stateHash == null ? "" : stateHash;
+    }
 
     /** 名字截断长度 · CCB {@code accessibilitySnapshot.ts:179}（{@code truncate(name, 40)}）。 */
     public static final int NAME_MAX = 40;
@@ -53,11 +94,6 @@ public record ComputerUseAccessibilitySnapshot(
             "Tab", "TabItem", "List", "ListItem", "Tree", "TreeItem",
             "DataGrid", "DataItem", "Document", "ScrollBar", "ToolBar",
             "SplitButton", "ToggleButton", "Hyperlink");
-
-    public ComputerUseAccessibilitySnapshot {
-        text = text == null ? "" : text;
-        nodes = nodes == null ? List.of() : List.copyOf(nodes);
-    }
 
     /**
      * 空快照（窗口没有可访问元素）。
@@ -89,12 +125,22 @@ public record ComputerUseAccessibilitySnapshot(
             if (sb.length() > 0) {
                 sb.append('\n');
             }
-            sb.append(pad).append('[').append(node.role()).append(']');
+            sb.append(pad);
+            // 有 index 的快照（macOS）在行首标 [#N]，模型可直接引用它做动作
+            if (node.index() >= 0) {
+                sb.append("[#").append(node.index()).append("] ");
+            }
+            sb.append('[').append(node.role()).append(']');
             if (!node.name().isEmpty()) {
                 sb.append(" \"").append(truncate(node.name(), NAME_MAX)).append('"');
             }
-            sb.append(" (").append(node.x()).append(',').append(node.y()).append(' ')
-                    .append(node.width()).append('x').append(node.height()).append(')');
+            // 坐标块：Windows 恒输出（既有行为逐字节不变）；
+            // macOS（index >= 0）取不到边界时省略，避免伪造 (0,0 0x0)
+            boolean printBounds = node.index() < 0 || node.hasBounds();
+            if (printBounds) {
+                sb.append(" (").append(node.x()).append(',').append(node.y()).append(' ')
+                        .append(node.width()).append('x').append(node.height()).append(')');
+            }
             if (!node.enabled()) {
                 sb.append(" DISABLED");
             }

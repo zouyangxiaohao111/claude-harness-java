@@ -371,4 +371,112 @@ class ToolResultPairingRepairTest {
         List<ChatMessageDto> empty = List.of();
         assertThat(ToolResultPairingRepair.ensureToolResultPairing(empty)).isSameAs(empty);
     }
+
+    // ─────────── [2026-11-01 抓现行] 诊断串：区分「丢行」与「顺序问题」 ───────────
+
+    /**
+     * <b>WHY（这是本诊断的唯一价值）</b>：DB 侧全量核对已证「数据完好却报悬挂」（全库 2236 个
+     * tool_call 仅 1 条真缺结果，且不在告警集合里；102/102 被报的 tool_use 都有结果行、385/385 紧邻）。
+     * 于是「列表里到底有没有那一行」成了唯一剩下的分岔：
+     * <ul>
+     *   <li>NOT_IN_LIST ⇒ 运行期丢行，去查构造/过滤路径；</li>
+     *   <li>at=N        ⇒ 行在但不在相邻区段 ⇒ 顺序问题（插入/重排）。</li>
+     * </ul>
+     * 若这两者被诊断串混淆，下次抓现行时仍无法定向 —— 故此处用**反射**直接调私有诊断方法断言其输出，
+     * 而不是去抓日志（抓日志还要引 appender，且会把「改文案」误判成失败）。
+     */
+    @Test
+    @DisplayName("诊断串：结果行不在列表 → NOT_IN_LIST（丢行）")
+    void diagnostic_missingRow_reportsNotInList() throws Exception {
+        List<ChatMessageDto> in = List.of(user("hi"), assistant("", call("toolu_X")));
+        String diag = invokeDiagnostic(in, 1, List.of("toolu_X"), java.util.Set.of());
+        assertThat(diag).contains("NOT_IN_LIST");
+        assertThat(diag).contains("列表=2");
+        assertThat(diag).contains("本条assistant下标=1");
+    }
+
+    @Test
+    @DisplayName("⭐ 诊断串：结果行在列表但不在相邻区段 → 报出下标（顺序问题，不是丢行）")
+    void diagnostic_rowElsewhere_reportsIndexNotMissing() throws Exception {
+        // a1 声明 toolu_X；结果行在下标 3，但紧邻 a1 的是 a2（下标2）⇒ 不属于 a1 的区段
+        List<ChatMessageDto> in = List.of(
+            user("hi"), assistant("", call("toolu_X")), assistant("", call("toolu_Y")),
+            toolResult("toolu_X", "res"));
+        String diag = invokeDiagnostic(in, 1, List.of("toolu_X"), java.util.Set.of());
+        assertThat(diag)
+            .as("行在列表里就必须报下标 —— 报 NOT_IN_LIST 会把『顺序问题』误判成『丢行』，两条修法完全不同")
+            .contains("toolu_X=[3]");
+        assertThat(diag).doesNotContain("toolu_X=NOT_IN_LIST");
+    }
+
+    @Test
+    @DisplayName("诊断串：给出 assistant 之后的角色序列（用于看区段是否被别的消息截断）")
+    void diagnostic_reportsFollowingRoles() throws Exception {
+        List<ChatMessageDto> in = List.of(
+            user("hi"), assistant("", call("toolu_X")), user("打断"), assistant("", call("toolu_Y")));
+        String diag = invokeDiagnostic(in, 1, List.of("toolu_X"), java.util.Set.of());
+        assertThat(diag).contains("其后角色=[user,assistant]");
+    }
+
+    /** 反射调用私有诊断方法（只观测，不参与判定 —— 所以测它不会与修复语义耦合）。 */
+    private static String invokeDiagnostic(List<ChatMessageDto> msgs, int idx,
+                                          List<String> missing, java.util.Set<String> present) throws Exception {
+        var m = ToolResultPairingRepair.class.getDeclaredMethod("describeMissingContext",
+            List.class, int.class, List.class, java.util.Set.class);
+        m.setAccessible(true);
+        return (String) m.invoke(null, msgs, idx, missing, present);
+    }
+
+    // ─────────── [2026-11-01 降噪] 同一 (assistant, 缺失集合) 只 WARN 一次 ───────────
+
+    /**
+     * <b>WHY</b>：本机实测同一条 assistant 连刷 8~9 次 WARN、三会话累计 390 行，把真问题淹掉
+     * （用户原话「经常出现，不应该啊」正是被刷屏放大的）。去重必须<b>只降日志级别</b>：
+     * 配对修复行为（合成占位 / 剥离孤儿）一次都不能少 —— 否则就是拿正确性换安静。
+     *
+     * <p>用 logback 的 ListAppender 真抓日志（不是反射调私有方法），因为要验的正是「打了几条 WARN」。
+     * 同时断言**修复结果两次完全一致**，防「降噪顺手把修复也跳过」。
+     */
+    @Test
+    @DisplayName("⭐ 同一 (assistant, 缺失集合) 重复命中 → 只 WARN 一次，但每次修复结果都必须照样补齐")
+    void sameMissingPair_warnsOnlyOnce_butStillRepairsEveryTime() {
+        ch.qos.logback.classic.Logger lg =
+            (ch.qos.logback.classic.Logger) org.slf4j.LoggerFactory.getLogger(ToolResultPairingRepair.class);
+        ch.qos.logback.core.read.ListAppender<ch.qos.logback.classic.spi.ILoggingEvent> appender =
+            new ch.qos.logback.core.read.ListAppender<>();
+        appender.start();
+        lg.addAppender(appender);
+        try {
+            ChatMessageDto asst = assistant("", call("toolu_DUP"));
+            List<ChatMessageDto> in = List.of(user("hi"), asst);
+            // 同一 assistant 原始对象、同一缺失集合，连续三遍（模拟每次请求边界都重跑）
+            String idA = asst.id();
+            List<ChatMessageDto> out1 = ToolResultPairingRepair.ensureToolResultPairing(in);
+            List<ChatMessageDto> out2 = ToolResultPairingRepair.ensureToolResultPairing(
+                List.of(user("hi"), new ChatMessageDto(
+                    idA, null, Role.assistant, "assistant", "", null,
+                    List.of(call("toolu_DUP")), null, null, null, null, null, null, null,
+                    null, null, null, null, false, false)));
+            List<ChatMessageDto> out3 = ToolResultPairingRepair.ensureToolResultPairing(
+                List.of(user("hi"), new ChatMessageDto(
+                    idA, null, Role.assistant, "assistant", "", null,
+                    List.of(call("toolu_DUP")), null, null, null, null, null, null, null,
+                    null, null, null, null, false, false)));
+
+            long warns = appender.list.stream()
+                .filter(e -> e.getLevel() == ch.qos.logback.classic.Level.WARN)
+                .filter(e -> String.valueOf(e.getFormattedMessage()).contains("配对修复"))
+                .count();
+            assertThat(warns).as("同一 (assistant, 缺失集合) 只应 WARN 一次").isEqualTo(1);
+
+            // ⭐ 关键：降噪不得影响修复 —— 三次都必须补齐合成结果
+            assertThat(out1).hasSize(3);
+            assertThat(out2).hasSize(3);
+            assertThat(out3).hasSize(3);
+            assertThat(out1.get(2).content()).isEqualTo(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER);
+            assertThat(out3.get(2).content()).isEqualTo(ToolResultPairingRepair.SYNTHETIC_TOOL_RESULT_PLACEHOLDER);
+        } finally {
+            lg.detachAppender(appender);
+        }
+    }
 }

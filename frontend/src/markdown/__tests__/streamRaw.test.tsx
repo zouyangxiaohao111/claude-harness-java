@@ -183,14 +183,18 @@ describe('[stream-raw] 样式契约：注入真 CSS 后读**计算值**（DOM �
     expect(cssText.length).toBeGreaterThan(100_000)
   })
 
-  it('.md-stream-raw 的计算值 white-space=pre-wrap（换行不被折叠）', () => {
+  // ⚠️ 显式放宽超时（2026-11-02）：本用例把**整个 globals.css**（已 480KB+）注入 jsdom 并读计算值，
+  //   单跑约 2s，但全量并行时机器被占满 ⇒ 超过 vitest 默认的 5s 上限 ⇒ 报「Test timed out」。
+  //   ⛔ 不能靠删 CSS 解决（globals.css 是生产真样式，删了样式就没人守了）；
+  //   ⛔ 也不能靠「单跑通过」掩盖（全量红 = CI 红）。给足超时即可。
+  it('.md-stream-raw 的计算值 white-space=pre-wrap（换行不被折叠）', { timeout: 30000 }, () => {
     const { raw } = mount()
     const cs = window.getComputedStyle(raw)
     expect(cs.whiteSpace).toBe('pre-wrap')
     expect(cs.wordBreak).toBe('break-word')
   })
 
-  it('回退线完整：D1 的 <pre class="md-stream-degraded"> 同样拿到 pre-wrap', () => {
+  it('回退线完整：D1 的 <pre class="md-stream-degraded"> 同样拿到 pre-wrap', { timeout: 30000 }, () => {
     // 该规则曾被 [stream-raw] 的重命名连带删掉（D1 路径在生产已不可达），而 `MarkdownText` 的
     // `STREAM_DEGRADE_CLASS`／产出 `<pre className={STREAM_DEGRADE_CLASS}>` 一直在（为支持一行回退）
     // ⇒ 回退后一旦命中 D1 降级，`<pre>` 会落到 `.msg .content pre`（0,2,1，**不设 white-space**）

@@ -10,36 +10,49 @@
  */
 import { FormModal } from './FormModal'
 import type { Model, ModelType } from '@/api/types'
-import { tagToClass } from '@/data'
 
 interface ModelFormModalProps {
   initial: Model
-  /** The provider's display name (e.g. "OpenAI") for the locked-tag chip */
-  providerName?: string
+  /**
+   * 提供商标识（tag · 如 DS / CL / GP）—— 只用于标题括号。
+   *
+   * <p>tag 由父级 provider 决定，用户不能在这里改 ⇒ 不是表单字段，只作上下文展示。
+   */
+  providerTag?: string
+  /** 新建 / 编辑：只影响标题文案（同一组件两处复用） */
+  mode?: 'create' | 'edit'
   onSave: (m: Model) => void
   onCancel: () => void
   onDelete?: () => void
 }
 
 // Note: the model `tag` (e.g. 'DS' / 'CL' / 'GP' / 'QW') used to be user-editable
-// here via a <select>. It is now LOCKED to the parent provider's tag — see the
-// `.fm-locked-tag` chip in the 基础 section. The historical DS/CL/GP/QW option
-// list is intentionally NOT kept here to avoid drift; if you need to migrate a
-// model between providers, do that at the provider level.
+// here via a <select>. 2026-11-01：编辑/添加模型弹窗里的「提供商标识」只读块也一并移除 ——
+// 它是**上下文**不是字段（用户不能在此改），改为显示在弹窗副标题里。
+// The historical DS/CL/GP/QW option list is intentionally NOT kept here to avoid drift.
 
-const TYPE_OPTIONS: { value: ModelType; label: string }[] = [
-  { value: 'chat', label: 'Chat · 文本对话（默认）' },
-  { value: 'text', label: 'Text · 文本补全' },
-  { value: 'vision', label: 'Vision · 图像理解' },
-  { value: 'multimodal', label: 'Multimodal · 多模态' },
-  { value: 'image_generation', label: 'Image Generation · 图像生成' },
-  { value: 'embedding', label: 'Embedding · 向量嵌入' },
-  { value: 'audio', label: 'Audio · 语音识别/合成' },
-  { value: 'rerank', label: 'Rerank · 重排序' },
-  { value: 'moderation', label: 'Moderation · 审核' },
+/**
+ * 模型类型选项（卡片式单选）。
+ *
+ * <p><b>为什么不用原生下拉</b>：模型类型是「**能力**」不是枚举常量 —— 用户需要看懂
+ * 「Embedding（向量嵌入）」和「Rerank（重排序）」的区别，而不是在一行文字后面展开 9 个选项去找。
+ * 卡片式把 9 个选项铺成 3×3 一屏看全，每项带中文说明。
+ *
+ * <p>⚠️ `desc` 是给用户看的说明，**不参与 wire 契约** —— wire 值仍是 `ModelType` 枚举本身。
+ */
+const TYPE_OPTIONS: { value: ModelType; label: string; desc: string }[] = [
+  { value: 'chat', label: 'Chat', desc: '文本对话（默认）' },
+  { value: 'text', label: 'Text', desc: '文本补全' },
+  { value: 'vision', label: 'Vision', desc: '图像理解' },
+  { value: 'multimodal', label: 'Multimodal', desc: '多模态' },
+  { value: 'image_generation', label: 'Image Generation', desc: '图像生成' },
+  { value: 'embedding', label: 'Embedding', desc: '向量嵌入' },
+  { value: 'audio', label: 'Audio', desc: '语音识别/合成' },
+  { value: 'rerank', label: 'Rerank', desc: '重排序' },
+  { value: 'moderation', label: 'Moderation', desc: '审核' },
 ]
 
-export function ModelFormModal({ initial, providerName, onSave, onCancel, onDelete }: ModelFormModalProps) {
+export function ModelFormModal({ initial, providerTag, mode = 'edit', onSave, onCancel, onDelete }: ModelFormModalProps) {
   // 三套配置页：embedding / rerank 各一套，其余（chat/text/vision/multimodal/…）共用生成参数。
   const isEmbedding = (v: Record<string, any>) => v.type === 'embedding'
   const isRerank = (v: Record<string, any>) => v.type === 'rerank'
@@ -63,7 +76,10 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
 
   return (
     <FormModal<Model>
-      title="编辑模型"
+      // 提供商标识不进表单（它是**上下文**，不是可填字段）⇒ 放在标题括号里，
+      // 例如「添加模型（DS）」。只显示 tag 本身，不重复显示 provider 名 ——
+      // provider 名可从「设置 → 提供商」看到，弹窗标题塞两个名字会过长。
+      title={`${mode === 'create' ? '添加' : '编辑'}模型${providerTag ? `（${providerTag}）` : ''}`}
       subtitle={initial.alias || initial.name || '新模型'}
       initial={initial}
       sections={[
@@ -74,25 +90,19 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
               { type: 'text', name: 'name', label: '模型名称', placeholder: 'e.g. deepseek-v3.2' },
               { type: 'text', name: 'alias', label: '别名', placeholder: 'e.g. DS-V3', hint: '显示在选择器中' },
             ],
-            [
-              {
-                type: 'locked',
-                label: '提供商标识',
-                render: () => (
-                  <div className="fm-locked-tag" title="tag 由父级 provider 决定，不能在此切换">
-                    <span className={`model-tag ${tagToClass(initial.tag)}`}>{initial.tag}</span>
-                    <span className="locked-tag-name">{providerName ?? initial.tag}</span>
-                    <span className="locked-tag-hint">· 通过提供商添加</span>
-                  </div>
-                ),
-              },
-            ],
           ],
         },
         {
           title: '类型',
           fields: [
-            { type: 'select', name: 'type', label: '模型类型', options: TYPE_OPTIONS, hint: '决定模型支持的能力（文本/图像/多模态/嵌入…）' },
+            {
+              type: 'radio-cards',
+              name: 'type',
+              label: '模型类型',
+              options: TYPE_OPTIONS,
+              columns: 3,
+              hint: '决定模型支持的能力（文本/图像/多模态/嵌入…）· 切换类型后下方参数区会自动切换',
+            },
           ],
         },
         {
@@ -135,7 +145,11 @@ export function ModelFormModal({ initial, providerName, onSave, onCancel, onDele
         {
           // [2026-10-22] 模型级「额外请求体」：后端逐键合并进请求体（只增/覆盖同名键，不替换整包）。
           //   think 字段保持原样（不动），本字段是独立通道。
+          // [2026-11-01] 改为**折叠**（默认收起）：这是极少数人才用的高级项，一直摊开会把
+          //   名称/类型/参数挤到上面，每次编辑都要往下滚。已有值时才默认展开（用户能立刻看到现状）。
           title: '高级 · 额外请求体（extraBody）',
+          collapsible: { defaultOpen: !!(initial.extraBody ?? '').trim() },
+          collapsedHint: '按 key 合并进请求体 · 例 {"reasoning": true}',
           fields: [
             {
               type: 'json',

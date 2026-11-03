@@ -3,6 +3,7 @@ import { projectApi, type FileContent } from '@/api/projects'
 import { ApiError } from '@/api/rest'
 import { monaco, monacoLangOf, MONACO_COMMON_OPTS } from '@/utils/monaco'
 import { openStandalone } from '@/utils/standalonePreview'
+import { MarkdownText } from '@/markdown/MarkdownText'
 
 interface FileViewModalProps {
   /** 项目 id（读文件） */
@@ -27,6 +28,18 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
   const editorRef = useRef<monaco.editor.IStandaloneCodeEditor | null>(null)
   const boxRef = useRef<HTMLDivElement>(null)
   const isHtml = /\.html?$/i.test(path)
+  /**
+   * [2026-11-02 用户实测「项目下面的 md 系列文档没有预览」] Markdown 三态。
+   *
+   * <p><b>WHY</b>：本组件原先把**所有**文本文件都丢进 Monaco（连只读态也是代码视图），
+   * 而 md 在项目里是最常看的文档格式 —— 打开满屏 `#` / `**` 源码等于没有预览能力。
+   * 产物侧（ArtifactPreviewModal）早已有「预览/源码/编辑」三态，这里对齐同一套交互：
+   * 默认**预览**（渲染后的 Markdown），要改再切「编辑」，想看原文切「源码」。
+   *
+   * <p>非 Markdown 文件不显示切换（没有「渲染后」形态可言），保持原有单态 Monaco。
+   */
+  const isMarkdown = /\.(md|markdown|mdx)$/i.test(path)
+  const [mdMode, setMdMode] = useState<'preview' | 'source' | 'edit'>('preview')
 
   // 读取文件（纯文本；html 也需要 content 供「运行」独立窗）
   useEffect(() => {
@@ -44,6 +57,9 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
 
   // Monaco 生命周期：data 就绪后创建编辑器（默认只读查看）
   useEffect(() => {
+    // [2026-11-02] Markdown **预览态不创建编辑器**（那正是「打开就是源码」的根因）。
+    //   只有非 markdown，或 markdown 切到 source/edit 时才挂载 Monaco。
+    if (isMarkdown && mdMode === 'preview') return
     if (!boxRef.current || !data) return
     const ed = monaco.editor.create(boxRef.current, {
       value: data.content,
@@ -53,7 +69,8 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
     })
     editorRef.current = ed
     return () => { ed.dispose(); editorRef.current = null }
-  }, [data, path])
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [data, path, isMarkdown, mdMode === 'preview'])
 
   const toggleEdit = () => {
     const next = !editing
@@ -70,11 +87,26 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
       setData((prev) => (prev ? { ...prev, content } : prev))
       setEditing(false)
       editorRef.current?.updateOptions({ readOnly: true })
+      // [2026-11-02] Markdown 保存后回预览（改完最想看到的是渲染结果，与产物侧同口径）
+      if (isMarkdown) setMdMode('preview')
     } catch (e) {
       setError(e instanceof ApiError ? e.userMessage() : String(e))
     } finally {
       setSaving(false)
     }
+  }
+
+  /**
+   * Markdown 编辑态取消：丢弃 Monaco 里的改动，回到预览。
+   *
+   * <p>⚠️ 必须把编辑器内容**重置回 data.content**：`mdMode` 从 edit 切回 preview 时
+   * Monaco 会被卸载（effect 提前 return），下次再进编辑会按 `data.content` 重建 ——
+   * 若不重置，用户会看到自己「取消」掉的草稿又回来了。
+   */
+  const cancelMdEdit = () => {
+    editorRef.current?.setValue(data?.content ?? '')
+    setMdMode('preview')
+    setError(null)
   }
 
   const fileName = path.split('/').pop() ?? path
@@ -100,16 +132,47 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
             {editing && <span className="file-view-edit-badge">编辑中</span>}
           </div>
           <div className="file-view-actions">
+            {/* [2026-11-02] Markdown 三态：默认预览（渲染后），可切源码 / 编辑 */}
+            {isMarkdown && data && mdMode !== 'edit' && (
+              <div className="artifact-mode-switch" role="group" aria-label="查看模式">
+                <button
+                  className={`artifact-mode-btn${mdMode === 'preview' ? ' on' : ''}`}
+                  onClick={() => setMdMode('preview')}
+                  title="渲染预览"
+                >预览</button>
+                <button
+                  className={`artifact-mode-btn${mdMode === 'source' ? ' on' : ''}`}
+                  onClick={() => setMdMode('source')}
+                  title="查看 Markdown 原文"
+                >源码</button>
+              </div>
+            )}
             {isHtml && data && !editing && (
               <button className="diff-tbtn" onClick={runHtml} title="在独立窗口运行预览">运行</button>
             )}
-            {!editing ? (
-              <button className="diff-tbtn" onClick={toggleEdit} title="切换编辑模式（保存写回项目）">编辑</button>
+            {isMarkdown ? (
+              mdMode === 'edit' ? (
+                <>
+                  <button className="diff-tbtn save" onClick={() => void save()} disabled={saving}>{saving ? '保存中…' : '保存'}</button>
+                  <button
+                    className="diff-tbtn"
+                    onClick={cancelMdEdit}
+                    disabled={saving}
+                    title="放弃修改并回到预览"
+                  >取消</button>
+                </>
+              ) : (
+                <button className="diff-tbtn" onClick={() => setMdMode('edit')} title="编辑（保存写回项目）">编辑</button>
+              )
             ) : (
-              <>
-                <button className="diff-tbtn save" onClick={() => void save()} disabled={saving}>{saving ? '保存中…' : '保存'}</button>
-                <button className="diff-tbtn" onClick={toggleEdit} disabled={saving}>取消</button>
-              </>
+              !editing ? (
+                <button className="diff-tbtn" onClick={toggleEdit} title="切换编辑模式（保存写回项目）">编辑</button>
+              ) : (
+                <>
+                  <button className="diff-tbtn save" onClick={() => void save()} disabled={saving}>{saving ? '保存中…' : '保存'}</button>
+                  <button className="diff-tbtn" onClick={toggleEdit} disabled={saving}>取消</button>
+                </>
+              )
             )}
           </div>
           <button className="diff-close" onClick={close}>
@@ -118,11 +181,14 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
             </svg>
           </button>
         </div>
-        <div className="file-view-body monaco-body">
+        <div className={`file-view-body ${isMarkdown && mdMode === 'preview' ? 'md-preview-body' : 'monaco-body'}`}>
           {loading ? (
             <div className="file-view-empty">加载中…</div>
           ) : error ? (
             <div className="file-view-empty" style={{ color: 'var(--error-dark)' }}>{error}</div>
+          ) : isMarkdown && mdMode === 'preview' ? (
+            /* 默认态：渲染后的 Markdown（用户要「有预览」，不是满屏 # 和 **） */
+            <MarkdownText text={data?.content ?? ''} className="content md file-view-md" />
           ) : (
             <div ref={boxRef} className="monaco-box" />
           )}

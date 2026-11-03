@@ -70,6 +70,39 @@ public class WebFetchTool implements Tool {
 
     public static final String NAME = "WebFetch";
 
+    /**
+     * [2026-11-02 用户裁定「在 websearch / webfetch 中就存好当前」] 来源**当场入库**。
+     *
+     * <p><b>WHY 在工具里存，而不是轮末扫消息</b>：
+     * <ul>
+     *   <li>工具**本来就知道** url（入参就是它）；轮末再回头扫消息是绕远路；</li>
+     *   <li>存入时机 = 抓取成功那一刻 ⇒ 前端**即时**能看到来源，不用等轮末抽取；</li>
+     *   <li>不需要「结果 JSON 是什么形状」这层假设（轮末扫描要解析结果结构才拿得到 url）。</li>
+     * </ul>
+     *
+     * <p>{@code @Autowired(required=false)}：单测直构时无 bean ⇒ 跳过入库（工具行为零变化）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.session.SessionArtifactService artifactService;
+
+    /** 测试注入缝（生产走字段注入）。 */
+    public void setArtifactService(com.nexusai.application.session.SessionArtifactService svc) {
+        this.artifactService = svc;
+    }
+
+    /** 记一条来源（fail-soft：⛔ 采集失败绝不影响抓取结果返回）。 */
+    private void recordSource(com.nexusai.application.agent.tool.ToolUseContext ctx, String url) {
+        if (artifactService == null || ctx == null || ctx.sessionId() == null) {
+            return;
+        }
+        try {
+            String title = url;   // 标题稍后由前端/用户判断；url 本身已是可读标识
+            artifactService.recordSource(ctx.sessionId(), title, url, null);
+        } catch (Throwable t) {
+            log.warn("[WebFetchTool] 来源入库失败（不影响抓取） url={}: {}", url, t.toString());
+        }
+    }
+
     /** 弱模型摘要 querySource · 对齐 CC WebFetchTool/utils.ts:508 {@code querySource: 'web_fetch_apply'}。 */
     private static final String QUERY_SOURCE = "web_fetch_apply";
 
@@ -505,6 +538,8 @@ public class WebFetchTool implements Tool {
                 return handleRedirect(call, url, prompt, ri, start);
             }
             WebFetchSecurity.FetchedContent fc = (WebFetchSecurity.FetchedContent) outcome;
+            // [2026-11-02] 抓取成功 ⇒ 当场把该 URL 记为「来源」（不用等轮末抽取）
+            recordSource(ctx, url);
             boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
             // [S1-T7] agent 归因上下文 = **工具形参 ctx 的显式字段**（两套载体收口到 TUC 单一来源；
             //   工具线程上 ThreadLocal 不可达）。null → 等价 CC agentContext.ts:170 无 invokingRequestId。

@@ -79,11 +79,27 @@ export interface RequestOptions {
   method?: 'GET' | 'POST' | 'PUT' | 'PATCH' | 'DELETE'
   body?: unknown
   signal?: AbortSignal
+  /**
+   * 覆盖 Accept 头。缺省 = `application/json`。
+   *
+   * <p><b>WHY 需要这个口子（2026-11-02 实测「/compact 报 JSON 解析异常」）</b>：后端的
+   * `POST /command/builtins/compact/execute` 声明了 `produces="text/plain;charset=UTF-8"`，
+   * 而本函数此前**硬编码** `Accept: application/json` ⇒ HTTP 内容协商失败 ⇒ 406
+   * `HttpMediaTypeNotAcceptableException`。Spring 的 406 错误体既不是 JSON 也不是
+   * `text/plain` ⇒ 走不到上面那条 text/plain 放行分支 ⇒ 落到 `JSON.parse` 抛
+   * `SyntaxError: Unexpected token 'W'`（"Whitelabel Error Page" 的第一个字符）。
+   *
+   * <p>纯文本端点必须显式传 `'text/plain'`（或 `'*​/*'`），让协商放行。
+   */
+  accept?: string
 }
 
 export async function api<T>(path: string, opts: RequestOptions = {}, base: string = BASE_URL): Promise<T> {
-  const { method = 'GET', body, signal } = opts
-  const headers: Record<string, string> = { 'Accept': 'application/json', 'X-Client-Env': 'react' }
+  const { method = 'GET', body, signal, accept } = opts
+  const headers: Record<string, string> = {
+    'Accept': accept ?? 'application/json',
+    'X-Client-Env': 'react',
+  }
   if (body !== undefined) headers['Content-Type'] = 'application/json'
 
   let res: Response
@@ -110,11 +126,23 @@ export async function api<T>(path: string, opts: RequestOptions = {}, base: stri
   const raw = await res.text()
   if (!raw) return undefined as T
 
-  // text/plain（如 away-summary 返回纯文本摘要）→ 原样返回，其余 JSON → parse
+  // text/plain（如 away-summary 返回纯文本摘要、/compact 返回压缩结果）→ 原样返回
   const contentType = res.headers.get('Content-Type') ?? ''
   if (contentType.includes('text/plain')) return raw as unknown as T
 
-  return JSON.parse(raw) as T
+  // [2026-11-02 修] 非 JSON 响应体（HTML 错误页 / 代理插入的网关页）→ 显式报错，⛔ 不抛裸 SyntaxError。
+  //
+  // <p><b>WHY</b>：原实现 `return JSON.parse(raw)` 无 try。后端返回 Whitelabel Error Page（HTML）时，
+  // 用户会看到 `Unexpected token 'W', "Whitelabel"... is not valid JSON` —— 既看不出是哪个接口出错，
+  // 也看不出该怎么办。这里换成带状态码 + 路径 + 正文头 60 字的 ApiError，可直接定位。
+  try {
+    return JSON.parse(raw) as T
+  } catch {
+    throw new ApiError(
+      `响应不是合法 JSON（HTTP ${res.status} · ${contentType || '无 Content-Type'}）: ${raw.slice(0, 60).replace(/\s+/g, ' ')}…`,
+      { status: res.status, title: 'Invalid JSON Response', detail: `请求路径：${path}` },
+    )
+  }
 }
 
 export { BASE_URL }

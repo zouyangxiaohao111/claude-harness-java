@@ -17,6 +17,7 @@ import com.nexusai.application.agent.team.TeammateMessageFoldingChain;
 import com.nexusai.application.agent.tasks.MainSessionBackgroundService;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.agent.tasks.QueueEventPublisher;
+import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import jakarta.validation.Valid;
@@ -335,7 +336,16 @@ public class ChatController {
         // cancel-first（幂等，对齐 CC REPL.tsx:3777-3780）——裁剪前取消 in-flight 流，
         // 防本 turn 消息追加与裁剪竞态。
         chatService.cancelSession(sessionId, wsTemplate);
-        int deleted = messageService.trimSessionAfter(sessionId, messageId);
+        // [SQLITE_BUSY_SNAPSHOT 重试 2026-11-01] trimSessionAfter 是「先 SELECT 定位 pivot 再
+        //   DELETE」的延迟事务 —— WAL 下读事务升级为写事务时若快照已被其它连接写过，SQLite 直接
+        //   返回 SQLITE_BUSY_SNAPSHOT（busy_timeout 对这种情况无效，只能整段事务重来）。
+        //   实测：编辑用户消息重发偶发失败，前端「发送失败」toast 一闪而过。
+        //   ⚠️ 复用仓库既有的 SqliteBusyRetry（compact 5 条落库通道共用同一单点）—— 不再另写一套；
+        //   前提同上：必须在事务**外层**调用（每次 action.get() = 新事务），trimSessionAfter 自带
+        //   @Transactional 且本方法无外层事务，满足前提。
+        int deleted = SqliteBusyRetry.executeWithBusyRetry(
+            "trimAfter session=" + sessionId + " pivot=" + messageId,
+            () -> messageService.trimSessionAfter(sessionId, messageId));
         String newCid = UUID.randomUUID().toString();
         sessionService.updateConversationId(sessionId, newCid);
         if (log.isInfoEnabled()) {

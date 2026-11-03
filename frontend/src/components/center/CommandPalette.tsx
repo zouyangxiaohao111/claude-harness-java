@@ -56,6 +56,8 @@ export const COMMAND_ITEMS: CommandItem[] = [
   { name: 'agents', description: '管理后台运行的智能体' },
   { name: 'color', description: '切换主题配色' },
   { name: 'chrome', description: '连接 NexusAI in Chrome 浏览器扩展', type: 'local-jsx', hint: '/chrome' },
+  // [goal V253] 目标模式 · 后端 local 型命令（走 UserInputDispatcher 的 result handler）
+  { name: 'goal', description: '设定目标，持续执行直到条件满足', hint: '/goal <条件>' },
 ]
 
 /** name / 别名命中即视为已注册命令（slash 解析时直接执行，无需弹面板）· 已停用命令恒不命中 */

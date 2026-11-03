@@ -1,0 +1,58 @@
+-- ===================================================================
+-- V253: sessions 表加 goal（会话级目标状态 · /goal 模式）
+--
+-- 背景：CC 的 `activeGoal` 活在**进程内存**（claude.exe v2.1.212 `activeGoal:{condition,
+--   iterations, setAt, tokensAtStart}`，见 cli-wrapper 内 `Sor()` / `Aor()`）。
+--   本仓 Web 端每个 HTTP send 都是新的 LlmAgentLoop（prototype 作用域）⇒ 进程内存态
+--   活不过下一条用户消息 ⇒ 必须落到 sessions 表列
+--   （multi-session-vs-cc-single-session 铁律：todos V43 / effort_level V31 /
+--   disabled_tools V35 / team_context V40 / computer_use_grants V250 同款范式）。
+--
+-- goal TEXT（JSON 对象，可空；null = 该会话没有目标）：
+--   {
+--     "condition": "e2e/login.spec.ts 全部通过，且不修改测试断言",
+--     "phase": "active",
+--     "iterations": 2,
+--     "setAt": 1762300000000,
+--     "tokensAtStart": 145320,
+--     "lastReason": "尚未满足 — transcript 里只有单测通过"
+--   }
+--
+--   condition     目标条件原文（CC 语义，上限 4000 字符，超长拒绝设置）
+--   phase         active | achieved | impossible
+--                 ⚠️ 没有 DSH 的 paused/blocked —— 我们没有那两个入口（照 CC 只有
+--                   met / not-met / impossible 三种结局）
+--   iterations    已评估轮数（**纯记账**，不参与任何判断；CC 同款：goal 对象里没有
+--                 上限字段，max-turns 是评估器的替代品不是补充）
+--   setAt         目标设定时刻（epoch 毫秒）· resume 恢复时**重置**（CC 同款：
+--                 restoreGoalFromTranscript 重置 setAt / tokensAtStart 基线）
+--   tokensAtStart 设定时的**输出 token** 累计值（CC `DA()` 口径 = 各模型 outputTokens
+--                 之和，**不是总量**）· 恢复时同样重置
+--   lastReason    最近一次评估器返回的 reason（CC 侧即注入下一轮的那句话）
+--
+-- ⛔ 本列是「当前快照」，不是历史。历史/审计在 messages 表的 goal_status 附件里
+--   （transcript 本来就是 append-only，见 ChatService 的 recordTranscript 对齐段）。
+--   这与 DSH 的结构同构：DSH 把每次变更的整快照 append 进会话日志
+--   （packages/goal/goal/README.md:24「The session log is the only durable authority」），
+--   我们则是「列存当前值 + messages 存历史」，两个载体都是现成的。
+--
+-- 为什么不从 transcript 反推当前值（CC 的做法）：压缩会剪掉旧的 goal attachment，
+--   一旦「目标设定」那条落在压缩边界之前就再也恢复不出来。本列独立于消息生命周期，
+--   /compact 动不了它 ⇒ 恢复永远可靠。
+--
+-- 解析失败 → 降级为「无目标」+ warn（不抛），照抄 SessionService.getDisabledTools
+--   （domain/session/SessionService.java:612-629）的 fail-soft 读法。
+--
+-- ⚠️⚠️ 号段分工（**主线固定用 V250+ 号段**）：
+--   场景分支（feat/scene-fusion）占用 **V201–V208**（agri 批次）并可继续 **V209–V249**；
+--   主线 computer-use / goal 用 **V250+**；两段不得交叉。
+--   为什么必须隔离：场景分支**持有 master 的迁移文件** ⇒ 若主线与场景分支取到同一个
+--   版本号，场景分支下次 merge master 后**同一 jar 内会出现两个同号文件** ⇒ Flyway
+--   在 classpath 扫描阶段直接抛 "Found more than one migration with version N" ⇒
+--   **整库起不来**。本仓已因此踩坑两次（V75 / V78 撞号）。
+--
+-- ⚠️ 本文件注释**不得**出现「美元符 + 左大括号」的 Flyway 占位符字面量
+--    （application.yml 未关 flyway.placeholder-replacement，SQL 注释也在替换范围内
+--     ⇒ Flyway 会把它当未配置占位符并解析失败）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN goal TEXT;

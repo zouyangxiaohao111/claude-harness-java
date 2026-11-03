@@ -29,11 +29,26 @@ import static org.mockito.Mockito.mock;
  *
  * <p>本测试用 {@link ComputerUseToolConfig#resolvePlatform()} 的覆写点注入 macOS 平台
  * ⇒ <b>不依赖运行机器的操作系统</b>（开发机是 Windows 也能跑）。
+ *
+ * <h2>⚠️ 本仓在 CCB 的 24 个之上<b>新增 3 个</b>（有意偏离，如实标注）</h2>
+ * <p>CCB 的 macOS 没有元素级操作（{@code click_element} / {@code type_into_element} 在
+ * {@code caps.platform === 'win32'} 条件块里）。本仓在 macOS 上用 Accessibility（AXUIElement）
+ * 实现了同一契约（dsh {@code dsh-computer-use} 的路线），并补了配套的 {@code observe}：
+ * <ul>
+ *   <li>{@code observe} —— 读 AX 语义树，返回 observationId + 带序号/句柄的元素表；</li>
+ *   <li>{@code click_element} —— 按 observationId + index 执行 {@code AXPress}；</li>
+ *   <li>{@code type_into_element} —— 按 observationId + index 写 {@code AXValue} / {@code AXSelectedText}。</li>
+ *   <li>{@code confirm} —— 敏感动作的一次性确认令牌（dsh computer_confirm）；</li>
+ *   <li>{@code list_apps} —— 运行中应用列表（带 pid / 前台标记 / 授权状态）。</li>
+ *   <li>{@code perform_action} —— 执行元素声明的任意 AX 动作（AXExpand/AXShowMenu…）。</li>
+ *   <li>{@code wait_for} —— 按条件等待（文本/角色/标题出现）。</li>
+ * </ul>
+ * ⇒ macOS 工具面 = <b>24 + 7 = 31</b>。
  */
 class ComputerUseMacOsToolSurfaceTest {
 
-    /** CCB 的 macOS 工具面 = 35 − 11（Windows 专属）= 24 个（顺序 = CCB tools.ts 的顺序）。 */
-    private static final List<String> EXPECTED_24 = List.of(
+    /** macOS 工具面（CCB 的 24 个 + 本仓 AX 增补的 3 个；顺序 = 注册顺序）。 */
+    private static final List<String> EXPECTED_MACOS = List.of(
             "mcp__computer-use__request_access",
             "mcp__computer-use__screenshot",
             "mcp__computer-use__zoom",
@@ -48,7 +63,17 @@ class ComputerUseMacOsToolSurfaceTest {
             "mcp__computer-use__left_click_drag",
             "mcp__computer-use__mouse_move",
             "mcp__computer-use__open_application",
-            // ── CCB tools.ts:420-836 的 win32 条件块（11 个）在 macOS 上【不注册】──
+            // ── [本仓 macOS AX 增补] Accessibility 语义树观察与元素操作 ──
+            "mcp__computer-use__observe",
+            "mcp__computer-use__click_element",
+            "mcp__computer-use__type_into_element",
+            // ── [本仓 macOS AX 增补] 任意 AX 动作 + 条件等待（dsh perform_action / wait）──
+            "mcp__computer-use__perform_action",
+            "mcp__computer-use__wait_for",
+            // ── [本仓 macOS AX 增补] 敏感动作确认 + 应用列表（dsh computer_confirm / list_apps）──
+            "mcp__computer-use__confirm",
+            "mcp__computer-use__list_apps",
+            // ── CCB tools.ts:420-836 的 win32 条件块里，macOS 仍【不注册】的 9 个 ──
             "mcp__computer-use__switch_display",
             "mcp__computer-use__list_granted_applications",
             "mcp__computer-use__read_clipboard",
@@ -88,12 +113,12 @@ class ComputerUseMacOsToolSurfaceTest {
                 new ComputerUseMouseState(), new ComputerUseDisplayStore(),
                 new ComputerUseWindowBindingStore());
 
-        assertThat(tools).hasSize(24);
-        assertThat(tools.stream().map(Tool::name).toList()).isEqualTo(EXPECTED_24);
+        assertThat(tools).hasSize(EXPECTED_MACOS.size());
+        assertThat(tools.stream().map(Tool::name).toList()).isEqualTo(EXPECTED_MACOS);
     }
 
     @Test
-    @DisplayName("macOS 工具面里不含任何 Windows 专属工具")
+    @DisplayName("macOS 工具面里不含真正 Windows 专属的工具（click/type_into_element 除外：本仓有 AX 实现）")
     void macOsToolSurfaceHasNoWindowsOnlyTools() throws Exception {
         ComputerUseToolConfig config = new MacOsToolConfig();
         setEnabled(config, true);
@@ -106,10 +131,10 @@ class ComputerUseMacOsToolSurfaceTest {
                 new ComputerUseMouseState(), new ComputerUseDisplayStore(),
                 new ComputerUseWindowBindingStore());
 
+        // click_element / type_into_element【不在】此列：本仓用 AXPress / AXValue 在 macOS 上
+        // 实现了同一契约（见类注释），只是不复用 Windows 的 hwnd 绑定路径。
         List<String> windowsOnly = List.of(
                 "mcp__computer-use__window_management",
-                "mcp__computer-use__click_element",
-                "mcp__computer-use__type_into_element",
                 "mcp__computer-use__open_terminal",
                 "mcp__computer-use__bind_window",
                 "mcp__computer-use__activate_window",

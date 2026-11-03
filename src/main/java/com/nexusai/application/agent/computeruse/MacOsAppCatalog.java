@@ -48,6 +48,22 @@ public final class MacOsAppCatalog {
     public record AppInfo(String bundleId, String displayName, String path) {
     }
 
+    /**
+     * 运行中应用（含 pid 与前台标记）· 对齐 dsh {@code ComputerAppSummary}。
+     *
+     * @param bundleId    bundle id
+     * @param displayName 显示名
+     * @param pid         进程 id
+     * @param frontmost   是否为前台应用
+     * @param hidden      是否被隐藏
+     */
+    public record RunningApp(String bundleId,
+                            String displayName,
+                            long pid,
+                            boolean frontmost,
+                            boolean hidden) {
+    }
+
     private final ComputerUseProcessRunner runner;
 
     /** 生产构造器（真起进程）。 */
@@ -84,6 +100,56 @@ public final class MacOsAppCatalog {
             log.warn("[computer-use] macOS 运行中应用枚举异常: {}", e.toString());
             return List.of();
         }
+    }
+
+    /**
+     * 运行中应用（含 pid 与前台标记）· NSWorkspace 枚举。
+     *
+     * <p>与 {@link #listRunning()} 的差别：走 NSWorkspace（无需辅助功能权限）、
+     * 额外给出 pid 与前台标记 —— 对齐 dsh 的 {@code computer_list_apps}
+     * （{@code types.ts:52-56} 的 {@code ComputerAppSummary} 需要 pid 与 frontmost）。
+     *
+     * @return 应用列表（失败 ⇒ 空列表）
+     */
+    public List<RunningApp> listRunningWithPid() {
+        try {
+            ComputerUseProcessRunner.Result result = runner.run(List.of(
+                    "osascript", "-l", "JavaScript", "-e", MacOsJxa.runningApplicationsWithPid()));
+            if (!result.ok()) {
+                log.warn("[computer-use] macOS 运行中应用枚举（带 pid）失败（退出码 {}）: {}",
+                        result.exitCode(), result.stderr());
+                return List.of();
+            }
+            return parseRunningWithPid(result.stdout());
+        } catch (Exception e) {
+            log.warn("[computer-use] macOS 运行中应用枚举（带 pid）异常: {}", e.toString());
+            return List.of();
+        }
+    }
+
+    /** 解析 {@link #listRunningWithPid()} 的 JSON 输出。 */
+    List<RunningApp> parseRunningWithPid(String raw) {
+        List<RunningApp> out = new ArrayList<>();
+        if (raw == null || raw.isBlank()) {
+            return out;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode array = JSON.readTree(raw);
+            if (array == null || !array.isArray()) {
+                return out;
+            }
+            for (com.fasterxml.jackson.databind.JsonNode node : array) {
+                out.add(new RunningApp(
+                        node.path("bundleId").asText(""),
+                        node.path("displayName").asText(""),
+                        node.path("pid").asLong(0L),
+                        node.path("frontmost").asBoolean(false),
+                        node.path("hidden").asBoolean(false)));
+            }
+        } catch (Exception e) {
+            log.warn("[computer-use] 解析 macOS 运行中应用（带 pid）失败: {}", e.toString());
+        }
+        return out;
     }
 
     /**

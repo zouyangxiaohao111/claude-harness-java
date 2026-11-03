@@ -20,15 +20,26 @@ interface ArtifactPreviewModalProps {
  * 而产物的 {@code localPath} 是<b>归档副本</b>的绝对路径（{@code {configHome}/artifacts/<sessionId>/…}），
  * 不在任何项目根内 —— 走项目通道必然报「文件路径非法」。
  *
- * <p>渲染口径：markdown → MarkdownText；html → 沙箱 iframe（{@code sandbox=""} 禁脚本）；
- * 其余文本 → 原文 {@code <pre>}。二进制不会进本弹窗（App 侧改为复制路径 + 提示）。
+ * <p><b>三态（2026-11-01 用户要求「默认预览，可以选择编辑 / 打开源代码模式」）</b>：
+ * <ul>
+ *   <li><b>预览</b>（默认）：markdown → MarkdownText 渲染；html → 沙箱 iframe；其余文本 → {@code <pre>}；</li>
+ *   <li><b>源码</b>：原样文本（只读），便于核对 Markdown 原文；</li>
+ *   <li><b>编辑</b>：可直接改，保存 {@code PUT /content} 写回归档副本（不动项目源文件）。</li>
+ * </ul>
  *
- * <p>编辑：文本类产物可就地改并 {@code PUT /content} —— <b>写回归档副本</b>，不动项目源文件。
+ * <p>⛔ 旧实现的默认态取决于调用方传不传 {@code initialEdit}，且「非编辑」时 markdown 才渲染 ——
+ * 但用户看到的仍是「点开就是一块代码/文本框」的观感。现在把「预览」做成显式的默认模式。
  */
 export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false, close }: ArtifactPreviewModalProps) {
   const [data, setData] = useState<ArtifactContent | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [editing, setEditing] = useState(initialEdit)
+  /**
+   * 当前模式：preview（默认）/ source（只读源码）/ edit（可编辑）。
+   *
+   * <p>用户 2026-11-01：<b>默认预览</b>，需要时可切「编辑」或「源码」。
+   * 卡片上的「编辑」按钮仍走 {@code initialEdit=true} → 直接进 edit。
+   */
+  const [mode, setMode] = useState<'preview' | 'source' | 'edit'>(initialEdit ? 'edit' : 'preview')
   const [draft, setDraft] = useState('')
   const [saving, setSaving] = useState(false)
 
@@ -59,7 +70,7 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
     try {
       await artifactsApi.saveContent(sessionId, artifact.id, draft)
       setData((prev) => (prev ? { ...prev, content: draft } : prev))
-      setEditing(false)
+      setMode('preview')   // 保存后回到预览：用户改完最想看到的是渲染结果
     } catch (e) {
       setError(e instanceof ApiError ? e.userMessage() : String(e))
     } finally {
@@ -72,7 +83,7 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
   /** 可编辑 = 文本类（binary 产物后端 PUT /content 会 400 ⇒ 不给编辑入口） */
   const editable = !!data && !data.binary && data.content != null
   /** 真正进入编辑态：内容还没到 / 是二进制 ⇒ 不给编辑框（否则会显示一个空 textarea） */
-  const canEdit = editing && editable
+  const isEditing = mode === 'edit' && editable
 
   return (
     <div className="overlay-backdrop artifact-overlay" onClick={close}>
@@ -88,15 +99,41 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
             </span>
           )}
           <div className="artifact-modal-actions">
-            {!editing && editable && (
-              <button className="diff-tbtn" onClick={() => setEditing(true)} title="编辑（保存写回归档副本）">编辑</button>
+            {/* 模式切换：预览 / 源码（编辑/源码互斥，二者都是对原文的操作） */}
+            {editable && mode !== 'edit' && (
+              <div className="artifact-mode-switch" role="group" aria-label="查看模式">
+                <button
+                  className={`artifact-mode-btn${mode === 'preview' ? ' on' : ''}`}
+                  onClick={() => setMode('preview')}
+                  title="渲染预览"
+                >
+                  预览
+                </button>
+                <button
+                  className={`artifact-mode-btn${mode === 'source' ? ' on' : ''}`}
+                  onClick={() => setMode('source')}
+                  title="查看源代码"
+                >
+                  源码
+                </button>
+              </div>
             )}
-            {canEdit && (
+            {mode !== 'edit' && editable && (
+              <button className="diff-tbtn" onClick={() => setMode('edit')} title="编辑（保存写回归档副本）">编辑</button>
+            )}
+            {isEditing && (
               <>
                 <button className="diff-tbtn save" onClick={() => void save()} disabled={saving}>
                   {saving ? '保存中…' : '保存'}
                 </button>
-                <button className="diff-tbtn" onClick={() => setEditing(false)} disabled={saving}>取消</button>
+                <button
+                  className="diff-tbtn"
+                  onClick={() => { setDraft(data?.content ?? ''); setMode('preview') }}
+                  disabled={saving}
+                  title="放弃修改并回到预览"
+                >
+                  取消
+                </button>
               </>
             )}
             <button className="artifact-modal-close" onClick={close} aria-label="关闭">✕</button>
@@ -106,13 +143,16 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
           {!data && !error && <div className="artifact-modal-state">正在读取产物内容…</div>}
           {error && <div className="artifact-modal-state artifact-modal-error">{error}</div>}
           {data?.binary && <div className="artifact-modal-state">二进制产物无法在浏览器预览</div>}
-          {canEdit ? (
+          {isEditing ? (
             <textarea
               className="artifact-modal-editor"
               value={draft}
               onChange={(e) => setDraft(e.target.value)}
               spellCheck={false}
             />
+          ) : mode === 'source' && data && !data.binary ? (
+            /* 源码模式：原样文本（只读）—— 用户要核对 Markdown 原文时用 */
+            <pre className="artifact-modal-pre">{data.content ?? ''}</pre>
           ) : data && !data.binary && data.content != null && (
             isMarkdown
               ? <MarkdownText text={data.content} className="content md artifact-modal-md" />

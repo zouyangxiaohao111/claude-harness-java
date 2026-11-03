@@ -1,5 +1,7 @@
 package com.nexusai.application.agent.computeruse;
 
+import java.util.List;
+
 /**
  * 前台应用解析器 · 供 computer-use 的<b>档位门控</b>判定「当前动作打向哪个应用」。
  *
@@ -25,4 +27,25 @@ public interface ComputerUseForegroundAppResolver {
      *         "No frontmost app (rare — login window?). Let it through."）
      */
     String currentAppId();
+
+    /**
+     * 取当前前台应用的全部<b>可用授权键别名</b>（首个 = {@link #currentAppId()}）。
+     *
+     * <h2>WHY 需要多个别名（本仓 macOS 的必需修正）</h2>
+     * <p>Windows 上授权键与前台判定键天然同源（都是 exe 名）⇒ 精确匹配就够。
+     * <b>macOS 不是</b>：前台应用同时有<b>稳定</b>的 bundle id（{@code com.apple.finder}）
+     * 和<b>随系统语言变化</b>的显示名（中文系统是「访达」，英文是 {@code Finder}）。
+     * <br>⇒ 只按其中一个匹配必然在某些语言下 miss（实测：授权 {@code Finder} 后，
+     * 中文系统上报「访达」不在白名单，所有输入动作被误拦）。
+     * <p>⇒ 让解析器把<b>所有等价键</b>都给出来，门控（{@link ComputerUseInputGate}）
+     * 用「命中任一即授权」的语义匹配。
+     *
+     * <p>默认实现返回 {@code [currentAppId()]}（Windows 等单键平台无需覆写）。
+     *
+     * @return 别名列表（<b>可能为空</b> = 取不到前台应用 ⇒ 调用方放行）
+     */
+    default List<String> currentAppAliases() {
+        String single = currentAppId();
+        return (single == null || single.isBlank()) ? List.of() : List.of(single);
+    }
 }

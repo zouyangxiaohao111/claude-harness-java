@@ -8,13 +8,14 @@
  * <p>桌面壳（Tauri）走 {@code openUrl} 交给系统浏览器；浏览器/dev 走 {@code window.open} 新标签。
  */
 import { artifactsApi, artifactRawUrl } from '@/api/artifacts'
-import { artifactKindOf, isTextArtifact } from '@/utils/artifactKind'
+import { artifactKindOf, isTextArtifact, type ArtifactLike } from '@/utils/artifactKind'
 import type { PreviewType } from '@/utils/standalonePreview'
 
 /**
  * 产物「点开」的分发口径（用户 2026-10-31 裁定 · 纯函数 · 可单测）。
  *
  * <ul>
+ *   <li>{@code open-directory}：目录 ⇒ 桌面端打开所在目录（资源管理器）/ 浏览器端复制路径 + 说明；</li>
  *   <li>{@code view-html}：html ⇒ 走我们现有的 html 预览（源码查看/编辑/保存/运行 + 在浏览器中打开）；</li>
  *   <li>{@code standalone}：docx/xlsx/pdf/图片 ⇒ 走**现有渲染**（DocxPreview / ExcelPreview / PdfPreview / 图片）；</li>
  *   <li>{@code preview-text}：md / 其它文本 ⇒ Markdown 渲染 + 编辑保存；</li>
@@ -22,19 +23,26 @@ import type { PreviewType } from '@/utils/standalonePreview'
  * </ul>
  */
 export type ArtifactOpenAction =
+  | { kind: 'open-directory' }
   | { kind: 'view-html' }
   | { kind: 'standalone'; previewType: PreviewType }
   | { kind: 'preview-text' }
   | { kind: 'unsupported' }
 
-/** 按产物标题（扩展名）判定点开方式。 */
-export function artifactOpenActionOf(title: string): ArtifactOpenAction {
-  const kind = artifactKindOf(title)
+/**
+ * 按产物类型判定点开方式。
+ *
+ * @param a 产物（标题 + 归档副本路径 + 目录标记）
+ */
+export function artifactOpenActionOf(a: ArtifactLike): ArtifactOpenAction {
+  const kind = artifactKindOf(a)
+  // 目录排最前：目录既不能预览也不能编辑，点开 = 打开所在目录
+  if (kind === 'dir') return { kind: 'open-directory' }
   if (kind === 'html') return { kind: 'view-html' }
   if (kind === 'docx' || kind === 'xlsx' || kind === 'pdf' || kind === 'img') {
     return { kind: 'standalone', previewType: kind === 'img' ? 'image' : kind }
   }
-  if (isTextArtifact(title)) return { kind: 'preview-text' }
+  if (isTextArtifact(a)) return { kind: 'preview-text' }
   return { kind: 'unsupported' }
 }
 

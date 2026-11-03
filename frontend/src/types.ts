@@ -129,7 +129,6 @@ export type SettingsTab =
   | 'env'
   | 'model'
   | 'providers'
-  | 'skills'
   | 'mcp'
   | 'database'
   | 'schedules'

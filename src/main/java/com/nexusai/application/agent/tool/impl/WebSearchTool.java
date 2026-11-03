@@ -146,6 +146,41 @@ public class WebSearchTool implements Tool {
     public static final String NAME = ToolNameConstants.WEB_SEARCH_TOOL_NAME;
 
     /**
+     * [2026-11-02 用户裁定「在 websearch / webfetch 中就存好当前」] 搜索结果**当场入库为来源**。
+     *
+     * <p><b>WHY 在工具里存</b>：hits 本来就带 {@code title + url}；轮末再扫消息解析结果 JSON
+     * 是绕远路，而且依赖「结果形状」这个假设。存入时机 = 搜索成功那一刻 ⇒ 前端即时可见。
+     *
+     * <p>{@code @Autowired(required=false)}：单测直构时无 bean ⇒ 跳过（工具行为零变化）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.session.SessionArtifactService artifactService;
+
+    /** 测试注入缝（生产走字段注入）。 */
+    public void setArtifactService(com.nexusai.application.session.SessionArtifactService svc) {
+        this.artifactService = svc;
+    }
+
+    /** 批量记来源（fail-soft：⛔ 采集失败绝不影响搜索结果返回）。 */
+    private void recordSources(com.nexusai.application.agent.tool.ToolUseContext ctx, List<SearchHit> hits) {
+        if (artifactService == null || ctx == null || ctx.sessionId() == null || hits == null || hits.isEmpty()) {
+            return;
+        }
+        String sid = ctx.sessionId();
+        for (SearchHit hit : hits) {
+            if (hit.url() == null || hit.url().isBlank()) {
+                continue;
+            }
+            try {
+                String title = hit.title() != null && !hit.title().isBlank() ? hit.title() : hit.url();
+                artifactService.recordSource(sid, title, hit.url(), null);
+            } catch (Throwable t) {
+                log.warn("[WebSearchTool] 来源入库失败（不影响搜索） url={}: {}", hit.url(), t.toString());
+            }
+        }
+    }
+
+    /**
      * 引擎结果条数内部上限 · 对齐 CC {@code max_uses: 8}（WebSearchTool.ts:82，API server tool
      * 固定搜索次数）语义的 Java 端输出上限——非用户输入参数（D-TR-H1-06 删 max_results）。
      */
@@ -664,6 +699,8 @@ public class WebSearchTool implements Tool {
             // 失败降级为简单摘要文本（仍在 results 末项），搜索不中断
             boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
             String commentary = summarizeHits(query, hits, ctx, isNonInteractive);
+            // [2026-11-02] 搜索成功 ⇒ 当场把 hits 记为「来源」
+            recordSources(ctx, hits);
             return ToolResult.success(call.id(), buildOutput(query, call.id(), hits, commentary, durationSeconds));
         } catch (Exception e) {
             log.warn("[WebSearchTool] 搜索失败: query='{}' engine={} err={}",

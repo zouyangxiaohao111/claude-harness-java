@@ -117,7 +117,8 @@ class CommandControllerBuiltInCommandsTest {
     void listBuiltins_returnsElevenWithType() throws Exception {
         mockMvc.perform(get("/api/command/builtins"))
             .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(11))
+            // [goal V253] 内置命令 11 → 12（新增 /goal · 对齐 CC claude.exe v2.1.212 的 goal 斜杠命令）
+            .andExpect(jsonPath("$.length()").value(12))
             .andExpect(jsonPath("$[0].name").value("clear"))
             // type gap 修复：BuiltInCommandDto 携带 type（CommandDto 无 type 字段）
             .andExpect(jsonPath("$[0].type").value("local"))
@@ -132,7 +133,10 @@ class CommandControllerBuiltInCommandsTest {
             // [E2] effort 命令注册（type='local-jsx' + argumentHint 对齐 CC effort/index.ts:4-13）
             .andExpect(jsonPath("$[10].name").value("effort"))
             .andExpect(jsonPath("$[10].type").value("local-jsx"))
-            .andExpect(jsonPath("$[10].argumentHint").value("[low|medium|high|max|auto]"));
+            .andExpect(jsonPath("$[10].argumentHint").value("[low|medium|high|max|auto]"))
+            // [goal V253] /goal · local 型（走 UserInputDispatcher 的 result handler）
+            .andExpect(jsonPath("$[11].name").value("goal"))
+            .andExpect(jsonPath("$[11].type").value("local"));
     }
 
     @Test
@@ -200,10 +204,10 @@ class CommandControllerBuiltInCommandsTest {
     @DisplayName("路由 literal-priority：GET /api/command/builtins 命中内置端点（而非 /{id}）")
     void route_literalBuiltins_winsOverPathVariable() throws Exception {
         // 若 Spring 把 /builtins 匹配到 getById(id="builtins")，则返回 404（getById mock 抛未找到）
-        // —— 本断言 200 + 11 条证明 literal 优先（Spring literal > path variable）。
+        // —— 本断言 200 + 12 条证明 literal 优先（Spring literal > path variable）。
         mockMvc.perform(get("/api/command/builtins"))
             .andExpect(status().isOk())
-            .andExpect(jsonPath("$.length()").value(11));
+            .andExpect(jsonPath("$.length()").value(12));
     }
 
     @Test

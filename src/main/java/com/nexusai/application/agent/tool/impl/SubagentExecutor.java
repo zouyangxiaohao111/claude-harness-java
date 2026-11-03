@@ -7132,6 +7132,19 @@ public class SubagentExecutor {
         if (msg.isCompactSummary()) {
             map.put("isCompactSummary", true);
         }
+        // [2026-11-02] 系统注入三件套（isMeta / author）· CC original: msg.isMeta / msg.author
+        //
+        //   WHY（用户实测「<system-reminder> 被渲染成用户气泡」）：subtype 上面已写，但消费侧
+        //   仍无法区分「用户真打的字」与「系统注入的 meta 行」—— 因为 skill_listing /
+        //   edited_text_file / date_change / changed_files / hook 回执这些行在 DTO 里都是
+        //   role=user，缺 isMeta 时右栏只能当普通提问渲染（实测把几 KB 的技能清单渲染成用户气泡）。
+        //   惰性写入（null / false 不落键）· 读侧缺省 false/null 与 CC undefined 同义。
+        if (msg.isMeta()) {
+            map.put("isMeta", true);
+        }
+        if (msg.author() != null) {
+            map.put("author", msg.author());
+        }
         return map;
     }
 }

@@ -80,7 +80,33 @@ public final class ToolResultPairingRepair {
 
     private static final Logger log = LoggerFactory.getLogger(ToolResultPairingRepair.class);
 
+    /**
+     * 已报过的「悬挂签名」（{@code assistantMsgId|missingIds}）· <b>只影响日志级别，不影响修复</b>。
+     *
+     * <p><b>WHY（2026-11-01 用户实测）</b>：同一对 (assistant, 缺失 id) 在每次请求边界都会重新命中
+     * ——本机实测一条 assistant 连刷 8~9 次 WARN，三个会话累计 390 行，把真问题淹掉（用户的困惑
+     * 「经常出现，不应该啊」正是被这种刷屏放大的）。首次出现保留 WARN（那是需要人看的），
+     * 后续同签名降 DEBUG（现场仍可查，默认日志不再刷屏）。
+     *
+     * <p>⚠️ <b>只降日志级别，配对修复行为一字不改</b>：合成占位、剥离孤儿等全部照常执行。
+     * 有界（{@value #MAX_REPORTED}）——超出即整体清空，避免长跑进程无限增长；清空后最坏情况是
+     * 各签名各再报一次 WARN，可接受。
+     */
+    private static final Set<String> REPORTED_PAIRS = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** 悬挂签名集合上限（见 {@link #REPORTED_PAIRS}）。 */
+    private static final int MAX_REPORTED = 512;
+
     private ToolResultPairingRepair() {
+    }
+
+    /** 该 (assistant, 缺失集合) 是否首次出现（首次 → 保留 WARN；否则 → 降 DEBUG）。 */
+    private static boolean firstTimeReporting(String assistantId, List<String> missingIds) {
+        String sig = assistantId + "|" + missingIds;
+        if (REPORTED_PAIRS.size() > MAX_REPORTED) {
+            REPORTED_PAIRS.clear();
+        }
+        return REPORTED_PAIRS.add(sig);
     }
 
     /**
@@ -249,10 +275,25 @@ public final class ToolResultPairingRepair {
 
             repaired = true;
 
-            log.warn("[ToolResultPairingRepair] 配对修复: 悬挂 tool_use={} 孤儿 tool_result={} 重复结果={} "
-                    + "无 id 结果={} · session={} assistantMsgId={}",
-                missingIds, orphanedIds, duplicateResults, nullIdCount,
-                assistantMsg.sessionId(), assistantMsg.id());
+            // [2026-11-01 降噪] 同一 (assistant, 缺失集合) 首次 WARN、其余 DEBUG —— 理由见
+            //   REPORTED_PAIRS 的 WHY（本机实测单条刷 8~9 次、三会话 390 行）。⛔ 只调级别，
+            //   下面的合成/剥离逻辑完全照常执行。
+            if (firstTimeReporting(assistantMsg.id(), missingIds)) {
+                log.warn("[ToolResultPairingRepair] 配对修复: 悬挂 tool_use={} 孤儿 tool_result={} 重复结果={} "
+                        + "无 id 结果={} · session={} assistantMsgId={} · {}",
+                    missingIds, orphanedIds, duplicateResults, nullIdCount,
+                    assistantMsg.sessionId(), assistantMsg.id(),
+                    // [2026-11-01 抓现行] 只补观测，不改行为。用于回答「数据完好却报悬挂」时唯一还缺的事实：
+                    //   缺失的 tool_use 在**本列表**里到底是「整条不存在」还是「存在但不在相邻区段」。
+                    //   DB 侧已证 102/102 结果行都在、且紧邻 —— 故若这里报 NOT_IN_LIST，就是运行期
+                    //   丢行（构造/过滤路径）；若是 [3] 这类下标，就是**顺序**问题（插入/重排）。
+                    describeMissingContext(messages, i, missingIds, presentIdSet));
+            } else if (log.isDebugEnabled()) {
+                log.debug("[ToolResultPairingRepair] 同一 (assistant, 缺失集合) 已报过 WARN，本次降级: "
+                        + "assistantMsgId={} missing={} · {}",
+                    assistantMsg.id(), missingIds,
+                    describeMissingContext(messages, i, missingIds, presentIdSet));
+            }
 
             // 3) 合成结果前置（CC :5836 `[...syntheticBlocks, ...content]`）
             for (String id : missingIds) {
@@ -295,6 +336,67 @@ public final class ToolResultPairingRepair {
             log.debug("[ToolResultPairingRepair] 修复完成: {} → {} 条", messages.size(), result.size());
         }
         return result;
+    }
+
+    /**
+     * 诊断串（<b>只观测，不参与任何判定</b>）· 回答「缺失的 tool_use 在本列表里到底在不在」。
+     *
+     * <p><b>WHY 需要它（2026-11-01 用户实测）</b>：同一个 assistant 的配对警告反复出现，而 DB 侧
+     * 全量核对是<b>完好的</b>（102/102 的 tool 结果行都在、385/385 紧邻 assistant、全库 2236 个
+     * tool_call 只有 1 条真缺结果且不在告警集合里）。即「数据对、进 provider 的列表不对」。
+     * 现有日志只报「缺了哪些 id」，分不出下面两种截然不同的根因：
+     * <ul>
+     *   <li><b>NOT_IN_LIST</b> —— 该 tool 结果行<b>根本不在本列表</b> ⇒ 运行期丢行
+     *       （某条构造/过滤路径把它删了），应去查构造点；</li>
+     *   <li><b>at=N</b> —— 行<b>在</b>列表里但下标 N 不属于本条 assistant 的相邻结果区段（当前下标 i，
+     *       区段 = i+1..）⇒ <b>顺序</b>问题（行被插到别处 / assistant 被复制），不是丢行。</li>
+     * </ul>
+     * 同时给出本条 assistant 之后紧邻几条的角色序列，用于判断「结果区段是否被别的消息截断」。
+     *
+     * @param messages   本次送检的完整列表
+     * @param assistantIndex 当前 assistant 在列表中的下标
+     * @param missingIds 本条 assistant 声明了但没有相邻结果的 tool_use id
+     * @param presentIdSet 本条 assistant 相邻区段里实际出现的 tool_call_id
+     * @return 单行诊断文本（永不返回 null）
+     */
+    private static String describeMissingContext(List<ChatMessageDto> messages, int assistantIndex,
+                                                 List<String> missingIds, Set<String> presentIdSet) {
+        try {
+            StringBuilder sb = new StringBuilder(192);
+            sb.append("列表=").append(messages.size()).append(" 条, 本条assistant下标=").append(assistantIndex)
+              .append(", 相邻区段toolIds=").append(presentIdSet);
+            // 缺失 id 在整表里的分布（可能多次出现 —— 出现多次本身也是线索）
+            sb.append(", 缺失id在表中位置={");
+            for (int k = 0; k < missingIds.size(); k++) {
+                String id = missingIds.get(k);
+                List<Integer> where = new ArrayList<>(2);
+                for (int idx = 0; idx < messages.size() && where.size() < 5; idx++) {
+                    ChatMessageDto m = messages.get(idx);
+                    if (m != null && id.equals(m.toolCallId())) {
+                        where.add(idx);
+                    }
+                }
+                if (k > 0) {
+                    sb.append(", ");
+                }
+                sb.append(id).append('=').append(where.isEmpty() ? "NOT_IN_LIST" : where);
+            }
+            sb.append('}');
+            // 本条 assistant 之后的 4 条角色（截断区段的现场）
+            sb.append(", 其后角色=[");
+            for (int idx = assistantIndex + 1; idx < messages.size() && idx <= assistantIndex + 4; idx++) {
+                ChatMessageDto m = messages.get(idx);
+                if (idx > assistantIndex + 1) {
+                    sb.append(',');
+                }
+                sb.append(m == null ? "null" : String.valueOf(m.role()));
+            }
+            sb.append(']');
+            return sb.toString();
+        } catch (RuntimeException e) {
+            // 诊断绝不能反过来打死修复主流程
+            return "诊断生成失败: " + e;
+        }
     }
 
     /** 合成 tool 结果（CC {@code syntheticBlocks} · messages.ts:5796-5801：is_error=true + 占位文本 + isMeta）。 */

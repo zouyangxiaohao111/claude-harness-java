@@ -704,8 +704,12 @@ class ExecPromptHookSemanticsTest {
         assertThat(capturedSystem.get())
             .as("CCJ-EXEC-11: 无旧附加句（JSON 约束由 outputFormat json_schema 承担）")
             .doesNotContain("Return ONLY the JSON object")
-            .contains("You are evaluating a hook in NexusAI.")
-            .contains("{\"ok\": false, \"reason\": \"Reason for why it is not met\"}");
+            // [goal V253] systemPrompt 已从「两态版」升级为 CC claude.exe v2.1.212 的
+            //   stop-condition 评估器（三态 + 证据制 + impossible 条款）。
+            //   CCJ-EXEC-11 的意图（不加尾部附加句）不变，故此处只更新断言的 prompt 原文。
+            .contains("You are evaluating a stop-condition hook in NexusAI.")
+            .contains("{\"ok\": false, \"impossible\": true, \"reason\":")
+            .contains("insufficient evidence in transcript");
     }
 
     @Test
