@@ -84,7 +84,17 @@ vi.mock('@/components/modals/ArtifactViewModal', () => ({ ArtifactViewModal: () 
 vi.mock('@/components/right/ArtifactDock', () => ({ ArtifactDock: () => null }))
 
 // 与本次接线无关的业务 hook → 空实现（各自需要一整套后端夹具，且不参与服务端运行态对账）
-vi.mock('@/hooks/useChatSocket', () => ({ useChatSocket: () => ({ clientRef: { current: null } }) }))
+// ⚠️ useChatSocket 例外：**捕获** App 传进来的 onSessionDone 回调（第 4 个实参），
+//   让用例能模拟「终态帧到达」而不必真起 STOMP。其余回调保持 no-op。
+vi.mock('@/hooks/useChatSocket', () => ({
+  useChatSocket: (
+    _sid: unknown, _streams: unknown, _toast: unknown,
+    onSessionDone?: (sid: string, topic?: string) => void,
+  ) => {
+    ;(globalThis as unknown as { __onSessionDone?: unknown }).__onSessionDone = onSessionDone
+    return { clientRef: { current: null } }
+  },
+}))
 vi.mock('@/hooks/useAwaySummary', () => ({ useAwaySummary: () => {} }))
 vi.mock('@/hooks/useProviders', () => ({ useProviders: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
 vi.mock('@/hooks/useMcp', () => ({ useMcp: () => ({ list: [], loading: false, error: null, refresh: async () => {} }) }))
@@ -175,6 +185,34 @@ describe('[C6·遗留2·A1] App 层接线：服务端收口 → 对账（删除 
     expect(stopBtn(c)).toBeFalsy()
   })
 
+  /**
+   * ⭐ [2026-11-04 用户实测「点进去明明在运行、停止键都出来了，左边还是没有运行点」]
+   *
+   * <p><b>现场</b>：刚发送、模型还在思考（**还没吐第一个 chunk**）⇒ `streams` 为空。
+   * 侧栏 `runningSessionIds` 原先只从 `streamOrder` 取键 ⇒ 此时集合为空 ⇒ 一个点都没有，
+   * 而主对话区的停止键却亮着（它用的是三路并集）—— 两处对「在跑」给出相反答案。
+   *
+   * <p><b>判据</b>：不看内部实现，只看用户看到的东西 —— 左侧会话行上有 `.status-dot.running`。
+   * 反向实验：把 `runningSessionIds` 改回只读 `streamOrder` ⇒ 本用例红。
+   */
+  it('⭐ 无流式块、只有服务端运行态 ⇒ 左侧会话栏必须有运行点', async () => {
+    const c = await mountApp()
+    const dotOf = () => c.querySelector(`.session-item .status-dot.running`)
+
+    // 前置：静默（无块、服务端未报运行）⇒ 没有运行点
+    expect(useChatStore.getState().streamOrder[SID]?.length ?? 0).toBe(0)
+    expect(dotOf(), '静默时不该有运行点').toBeNull()
+
+    // 事故现场：服务端说在跑（起轮 status=thinking），但**还没有任何流式块**
+    act(() => { useChatStore.getState().setServerRunning(SID, true) })
+    expect(useChatStore.getState().streamOrder[SID]?.length ?? 0, '本用例前提：确实没有块').toBe(0)
+    expect(dotOf(), '服务端在跑 ⇒ 侧栏必须有运行点').not.toBeNull()
+
+    // 收口 ⇒ 点消失
+    act(() => { useChatStore.getState().setServerRunning(SID, false) })
+    expect(dotOf(), '收口后运行点必须消失').toBeNull()
+  })
+
   it('⭐ 服务端收口（true→false）⇒ App 必须回收 turn 且定稿残留流式块（反向实验：删 App 那行调用 ⇒ 本用例红）', async () => {
     const c = await mountApp()
 
@@ -197,6 +235,59 @@ describe('[C6·遗留2·A1] App 层接线：服务端收口 → 对账（删除 
     expect((useChatStore.getState().messages[SID] ?? []).some((m) => m.id === BLOCK && m.content === '残留的正文')).toBe(true)
     expect(stopBtn(c)).toBeFalsy()
     expect(sendBtn(c)).toBeTruthy()
+  })
+
+  /**
+   * ⭐ [2026-11-04 用户实测「会话已经完成，左侧会话栏没有实时展示结束」]
+   *
+   * <p><b>根因</b>：侧栏状态点优先级 `pending > running > done`（SessionList），而
+   * `serverRunning` 原本**只有 `status=idle` 帧**一个清零点。该帧漏收（订阅晚建 /
+   * 断连窗口 / run 非本页发起）⇒ 会话永久停在 running ⇒ 绿点被压住 ⇒
+   * 用户看到「跑完了侧栏还在跑」。
+   *
+   * <p><b>修法</b>：终态回调 `handleSessionDone`（complete / cancel / error 三分支共同的入口）
+   * 里一并 `setServerRunning(sid, false)` —— 兜住 idle 帧丢失。
+   *
+   * <p>反向实验：删掉 handleSessionDone 里那行 `setServerRunning(sid, false)` ⇒ 本用例红
+   * （点和提示文案一直停在「运行中」）。
+   */
+  it('⭐ 终态回调到达 ⇒ 侧栏必须从「运行中」翻成「已完成」（不依赖 idle 帧）', async () => {
+    const c = await mountApp()
+    const dotOf = () => c.querySelector('.session-item .status-dot')
+
+    // 现场：服务端说在跑，但**没有流式块**（思考阶段 / 块已清）⇒ 唯一支撑就是 serverRunning
+    act(() => { useChatStore.getState().setServerRunning(SID, true) })
+    expect(dotOf()?.className, '跑的时候应是 running').toContain('running')
+
+    // 终态帧到达（complete / cancel / error 任一）——注意**不**发 idle 帧，正是要兜的场景
+    const onDone = (globalThis as unknown as { __onSessionDone?: (sid: string, topic?: string) => void }).__onSessionDone
+    expect(onDone, 'must capture App 传入的 onSessionDone').toBeTypeOf('function')
+    act(() => { onDone!(SID) })
+    await flushPromises()
+
+    // 当前会话自己结束 ⇒ 不打未读绿点，但**绝不能还挂着运行点**
+    expect(useChatStore.getState().serverRunning[SID], 'serverRunning 必须被清').toBe(false)
+    expect(dotOf()?.className ?? '', '不得再显示运行中').not.toContain('running')
+  })
+
+  it('⭐ 非当前会话结束 ⇒ 侧栏必须翻成「已完成 · 未读」绿点（不残留运行中）', async () => {
+    const c = await mountApp()
+    const OTHER = 'sess-other-done'
+
+    act(() => { useChatStore.getState().setServerRunning(OTHER, true) })
+    // 另一会话不在侧栏列表里 ⇒ DOM 上看不到；改用当前会话验同一个回调语义：
+    //   先把它标成「服务端在跑」，再走终态回调，断言点不再是 running。
+    act(() => { useChatStore.getState().setServerRunning(SID, true) })
+    const before = c.querySelector('.session-item .status-dot')?.className ?? ''
+    expect(before, '前置：先是 running').toContain('running')
+
+    const onDone = (globalThis as unknown as { __onSessionDone?: (sid: string, topic?: string) => void }).__onSessionDone
+    act(() => { onDone!(SID) })
+    await flushPromises()
+
+    const after = c.querySelector('.session-item .status-dot')?.className ?? ''
+    expect(after, '终态后不得残留 running').not.toContain('running')
+    expect(useChatStore.getState().serverRunning[OTHER], '无关会话不被误清').toBe(true)
   })
 
   it('⭐ 真发送路径：App 登记 activeStreams ⇒ 服务端收口必须回收该登记（覆盖回调那一半）', async () => {

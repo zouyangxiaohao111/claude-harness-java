@@ -315,6 +315,17 @@ public class SessionService {
         }
         s.setUpdatedAt(OffsetDateTime.now().toString());
 
+        // [V278] 会话级「引入知识库」开关：PATCH 语义（null 不改动）。写 0/1 而非 null ——
+        //   列是 NOT NULL DEFAULT 0，且 Flex 更新链不写 null（「清空」会静默变「无操作」）。
+        if (req.kbToolsEnabled() != null) {
+            s.setKbToolsEnabled(req.kbToolsEnabled() ? 1 : 0);
+            if (log.isInfoEnabled()) {
+                log.info("[SessionService] update: session={} kbToolsEnabled={}（4 个知识库工具"
+                        + "{}主线程工具池）", id, req.kbToolsEnabled(),
+                    req.kbToolsEnabled() ? "进入" : "退出");
+            }
+        }
+
         sessionMapper.update(s);
         // [批 4a · 用户裁定 #12] PATCH 改绑项目（mainProjectId）后必须让旧冻结值失效：
         //   SessionProjectRoot.setForSession 是 putIfAbsent 首写胜 ⇒ 不清缓存则改绑后
@@ -696,11 +707,44 @@ public class SessionService {
         if (s == null) throw new NotFoundException("Session " + sessionId + " not found");
         s.setGoal(SessionGoal.toJson(goal));
         s.setUpdatedAt(OffsetDateTime.now().toString());
-        sessionMapper.update(s);
+        // [goal-clear-20261104] 清空必须 update(entity, false) 显式写 NULL。
+        //   WHY：mybatis-flex update(entity) 默认 ignoreNulls=true（NOT_NULL 策略）⇒ 被置 null 的
+        //   goal 列会被 SET 跳过 ⇒ **DB 里旧目标原样残留**，只有 updated_at 变了。表现为
+        //   「点 × / /goal clear 后目标头消失，下一次 GET /goal 或调度器重读又回来」
+        //   （真机取证：日志 phase=none 且 updated_at 已更新，但 sessions.goal 仍是旧 JSON，
+        //   GET /api/v1/sessions/{id}/goal 照旧返回目标）。
+        //   ⚠️ 不能用稀疏 patch + updateByQuery(patch, false, qw)：false 会把 patch 里所有 null
+        //   字段都写 NULL，model_tag（NOT NULL）等列违反约束 → 500（前端联调实测）。
+        //   用 selectOneById 拿到的完整实体 s 置 null，非目标列保留 DB 原值，仅 goal 列写 NULL。
+        //   同款先例：本文件 setTeamContext 的清空分支（team_context 列，同一坑）。
+        if (goal == null) {
+            sessionMapper.update(s, false);
+        } else {
+            sessionMapper.update(s);
+        }
         if (log.isInfoEnabled()) {
             log.info("[SessionService] setGoal: session={} phase={} iterations={}",
                     sessionId, goal == null ? "none" : goal.phase(), goal == null ? 0 : goal.iterations());
         }
+    }
+
+    /**
+     * 列出所有「仍有目标」的会话（goal 列非空）· 供 {@code GoalCheckinScheduler} 定时扫描。
+     *
+     * <p><b>WHY 需要这个查询</b>：check-in / 评估器重试是<b>跨请求</b>的定时职责，必须能从
+     * DB 反查出「哪几个会话还有活着的目标」（进程内存态活不过一个请求）。
+     *
+     * <p><b>只筛列非空</b>：「是不是 live（active/paused）」由调用方用 {@code SessionGoal.isLive()}
+     * 判 —— 这一层不做 JSON 解析，避免 SQL 里塞业务语义（终态行也返回，调用方跳过即可）。
+     *
+     * @return 有目标行的会话记录（可能为空，永不 null）
+     */
+    public List<SessionRecord> listSessionsWithGoal() {
+        return sessionMapper.selectListByQuery(
+            QueryWrapper.create()
+                .where("goal IS NOT NULL")
+                .and("goal <> ''")
+                .orderBy("updated_at", false));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -887,7 +931,10 @@ public class SessionService {
             // [cache-savings] 会话累计缓存命中率（F5 重拉后前端底部「缓存%」的取数口）·
             //   由 model_usage_json（派生视图，只读不改写）逐模型桶派生，口径单点 = CacheHitRate.ofModels
             //   （每桶按自己的模型名判 anthropic）；无数据 / 解析失败 / 分母 0 → null（⛔ 不臆造 0）。
-            cacheHitRateOf(s.getModelUsageJson())
+            cacheHitRateOf(s.getModelUsageJson()),
+            // [V278] 会话级「引入知识库」开关透出（0/1 → Boolean，null 保持 null =
+            //   未设置；主对话工具策略只认 Integer.valueOf(1) ⇒ null 与 0 同义，但透传原始三态）
+            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null
         );
     }
 

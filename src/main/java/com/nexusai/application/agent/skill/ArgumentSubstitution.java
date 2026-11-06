@@ -62,11 +62,31 @@ public final class ArgumentSubstitution {
     /**
      * chunker 正则等价物 · CC original: shell-quote parse.js chunker（parse.js:52-56）。
      * group(1)=control 运算符；group(2)=word-run chunk（BAREWORD 或引号串）。
+     *
+     * <p><b>与 CC 的逐字对应</b>：CC 外层量词是 {@code *}（{@code '(' + CONTROL + ')'}
+     * {@code '|(' + BAREWORD + '|' + SINGLE_QUOTE + '|' + DOUBLE_QUOTE + ')*'}）。
+     * 旧实现移植成 {@code +} —— 语义上 {@code +} 少了一批「空匹配」，而 CC 侧这些空匹配
+     * 由 {@code s.match(chunker).filter(Boolean)} 丢弃，净效果一致；但已按 CC 原文改正为
+     * {@code *}（空匹配在 {@link #tokenizeShellQuote} 里显式跳过）。
+     *
+     * <p><b>Java 特有偏差：外层用占有量词 {@code *+}</b>。
+     * <ul>
+     *   <li>WHY：Java 的 {@link Pattern} 用<b>线程栈</b>做递归回溯（V8 的回溯栈在堆上），
+     *       输入越长栈越深。Stop 事件的 {@code jsonInput} 内含 {@code last_assistant_message}
+     *       （整段模型回答），几 KB 就会把这段正则打穿成 {@link StackOverflowError}
+     *       —— 实测 5 KB 转义 JSON 必炸（{@code 2026-11-05 error.log} 4 次，
+     *       表现是「目标评估器执行失败 → 重试 3 次 → 目标暂停」）。</li>
+     *   <li>为何不影响语义：占有量词只禁止「交还」已消费的 chunk。本改正则只做
+     *       {@code find()} 找最长可行匹配，交还只会切出更短的 chunk、再被下一个 find 捡回 ——
+     *       <b>20 万条随机样本对比（原量词 vs 占有量词）差异 0 条</b>；1.7 MB 输入 18 ms。</li>
+     *   <li>⚠️ 只把<b>最外层</b>改占有：内层 BAREWORD 的 {@code +} 与引号内的惰性 {@code *?}
+     *       保持原样 —— 一并改成占有会改变 chunk 边界（同一 20 万样本下差异 503 条）。</li>
+     * </ul>
      */
     private static final Pattern CHUNKER = Pattern.compile(
         "(" + CONTROL_SRC + ")"
         + "|((?:(?:\\\\[\"'|&;()<>\\s]|[^\\s'\"|&;()<>])+"
-        + "|\"((?:\\\\.|[^\"])*?)\"|'((?:\\\\.|[^'])*?)')+)");
+        + "|\"((?:\\\\.|[^\"])*?)\"|'((?:\\\\.|[^'])*?)')*+)");
 
     /** CC original: parseEnvVar /[*@#?$!_-]/（parse.js:136，特殊变量名单字符）。 */
     private static final Pattern SPECIAL_VAR = Pattern.compile("[*@#?$!_-]");
@@ -96,11 +116,18 @@ public final class ArgumentSubstitution {
         }
         try {
             return tokenizeShellQuote(args);
-        } catch (RuntimeException e) {
+        } catch (RuntimeException | StackOverflowError e) {
             // CC tryParseShellCommand 失败 → 回退空白分割（argumentSubstitution.ts:31-34）
+            //
+            // [2026-11-05] 必须同时接 StackOverflowError：CC 的 `catch (error)` 在 JS 里
+            //   无类型（TS 的 `Error` 只是静态标注，运行时不拦任何异常），所以「分词失败」
+            //   对 CC 是一个**全覆盖**兜底。旧实现只接 RuntimeException，等于把保险丝剪了 ——
+            //   而 Java 的 Pattern 用线程栈递归回溯，长输入正是抛 StackOverflowError（Error
+            //   不是 RuntimeException），于是穿透到 ExecPromptHook 的 catch(Throwable)，
+            //   被归一成 non_blocking_error ⇒ 目标评估器「执行失败 → 重试 3 次 → 目标暂停」。
             if (log.isDebugEnabled()) {
                 log.debug("[ArgumentSubstitution] parseArguments 解析失败，回退空白分割: {}",
-                    e.getMessage());
+                    e.getClass().getSimpleName());
             }
             List<String> out = new ArrayList<>();
             for (String s : args.split("\\s+")) {
@@ -271,6 +298,11 @@ public final class ArgumentSubstitution {
     /**
      * shell-quote tokenizer 等价物 · 逐条镜像 shell-quote parse.js parseInternal
      * （chunker 匹配 → 每 chunk 扫描）。返回仅 string token（运算符/glob/注释被过滤）。
+     *
+     * <p>CC 侧：{@code s.match(chunker).filter(Boolean)} —— chunker 外层是 {@code *}，
+     * 会在相邻 chunk 之间产出<b>空匹配</b>，由 {@code filter(Boolean)} 丢弃后才 map。
+     * 本方法对应同一个 {@code filter(Boolean)}：group(2) 为 null/空串 ⇒ 跳过，不进 scanChunk
+     * （否则 {@code ''} 会被当作一个合法空 token —— 而 CC 在 chunker 层就把它滤掉了）。
      */
     private static List<String> tokenizeShellQuote(String s) {
         List<String> tokens = new ArrayList<>();
@@ -280,7 +312,12 @@ public final class ArgumentSubstitution {
                 // control 运算符 → 非 string token，parseArguments 过滤（CC :37-39）
                 continue;
             }
-            ScanResult r = scanChunk(m.group(2));
+            String chunk = m.group(2);
+            // CC .filter(Boolean)：空匹配丢弃（'*' 量词特有，见 CHUNKER 注释）
+            if (chunk == null || chunk.isEmpty()) {
+                continue;
+            }
+            ScanResult r = scanChunk(chunk);
             if (r.text != null) {
                 tokens.add(r.text);
             }

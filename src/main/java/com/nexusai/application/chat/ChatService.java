@@ -933,7 +933,7 @@ public class ChatService {
         // [goal V253] resume 恢复：目标（/goal）从 sessions.goal 列读回并重挂 prompt Stop hook
         //   （对齐 CC claude.exe v2.1.212 的 restoreGoalFromTranscript —— 但真源读**列**而非反推
         //   transcript：压缩会剪掉旧的 goal attachment，反推会丢目标）。
-        //   已达成 / 已放弃的目标不复活；恢复时重置 setAt / tokensAtStart 基线（CC 同款）。
+        //   已达成 / 已放弃的目标不复活；恢复只重挂 hook，进度字段原样保留（⛔ 不重置轮数）。
         restoreGoalForResume(sessionId);
 
         String modelName = resolveModelNameForSession(session, req != null ? req.modelName() : null);
@@ -967,7 +967,11 @@ public class ChatService {
         //   ⇒ 否则只能等轮末抽取，而前端自动展开的门控是「本轮仍在跑」⇒ 永不重叠（用户实测）。
         //   ⛔ 只覆盖「本轮执行中」：自动展开只在这段时间有意义，轮末的产物卡由用户自己点。
         if (sessionArtifactService != null) {
-            sessionArtifactService.startTurnWatch(sessionId);
+            // ⭐ 带上本轮 userMessageId：轮内扫描发现的产物一律归属到这条用户消息
+            //   （B 方案「一轮一行」—— 同一文件在多轮被改 = 多行，历史轮次不会凭空少东西）。
+            //   ⚠️ 用 userMessageId 而不是 assistantMessageId：前者是 processUserMessage 的入参，
+            //   轮内监看 / 轮末 / 工具 hook 三处都拿得到；后者要等 loop 内部生成。
+            sessionArtifactService.startTurnWatch(sessionId, userMessageId);
         }
 
         // 3) 解析 provider
@@ -1238,7 +1242,9 @@ public class ChatService {
         //   （已在 finally / status=idle 之后，⛔ 不阻塞任何出站事件）。服务内部自带防抖 +
         //   全流程 try/catch，失败只 WARN —— 对话永远不会因它失败或变慢。
         if (sessionArtifactService != null) {
-            sessionArtifactService.scheduleExtract(sessionId);
+            // 归属用「本轮最终生效的 userMessageId」（排队消费后 state 可能换过 id）
+            sessionArtifactService.scheduleExtract(sessionId,
+                effectiveEventUserMessageId(state, userMessageId));
         }
 
         log.info("DONE: turns={} exit={}", state.turnCount(), state.exitReason());
@@ -4236,10 +4242,17 @@ public class ChatService {
      *
      * <p>CC 的其余语义逐条对齐：
      * <ul>
-     *   <li>内存已 armed 且条件一致 ⇒ 跳过（fresh 守卫，防重复挂 hook）</li>
+     *   <li>内存已 armed 且注册表里真有该 hook ⇒ 跳过（fresh 守卫，防重复挂 hook）</li>
      *   <li>目标已 met / failed（phase ≠ active）⇒ <b>不</b>复活</li>
-     *   <li>恢复时<b>重置</b> {@code iterations=0} / {@code setAt=now} / {@code tokensAtStart=当前}</li>
+     *   <li>恢复<b>只重挂 hook</b>：{@code iterations} / {@code setAt} / {@code tokensAtStart} /
+     *       {@code lastReason} <b>原样保留</b> —— CC 的 {@code turnsExecuted} 只在
+     *       {@code setGoal()} 与 {@code /goal continue} 归零（goalState.ts:115/131），
+     *       {@code resumeGoal()} 保留它</li>
      * </ul>
+     *
+     * <p>⛔ <b>本方法挂在 {@link #processUserMessage} 上（每条用户消息都跑）</b>，
+     * 所以绝不能在这里重置任何计数 —— 否则评估器刚记下的轮数会被下一条用户消息清零
+     * （真机缺陷：目标头恒显示「第 1 轮」）。
      */
     private void restoreGoalForResume(String sessionId) {
         com.nexusai.application.agent.goal.GoalService goalService =

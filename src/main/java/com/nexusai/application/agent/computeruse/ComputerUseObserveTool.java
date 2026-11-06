@@ -54,17 +54,44 @@ public final class ComputerUseObserveTool implements Tool {
 
     /** 工具描述（对齐 dsh 的取向：先观察、索引只属于本次观察、优先树而非截图）。 */
     private static final String DESCRIPTION =
-            "Read a fresh Accessibility observation of the frontmost app. Element indexes belong only "
+            "Read a fresh Accessibility observation of one exact running app. Element indexes belong only "
                     + "to the returned observationId. Prefer the tree over a screenshot: it names every "
                     + "control and is far smaller. Pass observationId plus elementIndex (or targetHandle) "
-                    + "to click_element / type_into_element / set_value. A stale observation is rejected — "
-                    + "observe again after the UI changes.";
+                    + "to click_element / type_into_element / perform_action. A stale observation is "
+                    + "rejected — observe again after the UI changes. When the tree does not answer a "
+                    + "visual question, request a screenshot artifact (screenshot=optional) and pass its "
+                    + "path to vision_analyze for OCR or visual inspection; coordinates read off that "
+                    + "image are image pixels and must be divided by pixelScale.";
 
-    /** 输入 schema。 */
+    /** 输入 schema（对齐 dsh {@code tools.ts:359-377} 的 {@code computer_observe}）。 */
     private static final String INPUT_SCHEMA = """
             {
               "type": "object",
               "properties": {
+                "app": {
+                  "type": "object",
+                  "description": "The exact app to observe. Omit to observe the frontmost app. Prefer bundleId.",
+                  "properties": {
+                    "bundleId": {
+                      "type": "string",
+                      "description": "Preferred exact macOS bundle identifier."
+                    },
+                    "pid": {
+                      "type": "integer",
+                      "description": "Exact current process id when already observed."
+                    },
+                    "name": {
+                      "type": "string",
+                      "description": "Display name accepted only when it resolves uniquely."
+                    }
+                  },
+                  "additionalProperties": false
+                },
+                "screenshot": {
+                  "type": "string",
+                  "enum": ["none", "optional", "required"],
+                  "description": "Default optional: capture a screenshot artifact when Screen Recording is granted. Required fails when it is not."
+                },
                 "full": {
                   "type": "boolean",
                   "description": "Return a full tree instead of a diff from the previous observation of the same app."
@@ -87,15 +114,15 @@ public final class ComputerUseObserveTool implements Tool {
      */
     public static final int DEFAULT_MAX_DEPTH = 14;
 
-    /** 默认节点上限 · dsh {@code config.ts:92} {@code maxNodes: 500}。 */
-    public static final int DEFAULT_MAX_NODES = 500;
-
-    /** 默认文本字节上限 · dsh {@code config.ts:94} {@code maxTextBytes: 64000}。 */
-    public static final int DEFAULT_MAX_TEXT_BYTES = 64_000;
+    // ⛔ 不在此声明节点/字节上限：真正的执行者是 MacOsUiaService.MAX_NODES /
+    //   MAX_TEXT_BYTES。曾在这里留两个「500 / 64000」常量且从未被读取
+    //   ⇒ 改这边不会生效（假单源）。现统一以 MacOsUiaService 为准。
 
     private final ComputerUseUiaService uiaService;
     private final ComputerUseUiSnapshotStore snapshotStore;
     private final MacOsTccChecker tcc;
+    /** 截图器（可为 null ⇒ 不支持截图产物）。 */
+    private final ComputerUseScreenCapturer capturer;
 
     /**
      * @param uiaService    AX/UIA 服务
@@ -105,9 +132,23 @@ public final class ComputerUseObserveTool implements Tool {
     public ComputerUseObserveTool(ComputerUseUiaService uiaService,
                                   ComputerUseUiSnapshotStore snapshotStore,
                                   MacOsTccChecker tcc) {
+        this(uiaService, snapshotStore, tcc, null);
+    }
+
+    /**
+     * @param uiaService    AX/UIA 服务
+     * @param snapshotStore 观察存储
+     * @param tcc           权限检查（可为 null ⇒ 不报权限状态）
+     * @param capturer      截图器（可为 null ⇒ {@code screenshot} 参数退化为「不截」）
+     */
+    public ComputerUseObserveTool(ComputerUseUiaService uiaService,
+                                  ComputerUseUiSnapshotStore snapshotStore,
+                                  MacOsTccChecker tcc,
+                                  ComputerUseScreenCapturer capturer) {
         this.uiaService = uiaService;
         this.snapshotStore = snapshotStore;
         this.tcc = tcc;
+        this.capturer = capturer;
     }
 
     @Override
@@ -166,15 +207,18 @@ public final class ComputerUseObserveTool implements Tool {
         boolean full = input.path("full").asBoolean(false);
         int maxDepth = input.path("max_depth").asInt(DEFAULT_MAX_DEPTH);
         String sessionId = ctx != null ? ctx.sessionId() : null;
+        ComputerUseAppSelector selector = readSelector(input.path("app"));
+        String screenshotMode = readScreenshotMode(input);
 
         try {
-            ComputerUseAccessibilitySnapshot snapshot = uiaService.captureSnapshot(0L, maxDepth);
+            ComputerUseAccessibilitySnapshot snapshot =
+                    uiaService.captureSnapshot(0L, maxDepth, selector);
             List<ComputerUseUiSnapshotStore.ObservedElement> elements = toObservedElements(snapshot.nodes());
 
             if (elements.isEmpty()) {
                 ObjectNode empty = JSON.createObjectNode();
                 empty.put("observationId", "");
-                empty.put("tree", "(no accessibility elements exposed by the frontmost window)");
+                empty.put("tree", "(no accessibility elements exposed by the observed window)");
                 empty.put("hint", "The app may not implement accessibility (canvas-drawn UI) — "
                         + "use screenshot + click coordinates instead.");
                 return ToolResult.success(call.id(), empty.toPrettyString());
@@ -194,7 +238,11 @@ public final class ComputerUseObserveTool implements Tool {
                     treeText,
                     snapshot.truncated(),
                     elements,
-                    full);
+                    full,
+                    // 窗口几何：供后续 scroll/drag 定向投递（投给「哪个窗口的哪个点」）
+                    snapshot.windowId(),
+                    snapshot.windowX(),
+                    snapshot.windowY());
 
             ObjectNode out = JSON.createObjectNode();
             out.put("observationId", observation.observationId());
@@ -203,8 +251,26 @@ public final class ComputerUseObserveTool implements Tool {
             app.put("name", observation.appName());
             app.put("bundleId", observation.bundleId());
             app.put("pid", observation.pid());
-            if (!observation.windowTitle().isEmpty()) {
-                out.putObject("window").put("title", observation.windowTitle());
+            // 观察的有效期：模型据此知道手上的观察还能用多久（dsh createdAt / expiresAt）
+            out.put("createdAt", observation.createdAt());
+            out.put("expiresAt", observation.expiresAt() == Long.MAX_VALUE
+                    ? "9999-12-31T23:59:59.999Z"
+                    : java.time.Instant.ofEpochMilli(observation.expiresAt()).toString());
+            // 观察对象是否在前台：后台观察时模型应知道「我看到的是后台窗口」
+            out.put("frontmost", snapshot.frontmost());
+            if (!observation.windowTitle().isEmpty() || snapshot.hasWindowFrame()) {
+                ObjectNode window = out.putObject("window");
+                window.put("title", observation.windowTitle());
+                if (snapshot.hasWindowFrame()) {
+                    ObjectNode frame = window.putObject("frame");
+                    frame.put("x", snapshot.windowX());
+                    frame.put("y", snapshot.windowY());
+                    frame.put("width", snapshot.windowWidth());
+                    frame.put("height", snapshot.windowHeight());
+                }
+                if (snapshot.windowId() > 0) {
+                    window.put("id", snapshot.windowId());
+                }
             }
             ObjectNode tree = out.putObject("tree");
             tree.put("mode", observation.treeMode());
@@ -220,17 +286,55 @@ public final class ComputerUseObserveTool implements Tool {
                 permissions.put("accessibility", "unavailable");
                 permissions.put("screenRecording", "unavailable");
             }
+            // 截图产物（dsh Artifact 形态：文件路径 + pixelScale，不是 inline image）
+            ObjectNode screenshot = ComputerUseScreenshotArtifact.capture(
+                    capturer, tcc, sessionId, observation.observationId(),
+                    screenshotMode, permissions);
+            if (screenshot != null) {
+                out.set("screenshot", screenshot);
+            }
 
             if (log.isInfoEnabled()) {
-                log.info("[computer-use] {} 完成: session={} observationId={} 元素={} 模式={} 文本字节={}",
+                log.info("[computer-use] {} 完成: session={} observationId={} 元素={} 模式={} 文本字节={} 前台={} 截图={}",
                         TOOL_NAME, sessionId, observation.observationId(), elements.size(),
-                        observation.treeMode(), treeText.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+                        observation.treeMode(), treeText.getBytes(java.nio.charset.StandardCharsets.UTF_8).length,
+                        snapshot.frontmost(), screenshot == null ? "无" : "有");
             }
             return ToolResult.success(call.id(), out.toPrettyString());
         } catch (Exception e) {
             log.error("[computer-use] {} 失败: session={} err={}", TOOL_NAME, sessionId, e.getMessage(), e);
             return ToolResult.error(call.id(), "读取辅助功能树失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 读 {@code app} 选择器（dsh {@code appSelectorSchema}）。
+     *
+     * @param appNode 输入里的 {@code app} 节点（可缺失）
+     * @return 选择器（缺失 ⇒ 前台应用）
+     */
+    static ComputerUseAppSelector readSelector(JsonNode appNode) {
+        if (appNode == null || !appNode.isObject()) {
+            return ComputerUseAppSelector.frontmost();
+        }
+        return new ComputerUseAppSelector(
+                appNode.path("bundleId").asText(""),
+                appNode.path("pid").asLong(0L),
+                appNode.path("name").asText(""));
+    }
+
+    /**
+     * 读 {@code screenshot} 模式（dsh {@code none|optional|required}）。
+     *
+     * @param input 输入
+     * @return 模式（缺省 {@code optional}）
+     */
+    static String readScreenshotMode(JsonNode input) {
+        String mode = input.path("screenshot").asText("");
+        if ("none".equals(mode) || "optional".equals(mode) || "required".equals(mode)) {
+            return mode;
+        }
+        return "optional";
     }
 
     /**
@@ -270,7 +374,11 @@ public final class ComputerUseObserveTool implements Tool {
                     node.height(),
                     // 子角色与 nativeIdentifier 是 dsh 三级解析的稳定字段
                     node.subrole(),
-                    node.nativeIdentifier()));
+                    node.nativeIdentifier(),
+                    // ⛔ focused / selected 曾在此被漏掉（用 14 参兼容构造）⇒ 观察里恒为 null
+                    //   ⇒ elementsToJson 的两个 if 永远不成立、模型永远看不到焦点/选中态
+                    node.focused(),
+                    node.selected()));
             flatten(node.children(), out);
         }
     }

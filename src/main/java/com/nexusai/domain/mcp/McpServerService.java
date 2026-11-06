@@ -194,6 +194,15 @@ public class McpServerService {
     @Autowired private com.nexusai.application.agent.mcp.ChannelSessionAllowlist channelSessionAllowlist;
 
     /**
+     * [V255 外部渠道] 渠道 ↔ 会话 绑定服务（生产接线 fail-loud）· gate 门序[3] 的权威判据。
+     *
+     * <p>CC 单进程单会话 ⇒ 白名单是进程级全局；本仓多会话 ⇒ 必须查 DB 绑定表
+     * （{@code mcp_channel_binding}，UNIQUE(channel_id) 保证同渠道全局唯一）。
+     * 未绑定 ⇒ 该渠道没人认领 ⇒ gate 门序[3] skip ⇒ 不注册 handler（fail-closed）。
+     */
+    @Autowired private com.nexusai.domain.mcp_channel_binding.ChannelBindingService channelBindingService;
+
+    /**
      * [S08 F2 接线] 插件 MCP 集成（F1-F5）· 供 {@link #start}/{@link #startEnabledBatch()}
      * 注入真实 pluginSource 解析器（CC mcpPluginIntegration.ts:354 addPluginScopeToServers
      * 注入 name@marketplace）→ gate 门序[4] marketplace 校验（McpToolPool:1359）可消费。
@@ -1108,6 +1117,36 @@ public class McpServerService {
     }
 
     /**
+     * [V255 外部渠道] server 名 → 归属会话 id 的解析器（gate 门序[3] 消费）。
+     *
+     * <p><b>为什么归属来自绑定表而不是「谁连的 MCP」</b>：CC 单进程单会话 ⇒ 消息靠 ambient
+     * {@code agentId: ci()} 进「当前正在跑的 agent」队列；本仓多会话 ⇒ 必须显式记录
+     * 「这个渠道归哪个会话」，且该关系要跨后端重启存活 ⇒ 落 {@code mcp_channel_binding} 表。
+     * 若用「连接时的 sessionId」，则「A 会话连的 MCP」会把消息永远投给 A，
+     * 即便用户后来把渠道转绑给了 B。
+     *
+     * <p><b>异常处理</b>：读表失败 → 返回 null（= 该渠道未绑定）⇒ gate 门序[3] skip
+     * ⇒ 不注册 handler（fail-closed，与 CC「未列入 --channels 不注册」同向）。
+     *
+     * @param serverName MCP server 名
+     * @return 归属会话 id；未绑定 / 读失败 → null
+     */
+    private String resolveBoundSessionId(String serverName) {
+        if (channelBindingService == null) {
+            return null;
+        }
+        try {
+            return channelBindingService.findByServerName(serverName)
+                .map(com.nexusai.model.mcp_channel_binding.ChannelBindingEntry::sessionId)
+                .orElse(null);
+        } catch (Exception e) {
+            log.warn("[McpServerService] 读取渠道绑定失败（server={}）→ 按未绑定处理，不注册 channel handler: {}",
+                serverName, e.toString());
+            return null;
+        }
+    }
+
+    /**
      * [S08 F3 供给] 插件 MCP servers 落库 · 对齐 CC config.ts 全链（Q-09=C：DB 唯一运行时源）。
      *
      * <p>消费 {@link PluginMcpIntegration#extractMcpServersFromPlugins} 产物（scoped
@@ -1204,6 +1243,9 @@ public class McpServerService {
             // （gate 门序[3 session] 恒 SESSION skip，安全默认与 CC「server 必须显式列入 --channels
             // 才注册 handler」一致，channelNotification.ts:247-257）。
             channelNotificationGate.setAllowedChannelsProvider(channelSessionAllowlist.sessionLookup());
+            // [V255 外部渠道] 门序[3] 的**权威**判据：server → 归属会话（绑定表）。
+            //   绑定表未接线时 gate 回落旧判据（session --channels 白名单），行为不变。
+            channelNotificationGate.setBoundSessionResolver(this::resolveBoundSessionId);
             if (log.isDebugEnabled()) {
                 log.debug("[McpServerService] start 注入 allowedChannelsProvider=真实会话态(ChannelSessionAllowlist.sessionLookup): " +
                         "gate 门序[3 session] 按**显式传入的会话**白名单判定（无会话/无白名单 → 空表 fail-closed）");
@@ -1327,6 +1369,8 @@ public class McpServerService {
         mcpToolPool.setMcpAuthToolSwapHandler(this::replaceServerToolsAfterAuth);
         // [S07 / 批 3b] 同 start()：显式会话查表器（本路径无会话 → gate 门序[3] 空表 fail-closed）
         channelNotificationGate.setAllowedChannelsProvider(channelSessionAllowlist.sessionLookup());
+        // [V255 外部渠道] 同 start()：门序[3] 的权威判据（绑定表）。
+        channelNotificationGate.setBoundSessionResolver(this::resolveBoundSessionId);
         List<McpToolPool.McpServerConfigEntry> entries = new ArrayList<>();
         for (McpServerRecord r : mcpServerMapper.selectAll()) {
             McpServer s = r.toDomain();

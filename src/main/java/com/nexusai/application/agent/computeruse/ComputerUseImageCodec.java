@@ -66,11 +66,35 @@ public final class ComputerUseImageCodec {
     /**
      * JPEG 编码 · 质量 {@link #SCREENSHOT_JPEG_QUALITY}。
      *
+     * <p>⭐ <b>WHY 先转 RGB</b>（2026-11-02 真机实测）：macOS 的 {@code screencapture} 产出的是
+     * <b>4 通道 RGBA</b> PNG（{@code colorType=6}），而 JDK 的 JPEG writer <b>不接受带 alpha 的
+     * {@code ComponentColorModel}</b> ⇒ 直接编码抛
+     * {@code IIOException: Bogus input colorspace}（<b>整条截图链路 100% 失败</b>）。
+     * <br>⇒ 编码前把图画到 {@link BufferedImage#TYPE_INT_RGB} 上（顺带把 alpha 合成掉）。
+     *
      * @param img 图像
      * @return JPEG 字节
      * @throws IOException 编码失败
      */
     public static byte[] encodeJpeg(BufferedImage img) throws IOException {
+        if (img == null) {
+            throw new IOException("[computer-use] 图像为 null，无法编码 JPEG");
+        }
+        BufferedImage source = img;
+        if (img.getColorModel().hasAlpha()) {
+            // 带 alpha ⇒ 必须转成不带 alpha 的 RGB，否则 JPEG writer 报 Bogus input colorspace
+            BufferedImage rgb = new BufferedImage(
+                    img.getWidth(), img.getHeight(), BufferedImage.TYPE_INT_RGB);
+            java.awt.Graphics2D g = rgb.createGraphics();
+            try {
+                g.setColor(java.awt.Color.BLACK);
+                g.fillRect(0, 0, img.getWidth(), img.getHeight());
+                g.drawImage(img, 0, 0, null);
+            } finally {
+                g.dispose();
+            }
+            source = rgb;
+        }
         Iterator<ImageWriter> writers = ImageIO.getImageWritersByFormatName("jpeg");
         if (!writers.hasNext()) {
             throw new IllegalStateException("[computer-use] 找不到 JPEG ImageWriter（ImageIO 插件缺失）");
@@ -82,7 +106,7 @@ public final class ComputerUseImageCodec {
         try (ByteArrayOutputStream bos = new ByteArrayOutputStream();
              ImageOutputStream ios = ImageIO.createImageOutputStream(bos)) {
             writer.setOutput(ios);
-            writer.write(null, new IIOImage(img, null, null), param);
+            writer.write(null, new IIOImage(source, null, null), param);
             ios.flush();
             return bos.toByteArray();
         } finally {

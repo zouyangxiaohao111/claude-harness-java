@@ -106,23 +106,54 @@ export interface FencePassResult extends PassResult {
 }
 
 /**
- * P0 · 围栏抢救：把「粘在内容行尾的三反引号」提为独立行（开围栏、闭围栏都提）。
- * 这不是"修复语法"，而是把源码还原成模型本意 —— 它想在那里断行。
+ * P0 · 围栏抢救：把「粘在内容行尾 / 夹在行中间的三反引号」提为独立行
+ * （开围栏、闭围栏都提）。这不是"修复语法"，而是把源码还原成模型本意 ——
+ * 它想在那里断行。
  *
  * 平衡闸（fail-safe）：单趟收集编辑的同时维护围栏态；若全文**仍处于未闭合状态**，
  * 整篇放弃（丢弃已收集的编辑）。绝不制造一个会吞掉后文的围栏。
  * 状态机与 CommonMark 同精度：闭合判据要求反引号数 >= 开围栏数。
+ *
+ * <p><b>为什么必须同时处理「行中间」的围栏串（2026-11-05 修）</b>：
+ * 旧实现只认「行尾粘连」（`^(.*[^\s`])(`{3,})\s*$`），于是
+ * {@code ##你现在配的是什么```yaml# config/…} 这种**围栏后还跟着内容**的行被完全忽略。
+ * 后果不是「少救一处」，而是**状态机整篇跑偏**：这个真正的开围栏没被看见 ⇒
+ * 后面那行「行尾 ```」被当成**开围栏** ⇒ 全文判未闭合 ⇒ 平衡闸整篇放弃 ⇒
+ * 本可救的其它提行全丢，版面被吞几十行（真库 msg a9ffc3f4：L13 之后 29 行被吞）。
+ *
+ * <p><b>行中间的围栏串只可能是开围栏</b>：CommonMark 的闭合围栏要求反引号后
+ * 「只能有空白」，而后继还有内容 ⇒ 提行后它只会开启一个带 info string 的围栏。
+ * 故：不在围栏内 ⇒ 开围栏（openLen = 反引号数）；已在围栏内 ⇒ **状态不变**
+ * （那一行只是代码块的普通内容行，不会闭合当前围栏）。
+ *
  * @param src 源码
  * @returns 修补后的源码、编辑列表、以及是否未提交任何提行。`aborted` 为 true
  *  表示「未提交任何提行」—— 既包括闸门因提行后仍不闭合而放弃，也包括原文本身
  *  就未闭合、无可提行的情形。
  */
 export function passFence(src: string): FencePassResult {
+  // 先按新规则（含行中间围栏）跑；若整篇判未闭合，**退回旧规则**（只认行尾粘连）再判一次。
+  // WHY 必须退回：新规则会把「本是段落里的反引号串」也纳入围栏态，某些文档因此从
+  //   「旧规则下能完整闭合」变成「整篇放弃」—— 那是**功能倒退**（实测语料 1 例：
+  //   ec08aaed，旧链可正常救 0 处、新规则却让整篇降级）。退回后至少不比改动前更差。
+  const lifted = liftFences(src, true)
+  if (!lifted.aborted) return lifted
+  return liftFences(src, false)
+}
+
+/**
+ * {@link passFence} 的提行实现。
+ *
+ * @param allowMidline 是否也处理「夹在行中间」的反引号串。false = 改动前的旧规则。
+ */
+function liftFences(src: string, allowMidline: boolean): FencePassResult {
   const edits: Edit[] = []
   let inFence = false
   let openLen = 0
   for (const { off, line } of relLines(src)) {
     // 行首的合法围栏（开围栏不限行尾；闭合要求行尾仅空白且长度 >= 开围栏）
+    // ⚠️ 不在此 continue：同一行既可能是行首开围栏、又可能在行尾粘连闭围栏
+    //   （`\`\`\`js code\`\`\``），原有的 open+glued 同处一行语义必须保留。
     const open = /^ {0,3}(`{3,})/.exec(line)
     if (open !== null && !inFence) {
       inFence = true
@@ -152,6 +183,30 @@ export function passFence(src: string): FencePassResult {
         text: '\n',
         pass: 'fence',
         kind: wasInFence ? 'lift-close-fence' : 'lift-open-fence',
+        line,
+      })
+      continue
+    }
+    if (!allowMidline) continue
+    // 行中间夹着的反引号串（后面还有内容）—— 见上方 JSDoc。
+    // ⚠️ CommonMark 规定：反引号围栏的 **info string 里不能再出现反引号**
+    //   （spec「If the info string comes after a backtick fence, it may not contain any backtick characters」）。
+    //   实测语料：`##① key为什么是英文```…如 \`applies_to_phase\` / …` 这类段落里的反引号串
+    //   后面带着行内代码 ⇒ 提行后 **不构成围栏**、整段仍是段落，反而会把后文吞进段落。
+    //   ⇒ info string 含反引号的一律不动（保持原样，不做任何猜测）。
+    // ⚠️ 必须用**非贪婪** `.*?` 取**第一个**反引号串：同一行可能有多处
+    //   （`##标题```info…​```后文` 是被压扁的一对围栏），贪婪会让匹配点滑到最后一处，
+    //   于是检查的是「第二段的 info string」而非真正要提行的那一处（实测语料出现过）。
+    const mid = /^(.*?[^\s`])(`{3,})(\S.*)$/.exec(line)
+    if (mid !== null && !inFence && !mid[3]!.includes('`')) {
+      inFence = true
+      openLen = mid[2]!.length
+      edits.push({
+        start: off + mid[1]!.length,
+        end: off + mid[1]!.length,
+        text: '\n',
+        pass: 'fence',
+        kind: 'lift-midline-open-fence',
         line,
       })
     }
@@ -544,7 +599,7 @@ export function passMarkers(src: string, providedRoot?: DocRoot): MarkerPassResu
 
 export interface RepairResult {
   /** 修补后的源码（交给解析器重解析的就是它）。**权威取本字段**：
-   *  恒等于 `markers.src`（P2/P3 是最后一环，其输出即链的终点）。 */
+   *  链的终点是 P4 快扫（`sweep.src`），即 P2/P3 之后再过一遍行级兜底。 */
   out: string
   /** 各 pass 的原始结果：各自的偏移**相对各自的输入**，自洽可解释。 */
   fence: FencePassResult
@@ -556,6 +611,8 @@ export interface RepairResult {
    *  （见 `repair` 的 `reuseRoot`）。 */
   glue: PassResult
   markers: MarkerPassResult
+  /** P4 快扫（纯行级正则兜底）的子结果。 */
+  sweep: PassResult
 }
 
 /**
@@ -566,15 +623,93 @@ export interface RepairResult {
 export const PROD_REPAIR_OPTS = { tableHeader: true } as const
 
 /**
+ * P4 · 快扫：行级正则兜底，给「行首 `##`~`######` 后紧跟非空白」补一个空格。
+ *
+ * <p><b>为什么需要（前四个 pass 结构上救不到）</b>：P1/P1.5/P2 的块级判据都来自真解析器的
+ * mdast position，而**被失控围栏吞进 `code` 节点的行不在任何段落的 position 里** ——
+ * 那些行本来是标题（`##你现在配的是什么`、`##关键澄清：…`），却因为落进围栏而永远
+ * 拿不到补空格。真库实测（20,673 条 assistant 消息 / 4,189 个命中行）：
+ * 围栏外该修 3,247 行、**失控未闭合围栏内 940 行**，后者是纯 position 判据的盲区。
+ *
+ * <p><b>为什么只认 `#{2,6}`，不认单 `#`（与 `headingFix` 的唯一有意分歧）</b>：
+ * 单井号在本仓语料里是**代码注释**的主力形态（`#include`、`#!/usr/bin/env bash`、
+ * Python 的 `#规则1`）—— 实测合法代码块内单井号命中存在，而 `##` 及以上在合法代码块内
+ * **0 命中**。这正是当年 `patches.ts` 被整体删除的形态（`#include` → `# include`），
+ * ⛔ 不要为了「更全」把单井号放进来。
+ *
+ * <p><b>为什么不放最前面（顺序不可换）</b>：P1.5 拆行的判据是 `GLUED_HEADING`（要求井号
+ * 后**紧跟 `\S`**）。先补空格会让 `##待讨论的6个点###①鉴权` 这类粘连行立刻变成合法 ATX，
+ * 拆行链路整条失效。⇒ 必须**先拆行、再补空格**，本 pass 是链的最后一环。
+ *
+ * <p><b>为什么可以不用 position 判据（对 C3 的显式豁免）</b>：本 pass 只做**单行内**
+ * 的「插一个空格」，不改行数、不改块边界归属 —— 它没有「自造块边界」的风险，
+ * 与 P1/P1.5 那类会改变块结构的编辑不同。例外恰恰是它要修的形态本身：那一行**本来就
+ * 是标题**，补空格只是把模型漏掉的空格还回去。
+ *
+ * <p>已知残差：若某段真代码里恰好有一行以 `##` 开头且后接非空白（如 Markdown 源码样例），
+ * 本 pass 会改动它。实测语料 0 命中（合法代码块内 `##`+非空白 = 0），登记备查。
+ */
+export function passHeadingSweep(src: string): PassResult {
+  const lines = relLines(src)
+  // 先标出「合法闭合围栏内」的行区间 —— 那些是真代码，一律不动。
+  // 未闭合围栏**不**进保护区：它的后半段本就是被吞掉的正文（这正是本 pass 要救的形态）。
+  // 判据与 passFence 的围栏状态机同精度（闭合要求反引号数 >= 开围栏数）。
+  const protectedLine = new Array<boolean>(lines.length).fill(false)
+  {
+    let openAt = -1
+    let openLen = 0
+    for (let i = 0; i < lines.length; i++) {
+      const line = lines[i]!.line
+      if (openAt === -1) {
+        const open = /^ {0,3}(`{3,})/.exec(line)
+        if (open !== null) {
+          openAt = i
+          openLen = open[1]!.length
+        }
+      } else {
+        const close = /^ {0,3}(`{3,})\s*$/.exec(line)
+        if (close !== null && close[1]!.length >= openLen) {
+          for (let k = openAt; k <= i; k++) protectedLine[k] = true
+          openAt = -1
+          openLen = 0
+        }
+      }
+    }
+  }
+  const edits: Edit[] = []
+  for (let i = 0; i < lines.length; i++) {
+    if (protectedLine[i] === true) continue
+    const { off, line } = lines[i]!
+    const m = /^(#{2,6})(?!#)(\S.*)$/.exec(line)
+    if (m === null) continue
+    const rest = m[2]!
+    // 残余块级粘连不救：直接补空格会把**表格行 / 围栏**并进标题文本
+    // （`####|a |b |` → `#### |a |b |` 会把表头吞成 h4 正文；`##标题```yaml…` 同理）。
+    // 这两类该由 P1/P1.5 先拆开 —— ⛔ 不要在这里硬补，那只会把形态变得更糟。
+    if (rest.includes('|') || /`{3,}/.test(rest)) continue
+    edits.push({
+      start: off + m[1]!.length,
+      end: off + m[1]!.length,
+      text: ' ',
+      pass: 'sweep',
+      kind: 'heading-space',
+      line,
+    })
+  }
+  return { src: applyEdits(src, edits), edits }
+}
+
+/**
  * 抢救链（顺序不可换：P0 先做，才决定后面看到的块结构）。
  *
- * P0 围栏 → P1 表格 → P1.5 拆行 → P2/P3 标记。四个 pass 各自读真解析器的 mdast position（符合 C3）；
+ * P0 围栏 → P1 表格 → P1.5 拆行 → P2/P3 标记 → P4 快扫。前四个 pass 各自读真解析器的
+ * mdast position（符合 C3）；P4 是纯行级兜底（豁免理由见其 JSDoc）。
  * 只在 settled 渲染前调用（C2）。各 pass 的诊断字段（`markers.rejects`）不参与决策
  * （注：`headingFix` 的 `(?!#)` 修正后，'## 已合规' 这类已合法标题不再进 rejects，属预期）。
  *
  * @param src 原始 markdown 源码
  * @param opts.tableHeader 是否启用 P1e（容器是活标题的表格），缺省 false
- * @returns 修补结果：`out` + 四个 pass 各自的子结果（偏移各自自洽，`fence.aborted` 不被吞）
+ * @returns 修补结果：`out` + 五个 pass 各自的子结果（偏移各自自洽，`fence.aborted` 不被吞）
  */
 export function repair(src: string, opts: { tableHeader?: boolean } = {}): RepairResult {
   try {
@@ -595,14 +730,18 @@ export function repair(src: string, opts: { tableHeader?: boolean } = {}): Repai
     const reuseRoot =
       p0.src === src && p1.edits.length === 0 && ps.edits.length === 0 ? p1.root : undefined
     const p2 = passMarkers(ps.src, reuseRoot)
+    // P4 快扫必须排在**所有** position 判据之后：它是纯行级兜底，专门覆盖前三者
+    // 「行落进 code 节点 ⇒ 没有段落 position ⇒ 永远看不到」的盲区（见 passHeadingSweep）。
+    const p4 = passHeadingSweep(p2.src)
     // `table` 显式取 `PassResult` 两字段（不透传 `p1`）：`TablePassResult.root` 的偏移基准是
     // `p0.src`、与 `out` 不配套，运行时的形状就不该与声明不一致（同 `RepairResult.table` 的 JSDoc）。
     return {
-      out: p2.src,
+      out: p4.src,
       fence: p0,
       table: { src: p1.src, edits: p1.edits },
       glue: { src: ps.src, edits: ps.edits },
       markers: p2,
+      sweep: p4,
     }
   } catch (err) {
     // fail-safe：抢救层任何异常都不该让消息渲染不出来 —— 退回原文，并显式告警而非静默
@@ -615,6 +754,7 @@ export function repair(src: string, opts: { tableHeader?: boolean } = {}): Repai
       table: fallback,
       glue: fallback,
       markers: { src, edits: [], rejects: [] },
+      sweep: fallback,
     }
   }
 }

@@ -77,10 +77,12 @@ class SessionArtifactSourceCodeFilterTest {
     private void callSaveDeliverable(Path path) {
         var item = new SessionArtifactParser.ParsedArtifact(path.getFileName().toString(), path.toString(), null, null);
         try {
+            // 第 5 个形参 = sourceMessageId（2026-11-05 起产物按轮次归属）；本测试不关心归属，传 null
             var m = SessionArtifactService.class.getDeclaredMethod(
-                    "saveDeliverable", String.class, SessionArtifactParser.ParsedArtifact.class, String.class, String.class);
+                    "saveDeliverable", String.class, SessionArtifactParser.ParsedArtifact.class,
+                    String.class, String.class, String.class);
             m.setAccessible(true);
-            m.invoke(service, SESSION, item, tempDir.toString(), "2026-11-02T00:00:00Z");
+            m.invoke(service, SESSION, item, tempDir.toString(), "2026-11-02T00:00:00Z", null);
         } catch (java.lang.reflect.InvocationTargetException e) {
             throw new IllegalStateException(e.getCause());
         } catch (ReflectiveOperationException e) {

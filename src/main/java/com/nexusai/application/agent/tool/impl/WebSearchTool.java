@@ -146,39 +146,19 @@ public class WebSearchTool implements Tool {
     public static final String NAME = ToolNameConstants.WEB_SEARCH_TOOL_NAME;
 
     /**
-     * [2026-11-02 用户裁定「在 websearch / webfetch 中就存好当前」] 搜索结果**当场入库为来源**。
+     * [2026-11-04 产物采集改走 hook] 来源采集**已从本工具移出** → 改由
+     * {@code ArtifactCollectionHooks}（PostToolUse hook）统一采集。
      *
-     * <p><b>WHY 在工具里存</b>：hits 本来就带 {@code title + url}；轮末再扫消息解析结果 JSON
-     * 是绕远路，而且依赖「结果形状」这个假设。存入时机 = 搜索成功那一刻 ⇒ 前端即时可见。
+     * <p><b>WHY 移出</b>（用户 2026-11-04 裁定）：工具内埋点每加一个工具就要补一次，
+     * 且子代理 / MCP 工具走别的路径容易漏；hook 一个覆盖所有工具
+     * （子代理与主循环共用 {@code StreamingToolExecutor.executePostToolUse}）。
      *
-     * <p>{@code @Autowired(required=false)}：单测直构时无 bean ⇒ 跳过（工具行为零变化）。
+     * <p>命中 url 仍取自 hits（{@code title + url}）—— hook 从本工具的<b>工具结果</b>里
+     * 按形状收集（{@code results[].content[]} 嵌着 hits），语义与原实现等价。
+     *
+     * <p>⛔ 旧的 {@code recordSources} 方法与 {@code artifactService} 字段已删除
+     * （规则七：显式择一，不留双写者）。
      */
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private com.nexusai.application.session.SessionArtifactService artifactService;
-
-    /** 测试注入缝（生产走字段注入）。 */
-    public void setArtifactService(com.nexusai.application.session.SessionArtifactService svc) {
-        this.artifactService = svc;
-    }
-
-    /** 批量记来源（fail-soft：⛔ 采集失败绝不影响搜索结果返回）。 */
-    private void recordSources(com.nexusai.application.agent.tool.ToolUseContext ctx, List<SearchHit> hits) {
-        if (artifactService == null || ctx == null || ctx.sessionId() == null || hits == null || hits.isEmpty()) {
-            return;
-        }
-        String sid = ctx.sessionId();
-        for (SearchHit hit : hits) {
-            if (hit.url() == null || hit.url().isBlank()) {
-                continue;
-            }
-            try {
-                String title = hit.title() != null && !hit.title().isBlank() ? hit.title() : hit.url();
-                artifactService.recordSource(sid, title, hit.url(), null);
-            } catch (Throwable t) {
-                log.warn("[WebSearchTool] 来源入库失败（不影响搜索） url={}: {}", hit.url(), t.toString());
-            }
-        }
-    }
 
     /**
      * 引擎结果条数内部上限 · 对齐 CC {@code max_uses: 8}（WebSearchTool.ts:82，API server tool
@@ -699,8 +679,8 @@ public class WebSearchTool implements Tool {
             // 失败降级为简单摘要文本（仍在 results 末项），搜索不中断
             boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
             String commentary = summarizeHits(query, hits, ctx, isNonInteractive);
-            // [2026-11-02] 搜索成功 ⇒ 当场把 hits 记为「来源」
-            recordSources(ctx, hits);
+            // [2026-11-04] 来源采集已移到 PostToolUse hook（ArtifactCollectionHooks）——
+            //   本工具只负责把 hits 放进结果（buildOutput），采集方从结果里按形状收 url。
             return ToolResult.success(call.id(), buildOutput(query, call.id(), hits, commentary, durationSeconds));
         } catch (Exception e) {
             log.warn("[WebSearchTool] 搜索失败: query='{}' engine={} err={}",
@@ -1076,6 +1056,47 @@ public class WebSearchTool implements Tool {
                     proxy == null ? "直连" : proxy);
         }
         return new AnySearchEngine(baseUrl, apiKey, proxy, anysearchHttpClient);
+    }
+
+    /**
+     * 纯搜索 · <b>供问答链（RAG）复用，不经过工具调用路径</b>。
+     *
+     * <p><b>WHY 要这个方法</b>：源侧 {@code chat_pipeline/search.go:searchWebIfEnabled} 在
+     * CHUNK_SEARCH 阶段并发跑一次联网检索。本仓的搜索引擎全在工具里，问答链没有工具上下文
+     * ⇒ 需要一个纯函数形态的入口。
+     *
+     * <p><b>与 {@link #execute} 的区别</b>（⛔ 刻意不共享执行路径）：
+     * <ul>
+     *   <li>不做弱模型结果总结（问答链要的是原始命中 + URL，正文由 WEB_FETCH 阶段抓）</li>
+     *   <li>不落库 / 不推流 / 不采集来源 / 不写会话状态</li>
+     * </ul>
+     * ⇒ 现有工具行为<b>零变化</b>（本方法是新增旁路，execute 一行未改）。
+     *
+     * <p>引擎选择仍走 {@link #resolveEngine()}（settings.websearchEngine）—— 与工具路径同一份配置，
+     * 不会出现「工具用 anysearch、问答链用别家」的分叉。
+     *
+     * @param query      搜索词（空白 → 空列表）
+     * @param maxResults 结果条数上限（&lt;= 0 → 空列表）
+     * @return 命中（{@code title} / {@code url}）；引擎失败 → 空列表 + WARN
+     */
+    public List<SearchEngine.SearchHit> searchRaw(String query, int maxResults) {
+        if (query == null || query.isBlank() || maxResults <= 0) {
+            return List.of();
+        }
+        try {
+            SearchEngine engine = resolveEngine();
+            List<SearchEngine.SearchHit> hits = engine.search(
+                new SearchEngine.SearchRequest(query, null, null, maxResults, null, null));
+            if (log.isInfoEnabled()) {
+                log.info("[WebSearchTool] RAG 联网检索 engine={} query={} 命中={}",
+                    engine.name(), query, hits == null ? 0 : hits.size());
+            }
+            return hits == null ? List.of() : hits;
+        } catch (Exception e) {
+            // 联网是增强：失败不该让整轮问答失败（源侧同样只记 WARN）
+            log.warn("[WebSearchTool] RAG 联网检索失败: query={} err={}", query, e.getMessage());
+            return List.of();
+        }
     }
 
     private static List<String> readStringList(JsonNode input, String key) {

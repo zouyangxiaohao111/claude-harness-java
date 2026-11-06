@@ -1916,14 +1916,64 @@ public class SubagentExecutor {
             //   之前审计偏差: 静默 fallback → 模型以为指定了 X 实则跑通用, 不一致.
             //   现在: 显式抛 AgentNotFoundException, 外层 SubagentTool.executeSync 捕获
             //   后转 ToolResult.error 返回父 Agent, 模型可调整策略.
-            String availableList = BuiltInAgents.getBuiltInAgents().stream()
-                .map(AgentDefinition::agentType)
-                .sorted()
-                .collect(java.util.stream.Collectors.joining(", "));
+            // [external-agent 2026-11-04] 「可用列表」必须取**本会话 registry 全量**（含自定义 md /
+            //   外部运行时 agent）。原实现只列 BuiltInAgents ⇒ 外部 agent 明明注册了，报错却说它不存在，
+            //   模型会被误导成「这个类型根本没做」。
+            String availableList = availableAgentTypesFor(effectiveType);
             log.warn("[SubagentExecutor] Agent type '{}' 未找到 — 抛出 AgentNotFoundException, "
                     + "可用: {}", effectiveType, availableList);
             throw new AgentNotFoundException("Agent type '" + effectiveType + "' 未找到。"
                     + "可用 Agent types: " + availableList);
+        }
+
+        // ── [external-agent 2026-11-04] 外部 CLI 运行时分支 ──
+        //   WHY 在 Step 2 之前分叉：Step 2–19 全部服务于**进程内 LLM 循环**
+        //   （工具白名单 / hooks / MCP / worktree / systemPrompt 装配），对外部进程毫无意义。
+        //   外部路径自带 agentId / transcript / 三态结果，对外形态与进程内子代理一致
+        //   ⇒ 右栏面板、SubagentController 两个端点、历史回看零改动。
+        if (agentDefinition instanceof AgentDefinition.ExternalAgentDefinition externalDef) {
+            String parentSessionId = (effectiveParentTuc != null && effectiveParentTuc.sessionId() != null
+                    && !com.nexusai.common.SessionKeys.NO_SESSION.equals(effectiveParentTuc.sessionId()))
+                    ? effectiveParentTuc.sessionId()
+                    : null;
+            if (parentSessionId == null) {
+                log.warn("[SubagentExecutor] 外部运行时子代理无父会话（{}=null）→ transcript 无落盘根，"
+                        + "右栏不可见。type={}", "effectiveParentTuc.sessionId", effectiveType);
+            }
+            // 工作目录：外部 CLI 必须在**父会话的项目根**里跑，否则它读不到仓库、
+            // 写产物也落到进程 user.dir（真机上表现为「文件找不着」）。
+            java.nio.file.Path externalCwd = null;
+            if (effectiveParentTuc != null && effectiveParentTuc.effectiveCwd() != null) {
+                externalCwd = effectiveParentTuc.effectiveCwd();
+            }
+
+            // [简化口径 2026-11-04 用户] 「没有运行时会说明并采用默认的配置」：
+            //   先探一次可用性；不可用就**回落内置 general-purpose**，并把原因写进日志。
+            //   ⛔ 不在这里直接失败 —— 用户选了默认运行时但本机没装，不该让整个任务挂掉。
+            var resolution = com.nexusai.application.agent.subagent.external.ExternalRuntimeSpec
+                    .tryResolve(externalDef, modelOverride, externalCwd);
+            if (!resolution.isAvailable()) {
+                log.warn("[SubagentExecutor] 外部运行时不可用，回落内置子代理: type={} reason={}",
+                        effectiveType, resolution.unavailableReason());
+                // 回落：换成内置 general-purpose 继续走原有 22 步链路
+                agentDefinition = BuiltInAgents.get(BuiltInAgents.GENERAL_PURPOSE);
+                effectiveType = BuiltInAgents.GENERAL_PURPOSE;
+                if (agentDefinition == null) {
+                    throw new AgentNotFoundException(
+                            "外部运行时不可用（" + resolution.unavailableReason()
+                                    + "），且内置 general-purpose 也取不到");
+                }
+            } else {
+                String externalAgentId = com.nexusai.application.agent.subagent.external.ExternalAgentRunner
+                        .newAgentId();
+                log.info("[SubagentExecutor] 走外部运行时后端: type={} runtime={} capabilities={} agentId={} cwd={}",
+                        effectiveType, externalDef.runtime(), externalDef.capabilities(),
+                        externalAgentId, externalCwd);
+                return com.nexusai.application.agent.subagent.external.ExternalAgentRunner.run(
+                        externalDef, prompt, modelOverride, externalCwd,
+                        parentSessionId, externalAgentId,
+                        descriptionForExternal(prompt, effectiveType));
+            }
         }
 
         // ── Step 2: toolPermissionContext ──
@@ -3204,17 +3254,42 @@ public class SubagentExecutor {
     }
 
     /**
+     * 「可用 Agent types」列表 · 用于 AgentNotFoundException 的可操作提示。
+     *
+     * <p>[external-agent 2026-11-04] 原实现只列 {@code BuiltInAgents} ⇒ 自定义 md agent 与
+     * 外部运行时 agent 明明在本会话 registry 里，报错却说「不存在」，会把模型引向
+     * 「这个类型根本没做」的错误判断。现改为：registry 全量（含 per-session 自定义/外部）优先。
+     */
+    private String availableAgentTypesFor(String requestedType) {
+        if (additionalAgentDefinitions != null && !additionalAgentDefinitions.isEmpty()) {
+            return additionalAgentDefinitions.keySet().stream()
+                    .sorted()
+                    .collect(java.util.stream.Collectors.joining(", "));
+        }
+        return BuiltInAgents.getBuiltInAgents().stream()
+                .map(AgentDefinition::agentType)
+                .sorted()
+                .collect(java.util.stream.Collectors.joining(", "));
+    }
+
+    /**
+     * 外部后端的任务描述（写 transcript meta 标题）。
+     *
+     * <p>本入口（{@code executeStreaming}）签名里没有 description —— 它属于工具层参数。
+     * 用 prompt 首行截断是诚实的近似，⛔ 不要为此改动总入口签名。
+     */
+    private static String descriptionForExternal(String prompt, String agentType) {
+        if (prompt == null || prompt.isBlank()) return agentType;
+        String firstLine = prompt.lines().findFirst().orElse(prompt).trim();
+        return firstLine.length() <= 120 ? firstLine : firstLine.substring(0, 120) + "…";
+    }
+
+    /**
      * [P0-1] effort 合并 · 对齐 CC SkillTool.ts:208-212 ({@code {...baseAgent, effort: command.effort}}).
      *
      * <p>CC 对象展开 ({@code ...baseAgent}) 等价 Java 端 Builder 全字段复制 + effort 覆盖.
      * {@link #resolveAgentDefinition} 经 [FIX-AM] agentDefinitionResolver 可产出自定义 agent;
      * 本方法仅 BuiltIn 分支做 Builder 全字段复制 (自定义 agent 已含自身 effort, 原样返回 fail-safe).
-     *
-     * <p>[C-31] effort 消费点已打通: runSubagentQueryLoop 子 AgentState 注入
-     * {@code agentDefinition.effort} → LlmAgentLoop ModelRequest 构造读 {@code state.effortValue()}
-     * （:2762 等价 query.ts:694）→ ModelCaller → AnthropicSdkProvider buildMessageParams
-     * （output_config.effort + effort-2025-11-24 beta header，claude.ts:1458 + 437-463）。
-     * 本方法合并的数据形态因此真实作用于 fork LLM 请求（SkillTool.ts:208-212 语义闭环）。
      *
      * @param base   基础 AgentDefinition (BuiltIn)
      * @param effort skill frontmatter effort 值 (Command.getEffort, Command.java:172)

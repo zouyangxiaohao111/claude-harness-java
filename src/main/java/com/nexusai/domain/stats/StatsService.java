@@ -653,6 +653,55 @@ public class StatsService {
             : null;
     }
 
+    /**
+     * 某时刻之后的<b>输出 token</b> 合计（{@code /goal} 目标头「已消耗」的真实口径）。
+     *
+     * <h2>WHY 不从 AgentState 取</h2>
+     * 旧实现取 {@code AgentState.sessionOutputTokens()}（进程内 per-run 累计）：每轮 run 新建
+     * AgentState 并用注册表覆盖 ⇒ 经 REST 设目标时常常取不到（实测 {@code tokensAtStart=0}），
+     * 且它记的是「设定时的基线」而不是「目标期间消耗了多少」。明细表 {@code llm_usage_calls}
+     * 逐次调用一行、有 {@code idx_llm_usage_calls_session_started} 索引 ⇒ 一次 SUM 即可拿到真值
+     * （同一份数据源即「用量与花费」页与统计页的权威值）。
+     *
+     * <h2>口径</h2>
+     * 该会话 {@code started_at >= since} 的全部明细行，<b>不按 category 过滤</b> —— 子代理 /
+     * 压缩 / 旁路调用同样消耗目标期间的真实额度。只算 {@code output_tokens}（CC 的 {@code DA()} 口径）。
+     *
+     * <h2>时间比较</h2>
+     * 与 {@link #aggregate} 同款：{@code started_at} <b>字符串比较</b>，下界经
+     * {@link #normalizeBound} 统一成本地带偏移 ISO-8601。V101 之前的历史行是 UTC {@code Z} 结尾
+     * （实测 96570 行，最新到 2026-10-16）⇒ 仅当目标设定的下界早于该时点、跨格式边界时比较可能
+     * 偏移几分钟；目标期间消耗的展示场景不依赖那一档精度（且新写的行一律带偏移）。
+     *
+     * @param sessionId     会话 ID
+     * @param sinceEpochMs  下界（含）· epoch 毫秒
+     * @return 输出 token 合计（{@code >=0}）；<b>mapper 未装配 / 查询异常 / 参数非法 → {@code null}</b>
+     *         （调用方据此不渲染该字段，⛔ 不伪造 0 —— 「查不到」与「真的是 0」必须可分）
+     */
+    public Long outputTokensSince(String sessionId, long sinceEpochMs) {
+        if (sessionId == null || sessionId.isBlank() || sinceEpochMs <= 0L || usageCallMapper == null) {
+            return null;
+        }
+        String sinceIso = normalizeBound(String.valueOf(sinceEpochMs), "since");
+        if (sinceIso == null) {
+            return null;
+        }
+        QueryWrapper w = QueryWrapper.create()
+            .select("COALESCE(SUM(output_tokens),0) AS output_tokens")
+            .eq("session_id", sessionId)
+            .and("started_at >= ?", sinceIso);
+        List<OutputTokensRow> rows = queryAs(w, OutputTokensRow.class);
+        if (rows.isEmpty()) {
+            return null;
+        }
+        long used = rows.get(0).outputTokens;
+        if (log.isDebugEnabled()) {
+            log.debug("[StatsService] outputTokensSince: session={} since={} rows=1 used={}",
+                sessionId, sinceIso, used);
+        }
+        return used;
+    }
+
     /** 明细表按会话读（mapper 未装配 / 异常 → 空列表，fail-soft）。 */
     private List<LlmUsageCallRecord> listUsageCallsForSession(String sessionId) {
         if (usageCallMapper == null) {
@@ -876,6 +925,16 @@ public class StatsService {
         private long failedCalls;
         private long legacyCalls;
         private double legacyCostYuan;
+    }
+
+    /**
+     * 单值输出 token 合计行（{@link #outputTokensSince}）。
+     *
+     * <p>⚠️ 别名必须是蛇形 {@code output_tokens} —— Flex 由字段名反推列名建 ResultMap，
+     * 写 camelCase 别名会让字段静默为 0（同本段开头的口径警告）。
+     */
+    private static class OutputTokensRow {
+        private long outputTokens;
     }
 
     /** byDay 单行（{@code day_date} = 调用发生日，本地日期）。 */

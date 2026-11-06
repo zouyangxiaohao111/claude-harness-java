@@ -113,7 +113,9 @@ class MacOsComputerUseBackendTest {
             if (script.contains("NSPasteboard")) {
                 return ok("{\"restored\":true,\"pasted\":true,\"snapshotItems\":1}");
             }
-            if (script.contains("CGPreflightScreenCaptureAccess")) {
+            // 屏幕录制探针：2026-11-02 起改用 CGWindowListCreateImage
+            //   （CGPreflightScreenCaptureAccess 在 JXA 桥里根本不存在 ⇒ 永远 TypeError）
+            if (script.contains("CGWindowListCreateImage")) {
                 return ok("true");
             }
             if (script.contains("CGGetActiveDisplayList")) {
@@ -483,7 +485,7 @@ class MacOsComputerUseBackendTest {
     void tccUnauthorizedScreenRecordingFailsLoud() {
         FakeRunner runner = new FakeRunner(cmd -> {
             String script = scriptOf(cmd);
-            if (script.contains("CGPreflightScreenCaptureAccess")) {
+            if (script.contains("CGWindowListCreateImage")) {
                 return ok("false");
             }
             return defaultRunner().handler.apply(cmd);

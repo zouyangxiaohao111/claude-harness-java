@@ -844,29 +844,43 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             //   由 LlmAgentLoop turn 顶部 drain 出站到 /topic/tasks（对齐 CC sessionState.ts:128
             //   enqueueSdkEvent {subtype:'session_state_changed', state}）。
             //   sdkEventQueue 未注入（测试直构）→ 跳过，不阻断权限流程。
-            if (pending.isEmpty() && sdkEventQueue != null) {
-                // [C2 · 会话归属规则] 归【发射会话】= 本次弹窗实际投递到的会话（owningSessionId，
-                //   与上面 STOMP 推送端点同源；teammate 请求 → Leader 会话）。
-                //   取不到会话（null / NO_SESSION 哨兵）⇒ 不入队 + log.warn：
-                //   ⛔ 不许塞 SessionKeys.NO_SESSION 冒充会话（那是「确无会话」哨兵，非真会话；
-                //      会被前端 `/topic/sessions/no-session/...` 打成无人订阅的 topic）；
-                //   ⛔ 不许用 null 入队（出站 session_id 恒非空是 C2 契约，前端
-                //      `evt.session_id ?? sessionIdRef.current` 会把它错标到当前打开的会话）。
-                //   丢弃代价 = 零可见损失：该事件前端当前未消费（仅回「会话继续运行」语义）。
-                String emitSessionId = owningSessionId(ctx);
-                if (emitSessionId == null || emitSessionId.isBlank()
-                        || SessionKeys.isNoSession(emitSessionId)) {
-                    log.warn("PERMISSION 无 pending 权限请求，但取不到发射会话（sessionId={}）→ "
-                        + "会话态 running 通知**不入队** requestId={}（C2：空会话键出站会被前端错标到当前会话）",
-                        emitSessionId, requestId);
-                } else {
-                    sdkEventQueue.enqueueSdkEvent(emitSessionId,
-                        new SdkEventQueue.SessionStateChangedEvent("running"));
-                    if (log.isDebugEnabled()) {
-                        log.debug("PERMISSION 无 pending 权限请求 → 会话态 running 通知出站 sessionId={} requestId={}（对齐 CC structuredIO.ts:654）",
+            // [权限决策隔离 · 2026-11-04] 会话态 running 是**纯通知副作用**，其失败不得改写本次
+            //   权限决策。原实现无兜底：`new SdkEventQueue.SessionStateChangedEvent(...)` 抛
+            //   NoClassDefFoundError（并发构建把 target/classes 重写、该内部类首次懒加载落空，
+            //   JVM 负缓存后持续失败）→ 冒出 finally 顶掉 try 里已定的返回值 →
+            //   ToolPermissionGate.mapToDecision 的 catch (Throwable) 接住 → cancelAndAbortDecision
+            //   → 用户刚点的「允许」被当取消、整轮 abort("permission_cancelled")。
+            //   实测：日志 info.log 同一 requestId 出现 decision=Allow 紧接「按取消处理」。
+            //   catch Throwable 而非 Exception：NoClassDefFoundError 是 Error，正是本事故形态。
+            try {
+                if (pending.isEmpty() && sdkEventQueue != null) {
+                    // [C2 · 会话归属规则] 归【发射会话】= 本次弹窗实际投递到的会话（owningSessionId，
+                    //   与上面 STOMP 推送端点同源；teammate 请求 → Leader 会话）。
+                    //   取不到会话（null / NO_SESSION 哨兵）⇒ 不入队 + log.warn：
+                    //   ⛔ 不许塞 SessionKeys.NO_SESSION 冒充会话（那是「确无会话」哨兵，非真会话；
+                    //      会被前端 `/topic/sessions/no-session/...` 打成无人订阅的 topic）；
+                    //   ⛔ 不许用 null 入队（出站 session_id 恒非空是 C2 契约，前端
+                    //      `evt.session_id ?? sessionIdRef.current` 会把它错标到当前打开的会话）。
+                    //   丢弃代价 = 零可见损失：该事件前端当前未消费（仅回「会话继续运行」语义）。
+                    String emitSessionId = owningSessionId(ctx);
+                    if (emitSessionId == null || emitSessionId.isBlank()
+                            || SessionKeys.isNoSession(emitSessionId)) {
+                        log.warn("PERMISSION 无 pending 权限请求，但取不到发射会话（sessionId={}）→ "
+                            + "会话态 running 通知**不入队** requestId={}（C2：空会话键出站会被前端错标到当前会话）",
                             emitSessionId, requestId);
+                    } else {
+                        sdkEventQueue.enqueueSdkEvent(emitSessionId,
+                            new SdkEventQueue.SessionStateChangedEvent("running"));
+                        if (log.isDebugEnabled()) {
+                            log.debug("PERMISSION 无 pending 权限请求 → 会话态 running 通知出站 sessionId={} requestId={}（对齐 CC structuredIO.ts:654）",
+                                emitSessionId, requestId);
+                        }
                     }
                 }
+            } catch (Throwable th) {
+                // 通知失败只留痕，不改变本次决策（上面的清理已完成，返回值不受影响）
+                log.warn("PERMISSION 会话态 running 通知失败，忽略（不影响本次权限决策）requestId={} err={}",
+                    requestId, th.toString());
             }
         }
     }

@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool;
 
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
@@ -48,6 +49,62 @@ public final class AgentToolPolicy {
     private static final Logger log = LoggerFactory.getLogger(AgentToolPolicy.class);
 
     private AgentToolPolicy() {
+    }
+
+    /**
+     * 「默认池 + 这几个专属工具」的显式名单（主对话「引入知识库」开关用）。
+     *
+     * <h2>⭐ 为什么需要这个，而不是直接把工具名拼进白名单</h2>
+     * 默认池的语义是「剔除 {@link ToolScope#EXCLUSIVE}」。要让<b>个别</b>专属工具
+     * 进池，唯一不解开全部专属工具的办法是：<b>按默认池的规则算出该有哪些工具</b>，
+     * 再把指定名字追加进去，最后交给显式名单分支（它不剔除 EXCLUSIVE）。
+     *
+     * <p>⛔ 不能直接用「池里全部工具名」当名单 —— 那会把**其它**专属工具一并放行。
+     *
+     * @param visibleTools 当轮已过滤池
+     * @param extraNames   额外要放行的工具名（只写名字；池里没有的会被静默忽略）
+     * @return 显式名单；池为空 ⇒ {@code Optional.empty()}（调用方回落到通配）
+     */
+    public static Optional<List<String>> defaultPoolPlus(List<Tool> visibleTools,
+                                                        java.util.Collection<String> extraNames) {
+        if (visibleTools == null || visibleTools.isEmpty()) {
+            return Optional.empty();
+        }
+        Set<String> extras = new HashSet<>();
+        if (extraNames != null) {
+            for (String n : extraNames) {
+                if (n != null && !n.isBlank()) {
+                    extras.add(n.trim());
+                }
+            }
+        }
+        List<String> names = new ArrayList<>(visibleTools.size() + extras.size());
+        Set<String> seen = new HashSet<>();
+        // 先按池原顺序列出「非专属」工具（= 默认池内容）
+        for (Tool tool : visibleTools) {
+            if (tool == null || tool.name() == null) {
+                continue;
+            }
+            if (ToolScope.of(tool) == ToolScope.EXCLUSIVE) {
+                continue;
+            }
+            if (seen.add(tool.name())) {
+                names.add(tool.name());
+            }
+        }
+        // 再追加点名的专属工具（只加池里真实存在的）
+        for (Tool tool : visibleTools) {
+            if (tool == null || tool.name() == null) {
+                continue;
+            }
+            if (extras.contains(tool.name()) && seen.add(tool.name())) {
+                names.add(tool.name());
+            }
+        }
+        if (names.isEmpty()) {
+            return Optional.empty();
+        }
+        return Optional.of(names);
     }
 
     /**

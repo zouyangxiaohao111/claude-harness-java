@@ -224,6 +224,19 @@ public class SlashCommandInterceptor {
                     log.info("[slash] local 命令 skip 结果: cmd={} → 无消息（shouldQuery=false）", commandName);
                     return new SlashResolution(true, false, null, null, command, null, genResultId());
                 }
+                // [goal V253] query 形态 ⇒ 触发一轮执行 · 对齐 CC processSlashCommand 的
+                //   {@code if (b.type==="query") return {messages:[_, stdout, {content:b.prompt, isMeta:true}],
+                //   shouldQuery:true, resultText:b.value}}。
+                //   ⇒ /goal <条件> 设定目标后**立刻跑一轮 LLM**，模型看到 kickoff 提示词就开始朝目标工作
+                //   （否则只记下目标、不执行 —— 用户实测发现的缺口）。
+                if ("query".equals(lr.kind())) {
+                    String kickoff = lr.prompt();
+                    String stdout = "<local-command-stdout>"
+                        + (lr.value() == null ? "" : lr.value()) + "</local-command-stdout>";
+                    log.info("[slash] local 命令 query 结果: cmd={} → 触发一轮执行（shouldQuery=true, "
+                        + "kickoff {} 字符）", commandName, kickoff == null ? 0 : kickoff.length());
+                    return new SlashResolution(true, true, kickoff, stdout, command, kickoff, genResultId());
+                }
                 String stdout = "<local-command-stdout>"
                     + (lr.value() == null ? "" : lr.value()) + "</local-command-stdout>";
                 log.info("[slash] local 命令 text 结果: cmd={} → <local-command-stdout>（shouldQuery=false）",

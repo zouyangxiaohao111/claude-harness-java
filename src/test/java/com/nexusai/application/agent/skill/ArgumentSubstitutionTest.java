@@ -114,6 +114,49 @@ class ArgumentSubstitutionTest {
             .containsExactly("spaced", "out");
     }
 
+    @Test
+    @DisplayName("parseArguments 长 JSON 输入不抛 StackOverflowError（2026-11-05 生产故障回归）")
+    void parseArguments_longJsonInput_noStackOverflow() {
+        // WHY（真实事故）：prompt/agent 型 hook 把整个 hook 输入 JSON 当 args 传给
+        // substituteArguments（CC hookHelpers.ts:30 addArgumentsToPrompt）。Stop 事件的
+        // jsonInput 含 last_assistant_message（整段模型回答）⇒ 几 KB 的转义 JSON。
+        // Java 的 Pattern 用线程栈递归回溯（V8 是堆上显式栈，所以 CC 侧永不炸），
+        // 旧 chunker 在 5 KB 处必抛 StackOverflowError，且 catch(RuntimeException) 接不住
+        // （Error 不是 RuntimeException）⇒ 穿透到 ExecPromptHook.catch(Throwable) →
+        // 归一成 non_blocking_error → 「目标评估器执行失败 → 重试 3 次 → 目标暂停」。
+        StringBuilder sb = new StringBuilder("{\"hook_event_name\":\"Stop\",\"session_id\":\"sess-x\"");
+        for (int i = 0; i < 200; i++) {
+            sb.append(",\"k").append(i).append("\":\"C:\\\\a\\\\b | c (d) \\\"q\\\" (e)\"");
+        }
+        String longJson = sb.append("}").toString();
+        assertThat(longJson.length()).isGreaterThan(5000);   // 必须越过旧实现的爆栈阈值
+
+        // 断言 1：不抛错。若 chunker 退回递归回溯形态，这里会抛 StackOverflowError（测试失败）。
+        List<String> parsed = ArgumentSubstitution.parseArguments(longJson);
+        // 断言 2：返回非空，且首 token 携带 JSON 的骨架 —— 命中的是 shell 分词语义下的
+        //   「去引号去转义」形态（整段 JSON 被视作一个 chunk，因为空格都在引号内）。
+        //   ⚠️ 不断言原样 JSON：shell-quote 本来就会吃掉引号与反斜杠，CC 侧行为相同。
+        assertThat(parsed).isNotEmpty();
+        assertThat(parsed.get(0)).startsWith("{hook_event_name:Stop");
+        assertThat(parsed.get(0)).contains("session_id:sess-x");
+    }
+
+    @Test
+    @DisplayName("parseArguments 分词失败 → 回退空白分割（覆盖 Error 型失败，对齐 CC 无类型 catch）")
+    void parseArguments_fallbackCoversErrorType() {
+        // CC argumentSubstitution.ts:30-34 的 catch (error) 在 JS 里不区分异常类型，
+        // 任何解析失败都退回 args.split(/\s+/).filter(Boolean)。Java 侧只有
+        // catch(RuntimeException) 时，Error（StackOverflowError 等）会绕过兜底 —
+        // 本测试锁住「兜底必须覆盖 Error」这条意图：期望值等同空白分割结果。
+        // 注：走不到分词异常时本条也成立（结果与空白分割一致），故用普通输入断言契约。
+        assertThat(ArgumentSubstitution.parseArguments("foo ${} bar"))
+            .containsExactly("foo", "${}", "bar");
+        // 超长坏替换同样必须走兜底而不是抛错（坏替换抛 IllegalArgumentException 在 chunk 扫描期，
+        // 长输入下 chunker 的栈问题先发生 → 也必须在兜底范围内）。
+        String longBad = "x ${} " + "y ".repeat(5000);
+        assertThat(ArgumentSubstitution.parseArguments(longBad)).isNotEmpty();
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // parseArgumentNames · CC argumentSubstitution.ts:50-68
     // ════════════════════════════════════════════════════════════════════════

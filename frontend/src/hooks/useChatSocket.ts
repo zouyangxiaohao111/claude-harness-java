@@ -29,6 +29,36 @@ import { isQueuedCommandEditable } from './useCommandQueue'
 const pendingStreamAppends = new Map<string, Map<string, { delta: string; reasoning: string }>>()
 /** 已排定的 flush（rAF id；microtask 回落时用 0 占位）：非 null = 已有一帧待 flush, 后续 chunk 只累积不再排。 */
 let streamFlushRaf: number | null = null
+/**
+ * [flush-backstop 2026-11-05] rAF 兜底定时器。
+ *
+ * <p><b>WHY 必须有</b>：{@code requestAnimationFrame} 在<b>窗口不可见 / 标签页切到后台 /
+ * 窗口被最小化</b>时会被浏览器<b>暂停调度</b>（WebView2 同款）。此时
+ * {@link scheduleStreamFlush} 排的那一帧永不触发 ⇒ 增量永远留在
+ * {@link pendingStreamAppends} 里 ⇒ UI 停在最后一帧不再长字；用户切回窗口/切会话时
+ * rAF 恢复（或显式 flush）才一次性补上 —— 这正是「明明结束了却卡在渲染，切换会话才继续」。
+ * 定时器不受可见性影响 ⇒ 补上这一路，保证最迟 250ms 内一定落库。
+ */
+let streamFlushTimer: number | null = null
+/** 兜底间隔（ms）：rAF 正常时最先触发的是 rAF，本定时器只做「rAF 被暂停」时的保底。 */
+const STREAM_FLUSH_BACKSTOP_MS = 250
+
+/**
+ * [gap-repair-deadlock 2026-11-05] 缺口修复（重拉尾页）的硬超时。
+ *
+ * <p>WHY：修复期间 {@code stitchingRef=true} 会让**每一帧都只进缓冲不派发**，
+ * 而复位只发生在 await 之后。{@code api()} 不带超时 ⇒ 重拉一旦挂住就是**永久**停摆。
+ * 8 秒 = 一个尾页请求的正常数量级上界；超时后按失败处理并照常派发缓冲帧。
+ */
+const STREAM_GAP_REPAIR_TIMEOUT_MS = 8_000
+
+/** [gap-repair-deadlock] 超时留痕（走 console.warn：前端无后端那样的落盘日志通道，但 devtools 可查）。 */
+function logGapRepairTimeout(sid: string): void {
+  console.warn(
+    '[stream-gap] 缺口修复超时（%dms）→ 放弃本次对账并按序派发缓冲帧，避免实时通道永久停摆。sid=%s',
+    STREAM_GAP_REPAIR_TIMEOUT_MS, sid,
+  )
+}
 const canUseRaf = typeof requestAnimationFrame === 'function'
 
 /** 把缓冲里所有会话/块的累积增量一次 append 进 chatStore（合并 setState）。显式调用点（complete/cancel/
@@ -37,6 +67,12 @@ function flushStreamAppends() {
   if (streamFlushRaf !== null) {
     if (canUseRaf) cancelAnimationFrame(streamFlushRaf)
     streamFlushRaf = null
+  }
+  // [flush-backstop] 显式 flush（complete/cancel/error/unmount/断连）同样要收掉兜底定时器 ——
+  //   否则它到点会对着已清空的缓冲做一次空转（无害，但会把后续一轮的 flush 节奏搅乱）。
+  if (streamFlushTimer !== null) {
+    window.clearTimeout(streamFlushTimer)
+    streamFlushTimer = null
   }
   if (pendingStreamAppends.size === 0) return
   const st = useChatStore.getState()
@@ -60,6 +96,15 @@ function scheduleStreamFlush() {
     streamFlushRaf = 0
     queueMicrotask(publish)
   }
+  // [flush-backstop 2026-11-05] rAF 不可靠时的保底（原因见 STREAM_FLUSH_BACKSTOP_MS 的注释）。
+  //   ⚠️ 只在「本帧尚未排定」时挂一次（上面的 early-return 已保证），否则每 chunk 一个定时器。
+  //   到点后若无人在等（buffer 已空 / 已被显式 flush）→ flushStreamAppends 自身就是 no-op。
+  if (streamFlushTimer === null) {
+    streamFlushTimer = window.setTimeout(() => {
+      streamFlushTimer = null
+      flushStreamAppends()
+    }, STREAM_FLUSH_BACKSTOP_MS)
+  }
 }
 
 /** [Phase2 · session-file-panel-collapse-atfile] files.changed 载荷 → SessionFile[]（整表替换 · path basename → name）。 */
@@ -74,6 +119,36 @@ function toChangedSessionFiles(raw: { files?: Array<{ path?: string | null; stat
 }
 
 /** STOMP skill_improvement.suggestion 事件（对齐 SkillImprovementSuggestionEvent · 轻量信号） */
+/**
+ * [产物实时推送 2026-11-04] artifact STOMP 载荷里**用于判定的三个字段**。
+ *
+ * <p><b>WHY 只取这三个</b>：其余字段（title / localPath / sizeBytes …）仍以
+ * `GET /sessions/{id}/artifacts` 重拉结果为唯一权威口径（避免两处各自解析 DTO 而漂移）；
+ * 而「是不是这一条」「是不是新建」这两个判据**只能**从推送里拿 —— 重拉的 list 没有
+ * 「本次推送的是哪条」这个信息。
+ *
+ * <p><b>核心 bug 的修复点</b>：原实现不读载荷 ⇒ App 只能取 `list[0]` 打开 ⇒
+ * 上一轮的旧产物被重新推送（轮末扫描 / 轮内监看会把目录里所有文件重新 upsert）
+ * 时会被当成「刚生成的」弹出来。
+ */
+export interface ArtifactPushPayload {
+  /** 被推送的产物 id（载荷缺失/解析失败 → null ⇒ 调用方应按「不知道是哪条」处理）。 */
+  artifactId: string | null
+  /** 产物类别（'deliverable' | 'source'）；无法判定 → null。 */
+  kind: 'deliverable' | 'source' | null
+  /** 是否为**新建**行（true）/ 更新已有行（false）。 */
+  created: boolean
+}
+
+/**
+ * 轮次终态类型（`onSessionDone` 的第三参）。
+ *
+ * <p>用途：宿主据此决定**系统通知**的文案 ——
+ * `complete` 发「已完成」，`error` 发「出错了」，`cancel` 不发（用户自己按的停止，
+ * 他本来就在等它停，再弹一条通知是噪音）。
+ */
+export type TurnEndKind = 'complete' | 'error' | 'cancel'
+
 interface SkillImprovementSuggestionWire {
   type: string
   sessionId?: string | null
@@ -243,9 +318,14 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
       //   统一约束：后端改字段名（如 computerUse）时**编译期**报错，而不是静默丢字段
       //   ⇒ 症状（授权范围消失 / 命中 fail-loud）不会以「编译全绿但线上坏」的形式出现。
       const raw = JSON.parse(msg.body) as PermissionEventPayload
+      if (!raw?.requestId) return
       const st = useChatStore.getState()
       // TEMP 诊断（联调 §38）：确认权限事件到达 + 订阅键（sessionId 匹配检查）
       console.debug(`[perm] ${kind} event on ${topic}`, { requestId: raw.requestId, toolName: raw.toolName, sessionId: sid })
+      // ⚠️ 按 requestId 去重：同一会话可能同时存在 watchSubs（名单订阅）与 permSubs（本订阅）
+      //   两条 message topic 通道 ⇒ 同一条事件会到达两次。不去重会让队列里堆出重复项
+      //   （显示无碍——find 只取第一个，但「已处理/未处理」计数与去重语义会失真）。
+      if (st.permissionQueue.some((r) => r.requestId === raw.requestId)) return
       st.enqueuePermission(toPermissionItem(raw, sid, kind))
       console.debug('[perm] queued, queueLen=', st.permissionQueue.length, raw.requestId)
       // 后端无限等待用户响应（2026-08-24 移除 30s 自动超时；用户取消会话 → user_abort）
@@ -306,8 +386,10 @@ export function useChatSocket(
   showToast?: (msg: string, type?: 'success' | 'info') => void,
   /** 会话生命周期明确信号：complete / cancelled 到达 → 回调 App 移除 activeStreams。
    *   对齐 Harness 事件驱动确定性——不用「streams 从有到无」推断移除（推断与登记竞争 = 卡住根因）。
-   *   topic 参数：事件来源的 streamTopic，App 侧校验当前登记匹配才删（防旧 turn 终止误删新 turn 登记） */
-  onSessionDone?: (sessionId: string, topic?: string) => void,
+   *   topic 参数：事件来源的 streamTopic，App 侧校验当前登记匹配才删（防旧 turn 终止误删新 turn 登记）
+   *   kind 参数：终态类型 —— complete（正常跑完）/ error（模型调用失败）/ cancel（用户主动停止）。
+   *   App 用它决定系统通知的文案（取消不发通知：用户自己按的停止，他本来就知道）。 */
+  onSessionDone?: (sessionId: string, topic?: string, kind?: TurnEndKind) => void,
   /** 排队命令被后端消费（queue.drained）→ 回调 App：append 正式气泡 + 登记新 streamTopic。
    *   drained[].uuid = 后端 user 消息 id（DB 权威），前端气泡 id 用它 → GET 刷新不重复。
    *   [busy 气泡附件胶囊] drained[].userAttachments = 后端权威附件快照（与 GET /messages 同投影）——
@@ -334,14 +416,18 @@ export function useChatSocket(
    */
   knownSessionIds?: string[],
   /**
-   * [产物实时推送 2026-11-02] 后端产物抽取完成推了 `/topic/sessions/{sid}/artifact`
+   * [产物实时推送 2026-11-04] 后端产物抽取完成推了 `/topic/sessions/{sid}/artifact`
    * → 回调 App 立即重拉产物列表（不再等 15 秒轮询）。
    *
-   * <p>只做「踢一脚」：不解析载荷里的字段（后端 DTO 会演进），重拉 list 才是唯一权威口径，
-   * 与既有「轮末 3 秒补拉」走同一条 {@code reloadArtifacts} 路径。
-   * ⚠️ 必须放在参数表**末尾**：调用方全用位置参数，插在中间会让后续实参整体错位。
+   * <p><b>载荷带「是哪一条 + 是不是新建」</b>（2026-11-04 修）：
+   * 原实现只做「踢一脚」（不读 body）⇒ 回调只知道「有东西变了」，不知道是哪条、
+   * 也不知道是新建还是更新 ⇒ App 只能取 `list[0]` 打开 ⇒
+   * **上一轮的旧产物被重新推送时会被当成新的弹出来**（用户实测「新轮次会默认打开之前的产物」）。
+   * ⇒ 现在把 {@code created} 与 {@code artifactId} 一并透出，让调用方能精确判断。
+   *
+   * <p>⚠️ 必须放在参数表**末尾**：调用方全用位置参数，插在中间会让后续实参整体错位。
    */
-  onArtifactPush?: (sid: string) => void,
+  onArtifactPush?: (sid: string, payload: ArtifactPushPayload) => void,
 ) {
   const clientRef = useRef<Client | null>(null)
   const setConnection = useChatStore((s) => s.setConnection)
@@ -492,11 +578,23 @@ export function useChatSocket(
         })
       }
     })
-    // [产物实时推送 2026-11-02] 后端抽取完成即推 → 立即重拉产物列表（不再等 15 秒轮询）。
-    //   只做「踢一脚」：拿到的载荷不带完整字段演进保证，重拉 list 才是唯一权威口径
-    //   （与既有轮末 3 秒补拉同一条路径，避免两处各自解析 DTO 而漂移）。
-    const artifact = client.subscribe(`/topic/sessions/${sid}/artifact`, () => {
-      onArtifactPushRef.current?.(sid)
+    // [产物实时推送 2026-11-04] 后端抽取完成即推 → 立即重拉产物列表（不再等 15 秒轮询）。
+    //   载荷只取「是哪一条 + 是不是新建」两个判据字段（其余字段仍以重拉 list 为权威口径，
+    //   与既有轮末 3 秒补拉同一条路径，避免两处各自解析 DTO 而漂移）。
+    //   WHY 要这两个字段：只「踢一脚」的话，App 不知道推的是哪一条 ⇒ 只能取 list[0]
+    //   ⇒ 旧产物被重新推送时会被当成新的弹出来（用户实测「新轮次会默认打开之前的产物」）。
+    const artifact = client.subscribe(`/topic/sessions/${sid}/artifact`, (msg) => {
+      let raw: Record<string, unknown> | null = null
+      try { raw = JSON.parse(msg.body) } catch { return }
+      const artifactNode = raw?.artifact as { id?: unknown; kind?: unknown } | undefined
+      const payload: ArtifactPushPayload = {
+        artifactId: typeof artifactNode?.id === 'string' ? artifactNode.id : null,
+        kind: artifactNode?.kind === 'deliverable' || artifactNode?.kind === 'source'
+          ? artifactNode.kind
+          : null,
+        created: raw?.created === true,
+      }
+      onArtifactPushRef.current?.(sid, payload)
     })
     // 压缩进度（compact-progress · 按 sid 常驻）：manual/auto /compact 进行中 → 驱动输入框上方进度横幅 + 发送键变停止
     const compact = client.subscribe(`/topic/sessions/${sid}/compact-progress`, (msg) => {
@@ -739,6 +837,43 @@ export function useChatSocket(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeStreams])
 
+  /**
+   * [perm-backstop 2026-11-05] 当前会话的权限/提问补拉兜底（对齐 goal 目标轮询的 F1 双通道）。
+   *
+   * <p><b>病情（用户实测）</b>：两个会话同时触发 AskUserQuestion —— 另一个会话（后台）能看到
+   * 侧栏黄点，而<b>当前会话自己的提问卡片一直不出现</b>，卡住二十多分钟；等另一个会话答完、
+   * 切走再切回来，卡片才冒出来。切回来才出现 = 它是由切会话的 REST 补拉
+   * （{@link replayPendingPermissions}）捞回来的 ⇒ <b>实时 STOMP 事件在到达前就丢了</b>。
+   *
+   * <p><b>为什么不能只靠实时推送</b>：权限请求是<b>一次性推送</b>，订阅未建立 / 被误摘 /
+   * 半开连接都会静默丢弃，而后端仍在无限等待（{@code future.get()} 无超时是设计）。
+   * 后端已经保留了「仍在等待用户」的快照（{@code WebSocketPermissionPrompter.pendingBySession}
+   * + {@code GET /sessions/{sid}/state}），只是此前只在「切会话 / 重连」两个时点消费。
+   *
+   * <p><b>为什么只在「本会话在跑 且 本地没有它的待处理项」时轮询</b>：
+   * <ul>
+   *   <li>AskUserQuestion 会阻塞当前 turn ⇒ 该场景必然 {@code running}；</li>
+   *   <li>本地已有该项 ⇒ 卡片已在显示，再拉只会重复（{@link replayPendingPermissions} 自身按
+   *       requestId 去重，是幂等的）；</li>
+   *   <li>不在跑 / 无需回答的绝大多数时间是<b>零额外请求</b>（与会话数无关，只打当前会话）。</li>
+   * </ul>
+   *
+   * <p>间隔 8 秒：比 goal 的 10 秒略快 —— 卡片不出现时用户面对的是「整个对话卡死」，
+   * 体感权重高于目标条的状态刷新。
+   */
+  const currentPermCount = useChatStore(
+    (s) => s.permissionQueue.filter((r) => r.sessionId === sessionId).length,
+  )
+  const currentRunning = !!sessionId && !!activeStreams[sessionId]
+  useEffect(() => {
+    if (!sessionId || !currentRunning || currentPermCount > 0) return
+    let cancelled = false
+    const pull = () => { if (!cancelled) replayPendingPermissions(sessionId) }
+    pull()   // 进入该状态的瞬间先拉一次（不必等满一个周期）
+    const timer = window.setInterval(pull, 8_000)
+    return () => { cancelled = true; window.clearInterval(timer) }
+  }, [sessionId, currentRunning, currentPermCount])
+
   /** 动态增删活跃会话的 stream + 权限订阅（onConnect 首次 + activeStreams 变化时）：
    *  切走会话不取消订阅，原会话事件持续接收直到 complete → 多会话并行状态准确。
    *  会话级单 topic：stream topic = /topic/sessions/{sid}/stream 恒定，无 per-message 轮换；
@@ -767,7 +902,11 @@ export function useChatSocket(
       if (!active[sid] && sid !== sessionIdRef.current) { sub.unsubscribe(); streamSubsRef.current.delete(sid) }
     }
     for (const [sid, subs] of permSubsRef.current) {
-      if (!active[sid] && sid !== sessionId) {
+      // ⚠️ 判据必须用 ref（与上面 stream 循环同款）：本函数被 onConnect（[] 依赖，闭包永久冻结在
+      //   首次渲染）和 activeStreams effect 两处调用，闭包里的 `sessionId` 可能是过期值 ⇒
+      //   会误判「当前会话不是当前会话」→ 把当前会话的权限订阅摘掉 ⇒
+      //   此后该会话的 AskUserQuestion 实时事件全部丢失（只有切走再切回的 REST 补拉才能找回）。
+      if (!active[sid] && sid !== sessionIdRef.current) {
         subs.message.unsubscribe(); subs.bridge.unsubscribe(); subs.channel.unsubscribe()
         permSubsRef.current.delete(sid)
         bridgeDismissSubs.get(sid)?.unsubscribe()
@@ -809,7 +948,7 @@ export function useChatSocket(
   /** /topic/tasks 事件：task_started/task_progress/task_notification → 本地通知；其余暂不映射 */
   function handleTaskEvent(evt: TaskEvent) {
     // 后端 d973edad 新增顶层 type='task.notification'（结构化终态直推 · 含空闲路径）：
-    //   更新任务状态活动历史 + toast（对齐 CC 任务完成通知）；按会话过滤（契约 §二）
+    //   更新任务状态活动历史；按会话过滤（契约 §二）
     if (evt.type === 'task.notification') {
       // wire 键 = task_id（后端 TaskNotificationEvent @JsonProperty("task_id")，非 camelCase taskId）——
       //   旧实现读 evt.taskId 恒 undefined → taskId=null → addActivity 永不执行 → 子代理后台任务终态
@@ -822,7 +961,8 @@ export function useChatSocket(
           ts: Date.now(),
         }, evt.sessionId ?? sessionIdRef.current ?? undefined)
       }
-      if (showToast) showToast(`任务${evt.status === 'failed' ? '失败' : evt.status === 'stopped' ? '已停止' : '完成'}：${evt.summary ?? '…'}`, 'info')
+      // [2026-11-04 用户裁定] 不再弹「任务完成/失败/已停止」toast（终态太频繁、打断操作）；
+      //   终态仍写活动历史，去右栏「运行」tab 查看。
       return
     }
     // [toolsum-display] tool_use_summary 实时事件 → 会话消息流内插一行摘要（DB 落库后 F5/complete 重拉亦可见；
@@ -919,8 +1059,9 @@ export function useChatSocket(
           const usage = taskUsageOf(evt.usage)
           if (usage) useSubagentStore.getState().setUsage(taskId, usage, sid)
         }
-        // 任务终态 → 居中 toast（对齐「打开会话」提示）
-        if (showToast) showToast(`任务${evt.status === 'failed' ? '失败' : evt.status === 'stopped' ? '已停止' : '完成'}：${evt.summary ?? evt.output_file ?? '…'}`, 'info')
+        // [2026-11-04 用户裁定] 不再弹「任务完成/失败/已停止」toast —— 异步任务终态太频繁，
+        //   每次都打断当前操作。终态仍写活动历史（上方 addActivity + setUsage），
+        //   要查看去右栏「运行」tab 的卡片，不再主动打扰。
         break
       }
       // session_state_changed 暂不映射通知
@@ -978,15 +1119,37 @@ export function useChatSocket(
   /**
    * 缺口修复（resync-lite）· 对齐 dsh `repairGap`：重拉尾页（onReconnectReload）→
    * 把缓冲事件按 seq 拼回去。UI 不闪 loading；期间新事件继续进缓冲。
+   *
+   * <p>⚠️ <b>[gap-repair-deadlock 2026-11-05] 必须带硬超时</b>：修复期间的每一帧都会在
+   * {@link acceptStreamEvent} 顶部被放进 {@code liveBufferRef} 并 <b>return</b>（不派发）；
+   * 而 {@code stitchingRef} 只在下面 {@code finally} 里复位。<b>若那一次重拉永不返回</b>
+   * （{@code api()} 用裸 fetch，<b>不带 AbortSignal / 超时</b>；连接半开、后端卡住都会挂住），
+   * {@code finally} 永不执行 ⇒ {@code stitchingRef} 恒为 true ⇒ <b>之后所有帧（含 complete）
+   * 全部只进缓冲、永不派发</b> ⇒ 界面彻底静止，只能靠切会话（走 {@code loadTailWindow}
+   * 整表替换、不经过本通道）才「突然全出现」——
+   * 这正是「明明跑完了却卡在渲染，切换会话才继续」的一个精确成因。
+   *
+   * <p>⇒ 用 {@link #STREAM_GAP_REPAIR_TIMEOUT_MS} 兜住 await：超时即按修复失败处理，
+   * 照常把缓冲里的事件派发出去（宁可少一次对账，也不能让实时通道永久停摆）。
    */
   async function repairStreamGap(sid: string): Promise<void> {
     if (stitchingRef.current) return
     stitchingRef.current = true
+    let timer: number | null = null
     try {
-      await onReconnectReloadRef.current?.(sid)
+      await Promise.race([
+        Promise.resolve(onReconnectReloadRef.current?.(sid)),
+        new Promise<void>((resolve) => {
+          timer = window.setTimeout(() => {
+            logGapRepairTimeout(sid)
+            resolve()
+          }, STREAM_GAP_REPAIR_TIMEOUT_MS)
+        }),
+      ])
     } catch {
       // 静默：下次事件/重连会再次触发修复（不 toast 打扰）
     } finally {
+      if (timer !== null) window.clearTimeout(timer)
       stitchingRef.current = false
       const buf = liveBufferRef.current
       liveBufferRef.current = []
@@ -1149,7 +1312,7 @@ export function useChatSocket(
       }
       // 生命周期明确信号：通知 App 移除 activeStreams → 取消该会话订阅（无推断竞争）。
       //   带 topic：App 侧校验当前登记的 topic 匹配才删（防旧 turn 终止事件误删刚登记的新 turn）
-      onSessionDoneRef.current?.(sid, topic)
+      onSessionDoneRef.current?.(sid, topic, 'complete')
     } else if (isRetry(evt)) {
       st.setRetry({ attempt: evt.attempt, maxRetries: evt.maxRetries, retryDelayMs: evt.retryDelayMs })
     } else if (isError(evt)) {
@@ -1168,13 +1331,13 @@ export function useChatSocket(
       flushStreamAppends()
       st.setRetry(null)          // complete 分支才置 null；error 分支此前漏 → 重试横幅残留
       st.clearStream(sid)        // error 轮无 complete，流式块不会 finalize → 清掉避免「思考中/打字机」卡住
-      onSessionDoneRef.current?.(sid, topic)
+      onSessionDoneRef.current?.(sid, topic, 'error')
     } else if (isCancelled(evt)) {
       // [打字机节流] 取消清流前 flush 缓冲（把窗口内已收的 delta/reasoning 渲染, 避免取消即丢尾段）
       flushStreamAppends()
       // 已取消 → 清流 + 居中 toast（对齐「已刷新对话」等通知 · 不再走左侧通知栏）
       st.clearStream(sid)
-      onSessionDoneRef.current?.(sid, topic)
+      onSessionDoneRef.current?.(sid, topic, 'cancel')
       if (showToast) showToast('已取消', 'info')
     } else if (isStatus(evt)) {
       // session.status → 驱动 StreamHeader 状态点；非法值回落 idle（防御后端脏数据）

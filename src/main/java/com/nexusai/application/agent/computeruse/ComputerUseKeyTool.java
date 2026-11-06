@@ -94,6 +94,10 @@ public final class ComputerUseKeyTool implements Tool {
                   "minimum": 1,
                   "maximum": 100,
                   "description": "Number of times to repeat the key press. Default is 1."
+                },
+                "observationId": {
+                  "type": "string",
+                  "description": "Optional. The observationId returned by observe. When given, the key is routed ONLY to that application's process (it does not steal focus from your current foreground app). Without it the key goes to the global input stream."
                 }
               },
               "required": ["text"]
@@ -107,6 +111,8 @@ public final class ComputerUseKeyTool implements Tool {
     private final ComputerUseSleeper sleeper;
     private final ComputerUseGrantStore grantStore;
     private final ComputerUseForegroundAppResolver foregroundAppResolver;
+    /** 观察存储（用于按 observationId 找目标 pid；null ⇒ 不支持定向投递）。 */
+    private final ComputerUseUiSnapshotStore snapshotStore;
 
     /**
      * @param keyboard              键盘注入实现
@@ -118,6 +124,21 @@ public final class ComputerUseKeyTool implements Tool {
                               ComputerUseSleeper sleeper,
                               ComputerUseGrantStore grantStore,
                               ComputerUseForegroundAppResolver foregroundAppResolver) {
+        this(keyboard, sleeper, grantStore, foregroundAppResolver, null);
+    }
+
+    /**
+     * @param keyboard              键盘注入实现
+     * @param sleeper               休眠器（可注入假时钟）
+     * @param grantStore            会话授权位读写（null ⇒ 授权位按全 false 处理）
+     * @param foregroundAppResolver 前台应用解析（null ⇒ 门控不生效）
+     * @param snapshotStore         观察存储（null ⇒ 即使给了 observationId 也不定向，走全局 HID）
+     */
+    public ComputerUseKeyTool(ComputerUseKeyboard keyboard,
+                              ComputerUseSleeper sleeper,
+                              ComputerUseGrantStore grantStore,
+                              ComputerUseForegroundAppResolver foregroundAppResolver,
+                              ComputerUseUiSnapshotStore snapshotStore) {
         if (keyboard == null) {
             throw new IllegalArgumentException("ComputerUseKeyTool 需要键盘实现");
         }
@@ -125,6 +146,7 @@ public final class ComputerUseKeyTool implements Tool {
         this.sleeper = sleeper == null ? ComputerUseSleeper.REAL : sleeper;
         this.grantStore = grantStore;
         this.foregroundAppResolver = foregroundAppResolver;
+        this.snapshotStore = snapshotStore;
     }
 
     @Override
@@ -237,6 +259,33 @@ public final class ComputerUseKeyTool implements Tool {
             events = ComputerUseKeyCombo.parse(keySequence);
         } catch (IllegalArgumentException e) {
             return ToolResult.error(call.id(), e.getMessage());
+        }
+
+        // ⭐ 定向投递（对齐 dsh computer_press_key：按键只送目标进程，不抢用户前台）
+        //   给了 observationId + 有 store ⇒ 按该观察的应用 pid 投递；
+        //   否则 targetPid 归零，走全局 HID（与改动前行为一致，不破坏既有调用）。
+        long targetPid = 0L;
+        String observationId = input.path("observationId").asText("");
+        if (!observationId.isEmpty()) {
+            if (snapshotStore == null) {
+                // 工具被构造为「不支持定向」⇒ 明确拒绝而不是静默退化成全局注入（那会抢焦点）
+                return ToolResult.error(call.id(),
+                        "observationId is not supported on this configuration (no observation store).");
+            }
+            ComputerUseUiSnapshotStore.Observation observation =
+                    snapshotStore.require(sessionId, observationId);
+            if (observation == null) {
+                // 未知 / 过期 / 代际不符 ⇒ dsh 的 COMPUTER_STALE_OBSERVATION 语义
+                return ToolResult.error(call.id(),
+                        ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION
+                                + ": observation " + observationId
+                                + " is unknown, expired, or from a previous generation."
+                                + " Call observe again and use the new observationId.");
+            }
+            targetPid = observation.pid();
+        }
+        if (keyboard instanceof MacOsKeyboard macOsKeyboard) {
+            macOsKeyboard.setTargetPid(targetPid);
         }
 
         try {

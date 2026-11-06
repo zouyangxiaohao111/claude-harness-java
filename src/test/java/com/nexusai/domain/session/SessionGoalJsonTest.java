@@ -53,6 +53,45 @@ class SessionGoalJsonTest {
     }
 
     @Test
+    @DisplayName("往返：retryAt/retryCount 必须落盘（曾漏写 ⇒ 自动重试链路从未生效）")
+    void roundTrip_retrySchedule() {
+        SessionGoal g = new SessionGoal(
+            "e2e 全绿", SessionGoal.Phase.ACTIVE, 0, 1L, 0L, null,
+            null, null, null, 1762300060000L, 2);
+
+        String json = SessionGoal.toJson(g);
+        assertThat(json).contains("\"retryAt\"");
+        assertThat(json).contains("\"retryCount\"");
+
+        SessionGoal back = SessionGoal.fromJson(json);
+        assertThat(back).isNotNull();
+        assertThat(back.retryAt()).isEqualTo(1762300060000L);
+        assertThat(back.retryCount()).isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("往返：consumeRetry 后写回，retryCount 仍在（上限不被复位）")
+    void roundTrip_afterConsumeRetry_countSurvives() {
+        SessionGoal consumed = new SessionGoal(
+            "c", SessionGoal.Phase.ACTIVE, 0, 1L, 0L, null,
+            null, null, null, 999L, 3).consumeRetry();
+
+        SessionGoal back = SessionGoal.fromJson(SessionGoal.toJson(consumed));
+        assertThat(back).isNotNull();
+        assertThat(back.retryAt()).isNull();
+        assertThat(back.retryCount()).isEqualTo(3);
+    }
+
+    @Test
+    @DisplayName("往返：无重试排程时不写这两个键")
+    void roundTrip_noRetry_omitsKeys() {
+        String json = SessionGoal.toJson(
+            new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 1L, 0L, null));
+        assertThat(json).doesNotContain("retryAt");
+        assertThat(json).doesNotContain("retryCount");
+    }
+
+    @Test
     @DisplayName("三态 phase 均可往返")
     void roundTrip_allPhases() {
         for (SessionGoal.Phase p : SessionGoal.Phase.values()) {
@@ -101,9 +140,20 @@ class SessionGoalJsonTest {
     @Test
     @DisplayName("降级：未知 phase → ACTIVE（fail-soft，不抛）")
     void fromJson_unknownPhase_fallsBackToActive() {
-        SessionGoal g = SessionGoal.fromJson("{\"condition\":\"c\",\"phase\":\"paused\"}");
+        SessionGoal g = SessionGoal.fromJson("{\"condition\":\"c\",\"phase\":\"definitely-not-a-phase\"}");
         assertThat(g).isNotNull();
         assertThat(g.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+    }
+
+    @Test
+    @DisplayName("四态 phase 均可往返（paused 是 B4 新增的合法态，不再是「未知」）")
+    void fromJson_allFourPhasesRoundTrip() {
+        for (SessionGoal.Phase p : SessionGoal.Phase.values()) {
+            SessionGoal g = SessionGoal.fromJson(
+                SessionGoal.toJson(new SessionGoal("c", p, 1, 1L, 1L, "r")));
+            assertThat(g).isNotNull();
+            assertThat(g.phase()).isEqualTo(p);
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -161,5 +211,58 @@ class SessionGoalJsonTest {
         assertThat(new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null).isActive()).isTrue();
         assertThat(new SessionGoal("c", SessionGoal.Phase.ACHIEVED, 0, 0L, 0L, null).isActive()).isFalse();
         assertThat(new SessionGoal("c", SessionGoal.Phase.IMPOSSIBLE, 0, 0L, 0L, null).isActive()).isFalse();
+    }
+
+    @Test
+    @DisplayName("isLive：ACTIVE / PAUSED 为真（两者都需要 Stop hook 继续参与）")
+    void isLive_activeOrPaused() {
+        assertThat(new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null).isLive()).isTrue();
+        assertThat(new SessionGoal("c", SessionGoal.Phase.PAUSED, 0, 0L, 0L, null).isLive()).isTrue();
+        assertThat(new SessionGoal("c", SessionGoal.Phase.ACHIEVED, 0, 0L, 0L, null).isLive()).isFalse();
+        assertThat(new SessionGoal("c", SessionGoal.Phase.IMPOSSIBLE, 0, 0L, 0L, null).isLive()).isFalse();
+    }
+
+    /**
+     * ⚠️ <b>回归锁定：consumeRetry 绝不能清零 retryCount</b>。
+     *
+     * <p>WHY：清零会让 {@code scheduleEvaluatorRetry} 每次都读到 attempts=0 ⇒
+     * 永远到不了上限 3 ⇒ <b>无限重试</b>（永久性失败 + 守卫复位 = 重试风暴）。
+     * 这个 bug 我在实施时真的写出过，所以锁死它。
+     */
+    @Test
+    @DisplayName("consumeRetry：清 retryAt、保留 retryCount（防无限重试）")
+    void consumeRetry_keepsRetryCount() {
+        SessionGoal g = new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null)
+            .withRetry(123L, 2);
+        SessionGoal after = g.consumeRetry();
+        assertThat(after.retryAt()).as("消费后不应再有待重试时刻").isNull();
+        assertThat(after.retryCount()).as("计数必须保留，否则重试上限永远到不了").isEqualTo(2);
+    }
+
+    @Test
+    @DisplayName("clearRetryFully：两者都清（只在评估器真的出结论时用）")
+    void clearRetryFully_clearsBoth() {
+        SessionGoal g = new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null)
+            .withRetry(123L, 2);
+        SessionGoal after = g.clearRetryFully();
+        assertThat(after.retryAt()).isNull();
+        assertThat(after.retryCount()).isNull();
+    }
+
+    @Test
+    @DisplayName("deferral 与 retry 互不影响（两套独立语义）")
+    void deferralAndRetry_areIndependent() {
+        SessionGoal g = new SessionGoal("c", SessionGoal.Phase.ACTIVE, 0, 0L, 0L, null)
+            .withDeferral(100L, 1, 100L)
+            .withRetry(200L, 2);
+        // 清延迟不该动重试
+        SessionGoal clearedDeferral = g.clearDeferral();
+        assertThat(clearedDeferral.deferredSince()).isNull();
+        assertThat(clearedDeferral.retryAt()).isEqualTo(200L);
+        assertThat(clearedDeferral.retryCount()).isEqualTo(2);
+        // 消费重试不该动延迟
+        SessionGoal consumedRetry = g.consumeRetry();
+        assertThat(consumedRetry.deferredSince()).isEqualTo(100L);
+        assertThat(consumedRetry.checkinCount()).isEqualTo(1);
     }
 }

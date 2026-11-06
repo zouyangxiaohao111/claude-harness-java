@@ -111,6 +111,24 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [V254 外部渠道] 装配 settings.channels_enabled 实时 DB 读源到
+     * {@link com.nexusai.application.agent.mcp.ChannelNotificationGate}。
+     *
+     * <p><b>位置照抄</b>上一方法 {@link #bridgeAllowDynamicHeaderValuesSource}（同为「static 代码要读
+     * DB settings」的既有范式）：安装点在 @PostConstruct，读源是本类自己的
+     * {@link #readDbChannelsEnabled()}（三态：null = 未配置 → 回落 yml 兜底）。
+     *
+     * <p>POJO 单测不触发 Spring → 读源不安装 → 门序[2] 回落 yml 值（默认 false，fail-closed）。
+     */
+    @PostConstruct
+    void bridgeChannelsEnabledSource() {
+        com.nexusai.application.agent.mcp.ChannelNotificationGate.installChannelsEnabledSource(this::readDbChannelsEnabled);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] channelsEnabled 实时 DB 读源注入完成（前端「设置→高级」改完下一条通道消息即生效）");
+        }
+    }
+
     public SettingsDto get() {
         SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
         if (s == null) throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
@@ -180,8 +198,38 @@ public class SettingsService {
         if (req.webfetchEngine() != null) s.setWebfetchEngine(req.webfetchEngine());
         // [V103] 市场管理员模式 merge（null = 不覆盖；默认关 → 设置页不显示「市场管理」）
         if (req.marketAdminEnabled() != null) s.setMarketAdminEnabled(req.marketAdminEnabled());
+        // [V254 外部渠道] channel 总开关 merge（null = 不覆盖，对齐既有 merge；默认关 → 通道消息不进）
+        if (req.channelsEnabled() != null) s.setChannelsEnabled(req.channelsEnabled());
+        // [V258 goal-checkin] 目标 check-in 间隔 merge（null = 不覆盖；0 合法 = 显式关闭）。
+        //   负数是非法输入 —— fail-loud 拒绝，而不是静默当成「未配置」让用户以为改了。
+        if (req.goalCheckinMinutes() != null) {
+            if (req.goalCheckinMinutes() < 0) {
+                throw new ValidationException("goalCheckinMinutes 不能为负数（0 = 关闭 check-in）");
+            }
+            s.setGoalCheckinMinutes(req.goalCheckinMinutes());
+        }
         // [agent-swarms-setting V42] Agent Swarms 开关 merge（null = 不覆盖，对齐既有 merge；写库后尾部同步静态覆盖）
         if (req.agentSwarmsEnabled() != null) s.setAgentSwarmsEnabled(req.agentSwarmsEnabled());
+        // [V259 external-agent] 子代理外部运行时 merge（null = 不覆盖）。
+        //   ⚠️ defaultRuntime 非空时**必须**是目录里已知的 runtime：否则用户以为「配了默认」，
+        //   实际派发时找不到可执行文件才失败 —— 那是更晚、更难归因的失败点。
+        if (req.subagentExternalEnabled() != null) {
+            s.setSubagentExternalEnabled(req.subagentExternalEnabled());
+        }
+        if (req.subagentDefaultRuntime() != null) {
+            String rt = req.subagentDefaultRuntime().trim();
+            if (rt.isEmpty()) {
+                s.setSubagentDefaultRuntime(null);   // 显式清空 = 回到「全内置」
+            } else if (com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.find(rt) == null) {
+                throw new ValidationException("未知的外部运行时 '" + rt + "'，可选："
+                        + com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.presets()
+                                .stream()
+                                .map(com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.RuntimePreset::runtime)
+                                .collect(java.util.stream.Collectors.joining(", ")));
+            } else {
+                s.setSubagentDefaultRuntime(rt);
+            }
+        }
         // [V44] 全局默认权限模式 merge（null = 不覆盖，对齐既有 merge）：写侧 isSettable 校验——
         //   UI/HTTP 值必须在 6 值集合（default/plan/acceptEdits/bypassPermissions/dontAsk/auto），
         //   否则 fail-loud（ValidationException 400）而非静默折叠最严格 DEFAULT（列必须存 CC 串
@@ -493,7 +541,78 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [V254 外部渠道] {@code channels_enabled} 实时读源（三态：true / false / <b>null=未配置</b>）。
+     *
+     * <p>被 {@code ChannelNotificationGate} 的门序[2] runtime 消费。语义：
+     * <ul>
+     *   <li>DB 列有值（0/1）→ 该值即权威（用户可在「设置→高级」显式开/关）；</li>
+     *   <li>DB 行缺失 / 列 NULL → 返回 <b>null</b>（=未配置）→ 调用方回落 yml
+     *       {@code nexusai.mcp.channels-enabled} 兜底；</li>
+     *   <li>读取抛异常 → 返回 <b>null</b> + warn（同样回落 yml，不让一次 DB 抖动反转用户设置）。</li>
+     * </ul>
+     *
+     * <p><b>为什么是三态而不是布尔</b>：必须区分「用户显式关闭（false）」与「没有这个配置（null）」——
+     * 前者要尊重（UI 关掉后不能被 yml 顶回来），后者才回落兜底。
+     *
+     * <p><b>不缓存</b>：前端 PUT 后下一条通道消息即生效（同 {@link #readDbAllowDynamicHeaderValues} 形状）。
+     */
+    public Boolean readDbChannelsEnabled() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            // 行缺失 / 列 NULL → 未配置（null → 回落 yml）。注意顺序：先判 null 再拆箱，避免 NPE。
+            if (s == null || s.getChannelsEnabled() == null) {
+                return null;
+            }
+            return s.getChannelsEnabled();
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.channelsEnabled 失败，回落 yml "
+                    + "nexusai.mcp.channels-enabled 兜底（不因读失败而反转用户设置）: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
     // ============== helpers ==============
+
+    /**
+     * [V258 goal-checkin] 实时读目标 check-in 间隔（分钟）· 供 {@code GoalCheckinScheduler} 消费。
+     *
+     * <p><b>为什么不缓存</b>：用户改完「设置→高级」后，下一次定时器 tick 就该用新值 ——
+     * 与 {@link #readDbChannelsEnabled} 同款（前端 PUT 后下一条即生效）。
+     *
+     * <p><b>fail-soft</b>：读失败 → null（= 未配置 → {@code GoalCheckinConfig} 用默认 30 分钟）。
+     * 不因读失败而反转成「关闭」—— 那会让一次 DB 抖动静默停掉所有 check-in。
+     *
+     * @return 配置的分钟数；null = 未配置（调用方回落默认值）
+     */
+    public Integer readDbGoalCheckinMinutes() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            return s == null ? null : s.getGoalCheckinMinutes();
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.goalCheckinMinutes 失败，"
+                    + "回落 GoalCheckinConfig 默认 30 分钟（不因读失败而关闭 check-in）: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
+    // ══════════════ 知识库域配置：已全部迁出 → KbConfigService ══════════════
+    //
+    // ⭐ 用户 2026-11-05 最终裁定：「8 个 kb_* 字段全部搬到 kb_config，settings 一个不留」。
+    //    V273 已经把列 DROP 掉，对应字段也从 SettingsRecord 移除。
+    //
+    //    原方法 → 新去处：
+    //      readKbModelConfig / updateKbModelConfig   → KbConfigService#readModelConfig / #updateModelConfig
+    //      readKbRetrieverEngine / updateKbRetrieverEngine → KbConfigService#readRetrieverEngine / #updateRetrieverEngine
+    //      readDefaultStorageBackendId / updateDefaultStorageBackendId → KbConfigService 同名方法
+    //      readKbMemory* / updateKbMemoryConfig      → KbConfigService#readMemory* / #updateMemoryConfig
+    //
+    //    ⚠️ 这里不要留「兼容转发」的壳：留着就会有人继续调，settings 与 kb_config 两份口径再次分叉，
+    //       而那正是这次搬迁要根除的问题。
 
     private static SettingsDto toDto(SettingsRecord s) {
         return new SettingsDto(
@@ -610,7 +729,15 @@ public class SettingsService {
             // [V102] WebFetch 抓取引擎透出（null → WebFetchTool 内置本地抓取）
             s.getWebfetchEngine(),
             // [V103] 市场管理员模式透出（null/false → 前端隐藏「市场管理」）
-            s.getMarketAdminEnabled()
+            s.getMarketAdminEnabled(),
+            // [V254 外部渠道] channel 总开关透出（null = 未配置 → 回落 yml nexusai.mcp.channels-enabled）
+            s.getChannelsEnabled(),
+            // [V258 goal-checkin] 目标 check-in 间隔透出（null = 未配置 → GoalCheckinConfig 默认 30；
+            //   不透出这行前端「设置→高级」会恒显示空）
+            s.getGoalCheckinMinutes(),
+            // [V259 external-agent] 子代理外部运行时透出（不补这两行 ⇒ 前端面板恒显示空/默认）
+            s.getSubagentDefaultRuntime(),
+            s.getSubagentExternalEnabled()
         );
     }
 

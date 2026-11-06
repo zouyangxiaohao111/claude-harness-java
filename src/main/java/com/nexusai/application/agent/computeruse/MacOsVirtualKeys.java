@@ -50,22 +50,37 @@ public final class MacOsVirtualKeys {
      */
     public enum Modifier {
         /** Shift（macOS 虚拟键码 56）。 */
-        SHIFT("shift", 56, "$.kCGEventFlagMaskShift"),
+        SHIFT("shift", 56, "$.kCGEventFlagMaskShift", 0x00020000L),
         /** Control / Ctrl（macOS 虚拟键码 59）。 */
-        CONTROL("control", 59, "$.kCGEventFlagMaskControl"),
+        CONTROL("control", 59, "$.kCGEventFlagMaskControl", 0x00040000L),
         /** Option / Alt（macOS 虚拟键码 58）。 */
-        OPTION("option", 58, "$.kCGEventFlagMaskAlternate"),
+        OPTION("option", 58, "$.kCGEventFlagMaskAlternate", 0x00080000L),
         /** Command / Cmd / Meta / Super（macOS 虚拟键码 55）。 */
-        COMMAND("command", 55, "$.kCGEventFlagMaskCommand");
+        COMMAND("command", 55, "$.kCGEventFlagMaskCommand", 0x00100000L);
 
         private final String name;
         private final int keyCode;
         private final String flagSymbol;
+        private final long flagMask;
 
-        Modifier(String name, int keyCode, String flagSymbol) {
+        Modifier(String name, int keyCode, String flagSymbol, long flagMask) {
             this.name = name;
             this.keyCode = keyCode;
             this.flagSymbol = flagSymbol;
+            this.flagMask = flagMask;
+        }
+
+        /**
+         * CoreGraphics flags 的<b>数值</b>位掩码（JNA 定向投递用）。
+         *
+         * <p>{@link #flagSymbol()} 是给 JXA 拼脚本用的符号名；
+         * 走 JNA 时 {@code CGEventSetFlags} 收的是 {@code CGEventFlags} 整数
+         * ⇒ 必须用数值，不能把符号名传进去。
+         *
+         * @return flags 位掩码
+         */
+        public long flagMask() {
+            return flagMask;
         }
 
         /** @return 规范名 */

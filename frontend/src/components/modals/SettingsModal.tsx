@@ -11,6 +11,7 @@ import { SchedulesPanel } from './SchedulesPanel'
 import { HookPanel } from './HookPanel'
 import { BusinessPanel } from './BusinessPanel'
 import { EnvConfigPanel } from '../settings/EnvConfigPanel'
+import { SubagentRuntimePanel } from '../settings/SubagentRuntimePanel'
 import { PluginPanel } from '../settings/PluginPanel'
 import { ModelSettingsPanel } from '../settings/ModelSettingsPanel'
 import { MarketManagePanel } from '../settings/MarketManagePanel'
@@ -71,6 +72,7 @@ const NAV_ITEMS: { id: SettingsTab; label: string; section: 'core' | 'tools' | '
   { id: 'general',    label: '通用',   section: 'core' },
   { id: 'appearance', label: '外观',   section: 'core' },
   { id: 'env',        label: '环境配置', section: 'core' },
+  { id: 'cli',        label: 'CLI 设置', section: 'core' },
   { id: 'model',      label: '模型',   section: 'core' },
   { id: 'providers',  label: '提供商', section: 'tools' },
   { id: 'mcp',        label: 'MCP',   section: 'tools' },
@@ -155,6 +157,37 @@ export function SettingsModal({
   useEffect(() => {
     setDynamicHeaderValues(appSettings?.allowDynamicHeaderValues ?? true)
   }, [appSettings?.allowDynamicHeaderValues])
+
+  // 外部渠道总开关（高级 tab · settings.channels_enabled · V254）。
+  // 默认**关**：通道是外部入口（外部 MCP server 能往会话里注入消息），未配置时按关处理
+  // （后端 ChannelNotificationGate 门序[2] 的 DB 值优先、null 才回落 yml 兜底，默认 false）。
+  const [channelsEnabled, setChannelsEnabled] = useState(appSettings?.channelsEnabled ?? false)
+  useEffect(() => {
+    setChannelsEnabled(appSettings?.channelsEnabled ?? false)
+  }, [appSettings?.channelsEnabled])
+
+  // [V258 goal-checkin] 目标 check-in 间隔（高级 tab · settings.goal_checkin_minutes）。
+  // 默认 30 分钟（对齐 CC CLAUDE_CODE_GOAL_CHECKIN_MINUTES）；0 = 关闭（目标仍会延迟评估，
+  // 只是不主动注入提示）。留空 = 未配置 → 后端也按 30 处理。
+  const [goalCheckinDraft, setGoalCheckinDraft] = useState('')
+  useEffect(() => {
+    setGoalCheckinDraft(
+      appSettings?.goalCheckinMinutes != null ? String(appSettings.goalCheckinMinutes) : '')
+  }, [appSettings?.goalCheckinMinutes])
+
+  const saveGoalCheckin = () => {
+    const raw = goalCheckinDraft.trim()
+    if (raw === '') {
+      void onSaveSettings({ goalCheckinMinutes: null })
+      return
+    }
+    const parsed = Number(raw)
+    if (Number.isNaN(parsed) || !Number.isInteger(parsed) || parsed < 0) {
+      showToast('check-in 间隔必须是非负整数（分钟；0 = 关闭）', 'info')
+      return
+    }
+    void onSaveSettings({ goalCheckinMinutes: parsed })
+  }
 
   // 流空闲超时（通用 tab · settings.stream_idle_timeout_ms；V78 列）。
   // 留空 = 未配置（后端回落 env/默认 300000）；有效下限 300000——低于下限会被后端抬到 300s，
@@ -311,6 +344,10 @@ export function SettingsModal({
             {settingsTab === 'env' && (
               <EnvConfigPanel settings={appSettings} onSaveSettings={onSaveSettings} onOpenMemoryEditor={onOpenMemoryEditor} sessionId={sessionId} />
             )}
+            {/* [external-agent 2026-11-04] CLI 设置：外部运行时（自动感知 + 模型/推理强度 + 代理与自定义路径） */}
+            {settingsTab === 'cli' && (
+              <SubagentRuntimePanel settings={appSettings} onSaveSettings={onSaveSettings} showToast={showToast} sessionId={sessionId} />
+            )}
             {settingsTab === 'model' && (
               <ModelSettingsPanel
                 providers={providers}
@@ -392,6 +429,49 @@ export function SettingsModal({
                     <input type="checkbox" />
                     <span></span>
                   </label>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">外部渠道</div>
+                    <div className="settings-row-desc">
+                      允许 MCP 渠道服务器（如微信）把消息投递进会话。关闭时渠道消息不会进来。
+                    </div>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      checked={channelsEnabled}
+                      onChange={(e) => {
+                        setChannelsEnabled(e.target.checked)
+                        // 必须走 onSaveSettings（同「按会话展开请求头占位符」）：
+                        // appSettings 是唯一真源，直接调 settingsApi 会让开关状态与后端不同步
+                        void onSaveSettings({ channelsEnabled: e.target.checked })
+                      }}
+                    />
+                    <span></span>
+                  </label>
+                </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">目标 check-in 间隔</div>
+                    <div className="settings-row-desc">
+                      /goal 目标因后台任务未结束而暂停评估时，每隔多少分钟提醒模型去看一次进度
+                      （默认 30 分钟；填 0 表示关闭提醒，目标本身仍会继续）。
+                    </div>
+                  </div>
+                  <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                    <input
+                      type="number"
+                      min={0}
+                      step={1}
+                      value={goalCheckinDraft}
+                      placeholder="30"
+                      onChange={(e) => setGoalCheckinDraft(e.target.value)}
+                      onBlur={saveGoalCheckin}
+                      style={{ width: '84px' }}
+                    />
+                    <span className="settings-row-desc" style={{ margin: 0 }}>分钟</span>
+                  </div>
                 </div>
                 <div className="settings-row">
                   <div>

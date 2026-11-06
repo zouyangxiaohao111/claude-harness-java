@@ -117,6 +117,8 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
     private final ComputerUseWindowBindingStore bindingStore;
     private final ComputerUseUiSnapshotStore snapshotStore;
     private final ComputerUseConfirmationStore confirmationStore;
+    /** TCC 权限检查（macOS 侧用于报告权限状态；可为 null）。 */
+    private final MacOsTccChecker tcc;
 
     /**
      * @param uiaService    UIA/AX 服务
@@ -130,11 +132,29 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
                                           ComputerUseWindowBindingStore bindingStore,
                                           ComputerUseUiSnapshotStore snapshotStore,
                                           ComputerUseConfirmationStore confirmationStore) {
+        this(uiaService, windowOps, bindingStore, snapshotStore, confirmationStore, null);
+    }
+
+    /**
+     * @param uiaService    UIA/AX 服务
+     * @param windowOps     窗口操作原语（仅 Windows 的回落路径需要；macOS 传 null）
+     * @param bindingStore  绑定窗口存储（仅 Windows 需要；macOS 传 null）
+     * @param snapshotStore 观察存储（observationId + index 解析）
+     * @param confirmationStore 敏感动作令牌存储（可空 ⇒ 敏感动作一律拒绝）
+     * @param tcc           TCC 权限检查（可空 ⇒ 权限报 unavailable）
+     */
+    public ComputerUseTypeIntoElementTool(ComputerUseUiaService uiaService,
+                                          ComputerUseWindowOps windowOps,
+                                          ComputerUseWindowBindingStore bindingStore,
+                                          ComputerUseUiSnapshotStore snapshotStore,
+                                          ComputerUseConfirmationStore confirmationStore,
+                                          MacOsTccChecker tcc) {
         this.uiaService = uiaService;
         this.windowOps = windowOps;
         this.bindingStore = bindingStore;
         this.snapshotStore = snapshotStore;
         this.confirmationStore = confirmationStore;
+        this.tcc = tcc;
     }
 
     /**
@@ -258,7 +278,10 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
         try {
             // 路径 0：observationId + index/targetHandle（dsh 语义 · macOS 主路径）
             String targetId;
+            String expectedStateHash = null;
             ComputerUseUiSnapshotStore.ObservedElement observed = null;
+            ComputerUseTargetResolver.Resolution targetResolution = null;
+            ComputerUseUiSnapshotStore.Observation beforeObservation = null;
             if (observationId != null || index >= 0 || (handle != null && !handle.isEmpty())) {
                 ComputerUseElementResolver.Resolution resolution =
                         ComputerUseElementResolver.resolveObserved(
@@ -269,6 +292,12 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
                 }
                 observed = resolution.element();
                 targetId = resolution.locator();
+                targetResolution = resolution.targetResolution();
+                // dsh expectedStateHash：动作前校验树没变（macOS 的 locator 是树序派生的，
+                // 界面一变同一路径就指向别的元素 ⇒ 写值会写错字段）
+                expectedStateHash = resolution.stateHash();
+                beforeObservation = snapshotStore != null
+                        ? snapshotStore.require(sessionId, observationId) : null;
             } else if (automationId != null && !automationId.isEmpty()) {
                 targetId = automationId;
             } else {
@@ -278,9 +307,11 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
             String label = labelOfObserved(observed, index, name, role, automationId);
 
             // 路径 1：按 locator 直接设值（CCB executorCrossPlatform.ts:1112-1114）
-            if (targetId != null && uiaService.setElementValue(hwnd, targetId, text)) {
-                return ToolResult.success(call.id(),
-                        "Typed " + text.length() + " chars into: " + label);
+            long targetPid = beforeObservation == null ? 0L : beforeObservation.pid();
+            if (targetId != null && uiaService.setElementValue(
+                    hwnd, targetId, text, expectedStateHash, targetPid)) {
+                return typeAndReport(call, sessionId, label, text.length(), beforeObservation,
+                        targetResolution, targetPid);
             }
 
             if (targetId == null) {
@@ -296,9 +327,9 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
                                     + ". The element was not found or doesn't support text input.");
                 }
                 String foundId = found.automationId().isEmpty() ? found.locator() : found.automationId();
-                if (!foundId.isEmpty() && uiaService.setElementValue(hwnd, foundId, text)) {
-                    return ToolResult.success(call.id(),
-                            "Typed " + text.length() + " chars into: " + describe(name, role, automationId));
+                if (!foundId.isEmpty() && uiaService.setElementValue(hwnd, foundId, text, targetPid)) {
+                    return typeAndReport(call, sessionId, label, text.length(), beforeObservation,
+                            targetResolution, targetPid);
                 }
             }
 
@@ -323,13 +354,68 @@ public final class ComputerUseTypeIntoElementTool implements Tool {
                 log.info("[computer-use] {} 回落点击+输入: element=\"{}\" client=({},{}) len={}",
                         TOOL_NAME, label, client[0], client[1], text.length());
             }
-            return ToolResult.success(call.id(),
-                    "Typed " + text.length() + " chars into: " + label);
+            return typeAndReport(call, sessionId, label, text.length(), beforeObservation,
+                    targetResolution, targetPid);
+        } catch (ComputerUseStaleObservationException e) {
+            // dsh COMPUTER_STALE_OBSERVATION：树变了 ⇒ 让模型重新 observe，而不是把它
+            // 当成「元素不可用」去重复尝试同一个 locator
+            log.warn("[computer-use] {} 拒绝执行：观察已陈旧。{}", TOOL_NAME, e.getMessage());
+            return ToolResult.error(call.id(),
+                    ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION + ": " + e.getMessage());
         } catch (Exception e) {
             log.error("[computer-use] {} 执行失败: index={} name={} role={} automationId={} err={}",
                     TOOL_NAME, index, name, role, automationId, e.getMessage(), e);
             return ToolResult.error(call.id(), "元素输入失败: " + e.getMessage());
         }
+    }
+
+    /**
+     * 输入成功后返回结构化动作结果（dsh {@code actionResultSchema}）。
+     *
+     * <p>macOS 侧带后置观察 + effect；Windows 侧维持既有文案（CCB 路线，不改 Windows 行为）。
+     */
+    private AgentToolResult<?> typeAndReport(ToolUseBlock call,
+                                             String sessionId,
+                                             String label,
+                                             int charCount,
+                                             ComputerUseUiSnapshotStore.Observation before,
+                                             ComputerUseTargetResolver.Resolution resolution) {
+        return typeAndReport(call, sessionId, label, charCount, before, resolution, 0L);
+    }
+
+    /**
+     * 输入成功后返回结构化动作结果（dsh {@code actionResultSchema}）。
+     *
+     * @param targetPid 目标应用 pid（观察后台应用时必须带上 ⇒ 写值落在同一棵树上）
+     */
+    private AgentToolResult<?> typeAndReport(ToolUseBlock call,
+                                             String sessionId,
+                                             String label,
+                                             int charCount,
+                                             ComputerUseUiSnapshotStore.Observation before,
+                                             ComputerUseTargetResolver.Resolution resolution,
+                                             long targetPid) {
+        if (uiaService.requiresBoundWindow()) {
+            return ToolResult.success(call.id(), "Typed " + charCount + " chars into: " + label);
+        }
+        ComputerUseActionResult result = ComputerUseActionExecutor.buildResult(
+                uiaService, snapshotStore, sessionId,
+                ComputerUseActionResult.ACTION_SET_VALUE,
+                ComputerUseActionResult.CHANNEL_ACCESSIBILITY,
+                resolution, before, MacOsUiaService.DEFAULT_MAX_DEPTH, tcc);
+        com.fasterxml.jackson.databind.node.ObjectNode permissions = JSON.createObjectNode();
+        if (tcc != null) {
+            MacOsTccChecker.Status status = tcc.status();
+            permissions.put("accessibility", status.accessibilityGranted() ? "granted" : "denied");
+            permissions.put("screenRecording", status.screenRecordingGranted() ? "granted" : "denied");
+        } else {
+            permissions.put("accessibility", "unavailable");
+            permissions.put("screenRecording", "unavailable");
+        }
+        com.fasterxml.jackson.databind.node.ObjectNode extra = JSON.createObjectNode();
+        extra.put("typedChars", charCount);
+        extra.put("target", label);
+        return ToolResult.success(call.id(), ComputerUseActionResult.render(result, permissions, extra));
     }
 
     /** 目标描述（优先用观察元素里的真实角色/名字）。 */

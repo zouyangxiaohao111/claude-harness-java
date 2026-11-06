@@ -127,6 +127,7 @@ export type SettingsTab =
   | 'general'
   | 'appearance'
   | 'env'
+  | 'cli'
   | 'model'
   | 'providers'
   | 'mcp'

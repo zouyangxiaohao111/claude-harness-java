@@ -41,7 +41,16 @@ public record ComputerUseAccessibilitySnapshot(
         long pid,
         String windowTitle,
         String stateHash,
-        boolean truncated) {
+        boolean truncated,
+        /** 窗口矩形（屏幕坐标，左上原点）· dsh {@code window.frame}；空 = 拿不到。 */
+        int windowX,
+        int windowY,
+        int windowWidth,
+        int windowHeight,
+        /** 窗口号（CGWindowNumber）· dsh {@code window.id}；0 = 拿不到。 */
+        long windowId,
+        /** 观察对象是否为前台应用 · dsh {@code frontmost}。 */
+        boolean frontmost) {
 
     /**
      * 兼容构造（无应用身份）· Windows 侧 / 既有单测沿用。
@@ -52,7 +61,33 @@ public record ComputerUseAccessibilitySnapshot(
      */
     public ComputerUseAccessibilitySnapshot(String text, List<ComputerUseAccessibilityNode> nodes,
                                             long timestamp) {
-        this(text, nodes, timestamp, "", "", 0L, "", "", false);
+        this(text, nodes, timestamp, "", "", 0L, "", "", false, 0, 0, 0, 0, 0L, false);
+    }
+
+    /**
+     * 兼容构造（带应用身份，无窗口几何）· 既有单测沿用。
+     *
+     * @param text         紧凑文本
+     * @param nodes        节点树
+     * @param timestamp    时刻
+     * @param appName      应用显示名
+     * @param bundleId     应用 bundle id
+     * @param pid          应用 pid
+     * @param windowTitle  窗口标题
+     * @param stateHash    状态指纹
+     * @param truncated    树是否被截断
+     */
+    public ComputerUseAccessibilitySnapshot(String text,
+                                            List<ComputerUseAccessibilityNode> nodes,
+                                            long timestamp,
+                                            String appName,
+                                            String bundleId,
+                                            long pid,
+                                            String windowTitle,
+                                            String stateHash,
+                                            boolean truncated) {
+        this(text, nodes, timestamp, appName, bundleId, pid, windowTitle, stateHash, truncated,
+                0, 0, 0, 0, 0L, false);
     }
 
     /**
@@ -76,6 +111,11 @@ public record ComputerUseAccessibilitySnapshot(
         bundleId = bundleId == null ? "" : bundleId;
         windowTitle = windowTitle == null ? "" : windowTitle;
         stateHash = stateHash == null ? "" : stateHash;
+    }
+
+    /** @return 窗口矩形是否拿得到（宽高都 > 0） */
+    public boolean hasWindowFrame() {
+        return windowWidth > 0 && windowHeight > 0;
     }
 
     /** 名字截断长度 · CCB {@code accessibilitySnapshot.ts:179}（{@code truncate(name, 40)}）。 */

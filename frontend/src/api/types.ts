@@ -498,6 +498,21 @@ export interface AppSettings {
   webfetchEngine?: string | null
   /** 市场管理员模式（默认关）· true 才在设置页显示「市场管理」；上架能力不受影响 */
   marketAdminEnabled?: boolean | null
+  /** 外部渠道（channel）总开关（settings.channels_enabled · 默认关）· true 才允许 MCP channel server
+   *  注册入站通知 handler（后端 ChannelNotificationGate 门序[2] 实时读）。
+   *  null/undefined = 未配置 → 回落后端 yml nexusai.mcp.channels-enabled（默认 false）。 */
+  channelsEnabled?: boolean | null
+  /** [V258] 目标 check-in 间隔（分钟）· 对齐 CC `CLAUDE_CODE_GOAL_CHECKIN_MINUTES`（默认 30）。
+   *  /goal 目标因后台任务未归位而延迟评估时，每 N 分钟注入一次 check-in 提示（指数退避 ×2、最多 3 次）。
+   *  null/undefined = 未配置 → 后端默认 30；0 = 显式关闭。 */
+  goalCheckinMinutes?: number | null
+  /** [V259 external-agent] 子代理默认外部运行时 id（claude / codex / opencode / pi）。
+   *  空/null = 全用内置子代理（默认）；配了则「未显式指定 subagent_type」时派给它。
+   *  ⚠️ 用户显式传 subagent_type 时永远优先，本值不生效。 */
+  subagentDefaultRuntime?: string | null
+  /** [V259 external-agent] 外部运行时总开关。null/undefined = 未配置（yml 兜底）；
+   *  false = 用户显式关闭（压过 yml 的 true，避免「关了重启又活」）。 */
+  subagentExternalEnabled?: boolean | null
   /** Agent Swarms 功能开关（设置页「环境配置」模块写 · 后端 TaskSystemConfig.isAgentSwarmsEnabled 读） */
   agentSwarmsEnabled?: boolean | null
   /** 协调者模式开关（设置页「环境配置」模块写 · 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读；未配置/null → 关闭） */

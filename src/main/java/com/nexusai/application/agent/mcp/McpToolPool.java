@@ -1736,11 +1736,23 @@ public class McpToolPool {
                     //   残留别会话 id，旧实现靠已删除的 MDC 回放装置才「看起来工作」）。
                     //   CC useManageMCPConnections :523-530 channel 消息 enqueue 注入当前会话队列
                     //   （CC 单进程 ambient）——Java 多会话须显式携带。
-                    final String channelSessionId = connectSessionId;
+                    //
+                    //   [V255 外部渠道] 归属会话**以绑定表为准**（gateResult.boundSessionId()），
+                    //   回落 connectSessionId（绑定表未接线时的旧路径）：
+                    //     · 绑定表说了「这个渠道归会话 X」⇒ 消息投 X，与「谁连的 MCP」无关；
+                    //     · 绑定表未接线 ⇒ 回落连接时的会话（批 3b 的显式传参语义，不读 MDC）。
+                    //   ⚠️ 归属错了的后果：NotificationQueue.drainForQuery 的 [3a] 规则
+                    //   「具体会话的 turn 只捞 sessionId 匹配的命令」⇒ 消息永远躺在队列里没人消费
+                    //   （症状 = 微信发了消息但会话里毫无反应）。
+                    final String channelSessionId = gateResult.boundSessionId() != null
+                        ? gateResult.boundSessionId()
+                        : connectSessionId;
                     transport.setNotificationHandler(ChannelNotification.NOTIFICATION_METHOD,
                         params -> channelNotification.receiveNotification(serverName, params, channelSessionId));
-                    log.info("[McpToolPool] {} channel 入站通知 handler 已注册（notifications/claude/channel）sessionId={}",
-                        serverName, channelSessionId);
+                    log.info("[McpToolPool] {} channel 入站通知 handler 已注册（notifications/claude/channel）sessionId={}"
+                        + "（来源={}）",
+                        serverName, channelSessionId,
+                        gateResult.boundSessionId() != null ? "绑定表" : "连接参数回落");
                 } else {
                     log.info("[McpToolPool] {} channel 跳过 (kind={})，handler 不注册（连接保持）",
                         serverName, gateResult.kind());

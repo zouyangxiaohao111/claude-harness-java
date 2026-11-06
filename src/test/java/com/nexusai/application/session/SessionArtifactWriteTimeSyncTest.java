@@ -95,7 +95,7 @@ class SessionArtifactWriteTimeSyncTest {
     void deliverableInDirIsSavedAndPushedImmediately() throws IOException {
         Path file = writeFile(SessionArtifactService.deliverablesDir(SESSION), "方案.docx", "x");
 
-        assertThat(service.syncDeliverableForPath(SESSION, file.toString()))
+        assertThat(service.syncDeliverableForPath(SESSION, file.toString(), null))
             .as("产物目录里的文件应当场入库").isTrue();
 
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -111,7 +111,7 @@ class SessionArtifactWriteTimeSyncTest {
     void ordinaryFileIsIgnored() throws IOException {
         Path file = writeFile(tempDir.resolve("workspace"), "readme.txt", "x");
 
-        assertThat(service.syncDeliverableForPath(SESSION, file.toString())).isFalse();
+        assertThat(service.syncDeliverableForPath(SESSION, file.toString(), null)).isFalse();
         verify(mapper, never()).insert(any(SessionArtifactRecord.class));
         verify(wsTemplate, never()).convertAndSend(eq(TOPIC), any(Object.class));
     }
@@ -121,7 +121,7 @@ class SessionArtifactWriteTimeSyncTest {
     void sourceCodeInsideDirIsRejected() throws IOException {
         Path file = writeFile(SessionArtifactService.deliverablesDir(SESSION), "make_docx.py", "print(1)");
 
-        assertThat(service.syncDeliverableForPath(SESSION, file.toString())).isFalse();
+        assertThat(service.syncDeliverableForPath(SESSION, file.toString(), null)).isFalse();
         verify(mapper, never()).insert(any(SessionArtifactRecord.class));
     }
 
@@ -135,7 +135,7 @@ class SessionArtifactWriteTimeSyncTest {
         Path dir = SessionArtifactService.deliverablesDir(SESSION);
         Files.createDirectories(dir);
 
-        service.startTurnWatch(SESSION);
+        service.startTurnWatch(SESSION, null);
         try {
             // ① 复制进来一个新文件 → 下一拍必须入库 + 推送
             Path copied = dir.resolve("复制来的报告.docx");
@@ -166,7 +166,7 @@ class SessionArtifactWriteTimeSyncTest {
         Path dir = SessionArtifactService.deliverablesDir(SESSION);
         Files.createDirectories(dir);
 
-        service.startTurnWatch(SESSION);
+        service.startTurnWatch(SESSION, null);
         service.stopTurnWatch(SESSION);
         // 停掉之后复制文件 → 不应被感知
         Files.writeString(dir.resolve("停止后复制.docx"), "x", StandardCharsets.UTF_8);
@@ -202,11 +202,11 @@ class SessionArtifactWriteTimeSyncTest {
     @DisplayName("目录本身 / 不存在的路径 ⇒ false 且不抛（写盘钩子必须 fail-soft）")
     void dirItselfAndMissingPathAreIgnored() {
         Path dir = SessionArtifactService.deliverablesDir(SESSION);
-        assertThat(service.syncDeliverableForPath(SESSION, dir.toString())).isFalse();
-        assertThat(service.syncDeliverableForPath(SESSION, dir.resolve("不存在.docx").toString())).isFalse();
+        assertThat(service.syncDeliverableForPath(SESSION, dir.toString(), null)).isFalse();
+        assertThat(service.syncDeliverableForPath(SESSION, dir.resolve("不存在.docx").toString(), null)).isFalse();
         // null / 空会话 → 直接 false
-        assertThat(service.syncDeliverableForPath(null, dir.toString())).isFalse();
-        assertThat(service.syncDeliverableForPath(SESSION, null)).isFalse();
+        assertThat(service.syncDeliverableForPath(null, dir.toString(), null)).isFalse();
+        assertThat(service.syncDeliverableForPath(SESSION, null, null)).isFalse();
         verify(mapper, never()).insert(any(SessionArtifactRecord.class));
     }
 }

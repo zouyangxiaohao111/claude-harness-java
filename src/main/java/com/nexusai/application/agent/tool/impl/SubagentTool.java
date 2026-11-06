@@ -221,6 +221,62 @@ public class SubagentTool implements Tool {
     private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
 
     /**
+     * [external-agent 2026-11-04] 设置默认外部运行时 → agentType 的解析器。
+     *
+     * <p>返回 null 表示「不要替换」（未配置 / 用户显式关闭 / 运行时不可用）。
+     * 由装配点注入（读 settings + ExternalRuntimeCatalog）；未注入时恒 null = 行为与改造前一致。
+     */
+    private java.util.function.Supplier<String> defaultExternalAgentType;
+
+    /**
+     * [external-agent 2026-11-04] 生产接线：从设置取「默认外部运行时」，并解析成实际可派发的 agentType。
+     *
+     * <p>解析规则（任一不满足即返回 null = 不替换，保持「默认内置」）：
+     * <ol>
+     *   <li>{@code settings.subagentExternalEnabled == FALSE} → null（用户显式关了）</li>
+     *   <li>{@code settings.subagentDefaultRuntime} 为空 → null（没配默认）</li>
+     *   <li>该运行时在 registry 里没有对应 agentType → null（配了但没定义 md，不能凭空派发）</li>
+     * </ol>
+     *
+     * <p>⚠️ 第 3 条是必须的：设置里配了 `codex` 但没写 {@code agents/codex-*.md} 时，
+     * 若直接派发 `codex` 会得到 AgentNotFoundException —— 不如退回内置并留 WARN。
+     */
+    @Autowired(required = false)
+    public void setSettingsService(com.nexusai.domain.settings.SettingsService settingsService) {
+        if (settingsService == null) return;
+        this.defaultExternalAgentType = () -> {
+            try {
+                var dto = settingsService.get();
+                if (dto == null) return null;
+                if (Boolean.FALSE.equals(dto.subagentExternalEnabled())) {
+                    log.debug("[SubagentTool] 默认外部运行时被显式关闭（settings.subagentExternalEnabled=false）");
+                    return null;
+                }
+                String rt = dto.subagentDefaultRuntime();
+                if (rt == null || rt.isBlank()) return null;
+                // 设置里的 runtime id → registry 中真正的 agentType（md 里 name: 可与 runtime 不同）
+                for (AgentDefinition def : currentRegistry().listAgents()) {
+                    if (def instanceof AgentDefinition.ExternalAgentDefinition ext
+                            && rt.equalsIgnoreCase(ext.runtime())) {
+                        return def.agentType();
+                    }
+                }
+                log.warn("[SubagentTool] settings.subagentDefaultRuntime='{}' 已配置，但 agents 目录里没有"
+                        + "对应 runtime 的 md 定义 ⇒ 回落内置 agent（新建 agents/<name>.md 并写 runtime: {} 即可生效）",
+                        rt, rt);
+                return null;
+            } catch (Exception e) {
+                log.warn("[SubagentTool] 读子代理运行时设置失败，回落内置: {}", e.toString());
+                return null;
+            }
+        };
+    }
+
+    public void setDefaultExternalAgentType(java.util.function.Supplier<String> supplier) {
+        this.defaultExternalAgentType = supplier;
+    }
+
+    /**
      * [A5-2] 子 Agent 预算求和分派 mapper（isAnthropic 原料 · deepseek input 已含 cache hit，
      * 4 项和双计 over-count）· {@code @Autowired(required=false)} 字段注入（对齐
      * featureFlags/skillPreloader 先例，4 个 SubagentExecutor 构造站点统一消费同一实例）。
@@ -768,6 +824,35 @@ public class SubagentTool implements Tool {
             }
         }
         return reg;
+    }
+
+    /**
+     * 失效全部 per-cwd 的 Agent 注册表缓存 · 下次访问时按磁盘重建。
+     *
+     * <p><b>WHY 需要这个入口</b>：注册表是**启动时从磁盘扫描**的快照并按 cwd 缓存
+     * （{@link #registriesByCwd}）。通过界面新建/删除智能体是**写 MD 文件**，
+     * 不重新扫描的话新智能体在会话里绑不上（PATCH /sessions 会报「agent 类型不存在」），
+     * 删掉的智能体还会继续可用 —— 两者都不报「文件没刷新」这种线索。
+     *
+     * <p>⚠️ 只在智能体 CRUD 时清空，⛔ 不要放进每一轮的工具装配路径
+     * （那会让每轮都重扫磁盘，且丢失 CC 的 memoize 语义）。
+     */
+    public void invalidateAgentRegistries() {
+        int n = registriesByCwd.size();
+        registriesByCwd.clear();
+        // ⚠️ 只清 registriesByCwd **不够**（缺陷 29 · 2026-11-05 真机）：
+        //   重建 registry 走 loadAgentsDir.loadAllSources → MarkdownConfigLoader
+        //   .loadMarkdownFilesForSubdir，**文件列表是 memoize 的**。不清那一层，
+        //   重建出来的还是「旧文件清单」⇒ 新建/删除的 MD 在会话校验里看不见
+        //   （PATCH /sessions 报「agent 类型不存在」），只有重启进程才生效。
+        //   loadAgentsDir.clearCache() 内部连带清 MarkdownConfigLoader（:51-57）。
+        try {
+            com.nexusai.application.agent.subagent.loadAgentsDir.clearCache();
+        } catch (RuntimeException e) {
+            log.warn("[SubagentTool] 清 MarkdownConfigLoader 文件列表缓存失败（注册表会读到旧清单）: {}",
+                e.toString());
+        }
+        log.info("[SubagentTool] Agent 注册表缓存已失效（{} 个 cwd），下次访问将按磁盘重建", n);
     }
 
     /**
@@ -1982,6 +2067,20 @@ public class SubagentTool implements Tool {
         String description = getString(input, "description");
         String prompt = getString(input, "prompt");
         String subagentType = getStringOrNull(input, "subagent_type");
+        // [external-agent 2026-11-04] 「默认内置，配了默认才按默认跑，用户显式指定永远优先」。
+        //   三层优先级（低 → 高）：
+        //     ① 用户没传 subagent_type（原来落 general-purpose）
+        //     ② settings.subagentDefaultRuntime 已配置 且 subagentExternalEnabled 未被显式关闭
+        //     ③ 本次调用显式传了 subagent_type（内置名或外部名）
+        //   ⚠️ 只在 ① 时替换：用户点名内置 agent 时不得被默认值劫持。
+        if (subagentType == null || subagentType.isBlank()) {
+            String forced = defaultExternalAgentType == null ? null : defaultExternalAgentType.get();
+            if (forced != null && !forced.isBlank()) {
+                log.info("[SubagentTool] 未指定 subagent_type → 按设置默认外部运行时派发为 '{}'"
+                        + "（settings.subagentDefaultRuntime；用户显式指定时此默认不生效）", forced);
+                subagentType = forced;
+            }
+        }
         String model = getStringOrNull(input, "model");
         boolean runInBackground = input.has("run_in_background") && input.get("run_in_background").asBoolean();
 

@@ -5,13 +5,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.skill.NexusaiPaths;
-import com.nexusai.application.agent.cost.LlmSideCallClient;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
-import com.nexusai.infra.llm.ModelConfigResolver;
-import com.nexusai.infra.llm.ProviderConfig;
-import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.session.dto.ArtifactContentUpdateResponse;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.SessionArtifactDto;
@@ -84,14 +80,6 @@ public class SessionArtifactService {
     /** 项目惯例：各服务静态 ObjectMapper。 */
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** 弱档（小快）模型兜底名 · 与 ChatService 标题生成同源（resolveFastModelName 三极回落）。 */
-    private static final String FAST_MODEL_FALLBACK = "claude-haiku-4-5-20251001";
-
-    /** 抽取输入总长度上限：超限保留<b>尾部</b>（近期消息更相关）。 */
-    private static final int MAX_INPUT_CHARS = 60_000;
-
-    /** 工具返回内容每条截断长度（工具输出通常是噪声，只留开头判断用了什么）。 */
-    private static final int TOOL_RESULT_MAX_CHARS = 300;
 
     /** 每会话防抖窗口：10 秒内重复触发合并成一次。 */
     private static final long DEBOUNCE_MS = 10_000L;
@@ -155,44 +143,6 @@ public class SessionArtifactService {
      */
     private static final String[] SOURCE_TOOL_KEYWORDS = {"websearch", "web_search", "webfetch", "web_fetch"};
 
-    /** 工具入参里表示「文件路径」的键（Write/Edit/Read 等工具的实际字段名集合）。 */
-    private static final String[] PATH_ARG_KEYS = {
-            "file_path", "path", "notebook_path", "filePath",
-            "target_file", "output_path", "outputPath", "absolute_path"
-    };
-
-    /**
-     * 抽取提示词（只输出 JSON）。规则写死在提示词里而不是后处理里：
-     * 「什么算产物/来源」是判断问题（规则五：交给模型），后处理只做确定性清洗。
-     */
-    private static final String SYSTEM_PROMPT = """
-            你是「会话产物 / 来源」抽取器。给你一段会话历史（用户、助手、工具调用摘要），
-            请从中抽取两类条目，只输出一个 JSON 对象，不要任何解释、不要 Markdown 围栏。
-
-            输出结构（缺的字段用 null，不得编造）：
-            {"deliverables":[{"title":"...","path":"...","summary":"..."}],
-             "sources":[{"title":"...","url":"...","summary":"..."}]}
-
-            deliverables（产物）—— 只收「用户最终要的结果文件」：
-            - 例如：报告、文档、设计稿、演示文稿、导出的表格、生成的 html / 图片 / PDF 等交付物。
-            - path 必须是该文件在磁盘上的路径（绝对路径优先；相对路径也可以），
-              没有路径的条目不要收（用户点不开）。
-            - ⛔ 排除：源码改动（改了哪些 .java / .ts / .tsx / .css 等）、临时脚本、测试文件、
-              构建中间产物、日志文件。
-            - 同一交付物的多个版本只保留最终版（给最终路径，一条即可）。
-
-            sources（来源）—— 只收「外部引用」：
-            - 例如：用户提供的 URL、网页搜索结果、知识库/文档链接、被用户 @ 引用的文件。
-            - url 必填（展示形态只支持链接）：网页链接原样写进 url；
-              被 @ 引用的本地文件把其绝对路径写进 url（这是唯一可存的引用位置）。
-            - ⛔ 排除：助手自己生成或拼出来的链接、没有实际访问的链接、内部工具跳转地址。
-
-            规则：
-            - 宁缺毋滥：不确定的整条不要。
-            - title 必填、简短（≤60 字）；summary 一句话（≤100 字）说明它是什么。
-            - 只输出 JSON。
-            """;
-
     @Autowired private SessionArtifactMapper artifactMapper;
 
     /**
@@ -220,27 +170,9 @@ public class SessionArtifactService {
     /** 会话消息读取（全量内部通道）· required=false 容错直接构造的单测。 */
     @Autowired(required = false) private MessageService messageService;
 
-    /** 旁路 LLM 单发 + 记账 · required=false：缺失时抽取整体跳过（WARN，不静默成功）。 */
-    @Autowired(required = false) private LlmSideCallClient sideCallClient;
-
-    @Autowired(required = false) private ModelConfigResolver modelConfigResolver;
-
     /** 抽取开关（nexusai.artifacts.extract-enabled，默认 true）· 字段初值 true = 非 Spring 直构默认开。 */
     @Value("${nexusai.artifacts.extract-enabled:true}")
     private boolean extractEnabled = true;
-
-    /**
-     * **LLM 抽取**开关（nexusai.artifacts.llm-extract-enabled，默认 <b>false</b>）。
-     *
-     * <p><b>WHY 默认关</b>（2026-11-02 用户裁定）：交付物改由「扫固定目录」收集、来源改由
-     * 「读 WebSearch/WebFetch 结果」收集后，两条都是**确定性**通道，覆盖了绝大多数场景 ⇒
-     * 轮末那次旁路模型调用（读整段会话猜路径/猜链接）变成纯兜底，不值得每轮都花。
-     *
-     * <p>保留开关而不是删代码：{@code extractNow} 里那条路径覆盖「文件写在目录外」的残余情况，
-     * 需要时可以临时打开验证/补数据。
-     */
-    @Value("${nexusai.artifacts.llm-extract-enabled:false}")
-    private boolean llmExtractEnabled = false;
 
     /**
      * 产物归档开关（nexusai.artifacts.archive-enabled，默认 true）。
@@ -287,7 +219,16 @@ public class SessionArtifactService {
      */
     private final Map<String, TurnWatch> turnWatches = new ConcurrentHashMap<>();
 
-    private record TurnWatch(java.util.concurrent.ScheduledFuture<?> future, Map<String, String> signatures) {}
+    /**
+     * 轮内监看的句柄。
+     *
+     * @param future        定时任务
+     * @param signatures    文件签名（size:mtime）
+     * @param userMessageId <b>本轮归属</b> —— 扫描发现的产物一律挂到这条用户消息上
+     */
+    private record TurnWatch(java.util.concurrent.ScheduledFuture<?> future,
+                             Map<String, String> signatures,
+                             String userMessageId) {}
 
     /** 每会话上次触发时刻（防抖）· sessionId → epoch millis。 */
     private final Map<String, Long> lastRun = new ConcurrentHashMap<>();
@@ -311,6 +252,41 @@ public class SessionArtifactService {
                 QueryWrapper.create()
                         .eq("session_id", sessionId)
                         .orderBy("updated_at", false));   // desc（新→旧）
+        return toBuckets(rows);
+    }
+
+    /**
+     * 某一轮（用户消息）产出的产物/来源。
+     *
+     * <p><b>WHY 单独一个方法</b>（2026-11-05 用户裁定「展示的可访问产物是轮次的」）：
+     * 会话级列表给右侧栏看总量，而对话流里每轮气泡下只该展示<b>本轮</b>产出的东西。
+     * 二者数据源相同、口径不同，都从同一张表取，⛔ 不另存一份。
+     *
+     * <p>⚠️ {@code messageId} 为空 → 返回**归属未知**的那批（历史行），
+     * 便于前端把它们归入「历史」分组而不是丢掉。
+     *
+     * @param sessionId 会话 id
+     * @param messageId 用户消息 id（null/空白 = 归属未知）
+     * @return 该轮的两个桶
+     */
+    public ArtifactBuckets listByMessage(String sessionId, String messageId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return new ArtifactBuckets(List.of(), List.of());
+        }
+        QueryWrapper q = QueryWrapper.create()
+                .eq("session_id", sessionId)
+                .orderBy("updated_at", false);
+        if (messageId == null || messageId.isBlank()) {
+            q.and("source_message_id IS NULL");
+        } else {
+            q.eq("source_message_id", messageId);
+        }
+        List<SessionArtifactRecord> rows = artifactMapper.selectListByQuery(q);
+        return toBuckets(rows);
+    }
+
+    /** 行 → 两桶（未知 kind 忽略并留调试日志，存量脏行不抛错）。 */
+    private ArtifactBuckets toBuckets(List<SessionArtifactRecord> rows) {
         List<SessionArtifactDto> deliverables = new ArrayList<>();
         List<SessionArtifactDto> sources = new ArrayList<>();
         if (rows != null) {
@@ -762,7 +738,7 @@ public class SessionArtifactService {
      *
      * <p>本方法<b>永不抛出</b>：任何异常（含线程池拒绝）只 WARN。
      */
-    public void scheduleExtract(String sessionId) {
+    public void scheduleExtract(String sessionId, String userMessageId) {
         try {
             if (!extractEnabled) {
                 if (log.isDebugEnabled()) {
@@ -792,7 +768,7 @@ public class SessionArtifactService {
                     return;
                 }
                 try {
-                    extractNow(sessionId);
+                    extractNow(sessionId, userMessageId);
                 } catch (Throwable t) {
                     // 双保险：extractNow 内部已兜底，这里防「兜底本身出错 / OOM 之类」漏出去
                     log.warn("[artifact-extract] 异步抽取异常（不影响对话） session={}: {}", sessionId, t.toString());
@@ -806,13 +782,13 @@ public class SessionArtifactService {
     }
 
     /**
-     * 同步执行一次抽取（测试 / 手动补跑用；生产只经 {@link #scheduleExtract(String)}）。
+     * 同步执行一次抽取（测试 / 手动补跑用；生产只经 {@link #scheduleExtract(String, String)}）。
      *
      * <p>⛔ 同样<b>不抛异常</b>：失败只 WARN —— 让调用方（测试之外）永远不可能因产物抽取影响对话。
      *
      * @param sessionId 会话 id
      */
-    public void extractNow(String sessionId) {
+    public void extractNow(String sessionId, String userMessageId) {
         long startedAt = System.currentTimeMillis();
         try {
             if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
@@ -822,94 +798,27 @@ public class SessionArtifactService {
             // [2026-11-02 做法 A] 交付物：扫 Agent 按提示词写入的固定目录。
             //   ⚠️ 不受 llmExtractEnabled 影响 —— 这是纯文件系统操作，与「要不要调模型」无关。
             try {
-                syncDeliverablesFromDir(sessionId);
+                syncDeliverablesFromDir(sessionId, userMessageId);
             } catch (Throwable t) {
                 log.warn("[artifact-extract] 交付物目录扫描异常 session={}: {}", sessionId, t.toString());
             }
             List<ChatMessageDto> messages = readNonMetaMessages(sessionId);
             // [2026-11-02] 来源**兜底扫描**：工具已在抓取/搜索成功时当场入库
-            //   （WebSearchTool.recordSources / WebFetchTool.recordSource）。这里再扫一遍是为了
+            //   （[2026-11-04 起] 由 ArtifactCollectionHooks 这个 PostToolUse hook 采集）。
+            //   这里再扫一遍是为了
             //   补「升级前产生的历史工具结果」与「工具注入缺失（单测直构）时漏掉的」——
             //   幂等（按 title upsert）⇒ 正常路径下这里 0 新增，不会重复。
             try {
-                syncSourcesFromToolResults(sessionId, messages);
+                syncSourcesFromToolResults(sessionId, messages, userMessageId);
             } catch (Throwable t) {
                 log.warn("[artifact-extract] 工具结果来源兜底收集异常 session={}: {}", sessionId, t.toString());
             }
-            // ══════════ LLM 通道（可选，默认关）══════════
-            // [2026-11-02] 两条确定性通道上线后，LLM 抽取降级为**兜底**：
-            //   覆盖「文件写在目录外 / 来源不是这两个工具产出」的残余情况。
-            //   默认关闭以省一次模型调用；需要时把 nexusai.artifacts.llm-extract-enabled 置 true。
-            if (!llmExtractEnabled) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[artifact-extract] LLM 抽取已关闭（nexusai.artifacts.llm-extract-enabled=false），"
-                            + "仅用确定性通道 session={}", sessionId);
-                }
-                return;
-            }
-            if (messages.isEmpty()) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[artifact-extract] 会话无非 meta 消息，跳过 session={}", sessionId);
-                }
-                return;
-            }
-            String userPayload = buildExtractionInput(messages);
-            if (userPayload.isBlank()) {
-                if (log.isDebugEnabled()) {
-                    log.debug("[artifact-extract] 抽取输入为空（无可用正文/工具路径），跳过 session={}", sessionId);
-                }
-                return;
-            }
-            if (sideCallClient == null) {
-                log.warn("[artifact-extract] LlmSideCallClient 未装配，跳过抽取 session={}", sessionId);
-                return;
-            }
-            String modelName = resolveModelName();
-            if (modelName == null) {
-                log.warn("[artifact-extract] fast 模型未配置（settings fast/weak 与兜底 {} 均不可用），跳过抽取 session={}",
-                        FAST_MODEL_FALLBACK, sessionId);
-                return;
-            }
-            ProviderConfig config = resolveConfig(modelName);
-            if (config == null || !config.isUsable()) {
-                log.warn("[artifact-extract] 模型配置不可用（model={}），跳过抽取 session={}", modelName, sessionId);
-                return;
-            }
-            log.info("[artifact-extract] 开始 session={} 消息数={} 输入字符={} 模型={}",
-                    sessionId, messages.size(), userPayload.length(), modelName);
-
-            String raw = sideCallClient.chat(config, modelName, SYSTEM_PROMPT, userPayload, null,
-                    LlmSideCallClient.SideCallUsage.inSession(
-                            sessionId, null, UsageCategory.SIDE_CALL, "artifact_extract"));
-
-            SessionArtifactParser.ParsedExtraction parsed = SessionArtifactParser.parse(raw);
-            if (parsed.deliverables().isEmpty() && parsed.sources().isEmpty()) {
-                log.info("[artifact-extract] 模型未返回任何条目 session={} 耗时={}ms",
-                        sessionId, System.currentTimeMillis() - startedAt);
-                return;
-            }
-
-            String cwd = resolveSessionCwd(sessionId);
-            String now = OffsetDateTime.now().toString();
-            int saved = 0;
-            int dropped = 0;
-            for (SessionArtifactParser.ParsedArtifact item : parsed.deliverables()) {
-                if (!saveDeliverable(sessionId, item, cwd, now)) {
-                    dropped++;
-                } else {
-                    saved++;
-                }
-            }
-            for (SessionArtifactParser.ParsedArtifact item : parsed.sources()) {
-                if (!saveSource(sessionId, item, now)) {
-                    dropped++;
-                } else {
-                    saved++;
-                }
-            }
-            log.info("[artifact-extract] 完成 session={} 模型产物={} 模型来源={} 入库={} 丢弃={} 耗时={}ms",
-                    sessionId, parsed.deliverables().size(), parsed.sources().size(),
-                    saved, dropped, System.currentTimeMillis() - startedAt);
+            // ══════════ LLM 通道已删除（2026-11-05 用户裁定）══════════
+            // WHY：产物/来源的两条确定性通道（目录扫描 + 工具结果）已覆盖全部正常路径，
+            //   LLM 抽取是「兜底中的兜底」，代价是一次额外的模型调用（慢 + 花钱），
+            //   且它读的是**整段会话**而不是当前轮 ⇒ 会把旧产物重复归属到新轮次。
+            //   ⇒ 整段删除（含 SYSTEM_PROMPT / buildExtractionInput / parse）。
+            //   ⛔ 不要再加回来：产物归属由「提示词约定固定目录 + 轮次扫描 + 工具 hook」保证。
         } catch (Throwable t) {
             log.warn("[artifact-extract] 抽取失败（不影响对话） session={}: {}", sessionId, t.toString());
         }
@@ -941,76 +850,6 @@ public class SessionArtifactService {
             out.add(m);
         }
         return out;
-    }
-
-    /**
-     * 拼抽取输入：role + 正文 + 工具名与<b>参数里的文件路径</b>；工具返回截断到 300 字。
-     *
-     * <p>⛔ 不拼工具入参原文：Write/Edit 的 arguments 里是整个文件内容，拼进来会把 6 万字符预算
-     * 全部吃掉，而模型真正需要的是「写了哪个文件」——只取路径键。
-     */
-    private String buildExtractionInput(List<ChatMessageDto> messages) {
-        StringBuilder sb = new StringBuilder();
-        for (ChatMessageDto m : messages) {
-            String role = m.role() == null ? "unknown" : m.role().name().toLowerCase();
-            String content = m.content();
-            List<ToolCallDto> toolCalls = m.toolCalls();
-            boolean hasTools = toolCalls != null && !toolCalls.isEmpty();
-            if ((content == null || content.isBlank()) && !hasTools) {
-                continue;
-            }
-            sb.append('[').append(role).append("] ");
-            if (content != null && !content.isBlank()) {
-                sb.append("tool".equals(role) ? truncate(content, TOOL_RESULT_MAX_CHARS) : content);
-            }
-            if (hasTools) {
-                for (ToolCallDto tc : toolCalls) {
-                    sb.append("\n  tool: ").append(tc.name() == null ? "unknown" : tc.name());
-                    String path = extractPathFromArguments(tc.arguments());
-                    if (path != null) {
-                        sb.append(" path=").append(path);
-                    }
-                }
-            }
-            sb.append('\n');
-        }
-        String text = sb.toString();
-        if (text.length() > MAX_INPUT_CHARS) {
-            // 超限保留尾部：抽取关心「最终交付了什么」，早期消息相关性低
-            text = text.substring(text.length() - MAX_INPUT_CHARS);
-        }
-        return text;
-    }
-
-    /** 从工具入参 JSON 里取第一个已知「路径」键；解析失败 / 无路径 → null。 */
-    private static String extractPathFromArguments(String arguments) {
-        if (arguments == null || arguments.isBlank()) {
-            return null;
-        }
-        try {
-            JsonNode node = JSON.readTree(arguments);
-            if (node == null || !node.isObject()) {
-                return null;
-            }
-            for (String key : PATH_ARG_KEYS) {
-                JsonNode value = node.get(key);
-                if (value != null && value.isTextual()) {
-                    String path = value.asText();
-                    if (path != null && !path.isBlank()) {
-                        return path.trim();
-                    }
-                }
-            }
-        } catch (Exception e) {
-            if (log.isDebugEnabled()) {
-                log.debug("[artifact-extract] 工具入参不是合法 JSON，跳过路径提取: {}", e.toString());
-            }
-        }
-        return null;
-    }
-
-    private static String truncate(String text, int max) {
-        return text.length() <= max ? text : text.substring(0, max) + "…(已截断)";
     }
 
     // ───────────────────────── 清洗 + UPSERT ─────────────────────────
@@ -1065,7 +904,7 @@ public class SessionArtifactService {
     }
 
     private boolean saveDeliverable(String sessionId, SessionArtifactParser.ParsedArtifact item,
-                                    String cwd, String now) {
+                                    String cwd, String now, String sourceMessageId) {
         String title = clip(item.title(), TITLE_MAX);
         if (title == null) {
             return false;
@@ -1130,12 +969,13 @@ public class SessionArtifactService {
                     sessionId, resolved);
         }
         upsert(sessionId, KIND_DELIVERABLE, title, localPath, null, sizeBytes,
-                clip(item.summary(), SUMMARY_MAX), now);
+                clip(item.summary(), SUMMARY_MAX), now, sourceMessageId);
         return true;
     }
 
     /** 来源清洗 + 入库：url 为空整条丢弃（展示形态只支持链接）。 */
-    private boolean saveSource(String sessionId, SessionArtifactParser.ParsedArtifact item, String now) {
+    private boolean saveSource(String sessionId, SessionArtifactParser.ParsedArtifact item, String now,
+                               String sourceMessageId) {
         String title = clip(item.title(), TITLE_MAX);
         if (title == null) {
             return false;
@@ -1148,7 +988,7 @@ public class SessionArtifactService {
             return false;
         }
         upsert(sessionId, KIND_SOURCE, title, null, url, null,
-                clip(item.summary(), SUMMARY_MAX), now);
+                clip(item.summary(), SUMMARY_MAX), now, sourceMessageId);
         return true;
     }
 
@@ -1158,15 +998,99 @@ public class SessionArtifactService {
      * <p>「同一交付物多版本只留最终版」由唯一索引 uk_session_artifact + 这里先查后写共同保证；
      * 两次并发抽取撞同一个键时，唯一索引会让后写者报错 → 捕获后 WARN（下一轮会覆盖成最终值）。
      */
-    private void upsert(String sessionId, String kind, String title, String localPath, String url,
-                        Long sizeBytes, String summary, String now) {
+    /**
+     * 该行是否「自上次记录以来没变过」（**产物没变 ⇒ 不刷时间戳、不重推**）。
+     *
+     * <p><b>WHY 需要它</b>（2026-11-04 用户实测「新轮次会默认打开之前的产物」）：
+     * 轮末目录扫描 / 轮内监看每轮都会把目录里**所有**文件重走一遍 upsert，而 upsert 原先
+     * <b>无条件</b>刷 {@code updated_at} ⇒ 上一轮的旧产物被顶到「最新」⇒ 前端按 updated_at
+     * 倒序取 {@code list[0]} 就把**旧产物当新的**弹了出来。
+     *
+     * <p><b>判据</b>：
+     * <ul>
+     *   <li><b>产物</b>（有 localPath）：大小相同 <b>且</b> 文件 mtime <b>不晚于</b>行上的
+     *       {@code updated_at}（= 我们上次确认它的时间）⇒ 之后没人改过它；</li>
+     *   <li><b>来源</b>（无 localPath）：url / 大小 / 摘要全同 ⇒ 没变。</li>
+     * </ul>
+     *
+     * <p><b>⛔ 只比大小不够</b>：同尺寸重写（"cat" → "dog"）会被误判成「没变」⇒ 把轮内监看
+     * （按 {@code size:mtime} 精确去重）的判断压掉 ⇒ 编辑过程中不再实时推送。
+     * ⇒ 必须带上 mtime。
+     *
+     * @param existing  DB 里已有的行
+     * @param localPath 产物本地路径（null = 来源类条目）
+     * @param url       来源 url（产物为 null）
+     * @param sizeBytes 本次读到的大小
+     * @param summary   本次摘要
+     * @return true = 没变（调用方应跳过时间戳刷新与推送）
+     */
+    private static boolean isUnchangedArtifact(SessionArtifactRecord existing, String localPath, String url,
+                                               Long sizeBytes, String summary) {
+        if (!java.util.Objects.equals(existing.getUrl(), url)
+                || !java.util.Objects.equals(existing.getSizeBytes(), sizeBytes)
+                || !java.util.Objects.equals(existing.getSummary(), summary)) {
+            return false;
+        }
+        if (localPath == null || localPath.isBlank()) {
+            return true;   // 来源类：url/大小/摘要全同 ⇒ 没变
+        }
+        if (!java.util.Objects.equals(existing.getLocalPath(), localPath)) {
+            return false;  // 路径变了 ⇒ 换了文件 ⇒ 变了
+        }
+        // mtime 与 updated_at 比较：文件是否在「我们上次确认它」之后被改过。
+        String updatedAt = existing.getUpdatedAt();
+        if (updatedAt == null || updatedAt.isBlank()) {
+            return false;  // 无上次确认时间 ⇒ 保守当「变了」（刷新一次时间戳）
+        }
         try {
-            SessionArtifactRecord existing = artifactMapper.selectOneByQuery(
-                    QueryWrapper.create()
-                            .eq("session_id", sessionId)
-                            .eq("kind", kind)
-                            .eq("title", title));
+            long mtime = Files.getLastModifiedTime(Paths.get(localPath)).toMillis();
+            long lastConfirmed = java.time.OffsetDateTime.parse(updatedAt).toInstant().toEpochMilli();
+            return mtime <= lastConfirmed;
+        } catch (Exception e) {
+            // 读不到 mtime（文件已删 / 路径异常）⇒ 保守当「变了」
+            return false;
+        }
+    }
+
+    private void upsert(String sessionId, String kind, String title, String localPath, String url,
+                        Long sizeBytes, String summary, String now, String sourceMessageId) {
+        try {
+            // ⭐ 幂等键 = (session, 归属轮次, kind, title)。
+            //   WHY 带 sourceMessageId：同一文件在**不同轮**被改过时必须是两行
+            //   （消息是 append-only 的，产物跟着「搬家」会让历史轮次凭空少一个）。
+            //   ⚠️ SQLite 的 NULL 不等于 NULL ⇒ 历史行（归属未知）用 IS NULL 单独匹配，
+            //   与迁移里的 COALESCE 表达式唯一索引口径一致。
+            QueryWrapper key = QueryWrapper.create()
+                    .eq("session_id", sessionId)
+                    .eq("kind", kind)
+                    .eq("title", title);
+            if (sourceMessageId == null || sourceMessageId.isBlank()) {
+                key.and("source_message_id IS NULL");
+            } else {
+                key.eq("source_message_id", sourceMessageId);
+            }
+            SessionArtifactRecord existing = artifactMapper.selectOneByQuery(key);
             if (existing != null) {
+                // [2026-11-04] **产物没变 ⇒ 不刷新 updated_at、不推送**。
+                // WHY：轮末目录扫描 / 轮内监看每轮都会把目录里**所有**文件重新走一遍 upsert。
+                //   原实现无条件 `setUpdatedAt(now)` ⇒ 上一轮的旧产物被顶到「最新」⇒
+                //   前端按 updated_at 倒序取 list[0] 就把**旧产物当新的**弹了出来
+                //   （用户实测「新轮次会默认打开之前的产物」）。
+                //
+                //   判据 = 「这个文件自上次记录以来**没有再被改过**」：
+                //     · 大小相同 **且** 文件的 mtime **不晚于** 行上的 updated_at
+                //       （updated_at = 我们上次确认它的时间；mtime > 它 ⇒ 文件在那之后被改过）。
+                //   ⛔ 只比大小**不够**：同尺寸重写（"cat"→"dog"）会被误判成「没变」⇒
+                //       会把轮内监看（按 mtime 精确去重）的判断给压掉 ⇒ 编辑中不再实时推送。
+                //   ⛔ source 没有磁盘文件 ⇒ 走「url/大小/摘要全同」的记录级判据。
+                boolean unchanged = isUnchangedArtifact(existing, localPath, url, sizeBytes, summary);
+                if (unchanged) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("[artifact-extract] UPSERT 未变（跳过刷新时间戳+推送） session={} kind={} title={}",
+                                sessionId, kind, title);
+                    }
+                    return;
+                }
                 // 旧副本路径必须在覆盖前抓下来：新副本名带「路径 hash」，路径不变时同名覆盖，
                 // 路径变了（用户换了文件）则旧副本成为孤儿 —— 见下方 cleanupReplacedCopy。
                 String oldLocalPath = existing.getLocalPath();
@@ -1200,8 +1124,9 @@ public class SessionArtifactService {
             row.setUrl(url);
             row.setSizeBytes(sizeBytes);
             row.setSummary(summary);
-            // 当前抽取链路没有逐条溯源信息 —— 保持 NULL，不伪造归属（V205 列语义）
-            row.setSourceMessageId(null);
+            // ⭐ 归属到触发它的那一轮用户消息（V205 列语义，2026-11-05 起真正写入）
+            row.setSourceMessageId(
+                    sourceMessageId == null || sourceMessageId.isBlank() ? null : sourceMessageId);
             row.setCreatedAt(now);
             row.setUpdatedAt(now);
             artifactMapper.insert(row);
@@ -1238,6 +1163,26 @@ public class SessionArtifactService {
 
     /** 交付物目录名（会话产物目录下的子目录，Agent 按系统提示词写入这里）。 */
     public static final String DELIVERABLES_DIR_NAME = "deliverables";
+
+    /** 截图目录名（会话产物目录下的子目录，computer-use observe 的截图产物写这里）。 */
+    public static final String SCREENSHOTS_DIR_NAME = "screenshots";
+
+    /**
+     * 会话截图目录：{@code {artifactsRoot}/{sessionId}/screenshots}。
+     *
+     * <p><b>WHY 单独一个子目录</b>（2026-11-03 用户裁定）：截图<b>不是交付物</b> ——
+     * 交付物是「用户要的东西」，进产物面板（ArtifactDock）会让用户看到一堆临时截图。
+     * <br>⇒ 截图与 {@code deliverables/} 平级但独立：同根（便于随会话一起清理）、
+     * 不同目录（不进产物面板）。
+     * <br>⛔ 该目录必须留在 {@code artifactsRoot} 之内：归档逻辑遇到「已经在自有目录里」
+     * 的文件会跳过复制，避免自我复制出重复副本。
+     *
+     * @param sessionId 会话 id（空白 → {@code unknown}，与 {@link #sessionArtifactsDir} 同口径）
+     * @return 截图目录绝对路径（不保证已存在）
+     */
+    public static Path screenshotsDir(String sessionId) {
+        return sessionArtifactsDir(sessionId).resolve(SCREENSHOTS_DIR_NAME);
+    }
 
     /**
      * 会话交付物目录：{@code {artifactsRoot}/{sessionId}/deliverables}。
@@ -1495,7 +1440,7 @@ public class SessionArtifactService {
      *
      * <p><b>WHY（2026-11-02 用户裁定「做法 A：固定目录 + 后端自己查」）</b>：
      * 原链路只有「轮末旁路 LLM 读会话猜路径」一条，而 Bash 脚本生成的文件**根本猜不到**
-     * （{@code BashTool} 的入参是 {@code command}，不是路径键 → {@code extractPathFromArguments} 恒 null）。
+     * （{@code BashTool} 的入参是 {@code command}，没有路径键 ⇒ 只能靠轮内目录扫描兜住）。
      * 改为「Agent 按系统提示词把交付物写进固定目录 → 后端扫目录」后：
      * <ul>
      *   <li>脚本产物也能收到（只要写进目录）；</li>
@@ -1512,7 +1457,7 @@ public class SessionArtifactService {
      * @param sessionId 会话 id
      * @return 本次新入库/更新的条数（用于日志与测试断言）
      */
-    public int syncDeliverablesFromDir(String sessionId) {
+    public int syncDeliverablesFromDir(String sessionId, String sourceMessageId) {
         if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
             return 0;
         }
@@ -1540,7 +1485,7 @@ public class SessionArtifactService {
                         continue;
                     }
                     var item = new SessionArtifactParser.ParsedArtifact(name, file.toString(), null, null);
-                    if (saveDeliverable(sessionId, item, dir.toString(), now)) {
+                    if (saveDeliverable(sessionId, item, dir.toString(), now, sourceMessageId)) {
                         saved++;
                     }
                 } catch (Throwable t) {
@@ -1579,7 +1524,7 @@ public class SessionArtifactService {
      * @param absPath   刚写入的绝对路径
      * @return true = 已作为产物入库并推送；false = 不在产物目录 / 被过滤 / 未启用
      */
-    public boolean syncDeliverableForPath(String sessionId, String absPath) {
+    public boolean syncDeliverableForPath(String sessionId, String absPath, String sourceMessageId) {
         if (!extractEnabled || sessionId == null || sessionId.isBlank() || absPath == null || absPath.isBlank()) {
             return false;
         }
@@ -1595,7 +1540,8 @@ public class SessionArtifactService {
                 return false;
             }
             var item = new SessionArtifactParser.ParsedArtifact(name, file.toString(), null, null);
-            boolean saved = saveDeliverable(sessionId, item, dir.toString(), OffsetDateTime.now().toString());
+            boolean saved = saveDeliverable(sessionId, item, dir.toString(), OffsetDateTime.now().toString(),
+                    sourceMessageId);
             if (saved && log.isInfoEnabled()) {
                 log.info("[artifact-scan] 写盘即入库 session={} file={}（轮中实时推送）", sessionId, name);
             }
@@ -1627,7 +1573,7 @@ public class SessionArtifactService {
      *
      * @param sessionId 会话 id（null/空白 / 开关关闭 → no-op）
      */
-    public void startTurnWatch(String sessionId) {
+    public void startTurnWatch(String sessionId, String userMessageId) {
         if (!extractEnabled || sessionId == null || sessionId.isBlank()) {
             return;
         }
@@ -1636,13 +1582,22 @@ public class SessionArtifactService {
                 return existing;   // 已在监看（同一轮重复触发）→ 不叠加
             }
             Map<String, String> signatures = new ConcurrentHashMap<>();
+            // [2026-11-04] **先播种签名表**：目录里**已存在**的文件（上一轮 / 更早的产物）
+            //   先记下 size:mtime ⇒ 第一拍扫描时它们「未变更」⇒ 不会重推、不会入库。
+            //   WHY：此前签名表是空的 ⇒ 第一拍把目录里所有旧文件都当成「变过了」
+            //   （signatures.put 返回 null ≠ prev）⇒ 逐个 syncDeliverableForPath ⇒ upsert
+            //   ⇒ 推 STOMP ⇒ 前端在新轮次里收到推送 → 自动打开**上一轮**的产物
+            //   （用户实测「新轮次会默认打开之前的产物」）。
+            //   播种只记「已存在」，不改动任何文件、不入库、不推送。
+            seedTurnWatchSignatures(sid, signatures);
             var future = turnWatchScheduler.scheduleWithFixedDelay(
-                () -> scanTurnWatchedDir(sid, signatures),
+                () -> scanTurnWatchedDir(sid, signatures, userMessageId),
                 TURN_WATCH_INTERVAL_MS, TURN_WATCH_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
             if (log.isDebugEnabled()) {
-                log.debug("[artifact-watch] 开始轮内监看 session={} 间隔={}ms", sid, TURN_WATCH_INTERVAL_MS);
+                log.debug("[artifact-watch] 开始轮内监看 session={} 间隔={}ms 已播种文件={}",
+                        sid, TURN_WATCH_INTERVAL_MS, signatures.size());
             }
-            return new TurnWatch(future, signatures);
+            return new TurnWatch(future, signatures, userMessageId);
         });
     }
 
@@ -1662,14 +1617,67 @@ public class SessionArtifactService {
         TurnWatch w = turnWatches.remove(sessionId);
         if (w != null) {
             w.future().cancel(false);
+            // ⭐ 轮末补扫一次：监看是每 2s 一拍，最后 2s 内落盘的文件否则会漏收
+            //   （LLM 抽取通道已删除，这里是唯一的轮末兜底）。用同一个 userMessageId 归属。
+            try {
+                scanTurnWatchedDir(sessionId, w.signatures(), w.userMessageId());
+            } catch (Throwable t) {
+                log.warn("[artifact-watch] 轮末补扫失败（不影响对话） session={}: {}", sessionId, t.toString());
+            }
             if (log.isDebugEnabled()) {
                 log.debug("[artifact-watch] 结束轮内监看 session={}", sessionId);
             }
         }
     }
 
+    /**
+     * 播种轮内监看的签名表（**只读，不入库、不推送**）。
+     *
+     * <p><b>WHY 需要它</b>（2026-11-04 用户实测「新轮次会默认打开之前的产物」）：
+     * 监看开始时签名表是空的 ⇒ 第一拍扫描时目录里**每一个已存在的文件**都会被判成
+     * 「变过了」（{@code signatures.put} 首次返回 null，与 prev 不等）⇒ 逐个走
+     * {@link #syncDeliverableForPath} ⇒ 入库 + 推 STOMP ⇒ 前端在<b>新轮次</b>里收到推送
+     * ⇒ 自动展开面板 ⇒ 弹出来的是<b>上一轮</b>的产物。
+     *
+     * <p>⇒ 监看开始前先把「已存在文件」的 {@code size:mtime} 记进签名表 ⇒ 第一拍它们就是
+     * 「未变更」⇒ 不重推。**本轮真正新写/新复制**的文件不在播种范围内 ⇒ 仍会被正常感知。
+     *
+     * <p>⛔ 播种只读目录元信息，不读文件内容、不碰 DB、不发推送。
+     *
+     * @param sessionId  会话 id
+     * @param signatures 签名表（原地写入）
+     */
+    private void seedTurnWatchSignatures(String sessionId, Map<String, String> signatures) {
+        try {
+            Path dir = deliverablesDir(sessionId);
+            if (!Files.isDirectory(dir)) {
+                return;
+            }
+            try (Stream<Path> files = Files.list(dir)) {
+                for (Path file : files.toList()) {
+                    if (!Files.isRegularFile(file)) {
+                        continue;
+                    }
+                    String name = file.getFileName() == null ? null : file.getFileName().toString();
+                    if (name == null || name.isBlank()) {
+                        continue;
+                    }
+                    try {
+                        signatures.put(name, Files.size(file) + ":" + Files.getLastModifiedTime(file).toMillis());
+                    } catch (Exception e) {
+                        // 读不到 stat → 不播种（下一拍当新文件处理，会入库一次，可接受）
+                    }
+                }
+            }
+        } catch (Throwable t) {
+            // 播种失败只降级（下一拍当新文件处理 ⇒ 最多多重推一次旧产物，不影响对话）
+            log.warn("[artifact-watch] 播种签名表失败（降级继续） session={}: {}", sessionId, t.toString());
+        }
+    }
+
     /** 单次扫描：只处理 `size:mtime` 变过的文件（未变 ⇒ 不入库、不推送）。 */
-    private void scanTurnWatchedDir(String sessionId, Map<String, String> signatures) {
+    private void scanTurnWatchedDir(String sessionId, Map<String, String> signatures,
+                                    String userMessageId) {
         try {
             Path dir = deliverablesDir(sessionId);
             if (!Files.isDirectory(dir)) {
@@ -1696,7 +1704,7 @@ public class SessionArtifactService {
                     if (sig.equals(prev)) {
                         continue;   // 未变更 → ⛔ 不重复入库/推送
                     }
-                    syncDeliverableForPath(sessionId, file.toString());
+                    syncDeliverableForPath(sessionId, file.toString(), userMessageId);
                 }
             }
             // 文件被删掉 → 忘掉签名，之后同名重建能再次触发
@@ -1722,13 +1730,14 @@ public class SessionArtifactService {
      * @param summary   可选摘要
      * @return true = 已入库/更新；false = 被丢弃（参数不合格）
      */
-    public boolean recordSource(String sessionId, String title, String url, String summary) {
+    public boolean recordSource(String sessionId, String title, String url, String summary,
+                                String sourceMessageId) {
         if (sessionId == null || sessionId.isBlank()) {
             return false;
         }
         return saveSource(sessionId,
                 new SessionArtifactParser.ParsedArtifact(title, null, url, summary),
-                OffsetDateTime.now().toString());
+                OffsetDateTime.now().toString(), sourceMessageId);
     }
 
     /**
@@ -1754,7 +1763,8 @@ public class SessionArtifactService {
      * @param messages  本轮消息（含 toolCalls，从中找网络工具结果）
      * @return 本次新入库/更新的来源条数
      */
-    public int syncSourcesFromToolResults(String sessionId, List<ChatMessageDto> messages) {
+    public int syncSourcesFromToolResults(String sessionId, List<ChatMessageDto> messages,
+                                          String sourceMessageId) {
         if (sessionId == null || sessionId.isBlank() || messages == null || messages.isEmpty()) {
             return 0;
         }
@@ -1771,7 +1781,7 @@ public class SessionArtifactService {
                 }
                 try {
                     saved += extractUrls(tc.result()).size() > 0
-                            ? saveExtractedSources(sessionId, extractUrls(tc.result()), now)
+                            ? saveExtractedSources(sessionId, extractUrls(tc.result()), now, sourceMessageId)
                             : 0;
                 } catch (Throwable t) {
                     log.warn("[artifact-sources] 单条工具结果解析失败（跳过） session={} tool={}: {}",
@@ -1865,10 +1875,11 @@ public class SessionArtifactService {
     }
 
     /** 逐条入库（复用 saveSource 的清洗与幂等）。 */
-    private int saveExtractedSources(String sessionId, List<SessionArtifactParser.ParsedArtifact> items, String now) {
+    private int saveExtractedSources(String sessionId, List<SessionArtifactParser.ParsedArtifact> items,
+                                     String now, String sourceMessageId) {
         int n = 0;
         for (SessionArtifactParser.ParsedArtifact item : items) {
-            if (saveSource(sessionId, item, now)) {
+            if (saveSource(sessionId, item, now, sourceMessageId)) {
                 n++;
             }
         }
@@ -2018,30 +2029,6 @@ public class SessionArtifactService {
 
     // ───────────────────────── 模型 / 路径解析 ─────────────────────────
 
-    /** 弱档模型名（与标题生成同一条 resolveFastModelName 链）；未配置 → null。 */
-    private String resolveModelName() {
-        if (modelConfigResolver == null) {
-            return null;
-        }
-        try {
-            String name = modelConfigResolver.resolveFastModelName(FAST_MODEL_FALLBACK);
-            return name == null || name.isBlank() ? null : name;
-        } catch (RuntimeException e) {
-            log.warn("[artifact-extract] 解析 fast 模型失败: {}", e.toString());
-            return null;
-        }
-    }
-
-    /** DB 模型名 → 真实 provider 配置（密钥解密等由 resolver 内部完成）；失败 → null。 */
-    private ProviderConfig resolveConfig(String modelName) {
-        try {
-            ModelConfigResolver.ResolvedModel resolved = modelConfigResolver.resolve(modelName);
-            return resolved == null ? null : resolved.config();
-        } catch (RuntimeException e) {
-            log.warn("[artifact-extract] 解析模型配置失败 model={}: {}", modelName, e.toString());
-            return null;
-        }
-    }
 
     /**
      * 会话工作目录（相对路径的解析基准）。

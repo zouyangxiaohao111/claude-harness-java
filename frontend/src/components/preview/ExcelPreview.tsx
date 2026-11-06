@@ -25,18 +25,21 @@ export function ExcelPreview({ bytes, error }: ExcelPreviewProps) {
     ;(async () => {
       try {
         await import('@univerjs/presets/lib/styles/preset-sheets-core.css')
-        const [{ createUniver, LocaleType }, { UniverSheetsCorePreset }, { importFile }] = await Promise.all([
+        const [{ createUniver, LocaleType }, { UniverSheetsCorePreset }, { importFile }, zhCN] = await Promise.all([
           import('@univerjs/presets'),
           import('@univerjs/preset-sheets-core'),
           import('univer-file-import'),
+          import('@univerjs/preset-sheets-core/locales/zh-CN'),
         ])
         if (disposed || !boxRef.current) return
         const { univer: u, univerAPI } = createUniver({
           locale: LocaleType.ZH_CN,
+          // ⛔ 必须显式给 locales：预设不会自带语言包，只写 locale 会让 LocaleService.t()
+          //   抛 `Locale not initialized`，Ribbon 直接崩溃 ⇒ 画布空白、无任何错误提示。
+          locales: { [LocaleType.ZH_CN]: zhCN.default },
           presets: [
             UniverSheetsCorePreset({
               container: boxRef.current,
-              workerURL: new URL('@univerjs/preset-sheets-core/worker', import.meta.url).toString(),
             }),
           ],
         })

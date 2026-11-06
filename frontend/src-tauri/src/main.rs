@@ -18,6 +18,22 @@ mod frontlog;
 /// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
 struct BackendState(std::sync::Mutex<Option<u32>>);
 
+/// 「点关闭按钮 → 只隐藏到托盘」的开关。
+///
+/// <h2>WHY 需要一个可变开关而不是硬编码</h2>
+/// 用户要的是「点 X 不退出，从托盘右键菜单里才能退出」。但退出那一下**也是**走
+/// `CloseRequested`（同一个钩子）—— 若钩子无条件隐藏，程序就永远退不出去。
+/// 所以托盘菜单的「退出」必须先把这个开关置 false，再调 `window.close()`，
+/// 钩子看到 false 才放行。
+///
+/// <p>用 `AtomicBool` 而非 `Mutex<bool>`：钩子和菜单回调可能在两个线程上，
+/// 读一次就完事，不需要临界区。
+///
+/// <p>⚠️ 默认 `true`（隐藏）：这正是用户要的行为。若托盘图标创建失败
+/// （极少数 Linux 桌面环境没有托盘），[`install_tray`] 会把开关拨回 false，
+/// 否则用户点了关闭就**再也找不回窗口**（无托盘可点、程序还在后台跑）= 死锁。
+struct HideOnClose(std::sync::atomic::AtomicBool);
+
 /// 主窗口 label。tauri.conf.json `app.windows` 未写 label，Tauri 首个窗口默认取 "main"。
 const MAIN_WINDOW_LABEL: &str = "main";
 
@@ -40,6 +56,231 @@ fn reclaim_target_on_close(
         state.lock().unwrap().take()
     } else {
         None
+    }
+}
+
+/// 托盘菜单项 id（`on_menu_event` 里按它分发）。
+const TRAY_MENU_SHOW: &str = "tray-show";
+const TRAY_MENU_QUIT: &str = "tray-quit";
+/// 「最近任务」子菜单容器的 id（不参与点击分发 —— 子菜单本身不触发事件）。
+const TRAY_MENU_RECENT: &str = "tray-recent";
+/// 「最近任务」菜单项的 id 前缀；后面接会话 id。点击时剥掉前缀得到 `sess-xxxx`。
+///
+/// <p>用**固定前缀**而不是每项一个全局常量：菜单项数量随会话数变化，
+/// 前缀让分发逻辑保持一行（`strip_prefix`），也不必把 id 列表存到别处。
+const TRAY_MENU_RECENT_PREFIX: &str = "tray-recent:";
+/// 托盘菜单里最多列几个最近任务。
+///
+/// <p>为什么是 5：用户截图里 WorkBuddy 的菜单就是「最近任务 → 4 条 + 更多」。
+/// 再多会撑满屏幕高度，且托盘菜单不适合滚动。
+const TRAY_RECENT_LIMIT: usize = 5;
+
+/// 「最近任务」的一条（前端通过 IPC 推过来）。
+#[derive(serde::Deserialize)]
+pub struct RecentTask {
+    /// 会话 id（`sess-xxxx`）—— 点击后原样发给前端。
+    pub id: String,
+    /// 会话标题。空标题前端已兜底为「新会话」，但这里再防一次（空白菜单项点不了）。
+    pub title: String,
+}
+
+/// 前端推送「最近任务」→ 重建托盘菜单。
+///
+/// <h2>WHY 由前端推而不是 Rust 自己去拉</h2>
+/// 会话列表在**前端 store**里已经是最新的（含本地乐观新建、标题实时改名）。
+/// 让 Rust 再走一遍 HTTP 会制造第二份真源，且要处理鉴权/端口/错误。
+/// 这里只做「照单重建菜单」，数据从哪来不归它管。
+///
+/// <h2>菜单形态（对齐用户给的 WorkBuddy 截图）</h2>
+/// <pre>
+///   NexusAI            ← 品牌项（禁用）
+///   打开主窗口
+///   最近任务 ›          ← 子菜单
+///     ✓ 会话标题 1      ← 当前会话打勾
+///       会话标题 2
+///       ...
+///   ─────────
+///   退出 NexusAI
+/// </pre>
+///
+/// <p>菜单重建失败（托盘已销毁 / 平台不支持）→ 返回 Err 给前端，前端静默忽略
+/// （托盘只是增强，推列表失败不该影响任何主流程）。
+///
+/// <p>`current_id` 是前端**当前打开的会话**，用来在子菜单里打勾；缺省则都不打勾。
+#[tauri::command]
+fn update_tray_recent(
+    app: tauri::AppHandle,
+    tasks: Vec<RecentTask>,
+    current_id: Option<String>,
+) -> Result<(), String> {
+    rebuild_tray_menu(&app, &tasks, current_id.as_deref()).map_err(|e| e.to_string())
+}
+
+/// 按最近任务列表重建托盘菜单（供 `update_tray_recent` 与启动期共用）。
+///
+/// <h2>WHY 用子菜单而不是平铺</h2>
+/// Windows 托盘菜单是**系统原生菜单**（muda → Win32），行高/内边距/字体全部由系统渲染，
+/// 代码改不了样式。会话一多就挤成一坨、容易误点到「退出」。
+/// 唯一能让每项「松」下来的手段是**减少主菜单项数** ⇒ 会话列表收进「最近任务 ›」子菜单。
+///
+/// <h2>菜单形态</h2>
+/// <pre>
+///   NexusAI            ← 品牌项（禁用）
+///   打开主窗口
+///   最近任务 ›          ← 子菜单
+///     ✓ 会话标题 1      ← 当前会话打勾
+///       会话标题 2
+///       ...
+///   ─────────
+///   退出 NexusAI
+/// </pre>
+fn rebuild_tray_menu(
+    app: &tauri::AppHandle,
+    tasks: &[RecentTask],
+    current_id: Option<&str>,
+) -> tauri::Result<()> {
+    use tauri::menu::{CheckMenuItem, MenuItem, MenuItemBuilder, SubmenuBuilder};
+
+    let mut menu = tauri::menu::MenuBuilder::new(app);
+
+    // 品牌项：纯标识，不可点；把「最近任务」这个名字腾给子菜单
+    let brand = MenuItemBuilder::with_id("tray-brand", "NexusAI").enabled(false).build(app)?;
+    menu = menu.item(&brand);
+
+    let show = MenuItemBuilder::with_id(TRAY_MENU_SHOW, "打开主窗口").build(app)?;
+    menu = menu.item(&show);
+
+    // 「最近任务」子菜单：只有真的有条目时才建（空子菜单点开是空白，比没有更糟）
+    if !tasks.is_empty() {
+        let mut sub = SubmenuBuilder::with_id(app, TRAY_MENU_RECENT, "最近任务");
+        for t in tasks.iter().take(TRAY_RECENT_LIMIT) {
+            // ⚠️ 标题为空会让菜单项变成一条空白（点不到也看不懂）⇒ 兜底文案
+            let label = if t.title.trim().is_empty() { "新会话" } else { t.title.trim() };
+            // 菜单过长会撑爆托盘菜单宽度 ⇒ 截断（字符边界安全：按 chars 取，不按字节）
+            let label: String = if label.chars().count() > 40 {
+                format!("{}…", label.chars().take(39).collect::<String>())
+            } else {
+                label.to_string()
+            };
+            // 当前会话打勾：一眼看出「我在这」
+            let item = CheckMenuItem::with_id(
+                app,
+                format!("{}{}", TRAY_MENU_RECENT_PREFIX, t.id),
+                label,
+                true,
+                current_id == Some(t.id.as_str()),
+                None::<&str>,
+            )?;
+            sub = sub.item(&item);
+        }
+        let sub = sub.build()?;
+        menu = menu.item(&sub);
+    }
+
+    menu = menu.separator();
+
+    let quit = MenuItem::with_id(app, TRAY_MENU_QUIT, "退出 NexusAI", true, None::<&str>)?;
+    let menu = menu.item(&quit).build()?;
+
+    if let Some(tray) = app.tray_by_id("main-tray") {
+        tray.set_menu(Some(menu))?;
+    }
+    Ok(())
+}
+
+/// 建立系统托盘图标 + 右键菜单（「显示主窗口」/「退出 NexusAI」）。
+///
+/// <h2>WHY 需要托盘</h2>
+/// 用户裁定：「点击 X 不直接退出，最小化；右键最小化图标里有『退出』再退出」。
+/// 没有托盘的话，「隐藏到后台」就等于「程序还在跑但用户再也找不到它」。
+///
+/// <h2>菜单形态</h2>
+/// <ul>
+///   <li><b>显示主窗口</b> —— 托盘图标左键单击也会触发同一个动作（`show_menu_on_left_click(false)`
+///       让它左键直接唤回窗口，右键才出菜单，与 Windows 托盘惯例一致）；</li>
+///   <li><b>退出 NexusAI</b> —— 先把 [`HideOnClose`] 拨到 false，再 `close()` 主窗口，
+///       让 `CloseRequested` 钩子放行走真正的退出路径（回收后端 → `ExitRequested`）。</li>
+/// </ul>
+///
+/// <h2>失败处理（重要）</h2>
+/// 托盘创建失败（Linux 无 StatusNotifier / 图标缺失）时**必须**把 `HideOnClose` 拨回 false：
+/// 否则用户点关闭 → 窗口隐藏 → 没有托盘可点回来 → 程序在后台跑但永远不可达 = 死锁。
+/// 这里只记日志、不返回 Err —— 托盘是增强功能，不该让应用启动失败。
+fn install_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
+    // 启动期还不知道会话列表（前端 store 尚未挂载）⇒ 先建空列表版菜单，
+    // 前端首个 useEffect 会立刻推真实列表过来。⛔ 别在这里自己拼一份菜单 ——
+    // 会与 rebuild_tray_menu 的形态分叉（曾经就是两份菜单代码各自演化）。
+    let show = tauri::menu::MenuItemBuilder::with_id(TRAY_MENU_SHOW, "打开主窗口").build(app)?;
+    let quit = tauri::menu::MenuItemBuilder::with_id(TRAY_MENU_QUIT, "退出 NexusAI").build(app)?;
+    let brand = tauri::menu::MenuItemBuilder::with_id("tray-brand", "NexusAI")
+        .enabled(false)
+        .build(app)?;
+    let menu = tauri::menu::MenuBuilder::new(app)
+        .items(&[&brand, &show, &quit])
+        .build()?;
+
+    let mut builder = tauri::tray::TrayIconBuilder::with_id("main-tray")
+        .menu(&menu)
+        // 左键单击 = 唤回窗口（与 Windows 托盘惯例一致）；右键才弹菜单
+        .show_menu_on_left_click(false)
+        .on_tray_icon_event(|tray, event| {
+            // 左键单击唤回（右键由 menu 自己处理，这里只管 Left + Up 的同一次点击）
+            if let tauri::tray::TrayIconEvent::Click {
+                button: tauri::tray::MouseButton::Left,
+                button_state: tauri::tray::MouseButtonState::Up,
+                ..
+            } = event
+            {
+                show_main_window(tray.app_handle());
+            }
+        });
+
+    // 复用应用自身图标（bundle.icon 里已声明），避免额外资源文件
+    if let Some(icon) = app.default_window_icon() {
+        builder = builder.icon(icon.clone());
+    }
+    builder.build(app)?;
+    Ok(())
+}
+
+/// 托盘菜单的统一分发（**应用级**处理器）。
+///
+/// <h2>WHY 挂在 Builder 上而不是 TrayIconBuilder 上</h2>
+/// 「最近任务」菜单会**在运行时整块重建**（`rebuild_tray_menu` 里的 `tray.set_menu`）。
+/// 挂在 `TrayIconBuilder` 上的处理函数只对**建托盘时那份菜单**生效；
+/// 重建出来的新菜单项**不在**任何 `TrayIconBuilder` 的注册表里 ⇒ 点了没反应。
+/// 应用级 `on_menu_event`（`Builder::on_menu_event`）按 **id** 分发，与菜单实例无关 ⇒
+/// 重建前后都能路由。
+fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
+    let id = event.id().as_ref().to_string();
+    match id.as_str() {
+        TRAY_MENU_SHOW => show_main_window(app),
+        TRAY_MENU_QUIT => {
+            // 先放行关闭钩子，再关窗 —— 顺序不能反（反了钩子会把这次关闭也当成「隐藏」）
+            app.state::<HideOnClose>()
+                .0
+                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+                let _ = window.close();
+            }
+        }
+        other => {
+            // 「最近任务」项：id = "tray-recent:<sessionId>" → 唤回窗口 + 通知前端切换会话。
+            // 前端收不到（未监听 / 已销毁）→ 至少把窗口唤起来，用户自己能点左侧列表。
+            if let Some(sid) = other.strip_prefix(TRAY_MENU_RECENT_PREFIX) {
+                show_main_window(app);
+                let _ = app.emit("tray://switch-session", sid.to_string());
+            }
+        }
+    }
+}
+
+/// 从托盘唤回主窗口：显示 + 取消最小化 + 置前聚焦。
+fn show_main_window(app: &tauri::AppHandle) {
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
+        let _ = window.show();
+        let _ = window.unminimize();
+        let _ = window.set_focus();
     }
 }
 
@@ -249,8 +490,16 @@ fn main() {
             }
         }))
         .manage(BackendState(std::sync::Mutex::new(None)))
+        .manage(HideOnClose(std::sync::atomic::AtomicBool::new(true)))
+        // [2026-11-04] 托盘菜单统一分发挂在**应用级**（见 handle_menu_event 的 WHY）：
+        //   「最近任务」菜单会在运行时整块重建，挂在 TrayIconBuilder 上的处理器收不到新菜单项。
+        .on_menu_event(handle_menu_event)
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_fs::init())
+        // 系统级通知（Windows/macOS 右下角/通知中心）：轮次结束时由前端调用。
+        // 前端走 @tauri-apps/plugin-notification；未装插件时该 API 会 reject，
+        // 前端封装里已降级到 Web Notification API（详见 utils/systemNotify.ts）。
+        .plugin(tauri_plugin_notification::init())
         .plugin(tauri_plugin_opener::init())
         .invoke_handler(tauri::generate_handler![
             chrome_extension_dir,
@@ -264,9 +513,22 @@ fn main() {
             error_report::report_capability,
             error_report::report_startup_error,
             frontlog::frontend_log,
-            frontlog::frontend_heartbeat
+            frontlog::frontend_heartbeat,
+            update_tray_recent
         ])
         .setup(|app| {
+            // [2026-11-04 用户裁定] 系统托盘：「点 X 隐藏到托盘」，托盘右键菜单才有「退出」。
+            //   ⚠️ 失败时必须把 HideOnClose 拨回 false —— 否则没有托盘可唤回窗口，
+            //   用户点关闭后程序在后台跑却永远不可达（死锁）。故这里吞掉错误只记日志。
+            if let Err(e) = install_tray(app) {
+                app.state::<HideOnClose>()
+                    .0
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                backend::log_launcher(&format!(
+                    "[tray] 托盘创建失败，关闭行为退回「直接退出」以免窗口不可唤回: {}", e
+                ));
+            }
+
             // ===== 启动期小窗（承载 loader）+ 就绪放大交给前端 =====
             // 背景：后端冷启动实测可能 >8s（首次 Flyway 全量迁移 / c3p0 / Quartz bean 初始化）。
             // 若窗口初始就是 85% 大窗，首帧将长时间空白/白屏。故启动期用 420x420 小正方形窗承载 loader，
@@ -391,6 +653,23 @@ fn main() {
             Ok(())
         })
         .on_window_event(|window, event| {
+            // [2026-11-04 用户裁定] 主窗口「点 X」= 隐藏到托盘（不退出）；
+            //   真要退出走托盘右键菜单的「退出 NexusAI」（它先把 HideOnClose 拨 false 再关窗）。
+            //   独立预览窗（standalone-preview）不受影响：它本就该正常关闭。
+            if let tauri::WindowEvent::CloseRequested { api, .. } = event {
+                if window.label() == MAIN_WINDOW_LABEL
+                    && window
+                        .app_handle()
+                        .state::<HideOnClose>()
+                        .0
+                        .load(std::sync::atomic::Ordering::SeqCst)
+                {
+                    // prevent_close() 阻止默认销毁；hide() 让窗口从任务栏消失但进程与后端继续活着
+                    api.prevent_close();
+                    let _ = window.hide();
+                    return;
+                }
+            }
             // 用户关窗：整树杀掉本会话自启的后端 java（防孤儿）。本钩子对所有窗口触发，
             // 是否该回收（及出栈）一律交给 reclaim_target_on_close 判定。
             if let tauri::WindowEvent::CloseRequested { .. } = event {
@@ -495,6 +774,86 @@ mod tests {
             prod.contains("reclaim_target_on_close(window.label()"),
             "关窗钩子必须经由 reclaim_target_on_close(window.label(), …) 判定；\
              绕过它直接 kill 会复活「关独立预览窗连带杀掉后端」缺陷"
+        );
+    }
+
+    /// ⭐ [2026-11-04 用户裁定] 「点 X 只隐藏到托盘」的不变量。
+    ///
+    /// <p><b>为什么要守它</b>：这个功能有两处都能把应用变成「不可达的后台进程」——
+    /// <ol>
+    ///   <li>钩子隐藏了窗口但**没有** `prevent_close()` ⇒ 窗口照样被销毁，托盘唤回的是
+    ///       一个已销毁的窗口（`get_webview_window` 返回 None）⇒ 用户再也打不开；</li>
+    ///   <li>托盘创建失败却仍保持「隐藏」⇒ 没有托盘可点回来 ⇒ 同上。</li>
+    /// </ol>
+    /// 两条都无法在单测里跑 Tauri 运行时，故用源码级守护（与上面那条同款取舍）。
+    #[test]
+    fn close_hides_instead_of_destroying() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        assert!(
+            prod.contains("api.prevent_close()"),
+            "隐藏到托盘前必须 prevent_close()，否则窗口被销毁、托盘再也唤不回来"
+        );
+        assert!(
+            prod.contains("window.hide()"),
+            "关闭主窗口应当 hide() 而不是销毁"
+        );
+        // 托盘失败 → 必须退回「直接退出」，否则无可唤回入口
+        assert!(
+            prod.contains("托盘创建失败") && prod.contains("store(false"),
+            "托盘创建失败必须把 HideOnClose 拨回 false（否则用户点关闭后窗口永远不可唤回）"
+        );
+        // 菜单「退出」必须先放行钩子，再 close —— 顺序反了钩子会把退出也当成隐藏
+        let quit_pos = prod.find("TRAY_MENU_QUIT =>").expect("托盘退出菜单项必须存在");
+        // ⚠️ 不能直接 `&prod[quit_pos..quit_pos + 600]`：源码里全是中文，按**字节**切会
+        //   落在多字节字符中间 ⇒ panic（实测 `not a char boundary`）。按字符数取窗口。
+        let quit_seg: String = prod[quit_pos..].chars().take(600).collect();
+        let store_pos = quit_seg.find("store(false").expect("退出项必须先把 HideOnClose 置 false");
+        let close_pos = quit_seg.find("window.close()").expect("退出项必须真的关闭窗口");
+        assert!(
+            store_pos < close_pos,
+            "必须先 store(false) 再 close()：顺序反了关闭钩子会把这一下也当成「隐藏」，程序退不出去"
+        );
+    }
+
+    /// ⭐ [2026-11-04 用户裁定] 托盘菜单「间隔太短」⇒ 会话列表必须收进**子菜单**。
+    ///
+    /// <p><b>为什么值得守</b>：Windows 托盘菜单是系统原生菜单，行高与内边距**由 OS 渲染，
+    /// 代码改不了**。唯一能让每项松下来的手段是减少主菜单项数 —— 一旦有人把会话重新
+    /// 平铺回主菜单，「间隔太短」立刻复发，而这是纯观感缺陷、任何功能测试都抓不到。
+    #[test]
+    fn recent_tasks_must_live_in_submenu() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+
+        let build_start = prod
+            .find("fn rebuild_tray_menu")
+            .expect("必须存在 rebuild_tray_menu");
+        let build_seg: String = prod[build_start..].chars().take(2600).collect();
+
+        // ⚠️ 必须断言**构造调用**而不是类型名：函数开头的 `use tauri::menu::{CheckMenuItem, ...}`
+        //   本身就能满足 `contains("CheckMenuItem")`，实测把构造换成普通 MenuItem 后守护仍是绿的。
+        assert!(
+            build_seg.contains("SubmenuBuilder::with_id(app, TRAY_MENU_RECENT"),
+            "最近任务必须建为 SubmenuBuilder 子菜单；平铺回主菜单会让系统原生行距挤成一坨"
+        );
+        assert!(
+            build_seg.contains("CheckMenuItem::with_id("),
+            "当前会话必须真的用 CheckMenuItem::with_id 构造（仅 use 导入不算），否则用户看不出自己在哪个会话"
+        );
+        assert!(
+            build_seg.contains("current_id == Some(t.id.as_str())"),
+            "勾选判据必须是「当前会话 == 该条」，否则永远不打勾或全打勾"
+        );
+        assert!(
+            build_seg.contains("TRAY_MENU_RECENT_PREFIX"),
+            "子菜单项 id 仍须带 tray-recent: 前缀，否则 handle_menu_event 分发不到"
+        );
+        // 品牌项必须禁用（它只是标识，点它什么都不该发生）
+        assert!(
+            prod.contains("tray-brand"),
+            "顶部品牌项 tray-brand 必须存在（把「最近任务」这个名字腾给子菜单）"
         );
     }
 }

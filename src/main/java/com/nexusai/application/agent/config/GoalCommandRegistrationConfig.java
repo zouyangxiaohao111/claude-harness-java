@@ -75,6 +75,24 @@ public class GoalCommandRegistrationConfig {
     private UserInputDispatcher.LocalCommandResult handleGoal(
             String args, String sessionId, GoalService goalService,
             SessionAgentStateRegistry sessionRegistry) {
+        return handleGoalForTest(args, sessionId, goalService, sessionRegistry);
+    }
+
+    /**
+     * [/goal handler 主体] 的测试入口 · 对齐 CC 的 goal 命令 call 语义。
+     *
+     * <p>WHY 暴露：本 handler 是「设定目标 ⇒ 返回 query + kickoff」这条契约的唯一实现点，
+     * 而它注册在 {@link UserInputDispatcher} 的 lambda 里（无法直接测）⇒ 抽出同款公开入口。
+     *
+     * @param args           命令名后的参数文本（可为空）
+     * @param sessionId      会话 ID
+     * @param goalService    目标服务
+     * @param sessionRegistry 会话 AgentState 注册表（取输出 token 累计值；null → 0）
+     * @return text（只读状态）/ query（设定目标 + kickoff 提示词 ⇒ 触发一轮执行）
+     */
+    public UserInputDispatcher.LocalCommandResult handleGoalForTest(
+            String args, String sessionId, GoalService goalService,
+            SessionAgentStateRegistry sessionRegistry) {
         String raw = args == null ? "" : args.trim();
 
         // ── 无参：显示当前目标（CC：Goal active: <c> (N turns) / No goal set）──
@@ -96,16 +114,38 @@ public class GoalCommandRegistrationConfig {
         }
 
         // ── 设定目标 ──
+        //   CC 返回 {type:"query", value:"Goal set: <c>", prompt:kickoff} ⇒ **触发一轮执行**。
         long tokensAtStart = currentOutputTokens(sessionRegistry, sessionId);
         try {
             SessionGoal goal = goalService.setGoal(sessionId, raw, tokensAtStart);
-            return UserInputDispatcher.LocalCommandResult.text(
-                "Goal set: " + goal.condition());
+            return UserInputDispatcher.LocalCommandResult.query(
+                "Goal set: " + goal.condition(),
+                kickoffPrompt(goal.condition()));
         } catch (IllegalArgumentException e) {
             // CC：超长 / 空条件 → 拒绝并回报（不抛到用户）
             log.warn("[goal] 设定目标被拒 session={}: {}", sessionId, e.getMessage());
             return UserInputDispatcher.LocalCommandResult.text(e.getMessage());
         }
+    }
+
+    /**
+     * kickoff 提示词 · 对齐 CC claude.exe v2.1.212 的 {@code tmo(condition)}（逐字）。
+     *
+     * <p><b>WHY 需要它</b>：CC 的 {@code /goal} 设定目标后返回 {@code {type:"query", prompt:kickoff}}，
+     * 该提示词作为 <b>isMeta 的 user 消息</b>注入本轮 ⇒ 模型看到「目标已激活，立即开始朝它工作」
+     * ⇒ <b>目标模式立刻开始执行</b>（否则只记下目标、模型在等下一条消息）。
+     *
+     * <p>⚠️ 本仓 prompt 型命令的 {@code metaMessageContent} 走
+     * {@code ChatService:865-887} 的 isMeta 落库通道（UI 隐藏、模型可见、DB 持久化）——
+     * 与 CC 的 {@code messages:[..., {content:b.prompt, isMeta:true}]} 同构。
+     */
+    static String kickoffPrompt(String condition) {
+        return "A session-scoped Stop hook is now active with condition: \"" + condition + "\". "
+            + "Briefly acknowledge the goal, then immediately start (or continue) working toward it "
+            + "— treat the condition itself as your directive and do not pause to ask the user what to do. "
+            + "The hook will block stopping until the condition holds. "
+            + "It auto-clears once the condition is met — do not tell the user to run `/goal clear` "
+            + "after success; that's only for clearing a goal early.";
     }
 
     /**

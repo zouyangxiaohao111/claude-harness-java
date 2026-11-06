@@ -8,6 +8,9 @@ import type { TurnUsageDto } from '@/api/usageTurns'
 import type { SessionFile } from '@/types'
 import { subagentColor } from '@/api/types'
 import { compactNumber, formatFileSize } from '@/utils/format'
+import { deliverAttachmentFiles, type AcceptedAttachment } from '@/utils/attachmentDelivery'
+import { u8ToBase64 } from '@/utils/base64'
+import { uploadAttachment } from '@/api/chat'
 import { briefErrorMessage, briefPayload, dropTextInBriefTurns, isBriefBlock, isSendUserMessage } from '@/utils/sendUserMessage'
 import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
@@ -19,6 +22,13 @@ import { ArtifactCards } from '@/components/right/ArtifactCards'
 const NO_CHANGED_FILES: SessionFile[] = []
 /** 稳定空产物列表（artifacts 未接时兜底 · 同上避免新数组引用） */
 const NO_ARTIFACTS: SessionArtifactDto[] = []
+
+/** 单轮产物指纹（id/大小/路径/标题）：内容变了才重建卡片节点，否则历史轮 footer 引用保持稳定 */
+function artifactSigOf(items: SessionArtifactDto[]): string {
+  return items
+    .map((d) => `${d.id}\u0001${d.sizeBytes ?? ''}\u0001${d.localPath ?? ''}\u0001${d.title}`)
+    .join('\u0000')
+}
 
 // @引用 token（@"引号路径" 或 @路径 · 遇空白/中文标点/右括号/引号结束）
 const AT_MENTION_RE = /@"[^"]+"|@[^\s，。、；：（()）“”"'#]+/g
@@ -1025,6 +1035,9 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
   )
 }
 
+/** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
+type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
+
 export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
@@ -1147,6 +1160,21 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   // [慢裁剪提示] 裁剪超过 1s 才为 true ⇒ 按钮文案切到「正在裁剪并重新发送…」（防用户以为卡死）
   const [editSlow, setEditSlow] = useState(false)
   const [editError, setEditError] = useState<string | null>(null)
+  /**
+   * [2026-11-06 用户报「编辑用户消息无法粘贴图片」] 编辑态**新增**的图片。
+   *
+   * <p>此前编辑态只有一个 textarea：既没有粘贴处理、也没有添加入口 ⇒ 用户在编辑时
+   * 完全无法补图（而主输入框 Composer 三通道俱全）。原消息自带的图走 `userImages`
+   * （原样保留、随重发带上），这里只装**本次新加**的。
+   *
+   * <p>形状照搬 Composer 的 chip：`base64` 是 dataURL（供预览），提交时剥前缀转纯 base64
+   * （后端 `Base64.decode` 与图像 block 都要求纯 base64）；`contentId` = 走 upload 腿的大图。
+   */
+  const [editAdded, setEditAdded] = useState<EditAttachmentChip[]>([])
+  /** 正在上传的附件数（上传未回填 contentId 时禁止发送，避免发出「有 chip 收不到」） */
+  const [editUploading, setEditUploading] = useState(0)
+  /** 编辑态附件去重键（与 Composer.addedKeysRef 同源语义：一个 chip 一个键，移除时按键释放） */
+  const editAddedKeysRef = useRef<Set<string>>(new Set())
   const [copied, setCopied] = useState(false)
   const editInputRef = useRef<HTMLTextAreaElement>(null)
   const copiedTimerRef = useRef<number | null>(null)
@@ -1172,6 +1200,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     setEditDraft(msg.content ?? '')
     setEditError(null)
     setEditSlow(false)
+    // 每次进入编辑态都是全新草稿：新加的图片不跨次残留（去重键也一并清）
+    setEditAdded([])
+    setEditUploading(0)
+    editAddedKeysRef.current.clear()
     setEditing(true)
   }
   const cancelEdit = () => {
@@ -1179,9 +1211,98 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     setEditError(null)
     setEditSlow(false)
   }
+  /**
+   * 编辑态添加附件 —— 复用主输入框同一条投递通道（`deliverAttachmentFiles`），
+   * 不另写一套 FileReader：图片 ≤5MB 走 base64 直传、>5MB 走 upload 拿 contentId，
+   * 拒绝/失败都**响亮**反馈（红线：不留「有 chip 但模型收不到」）。
+   */
+  const addEditFiles = (fileList: FileList | File[]) => {
+    const files = Array.from(fileList)
+    if (files.length === 0) return
+    const sid = msg.sessionId
+    void deliverAttachmentFiles(files, {
+      sessionId: sid,
+      isDuplicate: (k) => editAddedKeysRef.current.has(k),
+      reserve: (k) => { editAddedKeysRef.current.add(k) },
+      release: (k) => { editAddedKeysRef.current.delete(k) },
+      onAccepted: (a) => {
+        setEditAdded((prev) => [...prev, a])
+        if (a.uploading) setEditUploading((n) => n + 1)
+      },
+      // ⭐ 按键回填（不是按文件名）：两张都叫 image.png 的截图必须各自定位
+      onUploaded: (key, _filename, contentId) => {
+        setEditAdded((prev) => prev.map((a) => (a.uploading && a.dedupKey === key ? { ...a, uploading: false, contentId } : a)))
+        setEditUploading((n) => Math.max(0, n - 1))
+      },
+      onFailed: (key, filename, reason) => {
+        setEditAdded((prev) => prev.filter((a) => a.dedupKey !== key))
+        setEditUploading((n) => Math.max(0, n - 1))
+        setEditError(`附件未能送达：${filename}（${reason}）`)
+      },
+      onRejected: (filename, reason) => {
+        setEditError(reason === 'no-session'
+          ? `需先打开一个会话再添加附件：${filename}`
+          : `不支持的文件类型：${filename}`)
+      },
+      encodeDataUrl: async (file, mediaType) => {
+        const bytes = new Uint8Array(await file.arrayBuffer())
+        return { dataUrl: `data:${mediaType};base64,${u8ToBase64(bytes)}`, bytes }
+      },
+      upload: (file, s) => uploadAttachment(file, s),
+    })
+  }
+  /**
+   * 编辑框粘贴 → 附件（Ctrl+V）。通道与判定**逐字照搬 Composer.onPaste**：
+   * ① `clipboardData.items`（浏览器复制位图）② `files`（资源管理器复制的图片文件，
+   * WebView2 的 items 常不含 file 项）③ `navigator.clipboard.read()` 异步兜底。
+   * 有图片即 `preventDefault`，避免二进制乱码落进正文。
+   */
+  const onEditPaste = async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const images: File[] = []
+    for (const item of e.clipboardData?.items ?? []) {
+      if (item.kind === 'file' && item.type.startsWith('image/')) {
+        const f = item.getAsFile()
+        if (f) images.push(f)
+      }
+    }
+    if (images.length === 0 && e.clipboardData?.files?.length) {
+      for (const f of e.clipboardData.files) {
+        if (f.type.startsWith('image/')) images.push(f)
+      }
+    }
+    if (images.length > 0) {
+      e.preventDefault()
+      addEditFiles(images)
+      return
+    }
+    try {
+      if (!navigator.clipboard?.read) return
+      const entries = await navigator.clipboard.read()
+      const files: File[] = []
+      for (const entry of entries) {
+        for (const type of entry.types) {
+          if (type.startsWith('image/')) {
+            const blob = await entry.getType(type)
+            files.push(new File([blob], `clipboard-${Date.now()}.png`, { type }))
+          }
+        }
+      }
+      if (files.length) {
+        e.preventDefault()
+        addEditFiles(files)
+      }
+    } catch {
+      // 无权限 / 剪贴板无图片 → 静默（正常文本粘贴不打扰）
+    }
+  }
   const submitEdit = async () => {
     const text = editDraft.trim()
     if (!text || editSending || !onEditResend) return
+    // 上传未完成 ⇒ 不发送（否则 base64/contentId 都还没就绪，模型收不到这张图）
+    if (editUploading > 0) {
+      setEditError('附件上传中，请稍候')
+      return
+    }
     setEditSending(true)
     setEditError(null)
     // [2026-11-01] 原消息的图片附件随重发一起带上（否则「编辑后重发」会把图静默丢掉 ——
@@ -1190,6 +1311,22 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     const attachments: AttachmentRequest[] = []
     for (const img of userImages) {
       attachments.push({ type: 'image', base64: img.base64, mediaType: img.mediaType })
+    }
+    // [2026-11-06] 编辑态**新加**的图片/附件（本次修复：此前编辑态无法补图）
+    for (const a of editAdded) {
+      let b64 = a.base64
+      if (b64) {
+        // dataURL → 纯 base64（后端 Base64.decode / 图像 block 都要求纯 base64）
+        const m = /^data:[^;]+;base64,(.+)$/.exec(b64)
+        if (m) b64 = m[1]
+      }
+      attachments.push({
+        type: a.type,
+        filename: a.filename,
+        mediaType: a.mediaType,
+        ...(b64 ? { base64: b64 } : {}),
+        ...(a.contentId ? { contentId: a.contentId } : {}),
+      })
     }
     for (const a of msg.userAttachments ?? []) {
       if (a.type === 'image' || !a.filename) continue
@@ -1445,6 +1582,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                 rows={1}
                 disabled={editSending}
                 onChange={(e) => setEditDraft(e.target.value)}
+                onPaste={onEditPaste}
                 onKeyDown={(e) => {
                   // Enter 发送 / Shift+Enter 换行 / Esc 取消（输入法组合中的 Enter 不算发送）
                   if (e.key === 'Enter' && !e.shiftKey && !e.nativeEvent.isComposing) {
@@ -1463,7 +1601,31 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                   <path d="M8 5.2v.01" strokeLinecap="round" />
                 </svg>
                 <span>编辑后将从此处重新开始对话，已有产物不会被删除</span>
+                {/* [2026-11-06 用户裁定] 补图只保留粘贴（Ctrl+V），不加「+ 图片」选择器入口。
+                    粘贴本身见 textarea 的 onPaste（三通道：items / files / clipboard.read 兜底）。 */}
               </div>
+              {/* [2026-11-06] 本次新加、将随重发上传的图片（可单张移除）；原消息自带的图在上方只读区 */}
+              {editAdded.length > 0 && (
+                <div className="user-edit-attach">
+                  {editAdded.map((a) => (
+                    <span key={a.dedupKey} className="user-edit-added">
+                      {a.base64
+                        ? <img src={a.base64} alt={a.filename} className="user-edit-thumb" title={a.filename} />
+                        : <span className="user-edit-thumb pending" title={`${a.filename}（上传中…）`} />}
+                      <button
+                        type="button"
+                        className="user-edit-added-x"
+                        title="移除这张图"
+                        onClick={() => {
+                          editAddedKeysRef.current.delete(a.dedupKey)
+                          setEditAdded((prev) => prev.filter((x) => x.dedupKey !== a.dedupKey))
+                          if (a.uploading) setEditUploading((n) => Math.max(0, n - 1))
+                        }}
+                      >×</button>
+                    </span>
+                  ))}
+                </div>
+              )}
               {editError && <div className="user-edit-error" role="alert">{editError}</div>}
               <div className="user-edit-actions">
                 <button type="button" className="ue-cancel" onClick={cancelEdit} disabled={editSending}>取消</button>
@@ -2713,12 +2875,29 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
    *  · 进行中轮次：不挂（内容未定稿，用量行等该轮结束再出现）。
    *  节点按 (文案/链接/计数) 缓存 → 消息增长时历史轮 footer 引用不变，不击穿行级 memo。 */
   const footerCacheRef = useRef(new Map<string, { key: string; node: ReactNode }>())
-  /** 产物指纹（id/大小/路径/标题）：内容变了才重建卡片节点，否则历史轮 footer 引用保持稳定 */
   const deliverables = artifacts?.deliverables ?? NO_ARTIFACTS
-  const artifactsSig = useMemo(
-    () => deliverables.map((d) => `${d.id}\u0001${d.sizeBytes ?? ''}\u0001${d.localPath ?? ''}\u0001${d.title}`).join('\u0000'),
-    [deliverables],
-  )
+  /**
+   * [产物按轮归属] 按 {@code sourceMessageId}（= 产出它的那一轮的用户消息 id）分桶。
+   *
+   * <p><b>WHY</b>（2026-11-05 用户裁定「轮次级别产物不是会话」）：产物是**某一轮**的交付物。
+   * 此前把整会话的产物都挂在「最后一条 assistant」下 ⇒ 上一轮做的报告看起来像这一轮刚产出的
+   * （用户实测截图：更早一轮的 记忆架构说明.html 出现在最新一轮末尾）。
+   * 现在每轮只显示**自己那一轮**的产物；右侧栏「查看所有产物 (N)」仍看会话总量。
+   *
+   * <p>归属未知（{@code sourceMessageId} 为 null 的历史行）⛔ 不猜：不挂到任何一轮，
+   * 只在右侧栏可见 —— 挂到「最后一条」正是本次要修掉的错误。
+   */
+  const deliverablesByTurn = useMemo(() => {
+    const byTurn = new Map<string, SessionArtifactDto[]>()
+    for (const d of deliverables) {
+      const owner = d.sourceMessageId
+      if (!owner) continue
+      const list = byTurn.get(owner)
+      if (list) list.push(d)
+      else byTurn.set(owner, [d])
+    }
+    return byTurn
+  }, [deliverables])
   const footerByRowKey = useMemo(() => {
     const lastAssistantRowByTurn = new Map<string, { key: string; msgId: string }>()
     for (const row of flatRows) {
@@ -2732,11 +2911,13 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (activeTurnKeys.has(turnKey)) continue
       const usageLabel = usageLabelByTurn.get(turnKey) ?? null
       const withLinks = row.msgId === lastAssistantId && turnEnded && onOpenRightTab != null
-      // [产物卡片] 只挂在「会话最后一条 assistant」的已结束轮上，位于 TurnFooter 之前
-      const withArtifacts = row.msgId === lastAssistantId && turnEnded && deliverables.length > 0
+      // [产物卡片] 只挂**本轮的**产物（按 sourceMessageId 归属），位于 TurnFooter 之前。
+      //   已结束的历史轮同样显示自己那轮 —— 不再把整会话产物堆到最后一条 assistant 下。
+      const turnDeliverables = deliverablesByTurn.get(turnKey) ?? NO_ARTIFACTS
+      const withArtifacts = turnDeliverables.length > 0
       if (!usageLabel && !withLinks && !withArtifacts) continue
       const cacheKey = `${usageLabel ?? ''}\u0000${withLinks ? 1 : 0}\u0000${artifactCount}\u0000${changeCount}`
-        + `\u0000${withArtifacts ? artifactsSig : ''}`
+        + `\u0000${withArtifacts ? artifactSigOf(turnDeliverables) : ''}`
       const cached = prevCache.get(row.key)
       const node = cached && cached.key === cacheKey
         ? cached.node
@@ -2744,7 +2925,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           <>
             {withArtifacts && (
               <TurnArtifacts
-                items={deliverables}
+                items={turnDeliverables}
                 onOpen={onOpenArtifact}
                 onEdit={onEditArtifact}
                 onOpenInBrowser={onOpenArtifactInBrowser}
@@ -2762,7 +2943,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     footerCacheRef.current = nextCache
     return result
   }, [flatRows, activeTurnKeys, usageLabelByTurn, lastAssistantId, turnEnded, artifactCount, changeCount,
-      onOpenRightTab, deliverables, artifactsSig, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser])
+      onOpenRightTab, deliverablesByTurn, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser])
   /** 用户手动展开/收起的历史轮次（缺省 = 已结束轮次收起、进行中轮次展开）。 */
   const [processOpenByTurn, setProcessOpenByTurn] = useState<Record<string, boolean>>({})
   const toggleTurnProcess = useCallback((key: string, open: boolean) => {
@@ -3871,11 +4052,17 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 <div className="exec-scan-line" aria-hidden="true" />
               </>
             )}
-            <div className="thinking-wrap open">
-              <div className="thinking-toggle">
-                <span>思考中…</span>
+            {/* [2026-11-04 用户裁定] 这句静态「思考中…」去掉：它不承载内容、也不会变化，
+                和上面的「正在执行 · 时长」+ 扫光条重复，用户原话「这个静态的 不应该有的」。
+                ⚠️ 仅在**占位承载状态行**时去掉（showPendingPlaceholder=true）；窗口里没有任何
+                user 行那种边缘态（thinking-only 分支）仍保留它 —— 那时它是唯一的运行线索。 */}
+            {!showPendingPlaceholder && (
+              <div className="thinking-wrap open">
+                <div className="thinking-toggle">
+                  <span>思考中…</span>
+                </div>
               </div>
-            </div>
+            )}
           </div>
         </div>
       )}

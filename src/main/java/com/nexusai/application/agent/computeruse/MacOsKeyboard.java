@@ -60,6 +60,19 @@ public final class MacOsKeyboard implements ComputerUseKeyboard {
     private final Set<MacOsVirtualKeys.Modifier> held =
             EnumSet.noneOf(MacOsVirtualKeys.Modifier.class);
 
+    /**
+     * 键盘输入的目标进程（{@code <= 0} = 不定向，走全局 HID）。
+     *
+     * <h2>WHY 需要它（对齐 dsh {@code main.swift:777}）</h2>
+     * <p>dsh 的每次按键都是 {@code down.postToPid(app.processIdentifier)} —— 只送给目标 app。
+     * 本仓此前恒走 {@code CGEventPost(kCGHIDEventTap)}（全局注入）⇒
+     * <b>在后台应用里输入必然先把焦点抢过来</b>，对用户的当前工作是破坏性的。
+     *
+     * <p>调用方（{@link ComputerUseTypeTool} / {@link ComputerUseKeyTool}）在
+     * 「已知目标应用」时调 {@link #setTargetPid(long)}；未知时保持 0，行为与本轮之前一致。
+     */
+    private volatile long targetPid;
+
     /** 生产构造器（真起进程）。 */
     public MacOsKeyboard() {
         this(ComputerUseProcessRunner.REAL, new MacOsTccChecker());
@@ -75,6 +88,23 @@ public final class MacOsKeyboard implements ComputerUseKeyboard {
         }
         this.runner = runner;
         this.tcc = tcc;
+    }
+
+    /**
+     * 设置键盘输入的目标进程（0 = 不定向，走全局 HID）。
+     *
+     * @param pid 目标进程 pid
+     */
+    public void setTargetPid(long pid) {
+        this.targetPid = Math.max(0L, pid);
+        if (log.isDebugEnabled()) {
+            log.debug("[computer-use] macOS 键盘目标进程 = {}", pid <= 0 ? "全局 HID（不定向）" : pid);
+        }
+    }
+
+    /** @return 当前键盘目标进程（0 = 不定向） */
+    public long targetPid() {
+        return targetPid;
     }
 
     @Override
@@ -115,6 +145,17 @@ public final class MacOsKeyboard implements ComputerUseKeyboard {
             return;
         }
         tcc.requireAccessibility();
+        // ⭐ 路径 A（首选）：定向 Unicode 直投 —— 不碰用户剪贴板、不受「目标屏蔽粘贴」限制。
+        //   真机已验证（向后台 TextEdit 投中文，AX 回读一致、前台不变）。
+        //   仅当已知目标进程时可用；失败/不可用 ⇒ 落回路径 B（剪贴板），功能不丢。
+        long pid = targetPid;
+        if (pid > 0 && MacOsSkyLight.postUnicodeText(pid, text)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[computer-use] macOS 已定向直投 {} 字符到 pid={}（未使用剪贴板）",
+                        text.length(), pid);
+            }
+            return;
+        }
         // 修饰键按住时 ⌘V 会变成别的组合键 ⇒ 先临时释放（对齐「物理按住 ctrl 再打字」的语义例外）
         Set<MacOsVirtualKeys.Modifier> resumeHeld = holdDownModifiersForPaste();
         String raw;
@@ -126,6 +167,14 @@ public final class MacOsKeyboard implements ComputerUseKeyboard {
             }
         }
         // 脚本输出单行 JSON：{"restored":bool,"pasted":bool,"snapshotItems":n}
+        // ⛔ 必须把「脚本没输出」与「脚本输出说粘贴失败」分开：
+        //   前者是 osascript 自身没跑起来（进程被杀 / 桥接异常 / 超时），
+        //   后者才是「目标控件不接受 ⌘V」。两者混成一句会让模型误判并去换控件。
+        if (raw == null || raw.isBlank()) {
+            throw new IllegalStateException(
+                    "[computer-use] macOS 粘贴脚本没有任何输出（osascript 未正常返回，"
+                            + "不是目标控件拒绝粘贴；请检查辅助功能权限或重试）");
+        }
         boolean restored = raw.contains("\"restored\":true");
         boolean pasted = raw.contains("\"pasted\":true");
         if (!pasted) {
@@ -182,10 +231,14 @@ public final class MacOsKeyboard implements ComputerUseKeyboard {
             }
         }
         String flags = flagsExpression();
-        MacOsExec.jxaVoid(runner, MacOsJxa.keyEvent(keyCode, event.down(), flags));
+        long pid = targetPid;
+        // ⭐ 定向投递（对齐 dsh main.swift:777 `down.postToPid(app.processIdentifier)`）：
+        //   pid > 0 ⇒ 按键只送目标进程，不抢用户当前前台；pid == 0 ⇒ 回落全局 HID（旧行为）
+        MacOsExec.jxaVoid(runner, MacOsJxa.keyEvent(keyCode, event.down(), flags, pid, 0L));
         if (log.isDebugEnabled()) {
-            log.debug("[computer-use] macOS 按键事件已注入: {} · keyCode={} · down={} · flags={}",
-                    name, keyCode, event.down(), flags);
+            log.debug("[computer-use] macOS 按键事件已注入: {} · keyCode={} · down={} · flags={} · 目标={}",
+                    name, keyCode, event.down(), flags,
+                    pid > 0 ? ("pid=" + pid) : "全局 HID");
         }
     }
 

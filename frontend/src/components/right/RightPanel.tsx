@@ -1,4 +1,5 @@
 import { memo, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
 import type { SettingsTab, Project, SessionFile, RightTab } from '@/types'
@@ -266,10 +267,15 @@ const runResultLabel = (r: WorkflowRunDto) => {
   return WORKFLOW_STATUS_META[r.status].label
 }
 
-/** 文件树右键菜单状态（fixed 定位，左键文件打开、右键菜单） */
-type FileMenuState = { x: number; y: number; node: FileNode }
+/** 文件树右键菜单状态（fixed 定位，左键文件打开、右键菜单）
+ *
+ * <p>`node` 为 null = 在**空白区域**右键（不是某个文件/目录行）⇒ 菜单只保留
+ * 「新建文件…／新建文件夹…／刷新」三项（其余项都要求一个具体目标，空白处语义不成立）；
+ * 新建落在**项目根**。 */
+type FileMenuState = { x: number; y: number; node: FileNode | null }
 type FileOpDialogState =
-  | { kind: 'newFile' | 'newDir'; node: FileNode; title: string }
+  // node=null = 空白区域右键「新建…」⇒ 建在**项目根**
+  | { kind: 'newFile' | 'newDir'; node: FileNode | null; title: string }
   | { kind: 'rename'; node: FileNode; title: string }
 
 /** 文件树单节点 · IDE 风格：目录可展开/折叠，文件点击查看 */
@@ -376,12 +382,20 @@ function ProjectFileTree({
   )
 }
 
-/** 文件树右键菜单（复用 project-context-menu 样式） */
+/** 文件树右键菜单（复用 project-context-menu 样式）
+ *
+ * <p>用 {@code createPortal} 挂到 body：抽屉祖先 `.right.right-drawer` 带 `backdrop-filter`，
+ * 它会成为后代 `position: fixed` 的**包含块** ⇒ 菜单按 clientX/clientY 定位会再多叠加一次
+ * 抽屉左边界（实测 left:1569 被渲染到 x=3106，跑出视口看不见）。挂到 body 后 fixed 才真正
+ * 以视口为基准。 */
 function FileTreeContextMenu({ menu, onAction }: {
   menu: FileMenuState
   onAction: (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'refresh' | 'rename' | 'delete') => void
 }) {
-  return (
+  // 空白区域右键（node === null）：只留「新建文件…／新建文件夹…／刷新」——
+  // 其余项（资源管理器/添加到对话/复制路径/重命名/删除）都要求一个具体目标，空白处无目标可言。
+  const onBlank = menu.node === null
+  return createPortal(
     <div
       className="project-context-menu file-tree-menu"
       style={{ left: menu.x, top: menu.y }}
@@ -390,15 +404,25 @@ function FileTreeContextMenu({ menu, onAction }: {
     >
       <div className="ctx-menu-item" onClick={() => onAction('newFile')}>新建文件…</div>
       <div className="ctx-menu-item" onClick={() => onAction('newDir')}>新建文件夹…</div>
-      <div className="ctx-menu-item" onClick={() => onAction('reveal')}>在文件资源管理器中显示</div>
-      <div className="ctx-menu-divider"></div>
-      <div className="ctx-menu-item" onClick={() => onAction('quote')}>添加到对话</div>
-      <div className="ctx-menu-divider"></div>
-      <div className="ctx-menu-item" onClick={() => onAction('copy')}>复制路径</div>
-      <div className="ctx-menu-item" onClick={() => onAction('refresh')}>刷新</div>
-      <div className="ctx-menu-item" onClick={() => onAction('rename')}>重命名</div>
-      <div className="ctx-menu-item danger" onClick={() => onAction('delete')}>删除</div>
-    </div>
+      {onBlank ? (
+        <>
+          <div className="ctx-menu-divider"></div>
+          <div className="ctx-menu-item" onClick={() => onAction('refresh')}>刷新</div>
+        </>
+      ) : (
+        <>
+          <div className="ctx-menu-item" onClick={() => onAction('reveal')}>在文件资源管理器中显示</div>
+          <div className="ctx-menu-divider"></div>
+          <div className="ctx-menu-item" onClick={() => onAction('quote')}>添加到对话</div>
+          <div className="ctx-menu-divider"></div>
+          <div className="ctx-menu-item" onClick={() => onAction('copy')}>复制路径</div>
+          <div className="ctx-menu-item" onClick={() => onAction('refresh')}>刷新</div>
+          <div className="ctx-menu-item" onClick={() => onAction('rename')}>重命名</div>
+          <div className="ctx-menu-item danger" onClick={() => onAction('delete')}>删除</div>
+        </>
+      )}
+    </div>,
+    document.body,
   )
 }
 
@@ -412,12 +436,15 @@ function FileOpDialog({ state, onCancel, onConfirm }: {
   useEffect(() => {
     setValue(state.kind === 'rename' ? state.node.name : '')
   }, [state])
+  // 新建基准目录：目录节点 → 该目录；文件节点 → 其父目录；null（空白区域）→ 项目根
+  const baseDirOf = (n: FileNode | null) =>
+    !n ? '项目根' : (n.type === 'dir' ? n.path : (n.path.split('/').slice(0, -1).join('/') || '项目根'))
   return (
     <div className="overlay-backdrop" onClick={onCancel}>
       <div className="file-op-dialog" onClick={(e) => e.stopPropagation()}>
         <div className="file-op-title">{state.title}</div>
         <div className="file-op-hint">
-          {state.kind === 'rename' ? `重命名 ${state.node.path}` : `位置：${state.node.type === 'dir' ? state.node.path : (state.node.path.split('/').slice(0, -1).join('/') || '项目根')}/`}
+          {state.kind === 'rename' ? `重命名 ${state.node.path}` : `位置：${baseDirOf(state.node)}/`}
         </div>
         <input
           className="settings-input"
@@ -842,9 +869,11 @@ export const RightPanel = memo(function RightPanel({
     }
   }
 
-  const openFileMenu = (e: ReactMouseEvent, node: FileNode) => {
+  /** 右键文件/目录行（node 非空）或在**空白区域**右键（node = null，菜单只剩新建/刷新） */
+  const openFileMenu = (e: ReactMouseEvent, node: FileNode | null) => {
+    // 菜单宽度按内容浮动（空白态只有 3 项）⇒ 高度取各行上限，防止贴底时溢出视口
     const MENU_W = 214
-    const MENU_H = 236
+    const MENU_H = node ? 236 : 120
     setFileMenu({
       x: Math.max(0, Math.min(e.clientX, window.innerWidth - MENU_W)),
       y: Math.max(0, Math.min(e.clientY, window.innerHeight - MENU_H)),
@@ -853,18 +882,18 @@ export const RightPanel = memo(function RightPanel({
   }
 
   const onFileMenuAction = (action: 'newFile' | 'newDir' | 'reveal' | 'quote' | 'copy' | 'refresh' | 'rename' | 'delete') => {
-    const node = fileMenu?.node
-    if (!node) return
+    const node = fileMenu?.node ?? null
     setFileMenu(null)
+    // 空白区域右键只有这三项可达（菜单本身不渲染其余项）；新建落在项目根
     switch (action) {
       case 'newFile': setOpDialog({ kind: 'newFile', node, title: '新建文件' }); break
       case 'newDir': setOpDialog({ kind: 'newDir', node, title: '新建文件夹' }); break
-      case 'reveal': void revealEntry(node); break
-      case 'quote': onQuoteFile(node.path); showToast('已添加到对话', 'success'); break
-      case 'copy': void copyEntryPath(node); break
       case 'refresh': refreshFileTree(); break
-      case 'rename': setOpDialog({ kind: 'rename', node, title: '重命名' }); break
-      case 'delete': void deleteEntry(node); break
+      case 'reveal': if (node) void revealEntry(node); break
+      case 'quote': if (node) { onQuoteFile(node.path); showToast('已添加到对话', 'success') } break
+      case 'copy': if (node) void copyEntryPath(node); break
+      case 'rename': if (node) setOpDialog({ kind: 'rename', node, title: '重命名' }); break
+      case 'delete': if (node) void deleteEntry(node); break
     }
   }
 
@@ -885,7 +914,9 @@ export const RightPanel = memo(function RightPanel({
         await projectApi.renameEntry(main.id, dlg.node.path, name)
         showToast('已重命名', 'success')
       } else {
-        const base = dlg.node.type === 'dir' ? dlg.node.path : dlg.node.path.split('/').slice(0, -1).join('/')
+        // node=null（空白区域右键「新建…」）⇒ 建在**项目根**（base=''）
+        const n = dlg.node
+        const base = !n ? '' : (n.type === 'dir' ? n.path : n.path.split('/').slice(0, -1).join('/'))
         await projectApi.createEntry(main.id, base ? `${base}/${name}` : name, dlg.kind === 'newDir' ? 'dir' : 'file')
         showToast(dlg.kind === 'newDir' ? '已新建文件夹' : '已新建文件', 'success')
       }
@@ -1018,7 +1049,18 @@ export const RightPanel = memo(function RightPanel({
 
   /** 「项目」= 现有项目卡 + 项目文件树（右键菜单 / 新建重命名弹窗复用同一份状态） */
   const projectsSection = (
-    <>
+    // 整个项目 tab 都可右键：空白区域（非文件/目录行）右键 = openFileMenu(e, null)
+    //   ⇒ 菜单只出「新建文件…／新建文件夹…／刷新」，新建落在项目根。
+    //   文件树行自己 onContextMenu stopPropagation ⇒ 行上右键仍是完整菜单。
+    //   style minHeight:'100%' 让下方空白也算「项目 tab 区域」（否则只有内容高度可点）。
+    <div
+      className="right-projects-surface"
+      style={{ minHeight: '100%' }}
+      onContextMenu={(e) => {
+        e.preventDefault()
+        openFileMenu(e, null)
+      }}
+    >
       {main.id ? (
         <>
           {/* 单项目模式（设计稿 v3）：项目卡 + 文件树，无主次/无切换/无绑定新项目 */}
@@ -1080,7 +1122,7 @@ export const RightPanel = memo(function RightPanel({
       ) : (
         <div className="right-empty">未绑定项目 · 在输入框上方选择项目开始对话</div>
       )}
-    </>
+    </div>
   )
 
   /** 「团队」= 现有 TeamPanel（抽屉里是独立 tab，图标轨里是折叠分组） */

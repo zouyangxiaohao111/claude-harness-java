@@ -517,10 +517,13 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
 
   // ---- 使用专家（本地走 PATCH · 建科市场走 installMarketPlugin）----
   const handleUse = (card: ExpertCard) => {
-    if (busy) {
-      showToast('对话进行中，请等当前轮完成后切换专家', 'info')
-      return
-    }
+    // ⭐ 本地专家**不受 busy 互斥**（用户 2026-11-06：「应该和技能一样 没点发送都是可以点击的」）。
+    //   理由：使用专家只 PATCH sessions.main_thread_agent（纯写会话字段，不发消息、不开轮），
+    //   而后端在**每轮开头**读一次该列（LlmAgentLoop.collectRunMaterial 的 SP-03 段）⇒
+    //   切换对**正在跑的那一轮无影响**（它已固化定义），从下一轮起生效。
+    //   ⛔ 不要在这里加 busy 门 —— 与「召唤技能」同一条裁定：设定 ≠ 发送。
+    //   ⚠️ 市场专家的「使用」实际是**安装插件**（写磁盘 + reconcile），那是安装语义，
+    //   仍由 installMarketPlugin 自己的 busy 门拦截（见其函数首行），不在本处拦。
     if (card.inUse) return
     // v4：按卡片种类分流（两个源同时在场，不能再用「当前来源」判断）
     if (card.kind === 'remote') {
@@ -705,10 +708,10 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                             )
                           ) : (
                             <button
-                              className={`sm-use-btn${c.inUse ? ' used' : ''}${busy && !c.inUse ? ' disabled' : ''}`}
+                              className={`sm-use-btn${c.inUse ? ' used' : ''}`}
                               disabled={c.inUse}
                               onClick={() => handleUse(c)}
-                              title={busy && !c.inUse ? '对话进行中不可切换（仅新会话可切换）' : (c.inUse ? '当前会话正在使用' : `使用 ${c.name} 驱动会话`)}
+                              title={c.inUse ? '当前会话正在使用' : `使用 ${c.name} 驱动会话`}
                             >
                               {c.inUse ? '使用中' : '使用'}
                             </button>

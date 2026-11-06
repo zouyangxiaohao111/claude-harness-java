@@ -869,4 +869,37 @@ class SessionServiceTest {
         when(sessionMapper.selectOneById("sess-2")).thenReturn(dirty);
         assertThat(service.getById("sess-2").model()).as("脏 tag → null（warn 不抛）").isNull();
     }
+
+    @Test
+    @DisplayName("[goal-clear] 清目标必须 update(entity,false) 显式写 NULL —— 否则 ignoreNulls 跳过 goal 列，旧目标残留")
+    void setGoal_nullMustWriteExplicitNull() {
+        // WHY（规则九 · 2026-11-04 真机缺陷）：mybatis-flex update(entity) 默认 ignoreNulls=true
+        //   ⇒ 被置 null 的 goal 列在 SET 里被跳过，**DB 旧目标原样残留**，只有 updated_at 变了。
+        //   用户看到「点 × 后目标头消失，下次 GET /goal 又回来」。
+        //   真机取证：日志 `setGoal: phase=none` 且 updated_at 已更新，但 sessions.goal 仍是旧 JSON。
+        //   本用例锁死「清空走 update(entity,false)」这条重载选择 —— 改回单参 update 即回红。
+        final String id = "sess-goal-clear";
+        SessionRecord rec = new SessionRecord();
+        rec.setId(id);
+        when(sessionMapper.selectOneById(id)).thenReturn(rec);
+
+        service.setGoal(id, null);
+
+        verify(sessionMapper).update(any(SessionRecord.class), org.mockito.ArgumentMatchers.eq(false));
+    }
+
+    @Test
+    @DisplayName("[goal-clear] 写目标仍走原 update(entity)（非 null 路径行为不变）")
+    void setGoal_nonNullKeepsDefaultUpdate() {
+        // 非 null 时列有值，ignoreNulls 不会跳过 goal ⇒ 走单参 update 即可；
+        // 锁住「不要为了修清除而把所有写路径都改成 false」（false 会把完整实体的 null 列全写 NULL）。
+        final String id = "sess-goal-set";
+        SessionRecord rec = new SessionRecord();
+        rec.setId(id);
+        when(sessionMapper.selectOneById(id)).thenReturn(rec);
+
+        service.setGoal(id, new SessionGoal("e2e 全绿", SessionGoal.Phase.ACTIVE, 0, 1000L, 0L, null));
+
+        verify(sessionMapper).update(any(SessionRecord.class));
+    }
 }

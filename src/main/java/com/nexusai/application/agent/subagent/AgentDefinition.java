@@ -18,9 +18,10 @@ import java.util.function.BiFunction;
  *   └── PluginAgentDefinition
  * </pre>
  */
-public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefinition, 
-                                                       AgentDefinition.CustomAgentDefinition, 
-                                                       AgentDefinition.PluginAgentDefinition {
+public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefinition,
+                                                       AgentDefinition.CustomAgentDefinition,
+                                                       AgentDefinition.PluginAgentDefinition,
+                                                       AgentDefinition.ExternalAgentDefinition {
     
     String agentType();
     String whenToUse();
@@ -45,6 +46,20 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
     /** CC original: pendingSnapshotUpdate（loadAgentsDir.ts:128）· 新快照待同步时间戳（前端 dialog 消费，Java 仅存数据字段）。 */
     Optional<String> pendingSnapshotUpdate();
     Optional<Boolean> omitClaudeMd();
+
+    /**
+     * 主线程模型覆盖（{@code provider/name}）· **本仓扩展，CC 无此字段**。
+     *
+     * <p>WHY：CC 的 {@code model:} 只用于子代理（{@code resumeAgent.ts:151} 的注释明写
+     * 「Resolve model for analytics metadata」，主循环模型由 {@code --model} / {@code /model} 决定）。
+     * 本仓用户 2026-11-05 裁定「主线程应该也可以支持，拿不到再回默认」⇒ 新增本字段，
+     * 只从 MD frontmatter 的 {@code main-model} 读，⛔ 不从任何 CC 字段推导。
+     *
+     * <p>缺省 {@code Optional.empty()} = 不覆盖（走会话当前模型）。
+     *
+     * @return 主线程模型名（{@code provider/name}）
+     */
+    default Optional<String> mainModel() { return Optional.empty(); }
     
     /**
      * 获取系统提示 · 对齐 CC getSystemPrompt()
@@ -263,6 +278,8 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
         Optional<String> isolation,
         Optional<String> pendingSnapshotUpdate,
         Optional<Boolean> omitClaudeMd,
+        /** 主线程模型覆盖（本仓扩展；MD frontmatter {@code main-model}）· empty = 不覆盖 */
+        Optional<String> mainModel,
         /** 自定义 Agent 来源 · 对齐 CC source */
         String customSource,  // 'userSettings' | 'projectSettings' | 'policySettings' | 'flagSettings'
         /** 系统提示内容（静态）· 对齐 CC getSystemPrompt */
@@ -345,6 +362,7 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
             private Optional<String> isolation = Optional.empty();
             private Optional<String> pendingSnapshotUpdate = Optional.empty();
             private Optional<Boolean> omitClaudeMd = Optional.empty();
+            private Optional<String> mainModel = Optional.empty();
 
             private Builder(String agentType, String whenToUse, String customSource,
                              String systemPromptContent) {
@@ -394,6 +412,8 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
             public Builder pendingSnapshotUpdate(String v) { this.pendingSnapshotUpdate = Optional.ofNullable(v); return this; }
             /** CC 不解析 (仅内置 agent 有); 暴露供扩展, loadAgentFile 不设置. */
             public Builder omitClaudeMd(Boolean v) { this.omitClaudeMd = Optional.ofNullable(v); return this; }
+            /** 主线程模型覆盖（本仓扩展）· MD frontmatter {@code main-model}；null → empty. */
+            public Builder mainModel(String v) { this.mainModel = Optional.ofNullable(v); return this; }
 
             public CustomAgentDefinition build() {
                 return new CustomAgentDefinition(
@@ -402,6 +422,7 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
                     permissionMode, maxTurns, filename, baseDir,
                     criticalSystemReminder, requiredMcpServers, background,
                     initialPrompt, memory, isolation, pendingSnapshotUpdate, omitClaudeMd,
+                    mainModel,
                     customSource, systemPromptContent
                 );
             }
@@ -542,20 +563,215 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
     }
 
     /**
+     * 外部 CLI 运行时型 Agent 定义 · 本仓扩展（无 CC 对应物）。
+     *
+     * <p><b>WHY 需要第 4 种 permit</b>：{@code Agent} 工具的 agent 清单来自
+     * {@code AgentDefinitionRegistry.listAgents()}，但注册中心经
+     * {@link loadAgentsDir#getActiveAgentsFromList} 做**六组 source 白名单**折叠
+     * （loadAgentsDir.ts:193-221 同构）——没落在这 6 个 source 值里的定义会被**静默丢弃**，
+     * 工具描述里看不到、模型永远选不到。故本类型的 {@code source()} <b>必须复用六组之一</b>
+     * （由 md 所在配置根决定 userSettings / projectSettings / policySettings / flagSettings），
+     * ⛔ 不得新增 source 字面量。
+     *
+     * <p><b>能力位语义（不假装）</b>：外部进程不认本仓的工具白名单 / hooks / MCP / resume，
+     * 故 {@link Capabilities} 四个布尔显式声明后端能提供什么，消费侧按位降级。
+     * {@code tools()/disallowedTools()/hooks()/mcpServers()/skills()/isolation()} 一律
+     * 返回 {@code Optional.empty()} = 「本后端不支持」，⛔ 不用空列表冒充「支持但为空」。
+     *
+     * @param agentType          唯一类型名（md frontmatter {@code name}）
+     * @param whenToUse          给模型看的选择依据（md frontmatter {@code description}）
+     * @param externalSource     六组 source 之一（userSettings / projectSettings / ...）
+     * @param systemPromptContent md 正文（作为任务前缀/角色说明）
+     * @param runtime            外部运行时 id（claude / codex / opencode / pi / acp / 任意 recipe id）
+     * @param bin                可执行文件名（null → 取 runtime 注册表默认）
+     * @param fallbackBins       备用可执行文件名（探测顺序）
+     * @param versionArgs        探测 argv（默认 {@code --version}）
+     * @param args               argv 模板，支持 {@code {prompt}} / {model} / {cwd} 占位
+     * @param promptVia          {@code argv}（任务作为最后一个参数）或 {@code stdin}
+     * @param streamFormat       输出协议（claude-stream-json / jsonl / plain）
+     * @param timeoutMs          硬超时（毫秒，到点杀进程树）
+     * @param capabilities       能力位
+     */
+    record ExternalAgentDefinition(
+        String agentType,
+        String whenToUse,
+        String externalSource,
+        String systemPromptContent,
+        String runtime,
+        Optional<String> bin,
+        List<String> fallbackBins,
+        List<String> versionArgs,
+        List<String> args,
+        String promptVia,
+        String streamFormat,
+        long timeoutMs,
+        Capabilities capabilities,
+        Optional<String> model,
+        Optional<String> permissionMode,
+        Optional<Integer> maxTurns,
+        Optional<Boolean> background,
+        Optional<String> effort,
+        Optional<String> color,
+        Optional<String> filename,
+        Optional<String> baseDir,
+        /**
+         * 追加在内置 argv **之前**的前缀参数（高级用法）。
+         *
+         * <p>为什么是前缀而不是追加在末尾：各 CLI 的约定不同，插在末尾常会破坏
+         * 「最后一个位置参数是任务」的形态（如 {@code claude -p "<task>"}）。
+         */
+        List<String> argsPrefix
+    ) implements AgentDefinition {
+
+        /**
+         * 外部后端能力位 · 消费侧必须按位降级，⛔ 不得假定全部为 true。
+         *
+         * @param streaming    能否解析中间事件（thinking / tool-call / text-delta）
+         * @param resume       是否支持续跑同一会话
+         * @param outputSchema 是否支持结构化输出校验
+         * @param depthLimit   允许的最大递归深度（0 = 禁止它再派子代理）
+         */
+        public record Capabilities(boolean streaming, boolean resume, boolean outputSchema, int depthLimit) {
+            /** 保守默认：只认最终文本，不续跑、不校验、禁止递归。 */
+            public static final Capabilities MINIMAL = new Capabilities(false, false, false, 0);
+        }
+
+        @Override
+        public String source() { return externalSource; }
+
+        @Override
+        public String getSystemPrompt(String modelId, List<String> additionalWorkingDirectories) {
+            return systemPromptContent != null ? systemPromptContent : "";
+        }
+
+        // ── 本后端**不支持**的 CC 字段：恒 empty（= 不支持，不是「空值」）──
+        @Override public Optional<List<String>> tools() { return Optional.empty(); }
+        @Override public Optional<List<String>> disallowedTools() { return Optional.empty(); }
+        @Override public Optional<List<String>> skills() { return Optional.empty(); }
+        @Override public Optional<List<Map<String, Object>>> mcpServers() { return Optional.empty(); }
+        @Override public Optional<Map<String, Object>> hooks() { return Optional.empty(); }
+        @Override public Optional<String> criticalSystemReminder_EXPERIMENTAL() { return Optional.empty(); }
+        @Override public Optional<List<String>> requiredMcpServers() { return Optional.empty(); }
+        @Override public Optional<String> initialPrompt() { return Optional.empty(); }
+        @Override public Optional<String> memory() { return Optional.empty(); }
+        @Override public Optional<String> isolation() { return Optional.empty(); }
+        @Override public Optional<String> pendingSnapshotUpdate() { return Optional.empty(); }
+        @Override public Optional<Boolean> omitClaudeMd() { return Optional.empty(); }
+
+        public static Builder builder(String agentType, String whenToUse,
+                                      String externalSource, String systemPromptContent) {
+            return new Builder(agentType, whenToUse, externalSource, systemPromptContent);
+        }
+
+        public static final class Builder {
+            private final String agentType;
+            private final String whenToUse;
+            private final String externalSource;
+            private final String systemPromptContent;
+            private String runtime;
+            private Optional<String> bin = Optional.empty();
+            private List<String> fallbackBins = List.of();
+            private List<String> versionArgs = List.of("--version");
+            private List<String> args = List.of();
+            private String promptVia = "argv";
+            /**
+             * 空串 = 用户未指定 ⇒ 由 {@code baseRuntime} 预设提供（再没有则回落 plain）。
+             *
+             * <p>⛔ 默认值不能写 {@code "plain"}：那会让「继承预设的 streamFormat」永远不生效
+             * —— 用户写了 {@code baseRuntime: claude} 却按 plain 解析，静默拿不到结构化事件。
+             * （2026-11-04 由 {@code ExternalRuntimeInheritanceTest} 抓到。）
+             */
+            private String streamFormat = "";
+            private long timeoutMs = 600_000L;
+            private Capabilities capabilities = Capabilities.MINIMAL;
+            private Optional<String> model = Optional.empty();
+            private Optional<String> permissionMode = Optional.empty();
+            private Optional<Integer> maxTurns = Optional.empty();
+            private Optional<Boolean> background = Optional.empty();
+            private Optional<String> effort = Optional.empty();
+            private Optional<String> color = Optional.empty();
+            private Optional<String> filename = Optional.empty();
+            private Optional<String> baseDir = Optional.empty();
+            private List<String> argsPrefix = List.of();
+
+            private Builder(String agentType, String whenToUse,
+                            String externalSource, String systemPromptContent) {
+                this.agentType = agentType;
+                this.whenToUse = whenToUse;
+                this.externalSource = externalSource;
+                this.systemPromptContent = systemPromptContent;
+            }
+
+            /** 外部运行时 id（必填；缺失时 build() 抛 IllegalArgumentException）。 */
+            public Builder runtime(String v) { this.runtime = v; return this; }
+            public Builder bin(String v) { this.bin = Optional.ofNullable(v); return this; }
+            public Builder fallbackBins(List<String> v) { this.fallbackBins = v == null ? List.of() : List.copyOf(v); return this; }
+            public Builder versionArgs(List<String> v) { this.versionArgs = v == null ? List.of() : List.copyOf(v); return this; }
+            public Builder args(List<String> v) { this.args = v == null ? List.of() : List.copyOf(v); return this; }
+            public Builder promptVia(String v) { if (v != null && !v.isBlank()) this.promptVia = v; return this; }
+            public Builder streamFormat(String v) { if (v != null && !v.isBlank()) this.streamFormat = v; return this; }
+            public Builder timeoutMs(long v) { if (v > 0) this.timeoutMs = v; return this; }
+            public Builder capabilities(Capabilities v) { if (v != null) this.capabilities = v; return this; }
+            public Builder model(String v) { this.model = Optional.ofNullable(v); return this; }
+            public Builder permissionMode(String v) { this.permissionMode = Optional.ofNullable(v); return this; }
+            public Builder maxTurns(Integer v) { this.maxTurns = Optional.ofNullable(v); return this; }
+            public Builder background(Boolean v) { this.background = Optional.ofNullable(v); return this; }
+            public Builder effort(String v) { this.effort = Optional.ofNullable(v); return this; }
+            public Builder color(String v) { this.color = Optional.ofNullable(v); return this; }
+            public Builder filename(String v) { this.filename = Optional.ofNullable(v); return this; }
+            public Builder baseDir(String v) { this.baseDir = Optional.ofNullable(v); return this; }
+
+            /** 追加在内置 argv 之前的前缀参数。 */
+            public Builder argsPrefix(List<String> v) { this.argsPrefix = v == null ? List.of() : List.copyOf(v); return this; }
+
+            public ExternalAgentDefinition build() {
+                if (runtime == null || runtime.isBlank()) {
+                    throw new IllegalArgumentException(
+                        "外部运行时 agent '" + agentType + "' 缺 sub-runtime 字段（frontmatter 写 sub-runtime: claude|codex|opencode|pi，表示子代理用哪个外部 CLI）");
+                }
+                // argv 校验（用户 2026-11-04 简化口径：只选名字即可）
+                //   - args 为空 ⇒ 合法：运行时由本机扫描到的预设提供完整 argv
+                //   - args 非空 ⇒ 必须含 {prompt}，否则任务传不进 CLI
+                if ("argv".equals(promptVia) && !args.isEmpty()) {
+                    boolean hasPromptPlaceholder = args.stream()
+                            .anyMatch(a -> a != null && a.contains("{prompt}"));
+                    if (!hasPromptPlaceholder) {
+                        throw new IllegalArgumentException(
+                            "外部运行时 agent '" + agentType + "' 的 args 缺少 {prompt} 占位（promptVia=argv 时任务无处传递）。"
+                                + "若只想用内置预设，请删掉 args 只留 sub-runtime");
+                    }
+                }
+                return new ExternalAgentDefinition(
+                    agentType, whenToUse, externalSource, systemPromptContent,
+                    runtime, bin, fallbackBins, versionArgs, args,
+                    promptVia, streamFormat, timeoutMs, capabilities,
+                    model, permissionMode, maxTurns, background, effort, color, filename, baseDir,
+                    argsPrefix
+                );
+            }
+        }
+    }
+
+    /**
      * 类型守卫 · 对齐 CC isBuiltInAgent/isCustomAgent/isPluginAgent
      */
     static boolean isBuiltIn(AgentDefinition agent) {
         return agent instanceof BuiltInAgentDefinition;
     }
-    
+
     static boolean isCustom(AgentDefinition agent) {
         return agent instanceof CustomAgentDefinition;
     }
-    
+
     static boolean isPlugin(AgentDefinition agent) {
         return agent instanceof PluginAgentDefinition;
     }
-    
+
+    /** 是否外部 CLI 运行时型（本仓扩展，非 CC 概念）。 */
+    static boolean isExternal(AgentDefinition agent) {
+        return agent instanceof ExternalAgentDefinition;
+    }
+
     /**
      * 检查是否使用所有工具 · 对齐 CC hasWildcard 精确判定
      * <p>CC original: agentToolUtils.ts:163-165 {@code hasWildcard =

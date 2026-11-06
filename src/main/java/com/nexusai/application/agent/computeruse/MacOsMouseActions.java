@@ -32,6 +32,15 @@ public final class MacOsMouseActions implements ComputerUseMouseActions {
     private final MacOsDisplays displays;
     private final MacOsTccChecker tcc;
 
+    /** 定向滚动/拖拽的目标进程（{@code <=0} = 全局 HID）。 */
+    private volatile long targetPid;
+    /** 目标窗口号（{@code CGWindowList} 的 kCGWindowNumber）。 */
+    private volatile long targetWindowNumber;
+    private volatile double targetWindowX;
+    private volatile double targetWindowY;
+    /** 作用点（屏幕坐标）；null = 未设定向。 */
+    private volatile double[] targetPoint;
+
     /** 生产构造器（真起进程）。 */
     public MacOsMouseActions() {
         this(ComputerUseProcessRunner.REAL, new MacOsDisplays(), new MacOsTccChecker());
@@ -89,6 +98,35 @@ public final class MacOsMouseActions implements ComputerUseMouseActions {
     @Override
     public void scroll(int dx, int dy) throws Exception {
         tcc.requireAccessibility();
+        // ⭐ 路径 A（首选）：定向投递 —— 滚轮只送目标窗口，用户前台应用不受影响。
+        //   真机验证（2026-11-05）：后台 TextEdit 文档滚动条 0.5086→0.7562，
+        //   系统光标纹丝不动，前台仍是「访达」⇒ 定向滚轮不需要把应用拉到前台。
+        //   ⛔ 关键：必须 CGEventSetLocation(ev, 屏幕点)，否则事件被静默丢弃（踩过）。
+        long pid = targetPid;
+        if (pid > 0) {
+            double[] point = targetPoint;
+            long windowNumber = targetWindowNumber;
+            double windowX = targetWindowX;
+            double windowY = targetWindowY;
+            if (point != null && windowNumber > 0) {
+                // dsh 的滚轮量以「行」为单位；本仓入参也是「刻度」⇒ 直接透传
+                boolean sent = MacOsSkyLight.postScroll(pid, windowNumber,
+                        point[0], point[1], windowX, windowY, dy, dx);
+                if (sent) {
+                    if (log.isInfoEnabled()) {
+                        log.info("[computer-use] macOS 定向滚动完成: pid={} win={} dx={} dy={} 光学标未动",
+                                pid, windowNumber, dx, dy);
+                    }
+                    return;
+                }
+            }
+            // 定向信息不全（没有点/窗口号）⇒ 落回全局；不静默跳过
+            if (log.isDebugEnabled()) {
+                log.debug("[computer-use] 定向滚动信息不全（point={} win={}）⇒ 回落全局投递",
+                        point == null ? "null" : "有", windowNumber);
+            }
+        }
+        // 路径 B：全局 HID（会滚前台窗口；保持旧行为）
         // CCB executorCrossPlatform.ts:507-508 —— 垂直先、水平后
         if (dy != 0) {
             MacOsExec.jxaVoid(runner, MacOsJxa.verticalScrollWheel(dy));
@@ -97,8 +135,33 @@ public final class MacOsMouseActions implements ComputerUseMouseActions {
             MacOsExec.jxaVoid(runner, MacOsJxa.horizontalScrollWheel(dx));
         }
         if (log.isInfoEnabled()) {
-            log.info("[computer-use] macOS 滚动完成: dx={} dy={}", dx, dy);
+            log.info("[computer-use] macOS 滚动完成（全局）: dx={} dy={}", dx, dy);
         }
+    }
+
+    /**
+     * 设置定向滚动/拖拽的目标（{@code pid<=0} ⇒ 不定向，走全局 HID）。
+     *
+     * @param pid          目标进程
+     * @param windowNumber 目标窗口号
+     * @param windowX      窗口原点 X
+     * @param windowY      窗口原点 Y
+     * @param screenX      滚动/拖拽作用的屏幕点 X
+     * @param screenY      滚动/拖拽作用的屏幕点 Y
+     */
+    public void setScrollTarget(long pid, long windowNumber,
+                                double windowX, double windowY,
+                                double screenX, double screenY) {
+        this.targetPid = Math.max(0L, pid);
+        this.targetWindowNumber = windowNumber;
+        this.targetWindowX = windowX;
+        this.targetWindowY = windowY;
+        this.targetPoint = pid > 0 ? new double[]{screenX, screenY} : null;
+    }
+
+    /** 清除定向目标（回到全局投递）。 */
+    public void clearScrollTarget() {
+        setScrollTarget(0L, 0L, 0.0, 0.0, 0.0, 0.0);
     }
 
     /** 键序号 · CCB {@code input/backends/darwin.ts:144}（left=0 / right=1 / other=2）。 */

@@ -102,6 +102,8 @@ public final class ComputerUsePerformActionTool implements Tool {
     private final ComputerUseUiaService uiaService;
     private final ComputerUseUiSnapshotStore snapshotStore;
     private final ComputerUseConfirmationStore confirmationStore;
+    /** TCC 权限检查（macOS 侧用于报告权限状态；可为 null）。 */
+    private final MacOsTccChecker tcc;
 
     /**
      * @param uiaService         AX/UIA 服务
@@ -111,9 +113,23 @@ public final class ComputerUsePerformActionTool implements Tool {
     public ComputerUsePerformActionTool(ComputerUseUiaService uiaService,
                                         ComputerUseUiSnapshotStore snapshotStore,
                                         ComputerUseConfirmationStore confirmationStore) {
+        this(uiaService, snapshotStore, confirmationStore, null);
+    }
+
+    /**
+     * @param uiaService         AX/UIA 服务
+     * @param snapshotStore      观察存储
+     * @param confirmationStore  敏感动作令牌存储（可空 ⇒ 敏感动作一律拒绝）
+     * @param tcc                TCC 权限检查（可空 ⇒ 权限报 unavailable）
+     */
+    public ComputerUsePerformActionTool(ComputerUseUiaService uiaService,
+                                        ComputerUseUiSnapshotStore snapshotStore,
+                                        ComputerUseConfirmationStore confirmationStore,
+                                        MacOsTccChecker tcc) {
         this.uiaService = uiaService;
         this.snapshotStore = snapshotStore;
         this.confirmationStore = confirmationStore;
+        this.tcc = tcc;
     }
 
     @Override
@@ -219,7 +235,13 @@ public final class ComputerUsePerformActionTool implements Tool {
                 return ToolResult.error(call.id(),
                         "perform_action requires a bound window on this platform.");
             }
-            if (!uiaService.performAction(hwnd, element.locator(), action)) {
+            // 动作前的观察：提供【目标应用 pid】（后台应用必须按它定位，不能用前台应用）
+            ComputerUseUiSnapshotStore.Observation before = snapshotStore != null
+                    ? snapshotStore.require(sessionId, observationId) : null;
+            long targetPid = before == null ? 0L : before.pid();
+            // dsh expectedStateHash：动作前校验树没变（locator 是树序派生的）
+            if (!uiaService.performAction(hwnd, element.locator(), action,
+                    resolution.stateHash(), targetPid)) {
                 return ToolResult.error(call.id(),
                         "COMPUTER_ACTION_BLOCKED: the Accessibility action \"" + action
                                 + "\" was rejected by the application");
@@ -228,9 +250,31 @@ public final class ComputerUsePerformActionTool implements Tool {
                 log.info("[computer-use] {} 完成: session={} action={} element=#{}",
                         TOOL_NAME, sessionId, action, element.index());
             }
-            return ToolResult.success(call.id(),
-                    "Performed " + action + " on: [" + element.index() + "] " + element.role()
-                            + (element.name().isEmpty() ? "" : " \"" + element.name() + "\""));
+            // ⭐ macOS 侧返回结构化动作结果（dsh actionResultSchema）：
+            //   动作后的新观察 + effect（生效没有）+ resolution（目标变了没有）
+            ComputerUseActionResult result = ComputerUseActionExecutor.buildResult(
+                    uiaService, snapshotStore, sessionId,
+                    ComputerUseActionResult.ACTION_PERFORM_ACTION,
+                    ComputerUseActionResult.CHANNEL_ACCESSIBILITY,
+                    resolution.targetResolution(), before, MacOsUiaService.DEFAULT_MAX_DEPTH, tcc);
+            com.fasterxml.jackson.databind.node.ObjectNode permissions = JSON.createObjectNode();
+            if (tcc != null) {
+                MacOsTccChecker.Status status = tcc.status();
+                permissions.put("accessibility", status.accessibilityGranted() ? "granted" : "denied");
+                permissions.put("screenRecording", status.screenRecordingGranted() ? "granted" : "denied");
+            } else {
+                permissions.put("accessibility", "unavailable");
+                permissions.put("screenRecording", "unavailable");
+            }
+            com.fasterxml.jackson.databind.node.ObjectNode extra = JSON.createObjectNode();
+            extra.put("performedAction", action);
+            return ToolResult.success(call.id(), ComputerUseActionResult.render(result, permissions, extra));
+        } catch (ComputerUseStaleObservationException e) {
+            // dsh COMPUTER_STALE_OBSERVATION：树变了 ⇒ 让模型重新 observe，
+            // 而不是当成「动作被拒」去重复尝试同一个 locator
+            log.warn("[computer-use] {} 拒绝执行：观察已陈旧。{}", TOOL_NAME, e.getMessage());
+            return ToolResult.error(call.id(),
+                    ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION + ": " + e.getMessage());
         } catch (Exception e) {
             log.error("[computer-use] {} 失败: session={} action={} err={}",
                     TOOL_NAME, sessionId, action, e.getMessage(), e);

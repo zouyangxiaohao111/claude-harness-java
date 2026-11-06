@@ -104,6 +104,10 @@ public final class ComputerUseScrollTool implements Tool {
                   "minimum": 0,
                   "maximum": 100,
                   "description": "Number of scroll ticks."
+                },
+                "observationId": {
+                  "type": "string",
+                  "description": "Optional. The observationId returned by observe. When given, the wheel event is routed ONLY to that application's window at the given point (the user's foreground app is not scrolled and the system cursor is not moved). Without it the scroll goes to the global input stream."
                 }
               },
               "required": ["coordinate", "scroll_direction", "scroll_amount"]
@@ -119,6 +123,8 @@ public final class ComputerUseScrollTool implements Tool {
     private final ComputerUseGrantStore grantStore;
     private final ComputerUseForegroundAppResolver foregroundAppResolver;
     private final ComputerUseMouseState mouseState;
+    /** 观察存储（用于按 observationId 找目标 pid + 窗口几何；null ⇒ 不支持定向）。 */
+    private final ComputerUseUiSnapshotStore snapshotStore;
 
     /**
      * @param mouse                 鼠标动作实现
@@ -134,6 +140,19 @@ public final class ComputerUseScrollTool implements Tool {
                                  ComputerUseGrantStore grantStore,
                                  ComputerUseForegroundAppResolver foregroundAppResolver,
                                  ComputerUseMouseState mouseState) {
+        this(mouse, geometryStore, coordinateMode, grantStore, foregroundAppResolver, mouseState, null);
+    }
+
+    /**
+     * @param snapshotStore 观察存储（null ⇒ 即使给了 observationId 也不定向，走全局滚动）
+     */
+    public ComputerUseScrollTool(ComputerUseMouseActions mouse,
+                                 ComputerUseGeometryStore geometryStore,
+                                 ComputerUseCoordinateMode coordinateMode,
+                                 ComputerUseGrantStore grantStore,
+                                 ComputerUseForegroundAppResolver foregroundAppResolver,
+                                 ComputerUseMouseState mouseState,
+                                 ComputerUseUiSnapshotStore snapshotStore) {
         if (mouse == null || geometryStore == null) {
             throw new IllegalArgumentException("ComputerUseScrollTool 依赖不能为空");
         }
@@ -143,6 +162,7 @@ public final class ComputerUseScrollTool implements Tool {
         this.grantStore = grantStore;
         this.foregroundAppResolver = foregroundAppResolver;
         this.mouseState = mouseState;
+        this.snapshotStore = snapshotStore;
     }
 
     @Override
@@ -276,6 +296,33 @@ public final class ComputerUseScrollTool implements Tool {
                 // 不可能到达（上面已校验）· fail loud
                 return ToolResult.error(call.id(), "\"scroll_direction\" must be one of: up, down, left, right");
             }
+        }
+
+        // ⭐ 定向投递（对齐 dsh computer_scroll：滚轮只送目标窗口，系统光标不动）
+        //   给的 observationId 里含窗口号 + 窗口原点 ⇒ 才能算出「窗口内局部坐标」。
+        long targetPid = 0L;
+        String observationId = input.path("observationId").asText("");
+        if (!observationId.isEmpty() && snapshotStore != null) {
+            ComputerUseUiSnapshotStore.Observation observation =
+                    snapshotStore.require(sessionId, observationId);
+            if (observation == null) {
+                return ToolResult.error(call.id(),
+                        ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION
+                                + ": observation " + observationId
+                                + " is unknown, expired, or from a previous generation."
+                                + " Call observe again and use the new observationId.");
+            }
+            if (observation.hasWindowTarget()) {
+                targetPid = observation.pid();
+                if (mouse instanceof MacOsMouseActions macOsMouse) {
+                    // observation 的位置字段：windowX/windowY 是窗口原点
+                    macOsMouse.setScrollTarget(observation.pid(), observation.windowId(),
+                            observation.windowX(), observation.windowY(), point[0], point[1]);
+                }
+            }
+        }
+        if (targetPid == 0L && mouse instanceof MacOsMouseActions macOsMouse) {
+            macOsMouse.clearScrollTarget();
         }
 
         try {

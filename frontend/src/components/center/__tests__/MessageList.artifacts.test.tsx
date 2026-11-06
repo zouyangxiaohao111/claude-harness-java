@@ -36,8 +36,18 @@ function baseMsg(id: string, role: 'user' | 'assistant', content: string): ChatM
 const userMsg = (id: string): ChatMessageDto => ({ ...baseMsg(id, 'user', '用户消息'), userMessageId: id })
 const assistantMsg = (id: string): ChatMessageDto => baseMsg(id, 'assistant', `助手回复 ${id}`)
 
-function art(id: string, title: string, localPath: string | null, sizeBytes: number | null = 2048): SessionArtifactDto {
-  return { id, kind: 'deliverable', title, localPath, url: null, sizeBytes, summary: null, updatedAt: null, directory: false }
+function art(
+  id: string,
+  title: string,
+  localPath: string | null,
+  sizeBytes: number | null = 2048,
+  /** 归属轮（= 发起该轮的用户消息 id）；null = 归属未知的历史行 */
+  sourceMessageId: string | null = 'u1',
+): SessionArtifactDto {
+  return {
+    id, kind: 'deliverable', title, localPath, url: null, sizeBytes, summary: null,
+    sourceMessageId, updatedAt: null, directory: false,
+  }
 }
 
 let container: HTMLDivElement
@@ -152,5 +162,75 @@ describe('[产物卡片] 正文最多 5 张（最新）+ 全量计数', () => {
     // 入口永远在：没有数据也要让用户看到「(0)」，否则会以为功能缺失
     expect(container.textContent).toContain('查看所有产物')
     expect(container.textContent).toContain('(0)')
+  })
+})
+
+describe('[产物卡片] 按轮次归属（2026-11-05 用户裁定「轮次级别产物不是会话」）', () => {
+  beforeEach(() => {
+    (globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
+    useChatStore.setState({
+      messages: {}, streams: {}, streamOrder: {}, streamTicks: {}, snippedIds: {}, apiErrors: {}, changedFiles: {},
+      sessions: [{ id: SID, modelName: 'GLM-5.3-Flash' } as unknown as SessionDto],
+    })
+    container = document.createElement('div')
+    document.body.appendChild(container)
+  })
+
+  afterEach(() => {
+    act(() => { root?.unmount() })
+    container.remove()
+    root = undefined as unknown as Root
+  })
+
+  it('两轮各有产物 → 各挂在自己那轮，上一轮的产物不出现在最后一轮', () => {
+    const messages: ChatMessageDto[] = [
+      userMsg('u1'), assistantMsg('m1'),
+      userMsg('u2'), assistantMsg('m2'),
+    ]
+    renderList(messages, {
+      deliverables: [
+        art('a1', '第一轮.html', 'D:/out/a1.html', 2048, 'u1'),
+        art('a2', '第二轮.html', 'D:/out/a2.html', 2048, 'u2'),
+      ],
+      sources: [],
+    })
+    const cards = Array.from(container.querySelectorAll('.artifact-card'))
+    expect(cards.map((c) => c.querySelector('.ac-name')?.textContent)).toEqual(['第一轮.html', '第二轮.html'])
+    // 每张卡（各自轮末尾）必须跟在自己轮的 assistant 之后
+    const m1 = container.querySelector('[data-msg-id="m1"]')
+    const m2 = container.querySelector('[data-msg-id="m2"]')
+    expect(m1).not.toBeNull()
+    expect(m2).not.toBeNull()
+    expect(m1!.compareDocumentPosition(cards[0]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    expect(m2!.compareDocumentPosition(cards[1]!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+    // 反证：第一轮的卡不能落在第二轮之后
+    expect(cards[0]!.compareDocumentPosition(m2!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('只有上一轮有产物 → 最后一轮不再显示该卡片（此前它被错挂到最后一条 assistant）', () => {
+    const messages: ChatMessageDto[] = [
+      userMsg('u1'), assistantMsg('m1'),
+      userMsg('u2'), assistantMsg('m2'),
+    ]
+    renderList(messages, {
+      deliverables: [art('a1', '记忆架构说明.html', 'D:/out/a1.html', 2048, 'u1')],
+      sources: [],
+    })
+    const cards = Array.from(container.querySelectorAll('.artifact-card'))
+    expect(cards.map((c) => c.querySelector('.ac-name')?.textContent)).toEqual(['记忆架构说明.html'])
+    const m2 = container.querySelector('[data-msg-id="m2"]')!
+    // 卡片在第二轮之前（即属于第一轮），而不是跟在 m2 后面
+    expect(cards[0]!.compareDocumentPosition(m2) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy()
+  })
+
+  it('归属未知（sourceMessageId=null）→ 不挂到任何一轮，但计数仍包含它', () => {
+    renderList([userMsg('u1'), assistantMsg('m1')], {
+      deliverables: [art('a1', '旧产物.html', 'D:/out/a1.html', 2048, null)],
+      sources: [],
+    })
+    expect(container.querySelectorAll('.artifact-card')).toHaveLength(0)
+    // 会话级入口的计数口径不变：历史行仍算进总数（右侧栏能看全）
+    expect(container.textContent).toContain('查看所有产物')
+    expect(container.textContent).toContain('(1)')
   })
 })

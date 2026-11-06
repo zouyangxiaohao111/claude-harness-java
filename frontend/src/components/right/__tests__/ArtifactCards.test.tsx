@@ -25,6 +25,7 @@ const art = (id: string, title: string, extra: Partial<SessionArtifactDto> = {})
   url: null,
   sizeBytes: 1024,
   summary: null,
+  sourceMessageId: null,
   updatedAt: null,
   directory: false,
   ...extra,

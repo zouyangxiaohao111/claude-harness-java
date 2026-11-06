@@ -6,7 +6,9 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.ArrayDeque;
 import java.util.ArrayList;
+import java.util.Deque;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
@@ -67,17 +69,23 @@ public final class MacOsUiaService implements ComputerUseUiaService {
     private static final Logger log = LoggerFactory.getLogger(MacOsUiaService.class);
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** 默认遍历深度（与 Windows 侧同值，便于模型看到同形状的树）。 */
-    public static final int DEFAULT_MAX_DEPTH = 4;
+    /**
+     * 默认遍历深度 · dsh {@code config.ts:93} {@code maxDepth: z.number().default(14)}。
+     *
+     * <p><b>⚠️ 与 Windows UIA 的 4 不同</b>：Windows 的 UIA 树层级浅、每层节点多，4 层足够；
+     * macOS 的 AX 树在背景应用里会多套几层 Group（实测 Finder 工具栏在 5~7 层），
+     * 4 层会漏掉真正的控件 ⇒ macOS 侧对齐 dsh 的 14。
+     */
+    public static final int DEFAULT_MAX_DEPTH = 14;
 
-    /** 节点上限：防巨树撑爆上下文（dsh 用 maxNodes 同类保护）。 */
-    public static final int MAX_NODES = 220;
+    /** 节点上限 · dsh {@code config.ts:92} {@code maxNodes: 500}（防巨树撑爆上下文）。 */
+    public static final int MAX_NODES = 500;
 
     /** 条件等待的轮询间隔（毫秒）· 取 100ms（dsh 的 settleMs 默认 250ms，本仓取短以降低交互延迟）。 */
     public static final long POLL_INTERVAL_MS = 100L;
 
-    /** 文本字节上限（估算；防止单次观察吃掉过多 token）。 */
-    public static final int MAX_TEXT_BYTES = 9_000;
+    /** 文本字节上限 · dsh {@code config.ts:94} {@code maxTextBytes: 64000}。 */
+    public static final int MAX_TEXT_BYTES = 64_000;
 
     private final ComputerUseProcessRunner runner;
     private final MacOsTccChecker tcc;
@@ -107,20 +115,60 @@ public final class MacOsUiaService implements ComputerUseUiaService {
 
     @Override
     public ComputerUseAccessibilitySnapshot captureSnapshot(long hwnd, int maxDepth) {
+        return captureSnapshot(hwnd, maxDepth, ComputerUseAppSelector.frontmost());
+    }
+
+    /**
+     * 抓一棵 AX 树 · <b>可指定观察对象</b>（对齐 dsh {@code computer_observe} 的 {@code app} 入参）。
+     *
+     * @param hwnd     忽略（macOS 从应用定位）
+     * @param maxDepth 最大深度
+     * @param selector 观察对象；空 ⇒ 前台应用
+     * @return 快照（观察对象解析失败 ⇒ <b>抛异常</b>，不静默回落到前台应用）
+     */
+    public ComputerUseAccessibilitySnapshot captureSnapshot(long hwnd,
+                                                          int maxDepth,
+                                                          ComputerUseAppSelector selector) {
         tcc.requireAccessibility();
         int depth = maxDepth <= 0 ? DEFAULT_MAX_DEPTH : maxDepth;
-        String raw = runJxa(MacOsJxa.accessibilitySnapshot(depth, MAX_NODES, MAX_TEXT_BYTES));
+        String raw = runJxa(MacOsJxa.accessibilitySnapshot(depth, MAX_NODES, MAX_TEXT_BYTES, selector));
         JsonNode root = parseJson(raw, "AX 快照");
+        if (!root.path("appResolved").asBoolean(true)) {
+            // ⛔ 观察对象解析失败必须显式失败：静默回落到前台应用会让模型以为在看 A、实际看的是 B
+            throw new IllegalStateException(
+                    "[computer-use] macOS 无法定位观察对象: " + root.path("resolveError").asText("unknown"));
+        }
         List<ComputerUseAccessibilityNode> nodes = rebuildTree(root.path("records"));
+        // ── 元素矩形（dsh elementSchema.frame）──
+        // ⛔ JXA 读 AXPosition/AXSize 会 exit 139（Ref() 桥接解错类型后解引用）
+        //   ⇒ 坐标只能走 JNA 直调 AXValueGetValue。两者用【同一套 BFS 顺序 + 同一组上限】，
+        //   locator 才能严格对上（对齐参数：depth 与 MAX_NODES 必须和上面那次 JXA 调用一致）。
+        long appPid = root.path("app").path("pid").asLong(0L);
+        java.util.Map<String, MacOsAxFrames.Frame> elementFrames =
+                MacOsAxFrames.frames(appPid, depth, MAX_NODES);
+        if (!elementFrames.isEmpty()) {
+            int[] counter = new int[1];
+            // ⛔ 必须【递归】回填：nodes 只是顶层列表，子节点在 children 里。
+            //   曾只遍历顶层 ⇒ 43 个元素里只有 1 个（根）拿到矩形，其余全是 0。
+            nodes = withFrames(nodes, elementFrames, counter);
+            if (log.isInfoEnabled()) {
+                log.info("[computer-use] macOS 元素矩形采集: 有矩形 {}/{} 个元素",
+                        counter[0], countNodes(nodes));
+            }
+        }
         String text = root.path("text").asText("");
         if (text.isEmpty()) {
             text = ComputerUseAccessibilitySnapshot.formatForModel(nodes);
         }
+        JsonNode frame = root.path("window").path("frame");
+        boolean hasFrame = frame.isObject() && frame.path("width").asInt(0) > 0;
         if (log.isInfoEnabled()) {
-            log.info("[computer-use] macOS AX 快照完成: app={} window={} 节点={} 截断={} 文本字节≈{}",
+            log.info("[computer-use] macOS AX 快照完成: app={} window={} 节点={} 截断={} 文本字节≈{} 前台={} 窗口矩形={}",
                     root.path("app").path("name").asText("?"),
                     root.path("window").path("title").asText(""),
-                    nodes.size(), root.path("truncated").asBoolean(false), text.length());
+                    nodes.size(), root.path("truncated").asBoolean(false), text.length(),
+                    root.path("frontmost").asBoolean(false),
+                    hasFrame ? (frame.path("width").asInt(0) + "x" + frame.path("height").asInt(0)) : "无");
         }
         return new ComputerUseAccessibilitySnapshot(
                 text,
@@ -135,7 +183,56 @@ public final class MacOsUiaService implements ComputerUseUiaService {
                 //   「元素签名序列」—— 两者不同构，任何 Java 侧重算都会与 JXA 值不等
                 //   ⇒ 动作会被永远误判为「树已变」而拒绝。
                 root.path("stateHash").asText(""),
-                root.path("truncated").asBoolean(false));
+                root.path("truncated").asBoolean(false),
+                frame.path("x").asInt(0),
+                frame.path("y").asInt(0),
+                frame.path("width").asInt(0),
+                frame.path("height").asInt(0),
+                root.path("window").path("id").asLong(0L),
+                root.path("frontmost").asBoolean(false));
+    }
+
+    /** 递归回填元素矩形（命中 map 的元素换成带坐标的新 record，其余原样保留）。 */
+    private static List<ComputerUseAccessibilityNode> withFrames(
+            List<ComputerUseAccessibilityNode> nodes,
+            java.util.Map<String, MacOsAxFrames.Frame> frames,
+            int[] counter) {
+        List<ComputerUseAccessibilityNode> out = new java.util.ArrayList<>(nodes.size());
+        for (ComputerUseAccessibilityNode node : nodes) {
+            List<ComputerUseAccessibilityNode> kids = withFrames(node.children(), frames, counter);
+            MacOsAxFrames.Frame f = frames.get(node.locator());
+            if (f == null) {
+                out.add(kids == node.children() ? node : new ComputerUseAccessibilityNode(
+                        node.role(), node.name(), node.automationId(),
+                        node.x(), node.y(), node.width(), node.height(),
+                        node.enabled(), node.value(), kids,
+                        node.index(), node.locator(), node.actions(),
+                        node.subrole(), node.nativeIdentifier(),
+                        node.focused(), node.selected()));
+                continue;
+            }
+            counter[0]++;
+            out.add(new ComputerUseAccessibilityNode(
+                    node.role(), node.name(), node.automationId(),
+                    f.x(), f.y(), f.width(), f.height(),
+                    node.enabled(), node.value(), kids,
+                    node.index(), node.locator(), node.actions(),
+                    node.subrole(), node.nativeIdentifier(),
+                    node.focused(), node.selected()));
+        }
+        return out;
+    }
+
+    /** 全树节点数（含子节点）。 */
+    private static int countNodes(List<ComputerUseAccessibilityNode> nodes) {
+        int total = 0;
+        Deque<ComputerUseAccessibilityNode> queue = new ArrayDeque<>(nodes);
+        while (!queue.isEmpty()) {
+            ComputerUseAccessibilityNode node = queue.removeFirst();
+            total++;
+            queue.addAll(node.children());
+        }
+        return total;
     }
 
     /**
@@ -166,14 +263,24 @@ public final class MacOsUiaService implements ComputerUseUiaService {
      */
     @Override
     public boolean invokeElement(long hwnd, String automationId, String expectedStateHash) {
+        return invokeElement(hwnd, automationId, expectedStateHash, 0L);
+    }
+
+    @Override
+    public boolean invokeElement(long hwnd, String automationId, String expectedStateHash, long targetPid) {
         if (automationId == null || automationId.isEmpty()) {
             return false;
         }
         tcc.requireAccessibility();
-        String raw = runJxa(MacOsJxa.accessibilityInvoke(automationId, expectedStateHash));
+        String raw = runJxa(MacOsJxa.accessibilityInvoke(automationId, expectedStateHash, targetPid));
         JsonNode node = parseJson(raw, "AXPress");
         boolean ok = node.path("ok").asBoolean(false);
         int err = node.path("err").asInt(0);
+        // ⭐ 陈旧不是「不可按」：必须让上层看到独立错误码，否则模型会重复尝试同一 locator
+        if (err == ComputerUseStaleObservationException.AX_ERR_STALE) {
+            throw new ComputerUseStaleObservationException(node.path("message").asText(
+                    "the accessibility tree changed since the observation"));
+        }
         if (!ok) {
             if (log.isWarnEnabled()) {
                 log.warn("[computer-use] macOS AXPress 失败: locator={} err={} actions={} msg={}",
@@ -326,13 +433,29 @@ public final class MacOsUiaService implements ComputerUseUiaService {
      */
     @Override
     public boolean performAction(long hwnd, String locator, String action) {
+        return performAction(hwnd, locator, action, 0L);
+    }
+
+    @Override
+    public boolean performAction(long hwnd, String locator, String action, long targetPid) {
+        return performAction(hwnd, locator, action, null, targetPid);
+    }
+
+    @Override
+    public boolean performAction(long hwnd, String locator, String action,
+                                 String expectedStateHash, long targetPid) {
         if (locator == null || locator.isEmpty() || action == null || action.isEmpty()) {
             return false;
         }
         tcc.requireAccessibility();
-        String raw = runJxa(MacOsJxa.accessibilityPerformAction(locator, action));
+        String raw = runJxa(MacOsJxa.accessibilityPerformAction(
+                locator, action, expectedStateHash, targetPid));
         JsonNode node = parseJson(raw, "AX performAction");
         boolean ok = node.path("ok").asBoolean(false);
+        if (node.path("err").asInt(0) == ComputerUseStaleObservationException.AX_ERR_STALE) {
+            throw new ComputerUseStaleObservationException(node.path("message").asText(
+                    "the accessibility tree changed since the observation"));
+        }
         if (!ok && log.isWarnEnabled()) {
             log.warn("[computer-use] macOS AX 动作失败: locator={} action={} err={} available={} msg={}",
                     locator, action, node.path("err").asInt(0),
@@ -354,13 +477,29 @@ public final class MacOsUiaService implements ComputerUseUiaService {
      */
     @Override
     public boolean setElementValue(long hwnd, String automationId, String value) {
+        return setElementValue(hwnd, automationId, value, 0L);
+    }
+
+    @Override
+    public boolean setElementValue(long hwnd, String automationId, String value, long targetPid) {
+        return setElementValue(hwnd, automationId, value, null, targetPid);
+    }
+
+    @Override
+    public boolean setElementValue(long hwnd, String automationId, String value,
+                                   String expectedStateHash, long targetPid) {
         if (automationId == null || automationId.isEmpty()) {
             return false;
         }
         tcc.requireAccessibility();
-        String raw = runJxa(MacOsJxa.accessibilitySetValue(automationId, value));
+        String raw = runJxa(MacOsJxa.accessibilitySetValue(
+                automationId, value, expectedStateHash, targetPid));
         JsonNode node = parseJson(raw, "AX setValue");
         boolean ok = node.path("ok").asBoolean(false);
+        if (node.path("err").asInt(0) == ComputerUseStaleObservationException.AX_ERR_STALE) {
+            throw new ComputerUseStaleObservationException(node.path("message").asText(
+                    "the accessibility tree changed since the observation"));
+        }
         if (log.isInfoEnabled()) {
             log.info("[computer-use] macOS AX 设值{}: locator={} 字符数={} 方式={} err={}",
                     ok ? "成功" : "失败", automationId,
@@ -435,7 +574,9 @@ public final class MacOsUiaService implements ComputerUseUiaService {
                 toStringList(rec.path("actions")),
                 // 子角色与原生标识：dsh 三级解析（exact / native-identifier / semantic）的稳定字段
                 rec.path("subrole").asText(""),
-                rec.path("sid").asText(""));
+                rec.path("sid").asText(""),
+                rec.hasNonNull("focused") ? rec.get("focused").asBoolean() : null,
+                rec.hasNonNull("selected") ? rec.get("selected").asBoolean() : null);
     }
 
     private List<ComputerUseAccessibilityNode> buildChildren(String parent,

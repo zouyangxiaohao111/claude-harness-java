@@ -104,7 +104,19 @@ public class SessionController {
         return sessionService.create(req);
     }
 
-    @PatchMapping("/{id}")
+    /**
+     * 更新会话 · {@code PATCH}（本仓原生）与 {@code PUT}（源侧 WeKnora 用这个动词）同实现。
+     *
+     * <p>⚠️ 语义是<b>部分更新</b>：{@link SessionUpdateRequest} 全字段可选，未传即不改。
+     * 源侧 PUT 收的是完整 Session 对象，但 service 层同样只覆盖传入字段
+     * ⇒ 两种动词在本仓行为一致，⛔ 不改整体替换（那会静默清空未传字段）。
+     *
+     * @param id  会话 ID
+     * @param req 更新请求（全字段可选）
+     * @return 更新后的会话
+     */
+    @RequestMapping(value = "/{id}",
+                    method = {RequestMethod.PATCH, RequestMethod.PUT})
     public SessionDto update(@PathVariable String id,
                              @RequestBody SessionUpdateRequest req) {
         return sessionService.update(id, req);

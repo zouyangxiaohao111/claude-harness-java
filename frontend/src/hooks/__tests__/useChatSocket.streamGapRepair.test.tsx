@@ -129,6 +129,54 @@ describe('[seq 缺口修复]', () => {
     expect(blockContent()).toBe('a')
   })
 
+  it('⭐ [gap-repair-deadlock] 重拉永不返回 ⇒ 超时后必须恢复派发（否则实时通道永久停摆）', async () => {
+    // WHY（用户实测「明明跑完了却卡在渲染，切换会话才继续」）：
+    //   修复期间 stitchingRef=true ⇒ 每一帧都只进缓冲、不派发；复位只在 await 之后。
+    //   而 api() 用裸 fetch（无超时）⇒ 重拉一旦挂住，finally 永不执行 ⇒
+    //   之后**所有帧（含 complete）永不被派发** ⇒ 界面彻底静止，只能靠切会话整表替换才「突然全出现」。
+    vi.useFakeTimers()
+    /**
+     * 推进假时钟并把微任务链跑完。
+     *
+     * ⚠️ 必须"推进 → 让出微任务 → 再推进"两段：超时 resolve 是微任务，`finally` 里的
+     *   `dispatchEvent → scheduleStreamFlush` 会在微任务里**新排一个 rAF**，
+     *   只推进一次的话那个 rAF 不会被触发，正文仍停在旧值（假红）。
+     */
+    const tick = async (ms: number) => {
+      await act(async () => { vi.advanceTimersByTime(ms) })
+      await act(async () => { await Promise.resolve() })
+      await act(async () => { vi.advanceTimersByTime(ms) })
+    }
+    try {
+      const onReload = vi.fn(() => new Promise<void>(() => { /* 永不 resolve：模拟请求挂住 */ }))
+      act(() => { root!.render(<Host onReload={onReload} />) })
+      act(() => { fakeClient.onConnect?.() })
+      await tick(50)
+      onReload.mockClear()
+
+      push({ type: 'message.chunk', seq: 1, assistantMessageId: 'b1', delta: 'a' })
+      await tick(50)
+      expect(blockContent()).toBe('a')
+
+      // 触发缺口修复（重拉永不返回）
+      push({ type: 'message.chunk', seq: 3, assistantMessageId: 'b1', delta: 'c' })
+      await tick(100)
+      expect(onReload, '缺口必须触发一次重拉').toHaveBeenCalledTimes(1)
+      expect(blockContent(), '修复期间不派发').toBe('a')
+
+      // ⭐ 超过修复超时窗口 ⇒ 必须放弃对账并把缓冲帧派发出去
+      await tick(8_500)
+      expect(blockContent(), '超时后必须恢复派发（否则此后所有帧永久卡死）').toBe('ac')
+
+      // 反向验证：后续帧也必须继续正常派发（stitchingRef 已复位）
+      push({ type: 'message.chunk', seq: 4, assistantMessageId: 'b1', delta: 'd' })
+      await tick(50)
+      expect(blockContent()).toBe('acd')
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it('后端重启（seq 大幅回退）→ 重置窗口继续处理', async () => {
     const onReload = vi.fn()
     await mount(onReload)

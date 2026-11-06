@@ -203,6 +203,16 @@ public class LlmAgentLoop implements AgentLoop {
     private static final Logger log = LoggerFactory.getLogger(LlmAgentLoop.class);
 
     /**
+     * 4 个知识库专属工具名（主对话「引入知识库」开关打开时放行）。
+     *
+     * <p>⚠️ 必须与工具实现的 {@code name()} 逐字一致 —— 名字对不上时
+     * {@code AgentToolPolicy} 只记 WARN 并忽略，工具<b>不会</b>出现在池里，
+     * 用户看到「开关打开了但没有知识库工具」。
+     */
+    private static final java.util.List<String> KB_TOOL_NAMES = java.util.List.of(
+            "search_knowledge", "list_documents", "read_document", "query_knowledge_graph");
+
+    /**
      * 会话运行中注册表 — 对齐 CC QueryGuard isQueryActive 三闸（useQueueProcessor.ts:49）。
      *
      * <p>CRON-D2：CronIdleExecutor 据此判目标 session 是否空闲（无运行中 agent_loop）→ 空闲才启动队列轮询。
@@ -439,6 +449,17 @@ public class LlmAgentLoop implements AgentLoop {
      */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private HookRegistry hookRegistry;
+    /**
+     * [产物采集 2026-11-04] 产物 / 来源服务 · 供 {@code ArtifactCollectionHooks} 采集用。
+     *
+     * <p>WHY 放在 loop 而不是各工具里：采集改走 PostToolUse hook（用户 2026-11-04 裁定），
+     * 一个 hook 覆盖 Write/Edit/WebSearch/WebFetch（含子代理 —— 子代理与主循环共用
+     * {@code StreamingToolExecutor.executePostToolUse}），不用每加一个工具补一次埋点。
+     *
+     * <p>{@code required=false}：无 bean 时 hook 不注册（采集退化为目录扫描兜底，不影响对话）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.session.SessionArtifactService sessionArtifactService;
     // [goal V253] 目标（/goal）服务与任务框架服务**经 AgentLoopContext 传递**（loop() 是 static
     //   方法，拿不到本类实例字段）—— 见 AgentLoopContext.goalService() / taskFrameworkService()。
     //   ctx.goalService() 为 null ⇒ 目标机制整体不生效（老路径行为不变）。
@@ -1930,6 +1951,31 @@ public class LlmAgentLoop implements AgentLoop {
     /** [R32-b7b-2 P1-3 修复] CC startup flag (--model) — 优先级 2, 独立于 session override. */
     private volatile String startupModelFlag;
 
+    /**
+     * [W10 主线程智能体模型] 会话绑定智能体的 {@code main-model}（本仓扩展）— 优先级 1.8。
+     *
+     * <p><b>WHY 有这一层</b>：CC 的 agent {@code model:} 只给子代理用（{@code resumeAgent.ts:151}
+     * 注释：「Resolve model for analytics metadata」），主线程模型只由 {@code --model}/{@code /model}
+     * 决定。用户 2026-11-05 裁定「主线程应该也可以支持，拿不到再回默认」⇒ 本仓扩展一层。
+     *
+     * <p><b>优先级放在 skill 之后、startup flag 之前</b>：
+     * <ul>
+     *   <li>skill 的 {@code model:} 是「这个技能需要什么模型」，作用域更窄、更临时 ⇒ 它先</li>
+     *   <li>agent 的 {@code main-model} 是「这个专家整体用哪个模型」，比启动参数更贴切 ⇒ 它后于 skill、先于 flag</li>
+     * </ul>
+     *
+     * <p>{@code null} / blank = 该智能体没配 main-model ⇒ 继续往下（⛔ 不当作错误）。
+     */
+    private volatile String mainThreadAgentModel;
+
+    /** 设置会话绑定智能体的主线程模型（{@code null}/blank = 清除）。 */
+    public void setMainThreadAgentModel(String model) {
+        this.mainThreadAgentModel = (model == null || model.isBlank()) ? null : model.trim();
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] 主线程智能体模型覆盖: present={}", this.mainThreadAgentModel != null);
+        }
+    }
+
     /** [R32-b7b-2 R4 重做] settings 持久层 — 读 settings.model (优先级 4). */
     private com.nexusai.application.agent.settings.storage.FileConfigStorage configStorage;
 
@@ -2241,6 +2287,15 @@ public class LlmAgentLoop implements AgentLoop {
                 return skillModel;
             }
             log.warn("[LlmAgentLoop] 模型不在 allowlist 中, 跳过 skill-model 层");
+        }
+        // 1.8 [W10 本仓扩展] 会话绑定智能体的 main-model —— 拿不到就继续往下（用户裁定「拿不到再回默认」）
+        if (mainThreadAgentModel != null && !mainThreadAgentModel.isBlank()) {
+            if (isModelAllowed(mainThreadAgentModel)) {
+                log.info("[LlmAgentLoop] 当前模型来源: agent-main-model");
+                return mainThreadAgentModel;
+            }
+            // ⚠️ 不在 allowlist / 库里查不到 ⇒ 不算错误，继续走下面的层。
+            log.warn("[LlmAgentLoop] 智能体 main-model 不可用，回落下一层: model={}", mainThreadAgentModel);
         }
         // 2. Startup flag (CC --model 启动 flag) — 独立字段, 优先级 2
         if (startupModelFlag != null && !startupModelFlag.isBlank()) {
@@ -2583,6 +2638,10 @@ public class LlmAgentLoop implements AgentLoop {
         // RunRequest 紧凑构造器已校验 userPrompt + querySource 此处不再重复
         String userPrompt = params.userPrompt();
         ProviderConfig config = params.config();
+        // [W10] 主线程模型覆盖：会话绑定智能体的 MD {@code main-model}（本仓扩展）。
+        //   ⚠️ 必须在 getModelForCall() **之前**解析 —— 那一层会读本字段。
+        //   每轮重算（含清空）：换绑定智能体后不能残留上一次的模型。
+        setMainThreadAgentModel(resolveMainThreadAgentModel(params.sessionId()));
         // [R32-b7b-2 R4 重做] CC 对齐 — 每次 call 重新解析 model 优先级链.
         // getModelForCall() 返回 null 时回落 params.modelName() (CC Built-in default 语义).
         String resolvedModel = getModelForCall();
@@ -3134,6 +3193,13 @@ public class LlmAgentLoop implements AgentLoop {
         //   false 等价）→ 本调用为 no-op；内部构建开启时置常量并走真实注册，与 setup.ts
         //   发布构建宏替换 false 语义一致。注册入口见 {@link HookRegistry#registerAttributionHooks}。
         registerAttributionHooks();
+
+        // ── [产物采集 2026-11-04] ArtifactCollectionHooks 生产接线 ──
+        // 产物/来源采集从「工具内埋点」改为 PostToolUse hook（用户裁定）：
+        //   · Write/Edit → 落进交付物目录的文件当场入库+推送；
+        //   · WebSearch/WebFetch → 从工具结果里收集 url 记为来源。
+        // ⛔ 交付物目录扫描（Bash/cp/脚本产物）**保留** —— 工具 hook 看不见它们。
+        registerArtifactCollectionHooks();
 
         // ── §14: SessionStart hooks — 会话开始（对齐 CC sessionHooks.ts）──
         // [2026-08-12 △-03] initialUserMessage/watchPaths 消费 · 对齐 CC processSessionStartHooks
@@ -3868,6 +3934,22 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             } catch (Exception e) {
                 log.warn("LlmAgentLoop: turn 边界 makeSnapshot 失败（不阻塞主链）: cause={}", e.toString());
+            }
+        }
+        // [goal-hook-wipe 2026-11-05] 每轮开始前把「有活跃目标 ⇒ 注册表里就有 goal Stop hook」
+        //   这条不变式补回来：本类末尾的 §14 executeSessionEndHooks 会在每次 run 结束时
+        //   clearSessionHooks（HookRegistry:4737），把 goal hook 一并清掉。CC 的 SessionEnd 只在
+        //   /clear 与进程关闭时跑（gracefulShutdown.ts:468 / commands/clear/conversation.ts:91），
+        //   本仓按 run 执行是结构性偏差；不改 SessionEnd 语义的前提下，用幂等补挂兜住，
+        //   覆盖主路径 / cron 后台轮 / check-in 轮（都经本方法）。
+        if (mainCtx != null && sessionId != null && !sessionId.isBlank()) {
+            try {
+                com.nexusai.application.agent.goal.GoalService gs = mainCtx.goalService();
+                if (gs != null) {
+                    gs.ensureArmed(sessionId);
+                }
+            } catch (Exception e) {
+                log.warn("[goal] 补挂目标 hook 失败（不影响本轮对话）session={}: {}", sessionId, e.toString());
             }
         }
         MainLoopDeps mainDeps = new MainLoopDeps(mainCtx, this::getModelForCall);
@@ -5105,6 +5187,61 @@ public class LlmAgentLoop implements AgentLoop {
      * @param sessionId 会话 ID
      * @return SessionRecord 或 null
      */
+    /**
+     * 解析会话绑定智能体的主线程模型（MD {@code main-model}）。
+     *
+     * <p>返回 {@code null} 的全部情形都**不是错误**（用户裁定「拿不到再回默认」）：
+     * 没绑智能体 / 注册表不可用 / 智能体未配 main-model / 文件读不到。
+     *
+     * @param sessionId 会话 id
+     * @return 模型名（{@code provider/name}）；null = 不覆盖
+     */
+    private String resolveMainThreadAgentModel(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
+            if (row == null || row.getMainThreadAgent() == null || row.getMainThreadAgent().isBlank()) {
+                return null;
+            }
+            com.nexusai.application.agent.tool.impl.SubagentTool tool = currentSubagentTool();
+            if (tool == null) {
+                return null;
+            }
+            com.nexusai.application.agent.subagent.AgentDefinition def =
+                tool.agentRegistry(sessionId).findAgent(row.getMainThreadAgent().trim());
+            return def == null ? null : def.mainModel().orElse(null);
+        } catch (RuntimeException e) {
+            // fail-soft：智能体配置读失败 ⇒ 用会话当前模型，⛔ 不阻断本轮。
+            log.warn("[LlmAgentLoop] 解析智能体 main-model 失败，本轮用会话模型 session={} 原因={}",
+                sessionId, e.toString());
+            return null;
+        }
+    }
+
+    /**
+     * 取本 loop 的 SubagentTool（实例优先，静态桥兜底）。
+     *
+     * <p><b>为什么不能只用静态桥</b>（缺陷 30 · 2026-11-05 真机）：
+     * {@code staticSubagentTool} 是在 {@code doRun} <b>中段</b>才桥接的，
+     * 而读智能体 main-model 发生在 {@code doRun} <b>开头</b> ⇒ 首次 run 时静态桥仍是 null，
+     * 解析恒返回 null，模型覆盖一次都不生效（日志里连「不可用」的 WARN 都没有，
+     * 因为压根没进判断）。实例字段 {@code toolRegistry} 是构造时注入的，恒可用。
+     *
+     * @return SubagentTool；都没有 → null
+     */
+    private com.nexusai.application.agent.tool.impl.SubagentTool currentSubagentTool() {
+        if (toolRegistry != null) {
+            for (Object t : toolRegistry.all()) {
+                if (t instanceof com.nexusai.application.agent.tool.impl.SubagentTool st) {
+                    return st;
+                }
+            }
+        }
+        return findSubagentTool();
+    }
+
     private static com.nexusai.repository.session.entity.SessionRecord sessionRowOrNull(String sessionId) {
         if (staticSessionMapper == null || sessionId == null) {
             return null;
@@ -9140,9 +9277,16 @@ public class LlmAgentLoop implements AgentLoop {
                     //   （finally 再挂回）⇒ 本轮不评估，等后台归位后的下一轮才判。
                     //   本仓等价实现 = 摘掉 goal 的 prompt Stop hook → 执行 Stop hooks（此时 goal
                     //   hook 已不在注册表里，不会被评估）→ finally 挂回。
-                    if (ctx.goalService() != null && ctx.taskFrameworkService() != null
-                        && ctx.taskFrameworkService().hasPendingBackgroundWork(state.sessionId())) {
-                        ctx.goalService().deferEvaluationForBackground(state.sessionId());
+                    if (ctx.goalService() != null && ctx.taskFrameworkService() != null) {
+                        if (ctx.taskFrameworkService().hasPendingBackgroundWork(state.sessionId())) {
+                            ctx.goalService().deferEvaluationForBackground(state.sessionId());
+                        } else {
+                            // [B5 2026-11-04] 后台工作已归位 ⇒ 摘掉延迟态（对齐 CC
+                            //   `else if(j.deferredSince !== void 0){ ...摘掉 deferredSince/checkinCount/
+                            //    lastDeferralPassAt 三字段 }`）—— 不摘的话 check-in 定时器会一直认为
+                            //   该目标还在等后台任务，继续无谓地注入 check-in 提示。
+                            ctx.goalService().clearDeferralIfAny(state.sessionId());
+                        }
                     }
                     HookRegistry.StopHookCollectResult loopStopCollect;
                     try {
@@ -9184,27 +9328,31 @@ public class LlmAgentLoop implements AgentLoop {
                             //   blockingErrors.push → query.ts:1274-1277 全部 append user message）——
                             //   旧 executeEvent 折叠只注入首条，第 2+ blockingError 静默丢失
                             java.util.List<String> blockingTexts = new java.util.ArrayList<>();
+                            // [B1/B2 2026-11-04] goal 判定统一走 GoalService.consumeStopHookResult：
+                            //   ① 判据按 hook 身份（对齐 CC v2.1.318 的 ft() + condition 比对），
+                            //      不再用「任意 PromptHook SUCCESS」；
+                            //   ② 与 §14 兜底共用同一份语义（两处执行点不再漂移）。
+                            // [B3 2026-11-04] 本次 blocking 是否来自 goal hook —— 撞 cap 时
+                            //   决定「优雅暂停」还是「保持原有安全阀报错」。
+                            boolean goalNotMet = false;
                             for (GenericHook.HookResult r : loopStopCollect.results()) {
                                 if (r == null) {
                                     continue;
                                 }
-                                // [goal V253] impossible 消费 · 对齐 CC claude.exe v2.1.212：
-                                //   ok=false + impossible=true → outcome=success + impossible 标记
-                                //   （**不是** blocking）⇒ 目标停止推进、交还控制权，等用户处理。
-                                //   若不在此消费，impossible 结果会被静默吞掉（既不 block 也不改目标状态）
-                                //   ⇒ 目标永远挂在 active 态，UI 显示「还在追」但实际已停。
-                                if (Boolean.TRUE.equals(r.impossible())) {
-                                    if (ctx.goalService() != null) {
-                                        com.nexusai.domain.session.SessionGoal g =
-                                            ctx.goalService().recordImpossible(state.sessionId());
-                                        // [goal V253] 溯源行落进本轮「已完成」折叠区（理由同达成分支）
-                                        if (g != null) {
-                                            state.appendMessage(ctx.goalService().buildTerminalTraceMessage(g));
-                                        }
-                                        log.info("[goal] 评估器判定条件不可能达成 → 目标停止推进（session={}）",
-                                            state.sessionId());
+                                com.nexusai.application.agent.goal.GoalService.GoalVerdict verdict =
+                                    ctx.goalService() == null ? null
+                                        : ctx.goalService().consumeStopHookResult(state.sessionId(), r);
+                                if (verdict != null && verdict.kind()
+                                        != com.nexusai.application.agent.goal.GoalService.GoalVerdict.Kind.IGNORED) {
+                                    // 达成 / 无法达成 ⇒ 溯源行落进本轮「已完成」折叠区
+                                    if (verdict.trace() != null) {
+                                        state.appendMessage(verdict.trace());
                                     }
-                                    continue;
+                                    // 达成 / impossible / 评估器失败 / 取消 ⇒ 本结果不再产生 blocking 注入
+                                    if (verdict.kind() != com.nexusai.application.agent.goal.GoalService.GoalVerdict.Kind.NOT_MET) {
+                                        continue;
+                                    }
+                                    goalNotMet = true;
                                 }
                                 if (r.blockingError() != null) {
                                     // [hooks_v3 5-8/5-W4-1] Stop 阻塞文案前缀 · CC getStopHookMessage
@@ -9220,37 +9368,12 @@ public class LlmAgentLoop implements AgentLoop {
                                     //   实时落库 + 前端渲染成用户自己的气泡（污染 lastUserMessageId 归属）。
                                     //   模型面不受影响（isMeta 与 isVisibleInTranscriptOnly 一样绝不用于模型侧过滤）。
                                     state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
-                                    // [goal V253] 未达成回写 · 对齐 CC：iterations++ + lastReason=reason
-                                    //   （reason 即注入下一轮的那句话，也是 UI 目标头「最近一次判定」的来源）
-                                    if (ctx.goalService() != null) {
-                                        ctx.goalService().recordNotMet(state.sessionId(), r.stopReason());
-                                    }
                                 }
                             }
-                            // [goal V253] 达成消费 · 对齐 CC：ok=true（success 且无 blockingError）
-                            //   ⇒ 目标达成、摘 hook。
-                            //   ⚠️ 判据必须精确：不能用「没有 blockingError」当达成 ——
-                            //   goal hook 被后台门控摘掉、或评估器报错（non_blocking_error）时，
-                            //   同样「没有 blockingError」，但那不是达成。必须存在一个
-                            //   **PromptHook 型**的 SUCCESS 结果（goal hook 的载体）。
-                            if (ctx.goalService() != null && ctx.goalService().hasActiveGoal(state.sessionId())) {
-                                boolean goalHookMet = loopStopCollect.results().stream()
-                                    .filter(java.util.Objects::nonNull)
-                                    .anyMatch(r -> r.hook() instanceof com.nexusai.application.agent.permission.hook.PromptHook
-                                        && r.outcome() == GenericHook.HookOutcome.SUCCESS
-                                        && !Boolean.TRUE.equals(r.impossible()));
-                                if (goalHookMet) {
-                                    com.nexusai.domain.session.SessionGoal g =
-                                        ctx.goalService().recordAchieved(state.sessionId());
-                                    // [goal V253] 溯源行落进本轮「已完成」折叠区
-                                    //   （role=user + isMeta + author='attachment' + subtype='goal_status'
-                                    //    ⇒ 前端 isSystemInjectedRow 天然覆盖，不开新轮、不当用户气泡）
-                                    if (g != null) {
-                                        state.appendMessage(ctx.goalService().buildTerminalTraceMessage(g));
-                                    }
-                                    log.info("[goal] 评估器判定条件已满足 → 目标达成（session={}）", state.sessionId());
-                                }
-                            }
+                            // [B1/B2 2026-11-04] 达成 / impossible / 未达成 的消费已在上面
+                            //   GoalService.consumeStopHookResult 统一处理（判据 = hook 身份 +
+                            //   condition 比对，对齐 CC v2.1.318）。旧实现此处按「任意 PromptHook
+                            //   SUCCESS」判达成 ⇒ 用户自配 hook 成功会误判目标达成，已删除。
                             // [IMP-HOOKS-S5 D-11 ①] hookCount>0 → stop_hook_summary + hookErrors 通知
                             //   （镜像 §14 :4703-4716 · CC stopHooks.ts:298-317）
                             if (loopStopCollect.hookCount() > 0) {
@@ -9284,6 +9407,32 @@ public class LlmAgentLoop implements AgentLoop {
                                     //   上限内对齐 CC（每 turn 边界 hook 重跑一次，stop_hook_active=true
                                     //   告知 hook 自愈，hooks.ts:3683）；超上限 = 恒阻塞，Java 以安全阀终止
                                     //   防崩溃（Java 独有基础设施，同 MAX_STRUCTURED_OUTPUT_RETRIES 模式）。
+                                    //
+                                    // [B3 2026-11-04] **全部 blocking 都来自 goal hook** ⇒ 按 CC v2.1.318
+                                    //   的语义「优雅暂停」而不是报错终止：
+                                    //     CC: 撞 CLAUDE_CODE_STOP_HOOK_BLOCK_CAP → 打 warning
+                                    //         「A hook blocked the turn from ending N consecutive times —
+                                    //          overriding and ending turn.」→ return {reason:"completed",
+                                    //          goalPass:"not_met"} → kg()/bg("not_met") → {kind:"pause",
+                                    //          cause:"goal_check_capped"} → 目标 pause + 文案
+                                    //         「Goal paused · goal checks kept finding it unmet this turn ·
+                                    //          send a message to continue」
+                                    //   本仓旧实现 setError + STOP_HOOK_BLOCKING_LIMIT_EXCEEDED + break
+                                    //   ⇒ 用户看到「失败」而不是「目标暂停、发消息继续」。
+                                    //
+                                    //   ⚠️ 混有用户自配 hook 的 blocking 时**保持原安全阀**：那种持续阻塞
+                                    //   几乎一定是配置错误（CC 原文警告语也是这么说的），报错才有诊断价值。
+                                    if (goalNotMet && !hasNonGoalBlocking(loopStopCollect, ctx.goalService(), state.sessionId())) {
+                                        String pauseReason = "goal checks kept finding it unmet this turn";
+                                        if (ctx.goalService() != null) {
+                                            ctx.goalService().recordPaused(state.sessionId(), pauseReason);
+                                        }
+                                        state.setExitReason(ExitReason.NORMAL);
+                                        log.warn("[LlmAgentLoop] turn={} goal 评估连续未达成 {} 次 → 目标暂停"
+                                                + "（对齐 CC goal_check_capped；发消息即可继续）",
+                                            state.turnCount(), stopHookBlockingReentries + 1);
+                                        break;
+                                    }
                                     state.setError("Stop hook repeatedly blocked continuation after "
                                         + (stopHookBlockingReentries + 1) + " re-entries (safety valve "
                                         + "MAX_STOP_HOOK_BLOCKING_REENTRIES=" + maxStopHookBlockingReentries() + ")");
@@ -9596,12 +9745,40 @@ public class LlmAgentLoop implements AgentLoop {
                         // [P1-4] 语义分流（CC stopHooks.ts:333-344：preventedContinuation 优先于
                         //   blockingErrors 早返）。Java exit=2 结果双置 preventContinuation+blockingError，
                         //   故以 blockingError 为主信号（先判）→ 重入；纯 preventContinuation → 优雅终止。
+                        //
+                        // [B2 2026-11-04] **§14 也消费 goal 三态** —— 旧实现只在此注入 blockingError、
+                        //   零 goal 回写 ⇒ 走 §14 的轮次即使评估器判了达成也不落终态（UI 永远显示
+                        //   「还在追」）。两处共用 GoalService.consumeStopHookResult 后结构上不会漂移。
                         boolean anyBlocking = false;
+                        boolean goalNotMetHere = false;
+                        java.util.List<GenericHook.HookResult> plainBlocking = new java.util.ArrayList<>();
                         for (GenericHook.HookResult r : stopCollect.results()) {
-                            if (r != null && r.blockingError() != null) {
-                                anyBlocking = true;
-                                break;
+                            if (r == null) {
+                                continue;
                             }
+                            com.nexusai.application.agent.goal.GoalService.GoalVerdict verdict =
+                                ctx.goalService() == null ? null
+                                    : ctx.goalService().consumeStopHookResult(state.sessionId(), r);
+                            if (verdict != null && verdict.kind()
+                                    != com.nexusai.application.agent.goal.GoalService.GoalVerdict.Kind.IGNORED) {
+                                if (verdict.trace() != null) {
+                                    state.appendMessage(verdict.trace());
+                                }
+                                if (verdict.kind() == com.nexusai.application.agent.goal.GoalService.GoalVerdict.Kind.NOT_MET) {
+                                    goalNotMetHere = true;
+                                }
+                                // goal 消费过的结果不再走通用 blocking 注入（避免重复反馈）
+                                continue;
+                            }
+                            if (r.blockingError() != null) {
+                                anyBlocking = true;
+                                plainBlocking.add(r);
+                            }
+                        }
+                        // goal hook 判未达成且没有其它 blocking ⇒ 同样进入重入路径（reason 已由
+                        //   consumeStopHookResult 写进 lastReason，这里只需触发下一轮）
+                        if (goalNotMetHere) {
+                            anyBlocking = true;
                         }
                         if (!anyBlocking && stopCollect.preventedContinuation()) {
                             // [P1-4] 通道 2: preventContinuation → 优雅终止（CC stopHooks.ts:333-336）
@@ -9612,26 +9789,36 @@ public class LlmAgentLoop implements AgentLoop {
                         } else if (anyBlocking) {
                             // [P1-4] 通道 1: blockingError → 注入 LLM 反馈, 重入 loop
                             // [R6] CC stopHooks.ts:240-247 逐 result blockingErrors.push → 全部注入
-                            for (GenericHook.HookResult r : stopCollect.results()) {
-                                if (r != null && r.blockingError() != null) {
-                                    // [hooks_v3 5-8/5-W4-1] Stop 阻塞文案前缀 · CC getStopHookMessage
-                                    //   'Stop hook feedback:\n' 前缀（hooks.ts:1894-1896）。
-                                    String blockingText = HookEvent.getStopHookMessage(r.blockingError());
-                                    log.info("HOOK Stop blockingError: {}", blockingText);
-                                    // [P2-14 2026-09-12] isMeta=true · 同 in-loop 点 · CC original:
-                                    //   stopHooks.ts:267-271 createUserMessage({..., isMeta: true})
-                                    //   （"Hide from UI (shown in summary message instead)"）。
-                                    state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
-                                }
+                            for (GenericHook.HookResult r : plainBlocking) {
+                                // [hooks_v3 5-8/5-W4-1] Stop 阻塞文案前缀 · CC getStopHookMessage
+                                //   'Stop hook feedback:\n' 前缀（hooks.ts:1894-1896）。
+                                String blockingText = HookEvent.getStopHookMessage(r.blockingError());
+                                log.info("HOOK Stop blockingError: {}", blockingText);
+                                // [P2-14 2026-09-12] isMeta=true · 同 in-loop 点 · CC original:
+                                //   stopHooks.ts:267-271 createUserMessage({..., isMeta: true})
+                                //   （"Hide from UI (shown in summary message instead)"）。
+                                state.appendMessage(toMessage(Role.user, blockingText, null, null, true));
                             }
                             if (stopHookBlockingReentries >= maxStopHookBlockingReentries()) {
                                 // [SH-02 E4] §14 重入上限安全阀（同 in-loop）· 防 StackOverflowError
-                                state.setError("Stop hook repeatedly blocked continuation after "
-                                    + (stopHookBlockingReentries + 1) + " re-entries (safety valve "
-                                    + "MAX_STOP_HOOK_BLOCKING_REENTRIES=" + maxStopHookBlockingReentries() + ")");
-                                state.setExitReason(ExitReason.STOP_HOOK_BLOCKING_LIMIT_EXCEEDED);
-                                log.error("[LlmAgentLoop] turn={} §14 stop-hook blocking 重入超限: reentries={} max={} → 终止（安全阀防 StackOverflowError）",
-                                    state.turnCount(), stopHookBlockingReentries, maxStopHookBlockingReentries());
+                                // [B3 2026-11-04] 同 in-loop：全部 blocking 来自 goal hook ⇒ 优雅暂停。
+                                if (goalNotMetHere && !hasNonGoalBlocking(stopCollect, ctx.goalService(), state.sessionId())) {
+                                    String pauseReason = "goal checks kept finding it unmet this turn";
+                                    if (ctx.goalService() != null) {
+                                        ctx.goalService().recordPaused(state.sessionId(), pauseReason);
+                                    }
+                                    state.setExitReason(ExitReason.NORMAL);
+                                    log.warn("[LlmAgentLoop] turn={} §14 goal 评估连续未达成 {} 次 → 目标暂停"
+                                            + "（对齐 CC goal_check_capped；发消息即可继续）",
+                                        state.turnCount(), stopHookBlockingReentries + 1);
+                                } else {
+                                    state.setError("Stop hook repeatedly blocked continuation after "
+                                        + (stopHookBlockingReentries + 1) + " re-entries (safety valve "
+                                        + "MAX_STOP_HOOK_BLOCKING_REENTRIES=" + maxStopHookBlockingReentries() + ")");
+                                    state.setExitReason(ExitReason.STOP_HOOK_BLOCKING_LIMIT_EXCEEDED);
+                                    log.error("[LlmAgentLoop] turn={} §14 stop-hook blocking 重入超限: reentries={} max={} → 终止（安全阀防 StackOverflowError）",
+                                        state.turnCount(), stopHookBlockingReentries, maxStopHookBlockingReentries());
+                                }
                             } else {
                                 state.markNeedsFollowUp();
                                 // [H7-arch Phase 5-2 B1] 重入点：loop(ctx, params, state, uuids,
@@ -11825,6 +12012,37 @@ public class LlmAgentLoop implements AgentLoop {
         hookRegistry.registerAttributionHooks(hooks);
     }
 
+    /**
+     * [产物采集 2026-11-04] 注册产物 / 来源采集 PostToolUse hooks。
+     *
+     * <p><b>WHY 是 hook 而不是工具内埋点</b>（用户 2026-11-04 裁定）：原实现是在
+     * {@code WebSearchTool} / {@code WebFetchTool} 里各埋一个点、在
+     * {@code SessionFilesRecorder.record()} 里顺带调一次 ⇒ 每加一个工具就要补一次，
+     * 且子代理 / MCP 工具走别的路径容易漏。改成 PostToolUse hook 后一个 hook 覆盖所有工具
+     * （子代理与主循环共用 {@code StreamingToolExecutor.executePostToolUse}）。
+     *
+     * <p><b>⛔ 换不掉交付物目录扫描</b>：Bash / cp / 脚本写出的文件工具 hook 看不见
+     * （Bash 入参只有 {@code command} 字符串）⇒ 那条路由
+     * {@code SessionArtifactService.startTurnWatch}（轮内每 2s 扫目录）承担。
+     *
+     * <p><b>策略闸门</b>：本 hook 是 programmatic PostToolUse hook ⇒
+     * {@code policySettings.disableAllHooks=true} 时与其它 hook 一起被跳过（用户 2026-11-04
+     * 拍板「跟着停」，与 CC 语义一致，不另开第二条执行路径）。
+     *
+     * <p>同名重复注册 = LinkedHashMap.put 覆盖，幂等；每会话 run() 入口注册安全。
+     */
+    private void registerArtifactCollectionHooks() {
+        if (hookRegistry == null || sessionArtifactService == null) {
+            return;
+        }
+        // ⭐ 传 stateRegistry：hook 要按 sessionId 取本轮 userMessageId 做归属
+        //   （ToolUseContext 只带 sessionId，没有 messageId）。
+        com.nexusai.application.agent.permission.hook.ArtifactCollectionHooks hooks =
+            new com.nexusai.application.agent.permission.hook.ArtifactCollectionHooks(
+                sessionArtifactService, sessionAgentStateRegistry);
+        hooks.registerArtifactCollectionHooks(hookRegistry);
+    }
+
     // ── H3 v4 Gap①: executeEvent message attachment 生产者侧注入 ──
     /**
      * [H3 v4 修复 Gap①] 把 executeEvent 结果的 message attachment 注入 LLM 可见通道
@@ -11990,6 +12208,41 @@ public class LlmAgentLoop implements AgentLoop {
             return hookEventName;
         }
         return "Hook";
+    }
+
+    /**
+     * [B3 2026-11-04] 本次 Stop hook 结果里是否有<b>非 goal hook</b> 产生的 blockingError。
+     *
+     * <p><b>WHY 需要</b>：撞 block-cap 时要把两种情形分开 ——
+     * <ul>
+     *   <li>全部 blocking 来自 goal hook ⇒ 按 CC 语义「优雅暂停」（评估器只是还没看到满足条件）；
+     *   </li>
+     *   <li>混有用户自配 hook 的 blocking ⇒ 保持原安全阀报错（那种持续阻塞几乎一定是配置错误，
+     *       CC 的警告语 "check stop_hook_active in the input and return success while it's true"
+     *       也是给配置错误的提示）。</li>
+     * </ul>
+     *
+     * @param collect     Stop hook 收集结果
+     * @param goalService 目标服务（null = 未接线 ⇒ 无法判定身份，保守按「非 goal」处理）
+     * @param sessionId   会话 ID（用于 goal hook 身份校验）
+     * @return true = 存在非 goal hook 的 blocking
+     */
+    private static boolean hasNonGoalBlocking(HookRegistry.StopHookCollectResult collect,
+                                              com.nexusai.application.agent.goal.GoalService goalService,
+                                              String sessionId) {
+        if (collect == null || collect.results() == null) {
+            return false;
+        }
+        for (GenericHook.HookResult r : collect.results()) {
+            if (r == null || r.blockingError() == null) {
+                continue;
+            }
+            // goalService 未接线 ⇒ 无法判定身份 ⇒ 保守按「非 goal」处理（保持原安全阀）
+            if (goalService == null || !goalService.isGoalHookResult(sessionId, r)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     /**
@@ -13348,13 +13601,69 @@ public class LlmAgentLoop implements AgentLoop {
     private static List<Tool> applySessionAgentToolPolicy(String sessionId, List<Tool> available) {
         java.util.Optional<java.util.List<String>> noList = java.util.Optional.empty();
         com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
+
+        // ── 「引入知识库」开关（V278 / Q1 拍板）────────────────────────
+        //   ⭐ 只影响**工具可见性**：打开时在默认池基础上**额外点名** 4 个 KB 专属工具。
+        //   ⛔ 不改 loop() 的任何执行逻辑。
+        //   ⚠️ 必须用「默认池的显式名单 + 4 个 KB 工具名」而不是「池里全部工具名」：
+        //   后者会把**其它**专属工具也一并放行（它们本该被隐藏）。
+        boolean kbToolsOn = row != null && Integer.valueOf(1).equals(row.getKbToolsEnabled());
         String agentType = row != null ? row.getMainThreadAgent() : null;
+        // ⭐ 必须先记「输入」：开关是否打开、池里原本有几个 —— 否则策略生效与否无从判断
+        //   （tools=96 是过滤器之前的全量池，不能当判据）。
+        if (log.isInfoEnabled()) {
+            int kbPresent = 0;
+            if (available != null) {
+                for (Tool tool : available) {
+                    if (tool != null && KB_TOOL_NAMES.contains(tool.name())) {
+                        kbPresent++;
+                    }
+                }
+            }
+            log.info("[LlmAgentLoop] 会话工具策略入口: session={} kbToolsEnabled={} agentType={} "
+                    + "池={} 池内知识库工具={}", sessionId, kbToolsOn, agentType,
+                    available == null ? -1 : available.size(), kbPresent);
+        }
         if (agentType == null || agentType.isBlank()) {
             if (log.isDebugEnabled()) {
-                log.debug("[LlmAgentLoop] 会话未绑定主线程 agent → 默认池装配（隐藏专属工具）: session={} 池 {}",
+                log.debug("[LlmAgentLoop] 会话未绑定主线程 agent → {}装配: session={} 池 {}",
+                        kbToolsOn ? "默认池+知识库工具" : "默认池（隐藏专属工具）",
                         sessionId, available.size());
             }
-            return com.nexusai.application.agent.tool.AgentToolPolicy.apply(available, noList, noList);
+            if (kbToolsOn) {
+                java.util.Optional<java.util.List<String>> withKb =
+                        com.nexusai.application.agent.tool.AgentToolPolicy
+                                .defaultPoolPlus(available, KB_TOOL_NAMES);
+                if (withKb.isPresent()) {
+                    List<Tool> scoped = com.nexusai.application.agent.tool.AgentToolPolicy.apply(
+                            available, withKb, noList);
+                    if (log.isInfoEnabled()) {
+                        int kept = 0;
+                        for (Tool tool : scoped) {
+                            if (tool != null && KB_TOOL_NAMES.contains(tool.name())) {
+                                kept++;
+                            }
+                        }
+                        log.info("[LlmAgentLoop] 默认池+知识库工具: session={} 名单={} 结果={} 知识库工具={}",
+                                sessionId, withKb.get().size(), scoped.size(), kept);
+                    }
+                    return scoped;
+                }
+                log.warn("[LlmAgentLoop] 知识库开关已开但默认池为空，回落到通配规则: session={}", sessionId);
+            }
+            List<Tool> base = com.nexusai.application.agent.tool.AgentToolPolicy.apply(
+                    available, noList, noList);
+            if (log.isInfoEnabled()) {
+                int kept = 0;
+                for (Tool tool : base) {
+                    if (tool != null && KB_TOOL_NAMES.contains(tool.name())) {
+                        kept++;
+                    }
+                }
+                log.info("[LlmAgentLoop] 默认池（隐藏专属工具）: session={} 结果={} 知识库工具={}",
+                        sessionId, base.size(), kept);
+            }
+            return base;
         }
         com.nexusai.application.agent.tool.impl.SubagentTool subagentTool = findSubagentTool();
         if (subagentTool == null) {

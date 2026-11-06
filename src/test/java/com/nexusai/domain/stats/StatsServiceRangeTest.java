@@ -413,6 +413,53 @@ class StatsServiceRangeTest {
     }
 
     // ══════════════════════════════════════════════════════════════════════════════════════════
+    // [/goal tokens] 目标期间真实消耗 —— 目标头「已消耗」的唯一数据源
+    // ══════════════════════════════════════════════════════════════════════════════════════════
+
+    /**
+     * WHY：目标头上那个「X tok」此前显示的是 {@code tokensAtStart}（设定时刻的基线快照），
+     * 于是「目标期间真的烧了多少」永远看不到（实测真机目标显示 0 tok，而同一时段明细表里
+     * 是 134k output token）。本用例钉死：只算 {@code started_at >= since}、只算该会话、
+     * 只算 output（⛔ 不含 input）、不按 category 过滤（子代理消耗同样算）。
+     */
+    @Test
+    @DisplayName("[goal tokens] outputTokensSince：只算该会话、since 之后、output（子代理/旁路一并计入）")
+    void outputTokensSinceSumsOutputAfterBound() {
+        long since = epochMs(2026, 10, 14, 0, 0);
+        // 夹具已有：uc-b = S1 子代理 10-14 09:00 output=50；uc-a = S1 主 agent 10-13 10:00 output=100
+        // 再加一条 S1 旁路调用（SIDE_CALL）在 10-14 12:00 output=7 —— 必须被计入（不按 category 过滤）
+        usageMapper.insertSelective(priced("uc-side", S1, SUB_AGENT, "SIDE_CALL", S1, 1, "skill-x",
+            MODEL_OPENAI, local(2026, 10, 14, 12, 0),
+            11, 7, 0, 0, 0.01, 0.01, 0.0, 0.0, 0.0, 0.01, "SETTLED", "UPSTREAM", 0, 20L));
+
+        assertThat(stats().outputTokensSince(S1, since))
+            .as("10-14 之后 S1 的 output = 子代理 50 + 旁路 7；uc-a 在 10-13 被 since 排除")
+            .isEqualTo(57L);
+        assertThat(stats().outputTokensSince(S2, since))
+            .as("S2 的 10-14 行 uc-c(30) + 10-16 行 uc-d(5) = 35；S1 的行一律不计入（按 session_id 隔离）")
+            .isEqualTo(35L);
+    }
+
+    /** WHY：新设目标还没跑过任何调用时必须是 0（而不是 null）—— 「真的是 0」要显示得出来。 */
+    @Test
+    @DisplayName("[goal tokens] 无任何明细行 → 0（不是 null）")
+    void outputTokensSinceReturnsZeroWhenNoRows() {
+        assertThat(stats().outputTokensSince("sess-no-calls", epochMs(2026, 10, 1, 0, 0)))
+            .as("查询成功但无匹配行 = 真 0；null 只留给「取不到」")
+            .isEqualTo(0L);
+    }
+
+    /** WHY：区分「查不到」与「真为 0」是前端「不渲染 vs 显示 0」的唯一依据。 */
+    @Test
+    @DisplayName("[goal tokens] mapper 未装配 / 参数非法 → null（前端据此不渲染，⛔ 不显示 0）")
+    void outputTokensSinceReturnsNullWhenUnavailable() {
+        StatsService bare = new StatsService();   // 未注入 mapper
+        assertThat(bare.outputTokensSince(S1, epochMs(2026, 10, 14, 0, 0))).isNull();
+        assertThat(stats().outputTokensSince(S1, 0L)).as("since<=0 视为无有效下界").isNull();
+        assertThat(stats().outputTokensSince("  ", epochMs(2026, 10, 14, 0, 0))).isNull();
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════════════════
     // 夹具构造
     // ══════════════════════════════════════════════════════════════════════════════════════════
 

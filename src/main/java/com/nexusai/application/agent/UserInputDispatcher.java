@@ -267,14 +267,36 @@ public class UserInputDispatcher {
      * @param kind  "text" | "skip"（compact 本批次 TODO 未接入）
      * @param value text 结果值（skip → null）
      */
-    public record LocalCommandResult(String kind, String value) {
+    public record LocalCommandResult(String kind, String value, String prompt) {
+
+        public LocalCommandResult(String kind, String value) {
+            this(kind, value, null);
+        }
 
         public static LocalCommandResult text(String value) {
-            return new LocalCommandResult("text", value);
+            return new LocalCommandResult("text", value, null);
         }
 
         public static LocalCommandResult skip() {
-            return new LocalCommandResult("skip", null);
+            return new LocalCommandResult("skip", null, null);
+        }
+
+        /**
+         * [goal V253] 「设定目标 ⇒ 触发一轮执行」形态 · 对齐 CC 的 {@code {type:"query"}} 返回。
+         *
+         * <p><b>WHY 需要第三种 kind</b>：CC 的 {@code /goal} 命令（{@code local-jsx} 型）调用后
+         * 返回 {@code {type:"query", value:"Goal set: <c>", prompt:kickoff}}，
+         * {@code processSlashCommand} 据此把 kickoff 提示词当 <b>isMeta 的 user 消息</b>注入并
+         * {@code shouldQuery:true} ⇒ <b>立刻跑一轮 LLM</b>，模型看到目标就开始朝它工作。
+         *
+         * <p>本仓原实现只有 text/skip 两种 ⇒ {@code /goal <条件>} 只记下目标、<b>不执行</b>
+         * （用户实测发现的缺口）。
+         *
+         * @param value 命令回显文本（{@code Goal set: <c>}）
+         * @param prompt kickoff 提示词（作为 isMeta 的 user 消息注入 ⇒ 模型侧可见、UI 隐藏）
+         */
+        public static LocalCommandResult query(String value, String prompt) {
+            return new LocalCommandResult("query", value, prompt);
         }
     }
 

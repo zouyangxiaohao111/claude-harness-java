@@ -71,37 +71,19 @@ public class WebFetchTool implements Tool {
     public static final String NAME = "WebFetch";
 
     /**
-     * [2026-11-02 用户裁定「在 websearch / webfetch 中就存好当前」] 来源**当场入库**。
+     * [2026-11-04 产物采集改走 hook] 来源采集**已从本工具移出** → 改由
+     * {@code ArtifactCollectionHooks}（PostToolUse hook）统一采集。
      *
-     * <p><b>WHY 在工具里存，而不是轮末扫消息</b>：
-     * <ul>
-     *   <li>工具**本来就知道** url（入参就是它）；轮末再回头扫消息是绕远路；</li>
-     *   <li>存入时机 = 抓取成功那一刻 ⇒ 前端**即时**能看到来源，不用等轮末抽取；</li>
-     *   <li>不需要「结果 JSON 是什么形状」这层假设（轮末扫描要解析结果结构才拿得到 url）。</li>
-     * </ul>
+     * <p><b>WHY 移出</b>（用户 2026-11-04 裁定）：工具内埋点每加一个工具就要补一次，
+     * 且子代理 / MCP 工具走别的路径容易漏；hook 一个覆盖所有工具
+     * （子代理与主循环共用 {@code StreamingToolExecutor.executePostToolUse}）。
      *
-     * <p>{@code @Autowired(required=false)}：单测直构时无 bean ⇒ 跳过入库（工具行为零变化）。
+     * <p>命中 url 仍取自本工具的<b>工具结果</b>（{@code buildOutput} 把 url 放在<b>顶层</b>）
+     * —— hook 按形状递归收集，语义与原实现等价。
+     *
+     * <p>⛔ 旧的 {@code recordSource} 方法与 {@code artifactService} 字段已删除
+     * （规则七：显式择一，不留双写者）。
      */
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private com.nexusai.application.session.SessionArtifactService artifactService;
-
-    /** 测试注入缝（生产走字段注入）。 */
-    public void setArtifactService(com.nexusai.application.session.SessionArtifactService svc) {
-        this.artifactService = svc;
-    }
-
-    /** 记一条来源（fail-soft：⛔ 采集失败绝不影响抓取结果返回）。 */
-    private void recordSource(com.nexusai.application.agent.tool.ToolUseContext ctx, String url) {
-        if (artifactService == null || ctx == null || ctx.sessionId() == null) {
-            return;
-        }
-        try {
-            String title = url;   // 标题稍后由前端/用户判断；url 本身已是可读标识
-            artifactService.recordSource(ctx.sessionId(), title, url, null);
-        } catch (Throwable t) {
-            log.warn("[WebFetchTool] 来源入库失败（不影响抓取） url={}: {}", url, t.toString());
-        }
-    }
 
     /** 弱模型摘要 querySource · 对齐 CC WebFetchTool/utils.ts:508 {@code querySource: 'web_fetch_apply'}。 */
     private static final String QUERY_SOURCE = "web_fetch_apply";
@@ -326,6 +308,60 @@ public class WebFetchTool implements Tool {
     }
 
     /**
+     * 抓取网页正文（Markdown）· <b>供问答链（RAG）复用，不经过工具调用路径</b>。
+     *
+     * <p><b>WHY 要这个方法</b>：源侧 {@code chat_pipeline/web_fetch.go} 里的 WEB_FETCH 阶段
+     * 就是「把检索结果里的网页 URL 换成整页正文」。本仓的抓取能力全在工具里，
+     * 但问答链没有工具上下文（没有 {@code ToolUseBlock} / {@code ToolUseContext}，
+     * 也不该伪造一个）⇒ 需要一个纯函数形态的入口。
+     *
+     * <p><b>与 {@link #execute} 的区别</b>（⛔ 刻意不共享执行路径）：
+     * <ul>
+     *   <li>不做 prompt 二次总结（问答链自己拼上下文）</li>
+     *   <li>不做 redirect 提示（返回 null，调用方保留原 snippet）</li>
+     *   <li>不写缓存/不落库/不推流/不采集来源</li>
+     * </ul>
+     * ⇒ 现有工具行为<b>零变化</b>（本方法是新增旁路，execute 一行未改）。
+     *
+     * <p><b>安全链保留</b>：仍走 {@link #resolveSecurity()}（SSRF 校验 / 域黑名单 / egress 拦截 /
+     * 大小上限 / 代理），与工具路径同一条链 —— 问答链不是绕过安全检查的后门。
+     *
+     * @param url 目标 URL（必须 http/https）
+     * @return Markdown 正文；URL 非法 / 被抓取链拒绝 / 失败 → {@code null}（调用方保留原内容）
+     */
+    public String fetchMarkdown(String url) {
+        if (url == null || url.isBlank()) {
+            return null;
+        }
+        if (!url.startsWith("http://") && !url.startsWith("https://")) {
+            log.warn("[WebFetchTool] RAG 抓取拒绝非 http(s) URL: {}", url);
+            return null;
+        }
+        try {
+            if ("deepseek".equals(currentFetchEngine())) {
+                SettingsDto s = settingsService != null ? settingsService.get() : null;
+                String key = s != null && s.apiKey() != null ? s.apiKey() : "";
+                String base = s != null && s.websearchBaseUrl() != null && !s.websearchBaseUrl().isBlank()
+                    ? s.websearchBaseUrl().trim() : DeepSeekFetchEngine.DEFAULT_BASE_URL;
+                String proxy = s != null ? s.proxy() : null;
+                DeepSeekFetchEngine.Page page = new DeepSeekFetchEngine(base, key, proxy, null).fetch(url);
+                return page == null ? null : page.content();
+            }
+            Object outcome = resolveSecurity().getURLMarkdownContent(url);
+            if (outcome instanceof WebFetchSecurity.FetchedContent fc) {
+                return fc.content();
+            }
+            // 跨 host 重定向不跟随（SSRF 防护）⇒ 保留原 snippet，交给调用方决定
+            log.info("[WebFetchTool] RAG 抓取遇到重定向，不跟随: {}", url);
+            return null;
+        } catch (Exception e) {
+            // 抓取失败是常态（站点拒绝/超时/被安全链拦）⇒ 单条失败不该影响整轮
+            log.warn("[WebFetchTool] RAG 抓取失败: url={} err={}", url, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
      * [websearch-domaincheck] 当前域预检端点源（DB settings.websearch_domain_check_url，V39 列）· 跳过预检语义。
      *
      * <p>{@link SettingsService} 未注入（测试/孤立运行）→ null（默认跳过预检）；{@code get()}
@@ -538,8 +574,8 @@ public class WebFetchTool implements Tool {
                 return handleRedirect(call, url, prompt, ri, start);
             }
             WebFetchSecurity.FetchedContent fc = (WebFetchSecurity.FetchedContent) outcome;
-            // [2026-11-02] 抓取成功 ⇒ 当场把该 URL 记为「来源」（不用等轮末抽取）
-            recordSource(ctx, url);
+            // [2026-11-04] 来源采集已移到 PostToolUse hook（ArtifactCollectionHooks）——
+            //   本工具只负责把 url 放进结果（buildOutput 顶层），采集方从结果里收 url。
             boolean isNonInteractive = ctx != null && ctx.isNonInteractiveSession();
             // [S1-T7] agent 归因上下文 = **工具形参 ctx 的显式字段**（两套载体收口到 TUC 单一来源；
             //   工具线程上 ThreadLocal 不可达）。null → 等价 CC agentContext.ts:170 无 invokingRequestId。

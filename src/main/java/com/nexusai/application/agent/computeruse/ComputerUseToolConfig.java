@@ -540,15 +540,17 @@ public class ComputerUseToolConfig {
                 new ComputerUseMiddleClickTool(mouseActions, geometryStore,
                         coordinateMode, grantStore, foregroundAppResolver),
                 // [Phase 1c] 文本输入（KEYEVENTF_UNICODE 逐字符注入，无特殊键语义）
-                new ComputerUseTypeTool(keyboard, ComputerUseSleeper.REAL, grantStore, foregroundAppResolver),
+                new ComputerUseTypeTool(keyboard, ComputerUseSleeper.REAL, grantStore,
+                        foregroundAppResolver, effectiveSnapshotStore),
                 // [Phase 1c] 按键 / 组合键（修饰键正序按下、逆序释放）
-                new ComputerUseKeyTool(keyboard, ComputerUseSleeper.REAL, grantStore, foregroundAppResolver),
+                new ComputerUseKeyTool(keyboard, ComputerUseSleeper.REAL, grantStore,
+                        foregroundAppResolver, effectiveSnapshotStore),
                 // [Phase 2a] 滚轮滚动（Windows 侧忽略坐标 —— 对齐 CCB）
                 new ComputerUseScrollTool(mouseActions, geometryStore, coordinateMode,
-                        grantStore, foregroundAppResolver, effectiveMouseState),
+                        grantStore, foregroundAppResolver, effectiveMouseState, effectiveSnapshotStore),
                 // [Phase 2a] 拖拽（按下 → 缓动移动 → 抬起；异常路径不卡键）
                 new ComputerUseLeftClickDragTool(animator, geometryStore, coordinateMode,
-                        grantStore, foregroundAppResolver, effectiveMouseState),
+                        grantStore, foregroundAppResolver, effectiveMouseState, effectiveSnapshotStore),
                 // [Phase 2a] 纯移动鼠标（不点击）
                 new ComputerUseMouseMoveTool(mouseActions, geometryStore, coordinateMode,
                         grantStore, foregroundAppResolver, effectiveMouseState),
@@ -562,17 +564,21 @@ public class ComputerUseToolConfig {
         //   ⇒ Windows 仍要求先 bind 窗口（UIA 需要 hwnd），macOS 不需要。
         if (uiaService != null) {
             tools.add(new ComputerUseObserveTool(uiaService, effectiveSnapshotStore,
-                    platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null));
+                    platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null,
+                    capturer));
             tools.add(new ComputerUseClickElementTool(uiaService, windowOps, effectiveBindingStore,
-                    effectiveSnapshotStore, effectiveConfirmationStore));
+                    effectiveSnapshotStore, effectiveConfirmationStore,
+                    platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null));
             tools.add(new ComputerUseTypeIntoElementTool(uiaService, windowOps, effectiveBindingStore,
-                    effectiveSnapshotStore, effectiveConfirmationStore));
+                    effectiveSnapshotStore, effectiveConfirmationStore,
+                    platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null));
             // ── [macOS AX] 任意 AX 动作 + 条件等待（dsh computer_perform_action / computer_wait）──
             //   Windows 侧无等价实现（UIA 动作集不是统一名字空间；条件等待需轮询 AX 树）
             //   ⇒ 仅在实现了对应能力的平台注册（避免注册「永远调不通」的工具）。
             if (platform.kind() == ComputerUsePlatform.Kind.MACOS) {
                 tools.add(new ComputerUsePerformActionTool(uiaService, effectiveSnapshotStore,
-                        effectiveConfirmationStore));
+                        effectiveConfirmationStore,
+                        platform.kind() == ComputerUsePlatform.Kind.MACOS ? new MacOsTccChecker() : null));
                 tools.add(new ComputerUseWaitForConditionTool(uiaService));
             }
         }

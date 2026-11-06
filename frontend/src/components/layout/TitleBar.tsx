@@ -27,15 +27,21 @@ export function TitleBar({ onToggleSidebar, sidebarCollapsed }: {
     return () => { unsub?.() }
   }, [])
 
+  // ⛔ 不能保留 onDoubleClick={() => toggleMaximize()}：`.topbar` 上加了
+  //   `data-tauri-drag-region` 后，Tauri 的 drag.js 在 Windows 上对双击自己发
+  //   `internal_toggle_maximize`（drag.js: `e.detail === 2 ? 'internal_toggle_maximize'`）
+  //   ⇒ 两个处理器各切一次 = 互相抵消 = 双击没反应。双击最大化统一交给 Tauri。
   return (
-    <div className="titlebar" onDoubleClick={() => void toggleMaximize()}>
+    <div className="titlebar">
       <div className="traffic">
         <button
           type="button"
           className="traffic-btn c-red"
           onClick={() => void closeWindow()}
-          title="关闭窗口"
-          aria-label="关闭窗口"
+          // [2026-11-04 用户裁定] 点红钮不再退出，而是隐藏到系统托盘；
+          //   真退出走托盘右键菜单「退出 NexusAI」（Rust 侧 main.rs 的 HideOnClose 开关）。
+          title="隐藏到托盘（退出请右键托盘图标）"
+          aria-label="隐藏到托盘"
         >
           <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.4" strokeLinecap="round">
             <path d="M2.5 2.5L7.5 7.5M7.5 2.5L2.5 7.5" />

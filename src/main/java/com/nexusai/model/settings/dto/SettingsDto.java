@@ -193,5 +193,128 @@ public record SettingsDto(
     //   用户裁定 2026-10-21：普通用户不该看到「市场管理」（版本历史/回滚/全量清单），
     //   但**上架**所有人可用（市场弹窗「＋ 添加」）。登录权限上线前先用本开关收口。
     //   ⚠️ 三处必须同步（同 webfetchEngine）：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
-    Boolean marketAdminEnabled
-) {}
+    Boolean marketAdminEnabled,
+    // [V254 外部渠道] 外部渠道（channel）总开关（settings.channels_enabled 0/1，默认关）。
+    //   true → 允许 MCP channel server 注册入站通知 handler（ChannelNotificationGate 门序[2]）；
+    //   false → 通道消息不进来。前端「设置→高级」独立开关，改完即生效（DB 实时读）。
+    //   null = 未配置 → 回落 yml nexusai.mcp.channels-enabled（默认 false）。
+    //   ⚠️ 三处必须同步（同 marketAdminEnabled）：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
+    //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
+    Boolean channelsEnabled,
+    // [V258 goal-checkin] 目标 check-in 间隔（settings.goal_checkin_minutes，单位分钟）。
+    //   对齐 CC claude.exe v2.1.318 `CLAUDE_CODE_GOAL_CHECKIN_MINUTES`（默认 30）。
+    //   目标因后台任务未归位而延迟评估时，每 N 分钟注入一次 check-in 提示
+    //   （GoalCheckinScheduler 消费；指数退避 ×2、最多 3 次）。
+    //   null/<=0 = 未配置 → 默认 30；要显式关闭请填 0（但 0 与 null 在 UI 上并列显示）。
+    //   ⚠️ 三处必须同步（同 channelsEnabled）：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
+    //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
+    Integer goalCheckinMinutes,
+    // [V259 external-agent] 子代理外部运行时的两个透出字段。
+    //   ⚠️ 三处必须同步（同 channelsEnabled / goalCheckinMinutes）：
+    //   ① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
+    //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
+    //   ⛔ 曾被并发会话的整体覆盖误删，导致 SettingsService / SubagentTool 引用不到。
+    String subagentDefaultRuntime,
+    Boolean subagentExternalEnabled
+) {
+
+    /**
+     * 70 参兼容构造器 · 承接「加了 goalCheckinMinutes 之前」的全部调用点。
+     *
+     * <p><b>WHY 用转发构造器而不是改所有调用点</b>：与 {@code GenericHook.HookResult}
+     * 的 18 参转发构造器、{@code SessionGoal} 的 6 参转发构造器同一范式 —— 唯一真源仍是
+     * record 的全部字段，转发构造器只让旧调用点不必立刻补一个 null（本仓测试侧 12 处构造点）。
+     * 这是纯追加，不是「破约留兼容壳」。
+     */
+    public SettingsDto(
+        Theme theme,
+        FontSize fontSize,
+        String accent,
+        Boolean animationsEnabled,
+        String mainModelName,
+        String fastModelName,
+        String weakModelName,
+        String mediumModelName,
+        String strongModelName,
+        String subagentModelName,
+        Integer maxOutputTokens,
+        String fallbackModelName,
+        String multimodalModelName,
+        String ttsModelName,
+        String asrModelName,
+        Integer autoCompactWindow,
+        String autoMemoryDirectory,
+        Boolean autoMemoryEnabled,
+        Boolean autoDreamEnabled,
+        String websearchEngine,
+        String apiKey,
+        String proxy,
+        Boolean websearchUseSmallModel,
+        String websearchBaseUrl,
+        String websearchDomainCheckUrl,
+        Boolean agentSwarmsEnabled,
+        String permissionMode,
+        String classifierModel,
+        Boolean autoCompactEnabled,
+        Boolean reactiveCompactEnabled,
+        Boolean contextCollapseEnabled,
+        Boolean historySnipEnabled,
+        Boolean smSessionMemoryEnabled,
+        Boolean smCompactEnabled,
+        Boolean cachedMicrocompactEnabled,
+        Boolean timeBasedMcEnabled,
+        Integer timeBasedMcGapMinutes,
+        Integer timeBasedMcKeepRecent,
+        Boolean disableCompact,
+        Boolean disableAutoCompact,
+        Integer cachedMicrocompactTriggerThreshold,
+        Integer cachedMicrocompactKeepRecent,
+        Integer smMinTokens,
+        Integer smMinTextBlockMessages,
+        Integer smMaxTokens,
+        Integer smMinimumMessageTokensToInit,
+        Integer smMinimumTokensBetweenUpdate,
+        Integer smToolCallsBetweenUpdates,
+        Integer maxConsecutiveAutocompactFailures,
+        Integer maxPtlRetries,
+        Integer maxCompactStreamingRetries,
+        Integer snipNudgeThreshold,
+        Boolean taskReminderEnabled,
+        Boolean systemPromptBoundaryEnabled,
+        Boolean proactiveEnabled,
+        Boolean coordinatorModeEnabled,
+        Boolean skillSearchIntentEnabled,
+        Boolean scratchpadEnabled,
+        Boolean frcEnabled,
+        Boolean agentMainThreadEnabled,
+        Boolean verifyPlanReminderEnabled,
+        String language,
+        String outputStyle,
+        Map<String, Boolean> enabledPlugins,
+        Boolean pluginClaudeFallback,
+        Boolean allowDynamicHeaderValues,
+        Integer streamIdleTimeoutMs,
+        String webfetchEngine,
+        Boolean marketAdminEnabled,
+        Boolean channelsEnabled
+    ) {
+        this(theme, fontSize, accent, animationsEnabled, mainModelName, fastModelName,
+            weakModelName, mediumModelName, strongModelName, subagentModelName,
+            maxOutputTokens, fallbackModelName, multimodalModelName, ttsModelName, asrModelName,
+            autoCompactWindow, autoMemoryDirectory, autoMemoryEnabled, autoDreamEnabled,
+            websearchEngine, apiKey, proxy, websearchUseSmallModel, websearchBaseUrl,
+            websearchDomainCheckUrl, agentSwarmsEnabled, permissionMode, classifierModel,
+            autoCompactEnabled, reactiveCompactEnabled, contextCollapseEnabled, historySnipEnabled,
+            smSessionMemoryEnabled, smCompactEnabled, cachedMicrocompactEnabled, timeBasedMcEnabled,
+            timeBasedMcGapMinutes, timeBasedMcKeepRecent, disableCompact, disableAutoCompact,
+            cachedMicrocompactTriggerThreshold, cachedMicrocompactKeepRecent, smMinTokens,
+            smMinTextBlockMessages, smMaxTokens, smMinimumMessageTokensToInit,
+            smMinimumTokensBetweenUpdate, smToolCallsBetweenUpdates, maxConsecutiveAutocompactFailures,
+            maxPtlRetries, maxCompactStreamingRetries, snipNudgeThreshold, taskReminderEnabled,
+            systemPromptBoundaryEnabled, proactiveEnabled, coordinatorModeEnabled,
+            skillSearchIntentEnabled, scratchpadEnabled, frcEnabled, agentMainThreadEnabled,
+            verifyPlanReminderEnabled, language, outputStyle, enabledPlugins, pluginClaudeFallback,
+            allowDynamicHeaderValues, streamIdleTimeoutMs, webfetchEngine, marketAdminEnabled,
+            channelsEnabled, null, null, null);
+    }
+}

@@ -180,6 +180,34 @@ public final class MacOsJxa {
      * @return JXA 脚本文本
      */
     public static String keyEvent(int keyCode, boolean keyDown, String flagsExpr) {
+        return keyEvent(keyCode, keyDown, flagsExpr, 0L, 0L);
+    }
+
+    /**
+     * 键盘事件脚本 · <b>可定向投递给指定进程</b>（不抢焦点、不动系统光标）。
+     *
+     * <h2>⭐ WHY 要定向（对齐 dsh）</h2>
+     * <p>dsh {@code main.swift:777} 的做法是 {@code down.postToPid(app.processIdentifier)} ——
+     * 按键<b>只送给目标 app 进程</b>，用户的当前前台应用不受影响。
+     * 走全局 {@code CGEventPost(kCGHIDEventTap)} 则必然先把焦点抢过来，
+     * 对「在后台应用里输入」这件事是破坏性的。
+     *
+     * <h2>⭐ 实测（2026-11-05）</h2>
+     * <p>{@code CGEventPostToPid} 是 <b>CoreGraphics 的公开 API</b>，
+     * 且 <b>JXA 桥里可用</b>（{@code typeof $.CGEventPostToPid === "function"}）。
+     * 真机验证：Finder 前台时向后台 TextEdit 定向投递 {@code 'A'}，
+     * 文件里真的出现 {@code A}、AX 回读 {@code focused=true} ⇒ <b>不抢焦点地输入成功</b>。
+     * <br>⇒ 不需要 JNA / 不需要私有框架（这是本仓此前「键盘定向要改架构」的误判）。
+     *
+     * @param keyCode    macOS 虚拟键码
+     * @param keyDown    true = 按下
+     * @param flagsExpr  修饰键 flags 的 JS 表达式（null / 空 = 无修饰键）
+     * @param targetPid  目标进程 pid（&lt;= 0 ⇒ 走全局 HID 投递）
+     * @param holdMs     按键按下与抬起之间的等待（定向时同一脚本内完成 down+up 才需要）
+     * @return JXA 脚本文本
+     */
+    public static String keyEvent(int keyCode, boolean keyDown, String flagsExpr,
+                                  long targetPid, long holdMs) {
         StringBuilder sb = new StringBuilder();
         sb.append("ObjC.import(\"CoreGraphics\"); ");
         sb.append("var e = $.CGEventCreateKeyboardEvent(null, ").append(keyCode)
@@ -187,7 +215,46 @@ public final class MacOsJxa {
         if (flagsExpr != null && !flagsExpr.isBlank()) {
             sb.append("$.CGEventSetFlags(e, ").append(flagsExpr).append("); ");
         }
-        sb.append("$.CGEventPost($.kCGHIDEventTap, e);");
+        if (targetPid > 0) {
+            sb.append("$.CGEventPostToPid(").append(targetPid).append(", e);");
+        } else {
+            sb.append("$.CGEventPost($.kCGHIDEventTap, e);");
+        }
+        return sb.toString();
+    }
+
+    /**
+     * <b>一次调用完成</b>一个定向按键的 down + up（减少进程外调用往返）。
+     *
+     * <p>定向投递必须「down 与 up 之间留一点时间且都送到同一进程」；
+     * 拆成两次 osascript 调用会让中间那段时间里目标可能被激活/切换，且更慢。
+     *
+     * @param keyCode   macOS 虚拟键码
+     * @param flagsExpr 修饰键 flags 的 JS 表达式（null / 空 = 无修饰键）
+     * @param targetPid 目标进程 pid（&lt;= 0 ⇒ 走全局 HID 投递）
+     * @param holdMs    down 与 up 之间的等待毫秒
+     * @return JXA 脚本文本
+     */
+    public static String keyTap(int keyCode, String flagsExpr, long targetPid, long holdMs) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("ObjC.import(\"CoreGraphics\"); ");
+        sb.append("function mk(d) { var e = $.CGEventCreateKeyboardEvent(null, ").append(keyCode)
+                .append(", d); ");
+        if (flagsExpr != null && !flagsExpr.isBlank()) {
+            sb.append("$.CGEventSetFlags(e, ").append(flagsExpr).append("); ");
+        }
+        sb.append("return e; } ");
+        if (targetPid > 0) {
+            sb.append("$.CGEventPostToPid(").append(targetPid).append(", mk(true)); ");
+        } else {
+            sb.append("$.CGEventPost($.kCGHIDEventTap, mk(true)); ");
+        }
+        sb.append("$.NSThread.sleepForTimeInterval(").append(Math.max(1, holdMs) / 1000.0).append("); ");
+        if (targetPid > 0) {
+            sb.append("$.CGEventPostToPid(").append(targetPid).append(", mk(false));");
+        } else {
+            sb.append("$.CGEventPost($.kCGHIDEventTap, mk(false));");
+        }
         return sb.toString();
     }
 
@@ -413,21 +480,37 @@ public final class MacOsJxa {
      */
     public static String displayList() {
         return "ObjC.import(\"CoreGraphics\"); "
+                + "ObjC.import(\"AppKit\"); "
                 + "var countRef = Ref(); "
                 + "$.CGGetActiveDisplayList(0, null, countRef); "
                 + "var count = countRef[0]; "
                 + "var idBuf = Ref(); "
                 + "$.CGGetActiveDisplayList(count, idBuf, countRef); "
                 + "var mainId = $.CGMainDisplayID(); "
+                // ⭐ 缩放比取 NSScreen.backingScaleFactor（实测真值），不用 CGDisplayPixelsWide：
+                //   JXA 里 CGDisplayPixelsWide 返回的是【点】宽（1440），不是背板像素宽（2880）
+                //   ⇒ 用它算 ppt 会恒得 1.0（Retina 上错一倍）⇒ 截图坐标换算全错。
+                //   NSScreen 那边 frame 是点、backingScaleFactor 是倍数 ⇒ 像素 = 点 × 倍数。
+                + "var screens = $.NSScreen.screens; "
+                + "var scaleByFrame = {}; "
+                + "for (var si = 0; si < screens.count; si++) { "
+                + "  var sc = screens.objectAtIndex(si); "
+                + "  var sf = sc.frame; "
+                + "  var key = Math.round(sf.origin.x) + \"x\" + Math.round(sf.origin.y); "
+                + "  scaleByFrame[key] = Number(sc.backingScaleFactor); "
+                + "} "
                 + "var result = []; "
                 + "for (var i = 0; i < count; i++) { "
                 + "  var did = idBuf[i]; "
-                + "  var pw = $.CGDisplayPixelsWide(did); "
-                + "  var ph = $.CGDisplayPixelsHigh(did); "
                 + "  var b = $.CGDisplayBounds(did); "
                 + "  var bw = b.size.width; "
                 + "  var bh = b.size.height; "
-                + "  var ppt = (bw > 0 && pw > 0) ? (pw / bw) : 2; "
+                + "  var key = Math.round(b.origin.x) + \"x\" + Math.round(b.origin.y); "
+                + "  var scale = scaleByFrame[key]; "
+                + "  if (!scale || scale <= 0) { scale = 2; } "
+                + "  var pw = Math.round(bw * scale); "
+                + "  var ph = Math.round(bh * scale); "
+                + "  var ppt = scale; "
                 + "  result.push({displayId: did, pixelWidth: pw, pixelHeight: ph, "
                 + "pointWidth: bw, pointHeight: bh, originX: b.origin.x, originY: b.origin.y, "
                 + "pixelsPerPoint: ppt, isPrimary: (did == mainId)}); "
@@ -577,11 +660,73 @@ public final class MacOsJxa {
      * @return JXA 脚本文本（输出 JSON 对象）
      */
     public static String accessibilitySnapshot(int maxDepth, int maxNodes, int maxTextBytes) {
+        return accessibilitySnapshot(maxDepth, maxNodes, maxTextBytes, null);
+    }
+
+    /**
+     * AX 树快照脚本 · <b>可指定观察对象</b>（对齐 dsh {@code computer_observe} 的 {@code app} 入参）。
+     *
+     * <p><b>WHY 要能观察后台应用</b>：dsh 的 {@code app={bundleId?|pid?|name?}} 让模型指定
+     * 目标应用，观察<b>不抢前台</b>（dsh 核心卖点：不干扰用户）。
+     * 本仓此前硬编码前台应用 ⇒ 想看后台应用必须先激活它，与该目标相反。
+     *
+     * <p><b>定位优先级</b>（与 dsh {@code resolveApp} 同款）：{@code pid} 精确 → {@code bundleId}
+     * 精确 → {@code name} 唯一匹配（多个同名 ⇒ <b>明确失败，不猜</b>）。
+     *
+     * <p>⚠️ <b>观察对象解析失败必须显式报错</b>（{@code appResolved:false} + 空 records），
+     * <b>不得静默回落到前台应用</b> —— 那会让模型以为自己在看 A 应用，实际看的是 B。
+     *
+     * @param maxDepth     最大遍历深度
+     * @param maxNodes     节点上限
+     * @param maxTextBytes 文本字节上限
+     * @param selector     观察对象选择器（{@code bundleId}/{@code pid}/{@code name} 三选一；null ⇒ 前台应用）
+     * @return JXA 脚本文本（输出 JSON 对象）
+     */
+    public static String accessibilitySnapshot(int maxDepth, int maxNodes, int maxTextBytes,
+                                              ComputerUseAppSelector selector) {
         return axResolvePrelude() + axSignatureWalkerJsFunction() + axHashJsFunction() + """
                 var MAX_DEPTH = %d, MAX_NODES = %d, MAX_TEXT_BYTES = %d;
+                var SEL_BID = %s, SEL_PID = %s, SEL_NAME = %s;
                 function run() {
-                  var app = $.NSWorkspace.sharedWorkspace.frontmostApplication;
-                  var pid = app.processIdentifier;
+                  // ── 定位观察对象（dsh app 选择器语义）──
+                  var app = null, resolved = true, resolveError = null;
+                  if (SEL_PID > 0) {
+                    var appsByPid = $.NSWorkspace.sharedWorkspace.runningApplications;
+                    for (var i = 0; i < appsByPid.count; i++) {
+                      var ap = appsByPid.objectAtIndex(i);
+                      if (Number(ap.processIdentifier) === SEL_PID) { app = ap; break; }
+                    }
+                    if (app === null) { resolved = false; resolveError = "no running application with pid " + SEL_PID; }
+                  } else if (SEL_BID !== "") {
+                    var appsByBid = $.NSWorkspace.sharedWorkspace.runningApplications;
+                    for (var j = 0; j < appsByBid.count; j++) {
+                      var ab = appsByBid.objectAtIndex(j), bb = ab.bundleIdentifier;
+                      var bstr = (bb && !bb.isNil()) ? String(ObjC.unwrap(bb)) : "";
+                      if (bstr === SEL_BID) { app = ab; break; }
+                    }
+                    if (app === null) { resolved = false; resolveError = "no running application with bundleId " + SEL_BID; }
+                  } else if (SEL_NAME !== "") {
+                    var appsByName = $.NSWorkspace.sharedWorkspace.runningApplications;
+                    var hits = [];
+                    for (var k = 0; k < appsByName.count; k++) {
+                      var an = appsByName.objectAtIndex(k), nn = an.localizedName;
+                      var nstr = (nn && !nn.isNil()) ? String(ObjC.unwrap(nn)) : "";
+                      if (nstr === SEL_NAME) hits.push(an);
+                    }
+                    if (hits.length === 1) { app = hits[0]; }
+                    else if (hits.length === 0) { resolved = false; resolveError = "no running application named " + SEL_NAME; }
+                    else { resolved = false; resolveError = SEL_NAME + " matches " + hits.length + " applications (ambiguous)"; }
+                  } else {
+                    app = $.NSWorkspace.sharedWorkspace.frontmostApplication;
+                  }
+                  if (!resolved || app === null) {
+                    return JSON.stringify({
+                      appResolved: false, resolveError: resolveError,
+                      app: { name: "", bid: "", pid: 0 },
+                      window: null, truncated: false, records: [], text: "", stateHash: ""
+                    });
+                  }
+                  var pid = Number(app.processIdentifier);
                   var appEl = $.AXUIElementCreateApplication(pid);
                   var wins = [];
                   var wr = copyAttr(appEl, K.Windows);
@@ -607,6 +752,7 @@ public final class MacOsJxa {
                       } catch (e) {}
                     }
                     var acts = actionsOf(el), enabled = boolAttr(el, K.Enabled), focused = boolAttr(el, K.Focused);
+                    var selected = boolAttr(el, K.Selected);
                     var subrole = str(el, K.Subrole);
                     var idx = records.length;
                     var label = title || desc || "";
@@ -618,11 +764,14 @@ public final class MacOsJxa {
                     if (subrole) rec.subrole = subrole;
                     if (value !== null) rec.value = value;
                     if (focused !== null) rec.focused = focused;
+                    if (selected !== null) rec.selected = selected;
                     records.push(rec);
                     var line = "[" + idx + "] " + String(role).replace(/^AX/, "");
                     if (label) line += " \\"" + label.slice(0, 40) + "\\"";
                     if (value) line += " value=\\"" + value.slice(0, 30) + "\\"";
                     if (enabled === false) line += " DISABLED";
+                    if (focused === true) line += " FOCUSED";
+                    if (selected === true) line += " SELECTED";
                     if (acts.length) line += " (" + acts.join(",") + ")";
                     var size = line.length + 1;
                     if (textBytes + size <= MAX_TEXT_BYTES) { lines.push(line); textBytes += size; }
@@ -632,17 +781,66 @@ public final class MacOsJxa {
                     for (var ci = 0; ci < kids.length; ci++) queue.push([kids[ci], loc.concat([ci]), depth + 1]);
                   }
                   var bid = app.bundleIdentifier;
+                  var winTitle = root ? str(root, K.Title) : null;
+                  // ── 窗口矩形 + 窗口号（dsh window.frame / window.id）──
+                  //   ⚠️ AXWindowNumber 属性本机实测返回 -25205（不可用）⇒ 走 CGWindowList 兜底：
+                  //   按 pid + 标题配对；标题为空时取该进程的**第一个 layer 0 窗口**。
+                  //   ⚠️ Finder 的桌面窗口在 CGWindowList 里 layer = -2147483603（不是 0）
+                  //   ⇒ 标题配对失败时**放宽到任意 layer**，取面积最大的那个（桌面窗口最大）。
+                  var winFrame = null, winId = null, winBestArea = -1;
+                  try {
+                    var winInfo = $.CGWindowListCopyWindowInfo($.kCGWindowListOptionOnScreenOnly, $.kCGNullWindowID);
+                    var winArr = ObjC.castRefToObject(winInfo);
+                    for (var gi = 0; gi < winArr.count; gi++) {
+                      var gd = winArr.objectAtIndex(gi);
+                      var go = gd.objectForKey('kCGWindowOwnerPID');
+                      if (!go || Number(ObjC.unwrap(go)) !== pid) continue;
+                      var gname = gd.objectForKey('kCGWindowName');
+                      var gnameStr = (gname && !gname.isNil()) ? String(ObjC.unwrap(gname)) : "";
+                      var gb = gd.objectForKey('kCGWindowBounds');
+                      if (!gb) continue;
+                      var gx = gb.objectForKey('X'), gy = gb.objectForKey('Y');
+                      var gw = gb.objectForKey('Width'), gh = gb.objectForKey('Height');
+                      if (!gx || !gy || !gw || !gh) continue;
+                      var bx = Number(ObjC.unwrap(gx)), by = Number(ObjC.unwrap(gy));
+                      var bw = Number(ObjC.unwrap(gw)), bh = Number(ObjC.unwrap(gh));
+                      var gl = gd.objectForKey('kCGWindowLayer');
+                      var glv = gl ? Number(ObjC.unwrap(gl)) : 0;
+                      var nameMatch = (winTitle !== null && gnameStr !== "" && gnameStr === winTitle);
+                      // 标题匹配 ⇒ 直接采纳；否则只在「标题为空」时按面积兜底
+                      if (!nameMatch) {
+                        if (winTitle !== null && winTitle !== "") continue;
+                        if (glv !== 0 && bw * bh <= winBestArea) continue;
+                        if (bw * bh <= winBestArea) continue;
+                      }
+                      winBestArea = bw * bh;
+                      winFrame = { x: bx, y: by, width: bw, height: bh };
+                      var gn = gd.objectForKey('kCGWindowNumber');
+                      if (gn) winId = Number(ObjC.unwrap(gn));
+                      if (nameMatch) break;
+                    }
+                  } catch (e) { winFrame = null; }
+                  var frontPid = Number($.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier);
                   return JSON.stringify({
+                    appResolved: true,
                     app: { name: String(ObjC.unwrap(app.localizedName)),
                            bid: (bid && !bid.isNil()) ? String(ObjC.unwrap(bid)) : "", pid: pid },
-                    window: { title: root ? str(root, K.Title) : null },
+                    frontmost: (pid === frontPid),
+                    window: { title: winTitle, frame: winFrame, id: winId },
                     truncated: truncated, records: records, text: lines.join("\\n"),
                     // ⭐ 状态指纹：与 accessibilityInvoke 用同一函数算同一份签名序列
                     stateHash: axHash(axSignatures(root, MAX_DEPTH))
                   });
                 }
                 run();
-                """.formatted(maxDepth, maxNodes, maxTextBytes);
+                """.formatted(maxDepth, maxNodes, maxTextBytes,
+                jsonStringLiteral(selector == null ? "" : nullToEmpty(selector.bundleId())),
+                selector == null || selector.pid() <= 0 ? "0" : Long.toString(selector.pid()),
+                jsonStringLiteral(selector == null ? "" : nullToEmpty(selector.name())));
+    }
+
+    private static String nullToEmpty(String value) {
+        return value == null ? "" : value;
     }
 
     /**
@@ -660,7 +858,8 @@ public final class MacOsJxa {
                 var K = { Role: cf("AXRole"), Title: cf("AXTitle"), Desc: cf("AXDescription"),
                           Children: cf("AXChildren"), Windows: cf("AXWindows"), Value: cf("AXValue"),
                           SelectedText: cf("AXSelectedText"), Identifier: cf("AXIdentifier"),
-                          Enabled: cf("AXEnabled"), Focused: cf("AXFocused"), Subrole: cf("AXSubrole") };
+                          Enabled: cf("AXEnabled"), Focused: cf("AXFocused"), Subrole: cf("AXSubrole"),
+                          Selected: cf("AXSelected") };
                 function copyAttr(el, attr) {
                   var out = Ref();
                   var e = $.AXUIElementCopyAttributeValue(el, attr, out);
@@ -715,6 +914,20 @@ public final class MacOsJxa {
                     return ns.count ? ns.objectAtIndex(0) : appEl;
                   } catch (e) { return appEl; }
                 }
+                // ⭐⭐ 按 pid 取窗口（对齐 dsh 的「动作作用于【被观察的那个应用】」）
+                //   WHY：observe 以按 bundleId/pid 观察**后台应用**（不抢前台），
+                //   而动作若仍在 frontWindow()（前台应用）里按 locator 反查，
+                //   就是**在另一棵树上找同一个路径** ⇒ 定位错元素 / 元素不存在。
+                //   ⇒ 动作必须带着「该观察所属的 pid」来解析。
+                function windowOfPid(pid) {
+                  var appEl = $.AXUIElementCreateApplication(pid);
+                  var wr = copyAttr(appEl, K.Windows);
+                  if (wr === null) return appEl;
+                  try {
+                    var ns = ObjC.castRefToObject(wr);
+                    return ns.count ? ns.objectAtIndex(0) : appEl;
+                  } catch (e) { return appEl; }
+                }
                 function resolve(root, loc) {
                   if (!loc) return root;
                   var parts = String(loc).split(".");
@@ -744,13 +957,30 @@ public final class MacOsJxa {
      * @return JXA 脚本文本（输出 {@code {found, role, name, actions, ok, err, message}}）
      */
     public static String accessibilityInvoke(String locator, String expectedStateHash) {
+        return accessibilityInvoke(locator, expectedStateHash, 0L);
+    }
+
+    /**
+     * {@code AXPress} 脚本 · 按 locator 反查后执行 · <b>作用于指定 pid 的应用</b>。
+     *
+     * <p>⭐ <b>WHY 要带 pid</b>（2026-11-02 真机实测抓到）：observe 允许按 bundleId/pid
+     * 观察<b>后台应用</b>（不抢前台）；若动作仍在<b>前台应用</b>的树里按 locator 反查，
+     * 就是<b>在另一棵树上找同一个路径</b> ⇒ 元素不存在 / 按错按钮。
+     *
+     * @param locator 子节点索引路径（如 {@code "0.2.1"}）
+     * @param expectedStateHash 期望的整树状态哈希（空 = 不校验）
+     * @param targetPid 目标应用 pid（0 = 用前台应用）
+     * @return JXA 脚本文本
+     */
+    public static String accessibilityInvoke(String locator, String expectedStateHash, long targetPid) {
         // ⛔ 三个片段缺一不可：prelude(AX 读写) + 签名遍历 + 哈希函数
         //   （observe 侧同样三件套算 stateHash；漏掉 axHashJsFunction 会导致
         //    "Can't find variable: axHash"，陈旧校验整段失效 —— 2026-11-02 真机实测）
         return axResolvePrelude() + axSignatureWalkerJsFunction() + axHashJsFunction() + """
                 var LOCATOR = %s;
                 var EXPECTED_HASH = %s;
-                var win = frontWindow();
+                var TARGET_PID = %d;
+                var win = TARGET_PID > 0 ? windowOfPid(TARGET_PID) : frontWindow();
                 var el = resolve(win, LOCATOR);
                 var out = { locator: LOCATOR, found: el !== null };
                 if (el && EXPECTED_HASH) {
@@ -790,9 +1020,9 @@ public final class MacOsJxa {
                 JSON.stringify(out);
                 """.formatted(jsonStringLiteral(locator),
                 jsonStringLiteral(expectedStateHash == null ? "" : expectedStateHash),
+                targetPid,
                 "axHash");
     }
-
     /**
      * 按<b>动作名</b>执行 AX 动作的脚本（对齐 dsh {@code computer_perform_action}）。
      *
@@ -811,15 +1041,61 @@ public final class MacOsJxa {
      * @return JXA 脚本文本（输出 {@code {found, ok, err, available, message}}）
      */
     public static String accessibilityPerformAction(String locator, String action) {
-        return axResolvePrelude() + """
+        return accessibilityPerformAction(locator, action, 0L);
+    }
+
+    /**
+     * 按<b>动作名</b>执行 AX 动作 · <b>作用于指定 pid 的应用</b>。
+     *
+     * @param locator 子节点索引路径
+     * @param action  动作名（如 {@code AXPress} / {@code AXExpand} / {@code AXShowMenu}）
+     * @param targetPid 目标应用 pid（0 = 用前台应用）
+     * @return JXA 脚本文本（输出 {@code {found, ok, err, available, message}}）
+     */
+    public static String accessibilityPerformAction(String locator, String action, long targetPid) {
+        return accessibilityPerformAction(locator, action, null, targetPid);
+    }
+
+    /**
+     * 按动作名执行 · 带<b>陈旧校验</b> + <b>作用于指定 pid</b>
+     * （与 {@link #accessibilityInvoke(String, String, long)} 同一套 dsh {@code expectedStateHash} 语义）。
+     *
+     * <p><b>WHY 必须校验</b>：locator 是「某棵树里的路径」。观察之后界面一变（弹层、列表刷新、
+     * 窗口切换），同一路径就指向<b>另一个元素</b> ⇒ 不校验就会对错的元素执行动作。
+     *
+     * @param locator           子节点索引路径
+     * @param action            动作名
+     * @param expectedStateHash 期望的整树状态哈希（空 = 不校验）
+     * @param targetPid         目标应用 pid（0 = 用前台应用）
+     * @return JXA 脚本文本
+     */
+    public static String accessibilityPerformAction(String locator, String action,
+                                                    String expectedStateHash, long targetPid) {
+        // ⛔ 三件套缺一不可：prelude + 签名遍历 + 哈希函数（漏掉会 "Can't find variable: axHash"）
+        return axResolvePrelude() + axSignatureWalkerJsFunction() + axHashJsFunction() + """
                 var LOCATOR = %s;
                 var ACTION = %s;
-                var el = resolve(frontWindow(), LOCATOR);
+                var EXPECTED_HASH = %s;
+                var TARGET_PID = %d;
+                var win = TARGET_PID > 0 ? windowOfPid(TARGET_PID) : frontWindow();
+                var el = resolve(win, LOCATOR);
                 var out = { locator: LOCATOR, action: ACTION, found: el !== null };
-                if (!el) {
+                if (el && EXPECTED_HASH) {
+                  // ── 陈旧校验：树变了就不动手 ──
+                  var nowHash = %s(axSignatures(win, 14));
+                  out.stateMatched = (nowHash === EXPECTED_HASH);
+                  if (!out.stateMatched) {
+                    out.ok = false; out.err = -25209;
+                    out.message = "the accessibility tree changed since the observation (expected "
+                        + EXPECTED_HASH + ", now " + nowHash
+                        + "). Call observe again and use the new observationId.";
+                  }
+                }
+                if (out.stateMatched === false) {
+                  // 陈旧 ⇒ 已写好错误，跳过动作
+                } else if (!el) {
                   out.ok = false; out.err = -25208;
                   out.message = "locator is not in the current AX tree (the UI changed — observe again)";
-                  JSON.stringify(out);
                 } else {
                   var acts = actionsOf(el);
                   out.available = acts;
@@ -836,7 +1112,9 @@ public final class MacOsJxa {
                     JSON.stringify(out);
                   }
                 }
-                """.formatted(jsonStringLiteral(locator), jsonStringLiteral(action));
+                """.formatted(jsonStringLiteral(locator), jsonStringLiteral(action),
+                jsonStringLiteral(expectedStateHash == null ? "" : expectedStateHash),
+                targetPid, "axHash");
     }
 
     /**
@@ -850,12 +1128,58 @@ public final class MacOsJxa {
      * @return JXA 脚本文本（输出 {@code {found, ok, via, err, before, after}}）
      */
     public static String accessibilitySetValue(String locator, String value) {
-        return axResolvePrelude() + """
+        return accessibilitySetValue(locator, value, 0L);
+    }
+
+    /**
+     * 设值脚本 · <b>作用于指定 pid 的应用</b>。
+     *
+     * @param locator 子节点索引路径
+     * @param value   要写入的值
+     * @param targetPid 目标应用 pid（0 = 用前台应用）
+     * @return JXA 脚本文本（输出 {@code {found, ok, via, err, before, after}}）
+     */
+    public static String accessibilitySetValue(String locator, String value, long targetPid) {
+        return accessibilitySetValue(locator, value, null, targetPid);
+    }
+
+    /**
+     * 设值 · 带<b>陈旧校验</b> + <b>作用于指定 pid</b>。
+     *
+     * <p><b>WHY 必须校验</b>：写值比点击更危险 —— locator 在界面变化后指向别的输入框时，
+     * 不校验就会把文本写进<b>另一个字段</b>（用户看不出，但数据已错）。
+     *
+     * @param locator           子节点索引路径
+     * @param value             要写入的值
+     * @param expectedStateHash 期望的整树状态哈希（空 = 不校验）
+     * @param targetPid         目标应用 pid（0 = 用前台应用）
+     * @return JXA 脚本文本
+     */
+    public static String accessibilitySetValue(String locator, String value,
+                                               String expectedStateHash, long targetPid) {
+        // ⛔ 三件套缺一不可：prelude + 签名遍历 + 哈希函数
+        return axResolvePrelude() + axSignatureWalkerJsFunction() + axHashJsFunction() + """
                 var LOCATOR = %s;
                 var VALUE = %s;
-                var el = resolve(frontWindow(), LOCATOR);
+                var EXPECTED_HASH = %s;
+                var TARGET_PID = %d;
+                var win = TARGET_PID > 0 ? windowOfPid(TARGET_PID) : frontWindow();
+                var el = resolve(win, LOCATOR);
                 var out = { locator: LOCATOR, found: el !== null };
-                if (!el) {
+                if (el && EXPECTED_HASH) {
+                  // ── 陈旧校验：树变了就不动手 ──
+                  var nowHash = %s(axSignatures(win, 14));
+                  out.stateMatched = (nowHash === EXPECTED_HASH);
+                  if (!out.stateMatched) {
+                    out.ok = false; out.err = -25209;
+                    out.message = "the accessibility tree changed since the observation (expected "
+                        + EXPECTED_HASH + ", now " + nowHash
+                        + "). Call observe again and use the new observationId.";
+                  }
+                }
+                if (out.stateMatched === false) {
+                  // 陈旧 ⇒ 已写好错误，跳过动作
+                } else if (!el) {
                   out.ok = false; out.err = -25208;
                   out.message = "locator 在当前 AX 树中不存在（界面已变化，请重新 observe）";
                 } else {
@@ -896,7 +1220,9 @@ public final class MacOsJxa {
                   }
                 }
                 JSON.stringify(out);
-                """.formatted(jsonStringLiteral(locator), jsonStringLiteral(value));
+                """.formatted(jsonStringLiteral(locator), jsonStringLiteral(value),
+                jsonStringLiteral(expectedStateHash == null ? "" : expectedStateHash),
+                targetPid, "axHash");
     }
 
     /**
@@ -987,19 +1313,24 @@ public final class MacOsJxa {
     }
 
     /**
-     * 屏幕录制（Screen Recording）授权探测脚本。
+     * 屏幕录制权限探针 · JXA。
      *
-     * <p><b>本仓新增</b>：CCB 的 JXA 副本用 {@code screencapture -x -R 0,0,1,1 /dev/null}
-     * 的退出码做探针（{@code src/utils/computerUse/hostAdapter.ts:53-64}），
-     * 没有用规范 API。
-     * <br>⇒ 本仓用 macOS 10.15+ 的 {@code CGPreflightScreenCaptureAccess()}
-     * （CoreGraphics 框架）做等价判定。
+     * <p>⭐ <b>WHY 不用 {@code CGPreflightScreenCaptureAccess}</b>（2026-11-02 真机实测）：
+     * 该 C 函数<b>在 JXA 桥里根本没有</b>（{@code typeof $.CGPreflightScreenCaptureAccess}
+     * = {@code "undefined"}）⇒ 每次探测都会抛 TypeError、回落间接探针、
+     * 并打一条无意义的 WARN（<b>永远失败</b>的探针不是探针）。
+     * <br>⇒ 改用 {@code CGWindowListCreateImage}：它<b>在 JXA 里可用</b>，且
+     * <b>没有屏幕录制权限时返回 NULL</b>（这正是它被 ScreenCaptureKit 取代的原因）⇒
+     * 「拿到非 NULL 图像」就是「有权限」的可靠判据。
      *
      * @return JXA 脚本文本（输出 {@code "true"} / {@code "false"}）
      */
     public static String screenCaptureAccess() {
         return "ObjC.import(\"CoreGraphics\"); "
-                + "$.CGPreflightScreenCaptureAccess() ? \"true\" : \"false\"";
+                + "var r = $.CGRectMake(0, 0, 1, 1); "
+                + "var img = $.CGWindowListCreateImage(r, $.kCGWindowListOptionOnScreenOnly, "
+                + "$.kCGNullWindowID, [$.kCGWindowImageDefault]); "
+                + "(img !== null && img !== undefined) ? \"true\" : \"false\"";
     }
 
     // ══════════════════════════════════════════════════════════════════

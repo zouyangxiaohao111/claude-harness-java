@@ -148,7 +148,10 @@ export function WorkspaceHeader({
   const traceLabel = traceActive ? '返回对话' : traceCount != null && traceCount > 0 ? `轨迹 · 共 ${traceCount} 条` : '轨迹'
 
   return (
-    <div className="ws-head">
+    // [2026-11-04] 顶栏主体（1615px 宽）是窗口拖动区：无边框窗口只能靠
+    //   `data-tauri-drag-region` 拖动（Tauri 唯一认的属性），deep = 子树任意位置可拖，
+    //   但 button/input 等由 Tauri 自动排除 ⇒ 搜索/轨迹/面板等按钮点击不受影响。
+    <div className="ws-head" data-tauri-drag-region="deep">
       {title !== null && (
         <div className="ws-title-wrap">
           {editing ? (

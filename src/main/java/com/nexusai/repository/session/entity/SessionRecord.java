@@ -219,6 +219,20 @@ public class SessionRecord {
      */
     private String goal;
 
+    /**
+     * 主对话「引入知识库」开关（V278，2026-11-06）。
+     *
+     * <p><b>语义</b>：1 = 4 个知识库专属工具进入主线程工具池；
+     * 0/null = 现状（它们被 {@code @ExclusiveTool} 挡在默认池外）。
+     *
+     * <p>⚠️ 只控制<b>工具可见性</b>，不改变 {@code LlmAgentLoop.loop()} 的执行逻辑。
+     * ⛔ 不要把它当成「本轮是否走 RAG 链」的开关 —— RAG 链是独立入口。
+     */
+    private Integer kbToolsEnabled = 0;
+
+    public Integer getKbToolsEnabled() { return kbToolsEnabled; }
+    public void setKbToolsEnabled(Integer v) { this.kbToolsEnabled = v; }
+
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
     public String getModelTag() { return modelTag; }

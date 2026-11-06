@@ -87,6 +87,12 @@ public final class ComputerUseMouseAnimator {
      * @param sleeper             休眠器（可注入假时钟 ⇒ 单测零耗时）
      * @param mouseAnimationEnabled {@code mouseAnimation} 子开关（CCB {@code gates.ts:15}，默认 true）
      */
+    /** 定向拖拽目标进程（{@code <=0} = 用真实光标拖拽）。 */
+    private volatile long targetPid;
+    private volatile long targetWindowNumber;
+    private volatile double targetWindowX;
+    private volatile double targetWindowY;
+
     public ComputerUseMouseAnimator(ComputerUseCursor cursor,
                                     ComputerUseSleeper sleeper,
                                     boolean mouseAnimationEnabled) {
@@ -154,6 +160,21 @@ public final class ComputerUseMouseAnimator {
      * @throws Exception 注入失败
      */
     public void drag(int fromX, int fromY, int toX, int toY) throws Exception {
+        // ⭐ 路径 A（首选）：定向拖拽 —— 事件只送目标窗口，系统光标不动。
+        //   ⚠️ 前提：目标应用必须在前台（真机实测：后台拖拽无效果，前台生效）。
+        //   这与 dsh activateForCursor 的设计一致 —— 调用方负责先激活。
+        if (targetPid > 0 && targetWindowNumber > 0) {
+            boolean sent = MacOsSkyLight.postDrag(targetPid, targetWindowNumber,
+                    fromX, fromY, toX, toY, targetWindowX, targetWindowY);
+            if (sent) {
+                if (log.isInfoEnabled()) {
+                    log.info("[computer-use] macOS 定向拖拽完成: pid={} win={} ({},{})→({},{}) 光学标未动",
+                            targetPid, targetWindowNumber, fromX, fromY, toX, toY);
+                }
+                return;
+            }
+            log.debug("[computer-use] 定向拖拽不可用 ⇒ 回落全局拖拽");
+        }
         moveAndSettle(fromX, fromY);
         cursor.leftButtonDown();
         sleeper.sleep(MOVE_SETTLE_MS);
@@ -162,6 +183,26 @@ public final class ComputerUseMouseAnimator {
         } finally {
             cursor.leftButtonUp();
         }
+    }
+
+    /**
+     * 设置定向拖拽目标（{@code pid<=0} ⇒ 不定向，走真实光标拖拽）。
+     *
+     * @param pid          目标进程
+     * @param windowNumber 目标窗口号
+     * @param windowX      窗口原点 X
+     * @param windowY      窗口原点 Y
+     */
+    public void setDragTarget(long pid, long windowNumber, double windowX, double windowY) {
+        this.targetPid = Math.max(0L, pid);
+        this.targetWindowNumber = windowNumber;
+        this.targetWindowX = windowX;
+        this.targetWindowY = windowY;
+    }
+
+    /** 清除定向拖拽目标。 */
+    public void clearDragTarget() {
+        setDragTarget(0L, 0L, 0.0, 0.0);
     }
 
     /**

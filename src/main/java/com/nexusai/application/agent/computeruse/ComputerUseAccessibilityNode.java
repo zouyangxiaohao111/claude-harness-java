@@ -61,7 +61,9 @@ public record ComputerUseAccessibilityNode(
         String locator,
         List<String> actions,
         String subrole,
-        String nativeIdentifier) {
+        String nativeIdentifier,
+        Boolean focused,
+        Boolean selected) {
 
     public ComputerUseAccessibilityNode {
         if (role == null) {
@@ -108,7 +110,45 @@ public record ComputerUseAccessibilityNode(
                                         String value,
                                         List<ComputerUseAccessibilityNode> children) {
         this(role, name, automationId, x, y, width, height, enabled, value, children,
-                -1, "", List.of(), "", "");
+                -1, "", List.of(), "", "", null, null);
+    }
+
+    /**
+     * 兼容构造（有 index / locator / actions / subrole / nativeIdentifier，无 focused / selected）。
+     *
+     * @param role             控件类型名
+     * @param name             可访问名
+     * @param automationId     自动化 id
+     * @param x                屏幕 X
+     * @param y                屏幕 Y
+     * @param width            宽
+     * @param height           高
+     * @param enabled          是否可用
+     * @param value            当前值
+     * @param children         子节点
+     * @param index            先序序号
+     * @param locator          子节点索引路径
+     * @param actions          可执行动作集
+     * @param subrole          子角色
+     * @param nativeIdentifier 原生标识
+     */
+    public ComputerUseAccessibilityNode(String role,
+                                        String name,
+                                        String automationId,
+                                        int x,
+                                        int y,
+                                        int width,
+                                        int height,
+                                        boolean enabled,
+                                        String value,
+                                        List<ComputerUseAccessibilityNode> children,
+                                        int index,
+                                        String locator,
+                                        List<String> actions,
+                                        String subrole,
+                                        String nativeIdentifier) {
+        this(role, name, automationId, x, y, width, height, enabled, value, children,
+                index, locator, actions, subrole, nativeIdentifier, null, null);
     }
 
     /**

@@ -490,13 +490,26 @@ nexusai:
 
   # ---------------------------------------------------------------
   # MCP (Model Context Protocol) configuration
-  # R32-b7a-3 方案 A: 5 个 stub Tool 通过 nexusai.mcp.features.* 暴露,
+  # R32-b7a-3 方案 A: stub Tool 通过 nexusai.mcp.features.* 暴露,
   # 默认全部 disabled. 开启后将由 McpToolPool 启动期 tools/list
   # 拉取同名 MCP tool 自动覆盖 stub.
   # 配置项设计: 探查/findings/r32-b7a-3-explore.md §6
+  #
+  # ⚠️ 接线现状（2026-11-04 逐项单模式 grep 核实，勿按注释字面理解）
+  #   ✅ 真被读：channels-enabled / channels-permission-relay-enabled /
+  #      features.send-user-file-tool / output.max-tokens /
+  #      prefetch-on-startup / prefetch-official-registry / policy
+  #   ⛔ 零消费（改了不生效，保留占位待接线）：
+  #      enabled / pool.* / features.{web-browser,list-peers,push-notification,subscribe-pr}-tool /
+  #      auth.* / resources.* / prompts.*
+  #      其中 4 个 features 键的「键名」与被门控的 Tool 实际读取的键不一致，
+  #      见下方逐条标注。
+  #   servers[] 也不参与装配：真实 server 列表来自 DB（McpServerService）。
   # ---------------------------------------------------------------
   mcp:
-    # 全局 MCP 开关 (默认关闭 — 需明确启用后 McpToolPool 才装配 server)
+    # ⛔ 零消费（占位未接线）：全仓只有 McpConfig 构造器把它打进启动日志，
+    #   没有任何门控读它。改成 true 不会让 McpToolPool 装配 server。
+    #   （McpToolPool 的 server 来源是 DB / REST start，不是本开关。）
     enabled: false
 
     # [impl-I-3 T1] channel 全局 runtime 开关 · CC original: isChannelsEnabled() (channelAllowlist.ts:51-53,
@@ -506,35 +519,53 @@ nexusai:
     # (channelPermissions.ts:36-38, GrowthBook 'tengu_harbor_permissions')。独立于 channels-enabled。
     channels-permission-relay-enabled: false
 
-    # MCP tool pool 并发/超时配置
+    # ⛔ 零消费（占位未接线）：McpProperties.Pool 三个字段全仓无调用方
+    #   （maxConcurrentCalls / callTimeoutMs / serializeSameServer 仅出现在 record 定义处）。
+    #   实际并发/超时由各 executor 内部常量决定，不读这里。
+    #   MCP tool pool 并发/超时配置
     pool:
       max-concurrent-calls: 4
       call-timeout-ms: 30000
       serialize-same-server: true
 
-    # MCP server 列表 (按需添加; 注释示例: filesystem / web-browser / github)
+    # MCP server 列表
+    # ⛔ 不参与装配：仅 McpConfig 启动日志打印 servers().size()；
+    #   真实 server 列表来自 DB（McpServerService / REST 添加），不是本段。
     # transport 可选: stdio / sse / http / ws / sdk / claudeai-proxy
     servers: []
 
-    # Feature flags — 5 个 stub Tool 的开关 (默认全部 false)
+    # Feature flags — stub Tool 的开关（默认全部 false）
+    # ⚠️ 只有 send-user-file-tool 与 stub 类真正对得上；其余 4 个键名与
+    #   被门控的 Tool 实际读取的键不一致（见逐条）。
     features:
-      web-browser-tool: false        # 对应 WebBrowserTool stub
-      list-peers-tool: false         # 对应 ListPeersTool stub
-      send-user-file-tool: false     # 对应 SendUserFileTool stub
-      push-notification-tool: false  # 对应 PushNotificationTool stub
-      subscribe-pr-tool: false       # 对应 SubscribePRTool stub
+      # ⛔ 键名不通：WebBrowserTool 实际读 nexusai.feature.web-browser-tool
+      #   （@ConditionalOnProperty(prefix="nexusai.feature", name="web-browser-tool")）
+      web-browser-tool: false
+      # ⛔ 键名不通：ListPeersTool 实际读 nexusai.feature.uds-inbox
+      list-peers-tool: false
+      # ✅ 真接线：SendUserFileTool 的 @ConditionalOnProperty 直读本键
+      send-user-file-tool: false
+      # ⛔ 键名不通：PushNotificationTool 走 KairosOrPushNotificationEnabledCondition，
+      #   实际读 nexusai.feature.kairos / nexusai.feature.kairos-push-notification（OR）
+      push-notification-tool: false
+      # ⛔ 键名不通：SubscribePRTool 实际读 nexusai.feature.kairos-github-webhooks
+      subscribe-pr-tool: false
 
-    # OAuth / Authorization Server discovery
+    # ⛔ 零消费（占位未接线）：McpProperties.Auth 两个字段全仓无调用方。
+    #   OAuth / Authorization Server discovery
     auth:
       oauth-enabled: false
       as-discovery-timeout-ms: 5000
 
-    # MCP resources 端点 (McpToolPool resources/list + resources/subscribe)
+    # ⛔ 零消费（占位未接线）：McpProperties.Resources 两个字段全仓无调用方。
+    #   （McpToolPool 的 resources/list 端点不受本段控制。）
+    #   MCP resources 端点
     resources:
       list-enabled: true
       subscribe-enabled: false
 
-    # MCP prompts 端点 (McpToolPool prompts/list)
+    # ⛔ 零消费（占位未接线）：McpProperties.Prompts 字段全仓无调用方。
+    #   MCP prompts 端点
     prompts:
       list-enabled: false
 
@@ -552,7 +583,7 @@ nexusai:
     # (mcpValidation.ts:26-47, env MAX_MCP_OUTPUT_TOKENS > growthbook > 默认 25000)。
     # Java 无 growthbook → yml 承接；env 覆盖由 ${MAX_MCP_OUTPUT_TOKENS:25000} placeholder 处理。
     output:
-      max-tokens: ${MAX_MCP_OUTPUT_TOKENS:64000}
+      max-tokens: ${MAX_MCP_OUTPUT_TOKENS:384000}
 
   # ------------------------------------------------------------------
   # 安全配置（BearerTokenAuthFilter 注入源 · nexusai.security.require-oauth-auth）

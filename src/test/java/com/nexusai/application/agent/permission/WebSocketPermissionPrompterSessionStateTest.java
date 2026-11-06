@@ -146,4 +146,48 @@ class WebSocketPermissionPrompterSessionStateTest {
         t.join(3_000);
         // 无断言失败 = 未注入时 finally 不抛错、权限流程正常（sdkEventQueue==null 分支跳过）
     }
+
+    @Test
+    @DisplayName("通知发射抛 Error（类加载失败形态）→ finally 不得冒泡，用户决策不受影响")
+    void emitThrowableDoesNotEscapeFinally() throws Exception {
+        // WHY（2026-11-04 生产事故）：finally 里 new SdkEventQueue.SessionStateChangedEvent(...) 抛
+        //   NoClassDefFoundError（并发构建重写 target/classes → 内部类首次懒加载落空，JVM 负缓存后
+        //   持续失败）→ 冒出 finally 顶掉 try 里已定的返回值 → ToolPermissionGate.mapToDecision 的
+        //   catch (Throwable) 接住 → cancelAndAbortDecision → 用户刚点的「允许」被当取消、整轮
+        //   abort("permission_cancelled")。日志实证：同一 requestId 先 decision=Allow、紧接「按取消处理」。
+        //   这里用 Error（非 Exception）作桩 —— 必须 catch Throwable 才拦得住。
+        SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
+        WebSocketPermissionPrompter bound = new WebSocketPermissionPrompter(ws, 100);
+        SdkEventQueue exploding = new SdkEventQueue() {
+            @Override
+            public void enqueueSdkEvent(String sessionId, SdkEvent event) {
+                throw new NoClassDefFoundError(
+                    "com/nexusai/application/agent/tasks/SdkEventQueue$SessionStateChangedEvent");
+            }
+        };
+        injectSdkEventQueue(bound, exploding);
+
+        Throwable[] escaped = new Throwable[1];
+        PermissionResult[] result = new PermissionResult[1];
+        Thread t = new Thread(() -> {
+            try {
+                result[0] = bound.prompt(new StubTool("Edit"), JSON.createObjectNode(),
+                    new PermissionDecisionReason.Other("test"), newCtx(), "req-3",
+                    new PermissionPromptDetails("desc", List.of(), null));
+            } catch (Throwable th) {
+                escaped[0] = th;
+            }
+        });
+        t.start();
+        awaitPendingRegistration(bound, "req-3");
+        bound.onResponse("req-3", "allow");
+        t.join(3_000);
+
+        assertThat(escaped[0])
+            .as("通知发射失败不得从 prompt() 冒出（otherwise 权限门按取消处理 ⇒ 授权被吃掉）")
+            .isNull();
+        assertThat(result[0])
+            .as("用户点的 allow 必须原样带出（不得因通知失败降级为 Deny）")
+            .isInstanceOf(PermissionResult.Allow.class);
+    }
 }

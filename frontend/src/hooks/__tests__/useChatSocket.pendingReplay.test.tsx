@@ -48,19 +48,19 @@ vi.mock('@/api/sessions', () => ({ sessionApi: { state: stateMock } }))
 const SID = 'sess-replay'
 const OTHER = 'sess-other'
 
-function Host({ ids }: { ids: string[] }) {
-  useChatSocket(SID, {}, undefined, undefined, undefined, undefined, undefined, undefined, ids)
+function Host({ ids, streams }: { ids: string[]; streams?: Record<string, string> }) {
+  useChatSocket(SID, streams ?? {}, undefined, undefined, undefined, undefined, undefined, undefined, ids)
   return null
 }
 
 let container: HTMLDivElement | undefined
 let root: Root | undefined
 
-async function mount(ids: string[] = []) {
+async function mount(ids: string[] = [], streams?: Record<string, string>) {
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
-  act(() => { root!.render(<Host ids={ids} />) })
+  act(() => { root!.render(<Host ids={ids} streams={streams} />) })
   act(() => { fakeClient.onConnect?.() })
   // replay 是异步 promise（sessionApi.state.then）→ 让出微任务
   await act(async () => { await Promise.resolve(); await Promise.resolve() })
@@ -135,6 +135,79 @@ describe('[会话状态同步] pending 补拉 + 已知会话订阅', () => {
     const q = useChatStore.getState().permissionQueue
     expect(q).toHaveLength(1)
     expect(q[0].sessionId).toBe(OTHER)
+  })
+
+  it('⭐ [perm-backstop] 当前会话在跑且本地无待处理项 ⇒ 定时补拉（实时事件丢了也能弹出来）', async () => {
+    // WHY（用户实测缺陷）：两个会话同时触发 AskUserQuestion，当前会话的卡片一直不出现、
+    //   卡住二十多分钟；切走再切回来才冒出来 ⇒ 实时 STOMP 事件丢了，只有切会话触发的
+    //   REST 补拉能找回。本用例锁死「边跑边补」这条第三路兜底。
+    vi.useFakeTimers()
+    try {
+      stateMock.mockResolvedValue({ sessionId: SID, pendingPermissions: [] })
+      await mount([], { [SID]: `/topic/sessions/${SID}/stream` })
+      const callsAfterMount = stateMock.mock.calls.length
+
+      // 首个周期：后端此时已有待回答的提问（实时推送已丢）
+      stateMock.mockResolvedValue({
+        sessionId: SID,
+        pendingPermissions: [{ requestId: 'r-lost', toolName: 'AskUserQuestion', toolInput: { questions: [] } }],
+      })
+      await act(async () => {
+        vi.advanceTimersByTime(8_000)
+        await Promise.resolve(); await Promise.resolve()
+      })
+
+      expect(stateMock.mock.calls.length).toBeGreaterThan(callsAfterMount)
+      const q = useChatStore.getState().permissionQueue
+      expect(q.map((r) => r.requestId)).toContain('r-lost')
+      expect(q.find((r) => r.requestId === 'r-lost')!.sessionId).toBe(SID)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('[perm-backstop] 本地已有该会话的待处理项 ⇒ 不再轮询（卡片已在显示，不重复请求）', async () => {
+    vi.useFakeTimers()
+    try {
+      stateMock.mockResolvedValue({ sessionId: SID, pendingPermissions: [] })
+      useChatStore.setState({
+        permissionQueue: [{
+          kind: 'message', sessionId: SID, requestId: 'r-already', toolUseId: null,
+          toolName: 'AskUserQuestion', description: null, reason: null, warning: null,
+          toolInput: {}, isLeaderInbox: false, workerName: null, workerBadgeColor: null,
+          timestampMs: 1, suggestions: null, computerUse: null,
+        }],
+      })
+      await mount([], { [SID]: `/topic/sessions/${SID}/stream` })
+      const before = stateMock.mock.calls.length
+
+      await act(async () => {
+        vi.advanceTimersByTime(24_000)
+        await Promise.resolve(); await Promise.resolve()
+      })
+
+      expect(stateMock.mock.calls.length).toBe(before)
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
+  it('[perm-backstop] 当前会话没在跑 ⇒ 不轮询（无待回答交互的常态零额外请求）', async () => {
+    vi.useFakeTimers()
+    try {
+      stateMock.mockResolvedValue({ sessionId: SID, pendingPermissions: [] })
+      await mount([])
+      const before = stateMock.mock.calls.length
+
+      await act(async () => {
+        vi.advanceTimersByTime(24_000)
+        await Promise.resolve(); await Promise.resolve()
+      })
+
+      expect(stateMock.mock.calls.length).toBe(before)
+    } finally {
+      vi.useRealTimers()
+    }
   })
 
   it('⭐ 补拉的桌面控制请求 ⇒ computerUse 原样保留（防 F5 / 切会话后授权范围消失）', async () => {

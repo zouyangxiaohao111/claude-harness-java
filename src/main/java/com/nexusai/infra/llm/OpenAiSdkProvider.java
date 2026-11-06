@@ -677,11 +677,12 @@ public class OpenAiSdkProvider implements LlmProvider {
                                               ChatRequestOptions.ThinkingConfig thinkingConfig) {
         String sessionId = SessionIdResolver.resolve(history, null);
         OpenAIClient client = buildClient(config, sessionId);
-        boolean thinkingDisabled = thinkingConfig != null && "disabled".equals(thinkingConfig.type());
+        // [goal V253] thinking 类型透传：disabled / adaptive / null（不发字段）
+        String thinkingType = thinkingTypeOf(thinkingConfig);
         // 与 doStream 同参（同 history/tools/effort；includeUsage/streamingMainChain=false——非流式、非探针链）
         ChatCompletionCreateParams params = buildRequestParams(
             sdkModelName(modelName), systemPrompt, history, tools,
-            null, thinkingDisabled, null, effortValue, null,
+            null, thinkingType, null, effortValue, null,
             false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
         // 模型级额外请求体（models.extra_body）· 逐键合并（只增/覆盖）
         params = applyExtraBody(params, config);
@@ -818,8 +819,8 @@ public class OpenAiSdkProvider implements LlmProvider {
             ArrayNode tools = options != null ? options.tools() : null;
             JsonNode outputFormatSchema =
                 options != null && options.outputFormat() != null ? options.outputFormat().schema() : null;
-            boolean thinkingDisabled = options != null && options.thinkingConfig() != null
-                && "disabled".equals(options.thinkingConfig().type());
+            // [goal V253] thinking 类型透传：disabled / adaptive / null（不发字段）
+            String thinkingType = options != null ? thinkingTypeOf(options.thinkingConfig()) : null;
             // [P2-16] 对齐 CC claude.ts:744-745 abort 消费 — 请求前 signal.aborted 预检
             if (options != null && options.abortController() != null
                 && options.abortController().isCancelled()) {
@@ -840,7 +841,7 @@ public class OpenAiSdkProvider implements LlmProvider {
             OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
-                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens,
+                outputFormatSchema, thinkingType, temperature, null, maxTokens,
                 // [D 可观测性] 同上：显式走 12-param 主实现并带注入 header 数（原为经 9-param 链式落到
                 //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
                 false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
@@ -852,9 +853,9 @@ public class OpenAiSdkProvider implements LlmProvider {
 
             String content = extractContent(resp);
             if (log.isInfoEnabled()) {
-                log.info("[OpenAiSdkProvider] chatWithOptions: model={} contentLen={} messages={} outputFormat={} thinkingDisabled={} temperature={} maxTokens={} querySource={}",
+                log.info("[OpenAiSdkProvider] chatWithOptions: model={} contentLen={} messages={} outputFormat={} thinkingType={} temperature={} maxTokens={} querySource={}",
                     modelName, content.length(), history.size(),
-                    outputFormatSchema != null, thinkingDisabled,
+                    outputFormatSchema != null, thinkingType,
                     temperature, maxTokens,
                     options != null ? options.querySource() : null);
             }
@@ -902,8 +903,8 @@ public class OpenAiSdkProvider implements LlmProvider {
             ArrayNode tools = options != null ? options.tools() : null;
             JsonNode outputFormatSchema =
                 options != null && options.outputFormat() != null ? options.outputFormat().schema() : null;
-            boolean thinkingDisabled = options != null && options.thinkingConfig() != null
-                && "disabled".equals(options.thinkingConfig().type());
+            // [goal V253] thinking 类型透传：disabled / adaptive / null（不发字段）
+            String thinkingType = options != null ? thinkingTypeOf(options.thinkingConfig()) : null;
             // [P2-16] 对齐 CC claude.ts:744-745 abort 消费 — 请求前 signal.aborted 预检
             if (options != null && options.abortController() != null
                 && options.abortController().isCancelled()) {
@@ -923,7 +924,7 @@ public class OpenAiSdkProvider implements LlmProvider {
             OpenAIClient client = buildClient(config, sessionId);
             ChatCompletionCreateParams params = buildRequestParams(
                 sdkModelName(modelName), systemPrompt, history, tools,
-                outputFormatSchema, thinkingDisabled, temperature, null, maxTokens,
+                outputFormatSchema, thinkingType, temperature, null, maxTokens,
                 // [D 可观测性] 同上：显式走 12-param 主实现并带注入 header 数（原为经 9-param 链式落到
                 //   11-param，includeUsage/streamingMainChain 取值不变 ⇒ 仅多日志字段）。
                 false, false, ProviderHeaderInjector.injectableCount(config.extraHeaders()));
@@ -1192,6 +1193,22 @@ public class OpenAiSdkProvider implements LlmProvider {
     }
 
     /**
+     * [goal V253] 9-param 重载 · thinking 类型化入口（{@code thinkingType} 见 13-param 主实现 javadoc）。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         String thinkingType,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens) {
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingType, temperature, effortValue, maxTokens, false);
+    }
+
+    /**
      * [DEC-04] 带 includeUsage 的 buildRequestParams（10 参 · 保留旧签名）。
      *
      * <p>行为与 11 参重载<b>完全一致</b>，只差探针记账口径：本重载不带「是否流式主链」载荷 ⇒
@@ -1212,6 +1229,23 @@ public class OpenAiSdkProvider implements LlmProvider {
                                                          boolean includeUsage) {
         return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
             thinkingDisabled, temperature, effortValue, maxTokens, includeUsage, false);
+    }
+
+    /**
+     * [goal V253] 10-param 重载 · thinking 类型化入口。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         String thinkingType,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens,
+                                                         boolean includeUsage) {
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingType, temperature, effortValue, maxTokens, includeUsage, false);
     }
 
     /**
@@ -1237,6 +1271,53 @@ public class OpenAiSdkProvider implements LlmProvider {
         return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
             thinkingDisabled, temperature, effortValue, maxTokens, includeUsage, streamingMainChain,
             HEAD_PROBE_HDRS_UNKNOWN);
+    }
+
+    /**
+     * [goal V253] 11-param 重载 · thinking 类型化入口。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         String thinkingType,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens,
+                                                         boolean includeUsage,
+                                                         boolean streamingMainChain) {
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingType, temperature, effortValue, maxTokens, includeUsage, streamingMainChain,
+            HEAD_PROBE_HDRS_UNKNOWN);
+    }
+
+    /**
+     * [goal V253] {@link LlmProvider.ChatRequestOptions.ThinkingConfig} → wire 的 {@code thinking.type}。
+     *
+     * <p>映射（对齐 CC utils/thinking.ts:11-13 + OpenAI 兼容端点的 MiniMax 语义）：
+     * <ul>
+     *   <li>{@code type="disabled"} → {@code "disabled"}（发 {@code thinking:{type:"disabled"}}）</li>
+     *   <li>{@code type="adaptive"} → {@code "adaptive"}（发 {@code thinking:{type:"adaptive"}}）</li>
+     *   <li>其它 / null → {@code null}（<b>不发</b> {@code thinking} 字段）</li>
+     * </ul>
+     *
+     * <p>⚠️ 为什么需要 adaptive：<b>强制开启思考的模型会拒绝 disabled</b>
+     * （实测 MiniMax-M3.1-Flash：{@code requires adaptive thinking; thinking.type="disabled"
+     * is not allowed} ⇒ 400）。目标（/goal）评估器在这种模型上必须切 adaptive 才跑得起来。
+     */
+    static String thinkingTypeOf(LlmProvider.ChatRequestOptions.ThinkingConfig thinkingConfig) {
+        if (thinkingConfig == null) {
+            return null;
+        }
+        String type = thinkingConfig.type();
+        if (type == null) {
+            return null;
+        }
+        if ("disabled".equals(type) || "adaptive".equals(type)) {
+            return type;
+        }
+        return null;
     }
 
     /**
@@ -1268,6 +1349,44 @@ public class OpenAiSdkProvider implements LlmProvider {
                                                          ArrayNode tools,
                                                          JsonNode outputFormatSchema,
                                                          boolean thinkingDisabled,
+                                                         Double temperature,
+                                                         String effortValue,
+                                                         Integer maxTokens,
+                                                         boolean includeUsage,
+                                                         boolean streamingMainChain,
+                                                         int injectedCustomHeaderCount) {
+        // [goal V253] boolean 入口 → thinkingType 入口（向后兼容委托）
+        return buildRequestParams(modelName, systemPrompt, history, tools, outputFormatSchema,
+            thinkingDisabled ? "disabled" : null, temperature, effortValue, maxTokens,
+            includeUsage, streamingMainChain, injectedCustomHeaderCount);
+    }
+
+    /**
+     * [goal V253] buildRequestParams · 13-param 主实现（thinking 类型化）。
+     *
+     * <p><b>WHY 需要 String 型 {@code thinkingType}</b>：旧形参是 {@code boolean thinkingDisabled}，
+     * 只能表达「关思考 / 不带 thinking 参数」两种状态 ⇒ 无法表达 {@code {"type":"adaptive"}}。
+     * 而 <b>强制开启思考的模型（如 MiniMax-M3.1-Flash）会拒绝 {@code disabled}</b>
+     * （实测 400：{@code requires adaptive thinking; thinking.type="disabled" is not allowed}）
+     * ⇒ 目标（/goal）评估器需要能按模型能力切到 adaptive。
+     *
+     * <p><b>取值语义</b>（{@code thinkingType}）：
+     * <ul>
+     *   <li>{@code "disabled"} → 发 {@code thinking:{type:"disabled"}}（CC execPromptHook.ts:71）</li>
+     *   <li>{@code "adaptive"} → 发 {@code thinking:{type:"adaptive"}}（CC thinking.ts:11）</li>
+     *   <li>{@code null} → <b>不发</b> {@code thinking} 字段（让模型走自身默认；OpenAI 兼容端点的
+     *       「省略 = 默认开启思考」语义）</li>
+     * </ul>
+     *
+     * <p>⚠️ <b>非流式解析不受影响</b>：{@code extractContent} 只取 {@code message.content}，
+     * {@code reasoning_content} 在独立字段 ⇒ 模型的思考内容不会污染评估器的 JSON 解析。
+     */
+    public static ChatCompletionCreateParams buildRequestParams(String modelName,
+                                                         String systemPrompt,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         JsonNode outputFormatSchema,
+                                                         String thinkingType,
                                                          Double temperature,
                                                          String effortValue,
                                                          Integer maxTokens,
@@ -1340,9 +1459,11 @@ public class OpenAiSdkProvider implements LlmProvider {
             }
         }
         // [H13-GAP-3 v3] thinkingConfig disabled → thinking:{type:'disabled'}（CC execPromptHook.ts:71）.
-        if (thinkingDisabled) {
+        // [goal V253] 扩展：adaptive → thinking:{type:'adaptive'}（兼容强制思考的模型，如 MiniMax-M3.1-Flash）；
+        //   null → 不发 thinking 字段（让模型走自身默认）。
+        if (thinkingType != null && !thinkingType.isBlank()) {
             Map<String, Object> thinking = new LinkedHashMap<>();
-            thinking.put("type", "disabled");
+            thinking.put("type", thinkingType);
             b.putAdditionalBodyProperty("thinking", JsonValue.from(thinking));
         }
         // [P2-16] temperature（非 null 才发送，对齐 CC claude.ts:1717）

@@ -570,6 +570,16 @@ public class loadAgentsDir {
             builder.model("inherit".equals(trimmed.toLowerCase()) ? "inherit" : trimmed);
         }
 
+        // main-model · **本仓扩展**（CC 无此字段；用户 2026-11-05 裁定主线程也要能指定模型）
+        //   语义：{@code provider/name}，仅在**会话绑定该智能体**时覆盖主循环模型；
+        //   拿不到（模型不存在/被禁用）⇒ 回落会话当前模型。
+        //   ⚠️ 与上面的 {@code model:} 不冲突：{@code model:} 管子代理，{@code main-model:} 管主线程。
+        //   兼容写法：mainModel（驼峰）。
+        Object mainModelObj = fm.get("main-model") != null ? fm.get("main-model") : fm.get("mainModel");
+        if (mainModelObj instanceof String mm && !mm.trim().isEmpty()) {
+            builder.mainModel(mm.trim());
+        }
+
         // background · CC :575 ('true'/true -> true, 其余忽略)
         Object bg = fm.get("background");
         if (Boolean.TRUE.equals(bg) || "true".equals(bg)) builder.background(true);
@@ -691,7 +701,161 @@ public class loadAgentsDir {
         }
 
         // 注意: CC parseAgentFromMarkdown 不解析 omitClaudeMd (仅内置 agent 有) — 缺省 empty, 对齐 CC.
+
+        // ── 外部 CLI 运行时型（本仓扩展，非 CC 概念）──
+        //   语义（用户 2026-11-04 明确）：「**子**代理用这个运行时」，主代理仍走 NexusAI 自有循环。
+        //   故字段名是 sub-runtime（也接受 subRuntime / 旧 runtime 以兼容）。
+        Object runtimeObj = firstNonNull(fm, "sub-runtime", "subRuntime", "runtime");
+        if (!(runtimeObj instanceof String) && looksLikeExternalConfig(fm)) {
+            // 有 bin/args/streamFormat/promptVia 却没写 sub-runtime ⇒ 几乎一定是漏写。
+            // 若不提示，它会静默退化成「普通自定义 agent」（用进程内模型跑），用户看到的是
+            // 「配了 CLI 但答案像是模型自己编的」。此处 warn 不拒（可能是用户有意为之的自定义 agent）。
+            log.warn("[loadAgentsDir] agent '{}' 声明了外部运行时字段（bin/args/streamFormat/promptVia）"
+                    + "但缺 'sub-runtime' ⇒ 将按普通自定义 agent 处理（进程内模型）。若想接外部 CLI 请补 "
+                    + "sub-runtime: claude|codex|opencode|pi (file={})", agentType, filePath);
+        }
+        if (runtimeObj instanceof String runtimeStr && !runtimeStr.trim().isEmpty()) {
+            AgentDefinition.ExternalAgentDefinition.Builder ext =
+                AgentDefinition.ExternalAgentDefinition.builder(
+                    agentType, description, source, content.trim())
+                    .runtime(runtimeStr.trim())
+                    .filename(getFileNameWithoutExtension(Path.of(filePath)))
+                    .baseDir(baseDir);
+
+            Object binObj = fm.get("bin");
+            if (binObj instanceof String bs && !bs.trim().isEmpty()) ext.bin(bs.trim());
+
+            List<String> fallbackBins = parseStringList(fm.get("fallbackBins"));
+            if (!fallbackBins.isEmpty()) ext.fallbackBins(fallbackBins);
+
+            List<String> versionArgs = parseStringList(fm.get("versionArgs"));
+            if (!versionArgs.isEmpty()) ext.versionArgs(versionArgs);
+
+            List<String> extArgs = parseStringList(fm.get("args"));
+            if (!extArgs.isEmpty()) ext.args(extArgs);
+
+            Object pvObj = fm.get("promptVia");
+            if (pvObj instanceof String pv && !pv.trim().isEmpty()) ext.promptVia(pv.trim());
+
+            Object sfObj = fm.get("streamFormat");
+            if (sfObj instanceof String sf && !sf.trim().isEmpty()) ext.streamFormat(sf.trim());
+
+            Object timeoutObj = fm.get("timeoutMs");
+            if (timeoutObj instanceof Number tn) ext.timeoutMs(tn.longValue());
+
+            // capabilities: {streaming: true, resume: false, outputSchema: false, depthLimit: 0}
+            Object capsObj = fm.get("capabilities");
+            if (capsObj instanceof Map<?, ?> capsMap) {
+                AgentDefinition.ExternalAgentDefinition.Capabilities minimal =
+                    AgentDefinition.ExternalAgentDefinition.Capabilities.MINIMAL;
+                ext.capabilities(new AgentDefinition.ExternalAgentDefinition.Capabilities(
+                    boolFromMap(capsMap, "streaming", minimal.streaming()),
+                    boolFromMap(capsMap, "resume", minimal.resume()),
+                    boolFromMap(capsMap, "outputSchema", minimal.outputSchema()),
+                    intFromMap(capsMap, "depthLimit", minimal.depthLimit())));
+            }
+
+            Object extModelObj = fm.get("model");
+            if (extModelObj instanceof String ems && !ems.trim().isEmpty()
+                    && !"inherit".equalsIgnoreCase(ems.trim())) {
+                ext.model(ems.trim());
+            }
+            Object extPmObj = fm.get("permissionMode");
+            if (extPmObj instanceof String epm && !epm.trim().isEmpty()) ext.permissionMode(epm.trim());
+            Integer extMaxTurns = ParseSkillFrontmatter.parsePositiveIntFromFrontmatter(fm.get("maxTurns"));
+            if (extMaxTurns != null) ext.maxTurns(extMaxTurns);
+            Object extBg = fm.get("background");
+            if (Boolean.TRUE.equals(extBg) || "true".equals(extBg)) ext.background(true);
+            Object extEffort = fm.get("effort");
+            if (extEffort != null) ext.effort(extEffort.toString());
+            Object extColor = fm.get("color");
+            if (extColor != null) ext.color(extColor.toString());
+
+            // ── 高级覆盖项（正常只需写 sub-runtime，其余来自本机扫描到的预设）──
+            //   argsPrefix: 追加在内置 argv 之前（CLI 前缀开关必须在位置参数前）。
+            List<String> prefixArgs = parseStringList(fm.get("argsPrefix"));
+            if (!prefixArgs.isEmpty()) ext.argsPrefix(prefixArgs);
+            // ⛔ md 里不再接受 env（用户 2026-11-04）：md 会进版本库，密钥写进去就是明文外泄。
+            //   旧配置写了 env 时**显式告警**而不是静默忽略 —— 否则用户会以为代理/密钥还在生效。
+            if (fm.containsKey("env")) {
+                log.warn("[loadAgentsDir] agent '{}' 的 frontmatter 写了 env，该字段已废弃并被忽略；"
+                        + "配置目录 / base URL / API key 请到「设置 → 子代理运行时」里填（按 runtime 生效）"
+                        + " (file={})", agentType, filePath);
+            }
+
+            try {
+                AgentDefinition.ExternalAgentDefinition extDef = ext.build();
+                log.info("[loadAgentsDir] 外部运行时 agent '{}' 已解析: runtime={} stream={} promptVia={} "
+                        + "capabilities={} source={}",
+                    agentType, runtimeStr.trim(), extDef.streamFormat(),
+                    extDef.promptVia(), extDef.capabilities(), source);
+                return extDef;
+            } catch (IllegalArgumentException e) {
+                // fail-loud 到日志 + 丢弃该 agent：配置错误不该产出一个「看起来能用实则传不到任务」的 agent
+                log.error("[loadAgentsDir] 外部运行时 agent '{}' 配置非法, 已跳过: {} (file={})",
+                    agentType, e.getMessage(), filePath);
+                return null;
+            }
+        }
+
         return builder.build();
+    }
+
+    /** 是否声明了外部运行时专属字段（用于「漏写 runtime」的警示，不参与解析分支）。 */
+    private static boolean looksLikeExternalConfig(Map<String, Object> fm) {
+        return fm.containsKey("bin") || fm.containsKey("args")
+                || fm.containsKey("streamFormat") || fm.containsKey("promptVia")
+                || fm.containsKey("fallbackBins") || fm.containsKey("capabilities");
+    }
+
+    /** frontmatter 多键名取第一个存在者（兼容 sub-runtime / subRuntime / 旧 runtime）。 */
+    private static Object firstNonNull(Map<String, Object> fm, String... keys) {
+        for (String k : keys) {
+            Object v = fm.get(k);
+            if (v != null) return v;
+        }
+        return null;
+    }
+
+    /** frontmatter 字符串列表（支持 YAML 列表与逗号分隔串）。 */
+    private static List<String> parseStringList(Object raw) {        if (raw instanceof List<?> list) {
+            List<String> out = new ArrayList<>();
+            for (Object item : list) {
+                if (item != null && !item.toString().trim().isEmpty()) out.add(item.toString().trim());
+            }
+            return out;
+        }
+        if (raw instanceof String s && !s.trim().isEmpty()) {
+            List<String> out = new ArrayList<>();
+            for (String part : s.split(",")) {
+                if (!part.trim().isEmpty()) out.add(part.trim());
+            }
+            return out;
+        }
+        return List.of();
+    }
+
+    private static boolean boolFromMap(Map<?, ?> map, String key, boolean fallback) {
+        Object v = map.get(key);
+        if (v instanceof Boolean b) return b;
+        if (v instanceof String s) {
+            if ("true".equalsIgnoreCase(s.trim())) return true;
+            if ("false".equalsIgnoreCase(s.trim())) return false;
+        }
+        return fallback;
+    }
+
+    private static int intFromMap(Map<?, ?> map, String key, int fallback) {
+        Object v = map.get(key);
+        if (v instanceof Number n) return n.intValue();
+        if (v instanceof String s) {
+            try {
+                return Integer.parseInt(s.trim());
+            } catch (NumberFormatException ignore) {
+                return fallback;
+            }
+        }
+        return fallback;
     }
 
     /** CC loadAgentsDir.ts:657 filename = basename without .md */

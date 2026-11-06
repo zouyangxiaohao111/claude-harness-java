@@ -135,9 +135,120 @@ public class GoalService {
         return g != null && g.isActive();
     }
 
-    /** 该会话的 prompt Stop hook 是否已挂（内存态判据）。 */
+    /**
+     * 该会话的 prompt Stop hook 是否真的挂在注册表上。
+     *
+     * <p>⚠️ <b>不能只看 {@link #armedConditions} 这个内存标记</b>：hook 会被本类之外的路徑摘掉
+     * （{@code HookRegistry.executeSessionEndHooks} 的 finally 会 {@code clearSessionHooks}
+     * 清空整张表，见 {@code HookRegistry:4737}）。内存标记不知道这件事 ⇒ 单看内存会得出
+     * 「还挂着」的假象：{@code restoreForResume} 的 fresh 守卫据此提前返回、不补挂，
+     * 目标 hook 就此永久丢失（真机 sess-189e74fa：21:24:57 被清理后直到用户手动发消息都没再挂上）。
+     *
+     * <p>注册表未接线时（单元测试 / 非容器上下文）无从核实 ⇒ 沿用内存标记（老行为）。
+     */
     public boolean isArmed(String sessionId) {
-        return sessionId != null && armedConditions.containsKey(sessionId);
+        if (sessionId == null) {
+            return false;
+        }
+        String condition = armedConditions.get(sessionId);
+        if (condition == null) {
+            return false;
+        }
+        HookRegistry registry = hookRegistry();
+        if (registry == null) {
+            return true;
+        }
+        return isHookRegistered(registry, sessionId, condition);
+    }
+
+    /**
+     * 注册表里是否真有一个 prompt == condition 的 Stop hook。
+     *
+     * <p>按文本精确匹配（{@link #arm} 把 {@code prompt} 设成目标条件原文），
+     * 与 {@link #isGoalHookResult} 同一判据 —— 用户自配的 prompt hook 不会被误认成 goal hook。
+     */
+    private boolean isHookRegistered(HookRegistry registry, String sessionId, String condition) {
+        if (registry == null || condition == null) {
+            return false;
+        }
+        try {
+            Map<HookEventType, java.util.List<
+                com.nexusai.application.agent.permission.hook.SessionHookStore.SessionDerivedHookMatcher>> all =
+                registry.getSessionHooks(sessionId, HookEventType.STOP);
+            if (all == null) {
+                return false;
+            }
+            java.util.List<com.nexusai.application.agent.permission.hook.SessionHookStore.SessionDerivedHookMatcher>
+                matchers = all.get(HookEventType.STOP);
+            if (matchers == null) {
+                return false;
+            }
+            for (var m : matchers) {
+                if (m == null || m.hooks() == null) {
+                    continue;
+                }
+                for (var h : m.hooks()) {
+                    if (h instanceof PromptHook ph && condition.equals(ph.prompt())) {
+                        return true;
+                    }
+                }
+            }
+            return false;
+        } catch (Exception e) {
+            // 核实失败 ⇒ 不作「已丢失」处理（fail-soft：宁可少补挂一次，也不要在注册表异常时
+            //   反复 add 出重复 hook）
+            log.warn("[goal] 查询 Stop hook 注册表失败（按仍在挂载处理）session={}: {}", sessionId, e.toString());
+            return true;
+        }
+    }
+
+    /**
+     * 确保「有活跃目标 ⇒ 注册表里就有对应的 prompt Stop hook」这条不变式成立。
+     *
+     * <p><b>WHY 需要主动补挂</b>：{@code HookRegistry.executeSessionEndHooks} 在每次
+     * {@code LlmAgentLoop.run()} 结束时（finally）无条件 {@code clearSessionHooks}，
+     * 会把 goal hook 一起清掉。对齐 CC 的做法是 SessionEnd 只在「/clear」与「进程关闭」时执行
+     * （{@code claude-code-best/src/utils/gracefulShutdown.ts:468}、
+     * {@code src/commands/clear/conversation.ts:91}），本仓按 run 执行属于结构性偏差。
+     * 在不改动 SessionEnd 语义的前提下，用本方法在每轮<b>开始前</b>把不变式补回来 ——
+     * 覆盖主路径、cron 后台轮、check-in 轮全部 run 形态（它们都经 {@code LlmAgentLoop.doRun}）。
+     *
+     * <p>幂等：已挂着就只同步内存标记，不重复 add。
+     *
+     * <p><b>不补挂的两种情况</b>：
+     * <ul>
+     *   <li>延迟评估中（{@link #deferredSessions}）—— {@link #deferEvaluationForBackground}
+     *       是<b>故意</b>摘掉的，补回来会让子代理未跑完时就评估；</li>
+     *   <li>目标已暂停 / 已终态 —— 暂停态是「等用户发消息」的显式状态，不该自动重挂。</li>
+     * </ul>
+     *
+     * @param sessionId 会话 ID
+     */
+    public void ensureArmed(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        if (deferredSessions.contains(sessionId)) {
+            return;
+        }
+        SessionGoal g = getGoal(sessionId);
+        if (g == null || !g.isActive()) {
+            // 无目标 / 已暂停 / 已终态 ⇒ 顺手清掉可能残留的内存标记（防止它再骗过 fresh 守卫）
+            armedConditions.remove(sessionId);
+            return;
+        }
+        HookRegistry registry = hookRegistry();
+        if (registry == null) {
+            return;
+        }
+        if (isHookRegistered(registry, sessionId, g.condition())) {
+            armedConditions.put(sessionId, g.condition());
+            return;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[goal] 目标 hook 不在注册表里（多由 SessionEnd 清理所致）⇒ 补挂 session={}", sessionId);
+        }
+        arm(sessionId, g.condition());
     }
 
     /**
@@ -173,6 +284,175 @@ public class GoalService {
             goalPrompt = g == null ? null : g.condition();
         }
         return goalPrompt != null && goalPrompt.equals(ph.prompt());
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // Stop hook 结果的统一消费（两处执行点共用）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 一个 Stop hook 结果对目标的最终影响。
+     *
+     * @param kind        影响类型
+     * @param trace       需要落进本轮「已完成」折叠区的溯源消息（无 → null）
+     */
+    public record GoalVerdict(Kind kind, com.nexusai.model.session.dto.ChatMessageDto trace) {
+        /** 影响类型。 */
+        public enum Kind {
+            /** 与本会话目标无关（用户的其它 prompt hook / 非 goal hook）。 */
+            IGNORED,
+            /** 评估器判达成。 */
+            MET,
+            /** 评估器判无法达成。 */
+            IMPOSSIBLE,
+            /** 评估器判未达成（需要继续 block 重入）。 */
+            NOT_MET,
+            /** 评估器自身报错（对齐 CC {@code $e="error"}）。 */
+            EVALUATOR_ERROR,
+            /** 评估器超时 / 被取消。 */
+            CANCELLED
+        }
+    }
+
+    /**
+     * 判断并消费一个 Stop hook 结果 · <b>两处执行点共用这一份语义</b>。
+     *
+     * <p><b>WHY 必须抽成方法（B2）</b>：本仓 Stop hook 有两个执行点 —— 循环内纯文本分支
+     * （{@code LlmAgentLoop:8994} 附近）与循环退出后的 §14 兜底（{@code :9500} 之后）。
+     * 旧实现只在循环内那段消费 goal 三态，§14 段完全没有 ⇒ 走 §14 的轮次即使评估器
+     * 判了达成也不回写终态，UI 永远显示「还在追」。两处共用本方法后结构上不可能再漂移。
+     *
+     * <p><b>WHY 判据必须按 hook 身份（B1）</b>：对齐 CC v2.1.318 ——
+     * <pre>
+     * let ft=(pe)=&gt;(h.sessionHooksRegistry.get(z(),"Stop").get("Stop")??[])
+     *   .flatMap(ve=&gt;ve.hooks).some(ve=&gt;xhr(ve,pe))?pe:void 0;
+     * ...
+     * if(Oe.hookEvent==="Stop"&amp;&amp;ve){ ... if(tt?.condition===ve.prompt){...} }
+     * </pre>
+     * 旧实现用「任意 PromptHook 型 SUCCESS」当达成判据 ⇒ 用户自己配的 prompt Stop hook
+     * 一旦返回成功，目标就被误判为达成（反之用户 hook 的 blocking 也会被当成目标未达成）。
+     *
+     * @param sessionId 会话 ID
+     * @param result    单个 hook 结果（可 null）
+     * @return 影响结论（{@code IGNORED} = 与本会话目标无关）
+     */
+    public GoalVerdict consumeStopHookResult(String sessionId, GenericHook.HookResult result) {
+        if (sessionId == null || result == null) {
+            return new GoalVerdict(GoalVerdict.Kind.IGNORED, null);
+        }
+        // [goal-observability] 入口留痕：本方法是 goal 与 Stop hook 的**唯一**汇合点，
+        //   而下面两处提前 return（身份不符 / 目标已非 live）此前**一条日志都没有**
+        //   ⇒ 日志里看到「hook 跑了但目标没动」时无从分辨是哪种原因。
+        //   两条分支各打一条 info（含 sessionId + 判定依据），成功分支沿用既有日志。
+        // ① 身份校验：不是本会话 goal hook 的结果 ⇒ 与本目标无关
+        if (!isGoalHookResult(sessionId, result)) {
+            if (log.isInfoEnabled()) {
+                log.info("[goal] Stop hook 结果与本会话目标无关 ⇒ 跳过（session={} outcome={} 来源={}）",
+                    sessionId, result.outcome(),
+                    result.hook() == null ? null : result.hook().type());
+            }
+            return new GoalVerdict(GoalVerdict.Kind.IGNORED, null);
+        }
+        SessionGoal g = getGoal(sessionId);
+        if (g == null || !g.isLive()) {
+            // 身份已确认是本会话的 goal hook，但目标已终态/已清 ⇒ 结果按无效丢弃。
+            // ⚠️ 这条与上一条必须区分：前者是「别的 hook」，本条是「本目标的 hook 但目标已收尾」。
+            if (log.isInfoEnabled()) {
+                log.info("[goal] goal hook 有结果但目标已非活跃 ⇒ 丢弃（session={} phase={} outcome={}）",
+                    sessionId, g == null ? null : g.phase(), result.outcome());
+            }
+            return new GoalVerdict(GoalVerdict.Kind.IGNORED, null);
+        }
+        // ② impossible（评估器判「条件根本不可能达成」）
+        if (Boolean.TRUE.equals(result.impossible())) {
+            SessionGoal done = recordImpossible(sessionId);
+            log.info("[goal] 评估器判定条件不可能达成 → 目标停止推进（session={}）", sessionId);
+            return new GoalVerdict(GoalVerdict.Kind.IMPOSSIBLE,
+                done == null ? null : buildTerminalTraceMessage(done));
+        }
+        // ③ 评估器自身失败（非本目标的 blocking 语义）
+        //   [B6 2026-11-04] 对齐 CC v2.1.318：error 不是「目标失败」，而是「这次判定没做成」——
+        //   CC 走 su()/kg() 的 {kind:"retry", cause:"goal_check"}，按 60/300/900 秒三档重试。
+        //   本仓的等价做法：写 deferredSince（让 GoalCheckinScheduler 的下一拍重新触发一轮），
+        //   并把 checkinCount 当重试计数用（超过 MAX_AUTO_RETRIES 就停）。
+        if (result.outcome() == GenericHook.HookOutcome.NON_BLOCKING_ERROR) {
+            scheduleEvaluatorRetry(sessionId, g);
+            return new GoalVerdict(GoalVerdict.Kind.EVALUATOR_ERROR, null);
+        }
+        if (result.outcome() == GenericHook.HookOutcome.CANCELLED) {
+            log.info("[goal] 评估器被取消 / 超时，目标保持不变（session={}）", sessionId);
+            return new GoalVerdict(GoalVerdict.Kind.CANCELLED, null);
+        }
+        // ④ 达成：prompt hook 返回 SUCCESS 且非 impossible
+        if (result.outcome() == GenericHook.HookOutcome.SUCCESS) {
+            SessionGoal done = recordAchieved(sessionId);
+            log.info("[goal] 评估器判定条件已满足 → 目标达成（session={}）", sessionId);
+            return new GoalVerdict(GoalVerdict.Kind.MET,
+                done == null ? null : buildTerminalTraceMessage(done));
+        }
+        // ⑤ 未达成：blockingError ⇒ iterations++ + lastReason
+        if (result.blockingError() != null) {
+            recordNotMet(sessionId, result.stopReason());
+            return new GoalVerdict(GoalVerdict.Kind.NOT_MET, null);
+        }
+        return new GoalVerdict(GoalVerdict.Kind.IGNORED, null);
+    }
+
+    /**
+     * 评估器报错后的自动重试排程 · 对齐 CC v2.1.318 的 {@code su()} 重试分支。
+     *
+     * <p>CC 原文要点：
+     * <pre>
+     * if(M.kind==="retry"){
+     *   if(x&gt;=Fi){ ... announced:"gave_up"
+     *     yield Mw(`Goal paused after ${Fi} automatic retries · ${J} · send a message to continue`,"warning"); return }
+     *   let K=Di[x]??Di[0];                                   // 60s / 300s / 900s
+     *   $a({goal:S,cause:J,...}, Math.round(K*(1+Math.random()*yg)))   // 排下一次重试
+     *   yield Mw(`Goal still active · ${J} · retrying in ${Math.round(K/60000)} min (${x+1}/${Fi}) · ...`,"notice")
+     * }
+     * </pre>
+     *
+     * <p><b>本仓的落地形态</b>：CC 用 {@code setTimeout} 直接排程；本仓是 Web 多会话
+     * ⇒ 写 {@code retryAt} + {@code retryCount}（<b>不复用</b> {@code checkinCount}，
+     * 两者是不同语义的退避），由 {@link GoalCheckinScheduler} 的 tick 在到期后重新触发一轮。
+     *
+     * <p><b>不可恢复错误</b>（auth / disk_full / billing / context_limit / model_unavailable）
+     * ⇒ CC 走 {@code ru()} 直接清目标并给 warning；这里同样清，避免无限重试白烧。
+     *
+     * @param sessionId 会话 ID
+     * @param goal      当前目标快照
+     */
+    private void scheduleEvaluatorRetry(String sessionId, SessionGoal goal) {
+        try {
+            int attempts = goal.retryCount() == null ? 0 : goal.retryCount();
+            if (attempts >= GoalCheckinConfig.MAX_AUTO_RETRIES) {
+                // [goal-gave-up 2026-11-04] 对齐 CC su() 的 gave_up 分支：
+                //   `if(x>=Fi){ ... announced:"gave_up"
+                //     yield Mw(`Goal paused after ${Fi} automatic retries · ${J} ·
+                //               send a message to continue`,"warning"); return }`
+                //   ⛔ 旧实现只打一条 warn 就 return，目标静默留在 ACTIVE —— 用户看到一个
+                //   永远不推进的目标头，既不知道评估器一直在失败、也没有任何继续的入口。
+                //   ⇒ 转 PAUSED：保留 condition / iterations / lastReason，发一条消息即
+                //   resumeFromPause 恢复追踪（灰条 +「已暂停 · 发消息继续」本身就是告知）。
+                //   countIteration=false：这几轮评估器全失败，没有任何一轮真正得出过结论。
+                String reason = "评估器连续 " + attempts + " 次失败，目标已暂停 · 发消息继续";
+                recordPaused(sessionId, reason, false);
+                log.warn("[goal] 评估器连续失败 {} 次（上限 {}），已暂停目标（发消息可继续）session={}",
+                    attempts, GoalCheckinConfig.MAX_AUTO_RETRIES, sessionId);
+                return;
+            }
+            long now = System.currentTimeMillis();
+            long nextMs = GoalCheckinConfig.retryIntervalMs(attempts);
+            // 用独立字段 retryAt/retryCount 承载（⛔ 不复用 checkinCount：那是后台延迟
+            //   check-in 的语义，混用会让两种退避互相污染）。
+            SessionGoal updated = goal.withRetry(now + nextMs, attempts + 1);
+            sessionService.setGoal(sessionId, updated);
+            publish(sessionId, updated);
+            log.warn("[goal] 评估器执行失败，{} 分钟后自动重试（第 {}/{} 次）session={}",
+                Math.round(nextMs / 60_000.0), attempts + 1, GoalCheckinConfig.MAX_AUTO_RETRIES, sessionId);
+        } catch (Exception e) {
+            log.warn("[goal] 排评估器重试失败（目标保持不变）session={}: {}", sessionId, e.toString());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -277,7 +557,10 @@ public class GoalService {
         if (g == null) {
             return null;
         }
-        SessionGoal updated = g.withIterations(g.iterations() + 1).withReason(reason);
+        // [B6 2026-11-04] 评估器**成功给出了判定**（未达成也是判定）⇒ 清掉重试计数。
+        //   retryCount 的唯一归零点就是这里 / recordAchieved / recordImpossible ——
+        //   ⛔ 不在「重试到点消费」时清（那样上限永远到不了 = 无限重试）。
+        SessionGoal updated = g.withIterations(g.iterations() + 1).withReason(reason).clearRetryFully();
         sessionService.setGoal(sessionId, updated);
         publish(sessionId, updated);
         log.info("[GoalService] 目标未达成, session={} 第 {} 轮, reason={}",
@@ -292,32 +575,27 @@ public class GoalService {
      * {@code yield {type:"active_goal", value:undefined}} ⇒ <b>清活动目标</b>，
      * 并 append {@code goal_status}（met:true / failed:true）。
      *
-     * <p>⚠️ <b>为什么达成后列要置 null 而不是留 phase=achieved</b>：列是<b>真源</b>，
-     * 读侧（GET /goal、resume 恢复）都按「列里有值 = 该会话有目标」解释 ⇒ 若列里留着
-     * {@code phase=achieved}，切会话/F5 会把一条<b>已结束</b>的目标重新拉回前端（绿条复活），
-     * resume 也会看到一条「曾经达成」的目标。达成这件事由两处承载：
+     * <p><b>终态留列（与 impossible 一致）</b>：「达成」是既成事实，DB 里应留权威痕迹 ——
+     * 否则 F5 后只剩推送痕迹、无权威状态可读。
+     *
+     * <p><b>为什么留列不会让绿条复活</b>（曾担心的问题）：绿条复活的前提是「读侧把列里
+     * 非 active 的终态也当成目标」。本仓三处读侧都<b>只认 active</b>：
      * <ul>
-     *   <li><b>即时</b>：本次 {@code publish(sessionId, achieved)} 推 STOMP ⇒ 前端显绿条</li>
-     *   <li><b>历史</b>：{@code goal_status} 溯源行落进该轮「已完成」折叠区（messages，append-only）</li>
+     *   <li>{@link #restoreForResume}：{@code if (!g.isActive()) return null} ⇒ 终态不复活；</li>
+     *   <li>前端 {@code GoalHead}：{@code phase==='achieved'} 时显示绿条 + 6 秒后自行清列
+     *       （绿条是一次性提示，不是常驻目标）；</li>
+     *   <li>{@code phase==='impossible'} 时红条<b>常驻</b>，等用户手动清（UI 裁定）。</li>
      * </ul>
-     * ⇒ 列只存「当前还在追的目标」，终态不驻留。
+     * ⇒ 列存「该会话的目标及其当前阶段」，阶段决定读侧怎么显示，不是「有没有目标」。
      *
      * @param sessionId 会话 ID
      * @return 完成后的目标快照（供调用方落溯源行）；无目标 → null
      */
     public SessionGoal recordAchieved(String sessionId) {
-        SessionGoal g = getGoal(sessionId);
-        if (g == null) {
-            return null;
-        }
-        SessionGoal achieved = g.withIterations(g.iterations() + 1).withPhase(SessionGoal.Phase.ACHIEVED);
-        disarm(sessionId);
-        // 列置 null（终态不驻留 · 见 javadoc）—— 但先把 achieved 快照推给前端（绿条）
-        publish(sessionId, achieved);
-        sessionService.setGoal(sessionId, null);
-        log.info("[GoalService] 目标达成, session={} 第 {} 轮（列已清 · 终态只留推送与溯源行）",
-            sessionId, achieved.iterations());
-        return achieved;
+        // [goal V253] 终态**留列**（与 impossible 一致）——
+        //   「达成」是既成事实，DB 里应留痕（否则 F5 后只剩推送痕迹、无权威状态）。
+        //   前端绿条淡出后由前端自行清列（见 GoalHead 的 6 秒定时器）。
+        return finish(sessionId, SessionGoal.Phase.ACHIEVED);
     }
 
     /**
@@ -339,13 +617,113 @@ public class GoalService {
         return finish(sessionId, SessionGoal.Phase.IMPOSSIBLE);
     }
 
+    /**
+     * 评估器反复判定未达成、撞 Stop-hook block-cap ⇒ <b>暂停</b>目标（不报错终止）。
+     *
+     * <p><b>CC 语义（claude.exe v2.1.318）</b>：
+     * <pre>
+     * not_met → 继续 block + 重入，最多 CLAUDE_CODE_STOP_HOOK_BLOCK_CAP（默认 8）次
+     *   ∥
+     * 撞 cap → 打 warning「A hook blocked the turn from ending N consecutive times —
+     *          overriding and ending turn」→ return {reason:"completed", goalPass:"not_met"}
+     *   ∥
+     * su()/kg()/bg("not_met") → {kind:"pause", cause:"goal_check_capped"}
+     *   → 目标 pause + 提示「Goal paused · goal checks kept finding it unmet this turn ·
+     *      send a message to continue」
+     * </pre>
+     *
+     * <p><b>本仓旧实现的偏离（本次修复）</b>：撞 cap 时 {@code setError(...) +
+     * STOP_HOOK_BLOCKING_LIMIT_EXCEEDED + break} = <b>报错终止</b>，用户看到的是失败而不是
+     * 「目标暂停，发消息继续」。
+     *
+     * <p><b>为什么暂停而不是清空</b>：暂停保留了 condition / iterations / lastReason，
+     * 用户发下一条消息即可继续（{@link #resumeFromPause}）；清空则要重新 /goal。
+     *
+     * @param sessionId 会话 ID
+     * @param reason    暂停原因（写进 lastReason，前端「最近一次判定」显示）
+     * @return 暂停后的目标；无目标 → null
+     */
+    public SessionGoal recordPaused(String sessionId, String reason) {
+        return recordPaused(sessionId, reason, true);
+    }
+
+    /**
+     * 暂停目标 · 可选是否把本次暂停算作一轮评估。
+     *
+     * @param sessionId      会话 ID
+     * @param reason         暂停原因（写进 lastReason，前端「最近一次判定」显示）
+     * @param countIteration 本次暂停是否算一轮评估：
+     *                       <ul>
+     *                         <li>{@code true} —— 评估器<b>给出了结论</b>（判未达成撞 cap）。
+     *                             调用点：{@code LlmAgentLoop} 的 goal_check_capped 分支。</li>
+     *                         <li>{@code false} —— 评估器<b>连续报错放弃</b>，没有任何一轮真正
+     *                             评出结论。调用点：{@code scheduleEvaluatorRetry} 的 gave_up
+     *                             分支（对齐 CC {@code su()} 的 {@code announced:"gave_up"}）。</li>
+     *                       </ul>
+     * @return 暂停后的目标；无目标（含期间已被清除）→ null
+     */
+    public SessionGoal recordPaused(String sessionId, String reason, boolean countIteration) {
+        SessionGoal g = getGoal(sessionId);
+        if (g == null) {
+            return null;
+        }
+        SessionGoal progressed = countIteration ? g.withIterations(g.iterations() + 1) : g;
+        SessionGoal updated = progressed
+            .withReason(reason)
+            .withPhase(SessionGoal.Phase.PAUSED)
+            // [B6 2026-11-04] 暂停 = 评估器成功判了一轮的结论 ⇒ 清重试计数
+            //   （否则下一次用户发消息继续时，会带着上一轮的 retryCount 起算）
+            .clearRetryFully();
+        sessionService.setGoal(sessionId, updated);
+        // 暂停态摘 hook：本轮不再续评。用户下一条消息触发 resumeFromPause 才重挂。
+        disarm(sessionId);
+        publish(sessionId, updated);
+        log.info("[GoalService] 目标暂停 phase=PAUSED, session={} 第 {} 轮, reason={}",
+            sessionId, updated.iterations(), reason);
+        return updated;
+    }
+
+    /**
+     * 用户发了新消息 ⇒ 暂停态自动恢复为推进态并重挂 Stop hook · 对齐 CC。
+     *
+     * <p><b>CC 语义</b>：pause 只是 {@code bg()→{kind:"pause"}} 的行为层结论，
+     * {@code activeGoal} 本身还在（hook 也在），所以用户下一条消息进入新一轮时目标自然继续。
+     * 本仓 pause 是显式 phase 值且摘了 hook ⇒ 必须在新一轮开始时显式恢复。
+     *
+     * <p><b>何时调用</b>：{@code LlmAgentLoop} 每轮入口 / {@code ChatService} 恢复目标时。
+     * 只对 {@code PAUSED} 生效（ACTIVE 已挂着 hook，不需要重挂；终态不复活）。
+     *
+     * @param sessionId           会话 ID
+     * @param currentOutputTokens 当前输出 token 累计值（CC {@code DA()} 口径；重挂时重置基线）
+     * @return 恢复后的目标；无需恢复 → null
+     */
+    public SessionGoal resumeFromPause(String sessionId, long currentOutputTokens) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        SessionGoal g = getGoal(sessionId);
+        if (g == null || !g.isPaused()) {
+            return null;
+        }
+        SessionGoal resumed = new SessionGoal(
+            g.condition(), SessionGoal.Phase.ACTIVE, g.iterations(),
+            System.currentTimeMillis(), currentOutputTokens, null);
+        sessionService.setGoal(sessionId, resumed);
+        arm(sessionId, resumed.condition());
+        publish(sessionId, resumed);
+        log.info("[GoalService] 目标从暂停恢复为推进态（用户发来新消息）session={} 已评估 {} 轮",
+            sessionId, resumed.iterations());
+        return resumed;
+    }
+
     /** 终态统一处理：更新列 + 摘 hook。 */
     private SessionGoal finish(String sessionId, SessionGoal.Phase phase) {
         SessionGoal g = getGoal(sessionId);
         if (g == null) {
             return null;
         }
-        SessionGoal updated = g.withIterations(g.iterations() + 1).withPhase(phase);
+        // [B6 2026-11-04] 终态 ⇒ 清重试排程与计数（评估器成功给出了终局判定）
+        SessionGoal updated = g.withIterations(g.iterations() + 1).withPhase(phase).clearRetryFully();
         sessionService.setGoal(sessionId, updated);
         disarm(sessionId);
         publish(sessionId, updated);
@@ -358,18 +736,30 @@ public class GoalService {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 轮首恢复目标 · 对齐 CC {@code restoreGoalFromTranscript}（但真源读列而非反推 transcript）。
+     * 轮首恢复目标 · 语义 = <b>只把「内存态」读回来</b>（真正的目标数据在 {@code sessions.goal} 列）。
      *
-     * <p>CC 规则：
+     * <p><b>CC 语义（src/services/goal/goalState.ts）</b>：CC 的 goal 是纯内存 {@code Map}，
+     * 进程重启就没了；{@code turnsExecuted} 的<b>唯一归零点</b>是
+     * {@code setGoal()}（新目标）与 {@code continueGoalFromMaxTurns()}（用户显式
+     * {@code /goal continue}）；{@code resumeGoal()} 只重置 {@code startTime}，
+     * <b>保留</b> {@code turnsExecuted}。
+     *
+     * <p>⛔ <b>本方法不得重置任何计数/基线</b>。此前它在重挂 hook 时顺手写了
+     * {@code iterations=0 / setAt=now / tokensAtStart=当前}，而它挂在
+     * {@code ChatService.processUserMessage}（<b>每条用户消息</b>）上 ⇒
+     * 评估器刚记下的「第 N 轮」与「已运行时长」被每条消息清零 ⇒
+     * 目标头恒显示「第 1 轮」、时间恒从最新一条消息起算（真机日志
+     * 09:35:20 记第 1 轮 → 09:40:02 / 09:44:41 两次 restore 归零）。
+     *
+     * <p>CC 的规则逐条对应：
      * <ol>
-     *   <li>内存已 armed ⇒ 跳过（fresh 守卫，防重复挂 hook）</li>
-     *   <li>目标已 met/failed ⇒ 不恢复</li>
-     *   <li>否则重新注册 prompt hook，并<b>重置</b> {@code iterations=0} / {@code setAt=now} /
-     *       {@code tokensAtStart=当前}</li>
+     *   <li>内存已 armed 且注册表里真有这个 hook ⇒ 跳过（fresh 守卫）</li>
+     *   <li>目标已 met/failed ⇒ 不恢复（终态不复活）</li>
+     *   <li>否则<b>仅</b>重新注册 prompt hook，状态字段原样保留</li>
      * </ol>
      *
      * @param sessionId 会话 ID
-     * @param currentOutputTokens 当前输出 token 累计值（CC {@code DA()} 口径）
+     * @param currentOutputTokens 当前输出 token 累计值（本方法已不再使用，保留入参以兼容调用点）
      * @return 恢复后的目标；无需恢复 / 无目标 → null
      */
     public SessionGoal restoreForResume(String sessionId, long currentOutputTokens) {
@@ -377,26 +767,39 @@ public class GoalService {
             return null;
         }
         // fresh 守卫：已 armed 且条件一致 ⇒ 不重复挂（照 ChatService.restoreWorktreeForResume 的形状）
+        //   ⚠️ 判据必须核实注册表：hook 可能被 SessionEnd 的 clearSessionHooks 摘掉，而内存标记
+        //   不知道 ⇒ 只看内存会「以为还挂着」直接返回，目标 hook 永久丢失。
         String armed = armedConditions.get(sessionId);
         SessionGoal g = getGoal(sessionId);
         if (g == null) {
             return null;
         }
-        if (armed != null && armed.equals(g.condition())) {
+        if (armed != null && armed.equals(g.condition()) && isArmed(sessionId)) {
             return g;
+        }
+        if (armed != null) {
+            // 内存说有、注册表说没有（或条件已过期）⇒ 丢掉过期标记，走下面重新挂
+            armedConditions.remove(sessionId);
+        }
+        // [B7 · 2026-11-04] 暂停态 ⇒ 用户发来消息即为「继续」，恢复推进（对齐 CC）：
+        //   CC 的 pause 只是行为层结论（activeGoal + hook 都还在），用户下一条消息自然续评；
+        //   本仓 pause 是显式 phase 且摘了 hook ⇒ 必须在这里显式恢复，而不是要求 /goal resume。
+        if (g.isPaused()) {
+            return resumeFromPause(sessionId, currentOutputTokens);
         }
         // 已完成 / 已放弃的目标不复活
         if (!g.isActive()) {
             return null;
         }
-        // 重置计时与 token 基线（CC 同款）
-        SessionGoal restored = new SessionGoal(
-            g.condition(), SessionGoal.Phase.ACTIVE, 0, System.currentTimeMillis(), currentOutputTokens, null);
-        sessionService.setGoal(sessionId, restored);
-        arm(sessionId, restored.condition());
-        publish(sessionId, restored);
-        log.info("[GoalService] restoreForResume: session={} 目标已恢复（重置 setAt/tokensAtStart 基线）", sessionId);
-        return restored;
+        // ⛔ 只重挂 hook，**不重写目标状态**：iterations / setAt / tokensAtStart / lastReason
+        //   全部原样保留。CC 的 turnsExecuted 只在 setGoal（新目标）与 /goal continue 归零，
+        //   resume 时保留（goalState.ts resumeGoal 只重置 startTime）。
+        //   ⇒ 这里连 setGoal/publish 都不需要：列里的值本来就是正确的，多写一次反而制造
+        //   「读取-写到一半进程挂掉」的窗口。
+        arm(sessionId, g.condition());
+        log.info("[GoalService] restoreForResume: session={} 目标 hook 已重挂（第 {} 轮，状态原样保留）",
+            sessionId, g.iterations());
+        return g;
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -471,7 +874,47 @@ public class GoalService {
         PromptHook promptHook = new PromptHook(condition, null, null, null, null, null);
         registry.removeSessionHook(sessionId, HookEventType.STOP, promptHook);
         deferredSessions.add(sessionId);
+        // [B5 2026-11-04] 把延迟起点写进列 ⇒ GoalCheckinScheduler 才能跨请求看到它。
+        //   对齐 CC v2.1.318：`let ve=Qa(j,pe,Date.now()); Ke=ve.nextGoal;` 里
+        //   Qa() 产出的 nextGoal 带 deferredSince/checkinCount/lastDeferralPassAt 三字段。
+        //   ⚠️ 只写 deferredSince（首次进入延迟时），不重置已有计数 —— 否则退避永远回不到 2x/4x。
+        try {
+            SessionGoal g = getGoal(sessionId);
+            if (g != null && g.deferredSince() == null) {
+                long now = System.currentTimeMillis();
+                SessionGoal updated = g.withDeferral(now, 0, now);
+                sessionService.setGoal(sessionId, updated);
+                publish(sessionId, updated);
+            }
+        } catch (Exception e) {
+            log.warn("[goal] 写入延迟评估起点失败（不影响本轮不评估）session={}: {}",
+                sessionId, e.toString());
+        }
         log.info("[goal] evaluation deferred — background work still running (session={})", sessionId);
+        return true;
+    }
+
+    /**
+     * 后台工作已归位 ⇒ 清掉延迟态（对齐 CC 的 {@code else if(j.deferredSince !== void 0)} 分支）。
+     *
+     * <p><b>WHY 必须清</b>：不清的话 {@code GoalCheckinScheduler} 会一直认为该目标还在等后台任务，
+     * 按退避节奏无谓地注入 check-in 提示（用户看到多余的一轮）。
+     *
+     * @param sessionId 会话 ID
+     * @return true = 确实清掉了一个延迟态
+     */
+    public boolean clearDeferralIfAny(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        SessionGoal g = getGoal(sessionId);
+        if (g == null || g.deferredSince() == null) {
+            return false;
+        }
+        SessionGoal cleared = g.clearDeferral();
+        sessionService.setGoal(sessionId, cleared);
+        publish(sessionId, cleared);
+        log.info("[goal] 后台工作已归位 ⇒ 清除延迟态 session={}", sessionId);
         return true;
     }
 

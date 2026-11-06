@@ -177,7 +177,9 @@ public class ProjectSessionBindingService {
             // [cache-savings] 会话累计缓存命中率（与 SessionService.toDto 同口径同源：
             //   model_usage_json 逐模型桶派生 · 口径单点 CacheHitRate.ofModels；无数据/解析失败/分母 0 → null）
             CacheHitRate.ofModels(CostTracker.parseModelUsageJson(s.getModelUsageJson()),
-                modelMapper, providerMapper)
+                modelMapper, providerMapper),
+            // [V278] 会话级「引入知识库」开关（0/1 → Boolean，null = 未设置）
+            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null
         );
     }
 

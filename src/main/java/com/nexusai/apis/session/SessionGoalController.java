@@ -1,7 +1,9 @@
 package com.nexusai.apis.session;
 
+import com.nexusai.application.agent.goal.GoalCheckinConfig;
 import com.nexusai.application.agent.goal.GoalService;
 import com.nexusai.domain.session.SessionGoal;
+import com.nexusai.domain.stats.StatsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -48,6 +50,19 @@ public class SessionGoalController {
     private GoalService goalService;
 
     /**
+     * 用量统计 · 只用于算「目标期间真实消耗的输出 token」({@link StatsService#outputTokensSince})。
+     *
+     * <p><b>WHY 不用 {@code GoalService} 里的 {@code tokensAtStart}</b>：那是「设定时刻的基线快照」，
+     * 不是消耗量；且它读进程内 AgentState（每轮 run 重建）⇒ 经 REST 设目标时常常恒为 0。
+     * 真值是 {@code llm_usage_calls} 明细（与「用量与花费」页同源）。
+     *
+     * <p>{@code required=false}：同 {@link #goalService} 的容错风格 —— 未接线时该字段不产出（见
+     * {@link #tokensUsedSince})，端点其余字段照常返回。
+     */
+    @Autowired(required = false)
+    private StatsService statsService;
+
+    /**
      * 会话目标快照 · GET /api/v1/sessions/{sessionId}/goal。
      *
      * <p><b>200 + 空态</b>（不是 404）：「该会话没有目标」是合法状态
@@ -69,7 +84,30 @@ public class SessionGoalController {
             goal.iterations(),
             goal.setAt(),
             goal.tokensAtStart(),
-            goal.lastReason()));
+            goal.lastReason(),
+            // [B6 2026-11-04] 自动重试进度（纯展示）：与 STOMP 推送载荷逐字一致
+            goal.retryCount() == null ? 0 : goal.retryCount(),
+            GoalCheckinConfig.MAX_AUTO_RETRIES,
+            tokensUsedSince(sessionId, goal)));
+    }
+
+    /**
+     * 目标期间真实消耗的输出 token（{@code started_at >= goal.setAt} 的明细求和）。
+     *
+     * <p>{@code null} = 取不到（统计服务未接线 / 查询异常）⇒ 前端不渲染该字段。
+     * ⛔ 不回落 0：那会和「新设目标、确实还没消耗」混为一谈。
+     */
+    private Long tokensUsedSince(String sessionId, SessionGoal goal) {
+        if (statsService == null) {
+            return null;
+        }
+        try {
+            return statsService.outputTokensSince(sessionId, goal.setAt());
+        } catch (Exception e) {
+            log.warn("SessionGoalController.get: 目标消耗 token 聚合失败（该字段不产出）session={}: {}",
+                sessionId, e.toString());
+            return null;
+        }
     }
 
     /**
@@ -106,7 +144,21 @@ public class SessionGoalController {
         int iterations,
         long setAt,
         long tokensAtStart,
-        String lastReason
+        String lastReason,
+        /** [B6] 已自动重试次数（0 = 从未重试）。纯展示，不可配置。 */
+        int retryCount,
+        /** [B6] 自动重试上限（后端常量；前端不硬编码，随载荷走）。 */
+        int retryLimit,
+        /**
+         * 设定目标<b>至今真实消耗</b>的输出 token（{@code llm_usage_calls} 按
+         * {@code started_at >= setAt} 求和）。
+         *
+         * <p>⚠️ 与 {@code tokensAtStart} 语义完全不同：后者是「设定时刻的基线快照」（只用于算差值），
+         * <b>不能当消耗量显示</b>。本字段才是真实的「已消耗」。
+         *
+         * <p>null = 取不到（统计服务未接线 / 查询异常）；前端此时不渲染该字段，⛔ 不显示 0。
+         */
+        Long tokensUsed
     ) {
     }
 

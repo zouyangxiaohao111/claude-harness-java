@@ -1,0 +1,18 @@
+-- ===================================================================
+-- V254: settings 加 channels_enabled（外部渠道总开关 · 前端「设置→高级」独立开关）
+--
+-- 背景：外部渠道（channel）能力此前只有 yml 静态开关 `nexusai.mcp.channels-enabled`
+--   （application.yml，默认 false）。它是**启动期静态配置**，用户要开必须改文件 + 重启后端。
+--   用户裁定 2026-11-03：改成「设置·高级」里的独立开关，改完即生效。
+--
+-- 语义：true = 允许 MCP channel server 注册入站通知 handler
+--   （ChannelNotificationGate 门序[2] runtime）；false = 关闭，通道消息不进来。
+--
+-- 与 yml 的关系：yml `nexusai.mcp.channels-enabled` 保留为**兜底默认值**（列缺失/NULL 时用），
+--   DB 列是权威源；两者皆 false 时关闭。默认值取 false（fail-closed）——
+--   通道是外部入口，默认不该开。
+--
+-- ⚠️ 本文件注释**不得**出现「美元符 + 左大括号」的 Flyway 占位符字面量
+--    （application.yml 未关 flyway.placeholder-replacement，SQL 注释也在替换范围内）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN channels_enabled INTEGER;

@@ -113,7 +113,7 @@ public final class SubagentToolPrompt {
                                 .collect(Collectors.joining("\n"));
 
         // CC prompt.ts:202-212 shared
-        String shared = sharedSection(agentListSection, forkEnabled);
+        String shared = sharedSection(agentListSection, forkEnabled, effectiveAgents);
 
         // CC prompt.ts:216-218 coordinator slim return
         if (isCoordinator) {
@@ -206,6 +206,14 @@ public final class SubagentToolPrompt {
      * <p>4 分支: allowlist+denylist（交集过滤）/ allowlist-only / denylist-only / 无限制。
      */
     static String getToolsDescription(AgentDefinition agent) {
+        // [external-agent 2026-11-04] 外部 CLI 运行时：它**不认**本仓的工具白名单，
+        // 故不能沿用下面 4 分支（未设 tools 时会渲染成 "All tools" —— 那是谎报：
+        // 模型会以为这个子代理能用 Read/Edit/Grep 等本仓工具）。
+        // 如实写明是外部运行时，让模型知道「工具集由对方 CLI 决定」。
+        if (agent instanceof AgentDefinition.ExternalAgentDefinition ext) {
+            String caps = ext.capabilities().streaming() ? "streaming" : "final-text-only";
+            return "None (external CLI runtime: " + ext.runtime() + ", " + caps + ")";
+        }
         List<String> tools = agent.tools().orElse(List.of());
         List<String> disallowedTools = agent.disallowedTools().orElse(List.of());
         boolean hasAllowlist = tools != null && !tools.isEmpty();
@@ -407,7 +415,8 @@ public final class SubagentToolPrompt {
      *
      * <p>coordinator slim return（prompt.ts:216-218）就是只返回本段。
      */
-    private static String sharedSection(String agentListSection, boolean forkEnabled) {
+    private static String sharedSection(String agentListSection, boolean forkEnabled,
+                                        List<AgentDefinition> agents) {
         String forkLine = forkEnabled
                 ? "When using the " + AGENT_TOOL_NAME
                         + " tool, specify a subagent_type to use a specialized agent, or omit it to fork yourself — a fork inherits your full conversation context."
@@ -420,7 +429,53 @@ public final class SubagentToolPrompt {
                 + "\n"
                 + agentListSection
                 + "\n"
+                + externalRuntimeSection(agents)
                 + "\n"
                 + forkLine;
+    }
+
+    /**
+     * 运行时选择规则段 · 仅在清单里**存在外部运行时 agent** 时插入（否则纯噪音）。
+     *
+     * <p><b>为什么需要这段</b>：外部 agent（`runtime: claude/codex/...`）与内置 agent 在
+     * 工具清单里长得一样，模型没有任何理由偏好其中一个。若不写明，模型可能：
+     * <ul>
+     *   <li>该用内置时跑去调外部 CLI（慢一个数量级、还要花对方的配额、且拿不到本仓工具）；</li>
+     *   <li>用户明确点名「用 claude code 跑」时仍走内置，等于用户指令被忽略。</li>
+     * </ul>
+     * 故规则写成两条硬约束：**默认内部**、**只有用户明确指定才外部**。
+     */
+    private static String externalRuntimeSection(List<AgentDefinition> agents) {
+        List<AgentDefinition.ExternalAgentDefinition> external = agents == null ? List.of()
+                : agents.stream()
+                        .filter(AgentDefinition::isExternal)
+                        .map(a -> (AgentDefinition.ExternalAgentDefinition) a)
+                        .toList();
+        if (external.isEmpty()) {
+            return "";
+        }
+        // 按运行时分组，让模型知道「一共有哪几台 CLI、各自叫什么」
+        java.util.Map<String, List<String>> byRuntime = new java.util.LinkedHashMap<>();
+        for (var e : external) {
+            byRuntime.computeIfAbsent(e.runtime(), k -> new java.util.ArrayList<>()).add(e.agentType());
+        }
+        StringBuilder grouped = new StringBuilder();
+        for (var entry : byRuntime.entrySet()) {
+            grouped.append("\n  - ").append(entry.getKey()).append(": ")
+                    .append(String.join(", ", entry.getValue()));
+        }
+        return "External runtime agents (separate CLI processes):"
+                + grouped
+                + "\n- These run a **separate CLI process on this machine** (Claude Code, Codex, opencode, pi…). "
+                + "They are slower, consume that CLI's own quota/login, and cannot use this session's tools, hooks, or MCP servers.\n"
+                + "- **Default to the internal agents.** Do not pick an external-runtime agent on your own initiative, "
+                + "even when the task looks like something that CLI is good at.\n"
+                + "- Use one **only when the user explicitly names that CLI** — \"use Claude Code\", \"have Codex do this\", "
+                + "\"用 claude code 跑一下\", \"交给 opencode\". If the user did not name one, stay internal.\n"
+                + "- The runtime name in the list above is the user-facing choice (claude / codex / opencode / pi). "
+                + "Several agent types may share the same runtime — pick the one whose description matches the task.\n"
+                + "- If the user names a CLI that is not in the list, say it is not installed/configured here and "
+                + "offer to do the work internally instead — do not silently substitute another CLI.\n"
+                + "- When the user names one but is ambiguous about which, ask which CLI they mean rather than guessing.";
     }
 }

@@ -92,6 +92,10 @@ public final class ComputerUseLeftClickDragTool implements Tool {
                   "minItems": 2,
                   "maxItems": 2,
                   "description": "(x, y) start point. If omitted, drags from the current cursor position. %s"
+                },
+                "observationId": {
+                  "type": "string",
+                  "description": "Optional. The observationId returned by observe. When given, the drag events are routed ONLY to that application's window (the system cursor is not moved). NOTE: the target app must be frontmost for the drag to take effect."
                 }
               },
               "required": ["coordinate"]
@@ -104,6 +108,8 @@ public final class ComputerUseLeftClickDragTool implements Tool {
     private final ComputerUseGrantStore grantStore;
     private final ComputerUseForegroundAppResolver foregroundAppResolver;
     private final ComputerUseMouseState mouseState;
+    /** 观察存储（用于按 observationId 找目标 pid + 窗口几何；null ⇒ 不支持定向）。 */
+    private final ComputerUseUiSnapshotStore snapshotStore;
 
     /**
      * @param animator               鼠标缓动器（提供 press → move → release 的拖拽）
@@ -119,6 +125,20 @@ public final class ComputerUseLeftClickDragTool implements Tool {
                                         ComputerUseGrantStore grantStore,
                                         ComputerUseForegroundAppResolver foregroundAppResolver,
                                         ComputerUseMouseState mouseState) {
+        this(animator, geometryStore, coordinateMode, grantStore, foregroundAppResolver,
+                mouseState, null);
+    }
+
+    /**
+     * @param snapshotStore 观察存储（null ⇒ 即使给了 observationId 也不定向）
+     */
+    public ComputerUseLeftClickDragTool(ComputerUseMouseAnimator animator,
+                                        ComputerUseGeometryStore geometryStore,
+                                        ComputerUseCoordinateMode coordinateMode,
+                                        ComputerUseGrantStore grantStore,
+                                        ComputerUseForegroundAppResolver foregroundAppResolver,
+                                        ComputerUseMouseState mouseState,
+                                        ComputerUseUiSnapshotStore snapshotStore) {
         if (animator == null || geometryStore == null) {
             throw new IllegalArgumentException("ComputerUseLeftClickDragTool 依赖不能为空");
         }
@@ -128,6 +148,7 @@ public final class ComputerUseLeftClickDragTool implements Tool {
         this.grantStore = grantStore;
         this.foregroundAppResolver = foregroundAppResolver;
         this.mouseState = mouseState;
+        this.snapshotStore = snapshotStore;
     }
 
     @Override
@@ -250,6 +271,28 @@ public final class ComputerUseLeftClickDragTool implements Tool {
 
         try {
             if (start != null) {
+                // ⭐ 定向拖拽（对齐 dsh computer_drag：事件只送目标窗口，系统光标不动）
+                long targetPid = 0L;
+                String observationId = input.path("observationId").asText("");
+                if (!observationId.isEmpty() && snapshotStore != null) {
+                    ComputerUseUiSnapshotStore.Observation observation =
+                            snapshotStore.require(sessionId, observationId);
+                    if (observation == null) {
+                        return ToolResult.error(call.id(),
+                                ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION
+                                        + ": observation " + observationId
+                                        + " is unknown, expired, or from a previous generation."
+                                        + " Call observe again and use the new observationId.");
+                    }
+                    if (observation.hasWindowTarget()) {
+                        targetPid = observation.pid();
+                        animator.setDragTarget(observation.pid(), observation.windowId(),
+                                observation.windowX(), observation.windowY());
+                    }
+                }
+                if (targetPid == 0L) {
+                    animator.clearDragTarget();
+                }
                 animator.drag(start[0], start[1], end[0], end[1]);
             } else {
                 // 省略起点 ⇒ 从当前光标位置拖（CCB toolCalls.ts:2719）

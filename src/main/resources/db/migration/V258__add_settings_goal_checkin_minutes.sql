@@ -1,0 +1,20 @@
+-- ===================================================================
+-- V258: settings 加 goal_checkin_minutes（目标 check-in 间隔 · 前端「设置→高级」）
+--
+-- 背景：`/goal` 目标模式的 check-in 定时器 —— 对齐 CC claude.exe v2.1.318 的
+--   `CLAUDE_CODE_GOAL_CHECKIN_MINUTES`（默认 30 分钟，0 = 关闭）。
+--   CC 是 CLI，从 shell env 读；本仓是 Web 应用，用户没有 shell env
+--   ⇒ 改成「设置 → 高级」里的独立配置项（用户 2026-11-04 拍板）。
+--
+-- 语义：目标因后台任务未归位而延迟评估时，每 N 分钟注入一次 check-in 提示，
+--   让模型去查后台进度（而不是干等）。指数退避 ×2、最多 3 次 idle check-in
+--   （常量见 GoalCheckinConfig）。
+--
+--   null = 未配置 → 回落默认 30 分钟
+--   0    = 显式关闭 check-in（目标仍然会被延迟评估，只是不主动提示）
+--   <0   = 非法，按「未配置」处理（读侧 resolveCheckinIntervalMs 只认 >0）
+--
+-- ⚠️ 本文件注释不得出现 Flyway 占位符字面量（application.yml 未关
+--    flyway.placeholder-replacement，SQL 注释也在替换范围内）。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN goal_checkin_minutes INTEGER;

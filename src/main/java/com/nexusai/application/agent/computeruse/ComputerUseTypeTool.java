@@ -103,6 +103,10 @@ public final class ComputerUseTypeTool implements Tool {
                 "text": {
                   "type": "string",
                   "description": "Text to type."
+                },
+                "observationId": {
+                  "type": "string",
+                  "description": "Optional. The observationId returned by observe. When given, the text is typed ONLY into that application's process (Unicode events, no clipboard use, no focus steal). Without it the text goes to the global input stream via the clipboard."
                 }
               },
               "required": ["text"]
@@ -116,6 +120,8 @@ public final class ComputerUseTypeTool implements Tool {
     private final ComputerUseSleeper sleeper;
     private final ComputerUseGrantStore grantStore;
     private final ComputerUseForegroundAppResolver foregroundAppResolver;
+    /** 观察存储（用于按 observationId 找目标 pid；null ⇒ 不支持定向）。 */
+    private final ComputerUseUiSnapshotStore snapshotStore;
 
     /**
      * @param keyboard               键盘注入实现
@@ -127,6 +133,21 @@ public final class ComputerUseTypeTool implements Tool {
                                ComputerUseSleeper sleeper,
                                ComputerUseGrantStore grantStore,
                                ComputerUseForegroundAppResolver foregroundAppResolver) {
+        this(keyboard, sleeper, grantStore, foregroundAppResolver, null);
+    }
+
+    /**
+     * @param keyboard              键盘注入实现
+     * @param sleeper               休眠器
+     * @param grantStore            会话授权位读写
+     * @param foregroundAppResolver 前台应用解析
+     * @param snapshotStore         观察存储（null ⇒ 即使给了 observationId 也不定向）
+     */
+    public ComputerUseTypeTool(ComputerUseKeyboard keyboard,
+                               ComputerUseSleeper sleeper,
+                               ComputerUseGrantStore grantStore,
+                               ComputerUseForegroundAppResolver foregroundAppResolver,
+                               ComputerUseUiSnapshotStore snapshotStore) {
         if (keyboard == null) {
             throw new IllegalArgumentException("ComputerUseTypeTool 需要键盘实现");
         }
@@ -134,6 +155,7 @@ public final class ComputerUseTypeTool implements Tool {
         this.sleeper = sleeper == null ? ComputerUseSleeper.REAL : sleeper;
         this.grantStore = grantStore;
         this.foregroundAppResolver = foregroundAppResolver;
+        this.snapshotStore = snapshotStore;
     }
 
     @Override
@@ -209,6 +231,30 @@ public final class ComputerUseTypeTool implements Tool {
                 sessionId, grantStore, foregroundAppResolver, ComputerUseActionKind.KEYBOARD);
         if (rejection != null) {
             return ToolResult.error(call.id(), rejection);
+        }
+
+        // ⭐ 定向投递（对齐 dsh computer_type_text：Unicode 事件只送目标进程，
+        //   不碰剪贴板、不抢用户前台）。给了 observationId + 有 store ⇒ 按该观察的 pid。
+        long targetPid = 0L;
+        String observationId = input.path("observationId").asText("");
+        if (!observationId.isEmpty()) {
+            if (snapshotStore == null) {
+                return ToolResult.error(call.id(),
+                        "observationId is not supported on this configuration (no observation store).");
+            }
+            ComputerUseUiSnapshotStore.Observation observation =
+                    snapshotStore.require(sessionId, observationId);
+            if (observation == null) {
+                return ToolResult.error(call.id(),
+                        ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION
+                                + ": observation " + observationId
+                                + " is unknown, expired, or from a previous generation."
+                                + " Call observe again and use the new observationId.");
+            }
+            targetPid = observation.pid();
+        }
+        if (keyboard instanceof MacOsKeyboard macOsKeyboard) {
+            macOsKeyboard.setTargetPid(targetPid);
         }
 
         List<String> graphemes = ComputerUseGraphemes.segment(text);

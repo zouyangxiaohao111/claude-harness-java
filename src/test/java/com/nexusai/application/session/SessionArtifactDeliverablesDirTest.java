@@ -80,7 +80,7 @@ class SessionArtifactDeliverablesDirTest {
             writeDeliverable(n, "x");
         }
 
-        int saved = service.syncDeliverablesFromDir(SESSION);
+        int saved = service.syncDeliverablesFromDir(SESSION, null);
 
         assertThat(saved).as("7 个交付物都应入库").isEqualTo(names.size());
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -97,7 +97,7 @@ class SessionArtifactDeliverablesDirTest {
         writeDeliverable("App.java", "class App {}");
         writeDeliverable("真正的报告.docx", "x");
 
-        int saved = service.syncDeliverablesFromDir(SESSION);
+        int saved = service.syncDeliverablesFromDir(SESSION, null);
 
         assertThat(saved).as("只有那份 docx 该入库").isEqualTo(1);
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -108,7 +108,7 @@ class SessionArtifactDeliverablesDirTest {
     @Test
     @DisplayName("目录不存在 ⇒ 返回 0 且不抛（本轮没交付物是正常情况，不是错误）")
     void missingDirectoryIsNotAnError() {
-        assertThat(service.syncDeliverablesFromDir(SESSION)).isZero();
+        assertThat(service.syncDeliverablesFromDir(SESSION, null)).isZero();
         verify(mapper, never()).insert(any(SessionArtifactRecord.class));
     }
 
@@ -117,21 +117,24 @@ class SessionArtifactDeliverablesDirTest {
     void fileAlreadyInArtifactStoreIsNotArchived() throws IOException {
         Path original = writeDeliverable("报告.docx", "x");
 
-        service.syncDeliverablesFromDir(SESSION);
+        service.syncDeliverablesFromDir(SESSION, null);
 
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
         verify(mapper, atLeastOnce()).insert(cap.capture());
         // localPath 必须仍是**原文件**（不是 sessionArtifactsDir 下的 hash 副本）
         assertThat(cap.getValue().getLocalPath())
                 .isEqualTo(original.toAbsolutePath().normalize().toString());
-        assertThat(cap.getValue().getLocalPath()).endsWith("deliverables/报告.docx");
+        // ⚠️ 用 Path.endsWith(Path) 按**路径段**比较：String 版写死 "/" 在 Windows 上必红
+        //   （Path.toString() 用反斜杠）—— 这是既有测试的跨平台缺陷，本次一并修正。
+        assertThat(java.nio.file.Path.of(cap.getValue().getLocalPath())
+                .endsWith(java.nio.file.Path.of("deliverables", "报告.docx"))).isTrue();
     }
 
     @Test
     @DisplayName("无会话 id ⇒ 返回 0，不碰文件系统")
     void blankSessionIdIsNoop() {
-        assertThat(service.syncDeliverablesFromDir("  ")).isZero();
-        assertThat(service.syncDeliverablesFromDir(null)).isZero();
+        assertThat(service.syncDeliverablesFromDir("  ", null)).isZero();
+        assertThat(service.syncDeliverablesFromDir(null, null)).isZero();
     }
 
     @Test

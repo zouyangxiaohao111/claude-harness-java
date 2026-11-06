@@ -101,5 +101,13 @@ public record SessionDto(
      * <p>null = 无 {@code model_usage_json} / 解析失败 / 分母为 0（⛔ 不输出 NaN/Infinity、不臆造 0，
      * 前端按「不显示」处理）。
      */
-    Double cacheHitRate
+    Double cacheHitRate,
+    /**
+     * 会话级「引入知识库」开关（V278 列 kb_tools_enabled）· 1 = 4 个知识库专属工具进入主线程工具池；
+     * 0/null = 默认池（专属工具被 {@code @ExclusiveTool} 隐藏）。
+     *
+     * <p>前端会话级设置读写本字段（PATCH /api/v1/sessions/{id}）；只影响工具可见性，
+     * ⛔ 不改变 {@code LlmAgentLoop.loop()} 的执行逻辑。
+     */
+    Boolean kbToolsEnabled
 ) {}

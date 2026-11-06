@@ -7,6 +7,22 @@ import com.mybatisflex.annotation.Table;
 public class SettingsRecord {
     @Id private Integer id;          // always 1 (singleton)
     private String theme;
+
+    // ── 知识库域字段已于 2026-11-05 全部迁出 ──
+    //   ⭐ 用户裁定「8 个 kb_* 全部搬到 kb_config，settings 一个不留」。
+    //   原列（V273 已 DROP）：
+    //     kb_embedding_model_id / kb_rerank_model_id / kb_retriever_engine /
+    //     default_storage_backend_id / kb_memory_{enabled,write_mode,max_items,interest_threshold}
+    //   ⇒ 读写一律走 {@code com.nexusai.kb.config.KbConfigService}。
+    //   ⚠️ 不要在实体里保留「看起来还有」的同名字段 —— Flex 会把它们再写回 SELECT 列表，
+    //      列已删除 ⇒ 每次查 settings 都报 no such column。
+
+    /** 子代理外部运行时默认值（V259）。 */
+    private String subagentDefaultRuntime;
+
+    /** 外部子代理总开关（V259）。 */
+    private Boolean subagentExternalEnabled;
+
     private String fontSize;
     private String accent;
     private Boolean animationsEnabled;
@@ -271,6 +287,28 @@ public class SettingsRecord {
     //   同 autoMemoryEnabled -> auto_memory_enabled 先例）。
     private Integer streamIdleTimeoutMs;
 
+    // [V254 外部渠道] 外部渠道（channel）总开关（V254 建列 channels_enabled INTEGER 0/1）。
+    //   语义：true = 允许 MCP channel server 注册入站通知 handler
+    //   （ChannelNotificationGate 门序[2] runtime，CC original: isChannelsEnabled() /
+    //   GrowthBook 'tengu_harbor'）；false = 关闭，通道消息不进来。
+    //   null = 未配置 → 回落 yml `nexusai.mcp.channels-enabled`（默认 false，fail-closed）。
+    //   ⛔ 不做 provider 门序（用户裁定 2026-11-03「第三方模型肯定放行不能拦截」）：
+    //   与 CC 的 `channels are not available on third-party providers` **有意分歧**，
+    //   见 ChannelNotificationGate 门序说明（该门序在本仓不存在，不是漏做）。
+    //   命名：MyBatis-Flex camelCase→snake 精确映射（channelsEnabled -> channels_enabled；
+    //   同 autoMemoryEnabled -> auto_memory_enabled 先例）。
+    private Boolean channelsEnabled;
+
+    // [V258 goal-checkin] 目标 check-in 间隔（V258 建列 goal_checkin_minutes INTEGER）。
+    //   对齐 CC claude.exe v2.1.318 的 `CLAUDE_CODE_GOAL_CHECKIN_MINUTES`（默认 30 分钟）——
+    //   CC 是 CLI 从 env 读，本仓是 Web 应用改成「设置→高级」配置项（用户 2026-11-04 拍板）。
+    //   语义：目标因后台任务未归位而延迟评估时，每 N 分钟注入一次 check-in 提示
+    //   （GoalCheckinScheduler 消费；指数退避 ×2、最多 3 次 idle check-in）。
+    //   null = 未配置 → 默认 30；0 = 显式关闭；<0 按未配置处理。
+    //   命名：MyBatis-Flex camelCase→snake 精确映射（goalCheckinMinutes -> goal_checkin_minutes；
+    //   同 channelsEnabled -> channels_enabled 先例）。
+    private Integer goalCheckinMinutes;
+
     public Integer getId() { return id; }
     public void setId(Integer id) { this.id = id; }
     public String getTheme() { return theme; }
@@ -430,4 +468,15 @@ public class SettingsRecord {
     // （MyBatis-Flex snake↔camel 映射；null/<=0 = 未配置 → 回落 env/默认 300000）
     public Integer getStreamIdleTimeoutMs() { return streamIdleTimeoutMs; }
     public void setStreamIdleTimeoutMs(Integer streamIdleTimeoutMs) { this.streamIdleTimeoutMs = streamIdleTimeoutMs; }
+    // [V254 外部渠道] channels_enabled ↔ channelsEnabled
+    // （MyBatis-Flex snake↔camel 映射；null = 未配置 → 回落 yml nexusai.mcp.channels-enabled）
+    public Boolean getChannelsEnabled() { return channelsEnabled; }
+    public void setChannelsEnabled(Boolean channelsEnabled) { this.channelsEnabled = channelsEnabled; }
+    public Integer getGoalCheckinMinutes() { return goalCheckinMinutes; }
+    public void setGoalCheckinMinutes(Integer goalCheckinMinutes) { this.goalCheckinMinutes = goalCheckinMinutes; }
+
+    public String getSubagentDefaultRuntime() { return subagentDefaultRuntime; }
+    public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
+    public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }
+    public void setSubagentExternalEnabled(Boolean v) { this.subagentExternalEnabled = v; }
 }

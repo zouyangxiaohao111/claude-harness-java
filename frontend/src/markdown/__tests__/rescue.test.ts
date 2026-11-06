@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passGlue, passMarkers, passTable, relLines, repair, tableSplit, PROD_REPAIR_OPTS } from '../rescue.ts'
+import { applyEdits, bulletFix, headingFix, isSepRow, passFence, passGlue, passHeadingSweep, passMarkers, passTable, relLines, repair, tableSplit, PROD_REPAIR_OPTS } from '../rescue.ts'
 import { parseGfmWithMath } from '../parse.ts'
 
 describe('rescue · 工具层', () => {
@@ -94,6 +94,82 @@ describe('rescue · P0 围栏抢救', () => {
 
   it('一次提交两处提行（多编辑叠加，走 applyEdits 多编辑路径）', () => {
     expect(passFence('```\na```\n\n```\nb```\n').src).toBe('```\na\n```\n\n```\nb\n```\n')
+  })
+
+  /**
+   * ⭐ 2026-11-05 修：旧实现只认「行尾粘连」，于是 `##标题```yaml…` 这种
+   * **围栏后还有内容**的行被完全忽略。后果不是少救一处，而是状态机整篇跑偏 ——
+   * 这个真正的开围栏没被看见 ⇒ 后面那行的行尾 ``` 被当成**开**围栏 ⇒
+   * 全文判未闭合 ⇒ 平衡闸整篇放弃 ⇒ 版面被吞几十行。
+   */
+  it('行中间的开围栏也提行（`##标题```yaml…`）', () => {
+    const src = '##配的是什么```yaml# config\ndefault_model: x\n```\n'
+    const r = passFence(src)
+    expect(r.aborted).toBe(false)
+    expect(r.edits.map(e => e.kind)).toEqual(['lift-midline-open-fence'])
+    expect(r.src).toBe('##配的是什么\n```yaml# config\ndefault_model: x\n```\n')
+  })
+
+  it('提行后状态机不跑偏：后续行尾围栏被正确识别为闭围栏', () => {
+    // 真库 msg a9ffc3f4 的结构（压扁到 3 行）：L1 行中间开、L2 行尾闭。
+    // 用**已合规**的 `## 配置`（带空格）当首行，这样断言只检验围栏状态机，
+    // 不与「标题补空格」这件事混在一起（后者由 P2/P4 负责）。
+    const src = '## 配置```yamlkey: v\nvalue: x```\n后文\n'
+    const r = passFence(src)
+    expect(r.aborted).toBe(false)
+    expect(r.edits.map(e => e.kind)).toEqual(['lift-midline-open-fence', 'lift-close-fence'])
+    expect(r.src).toBe('## 配置\n```yamlkey: v\nvalue: x\n```\n后文\n')
+    // 判据：修复后真的产生了一个 code 节点（而不是把后文吞进代码）
+    expect(parseGfmWithMath(r.src).children.map(c => c.type)).toEqual(['heading', 'code', 'paragraph'])
+  })
+
+  /**
+   * CommonMark：反引号围栏的 info string 里**不能有反引号**。
+   * 语料里大量段落是 `##标题```说明…如 \`x\` / \`y\``（行内代码跟在后面）。
+   * 若把这种串当围栏提行，它**不构成围栏**、整段仍是段落，反而把后文吞进段落 ——
+   * 实测语料 5b819608 因此从 1 个 code 节点涨到 3 个。
+   */
+  it('info string 含反引号的行不动（提行后不构成围栏，反而会吞段落）', () => {
+    const src = '##key为什么是英文```如 `applies_to_phase` / `target` 所述\n后文\n'
+    const r = passFence(src)
+    expect(r.edits).toHaveLength(0)
+    expect(r.src).toBe(src)
+  })
+
+  /**
+   * 同一行有多处反引号串时必须取**第一个**（非贪婪）。
+   * 贪婪会让匹配点滑到末尾，于是检查的是「最后一段的 info string」，
+   * 把本该救的行误判成「info 含反引号」而放弃（实测语料出现过）。
+   *
+   * 构造要点：末尾再补一个「行尾粘连的闭围栏」，让新规则下全文能闭合 ——
+   * 否则会触发回退闸、退回旧规则，就测不到「取第一处」这件事了。
+   */
+  it('一行多处反引号串时按第一处判定（非贪婪）', () => {
+    const src = '##标题```yamla: 1\nb: 2```\n'
+    const r = passFence(src)
+    expect(r.edits.map(e => e.kind)).toEqual(['lift-midline-open-fence', 'lift-close-fence'])
+    // 第一处的 info string 是 `yamla: 1`（不含反引号）⇒ 放行；
+    // 若贪婪取到最后一处，检查的会是 `\n` 之后的内容，判据就漂了。
+    expect(r.src).toBe('##标题\n```yamla: 1\nb: 2\n```\n')
+  })
+
+  /**
+   * 回退闸：新规则使整篇判未闭合时必须退回旧规则，⛔ 不能比改动前更差。
+   * 实测语料 ec08aaed 就栽在这 —— 旧规则能闭合、能正常救，新规则却整篇放弃。
+   *
+   * 构造要点（否则测不出回退）：
+   *   · 前 3 行在**旧规则下就能完整闭合**（`前文``` ` 开 + ` ``` ` 闭）；
+   *   · 最后一行 `##标题```note` 在**新规则下**开启一个永不闭合的围栏。
+   * ⇒ 不含回退时：aborted=true / 0 编辑（功能倒退）；
+   *   含回退时：退回旧规则 ⇒ aborted=false / 只保留第 1 处提行。
+   */
+  it('新规则导致整篇不闭合时回退旧规则（不比改动前更差）', () => {
+    const src = '前文```\ncode\n```\n##标题```note\n'
+    const r = passFence(src)
+    expect(r.aborted).toBe(false)
+    // 只剩旧规则的那一处提行；行中间那处**没有**被提（回退把它放弃了）
+    expect(r.edits.map(e => e.kind)).toEqual(['lift-open-fence'])
+    expect(r.src).toBe('前文\n```\ncode\n```\n##标题```note\n')
   })
 })
 
@@ -553,9 +629,102 @@ describe('rescue · repair 编排', () => {
   it('M3 短路：p1.edits.length > 0 时不复用 P1 的树（有判别力的差分）', () => {
     const src = '正文|a |b |\n|---|---|\n##标题\n'
     const r = repair(src)
-    // 逐 pass 参照链（不复用任何树的等价实现）
-    const ref = passMarkers(passTable(passFence(src).src).src).src
-    expect(r.out).toBe(ref)
-    expect(r.out).toBe('正文\n|a |b |\n|---|---|\n##标题\n')
+    // 逐 pass 参照链（不复用任何树的等价实现）。P4 快扫是链的最后一环，参照链必须同步
+    // ——漏掉它会让本条退化成「只比到 P2」的假绿。
+    const ref = passHeadingSweep(passMarkers(passTable(passFence(src).src).src).src)
+    expect(r.sweep.edits.length).toBeGreaterThan(0)   // 前提门：P4 确实动过源码
+    expect(r.out).toBe(ref.src)
+    // `##标题` 在表格之后是**独立标题**（表格已由 P1 拆出），故 P4 应补空格。
+    expect(r.out).toBe('正文\n|a |b |\n|---|---|\n## 标题\n')
+  })
+})
+
+/**
+ * P4 快扫（`passHeadingSweep`）· 行级兜底。
+ *
+ * 为什么这一层必须存在：前四个 pass 的块级判据都来自解析器的 mdast position，
+ * 而**被失控围栏吞进 code 节点的行不在任何段落的 position 里** —— 那些行本来是标题，
+ * 却永远拿不到补空格。真库实测 20,673 条 assistant 消息 / 4,189 个裸标题行中，
+ * 失控未闭合围栏内有 940 行属于这个盲区。
+ */
+describe('rescue · P4 标题快扫', () => {
+  it('`##`~`######` 后紧跟非空白 → 补一个空格', () => {
+    expect(passHeadingSweep('##标题').src).toBe('## 标题')
+    expect(passHeadingSweep('###标题').src).toBe('### 标题')
+    expect(passHeadingSweep('######标题').src).toBe('###### 标题')
+    expect(passHeadingSweep('##你现在配的是什么').src).toBe('## 你现在配的是什么')
+  })
+
+  it('已合规 / 正文内的 # 一律不动', () => {
+    expect(passHeadingSweep('## 已合规').src).toBe('## 已合规')
+    expect(passHeadingSweep('正文里的 ##不是标题').src).toBe('正文里的 ##不是标题')
+  })
+
+  /**
+   * 单井号是本 pass **唯一**有意不处理的分支（与 `headingFix` 的分歧点）。
+   * 判据取自真库：`#include` / `#!/usr/bin/env bash` / Python 的 `#规则1` 都靠单井号，
+   * 无条件补空格会把它们改成 `# include` —— 正是当年 `patches.ts` 被删的形态。
+   */
+  it('单 `#` 不动（`#include` / shebang / Python 注释都是代码）', () => {
+    expect(passHeadingSweep('#单井号不动').src).toBe('#单井号不动')
+    expect(passHeadingSweep('#include <stdio.h>').src).toBe('#include <stdio.h>')
+    expect(passHeadingSweep('#!/usr/bin/env bash').src).toBe('#!/usr/bin/env bash')
+    expect(passHeadingSweep('#规则1: 人 + 打开的井口').src).toBe('#规则1: 人 + 打开的井口')
+  })
+
+  /**
+   * 合法闭合围栏内的 `##` 是真代码（Markdown 源码样例等），⛔ 绝不能改。
+   * 真库实测此类 0 命中，但结构上必须设防 —— 所以按围栏区间整体保护，而非逐行猜。
+   */
+  it('合法闭合围栏内一行都不动', () => {
+    const src = '```\n# 这是代码注释\n##include <x>\n```\n'
+    expect(passHeadingSweep(src).src).toBe(src)
+    expect(passHeadingSweep(src).edits).toHaveLength(0)
+  })
+
+  /**
+   * 未闭合围栏**不**进保护区 —— 它的后半段本就是被吞掉的正文。
+   * 这条是 P4 与「保护真代码」的分界线：闭围栏保护、开围栏不保护。
+   */
+  it('未闭合围栏之后仍补空格（那后半段是被吞的正文，不是代码）', () => {
+    const src = '```\ncode here\n##被吞掉的标题\n'
+    expect(passHeadingSweep(src).src).toBe('```\ncode here\n## 被吞掉的标题\n')
+  })
+
+  /**
+   * 残余块级粘连不救：直接补空格会把表格行 / 围栏并进标题文本。
+   * 这两类由 P1/P1.5 先拆，P4 只管「纯标题」。
+   */
+  it('带 `|` 或 ``` 的粘连行不补（应由 P1/P1.5 先拆）', () => {
+    expect(passHeadingSweep('####|a |b |').src).toBe('####|a |b |')
+    expect(passHeadingSweep('##标题```yaml').src).toBe('##标题```yaml')
+  })
+
+  it('一行只插一个空格（不重复应用）', () => {
+    const once = passHeadingSweep('##标题').src
+    expect(passHeadingSweep(once).edits).toHaveLength(0)
+    expect(passHeadingSweep(once).src).toBe(once)
+  })
+
+  /**
+   * ⭐ 本 pass 的**存在理由**：前四个 pass 全部看不到这种行。
+   * 输入是「未闭合围栏 + 后面跟着标题」——
+   *   · P0 判整篇不闭合 ⇒ 提行全放弃；
+   *   · P1/P1.5/P2 读的是顶层段落 position，而这些行已被解析器吞进 `code` 节点 ⇒ 无段落可读；
+   *   · P4 不保护未闭合围栏 ⇒ 命中。
+   * ⚠️ 若把输入换成 `##标题\n正文\n`（标题在顶层段落里），P2 就先修了它、P4 无事可做 ——
+   * 那样这条用例会退化成「P2 的重复测试」，钉不住 P4。
+   */
+  it('repair 全链路里 P4 救的正是前四 pass 都看不到的行', () => {
+    const src = '```\ncode here\n##被吞掉的标题\n'
+    const r = repair(src, PROD_REPAIR_OPTS)
+    // 前提门：确认前三者确实没动（否则本用例测的是别人）
+    expect(r.fence.aborted).toBe(true)          // P0 放弃
+    expect(r.table.edits).toHaveLength(0)
+    expect(r.glue.edits).toHaveLength(0)
+    expect(r.markers.edits).toHaveLength(0)     // P2 看不到（那行在 code 节点里）
+    // 结论：只有 P4 动了手
+    expect(r.sweep.edits).toHaveLength(1)
+    expect(r.out).toBe('```\ncode here\n## 被吞掉的标题\n')
   })
 })

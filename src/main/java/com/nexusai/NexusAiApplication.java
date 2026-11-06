@@ -15,7 +15,10 @@ import java.nio.file.Paths;
 @SpringBootApplication
 @EnableConfigurationProperties(ToolTelemetryProperties.class)
 @MapperScan({
-        "com.nexusai.repository.*.mapper"
+        "com.nexusai.repository.*.mapper",
+        // [R0 2026-11-05] 知识库域独立包 com.nexusai.kb（用户裁定「全部放在一个包下面」）。
+        // 新包不在上面的通配里 ⇒ 必须显式加，否则 kb_config 等 mapper 装配不上、启动即失败。
+        "com.nexusai.kb.**.mapper"
 //        "com.nexusai.repository.provider.mapper"
 //        ,"com.nexusai.repository.skill.mapper"
 //        ,"com.nexusai.repository.mcp.mapper"

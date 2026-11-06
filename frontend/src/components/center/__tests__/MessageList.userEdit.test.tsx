@@ -17,6 +17,23 @@ import type { AttachmentRequest, ChatMessageDto } from '@/api/types'
  */
 
 const SID = 'sess-user-edit'
+
+/**
+ * jsdom 的 `File`/`Blob` **没有 `arrayBuffer()`**（浏览器与 WebView2 都有）⇒ 附件投递会直接抛错。
+ * 此处补一个等价实现（走 FileReader，jsdom 有），**只补测试环境缺的标准 API**，
+ * ⛔ 不是为了让断言变绿而改行为 —— 实现与浏览器一致的 Promise<ArrayBuffer> 语义。
+ */
+if (typeof (Blob.prototype as unknown as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer !== 'function') {
+  ;(Blob.prototype as unknown as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer = function () {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(r.result as ArrayBuffer)
+      r.onerror = () => reject(r.error)
+      r.readAsArrayBuffer(this as unknown as Blob)
+    })
+  }
+}
+
 const noop = () => {}
 
 function userMsg(id: string, content: string): ChatMessageDto {
@@ -62,6 +79,31 @@ function typeInto(el: HTMLTextAreaElement, value: string) {
     set.call(el, value)
     el.dispatchEvent(new Event('input', { bubbles: true }))
   })
+}
+
+/**
+ * 在编辑框里粘贴一张图片。
+ *
+ * <p>React 的 `onPaste` 从 `nativeEvent.clipboardData` 读，而 jsdom 的 `ClipboardEvent`
+ * 构造器不完整 ⇒ 直接造一个普通 Event 并挂 `clipboardData` 属性。
+ * `items` 里给 `kind:'file' + getAsFile()`（浏览器复制位图走的那条分支）。
+ */
+function pasteImage(el: HTMLTextAreaElement, file: File) {
+  const ev = new Event('paste', { bubbles: true, cancelable: true })
+  Object.defineProperty(ev, 'clipboardData', {
+    value: {
+      items: [{ kind: 'file', type: file.type, getAsFile: () => file }],
+      files: [] as File[],
+    },
+  })
+  el.dispatchEvent(ev)
+}
+
+/** 等异步投递落地（读盘 + 内容 md5 去重 + setState） */
+async function flush(rounds = 6) {
+  for (let i = 0; i < rounds; i++) {
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+  }
 }
 
 describe('[用户消息编辑重发]', () => {
@@ -249,5 +291,59 @@ describe('[用户消息编辑重发]', () => {
     expect(call[0]).toBe('u1')
     expect(call[1]).toBe('看这张图（改）')
     expect(call[3]).toEqual([{ type: 'image', base64: 'AAAA', mediaType: 'image/png' }])
+  })
+
+  it('⭐ 编辑态粘贴图片 → 出现待发缩略图，重发时作为附件带上（纯 base64，非 dataURL）', async () => {
+    // WHY（用户 2026-11-06 报「点击编辑用户消息无法粘贴图片」）：
+    //   编辑态此前只有一个 textarea —— 连 onPaste 都没有 ⇒ 用户在编辑时完全无法补图。
+    //   [2026-11-06 用户裁定] 补图**只保留粘贴**（Ctrl+V），不加「+ 图片」选择器入口。
+    //   本用例锁住两条：①粘贴能被接住并显示缩略图；②重发时进 attachments 的 base64 必须
+    //   **不带 `data:` 前缀**（后端 Base64.decode 与图像 block 都只认纯 base64）。
+    //   变异自证：去掉 textarea 的 onPaste → 缩略图不出现 → 红。
+    const onEditResend = vi.fn(async () => {})
+    renderList([userMsg('u1', '原问题')], onEditResend)
+    hover()
+    act(() => { editBtn()!.click() })
+
+    const file = new File([new Uint8Array([137, 80, 78, 71])], 'shot.png', { type: 'image/png' })
+    pasteImage(textarea()!, file)
+    // 粘贴是 async（读盘 + 算内容 md5 去重）⇒ 等投递落地
+    await flush()
+
+    expect(container.querySelectorAll('.user-edit-thumb').length, '粘贴的图必须显示为待发缩略图').toBe(1)
+
+    typeInto(textarea()!, '带图的新问题')
+    await act(async () => { sendBtn()!.click() })
+
+    expect(onEditResend).toHaveBeenCalledTimes(1)
+    const call = onEditResend.mock.calls[0] as unknown as [string, string, () => void, AttachmentRequest[]]
+    expect(call[1]).toBe('带图的新问题')
+    expect(call[3], '新粘贴的图必须随重发带上').toHaveLength(1)
+    expect(call[3][0].type).toBe('image')
+    expect(call[3][0].mediaType).toBe('image/png')
+    expect(call[3][0].base64, '必须带 base64 正文').toBeTruthy()
+    expect(call[3][0].base64, 'base64 必须是纯串（dataURL 前缀会让后端落盘/图像 block 失败）')
+      .not.toContain('data:')
+  })
+
+  it('⭐ 待发图片可单张移除 → 移除后重发不再带上它', async () => {
+    // WHY：编辑态新加的图如果没有删除入口，用户贴错一张就只能取消整个编辑重来。
+    const onEditResend = vi.fn(async () => {})
+    renderList([userMsg('u1', '原问题')], onEditResend)
+    hover()
+    act(() => { editBtn()!.click() })
+
+    const file = new File([new Uint8Array([1, 2, 3])], 'shot.png', { type: 'image/png' })
+    pasteImage(textarea()!, file)
+    await flush()
+    expect(container.querySelectorAll('.user-edit-thumb').length).toBe(1)
+
+    act(() => { (container.querySelector('.user-edit-added-x') as HTMLButtonElement).click() })
+    expect(container.querySelectorAll('.user-edit-thumb').length, '移除后缩略图必须消失').toBe(0)
+
+    typeInto(textarea()!, '不要图了')
+    await act(async () => { sendBtn()!.click() })
+    const call = onEditResend.mock.calls[0] as unknown as [string, string, () => void, AttachmentRequest[] | undefined]
+    expect(call[3]).toBeUndefined()
   })
 })

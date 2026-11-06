@@ -78,6 +78,14 @@ describe('[状态行] 同一轮只允许一条「正在执行」', () => {
     renderList([userMsg('u1')], true)
     expect(runningToggles().length, '状态行恒一条').toBe(1)
     expect(scanLines().length, '扫光条恒一条').toBe(1)
+    // [2026-11-04 用户裁定] 占位里那句**静态**「思考中…」去掉 —— 用户原话：
+    //   「发送消息 还没收到流 此时 正在执行下面还有个思考中… 这个静态的 不应该有的」。
+    // 判据用「占位节点内有没有 .thinking-wrap」：⛔ 不比对整篇 textContent
+    //   （组件内联 <style> 里含「思考中…」注释字样，会假红）。
+    const placeholder = container.querySelector('.msg.assistant:not([data-msg-id])')
+    expect(placeholder, '刚发送时占位必须存在（正在执行 + 扫光条）').not.toBeNull()
+    expect(placeholder!.querySelector('.thinking-wrap'),
+      '占位里的静态「思考中…」不该再有').toBeNull()
   })
 
   it('本轮已有落库 assistant、模型在憋下一段（thinking=true）→ 也只有一条', () => {

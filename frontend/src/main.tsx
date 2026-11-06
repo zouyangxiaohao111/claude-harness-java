@@ -9,6 +9,8 @@ import { ErrorBoundary } from '@/components/common/ErrorBoundary'
 import { LaunchGate } from '@/components/startup/LaunchGate'
 import { StandalonePreviewView } from '@/components/standalone/StandalonePreviewView'
 import { isStandalonePreviewRoute } from '@/utils/standalonePreview'
+import { KnowledgeGraphDemo } from '@/components/knowledge/KnowledgeGraphDemo'
+import { isKnowledgeGraphDemoRoute } from '@/utils/knowledgeGraphRoute'
 // [OBS2] 错误上报出口：frontLog 以顶层副作用装好了通道，这里取它的上报函数交给 React 19 的错误回调。
 // ⛔ 必须放在 `import './utils/frontLog'` 之后（那一条负责安装通道）。
 import { reportFrontendError } from '@/utils/frontLog'
@@ -21,6 +23,8 @@ import '@fontsource/inter/700.css'
 /** 顶层分流：独立预览查看器路由渲染极简视图（跳过 LaunchGate/后端就绪门），其余走完整 App。 */
 function Root() {
   const [standalone] = useState(isStandalonePreviewRoute)
+  const [graphDemo] = useState(isKnowledgeGraphDemoRoute)
+  if (graphDemo) return <KnowledgeGraphDemo />
   return standalone ? (
     <StandalonePreviewView />
   ) : (

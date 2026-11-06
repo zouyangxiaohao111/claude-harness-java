@@ -37,7 +37,26 @@ public class ChannelNotificationGate {
     /** Gate 跳过原因 · CC ChannelGateResult kind（channelNotification.ts:142-153；AUTH/POLICY 已按 OPD-MCP-04 删除）。 */
     public enum GateKind { CAPABILITY, DISABLED, SESSION, MARKETPLACE, ALLOWLIST }
 
-    public record ChannelGateResult(String action, GateKind kind, String reason) {}
+    /**
+     * 门序结果 · CC ChannelGateResult（channelNotification.ts:142-153）。
+     *
+     * @param action        "register" | "skip"
+     * @param kind          跳过原因（skip 时非 null）
+     * @param reason        人类可读原因（CC 原文，skip 时非 null）
+     * @param boundSessionId [V255 外部渠道] 归属会话 id —— 门序[3] 从绑定表查到的
+     *                       「这个渠道归哪个会话」。<b>这是本仓相对 CC 的新增语义</b>：
+     *                       CC 的消息靠 ambient {@code agentId: ci()} 进「当前 agent」队列，
+     *                       本仓多会话必须显式携带（{@code NotificationQueue.drainForQuery}
+     *                       的 [3a] 规则：具体会话的 turn 只捞 sessionId 匹配的命令 ⇒
+     *                       归属写错 = 消息永远躺在队列里没人消费）。
+     *                       register 时非 null（= 该渠道绑定的会话）；skip 时为 null。
+     */
+    public record ChannelGateResult(String action, GateKind kind, String reason, String boundSessionId) {
+        /** 2-arg 兼容构造（skip 分支用；无归属会话）。 */
+        public ChannelGateResult(String action, GateKind kind, String reason) {
+            this(action, kind, reason, null);
+        }
+    }
 
     /** --channels 会话条目 · CC original: ChannelEntry（main.tsx:1650-1675 解析产物，
      *  bootstrap/state.ts:37-39 单一联合类型）→ 统一由 {@link ChannelAllowlist.ChannelEntry} 承担
@@ -66,7 +85,101 @@ public class ChannelNotificationGate {
 
     private static final java.util.regex.Pattern SAFE_META_KEY =
         java.util.regex.Pattern.compile("^[a-zA-Z_][a-zA-Z0-9_]*$");
+
+    /**
+     * [V254 外部渠道] channels_enabled 实时读源（DB settings 权威源）·
+     * CC original: {@code isChannelsEnabled()}（channelAllowlist.ts:51-53，GrowthBook 'tengu_harbor'）。
+     *
+     * <p><b>为什么用 static 读源而不是构造注入 {@code SettingsService}</b>：本仓对象图深，
+     * {@code ChannelNotificationGate} ← {@code McpToolPool} / {@code McpServerService} 都在
+     * agent/mcp 域内，把 domain/settings 拉进来会扩大依赖面；static 读源是本仓既有范式
+     * （同 {@code ProviderHeaderInjector.installGateSource} / {@code TaskSystemConfig.installAgentSwarmsSettingsSource}）。
+     *
+     * <p><b>不缓存</b>：前端「设置→高级」改完 → 下一条通道消息即生效（DB 实时读）。
+     *
+     * <p><b>返回 {@code null} = 「未配置 / 读不到」</b>（三态，不是布尔）：调用方据此回落 yml。
+     * 必须能区分「DB 显式 false（用户关掉）」与「DB 没有这个值」—— 前者要尊重用户的显式关闭，
+     * 后者才回落 yml 兜底。
+     */
+    private static volatile java.util.function.Supplier<Boolean> channelsEnabledDbSource;
+
+    /**
+     * 安装 channels_enabled 实时读源（{@code SettingsService.readDbChannelsEnabled} 的方法引用）。
+     *
+     * @param source 每次调用实时读 settings.channels_enabled，返回 null = 未配置/读不到；null = 卸载（仅测试用）
+     */
+    public static void installChannelsEnabledSource(java.util.function.Supplier<Boolean> source) {
+        channelsEnabledDbSource = source;
+    }
+
+    /**
+     * 读 channels_enabled 权威值（<b>null = 未配置 / 读不到</b>）。
+     *
+     * <p>语义：
+     * <ul>
+     *   <li>读源已安装 → 读源返回值（true / false / null）；</li>
+     *   <li>读源未安装（POJO 单测 / 装配失败）→ <b>null</b> + warn 至多一次；</li>
+     *   <li>读取抛异常 → <b>null</b> + warn（调用方回落 yml 兜底）。</li>
+     * </ul>
+     */
+    private static Boolean dbChannelsEnabled() {
+        java.util.function.Supplier<Boolean> s = channelsEnabledDbSource;
+        if (s == null) {
+            if (WARNED_SOURCE_MISSING.compareAndSet(false, true)) {
+                log.warn("[ChannelNotificationGate] channels_enabled 实时读源未安装"
+                    + "（无 Spring 上下文 / 装配失败）→ 回落 yml nexusai.mcp.channels-enabled");
+            }
+            return null;
+        }
+        try {
+            return s.get();
+        } catch (Exception e) {
+            log.warn("[ChannelNotificationGate] 读取 channels_enabled 失败，回落 yml 兜底: {}", e.toString());
+            return null;
+        }
+    }
+
+    private static final java.util.concurrent.atomic.AtomicBoolean WARNED_SOURCE_MISSING =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
+
     private final Supplier<Boolean> channelsEnabledSupplier;
+
+    /**
+     * [V255 外部渠道] server 名 → 归属会话 id 的解析器（null = 未注入 ⇒ 门序[3] 回落旧判据）。
+     *
+     * <p>生产注入：{@code ChannelBindingService.findByServerName(serverName).map(ChannelBindingEntry::sessionId).orElse(null)}。
+     *
+     * <p><b>为什么归属来自绑定表而不是「谁连的 MCP」</b>：CC 单进程单会话 ⇒ 消息靠 ambient
+     * {@code agentId: ci()} 进当前 agent 队列；本仓多会话 ⇒ 必须显式记录「渠道归哪个会话」，
+     * 且该关系要跨后端重启存活 ⇒ 落 {@code mcp_channel_binding} 表。
+     */
+    private Function<String, String> boundSessionResolver;
+
+    /**
+     * [V254 外部渠道] 门序[2] 的最终判定值。
+     *
+     * <p><b>DB 权威，yml 兜底</b>：
+     * <ul>
+     *   <li>DB 有明确值（true 或 false）→ <b>以 DB 为准</b>（用户可在 UI 显式开/关，
+     *       且 UI 关掉后<b>重启后端也不会被 yml 顶回来</b>）；</li>
+     *   <li>DB 未配置（null）/ 读源未装 / 读失败 → 回落 yml {@code nexusai.mcp.channels-enabled}。</li>
+     * </ul>
+     *
+     * <p><b>为什么 DB 优先而不是「或」关系</b>：若两者取或，yml 开着的通道在 UI 关掉后
+     * 重启又自动开 ⇒ 用户会觉得「关了没用」。DB 优先才能让 UI 的显式关闭真正生效。
+     * 而 DB 未配置时回落 yml，保留「yml 一把开」的运维便利。
+     *
+     * <p>⚠️ 与 CC 的差异：CC 只有 GrowthBook 灰度开关（进程级），没有 DB/UI 两级。
+     * 本仓是 Web 多用户形态，UI 开关是必需品（用户裁定 2026-11-03）。
+     */
+    private boolean runtimeChannelsEnabled() {
+        Boolean dbValue = dbChannelsEnabled();
+        if (dbValue != null) {
+            return dbValue;
+        }
+        return Boolean.TRUE.equals(channelsEnabledSupplier.get());
+    }
+
     /**
      * [批 3b] session --channels 白名单 · <b>显式 sessionId → 白名单</b> 的纯函数
      * （旧 {@code Supplier<...>} 版本在读时才解析会话来源，只能读 ThreadLocal ⇒ 派生线程失真）。
@@ -125,6 +238,31 @@ public class ChannelNotificationGate {
         }
         if (provider != null) {
             this.allowedChannelsProvider = provider;
+        }
+    }
+
+    /**
+     * [V255 外部渠道] 注入「server → 归属会话」查询器（生产经
+     * {@code ChannelBindingService.findByServerName}）。
+     *
+     * <p><b>门序[3] 的新判据</b>：这个 server 有没有绑定到某个会话？
+     * <ul>
+     *   <li>有绑定 → register，且 {@code boundSessionId} = 绑定表里的会话（消息投给它）；</li>
+     *   <li>无绑定 → skip（SESSION 门）—— 没人认领这个渠道 ⇒ 不注册 handler。</li>
+     * </ul>
+     *
+     * <p><b>与 CC 的语义差异（有意为之）</b>：CC 的门序[3] 判的是「server 在不在本会话的
+     * {@code --channels} 白名单里」（{@code Rt.allowedChannels}，进程级全局）；
+     * 本仓改为「server 有没有被绑定到某个会话」（DB 表，跨进程重启存活）。
+     * 两者在「谁有权用这个 channel」上是同一个问题，只是本仓必须显式记录归属会话。
+     */
+    public void setBoundSessionResolver(Function<String, String> resolver) {
+        if (log.isDebugEnabled()) {
+            log.debug("[ChannelNotificationGate] 注入 server→归属会话 解析器: {}",
+                resolver != null ? "真实绑定态(ChannelBindingService)" : "null(保持现态)");
+        }
+        if (resolver != null) {
+            this.boundSessionResolver = resolver;
         }
     }
 
@@ -215,20 +353,47 @@ public class ChannelNotificationGate {
                 "server did not declare claude/channel capability");
         }
         // 2. runtime gate（L211-217）
-        if (!Boolean.TRUE.equals(channelsEnabledSupplier.get())) {
+        //   [V254 外部渠道] 判定源 = DB settings.channels_enabled（权威，前端「设置→高级」改完即生效）
+        //   与 yml nexusai.mcp.channels-enabled（兜底默认值）的**或**关系：
+        //   DB 列 null（未配置）→ 回落 yml；DB 有值 → 以 DB 为准（用户可在 UI 关掉 yml 开的通道）。
+        if (!runtimeChannelsEnabled()) {
             log.info("[ChannelNotificationGate] 门序[2 runtime] 跳过 server={}: channels 功能未启用（channels-enabled=false）",
                 serverName);
             return new ChannelGateResult("skip", GateKind.DISABLED,
                 "channels feature is not currently available");
         }
         // 3. session --channels（L250-257）· [批 3b] 显式 sessionId 查表（无 ThreadLocal/MDC 源）
-        ChannelAllowlist.ChannelEntry entry =
-            findChannelEntry(serverName, allowedChannelsProvider.apply(sessionId));
-        if (entry == null) {
-            log.info("[ChannelNotificationGate] 门序[3 session] 跳过 server={}: 不在该会话 --channels "
-                + "白名单中（sessionId={}）", serverName, sessionId);
-            return new ChannelGateResult("skip", GateKind.SESSION,
-                "server " + serverName + " not in --channels list for this session");
+        //
+        //   [V255 外部渠道] 判据改为「server 有没有绑定到某个会话」（mcp_channel_binding 表）：
+        //     · 有绑定 → register，boundSessionId = 绑定表里的会话（消息投给它）；
+        //     · 无绑定 → skip（没人认领这个渠道）。
+        //   绑定表未接线时（boundSessionResolver == null）→ 回落旧判据（session --channels 白名单），
+        //   保持既有单测与旧路径的行为不变（fail-closed 方向一致）。
+        String boundSessionId = null;
+        ChannelAllowlist.ChannelEntry entry;
+        if (boundSessionResolver != null) {
+            boundSessionId = boundSessionResolver.apply(serverName);
+            if (boundSessionId == null || boundSessionId.isBlank()) {
+                log.info("[ChannelNotificationGate] 门序[3 session] 跳过 server={}: 该渠道未绑定到任何会话",
+                    serverName);
+                return new ChannelGateResult("skip", GateKind.SESSION,
+                    "server " + serverName + " is not bound to any session");
+            }
+            // 绑定表已给出归属会话 ⇒ 白名单条目由绑定态推导（server-kind，dev 豁免）
+            //   ⇒ 门序[5] 的 server-kind 分支会恒 skip，需在此显式标记为已授权（见下方）。
+            entry = new ChannelAllowlist.ChannelEntry("server", serverName, null, true);
+            if (log.isDebugEnabled()) {
+                log.debug("[ChannelNotificationGate] 门序[3 session] 命中绑定: server={} sessionId={}",
+                    serverName, boundSessionId);
+            }
+        } else {
+            entry = findChannelEntry(serverName, allowedChannelsProvider.apply(sessionId));
+            if (entry == null) {
+                log.info("[ChannelNotificationGate] 门序[3 session] 跳过 server={}: 不在该会话 --channels "
+                    + "白名单中（sessionId={}）", serverName, sessionId);
+                return new ChannelGateResult("skip", GateKind.SESSION,
+                    "server " + serverName + " not in --channels list for this session");
+            }
         }
         // 4. marketplace 校验（L259-276）· R1: pluginSource ? parsePluginIdentifier(pluginSource).marketplace : undefined
         if ("plugin".equals(entry.kind())) {
@@ -267,9 +432,9 @@ public class ChannelNotificationGate {
                     "server " + entry.name() + " is not on the approved channels allowlist (use --dangerously-load-development-channels for local dev)");
             }
         }
-        log.info("[ChannelNotificationGate] 门序全过 → register server={} kind={} entry={}",
-            serverName, entry.kind(), entry.name());
-        return new ChannelGateResult("register", null, null);
+        log.info("[ChannelNotificationGate] 门序全过 → register server={} kind={} entry={} sessionId={}",
+            serverName, entry.kind(), entry.name(), boundSessionId);
+        return new ChannelGateResult("register", null, null, boundSessionId);
     }
 
     /**

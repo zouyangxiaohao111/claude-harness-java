@@ -34,6 +34,32 @@ export interface BuiltInCommandDto {
   source: 'BUILTIN'
 }
 
+/**
+ * prompt 型内置命令的执行结果（后端 `PromptExecuteResult`）。
+ *
+ * <p>`/init` 这类 `type=prompt` 命令的价值全在提示词正文 —— 后端把正文回传，
+ * 前端须把它作为一条 user 消息发出（对齐 CC 把 `b.prompt` 注入本轮对话）。
+ */
+export interface PromptExecuteResult {
+  /** 恒 'prompt'（前端据此分流：注入对话，而非只弹 toast） */
+  type: 'prompt'
+  name: string
+  content: string
+}
+
+/**
+ * 类型守卫：后端 `executeBuiltin` 的响应是否为 prompt 型执行结果。
+ *
+ * <p>通用端点的响应类型是 `Object`（resume → ResumeAgentResult、prompt → PromptExecuteResult、
+ * 其余 → BuiltInCommandDto 元数据）⇒ 前端必须按 `type` 字段分流，否则会把元数据当正文发出去。
+ */
+export function isPromptExecuteResult(v: unknown): v is PromptExecuteResult {
+  return !!v && typeof v === 'object'
+    && (v as PromptExecuteResult).type === 'prompt'
+    && typeof (v as PromptExecuteResult).content === 'string'
+    && (v as PromptExecuteResult).content.length > 0
+}
+
 export const commandApi = {
   /**
    * 命令列表 · `sessionId` 可选（[TL-W1 P4] 后端已加 `?sessionId=` 查询参数）。

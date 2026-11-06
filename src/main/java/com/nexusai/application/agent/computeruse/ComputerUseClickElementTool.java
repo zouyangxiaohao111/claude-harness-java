@@ -122,6 +122,10 @@ public final class ComputerUseClickElementTool implements Tool {
     private final ComputerUseWindowBindingStore bindingStore;
     private final ComputerUseUiSnapshotStore snapshotStore;
     private final ComputerUseConfirmationStore confirmationStore;
+    /** TCC 权限检查（macOS 侧用于报告权限状态；可为 null）。 */
+    private final MacOsTccChecker tcc;
+    /** 当前会话 id（execute 时写入，供动作后置观察登记用）。 */
+    private String currentSessionId;
 
     /**
      * @param uiaService    UIA/AX 服务
@@ -135,11 +139,29 @@ public final class ComputerUseClickElementTool implements Tool {
                                        ComputerUseWindowBindingStore bindingStore,
                                        ComputerUseUiSnapshotStore snapshotStore,
                                        ComputerUseConfirmationStore confirmationStore) {
+        this(uiaService, windowOps, bindingStore, snapshotStore, confirmationStore, null);
+    }
+
+    /**
+     * @param uiaService    UIA/AX 服务
+     * @param windowOps     窗口操作原语（仅 Windows 的回落路径需要；macOS 传 null）
+     * @param bindingStore  绑定窗口存储（仅 Windows 需要；macOS 传 null）
+     * @param snapshotStore 观察存储（observationId + index 解析）
+     * @param confirmationStore 敏感动作令牌存储（可空 ⇒ 敏感动作一律拒绝）
+     * @param tcc           TCC 权限检查（可空 ⇒ 权限报 unavailable）
+     */
+    public ComputerUseClickElementTool(ComputerUseUiaService uiaService,
+                                       ComputerUseWindowOps windowOps,
+                                       ComputerUseWindowBindingStore bindingStore,
+                                       ComputerUseUiSnapshotStore snapshotStore,
+                                       ComputerUseConfirmationStore confirmationStore,
+                                       MacOsTccChecker tcc) {
         this.uiaService = uiaService;
         this.windowOps = windowOps;
         this.bindingStore = bindingStore;
         this.snapshotStore = snapshotStore;
         this.confirmationStore = confirmationStore;
+        this.tcc = tcc;
     }
 
     /**
@@ -245,6 +267,7 @@ public final class ComputerUseClickElementTool implements Tool {
         }
 
         String sessionId = ctx != null ? ctx.sessionId() : null;
+        this.currentSessionId = sessionId;
 
         // 敏感动作的一次性确认（dsh confirmations.ts:89-113）——在任何动作之前
         ComputerUseSensitiveGate.Gate gate = ComputerUseSensitiveGate.check(
@@ -280,6 +303,9 @@ public final class ComputerUseClickElementTool implements Tool {
                 targetId = resolution.locator();
                 // dsh expectedStateHash：动作前校验树没变（macOS 的 locator 是树序派生的）
                 expectedStateHash = resolution.stateHash();
+                // 动作前的观察：动作后的后置观察要用**同一个应用**定位
+                ComputerUseUiSnapshotStore.Observation beforeObservation =
+                        snapshotStore != null ? snapshotStore.require(sessionId, observationId) : null;
 
                 // dsh service.ts:509-513 —— 允许重绑且提供了 targetHandle 时：
                 //   重新 observe 一次，用新树做三级解析（exact → native-id → semantic）
@@ -324,7 +350,9 @@ public final class ComputerUseClickElementTool implements Tool {
 
                 return clickAndReport(call, hwnd, needsBinding, targetId,
                         labelOfObserved(observed, index, name, role, automationId), observed,
-                        expectedStateHash);
+                        expectedStateHash, beforeObservation,
+                        resolution.targetResolution(),
+                        beforeObservation == null ? 0L : beforeObservation.pid());
             } else if (automationId != null && !automationId.isEmpty()) {
                 targetId = automationId;
             } else {
@@ -351,6 +379,12 @@ public final class ComputerUseClickElementTool implements Tool {
 
             return clickAndReport(call, hwnd, needsBinding, targetId,
                     labelOfObserved(observed, index, name, role, automationId), observed, null);
+        } catch (ComputerUseStaleObservationException e) {
+            // dsh COMPUTER_STALE_OBSERVATION：树变了 ⇒ 让模型重新 observe，而不是把它
+            // 当成「元素不可用」去重复尝试同一个 locator
+            log.warn("[computer-use] {} 拒绝执行：观察已陈旧。{}", TOOL_NAME, e.getMessage());
+            return ToolResult.error(call.id(),
+                    ComputerUseUiSnapshotStore.ERR_STALE_OBSERVATION + ": " + e.getMessage());
         } catch (Exception e) {
             log.error("[computer-use] {} 执行失败: index={} name={} role={} automationId={} err={}",
                     TOOL_NAME, index, name, role, automationId, e.getMessage(), e);
@@ -369,30 +403,124 @@ public final class ComputerUseClickElementTool implements Tool {
                                               String label,
                                               ComputerUseUiSnapshotStore.ObservedElement observed,
                                               String expectedStateHash) {
-        boolean pressed = expectedStateHash == null
-                ? uiaService.invokeElement(hwnd, targetId)
-                : uiaService.invokeElement(hwnd, targetId, expectedStateHash);
-        if (!pressed) {
-            if (!needsBinding && windowOps == null) {
+        return clickAndReport(call, hwnd, needsBinding, targetId, label, observed, expectedStateHash, null);
+    }
+
+    /**
+     * 执行点击 + 返回结构化动作结果（dsh {@code actionResultSchema}）。
+     *
+     * @param before    动作前的观察（提供应用身份与 stateHash；可空）
+     * @param resolution 目标解析结果（可空）
+     */
+    private AgentToolResult<?> clickAndReport(ToolUseBlock call,
+                                              long hwnd,
+                                              boolean needsBinding,
+                                              String targetId,
+                                              String label,
+                                              ComputerUseUiSnapshotStore.ObservedElement observed,
+                                              String expectedStateHash,
+                                              ComputerUseUiSnapshotStore.Observation before) {
+        return clickAndReport(call, hwnd, needsBinding, targetId, label, observed, expectedStateHash,
+                before, null);
+    }
+
+    /**
+     * 执行点击 + 返回结构化动作结果（dsh {@code actionResultSchema}）。
+     *
+     * @param before     动作前的观察（提供应用身份与 stateHash；可空）
+     * @param resolution 目标解析结果（可空）
+     */
+    private AgentToolResult<?> clickAndReport(ToolUseBlock call,
+                                              long hwnd,
+                                              boolean needsBinding,
+                                              String targetId,
+                                              String label,
+                                              ComputerUseUiSnapshotStore.ObservedElement observed,
+                                              String expectedStateHash,
+                                              ComputerUseUiSnapshotStore.Observation before,
+                                              ComputerUseTargetResolver.Resolution resolution) {
+        // ⛔ 转发给带 targetPid 的那个重载（pid 从「动作前的观察」取）
+        //   ⚠️ 不能转发给自己（同名同参 ⇒ 无限递归 ⇒ StackOverflowError）
+        return clickAndReport(call, hwnd, needsBinding, targetId, label, observed, expectedStateHash,
+                before, resolution, before == null ? 0L : before.pid());
+    }
+
+    /**
+     * 执行点击 + 返回结构化动作结果（dsh {@code actionResultSchema}）。
+     *
+     * @param before     动作前的观察（提供应用身份与 stateHash；可空）
+     * @param resolution 目标解析结果（可空）
+     */
+    private AgentToolResult<?> clickAndReport(ToolUseBlock call,
+                                              long hwnd,
+                                              boolean needsBinding,
+                                              String targetId,
+                                              String label,
+                                              ComputerUseUiSnapshotStore.ObservedElement observed,
+                                              String expectedStateHash,
+                                              ComputerUseUiSnapshotStore.Observation before,
+                                              ComputerUseTargetResolver.Resolution resolution,
+                                              long targetPid) {
+        // ⭐ macOS 侧返回结构化动作结果（dsh actionResultSchema）：
+        //   动作后的新观察 + effect（生效没有）+ resolution（点的是不是那个元素）
+        if (needsBinding) {
+            // Windows 侧维持既有文案（CCB 路线，不改 Windows 行为）
+            boolean pressedWin = expectedStateHash == null
+                    ? uiaService.invokeElement(hwnd, targetId)
+                    : uiaService.invokeElement(hwnd, targetId, expectedStateHash);
+            if (!pressedWin) {
+                if (observed == null || !observed.hasBounds()) {
+                    return ToolResult.error(call.id(),
+                            "Element could not be pressed and has no usable bounds for a fallback click: " + label);
+                }
+                int cx = observed.x() + Math.round(observed.width() / 2f);
+                int cy = observed.y() + Math.round(observed.height() / 2f);
+                int[] client = windowOps.screenToClient(hwnd, cx, cy);
+                windowOps.sendClick(hwnd, client[0], client[1], false);
+            }
+            return ToolResult.success(call.id(), "Clicked element: " + label);
+        }
+        // dsh service.ts:441-446 —— 同一进程的动作排队，串到上一个动作的后置观察完成
+        //   ⇒ observe → click → observe 交错时不会读到半更新的界面树
+        String appKey = before == null ? "unknown" : before.bundleId() + ":" + before.pid();
+        return ComputerUseActionExecutor.enqueue(appKey, () -> {
+            boolean pressed = expectedStateHash == null
+                    ? uiaService.invokeElement(hwnd, targetId)
+                    : uiaService.invokeElement(hwnd, targetId, expectedStateHash, targetPid);
+            if (!pressed && windowOps == null) {
+                // macOS 无坐标回落 ⇒ AXPress 失败就是失败，显式报错不盲点
                 return ToolResult.error(call.id(),
                         "Element cannot be pressed via accessibility (no AXPress). macOS has no "
                                 + "coordinate fallback for observer-only elements — use screenshot + "
                                 + "left_click if the element is drawn without accessibility support.");
             }
-            if (observed == null || !observed.hasBounds()) {
-                return ToolResult.error(call.id(),
-                        "Element could not be pressed and has no usable bounds for a fallback click: " + label);
-            }
-            int centerX = observed.x() + Math.round(observed.width() / 2f);
-            int centerY = observed.y() + Math.round(observed.height() / 2f);
-            int[] client = windowOps.screenToClient(hwnd, centerX, centerY);
-            windowOps.sendClick(hwnd, client[0], client[1], false);
-            if (log.isInfoEnabled()) {
-                log.info("[computer-use] {} 回落中心点击: element=\"{}\" screen=({},{}) client=({},{})",
-                        TOOL_NAME, label, centerX, centerY, client[0], client[1]);
-            }
+            ComputerUseActionResult result = ComputerUseActionExecutor.buildResult(
+                    uiaService, snapshotStore, sessionIdOf(call),
+                    ComputerUseActionResult.ACTION_CLICK,
+                    ComputerUseActionResult.CHANNEL_ACCESSIBILITY,
+                    resolution, before, MacOsUiaService.DEFAULT_MAX_DEPTH, tcc);
+            return ToolResult.success(call.id(),
+                    ComputerUseActionResult.render(result, permissionsNode(), null));
+        });
+    }
+
+    /** 会话 id（execute 时缓存，避免层层传参）。 */
+    private String sessionIdOf(ToolUseBlock call) {
+        return currentSessionId;
+    }
+
+    /** 权限状态节点（dsh {@code permissions}）。 */
+    private com.fasterxml.jackson.databind.node.ObjectNode permissionsNode() {
+        com.fasterxml.jackson.databind.node.ObjectNode node = JSON.createObjectNode();
+        if (tcc != null) {
+            MacOsTccChecker.Status status = tcc.status();
+            node.put("accessibility", status.accessibilityGranted() ? "granted" : "denied");
+            node.put("screenRecording", status.screenRecordingGranted() ? "granted" : "denied");
+        } else {
+            node.put("accessibility", "unavailable");
+            node.put("screenRecording", "unavailable");
         }
-        return ToolResult.success(call.id(), "Clicked element: " + label);
+        return node;
     }
 
     /** 节点 → 观察元素（只为把坐标带进回落路径；Windows 的 name/role 现查路径用）。 */

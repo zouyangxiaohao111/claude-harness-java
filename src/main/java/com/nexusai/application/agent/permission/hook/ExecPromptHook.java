@@ -106,6 +106,79 @@ public class ExecPromptHook {
 
     private final ObjectMapper objectMapper;
 
+    /**
+     * [goal V253] 「该模型必须开思考」的模型名集合（进程内缓存）。
+     *
+     * <p><b>WHY 需要</b>：<b>强制开启思考的模型会拒绝 {@code thinking:{type:"disabled"}}</b>
+     * （实测 MiniMax-M3.1-Flash：{@code requires adaptive thinking; thinking.type="disabled"
+     * is not allowed (2013)} ⇒ HTTP 400）。目标（/goal）评估器默认按 CC 语义关思考，
+     * 在这类模型上会<b>每轮都白烧一次 400 往返</b>。
+     *
+     * <p>⚠️ <b>降级目标是「不传 thinking 字段」，不是「传 adaptive」</b>：显式 adaptive 会
+     * <b>强行要求模型思考</b>（实测响应带 reasoning_content），改变评估器「只读 transcript 判定」的
+     * 语义；而「不传」是<b>最小干预</b> —— 由 OpenAI 兼容端点/模型自己决定要不要思考
+     * （实测 MiniMax 省略=开启、deepseek 省略=关闭）。
+     *
+     * <p>⇒ 首次遇到该错误时把模型名记进来，后续直接用 {@code adaptive} 发（不再试错）。
+     * 与 CC 的「模型能力探测」同思路，但存在<b>进程内</b>（重启后重新探测一次即可，成本一次往返）。
+     *
+     * <p>⚠️ 只影响「评估器/prompt hook」这类<b>旁路判定</b>调用，不改主对话的 thinking 行为。
+     */
+    private static final java.util.Set<String> REQUIRES_NO_THINKING_FIELD =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
+     * [goal V253] 该模型是否已被证实「必须开思考」。
+     *
+     * @param modelName 模型名（可 null）
+     * @return true ⇒ 直接不传 thinking 字段（跳过 disabled 试错）
+     */
+    static boolean requiresNoThinkingField(String modelName) {
+        return modelName != null && REQUIRES_NO_THINKING_FIELD.contains(modelName);
+    }
+
+    /**
+     * [goal V253] 标记「该模型拒绝 thinking:disabled」。
+     *
+     * @param modelName 模型名（可 null）
+     */
+    static void markRequiresNoThinkingField(String modelName) {
+        if (modelName != null) {
+            REQUIRES_NO_THINKING_FIELD.add(modelName);
+        }
+    }
+
+    /**
+     * [goal V253] 判定异常是否是「模型拒绝 thinking:disabled」。
+     *
+     * <p>判据取服务端错误文本（实测形态）：
+     * {@code invalid params, model "X" requires adaptive thinking; thinking.type="disabled" ... is not allowed}
+     * 或 {@code reasoning effort none is not allowed}（同一族拒绝）。
+     *
+     * <p>⚠️ <b>必须带具体错误文本</b>：不能只看「400」—— 任何 400（参数错、schema 不支持）
+     * 都会命中「400 ⇒ 换 adaptive」这种宽判据 ⇒ 把真错误糊过去。
+     *
+     * @param t 异常
+     * @return true = 确实是 thinking 被拒
+     */
+    static boolean isThinkingRejected(Throwable t) {
+        if (t == null) {
+            return false;
+        }
+        String text = t.getMessage();
+        if (text == null) {
+            text = t.toString();
+        }
+        String lower = text.toLowerCase();
+        if (!lower.contains("thinking")) {
+            return false;
+        }
+        return lower.contains("requires adaptive thinking")
+            || lower.contains("adaptive thinking is not supported")
+            || lower.contains("thinking.type")
+            || lower.contains("reasoning effort none is not allowed");
+    }
+
     /** [usage-gateway] 旁路 LLM 单发客户端（统一记账）；测试可经 ReflectionTestUtils 注入 mock。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.nexusai.application.agent.cost.LlmSideCallClient sideCallClient;
@@ -150,7 +223,50 @@ public class ExecPromptHook {
     public HookResult exec(PromptHook hook, String hookName, HookEvent hookEvent,
                            String jsonInput, PromptLlmContext llmContext, AbortController parentAbort,
                            List<ChatMessageDto> messages) {
+        // [goal-observability] 执行期留痕：本方法此前**没有任何「开始了 / 结束了」的日志**，
+        //   调用方只能从「条件满足 / 未满足」这类分支日志反推它跑没跑；而取消、超时、
+        //   JSON 解析失败、schema 失败、异常五条路径的日志里**都没有 sessionId**
+        //   ⇒ 多会话并发时无法归因，用户的原话是「不知道 goal 的 stop hook 到底执行没有」。
+        //   本层只做首尾两条日志（含 sessionId + outcome + 耗时），不改任何分支语义。
+        //   ⚠️ 首尾日志在 try 之外 ⇒ 这里的每个取值都必须 null-safe：hook / llmContext 为 null
+        //   在原实现里是**抛在 try 内**的异常（由 catch 归一成 non_blocking_error），
+        //   若日志先一步解引用就会让 NPE 逃出本方法、改变既有异常语义。
+        String hookSessionId = hookEvent == null ? null : hookEvent.sessionId();
+        String hookEventType = hookEvent == null || hookEvent.type() == null
+            ? null : hookEvent.type().name();
+        String hookModel = llmContext == null ? null : llmContext.defaultFastModel();
+        int hookPromptLength = hook == null || hook.prompt() == null ? 0 : hook.prompt().length();
+        long hookEnterMs = System.currentTimeMillis();
+        if (log.isInfoEnabled()) {
+            log.info("[hook] prompt hook 开始执行 session={} event={} model={} 条件长度={}",
+                hookSessionId, hookEventType, hookModel, hookPromptLength);
+        }
+        HookResult hookResult = execInternal(hook, hookName, hookEvent, jsonInput, llmContext,
+            parentAbort, messages);
+        if (log.isInfoEnabled()) {
+            log.info("[hook] prompt hook 执行结束 session={} event={} outcome={} impossible={} 耗时={}ms",
+                hookSessionId, hookEventType,
+                hookResult == null ? null : hookResult.outcome(),
+                hookResult == null ? null : hookResult.impossible(),
+                System.currentTimeMillis() - hookEnterMs);
+        }
+        return hookResult;
+    }
+
+    /**
+     * {@link #exec} 的实际执行体（无首尾日志时的原实现体）。
+     *
+     * <p>拆出来的唯一原因是让 {@code exec} 能在<b>不受 return 路径数量影响</b>的前提下
+     * 统一打首尾两条日志 —— 本方法内部有 10 个 return 分支（父 abort / 超时 / 取消 /
+     * JSON 失败 / schema 失败 / 三态判定 / 异常），逐分支插日志必然漂移。
+     * 本方法自捕获 {@code Throwable}（见末尾 catch），故恒返回非 null。
+     */
+    private HookResult execInternal(PromptHook hook, String hookName, HookEvent hookEvent,
+                                    String jsonInput, PromptLlmContext llmContext,
+                                    AbortController parentAbort, List<ChatMessageDto> messages) {
         String effectiveToolUseID = "hook-" + UUID.randomUUID();
+        // [goal V253] 本次调用起点（降级重试时算剩余超时用）
+        long callStartMs = System.currentTimeMillis();
         // CC :55 hookTimeoutMs（truthy 语义，OD-EX-03）+ :57-59 createCombinedAbortSignal(signal, {timeoutMs})
         long timeoutMs = hook.timeoutMs();
         AbortController combinedAbort = new AbortController();
@@ -214,13 +330,21 @@ public class ExecPromptHook {
             //   standalone(HOOK, "exec-prompt-hook").withAgentContext(llmContext.agentContext())；
             //   config 仍取自 llmContext.config()。返回值/异常/超时/abort 语义与 chatWithOptions 完全一致
             //   （options 内 abortController=combinedAbort 原样透传）。
+            // [goal V253] thinking 类型三态选择：
+            //   "disabled"（默认）→ 发 thinking:{type:"disabled"}（CC execPromptHook.ts:71 语义）
+            //   null（不传）      → 走 OpenAI 兼容端点/模型自身的默认行为
+            //   ⛔ 不用 "adaptive" 作为降级目标：显式 adaptive 会**强行要求模型思考**、
+            //      改变判定语义（评估器本该只读 transcript 判定）；「不指定」才是最小干预
+            //      ——端点自己决定要不要思考（实测 MiniMax 省略=开启、deepseek 省略=关闭）。
+            //   已知「拒绝 disabled」的模型 → 直接 null（省一次 400 往返）。
+            String thinkingType = requiresNoThinkingField(effectiveModelName) ? null : "disabled";
             CompletableFuture<String> future = CompletableFuture.supplyAsync(() ->
                 sideCallClient.chat(
                     llmContext.config(),
                     effectiveModelName,
                     SYSTEM_PROMPT,
                     processedPrompt,
-                    buildRequestOptions(llmContext, combinedAbort, messages),
+                    buildRequestOptions(llmContext, combinedAbort, messages, thinkingType),
                     com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
                         .standalone(com.nexusai.infra.llm.UsageCategory.HOOK, "exec-prompt-hook")
                         .withAgentContext(llmContext.agentContext())
@@ -234,16 +358,30 @@ public class ExecPromptHook {
                 fullResponse = future.get(timeoutMs, TimeUnit.MILLISECONDS);
             } catch (ExecutionException ee) {
                 Throwable cause = ee.getCause() != null ? ee.getCause() : ee;
-                // provider 抛出的业务异常 → 交给外层 catch 走 non_blocking_error；
-                // 取消类（父 abort / 超时硬中断）→ cancelled · 对齐 CC :183-191
-                if (combinedAbort.isCancelled() || cause instanceof CancellationException) {
-                    if (log.isInfoEnabled()) {
-                        log.info("ExecPromptHook: hook={} 取消触发 (reason={}), outcome=cancelled",
-                            hookName, combinedAbort.reason());
+                // [goal V253] 降级重试 · 「模型拒绝 thinking:disabled」⇒ 改用 adaptive 再试一次。
+                //   WHY：强制开启思考的模型（如 MiniMax-M3.1-Flash）会 400 拒 disabled；
+                //   不降级 ⇒ 目标（/goal）评估器在这种模型上永远跑不起来。
+                //   判据必须精确（isThinkingRejected 只认具体错误文本）⇒ 其它 400 不被糊过去。
+                if (isThinkingRejected(cause) && "disabled".equals(thinkingType)) {
+                    log.info("ExecPromptHook: hook={} 模型拒绝 thinking:disabled → 降级 adaptive 重试（model={}）",
+                        hookName, effectiveModelName);
+                    markRequiresNoThinkingField(effectiveModelName);
+                    // ⚠️ 降级重试自身也可能失败（网络/其它错误）→ 由 retryWithAdaptive 内部
+                    //   重新抛出，交给下面的 catch 链处理（不吞异常）。
+                    fullResponse = retryWithAdaptive(llmContext, effectiveModelName, processedPrompt,
+                        messages, timeoutMs, callStartMs);
+                } else {
+                    // provider 抛出的业务异常 → 交给外层 catch 走 non_blocking_error；
+                    // 取消类（父 abort / 超时硬中断）→ cancelled · 对齐 CC :183-191
+                    if (combinedAbort.isCancelled() || cause instanceof CancellationException) {
+                        if (log.isInfoEnabled()) {
+                            log.info("ExecPromptHook: hook={} 取消触发 (reason={}), outcome=cancelled",
+                                hookName, combinedAbort.reason());
+                        }
+                        return cancelled();
                     }
-                    return cancelled();
+                    throw cause;
                 }
-                throw cause;
             } catch (TimeoutException te) {
                 // timeout → cancelled · 对齐 CC execPromptHook.ts:186-190
                 if (log.isWarnEnabled()) {
@@ -339,6 +477,48 @@ public class ExecPromptHook {
         }
     }
 
+    /**
+     * [goal V253] 降级重试 · 用 {@code thinking:{type:"adaptive"}} 再试一次。
+     *
+     * <p><b>WHY 需要</b>：强制开启思考的模型（如 MiniMax-M3.1-Flash）会 400 拒
+     * {@code thinking:{type:"disabled"}} ⇒ 目标（/goal）评估器在这种模型上跑不起来。
+     * 降级后模型<b>会思考</b>（响应带 {@code reasoning_content}）——
+     * 这偏离 CC「评估器不思考、只读 transcript 判定」的语义，但：
+     * <ul>
+     *   <li>{@code extractContent} 只取 {@code message.content}，{@code reasoning_content}
+     *       在独立字段 ⇒ <b>不会污染评估器的 JSON 解析</b>；</li>
+     *   <li>比「目标完全跑不起来」好；</li>
+     *   <li>且这是<b>按模型</b>的自动降级，不影响支持 disabled 的模型（deepseek-flash 仍走 disabled）。</li>
+     * </ul>
+     *
+     * <p><b>超时口径</b>：用<b>剩余</b>超时（{@code timeoutMs - 已耗时}），不是全额 ——
+     * 否则两次调用加起来可能超过调用方给的 30s 上限。
+     *
+     * @throws RuntimeException 重试仍失败 → 原样抛出（交给外层 catch 走 non_blocking_error）
+     */
+    private String retryWithAdaptive(PromptLlmContext llmContext, String modelName,
+                                    String processedPrompt, List<ChatMessageDto> messages,
+                                    long timeoutMs, long callStartMs) {
+        long elapsed = System.currentTimeMillis() - callStartMs;
+        long remaining = Math.max(1000L, timeoutMs - elapsed);
+        // 降级重试用独立 abort（原来的 combined 可能已被 abort）
+        AbortController retryAbort = new AbortController();
+        try {
+            return sideCallClient.chat(
+                llmContext.config(),
+                modelName,
+                SYSTEM_PROMPT,
+                processedPrompt,
+                buildRequestOptions(llmContext, retryAbort, messages, null),   // null = 不传 thinking（走端点默认）
+                com.nexusai.application.agent.cost.LlmSideCallClient.SideCallUsage
+                    .standalone(com.nexusai.infra.llm.UsageCategory.HOOK, "exec-prompt-hook")
+                    .withAgentContext(llmContext.agentContext())
+            );
+        } catch (Exception e) {
+            throw e instanceof RuntimeException re ? re : new RuntimeException(e);
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // 请求选项构建 · [对抗核验 H13-GAP-3 v3] 对齐 CC execPromptHook.ts:62-99 queryModelWithoutStreaming
     // ════════════════════════════════════════════════════════════════════════
@@ -359,6 +539,19 @@ public class ExecPromptHook {
     private LlmProvider.ChatRequestOptions buildRequestOptions(PromptLlmContext llmContext,
                                                                AbortController combinedAbort,
                                                                List<ChatMessageDto> messages) {
+        return buildRequestOptions(llmContext, combinedAbort, messages, "disabled");
+    }
+
+    /**
+     * [goal V253] 构建请求选项 · thinking 类型可覆盖（{@code thinkingTypeOverride}）。
+     *
+     * @param thinkingTypeOverride null = 用默认（{@code disabled}，CC 语义）；
+     *                            {@code "adaptive"} = 强制开思考（兼容拒绝 disabled 的模型）
+     */
+    private LlmProvider.ChatRequestOptions buildRequestOptions(PromptLlmContext llmContext,
+                                                               AbortController combinedAbort,
+                                                               List<ChatMessageDto> messages,
+                                                               String thinkingTypeOverride) {
         // CC v2.1.212 schema {ok:boolean, reason?:string, impossible?:boolean}
         com.fasterxml.jackson.databind.node.ObjectNode schema = objectMapper.createObjectNode();
         schema.put("type", "object");
@@ -375,12 +568,24 @@ public class ExecPromptHook {
 
         List<com.nexusai.application.agent.tool.Tool> tools =
             llmContext.tools() != null ? llmContext.tools() : List.of();
+        // [goal V253] thinking 类型三态：
+        //   "disabled" → thinking:{type:"disabled"}（CC execPromptHook.ts:71 的默认语义）
+        //   "adaptive" → thinking:{type:"adaptive"}（显式要思考）
+        //   null       → **不传 thinking 字段** ⇒ 走 OpenAI 兼容端点/模型自身的默认行为
+        //                （「降级」用这个：模型拒 disabled 时，退回「不指定」而不是「指定 adaptive」——
+        //                 指定 adaptive 会强行要求模型思考、改变判定语义；不指定则由端点决定）
+        LlmProvider.ChatRequestOptions.ThinkingConfig thinkingConfig =
+            thinkingTypeOverride == null || thinkingTypeOverride.isBlank()
+                ? null
+                : ("adaptive".equals(thinkingTypeOverride)
+                    ? LlmProvider.ChatRequestOptions.ThinkingConfig.adaptive()
+                    : LlmProvider.ChatRequestOptions.ThinkingConfig.disabled());
         return new LlmProvider.ChatRequestOptions(
             // [H2/CCJ-EXEC-01] history = CC messages 参数（可 null/空 = 仅 userMessage，CC :46-48）
             messages != null ? messages : List.of(),
             toOpenAiToolsArray(tools),
             LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(schema),
-            LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
+            thinkingConfig,
             null,   // [P2-16] temperature — CC execPromptHook.ts 未设 temperatureOverride (claude.ts:1693-1694 缺省 1)
             "hook_prompt",  // [IMPL-05 OD-EX-01] querySource — CC execPromptHook.ts:84 querySource: 'hook_prompt'
                           //   （遥测/日志按来源分流；Java 旧实现恒 null，EV-EX-023）

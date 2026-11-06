@@ -173,8 +173,14 @@ class ComputerUseUiSnapshotStoreTest {
     }
 
     @Test
-    @DisplayName("diff 模式：同一位置名字变了算「变化」，位置消失才算「移除」")
+    @DisplayName("diff 模式：同名元素内容变了算「变化」，名字不同才算「新增/移除」")
     void diffDetectsChangedAndRemoved() {
+        // ⭐ WHY 改成「语义身份」而非「位置身份」（对齐 dsh src/diff.ts:7-13）：
+        //   dsh 的 identity = role|subrole|title|label|frame —— 即「同一个控件」哪怕在树里
+        //   换了位置，仍被认作「同一个，只是变了点东西」；
+        //   而按 locator（位置）对齐时，界面轻微重排就会把每个元素都报成「变了」，
+        //   模型被告知「到处都变了」却拿不到任何有用信息。
+        //   ⛔ 本仓 macOS 拿不到坐标 ⇒ frame 项缺省 ⇒ identity 退化为 role|subrole|name。
         List<ComputerUseUiSnapshotStore.ObservedElement> before = List.of(
                 element(0, "", "Window", "W"),
                 element(1, "0", "Button", "A"),
@@ -185,10 +191,36 @@ class ComputerUseUiSnapshotStoreTest {
 
         String diff = ComputerUseUiSnapshotStore.diffElements(before, after);
 
-        // locator 仍是 "0" ⇒ 同一个位置、内容变了 ⇒ 变化行（~），不是新增（+）
-        assertThat(diff).contains("~ [#1] [Button] \"B\"");
-        // locator "1" 已不存在 ⇒ 移除行（-）
+        // 名字从 "A" 变成 "B" ⇒ 语义身份变了 ⇒ 是「新增 + 移除」，不是「变化」
+        //   （同名元素内容变化才判 ~；见下一个用例）
+        assertThat(diff).contains("+ [#1] [Button] \"B\"");
+        assertThat(diff).contains("- [#1] [Button] \"A\"");
+        // 名字 "Gone" 的元素消失了 ⇒ 移除行（-）
         assertThat(diff).contains("- [#2] [Button] \"Gone\"");
+        assertThat(diff).doesNotContain("~");
+    }
+
+    @Test
+    @DisplayName("diff 模式：同名元素内容变了 ⇒ 判「变化」（~）而非新增/移除")
+    void diffDetectsSameNameContentChange() {
+        // 同名同角色 ⇒ 语义身份相同 ⇒ 是「同一个元素，内容变了」⇒ ~ （对齐 dsh 的 state 比较）
+        List<ComputerUseUiSnapshotStore.ObservedElement> before = List.of(
+                element(0, "", "Window", "W"),
+                element(1, "0", "Button", "Save"));
+        List<ComputerUseUiSnapshotStore.ObservedElement> after = List.of(
+                element(0, "", "Window", "W"),
+                element(1, "0", "Button", "Save"));
+
+        // 内容变了（value 不同）⇒ ~ ；这里用 actions 变化来制造 state 差异
+        List<ComputerUseUiSnapshotStore.ObservedElement> afterChanged = List.of(
+                element(0, "", "Window", "W"),
+                new ComputerUseUiSnapshotStore.ObservedElement(1, "h", "0", "Button", "Save", null,
+                        true, List.of("AXPress", "AXShowMenu"), 0, 0, 0, 0, "", ""));
+
+        String diff = ComputerUseUiSnapshotStore.diffElements(before, afterChanged);
+
+        assertThat(diff).contains("~ [#1] [Button] \"Save\"");
         assertThat(diff).doesNotContain("+ [#1]");
+        assertThat(diff).doesNotContain("- [#1]");
     }
 }

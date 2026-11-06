@@ -128,10 +128,11 @@ public final class Win32UiaService implements ComputerUseUiaService {
     /** 单个 JSON 节点 → 节点对象（CCB {@code accessibilitySnapshot.ts:147-161}）。 */
     static ComputerUseAccessibilityNode parseNode(JsonNode raw) {
         JsonNode children = raw.has("c") && !raw.get("c").isNull() ? raw.get("c") : null;
+        String automationId = raw.path("id").asText("");
         return new ComputerUseAccessibilityNode(
                 raw.path("role").asText(""),
                 raw.path("name").asText(""),
-                raw.path("id").asText(""),
+                automationId,
                 raw.path("x").asInt(0),
                 raw.path("y").asInt(0),
                 raw.path("w").asInt(0),
@@ -139,7 +140,28 @@ public final class Win32UiaService implements ComputerUseUiaService {
                 // CCB: enabled: raw.on !== false —— 缺字段即视为可用
                 raw.path("on").asBoolean(true),
                 raw.hasNonNull("v") ? raw.get("v").asText() : null,
-                parseNodes(children));
+                parseNodes(children),
+                // ⭐ index / locator / actions：Windows 侧此前恒缺（index=-1 / locator="" / actions=空）
+                //   ⇒ observe 返回的元素**一个都用不了**（模型拿到 index=-1 无法引用）。
+                //   修：index = 脚本分配先序序号；locator = automationId（Windows 本就是稳定 id）；
+                //   actions = UIA Pattern 列表（与 macOS 的 AXActionNames 语义等价）。
+                raw.path("i").asInt(-1),
+                automationId,
+                toStringList(raw.path("acts")),
+                "",
+                "");
+    }
+
+    /** JSON 字符串数组 → 不可变列表（null / 非数组 ⇒ 空列表）。 */
+    private static List<String> toStringList(JsonNode array) {
+        if (array == null || !array.isArray()) {
+            return List.of();
+        }
+        List<String> out = new ArrayList<>(array.size());
+        for (JsonNode item : array) {
+            out.add(item.asText(""));
+        }
+        return out;
     }
 
     /** 输出预览（错误信息里截断）。 */
@@ -175,7 +197,7 @@ public final class Win32UiaService implements ComputerUseUiaService {
                   $typeName = $ct -replace 'ControlType\\.', ''
                   return $interactiveTypes -contains $typeName
                 }
-                function Get-Tree($el, $depth, $maxDepth) {
+                function Get-Tree($el, $depth, $maxDepth, $counter) {
                     if ($depth -ge $maxDepth) { return @() }
                     $result = @()
                     $children = $el.FindAll(
@@ -195,8 +217,15 @@ public final class Win32UiaService implements ComputerUseUiaService {
                             $vp = $child.GetCurrentPattern([System.Windows.Automation.ValuePattern]::Pattern)
                             if ($vp -ne $null) { $val = $vp.Current.Value }
                         } catch {}
+                        # ⭐ 可用动作集（对齐 dsh elementSchema.actions + 本仓 macOS 的 actions 字段）：
+                        #   UIA 的 Pattern 就是「可执行动作」的等价物（Invoke/Expand/Collapse/Toggle…）
+                        $acts = @()
+                        try {
+                            $sp = $child.GetSupportedPatterns()
+                            foreach ($p in $sp) { $acts += ($p.ProgrammaticName -replace 'Pattern\\.', '') }
+                        } catch {}
                         $isInteractive = Is-Interactive $ct
-                        $sub = Get-Tree $child ($depth + 1) $maxDepth
+                        $sub = Get-Tree $child ($depth + 1) $maxDepth $counter
                         if ($isInteractive -or $sub.Count -gt 0) {
                             $node = @{
                                 role = $typeName
@@ -205,7 +234,11 @@ public final class Win32UiaService implements ComputerUseUiaService {
                                 x = [int]$rect.X; y = [int]$rect.Y
                                 w = [int]$rect.Width; h = [int]$rect.Height
                                 on = $enabled
+                                # ⭐ index：本次快照内的先序序号（Windows 侧此前恒缺 ⇒ 元素无法被引用）
+                                i = $counter.n
+                                acts = $acts
                             }
+                            $counter.n = $counter.n + 1
                             if ($val -ne $null -and $val -ne '') { $node['v'] = $val }
                             if ($sub.Count -gt 0) { $node['c'] = $sub }
                             $result += $node
@@ -216,7 +249,8 @@ public final class Win32UiaService implements ComputerUseUiaService {
                 try {
                     $root = [System.Windows.Automation.AutomationElement]::FromHandle([IntPtr]::new([long]%d))
                     if ($root -eq $null) { Write-Output '[]'; exit 0 }
-                    $tree = Get-Tree $root 0 %d
+                    $counter = @{ n = 0 }
+                    $tree = Get-Tree $root 0 %d $counter
                     if ($tree -eq $null -or $tree.Count -eq 0) {
                         Write-Output '[]'
                     } else {

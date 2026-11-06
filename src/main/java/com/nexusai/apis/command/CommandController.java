@@ -25,6 +25,7 @@ import com.nexusai.model.command.dto.CommandDto;
 import com.nexusai.model.command.dto.CreateCommandRequest;
 import com.nexusai.model.command.dto.CompactExecuteRequest;
 import com.nexusai.model.command.dto.EffortExecuteRequest;
+import com.nexusai.model.command.dto.PromptExecuteResult;
 import com.nexusai.model.command.dto.ResumeExecuteRequest;
 import com.nexusai.model.command.dto.UpdateCommandRequest;
 import com.nexusai.domain.command.CommandService;
@@ -465,6 +466,28 @@ public class CommandController {
             //   故此处只传 null args（等价「无参数 = 显示当前目标」）；**设定条件必须走字面端点**。
             return executeGoalBuiltin(sessionIdParam, null);
         }
+        // [prompt-execute 2026-11-04] prompt 型命令真实执行 · 对齐 CC processSlashCommand。
+        //   WHY（用户实测 /init 发了但后端「没执行」）：/init 是 type=prompt 命令，价值全在
+        //   InitCommand.getPrompt() 正文；旧实现走下方通用薄触发分支只回 BuiltInCommandDto 元数据
+        //   （无 content 字段）⇒ 前端拿到 200 弹「已执行 /init」，但提示词从未进入对话、模型从未被
+        //   要求生成 CLAUDE.md —— 典型「报成功但什么都没发生」。
+        //   本分支把正文放进 PromptExecuteResult 返回，由前端作为一条 user 消息发出（=CC 把
+        //   b.prompt 注入本轮的语义）。content 缺失时 fail loud，绝不静默回元数据（否则故障复发）。
+        if (PromptExecuteResult.TYPE_PROMPT.equals(hit.getType())) {
+            String promptContent = hit.getContent();
+            if (promptContent == null || promptContent.isBlank()) {
+                log.error("[CommandController] executeBuiltin({}) 是 prompt 型命令但 content 为空"
+                    + " → 拒绝静默成功（fail loud）", name);
+                throw new IllegalStateException("Prompt command '" + hit.getName()
+                    + "' has no content; refusing to report success without executing.");
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[CommandController] executeBuiltin({}) 返回提示词正文 → 前端注入对话"
+                    + "（type=prompt, contentLen={}, session={}）",
+                    name, promptContent.length(), sessionIdParam);
+            }
+            return PromptExecuteResult.from(hit);
+        }
         // ⚠⚠ 以下 /clear 历史分支自 2026-09-11（P0-0/N1 决策）起【不可达】——上方 fail-loud 门已对 clear
         //   （含别名 reset/new）抛 ConflictException，本分支永不进入。清理链按决策【保留不删】（删除属另一
         //   决策，仅登记，见审计 §零 P0-0 / §12.4 N1）——请勿在此新增依赖；恢复 /clear 须先经用户拍板并
@@ -798,11 +821,30 @@ public class CommandController {
                 + "（dispatchResult null；GoalCommandRegistrationConfig 未执行？）");
             return "/goal 无法执行：/goal 命令未注册。";
         }
+        if ("query".equals(r.kind())) {
+            // [goal V253] query 形态 ⇒ 目标已设定 + kickoff 提示词（CC 的 {type:"query"} 等价）。
+            //   前端拿到后把 kickoff 作为一条 user 消息发出去 ⇒ **目标模式立刻开始执行**
+            //   （对齐 CC：processSlashCommand 把 b.prompt 当 isMeta 的 user 消息注入本轮）。
+            //   ⚠️ 本端点不自己起轮 —— 起轮涉及 busy 判定 / inProgress 注册 / STOMP 推送整套链，
+            //   复用前端已有的发消息通道更稳（与 CC 的消息流同构）。
+            log.info("[CommandController] executeGoalBuiltin: session={} 目标已设定 → 返回 kickoff 触发执行",
+                sessionId);
+            return r.value() + "\n" + GOAL_KICKOFF_MARKER + (r.prompt() == null ? "" : r.prompt());
+        }
         if (!"text".equals(r.kind()) || r.value() == null || r.value().isBlank()) {
             return "/goal 已执行（无文本结果）。";
         }
         return r.value();
     }
+
+    /**
+     * [goal V253] kickoff 提示词分隔标记 · 供前端从纯文本响应里切出 kickoff。
+     *
+     * <p>WHY 用标记而不是 JSON：本端点 {@code produces=text/plain}（与 /compact 同款，避免与
+     * 通用端点的 JSON 返回冲突 ⇒ Accept 必须放宽成通配），前端 {@code api()} 强制 JSON 解析 ⇒
+     * 不能直接吃 JSON 体。⇒ 回纯文本 + 一个不会与用户条件冲突的标记行。
+     */
+    private static final String GOAL_KICKOFF_MARKER = "\n[[GOAL_KICKOFF]]\n";
 
     /**
      * [RES-④] /resume 后端重建分支 · 对齐 CC resumeAgentBackground（resumeAgent.ts:42-265）。

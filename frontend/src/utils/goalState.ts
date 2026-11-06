@@ -5,19 +5,28 @@
  * （`/topic/sessions/{sid}/goal`），本仓是多会话 Web —— 全局单例会让「A 会话在追目标、
  * 切到 B」时 B 显示 A 的目标。故按 sessionId 键控。
  *
- * <p>[后端契约 · 对齐 CC claude.exe v2.1.212 的 activeGoal]
+ * <p>[后端契约 · 对齐 CC claude.exe v2.1.318 的 activeGoal]
  * 形状与 `sessions.goal` 列一一对应（`SessionGoal.java`）：
  * ```
- * { condition, phase, iterations, setAt, tokensAtStart, lastReason }
+ * { condition, phase, iterations, setAt, tokensAtStart, lastReason, retryCount, retryLimit, tokensUsed }
  * ```
- * `phase` ∈ `active | achieved | impossible`（**没有** DSH 的 paused/blocked ——
- * 那是它缺评估器的补偿机制，我们照 CC 只有三种结局）。
+ * ⚠️ `tokensAtStart` 是**设定时刻的基线快照**（列里存的），`tokensUsed` 才是目标期间
+ * **真实消耗**（后端按 `llm_usage_calls.started_at >= setAt` 求和，载荷级字段、不落列）。
+ * `phase` ∈ `active | paused | achieved | impossible`。
+ * `paused` 来自 CC v2.1.318 的 `kind:"pause"`（撞 block-cap / 评估器超时 / 用户排队打断），
+ * **不是**终态：用户发下一条消息即自动恢复（后端 `GoalService.resumeFromPause`）。
  */
 export interface GoalUiState {
   /** 目标条件原文（CC 语义，上限 4000 字符） */
   condition: string
-  /** active=追之中 / achieved=已达成 / impossible=无法达成 */
-  phase: 'active' | 'achieved' | 'impossible'
+  /**
+   * active=追之中 / paused=已暂停（发消息继续）/ achieved=已达成 / impossible=无法达成
+   *
+   * <p>[B4 2026-11-04] `paused` 对齐 CC v2.1.318 的 `kind:"pause"` 语义：
+   * 评估器连续判「未达成」撞 block-cap（CC 默认 8 次）后，目标不是失败而是暂停，
+   * 用户发下一条消息即自动恢复（后端 `GoalService.resumeFromPause`）。
+   */
+  phase: 'active' | 'paused' | 'achieved' | 'impossible'
   /** 已评估轮数（**纯记账**，不参与判断；CC 的 goal 对象里没有上限字段） */
   iterations: number
   /** 设定时刻（epoch 毫秒） */
@@ -26,6 +35,24 @@ export interface GoalUiState {
   tokensAtStart: number
   /** 最近一次评估器返回的 reason（= 注入下一轮的那句话，也是「最近一次判定」的来源） */
   lastReason?: string | null
+  /**
+   * [B6] 已自动重试次数（0 = 从未重试）。
+   *
+   * <p>这是**运行时状态**（后端 `retryCount`），纯展示用途：评估器自身失败
+   * （超时/JSON 解析失败/模型报错）时后端按 60/300/900 秒三档自动重试；
+   * 用户在目标详情里能看到「已自动重试 2/3 次」，知道为什么目标还没推进。
+   * ⛔ 这不是配置项 —— 重试间隔是后端常量（对齐 CC）。
+   */
+  retryCount?: number
+  /** [B6] 自动重试上限（后端常量；前端不硬编码，随载荷走）。 */
+  retryLimit?: number
+  /**
+   * 目标期间**真实消耗**的输出 token（后端 `llm_usage_calls.started_at >= setAt` 求和）。
+   *
+   * <p>与 `tokensAtStart`（设定时刻基线快照）语义不同，⛔ 不要混用。
+   * `null`/`undefined` = 后端取不到（统计未接线 / 查询异常）⇒ **不渲染该字段**，不显示 0。
+   */
+  tokensUsed?: number | null
 }
 
 /** 无目标的读取回落（模块级稳定引用 —— 避免每次新对象触发无谓重渲）。 */
@@ -70,7 +97,10 @@ export function parseGoalPayload(raw: unknown): GoalUiState | null {
   if (!condition || !condition.trim()) return null
   const phaseRaw = typeof o.phase === 'string' ? o.phase : 'active'
   const phase: GoalUiState['phase'] =
-    phaseRaw === 'achieved' ? 'achieved' : phaseRaw === 'impossible' ? 'impossible' : 'active'
+    phaseRaw === 'achieved' ? 'achieved'
+      : phaseRaw === 'impossible' ? 'impossible'
+        : phaseRaw === 'paused' ? 'paused'
+          : 'active'
   return {
     condition,
     phase,
@@ -78,5 +108,10 @@ export function parseGoalPayload(raw: unknown): GoalUiState | null {
     setAt: typeof o.setAt === 'number' ? o.setAt : Date.now(),
     tokensAtStart: typeof o.tokensAtStart === 'number' ? o.tokensAtStart : 0,
     lastReason: typeof o.lastReason === 'string' ? o.lastReason : null,
+    retryCount: typeof o.retryCount === 'number' ? o.retryCount : 0,
+    retryLimit: typeof o.retryLimit === 'number' ? o.retryLimit : 0,
+    // ⚠️ 缺失/非数字 → null（不是 0）：后端「取不到」与「确实是 0」必须可分，
+    //   否则新设目标会显示一个假的「0 tok」。
+    tokensUsed: typeof o.tokensUsed === 'number' ? o.tokensUsed : null,
   }
 }

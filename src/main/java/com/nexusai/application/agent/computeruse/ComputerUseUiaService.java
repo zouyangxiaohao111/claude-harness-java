@@ -77,6 +77,28 @@ public interface ComputerUseUiaService {
     ComputerUseAccessibilitySnapshot captureSnapshot(long hwnd, int maxDepth);
 
     /**
+     * 抓取<b>指定观察对象</b>的 UI Automation 树（对齐 dsh {@code computer_observe} 的
+     * {@code app} 入参）。
+     *
+     * <p><b>WHY 需要它</b>：dsh 允许模型直接指定要观察的应用（bundleId / pid / name），
+     * 观察<b>不抢前台</b> —— 这是 dsh「不干扰用户」的核心。本仓若只能观察前台应用，
+     * 想看后台应用就必须先激活它，与该目标相反。
+     *
+     * <p>默认实现：<b>忽略选择器</b>、退化为 {@link #captureSnapshot(long, int)}
+     * —— Windows 的 UIA 树从<b>窗口句柄</b>起步（已绑窗口），本就没有「按应用定位」的语义。
+     *
+     * @param hwnd     窗口句柄（macOS 忽略）
+     * @param maxDepth 最大遍历深度
+     * @param selector 观察对象；空 ⇒ 前台应用
+     * @return 快照（观察对象解析失败 ⇒ <b>抛异常</b>，不静默回落到前台应用）
+     */
+    default ComputerUseAccessibilitySnapshot captureSnapshot(long hwnd,
+                                                             int maxDepth,
+                                                             ComputerUseAppSelector selector) {
+        return captureSnapshot(hwnd, maxDepth);
+    }
+
+    /**
      * 用 {@code InvokePattern} 点击元素。
      *
      * <p>逐字对齐 CCB {@code win32/uiAutomation.ts:245-276}。
@@ -103,6 +125,26 @@ public interface ComputerUseUiaService {
      */
     default boolean invokeElement(long hwnd, String automationId, String expectedStateHash) {
         return invokeElement(hwnd, automationId);
+    }
+
+    /**
+     * 带<b>陈旧校验</b>与<b>目标进程</b>的点击。
+     *
+     * <p><b>WHY 要带 pid</b>（2026-11-02 真机实测抓到）：macOS 的 observe 允许按
+     * bundleId/pid 观察<b>后台应用</b>（不抢前台）；动作若仍在<b>前台应用</b>的树里
+     * 按 locator 反查，就是<b>在另一棵树上找同一个路径</b> ⇒ 元素不存在 / 按错按钮。
+     *
+     * <p>默认实现：忽略 pid，退化为 {@link #invokeElement(long, String, String)}
+     * —— Windows 的 UIA 用 {@code AutomationId} 精确定位、与窗口绑定，不受影响。
+     *
+     * @param hwnd              窗口句柄（macOS 忽略）
+     * @param automationId      定位键（macOS = locator 路径）
+     * @param expectedStateHash 期望状态指纹（null / 空 ⇒ 不校验）
+     * @param targetPid         目标应用 pid（0 = 不指定）
+     * @return true = 已触发
+     */
+    default boolean invokeElement(long hwnd, String automationId, String expectedStateHash, long targetPid) {
+        return invokeElement(hwnd, automationId, expectedStateHash);
     }
 
     /**
@@ -142,6 +184,41 @@ public interface ComputerUseUiaService {
     }
 
     /**
+     * 执行元素声明的<b>任意</b> Accessibility 动作 · <b>作用于指定 pid 的应用</b>。
+     *
+     * <p>默认实现：忽略 pid（Windows 侧无此概念）。
+     *
+     * @param hwnd    窗口句柄（macOS 忽略）
+     * @param locator 定位键
+     * @param action  动作名
+     * @param targetPid 目标应用 pid（0 = 不指定）
+     * @return true = 动作已执行
+     */
+    default boolean performAction(long hwnd, String locator, String action, long targetPid) {
+        return performAction(hwnd, locator, action);
+    }
+
+    /**
+     * 执行元素声明的 Accessibility 动作 · 带<b>陈旧校验</b> + 指定 pid。
+     *
+     * <p><b>WHY 要 hash</b>：locator 是「某棵树里的路径」，界面一变同一路径就指向<b>别的元素</b>。
+     * dsh 在 {@code actNow} 里用 {@code expectedStateHash} 挡住这种情况（
+     * {@code COMPUTER_STALE_OBSERVATION}）。默认实现忽略哈希（Windows 的 AutomationId 稳定，
+     * 不存在树序派生的问题），退化为 {@link #performAction(long, String, String, long)}。
+     *
+     * @param hwnd              窗口句柄（macOS 忽略）
+     * @param locator           定位键
+     * @param action            动作名
+     * @param expectedStateHash observe 返回的状态指纹（空 = 不校验）
+     * @param targetPid         目标应用 pid（0 = 不指定）
+     * @return true = 动作已执行
+     */
+    default boolean performAction(long hwnd, String locator, String action,
+                                  String expectedStateHash, long targetPid) {
+        return performAction(hwnd, locator, action, targetPid);
+    }
+
+    /**
      * 用 {@code ValuePattern} 设置元素的值。
      *
      * <p>逐字对齐 CCB {@code win32/uiAutomation.ts:281-314}。
@@ -152,4 +229,37 @@ public interface ComputerUseUiaService {
      * @return true = 已写入；false = 元素不存在或不支持 ValuePattern
      */
     boolean setElementValue(long hwnd, String automationId, String value);
+
+    /**
+     * 设置元素的值 · <b>作用于指定 pid 的应用</b>。
+     *
+     * <p>默认实现：忽略 pid（Windows 侧无此概念）。
+     *
+     * @param hwnd        窗口句柄（macOS 忽略）
+     * @param automationId 元素的 automationId
+     * @param value       要写入的值
+     * @param targetPid   目标应用 pid（0 = 不指定）
+     * @return true = 已写入
+     */
+    default boolean setElementValue(long hwnd, String automationId, String value, long targetPid) {
+        return setElementValue(hwnd, automationId, value);
+    }
+
+    /**
+     * 设置元素的值 · 带<b>陈旧校验</b> + 指定 pid。
+     *
+     * <p><b>WHY 写值比点击更需要校验</b>：locator 漂移到别的输入框时，
+     * 不校验就会把文本写进<b>另一个字段</b> —— 用户看不出，但数据已错。
+     *
+     * @param hwnd              窗口句柄（macOS 忽略）
+     * @param automationId      元素的 automationId / locator
+     * @param value             要写入的值
+     * @param expectedStateHash observe 返回的状态指纹（空 = 不校验）
+     * @param targetPid         目标应用 pid（0 = 不指定）
+     * @return true = 已写入
+     */
+    default boolean setElementValue(long hwnd, String automationId, String value,
+                                    String expectedStateHash, long targetPid) {
+        return setElementValue(hwnd, automationId, value, targetPid);
+    }
 }

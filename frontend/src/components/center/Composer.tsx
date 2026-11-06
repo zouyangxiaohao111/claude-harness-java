@@ -12,10 +12,12 @@ import { getCurrentWebview } from '@tauri-apps/api/webview'
 import { readFile, stat } from '@tauri-apps/plugin-fs'
 import { COMMAND_ITEMS, isDisabledCommand } from './CommandPalette'
 import { GoalHead } from './GoalHead'
+import { GoalSetPanel } from './GoalSetPanel'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
+import { u8ToBase64 } from '@/utils/base64'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
@@ -94,16 +96,6 @@ export function restorePendingAttachments(list?: AttachmentRequest[] | null): Pe
   })
 }
 
-/** Uint8Array → base64（Tauri fs 读文件二进制 → dataURL 直传） */
-function u8ToBase64(bytes: Uint8Array): string {
-  let binary = ''
-  const chunk = 0x8000
-  for (let i = 0; i < bytes.length; i += chunk) {
-    binary += String.fromCharCode(...bytes.subarray(i, i + chunk))
-  }
-  return btoa(binary)
-}
-
 interface ComposerProps {
   composerText: string
   setComposerText: (v: string) => void
@@ -168,6 +160,12 @@ interface ComposerProps {
   slashAlias?: { name: string; display: string } | null
   /** 左下角 + 菜单「专家/技能/连接器」→ 打开技能市场弹窗并切到对应 tab（App 持有 showMarket state） */
   onOpenMarket?: (tab?: 'expert' | 'skill' | 'connector') => void
+  /** 设定目标（+ 菜单「目标」→ 面板提交）：App 走 runBuiltin('goal', condition) */
+  onSetGoal?: (condition: string) => Promise<void>
+  /** 当前会话是否已有目标（+ 菜单里「目标」右侧徽章：设定 / 追踪中） */
+  hasGoal?: boolean
+  /** 当前目标条件（已有目标时点「目标」→ 面板预填，避免看起来像目标没了） */
+  goalCondition?: string | null
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -289,7 +287,7 @@ function renderHighlighted(
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -560,6 +558,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   const [plusOpen, setPlusOpen] = useState(false)
   // 「模式」子菜单展开态（simple/full 两个可选项 · 关菜单时一并复位）
   const [plusModeOpen, setPlusModeOpen] = useState(false)
+  // 设定目标面板（+ 菜单「目标」→ 输入框顶部就地变面板；提交/取消后关闭）
+  const [goalSetOpen, setGoalSetOpen] = useState(false)
+  // 切会话 ⇒ 收起面板：Composer 是单实例，不重置的话 A 会话打开的面板会跟到 B（多会话隔离铁律）
+  useEffect(() => {
+    setGoalSetOpen(false)
+  }, [sessionId])
   const plusRef = useRef<HTMLDivElement>(null)
   /** 关闭 + 菜单：子菜单展开态一并复位，避免下次打开仍留展开态。 */
   const closePlusMenu = () => { setPlusOpen(false); setPlusModeOpen(false) }
@@ -1030,7 +1034,20 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           </div>
         </div>
         {/* [goal V253] 目标头 · 贴在输入框顶部内缘（不是 App 层横幅 —— 目标是常驻身份，不是告警） */}
-        <GoalHead sessionId={sessionId ?? null} />
+        {/* 设定态与展示态占同一个位置：点「+ → 目标」就地变面板，提交后再变回目标头 */}
+        {goalSetOpen && onSetGoal ? (
+          <GoalSetPanel
+            // 已有目标时预填当前条件：点「目标」是来改写/查看的，打开空面板会让人以为目标没了
+            initialCondition={goalCondition ?? ''}
+            onCancel={() => setGoalSetOpen(false)}
+            onSubmit={async (condition) => {
+              await onSetGoal(condition)
+              setGoalSetOpen(false)
+            }}
+          />
+        ) : (
+          <GoalHead sessionId={sessionId ?? null} />
+        )}
         <div className="input-box">
           <div style={{ position: 'relative' }}>
             <div
@@ -1248,6 +1265,24 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                       <span>添加文件</span><span className="plus-chev">›</span>
                     </button>
                     <div className="plus-sep" />
+                    {/* 目标：会话行为设定（与「模式」同级），不是内容附件 ⇒ 单独成组、排在添加文件之后。
+                        右侧徽章随状态：无目标=「设定」，有目标=「追踪中」。点开 → 输入框顶部就地变面板。 */}
+                    {onSetGoal && (
+                      <button
+                        type="button"
+                        className="plus-item"
+                        role="menuitem"
+                        onClick={() => { closePlusMenu(); setGoalSetOpen(true) }}
+                      >
+                        <svg className="plus-ic" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                          <circle cx="7" cy="7" r="4.6" />
+                          <circle cx="7" cy="7" r="1.3" />
+                          <path d="M7 .8v1.8M7 11.4v1.8M.8 7h1.8M11.4 7h1.8" strokeLinecap="round" />
+                        </svg>
+                        <span>目标</span>
+                        <span className={`plus-badge${hasGoal ? ' on' : ''}`}>{hasGoal ? '追踪中' : '设定'}</span>
+                      </button>
+                    )}
                     {/* 模式：右侧 flyout（不再是盲切一项；modeLocked 时只提示不切换） */}
                     <div className="plus-sub-anchor">
                       <button

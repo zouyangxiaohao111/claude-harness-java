@@ -763,4 +763,30 @@ class CommandControllerBuiltInCommandsTest {
         assertThat(result).as("通用分支对 compact 必须真实执行（displayText），而非返回 BuiltInCommandDto 元数据")
             .isEqualTo("Compacted generic");
     }
+
+    // ════════════════════════════════════════════════════════════════
+    // [prompt-execute · 2026-11-04] prompt 型命令（/init）真实执行
+    // ════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("prompt-execute: /init/execute 返回提示词正文（PromptExecuteResult），不是空壳元数据")
+    void promptExecute_initReturnsPromptContent() throws Exception {
+        // WHY（规则九）: /init 是 type=prompt 命令，它的价值**全在提示词正文**（InitCommand.getPrompt()）。
+        //   旧实现下通用分支只回 BuiltInCommandDto 元数据（无 content 字段）⇒ 前端拿到 200 就弹
+        //   「已执行 /init」，但提示词从未进入对话、模型从未被要求生成 CLAUDE.md —— 用户实测
+        //   「发了 /init 但后端没执行」正是这个静默假成功。本断言以响应形状锁住真执行：
+        //   必须是 {type:'prompt', content:<正文>}；若退化为元数据（只有 name/type/description）→ fail。
+        String body = mockMvc.perform(post("/api/command/builtins/init/execute")
+                .param("sessionId", "sess-init-prompt"))
+            .andExpect(status().isOk()).andReturn().getResponse()
+            .getContentAsString(java.nio.charset.StandardCharsets.UTF_8);
+
+        assertThat(body).as("prompt 型命令必须回传提示词正文").contains("\"type\":\"prompt\"");
+        assertThat(body).as("正文来自 InitCommand（CCB NEW 分支），锁住关键片段防被换空")
+            .contains("CLAUDE.md")
+            .contains("skills/<skill-name>/SKILL.md");
+        assertThat(body).as("元数据薄触发的标志字段不得出现在 prompt 执行响应里")
+            .doesNotContain("\"description\"")
+            .doesNotContain("\"aliases\"");
+    }
 }

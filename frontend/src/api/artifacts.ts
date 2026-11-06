@@ -14,6 +14,14 @@ export interface SessionArtifactDto {
   url: string | null
   sizeBytes: number | null
   summary: string | null
+  /**
+   * 归属的用户消息 id（= 产出它的那一轮的轮键）。
+   *
+   * <p>{@code null} = 归属未知（V276 之前写入的历史行，或写入方拿不到轮次）。
+   * 前端**只把有归属的产物**挂到对应的那一轮；{@code null} 的不挂到任何一轮
+   * （挂到「最后一条」会让历史产物看起来像本轮产出）。它们仍出现在右侧栏总量里。
+   */
+  sourceMessageId: string | null
   updatedAt: string | null
   /**
    * `localPath` 指向的是**目录**而不是文件（后端**读时判定**，不落库）。

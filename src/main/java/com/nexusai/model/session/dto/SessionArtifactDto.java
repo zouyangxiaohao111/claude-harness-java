@@ -6,7 +6,11 @@ import com.nexusai.repository.session.entity.SessionArtifactRecord;
  * 会话「产物 / 来源」只读出站 DTO · GET {@code /api/v1/sessions/{sessionId}/artifacts}。
  *
  * <p>字段与 {@code session_artifact} 表（V205）一一对应，只减不加：{@code sessionId} /
- * {@code createdAt} / {@code sourceMessageId} 不出站（前端已按会话取，溯源字段当前恒空）。
+ * {@code createdAt} 不出站。
+ *
+ * <p><b>{@code sourceMessageId} 出站</b>（2026-11-05 起）：产物按「轮次」归属，
+ * 前端用它在每轮气泡下展示本轮产物；会话级总数仍由后端 {@code total} 口径给出。
+ * 历史行该字段为 {@code null} = 归属未知（⛔ 不伪造）。
  *
  * <p>{@code updatedAt} 是应用写入的 ISO-8601 偏移文本（DB 原始串直出，不二次解析 ——
  * 解析失败会让一条脏行把整个列表打成 500）。前端按字符串排序/格式化即可。
@@ -28,6 +32,13 @@ public record SessionArtifactDto(
         /** 产物文件字节数（目录 / 不可读 → null）。 */
         Long sizeBytes,
         String summary,
+        /**
+         * 归属的用户消息 id（本轮提问）。
+         *
+         * <p>{@code null} = 归属未知（V276 之前的历史行，或写入方拿不到轮次）
+         * —— 前端应把它们归入「历史 / 未知归属」分组，⛔ 不要猜。
+         */
+        String sourceMessageId,
         String updatedAt,
         /** {@code localPath} 指向的是<b>目录</b>（true）还是文件（false）。 */
         boolean directory
@@ -45,6 +56,7 @@ public record SessionArtifactDto(
         }
         return new SessionArtifactDto(
                 r.getId(), r.getKind(), r.getTitle(), r.getLocalPath(), r.getUrl(),
-                r.getSizeBytes(), r.getSummary(), r.getUpdatedAt(), directory);
+                r.getSizeBytes(), r.getSummary(), r.getSourceMessageId(),
+                r.getUpdatedAt(), directory);
     }
 }

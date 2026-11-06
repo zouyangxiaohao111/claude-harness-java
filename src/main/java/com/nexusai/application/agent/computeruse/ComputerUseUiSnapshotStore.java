@@ -88,7 +88,9 @@ public final class ComputerUseUiSnapshotStore {
                                   int width,
                                   int height,
                                   String subrole,
-                                  String nativeIdentifier) {
+                                  String nativeIdentifier,
+                                  Boolean focused,
+                                  Boolean selected) {
 
         public ObservedElement {
             targetHandle = targetHandle == null ? "" : targetHandle;
@@ -132,6 +134,42 @@ public final class ComputerUseUiSnapshotStore {
                     x, y, width, height, "", "");
         }
 
+        /**
+         * 兼容构造（有 subrole / nativeIdentifier，无 focused / selected）。
+         *
+         * @param index            序号
+         * @param targetHandle     句柄
+         * @param locator          定位路径
+         * @param role             角色
+         * @param name             名字
+         * @param value            值
+         * @param enabled          是否可用
+         * @param actions          动作集
+         * @param x                屏幕 X
+         * @param y                屏幕 Y
+         * @param width            宽
+         * @param height           高
+         * @param subrole          子角色
+         * @param nativeIdentifier 原生标识
+         */
+        public ObservedElement(int index,
+                               String targetHandle,
+                               String locator,
+                               String role,
+                               String name,
+                               String value,
+                               Boolean enabled,
+                               List<String> actions,
+                               int x,
+                               int y,
+                               int width,
+                               int height,
+                               String subrole,
+                               String nativeIdentifier) {
+            this(index, targetHandle, locator, role, name, value, enabled, actions,
+                    x, y, width, height, subrole, nativeIdentifier, null, null);
+        }
+
         /** @return 是否有真实屏幕矩形 */
         public boolean hasBounds() {
             return width > 0 && height > 0;
@@ -169,7 +207,26 @@ public final class ComputerUseUiSnapshotStore {
                               String treeText,
                               boolean truncated,
                               List<ObservedElement> elements,
-                              int generation) {
+                              int generation,
+                              long windowId,
+                              int windowX,
+                              int windowY) {
+
+        /**
+         * 兼容构造（无窗口几何）· 既有调用点不变（窗口号/原点按 0 处理 ⇒ 不定向）。
+         */
+        public Observation(String observationId, String sessionId, String appName, String bundleId,
+                           long pid, String windowTitle, long createdAt, long expiresAt,
+                           String stateHash, String treeMode, String treeText, boolean truncated,
+                           List<ObservedElement> elements, int generation) {
+            this(observationId, sessionId, appName, bundleId, pid, windowTitle, createdAt, expiresAt,
+                    stateHash, treeMode, treeText, truncated, elements, generation, 0L, 0, 0);
+        }
+
+        /** @return 是否有可定向投递的窗口信息（窗口号 + 原点齐全） */
+        public boolean hasWindowTarget() {
+            return windowId > 0L;
+        }
 
         public Observation {
             appName = appName == null ? "" : appName;
@@ -291,6 +348,31 @@ public final class ComputerUseUiSnapshotStore {
                               boolean truncated,
                               List<ObservedElement> elements,
                               boolean full) {
+        return record(sessionId, appName, bundleId, pid, windowTitle, stateHash, treeText,
+                truncated, elements, full, 0L, 0, 0);
+    }
+
+    /**
+     * 登记一次观察 · 带窗口几何（供定向投递用：滚轮/拖拽要知道「投给哪个窗口的哪个点」）。
+     *
+     * @param windowId 窗口号（{@code CGWindowList} 的 kCGWindowNumber；0 = 未知）
+     * @param windowX  窗口原点屏幕 X（点）
+     * @param windowY  窗口原点屏幕 Y（点）
+     * @return 新观察
+     */
+    public Observation record(String sessionId,
+                              String appName,
+                              String bundleId,
+                              long pid,
+                              String windowTitle,
+                              String stateHash,
+                              String treeText,
+                              boolean truncated,
+                              List<ObservedElement> elements,
+                              boolean full,
+                              long windowId,
+                              int windowX,
+                              int windowY) {
         Bucket bucket = bucket(sessionId);
         prune(bucket);
         long now = System.currentTimeMillis();
@@ -319,7 +401,10 @@ public final class ComputerUseUiSnapshotStore {
                 text,
                 truncated,
                 elements,
-                bucket.generation);
+                bucket.generation,
+                windowId,
+                windowX,
+                windowY);
 
         bucket.observations.put(observationId, observation);
         bucket.latestByApp.put(appKey, observationId);
@@ -419,22 +504,33 @@ public final class ComputerUseUiSnapshotStore {
      *
      * <p>dsh 的 {@code diffElements(previous.elements, elements, maxTextBytes)} 语义：
      * 树没变时给模型的东西应尽量小（模型刚从上次观察拿到过完整树）。
-     * 本实现按 <b>locator</b> 对齐（locator 是结构位置，最稳定），比按 index 更可靠。
+     *
+     * <p><b>WHY 按「语义身份」而不是「位置」对齐</b>（对齐 dsh {@code src/diff.ts:7-13}）：
+     * dsh 的 identity = {@code role|subrole|title|label|frame}，
+     * 即<b>同一个控件</b>哪怕在树里换了位置，仍被认作「同一个，只是变了点东西」；
+     * 而按 locator（位置）对齐时，界面轻微重排就会把每个元素都报成「变了」，
+     * 模型被告知「到处都变了」却拿不到任何有用信息。
+     * <br>⇒ 本实现的 identity = {@code role|subrole|name}（macOS 拿不到坐标 ⇒ 无 frame 项；
+     * dsh 在 frame 缺失时同样退化为「两者都缺 ⇒ 视为相同」）。
+     * <br>⭐ <b>与三级解析同源</b>：{@link ComputerUseTargetResolver} 的稳定字段也是
+     * role + subrole + name + actions ⇒ diff 与 rebind 用同一套身份语义，不会出现
+     * 「diff 说没变、rebind 却说变了」这种自相矛盾。
      *
      * @param before 前一次的元素
      * @param after  本次的元素
      * @return 差异文本（无变化 ⇒ 一行说明）
      */
     static String diffElements(List<ObservedElement> before, List<ObservedElement> after) {
-        Map<String, ObservedElement> oldByLocator = new LinkedHashMap<>();
+        Map<String, ObservedElement> oldByIdentity = new LinkedHashMap<>();
         for (ObservedElement element : before) {
-            oldByLocator.put(element.locator(), element);
+            oldByIdentity.put(identityOf(element), element);
         }
         Set<String> seen = new LinkedHashSet<>();
         List<String> lines = new ArrayList<>();
         for (ObservedElement element : after) {
-            seen.add(element.locator());
-            ObservedElement old = oldByLocator.get(element.locator());
+            String identity = identityOf(element);
+            seen.add(identity);
+            ObservedElement old = oldByIdentity.get(identity);
             if (old == null) {
                 lines.add("+ [#" + element.index() + "] " + describeElement(element));
             } else if (!sameElement(old, element)) {
@@ -442,21 +538,32 @@ public final class ComputerUseUiSnapshotStore {
             }
         }
         for (ObservedElement old : before) {
-            if (!seen.contains(old.locator())) {
+            if (!seen.contains(identityOf(old))) {
                 lines.add("- [#" + old.index() + "] " + describeElement(old));
             }
         }
         return lines.isEmpty() ? "(no accessibility changes since the previous observation)" : String.join("\n", lines);
     }
 
+    /**
+     * 元素的<b>语义身份</b>（对齐 dsh {@code src/diff.ts:7-13} 的 {@code identity}）。
+     *
+     * <p>dsh = {@code role|subrole|title|label|frame}；本仓 macOS 拿不到坐标 ⇒ 省略 frame；
+     * dsh 的 {@code title}/{@code label} 在本仓合并为 {@code name}（可访问名）。
+     *
+     * @param element 元素
+     * @return 身份键
+     */
+    static String identityOf(ObservedElement element) {
+        return element.role() + "\u0001" + element.subrole() + "\u0001" + element.name();
+    }
+
     private static boolean sameElement(ObservedElement a, ObservedElement b) {
-        return a.role().equals(b.role())
-                && a.name().equals(b.name())
-                && java.util.Objects.equals(a.value(), b.value())
+        return java.util.Objects.equals(a.value(), b.value())
                 && java.util.Objects.equals(a.enabled(), b.enabled())
-                && a.actions().equals(b.actions())
-                && a.x() == b.x() && a.y() == b.y()
-                && a.width() == b.width() && a.height() == b.height();
+                && java.util.Objects.equals(a.focused(), b.focused())
+                && java.util.Objects.equals(a.selected(), b.selected())
+                && a.actions().equals(b.actions());
     }
 
     /** 单元素单行描述（`[#N] [Role] "name" value="..." (actions)`）。 */
@@ -522,15 +629,34 @@ public final class ComputerUseUiSnapshotStore {
             if (!element.name().isEmpty()) {
                 node.put("name", element.name());
             }
+            if (!element.subrole().isEmpty()) {
+                node.put("subrole", element.subrole());
+            }
+            if (!element.nativeIdentifier().isEmpty()) {
+                node.put("nativeIdentifier", element.nativeIdentifier());
+            }
             if (element.value() != null) {
                 node.put("value", element.value());
             }
             if (element.enabled() != null) {
                 node.put("enabled", element.enabled());
             }
+            if (element.focused() != null) {
+                node.put("focused", element.focused());
+            }
+            if (element.selected() != null) {
+                node.put("selected", element.selected());
+            }
             ArrayNode actions = node.putArray("actions");
             element.actions().forEach(actions::add);
             if (element.hasBounds()) {
+                // dsh elementSchema.frame = {x,y,width,height}（rectSchema）
+                ObjectNode frame = node.putObject("frame");
+                frame.put("x", element.x());
+                frame.put("y", element.y());
+                frame.put("width", element.width());
+                frame.put("height", element.height());
+                // 兼容既有消费者（本仓早先的扁平四字段）
                 node.put("x", element.x());
                 node.put("y", element.y());
                 node.put("w", element.width());

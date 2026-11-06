@@ -83,7 +83,7 @@ class SessionArtifactSourceToolResultTest {
                 ],"durationSeconds":1.2}
                 """;
 
-        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebSearch", result)));
+        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebSearch", result)), null);
 
         assertThat(n).as("两条来源都应入库").isEqualTo(2);
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -104,7 +104,7 @@ class SessionArtifactSourceToolResultTest {
                  "url":"https://example.com/doc"}
                 """;
 
-        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebFetch", result)));
+        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebFetch", result)), null);
 
         assertThat(n).isEqualTo(1);
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -116,7 +116,7 @@ class SessionArtifactSourceToolResultTest {
     @DisplayName("非网络工具的结果 ⇒ 不产生来源")
     void ignoresNonSourceTools() {
         String result = "{\"url\":\"https://evil.example.com\"}";
-        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("Bash", result)));
+        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("Bash", result)), null);
         assertThat(n).isZero();
         verify(mapper, never()).insert(any(SessionArtifactRecord.class));
     }
@@ -132,7 +132,7 @@ class SessionArtifactSourceToolResultTest {
                 ]}]}
                 """;
 
-        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebSearch", result)));
+        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebSearch", result)), null);
 
         assertThat(n).as("只有 http(s) 那条入库").isEqualTo(1);
         ArgumentCaptor<SessionArtifactRecord> cap = ArgumentCaptor.forClass(SessionArtifactRecord.class);
@@ -143,14 +143,14 @@ class SessionArtifactSourceToolResultTest {
     @Test
     @DisplayName("工具结果不是 JSON（报错文本）⇒ 跳过且不抛")
     void nonJsonResultIsSkipped() {
-        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebFetch", "fetch failed: timeout")));
+        int n = service.syncSourcesFromToolResults(SESSION, List.of(msgWithTool("WebFetch", "fetch failed: timeout")), null);
         assertThat(n).isZero();
     }
 
     @Test
     @DisplayName("无会话 / 空消息 ⇒ 返回 0")
     void blankInputsAreNoop() {
-        assertThat(service.syncSourcesFromToolResults(null, List.of(msgWithTool("WebSearch", "{}")))).isZero();
-        assertThat(service.syncSourcesFromToolResults(SESSION, List.of())).isZero();
+        assertThat(service.syncSourcesFromToolResults(null, List.of(msgWithTool("WebSearch", "{}")), null)).isZero();
+        assertThat(service.syncSourcesFromToolResults(SESSION, List.of(), null)).isZero();
     }
 }
