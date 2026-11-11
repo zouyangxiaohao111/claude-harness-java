@@ -19,7 +19,7 @@
  *     （out 对应 tauri.conf.json bundle.resources 的 "backend" 条目）
  */
 import { execSync } from 'node:child_process'
-import { cpSync, existsSync, readdirSync, rmSync, statSync } from 'node:fs'
+import { copyFileSync, cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -71,17 +71,20 @@ function printSummary(jreDir, jarPath) {
 }
 
 /**
- * anydoc 原生库存在性检查（**只警告，不 fail**）。
+ * anydoc 原生库就位（**只警告，不 fail**）。
  *
- * <p>WHY 不是必需产物：`anydoc_go.dll` 由 Rust 从 WeKnora 的 `third_party/anydoc-go` 编译而来
+ * <p>WHY 不 fail：`anydoc_go.dll` 由 Rust 从 WeKnora 的 `third_party/anydoc-go` 编译而来
  * （步骤见同目录 `build-anydoc.md`），**不属于本仓可复现的构建产物** —— GitHub 上的 CI/打包机
  * 未必有 Rust 工具链。把它做成硬门禁会让「没编 Rust 的机器完全无法出包」，而缺了它只是
  * 让 Office 文档回落内置 Office 解析（`KbAnydocParser.supports()` 会返回 false），
  * 应用本身照常可用。
  *
- * <p>本步**不拷贝、不删除**该 DLL：`out` 目录（`front/src-tauri/backend/`）是它的家，
- * 开发者手工放入（或由 `build-anydoc-lib.sh` 的产物拷入），本脚本只负责点名它的状态。
- * `.gitignore` 里 `front/src-tauri/backend/*` 全忽略，故它不入库是**预期**的（同 jar / jre）。
+ * <p><b>⚠️ 2026-11-11 修（0.1.68 漏打的实证）</b>：原实现只认 `out`（`front/src-tauri/backend/`）
+ * 一个位置，而该目录被 `.gitignore` 全忽略 ⇒ **干净 worktree / CI 上必然找不到**；同时本仓又把
+ * `anydoc_go.dll` 提交在了仓库根的 `backend/`（那里 `prepare-backend` 从不看）⇒ 0.1.68 的打包日志
+ * 实打实是「⚠️ 未找到 anydoc 原生库」，装出来的包缺这个库、Office 文档回落 Tika。
+ * ⇒ 现在按「out 优先、仓库 `backend/` 兜底」查找，**找到就拷进 out**（out 才是随包分发的目录，
+ * `tauri.conf.json` 的 bundle.resources 指的是它）。
  */
 export function checkAnydocNative() {
   const dll = resolve(out, 'anydoc_go.dll')
@@ -90,13 +93,21 @@ export function checkAnydocNative() {
     console.log(`[prepare-backend] anydoc 原生库：已就位 ${dll}（${sizeMB} MB，随包分发）`)
     return true
   }
+  // 兜底：仓库根 backend/ 里可能已入库一份（.gitignore 只忽略 out，不忽略它）
+  const repoCopy = resolve(__dirname, '../../backend/anydoc_go.dll')
+  if (existsSync(repoCopy)) {
+    mkdirSync(out, { recursive: true })
+    copyFileSync(repoCopy, dll)
+    const sizeMB = (statSync(dll).size / 1024 / 1024).toFixed(1)
+    console.log(`[prepare-backend] anydoc 原生库：从仓库 backend/ 拷入 ${dll}（${sizeMB} MB，随包分发）`)
+    return true
+  }
   console.warn('')
   console.warn('[prepare-backend] ⚠️ 未找到 anydoc 原生库：' + dll)
   console.warn('  影响：Office/ODF/RTF/EPUB 文档将回落「内置 Office 解析」(Apache Tika)，')
   console.warn('        不会拿到 anydoc 的结构化 Markdown。应用本身可正常打包/运行。')
   console.warn('  处置：按 front/scripts/build-anydoc.md 自行编译，把产物 anydoc_go.dll')
-  console.warn('        拷到 front/src-tauri/backend/ 后重新运行本脚本。')
-  console.warn('  （该文件与本目录的 jar/jre 一样是构建产物，已被 .gitignore 忽略，不入库）')
+  console.warn('        放到 <仓库根>/backend/ 或 front/src-tauri/backend/ 后重新运行本脚本。')
   console.warn('')
   return false
 }
