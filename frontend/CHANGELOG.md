@@ -2,6 +2,22 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.70] - 2026-11-11
+
+### Added
+
+- **会话级「主线程人格」冻结**（对齐 CC 2.1.322 的 `this.mainThreadAgent` 语义）：
+  新增 `SessionMainThreadAgentRegistry` —— 会话首次解析出的 agent 定义冻结在该会话上，
+  磁盘 md 改动不热更（工具白名单用同一份定义 ⇒ 同样不热更）；换 agent / 进程重启才刷新，
+  `/clear` 不清（与 CC 的 `clearAgentDefinitionsCache` 同构）。
+- **agent 配置热更新**：watcher 监听 agents 目录（SkillChangeDetector）。
+
+### Fixed
+
+- **安装包里缺 `anydoc_go.dll`（0.1.68 的实证缺陷，本版沿用 0.1.69 的修复）**：
+  `prepare-backend.mjs` 改为「out 优先 → 仓库 `backend/` 兜底」并拷入随包目录；
+  干净 worktree 实跑输出「从仓库 backend/ 拷入（7.7 MB，随包分发）」，sha256 与仓库副本一致。
+
 ## [0.1.69] - 2026-11-11
 
 ### Fixed
