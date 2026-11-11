@@ -46,3 +46,12 @@ frontend/src-tauri/extension-pack/*
 !frontend/src-tauri/extension-pack/.gitkeep
 # 本地打包产物目录（不入库，供 pack.bat/sh 输出与人工取用）
 release/
+
+# 一次性探针 / 路由转储（临时验证产物，不入库；路径按 harness 布局重映射）
+target_routes.tsv
+frontend/.rev03/
+frontend/cmp.mjs
+frontend/md-compare.html
+
+# GitNexus analyze 自动生成的技能副本（可再生，非源码 ⇒ 不入库）
+/.claude/skills/
