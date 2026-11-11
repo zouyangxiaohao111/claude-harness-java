@@ -123,6 +123,19 @@ public class SkillChangeDetector implements ApplicationRunner {
     private volatile Telemetry telemetry;
 
     /**
+     * [CC-ALIGN-AGENTS] SubagentTool 引用 · reload 时连带清 per-cwd registry 缓存（组装层）。
+     *
+     * <p>对齐 CC {@code ke()} 内 {@code Fce()}（exe 2.1.322 offset≈309827980）：
+     * {@code Pr().agentDefinitions.clear(), Pr().markdownFiles.clear(), pBt()}（{@code Ae().agents=void 0}）。
+     * Java 两层 = {@code loadAgentsDir.clearCache()}（文件发现层）+ {@code SubagentTool.clearRegistryCache()}
+     * （per-cwd agent-defs 组装层）—— 只清前者磁盘 agent 变更仍不可见（PluginCacheUtils 同款成对清）。
+     *
+     * <p>{@code @Lazy} 断 ToolRegistry / SubagentTool 的 Spring 装配环（PluginCacheUtils:65-67 同款先例，
+     * 必须保留）；{@code required=false}：直构/测试未注入 → null → 跳过。
+     */
+    private volatile com.nexusai.application.agent.tool.impl.SubagentTool subagentTool;
+
+    /**
      * bare 模式判定（可注入）· CC original: {@code isBareMode()}（envUtils.ts:60-65）+ 启动门控
      * {@code if (!isBareMode()) { void skillChangeDetector.initialize(); }}（main.tsx:423-425）——
      * bare 模式跳过 watcher 初始化（脚本化调用无"用户输入窗口"，watcher 是纯开销）。
@@ -210,6 +223,19 @@ public class SkillChangeDetector implements ApplicationRunner {
     @Autowired(required = false)
     public void setTelemetry(Telemetry telemetry) {
         this.telemetry = telemetry;
+    }
+
+    /**
+     * [CC-ALIGN-AGENTS] 注入 SubagentTool（可选）· 对齐 CC {@code ke()} 内 {@code Fce()} 的
+     * {@code pBt()}（exe 2.1.322 offset≈309827980，{@code Ae().agents=void 0}）。
+     *
+     * <p>{@code @Lazy} 参数注入断 ToolRegistry / SubagentTool 装配环（PluginCacheUtils:65-67 先例）；
+     * 未注入（直构/测试）→ 对应清理项 no-op。
+     */
+    @Autowired(required = false)
+    public void setSubagentTool(
+            @org.springframework.context.annotation.Lazy com.nexusai.application.agent.tool.impl.SubagentTool subagentTool) {
+        this.subagentTool = subagentTool;
     }
 
     /**
@@ -359,7 +385,8 @@ public class SkillChangeDetector implements ApplicationRunner {
     };
 
     /**
-     * 计算可监听路径（5 类）· 对齐 CC {@code getWatchablePaths()}（skillChangeDetector.ts:171-235）.
+     * 计算可监听路径（skills/commands 全源 + agents 4 路径）· 对齐 CC {@code getWatchablePaths()}
+     * （skillChangeDetector.ts:171-235）.
      *
      * <ul>
      *   <li><b>[T3 双目录]</b> nexusai user skills/commands = {@code NexusaiPaths.getAppConfigHomeDir()/skills|commands}
@@ -369,7 +396,15 @@ public class SkillChangeDetector implements ApplicationRunner {
      *   <li>:187 user commands = getClaudeConfigHomeDir()/commands（claude 回落）</li>
      *   <li>:198 project skills = `.claude/skills` → resolve 绝对路径（:202）</li>
      *   <li>:211 project commands = `.claude/commands` → resolve 绝对路径（:215）</li>
-     *   <li>:224 additional dirs = join(dir, '.claude', 'skills')（state.ts:1666）</li>
+     *   <li><b>[CC-ALIGN-AGENTS]</b> agents 4 路径 —— CC 2.1.322 exe（offset≈309828433 的 {@code ye()}）
+     *       用<b>同一个</b>文件监听器管 skills/commands/agents 三类目录，显式把 agents 加进监听列表：
+     *       {@code let E=ODt("userSettings","agents"); if(E) try{await u.stat(E),s.push(E)}catch{}}
+     *       + {@code let U=ODt("projectSettings","agents"); ... s.push(i)}。Java 四路径 =
+     *       {@code ~/.{appName}/agents}（自有根优先）+ {@code getClaudeConfigHomeDir()/agents}（claude 回落）+
+     *       {@code .{appName}/agents} + {@code .claude/agents}。</li>
+     *   <li>:224 additional dirs = join(dir, '.claude', 'skills')（state.ts:1666）——
+     *       ⛔ additional dirs 只加 skills、<b>不加</b> agents：CC {@code ye()} 同样只对
+     *       --add-dir 目录补 skills，这是刻意对齐，勿"顺手补齐"。</li>
      * </ul>
      *
      * <p><b>P2-20 同源</b>：user 两路径走 {@link ClaudePaths#getClaudeConfigHomeDir()}（honor
@@ -425,7 +460,18 @@ public class SkillChangeDetector implements ApplicationRunner {
         addIfDirectory(paths, projectDir.resolve(".claude").resolve("skills").toAbsolutePath());
         // 8. project commands .claude/commands（claude 回落，CC :211-221）
         addIfDirectory(paths, projectDir.resolve(".claude").resolve("commands").toAbsolutePath());
-        // 9. additional dirs join(dir,'.claude','skills')（CC :224-232）· P2-21 同源合并
+        // [CC-ALIGN-AGENTS] 9~12. agents 目录 4 路径 —— CC 2.1.322 exe offset≈309828433 的 ye()：
+        //   let E=ODt("userSettings","agents"); if(E) try{await u.stat(E),s.push(E)}catch{} +
+        //   let U=ODt("projectSettings","agents"); ... s.push(i)。
+        //   即 CC 用同一个文件监听器管 skills/commands/agents 三类（agent md 改完无需重启）。
+        //   nexusai 自有根优先 + claude 回落（与加载侧 loadAgentsDir/MarkdownConfigLoader 双目录同源）。
+        addIfDirectory(paths, nexusaiUserConfigHome.resolve("agents"));                    // 9. ~/.{appName}/agents
+        addIfDirectory(paths, userConfigHome.resolve("agents"));                           // 10. getClaudeConfigHomeDir()/agents
+        addIfDirectory(paths, projectDir.resolve(NexusaiPaths.getProjectDirName())
+            .resolve("agents").toAbsolutePath());                                          // 11. .{appName}/agents
+        addIfDirectory(paths, projectDir.resolve(".claude").resolve("agents").toAbsolutePath()); // 12. .claude/agents
+        // 13. additional dirs join(dir,'.claude','skills')（CC :224-232）· P2-21 同源合并
+        //   ⛔ 刻意不加 agents：CC 的 --add-dir 只补 skills（exe ye() 同款），对齐勿补齐。
         List<Path> additional = new ArrayList<>(additionalDirs); // 测试注入 seam
         List<String> envAdditionalDirs = additionalDirectoriesSupplier.get();
         if (envAdditionalDirs != null) {
@@ -478,11 +524,41 @@ public class SkillChangeDetector implements ApplicationRunner {
      *       由 onIdle debounce 空闲窗口合并，见 {@link #watcherListener}）</li>
      * </ul>
      *
+     * <p><b>[CC-ALIGN-AGENTS] 两道过滤</b>（对齐 CC exe 2.1.322 offset≈309824000 的 {@code We()} 监听参数）：
+     * <ol>
+     *   <li><b>.md 扩展名</b>：CC {@code ignored} 回调末位 {@code if(n?.isFile()) return !f.endsWith(".md")}
+     *       —— 事件目标是<b>普通文件</b>且不以 {@code .md} 结尾 → 忽略（目录事件放行）。严格
+     *       {@code endsWith(".md")}，<b>不做</b> toLowerCase（CC 大小写敏感）。命中时直接 return：
+     *       不进 pending、不发遥测。删除事件 {@code Files.isRegularFile} 为 false → 与 CC
+     *       {@code n?.isFile()} 未定义时放行同语义。</li>
+     *   <li><b>深度 ≤2</b>：CC 是 {@code depth:2}（相对每个 watch root），而 directory-watcher 的
+     *       FILE_TREE 递归不限深度 → 在此按「path 父链上最长匹配的 watch root」相对化后裁剪：
+     *       {@code getNameCount() > 2} 丢弃。找不到任何 root（路径不落在监听目录内）→ <b>放行</b>
+     *       （不误杀）。</li>
+     * </ol>
+     *
      * <p>调用面（P3-33）：directory-watcher 每个 CREATE/MODIFY/DELETE 事件直接进入本方法；
      * 写稳定等待（awaitWriteFinish）由 {@code DirectoryChangeListener.onIdle} 空闲窗口承载（替代旧
      * {@code handleChangeAfterAwaitWriteFinish} mtime/size 轮询）。
      */
     void handleChange(Path path) {
+        if (path == null) {
+            return;
+        }
+        // (a) CC ignored 回调：普通文件且非 .md → 忽略（目录放行；大小写严格，不 toLowerCase）
+        if (Files.isRegularFile(path) && !path.getFileName().toString().endsWith(".md")) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SkillChangeDetector] 非 .md 文件变更 → 忽略（CC ignored 回调）: {}", path);
+            }
+            return;
+        }
+        // (b) CC depth:2（相对 watch root）→ directory-watcher 不限深度，此处自裁
+        if (!withinWatchDepth(path)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[SkillChangeDetector] 超出监听深度 2 → 忽略（CC depth:2）: {}", path);
+            }
+            return;
+        }
         if (log.isDebugEnabled()) {
             log.debug("[SkillChangeDetector] 检测到 skill 变更: {}", path);
         }
@@ -490,6 +566,31 @@ public class SkillChangeDetector implements ApplicationRunner {
             telemetry.recordEvent("tengu_skill_file_changed", Map.of("source", "chokidar"));
         }
         pendingChangedPaths.add(path);
+    }
+
+    /**
+     * [CC-ALIGN-AGENTS] 深度裁剪 · CC {@code depth:2}（exe 2.1.322 offset≈309824000 {@code We()}）。
+     *
+     * <p>在 {@link #getWatchablePaths()} 里找出是 {@code path} 父链上<b>最长</b>前缀的 root
+     * （最贴近的那个监听根），再算相对路径层数：{@code >2} → false。找不到 root → true（放行，
+     * 不误杀不在监听目录内的路径）。
+     *
+     * <p>每次事件重算一遍监听列表：列表极小（十余条 fs.stat），相对 2s 轮询间隔可忽略；缓存到
+     * 字段反而要处理 initialize 前后的失效。
+     */
+    private boolean withinWatchDepth(Path path) {
+        Path p = path.toAbsolutePath().normalize();
+        Path best = null;
+        for (Path root : getWatchablePaths()) {
+            Path r = root.toAbsolutePath().normalize();
+            if (p.startsWith(r) && (best == null || r.getNameCount() > best.getNameCount())) {
+                best = r;
+            }
+        }
+        if (best == null) {
+            return true; // 不在任何监听根下 → 放行（不误杀）
+        }
+        return best.relativize(p).getNameCount() <= 2;
     }
 
     // ─── P3-33 debounce（awaitWriteFinish 等价 · OnTimeoutListener 语义但复用本类 scheduler）───
@@ -574,6 +675,15 @@ public class SkillChangeDetector implements ApplicationRunner {
         }
         if (skillRegistry != null) {
             skillRegistry.refresh();
+        }
+        // [CC-ALIGN-AGENTS] 对齐 CC skillChangeDetector ke() 内 Fce()
+        // （exe 2.1.322 offset≈309827980：agentDefinitions.clear + markdownFiles.clear + agents=void 0）
+        // —— 两层成对清：文件发现层（loadAgentsDir.load 缓存 + MarkdownConfigLoader memoize）+ 组装层
+        //    （SubagentTool per-cwd registry）。只清前者则磁盘 agent 变更仍不可见。
+        com.nexusai.application.agent.subagent.loadAgentsDir.clearCache();
+        com.nexusai.application.agent.tool.impl.SubagentTool st = this.subagentTool;
+        if (st != null) {
+            st.clearRegistryCache();
         }
         resetSentSkillNames();
         // [skill-listing-cc-align 2026-09-10] 进程级 skill_listing sent 注册表同步清空（skill 文件变更后

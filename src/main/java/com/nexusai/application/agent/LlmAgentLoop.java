@@ -42,6 +42,7 @@ import com.nexusai.application.agent.permission.ToolPermissionGate;
 import com.nexusai.application.agent.plugin.PluginLoader;
 import com.nexusai.application.agent.subagent.ForkSubagent;
 import com.nexusai.application.agent.subagent.ForkSubagentMessages;
+import com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry;
 import com.nexusai.application.agent.subagent.createSubagentContext.AgentOptions;
 import com.nexusai.application.agent.tool.AgentToolUtils;
 import com.nexusai.application.agent.tool.AgentUsage;
@@ -5229,8 +5230,14 @@ public class LlmAgentLoop implements AgentLoop {
             if (tool == null) {
                 return null;
             }
+            // [CC 同构] 主线程 agent 的 model 与人格/工具白名单同源冻结：镜像 CC 读的是同一份
+            //   this.mainThreadAgent（exe 2.1.322 offset≈328512174 / 328518065 / 328523098），
+            //   会话内首次解析后磁盘 md 改动不热更。见 SessionMainThreadAgentRegistry。
+            final String agentTypeKey = row.getMainThreadAgent().trim();
             com.nexusai.application.agent.subagent.AgentDefinition def =
-                tool.agentRegistry(sessionId).findAgent(row.getMainThreadAgent().trim());
+                com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry.resolve(
+                    sessionId, agentTypeKey,
+                    () -> tool.agentRegistry(sessionId).findAgent(agentTypeKey));
             return def == null ? null : def.mainModel().orElse(null);
         } catch (RuntimeException e) {
             // fail-soft：智能体配置读失败 ⇒ 用会话当前模型，⛔ 不阻断本轮。
@@ -5340,7 +5347,14 @@ public class LlmAgentLoop implements AgentLoop {
                 if (subagentTool != null) {
                     // [批 3c] 会话显式传参：本处 sessionId 即上面解析出的会话（turnSessionId 直源）
                     //   → per-session agent-defs 视图；⛔ 不再经裸 MDC（原 agentRegistry() 无参会退化）
-                    foundDef = subagentTool.agentRegistry(sessionId).findAgent(sessionAgentType);
+                    // [CC 同构] 主线程人格冻结：对齐 CC this.mainThreadAgent（exe 2.1.322
+                    //   offset≈328512174 / 328518065 / 329932127）—— 会话内首次解析后固定，
+                    //   磁盘 md 改动（watcher 只刷 AppState.agentDefinitions）不热更。
+                    //   见 SessionMainThreadAgentRegistry。
+                    final String agentTypeKey = sessionAgentType;
+                    foundDef = SessionMainThreadAgentRegistry.resolve(
+                            sessionId, agentTypeKey,
+                            () -> subagentTool.agentRegistry(sessionId).findAgent(agentTypeKey));
                 }
                 if (foundDef != null) {
                     final com.nexusai.application.agent.subagent.AgentDefinition sessionAgentDef = foundDef;
@@ -13617,7 +13631,10 @@ public class LlmAgentLoop implements AgentLoop {
      *   <li>命中 → 按 {@code tools} 显式名单<b>替换</b>工具池（CC resolveAgentTools by-name 语义）。</li>
      * </ul>
      *
-     * <p>⚠️ 每轮求值：会话切 agent / 改白名单下一轮即生效，不做进程级缓存（多会话并发安全）。
+     * <p>⚠️ 每轮求值工具池与开关；但主线程 agent <b>定义</b>按会话冻结
+     * （{@link com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry}，
+     * 对齐 CC {@code this.mainThreadAgent}）—— 切 agent（agentType 变更）下一轮即生效，
+     * 改磁盘 md 的 {@code tools:} 不热更。
      *
      * @param sessionId     会话 id（非空，调用方已判）
      * @param available     已过 bare/deny/coordinator/会话禁用的当轮工具池
@@ -13696,8 +13713,14 @@ public class LlmAgentLoop implements AgentLoop {
                     + " → 按默认池装配（专属工具隐藏）: session={} agent={}", sessionId, agentType);
             return com.nexusai.application.agent.tool.AgentToolPolicy.apply(available, noList, noList);
         }
+        // [CC 同构] 主线程人格冻结：与上面 buildEffectivePromptOptions 同源，对齐 CC
+        //   computeToolPool 读的是同一份 this.mainThreadAgent（exe 2.1.322 offset≈328523098）
+        //   ⇒ 会话内首次解析后 tools 白名单固定，磁盘 md 改动不热更。见 SessionMainThreadAgentRegistry。
+        final String agentTypeKey = agentType == null ? null : agentType.trim();
         com.nexusai.application.agent.subagent.AgentDefinition def =
-                subagentTool.agentRegistry(sessionId).findAgent(agentType.trim());
+                SessionMainThreadAgentRegistry.resolve(
+                        sessionId, agentTypeKey,
+                        () -> subagentTool.agentRegistry(sessionId).findAgent(agentTypeKey));
         if (def == null) {
             log.warn("[LlmAgentLoop] 会话主线程 agent 未命中 registry → 按默认池装配（专属工具隐藏）: "
                     + "session={} agent={}", sessionId, agentType);

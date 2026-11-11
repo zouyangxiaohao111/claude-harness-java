@@ -267,7 +267,7 @@ class KnowledgeBaseServiceTest {
             + "\"wiki_enabled\":true,\"graph_enabled\":false}";
 
         KnowledgeBaseDto created = service.create(new CreateKnowledgeBaseRequest(
-            "建库即开Wiki", null, "document", null, "e", "s", strategy));
+            "建库即开Wiki", null, "document", null, "e", "s", strategy, null));
 
         assertThat(created.indexingStrategy())
             .as("源侧创建时同一个请求就带 indexing_strategy（KnowledgeBaseEditorModal.vue:1690）；"
@@ -286,7 +286,7 @@ class KnowledgeBaseServiceTest {
     @DisplayName("创建时 indexing_strategy 不是 JSON 对象 ⇒ 400（⛔ 不静默存脏数据）")
     void createRejectsNonJsonIndexingStrategy() {
         assertThatThrownBy(() -> service.create(new CreateKnowledgeBaseRequest(
-            "坏策略库", null, "document", null, "e", "s", "not-json")))
+            "坏策略库", null, "document", null, "e", "s", "not-json", null)))
             .isInstanceOf(ValidationException.class)
             .hasMessageContaining("JSON 对象");
     }

@@ -7,6 +7,8 @@ import com.nexusai.application.agent.permission.hook.GenericHook;
 import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.hook.PromptHook;
+import com.nexusai.application.agent.subagent.AgentDefinition;
+import com.nexusai.application.agent.subagent.loadAgentsDir;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
@@ -71,6 +73,10 @@ class SkillChangeDetectorTest {
         ClaudePaths.setConfigDirOverride(null);
         ClaudePaths.setManagedFilePathOverride(null);
         NexusaiPaths.setAppNameOverride(null);   // G5：复位 nexusai 自有根 appName 隔离
+        NexusaiPaths.setConfigHomeDirOverride(null); // agents 路径测试隔离
+        // [CC-ALIGN-AGENTS] 复位静态 agent 定义缓存（load 缓存 + MarkdownConfigLoader memoize），
+        //   避免本类 reload 清缓存用例与其它测试类互相污染
+        loadAgentsDir.clearCache();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -768,6 +774,156 @@ class SkillChangeDetectorTest {
             SkillChangeDetector.unregisterSentSkillNames(session.sentSkillNames());
             SkillChangeDetector.unregisterSuppressNextSkillListing(session.suppressNextSkillListing());
         }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 11. [CC-ALIGN-AGENTS] agents 目录纳入监听 + .md/深度过滤 + reload 清 agent 缓存
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * WHY（CC-ALIGN-AGENTS · 规则九）：CC 2.1.322 exe offset≈309828433 的 {@code ye()} 用同一个
+     * 文件监听器管 skills/commands/agents 三类目录，显式把 agents 加进监听列表：
+     * {@code ODt("userSettings","agents")} + {@code ODt("projectSettings","agents")}。本仓旧实现
+     * 全文件无 "agents" 字面 → agent md 改完永不热更新。本用例用临时目录造 4 个 agents 目录，
+     * 断言全部被收录，且 --add-dir 仍只加 skills（CC 刻意行为，不加 agents）。
+     */
+    @Test
+    @DisplayName("[CC-ALIGN-AGENTS] getWatchablePaths 收录 4 个 agents 目录；--add-dir 不加 agents")
+    void getWatchablePaths_includesFourAgentsDirs() throws Exception {
+        Path nexusaiHome = tempDir.resolve("nexusai-home");
+        Path claudeHome = tempDir.resolve("claude-home");
+        NexusaiPaths.setConfigHomeDirOverride(nexusaiHome.toString());
+        ClaudePaths.setConfigDirOverride(claudeHome.toString());
+        Path projectRoot = tempDir.resolve("proj");
+        detector.setProjectDir(projectRoot);
+        detector.setAdditionalDirectoriesSupplier(List::of);
+
+        Path nexusaiUserAgents = Files.createDirectories(nexusaiHome.resolve("agents"));
+        Path claudeUserAgents = Files.createDirectories(claudeHome.resolve("agents"));
+        Path projectNexusaiAgents = Files.createDirectories(
+            projectRoot.resolve(NexusaiPaths.getProjectDirName()).resolve("agents"));
+        Path projectClaudeAgents = Files.createDirectories(projectRoot.resolve(".claude").resolve("agents"));
+
+        assertThat(detector.getWatchablePaths())
+            .as("CC ye()：userSettings/agents 必须被监听（~/.{appName}/agents + ~/.claude/agents）")
+            .contains(nexusaiUserAgents.toAbsolutePath().normalize(),
+                      claudeUserAgents.toAbsolutePath().normalize())
+            .as("CC ye()：projectSettings/agents 必须被监听（.{appName}/agents + .claude/agents）")
+            .contains(projectNexusaiAgents.toAbsolutePath().normalize(),
+                      projectClaudeAgents.toAbsolutePath().normalize());
+
+        // ⛔ additional dirs 只加 skills、不加 agents（CC --add-dir 只补 skills）
+        Path addDir = tempDir.resolve("add-dir");
+        Path addAgents = Files.createDirectories(addDir.resolve(".claude").resolve("agents"));
+        detector.setAdditionalDirectoriesSupplier(() -> List.of(addDir.toString()));
+        assertThat(detector.getWatchablePaths())
+            .as("--add-dir/.claude/agents 不得被监听（CC ye() 对 additional 只补 skills）")
+            .doesNotContain(addAgents.toAbsolutePath().normalize());
+    }
+
+    /**
+     * WHY（CC-ALIGN-AGENTS · 规则九）：CC 监听器 {@code ignored} 回调末位
+     * {@code if(n?.isFile()) return !f.endsWith(".md")} —— 普通文件且非 .md 直接忽略（目录放行），
+     * 且严格 {@code endsWith(".md")}（不 toLowerCase）。旧实现无扩展名过滤：编辑器写临时文件
+     * （.swp / 4913 / .tmp）也会触发一次全量 reload + ConfigChange hook 副作用。
+     * 用遥测计数做行为断言（非 .md 不进 pending 也不发遥测）。
+     */
+    @Test
+    @DisplayName("[CC-ALIGN-AGENTS] handleChange：非 .md 文件被忽略（不遥测/不进 pending）；.md 与目录放行")
+    void handleChange_nonMarkdownFile_ignored() throws Exception {
+        Path skillsRoot = Files.createDirectories(tempDir.resolve(".claude").resolve("skills"));
+        detector.setProjectDir(tempDir);
+        detector.setAdditionalDirectoriesSupplier(List::of);
+        Telemetry telemetry = new Telemetry();
+        detector.setTelemetry(telemetry);
+
+        Path txFile = Files.writeString(skillsRoot.resolve("notes.txt"), "not a markdown");
+        detector.handleChange(txFile);
+        assertThat(telemetry.getCounter("tengu_skill_file_changed"))
+            .as("非 .md 普通文件必须被忽略（CC ignored: !f.endsWith('.md')）→ 不发遥测")
+            .isZero();
+
+        // 大小写严格：.MD 不是 .md（CC 不做 toLowerCase）
+        Path upperMd = Files.writeString(skillsRoot.resolve("UPPER.MD"), "x");
+        detector.handleChange(upperMd);
+        assertThat(telemetry.getCounter("tengu_skill_file_changed"))
+            .as("'.MD' 不得被当 .md 放行（CC 严格 endsWith('.md')，无 toLowerCase）")
+            .isZero();
+
+        // 目录事件放行（CC ignored 对目录返回 false）
+        Path subDir = Files.createDirectories(skillsRoot.resolve("my-skill"));
+        detector.handleChange(subDir);
+        assertThat(telemetry.getCounter("tengu_skill_file_changed"))
+            .as("目录事件必须放行（CC ignored 对目录返回 false）")
+            .isEqualTo(1);
+
+        // .md 文件放行
+        Path md = Files.writeString(subDir.resolve("SKILL.md"), "---\nname: x\n---\nbody");
+        detector.handleChange(md);
+        assertThat(telemetry.getCounter("tengu_skill_file_changed"))
+            .as(".md 文件必须放行")
+            .isEqualTo(2);
+
+        // 深度 >2（相对 watch root）→ 忽略（CC depth:2）
+        Path deep = Files.createDirectories(skillsRoot.resolve("a").resolve("b"));
+        Path deepMd = Files.writeString(deep.resolve("deep.md"), "x");
+        detector.handleChange(deepMd);
+        assertThat(telemetry.getCounter("tengu_skill_file_changed"))
+            .as("相对监听根第 3 层（a/b/deep.md，getNameCount=3 > depth 2）必须被裁剪丢弃（CC depth:2）")
+            .isEqualTo(2);
+    }
+
+    /**
+     * WHY（CC-ALIGN-AGENTS · 规则九）：CC reload 清缓存集合 {@code ke()} 含 {@code Fce()}
+     * （exe 2.1.322 offset≈309827980）：{@code agentDefinitions.clear() + markdownFiles.clear() + pBt()}
+     * （{@code Ae().agents=void 0}）。Java 两层 = {@code loadAgentsDir.clearCache()}（文件发现层）+
+     * {@code SubagentTool.clearRegistryCache()}（per-cwd 组装层）。旧实现 reload 只清 skill 缓存 →
+     * 磁盘新增 agent md 永不被发现。本用例端到端验证：新 agent md 写入 → watcher reload →
+     * 再 load 能看到新文件；且 SubagentTool 组装层同样被清。
+     */
+    @Test
+    @DisplayName("[CC-ALIGN-AGENTS] reload 清 agent 两层缓存 → 新增 agent md 立即可见（CC ke() 内 Fce()）")
+    void reload_clearsAgentCaches_newAgentFileVisible() throws Exception {
+        Path claudeProjDir = tempDir.resolve(".claude");
+        Path agentsDir = Files.createDirectories(claudeProjDir.resolve("agents"));
+        Files.writeString(agentsDir.resolve("a.md"), "---\nname: agent-a\ndescription: first\n---\nbody a");
+
+        detector.setProjectDir(tempDir);
+        detector.setAdditionalDirectoriesSupplier(List::of);
+        Path skillsRoot = Files.createDirectories(tempDir.resolve(".claude").resolve("skills"));
+        RecordingSkillRegistry registry = new RecordingSkillRegistry(skillsRoot.toString());
+        detector.setSkillRegistry(registry);
+        detector.setTelemetry(new Telemetry());
+
+        // 组装层探针：SubagentTool.clearRegistryCache 调用计数（匿名子类，不触真实装配）
+        AtomicInteger registryCacheClears = new AtomicInteger();
+        detector.setSubagentTool(new com.nexusai.application.agent.tool.impl.SubagentTool() {
+            @Override
+            public void clearRegistryCache() {
+                registryCacheClears.incrementAndGet();
+            }
+        });
+
+        // 预热文件发现层缓存（此时只有 a.md）
+        assertThat(loadAgentsDir.load(claudeProjDir, "projectSettings"))
+            .as("预热：初次加载只看到 a.md")
+            .containsOnlyKeys("agent-a");
+
+        detector.initialize();
+
+        // 新增 b.md → watcher 事件 → debounce → reload（清两层缓存）
+        Files.writeString(agentsDir.resolve("b.md"), "---\nname: agent-b\ndescription: second\n---\nbody b");
+
+        assertThat(awaitTrue(5000, () -> registry.refreshCalls.get() >= 1))
+            .as("agents 目录内 .md 变更必须触发 reload（CC 同一监听器管 agents）")
+            .isTrue();
+
+        assertThat(loadAgentsDir.load(claudeProjDir, "projectSettings"))
+            .as("reload 清 loadAgentsDir.clearCache 后，新 agent b.md 必须可见（CC Fce() agentDefinitions.clear）")
+            .containsKeys("agent-a", "agent-b");
+        assertThat(registryCacheClears.get())
+            .as("reload 必须成对清 SubagentTool per-cwd registry（CC pBt() agents=void 0 等价）")
+            .isGreaterThanOrEqualTo(1);
     }
 
     /** 记录 refresh 调用次数的 SkillRegistry（校验 SkillChangeDetector 联动）. */
