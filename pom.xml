@@ -14,7 +14,7 @@
 
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
-    <version>0.1.68</version>
+    <version>0.1.69</version>
     <name>nexusai-backend</name>
     <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 
@@ -78,6 +78,15 @@
             <groupId>org.duckdb</groupId>
             <artifactId>duckdb_jdbc</artifactId>
             <version>1.1.3</version>
+        </dependency>
+        <!-- 知识图谱 · 远程 Neo4j 存储（2026-11-11 用户要求「兼容 Neo4j，可配远程实例」）。
+             仅当 `nexusai.kb.graph.store=neo4j` 时装配（见 Neo4jGraphStore）。
+             ⚠️ 远程实例必须装 APOC 插件：写入依赖 apoc.merge.node。
+             ⚠️ 不配置时本依赖不产生任何连接（datasource 与它无关）。 -->
+        <dependency>
+            <groupId>org.neo4j.driver</groupId>
+            <artifactId>neo4j-java-driver</artifactId>
+            <version>5.28.0</version>
         </dependency>
 <!--    LRU缓存    -->
         <dependency>

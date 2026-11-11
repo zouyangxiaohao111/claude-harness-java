@@ -2,6 +2,19 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.69] - 2026-11-11
+
+### Fixed
+
+- **安装包里缺 `anydoc_go.dll`（0.1.68 的实证缺陷）**：`prepare-backend.mjs` 只从
+  `front/src-tauri/backend/` 取原生库，而该目录被 `.gitignore` 全忽略 ⇒ 干净 worktree / CI
+  上必然找不到；仓库却把 dll 提交在仓库根 `backend/`（脚本从不看那里）。
+  0.1.68 的打包日志实为「⚠️ 未找到 anydoc 原生库」⇒ 装出来的包缺该库，
+  Office / ODF / RTF / EPUB 文档全部回落 Apache Tika，拿不到 anydoc 的结构化 Markdown。
+  现改为「out 优先 → 仓库 `backend/` 兜底」，找到就拷进随包目录。
+  验证：干净 worktree 实跑 `prepare-backend` 输出「从仓库 backend/ 拷入（7.7 MB，随包分发）」，
+  且拷入文件与仓库副本 sha256 完全一致。
+
 ## [0.1.68] - 2026-11-11
 
 ### Added
