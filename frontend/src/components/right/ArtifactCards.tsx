@@ -84,6 +84,14 @@ export interface ArtifactCardsProps {
   onOpenInBrowser?: (a: SessionArtifactDto) => void
   /** 右栏窄卡（正文宽卡）· 同一套组件，只是更紧凑的留白 */
   compact?: boolean
+  /**
+   * 显示来源角标（交付物 / 项目）· 默认 false。
+   *
+   * <p><b>WHY 做成开关而不是默认显示</b>：正文气泡下的产物卡（`TurnArtifacts`）只挂本轮产物，
+   * 用户已经知道它是本轮出来的，再标一个「项目/交付物」是噪声；只有右栏「产物」tab 是按对话
+   * 汇总的，那里才需要区分「Agent 主动交付的文件」与「顺手改的项目文档」。
+   */
+  showOrigin?: boolean
 }
 
 /**
@@ -100,6 +108,7 @@ export const ArtifactCards = memo(function ArtifactCards({
   onEdit,
   onOpenInBrowser,
   compact = false,
+  showOrigin = false,
 }: ArtifactCardsProps) {
   if (items.length === 0) return null
   return (
@@ -109,6 +118,9 @@ export const ArtifactCards = memo(function ArtifactCards({
         const editable = isTextArtifact(a)
         const showBrowser = kind === 'html' && !!onOpenInBrowser
         const showEdit = editable && !!onEdit
+        // origin 未标注（历史行 / 旧后端）→ 不画角标，⛔ 不猜成任一种
+        const originLabel = a.origin === 'deliverables' ? '交付物'
+          : a.origin === 'project-write' ? '项目' : null
         return (
           <div
             key={a.id}
@@ -121,6 +133,9 @@ export const ArtifactCards = memo(function ArtifactCards({
               if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); onOpen?.(a) }
             }}
           >
+            {showOrigin && originLabel && (
+              <span className={`src ${a.origin}`}>{originLabel}</span>
+            )}
             <span className={`ac-ico k-${kind}`}>
               <ArtifactKindIcon kind={kind} />
             </span>

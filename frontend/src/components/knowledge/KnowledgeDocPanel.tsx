@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
 import { ApiError } from '@/api/rest'
 import { knowledgeApi, PARSE_STATUS_LABEL, PARSE_STATUS_TONE } from '@/api/knowledge'
 import type { KbFolderNode, KbTag, Knowledge, SearchHit } from '@/api/knowledge'
 import { KbUploadSource } from './KbUploadSource'
 import { KbDocDrawer } from './KbDocDrawer'
+import { IconSprite } from './IconSprite'
 
 interface KnowledgeDocPanelProps {
   baseId: string
@@ -14,6 +16,100 @@ interface KnowledgeDocPanelProps {
 }
 
 type ViewMode = 'list' | 'grid'
+
+/**
+ * 「查看 Trace」所需的最小形状（后端 `GET /knowledge/{id}/stages` 的 SpanTree）。
+ *
+ * <p>⚠️ 本仓的 span **就是分块**（`KbKnowledgeExtService#spans` 用 chunk 拼叶子），
+ * 不是源侧那种细粒度解析步骤 ⇒ 界面如实标注，⛔ 不编造阶段名。
+ */
+interface KnowledgeStages {
+  knowledge_id: string
+  title: string | null
+  parse_status: string | null
+  spans: Array<{
+    id: string
+    type: string | null
+    preview: string | null
+    start_at: number | null
+    end_at: number | null
+    chunk_index: number | null
+    enabled: boolean
+    children: unknown[]
+  }>
+  attempts: Array<{
+    id: number | null
+    task_type: string | null
+    state: string | null
+    attempt: number | null
+    error_message: string | null
+    started_at: string | null
+    finished_at: string | null
+  }>
+}
+
+/** 「移动到…」的目标知识库（后端 `KbAdvancedService.MoveTarget`）。 */
+interface MoveTarget {
+  id: string
+  name: string
+  description: string | null
+  type: string | null
+  knowledge_count: number
+}
+
+/** 知识库类型 → 中文（后端 `type` 取值：document / faq / …）。 */
+function kbTypeLabel(t: string | null | undefined): string {
+  switch (t) {
+    case 'document':
+      return '文档库'
+    case 'faq':
+      return '问答库'
+    case '':
+    case null:
+    case undefined:
+      return '未知类型'
+    default:
+      return t
+  }
+}
+
+/** 解析任务类型 → 中文（后端 `kb_ingest_task.task_type`）。 */
+function taskTypeLabel(t: string | null | undefined): string {
+  switch (t) {
+    case 'parse':
+      return '解析入库'
+    case 'wiki':
+      return 'Wiki 生成'
+    case '':
+    case null:
+    case undefined:
+      return '任务'
+    default:
+      return t
+  }
+}
+
+/** 解析任务状态 → 中文（后端 `kb_ingest_task.state`）。 */
+function taskStateLabel(s: string | null | undefined): string {
+  switch (s) {
+    case 'pending':
+      return '排队中'
+    case 'running':
+      return '执行中'
+    case 'done':
+      return '完成'
+    case 'failed':
+      return '失败'
+    case 'cancelled':
+      return '已取消'
+    case '':
+    case null:
+    case undefined:
+      return '未知状态'
+    default:
+      return s
+  }
+}
 
 const VIEW_MODE_KEY = 'nexusai.kb.docs.viewMode'
 
@@ -119,6 +215,8 @@ export function KnowledgeDocPanel({
   // 批量
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set())
   const [batchMode, setBatchMode] = useState(false)
+  /** 当前展开 ⋯ 菜单的行 id（null = 全关）。⚠️ 同一时刻只开一个。 */
+  const [menuOpenId, setMenuOpenId] = useState<string | null>(null)
 
   /**
    * 详情抽屉当前打开的文档。
@@ -228,7 +326,6 @@ export function KnowledgeDocPanel({
   }, [items, selectedTagIds, tags])
 
   const crumbs = folderCrumbs(folderPath)
-  const subFolders = useMemo(() => findChildren(folders, folderPath), [folders, folderPath])
 
   const allSelected = visibleItems.length > 0 && visibleItems.every((k) => selectedIds.has(k.id))
   const someSelected = visibleItems.some((k) => selectedIds.has(k.id)) && !allSelected
@@ -301,6 +398,151 @@ export function KnowledgeDocPanel({
       void loadFolders()
     } catch (e) {
       showToast(toMessage(e), 'info')
+    }
+  }
+
+  /**
+   * 文档行内「⋯」菜单打开的浮层（Trace / 移动到… / 编辑标签）。
+   *
+   * <p>⚠️ 用 state 而不是 `<details>`：Trace 与「移动到…」是异步弹层，
+   * 需要「先关菜单再开弹层」；`<details>` 的 open 状态不受控，弹层打开时菜单会留在原地。
+   */
+  const [traceState, setTraceState] = useState<{
+    row: Knowledge
+    loading: boolean
+    error: string | null
+    data: KnowledgeStages | null
+  } | null>(null)
+  const [moveTargetState, setMoveTargetState] = useState<{
+    row: Knowledge
+    loading: boolean
+    error: string | null
+    targets: MoveTarget[]
+    moving: string | null
+  } | null>(null)
+  /** 「编辑标签」弹层：给**单行**选标签（`PUT /knowledge/tags` 是替换语义 ⇒ 预填当前集合）。 */
+  const [rowTagState, setRowTagState] = useState<{
+    row: Knowledge
+    /** 当前勾选（初值 = 该行已有标签） */
+    selected: string[]
+    saving: boolean
+    error: string | null
+  } | null>(null)
+
+  /**
+   * 点「⋯」菜单以外的地方 ⇒ 关闭菜单。
+   *
+   * <p>⚠️ 菜单是 `<details open>`（受控），没有原生「点外面自动收起」⇒ 不补这一段的话，
+   * 用户点筛选栏/空白处后菜单会一直挂在那儿，看起来像界面卡住。
+   */
+  useEffect(() => {
+    if (menuOpenId === null) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as HTMLElement | null
+      if (!t) return
+      if (t.closest('.card-menu') || t.closest('summary.row-more-btn')) return
+      setMenuOpenId(null)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [menuOpenId])
+
+  /**
+   * 从行内**任意位置**打开详情抽屉（源侧：点行即开）。
+   *
+   * <p>⭐⭐ 必须排除「自己有交互」的子控件，否则：
+   * <ul>
+   *   <li>点复选框 ⇒ 同时勾选 + 弹抽屉（用户只想勾选）；</li>
+   *   <li>点 ⋯ ⇒ 菜单刚展开就被抽屉盖住；</li>
+   *   <li>点「+ 添加标签」/ 链接 ⇒ 被抽屉抢走。</li>
+   * </ul>
+   * 判据 = 「最近的 interactive 祖先是否存在」，而不是逐个比对坐标/className 列表
+   * （后者加了新控件就会漏）。
+   */
+  const openDrawerFromRow = (e: React.MouseEvent, row: Knowledge) => {
+    const t = e.target as HTMLElement | null
+    if (!t) return
+    const interactive = t.closest(
+      'input,button,a,summary,label,select,textarea,' +
+      '[role="menuitem"],[role="checkbox"],[role="switch"],' +
+      '.card-menu,.row-more-btn,.cell-check,.doc-list-check,.tag-add,.card-nav-check'
+    )
+    if (interactive) return
+    // 点行内空白处 = 用户已不关心菜单 ⇒ 顺手收起（否则抽屉弹出来时菜单还挂在下面）
+    setMenuOpenId(null)
+    setDrawerDoc(row)
+  }
+
+  /** 打开 Trace 弹层（先关菜单，再异步取数据）。 */
+  const openTrace = async (row: Knowledge) => {
+    setTraceState({ row, loading: true, error: null, data: null })
+    try {
+      const data = await knowledgeApi.getKnowledgeStages(row.id)
+      setTraceState({ row, loading: false, error: null, data })
+    } catch (e) {
+      const msg = toMessage(e)
+      console.warn(`[文档列表] Trace 加载失败 knowledge=${row.id} 原因=${msg}`)
+      setTraceState({ row, loading: false, error: msg, data: null })
+    }
+  }
+
+  /** 打开「移动到…」（跨知识库）弹层。 */
+  const openMoveTargets = async (row: Knowledge) => {
+    setMoveTargetState({ row, loading: true, error: null, targets: [], moving: null })
+    try {
+      const targets = await knowledgeApi.listMoveTargets(baseId)
+      setMoveTargetState({ row, loading: false, error: null, targets: targets ?? [], moving: null })
+    } catch (e) {
+      const msg = toMessage(e)
+      console.warn(`[文档列表] 目标知识库列表加载失败 base=${baseId} 原因=${msg}`)
+      setMoveTargetState({ row, loading: false, error: msg, targets: [], moving: null })
+    }
+  }
+
+  /** 执行跨库移动。 */
+  const doMoveToTarget = async (targetId: string) => {
+    const st = moveTargetState
+    if (!st || st.moving) return
+    setMoveTargetState({ ...st, moving: targetId, error: null })
+    try {
+      const r = await knowledgeApi.moveKnowledge({
+        source_kb_id: baseId,
+        target_kb_id: targetId,
+        knowledge_ids: [st.row.id],
+      })
+      setMoveTargetState(null)
+      showToast(`已移动 ${r?.moved ?? 1} 个文档到目标知识库`, 'success')
+      void loadItems()
+      void loadFolders()
+    } catch (e) {
+      const msg = toMessage(e)
+      console.warn(`[文档列表] 移动失败 knowledge=${st.row.id} target=${targetId} 原因=${msg}`)
+      setMoveTargetState({ ...st, moving: null, error: msg })
+    }
+  }
+
+  /** 打开「编辑标签」弹层（预填该行已有标签 —— 替换语义，⛔ 不能从空开始）。 */
+  const openRowTags = (row: Knowledge) => {
+    const own = (row.tags ?? []).map((t) => t.id)
+    setRowTagState({ row, selected: own, saving: false, error: null })
+  }
+
+  /** 保存单行标签。 */
+  const saveRowTags = async () => {
+    const st = rowTagState
+    if (!st || st.saving) return
+    setRowTagState({ ...st, saving: true, error: null })
+    try {
+      await knowledgeApi.setKnowledgeTags(baseId, [st.row.id], st.selected)
+      setRowTagState(null)
+      showToast('标签已更新', 'success')
+      void loadItems()
+      void loadTags()
+    } catch (e) {
+      const msg = toMessage(e)
+      console.warn(`[文档列表] 标签保存失败 knowledge=${st.row.id} 原因=${msg}`)
+      setRowTagState({ ...st, saving: false, error: msg })
+      showToast(`标签保存失败：${msg}`, 'info')
     }
   }
 
@@ -406,352 +648,441 @@ export function KnowledgeDocPanel({
     (statusFilter ? 1 : 0) + (typeFilter ? 1 : 0) + selectedTagIds.length
 
   return (
-    <div className="kb-docs">
-      {/* ── 左：文件夹树 ─────────────────────────────────── */}
+    <div className="knowledge-main">
+      {/* ⭐ tdesign 图标 sprite 必须在本组件内挂一份：
+          `KbCreateModal` 里那份随弹窗卸载，而文档行的 ⋯ 菜单、文件类型图标
+          都在这里渲染 —— 不挂 ⇒ `<use href="#t-icon-x">` 找不到 symbol，
+          渲染成**看不见的空白**（控制台零报错，最典型的静默失效）。
+          sprite 用 absolute+0 尺寸，不占布局。 */}
+      <IconSprite />
+      {/* ── 左：文件夹树（源侧 KbFolderTree.vue:1-130）──────── */}
       {!treeCollapsed && (
         <aside className="kb-folder-tree" aria-label="文件夹">
-          <button
-            type="button"
-            className={`kb-folder-item${folderPath === '' ? ' is-active' : ''}`}
-            onClick={() => setFolderPath('')}
-            title={baseName}
-          >
-            <span className="kb-folder-ic">🗂</span>
-            <span className="kb-folder-name">{baseName ?? '全部文档'}</span>
-            <span className="kb-folder-count">{total}</span>
-          </button>
-          <FolderBranch
-            nodes={folders}
-            current={folderPath}
-            onSelect={setFolderPath}
-            onRename={handleRenameFolder}
-          />
-          {folders.length === 0 && <div className="kb-folder-empty">暂无子文件夹</div>}
+          <div className="kb-folder-tree__header">
+            <span className="kb-folder-tree__title">文件夹</span>
+            <span className="kb-folder-tree__total">{baseName ?? '全部文档'} · {total}</span>
+          </div>
+          <div className="kb-folder-tree__body">
+            <div
+              className={`kb-folder-row is-root${folderPath === '' ? ' active' : ''}`}
+              /* ⚠️ `--app-selection-bg` 只在源站 theme.css 的**另一个** :root 块里定义，
+                 kb-scope.css 提取时没带上它 ⇒ 类里的 background 解析成空。
+                 这里按源站同一个表达式（theme.css:206）行内补上。 */
+              style={folderPath === ''
+                ? { paddingLeft: 4, background: 'color-mix(in srgb, var(--td-text-color-primary) 4%, var(--td-bg-color-container))' }
+                : { paddingLeft: 4 }}
+              role="button"
+              tabIndex={0}
+              title={baseName}
+              onClick={() => setFolderPath('')}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') setFolderPath('') }}
+            >
+              <span className="kb-folder-row__toggle-placeholder" aria-hidden="true" />
+              <span className="kb-folder-row__icon">🗂</span>
+              <span className="kb-folder-row__label">{baseName ?? '全部文档'}</span>
+              <span className="kb-folder-row__trailing">
+                <span className="kb-folder-row__count">{total}</span>
+              </span>
+            </div>
+            <FolderBranch
+              nodes={folders}
+              current={folderPath}
+              onSelect={setFolderPath}
+              onRename={handleRenameFolder}
+            />
+            {folders.length === 0 && <div className="no_content">暂无子文件夹</div>}
+          </div>
         </aside>
       )}
 
-      {/* ── 右：文档区 ───────────────────────────────────── */}
-      <div className="kb-doc-main">
-        {/* 面包屑路径 + 计数 */}
-        <div className="kb-doc-path">
-          {treeCollapsed && (
-            <button
-              type="button"
-              className="kb-icon-btn"
-              onClick={() => setTreeCollapsed(false)}
-              title="展开文件夹"
-              aria-label="展开文件夹"
-            >
-              ☰
-            </button>
-          )}
-          <button
-            type="button"
-            className="kb-crumb-link"
-            onClick={() => setFolderPath('')}
-            title={baseName}
-          >
-            {baseName ?? '全部文档'}
-          </button>
-          {crumbs.map((c, i) => (
-            <span key={c.path} className="kb-crumb-seg">
-              <span className="kb-crumb-sep">›</span>
-              {i === crumbs.length - 1 ? (
-                <span className="kb-crumb-current">{c.name}</span>
-              ) : (
-                <button type="button" className="kb-crumb-link" onClick={() => setFolderPath(c.path)}>
-                  {c.name}
-                </button>
-              )}
-            </span>
-          ))}
-          <span className="kb-doc-count">
-            {filtering ? `筛出 ${visibleItems.length}` : `${total} 个文档`}
-          </span>
-          {!treeCollapsed && folders.length > 0 && (
-            <button
-              type="button"
-              className="kb-icon-btn kb-tree-collapse"
-              onClick={() => setTreeCollapsed(true)}
-              title="收起文件夹"
-              aria-label="收起文件夹"
-            >
-              ‹
-            </button>
-          )}
-        </div>
-
-        {/* 工具条：搜索 / 筛选 / 视图 / 批量 / 上传 */}
-        <div className="kb-doc-toolbar">
-          <input
-            className="kb-input kb-doc-search"
-            placeholder="按标题搜索…"
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-          />
-          <select
-            className="kb-select"
-            value={statusFilter}
-            onChange={(e) => setStatusFilter(e.target.value)}
-            aria-label="按状态筛选"
-          >
-            <option value="">全部状态</option>
-            <option value="pending">排队中</option>
-            <option value="processing">解析中</option>
-            <option value="completed">已完成</option>
-            <option value="failed">失败</option>
-            <option value="cancelled">已取消</option>
-          </select>
-          <select
-            className="kb-select"
-            value={typeFilter}
-            onChange={(e) => setTypeFilter(e.target.value)}
-            aria-label="按类型筛选"
-          >
-            <option value="">全部类型</option>
-            {['pdf', 'docx', 'doc', 'xlsx', 'xls', 'pptx', 'md', 'txt', 'csv'].map((t) => (
-              <option key={t} value={t}>{fileMeta(t).label}</option>
-            ))}
-          </select>
-
-          {/* 标签筛选 */}
-          <div className="kb-tag-filter-wrap">
-            <button
-              type="button"
-              className={`kb-btn ghost${activeFilterCount > 0 ? ' is-active' : ''}`}
-              onClick={() => setTagPanelOpen((v) => !v)}
-            >
-              筛选{activeFilterCount > 0 ? ` · ${activeFilterCount}` : ''}
-            </button>
-            {tagPanelOpen && (
-              <div className="kb-tag-panel">
-                <div className="kb-tag-panel-head">
-                  <strong>标签</strong>
-                  <button type="button" className="kb-link" onClick={() => setTagManagerOpen((v) => !v)}>
-                    {tagManagerOpen ? '完成' : '管理'}
+      {/* ── 右：文档区（源侧 .tag-content > .doc-card-area）──── */}
+      <div className="tag-content">
+      <div className="doc-card-area">
+        {/* 工具条 + 文件夹路径（源侧 .doc-filter-bar，KnowledgeBase.vue:2544）*/}
+        <div className="doc-filter-bar">
+          <nav className="doc-folder-path" aria-label="文件夹路径">
+            {treeCollapsed && (
+              <button
+                type="button"
+                className="doc-folder-path__tree-toggle"
+                onClick={() => setTreeCollapsed(false)}
+                title="展开文件夹"
+                aria-label="展开文件夹"
+              >
+                ☰
+              </button>
+            )}
+            {crumbs.length === 0 ? (
+              <span className="doc-folder-path__crumb is-current" title={baseName} aria-current="page">
+                {baseName ?? '全部文档'}
+              </span>
+            ) : (
+              <button type="button" className="doc-folder-path__crumb" title={baseName} onClick={() => setFolderPath('')}>
+                {baseName ?? '全部文档'}
+              </button>
+            )}
+            {crumbs.map((c, i) => (
+              <span key={c.path} style={{ display: 'contents' }}>
+                <span className="doc-folder-path__sep" aria-hidden="true">›</span>
+                {i === crumbs.length - 1 ? (
+                  <span className="doc-folder-path__crumb is-current" title={c.name} aria-current="page">{c.name}</span>
+                ) : (
+                  <button type="button" className="doc-folder-path__crumb" title={c.name} onClick={() => setFolderPath(c.path)}>
+                    {c.name}
                   </button>
-                </div>
-                <div className="kb-tag-panel-list">
-                  {tags.length === 0 && <span className="kb-tag-empty">还没有标签</span>}
-                  {tags.map((t) => (
-                    <label key={t.id} className="kb-tag-check">
-                      <input
-                        type="checkbox"
-                        checked={selectedTagIds.includes(t.id)}
-                        onChange={() =>
-                          setSelectedTagIds((prev) =>
-                            prev.includes(t.id) ? prev.filter((x) => x !== t.id) : [...prev, t.id]
-                          )
-                        }
-                      />
-                      <span className="kb-tag-dot" style={{ background: t.color || '#94a3b8' }} />
-                      <span className="kb-tag-name">{t.name}</span>
-                      <span className="kb-tag-count">{t.knowledge_count ?? 0}</span>
-                      {tagManagerOpen && (
-                        <button
-                          type="button"
-                          className="kb-link danger"
-                          onClick={(e) => { e.preventDefault(); void handleDeleteTag(t) }}
-                        >
-                          删除
-                        </button>
-                      )}
-                    </label>
-                  ))}
-                </div>
-                {tagManagerOpen && (
-                  <div className="kb-tag-create">
-                    <input
-                      className="kb-input"
-                      placeholder="新标签名"
-                      value={newTagName}
-                      onChange={(e) => setNewTagName(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') void handleCreateTag() }}
-                    />
-                    <button type="button" className="kb-btn primary" onClick={() => void handleCreateTag()}>
-                      新建
+                )}
+              </span>
+            ))}
+            <span className="doc-folder-path__count">
+              {filtering ? `筛出 ${visibleItems.length}` : `${total} 个文档`}
+            </span>
+            {!treeCollapsed && folders.length > 0 && (
+              <button
+                type="button"
+                className="doc-folder-path__tree-toggle"
+                onClick={() => setTreeCollapsed(true)}
+                title="收起文件夹"
+                aria-label="收起文件夹"
+              >
+                ‹
+              </button>
+            )}
+          </nav>
+
+          {/* 右侧动作区（源侧 .doc-filter-bar__trailing；搜索框在 trailing 里面）*/}
+          <div className="doc-filter-bar__trailing">
+            {/* 搜索（源侧 t-input：.doc-search-input 挂在外层 wrap 上）*/}
+            <div className="t-input__wrap doc-search-input">
+              <div className="t-input t-input--prefix">
+                <span className="t-input__prefix t-input__prefix-icon" aria-hidden="true">⌕</span>
+                <input
+                  className="t-input__inner"
+                  placeholder="搜索文档…"
+                  aria-label="搜索文档"
+                  value={keyword}
+                  onChange={(e) => setKeyword(e.target.value)}
+                />
+              </div>
+            </div>
+
+            <div style={{ position: 'relative', flexShrink: 0 }}>
+              <button
+                type="button"
+                className={`doc-filter-toggle${tagPanelOpen || activeFilterCount > 0 ? ' active' : ''}`}
+                aria-expanded={tagPanelOpen}
+                onClick={() => setTagPanelOpen((v) => !v)}
+              >
+                筛选
+                {activeFilterCount > 0 && <span className="doc-filter-count">{activeFilterCount}</span>}
+              </button>
+
+              {/* 筛选面板（源侧 .doc-filter-panel，KnowledgeBase.vue:2587；
+                  源站由 t-popup 定位，这里用锚定容器 + 内联定位等价实现）*/}
+              {tagPanelOpen && (
+                <div className="doc-filter-panel" style={{ position: 'absolute', top: 'calc(100% + 6px)', right: 0, zIndex: 20 }}>
+                  <div className="doc-filter-panel__header">
+                    <strong>筛选</strong>
+                    <button
+                      type="button"
+                      disabled={activeFilterCount === 0}
+                      onClick={() => { setStatusFilter(''); setTypeFilter(''); setSelectedTagIds([]) }}
+                    >
+                      清空
                     </button>
                   </div>
-                )}
-                {activeFilterCount > 0 && (
-                  <button
-                    type="button"
-                    className="kb-btn ghost"
-                    onClick={() => { setStatusFilter(''); setTypeFilter(''); setSelectedTagIds([]) }}
-                  >
-                    清空筛选
-                  </button>
-                )}
-              </div>
-            )}
-          </div>
+                  <div className="doc-filter-panel__fields">
+                    <div className="doc-filter-field">
+                      <span>解析状态</span>
+                      <select
+                        className="t-input"
+                        value={statusFilter}
+                        onChange={(e) => setStatusFilter(e.target.value)}
+                        aria-label="按状态筛选"
+                      >
+                        <option value="">全部状态</option>
+                        <option value="pending">排队中</option>
+                        <option value="processing">解析中</option>
+                        <option value="completed">已完成</option>
+                        <option value="failed">失败</option>
+                        <option value="cancelled">已取消</option>
+                      </select>
+                    </div>
+                    <div className="doc-filter-field">
+                      <span>文件类型</span>
+                      <select
+                        className="t-input"
+                        value={typeFilter}
+                        onChange={(e) => setTypeFilter(e.target.value)}
+                        aria-label="按类型筛选"
+                      >
+                        <option value="">全部类型</option>
+                        {['pdf', 'docx', 'doc', 'xlsx', 'xls', 'pptx', 'md', 'txt', 'csv'].map((t) => (
+                          <option key={t} value={t}>{fileMeta(t).label}</option>
+                        ))}
+                      </select>
+                    </div>
+                  </div>
 
-          <div className="kb-view-toggle" role="group" aria-label="视图模式">
-            <button
-              type="button"
-              className={`kb-icon-btn${viewMode === 'list' ? ' is-active' : ''}`}
-              onClick={() => setViewMode('list')}
-              title="列表"
-              aria-pressed={viewMode === 'list'}
-            >
-              ☰
-            </button>
-            <button
-              type="button"
-              className={`kb-icon-btn${viewMode === 'grid' ? ' is-active' : ''}`}
-              onClick={() => setViewMode('grid')}
-              title="网格"
-              aria-pressed={viewMode === 'grid'}
-            >
-              ▦
-            </button>
-          </div>
-
-          <button
-            type="button"
-            className={`kb-btn ghost${batchMode ? ' is-active' : ''}`}
-            onClick={() => { setBatchMode((v) => !v); setSelectedIds(new Set()) }}
-            disabled={visibleItems.length === 0}
-          >
-            {batchMode ? '取消批量' : '批量管理'}
-          </button>
-          {/* ⭐ 四档来源（文件 / 文件夹 / URL / 手工）· 对齐源侧 KbUploadSourceDropdown */}
-          <KbUploadSource
-            baseId={baseId}
-            folderPath={folderPath}
-            showToast={showToast}
-            onDone={() => { void loadItems(); void loadFolders() }}
-          />
-        </div>
-
-        {/* 语义检索（搜文件内容，与标题搜索是两件事） */}
-        <div className="kb-searchbar">
-          <input
-            className="kb-input kb-semantic-input"
-            placeholder="在文档内容中检索…（回车执行）"
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            onKeyDown={(e) => { if (e.key === 'Enter') void runSearch() }}
-          />
-          <button
-            type="button"
-            className="kb-btn primary"
-            disabled={searching || !searchQuery.trim()}
-            onClick={() => void runSearch()}
-          >
-            {searching ? '检索中…' : '检索'}
-          </button>
-          {searchHits !== null && (
-            <button type="button" className="kb-btn ghost" onClick={() => setSearchHits(null)}>
-              清除结果
-            </button>
-          )}
-        </div>
-
-        {/* 批量操作条 */}
-        {batchMode && (
-          <div className="kb-batch-bar">
-            <span className="kb-batch-count">已选 {selectedIds.size} 个</span>
-            {tags.length > 0 && (
-              <select
-                className="kb-select"
-                value=""
-                onChange={(e) => { if (e.target.value) void handleBatchTag(e.target.value) }}
-                disabled={selectedIds.size === 0}
-                aria-label="批量打标签"
-              >
-                <option value="">打标签…</option>
-                {tags.map((t) => (
-                  <option key={t.id} value={t.id}>{t.name}</option>
-                ))}
-              </select>
-            )}
-            <button
-              type="button"
-              className="kb-btn ghost"
-              disabled={selectedIds.size === 0}
-              onClick={() => void handleBatchReparse()}
-            >
-              批量重解析
-            </button>
-            <button
-              type="button"
-              className="kb-btn ghost danger"
-              disabled={selectedIds.size === 0}
-              onClick={() => void handleBatchDelete()}
-            >
-              批量删除
-            </button>
-          </div>
-        )}
-
-        {error && <div className="kb-err">{error}</div>}
-
-        {/* 检索结果 */}
-        {searchHits !== null && (
-          <div className="kb-hits">
-            <div className="kb-hits-head">
-              检索结果 <span className="kb-hits-count">{searchHits.length}</span> 条
+                  {/* 标签筛选（源侧 .doc-filter-tags，KnowledgeBase.vue:2612）*/}
+                  <div className="doc-filter-tags">
+                    <div className="doc-filter-tags__heading">
+                      <span>
+                        标签
+                        {selectedTagIds.length > 0 && <span className="doc-filter-tags__count">{selectedTagIds.length}</span>}
+                      </span>
+                      <button type="button" onClick={() => setTagManagerOpen((v) => !v)}>
+                        {tagManagerOpen ? '完成' : '管理'}
+                      </button>
+                    </div>
+                    <div className="doc-filter-tags__list">
+                      {tags.length === 0 && <span className="doc-filter-tags__empty">还没有标签</span>}
+                      {tags.map((t) => (
+                        <label key={t.id} className="doc-filter-tag">
+                          <input
+                            type="checkbox"
+                            checked={selectedTagIds.includes(t.id)}
+                            onChange={() =>
+                              setSelectedTagIds((prev) =>
+                                prev.includes(t.id) ? prev.filter((x) => x !== t.id) : [...prev, t.id]
+                              )
+                            }
+                          />
+                          <span style={{ display: 'inline-block', width: 8, height: 8, borderRadius: '50%', flex: 'none', background: t.color || '#94a3b8' }} />
+                          <span>{t.name}</span>
+                          <span className="doc-filter-tags__count">{t.knowledge_count ?? 0}</span>
+                          {tagManagerOpen && (
+                            <button
+                              type="button"
+                              className="popup-menu-item danger"
+                              onClick={(e) => { e.preventDefault(); void handleDeleteTag(t) }}
+                            >
+                              删除
+                            </button>
+                          )}
+                        </label>
+                      ))}
+                    </div>
+                    {tagManagerOpen && (
+                      <div className="doc-filter-field" style={{ marginTop: 8 }}>
+                        <span>新建</span>
+                        <div style={{ display: 'flex', gap: 6, minWidth: 0 }}>
+                          <input
+                            className="t-input"
+                            placeholder="新标签名"
+                            value={newTagName}
+                            onChange={(e) => setNewTagName(e.target.value)}
+                            onKeyDown={(e) => { if (e.key === 'Enter') void handleCreateTag() }}
+                          />
+                          <button type="button" className="doc-filter-toggle" onClick={() => void handleCreateTag()}>
+                            新建
+                          </button>
+                        </div>
+                      </div>
+                    )}
+                  </div>
+                </div>
+              )}
             </div>
-            {searchHits.length === 0 && (
-              <div className="kb-empty-cards">
-                <div className="kb-empty-title">没有匹配的片段</div>
-                <div className="kb-empty-sub">换个说法试试；文档需解析完成才可被检索</div>
-              </div>
+
+            <button
+              type="button"
+              className={`doc-filter-toggle${batchMode ? ' active' : ''}`}
+              onClick={() => { setBatchMode((v) => !v); setSelectedIds(new Set()) }}
+              disabled={visibleItems.length === 0}
+            >
+              {batchMode ? '取消' : '批量管理'}
+            </button>
+
+            <div className="doc-view-toggle" role="group" aria-label="视图模式">
+              <button
+                type="button"
+                className={`doc-view-toggle-btn${viewMode === 'grid' ? ' active' : ''}`}
+                onClick={() => setViewMode('grid')}
+                title="网格"
+                aria-label="网格"
+                aria-pressed={viewMode === 'grid'}
+              >
+                ▦
+              </button>
+              <button
+                type="button"
+                className={`doc-view-toggle-btn${viewMode === 'list' ? ' active' : ''}`}
+                onClick={() => setViewMode('list')}
+                title="列表"
+                aria-label="列表"
+                aria-pressed={viewMode === 'list'}
+              >
+                ☰
+              </button>
+            </div>
+
+            <div className="doc-filter-actions">
+              {/* ⭐ 四档来源（文件 / 文件夹 / URL / 手工）· 对齐源侧 KbUploadSourceDropdown */}
+              <KbUploadSource
+                baseId={baseId}
+                folderPath={folderPath}
+                showToast={showToast}
+                onDone={() => { void loadItems(); void loadFolders() }}
+              />
+            </div>
+          </div>
+        </div>
+
+        {/* 语义检索（搜文件内容，与标题搜索是两件事）
+            ⚠️ 本仓特有：源站文档页没有 hybrid-search 入口 ⇒ 无真类名可抄。
+            沿用本仓既有 `.kb-searchbar` 钩子（已被守卫测试锁定），
+            内部控件改为源站 t-input / t-button 真类名。 */}
+        <div className="doc-filter-bar kb-searchbar" style={{ paddingTop: 12 }}>
+          <div className="t-input__wrap doc-search-input" style={{ marginLeft: 0, width: 320 }}>
+            <div className="t-input t-input--prefix">
+              <span className="t-input__prefix t-input__prefix-icon" aria-hidden="true">⌕</span>
+              <input
+                className="t-input__inner"
+                placeholder="在文档内容中检索…（回车执行）"
+                aria-label="在文档内容中检索"
+                value={searchQuery}
+                onChange={(e) => setSearchQuery(e.target.value)}
+                onKeyDown={(e) => { if (e.key === 'Enter') void runSearch() }}
+              />
+            </div>
+          </div>
+          <div className="doc-filter-bar__trailing">
+            <button
+              type="button"
+              className="t-button t-button--variant-base t-button--theme-primary t-size-s"
+              disabled={searching || !searchQuery.trim()}
+              onClick={() => void runSearch()}
+            >
+              <span className="t-button__text">{searching ? '检索中…' : '检索'}</span>
+            </button>
+            {searchHits !== null && (
+              <button
+                type="button"
+                className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                onClick={() => setSearchHits(null)}
+              >
+                <span className="t-button__text">清除结果</span>
+              </button>
             )}
-            {searchHits.map((h) => (
-              <div className="kb-hit" key={h.id}>
-                <div className="kb-hit-head">
-                  <span className="kb-hit-title">{h.knowledge_title}</span>
-                  <span className={`kb-hit-badge is-${h.match_type}`}>
-                    {h.match_type === 'hybrid' ? '双路命中' : h.match_type === 'vector' ? '语义' : '关键词'}
-                  </span>
-                  <span className="kb-hit-score">{h.score.toFixed(3)}</span>
-                </div>
-                {h.context_header && <div className="kb-hit-header">{h.context_header}</div>}
-                <div className="kb-hit-body">{h.content}</div>
+          </div>
+        </div>
+
+        {/* 批量操作条（源侧 .doc-batch-bar / DocumentBatchBar.vue:45）*/}
+        {batchMode && (
+          <div className="doc-batch-bar">
+            <div className="batch-bar-inner">
+              <div className="batch-bar-left">
+                <span className="batch-bar-count">已选 {selectedIds.size} 个</span>
+                <button
+                  type="button"
+                  className="t-button t-button--variant-text t-button--theme-default t-size-s batch-bar-clear"
+                  onClick={() => setSelectedIds(new Set())}
+                >
+                  <span className="t-button__text">清空选择</span>
+                </button>
               </div>
-            ))}
+              <div className="batch-bar-actions">
+                {tags.length > 0 && (
+                  <select
+                    className="t-input"
+                    value=""
+                    onChange={(e) => { if (e.target.value) void handleBatchTag(e.target.value) }}
+                    disabled={selectedIds.size === 0}
+                    aria-label="批量打标签"
+                  >
+                    <option value="">打标签…</option>
+                    {tags.map((t) => (
+                      <option key={t.id} value={t.id}>{t.name}</option>
+                    ))}
+                  </select>
+                )}
+                <button
+                  type="button"
+                  className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                  disabled={selectedIds.size === 0}
+                  onClick={() => void handleBatchReparse()}
+                >
+                  <span className="t-button__text">批量重解析</span>
+                </button>
+                <button
+                  type="button"
+                  className="t-button t-button--variant-outline t-button--theme-danger t-size-s"
+                  disabled={selectedIds.size === 0}
+                  onClick={() => void handleBatchDelete()}
+                >
+                  <span className="t-button__text">批量删除</span>
+                </button>
+              </div>
+            </div>
           </div>
         )}
 
-        {/* 列表 / 网格 */}
-        {searchHits === null && (
-          <>
-            {!loading && visibleItems.length === 0 && (
-              <div className="kb-empty-cards">
-                <div className="kb-empty-title">
-                  {filtering ? '没有匹配的文档' : folderPath ? '这个文件夹还没有文档' : '这个知识库还没有文档'}
-                </div>
-                <div className="kb-empty-sub">
-                  {filtering
-                    ? '换个关键词或清空筛选试试'
-                    : '上传 pdf / word / excel / ppt / md / txt 等格式的文档，解析后即可检索'}
-                </div>
-                {!filtering && (
-                  <button type="button" className="kb-btn primary" onClick={onRequestUpload}>
-                    上传文档
-                  </button>
-                )}
+        {error && (
+          <div className="t-alert t-alert--error" role="alert">
+            <div className="t-alert__content">
+              <div>{error}</div>
+            </div>
+          </div>
+        )}
+
+        {/* 检索结果（源侧 .search-results，kb-orphan.css:950）*/}
+        {searchHits !== null && (
+          <div className="search-results">
+            <h3 className="doc-section-header">
+              <span>检索结果</span>
+              <span className="doc-section-count">{searchHits.length}</span>
+            </h3>
+            {searchHits.length === 0 && (
+              <div className="no_content">没有匹配的片段 —— 换个说法试试；文档需解析完成才可被检索</div>
+            )}
+            {searchHits.length > 0 && (
+              <div className="chunk-list">
+                {searchHits.map((h) => (
+                  <div className="chunk-item kb-hit" key={h.id}>
+                    <div className="chunk-header">
+                      <div className="chunk-heading">
+                        <span className="chunk-index">{h.knowledge_title}</span>
+                        <span className="chunk-meta">
+                          {h.match_type === 'hybrid' ? '双路命中' : h.match_type === 'vector' ? '语义' : '关键词'}
+                          {` · ${h.score.toFixed(3)}`}
+                        </span>
+                      </div>
+                    </div>
+                    {h.context_header && <div className="chunk-history-current">{h.context_header}</div>}
+                    <div className="md-content kb-hit-body" style={{ marginTop: 8 }}>{h.content}</div>
+                  </div>
+                ))}
               </div>
             )}
+          </div>
+        )}
 
-            {/* 子文件夹磁贴（源侧 doc-folder-tile） */}
-            {subFolders.length > 0 && !filtering && (
-              <div className="kb-folder-tiles">
-                {subFolders.map((f) => (
-                  <button
-                    key={f.path}
-                    type="button"
-                    className="kb-folder-tile"
-                    onClick={() => setFolderPath(f.path)}
-                    title={f.path}
-                  >
-                    <span className="kb-folder-tile-ic">📁</span>
-                    <span className="kb-folder-tile-name">{f.name}</span>
-                    <span className="kb-folder-tile-count">{f.document_count}</span>
-                  </button>
-                ))}
+        {/* 列表 / 网格（源侧 .doc-scroll-container 包住 DocumentListView / DocumentCardView）*/}
+        {searchHits === null && (
+          <div className="doc-scroll-container">
+            {!loading && visibleItems.length === 0 && (
+              <div className="doc-empty-state">
+                <div className="wk-empty-state">
+                  <div className="wk-empty-state__title">
+                    {filtering ? '没有匹配的文档' : folderPath ? '这个文件夹还没有文档' : '这个知识库还没有文档'}
+                  </div>
+                  <div className="wk-empty-state__desc">
+                    {filtering
+                      ? '换个关键词或清空筛选试试'
+                      : '上传 pdf / word / excel / ppt / md / txt 等格式的文档，解析后即可检索'}
+                  </div>
+                  {!filtering && (
+                    <div className="wk-empty-state__actions">
+                      <button
+                        type="button"
+                        className="t-button t-button--variant-base t-button--theme-primary"
+                        onClick={onRequestUpload}
+                      >
+                        <span className="t-button__text">上传文档</span>
+                      </button>
+                    </div>
+                  )}
+                </div>
               </div>
             )}
 
@@ -759,167 +1090,354 @@ export function KnowledgeDocPanel({
                 列名，看起来像「有表无数据」而不是「空库」。 */}
             {viewMode === 'list' ? (
               visibleItems.length > 0 && (
-              <div className="kb-doc-list">
-                <div className="kb-doc-row kb-doc-head">
+              <div className="doc-list-view">
+                <div className="doc-list-header" role="row">
                   {/* ⭐ 源侧勾选列恒显（24px，header 里就是 checkbox），
                       ⛔ 不是「批量模式才出现」—— 实测 5 列：24px | 名称 | 标签 | 状态 | 操作 */}
-                  <span className="kb-doc-check">
-                    <input
-                      type="checkbox"
-                      checked={allSelected}
-                      ref={(el) => { if (el) el.indeterminate = someSelected }}
-                      onChange={toggleSelectAll}
-                      aria-label="全选"
-                    />
-                  </span>
-                  <span className="kb-doc-name">名称</span>
-                  <span className="kb-doc-tags">标签</span>
-                  <span className="kb-doc-status">状态</span>
-                  <span className="kb-doc-ops">操作</span>
+                  <div className="cell cell-check" role="columnheader">
+                    <label className="doc-list-check">
+                      <input
+                        type="checkbox"
+                        checked={allSelected}
+                        ref={(el) => { if (el) el.indeterminate = someSelected }}
+                        onChange={toggleSelectAll}
+                        aria-label="全选"
+                      />
+                    </label>
+                  </div>
+                  <div className="cell cell-name" role="columnheader">名称</div>
+                  <div className="cell cell-tags" role="columnheader">标签</div>
+                  <div className="cell cell-status" role="columnheader">状态</div>
+                  <div className="cell cell-actions" role="columnheader"></div>
                 </div>
+                <div className="doc-list-body" role="rowgroup">
                 {visibleItems.map((row) => {
                   const tone = PARSE_STATUS_TONE[row.parse_status] ?? 'idle'
                   const inFlight = !['completed', 'failed', 'cancelled'].includes(row.parse_status)
                   const meta = fileMeta(row.file_type)
                   const rowTags = tagsFor(row, tags)
                   return (
-                    <div className="kb-doc-row" key={row.id}>
-                      <span className="kb-doc-check">
-                        <input
-                          type="checkbox"
-                          checked={selectedIds.has(row.id)}
-                          onChange={() => toggleSelect(row.id)}
-                          aria-label={`选择 ${row.title}`}
-                        />
-                      </span>
-                      <span className="kb-doc-name" title={row.title}>
-                        <span className="kb-doc-ic">{meta.mark}</span>
+                    <div
+                      className={`doc-list-row${selectedIds.has(row.id) ? ' selected' : ''}`}
+                      style={{
+                        ...(selectedIds.has(row.id)
+                          ? { background: 'color-mix(in srgb, var(--td-text-color-primary) 4%, var(--td-bg-color-container))' }
+                          : {}),
+                        // ⭐ 整行可点开抽屉（源侧行为）⇒ 给手型光标，否则用户以为只有文件名能点
+                        cursor: 'pointer',
+                      }}
+                      key={row.id}
+                      data-select-id={row.id}
+                      role="row"
+                      onClick={(e) => openDrawerFromRow(e, row)}
+                    >
+                      <div className="cell cell-check" role="cell">
+                        <label className="doc-list-check">
+                          <input
+                            type="checkbox"
+                            checked={selectedIds.has(row.id)}
+                            onChange={() => toggleSelect(row.id)}
+                            aria-label={`选择 ${row.title}`}
+                          />
+                        </label>
+                      </div>
+                      <div className="cell cell-name" role="cell">
+                        <span className="row-file-icon-wrap">{meta.mark}</span>
                         {/* 源侧 .row-file-text：文件名 + meta 两行。
                             ⭐ 文件名可点 → 打开右侧详情抽屉（源侧点行即开抽屉）。 */}
-                        <span className="kb-doc-name-body">
-                          <button
-                            type="button"
-                            className="kb-doc-name-text kb-doc-name-link"
-                            onClick={() => setDrawerDoc(row)}
-                          >
-                            {row.title || row.file_name || row.id}
-                          </button>
-                          <span className="kb-doc-meta">
-                            {meta.label} · {formatSize(row.file_size)}
-                            {filtering && row.folder_path && (
-                              <span className="kb-doc-folder-hint">· {row.folder_path}</span>
-                            )}
+                        <div className="row-file-text">
+                          <div className="row-title-line">
+                            <button
+                              type="button"
+                              className="row-file-name"
+                              title={row.title}
+                              onClick={() => setDrawerDoc(row)}
+                            >
+                              {row.title || row.file_name || row.id}
+                            </button>
+                          </div>
+                          <span className="row-file-meta">
+                            <span className="row-source">{meta.label}</span>
+                            <span className="meta-sep" aria-hidden="true">·</span>
+                            <span>{formatSize(row.file_size)}</span>
                           </span>
+                          {filtering && row.folder_path && (
+                            <button
+                              type="button"
+                              className="row-file-folder"
+                              title={row.folder_path}
+                              onClick={() => setFolderPath(row.folder_path ?? '')}
+                            >
+                              <span>📁</span>
+                              <span>{row.folder_path}</span>
+                            </button>
+                          )}
+                        </div>
+                      </div>
+                      <div className="cell cell-tags" role="cell">
+                        <div className="row-tag-trigger">
+                          {rowTags.length === 0 ? (
+                            <span className="row-muted">—</span>
+                          ) : (
+                            <div className="row-tags">
+                              {rowTags.slice(0, 5).map((t) => (
+                                <span key={t.id} className="row-tag" title={t.name}>{t.name}</span>
+                              ))}
+                              {rowTags.length > 5 && (
+                                <span
+                                  className="row-tag row-tag--overflow"
+                                  title={rowTags.slice(5).map((t) => t.name).join(', ')}
+                                >
+                                  +{rowTags.length - 5}
+                                </span>
+                              )}
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                      <div className="cell cell-status" role="cell">
+                        <span
+                          className={`row-status-tag ${tone === 'ok' ? 'status-success' : tone === 'error' ? 'status-danger' : tone === 'running' ? 'status-primary' : 'status-default'}`}
+                          title={row.error_message ?? undefined}
+                        >
+                          {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
+                          {row.parse_status === 'completed' && row.enable_status !== 'enabled' && (
+                            <em className="row-muted">（索引未就绪）</em>
+                          )}
                         </span>
-                      </span>
-                      <span className="kb-doc-tags">
-                        {rowTags.length === 0 && <span className="kb-doc-tags-empty">—</span>}
-                        {rowTags.map((t) => (
-                          <span
-                            key={t.id}
-                            className="kb-tag-chip"
-                            style={{ borderColor: t.color || undefined }}
+                      </div>
+                      {/* ⭐ 末列只 28px ⇒ 只能放一个 ⋯（放文字按钮会把列挤成竖排）*/}
+                      <div className="cell cell-actions" role="cell">
+                        {/* 源站用 t-popup 承载动作菜单；本仓用受控 open（受控才能「点菜单项后
+                            立即关闭」—— `<details>` 的 open 不受控，弹层打开时菜单会留在原地） */}
+                        <details open={menuOpenId === row.id} style={{ position: 'relative' }}>
+                          <summary
+                            className="row-more-btn"
+                            title="更多操作"
+                            aria-label={`${row.title} · 更多操作`}
+                            style={{ listStyle: 'none' }}
+                            onClick={(e) => {
+                              // ⚠️ 阻止冒泡：否则整行 onClick 会顺手把抽屉打开（菜单被盖住）
+                              e.preventDefault()
+                              e.stopPropagation()
+                              setMenuOpenId((cur) => (cur === row.id ? null : row.id))
+                            }}
                           >
-                            <i className="kb-tag-dot" style={{ background: t.color || '#94a3b8' }} />
-                            {t.name}
-                          </span>
-                        ))}
-                      </span>
-                      <span className={`kb-doc-status tone-${tone}`} title={row.error_message ?? undefined}>
-                        <i className="kb-dot" />
-                        {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
-                        {row.parse_status === 'completed' && row.enable_status !== 'enabled' && (
-                          <em className="kb-hint">（索引未就绪）</em>
-                        )}
-                      </span>
-                      <span className="kb-doc-ops">
-                        {inFlight ? (
-                          <button type="button" className="kb-link" onClick={() => void handleCancel(row)}>
-                            取消
-                          </button>
-                        ) : (
-                          <button type="button" className="kb-link" onClick={() => void handleReparse(row)}>
-                            重解析
-                          </button>
-                        )}
-                        <button type="button" className="kb-link" onClick={() => void handleMove(row)}>
-                          移动
-                        </button>
-                        <a className="kb-link" href={knowledgeApi.downloadUrl(row.id)} download>
-                          下载
-                        </a>
-                        <button type="button" className="kb-link danger" onClick={() => void handleDelete(row)}>
-                          删除
-                        </button>
-                      </span>
+                            ⋯
+                          </summary>
+                          <div
+                            className="card-menu"
+                            style={{
+                              position: 'absolute', right: 0, top: 'calc(100% + 4px)', zIndex: 30,
+                              minWidth: 148, padding: 4, borderRadius: 10,
+                              background: 'var(--td-bg-color-container)',
+                              border: '0.5px solid var(--td-component-stroke)',
+                              boxShadow: '0 2px 4px #0000000a, 0 6px 20px #00000014',
+                            }}
+                            role="menu"
+                          >
+                            {/* ⚠️ 用 <div> 不是 <button> —— 源码 DocumentActionMenu.vue 全部是
+                                `<div class="doc-action-menu-item" @click.stop>`。
+                                CSS 里没有 `border:0/background:none`（因为 div 本来就不需要），
+                                换成 button 会让浏览器默认样式（2px outset 灰框 + buttonface 底）
+                                直接暴露 ⇒ 截图里那种「很原始」的样子。 */}
+                            <div
+                              className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                              onClick={() => { openRowTags(row); setMenuOpenId(null) }}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { openRowTags(row); setMenuOpenId(null) } }}
+                            >
+                              <MenuIcon name="edit" /><span>编辑标签</span>
+                            </div>
+                            <a
+                              className="doc-action-menu-item" role="menuitem"
+                              href={knowledgeApi.downloadUrl(row.id)} download
+                              onClick={() => setMenuOpenId(null)}
+                            >
+                              <MenuIcon name="download" /><span>下载</span>
+                            </a>
+                            <div
+                              className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                              onClick={() => { setMenuOpenId(null); void openTrace(row) }}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { setMenuOpenId(null); void openTrace(row) } }}
+                            >
+                              <MenuIcon name="chart-bar" /><span>查看 Trace</span>
+                            </div>
+                            {inFlight ? (
+                              <div
+                                className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                                onClick={() => { void handleCancel(row); setMenuOpenId(null) }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { void handleCancel(row); setMenuOpenId(null) } }}
+                              >
+                                <MenuIcon name="close-circle" /><span>停止解析</span>
+                              </div>
+                            ) : (
+                              <div
+                                className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                                onClick={() => { void handleReparse(row); setMenuOpenId(null) }}
+                                onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { void handleReparse(row); setMenuOpenId(null) } }}
+                              >
+                                <MenuIcon name="refresh" /><span>重建知识</span>
+                              </div>
+                            )}
+                            <div
+                              className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                              onClick={() => { void handleMove(row); setMenuOpenId(null) }}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { void handleMove(row); setMenuOpenId(null) } }}
+                            >
+                              <MenuIcon name="folder" /><span>移动到目录</span>
+                            </div>
+                            <div
+                              className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                              onClick={() => { setMenuOpenId(null); void openMoveTargets(row) }}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { setMenuOpenId(null); void openMoveTargets(row) } }}
+                            >
+                              <MenuIcon name="swap" /><span>移动到...</span>
+                            </div>
+                            <div
+                              className="doc-action-menu-item" role="menuitem" tabIndex={0}
+                              onClick={() => {
+                                setMenuOpenId(null)
+                                // 已在批量模式 ⇒ 菜单项语义变为「退出批量管理」
+                                setBatchMode((v) => !v)
+                                setSelectedIds(new Set())
+                              }}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  setMenuOpenId(null); setBatchMode((v) => !v); setSelectedIds(new Set())
+                                }
+                              }}
+                            >
+                              <MenuIcon name="queue" />
+                              <span>{batchMode ? '退出批量管理' : '批量管理'}</span>
+                            </div>
+                            {/* 源侧在「批量管理」与「删除文档」之间有一条分隔线 */}
+                            <div
+                              style={{
+                                height: 1,
+                                background: 'var(--td-component-stroke)',
+                                margin: '4px 0',
+                              }}
+                              aria-hidden="true"
+                            />
+                            <div
+                              className="doc-action-menu-item danger" role="menuitem" tabIndex={0}
+                              onClick={() => { void handleDelete(row); setMenuOpenId(null) }}
+                              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { void handleDelete(row); setMenuOpenId(null) } }}
+                            >
+                              <MenuIcon name="delete" /><span>删除文档</span>
+                            </div>
+                          </div>
+                        </details>
+                      </div>
                     </div>
                   )
                 })}
+                </div>
               </div>
               )
             ) : (
-              <div className="kb-doc-grid">
+              /* 卡片视图（源侧 DocumentCardView.vue:337-625）*/
+              <div className="doc-card-view">
+                <div className="doc-card-list doc-card-list-animated">
                 {visibleItems.map((row) => {
                   const tone = PARSE_STATUS_TONE[row.parse_status] ?? 'idle'
                   const meta = fileMeta(row.file_type)
                   const rowTags = tagsFor(row, tags)
                   return (
-                    <div className={`kb-doc-card${selectedIds.has(row.id) ? ' is-selected' : ''}`} key={row.id}>
-                      {batchMode && (
-                        <input
-                          className="kb-doc-card-check"
-                          type="checkbox"
-                          checked={selectedIds.has(row.id)}
-                          onChange={() => toggleSelect(row.id)}
-                          aria-label={`选择 ${row.title}`}
-                        />
-                      )}
-                      <div className="kb-doc-card-head">
-                        <span className="kb-doc-card-ic">{meta.mark}</span>
-                        <button
-                          type="button"
-                          className="kb-doc-card-title kb-doc-name-link"
-                          title={row.title}
-                          onClick={() => setDrawerDoc(row)}
-                        >
-                          {row.title || row.file_name || row.id}
-                        </button>
+                    <div
+                      className={`knowledge-card${selectedIds.has(row.id) ? ' is-selected' : ''}`}
+                      style={{
+                        ...(selectedIds.has(row.id)
+                          ? { background: 'color-mix(in srgb, var(--td-text-color-primary) 4%, var(--td-bg-color-container))' }
+                          : {}),
+                        // ⭐ 整卡可点开抽屉（与列表视图同一行为）
+                        cursor: 'pointer',
+                      }}
+                      key={row.id}
+                      data-select-id={row.id}
+                      onClick={(e) => openDrawerFromRow(e, row)}
+                    >
+                      <div className="card-content">
+                        <div className="card-content-nav">
+                          <div className="card-file-icon" title={`${meta.label} · ${formatSize(row.file_size)}`}>
+                            <span style={{ fontSize: 20, lineHeight: 1 }}>{meta.mark}</span>
+                          </div>
+                          <button
+                            type="button"
+                            className="card-content-title"
+                            title={row.title}
+                            onClick={() => setDrawerDoc(row)}
+                          >
+                            {row.title || row.file_name || row.id}
+                          </button>
+                          {batchMode && (
+                            <div className="card-nav-check">
+                              <label className="card-select-checkbox doc-list-check">
+                                <input
+                                  type="checkbox"
+                                  checked={selectedIds.has(row.id)}
+                                  onChange={() => toggleSelect(row.id)}
+                                  aria-label={`选择 ${row.title}`}
+                                />
+                              </label>
+                            </div>
+                          )}
+                        </div>
+                        <div className="card-preview">
+                          {!['completed', 'failed', 'cancelled'].includes(row.parse_status) ? (
+                            <div className="card-analyze">
+                              <span className={`row-status-tag ${tone === 'running' ? 'status-primary' : 'status-default'}`}>
+                                {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
+                              </span>
+                            </div>
+                          ) : row.parse_status === 'failed' ? (
+                            <div className="card-analyze" title={row.error_message ?? undefined}>
+                              <span className={`row-status-tag ${tone === 'error' ? 'status-danger' : 'status-default'}`}>
+                                {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
+                              </span>
+                            </div>
+                          ) : row.parse_status === 'cancelled' ? (
+                            <div className="card-analyze" style={{ color: 'var(--td-text-color-placeholder)' }}>
+                              {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
+                            </div>
+                          ) : (
+                            <div className="card-content-txt is-empty">
+                              {row.description || '暂无文档摘要'}
+                            </div>
+                          )}
+                        </div>
                       </div>
-                      <div className="kb-doc-card-tags">
-                        {rowTags.map((t) => (
-                          <span key={t.id} className="kb-tag-chip">
-                            <i className="kb-tag-dot" style={{ background: t.color || '#94a3b8' }} />
-                            {t.name}
-                          </span>
-                        ))}
-                      </div>
-                      <div className="kb-doc-card-foot">
-                        <span className={`kb-doc-status tone-${tone}`}>
-                          <i className="kb-dot" />
-                          {PARSE_STATUS_LABEL[row.parse_status] ?? row.parse_status}
-                        </span>
-                        <span className="kb-doc-card-size">{formatSize(row.file_size)}</span>
-                      </div>
-                      <div className="kb-doc-card-ops">
-                        <button type="button" className="kb-link" onClick={() => void handleReparse(row)}>
-                          重解析
-                        </button>
-                        <button type="button" className="kb-link" onClick={() => void handleMove(row)}>
-                          移动
-                        </button>
-                        <button type="button" className="kb-link danger" onClick={() => void handleDelete(row)}>
-                          删除
-                        </button>
+                      <div className="card-bottom">
+                        <div className="card-tags">
+                          {rowTags.length > 0 ? (
+                            <>
+                              <span className="card-tag-chip" title={rowTags[0].name}>{rowTags[0].name}</span>
+                              {rowTags.length > 1 && (
+                                <span
+                                  className="card-tag-overflow"
+                                  title={rowTags.slice(1).map((t) => t.name).join('、')}
+                                >
+                                  +{rowTags.length - 1}
+                                </span>
+                              )}
+                            </>
+                          ) : (
+                            <span className="row-muted">—</span>
+                          )}
+                        </div>
+                        <span className="card-time">{formatSize(row.file_size)}</span>
                       </div>
                     </div>
                   )
                 })}
+                </div>
               </div>
             )}
 
-            {hasInFlight && <div className="kb-polling">解析进行中 · 自动刷新…</div>}
-          </>
+            {hasInFlight && <div className="no_content">解析进行中 · 自动刷新…</div>}
+          </div>
         )}
+      </div>
       </div>
 
       {/* 文档详情抽屉（源侧 .doc-main-drawer） */}
@@ -930,62 +1448,377 @@ export function KnowledgeDocPanel({
           onClose={() => setDrawerDoc(null)}
         />
       )}
+
+      {/* ── ⋯ 菜单的三个弹层（Trace / 移动到… / 编辑标签）────────────── */}
+
+      {/* 1. 查看 Trace：后端 SpanTree。⚠️ 本仓 span = 分块，不是源侧的细粒度阶段 */}
+      {traceState && (
+        <PanelModal
+          title={`处理流水线 · ${traceState.row.title || traceState.row.file_name || traceState.row.id}`}
+          onClose={() => setTraceState(null)}
+        >
+          {traceState.loading && <p style={PANEL_HINT_STYLE}>正在加载处理记录…</p>}
+          {!traceState.loading && traceState.error && (
+            <p style={PANEL_ERROR_STYLE}>处理记录加载失败：{traceState.error}</p>
+          )}
+          {!traceState.loading && !traceState.error && traceState.data && (
+            <>
+              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
+                <span style={PANEL_META_STYLE}>状态：{traceState.data.parse_status || '—'}</span>
+                <span style={PANEL_META_STYLE}>分块数：{traceState.data.spans?.length ?? 0}</span>
+                <span style={PANEL_META_STYLE}>解析任务：{traceState.data.attempts?.length ?? 0} 次</span>
+              </div>
+              {(traceState.data.attempts?.length ?? 0) === 0 ? (
+                <p style={PANEL_HINT_STYLE}>该文档没有处理流水线记录</p>
+              ) : (
+                <ol style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                  {traceState.data.attempts.map((a, i) => (
+                    <li key={a.id ?? i} style={{ fontSize: 'var(--app-text-sm)' }}>
+                      <b>{taskTypeLabel(a.task_type)}</b>
+                      <span style={{ marginLeft: 6, color: 'var(--td-text-color-secondary)' }}>
+                        {taskStateLabel(a.state)}
+                      </span>
+                      <span style={PANEL_META_STYLE}> · 第 {a.attempt ?? 1} 次</span>
+                      <span style={PANEL_META_STYLE}>
+                        {' '}· {a.started_at || '—'} → {a.finished_at || '—'}
+                      </span>
+                      {a.error_message ? (
+                        <div style={{ ...PANEL_ERROR_STYLE, marginTop: 2 }}>{a.error_message}</div>
+                      ) : null}
+                    </li>
+                  ))}
+                </ol>
+              )}
+              <p style={PANEL_HINT_STYLE}>
+                本仓的流水线记录是「解析任务 + 分块」两级：任务表来自入库队列，
+                分块条目即解析产物。源站的 OCR / 版面 / 切分等细分阶段本仓未单独记录，
+                因此此处不展示那些阶段。
+              </p>
+            </>
+          )}
+        </PanelModal>
+      )}
+
+      {/* 2. 移动到…（跨知识库） */}
+      {moveTargetState && (
+        <PanelModal
+          title={`移动「${moveTargetState.row.title || moveTargetState.row.file_name || moveTargetState.row.id}」到…`}
+          onClose={() => { if (!moveTargetState.moving) setMoveTargetState(null) }}
+        >
+          {moveTargetState.loading && <p style={PANEL_HINT_STYLE}>正在加载目标知识库…</p>}
+          {!moveTargetState.loading && moveTargetState.error && (
+            <p style={PANEL_ERROR_STYLE}>目标知识库加载失败：{moveTargetState.error}</p>
+          )}
+          {!moveTargetState.loading && !moveTargetState.error && (
+            <>
+              {moveTargetState.targets.length === 0 ? (
+                <p style={PANEL_HINT_STYLE}>没有其它知识库可移入（需要先创建第二个知识库）</p>
+              ) : (
+                <ul style={{ listStyle: 'none', margin: 0, padding: 0, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                  {moveTargetState.targets.map((t) => (
+                    <li
+                      key={t.id}
+                      style={{
+                        display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+                        gap: 12, padding: '8px 10px',
+                        border: '1px solid var(--td-component-stroke)',
+                        borderRadius: 'var(--app-radius-sm)',
+                      }}
+                    >
+                      <div style={{ minWidth: 0 }}>
+                        <div style={{ fontSize: 'var(--app-text-base)', fontWeight: 600 }}>{t.name}</div>
+                        <div style={PANEL_META_STYLE}>
+                          {kbTypeLabel(t.type)} · 已有 {t.knowledge_count} 个文档
+                        </div>
+                      </div>
+                      <button
+                        type="button"
+                        className="doc-filter-toggle"
+                        disabled={moveTargetState.moving !== null}
+                        onClick={() => void doMoveToTarget(t.id)}
+                      >
+                        {moveTargetState.moving === t.id ? '移动中…' : '移到此处'}
+                      </button>
+                    </li>
+                  ))}
+                </ul>
+              )}
+              <p style={PANEL_HINT_STYLE}>
+                移动是<b>同步</b>完成的（本仓跨库移动不是异步任务）。⚠️ 目标知识库的切分/嵌入配置
+                可能与当前库不同，移动后如需按新配置重切，请手动「重建知识」。
+              </p>
+            </>
+          )}
+        </PanelModal>
+      )}
+
+      {/* 3. 编辑标签（单行） */}
+      {rowTagState && (
+        <PanelModal
+          title={`编辑标签 · ${rowTagState.row.title || rowTagState.row.file_name || rowTagState.row.id}`}
+          onClose={() => { if (!rowTagState.saving) setRowTagState(null) }}
+        >
+          {tags.length === 0 ? (
+            <p style={PANEL_HINT_STYLE}>本知识库还没有标签，请先在「筛选 → 管理」里创建</p>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {tags.map((t) => {
+                const checked = rowTagState.selected.includes(t.id)
+                return (
+                  <label
+                    key={t.id}
+                    style={{
+                      display: 'flex', alignItems: 'center', gap: 8,
+                      fontSize: 'var(--app-text-base)', cursor: 'pointer',
+                    }}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={checked}
+                      onChange={() =>
+                        setRowTagState((prev) => {
+                          if (!prev) return prev
+                          const next = checked
+                            ? prev.selected.filter((x) => x !== t.id)
+                            : [...prev.selected, t.id]
+                          return { ...prev, selected: next }
+                        })
+                      }
+                    />
+                    <span
+                      style={{
+                        display: 'inline-block', width: 8, height: 8, borderRadius: '50%',
+                        flex: 'none', background: t.color || '#94a3b8',
+                      }}
+                    />
+                    <span>{t.name}</span>
+                  </label>
+                )
+              })}
+            </div>
+          )}
+          {rowTagState.error && <p style={PANEL_ERROR_STYLE}>保存失败：{rowTagState.error}</p>}
+          <p style={PANEL_HINT_STYLE}>
+            标签是<b>整集合替换</b>语义：这里勾选的结果就是该文档最终的标签集合。
+          </p>
+          <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8, marginTop: 10 }}>
+            <button
+              type="button"
+              className="doc-filter-toggle"
+              disabled={rowTagState.saving}
+              onClick={() => setRowTagState(null)}
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              className="doc-filter-toggle"
+              disabled={rowTagState.saving || tags.length === 0}
+              onClick={() => void saveRowTags()}
+            >
+              {rowTagState.saving ? '保存中…' : '保存'}
+            </button>
+          </div>
+        </PanelModal>
+      )}
     </div>
   )
 }
 
-/** 递归渲染文件夹树。 */
+/**
+ * 文档列表页的弹层容器（内联样式，⛔ 不动全局 CSS）。
+ *
+ * <p>⚠️ 必须 `position: fixed` + 高 zIndex：文档列表在 `.kb-scene-panel` 里，
+ * 祖先带 `overflow:hidden`，用 absolute 会被裁掉。
+ */
+/**
+ * 文档行 ⋯ 菜单的图标（对齐源码 `DocumentActionMenu.vue` 的 `<t-icon name="x" />`）。
+ *
+ * <p><b>WHY 走 sprite 而不是内联 path</b>：源站用 tdesign 图标字体运行时，本仓没有。
+ * `IconSprite` 里已有同 path 的 symbol（数据取自官方包 tdesign-icons-vue-next@0.4.12），
+ * 这里只负责 `<use>` 引用 —— 图标数据只有一份，改的时候改 sprite 即可。
+ *
+ * <p>⚠️ 尺寸/颜色必须由 CSS 控：源码是 `.doc-action-menu-item .icon{font-size:var(--app-text-2xl);color:...}`，
+ * 而 `<svg>` 不认 font-size。⇒ 用 `width/height:1em` 继承父级 font-size，`stroke:currentColor` 继承 color。
+ * 这条规则已在 `styles/kb/kb-shared.css` 的 `.doc-action-menu-item .icon` 里覆盖（svg 也命中）。
+ */
+function MenuIcon({ name }: { name: string }) {
+  return (
+    <svg className="icon" width="1em" height="1em" aria-hidden="true">
+      <use href={`#t-icon-${name}`} />
+    </svg>
+  )
+}
+
+function PanelModal({
+  title,
+  onClose,
+  children,
+}: {
+  title: string
+  onClose: () => void
+  children: React.ReactNode
+}) {
+  /**
+   * Esc 只关本弹层。
+   *
+   * <p>⭐⭐ 必须**捕获阶段 + stopPropagation**：`App.tsx` 在 window 上也监听 Esc
+   * （非对话页按 Esc 会 `setWorkspacePage('chat')` 把整个知识库场景退掉）。
+   * 实测：不加这一段时，按一次 Esc 会连场景一起关，用户以为「弹层把页面弄崩了」。
+   */
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      e.preventDefault()
+      onClose()
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [onClose])
+
+  return createPortal(
+    <div className="kb-scope" style={{ display: 'contents' }}>
+      <div
+        role="presentation"
+        onClick={onClose}
+        style={{
+          position: 'fixed', inset: 0, zIndex: 1700,
+          background: 'rgba(0,0,0,0.45)',
+          display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 20,
+        }}
+      >
+        <div
+          role="dialog"
+          aria-modal="true"
+          aria-label={title}
+          onClick={(e) => e.stopPropagation()}
+          style={{
+            width: '100%', maxWidth: 560, maxHeight: 'calc(100vh - 40px)',
+            display: 'flex', flexDirection: 'column',
+            background: 'var(--td-bg-color-container, #fff)',
+            color: 'var(--td-text-color-primary, rgba(0,0,0,.9))',
+            borderRadius: 'var(--app-radius-lg, 10px)',
+            boxShadow: 'var(--td-shadow-3, 0 8px 30px rgba(0,0,0,.2))',
+            overflow: 'hidden',
+          }}
+        >
+          <div
+            style={{
+              display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+              gap: 12, padding: '12px 16px',
+              borderBottom: '1px solid var(--td-component-stroke, #e7e7e7)',
+              flexShrink: 0,
+            }}
+          >
+            <span style={{ fontSize: 'var(--app-text-xl, 16px)', fontWeight: 600 }}>{title}</span>
+            <button
+              type="button" onClick={onClose} title="关闭" aria-label="关闭"
+              style={{
+                border: 'none', background: 'transparent', cursor: 'pointer',
+                fontSize: 16, lineHeight: 1, padding: 4,
+                color: 'var(--td-text-color-secondary, rgba(0,0,0,.6))',
+              }}
+            >
+              ✕
+            </button>
+          </div>
+          <div style={{ padding: '14px 16px', overflow: 'auto', minHeight: 0 }}>{children}</div>
+        </div>
+      </div>
+    </div>,
+    document.body
+  )
+}
+
+const PANEL_META_STYLE = {
+  fontSize: 'var(--app-text-xs, 11px)',
+  color: 'var(--td-text-color-placeholder, rgba(0,0,0,.4))',
+}
+
+const PANEL_HINT_STYLE = {
+  margin: '10px 0 0',
+  fontSize: 'var(--app-text-xs, 11px)',
+  color: 'var(--td-text-color-placeholder, rgba(0,0,0,.4))',
+  lineHeight: 1.6,
+}
+
+const PANEL_ERROR_STYLE = {
+  margin: '8px 0 0',
+  fontSize: 'var(--app-text-sm, 12px)',
+  color: 'var(--td-error-color, #e34d59)',
+}
+
+/** 递归渲染文件夹树（源侧 KbFolderTree.vue:40-130 的行结构）。 */
 function FolderBranch({
   nodes,
   current,
   onSelect,
   onRename,
+  depth = 0,
 }: {
   nodes: KbFolderNode[]
   current: string
   onSelect: (path: string) => void
   onRename?: (node: KbFolderNode) => void
+  /** 缩进层级（源站 `--kb-folder-depth`，CSS 里上限 4 级）。 */
+  depth?: number
 }) {
   if (nodes.length === 0) return null
   return (
     <div className="kb-folder-branch">
-      {nodes.map((n) => (
-        <div key={n.path}>
-          <div className="kb-folder-row">
-            <button
-              type="button"
-              className={`kb-folder-item${current === n.path ? ' is-active' : ''}`}
-              onClick={() => onSelect(n.path)}
+      {nodes.map((n) => {
+        const hasChildren = (n.children?.length ?? 0) > 0
+        return (
+          <div key={n.path} style={{ position: 'relative' }}>
+            <div
+              className={`kb-folder-row${current === n.path ? ' active' : ''}${onRename ? ' is-editable' : ''}`}
+              style={current === n.path
+                ? {
+                    ['--kb-folder-depth' as string]: depth,
+                    background: 'color-mix(in srgb, var(--td-text-color-primary) 4%, var(--td-bg-color-container))',
+                  }
+                : { ['--kb-folder-depth' as string]: depth }}
+              role="button"
+              tabIndex={0}
               title={n.path}
+              onClick={() => onSelect(n.path)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') onSelect(n.path) }}
             >
-              <span className="kb-folder-ic">📁</span>
-              <span className="kb-folder-name">{n.name}</span>
-              <span className="kb-folder-count">{n.document_count}</span>
-            </button>
+              <span className="kb-folder-row__toggle-placeholder" aria-hidden="true">
+                {hasChildren ? '▾' : ''}
+              </span>
+              <span className="kb-folder-row__icon">📁</span>
+              <span className="kb-folder-row__label">{n.name}</span>
+              <span className="kb-folder-row__trailing">
+                <span className="kb-folder-row__count">{n.document_count}</span>
+              </span>
+            </div>
             {onRename && (
               <button
                 type="button"
-                className="kb-folder-rename"
-                onClick={() => onRename(n)}
+                className="kb-folder-row__more"
+                onClick={(e) => { e.stopPropagation(); onRename(n) }}
                 title="重命名 / 移动文件夹"
                 aria-label={`重命名 ${n.name}`}
               >
                 ✎
               </button>
             )}
+            {hasChildren && (
+              <div className="kb-folder-children">
+                <FolderBranch
+                  nodes={n.children}
+                  current={current}
+                  onSelect={onSelect}
+                  onRename={onRename}
+                  depth={depth + 1}
+                />
+              </div>
+            )}
           </div>
-          {n.children?.length > 0 && (
-            <div className="kb-folder-children">
-              <FolderBranch
-                nodes={n.children}
-                current={current}
-                onSelect={onSelect}
-                onRename={onRename}
-              />
-            </div>
-          )}
-        </div>
-      ))}
+        )
+      })}
     </div>
   )
 }

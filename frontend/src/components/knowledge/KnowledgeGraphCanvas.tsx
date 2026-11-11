@@ -498,9 +498,25 @@ export function KnowledgeGraphCanvas({
   const tooMany = nodes.length > MAX_NODES
 
   return (
-    <div className="kg-canvas-wrap" ref={wrapRef}>
+    /* DOM 照源站：.wiki-graph > .wiki-graph-canvas（SVG 挂载点）
+       + .graph-navigation-hint / .wiki-graph-legend / .wiki-graph-drawer */
+    <div
+      className="wiki-graph-canvas"
+      ref={wrapRef}
+      /* `.wiki-graph-canvas` 的尺寸规则在 .kb-scope 子树里；独立演示页
+         （#/knowledge-graph-demo，不在 .kb-scope 内）拿不到 ⇒ 行内补同一组值。
+         ⛔ 不加 position:relative —— 源站里这个 div 是无定位流内元素，
+         覆盖层（legend / 提示 / 截断提示）要对齐的是 **上一层** 的定位祖先
+         （面板里是 `.wiki-graph`，演示页是 `.kg-demo-stage`），
+         否则 canvas 被 min-height:500px 撑高时覆盖层会跟着跑到裁切区外。 */
+      style={{ width: '100%', height: '100%' }}
+    >
       <canvas
         ref={canvasRef}
+        /* `kg-canvas` 是 canvas 元素自身的渲染类（globals.css，**非** kb-scope 作用域，
+           演示页同样生效）：display/尺寸/cursor:grab/:active grabbing/touch-action
+           —— 与源站 `svg.style` 的 width/height 100% · cursor:grab · userSelect:none 等价。
+           派单允许保留（「SVG 本身，可保留下层」）。 */
         className="kg-canvas"
         onPointerDown={onPointerDown}
         onPointerMove={onPointerMove}
@@ -508,24 +524,102 @@ export function KnowledgeGraphCanvas({
         onPointerLeave={() => setHoverId(null)}
         onWheel={onWheel}
       />
-      {tooMany ? (
-        <div className="kg-overlay-note">节点 {nodes.length} 超过上限 {MAX_NODES}，已停止绘制</div>
-      ) : null}
-      <div className="kg-legend">
-        {(Object.keys(PALETTE) as GraphNodeType[]).map((t) => (
-          <span key={t} className="kg-legend-item">
-            <i style={{ background: `rgb(${PALETTE[t].join(',')})` }} />
-            {TYPE_LABELS[t]}
-          </span>
-        ))}
+
+      {/* 源站 WikiBrowser.vue:8 —— v-if="graphReady" 的常驻操作提示。
+          ⚠️ 行内补的是 `.graph-navigation-hint` 自己的定位声明（kb-04.css 逐字同值）：
+          该规则作用域在 `.kb-scope` 内，独立演示页（#/knowledge-graph-demo）拿不到，
+          不加兜底它会退化成流内块把画布挤小。主场景里行内与类规则一致，视觉不变。 */}
+      <div
+        className="graph-navigation-hint"
+        style={{ position: 'absolute', left: 20, bottom: 16, zIndex: 1 }}
+      >
+        拖拽空白处移动 · 滚轮缩放
       </div>
-      <div className="kg-tools">
-        <button type="button" onClick={() => zoomBy(1.18)} title="放大">+</button>
-        <button type="button" onClick={() => zoomBy(0.85)} title="缩小">−</button>
-        <button type="button" onClick={resetView} title="复位">复位</button>
+
+      {/* 源站 WikiBrowser.vue:73 —— .wiki-graph-legend，抽屉打开时加 .legend-shifted（right:496px）。
+          行内兜底同 `.wiki-graph-legend` / `.wiki-graph-legend.legend-shifted` 的声明（含独立演示页场景）。 */}
+      <div
+        className={`wiki-graph-legend${selectedId ? ' legend-shifted' : ''}`}
+        style={{
+          position: 'absolute',
+          top: 16,
+          right: selectedId ? 496 : 16,
+          zIndex: 10,
+          background: 'var(--td-bg-color-container, #fff)',
+          border: '1px solid var(--td-component-stroke, #e7e7e7)',
+          borderRadius: 'var(--app-radius-sm, 6px)',
+          padding: '10px 12px',
+          boxShadow: 'var(--td-shadow-1, 0 1px 10px rgba(0,0,0,.05))',
+        }}
+      >
+        <div className="legend-items">
+          {(Object.keys(PALETTE) as GraphNodeType[]).map((t) => (
+            <div key={t} className="legend-item">
+              <span
+                className="legend-dot"
+                style={{ background: `rgb(${PALETTE[t].join(',')})` }}
+              />
+              {TYPE_LABELS[t]}
+            </div>
+          ))}
+        </div>
+        <div className="legend-divider" />
+        {/* 源站 legend 的「适应屏幕 / 显示箭头」动作行；本仓对应「放大 / 缩小 / 复位」。
+            ⚠️ `.legend-action` 只声明了 display/gap/font-size/line-height/color/cursor，
+               没声明 border/background/padding/text-align/font-family ⇒ 这 5 项走行内复位
+               （原生 button 的 UA 样式），⛔ 不要写 `font: inherit`（会盖掉类里的 font-size）。 */}
+        <div className="legend-actions">
+          <button
+            type="button"
+            className="legend-action"
+            style={{ border: 0, background: 'transparent', padding: 0, textAlign: 'left', fontFamily: 'inherit' }}
+            onClick={() => zoomBy(1.18)}
+            title="放大"
+          >
+            <span className="legend-action-icon" aria-hidden="true">＋</span>
+            <span>放大</span>
+          </button>
+          <button
+            type="button"
+            className="legend-action"
+            style={{ border: 0, background: 'transparent', padding: 0, textAlign: 'left', fontFamily: 'inherit' }}
+            onClick={() => zoomBy(0.85)}
+            title="缩小"
+          >
+            <span className="legend-action-icon" aria-hidden="true">－</span>
+            <span>缩小</span>
+          </button>
+          <button
+            type="button"
+            className="legend-action"
+            style={{ border: 0, background: 'transparent', padding: 0, textAlign: 'left', fontFamily: 'inherit' }}
+            onClick={resetView}
+            title="复位视图（缩放 100% · 回到原点）"
+          >
+            <span className="legend-action-icon" aria-hidden="true">◍</span>
+            {/* ⚠️ 源站这条是「适应屏幕」（fitGraphToView 会算缩放比）。
+                本仓 resetView() 只把 zoom 复位成 1、pan 归零，**没有** fit-to-view 计算
+                ⇒ 文案写「复位」而不写「适应屏幕」，避免文案与行为不符（不改逻辑）。 */}
+            <span>复位</span>
+          </button>
+        </div>
+        {/* 源站同款截断提示类（.wiki-graph-truncation-hint，max-width 280 / 12px 灰字）。
+            源站把它放在这条竖向列里（flow 元素，不带定位）⇒ 这里同样放进 legend 列。 */}
+        {tooMany ? (
+          <div className="wiki-graph-truncation-hint">
+            节点 {nodes.length} 超过上限 {MAX_NODES}，已停止绘制
+          </div>
+        ) : null}
       </div>
+
+      {/* 节点详情抽屉：源站 <t-drawer class="wiki-graph-drawer" size="480px" placement="right"
+          :show-overlay="false" :close-btn="true">。覆盖层，不挤压画布（画布宽度不变）。
+          ⚠️ 源站 t-drawer 默认 attach:body ⇒ position:fixed（相对视口）。
+          本仓图谱挂在 `.kb-scene-panel` 弹窗里，fixed 会跑到弹窗外面，
+          ⇒ 用源站同款修饰类 `.t-drawer--attach`（kb-tdesign.css:3504 → position:absolute），
+          定位基准是上一层 `.wiki-graph`（position:relative）。详见报告第 11 项。 */}
       {selectedId ? (
-        <div className="kg-inspector">
+        <div className="t-drawer t-drawer--right t-drawer--open t-drawer--without-mask t-drawer--attach wiki-graph-drawer">
           {(() => {
             const node = nodes.find((n) => n.id === selectedId)
             if (!node) return null
@@ -533,11 +627,39 @@ export function KnowledgeGraphCanvas({
               (e) => e.sourceId === node.id || e.targetId === node.id,
             ).length
             return (
-              <>
-                <div className="kg-inspector-name">{node.name}</div>
-                <div className="kg-inspector-type">{TYPE_LABELS[node.type]}</div>
-                <div className="kg-inspector-meta">关联 {neighbors} 条</div>
-              </>
+              <div
+                className="t-drawer__content-wrapper t-drawer__content-wrapper--right"
+                style={{ width: 480, maxWidth: '100vw', transform: 'none' }}
+                role="dialog"
+                aria-label={`节点详情：${node.name}`}
+              >
+                <div className="t-drawer__header">{node.name}</div>
+                <button
+                  type="button"
+                  className="t-drawer__close-btn"
+                  title="关闭"
+                  aria-label="关闭"
+                  onClick={() => {
+                    setSelectedId(null)
+                    onSelect?.(null)
+                  }}
+                >
+                  ✕
+                </button>
+                <div className="t-drawer__body narrow-scrollbar">
+                  <div className="wiki-reader-meta">
+                    {/* 源站（WikiBrowser.vue:171）：
+                        <t-tag size="small" :theme="getTypeTheme(page_type)" variant="light-outline">
+                        ⚠️ theme 是按页面类型取色的（summary→primary / entity→success …），
+                        本仓节点分类是另一套 5 类，映射表属于逻辑 ⇒ 这里固定 primary，
+                        不假装按类型染色（见报告第 10 项）。 */}
+                    <span className="t-tag t-tag--primary t-tag--light-outline t-size-s">
+                      <span className="t-tag__text">{TYPE_LABELS[node.type]}</span>
+                    </span>
+                    <span className="wiki-reader-meta-text">关联 {neighbors} 条</span>
+                  </div>
+                </div>
+              </div>
             )
           })()}
         </div>

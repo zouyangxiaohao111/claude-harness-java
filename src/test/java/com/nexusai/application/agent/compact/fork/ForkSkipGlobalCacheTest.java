@@ -32,7 +32,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * [IMP-SP2-07 G1] fork 发送边界 needsToolBasedCacheMarker 等价物
  * （CC claude.ts:1212-1214 → claude.ts:1377 skipGlobalCacheForSystemPrompt 传参点）。
  *
- * <p><b>WHY 本测试存在（意图）</b>: ProductionForkedQuery:178 恒传 false 时，MCP 工具存在 +
+ * <p><b>WHY 本测试存在（意图）</b>: fork 发送边界恒传 false 时，MCP 工具存在 +
  * useGlobalCacheScope=true 仍走 boundary 模式 2 → 静态段带 GLOBAL cache_control —— fork 与主线程
  * 发送边界语义偏离 CC（MCP 工具 per-user 动态段不可 global cache，claude.ts:1210-1214 注释）。
  * Java 无 tool-search（willDefer 恒 false）→ Java 等价物 = gate && 发送工具集存在 MCP 工具。
@@ -41,7 +41,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * useGlobalCacheScope=true + querySource=COMPACT）+ fake LlmProvider 捕获 17-arg blocks stream
  * 的 arg(2)=blocks → run 后断言无 GLOBAL 块。
  */
-class ProductionForkedQuerySkipGlobalCacheTest {
+class ForkSkipGlobalCacheTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String BOUNDARY = SystemPromptAssembler.SYSTEM_PROMPT_DYNAMIC_BOUNDARY;
@@ -68,13 +68,10 @@ class ProductionForkedQuerySkipGlobalCacheTest {
             List.of(userMessage("u1", "question")),
             List.of("static-part", BOUNDARY, "dynamic-part"),
             Map.of(), Map.of(),
-            null, tuc,
+            allowAll(), tuc,
             QuerySource.COMPACT, null, 3, true, true, null);
 
-        ProductionForkedQuery query = new ProductionForkedQuery(
-            () -> provider, () -> "test-model",
-            () -> new ProviderConfig("https://api.anthropic.com", "sk-test"),
-            null, null);
+        QueryLoopForkedQuery query = forkQuery(provider);
 
         query.run(params);
 
@@ -99,13 +96,10 @@ class ProductionForkedQuerySkipGlobalCacheTest {
             List.of(userMessage("u1", "question")),
             List.of("static-part", BOUNDARY, "dynamic-part"),
             Map.of(), Map.of(),
-            null, tuc,
+            allowAll(), tuc,
             QuerySource.COMPACT, null, 3, true, true, null);
 
-        ProductionForkedQuery query = new ProductionForkedQuery(
-            () -> provider, () -> "test-model",
-            () -> new ProviderConfig("https://api.anthropic.com", "sk-test"),
-            null, null);
+        QueryLoopForkedQuery query = forkQuery(provider);
 
         query.run(params);
 
@@ -113,6 +107,41 @@ class ProductionForkedQuerySkipGlobalCacheTest {
         assertThat(capturedBlocks[0])
             .as("无 MCP 工具 → needsToolBasedCacheMarker=false → boundary 模式 2 保持（api.ts:368-397）")
             .anyMatch(b -> b.cacheScope() == CacheScope.GLOBAL);
+    }
+
+    /**
+     * 放行任意工具的 canUseTool。
+     *
+     * <p>主循环对后台 fork 来源（COMPACT 等）强制要求注入受限 canUseTool
+     * （{@code LlmAgentLoop.java:4393} INV-6 fail-loud）；本测试的关注点是
+     * cache marker 判定，权限维度取「全放行」以隔离变量。
+     */
+    private static com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool allowAll() {
+        return (tool, input, cctx, toolUseId, forceDecision) ->
+            com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow();
+    }
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。factory 只需 llmProviderFactory。 */
+    private static QueryLoopForkedQuery forkQuery(LlmProvider provider) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f =
+                com.nexusai.application.agent.loop.AgentLoopContextFactory.class.getDeclaredField("llmProviderFactory");
+            f.setAccessible(true);
+            f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "test-model",
+            () -> new ProviderConfig("https://api.anthropic.com", "sk-test"), factory);
     }
 
     // ════════════════════════════════════════════════════════════════════

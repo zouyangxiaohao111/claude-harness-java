@@ -4,7 +4,6 @@ import { ApiError } from '@/api/rest'
 import { createSocketClient, subscribeStream } from '@/api/socket'
 import { knowledgeApi } from '@/api/knowledge'
 import type { KbCitation, KnowledgeBase } from '@/api/knowledge'
-import { projectApi } from '@/api/projects'
 import { sessionApi } from '@/api/sessions'
 import type { StreamEvent, MessageChunkEvent, MessageCompleteEvent } from '@/api/types'
 
@@ -101,10 +100,26 @@ export function toggleScopeIds(prev: string[], id: string): string[] {
  * 后端阶段进度只写日志（`[问答链] ①…⑫`），**没有推 STOMP 阶段事件**。
  * 因此这里只显示客户端可观测的两种状态：「检索中」（POST 已受理、尚未收到首块）
  * 与「生成中」（已收到 `message.chunk`）。⛔ 不假装逐阶段进度。
+ *
+ * <h2>⚠️ 类名依据</h2>
+ * 结构取自设计稿 08（`.qa-wrap > .qa-main > .qa-scope / .qa-thread / .qa-compose`，
+ * 引用块 `.qa-sources > .src-item > .src-idx + .src-body > .src-title + .src-snip`）。
+ * 源站仓库里**没有知识库问答组件**（`grep -rl "qa-thread" D:/tmp/WeKnora/frontend/src` 0 命中，
+ * 中文「问答」只命中 agent 编辑器注释），`styles/kb/*.css` 里 `.qa-*` / `.src-*` / `.bubble`
+ * 同样是 0 条规则 ⇒ 这批类目前无样式。按派单要求仍落真类名、不自造 CSS；
+ * 只有最外层两条 flex 容器用行内兜底，避免绝对无布局。
  */
 export function KbQaPanel({ baseId, baseName, bases, showToast }: KbQaPanelProps) {
   const [scopeIds, setScopeIds] = useState<string[]>([baseId])
   const [question, setQuestion] = useState('')
+  /**
+   * 本次会话已提过的问题（设计稿 08 页右栏 `.qa-side-card > .qa-hist > .qa-hist-item`）。
+   * ⚠️ 只记录**真正发出去的提问**（点发送 / Ctrl+Enter 那一刻追加），不是输入框草稿 ——
+   * 否则用户边打字边改历史。
+   */
+  const [askedHistory, setAskedHistory] = useState<string[]>([])
+  /** 检索设置三开关（设计稿 08 右栏）。⚠️ 本仓后端 `askQa` 无对应参数 ⇒ 见下方注释。 */
+  const [qaOpts, setQaOpts] = useState({ hybrid: true, rerank: true, showCitations: true })
   const [answer, setAnswer] = useState('')
   const [citations, setCitations] = useState<KbCitation[]>([])
   const [webSources, setWebSources] = useState<WebSource[]>([])
@@ -189,19 +204,13 @@ export function KbQaPanel({ baseId, baseName, bases, showToast }: KbQaPanelProps
   /** 拿到本轮可用的 sessionId：优先复用本 panel 建的，否则新建一个专用会话。 */
   const ensureSession = useCallback(async (): Promise<string> => {
     if (sessionRef.current) return sessionRef.current
-    let mainProjectId = ''
-    try {
-      const projects = await projectApi.list()
-      mainProjectId = projects[0]?.id ?? ''
-    } catch {
-      /* 项目列表不可用 ⇒ 用空串（后端 DTO 只校验非空，空串会 400 ⇒ 下面给出可读提示） */
-    }
-    if (!mainProjectId) {
-      throw new Error('没有可用项目，无法创建知识库问答会话')
-    }
+    // 专用会话挂在「知识库工作区」项目下（服务端按 <安装目录>/workspace/kb →
+    // <配置根>/workspace/kb 降级解析并幂等注册）。⛔ 不要退回 projects[0]：
+    // 项目列表按 rowid 返回，随手拿到的是用户第一个注册的仓库。
+    const workspace = await knowledgeApi.workspaceProject()
     const created = await sessionApi.create({
       title: `知识库问答 · ${baseName ?? '当前库'}`,
-      mainProjectId,
+      mainProjectId: workspace.id,
     })
     sessionRef.current = created.id
     setSessionId(created.id)
@@ -221,6 +230,8 @@ export function KbQaPanel({ baseId, baseName, bases, showToast }: KbQaPanelProps
     setWebSources([])
     setErrorMsg(null)
     setPhase('retrieving')
+    // 记录到右栏「本次会话」历史（设计稿 08 页 `.qa-hist-item`）
+    setAskedHistory((prev) => (prev[prev.length - 1] === content ? prev : [...prev, content]))
     try {
       const sid = await ensureSession()
       await knowledgeApi.askQa(sid, {
@@ -270,110 +281,209 @@ export function KbQaPanel({ baseId, baseName, bases, showToast }: KbQaPanelProps
   const busy = phase === 'retrieving' || phase === 'generating'
 
   return (
-    <div className="kb-qa">
-      {/* 检索范围（跨库问答入口） */}
-      <div className="kb-qa-scope">
-        <span className="kb-qa-scope-label">检索范围：{scopeLabel}</span>
-        <div className="kb-qa-scope-list">
+    /* ⚠️ `.qa-*` / `.src-*` / `.bubble` / `.cite` 在 `styles/kb/*.css` 与 `globals.css` 中
+       **0 条规则**时靠 `.qa-wrap` 的纵向 flex 兜底 —— 现已由 `kb-08.css` 提供
+       （设计稿 08 页的内联 `<style>` 已被提取脚本并入），行内只留最外层 `flex:1`。 */
+    <div className="qa-wrap">
+      <div className="qa-main">
+        {/* 检索范围（跨库问答入口） */}
+        <div className="qa-scope">
+          <span className="qa-scope-label">检索范围：{scopeLabel}</span>
           {bases.map((b) => (
             <button
               key={b.id}
               type="button"
-              className={`kb-qa-scope-chip${scopeIds.includes(b.id) ? ' is-on' : ''}`}
+              className={`scope-chip${scopeIds.includes(b.id) ? ' on' : ''}`}
+              aria-pressed={scopeIds.includes(b.id)}
               onClick={() => toggleScope(b.id)}
               title={b.description || b.name}
             >
-              {b.name}
+              ▤ {b.name}
             </button>
           ))}
         </div>
-      </div>
 
-      {/* 提问 */}
-      <div className="kb-qa-bar">
-        <textarea
-          className="kb-qa-input"
-          placeholder="向知识库提问…（Ctrl/⌘ + Enter 发送）"
-          value={question}
-          rows={2}
-          onChange={(e) => setQuestion(e.target.value)}
-          onKeyDown={(e) => {
-            if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-              e.preventDefault()
-              void ask()
-            }
-          }}
-        />
-        {busy ? (
-          <button type="button" className="kb-btn" onClick={() => void stop()}>停止</button>
-        ) : (
-          <button
-            type="button"
-            className="kb-btn primary"
-            disabled={!question.trim()}
-            onClick={() => void ask()}
-          >
-            提问
-          </button>
-        )}
-      </div>
+        {/* 对话流：源站/设计稿把「问」与「答」放在同一个 .qa-turn 里。
+            ⚠️ 本仓没有「已提交问题」的独立状态（`question` 是输入框草稿，发送后不清空），
+            拿它当气泡会让用户边打字边改掉历史提问 ⇒ 只渲染「答」这一侧。 */}
+        {phase !== 'idle' && (
+          <div className="qa-thread">
+            <div className="qa-turn">
+              <div className="qa-a">
+                <div className="bubble">
+                  {/* 阶段提示（客户端可观测的两态，⛔ 不假装逐阶段进度）*/}
+                  <div className="qa-tips" data-phase={phase}>
+                    {phase === 'retrieving' && '检索中…（改写 → 检索 → 重排 → 合并）'}
+                    {phase === 'generating' && '生成中…'}
+                    {phase === 'done' && '已完成'}
+                    {phase === 'error' && (errorMsg || '失败')}
+                  </div>
 
-      {/* 阶段提示（客户端可观测的两态，⛔ 不假装逐阶段进度） */}
-      {phase !== 'idle' && (
-        <div className="kb-qa-phase" data-phase={phase}>
-          {phase === 'retrieving' && '检索中…（改写 → 检索 → 重排 → 合并）'}
-          {phase === 'generating' && '生成中…'}
-          {phase === 'done' && '已完成'}
-          {phase === 'error' && (errorMsg || '失败')}
-        </div>
-      )}
+                  {/* 答案 */}
+                  {answer && <p style={{ margin: 0, whiteSpace: 'pre-wrap' }}>{answer}</p>}
 
-      {/* 答案 */}
-      {answer && (
-        <div className="kb-qa-answer">
-          <div className="kb-qa-answer-body">{answer}</div>
-        </div>
-      )}
-
-      {/* 引用面板 */}
-      {(citations.length > 0 || webSources.length > 0) && (
-        <div className="kb-qa-citations">
-          <div className="kb-qa-citations-title">
-            引用来源 <span className="kb-detail-tab-count">{citations.length + webSources.length}</span>
+                  {/* 引用面板 */}
+                  {qaOpts.showCitations && (citations.length > 0 || webSources.length > 0) && (
+                    <div className="qa-sources">
+                      <div className="t">引用来源 {citations.length + webSources.length}</div>
+                      {citations.map((c) => (
+                        <div key={`${c.chunkId}-${c.refIndex}`}>
+                          <button
+                            type="button"
+                            className="src-item"
+                            aria-expanded={openCitation === c.refIndex}
+                            onClick={() => setOpenCitation(openCitation === c.refIndex ? null : c.refIndex)}
+                          >
+                            <span className="src-idx">[{c.refIndex}]</span>
+                            <span className="src-body">
+                              <span className="src-title">
+                                {c.knowledgeTitle || '未命名文档'}{c.chunkIndex != null ? ` · #${c.chunkIndex}` : ''}
+                              </span>
+                              <span className="src-snip">{c.snippet || '（无片段）'}</span>
+                            </span>
+                          </button>
+                          {openCitation === c.refIndex && (
+                            <pre style={{ margin: '4px 0 0', whiteSpace: 'pre-wrap', fontSize: 12, color: 'var(--td-text-color-secondary)' }}>
+                              {c.snippet || '（无片段）'}
+                            </pre>
+                          )}
+                        </div>
+                      ))}
+                      {webSources.map((w) => (
+                        <a
+                          key={w.url}
+                          className="src-item"
+                          href={w.url}
+                          target="_blank"
+                          rel="noreferrer noopener"
+                        >
+                          <span className="src-idx">🌐</span>
+                          <span className="src-body">
+                            <span className="src-title">{w.title || w.url}</span>
+                          </span>
+                        </a>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
           </div>
-          {citations.map((c) => (
-            <div key={`${c.chunkId}-${c.refIndex}`} className="kb-qa-citation">
+        )}
+
+        {/* 提问 */}
+        <div className="qa-compose">
+          <div className="qa-input-row">
+            <textarea
+              className="qa-input"
+              placeholder="向知识库提问…（Ctrl/⌘ + Enter 发送）"
+              value={question}
+              rows={2}
+              style={{ flex: 1, minWidth: 0 }}
+              onChange={(e) => setQuestion(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+                  e.preventDefault()
+                  void ask()
+                }
+              }}
+            />
+            {busy ? (
               <button
                 type="button"
-                className="kb-qa-citation-head"
-                onClick={() => setOpenCitation(openCitation === c.refIndex ? null : c.refIndex)}
+                className="t-button t-button--variant-outline t-button--theme-default t-size-m"
+                onClick={() => void stop()}
               >
-                <span className="kb-qa-citation-no">[{c.refIndex}]</span>
-                <span className="kb-qa-citation-title">{c.knowledgeTitle || '未命名文档'}</span>
-                {c.chunkIndex != null && (
-                  <span className="kb-qa-citation-meta">块 #{c.chunkIndex}</span>
-                )}
+                <span className="t-button__text">停止</span>
               </button>
-              {openCitation === c.refIndex && (
-                <pre className="kb-qa-citation-snippet">{c.snippet || '（无片段）'}</pre>
-              )}
-            </div>
-          ))}
-          {webSources.map((w) => (
-            <div key={w.url} className="kb-qa-citation">
-              <a
-                className="kb-qa-citation-head"
-                href={w.url}
-                target="_blank"
-                rel="noreferrer noopener"
+            ) : (
+              <button
+                type="button"
+                className="t-button t-button--variant-base t-button--theme-primary t-size-m"
+                disabled={!question.trim()}
+                onClick={() => void ask()}
               >
-                <span className="kb-qa-citation-no">🌐</span>
-                <span className="kb-qa-citation-title">{w.title || w.url}</span>
-              </a>
-            </div>
-          ))}
+                <span className="t-button__text">提问</span>
+              </button>
+            )}
+          </div>
         </div>
-      )}
+      </div>
+
+      {/* ── 右栏（设计稿 08 页 `.qa-side`）────────────────────────────
+          两张卡：本次会话历史 + 检索设置。
+          ⚠️ 检索设置三开关：本仓 `knowledgeApi.askQa` 的后端契约只有
+          `{content, knowledgeBaseIds}`，**没有** hybrid / rerank / showCitations 参数
+          ⇒ 开关会真实改变前端呈现（`showCitations` 控制引用区是否渲染），
+          但 hybrid / rerank 不传后端，点击时如实提示「本仓后端未开放该参数」，
+          ⛔ 不假装生效。 */}
+      <aside className="qa-side">
+        <div className="qa-side-card">
+          <h4>本次会话</h4>
+          <div className="qa-hist">
+            {askedHistory.length === 0 ? (
+              <div className="qa-hist-item" aria-disabled="true" style={{ opacity: 0.5 }}>
+                还没有提问
+              </div>
+            ) : (
+              askedHistory.map((h, i) => (
+                <div
+                  key={`${i}-${h}`}
+                  className="qa-hist-item"
+                  role="button"
+                  tabIndex={0}
+                  title={h}
+                  onClick={() => setQuestion(h)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setQuestion(h)
+                    }
+                  }}
+                >
+                  {h}
+                </div>
+              ))
+            )}
+          </div>
+        </div>
+
+        <div className="qa-side-card">
+          <h4>检索设置</h4>
+          <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+            {([
+              ['hybrid', '混合检索（向量 + 关键词）', false],
+              ['rerank', '启用重排', false],
+              ['showCitations', '显示引用来源', true],
+            ] as const).map(([key, label, wired]) => (
+              <div
+                key={key}
+                className="row"
+                style={{ justifyContent: 'space-between', fontSize: 12, color: 'var(--td-text-color-secondary)' }}
+              >
+                <span>{label}</span>
+                <button
+                  type="button"
+                  className={`t-switch t-size-s${qaOpts[key] ? ' t-is-checked' : ''}`}
+                  role="switch"
+                  aria-checked={qaOpts[key]}
+                  aria-label={label}
+                  onClick={() => {
+                    const next = !qaOpts[key]
+                    setQaOpts((o) => ({ ...o, [key]: next }))
+                    if (!wired) {
+                      showToast(`${label}：本仓后端 askQa 未开放该参数，开关仅记录在本页`, 'info')
+                    }
+                  }}
+                >
+                  <span className="t-switch__handle" />
+                </button>
+              </div>
+            ))}
+          </div>
+          <p className="hint mt16">设置仅影响本次会话，不写回知识库配置。</p>
+        </div>
+      </aside>
     </div>
   )
 }

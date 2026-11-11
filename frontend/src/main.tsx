@@ -11,6 +11,8 @@ import { StandalonePreviewView } from '@/components/standalone/StandalonePreview
 import { isStandalonePreviewRoute } from '@/utils/standalonePreview'
 import { KnowledgeGraphDemo } from '@/components/knowledge/KnowledgeGraphDemo'
 import { isKnowledgeGraphDemoRoute } from '@/utils/knowledgeGraphRoute'
+import { KbWindowView } from '@/components/knowledge/KbWindowView'
+import { isKbWindowRoute } from '@/utils/kbWindow'
 // [OBS2] 错误上报出口：frontLog 以顶层副作用装好了通道，这里取它的上报函数交给 React 19 的错误回调。
 // ⛔ 必须放在 `import './utils/frontLog'` 之后（那一条负责安装通道）。
 import { reportFrontendError } from '@/utils/frontLog'
@@ -24,7 +26,11 @@ import '@fontsource/inter/700.css'
 function Root() {
   const [standalone] = useState(isStandalonePreviewRoute)
   const [graphDemo] = useState(isKnowledgeGraphDemoRoute)
+  // 知识库独立窗口（用户 2026-11-09：面板要能拖到另一块屏幕）——
+  // 它是**独立的 Tauri WebView**，整个窗口就是知识库，故不进 LaunchGate（那会多一层启动门）。
+  const [kbWindow] = useState(isKbWindowRoute)
   if (graphDemo) return <KnowledgeGraphDemo />
+  if (kbWindow) return <KbWindowView />
   return standalone ? (
     <StandalonePreviewView />
   ) : (

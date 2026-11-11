@@ -347,7 +347,7 @@ class WebFetchToolTest {
         // 域预检阻断消息为 CC 真源 "Claude Code is unable to fetch from <domain>"（utils.ts:23 /
         // WebFetchSecurity.DomainBlockedException:649），以 "Claude Code is " 开头。[isToolErrorData 补丁]
         // 此前 isToolErrorData 仅登记 "unable to fetch"（只匹配以 unable 开头的串），阻断消息前缀不匹配
-        // → 下游消费者（InboundMcpToolProvider/ProductionForkedQuery/MagicDocsService 等）把阻断误判为
+        // → 下游消费者（InboundMcpToolProvider/fork 发送边界/MagicDocsService 等）把阻断误判为
         // 成功 tool_result（silent success）。补前缀后必须返回 true；contains 校验保留验证消息内容本身。
         assertThat(tr.data().toString()).as("内网云元数据必须被阻断").contains("unable to fetch");
         assertThat(LlmAgentLoop.isToolErrorData(tr.data()))

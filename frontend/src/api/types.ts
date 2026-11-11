@@ -508,7 +508,9 @@ export interface AppSettings {
   goalCheckinMinutes?: number | null
   /** [V259 external-agent] 子代理默认外部运行时 id（claude / codex / opencode / pi）。
    *  空/null = 全用内置子代理（默认）；配了则「未显式指定 subagent_type」时派给它。
-   *  ⚠️ 用户显式传 subagent_type 时永远优先，本值不生效。 */
+   *  ⚠️ 用户显式传 subagent_type 时永远优先，本值不生效。
+   *  ⚠️ 值域是 **runtime id**，不是 agentType（codex-external 那种）——
+   *  后端写侧只认 runtime id，派发侧也按 runtime id 反查 agentType。 */
   subagentDefaultRuntime?: string | null
   /** [V259 external-agent] 外部运行时总开关。null/undefined = 未配置（yml 兜底）；
    *  false = 用户显式关闭（压过 yml 的 true，避免「关了重启又活」）。 */
@@ -1333,6 +1335,8 @@ export interface ToolCallDto {
   arguments: string | null   // JSON 字符串，前端 JSON.parse
   result: string | null
   isError: boolean | null
+  /** 工具调用耗时（毫秒）· 后端 message.tool_result 事件携带 */
+  durationMs?: number | null
 }
 /** 压缩边界元数据（compact_boundary / microcompact_boundary 消息携带 · 后端透传）
  *

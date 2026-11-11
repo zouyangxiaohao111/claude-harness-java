@@ -69,18 +69,18 @@ class ToolRegistrationConfigForkModelFallbackTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("生产 productionForkedQuery: filesettings 无 model → modelSupplier 取 DB 主模型（非 null）")
+    @DisplayName("生产 queryLoopForkedQuery: filesettings 无 model → modelSupplier 取 DB 主模型（非 null）")
     void modelSupplier_fallsBackToDbMainModel() throws Exception {
         ToolRegistrationConfig config = new ToolRegistrationConfig();
         injectSettingsMapper(config, settingsMapperWith(DB_MAIN_MODEL));
 
         // configStorage=null 等价于「settings.json 无 model 键」（readSettings 路径缺失 → null）
-        var query = config.productionForkedQuery(
+        var query = config.queryLoopForkedQuery(
             Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-            new com.nexusai.application.agent.tool.ToolRegistry(),
             Mockito.mock(ModelMapper.class), Mockito.mock(ProviderMapper.class),
             Mockito.mock(com.nexusai.domain.provider.ProviderService.class),
-            null);
+            null, null,
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory());
 
         assertThat(query.modelSupplier().get())
             .as("settings.json 无 model 时 modelSupplier 不得为 null（DB settings.main_model_name 兜底）")
@@ -88,7 +88,7 @@ class ToolRegistrationConfigForkModelFallbackTest {
     }
 
     @Test
-    @DisplayName("生产 productionForkedQuery: settings.json 有 model → 文件源优先（不查 DB）")
+    @DisplayName("生产 queryLoopForkedQuery: settings.json 有 model → 文件源优先（不查 DB）")
     void modelSupplier_fileSettingsWins() throws Exception {
         ToolRegistrationConfig config = new ToolRegistrationConfig();
         // DB 值存在但不得被采用（文件源优先）
@@ -98,12 +98,12 @@ class ToolRegistrationConfigForkModelFallbackTest {
             Mockito.mock(com.nexusai.application.agent.settings.storage.FileConfigStorage.class);
         Mockito.when(fileStorage.readSettings(Mockito.anyList())).thenReturn("file-model");
 
-        var query = config.productionForkedQuery(
+        var query = config.queryLoopForkedQuery(
             Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-            new com.nexusai.application.agent.tool.ToolRegistry(),
             Mockito.mock(ModelMapper.class), Mockito.mock(ProviderMapper.class),
             Mockito.mock(com.nexusai.domain.provider.ProviderService.class),
-            fileStorage);
+            fileStorage, null,
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory());
 
         assertThat(query.modelSupplier().get()).isEqualTo("file-model");
     }

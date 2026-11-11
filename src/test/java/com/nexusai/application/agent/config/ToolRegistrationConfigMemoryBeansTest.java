@@ -64,15 +64,10 @@ class ToolRegistrationConfigMemoryBeansTest {
     @DisplayName("SessionMemoryService/ExtractMemoriesAgent/AutoDreamConsolidator @Bean 存在且可构造 + 生产 fork seam 注入")
     void memoryComponentsBeansAreRegisteredAndConstructible() {
         ToolRegistry registry = new ToolRegistry();
-        com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionFork =
-            config.productionForkedQuery(
-                Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-                registry, null, null, null, null);
-
         com.nexusai.application.agent.telemetry.Telemetry telemetry =
             new com.nexusai.application.agent.telemetry.Telemetry();
         com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery queryLoopFork = queryLoopForkBean();
-        SessionMemoryService sm = config.sessionMemoryService(registry, productionFork, queryLoopFork,
+        SessionMemoryService sm = config.sessionMemoryService(registry, queryLoopFork,
             telemetry,
             emptyAutoCompactorProvider(),
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED,
@@ -88,14 +83,14 @@ class ToolRegistrationConfigMemoryBeansTest {
             com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance());
         assertThat(storage).isNotNull();
 
-        ExtractMemoriesAgent extract = config.extractMemoriesAgent(storage, registry, productionFork,
+        ExtractMemoriesAgent extract = config.extractMemoriesAgent(storage, registry,
             queryLoopFork, telemetry,
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED);
         assertThat(extract).isNotNull();
 
         com.nexusai.application.agent.tasks.DreamTaskRegistry dreamRegistry =
             new com.nexusai.application.agent.tasks.DreamTaskRegistry();
-        AutoDreamConsolidator dreamer = config.autoDreamConsolidator(storage, registry, productionFork,
+        AutoDreamConsolidator dreamer = config.autoDreamConsolidator(storage, registry,
             queryLoopFork,
             new com.nexusai.application.agent.telemetry.Telemetry(),
             dreamRegistry,
@@ -113,7 +108,7 @@ class ToolRegistrationConfigMemoryBeansTest {
 
         // IMP-M-P0-3: 生产 fork seam 注入（DEL-M-48 接线缺口消除 + R9/IMP-18 收敛）——
         //   setForkedQuery 生产注入点真实生效（不再是测试才 set 的 seam）。
-        //   [E-1b-2] 实现已从 ProductionForkedQuery（自建循环）切到 QueryLoopForkedQuery
+        //   实现为 QueryLoopForkedQuery（主循环 queryLoop，E-2 后唯一实现），旧自建循环类已删除
         //   （主循环 queryLoop）——断言的是「@Bean 注入的同源引用」这一意图，不钉具体实现类。
         assertThat(readField(extract, "forkedQuery")).isSameAs(queryLoopFork);
         assertThat(readField(dreamer, "forkedQuery")).isSameAs(queryLoopFork);
@@ -177,13 +172,10 @@ class ToolRegistrationConfigMemoryBeansTest {
     @DisplayName("FIX-CL awaySummaryService/claudemdEngine @Bean 可构造 + 惰性 provider + mothCopse 门控")
     void awaySummaryAndClaudemdBeans_wired() {
         // WHY (规则 9): FIX-CL 把 AwaySummaryService 从"0 调用方不可达"接为生产 @Bean；provider/config
-        //       必须惰性解析（对齐 ProductionForkedQuery），避免 bean 构造期（settings/DB 未就绪）
+        //       必须惰性解析（对齐 QueryLoopForkedQuery），避免 bean 构造期（settings/DB 未就绪）
         //       锁定 mock provider —— 假接线反例（bean 存在但 LLM 调用恒 mock）。
         ToolRegistry registry = new ToolRegistry();
-        com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionFork =
-            config.productionForkedQuery(Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-                registry, null, null, null, null);
-        SessionMemoryService sm = config.sessionMemoryService(registry, productionFork, queryLoopForkBean(),
+        SessionMemoryService sm = config.sessionMemoryService(registry, queryLoopForkBean(),
             new com.nexusai.application.agent.telemetry.Telemetry(), emptyAutoCompactorProvider(),
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED,
             /*hookRegistry*/ null, /*readFileTool*/ null, /*settingsResolver*/ null);
@@ -219,9 +211,6 @@ class ToolRegistrationConfigMemoryBeansTest {
         // 改由 extractMemoriesAgent bean 注入的 supplier 断言（工具集来自主 registry）。
         ExtractMemoriesAgent extract = config.extractMemoriesAgent(
             config.memoryStorage(com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()), populated,
-            config.productionForkedQuery(
-                Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-                populated, null, null, null, null),
             queryLoopForkBean(),
             new com.nexusai.application.agent.telemetry.Telemetry(),
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED);
@@ -252,9 +241,6 @@ class ToolRegistrationConfigMemoryBeansTest {
             ExtractMemoriesAgent extract = config.extractMemoriesAgent(
                 config.memoryStorage(com.nexusai.application.agent.memory.AutoMemPaths.defaultInstance()),
                 populated,
-                config.productionForkedQuery(
-                    Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-                    populated, null, null, null, null),
                 queryLoopForkBean(),
                 new com.nexusai.application.agent.telemetry.Telemetry(),
                 com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED);
@@ -380,14 +366,10 @@ class ToolRegistrationConfigMemoryBeansTest {
         }
     }
 
-    /** P1-3: sessionMemoryService @Bean 需 ToolRegistry + ProductionForkedQuery 参数。 */
+    /** P1-3: sessionMemoryService @Bean 需 ToolRegistry + QueryLoopForkedQuery 参数。 */
     private SessionMemoryService sessionMemoryServiceBean() {
         ToolRegistry registry = new ToolRegistry();
-        com.nexusai.application.agent.compact.fork.ProductionForkedQuery productionFork =
-            config.productionForkedQuery(
-                Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class),
-                registry, null, null, null, null);
-        return config.sessionMemoryService(registry, productionFork, queryLoopForkBean(),
+        return config.sessionMemoryService(registry, queryLoopForkBean(),
             new com.nexusai.application.agent.telemetry.Telemetry(), emptyAutoCompactorProvider(),
             com.nexusai.application.agent.loop.FeatureFlags.ALL_DISABLED,
             /*hookRegistry*/ null, /*readFileTool*/ null, /*settingsResolver*/ null);

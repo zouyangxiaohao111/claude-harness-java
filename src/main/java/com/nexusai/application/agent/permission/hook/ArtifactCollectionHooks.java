@@ -154,9 +154,21 @@ public final class ArtifactCollectionHooks {
             return;
         }
         try {
-            // syncDeliverableForPath 内部已判「是否在交付物目录之下」+ 源码黑名单 + 幂等 upsert，
-            // 这里只管把路径喂给它。
-            artifactService.syncDeliverableForPath(sessionId, absPath, userMessageIdOf(sessionId));
+            // [V279 · 2026-11-10 用户裁定「项目目录里的文件也算产物」] 按路径分流：
+            //   · 在交付物目录之下 → 原链路（Agent 主动交付，origin=deliverables）
+            //   · 否则 → 项目内文档通道（Write/Edit 写的 docs/*.md 这类，origin=project-write）
+            // 分流在这里做而不是在服务里：服务层两个方法的入口条件本就不同（一个只收目录内，
+            // 一个只收目录外），混在一起会让「路径在不在目录内」这个判断散成两处。
+            if (artifactService.isInDeliverablesDir(sessionId, absPath)) {
+                // syncDeliverableForPath 内部已判「是否在交付物目录之下」+ 源码黑名单 + 幂等 upsert，
+                // 这里只管把路径喂给它。
+                artifactService.syncDeliverableForPath(sessionId, absPath, userMessageIdOf(sessionId));
+            } else {
+                // ⛔ 只有 Write/Edit 会走到这里（本 hook 只注册了这两个工具）。
+                //   Bash 不在采集范围：入参只有 command 字符串，从「> x.md」「tee」「python gen.py」
+                //   里解析输出路径不可靠（用户 2026-11-10 裁定不做）。
+                artifactService.syncProjectDocForPath(sessionId, absPath, userMessageIdOf(sessionId));
+            }
         } catch (Throwable t) {
             log.warn("[ArtifactCollectionHooks] 产物采集失败（不影响工具结果） tool={} path={}: {}",
                     toolName, absPath, t.toString());

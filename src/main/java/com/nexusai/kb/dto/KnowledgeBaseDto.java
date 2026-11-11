@@ -53,6 +53,69 @@ public record KnowledgeBaseDto(
     @JsonProperty("pinned_at") String pinnedAt,
     @JsonProperty("generated_profile") String generatedProfile,
     @JsonProperty("created_at") String createdAt,
-    @JsonProperty("updated_at") String updatedAt
+    @JsonProperty("updated_at") String updatedAt,
+    /**
+     * 索引策略 JSON（含 {@code wiki_enabled} / {@code graph_enabled}）。
+     *
+     * <p>⭐ 前端靠 `indexing_strategy.wiki_enabled` 决定是否显示 Wiki / 图谱 tab
+     * —— 源站 {@code KnowledgeBase.vue:99} 的 {@code isWiki} 就是这个判据。
+     * 之前没返回 ⇒ 前端拿不到 ⇒ 两个 tab 永远隐藏（**静默丢失功能**，零报错）。
+     *
+     * <p>⚠️ 这是**读侧**字段：`PATCH` 能写、`GET` 原来读不回来，本批补上出站。
+     */
+    @JsonProperty("indexing_strategy") String indexingStrategy,
+    /** Wiki 配置 JSON（含 {@code auto_generate} / {@code synthesis_model_id}）。 */
+    @JsonProperty("wiki_config") String wikiConfig,
+    /**
+     * 问题生成配置（`question_generation_config`）。
+     *
+     * <p>⭐ 读侧必须回传：设置弹窗的「AI 问题生成」开关靠它判断当前状态。
+     * 之前只写不读 ⇒ 保存成功后重新拉取仍是 `null` ⇒ **开关永远显示关闭**，
+     * 而且展开的 3 个子字段永远不出现（用户以为没保存）。
+     * 后端 `KbPostProcessConfig` 真消费它（`enabled` / `model_id` /
+     * `question_count` / `custom_instructions`）。
+     */
+    @JsonProperty("question_generation_config") String questionGenerationConfig,
+    /** 自动打标配置（`auto_tag_config`）；同上，后端真消费 4 键。 */
+    @JsonProperty("auto_tag_config") String autoTagConfig,
+    /**
+     * ASR 配置（`asr_config`）。
+     *
+     * <p>⚠️ 本仓**零消费者**（无执行链读它）—— 回传只为让开关状态能正确回显，
+     * 界面上已明确告知「保存了也不会转写」。
+     */
+    @JsonProperty("asr_config") String asrConfig,
+    /** 画像配置（`profile_config`）；⚠️ 同样零消费者，理由同上。 */
+    @JsonProperty("profile_config") String profileConfig,
+    /**
+     * FAQ 配置（`faq_config`）。
+     *
+     * <p>⭐ 读侧必须回传：FAQ 型库的「索引方式」单选项靠它判断当前值。
+     * `faq_config.index_mode` **后端真消费**
+     * （`KbFaqMetadata.resolveIndexMode` → `KbFaqService` 渲染 FAQ 正文）。
+     */
+    @JsonProperty("faq_config") String faqConfig
 ) {
+
+    /**
+     * 兼容构造器 · 不带最后 4 个配置字段（既有测试与旧调用点用）。
+     *
+     * <p>⚠️ 只为不破坏 20 参调用点（`KbWikiToolScopeThreeStateTest` 等）——
+     * 新增的 4 个字段在这些场景恒 `null`，等价于「未配置」，与引入前一致。
+     * ⛔ 生产代码（`KnowledgeBaseService.toDto`）必须走全参构造器，
+     * 否则前端开关又会读不到值。
+     */
+    public KnowledgeBaseDto(
+        String id, String name, String description, String type, boolean isTemporary,
+        String chunkingConfig, String imageProcessingConfig, String embeddingModelId,
+        String summaryModelId, String extractConfig, String vectorStoreId,
+        String storageBackendId, String retrieverEngine, boolean isPinned, String pinnedAt,
+        String generatedProfile, String createdAt, String updatedAt,
+        String indexingStrategy, String wikiConfig
+    ) {
+        this(id, name, description, type, isTemporary, chunkingConfig, imageProcessingConfig,
+            embeddingModelId, summaryModelId, extractConfig, vectorStoreId, storageBackendId,
+            retrieverEngine, isPinned, pinnedAt, generatedProfile, createdAt, updatedAt,
+            indexingStrategy, wikiConfig, null, null, null, null, null);
+    }
 }

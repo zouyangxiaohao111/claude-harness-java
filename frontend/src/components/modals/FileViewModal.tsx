@@ -3,7 +3,7 @@ import { projectApi, type FileContent } from '@/api/projects'
 import { ApiError } from '@/api/rest'
 import { monaco, monacoLangOf, MONACO_COMMON_OPTS } from '@/utils/monaco'
 import { openStandalone } from '@/utils/standalonePreview'
-import { MarkdownText } from '@/markdown/MarkdownText'
+import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 
 interface FileViewModalProps {
   /** 项目 id（读文件） */
@@ -188,7 +188,7 @@ export function FileViewModal({ projectId, path, close }: FileViewModalProps) {
             <div className="file-view-empty" style={{ color: 'var(--error-dark)' }}>{error}</div>
           ) : isMarkdown && mdMode === 'preview' ? (
             /* 默认态：渲染后的 Markdown（用户要「有预览」，不是满屏 # 和 **） */
-            <MarkdownText text={data?.content ?? ''} className="content md file-view-md" />
+            <MarkdownTextV2 text={data?.content ?? ''} className="content md file-view-md" />
           ) : (
             <div ref={boxRef} className="monaco-box" />
           )}

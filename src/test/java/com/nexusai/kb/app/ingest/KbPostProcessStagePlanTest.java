@@ -49,11 +49,15 @@ class KbPostProcessStagePlanTest {
         return out;
     }
 
+    /** 图片理解关（大多数用例不关心它）。 */
+    private static final KbPostProcessConfig.ImageUnderstanding IMG_OFF =
+        new KbPostProcessConfig.ImageUnderstanding(false, "");
+
     private static KbPostProcessConfig cfg(boolean summary, boolean question, boolean wiki, boolean tag) {
         return new KbPostProcessConfig(
             summary, summary ? "m" : "",
             new KbPostProcessConfig.QuestionGeneration(question, "m", 3, "", "emb"),
-            new KbPostProcessConfig.AutoTag(tag, "m", 5, true), wiki, wiki ? "m" : "", false);
+            new KbPostProcessConfig.AutoTag(tag, "m", 5, true), wiki, wiki ? "m" : "", false, IMG_OFF);
     }
 
     @Nested
@@ -140,7 +144,7 @@ class KbPostProcessStagePlanTest {
                 false, "m",
                 new KbPostProcessConfig.QuestionGeneration(false, "m", 3, "", "emb"),
                 new KbPostProcessConfig.AutoTag(false, "m", 5, true),
-                false, "", graph);
+                false, "", graph, IMG_OFF);
         }
 
         @Test
@@ -187,7 +191,7 @@ class KbPostProcessStagePlanTest {
             KbPostProcessConfig c = new KbPostProcessConfig(
                 false, "",
                 new KbPostProcessConfig.QuestionGeneration(true, "m", 3, "", ""),
-                new KbPostProcessConfig.AutoTag(false, "", 5, true), false, "", false);
+                new KbPostProcessConfig.AutoTag(false, "", 5, true), false, "", false, IMG_OFF);
             assertThat(stage.plan(knowledge(), c, chunks(5))).isEmpty();
         }
 

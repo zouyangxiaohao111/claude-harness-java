@@ -1,6 +1,7 @@
 package com.nexusai.domain.project;
 
 import com.nexusai.application.agent.worktree.GitCommandRunner;
+import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -25,6 +26,7 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.SimpleFileVisitor;
 import java.nio.file.attribute.BasicFileAttributes;
+import java.time.Instant;
 import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -441,7 +443,16 @@ public class ProjectService {
     }
 
     public List<ProjectDto> listAll() {
-        List<ProjectRecord> all = projectMapper.selectAll();
+        // [V280 · 2026-11-10 用户裁定] 项目分组序 = **注册先后**（created_at ASC），排完不再随会话活动变化。
+        //   原为 selectAll() 裸查：SQLite 无 ORDER BY 不保证行序 ⇒ 前端组间序会随查询计划漂。
+        //   ⚠️ ASC 侧必须 NULLS LAST（同 MessageService.SEQ_ASC_NULLS_LAST_ORDER 的口径）：SQLite
+        //   裸 ASC 视 NULL 为最小 ⇒ created_at 未回填的行会冒充「最早注册」排到最前。
+        //   片段自带方向（SQLite 文法要求方向写在 NULLS LAST 之前），故不再叠加 .orderBy("created_at")。
+        //   id 兜底让排序成为全序（同秒批量注册时 created_at 可能同值）。
+        List<ProjectRecord> all = projectMapper.selectListByQuery(
+            QueryWrapper.create()
+                .orderByUnSafely("created_at ASC NULLS LAST")
+                .orderBy("id", true));
         return all.stream().map(this::toDto).toList();
     }
 
@@ -485,6 +496,9 @@ public class ProjectService {
         p.setAgents(0);
         p.setLastIndexedAt(null);
         p.setBound(Boolean.FALSE);
+        // [V280] 注册时间 = 左栏项目分组序的唯一依据（升序，先注册在前）。
+        //   统一写 UTC 的 Z 结尾（与迁移回填同形态）⇒ 字符串序 == 时间序，跨时区不错序。
+        p.setCreatedAt(Instant.now().toString());
         projectMapper.insert(p);
         if (log.isDebugEnabled()) {
             log.debug("[ProjectService.register] 注册新项目: id={} name={} path={}", p.getId(), req.name(), absPath);
@@ -552,7 +566,8 @@ public class ProjectService {
             p.getDirty(),
             p.getAgents(),
             parseDateTime(p.getLastIndexedAt()),
-            Boolean.TRUE.equals(p.getBound())
+            Boolean.TRUE.equals(p.getBound()),
+            parseDateTime(p.getCreatedAt())
         );
     }
 

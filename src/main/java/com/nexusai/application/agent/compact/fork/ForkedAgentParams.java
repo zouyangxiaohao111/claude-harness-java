@@ -48,7 +48,7 @@ import java.util.function.Consumer;
  *                        {@code skipTranscript=false}（或未传）时会记 sidechain transcript
  *                        （{@code recordSidechainTranscript}）；<b>本仓 fork 一律不记 sidechain
  *                        transcript</b>（无论本值为 true/false —— Java fork 链
- *                        {@link RunForkedAgent} / {@code ProductionForkedQuery} 无任何 transcript
+ *                        {@link RunForkedAgent} / fork 循环无任何 transcript
  *                        I/O）。此为<b>用户裁定的有意偏离</b>（2026-09-12 E-1a），故字段保留但
  *                        不接线（CC 有对应物，符合本仓「死代码不一定要删」）。登记处：
  *                        {@code docs/zjkycode/plans/2026-09-12-fork-converge-E-registry.md}

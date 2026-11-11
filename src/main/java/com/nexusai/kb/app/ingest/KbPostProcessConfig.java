@@ -34,6 +34,7 @@ import org.slf4j.LoggerFactory;
  * @param wikiModelId      Wiki 生成模型 = {@code wiki_config.synthesis_model_id} → 回退 {@code summary_model_id}
  * @param graphEnabled     是否抽图谱 = {@code indexing_strategy.graph_enabled} **且** {@code extract_config.enabled}
  *                         **且** 有模型（源侧 {@code KnowledgeBase.IsGraphEnabled()}）
+ * @param image            图片理解配置（caption / OCR）
  */
 public record KbPostProcessConfig(
     boolean summaryEnabled,
@@ -42,7 +43,8 @@ public record KbPostProcessConfig(
     AutoTag autoTag,
     boolean wikiEnabled,
     String wikiModelId,
-    boolean graphEnabled
+    boolean graphEnabled,
+    ImageUnderstanding image
 ) {
 
     private static final Logger log = LoggerFactory.getLogger(KbPostProcessConfig.class);
@@ -88,10 +90,40 @@ public record KbPostProcessConfig(
         }
     }
 
+    /**
+     * 图片理解配置（对应 {@code kb_knowledge_base.image_processing_config} JSON）。
+     *
+     * <p><b>⭐ 对齐源侧两个判据</b>：
+     * <ul>
+     *   <li>{@code enable_multimodal} 对应源侧 {@code VLMConfig.IsEnabled()}
+     *       （{@code knowledgebase.go:733}：{@code Enabled && ModelID != ""}）。</li>
+     *   <li>{@code model_id} 是该库指定的图片理解模型；源侧没有它时<b>回落到知识库默认</b>
+     *       （{@code image_multimodal.go:941-975} 的 resolveVLM 先读库配置）。
+     *       ⇒ 本仓空值 = 用全局多模态档位（{@code settings.multimodalModelName}），
+     *       与 {@link KbVisionModelCaller} 的取值口径一致。</li>
+     * </ul>
+     *
+     * @param enabled 是否开启图片理解（caption + OCR）
+     * @param modelId 该库指定模型（空 = 用全局多模态档位）
+     */
+    public record ImageUnderstanding(boolean enabled, String modelId) {
+        /**
+         * 是否应该派发图片理解任务。
+         *
+         * <p>⚠️ <b>不看模型是否已配置</b>：与 {@code KbVisionCaller#isAvailable()} 同一分层原则 ——
+         * 没配模型时由执行期 fail-soft 跳过并留日志，而不是在这里静默不派发
+         * （后者会让「开关开了但什么也没发生」无法解释）。
+         */
+        public boolean runnable() {
+            return enabled;
+        }
+    }
+
     /** 全部关闭（单测 / 兜底用）。 */
     public static final KbPostProcessConfig NONE = new KbPostProcessConfig(
         false, "", new QuestionGeneration(false, "", DEFAULT_QUESTION_COUNT, "", ""),
-        new AutoTag(false, "", DEFAULT_MAX_TAGS, true), false, "", false);
+        new AutoTag(false, "", DEFAULT_MAX_TAGS, true), false, "", false,
+        new ImageUnderstanding(false, ""));
 
     /**
      * 从知识库行解析。
@@ -133,8 +165,23 @@ public record KbPostProcessConfig(
         }
 
         return new KbPostProcessConfig(
-            // 摘要默认开（源侧 ProcessConfig.SummaryEnabled = true），但没有模型就不派发
-            !summaryModel.isEmpty(),
+            // ⭐ 摘要恒开（对齐源码 `ResolveProcessConfig:43` 的 `SummaryEnabled: true`）。
+            //
+            // ⛔ 这里**不能**加「有模型才派发」的判据 —— 本仓曾这么写过，是错的：
+            //    源码 `knowledge_post_process.go:216` 的判据只有
+            //    `eff.SummaryEnabled && len(textChunks) > 0`，**不看模型**；
+            //    模型缺失的处理在**任务执行时**（`knowledge_process.go:1521-1527`）：
+            //      `if kb.SummaryModelID == "" { 标 summary_status=failed; 记 no_summary_model; return }`
+            //
+            //    两种写法对用户完全不同：
+            //    · 源码：没配模型 ⇒ 任务照派发 ⇒ 状态变 **failed** + 原因 `no_summary_model`
+            //      ⇒ 前端能显示「未配置摘要模型」并给出「去设置里配」的入口。
+            //    · 本仓旧写法：没配模型 ⇒ **根本不派发** ⇒ 状态永远停在 `none`
+            //      ⇒ 界面永远「尚未生成」，且没有任何错误、查不到原因。
+            //    后者的失效是**静默的**，用户只能猜。
+            //    ⇒ 判据保持恒 true；模型缺失由 {@code KbSummaryService.generate} 的
+            //      「守卫 5：配了摘要模型」在执行期兜住并落 failed 状态。
+            true,
             summaryModel,
             new QuestionGeneration(qEnabled, qModel, qCount,
                 trim(text(q, "custom_instructions")), trim(kb.getEmbeddingModelId())),
@@ -148,7 +195,29 @@ public record KbPostProcessConfig(
             //    indexing_strategy.graph_enabled 是「要图谱」，extract_config.enabled 是「抽什么」。
             //    只判其中一个 ⇒ 用户以为自己开了图谱，实际什么都没抽。
             //    外加「有模型」—— 与 W6 其余三条同口径（开关 ∧ 依赖就绪）。
-            graphEnabled(kb) && !summaryModel.isEmpty());
+            graphEnabled(kb) && !summaryModel.isEmpty(),
+            imageUnderstanding(kb));
+    }
+
+    /**
+     * 图片理解配置：{@code image_processing_config.enable_multimodal} + {@code model_id}。
+     *
+     * <p>⚠️ 这个字段（{@code kb_knowledge_base.image_processing_config}）在本批之前
+     * <b>只有写入、没有读取</b>：DDL 有默认值、PATCH 能存、设置弹窗没入口、
+     * 入库链也不看它 —— 用户开了什么都不会发生，且没有任何日志。
+     * 本方法把它接进后处理派发判据。
+     *
+     * @param kb 知识库行
+     * @return 配置（永不 null）
+     */
+    public static ImageUnderstanding imageUnderstanding(KbKnowledgeBaseRecord kb) {
+        if (kb == null) {
+            return new ImageUnderstanding(false, "");
+        }
+        JsonNode cfg = parse(kb.getImageProcessingConfig(), "image_processing_config");
+        return new ImageUnderstanding(
+            bool(cfg, "enable_multimodal", false),
+            trim(text(cfg, "model_id")));
     }
 
     /**

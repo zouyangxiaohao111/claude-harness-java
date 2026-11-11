@@ -1402,7 +1402,7 @@ class AutoDreamConsolidatorTest {
         public ForkedAgentResult run(RunForkedAgent.ForkQueryParams params) {
             this.last = params;
             this.calls++;
-            // G-79 流式语义：query 每产出一条消息即回调 onMessage（对齐 ProductionForkedQuery
+            // G-79 流式语义：query 每产出一条消息即回调 onMessage（对齐 fork 发送边界
             //   fork loop 的产出即回调 + forkedAgent.ts:578）——RunForkedAgent 不再 post-hoc replay
             for (ChatMessageDto m : params.messages()) {
                 params.onMessage().accept(m);

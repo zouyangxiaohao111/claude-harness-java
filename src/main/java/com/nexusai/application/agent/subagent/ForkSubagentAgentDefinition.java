@@ -72,7 +72,9 @@ public final class ForkSubagentAgentDefinition {
             java.util.Optional.empty(),                           // pendingSnapshotUpdate
             java.util.Optional.empty(),                           // omitClaudeMd
             (modelId, dirs) -> buildForkSystemPrompt(modelId),    // systemPromptFn
-            java.util.Optional.empty()                            // callback
+            java.util.Optional.empty(),                           // callback
+            java.util.Optional.empty(),                           // agentMode（CC 无此字段，fork 不声明）
+            java.util.Optional.empty()                            // kbAgentType（CC 无此字段，fork 不声明）
         );
     }
 

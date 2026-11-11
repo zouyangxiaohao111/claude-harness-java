@@ -45,7 +45,7 @@ function noop(): void {}
 async function noopAsync(): Promise<void> {}
 
 /** App 传下来的 onSaveSettings（写 appSettings 的唯一正常路径）。 */
-let onSave: Mock<(req: UpdateSettingsRequest) => Promise<void>>
+let onSave: Mock<(req: UpdateSettingsRequest) => Promise<boolean>>
 
 function render(root: Root, settings: AppSettings | null) {
   act(() => {
@@ -89,7 +89,7 @@ describe('SettingsModal · 外部渠道开关', () => {
     document.body.appendChild(container)
     root = createRoot(container)
     settingsUpdate.mockClear()
-    onSave = vi.fn(async () => {})
+    onSave = vi.fn(async () => true)
   })
 
   afterEach(() => {

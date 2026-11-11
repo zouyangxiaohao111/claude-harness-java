@@ -29,7 +29,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * （SessionMemoryService:1811-1819）；若生产合并入 user 消息 contentBlocks（CC 形态）则检测失效。
  * 本测试给出运行证据三件套：
  *   <li><b>生产主形态</b>：LlmAgentLoop.toolResultMessage 恒产出 Role.tool + toolCallId
- *       （:8006-8021 核心构造；全部 5 处调用位置 4113/4692/6503 + ProductionForkedQuery:302
+ *       （:8006-8021 核心构造；全部 5 处调用位置 4113/4692/6503 + LlmAgentLoop 工具结果构造
  *       + AgentLoopContext:1732/1740 共用同一工厂）。</li>
  *   <li><b>序列化侧</b>：AnthropicSdkProvider.buildSdkMessages 把 Role.tool + toolCallId 序列化为
  *       <b>user 角色 + tool_result 块（tool_use_id=toolCallId）</b>——与 CC 线上形态一致
@@ -150,7 +150,7 @@ class E4ToolResultFormCcContractTest {
 
         // 生产写入方全称排除：全仓 ChatMessageDto 主形态构造点共 3 处且全部产出
         // Role.tool + toolCallId（见 javadoc）：① LlmAgentLoop.toolResultMessage
-        // （:8006-8021，5 处调用位置 LlmAgentLoop:4113/4692/6503 + ProductionForkedQuery:302
+        // （:8006-8021，5 处调用位置 LlmAgentLoop:4113/4692/6503 + LlmAgentLoop 工具结果构造
         // + AgentLoopContext:1732/1740）；② SubagentExecutor.convertToChatMessageDto
         // （:4304-4307，fork 前缀恢复路径）；③ SubagentExecutor.toolResultMessage 影子工厂
         // （:4425-4443，子 Agent 独立构造）——漏检面收敛为外部数据注入

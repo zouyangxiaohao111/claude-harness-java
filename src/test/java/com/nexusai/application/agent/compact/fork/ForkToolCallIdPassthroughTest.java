@@ -44,7 +44,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * "跳过缺少 toolCallId 的 tool 消息"); yield null; }}）→ 下一轮请求里 assistant(tool_calls) 无
  * 对应 tool 响应 → <b>400 insufficient tool messages following tool_calls message</b>。
  *
- * <p><b>真实缺陷</b>：{@code ProductionForkedQuery} 工具轮走 1 参重载
+ * <p><b>真实缺陷</b>：fork 发送边界 工具轮走 1 参重载
  * {@code LlmAgentLoop.toolResultMessage(result)}，该重载内部把 {@code toolUseId} 硬编码为
  * {@code null}（{@code LlmAgentLoop:13058-13061}）→ fork 每条工具结果都丢 id。真机日志实证：
  * 「跳过缺少 toolCallId 的 tool 消息」36 次，全在 fork 线程；EXTRACT_MEMORIES 第 2 轮 8 次。
@@ -56,7 +56,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <h2>RED teeth（把修复改回去 → 哪条断言红）</h2>
  * <ul>
- *   <li>把 {@code ProductionForkedQuery} 的调用改回 1 参重载 {@code toolResultMessage(result)}
+ *   <li>把 fork 发送边界 的调用改回 1 参重载 {@code toolResultMessage(result)}
  *       （toolUseId=null）→ {@link #forkToolResult_carriesToolCallId} 的
  *       {@code toolCallId == "call-abc"} 断言红；</li>
  *   <li>同一个变异 → {@link #noToolMessageWithoutIdReachesProvider} 的「provider 之前那层」
@@ -80,8 +80,7 @@ class ForkToolCallIdPassthroughTest {
             new AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock(TOOL_CALL_ID, "Echo", emptyObject())), "", null),
             new AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = forkQuery(provider, registry);
 
         ForkedAgentResult result = loop.run(forkParams(allowAll(), forkCtxWith(echo)));
 
@@ -109,8 +108,7 @@ class ForkToolCallIdPassthroughTest {
             new AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock("call-2", "Echo", emptyObject())), "", null),
             new AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = forkQuery(provider, registry);
 
         ForkedAgentResult result = loop.run(forkParams(allowAll(), forkCtxWith(echo)));
 
@@ -135,7 +133,31 @@ class ForkToolCallIdPassthroughTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 测试工具（RunForkedAgentTest / ProductionForkedQueryUsageCcContractTest 同构，
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(LlmProvider provider, ToolRegistry registry) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            for (String[] kv : new String[][]{{"llmProviderFactory", null}, {"toolRegistry", null}}) {
+                java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                    .getDeclaredField(kv[0]);
+                f.setAccessible(true);
+                f.set(factory, kv[0].equals("llmProviderFactory") ? pf : registry);
+            }
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> MODEL, () -> ProviderConfig.empty(), factory);
+    }
+
+    // 测试工具（RunForkedAgentTest / fork 发送边界UsageCcContractTest 同构，
     // 独立类避免跨写集）
     // ════════════════════════════════════════════════════════════════════
 

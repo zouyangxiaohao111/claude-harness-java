@@ -52,6 +52,73 @@ class KbOfficeParserTest {
             assertThat(parser.supports("noext",
                 "application/vnd.openxmlformats-officedocument.presentationml.presentation")).isTrue();
         }
+
+        @Test
+        @DisplayName("电子书 / 网页归档：扩展名 + MIME 两条路都识别")
+        void recognisesEbookAndWebArchive() {
+            assertThat(parser.supports("a.epub", null)).isTrue();
+            assertThat(parser.supports("a.mhtml", null)).isTrue();
+            assertThat(parser.supports("noext", "application/epub+zip")).isTrue();
+            assertThat(parser.supports("noext", "multipart/related; type=\"text/html\"")).isTrue();
+            assertThat(parser.supports("noext", "application/x-mimearchive")).isTrue();
+            // 仍然是「不抢别人的」
+            assertThat(parser.supports("a.txt", "text/plain")).isFalse();
+            assertThat(parser.supports("a.png", "image/png")).isFalse();
+        }
+
+        @Test
+        @DisplayName("能力声明包含 epub/mhtml（前端下拉据此出现真实选项）")
+        void declaresEbookAndWebArchive() {
+            assertThat(parser.supportedExtensions()).contains("epub", "mhtml");
+            assertThat(parser.supportedExtensions()).containsAll(KbOfficeParser.EBOOK_WEB_EXT);
+        }
+    }
+
+    @Nested
+    @DisplayName("电子书 / 网页归档")
+    class EbookAndWebArchive {
+
+        /**
+         * 这两条与本文件其余用例的区别：它们要求「正文真的在」，而不只是「解析没抛异常」。
+         *
+         * <p>MHTML 的正文由 Tika 的 {@code EmbeddedDocumentExtractor} 交回解析；回落 context 里没有
+         * {@code Parser} 时会退到 {@code EmptyParser} ⇒ 正文变 0 字符、不报错。这种「静默变空」
+         * 用「不抛异常」根本测不出来（坏实现同样是绿的），故断言必须落到正文内容上。
+         * 已用变异对照确认：去掉回落 context 里的 {@code Parser} 后，MHTML 用例会红。
+         */
+        @Test
+        @DisplayName("EPUB：按 spine 抽出章节正文（不是 0 字符）")
+        void epubExtractsChapterText(@TempDir Path dir) throws Exception {
+            Path epub = KbTestDocuments.writeEpub(dir);
+            KbParsedDocument result = parser.parse(epub, KbParseContext.defaults().withWorkDir(dir.resolve("imgs")));
+
+            assertThat(result.text())
+                .as("章节正文必须真的被抽出来")
+                .contains("第一章 电子书正文")
+                .contains("这是 EPUB 解析验证用的正文段落。");
+            assertThat(result.metadata())
+                .containsEntry(KbParsedDocument.META_PARSER, "KbOfficeParser");
+            assertThat(result.metadata().get(KbParsedDocument.META_MIME_TYPE))
+                .as("MIME 由 Tika 探测（不是扩展名硬编）")
+                .isEqualTo("application/epub+zip");
+        }
+
+        @Test
+        @DisplayName("MHTML：正文 HTML 被解析成文字，MIME 报文头不泄漏进正文")
+        void mhtmlExtractsBodyOnly(@TempDir Path dir) throws Exception {
+            Path mhtml = KbTestDocuments.writeMhtml(dir);
+            KbParsedDocument result = parser.parse(mhtml, KbParseContext.defaults().withWorkDir(dir.resolve("imgs")));
+
+            assertThat(result.text())
+                .as("⛔ 回归：内嵌回落的 ParseContext 缺 Parser ⇒ MHTML 正文静默变空（实测 0 字符）")
+                .contains("网页归档正文标题")
+                .contains("这是 MHTML 解析验证用的正文段落。");
+            assertThat(result.text())
+                .as("只留正文：MIME 头与 boundary 不该进 Markdown")
+                .doesNotContain("MIME-Version")
+                .doesNotContain("=_NextPart")
+                .doesNotContain("Content-Type:");
+        }
     }
 
     @Nested

@@ -260,6 +260,23 @@
             <artifactId>tika-parser-mail-commons</artifactId>
             <version>${tika.version}</version>
         </dependency>
+        <!-- 电子书（.epub）· EpubParser 在这个模块里（本机实测：不加此模块，epub 落到 EmptyParser，
+             0 字符且不报错 —— 属于「静默无内容」，比报错更难排查）。同时带来 odf/hwp/mif 等模块，
+             与本次需求无关但不冲突。 -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parser-miscoffice-module</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
+        <!-- 网页归档（.mhtml/.mht）· MIME 域解析器（multipart/related）在这个模块里。
+             注意 mail-commons 只是公共工具类（MailUtil/MailDateParser），**不含**任何 Parser；
+             本机实测只加 mail-commons 时 mhtml 抽出的仍是原始 MIME 报文头（From:/boundary）。
+             该模块传递引入 apache-mime4j-core/dom，不引入 javax/jakarta.mail。 -->
+        <dependency>
+            <groupId>org.apache.tika</groupId>
+            <artifactId>tika-parser-mail-module</artifactId>
+            <version>${tika.version}</version>
+        </dependency>
 
         <!-- [B2b 文档解析层] 测试夹具用 POI 生成 .docx/.xlsx/.pptx（Tika 只负责读）。
              与 Tika 2.9.2 父 POM 管理的 POI 版本锁定 5.2.5，避免 Tika 内部 POI 与这里的 POI 版本错配。

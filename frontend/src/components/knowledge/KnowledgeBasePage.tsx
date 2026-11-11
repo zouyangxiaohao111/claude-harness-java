@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { CSSProperties } from 'react'
 import { ApiError } from '@/api/rest'
 import { knowledgeApi } from '@/api/knowledge'
-import type { Knowledge, KnowledgeBase, KnowledgeListQuery } from '@/api/knowledge'
+import type { KnowledgeBase, KnowledgeListQuery } from '@/api/knowledge'
 import { WikiPanel } from './WikiPanel'
-import { GraphPanel } from './GraphPanel'
 import { KbQaPanel } from './KbQaPanel'
 import { KnowledgeDocPanel } from './KnowledgeDocPanel'
 import { KbSettingsModal } from './KbSettingsModal'
@@ -12,6 +12,8 @@ import { KbSharedSpace } from './KbSharedSpace'
 import { KbCreateModal } from './KbCreateModal'
 import type { KbCreateSubmit } from './KbCreateModal'
 import { KbGalleryPanel } from './KbGalleryPanel'
+import { KbSceneSettingsModal } from './KbSceneSettingsModal'
+import { KbPersonalInfoModal } from './KbPersonalInfoModal'
 
 interface KnowledgeBasePageProps {
   showToast: (msg: string, type?: 'success' | 'info') => void
@@ -93,31 +95,234 @@ const NAV_ITEMS: Array<{
   { key: 'shared',     label: '共享空间', glyph: '◍', handlerKey: 'onOpenSharedSpace' },
 ]
 
+/**
+ * 左下角用户区 · 行内样式。
+ *
+ * <p>取值对齐 `globals.css:17133-17197` 的 `.kb-aside` 家族，让用户区与导航项同视觉重量。
+ */
+const USER_AREA: CSSProperties = {
+  position: 'relative',
+  flexShrink: 0,
+  borderTop: '1px solid #e7e7e7',
+  marginTop: 6,
+  paddingTop: 6,
+}
+const USER_BTN: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  width: '100%',
+  height: 44,
+  padding: '6px 8px 6px 10px',
+  border: 0,
+  borderRadius: 4,
+  background: 'transparent',
+  font: 'inherit',
+  textAlign: 'left',
+  cursor: 'pointer',
+  boxSizing: 'border-box',
+  transition: 'background-color 0.2s ease',
+}
+const AVATAR: CSSProperties = {
+  width: 26,
+  height: 26,
+  borderRadius: '50%',
+  background: '#07c05f',
+  color: '#fff',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  fontSize: 13,
+  fontWeight: 600,
+  flex: '0 0 26px',
+}
+const USER_META: CSSProperties = {
+  display: 'flex',
+  flexDirection: 'column',
+  minWidth: 0,
+  flex: 1,
+  overflow: 'hidden',
+}
+const USER_NAME: CSSProperties = {
+  fontSize: 14,
+  fontWeight: 500,
+  lineHeight: '18px',
+  color: 'rgba(0, 0, 0, 0.9)',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+}
+const USER_EMAIL: CSSProperties = {
+  fontSize: 12,
+  lineHeight: '16px',
+  color: 'rgba(0, 0, 0, 0.4)',
+  overflow: 'hidden',
+  textOverflow: 'ellipsis',
+  whiteSpace: 'nowrap',
+}
+
+/** 上弹抽屉：贴着用户区上边缘弹出（`.kb-aside` 有 `overflow:hidden`，故宽度取 `left/right:0` 自适应）。 */
+const MENU_BOX: CSSProperties = {
+  position: 'absolute',
+  bottom: '100%',
+  left: 0,
+  right: 0,
+  marginBottom: 4,
+  background: '#fff',
+  border: '1px solid #e7e7e7',
+  borderRadius: 8,
+  boxShadow: '0 4px 16px rgba(0, 0, 0, 0.08)',
+  padding: 4,
+  zIndex: 20,
+}
+/** 菜单项：字号/圆角/内边距对齐 `.kb-aside-item` 的紧凑档。 */
+const MENU_ITEM: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  gap: 8,
+  height: 34,
+  padding: '6px 8px 6px 10px',
+  borderRadius: 4,
+  fontSize: 14,
+  fontWeight: 500,
+  color: 'rgba(0, 0, 0, 0.9)',
+  cursor: 'pointer',
+  transition: 'background-color 0.2s ease',
+  boxSizing: 'border-box',
+}
+/** 图标列宽与 `.kb-aside-icon` 的 18px 对齐，保证两项文字左缘与上方导航项齐平。 */
+const MENU_ICON: CSSProperties = {
+  width: 18,
+  flex: '0 0 18px',
+  display: 'flex',
+  alignItems: 'center',
+  justifyContent: 'center',
+  color: 'rgba(0, 0, 0, 0.6)',
+  fontSize: 14,
+}
+
 export function KbSceneNav(props: KbSceneNavProps) {
   const { activeKey = 'knowledge' } = props
+  /** 上弹抽屉是否展开 */
+  const [menuOpen, setMenuOpen] = useState(false)
+  /** 场景级「全部设置」弹窗 */
+  const [sceneSettingsOpen, setSceneSettingsOpen] = useState(false)
+  /** 「个人信息」弹窗 */
+  const [personalInfoOpen, setPersonalInfoOpen] = useState(false)
+  /** 悬停项 key（行内样式做不了 `:hover`，用 state 模拟，取值同 `.kb-aside-item:hover`） */
+  const [hoverKey, setHoverKey] = useState<string | null>(null)
+  /** 用户区容器：点外部关闭抽屉时用来判断点击是否落在里面 */
+  const userAreaRef = useRef<HTMLDivElement>(null)
+
+  // 点抽屉外部关闭（抽屉本身在 userAreaRef 内 ⇒ 点按钮/菜单项不会先被关掉）
+  useEffect(() => {
+    if (!menuOpen) return
+    const onDocClick = (e: MouseEvent) => {
+      if (userAreaRef.current && !userAreaRef.current.contains(e.target as Node)) setMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDocClick)
+    return () => document.removeEventListener('mousedown', onDocClick)
+  }, [menuOpen])
+
+  /**
+   * Esc 逐层退出：抽屉 → 全部设置 → 个人信息，就近的那层先关。
+   *
+   * <p>⚠️ 必须在<b>捕获阶段</b>处理并 `stopPropagation`：App.tsx:2817 有一条
+   * `useEscapeKey(showKnowledge, () => setShowKnowledge(false))`，挂在 window 冒泡阶段；
+   * 两个子弹窗内部也各自挂了冒泡阶段的 Esc。若不在捕获阶段截断，一次 Esc 会
+   * **同时**关掉弹窗和整个知识库场景（实测：`.kb-scene-panel` 计数 1→0）。
+   * 捕获阶段在 window 上最先执行，截断后下层监听器都收不到，于是只退一层。
+   */
+  useEffect(() => {
+    if (!menuOpen && !sceneSettingsOpen && !personalInfoOpen) return
+    const onEscCapture = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      if (personalInfoOpen) setPersonalInfoOpen(false)
+      else if (sceneSettingsOpen) setSceneSettingsOpen(false)
+      else setMenuOpen(false)
+    }
+    window.addEventListener('keydown', onEscCapture, true)
+    return () => window.removeEventListener('keydown', onEscCapture, true)
+  }, [menuOpen, sceneSettingsOpen, personalInfoOpen])
+
   return (
-    <aside className="kb-aside">
-      <div className="kb-aside-top">
-        {NAV_ITEMS.map((item) => {
-          const handler = props[item.handlerKey] as (() => void) | undefined
-          const onClick = item.key === 'knowledge'
-            ? (props.onBackToList ?? handler)
-            : handler
-          return (
-            <button
-              key={item.key}
-              type="button"
-              className={`kb-aside-item${activeKey === item.key ? ' is-active' : ''}`}
-              onClick={onClick}
-              title={item.label}
-            >
-              <span className="kb-aside-icon">{item.glyph}</span>
-              <span className="kb-aside-label">{item.label}</span>
-            </button>
-          )
-        })}
-      </div>
-    </aside>
+    <>
+      <aside className="kb-aside">
+        <div className="kb-aside-top">
+          {NAV_ITEMS.map((item) => {
+            const handler = props[item.handlerKey] as (() => void) | undefined
+            const onClick = item.key === 'knowledge'
+              ? (props.onBackToList ?? handler)
+              : handler
+            return (
+              <button
+                key={item.key}
+                type="button"
+                className={`kb-aside-item${activeKey === item.key ? ' is-active' : ''}`}
+                onClick={onClick}
+                title={item.label}
+              >
+                <span className="kb-aside-icon">{item.glyph}</span>
+                <span className="kb-aside-label">{item.label}</span>
+              </button>
+            )
+          })}
+        </div>
+
+        {/* 左下角用户区（`.kb-aside-top` 的 flex:1 已把它顶到底部，⛔ 不要再加 marginTop:auto） */}
+        <div className="kb-aside-user" ref={userAreaRef} style={USER_AREA}>
+          {menuOpen && (
+            <div className="kb-user-menu" role="menu" style={MENU_BOX}>
+              <div
+                className="kb-user-menu-item"
+                role="menuitem"
+                style={{ ...MENU_ITEM, background: hoverKey === 'personal' ? '#f3f3f3' : 'transparent' }}
+                onMouseEnter={() => setHoverKey('personal')}
+                onMouseLeave={() => setHoverKey(null)}
+                onClick={() => { setMenuOpen(false); setPersonalInfoOpen(true) }}
+              >
+                <span style={MENU_ICON}>◎</span>
+                <span>个人设置</span>
+              </div>
+              <div
+                className="kb-user-menu-item"
+                role="menuitem"
+                style={{ ...MENU_ITEM, background: hoverKey === 'scene-settings' ? '#f3f3f3' : 'transparent' }}
+                onMouseEnter={() => setHoverKey('scene-settings')}
+                onMouseLeave={() => setHoverKey(null)}
+                onClick={() => { setMenuOpen(false); setSceneSettingsOpen(true) }}
+              >
+                <span style={MENU_ICON}>⚙</span>
+                <span>全部设置</span>
+              </div>
+            </div>
+          )}
+
+          <button
+            type="button"
+            className="kb-aside-user-btn"
+            style={{ ...USER_BTN, background: hoverKey === 'user' ? '#f3f3f3' : 'transparent' }}
+            onClick={() => setMenuOpen((v) => !v)}
+            onMouseEnter={() => setHoverKey('user')}
+            onMouseLeave={() => setHoverKey(null)}
+            aria-expanded={menuOpen}
+            aria-haspopup="menu"
+            title="账号菜单"
+          >
+            <span style={AVATAR}>A</span>
+            <span style={USER_META}>
+              <span className="kb-aside-user-name" style={USER_NAME}>admin</span>
+              <span className="kb-aside-user-email" style={USER_EMAIL}>admin@weknora.local</span>
+            </span>
+          </button>
+        </div>
+      </aside>
+
+      {/* 两个弹窗必须挂在 `<aside>` 外：`.kb-aside` 有 `overflow:hidden`，放里面会被裁 */}
+      <KbSceneSettingsModal open={sceneSettingsOpen} onClose={() => setSceneSettingsOpen(false)} />
+      <KbPersonalInfoModal open={personalInfoOpen} onClose={() => setPersonalInfoOpen(false)} />
+    </>
   )
 }
 
@@ -167,17 +372,43 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   const [detailTab, setDetailTab] = useState<'docs' | 'wiki' | 'graph' | 'gallery' | 'qa'>('docs')
   const [bases, setBases] = useState<KnowledgeBase[]>([])
   const [activeBaseId, setActiveBaseId] = useState<string | null>(null)
-  const [items, setItems] = useState<Knowledge[]>([])
+  /**
+   * 每个库的条目数（卡片底部「N 个文档 / N 组问句」用，设计稿 01 页卡片底部就是这个）。
+   *
+   * <p>⚠️ 后端 `GET /knowledge-bases` **不返回** count 字段（只回 18 个字段，见
+   * `api/knowledge.ts:KnowledgeBase`），所以只能对每个库单独拉一次 `listKnowledge({page_size:1})`
+   * 读它的 `total`。库数量是个位数，N 次并行请求可接受；失败时该库不显示计数（⛔ 不显示 0 冒充）。
+   */
+  const [itemCounts, setItemCounts] = useState<Record<string, number>>({})
   const [total, setTotal] = useState(0)
   const [loadingBases, setLoadingBases] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [keyword, setKeyword] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
   const [createOpen, setCreateOpen] = useState(false)
-  const [uploading, setUploading] = useState(false)
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
   /** 设置弹窗（详情页右上角齿轮）*/
   const [settingsOpen, setSettingsOpen] = useState(false)
+  /** 信息弹层（详情页标题行右侧 ℹ 圆钮，对齐源码 KBInfoPopover） */
+  const [infoOpen, setInfoOpen] = useState(false)
+
+  /**
+   * 当前已挂载解析引擎**不支持**的扩展名 —— 对齐源码
+   * `KnowledgeBase.vue:2508` 的 `unsupportedFileTypes` 提示条。
+   *
+   * <p>数据源：`GET /system/parser-engines`（本仓已有，返回 Name/FileTypes/Available）。
+   * 口径 = 「所有 Available=true 引擎声明支持的类型」的并集，再与用户最常传的几类求差。
+   */
+  const [engineTypes, setEngineTypes] = useState<{ supported: Set<string>; checked: boolean }>({
+    supported: new Set(),
+    checked: false,
+  })
+  const unsupportedFileTypes = useMemo(() => {
+    if (!engineTypes.checked) return []
+    /** 用户最常传、且缺引擎时后果最明显的几类（与源码提示条同一组） */
+    const WATCHED = ['bmp', 'gif', 'jpeg', 'jpg', 'pdf', 'png', 'tiff', 'webp']
+    return WATCHED.filter((ext) => !engineTypes.supported.has(ext))
+  }, [engineTypes])
   /**
    * 分类标签（设计稿 .toolbar 里的胶囊组：全部 / 收藏 / 最近 / 本空间 / 我创建的）。
    *
@@ -192,6 +423,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
     () => bases.find((b) => b.id === activeBaseId) ?? null,
     [bases, activeBaseId]
   )
+
+  /**
 
   /**
    * 列表页展示的库：按「分类 + 搜索 + 排序」派生。
@@ -222,6 +455,22 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
       const list = await knowledgeApi.listBases()
       setBases(list)
       setActiveBaseId((prev) => (prev && list.some((b) => b.id === prev) ? prev : (list[0]?.id ?? null)))
+      // 并行拉每个库的条目总数（卡片底部「N 个文档 / N 组问句」，设计稿 01 页要这个）。
+      // 失败静默：拿不到就不显示计数，⛔ 不用 0 冒充。
+      void Promise.all(
+        list.map(async (b) => {
+          try {
+            const p = await knowledgeApi.listKnowledge(b.id, { page: 1, page_size: 1 })
+            return [b.id, p.total] as const
+          } catch {
+            return null
+          }
+        }),
+      ).then((pairs) => {
+        const next: Record<string, number> = {}
+        for (const p of pairs) if (p) next[p[0]] = p[1]
+        setItemCounts(next)
+      })
     } catch (e) {
       setError(toMessage(e))
     } finally {
@@ -246,7 +495,6 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   //   这里只取一份用于页头展示。⛔ 不要在这里也做一套轮询 —— 两个定时器会互相打架。
   const loadItems = useCallback(async () => {
     if (!activeBaseId) {
-      setItems([])
       setTotal(0)
       return
     }
@@ -255,7 +503,6 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
       if (keyword.trim()) query.keyword = keyword.trim()
       if (statusFilter) query.parse_status = statusFilter
       const page = await knowledgeApi.listKnowledge(activeBaseId, query)
-      setItems(page.data)
       setTotal(page.total)
       setError(null)
     } catch (e) {
@@ -267,6 +514,39 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
     if (view !== 'detail') return
     void loadItems()
   }, [view, loadItems])
+
+  /**
+   * 拉一次解析引擎清单，算出「当前没有任何可用引擎能解析的扩展名」。
+   *
+   * <p>对齐源码 `KnowledgeBase.vue:2508` 的提示条。只拉一次（引擎能力不随选库变化），
+   * 失败就静默降级（不显示提示条）—— 提示条缺席比报错阻塞页面好。
+   */
+  useEffect(() => {
+    let alive = true
+    ;(async () => {
+      try {
+        // ⚠️ `listParserEngines` 已在 api 层解包，直接是数组（不是 { success, data }）
+        const engines = await knowledgeApi.listParserEngines()
+        if (!alive) return
+        const supported = new Set<string>()
+        for (const e of engines ?? []) {
+          if (!e.Available) continue
+          for (const t of e.FileTypes ?? []) {
+            supported.add(String(t).replace(/^\./, '').toLowerCase())
+          }
+        }
+        setEngineTypes({ supported, checked: true })
+        console.info(
+          `[知识库] 解析引擎清单 engines=${(engines ?? []).length} 可用类型=${supported.size}`
+        )
+      } catch (e) {
+        // 拿不到清单 = 无法判断，不显示提示条（⛔ 不要谎报「全部不支持」）
+        console.warn(`[知识库] 解析引擎清单加载失败，跳过不支持类型提示：${String(e)}`)
+        if (alive) setEngineTypes({ supported: new Set(), checked: false })
+      }
+    })()
+    return () => { alive = false }
+  }, [])
 
   // ── 操作 ──────────────────────────────────────────────────────
   const openBase = (base: KnowledgeBase) => {
@@ -281,10 +561,12 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   /**
    * 创建知识库。
    *
-   * <p>⭐ 参数来自 {@link KbCreateModal}。本仓 `CreateKnowledgeBaseRequest` 的
-   * 真实字段是 `name` / `description` / `type` / `embeddingModelId` / `summaryModelId`；
-   * 分块大小与重叠是「上传时的解析参数」，不在创建请求里 ⇒ 这里只落前三个，
-   * 分块值记进 localStorage，供上传面板读取（⛔ 不假装写进了后端）。
+   * <p>⭐ 参数来自 {@link KbCreateModal}。后端 `CreateKnowledgeBaseRequest` 接收
+   * `name` / `description` / `type` / `embedding_model_id` / `summary_model_id` /
+   * **`indexing_strategy`**（本批补的，源侧创建时同一个请求就带它）。
+   *
+   * <p>分块大小与重叠仍是「上传时的解析参数」，不在创建请求里 ⇒ 记进 localStorage
+   * 供上传面板读取（⛔ 不假装写进了后端）。
    */
   const handleCreateBase = async (payload: KbCreateSubmit) => {
     try {
@@ -292,6 +574,9 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         name: payload.name,
         description: payload.description || undefined,
         type: payload.type,
+        // ⭐ RAG / Wiki 开关 —— Wiki 的启用**只**由这个字段承载
+        //    （源码 KnowledgeBaseEditorModal.vue:1675）。null ⇒ 不写（FAQ 库走这条）。
+        indexing_strategy: payload.indexingStrategy ?? undefined,
       })
       try {
         window.localStorage.setItem(
@@ -327,7 +612,6 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
 
   const handleUpload = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0 || !activeBaseId) return
-    setUploading(true)
     let ok = 0
     const failures: string[] = []
     for (const file of Array.from(fileList)) {
@@ -338,7 +622,6 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         failures.push(`${file.name}: ${toMessage(e)}`)
       }
     }
-    setUploading(false)
     if (fileInputRef.current) fileInputRef.current.value = ''
     if (ok > 0) showToast(`已上传 ${ok} 个文件，正在解析`, 'success')
     if (failures.length > 0) showToast(failures.join('；'), 'info')
@@ -375,93 +658,146 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   if (view === 'list') {
     return (
       <>
-      <div className="kb-page">
+      <div className="kb-list-container">
         <div className="kb-list-content">
-          <div className="kb-header">
-            <div className="kb-title-row">
-              <h2 className="kb-h2">
-                <svg className="kb-h2-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-                  <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />
-                </svg>
-                知识库
-              </h2>
-              <div className="kb-header-actions">
+          {/* 页头：源站 KnowledgeBaseList.vue:4-25 —— header > header-title > title-row > (h2 + header-actions) */}
+          <div className="header">
+            <div className="header-title">
+              <div className="title-row">
+                {/* 标题字号由源站 CSS 提供：`.header h2 { font-size: var(--app-text-4xl) }`，
+                    该 token 的定义在源站 `assets/theme/theme.css:273`（24px），
+                    已随 kb-scope.css 一并落库 ⇒ 这里不需要内联兜底。 */}
+                <h2>
+                  {/* 源站 ResourceIcon.vue 是 <span class="resource-icon" style="mask-image:url(svg)">，
+                      由 background-color 填充遮罩；本仓没有该组件，改用真 <svg> 自绘 ⇒
+                      必须把 `background-color:currentColor` 清掉，否则 24×24 会变成实心色块。
+                      （设计稿 mock-chrome.css:343 对同一元素就是 `background:none !important`） */}
+                  <svg className="resource-icon" width={24} height={24} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" style={{ backgroundColor: 'transparent' }}>
+                    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />
+                  </svg>
+                  知识库
+                </h2>
+                {/* ⭐ 源站 .header-actions 与 h2 平级（同在 .title-row 内） */}
+                <div className="header-actions">
+                  {/* 排序：源站 ResourceSortControl.vue:20 —— .resource-sort-trigger */}
+                  <button
+                    type="button"
+                    className="resource-sort-trigger"
+                    onClick={() => setSortBy(
+                      sortBy === 'updated' ? 'created' : sortBy === 'created' ? 'name' : 'updated'
+                    )}
+                    title="切换排序"
+                  >
+                    <span className="resource-sort-trigger__label">
+                      排序 · {sortBy === 'updated' ? '最近更新' : sortBy === 'created' ? '创建时间' : '名称'}
+                    </span>
+                  </button>
+                  {/* ⛔ 设计稿 01 页的 .header-actions 只有「排序 + 新建」两个按钮（无关闭）。
+                      实测设计稿 headerActions = ["排序 · 最近更新", "＋ 新建知识库"]。
+                      「退出」由 Esc / 点遮罩承担（App.tsx:2817 useEscapeKey + 3244 遮罩 onClick）。 */}
+                  {/* 真机实测：源侧是白底 text 按钮（13px / 32px 高 / 圆角 6px），
+                      ⛔ 不是绿底主按钮 —— 绿底是「创建知识库」弹窗里的确认按钮。 */}
+                  <button
+                    type="button"
+                    className="t-button t-button--variant-text t-button--theme-default t-button--shape-rectangle t-size-s header-action-btn"
+                    onClick={() => setCreateOpen(true)}
+                  >
+                    <span className="t-button__text">＋ 新建知识库</span>
+                  </button>
+                </div>
+              </div>
+              <p className="header-subtitle">管理和组织您的知识库，支持文档型和问答型知识库</p>
+            </div>
+          </div>
+
+          {/* 工具条：源站 ResourceListToolbar.vue —— .resource-toolbar > .scope-filters > .category-tabs */}
+          <div className="resource-toolbar">
+            <div className="scope-filters">
+              <div className="category-tabs" role="group" aria-label="分类">
+                {([
+                  ['all', '全部', bases.length],
+                  ['fav', '收藏', bases.filter((b) => b.is_pinned).length],
+                  ['recent', '最近', bases.length],
+                  // ⚠️ 设计稿 01 页有 5 个分类（全部/收藏/最近/本空间/我创建的）。
+                  // 本仓 `KnowledgeBase` 契约**没有** creator / space 字段
+                  // （见 api/knowledge.ts:只回 18 个字段，无 owner/space）
+                  // ⇒ 这两项无法真实过滤。在这里如实呈现为「不可用」而不是造一个假列表。
+                  ['space', '本空间', 0],
+                  ['mine', '我创建的', 0],
+                ] as const).map(([key, label, count]) => {
+                  const unavailable = key === 'space' || key === 'mine'
+                  return (
+                  <button
+                    key={key}
+                    type="button"
+                    aria-pressed={category === key}
+                    aria-disabled={unavailable || undefined}
+                    title={unavailable ? '本仓知识库契约无 owner/space 字段，无法按此过滤' : undefined}
+                    onClick={() => {
+                      if (unavailable) {
+                        showToast('本仓知识库无「所属空间/创建者」字段，暂不支持该分类', 'info')
+                        return
+                      }
+                      setCategory(key)
+                    }}
+                  >
+                    {label}<span className="scope-count">{count}</span>
+                  </button>
+                  )
+                })}
+              </div>
+            </div>
+            {/* 搜索：源站是 t-input；本仓无 TDesign 组件，手写三层 .t-input__wrap > .t-input > .t-input__inner
+                （源站 class 落在 t-input__wrap 上，`.search-input .t-input` 才能命中内层） */}
+            <div className="t-input__wrap search-input">
+              <div className="t-input">
                 <input
-                  className="kb-input kb-header-search"
+                  className="t-input__inner"
                   placeholder="搜索知识库…"
+                  aria-label="搜索知识库"
                   value={keyword}
                   onChange={(e) => setKeyword(e.target.value)}
                 />
-                {closeScene && (
-                  <button type="button" className="kb-btn ghost" onClick={closeScene}>
-                    ✕ 关闭
-                  </button>
-                )}
-                {/* 设计稿是 .primary（绿底白字 fw500），⛔ 不是白底 ghost */}
-                {/* 真机实测：源侧是白底 text 按钮（13px / 32px 高 / 圆角 6px），
-                    ⛔ 不是绿底主按钮 —— 绿底是「创建知识库」弹窗里的确认按钮。 */}
-                <button type="button" className="kb-btn" onClick={() => setCreateOpen(true)}>
-                  ＋ 新建知识库
-                </button>
               </div>
             </div>
-            <p className="kb-subtitle">管理和组织您的知识库，支持文档型和问答型知识库</p>
-          </div>
-
-          {/* 工具条：分类胶囊 + 排序 + 搜索（设计稿 .toolbar） */}
-          <div className="kb-toolbar">
-            <div className="kb-cat-tabs" role="tablist" aria-label="分类">
-              {([
-                ['all', '全部', bases.length],
-                ['fav', '收藏', bases.filter((b) => b.is_pinned).length],
-                ['recent', '最近', bases.length],
-              ] as const).map(([key, label, count]) => (
-                <button
-                  key={key}
-                  type="button"
-                  role="tab"
-                  aria-selected={category === key}
-                  className={`kb-cat${category === key ? ' on' : ''}`}
-                  onClick={() => setCategory(key)}
-                >
-                  {label}<span className="kb-cat-n">{count}</span>
-                </button>
-              ))}
-            </div>
-            <button
-              type="button"
-              className="kb-sort-trigger"
-              onClick={() => setSortBy(
-                sortBy === 'updated' ? 'created' : sortBy === 'created' ? 'name' : 'updated'
-              )}
-              title="切换排序"
-            >
-              排序 · {sortBy === 'updated' ? '最近更新' : sortBy === 'created' ? '创建时间' : '名称'}
-            </button>
           </div>
 
           {error && <div className="kb-err">{error}</div>}
 
           <div className="kb-list-main">
+            {/* 骨架屏：源站 KnowledgeBaseList.vue:47-61 —— .kb-card.kb-card-skeleton.is-skeleton
+                ⚠️ 本仓无 t-skeleton，内部保留 .kb-skel* 由 globals.css 兜底 */}
             {loadingBases && bases.length === 0 && (
               <div className="kb-card-wrap">
                 {[0, 1, 2, 3, 4, 5].map((n) => (
-                  <div className="kb-card kb-card-skeleton" key={n}>
-                    <div className="kb-card-header"><div className="kb-skel kb-skel-title" /></div>
-                    <div className="kb-card-content"><div className="kb-skel kb-skel-line" /></div>
-                    <div className="kb-card-bottom"><div className="kb-skel kb-skel-badge" /></div>
+                  <div className="kb-card kb-card-skeleton is-skeleton" key={n}>
+                    <div className="card-header"><div className="kb-skel kb-skel-title" /></div>
+                    <div className="card-content"><div className="kb-skel kb-skel-line" /></div>
+                    <div className="card-bottom"><div className="kb-skel kb-skel-badge" /></div>
                   </div>
                 ))}
               </div>
             )}
 
+            {/* 空态：源站 EmptyState.vue —— .wk-empty-state 系列 */}
             {!loadingBases && bases.length === 0 && (
-              <div className="kb-empty-cards">
-                <div className="kb-empty-title">还没有知识库</div>
-                <div className="kb-empty-sub">创建第一个知识库，然后上传文档开始构建你的知识底座</div>
-                <button type="button" className="kb-btn primary" onClick={() => setCreateOpen(true)}>
-                  新建知识库
-                </button>
+              <div className="wk-empty-state">
+                <div className="wk-empty-state__icon">
+                  <svg width={32} height={32} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />
+                  </svg>
+                </div>
+                <div className="wk-empty-state__title">还没有知识库</div>
+                <div className="wk-empty-state__desc">创建第一个知识库，然后上传文档开始构建你的知识底座</div>
+                <div className="wk-empty-state__actions">
+                  <button
+                    type="button"
+                    className="t-button t-button--variant-base t-button--theme-primary t-button--shape-rectangle"
+                    onClick={() => setCreateOpen(true)}
+                  >
+                    <span className="t-button__text">新建知识库</span>
+                  </button>
+                </div>
               </div>
             )}
 
@@ -470,9 +806,10 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                 {filteredBases
                   .map((base) => {
                     const meta = KB_TYPE_META[base.type] ?? KB_TYPE_META.document
+                    const isFaq = base.type === 'faq'
                     return (
                       <div
-                        className={`kb-card kb-type-${base.type || 'document'}`}
+                        className={`kb-card ${isFaq ? 'kb-type-faq' : 'kb-type-document'}`}
                         key={base.id}
                         role="link"
                         tabIndex={0}
@@ -484,11 +821,12 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                           }
                         }}
                       >
-                        {/* ⭐ 收藏星标（设计稿 .kb-favorite-star）：置顶即收藏 */}
+                        {/* ⭐ 收藏星标（源站 KnowledgeBaseList.vue:395-398）：置顶即收藏 */}
                         <button
                           type="button"
-                          className={`kb-fav${base.is_pinned ? ' on' : ''}`}
+                          className={`kb-favorite-star${base.is_pinned ? ' is-favorited' : ''}`}
                           title={base.is_pinned ? '取消收藏' : '收藏'}
+                          aria-label="收藏"
                           aria-pressed={!!base.is_pinned}
                           onClick={async (e) => {
                             e.stopPropagation()
@@ -502,49 +840,129 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                         >
                           {base.is_pinned ? '★' : '☆'}
                         </button>
-                        <div className="kb-card-header">
-                          <span className="kb-card-avatar">{meta.mark}</span>
-                          <span className="kb-card-title" title={base.name}>
-                            <span className="kb-card-title-text">{base.name}</span>
-                          </span>
-                          <div className="kb-more-wrap" onClick={(e) => e.stopPropagation()}>
-                            <button
-                              type="button"
-                              className={`kb-more${openMenuId === base.id ? ' active' : ''}`}
-                              aria-label="更多操作"
-                              aria-expanded={openMenuId === base.id}
-                              onClick={() => setOpenMenuId((v) => (v === base.id ? null : base.id))}
-                            >
-                              <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16">
-                                <circle cx="5" cy="12" r="1.8" />
-                                <circle cx="12" cy="12" r="1.8" />
-                                <circle cx="19" cy="12" r="1.8" />
+                        <div className="card-header">
+                          {/* 类型图标：源站 KbTypeAvatar.vue —— 16px SVG，不是字符 */}
+                          <span className={`kb-type-avatar ${isFaq ? 'is-faq' : 'is-document'}`} aria-hidden="true">
+                            {isFaq ? (
+                              <svg className="kb-type-icon kb-faq-icon" width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M5 4h14a2 2 0 0 1 2 2v11a2 2 0 0 1-2 2H9l-5 3v-3a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2Z" />
+                                <g className="kb-faq-question">
+                                  <path d="M9.5 9a2.5 2.5 0 0 1 5 .5c0 1.5-2.5 1.5-2.5 3" />
+                                  <circle cx="12" cy="15.5" r="0.8" fill="currentColor" stroke="none" />
+                                </g>
                               </svg>
-                            </button>
-                            {openMenuId === base.id && (
-                              <div className="kb-menu" onMouseDown={(e) => e.stopPropagation()}>
-                                <button
-                                  type="button"
-                                  className="kb-menu-item danger"
-                                  onClick={() => void handleDeleteBase(base)}
-                                >
-                                  删除知识库
-                                </button>
-                              </div>
+                            ) : (
+                              <svg className="kb-type-icon kb-folder-icon" width={16} height={16} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.7} strokeLinecap="round" strokeLinejoin="round">
+                                <path d="M3 19V6a2 2 0 0 1 2-2h4l2 3h8a2 2 0 0 1 2 2v8a2 2 0 0 1-2 2Z" />
+                                <g className="kb-folder-paper">
+                                  <rect x="7" y="8" width="10" height="10" rx="1" />
+                                  <path d="M10 11h4m-4 3h4" />
+                                </g>
+                                <path className="kb-folder-front" d="M3 9h18v8a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2Z" />
+                              </svg>
                             )}
-                          </div>
+                          </span>
+                          <span className="card-title" title={base.name}>
+                            <span className="card-title-text">{base.name}</span>
+                          </span>
+                          <button
+                            type="button"
+                            className={`more-wrap${openMenuId === base.id ? ' active-more' : ''}`}
+                            aria-label="展开"
+                            aria-expanded={openMenuId === base.id}
+                            aria-haspopup="true"
+                            onClick={(e) => {
+                              e.stopPropagation()
+                              setOpenMenuId((v) => (v === base.id ? null : base.id))
+                            }}
+                          >
+                            <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true">
+                              <circle cx="5" cy="12" r="1.8" />
+                              <circle cx="12" cy="12" r="1.8" />
+                              <circle cx="19" cy="12" r="1.8" />
+                            </svg>
+                          </button>
+                          {/* 菜单：源站是 t-popup（overlayClassName=card-more-popup）；
+                              本仓无 TDesign，保留现有"卡内绝对定位"实现，类名换 .popup-menu。
+                              ⚠️ 定位值内联：globals.css 里 .kb-menu 的绝对定位随旧类名一起弃用，
+                              而 kb-*.css 只负责 .popup-menu 的外观（flex + item 样式），不含定位。 */}
+                          {openMenuId === base.id && (
+                            <div
+                              className="popup-menu"
+                              style={{ position: 'absolute', top: 44, right: 8, zIndex: 20, minWidth: 132, padding: 4, border: '1px solid var(--td-component-stroke, #e7e7e7)', borderRadius: 10, background: 'var(--td-bg-color-container, #fff)', boxShadow: '0 6px 20px rgba(0, 0, 0, 0.10)' }}
+                              onMouseDown={(e) => e.stopPropagation()}
+                            >
+                              {/* 置顶 / 取消置顶：源站 KnowledgeBaseList.vue:415-418（handleTogglePin）。
+                                  ⚠️ 本仓原有菜单只有「删除」，派单书 §4 DOM 骨架要求补这一项。
+                                  逻辑**整段复用卡片星标**已有调用（togglePin → loadBases → 关菜单），
+                                  不新增 API、不新增 state、不改任何既有 handler 函数体。 */}
+                              <div
+                                className="popup-menu-item"
+                                role="button"
+                                tabIndex={0}
+                                style={{ borderRadius: 4 }}
+                                onClick={async (e) => {
+                                  e.stopPropagation()
+                                  try {
+                                    await knowledgeApi.togglePin(base.id)
+                                    await loadBases()
+                                    setOpenMenuId(null)
+                                  } catch (err) {
+                                    showToast(toMessage(err), 'info')
+                                  }
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                  }
+                                }}
+                              >
+                                <span>{base.is_pinned ? '取消置顶' : '置顶'}</span>
+                              </div>
+                              <div
+                                className="popup-menu-item delete"
+                                role="button"
+                                tabIndex={0}
+                                style={{ borderRadius: 4 }}
+                                onClick={(e) => {
+                                  e.stopPropagation()
+                                  void handleDeleteBase(base)
+                                }}
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' || e.key === ' ') {
+                                    e.preventDefault()
+                                    e.stopPropagation()
+                                    void handleDeleteBase(base)
+                                  }
+                                }}
+                              >
+                                <span>删除知识库</span>
+                              </div>
+                            </div>
+                          )}
                         </div>
-                        <div className="kb-card-content">
-                          <div className={`kb-card-desc${base.description ? '' : ' is-empty'}`}>
+                        <div className="card-content">
+                          <div className={`card-description${base.description ? '' : ' is-empty'}`}>
                             {base.description || '暂无描述'}
                           </div>
                         </div>
-                        <div className="kb-card-bottom">
-                          <span className="kb-badge">
-                            <span className="kb-badge-mark">{meta.mark}</span>
-                            {meta.label}
-                          </span>
-                          <span className="kb-card-time">{base.updated_at ?? ''}</span>
+                        <div className="card-bottom">
+                          <div className="bottom-left">
+                            <div className="feature-badges">
+                              <div className={`feature-badge is-count ${isFaq ? 'type-faq' : 'type-document'}`}>
+                                <span aria-hidden="true">{meta.mark}</span>
+                                {/* 设计稿 01 页卡片底部是「N 个文档」/「N 组问句」（实测：
+                                    ["▤|1 个文档","▤|0 个文档","💬|24 组问句"]），
+                                    不是类型名。计数拿不到时回落成类型名（不显示 0 冒充）。 */}
+                                <span className="badge-count">
+                                  {itemCounts[base.id] == null
+                                    ? meta.label
+                                    : `${itemCounts[base.id]} ${isFaq ? '组问句' : '个文档'}`}
+                                </span>
+                              </div>
+                            </div>
+                          </div>
                         </div>
                       </div>
                     )
@@ -566,132 +984,180 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
     <div className="kb-page">
       <div className="kb-list-content">
         {/* 面包屑：知识库 › 当前库（点「知识库」回列表 —— 这就是用户要的退出路径） */}
-        <div className="kb-header">
+        {/* ⚠️ 容器类名必须是 `document-header`（不是自造的 kb-header）：
+            kb-shared.css 里这一整块规则全是 `.kb-scope .document-header .xxx` 后代选择器，
+            缺这一层 ⇒ `.breadcrumb-separator{font-size:14px}` 等规则**全部不命中**，
+            `<svg>` 退回默认尺寸 300×150（截图里那个巨大箭头就是这么来的）。 */}
+        <div className="document-header">
+          <div className="document-header-title">
           <div className="kb-title-row">
-            <h2 className="kb-breadcrumb">
-              <button type="button" className="kb-crumb-link" onClick={() => setView('list')}>
+            {/* ⭐ 结构逐字对齐源码 KnowledgeBase.vue:2458-2495：
+                h2.document-breadcrumb > (breadcrumb-link 知识库) + 分隔 + (当前库下拉)
+                + 分隔 + div.kb-view-tabs > button.kb-view-tab[role=tab]
+                标题行右侧 kb-title-actions = 信息(ℹ) + 设置(⚙) 两个圆钮。
+                ⛔ 之前这里是自造的 kb-breadcrumb / kb-detail-tabs / kb-header-actions。 */}
+            <h2 className="document-breadcrumb">
+              <button type="button" className="breadcrumb-link" onClick={() => setView('list')}>
                 知识库
               </button>
-              <svg className="kb-crumb-sep" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.8}>
+              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
                 <path d="M9 5l7 7-7 7" />
               </svg>
-              <span className="kb-crumb-current">{activeBase?.name ?? '—'}</span>
+              <button type="button" className="breadcrumb-link dropdown" disabled={!activeBaseId}>
+                <span>{activeBase?.name ?? '—'}</span>
+                {bases.length > 1 && (
+                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <path d="M6 9l6 6 6-6" />
+                  </svg>
+                )}
+              </button>
+              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                <path d="M9 5l7 7-7 7" />
+              </svg>
+              {/* ⭐ tabs：文档 / Wiki / 图谱 / 画廊 —— **四个恒定显示**。
+                  ⚠️ 设计稿 02（文档列表）、03（Wiki）、04（图谱）三页的 header
+                  都是这 4 个 tab 全在（已逐页核对），用户也确认「所有知识库都显示」。
+                  ⛔ 不要按源码 `if (isWiki) {wiki, graph}` 的条件渲染 ——
+                  本仓 `indexing_strategy` 常为 NULL，条件渲染会让这两个 tab
+                  **在所有库上永久消失**（用户报的正是这个）。
+                 点进 Wiki/图谱时若库没开 wiki 能力，由对应面板自己说明未启用。 */}
+              <div className="kb-view-tabs" role="tablist" aria-label="知识库视图">
+                <button
+                  type="button" role="tab"
+                  className={`kb-view-tab${detailTab === 'docs' ? ' active' : ''}`}
+                  aria-selected={detailTab === 'docs'}
+                  onClick={() => setDetailTab('docs')}
+                >
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <path d="M4 22h16V8h-6V2H4v20Z" /><path d="M14 2v6h6m-6-6h1l5 5v1m-6-6H4v20h16V8" />
+                  </svg>
+                  <span>文档</span>
+                </button>
+                <button
+                  type="button" role="tab"
+                  className={`kb-view-tab${detailTab === 'wiki' ? ' active' : ''}`}
+                  aria-selected={detailTab === 'wiki'}
+                  onClick={() => setDetailTab('wiki')}
+                >
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <path d="M2 4h9v17H2V4Zm11 0h9v17h-9V4Z" /><path d="M5 8h3M5 12h3M5 16h3M16 8h3M16 12h3" />
+                  </svg>
+                  <span>Wiki</span>
+                </button>
+                <button
+                  type="button" role="tab"
+                  className={`kb-view-tab${detailTab === 'graph' ? ' active' : ''}`}
+                  aria-selected={detailTab === 'graph'}
+                  onClick={() => setDetailTab('graph')}
+                >
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <circle cx="6" cy="6" r="2.6" /><circle cx="18" cy="7" r="2.6" /><circle cx="12" cy="18" r="2.6" />
+                    <path d="M8.2 7.2 15.6 8M7.3 8.3l3.5 7.6M16.7 9.2l-3.4 6.6" />
+                  </svg>
+                  <span>图谱</span>
+                </button>
+                <button
+                  type="button" role="tab"
+                  className={`kb-view-tab${detailTab === 'gallery' ? ' active' : ''}`}
+                  aria-selected={detailTab === 'gallery'}
+                  onClick={() => setDetailTab('gallery')}
+                >
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <rect x="2.5" y="4.5" width="19" height="15" rx="2" /><circle cx="8.5" cy="10" r="1.6" /><path d="M4 17l5-4.5 4 3.5 3.5-3L21 17" />
+                  </svg>
+                  <span>画廊</span>
+                </button>
+              </div>
             </h2>
-            <div className="kb-header-actions">
+            {/* ⭐ 标题行右侧动作锚点：源码 kb-title-actions = 信息 + 设置（两个圆形按钮）。
+                ⚠️ 额外保留「关闭」：源码是独立路由页（浏览器可后退），本仓是浮层，
+                没有浏览器后退 ⇒ ⛔ 不能按源码删掉它，否则唯一出口消失（死锁）。 */}
+            <div className="kb-title-actions">
               {closeScene && (
-                <button type="button" className="kb-btn ghost" onClick={closeScene}>
-                  ✕ 关闭
+                <button
+                  type="button"
+                  className="kb-btn ghost"
+                  onClick={closeScene}
+                  title="关闭知识库"
+                  aria-label="关闭知识库"
+                >
+                  ✕
                 </button>
               )}
-              <button type="button" className="kb-btn ghost" onClick={() => void loadItems()}>
-                刷新
+              <button
+                type="button"
+                className="kb-info-button"
+                title="知识库信息"
+                aria-label="知识库信息"
+                onClick={() => setInfoOpen((v) => !v)}
+              >
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                  <circle cx="12" cy="12" r="9.2" /><path d="M12 11v6M12 7.6v.8" />
+                </svg>
               </button>
               <button
                 type="button"
-                className="kb-btn"
-                onClick={() => setSettingsOpen(true)}
+                className="kb-settings-button"
                 title="知识库设置"
+                aria-label="知识库设置"
+                disabled={!activeBaseId}
+                onClick={() => setSettingsOpen(true)}
               >
-                ⚙ 设置
+                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.7} aria-hidden="true">
+                  <circle cx="12" cy="12" r="3.1" />
+                  <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v0a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
+                </svg>
               </button>
-              <button
-                type="button"
-                className="kb-btn primary"
-                disabled={!activeBaseId || uploading}
-                onClick={() => fileInputRef.current?.click()}
-              >
-                {uploading ? '上传中…' : '＋ 上传文档'}
-              </button>
-              <input
-                ref={fileInputRef}
-                type="file"
-                multiple
-                hidden
-                onChange={(e) => void handleUpload(e.target.files)}
-              />
             </div>
           </div>
-          <p className="kb-subtitle">
+          </div>
+          <p className="document-subtitle">
             {activeBase?.description || `${total} 个文档 · 解析完成后即可被检索`}
           </p>
-          {/* ⭐ 详情页 Tab（源侧形态：Wiki 是知识库的子页，不是独立入口） */}
-          <div className="kb-detail-tabs" role="tablist">
-            <button
-              type="button"
-              role="tab"
-              aria-selected={detailTab === 'docs'}
-              className={`kb-detail-tab${detailTab === 'docs' ? ' is-active' : ''}`}
-              onClick={() => setDetailTab('docs')}
-            >
-              文档
-              <span className="kb-detail-tab-count">{total}</span>
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={detailTab === 'wiki'}
-              className={`kb-detail-tab${detailTab === 'wiki' ? ' is-active' : ''}`}
-              onClick={() => setDetailTab('wiki')}
-            >
-              Wiki
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={detailTab === 'graph'}
-              className={`kb-detail-tab${detailTab === 'graph' ? ' is-active' : ''}`}
-              onClick={() => setDetailTab('graph')}
-            >
-              图谱
-            </button>
-            {/* ⭐ QA-13：问答 tab（源侧 KB 详情页没有 ⇒ 本仓新增，不属于「复刻」） */}
-            <button
-              type="button"
-              role="tab"
-              aria-selected={detailTab === 'gallery'}
-              className={`kb-detail-tab${detailTab === 'gallery' ? ' is-active' : ''}`}
-              onClick={() => setDetailTab('gallery')}
-            >
-              画廊
-            </button>
-            <button
-              type="button"
-              role="tab"
-              aria-selected={detailTab === 'qa'}
-              className={`kb-detail-tab${detailTab === 'qa' ? ' is-active' : ''}`}
-              onClick={() => setDetailTab('qa')}
-            >
-              问答
-            </button>
-          </div>
+          {/* ⭐ 源码 KnowledgeBase.vue:2508-2515：有不可解析的扩展名时提示去配置（点整行走设置） */}
+          {unsupportedFileTypes.length > 0 && (
+            <p className="parser-hint" onClick={() => setSettingsOpen(true)}>
+              <svg className="parser-hint-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                <circle cx="12" cy="12" r="9.2" /><path d="M12 11v6M12 7.6v.8" />
+              </svg>
+              <span>
+                部分文档类型（{unsupportedFileTypes.map((t) => '.' + t).join('、')}）暂无可用解析引擎，上传后将无法解析
+              </span>
+              <span className="parser-hint-link">前往配置 →</span>
+            </p>
+          )}
         </div>
 
         {detailTab === 'wiki' ? (
           activeBaseId ? (
             <WikiPanel
               baseId={activeBaseId}
-              baseName={activeBase?.name}
               showToast={showToast}
+              initialView="tree"
             />
           ) : (
-            <div className="kb-wiki-loading">正在加载知识库…</div>
+            <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>
           )
         ) : detailTab === 'graph' ? (
+          /* ⭐ 图谱 tab = **同一个 WikiPanel 的 graph 视图**（源码 KnowledgeBase.vue:2526：
+             `<WikiBrowser :view="activeKbTab === 'graph' ? 'graph' : 'browser'" />`）。
+             ⛔ 不是 GraphPanel —— 那是「文档抽出的实体关系星图」（暗色背景 + 29 实体/55 关系），
+             与源码的「Wiki 页面关系图 + 480px 节点抽屉」是两套完全不同的东西。
+             用户已指出接错（图一 vs 图二）。 */
           activeBaseId ? (
-            <GraphPanel
+            <WikiPanel
               baseId={activeBaseId}
-              baseName={activeBase?.name}
-              knowledgeOptions={items.map((k) => ({ id: k.id, title: k.title || k.file_name || k.id }))}
               showToast={showToast}
+              initialView="graph"
             />
           ) : (
-            <div className="kb-wiki-loading">正在加载知识库…</div>
+            <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>
           )
         ) : detailTab === 'gallery' ? (
           activeBaseId ? (
             <KbGalleryPanel baseId={activeBaseId} showToast={showToast} />
           ) : (
-            <div className="kb-wiki-loading">正在加载知识库…</div>
+            <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>
           )
         ) : detailTab === 'qa' ? (
           activeBaseId ? (
@@ -702,7 +1168,7 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
               showToast={showToast}
             />
           ) : (
-            <div className="kb-wiki-loading">正在加载知识库…</div>
+            <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>
           )
         ) : (
           /* ⭐ FAQ 型知识库走条目管理（结构化问答对），文档库才走文件列表 */
@@ -720,6 +1186,64 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
       </div>
 
       {createModalEl}
+
+      {/* ⚠️ 隐藏文件输入：**不是 UI 入口**（源码 header 也没有上传按钮），
+          只给文档区空态按钮「上传文档」用 —— `KnowledgeDocPanel.onRequestUpload`
+          需要一个能被 click() 的 input。 */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        hidden
+        onChange={(e) => void handleUpload(e.target.files)}
+      />
+
+      {/* ⭐ 信息弹层（对齐源码 KBInfoPopover：只读展示知识库元信息）。
+          ⚠️ 本仓 `KnowledgeBaseDto` 不返回 indexing_strategy / 存储引擎详情，
+          所以只列**读得到**的字段，⛔ 不编造缺失项。 */}
+      {infoOpen && activeBase && (
+        <div
+          style={{ position: 'fixed', inset: 0, zIndex: 300, background: 'transparent' }}
+          onClick={() => setInfoOpen(false)}
+        >
+          <div
+            className="kb-info-popover"
+            style={{
+              position: 'absolute',
+              right: 24,
+              top: 96,
+              minWidth: 260,
+              padding: 16,
+              borderRadius: 'var(--app-radius-lg, 10px)',
+              background: 'var(--td-bg-color-container, #fff)',
+              border: '0.5px solid var(--td-component-stroke, #e7e7e7)',
+              boxShadow: '0 2px 4px #0000000a, 0 6px 20px #00000014',
+              fontSize: 'var(--app-text-base, 14px)',
+              color: 'var(--td-text-color-primary)',
+            }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div style={{ fontWeight: 600, marginBottom: 10 }}>{activeBase.name}</div>
+            <dl style={{ margin: 0, display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 12px' }}>
+              <dt style={{ color: 'var(--td-text-color-placeholder)' }}>类型</dt>
+              <dd style={{ margin: 0 }}>
+                {activeBase.type === 'faq' ? '问答库' : activeBase.type === 'wiki' ? 'Wiki 库' : '文档库'}
+              </dd>
+              <dt style={{ color: 'var(--td-text-color-placeholder)' }}>文档数</dt>
+              <dd style={{ margin: 0 }}>{total}</dd>
+              <dt style={{ color: 'var(--td-text-color-placeholder)' }}>创建时间</dt>
+              <dd style={{ margin: 0 }}>{activeBase.created_at ?? '—'}</dd>
+              <dt style={{ color: 'var(--td-text-color-placeholder)' }}>更新时间</dt>
+              <dd style={{ margin: 0 }}>{activeBase.updated_at ?? '—'}</dd>
+            </dl>
+            {activeBase.description && (
+              <p style={{ margin: '10px 0 0', color: 'var(--td-text-color-secondary)' }}>
+                {activeBase.description}
+              </p>
+            )}
+          </div>
+        </div>
+      )}
 
       {settingsOpen && activeBase && (
         <KbSettingsModal

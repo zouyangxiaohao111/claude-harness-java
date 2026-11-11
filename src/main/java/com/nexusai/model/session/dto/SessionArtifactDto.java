@@ -39,6 +39,14 @@ public record SessionArtifactDto(
          * —— 前端应把它们归入「历史 / 未知归属」分组，⛔ 不要猜。
          */
         String sourceMessageId,
+        /**
+         * 产物来源通道 · {@code deliverables}（写进会话交付物目录）| {@code project-write}
+         * （Write/Edit 写过的项目内文档）。
+         *
+         * <p>{@code null} = 未标注（V279 之前的历史行）。前端据此画角标区分
+         * 「Agent 主动交付的文件」与「顺手改的项目文档」，⛔ 不要把 null 当成任一种。
+         */
+        String origin,
         String updatedAt,
         /** {@code localPath} 指向的是<b>目录</b>（true）还是文件（false）。 */
         boolean directory
@@ -57,6 +65,6 @@ public record SessionArtifactDto(
         return new SessionArtifactDto(
                 r.getId(), r.getKind(), r.getTitle(), r.getLocalPath(), r.getUrl(),
                 r.getSizeBytes(), r.getSummary(), r.getSourceMessageId(),
-                r.getUpdatedAt(), directory);
+                r.getOrigin(), r.getUpdatedAt(), directory);
     }
 }

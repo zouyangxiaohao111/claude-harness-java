@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p>本测试钉死三件事：
  * <ol>
  *   <li><b>金样</b>：{@code CacheSharingParamsBuilder}（生产压缩 fork 组装链）→
- *       {@code StreamCompactSummary} → 真 {@link ProductionForkedQuery} → provider 实收
+ *       {@code StreamCompactSummary} → 真 fork 发送边界 → provider 实收
  *       {@code SystemPromptBlock} 列表 = 逐字节金样（钉住「E-1a 不改发送字节」）。</li>
  *   <li><b>形态等价</b>：<b>pre-append 原料 + 独立 systemContext map</b>（= E-1a 后
  *       {@code CacheSafeParams}/{@code ForkRawMaterial}/{@code PostSamplingContext} 的形态）
@@ -57,7 +57,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       依赖「恰好并入一次」而非巧合。</li>
  * </ol>
  *
- * <p><b>RED teeth</b>：删掉 {@code ProductionForkedQuery} 使用点的 append（或把上游改回
+ * <p><b>RED teeth</b>：删掉 fork 发送边界 使用点的 append（或把上游改回
  * post-append 而使用点仍 append）→ 第 1/2 条断言 RED（blocks 少一段 gitStatus / 多一段）。
  */
 @DisplayName("[E-1a] fork 系统提示 pre-append 契约：发送边界恰 append 一次")
@@ -71,7 +71,7 @@ class ForkSystemPromptPreAppendContractTest {
         "DEFAULT-1", "DEFAULT-2",
         SystemPromptAssembler.SYSTEM_PROMPT_DYNAMIC_BOUNDARY, "DYNAMIC-1", "APPEND-CMD");
 
-    /** 金样（改动前 master 上捕获的 ProductionForkedQuery 实发 blocks 文本）。 */
+    /** 金样（改动前 master 上捕获的 fork 发送边界实发 blocks 文本）。 */
     private static final String GOLDEN_3P_BLOCK_TEXT =
         "DEFAULT-1\n\nDEFAULT-2\n\n__SYSTEM_PROMPT_DYNAMIC_BOUNDARY__\n\nDYNAMIC-1\n\nAPPEND-CMD"
             + "\n\ngitStatus: GIT-BLOCK";
@@ -132,7 +132,7 @@ class ForkSystemPromptPreAppendContractTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 发送链（真 ProductionForkedQuery · 断言面 = provider 实收 blocks）
+    // 发送链（真 fork 发送边界 · 断言面 = provider 实收 blocks）
     // ════════════════════════════════════════════════════════════════════
 
     /** 生产 builder 组装链（压缩 fork 路径）。 */
@@ -170,20 +170,58 @@ class ForkSystemPromptPreAppendContractTest {
             baseContext(), List.of(userMessage("c1", "ctx1")), gate);
     }
 
-    /** 走真 StreamCompactSummary → RunForkedAgent → ProductionForkedQuery，返回 provider 实收 blocks。 */
+    /** 走真 StreamCompactSummary → RunForkedAgent → 主循环 queryLoop，返回 provider 实收 blocks。 */
     private List<SystemPromptBlock> send(CacheSafeParams cs) {
+        return send(cs, cs.useGlobalCacheScope());
+    }
+
+    /**
+     * 发送链（显式指定 firstParty gate）。
+     *
+     * <p><b>[E-1b-2-R9]</b> 主循环从 {@code params.config()} 现算 firstParty 判定，
+     * <b>不再</b>读 {@code CacheSafeParams.useGlobalCacheScope}（已登记的接受偏离）——
+     * 故 gate 维度必须经 provider config 表达，而非只塞进 CacheSafeParams。
+     */
+    private List<SystemPromptBlock> send(CacheSafeParams cs, boolean firstParty) {
         Capturing provider = new Capturing();
         StreamCompactSummary scs = new StreamCompactSummary(
             () -> provider, () -> "model", ProviderConfig::empty, null, null,
             false, true, false, null, null, null);
-        scs.setForkedQuery(new ProductionForkedQuery(
-            () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
+        scs.setForkedQuery(forkQuery(provider, firstParty));
         scs.streamCompactSummary(
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
             "model", provider, ProviderConfig.empty(),
             new CompactConversationContext().setCacheSafeParams(cs).setAbortController(new AbortController()));
         assertThat(provider.blocks).as("fake provider 必须真实收到 fork 请求（否则本测试空转）").isNotNull();
         return provider.blocks;
+    }
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(Capturing provider, boolean firstParty) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true);
+            f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "model",
+            // [E-1b-2-R9] 主循环从 params.config() 现算 firstParty gate（不再读
+            //   params.useGlobalCacheScope）；anthropic 端点 = firstParty，其余 = 3P。
+            () -> firstParty
+                ? new ProviderConfig("https://api.anthropic.com", "sk-test")
+                : new ProviderConfig("https://api.deepseek.com", "sk-test"),
+            factory);
     }
 
     private static ToolUseContext baseContext() {

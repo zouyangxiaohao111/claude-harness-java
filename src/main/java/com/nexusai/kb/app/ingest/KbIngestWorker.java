@@ -51,6 +51,10 @@ public class KbIngestWorker {
     private final KbAutoTagService autoTagService;
     private final KbWikiTaskHandler wikiHandler;
     private final com.nexusai.kb.app.graph.KbGraphExtractionService graphService;
+    private final com.nexusai.kb.app.image.KbImageEnrichService imageEnrichService;
+    private final com.nexusai.kb.app.retrieval.KbIndexWriter indexWriter;
+    private final com.nexusai.kb.repo.mapper.KbKnowledgeMapper knowledgeMapper;
+    private final com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbKnowledgeStateRepository stateRepository;
 
     public KbIngestWorker(
@@ -61,6 +65,10 @@ public class KbIngestWorker {
         KbAutoTagService autoTagService,
         KbWikiTaskHandler wikiHandler,
         com.nexusai.kb.app.graph.KbGraphExtractionService graphService,
+        com.nexusai.kb.app.image.KbImageEnrichService imageEnrichService,
+        com.nexusai.kb.app.retrieval.KbIndexWriter indexWriter,
+        com.nexusai.kb.repo.mapper.KbKnowledgeMapper knowledgeMapper,
+        com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper knowledgeBaseMapper,
         KbKnowledgeStateRepository stateRepository
     ) {
         this.queue = queue;
@@ -70,6 +78,10 @@ public class KbIngestWorker {
         this.autoTagService = autoTagService;
         this.wikiHandler = wikiHandler;
         this.graphService = graphService;
+        this.imageEnrichService = imageEnrichService;
+        this.indexWriter = indexWriter;
+        this.knowledgeMapper = knowledgeMapper;
+        this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.stateRepository = stateRepository;
     }
 
@@ -182,6 +194,18 @@ public class KbIngestWorker {
                 String model = p == null ? null : p.path("model").asText(null);
                 return wikiHandler.run(knowledgeId, attempt, model);
             }
+            case KbIngestTaskRecord.TYPE_IMAGE_UNDERSTAND: {
+                // ⭐ 与源侧同构：图片理解失败不阻塞文档完成（正文早已可检索），
+                //    但必须留痕 —— 失败计数会出现在返回的 detail 里。
+                int done = imageEnrichService.enrichKnowledge(knowledgeId);
+                if (done == 0) {
+                    return KbPostProcessOutcome.skipped("无可理解的图片（或视觉模型未配置）");
+                }
+                // ⭐ 图内文字变了 ⇒ 索引文本变了 ⇒ 必须重建索引，否则 OCR 白跑
+                //    （文字在库里，但向量/FTS 还是旧的）。失败只 WARN，不判任务失败。
+                reindexQuietly(knowledgeId);
+                return KbPostProcessOutcome.done("图片=" + done);
+            }
             default:
                 return null;
         }
@@ -218,6 +242,39 @@ public class KbIngestWorker {
                         task.getTaskType(), knowledgeId, outcome.detail());
                 }
             }
+        }
+    }
+
+    /**
+     * 重建该文档索引（图内文字变化后必须调用）。
+     *
+     * <p><b>⚠️ 必在事务外</b>：{@code KbIndexWriter} 的 FTS 写入走独立 JDBC 连接，
+     * 外层事务会自锁 SQLITE_BUSY。本方法在 worker 的 settle 之外调用，天然无事务。
+     *
+     * <p><b>失败只 WARN</b>：图内文字已落库，索引是派生物 —— 失败不该把图片理解判失败
+     * （下次编辑/重建索引会补上）。但要留痕，⛔ 不静默。
+     */
+    private void reindexQuietly(String knowledgeId) {
+        if (indexWriter == null || knowledgeMapper == null) {
+            return;
+        }
+        try {
+            com.nexusai.kb.repo.entity.KbKnowledgeRecord knowledge =
+                knowledgeMapper.selectOneById(knowledgeId);
+            if (knowledge == null) {
+                return;
+            }
+            com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord kb = knowledgeBaseMapper == null
+                ? null : knowledgeBaseMapper.selectOneById(knowledge.getKnowledgeBaseId());
+            String modelId = knowledge.getEmbeddingModelId();
+            if (modelId == null || modelId.isBlank()) {
+                modelId = kb == null ? null : kb.getEmbeddingModelId();
+            }
+            indexWriter.reindexKnowledge(knowledgeId, knowledge.getKnowledgeBaseId(), modelId);
+            log.info("[图片] 图内文字已进索引 knowledge={} 模型={}", knowledgeId, modelId);
+        } catch (RuntimeException e) {
+            log.warn("[图片] 重建索引失败（图内文字已落库，可稍后编辑触发重索引）knowledge={} 原因={}",
+                knowledgeId, e.getMessage());
         }
     }
 

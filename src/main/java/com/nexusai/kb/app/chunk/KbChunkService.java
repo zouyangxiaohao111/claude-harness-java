@@ -8,9 +8,11 @@ import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.kb.repo.KbTimeFormat;
 import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.entity.KbChunkRevisionRecord;
+import com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
 import com.nexusai.kb.repo.mapper.KbChunkRevisionMapper;
+import com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper;
 import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -55,23 +57,35 @@ public class KbChunkService {
     private final KbChunkMapper chunkMapper;
     private final KbChunkRevisionMapper revisionMapper;
     private final KbKnowledgeMapper knowledgeMapper;
+    private final KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbIndexWriter indexWriter;
     private final KbActivityService activityService;
     private final JdbcTemplate jdbc;
+    /**
+     * 问句重新生成复用入库后处理的同一套实现（取配置、调模型、重读 revision、重建索引）。
+     *
+     * <p>⚠️ 无循环依赖：{@code KbQuestionGenerationService} 只依赖 mapper / indexWriter /
+     * sideCallClient，<b>不依赖本类</b>。
+     */
+    private final com.nexusai.kb.app.ingest.KbQuestionGenerationService questionGenerationService;
 
     @Autowired
     public KbChunkService(KbChunkMapper chunkMapper,
                           KbChunkRevisionMapper revisionMapper,
                           KbKnowledgeMapper knowledgeMapper,
+                          KbKnowledgeBaseMapper knowledgeBaseMapper,
                           KbIndexWriter indexWriter,
                           KbActivityService activityService,
-                          JdbcTemplate jdbc) {
+                          JdbcTemplate jdbc,
+                          com.nexusai.kb.app.ingest.KbQuestionGenerationService questionGenerationService) {
         this.chunkMapper = chunkMapper;
         this.revisionMapper = revisionMapper;
         this.knowledgeMapper = knowledgeMapper;
+        this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.indexWriter = indexWriter;
         this.activityService = activityService;
         this.jdbc = jdbc;
+        this.questionGenerationService = questionGenerationService;
     }
 
     /**
@@ -80,11 +94,41 @@ public class KbChunkService {
      * @param knowledgeId 文档 ID
      * @param includeDisabled 是否含被禁用的块
      */
+    /**
+     * 列出某文档的分块。
+     *
+     * <p><b>⭐ 默认不含父块</b>（对齐源站 {@code handler/chunk.go:135}：
+     * {@code chunkType := []types.ChunkType{types.ChunkTypeText}} —— 列表端点默认只列
+     * {@code text}，其它类型要靠 {@code ?chunk_type=} 显式要）。父子模式下父块与子块共用
+     * {@code chunk_index} 且正文高度重叠，混在一起会让「按 chunk_index 顺序拼回文档」的调用方
+     * （分块管理列表 / 文档重建 / 预览）把同一段正文输出两遍。
+     *
+     * @param knowledgeId 文档 ID
+     * @param includeDisabled 是否含被禁用的块
+     */
     public List<KbChunkRecord> list(String knowledgeId, boolean includeDisabled) {
+        return list(knowledgeId, includeDisabled, false);
+    }
+
+    /**
+     * 列出某文档的分块（可控是否含父块）。
+     *
+     * @param knowledgeId     文档 ID
+     * @param includeDisabled 是否含被禁用的块
+     * @param includeParents  是否含 {@code chunk_type='parent_text'} 的父块
+     *                        （诊断 / 分块管理需要看父块时才传 true）
+     */
+    public List<KbChunkRecord> list(String knowledgeId, boolean includeDisabled,
+                                    boolean includeParents) {
         requireKnowledge(knowledgeId);
         QueryWrapper q = QueryWrapper.create().where("knowledge_id = ?", knowledgeId);
         if (!includeDisabled) {
             q.and("is_enabled = 1");
+        }
+        if (!includeParents) {
+            // ⚠️ 必须同时放行 NULL：DDL 里 chunk_type 是 NOT NULL DEFAULT 'text'，
+            //    但历史脏数据可能是 NULL；`<> 'parent_text'` 对 NULL 求值为 NULL ⇒ 行被静默丢掉。
+            q.and("(chunk_type IS NULL OR chunk_type <> ?)", KbChunk.CHUNK_TYPE_PARENT_TEXT);
         }
         q.orderBy("chunk_index", true);
         return new ArrayList<>(chunkMapper.selectListByQuery(q));
@@ -294,6 +338,213 @@ public class KbChunkService {
         log.info("[分块] 已删除生成问句 chunk={} 剩余={}", chunkId, remaining.size());
         reindexChunkKnowledge(chunk);
         return true;
+    }
+
+    /**
+     * 新增 / 修改一条生成问句（源侧 {@code PUT /chunks/by-id/{id}/questions}）。
+     *
+     * <p><b>⭐⭐ 追加 vs 替换的判据就在 {@code questionId} 上</b>（见
+     * {@link #upsertQuestionMetadata}）：<b>空 ⇒ 追加</b>，非空 ⇒ 按<b>问句文本</b>找到那条
+     * 并<b>原地替换</b>。⛔ 找不到时抛 400，绝不「找不到就当新增」—— 那会让用户以为改掉了，
+     * 实际列表里多出一条、旧的那条还在。
+     *
+     * <p>⚠️ 本仓问句没有独立 id（存在 metadata 的字符串/对象数组里）⇒ 前端编辑时要传
+     * <b>旧问句文本</b>当 {@code question_id}。
+     *
+     * @param chunkId    分块 ID
+     * @param questionId 空 = 新增；非空 = 要替换的旧问句文本
+     * @param question   新问句
+     * @return 更新后的分块 + 最新问句列表 + 是否新增
+     */
+    public QuestionUpsertResult upsertGeneratedQuestion(
+        String chunkId, String questionId, String question
+    ) {
+        KbChunkRecord chunk = getById(chunkId);
+        int revision = chunk.getContentRevision() == null ? 0 : chunk.getContentRevision();
+        boolean added = questionId == null || questionId.isBlank();
+        String merged = upsertQuestionMetadata(chunk.getMetadata(), questionId, question, revision);
+        chunk.setMetadata(merged);
+        // ⚠️ 只更新 metadata 这一列：content / start_at / end_at 的位置不变式不能被问句影响
+        KbChunkRecord patch = new KbChunkRecord();
+        patch.setId(chunk.getId());
+        patch.setMetadata(merged);
+        chunkMapper.update(patch);
+
+        java.util.List<String> questions =
+            com.nexusai.kb.app.ingest.KbGeneratedQuestions.read(merged);
+        boolean indexOk = reindexQuietly(chunk);
+        log.info("[分块] 已{}生成问句 chunk={} 文本={} 问句数={} 已重建索引={}",
+            added ? "新增" : "修改", chunkId, question == null ? "" : question.trim(),
+            questions.size(), indexOk);
+        return new QuestionUpsertResult(chunk, questions, added, indexOk);
+    }
+
+    /**
+     * 重新生成某分块的辅助问句（源侧 {@code POST /chunks/by-id/{id}/questions/regenerate}）。
+     *
+     * <p>复用入库后处理的 {@link com.nexusai.kb.app.ingest.KbQuestionGenerationService#generateBatch}：
+     * 它内部会重读 contentRevision（生成期间用户编辑 ⇒ 跳过）、写回 metadata 并重建索引。
+     *
+     * <p>⚠️ 「跳过」不是错误：问句配置关闭 / 没有可用模型 / 无可生成文本时，
+     * {@code generateBatch} 返回 SKIPPED 而不是抛异常 ⇒ 这里把状态与说明原样返回，
+     * 前端照实展示，⛔ 不假装「已重新生成」。
+     *
+     * @param chunkId 分块 ID
+     * @return 最新分块 + 问句列表 + 后处理结果（status/detail 用于如实告知用户）
+     */
+    public RegenerateResult regenerateGeneratedQuestions(String chunkId) {
+        KbChunkRecord chunk = getById(chunkId);
+        if (chunk.getChunkType() != null && !"text".equals(chunk.getChunkType())) {
+            throw new ValidationException(
+                "问句只能对文本分块生成（当前类型 " + chunk.getChunkType() + "）");
+        }
+        String knowledgeId = chunk.getKnowledgeId();
+        KbKnowledgeRecord knowledge = knowledgeId == null || knowledgeId.isBlank()
+            ? null : knowledgeMapper.selectOneById(knowledgeId);
+        if (knowledge == null) {
+            throw new NotFoundException("分块 " + chunkId + " 所属文档不存在");
+        }
+        int attempt = knowledge.getParseAttempt() == null ? 0 : knowledge.getParseAttempt();
+        String kbId = chunk.getKnowledgeBaseId();
+        KbKnowledgeBaseRecord kb = kbId == null || kbId.isBlank()
+            ? null : knowledgeBaseMapper.selectOneById(kbId);
+        int count = com.nexusai.kb.app.ingest.KbPostProcessConfig.resolve(kb)
+            .question().questionCount();
+        log.info("[分块API] 问句重新生成开始 chunk={} knowledge={} 每块条数={}",
+            chunkId, knowledgeId, count);
+
+        com.nexusai.kb.app.ingest.KbPostProcessOutcome outcome =
+            questionGenerationService.generateBatch(
+                knowledgeId, attempt, 0, java.util.List.of(chunkId), count);
+
+        KbChunkRecord latest = getById(chunkId);
+        java.util.List<String> questions =
+            com.nexusai.kb.app.ingest.KbGeneratedQuestions.read(latest.getMetadata());
+        log.info("[分块API] 问句重新生成结束 chunk={} 状态={} 说明={} 条数={}",
+            chunkId, outcome.status(), outcome.detail(), questions.size());
+        return new RegenerateResult(latest, questions,
+            outcome.status().name(), outcome.detail());
+    }
+
+    /**
+     * 问句「追加 / 替换」的<b>纯函数</b>（不碰库，单测直接打）。
+     *
+     * <p>⭐ 三条不可省的规则：
+     * <ol>
+     *   <li>{@code question} trim 后为空 ⇒ 400（源侧同款）；</li>
+     *   <li>{@code questionId} 非空但<b>找不到</b> ⇒ 400，⛔ 不静默新增；</li>
+     *   <li>替换要<b>保留该条的 id 与其它条目不动</b>（metadata 里还有 faq / image 等别的键）。</li>
+     * </ol>
+     *
+     * @param metadataJson 原 metadata（可 null / 坏 JSON ⇒ 视为空对象）
+     * @param questionId   空 = 新增；非空 = 旧问句文本
+     * @param question     新问句
+     * @param revision     当前 contentRevision（写进条目的 content_revision）
+     * @return 新 metadata JSON
+     */
+    static String upsertQuestionMetadata(
+        String metadataJson, String questionId, String question, int revision
+    ) {
+        String text = question == null ? "" : question.trim();
+        if (text.isEmpty()) {
+            throw new ValidationException("问句不能为空");
+        }
+        com.fasterxml.jackson.databind.ObjectMapper om =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+        try {
+            com.fasterxml.jackson.databind.JsonNode parsed =
+                (metadataJson == null || metadataJson.isBlank()) ? null : om.readTree(metadataJson);
+            com.fasterxml.jackson.databind.node.ObjectNode root =
+                parsed != null && parsed.isObject()
+                    ? (com.fasterxml.jackson.databind.node.ObjectNode) parsed
+                    : om.createObjectNode();
+            com.fasterxml.jackson.databind.JsonNode existing =
+                root.get(com.nexusai.kb.app.ingest.KbGeneratedQuestions.KEY);
+            com.fasterxml.jackson.databind.node.ArrayNode arr =
+                existing != null && existing.isArray()
+                    ? (com.fasterxml.jackson.databind.node.ArrayNode) existing
+                    : om.createArrayNode();
+
+            if (questionId == null || questionId.isBlank()) {
+                arr.add(newQuestionNode(om, text, revision));
+            } else {
+                String key = questionId.trim();
+                boolean found = false;
+                for (int i = 0; i < arr.size(); i++) {
+                    com.fasterxml.jackson.databind.JsonNode n = arr.get(i);
+                    String old = n.isTextual() ? n.asText() : n.path("question").asText("");
+                    if (!found && old != null && old.trim().equals(key)) {
+                        // ⭐ 原地替换：保留 id，只改文本与版本号
+                        com.fasterxml.jackson.databind.node.ObjectNode item =
+                            n.isObject()
+                                ? (com.fasterxml.jackson.databind.node.ObjectNode) n
+                                : om.createObjectNode();
+                        item.put("question", text);
+                        item.put("content_revision", revision);
+                        if (!item.hasNonNull("id") || item.path("id").asText().isBlank()) {
+                            item.put("id", generatedQuestionId(text, revision));
+                        }
+                        arr.set(i, item);
+                        found = true;
+                    }
+                }
+                if (!found) {
+                    // ⛔ 不静默新增：用户以为在「改」，实际会多出一条
+                    throw new ValidationException(
+                        "该分块里没有这条问句（本仓问句无独立 id，question_id 需传旧问句文本）");
+                }
+            }
+            root.set(com.nexusai.kb.app.ingest.KbGeneratedQuestions.KEY, arr);
+            return om.writeValueAsString(root);
+        } catch (ValidationException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new ValidationException("问句元数据写入失败: " + e.getMessage());
+        }
+    }
+
+    private static com.fasterxml.jackson.databind.node.ObjectNode newQuestionNode(
+        com.fasterxml.jackson.databind.ObjectMapper om, String question, int revision
+    ) {
+        com.fasterxml.jackson.databind.node.ObjectNode item = om.createObjectNode();
+        item.put("id", generatedQuestionId(question, revision));
+        item.put("question", question);
+        item.put("content_revision", revision);
+        return item;
+    }
+
+    /** 问句 id（与 {@code KbQuestionGenerationService#mergeQuestions} 同算法，便于对齐）。 */
+    private static String generatedQuestionId(String question, int revision) {
+        return "q" + Math.abs((question + revision).hashCode());
+    }
+
+    /**
+     * 重建索引但<b>不否决写入</b>：问句已落 metadata，索引失败只影响「能不能搜到新问句」。
+     * <p>⚠️ 必须打 ERROR —— 否则用户以为改好了，实际检索仍是旧的，且全程无提示。
+     *
+     * @return true = 索引重建成功
+     */
+    private boolean reindexQuietly(KbChunkRecord chunk) {
+        try {
+            reindexChunkKnowledge(chunk);
+            return true;
+        } catch (RuntimeException e) {
+            log.error("[分块] 问句已保存但索引重建失败 chunk={} knowledge={} —— 搜索仍是旧文本",
+                chunk.getId(), chunk.getKnowledgeId(), e);
+            return false;
+        }
+    }
+
+    /** 问句 upsert 结果。 */
+    public record QuestionUpsertResult(
+        KbChunkRecord chunk, java.util.List<String> questions,
+        boolean added, boolean indexRebuilt) {
+    }
+
+    /** 问句重新生成结果。 */
+    public record RegenerateResult(
+        KbChunkRecord chunk, java.util.List<String> questions,
+        String status, String detail) {
     }
 
     /** 把问句数组写回 metadata（保留其它键；空数组时删掉该键）。 */

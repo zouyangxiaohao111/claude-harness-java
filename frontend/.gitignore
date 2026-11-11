@@ -39,3 +39,7 @@ scripts/.minio-credentials.json
 /test-results/
 /playwright-report/
 /blob-report/
+
+
+# Markdown 渲染人工对照页（本地开发用，配套 vendor/__compare/main.tsx）
+/md-compare.html

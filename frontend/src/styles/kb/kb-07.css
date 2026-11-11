@@ -1,0 +1,62 @@
+/* ⚠️ 自动生成，勿手改。
+   来源：deliverables/kb-design/assets/weknora-bundle.css
+   生成：deliverables/kb-design/scripts/extract_page_css.py
+   改了源站样式要重跑脚本，不要在本文件里手改。 */
+
+/* 07-共享空间.html 专属组件样式（bundle 0 条 + 内联 24 条） */
+.kb-scope .space-group{
+    display:flex; align-items:center; gap:6px; height:32px;
+    margin:4px 0 8px; padding:0 2px; font-size:13px;
+    color:var(--td-text-color-secondary); cursor:pointer; user-select:none;
+  }
+.kb-scope .space-group:hover{ color:var(--td-text-color-primary); }
+.kb-scope .space-group-count{ color:var(--td-text-color-placeholder); font-variant-numeric:tabular-nums; }
+.kb-scope .space-group-chev{
+    display:inline-block; margin-left:2px; font-size:12px;
+    color:var(--td-text-color-placeholder); transition: transform .15s ease;
+  }
+.kb-scope .space-group-chev.is-open{ transform: rotate(180deg); }
+.kb-scope .space-empty{
+    display:flex; flex-direction:column; align-items:center; justify-content:center;
+    padding:64px 24px; text-align:center;
+  }
+.kb-scope .space-empty-badge{
+    width:72px; height:72px; border-radius:18px; background:var(--td-bg-color-container-hover);
+    color:var(--td-text-color-placeholder); display:flex; align-items:center; justify-content:center;
+    font-size:34px; margin-bottom:18px;
+  }
+.kb-scope .space-empty-title{ font-size:15px; font-weight:500; color:var(--td-text-color-primary); margin-bottom:6px; }
+.kb-scope .space-empty-sub{ font-size:13px; color:var(--td-text-color-placeholder); margin-bottom:18px; }
+.kb-scope .space-empty-actions{ display:flex; align-items:center; gap:8px; }
+.kb-scope .space-card .card-desc{ min-height:18px; }
+.kb-scope .space-stats{
+    margin-top:auto; padding-top:10px; border-top:1px solid #f2f2f2;
+    display:flex; align-items:center; gap:14px;
+    font-size:12px; color:var(--td-text-color-secondary);
+  }
+.kb-scope .space-stat{ display:inline-flex; align-items:center; gap:4px; }
+.kb-scope .space-stat i{ font-style:normal; font-size:12px; color:var(--td-text-color-placeholder); }
+.kb-scope .space-avatar{
+    width:36px; height:36px; border-radius:10px; background:var(--td-bg-color-container-hover);
+    color:var(--td-text-color-secondary); display:inline-flex; align-items:center;
+    justify-content:center; font-size:18px; flex:none;
+  }
+.kb-scope .space-logo{ font-size:22px; line-height:1; color:var(--td-text-color-primary); }
+.kb-scope .mini-modal{
+    position:fixed; top:50%; left:50%; transform:translate(-50%,-50%);
+    width:400px; background:#fff; border-radius:12px;
+    box-shadow:0 6px 30px 5px rgba(0,0,0,.05), 0 16px 24px 2px rgba(0,0,0,.04), 0 8px 10px -5px rgba(0,0,0,.08); z-index:80; overflow:hidden;
+  }
+.kb-scope .mini-head{
+    height:52px; padding:0 18px; display:flex; align-items:center;
+    justify-content:space-between; border-bottom:1px solid var(--td-component-stroke);
+  }
+.kb-scope .mini-head strong{ font-size:15px; }
+.kb-scope .mini-head button{ width:28px; height:28px; border:0; background:none; border-radius:var(--app-radius-md); color:var(--td-text-color-secondary); }
+.kb-scope .mini-head button:hover{ background:var(--td-bg-color-container-hover); }
+.kb-scope .mini-body{ padding:18px; }
+.kb-scope .mini-label{ display:block; font-size:13px; font-weight:500; margin-bottom:8px; }
+.kb-scope .mini-foot{
+    height:57px; padding:12px 18px; border-top:1px solid var(--td-component-stroke);
+    display:flex; align-items:center; justify-content:flex-end; gap:8px;
+  }

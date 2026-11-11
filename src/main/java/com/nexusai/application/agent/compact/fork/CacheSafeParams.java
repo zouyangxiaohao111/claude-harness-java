@@ -24,7 +24,7 @@ import java.util.Map;
  * 数组）—— 与 CC 一致（CC 的 {@code systemPrompt} 即 {@code query()} 不可变 params 的值，
  * 未经 {@code appendSystemContext}；fork 自身 query() 内重跑，query.ts:449-450/:660）。
  * {@code appendSystemContext} <b>非幂等</b>（每次调用追加一个末尾元素），故 append 只在
- * <b>使用点</b>执行一次（Java 侧 = {@code ProductionForkedQuery} 发送边界）——
+ * <b>使用点</b>执行一次（Java 侧 = 主循环 queryLoop 发送边界）——
  * 对 post-append 值再并入会多一段 → 发送 blocks 与主线程不一致 → prompt cache 永不命中。
  *
  * <p><b>useGlobalCacheScope（RES-R4 · Java 侧通信通道）</b>: 主线程发送边界用

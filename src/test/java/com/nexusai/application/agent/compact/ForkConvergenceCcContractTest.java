@@ -4,7 +4,7 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
-import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
+import com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.ToolPermissionGate;
@@ -47,7 +47,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *   <li><b>userContext 只前置一次（[userctx-single-prepend]）</b>——forkContextMessages
  *       不含 meta；RunForkedAgent 的 initialMessages = [...forkContextMessages,
  *       ...promptMessages]（forkedAgent.ts:543 <b>不贴</b> userContext），userContext 作为参数
- *       透传到发送边界，由 ProductionForkedQuery 贴一次（query.ts:900）。断言面 =
+ *       透传到发送边界，由 fork 发送边界 贴一次（query.ts:900）。断言面 =
  *       <b>真实发给 provider 的 messages</b>（{@link CapturingProvider}），
  *       而非 RunForkedAgent 交给 seam 的中间产物。</li>
  *   <li><b>结果提取（CC compact.ts:1201-1230）</b>——getLastAssistantMessage →
@@ -119,9 +119,9 @@ class ForkConvergenceCcContractTest {
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
             "model", providerReturning("fallback text"), ProviderConfig.empty(), ctxOf(cs));
 
-        // ⚠️ 断言面 = 真实 ProductionForkedQuery 实际交给 provider 的 messages
+        // ⚠️ 断言面 = 真实 fork 发送边界实际交给 provider 的 messages
         //   （旧断言读 RunForkedAgent 交给 seam 的中间产物 → 假替身 RecordingQuery 从不执行
-        //    ProductionForkedQuery:233-235 的第二次前置 → 断言恒绿 → 双前置 bug 永久隐身）。
+        //    fork 发送边界的第二次前置 → 断言恒绿 → 双前置 bug 永久隐身）。
         List<ChatMessageDto> messages = provider.lastHistory();
         assertThat(messages).as("fake provider 必须真实收到 fork 请求（否则本测试空转）").isNotNull();
         // 1(userContext meta) + 2(forkCtx) + 1(summary) = 4 · CC forkedAgent.ts:543 + query.ts:900
@@ -143,7 +143,7 @@ class ForkConvergenceCcContractTest {
             .isEqualTo(SUMMARY_REQUEST);
         // cache-safe 参数透传（systemPrompt 数组 → 发送边界 blocks）
         // [E-1a pre-append 契约] cs 的 systemPrompt 是 **pre-append** 数组（[main-system-prompt]），
-        //   systemContext（{"os":"linux"}）独立成 map；ProductionForkedQuery 发送边界恰 append
+        //   systemContext（{"os":"linux"}）独立成 map；fork 发送边界恰 append
         //   一次 → 实发 block 文本 = "main-system-prompt\n\nos: linux"（3P gate=false → 单 ORG block）。
         assertThat(provider.lastSystemBlocks())
             .as("cache-safe systemPrompt 必须透传到发送边界（splitSysPromptPrefix 产物）")
@@ -290,11 +290,11 @@ class ForkConvergenceCcContractTest {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 13 参构造 + <b>真实生产 fork loop</b>（{@link ProductionForkedQuery}）。
+     * 13 参构造 + <b>真实生产 fork loop</b>（fork 发送边界）。
      *
      * <p><b>为什么必须走真实实现</b>: 消息拼接断言只能在「最终发给 provider 的 messages」上做。
      * 用 {@link RecordingQuery} 假替身只记录 RunForkedAgent 交给 seam 的中间产物，
-     * <b>从不执行</b> {@code ProductionForkedQuery:233-235} 的发送边界
+     * <b>从不执行</b> fork 发送边界 的发送边界
      * {@code prependUserContext} → 「外层 + 内层双前置」bug 在该替身下恒绿。
      */
         /** [批 5a] 显式压缩上下文（CC compactConversation 的 context + cacheSafeParams 参数）。 */
@@ -306,9 +306,30 @@ class ForkConvergenceCcContractTest {
 private static StreamCompactSummary scsWithRealForkLoop(CacheSafeParams cs, CapturingProvider provider) {
         StreamCompactSummary scs = new StreamCompactSummary(
             () -> providerReturning("fallback text"), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
-        scs.setForkedQuery(new ProductionForkedQuery(
-            () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
+        scs.setForkedQuery(realForkLoop(provider));
         return scs;
+    }
+
+    /** 真 fork seam（主循环 queryLoop · E-2 后唯一实现）。factory 只需 llmProviderFactory。 */
+    static QueryLoopForkedQuery realForkLoop(CapturingProvider provider) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true);
+            f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "model", ProviderConfig::empty, factory);
     }
 
     private static StreamCompactSummary compactSummaryWith(CacheSafeParams cs, RecordingQuery recording) {
@@ -377,7 +398,7 @@ private static StreamCompactSummary scsWithRealForkLoop(CacheSafeParams cs, Capt
      * 捕获 <b>真实发给 provider</b> 的 messages 的 fake {@link LlmProvider}。
      *
      * <p>断言面放在 provider 入参（= 真实生产路径最后一道），因此不依赖任何 seam 替身：
-     * 只要 {@code StreamCompactSummary} 与 {@code ProductionForkedQuery} 任一处前置被改回
+     * 只要 {@code StreamCompactSummary} 与 fork 发送边界 任一处前置被改回
      * 「两层都贴」，provider 收到的就变成 {@code [meta, meta, ...]}（5 条 / 2 meta）→ 断言 RED。
      */
     static final class CapturingProvider implements LlmProvider {
@@ -413,7 +434,7 @@ private static StreamCompactSummary scsWithRealForkLoop(CacheSafeParams cs, Capt
             // 快照（runningMessages 在 provider 返回后仍会被追加 assistant/tool 消息）
             this.lastHistory = List.copyOf(history);
             this.lastSystemBlocks = systemPromptBlocks == null ? null : List.copyOf(systemPromptBlocks);
-            // 无工具调用 → ProductionForkedQuery 单轮收尾
+            // 无工具调用 → fork 单轮收尾
             onAssistantMessage.accept(new AssistantMessage("summary text", "stop", List.of()));
             onComplete.run();
         }

@@ -1,5 +1,7 @@
 package com.nexusai.kb.app.profile;
 
+import com.nexusai.kb.app.prompt.KbPromptLoader;
+
 /**
  * 知识库画像提示词 · 批次 W4。
  *
@@ -27,17 +29,7 @@ public final class KbProfilePrompts {
     }
 
     /** 系统提示词（中文，逐字可用）。 */
-    public static final String SYSTEM = """
-        你是知识库描述撰写助手。给定一个知识库的名称和它的文档标题列表，
-        用中文写出 2-4 句、总计不超过 200 字的描述，概括这个知识库**实际覆盖的主题**。
-
-        规则：
-        1. 只依据给出的标题，⛔ 不要补充标题里没有的主题；
-        2. 不要写「本知识库」「该知识库」以外的营销用语，直接描述内容范围；
-        3. 不要罗列全部标题，提炼共性；
-        4. 如果标题不足以判断主题，就如实说「内容主题不明确」；
-        5. 只输出描述正文，不要加标题、不要加引号、不要加项目符号。
-        """;
+    public static final String SYSTEM = KbPromptLoader.cached("profile/profile-system.md");
 
     /** 用户消息模板。 */
     public static String userMessage(String kbName, java.util.List<String> titles) {

@@ -100,6 +100,33 @@ public class KbSummaryService {
     }
 
     /**
+     * 手动重新生成摘要（用户点「重新生成」）。
+     *
+     * <p><b>为什么不直接调 {@link #generate(String, int)}</b>：那个方法有「守卫 2：陈旧任务」——
+     * 它要求传入的 {@code attempt} 与 {@code kb_knowledge.parse_attempt} 完全相等，
+     * 那是给<b>异步后处理管线</b>用的（防止用户重新解析后旧任务把新结果覆盖掉）。
+     * 手动触发时调用方拿不到「当时那个 attempt」，传当前值虽然能过守卫，
+     * 但语义上是把「管线内部一致性检查」当成了「用户操作」的入口 —— 一旦将来 attempt
+     * 语义变化（例如改成序号而非计数），这段就会静默失效。
+     *
+     * <p>所以这里**显式重置 attempt 上下文**：先读当前 attempt，再交给 {@code generate}，
+     * 并在两者之间不做任何 await/await 式的让步（同一线程内完成，不会被别的解析插队）。
+     * 手动重生成语义上就是「以当前状态为准重算一次」。
+     *
+     * @param knowledgeId 文档 ID
+     * @return 结果（永不 null、永不抛）
+     */
+    public KbPostProcessOutcome regenerate(String knowledgeId) {
+        KbKnowledgeRecord knowledge = knowledgeMapper.selectOneById(knowledgeId);
+        if (knowledge == null) {
+            return KbPostProcessOutcome.skipped("knowledge_not_found");
+        }
+        int attempt = knowledge.getParseAttempt() == null ? 0 : knowledge.getParseAttempt();
+        log.info("[摘要] 手动重新生成 knowledge={} attempt={}", knowledgeId, attempt);
+        return generate(knowledgeId, attempt);
+    }
+
+    /**
      * 生成摘要。
      *
      * @param knowledgeId 文档 ID
@@ -132,8 +159,17 @@ public class KbSummaryService {
             return KbPostProcessOutcome.skipped("kb_not_found");
         }
         // ── 守卫 5：配了摘要模型 ──────────────────────────────────────
+        // ⚠️ 判据必须是**模型字段本身**，⛔ 不能用 `config.summaryEnabled()`：
+        //    后者是对齐源码的「恒 true」（源码 ResolveProcessConfig:43），
+        //    它表达的是「要不要派发这个环节」，不是「这个环节能不能跑」。
+        //    两个问题分开问，混用会让守卫永远不生效（任务照跑到模型调用才炸）。
+        //
+        //    ⭐ 语义对齐源码 knowledge_process.go:1521-1527：
+        //      `if kb.SummaryModelID == "" { 标 failed; 记 no_summary_model; return }`
+        //      ⇒ **标 failed 而不是静默跳过**，前端据此显示「去设置里配摘要模型」。
         KbPostProcessConfig config = KbPostProcessConfig.resolve(kb);
-        if (!config.summaryEnabled()) {
+        if (config.summaryModelId() == null || config.summaryModelId().isBlank()) {
+            log.info("[摘要] 未配置摘要模型，跳过并标记失败 knowledge={}", knowledgeId);
             markStatus(knowledgeId, "failed");
             return KbPostProcessOutcome.skipped("no_summary_model");
         }
@@ -160,15 +196,25 @@ public class KbSummaryService {
         markStatus(knowledgeId, "processing");
 
         // ── 调模型 ────────────────────────────────────────────────────
-        ProviderConfig provider = resolveConfig(config.summaryModelId());
+        ModelConfigResolver.ResolvedModel resolved = resolveModel(config.summaryModelId());
+        ProviderConfig provider = resolved == null ? null : resolved.config();
         if (provider == null) {
             markStatus(knowledgeId, "failed");
             return KbPostProcessOutcome.skipped("provider_not_configured");
         }
+        // ⚠️ 传给模型的必须是 **models.name**（provider 侧的真实模型名），
+        //    而 `config.summaryModelId()` 来自 `kb_knowledge_base.summary_model_id`，
+        //    存的是 **models.id**。两者混用时会真的打到对方 API 上并 400：
+        //    实测 `The supported API model names are deepseek-flash, deepseek-v4-pro,
+        //    but you passed model-0823a98d`。
+        //    ⇒ 这里用 ResolvedModel 带回来的真实名，⛔ 不要再传 ID。
+        String apiModelName = resolved.apiModelName() != null && !resolved.apiModelName().isBlank()
+            ? resolved.apiModelName()
+            : config.summaryModelId();
         String raw;
         try {
             raw = sideCallClient.chat(
-                provider, config.summaryModelId(),
+                provider, apiModelName,
                 KbPostProcessPrompts.SUMMARY_SYSTEM, content,
                 options(TEMPERATURE, MAX_TOKENS, "document_summary"),
                 LlmSideCallClient.SideCallUsage.standalone(
@@ -482,12 +528,26 @@ public class KbSummaryService {
     }
 
     private ProviderConfig resolveConfig(String modelName) {
+        ModelConfigResolver.ResolvedModel r = resolveModel(modelName);
+        return r == null ? null : r.config();
+    }
+
+    /**
+     * 解析「模型 ID / 名」→ 真实配置 + 真实模型名。
+     *
+     * <p>⚠️ 为什么要把 {@code ResolvedModel} 整份传回来而不是只留 {@code config()}：
+     * 调用模型 API 需要的是 **models.name**，而库里存的是 **models.id**。
+     * 只带 config 出去，调用点就只好把 ID 当名字发，实测会被对方 400 拒绝。
+     *
+     * @param modelName 模型 ID 或名（`ModelConfigResolver` 两者都认）
+     * @return 解析结果；不可用 → null
+     */
+    private ModelConfigResolver.ResolvedModel resolveModel(String modelName) {
         if (modelConfigResolver == null || modelName == null || modelName.isBlank()) {
             return null;
         }
         try {
-            ModelConfigResolver.ResolvedModel r = modelConfigResolver.resolve(modelName);
-            return r == null ? null : r.config();
+            return modelConfigResolver.resolve(modelName);
         } catch (RuntimeException e) {
             log.warn("[摘要] provider 配置解析失败 model={} 原因={}", modelName, e.getMessage());
             return null;

@@ -1,6 +1,6 @@
 import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
-import { MarkdownText } from '@/markdown/MarkdownText'
+import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { projectPreview } from '@/markdown/plainPreview'
 import type { AttachmentRequest, ChatMessageDto, ToolCallDto } from '@/api/types'
 import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
@@ -703,7 +703,7 @@ function SendUserMessageBody({ tool }: { tool: NonNullable<ChatMessageDto['toolC
   if (!payload) return null
   return (
     <div className="sum-body">
-      {payload.message !== '' && <MarkdownText text={payload.message} className="content md" />}
+      {payload.message !== '' && <MarkdownTextV2 text={payload.message} className="content md" />}
       {payload.attachments.length > 0 && (
         <div className="sum-attachments">
           {payload.attachments.map((a) => (
@@ -791,7 +791,7 @@ function CompactSummaryCard({ msg, highlighted }: { msg: ChatMessageDto; highlig
       </div>
       {expanded && text.trim() !== '' && (
         <div className="cs-body">
-          <MarkdownText text={text} className="cs-text md" />
+          <MarkdownTextV2 text={text} className="cs-text md" />
         </div>
       )}
     </div>
@@ -903,7 +903,7 @@ function StopHookSummaryRow({ payload }: { payload: NonNullable<ChatMessageDto['
  *  代码块缩进会被抹平 —— 均为已拍板接受的取舍。 */
 const HEAVY_CONTENT_CHARS = 20_000
 const HEAVY_PREVIEW_CHARS = 5_000
-function ContentGuard({ text, className, onRunHtml }: { text: string; className: string; onRunHtml?: (code: string) => void }) {
+function ContentGuard({ text, className, onRunHtml, streaming }: { text: string; className: string; onRunHtml?: (code: string) => void; streaming?: boolean }) {
   const heavy = text.length > HEAVY_CONTENT_CHARS
   const [expanded, setExpanded] = useState(false)
   // 预览：先按字符截断源文、再投影（顺序不可换 —— 反过来会对 >20KB 全文 parse，
@@ -921,7 +921,7 @@ function ContentGuard({ text, className, onRunHtml }: { text: string; className:
     () => (heavy ? projectPreview(text, HEAVY_PREVIEW_CHARS) : ''),
     [text, heavy],
   )
-  if (!heavy || expanded) return <MarkdownText text={text} className={className} onRunHtml={onRunHtml} />
+  if (!heavy || expanded) return <MarkdownTextV2 text={text} className={className} streaming={streaming} onRunHtml={onRunHtml} />
   return (
     <div className={className}>
       <pre className="heavy-preview">{shown}{text.length > HEAVY_PREVIEW_CHARS ? '…' : ''}</pre>
@@ -1931,7 +1931,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
         )}
         {/* 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含
             SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。 */}
-        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownText text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
+        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownTextV2 text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
         {/* [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」） */}
         {renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })}
       </div>
@@ -3528,9 +3528,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           animation: exec-scan 1.5s ease-in-out infinite;
         }
         @keyframes exec-scan { 0% { left: -42%; } 100% { left: 100%; } }
-        /* 尊重系统「减少动态效果」偏好：关掉扫光与波浪（状态行文字仍在，信息不丢）。 */
+        /* [2026-11-10] 扫光条**不再跟随系统「减少动态效果」偏好**。
+           WHY：Windows 关掉「动画效果」⇒ WebView2 客户端 prefers-reduced-motion=reduce
+           （Chrome 不跟随 ⇒ 浏览器正常、客户端静止）⇒ 扫光条在客户端永远不动，
+           而它是「还在跑」的唯一动效线索 ⇒ 状态信息丢失。
+           裁定：动效由产品「设置 → 动画」开关控制（.app.no-animations 用
+           animation-duration:0s !important 全局压制，已覆盖「产品关 ⇒ 静止」）。 */
+        .app.no-animations .exec-scan-line::after { animation: none; left: 29%; }
+        /* 波浪点仍尊重系统偏好（纯装饰，不承载状态信息，静止不丢信息）。 */
         @media (prefers-reduced-motion: reduce) {
-          .exec-scan-line::after { animation: none; left: 29%; }
           .turn-process-toggle.running .wave-dots i { animation: none; opacity: .7; }
         }
         .turn-process-status { font-weight: 500; }

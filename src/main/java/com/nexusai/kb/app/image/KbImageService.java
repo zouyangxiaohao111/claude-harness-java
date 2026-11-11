@@ -15,7 +15,6 @@ import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.jdbc.core.JdbcTemplate;
 import org.springframework.stereotype.Service;
 
 import java.time.LocalDateTime;
@@ -69,17 +68,25 @@ public class KbImageService {
     private final KbChunkImageMapper imageMapper;
     private final KbChunkMapper chunkMapper;
     private final KbKnowledgeMapper knowledgeMapper;
-    private final JdbcTemplate jdbcTemplate;
 
+    /**
+     * ⚠️ 本类<b>刻意不注入 JdbcTemplate</b>。
+     *
+     * <p>本仓的 {@code @Transactional} 由 MyBatis-Flex 的 {@code FlexTransactionManager} 接管，
+     * 它不绑定 Spring 的 {@code DataSourceUtils}；而 {@code JdbcTemplate} 正是靠那个
+     * ThreadLocal 复用事务连接。两者混用 ⇒ 事务内另借一条连接 ⇒ 抢 SQLite 写锁
+     * ⇒ {@code SQLITE_BUSY}（已在 {@link #projectChunk} 上真实发生过）。
+     *
+     * <p>⇒ 本类全部读写都走 {@code imageMapper}，与外层事务同一条连接。
+     * ⛔ 不要再为「写个原生 SQL 方便」把 JdbcTemplate 加回来。
+     */
     @Autowired
     public KbImageService(KbChunkImageMapper imageMapper,
                           KbChunkMapper chunkMapper,
-                          KbKnowledgeMapper knowledgeMapper,
-                          JdbcTemplate jdbcTemplate) {
+                          KbKnowledgeMapper knowledgeMapper) {
         this.imageMapper = imageMapper;
         this.chunkMapper = chunkMapper;
         this.knowledgeMapper = knowledgeMapper;
-        this.jdbcTemplate = jdbcTemplate;
     }
 
     /**
@@ -89,6 +96,22 @@ public class KbImageService {
      * ⚠️ 用「全量替换」而不是「增量比对」：image_info 是整块 JSON，
      * 增量比对的下标对齐很容易错位，而一个 chunk 的图片数是个位数，全量重算可忽略。
      *
+     * <h2>⭐⭐ 为什么必须走 Flex Mapper 而不是 JdbcTemplate</h2>
+     * 本方法会被 {@code @Transactional} 方法调用（{@code KbChunkWriter.replaceChunks} /
+     * {@code KbKnowledgeExtService.updateImageInfo}），而本仓的 {@code @Transactional}
+     * 由 MyBatis-Flex 的 {@code FlexTransactionManager} 接管
+     * （{@code FlexTransactionAutoConfiguration implements TransactionManagementConfigurer}）。
+     * 它 {@code doBegin} 只生成一个 XID 字符串，<b>不调用 Spring 的
+     * {@code DataSourceUtils.bindResource}</b>；Flex 的 Mapper 从
+     * {@code FlexDataSource.getConnection()} 按 XID 复用同一条连接，
+     * 而 {@code JdbcTemplate} 走 {@code DataSourceUtils} 时 ThreadLocal 是空的
+     * ⇒ 另借一条 Hikari 连接 ⇒ 同事务内<b>自己和自己抢 SQLite 写锁</b>。
+     *
+     * <p>实测（2026-11-09）：上传一份 1.81 MB 带 3 张图的 docx，
+     * `DELETE FROM kb_chunk_image` 空转 5 秒后 {@code SQLITE_BUSY}，重试 3 次全部失败，
+     * 而解析本身完全成功 ⇒ 用户看到「解析失败」但日志里没有任何解析错误。
+     * ⇒ 投影表的<b>全部写操作</b>必须走 {@code imageMapper}，与读操作同一条连接。
+     *
      * @param chunk kb_chunk 行（caller 已读库；本方法不读 chunk）
      */
     public void projectChunk(KbChunkRecord chunk) {
@@ -96,31 +119,58 @@ public class KbImageService {
             return;
         }
         List<Map<String, Object>> rows = parseImageInfo(chunk);
-        // ⚠️ 参数化原生 SQL：复合主键 + 批量插入，Flex 的 insertOrUpdate 不适用。
-        jdbcTemplate.update("DELETE FROM kb_chunk_image WHERE chunk_id = ?", chunk.getId());
+
+        // 全量替换：先清该块的所有投影行
+        imageMapper.deleteByQuery(
+            QueryWrapper.create().where("chunk_id = ?", chunk.getId()));
+
         if (rows.isEmpty()) {
             return;
         }
-        String now = KbTimeFormat.format(LocalDateTime.now());
-        List<Object[]> batch = new ArrayList<>(rows.size());
+
+        LocalDateTime now = LocalDateTime.now();
+        List<KbChunkImageRecord> batch = new ArrayList<>(rows.size());
         for (int i = 0; i < rows.size(); i++) {
             Map<String, Object> r = rows.get(i);
-            batch.add(new Object[]{
-                chunk.getId(), i,
-                chunk.getKnowledgeBaseId(), chunk.getKnowledgeId(),
-                chunk.getChunkType() == null ? "" : chunk.getChunkType(),
-                r.get("image_key"), r.get("url"), r.get("original_url"),
-                r.get("caption"), r.get("ocr_text"), r.get("attrs"),
-                chunk.getIsEnabled() == null ? 1 : chunk.getIsEnabled(),
-                r.get("status"), now, now, 0L
-            });
+            KbChunkImageRecord rec = new KbChunkImageRecord();
+            rec.setChunkId(chunk.getId());
+            rec.setImageIndex(i);
+            rec.setKnowledgeBaseId(chunk.getKnowledgeBaseId());
+            rec.setKnowledgeId(chunk.getKnowledgeId());
+            rec.setChunkType(chunk.getChunkType() == null ? "" : chunk.getChunkType());
+            rec.setImageKey(str(r.get("image_key")));
+            rec.setUrl(str(r.get("url")));
+            rec.setOriginalUrl(str(r.get("original_url")));
+            rec.setCaption(str(r.get("caption")));
+            rec.setOcrText(str(r.get("ocr_text")));
+            rec.setAttrs(str(r.get("attrs")));
+            rec.setIsEnabled(chunk.getIsEnabled() == null ? 1 : chunk.getIsEnabled());
+            rec.setStatus(intOf(r.get("status")));
+            // 时间走实体上的 KbSqliteLocalDateTimeTypeHandler ⇒ 输出
+            // "yyyy-MM-dd HH:mm:ss"（与 KbTimeFormat.format 逐字节同款，探针已验证）
+            rec.setCreatedAt(now);
+            rec.setUpdatedAt(now);
+            rec.setTenantId(0L);
+            batch.add(rec);
         }
-        jdbcTemplate.batchUpdate(
-            "INSERT INTO kb_chunk_image (chunk_id, image_index, knowledge_base_id, knowledge_id, "
-                + "chunk_type, image_key, url, original_url, caption, ocr_text, attrs, "
-                + "is_enabled, status, created_at, updated_at, tenant_id) "
-                + "VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
-            batch);
+        imageMapper.insertBatch(batch);
+    }
+
+    /** 列值 → 文本（null 落空串：投影表这几列都是 {@code NOT NULL DEFAULT ''}）。 */
+    private static String str(Object v) {
+        return v == null ? "" : String.valueOf(v);
+    }
+
+    /** 列值 → int（null 落 0：{@code status} 列 {@code NOT NULL DEFAULT 0}）。 */
+    private static int intOf(Object v) {
+        if (v instanceof Number n) {
+            return n.intValue();
+        }
+        try {
+            return v == null ? 0 : Integer.parseInt(String.valueOf(v).trim());
+        } catch (NumberFormatException e) {
+            return 0;
+        }
     }
 
     /**
@@ -240,21 +290,23 @@ public class KbImageService {
         }
         boolean asc = "asc".equalsIgnoreCase(sortOrder);
 
-        StringBuilder where = new StringBuilder(" FROM kb_chunk_image WHERE knowledge_base_id = ?");
-        List<Object> args = new ArrayList<>();
-        args.add(kbId);
+        // ⚠️ 条件用 QueryWrapper 拼，不走裸 SQL 字符串：
+        //    本类早已因「JdbcTemplate 与 Flex 事务不同连接」炸过一次（见 projectChunk 的 javadoc），
+        //    这里若继续用 jdbcTemplate，将来把它包进事务的人会再踩一次同一个坑。
+        QueryWrapper qw = QueryWrapper.create();
+        qw.and("knowledge_base_id = ?", kbId);
         if (isEnabled != null) {
-            where.append(" AND is_enabled = ?");
-            args.add(isEnabled ? 1 : 0);
+            qw.and("is_enabled = ?", isEnabled ? 1 : 0);
         }
         if (knowledgeIds != null && !knowledgeIds.isBlank()) {
             String[] ids = knowledgeIds.split(",");
-            where.append(" AND knowledge_id IN (")
-                .append(String.join(",", java.util.Collections.nCopies(ids.length, "?")))
-                .append(")");
+            List<String> trimmed = new ArrayList<>(ids.length);
             for (String id : ids) {
-                args.add(id.trim());
+                trimmed.add(id.trim());
             }
+            qw.and("knowledge_id IN (" + String.join(",",
+                java.util.Collections.nCopies(trimmed.size(), "?")) + ")",
+                trimmed.toArray());
         }
         if (keyword != null && !keyword.isBlank()) {
             String scope = searchIn == null || searchIn.isBlank() ? "all" : searchIn.trim();
@@ -263,15 +315,11 @@ public class KbImageService {
             }
             String like = "%" + keyword.trim() + "%";
             switch (scope) {
-                case "caption" -> { where.append(" AND caption LIKE ?"); args.add(like); }
-                case "ocr" -> { where.append(" AND ocr_text LIKE ?"); args.add(like); }
-                case "attrs" -> { where.append(" AND attrs LIKE ?"); args.add(like); }
-                default -> {
-                    where.append(" AND (caption LIKE ? OR ocr_text LIKE ? OR attrs LIKE ?)");
-                    args.add(like);
-                    args.add(like);
-                    args.add(like);
-                }
+                case "caption" -> qw.and("caption LIKE ?", like);
+                case "ocr" -> qw.and("ocr_text LIKE ?", like);
+                case "attrs" -> qw.and("attrs LIKE ?", like);
+                default -> qw.and("(caption LIKE ? OR ocr_text LIKE ? OR attrs LIKE ?)",
+                    like, like, like);
             }
         }
         if (attrFilters != null && !attrFilters.isBlank()) {
@@ -281,44 +329,45 @@ public class KbImageService {
                 if (eq <= 0) {
                     continue;
                 }
-                where.append(" AND attrs LIKE ?");
-                args.add("%\"" + pair.substring(0, eq).trim() + "\"%"
+                qw.and("attrs LIKE ?", "%\"" + pair.substring(0, eq).trim() + "\"%"
                     + pair.substring(eq + 1).trim() + "%");
             }
         }
 
-        Integer total = jdbcTemplate.queryForObject(
-            "SELECT COUNT(*)" + where, Integer.class, args.toArray());
-        String sql = "SELECT *" + where + " ORDER BY " + sort + (asc ? " ASC" : " DESC")
-            + ", chunk_id ASC, image_index ASC LIMIT ? OFFSET ?";
-        List<Object> pageArgs = new ArrayList<>(args);
-        pageArgs.add(size);
-        pageArgs.add((p - 1) * size);
+        long total = imageMapper.selectCountByQuery(qw);
 
-        List<ImageAsset> items = new ArrayList<>();
+        // 排序 + 分页（sort / asc 已在上面白名单校验，拼进 ORDER BY 是安全的）。
+        // ⚠️ 复用同一个 qw 实例：Flex 的 QueryWrapper 是可变构建器，
+        //    count 执行不消耗它；这里补上 ORDER BY / LIMIT 就是列表查询。
+        qw.orderBy(sort, asc)
+            .orderBy("chunk_id", true)
+            .orderBy("image_index", true)
+            .limit((p - 1) * size, size);
+
+        List<KbChunkImageRecord> records = imageMapper.selectListByQuery(qw);
+        List<ImageAsset> items = new ArrayList<>(records.size());
         Map<String, String> titleCache = new HashMap<>();
-        jdbcTemplate.query(sql, rs -> {
+        for (KbChunkImageRecord rec : records) {
             ImageAsset a = new ImageAsset(
-                rs.getString("chunk_id") + "#" + rs.getInt("image_index"),
-                rs.getString("chunk_id"),
-                rs.getString("knowledge_id"),
-                rs.getString("chunk_type"),
-                rs.getString("url"),
-                rs.getString("original_url"),
-                rs.getString("caption"),
-                rs.getString("ocr_text"),
-                rs.getString("attrs"),
-                rs.getInt("is_enabled") != 0,
-                rs.getInt("status"),
-                rs.getString("created_at"),
-                rs.getString("updated_at"),
+                rec.getChunkId() + "#" + rec.getImageIndex(),
+                rec.getChunkId(),
+                rec.getKnowledgeId(),
+                rec.getChunkType(),
+                rec.getUrl(),
+                rec.getOriginalUrl(),
+                rec.getCaption(),
+                rec.getOcrText(),
+                rec.getAttrs(),
+                rec.getIsEnabled() == null || rec.getIsEnabled() != 0,
+                rec.getStatus() == null ? 0 : rec.getStatus(),
+                KbTimeFormat.format(rec.getCreatedAt()),
+                KbTimeFormat.format(rec.getUpdatedAt()),
                 "");
-            String kid = a.knowledgeId();
-            String title = titleCache.computeIfAbsent(kid, this::lookupTitle);
+            String title = titleCache.computeIfAbsent(a.knowledgeId(), this::lookupTitle);
             items.add(a.withSourceName(title));
-        }, pageArgs.toArray());
+        }
 
-        return new Page(items, p, size, total == null ? 0 : total);
+        return new Page(items, p, size, (int) total);
     }
 
     private String lookupTitle(String knowledgeId) {
@@ -396,20 +445,29 @@ public class KbImageService {
 
     /** 供其它服务使用：去重后的图片 key 集合（调试 / 统计用）。 */
     public Set<String> distinctKeys(String kbId) {
-        List<String> keys = jdbcTemplate.queryForList(
-            "SELECT DISTINCT image_key FROM kb_chunk_image WHERE knowledge_base_id = ?",
-            String.class, kbId);
-        return new LinkedHashSet<>(keys);
+        QueryWrapper qw = QueryWrapper.create()
+            .select("DISTINCT image_key")
+            .where("knowledge_base_id = ?", kbId);
+        List<Object> keys = imageMapper.selectObjectListByQuery(qw);
+        Set<String> out = new LinkedHashSet<>(keys.size());
+        for (Object k : keys) {
+            if (k != null) {
+                out.add(String.valueOf(k));
+            }
+        }
+        return out;
     }
 
     /** 删除某个知识下的全部投影行（源侧触发器在 hard delete 时做的事）。 */
     public void deleteByKnowledgeId(String knowledgeId) {
-        jdbcTemplate.update("DELETE FROM kb_chunk_image WHERE knowledge_id = ?", knowledgeId);
+        imageMapper.deleteByQuery(
+            QueryWrapper.create().where("knowledge_id = ?", knowledgeId));
     }
 
     /** 删除某个块的投影行。 */
     public void deleteByChunkId(String chunkId) {
-        jdbcTemplate.update("DELETE FROM kb_chunk_image WHERE chunk_id = ?", chunkId);
+        imageMapper.deleteByQuery(
+            QueryWrapper.create().where("chunk_id = ?", chunkId));
     }
 
     /** 供测试 / 其它服务读投影行。 */

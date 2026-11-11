@@ -31,6 +31,14 @@ public class SessionArtifactRecord {
     private String summary;
     /** 溯源消息 id（当前抽取链路不产逐条溯源 → 恒 null，不伪造）。 */
     private String sourceMessageId;
+    /**
+     * 产物来源通道 · {@code deliverables}（写进会话交付物目录）| {@code project-write}
+     * （Write/Edit 写过的项目内文档）。V279 起写入；历史行为 null = 未标注。
+     *
+     * <p>WHY 落库而不是读时判断：读时只能靠 {@code local_path} 是否在交付物目录下推断，
+     * 而归档副本与项目原文件在归档后路径形态一致（都在归档目录内）⇒ 读时判不出来。
+     */
+    private String origin;
     private String createdAt;
     private String updatedAt;
 
@@ -52,6 +60,8 @@ public class SessionArtifactRecord {
     public void setSummary(String summary) { this.summary = summary; }
     public String getSourceMessageId() { return sourceMessageId; }
     public void setSourceMessageId(String sourceMessageId) { this.sourceMessageId = sourceMessageId; }
+    public String getOrigin() { return origin; }
+    public void setOrigin(String origin) { this.origin = origin; }
     public String getCreatedAt() { return createdAt; }
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getUpdatedAt() { return updatedAt; }

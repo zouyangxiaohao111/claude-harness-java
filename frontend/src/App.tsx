@@ -1,4 +1,14 @@
 import './styles/globals.css'
+// V2 markdown 渲染器的代码块样式（照搬源站 .chat-code-block 系列）。
+// ⚠️ 必须排在 globals.css 之后：V1 的 .md-code-block 规则还在 globals.css 里，
+//    两者选择器不同（不冲突），但同权重时先加载者被覆盖 —— 放后面确保源站样式生效。
+import './styles/chat-code-block.css'
+// 代码高亮配色（照搬源站 GitHub Light/Dark）。
+// ⚠️ 必须有：highlight.js 只切 token 不配色，缺这个文件代码块全是单色（真机缺陷）。
+import './styles/chat-code-hljs.css'
+// 知识库设计稿对齐样式（自动从 weknora-bundle.css 提取，全表作用域在 .kb-scope 子树内）。
+// ⚠️ 必须排在 globals.css 之后：同权重时靠后者胜出。
+import './styles/kb/index.css'
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 
 import {
@@ -19,6 +29,7 @@ import { compareSessions } from '@/utils/sessionOrder'
 import { resolveNewSessionProjectId } from '@/utils/newSessionProject'
 import { chatApi } from '@/api/chat'
 import { artifactsApi, type SessionArtifacts, type SessionArtifactDto } from '@/api/artifacts'
+import { buildTurnContext, dedupeByFile } from '@/utils/artifactGrouping'
 import { goalApi, splitGoalKickoff } from '@/api/goal'
 import { usageTurnsApi, type TurnUsageDto } from '@/api/usageTurns'
 import { commandApi, isPromptExecuteResult } from '@/api/command'
@@ -34,6 +45,9 @@ import { computeTurnRunning } from '@/utils/turnRunning'
 import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
 import { sendSystemNotification, ensureNotificationPermissionOnGesture } from '@/utils/systemNotify'
+import { onSystemNotificationClick } from '@/utils/systemNotify'
+import { showMainWindow } from '@/utils/tauri-bridge'
+import { openKnowledgeWindow } from '@/utils/kbWindow'
 import { updateTrayRecent, onTraySwitchSession } from '@/utils/trayRecent'
 import { useChatStore, selectCompact, collectRemovedUuids } from '@/stores/chatStore'
 import { parseGoalPayload } from '@/utils/goalState'
@@ -54,6 +68,7 @@ import { MenuBar } from '@/components/layout/MenuBar'
 import { SessionList } from '@/components/left/SessionList'
 import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
+import { AskUserPendingHint } from '@/components/center/AskUserPendingHint'
 import { DialogOpsModal } from '@/components/center/DialogOpsModal'
 import { RetryBanner } from '@/components/center/RetryBanner'
 import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
@@ -195,6 +210,13 @@ function App() {
   // ---- all sessions：来自后端（chatStore.sessions，挂载时 sessionApi.list() 拉取）----
   const storeSessions = useChatStore((s) => s.sessions)
   const setSessions = useChatStore((s) => s.setSessions)
+  /**
+   * 会话列表请求序号（防「在途响应把本地改动冲掉」）。
+   *
+   * <p>只有**序号仍是最新**的响应才允许 `setSessions`。本地改动（新建 / 删除会话）也 `++`，
+   * 使在途的旧请求结果被丢弃 —— 否则静默轮询会出现「新建的会话闪一下又消失，最多 5 秒后才回来」。
+   */
+  const sessionListSeqRef = useRef(0)
   // [goal V253] 目标状态写入（STOMP 推送 / REST 拉取都汇到这里）
   const setGoal = useChatStore((s) => s.setGoal)
 
@@ -206,7 +228,7 @@ function App() {
   useEffect(() => {
     let cancelled = false
     projectApi.list()
-      .then((list) => { if (!cancelled) setRealProjects(list.map((d) => ({ id: d.id, name: d.name, branch: d.branch ?? '', dirty: d.dirty ?? 0, agents: d.agents ?? 0, path: d.path ?? '' }))) })
+      .then((list) => { if (!cancelled) setRealProjects(list.map((d) => ({ id: d.id, name: d.name, branch: d.branch ?? '', dirty: d.dirty ?? 0, agents: d.agents ?? 0, path: d.path ?? '', createdAt: d.createdAt ?? undefined }))) })
       .catch(() => { /* 后端未就绪则回落 mock allProjects，不阻断 */ })
     return () => { cancelled = true }
   }, [])
@@ -221,6 +243,81 @@ function App() {
    * 知识库是浮层，两者语义不同，不要合并成一个 state。
    */
   const [showKnowledge, setShowKnowledge] = useState(false)
+  /**
+   * 知识库浮层的拖动位移（用户 2026-11-09 裁定：保留弹窗但要能移开）。
+   *
+   * <p>⚠️ 与面板的居中定位并存：居中由 `.kb-scene-overlay` 的 flex 负责，
+   * `transform: translate()` 只叠加在中心点之上 ⇒ 用户把窗口挪到任意位置，
+   * 窗口尺寸变化时仍会回到「相对居中」的位置（不会漂到屏幕外）。
+   *
+   * <p>⚠️ 关闭时**不复位**：用户把面板挪到右边、关掉、再打开，应该还在右边
+   * —— 那是他的偏好，复位等于每次都要重拖一遍。
+   */
+  const [kbDrag, setKbDrag] = useState({ x: 0, y: 0 })
+  /**
+   * 「正在拖」的同步标志（**不能用 state**）。
+   *
+   * <p>mouse 与 pointer 两套处理器会在同一帧内先后触发，state 更新是异步的 ⇒
+   * 第二次进来时 `kbDragging` 还是 false，去重失效、位移翻倍。ref 是同步的。
+   */
+  const kbDragActiveRef = useRef(false)
+  /** 拖动中（用来临时关掉 transition，否则拖动会「橡皮筋」式滞后） */
+  const [kbDragging, setKbDragging] = useState(false)
+
+  /**
+   * 知识库面板拖动的统一入口（mouse + pointer 双通道）。
+   *
+   * <p><b>为什么必须双通道（实测事故）</b>：只挂 `onPointerDown` 时，在部分渲染环境下
+   * **真实鼠标按下只产生 `mousedown`，一条 `pointerdown` 都没有** ——
+   * 于是「按住拖动条」完全没反应，用户报「知识库弹窗无法移动」。
+   * 合成事件测试查不出这种问题（合成 PointerEvent 当然能触发 pointer 处理器）。
+   *
+   * <p>⚠️ 支持 Pointer Events 的环境里两套都会派发 ⇒ 用 {@link kbDragActiveRef}
+   * 做「已在拖动中」的去重，否则一次拖动会同时被两个 handler 处理、位移翻倍。
+   */
+  function startDrag(clientX: number, clientY: number, button: number) {
+    if (button !== 0 || kbDragActiveRef.current) return
+    kbDragActiveRef.current = true
+    const startX = clientX - kbDrag.x
+    const startY = clientY - kbDrag.y
+    // 面板基准位置（居中后的静态位置，**不含当前位移**）——用来算可拖范围
+    const base = document.querySelector('.kb-scene-panel')?.getBoundingClientRect()
+    const baseX = base ? base.x - kbDrag.x : 0
+    const baseY = base ? base.y - kbDrag.y : 0
+    const baseW = base ? base.width : window.innerWidth
+    /** 至少留 80px 在视口内，防止整块拖出去再也点不到 */
+    const KEEP = 80
+    const minX = -baseX - baseW + KEEP
+    const maxX = window.innerWidth - baseX - KEEP
+    const minY = -baseY
+    const maxY = window.innerHeight - baseY - KEEP
+    const clamp = (v: number, lo: number, hi: number) => Math.min(Math.max(v, lo), hi)
+
+    setKbDragging(true)
+    const onMove = (ev: MouseEvent | PointerEvent) => {
+      setKbDrag({
+        x: clamp(ev.clientX - startX, minX, maxX),
+        y: clamp(ev.clientY - startY, minY, maxY),
+      })
+    }
+    const onUp = () => {
+      kbDragActiveRef.current = false
+      // 两套都摘，摘不存在的监听是无害的空操作
+      window.removeEventListener('pointermove', onMove)
+      window.removeEventListener('pointerup', onUp)
+      window.removeEventListener('pointercancel', onUp)
+      window.removeEventListener('mousemove', onMove)
+      window.removeEventListener('mouseup', onUp)
+      setKbDragging(false)
+    }
+    // 挂到 window：拖出拖动条（甚至拖出面板）也要继续跟手
+    window.addEventListener('pointermove', onMove)
+    window.addEventListener('pointerup', onUp)
+    window.addEventListener('pointercancel', onUp)
+    window.addEventListener('mousemove', onMove)
+    window.addEventListener('mouseup', onUp)
+  }
+
   /** 知识库场景内的当前面：知识库 / 共享空间（侧栏切换） */
   const [kbScene, setKbScene] = useState<'knowledge' | 'shared'>('knowledge')
   /** 斜杠前缀 chip 的显示别名（召唤技能时携带中文显示名；Composer 仅在前缀名匹配时使用） */
@@ -452,15 +549,20 @@ function App() {
       .catch(() => { /* 后端未就绪则档位显示未配置，不阻断 */ })
     return () => { cancelled = true }
   }, [applyAppSettings])
-  const onSaveSettings = useCallback(async (req: UpdateSettingsRequest) => {
+  const onSaveSettings = useCallback(async (req: UpdateSettingsRequest): Promise<boolean> => {
     try {
       const updated = await settingsApi.update(req)
       // PUT 的响应契约仍是 SettingsDto（**不含**只读的 appName/configHome）⇒ 必须经 applyAppSettings
       //   （内部 mergeSettings 从旧值保留只读字段），否则每次保存设置后 PermissionBubble 的
       //   自有根标签会静默退化回 .nexusai/。⛔ 不许在此处再手写一份合并（本仓刚因「两套写法」返工过）。
       applyAppSettings(updated)
+      return true
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      // ⚠️ 必须把「失败」回传给调用方，否则面板会以为保存成功再弹一条成功提示
+      //   ⇒ 用户看到「已设为 X」但配置根本没变（本仓 CLI 默认运行时踩过：值域不匹配被 400 拒，
+      //   错误提示被吞 ⇒ 界面显示成功、DB 纹丝不动）。
+      return false
     }
   }, [showToast, applyAppSettings])
 
@@ -469,9 +571,10 @@ function App() {
   // 列表非空 → 自动切到第一个真实会话（真实 id）。
   useEffect(() => {
     let cancelled = false
+    const mySeq = ++sessionListSeqRef.current
     sessionApi.list()
       .then((list) => {
-        if (cancelled) return
+        if (cancelled || mySeq !== sessionListSeqRef.current) return
         setSessions(list)
         if (list.length > 0 && !list.some((s) => s.id === sessionR.activeSession)) {
           sessionDispatch({ type: 'SWITCH', sessionId: list[0].id })
@@ -484,6 +587,34 @@ function App() {
     return () => { cancelled = true }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [setSessions, showToast])
+
+  // ---- 会话列表静默轮询（2026-11-10 用户裁定：「组内会动」要实时，方式=后台定时刷新、前端无感）----
+  //
+  // WHY 需要它：后端每个用户消息入库都会写 sessions.updated_at（MessageService 三处），
+  //   但前端**没有任何地方本地更新 updatedAt**，也没有「列表变了」的 WS 事件 ⇒ 不轮询的话
+  //   组内顺序只在「新建会话 / F5」两个时刻才变，用户看不到「谁最近活动」。
+  //
+  // 为什么是整表 setSessions 而不是增量 patch：列表只有几十行，整表替换最省事且不会漏字段；
+  //   渲染层靠 React diff，引用变了但值相同 ⇒ 不重排 DOM。
+  //
+  // ⚠️ 静默语义：成功不弹 toast、失败也不弹（网络抖动不该在用户面前刷红条）；
+  //   ⛔ 不切换 activeSession —— 首屏那次拉取才负责「无会话时自动切第一个」。
+  // ⚠️ 页面在后台（切到别的 tab / 窗口最小化）时跳过：没人看，白耗后端连接池（SQLite 写锁敏感）。
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      if (cancelled || document.visibilityState === 'hidden') return
+      const mySeq = ++sessionListSeqRef.current
+      sessionApi.list()
+        .then((list) => { if (!cancelled && mySeq === sessionListSeqRef.current) setSessions(list) })
+        .catch(() => { /* 静默：轮询失败不打扰用户，下一轮自然重试 */ })
+    }
+    const timer = window.setInterval(poll, 5000)
+    // 切回前台立刻补一次（否则最多要等 5s 才看到期间发生的变化）
+    const onVisible = () => { if (document.visibilityState === 'visible') poll() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => { cancelled = true; window.clearInterval(timer); document.removeEventListener('visibilitychange', onVisible) }
+  }, [setSessions])
 
   // ---- current session & its context ----
   const activeSessionId = sessionR.activeSession
@@ -638,19 +769,12 @@ function App() {
     try {
       const r = await artifactsApi.list(sessionId)
       if (artifactsSessionRef.current !== sessionId) return null // 已切到别的会话 → 丢弃迟到响应
-      // [2026-11-01 用户裁定] 产物按**时间倒序**（新 → 旧）。
-      // 后端 list 已按 updated_at 倒序，这里再排一次是**兜底**：排序是用户可见的硬约定，
-      // ⛔ 不能只依赖「后端某天改成别的顺序」；同时给 updatedAt 缺失的旧行一个稳定次序。
-      const byTimeDesc = <T extends { updatedAt: string | null }>(rows: T[]): T[] =>
-        [...rows].sort((x, y) => {
-          const tx = x.updatedAt ? Date.parse(x.updatedAt) : 0
-          const ty = y.updatedAt ? Date.parse(y.updatedAt) : 0
-          return ty - tx
-        })
-      const deliverables = byTimeDesc(Array.isArray(r?.deliverables) ? r.deliverables : [])
+      // [脏数据兜底 2026-11-10 用户裁定] 去重规则见 dedupeByFile 的 WHY
+      //   （后端 V276~V278 每轮全量重录 ⇒ 同一文件跨轮多行；存量行不会自动消失）。
+      const deliverables = dedupeByFile(Array.isArray(r?.deliverables) ? r.deliverables : [])
       setSessionArtifacts({
         deliverables,
-        sources: byTimeDesc(Array.isArray(r?.sources) ? r.sources : []),
+        sources: dedupeByFile(Array.isArray(r?.sources) ? r.sources : []),
       })
       return deliverables
     } catch { return null /* 静默：保持旧值 */ }
@@ -661,6 +785,35 @@ function App() {
     if (!activeSessionId) return
     void reloadArtifacts(activeSessionId)
   }, [activeSessionId, reloadArtifacts])
+
+  /**
+   * [产物按对话分组 2026-11-10] 轮次键 → 用户提问原文 / 时间。
+   *
+   * <p><b>WHY 在 App 算而不是在 RightPanel 算</b>：RightPanel 只有 artifacts，拿不到消息表；
+   * 而「这一轮问了什么」是分组卡头的唯一可读标识（用户原话：「不然没法看是哪个对话产出的」）。
+   *
+   * <p><b>⛔ 只收真人提问</b>（复用 {@link isUserTurnRow} 单点真源）：系统注入行
+   * （`<system-reminder>` / `<task-notification>` / 「A session-scoped Stop hook…」）
+   * 在 DB 里也是 role=user，把它们当提问显示会变成「某轮的问题是一串 hook 日志」。
+   * 这类轮次不产生条目 ⇒ 其产物自然落到「历史产物」组。
+   */
+  const turnContext = useMemo(() => buildTurnContext(storeMessages), [storeMessages])
+
+  /**
+   * [产物分组「当前轮」高亮] 正在进行的那一轮的用户消息 id。
+   *
+   * <p>取「最后一条真人提问」而不是跟踪某个独立状态：产物卡组的键就是那条消息的 id，
+   * 最后一条提问 = 当前对话正在处理的那一轮。非运行态返回 null（没有「当前」可言，
+   * ⛔ 别把最后一轮一直标成「当前」—— 那会让用户以为它还在跑）。
+   */
+  const currentTurnId = useMemo(() => {
+    if (!turnRunning) return null
+    for (let i = storeMessages.length - 1; i >= 0; i--) {
+      const m = storeMessages[i]
+      if (isUserTurnRow(m)) return m.id
+    }
+    return null
+  }, [turnRunning, storeMessages])
 
   /**
    * [goal V253] 拉取本会话目标（/goal）· 切会话 / F5 时的**初始状态来源**。
@@ -839,6 +992,41 @@ function App() {
     const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
     setMessages(sid, messages)
     useChatStore.getState().setHasMore(sid, hasMore)
+  }, [setMessages])
+  /** 尾部对账的调用序号（按 sid）：响应回来时若序号已变（期间又发了一次）→ 丢弃旧响应，
+   *  否则「先发的慢请求后返回」会把新结果覆盖成旧窗口。 */
+  const reconcileSeqRef = useRef<Record<string, number>>({})
+  /**
+   * [尾部对账] 切会话 / 断连重连 / idle 兜底 三处共用：拉一次尾窗，**只比尾部消息 id**，
+   * 变了才整表替换（无变化时完全不写 store ⇒ foldedTurnCounts 不归零、用户展开过的更早轮保留）。
+   *
+   * <p>本地尾部可能是**服务端不可达**的合成行（`away-*` 离开摘要 / `perm-*` 权限超时留痕，
+   * 只存在于前端）⇒ 比对前跳过它们，取最后一条服务端可达的行。
+   */
+  const reconcileTail = useCallback(async (sid: string): Promise<void> => {
+    const token = (reconcileSeqRef.current[sid] ?? 0) + 1
+    reconcileSeqRef.current[sid] = token
+    try {
+      const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
+      const localMsgs = useChatStore.getState().messages[sid] ?? []
+      // 过期守卫：期间又发起了更新的对账 → 本次结果作废
+      if (reconcileSeqRef.current[sid] !== token) return
+      let localTailId: string | null = null
+      for (let i = localMsgs.length - 1; i >= 0; i--) {
+        const id = localMsgs[i]?.id ?? null
+        if (!id || id.startsWith('away-') || id.startsWith('perm-')) continue
+        localTailId = id
+        break
+      }
+      const serverTailId = messages.length > 0 ? messages[messages.length - 1]?.id ?? null : null
+      // 尾部一致（且服务器非空、本地尾部 id 非空）→ 内容没变，不写 store
+      if (messages.length > 0 && localTailId != null && localTailId === serverTailId) return
+      setMessages(sid, messages)
+      useChatStore.getState().setHasMore(sid, hasMore)
+    } catch (e) {
+      // 静默：后台行为，一次失败不该打断用户（下次切会话 / 重连 / idle 仍可兜底）
+      console.debug('[reconcile-tail] 尾部对账失败（静默）', sid, e)
+    }
   }, [setMessages])
   /** [turn-paging] 向上翻页「加载更多」：以窗口内**最早一轮的用户提问 id** 为 beforeTurnId 再拉 2 轮 prepend
    *  （整轮返回 + 幂等去重）。⚠️ 不能用窗口首条消息 id：它可能是 boundary / system / 半截轮的残留行，
@@ -1197,18 +1385,30 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [ui, settings.settingsTab, providersApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
 
-  // ---- 历史回放：会话切换 —— 有常驻缓存直接复用；仅从未载入的会话才 GET 初始化 ----
-  // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻、切回不重拉」：messages/streams 已常驻
+  // ---- 历史回放：会话切换 —— 有常驻缓存仍校验尾部；仅从未载入的会话才 GET 初始化 ----
+  // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻」：messages/streams 已常驻
   //   chatStore，实时链路（chunk append / message.user / complete finalize / queue.drained）持续增量维护。
   //   旧实现每次切会话都 setMessages(activeSessionId, []) + GET 重拉 → 对仍正流式输出的会话切回瞬间历史
-  //   闪没、整列表重排抖动；store 明明有缓存还破坏重拉与常驻语义自相矛盾。故改为：缓存命中（历史非空，
-  //   含实时 finalize 增量）→ 直接渲染不重拉；仅 undefined/空缓存（首次切到未载入会话）才 GET 初始化。
+  //   闪没、整列表重排抖动。故缓存命中（历史非空）时不整表重拉；仅 undefined/空缓存（首次切到未载入会话）
+  //   才 GET 初始化。
+  //   [切会话尾部校验] 缓存非空 ≠ 内容最新：后台任务/子代理起的 run 不登记 activeStreams（本页只在
+  //   sendMessage / queue.drained 登记），useChatSocket 的「切回补拉」仅在 activeStreams 命中时触发 ⇒
+  //   兜底不生效，后台产出的新消息要 F5 才出现。故缓存命中时仍走一次 reconcileTail（拉尾窗，只比对
+  //   **尾部消息 id**，变了才整表替换 —— 无变化时完全不写 store ⇒ foldedTurnCounts 不归零、用户展开过
+  //   的更早轮保留）。运行中的会话跳过校验（避免拿到「已落库但缺最后一小段」的窗口把流式尾巴回退）。
+  //   校验失败静默：这是后台行为，一次失败不该打断用户。
   const isRealActive = storeSessions.some((s) => s.id === activeSessionId)
   useEffect(() => {
     if (!isRealActive) return
     let cancelled = false
     const cached = useChatStore.getState().messages[activeSessionId]
-    if (Array.isArray(cached) && cached.length > 0) return
+    if (Array.isArray(cached) && cached.length > 0) {
+      // 运行中（本页已登记，或 store 里有流式块）→ 跳过校验
+      if (activeStreams[activeSessionId] || (useChatStore.getState().streams?.[activeSessionId]?.length ?? 0) > 0) return
+      // 竞态守卫在 reconcileTail 内（按 sid 的调用序号），这里无需 cancelled
+      void reconcileTail(activeSessionId)
+      return
+    }
     // [turn-paging] 无缓存 → 最近 3 轮（有界窗口，不再全量；hasMore 供顶部「加载更多」）
     chatApi.listTurns(activeSessionId, { turns: FOLD_DEFAULT_TURNS })
       .then(({ messages, hasMore }) => {
@@ -1218,6 +1418,8 @@ function App() {
       })
       .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     return () => { cancelled = true }
+    // 运行中登记的增减不触发本校验（否则每次起停流都会重发 listTurns）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [activeSessionId, isRealActive, setMessages, showToast])
 
   // [Phase2] 切到真实会话 → GET /files 对账（补订阅前/断连期间的改动文件 · 与 files.changed 事件同源整表替换）
@@ -1458,18 +1660,13 @@ function App() {
   //   重拉 GET /messages 补偿缺口（DB 已逐条落库 realtime-persist）。reloadMessages 锁 activeSessionId
   //   （F5/当前会话专用）,后台会话断连需按 sid 拉 → 独立实现。finalizeBlocks 按 id 幂等去重保证不重复。
   const handleReconnectReload = useCallback(async (sid: string) => {
-    try {
-      // [window-paging] 查看通道一律尾页（对齐 deepseek；被 snip/裁剪的更早消息由向上翻页补）
-      await loadTailWindow(sid)
-    } catch {
-      // 重拉失败静默（不 toast 打扰——可能后台会话;下次 complete / 手动 F5 / 切会话重拉兜底）
-      console.debug('[reconnect-reload]', 'sid=', sid, '失败（静默,待下次兜底）')
-    }
+    // 断线重连 / 缺口修复 / idle 兜底三处共用 reconcileTail（尾部 id 一致则不写 store）
+    await reconcileTail(sid)
     // [C6 · 停止键可见性] 断连窗口内 run 的起轮 / 收口事件可能推给了零订阅者（STOMP topic 非持久）
     //   → 连上就重查一次服务端运行态，避免「run 早已结束但停止键仍挂着」/「run 在跑却没停止键」。
     //   与载入/切会话共用同一条 GET+回写实现（hooks/useServerRunning.ts）——单点，防两处判据漂移。
     await refreshServerRunning(sid)
-  }, [loadTailWindow])
+  }, [reconcileTail])
 
   // 多会话并行订阅（订阅所有 activeStreams；complete/cancel 明确回调移除）
   // [sm-boundary-reload] onCompactedReload 注册同一 handleReconnectReload（复用既有重拉实现，不新写一套）：
@@ -1621,6 +1818,37 @@ function App() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [sessionDispatch])
 
+  /**
+   * [2026-11-09] 系统通知点击 → 拉回前台 + 切到该会话。
+   *
+   * <p><b>WHY 必须有</b>：提问类通知（AskUserQuestion）弹在**系统通知中心**，用户点它时的
+   * 预期是「回到那个待回答的会话」。而默认行为只是「弹出一条通知」——窗口可能仍在后台/
+   * 最小化，用户点了通知什么也没发生（用户实测：「点击不会把客户端拉到前台」）。
+   *
+   * <p><b>三步</b>：① Rust {@code show_main_window_command}（show + unminimize + set_focus，
+   * 走 Rust 是因为前端窗口 API 在「窗口被别的窗口盖住」时不保证能置顶）；② 切会话；
+   * ③ 无载荷（Web 通道拿不到 extra）时只拉前台、不切会话。
+   *
+   * <p>⛔ 会话可能已删除 ⇒ 忽略（不弹错）。
+   */
+  useEffect(() => {
+    let off: (() => void) | null = null
+    let cancelled = false
+    void onSystemNotificationClick((extra) => {
+      if (cancelled) return
+      void showMainWindow()
+      const sid = typeof extra?.sessionId === 'string' ? extra.sessionId.trim() : ''
+      if (!sid) return
+      // 会话可能已删除 / 不在当前列表 ⇒ 忽略（界面上本来就找不到它）
+      if (!useChatStore.getState().sessions.some((x) => x.id === sid)) return
+      sessionDispatch({ type: 'SWITCH', sessionId: sid })
+      if (!sessionR.openSessions.includes(sid)) sessionDispatch({ type: 'ADD_TAB', tabId: sid })
+    }).then((fn) => { if (cancelled) fn(); else off = fn })
+    return () => { cancelled = true; off?.() }
+    // sessionR.openSessions 每次渲染都是新数组：用 ref 读最新，避免反复重订阅
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessionDispatch])
+
   // ---- delete session（后端删 + 本地清 store + 切到下一个会话）----
   const handleDeleteSession = useCallback(
     (sessionId: string) => {
@@ -1640,6 +1868,7 @@ function App() {
         // 本地清理：chatStore 消息/流 + 会话列表
         useChatStore.getState().clearSession(sessionId)
         const remaining = storeSessions.filter((s) => s.id !== sessionId)
+        sessionListSeqRef.current++  // 丢弃在途轮询响应，避免已删会话闪回
         setSessions(remaining)
         // 若删除的是当前会话 → 切到下一个（或空）
         if (activeSessionId === sessionId) {
@@ -1727,7 +1956,8 @@ function App() {
     //   → 本来就是最新 → 排序后自然在最前；同时整列表从此保持与后端 GET /sessions 同一口径，
     //   消除「新建跳到顶上、F5 后掉回原位」的错序（原写法 [created, ...storeSessions] 前插，
     //   F5 走 sessionApi.list() 的 DB 序 = 另一套口径）。
-    setSessions([created, ...storeSessions].sort(compareSessions))
+    sessionListSeqRef.current++  // 丢弃在途轮询响应，避免新会话闪一下又消失
+      setSessions([created, ...storeSessions].sort(compareSessions))
     sessionDispatch({ type: 'SWITCH', sessionId: created.id })
     sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
     // M2：右面板 main 用真实项目反查（created.mainProjectId → realProjects），无真实 id → 空项目（不显示演示项目名）
@@ -1762,7 +1992,7 @@ function App() {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       return
     }
-    const p: Project = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '' }
+    const p: Project = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '', createdAt: proj.createdAt ?? undefined }
     // 刷新真实项目缓存（置顶去重）
     setRealProjects((prev) => (prev.some((x) => x.id === p.id) ? prev : [p, ...prev]))
     // 创建该项目第一个会话（新工作组起点；不拦截——新工作组无空会话）
@@ -1778,7 +2008,8 @@ function App() {
       return
     }
     // 同 createSession：按统一口径重排（新建会话 updatedAt 最新 → 自然置顶），不无条件前插
-    setSessions([created, ...storeSessions].sort(compareSessions))
+    sessionListSeqRef.current++  // 丢弃在途轮询响应，避免新会话闪一下又消失
+      setSessions([created, ...storeSessions].sort(compareSessions))
     sessionDispatch({ type: 'SWITCH', sessionId: created.id })
     sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
     setPerSessionProjects((prev) => ({
@@ -1824,7 +2055,7 @@ function App() {
     }
     // 刷新真实项目缓存
     setRealProjects((prev) => {
-      const p = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '' }
+      const p = { id: proj.id, name: proj.name, branch: proj.branch ?? '', dirty: proj.dirty ?? 0, agents: proj.agents ?? 0, path: proj.path ?? '', createdAt: proj.createdAt ?? undefined }
       return [p, ...prev.filter((x) => x.id !== proj.id)]
     })
     try {
@@ -2766,8 +2997,15 @@ function App() {
   useEscapeKey(showMemoryEditor, () => setShowMemoryEditor(false))
   useEscapeKey(showIncludeApproval, () => setShowIncludeApproval(false))
   useEscapeKey(showMarket, () => setShowMarket(false))
-  // 知识库浮层：Esc 关闭（浮层只有一层，不需要「先退详情」的歧义）
-  useEscapeKey(showKnowledge, () => setShowKnowledge(false))
+  // ⛔ 知识库浮层**刻意不挂 Esc**（用户 2026-11-09 裁定：「只留 ✕，Esc 也不响应」）。
+  //   原因有三，缺一条都会误关：
+  //   ① 场景内的输入框（问答 tab 的提问框、文档搜索、FAQ 编辑器、重命名）里按 Esc 是
+  //     「取消当前输入」的通用习惯 —— 挂在 window 冒泡阶段会把整个场景一起关掉；
+  //   ② `KbSceneNav` 已经用**捕获阶段**做「抽屉 → 全部设置 → 个人信息」逐层退出
+  //     （见 KnowledgeBasePage.tsx:236-247），再加一条冒泡阶段的兜底会让「退一层」
+  //     与「全关」互相抢；
+  //   ③ 它是非模态浮层（可拖动、可边聊天边看），没有「Esc = 关模态框」这个语义。
+  //   ⇒ 关闭入口只有 ✕（KnowledgeBasePage 的 `closeScene`）与侧栏里那些显式跳转项。
 
   // ---- global keys（⌘K 打开命令面板；原 ⌘K→搜索 的快捷键移交给 MenuBar 搜索按钮）----
   useEffect(() => {
@@ -2834,6 +3072,12 @@ function App() {
           const p = realProjects.find((x) => x.id === pid) ?? allProjects.find((x) => x.id === pid)
           return p?.name ?? '未绑定项目'
         }}
+        // [2026-11-10 用户裁定] 项目分组序 = 注册先后（projects.created_at 升序），与任何会话活动无关
+        //   ⇒ 在后面的项目里新建会话不再把该组顶到最前。mock 项目无 createdAt → undefined（沉底兜底）。
+        projectCreatedAtFor={(pid) => {
+          const p = realProjects.find((x) => x.id === pid) ?? allProjects.find((x) => x.id === pid)
+          return p?.createdAt
+        }}
         onCreateInProject={(pid) => {
           // #1 项目内新建：带 mainProjectId 创建（用真实默认模型，非 mock 随机）
           void (async () => {
@@ -2865,7 +3109,8 @@ function App() {
               //   原 `pid ?? undefined` 既是类型洞（undefined 混入）也把「空串组键」放行到后端。
               const created = await sessionApi.create({ model: pickFrom.tag, modelName: pickFrom.name, mainProjectId: targetPid })
               // 同 createSession：按统一口径重排（新建会话 updatedAt 最新 → 自然置顶），不无条件前插
-              setSessions([created, ...storeSessions].sort(compareSessions))
+              sessionListSeqRef.current++  // 丢弃在途轮询响应，避免新会话闪一下又消失
+      setSessions([created, ...storeSessions].sort(compareSessions))
               sessionDispatch({ type: 'SWITCH', sessionId: created.id })
               sessionDispatch({ type: 'ADD_TAB', tabId: created.id })
               // M2：项目内新建后写 perSessionProjects 真实 main（反查 realProjects）；无真实 id → 空项目
@@ -2883,7 +3128,19 @@ function App() {
         onOpenSchedules={() => setWorkspacePage('schedules')}
         schedulesActive={showSchedulesPage}
         onOpenAgentMarket={() => setShowMarket(true)}
-        onOpenKnowledgeBase={() => { setKbScene('knowledge'); setShowKnowledge(true) }}
+        onOpenKnowledgeBase={() => {
+          // ⭐ 用户 2026-11-09 裁定：「点开默认就是独立窗口」。
+          //   知识库不再先弹浮层 —— 直接开**新的 Tauri 窗口**（系统级窗口，可拖到另一块屏）。
+          //   ⚠️ 浮层形态保留在下面（showKnowledge 仍可被设为 true），但**入口不再用它**：
+          //     它只在「独立窗口开不出来」时作为兜底（弹窗被拦 / capability 缺失）。
+          void openKnowledgeWindow({ scene: 'knowledge', baseId: null, tab: null }).then((ok) => {
+            if (!ok) {
+              // 独立窗开不出来 ⇒ 退回浮层，保证用户点了有东西出现（⛔ 不能点了没反应）
+              setKbScene('knowledge')
+              setShowKnowledge(true)
+            }
+          })
+        }}
         doneUnreadIds={doneUnreadIds}
         onAddWorkspace={() => void handleAddWorkspace()}
         onOpenSettings={openBasicSettings}
@@ -3043,6 +3300,8 @@ function App() {
         onOpenFileRow={openChangedFileDiff}
         onOpenFile={openProjectFile}
         artifacts={sessionArtifacts}
+        turnContext={turnContext}
+        currentTurnId={currentTurnId}
         onOpenArtifact={openArtifact}
         onEditArtifact={editArtifact}
         onOpenArtifactInBrowser={openArtifactInBrowser}
@@ -3188,15 +3447,77 @@ function App() {
       {showAgentsPanel && <AgentsPanel onClose={() => setShowAgentsPanel(false)} sessionId={activeSessionId} />}
       {showChromePanel && <ChromePanel sessionId={activeSessionId} onClose={() => setShowChromePanel(false)} />}
       {/* 技能市场（V58 主线程 agent 胶囊 → SkillMarketModal · 骨架版） */}
-      {/* ⭐ 知识库浮层（独立场景 · 用户 2026-11-06 裁定）
-          遮罩 + 居中面板承载知识库的**全部**内容（列表 → 详情 → 文档/Wiki/图谱/问答 → 设置）。
-          关闭：✕ / 点遮罩 / Esc。主对话保持挂载且可见。 */}
+      {/* ⭐ 知识库浮层（独立场景 · 用户 2026-11-06 裁定；2026-11-09 改为非模态可拖动）
+          面板承载知识库的**全部**内容（列表 → 详情 → 文档/Wiki/图谱/问答 → 设置）。
+          关闭：**只留 ✕**（用户裁定「Esc 也不响应」；点面板外也不关）。
+          主对话保持挂载、可见、可输入 —— 覆盖层 pointer-events:none，点击穿透。 */}
       {showKnowledge && (
-        <div
-          className="kb-scene-overlay"
-          onClick={(e) => { if (e.target === e.currentTarget) setShowKnowledge(false) }}
-        >
-          <div className="kb-scene-panel" role="dialog" aria-modal="true" aria-label="知识库">
+        <div className="kb-scene-overlay">
+          <div
+            className="kb-scene-panel kb-scope"
+            role="dialog"
+            /* ⛔ 不能写 aria-modal="true"：它是**非模态**浮层，主对话同时可交互。
+               写了会让读屏软件把主对话标成不可用，与实际行为不符。 */
+            aria-label="知识库"
+            style={{
+              transform: `translate(${kbDrag.x}px, ${kbDrag.y}px)`,
+              transition: kbDragging ? 'none' : 'transform 120ms ease-out',
+            }}
+          >
+            {/* ⭐ 拖动条 —— **必须是面板的子元素**（面板 position:relative 才是它的包含块）。
+                ⚠️ 放到 overlay 下面会铺满整个视口：overlay 是 fixed inset:0 且没有定位上下文，
+               把手按 absolute 定位会以视口为准（实测宽 1876px、x=0，与面板错位且拖不动）。
+
+                ⚠️ 第一版只给了 6px 高、`background:transparent` ⇒ **用户根本看不见，也点不中**。
+
+                ⚠️⚠️ 第二版只挂 `onPointerDown` ⇒ **在部分环境里整个拖拽是死的**。
+               实测（真实鼠标，非合成事件）只有 `mousedown / mousemove / mouseup`，
+               **一条 pointerdown 都没有** —— 该渲染环境不派发 Pointer Events。
+               ⇒ 必须**同时**挂 mouse 与 pointer 两套，且用 `draggingRef` 去重
+               （支持 pointer 的环境会两者都发，不去重会算两次位移）。 */}
+            <div
+              className="kb-scene-drag-handle"
+              onPointerDown={(e) => startDrag(e.clientX, e.clientY, e.button)}
+              onMouseDown={(e) => startDrag(e.clientX, e.clientY, e.button)}
+              title="按住拖动，移动知识库窗口"
+              role="separator"
+              aria-label="拖动以移动知识库窗口"
+            />
+            {/* ✕ 关闭（唯一关闭入口）。位置在面板右上角，绝对定位在面板内。 */}
+            <button
+              type="button"
+              className="kb-scene-close"
+              onClick={() => setShowKnowledge(false)}
+              title="关闭知识库（Esc 不生效，点面板外也不关）"
+              aria-label="关闭知识库"
+            >
+              ✕
+            </button>
+            {/* ⭐ 「弹出独立窗口」（用户 2026-11-09：面板要能拖到另一块屏幕）。
+                ⚠️ 页面元素再怎么 fixed/transform 都只能活在主窗口的 WebView 里，
+                   移出边界只会被裁掉 ⇒ 必须开一个新的 Tauri 窗口（系统级窗口，可跨屏）。
+                点它：开独立窗 → 关掉这里的面板（避免同一个知识库同时开两份、各改各的）。 */}
+            <button
+              type="button"
+              className="kb-scene-popout"
+              onClick={() => {
+                void openKnowledgeWindow({
+                  scene: kbScene,
+                  // ⚠️ 只带「场景」：库与 tab 的选择在 KnowledgeBasePage 内部 state 里，
+                  //    主窗口这一层拿不到 ⇒ 独立窗自己回到列表页（⛔ 不猜用户点进了哪个库）。
+                  baseId: null,
+                  tab: null,
+                }).then((ok) => {
+                  // ⚠️ 只有**确实开出来了**才关面板。反过来（先关再开）在弹窗被拦时
+                  //    表现为「点了没反应、面板还消失了」——用户会以为功能坏了。
+                  if (ok) setShowKnowledge(false)
+                })
+              }}
+              title="在独立窗口中打开（可拖到另一块屏幕）"
+              aria-label="在独立窗口中打开知识库"
+            >
+              ⧉
+            </button>
             {/* ⭐ 场景内左侧栏（设计稿 <aside class="aside"> 的 7 项）
                 ⚠️ 只在弹窗里；主窗口会话栏（SessionList）不动 */}
             <KbSceneNav
@@ -3331,6 +3652,9 @@ function App() {
       )}
       <Toast toast={ui.toast} />
       <UpdateCenter appName={appSettings?.appName ?? null} />
+      {/* [待回答浮层] 后台会话的工具在等用户回答时，右下角常驻提示（点击直达该会话）。
+          当前会话的提问由对话流里的 PermissionBubble 承担，故只显示非当前会话的。 */}
+      <AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />
     </div>
   )
 }

@@ -1,0 +1,105 @@
+/* ⚠️ 自动生成，勿手改。
+   来源：deliverables/kb-design/assets/weknora-bundle.css
+   生成：deliverables/kb-design/scripts/extract_page_css.py
+   改了源站样式要重跑脚本，不要在本文件里手改。 */
+
+/* 11-文档抽屉与助手.html 专属组件样式（bundle 0 条 + 内联 44 条） */
+.kb-scope .mock-drawer-wrap{ position: fixed; inset: 0; z-index: 120; display: flex; }
+.kb-scope .mock-drawer-wrap .t-drawer--right{
+    position: relative; width: 654px; min-width: 654px; height: 100%;
+    background: #fff; display: flex; flex-direction: column;
+    border-right: 1px solid var(--td-component-stroke);
+  }
+.kb-scope .mock-drawer-wrap .t-drawer__content-wrapper--right{ transform: none !important; }
+.kb-scope .t-drawer__content-wrapper--right{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kb-scope .t-drawer__body{ flex: 1; min-height: 0; overflow-y: auto; }
+.kb-scope .doc-drawer-body{ padding: 16px 18px 24px !important; }
+.kb-scope .assistant-panel{
+    width: 440px; min-width: 440px; height: 100%; flex: none;
+    background: #fff; border-left: 1px solid var(--td-component-stroke);
+    display: flex; flex-direction: column;
+  }
+.kb-scope .assistant-panel__header{
+    flex: none; height: 52px; padding: 0 12px 0 16px;
+    display: flex; align-items: center; gap: 8px;
+    border-bottom: 1px solid var(--td-component-stroke);
+  }
+.kb-scope .assistant-panel__title{ font-size: 14px; font-weight: 500; color: var(--td-text-color-primary); }
+.kb-scope .assistant-panel__header-icon{
+    width: 20px; height: 20px; border-radius: 5px; flex: none;
+    background: var(--td-brand-color-light); color: var(--td-brand-color);
+    display: inline-flex; align-items: center; justify-content: center; font-size: 12px;
+  }
+.kb-scope .assistant-panel__actions{ margin-left: auto; display: flex; align-items: center; gap: 2px; }
+.kb-scope .assistant-panel__action{
+    width: 26px; height: 26px; border: 0; border-radius: var(--app-radius-sm);
+    background: transparent; color: var(--td-text-color-secondary); font-size: 12px; cursor: pointer;
+  }
+.kb-scope .assistant-panel__action:hover{ background: var(--td-bg-color-container-hover); }
+.kb-scope .assistant-panel__help{ width: 20px; height: 20px; border: 1px solid var(--td-component-stroke); border-radius: 50%;
+    background: none; color: var(--td-text-color-placeholder); font-size: 11px; cursor: pointer; }
+.kb-scope .assistant-body{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kb-scope .assistant-welcome{
+    flex: 1; display: flex; flex-direction: column; align-items: center;
+    justify-content: center; padding: 24px 24px 16px; text-align: center;
+  }
+.kb-scope .assistant-welcome-icon{
+    width: 40px; height: 40px; border-radius: 10px;
+    background: var(--td-brand-color-light); color: var(--td-brand-color);
+    display: flex; align-items: center; justify-content: center; font-size: 18px;
+  }
+.kb-scope .assistant-welcome-title{ margin: 8px 0 0; font-size: 18px; font-weight: 500; color: var(--td-text-color-primary); }
+.kb-scope .assistant-welcome-desc{ margin: 6px 0 0; font-size: 12px; line-height: 1.6; color: var(--td-text-color-secondary); }
+.kb-scope .assistant-starters{ display: flex; flex-direction: column; gap: 8px; margin-top: 24px; width: 100%; }
+.kb-scope .assistant-starter{
+    padding: 8px 14px; border: 1px solid var(--td-component-stroke); border-radius: 10px;
+    background: #fff; font: inherit; font-size: 13px; color: var(--td-text-color-primary);
+    text-align: left; cursor: pointer;
+  }
+.kb-scope .assistant-starter:hover{ border-color: var(--td-brand-color); color: var(--td-brand-color); }
+.kb-scope .assistant-composer{ flex: none; padding: 12px 16px 16px; }
+.kb-scope .assistant-input{
+    min-height: 72px; padding: 10px 12px; border: 1px solid var(--td-component-border);
+    border-radius: 10px; background: #fff; display: flex; flex-direction: column;
+  }
+.kb-scope .assistant-input textarea{
+    flex: 1; border: 0; outline: none; resize: none; font: inherit; font-size: 13px;
+    line-height: 1.6; color: var(--td-text-color-primary);
+  }
+.kb-scope .assistant-input textarea::placeholder{ color: var(--td-text-color-placeholder); }
+.kb-scope .assistant-control-bar{
+    display: flex; align-items: center; gap: 8px; padding-top: 6px;
+    border-top: 1px solid #f2f2f2; margin-top: 6px;
+  }
+.kb-scope .assistant-ctl{
+    height: 24px; padding: 0 8px; border: 1px solid var(--td-component-stroke);
+    border-radius: 12px; background: #fff; font: inherit; font-size: 11px;
+    color: var(--td-text-color-secondary); cursor: pointer;
+  }
+.kb-scope .chunk-list{ display:flex; flex-direction:column; gap:10px; margin-top:10px; }
+.kb-scope .chunk-item{ border:1px solid var(--td-component-stroke); border-radius:var(--app-radius-md); background:#fff; padding:10px 12px; }
+.kb-scope .chunk-header{ display:flex; align-items:center; justify-content:space-between; gap:8px; margin-bottom:8px; }
+.kb-scope .chunk-heading{ display:flex; align-items:center; gap:8px; }
+.kb-scope .chunk-index{ font-size:12px; font-weight:600; color:var(--td-text-color-primary); }
+.kb-scope .chunk-meta{ font-size:12px; color:var(--td-text-color-placeholder); }
+.kb-scope .chunk-header-right{ display:flex; align-items:center; gap:2px; }
+.kb-scope .chunk-toolbar-divider{ width:1px; height:16px; background:var(--td-component-stroke); margin:0 6px; }
+.kb-scope .chunk-content{
+    font-size:13px; line-height:1.75; color:var(--td-text-color-primary);
+    white-space:pre-wrap; word-break:break-word; max-height:220px; overflow-y:auto;
+  }
+.kb-scope .chunk-parent-pop{
+    margin-top: 8px; padding: 10px 12px;
+    background: var(--td-bg-color-secondarycontainer);
+    border-radius: var(--app-radius-sm); font-size: 12px; line-height: 1.7;
+  }
+.kb-scope .chunk-parent-label{ font-weight: 600; margin-bottom: 6px; color: var(--td-text-color-primary); }
+.kb-scope .chunk-parent-body{ color: var(--td-text-color-secondary); }
+.kb-scope .chunk-question-list{ margin: 0; padding-left: 16px; color: var(--td-text-color-secondary); }
+.kb-scope .chunk-question-list li{ margin-bottom: 4px; }
+.kb-scope .chunk-history-row{
+    display: flex; justify-content: space-between;
+    padding: 4px 0; color: var(--td-text-color-secondary);
+    border-bottom: 1px solid var(--td-component-stroke);
+  }
+.kb-scope .chunk-history-row:last-child{ border-bottom: 0; }

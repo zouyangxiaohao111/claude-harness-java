@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>[E-1a pre-append 契约]</b>：{@code CacheSafeParams.systemPrompt} 存的是<b>未经</b>
  * {@code appendSystemContext} 的组装段数组 + 独立 {@code systemContext} map；append 由使用点
- * （fork 发送边界 {@code ProductionForkedQuery}）恰做一次。故本测试对 {@code systemPrompt()} 的
+ * （fork 发送边界）恰做一次。故本测试对 {@code systemPrompt()} 的
  * 断言不含 {@code gitStatus} 段 —— 发送字节逐字节金样见
  * {@link ForkSystemPromptPreAppendContractTest}（改动前后一致）。
  */
@@ -154,7 +154,7 @@ class CacheSharingParamsBuilderTest {
         assertThat(assembleCalls).hasValue(1);
         // [E-1a pre-append 契约] systemPrompt = default 元素数组 **pre-append** 形态（不含
         //   systemContext 段）；systemContext 独立成 map 随第 3 字段透传，append 由使用点
-        //   （ProductionForkedQuery 发送边界）恰做一次 —— 发送字节见
+        //   （fork 发送边界）恰做一次 —— 发送字节见
         //   ForkSystemPromptPreAppendContractTest 金样（本断言面 = 字段，金样面 = 发送 blocks）。
         assertThat(cs.systemPrompt())
             .as("default 元素数组（pre-append · 未经 appendSystemContext）")
@@ -179,7 +179,7 @@ class CacheSharingParamsBuilderTest {
 
         // default 组装元素后紧跟 append（EffectiveSystemPromptBuilder 恒末尾追加 :121）——
         // [E-1a pre-append 契约] systemContext(gitStatus) **不在此并入**（append 由使用点
-        //   ProductionForkedQuery 恰做一次），故字段断言止于 append 元素（恒末尾语义不含 context 段）。
+        //   fork 发送边界恰做一次），故字段断言止于 append 元素（恒末尾语义不含 context 段）。
         assertThat(cs.systemPrompt())
             .as("append 必须紧跟 default 元素末尾（恒末尾追加）· pre-append 形态不含 systemContext 段")
             .containsExactly("DEFAULT-1", "DEFAULT-2", "APPEND-CMD");

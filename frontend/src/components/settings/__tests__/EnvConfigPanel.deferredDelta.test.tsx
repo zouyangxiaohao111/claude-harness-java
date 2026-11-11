@@ -53,7 +53,7 @@ describe('EnvConfigPanel · 工具延迟加载公告开关（已退役）', () =
     vi.restoreAllMocks()
   })
 
-  async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<void>) {
+  async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<boolean>) {
     await act(async () => {
       root.render(<EnvConfigPanel settings={settings} onSaveSettings={onSave} onOpenMemoryEditor={() => {}} />)
       await Promise.resolve()
@@ -61,7 +61,7 @@ describe('EnvConfigPanel · 工具延迟加载公告开关（已退役）', () =
   }
 
   it('面板不再渲染「延迟加载公告用增量方式」开关行（该字段已从 AppSettings 契约移除）', async () => {
-    await render(baseSettings(), async () => {})
+    await render(baseSettings(), async () => true)
     const names = Array.from(container.querySelectorAll('.envc-name')).map((n) => n.textContent)
     expect(names).not.toContain(RETIRED_FIELD_NAME)
   })

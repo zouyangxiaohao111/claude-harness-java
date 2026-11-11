@@ -124,6 +124,33 @@ public class KnowledgeService {
      */
     private final javax.sql.DataSource dataSource;
 
+    /**
+     * 原生 JDBC（删除时清子表用）。
+     *
+     * <p>⚠️ <b>由 {@code dataSource} 直接构造，不走注入</b>：本类构造器签名被
+     * {@code KnowledgeServiceTest} 直构使用（10 个参数逐位不变），加参数会破坏它；
+     * 且 {@code JdbcTemplate} 是无状态薄封装，{@code new JdbcTemplate(ds)} 与
+     * Spring 自动装配的那个等价。
+     */
+    private final org.springframework.jdbc.core.JdbcTemplate jdbc;
+
+    /**
+     * 索引清理器（清 {@code kb_embedding} + {@code kb_chunk_fts}）。
+     *
+     * <p>用 {@code @Autowired(required=false)} 字段注入而<b>不动构造器签名</b>
+     * —— 同 {@code PartialCompactService:156-167} 的既有模式：直构测试保持逐位不变。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.kb.app.retrieval.KbIndexWriter indexWriter;
+
+    /**
+     * 活动流（删除后记一条）。
+     *
+     * <p>同上：字段注入。为 null 只出现在直构测试里，生产恒已装配。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private KbActivityService activityService;
+
     public KnowledgeService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -146,6 +173,7 @@ public class KnowledgeService {
         this.chunkMapper = chunkMapper;
         this.engineRegistry = engineRegistry;
         this.dataSource = dataSource;
+        this.jdbc = new org.springframework.jdbc.core.JdbcTemplate(dataSource);
     }
 
     /**
@@ -338,17 +366,60 @@ public class KnowledgeService {
     }
 
     /**
-     * 逻辑删除知识条目，并作废其未认领的解析任务。
+     * 删除知识条目 · 清索引 + 清子表 + 逻辑删主行。
+     *
+     * <p><b>⭐⭐ 为什么必须清子表（P0 · 数据正确性）</b>：检索侧只按
+     * {@code knowledge_base_id} 过滤 —— 向量路查 {@code kb_embedding}、关键词路查
+     * {@code kb_chunk_fts}，<b>两者都没有 deleted 闸</b>。只把 {@code kb_knowledge}
+     * 逻辑删掉，块与索引仍然活着 ⇒ <b>用户删掉的文档依旧能被召回，而且返回完整正文</b>。
+     * {@link #hybridSearch} 自己有 {@code enabled + completed} 闸，但 agent 工具与问答链
+     * 没有 ⇒ 不能指望闸兜底。
+     *
+     * <p><b>清理顺序</b>（与 {@code KbKnowledgeExtService#batchDelete} 逐条一致）：
+     * 索引 → 图片投影 → 修订 → 块 → 标签关联 → 主行。
+     * <b>主行留到最后</b>：中途失败时行还在，用户看得见也重试得了；先删主行会留下
+     * 任何入口都查不到归属的孤儿块与孤儿索引（不可恢复）。
+     *
+     * <p><b>⛔ 不能加 {@code @Transactional}</b>：{@code KbIndexWriter#clearIndex} 用
+     * {@code DataSourceUtils} 取原生连接写 FTS5 虚拟表，而本仓事务管理器是
+     * {@code FlexTransactionManager}（事务绑在 SqlSession 的<b>另一条</b>连接上）
+     * ⇒ 外层持 SQLite 写锁、内层等锁 ⇒ 自锁 {@code SQLITE_BUSY}（实测 500，见
+     * {@code KbAdvancedService#clearContents} 同类结论）。代价是删除不是原子的 ——
+     * 但每一步都幂等，中途失败重试即可。
      *
      * @param id 知识条目 ID
-     * @throws NotFoundException 不存在
+     * @throws NotFoundException 不存在（含已逻辑删除）
      */
-    @Transactional
     public void delete(String id) {
-        requireKnowledge(id);
+        // ① 存在性校验（null ⇒ 404，⛔ 不再让 deleteById 静默成功）
+        KbKnowledgeRecord row = requireKnowledge(id);
+        // ② 作废未认领的任务（running 的由 attempt 比对自行放弃，这里不碰）
         queue.cancelQueued(id);
+
+        // ③ 索引：kb_embedding（向量）+ kb_chunk_fts（关键词）
+        if (indexWriter == null) {
+            // 只会出现在「不走 Spring 的直构装配」（单测）；生产恒已注入
+            log.warn("[知识] 索引清理器未装配，跳过索引清理 id={}", id);
+        } else {
+            // 失败必须抛出去：留着索引会让已删文档继续被召回，比 500 更难排查
+            indexWriter.clearIndex(id);
+        }
+
+        // ④ 块相关子表（从深到浅）
+        jdbc.update("DELETE FROM kb_chunk_image WHERE knowledge_id = ?", id);
+        jdbc.update("DELETE FROM kb_chunk_revision WHERE knowledge_id = ?", id);
+        jdbc.update("DELETE FROM kb_chunk WHERE knowledge_id = ?", id);
+        // ⑤ 标签关联
+        jdbc.update("DELETE FROM kb_knowledge_tag_relation WHERE knowledge_id = ?", id);
+        // ⑥ 主行（Flex 逻辑删：UPDATE kb_knowledge SET deleted = 1）
         knowledgeMapper.deleteById(id);
-        log.info("[知识] 已逻辑删除 id={}", id);
+
+        // ⑦ 活动流（旁路证据；KbActivityService 内部吞异常，不影响删除结果）
+        if (activityService != null) {
+            activityService.record(row.getKnowledgeBaseId(), KbActivityService.A_DELETE,
+                "success", "knowledge", id, null);
+        }
+        log.info("[知识] 已删除（索引 + 子表 + 主行）id={} kb={}", id, row.getKnowledgeBaseId());
     }
 
     /**

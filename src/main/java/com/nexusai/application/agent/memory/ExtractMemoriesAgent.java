@@ -81,7 +81,7 @@ import java.util.function.Supplier;
  *
  * <p><b>注入 seam（IMP-M-P0-3 生产接线）</b>：CC 调全局 query()；Java 经
  * {@link RunForkedAgent.ForkedQuery} 函数式 seam 注入（测试注入 RecordingQuery；生产
- * 由 ToolRegistrationConfig.extractMemoriesAgent 注入 {@link ProductionForkedQuery}
+ * 由 ToolRegistrationConfig.extractMemoriesAgent 注入 {@link QueryLoopForkedQuery}
  * 专用多轮 fork loop，canUseTool 受限门控真实生效 INV-6）。{@link CacheSafeParams}
  * 由 {@link #cacheSafeParamsSupplier} 注入（null → RunForkedAgent.createMinimalCacheSafeParams
  * 5 参兜底 —— [RES-C5] systemPrompt/gate 原料由调用方注入、无工具集；生产 supplier 必须
@@ -907,7 +907,7 @@ public class ExtractMemoriesAgent {
                     // [SM-fork 模型直传 2026-09-10] fork 上下文 = supplier 工具集 + 会话模型
                     //   （ForkRawMaterial 捕获点透传 · CC createCacheSafeParams(context)
                     //   forkedAgent.ts:131-141 的 toolUseContext 同时带 options.tools + mainLoopModel）。
-                    //   仅传 supplied.toolUseContext() → effectiveModelName 恒 null → ProductionForkedQuery
+                    //   仅传 supplied.toolUseContext() → effectiveModelName 恒 null → fork 直传分支
                     //   直传分支取不到模型 → provider 回落 MockLlmProvider（假回复/永不 Write 记忆）。
                     ForkRawMaterial.forkToolUseContext(supplied.toolUseContext(), forkRawMaterial), messages,
                     // [RES-C5 rework] gate 合并：生产 supplier 5 参便捷构造 gate=false 占位，
@@ -962,10 +962,10 @@ public class ExtractMemoriesAgent {
 
             if (forkedQuery == null) {
                 // IMP-M-P0-3: 生产恒注入（ToolRegistrationConfig.extractMemoriesAgent 注入
-                // ProductionForkedQuery）。未注入 = 编程错误 → fail loud（不静默跳过 fork 假装
+                // QueryLoopForkedQuery）。未注入 = 编程错误 → fail loud（不静默跳过 fork 假装
                 // 成功；异常由下方 best-effort catch 记录 + 游标不动，下轮注入后仍可提取）。
                 throw new IllegalStateException(
-                    "[ExtractMemories] fork 查询 seam 未注入（生产 ToolRegistrationConfig 必须 setForkedQuery 注入 ProductionForkedQuery），fail loud");
+                    "[ExtractMemories] fork 查询 seam 未注入（生产 ToolRegistrationConfig 必须 setForkedQuery 注入 QueryLoopForkedQuery），fail loud");
             }
 
             log.info("[ExtractMemories] 发起 fork: {} 条新增消息, memoryDir={}, maxTurns=5, skipTranscript=true",
@@ -1006,7 +1006,7 @@ public class ExtractMemoriesAgent {
             //   read/input（旧恒三字段分母对 deepseek 双计 → 命中率恒为真实一半）。*100 后
             //   1 位小数（JS toFixed(1) 等价，Locale.ROOT 防小数分隔符漂移；read ≤ 0 / 分母 ≤ 0 →
             //   0 → "0.0"）。CC logForDebugging 调试级 → Java debug 级。usage 保真由
-            //   ProductionForkedQuery 全量累计提供（forkedAgent.ts:557-566 · IMP-MV2-10）。
+            //   QueryLoopForkedQuery 全量累计提供（forkedAgent.ts:557-566 · IMP-MV2-10）。
             double hitRatePct = ContextUsageCalculator.computeCacheHitRate(
                 usage.inputTokens(), usage.cacheReadInputTokens(),
                 usage.cacheCreationInputTokens(), result.isAnthropic()) * 100.0;

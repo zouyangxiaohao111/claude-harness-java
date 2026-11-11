@@ -1,6 +1,7 @@
 package com.nexusai.kb.app.retrieval;
 
 import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.kb.app.chunk.KbChunk;
 import com.nexusai.kb.repo.KbTimeFormat;
 import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.entity.KbEmbeddingRecord;
@@ -16,8 +17,12 @@ import java.sql.Connection;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.HashMap;
+import java.util.HashSet;
 import java.util.HexFormat;
 import java.util.List;
+import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 /**
@@ -91,26 +96,71 @@ public class KbIndexWriter {
     public int reindexKnowledge(
         String knowledgeId, String knowledgeBaseId, String modelId
     ) {
-        List<KbChunkRecord> chunks = chunkMapper.selectListByQuery(
+        // ⚠️ 一次取出该文档的**全部**块，再在内存里拆「启用 / 禁用」：
+        //    · 进索引的只有启用块（V257 DDL：is_enabled 1 = 启用 / 0 = 禁用）；
+        //    · 但「块是否还存在」要按全量判断（禁用块的向量不该被当孤儿删掉）。
+        List<KbChunkRecord> all = chunkMapper.selectListByQuery(
             QueryWrapper.create()
                 .where("knowledge_id = ?", knowledgeId)
                 .orderBy("chunk_index", true));
+        List<KbChunkRecord> chunks = new ArrayList<>(all.size());
+        Set<String> existingIds = new HashSet<>(all.size() * 2);
+        int parentSkipped = 0;
+        for (KbChunkRecord c : all) {
+            // ⭐ existingIds 必须含父块 id：父块本来就不该有向量，但若历史上误建过一行
+            //    （例如本改动之前跑的索引），按「块还存在」保留更安全 —— 删错是数据损失，
+            //    留着只是一行没人检索的向量（检索侧按 chunk_type 过滤）。
+            existingIds.add(c.getId());
+            // is_enabled 为 null 视为启用（DDL 是 NOT NULL DEFAULT 1，null 只可能是历史脏数据）
+            if (c.getIsEnabled() != null && c.getIsEnabled() == 0) {
+                continue;
+            }
+            // ⭐ 父块不进向量 / FTS 索引（源站 knowledge_process.go:613
+            //    "Add parent chunks first (they go into DB but NOT into the vector index)"；
+            //    过滤处 knowledge_process.go:3402 `if !chunk.IsEnabled || chunk.ChunkType == ChunkTypeParentText`）。
+            //    父块只在「命中子块后展开上下文」时被读，把它也向量化会让同段内容被检索两次，
+            //    结果里出现父子两份几乎相同的片段。
+            if (KbChunk.CHUNK_TYPE_PARENT_TEXT.equals(c.getChunkType())) {
+                parentSkipped++;
+                continue;
+            }
+            chunks.add(c);
+        }
+        if (parentSkipped > 0) {
+            log.info("[索引] 跳过父块 {} 个（parent_text 不进索引）knowledge={}", parentSkipped, knowledgeId);
+        }
         if (chunks.isEmpty()) {
-            log.info("[索引] 文档无分块，跳过 knowledge={}", knowledgeId);
-            // 旧索引仍要清（重解析后可能变空）
-            clearIndex(knowledgeId);
+            log.info("[索引] 文档无启用分块，跳过 knowledge={} 总块数={}",
+                knowledgeId, all.size());
+            // 旧 FTS 必须清（全部禁用 / 重解析后变空）
+            clearFts(knowledgeId);
+            // 向量：只清「块已不存在」的孤儿；禁用块的向量留着
+            // （检索侧已按 is_enabled 过滤，重新启用时不必再花一次 embedding）
+            int purged = purgeStaleVectors(knowledgeId, List.of(), existingIds);
+            log.info("[索引] 文档无启用分块 knowledge={} 清理孤儿向量={}", knowledgeId, purged);
             return 0;
+        }
+
+        boolean withVectors = modelId != null && !modelId.isBlank();
+        if (!withVectors) {
+            // ⭐ 只重建关键词索引：⛔ 不清 {@code kb_embedding}
+            //    历史缺陷（P0）：这里原来先 clearIndex 再走本分支 ⇒ 编辑一个分块
+            //    会把整篇文档的向量删光且不重建，语义检索永久失效，日志还写「已重建索引」。
+            //    但也不能一味保留：{@link KbChunkService#update} 改过正文的块，
+            //    其向量是旧正文算的（content_hash 对不上）⇒ 必须删掉那一行，
+            //    否则「正文改了、向量还是旧的」，语义检索会命中错位内容。
+            //    ⚠️ 本层只拿到 knowledgeId，拿不到「被编辑的 chunkId」；
+            //    用 content_hash 与当前索引文本比对即可精确识别过期行（不需要额外参数）。
+            int purged = purgeStaleVectors(knowledgeId, chunks, existingIds);
+            clearFts(knowledgeId);
+            writeFts(chunks);
+            log.info("[索引] 仅重建关键词索引 knowledge={} 块数={} 清理过期向量={}",
+                knowledgeId, chunks.size(), purged);
+            return chunks.size();
         }
 
         // 1) 清旧索引（向量 + FTS）
         clearIndex(knowledgeId);
-
-        boolean withVectors = modelId != null && !modelId.isBlank();
-        if (!withVectors) {
-            writeFts(chunks);
-            log.info("[索引] 无嵌入模型，仅建关键词索引 knowledge={} 块数={}", knowledgeId, chunks.size());
-            return chunks.size();
-        }
 
         // 2) 向量化：按批调用
         List<String> inputs = new ArrayList<>(chunks.size());
@@ -176,7 +226,20 @@ public class KbIndexWriter {
     public void clearIndex(String knowledgeId) {
         embeddingMapper.deleteByQuery(
             QueryWrapper.create().where("knowledge_id = ?", knowledgeId));
-        // ⚠️ FTS 是虚拟表，只能走原生 JDBC。这里**不在事务内**调用（见 clearIndex 上方说明），
+        clearFts(knowledgeId);
+    }
+
+    /**
+     * 只清关键词索引（{@code kb_chunk_fts}），⛔ 不动 {@code kb_embedding}。
+     *
+     * <p><b>为什么单独抽出来</b>：「只重建关键词索引」的路径（{@code modelId == null}）
+     * 如果复用 {@link #clearIndex} 会把向量一起删掉 —— 这正是 P0 缺陷的形态
+     * （编辑一个分块 ⇒ 整篇文档语义检索失效）。
+     *
+     * @param knowledgeId 知识条目 ID
+     */
+    private void clearFts(String knowledgeId) {
+        // ⚠️ FTS 是虚拟表，只能走原生 JDBC。这里**不在事务内**调用（见 reindexKnowledge 上方说明），
         //    用独立连接 + 自身自动提交即可；若将来有人给调用链加 @Transactional，
         //    必须改回 DataSourceUtils 语义，否则会自锁。
         Connection conn = org.springframework.jdbc.datasource.DataSourceUtils.getConnection(dataSource);
@@ -189,6 +252,74 @@ public class KbIndexWriter {
         } finally {
             org.springframework.jdbc.datasource.DataSourceUtils.releaseConnection(conn, dataSource);
         }
+    }
+
+    /**
+     * 清掉「已与当前正文不一致」的向量行（只重建关键词索引时用）。
+     *
+     * <p><b>⭐ 为什么要清</b>：{@code modelId == null} 意味着这次没有模型可用，
+     * 无法重算向量 —— 但用户可能刚刚<b>改过某块的正文</b>，那一行的向量还是旧正文算出来的。
+     * 留着它 ⇒ 语义检索把「旧内容的相似度」套在「新内容」上返回，用户看到的是错位结果，
+     * 而且不报错、无从察觉。⇒ 删掉（宁可少一条向量，也不要一条错的）。
+     *
+     * <p><b>识别方式</b>：{@code kb_embedding.content_hash} 存的就是索引文本的 SHA-256
+     * （见本类写向量分支），与当前 {@link #indexTextOf(KbChunkRecord)} 的哈希比对即可。
+     * 另外清掉「块已不存在」的孤儿行（重解析后块被换掉）。
+     *
+     * <p><b>⚠️ 禁用块的向量要保留</b>：块的可见性由检索侧按 {@code kb_chunk.is_enabled} 过滤，
+     * 向量本身没错。这里若把禁用块的向量也删了，用户重新启用时就再也建不回来
+     * （重新启用的调用链同样传 {@code modelId=null}）⇒ 语义检索永久缺一块。
+     *
+     * @param knowledgeId  知识条目 ID
+     * @param enabledChunks 当前<b>启用</b>的块（用于比对哈希；可为空 = 全部禁用）
+     * @param existingIds  该文档当前<b>存在</b>的块 id（含禁用；用于识别孤儿向量）
+     * @return 删掉的向量行数
+     */
+    private int purgeStaleVectors(
+        String knowledgeId, List<KbChunkRecord> enabledChunks, Set<String> existingIds
+    ) {
+        List<KbEmbeddingRecord> rows;
+        try {
+            rows = embeddingMapper.selectListByQuery(
+                QueryWrapper.create()
+                    .where("knowledge_id = ?", knowledgeId)
+                    .and("source_type = ?", "chunk"));
+        } catch (RuntimeException e) {
+            // ⭐ 降级：读不出来时不清（清错是数据损失，留着只是暂时陈旧）
+            log.warn("[索引] 读旧向量失败，跳过过期向量清理 knowledge={} 原因={}",
+                knowledgeId, e.getMessage());
+            return 0;
+        }
+        if (rows.isEmpty()) {
+            return 0;
+        }
+        // ⚠️ 需求要的是「不清全部」而不是「一条都不清」：
+        //    · 块已不存在 ⇒ 孤儿向量，删；
+        //    · 块存在但被禁用 ⇒ 向量保留（检索侧按 is_enabled 过滤；重新启用无需重算）；
+        //    · 块启用但索引文本变了 ⇒ 向量已过期，删（宁可少一条，也不要一条错的）。
+        Map<String, String> hashById = new HashMap<>(enabledChunks.size() * 2);
+        for (KbChunkRecord c : enabledChunks) {
+            hashById.put(c.getId(), sha256(indexTextOf(c)));
+        }
+        int purged = 0;
+        for (KbEmbeddingRecord row : rows) {
+            if (!existingIds.contains(row.getSourceId())) {
+                embeddingMapper.deleteById(row.getId());
+                purged++;
+                continue;
+            }
+            String expect = hashById.get(row.getSourceId());
+            if (expect == null) {
+                continue;  // 禁用块：向量保留
+            }
+            // ⚠️ content_hash 为空 = 历史行，无法证明过期（也证明不了新鲜）⇒ 不动它。
+            //    「不知道」≠「过期」，删错是数据损失；陈旧只影响排序质量。
+            if (row.getContentHash() != null && !expect.equals(row.getContentHash())) {
+                embeddingMapper.deleteById(row.getId());
+                purged++;
+            }
+        }
+        return purged;
     }
 
     // ── 内部 ────────────────────────────────────────────────────────
@@ -219,7 +350,10 @@ public class KbIndexWriter {
      * 索引文本是派生物，可以随便拼。
      */
     private static String indexTextOf(KbChunkRecord c) {
+        // ⭐ 图内文字（caption / OCR）必须进索引，否则「图片理解」等于白跑：
+        //    文字只躺在 image_info 里，向量与 FTS 都命中不到。
         return embeddingInputOf(c)
+            + com.nexusai.kb.app.image.KbImageEnrichService.imageTextForIndex(c.getImageInfo())
             + com.nexusai.kb.app.ingest.KbGeneratedQuestions.indexText(c.getMetadata());
     }
 
@@ -234,8 +368,11 @@ public class KbIndexWriter {
                 ps.setString(2, c.getKnowledgeId());
                 ps.setString(3, c.getKnowledgeBaseId());
                 ps.setString(4, c.getContextHeader() == null ? "" : c.getContextHeader());
-                // ⭐ 与向量输入同构：正文 + 生成的问题（否则「向量能召回、关键词召回不到」）
+                // ⭐ 与向量输入同构：正文 + 图内文字 + 生成的问题
+                //    （否则「向量能召回、关键词召回不到」）
                 ps.setString(5, (c.getContent() == null ? "" : c.getContent())
+                    + com.nexusai.kb.app.image.KbImageEnrichService
+                        .imageTextForIndex(c.getImageInfo())
                     + com.nexusai.kb.app.ingest.KbGeneratedQuestions
                         .indexText(c.getMetadata()));
                 ps.addBatch();

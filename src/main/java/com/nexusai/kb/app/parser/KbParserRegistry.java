@@ -12,8 +12,9 @@ import java.util.List;
 /**
  * 解析器注册表 · 按扩展名/MIME 选一个解析器（Spring 构造注入 {@code List<KbDocumentParser>}）。
  *
- * <p><b>选择顺序</b>：{@code @Order} 升序 —— PDF(10) → Office(20) → 文本/兜底(30)。这与
- * 「越专用的越先」一致：{@code KbTextParser} 是兜底的（对未知扩展名也返回 true），必须最后。
+ * <p><b>选择顺序</b>：{@code @Order} 升序 —— PDF(10) → anydoc(12) → 图片(15) → Office(20) →
+ * 文本/兜底(30)。这与「越专用的越先」一致：{@code KbTextParser} 是兜底的（对未知扩展名也返回 true），
+ * 必须最后；anydoc 排在 Office 之前，是「Office 类格式默认走 anydoc、内置 Office 解析兜底」的落地。
  *
  * <p><b>为什么显式排序而不是依赖注入顺序</b>：Spring 对同类型集合注入的顺序不保证（取决于 bean 定义
  * 顺序），兜底解析器排到前面会把 .csv 抢走。故用 {@code AnnotationAwareOrderComparator} 显式排，
@@ -104,6 +105,43 @@ public class KbParserRegistry {
     /** 当前装配的解析器（只读视图，供测试与诊断端点）。 */
     public List<KbDocumentParser> parsers() {
         return parsers;
+    }
+
+    /**
+     * 全部已装配解析器的能力快照（顺序 = {@code @Order} 升序，与 {@link #select} 的路由优先级一致）。
+     *
+     * <p><b>为什么由注册表出这份数据</b>：解析器集合是 Spring 装配出来的，注册表是唯一持有者；
+     * 让端点直接读字段会绕开 {@code @Order} 排序，前端下拉的顺序就会随 bean 定义顺序漂移。
+     *
+     * <p><b>可用性来源</b>：实现了 {@link SelfDescribingAvailability} 的解析器自报（如
+     * {@link KbAnydocParser} —— 依赖随包分发的原生库，非 Windows / 库缺失时不可用）；其余解析器
+     * 按既有语义视为恒可用（{@code available=true} / {@code unavailableReason=""}）。
+     * 每次现问而不缓存：装上 DLL 重启后应立刻变为可用，快照不该跟实现状态漂移。
+     *
+     * @return 能力快照（不含 {@code parsers()} 里的 null 项；永远非 null）
+     */
+    public List<ParserEngineInfo> describeEngines() {
+        List<ParserEngineInfo> engines = new java.util.ArrayList<>(parsers.size());
+        for (KbDocumentParser parser : parsers) {
+            boolean available = true;
+            String unavailableReason = "";
+            if (parser instanceof SelfDescribingAvailability self) {
+                available = self.isAvailable();
+                String reason = self.unavailableReason();
+                unavailableReason = reason == null ? "" : reason;
+            }
+            engines.add(new ParserEngineInfo(
+                parser.name(),
+                parser.displayName(),
+                parser.supportedExtensions(),
+                available,
+                unavailableReason));
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("KbParserRegistry: describeEngines → {} 个 {}", engines.size(),
+                engines.stream().map(ParserEngineInfo::name).toList());
+        }
+        return List.copyOf(engines);
     }
 
     private static int orderOf(KbDocumentParser parser) {

@@ -1,4 +1,5 @@
 import { useMemo, useState } from 'react'
+import type { CSSProperties } from 'react'
 import type { ChatMessageDto, ToolCallDto } from '@/api/types'
 import { compactNumber } from '@/utils/format'
 import { pairCompactSummaries } from '@/utils/compactPairing'
@@ -209,6 +210,61 @@ interface Turn {
  *  下游 useMemo 依赖永不相等、缓存全废（调用点 App.tsx:350 已在传稳定引用）。 */
 const EMPTY_SNIPPED_IDS: string[] = []
 
+/** 内嵌宿主修正 —— 源站设计稿 12 的 `.kp-timeline` 是**抽屉**（width/height 100%，由
+ *  `.kp-secondary-drawer` 给死宽 820px）。本仓的 TraceView 挂在 `.stream`（flex:1 + overflow-y:auto）
+ *  里一块**内联**区域，不是全屏抽屉 ⇒ 直接套 `height:100%` 会得到一个 0 高/无滚动条的错误盒子
+ *  （`.kp-timeline{overflow:hidden}` + `.kp-body{flex:1}` 在没有确定高度时塌成最小高度）。
+ *  这里只钉「宿主差异」这一件事，不改任何源站排版值：
+ *  - `height:auto` 让内容撑高，交给外层 `.stream` 滚动（与改动前 `.trace-view` 的行为一致）；
+ *  - `overflow:visible` 取消抽屉级裁切。
+ *  ⛔ 不是补样式、不是造规则 —— 是承认「本仓这一处不是抽屉」。 */
+const EMBEDDED_TIMELINE_STYLE: CSSProperties = {
+  height: 'auto',
+  overflow: 'visible',
+  /* 与改动前 `.trace-view{max-width:760px;margin:0 auto}` 同值：源站抽屉是 820px 定宽，
+     内嵌到对话流里沿用本仓原有的 760px 可读宽度，不把行拉满整屏。 */
+  maxWidth: 760,
+  margin: '0 auto',
+}
+/** 内容单元格布局 —— 源站 `.kp-cell-bar` 是「瀑布条形图轨道」（`position:relative;height:34px`，
+ *  里面只放绝对定位的 `.kp-bar`），本仓这一列要放**单行文本**（工具名/正文预览）。
+ *  只补 `display:flex + align-items:center + min-width:0`（纵向居中 + 允许 ellipsis），
+ *  不改轨道自身的 position/height/margin。 */
+const CONTENT_CELL_STYLE: CSSProperties = {
+  display: 'flex',
+  alignItems: 'center',
+  minWidth: 0,
+}
+
+/** 详情浮层内容区 —— `.kp-detail-body` 源站是「抽屉内联面板」的子块
+ *  （`flex:1 1 auto;overflow-y:auto`）；本仓它是 `.trace-detail` 卡片里的一块，
+ *  卡片自身已限高（`max-height:82vh`）⇒ 这里只要 `min-height:0` 让它能收缩滚动。 */
+const DETAIL_BODY_STYLE: CSSProperties = {
+  flex: '1 1 auto',
+  minHeight: 0,
+}
+
+/** [snip-persist] 已裁剪正文的删除线（旧 `.trace-record.snipped .content{text-decoration:line-through}` 等价物）。 */
+const SNIPPED_TEXT_STYLE: CSSProperties = {
+  textDecoration: 'line-through',
+}
+
+/** 空态宿主 —— `.kp-state` 是 `display:flex;flex:1 1 auto;justify-content:center`（居中态），
+ *  它要求父级是 flex 容器；源站的父级是 `.kp-drawer-shell > .kp-timeline`（flex column）。
+ *  本仓空态只渲染 `.kp-timeline > .kp-state` 两层，故在 timeline 上补成 flex column。
+ *  只声明 display/flex-direction，不覆盖任何尺寸。 */
+const EMPTY_TIMELINE_STYLE: CSSProperties = {
+  ...EMBEDDED_TIMELINE_STYLE,
+  display: 'flex',
+  flexDirection: 'column',
+}
+
+/** 同上：内嵌宿主下 `.kp-body` 不能 `flex:1 1 auto`（父级无确定高度 ⇒ 高度按内容走）。 */
+const EMBEDDED_BODY_STYLE: CSSProperties = {
+  flex: '0 0 auto',
+  overflow: 'visible',
+}
+
 export function TraceView({ messages, snippedIds = EMPTY_SNIPPED_IDS }: TraceViewProps) {
   // [轨迹详情] 点击记录行 → 浮层看完整内容
   const [detail, setDetail] = useState<TraceRecord | null>(null)
@@ -279,66 +335,121 @@ export function TraceView({ messages, snippedIds = EMPTY_SNIPPED_IDS }: TraceVie
 
   if (visible.length === 0) {
     return (
-      <div className="trace-view">
-        <div className="trace-empty">该会话暂无轨迹</div>
+      /* 设计稿 12 的空态类 `.kp-state`（居中灰字）。
+         `.kb-scope` 是 kb-*.css 的作用域根：所有规则都写成 `.kb-scope .kp-*`（**后代**选择器），
+         故它必须是祖先；用 `display:contents` 包裹层不产生布局盒子。 */
+      <div className="kb-scope" style={{ display: 'contents' }}>
+        <div className="kp-timeline" style={EMPTY_TIMELINE_STYLE}>
+          <div className="kp-state">该会话暂无轨迹</div>
+        </div>
       </div>
     )
   }
   if (turns.length === 0) {
-    return <div className="trace-view"><div className="trace-empty">该会话暂无轨迹</div></div>
-  }
-
-  return (
-    <div className="trace-view">
-      {turns.map((t) => (
-        <div key={t.num} className="trace-turn">
-          <div className="trace-turn-header"><span className="turn-num">#{t.num}</span> {t.title}</div>
-          {t.records.map((r, i) => r.compact ? (
-            // [compact 边界] 居中灰条标记行（内容可点开读压缩摘要）
-            <div
-              key={i}
-              className={`trace-compact-marker${r.full != null ? ' clickable' : ''}`}
-              onClick={() => { if (r.full != null) setDetail(r) }}
-              title={r.full != null ? `点击查看${r.detailTitle ?? '压缩摘要'}` : undefined}
-            >
-              <span className="trace-compact-txt">{r.txt}</span>
-            </div>
-          ) : (
-            <div
-              key={i}
-              className={`trace-record ${r.kind === 'user' ? 'user-rec' : r.kind === 'assistant' ? 'assistant-rec' : r.toolClass}${r.snipped ? ' snipped' : ''}${r.full != null ? ' clickable' : ''}`}
-              onClick={() => { if (r.full != null) setDetail(r) }}
-              title={r.full != null ? '点击查看完整内容' : undefined}
-            >
-              <span className={`kind ${r.kind}`}>{r.kind}</span>
-              {r.snipped && <span className="trace-snipped-tag" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span>}
-              <span className="content">
-                {r.kind === 'tool' ? (
-                  <span className={`tool-name ${r.toolClass.replace('tool-', '')}`}>{r.toolName}</span>
-                ) : r.kind === 'user' ? (
-                  <span className="user-txt">{r.txt}</span>
-                ) : (
-                  r.txt
-                )}
-              </span>
-              <span className="time">{r.time}</span>
-            </div>
-          ))}
+    return (
+      <div className="kb-scope" style={{ display: 'contents' }}>
+        <div className="kp-timeline" style={EMPTY_TIMELINE_STYLE}>
+          <div className="kp-state">该会话暂无轨迹</div>
         </div>
-      ))}
+      </div>
+    )
+  }
+  return (
+    <div className="kb-scope" style={{ display: 'contents' }}>
+    <div className="kp-timeline" style={EMBEDDED_TIMELINE_STYLE}>
+      <div className="kp-body" style={EMBEDDED_BODY_STYLE}>
+          <div className="kp-scroll">
+            {turns.map((t) => (
+              /* 设计稿 12 —— `.kp-rows > .kp-row`；本仓是记录列表（非瀑布图）⇒ 用
+                 `.kp-rows-gridless` 关掉 `.kp-cell-bar` 的刻度背景 */
+              <div key={t.num} className="kp-rows kp-rows-gridless">
+                {/* 分组行：设计稿 12 的 `.kp-row.is-group`（本仓类名是 `.kp-row-root`）。
+                    `.kp-row` 自带 cursor:pointer，分组行不可点 ⇒ 行内复位成 default。 */}
+                <div className="kp-row kp-row-root" style={{ cursor: 'default' }}>
+                  <div className="kp-cell-name">
+                    <span className="kp-name-inner">
+                      <span className="kp-name-mono">#{t.num}</span>
+                      <span className="kp-name-text">{t.title}</span>
+                    </span>
+                  </div>
+                  <div className="kp-cell-dur">{t.records.length} 条</div>
+                  <div className="kp-cell-bar" />
+                </div>
+                {t.records.map((r, i) => r.compact ? (
+                  // [compact 边界] 居中灰条标记行（内容可点开读压缩摘要）
+                  <div
+                    key={i}
+                    className="kp-row kp-row-inert"
+                    style={r.full == null ? { cursor: 'default' } : undefined}
+                    onClick={() => { if (r.full != null) setDetail(r) }}
+                    title={r.full != null ? `点击查看${r.detailTitle ?? '压缩摘要'}` : undefined}
+                  >
+                    <div className="kp-cell-name">
+                      <span className="kp-name-inner">
+                        <span className="kp-dot kp-dot-skipped" />
+                        <span className="kp-name-text">标记</span>
+                      </span>
+                    </div>
+                    <div className="kp-cell-dur">{r.time}</div>
+                    <div className="kp-cell-bar" style={CONTENT_CELL_STYLE}>
+                      <span className="kp-name-text">{r.txt}</span>
+                    </div>
+                  </div>
+                ) : (
+                  <div
+                    key={i}
+                    className={`kp-row${r.snipped ? ' kp-row-inert' : ''}`}
+                    /* `.kp-row` 自带 cursor:pointer（源站每行都可展开）；本仓只有带 `full`
+                       的行能点开详情 ⇒ 其余行复位成默认光标，避免「看起来能点却点了没反应」。 */
+                    style={r.full == null ? { cursor: 'default' } : undefined}
+                    onClick={() => { if (r.full != null) setDetail(r) }}
+                    title={r.full != null ? '点击查看完整内容' : undefined}
+                  >
+                    <div className="kp-cell-name">
+                      <span className="kp-name-inner">
+                        <span className={`kp-dot ${r.snipped ? 'kp-dot-skipped' : 'kp-dot-done'}`} />
+                        <span className="kp-name-kind">{r.kind}</span>
+                        {r.snipped && <span className="kp-chip-skipped" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span>}
+                      </span>
+                    </div>
+                    <div className="kp-cell-dur">{r.time}</div>
+                    <div className="kp-cell-bar" style={CONTENT_CELL_STYLE}>
+                      {/* [snip-persist] 旧实现给已裁剪行加 `text-decoration:line-through` + 0.55 透明；
+                          新结构里透明由 `.kp-row-inert`(0.45) 承担，删除线在此显式保留（否则「已裁剪」
+                          只剩一个灰 chip，正文看上去与正常消息无异）。 */}
+                      {r.kind === 'tool' ? (
+                        <span className="kp-name-text kp-name-mono" style={r.snipped ? SNIPPED_TEXT_STYLE : undefined}>{r.toolName}</span>
+                      ) : (
+                        <span className="kp-name-text" style={r.snipped ? SNIPPED_TEXT_STYLE : undefined}>{r.txt}</span>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      {/* 详情浮层：本仓自有交互（点击行看全文）。设计稿 12 是抽屉内联 `.kp-detail`（无遮罩层）
+          ⇒ 遮罩保留本仓实现，仅内部标题/正文套用 `.kp-detail-*` / `.kp-json` 的排版语义。 */}
       {detail && (
         <div className="trace-detail-mask" onClick={() => setDetail(null)}>
           <div className="trace-detail" onClick={(e) => e.stopPropagation()}>
-            <div className="trace-detail-head">
-              <span className="trace-detail-title">{detailLabel}</span>
-              <button type="button" className="trace-detail-close" onClick={() => setDetail(null)} aria-label="关闭">
+            <div className="kp-detail-head">
+              <span className="kp-detail-title">{detailLabel}</span>
+              <button type="button" className="kp-icon-btn" onClick={() => setDetail(null)} aria-label="关闭">
                 <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" width="12" height="12"><path d="M3 3L9 9M9 3L3 9" /></svg>
               </button>
             </div>
-            <pre className="trace-detail-body">{detail.full ?? detail.txt}</pre>
+            {/* 设计稿 12 —— `.kp-detail > .kp-detail-head + .kp-detail-body`；
+                `.kp-detail-body` 提供 16/20/18 的内边距（`.kp-json` 自带 1px 描边，
+                不加这层会贴着弹窗圆角）。 */}
+            <div className="kp-detail-body" style={DETAIL_BODY_STYLE}>
+              <pre className="kp-json kp-json-large">{detail.full ?? detail.txt}</pre>
+            </div>
           </div>
         </div>
       )}
+    </div>
     </div>
   )
 }

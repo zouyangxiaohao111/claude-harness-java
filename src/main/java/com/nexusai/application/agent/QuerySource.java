@@ -277,7 +277,7 @@ public enum QuerySource {
      * 主会话语义」的后台 fork（压缩摘要 / 会话记忆 / 记忆提取 / 梦境整理）。
      *
      * <p><b>WHY 需要（E-1b 前置机制）</b>：这 4 个来源的生产实现今天走专用循环
-     * （{@code ProductionForkedQuery}）；E-1b 收敛到主循环 {@code queryLoop} 后，主循环内若干
+     * （旧自建 fork 循环，E-2 已删）；E-1b 收敛到主循环 {@code queryLoop} 后，主循环内若干
      * <b>主会话专属副作用</b>（blocking-limit 预检 / autocompact / turn 事件发布 / post-sampling
      * hooks / skill_listing 注入）会**对 fork 也执行** —— 而 Java 的 {@code AgentLoopContext}
      * 携带主会话级 bean（事件桥 / state / 注册表），CC 侧靠 fork 的**隔离上下文**

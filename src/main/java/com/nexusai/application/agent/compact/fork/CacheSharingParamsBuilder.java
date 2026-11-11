@@ -36,7 +36,7 @@ import java.util.function.Supplier;
  *       （:277-281）→ {@link SystemPromptContextProvider#fetchSystemPromptParts} 三路并行
  *       （userContext/systemContext 从 {@link SystemPromptParts} 取出）</li>
  *   <li>systemContext <b>不在此并入</b>（[E-1a pre-append 契约]）：产物只存 pre-append 数组 +
- *       独立 systemContext map，append 由使用点（fork 发送边界 ProductionForkedQuery）执行一次 ·
+ *       独立 systemContext map，append 由使用点（fork 发送边界）执行一次 ·
  *       CC 语义 = fork 自身 query() 内重跑 appendSystemContext（query.ts:449-450/:660）</li>
  *   <li>{@code toolUseContext: context}（:285）→ 入参 toolUseContext；{@code forkContextMessages}
  *       （:286）→ 入参 forkContextMessages（压缩前消息）</li>
@@ -124,12 +124,12 @@ public final class CacheSharingParamsBuilder {
 
         // 3. [E-1a pre-append 契约] **不再**在此 appendSystemContext —— 本字段只存 pre-append
         //    形态（组装段数组，含 boundary 元素）+ 独立 systemContext map；append 由**使用点**
-        //    执行（fork = ProductionForkedQuery 发送边界一次 · CC forkedAgent 自身 query() 内重跑）。
+        //    执行（fork = QueryLoopForkedQuery 发送边界一次 · CC forkedAgent 自身 query() 内重跑）。
         //    WHY: appendSystemContext **非幂等**（每次调用追加末尾元素）—— 若此处存 post-append，
         //    fork 发送边界再 append 一次 → 多出 systemContext 段 → 发送 blocks 与主线程不一致 →
         //    prompt cache 永不命中。
         //    [RES-R4] 保留主线程发送前数组（含 boundary 元素），不再无条件 \n\n 扁平化 ——
-        //    发送边界（StreamCompactSummary → ProductionForkedQuery）用实际 gate 经
+        //    发送边界（StreamCompactSummary → 主循环 queryLoop）用实际 gate 经
         //    SystemPromptSplitter 剥离（REQ-R4-1/2/4）。
         List<String> preAppendSystemPrompt = systemPrompt.elements();
 

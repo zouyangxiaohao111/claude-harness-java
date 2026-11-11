@@ -156,6 +156,16 @@ public class KnowledgeBaseService {
         row.setImageProcessingConfig(DEFAULT_IMAGE_PROCESSING_CONFIG);
         row.setCosConfig(DEFAULT_COS_CONFIG);
         row.setVlmConfig(DEFAULT_VLM_CONFIG);
+        // ⭐ 索引策略（RAG / Wiki / 图谱的开关）—— 源侧创建时同一个请求就带上它
+        //    （KnowledgeBaseEditorModal.vue:1690）。bounds = 只接受 JSON 对象，
+        //    其它形态当作「未配置」（null），⛔ 不要静默塞一个空串让下游 parse 成脏数据。
+        if (req.indexingStrategy() != null && !req.indexingStrategy().isBlank()) {
+            String strategy = req.indexingStrategy().trim();
+            if (!strategy.startsWith("{")) {
+                throw new ValidationException("indexing_strategy 必须是 JSON 对象");
+            }
+            row.setIndexingStrategy(strategy);
+        }
         // DB 列 NOT NULL 且无默认值 ⇒ 留空时写空串
         row.setEmbeddingModelId(req.embeddingModelId() == null ? "" : req.embeddingModelId());
         row.setSummaryModelId(req.summaryModelId() == null ? "" : req.summaryModelId());
@@ -428,6 +438,15 @@ public class KnowledgeBaseService {
             r.getPinnedAt(),
             r.getGeneratedProfile(),
             KbTimeFormat.format(r.getCreateTime()),
-            KbTimeFormat.format(r.getUpdateTime()));
+            KbTimeFormat.format(r.getUpdateTime()),
+            // ⭐ 读侧补出：前端靠 indexing_strategy.wiki_enabled 决定 Wiki/图谱 tab 是否显示
+            r.getIndexingStrategy(),
+            r.getWikiConfig(),
+            // ⭐ 读侧补出（B7）：前端开关状态靠这几项回显。只写不读 ⇒ 保存后开关仍显示关闭。
+            r.getQuestionGenerationConfig(),
+            r.getAutoTagConfig(),
+            r.getAsrConfig(),
+            r.getProfileConfig(),
+            r.getFaqConfig());
     }
 }

@@ -41,7 +41,7 @@ interface SettingsModalProps {
   showToast: (msg: string, type?: 'success' | 'info') => void
   /** 环境配置（设置页「环境配置」tab：压缩窗口/自动记忆/away 门控） */
   appSettings: AppSettings | null
-  onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
+  onSaveSettings: (req: UpdateSettingsRequest) => Promise<boolean>
   /** 全局模型配置（设置页「模型」tab：档位角色绑定/解绑） */
   onBindModelTier: (role: ModelTierRole, fullName: string) => void
   /** 一键把某个模型写进所有通用档位（不含 TTS / ASR） */

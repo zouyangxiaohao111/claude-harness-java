@@ -62,6 +62,19 @@ function Host({ sid }: { sid: string }) {
   )
 }
 
+/**
+ * 可控 activeStreams 的 Host：用于构造「后台代跑轮」的真实形态 ——
+ * 该会话**从未登记** activeStreams（后台/子代理/cron 起的 run 不经本页 sendMessage）。
+ */
+function HostWithStreams({ sid, streams }: { sid: string; streams: Record<string, string> }) {
+  const messages = useChatStore((s) => s.messages[sid] ?? EMPTY)
+  useChatSocket(sid, streams, undefined, undefined, undefined, undefined, undefined, undefined, [A, B])
+  return (
+    <MessageList sessionId={sid} messages={messages} onDelete={noop} conversationId={null}
+      onLoadOlder={noop} onNearBottomChange={noop} />
+  )
+}
+
 function pushChunk(sid: string, assistantMessageId: string, delta: string) {
   const sub = fakeClient.subscriptions.find((s) => s.destination === `/topic/sessions/${sid}/stream`)
   if (!sub) throw new Error(`前置失败：${sid} 的 stream topic 未订阅`)
@@ -115,5 +128,42 @@ describe('[跨会话流式] 切走期间的内容，切回立即可见', () => {
 
     expect(container!.textContent).toContain('前半段')
     expect(container!.textContent).toContain('后半段')
+  })
+
+  it('⭐ 后台代跑轮：会话不在 activeStreams 且非当前会话 ⇒ stream 订阅也不得被退订', async () => {
+    // WHY（用户实测「后台子代理完成 → 代跑一轮跑完 → 前端没有任何记录，F5 才有」）：
+    //   activeStreams 只登记本页 sendMessage / queue.drained 发起的轮次；
+    //   后台 / 子代理 / cron 代跑的轮次**从不登记** ⇒ 旧退订判据
+    //   `if (!active[sid] && sid !== sessionIdRef.current) unsubscribe()` 必然把它误判成「空闲」，
+    //   用户一切走就摘掉订阅。simple broker 不持久、不重放 ⇒ 该轮 chunk / complete 永久丢，
+    //   且没有任何路径重订 ⇒ 只能 F5。
+    // ⚠️ 注意本用例与上一条的区别：上一条把 A 恒放在 activeStreams 里，旧代码对 A 会短路、
+    //   根本走不到退订分支（那条用例改动前后都绿，无判别力）。这里必须让 A **不在** activeStreams。
+    act(() => { root!.render(<HostWithStreams sid={A} streams={{}} />) })
+    act(() => { fakeClient.onConnect?.() })
+    await act(async () => { await new Promise((r) => setTimeout(r, 40)) })
+
+    pushChunk(A, 'blk-a', '开始')
+    await act(async () => { await new Promise((r) => setTimeout(r, 40)) })
+    expect(container!.textContent).toContain('开始')
+
+    // 切到 B，且 activeStreams 仍为空（模拟后台轮次从未登记）—— effect 依赖变化会触发 syncAllStreams
+    act(() => { root!.render(<HostWithStreams sid={B} streams={{}} />) })
+    await act(async () => { await new Promise((r) => setTimeout(r, 40)) })
+
+    const subA = fakeClient.subscriptions.find((s) => s.destination === `/topic/sessions/${A}/stream`)
+    expect(subA, '前置失败：A 的 stream 订阅应已建立').toBeTruthy()
+    expect(
+      subA?.unsubscribed,
+      'A 不在 activeStreams（后台代跑轮）且已切走 ⇒ 旧判据会退订；订阅一摘，该轮帧永久丢失',
+    ).toBe(false)
+
+    // 行为级验证：切走后 A 的后台内容仍能进入 store
+    pushChunk(A, 'blk-a', '后台追加')
+    await act(async () => { await new Promise((r) => setTimeout(r, 40)) })
+    expect(container!.textContent).not.toContain('后台追加')  // 当前渲染的是 B
+    act(() => { root!.render(<HostWithStreams sid={A} streams={{}} />) })
+    await act(async () => { await new Promise((r) => setTimeout(r, 40)) })
+    expect(container!.textContent, '切回 A 必须看到后台轮次期间推来的内容').toContain('后台追加')
   })
 })

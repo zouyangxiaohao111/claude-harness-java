@@ -833,7 +833,7 @@ class ExtractMemoriesAgentTest {
     void forkRawMaterial_carriesSessionModel() {
         // WHY (规则九): 生产事故 —— extract/dream fork 恒落 MockLlmProvider（假回复/永不 Write 记忆）。
         //   根因：生产 supplier 的 toolUseContext 由 buildProductionCacheSafeParams 8 参构造 →
-        //   effectiveModelName 恒 null → ProductionForkedQuery「会话模型直传」(:239-256) 取不到模型
+        //   effectiveModelName 恒 null → 主循环「会话模型直传」分支 取不到模型
         //   → 回落全局 supplier（settings.json 无 model → model=null → ProviderConfig.empty() → Mock）。
         //   CC 真源：createCacheSafeParams(context) 的 toolUseContext 同时带 options.tools 与
         //   options.mainLoopModel（forkedAgent.ts:131-141）——会话模型随 ForkRawMaterial 从

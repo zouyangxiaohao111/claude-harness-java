@@ -77,7 +77,10 @@ public class KbWikiIngestService {
     }
 
     /**
-     * 一轮 Wiki 生成（针对一批文档）。
+     * 一轮 Wiki 生成（自动路径 · 4 参重载）。
+     *
+     * <p>等价于 {@code runBatch(..., manual=false)}：入库后自动生成时
+     * 仍然受 {@code auto_generate} 开关约束（行为与本批之前完全一致）。
      *
      * @param kbId          知识库 ID
      * @param knowledgeIds  本轮要处理的文档（已解析完成）
@@ -88,6 +91,29 @@ public class KbWikiIngestService {
     public RunSummary runBatch(
         String kbId, List<String> knowledgeIds, String modelName, boolean ingestRunning
     ) {
+        return runBatch(kbId, knowledgeIds, modelName, ingestRunning, false);
+    }
+
+    /**
+     * 一轮 Wiki 生成（针对一批文档）。
+     *
+     * <h2>⭐⭐ {@code manual} 只绕过 {@code auto_generate} 一道闸，其余逻辑完全不变</h2>
+     * {@code auto_generate=false} 的语义是「<b>不要自动生成</b>」，不是「<b>不许生成</b>」。
+     * 用户关掉自动生成后，若手动点「生成 Wiki」也被这里静默跳过，接口会返回 200 +
+     * {@code skipped}，页面上什么都不会发生 —— 用户只能整篇重新解析（重跑分块与索引，
+     * 成本高且块 ID 会变）。
+     *
+     * @param kbId          知识库 ID
+     * @param knowledgeIds  本轮要处理的文档（已解析完成）
+     * @param modelName     模型名（null ⇒ 跳过）
+     * @param ingestRunning 是否有其他 ingest 在跑（决定剪枝延后）
+     * @param manual        {@code true} = 用户手动触发（忽略 {@code auto_generate} 开关）
+     * @return 本轮统计
+     */
+    public RunSummary runBatch(
+        String kbId, List<String> knowledgeIds, String modelName,
+        boolean ingestRunning, boolean manual
+    ) {
         if (kbId == null || kbId.isBlank()) {
             throw new ValidationException("知识库 ID 不能为空");
         }
@@ -96,13 +122,22 @@ public class KbWikiIngestService {
             throw new ValidationException("知识库不存在: " + kbId);
         }
         KbWikiConfig config = KbWikiConfig.parse(kb.getWikiConfig());
-        if (!config.isAutoGenerateEnabled()) {
-            log.info("[Wiki] 跳过：知识库未启用自动生成 kb={}", kbId);
+        if (shouldSkipForAutoGenerate(config, manual)) {
+            log.info("[Wiki] 跳过：知识库未启用自动生成 kb={} auto_generate={} 手动={}",
+                kbId, config.getAutoGenerate(), manual);
             return RunSummary.skipped("auto_generate 已关闭");
         }
+        if (manual && !config.isAutoGenerateEnabled()) {
+            // ⭐ 手动触发时开关被关闭 = 有意为之，必须留痕（否则排查时看不出为什么跑了）
+            log.info("[Wiki] 手动生成：忽略 auto_generate 开关 kb={} auto_generate={}",
+                kbId, config.getAutoGenerate());
+        }
         if (knowledgeIds == null || knowledgeIds.isEmpty()) {
+            log.info("[Wiki] 跳过：没有待处理文档 kb={} 手动={}", kbId, manual);
             return RunSummary.skipped("没有待处理文档");
         }
+        log.info("[Wiki] 开始一轮生成 kb={} 文档数={} 模型={} 手动={} 其它ingest在跑={}",
+            kbId, knowledgeIds.size(), modelName, manual, ingestRunning);
 
         List<KbWikiMapStage.ExistingPage> existingPages = pageService.existingPagesFor(kbId);
         List<KbWikiMapStage.MapResult> maps = new ArrayList<>();
@@ -115,6 +150,11 @@ public class KbWikiIngestService {
             try {
                 DocContent doc = loadDocContent(kbId, knowledgeId);
                 if (doc == null) {
+                    // ⭐ 必须留痕：三种 null 原因（已删 / 未解析完成 / 跨库 / 无分块）里
+                    //    任何一种都意味着「用户点了生成，这一篇什么也没产出」，
+                    //    静默 ++ 会让排查时完全看不出为什么文档数对不上。
+                    log.info("[Wiki] 文档跳过（已删除/未解析完成/跨库/无分块）kb={} knowledge={} 手动={}",
+                        kbId, knowledgeId, manual);
                     skippedDocs++;
                     continue;   // 已删除 / 未解析完成 / 跨库
                 }
@@ -302,6 +342,30 @@ public class KbWikiIngestService {
         log.info("[Wiki] 本轮完成 kb={} 文档={} 跳过={} 失败={} 新建页={} 更新页={} 拒绝={}",
             kbId, maps.size(), skippedDocs, failedDocs, created.size(), updated.size(), rejected);
         return summary;
+    }
+
+    /**
+     * 是否因 {@code auto_generate} 开关而整轮跳过。
+     *
+     * <p><b>抽成纯函数是为了可单测</b>（{@link #runBatch} 内部依赖 mapper / LLM，
+     * 单测里造不起）。⚠️ 语义必须与 {@link #runBatch} 完全一致：
+     * <ul>
+     *   <li>{@code manual=true} ⇒ <b>永不</b>因开关跳过（手动生成是有意为之）；</li>
+     *   <li>{@code manual=false} ⇒ 开关关闭才跳过（自动路径行为与本批之前一致）。</li>
+     * </ul>
+     *
+     * @param config 知识库 Wiki 配置（{@code auto_generate} 三态，null ⇒ 开）
+     * @param manual 是否用户手动触发
+     * @return 是否跳过本轮
+     */
+    static boolean shouldSkipForAutoGenerate(KbWikiConfig config, boolean manual) {
+        if (config == null) {
+            return false;
+        }
+        if (manual) {
+            return false;
+        }
+        return !config.isAutoGenerateEnabled();
     }
 
     // ══════════════════════════════════════════════════════════

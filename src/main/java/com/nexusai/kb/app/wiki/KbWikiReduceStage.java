@@ -172,7 +172,13 @@ public class KbWikiReduceStage {
             log.warn("[Wiki] Reduce 跳过（未配置模型） slug={}", slug);
             return rejected(slug, existing, "未配置 Wiki 生成模型");
         }
-        ProviderConfig config = resolveConfig(modelName);
+        ModelConfigResolver.ResolvedModel _r = resolveModel(modelName);
+        ProviderConfig config = _r == null ? null : _r.config();
+        // ⚠️ 往下传的必须是 **models.name**：入参 modelName 往往只是 models.id，
+        //    直接发出去会被对方 API 400（实测 `but you passed model-0823a98d`）。
+        if (_r != null && _r.apiModelName() != null && !_r.apiModelName().isBlank()) {
+            modelName = _r.apiModelName();
+        }
         if (config == null) {
             return rejected(slug, existing, "模型 provider 配置无法解析");
         }
@@ -307,9 +313,14 @@ public class KbWikiReduceStage {
         if (pages == null || pages.isEmpty() || modelName == null || modelName.isBlank()) {
             return Map.of();
         }
-        ProviderConfig config = resolveConfig(modelName);
+        ModelConfigResolver.ResolvedModel _r2 = resolveModel(modelName);
+        ProviderConfig config = _r2 == null ? null : _r2.config();
         if (config == null) {
             return Map.of();
+        }
+        // ⚠️ 同 resolveModel 的说明：往下传真实模型名而不是 ID
+        if (_r2.apiModelName() != null && !_r2.apiModelName().isBlank()) {
+            modelName = _r2.apiModelName();
         }
         String user = KbWikiPrompts.TAXONOMY_PLAN_USER
             .replace("{{EXISTING_FOLDERS}}", existingFolders == null || existingFolders.isEmpty()
@@ -701,13 +712,20 @@ public class KbWikiReduceStage {
         return new ArrayList<>(out);
     }
 
-    private ProviderConfig resolveConfig(String modelName) {
+    /**
+     * 解析「模型 ID / 名」→ 配置 + 真实模型名。
+     *
+     * <p>⚠️ 必须整份返回 {@link ModelConfigResolver.ResolvedModel}：调用点要的是
+     * {@code apiModelName}（= {@code models.name}），而库里 {@code *_model_id} 存的是
+     * {@code models.id}。只带 config 出去，调用点就只好把 ID 当名字发 ——
+     * 实测被对方 400 拒绝（{@code but you passed model-0823a98d}）。
+     */
+    private ModelConfigResolver.ResolvedModel resolveModel(String modelName) {
         if (modelConfigResolver == null) {
             return null;
         }
         try {
-            ModelConfigResolver.ResolvedModel r = modelConfigResolver.resolve(modelName);
-            return r == null ? null : r.config();
+            return modelConfigResolver.resolve(modelName);
         } catch (RuntimeException e) {
             log.warn("[Wiki] provider 配置解析失败 model={} 原因={}", modelName, e.getMessage());
             return null;

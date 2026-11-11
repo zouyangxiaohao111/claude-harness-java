@@ -613,7 +613,7 @@ public class ToolRegistry {
      */
     /**
      * 构建 LLM 工具 schema 数组 · 无 defer_loading 发射（等价空集合重载，保留旧契约；
-     * compact 直调方 ProductionForkedQuery:413 / StreamCompactSummary:391 走本签名，
+     * compact 直调方 ToolRegistry.dispatch / StreamCompactSummary:391 走本签名，
      * 不参与 tool-search 过滤/发射 → 登记残留）。
      */
     public ArrayNode toOpenAiToolsArray() {

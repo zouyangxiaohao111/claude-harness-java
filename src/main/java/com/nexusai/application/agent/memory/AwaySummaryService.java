@@ -103,7 +103,7 @@ public class AwaySummaryService {
     }
 
     /**
-     * 惰性 provider/config 构造（FIX-CL 生产 @Bean 接线）· 对齐 ProductionForkedQuery 运行时
+     * 惰性 provider/config 构造（FIX-CL 生产 @Bean 接线）· 对齐 QueryLoopForkedQuery 运行时
      * LLM 解析模式：provider/config 在 {@link #generate} 每次调用时解析，避免 bean 构造期
      * （Spring 启动，settings/DB 尚未就绪）锁定 mock provider。
      */
@@ -181,7 +181,7 @@ public class AwaySummaryService {
 
                 // CC :41-57 — queryModelWithoutStreaming options（querySource/skipCacheWrite/small-fast/thinking-disabled）
                 LlmProvider.ChatRequestOptions options = buildAwaySummaryOptions(recent, signal);
-                // FIX-CL：config 惰性解析（每次调用取最新，对齐 ProductionForkedQuery 模式）
+                // FIX-CL：config 惰性解析（每次调用取最新，对齐 QueryLoopForkedQuery 模式）
                 ProviderConfig config = providerConfigSupplier.get();
                 // [usage-gateway] 旁路 LLM 收口（替代 provider.chatWithOptions，补记账）：归属 =
                 //   本方法 sessionId 形参（REST 载体 resolveSessionId 解析出的当前会话 ID，单轨）；

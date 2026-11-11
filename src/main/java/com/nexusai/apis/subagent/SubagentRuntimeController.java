@@ -72,7 +72,11 @@ public class SubagentRuntimeController {
             // 读设置失败不能把整张清单拖垮：清单本身是静态数据 + PATH 探测
             log.warn("[SubagentRuntimeController] 读子代理运行时设置失败（清单照常返回）: {}", e.toString());
         }
-        // 兼容旧值：老配置里存的是 runtime id，新语义存 agentType —— 两种都认
+        // ⛔ defaultRuntime / defaultAgentType 同值，且**都是 runtime id**（claude / codex / …）。
+        //   agentType（codex-external 那种）是 md 的 name，与 runtime 是两个命名空间 ——
+        //   派发侧按 runtime id 反查 agentType，所以这里只能给 runtime id。
+        //   （此前注释写「新语义存 agentType」是错的，前端照着发 agentType ⇒ 后端 400
+        //     ⇒ 「设为默认」永远不生效。本仓 2026-11-09 实测。）
         defaultAgentType = defaultRuntime;
 
         Map<String, Object> current = new LinkedHashMap<>();

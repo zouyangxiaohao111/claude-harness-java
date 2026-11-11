@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.permission.hook.ElicitationResponse;
+import com.nexusai.infra.util.ExecutableResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -103,7 +104,15 @@ public class StdioMcpTransport implements McpTransport {
         Objects.requireNonNull(config, "config");
         Objects.requireNonNull(config.command(), "command required for stdio transport");
         try {
-            ProcessBuilder pb = new ProcessBuilder(concatCommand(config.command(), config.args()));
+            // [MCP-WIN-1] Windows 裸命令名 → 真实可执行文件路径。
+            //   ProcessBuilder 不认 PATHEXT：npm 全局装的 MCP server 只产出 <name>.cmd，
+            //   传裸名 "codegraph" 会 CreateProcess error=2（系统找不到指定的文件）。
+            //   .cmd 完整路径 ProcessBuilder 可直接启动（实测），故只需解析路径。
+            String resolvedCommand = ExecutableResolver.resolve(config.command());
+            if (!resolvedCommand.equals(config.command())) {
+                log.info("[StdioMcpTransport] resolved command '{}' → '{}'", config.command(), resolvedCommand);
+            }
+            ProcessBuilder pb = new ProcessBuilder(concatCommand(resolvedCommand, config.args()));
             pb.redirectErrorStream(false);
             if (config.cwd() != null) {
                 pb.directory(new java.io.File(config.cwd()));

@@ -97,6 +97,38 @@ public class SessionArtifactService {
     private static final String KIND_DELIVERABLE = "deliverable";
     private static final String KIND_SOURCE = "source";
 
+    /** 产物来源通道：写进会话交付物目录（Agent 按提示词主动交付）。 */
+    static final String ORIGIN_DELIVERABLES = "deliverables";
+
+    /** 产物来源通道：Write/Edit 写过的项目内文档（V279 起，用户 2026-11-10 裁定）。 */
+    static final String ORIGIN_PROJECT_WRITE = "project-write";
+
+    /**
+     * 项目内文档白名单扩展名（**大小写不敏感**）。
+     *
+     * <p><b>WHY 要有白名单，而不是只靠 {@link #SOURCE_CODE_EXTENSIONS} 黑名单</b>：
+     * 黑名单只枚举了「绝对不收」的源码/构建扩展名，对**无扩展名**文件（{@code exclude}、
+     * {@code .gitignore}、{@code Makefile}）和黑名单没列到的二进制（{@code .db}、{@code .bin}）
+     * 一律放行 ⇒ 产物面板会被配置文件和数据库文件刷屏。白名单是正向声明「什么算用户会看的文档」。
+     *
+     * <p>实测口径（近 2000 次 Write/Edit）：java 1076 / tsx 318 / ts 149 / py 145 全被黑名单拦，
+     * 真正该收的 {@code md} 有 187 次 —— 白名单就是为这一类开的门。
+     */
+    private static final Set<String> DOC_EXTENSIONS = Set.of(
+            "md", "markdown", "html", "htm", "pdf",
+            "docx", "doc", "xlsx", "xls", "pptx", "ppt",
+            "txt", "csv", "rtf", "odt", "epub");
+
+    /**
+     * 项目内文档采集的路径排除段（**任一段命中即不收**）。
+     *
+     * <p>WHY：{@code node_modules} 里几万个 {@code .md}、{@code target} 里编译期生成的
+     * 报告、{@code dist} 里打包产物 —— 都不是「用户要的东西」，收进来只会把面板淹掉。
+     */
+    private static final Set<String> EXCLUDED_PATH_SEGMENTS = Set.of(
+            "node_modules", ".git", "target", "build", "dist", ".next", "__pycache__",
+            ".venv", "venv", ".gradle", ".idea", ".vscode", "coverage");
+
     /** 归档根目录名：{@code {configHome}/artifacts} · 与 {@code image-cache} 同族（决策 D1 自有根）。 */
     private static final String ARTIFACTS_DIR_NAME = "artifacts";
 
@@ -969,7 +1001,7 @@ public class SessionArtifactService {
                     sessionId, resolved);
         }
         upsert(sessionId, KIND_DELIVERABLE, title, localPath, null, sizeBytes,
-                clip(item.summary(), SUMMARY_MAX), now, sourceMessageId);
+                clip(item.summary(), SUMMARY_MAX), now, sourceMessageId, ORIGIN_DELIVERABLES);
         return true;
     }
 
@@ -1054,21 +1086,29 @@ public class SessionArtifactService {
 
     private void upsert(String sessionId, String kind, String title, String localPath, String url,
                         Long sizeBytes, String summary, String now, String sourceMessageId) {
+        upsert(sessionId, kind, title, localPath, url, sizeBytes, summary, now, sourceMessageId, null);
+    }
+
+    /**
+     * 幂等写入（带来源通道 version）。
+     *
+     * @param origin 产物来源通道 · {@code deliverables} / {@code project-write}；
+     *               {@code null} = 不标注（来源类条目、或调用方不关心）
+     */
+    private void upsert(String sessionId, String kind, String title, String localPath, String url,
+                        Long sizeBytes, String summary, String now, String sourceMessageId,
+                        String origin) {
         try {
-            // ⭐ 幂等键 = (session, 归属轮次, kind, title)。
-            //   WHY 带 sourceMessageId：同一文件在**不同轮**被改过时必须是两行
-            //   （消息是 append-only 的，产物跟着「搬家」会让历史轮次凭空少一个）。
-            //   ⚠️ SQLite 的 NULL 不等于 NULL ⇒ 历史行（归属未知）用 IS NULL 单独匹配，
-            //   与迁移里的 COALESCE 表达式唯一索引口径一致。
+            // ⭐ 幂等键 = (session, kind, title) · **不含轮次**（V279 起）。
+            //   WHY 去掉了 sourceMessageId（2026-11-10 用户裁定）：原键含轮次，而轮末
+            //   syncDeliverablesFromDir 把「本轮 id」喂给目录里**每一个**文件 ⇒ 同一文件每轮
+            //   插一行。实测某会话 28 个真实文件产生 889 行、横跨 108 个轮次 ⇒「按对话分组」
+            //   会变成上百份重复。现在一轮文件只有一行，归属 = **首次产出那一轮**（见下方
+            //   「只在原本为空时写入」），这才是「哪个对话产出的」的正确答案。
             QueryWrapper key = QueryWrapper.create()
                     .eq("session_id", sessionId)
                     .eq("kind", kind)
                     .eq("title", title);
-            if (sourceMessageId == null || sourceMessageId.isBlank()) {
-                key.and("source_message_id IS NULL");
-            } else {
-                key.eq("source_message_id", sourceMessageId);
-            }
             SessionArtifactRecord existing = artifactMapper.selectOneByQuery(key);
             if (existing != null) {
                 // [2026-11-04] **产物没变 ⇒ 不刷新 updated_at、不推送**。
@@ -1100,6 +1140,16 @@ public class SessionArtifactService {
                 existing.setSizeBytes(sizeBytes);
                 existing.setSummary(summary);
                 existing.setUpdatedAt(now);
+                // ⭐ 归属与通道**只在原本为空时补写**，已有值一律不覆盖。
+                // WHY：既然键里没有轮次，每轮都会走到这个分支；若无条件覆盖归属，这个文件就会
+                //   在历史轮次之间「搬家」（用户 2026-11-05 报过的正是这个）。首次产出那一轮
+                //   才是它的归属。
+                if (isBlank(existing.getSourceMessageId()) && !isBlank(sourceMessageId)) {
+                    existing.setSourceMessageId(sourceMessageId);
+                }
+                if (isBlank(existing.getOrigin()) && !isBlank(origin)) {
+                    existing.setOrigin(origin);
+                }
                 // update(entity, false) = **显式写 NULL**（MyBatis-Flex 默认忽略 null 字段）：
                 // 本表语义是「本行 = 最终版抽取结果」，清空的 summary/size 必须真的落成 NULL，
                 // 否则旧值会一直挂在列表上（EffortCommand/SessionPermissionOverlay 同款用法）。
@@ -1127,12 +1177,13 @@ public class SessionArtifactService {
             // ⭐ 归属到触发它的那一轮用户消息（V205 列语义，2026-11-05 起真正写入）
             row.setSourceMessageId(
                     sourceMessageId == null || sourceMessageId.isBlank() ? null : sourceMessageId);
+            row.setOrigin(origin);
             row.setCreatedAt(now);
             row.setUpdatedAt(now);
             artifactMapper.insert(row);
             if (log.isDebugEnabled()) {
-                log.debug("[artifact-extract] UPSERT 新增 session={} kind={} title={} path={} url={}",
-                        sessionId, kind, title, localPath, url);
+                log.debug("[artifact-extract] UPSERT 新增 session={} kind={} title={} path={} url={} origin={}",
+                        sessionId, kind, title, localPath, url, origin);
             }
             // [产物实时推送] 新产物 → 前端即时插入并按需自动展开侧栏
             pushArtifactUpsert(sessionId, row, true);
@@ -1140,6 +1191,11 @@ public class SessionArtifactService {
             log.warn("[artifact-extract] 入库失败（跳过该条，不影响其它条目） session={} kind={} title={}: {}",
                     sessionId, kind, title, e.toString());
         }
+    }
+
+    /** 字符串 null/空白判定（归属/通道「只在原本为空时写入」用）。 */
+    private static boolean isBlank(String s) {
+        return s == null || s.isBlank();
     }
 
     // ───────────────────────── 产物归档（复制到自有目录） ─────────────────────────
@@ -1411,6 +1467,10 @@ public class SessionArtifactService {
             a.put("url", row.getUrl());
             if (row.getSizeBytes() == null) a.putNull("sizeBytes"); else a.put("sizeBytes", row.getSizeBytes());
             a.put("summary", row.getSummary());
+            // ⚠️ 推送与轮询（SessionArtifactDto）字段必须逐字一致，否则前端两条路径拿到的
+            //    origin 一个有值一个没有 ⇒ 角标时有时无。
+            a.put("origin", row.getOrigin());
+            a.put("sourceMessageId", row.getSourceMessageId());
             a.put("updatedAt", row.getUpdatedAt());
             // 目录判定是**读时**做的（不落库）⇒ 推送时按路径补一次，与 list 接口口径一致
             a.put("directory", row.getLocalPath() != null && Files.isDirectory(toPathQuietly(row.getLocalPath())));
@@ -1549,6 +1609,145 @@ public class SessionArtifactService {
         } catch (Throwable t) {
             log.warn("[artifact-scan] 写盘即入库失败（不影响写盘） session={} path={}: {}",
                     sessionId, absPath, t.toString());
+            return false;
+        }
+    }
+
+    /**
+     * 项目内文档入库（Write/Edit 写了 {@code docs/xxx.md} 这类文件时调用）· V279 起。
+     *
+     * <p><b>WHY 需要这条通道</b>（2026-11-10 用户裁定「项目目录里的文件也算产物」）：
+     * 此前只收 {@link #deliverablesDir} 之下的文件，而实际工作里大量交付文档是直接写在
+     * 项目目录里的（{@code docs/zjkycode/plans/*.md}、{@code docs/specs/*.md}）——
+     * 用户在原会话里指出的两个 md 正是这类，它们在产物表里 **0 行**。
+     *
+     * <p><b>⛔ 必须归档复制</b>：产物读取端点有路径边界
+     * （{@link #resolveArtifactPath}：不在本会话归档目录内一律 400）。项目内文件直接入库
+     * 前端一打开就报「产物路径非法」⇒ 必须用 {@link #archiveFile} 复制进
+     * {@code {configHome}/artifacts/{sid}/}，{@code local_path} 存**副本**。
+     *
+     * <p><b>⛔ 归档失败就不入库</b>：回落记录原路径的话，条目在列表上点不开（死链）。
+     * 与 {@code saveDeliverable}「不展示点不开的死链」同口径。
+     *
+     * <p><b>过滤三层</b>（顺序不能换）：
+     * <ol>
+     *   <li>黑名单 {@link #isSourceCodeFile}：源码/构建产物绝对不收；</li>
+     *   <li>白名单 {@link #DOC_EXTENSIONS}：只有「用户会看的文档」才收（无扩展名文件在此被挡）；</li>
+     *   <li>路径段排除 {@link #EXCLUDED_PATH_SEGMENTS}：{@code node_modules} / {@code target}
+     *       之类编译产物目录不收。</li>
+     * </ol>
+     *
+     * <p><b>绝不抛</b>：写盘已经成功，采集只是旁路增强。
+     *
+     * @param sessionId        会话 id（null/空白 → false）
+     * @param absPath          Write/Edit 写盘后的绝对路径
+     * @param sourceMessageId  本轮 userMessageId（归属键；可为 null）
+     * @return true = 已作为产物入库并推送
+     */
+    public boolean syncProjectDocForPath(String sessionId, String absPath, String sourceMessageId) {
+        if (!extractEnabled || isBlank(sessionId) || isBlank(absPath)) {
+            return false;
+        }
+        try {
+            Path file = Path.of(absPath).toAbsolutePath().normalize();
+            if (!Files.isRegularFile(file)) {
+                return false;
+            }
+            // ① 黑名单（源码绝对不收）
+            if (isSourceCodeFile(file)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-project-doc] 丢弃源码文件 session={} path={}", sessionId, file);
+                }
+                return false;
+            }
+            // ② 白名单（只有文档类扩展名才收）
+            String name = file.getFileName() == null ? "" : file.getFileName().toString();
+            String ext = ArtifactFileKind.extensionOf(name);
+            if (!DOC_EXTENSIONS.contains(ext.toLowerCase())) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-project-doc] 丢弃非文档扩展名 session={} path={} ext={}",
+                            sessionId, file, ext);
+                }
+                return false;
+            }
+            // ③ 路径段排除（编译产物目录）— 同时排除 configHome 内部路径（那是应用自有资产，不是用户文档）
+            if (hasExcludedSegment(file) || isInsideConfigHome(file)) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-project-doc] 丢弃排除路径 session={} path={}", sessionId, file);
+                }
+                return false;
+            }
+            // ④ 归档复制（不复制的话产物端点会以「产物路径非法」400）
+            Path archived = archiveFile(file, sessionId, ARCHIVE_MAX_MB);
+            if (archived == null) {
+                log.warn("[artifact-project-doc] 归档失败，不入库（避免点不开的死链）session={} path={}",
+                        sessionId, file);
+                return false;
+            }
+            Long sizeBytes = null;
+            try {
+                sizeBytes = Files.size(archived);
+            } catch (Exception e) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-project-doc] 副本大小读取失败 size=null path={}: {}",
+                            archived, e.toString());
+                }
+            }
+            upsert(sessionId, KIND_DELIVERABLE, name, archived.toString(), null, sizeBytes, null,
+                    OffsetDateTime.now().toString(), sourceMessageId, ORIGIN_PROJECT_WRITE);
+            log.info("[artifact-project-doc] 项目文档入库 session={} name={} src={} copy={} bytes={}",
+                    sessionId, name, file, archived, sizeBytes);
+            return true;
+        } catch (Throwable t) {
+            log.warn("[artifact-project-doc] 项目文档采集失败（不影响写盘） session={} path={}: {}",
+                    sessionId, absPath, t.toString());
+            return false;
+        }
+    }
+
+    /** 路径任一段命中 {@link #EXCLUDED_PATH_SEGMENTS}（大小写不敏感）。 */
+    private static boolean hasExcludedSegment(Path file) {
+        for (Path seg : file) {
+            String s = seg.toString();
+            if (s.isEmpty()) {
+                continue;
+            }
+            if (EXCLUDED_PATH_SEGMENTS.contains(s.toLowerCase())) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 是否落在应用自有配置目录内（{@code {configHome}} 下的文件不是「用户文档」）。 */
+    private static boolean isInsideConfigHome(Path file) {
+        try {
+            Path home = Paths.get(NexusaiPaths.getAppConfigHomeDir()).toAbsolutePath().normalize();
+            return file.startsWith(home);
+        } catch (Exception e) {
+            return false;   // 解析不出就当不在（宁可多收一条，也不能吞掉用户文档）
+        }
+    }
+
+    /**
+     * 该路径是否在本会话交付物目录之下（供 hook 分流用）。
+     *
+     * <p>与 {@link #syncDeliverableForPath} 的入口判据同源（都折算成绝对路径再比），
+     * ⛔ 不另写一份 normalize 逻辑，否则两处口径可能漂移。
+     *
+     * @param sessionId 会话 id
+     * @param absPath   绝对路径
+     * @return true = 在交付物目录之下（含目录本身 → false，目录不是文件）
+     */
+    public boolean isInDeliverablesDir(String sessionId, String absPath) {
+        if (isBlank(sessionId) || isBlank(absPath)) {
+            return false;
+        }
+        try {
+            Path dir = deliverablesDir(sessionId).toAbsolutePath().normalize();
+            Path file = Path.of(absPath).toAbsolutePath().normalize();
+            return file.startsWith(dir) && !file.equals(dir);
+        } catch (Exception e) {
             return false;
         }
     }

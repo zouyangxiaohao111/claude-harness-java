@@ -26,22 +26,22 @@ class KbMemoryControllerContractTest {
 
     /** 源侧 routes_memory.go:21-38 的 16 条（verb + 路径）。 */
     private static final Set<String> EXPECTED = Set.of(
-        "GET /api/v1/memory/settings",
-        "PUT /api/v1/memory/settings",
-        "GET /api/v1/memory/items",
-        "POST /api/v1/memory/items",
-        "DELETE /api/v1/memory/items",
-        "PUT /api/v1/memory/items/{id}",
-        "DELETE /api/v1/memory/items/{id}",
-        "POST /api/v1/memory/items/{id}/confirm",
-        "POST /api/v1/memory/items/{id}/reject",
-        "GET /api/v1/memory/topics",
-        "DELETE /api/v1/memory/topics/{id}",
-        "POST /api/v1/memory/topics/{id}/promote",
-        "GET /api/v1/memory/documents",
-        "DELETE /api/v1/memory/documents/{id}",
-        "GET /api/v1/memory/export",
-        "POST /api/v1/memory/consolidate"
+        "GET /api/v1/kb/memory/settings",
+        "PUT /api/v1/kb/memory/settings",
+        "GET /api/v1/kb/memory/items",
+        "POST /api/v1/kb/memory/items",
+        "DELETE /api/v1/kb/memory/items",
+        "PUT /api/v1/kb/memory/items/{id}",
+        "DELETE /api/v1/kb/memory/items/{id}",
+        "POST /api/v1/kb/memory/items/{id}/confirm",
+        "POST /api/v1/kb/memory/items/{id}/reject",
+        "GET /api/v1/kb/memory/topics",
+        "DELETE /api/v1/kb/memory/topics/{id}",
+        "POST /api/v1/kb/memory/topics/{id}/promote",
+        "GET /api/v1/kb/memory/documents",
+        "DELETE /api/v1/kb/memory/documents/{id}",
+        "GET /api/v1/kb/memory/export",
+        "POST /api/v1/kb/memory/consolidate"
     );
 
     @Test
@@ -81,8 +81,8 @@ class KbMemoryControllerContractTest {
 
     private static Set<String> collectRoutes() {
         Set<String> out = new java.util.LinkedHashSet<>();
-        // 类级 @RequestMapping("/api/v1/memory") 不在方法注解里 ⇒ 这里补回前缀
-        String base = "/api/v1/memory";
+        // 类级 @RequestMapping("/api/v1/kb/memory") 不在方法注解里 ⇒ 这里补回前缀
+        String base = "/api/v1/kb/memory";
         for (Method m : KbMemoryController.class.getDeclaredMethods()) {
             for (String verb : List.of("GetMapping", "PostMapping", "PutMapping", "DeleteMapping")) {
                 var a = m.getAnnotation(annotationClass(verb));

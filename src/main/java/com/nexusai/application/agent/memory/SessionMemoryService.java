@@ -175,7 +175,7 @@ public class SessionMemoryService {
      */
     private boolean sessionMemoryFeatureEnabled;
 
-    /** fork 查询 seam · 生产注入 ProductionForkedQuery（ToolRegistrationConfig）。 */
+    /** fork 查询 seam · 生产注入 QueryLoopForkedQuery（ToolRegistrationConfig）。 */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
 
     /**
@@ -478,7 +478,7 @@ public class SessionMemoryService {
     }
 
     /**
-     * 注入 fork 查询 seam · 生产接 {@link RunForkedAgent.ForkedQuery}（ProductionForkedQuery，
+     * 注入 fork 查询 seam · 生产接 {@link RunForkedAgent.ForkedQuery}（QueryLoopForkedQuery，
      * ToolRegistrationConfig）。未注入 → extractSessionMemory 显式日志跳过（plan risks）。
      */
     public void setForkedQuery(RunForkedAgent.ForkedQuery query) {
@@ -834,7 +834,7 @@ public class SessionMemoryService {
                     mergeContext(supplied.systemContext(), psContext.systemContext()),
                     // [SM-fork 模型直传 2026-09-10] fork 上下文 = supplier 工具集 + 会话模型：
                     //   仅传 supplied.toolUseContext() 会丢会话模型（8 参构造 effectiveModelName=null）
-                    //   → ProductionForkedQuery 直传分支取不到模型 → provider 回落 MockLlmProvider
+                    //   → QueryLoopForkedQuery 直传分支取不到模型 → provider 回落 MockLlmProvider
                     //   （假回复/永不 Edit，summary.md 冻结）。CC 真源：createCacheSafeParams(context)
                     //   的 toolUseContext 同时带 options.tools 与 options.mainLoopModel
                     //   （forkedAgent.ts:131-141 + sessionMemory.ts:411-418）。
@@ -891,7 +891,7 @@ public class SessionMemoryService {
 
             if (forkedQuery == null) {
                 log.warn("[SessionMemory] fork 查询 seam 未注入（生产 ToolRegistrationConfig 必须 "
-                    + "setForkedQuery 注入 ProductionForkedQuery），提取跳过（游标不动，下轮重试）");
+                    + "setForkedQuery 注入 QueryLoopForkedQuery），提取跳过（游标不动，下轮重试）");
                 return;
             }
 
@@ -2384,7 +2384,7 @@ public class SessionMemoryService {
      * <p><b>[E-1a pre-append 契约]</b>: 该数组是 <b>pre-append</b> 形态（未经
      * {@code appendSystemContext}）—— 与 CC 同义（CC REPLHookContext.systemPrompt 即 query()
      * 不可变 params）。因此本方法产出的 {@code CacheSafeParams.systemPrompt} 也是 pre-append，
-     * append 由 fork 发送边界（{@code ProductionForkedQuery}）恰做一次；systemContext 独立随
+     * append 由 fork 发送边界恰做一次；systemContext 独立随
      * psContext.systemContext() 透传（{@code mergeContext}）—— 对 post-append 值再并入会让
      * SM fork 系统提示多一段 → prompt cache 永不命中。
      *

@@ -37,8 +37,14 @@ export interface SubagentExternalAgent {
 
 /** 当前默认配置（三态：configured=false 表示用户从未配置过） */
 export interface SubagentRuntimeCurrent {
+  /**
+   * 默认外部运行时 · 值域是 **runtime id**（claude / codex / opencode / pi）。
+   *
+   * ⚠️ **不是 agentType**（codex-external 那种）—— 后端 `settings.subagentDefaultRuntime`
+   * 只认 runtime id，传 agentType 一律 400；派发侧也是按 runtime id 去 registry 反查 agentType。
+   */
   defaultRuntime: string | null
-  /** 与 defaultRuntime 同值：老配置存 runtime id，新语义按 agentType 选 */
+  /** 与 defaultRuntime 同值（保留字段名兼容旧调用点）· 值域同样是 runtime id */
   defaultAgentType: string | null
   externalEnabled: boolean | null
   configured: boolean

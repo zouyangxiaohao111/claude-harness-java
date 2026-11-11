@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { artifactsApi, type ArtifactContent, type SessionArtifactDto } from '@/api/artifacts'
 import { ApiError } from '@/api/rest'
-import { MarkdownText } from '@/markdown/MarkdownText'
+import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { formatFileSize } from '@/utils/format'
 
 interface ArtifactPreviewModalProps {
@@ -155,7 +155,7 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
             <pre className="artifact-modal-pre">{data.content ?? ''}</pre>
           ) : data && !data.binary && data.content != null && (
             isMarkdown
-              ? <MarkdownText text={data.content} className="content md artifact-modal-md" />
+              ? <MarkdownTextV2 text={data.content} className="content md artifact-modal-md" />
               : isHtml
                 ? <iframe className="artifact-modal-frame" title={artifact.title} sandbox="" srcDoc={data.content} />
                 : <pre className="artifact-modal-pre">{data.content}</pre>

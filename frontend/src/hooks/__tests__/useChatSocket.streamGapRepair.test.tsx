@@ -177,6 +177,42 @@ describe('[seq 缺口修复]', () => {
     }
   })
 
+  it('⭐ seq 回退中间段（last−seq ∈ [1,100] 且 seq≠1）→ 必须放行（旧判据会静默丢弃整轮）', async () => {
+    // WHY（用户实测「后台子代理完成 → 代跑一轮 → 前端没有任何记录，F5 才有」）：
+    //   旧判据 `if (seq <= last) { if ((seq === 1 && last > 1) || last - seq > 100) reset; else return }`
+    //   只兜住了 seq=1 与大跨度（>100）两种形态；中间那一段（差值 1..100 且 seq≠1）被当「重复帧」
+    //   静默丢弃。STOMP 不重传 ⇒ 该轮 chunk / tool / complete 全部丢失，且无任何补偿 ⇒ 只能 F5。
+    const onReload = vi.fn()
+    await mount(onReload)
+    push({ type: 'message.chunk', seq: 1, assistantMessageId: 'b1', delta: 'a' })
+    await flush()
+
+    // 先把游标推到 50（等价「旧进程已跑到 50」）：seq=50 相对 1 是缺口 → 走一次 repair，
+    //   修复完成后缓冲帧按序派发，lastSeq 推进到 50。
+    push({ type: 'message.chunk', seq: 50, assistantMessageId: 'b1', delta: 'z' })
+    await flush()
+    expect(onReload, '缺口应触发一次重拉').toHaveBeenCalledTimes(1)
+    expect(blockContent(), 'repair 完成后缓冲帧必须派发').toBe('az')
+
+    // 真重复仍必须丢弃（seq === 已见最大）
+    push({ type: 'message.chunk', seq: 50, assistantMessageId: 'b1', delta: 'R' })
+    await flush()
+    expect(blockContent(), 'seq === 已见最大 ⇒ 真重复，必须丢弃').toBe('az')
+
+    // ⭐ 核心：seq=30 落在 [1,100] 盲区（50-30=20，且 seq≠1）⇒ 必须放行
+    push({ type: 'message.chunk', seq: 30, assistantMessageId: 'b2', delta: 'B' })
+    await flush()
+    expect(
+      blockContent('b2'),
+      'seq 回退必须重置游标并派发本帧（旧判据当重复丢弃 ⇒ 该轮永久失明）',
+    ).toBe('B')
+
+    // 游标已复位到 29 ⇒ 后续 seq=31 连续，正常追加
+    push({ type: 'message.chunk', seq: 31, assistantMessageId: 'b2', delta: 'C' })
+    await flush()
+    expect(blockContent('b2'), '复位后必须恢复连续派发').toBe('BC')
+  })
+
   it('后端重启（seq 大幅回退）→ 重置窗口继续处理', async () => {
     const onReload = vi.fn()
     await mount(onReload)

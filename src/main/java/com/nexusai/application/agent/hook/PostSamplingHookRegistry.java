@@ -45,8 +45,8 @@ import java.util.function.BiConsumer;
  *       等价表达；所有 post-sampling hook（含 extractSessionMemory）跨批串行。</li>
  *   <li><b>D11 子代理范围</b>：CC 子代理经 forkedAgent.ts:545-555 复用 query() 触发
  *       executePostSamplingHooks，但各 hook 内 querySource 门控拦截（sessionMemory.ts:278-281
- *       注释佐证）；Java 子代理走 ProductionForkedQuery 专用 fork loop，无 executeAll 调用 ——
- *       门控等价，可观察行为一致（无代码改动，本注释为登记）。</li>
+ *       注释佐证）；Java 子代理复用主循环 queryLoop（同样调 executeAll，<b>会</b>触发本表），
+ *       行为与 CC 一致 —— 靠各 hook 内的 querySource 门控拦截（sessionMemory.ts:278-281 等价）。</li>
  * </ul>
  *
  * <p>L2 契约 (5 Release Gate):

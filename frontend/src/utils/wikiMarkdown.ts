@@ -132,7 +132,8 @@ function replaceWikiLinks(text: string): string {
         const parsed = parseWikiLink(text.slice(i + 2, close))
         if (parsed) {
           // ⚠️ slug 与 label 都必须转义 —— 它们来自模型输出
-          out += `<a ${WIKI_LINK_ATTR}="${escapeHtml(parsed.slug)}">${escapeHtml(parsed.label)}</a>`
+          // ⭐ 带 href="#"：与源站 WeKnora 一致（缺 href 时浏览器 :link 默认色规则不适用）
+          out += `<a href="#" ${WIKI_LINK_ATTR}="${escapeHtml(parsed.slug)}">${escapeHtml(parsed.label)}</a>`
         } else {
           // 非法形态 ⇒ 原样保留
           out += text.slice(i, close + 2)
@@ -207,8 +208,13 @@ function sanitizeHtml(html: string): string {
     // wiki 链接
     const wiki = attrs.match(new RegExp(`${WIKI_LINK_ATTR}="([^"]*)"`))
     if (wiki && tag === 'a') {
+      // ⭐ wiki 内链固定 href="#"（与源站 WeKnora 一致）：下面的普通链接分支只放行 http/https，
+      //    不在这里显式补 href="#" 的话，href 会被白名单剥掉 ⇒ <a> 缺 href 语义上不是链接
+      safeAttrs.push('href="#"')
       safeAttrs.push(`${WIKI_LINK_ATTR}="${wiki[1]}"`)
-      safeAttrs.push('class="wiki-link"')
+      // ⭐ 用源站的 wiki-content-link：本仓 kb-shared.css 已有该类定义（品牌绿 + 虚线下划线），
+      //    原来的 wiki-link 在 styles/ 下零定义 ⇒ 链接会继承正文纯黑色
+      safeAttrs.push('class="wiki-content-link"')
     }
     // 普通链接：只允许 http/https + 加 noopener
     if (tag === 'a') {

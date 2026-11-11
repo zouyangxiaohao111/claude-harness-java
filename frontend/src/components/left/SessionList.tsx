@@ -31,6 +31,13 @@ interface SessionListProps {
   projectPathFor?: (projectId: string | null) => string
   /** projectId → 项目名（兜底，路径缺失时用） */
   projectNameFor?: (projectId: string | null) => string
+  /**
+   * projectId → 项目**注册时间**（`ProjectDto.createdAt` 的 ISO 串）。
+   *
+   * <p>分组标题序的唯一依据（注册先后，升序）：2026-11-10 用户裁定 —— 组间序排完**不再动**，
+   * 只有组内会话序按 updatedAt 动。省略 / 返回 undefined = 该组排在有值之后（兜底组键升序）。
+   */
+  projectCreatedAtFor?: (projectId: string | null) => string | undefined
   onCreateInProject?: (projectId: string | null) => void
   onCreateSession?: () => void
   /** 点击左栏「技能市场」入口 → 打开技能市场弹窗（App 持有 showMarket state） */
@@ -112,7 +119,7 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
-export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules, schedulesActive, groupsDefaultCollapsed }: SessionListProps) {
+export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules, schedulesActive, groupsDefaultCollapsed }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 默认折叠口径：只记录**用户/自动展开过**的组（collapsedGroups 的反面）。
   // 两套 state 并存而不是合成一个 Map：默认展开与默认折叠是两种语义，用一个布尔直接翻转
@@ -157,9 +164,11 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   }
   // 分组标题序：口径与理由见 compareGroups（比对函数已提出到 sessionOrder.ts 以便覆盖测试 ——
   // 原实现 inline 在此处且对两个非 unbound 组恒返回 0，是本次缺陷的同一处却零测试覆盖）。
+  // [2026-11-10 用户裁定] 组间序 = 项目**注册先后**（projects.created_at），不看任何会话活动；
+  // 在后面的项目里新建会话不再把该组顶到最前。
   const orderedKeys = [...groups.keys()].sort((a, b) => compareGroups(
-    { key: a, sessions: groups.get(a) ?? [] },
-    { key: b, sessions: groups.get(b) ?? [] },
+    { key: a, sessions: groups.get(a) ?? [], projectCreatedAt: projectCreatedAtFor?.(a) },
+    { key: b, sessions: groups.get(b) ?? [], projectCreatedAt: projectCreatedAtFor?.(b) },
   ))
 
   const toggleGroup = (key: string) => {

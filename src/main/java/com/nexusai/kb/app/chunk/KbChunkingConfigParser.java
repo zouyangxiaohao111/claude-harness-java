@@ -70,8 +70,20 @@ public final class KbChunkingConfigParser {
         int tokenLimit = intOf(root, "token_limit", 0);
         List<String> languages = stringListOf(root, "languages");
 
+        // 父子分块（源侧 knowledgebase.go:288-296）：缺省 = 关闭 + 源站默认尺寸，
+        // 尺寸 clamp 在 KbSplitterConfig.normalized() 里统一做。
+        boolean enableParentChild = boolOf(root, "enable_parent_child", false);
+        int parentChunkSize = intOf(root, "parent_chunk_size",
+            KbSplitterConfig.DEFAULT_PARENT_CHUNK_SIZE);
+        int childChunkSize = intOf(root, "child_chunk_size",
+            KbSplitterConfig.DEFAULT_CHILD_CHUNK_SIZE);
+
+        // 解析引擎路由（源侧 knowledgebase.go:282-287）
+        List<ParserEngineRule> rules = parserEngineRulesOf(root);
+
         return new KbSplitterConfig(
-            chunkSize, chunkOverlap, separators, strategy, tokenLimit, languages)
+            chunkSize, chunkOverlap, separators, strategy, tokenLimit, languages,
+            enableParentChild, parentChunkSize, childChunkSize, rules)
             .normalized();
     }
 
@@ -81,6 +93,55 @@ public final class KbChunkingConfigParser {
             return fallback;
         }
         return node.asInt(fallback);
+    }
+
+    /**
+     * 读布尔字段 · 照 {@link #intOf} 的容错风格。
+     *
+     * <p>⚠️ 同时接受 JSON 布尔与 {{@code 0/1}} 数字（DDL 里存的是 {@code 0/1}，前端有的地方也发数字）。
+     * 其它形态（字符串 {@code "true"}、对象）一律回落 —— ⛔ 不用 {@code asBoolean()}，
+     * 它会把<b>任意非空对象</b>判成 true。
+     */
+    private static boolean boolOf(JsonNode root, String field, boolean fallback) {
+        JsonNode node = root.get(field);
+        if (node == null) {
+            return fallback;
+        }
+        if (node.isBoolean()) {
+            return node.asBoolean(fallback);
+        }
+        if (node.isNumber()) {
+            return node.asInt(0) != 0;
+        }
+        return fallback;
+    }
+
+    /**
+     * 读 {@code parser_engine_rules} 数组 · 源侧 {@code [{file_types:["pdf"],engine:"..."}]}。
+     *
+     * <p>容错：非数组 / 某项非对象 / {@code engine} 空白 ⇒ 丢弃该项（记 debug），
+     * ⛔ 不因一条坏规则让整库配置回落默认 —— 那会把别的类型的好规则一起丢掉。
+     */
+    private static List<ParserEngineRule> parserEngineRulesOf(JsonNode root) {
+        JsonNode node = root.get("parser_engine_rules");
+        if (node == null || !node.isArray() || node.isEmpty()) {
+            return List.of();
+        }
+        List<ParserEngineRule> out = new ArrayList<>(node.size());
+        for (JsonNode item : node) {
+            if (!item.isObject()) {
+                continue;
+            }
+            List<String> fileTypes = stringListOf(item, "file_types");
+            String engine = textOf(item, "engine");
+            if (fileTypes.isEmpty() || engine.isBlank()) {
+                log.debug("[分块配置] 跳过不完整的 parser_engine_rules 项 fileTypes={} engine={}",
+                    fileTypes, engine);
+                continue;
+            }
+            out.add(new ParserEngineRule(fileTypes, engine));
+        }
+        return out;
     }
 
     private static String textOf(JsonNode root, String field) {

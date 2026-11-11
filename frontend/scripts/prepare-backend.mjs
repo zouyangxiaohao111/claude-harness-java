@@ -3,8 +3,12 @@
  * 打包后端产物并裁剪 JRE，供 Tauri 桌面端随应用分发。
  *
  * 职责链路：
- *   mvn clean package（backend）→ 校验 jar 内迁移版本号唯一 → 用 JDK25 jdeps 求 jar 模块
- *   + 拼 Spring 补丁模块集 → jlink 裁 JRE → jar + jre 拷入 front/src-tauri/backend/
+ *   mvn clean package（backend）→ 校验 jar 内迁移版本号唯一 → 检查 anydoc 原生库是否就位
+ *   （仅警告）→ 用 JDK25 jdeps 求 jar 模块 + 拼 Spring 补丁模块集 → jlink 裁 JRE
+ *   → jar + jre 拷入 front/src-tauri/backend/
+ *
+ * ⚠️ anydoc_go.dll 由 Rust 单独构建（front/scripts/build-anydoc.md），本脚本只检查不生成。
+ *    缺失时 Office 文档回落内置 Office 解析（Apache Tika），应用照常可用。
  *
  * 用法：
  *   JAVA_HOME=/path/to/jdk25 node scripts/prepare-backend.mjs
@@ -64,6 +68,37 @@ function printSummary(jreDir, jarPath) {
   const binSizeMB = (dirSize(join(jreDir, 'bin')) / 1024 / 1024).toFixed(1)
   console.log(`[prepare-backend] 完成 → out: ${out}`)
   console.log(`[prepare-backend] nexusai-backend.jar ${jarSizeMB} MB；jre/bin 约 ${binSizeMB} MB（jre 整体见上）`)
+}
+
+/**
+ * anydoc 原生库存在性检查（**只警告，不 fail**）。
+ *
+ * <p>WHY 不是必需产物：`anydoc_go.dll` 由 Rust 从 WeKnora 的 `third_party/anydoc-go` 编译而来
+ * （步骤见同目录 `build-anydoc.md`），**不属于本仓可复现的构建产物** —— GitHub 上的 CI/打包机
+ * 未必有 Rust 工具链。把它做成硬门禁会让「没编 Rust 的机器完全无法出包」，而缺了它只是
+ * 让 Office 文档回落内置 Office 解析（`KbAnydocParser.supports()` 会返回 false），
+ * 应用本身照常可用。
+ *
+ * <p>本步**不拷贝、不删除**该 DLL：`out` 目录（`front/src-tauri/backend/`）是它的家，
+ * 开发者手工放入（或由 `build-anydoc-lib.sh` 的产物拷入），本脚本只负责点名它的状态。
+ * `.gitignore` 里 `front/src-tauri/backend/*` 全忽略，故它不入库是**预期**的（同 jar / jre）。
+ */
+export function checkAnydocNative() {
+  const dll = resolve(out, 'anydoc_go.dll')
+  if (existsSync(dll)) {
+    const sizeMB = (statSync(dll).size / 1024 / 1024).toFixed(1)
+    console.log(`[prepare-backend] anydoc 原生库：已就位 ${dll}（${sizeMB} MB，随包分发）`)
+    return true
+  }
+  console.warn('')
+  console.warn('[prepare-backend] ⚠️ 未找到 anydoc 原生库：' + dll)
+  console.warn('  影响：Office/ODF/RTF/EPUB 文档将回落「内置 Office 解析」(Apache Tika)，')
+  console.warn('        不会拿到 anydoc 的结构化 Markdown。应用本身可正常打包/运行。')
+  console.warn('  处置：按 front/scripts/build-anydoc.md 自行编译，把产物 anydoc_go.dll')
+  console.warn('        拷到 front/src-tauri/backend/ 后重新运行本脚本。')
+  console.warn('  （该文件与本目录的 jar/jre 一样是构建产物，已被 .gitignore 忽略，不入库）')
+  console.warn('')
+  return false
 }
 
 /** jar 内迁移目录（spring-boot repackage 把 target/classes 放到 BOOT-INF/classes 下） */
@@ -143,7 +178,7 @@ function main() {
   // flywayInitializer bean 建不出来 ⇒ Spring 上下文起不来 ⇒ 用户端 app 打不开（后端 60 秒超时）。
   // 同类还有改名/删除过的 .class，clean 一并覆盖；不做增量优化是因为「不产生陈旧产物」这条
   // 无法用「少编一点」换回来。
-  console.log('[prepare-backend] [1/5] mvn clean package（backend，跳过测试）…')
+  console.log('[prepare-backend] [1/6] mvn clean package（backend，跳过测试）…')
   execSync('mvn -DskipTests clean package', { cwd: backend, stdio: 'inherit' })
 
   // 2) JDK 定位与校验（需完整 JDK 25：jlink/jdeps/java/jar 齐全）
@@ -168,7 +203,7 @@ function main() {
       process.exit(1)
     }
   }
-  console.log(`[prepare-backend] [2/5] 使用 JAVA_HOME: ${javaHome}`)
+  console.log(`[prepare-backend] [2/6] 使用 JAVA_HOME: ${javaHome}`)
 
   const jarPath = resolve(backend, JAR_REL)
   if (!existsSync(jarPath)) {
@@ -178,11 +213,15 @@ function main() {
   }
 
   // 3) 出包门禁：jar 内迁移版本号必须唯一（否则 Flyway validate 就拒，用户端 app 起不来）
-  console.log(`[prepare-backend] [3/5] 校验迁移版本号唯一性: ${jarPath}`)
+  console.log(`[prepare-backend] [3/6] 校验迁移版本号唯一性: ${jarPath}`)
   assertUniqueMigrationVersions(jarPath, tools.jar)
 
+  // 3.5) anydoc 原生库检查（只警告不 fail —— 见 checkAnydocNative 的 WHY）
+  console.log(`[prepare-backend] [4/6] 检查 anydoc 原生库: ${resolve(out, 'anydoc_go.dll')}`)
+  checkAnydocNative()
+
   // 4) jdeps 求基线模块，与补丁集并集去重排序 → --add-modules 串
-  console.log(`[prepare-backend] [4/5] jdeps 分析模块依赖: ${jarPath}`)
+  console.log(`[prepare-backend] [5/6] jdeps 分析模块依赖: ${jarPath}`)
   const raw = execSync(`"${tools.jdeps}" --print-module-deps --ignore-missing-deps "${jarPath}"`, {
     encoding: 'utf8',
   }).trim()
@@ -199,7 +238,7 @@ function main() {
   // 清旧产物，防 jlink 「目录已存在」；上次打包留下的 jre 被 .gitignore 忽略但仍在磁盘，
   // 若不删则重复 tauri build 时 jlink 必然失败
   rmSync(jreDir, { recursive: true, force: true })
-  console.log(`[prepare-backend] [5/5] jlink 裁剪 JRE → ${jreDir}`)
+  console.log(`[prepare-backend] [6/6] jlink 裁剪 JRE → ${jreDir}`)
   execSync(
     `"${tools.jlink}" --add-modules ${addModules} --output "${jreDir}" --strip-debug --no-man-pages --no-header-files --compress=zip-6`,
     { stdio: 'inherit' }

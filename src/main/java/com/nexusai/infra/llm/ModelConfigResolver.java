@@ -41,7 +41,28 @@ public class ModelConfigResolver {
     private static final Logger log = LoggerFactory.getLogger(ModelConfigResolver.class);
 
     /** 解析结果载体 · (真实 config, provider type) · CC original 语义：model → provider 路由。 */
-    public record ResolvedModel(ProviderConfig config, String providerType) {}
+    /**
+     * 解析结果。
+     *
+     * @param config       provider 连接配置
+     * @param providerType provider 类型（openai_compatible / anthropic / …）
+     * @param apiModelName <b>发给模型 API 的真实模型名</b>（= {@code models.name}）。
+     *                     ⚠️ 2026-11-09 新增：调用方手里往往只有 {@code models.id}
+     *                     （知识库那些 {@code *_model_id} 列就是这样），若把 ID 当名字发给
+     *                     对方 API，会被 400 拒绝。调用点必须用这个字段，⛔ 不要用入参。
+     */
+    public record ResolvedModel(ProviderConfig config, String providerType, String apiModelName) {
+        /**
+         * 2 参兼容构造（{@code apiModelName} 留 null）。
+         *
+         * <p>为什么留：既有测试与部分调用点只关心 {@code config}，加第三个字段不该让它们全改。
+         * ⚠️ 但**真正调模型 API 的地方必须用 3 参版** —— 2 参版拿不到真实模型名，
+         * 传 null 出去会退回「用入参当模型名」，那正是本次修掉的 400 成因。
+         */
+        public ResolvedModel(ProviderConfig config, String providerType) {
+            this(config, providerType, null);
+        }
+    }
 
     private static final int SETTINGS_SINGLETON_ID = 1;
 
@@ -108,6 +129,22 @@ public class ModelConfigResolver {
         }
         ModelRecord model = findEnabledModelByName(modelName);
         if (model == null) {
+            // ⭐ 2026-11-09：名查不到时再按 **ID** 试一次。
+            //   成因：知识库那一侧（`kb_knowledge_base.summary_model_id` /
+            //   `extraction_model_id` 等）存的是 models.id，而本方法签名要的是
+            //   models.name（见 javadoc 的「非配置名/字面量」）。两者混用时，
+            //   ModelNameResolver 必然未命中 ⇒ 摘要/问题生成/自动标签在「模型明明配了」
+            //   的情况下静默失败，用户只看到「生成失败」。
+            //   实测：summary_model_id=model-0823a98d 时这里报未命中。
+            //   ⚠️ 只做**兜底**，不改名优先的既有语义：同名的解析结果不该被 ID 分支影响。
+            ModelRecord byId = modelMapper.selectOneById(modelName);
+            if (byId != null && Boolean.TRUE.equals(byId.getEnabled())) {
+                log.info("[ModelConfigResolver] modelName={} 按名未命中，按 **ID** 命中模型 {} → 继续解析"
+                    + "（调用方传的是 ID，不是 name）", modelName, byId.getName());
+                model = byId;
+            }
+        }
+        if (model == null) {
             // [2026-10-22 根治] 提到 ERROR：未命中的常见成因是「裸名歧义被 fail-loud 拒绝」
             //   （多个 provider 提供同名模型）或模型被禁用；静默 warn 会让调用方悄悄回落 mock，
             //   用户只看到「主代理不动」。日志必须一眼可见。
@@ -145,7 +182,9 @@ public class ModelConfigResolver {
         //   （fail-soft：不阻断请求，只记 warn）。
         Map<String, Object> extraBody = parseExtraBody(model.getExtraBody(), modelName);
         return new ResolvedModel(new ProviderConfig(provider.getBaseUrl(), rawKey,
-            ProviderService.deserializeHeaders(provider.getExtraHeaders()), extraBody), providerType);
+            ProviderService.deserializeHeaders(provider.getExtraHeaders()), extraBody), providerType,
+            // ⚠️ 用 models.name（真实模型名），不是入参 modelName —— 入参可能是 ID
+            model.getName());
     }
 
     /**

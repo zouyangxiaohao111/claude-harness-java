@@ -11,6 +11,8 @@ export interface Project {
   dirty: number
   agents: number
   path: string
+  /** V280 · 项目注册时间（UTC ISO-8601）· 左栏项目分组序依据（注册先后，排完不动）。可选 = mock 数据无此字段。 */
+  createdAt?: string
 }
 
 export interface DiffLine {

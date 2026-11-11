@@ -37,6 +37,8 @@ public class KbIngestTaskRecord {
     public static final String TYPE_AUTO_TAG = "auto_tag";
     /** 任务类型：图谱抽取（W7 · 每篇文档 1 槽）。 */
     public static final String TYPE_GRAPH = "graph";
+    /** 任务类型：图片理解（caption + OCR · 每篇文档 1 槽）。 */
+    public static final String TYPE_IMAGE_UNDERSTAND = "image_understand";
 
     /** 状态：待认领。 */
     public static final String STATE_QUEUED = "queued";

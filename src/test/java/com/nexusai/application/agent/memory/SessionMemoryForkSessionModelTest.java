@@ -7,7 +7,7 @@ import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.application.agent.QuerySource;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
-import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
+import com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery;
 import com.nexusai.application.agent.compact.fork.RunForkedAgent;
 import com.nexusai.application.agent.hook.PostSamplingContext;
 import com.nexusai.application.agent.permission.PermissionMode;
@@ -50,7 +50,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * 根因：{@code doExtractSessionMemory}/{@code manuallyExtractSessionMemory} 把
  * <b>supplier 的</b> {@code toolUseContext} 原样塞进 {@code CacheSafeParams} —— 该上下文由
  * {@code buildProductionCacheSafeParams} 用 8 参构造（{@code effectiveModelName} 缺省 null），
- * 于是 {@code ProductionForkedQuery} 的「会话模型直传」分支（:239-256）读不到会话模型 →
+ * 于是 fork 发送边界 的「会话模型直传」分支（:239-256）读不到会话模型 →
  * 回落全局 supplier（settings.json 无 model → null → ProviderConfig.empty() → Mock）。
  *
  * <p>CC 真源：{@code createCacheSafeParams(context)} 直接取 {@code context.toolUseContext}
@@ -60,7 +60,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * psContext 会话模型）必须在传入 fork 前合并。
  *
  * <p>本测试从 {@link SessionMemoryService#extractSessionMemory} 入口起（<b>不</b>直接注入
- * forkCtx —— 那正是既有 {@code ProductionForkedQuerySessionModelRouteTest} 测不出本 bug 的原因），
+ * forkCtx —— 那正是既有 {@code fork 发送边界SessionModelRouteTest} 测不出本 bug 的原因），
  * 断言真正传给 fork 的 toolUseContext 带非空 effectiveModelName，且 supplier 工具集不丢。
  */
 @DisplayName("[SM-fork 模型直传] 提取 fork 的 toolUseContext 携带会话模型（修 MockLlmProvider 恒落）")
@@ -132,7 +132,7 @@ class SessionMemoryForkSessionModelTest {
         assertThat(query.captured).as("阈值满足 → 必须发起 fork").isNotNull();
         assertThat(query.captured.toolUseContext().effectiveModelName())
             .as("fork toolUseContext 必须携带会话模型（= CC toolUseContext.options.mainLoopModel，"
-                + "sessionMemory.ts:411-418）—— 否则 ProductionForkedQuery 会话模型直传取不到模型 → "
+                + "sessionMemory.ts:411-418）—— 否则 fork 的会话模型直传取不到模型 → "
                 + "model=null → provider 回落 MockLlmProvider（假回复 / 永不 Edit）")
             .isEqualTo(SESSION_MODEL);
         assertThat(query.captured.toolUseContext().availableTools())
@@ -165,7 +165,7 @@ class SessionMemoryForkSessionModelTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 验收 2 · 端到端: SM 服务 → 真 ProductionForkedQuery → 必须路由到会话模型的 provider
+    // 验收 2 · 端到端: SM 服务 → 真 fork 发送边界 → 必须路由到会话模型的 provider
     // ════════════════════════════════════════════════════════════════════
 
     @Test
@@ -179,20 +179,17 @@ class SessionMemoryForkSessionModelTest {
         LlmProvider sessionProvider = capturingProvider(sessionProviderCalled, usedModel);
         ProviderConfig sessionCfg = new ProviderConfig("https://api.deepseek.com", "sk-session");
 
-        Function<String, ProductionForkedQuery.ForkModelRoute> resolver = (full) ->
+        Function<String, QueryLoopForkedQuery.ForkModelRoute> resolver = (full) ->
             SESSION_MODEL.equals(full)
-                ? new ProductionForkedQuery.ForkModelRoute(
+                ? new QueryLoopForkedQuery.ForkModelRoute(
                     "deepseek-v4.1-flash-expires-on-0910", sessionCfg, sessionProvider, "openai_compatible")
                 : null;
 
         SessionMemoryService svc = new SessionMemoryService(baseDir);
         svc.setSessionMemoryFeatureEnabled(true);
         svc.setReadFileTool(readFileTool());
-        // 生产 seam 形态: SM 持有真 ProductionForkedQuery（非 RecordingQuery —— 后者绕过 TUC 取值）
-        svc.setForkedQuery(new ProductionForkedQuery(
-            () -> supplierProvider, () -> "global-model",
-            () -> new ProviderConfig("https://api.ark.volces.com", "sk-global"),
-            null, null, resolver));
+        // 生产 seam 形态: SM 持有真 fork 发送边界（非 RecordingQuery —— 后者绕过 TUC 取值）
+        svc.setForkedQuery(forkQuery(supplierProvider, sessionProvider, resolver));
         svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), ctx(List.of(), null), List.of(), false));
 
@@ -206,7 +203,8 @@ class SessionMemoryForkSessionModelTest {
         assertThat(supplierProviderCalled)
             .as("有会话模型时不得回落全局 supplier provider（settings 无 model → mock 假回复）")
             .isFalse();
-        assertThat(usedModel.get()).isEqualTo("deepseek-v4.1-flash-expires-on-0910");
+        // [E-1b-2] 主循环按全名透传，ModelCaller 剥前缀。
+        assertThat(usedModel.get()).isEqualTo("deepseek/deepseek-v4.1-flash-expires-on-0910");
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -313,6 +311,40 @@ class SessionMemoryForkSessionModelTest {
     }
 
     /** fake provider：标记调用 + 记录 stream 收到的 model，回无工具调用文本即停。 */
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(
+            LlmProvider supplierProvider, LlmProvider routeProvider,
+            java.util.function.Function<String, QueryLoopForkedQuery.ForkModelRoute> resolver) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        // 主循环按 (config, type) 取 provider ⇒ 按 baseUrl 分发：ark 端点 = 全局 supplier，其余 = 会话路由。
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> {
+                com.nexusai.infra.llm.ProviderConfig c = inv.getArgument(0);
+                return c != null && c.baseUrl() != null && c.baseUrl().contains("ark.volces.com")
+                    ? supplierProvider : routeProvider;
+            });
+        org.mockito.Mockito.when(pf.getProvider(org.mockito.ArgumentMatchers.any()))
+            .thenAnswer(inv -> {
+                com.nexusai.infra.llm.ProviderConfig c = inv.getArgument(0);
+                return c != null && c.baseUrl() != null && c.baseUrl().contains("ark.volces.com")
+                    ? supplierProvider : routeProvider;
+            });
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true); f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            resolver, () -> "global-model",
+            () -> new ProviderConfig("https://api.ark.volces.com", "sk-global"), factory);
+    }
+
     private static LlmProvider capturingProvider(AtomicBoolean called, AtomicReference<String> modelRef) {
         return new LlmProvider() {
             @Override public String type() { return "test"; }

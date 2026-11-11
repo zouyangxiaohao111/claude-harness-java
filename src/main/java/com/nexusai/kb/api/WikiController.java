@@ -7,10 +7,15 @@ import com.nexusai.kb.app.wiki.KbWikiLinter;
 import com.nexusai.kb.app.wiki.KbWikiPageService;
 import com.nexusai.kb.app.wiki.KbWikiSlug;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord;
+import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import com.nexusai.kb.repo.entity.KbWikiFolderRecord;
 import com.nexusai.kb.repo.entity.KbWikiPageIssueRecord;
 import com.nexusai.kb.repo.entity.KbWikiPageRecord;
 import com.nexusai.kb.repo.entity.KbWikiPageRevisionRecord;
+import com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper;
+import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
+import com.mybatisflex.core.query.QueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -30,6 +35,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * Wiki REST 端点 · W2-8（22 个，逐条对齐源侧 swagger）。
@@ -49,6 +55,20 @@ public class WikiController {
 
     @Autowired private KbWikiPageService pageService;
     @Autowired private KbWikiIngestService ingestService;
+    @Autowired private KbKnowledgeMapper knowledgeMapper;
+    @Autowired private KbKnowledgeBaseMapper knowledgeBaseMapper;
+
+    /**
+     * 进程内「正在生成 Wiki」的知识库集合（连点保护）。
+     *
+     * <p>⚠️ <b>单机进程内锁</b>：多实例部署时每个进程各有一份，<b>不构成分布式锁</b>。
+     * 之所以只做进程内：本仓当前单机部署，且连点的真实场景是「用户双击按钮」，
+     * 同一请求必然落在同一进程。要跨实例互斥需要 DB 行锁或分布式锁 —— 本批不做。
+     */
+    private final Set<String> runningKbs = ConcurrentHashMap.newKeySet();
+
+    /** 整库模式下「文档较多」的提示阈值（超过只提示慢，⛔ 不拒绝）。 */
+    private static final int SLOW_DOC_THRESHOLD = 50;
 
     // ══════════════════════════════════════════════════════════
     // 页面（1-5）
@@ -544,6 +564,162 @@ public class WikiController {
     }
 
 
+    // ══════════════════════════════════════════════════════════
+    // 手动生成（23）· 对齐 GraphController 的 graph/rebuild
+    // ══════════════════════════════════════════════════════════
+
+    /**
+     * 手动生成 / 补生成本库 Wiki。
+     *
+     * <h2>为什么需要这个端点</h2>
+     * Wiki 原本只在文档入库后自动生成（{@code KbPostProcessStage} 派发 {@code TYPE_WIKI}）。
+     * 用户上传时没配模型、或那一轮生成失败，之后配好模型也<b>没有任何补生成入口</b> ——
+     * 只能整篇重新解析（重跑分块与索引，成本高，且块 ID 会变）。
+     *
+     * <h2>⭐ 与自动路径的唯一差别是绕过 {@code auto_generate}</h2>
+     * 本端点走 {@code runBatch(..., manual=true)}：{@code auto_generate=false} 只表示
+     * 「不要自动生成」，不表示「不允许生成」。
+     *
+     * <h2>⭐⭐ 并发保护只是<b>单机进程内</b>锁</h2>
+     * {@link #runningKbs} 挡住同一知识库的连点（每篇文档一次 LLM 调用，重复跑很贵）。
+     * ⚠️ 多实例部署时各进程各有一份集合 ⇒ <b>不构成分布式锁</b>。
+     * 要跨实例互斥需要 DB 行锁 / 分布式锁，本批不做（当前是单机部署）。
+     *
+     * @param kb          知识库 ID
+     * @param knowledgeId 文档 ID（不传 ⇒ 整库：所有已解析完成且已启用的文档）
+     * @param model       模型名（可空 ⇒ wiki_config.synthesis_model_id ⇒ summary_model_id）
+     * @return 结果摘要（snake_case）
+     */
+    @PostMapping({"/api/v1/knowledgebase/{kb}/wiki/rebuild",
+                  "/api/v1/knowledge-bases/{kb}/wiki/rebuild"})
+    public WikiRebuildResponse rebuild(
+        @PathVariable("kb") String kb,
+        @RequestParam(value = "knowledge_id", required = false) String knowledgeId,
+        @RequestParam(value = "model", required = false) String model
+    ) {
+        KbKnowledgeBaseRecord kbRow = requireKb(kb);
+        KbWikiConfig config = KbWikiConfig.parse(kbRow.getWikiConfig());
+        String modelName = resolveRebuildModel(model, config, kbRow);
+        if (modelName == null) {
+            log.warn("[WikiAPI] 生成失败：未配置模型 kb={} 请求model={} synthesis={} summary={}",
+                kb, model, config.getSynthesisModelId(), kbRow.getSummaryModelId());
+            throw new ValidationException(
+                "未配置 Wiki 生成模型（知识库 wiki_config.synthesis_model_id 与 summary_model_id 均为空）");
+        }
+
+        // ── 选文档 ────────────────────────────────────────────────
+        List<String> knowledgeIds;
+        if (knowledgeId != null && !knowledgeId.isBlank()) {
+            KbKnowledgeRecord doc = knowledgeMapper.selectOneById(knowledgeId);
+            if (doc == null) {
+                log.warn("[WikiAPI] 生成失败：文档不存在 kb={} knowledge={}", kb, knowledgeId);
+                throw new com.nexusai.infra.exception.NotFoundException("知识条目不存在: " + knowledgeId);
+            }
+            if (!kb.equals(doc.getKnowledgeBaseId())) {
+                log.warn("[WikiAPI] 生成失败：文档不属于该知识库 kb={} knowledge={} 实际kb={}",
+                    kb, knowledgeId, doc.getKnowledgeBaseId());
+                throw new ValidationException("该文档不属于此知识库");
+            }
+            knowledgeIds = List.of(knowledgeId);
+            log.info("[WikiAPI] 手动生成（单篇）kb={} knowledge={} 模型={}",
+                kb, knowledgeId, modelName);
+        } else {
+            knowledgeIds = listGeneratableKnowledgeIds(kb);
+            if (knowledgeIds.isEmpty()) {
+                log.info("[WikiAPI] 跳过：该知识库没有已解析完成的文档 kb={}", kb);
+                return WikiRebuildResponse.skipped("该知识库没有已解析完成的文档");
+            }
+            log.info("[WikiAPI] 手动生成（整库）kb={} 待处理文档={} 模型={} 超过50篇会较慢={}",
+                kb, knowledgeIds.size(), modelName, knowledgeIds.size() > SLOW_DOC_THRESHOLD);
+        }
+
+        // ── 并发保护（进程内 · 见方法 javadoc 的限制说明）──────────
+        if (!runningKbs.add(kb)) {
+            log.warn("[WikiAPI] 跳过：该知识库正在生成 Wiki（连点保护）kb={} 文档数={}",
+                kb, knowledgeIds.size());
+            return WikiRebuildResponse.skipped("该知识库正在生成 Wiki，请稍候");
+        }
+        try {
+            KbWikiIngestService.RunSummary s = ingestService.runBatch(
+                kb, knowledgeIds, modelName, false, true);
+            String status = s.skipped() ? "skipped" : "done";
+            String detail = s.skipped()
+                ? (s.skipReason() == null ? "已跳过" : s.skipReason())
+                : "完成：处理 " + s.docsProcessed() + " 篇，新建 " + s.createdPages().size()
+                    + " 页，更新 " + s.updatedPages().size() + " 页"
+                    + (knowledgeIds.size() > SLOW_DOC_THRESHOLD
+                        ? "（整库 " + knowledgeIds.size() + " 篇，耗时较长属正常）" : "");
+            log.info("[WikiAPI] 手动生成结束 kb={} status={} 处理={} 跳过={} 失败={} 新建页={} 更新页={}",
+                kb, status, s.docsProcessed(), s.docsSkipped(), s.docsFailed(),
+                s.createdPages().size(), s.updatedPages().size());
+            return WikiRebuildResponse.of(status, detail, s);
+        } catch (RuntimeException e) {
+            log.error("[WikiAPI] 手动生成异常 kb={} 文档数={} 原因={}",
+                kb, knowledgeIds.size(), e.toString());
+            return WikiRebuildResponse.failed("生成失败: " + e.getMessage());
+        } finally {
+            runningKbs.remove(kb);
+        }
+    }
+
+    /**
+     * 整库模式下可参与生成的文档 ID。
+     *
+     * <p>口径照抄检索可见性闸（{@code KnowledgeService#hybridSearch} 的
+     * {@code enable_status='enabled' && parse_status='completed'}）：
+     * 只有「解析完成 **且** 已启用」的文档才有完整、可检索的分块可喂给 Wiki。
+     * ⚠️ 不包含 {@code finalizing}：那种状态的文档分块虽已落库，但后处理
+     * （摘要/问句/Wiki 自己）还在跑，此时再喂给 Wiki 会读到半成品。
+     *
+     * @param kb 知识库 ID
+     * @return 文档 ID 列表（可能为空）
+     */
+    private List<String> listGeneratableKnowledgeIds(String kb) {
+        List<KbKnowledgeRecord> rows = knowledgeMapper.selectListByQuery(
+            QueryWrapper.create()
+                .where("knowledge_base_id = ?", kb)
+                .and("parse_status = ?", "completed")
+                .and("enable_status = ?", "enabled")
+                .orderBy("create_time", true));
+        List<String> out = new ArrayList<>(rows.size());
+        for (KbKnowledgeRecord r : rows) {
+            out.add(r.getId());
+        }
+        return out;
+    }
+
+    /**
+     * 模型解析：请求参数 → {@code wiki_config.synthesis_model_id} → {@code summary_model_id}。
+     *
+     * <p>顺序与 {@code KbPostProcessConfig#resolve} 一致（源侧
+     * {@code wiki_ingest_batch.go:404}「Empty uses summary_model_id」）。
+     *
+     * @return 模型名；全部为空时 {@code null}
+     */
+    private static String resolveRebuildModel(
+        String requested, KbWikiConfig config, KbKnowledgeBaseRecord kb
+    ) {
+        if (requested != null && !requested.isBlank()) {
+            return requested.trim();
+        }
+        if (config.getSynthesisModelId() != null && !config.getSynthesisModelId().isBlank()) {
+            return config.getSynthesisModelId().trim();
+        }
+        if (kb.getSummaryModelId() != null && !kb.getSummaryModelId().isBlank()) {
+            return kb.getSummaryModelId().trim();
+        }
+        return null;
+    }
+
+    private KbKnowledgeBaseRecord requireKb(String kb) {
+        KbKnowledgeBaseRecord row = knowledgeBaseMapper.selectOneById(kb);
+        if (row == null) {
+            throw new com.nexusai.infra.exception.NotFoundException("知识库不存在: " + kb);
+        }
+        return row;
+    }
+
+
     /**
      * 把路径里的两段拼回 slug。
      *
@@ -775,5 +951,57 @@ public class WikiController {
         @JsonProperty("slug") String slug,
         @JsonProperty("path") List<String> path
     ) {
+    }
+
+    /**
+     * 手动生成结果（对齐 {@code GraphRebuildResponse} 的 {@code status} / {@code detail}）。
+     *
+     * <p>⚠️ 前 3 个字段是本批新增，其余直接从 {@code KbWikiIngestService.RunSummary} 映射。
+     *
+     * @param status           {@code done | skipped | failed}
+     * @param detail           人话说明（用户直接看到）
+     * @param docsProcessed    成功处理的文档数
+     * @param docsSkipped      跳过的文档数
+     * @param docsFailed       失败的文档数
+     * @param createdPages     新建页面 slug
+     * @param updatedPages     更新页面 slug
+     * @param rejectedPages    被拒页面数
+     * @param deadLinksRemoved 清理的死链数
+     * @param crossLinksAdded  补的交叉链接数
+     */
+    public record WikiRebuildResponse(
+        @JsonProperty("status") String status,
+        @JsonProperty("detail") String detail,
+        @JsonProperty("docs_processed") int docsProcessed,
+        @JsonProperty("docs_skipped") int docsSkipped,
+        @JsonProperty("docs_failed") int docsFailed,
+        @JsonProperty("created_pages") List<String> createdPages,
+        @JsonProperty("updated_pages") List<String> updatedPages,
+        @JsonProperty("rejected_pages") int rejectedPages,
+        @JsonProperty("dead_links_removed") int deadLinksRemoved,
+        @JsonProperty("cross_links_added") int crossLinksAdded
+    ) {
+        /** 整轮跳过（如「没有已解析完成的文档」「正在生成」）。 */
+        static WikiRebuildResponse skipped(String detail) {
+            return new WikiRebuildResponse(
+                "skipped", detail, 0, 0, 0, List.of(), List.of(), 0, 0, 0);
+        }
+
+        /** 异常失败。 */
+        static WikiRebuildResponse failed(String detail) {
+            return new WikiRebuildResponse(
+                "failed", detail, 0, 0, 0, List.of(), List.of(), 0, 0, 0);
+        }
+
+        /** 正常结束（done / skipped）· 逐字段映射 RunSummary。 */
+        static WikiRebuildResponse of(
+            String status, String detail, KbWikiIngestService.RunSummary s
+        ) {
+            return new WikiRebuildResponse(
+                status, detail,
+                s.docsProcessed(), s.docsSkipped(), s.docsFailed(),
+                s.createdPages(), s.updatedPages(), s.rejectedPages(),
+                s.deadLinksRemoved(), s.crossLinksAdded());
+        }
     }
 }

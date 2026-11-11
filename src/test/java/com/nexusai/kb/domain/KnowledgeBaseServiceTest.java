@@ -225,6 +225,72 @@ class KnowledgeBaseServiceTest {
 
     // ── 用例 5：基础 CRUD ─────────────────────────────────────────────
 
+    /**
+     * ⭐ 回归守护：`indexing_strategy` / `wiki_config` 必须**出站**。
+     *
+     * <p><b>WHY 这条必须存在</b>：前端靠 {@code indexing_strategy.wiki_enabled} 决定
+     * Wiki / 图谱 tab 是否显示（源站 `KnowledgeBase.vue:99` 的 isWiki 判据）。
+     * DTO 一旦漏掉这个字段，那两个 tab 就**永远隐藏**，而且：
+     * 接口 200、字段缺失、控制台零报错 —— 只是「功能不见了」。
+     * 这正是本仓栽过多次的「配置字段零生产者 / 半截接线」型静默缺陷。
+     */
+    @Test
+    @DisplayName("⭐ indexing_strategy 与 wiki_config 必须出站（否则 Wiki/图谱 tab 永远隐藏）")
+    void indexingStrategyIsReturned() {
+        KnowledgeBaseDto created = service.create(new CreateKnowledgeBaseRequest(
+            "wiki开关库", null, "document", null, "e", "s"));
+
+        // 新建时两列为空 ⇒ DTO 值为 null，但**字段必须在**（不是被 DTO 丢掉）
+        assertThat(created.indexingStrategy()).isNull();
+        assertThat(created.wikiConfig()).isNull();
+
+        // 写进去再读回来 —— 证明 toDto 真的搬运了这两列
+        String strategy = "{\"wiki_enabled\":true,\"graph_enabled\":false}";
+        com.fasterxml.jackson.databind.node.ObjectNode body =
+            new com.fasterxml.jackson.databind.ObjectMapper().createObjectNode();
+        body.put("indexing_strategy", strategy);
+        service.patch(created.id(), body);
+
+        KnowledgeBaseDto after = service.list().stream()
+            .filter((b) -> created.id().equals(b.id()))
+            .findFirst()
+            .orElseThrow();
+        assertThat(after.indexingStrategy())
+            .as("indexing_strategy 读不回来 ⇒ 前端拿不到 wiki_enabled ⇒ Wiki/图谱 tab 永久隐藏")
+            .isEqualTo(strategy);
+    }
+
+    @Test
+    @DisplayName("⭐ 创建时就带 indexing_strategy ⇒ Wiki 开关落库（源侧创建流程，不靠事后 patch）")
+    void createAcceptsIndexingStrategy() {
+        String strategy = "{\"vector_enabled\":true,\"keyword_enabled\":true,"
+            + "\"wiki_enabled\":true,\"graph_enabled\":false}";
+
+        KnowledgeBaseDto created = service.create(new CreateKnowledgeBaseRequest(
+            "建库即开Wiki", null, "document", null, "e", "s", strategy));
+
+        assertThat(created.indexingStrategy())
+            .as("源侧创建时同一个请求就带 indexing_strategy（KnowledgeBaseEditorModal.vue:1690）；"
+                + "只能事后 patch 的话，前端那个「Wiki 知识库」勾选框就只能灰置")
+            .isEqualTo(strategy);
+
+        // 回读确认真的落库了，不是只在返回的 DTO 上
+        KnowledgeBaseDto reread = service.list().stream()
+            .filter((b) -> created.id().equals(b.id()))
+            .findFirst()
+            .orElseThrow();
+        assertThat(reread.indexingStrategy()).isEqualTo(strategy);
+    }
+
+    @Test
+    @DisplayName("创建时 indexing_strategy 不是 JSON 对象 ⇒ 400（⛔ 不静默存脏数据）")
+    void createRejectsNonJsonIndexingStrategy() {
+        assertThatThrownBy(() -> service.create(new CreateKnowledgeBaseRequest(
+            "坏策略库", null, "document", null, "e", "s", "not-json")))
+            .isInstanceOf(ValidationException.class)
+            .hasMessageContaining("JSON 对象");
+    }
+
     @Test
     @DisplayName("创建 → 查询 → 更新 → 查询，update_time 会变")
     void createReadUpdate() {

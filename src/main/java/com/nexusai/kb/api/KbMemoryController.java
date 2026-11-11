@@ -23,7 +23,13 @@ import java.util.Map;
  * 而<b>没有暴露 REST 端点</b>，排期里却记成「16 端点」。W12 契约校验
  * （{@code validate_contracts.py}）把这条差异照出来了 —— 本类补上。
  *
- * <p><b>路径与源侧一一对应</b>（{@code routes_memory.go:21-38}）：
+ * <p><b>URL 前缀</b>：{@code /api/v1/kb/memory}。带 {@code kb} 段是刻意隔离 ——
+ * {@code com.nexusai.apis.memory.MemoryController}（AgentLoop 的 {@code /files}、{@code /config}）
+ * 占用 {@code /api/v1/memory}，而知识库长期记忆与客户端长期记忆是<b>两套无关数据</b>
+ * （用户 2026-11-08 拍板：启用开关读 {@code user_enabled}、写 {@code PUT /kb/memory/settings}）。
+ * 两套前缀分开后，URL 空间不再混在一起，改名/下线一侧不会误伤另一侧。
+ *
+ * <p><b>路径与源侧一一对应</b>（{@code routes_memory.go:21-38}；下表是前缀之后的相对路径）：
  * <pre>
  * GET    /memory/settings            PUT /memory/settings
  * GET    /memory/items               POST /memory/items          DELETE /memory/items
@@ -38,7 +44,7 @@ import java.util.Map;
  * （与 W9 服务层一致）；接入多用户时只改那一处。
  */
 @RestController
-@RequestMapping("/api/v1/memory")
+@RequestMapping("/api/v1/kb/memory")
 public class KbMemoryController {
 
     private static final Logger log = LoggerFactory.getLogger(KbMemoryController.class);

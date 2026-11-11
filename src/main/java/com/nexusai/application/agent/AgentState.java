@@ -150,7 +150,7 @@ public class AgentState {
     /**
      * 最大轮数 · CC original: {@code maxTurns} (query.ts:190).
      * <p><b>OD-11 对齐 CC 无默认</b>：null = 无限轮（CC 不设默认值，调用方不传则无上限）。
-     * 旧默认 8 已删（三处统一：LlmAgentLoop / SubagentExecutor / ProductionForkedQuery）。
+     * 旧默认 8 已删（三处统一：LlmAgentLoop / SubagentExecutor / fork 隔离 AgentState）。
      */
     private Integer maxTurns = null;
 

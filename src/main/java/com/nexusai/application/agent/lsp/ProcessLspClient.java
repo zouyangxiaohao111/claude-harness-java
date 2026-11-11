@@ -2,6 +2,7 @@ package com.nexusai.application.agent.lsp;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
+import com.nexusai.infra.util.ExecutableResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -63,13 +64,31 @@ public class ProcessLspClient implements LspClient {
         Objects.requireNonNull(command, "command required");
         state.set(State.STARTING);
         try {
-            ProcessBuilder pb = new ProcessBuilder(concat(command, args));
+            // [LSP-WIN-1] Windows 裸命令名 → 真实可执行文件路径。
+            //   与 MCP 的 StdioMcpTransport 同源问题：ProcessBuilder 不认 PATHEXT，
+            //   npm 全局装的 LSP server（如 typescript-language-server）只产出 .cmd，
+            //   传裸名会 CreateProcess error=2。详见 ExecutableResolver。
+            //
+            //   解析必须按【子进程实际生效的环境】做：父进程 env 叠加调用方传入的 env。
+            //   若只用 System.getenv()，调用方用 env 覆盖 PATH 时（如指向自带 node_modules/.bin）
+            //   会解析到错误的目录，与子进程实际 PATH 不一致。
+            Map<String, String> effectiveEnv = new java.util.HashMap<>(System.getenv());
+            if (env != null) {
+                effectiveEnv.putAll(env);
+            }
+            String resolvedCommand = ExecutableResolver.resolve(
+                command, System.getProperty("os.name", ""), effectiveEnv,
+                p -> java.nio.file.Files.isRegularFile(p));
+            if (!resolvedCommand.equals(command)) {
+                log.info("[ProcessLspClient] 已解析命令 '{}' → '{}'", command, resolvedCommand);
+            }
+            ProcessBuilder pb = new ProcessBuilder(concat(resolvedCommand, args));
             pb.redirectErrorStream(false);
             if (cwd != null) pb.directory(new java.io.File(cwd));
             if (env != null) pb.environment().putAll(env);
             this.process = pb.start();
             log.info("[ProcessLspClient] started cmd={} args={} pid={}",
-                command, java.util.Arrays.toString(args), process.pid());
+                resolvedCommand, java.util.Arrays.toString(args), process.pid());
             startStdoutReader();
             state.set(State.READY);
         } catch (IOException e) {

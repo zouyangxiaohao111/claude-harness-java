@@ -284,6 +284,19 @@ fn show_main_window(app: &tauri::AppHandle) {
     }
 }
 
+/// [2026-11-09] 把主窗口拉到前台（显示 + 取消最小化 + 置前聚焦）。
+///
+/// <h2>WHY 需要暴露成 command</h2>
+/// 托盘菜单唤回窗口走的是 Rust 内部（{@link show_main_window}），但**系统通知的点击**
+/// 发生在前端（{@code @tauri-apps/plugin-notification} 的 {@code onAction} 事件）⇒ 前端必须
+/// 能主动把窗口拉回前台，否则用户点了通知什么也没发生（窗口仍在后台/最小化）。
+///
+/// <p>幂等：窗口已在前台时重复调用无副作用。
+#[tauri::command]
+fn show_main_window_command(app: tauri::AppHandle) {
+    show_main_window(&app);
+}
+
 /// 查找本机 Chrome / Chromium 可执行文件。
 /// Windows：Program Files / Program Files (x86) / %LOCALAPPDATA%；
 /// macOS：/Applications/Google Chrome.app；
@@ -514,7 +527,8 @@ fn main() {
             error_report::report_startup_error,
             frontlog::frontend_log,
             frontlog::frontend_heartbeat,
-            update_tray_recent
+            update_tray_recent,
+            show_main_window_command
         ])
         .setup(|app| {
             // [2026-11-04 用户裁定] 系统托盘：「点 X 隐藏到托盘」，托盘右键菜单才有「退出」。

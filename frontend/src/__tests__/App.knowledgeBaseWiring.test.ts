@@ -21,6 +21,8 @@ const PAGE_TSX = fileURLToPath(new URL('../components/knowledge/KnowledgeBasePag
 /** 文档区（2026-11-06 拆出：文件夹树/筛选/标签/网格列表/批量全在这里） */
 const DOC_PANEL_TSX = fileURLToPath(new URL('../components/knowledge/KnowledgeDocPanel.tsx', import.meta.url))
 const CSS = fileURLToPath(new URL('../styles/globals.css', import.meta.url))
+/** 知识库独立窗口（Tauri 系统窗口，可拖到别的屏幕） */
+const KB_WINDOW_UTIL = fileURLToPath(new URL('../utils/kbWindow.ts', import.meta.url))
 
 function src(p: string): string {
   return readFileSync(p, 'utf8').replace(/\r\n?/g, '\n')
@@ -33,8 +35,10 @@ describe('知识库入口接线（源码级）', () => {
       .split('\n')
       .find((l) => l.includes('onOpenKnowledgeBase'))
     expect(line, '找不到 onOpenKnowledgeBase（入口被删？）').toBeTruthy()
-    // 2026-11-06 用户裁定：知识库是**独立场景**，用浮层承载，⛔ 不再换页
-    expect(line).toContain('setShowKnowledge(true)')
+    // 2026-11-06：知识库是**独立场景**，⛔ 不换页（原先用浮层承载）。
+    // 2026-11-09 用户改判：「点开默认就是独立窗口」⇒ 入口改为开 Tauri 系统窗口，
+    //   浮层只作为「独立窗开不出来」的兜底。所以这里断言的是「不再是 toast 占位」，
+    //   具体的入口形态由下面那条「默认开独立窗口」用例守。
     expect(line, '入口退回 toast 占位 = 用户报过的缺陷复发').not.toContain('建设中')
   })
 
@@ -46,8 +50,10 @@ describe('知识库入口接线（源码级）', () => {
     expect(app).toContain('kb-scene-overlay')
     expect(app).toContain('kb-scene-panel')
     // 面板里真的渲染页面，并传了关闭回调
-    // 面板内先渲染场景侧栏（KbSceneNav）再渲染页面 ⇒ 放宽窗口，但必须两者都在
-    expect(app).toMatch(/kb-scene-panel[\s\S]{0,2000}<KnowledgeBasePage/)
+    // 面板内先渲染场景侧栏（KbSceneNav）再渲染页面 ⇒ 必须两者都在，且顺序如此
+    // ⚠️ 窗口别卡太死：2026-11-09 在 KbSceneNav 之前插了拖动把手 + ✕ 按钮，
+    //    原来 2000 字符窗口就不够了（这不是结构退化，只是多了两个控件）。
+    expect(app).toMatch(/kb-scene-panel[\s\S]{0,4000}<KnowledgeBasePage/)
     expect(app, '场景侧栏缺失 ⇒ 弹窗里没有设计稿那 7 个菜单项').toContain('<KbSceneNav')
     expect(app).toContain('onRequestClose={() => setShowKnowledge(false)}')
   })
@@ -68,6 +74,159 @@ describe('知识库入口接线（源码级）', () => {
     const css = src(CSS)
     expect(css).toContain('.kb-scene-overlay')
     expect(css).toContain('.kb-scene-panel')
+  })
+})
+
+/**
+ * 非模态可拖动浮层（用户 2026-11-09 裁定）。
+ *
+ * <p><b>WHY（用户原话）</b>：「知识库弹窗应该用户主动关闭才关闭 并且它不影响我们输入
+ * 对话其他住会话的」+「保留弹窗但是能够移动」+「只留 ✕（Esc 也不响应）」。
+ *
+ * <p>改之前是**全屏黑遮罩 + aria-modal**：主对话既看不见也点不到（遮罩 `inset:0`
+ * 吃掉所有点击），用户想「一边聊天一边看知识库」做不到。
+ *
+ * <p><b>为什么是源码断言</b>：同上一组 —— App.tsx 是巨型组件，jsdom 挂载代价过高，
+ * 而被测的是「几个属性有没有写对」。失效方式全是静默的：`pointer-events` 写错
+ * ⇒ 点击被吃但界面看起来完全一样；`aria-modal` 留着 ⇒ 读屏软件把主对话标成不可用，
+ * 肉眼永远发现不了。
+ */
+describe('知识库浮层是「非模态 + 可拖动 + 只留 ✕」（2026-11-09 用户裁定）', () => {
+  it('⭐ 不能再点遮罩关闭（唯一关闭入口 = ✕）', () => {
+    const app = src(APP_TSX)
+    // 旧的 `onClick={(e) => { if (e.target === e.currentTarget) setShowKnowledge(false) }}`
+    // 是最容易手滑的一条（面板很大，边缘一点就没了）
+    const overlayBlock = app.slice(
+      app.indexOf('className="kb-scene-overlay"'),
+      app.indexOf('className="kb-scene-panel')
+    )
+    // ⚠️ 判据必须是「这一段里有没有 real onClick」，不能靠切到 `>` 之前 ——
+    //    `<div className="..." onClick=...>` 的 onClick 在 `>` **之前**，
+    //    切到引号结束就把它切掉了（第一次写这条断言就是这么假绿的）。
+    expect(overlayBlock, '遮罩上还挂着点击关闭 ⇒ 用户会手滑丢上下文')
+      // ⚠️ 不能用 `[^>]*`：箭头函数 `{(e) => ...}` 里就有 `>`，正则会在这里停住 ⇒ 假绿。
+      //    用 `[\s\S]*?` 跨行匹配，并要求「同一个 onClick 属性内」出现关闭调用。
+      .not.toMatch(/onClick=\{[\s\S]{0,200}?setShowKnowledge\(false\)/)
+    // ✕ 必须在
+    expect(app).toContain('kb-scene-close')
+    expect(app).toMatch(/kb-scene-close[\s\S]{0,400}setShowKnowledge\(false\)/)
+  })
+
+  it('⭐ Esc 不响应（面板里输入框按 Esc 是「取消输入」，不能连带关场景）', () => {
+    const app = src(APP_TSX)
+    // 允许出现在注释里，但**不能有真实的 hook 调用**
+    const liveCalls = app
+      .split('\n')
+      .filter((l) => l.includes('useEscapeKey(showKnowledge'))
+    expect(liveCalls, '还挂着 useEscapeKey(showKnowledge, ...) ⇒ 输入框里按 Esc 会关掉整个场景')
+      .toHaveLength(0)
+  })
+
+  it('⭐ 非模态：不能写 aria-modal（写了就会误导读屏软件）', () => {
+    const app = src(APP_TSX)
+    // ⚠️ 不能在源码里找 `aria-modal` 字样：注释里为了说明「为什么不能写」必然会提到它
+    //    （第一次写这条断言就是这么假红的）。改为剥离注释后再查。
+    const stripped = app
+      .replace(/\/\*[\s\S]*?\*\//g, '')     // 块注释
+      .replace(/^\s*\/\/.*$/gm, '')        // 行注释
+    const i = stripped.indexOf('role="dialog"')
+    expect(i, '找不到 role="dialog"').toBeGreaterThan(0)
+    const attrBlock = stripped.slice(i, i + 300)
+    expect(attrBlock, 'aria-modal 在非模态浮层上是错的').not.toContain('aria-modal=')
+  })
+
+  it('⭐ 覆盖层必须 pointer-events:none（否则背景透明也照样吃掉主对话的点击）', () => {
+    const css = src(CSS)
+    const block = css.slice(
+      css.indexOf('.kb-scene-overlay {'),
+      css.indexOf('.kb-scene-panel {')
+    )
+    expect(block, '覆盖层没有 pointer-events:none ⇒ 点不到主对话输入框')
+      .toMatch(/pointer-events:\s*none/)
+    // 而面板本身必须 auto，否则整个面板都点不动
+    const panelCss = css.slice(
+      css.indexOf('.kb-scene-panel {'),
+      css.indexOf('.kb-scene-panel {') + 600
+    )
+    expect(panelCss).toMatch(/pointer-events:\s*auto/)
+  })
+
+  it('⭐ 遮罩不能再有实色背景（半透明黑会盖住主对话）', () => {
+    const css = src(CSS)
+    const block = css.slice(
+      css.indexOf('.kb-scene-overlay {'),
+      css.indexOf('.kb-scene-panel {')
+    )
+    expect(block).toMatch(/background:\s*transparent/)
+    expect(block, '半透明黑回来了 ⇒ 「一边聊天一边看」又做不到').not.toMatch(/rgba\(\s*0\s*,\s*0\s*,\s*0/)
+  })
+
+  it('⭐ 面板有拖动位移（transform 由 kbDrag 驱动）', () => {
+    const app = src(APP_TSX)
+    expect(app).toContain('kb-scene-drag-handle')
+    expect(app).toMatch(/const \[kbDrag, setKbDrag\] = useState/)
+    expect(app).toMatch(/transform: `translate\(\$\{kbDrag\.x\}px, \$\{kbDrag\.y\}px\)`/)
+  })
+
+  it('⭐ 拖动把手必须是面板的子元素（放 overlay 下会按视口定位、拖不动）', () => {
+    const app = src(APP_TSX)
+    // 实测踩过：把手放在 overlay 下 ⇒ 宽 1876px、x=0，与面板错位且 pointerdown 无效
+    const panelIdx = app.indexOf('className="kb-scene-panel kb-scope"')
+    const handleIdx = app.indexOf('className="kb-scene-drag-handle"')
+    expect(panelIdx, '找不到面板').toBeGreaterThan(0)
+    expect(handleIdx, '找不到把手').toBeGreaterThan(0)
+    expect(handleIdx, '把手必须在面板标签**之后**（= 面板的子元素）')
+      .toBeGreaterThan(panelIdx)
+  })
+
+  it('⭐⭐ 拖动必须同时挂 mouse 与 pointer（只挂 pointer ⇒ 某些环境整个拖拽是死的）', () => {
+    const app = src(APP_TSX)
+    const i = app.indexOf('className="kb-scene-drag-handle"')
+    expect(i, '找不到拖动条').toBeGreaterThan(0)
+    const block = app.slice(i, i + 600)
+
+    // 实测事故：该渲染环境真实鼠标按下只产生 mousedown，**一条 pointerdown 都没有**
+    // ⇒ 只挂 onPointerDown 时「按住拖动」完全没反应（用户报「无法移动」）。
+    // 合成 PointerEvent 测试查不出这个问题，所以这里只能做源码级断言。
+    expect(block, '缺 onMouseDown ⇒ 不派发 Pointer Events 的环境拖不动')
+      .toContain('onMouseDown')
+    expect(block, '缺 onPointerDown ⇒ 支持 Pointer 的环境少了高精度路径')
+      .toContain('onPointerDown')
+
+    // 两套都会派发的环境里必须去重，否则位移翻倍。去重标志必须是 **ref**（state 是异步的）
+    expect(app).toMatch(/kbDragActiveRef/)
+    expect(app, '去重不能用 state：同帧内第二次进来时 state 还没更新')
+      .toMatch(/const kbDragActiveRef = useRef\(/)
+  })
+
+  it('⭐ 拖动必须有边界夹取（否则整块拖出视口就再也点不到）', () => {
+    const app = src(APP_TSX)
+    expect(app, '没有 clamp ⇒ 面板可被拖到屏幕外').toMatch(/const clamp = /)
+    expect(app).toMatch(/window\.innerWidth - baseX/)
+  })
+
+  it('⭐⭐ 点「知识库」默认开独立窗口（页面元素无法移出 WebView，必须开系统窗口）', () => {
+    const app = src(APP_TSX)
+    // ⚠️ 入口已经是一段多行箭头函数，不能只看 `.find()` 那一行（`openKnowledgeWindow`
+    //    在下面几行）。取入口到下一个 prop 之间的一段。
+    const i = app.indexOf('onOpenKnowledgeBase')
+    expect(i, '找不到知识库入口').toBeGreaterThan(0)
+    const block = app.slice(i, i + 500)
+    // 用户 2026-11-09：「点开默认就是独立窗口」
+    expect(block, '入口没走独立窗口 ⇒ 点开还是浮层').toContain('openKnowledgeWindow')
+  })
+
+  it('⭐ 独立窗口开不出来时必须退回浮层（⛔ 不能点了没反应）', () => {
+    const app = src(APP_TSX)
+    const i = app.indexOf('onOpenKnowledgeBase')
+    const block = app.slice(i, i + 900)
+    expect(block, '缺 !ok 兜底 ⇒ 弹窗被拦时用户点了什么都没有').toMatch(/if \(!ok\)/)
+    expect(block).toContain('setShowKnowledge(true)')
+  })
+
+  it('⭐ 独立窗口用系统标题栏（否则无边框窗只能 Alt+F4 关、也无法系统级拖到别的屏）', () => {
+    const win = src(KB_WINDOW_UTIL)
+    expect(win).toMatch(/decorations:\s*true/)
   })
 })
 

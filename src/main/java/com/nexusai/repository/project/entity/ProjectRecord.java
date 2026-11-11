@@ -13,6 +13,8 @@ public class ProjectRecord {
     private Integer agents;
     private String lastIndexedAt;
     private Boolean bound;
+    /** V280 · 注册时间（UTC ISO-8601，Z 结尾）· 左栏项目分组序唯一依据（注册先后，排完不动）。 */
+    private String createdAt;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -30,4 +32,6 @@ public class ProjectRecord {
     public void setLastIndexedAt(String lastIndexedAt) { this.lastIndexedAt = lastIndexedAt; }
     public Boolean getBound() { return bound; }
     public void setBound(Boolean bound) { this.bound = bound; }
+    public String getCreatedAt() { return createdAt; }
+    public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
 }

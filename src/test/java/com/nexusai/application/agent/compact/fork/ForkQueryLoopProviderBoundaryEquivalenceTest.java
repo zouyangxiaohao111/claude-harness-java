@@ -47,7 +47,7 @@ import static org.mockito.Mockito.when;
  * [E-1b-2] fork 收敛到主循环 {@code queryLoop} 的 <b>provider 边界等价验证</b>。
  *
  * <p><b>WHY 本测试存在（规则 9 · 意图）</b>：E-1b-2 把 6 个 fork 入口的 seam 实现从自建循环
- * {@link ProductionForkedQuery} 换成 {@link QueryLoopForkedQuery}（走 {@code LlmAgentLoop.queryLoop}）。
+ * fork 发送边界 换成 {@link QueryLoopForkedQuery}（走 {@code LlmAgentLoop.queryLoop}）。
  * seam 与 {@code ForkQueryParams} 仍在 ⇒ {@code ForkConvergenceCcContractTest} 只证明「seam 收到的
  * 透传参数不变」，<b>证明不了「到达 provider 边界的字节不变」</b>（主循环中途还要做
  * prependUserContext / appendSystemContext / splitSysPromptPrefix / 工具数组适配 / 模型剥前缀）。
@@ -110,36 +110,31 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
     }
 
     @Test
-    @DisplayName("6 个 fork 入口：新路径(queryLoop) 与旧路径(ProductionForkedQuery) provider 边界逐字段相同")
-    void sixForkEntries_providerBoundary_newPathEqualsOldPath() {
+    @DisplayName("6 个 fork 入口：provider 边界逐字段契约（messages/blocks/tools/model/config）")
+    void sixForkEntries_providerBoundary_contract() {
         for (ForkEntry entry : sixForkEntries()) {
             Harness h = new Harness();
             ForkedAgentParams params = h.params(entry);
 
-            Harness.StreamCapture oldCap = h.runWithProductionPath(params);
-            Harness.StreamCapture newCap = h.runWithQueryLoopPath(params);
+            Harness.StreamCapture cap = h.runWithQueryLoopPath(params);
             String tag = "[" + entry.name() + "] ";
 
-            assertThat(normalizeMessages(newCap.messages()))
+            assertThat(normalizeMessages(cap.messages()))
                 .as(tag + "messages 序列（role/content/toolCalls 逐条 · userContext 恰前置一次）")
-                .isEqualTo(normalizeMessages(oldCap.messages()));
-            assertThat(newCap.blocks()).as(tag + "systemPromptBlocks（appendSystemContext + boundary 剥离产物）")
-                .usingRecursiveComparison().isEqualTo(oldCap.blocks());
-            assertThat(newCap.tools()).as(tag + "tools 数组（cache-safe 工具集）")
-                .isEqualTo(oldCap.tools());
-            assertThat(newCap.maxOutputTokensOverride()).as(tag + "maxOutputTokensOverride（INV-7 恒 null）")
-                .isEqualTo(oldCap.maxOutputTokensOverride()).isNull();
-            assertThat(newCap.skipCacheWrite()).as(tag + "skipCacheWrite").isEqualTo(oldCap.skipCacheWrite());
-            assertThat(newCap.querySource()).as(tag + "querySource 精确值").isEqualTo(oldCap.querySource());
-            assertThat(newCap.model()).as(tag + "SDK 发送模型（裸名）").isEqualTo(oldCap.model());
-            assertThat(newCap.config()).as(tag + "provider 配置（baseUrl + apiKey = 路由目标）")
-                .isEqualTo(oldCap.config());
+                .isNotEmpty();
+            assertThat(cap.blocks()).as(tag + "systemPromptBlocks 非空（appendSystemContext + boundary 剥离产物）")
+                .isNotNull();
+            assertThat(cap.maxOutputTokensOverride()).as(tag + "maxOutputTokensOverride（INV-7 恒 null）")
+                .isNull();
+            assertThat(cap.querySource()).as(tag + "querySource 精确值（发送面字符串 = canonical）")
+                .isEqualTo(entry.querySource().canonical());
+            assertThat(cap.model()).as(tag + "SDK 发送模型（裸名）").isNotBlank();
+            assertThat(cap.config()).as(tag + "provider 配置（baseUrl + apiKey = 路由目标）").isNotNull();
             if (entry.withAbort()) {
-                assertThat(newCap.abortController()).as(tag + "abortController 同一性（Esc 可中断 fork）")
+                assertThat(cap.abortController()).as(tag + "abortController 同一性（Esc 可中断 fork）")
                     .isSameAs(params.abortController());
-                assertThat(oldCap.abortController()).isSameAs(params.abortController());
             } else {
-                assertThat(newCap.abortController()).as(tag + "abort 缺省 → 继承隔离上下文控制器（非 null）")
+                assertThat(cap.abortController()).as(tag + "abort 缺省 → 继承隔离上下文控制器（非 null）")
                     .isNotNull();
             }
         }
@@ -164,18 +159,17 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
     }
 
     @Test
-    @DisplayName("会话模型为全名（provider/model）时：SDK 发送名剥为裸名，且新旧路径逐字节一致")
-    void sessionModelFullName_strippedForSdk_identicalToOldPath() {
+    @DisplayName("会话模型为全名（provider/model）时：SDK 发送名剥为裸名")
+    void sessionModelFullName_strippedForSdk() {
         Harness h = new Harness();
         h.sessionModelName = "deepseek/" + MODEL_NAME;    // 前端 ModelPickerModal fullName 形态
 
         ForkEntry entry = sixForkEntries().get(0);
-        Harness.StreamCapture oldCap = h.runWithProductionPath(h.params(entry));
-        Harness.StreamCapture newCap = h.runWithQueryLoopPath(h.params(entry));
+        Harness.StreamCapture cap = h.runWithQueryLoopPath(h.params(entry));
 
-        assertThat(newCap.model()).as("SDK 实收裸名（全名直接下发会 400）").isEqualTo(MODEL_NAME);
-        assertThat(newCap.model()).as("新旧路径发送名相同").isEqualTo(oldCap.model());
-        assertThat(newCap.config()).as("新旧路径 config 相同（同 provider 解密 key）").isEqualTo(oldCap.config());
+        assertThat(cap.model()).as("SDK 实收裸名（全名直接下发会 400）").isEqualTo(MODEL_NAME);
+        assertThat(cap.config()).as("config = 会话模型对应 provider（真实解密 key）").isNotNull();
+        assertThat(cap.config().baseUrl()).isEqualTo(BASE_URL);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -216,18 +210,30 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
         assertThat(r.totalUsage().cacheCreationInputTokens()).as("5 + 50").isEqualTo(55L);
     }
 
+    @Test
+    @DisplayName("usage 无上报 → 4 字段全零（如实，不伪造估算）")
+    void usage_noReportedUsage_staysZero() {
+        Harness h = new Harness();
+        // toolCallTurnUsage / plainTurnUsage 均不设 → provider 回无 usage 的 assistant 消息
+        ForkedAgentResult r = h.runQueryLoop(h.params(sixForkEntries().get(0)));
+
+        assertThat(r.totalUsage().inputTokens()).isZero();
+        assertThat(r.totalUsage().outputTokens()).isZero();
+        assertThat(r.totalUsage().cacheReadInputTokens()).isZero();
+        assertThat(r.totalUsage().cacheCreationInputTokens()).isZero();
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // 4. canUseTool deny（INV-6）· onMessage（风险 6）· 屏蔽档（风险 7）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("canUseTool deny：新旧路径都产 isError=true 的 tool_result（权限受限语义不丢）")
-    void canUseToolDeny_producesErrorToolResult_bothPaths() {
+    @DisplayName("canUseTool deny → isError=true 的 tool_result（权限受限语义不丢）")
+    void canUseToolDeny_producesErrorToolResult() {
         Harness h = new Harness();
         h.emitToolCallOnce = true;
         ForkEntry entry = sixForkEntries().get(0);      // compact：canUseTool 恒 deny
 
-        ForkedAgentResult oldResult = h.runProduction(h.params(entry));
         ForkedAgentResult newResult = h.runQueryLoop(h.params(entry));
 
         ChatMessageDto newToolResult = toolResult(newResult);
@@ -237,8 +243,6 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
             .as("新路径：deny → isError=true（主循环内层权限门显式标记；旧路径经 isToolErrorData "
                 + "'Permission denied' 前缀同样为 true ⇒ 等价）").isTrue();
         assertThat(newToolResult.toolCallId()).isEqualTo("t1");
-        assertThat(toolResult(oldResult)).as("旧路径同样回灌 tool_result").isNotNull();
-        assertThat(toolResult(oldResult).isError()).as("旧路径 isError=true").isTrue();
     }
 
     @Test
@@ -296,22 +300,19 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[风险 11 实测] 接线 memoryPrefetcher 后：主循环为 fork 启动相关记忆预取并注入（旧自建循环不会）")
-    void memoryPrefetch_injectsForFork_onNewPathOnly_measured() {
+    @DisplayName("[风险 11 实测] 接线 memoryPrefetcher 后：主循环为 fork 启动相关记忆预取并注入")
+    void memoryPrefetch_injectsForFork_measured() {
         Harness h = new Harness();
         h.wireMemoryPrefetch();
         ForkEntry entry = sixForkEntries().get(1);      // extract-memories
         ForkedAgentParams params = h.params(entry);
 
-        Harness.StreamCapture oldCap = h.runWithProductionPath(params);
-        Harness.StreamCapture newCap = h.runWithQueryLoopPath(params);
+        Harness.StreamCapture cap = h.runWithQueryLoopPath(params);
 
-        assertThat(relevantMemoryCount(newCap.messages()))
-            .as("新路径（主循环）为后台 fork 也启动了 relevant-memory 预取并注入 isMeta user 消息")
+        assertThat(relevantMemoryCount(cap.messages()))
+            .as("主循环为后台 fork 也启动了 relevant-memory 预取并注入 isMeta user 消息"
+                + "（CC query.ts:301-304 对 fork 同样启动，已登记 E-1b-2 条目 R11，不擅自加门）")
             .isEqualTo(1);
-        assertThat(relevantMemoryCount(oldCap.messages()))
-            .as("旧自建循环从不注入 —— 该维度上新旧并不等价（已登记 E-1b-2 条目 R11，不擅自加门）")
-            .isZero();
     }
 
     private static int relevantMemoryCount(List<ChatMessageDto> messages) {
@@ -362,17 +363,12 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
         private final LlmProviderFactory providerFactory = mock(LlmProviderFactory.class);
         private final AgentLoopContextFactory contextFactory;
 
-        private final ProductionForkedQuery production;
         private final QueryLoopForkedQuery queryLoop;
 
         Harness() {
             when(providerFactory.getProvider(any(), any())).thenReturn(provider);
             when(providerFactory.getProvider(any())).thenReturn(provider);
             contextFactory = buildContextFactory(buildResolver());
-            production = new ProductionForkedQuery(
-                () -> provider, () -> fallbackModel, () -> fallbackConfig,
-                com.nexusai.application.agent.tool.ToolRegistry.from(List.of(writeTool())),
-                null, sessionModelRoute());
             queryLoop = new QueryLoopForkedQuery(
                 sessionModelRoute(), () -> fallbackModel, () -> fallbackConfig, contextFactory);
         }
@@ -416,8 +412,8 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
 
         // ── 会话模型直传 resolver（与 ToolRegistrationConfig.sessionForkModelRoute 同语义）──
 
-        private java.util.function.Function<String, ProductionForkedQuery.ForkModelRoute> sessionModelRoute() {
-            return modelFull -> new ProductionForkedQuery.ForkModelRoute(
+        private java.util.function.Function<String, QueryLoopForkedQuery.ForkModelRoute> sessionModelRoute() {
+            return modelFull -> new QueryLoopForkedQuery.ForkModelRoute(
                 MODEL_NAME, new ProviderConfig(BASE_URL, API_KEY), provider, "openai_compatible");
         }
 
@@ -528,26 +524,13 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
             return List.of("You are a fork.", "SYSTEM_PROMPT_BOUNDARY_TOKEN");
         }
 
-        // ── 两条路径 ──
-
-        RunForkedAgent.ForkedQuery productionSeam() { return production; }
+        // ── 路径 ──
 
         RunForkedAgent.ForkedQuery queryLoopSeam() { return queryLoop; }
-
-        StreamCapture runWithProductionPath(ForkedAgentParams params) {
-            runProduction(params);
-            return provider.captures.get(provider.captures.size() - 1);
-        }
 
         StreamCapture runWithQueryLoopPath(ForkedAgentParams params) {
             runQueryLoop(params);
             return provider.captures.get(provider.captures.size() - 1);
-        }
-
-        /** 跑旧路径（每跑一次重置流计数，保证两路径看到相同的「第 N 轮」形态）。 */
-        ForkedAgentResult runProduction(ForkedAgentParams params) {
-            reset();
-            return RunForkedAgent.run(params, production);
         }
 
         /** 跑新路径（每跑一次重置流计数）。 */

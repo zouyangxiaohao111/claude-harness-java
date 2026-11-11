@@ -135,7 +135,7 @@ public class KbPostProcessStage {
      * @param knowledge  知识条目（当前只用其 id，保留以备后续按文档定制）
      * @param config     配置
      * @param textChunks 该文档的文本块（按 chunkIndex 升序）
-     * @return 清单（顺序 = 摘要 → 问题批次 → Wiki → 打标）
+     * @return 清单（顺序 = 摘要 → 问题批次 → Wiki → 图谱 → 图片理解 → 打标）
      */
     List<Planned> plan(KbKnowledgeRecord knowledge, KbPostProcessConfig config,
                        List<KbChunkRecord> textChunks) {
@@ -181,6 +181,18 @@ public class KbPostProcessStage {
             Map<String, Object> payload = new LinkedHashMap<>();
             payload.put("model", config.summaryModelId());
             out.add(new Planned(KbIngestTaskRecord.TYPE_GRAPH, true, toJson(payload)));
+        }
+
+        // ③.6 图片理解（caption + OCR）：1 个槽位（每篇文档一轮，一次读完所有图）
+        //
+        // ⭐ 判据只看开关，不看「有没有图」—— 与源侧 `options.EnableMultimodel &&
+        //    len(options.StoredImages) > 0` 的差别：本阶段拿不到图片清单（要查库），
+        //    代价是纯文本文档会多跑一个立刻 skip 的任务（一次查库，无模型调用）。
+        //    ⛔ 反过来「在派发期查库算图片数」会引入第二个真源，与 plan() 的纯函数性质冲突。
+        if (config.image().runnable()) {
+            Map<String, Object> payload = new LinkedHashMap<>();
+            payload.put("model", config.image().modelId());
+            out.add(new Planned(KbIngestTaskRecord.TYPE_IMAGE_UNDERSTAND, true, toJson(payload)));
         }
 
         // ④ 自动打标：不占槽位（失败不能把文档卡在 finalizing）

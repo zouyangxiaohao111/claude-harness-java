@@ -2,6 +2,138 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.67] - 2026-11-09（追加·未递增）
+
+### 文档抽屉：摘要可生成/可编辑 + 自定义元数据可读可写（2026-11-09）
+
+**用户原话**：「点开文档 右边抽屉 摘要应该能够生成（重新）可以编辑」
++ 截图里「自定义元数据」只有一个 `＋`，点了弹「本仓 kb_knowledge 无 metadata 列，暂未接入」。
+
+**那两个「暂未接入」都是错的**：
+- 摘要正文**有落点** —— `KbSummaryService` 写回 `kb_knowledge.description`，
+  ⛔ 不是「只在分块里、抽屉拿不到」（旧注释就是这么误导的）。
+- 元数据**有列有接口** —— `kb_knowledge.custom_metadata` 列存在，
+  `PUT /api/v1/knowledge/{id}` 的 `custom_metadata` 字段也早就在收。
+
+**改了什么**：
+- 摘要区：`编辑`（写 description）+ `重新生成`（新端点 `regenerate-summary`）+ 同步 loading +
+  失败原因翻成可操作提示（`no_summary_model` → 「去设置里配摘要模型」）。
+  ⚠️ 判定用 `summary_status`，⛔ 不能用「有没有 description」—— `failed` 时正文可能还是上一次的旧值。
+- 元数据区：读（`JSON.parse`，脏数据降级为空而非白屏）+ 编辑（增删改 / 四类型 / 上限 20 /
+  数字 `Number.isFinite` 校验）+ 保存。
+  ⚠️ 后端该列是 TEXT 存 JSON 串（`KnowledgeDto.customMetadata: String`）⇒ 必须 `JSON.stringify`，
+  传对象会让后端反序列化失败。
+- 补 `t-icon-info-circle` / `t-icon-add` 两个图标（path 逐字取自 tdesign 官方 tarball）；
+  抽屉里全部改用 `<use>` 引用 sprite，⛔ 不再自绘。
+
+**真机实测**：摘要 → `completed` + 60 字符正文；元数据 → 中文/数字/布尔正确往返，且**不冲掉 description**。
+新增 11 条源码级断言；**2 个变异精确回红**（把 status 判据改成「有无正文」/ 去掉 `JSON.stringify`）。
+
+### 知识库弹窗改成「非模态 + 可拖动 + 只留 ✕」（2026-11-09）
+
+**用户原话**：「知识库弹窗应该用户主动关闭才关闭 并且它不影响我们输入 对话其他住会话的」
+→ 追问后确定：**保留弹窗但是能够移动**、**只留 ✕（Esc 也不响应）**、目标是**一边聊天一边看知识库**。
+
+**改动前的三个问题**：
+1. `.kb-scene-overlay` 是 `position:fixed; inset:0` + `rgba(0,0,0,.30)` 黑遮罩 ⇒ **主对话既看不见也点不到**；
+2. 三条关闭路径里「点遮罩」最容易手滑（面板很大，边缘一点就没了，上下文全丢）；
+3. `useEscapeKey(showKnowledge, ...)` 挂在 window 冒泡阶段 ⇒ 在场景内**任何输入框**按 Esc
+   都会把整个场景关掉（问答提问框 / 文档搜索 / FAQ 编辑器 / 重命名都会中招）。
+
+**改法**：
+- **覆盖层 `pointer-events:none` + `background:transparent`**：面板之外的点击**穿透**给主对话。
+  这是「不影响输入」的关键 —— 只去背景色不加这条，透明层照样吃掉点击。
+- **面板 `pointer-events:auto`** + 新增 **6px 拖动把手**（`kb-scene-drag-handle`），位移由 `kbDrag` 驱动。
+  把手是**面板的子元素**（⚠️ 放 overlay 下会按视口定位 ⇒ 实测宽 1876px、x=0、拖不动）。
+- **只留 ✕**：删掉遮罩 `onClick`、删掉 `useEscapeKey(showKnowledge)`。
+- 去掉 `aria-modal="true"`：非模态浮层写它会让读屏软件把主对话标成不可用。
+
+**验证（真机 + 源码级断言）**：
+- `overlay.bg=rgba(0,0,0,0)` / `overlay.pointerEvents=none` / `panel.pointerEvents=auto` /
+  `panel.aria-modal=null` / `overlay.onclick=null`；
+- 点遮罩**不关**、Esc **不关**（window + document 双路径）；
+- 拖动 `matrix(1,0,0,1,0,0)` → `matrix(1,0,0,1,-600,-243)`；
+- **拖开后输入框可达**：`elementFromPoint()` 命中 `textarea` 本身，`focus()` 与输入均成功，面板**仍开着**；
+- 新增 7 条源码级断言；三个变异（加回遮罩 onClick / 加回 Esc / 去掉 pointer-events）**逐一精确回红**；
+- 前端全量 `1277 passed`（另 2 例为既有失败，已用 HEAD 版对照证明与本次无关）。
+
+**顺手查过「其他会话是否串线」**：知识库是**全局资源**（`GET /knowledge-bases` 无 session 参数），
+弹窗开着切会话不会串库；问答 tab 的 `sessionId` 是 `KbQaPanel` 首次提问时**自建的专用会话**，
+不写主对话 ⇒ **无会话泄漏**。
+
+
+**⭐ 2026-11-09 追加裁定（用户）：点开知识库 = 默认开独立窗口 + 拖动条完全隐藏 + 按钮组对齐副标题**
+
+1. **点「知识库」默认开独立窗口**（原先是先弹浮层）。
+   ⚠️ 技术上必须开新窗口：NexusAI 是 Tauri 应用，**页面元素再怎么 fixed/transform
+   都只能活在主窗口的 WebView 画布内**，移出边界只会被裁掉 ⇒ 不可能出现在另一块显示器上。
+   新增 `utils/kbWindow.ts`（`WebviewWindow` 开窗 + `getByLabel` 复用 + localStorage 传背景态）
+   + `components/knowledge/KbWindowView.tsx`（独立窗口视图，无 overlay/拖动条/✕）
+   + `main.tsx` 的 `#/knowledge-window` 路由分流。
+   可行性依据：`KnowledgeBasePage` 及子组件**不依赖 chat store / session / STOMP**，只用 `knowledgeApi`（HTTP）
+   ⇒ 独立 WebView 无需重连推送、无需同步登录态。
+   **独立窗开不出来**（弹窗被拦 / capability 缺失）时**退回浮层**，⛔ 不能让「点了没反应」。
+2. **独立窗口用系统标题栏**（`decorations: true`）：主窗是无边框窗，但子窗必须显式打开 ——
+   否则没有原生关闭/最小化，也无法用系统级拖拽挪到副屏。
+3. **拖动条完全隐藏**：用户「不应该有个拖动的样式在啊 太丑了」⇒ 删掉 ⠿ 文字与灰底，
+   只保留 28px 热区 + `cursor:grab`（看不到 ≠ 点不到：6px 那版实测点不中）。
+4. **右上按钮组对齐副标题**：`position:relative; top:30px`（实测副标题中心 cy=113、按钮组 cy=113，**差 0**）。
+   ⚠️ 用 relative 而非 `margin-top`：后者会把 `.title-row` 撑高，副标题被一起推走，永远追不上。
+
+**⚠️ 拖动第一版是死的（用户报「无法移动」）—— 真因是只挂了 `onPointerDown`**：
+该环境真实鼠标按下**只产生 `mousedown`，一条 `pointerdown` 都没有**（实测事件序列只有
+`mousedown → mousemove × N → mouseup`）。⇒ 改 **mouse + pointer 双通道** + `kbDragActiveRef`（ref 非 state）去重。
+⚠️ **合成事件测试查不出这个坑**：合成 `PointerEvent` 当然能触发 pointer 处理器，
+上一轮就是靠合成事件「验证通过」的，真实鼠标一拖才发现不动。**涉及输入手势的验证必须用真实鼠标。**
+
+另：拖动加了边界夹取（至少留 80px 在视口内），实测拖到 `(-2000,-2000)` 停 `x=-1356`、右侧仍 84px。
+源码级断言 26 条；变异「关掉 decorations」精确回红。
+
+**⚠️ 拖动第一版是死的（用户报「知识库弹窗无法移动」，2026-11-09 二次修复）**：
+
+三个叠加原因，每个单独都足以让拖动失效：
+1. **只挂 `onPointerDown`** —— 该渲染环境真实鼠标按下**只产生 `mousedown`，一条 `pointerdown` 都没有**
+   （实测整条事件序列只有 `mousedown → mousemove × N → mouseup`）。⇒ 改为 **mouse + pointer 双通道**，
+   并用 `kbDragActiveRef`（**ref 不是 state**：同帧内第二次进来时 state 还没更新）去重，防位移翻倍。
+   ⚠️ **合成事件测试查不出这个坑** —— 合成 `PointerEvent` 当然能触发 pointer 处理器，
+   我上一轮就是靠合成事件「验证通过」的，真实鼠标一拖才发现不动。
+2. **6px + `background:transparent`** —— 用户看不见也点不中。改为 **28px 可见条 + 「⠿ 拖动」字样 + hover 高亮**。
+3. **面板 `height:100%`（1440×897，上下只剩 24px）** —— 就算拖了也看不出位移。
+   改为 `92% / 90vh`，四周留出余量。
+
+另加**边界夹取**：至少留 80px 在视口内（实测拖到 `(-2000,-2000)` 时停在 `x=-1356`、右侧仍有 84px），
+防止整块拖出屏幕后点不到 ✕。
+
+真机复验（**真实鼠标**，非合成事件）：拖动 `1440×851 @ (240,47)` → `(x-324, y+239)` → 再拖 `x=-404` → 再拖 `x=-1356`（夹取生效）。
+新增 2 条源码级断言锁住「必须双通道」与「必须有 clamp」。
+### Fixed
+
+- **「CLI 设置」里默认外部运行时永远回落 claude**（「设为默认」点了没反应、「改回内置」也清不掉）。
+  - **① 值域错配**：面板原先把 `agentType`（`codex-external` 那种 md 的 `name`）发给后端，而后端 `settings.subagentDefaultRuntime` 只认 **runtime id**（`codex`）⇒ 每次都被 400 拒（派发侧也是按 runtime id 反查 agentType ⇒ 两者是两个命名空间）。面板改发 `c.runtime`，并把 `api/subagentRuntimes.ts` 的 `defaultRuntime` 字段注释**改成与实现一致的 runtime id 口径**（原注释写「新语义存 agentType」，是本次 bug 的源头之一）。
+  - **② 失败被当成成功（假成功 toast）**：`App.onSaveSettings` 原本 catch 住异常只弹 toast、**不把失败回传给调用方** ⇒ 面板无从判断成败 ⇒ 后端 400 时界面照样弹「默认子代理已设为 X」，用户以为配好了、DB 纹丝不动。修法：`onSaveSettings` 改为返回 `Promise<boolean>`，面板改成 `if (ok) showToast(...)`；`SettingsModal` / `EnvConfigPanel` / `PluginPanel` / `SubagentRuntimePanel` 的 prop 类型与 5 个既有测试的 mock 同步改。
+  - **③ 后端清空不落库**：MyBatis-Flex `update(entity)` 默认忽略 null 字段 ⇒ 「改回内置」被跳过、DB 留着旧值 ⇒ 清空分支改走 `update(s, false)` 显式写 NULL（详见 backend CHANGELOG 同日条目）。
+  - **验证**：新增 `SubagentRuntimePanel.defaultRuntime.test.tsx`（3 例）+ 变异自证 2 组（写 agentType ⇒ 精确 1 例转红；无条件弹成功 toast ⇒ 精确 1 例转红）。真机验收在隔离实例（3490 / `nexusai-cgtest`）上完成：设 `codex` → DB 落 `codex`；清空 → DB 真落 NULL；传 agentType → 400。
+  - **回归**：前端全量 1266 例中 1264 绿（余 2 例为用户 KB 在途改动 `kb-wiki-loading` / `.kb-qa` 的源码内容断言失败，与本次改动无关）。
+
+
+### Added
+
+- **「工具在等你回答」双通道提示**：AskUserQuestion 类请求到达时，除了原有的对话流问答卡片，新增 ① **右下角常驻浮层** + ② **系统级通知**（Windows 右下角 / macOS 通知中心）。
+  - **WHY 需要它**：提问请求会**阻塞整个轮次**（后端在 `future.get()` 上无限等待，不回答就一直不结束），而问答卡片渲染在**对话流里** ⇒ 两个看不见的场景：① 提问在**后台会话**里等着，用户在另一个会话 ⇒ 卡片根本没渲染，只有侧栏一个黄点；② 当前会话但消息很长，用户滚不到卡片那儿。⇒ 右下角固定浮层，任何会话的提问一到达就能看见，点一下直达。
+  - **浮层只显示非当前会话**（`AskUserPendingHint`）：当前会话的提问已由对话流里的 `PermissionBubble` 承担，右下角再提示一遍是重复噪音 ⇒ 按渲染时的 `activeSessionId` 过滤，用户切到该会话的那一刻浮层自动消失。
+  - **判定口径 = `toolInput.questions` 非空**，不按工具名判：与后端 `WebSocketPermissionPrompter` 自己的诊断日志（第 776 行）同口径，也与 `PermissionBubble` 渲染选择题读的字段一致 ⇒ 三处不会漂移；将来新增别的提问型工具也自动覆盖。
+  - **入队收口到单一函数 `enqueuePermissionItem`**（`useChatSocket.ts`）：同一次提问会被**四条路径**送达 —— 实时 message / bridge / channel 三通道 + REST 补拉（切会话 / 重连 / 8 秒兜底轮询都会再捞一次）。此前各路径各自调 `enqueuePermission`，若把发通知散在各路径里必然「同一次提问弹 N 条通知」⇒ 收口成一处，入队 + 去重 + 通知同一个判据。
+  - **两层去重**：① 队列去重（入队前，按 requestId）② 通知去重表（入队后，按 requestId，`askUserNotice.ts`）。第二层不可省：message 事件到达 → 用户回答 → 出队 → bridge 事件姗姗来迟，此时队列里**已无**该项，只有第二层能挡住重复通知。
+  - **通知用独立 tag `nexusai-ask-user`**：`sendSystemNotification` 的 Web 通道同 tag 会**互相替换**（浏览器规范）⇒ 用默认 tag（`nexusai-turn-done`）发提问通知会把「本轮已完成」顶掉，表现为「通知丢了一条」。为此给 `SystemNotifyPayload` 加了可选 `tag` 字段（缺省行为逐字不变）。
+  - **点击系统通知 ⇒ 拉回前台 + 切到该会话**（用户实测：「点击不会把客户端拉到前台」）。原实现只有「弹通知」，用户点了什么也不会发生。
+    - **Rust**：新增 `show_main_window_command`（show + 取消最小化 + 置前聚焦）。Rust 侧本来就有 `show_main_window`（托盘唤回用的），但它**不是 command**、前端调不到 ⇒ 暴露成 command。走 Rust 而非前端窗口 API：前端 `getCurrentWindow().setFocus()` 在「窗口被别的窗口盖住」时不保证能置顶。
+    - **前端**：`registerActionTypes` + `onAction` 订阅 ⇒ 点击通知 → 拉回前台 → **切到该会话**（通知里带 `extra: { sessionId }` 载荷，点击时回读）。会话可能已删除 ⇒ 忽略。
+    - **补 `actionTypeId`**：这是「点了没反应」的**另一半**原因 —— 未注册 action type 时部分平台**根本不派发点击事件** ⇒ 补注册后点击事件才收得到。
+    - **验证**：新增 6 例（extra 载荷随通知下发 / 无载荷时不出现该字段 / 注册 action type / 点击回调收到载荷 / 无载荷不回调 / 非 Tauri 不订阅），
+      **变异自证 3 组**（去掉 `actionTypeId` ⇒ 精确 1 条转红；丢掉 extra 载荷 ⇒ 精确 1 条转红；不回读载荷 ⇒ 精确 1 条转红）
+      —— 证明「点击能拉回前台并切会话」这条链路的每一环都被断言承重，而非全绿即通过。
+  - **验证**：新增 3 个测试文件共 40 例（判定/去重/tag 隔离/浮层渲染/端到端通知链路），**变异自证 3 组**（破坏去重表 ⇒ 精确 1 条转红；改坏 tag ⇒ 精确 1 条转红；判定恒真 ⇒ 精确 4 条转红）；全量 1266 例中 **1264 绿**，余 2 红为知识库会话的未提交改动（`wikiPanelWiring` / `KbQaPanel`，已用「移开本批改动仍红」对照证明非本批引入）。**真机验证**（浏览器 + 真实 STOMP broker，非 mock）：帧经真实 broker → 应用真实订阅 → 真实入队 ⇒ 浮层出现、点击直达目标会话并弹出卡片、来回切换时项随当前会话动态增删；Windows 右下角系统通知经用户实机确认弹出。
+
 ## [0.1.67] - 2026-11-06
 
 ### Added

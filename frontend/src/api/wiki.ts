@@ -139,6 +139,27 @@ export interface WikiRevision {
   edited_at: string | null
 }
 
+/**
+ * 手动生成 Wiki 的结果（后端 `WikiRebuildResponse`）。
+ *
+ * <p>⚠️ `status` 是判定依据，⛔ 不要只看 `created_pages.length`：
+ * `skipped` 时后端 HTTP 仍是 200，且各计数全为 0 —— 当成成功会骗用户。
+ */
+export interface WikiRebuildResult {
+  /** `done | skipped | failed` */
+  status: 'done' | 'skipped' | 'failed' | string
+  /** 人话说明（用户直接看到） */
+  detail: string
+  docs_processed: number
+  docs_skipped: number
+  docs_failed: number
+  created_pages: string[]
+  updated_pages: string[]
+  rejected_pages: number
+  dead_links_removed: number
+  cross_links_added: number
+}
+
 // ══════════════════════════════════════════════════════════════
 // slug 拆分
 // ══════════════════════════════════════════════════════════════
@@ -305,6 +326,32 @@ export const wikiApi = {
       method: 'PUT',
       body: { slug, path },
     }),
+
+  // ── 手动生成（对齐 graphApi.rebuild）─────────────────────────────
+  /**
+   * 手动生成 / 补生成本库 Wiki。
+   *
+   * <p><b>为什么需要</b>：Wiki 原本只在文档入库后自动生成。上传时没配模型、或那一轮
+   * 生成失败，之后配好模型也<b>没有补生成入口</b> —— 只能整篇重新解析（重跑分块与索引，
+   * 成本高且块 ID 会变）。
+   *
+   * <p>⚠️ <b>同步调用</b>：整库多篇文档时可能几十秒到几分钟（每篇一次 LLM 调用）。
+   * 调用方必须自己维护 loading 态，否则用户会以为「点了没反应」。
+   *
+   * @param baseId      知识库 ID
+   * @param knowledgeId 文档 ID（不传 ⇒ 整库：所有已解析完成且已启用的文档）
+   * @param model       模型名（不传 ⇒ 后端按 wiki_config.synthesis_model_id ⇒ summary_model_id）
+   */
+  rebuild: (baseId: string, knowledgeId?: string, model?: string) => {
+    const qs = new URLSearchParams()
+    if (knowledgeId) qs.set('knowledge_id', knowledgeId)
+    if (model) qs.set('model', model)
+    const suffix = qs.toString() ? `?${qs.toString()}` : ''
+    return api<WikiRebuildResult>(
+      `/knowledge-bases/${encodeURIComponent(baseId)}/wiki/rebuild${suffix}`,
+      { method: 'POST' }
+    )
+  },
 }
 
 // ══════════════════════════════════════════════════════════════

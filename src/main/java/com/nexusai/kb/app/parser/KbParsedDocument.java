@@ -15,11 +15,15 @@ import java.util.Map;
  * @param text     解析出的文本（Markdown 优先）；恒非 null（可能为空串）
  * @param images   图片引用（未提取到图片时为空列表）
  * @param metadata 文档级元数据（标题/作者/MIME/页数/截断与视觉失败标记等）
+ * @param sourceBlocks 源位置块 · 把 {@code text} 的码点区间映射回原文件的页码/段落/行/字符区间
+ *                     （源站 {@code types.SourceBlock}）。解析器不知道结构时为空列表，
+ *                     上层据此判定「本文件无法溯源」，⛔ 不伪造定位。
  */
 public record KbParsedDocument(
     String text,
     List<KbImageRef> images,
-    Map<String, String> metadata
+    Map<String, String> metadata,
+    List<KbSourceBlock> sourceBlocks
 ) {
 
     // ── metadata 键（解析器与上层共用同一批字面量，避免各写各的） ──
@@ -46,11 +50,24 @@ public record KbParsedDocument(
     public static final String META_VISION_PAGES = "visionPages";
     /** 解析器名称（{@code KbPdfParser} / {@code KbOfficeParser} / {@code KbTextParser}）。 */
     public static final String META_PARSER = "parser";
+    /** 解析器产出的源位置块数量（0 = 本文件无法溯源，用于日志与排查）。 */
+    public static final String META_SOURCE_BLOCKS = "sourceBlocks";
 
     public KbParsedDocument {
         text = text == null ? "" : text;
         images = images == null ? List.of() : List.copyOf(images);
         metadata = metadata == null ? Map.of() : Map.copyOf(metadata);
+        sourceBlocks = sourceBlocks == null ? List.of() : List.copyOf(sourceBlocks);
+    }
+
+    /**
+     * 兼容构造器 · 不带源位置块（PDF / anydoc 等尚未产出 locator 的解析器仍用它）。
+     *
+     * <p>⚠️ 保留它是<b>有意的</b>：{@code sourceBlocks} 是本批新增字段，
+     * 未接入的解析器不该被迫改一行无关代码。
+     */
+    public KbParsedDocument(String text, List<KbImageRef> images, Map<String, String> metadata) {
+        this(text, images, metadata, List.of());
     }
 
     /** 空产物（解析成功但文档无内容时用，不是失败）。 */

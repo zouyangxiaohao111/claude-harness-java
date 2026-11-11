@@ -45,7 +45,7 @@ import java.util.function.Consumer;
  * <p><b>Java query() 等价 seam</b>: CC {@code runForkedAgent} 直接调全局 {@code query()}；
  * Java 端无全局 query()，故本类以 {@link ForkedQuery} 函数式接口作为 query loop seam
  * （测试注入 RecordingQuery 断言 fork 参数；生产由 ToolRegistrationConfig 注入
- * {@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery} —— 专用多轮
+ * {@link com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery} —— 主循环
  * fork loop，自建 provider 流式循环，<b>不调 LlmAgentLoop.run()</b>，canUseTool 受限门控
  * INV-6 真实生效）。
  *
@@ -134,7 +134,7 @@ public final class RunForkedAgent {
      * @param messages             initialMessages（forkContextMessages + promptMessages）
      * @param systemPrompt         主线程 system prompt **pre-append** 数组（组装段数组，含
      *                             boundary 元素；发送边界才剥离，appendSystemContext 由
-     *                             {@code ProductionForkedQuery} 使用点恰做一次）· CC original:
+     *                             fork 发送边界使用点恰做一次）· CC original:
      *                             {@code systemPrompt: SystemPrompt} (forkedAgent.ts:59)
      * @param userContext          user context（cache-safe）
      * @param systemContext        system context（cache-safe）
@@ -272,7 +272,7 @@ public final class RunForkedAgent {
         //   自动传播到 fork 内的 query()）。Java 的 plain ThreadLocal 不跨线程（且 fork 的发送点
         //   可能已不在发起线程上）⇒ 必须以**值**承载。
         //   来源 = 父 cache-safe 上下文的显式字段（cs.toolUseContext().agentContext()），
-        //   ⛔ 不读 ambient 归因上下文（宿 ThreadLocal，原 ProductionForkedQuery 的 ambient 读已删）。
+        //   ⛔ 不读 ambient 归因上下文（宿 ThreadLocal，原自建循环的 ambient 读已删）。
         //   ToolUseContext.with(SubagentContextOverrides) 对 agentContext 取 null（「新 agent 不继承父」
         //   语义 —— 对 createSubagentContext 的真子代理正确，由 SubagentExecutor stampSubagentLoopContext
         //   盖章）；fork 不是新 agent，故在此按同一「显式盖章」手法补上发起者的上下文。
@@ -283,11 +283,11 @@ public final class RunForkedAgent {
 
         // ── 3. query loop 透传 cache-safe 参数（forkedAgent.ts:545-556）──
         // [RES-R4-2] CacheSafeParams.systemPrompt 数组语义直接透传（forkedAgent.ts:59 + :545-556
-        // query({systemPrompt}) 不经 join 扁平化）：boundary 元素保留到发送边界（ProductionForkedQuery
+        // query({systemPrompt}) 不经 join 扁平化）：boundary 元素保留到发送边界
         // streamOnce 前按 useGlobalCacheScope gate 调 splitSysPromptPrefix 剥离，与主线程
         // LlmAgentLoop:2903-2911 同款），boundary 永不达 LLM。
         // [E-1a] 透传的是 **pre-append** 数组（+ 第 4 参 systemContext map）：appendSystemContext
-        // 由发送边界（ProductionForkedQuery）使用点恰做一次 —— 与 CC forkedAgent 自身 query()
+        // 由发送边界使用点恰做一次 —— 与 CC forkedAgent 自身 query()
         // 内重跑 append 同构（query.ts:449-450/:660）。此处不得预先 append（非幂等）。
         ForkQueryParams queryParams = new ForkQueryParams(
             initialMessages,
@@ -334,7 +334,7 @@ public final class RunForkedAgent {
         //   queryTracking 取父 toolUseContext（CC :619 toolUseContext.queryTracking）·
         //   querySource 取 canonical 小写值（QuerySource.canonical，如 'compact'/'session_memory'）。
         // [A 命中率口径] 末参 anthropic = provider 协议判定（ForkedAgentResult 第 3 组件 providerType）：
-        //   ProductionForkedQuery 传 provider.type() → "anthropic".equals 判 Anthropic；测试/便捷
+        //   QueryLoopForkedQuery 传 provider.type() → "anthropic".equals 判 Anthropic；测试/便捷
         //   构造 providerType=null → false（非 anthropic read/input 语义，deepseek 不双计）。
         AgentContext.emitForkAgentQueryEvent(
             telemetry,

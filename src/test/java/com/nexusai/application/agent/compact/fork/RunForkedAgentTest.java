@@ -339,7 +339,7 @@ class RunForkedAgentTest {
     }
 
     @Test
-    @DisplayName("G-79：ProductionForkedQuery 流式回调顺序 = assistant → tool_result → assistant（产出即回调 · forkedAgent.ts:578）")
+    @DisplayName("G-79：fork 流式回调顺序 = assistant → tool_result → assistant（产出即回调 · forkedAgent.ts:578）")
     void productionForkedQuery_streamsOnMessageInProduceOrder() {
         // WHY：生产 fork loop 是唯一消息生产点 —— 每产出一条消息（assistant + tool_result）
         // 即回调 onMessage，顺序与 outputMessages 一致（CC query() 产出 user 消息亦回调）。
@@ -349,8 +349,7 @@ class RunForkedAgentTest {
             new com.nexusai.infra.llm.AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock("c1", "Echo", emptyObject()))),
             new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         List<ChatMessageDto> streamed = new ArrayList<>();
         RunForkedAgent.ForkQueryParams params = new RunForkedAgent.ForkQueryParams(
@@ -429,19 +428,18 @@ class RunForkedAgentTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[RES-R4-2] ProductionForkedQuery 发送边界剥离 boundary（boundary 永不达 LLM）")
+    @DisplayName("[RES-R4-2] fork 发送边界剥离 boundary（boundary 永不达 LLM）")
     void productionForkedQuery_stripsBoundaryBeforeSend() {
         // WHY（CLAUDE.md 规则 9 · 测试验证意图）：[RES-R4-2] 通用 fork（RunForkedAgent）必须与
         // 主线程一致在发送边界剥离 boundary（splitSysPromptPrefix · LlmAgentLoop:2903-2911），
         // 否则 boundary 标记泄漏到 LLM 且 fork 缓存 key 与主循环字节不一致（forkedAgent.ts:59
-        // systemPrompt 为数组、发送边界才剥离）。本测试走完整链（RunForkedAgent → ProductionForkedQuery
+        // systemPrompt 为数组、发送边界才剥离）。本测试走完整链（RunForkedAgent → fork 发送边界
         // → provider），断言 provider 收到的 systemPrompt 剥离 boundary 且静态/动态以 \n\n 连接。
         EchoTool echo = new EchoTool();
         ToolRegistry registry = ToolRegistry.from(List.of(echo));
         ScriptedProvider provider = new ScriptedProvider(
             new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         // GIVEN: systemPrompt 数组含 boundary + gate=true（firstParty → boundary 模式）
         CacheSafeParams cs = new CacheSafeParams(
@@ -461,10 +459,10 @@ class RunForkedAgentTest {
     }
 
     @Test
-    @DisplayName("[RES-C6] ProductionForkedQuery 发送走 blocks 数组（非 join 单 String）· 对齐主线程 blocks 通道")
+    @DisplayName("[RES-C6] fork 发送走 blocks 数组（非 join 单 String）· 对齐主线程 blocks 通道")
     void productionForkedQuery_sendsBlocksArray_notJoinedString() {
         // WHY（CLAUDE.md 规则 9）：[RES-C6] 通用 fork 发送此前走 split + join("\\n\\n") 单 String +
-        // String 重载（ProductionForkedQuery:174-179/206-207）→ provider String 路径 wrap 单 block
+        // String 重载（旧自建循环）→ provider String 路径 wrap 单 block
         // ORG，与主线程 blocks 数组通道（LlmAgentLoop:2897-2904 → ModelCaller blocks 重载）序列化
         // 层级不一致 → 缓存 key / 模型侧 system 表示漂移。CC systemPrompt 以数组贯穿发送边界
         // （utils/api.ts:321-435 splitSysPromptPrefix 产物 → buildSystemPromptBlocks 发送）。
@@ -473,8 +471,7 @@ class RunForkedAgentTest {
         ToolRegistry registry = ToolRegistry.from(List.of(echo));
         ScriptedProvider provider = new ScriptedProvider(
             new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         // GIVEN: systemPrompt 数组含 boundary + gate=true（firstParty → boundary 模式）
         CacheSafeParams cs = new CacheSafeParams(
@@ -504,7 +501,7 @@ class RunForkedAgentTest {
     void runForkedAgent_preservesBoundaryElementsInForkQueryParams() {
         // WHY（CLAUDE.md 规则 9）：[RES-R4-2] ForkQueryParams.systemPrompt 必须是数组语义
         // （forkedAgent.ts:59 SystemPrompt = readonly string[]），boundary 是独立数组元素而非
-        // join 内联文本 —— 发送边界（ProductionForkedQuery splitSysPromptPrefix）需要数组才能
+        // join 内联文本 —— 发送边界（fork 发送边界 splitSysPromptPrefix）需要数组才能
         // 识别 boundary 元素并剥离；join 扁平化会让 boundary 丢失元素身份 → 无法剥离 → 泄漏。
         CacheSafeParams cs = new CacheSafeParams(
             List.of("static-prefix", BOUNDARY, "dynamic-suffix"),
@@ -560,7 +557,7 @@ class RunForkedAgentTest {
         public ForkedAgentResult run(RunForkedAgent.ForkQueryParams params) {
             this.last = params;
             // G-79 流式语义：query 每产出一条消息即回调 onMessage（forkedAgent.ts:578）——
-            // 对齐 ProductionForkedQuery fork loop；RunForkedAgent 不再 post-hoc replay
+            // 对齐 fork 发送边界 fork loop；RunForkedAgent 不再 post-hoc replay
             List<ChatMessageDto> msgs = produced != null ? produced : params.messages();
             for (ChatMessageDto m : msgs) {
                 params.onMessage().accept(m);
@@ -573,11 +570,45 @@ class RunForkedAgentTest {
         }
     }
     // ════════════════════════════════════════════════════════════════════
-    // IMP-M-P0-3 · ProductionForkedQuery 生产 fork loop 契约
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery portedForkLoop(
+            com.nexusai.infra.llm.LlmProvider provider, ToolRegistry registry) {
+        // [E-1b-2-R9] 主循环从 params.config() 现算 firstParty gate（不再读
+        //   CacheSafeParams.useGlobalCacheScope）⇒ 本 helper 用 anthropic 端点命中 firstParty。
+        return portedForkLoop(provider, registry,
+            new com.nexusai.infra.llm.ProviderConfig("https://api.anthropic.com", "sk-test"));
+    }
+
+    private static QueryLoopForkedQuery portedForkLoop(
+            com.nexusai.infra.llm.LlmProvider provider, ToolRegistry registry,
+            com.nexusai.infra.llm.ProviderConfig cfg) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f1 = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f1.setAccessible(true); f1.set(factory, pf);
+            java.lang.reflect.Field f2 = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("toolRegistry");
+            f2.setAccessible(true); f2.set(factory, registry);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(full -> null, () -> MODEL, () -> cfg, factory);
+    }
+
+    // IMP-M-P0-3 · fork 生产 loop 契约
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("ProductionForkedQuery: maxTurns 逐轮上限（恒工具调用时 5 轮硬性终止）")
+    @DisplayName("fork loop: maxTurns 逐轮上限（恒工具调用时 5 轮硬性终止）")
     void productionForkedQuery_limitsTurnsToMaxTurns() {
         // WHY: extractMemories.ts:426 maxTurns=5 —— fork 必须硬性限制 API round-trips，
         // 防 verification rabbit-hole 烧 turn（CC 注释 "A hard cap prevents verification
@@ -589,8 +620,7 @@ class RunForkedAgentTest {
                 List.of(new ToolUseBlock("c1", "Echo", emptyObject()))),
             new com.nexusai.infra.llm.AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock("c2", "Echo", emptyObject()))));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         RunForkedAgent.ForkQueryParams params = forkParams(5, allowAll(), forkCtxWith(echo));
         ForkedAgentResult result = loop.run(params);
@@ -606,7 +636,7 @@ class RunForkedAgentTest {
     }
 
     @Test
-    @DisplayName("ProductionForkedQuery: 无工具调用时正常终止（读→写多轮 fork 语义）")
+    @DisplayName("fork loop: 无工具调用时正常终止（读→写多轮 fork 语义）")
     void productionForkedQuery_terminatesOnFinalAnswer() {
         // WHY: extract/auto-dream fork 是受限多轮 agent（读文件 → 写记忆），末轮必须是无工具
         // 调用的最终回答。loop 在模型产出纯文本时终止（CC query() 无 tool_use → 停止）。
@@ -616,8 +646,7 @@ class RunForkedAgentTest {
             new com.nexusai.infra.llm.AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock("c1", "Echo", emptyObject()))),
             new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         ForkedAgentResult result = loop.run(forkParams(null, allowAll(), forkCtxWith(echo)));
 
@@ -629,7 +658,7 @@ class RunForkedAgentTest {
     }
 
     @Test
-    @DisplayName("ProductionForkedQuery: canUseTool Deny → tool_result isError（INV-6 受限门控真实生效）")
+    @DisplayName("fork loop: canUseTool Deny → tool_result isError（INV-6 受限门控真实生效）")
     void productionForkedQuery_canUseToolDeny_producesErrorToolResult() {
         // WHY: INV-6 —— extract/auto-dream 的受限 canUseTool（Read/Grep/Glob + 只读 Bash +
         // auto-memory 内 Edit/Write）必须在 fork loop 内真实生效。拒绝 → ToolResult.error
@@ -640,8 +669,7 @@ class RunForkedAgentTest {
         ScriptedProvider provider = new ScriptedProvider(
             new com.nexusai.infra.llm.AssistantMessage("", "tool_calls",
                 List.of(new ToolUseBlock("c1", "Echo", emptyObject()))));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         // 受限 canUseTool（对齐 createAutoMemCanUseTool deny 语义：拒绝任意工具）
         // maxTurns=1 界定单轮：脚本化 provider 恒产工具调用（无 maxTurns 会无限循环 ——
@@ -658,21 +686,20 @@ class RunForkedAgentTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[C] ProductionForkedQuery: skipCacheWrite=true 真实送达 provider.stream（compact fork 不写缓存）")
+    @DisplayName("[C] fork loop: skipCacheWrite=true 真实送达 provider.stream（compact fork 不写缓存）")
     void productionForkedQuery_skipCacheWrite_reachesProvider() {
         // WHY（CLAUDE.md 规则 9 · 测试验证意图）：配合 RunForkedAgent.java:210（params.skipCacheWrite()
         //   → ForkQueryParams）与 compact.ts:1195（compact fork 恒 true），fork 的「不写 cache」
         //   语义只有在**真正到达 provider** 时才成立 —— 此前 ForkQueryParams.skipCacheWrite 写入后
-        //   在 fork 链上 0 读点（ProductionForkedQuery.streamOnce 调 17 参 stream 时无处可传），
+        //   在 fork 链上 0 读点（主循环 provider.stream 调 17 参 stream 时无处可传），
         //   marker 移位（claude.ts:3243）在 fork 路径恒不触发 → fork 会覆盖主线程 cache 条目。
-        //   RED 变异：把 ProductionForkedQuery.streamOnce 的 provider.stream 末参改回不传/null
+        //   RED 变异：把 主循环 provider.stream 的 provider.stream 末参改回不传/null
         //   （或删掉 streamOnce 的 skipCacheWrite 形参透传）→ provider 收到 null → 本断言红。
         EchoTool echo = new EchoTool();
         ToolRegistry registry = ToolRegistry.from(List.of(echo));
         ScriptedProvider provider = new ScriptedProvider(
             new com.nexusai.infra.llm.AssistantMessage("done", "stop", List.of()));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> MODEL, () -> com.nexusai.infra.llm.ProviderConfig.empty(), registry);
+        QueryLoopForkedQuery loop = portedForkLoop(provider, registry);
 
         loop.run(forkParams(1, allowAll(), forkCtxWith(echo), true));
 
@@ -682,7 +709,7 @@ class RunForkedAgentTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // IMP-M-P0-3 · ProductionForkedQuery 测试工具
+    // IMP-M-P0-3 · fork 发送边界 测试工具
     // ════════════════════════════════════════════════════════════════════
 
     /** 构造 ForkQueryParams（extract 风格：maxTurns/skipCacheWrite=false；[RES-R4-2] 数组 + gate=3P 默认）。 */

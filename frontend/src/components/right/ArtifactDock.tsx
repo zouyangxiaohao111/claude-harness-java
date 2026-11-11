@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { artifactsApi, type ArtifactContent, type SessionArtifactDto } from '@/api/artifacts'
 import { ApiError } from '@/api/rest'
-import { MarkdownText } from '@/markdown/MarkdownText'
+import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { monaco, monacoLangOf, MONACO_COMMON_OPTS } from '@/utils/monaco'
 import { artifactKindOf, isTextArtifact } from '@/utils/artifactKind'
 import { openArtifactRawInBrowser } from '@/utils/artifactOpen'
@@ -266,7 +266,7 @@ export function ArtifactDock({
               title={`${artifact.title} · 预览`}
             />
           ) : isMarkdown ? (
-            <MarkdownText text={data.content ?? ''} className="content md ad-md" />
+            <MarkdownTextV2 text={data.content ?? ''} className="content md ad-md" />
           ) : isText ? (
             <pre className="ad-pre">{data.content}</pre>
           ) : (

@@ -1,5 +1,6 @@
 import { api } from './rest'
 import { API_V1_BASE } from './base'
+import type { ProjectDto } from './projects'
 
 /**
  * 知识库 API 客户端 · 对齐 WeKnora 复刻后端（`/api/v1/knowledge-bases`）。
@@ -37,14 +38,34 @@ export interface KnowledgeBase {
   created_at: string | null
   updated_at: string | null
   /**
-   * ⚠️ 以下 4 个是**写侧字段**：后端 `KnowledgeBaseDto` 只返回 18 个字段，
-   * 这几项只能通过 `PATCH /knowledge-bases/{id}` 写，读不回来（D-13 的既定偏离）。
-   * 所以这里标可选 —— 读接口永远拿不到，写接口可以传。
+   * ⭐ **读侧已补**（B7，2026-11-10）：后端 `KnowledgeBaseDto` 现在返回这 4 项。
+   *
+   * <p>补之前的真实故障：「AI 问题生成 / 自动关联标签」开关保存成功后，
+   * `onSaved` 重新拉取仍是 `null` ⇒ **开关永远显示关闭**，展开的子字段也永不出现，
+   * 用户以为没保存。所以这几个字段必须读回，⛔ 不能只写不读。
    */
   question_generation_config?: string | null
   auto_tag_config?: string | null
   wiki_config?: string | null
-  /** 索引策略（`graph_enabled` 等）；写侧字段 */
+  /**
+   * ASR 配置（`asr_config`）。⚠️ 同为写侧字段（DTO 不返回），且**后端零消费者**
+   * —— 存进去不会让音频被真正转写，界面里已如实提示。
+   */
+  asr_config?: string | null
+  /** 画像配置（`profile_config`）。⚠️ 写侧字段 + **后端零消费者**。 */
+  profile_config?: string | null
+  /**
+   * FAQ 配置（`faq_config`）。⭐ `index_mode` **后端真消费**
+   * （`KbFaqMetadata.resolveIndexMode` → `KbFaqService` 渲染正文）。
+   */
+  faq_config?: string | null
+  /**
+   * 索引策略 JSON（`wiki_enabled` / `graph_enabled`）。
+   *
+   * ⭐ **读侧可拿**：`KnowledgeBaseDto` 原先漏了这个字段，导致前端无法判断
+   * Wiki / 图谱 tab 是否该显示（`KnowledgeBase.vue:99` 的 isWiki 判据）⇒ 两个 tab 永远隐藏。
+   * 已补进出站 DTO。
+   */
   indexing_strategy?: string | null
 }
 
@@ -56,6 +77,22 @@ export interface CreateKnowledgeBaseBody {
   embedding_model_id?: string | null
   summary_model_id?: string | null
   chunking_config?: string | null
+  /**
+   * 索引策略 —— **Wiki / RAG 开关的唯一载体**。
+   *
+   * <p>源侧创建时同一个请求就带上它（`KnowledgeBaseEditorModal.vue:1690-1694`）：
+   * `{ vector_enabled, keyword_enabled, wiki_enabled, graph_enabled }`。
+   * ⚠️ 源侧注释写死「Wiki enablement is carried solely by
+   * `indexing_strategy.wiki_enabled`」⇒ Wiki **不是** `type` 的一个取值。
+   *
+   * <p>不传 = 不写（FAQ 库走这条）。
+   */
+  indexing_strategy?: {
+    vector_enabled: boolean
+    keyword_enabled: boolean
+    wiki_enabled: boolean
+    graph_enabled?: boolean
+  } | null
 }
 
 /** 更新知识库请求（null / 不传 = 不改）。 */
@@ -177,7 +214,17 @@ function toQuery(params: Record<string, unknown>): string {
   return q ? `?${q}` : ''
 }
 
-/** 分块视图（后端 `ChunkController.ChunkView`，16 字段）。 */
+/**
+ * 分块视图（后端 `ChunkController.ChunkView`，18 字段）。
+ *
+ * <p>`metadata` 是**原始 JSON 字符串**（后端原样透传，不解析）：
+ * <pre>
+ * {"generated_questions":[{"id":"q...","question":"...","content_revision":3}],
+ *  "generated_questions_revision":3}
+ * </pre>
+ * 形态定义见后端 `KbGeneratedQuestions` 类注释。⛔ 前端也**不要**在这里解析成对象：
+ * 消费点各自用 {@link parseGeneratedQuestions} 容错解析，坏 JSON 只影响自己的展示。
+ */
 export interface ChunkView {
   id: string
   knowledge_id: string
@@ -196,6 +243,27 @@ export interface ChunkView {
   index_status: string | null
   context_header: string | null
   source_locators: string | null
+  /** 原始 metadata JSON（可能为 null / 坏 JSON） */
+  metadata?: string | null
+}
+
+/** 分块编辑历史的一条（后端 `ChunkController.RevisionView`，11 字段）。 */
+export interface ChunkRevision {
+  id: string
+  chunk_id: string
+  knowledge_id: string
+  knowledge_base_id: string
+  /** 版本号（1-based，逐条递增；回滚会**追加**新版本，不删历史） */
+  revision: number | null
+  content: string
+  is_enabled: boolean
+  editor_id: string | null
+  /** 编辑来源：`user` / `rollback` 等（后端 `KbChunkService#writeSnapshot` 的入参） */
+  edit_source: string | null
+  /** `yyyy-MM-dd HH:mm:ss`（⛔ 不要 `new Date()` 解析） */
+  edited_at: string | null
+  /** `yyyy-MM-dd HH:mm:ss` */
+  created_at: string | null
 }
 
 /** 检索命中项（后端 `SearchResultDto`）。 */
@@ -221,6 +289,50 @@ export interface HybridSearchBody {
   rerank_top_n?: number
 }
 
+/**
+ * 解析引擎能力（后端 `GET /api/v1/system/parser-engines` 的 `data[]` 元素）。
+ *
+ * <p>⚠️ **键名大写开头是对齐源站的**：源侧 Go 结构体未打 json tag，
+ * 序列化出 `Name` / `Description` / `FileTypes` / `Available` / `UnavailableReason`；
+ * 本仓 `ParserEngineInfo` 用 `@JsonProperty` 逐字锁定同一批键名
+ * （`backend/.../kb/app/parser/ParserEngineInfo.java:24-28`）。
+ * ⛔ 不要「顺手」改成 camelCase —— 后端就是按这套键名吐的。
+ *
+ * <p>`Description` 在本仓承载的是**展示名**（`KbDocumentParser#displayName()`，
+ * 如「内置 PDF 解析」），不是长描述，可直接当下拉选项文案。
+ */
+export interface ParserEngineInfo {
+  Name: string
+  Description: string
+  FileTypes: string[]
+  Available: boolean
+  UnavailableReason: string
+}
+
+/**
+ * `rawBytes` 专用错误（二进制通道，不复用 {@link ApiError}）。
+ *
+ * <p><b>WHY 另起一个类而不是复用 ApiError</b>：`ApiError` 的语义是「JSON 接口失败」，
+ * 调用方（列表 / 编辑弹层）会拿它的 `userMessage()` 直接展示；二进制取字节失败需要
+ * 单独区分「有没有原文件」（404）与「网络/服务端故障」（0 / 5xx），
+ * 混用会让「该文档没有原文件」被当成「服务异常，请重试」。
+ */
+export class KbRawBytesError extends Error {
+  /** HTTP 状态码；0 = 网络层失败（连不上） */
+  status: number
+
+  constructor(message: string, status: number) {
+    super(message)
+    this.name = 'KbRawBytesError'
+    this.status = status
+  }
+
+  /** 后端明确说「没有原始文件」（手工创建 / URL 导入 / 文件已被清理）。 */
+  get isMissingFile(): boolean {
+    return this.status === 404
+  }
+}
+
 export const knowledgeApi = {
   // ── 知识库 ──────────────────────────────────────────────────────
   listBases: () => api<KnowledgeBase[]>('/knowledge-bases'),
@@ -228,13 +340,39 @@ export const knowledgeApi = {
   getBase: (id: string) => api<KnowledgeBase>(`/knowledge-bases/${encodeURIComponent(id)}`),
 
   createBase: (body: CreateKnowledgeBaseBody) =>
-    api<KnowledgeBase>('/knowledge-bases', { method: 'POST', body }),
+    api<KnowledgeBase>('/knowledge-bases', {
+      method: 'POST',
+      body: {
+        ...body,
+        // ⚠️ 后端 `CreateKnowledgeBaseRequest.indexingStrategy` 是 **String**
+        //    （列本身就是 TEXT 存 JSON），不是嵌套对象 ⇒ 必须在这里序列化。
+        //    直接传对象会被 Jackson 当字符串转义成 `{"vector_enabled":...}` 字面量，
+        //    落库后 `indexing_strategy` 变成一段双引号包裹的字符串，下游 parse 全空。
+        ...(body.indexing_strategy === undefined || body.indexing_strategy === null
+          ? {}
+          : { indexing_strategy: JSON.stringify(body.indexing_strategy) }),
+      },
+    }),
 
   updateBase: (id: string, body: UpdateKnowledgeBaseBody) =>
     api<KnowledgeBase>(`/knowledge-bases/${encodeURIComponent(id)}`, { method: 'PUT', body }),
 
   deleteBase: (id: string) =>
     api<void>(`/knowledge-bases/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+
+  /**
+   * 解析引擎清单（后端注册表驱动 · `GET /api/v1/system/parser-engines`）。
+   *
+   * <p>响应外层是 `{success, data:[...]}`（与本仓 `/system/vector-stores/types`、
+   * `/system/storage-backends/types` 同一种「下拉元数据」形状），这里解包出 `data`。
+   * 其余知识库端点是**裸返 DTO**，不带这层包装 —— ⛔ 别把两种形状混起来。
+   *
+   * <p>⚠️ `api()` 只做 JSON 解析、**不做**包装解包（见 `api/rest.ts:140` 的
+   * `return JSON.parse(raw) as T`），故解包必须写在这里。
+   */
+  listParserEngines: () =>
+    api<{ success: boolean; data: ParserEngineInfo[] }>('/system/parser-engines')
+      .then((r) => r?.data ?? []),
 
   // ── 知识条目 ────────────────────────────────────────────────────
   listKnowledge: (baseId: string, query: KnowledgeListQuery = {}) =>
@@ -254,6 +392,137 @@ export const knowledgeApi = {
     api<ChunkView[]>(
       `/chunks/${encodeURIComponent(knowledgeId)}${opts.enabledOnly ? '?include_disabled=false' : ''}`
     ),
+
+  /**
+   * 按分块 ID 取单个分块（后端 `ChunkController#getById` · `GET /chunks/by-id/{id}`）。
+   *
+   * <p>「父块上下文」按钮用这个：`parent_chunk_id` 可能属于**另一篇文档**
+   * （摘要块挂靠首个正文块时同一文档，但字段语义不保证）⇒ 不能靠 `listChunks` 过滤，
+   * 必须走这条不需要 knowledgeId 的端点。
+   */
+  getChunkById: (id: string) =>
+    api<ChunkView>(`/chunks/by-id/${encodeURIComponent(id)}`),
+
+  /**
+   * 更新分块（后端 `ChunkController#update` · `PUT /chunks/{knowledgeId}/{id}`）。
+   *
+   * <p>⚠️ 请求体是 **snake_case** `is_enabled`；发 `isEnabled` 会被 Jackson 静默忽略。
+   * 两个字段都可省（undefined/null = 不改）。
+   *
+   * <p>⚠️ **索引重建结果不可知**：后端先提交事务再重建索引，索引失败只 `log.error`，
+   * 响应仍是 200 ⇒ 前端**只能**说「内容已保存」，⛔ 不能说「已重建索引 / 搜索已更新」。
+   */
+  updateChunk: (
+    knowledgeId: string,
+    id: string,
+    body: { content?: string; is_enabled?: boolean }
+  ) =>
+    api<ChunkView>(
+      `/chunks/${encodeURIComponent(knowledgeId)}/${encodeURIComponent(id)}`,
+      { method: 'PUT', body }
+    ),
+
+  /**
+   * 分块编辑历史（后端 `ChunkController#revisions`，裸数组，**倒序**）。
+   *
+   * <p>⚠️ 本仓只在**编辑/回滚时写快照**（`KbChunkService#writeSnapshot`）⇒
+   * 从未编辑过的分块返回空数组，这是真实状态，⛔ 不要拿「当前内容」伪造一条。
+   */
+  listChunkRevisions: (knowledgeId: string, id: string) =>
+    api<ChunkRevision[]>(
+      `/chunks/${encodeURIComponent(knowledgeId)}/${encodeURIComponent(id)}/revisions`
+    ),
+
+  /**
+   * 回滚到指定版本（后端 `ChunkController#revert` · `POST /chunks/{knowledgeId}/{id}/revert`）。
+   *
+   * <p>⚠️ 语义是「把目标版本内容写回正文 + **追加**一条新 revision」，⛔ 不是删历史，
+   * 也不可撤销（回滚本身也会产生一个新版本，可以再回滚回来）。
+   * `revision` 必填，缺 ⇒ 后端 400。
+   */
+  revertChunk: (knowledgeId: string, id: string, revision: number) =>
+    api<ChunkView>(
+      `/chunks/${encodeURIComponent(knowledgeId)}/${encodeURIComponent(id)}/revert`,
+      { method: 'POST', body: { revision } }
+    ),
+
+  /**
+   * 新增 / 修改一条生成问句（后端 `ChunkController#upsertGeneratedQuestion`
+   * · `PUT /chunks/by-id/{id}/questions`）。
+   *
+   * <p>⚠️ **本仓问句没有独立 id**（存在 `metadata.generated_questions` 里）⇒
+   * `question_id` 的语义是「要替换的**旧问句文本**」：
+   * 空 ⇒ 新增；非空 ⇒ 原地替换。⛔ 传一个不存在的旧文本 ⇒ 后端 400。
+   *
+   * <p>⚠️ 响应的 `index_rebuilt=false` 表示「问句已保存但索引没重建好」——
+   * 这时搜索仍是旧文本，⛔ 不要笼统说「已保存」。
+   */
+  upsertChunkQuestion: (chunkId: string, body: { question_id?: string; question: string }) =>
+    api<{
+      chunk: ChunkView
+      added: boolean
+      questions: string[]
+      index_rebuilt: boolean
+    }>(`/chunks/by-id/${encodeURIComponent(chunkId)}/questions`, { method: 'PUT', body }),
+
+  /**
+   * 重新生成某分块的辅助问句（后端 `POST /chunks/by-id/{id}/questions/regenerate`）。
+   *
+   * <p>⚠️ 会真的调一次模型（几秒）⇒ 按钮要显示 loading、禁止重复点。
+   * ⚠️ `status` 可能是 `SKIPPED`（问句配置关闭 / 无模型 / 无可生成文本）——
+   * 必须把 `detail` 显示给用户，⛔ 不能说「已重新生成」。
+   */
+  regenerateChunkQuestions: (chunkId: string) =>
+    api<{
+      chunk: ChunkView
+      questions: string[]
+      status: string
+      detail: string | null
+    }>(`/chunks/by-id/${encodeURIComponent(chunkId)}/questions/regenerate`, { method: 'POST' }),
+
+  /**
+   * 删除分块里的一条生成问句（后端 `DELETE /chunks/by-id/{id}/questions`）。
+   *
+   * <p>⚠️ 后端按**问句文本**匹配（本仓问句无独立 id）⇒ 直接传文本。
+   * 响应只有 `{deleted}`，**不返回新列表** ⇒ 调用方要自己刷新。
+   */
+  deleteChunkQuestion: (chunkId: string, questionText: string) =>
+    api<{ deleted: boolean; note?: string }>(
+      `/chunks/by-id/${encodeURIComponent(chunkId)}/questions`,
+      { method: 'DELETE', body: { question_id: questionText } }
+    ),
+
+  /**
+   * 文档处理流水线（后端 `GET /knowledge/{id}/stages`，返回 SpanTree）。
+   *
+   * <p>⚠️ 本仓的 span **就是分块本身**（`KbKnowledgeExtService#spans` 用 chunk 拼出叶子），
+   * 不是源侧那种细粒度解析步骤 ⇒ 界面要如实说明，⛔ 不编造「OCR/布局/切分」阶段。
+   */
+  getKnowledgeStages: (id: string) =>
+    api<{
+      knowledge_id: string
+      title: string | null
+      parse_status: string | null
+      spans: Array<{
+        id: string
+        type: string | null
+        preview: string | null
+        start_at: number | null
+        end_at: number | null
+        chunk_index: number | null
+        enabled: boolean
+        children: unknown[]
+      }>
+      attempts: Array<{
+        id: number | null
+        task_type: string | null
+        state: string | null
+        attempt: number | null
+        error_message: string | null
+        started_at: string | null
+        finished_at: string | null
+      }>
+    }>(`/knowledge/${encodeURIComponent(id)}/stages`),
 
   deleteKnowledge: (id: string) =>
     api<void>(`/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -359,6 +628,18 @@ export const knowledgeApi = {
     }),
 
   /**
+   * 知识库工作区项目（`GET /api/v1/kb/workspace/project`）。
+   *
+   * <p>助手 / 问答面板建专用会话时，`mainProjectId` 必须传它 —— ⛔ 不要再取
+   * `projectApi.list()[0]`：项目列表按 SQLite rowid 返回（后端无 ORDER BY），
+   * 随手拿到的那条是用户第一个注册的仓库，会把助手会话的 cwd / 记忆 / 产物写进用户仓库。
+   *
+   * <p>服务端按 `<安装目录>/workspace/kb` → `<配置根>/workspace/kb` 降级解析并幂等注册，
+   * 浏览器不需要知道目录在哪。
+   */
+  workspaceProject: () => api<ProjectDto>('/kb/workspace/project'),
+
+  /**
    * 只检索不生成（`POST /api/v1/knowledge-search`）。
    *
    * <p>用于「问答前先看命中了什么」。不落消息、不落引用、不推流。
@@ -400,6 +681,29 @@ export const knowledgeApi = {
       method: 'POST',
       body: { knowledge_ids: knowledgeIds, folder_path: folderPath },
     }),
+
+  /**
+   * 跨知识库移动：可选的**目标知识库**列表（`GET /knowledge-bases/{id}/move-targets`）。
+   *
+   * <p>⚠️ 后端排除**源库自己**（返回里不会有当前库）⇒ 列表为空 = 没有别的库可移，
+   * 界面要如实说「没有其它知识库」，⛔ 不要拿当前库凑一个选项。
+   */
+  listMoveTargets: (baseId: string) =>
+    api<Array<{
+      id: string
+      name: string
+      description: string | null
+      type: string | null
+      knowledge_count: number
+    }>>(`/knowledge-bases/${encodeURIComponent(baseId)}/move-targets`),
+
+  /**
+   * 把文档移动到另一个知识库（`POST /knowledge/move`）。
+   *
+   * <p>⚠️ 本仓是**同步**完成（源侧是异步任务）⇒ 返回后即可刷新列表，不需要轮询进度。
+   */
+  moveKnowledge: (body: { source_kb_id: string; target_kb_id: string; knowledge_ids: string[] }) =>
+    api<{ moved: number }>('/knowledge/move', { method: 'POST', body }),
 
   // ── 标签（源侧 KbTagManageDrawer / KnowledgeTagFilter）──────────────
   /** 库内标签列表（`GET /knowledge-bases/{id}/tags`）。 */
@@ -476,6 +780,51 @@ export const knowledgeApi = {
   /** 下载原文（`GET /knowledge/{id}/download`）。 */
   downloadUrl: (id: string) => `${API_V1_BASE}/knowledge/${encodeURIComponent(id)}/download`,
 
+  /**
+   * 取文档原始字节（预览用）。
+   *
+   * <p>⚠️ 与 {@link downloadUrl} 的区别：那个返回 **URL**（给 `<PdfPreview>` / 下载链接直接消费），
+   * 这个直接 fetch 成 `Uint8Array`（给 docx / xlsx 的行内渲染器消费，也用于先探测「有没有原文件」）。
+   *
+   * <p>⚠️ **不能**用 {@link api}：它会 `res.text()` + `JSON.parse`，二进制会被当非法 JSON 抛错。
+   * 这里走裸 `fetch`，只在 HTTP 失败时按 RFC 7807 解析错误体。
+   *
+   * <p>⚠️ 无原始文件时后端返回 **404**（`KnowledgeExtController#download` →
+   * `NotFoundException("文档 X 没有可下载的原始文件（手工创建 / URL 导入的文档不保存原文件）")`），
+   * 抛 {@link KbRawBytesError}（带 `status`），调用方据此显示「只能查看分块」而不是「重试」。
+   */
+  rawBytes: async (id: string): Promise<Uint8Array> => {
+    const url = `${API_V1_BASE}/knowledge/${encodeURIComponent(id)}/download`
+    let res: Response
+    try {
+      res = await fetch(url, {
+        // 后端 download 的 produces 是 application/octet-stream；显式声明避免内容协商 406
+        headers: { Accept: 'application/octet-stream', 'X-Client-Env': 'react' },
+      })
+    } catch (e) {
+      // 网络层失败（断网 / 后端未起 / CORS）
+      throw new KbRawBytesError(
+        `网络错误：无法连接后端（${e instanceof Error ? e.message : String(e)}）`,
+        0
+      )
+    }
+    if (!res.ok) {
+      // 错误体是 RFC 7807 Problem（JSON）· 解析失败时退回 statusText
+      let detail = ''
+      try {
+        const body = (await res.json()) as { detail?: string; message?: string; title?: string }
+        detail = body?.detail ?? body?.message ?? body?.title ?? ''
+      } catch {
+        // 非 JSON 错误体（网关页 / 空响应）—— 不掩盖，下面用状态码兜底
+      }
+      throw new KbRawBytesError(
+        `HTTP ${res.status}${detail ? `：${detail}` : ` ${res.statusText}`}`,
+        res.status
+      )
+    }
+    return new Uint8Array(await res.arrayBuffer())
+  },
+
   // ── 其他入库来源（对齐源侧 KbUploadSourceDropdown 的四档）──────────
   /**
    * URL 导入（`POST /knowledge-bases/{id}/knowledge/url`）。
@@ -538,13 +887,85 @@ export const knowledgeApi = {
     ),
 
   // ── 活动记录（后端 GET /knowledge-bases/{id}/activity）─────────────
-  /** 活动流（对齐源侧 activity 端点；返回 `{items:[...]}`）。 */
+  /**
+   * 活动流。
+   *
+   * <p>⭐ **契约修正（B8）**：后端 `KnowledgeBaseAdvancedController#activity` 返回的是
+   * `{"data":[...]}`（`record ActivityPage(@JsonProperty("data") List<ActivityItem> data)`），
+   * 而这里原来读的是 `r.items` ⇒ **永远返回空数组** ⇒ 活动记录面板恒显示
+   * 「暂无活动记录」，接口 200、零报错。
+   *
+   * <p>字段名同样修正：后端是 `details`（复数），面板原来读 `detail`。
+   */
   listActivity: async (baseId: string, limit = 50) => {
-    const r = await api<{ items: Array<Record<string, unknown>> }>(
-      `/knowledge-bases/${encodeURIComponent(baseId)}/activity?limit=${limit}`
-    )
-    return r.items ?? []
+    const r = await api<{
+      data?: Array<{
+        id: number
+        action: string
+        outcome: string
+        actor_user_id: string
+        actor_role: string
+        target_type: string
+        target_id: string
+        details: string
+        created_at: string
+      }>
+    }>(`/knowledge-bases/${encodeURIComponent(baseId)}/activity?limit=${limit}`)
+    return r?.data ?? []
   },
+
+  // ── 知识库画像（`POST /knowledge-bases/{id}/profile/generate`）──────
+  /**
+   * 生成 AI 画像描述（源侧 `POST /knowledge-bases/{id}/profile/generate`）。
+   *
+   * <p>响应 `{profile:{gist,topics}, status, document_count, model}`；
+   * `status` 非成功时 `profile` 可能为空对象（不是 null），调用方按 `profile?.gist` 判空。
+   */
+  /**
+   * 向量存储列表（`GET /api/v1/vector-stores`）。
+   *
+   * <p>本仓后端有 `VectorStoreController`（list/types/get/update/test/delete），
+   * **前端此前一条都没接** ⇒ 「向量存储」面板只能显示假的默认值。
+   */
+  listVectorStores: () =>
+    api<Array<{
+      id: string
+      name: string
+      engine_type?: string
+      provider?: string
+      status?: string
+      is_default?: boolean
+      available?: boolean
+      unavailable_reason?: string
+    }>>('/vector-stores'),
+
+  /**
+   * 存储后端实例列表（`GET /api/v1/storage-backends`）。
+   *
+   * <p>⚠️ 与向量库同构：后端有全套 CRUD，前端此前未接。
+   */
+  listStorageBackends: () =>
+    api<Array<{
+      id: string
+      name: string
+      provider: string
+      source?: string
+      status?: string
+      available?: boolean
+      is_default?: boolean
+      unavailable_reason?: string
+    }>>('/storage-backends'),
+
+  generateProfile: (baseId: string, body?: { model?: string }) =>
+    api<{
+      profile: { gist?: string; topics?: string[] } | null
+      status: string
+      document_count: number
+      model: string
+    }>(`/knowledge-bases/${encodeURIComponent(baseId)}/profile/generate`, {
+      method: 'POST',
+      body: body ?? {},
+    }),
 
   // ── FAQ（后端 FaqController · 10 个端点）────────────────────────────
   /** FAQ 条目列表（`GET /knowledge-bases/{id}/faq/entries`）。 */
@@ -601,6 +1022,46 @@ export const knowledgeApi = {
       `/knowledge-bases/${encodeURIComponent(baseId)}/faq/entries`,
       { method: 'POST', body: { entries, mode } }
     ),
+
+  // ── 摘要（对齐源侧 knowledge-base/index.ts:709-718）─────────────────
+
+  /**
+   * 手动重新生成摘要（`POST /knowledge/{id}/regenerate-summary`）。
+   *
+   * <p><b>同步返回</b>：后端是一次 LLM 调用，做完才返回 ⇒ 前端必须自己维护 loading，
+   * 否则用户会以为「点了没反应」。
+   *
+   * <p>⚠️ 判定依据是 `summary_status`，不是「有没有 description」：
+   * `failed` 时 description 仍可能是上一次的旧值。
+   */
+  regenerateSummary: (id: string) =>
+    api<{ summary_status: string; description: string; detail?: string }>(
+      `/knowledge/${encodeURIComponent(id)}/regenerate-summary`,
+      { method: 'POST' },
+    ),
+
+  /**
+   * 保存手改的摘要正文（`PUT /knowledge/{id}` 的 `description` 字段）。
+   *
+   * <p>⚠️ 只发改动过的字段：该端点是「传什么写什么」，把整行回传容易冲掉并发改动。
+   */
+  updateSummary: (id: string, description: string) =>
+    api<Knowledge>(`/knowledge/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: { description },
+    }),
+
+  /**
+   * 保存自定义元数据（`PUT /knowledge/{id}` 的 `custom_metadata` 字段）。
+   *
+   * <p>⚠️ 后端该列是 **TEXT 存 JSON 文本**（`KnowledgeDto.customMetadata: String`），
+   * 而源侧接的是对象 ⇒ 这里必须 `JSON.stringify`。传对象会让后端反序列化失败。
+   */
+  updateCustomMetadata: (id: string, metadata: Record<string, unknown>) =>
+    api<Knowledge>(`/knowledge/${encodeURIComponent(id)}`, {
+      method: 'PUT',
+      body: { custom_metadata: JSON.stringify(metadata) },
+    }),
 }
 
 /** FAQ 列表查询参数。 */

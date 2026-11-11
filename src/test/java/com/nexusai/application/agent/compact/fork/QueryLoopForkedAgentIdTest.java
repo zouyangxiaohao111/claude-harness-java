@@ -181,7 +181,7 @@ class QueryLoopForkedAgentIdTest {
         setField(contextFactory, "llmProviderFactory", providerFactory);
         setField(contextFactory, "modelConfigResolver", buildResolver());
         return new QueryLoopForkedQuery(
-            modelFull -> new ProductionForkedQuery.ForkModelRoute(
+            modelFull -> new QueryLoopForkedQuery.ForkModelRoute(
                 MODEL_NAME, new ProviderConfig(BASE_URL, API_KEY), provider, "openai_compatible"),
             () -> MODEL_NAME, () -> new ProviderConfig(BASE_URL, API_KEY), contextFactory);
     }

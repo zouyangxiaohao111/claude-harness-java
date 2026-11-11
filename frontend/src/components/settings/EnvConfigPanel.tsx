@@ -11,7 +11,7 @@ export const AWAY_GATES_KEY = 'nexusai-away-gates'
 
 interface EnvConfigPanelProps {
   settings: AppSettings | null
-  onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
+  onSaveSettings: (req: UpdateSettingsRequest) => Promise<boolean>
   /** 打开记忆编辑器（独立弹窗 MemoryEditorModal · 设置弹窗保持打开，编辑器 z-index 更高） */
   onOpenMemoryEditor: () => void
   /** [批 3a] 当前活动会话 id：/memory/config 的 dreamStatus 是 per-project 数据，后端口已必填

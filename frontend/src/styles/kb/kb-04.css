@@ -1,0 +1,129 @@
+/* ⚠️ 自动生成，勿手改。
+   来源：deliverables/kb-design/assets/weknora-bundle.css
+   生成：deliverables/kb-design/scripts/extract_page_css.py
+   改了源站样式要重跑脚本，不要在本文件里手改。 */
+
+/* 04-图谱.html 专属组件样式（bundle 58 条 + 内联 26 条） */
+.kb-scope .faq-section .faq-section-label.clickable{cursor:pointer;-webkit-user-select:none;user-select:none;padding:2px 0;border-radius:var(--app-radius-xs)}
+.kb-scope .faq-section .faq-section-label.clickable:hover{color:var(--td-text-color-primary);background:var(--td-bg-color-container);padding-left:4px;padding-right:4px;margin-left:-4px;margin-right:-4px}
+.kb-scope .graph-navigation-hint{position:absolute;left:20px;bottom:16px;pointer-events:none;color:var(--td-text-color-placeholder);font-size:var(--app-text-sm);padding:5px 9px;background:var(--td-bg-color-container);border-radius:var(--app-radius-xs);z-index:1}
+.kb-scope .wiki-graph-canvas .graph-cluster-outline{fill-opacity:.45;stroke-opacity:0;transition:fill-opacity var(--app-motion-fast) ease,stroke-opacity var(--app-motion-fast) ease,opacity var(--app-motion-fast) ease}
+.kb-scope .wiki-graph-canvas .graph-cluster-outline.is-hovered{fill-opacity:.8;stroke-opacity:.8}
+.kb-scope .wiki-graph-canvas .graph-cluster-outline.is-dimmed{opacity:.3}
+.kb-scope .wiki-graph-canvas .graph-cluster-outline.is-dimmed.is-hovered{opacity:1}
+@media (prefers-reduced-motion: reduce){.kb-scope .wiki-graph-canvas .graph-cluster-outline{transition:none}}
+.kb-scope .wiki-graph-canvas .hide-edge-markers line{marker-start:none;marker-end:none}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption{cursor:zoom-in;outline:none}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption text{paint-order:stroke;stroke:var(--td-bg-color-container);stroke-width:4px;stroke-linejoin:round}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption .graph-caption-pill{display:none}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption:hover text, .kb-scope .wiki-graph-canvas .graph-cluster-caption:focus-visible text{fill:var(--td-brand-color);text-decoration:underline}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus{cursor:pointer}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus .graph-caption-pill{display:inline;fill:var(--td-bg-color-container);stroke:var(--td-component-border);stroke-width:1px;transition:stroke var(--app-motion-instant) ease}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus text{fill:var(--td-text-color-secondary);font-weight:500;stroke:none}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus:hover .graph-caption-pill, .kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus:focus-visible .graph-caption-pill{stroke:var(--td-brand-color)}
+.kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus:hover text, .kb-scope .wiki-graph-canvas .graph-cluster-caption.is-outside-focus:focus-visible text{fill:var(--td-brand-color);text-decoration:none}
+.kb-scope .wiki-graph{flex:1;position:relative;overflow:hidden;width:100%;height:100%}
+.kb-scope .wiki-graph-empty{position:absolute;top:0;left:0;width:100%;height:100%;z-index:20;background:var(--td-bg-color-container)}
+.kb-scope .wiki-graph-help{min-width:240px;max-width:320px}
+.kb-scope .wiki-graph-help .help-section-title{font-size:var(--app-text-xs);line-height:14px;color:var(--td-text-color-placeholder);text-transform:uppercase;letter-spacing:.04em;margin-bottom:8px;-webkit-user-select:none;user-select:none}
+.kb-scope .wiki-graph-help .help-rows{display:flex;flex-direction:column;gap:6px}
+.kb-scope .wiki-graph-help .help-row{display:grid;grid-template-columns:110px 1fr;gap:12px;font-size:var(--app-text-sm);line-height:16px}
+.kb-scope .wiki-graph-help .help-key{color:var(--td-text-color-primary);font-weight:500;white-space:nowrap}
+.kb-scope .wiki-graph-help .help-desc{color:var(--td-text-color-secondary)}
+.kb-scope .wiki-graph-search-container{position:absolute;top:16px;left:16px;display:flex;flex-direction:column;gap:12px;z-index:10;width:320px}
+.kb-scope .wiki-graph-search{width:100%;box-shadow:var(--td-shadow-1);border-radius:var(--app-radius-xs)}
+.kb-scope .wiki-graph-drawer{box-shadow:-4px 0 16px #00000014}
+.kb-scope .graph-search-select{background:var(--td-bg-color-container)!important;opacity:.95}
+.kb-scope .wiki-graph-canvas{width:100%;height:100%;min-height:500px}
+.kb-scope .wiki-graph-search-row{display:flex;align-items:center;gap:8px;width:100%}
+.kb-scope .wiki-graph-search-row .t-popup__reference{display:inline-flex}
+.kb-scope .wiki-graph-search-row .wiki-graph-search{flex:1;min-width:0}
+.kb-scope .wiki-graph-help-trigger{display:inline-flex;align-items:center;justify-content:center;width:32px;height:32px;flex-shrink:0;background:transparent;border:none;color:var(--td-text-color-placeholder);font-size:var(--app-text-2xl);cursor:pointer;-webkit-user-select:none;user-select:none;transition:color var(--app-motion-fast) ease}
+.kb-scope .wiki-graph-help-trigger:hover{color:var(--td-brand-color)}
+.kb-scope .wiki-graph-legend{position:absolute;top:16px;right:16px;background:var(--td-bg-color-container);border:1px solid var(--td-component-stroke);border-radius:var(--app-radius-sm);padding:10px 12px;box-shadow:var(--td-shadow-1);display:flex;flex-direction:column;gap:12px;z-index:10;opacity:.95;transition:right var(--app-motion-slow) cubic-bezier(.645,.045,.355,1)}
+.kb-scope .wiki-graph-legend.legend-shifted{right:496px}
+.kb-scope .legend-items{display:flex;flex-direction:column;gap:8px}
+.kb-scope .legend-item{display:flex;align-items:center;gap:8px;font-size:var(--app-text-xs);color:var(--td-text-color-secondary)}
+.kb-scope .legend-item.clickable{cursor:pointer;transition:all var(--app-motion-fast)}
+.kb-scope .legend-item.clickable:hover{color:var(--td-text-color-primary)}
+.kb-scope .legend-dot{width:10px;height:10px;border-radius:50%;display:inline-block;flex-shrink:0}
+.kb-scope .legend-divider{height:1px;background:var(--td-component-stroke);margin:0 -12px}
+.kb-scope .legend-actions{display:flex;flex-direction:column;gap:8px}
+.kb-scope .legend-action{display:flex;align-items:center;gap:6px;font-size:var(--app-text-xs);line-height:14px;color:var(--td-text-color-secondary);cursor:pointer;-webkit-user-select:none;user-select:none;transition:all var(--app-motion-fast)}
+.kb-scope .wiki-graph-status-card{display:flex;flex-direction:column;gap:4px;max-width:240px;padding-top:8px;border-top:1px dashed var(--td-component-stroke);-webkit-user-select:none;user-select:none}
+.kb-scope .wiki-graph-status-card .status-card-header{display:flex;align-items:center;gap:4px;font-size:var(--app-text-xs);line-height:14px;color:var(--td-text-color-placeholder)}
+.kb-scope .wiki-graph-status-card .status-card-header .t-icon{font-size:var(--app-text-sm)}
+.kb-scope .wiki-graph-status-card .status-card-title{font-weight:500}
+.kb-scope .wiki-graph-status-card .status-card-primary{font-size:var(--app-text-sm);line-height:16px;color:var(--td-text-color-primary);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-scope .wiki-graph-status-card .status-card-secondary{font-size:var(--app-text-xs);line-height:14px;color:var(--td-text-color-secondary)}
+.kb-scope .wiki-drawer-neighbor-hint{font-size:var(--app-text-sm);line-height:16px;color:var(--td-text-color-secondary);-webkit-user-select:none;user-select:none}
+.kb-scope .legend-action-icon{display:inline-flex;align-items:center;justify-content:center;width:14px;height:14px;flex-shrink:0;font-size:var(--app-text-md);line-height:1;color:var(--td-text-color-placeholder);transition:color var(--app-motion-fast)}
+.kb-scope .legend-action-icon .t-icon{font-size:var(--app-text-md);line-height:1}
+.kb-scope .node-active-ring{transform-origin:0 0;animation:node-active-pulse-147e6419 1.5s cubic-bezier(.25,.46,.45,.94) infinite}
+.kb-scope .wiki-graph-drawer{box-shadow:-4px 0 16px #00000014}
+.kb-scope .wiki-graph-drawer .wiki-reader-meta-text{font-size:var(--app-text-md);color:var(--td-text-color-placeholder)}
+.kb-scope .wiki-graph-canvas .node-active-ring{ animation: none !important; }
+.kb-scope .artboard{ width: 1920px; max-width: none; }
+.kb-scope .wiki-browser{ background: #fff; }
+.kb-scope .wiki-graph{ position: relative; }
+.kb-scope .wiki-graph-canvas{ background: transparent; }
+.kb-scope .wiki-graph-search{ position: relative; }
+.kb-scope .wiki-graph-search .t-select__dropdown{
+    position: absolute; left: 0; top: 100%; z-index: 5500; width: 100%;
+    margin-top: 6px;
+  }
+.kb-scope .wiki-graph-search .t-select__dropdown[hidden]{ display: none; }
+.kb-scope .wiki-graph-search .t-select__dropdown .t-select__list{ margin: 0; padding: var(--td-pop-padding-m); list-style: none; }
+.kb-scope .graph-help-popup{ position: absolute; z-index: 5500; }
+.kb-scope .graph-help-popup[hidden]{ display: none; }
+.kb-scope .graph-help-popup .t-popup__content{ padding: 12px 14px !important; }
+.kb-scope .app-shell{ position: relative; }
+.kb-scope .app-shell > .t-drawer.wiki-graph-drawer{
+    position: absolute; inset: 0; z-index: 1500;
+    width: 100%; height: 100%;
+    pointer-events: none; overflow: hidden;
+  }
+.kb-scope .app-shell > .t-drawer.wiki-graph-drawer.is-closed{ display: none; }
+.kb-scope .wiki-graph-drawer .t-drawer__content-wrapper{
+    position: absolute; top: 0; right: 0; bottom: 0;
+    display: flex; flex-direction: column;
+    width: 480px; height: 100%;
+    background: var(--td-bg-color-container);
+    box-shadow: var(--td-shadow-2);
+    overflow: hidden; pointer-events: auto;
+    transform: translateX(0);
+  }
+.kb-scope .wiki-graph-drawer .t-drawer__header{
+    display: flex; align-items: center;
+    flex: none; min-height: var(--td-comp-size-xxxl);
+    padding: 0 var(--td-comp-paddingLR-l) 0 var(--td-comp-paddingLR-l);
+    padding-right: 44px;
+    font: var(--td-font-title-medium); font-weight: 400;
+    color: var(--td-text-color-primary);
+    border-bottom: 1px solid var(--td-border-level-1-color);
+    border-radius: var(--td-radius-small) var(--td-radius-small) 0 0;
+  }
+.kb-scope .wiki-graph-drawer .t-drawer__close-btn{
+    position: absolute; display: flex; justify-content: center; align-items: center;
+    width: var(--td-comp-size-xs); height: var(--td-comp-size-xs);
+    top: calc((var(--td-comp-size-xxxl) - var(--td-comp-size-xs)) / 2);
+    right: var(--td-comp-margin-s);
+    color: var(--td-text-color-primary);
+    border-radius: var(--td-radius-default);
+    cursor: pointer;
+  }
+.kb-scope .wiki-graph-drawer .t-drawer__close-btn:hover{ background-color: var(--td-bg-color-container-hover); }
+.kb-scope .wiki-graph-drawer .t-drawer__close-btn .t-icon{ font-size: calc(var(--td-font-size-body-medium) + 2px); }
+.kb-scope .wiki-graph-drawer .t-drawer__body{
+    flex: 1; min-height: 0;
+    padding: var(--td-comp-paddingTB-l) var(--td-comp-paddingLR-l);
+    overflow: auto;
+  }
+.kb-scope .wiki-graph-drawer .wiki-reader-meta{ margin-bottom: 8px; }
+.kb-scope .wiki-graph-drawer .wiki-drawer-neighbor-hint{ margin-bottom: 16px; }
+.kb-scope .wiki-graph-empty{
+    position: absolute; inset: 0; z-index: 20;
+    display: none; align-items: center; justify-content: center;
+    background: var(--td-bg-color-container);
+  }
+.kb-scope .wiki-graph-empty.is-open{ display: flex; }

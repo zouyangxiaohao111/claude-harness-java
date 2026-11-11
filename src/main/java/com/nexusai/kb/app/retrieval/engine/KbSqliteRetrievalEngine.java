@@ -47,6 +47,17 @@ public class KbSqliteRetrievalEngine implements KbRetrievalEngine {
     private final KbEmbeddingMapper embeddingMapper;
     private final DataSource dataSource;
 
+    /**
+     * 知识库域配置（{@code kb_config}）。
+     *
+     * <p><b>⭐ 为什么用字段注入而不是构造注入</b>：本类构造器被两个直构测试逐位使用
+     * （{@code KnowledgeIngestTest} / {@code KnowledgeServiceTest}），加参数会破坏它们；
+     * 字段注入 + {@code required=false} 让「不走 Spring 的直构」仍可工作（视为未配置 ⇒ 阈值 0 = 不过滤）。
+     * 与 {@code KnowledgeService#indexWriter} 的既有模式一致。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService configService;
+
     public KbSqliteRetrievalEngine(
         KbHybridSearcher searcher,
         KbIndexWriter indexWriter,
@@ -147,8 +158,27 @@ public class KbSqliteRetrievalEngine implements KbRetrievalEngine {
             return List.of();
         }
         String modelId = params.disableVector() ? null : params.modelId();
+        // ⭐ 阈值来自 kb_config（vector_threshold / keyword_threshold）。
+        //   历史缺陷：这里调 4 参重载 ⇒ 阈值恒为 0.0（不过滤）⇒ API 路径召回噪声大，
+        //   而问答链（KbQaPipeline）显式传了阈值 ⇒ 两条路径口径不一致。
+        double vectorThreshold = 0.0;
+        double keywordThreshold = 0.0;
+        if (configService != null) {
+            try {
+                com.nexusai.kb.config.KbConfigService.QaParams qa = configService.readQaParams();
+                if (qa != null) {
+                    vectorThreshold = qa.vectorThreshold();
+                    keywordThreshold = qa.keywordThreshold();
+                }
+            } catch (RuntimeException e) {
+                // ⭐ 降级而不是失败：配置读不出来不该让检索整体 500（readQaParams 内部已全默认）
+                log.warn("[sqlite 引擎] 读检索阈值失败，本次不过滤 kb={} 原因={}",
+                    params.kbId(), e.getMessage());
+            }
+        }
         List<KbHybridSearcher.Hit> hits = searcher.search(
-            params.kbId(), params.query(), params.limit(), modelId);
+            params.kbId(), params.query(), params.limit(), modelId,
+            vectorThreshold, keywordThreshold);
         if (hits == null || hits.isEmpty()) {
             return List.of();
         }

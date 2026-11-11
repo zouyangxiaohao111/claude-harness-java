@@ -72,11 +72,25 @@ export function latestUpdatedAt(sessions: Pick<SessionOrderKey, 'updatedAt'>[]):
 export interface SessionGroupOrderKey {
   key: string
   sessions: Pick<SessionOrderKey, 'updatedAt'>[]
+  /**
+   * 该组对应项目的**注册时间**（`ProjectDto.createdAt` 的 ISO 串）。
+   *
+   * <p>⚠️ 与 {@link SessionGroupOrderKey.sessions} **完全无关** —— 2026-11-10 用户裁定：
+   * 组间序按项目自己的注册先后、排完**不再动**；只有组内会话序随 updatedAt 动。
+   * 原实现读的是「组内最新会话 updatedAt」⇒ 在后面的项目里新建一个会话就把整组顶到最前。
+   *
+   * <p>可空：项目信息未加载（realProjects 尚未拉到）/ 组键为空串 / 迁移前未回填的异常行 → 排在有值之后。
+   */
+  projectCreatedAt?: string | null
 }
 
 /**
- * **分组标题排序的唯一口径**：`'__unbound__'`（未分组）恒末尾 → 组内最新 `updatedAt` 降序
- * （最近活动的组在前）→ 同值时按组键升序兜底。
+ * **分组标题排序的唯一口径**：`'__unbound__'`（未分组）恒末尾 → 项目**注册时间升序**
+ * （先注册的组在前，与任何会话活动无关）→ 同值时按组键升序兜底。
+ *
+ * <p><b>WHY 组间序不看会话</b>：2026-11-10 用户实测「在后面的项目里创建新会话 → 该项目跑到最前面」
+ * 并判为错误。口径改为「项目分组序排完不动，只有组内会话序按 updatedAt 动」——
+ * 组内变化因此**不外溢**到组间。
  *
  * <p><b>WHY 必须导出而非 inline 在 JSX 里</b>：原实现 inline 在 `SessionList.tsx` 的
  * `.sort(...)` 中、对两个非 unbound 组**恒返回 0** —— 它正是本次缺陷的同一处，却因 inline
@@ -86,15 +100,22 @@ export interface SessionGroupOrderKey {
  * 只有偏序，组间序会回落到 `Map` 插入序（随 sessions 传入序漂移），那正是本次要修的缺陷类别。
  * 补组键升序后成为**确定的全序**（与输入顺序无关）。
  *
- * <p>组内最新 `updatedAt` 的口径理由见 {@link latestUpdatedAt}（dsh 的组间持久手工序本项目没有）。
+ * <p>注册时间怎么来的见后端 `projects.created_at`（V280 迁移 + `ProjectService.register`）。
  */
 export function compareGroups(a: SessionGroupOrderKey, b: SessionGroupOrderKey): number {
   const aUnbound = a.key === '__unbound__'
   const bUnbound = b.key === '__unbound__'
   if (aUnbound || bUnbound) return aUnbound && bUnbound ? 0 : aUnbound ? 1 : -1
-  const ua = latestUpdatedAt(a.sessions)
-  const ub = latestUpdatedAt(b.sessions)
-  if (ua > ub) return -1
-  if (ua < ub) return 1
+  // 空值（项目未加载 / created_at 未回填）视作空串 → 升序时沉底，仍是确定序。
+  const ca = a.projectCreatedAt ?? ''
+  const cb = b.projectCreatedAt ?? ''
+  // ⚠️ 升序 + 空值必须**沉底**（不是「空串最小」排最前）：与后端
+  //   `ORDER BY created_at ASC NULLS LAST` 同口径 —— 未回填 / 项目信息未拉到的组
+  //   不得冒充「最早注册」。空值判定放在比较之前，故不能直接 `ca < cb`。
+  const aEmpty = ca === ''
+  const bEmpty = cb === ''
+  if (aEmpty !== bEmpty) return aEmpty ? 1 : -1
+  if (ca < cb) return -1
+  if (ca > cb) return 1
   return a.key < b.key ? -1 : a.key > b.key ? 1 : 0
 }

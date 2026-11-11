@@ -22,7 +22,7 @@ import java.util.Map;
  * <p><b>[E-1a] systemPrompt 是 CC 语义的 pre-append 形态</b>（组装段数组，含 boundary 段，
  * <b>未经</b> {@code appendSystemContext}）: 与 CC 一致 —— CC 的 fork 在自身 query() 内
  * <b>重新执行</b> {@code appendSystemContext + prependUserContext}（query.ts:449-450/:660，
- * forkedAgent.ts:545-556 透传原始三参）。Java {@link ProductionForkedQuery} 发送边界现同样
+ * forkedAgent.ts:545-556 透传原始三参）。Java fork 发送边界现同样
  * <b>先</b> {@code appendSystemContext(systemPrompt, systemContext)} <b>再</b>
  * {@code splitSysPromptPrefix}（append 使用点，单一 static 实现）——因此本字段存 pre-append
  * 值 + 独立 {@link #systemContext} map 即可让 fork 发送 blocks 与主线程一致。
@@ -45,7 +45,7 @@ public record ForkRawMaterial(
         //   （sessionMemory.ts:411-418 从 toolUseContext.options 取 mainLoopModel 组装 fork
         //   systemPrompt；extractMemories.ts:372 createCacheSafeParams(context) 同源）。
         //   WHY: 生产 supplier 的 toolUseContext 由 buildProductionCacheSafeParams 8 参构造 →
-        //   effectiveModelName 缺省 null → ProductionForkedQuery 会话模型直传解析取不到模型 →
+        //   effectiveModelName 缺省 null → QueryLoopForkedQuery 会话模型直传解析取不到模型 →
         //   model=null → provider 回落 MockLlmProvider（假回复 / 永不 Edit）。null = 未捕获
         //   （非主循环入口/测试直构）→ 不造字段，回落既有全局 supplier 语义。
         String effectiveModelName,
@@ -126,7 +126,7 @@ public record ForkRawMaterial(
      * {@code options.tools} 与 {@code options.mainLoopModel}。Java 侧这两个维度来自不同源：
      * 工具集 = 生产 supplier 的合成上下文（8 参构造 → {@code effectiveModelName}=null），
      * 会话模型 = psContext/{@link ForkRawMaterial} 的会话捕获。若只传 supplier 上下文，
-     * {@code ProductionForkedQuery} 的会话模型直传分支（:239-256）读不到模型 → 回落全局
+     * 会话模型直传分支读不到模型 → 回落全局
      * supplier（settings.json 无 model → model=null → {@code ProviderConfig.empty()}）→
      * provider 回落 {@code MockLlmProvider}（假回复 / 永不 Edit，summary.md 冻结不前进）。
      *

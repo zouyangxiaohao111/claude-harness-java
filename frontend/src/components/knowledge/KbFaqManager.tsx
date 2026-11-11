@@ -11,7 +11,7 @@ interface Props {
 const PAGE_SIZE = 20
 
 /**
- * FAQ 条目管理 · 对齐源侧 `components/FAQEntryManager.vue`。
+ * FAQ 条目管理 · 对齐源侧 `views/knowledge/components/FAQEntryManager.vue`（列表视图）。
  *
  * <h2>⭐ FAQ 库与文档库的区别</h2>
  * 文档库是「上传文件 → 解析 → 切块」；FAQ 库是<b>结构化的问答对</b>：
@@ -26,6 +26,21 @@ const PAGE_SIZE = 20
  *   <li><b>相似问法有多行</b>：用户按行输入，提交前要 trim + 去空行；
  *       空数组不能传 `[""]`（后端会当成一条空问法）。</li>
  * </ol>
+ *
+ * <h2>类名依据</h2>
+ * 逐层照源侧列表视图（`FAQEntryManager.vue:99-420` + `FAQBatchBar.vue:35-46`）：
+ * `.faq-manager > .faq-content > .faq-main > .faq-card-area > .faq-filter-bar +
+ * .faq-scroll-container > .faq-entry-list > .faq-list-row > .faq-list-check /
+ * .faq-list-main(.faq-list-question + .faq-list-tag) / .faq-list-meta(.faq-list-counts +
+ * .faq-list-updated) / .faq-list-actions / .faq-list-details`。
+ * 批量条用 `.faq-batch-bar__*`；空态用 `.faq-empty-state > .empty-content`。
+ *
+ * <p>⚠️ 设计稿 09 用的 `.faq-toolbar` / `.faq-list` / `.faq-item` / `.faq-q` / `.faq-a` /
+ * `.faq-sim` / `.faq-meta` / `.faq-ops` / `.faq-edit` **只在设计稿的内联 &lt;style&gt; 里定义**，
+ * 源站源码与 `styles/kb/*.css` 均 0 条规则（见报告 §5）⇒ 改用源站真类名，
+ * 语义一一对应：toolbar→`faq-filter-bar`、list→`faq-entry-list`、item→`faq-list-row`、
+ * q→`faq-list-question`、a→`faq-list-details`、sim/meta→`faq-list-counts`/`faq-list-meta`、
+ * ops→`faq-list-actions`、edit→`faq-editor-form`。
  */
 export function KbFaqManager({ baseId, showToast }: Props) {
   const [items, setItems] = useState<KbFaqEntry[]>([])
@@ -130,132 +145,247 @@ export function KbFaqManager({ baseId, showToast }: Props) {
   }
 
   return (
-    <div className="kb-faq">
-      {/* 工具条 */}
-      <div className="kb-faq-bar">
-        <input
-          className="kb-input kb-doc-search"
-          placeholder="搜索问题或答案…"
-          value={keyword}
-          onChange={(e) => setKeyword(e.target.value)}
-        />
-        <select
-          className="kb-select"
-          value={enabledFilter}
-          onChange={(e) => setEnabledFilter(e.target.value as '' | 'true' | 'false')}
-          aria-label="按启用状态筛选"
-        >
-          <option value="">全部状态</option>
-          <option value="true">已启用</option>
-          <option value="false">已停用</option>
-        </select>
-        <span className="kb-faq-count">共 {total} 条</span>
-        <button type="button" className="kb-btn primary" onClick={() => setCreating(true)}>
-          ＋ 新建问答
-        </button>
-      </div>
+    <div className="faq-manager">
+      <div className="faq-content">
+        <div className="faq-main">
+          <div className="faq-card-area">
+            {/* 工具条（源侧 `.faq-filter-bar`）—— 搜索 + 筛选 + 全选 + 计数 + 新建 */}
+            <div className="faq-filter-bar">
+              <div className="t-input__wrap faq-search-input">
+                <div className="t-input t-input--prefix">
+                  <span className="t-input__prefix t-input__prefix-icon" aria-hidden="true">⌕</span>
+                  <input
+                    className="t-input__inner"
+                    placeholder="搜索问题或答案…"
+                    aria-label="搜索问题或答案"
+                    value={keyword}
+                    onChange={(e) => setKeyword(e.target.value)}
+                  />
+                </div>
+              </div>
 
-      {/* 批量条 */}
-      {selected.size > 0 && (
-        <div className="kb-batch-bar">
-          <span className="kb-batch-count">已选 {selected.size} 条</span>
-          <button type="button" className="kb-btn ghost" onClick={() => void batchSetEnabled(true)}>批量启用</button>
-          <button type="button" className="kb-btn ghost" onClick={() => void batchSetEnabled(false)}>批量停用</button>
-          <button type="button" className="kb-btn ghost danger" onClick={() => void batchDelete()}>批量删除</button>
-        </div>
-      )}
-
-      {error && <div className="kb-err">{error}</div>}
-
-      {/* 列表 */}
-      {loading && items.length === 0 && <div className="kb-wiki-loading">加载中…</div>}
-
-      {!loading && items.length === 0 && (
-        <div className="kb-empty-cards">
-          <div className="kb-empty-title">
-            {keyword.trim() || enabledFilter ? '没有匹配的问答' : '这个 FAQ 库还没有条目'}
-          </div>
-          <div className="kb-empty-sub">
-            {keyword.trim() || enabledFilter
-              ? '换个关键词或清空筛选试试'
-              : 'FAQ 库由「标准问题 + 相似问法 + 答案」组成，命中后直接返回答案'}
-          </div>
-          {!(keyword.trim() || enabledFilter) && (
-            <button type="button" className="kb-btn primary" onClick={() => setCreating(true)}>
-              新建第一条问答
-            </button>
-          )}
-        </div>
-      )}
-
-      {items.length > 0 && (
-        <div className="kb-faq-list">
-          <div className="kb-faq-row kb-faq-head">
-            <span className="kb-faq-check">
-              <input type="checkbox" checked={allSelected} onChange={toggleAll} aria-label="全选" />
-            </span>
-            <span className="kb-faq-q">标准问题</span>
-            <span className="kb-faq-sim">相似问法</span>
-            <span className="kb-faq-tag">标签</span>
-            <span className="kb-faq-state">状态</span>
-            <span className="kb-faq-ops">操作</span>
-          </div>
-
-          {items.map((it) => (
-            <div className="kb-faq-row" key={it.id}>
-              <span className="kb-faq-check">
-                <input
-                  type="checkbox"
-                  checked={selected.has(it.id)}
-                  onChange={() => toggleOne(it.id)}
-                  aria-label={`选择 ${it.standard_question}`}
-                />
-              </span>
-              <span className="kb-faq-q" title={it.standard_question}>
-                <span className="kb-faq-qtext">{it.standard_question || '（空）'}</span>
-                <span className="kb-faq-answer">
-                  {it.answers?.[0] || '（无答案）'}
+              <div className="faq-filter-bar__filters">
+                <select
+                  className="t-input"
+                  value={enabledFilter}
+                  onChange={(e) => setEnabledFilter(e.target.value as '' | 'true' | 'false')}
+                  aria-label="按启用状态筛选"
+                >
+                  <option value="">全部状态</option>
+                  <option value="true">已启用</option>
+                  <option value="false">已停用</option>
+                </select>
+                {/* 全选：源侧列表视图的勾选在行内（`.faq-list-check`），
+                    整表全选由批次条承接 —— 本仓保留原能力，放在筛选行里。
+                    ⚠️ 源侧是 `<t-checkbox>`（渲染成 `<label class="t-checkbox">`）⇒ 也用 label，
+                    否则原生 input 被 `.t-checkbox__former` 视觉隐藏后点不到。 */}
+                <span className="faq-list-check">
+                  <label className={`t-checkbox${allSelected ? ' t-is-checked' : ''}`}>
+                    <input
+                      type="checkbox"
+                      className="t-checkbox__former"
+                      checked={allSelected}
+                      onChange={toggleAll}
+                      aria-label="全选"
+                    />
+                    <span className="t-checkbox__input" />
+                  </label>
                 </span>
-              </span>
-              <span className="kb-faq-sim" title={(it.similar_questions ?? []).join(' / ')}>
-                {it.similar_questions?.length
-                  ? `${it.similar_questions.length} 条`
-                  : '—'}
-              </span>
-              <span className="kb-faq-tag">
-                {it.tag_name ? <span className="kb-tag-chip">{it.tag_name}</span> : '—'}
-              </span>
-              <span className={`kb-faq-state${it.is_enabled ? ' is-on' : ''}`}>
-                <i className="kb-dot" />
-                {it.is_enabled ? '已启用' : '已停用'}
-              </span>
-              <span className="kb-faq-ops">
-                <button type="button" className="kb-link" onClick={() => setEditing(it)}>编辑</button>
+              </div>
+
+              <div className="faq-filter-bar__trailing">
+                <span className="faq-list-meta">共 {total} 条</span>
                 <button
                   type="button"
-                  className="kb-link"
-                  onClick={async () => {
-                    try {
-                      await knowledgeApi.patchFaq(baseId, [it.id], { is_enabled: !it.is_enabled })
-                      void load()
-                    } catch (e) { showToast(toMessage(e), 'info') }
-                  }}
+                  className="t-button t-button--variant-base t-button--theme-primary t-size-s"
+                  onClick={() => setCreating(true)}
                 >
-                  {it.is_enabled ? '停用' : '启用'}
+                  <span className="t-button__text">＋ 新建问答</span>
                 </button>
-                <button type="button" className="kb-link danger" onClick={() => void removeOne(it)}>删除</button>
-              </span>
+              </div>
             </div>
-          ))}
-        </div>
-      )}
 
-      {/* 分页 */}
-      {pages > 1 && (
-        <div className="kb-faq-pager">
-          <button type="button" className="kb-btn ghost" disabled={page <= 1} onClick={() => setPage(page - 1)}>上一页</button>
-          <span>{page} / {pages}</span>
-          <button type="button" className="kb-btn ghost" disabled={page >= pages} onClick={() => setPage(page + 1)}>下一页</button>
+            {error && <div className="kb-err">{error}</div>}
+
+            {loading && items.length === 0 && (
+              <div className="faq-load-more">加载中…</div>
+            )}
+
+            {!loading && items.length === 0 && (
+              /* 源侧空态：`.faq-empty-state > .empty-content > .empty-icon / .empty-text / .empty-desc` */
+              <div className="faq-empty-state">
+                <div className="empty-content">
+                  <div className="empty-icon" aria-hidden="true">▧</div>
+                  <div className="empty-text">
+                    {keyword.trim() || enabledFilter ? '没有匹配的问答' : '这个 FAQ 库还没有条目'}
+                  </div>
+                  <div className="empty-desc">
+                    {keyword.trim() || enabledFilter
+                      ? '换个关键词或清空筛选试试'
+                      : 'FAQ 库由「标准问题 + 相似问法 + 答案」组成，命中后直接返回答案'}
+                  </div>
+                  {!(keyword.trim() || enabledFilter) && (
+                    <button
+                      type="button"
+                      className="t-button t-button--variant-base t-button--theme-primary t-size-s"
+                      onClick={() => setCreating(true)}
+                    >
+                      <span className="t-button__text">新建第一条问答</span>
+                    </button>
+                  )}
+                </div>
+              </div>
+            )}
+
+            <div className="faq-scroll-container">
+              {items.length > 0 && (
+                <div className="faq-entry-list">
+                  {items.map((it) => (
+                    <div className={`faq-list-row is-selectable${selected.has(it.id) ? ' selected' : ''}`} key={it.id}>
+                      <div className="faq-list-check">
+                        <label className={`t-checkbox${selected.has(it.id) ? ' t-is-checked' : ''}`}>
+                          <input
+                            type="checkbox"
+                            className="t-checkbox__former"
+                            checked={selected.has(it.id)}
+                            onChange={() => toggleOne(it.id)}
+                            aria-label={`选择 ${it.standard_question}`}
+                          />
+                          <span className="t-checkbox__input" />
+                        </label>
+                      </div>
+
+                      <div className="faq-list-main">
+                        {/* 源侧列表视图的 `.faq-list-question` 是 <button>（点击展开详情）；
+                            本仓答案常显、没有展开态 ⇒ 用源侧另一处同语义的静态问题文本类
+                            `.faq-question`（网格卡版本，无 cursor:pointer），
+                            ⛔ 不用 `.faq-list-question` 以免出现「有手型光标但点了没反应」。 */}
+                        <div className="faq-question" title={it.standard_question}>
+                          <span>{it.standard_question || '（空）'}</span>
+                        </div>
+                        <div className="faq-list-tag">
+                          {it.tag_name ? (
+                            <span className="t-tag t-tag--default t-tag--light t-size-s">
+                              <span className="faq-list-tag-text">{it.tag_name}</span>
+                            </span>
+                          ) : (
+                            <span className="t-tag t-tag--default t-tag--light t-size-s">
+                              <span className="faq-list-tag-text">未打标签</span>
+                            </span>
+                          )}
+                        </div>
+                      </div>
+
+                      <div className="faq-list-meta">
+                        <div className="faq-list-counts">
+                          <span>{it.similar_questions?.length ?? 0} 相似问法</span>
+                          <span>{it.negative_questions?.length ?? 0} 否定问法</span>
+                          <span>{it.answers?.length ?? 0} 答案</span>
+                        </div>
+                        <div className="faq-list-updated">更新于 {it.updated_at || '—'}</div>
+                      </div>
+
+                      <div className="faq-list-actions">
+                        <span className={`status-item-compact${it.is_enabled ? ' success' : ''}`}>
+                          <span className={`status-icon${it.is_enabled ? ' success' : ' warning'}`} aria-hidden="true">●</span>
+                          <span>{it.is_enabled ? '已启用' : '已停用'}</span>
+                        </span>
+                        {/* 源侧这三个动作在 `.more-wrap` 弹出菜单里（`.popup-menu-item`）；
+                            本仓一直是行内三个文字按钮（功能保留），用源站自己的文字按钮写法 */}
+                        <button
+                          type="button"
+                          className="t-button t-button--variant-text t-button--theme-default t-size-s"
+                          onClick={() => setEditing(it)}
+                        >
+                          <span className="t-button__text">编辑</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="t-button t-button--variant-text t-button--theme-default t-size-s"
+                          onClick={async () => {
+                            try {
+                              await knowledgeApi.patchFaq(baseId, [it.id], { is_enabled: !it.is_enabled })
+                              void load()
+                            } catch (e) { showToast(toMessage(e), 'info') }
+                          }}
+                        >
+                          <span className="t-button__text">{it.is_enabled ? '停用' : '启用'}</span>
+                        </button>
+                        <button
+                          type="button"
+                          className="t-button t-button--variant-text t-button--theme-danger t-size-s"
+                          onClick={() => void removeOne(it)}
+                        >
+                          <span className="t-button__text">删除</span>
+                        </button>
+                      </div>
+
+                      {/* 答案（源侧 `.faq-list-details`，展开态容器；本仓常显第一条答案） */}
+                      <div className="faq-list-details">
+                        <div className="faq-list-detail-section">
+                          <div className="faq-list-detail-label">答案</div>
+                          <ul>
+                            <li>{it.answers?.[0] || '（无答案）'}</li>
+                          </ul>
+                        </div>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+
+              {pages > 1 && (
+                <div className="faq-load-more">
+                  <button
+                    type="button"
+                    className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                    disabled={page <= 1}
+                    onClick={() => setPage(page - 1)}
+                  >
+                    <span className="t-button__text">上一页</span>
+                  </button>
+                  <span style={{ margin: '0 12px' }}>{page} / {pages}</span>
+                  <button
+                    type="button"
+                    className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                    disabled={page >= pages}
+                    onClick={() => setPage(page + 1)}
+                  >
+                    <span className="t-button__text">下一页</span>
+                  </button>
+                </div>
+              )}
+            </div>
+          </div>
+        </div>
+      </div>
+
+      {/* 批量条（源侧 `components/FAQBatchBar.vue`：`.faq-batch-bar > .faq-batch-bar__inner > __selection + __actions`）*/}
+      {selected.size > 0 && (
+        <div className="faq-batch-bar" role="region" aria-label={`已选 ${selected.size} 条`}>
+          <div className="faq-batch-bar__inner">
+            <div className="faq-batch-bar__selection">
+              <span className="faq-batch-bar__count">已选 {selected.size} 条</span>
+              <button
+                type="button"
+                className="t-button t-button--variant-text t-button--theme-default t-size-s"
+                onClick={() => setSelected(new Set())}
+              >
+                <span className="t-button__text">取消选择</span>
+              </button>
+            </div>
+            <div className="faq-batch-bar__actions">
+              <button type="button" className="t-button t-button--variant-outline t-button--theme-default t-size-s" onClick={() => void batchSetEnabled(true)}>
+                <span className="t-button__text">批量启用</span>
+              </button>
+              <button type="button" className="t-button t-button--variant-outline t-button--theme-default t-size-s" onClick={() => void batchSetEnabled(false)}>
+                <span className="t-button__text">批量停用</span>
+              </button>
+              <button type="button" className="t-button t-button--variant-outline t-button--theme-danger t-size-s" onClick={() => void batchDelete()}>
+                <span className="t-button__text">批量删除</span>
+              </button>
+            </div>
+          </div>
         </div>
       )}
 
@@ -327,69 +457,102 @@ function FaqEditor({ baseId, entry, tags, showToast, onClose, onSaved }: {
   }
 
   return (
+    /* 外壳沿用本仓既有弹窗（`kb-mini-*` 在 globals.css，本仓通用）；
+       表单主体用源侧 `.faq-editor-form` + `.form-item/.form-label/.form-tip` */
     <div className="kb-mini-modal kb-mini-lg" role="dialog" aria-modal="true" aria-label={entry ? '编辑问答' : '新建问答'}>
       <div className="kb-mini-head">
         <strong>{entry ? '编辑问答' : '新建问答'}</strong>
         <button type="button" className="kb-mini-x" onClick={onClose}>✕</button>
       </div>
-      <div className="kb-mini-body kb-faq-editor">
-        <label className="kb-mini-label">标准问题 <em>*</em></label>
-        <input
-          className="kb-input"
-          placeholder="用户最常这样问…"
-          value={question}
-          onChange={(e) => setQuestion(e.target.value)}
-          autoFocus
-        />
-
-        <label className="kb-mini-label">相似问法（每行一条）</label>
-        <textarea
-          className="kb-input kb-mini-textarea kb-faq-textarea"
-          placeholder={'换一种说法\n再换一种'}
-          value={similars}
-          onChange={(e) => setSimilars(e.target.value)}
-          rows={3}
-        />
-
-        <label className="kb-mini-label">否定问法（每行一条，命中则不返回本答案）</label>
-        <textarea
-          className="kb-input kb-mini-textarea kb-faq-textarea"
-          placeholder="容易混淆但不应命中的问法"
-          value={negatives}
-          onChange={(e) => setNegatives(e.target.value)}
-          rows={2}
-        />
-
-        <label className="kb-mini-label">答案（每行一条）<em>*</em></label>
-        <textarea
-          className="kb-input kb-mini-textarea"
-          placeholder="回答内容"
-          value={answers}
-          onChange={(e) => setAnswers(e.target.value)}
-          rows={6}
-        />
-
-        <div className="kb-faq-editor-row">
-          <div>
-            <label className="kb-mini-label">标签</label>
-            <select
-              className="kb-select"
-              value={tagId ?? ''}
-              onChange={(e) => setTagId(e.target.value ? Number(e.target.value) : null)}
-            >
-              <option value="">无标签</option>
-              {tags.map((t) => (
-                <option key={t.id} value={t.id}>{t.name}</option>
-              ))}
-            </select>
+      <div className="kb-mini-body faq-editor-form">
+        <div className="form-item">
+          <label className="form-label required">标准问题</label>
+          <div className="t-input__wrap">
+            <div className="t-input">
+              <input
+                className="t-input__inner"
+                placeholder="用户最常这样问…"
+                value={question}
+                onChange={(e) => setQuestion(e.target.value)}
+                autoFocus
+              />
+            </div>
           </div>
-          <label className="kbs-inline">
-            <input type="checkbox" checked={enabled} onChange={(e) => setEnabled(e.target.checked)} />
-            <span>启用</span>
+        </div>
+
+        <div className="form-item">
+          <label className="form-label">相似问法（每行一条）</label>
+          <div className="t-textarea">
+            <textarea
+              className="t-textarea__inner"
+              placeholder={'换一种说法\n再换一种'}
+              value={similars}
+              onChange={(e) => setSimilars(e.target.value)}
+              rows={3}
+            />
+          </div>
+        </div>
+
+        <div className="form-item">
+          <label className="form-label">否定问法（每行一条，命中则不返回本答案）</label>
+          <div className="t-textarea">
+            <textarea
+              className="t-textarea__inner"
+              placeholder="容易混淆但不应命中的问法"
+              value={negatives}
+              onChange={(e) => setNegatives(e.target.value)}
+              rows={2}
+            />
+          </div>
+        </div>
+
+        <div className="form-item">
+          <label className="form-label required">答案（每行一条）</label>
+          <div className="t-textarea">
+            <textarea
+              className="t-textarea__inner"
+              placeholder="回答内容"
+              value={answers}
+              onChange={(e) => setAnswers(e.target.value)}
+              rows={6}
+            />
+          </div>
+        </div>
+
+        <div className="form-item">
+          <label className="form-label">标签</label>
+          <select
+            className="t-input"
+            value={tagId ?? ''}
+            onChange={(e) => setTagId(e.target.value ? Number(e.target.value) : null)}
+          >
+            <option value="">无标签</option>
+            {tags.map((t) => (
+              <option key={t.id} value={t.id}>{t.name}</option>
+            ))}
+          </select>
+        </div>
+
+        <div style={{ display: 'flex', alignItems: 'center', gap: 16 }}>
+          <label className={`t-checkbox${enabled ? ' t-is-checked' : ''}`}>
+            <input
+              type="checkbox"
+              className="t-checkbox__former"
+              checked={enabled}
+              onChange={(e) => setEnabled(e.target.checked)}
+            />
+            <span className="t-checkbox__input" />
+            <span className="t-checkbox__label">启用</span>
           </label>
-          <label className="kbs-inline">
-            <input type="checkbox" checked={recommended} onChange={(e) => setRecommended(e.target.checked)} />
-            <span>推荐</span>
+          <label className={`t-checkbox${recommended ? ' t-is-checked' : ''}`}>
+            <input
+              type="checkbox"
+              className="t-checkbox__former"
+              checked={recommended}
+              onChange={(e) => setRecommended(e.target.checked)}
+            />
+            <span className="t-checkbox__input" />
+            <span className="t-checkbox__label">推荐</span>
           </label>
         </div>
       </div>

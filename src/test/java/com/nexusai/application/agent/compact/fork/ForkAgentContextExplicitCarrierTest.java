@@ -46,7 +46,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       {@code ToolUseContext.with(SubagentContextOverrides)} 对 agentContext 取 null
  *       （「新 agent 不继承父」语义，对 {@code createSubagentContext} 的真子代理正确），
  *       但 fork <b>不是新 agent</b>，故按 SubagentExecutor 同款「显式盖章」手法补上。</li>
- *   <li>{@code ProductionForkedQuery.streamOnce} 从 fork 上下文的<b>显式字段</b>取
+ *   <li>{@code 主循环 provider.stream} 从 fork 上下文的<b>显式字段</b>取
  *       （原读 {@code AgentContext.getAgentContext()} ambient —— 已删）。</li>
  * </ol>
  *
@@ -144,7 +144,7 @@ class ForkAgentContextExplicitCarrierTest {
     }
 
     @Test
-    @DisplayName("★ 端到端：ProductionForkedQuery 把发起者上下文送到 provider 的显式实参")
+    @DisplayName("★ 端到端：fork 发送边界把发起者上下文送到 provider 的显式实参")
     void productionForkedQuery_sendsInitiatorContextToProvider() {
         AgentContext initiator = ctx();
         Object[] capturedAgentContext = new Object[]{null};
@@ -153,17 +153,44 @@ class ForkAgentContextExplicitCarrierTest {
         ForkQueryParams params = new ForkQueryParams(
             List.of(userMessage("u-1")),
             List.of(), Map.of(), Map.of(),
-            null, tuc(initiator),
+            allowAll(), tuc(initiator),
             QuerySource.COMPACT, null, 1, true, false, null);
 
-        new ProductionForkedQuery(() -> provider, () -> "test-model",
-            () -> new ProviderConfig("https://api.test", "sk-test"),
-            null, null).run(params);
+        forkQuery(provider).run(params);
 
         assertThat(capturedAgentContext[0])
             .as("provider.stream 的末位显式实参 = fork 上下文字段携带的**同一** agentContext 实例；"
                 + "RED ⇒ 归因上下文没走到发送边界（旧实现读 ambient 在该线程不可靠）")
             .isSameAs(initiator);
+    }
+
+    /** 放行任意工具的 canUseTool（主循环对后台 fork 来源强制要求注入，INV-6 fail-loud）。 */
+    private static com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool allowAll() {
+        return (tool, input, cctx, toolUseId, forceDecision) ->
+            com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow();
+    }
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(LlmProvider provider) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true);
+            f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "test-model",
+            () -> new ProviderConfig("https://api.test", "sk-test"), factory);
     }
 
     // ──────────────────────────── stub ────────────────────────────

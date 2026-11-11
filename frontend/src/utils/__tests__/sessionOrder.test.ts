@@ -86,42 +86,71 @@ describe('compareSessions', () => {
 })
 
 describe('compareGroups', () => {
-  const g = (key: string, updatedAtList: (string | null | undefined)[]): SessionGroupOrderKey =>
-    ({ key, sessions: updatedAtList.map((u, i) => s(`${key}-${i}`, u)) })
+  /**
+   * 组入参：key + 该组会话（组间序**不看**会话，仍带上以钉住「看了就是 bug」）
+   * + projectCreatedAt（组间序的唯一依据）。
+   */
+  const g = (key: string, updatedAtList: (string | null | undefined)[], createdAt?: string | null): SessionGroupOrderKey =>
+    ({ key, sessions: updatedAtList.map((u, i) => s(`${key}-${i}`, u)), projectCreatedAt: createdAt })
   const order = (list: SessionGroupOrderKey[]) => [...list].sort(compareGroups).map((x) => x.key)
 
-  it("'__unbound__' 恒末尾（无论其组内最新 updatedAt 多大）· WHY：未分组不是一个项目，混在项目组之间会让左栏『工作区』语义错乱", () => {
+  it("'__unbound__' 恒末尾（无论其组内最新 updatedAt / 注册时间如何）· WHY：未分组不是一个项目，混在项目组之间会让左栏『工作区』语义错乱", () => {
     const t = '2026-09-12T10:00:00.100000+08:00'
-    // unbound 的最新 updatedAt 最大，仍必须排最后
-    expect(order([g('__unbound__', ['2026-09-12T23:59:59.999999+08:00']), g('p1', [t])])).toEqual(['p1', '__unbound__'])
-    expect(order([g('p1', [t]), g('__unbound__', ['2026-09-12T23:59:59.999999+08:00'])])).toEqual(['p1', '__unbound__'])
+    // unbound 的最新 updatedAt 最大、且注册时间最早，仍必须排最后
+    expect(order([g('__unbound__', ['2026-09-12T23:59:59.999999+08:00'], '2020-01-01T00:00:00Z'), g('p1', [t], '2026-01-01T00:00:00Z')]))
+      .toEqual(['p1', '__unbound__'])
+    expect(order([g('p1', [t], '2026-01-01T00:00:00Z'), g('__unbound__', ['2026-09-12T23:59:59.999999+08:00'], '2020-01-01T00:00:00Z')]))
+      .toEqual(['p1', '__unbound__'])
     // 只有 unbound
-    expect(order([g('__unbound__', [t])])).toEqual(['__unbound__'])
+    expect(order([g('__unbound__', [t], null)])).toEqual(['__unbound__'])
   })
 
-  it('组内最新 updatedAt 降序（最近活动的组在前）· WHY：原实现 comparator 对两个非 unbound 组恒返回 0 → 组间序随 Map 插入序漂移，这就是「排序不固定」的同一处', () => {
-    const early = g('p-early', ['2026-09-12T09:00:00.100000+08:00'])
-    const late = g('p-late', ['2026-09-12T20:00:00.100000+08:00'])
-    const mid = g('p-mid', ['2026-09-12T12:00:00.100000+08:00'])
-    // 任一输入顺序都得同一结果
-    expect(order([early, late, mid])).toEqual(['p-late', 'p-mid', 'p-early'])
-    expect(order([mid, early, late])).toEqual(['p-late', 'p-mid', 'p-early'])
-    // 组内取的是【最新】一条，而不是第一条/最后一条
-    expect(order([g('p1', ['2026-09-12T09:00:00.100000+08:00', '2026-09-12T22:00:00.100000+08:00']), g('p2', ['2026-09-12T12:00:00.100000+08:00'])]))
-      .toEqual(['p1', 'p2'])
-  })
-
-  it('组内最新 updatedAt 同值时按组键升序 · WHY：与 compareSessions 的 id 兜底同源 —— 同值只有偏序，组间序会回落到 Map 插入序', () => {
+  it('项目注册时间升序（先注册的项目在前）· WHY：2026-11-10 用户裁定「项目分组序按项目自身、排完不再动」，注册先后是唯一能从数据推导的固定序', () => {
     const t = '2026-09-12T10:00:00.100000+08:00'
-    expect(order([g('p-b', [t]), g('p-a', [t]), g('p-c', [t])])).toEqual(['p-a', 'p-b', 'p-c'])
-    expect(order([g('p-c', [t]), g('p-b', [t]), g('p-a', [t])])).toEqual(['p-a', 'p-b', 'p-c'])
-    // 全空 updatedAt 也走同一条兜底（不抛、不依赖插入序）
-    expect(order([g('p-b', [null]), g('p-a', [undefined])])).toEqual(['p-a', 'p-b'])
+    const first = g('p-first', [t], '2020-01-01T00:00:01Z')
+    const second = g('p-second', [t], '2020-01-01T00:00:02Z')
+    const third = g('p-third', [t], '2020-01-01T00:00:03Z')
+    expect(order([first, second, third])).toEqual(['p-first', 'p-second', 'p-third'])
+    // 任一输入顺序都得同一结果
+    expect(order([third, first, second])).toEqual(['p-first', 'p-second', 'p-third'])
+  })
+
+  it('组间序**完全不看会话活动** · WHY：这是本次缺陷的判别性用例 —— 在最后注册的项目里新建一个会话（updatedAt 最新）不得把该组顶到最前；原口径（组内最新 updatedAt 降序）在此必红', () => {
+    const oldT = '2026-09-12T09:00:00.100000+08:00'
+    const newestT = '2026-09-12T23:59:59.999999+08:00'
+    // p-late 后注册，但组内有「最新」的会话；p-early 先注册，组内会话全都很旧
+    const early = g('p-early', [oldT], '2020-01-01T00:00:01Z')
+    const late = g('p-late', [newestT], '2020-01-01T00:00:02Z')
+    expect(order([late, early])).toEqual(['p-early', 'p-late'])
+    // 同一组内再加一条更新的会话，组序仍不变
+    const lateEvenNewer = g('p-late', [newestT, '2026-09-13T00:00:00.000001+08:00'], '2020-01-01T00:00:02Z')
+    expect(order([lateEvenNewer, early])).toEqual(['p-early', 'p-late'])
+  })
+
+  it('注册时间同值时按组键升序 · WHY：与 compareSessions 的 id 兜底同源 —— 同值只有偏序，组间序会回落到 Map 插入序', () => {
+    const t = '2026-09-12T10:00:00.100000+08:00'
+    const c = '2020-01-01T00:00:01Z'
+    expect(order([g('p-b', [t], c), g('p-a', [t], c), g('p-c', [t], c)])).toEqual(['p-a', 'p-b', 'p-c'])
+    expect(order([g('p-c', [t], c), g('p-b', [t], c), g('p-a', [t], c)])).toEqual(['p-a', 'p-b', 'p-c'])
+  })
+
+  it('注册时间缺失（null / undefined / 空串）沉底，且仍按组键兜底 · WHY：项目信息未拉到时不能让该组冒充「最早注册」排到最前（后端 ASC NULLS LAST 同口径）', () => {
+    const t = '2026-09-12T10:00:00.100000+08:00'
+    expect(order([g('p-none', [t], null), g('p-known', [t], '2020-01-01T00:00:01Z')]))
+      .toEqual(['p-known', 'p-none'])
+    expect(order([g('p-none', [t], undefined), g('p-known', [t], '2020-01-01T00:00:01Z')]))
+      .toEqual(['p-known', 'p-none'])
+    // 两个都缺 → 按组键升序
+    expect(order([g('p-b', [t], null), g('p-a', [t], undefined)])).toEqual(['p-a', 'p-b'])
   })
 
   it('全序性：500 次乱序输入只产出同一种组序 · WHY：把「顺序确定」固化为不变量 —— 偏序（恒 0 版）在乱序输入下会产出多种组序', () => {
     const t = '2026-09-12T10:00:00.100000+08:00'
-    const base = [g('p-1', [t]), g('p-2', [t]), g('p-3', [t]), g('p-4', [t]), g('__unbound__', [t])]
+    const base = [
+      g('p-1', [t], '2020-01-01T00:00:01Z'), g('p-2', [t], '2020-01-01T00:00:02Z'),
+      g('p-3', [t], '2020-01-01T00:00:03Z'), g('p-4', [t], '2020-01-01T00:00:04Z'),
+      g('__unbound__', [t], '2019-01-01T00:00:00Z'),
+    ]
     const expected = ['p-1', 'p-2', 'p-3', 'p-4', '__unbound__']
     const seen = new Set<string>()
     for (let i = 0; i < 500; i++) {

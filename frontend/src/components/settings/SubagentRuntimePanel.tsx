@@ -10,7 +10,8 @@ import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
 
 interface Props {
   settings: AppSettings | null
-  onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
+  /** 返回 true = 保存成功；false = 失败（失败已由 App 侧 toast 报出） */
+  onSaveSettings: (req: UpdateSettingsRequest) => Promise<boolean>
   showToast: (msg: string, kind?: 'success' | 'info') => void
   sessionId?: string | null
 }
@@ -70,23 +71,25 @@ export function SubagentRuntimePanel({ settings, onSaveSettings, showToast, sess
   const usingBuiltin = defaultRuntime === ''
 
   /**
-   * 该 runtime 对应的 subagent_type（设置里存的是 agentType，不是 runtime）。
+   * 该 runtime 是否已注册为可派发 agent（agents 目录里有对应 md）。
    *
-   * <p>没建 md 时后端也能按 runtime 名占位，但那样会走「回落内置 + WARN」；
-   * 所以优先用 registry 里真实存在的 agentType。
+   * <p>没有 md 时后端会「回落内置 + WARN」⇒ 界面不该让用户把它设为默认。
    */
-  const agentTypeOf = (runtime: string): string | null => {
-    const hit = agents.find((a) => a.runtime === runtime)
-    return hit ? hit.agentType : runtime
+  const hasAgentFor = (runtime: string): boolean =>
+    agents.some((a) => a.runtime === runtime)
+
+  /** 当前默认运行时的展示名（默认运行时存的是 **runtime id**，不是 agentType）。 */
+  const defaultRuntimeLabel = (): string => {
+    if (usingBuiltin) return '内置子代理（仓内运行）'
+    return configs.find((c) => c.runtime === defaultRuntime)?.displayName ?? defaultRuntime
   }
 
   const saveSettings = async (req: UpdateSettingsRequest, okMsg: string) => {
-    try {
-      await onSaveSettings(req)
-      showToast(okMsg, 'info')
-    } catch (e) {
-      showToast(e instanceof Error ? e.message : String(e), 'info')
-    }
+    // ⚠️ onSaveSettings 返回 false = 保存失败（错误已由 App 侧 toast 报出）。
+    //   绝不能在失败时也弹「已设为 X」—— 那会让用户以为配好了，实际 DB 纹丝不动
+    //   （本仓踩过：值域不匹配被后端 400 拒，错误被吞 ⇒ 界面显示成功、配置没变）。
+    const ok = await onSaveSettings(req)
+    if (ok) showToast(okMsg, 'info')
   }
 
   const rescan = async () => {
@@ -137,7 +140,7 @@ export function SubagentRuntimePanel({ settings, onSaveSettings, showToast, sess
                 所以这里只显示结果、不再给第二个下拉（两处都能改会互相打架）。 */}
             <div className="cli-current-default">
               <span className={usingBuiltin ? 'cli-ok' : 'cli-ink'}>
-                {usingBuiltin ? '内置子代理（仓内运行）' : defaultRuntime}
+                {defaultRuntimeLabel()}
               </span>
               {!usingBuiltin && (
                 <button
@@ -252,7 +255,7 @@ export function SubagentRuntimePanel({ settings, onSaveSettings, showToast, sess
                 <div
                   key={c.runtime}
                   className={`cli-card${isOpen ? ' is-open' : ''}${
-                    defaultRuntime === agentTypeOf(c.runtime) ? ' is-default' : ''
+                    defaultRuntime === c.runtime ? ' is-default' : ''
                   }`}
                 >
                   {/* ⛔ 这里必须是 div 而不是 <button>：行尾还有「设为默认」按钮，
@@ -305,23 +308,28 @@ export function SubagentRuntimePanel({ settings, onSaveSettings, showToast, sess
                   {/* 「设为默认」放在点击区**外面**：它是个独立动作，
                       嵌在整行点击区里既容易误触，也需要 stopPropagation 打补丁。 */}
                   <div className="cli-card-tail">
-                    {defaultRuntime === agentTypeOf(c.runtime) ? (
+                    {defaultRuntime === c.runtime ? (
                       <span className="cli-builtin-badge">默认</span>
                     ) : (
                       <button
                         type="button"
                         className="cli-card-action"
-                        disabled={enabled === false || !agentTypeOf(c.runtime)}
+                        disabled={enabled === false || !hasAgentFor(c.runtime)}
                         title={
                           enabled === false
                             ? '外部运行时已关闭'
-                            : agentTypeOf(c.runtime)
+                            : hasAgentFor(c.runtime)
                               ? '设为默认子代理'
                               : '该 CLI 尚未注册为可派发 agent（需要在 agents/ 里建 md）'
                         }
                         onClick={() => {
-                          const t = agentTypeOf(c.runtime)
-                          if (t) void saveSettings({ subagentDefaultRuntime: t }, `默认子代理已设为 ${t}`)
+                          // ⚠️ 写入的是 **runtime id**（如 codex），不是 agentType（如 codex-external）。
+                          //   后端 settings.subagentDefaultRuntime 只认 runtime id
+                          //   （ExternalRuntimeCatalog.find），传 agentType 会被 400 拒。
+                          void saveSettings(
+                            { subagentDefaultRuntime: c.runtime },
+                            `默认子代理已设为 ${c.displayName}`,
+                          )
                         }}
                       >
                         设为默认

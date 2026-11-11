@@ -18,59 +18,86 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
  *   <li><b>文本层够的页不能白花钱调视觉</b> —— 每次视觉调用都是真金白银；判据写松了会把整份电子版
  *       PDF 全送模型。故「阈值边界」必须逐条钉死。</li>
  *   <li><b>扫描件必须被识别为「需要视觉」</b> —— 否则入库结果是空的，用户以为文档没内容。</li>
- *   <li><b>视觉失败不能让整份解析失败</b> —— 硬约束（派单书 §3.3）。一次超时不该让上传白费。</li>
+ *   <li><b>视觉失败不能让整份解析失败</b> —— 硬约束。一次超时不该让上传白费。</li>
  *   <li><b>页数上限 200 + truncated 标记</b> —— 静默只解析一部分会让用户以为索引完整。</li>
  * </ol>
+ *
+ * <p><b>判据口径</b>：扫描件判定以<b>图片覆盖面积比</b>为主信号（对齐源站
+ * {@code WeKnora/docreader/parser/pdf_parser.py:193-203}）。带劣质内嵌 OCR 层的扫描件
+ * 有几百上千字，按字符数会漏判 —— 那正是「乱码入库、视觉不触发」的历史缺陷。
  */
 @DisplayName("[B2b] PDF 解析器（文本层 + 视觉补强判据 + fail-soft）")
 class KbPdfParserTest {
 
     @Nested
-    @DisplayName("视觉触发判据（派单书 §3.3 三条）")
+    @DisplayName("视觉触发判据（对齐源站 _classify_page：图片面积比为主信号）")
     class VisionCriteria {
 
         @Test
-        @DisplayName("文本为 0 → 需要视觉（扫描件）")
-        void emptyTextNeedsVision() {
-            assertThat(KbPdfParser.needsVision("", 0)).isTrue();
-            assertThat(KbPdfParser.needsVision(null, 0)).isTrue();
-            assertThat(KbPdfParser.needsVision("   \n  ", 3)).isTrue();
+        @DisplayName("图片盖住半页以上 → 需要视觉（哪怕带几百字劣质 OCR 文字层）")
+        void imageDominatedPageNeedsVision() {
+            assertThat(KbPdfParser.needsVision("a".repeat(2000), KbPdfParser.SCAN_IMAGE_AREA_RATIO))
+                .as("面积比 0.5 是闭区间下界（>= 0.5）").isTrue();
+            assertThat(KbPdfParser.needsVision(garbledOcrText(), 0.95))
+                .as("扫描件带 2000 字乱码层：旧判据（<100 字符）会漏判，面积比必须抓住")
+                .isTrue();
+            assertThat(KbPdfParser.needsVision(null, 1.2))
+                .as("重叠图片可让比值 > 1.0，不 clamp").isTrue();
         }
 
         @Test
-        @DisplayName("文本 < 100 字符 → 需要视觉（无论有没有图）")
-        void shortTextNeedsVision() {
-            assertThat(KbPdfParser.needsVision("九十九个字符".repeat(10), 0))
-                .as("恰好 50 字符（< 100）应触发").isTrue();
-            assertThat(KbPdfParser.needsVision(repeat('a', 99), 0)).isTrue();
-            assertThat(KbPdfParser.needsVision(repeat('a', 99), 5)).isTrue();
+        @DisplayName("正文够长且图片面积很小 → 不需要视觉")
+        void nativePageSkipsVision() {
+            assertThat(KbPdfParser.needsVision("a".repeat(2000), 0.02))
+                .as("电子版页面实测 ~0.0-0.05").isFalse();
+            assertThat(KbPdfParser.needsVision("a".repeat(2000), 0.0)).isFalse();
+            assertThat(KbPdfParser.needsVision("a".repeat(2000), 0.499))
+                .as("差一格不触发").isFalse();
         }
 
         @Test
-        @DisplayName("文本 ≥ 100 且无图 → 不需要视觉")
-        void enoughTextWithoutImagesSkipsVision() {
-            assertThat(KbPdfParser.needsVision(repeat('a', 100), 0))
-                .as("边界值 100 恰好不触发（判据是 < 100）").isFalse();
-            assertThat(KbPdfParser.needsVision(repeat('a', 500), 0)).isFalse();
+        @DisplayName("文字极少 + 有点图 → 需要视觉；文字极少 + 无图 → 不需要")
+        void thinTextNeedsSomeImage() {
+            assertThat(KbPdfParser.needsVision("a".repeat(9), 0.1))
+                .as("面积比 0.1 是闭区间下界").isTrue();
+            assertThat(KbPdfParser.needsVision("a".repeat(9), 0.099)).isFalse();
+            assertThat(KbPdfParser.needsVision("a".repeat(10), 0.15))
+                .as("10 字符已达下限（判据是 < 10）").isFalse();
+            assertThat(KbPdfParser.needsVision("", 0.15))
+                .as("文字为空同样走次信号").isTrue();
         }
 
         @Test
-        @DisplayName("有图且文本 < 500 → 需要视觉（图里才可能是正文）")
-        void imageWithThinTextNeedsVision() {
-            assertThat(KbPdfParser.needsVision(repeat('a', 100), 1))
-                .as("100 字符 + 有图 → 图里可能是正文，触发").isTrue();
-            assertThat(KbPdfParser.needsVision(repeat('a', 499), 2)).isTrue();
+        @DisplayName("真空白页（无文字 + 无图）→ 不需要视觉（源站 _classify_page 返回 text）")
+        void blankPageSkipsVision() {
+            assertThat(KbPdfParser.needsVision("", 0.0))
+                .as("源站 _classify_page(0.0, 0) = \"text\"；随后只把非空文本块放进正文")
+                .isFalse();
+            assertThat(KbPdfParser.needsVision(null, 0.0)).isFalse();
+            assertThat(KbPdfParser.needsVision("   \n  ", 0.05)).isFalse();
         }
 
         @Test
-        @DisplayName("有图但文本 ≥ 500 → 不需要视觉（正文已足够）")
-        void imageWithRichTextSkipsVision() {
-            assertThat(KbPdfParser.needsVision(repeat('a', 500), 3)).isFalse();
-            assertThat(KbPdfParser.needsVision(repeat('a', 5000), 10)).isFalse();
+        @DisplayName("面积比计算走内容流 CTM：整页图 ≈ 1.0，半页图 ≈ 0.18，无图 = 0")
+        void imageAreaRatioFromContentStream(@TempDir Path dir) throws Exception {
+            assertThat(ratioOf(KbTestDocuments.writeTextPdf(dir, 1))).isEqualTo(0.0);
+            assertThat(ratioOf(KbTestDocuments.writeFullPageImagePdf(dir)))
+                .isCloseTo(1.0, org.assertj.core.data.Offset.offset(0.01));
+            assertThat(ratioOf(KbTestDocuments.writeScaledImagePdf(dir, 300f, 300f)))
+                .as("300×300pt ÷ (595×842pt) —— 用像素数近似会因 DPI 不同算错")
+                .isCloseTo(90000.0 / (595.0 * 842.0), org.assertj.core.data.Offset.offset(0.01));
         }
 
-        private static String repeat(char c, int n) {
-            return String.valueOf(c).repeat(n);
+        /** 必须在文档打开期间统计：内容流在 {@code PDDocument} 关闭后不可再读。 */
+        private static double ratioOf(Path pdf) throws Exception {
+            try (org.apache.pdfbox.pdmodel.PDDocument doc =
+                     org.apache.pdfbox.Loader.loadPDF(pdf.toFile())) {
+                return KbPdfParser.pageImageAreaRatio(doc.getPage(0));
+            }
+        }
+
+        private static String garbledOcrText() {
+            return "锘匡拷锟斤拷OCR".repeat(200);
         }
     }
 

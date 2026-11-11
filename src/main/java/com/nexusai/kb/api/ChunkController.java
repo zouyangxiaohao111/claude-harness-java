@@ -31,8 +31,19 @@ import java.util.List;
  *   <tr><td>POST</td><td>/chunks/{knowledge_id}/{id}/revert</td><td>回滚到指定版本</td></tr>
  * </table>
  *
- * <p>⚠️ 生成问题的三个端点里，本仓只做 <b>DELETE</b>（源侧 {@code DELETE /chunks/by-id/{id}/questions}）。
- * PUT（手写问句）与 POST（重新生成）不在核心 178 清单内，未做 —— ⛔ 不建假端点。
+ * <p>⚠️ 生成问题三个端点（源侧 {@code /chunks/by-id/{id}/questions}）：
+ * <b>DELETE</b> / <b>PUT</b> / <b>POST …/regenerate</b> 均已实现。
+ * <ul>
+ *   <li>PUT：手写新增或修改一条 —— 本仓问句<b>没有独立 id</b>，
+ *       {@code question_id} 空 = 新增，非空 = <b>旧问句文本</b>（原地替换）。</li>
+ *   <li>POST regenerate：复用入库后处理的问题生成服务，对该分块单独重跑一轮。</li>
+ * </ul>
+ *
+ * <p>⚠️ <b>出站字段现状（18 个）</b>：{@code metadata} 与 {@code source_locators} 都是
+ * <b>原始 JSON 字符串原样透传</b>（⛔ 不解析、不裁剪）。前者承载
+ * {@code generated_questions[].question}（形态见 {@code KbGeneratedQuestions}），
+ * 后者承载 {@code KbSourceLocator} 数组（7 种 type）。
+ * {@code metadata} 是本批新增出站字段（此前只落库、不出站 ⇒ 前端按钮只能弹「未接入」）。
  *
  * <h2>⭐⭐ 编辑后必须重建索引，且必须在事务外</h2>
  * 见 {@link KbChunkService#reindexChunkKnowledge}。本 Controller 在 service 方法返回后
@@ -87,6 +98,50 @@ public class ChunkController {
     @GetMapping("/api/v1/chunks/by-id/{id}")
     public ChunkView getById(@PathVariable String id) {
         return toView(chunkService.getById(id));
+    }
+
+    /**
+     * 新增 / 修改一条生成问句（源侧 {@code PUT /chunks/by-id/{id}/questions}）。
+     *
+     * <p><b>⭐⭐ 本仓差异</b>：源侧每条问句有 {@code uuid}，本仓存在
+     * {@code kb_chunk.metadata.generated_questions} 里、<b>没有 id</b>
+     * ⇒ {@code question_id} 的语义改为：<b>空 = 新增；非空 = 旧问句文本（原地替换）</b>。
+     * 找不到该文本 ⇒ 400（⛔ 不静默新增，否则用户以为改掉了、实际多出一条）。
+     *
+     * <p>写入后由 service 重建索引（问句会拼进索引文本，见 {@code KbGeneratedQuestions.indexText}）。
+     * 索引失败<b>不否决保存</b>，但响应里 {@code index_rebuilt=false} 并打 ERROR。
+     *
+     * @param id   分块 ID
+     * @param req  {@code {"question_id": "<旧问句文本，可空>", "question": "<新问句>"}}
+     * @return 更新后的分块 + 最新问句列表
+     */
+    @PutMapping("/api/v1/chunks/by-id/{id}/questions")
+    public QuestionUpsertResponse upsertGeneratedQuestion(
+            @PathVariable String id,
+            @RequestBody(required = false) UpsertQuestionRequest req) {
+        if (req == null) {
+            throw new com.nexusai.infra.exception.ValidationException("question 必填");
+        }
+        KbChunkService.QuestionUpsertResult r =
+            chunkService.upsertGeneratedQuestion(id, req.questionId(), req.question());
+        return new QuestionUpsertResponse(
+            toView(r.chunk()), r.added(), r.questions(), r.indexRebuilt());
+    }
+
+    /**
+     * 重新生成某分块的辅助问句（源侧 {@code POST /chunks/by-id/{id}/questions/regenerate}）。
+     *
+     * <p>复用 {@code KbQuestionGenerationService#generateBatch}（与入库后处理同一套：
+     * 读知识库问题配置、调模型、写回 metadata、重建索引）。
+     *
+     * <p>⚠️ {@code status} 可能不是 {@code DONE}：问句配置关闭 / 无可用模型 / 分块无正文时
+     * 返回 {@code SKIPPED} 并带原因 ⇒ 前端必须照实展示，⛔ 不能说「已重新生成」。
+     */
+    @PostMapping("/api/v1/chunks/by-id/{id}/questions/regenerate")
+    public QuestionRegenerateResponse regenerateGeneratedQuestions(@PathVariable String id) {
+        KbChunkService.RegenerateResult r = chunkService.regenerateGeneratedQuestions(id);
+        return new QuestionRegenerateResponse(
+            toView(r.chunk()), r.questions(), r.status(), r.detail());
     }
 
     @PutMapping("/api/v1/chunks/{knowledgeId}/{id}")
@@ -157,7 +212,7 @@ public class ChunkController {
             r.getStartAt(), r.getEndAt(), r.getPreChunkId(), r.getNextChunkId(),
             r.getParentChunkId(), r.getChunkType(), r.getImageInfo(),
             r.getContentRevision(), r.getIndexStatus(), r.getContextHeader(),
-            r.getSourceLocators());
+            r.getSourceLocators(), r.getMetadata());
     }
 
     /** 分块出站视图（snake_case，对齐源侧 chunk 契约）。 */
@@ -178,7 +233,15 @@ public class ChunkController {
         @com.fasterxml.jackson.annotation.JsonProperty("content_revision") Integer contentRevision,
         @com.fasterxml.jackson.annotation.JsonProperty("index_status") String indexStatus,
         @com.fasterxml.jackson.annotation.JsonProperty("context_header") String contextHeader,
-        @com.fasterxml.jackson.annotation.JsonProperty("source_locators") String sourceLocators) {
+        @com.fasterxml.jackson.annotation.JsonProperty("source_locators") String sourceLocators,
+        /**
+         * 分块元数据原文（JSON 字符串，原样透传，⛔ 不在 controller 里解析/裁剪）。
+         *
+         * <p>前端「辅助召回问题」按钮要读 {@code generated_questions[].question}
+         * （形态见 {@code KbGeneratedQuestions} 类注释）。此前本字段未出站 ⇒ 前端拿不到，
+         * 按钮只能弹「未接入」。此处仅新增透传，不改变其它 17 个字段的位置与语义。
+         */
+        @com.fasterxml.jackson.annotation.JsonProperty("metadata") String metadata) {
     }
 
     /** 更新请求（null = 不改）。 */
@@ -190,6 +253,39 @@ public class ChunkController {
     /** 回滚请求。 */
     public record RevertRequest(
         @com.fasterxml.jackson.annotation.JsonProperty("revision") Integer revision) {
+    }
+
+    /**
+     * 问句 upsert 请求（源侧 {@code UpsertGeneratedQuestionRequest} 同形）。
+     *
+     * @param questionId 空 = 新增；非空 = 要替换的<b>旧问句文本</b>（本仓问句无独立 id）
+     * @param question   新问句（trim 后不能为空）
+     */
+    public record UpsertQuestionRequest(
+        @com.fasterxml.jackson.annotation.JsonProperty("question_id") String questionId,
+        @com.fasterxml.jackson.annotation.JsonProperty("question") String question) {
+    }
+
+    /** 问句 upsert 响应。 */
+    public record QuestionUpsertResponse(
+        @com.fasterxml.jackson.annotation.JsonProperty("chunk") ChunkView chunk,
+        @com.fasterxml.jackson.annotation.JsonProperty("added") boolean added,
+        @com.fasterxml.jackson.annotation.JsonProperty("questions") List<String> questions,
+        /**
+         * 索引是否已重建。false ⇒ 问句已保存但<b>搜索仍是旧文本</b>（服务端已打 ERROR）。
+         * ⚠️ 前端要能显示这一状态，⛔ 不要笼统说「已保存」。
+         */
+        @com.fasterxml.jackson.annotation.JsonProperty("index_rebuilt") boolean indexRebuilt) {
+    }
+
+    /** 问句重新生成响应。 */
+    public record QuestionRegenerateResponse(
+        @com.fasterxml.jackson.annotation.JsonProperty("chunk") ChunkView chunk,
+        @com.fasterxml.jackson.annotation.JsonProperty("questions") List<String> questions,
+        /** DONE / SKIPPED / SUPERSEDED / FAILED（见 {@code KbPostProcessOutcome.Status}）。 */
+        @com.fasterxml.jackson.annotation.JsonProperty("status") String status,
+        /** 人可读原因（SKIPPED/FAILED 时有值，用于如实告知用户）。 */
+        @com.fasterxml.jackson.annotation.JsonProperty("detail") String detail) {
     }
 
     /** 删除结果。 */

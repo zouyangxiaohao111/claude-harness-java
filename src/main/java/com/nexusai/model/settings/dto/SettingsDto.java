@@ -214,6 +214,12 @@ public record SettingsDto(
     //   ① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
     //   放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
     //   ⛔ 曾被并发会话的整体覆盖误删，导致 SettingsService / SubagentTool 引用不到。
+    //
+    //   ⛔⛔ 值域 = **runtime id**（claude / codex / opencode / pi），**不是 agentType**
+    //   （codex-external 那种）。两者是不同的命名空间：agentType 是 md 里的 name，
+    //   runtime 是 md 里的 sub-runtime。派发侧（SubagentTool.setSettingsService）按
+    //   runtime id 去 registry 里反查 agentType ⇒ 这里存 agentType 会永远查不到 ⇒ 回落内置。
+    //   ⛔ 写侧（SettingsService.update）只认 runtime id，传 agentType 一律 400（fail loud）。
     String subagentDefaultRuntime,
     Boolean subagentExternalEnabled
 ) {

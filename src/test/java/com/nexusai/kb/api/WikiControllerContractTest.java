@@ -47,6 +47,21 @@ class WikiControllerContractTest {
         "/api/v1/knowledge-bases/{kb}/wiki/revert",
         "/api/v1/knowledge-bases/{kb}/wiki/move-page");
 
+    /**
+     * 本仓<b>额外</b>的端点（源侧没有，为补能力缺口而加）。
+     *
+     * <p>⭐ 为什么要显式登记而不是简单放宽成「≥ 22」：
+     * 计数断言的价值是「多一个或少一个都会红」—— 放宽成 ≥ 就再也发现不了误加。
+     * 这里把「有意的额外端点」写成白名单，任何<b>意外的</b>多/少仍然会失败。
+     *
+     * <p>目前只有 1 个：{@code wiki/rebuild} —— Wiki 原本只在文档入库后自动生成，
+     * 上传时没配模型、或那一轮生成失败，之后配好模型也没有补生成入口
+     * （只能整篇重新解析，重跑分块与索引、块 ID 会变）。该端点对齐
+     * {@code graph/rebuild} 提供手动补生成。
+     */
+    private static final List<String> OUR_EXTRA_PATHS = List.of(
+        "/api/v1/knowledge-bases/{kb}/wiki/rebuild");
+
     /** 收集某个 mapping 注解上的全部路径。 */
     private static Set<String> pathsOf(Method m) {
         Set<String> out = new TreeSet<>();
@@ -89,13 +104,21 @@ class WikiControllerContractTest {
         }
 
         assertThat(conventions)
-            .as("⭐⭐ 源侧 22 个端点一个都不能少 —— 缺一个就意味着某块功能整块不可用")
-            .hasSize(EXPECTED_PATHS.size());
+            .as("⭐⭐ 源侧 22 个端点一个都不能少（本仓额外端点显式登记在 OUR_EXTRA_PATHS）；"
+                + "意外的多/少都必须红，所以计数仍然精确比对")
+            .hasSize(EXPECTED_PATHS.size() + OUR_EXTRA_PATHS.size());
 
         // 每条期望路径都至少被一个方法覆盖
         for (String expected : EXPECTED_PATHS) {
             assertThat(conventions.stream().anyMatch(c -> c.endsWith(" " + expected)))
                 .as("缺少端点: %s", expected)
+                .isTrue();
+        }
+
+        // 每个「本仓额外端点」也确实存在（白名单不能是空头承诺）
+        for (String extra : OUR_EXTRA_PATHS) {
+            assertThat(conventions.stream().anyMatch(c -> c.endsWith(" " + extra)))
+                .as("白名单登记了但实际不存在: %s", extra)
                 .isTrue();
         }
     }

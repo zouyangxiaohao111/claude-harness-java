@@ -59,8 +59,12 @@ public class KbWikiTaskHandler {
             return KbPostProcessOutcome.skipped("未配置 Wiki 生成模型");
         }
         try {
+            // ⭐ 显式传 5 参：manual=false ⇒ 自动路径仍受 auto_generate 开关约束
+            //    （4 参重载也是 manual=false，这里写成显式只为让「自动 / 手动」在调用点可见）
+            log.info("[Wiki] 自动生成（入库后）knowledge={} kb={} 模型={}",
+                knowledgeId, knowledge.getKnowledgeBaseId(), modelName);
             KbWikiIngestService.RunSummary summary = ingestService.runBatch(
-                knowledge.getKnowledgeBaseId(), List.of(knowledgeId), modelName, false);
+                knowledge.getKnowledgeBaseId(), List.of(knowledgeId), modelName, false, false);
             if (summary.skipped()) {
                 return KbPostProcessOutcome.skipped(summary.skipReason());
             }

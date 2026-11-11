@@ -59,7 +59,7 @@ import java.util.function.Supplier;
  *   <li><b>fork 缓存共享</b>（compact.ts:1155-1248）——复用主线程 prompt cache 前缀：
  *       {@code tengu_compact_cache_prefix}（默认 true）→ [IMP2-23 ⊕-7] 委托
  *       {@link RunForkedAgent}（forkedAgent.ts:489-626 单一实现；seam 经
- *       {@link #setForkedQuery} 注入，生产 = ProductionForkedQuery）。
+ *       {@link #setForkedQuery} 注入，生产 = QueryLoopForkedQuery）。
  *       参数契约（INV-7）：<b>不设 maxOutputTokens</b>（破坏 cache key，compact.ts:1181-1187）、
  *       skipCacheWrite=true（fork 不写缓存）、maxTurns=1、querySource=compact、
  *       abortController 透传、canUseTool=deny（compact.ts:1191）。
@@ -88,7 +88,7 @@ import java.util.function.Supplier;
  *       {@code messages: prependUserContext(messagesForQuery, userContext)} 在<b>发请求那一刻</b>
  *       贴一次。本类此前额外前置一次（外层副本）→ 请求变 {@code [meta, meta, ...]}，
  *       与主线程 {@code [meta, ...]} 前缀不一致 → message[1] 起 prompt cache 永不命中。
- *       现由 {@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery}
+ *       现由 {@link com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery}
  *       内层前置独自承担（唯一前置点）。</li>
  *   <li>CC {@code isSessionActivityTrackingActive} 对应 {@code sessionActivityTrackingActive}
  *       标志 + {@code sessionActivitySignal} 回调。</li>
@@ -191,7 +191,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
     /**
      * [IMP2-23 ⊕-7] fork 查询 seam · 收敛后 tryForkCacheSharing 委托
      * {@link RunForkedAgent#run}，经本 seam 执行 fork 查询（CC runForkedAgent 调全局
-     * query() 的 Java 等价；生产注入 ProductionForkedQuery，测试注入 RecordingQuery）。
+     * query() 的 Java 等价；生产注入 QueryLoopForkedQuery，测试注入 RecordingQuery）。
      * 未注入 → fork 路径不可用，直落流式 fallback（fail-loud 日志，不静默假成功）。
      */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
@@ -382,7 +382,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
 
     /**
      * [IMP2-23 ⊕-7] 注入 fork 查询 seam（对齐 ExtractMemoriesAgent/AutoDreamConsolidator
-     * 同模式 setter）· 生产接 {@link ProductionForkedQuery}（ToolRegistrationConfig 接线）；
+     * 同模式 setter）· 生产接 QueryLoopForkedQuery（ToolRegistrationConfig 接线）；
      * 未注入 → fork 缓存共享路径直落流式 fallback。
      *
      * @param query fork 查询实现（CC query() 等价 seam）
@@ -555,9 +555,9 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
      * isApiErrorMessage / API 错误前缀 → null 落流式 fallback（no_text_response）。
      *
      * <p><b>[IMP-CM-14 F02 + IMP-MV2-10] usage 透传</b>: 结果 usage 源自 {@code result.totalUsage()}
-     * （CC forkedAgent.ts:119 totalUsage 累计；Java ProductionForkedQuery 逐轮从
+     * （CC forkedAgent.ts:119 totalUsage 累计；Java QueryLoopForkedQuery 逐轮从
      * AssistantMessage.usage（AgentUsage）全量累计 input/output/cacheRead/cacheCreate
-     * 四字段，[IMP-MV2-10] 修复 input/cache 恒 0 —— ProductionForkedQuery.java:259-282）。
+     * 四字段，[IMP-MV2-10] 修复 input/cache 恒 0 —— QueryLoopForkedQuery usage 累计）。
      * 语义对齐 CC compact.ts:645 {@code compactionUsage = getTokenUsage(summaryResponse)}：
      * 有效摘要必带 usage（可零值但非 null）。
      *
@@ -602,7 +602,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
                 .withProjectRoot(cacheSafeParams.projectRoot());
             if (log.isDebugEnabled()) {
                 // [userctx-single-prepend] 消息条数口径：此处 forkContextMessages 条数 = 未前置的
-                //   fork 前缀条数；userContext 非空时 meta 消息由 ProductionForkedQuery 在发送边界
+                //   fork 前缀条数；userContext 非空时 meta 消息由 QueryLoopForkedQuery 在发送边界
                 //   前置一次（query.ts:900 = prependUserContext(messagesForQuery, userContext)），
                 //   实际下发条数 = forkCtx + 1(summary) + (userContext 空 ? 0 : 1)。
                 //   本类<b>不再</b>前置（CC forkedAgent.ts:543 initialMessages 不贴 userContext）。
@@ -1305,7 +1305,7 @@ public class StreamCompactSummary implements AutoCompactor.CompactCallback {
     /**
      * fork 结果 usage → {@link CompactConversation.TokenUsage} · 对齐 CC
      * {@code result.totalUsage}（forkedAgent.ts:119，loop 内 API 调用累计 usage；
-     * Java ProductionForkedQuery 逐轮全量累计 4 字段（input/output/cacheRead/cacheCreate，
+     * Java QueryLoopForkedQuery 逐轮全量累计 4 字段（input/output/cacheRead/cacheCreate，
      * [IMP-MV2-10]），fork 路径 input/cache 为真实用量非恒 0）。
      *
      * @param u fork 累计 usage（非 null，可零值 empty）

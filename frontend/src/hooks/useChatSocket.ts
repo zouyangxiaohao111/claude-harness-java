@@ -16,6 +16,8 @@ import { teamsApi } from '../api/teams'
 import { EMPTY_COMPACT_TABLE, dropCompactSession, isCompactCanceled, reduceCompactTable, type CompactProgressWire, type CompactTable } from '../utils/compactProgress'
 import { noteInboundFrame } from '../utils/inboundFrameStats'
 import { parseDrainedQueueItems, type DrainedQueueItem } from '../utils/queuedUserBubble'
+import { askQuestionSummary, markAskUserQuestionNotified } from '../utils/askUserNotice'
+import { sendSystemNotification } from '../utils/systemNotify'
 import { isQueuedCommandEditable } from './useCommandQueue'
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
@@ -279,6 +281,47 @@ function toPermissionItem(
 }
 
 /**
+ * 权限请求入队 · **唯一入队点**（四条到达路径全部经此函数）。
+ *
+ * <p><b>WHY 收口到这里</b>：同一次提问会被四条路径送达 ——
+ * 实时 message / bridge / channel 三通道 + REST 补拉（{@link replayPendingPermissions}，
+ * 切会话 / 重连 / 8 秒兜底轮询都会再捞一次）。此前每条路径各自调
+ * {@code enqueuePermission}，若把「发通知」散在各路径里，必然出现「同一次提问弹 N 条通知」。
+ * ⇒ 收口成一处：<b>入队 + 去重 + 通知</b> 三件事同一个函数，同一个判据。
+ *
+ * <p><b>去重判据</b>：requestId（工具调用 id）。三条通道 + 补拉用的是**同一个** owner
+ * requestId（见 PendingPermissionSnapshot 的 javadoc）⇒ 按它去重即可全覆盖。
+ * 队列里已有该项 ⇒ 直接跳过（不重复入队，也不重复通知）。
+ *
+ * <p><b>通知判据</b>：{@code toolInput.questions} 非空 ⇒ 是「提问型」请求（与后端
+ * {@code WebSocketPermissionPrompter} 自己的诊断日志同口径，也与 PermissionBubble
+ * 渲染选择题读的字段一致）⇒ 发一条系统通知。
+ *
+ * <p>⛔ 通知用**独立 tag**（{@code nexusai-ask-user}）：系统通知的默认 tag
+ * （{@code nexusai-turn-done}）在 Web 通道里同 tag 会**互相替换** ⇒ 用默认 tag 发提问
+ * 通知会把「本轮已完成」顶掉。
+ *
+ * <p>⛔ 通知失败一律静默：通知是锦上添花，不能因为它把权限入队流程打挂。
+ */
+function enqueuePermissionItem(item: NormalizedPermission): void {
+  const st = useChatStore.getState()
+  // 已在队列（同一 requestId 的重复到达）⇒ 不重复入队、不重复通知
+  if (st.permissionQueue.some((r) => r.requestId === item.requestId)) return
+  st.enqueuePermission(item)
+  // 提问型请求 → 系统通知（去重表按 requestId；跨路径只发一次）
+  if (!markAskUserQuestionNotified(item.requestId, item.toolInput)) return
+  const summary = askQuestionSummary(item.toolInput)
+  const sessionTitle = st.sessions.find((s) => s.id === item.sessionId)?.title?.trim()
+  void sendSystemNotification({
+    title: 'NexusAI · 需要你回答',
+    body: summary || sessionTitle || '有工具在等你回答',
+    tag: 'nexusai-ask-user',
+    // 载荷：用户点通知时回读 ⇒ 拉回前台并切到该会话
+    extra: { sessionId: item.sessionId },
+  })
+}
+
+/**
  * 会话状态补拉 · 对齐 dsh「宿主在每次打开/切换会话时重放未回答的 pending」（stable rpcId replay）。
  *
  * <p>为什么必须有：权限请求本体是**一次性 STOMP 推送**。请求到达时若该会话不在前端订阅集合
@@ -292,11 +335,9 @@ function replayPendingPermissions(sid: string): void {
     .then((st) => {
       const list = st?.pendingPermissions ?? []
       if (list.length === 0) return
-      const store = useChatStore.getState()
       for (const raw of list) {
         if (!raw?.requestId) continue
-        if (store.permissionQueue.some((r) => r.requestId === raw.requestId)) continue
-        store.enqueuePermission(toPermissionItem(raw, sid, 'message'))
+        enqueuePermissionItem(toPermissionItem(raw, sid, 'message'))
       }
     })
     .catch(() => { /* 老后端无该端点 / 网络失败 → 静默（不影响实时通道） */ })
@@ -319,15 +360,15 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
       //   ⇒ 症状（授权范围消失 / 命中 fail-loud）不会以「编译全绿但线上坏」的形式出现。
       const raw = JSON.parse(msg.body) as PermissionEventPayload
       if (!raw?.requestId) return
-      const st = useChatStore.getState()
       // TEMP 诊断（联调 §38）：确认权限事件到达 + 订阅键（sessionId 匹配检查）
       console.debug(`[perm] ${kind} event on ${topic}`, { requestId: raw.requestId, toolName: raw.toolName, sessionId: sid })
       // ⚠️ 按 requestId 去重：同一会话可能同时存在 watchSubs（名单订阅）与 permSubs（本订阅）
       //   两条 message topic 通道 ⇒ 同一条事件会到达两次。不去重会让队列里堆出重复项
       //   （显示无碍——find 只取第一个，但「已处理/未处理」计数与去重语义会失真）。
-      if (st.permissionQueue.some((r) => r.requestId === raw.requestId)) return
-      st.enqueuePermission(toPermissionItem(raw, sid, kind))
-      console.debug('[perm] queued, queueLen=', st.permissionQueue.length, raw.requestId)
+      //   （去重 + 通知已收口到 enqueuePermissionItem · 覆盖三条通道 + REST 补拉）
+      enqueuePermissionItem(toPermissionItem(raw, sid, kind))
+      // ⚠️ 队列长度取**入队后**的新状态（入队前的快照少 1）
+      console.debug('[perm] queued, queueLen=', useChatStore.getState().permissionQueue.length, raw.requestId)
       // 后端无限等待用户响应（2026-08-24 移除 30s 自动超时；用户取消会话 → user_abort）
     })
   })
@@ -677,9 +718,8 @@ export function useChatSocket(
         try {
           const raw = JSON.parse(msg.body) as PermissionEventPayload
           if (!raw?.requestId) return
-          const st = useChatStore.getState()
-          if (st.permissionQueue.some((r) => r.requestId === raw.requestId)) return
-          st.enqueuePermission(toPermissionItem(raw, sid, 'message'))
+          // 去重 + 通知收口到 enqueuePermissionItem（与三通道实时路径共用）
+          enqueuePermissionItem(toPermissionItem(raw, sid, 'message'))
         } catch { /* 非法载荷忽略 */ }
       }))
     }
@@ -896,11 +936,13 @@ export function useChatSocket(
       // 会话级常驻订阅（queue.drained 排队消费 / token-warning 压缩警告）· 按 sid 常驻，切走不退订
       subscribeSessionLevel(client, sid)
     }
-    // 移除：非活跃会话的订阅（当前会话常驻权限订阅不在此移除 —— C1 leader idle 也要收权限；
-    //   当前会话 stream 常驻订阅也不在此移除 —— cron/Ask 主动推流依赖它）
-    for (const [sid, sub] of streamSubsRef.current) {
-      if (!active[sid] && sid !== sessionIdRef.current) { sub.unsubscribe(); streamSubsRef.current.delete(sid) }
-    }
+    // 移除：这里刻意「什么都不做」—— stream 订阅一旦建立就常驻，只在断连（clearSubscriptions）
+    //   与 unmount 时统一清空。
+    //   WHY：activeStreams 只登记本页 sendMessage / queue.drained 发起的轮次，后台 / 子代理 / cron
+    //   代跑的轮次从不登记 ⇒ 一旦按「不在活跃流里」退订，就必然把这类会话误判成非活跃 ⇒
+    //   simple broker 不持久、不重放，订阅一摘，该轮所有 chunk / complete 帧永久丢失 ⇒
+    //   之后没有任何路径重订（ensureSessionStream 只在切到它 / 重连时跑）⇒ 只能 F5 才看到内容。
+    //   订阅本身极廉价（每会话一条 SUBSCRIBE），不值得用一个会误判的判据去省。
     for (const [sid, subs] of permSubsRef.current) {
       // ⚠️ 判据必须用 ref（与上面 stream 循环同款）：本函数被 onConnect（[] 依赖，闭包永久冻结在
       //   首次渲染）和 activeStreams effect 两处调用，闭包里的 `sessionId` 可能是过期值 ⇒
@@ -1075,12 +1117,15 @@ export function useChatSocket(
   const liveBufferRef = useRef<Array<{ evt: StreamEvent; topic?: string }>>([])
   /** 修复进行中：新事件一律进缓冲，避免与重拉的历史交错（dsh stitching 同义） */
   const stitchingRef = useRef(false)
+  /** sessionId → 本轮是否已收到 message.complete（idle 到达时据此决定是否需要兜底对账） */
+  const turnSawCompleteRef = useRef<Map<string, boolean>>(new Map())
 
   /**
    * 流事件入口（stream topic 回调）· 对齐 dsh `acceptLiveEvent`（session.ts:679-733）：
    * - 无 seq（旧后端/非会话事件）→ 直接处理，不参与缺口检测
    * - 修复进行中 → 缓冲
-   * - 重复帧（seq ≤ 已见）→ 丢弃；若「远小于已见值」判定为后端重启（计数器归零）→ 重置放行
+   * - 同一 seq（seq === 已见）→ 真重复帧，丢弃
+   * - seq 回退（seq < 已见）→ 计数器归零（后端进程重启 / JVM 静态表清零）⇒ 重置游标并照常派发
    * - seq 缺口（> 已见 + 1）→ 缓冲 + 触发 repair（重拉尾页），⛔ 绝不带洞追加
    * - 连续 → 正常分派并推进已见最大
    */
@@ -1096,16 +1141,18 @@ export function useChatSocket(
       return
     }
     const last = lastSeqRef.current.get(sid) ?? 0
-    if (seq <= last) {
-      // 后端重启（进程内计数器从 1 重来）⇒ 已见值远大于当前帧：重置窗口，按新序号继续。
-      // 判据两条：① 收到 seq=1 且此前已见过更大值（精确：同一进程内 seq 只增不减）
-      //           ② 远小于已见值（兜底：重启后首个可见帧可能已不是 1）
-      // ⛔ 不重置会把重启后的内容当「重复帧」永久丢弃。
-      if ((seq === 1 && last > 1) || last - seq > 100) {
-        lastSeqRef.current.set(sid, seq - 1)
-      } else {
-        return  // 重复帧
-      }
+    if (seq === last) {
+      return  // 同一 seq 已派发过 → 真重复帧
+    }
+    if (seq < last) {
+      // seq 回退 = 计数器归零（后端进程重启 / JVM 静态计数器表清零）。lastSeqRef 是 hook 内存 Map，
+      //   切会话 / 重连都不重置；若重启后前端漏看 seq=1，首个可见帧 seq=k（k ∈ [1,last]）就会被当成
+      //   「重复帧」静默丢弃 ⇒ 整轮 chunk / tool / complete 全吞，只能 F5。
+      //   原判据 `(seq === 1 && last > 1) || last - seq > 100` 只覆盖了 seq=1 与大跨度：
+      //   中间那一段（last-seq ∈ [1,100] 且 seq ≠ 1）会被静默丢弃，这是 bug。
+      //   STOMP 不重传 ⇒ 这帧几乎必然是新内容，丢弃反而让本轮彻底失明 → 重置游标并照常派发本帧。
+      console.warn('[stream] seq 回退，重置游标', sid, seq, last)
+      lastSeqRef.current.set(sid, seq - 1)
     }
     if (seq > (lastSeqRef.current.get(sid) ?? 0) + 1) {
       liveBufferRef.current.push({ evt, topic })
@@ -1263,6 +1310,8 @@ export function useChatSocket(
         })
       }
     } else if (isComplete(evt)) {
+      // 标记本轮已收到 complete，idle 据此决定是否需要兜底对账
+      turnSawCompleteRef.current.set(sid, true)
       // [打字机节流] 收口前先 flush 缓冲里的尾增量——finalizeBlocks 把流式块转消息, 若缓冲未 flush
       //   会缺最后一段（同帧内已收但尚未 append 的 delta/reasoning）→ 消息尾字丢失
       flushStreamAppends()
@@ -1357,6 +1406,21 @@ export function useChatSocket(
       //   ⚠️ 位置承重：必须在本行之前 —— 放到 setServerRunning 之后 = flush 落在 finalizeBlocks 之后 ⇒ 尾段照丢。
       if (sid && status === 'idle') flushStreamAppends()
       if (sid) st.setServerRunning(sid, status !== 'idle')
+      // [idle 兜底对账] complete 可能被 seq 闸门丢弃，或派发中途抛错（本文件 complete 分支里
+      //   finalizeBlocks / usage 任一抛错都会让 onSessionDone 永不执行）⇒ 实时通道再无渲染机会。
+      //   而 idle 是后端的**收口必达点**（ChatService.java:1223-1228 finally 内推；CronIdleExecutor
+      //   :1751-1754 finally 内推），且 cron 路径用裸 convertAndSend **不带 seq**（旁路必达）⇒
+      //   把 idle 当作「本轮该收口了」的最终锚点：整轮没见过 complete 就按 sid 拉一次尾窗对账。
+      //   ⚠️ ChatService 路径的 idle 走 sendAndLog → StreamEventSeq.send 会盖 seq（与 chunk 共用
+      //   计数器），仍要过上面的闸门；但闸门现已不再静默丢弃回退帧，最坏也只是被缺口修复推迟。
+      //   不收口就永远看不到内容，只能 F5（reconcileTail 尾部一致时完全不写 store，不扰动折叠态）。
+      if (sid && status !== 'idle') {
+        turnSawCompleteRef.current.set(sid, false)   // 新一轮开始，清标记
+      } else if (sid) {
+        const sawComplete = turnSawCompleteRef.current.get(sid) === true
+        turnSawCompleteRef.current.set(sid, false)
+        if (!sawComplete) onReconnectReloadRef.current?.(sid)
+      }
     } else if (isTokenWarning(evt)) {
       // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 清除该会话告警（写 null）。
       //   suppressed=false → 本行**总是**写入事件，显示与否由渲染门 tokenWarningBannerText 决定：

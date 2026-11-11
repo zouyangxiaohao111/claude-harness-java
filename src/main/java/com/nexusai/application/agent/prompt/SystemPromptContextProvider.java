@@ -387,7 +387,7 @@ public class SystemPromptContextProvider {
      * 且是 {@code static}</b>（无实例状态）—— 三个调用点都是「使用点」：
      * <ul>
      *   <li>主循环 {@code LlmAgentLoop} s10（每 tool 轮 · CC query.ts:648）</li>
-     *   <li>fork 发送边界 {@code ProductionForkedQuery}（CC forkedAgent 自身 query() 内重跑）</li>
+     *   <li>fork 发送边界（CC forkedAgent 自身 query() 内重跑）</li>
      *   <li>hook 查询 {@code ApiQueryHookHelper}（CC apiQueryHookHelper.ts:73-75）</li>
      * </ul>
      * <b>契约</b>：持有 {@code systemPrompt} 的字段（{@code QueryParams.systemPrompt} /

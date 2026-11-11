@@ -69,6 +69,106 @@ class KbTextParserTest {
     }
 
     @Nested
+    @DisplayName("CSV / TSV / JSON 结构化")
+    class Structured {
+
+        @Test
+        @DisplayName("CSV → Markdown 表格：表头 + 分隔行 + 数据行")
+        void csvBecomesMarkdownTable(@TempDir Path dir) throws Exception {
+            Path csv = KbTestDocuments.writeCsv(dir);
+            KbParsedDocument result = parser.parse(csv, KbParseContext.defaults());
+
+            assertThat(result.text())
+                .contains("| 标段 | 金额 | 负责人 |")
+                .contains("| --- | --- | --- |")
+                .contains("| A 标段 | 6000 万元 | 张三 |");
+            assertThat(result.metadata())
+                .containsEntry(KbTextParser.META_STRUCTURED, "true")
+                .containsEntry(KbParsedDocument.META_PARSER, "KbTextParser");
+        }
+
+        @Test
+        @DisplayName("引号里含逗号的字段不被切成两列（RFC4180）")
+        void quotedCommaStaysOneCell(@TempDir Path dir) throws Exception {
+            Path csv = KbTestDocuments.writeCsv(dir);
+            String text = parser.parse(csv, KbParseContext.defaults()).text();
+
+            assertThat(text)
+                .as("`\"1,200 万元\"` 必须落在一个单元格里（金额列最常见的形态）")
+                .contains("| B 标段 | 1,200 万元 | 李四 |");
+        }
+
+        @Test
+        @DisplayName("GBK 的 CSV 按 Tika 探测的 charset 读，不出现乱码")
+        void gbkCsvIsDecoded(@TempDir Path dir) throws Exception {
+            Path csv = KbTestDocuments.writeGbkCsv(dir);
+            String text = parser.parse(csv, KbParseContext.defaults()).text();
+
+            assertThat(text)
+                .as("硬编 UTF-8 读 GBK 会出乱码，此处必须是正确中文")
+                .contains("| A 标段 | 6000 万元 |")
+                .doesNotContain("\uFFFD");
+        }
+
+        @Test
+        @DisplayName("TSV → 同一种表格（按制表符切分）")
+        void tsvBecomesMarkdownTable(@TempDir Path dir) throws Exception {
+            Path tsv = dir.resolve("数据.tsv");
+            java.nio.file.Files.writeString(tsv, "a\tb\n1\t2\n", java.nio.charset.StandardCharsets.UTF_8);
+
+            assertThat(parser.parse(tsv, KbParseContext.defaults()).text())
+                .contains("| a | b |")
+                .contains("| 1 | 2 |");
+        }
+
+        @Test
+        @DisplayName("JSON → 围栏代码块（层级保留，不压平）")
+        void jsonBecomesFencedBlock(@TempDir Path dir) throws Exception {
+            Path json = KbTestDocuments.writeJson(dir);
+            String text = parser.parse(json, KbParseContext.defaults()).text();
+
+            assertThat(text).startsWith("```json").endsWith("```");
+            assertThat(text)
+                .contains("\"project\"")
+                .contains("\"nested\"")
+                .as("嵌套层级必须保留 —— 压平成表格会丢结构")
+                .contains("\"k\"");
+        }
+
+        @Test
+        @DisplayName("非法 JSON → 退回 Tika 原文（不抛异常、不返回空）")
+        void invalidJsonFallsBack(@TempDir Path dir) throws Exception {
+            Path json = dir.resolve("注释.json");
+            java.nio.file.Files.writeString(json,
+                "{ // JSONC 注释风格，不是合法 JSON\n  \"a\": 1\n}",
+                java.nio.charset.StandardCharsets.UTF_8);
+
+            KbParsedDocument result = parser.parse(json, KbParseContext.defaults());
+
+            assertThat(result.text()).as("退回原文：至少用户能看到自己写了什么").contains("JSONC");
+            assertThat(result.metadata()).doesNotContainKey(KbTextParser.META_STRUCTURED);
+        }
+
+        @Test
+        @DisplayName("探测成 ISO-8859-1 但字节其实是 UTF-8 → 以 UTF-8 为准（不写乱码进库）")
+        void misdetectedCharsetIsCorrected(@TempDir Path dir) throws Exception {
+            Path csv = dir.resolve("误判.csv");
+            java.nio.file.Files.writeString(csv, "标段,金额\nA 标段,6000 万元\n",
+                java.nio.charset.StandardCharsets.UTF_8);
+
+            // 直接喂一个「探测错了」的 Metadata，等价于 Tika 偶发给出 ISO-8859-1 的现场
+            org.apache.tika.metadata.Metadata md = new org.apache.tika.metadata.Metadata();
+            md.set("Content-Encoding", "ISO-8859-1");
+            String raw = KbTextParser.readTextWithDetectedCharset(csv, md);
+
+            assertThat(raw)
+                .as("按 ISO-8859-1 解 UTF-8 字节会出替换字符，必须被纠正")
+                .contains("A 标段")
+                .doesNotContain("\uFFFD");
+        }
+    }
+
+    @Nested
     @DisplayName("类型识别与兜底边界")
     class Supports {
 

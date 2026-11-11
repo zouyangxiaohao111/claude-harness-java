@@ -1,0 +1,184 @@
+/**
+ * 代码高亮配色 · 照搬源站（GitHub Light / Dark）。
+ *
+ * 来源：WeKnora（pinned 80e8345）
+ * - `frontend/src/components/css/chat-hljs.less`（浅色）
+ * - `frontend/src/components/css/chat-hljs-dark.less`（深色）
+ *
+ * <h2>⭐⭐ 为什么必须有这个文件（真机缺陷，2026-11-11）</h2>
+ * `highlight.js` 只负责把源码切成 `<span class="hljs-keyword">` 这样的 token，
+ * <b>配色要靠主题 CSS</b>。没引主题 ⇒ 所有 token 都是同一个颜色 ⇒
+ * 用户看到「有语言标签和复制按钮，但代码全是黑的」。
+ *
+ * <h2>⚠️ 与源站的两处差异</h2>
+ * <ol>
+ *   <li>源站用 LESS mixin + `:deep()`（Vue scoped）；这里展开成普通 CSS。</li>
+ *   <li>源站的深色选择器挂在 `html[theme-mode='dark']` 下的 4 个容器
+ *       （`.markdown-content` / `.answer-content` / …）。本仓只有一个渲染入口
+ *       （`.md-content`）⇒ 收窄成 `html[theme-mode='dark'] .chat-code-block__pre`。
+ *       判断暗色模式的属性名需与本仓一致（见下方 TODO）。</li>
+ * </ol>
+ */
+
+/* ── 浅色（默认）────────────────────────────────────────────────────────── */
+
+.chat-code-block__pre .hljs {
+  color: #24292e;
+  background: transparent;
+}
+
+.chat-code-block__pre .hljs-doctag,
+.chat-code-block__pre .hljs-keyword,
+.chat-code-block__pre .hljs-meta .hljs-keyword,
+.chat-code-block__pre .hljs-template-tag,
+.chat-code-block__pre .hljs-template-variable,
+.chat-code-block__pre .hljs-type,
+.chat-code-block__pre .hljs-variable.language_ {
+  color: #d73a49;
+}
+
+.chat-code-block__pre .hljs-title,
+.chat-code-block__pre .hljs-title.class_,
+.chat-code-block__pre .hljs-title.class_.inherited__,
+.chat-code-block__pre .hljs-title.function_ {
+  color: #6f42c1;
+}
+
+.chat-code-block__pre .hljs-attr,
+.chat-code-block__pre .hljs-attribute,
+.chat-code-block__pre .hljs-literal,
+.chat-code-block__pre .hljs-meta,
+.chat-code-block__pre .hljs-number,
+.chat-code-block__pre .hljs-operator,
+.chat-code-block__pre .hljs-variable,
+.chat-code-block__pre .hljs-selector-attr,
+.chat-code-block__pre .hljs-selector-class,
+.chat-code-block__pre .hljs-selector-id {
+  color: #005cc5;
+}
+
+.chat-code-block__pre .hljs-regexp,
+.chat-code-block__pre .hljs-string,
+.chat-code-block__pre .hljs-meta .hljs-string {
+  color: #032f62;
+}
+
+.chat-code-block__pre .hljs-built_in,
+.chat-code-block__pre .hljs-symbol {
+  color: #e36209;
+}
+
+.chat-code-block__pre .hljs-comment,
+.chat-code-block__pre .hljs-code,
+.chat-code-block__pre .hljs-formula {
+  color: #6a737d;
+}
+
+.chat-code-block__pre .hljs-name,
+.chat-code-block__pre .hljs-quote,
+.chat-code-block__pre .hljs-selector-tag,
+.chat-code-block__pre .hljs-selector-pseudo {
+  color: #22863a;
+}
+
+.chat-code-block__pre .hljs-subst {
+  color: #24292e;
+}
+
+.chat-code-block__pre .hljs-section {
+  color: #005cc5;
+  font-weight: 700;
+}
+
+/* ── 深色 ────────────────────────────────────────────────────────────────
+   ⚠️ 源站用 `html[theme-mode='dark']`。本仓若用别的属性名/类名切换暗色，
+   需同步改这里的两个选择器 —— 否则暗色下代码仍是浅色配色（对比度极差）。
+   TODO 待核：本仓暗色模式的挂载点。 */
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs,
+.dark .chat-code-block__pre .hljs,
+[data-theme='dark'] .chat-code-block__pre .hljs {
+  color: #c9d1d9;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-doctag,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-keyword,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-meta .hljs-keyword,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-template-tag,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-template-variable,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-type,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-variable.language_,
+.dark .chat-code-block__pre .hljs-doctag,
+.dark .chat-code-block__pre .hljs-keyword,
+.dark .chat-code-block__pre .hljs-type,
+[data-theme='dark'] .chat-code-block__pre .hljs-keyword,
+[data-theme='dark'] .chat-code-block__pre .hljs-type {
+  color: #ff7b72;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-title,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-title.class_,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-title.function_,
+.dark .chat-code-block__pre .hljs-title,
+[data-theme='dark'] .chat-code-block__pre .hljs-title {
+  color: #d2a8ff;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-attr,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-attribute,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-literal,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-meta,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-number,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-operator,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-variable,
+.dark .chat-code-block__pre .hljs-number,
+.dark .chat-code-block__pre .hljs-attr,
+[data-theme='dark'] .chat-code-block__pre .hljs-number,
+[data-theme='dark'] .chat-code-block__pre .hljs-attr {
+  color: #79c0ff;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-regexp,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-string,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-meta .hljs-string,
+.dark .chat-code-block__pre .hljs-string,
+[data-theme='dark'] .chat-code-block__pre .hljs-string {
+  color: #a5d6ff;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-built_in,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-symbol,
+.dark .chat-code-block__pre .hljs-built_in,
+[data-theme='dark'] .chat-code-block__pre .hljs-built_in {
+  color: #ffa657;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-comment,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-code,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-formula,
+.dark .chat-code-block__pre .hljs-comment,
+[data-theme='dark'] .chat-code-block__pre .hljs-comment {
+  color: #8b949e;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-name,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-quote,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-selector-tag,
+html[theme-mode='dark'] .chat-code-block__pre .hljs-selector-pseudo,
+.dark .chat-code-block__pre .hljs-name,
+[data-theme='dark'] .chat-code-block__pre .hljs-name {
+  color: #7ee787;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-subst,
+.dark .chat-code-block__pre .hljs-subst,
+[data-theme='dark'] .chat-code-block__pre .hljs-subst {
+  color: #c9d1d9;
+}
+
+html[theme-mode='dark'] .chat-code-block__pre .hljs-section,
+.dark .chat-code-block__pre .hljs-section,
+[data-theme='dark'] .chat-code-block__pre .hljs-section {
+  color: #1f6feb;
+  font-weight: 700;
+}

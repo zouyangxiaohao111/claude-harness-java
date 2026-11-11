@@ -23,6 +23,9 @@ const { pluginMock } = vi.hoisted(() => ({
     isPermissionGranted: vi.fn(async () => true),
     requestPermission: vi.fn(async () => 'granted' as const),
     sendNotification: vi.fn(),
+    registerActionTypes: vi.fn(async () => {}),
+    // 参数类型显式标注：vi.fn 会从实现推断成「无参」⇒ mockImplementation 传回调时报类型错
+    onAction: vi.fn(async (_cb: (e: unknown) => void) => ({ unregister: vi.fn(async () => {}) })),
   },
 }))
 vi.mock('@tauri-apps/plugin-notification', () => pluginMock)
@@ -63,6 +66,8 @@ beforeEach(async () => {
   pluginMock.isPermissionGranted.mockResolvedValue(true)
   pluginMock.requestPermission.mockResolvedValue('granted')
   pluginMock.sendNotification.mockClear()
+  pluginMock.registerActionTypes.mockClear()
+  pluginMock.onAction.mockClear()
   notify = await import('../systemNotify')
 })
 
@@ -100,6 +105,33 @@ describe('sendSystemNotification · Web 通道', () => {
     expect(await notify.sendSystemNotification({ title: '   ' })).toBe(false)
     expect(instances).toHaveLength(0)
   })
+
+  it('⚠️ 指定 tag → 用该 tag（不同语义的通知**不能共用默认 tag**，否则会互相顶掉）', async () => {
+    const { instances } = installNotification('granted')
+    const ok = await notify.sendSystemNotification({
+      title: 'NexusAI · 需要你回答',
+      body: '选哪个？',
+      tag: 'nexusai-ask-user',
+    })
+    expect(ok).toBe(true)
+    expect(instances[0]!.opts?.tag).toBe('nexusai-ask-user')
+  })
+
+  it('⚠️ 提问通知与轮次完成通知的 tag 必须不同（否则提问通知会把「本轮已完成」顶掉）', async () => {
+    const { instances } = installNotification('granted')
+    await notify.sendSystemNotification({ title: '本轮已完成' })
+    await notify.sendSystemNotification({ title: '需要你回答', tag: 'nexusai-ask-user' })
+    expect(instances).toHaveLength(2)
+    expect(instances[0]!.opts?.tag).toBe('nexusai-turn-done')
+    expect(instances[1]!.opts?.tag).toBe('nexusai-ask-user')
+    expect(instances[0]!.opts?.tag).not.toBe(instances[1]!.opts?.tag)
+  })
+
+  it('空 tag → 回落默认 tag（不传 tag 的调用方行为不变）', async () => {
+    const { instances } = installNotification('granted')
+    await notify.sendSystemNotification({ title: '本轮已完成', tag: '   ' })
+    expect(instances[0]!.opts?.tag).toBe('nexusai-turn-done')
+  })
 })
 
 describe('sendSystemNotification · Tauri 通道', () => {
@@ -108,8 +140,34 @@ describe('sendSystemNotification · Tauri 通道', () => {
     const { instances } = installNotification('granted')
     const ok = await notify.sendSystemNotification({ title: '本轮已完成', body: '会话A' })
     expect(ok).toBe(true)
-    expect(pluginMock.sendNotification).toHaveBeenCalledWith({ title: '本轮已完成', body: '会话A' })
+    expect(pluginMock.sendNotification).toHaveBeenCalledWith({
+      title: '本轮已完成',
+      body: '会话A',
+      // ⚠️ actionTypeId 必须带：未注册 action type 时部分平台**不派发点击事件**
+      //   ⇒ 用户点通知什么也不会发生（实测「点击不会把客户端拉到前台」的另一半原因）。
+      actionTypeId: 'nexusai-notify',
+    })
     expect(instances, '不该同时走 Web 通道').toHaveLength(0)
+  })
+
+  it('⚠️ 携带 extra 载荷（点击通知时回读 sessionId）', async () => {
+    isTauriMock.mockReturnValue(true)
+    installNotification('granted')
+    const ok = await notify.sendSystemNotification({
+      title: 'NexusAI · 需要你回答',
+      extra: { sessionId: 'sess-1' },
+    })
+    expect(ok).toBe(true)
+    const arg = pluginMock.sendNotification.mock.calls[0]![0] as { extra?: Record<string, unknown> }
+    expect(arg.extra).toEqual({ sessionId: 'sess-1' })
+  })
+
+  it('不传 extra → 载荷字段整个不出现（不塞空对象）', async () => {
+    isTauriMock.mockReturnValue(true)
+    installNotification('granted')
+    await notify.sendSystemNotification({ title: '本轮已完成' })
+    const arg = pluginMock.sendNotification.mock.calls[0]![0] as Record<string, unknown>
+    expect('extra' in arg).toBe(false)
   })
 
   it('Tauri 里权限未授予 → 先 requestPermission，仍拒则不发', async () => {
@@ -126,9 +184,51 @@ describe('sendSystemNotification · Tauri 通道', () => {
 
   it('插件缺失（import 抛）→ 静默 false，不把异常抛给收口流程', async () => {
     isTauriMock.mockReturnValue(true)
-    vi.doMock('@tauri-apps/plugin-notification', () => { throw new Error('plugin not installed') })
-    vi.resetModules()
-    const fresh = await import('../systemNotify')
-    await expect(fresh.sendSystemNotification({ title: '本轮已完成' })).resolves.toBe(false)
+    // 插件 API 抛错（模拟插件损坏 / IPC 断连）⇒ 必须静默 false，不能把异常抛给收口流程
+    pluginMock.isPermissionGranted.mockRejectedValueOnce(new Error('plugin broken'))
+    await expect(notify.sendSystemNotification({ title: '本轮已完成' })).resolves.toBe(false)
+  })
+})
+
+describe('onSystemNotificationClick · 订阅通知点击', () => {
+  it('Tauri 环境 → 注册 action type 并订阅 onAction', async () => {
+    isTauriMock.mockReturnValue(true)
+    const off = await notify.onSystemNotificationClick(() => {})
+    expect(pluginMock.registerActionTypes).toHaveBeenCalledTimes(1)
+    expect(pluginMock.onAction).toHaveBeenCalledTimes(1)
+    off()
+  })
+
+  it('⚠️ 点击通知 → 回调收到 extra 载荷（App 据此切会话）', async () => {
+    isTauriMock.mockReturnValue(true)
+    const box: { handler: ((e: unknown) => void) | null } = { handler: null }
+    pluginMock.onAction.mockImplementation(async (cb: (e: unknown) => void) => {
+      box.handler = cb
+      return { unregister: vi.fn(async () => {}) }
+    })
+    const seen: Record<string, unknown>[] = []
+    await notify.onSystemNotificationClick((extra) => seen.push(extra))
+    box.handler!({ actionId: 'tap', notification: { extra: { sessionId: 'sess-9' } } })
+    expect(seen).toEqual([{ sessionId: 'sess-9' }])
+  })
+
+  it('点击通知但没有载荷 → 不回调（调用方自己处理「不知切哪个会话」）', async () => {
+    isTauriMock.mockReturnValue(true)
+    const box: { handler: ((e: unknown) => void) | null } = { handler: null }
+    pluginMock.onAction.mockImplementation(async (cb: (e: unknown) => void) => {
+      box.handler = cb
+      return { unregister: vi.fn(async () => {}) }
+    })
+    const seen: Record<string, unknown>[] = []
+    await notify.onSystemNotificationClick((extra) => seen.push(extra))
+    box.handler!({ actionId: 'tap', notification: null })
+    expect(seen).toHaveLength(0)
+  })
+
+  it('非 Tauri（浏览器）→ 不订阅，返回空操作函数', async () => {
+    isTauriMock.mockReturnValue(false)
+    const off = await notify.onSystemNotificationClick(() => {})
+    expect(pluginMock.onAction).not.toHaveBeenCalled()
+    expect(() => off()).not.toThrow()
   })
 })

@@ -130,7 +130,7 @@ public record AgentUsage(
     /**
      * [E-1a] 从消息列表累加 usage（逐条取值、逐字段相加）· 对齐 CC {@code accumulateUsage}
      * (Open-ClaudeCode/src/utils/forkedAgent.ts:557-566 · NonNullableUsage 逐字段相加) 的
-     * Java 等价物 —— 供 fork（{@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery}
+     * Java 等价物 —— 供 fork（{@link com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery}
      * 现逐轮累加）与子代理（{@code SubagentExecutor}）共用的单一实现。
      *
      * <p><b>WHY 需要它（与既有提取器区别）</b>：{@code SubagentExecutor.extractUsageFromMessages}

@@ -64,19 +64,61 @@ describe('[W3] WikiPanel 关键行为', () => {
   })
 
   it('⭐ 空库与「加载中」是两个不同状态', () => {
-    expect(wikiPanel).toContain('kb-wiki-loading')
+    // 2026-11-10 对齐源站：空态文案照抄源站 i18n（zh-CN.ts:5824-5826）
+    //   emptyTitle='暂无 Wiki 页面' / emptyDesc='上传文档并启用 Wiki 后将自动生成知识页面'
+    //   selectPageHint='从左侧选择一个页面查看内容'
+    // 加载态文案照源站 `knowledgeEditor.wikiBrowser.loading` = '加载中…'
+    // ⛔ 旧锚点 `kb-wiki-loading` 是本仓自造的类名，实现里从来就没有 ⇒ 旧断言恒红。
+    //    判据意图（空库 ≠ 加载中，两者不同分支）改用**真实存在的分支锚点**守。
+    expect(wikiPanel).toContain('if (loading) {')
+    expect(wikiPanel).toContain('加载中…')
     expect(wikiPanel).toContain('WikiEmpty')
-    expect(wikiPanel).toContain('还没有 Wiki 页面')
+    expect(wikiPanel).toContain('暂无 Wiki 页面')
+    expect(wikiPanel).toContain('上传文档并启用 Wiki 后将自动生成知识页面')
   })
 
-  it('⭐ 回滚走 API 而不是本地改（版本必须落库）', () => {
-    expect(wikiPanel).toContain('wikiApi.revert(')
+  it('⭐ 侧栏「知识/摘要」是内容分类筛选器（对齐源站 setActiveTab）', () => {
+    // 2026-11-10 对齐源站 WikiBrowser.vue：
+    //   :260-262  @click="setActiveTab(tab.type)" + active 类名跟随 activeTab
+    //   :1284     CONTENT_TABS = ['knowledge','summary']
+    //   :1319-24  知识 tab 计数 = 四类非 summary 求和（不含 summary）
+    //   :1777     setActiveTab 只换侧栏列表，**不改动右侧已选中的页**
+    expect(wikiPanel).toContain("useState<'knowledge' | 'summary'>")
+    expect(wikiPanel).toContain("setActiveTab('knowledge')")
+    expect(wikiPanel).toContain("setActiveTab('summary')")
+    // 按 page_type 过滤（不是 slug 前缀）
+    expect(wikiPanel).toContain("p.page_type === 'summary'")
+    expect(wikiPanel).toContain("p.page_type !== 'summary'")
+    // 计数：知识 tab 排除 summary
+    expect(wikiPanel).not.toContain('{pages.length}')
+  })
+
+  it('⭐ 默认展示索引（系统视图，与选中页互斥）', () => {
+    // 2026-11-10 对齐源站 WikiBrowser.vue：
+    //   :1005   activeSystemView = ref<'' | 'index'>('')
+    //   :2779   openIndexView(): selectedPage = null + activeSystemView = 'index'
+    //   :2980-91 加载后默认 openIndexView()（注释：「The index is the natural landing view」）
+    //   :247-51 侧栏置顶入口 .wiki-nav-item > svg.wiki-nav-icon + .wiki-nav-text「索引」
+    expect(wikiPanel).toContain("systemView, setSystemView] = useState<'' | 'index'>")
+    expect(wikiPanel).toContain('openIndexView')
+    expect(wikiPanel).toContain('wikiApi.getIndex(baseId)')
+    expect(wikiPanel).toContain('wiki-nav-item')
+    expect(wikiPanel).toContain('wiki-nav-text')
+    expect(wikiPanel).toContain('wiki-index-body')
+    // 索引与选中页互斥：选中普通页要退出系统视图
+    expect(wikiPanel).toContain("setSystemView('')")
+  })
+
+  it('⭐ 回滚走 API 而不是本地改（版本必须落库）', () => {    expect(wikiPanel).toContain('wikiApi.revert(')
     expect(wikiPanel).toContain('wikiApi.revisions(')
   })
 
-  it('⭐ 图谱复用已有画布组件（⛔ 不另写一套）', () => {
-    expect(wikiPanel).toContain("from './KnowledgeGraphCanvas'")
-    expect(wikiPanel).toContain('<KnowledgeGraphCanvas')
+  it('⭐ 图谱走设计稿 04 的 SVG 实现（⛔ 不另一套 canvas 图）', () => {
+    // 2026-11-09 用户裁定「直接照 04 页做」：图谱视图 = KbWikiGraph（SVG 力导向 + 480px 抽屉）。
+    // 旧断言守的是「复用 KnowledgeGraphCanvas」，那条决策已被设计稿覆盖 ⇒ 改锚新组件。
+    expect(wikiPanel).toContain("from './KbWikiGraph'")
+    expect(wikiPanel).toContain('<KbWikiGraph')
+    expect(wikiPanel).not.toContain('<KnowledgeGraphCanvas')
   })
 
   it('⭐ Lint 面板展示健康分与问题', () => {

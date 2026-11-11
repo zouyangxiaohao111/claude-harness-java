@@ -1,6 +1,7 @@
 package com.nexusai.kb.app.parser;
 
 import java.nio.file.Path;
+import java.util.Set;
 
 /**
  * 文档解析器契约 · 一个解析器负责一类文件，产出 {@link KbParsedDocument}。
@@ -42,5 +43,26 @@ public interface KbDocumentParser {
      */
     default String name() {
         return getClass().getSimpleName();
+    }
+
+    /**
+     * 本解析器支持的扩展名（小写、不含点）· 用于注册表端点对外暴露能力。
+     *
+     * <p>默认空集合 = 「未声明」；实现类应返回 {@code supports()} 真正认的那批扩展名，
+     * 与判定逻辑同源（复用类内常量，⛔ 不另抄一份），否则前端下拉会出现「选了却不生效」的选项。
+     *
+     * @return 扩展名集合（不可变；未声明时为空集，非 null）
+     */
+    default Set<String> supportedExtensions() {
+        return Set.of();
+    }
+
+    /**
+     * 展示名 · 前端下拉用（如 {@code 内置 PDF 解析}）。
+     *
+     * @return 展示名；默认同 {@link #name()}
+     */
+    default String displayName() {
+        return name();
     }
 }

@@ -10,6 +10,7 @@ import com.nexusai.application.agent.loop.SubagentLoopDeps;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -30,14 +31,10 @@ import java.util.function.Supplier;
  * <p><b>WHY 存在（E-1b-2 · fork 收敛）</b>: CC 的 fork <b>没有独立循环/工具执行代码</b> ——
  * {@code runForkedAgent}（forkedAgent.ts:489-626）把 cache-safe 参数透传给全局 {@code query()}
  * （:545-556），工具执行的 hook 链 / schema 校验 / 权限门 / decision telemetry 全部由主循环承担。
- * 本仓旧路径 {@link ProductionForkedQuery} 自建循环（逐轮 provider 调用 + {@code HookPermissionResolver}
- * 门控 + {@code ToolRegistry.dispatch}），只覆盖主循环工具执行链的一小部分。本类把 6 个 fork 入口
+ * 本仓旧路径曾自建循环（逐轮 provider 调用 + {@code HookPermissionResolver} 门控 +
+ * {@code ToolRegistry.dispatch}），只覆盖主循环工具执行链的一小部分。本类把 6 个 fork 入口
  * 收回到同一个 {@code queryLoop}，工具执行链全量继承（用户决策 2）。
- *
- * <p><b>与 {@link ProductionForkedQuery} 的关系（E-2 才删旧类）</b>: 两者实现同一
- * {@link RunForkedAgent.ForkedQuery} seam；{@code ToolRegistrationConfig} 只把注入点从旧实现切到
- * 本类，<b>旧类与 seam 均保留 ⇒ 一行回退</b>。本类内<b>不设</b>「回落 ProductionForkedQuery」分支
- * （会让新旧等价验证失去判别力）。
+ * <b>[E-2] 旧自建循环类已删除</b> —— 本类是 fork 的唯一实现。
  *
  * <p><b>E-1b-2 相对旧实现的语义对齐点（逐条）</b>:
  * <ol>
@@ -78,13 +75,26 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
     private static final Logger log = LoggerFactory.getLogger(QueryLoopForkedQuery.class);
 
     /**
+     * 会话模型直传的路由结果。
+     *
+     * <p>原为旧自建 fork 循环类的嵌套 record（E-2 删旧类时迁入本类，唯一生产消费方）。
+     *
+     * @param model         SDK 发送名（裸名，去 provider 前缀）
+     * @param config        provider 运行时配置（baseUrl + 解密 apiKey）
+     * @param provider      目标 LlmProvider
+     * @param providerType  provider.type()（openai_compatible / anthropic …）
+     */
+    public record ForkModelRoute(String model, ProviderConfig config,
+                                 LlmProvider provider, String providerType) {}
+
+    /**
      * 会话模型直传解析（方案 A · 对齐 CC {@code toolUseContext.options.mainLoopModel}）：
      * 入参 = {@code forkCtx.effectiveModelName()}（父会话当前运行模型，provider 全名）；
-     * 返回 {@link ProductionForkedQuery.ForkModelRoute}（裸发送名 + provider config + LlmProvider）。
+     * 返回 {@link ForkModelRoute}（裸发送名 + provider config + LlmProvider）。
      * 非 null 且解析成功 → 用其 config 路由；失败/缺失 → 回落 supplier（旧 settings 路径，行为不变）。
-     * 与 {@link ProductionForkedQuery} 同源（{@code ToolRegistrationConfig.sessionForkModelRoute}）。
+     * 生产由 {@code ToolRegistrationConfig.sessionForkModelRoute} 注入。
      */
-    private final Function<String, ProductionForkedQuery.ForkModelRoute> sessionModelRouteResolver;
+    private final Function<String, ForkModelRoute> sessionModelRouteResolver;
 
     /** 回落模型名 supplier（settings → DB 主模型，裸名）· 会话模型缺失/解析失败时使用（同旧实现）。 */
     private final Supplier<String> modelSupplier;
@@ -99,9 +109,8 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
     private final AgentLoopContextFactory contextFactory;
 
     /**
-     * [fork 模型直传] 「会话模型缺失」告警去重（每 querySource 一次）—— 与
-     * {@link ProductionForkedQuery} 同判据同文案（缺失时 fork 只能回落全局 supplier，settings 无
-     * model → Mock 假回复；首次 warn 显式暴露，后续 debug 防刷屏）。
+     * [fork 模型直传] 「会话模型缺失」告警去重（每 querySource 一次）—— 缺失时 fork 只能回落
+     * 全局 supplier（settings 无 model → Mock 假回复）；首次 warn 显式暴露，后续 debug 防刷屏。
      */
     private final Set<String> sessionModelMissingWarned = ConcurrentHashMap.newKeySet();
 
@@ -121,7 +130,7 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
     }
 
     /**
-     * 构造 · 由 {@code ToolRegistrationConfig} 生产注入（与 {@code productionForkedQuery} 同位置）。
+     * 构造 · 由 {@code ToolRegistrationConfig} 生产注入。
      *
      * @param sessionModelRouteResolver 会话模型直传解析（{@code ToolRegistrationConfig.sessionForkModelRoute}）
      * @param modelSupplier             回落模型 supplier（settings/DB 裸名）
@@ -129,7 +138,7 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
      * @param contextFactory            主循环上下文工厂（fork 隔离 ctx）
      */
     public QueryLoopForkedQuery(
-            Function<String, ProductionForkedQuery.ForkModelRoute> sessionModelRouteResolver,
+            Function<String, ForkModelRoute> sessionModelRouteResolver,
             Supplier<String> modelSupplier,
             Supplier<ProviderConfig> configSupplier,
             AgentLoopContextFactory contextFactory) {
@@ -137,6 +146,26 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         this.modelSupplier = modelSupplier;
         this.configSupplier = configSupplier;
         this.contextFactory = contextFactory;
+    }
+
+    /**
+     * 回落模型名 supplier（settings → DB 主模型，裸名）。
+     *
+     * <p>消费点 = {@code ToolRegistrationConfig.sessionMemoryService} 的
+     * {@code setMainLoopModelSupplier}（hook input data.model · CC getMainLoopModel 等价）。
+     */
+    public Supplier<String> modelSupplier() {
+        return modelSupplier;
+    }
+
+    /**
+     * 回落 provider 配置 supplier（settings 模型解析）。
+     *
+     * <p>消费点 = 3 个 bean 的 {@code setUseGlobalCacheScopeSupplier}
+     * （{@code GlobalCacheScope.shouldUseGlobalCacheScope(config)} · betas.ts:227-233）。
+     */
+    public Supplier<ProviderConfig> configSupplier() {
+        return configSupplier;
     }
 
     /**
@@ -153,11 +182,11 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         long startTime = System.currentTimeMillis();
         ToolUseContext forkCtx = p.toolUseContext();
 
-        // ── 1. 会话模型直传（语义逐条对齐 ProductionForkedQuery.run :248-290）──
+        // ── 1. 会话模型直传（方案 A）──
         String sessionModel = forkCtx != null ? forkCtx.effectiveModelName() : null;
-        ProductionForkedQuery.ForkModelRoute route = null;
+        ForkModelRoute route = null;
         if (sessionModelRouteResolver != null && sessionModel != null && !sessionModel.isBlank()) {
-            ProductionForkedQuery.ForkModelRoute candidate = sessionModelRouteResolver.apply(sessionModel);
+            ForkModelRoute candidate = sessionModelRouteResolver.apply(sessionModel);
             if (candidate != null && candidate.provider() != null && candidate.config() != null
                     && candidate.config().isUsable() && candidate.model() != null
                     && !candidate.model().isBlank()) {
@@ -179,7 +208,7 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         } else {
             model = modelSupplier != null ? modelSupplier.get() : null;
             config = configSupplier != null ? configSupplier.get() : null;
-            // [fail-loud 规则十二 · 同 ProductionForkedQuery :269-284] 会话模型缺失 → 直传分支静默
+            // [fail-loud 规则十二] 会话模型缺失 → 直传分支静默
             //   跳过，只能回落全局 supplier；此前无日志则 SM/extract/dream fork 落 MockLlmProvider
             //   （假回复/永不 Edit）时排障需逐行读代码。每 querySource warn 一次（去重字段）。
             if (sessionModelRouteResolver != null && forkCtx != null) {

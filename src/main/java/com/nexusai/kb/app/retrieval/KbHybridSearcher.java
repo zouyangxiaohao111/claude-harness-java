@@ -152,19 +152,71 @@ public class KbHybridSearcher {
      */
     public List<Hit> search(String knowledgeBaseId, String query, int limit, String modelId,
                             double vectorThreshold, double keywordThreshold) {
+        return search(knowledgeBaseId, query, limit, modelId,
+            vectorThreshold, keywordThreshold, MODE_HYBRID);
+    }
+
+    /** 检索模式 · 混合（两路都走）· 对齐源站 {@code search_knowledge} 的 {@code mode=hybrid}（默认）。 */
+    public static final String MODE_HYBRID = "hybrid";
+    /** 检索模式 · 只走向量路 · 对齐源站 {@code mode=semantic}。 */
+    public static final String MODE_SEMANTIC = "semantic";
+    /** 检索模式 · 只走关键词路 · 对齐源站 {@code mode=keyword}。 */
+    public static final String MODE_KEYWORD = "keyword";
+
+    /**
+     * 按<b>检索模式</b>选择走哪几路召回 · 对齐源站 {@code search_knowledge} 的 {@code mode} 参数
+     * （{@code internal/agent/tools/*search_knowledge*.go}）。
+     *
+     * <h2>⭐⭐ 三档语义（源站描述逐字对齐）</h2>
+     * <ul>
+     *   <li>{@code hybrid}（默认）：两路都走再 RRF 融合 —— 覆盖大多数问题</li>
+     *   <li>{@code semantic}：<b>只走向量路</b> —— 适合改述的、概念性的问题</li>
+     *   <li>{@code keyword}：<b>只走关键词路</b> —— 适合精确词、错误信息、标识符</li>
+     * </ul>
+     *
+     * <p>⚠️ {@code semantic} 但没配嵌入模型时，<b>不静默退化成 hybrid</b>：返回空结果并在
+     * 日志里 warn，因为「用户明确要求语义检索」和「模型缺失」是两件事，
+     * 悄悄换成关键词检索会让他以为语义检索有效。
+     *
+     * <p>⚠️ 未知 mode 值按 {@code hybrid} 处理（源站 {@code mode} 是枚举，非法值不会到这一步；
+     * Java 侧做兜底是为了让模型写错时仍能检索，而非报错中断）。
+     *
+     * @param knowledgeBaseId   知识库 id
+     * @param query             查询文本
+     * @param limit             返回条数（&lt;= 0 用 10）
+     * @param modelId           嵌入模型 id（null/空 = 跳过向量路）
+     * @param vectorThreshold   向量余弦下限（&lt;= 0 = 不过滤）
+     * @param keywordThreshold  关键词分下限（&lt;= 0 = 不过滤）
+     * @param mode              hybrid / semantic / keyword
+     * @return 按融合分降序的命中
+     */
+    public List<Hit> search(String knowledgeBaseId, String query, int limit, String modelId,
+                            double vectorThreshold, double keywordThreshold, String mode) {
         String q = query == null ? "" : query.trim();
         if (q.isEmpty()) {
             return List.of();
         }
         int top = limit <= 0 ? 10 : limit;
+        String m = normalizeMode(mode);
+
+        boolean wantVector = !MODE_KEYWORD.equals(m);
+        boolean wantKeyword = !MODE_SEMANTIC.equals(m);
 
         List<String> vectorIds = List.of();
-        if (modelId != null && !modelId.isBlank()) {
-            vectorIds = vectorRecall(knowledgeBaseId, q, modelId, vectorThreshold);
-        } else {
-            log.debug("[检索] 未指定嵌入模型，跳过向量路 kb={}", knowledgeBaseId);
+        if (wantVector) {
+            if (modelId != null && !modelId.isBlank()) {
+                vectorIds = vectorRecall(knowledgeBaseId, q, modelId, vectorThreshold);
+            } else if (MODE_SEMANTIC.equals(m)) {
+                // ⛔ 不静默退化成关键词检索：显式要求 semantic 却没有模型，如实返回空
+                log.warn("[检索] mode=semantic 但未配置嵌入模型，语义检索不可用 kb={}", knowledgeBaseId);
+                return List.of();
+            } else {
+                log.debug("[检索] 未指定嵌入模型，跳过向量路 kb={}", knowledgeBaseId);
+            }
         }
-        List<String> keywordIds = keywordRecall(knowledgeBaseId, q, keywordThreshold);
+        List<String> keywordIds = wantKeyword
+            ? keywordRecall(knowledgeBaseId, q, keywordThreshold)
+            : List.of();
 
         if (vectorIds.isEmpty() && keywordIds.isEmpty()) {
             return List.of();
@@ -176,8 +228,27 @@ public class KbHybridSearcher {
             KbRrfFusion.DEFAULT_VECTOR_WEIGHT,
             KbRrfFusion.DEFAULT_KEYWORD_WEIGHT);
 
-        List<KbRrfFusion.Fused> cut = fused.size() > top ? fused.subList(0, top) : fused;
-        return materialize(cut);
+        // ⚠️ 顺序：先回填（会丢掉「块已删 / 块禁用 / 文档已删」的命中）再截断。
+        //    反过来做的话，被丢掉的命中会白占名额 ⇒ 实际返回条数少于 limit。
+        List<Hit> hits = materialize(fused);
+        return hits.size() > top ? new ArrayList<>(hits.subList(0, top)) : hits;
+    }
+
+    /**
+     * 规范化检索模式：null / 空 / 未知值 → {@code hybrid}（对齐源站默认值）。
+     *
+     * @param mode 原始值
+     * @return hybrid / semantic / keyword 三者之一
+     */
+    public static String normalizeMode(String mode) {
+        if (mode == null) {
+            return MODE_HYBRID;
+        }
+        String m = mode.trim().toLowerCase(java.util.Locale.ROOT);
+        if (MODE_SEMANTIC.equals(m) || MODE_KEYWORD.equals(m)) {
+            return m;
+        }
+        return MODE_HYBRID;
     }
 
     // ── 向量召回 ────────────────────────────────────────────────────
@@ -207,11 +278,16 @@ public class KbHybridSearcher {
         }
 
         // ⚠️ 必须按 model_id 过滤：不同模型的向量空间不可比，混算余弦是垃圾结果
+        // ⭐ 块级可见性闸（缺陷：is_enabled=0 的分块仍被召回）
+        //   kb_embedding 只是索引产物，块被禁用后向量行可能还在（禁用不走重建索引）
+        //   ⇒ 用子查询把「未删 + 启用」的块限定出来，一次查询完成（不是逐条查、也不是 N+1）。
         List<KbEmbeddingRecord> rows = embeddingMapper.selectListByQuery(
             QueryWrapper.create()
                 .where("knowledge_base_id = ?", kbId)
                 .and("model_id = ?", modelId)
-                .and("source_type = ?", "chunk"));
+                .and("source_type = ?", "chunk")
+                .and("source_id IN (SELECT id FROM kb_chunk WHERE knowledge_base_id = ?"
+                    + " AND deleted = 0 AND is_enabled = 1)", kbId));
 
         List<Scored> scored = new ArrayList<>(rows.size());
         for (KbEmbeddingRecord row : rows) {
@@ -297,9 +373,15 @@ public class KbHybridSearcher {
             return keywordRecallLike(kbId, query);
         }
         // rank 也要取出来：阈值要按原始分筛（源侧 keyword_threshold 语义）
-        String sql = "SELECT chunk_id, rank FROM kb_chunk_fts "
-            + "WHERE kb_chunk_fts MATCH ? AND knowledge_base_id = ? "
-            + "ORDER BY rank LIMIT ?";
+        // ⭐ JOIN kb_chunk 做块级可见性闸（缺陷：is_enabled=0 的块仍被召回）。
+        //   FTS 表没有 is_enabled 列，且它只是索引产物 ⇒ 以 kb_chunk 为准。
+        //   ⚠️ FTS5 的 MATCH 必须作用在**表名**上（带别名会报 no such column）——
+        //   真机实测：`FROM kb_chunk_fts f ... WHERE f MATCH ?` 直接 SQL 错误。
+        String sql = "SELECT kb_chunk_fts.chunk_id, kb_chunk_fts.rank FROM kb_chunk_fts "
+            + "JOIN kb_chunk c ON c.id = kb_chunk_fts.chunk_id "
+            + "WHERE kb_chunk_fts MATCH ? AND kb_chunk_fts.knowledge_base_id = ? "
+            + "AND c.deleted = 0 AND c.is_enabled = 1 "
+            + "ORDER BY kb_chunk_fts.rank LIMIT ?";
         try (var conn = dataSource.getConnection();
              var ps = conn.prepareStatement(sql)) {
             ps.setString(1, matchExpr);
@@ -380,6 +462,8 @@ public class KbHybridSearcher {
         List<KbChunkRecord> rows = chunkMapper.selectListByQuery(
             QueryWrapper.create()
                 .where("knowledge_base_id = ?", kbId)
+                // ⭐ 禁用块不召回（与 FTS 路同口径）
+                .and("is_enabled = 1")
                 .and("(content LIKE ? ESCAPE '\\' OR context_header LIKE ? ESCAPE '\\')",
                     pattern, pattern)
                 .orderBy("chunk_index", true)
@@ -402,11 +486,31 @@ public class KbHybridSearcher {
             ids.add(f.id());
         }
         List<KbChunkRecord> rows = chunkMapper.selectListByQuery(
-            QueryWrapper.create().where(
-                "id IN (" + String.join(",", ids.stream().map(x -> "?").toList()) + ")",
-                ids.toArray()));
+            QueryWrapper.create()
+                // ⭐ 禁用块不返回正文（与召回侧同一闸；索引可能残留旧行）
+                .where("is_enabled = 1")
+                .and("id IN (" + String.join(",", ids.stream().map(x -> "?").toList()) + ")",
+                    ids.toArray()));
+
+        // ⭐⭐ 文档状态闸（缺陷：逻辑删 / 禁用的文档仍被召回并返回完整正文）
+        //   索引产物（kb_embedding / kb_chunk_fts）不会随 kb_knowledge.deleted 自动失效，
+        //   所以检索侧必须自己确认「块所属文档仍然可见」。
+        //   ⚠️ 一次批量 IN 查询（内部按批切），⛔ 不是逐条查（N+1）。
+        Set<String> knowledgeIds = new LinkedHashSet<>();
+        for (KbChunkRecord r : rows) {
+            if (r.getKnowledgeId() != null) {
+                knowledgeIds.add(r.getKnowledgeId());
+            }
+        }
+        // 只收录「表里确实存在」的文档 → 可见性；查不到的（wiki 页块）不在 map 里，不参与过滤。
+        java.util.Map<String, Boolean> docVisible = knowledgeVisibility(knowledgeIds);
+
         java.util.Map<String, KbChunkRecord> byId = new java.util.HashMap<>();
         for (KbChunkRecord r : rows) {
+            Boolean visible = docVisible.get(r.getKnowledgeId());
+            if (Boolean.FALSE.equals(visible)) {
+                continue;  // 逻辑删 / disabled 的文档 ⇒ 不返回正文
+            }
             byId.put(r.getId(), r);
         }
 
@@ -425,5 +529,60 @@ public class KbHybridSearcher {
     }
 
     private record Scored(String chunkId, double score) {
+    }
+
+    // ── 可见性闸（批量，⛔ 不逐条查）─────────────────────────────────
+
+    /** 文档状态批量查询的单批 id 数（SQLite 绑定变量数有上限，分批更稳）。 */
+    private static final int IN_BATCH = 200;
+
+    /**
+     * 文档级可见性：{@code knowledgeId → 是否可见}。
+     *
+     * <p><b>⭐ 为什么检索侧也要问一遍</b>：删文档虽然有清理索引的路径，但它是「先清索引、
+     * 再删主行」的多步操作，中途崩溃或别的入口漏清都会留下孤儿索引 ⇒ 已删文档仍能被召回，
+     * 而且返回**完整正文**。这是数据正确性问题，不能只靠上游自觉。
+     *
+     * <p><b>口径</b>（V257 DDL）：{@code kb_knowledge.deleted = 0} 且
+     * {@code enable_status = 'enabled'}（列注释：enabled | disabled）。
+     * ⚠️ <b>不</b>在这里过滤 {@code parse_status}：{@code KbAdvancedService#rebuildIndex}
+     * 会对 {@code finalizing} 的文档建索引，若这里要求 {@code completed}，
+     * 那些文档会「索引建好了但永远搜不到」。
+     *
+     * <p>⚠️ 查不到的 id <b>不进</b> map —— wiki 页块把 {@code knowledge_id} 填成 wiki 页 id，
+     * 没有对应知识条目（见 {@code KbWikiChunkSync}），不能因此被当成「已删」丢掉。
+     *
+     * @param knowledgeIds 候选文档 id
+     * @return id → 是否可见；读失败时返回空 map（= 不额外过滤）
+     */
+    private java.util.Map<String, Boolean> knowledgeVisibility(Set<String> knowledgeIds) {
+        if (knowledgeIds == null || knowledgeIds.isEmpty()) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, Boolean> out = new java.util.HashMap<>(knowledgeIds.size() * 2);
+        List<String> all = new ArrayList<>(knowledgeIds);
+        try {
+            for (int start = 0; start < all.size(); start += IN_BATCH) {
+                List<String> batch = all.subList(start, Math.min(start + IN_BATCH, all.size()));
+                String sql = "SELECT id, deleted, enable_status FROM kb_knowledge "
+                    + "WHERE id IN (" + String.join(",", batch.stream().map(x -> "?").toList()) + ")";
+                try (var conn = dataSource.getConnection();
+                     var ps = conn.prepareStatement(sql)) {
+                    for (int i = 0; i < batch.size(); i++) {
+                        ps.setString(i + 1, batch.get(i));
+                    }
+                    try (var rs = ps.executeQuery()) {
+                        while (rs.next()) {
+                            out.put(rs.getString(1),
+                                rs.getInt(2) == 0 && "enabled".equals(rs.getString(3)));
+                        }
+                    }
+                }
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("[检索] 文档可见性查询失败，跳过该闸 原因={}", e.getMessage());
+            return java.util.Map.of();
+        }
     }
 }

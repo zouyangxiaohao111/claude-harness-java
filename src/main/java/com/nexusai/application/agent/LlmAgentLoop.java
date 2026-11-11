@@ -4388,12 +4388,12 @@ public class LlmAgentLoop implements AgentLoop {
         //   createAutoMemCanUseTool / createCompactCanUseTool）；Java 的 canUseTool == null 语义
         //   = 回落内层 ToolPermissionGate（**全权限**）。主线程/子代理/hook agent 本就该回落
         //   （现状，零变化）；后台 fork 若漏注入则**静默变全权限** → 与
-        //   ProductionForkedQuery.executeGatedTool 的 fail-loud 同判据，此处对齐为 fail-loud
+        //   QueryLoopForkedQuery 工具执行链 的 fail-loud 同判据，此处对齐为 fail-loud
         //   （异常直接暴露，不静默降级）。
         if (QuerySource.isBackgroundForkSource(params.querySource()) && params.canUseTool() == null) {
             throw new IllegalStateException("[queryLoop] 后台 fork 来源（querySource="
                 + params.querySource() + "）未注入 canUseTool —— fork 工具将退回内层 permissionGate"
-                + "（全权限），INV-6 破坏，fail loud（对齐 ProductionForkedQuery 同判据）");
+                + "（全权限），INV-6 破坏，fail loud");
         }
         // [P-8] CC query.ts:276 初始 turnCount:1 —— Java AgentState 初始 0，入口补齐；
         //   递归重入（stop_hook_blocking loop(..., true)）不经本方法，turnCount 保持（CC:1301）。
@@ -7533,7 +7533,7 @@ public class LlmAgentLoop implements AgentLoop {
                 perTurnTuc != null ? perTurnTuc.abortController() : null,
                 // [C] skipCacheWrite 透传（params → ModelRequest → ModelCaller → provider.stream 末参）。
                 //   本仓生产恒 null（所有 RunRequest 工厂第 11 实参传 null = CC 未设置语义，主线程写 cache）；
-                //   fork 路径不经本构造点（走 ProductionForkedQuery，自带 skipCacheWrite=true）。
+                //   fork 路径不经本构造点（走主循环 queryLoop，skipCacheWrite 由 QueryParams 承载）。
                 //   本字段是「QueryParams.skipCacheWrite 0 读点」断点的闭合点（原 0 读点 → 唯一读点）。
                 params.skipCacheWrite(),
                 // ═══════════════════ [A#3 tuc-invoking-req] 显式 agent 归因上下文 ═══════════════════
@@ -8576,7 +8576,7 @@ public class LlmAgentLoop implements AgentLoop {
                             //   [E-1a 变更] 旧实现传 post-append 的 fullSystemPrompt（Java 特有取舍，
                             //   因 fork 发送边界当时不重跑 append）；E-1a 把 append 移到使用点后，
                             //   本字段回归 CC 的 pre-append 语义，systemContext 独立随第 4 参透传，
-                            //   fork 发送边界（ProductionForkedQuery）仍恰并入一次 → 发送字节不变。
+                            //   fork 发送边界仍恰并入一次 → 发送字节不变。
                             //   消费点：SessionMemoryService.sessionSystemPrompt →
                             //   CacheSafeParams.systemPrompt（pre-append + systemContext map）；
                             //   ApiQueryHookHelper（hook 查询）在自身使用点补 append。
@@ -9191,7 +9191,7 @@ public class LlmAgentLoop implements AgentLoop {
                     //   合并后 userContext 一致。
                     //   [E-1a 变更] systemPrompt 传 **pre-append** 的 params.systemPrompt()
                     //   （= CC 语义）：append 已移到使用点 —— fork 发送边界
-                    //   {@code ProductionForkedQuery} 在 splitSysPromptPrefix 前恰并入一次
+                    //   fork 发送边界在 splitSysPromptPrefix 前恰并入一次
                     //   （systemContext 独立随第 3 参透传）。旧实现传 post-append 的 fullSystemPrompt
                     //   是 Java 特有取舍（当时发送边界不重跑 append）；两形态在本批**发送字节相同**。
                     //   同款先例：CacheSharingParamsBuilder（同批改为 pre-append）。
@@ -9212,7 +9212,7 @@ public class LlmAgentLoop implements AgentLoop {
                             // [SM-fork 模型直传 2026-09-10] 当轮会话运行模型（= CC
                             //   toolUseContext.options.mainLoopModel）随 fork 原料透传 ——
                             //   extract/dream fork 的 toolUseContext 由此补齐 effectiveModelName，
-                            //   否则 ProductionForkedQuery 直传分支取不到模型 → provider 回落
+                            //   否则 QueryLoopForkedQuery 直传分支取不到模型 → provider 回落
                             //   MockLlmProvider（假回复/永不 Write 记忆）。源 = state.currentModel()
                             //   （与 post-sampling hook toolUseContext 的 hookToolUseContext 同源）。
                             state.currentModel(),
@@ -15422,7 +15422,7 @@ public class LlmAgentLoop implements AgentLoop {
             // [测试残留修复 · isToolErrorData 前缀缺口] EditFileTool/WriteFileTool 兜底门禁
             //   （execute(call) 无 ctx → "…requires ToolUseContext"，execute(call, ctx) validateInput
             //   失败 → "…validateInput failed: …"）此前不命中任何前缀 → 直接 execute 调用方
-            //   （MagicDocUpdater.java:400 / ProductionForkedQuery.java:310 等）把门禁拒绝误判为成功
+            //   （MagicDocUpdater.java:400 / LlmAgentLoop 工具执行链 等）把门禁拒绝误判为成功
             //   （silent success）。补 4 前缀使门禁错误结果被识别（CC 语义：错误必须显式失败）。
             || s.startsWith("EditFileTool validateInput failed") || s.startsWith("WriteFileTool validateInput failed")
             || s.startsWith("EditFileTool requires ToolUseContext") || s.startsWith("WriteFileTool requires ToolUseContext")
@@ -15439,7 +15439,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   "NexusAI is unable to fetch from <domain>"（WebFetchSecurity.DomainBlockedException:649，
             //   WebFetchTool.java:304-306 以 ToolResult.error(call.id(), e.getMessage()) 透传 data）。
             //   此前仅登记 "unable to fetch"（只匹配以 unable 开头的串），阻断消息以 "NexusAI is " 开头
-            //   → 前缀不匹配 → 下游消费者（InboundMcpToolProvider/ProductionForkedQuery/MagicDocsService 等）
+            //   → 前缀不匹配 → 下游消费者（InboundMcpToolProvider/MagicDocsService 等）
             //   把阻断误判为成功 tool_result（silent success）。补前缀使 WebFetch 阻断被识别为 error。
             || s.startsWith("NexusAI is unable to fetch")
             || s.startsWith("WorktreeCreate hook failed") || s.startsWith("WorktreeRemove hook failed")

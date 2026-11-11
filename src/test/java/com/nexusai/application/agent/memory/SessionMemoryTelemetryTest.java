@@ -2,7 +2,7 @@ package com.nexusai.application.agent.memory;
 
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.nexusai.application.agent.compact.CompactionResult;
-import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
+import com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.telemetry.Telemetry;
 import com.nexusai.application.agent.tool.AbortController;
@@ -241,9 +241,9 @@ class SessionMemoryTelemetryTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
-    @DisplayName("[IMP-MV2-10] extraction 事件携带真实 input/cache usage（ProductionForkedQuery 全量累计 · 非恒 0）")
+    @DisplayName("[IMP-MV2-10] extraction 事件携带真实 input/cache usage（fork 全量累计 · 非恒 0）")
     void extractionEvent_carriesFullUsageFromFork() {
-        // WHY: D1 △-2 —— ProductionForkedQuery 旧实现仅累计 outputTokens
+        // WHY: D1 △-2 —— 旧实现仅累计 outputTokens
         //   （new ForkUsage(0, outputTokens, 0, 0)）→ tengu_extract_memories_extraction 的
         //   input/cache 恒 0，成本监控失真。CC forkedAgent.ts:557-566 从 message_delta 累计
         //   全量 usage（input/output/cache_read/cache_create）→ 事件字段必须非恒 0。
@@ -252,14 +252,17 @@ class SessionMemoryTelemetryTest {
         RecordingTelemetry telemetry = new RecordingTelemetry();
         agent.setTelemetry(telemetry);
 
-        // provider 上报完整 usage（含 cache_read>0）→ ProductionForkedQuery 全量累计
+        // provider 上报完整 usage（含 cache_read>0）→ fork 全量累计
         UsageProvider provider = new UsageProvider(
             new AssistantMessage("final answer", "stop", List.of(), "", null,
                 new AgentUsage(1000L, 300L, 50L, 700L, null, null, null)));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> "test-model", () -> ProviderConfig.empty(),
-            ToolRegistry.from(List.of()));
+        QueryLoopForkedQuery loop = forkQuery(provider);
         agent.setForkedQuery(loop);
+        // 主循环执行工具依赖 per-turn TUC.availableTools（旧自建循环用 ToolRegistry.dispatch）——
+        //   故必须注入带工具的 CacheSafeParams，否则 tool_calls 轮直接报
+        //   「assistant returned tool_calls but per-turn TUC has no availableTools」→ 零产出。
+        agent.setCacheSafeParamsSupplier((sid, cwd) -> new com.nexusai.application.agent.compact.fork.CacheSafeParams(
+            List.of(), Map.of(), Map.of(), tucWithEcho(), List.of(), false));
 
         runExtractSync(agent, List.of(msg("m1", "a"), msg("m2", "b")));
 
@@ -291,10 +294,13 @@ class SessionMemoryTelemetryTest {
                 new AgentUsage(500L, 150L, 20L, 300L, null, null, null)),
             new AssistantMessage("done", "stop", List.of(), "", null,
                 new AgentUsage(700L, 42L, 30L, 400L, null, null, null)));
-        ProductionForkedQuery loop = new ProductionForkedQuery(
-            () -> provider, () -> "test-model", () -> ProviderConfig.empty(),
-            ToolRegistry.from(List.of()));
+        QueryLoopForkedQuery loop = forkQuery(provider);
         agent.setForkedQuery(loop);
+        // 主循环执行工具依赖 per-turn TUC.availableTools（旧自建循环用 ToolRegistry.dispatch）——
+        //   故必须注入带工具的 CacheSafeParams，否则 tool_calls 轮直接报
+        //   「assistant returned tool_calls but per-turn TUC has no availableTools」→ 零产出。
+        agent.setCacheSafeParamsSupplier((sid, cwd) -> new com.nexusai.application.agent.compact.fork.CacheSafeParams(
+            List.of(), Map.of(), Map.of(), tucWithEcho(), List.of(), false));
 
         runExtractSync(agent, List.of(msg("m1", "a"), msg("m2", "b")));
 
@@ -307,6 +313,26 @@ class SessionMemoryTelemetryTest {
     }
 
     /** 显式开 gate 同步跑一轮提取（对齐 ExtractMemoriesAgentTest.runExtractSync 模式）。 */
+    /** per-turn TUC（含 Echo 工具）—— 主循环工具执行的前置。 */
+    private static com.nexusai.application.agent.tool.ToolUseContext tucWithEcho() {
+        com.nexusai.application.agent.tool.Tool echo = new com.nexusai.application.agent.tool.Tool() {
+            @Override public String name() { return "Echo"; }
+            @Override public String description() { return "echo test tool"; }
+            @Override public com.fasterxml.jackson.databind.JsonNode inputSchema() {
+                return com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+            }
+            @Override public com.nexusai.application.agent.tool.AgentToolResult<?> execute(
+                    com.nexusai.application.agent.tool.ToolUseBlock call) {
+                return com.nexusai.application.agent.tool.ToolResult.success(call.id(), "ok");
+            }
+        };
+        return new com.nexusai.application.agent.tool.ToolUseContext(
+            java.util.UUID.randomUUID(), "no-session",
+            com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
+            Map.of(), List.of(echo), "",
+            com.nexusai.application.agent.tool.AbortController.NOOP, List.of());
+    }
+
     private static void runExtractSync(ExtractMemoriesAgent agent, List<ChatMessageDto> messages) {
         agent.setExtractionGate(() -> true);
         agent.setAutoMemoryEnabled(() -> true);
@@ -376,6 +402,53 @@ class SessionMemoryTelemetryTest {
     }
 
     /** 记录事件名 + 属性 + 计数的 Telemetry 假实现。 */
+    /**
+     * 最小 ModelConfigResolver stub：按名解析出 openai_compatible + 原样 SDK 名。
+     *
+     * <p>主循环经 {@code LlmInvocationGateway.resolve} 取 providerType / sdk 模型名；
+     * 缺 resolver 时 providerType 退化、config 被判 unusable ⇒ provider 不被调用（0 token）。
+     */
+    private static com.nexusai.infra.llm.ModelConfigResolver resolverStub() {
+        com.nexusai.infra.llm.ModelConfigResolver r =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.ModelConfigResolver.class);
+        org.mockito.Mockito.when(r.resolve(org.mockito.ArgumentMatchers.anyString()))
+            .thenAnswer(inv -> new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
+                com.nexusai.infra.llm.ProviderConfig.empty(), "openai_compatible",
+                (String) inv.getArgument(0)));
+        org.mockito.Mockito.when(r.resolveSdkModelName(org.mockito.ArgumentMatchers.anyString()))
+            .thenAnswer(inv -> inv.getArgument(0));
+        return r;
+    }
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(LlmProvider provider) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true); f.set(factory, pf);
+            // 主循环经 LlmInvocationGateway 解析 providerType / SDK 模型名 —— 缺 resolver 时
+            //   providerType 退化为默认且 sdk 名不剥前缀，config 被判定 unusable（0 token）。
+            java.lang.reflect.Field fr = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("modelConfigResolver");
+            fr.setAccessible(true); fr.set(factory, resolverStub());
+            java.lang.reflect.Field f2 = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("toolRegistry");
+            f2.setAccessible(true); f2.set(factory, ToolRegistry.from(List.of()));
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "test-model", () -> ProviderConfig.empty(), factory);
+    }
+
     private static final class RecordingTelemetry extends Telemetry {
         final List<String> events = new ArrayList<>();
         final Map<String, Map<String, Object>> attrsByEvent = new HashMap<>();

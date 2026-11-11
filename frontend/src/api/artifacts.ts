@@ -22,6 +22,16 @@ export interface SessionArtifactDto {
    * （挂到「最后一条」会让历史产物看起来像本轮产出）。它们仍出现在右侧栏总量里。
    */
   sourceMessageId: string | null
+  /**
+   * 产物来源通道（后端 V279 起写入）。
+   *
+   * <p>`deliverables` = 写进会话交付物目录（Agent 主动交付）；
+   * `project-write` = 本轮 Write/Edit 写过的项目内文档。
+   *
+   * <p>`null` / `undefined` = 未标注（V279 之前的历史行，或旧后端）——
+   * ⛔ 不要当成任一种来画角标，那会伪造来源。可选是为兼容未升级的后端。
+   */
+  origin?: 'deliverables' | 'project-write' | null
   updatedAt: string | null
   /**
    * `localPath` 指向的是**目录**而不是文件（后端**读时判定**，不落库）。

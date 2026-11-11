@@ -3,7 +3,7 @@ import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
 
 interface PluginPanelProps {
   settings: AppSettings | null
-  onSaveSettings: (req: UpdateSettingsRequest) => Promise<void>
+  onSaveSettings: (req: UpdateSettingsRequest) => Promise<boolean>
 }
 
 /**

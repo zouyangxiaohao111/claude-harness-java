@@ -42,7 +42,7 @@ import static org.mockito.Mockito.when;
  * [E-1a] fork 屏蔽档（task 4）· 每个受屏蔽的副作用点「fork 来源不触发 / 主线程来源触发」。
  *
  * <p><b>WHY 本测试存在（意图 · CLAUDE.md 规则九）</b>：后台 fork（compact / session-memory /
- * extract-memories / auto-dream）今天走专用循环 {@code ProductionForkedQuery}；E-1b 收敛到主循环
+ * extract-memories / auto-dream）今天走专用循环 fork 发送边界；E-1b 收敛到主循环
  * {@code queryLoop} 后，主循环内<b>主会话专属副作用</b>会对 fork 也执行 —— 而 Java 的
  * {@code AgentLoopContext} 携带主会话级 bean（事件桥 / state / 注册表），CC 靠 fork 的隔离上下文
  * 天然隔离。若不设门，fork 会：把 turn 生命周期发进主会话 UI 事件流、把 fork 消息喂给主会话

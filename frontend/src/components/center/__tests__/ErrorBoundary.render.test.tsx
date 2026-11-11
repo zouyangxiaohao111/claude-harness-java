@@ -35,8 +35,12 @@ import type { ChatMessageDto } from '@/api/types'
 /** 注入毒的正文标记。 */
 const POISON = 'OBS2-POISON-MARKER'
 
-vi.mock('@/markdown/MarkdownText', () => ({
-  MarkdownText: ({ text }: { text: string }) => {
+vi.mock('@/markdown/vendor/renderer', () => ({
+  // 2026-11-11：主会话渲染器已从 V1（@/markdown/MarkdownText）切到 V2
+  // （@/markdown/vendor/renderer）。本测试靠「注入毒」验证逐行 ErrorBoundary，
+  // 必须 mock **当前真正被 MessageList 引用的那个模块** ——
+  // mock 错目标会让毒注入静默失效（测试变红但根因是 mock 过时，不是产品缺陷）。
+  MarkdownTextV2: ({ text }: { text: string }) => {
     if (text.includes(POISON)) throw new Error(`注入的渲染毒：正文含 ${POISON}`)
     return <div className="md-mock">{text}</div>
   },

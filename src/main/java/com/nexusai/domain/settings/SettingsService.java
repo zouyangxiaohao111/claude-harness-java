@@ -216,10 +216,16 @@ public class SettingsService {
         if (req.subagentExternalEnabled() != null) {
             s.setSubagentExternalEnabled(req.subagentExternalEnabled());
         }
+        // ⛔ 清空这一支必须走 update(entity, **false**)，否则 DB 里会留着旧值。
+        //   mybatis-flex update(entity) 默认忽略 null 字段（NOT_NULL 策略）⇒ subagent_default_runtime
+        //   列被 SET 跳过 ⇒ 「改回内置」点了没反应，DB 永远停在 claude ⇒ 派发永远回落到 claude。
+        //   （对齐 SettingsService.clearModelTier:406 / SessionService.setTeamContext:855 的同款写法。）
+        boolean clearSubagentDefaultRuntime = false;
         if (req.subagentDefaultRuntime() != null) {
             String rt = req.subagentDefaultRuntime().trim();
             if (rt.isEmpty()) {
                 s.setSubagentDefaultRuntime(null);   // 显式清空 = 回到「全内置」
+                clearSubagentDefaultRuntime = true;
             } else if (com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.find(rt) == null) {
                 throw new ValidationException("未知的外部运行时 '" + rt + "'，可选："
                         + com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.presets()
@@ -328,7 +334,16 @@ public class SettingsService {
                 req.autoMemoryEnabled(), req.autoDreamEnabled());
         }
 
-        settingsMapper.update(s);
+        // ⚠️ 清空「默认外部运行时」时必须 ignoreNulls=false 显式写 NULL（对齐 clearModelTier:406）。
+        //   默认 update(entity) 忽略 null 字段 ⇒ subagent_default_runtime 列被 SET 跳过
+        //   ⇒ 用户点「改回内置」没反应，DB 留着旧 runtime ⇒ 派发永远回落到它。
+        //   ⛔ 不能用「稀疏 patch + updateByQuery(patch,false,qw)」：false 会把 patch 所有 null 字段
+        //   写 NULL，settings 里 NOT NULL 列（theme/font_size/accent/…）会炸 ⇒ 用完整实体 s。
+        if (clearSubagentDefaultRuntime) {
+            settingsMapper.update(s, false);
+        } else {
+            settingsMapper.update(s);
+        }
 
         // [C-1 · 实施阶段补充登记 4 · memoize 冻结] autoMemoryDirectory 运行期变更 → 清 AutoMemPaths
         // memoize 缓存：getAutoMemPath 按 projectRoot 槽缓存（AutoMemPaths#autoMemPathCache，对齐 CC

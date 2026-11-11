@@ -181,7 +181,7 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             .containsEntry("gitStatus", "GIT-STATUS-GOLDEN");
         // [E-1a pre-append 契约] PostSamplingContext.systemPrompt = 组装段数组（**未经**
         //   appendSystemContext），systemContext 独立随第 4 参透传（上方已断言）；
-        //   append 在使用点（fork 发送边界 ProductionForkedQuery / hook 查询 ApiQueryHookHelper）。
+        //   append 在使用点（fork 发送边界 / hook 查询 ApiQueryHookHelper）。
         assertThat(ps.systemPrompt())
             .as("[E-1a] systemPrompt 必须是 pre-append 形态（不得预先并入 systemContext 段）")
             .noneSatisfy(seg -> assertThat(seg).contains("gitStatus: GIT-STATUS-GOLDEN"));

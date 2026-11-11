@@ -1,0 +1,309 @@
+/**
+ * 代码块样式 · 照搬源站。
+ *
+ * 来源：WeKnora（pinned 80e8345）
+ * `frontend/src/components/css/chat-markdown.less` 的 `.chat-code-block*` 规则。
+ *
+ * 改动只有两种（都是形式，不是语义）：
+ * 1. 去掉 Vue scoped 的 `:deep()` 包装（React 无此概念）
+ * 2. LESS 的嵌套/`&` 选择器展开成普通 CSS
+ *
+ * 为什么不复用本仓既有的 `.md-code-block`：用户 2026-11-11 裁定
+ * 「所有跟 V1 相同的我都不认可，你都 V2 了 就抄源侧就行」。
+ *
+ * <h2>⚠️ 变量已换成本仓对话区可用的那套（真机缺陷，2026-11-11）</h2>
+ * 源站用的 `--td-*` / `--app-*` 在本仓**只定义在 `.kb-scope` 子树里**
+ * （`kb-scope.css`），而对话区不在该子树 ⇒ 取不到值 ⇒
+ * 边框/背景/圆角全部失效（浏览器实测 `preBg = rgba(0,0,0,0)`）。
+ * ⇒ 统一换成本仓 `globals.css` 的 `:root` 变量：
+ * `--surface-1/2` · `--hairline-strong` · `--ink*` · `--accent` · `--r-sm/md/lg`。
+ */
+
+/* 非代码块的裸 <pre>（源站同一条，保证其它 pre 不裸奔） */
+pre:not(.chat-code-block__pre):not(.chat-mermaid-block__canvas) {
+  background: var(--surface-2);
+  padding: 14px 16px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  overflow-x: auto;
+  margin: 0.75em 0;
+  line-height: 1.55;
+  font-size: 13px;
+}
+
+pre:not(.chat-code-block__pre):not(.chat-mermaid-block__canvas) code {
+  background: none;
+  padding: 0;
+  font-size: inherit;
+  font-weight: 400;
+}
+
+/* ── 代码块容器 ─────────────────────────────────────────────────────────── */
+
+.chat-code-block {
+  margin: 0.75em 0;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-md);
+  overflow: hidden;
+  background: var(--surface-1);
+  box-shadow: 0 1px 2px color-mix(in srgb, var(--ink) 6%, transparent);
+  /* ⭐⭐ 宽度策略：60% 起步，内容更宽就跟着长，最多到容器宽（2026-11-11 两次裁定）
+   *
+   * 规则来源分两半：
+   * - 自适应思想来自表格（源站 `.chat-markdown-table` 是
+   *   `width: fit-content; max-width: 100%; overflow-x: auto`）
+   * - 「60% 起步」是用户实测后追加的：纯 fit-content 时 3 行短代码只有 104px，
+   *   视觉上太窄、像个小方块 ⇒ 给一个 60% 的下限
+   *
+   * 三条缺一不可：
+   *   `width: fit-content`  内容多宽就多宽（长代码不被截断）
+   *   `min-width: 60%`      短代码也不缩成一个窄条（用户要的起始宽度）
+   *   `max-width: 100%`     不撑破容器；超出由 `__pre` 横向滚动
+   *
+   * ⛔ 不要写 `width: 100%` —— 短代码会占满整行，两侧空白很难看。
+   * ⛔ 不要只写 `fit-content` —— 短代码会窄到 100px 左右。
+   * ⚠️ 行内代码（单个反引号）不受影响：那是 `<code>`，不是 `.chat-code-block`。 */
+  display: block;
+  width: fit-content;
+  min-width: 60%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+/* 头部：语言徽标 + 动作区 */
+.chat-code-block__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-height: 36px;
+  padding: 6px 10px 6px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline-strong);
+}
+
+.chat-code-block__lang {
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1.2;
+  color: var(--ink-subtle);
+  letter-spacing: 0.02em;
+  text-transform: none;
+}
+
+.chat-code-block__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* 复制按钮 */
+.chat-code-block__copy {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-subtle);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease,
+    border-color 0.15s ease;
+}
+
+.chat-code-block__copy:hover {
+  background: color-mix(in srgb, var(--ink) 6%, var(--surface-2));
+  border-color: var(--hairline-strong);
+  color: var(--ink);
+}
+
+.chat-code-block__copy.is-copied {
+  color: var(--ink);
+}
+
+.chat-code-block__copy.is-error {
+  color: var(--error);
+}
+
+.chat-code-block__copy-icon {
+  flex-shrink: 0;
+}
+
+/* 本仓特有：HTML 代码块的「运行」按钮（源站没有此功能）。
+   样式沿用复制按钮的视觉（同尺寸、同 hover），只把品牌色换成强调色。 */
+.chat-code-block__run {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin: 0;
+  padding: 4px 8px;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--accent);
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 0.15s ease, border-color 0.15s ease;
+}
+
+.chat-code-block__run:hover {
+  background: color-mix(in srgb, var(--accent) 8%, transparent);
+  border-color: var(--accent);
+}
+
+/* 正文：横向滚动（长代码不撑破宽度 —— 这是本次真机缺陷的修复点） */
+.chat-code-block__pre {
+  margin: 0;
+  padding: 14px 16px;
+  border-radius: 0;
+  background: color-mix(in srgb, var(--surface-2) 88%, var(--surface-1));
+  overflow-x: auto;
+  font-size: 13px;
+  line-height: 1.55;
+  /* 让 `__pre` 跟随容器的 fit-content 宽度；容器被 max-width 夹住时这里出滚动条 */
+  max-width: 100%;
+}
+
+.chat-code-block__pre code {
+  background: transparent;
+  padding: 0;
+  border-radius: 0;
+  font-size: inherit;
+  font-weight: 400;
+  white-space: pre;
+  display: block;
+  /* ⭐⭐ 必须是真等宽字体（2026-11-11 用户：「代码没有按照格式化吗 类似 idea 那种」）
+   *
+   * 缺陷来源：`globals.css:1418` 的 `.msg .content code { font-family: var(--font-sans) }`
+   * 是一条**历史规则**（注释写「用户要求不用等宽」），它把代码块也一起命中了，
+   * 于是本仓代码块实测 `MMMM`=44.9px / `iiii`=12.1px —— **完全不是等宽**，
+   * 缩进对不齐、看起来像正文而不像代码。
+   *
+   * 这里用 `!important` 顶掉那条规则：
+   * - 它是**旧的、针对行内 code** 的规则，不该管代码块
+   * - 但它的选择器 `.msg .content code` 优先级(0,2,1) 高于 `.chat-code-block__pre code`(0,2,1)
+   *   在层叠里打平后取决于加载顺序 —— 用 !important 一劳永逸，避免以后又被人改回去
+   * ⚠️ 只影响代码块内的 code，行内 code（单个反引号）仍走原规则，不受影响。 */
+  font-family: var(--font-mono) !important;
+  /* IDE 观感：等宽 + 稍松行高（1.6 更接近 JetBrains/IDEA 默认） */
+  line-height: 1.6;
+  /* 制表符按 4 空格展开（IDE 默认），避免混用 tab 时错位 */
+  tab-size: 4;
+  -moz-tab-size: 4;
+}
+
+/* ── Mermaid 图表块（照抄源站 chat-mermaid-block） ────────────────────────
+   结构：.chat-mermaid-block > __header(徽标+放大) + __canvas(pre 承载源码/渲染后是 svg)
+   两段式：先显示源码（data-mermaid="false"），mount 后异步渲染成 SVG。
+   ⚠️ 变量同样换成本仓 :root 可用的那套（源站的 --td-* 在 .kb-scope 里取不到）。 */
+
+.chat-mermaid-block {
+  margin: 0.75em 0;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-lg);
+  overflow: hidden;
+  background: var(--surface-1);
+  box-shadow: 0 1px 3px color-mix(in srgb, var(--ink) 5%, transparent);
+  width: fit-content;
+  min-width: 60%;
+  max-width: 100%;
+  box-sizing: border-box;
+}
+
+.chat-mermaid-block__header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-height: 36px;
+  padding: 6px 10px 6px 12px;
+  background: var(--surface-2);
+  border-bottom: 1px solid var(--hairline-strong);
+}
+
+.chat-mermaid-block__badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  text-transform: uppercase;
+  color: var(--ink-subtle);
+}
+
+.chat-mermaid-block__actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.chat-mermaid-block__expand {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  margin: 0;
+  padding: 0;
+  border: 1px solid transparent;
+  border-radius: var(--r-sm);
+  background: transparent;
+  color: var(--ink-subtle);
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease, border-color 0.15s ease;
+}
+
+.chat-mermaid-block__expand:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--ink) 6%, var(--surface-2));
+  border-color: var(--hairline-strong);
+  color: var(--ink);
+}
+
+.chat-mermaid-block__expand:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.chat-mermaid-block__canvas {
+  margin: 0;
+  padding: 20px 16px 18px;
+  border: 0;
+  border-radius: 0;
+  background: var(--surface-1);
+  overflow-x: auto;
+  text-align: center;
+  cursor: zoom-in;
+  /* 渲染前显示源码时保持可读 */
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.6;
+  white-space: pre;
+}
+
+/* 渲染后（内含 svg）去掉源码样式 */
+.chat-mermaid-block__canvas[data-mermaid="true"] {
+  font-family: inherit;
+  white-space: normal;
+}
+
+.chat-mermaid-block__canvas svg {
+  max-width: 100%;
+  height: auto;
+}
+
+/* mermaid 自己画的节点描边（源站同值） */
+.chat-mermaid-block__canvas .node rect,
+.chat-mermaid-block__canvas .node circle,
+.chat-mermaid-block__canvas .node ellipse,
+.chat-mermaid-block__canvas .node polygon,
+.chat-mermaid-block__canvas .node path {
+  stroke-width: 1.5px;
+}

@@ -74,55 +74,89 @@ export function KbGalleryPanel({ baseId, showToast }: Props) {
     return out.filter((i) => (i.title + i.sourceTitle).toLowerCase().includes(k))
   }, [docs, keyword])
 
+  /* 空态/加载态标记：源站 `.ig-scroll.is-empty`（kb-shared.css）才让 `.wk-empty-state` 撑满高度 */
+  const isEmpty = !loading && images.length === 0
+
   return (
-    <div className="kb-gallery">
-      <div className="kb-gallery-toolbar">
-        <div className="kb-gallery-summary">
-          <span className="kb-gallery-title">全部图片</span>
-          <span className="kb-gallery-count">共 {images.length} 张</span>
+    <div className="image-gallery">
+      <div className="ig-toolbar">
+        <div className="ig-toolbar__summary">
+          <span className="ig-toolbar__title">全部图片</span>
+          <span className="ig-toolbar__count">共 {images.length} 张</span>
         </div>
-        <div className="kb-gallery-trailing">
-          <input
-            className="kb-input kb-gallery-search"
-            placeholder="搜索图片…"
-            value={keyword}
-            onChange={(e) => setKeyword(e.target.value)}
-          />
-          <button type="button" className="kb-gallery-toolbtn" title="筛选" onClick={() => showToast('图片筛选：本仓暂未接入图片抽取', 'info')}>
+        <div className="ig-toolbar__trailing">
+          {/* 源站 `t-input class="ig-search"`（ImageGallery.vue:691）⇒ 三层手写结构 */}
+          <div className="t-input__wrap ig-search">
+            <div className="t-input t-input--prefix">
+              <span className="t-input__prefix t-input__prefix-icon" aria-hidden="true">⌕</span>
+              <input
+                className="t-input__inner"
+                placeholder="搜索图片…"
+                aria-label="搜索图片"
+                value={keyword}
+                onChange={(e) => setKeyword(e.target.value)}
+              />
+            </div>
+          </div>
+          <button type="button" className="ig-tool-btn" title="筛选" onClick={() => showToast('图片筛选：本仓暂未接入图片抽取', 'info')}>
             ⚗
           </button>
-          <button type="button" className="kb-gallery-toolbtn" title="视图" onClick={() => showToast('视图切换：当前只有网格视图', 'info')}>
+          <button type="button" className="ig-tool-btn" title="视图" onClick={() => showToast('视图切换：当前只有网格视图', 'info')}>
             ▦
           </button>
-          <button type="button" className="kb-gallery-toolbtn kb-gallery-sort" title="排序">
-            排序 · 创建时间
+          <button type="button" className="ig-tool-btn ig-sort-trigger" title="排序">
+            <span className="ig-sort-trigger__label">排序 · 创建时间</span>
           </button>
         </div>
       </div>
 
-      <div className="kb-gallery-scroll">
+      {/* ⚠️ `.ig-grid` 源站带 `grid-auto-rows:1px`，靠 JS 给每张卡片算 `grid-row-end` 做瀑布流；
+          本仓没有那段测量脚本 ⇒ 行内把 auto-rows 复位成 auto，否则卡片会互相叠压。 */}
+      <div className={`ig-scroll${isEmpty ? ' is-empty' : ''}`}>
         {loading ? (
-          <div className="kb-gallery-empty">
-            <div className="kb-gallery-empty-title">正在加载…</div>
+          <div className="ig-loading">
+            <div className="wk-empty-state">
+              <div className="wk-empty-state__title">正在加载…</div>
+            </div>
           </div>
         ) : images.length === 0 ? (
-          <div className="kb-gallery-empty">
-            <div className="kb-gallery-empty-icon">▧</div>
-            <div className="kb-gallery-empty-title">还没有可浏览的图片</div>
-            <div className="kb-gallery-empty-desc">文档中的图片在解析完成后会出现在这里</div>
-            <div className="kb-gallery-empty-actions">
-              <span className="kb-gallery-empty-note">
+          /* 源站空态 = components/EmptyState.vue 的 `.wk-empty-state` 四段 */
+          <div className="wk-empty-state">
+            <div className="wk-empty-state__icon">▧</div>
+            <div className="wk-empty-state__title">还没有可浏览的图片</div>
+            <div className="wk-empty-state__desc">文档中的图片在解析完成后会出现在这里</div>
+            <div className="wk-empty-state__actions">
+              <span style={{ fontSize: 12, color: 'var(--td-text-color-placeholder)', lineHeight: 1.6 }}>
                 当前版本未做「文档内嵌图片抽取」，因此这里恒为空（不是加载失败）。
               </span>
             </div>
           </div>
         ) : (
-          <div className="kb-gallery-grid">
+          <div className="ig-grid" style={{ gridAutoRows: 'auto' }}>
             {images.map((img) => (
-              <figure className="kb-gallery-card" key={img.id} title={img.title || img.sourceTitle}>
-                <img src={img.url} alt={img.title || img.sourceTitle} loading="lazy" />
-                <figcaption>{img.sourceTitle}</figcaption>
-              </figure>
+              /* 源站元素是 `<button class="ig-card">`（ImageGallery.vue:900-938）⇒ 同元素。
+                 ⚠️ 源站点击会 `openViewer(idx)`；本仓没有图片查看器 ⇒ ⛔ 不挂 onClick
+                 （保持与改造前一致：卡片不可点，不新增交互、也不造假提示）。 */
+              <button
+                type="button"
+                className="ig-card"
+                key={img.id}
+                title={img.title || img.sourceTitle}
+              >
+                {/* 源站 `:style="{ aspectRatio: imageRatios[img.id] || 4/3 }"`（ImageGallery.vue:908） */}
+                <div className="ig-card__thumb" style={{ aspectRatio: '4 / 3' }}>
+                  <img src={img.url} alt={img.title || img.sourceTitle} loading="lazy" draggable={false} />
+                </div>
+                <div className="ig-card__meta">
+                  <div className={`ig-card__caption${img.title ? '' : ' is-empty'}`}>
+                    {img.title || '未命名图片'}
+                  </div>
+                  <div className="ig-card__source" title={img.sourceTitle}>
+                    <span aria-hidden="true">▤</span>
+                    <span>{img.sourceTitle || '—'}</span>
+                  </div>
+                </div>
+              </button>
             ))}
           </div>
         )}

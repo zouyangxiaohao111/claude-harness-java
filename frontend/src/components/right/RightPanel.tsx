@@ -1,4 +1,4 @@
-import { memo, useEffect, useState } from 'react'
+import { memo, useEffect, useMemo, useState } from 'react'
 import { createPortal } from 'react-dom'
 import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
@@ -13,6 +13,7 @@ import type { Schedule, ScheduleKind, WorkflowRunDto } from '@/api/types'
 import { useSchedules } from '@/hooks/useSchedules'
 import { CollapsibleGroup, RUN_ROW_CAP, RunMoreButton, capRunRows } from './CollapsibleGroup'
 import { ArtifactCards } from './ArtifactCards'
+import { groupArtifactsByTurn } from '@/utils/artifactGrouping'
 import { AgentTranscriptView } from './AgentTranscriptView'
 import { cronToHuman } from '@/components/modals/SchedulesPanel'
 import { useSubagentStore, type SubagentIdentity } from '@/stores/subagentStore'
@@ -30,6 +31,45 @@ import type { Client } from '@stomp/stompjs'
  * 新增值通过 {@link RightPanelProps.setRightTab} 的窄类型出口收敛。
  */
 type PanelTab = RightTab | 'artifacts' | 'sources' | 'team' | 'run' | 'terminal'
+
+/** turnContext 缺省值 · 稳定引用（避免每次渲染造新 Map 击穿 memo）。 */
+const EMPTY_TURN_CONTEXT = new Map<string, { question: string; createdAt: string | null }>()
+
+/** 组头时间：今天 → 「今天 HH:mm」，今年 → 「M月D日」，更早 → 「YYYY-MM-DD」。 */
+function formatGroupTime(iso: string | null): string {
+  if (!iso) return ''
+  const t = Date.parse(iso)
+  if (Number.isNaN(t)) return ''
+  const d = new Date(t)
+  const now = new Date()
+  const hm = `${String(d.getHours()).padStart(2, '0')}:${String(d.getMinutes()).padStart(2, '0')}`
+  if (d.toDateString() === now.toDateString()) return `今天 ${hm}`
+  if (d.getFullYear() === now.getFullYear()) return `${d.getMonth() + 1}月${d.getDate()}日`
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`
+}
+
+/** 产物面板空态（照设计稿「空态」Tab：说清产物从哪来 + 收什么不收什么）。 */
+function ArtifactsEmpty() {
+  return (
+    <div className="art-empty">
+      <div className="ae-ico">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}
+          strokeLinecap="round" strokeLinejoin="round" width={24} height={24} aria-hidden="true">
+          <path d="M6 2.8h7.4L19 8.4v12.8H6z" />
+          <path d="M9 12.4h6M9 15.4h6M9 18.4h4" />
+        </svg>
+      </div>
+      <div className="ae-title">还没有产物</div>
+      <div className="ae-desc">
+        对话里产出的报告、文档、设计稿、导出文件<br />
+        会按<b>每一条提问</b>归类显示在这里。
+      </div>
+      <div className="ae-foot">
+        产物只会收「交付物目录」与本轮改动的文档；<br />源码文件一律不进来。
+      </div>
+    </div>
+  )
+}
 
 /**
  * 省略 `visibleTabs` 时渲染的 tab 集合（图标轨 / 编程助手 / Work 通用等常规场景）。
@@ -191,6 +231,15 @@ interface RightPanelProps {
   onEditArtifact?: (a: SessionArtifactDto) => void
   /** 产物卡「在浏览器中打开」→ 系统浏览器打开 raw 端点（仅 html 产物有该入口 · App 处理） */
   onOpenArtifactInBrowser?: (a: SessionArtifactDto) => void
+  /**
+   * [产物按对话分组 2026-11-10] 轮次键 → 用户提问原文 / 时间（App 从消息列表算出）。
+   *
+   * <p>WHY 由 App 传：本组件只有 {@code artifacts}，拿不到消息表；而「这一轮问了什么」
+   * 是分组卡头的唯一可读标识。省略 ⇒ 全部产物归到「历史产物」一组（不崩、不猜归属）。
+   */
+  turnContext?: Map<string, { question: string; createdAt: string | null }>
+  /** 当前正在执行的轮次键（用于给该组打「当前」高亮 · 省略 = 无高亮） */
+  currentTurnId?: string | null
   /** [Phase3] 文件树右键「引用到对话」→ 插入 @path 到输入框（App 处理 · 与 @ 补全同效） */
   onQuoteFile: (path: string) => void
   showToast: (msg: string, type?: 'success' | 'info') => void
@@ -550,6 +599,8 @@ export const RightPanel = memo(function RightPanel({
   onOpenArtifact,
   onEditArtifact,
   onOpenArtifactInBrowser,
+  turnContext,
+  currentTurnId,
   onQuoteFile,
   showToast,
   openSettingsAt,
@@ -982,26 +1033,51 @@ export const RightPanel = memo(function RightPanel({
     </>
   )
 
-  /** [产物口径 2026-10-28 用户纠正] 产物 ≠ 修改的文件：只放后端轮末异步抽取出的最终交付物。 */
-  const deliverables = artifacts?.deliverables ?? []
+  /** [产物口径 2026-10-28 用户纠正] 产物 ≠ 修改的文件：只放后端抽取出的最终交付物。 */  const deliverables = artifacts?.deliverables ?? []
+  /**
+   * [产物按对话分组 2026-11-10 用户裁定] 「不然没法看是哪个对话产出的」。
+   *
+   * <p>每个对话一张容器卡，卡头 = 该轮用户提问原文 + 时间 + 本轮产物数；组间时间倒序。
+   * 归属未知（历史行 / 孤儿键 / 系统注入轮次）统一进「历史产物」组，⛔ 不猜。
+   *
+   * <p>⛔ 产物卡本身**不改**：仍复用 {@link ArtifactCards}（图标/悬停/点击/编辑/浏览器打开
+   * 完全一致），这里只加分组容器与来源角标。
+   */
+  const artifactGroups = useMemo(
+    () => groupArtifactsByTurn(deliverables, turnContext ?? EMPTY_TURN_CONTEXT),
+    [deliverables, turnContext],
+  )
   const artifactsSection = (
     <>
       {deliverables.length === 0 ? (
-        <DrawerEmpty
-          icon="file"
-          title="任务结束后自动整理交付物"
-          desc="这里只放你最终要的结果文件（报告 / 文档 / 设计稿 / 导出物），不包含中间代码。"
-        />
+        <ArtifactsEmpty />
       ) : (
-        /* [2026-10-31 产物卡片改版] 3 列网格卡片（按类型图标）· 与正文下方同一套组件/同一套图标/
-           同一个点击处理函数（App.openArtifact） */
-        <ArtifactCards
-          items={deliverables}
-          onOpen={onOpenArtifact}
-          onEdit={onEditArtifact}
-          onOpenInBrowser={onOpenArtifactInBrowser}
-          compact
-        />
+        <>
+          {artifactGroups.map((g) => (
+            <div key={g.key} className={`gcard${g.key === currentTurnId ? ' cur' : ''}`}>
+              <div className="gc-head">
+                <div className="gc-top">
+                  <span className="gc-time">{formatGroupTime(g.createdAt)}</span>
+                  <span className="gc-n">{g.items.length} 个产物</span>
+                </div>
+                <div className="gc-q">
+                  {g.key === currentTurnId && <span className="cur-tag">当前</span>}
+                  {g.question ?? '历史产物'}
+                </div>
+              </div>
+              <div className="gc-body">
+                <ArtifactCards
+                  items={g.items}
+                  onOpen={onOpenArtifact}
+                  onEdit={onEditArtifact}
+                  onOpenInBrowser={onOpenArtifactInBrowser}
+                  compact
+                  showOrigin
+                />
+              </div>
+            </div>
+          ))}
+        </>
       )}
     </>
   )

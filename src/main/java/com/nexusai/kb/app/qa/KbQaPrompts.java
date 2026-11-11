@@ -1,5 +1,7 @@
 package com.nexusai.kb.app.qa;
 
+import com.nexusai.kb.app.prompt.KbPromptLoader;
+
 /**
  * 知识库问答的提示词（全中文）。
  *
@@ -26,28 +28,9 @@ public final class KbQaPrompts {
      * 系统提示词（有检索资料时）。
      *
      * <p>⚠️ 不要在运行时给这段加日期/用户名之类的变量 —— 那会让 prompt cache 每次都失效。
+     * <p>正文：{@code resources/kb/prompt/qa/qa.system-with-context.md}（外置，改内容改这里）。
      */
-    public static final String SYSTEM_WITH_CONTEXT = """
-        你是企业知识库的问答助手。用户的问题会附带从知识库中检索到的资料。
-
-        ## 回答规则
-
-        1. **只使用提供的资料回答**。资料里没有的内容，不要凭常识或推测补充。
-        2. **资料不足时明确说明**。例如「提供的资料中没有关于 XX 的内容」，
-           并指出还需要哪方面的资料。不要为了显得有帮助而编造。
-        3. **在用到资料的句子后面标注编号**，格式为 `[1]`、`[2]`。
-           编号必须来自资料中已有的编号，不要发明。
-           一句话综合了多段资料时，可并列多个编号，如 `[1][3]`。
-        4. **不要复述原文**。用自己的话概括，只保留与问题相关的部分。
-        5. **资料之间若互相矛盾**，指出矛盾并分别给出各自出处，不要擅自裁决。
-        6. 用中文回答。技术名词、代码、型号保持原样。
-        7. 只输出回答本身，不要写「根据提供的资料」这类开场白。
-
-        ## 格式
-
-        - 用 Markdown。步骤、并列项用有序/无序列表。
-        - 数值、单位、时间点必须原样保留，不要四舍五入或换算。
-        """;
+    public static final String SYSTEM_WITH_CONTEXT = KbPromptLoader.cached("qa/qa.system-with-context.md");
 
     /**
      * 系统提示词（未检索到资料时）。
@@ -55,22 +38,9 @@ public final class KbQaPrompts {
      * <p>⚠️ 这条不是「让模型硬答」的许可，而是「老实说没有」的指令。
      * 用它而不是直接返回固定文案，是因为用户问题常常需要澄清方向
      * （「没找到 XX，你是想问 YY 吗」），这比一句冷冰冰的「未找到」有用。
+     * <p>正文：{@code resources/kb/prompt/qa/qa.system-no-context.md}（外置，改内容改这里）。
      */
-    public static final String SYSTEM_NO_CONTEXT = """
-        你是企业知识库的问答助手。
-
-        ## 情况
-
-        本轮**没有从知识库检索到任何相关资料**。
-
-        ## 回答规则
-
-        1. 明确告诉用户：在知识库中没有找到与该问题相关的内容。
-        2. **不要凭常识或推测作答** —— 用户问的是知识库里的内容，
-           用通用知识回答会被误当成「知识库里是这么写的」。
-        3. 可以做的：请用户补充关键词、说明可能相关的文档名或知识库范围。
-        4. 用中文，简短（不超过 3 句）。只输出回答本身。
-        """;
+    public static final String SYSTEM_NO_CONTEXT = KbPromptLoader.cached("qa/qa.system-no-context.md");
 
     /**
      * 模型返回空回答时的兜底文案（阶段 11 对齐源侧

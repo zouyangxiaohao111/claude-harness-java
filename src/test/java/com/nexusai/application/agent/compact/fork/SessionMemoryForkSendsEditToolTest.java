@@ -71,13 +71,10 @@ class SessionMemoryForkSendsEditToolTest {
             requestMessages,
             List.of("static", "dynamic"),
             Map.of(), Map.of(),
-            null, tuc,
+            allowAll(), tuc,
             QuerySource.SESSION_MEMORY, null, null, false, false, null);
 
-        ProductionForkedQuery query = new ProductionForkedQuery(
-            () -> provider, () -> "test-model",
-            () -> new ProviderConfig("https://api.test", "sk-test"),
-            null, null);
+        QueryLoopForkedQuery query = forkQuery(provider);
 
         ForkedAgentResult result = query.run(params);
 
@@ -113,6 +110,34 @@ class SessionMemoryForkSendsEditToolTest {
     // ════════════════════════════════════════════════════════════════════
 
     /** fake provider：捕获 stream 的 tools(第5参) 与 history(第4参)，回无工具调用文本（对齐真实模型行为）。 */
+    /** 放行任意工具（主循环对后台 fork 来源强制要求注入 canUseTool · INV-6 fail-loud）。 */
+    private static com.nexusai.application.agent.permission.hook.HookPermissionResolver.CanUseTool allowAll() {
+        return (tool, input, cctx, toolUseId, forceDecision) ->
+            com.nexusai.application.agent.permission.ToolPermissionGate.DecisionResult.allow();
+    }
+
+    /** 主循环 queryLoop 的 fork seam（E-2 后唯一实现）。 */
+    private static QueryLoopForkedQuery forkQuery(LlmProvider provider) {
+        com.nexusai.infra.llm.LlmProviderFactory pf =
+            org.mockito.Mockito.mock(com.nexusai.infra.llm.LlmProviderFactory.class);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any(), org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        org.mockito.Mockito.when(pf.getProvider(
+            org.mockito.ArgumentMatchers.any())).thenReturn(provider);
+        com.nexusai.application.agent.loop.AgentLoopContextFactory factory =
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory();
+        try {
+            java.lang.reflect.Field f = com.nexusai.application.agent.loop.AgentLoopContextFactory.class
+                .getDeclaredField("llmProviderFactory");
+            f.setAccessible(true); f.set(factory, pf);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
+        return new QueryLoopForkedQuery(
+            full -> null, () -> "test-model",
+            () -> new ProviderConfig("https://api.test", "sk-test"), factory);
+    }
+
     private static LlmProvider fakeProvider(ArrayNode[] capturedTools, List<ChatMessageDto>[] capturedHistory) {
         return new LlmProvider() {
             @Override public String type() { return "test"; }

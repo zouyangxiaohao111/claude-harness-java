@@ -1,0 +1,21 @@
+/* 知识库设计稿对齐 · 样式汇总入口。只 @import 不写规则。 */
+@import './kb-scope.css';
+@import './kb-tdesign.css';
+@import './kb-01.css';
+@import './kb-02.css';
+@import './kb-03.css';
+@import './kb-04.css';
+@import './kb-05.css';
+@import './kb-06.css';
+@import './kb-07.css';
+@import './kb-08.css';
+@import './kb-09.css';
+@import './kb-10.css';
+@import './kb-11.css';
+@import './kb-12.css';
+@import './kb-13.css';
+@import './kb-14.css';
+@import './kb-shared.css';
+@import './kb-keyframes.css';
+@import './kb-orphan.css';
+@import './kb-atrule.css';

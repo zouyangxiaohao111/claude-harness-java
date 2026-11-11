@@ -12,6 +12,8 @@ export interface ProjectDto {
   agents: number | null
   lastIndexedAt: string | null
   bound: boolean
+  /** V280 · 注册时间（UTC ISO-8601）· 左栏项目分组序依据（注册先后）。后端未回填时为 null。 */
+  createdAt?: string | null
 }
 /** POST /projects 请求 · 后端 name/path 均必填（@NotBlank） */
 export interface ProjectCreateRequest { name: string; path: string }

@@ -1926,6 +1926,22 @@ public class SubagentExecutor {
                     + "可用 Agent types: " + availableList);
         }
 
+        // ── [KB 内置 Agent 对齐] quick-answer 模式不得当 ReAct 子代理执行 ──
+        // 源站 Semantic：agent_mode=quick-answer 由固定 RAG 流水线承载（本仓 KbQaPipeline），
+        // 不是 ReAct 工具循环。若把它当子代理跑，会出现两种错：
+        //   ① 它声明 0 工具，ReAct 会一直「无工具可用」地空转；
+        //   ② 它的人格是「依据参考材料作答」的 RAG 人格，没有检索工具就拿不到材料。
+        // ⇒ 在分派点显式拒绝，并告诉模型该走哪条路。
+        String kbAgentMode = agentDefinition.agentMode().orElse(null);
+        if (com.nexusai.kb.agent.KbBuiltInAgentDefs.MODE_QUICK_ANSWER.equals(kbAgentMode)) {
+            log.warn("[SubagentExecutor] 拒绝把 quick-answer agent 当作子代理执行 type={} "
+                + "（应走 KbQaPipeline 的 RAG 流水线）", effectiveType);
+            throw new IllegalStateException("Agent '" + effectiveType
+                + "' 是快速问答模式（quick-answer），不使用工具、不能作为子代理执行。"
+                + " 知识库问答请走问答链（POST /api/v1/knowledge-chat/{sessionId}）；"
+                + " 需要多步检索与工具调用请改用 builtin-smart-reasoning 等 smart-reasoning 模式的 agent。");
+        }
+
         // ── [external-agent 2026-11-04] 外部 CLI 运行时分支 ──
         //   WHY 在 Step 2 之前分叉：Step 2–19 全部服务于**进程内 LLM 循环**
         //   （工具白名单 / hooks / MCP / worktree / systemPrompt 装配），对外部进程毫无意义。

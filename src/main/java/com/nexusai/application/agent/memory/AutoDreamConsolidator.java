@@ -78,7 +78,7 @@ import java.util.stream.Stream;
  *
  * <p><b>注入 seam</b>：CC 调全局 query()；Java 经 {@link RunForkedAgent.ForkedQuery} 函数式
  * seam 注入（生产由 ToolRegistrationConfig.autoDreamConsolidator 注入
- * {@link com.nexusai.application.agent.compact.fork.ProductionForkedQuery}）。
+ * {@link com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery}）。
  *
  * <p><b>手动 /dream（OPD-CM5-E-06）</b>：CC 补回真源 {@code skills/bundled/dream.ts} 后，
  * recordConsolidation 非死代码（CC /dream skill 消费）；Java 侧 {@link #doDream} 手动整合
@@ -229,7 +229,7 @@ public class AutoDreamConsolidator {
     /** 扫描节流内存变量 · CC original: 闭包内存变量 lastSessionScanAt（autoDream.ts:123/143-151） */
     private volatile long lastSessionScanAt = 0L;
 
-    /** fork 查询 seam · 测试注入 RecordingQuery；生产接 ProductionForkedQuery */
+    /** fork 查询 seam · 测试注入 RecordingQuery；生产接 QueryLoopForkedQuery */
     private volatile RunForkedAgent.ForkedQuery forkedQuery;
 
     /**
@@ -1059,7 +1059,7 @@ public class AutoDreamConsolidator {
                     forkRawMaterial != null ? forkRawMaterial.systemContext() : null),
                 // [SM-fork 模型直传 2026-09-10] fork 上下文 = supplier 工具集 + 会话模型
                 //   （ForkRawMaterial 捕获点透传 · 同 SessionMemoryService/ExtractMemoriesAgent）：
-                //   仅传 supplied.toolUseContext() → effectiveModelName 恒 null → ProductionForkedQuery
+                //   仅传 supplied.toolUseContext() → effectiveModelName 恒 null → fork 直传分支
                 //   直传分支取不到模型 → provider 回落 MockLlmProvider（dream fork 永不产内容）。
                 ForkRawMaterial.forkToolUseContext(supplied.toolUseContext(), forkRawMaterial),
                 forkRawMaterial != null ? forkRawMaterial.forkContextMessages() : List.of(),
@@ -1171,7 +1171,7 @@ public class AutoDreamConsolidator {
      * `text.trim()`，toolCalls().size() ≡ CC toolUseCount。无代码改动（OPD-R2-AD-02 闭合）。
      *
      * <p><b>G-79 时序</b>：RunForkedAgent 已改流式 —— onMessage 经 ForkQueryParams 透传给
-     * query loop（ProductionForkedQuery 每产出一条 assistant/tool_result 消息即回调，
+     * query loop（QueryLoopForkedQuery 每产出一条 assistant/tool_result 消息即回调，
      * forkedAgent.ts:578），回调发生在 completeDreamTask 之前（run 返回后才 complete，
      * 对齐 CC 流式顺序）；post-hoc replay 已删除（IMP-18 先行者风险闭合）。
      */

@@ -41,7 +41,7 @@ import java.util.Map;
  *       数组）—— CC 同义（query.ts:1001-1008 传的是 query() 不可变 params，未经
  *       {@code appendSystemContext}）。{@code appendSystemContext} <b>非幂等</b>（每次调用追加
  *       末尾元素），故 append 只在<b>使用点</b>各做一次：fork 路径 =
- *       {@code ProductionForkedQuery} 发送边界；hook 查询 = {@code ApiQueryHookHelper}。
+ *       fork 发送边界；hook 查询 = {@code ApiQueryHookHelper}。
  *       消费方若需要「发送形态」的数组，须自行调
  *       {@link com.nexusai.application.agent.prompt.SystemPromptContextProvider#appendSystemContext}。</li>
  *   <li>{@code userContext} — CC original: userContext (postSamplingHooks.ts:14), 可空</li>

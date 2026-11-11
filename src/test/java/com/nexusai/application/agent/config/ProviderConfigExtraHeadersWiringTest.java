@@ -1,6 +1,6 @@
 package com.nexusai.application.agent.config;
 
-import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
+import com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery;
 import com.nexusai.application.agent.settings.storage.FileConfigStorage;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.domain.provider.ProviderService;
@@ -75,13 +75,14 @@ class ProviderConfigExtraHeadersWiringTest {
         FileConfigStorage fileStorage = Mockito.mock(FileConfigStorage.class);
         Mockito.when(fileStorage.readSettings(Mockito.anyList())).thenReturn(MODEL_FULL_NAME);
 
-        ProductionForkedQuery query = config.productionForkedQuery(
+        QueryLoopForkedQuery query = config.queryLoopForkedQuery(
             Mockito.mock(LlmProviderFactory.class),
-            new ToolRegistry(),
             modelMapperReturningModel(),
             providerMapperReturningProvider(),
             providerServiceReturningKey(),
-            fileStorage);
+            fileStorage,
+            /*usageLedgerRegistry*/ null,
+            new com.nexusai.application.agent.loop.AgentLoopContextFactory());
 
         ProviderConfig cfg = query.configSupplier().get();
 
@@ -110,7 +111,7 @@ class ProviderConfigExtraHeadersWiringTest {
 
     // ════════════════════════════════════════════════════════════════════
     // ② sessionForkModelRoute（ToolRegistrationConfig 第 1 处构造点 · private static）
-    //    —— 装进 ProductionForkedQuery.ForkModelRoute，被 QueryLoopForkedQuery 取用
+    //    —— 装进 QueryLoopForkedQuery.ForkModelRoute，被 QueryLoopForkedQuery 取用
     // ════════════════════════════════════════════════════════════════════
 
     @Test
@@ -125,12 +126,12 @@ class ProviderConfigExtraHeadersWiringTest {
             .thenReturn(Mockito.mock(LlmProvider.class));
 
         @SuppressWarnings("unchecked")
-        Function<String, ProductionForkedQuery.ForkModelRoute> routeFn =
-            (Function<String, ProductionForkedQuery.ForkModelRoute>) m.invoke(
+        Function<String, QueryLoopForkedQuery.ForkModelRoute> routeFn =
+            (Function<String, QueryLoopForkedQuery.ForkModelRoute>) m.invoke(
                 null, factory, modelMapperReturningModel(), providerMapperReturningProvider(),
                 providerServiceReturningKey());
 
-        ProductionForkedQuery.ForkModelRoute route = routeFn.apply(MODEL_FULL_NAME);
+        QueryLoopForkedQuery.ForkModelRoute route = routeFn.apply(MODEL_FULL_NAME);
         assertThat(route)
             .as("前置：路由必须解析成功（否则下面断言的是 null 的假象）")
             .isNotNull();

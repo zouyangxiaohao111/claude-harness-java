@@ -124,10 +124,17 @@ public class KbGraphExtractionService {
         if (modelName == null || modelName.isBlank()) {
             return KbGraphOutcome.skipped("未配置图谱抽取模型");
         }
-        ProviderConfig provider = resolveConfig(modelName);
+        ModelConfigResolver.ResolvedModel resolved = resolveModel(modelName);
+        ProviderConfig provider = resolved == null ? null : resolved.config();
         if (provider == null) {
             return KbGraphOutcome.skipped("提供方未配置");
         }
+        // ⚠️ 传给模型 API 的必须是 **models.name**，而调用方手里通常只有 **models.id**
+        //    （知识库的 *_model_id 列存 id）。用错会真的打到对方 API 上并 400：
+        //    实测 `The supported API model names are deepseek-flash, deepseek-v4-pro,
+        //    but you passed model-0823a98d`。
+        String apiModelName = resolved.apiModelName() != null && !resolved.apiModelName().isBlank()
+            ? resolved.apiModelName() : modelName;
 
         List<KbChunkRecord> chunks = graphChunksOf(knowledgeId);
         if (chunks.isEmpty()) {
@@ -147,7 +154,7 @@ public class KbGraphExtractionService {
             List<KbGraphParser.ExtractedEntity> got;
             try {
                 String raw = sideCallClient.chat(
-                    provider, modelName, KbGraphPrompts.EXTRACT_ENTITIES, clipped,
+                    provider, apiModelName, KbGraphPrompts.EXTRACT_ENTITIES, clipped,
                     options(MAX_TOKENS_ENTITIES, "graph_extract_entities"),
                     LlmSideCallClient.SideCallUsage.standalone(
                         UsageCategory.SIDE_CALL, "graph_extract_entities"));
@@ -175,7 +182,7 @@ public class KbGraphExtractionService {
         try {
             String entitiesJson = entitiesJsonOf(entities.values());
             String raw = sideCallClient.chat(
-                provider, modelName, KbGraphPrompts.EXTRACT_RELATIONSHIPS,
+                provider, apiModelName, KbGraphPrompts.EXTRACT_RELATIONSHIPS,
                 KbGraphPrompts.relationshipUserMessage(entitiesJson, merged),
                 options(MAX_TOKENS_RELATIONS, "graph_extract_relations"),
                 LlmSideCallClient.SideCallUsage.standalone(
@@ -399,13 +406,19 @@ public class KbGraphExtractionService {
         }
     }
 
-    private ProviderConfig resolveConfig(String modelName) {
+    /**
+     * 解析「模型 ID / 名」→ 配置 + 真实模型名。
+     *
+     * <p>⚠️ 必须整份返回 {@link ModelConfigResolver.ResolvedModel}：调用点要的是
+     * {@code apiModelName}（= {@code models.name}），而库里存的是 {@code models.id}。
+     * 只带 config 出去，调用点就只好把 ID 当名字发，实测被对方 400 拒绝。
+     */
+    private ModelConfigResolver.ResolvedModel resolveModel(String modelName) {
         if (modelConfigResolver == null) {
             return null;
         }
         try {
-            ModelConfigResolver.ResolvedModel r = modelConfigResolver.resolve(modelName);
-            return r == null ? null : r.config();
+            return modelConfigResolver.resolve(modelName);
         } catch (RuntimeException e) {
             log.warn("[图谱] provider 配置解析失败 model={} 原因={}", modelName, e.getMessage());
             return null;

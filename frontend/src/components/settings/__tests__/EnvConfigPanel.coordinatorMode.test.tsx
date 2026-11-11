@@ -66,7 +66,7 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
     return box as HTMLInputElement
   }
 
-  async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<void>) {
+  async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<boolean>) {
     await act(async () => {
       root.render(<EnvConfigPanel settings={settings} onOpenMemoryEditor={() => {}} onSaveSettings={onSave} />)
       await Promise.resolve()
@@ -74,22 +74,22 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
   }
 
   it('settings 未配置该字段 → 默认关闭（checkbox 未勾选）', async () => {
-    await render(baseSettings(), async () => {})
+    await render(baseSettings(), async () => true)
     expect(coordinatorModeCheckbox().checked).toBe(false)
   })
 
   it('settings.coordinatorModeEnabled=null → 默认关闭', async () => {
-    await render(baseSettings({ coordinatorModeEnabled: null }), async () => {})
+    await render(baseSettings({ coordinatorModeEnabled: null }), async () => true)
     expect(coordinatorModeCheckbox().checked).toBe(false)
   })
 
   it('settings.coordinatorModeEnabled=true → 回填为开', async () => {
-    await render(baseSettings({ coordinatorModeEnabled: true }), async () => {})
+    await render(baseSettings({ coordinatorModeEnabled: true }), async () => true)
     expect(coordinatorModeCheckbox().checked).toBe(true)
   })
 
   it('勾选 → 经 onSaveSettings 以 coordinatorModeEnabled 键写回 true', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => {})
+    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
     await render(baseSettings({ coordinatorModeEnabled: false }), onSave)
 
     const box = coordinatorModeCheckbox()
@@ -103,7 +103,7 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
   })
 
   it('取消勾选 → 写回 false', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => {})
+    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
     await render(baseSettings({ coordinatorModeEnabled: true }), onSave)
 
     await act(async () => {

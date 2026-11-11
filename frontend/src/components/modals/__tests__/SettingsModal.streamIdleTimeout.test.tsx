@@ -44,7 +44,7 @@ function noop(): void {}
 async function noopAsync(): Promise<void> {}
 
 /** App 传下来的 onSaveSettings（写 appSettings 的唯一正常路径）。 */
-let onSave: Mock<(req: UpdateSettingsRequest) => Promise<void>>
+let onSave: Mock<(req: UpdateSettingsRequest) => Promise<boolean>>
 /** 前端拦下非法值时的提示渠道。 */
 let toast: Mock<(msg: string, type?: 'success' | 'info') => void>
 
@@ -97,7 +97,7 @@ describe('SettingsModal · 流空闲超时（通用 tab · V78）', () => {
     document.body.appendChild(container)
     root = createRoot(container)
     settingsUpdate.mockClear()
-    onSave = vi.fn(async () => {})
+    onSave = vi.fn(async () => true)
     toast = vi.fn()
   })
 

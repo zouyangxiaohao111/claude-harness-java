@@ -3,7 +3,7 @@ package com.nexusai.application.agent.compact;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.compact.fork.CacheSafeParams;
 import com.nexusai.application.agent.compact.fork.ForkedAgentResult;
-import com.nexusai.application.agent.compact.fork.ProductionForkedQuery;
+import com.nexusai.application.agent.compact.fork.QueryLoopForkedQuery;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.prompt.CacheScope;
 import com.nexusai.application.agent.prompt.SystemPromptAssembler;
@@ -38,15 +38,15 @@ import static org.assertj.core.api.Assertions.assertThat;
  *
  * <p><b>WHY 本测试存在（意图）</b>: 用户上下文（claudeMd?/currentDate）是 Anthropic prompt
  * cache 前缀的一部分 —— fork 不前置则消息前缀与主线程不一致、fork 缓存共享永不命中；
- * 但前置<b>两次</b>（StreamCompactSummary 外层 + ProductionForkedQuery 内层）会得到
+ * 但前置<b>两次</b>（StreamCompactSummary 外层 + fork 发送边界）会得到
  * {@code [meta, meta, ...]}，与主线程 {@code [meta, ...]} 从 message[1] 起错位，同样
  * 使 prompt cache 永不命中，且 `AgentLoopContext.prependUserContext` 无去重、每次
  * {@code UUID.randomUUID()}（不幂等）。本测试钉扎「<b>恰好前置一次</b>」。
  *
  * <p><b>[userctx-single-prepend] 断言面 = 真实发给 provider 的 messages</b>: 旧版本经
  * {@link ForkConvergenceCcContractTest.RecordingQuery} 假替身断言（该替身只记录
- * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> ProductionForkedQuery 的发送边界
- * 前置）→ 双前置 bug 恒绿。现改为注入真实 {@code ProductionForkedQuery} + 捕获 provider 入参的
+ * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> fork 发送边界 的发送边界
+ * 前置）→ 双前置 bug 恒绿。现改为注入真实 fork 发送边界 + 捕获 provider 入参的
  * {@link ForkConvergenceCcContractTest.CapturingProvider}。
  *
  * <p><b>断言 WHY</b>:
@@ -85,8 +85,8 @@ class StreamCompactSummaryForkUserContextTest {
             List.of(userMessage("u1", "ctx")), SUMMARY_REQUEST, 0,
             "model", fakeProvider(), ProviderConfig.empty(), ctxOf(cs, abort));
 
-        // ⚠️ 断言面 = 真实 ProductionForkedQuery 实际发给 provider 的 messages（旧断言读
-        //   RunForkedAgent 交给 seam 的中间产物 → 假替身从不执行 ProductionForkedQuery:233-235
+        // ⚠️ 断言面 = 真实 fork 发送边界实际发给 provider 的 messages（旧断言读
+        //   RunForkedAgent 交给 seam 的中间产物 → 假替身从不执行 fork 发送边界
         //   的发送边界前置 → 「外层 + 内层双前置」bug 在该替身下恒绿 → 已被本改造取代）。
         List<ChatMessageDto> fork = provider.lastHistory();
         assertThat(fork).as("fake provider 必须真实收到 fork 请求（否则本测试空转）").isNotNull();
@@ -294,11 +294,11 @@ class StreamCompactSummaryForkUserContextTest {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 13 参构造 + <b>真实生产 fork loop</b>（{@link ProductionForkedQuery}）·
+     * 13 参构造 + <b>真实生产 fork loop</b>（fork 发送边界）·
      * 消息拼接断言面（「最终发给 provider 的 messages」）。
      *
      * <p><b>为什么不用 {@link ForkConvergenceCcContractTest.RecordingQuery}</b>: 假替身只记录
-     * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> {@code ProductionForkedQuery:233-235}
+     * RunForkedAgent 交给 seam 的中间产物，<b>从不执行</b> fork 发送边界
      * 的发送边界 {@code prependUserContext} —— 「外层 + 内层双前置」bug 在替身下恒绿。
      */
     private static StreamCompactSummary scsWithRealForkLoop(
@@ -306,8 +306,7 @@ class StreamCompactSummaryForkUserContextTest {
             ForkConvergenceCcContractTest.CapturingProvider provider) {
         StreamCompactSummary scs = new StreamCompactSummary(
             () -> fakeProvider(), () -> "model", ProviderConfig::empty, null, null, false, true, false, null, null, null);
-        scs.setForkedQuery(new ProductionForkedQuery(
-            () -> provider, () -> "model", ProviderConfig::empty, new ToolRegistry()));
+        scs.setForkedQuery(ForkConvergenceCcContractTest.realForkLoop(provider));
         return scs;
     }
 

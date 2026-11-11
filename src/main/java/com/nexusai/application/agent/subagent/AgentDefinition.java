@@ -60,7 +60,43 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
      * @return 主线程模型名（{@code provider/name}）
      */
     default Optional<String> mainModel() { return Optional.empty(); }
-    
+
+    /**
+     * 执行引擎选择器 · **本仓扩展，CC 无此字段**（源站 WeKnora {@code CustomAgentConfig.AgentMode}）。
+     *
+     * <p>取值：{@code "quick-answer"}（固定 RAG 流水线，不调工具）/
+     * {@code "smart-reasoning"}（ReAct，调工具）。
+     *
+     * <p>WHY 单独立字段而不复用 {@link #agentType()}：本仓 {@code agentType} 是
+     * <b>注册表主键</b>（{@code AgentDefinitionRegistry:117/169} 用它做 Map key，
+     * {@code SubagentTool:2254} 按它查 Agent），塞源站的 {@code rag-qa} 会破坏查找。
+     * 源站这一层是 {@code DeriveKBFilterForAgent(agentMode, allowedTools)}
+     * （{@code internal/agent/tools/capabilities.go:202}）真正读的入参。
+     *
+     * @return 执行模式；缺省 {@code empty} = 未声明（走本仓现有行为）
+     */
+    default Optional<String> agentMode() { return Optional.empty(); }
+
+    /**
+     * 预设类别 · **本仓扩展，CC 无此字段**（源站 WeKnora {@code CustomAgentConfig.AgentType}）。
+     *
+     * <p>取值：{@code "rag-qa"} / {@code "wiki-qa"} / {@code "hybrid-rag-wiki"} /
+     * {@code "data-analysis"} / {@code "custom"}。
+     *
+     * <p>⚠️ <b>只存不消费</b>（用户 2026-11-10 选 A 方案）。实证：源站四个
+     * {@code AgentType*} 常量在 Go 代码里<b>零引用</b>，运行时 KB 过滤只读
+     * {@code agentMode} + {@code allowedTools}（{@code capabilities.go:202}）；
+     * 该字段的真实用途是<b>编辑器表单预填种子</b>（{@code config/agent_type_presets.yaml}
+     * 头部注释：「the preset only seeds the form」）。本仓不对齐
+     * {@code /platform/agents} 页面，故暂无可消费点，仅保留配置值以备后续。
+     *
+     * <p>命名为 {@code kbAgentType} 而非 {@code agentType}，避免与
+     * {@link #agentType()}（CC 语义的身份标识）混淆。
+     *
+     * @return 预设类别；缺省 {@code empty} = 未声明
+     */
+    default Optional<String> kbAgentType() { return Optional.empty(); }
+
     /**
      * 获取系统提示 · 对齐 CC getSystemPrompt()
      * 内置 Agent 使用动态 prompt（依赖 modelId + additionalWorkingDirectories），
@@ -114,9 +150,23 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
          * CC builtInAgents.ts 当前 0 个内置 agent 提供 callback, 故 Java 端保持空实现
          * (Optional.empty(), 对齐 CC undefined), 仅对齐类型语义。
          */
-        Optional<Runnable> callback
+        Optional<Runnable> callback,
+        /**
+         * 执行引擎选择器 · 本仓扩展（源站 WeKnora {@code agent_mode}）·
+         * {@code "quick-answer"} | {@code "smart-reasoning"}。
+         *
+         * <p>见 {@link AgentDefinition#agentMode()} 的 WHY。缺省 {@code Optional.empty()}。
+         */
+        Optional<String> agentMode,
+        /**
+         * 预设类别 · 本仓扩展（源站 WeKnora {@code agent_type}）·
+         * {@code rag-qa} / {@code wiki-qa} / {@code hybrid-rag-wiki} / {@code data-analysis} / {@code custom}。
+         *
+         * <p><b>只存不消费</b>，见 {@link AgentDefinition#kbAgentType()}。缺省 {@code Optional.empty()}。
+         */
+        Optional<String> kbAgentType
     ) implements AgentDefinition {
-        
+
         @Override
         public String source() { return "built-in"; }
         
@@ -125,7 +175,17 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
         
         @Override
         public Optional<String> filename() { return Optional.empty(); }
-        
+
+        /**
+         * record 组件直接暴露，故无需实现 —— 但显式覆写让「本仓扩展字段」与 CC 字段在
+         * IDE 跳转时一眼可分（record accessor 与接口 default 同名，Java 自动用 record 的）。
+         */
+        @Override
+        public Optional<String> agentMode() { return agentMode == null ? Optional.empty() : agentMode; }
+
+        @Override
+        public Optional<String> kbAgentType() { return kbAgentType == null ? Optional.empty() : kbAgentType; }
+
         @Override
         public String getSystemPrompt(String modelId, List<String> additionalWorkingDirectories) {
             return systemPromptFn != null ? systemPromptFn.apply(modelId, additionalWorkingDirectories) : "";
@@ -192,6 +252,8 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
             private Optional<String> pendingSnapshotUpdate = Optional.empty();
             private Optional<Boolean> omitClaudeMd = Optional.empty();
             private Optional<Runnable> callback = Optional.empty();
+            private Optional<String> agentMode = Optional.empty();
+            private Optional<String> kbAgentType = Optional.empty();
 
             private Builder(String agentType, String whenToUse,
                              BiFunction<String, List<String>, String> systemPromptFn) {
@@ -239,13 +301,19 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
             /** CC original: callback?: () => void (loadAgentsDir.ts:139) · 内置 Agent query 循环结束后回调 (runAgent.ts:812-814); CC 0 内置 agent 使用, 保持空实现. */
             public Builder callback(Runnable v) { this.callback = Optional.ofNullable(v); return this; }
 
+            /** 执行引擎 · 本仓扩展（源站 agent_mode）· {@code "quick-answer"} | {@code "smart-reasoning"}。 */
+            public Builder agentMode(String v) { this.agentMode = Optional.ofNullable(v); return this; }
+            /** 预设类别 · 本仓扩展（源站 agent_type）· <b>只存不消费</b>。 */
+            public Builder kbAgentType(String v) { this.kbAgentType = Optional.ofNullable(v); return this; }
+
             public BuiltInAgentDefinition build() {
                 return new BuiltInAgentDefinition(
                     agentType, whenToUse, tools, disallowedTools, skills,
                     mcpServers, hooks, color, model, effort,
                     permissionMode, maxTurns, criticalSystemReminder,
                     requiredMcpServers, background, initialPrompt, memory,
-                    isolation, pendingSnapshotUpdate, omitClaudeMd, systemPromptFn, callback
+                    isolation, pendingSnapshotUpdate, omitClaudeMd, systemPromptFn, callback,
+                    agentMode, kbAgentType
                 );
             }
         }

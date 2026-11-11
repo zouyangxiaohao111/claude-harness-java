@@ -113,7 +113,8 @@ class KnowledgeIngestTest {
             // W6：后处理 fan-out（本测试的知识库未配模型/开关 ⇒ 不派发子任务）
             new KbPostProcessStage(chunkMapper, stateRepository, queue));
         worker = new KbIngestWorker(queue, parseProcessor, noopSummary(), noopQuestions(),
-            noopAutoTag(), noopWiki(), noopGraph(), stateRepository);
+            noopAutoTag(), noopWiki(), noopGraph(), noopImageEnrich(), indexWriter,
+            knowledgeMapper, knowledgeBaseMapper, stateRepository);
     }
 
     @BeforeEach
@@ -296,6 +297,10 @@ class KnowledgeIngestTest {
         assertThat(readTaskState(taskId)).isEqualTo(KbIngestTaskRecord.STATE_QUEUED);
 
         worker.drainBatch(1);
+        // ⭐ 解析完成后会 fan-out 摘要任务（源码语义：只判「有文本块」，不看模型，
+        //    模型缺失在执行期才标 failed）。drainBatch(1) 只跑一条 ⇒ 再跑一轮把摘要消费掉，
+        //    否则 pending_subtasks 差 1、文档卡在 finalizing（实测过）。
+        worker.drainBatch(4);
 
         Row row = readKnowledge(knowledgeId);
         assertThat(row.parseStatus).as("⭐ 解析成功后必须 completed").isEqualTo("completed");
@@ -392,11 +397,15 @@ class KnowledgeIngestTest {
                 chunkMapper),
             new KbPostProcessStage(chunkMapper, stateRepository, queue));
         KbIngestWorker realWorker = new KbIngestWorker(queue, processor, noopSummary(),
-            noopQuestions(), noopAutoTag(), noopWiki(), noopGraph(), stateRepository);
+            noopQuestions(), noopAutoTag(), noopWiki(), noopGraph(), noopImageEnrich(),
+            // 这两个用例不测图片理解重索引 ⇒ indexWriter 传 null（reindexQuietly 会短路）
+            null, knowledgeMapper, knowledgeBaseMapper, stateRepository);
 
         new KnowledgeIngestService(knowledgeMapper, stateRepository, queue)
             .submitParse(knowledgeId);
         realWorker.drainBatch(1);
+        // 同上：解析后 fan-out 的摘要在第二轮消费（本测试知识库未配模型 ⇒ 执行期标 failed 并释放槽位）
+        realWorker.drainBatch(4);
 
         Row row = readKnowledge(knowledgeId);
         assertThat(row.parseStatus).as("真实 docx 必须解析成功").isEqualTo("completed");
@@ -407,6 +416,62 @@ class KnowledgeIngestTest {
         assertThat(chunks.get(0).content)
             .as("解析结果必须真的含 docx 里的中文正文（证明不是空解析）")
             .contains("知识库入库端到端验证");
+    }
+
+    // ── 用例 5b：source_locators 真的落库 ──────────────────────────────
+
+    /**
+     * <b>WHY 必须有这一条</b>：{@code kb_chunk.source_locators} 在本批之前<b>全库恒为 NULL</b>，
+     * 而「列存在 + 实体有 getter + 前端有类型」让缺陷看起来像「只是前端没渲染」。
+     * 判据只能是<b>入完库回表读这一列</b>：算法单测全绿也不能证明它被写进去了。
+     *
+     * <p>同时断言两件事：①列非 NULL 且是合法 JSON 数组；②内容里真的带 docx 定位（{@code "type":"docx"}）。
+     * 只断言①会被「写了个空对象」骗过。
+     */
+    @Test
+    @DisplayName("⭐ 端到端：kb_chunk.source_locators 非 NULL 且内容是真的 docx 定位")
+    void endToEndWritesSourceLocators() throws Exception {
+        Path docx = writeRealDocx();
+        String baseId = insertKnowledgeBase();
+        String knowledgeId = insertKnowledgeWithBase("unprocessed", 0, docx, baseId);
+
+        KbParserRegistry registry = new KbParserRegistry(
+            List.of(new KbOfficeParser(), new KbTextParser()));
+        KnowledgeParseProcessor processor = new KnowledgeParseProcessor(
+            knowledgeMapper, knowledgeBaseMapper, registry, stateRepository,
+            new KbChunkWriter(chunkMapper),
+            new KbIndexWriter(
+                MybatisFlexBootstrap.getInstance().getMapper(KbEmbeddingMapper.class),
+                chunkMapper, new NoopEmbeddingPort(), sqlite()),
+            null,
+            sqliteEngineRegistry(
+                new KbIndexWriter(
+                    MybatisFlexBootstrap.getInstance().getMapper(KbEmbeddingMapper.class),
+                    chunkMapper, new NoopEmbeddingPort(), sqlite()),
+                chunkMapper),
+            new KbPostProcessStage(chunkMapper, stateRepository, queue),
+            // ⭐ 溯源随分块一次落库（KbChunk.sourceLocators → KbChunkWriter），
+            //    故这里不再需要给编排器传 chunkMapper
+            null);
+        KbIngestWorker realWorker = new KbIngestWorker(queue, processor, noopSummary(),
+            noopQuestions(), noopAutoTag(), noopWiki(), noopGraph(), noopImageEnrich(),
+            // 这两个用例不测图片理解重索引 ⇒ indexWriter 传 null（reindexQuietly 会短路）
+            null, knowledgeMapper, knowledgeBaseMapper, stateRepository);
+
+        new KnowledgeIngestService(knowledgeMapper, stateRepository, queue).submitParse(knowledgeId);
+        realWorker.drainBatch(1);
+        // 解析后 fan-out 的摘要任务在第二轮消费（同上，模型未配 ⇒ 执行期标 failed 并释放槽位）
+        realWorker.drainBatch(4);
+
+        assertThat(readKnowledge(knowledgeId).parseStatus).isEqualTo("completed");
+
+        List<String> locators = readSourceLocators(knowledgeId);
+        assertThat(locators)
+            .as("⭐ source_locators 不能全是 NULL（这正是本批修复的缺陷）")
+            .isNotEmpty();
+        assertThat(locators.get(0))
+            .as("必须是 docx 定位，而不是随便写了个 JSON")
+            .contains("\"type\":\"docx\"");
     }
 
     // ── 用例 6：取消 ────────────────────────────────────────────────
@@ -629,6 +694,28 @@ class KnowledgeIngestTest {
         return out;
     }
 
+    /**
+     * 读 {@code kb_chunk.source_locators}（跳过 NULL 行）。
+     *
+     * <p>⚠️ 必须用 {@code getString} 而不是「先判空再取」：{@code wasNull} 的判定顺序在这里
+     * 直接影响「NULL 行是否被算成一条空串」—— 算进去会让断言 {@code isNotEmpty()} 假绿。
+     */
+    private static List<String> readSourceLocators(String knowledgeId) throws Exception {
+        List<String> out = new ArrayList<>();
+        try (Connection c = sqlite().getConnection(); Statement s = c.createStatement();
+             ResultSet rs = s.executeQuery(
+                 "SELECT source_locators FROM kb_chunk WHERE knowledge_id = '"
+                     + knowledgeId + "' AND deleted = 0 ORDER BY chunk_index")) {
+            while (rs.next()) {
+                String v = rs.getString(1);
+                if (v != null && !v.isBlank()) {
+                    out.add(v);
+                }
+            }
+        }
+        return out;
+    }
+
     /** 本测试不配嵌入模型 ⇒ 该端口不会被调用（配了也只是兜底）。 */
     private static final class NoopEmbeddingPort
         implements com.nexusai.kb.app.retrieval.KbEmbeddingPort {
@@ -689,6 +776,15 @@ class KnowledgeIngestTest {
             public com.nexusai.kb.app.graph.KbGraphOutcome extract(
                 String knowledgeId, int attempt, String modelName) {
                 return com.nexusai.kb.app.graph.KbGraphOutcome.skipped("test-stub");
+            }
+        };
+    }
+
+    private static com.nexusai.kb.app.image.KbImageEnrichService noopImageEnrich() {
+        return new com.nexusai.kb.app.image.KbImageEnrichService(chunkMapper, null, null) {
+            @Override
+            public int enrichKnowledge(String knowledgeId) {
+                return 0;
             }
         };
     }

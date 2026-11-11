@@ -828,7 +828,30 @@ public class BuiltInAgents {
         if (verificationEnabled) {
             agents.add(VERIFICATION_AGENT);
         }
+        // ── 知识库场景 6 个内置 Agent（源站 WeKnora builtin_agents.yaml 对齐）──────────
+        // 单独一段，对齐「CC 对齐 vs 源站对齐」两条线的分离。
+        // ⚠️ coordinator 分支已在上方 early return ⇒ 该模式下不含 kb agent（与 CC 整表替换语义一致）。
+        agents.addAll(com.nexusai.kb.agent.KbBuiltInAgentDefs.all());
+        if (log.isDebugEnabled()) {
+            log.debug("[BuiltInAgents] getBuiltInAgents 返回 {} 个（含 kb 6 个）",
+                agents.size());
+        }
         return agents;
+    }
+
+    /**
+     * 读取某个内置 Agent 的执行模式（{@code quick-answer} / {@code smart-reasoning}）。
+     *
+     * <p>⭐ 这是 {@link AgentDefinition#agentMode()} 的<b>唯一读侧出口</b> ——
+     * 没有它，该字段就是「设计了但从未接线」（本仓第 27 类静默缺陷）。
+     * 调用方据此决定走 RAG 固定流水线还是 ReAct 工具循环。
+     *
+     * @param agentType agent id
+     * @return 执行模式；agent 不存在或未声明时返回 {@code Optional.empty()}
+     */
+    public static java.util.Optional<String> agentModeOf(String agentType) {
+        AgentDefinition def = get(agentType);
+        return def == null ? java.util.Optional.empty() : def.agentMode();
     }
 
     /**

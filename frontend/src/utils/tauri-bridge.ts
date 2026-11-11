@@ -28,6 +28,39 @@ export async function minimizeWindow(): Promise<void> {
 }
 
 /**
+ * 把主窗口拉回前台（显示 + 取消最小化 + 置前聚焦）。
+ *
+ * <h2>WHY 走 Rust command 而不是前端窗口 API</h2>
+ * 前端的 {@code getCurrentWindow().show()/unminimize()/setFocus()} 在**本窗口**上生效，
+ * 但系统通知的点击回调发生在**通知本体**上、此时窗口可能已最小化或被别的窗口盖住 ⇒
+ * 前端窗口 API 在这种情况下不保证能把窗口「唤到最前」。
+ * <p>Rust 侧已有 {@code show_main_window}（托盘唤回用的就是它），但它**不是 command**、
+ * 前端调不到 ⇒ 这里在 Rust 暴露 {@code show_main_window_command}，前端 invoke 它。
+ * <p>非 Tauri（浏览器 dev）⇒ 尽力 {@code window.focus()}（浏览器无跨平台聚焦能力，
+ * 只能对当前标签页生效），失败静默。
+ */
+export async function showMainWindow(): Promise<void> {
+  if (!(await isTauriEnv())) {
+    // 浏览器兜底：只能聚焦当前标签页（浏览器无「把标签页拉到最前」的能力）
+    try { window.focus() } catch { /* 浏览器可能拒绝 */ }
+    return
+  }
+  try {
+    const { invoke } = await import('@tauri-apps/api/core')
+    await invoke('show_main_window_command')
+  } catch {
+    // Rust command 不可用（旧壳未重编）⇒ 静默；退一步用前端窗口 API 试试
+    try {
+      const { getCurrentWindow } = await import('@tauri-apps/api/window')
+      const win = getCurrentWindow()
+      await win.show()
+      await win.unminimize()
+      await win.setFocus()
+    } catch { /* 静默 */ }
+  }
+}
+
+/**
  * 交通灯绿色按钮：切换 **macOS 原生全屏**（进入独立 Space）。
  *
  * <p><b>WHY 从 toggleMaximize 改成 setFullscreen</b>（2026-11-02 用户实测

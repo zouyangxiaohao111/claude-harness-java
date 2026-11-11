@@ -28,6 +28,89 @@
 export interface SystemNotifyPayload {
   title: string
   body?: string
+  /**
+   * Web 通道的**通知分组标识**：同一 tag 的通知会**互相替换**（浏览器规范）。
+   *
+   * <p>⚠️ 缺省值 `nexusai-turn-done` 是「本轮完成/出错」专用分组 —— 拿它发别的通知
+   * 会把轮次通知**顶掉**（用户看到的是新通知、旧通知消失，看起来像「通知丢了一条」）。
+   * 故不同语义的通知**必须各给一个独立 tag**。
+   *
+   * <p>（Tauri 通道忽略本字段：Windows 操作中心 / macOS 通知中心按通知自身分组，
+   * 不做同 tag 替换。）
+   */
+  tag?: string
+  /**
+   * 随通知携带的**结构化载荷**（点击通知时回读）。
+   *
+   * <p>用途：用户点通知时要知道「该切到哪个会话」⇒ 载荷里放 {@code sessionId}。
+   * Tauri 通道回读 {@code ActiveNotification.extra}；Web 通道**不支持**（浏览器规范
+   * 无此能力）⇒ Web 通道点击只能聚焦窗口，不切会话。
+   */
+  extra?: Record<string, unknown>
+}
+
+/** 「本轮完成/出错」通知的默认分组（同一会话连续结束不堆一屏）。 */
+const DEFAULT_TAG = 'nexusai-turn-done'
+
+/**
+ * 桌面端通知的 action type id。
+ *
+ * <p>Tauri v2 通知插件：桌面平台上 {@code registerActionTypes} 注册的 action 会变成
+ * 通知上的**按钮**；而点击通知本体（{@code actionId === 'tap'}）会走
+ * {@code onAction} 事件。注册 action type 是让「点击通知 ⇒ 前端收到事件」生效的前提
+ * （未注册时部分平台不派发点击事件）。
+ */
+const DESKTOP_ACTION_TYPE_ID = 'nexusai-notify'
+
+/** 已注册的 action type（防重复注册；重复注册会抛）。 */
+let actionTypeRegistered = false
+
+/**
+ * 注册桌面端通知 action type（幂等）。
+ *
+ * <p>⛔ 失败一律静默：注册失败只是「点通知没反应」，不能影响发通知本身。
+ */
+async function ensureActionTypeRegistered(): Promise<void> {
+  if (actionTypeRegistered) return
+  try {
+    const plugin = await import('@tauri-apps/plugin-notification')
+    await plugin.registerActionTypes([{
+      id: DESKTOP_ACTION_TYPE_ID,
+      actions: [{ id: 'open', title: '打开' }],
+    }])
+    actionTypeRegistered = true
+  } catch (e) {
+    // 插件缺失 / 已注册 / 平台不支持 —— 静默
+  }
+}
+
+/**
+ * 订阅「用户点击了系统通知」。
+ *
+ * <p>回调参数 = 通知载荷里的 {@code extra}（本仓用于取 {@code sessionId}）。
+ * 纯浏览器模式（无 Tauri）**不订阅** —— Web Notification 的点击只能聚焦窗口，
+ * 且拿不到自定义载荷 ⇒ 调用方需自行处理「无 sessionId」的情况。
+ *
+ * @returns 取消订阅函数（调用方在卸载时调用）；非 Tauri 环境返回一个空操作函数
+ */
+export async function onSystemNotificationClick(
+  cb: (extra: Record<string, unknown>) => void,
+): Promise<() => void> {
+  try {
+    const { isTauri } = await import('@tauri-apps/api/core')
+    if (!isTauri()) return () => {}
+    await ensureActionTypeRegistered()
+    const plugin = await import('@tauri-apps/plugin-notification')
+    const unlisten = await plugin.onAction((event) => {
+      // actionId 'tap' = 点击通知本体；其它 = 点了 action 按钮（本仓只有一个 'open'，等价）
+      const extra = event?.notification?.extra
+      if (extra && typeof extra === 'object') cb(extra as Record<string, unknown>)
+    })
+    return () => { try { unlisten.unregister() } catch { /* 已注销 */ } }
+  } catch {
+    // 插件缺失 / 非 Tauri —— 静默（调用方拿到的空操作函数）
+    return () => {}
+  }
 }
 
 /**
@@ -39,11 +122,12 @@ export async function sendSystemNotification(payload: SystemNotifyPayload): Prom
   // 空标题没有任何意义（某些平台会直接拒绝）
   const title = payload.title?.trim()
   if (!title) return false
+  const tag = payload.tag?.trim() || DEFAULT_TAG
 
   try {
     const { isTauri } = await import('@tauri-apps/api/core')
-    if (isTauri()) return await sendViaTauri(title, payload.body)
-    return await sendViaWeb(title, payload.body)
+    if (isTauri()) return await sendViaTauri(title, payload.body, payload.extra)
+    return await sendViaWeb(title, payload.body, tag)
   } catch {
     // 插件缺失 / 非 Tauri 构建 / 浏览器不支持 —— 一律静默
     return false
@@ -51,7 +135,11 @@ export async function sendSystemNotification(payload: SystemNotifyPayload): Prom
 }
 
 /** Tauri 通道：`@tauri-apps/plugin-notification`。 */
-async function sendViaTauri(title: string, body?: string): Promise<boolean> {
+async function sendViaTauri(
+  title: string,
+  body?: string,
+  extra?: Record<string, unknown>,
+): Promise<boolean> {
   const plugin = await import('@tauri-apps/plugin-notification')
   let granted = await plugin.isPermissionGranted()
   if (!granted) {
@@ -59,7 +147,16 @@ async function sendViaTauri(title: string, body?: string): Promise<boolean> {
     granted = (await plugin.requestPermission()) === 'granted'
   }
   if (!granted) return false
-  plugin.sendNotification({ title, body })
+  // ⛔ actionTypeId 必须带上：未注册 action type 时，部分平台**不派发点击事件**
+  //   ⇒ 用户点通知什么也不会发生（表现为「通知能弹、点了没反应」）。
+  await ensureActionTypeRegistered()
+  plugin.sendNotification({
+    title,
+    body,
+    actionTypeId: DESKTOP_ACTION_TYPE_ID,
+    // 载荷：点击通知时由 onAction 回读（取 sessionId）
+    ...(extra ? { extra } : {}),
+  })
   return true
 }
 
@@ -93,7 +190,7 @@ export async function ensureNotificationPermissionOnGesture(): Promise<void> {
 }
 
 /** Web 通道：浏览器 Notification API。 */
-async function sendViaWeb(title: string, body?: string): Promise<boolean> {
+async function sendViaWeb(title: string, body?: string, tag: string = DEFAULT_TAG): Promise<boolean> {
   if (typeof Notification === 'undefined') return false
   // ⛔ 不在异步事件里主动 requestPermission：浏览器要求手势，调了也只会被静默拒。
   //   只消费「用户此前已经放行」的结果。
@@ -101,7 +198,7 @@ async function sendViaWeb(title: string, body?: string): Promise<boolean> {
   const n = new Notification(title, {
     body,
     // 同一个 tag 会替换上一条（同一会话连续两轮结束时不会堆一屏）
-    tag: 'nexusai-turn-done',
+    tag,
     silent: false,
   })
   // 点击通知 → 把窗口拉回前台（Web 端没有可靠的跨平台「聚焦窗口」API，

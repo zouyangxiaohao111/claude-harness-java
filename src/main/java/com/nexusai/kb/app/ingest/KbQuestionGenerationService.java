@@ -152,7 +152,18 @@ public class KbQuestionGenerationService {
 
         // ── 模型 ──────────────────────────────────────────────────────
         String modelId = config.question().modelId();
-        ProviderConfig provider = resolveConfig(modelId);
+        // ⚠️ 传给模型 API 的必须是 **models.name**（provider 侧真实模型名），
+        //    而 `question_generation_config.model_id` / 继承来的 `summary_model_id`
+        //    存的是 **models.id**。两者混用会真的打到对方 API 上并 400：
+        //    实测 `The supported API model names are deepseek-flash, deepseek-v4-pro,
+        //    but you passed model-0823a98d`。
+        //    ⇒ 与 KbSummaryService / KbGraphExtractionService / Wiki 三阶段同构：
+        //      解析后取 `apiModelName`，非空白才覆盖，否则回退原值。
+        ModelConfigResolver.ResolvedModel resolved = resolveModel(modelId);
+        ProviderConfig provider = resolved == null ? null : resolved.config();
+        String apiModelName = resolved != null
+            && resolved.apiModelName() != null && !resolved.apiModelName().isBlank()
+            ? resolved.apiModelName() : modelId;
         if (provider == null) {
             return KbPostProcessOutcome.skipped("provider_not_configured");
         }
@@ -190,7 +201,7 @@ public class KbQuestionGenerationService {
                     content, prev, next, knowledge.getTitle(), limit,
                     config.question().customInstructions());
                 String raw = sideCallClient.chat(
-                    provider, modelId, null, prompt,
+                    provider, apiModelName, null, prompt,
                     options(TEMPERATURE, MAX_TOKENS, "question_generation"),
                     LlmSideCallClient.SideCallUsage.standalone(
                         UsageCategory.SIDE_CALL, "question_generation"));
@@ -374,6 +385,24 @@ public class KbQuestionGenerationService {
             return kb.getEmbeddingModelId();
         }
         return null;
+    }
+
+    /**
+     * 解析「模型 ID / 名」→ 真实配置 + 真实模型名。
+     *
+     * <p>⚠️ 必须整份返回 {@code ResolvedModel} 而不是只留 {@code config()}：
+     * 调 API 要的是 **models.name**，而库里存的是 **models.id**（见调用点注释）。
+     */
+    private ModelConfigResolver.ResolvedModel resolveModel(String modelName) {
+        if (modelConfigResolver == null || modelName == null || modelName.isBlank()) {
+            return null;
+        }
+        try {
+            return modelConfigResolver.resolve(modelName);
+        } catch (RuntimeException e) {
+            log.warn("[问句] provider 配置解析失败 model={} 原因={}", modelName, e.getMessage());
+            return null;
+        }
     }
 
     private ProviderConfig resolveConfig(String modelName) {

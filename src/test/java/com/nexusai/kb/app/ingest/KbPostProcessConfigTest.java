@@ -40,10 +40,18 @@ class KbPostProcessConfigTest {
         }
 
         @Test
-        @DisplayName("⭐⭐ 没配摘要模型 ⇒ 不派发（否则占一个槽位、跑一次必然失败的任务）")
-        void disabledWithoutModel() {
+        @DisplayName("⭐⭐ 没配摘要模型 ⇒ 仍然派发（对齐源码：模型缺失在执行期处置，不在派发期）")
+        void dispatchedWithoutModel() {
             KbPostProcessConfig c = KbPostProcessConfig.resolve(kb("", null, null, null));
-            assertThat(c.summaryEnabled()).isFalse();
+            // 源码 knowledge_post_process.go:216 `eff.SummaryEnabled && len(textChunks) > 0`，
+            // SummaryEnabled 恒 true（ResolveProcessConfig:43）⇒ 不看模型。
+            // 模型缺失由 knowledge_process.go:1521-1527 在**任务执行时**标 failed + no_summary_model。
+            //
+            // ⚠️ 反面（本仓曾经的写法）：派发期就判「无模型 ⇒ 不派发」⇒ 状态永远停在 none，
+            //    界面永远「尚未生成」，且没有任何错误、查不到原因 —— **静默失效**。
+            assertThat(c.summaryEnabled())
+                .as("派发条件只表达「要不要做这个环节」，不是「能不能跑」")
+                .isTrue();
             assertThat(c.summaryModelId()).isEmpty();
         }
 

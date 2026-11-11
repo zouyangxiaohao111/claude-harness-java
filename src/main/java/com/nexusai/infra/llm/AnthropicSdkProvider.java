@@ -2613,7 +2613,7 @@ public class AnthropicSdkProvider implements LlmProvider {
         // [P1 发送边界配对修复] CC original: ensureToolResultPairing（claude.ts:1324，主线程与 fork 共用
         //   同一处；forkedAgent.ts:538-541 明确「不在 fork 侧过滤悬挂 tool_use，下游统一修」）。
         //   Anthropic 通道唯一 DTO→wire 转换点（buildMessageParams → stream/chat/chatWithRaw/chatWithOptions
-        //   及 fork 的 ProductionForkedQuery.streamOnce 全经此）。
+        //   及 fork 的 主循环 provider.stream 全经此）。
         history = ToolResultPairingRepair.ensureToolResultPairing(history);
         // [CC 对齐 · fork-400 专项 2026-10-10] tool 结果组合并器：连续的 Role.tool 消息
         //   合并进同一条 user MessageParam 的 content 数组（见 tool 分支注释与循环尾 flush）。

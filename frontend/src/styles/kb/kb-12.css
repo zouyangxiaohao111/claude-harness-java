@@ -1,0 +1,106 @@
+/* ⚠️ 自动生成，勿手改。
+   来源：deliverables/kb-design/assets/weknora-bundle.css
+   生成：deliverables/kb-design/scripts/extract_page_css.py
+   改了源站样式要重跑脚本，不要在本文件里手改。 */
+
+/* 12-处理Trace.html 专属组件样式（bundle 0 条 + 内联 54 条） */
+.kb-scope .kp-drawer-wrap{ position: fixed; inset: 0; z-index: 130; display: flex; justify-content: flex-end; }
+.kb-scope .kp-secondary-drawer{
+    width: 820px; min-width: 820px; height: 100%; background: #fff;
+    display: flex; flex-direction: column;
+    box-shadow: -6px 0 24px rgba(0,0,0,.12);
+  }
+.kb-scope .kp-drawer-shell{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kb-scope .kp-timeline{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kb-scope .kp-shell{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
+.kb-scope .kp-head{ flex: none; padding: 14px 18px 0; border-bottom: 1px solid var(--td-component-stroke); }
+.kb-scope .kp-head-toolbar{ display: flex; align-items: flex-start; gap: 10px; }
+.kb-scope .kp-title-block{ flex: 1; min-width: 0; }
+.kb-scope .kp-eyebrow{ font-size: 12px; color: var(--td-text-color-placeholder); margin-bottom: 4px; }
+.kb-scope .kp-title{ display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; color: var(--td-text-color-primary); }
+.kb-scope .kp-title span.name{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-scope .kp-done-badge{
+    flex: none; font-size: 11px; font-weight: 500;
+    color: #2ba471; background: #e8f7ef; border-radius: 3px; padding: 1px 6px;
+  }
+.kb-scope .kp-head-actions{ display: flex; align-items: center; gap: 2px; flex: none; }
+.kb-scope .kp-iconbtn{
+    width: 26px; height: 26px; border: 0; border-radius: var(--app-radius-sm);
+    background: transparent; color: var(--td-text-color-secondary); font-size: 12px; cursor: pointer;
+  }
+.kb-scope .kp-iconbtn:hover{ background: var(--td-bg-color-container-hover); color: var(--td-text-color-primary); }
+.kb-scope .kp-stat-strip{
+    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
+    padding: 8px 0 12px; font-size: 12px; color: var(--td-text-color-secondary);
+  }
+.kb-scope .kp-stat b{ color: var(--td-text-color-primary); font-weight: 600; }
+.kb-scope .kp-stat.is-warn b{ color: #d54941; }
+.kb-scope .kp-stat.is-ok b{ color: #2ba471; }
+.kb-scope .kp-attempts{ display: flex; align-items: center; gap: 6px; padding: 0 0 12px; flex-wrap: wrap; }
+.kb-scope .kp-attempt{
+    height: 26px; padding: 0 10px; border: 1px solid var(--td-component-stroke);
+    border-radius: var(--app-radius-sm); background: #fff;
+    font: inherit; font-size: 12px; color: var(--td-text-color-secondary); cursor: pointer;
+  }
+.kb-scope .kp-attempt:hover{ border-color: var(--td-brand-color); color: var(--td-brand-color); }
+.kb-scope .kp-attempt.is-active{ background: var(--td-brand-color); border-color: var(--td-brand-color); color: #fff; }
+.kb-scope .kp-body{ flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+.kb-scope .kp-ruler{
+    flex: none; height: 26px; display: flex; align-items: center;
+    margin-left: 268px; padding-right: 14px;
+    font-size: 11px; color: var(--td-text-color-placeholder);
+    border-bottom: 1px solid #f2f2f2;
+  }
+.kb-scope .kp-ruler .tick{ flex: 1; text-align: left; }
+.kb-scope .kp-scroll{ flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 8px; }
+.kb-scope .kp-row{
+    display: flex; align-items: center; height: 26px;
+    font-size: 12px; color: var(--td-text-color-primary);
+    border-bottom: 1px solid #fafafa;
+  }
+.kb-scope .kp-row:hover{ background: #fafafa; }
+.kb-scope .kp-row.is-group{ background: #fcfcfc; font-weight: 600; }
+.kb-scope .kp-row.is-group .kp-node-label{ font-weight: 600; }
+.kb-scope .kp-node{
+    width: 268px; flex: none; display: flex; align-items: center; gap: 6px;
+    padding-left: 14px; min-width: 0;
+  }
+.kb-scope .kp-node-label{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.kb-scope .kp-node-dur{ margin-left: auto; padding-right: 10px; font-size: 11px; color: var(--td-text-color-secondary); font-variant-numeric: tabular-nums; }
+.kb-scope .kp-dot{ width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--td-text-color-placeholder); }
+.kb-scope .kp-dot.ok{ background: #2ba471; }
+.kb-scope .kp-dot.skip{ background: #d9d9d9; }
+.kb-scope .kp-caret{ width: 10px; font-size: 9px; color: var(--td-text-color-placeholder); flex: none; }
+.kb-scope .kp-indent{ display: inline-block; flex: none; }
+.kb-scope .kp-bar-area{ flex: 1; min-width: 0; position: relative; height: 100%; padding-right: 14px; }
+.kb-scope .kp-bar{
+    position: absolute; top: 50%; transform: translateY(-50%);
+    height: 8px; border-radius: 2px; background: var(--td-brand-color);
+  }
+.kb-scope .kp-bar.is-group{ height: 10px; background: #d5f2e1; border: 1px dashed #7fd4a3; }
+.kb-scope .kp-bar.is-skip{ background: transparent; border: 1px dashed #d9d9d9; height: 6px; }
+.kb-scope .kp-detail{
+    flex: none; max-height: 40%; overflow-y: auto;
+    border-top: 1px solid var(--td-component-stroke); background: #fcfcfc;
+  }
+.kb-scope .kp-detail-head{
+    display: flex; align-items: center; gap: 8px;
+    padding: 12px 18px 8px; font-size: 13px; font-weight: 600;
+  }
+.kb-scope .kp-detail-head .state{ font-size: 11px; font-weight: 500; color: #2ba471; background: #e8f7ef; border-radius: 3px; padding: 1px 6px; }
+.kb-scope .kp-detail-head .acts{ margin-left: auto; display: flex; gap: 2px; }
+.kb-scope .kp-tabs{
+    display: flex; align-items: center; gap: 16px;
+    padding: 0 18px; border-bottom: 1px solid var(--td-component-stroke);
+    font-size: 12px;
+  }
+.kb-scope .kp-tab{
+    height: 30px; border: 0; background: none; padding: 0;
+    font: inherit; font-size: 12px; color: var(--td-text-color-secondary); cursor: pointer;
+    border-bottom: 2px solid transparent;
+  }
+.kb-scope .kp-tab.is-active{ color: var(--td-brand-color); border-bottom-color: var(--td-brand-color); font-weight: 500; }
+.kb-scope .kp-detail-body{ padding: 14px 18px 18px; }
+.kb-scope .kp-kv{ display: flex; align-items: baseline; gap: 12px; padding: 6px 0; font-size: 12px; }
+.kb-scope .kp-kv .k{ width: 48px; flex: none; color: var(--td-text-color-placeholder); }
+.kb-scope .kp-kv .v{ color: var(--td-text-color-primary); font-variant-numeric: tabular-nums; }
