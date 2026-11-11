@@ -6,8 +6,7 @@ import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.entity.KbGraphEntityRecord;
 import com.nexusai.kb.repo.entity.KbGraphRelationRecord;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
-import com.nexusai.kb.repo.mapper.KbGraphEntityMapper;
-import com.nexusai.kb.repo.mapper.KbGraphRelationMapper;
+import com.nexusai.kb.app.graph.store.KbGraphStore;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -62,17 +61,18 @@ public class KbGraphSearchService {
     /** 证据正文截断长度。 */
     private static final int SOURCE_CONTENT_MAX_CHARS = 400;
 
-    private final KbGraphEntityMapper entityMapper;
-    private final KbGraphRelationMapper relationMapper;
+    /**
+     * 图谱存储（本地 SQLite 或远程 Neo4j）。
+     *
+     * <p>⭐ 2026-11-11 抽接口：本类原来直连两个 mapper。现在读全量后在内存里排序 ——
+     * 排序必须在这里做（而不是依赖 SQL 的 {@code ORDER BY}），否则远程 Neo4j 实现
+     * 得再实现一遍同样的排序，两边容易分叉。
+     */
+    private final KbGraphStore graphStore;
     private final KbChunkMapper chunkMapper;
 
-    public KbGraphSearchService(
-        KbGraphEntityMapper entityMapper,
-        KbGraphRelationMapper relationMapper,
-        KbChunkMapper chunkMapper
-    ) {
-        this.entityMapper = entityMapper;
-        this.relationMapper = relationMapper;
+    public KbGraphSearchService(KbGraphStore graphStore, KbChunkMapper chunkMapper) {
+        this.graphStore = graphStore;
         this.chunkMapper = chunkMapper;
     }
 
@@ -152,11 +152,13 @@ public class KbGraphSearchService {
         Set<String> reasons = new LinkedHashSet<>();
 
         // ── ① 选实体 ─────────────────────────────────────────────────
-        List<KbGraphEntityRecord> all = entityMapper.selectListByQuery(
-            QueryWrapper.create()
-                .where("knowledge_base_id = ?", kbId)
-                .orderBy("degree", false)
-                .orderBy("frequency", false));
+        // 度数/频次降序（原 SQL ORDER BY degree DESC, frequency DESC 的等价物）。
+        // ⚠️ 在内存里排：store 接口不承诺顺序，两种实现都不能依赖 SQL 排序。
+        List<KbGraphEntityRecord> all = new ArrayList<>(graphStore.listEntities(kbId));
+        all.sort(java.util.Comparator
+            .comparingInt((KbGraphEntityRecord e) -> e.getDegree() == null ? 0 : e.getDegree())
+            .thenComparingInt(e -> e.getFrequency() == null ? 0 : e.getFrequency())
+            .reversed());
 
         List<KbGraphEntityRecord> picked = new ArrayList<>();
         if (query.isEmpty()) {
@@ -203,10 +205,10 @@ public class KbGraphSearchService {
         }
 
         // ── ② 选关系（两端必须都在 picked 里）─────────────────────────
-        List<KbGraphRelationRecord> allRel = relationMapper.selectListByQuery(
-            QueryWrapper.create()
-                .where("knowledge_base_id = ?", kbId)
-                .orderBy("weight", false));
+        // 权重降序（原 SQL ORDER BY weight DESC 的等价物），同样在内存里排。
+        List<KbGraphRelationRecord> allRel = new ArrayList<>(graphStore.listRelations(kbId));
+        allRel.sort(java.util.Comparator.comparingDouble(
+            (KbGraphRelationRecord r) -> r.getWeight() == null ? 0.0 : r.getWeight()).reversed());
         List<Relation> relations = new ArrayList<>();
         for (KbGraphRelationRecord r : allRel) {
             if (relations.size() >= maxRelations) {

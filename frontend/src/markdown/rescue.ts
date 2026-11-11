@@ -27,12 +27,23 @@
  */
 
 import { parseGfmWithMath } from './parse.ts'
+import { FENCE_LANGS } from './fenceLanguages.ts'
 
 /** 目标首字符类：CJK（汉/扩展A/假名/谚文）。
  *  刻意**窄于** `cjkFriendlyStrong.ts` 的 script-extension 判据 —— 不含注音符号、
  *  兼容汉字、半角片假名与扩展 B+ 星面汉字。改动会作废已跑通的语料验证基线，
  *  如需放宽请单独登记。 */
 export const CJK_START = /[\u4e00-\u9fff\u3400-\u4dbf\u3040-\u30ff\uac00-\ud7af]/
+
+/**
+ * 已知的围栏语言标识（**按长度降序**，用于 info-string 粘连判据的最长前缀匹配）。
+ *
+ * <p>为什么需要白名单：真实的手滑形态 ` ```tsxturnRunning={…} ` 里，语言名与代码首行之间
+ * **没有任何分隔字符** —— 切点只能由「已知语言名到哪儿结束」来定，找 `<` / `{` 会切错位置。
+ *
+ * <p>词表本身在 {@link ./fenceLanguages.ts}（含维护规则），这里只按长度降序取用。
+ */
+const KNOWN_FENCE_LANGS: readonly string[] = FENCE_LANGS
 
 /** 一条源码编辑。`start`/`end` 是 UTF-16 偏移（与 `String.prototype.slice`、
  *  mdast `position.*.offset` 同单位），且**相对产生它那一次 `applyEdits` 的 `src`**。
@@ -138,6 +149,16 @@ export function passFence(src: string): FencePassResult {
   //   ec08aaed，旧链可正常救 0 处、新规则却让整篇降级）。退回后至少不比改动前更差。
   const lifted = liftFences(src, true)
   if (!lifted.aborted) return lifted
+  // 第二档：允许把「围栏内、行中间、后面还跟着正文」的 ``` 判成**闭围栏**。
+  // WHY 需要这一档（2026-11-11 真库 msg 86456756 实测）：模型偶发丢换行，把闭合围栏与
+  //   下一句正文并到同一行（`…agri_ask_user``` ↑**没有 search_api**`）。按 CommonMark，
+  //   围栏内的 ``` 只是代码内容 ⇒ 这一处不被认作闭合 ⇒ **围栏状态从此整体错位一位** ⇒
+  //   后面每个 ``` 的开/闭角色全部反转 ⇒ 全文判未闭合 ⇒ 平衡闸把整篇的修复全丢掉
+  //   （实测该消息：h2 0→3、table 1→2 的修复确实生效，但两个代码块仍各吞掉后文）。
+  //   本档专门破这个死锁：只要**它能让全文达到平衡**才采用（`!aborted` 即平衡），
+  //   否则退回旧规则 —— 绝不提交一个自己都判不平衡的结构。
+  const aggressive = liftFences(src, true, true)
+  if (!aggressive.aborted) return aggressive
   return liftFences(src, false)
 }
 
@@ -145,8 +166,10 @@ export function passFence(src: string): FencePassResult {
  * {@link passFence} 的提行实现。
  *
  * @param allowMidline 是否也处理「夹在行中间」的反引号串。false = 改动前的旧规则。
+ * @param allowMidlineClose 是否允许把「围栏内、行中间、后接正文」的 ``` 判成闭围栏。
+ *   仅由 {@link passFence} 的第二档启用（保守档失败时才试）。
  */
-function liftFences(src: string, allowMidline: boolean): FencePassResult {
+function liftFences(src: string, allowMidline: boolean, allowMidlineClose = false): FencePassResult {
   const edits: Edit[] = []
   let inFence = false
   let openLen = 0
@@ -158,11 +181,93 @@ function liftFences(src: string, allowMidline: boolean): FencePassResult {
     if (open !== null && !inFence) {
       inFence = true
       openLen = open[1]!.length
+      // [info-string 粘连] 把代码首行手滑写进了 info string：
+      //   ` ```tsx<MarkdownTextV2 … ` / ` ```tsxturnRunning={…} ` / ` ```sqlSELECT … ` ——
+      //   整行只开一个围栏，语言名成了 `tsxturnRunning`，真正的首行代码被当成 info string
+      //   丢掉（唯一一行时 ⇒ 代码块**内容为零**，只渲染出一个空块）。
+      //
+      // 为什么这在 CommonMark 里**合法**、因此只能靠判据救：info string 允许任意字符。
+      //   marked 判得完全正确，渲染器没有 bug —— 这条不是「修语法」，是还原作者本意。
+      //
+      // ⭐⭐ 判据只有一条：**语言名之后紧跟非空白字符**。
+      //   合法 info string 的语言名与元数据之间**必须有空白**
+      //   （` ```js title="x" `、` ```bash -e `、` ```js {1,3} `）⇒ rest 以空白开头或为空；
+      //   粘连形态里语言名直接接代码（`tsx` + `turnRunning=`、`sql` + `SELECT`）⇒ rest 非空且首字符非空白。
+      //   这个区分是**结构性**的，不依赖猜「余部像不像代码」——早期版本用
+      //   `rest.startsWith('<') || 标识符紧跟 =([` 只能救 JSX 与赋值两种形态，
+      //   实测 ` ```shellcd ` / ` ```sqlSELECT ` / ` ```scss$color ` 全部漏网。
+      //
+      //   切点为什么必须靠**语言名白名单**：真实形态里语言名与代码之间可能**没有任何分隔字符**
+      //   （`tsxturnRunning={}` 的正确切点在 `tsx` 与 `turnRunning` 之间，那里什么都没有），
+      //   所以只能由「已知语言名到哪儿结束」来定。词表见 ./fenceLanguages.ts（含维护规则）。
+      // ⚠️ 只在 `!inFence` 分支 ⇒ 代码块**内部**内容行里出现的 ``` 不受影响。
+      const infoStart = open[0].length
+      const info = line.slice(infoStart)
+      const langHit = KNOWN_FENCE_LANGS.find((l) => info.startsWith(l))
+      if (langHit !== undefined) {
+        const rest = info.slice(langHit.length)
+        // rest 非空 且 首字符不是空白（空格 / tab 等）
+        if (rest.length > 0 && !/^\s/.test(rest)) {
+          const at = off + infoStart + langHit.length
+          edits.push({
+            start: at,
+            end: at,
+            text: '\n',
+            pass: 'fence',
+            kind: 'split-info-string',
+            line,
+          })
+        }
+      }
     } else if (inFence) {
       const close = /^ {0,3}(`{3,})\s*$/.exec(line)
       if (close !== null && close[1]!.length >= openLen) {
         inFence = false
         openLen = 0
+      } else if (allowMidlineClose) {
+        // [行内闭围栏] 围栏内出现「``` + 空白 + 正文」⇒ 判成闭围栏，并把 ``` **独占一行**。
+        //   真库形态：`…agri_ask_user``` ↑**没有 search_api**`（模型丢换行导致）
+        //   目标形态：`…agri_ask_user` / ``` / `↑**没有 search_api**`
+        //   ⚠️ 必须插**两个**换行（``` 前后各一）。只插前面那个的话，``` 会带着后续正文
+        //   留在新行开头（` ``` ↑**…**`）—— 那按 CommonMark 是**开围栏**（info string 是
+        //   后面那句话），结果比不修更糟（实测把整张表格吞进了代码块）。
+        //   第二个换行插在 `\S` 之前（吃掉中间的空格），否则新行以空格开头会变成缩进代码块。
+        //   ⚠️ 三道保守闸：
+        //   ① `.*?` 取**第一个**围栏串（同一行可能有多个）；
+        //   ② 围栏串长度须 >= 开围栏长度（与 CommonMark 闭合要求一致）；
+        //   ③ 余下正文里**不许再有反引号**（有多处围栏串的多半是代码内容，不是粘连）。
+        //   ④ 余下正文须**像自然语言**：含 CJK，或以 ↑/→/*/#/> 这类正文标记开头。
+        //      WHY：围栏内本就在讲 markdown 的文档（`写 ``` 来开代码块`）不该被拆。
+        //      宁可少救（英文散文的粘连会被漏掉），也不制造新的错误。
+        //   ⭐ 最终还是由外层平衡闸兜底：本档产出的结果若不闭合，passFence 会整档丢弃。
+        const mc = /^(.*?[^\s`])(`{3,})([ \t]+)(\S.*)$/.exec(line)
+        const trailer = mc?.[4] ?? ''
+        const looksProse = /[\u4e00-\u9fff]/.test(trailer) || /^[↑→←↓*#>!-]/.test(trailer)
+        if (mc !== null && mc[2]!.length >= openLen && !trailer.includes('`') && looksProse) {
+          inFence = false
+          openLen = 0
+          const atFence = off + mc[1]!.length
+          // 第二个编辑把「``` 与正文之间的空白」**替换**成换行（不是插入）：
+          //   插入会留下 ` ```  ` 那样的行尾空格，且正文新行以空格开头会被当成缩进代码块。
+          const wsStart = atFence + mc[2]!.length
+          edits.push({
+            start: atFence,
+            end: atFence,
+            text: '\n',
+            pass: 'fence',
+            kind: 'lift-midline-close-fence',
+            line,
+          })
+          edits.push({
+            start: wsStart,
+            end: wsStart + mc[3]!.length,
+            text: '\n',
+            pass: 'fence',
+            kind: 'lift-midline-close-fence',
+            line,
+          })
+          continue
+        }
       }
     }
     // 行尾粘连的反引号：提行后等同于"行首出现一个反引号串"，共用同一条长度规则
@@ -214,6 +319,7 @@ function liftFences(src: string, allowMidline: boolean): FencePassResult {
   if (inFence) return { src, edits: [], aborted: true }
   return { src: applyEdits(src, edits), edits, aborted: false }
 }
+
 
 /** 表格规则：本行含 `|`、下一行是分隔行、且第一个 `|` 之前有非空内容 → 返回该 `|` 的下标。
  *  左半段若是 setext 下划线 / thematic break / 空 ATX 标题形状（`---`/`===`/`***`/`___`、
@@ -476,6 +582,31 @@ function splitPoints(line: string, hashes: number): number[] {
       pts.push(hashes + p)
       break
     }
+  }
+  // 6) 粗体开头的新块：`##改了5个文件**1.解析层…**（…）` / `##两件必须告诉你的**①本机…**，…`
+  //
+  //    与「标题内强调」的区分是**必须**的：`##这版的基准是你给的文件**视觉100%沿用…**：…`
+  //    （rescue.test.ts 的「不拆不该拆的」组）骨架完全相同，但它**不该拆** —— 那里
+  //    `**…**` 是标题内部的强调，冒号后的内容仍属标题。
+  //
+  //    唯一可靠的分界：**`**` 之内是否以「新块标记」开头**。
+  //    以 `1.` / `①` / `-` 开头 ⇒ 那是另一个块的起点（列表项/编号项），标题在它之前结束；
+  //    否则 ⇒ 是标题里的强调。三个真库样本实测：两个应拆的 inner 均命中，被裁定的那条不命中。
+  //
+  //    其余闸门都保守取「拒」：`**` 紧贴井号（`##**重要**说明` 是正常标题）、标题段含
+  //    句读/块级标点（`##结论：**…` 更像标题）、`**` 未闭合、闭合后无内容。
+  const bi = body.indexOf('**')
+  if (bi > 0 && !inCodeBefore(body, bi)) {
+    const head = body.slice(0, bi)
+    const close = body.indexOf('**', bi + 2)
+    const inner = close > 0 ? body.slice(bi + 2, close) : null
+    const ok =
+      inner !== null &&
+      close + 2 < body.length &&           // 闭合后还有内容（否则就是整行一个粗体）
+      !/[。，、；：！？|#]/.test(head) &&   // 标题段不像含标点的正文
+      !/`{3,}/.test(head) &&
+      /^(\d+[.、)]|[①-⑳]|[-•])/.test(inner) // ★唯一分界：inner 以新块标记开头
+    if (ok) pts.push(hashes + bi)
   }
   // 拆点必须落在正文里（> hashes）：拆点 = hashes 会拆出纯井号段（`####|a |b |` → `####` +
   // `|a |b |`），那是 ATX 空标题（凭空多一个空 h4）—— P1 的 tableSplit 对同一形状有同款闸

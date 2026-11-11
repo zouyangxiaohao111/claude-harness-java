@@ -266,7 +266,7 @@ export function ArtifactDock({
               title={`${artifact.title} · 预览`}
             />
           ) : isMarkdown ? (
-            <MarkdownTextV2 text={data.content ?? ''} className="content md ad-md" />
+            <MarkdownTextV2 text={data.content ?? ''} className="content md ad-md markdown-prose" />
           ) : isText ? (
             <pre className="ad-pre">{data.content}</pre>
           ) : (

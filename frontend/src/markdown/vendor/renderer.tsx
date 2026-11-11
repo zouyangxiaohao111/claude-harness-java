@@ -25,6 +25,8 @@ import { highlightCode } from './codeHighlight'
 import { useMermaidRender } from './mermaidRender'
 // 剪贴板（本仓既有设施，V1 CodeBlock 用的就是它）
 import { writeClipboard } from '@/markdown/clipboard'
+// [rescue] 脏输入抢救：本仓独有能力（763 行），源站没有。只在**收口期**跑，见下方注释。
+import { repair, PROD_REPAIR_OPTS } from '@/markdown/rescue'
 
 import {
   renderChatMarkdown,
@@ -121,6 +123,20 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
 
   const html = useMemo(() => {
     if (!text || !text.trim()) return ''
+    // ⭐⭐ 分工：CC 管「流式期」，rescue 管「收口」。
+    //
+    // 流式期（streaming=true）**不跑 rescue** —— 与 V1 的取舍一致
+    // （`MarkdownText.tsx:71` 的注释说明了原因）：rescue 会改写长度（插入换行/空格），
+    // 而流式的增量解析依赖「上一帧是这一帧的前缀」这一不变量，长度改写会破坏它。
+    // 流式期的未闭合语法由 `streamingGuards` 那 8 个守卫兜住（照抄源站）。
+    //
+    // 收口期（streaming=false）跑一次 rescue：源站流水线**修不了**模型输出的
+    // 粘连形态（`##标题` 缺空格 / 表格首行与标题粘连 / 围栏贴行尾），因为它严格按
+    // CommonMark 判定，这些本就不算语法。实测：同一份粘连原文，源站 marked17 与
+    // 本仓 marked18 输出逐字一致、都是 `h2=0 table=0`。
+    // rescue 的分法取自真解析器（不是整文本正则），且不碰围栏内代码；
+    // 对规范文档幂等（实测 CLAUDE.md 3403 字符零改动）。
+    const source = streaming ? text : repair(text, PROD_REPAIR_OPTS).out
     const opts: RenderChatMarkdownOptions = {
       renderer: renderer ?? buildDefaultRenderer(onRunHtml),
       // 源站把 escapeMarkdown 交给调用方；本仓没有额外转义需求 ⇒ 恒等。
@@ -130,7 +146,7 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
       streaming,
     }
     try {
-      return renderChatMarkdown(text, opts)
+      return renderChatMarkdown(source, opts)
     } catch (e) {
       // 渲染失败不能让整条消息消失：降级成转义后的纯文本
       console.warn('[MarkdownTextV2] 渲染失败，降级纯文本', e)

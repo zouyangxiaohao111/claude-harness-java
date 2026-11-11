@@ -21,9 +21,10 @@ const wikiPanel = readFileSync(WIKI_PANEL, 'utf-8')
 describe('[W3] Wiki tab 接线', () => {
   it('⭐ 详情页有 docs / wiki tab 的 state（QA-13 后扩到 docs/wiki/graph/qa）', () => {
     // ⚠️ 断言「docs 与 wiki 都在联合类型里」，⛔ 不钉死整串 ——
-    //    QA-13 加 'qa' / W7 加 'graph' 都只是扩取值，不该让这条红；
+    //    QA-13 加 'qa' / W7 加 'graph' / 2026-11-11 加 'entity-graph' 都只是扩取值，不该让这条红；
     //    真正要守的是「docs/wiki 两个 tab 仍然存在且能切换」（下一条）。
-    expect(kbPage).toMatch(/useState<'docs'[^>]*'wiki'[^>]*>\('docs'\)/)
+    //    ⚠️ 联合类型被格式化器折成多行后，`[^>]*` 跨不了换行 ⇒ 用 `[\s\S]*?`（实测踩过）。
+    expect(kbPage).toMatch(/useState<\s*'docs'[\s\S]*?'wiki'[\s\S]*?>\('docs'\)/)
   })
 
   it('⭐ 两个 tab 按钮都绑了 setDetailTab', () => {

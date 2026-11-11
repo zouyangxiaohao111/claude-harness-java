@@ -2766,6 +2766,7 @@ html {
   backdrop-filter: blur(8px);
   -webkit-backdrop-filter: blur(8px);
   padding: 24px;
+  cursor: zoom-out;
 }
 .msg-img-zoom img {
   max-width: 90vw;
@@ -2774,6 +2775,27 @@ html {
   box-shadow: 0 24px 64px rgba(0, 0, 0, 0.4);
   cursor: default;
 }
+/* 显式关闭按钮（放在右上角 · 图片占满视口时点不到遮罩） */
+.msg-img-zoom-close {
+  position: absolute;
+  top: 16px;
+  right: 16px;
+  width: 32px;
+  height: 32px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: rgba(20,24,31, 0.55);
+  color: #fff;
+  font-size: 20px;
+  line-height: 1;
+  cursor: pointer;
+  transition: background 120ms var(--ease);
+}
+.msg-img-zoom-close:hover { background: rgba(20,24,31, 0.85); }
 
 /* 输入 `/` 命令即时提示下拉 */
 .composer .slash-menu {

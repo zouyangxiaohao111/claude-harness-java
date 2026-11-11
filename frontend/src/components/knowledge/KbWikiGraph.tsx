@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import type { ReactNode } from 'react'
 import { ApiError } from '@/api/rest'
 import { wikiApi } from '@/api/wiki'
 import type { WikiGraph, WikiPage } from '@/api/wiki'
@@ -99,18 +100,37 @@ const GRAPH_SYSTEM_PAGE_TYPES: Record<string, number> = { index: 1 }
 const SVGNS = 'http://www.w3.org/2000/svg'
 const ALL_TYPES = ['summary', 'entity', 'concept', 'synthesis', 'comparison', 'index']
 
+/**
+ * Wiki 图谱的默认视觉方案（= 上面前 5 个常量的组合）。
+ *
+ * <p>⛔ 数值逐字保留，`KbWikiGraph` 不传 `schema` 时行为与本文件改造前**完全一致**。
+ */
+const WIKI_SCHEMA: GraphTypeSchema = {
+  colors: NODE_COLOR,
+  labels: TYPE_LABEL,
+  themes: TYPE_THEME,
+  legend: LEGEND_TYPES,
+  all: ALL_TYPES,
+}
+
 // ══════════════════════════════════════════════════════════════
 // 数据形状
 // ══════════════════════════════════════════════════════════════
 
-interface GraphEdge {
+export interface GraphEdge {
   source: string
   target: string
   /** 反向边也存在（真机后端返回两行）⇒ 两端都画箭头。 */
   bidir: boolean
 }
 
-interface GraphData {
+/**
+ * 图谱画布的输入数据（两套图谱共用）。
+ *
+ * <p>⭐ 关系图谱（实体-关系）由 `graphAdapter.buildSvgGraph()` 产出同一形状后注入，
+ * 从而复用本文件的全部渲染与交互。
+ */
+export interface GraphData {
   total: number
   nodes: GraphNodeLike[]
   edges: GraphEdge[]
@@ -347,13 +367,86 @@ function GraphIconSprite() {
 // 组件
 // ══════════════════════════════════════════════════════════════
 
-export interface KbWikiGraphProps {
-  baseId: string
-  /** WikiPanel 已经拉过的全量页面（抽屉正文/版本从这里取，省一次请求）。 */
-  pages: WikiPage[]
+/**
+ * 图谱节点类型的视觉方案（颜色 / 中文 / t-tag 主题 / 图例 / 全部类型）。
+ *
+ * <p>抽成参数是为了让**关系图谱**（实体-关系）复用同一套 SVG 引擎，
+ * 而图例文案说「文档 / 实体 / 概念 / 关系 / 属性」而不是 Wiki 的
+ * 「摘要 / 实体 / 概念 / 综合 / 对比」。
+ *
+ * <p>⛔ 不传时用 {@link WIKI_SCHEMA}（= 原模块常量，Wiki 图谱行为零变化）。
+ */
+export interface GraphTypeSchema {
+  colors: Record<string, string>
+  labels: Record<string, string>
+  themes: Record<string, string>
+  /** 图例项（顺序即渲染顺序）。 */
+  legend: Array<{ type: string; label: string; color: string }>
+  /** 全部类型（图例过滤的初始全选集合）。 */
+  all: string[]
 }
 
-export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
+export interface KbWikiGraphProps {
+  baseId: string
+  /** WikiPanel 已经拉过的全量页面（抽屉正文/版本从这里取，省一次请求）。
+   *  关系图谱没有 Wiki 页面 ⇒ 传空数组（配合 `renderNodeBody`）。 */
+  pages: WikiPage[]
+  /**
+   * 外部直接给图谱数据 —— 给了就**跳过**内部 `wikiApi.getGraph(baseId)`。
+   *
+   * <p>⭐ 关系图谱（实体-关系）走这条：数据来自 `GET /knowledge-bases/{id}/graph`，
+   * 由调用方转成同一份 `GraphData` 后注入 ⇒ 两套图谱共用同一个渲染引擎
+   * （SVG + 力导向 + 集群轮廓 + 标签避让 + pan/zoom + 展开子图）。
+   *
+   * <p>⚠️ 传 `undefined` = 走 Wiki 内部加载（默认）；传 `null` = 外部暂无数据（空态）。
+   */
+  dataOverride?: GraphData | null
+  /** 节点类型视觉方案（不传 = Wiki 的六类）。 */
+  schema?: GraphTypeSchema
+  /**
+   * 抽屉正文渲染器（给了就用它，不再调 `wikiApi.getPage`）。
+   *
+   * <p>关系图谱的节点是实体，没有 Wiki 页面正文 ⇒ 这里渲染实体的属性 / 关系 / 证据块。
+   */
+  renderNodeBody?: (slug: string) => ReactNode
+  /** 搜索框 placeholder（默认「搜索 Wiki 页面...」）。 */
+  searchPlaceholder?: string
+  /** 搜索无结果文案（默认「没有找到匹配的页面」）。关系图谱要换成「实体」。 */
+  searchEmptyText?: string
+  /** 概览状态卡的标题（默认「全库概览」）。 */
+  statusTitle?: string
+  /** 外部加载失败的原因（由调用方持有；内部加载时留空）。 */
+  loadError?: string | null
+  /** 外部是否正在加载（由调用方持有；内部加载时留空）。 */
+  loadingOverride?: boolean
+}
+
+export function KbWikiGraph({
+  baseId,
+  pages,
+  dataOverride,
+  schema: schemaProp,
+  renderNodeBody,
+  searchPlaceholder = '搜索 Wiki 页面...',
+  searchEmptyText = '没有找到匹配的页面',
+  statusTitle = '全库概览',
+  loadError,
+  loadingOverride,
+}: KbWikiGraphProps) {
+  /**
+   * 节点视觉方案。
+   *
+   * <p>⚠️ 必须是**稳定引用**（调用方用模块级常量或 useMemo 传），否则每次渲染
+   * `renderGraph` 的依赖变化 ⇒ 整张图重建、力导向从 alpha=1 重跑（画面会跳）。
+   */
+  const schema = schemaProp ?? WIKI_SCHEMA
+  /**
+   * 是否由外部供数（关系图谱）。
+   *
+   * <p>⚠️ 判据是 `dataOverride !== undefined`，⛔ 不能用 `!!dataOverride`：
+   * 外部「加载完成但 0 个节点」传 `null` 与「不接管」传 `undefined` 必须分开。
+   */
+  const external = dataOverride !== undefined
   const canvasRef = useRef<HTMLDivElement | null>(null)
   const hostRef = useRef<HTMLDivElement | null>(null)
   const engRef = useRef<Engine>(emptyEngine())
@@ -375,7 +468,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
   const [selectedSlug, setSelectedSlug] = useState<string | null>(null)
   const [drawerSlug, setDrawerSlug] = useState<string | null>(null)
   const [showArrows, setShowArrows] = useState(true)
-  const [filterTypes, setFilterTypes] = useState<Set<string>>(() => new Set(ALL_TYPES))
+  const [filterTypes, setFilterTypes] = useState<Set<string>>(() => new Set(schema.all))
   /** 每次命令式渲染完成 +1：驱动状态卡 / 抽屉提示重算。 */
   const [graphVersion, setGraphVersion] = useState(0)
   const [renderToken, setRenderToken] = useState(0)
@@ -399,7 +492,13 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
   const showArrowsRef = useRef(showArrows)
 
   // ── 加载图谱数据 ──────────────────────────────────────────────
+  /* ⭐ 两条数据通路，互斥：
+     ① 内部（Wiki 图谱）—— `wikiApi.getGraph(baseId)` → `mapGraph`；
+     ② 外部（关系图谱）—— 调用方已转成同一份 `GraphData` 从 `dataOverride` 注入。
+     ⛔ 外部接管时**不能**再发 `wikiApi.getGraph`：那个端点返回的是 Wiki 页面链接图，
+        与实体-关系图是完全不同的两份数据（会画出张冠李戴的图）。 */
   useEffect(() => {
+    if (external) return
     let alive = true
     setLoading(true)
     setError(null)
@@ -419,7 +518,17 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
     return () => {
       alive = false
     }
-  }, [baseId])
+  }, [baseId, external])
+
+  /* 外部数据同步到内部 `raw`。用 effect 而不是直接用 `dataOverride`：
+     下面 `applyFilter` / `nodeBySlug` / `searchHits` 全都读 `raw`，
+     直接读 `dataOverride` 要改七八处，反而容易漏。 */
+  useEffect(() => {
+    if (!external) return
+    setRaw(dataOverride)
+    setError(loadError ?? null)
+    setLoading(!!loadingOverride)
+  }, [external, dataOverride, loadError, loadingOverride])
 
   // ── 过滤后的图（源站 applyFilter）──────────────────────────────
   const applyFilter = useCallback(
@@ -675,7 +784,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
       const expansionRing = document.createElementNS(SVGNS, 'circle')
       expansionRing.setAttribute('r', String(r + 3))
       expansionRing.setAttribute('fill', 'none')
-      expansionRing.setAttribute('stroke', NODE_COLOR[n.type] || '#8c8c8c')
+      expansionRing.setAttribute('stroke', schema.colors[n.type] || '#8c8c8c')
       expansionRing.setAttribute('stroke-width', '1.5')
       expansionRing.setAttribute('stroke-dasharray', '3 3')
       expansionRing.setAttribute('pointer-events', 'none')
@@ -691,7 +800,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
       const activeRing = document.createElementNS(SVGNS, 'circle')
       activeRing.setAttribute('r', String(r + 5))
       activeRing.setAttribute('fill', 'none')
-      activeRing.setAttribute('stroke', NODE_COLOR[n.type] || '#8c8c8c')
+      activeRing.setAttribute('stroke', schema.colors[n.type] || '#8c8c8c')
       activeRing.setAttribute('stroke-width', '2')
       activeRing.style.opacity = '0'
       activeRing.style.transition = 'opacity 0.2s'
@@ -700,7 +809,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
 
       const circle = document.createElementNS(SVGNS, 'circle')
       circle.setAttribute('r', String(r))
-      circle.setAttribute('fill', NODE_COLOR[n.type] || '#8c8c8c')
+      circle.setAttribute('fill', schema.colors[n.type] || '#8c8c8c')
       circle.setAttribute('stroke', '#fff')
       circle.setAttribute('stroke-width', '1.5')
       circle.classList.add('node-circle')
@@ -1170,7 +1279,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
           const focus =
             hoverSlug && (e.source === hoverSlug || e.target === hoverSlug) ? hoverSlug : slug
           const found = eng.nodeEls.filter((n) => n.node.slug === focus)[0]
-          e.line.setAttribute('stroke', (found && NODE_COLOR[found.node.type]) || '#0052d9')
+          e.line.setAttribute('stroke', (found && schema.colors[found.node.type]) || '#0052d9')
           setEdgeMarkers(e, '-hl')
         } else {
           e.line.setAttribute('stroke', GRAPH_EDGE_COLOR)
@@ -1343,7 +1452,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
         startY = p.y - node.y
         const circle = g.querySelector('.node-circle')
         if (circle) {
-          circle.setAttribute('stroke', NODE_COLOR[node.type] || '#8c8c8c')
+          circle.setAttribute('stroke', schema.colors[node.type] || '#8c8c8c')
           circle.setAttribute('stroke-width', '2.5')
         }
         window.addEventListener('mousemove', onMove)
@@ -1517,7 +1626,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
     }
     // 声明在下方的事件桥（避免 useCallback 循环依赖）
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [data, mode, centerSlug, renderToken, buildAdjacency, applyFilter])
+  }, [data, mode, centerSlug, renderToken, buildAdjacency, applyFilter, schema])
 
   // ── 箭头开关：只切 marker，不重建画布（源站 toggleArrows）────────
   const applyArrowToggle = useCallback(() => {
@@ -1703,9 +1812,12 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
   }, [drawerSlug])
 
   // ── 抽屉页面兜底：pages 里没有就按 slug 拉一次 ─────────────────
+  /* ⚠️ 关系图谱（`renderNodeBody`）的节点是实体，**没有** Wiki 页面 ⇒
+     既不该查 `pages`，也不该发 `wikiApi.getPage`（会 404，且抽屉会一直转圈）。 */
   useEffect(() => {
     setRemotePage(null)
     if (!drawerSlug) return
+    if (renderNodeBody) return
     if (pages.some((p) => p.slug === drawerSlug)) return
     let alive = true
     wikiApi
@@ -1719,7 +1831,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
     return () => {
       alive = false
     }
-  }, [drawerSlug, pages, baseId])
+  }, [drawerSlug, pages, baseId, renderNodeBody])
 
   // ── Esc：先关抽屉，再关帮助/搜索（⛔ 一次 Esc 不连场景一起关）────
   useEffect(() => {
@@ -1874,11 +1986,11 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
                     <input
                       className="t-input__inner"
                       id="graphSearchInput"
-                      placeholder="搜索 Wiki 页面..."
+                      placeholder={searchPlaceholder}
                       type="text"
                       autoComplete="off"
                       spellCheck={false}
-                      aria-label="搜索 Wiki 页面"
+                      aria-label={searchPlaceholder.replace(/[.。…]+$/, '')}
                       value={searchKeyword}
                       onFocus={() => setSearchOpen(true)}
                       onChange={(e) => {
@@ -1922,7 +2034,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
               <div className="t-popup__content">
                 <ul className="t-select__list">
                   {searchHits.length === 0 ? (
-                    <li className="t-select-option t-is-disabled">没有找到匹配的页面</li>
+                    <li className="t-select-option t-is-disabled">{searchEmptyText}</li>
                   ) : (
                     searchHits.map((n) => (
                       <li
@@ -2008,7 +2120,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
       {/* 图例 + 状态卡（design-04 markup:253-273） */}
       <div className={`wiki-graph-legend${drawerSlug ? ' legend-shifted' : ''}`}>
         <div className="legend-items">
-          {LEGEND_TYPES.map((t) => (
+          {schema.legend.map((t) => (
             <div
               key={t.type}
               className={`legend-item clickable${filterTypes.has(t.type) ? '' : ' disabled'}`}
@@ -2130,7 +2242,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
                 {centerNode?.title ?? centerSlug}
               </div>
               <div className="status-card-secondary">
-                {(centerNode && TYPE_LABEL[centerNode.type]) || ''} ·{' '}
+                {(centerNode && schema.labels[centerNode.type]) || ''} ·{' '}
                 {Math.max(0, engRef.current.nodes.length - 1)} 个相关节点
               </div>
             </>
@@ -2140,7 +2252,7 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
                 <svg className="t-icon" aria-hidden="true">
                   <use href="#kb-g-icon-chart-bubble" />
                 </svg>
-                <span className="status-card-title">全库概览</span>
+                <span className="status-card-title">{statusTitle}</span>
               </div>
               <div
                 className="status-card-primary"
@@ -2237,9 +2349,9 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
           <div className="t-drawer__body narrow-scrollbar">
             <div className="wiki-reader-meta" id="ndMeta" style={{ marginBottom: 8 }}>
               <div
-                className={`t-tag t-tag--${TYPE_THEME[drawerNode?.type ?? ''] ?? 'default'} t-tag--light-outline t-size-s`}
+                className={`t-tag t-tag--${schema.themes[drawerNode?.type ?? ''] ?? 'default'} t-tag--light-outline t-size-s`}
               >
-                <span>{TYPE_LABEL[drawerNode?.type ?? ''] ?? drawerNode?.type ?? ''}</span>
+                <span>{schema.labels[drawerNode?.type ?? ''] ?? drawerNode?.type ?? ''}</span>
               </div>
               <span className="wiki-reader-meta-text">
                 {drawerPage ? `v${drawerPage.version}` : ''}
@@ -2275,7 +2387,12 @@ export function KbWikiGraph({ baseId, pages }: KbWikiGraphProps) {
             <div className="wiki-drawer-neighbor-hint" id="ndHint" style={{ marginBottom: 16 }}>
               {neighborHint}
             </div>
-            {drawerBodyHtml ? (
+            {renderNodeBody ? (
+              /* 关系图谱：实体没有 Wiki 正文，调用方渲染属性 / 关系 / 证据块 */
+              <div className="wiki-reader-body" id="ndBody">
+                {renderNodeBody(drawerSlug ?? '')}
+              </div>
+            ) : drawerBodyHtml ? (
               <div
                 className="wiki-reader-body"
                 id="ndBody"

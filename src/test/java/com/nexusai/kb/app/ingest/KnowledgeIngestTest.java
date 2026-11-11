@@ -771,7 +771,7 @@ class KnowledgeIngestTest {
 
     private static com.nexusai.kb.app.graph.KbGraphExtractionService noopGraph() {
         return new com.nexusai.kb.app.graph.KbGraphExtractionService(
-            knowledgeMapper, knowledgeBaseMapper, chunkMapper, null, null, null) {
+            knowledgeMapper, knowledgeBaseMapper, chunkMapper, null, null) {
             @Override
             public com.nexusai.kb.app.graph.KbGraphOutcome extract(
                 String knowledgeId, int attempt, String modelName) {

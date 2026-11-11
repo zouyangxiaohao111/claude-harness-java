@@ -171,6 +171,129 @@ describe('rescue · P0 围栏抢救', () => {
     expect(r.edits.map(e => e.kind)).toEqual(['lift-open-fence'])
     expect(r.src).toBe('前文\n```\ncode\n```\n##标题```note\n')
   })
+
+  // ⭐ 真实样本：2026-11-11 本会话里，助手（我）连续 4 次把反引号与代码首行写在
+  //   同一行，代码块因此整个空掉。这不是理论构造 —— 是反复发生的真实输入。
+  //   形态：` ```tsx` + 首行代码**无换行** ⇒ 整行被当成 info string（语言名），
+  //   代码首行丢失；只有一行内容时 ⇒ 代码块全空。
+  //   CommonMark 里完全合法（info string 允许任意字符）⇒ marked 判得没错，
+  //   渲染器没 bug，只能由 rescue 还原作者本意。
+  describe('info-string 粘连：语言标识与代码首行写在同一行', () => {
+    it('` ```tsx<MarkdownTextV2 … ` → 在 < 处断开，语言名只留 tsx', () => {
+      const src = '```tsx<MarkdownTextV2 text={b.content}\n  streaming={x}\n/>\n```\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out)
+        .toBe('```tsx\n<MarkdownTextV2 text={b.content}\n  streaming={x}\n/>\n```\n')
+    })
+
+    it('单行块（` ```tsxturnRunning={!!thinking} `）→ 断开后不再是空代码块', () => {
+      // 这条是本会话第 2 次手滑的真实形态：整个代码块只渲染出一个语言名、零内容。
+      const src = '```tsxturnRunning={!!thinking}\n```\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out)
+        .toBe('```tsx\nturnRunning={!!thinking}\n```\n')
+    })
+
+    it('⛔ 合法 info string 不动：` ```js title="x" `（语言名后带空白）', () => {
+      const src = '```js title="x"\ncode\n```\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+    })
+
+    it('⛔ 合法带参 info string 不动：` ```bash -e ` / ` ```js {1,3} `', () => {
+      for (const info of ['bash -e', 'js {1,3}', 'python hl_lines="2"']) {
+        const src = '```' + info + '\ncode\n```\n'
+        expect(repair(src, PROD_REPAIR_OPTS).out, info).toBe(src)
+      }
+    })
+
+    // ⭐⭐ 判据是「语言名后紧跟非空白」——不是猜「余部像不像代码」。
+    //    早期版本用 `rest.startsWith('<') || 标识符紧跟 =([` 只能救 JSX 与赋值两种形态，
+    //    下面这 5 种全部漏网（实测打红后才改成结构性判据）。
+    it('其他语言同形态：shell / scss / solidity / sql / dockerfile 也修', () => {
+      const cases: Array<[info: string, lang: string, firstLine: string]> = [
+        ['shellcd /tmp && ls', 'shell', 'cd /tmp && ls'],
+        ['scss$color: red;', 'scss', '$color: red;'],
+        ['soliditypragma solidity ^0.8.0;', 'solidity', 'pragma solidity ^0.8.0;'],
+        ['sqlSELECT * FROM t;', 'sql', 'SELECT * FROM t;'],
+        ['dockerfileFROM node:20', 'dockerfile', 'FROM node:20'],
+      ]
+      for (const [info, lang, firstLine] of cases) {
+        const src = '```' + info + '\n```\n'
+        expect(repair(src, PROD_REPAIR_OPTS).out, info)
+          .toBe('```' + lang + '\n' + firstLine + '\n```\n')
+      }
+    })
+
+    it('⛔ 正常语言标识不动：tsx / python / c++ / bash', () => {
+      for (const lang of ['tsx', 'python', 'c++', 'bash', 'shell']) {
+        const src = '```' + lang + '\ncode\n```\n'
+        expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+      }
+    })
+
+    it('⛔ info 以 < 开头（` ```<div> ` 无语言标识形态）不动：无可辨识语言名，不做猜测', () => {
+      const src = '```<div>\ncode\n```\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+    })
+
+    it('⛔ 代码块**内部**的内容行不受影响（那里的 ``` 不是闭合围栏）', () => {
+      const src = '```js\nconst a = 1\n```tsx<div>\n```\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+    })
+  })
+
+  /**
+   * ⭐⭐ 行内闭围栏（2026-11-11 真库 msg 86456756 实测形态）
+   *
+   * <p>模型偶发丢换行，把闭合围栏与下一句正文并到同一行：
+   * `…agri_ask_user``` ↑**没有 search_api**`。
+   *
+   * <p>为什么必须专门处理：按 CommonMark，**围栏内**的 ``` 只是代码内容 ⇒ 这一处不被认作闭合
+   * ⇒ 围栏状态从此**整体错位一位** ⇒ 后面每个 ``` 的开/闭角色全部反转 ⇒ 全文判未闭合
+   * ⇒ 平衡闸把整篇的修复**全部丢弃**（实测：h2 0→3、table 1→2 的修复虽然生效，但两个代码块
+   * 仍各吞掉后文，第一个吞掉 445 字符，把整张表格都算进了代码）。
+   */
+  describe('行内闭围栏：`…代码``` 正文` 形态', () => {
+    it('围栏内 ``` 后接正文 → 判成闭围栏，``` 独占一行（前后各插一个换行）', () => {
+      const src = '```\nagri-bot: a, b, c``` ↑没有这个工具\n\n后文一段。\n'
+      expect(repair(src, PROD_REPAIR_OPTS).out)
+        .toBe('```\nagri-bot: a, b, c\n```\n↑没有这个工具\n\n后文一段。\n')
+    })
+
+    it('⭐ 一处漏判不能让整篇修复全部作废：后面的行尾粘连也要救回来', () => {
+      // 真库 msg 86456756 的最小复现：第一处是行内闭围栏，第二处是行尾粘连。
+      // 修复前：第一处漏判 ⇒ 状态错位 ⇒ 平衡闸整篇放弃 ⇒ 第二处也救不了。
+      const src = [
+        '```',
+        'code_first``` 后接正文',
+        '',
+        '```',
+        'code_second```',
+        '',
+        '尾声。',
+        '',
+      ].join('\n')
+      const out = repair(src, PROD_REPAIR_OPTS).out
+      expect(out).toBe([
+        '```',
+        'code_first',
+        '```',
+        '后接正文',
+        '',
+        '```',
+        'code_second',
+        '```',
+        '',
+        '尾声。',
+        '',
+      ].join('\n'))
+    })
+
+    it('⛔ 围栏内本就在讲 markdown 围栏（`写 ``` 来开代码块`）不拆 —— 平衡闸 + looksProse 双保险', () => {
+      // 非 CJK 也行：判据放行 CJK 正文，但**拆完不闭合** ⇒ 整档丢弃
+      const src = '```\nwrite ``` to open a fence\n```\n'
+      // 行内 ``` 被当成闭合后，第三行又开一个新围栏 ⇒ 不闭合 ⇒ 退回保守规则 ⇒ 原文不动
+      expect(repair(src, PROD_REPAIR_OPTS).out).toBe(src)
+    })
+  })
 })
 
 describe('rescue · P1 表格抢救', () => {
@@ -410,9 +533,31 @@ describe('rescue · P1.5 拆行抢救（判据来自全库评估原型；语料�
     expect(repair('#二、生产阶段：6步，谁产生什么```\n', PROD_REPAIR_OPTS).out)
       .toBe('# 二、生产阶段：6步，谁产生什么\n```\n')
   })
+
+  it('粗体开头的新块：`##标题**1.…**` / `##标题**①…**` → 拆（真库 msg 38576df2 原行）', () => {
+    // 数字列表标记开头
+    expect(passGlue('##改了5个文件**1.解析层：区分「未声明」与「显式 `[]`」**（这是前置，不给就什么都实现不了）\n').src)
+      .toBe('## 改了5个文件\n**1.解析层：区分「未声明」与「显式 `[]`」**（这是前置，不给就什么都实现不了）\n')
+    // 带圈数字序号开头
+    expect(passGlue('##两件必须告诉你的**①本机5个专家改完也不会通告**，因为它们的 `tools:`没写 `Skill`：\n').src)
+      .toBe('## 两件必须告诉你的\n**①本机5个专家改完也不会通告**，因为它们的 `tools:`没写 `Skill`：\n')
+  })
 })
 
 describe('rescue · P1.5 误拆防护（原型约束：不拆不该拆的）', () => {
+  it('粗体是**标题内强调**时不拆：`**` 之内不以新块标记开头（真库 msg 36e9e71b 原行）', () => {
+    // ⚠️ 与本组上方「该拆」的两条骨架完全相同（`##` + 文字 + `**…**` + 后续），
+    //    唯一分界 = `**` 之内是否以 `1.` / `①` / `-` 这类新块标记开头。
+    const emphasis = '##结论**重要**的发现\n'
+    expect(passGlue(emphasis).src).toBe(emphasis)
+    // `**` 紧贴井号（正常标题以粗体开头）不拆
+    expect(passGlue('##**重要**说明\n').src).toBe('##**重要**说明\n')
+    // `**` 未闭合 / 闭合后无内容 都不拆
+    expect(passGlue('##标题**1.内容\n').src).toBe('##标题**1.内容\n')
+    expect(passGlue('##标题**1.内容**\n').src).toBe('##标题**1.内容**\n')
+    // 标题段含句读标点 ⇒ 不像标题，不拆
+    expect(passGlue('##结论：**1.要点**，后续正文\n').src).toBe('##结论：**1.要点**，后续正文\n')
+  })
   it('颜色值 `#0f5fd4`（# 后跟字母数字）不是第二个标题号 → 不拆', () => {
     const short = '##这版基准 `#0f5fd4`/`#0a49a8` 亮橙\n'
     expect(passGlue(short).src).toBe(short)

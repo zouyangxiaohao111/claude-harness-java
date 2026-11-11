@@ -151,6 +151,14 @@ public class KnowledgeService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private KbActivityService activityService;
 
+    /**
+     * 知识库画像自动生成触发器（2026-11-11）。
+     *
+     * <p>同上：字段注入，为 null 只出现在直构测试里，生产恒已装配。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.kb.app.profile.KbProfileTrigger profileTrigger;
+
     public KnowledgeService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -420,6 +428,12 @@ public class KnowledgeService {
                 "success", "knowledge", id, null);
         }
         log.info("[知识] 已删除（索引 + 子表 + 主行）id={} kb={}", id, row.getKnowledgeBaseId());
+
+        // ⭐ 2026-11-11：文档删除后重算知识库画像（源站 knowledge_delete.go:657）。
+        //    ⚠️ 失败不抛：文档已经删成功，画像是旁路能力。
+        if (profileTrigger != null) {
+            profileTrigger.trigger(row.getKnowledgeBaseId(), false);
+        }
     }
 
     /**

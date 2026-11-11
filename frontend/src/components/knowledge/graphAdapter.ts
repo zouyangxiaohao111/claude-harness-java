@@ -119,3 +119,157 @@ export function buildGraphView(
 
   return { nodes, edges, truncated, nodeCount: kept.length }
 }
+
+// ══════════════════════════════════════════════════════════════
+// SVG 引擎（KbWikiGraph）输入 —— 关系图谱复用 Wiki 图谱的动画与交互
+// ══════════════════════════════════════════════════════════════
+
+/**
+ * 实体类型 → Wiki 图谱的视觉类型。
+ *
+ * <p>⭐ 关系图谱「按 Wiki 图谱动画样式来」（用户 2026-11-11 要求）⇒ 直接复用
+ * `KbWikiGraph` 的六类视觉方案，实体类型只需要落到其中三类：
+ * <ul>
+ *   <li>{@code concept}（橙）—— 抽象概念：Concept / Category / Work</li>
+ *   <li>{@code entity}（绿）—— 其余具体实体</li>
+ *   <li>{@code summary}（蓝）—— 文档节点（关系图谱的 hub）</li>
+ * </ul>
+ *
+ * <p>⛔ 不在这里返回 {@code undefined}：颜色查表要有键，否则节点会变灰点。
+ */
+export function entityTypeToSvgType(entityType: string | undefined): string {
+  switch ((entityType || '').trim()) {
+    case 'Concept':
+    case 'Category':
+    case 'Work':
+      return 'concept'
+    default:
+      return 'entity'
+  }
+}
+
+/** SVG 图谱画布的一行节点（形状对齐 `KbWikiGraph` 的 `GraphNodeLike`）。 */
+export interface SvgGraphNode {
+  /** 唯一键：实体 `e:<id>` / 文档 `k:<id>`。 */
+  slug: string
+  title: string
+  type: string
+  /** 与 Wiki 图谱同口径：**有向边原始行**里该节点出现的次数。 */
+  linkCount: number
+}
+
+/** SVG 图谱画布的一条边。 */
+export interface SvgGraphEdge {
+  source: string
+  target: string
+  /** 反向边也存在 ⇒ 两端都画箭头。 */
+  bidir: boolean
+}
+
+/** SVG 图谱画布输入（= `KbWikiGraph` 的 `GraphData`）。 */
+export interface SvgGraphData {
+  total: number
+  nodes: SvgGraphNode[]
+  edges: SvgGraphEdge[]
+}
+
+/** 实体 slug 前缀（避免与文档 id 撞键）。 */
+export const ENTITY_SLUG = 'e:'
+/** 文档 slug 前缀。 */
+export const DOC_SLUG = 'k:'
+
+/**
+ * 后端 `GraphSearchResult` → SVG 图谱画布输入。
+ *
+ * <p>与 {@link buildGraphView} 的区别：那份给 canvas 星图用（`core` 根节点 + 5 类），
+ * 这份给 **Wiki 图谱那套 SVG 引擎**用（文档作 hub、实体挂靠、关系为边）。
+ *
+ * <p>⭐ 为什么把**文档**也画出来：实体来自不同文档，若不画文档层，图上只有一堆
+ * 互不相连的实体团；画了文档 hub 之后才有「文档 → 实体 → 关系」的层次，
+ * 与 Wiki 图谱「摘要 → 实体 → 概念」的观感一致。
+ *
+ * <p>⚠️ 截断：超过 {@link MAX_RENDER_NODES} 时按度数（关系数）取前 N，
+ * 否则上千实体画出来是一块糊。调用方拿 `truncated` 显式告诉用户。
+ */
+export function buildSvgGraph(
+  result: GraphSearchResult | null,
+  docTitles: Map<string, string> = new Map()
+): SvgGraphData & { truncated: boolean } {
+  const entities = result?.entities ?? []
+  if (entities.length === 0) {
+    return { total: 0, nodes: [], edges: [], truncated: false }
+  }
+
+  // ── ① 度数：关系两端各记 1（与 KbWikiGraph.mapGraph 同口径）
+  const degree = new Map<string, number>()
+  entities.forEach((e) => degree.set(e.id, 0))
+  const rels = (result?.relationships ?? []).filter(
+    (r) => degree.has(r.source_id) && degree.has(r.target_id)
+  )
+  rels.forEach((r) => {
+    degree.set(r.source_id, (degree.get(r.source_id) ?? 0) + 1)
+    degree.set(r.target_id, (degree.get(r.target_id) ?? 0) + 1)
+  })
+
+  // ── ② 超量截断（按关系度数高的优先，⛔ 不是简单切片）
+  const sorted = [...entities].sort((a, b) => (degree.get(b.id) ?? 0) - (degree.get(a.id) ?? 0))
+  const truncated = sorted.length > MAX_RENDER_NODES
+  const kept = truncated ? sorted.slice(0, MAX_RENDER_NODES) : sorted
+  const keptIds = new Set(kept.map((e) => e.id))
+
+  // ── ③ 节点：文档 hub + 实体
+  const nodes: SvgGraphNode[] = []
+  const edges: SvgGraphEdge[] = []
+  const docSeen = new Set<string>()
+  for (const e of kept) {
+    if (e.knowledge_id && !docSeen.has(e.knowledge_id)) {
+      docSeen.add(e.knowledge_id)
+      nodes.push({
+        slug: DOC_SLUG + e.knowledge_id,
+        /* ⚠️ 取不到标题 = 这篇文档已删除（实体行还在）。⛔ 不能回落到「文档」——
+           那看起来像个真标题，用户会以为是文档名就叫「文档」。 */
+        title: docTitles.get(e.knowledge_id) || '（文档已删除）',
+        type: 'summary',
+        linkCount: 0,
+      })
+    }
+    nodes.push({
+      slug: ENTITY_SLUG + e.id,
+      title: e.name,
+      type: entityTypeToSvgType(e.entity_type),
+      linkCount: degree.get(e.id) ?? 0,
+    })
+    if (e.knowledge_id) {
+      edges.push({
+        source: DOC_SLUG + e.knowledge_id,
+        target: ENTITY_SLUG + e.id,
+        bidir: false,
+      })
+    }
+  }
+
+  // ── ④ 实体间关系（两端都必须在 kept 里，否则会画出悬空边）
+  const pairSet = new Set(rels.map((r) => r.source_id + '→' + r.target_id))
+  const seen = new Set<string>()
+  for (const r of rels) {
+    if (!keptIds.has(r.source_id) || !keptIds.has(r.target_id)) continue
+    const key = [r.source_id, r.target_id].sort().join('↔')
+    if (seen.has(key)) continue
+    seen.add(key)
+    edges.push({
+      source: ENTITY_SLUG + r.source_id,
+      target: ENTITY_SLUG + r.target_id,
+      bidir: pairSet.has(r.target_id + '→' + r.source_id),
+    })
+  }
+
+  // ── ⑤ 文档 hub 的度数 = 它挂靠的实体数（供节点半径使用）
+  const byNode = new Map<string, SvgGraphNode>(nodes.map((n) => [n.slug, n]))
+  nodes.forEach((n) => {
+    if (n.type !== 'summary') return
+    n.linkCount = edges.filter((e) => e.source === n.slug).length
+    byNode.set(n.slug, n)
+  })
+
+  return { total: entities.length, nodes, edges, truncated }
+}

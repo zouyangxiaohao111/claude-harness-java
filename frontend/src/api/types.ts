@@ -90,6 +90,15 @@ export interface Model {
   rerankTopN?: number | null
   /** 重排默认指令（仅 type=rerank 生效 · models.rerank_instruct）；null/空 = 不发送 */
   rerankInstruct?: string | null
+  /**
+   * 所属提供商 ID · `models.provider_id`。
+   *
+   * <p>⭐ 2026-11-11 用户裁定：模型选择项显示成 `provider/modelName`，
+   * 否则同名模型（实测 `deepseek-v4.1-flash` 有三个 provider 各一份）在下拉里分不清。
+   */
+  providerId?: string | null
+  /** 所属提供商显示名 · `providers.name`（provider 已删 ⇒ null，显示时回退 providerId） */
+  providerName?: string | null
 }
 
 export interface CreateModelRequest {

@@ -145,7 +145,10 @@ public class KbQuestionGenerationService {
         if (kb == null) {
             return KbPostProcessOutcome.skipped("kb_not_found");
         }
-        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb);
+        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb,
+            modelConfigResolver == null ? null
+                : modelConfigResolver.settingsTierModelName(
+                    com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName));
         if (!config.question().runnable()) {
             return KbPostProcessOutcome.skipped("question_disabled");
         }

@@ -1455,7 +1455,11 @@ public record AttachmentMessageDto(
     public static AttachmentMessageDto dateChange(String newDate) {
         return new AttachmentMessageDto(
             null, "attachment", "date_change",
-            "The date has changed. Today's date is now " + newDate + ".",
+            // [对齐 CC 2.1.322 · mLt offset 299045186] changed 分支逐字（em-dash U+2014）。
+            // ⛔ 旧文案 `DO NOT mention this to the user explicitly because they are already aware.`
+            //   是 2.1.88 的版本，真源已改。
+            "The date has changed. Today's date is now " + newDate + ". "
+                + "No need to announce the new date \u2014 the user's own clock shows it.",
             null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, 0, false,
             null, null, null, false, false, null, null, null, null, null, null,

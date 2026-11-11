@@ -652,6 +652,8 @@ public class loadAgentsDir {
         if (disallowedTools != null) builder.disallowedTools(disallowedTools);
 
         // skills · CC :684 parseSlashCommandToolsFromFrontmatter (缺/空 = [])
+        //   语义与 CC / CCB 一致：「未声明」与「skills: []」都解析成 []（不可分，也不需要分）。
+        //   预加载 0 个；通告侧不读本字段（全量照常通告）。
         builder.skills(ParseSkillFrontmatter.parseSlashCommandToolsFromFrontmatter(fm.get("skills")));
 
         // initialPrompt · CC :699
@@ -1303,6 +1305,7 @@ public class loadAgentsDir {
             builder.maxTurns(maxTurnsNum.intValue());
         }
         // skills · CC :90
+        //   缺省与 [] 均不设置（= 不预加载）；通告侧不读本字段。
         if (definition.get("skills") instanceof List<?> skillsList && !skillsList.isEmpty()) {
             List<String> skills = new ArrayList<>();
             for (Object item : skillsList) {

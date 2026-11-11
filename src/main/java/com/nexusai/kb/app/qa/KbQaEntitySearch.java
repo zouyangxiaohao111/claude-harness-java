@@ -5,14 +5,15 @@ import com.nexusai.kb.app.retrieval.KbHybridSearcher;
 import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.entity.KbGraphEntityRecord;
 import com.nexusai.kb.repo.entity.KbGraphRelationRecord;
+import com.nexusai.kb.app.graph.store.KbGraphStore;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
-import com.nexusai.kb.repo.mapper.KbGraphEntityMapper;
-import com.nexusai.kb.repo.mapper.KbGraphRelationMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
+import java.util.Comparator;
+import java.util.HashSet;
 import java.util.HashMap;
 import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
@@ -48,20 +49,55 @@ public class KbQaEntitySearch {
 
     private static final Logger log = LoggerFactory.getLogger(KbQaEntitySearch.class);
 
-    /** 单个实体最多带出的证据块数（防高度数实体把上下文灌满）。 */
+    /**
+     * 单次检索的种子实体上限（对齐源站 {@code graphSearchMaxSeedNodes = 200}）。
+     *
+     * <p>⭐ 为什么必须有它：匹配是<b>子串</b>（{@code LIKE '%x%'}）。抽出一个宽泛词
+     * （「公司」「项目」）会把库里几乎所有实体捞进来，每个再带出若干块。
+     * 源站注释记录了真实事故：<i>「without a bound this returned 1309 nodes / 1917
+     * relations for a single query, which then exceeded the reranker's per-request limit
+     * and made chunk_merge walk the entire set」</i>。
+     */
+    static final int MAX_SEED_NODES = 200;
+
+    /**
+     * 一次检索最多展开的关系行数（对齐源站 {@code graphSearchMaxRows = 2000}）。
+     *
+     * <p>即使种子只有 200 个，hub 实体（度 36 的实测值）的邻域也可能很大。
+     */
+    static final int MAX_ROWS = 2000;
+
+    /**
+     * 一次检索最多带进上下文的块数（对齐源站 {@code maxEntityChunks = 30}）。
+     *
+     * <p>⚠️ 这是<b>总量</b>上限，不是每实体上限 —— 源站没有 per-entity 限制，
+     * 按节点顺序先到先得。此处照抄（⛔ 不要自己加一层 per-entity 上限，
+     * 那会让「排在后面的实体永远拿不到块」，与源站行为不一致）。
+     */
+    static final int MAX_TOTAL_CHUNKS = 30;
+
+    /**
+     * {@link #mergeByChunk} 的单实体上限（仅该纯函数/单测使用）。
+     *
+     * <p>⚠️ 生产主路径（{@code searchOneKb}）已改为「总量 30」以对齐源站
+     * {@code maxEntityChunks}，⛔ 不要把这个 per-entity 上限加回生产路径 ——
+     * 那会让排在后面的实体永远拿不到块。
+     */
     static final int MAX_CHUNKS_PER_ENTITY = 5;
 
-    private final KbGraphEntityMapper entityMapper;
-    private final KbGraphRelationMapper relationMapper;
+    /**
+     * 图谱存储（本地 SQLite 或远程 Neo4j，由 {@code KbGraphStore} 决定）。
+     *
+     * <p>⭐ 2026-11-11 抽接口：本类原来直连 {@code KbGraphEntityMapper} /
+     * {@code KbGraphRelationMapper}，接远程 Neo4j 时这里必须跟着改。
+     * 现在只依赖 {@link KbGraphStore} 的两个读方法（{@code listEntities} /
+     * {@code listRelations}），两种实现都能用。
+     */
+    private final KbGraphStore graphStore;
     private final KbChunkMapper chunkMapper;
 
-    public KbQaEntitySearch(
-        KbGraphEntityMapper entityMapper,
-        KbGraphRelationMapper relationMapper,
-        KbChunkMapper chunkMapper
-    ) {
-        this.entityMapper = entityMapper;
-        this.relationMapper = relationMapper;
+    public KbQaEntitySearch(KbGraphStore graphStore, KbChunkMapper chunkMapper) {
+        this.graphStore = graphStore;
         this.chunkMapper = chunkMapper;
     }
 
@@ -154,142 +190,308 @@ public class KbQaEntitySearch {
     }
 
     private void searchOneKb(String kbId, List<String> names, Map<String, EntityHit> byChunk) {
-        List<KbGraphEntityRecord> entities;
-        try {
-            // name LIKE '%<query>%' OR ... ：SQL 骨架只用 '?' 占位（⛔ 不插用户文本，无注入面）
-            StringBuilder sql = new StringBuilder("(");
-            List<Object> args = new ArrayList<>();
-            for (String n : names) {
-                if (n == null || n.isBlank()) {
-                    continue;
-                }
-                if (!args.isEmpty()) {
-                    sql.append(" OR ");
-                }
-                sql.append("name LIKE ?");
-                args.add("%" + escapeLike(n) + "%");
-            }
-            sql.append(")");
-            if (args.isEmpty()) {
-                // 全部名字为空 ⇒ 没有可查条件。⛔ 不能拼出 "()"（SQL 语法错）；
-                //    调用方已保证 names 非空，走到这里只可能是全空白，直接当作无命中。
-                return;
-            }
-            QueryWrapper q = QueryWrapper.create()
-                .where("knowledge_base_id = ?", kbId)
-                .and(sql.toString(), args.toArray());
-            entities = entityMapper.selectListByQuery(q);
-        } catch (RuntimeException ex) {
-            log.warn("[问答链] ④c 查实体失败，跳过该库 kb={} 原因={}", kbId, ex.getMessage());
-            return;
-        }
-        if (entities == null || entities.isEmpty()) {
-            return;
-        }
-        // ⭐ 精确名优先（源侧 ORDER BY seed_rank）：完全相等的实体排在前面，
-        //   保证「高分证据」先占 chunkIds 的插入顺序 ⇒ 阶段 8 保序截断时先留下。
-        Set<String> exact = new LinkedHashSet<>(names);
-        entities.sort((a, b) -> {
-            boolean ea = a != null && exact.contains(a.getName());
-            boolean eb = b != null && exact.contains(b.getName());
-            if (ea != eb) {
-                return ea ? -1 : 1;   // 精确的在前
-            }
-            // 同档内按名字长度升序（源侧 name_len）：短名更具体，先取
-            int la = a == null || a.getName() == null ? Integer.MAX_VALUE : a.getName().length();
-            int lb = b == null || b.getName() == null ? Integer.MAX_VALUE : b.getName().length();
-            return Integer.compare(la, lb);
-        });
-        // 名字 → 该实体直接关联的块
-        Map<String, List<String>> chunkIds = new LinkedHashMap<>();
-        for (KbGraphEntityRecord e : entities) {
-            if (e == null) {
-                continue;
-            }
-            List<String> ids = parseList(e.getChunkIds());
-            if (ids.size() > MAX_CHUNKS_PER_ENTITY) {
-                ids = new ArrayList<>(ids.subList(0, MAX_CHUNKS_PER_ENTITY));
-            }
-            if (!ids.isEmpty()) {
-                chunkIds.put(e.getName(), ids);
-            }
-        }
-        // 关系两端都在本次实体里 ⇒ 把关系挂的块也带进来（源侧同一跳语义）
-        try {
-            List<KbGraphRelationRecord> rels = relationMapper.selectListByQuery(QueryWrapper.create()
-                .where("knowledge_base_id = ?", kbId));
-            Set<String> known = chunkIds.keySet();
-            for (KbGraphRelationRecord r : rels) {
-                if (r == null) {
-                    continue;
-                }
-                boolean hit = known.contains(r.getSourceName()) || known.contains(r.getTargetName());
-                if (!hit) {
-                    continue;
-                }
-                List<String> ids = parseList(r.getChunkIds());
-                if (ids.isEmpty()) {
-                    continue;
-                }
-                String via = known.contains(r.getSourceName()) ? r.getSourceName() : r.getTargetName();
-                chunkIds.computeIfAbsent(via, k -> new ArrayList<>()).addAll(ids);
-            }
-        } catch (RuntimeException ex) {
-            // 关系表读失败不影响「实体直接关联块」这一路
-            log.warn("[问答链] ④c 查关系失败，只用实体块 kb={} 原因={}", kbId, ex.getMessage());
-        }
-        if (chunkIds.isEmpty()) {
+        // ── ① 子串匹配候选实体 ────────────────────────────────────────
+        List<KbGraphEntityRecord> matched = queryMatchedEntities(kbId, names);
+        if (matched.isEmpty()) {
             return;
         }
 
-        // 收集所有待回填的块 id
-        Set<String> wanted = new LinkedHashSet<>();
-        for (List<String> ids : chunkIds.values()) {
-            wanted.addAll(ids);
+        // ── ② 本库关系表：既用来判「有无关系」，也用来求一跳邻居 ─────────
+        //    源侧 Cypher 里 `EXISTS { (n)--() }` 与 `MATCH (n)-[r]-(m)` 都来自同一张边集，
+        //    所以一次读全库关系即可（本库实体量远小于全库，且已有 try/catch fail-soft）。
+        List<KbGraphRelationRecord> rels = queryRelations(kbId);
+        Set<String> related = new HashSet<>();
+        Map<String, List<String>> neighbours = new HashMap<>();
+        for (KbGraphRelationRecord r : rels) {
+            String src = r.getSourceName();
+            String dst = r.getTargetName();
+            if (src == null || src.isBlank() || dst == null || dst.isBlank()) {
+                continue;
+            }
+            related.add(src);
+            related.add(dst);
+            neighbours.computeIfAbsent(src, k -> new ArrayList<>()).add(dst);
+            neighbours.computeIfAbsent(dst, k -> new ArrayList<>()).add(src);
         }
+        if (related.isEmpty()) {
+            // 整库一条边都没有 ⇒ 实体路必然无结果（源侧 EXISTS 子句同样返回空）
+            return;
+        }
+
+        // ── ③ 种子实体：只留「有关系」的，按源侧 ORDER BY 排序后截 200 ────
+        //    源侧：`ORDER BY seed_rank, name_len, name, n.kg, elementId(n) LIMIT 200`。
+        //    前三级（精确名 → 名字短 → 字典序）决定「谁进 200」，后两级（kg / 元素 id）
+        //    只是同前三级的确定性兜底 —— 缺了它们，同名前缀的实体每次顺序可能不同。
+        Set<String> exact = new LinkedHashSet<>(names);
+        Comparator<KbGraphEntityRecord> order = Comparator
+            .comparingInt((KbGraphEntityRecord e) -> exact.contains(e.getName()) ? 0 : 1)
+            .thenComparingInt(e -> e.getName() == null ? Integer.MAX_VALUE : e.getName().length())
+            .thenComparing(e -> nz(e.getName()))
+            .thenComparing(e -> nz(e.getKnowledgeId()))
+            .thenComparing(e -> nz(e.getId()));
+        List<KbGraphEntityRecord> seeds = new ArrayList<>();
+        for (KbGraphEntityRecord e : matched) {
+            if (e == null || e.getName() == null || !related.contains(e.getName())) {
+                continue;
+            }
+            seeds.add(e);
+        }
+        seeds.sort(order);
+        boolean seedsTruncated = seeds.size() > MAX_SEED_NODES;
+        if (seedsTruncated) {
+            seeds = new ArrayList<>(seeds.subList(0, MAX_SEED_NODES));
+        }
+        if (seeds.isEmpty()) {
+            return;
+        }
+
+        // ── ④ 节点顺序：种子先（按上面的排序），再按种子顺序展开邻居 ─────────
+        //    源侧 decodeGraphSearchResult 把 `n`（种子）和 `m`（邻居）**都**放进 graph.Node，
+        //    filterSeenChunk 随后遍历 `graph.Node[].Chunks` ⇒ 邻居实体**自己的块**也会被取用。
+        //    ⚠️ 我们此前只取「关系行上的 chunk_ids」，与源站不等价：邻居实体在别的文档里
+        //       反复出现时（自身 chunks 多），关系行只记「这条边在哪抽出来的」（通常 1 个）
+        //       ⇒ 召回系统性偏少。此轮改为取节点自身的 chunks。
+        LinkedHashSet<String> nodeOrder = new LinkedHashSet<>();
+        for (KbGraphEntityRecord seed : seeds) {
+            nodeOrder.add(seed.getName());
+        }
+        int rowBudget = MAX_ROWS;
+        boolean rowsTruncated = false;
+        for (KbGraphEntityRecord seed : seeds) {
+            List<String> ns = neighbours.get(seed.getName());
+            if (ns == null) {
+                continue;
+            }
+            for (String n : ns) {
+                if (rowBudget <= 0) {
+                    rowsTruncated = true;
+                    break;
+                }
+                rowBudget--;
+                nodeOrder.add(n);
+            }
+            if (rowsTruncated) {
+                break;
+            }
+        }
+
+        // ── ⑤ 取所有节点（种子 + 邻居）各自的 chunks ─────────────────────
+        //    种子行已经在手（matched 里），只有邻居需要补查。
+        Set<String> seedNames = new LinkedHashSet<>();
+        for (KbGraphEntityRecord seed : seeds) {
+            seedNames.add(seed.getName());
+        }
+        Map<String, List<String>> chunksByNode = new LinkedHashMap<>();
+        for (KbGraphEntityRecord seed : seeds) {
+            List<String> ids = parseList(seed.getChunkIds());
+            if (!ids.isEmpty()) {
+                chunksByNode.put(seed.getName(), ids);
+            }
+        }
+        List<String> neighbourNames = new ArrayList<>();
+        for (String n : nodeOrder) {
+            if (!seedNames.contains(n)) {
+                neighbourNames.add(n);
+            }
+        }
+        if (!neighbourNames.isEmpty()) {
+            for (KbGraphEntityRecord nb : queryEntitiesByNames(kbId, neighbourNames)) {
+                if (nb == null || nb.getName() == null || seedNames.contains(nb.getName())) {
+                    continue;
+                }
+                List<String> ids = parseList(nb.getChunkIds());
+                if (!ids.isEmpty()) {
+                    chunksByNode.putIfAbsent(nb.getName(), ids);
+                }
+            }
+        }
+
+        // ── ⑥ 按节点顺序收集块，总量封顶 30（源侧 maxEntityChunks）─────────
+        Map<String, List<String>> viaByChunk = new LinkedHashMap<>();
+        int budget = MAX_TOTAL_CHUNKS;
+        boolean chunksTruncated = false;
+        for (String node : nodeOrder) {
+            List<String> ids = chunksByNode.get(node);
+            if (ids == null) {
+                continue;
+            }
+            for (String cid : ids) {
+                if (cid == null || cid.isBlank()) {
+                    continue;
+                }
+                if (viaByChunk.containsKey(cid)) {
+                    // 同一块被多个节点带出 ⇒ 记下全部来源（分数仍为 0）
+                    List<String> via = viaByChunk.get(cid);
+                    if (!via.contains(node)) {
+                        via.add(node);
+                    }
+                    continue;
+                }
+                if (budget <= 0) {
+                    chunksTruncated = true;
+                    break;
+                }
+                budget--;
+                List<String> via = new ArrayList<>(1);
+                via.add(node);
+                viaByChunk.put(cid, via);
+            }
+            if (chunksTruncated) {
+                break;
+            }
+        }
+        if (viaByChunk.isEmpty()) {
+            return;
+        }
+
+        // ── ⑦ 回填块内容（只收「启用且属于本库」的块）─────────────────────
         Map<String, KbChunkRecord> rows;
         try {
             List<KbChunkRecord> got = chunkMapper.selectListByQuery(
-                QueryWrapper.create().in("id", wanted));
+                QueryWrapper.create().in("id", viaByChunk.keySet()));
             rows = new HashMap<>();
             for (KbChunkRecord c : got) {
-                if (c != null && c.getId() != null) {
-                    // ⚠️ 只收「启用且属于本库」的块：图谱里可能残留已删/已禁用块的 id
-                    if (isDisabled(c)) {
-                        continue;
-                    }
-                    if (c.getKnowledgeBaseId() != null && !kbId.equals(c.getKnowledgeBaseId())) {
-                        continue;
-                    }
-                    rows.put(c.getId(), c);
+                if (c == null || c.getId() == null) {
+                    continue;
                 }
+                // ⚠️ 图谱里可能残留已删/已禁用块的 id（源侧同样在 filterSeenChunk 后校验 IsEnabled）
+                if (isDisabled(c)) {
+                    continue;
+                }
+                if (c.getKnowledgeBaseId() != null && !kbId.equals(c.getKnowledgeBaseId())) {
+                    continue;
+                }
+                rows.put(c.getId(), c);
             }
         } catch (RuntimeException ex) {
             log.warn("[问答链] ④c 回填块失败，跳过该库 kb={} 原因={}", kbId, ex.getMessage());
             return;
         }
 
-        for (Map.Entry<String, List<String>> e : chunkIds.entrySet()) {
-            for (String cid : e.getValue()) {
-                KbChunkRecord c = rows.get(cid);
-                if (c == null) {
-                    continue;  // 块已删/禁用 ⇒ 静默跳过
+        for (Map.Entry<String, List<String>> e : viaByChunk.entrySet()) {
+            KbChunkRecord c = rows.get(e.getKey());
+            if (c == null) {
+                continue;  // 块已删/禁用 ⇒ 静默跳过
+            }
+            EntityHit prev = byChunk.get(c.getId());
+            if (prev == null) {
+                byChunk.put(c.getId(), new EntityHit(
+                    c.getId(), c.getKnowledgeId(), c.getContent(), c.getContextHeader(),
+                    0.0, new ArrayList<>(e.getValue())));
+            } else {
+                // 跨库/跨实体重复命中 ⇒ 合并来源，分数仍为 0
+                List<String> via = new ArrayList<>(prev.viaEntities());
+                for (String v : e.getValue()) {
+                    if (!via.contains(v)) {
+                        via.add(v);
+                    }
                 }
-                EntityHit prev = byChunk.get(cid);
-                if (prev == null) {
-                    byChunk.put(cid, new EntityHit(
-                        c.getId(), c.getKnowledgeId(), c.getContent(), c.getContextHeader(),
-                        0.0, new ArrayList<>(List.of(e.getKey()))));
-                } else if (!prev.viaEntities().contains(e.getKey())) {
-                    // 同一块被多个实体带出 ⇒ 记录全部来源，分数仍为 0
-                    List<String> via = new ArrayList<>(prev.viaEntities());
-                    via.add(e.getKey());
-                    byChunk.put(cid, new EntityHit(prev.chunkId(), prev.knowledgeId(),
-                        prev.content(), prev.contextHeader(), 0.0, via));
+                byChunk.put(c.getId(), new EntityHit(prev.chunkId(), prev.knowledgeId(),
+                    prev.content(), prev.contextHeader(), 0.0, via));
+            }
+        }
+
+        if (log.isInfoEnabled()) {
+            log.info("[问答链] ④c 实体检索 kb={} 匹配={} 种子={}{} 节点={} 块={}{}",
+                kbId, matched.size(), seeds.size(),
+                seedsTruncated ? "(截断自 " + matched.size() + "，上限 " + MAX_SEED_NODES + ")" : "",
+                nodeOrder.size(), viaByChunk.size(),
+                (rowsTruncated || chunksTruncated) ? "（达到上限，已截断）" : "");
+        }
+    }
+
+    /**
+     * 子串匹配候选实体（源侧 {@code n.name CONTAINS nodeText}）。失败 ⇒ 空表。
+     *
+     * <p>⭐ 2026-11-11 抽接口后改为「取该库全量实体 + 内存子串过滤」：
+     * <ul>
+     *   <li><b>为什么不再让 SQL 做 LIKE</b>：远程 Neo4j 实现也要遵守同一语义，
+     *       若在这里用 SQL 通配符，Neo4j 那边就得重写一遍匹配逻辑，两边容易分叉；</li>
+     *   <li><b>代价可控</b>：本库实体数在千级（实测 253），全量拉回再过滤远低于一次往返开销；
+     *       真正的边界是种子上限 200，与这里无关。</li>
+     * </ul>
+     * ⚠️ 仍保留 {@link #escapeLike} 的语义对照 —— 内存过滤天然无通配符问题。
+     */
+    private List<KbGraphEntityRecord> queryMatchedEntities(String kbId, List<String> names) {
+        List<String> needles = new ArrayList<>();
+        for (String n : names) {
+            if (n != null && !n.isBlank()) {
+                needles.add(n.trim());
+            }
+        }
+        if (needles.isEmpty()) {
+            return List.of();
+        }
+        List<KbGraphEntityRecord> all;
+        try {
+            all = graphStore.listEntities(kbId);
+        } catch (RuntimeException ex) {
+            log.warn("[问答链] ④c 查实体失败，跳过该库 kb={} 原因={}", kbId, ex.getMessage());
+            return List.of();
+        }
+        if (all == null || all.isEmpty()) {
+            return List.of();
+        }
+        List<KbGraphEntityRecord> out = new ArrayList<>();
+        for (KbGraphEntityRecord e : all) {
+            if (e == null || e.getName() == null) {
+                continue;
+            }
+            for (String needle : needles) {
+                if (e.getName().contains(needle)) {
+                    out.add(e);
+                    break;
                 }
             }
         }
+        return out;
     }
+
+    /**
+     * 按精确名字取实体（用于取邻居节点自身的 chunks）。失败 ⇒ 空表。
+     *
+     * <p>同上：从 store 取全量后在内存里按名字集合过滤，保证两种存储实现语义一致。
+     */
+    private List<KbGraphEntityRecord> queryEntitiesByNames(String kbId, List<String> names) {
+        if (names == null || names.isEmpty()) {
+            return List.of();
+        }
+        Set<String> wanted = new HashSet<>(names);
+        List<KbGraphEntityRecord> all;
+        try {
+            all = graphStore.listEntities(kbId);
+        } catch (RuntimeException ex) {
+            // 拿不到邻居块不影响「种子实体自己的块」这一路
+            log.warn("[问答链] ④c 查邻居实体失败 kb={} 原因={}", kbId, ex.getMessage());
+            return List.of();
+        }
+        if (all == null || all.isEmpty()) {
+            return List.of();
+        }
+        List<KbGraphEntityRecord> out = new ArrayList<>();
+        for (KbGraphEntityRecord e : all) {
+            if (e != null && e.getName() != null && wanted.contains(e.getName())) {
+                out.add(e);
+            }
+        }
+        return out;
+    }
+
+    /** 本库全部关系（判「有无关系」+ 求一跳邻居共用）。失败 ⇒ 空表。 */
+    private List<KbGraphRelationRecord> queryRelations(String kbId) {
+        try {
+            List<KbGraphRelationRecord> got = graphStore.listRelations(kbId);
+            return got == null ? List.of() : got;
+        } catch (RuntimeException ex) {
+            log.warn("[问答链] ④c 查关系失败 kb={} 原因={}", kbId, ex.getMessage());
+            return List.of();
+        }
+    }
+
+    private static String nz(String s) {
+        return s == null ? "" : s;
+    }
+
 
     /**
      * 把「实体名 → 块 id 列表」压成「块 id → 经由哪些实体」。
@@ -299,7 +501,8 @@ public class KbQaEntitySearch {
      *   <li><b>跨实体去重</b>：同一块被两个实体带出时只保留一条命中，但要把两个实体都记下来
      *       （否则排查时看不出「为什么这块进来了」）；</li>
      *   <li><b>保序</b>：顺序 = 实体出现顺序 + 组内块顺序，⛔ 用 HashMap 会打乱；</li>
-     *   <li><b>上限</b>：单实体最多 {@link #MAX_CHUNKS_PER_ENTITY} 块，防高度数实体灌满上下文。</li>
+     *   <li><b>上限</b>：单实体最多 {@link #MAX_CHUNKS_PER_ENTITY} 块（此函数只服务单测/兜底，
+ *       生产主路径已改为 {@code MAX_TOTAL_CHUNKS} 总量上限，对齐源侧 maxEntityChunks）。</li>
      * </ol>
      *
      * @param chunkIdsByEntity 实体名 → 关联块 id（可含重复/空）

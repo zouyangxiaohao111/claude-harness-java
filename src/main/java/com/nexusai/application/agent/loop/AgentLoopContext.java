@@ -4347,13 +4347,16 @@ public record AgentLoopContext(
             //   messages.ts:3097-3100）；九分支 Java 均无 producer（Web N/A）→ 防御纯渲染
             //   （对齐批次G directory/diagnostics 范式），producer 接线登记各域未来。
             case "date_change": {
-                // CC messages.ts:4163-4167 case 'date_change'：content = `The date has changed. Today's
-                //   date is now ${attachment.newDate}. DO NOT mention this to the user explicitly because
-                //   they are already aware.`（wrapMessagesInSystemReminder + isMeta）。撇号 's 逐字。
+                // [对齐 CC 2.1.322 · mLt offset 299045186] changed 分支逐字：
+                //   `The date has changed. Today's date is now ${e.date}. No need to announce the new date
+                //    \u2014 the user's own clock shows it.`
+                // ⛔ 旧文案（2.1.88）是 `DO NOT mention this to the user explicitly because they are
+                //   already aware.`，且外层包 <system-reminder>。2.1.322 的 date 附件是**裸内容**
+                //   （只有 session_context 那类才包 system-reminder）⇒ 本 case 不再包裹。
                 String dc = a.dateChange();
                 return (dc == null || dc.isBlank()) ? null
-                    : "<system-reminder>\nThe date has changed. Today's date is now " + dc
-                        + ". DO NOT mention this to the user explicitly because they are already aware.\n</system-reminder>";
+                    : "The date has changed. Today's date is now " + dc + ". "
+                        + "No need to announce the new date \u2014 the user's own clock shows it.";
             }
             case "ultrathink_effort": {
                 // CC messages.ts:4168-4172 case 'ultrathink_effort'：content = `The user has requested
@@ -4664,47 +4667,149 @@ public record AgentLoopContext(
      *              {@code appendMessage} 提供尾部投递通道）
      */
     public static void maybeEmitDateChange(AgentState state) {
+        // CC {@code Ci(e,n,{querySource,...})}：querySource 只用于 auxiliary 分类；
+        // 无来源（null）时 CC {@code ns(undefined)} 返回 undefined ⇒ 非 auxiliary ⇒ 走「有变化即发」。
+        maybeEmitDateChange(state, null);
+    }
+
+    /**
+     * 日期附件投递（带 querySource 分类）· 对齐 CC 2.1.322 {@code Ci}
+     * （exe offset 308664520 定义 / offset 308666094 日期段）。
+     *
+     * <h2>CC 真源逐字</h2>
+     * <pre>
+     * function Ci(e,n,{querySource:r,resumeActive:s,stamp:y,announcementWalk:h}){
+     *   if(s||n.bare)return[];                 // resumeActive / bare 直接不发
+     *   let S=ns(r)==="auxiliary";
+     *   ...
+     *   let Y=uPs(), oe=Fki(e);                // 今天 / 历史最后一条 date 的 date 字段
+     *   if(S? oe===undefined : oe!==Y)         // auxiliary 只看「从未发过」；其余看「有变化」
+     *     E.push(on({type:"date",date:Y,
+     *       ...oe!==undefined&&{changed:!0},
+     *       ...Ml()&&{assumedUtc:!0}},y));
+     * }
+     * </pre>
+     *
+     * <h2>本仓映射</h2>
+     * <ul>
+     *   <li>{@code changed} 用 subtype 编码：{@code !changed → "date"} / {@code changed → "date_change"}
+     *       （CC 用 boolean 字段；本仓复用既有 subtype 通道，语义一一对应）。</li>
+     *   <li>判据读<b>本 agent 自己的消息历史</b>（CC {@code Fki(e)} 的 {@code e}），不是会话级槽位 ——
+     *       子代理历史从 initialMessages 起 ⇒ 天然「从未发过」⇒ 首轮就发。</li>
+     *   <li>{@code resumeActive} / {@code bare}：CC 直接不产附件。本仓 {@link AgentState}
+     *       无等价位，故不实现（结构性 N/A）。</li>
+     * </ul>
+     *
+     * @param state       AgentState（消息历史 + appendMessage 通道）
+     * @param querySource 本次 query 来源（null ⇒ 按非 auxiliary 处理，同 CC {@code ns(undefined)}）
+     */
+    public static void maybeEmitDateChange(AgentState state,
+                                           com.nexusai.application.agent.QuerySource querySource) {
         if (state == null) {
+            return;
+        }
+        // [对齐 CC 2.1.322 · Ci 开头] {@code if(s||n.bare)return[]} —— 共享父级 prompt 缓存的
+        //   fork/compaction 系循环**一律不发**：
+        //   · {@code n.bare}：CC {@code options.bareFork}（只有 resume_cache_warm 置 true）
+        //   · {@code s}（resumeActive）：CC compact 路径显式传 {@code resumeActive:y}
+        //     （exe offset 308671854 {@code Ci(P,w,{querySource:s,resumeActive:y,...})}）
+        //   本仓等价位 = 这些 querySource（它们都复用父上下文/前缀缓存，多一条尾部消息会
+        //   让 send 边界与父不一致）⇒ 直接不产附件。
+        //   ⛔ 少了这道门，fork/compact 契约测试会各多一条 date 消息（实测 6 红）。
+        if (isBareOrResumeForkSource(querySource)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[date] 跳过：querySource={} 属 fork/compaction 系（CC Ci 的 bare/resumeActive 门）",
+                    querySource);
+            }
             return;
         }
         com.nexusai.application.agent.prompt.SessionPromptCacheStore store = state.promptCacheStore();
         String currentDate = com.nexusai.application.agent.prompt.SessionPromptCacheStore.localIsoDate();
-        String lastDate = store.lastEmittedDate();
-        if (lastDate == null) {
-            // CC :1422-1426 —— 本会话首轮：只记录，不播报（否则每个会话开头都会白播一次）
-            store.setLastEmittedDate(currentDate);
-            if (log.isDebugEnabled()) {
-                log.debug("[date_change] 本会话首轮：只记录不播报 currentDate={} sessionId={}"
-                    + " · CC attachments.ts:1422-1426", currentDate, state.sessionId());
-            }
+        String lastDate = lastEmittedDateFromHistory(state.rawMessages());
+        boolean auxiliary = isAuxiliaryQuerySource(querySource);
+        // CC: S ? oe===undefined : oe!==Y
+        boolean shouldEmit = auxiliary
+            ? lastDate == null
+            : !currentDate.equals(lastDate);
+        if (!shouldEmit) {
             return;
         }
-        if (currentDate.equals(lastDate)) {
-            // CC :1428-1430 —— 同日：无动作（零注入，不影响前缀）
-            return;
-        }
-        // CC :1432 —— 跨午夜：先落状态（防同一 run 内多次迭代重复播报），再投递
+        // CC: ...(oe!==undefined && {changed:!0}) —— 历史有过日期才算「变更」，否则是首次告知
+        boolean changed = lastDate != null;
+        boolean assumedUtc = isAssumedUtcEnabled() && isAssumedUtc();
         store.setLastEmittedDate(currentDate);
 
         String sessionId = state.sessionId();
-        com.nexusai.application.agent.attachment.AttachmentMessageDto att =
-            com.nexusai.application.agent.attachment.AttachmentMessageDto.dateChange(currentDate);
-        String text = renderHookAttachmentForLlm(att);
-        if (text == null) {
-            // 防御：date_change 渲染 case 对新日期非空恒产文本（见该 case）；此处仅守不变量
-            log.warn("[date_change] 渲染为空（不应发生，newDate={}）⇒ 不追加 · CC messages.ts:4163-4167",
-                currentDate);
-            return;
-        }
         if (sessionId == null || sessionId.isBlank()) {
-            log.info("[date_change] 检测到跨午夜（{} -> {}）但无会话标识 ⇒ 无落库通道，不追加"
-                + "（对齐 CC simple 模式禁用附件）· CC attachments.ts:1419-1443", lastDate, currentDate);
+            if (log.isDebugEnabled()) {
+                log.debug("[date] 命中投递但无会话标识 ⇒ 只记录不投递（meta 消息落库需 sessionId）"
+                    + " date={} changed={} · CC simple(--bare) 模式禁用附件同语义", currentDate, changed);
+            }
             return;
         }
-        state.appendMessage(dateChangeMessage(sessionId, text));
-        log.info("[date_change] 跨午夜 → 尾部追加 date_change 消息（头部旧日期 {} 保持不变，绝不回写 messages[0]）: "
-            + "sessionId={} {} -> {} · CC attachments.ts:1406-1443 + query.ts:1580-1588",
-            lastDate, sessionId, lastDate, currentDate);
+        ChatMessageDto msg = dateAttachmentMessage(sessionId, currentDate, changed, assumedUtc);
+        if (msg == null) {
+            return;
+        }
+        state.appendMessage(msg);
+        log.info("[date] 尾部投递日期附件（独立消息 · 无免责声明包裹）: sessionId={} date={}"
+            + " changed={} assumedUtc={} querySource={} · 对齐 CC 2.1.322 Ci offset 308666094",
+            sessionId, currentDate, changed, assumedUtc, querySource);
+    }
+
+    /**
+     * CC {@code ns(querySource)} 的 auxiliary 分类 · 逐字对齐 exe offset 292529970：
+     * <pre>
+     * function ns(e){
+     *   if(e===void 0)return;
+     *   if(e.startsWith("repl_main_thread")||e==="sdk")return"main";
+     *   if(e.startsWith("agent:")||e==="hook_agent")return"subagent";
+     *   return"auxiliary";
+     * }
+     * </pre>
+     *
+     * <p><b>为什么 auxiliary 单独一档</b>：CC 对 auxiliary（compact / session_memory /
+     * extract_memories / auto_dream / marble_origami / workflow）只在<b>从未发过</b>时投递一次 ——
+     * 这些是短命后台查询，每次跨日重发只会污染它们的前缀。
+     *
+     * @param qs 本次 query 来源；null ⇒ false（CC {@code ns(undefined)} 返回 undefined ⇒
+     *           {@code undefined==="auxiliary"} 为假）
+     * @return true = auxiliary 档
+     */
+    static boolean isAuxiliaryQuerySource(com.nexusai.application.agent.QuerySource qs) {
+        if (qs == null) {
+            return false;
+        }
+        return switch (qs) {
+            // main（repl_main_thread* / sdk）
+            case USER, REPL_MAIN_THREAD, SDK,
+                 // subagent（agent:* / hook_agent）：WORKFLOW 的 CC 值是裸 "workflow"，
+                 // 不以 agent: 开头 ⇒ 归 auxiliary（见该枚举值的 javadoc 值域说明）
+                 SUBAGENT, FORK, HOOK_AGENT -> false;
+            // 其余一律 auxiliary
+            default -> true;
+        };
+    }
+
+    /**
+     * 「共享父级上下文的 fork/compaction 系」判据 · 对齐 CC 2.1.322 {@code Ci} 的
+     * {@code if(s||n.bare)return[]} 门（exe offset 308664520 开头）。
+     *
+     * <p>这些循环的共同点：<b>复用父级的 system prompt 字节 / 消息前缀</b>做 prompt cache 共享。
+     * 若在其中追加一条 date 尾部消息，fork 的 send 边界就会比父线程多一条 ⇒ 破坏
+     * 「fork 前缀 == 父前缀」的不变量（也是本仓 {@code ForkConvergenceCcContractTest} /
+     * {@code StreamCompactSummaryForkUserContextTest} / {@code ForkQueryLoopProviderBoundaryEquivalenceTest}
+     * 断言的消息条数契约）。
+     *
+     * @param qs querySource（null → false）
+     * @return true = 不发日期附件
+     */
+    static boolean isBareOrResumeForkSource(com.nexusai.application.agent.QuerySource qs) {
+        if (qs == null) {
+            return false;
+        }
+        return qs == com.nexusai.application.agent.QuerySource.FORK
+            || com.nexusai.application.agent.QuerySource.isBackgroundForkSource(qs);
     }
 
     /**
@@ -4735,6 +4840,172 @@ public record AgentLoopContext(
             "刚刚", java.time.OffsetDateTime.now(), null, null,
             null, java.util.List.of(), java.util.List.of(), null, true)
             .withSubtype("date_change");
+    }
+
+    /**
+     * 日期附件消息构造 · 对齐 CC 2.1.322 {@code type:"date"} 附件形态
+     * （schema exe offset 299044623：{@code u({date:o(), changed:I().optional(), assumedUtc:I().optional()})}）。
+     *
+     * <p><b>{@code changed} 用 subtype 编码</b>：CC 用 boolean 字段 {@code changed}；本仓复用既有
+     * subtype 通道 —— {@code changed=false → "date"} / {@code changed=true → "date_change"}，
+     * 语义一一对应，且与既有 {@code date_change} 消费者（前端 label、历史重放）零冲突。
+     *
+     * @param sessionId 目标会话 id（meta 消息落库必需）
+     * @param isoDate   {@code YYYY-MM-DD}（{@code SessionPromptCacheStore.localIsoDate()} 现算）
+     * @param changed   {@code 历史已有日期} ⇒ true（跨日）；首次告知 ⇒ false
+     * @param assumedUtc 是否走 UTC 文案（见 {@link #isAssumedUtc()}）
+     * @return isMeta=true 的 user 消息；isoDate 空 → null
+     */
+    public static ChatMessageDto dateAttachmentMessage(String sessionId, String isoDate,
+                                                       boolean changed, boolean assumedUtc) {
+        if (isoDate == null || isoDate.isBlank()) {
+            return null;
+        }
+        return new ChatMessageDto(
+            UUID.randomUUID().toString(), sessionId, Role.user, "attachment",
+            dateAttachmentText(isoDate, changed, assumedUtc),
+            null, java.util.List.of(), null, null, null,
+            "刚刚", java.time.OffsetDateTime.now(), null, null,
+            null, java.util.List.of(), java.util.List.of(), null, true)
+            .withSubtype(changed ? "date_change" : "date");
+    }
+
+    /**
+     * 首轮日期消息（{@code changed=false, assumedUtc=false}）· 便捷重载。
+     *
+     * @param sessionId 目标会话 id
+     * @param isoDate   {@code YYYY-MM-DD}
+     * @return 等价于 {@code dateAttachmentMessage(sessionId, isoDate, false, false)}
+     */
+    public static ChatMessageDto todayDateMessage(String sessionId, String isoDate) {
+        return dateAttachmentMessage(sessionId, isoDate, false, false);
+    }
+
+    /**
+     * 日期附件正文 · 逐字对齐 CC 2.1.322 {@code mLt}（exe offset 299045186）。
+     *
+     * <p>四分支（CC 原文逐字，含 em-dash U+2014）：
+     * <ul>
+     *   <li>assumedUtc + changed：{@code The UTC date is now X. The user's local date can differ. …}</li>
+     *   <li>assumedUtc + !changed：{@code The UTC date is X. The user's local date can differ. …}</li>
+     *   <li>!assumedUtc + changed：{@code The date has changed. Today's date is now X. No need to announce the new date — the user's own clock shows it.}</li>
+     *   <li>!assumedUtc + !changed：{@code Today's date is X.}</li>
+     * </ul>
+     *
+     * @param isoDate     {@code YYYY-MM-DD}
+     * @param changed     是否「日期变更」
+     * @param assumedUtc  是否 UTC 推断
+     * @return 模型可见正文（<b>无</b> system-reminder 包裹 —— CC 的 date 附件是裸内容）
+     */
+    public static String dateAttachmentText(String isoDate, boolean changed, boolean assumedUtc) {
+        if (assumedUtc) {
+            return changed
+                ? "The UTC date is now " + isoDate + ". The user's local date can differ. "
+                    + "If a system-reminder in a user's message, other than an earlier \"Today's date is\" "
+                    + "line (that was the UTC date), gives a date or time that is not marked UTC, that is the "
+                    + "user's local date: treat it as today's date."
+                : "The UTC date is " + isoDate + ". The user's local date can differ. "
+                    + "If a system-reminder in a user's message gives a date or time that is not marked UTC, "
+                    + "that is the user's local date: treat it as today's date.";
+        }
+        return changed
+            ? "The date has changed. Today's date is now " + isoDate + ". "
+                + "No need to announce the new date \u2014 the user's own clock shows it."
+            : "Today's date is " + isoDate + ".";
+    }
+
+    /**
+     * assumedUtc 门控 · 对齐 CC {@code Ml()}（exe offset 308658509）：
+     * {@code return k("tengu_peppy_nest",!1)&&vYi()} —— GrowthBook flag 默认 <b>false</b>。
+     *
+     * <p>本仓无 GrowthBook；以静态开关承载，默认 false（与 CC 默认值一致 ⇒ 生产零行为变化）。
+     * 测试可经 {@link #setAssumedUtcEnabledForTest(boolean)} 注入。
+     */
+    private static volatile boolean assumedUtcEnabled = false;
+
+    /** 测试/诊断注入 assumedUtc 门（对齐 CC {@code tengu_peppy_nest} flag）。 */
+    public static void setAssumedUtcEnabledForTest(boolean enabled) {
+        assumedUtcEnabled = enabled;
+    }
+
+    private static boolean isAssumedUtcEnabled() {
+        return assumedUtcEnabled;
+    }
+
+    /**
+     * assumedUtc 判定 · 对齐 CC {@code vYi()}（exe offset 294054850）。
+     *
+     * <p>CC 原文：
+     * <pre>
+     * function vYi(){
+     *   let e=a.peek(H());
+     *   return e?.get()!==void 0 ? e.isAssumed()
+     *     : en() && new Date().getTimezoneOffset()===0
+     *         && (m(process.env.TZ,u) || Intl.DateTimeFormat().resolvedOptions().timeZone==="UTC")
+     * }
+     * </pre>
+     * 其中 {@code m(e,t)} = {@code e==="UTC"||e==="Etc/UTC"}。
+     *
+     * <p>本仓等价：时区偏移为 0 <b>且</b>（{@code TZ} 环境变量为 UTC/Etc/UTC <b>或</b> JVM 默认
+     * 时区 ID 为 UTC/Etc/UTC/GMT）。{@code a.peek(H())} 的会话级 isAssumed 状态本仓无等价位 ⇒ N/A。
+     *
+     * @return true = 当前环境被推断为 UTC
+     */
+    static boolean isAssumedUtc() {
+        java.util.TimeZone tz = java.util.TimeZone.getDefault();
+        if (tz.getRawOffset() != 0 || tz.getDSTSavings() != 0) {
+            return false;
+        }
+        String envTz = System.getenv("TZ");
+        if ("UTC".equals(envTz) || "Etc/UTC".equals(envTz)) {
+            return true;
+        }
+        String id = tz.getID();
+        return "UTC".equals(id) || "Etc/UTC".equals(id) || "GMT".equals(id);
+    }
+
+    /** 从 date / date_change 消息正文里取 {@code YYYY-MM-DD}。 */
+    private static final java.util.regex.Pattern EMITTED_DATE_PATTERN =
+        java.util.regex.Pattern.compile("(\\d{4}-\\d{2}-\\d{2})");
+
+    /**
+     * 从本 agent 的消息历史里取「最后一次已告知模型的日期」· 对齐 CC 2.1.322 {@code Fki(e)}
+     * （exe offset 308666094 的判据来源）。
+     *
+     * <p><b>为什么按历史而不是按会话槽位</b>：CC 的判据是 {@code Fki(messages)} —— 每个 agent
+     * 用<b>自己的</b>消息数组。子代理的消息从 {@code initialMessages} 起是全新的 ⇒ 天然命中
+     * "历史无日期" ⇒ 首轮播报。若改读会话级槽位（{@code store.lastEmittedDate()}），子代理会因
+     * 主线程当天已播报而恒判"同日" ⇒ <b>永远拿不到日期</b>。
+     *
+     * <p>倒序扫描，命中 {@code subtype} 为 {@code date} / {@code date_change} 的第一条即返回。
+     * 正文里不是日期消息的普通用户文本不参与（只认这两个 subtype），不会误取用户提到的日期。
+     *
+     * @param messages 本 agent 的消息列表（null / 空 ⇒ null）
+     * @return {@code YYYY-MM-DD}；历史里从未播报过 ⇒ null
+     */
+    static String lastEmittedDateFromHistory(java.util.List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return null;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto m = messages.get(i);
+            if (m == null) {
+                continue;
+            }
+            String sub = m.subtype();
+            if (!"date".equals(sub) && !"date_change".equals(sub)) {
+                continue;
+            }
+            String content = m.content();
+            if (content == null) {
+                continue;
+            }
+            java.util.regex.Matcher matcher = EMITTED_DATE_PATTERN.matcher(content);
+            if (matcher.find()) {
+                return matcher.group(1);
+            }
+        }
+        return null;
     }
 
     /**

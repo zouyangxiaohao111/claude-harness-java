@@ -4,6 +4,7 @@ import { ApiError } from '@/api/rest'
 import { knowledgeApi } from '@/api/knowledge'
 import type { KnowledgeBase, KnowledgeListQuery } from '@/api/knowledge'
 import { WikiPanel } from './WikiPanel'
+import { GraphPanel } from './GraphPanel'
 import { KbQaPanel } from './KbQaPanel'
 import { KnowledgeDocPanel } from './KnowledgeDocPanel'
 import { KbSettingsModal } from './KbSettingsModal'
@@ -369,7 +370,9 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
    * <p>⚠️ 切库时必须重置回 `docs` —— 否则从「A 库的 Wiki」进入「B 库」，
    * 会停在 Wiki tab 看 B 库（用户预期是看新库的文档列表）。
    */
-  const [detailTab, setDetailTab] = useState<'docs' | 'wiki' | 'graph' | 'gallery' | 'qa'>('docs')
+  const [detailTab, setDetailTab] = useState<
+    'docs' | 'wiki' | 'graph' | 'entity-graph' | 'gallery' | 'qa'
+  >('docs')
   const [bases, setBases] = useState<KnowledgeBase[]>([])
   const [activeBaseId, setActiveBaseId] = useState<string | null>(null)
   /**
@@ -381,6 +384,13 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
    */
   const [itemCounts, setItemCounts] = useState<Record<string, number>>({})
   const [total, setTotal] = useState(0)
+  /**
+   * 当前库的文档清单（只给「关系图谱」tab 的「选择要抽取的文档」下拉用）。
+   *
+   * <p>⚠️ 复用 {@code loadItems} 那一次请求的返回值，⛔ 不另开一个请求 ——
+   * 两个定时器/两套列表会互相打架（本文件同款注释见 {@code loadItems} 上方）。
+   */
+  const [docOptions, setDocOptions] = useState<Array<{ id: string; title: string }>>([])
   const [loadingBases, setLoadingBases] = useState(true)
   const [error, setError] = useState<string | null>(null)
   const [keyword, setKeyword] = useState('')
@@ -496,6 +506,7 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   const loadItems = useCallback(async () => {
     if (!activeBaseId) {
       setTotal(0)
+      setDocOptions([])
       return
     }
     try {
@@ -504,6 +515,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
       if (statusFilter) query.parse_status = statusFilter
       const page = await knowledgeApi.listKnowledge(activeBaseId, query)
       setTotal(page.total)
+      // 顺带喂「关系图谱」tab 的重建下拉（同一次请求，零额外开销）
+      setDocOptions((page.data || []).map((k) => ({ id: k.id, title: k.title || k.file_name || k.id })))
       setError(null)
     } catch (e) {
       setError(toMessage(e))
@@ -574,9 +587,12 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         name: payload.name,
         description: payload.description || undefined,
         type: payload.type,
-        // ⭐ RAG / Wiki 开关 —— Wiki 的启用**只**由这个字段承载
+        // ⭐ RAG / Wiki / 图谱开关 —— Wiki 的启用**只**由这个字段承载
         //    （源码 KnowledgeBaseEditorModal.vue:1675）。null ⇒ 不写（FAQ 库走这条）。
         indexing_strategy: payload.indexingStrategy ?? undefined,
+        // ⭐ 图谱判据的第二半（`extract_config.enabled`）。弹窗已序列化成字符串
+        //    ⇒ 这里原样透传（⛔ 不再 stringify）。不转发的话 selection 白勾。
+        extract_config: payload.extract_config ?? undefined,
       })
       try {
         window.localStorage.setItem(
@@ -1058,6 +1074,23 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                 </button>
                 <button
                   type="button" role="tab"
+                  className={`kb-view-tab${detailTab === 'entity-graph' ? ' active' : ''}`}
+                  aria-selected={detailTab === 'entity-graph'}
+                  onClick={() => setDetailTab('entity-graph')}
+                >
+                  {/* ⭐ 第 5 个 tab「关系图谱」（2026-11-11 用户要求）。
+                      ⚠️ 与「图谱」tab **不是同一个东西**：
+                      · 图谱 = Wiki 页面之间的 [[链接]]（WikiPanel 的 graph 视图，源站同款）
+                      · 关系图谱 = 从文档正文抽出的**实体-关系**（kb_graph_entity / kb_graph_relation）
+                      用户明确指出「还有关系图谱页面也没有 不是 wiki图谱哦」。 */}
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
+                    <circle cx="12" cy="5" r="2.4" /><circle cx="5" cy="19" r="2.4" /><circle cx="19" cy="19" r="2.4" />
+                    <path d="M12 7.4v4.2M6.4 16.9l4.3-3.7M17.6 16.9l-4.3-3.7" />
+                  </svg>
+                  <span>关系图谱</span>
+                </button>
+                <button
+                  type="button" role="tab"
                   className={`kb-view-tab${detailTab === 'gallery' ? ' active' : ''}`}
                   aria-selected={detailTab === 'gallery'}
                   onClick={() => setDetailTab('gallery')}
@@ -1149,6 +1182,21 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
               baseId={activeBaseId}
               showToast={showToast}
               initialView="graph"
+            />
+          ) : (
+            <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>
+          )
+        ) : detailTab === 'entity-graph' ? (
+          /* ⭐ 关系图谱 tab（2026-11-11 用户要求「还有关系图谱页面也没有 不是 wiki图谱哦」）。
+             数据源 = `kb_graph_entity` / `kb_graph_relation`（LLM 从文档抽出的实体-关系）。
+             ⛔ 与上面「图谱」tab 的 Wiki 页面链接图完全无关，两套独立实现。
+             `knowledgeOptions` 供「重建图谱」下拉选文档（用的是 loadItems 同一次请求的结果）。 */
+          activeBaseId ? (
+            <GraphPanel
+              baseId={activeBaseId}
+              baseName={activeBase?.name}
+              knowledgeOptions={docOptions}
+              showToast={showToast}
             />
           ) : (
             <div className="wiki-reader-empty"><p className="wiki-empty-desc">正在加载知识库…</p></div>

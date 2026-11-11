@@ -82,11 +82,41 @@ public class KbVisionModelCaller implements KbVisionCaller {
 
     @Override
     public String describeImage(Path imageFile, String prompt, KbParseContext ctx) throws Exception {
-        if (!isAvailable()) {
-            throw new IllegalStateException("视觉模型未配置（settings.multimodalModelName 缺失或 provider 不可用）");
+        return describeImageWithModel(imageFile, prompt, ctx, null);
+    }
+
+    /**
+     * 按指定模型描述图片；{@code modelIdOrName} 为空 ⇒ 全局 {@code settings.multimodalModelName}。
+     *
+     * <p>⭐ 2026-11-11 用户裁定「VLLM 视觉模型…单独选择也能其效果」：
+     * 知识库设置里的选择经 {@code IMAGE_UNDERSTAND} 任务透传到此处。
+     *
+     * <p>⚠️ 指定模型解析失败 ⇒ <b>回落全局默认</b>并留 WARN，⛔ 不直接抛。
+     * 理由：库级模型可能是被删/禁用的历史值，此时「用全局默认把图读懂」远好于
+     * 「整篇文档的图片全部无描述」，而 WARN 保证这件事仍可观测。
+     */
+    @Override
+    public String describeImageWithModel(Path imageFile, String prompt, KbParseContext ctx,
+                                         String modelIdOrName) throws Exception {
+        String modelName = pickModelName(modelIdOrName);
+        if (modelName == null || modelName.isBlank()) {
+            throw new IllegalStateException(
+                "视觉模型未配置（知识库未指定模型，且 settings.multimodalModelName 缺失）");
         }
-        String modelName = resolveModelNameQuietly();
         ModelConfigResolver.ResolvedModel resolved = modelConfigResolver.resolve(modelName);
+        if (resolved == null || resolved.config() == null || !resolved.config().isUsable()) {
+            // 库级指定但解析不了 ⇒ 回落全局档位（见 javadoc）
+            String fallback = resolveModelNameQuietly();
+            if (fallback != null && !fallback.isBlank() && !fallback.equals(modelName)) {
+                log.warn("KbVisionModelCaller: 知识库指定模型不可用 model={} ⇒ 回落全局多模态 {}",
+                    modelName, fallback);
+                ModelConfigResolver.ResolvedModel fb = modelConfigResolver.resolve(fallback);
+                if (fb != null && fb.config() != null && fb.config().isUsable()) {
+                    modelName = fallback;
+                    resolved = fb;
+                }
+            }
+        }
         if (resolved == null || resolved.config() == null || !resolved.config().isUsable()) {
             throw new IllegalStateException("视觉模型 provider 解析失败: " + modelName);
         }
@@ -138,6 +168,19 @@ public class KbVisionModelCaller implements KbVisionCaller {
             log.warn("KbVisionModelCaller: 读取多模态档位模型失败 原因={}", e.getMessage());
             return null;
         }
+    }
+
+    /**
+     * 选哪个模型：库级指定优先，否则全局多模态档位。
+     *
+     * @param modelIdOrName 库级指定（`image_processing_config.model_id`，可 id 可 name）
+     * @return 最终要解析的模型标识；两者皆空 ⇒ null
+     */
+    private String pickModelName(String modelIdOrName) {
+        if (modelIdOrName != null && !modelIdOrName.isBlank()) {
+            return modelIdOrName.trim();
+        }
+        return resolveModelNameQuietly();
     }
 
     private static String mediaTypeOf(Path file) {

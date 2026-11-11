@@ -18,22 +18,22 @@ import type { AttachmentRequest, ChatMessageDto } from '@/api/types'
 
 const SID = 'sess-user-edit'
 
-/**
- * jsdom 的 `File`/`Blob` **没有 `arrayBuffer()`**（浏览器与 WebView2 都有）⇒ 附件投递会直接抛错。
- * 此处补一个等价实现（走 FileReader，jsdom 有），**只补测试环境缺的标准 API**，
- * ⛔ 不是为了让断言变绿而改行为 —— 实现与浏览器一致的 Promise<ArrayBuffer> 语义。
- */
-if (typeof (Blob.prototype as unknown as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer !== 'function') {
-  ;(Blob.prototype as unknown as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer = function () {
-    return new Promise<ArrayBuffer>((resolve, reject) => {
-      const r = new FileReader()
-      r.onload = () => resolve(r.result as ArrayBuffer)
-      r.onerror = () => reject(r.error)
-      r.readAsArrayBuffer(this as unknown as Blob)
-    })
-  }
-}
-
+/**
+ * jsdom 的 `File`/`Blob` **没有 `arrayBuffer()`**（浏览器与 WebView2 都有）⇒ 附件投递会直接抛错。
+ * 此处补一个等价实现（走 FileReader，jsdom 有），**只补测试环境缺的标准 API**，
+ * ⛔ 不是为了让断言变绿而改行为 —— 实现与浏览器一致的 Promise<ArrayBuffer> 语义。
+ */
+if (typeof (Blob.prototype as unknown as { arrayBuffer?: () => Promise<ArrayBuffer> }).arrayBuffer !== 'function') {
+  ;(Blob.prototype as unknown as { arrayBuffer: () => Promise<ArrayBuffer> }).arrayBuffer = function () {
+    return new Promise<ArrayBuffer>((resolve, reject) => {
+      const r = new FileReader()
+      r.onload = () => resolve(r.result as ArrayBuffer)
+      r.onerror = () => reject(r.error)
+      r.readAsArrayBuffer(this as unknown as Blob)
+    })
+  }
+}
+
 const noop = () => {}
 
 function userMsg(id: string, content: string): ChatMessageDto {
@@ -345,5 +345,54 @@ describe('[用户消息编辑重发]', () => {
     await act(async () => { sendBtn()!.click() })
     const call = onEditResend.mock.calls[0] as unknown as [string, string, () => void, AttachmentRequest[] | undefined]
     expect(call[3]).toBeUndefined()
+  })
+
+  it('⭐ 编辑态缩略图可点开大图，Esc 与关闭按钮都能关（用户报「无法预览和关闭」）', async () => {
+    // WHY：编辑态缩略图此前没有任何点击行为 ⇒ 图看不清也没法放大；灯箱本身也只有
+    //   「点遮罩」一条出口（图片占满视口时几乎点不到）⇒ 用户报「无法关闭」。
+    //   本用例锁住三条出口：点缩略图打开、Esc 关闭、右上角按钮关闭。
+    const onEditResend = vi.fn(async () => {})
+    const withImage: ChatMessageDto = {
+      ...userMsg('u1', '看这张图'),
+      imageData: [{ base64: 'AAAA', mediaType: 'image/png' }],
+    }
+    renderList([withImage], onEditResend)
+    hover()
+    act(() => { editBtn()!.click() })
+
+    const thumb = () => container.querySelector<HTMLImageElement>('.user-edit-thumb')!
+    act(() => { thumb().click() })
+    expect(container.querySelector('.msg-img-zoom'), '点编辑态缩略图必须打开大图').not.toBeNull()
+
+    act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
+    expect(container.querySelector('.msg-img-zoom'), 'Esc 必须能关掉大图').toBeNull()
+
+    act(() => { thumb().click() })
+    act(() => { container.querySelector<HTMLButtonElement>('.msg-img-zoom-close')!.click() })
+    expect(container.querySelector('.msg-img-zoom'), '关闭按钮必须能关掉大图').toBeNull()
+    expect(container.querySelector('.user-edit'), '关灯箱不应退出编辑态').not.toBeNull()
+  })
+
+  it('⭐ 编辑块展开后自动滚入视野（消息在视口下沿时不用手动滚才点到发送）', async () => {
+    // WHY：用户报「用户消息在对话框上方不远，点编辑后编辑框被遮挡，需要滚一下鼠标才能点发送」。
+    //   编辑块比原气泡高（textarea + 提示 + 图片行 + 按钮），下沿会被顶出 .stream 可视区。
+    //   jsdom 没有 scrollIntoView ⇒ 打桩后断言调用参数，锁住「进入编辑态就对齐一次」。
+    const spy = vi.fn()
+    const proto = HTMLElement.prototype as unknown as { scrollIntoView?: unknown }
+    const had = Object.prototype.hasOwnProperty.call(proto, 'scrollIntoView')
+    const prev = proto.scrollIntoView
+    proto.scrollIntoView = spy
+    try {
+      renderList([userMsg('u1', '原问题')], vi.fn(async () => {}))
+      hover()
+      act(() => { editBtn()!.click() })
+      // effect 在 rAF 里量位置（等 textarea 自动高度落定）
+      await act(async () => { await new Promise<void>((r) => requestAnimationFrame(() => r())) })
+      expect(spy).toHaveBeenCalled()
+      expect(spy.mock.calls[0][0]).toEqual({ block: 'nearest' })
+    } finally {
+      if (had) proto.scrollIntoView = prev
+      else delete proto.scrollIntoView
+    }
   })
 })

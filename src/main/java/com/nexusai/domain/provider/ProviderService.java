@@ -65,10 +65,17 @@ public class ProviderService {
         List<ProviderRecord> records = providerMapper.selectAll();
         if (records.isEmpty()) return List.of();
         List<ModelRecord> allModelRecords = modelMapper.selectAll();
+        // providerId → name（模型 DTO 要显示 `provider/modelName`，这里已有 records 不必再查）
+        Map<String, String> nameById = new HashMap<>();
+        for (ProviderRecord r : records) {
+            if (r.getId() != null) {
+                nameById.put(r.getId(), r.getName());
+            }
+        }
         Map<String, List<ModelDto>> modelsByProvider = new HashMap<>();
         for (ModelRecord r : allModelRecords) {
             modelsByProvider.computeIfAbsent(r.getProviderId(), k -> new ArrayList<>())
-                .add(toModelDto(r.toDomain()));
+                .add(toModelDto(r.toDomain(), nameById.get(r.getProviderId())));
         }
         List<ProviderDto> result = new ArrayList<>(records.size());
         for (ProviderRecord r : records) {
@@ -85,7 +92,7 @@ public class ProviderService {
         List<ModelRecord> modelRecords = modelMapper.selectListByQuery(
             QueryWrapper.create().eq("provider_id", id));
         List<ModelDto> modelDtos = modelRecords.stream()
-            .map(rec -> toModelDto(rec.toDomain()))
+            .map(rec -> toModelDto(rec.toDomain(), p.getName()))
             .toList();
         return toProviderDto(p, modelDtos);
     }
@@ -513,7 +520,12 @@ public class ProviderService {
             parseDateTime(p.getCreatedAt()), parseDateTime(p.getUpdatedAt()));
     }
 
-    private ModelDto toModelDto(Model m) {
+    /**
+     * 单个模型 → DTO。
+     *
+     * @param providerName 所属提供商显示名（调用方已知 ⇒ 透传，避免多查一次库）
+     */
+    private ModelDto toModelDto(Model m, String providerName) {
         return new ModelDto(m.getId(), m.getName(), m.getAlias(),
             ModelTags.parse(m.getTag()),   // [D5] 读路径安全解析：脏 tag → null 不抛
             m.getDescription(), m.getType() != null ? ModelType.valueOf(m.getType()) : null,
@@ -537,7 +549,11 @@ public class ProviderService {
             m.getEmbeddingDimensions(),
             m.getEmbeddingBatchSize(),
             m.getRerankTopN(),
-            m.getRerankInstruct());
+            m.getRerankInstruct(),
+            // ⭐ 2026-11-11：带上提供商，前端模型下拉显示成 `provider/modelName`。
+            //    本方法在 toProviderDto 内被调用，调用方手里**就有** provider（p），
+            //    直接透传即可，⛔ 不要为此再查一次库。
+            m.getProviderId(), providerName);
     }
 
     private static String generateId(String prefix) { return prefix + "-" + UUID.randomUUID().toString().substring(0, 8); }

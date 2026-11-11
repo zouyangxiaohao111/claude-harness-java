@@ -3,6 +3,7 @@ package com.nexusai.domain.provider;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
+import com.nexusai.infra.llm.ModelNameResolver;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.nexusai.repository.provider.entity.ProviderRecord;
 import com.nexusai.model.provider.Model;
@@ -52,7 +53,9 @@ public class ModelService {
         }
         List<ModelRecord> records = modelMapper.selectListByQuery(
             QueryWrapper.create().eq("provider_id", providerId));
-        return records.stream().map(r -> toDto(r.toDomain())).toList();
+        // 单 provider ⇒ 只需一条名字
+        java.util.Map<String, String> names = providerNames();
+        return records.stream().map(r -> toDto(r.toDomain(), names)).toList();
     }
 
     /**
@@ -62,7 +65,8 @@ public class ModelService {
      * 前端「模型总览」页不需要先拉 provider 再逐个拉 models（N+1 次请求）。
      */
     public List<ModelDto> listAll() {
-        return modelMapper.selectAll().stream().map(r -> toDto(r.toDomain())).toList();
+        java.util.Map<String, String> names = providerNames();
+        return modelMapper.selectAll().stream().map(r -> toDto(r.toDomain(), names)).toList();
     }
 
     public ModelDto getById(String id) {
@@ -249,7 +253,7 @@ public class ModelService {
     /**
      * 被知识库引用时拒绝操作（用户 2026-11-04 裁定「推荐拦」）。
      *
-     * @param modelId 模型 ID
+     * @param modelId 模型 ID（{@code models.id}）
      * @param action  动作名（「删除」/「停用」），用于错误文案
      * @throws ConflictException 有引用
      */
@@ -257,8 +261,20 @@ public class ModelService {
         if (kbModelUsage == null) {
             return;  // 精简装配（单测场景）⇒ 不做检查，⛔ 不因缺 bean 而阻断正常操作
         }
+        // ⭐ 知识库那几列可能存 ID，也可能存 provider/modelName 全名（2026-11-11 起新写入
+        //    的是后者）⇒ 两种形态都要查，否则新形态的引用漏拦、删除后检索静默降级。
+        String fullName = null;
+        try {
+            ModelRecord rec = modelMapper.selectOneById(modelId);
+            if (rec != null) {
+                fullName = ModelNameResolver.toFullName(providerMapper, rec);
+            }
+        } catch (RuntimeException e) {
+            log.warn("[模型] 解析全名失败 modelId={} 原因={}（仅按 ID 做引用检查）",
+                modelId, e.getMessage());
+        }
         com.nexusai.kb.repo.KbModelUsageRepository.Usage usage =
-            kbModelUsage.countUsage(modelId);
+            kbModelUsage.countUsage(modelId, fullName);
         if (!usage.isUnused()) {
             throw new ConflictException(
                 "该模型正被 " + usage.describe() + " 使用，不能" + action
@@ -290,7 +306,78 @@ public class ModelService {
             m.getEmbeddingDimensions(),
             m.getEmbeddingBatchSize(),
             m.getRerankTopN(),
-            m.getRerankInstruct());
+            m.getRerankInstruct(),
+            // ⭐ 2026-11-11 用户裁定：模型下拉要显示 `provider/modelName` ⇒ 必须带上提供商。
+            //    providerId 是 models.provider_id 原值；providerName 查 providers.name
+            //    （provider 已删 ⇒ null，前端回退显示 id）。
+            m.getProviderId(),
+            providerNameOf(m.getProviderId(), null));
+    }
+
+    /**
+     * 带 provider 名映射的重载 · 列表场景用它把 N 次查询压成 1 次。
+     *
+     * @param providerNames providerId → name（可为 null ⇒ 逐个查）
+     */
+    private ModelDto toDto(Model m, java.util.Map<String, String> providerNames) {
+        ModelDto base = toDto(m);
+        if (providerNames == null || m.getProviderId() == null) {
+            return base;
+        }
+        String name = providerNames.get(m.getProviderId());
+        if (name == null) {
+            return base;
+        }
+        return new ModelDto(base.id(), base.name(), base.alias(), base.tag(), base.desc(),
+            base.type(), base.maxTokens(), base.temperature(), base.topP(), base.think(),
+            base.enabled(), base.maxContextTokens(),
+            base.inputPricePeak(), base.inputPriceOffpeak(),
+            base.outputPricePeak(), base.outputPriceOffpeak(),
+            base.cacheReadPricePeak(), base.cacheReadPriceOffpeak(),
+            base.cacheWritePricePeak(), base.cacheWritePriceOffpeak(),
+            base.extraBody(), base.embeddingDimensions(), base.embeddingBatchSize(),
+            base.rerankTopN(), base.rerankInstruct(),
+            base.providerId(), name);
+    }
+
+    /**
+     * 提供商显示名。
+     *
+     * <p>⚠️ 查不到（provider 已删）返回 null，⛔ 不抛 —— 模型本身仍然可用，
+     * 不该因为 provider 行没了就让整个 `/models` 500。
+     *
+     * <p>⚠️ ⛔ 不要在这个方法上挂实例级缓存：本类是 Spring 单例，跨请求缓存会让
+     * 「改了 provider 名但界面还是旧名」。列表场景改用 {@link #providerNames()} 一次取全。
+     */
+    private String providerNameOf(String providerId, java.util.Map<String, String> providerNames) {
+        if (providerId == null || providerId.isBlank()) {
+            return null;
+        }
+        if (providerNames != null && providerNames.containsKey(providerId)) {
+            return providerNames.get(providerId);
+        }
+        try {
+            ProviderRecord p = providerMapper.selectOneById(providerId);
+            return p == null ? null : p.getName();
+        } catch (RuntimeException e) {
+            log.warn("[模型] 查询 provider 名失败 provider={} 原因={}", providerId, e.getMessage());
+            return null;
+        }
+    }
+
+    /** 一次性取全部 provider 名（列表场景用，避免 N+1）。 */
+    private java.util.Map<String, String> providerNames() {
+        java.util.Map<String, String> map = new java.util.HashMap<>();
+        try {
+            for (ProviderRecord p : providerMapper.selectAll()) {
+                if (p.getId() != null && p.getName() != null) {
+                    map.put(p.getId(), p.getName());
+                }
+            }
+        } catch (RuntimeException e) {
+            log.warn("[模型] 批量查询 provider 名失败 原因={}（providerName 将为空）", e.getMessage());
+        }
+        return map;
     }
 
     private static String generateId(String prefix) { return prefix + "-" + UUID.randomUUID().toString().substring(0, 8); }

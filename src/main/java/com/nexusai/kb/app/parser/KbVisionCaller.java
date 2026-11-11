@@ -31,4 +31,21 @@ public interface KbVisionCaller {
      * @throws Exception 调用失败（PDF 解析器按 fail-soft 处理：保留文本层 + 记 metadata）
      */
     String describeImage(Path imageFile, String prompt, KbParseContext ctx) throws Exception;
+
+    /**
+     * 让视觉模型描述一张图片 · <b>可指定模型</b>。
+     *
+     * <p>⭐ 2026-11-11 用户裁定：知识库设置里的「VLLM 视觉模型」要「单独选择也能其效果」。
+     * 该方法让调用方（图片理解）把库级选择透传下来；{@code modelIdOrName} 为空时
+     * 回落到全局 {@code settings.multimodalModelName}。
+     *
+     * <p>默认实现直接忽略参数、委托旧方法 ⇒ 既有实现类与测试桩无需改动即可编译，
+     * 且「不支持按库指定」的实现仍是安全的（只是不生效，行为与改动前一致）。
+     *
+     * @param modelIdOrName 库级指定的模型（`models.id` 或 `models.name`）；null/空 = 用全局默认
+     */
+    default String describeImageWithModel(Path imageFile, String prompt, KbParseContext ctx,
+                                          String modelIdOrName) throws Exception {
+        return describeImage(imageFile, prompt, ctx);
+    }
 }

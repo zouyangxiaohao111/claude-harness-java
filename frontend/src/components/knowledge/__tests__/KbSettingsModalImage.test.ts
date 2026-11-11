@@ -60,12 +60,40 @@ describe('知识库设置：图片理解分区', () => {
     expect(block).toContain('image_processing_config')
   })
 
-  it('⭐⭐ 模型选择必须用下拉（ModelSelect），不是自由输入框', () => {
+  /* ⭐ 2026-11-11 用户最终裁定：「VLLM 视觉模型 是可以选择的，但是默认选中 使用全局默认，
+     单独选择也能其效果」。
+     ⇒ 既要有下拉（可选），又必须留空默认为「使用全局默认」，且选项标签统一
+       `provider/modelName`（同名模型在多个 provider 下并存，不分组分不清）。 */
+  it('⭐⭐ VLLM 视觉模型必须是下拉，且默认项是「使用全局默认」', () => {
     const s = src()
-    // 源站是真下拉；写成 input 会让用户手打模型名，写错即静默失败
     const i = s.indexOf('VLLM 视觉模型')
     expect(i, '找不到 VLLM 视觉模型这一行').toBeGreaterThan(0)
-    const block = s.slice(i, i + 500)
+    const block = s.slice(i, i + 700)
     expect(block, 'VLLM 模型必须是 ModelSelect 下拉').toContain('<ModelSelect')
+    expect(block, '默认项必须写明「使用全局默认」').toContain('使用全局默认')
+    expect(block, '必须绑定 image_processing_config.model_id').toContain('model_id')
+  })
+
+  it('⭐⭐ 显示 provider/modelName 并按 provider 分组（同名模型必须能区分）', () => {
+    const s = src()
+    const i = s.indexOf('function ModelSelect')
+    expect(i, '找不到 ModelSelect 实现').toBeGreaterThan(0)
+    const block = s.slice(i, i + 5000)
+    expect(block, '缺 optgroup ⇒ 无法按提供者分组').toContain('<optgroup')
+    expect(block, '必须拼出 provider/modelName').toContain('fullNameOf')
+  })
+
+  it('⭐⭐⭐ 存储必须是 models.id（不是全名）—— 全名会在 provider 改名后失效', () => {
+    const s = src()
+    const i = s.indexOf('function ModelSelect')
+    const block = s.slice(i, i + 5000)
+    /* 用户裁定（2026-11-11）：「存 ID + 界面显示全名」。
+       判据：<option> 的 value 是主键 id ⇒ 调用链两次主键命中，绝不可能串到别的 provider。
+       ⛔ 若改成 value={fullNameOf(m)}，`providers.name` 一旦改名（ProviderService.update
+       允许改且不级联更新引用）所有已存值都会解析失败。 */
+    expect(block, 'option 的 value 必须是主键 id').toContain('value={m.id}')
+    expect(block, '⛔ 不得把全名当存储值').not.toContain('value={fullNameOf(m)}')
+    /* 但标签必须是全名（否则同名模型在界面上三行一模一样） */
+    expect(block, '标签必须是全名').toMatch(/\{fullNameOf\(m\)\}/)
   })
 })

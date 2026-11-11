@@ -94,7 +94,18 @@ public record KnowledgeBaseDto(
      * `faq_config.index_mode` **后端真消费**
      * （`KbFaqMetadata.resolveIndexMode` → `KbFaqService` 渲染 FAQ 正文）。
      */
-    @JsonProperty("faq_config") String faqConfig
+    @JsonProperty("faq_config") String faqConfig,
+    /**
+     * 知识图谱存储配置（`graph_store_config`，V281）。
+     *
+     * <p>⭐ 2026-11-11 用户要求「兼容 Neo4j，随时可配远程实例」。
+     * 结构：{@code {"store":"local"|"neo4j","uri":"bolt://...","username":"...","password_encrypted":"..."}}。
+     * 缺省 {@code "{}"} = 用本地 SQLite 两张表（零行为变化）。
+     *
+     * <p>⚠️ 图谱是**知识库级**功能（每库可独立选存储），所以放这一行而不是全局 settings。
+     * ⚠️ 读侧必须回传：设置弹窗要回显当前配置；⛔ 只写不读会导致「保存成功但永远显示旧值」。
+     */
+    @JsonProperty("graph_store_config") String graphStoreConfig
 ) {
 
     /**
@@ -116,6 +127,6 @@ public record KnowledgeBaseDto(
         this(id, name, description, type, isTemporary, chunkingConfig, imageProcessingConfig,
             embeddingModelId, summaryModelId, extractConfig, vectorStoreId, storageBackendId,
             retrieverEngine, isPinned, pinnedAt, generatedProfile, createdAt, updatedAt,
-            indexingStrategy, wikiConfig, null, null, null, null, null);
+            indexingStrategy, wikiConfig, null, null, null, null, null, null);
     }
 }

@@ -344,7 +344,7 @@ export function KbDocPreview({
               `.md-content.doc-merged-content`）。本仓的 `MarkdownText` 是对话正文在用的
               同一个 mdast 渲染器，带 GFM 表格 / 代码高亮 / 安全转义。
               ⛔ 不要退回 `white-space: pre-wrap` —— 那会把 `# 标题` 显示成字面井号。 */}
-          <MarkdownTextV2 text={textContent} className="md-content doc-merged-content" />
+          <MarkdownTextV2 text={textContent} className="md-content doc-merged-content markdown-prose" />
         </div>
         <p style={HINT_BASE}>
           以上是按分块顺序拼接的解析正文（{chunks.length} 个分块 · {textContent.length} 字）。

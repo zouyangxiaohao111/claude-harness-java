@@ -83,6 +83,14 @@ public class KbSummaryService {
     @Autowired(required = false)
     private ModelConfigResolver modelConfigResolver;
 
+    /**
+     * 知识库画像自动生成触发器（2026-11-11）。
+     *
+     * <p>⚠️ 字段注入：不改构造器签名（本类有直构测试点）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.app.profile.KbProfileTrigger profileTrigger;
+
     public KbSummaryService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -167,7 +175,10 @@ public class KbSummaryService {
         //    ⭐ 语义对齐源码 knowledge_process.go:1521-1527：
         //      `if kb.SummaryModelID == "" { 标 failed; 记 no_summary_model; return }`
         //      ⇒ **标 failed 而不是静默跳过**，前端据此显示「去设置里配摘要模型」。
-        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb);
+        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb,
+            modelConfigResolver == null ? null
+                : modelConfigResolver.settingsTierModelName(
+                    com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName));
         if (config.summaryModelId() == null || config.summaryModelId().isBlank()) {
             log.info("[摘要] 未配置摘要模型，跳过并标记失败 knowledge={}", knowledgeId);
             markStatus(knowledgeId, "failed");
@@ -248,6 +259,12 @@ public class KbSummaryService {
         } catch (RuntimeException e) {
             // 摘要本身已落库，索引失败不该让摘要任务判失败（重试会把整个 LLM 调用再来一遍）
             log.warn("[摘要] 重建索引失败（摘要已落库）knowledge={} 原因={}", knowledgeId, e.getMessage());
+        }
+        // ⭐ 2026-11-11：摘要更新后重算知识库画像（源站 knowledge_post_process.go:529）。
+        //    摘要里带着文档画像（gist/topics/...）⇒ 聚合内容变了 ⇒ 知识库描述该跟着变。
+        //    ⚠️ 失败不抛：摘要已经落库成功，画像是旁路能力。
+        if (profileTrigger != null) {
+            profileTrigger.trigger(kbId, false);
         }
         return KbPostProcessOutcome.done("summary_chars=" + chars);
     }

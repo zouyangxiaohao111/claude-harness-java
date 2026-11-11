@@ -104,7 +104,11 @@ public record KbPostProcessConfig(
      * </ul>
      *
      * @param enabled 是否开启图片理解（caption + OCR）
-     * @param modelId 该库指定模型（空 = 用全局多模态档位）
+     * @param modelId 该库指定的视觉模型（用户裁定 2026-11-11：「可以选，默认使用全局默认」）。
+     *                <b>空 = 跟随全局</b> {@code settings.multimodalModelName}；
+     *                <b>有值 = 该库专属</b>，经 {@code IMAGE_UNDERSTAND} 任务 payload 透传到
+     *                {@code KbImageEnrichService#enrichKnowledge(id, model)} → 视觉调用器。
+     *                指定模型不可用时视觉调用器会 WARN 并回落全局（不让整篇图片全无描述）。
      */
     public record ImageUnderstanding(boolean enabled, String modelId) {
         /**
@@ -132,10 +136,38 @@ public record KbPostProcessConfig(
      * @return 解析结果（永不 null）
      */
     public static KbPostProcessConfig resolve(KbKnowledgeBaseRecord kb) {
+        return resolve(kb, null);
+    }
+
+    /**
+     * 从知识库行解析 · <b>可带全局默认模型</b>。
+     *
+     * <h2>⭐⭐ 为什么需要 fallbackChatModel（2026-11-11 用户裁定 A）</h2>
+     * 设置面板「LLM 大语言模型」的占位文案写的是「跟随全局默认」，但此前后端**没有**这个回落：
+     * 未选模型 ⇒ {@code summary_model_id = ""} ⇒ 下面这条链全部静默失效：
+     * <ul>
+     *   <li>图谱：{@code graphEnabled(kb) && !summaryModel.isEmpty()} 恒 false
+     *       ⇒ {@code TYPE_GRAPH} 任务**根本不派发**，零日志零报错；</li>
+     *   <li>摘要：执行期标 {@code failed} + {@code no_summary_model}；</li>
+     *   <li>Wiki / AI 问题生成 / 自动打标：同一条 {@code summaryModel} 派生链一起失效。</li>
+     * </ul>
+     * ⇒ 传全局默认（{@code settings.main_model_name} 解析出的全名）进来，让那句文案名副其实。
+     *
+     * @param kb                  知识库行（null ⇒ {@link #NONE}）
+     * @param fallbackChatModel   全局默认大模型（`provider/model` 全名或 name/id）；null/空 ⇒ 不回落
+     * @return 解析结果（永不 null）
+     */
+    public static KbPostProcessConfig resolve(KbKnowledgeBaseRecord kb, String fallbackChatModel) {
         if (kb == null) {
             return NONE;
         }
         String summaryModel = trim(kb.getSummaryModelId());
+        // ⭐ 空 ⇒ 用全局默认（用户裁定 A：「如果是空的话 使用全局默认」）
+        if (summaryModel.isEmpty() && fallbackChatModel != null && !fallbackChatModel.isBlank()) {
+            summaryModel = fallbackChatModel.trim();
+            log.info("[后处理] 知识库未配置 LLM 模型 ⇒ 使用全局默认 model={} kb={}",
+                summaryModel, kb.getId());
+        }
 
         JsonNode q = parse(kb.getQuestionGenerationConfig(), "question_generation_config");
         boolean qEnabled = bool(q, "enabled", false);

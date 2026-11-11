@@ -69,6 +69,14 @@ public class KnowledgeBaseService {
     /** VLM 配置默认值 · 源侧 {@code vlm_config} DEFAULT '{}'。 */
     static final String DEFAULT_VLM_CONFIG = "{}";
 
+    /**
+     * 图谱存储配置默认值（V281）· {@code '{}'} = 用本地 SQLite 两张表。
+     *
+     * <p>⭐ 2026-11-11 用户要求「兼容 Neo4j，可配远程实例」：配了
+     * {@code {"store":"neo4j",...}} 该库就写远程，否则本地。每库一份，所以放在这一行。
+     */
+    static final String DEFAULT_GRAPH_STORE_CONFIG = "{}";
+
     private final KbKnowledgeBaseMapper mapper;
 
     @Autowired
@@ -85,6 +93,14 @@ public class KnowledgeBaseService {
      */
     @Autowired(required = false)
     private com.nexusai.kb.app.retrieval.engine.KbRetrievalEngineRegistry engineRegistry;
+
+    /**
+     * 知识库画像自动生成触发器（2026-11-11）。
+     *
+     * <p>⚠️ 字段注入而非构造器：本类有手工 {@code new} 的测试点，改构造器签名会连锁改所有调用方。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.app.profile.KbProfileTrigger profileTrigger;
 
     /**
      * 列表 · 按「置顶优先 + 创建时间倒序」。
@@ -156,6 +172,9 @@ public class KnowledgeBaseService {
         row.setImageProcessingConfig(DEFAULT_IMAGE_PROCESSING_CONFIG);
         row.setCosConfig(DEFAULT_COS_CONFIG);
         row.setVlmConfig(DEFAULT_VLM_CONFIG);
+        // ⚠️ 必须显式填：Flex 会把 null 也列进 INSERT ⇒ DB 的 DEFAULT '{}' 不生效，
+        //    直接报 NOT NULL constraint failed（本类第 3 次踩这个坑，见上面 chunking_config 的注释）。
+        row.setGraphStoreConfig(DEFAULT_GRAPH_STORE_CONFIG);
         // ⭐ 索引策略（RAG / Wiki / 图谱的开关）—— 源侧创建时同一个请求就带上它
         //    （KnowledgeBaseEditorModal.vue:1690）。bounds = 只接受 JSON 对象，
         //    其它形态当作「未配置」（null），⛔ 不要静默塞一个空串让下游 parse 成脏数据。
@@ -165,6 +184,17 @@ public class KnowledgeBaseService {
                 throw new ValidationException("indexing_strategy 必须是 JSON 对象");
             }
             row.setIndexingStrategy(strategy);
+        }
+        // ⭐ 抽取配置（extract_config）—— 图谱判据是 graph_enabled ∧ extract_config.enabled
+        //    两字段合取（KbPostProcessConfig.graphEnabled）⇒ 创建时只写前一个等于没开。
+        //    规则与上面的 indexing_strategy 完全一致：空白 ⇒ 不设（保持 DB 默认），
+        //    非 JSON 对象 ⇒ 400（⛔ 不静默塞脏串让下游 parse 成「未配置」）。
+        if (req.extractConfig() != null && !req.extractConfig().isBlank()) {
+            String extract = req.extractConfig().trim();
+            if (!extract.startsWith("{")) {
+                throw new ValidationException("extract_config 必须是 JSON 对象");
+            }
+            row.setExtractConfig(extract);
         }
         // DB 列 NOT NULL 且无默认值 ⇒ 留空时写空串
         row.setEmbeddingModelId(req.embeddingModelId() == null ? "" : req.embeddingModelId());
@@ -302,12 +332,19 @@ public class KnowledgeBaseService {
         changed |= setJsonField(body, "faq_config", row::setFaqConfig);
         changed |= setJsonField(body, "image_processing_config", row::setImageProcessingConfig);
         changed |= setJsonField(body, "auto_tag_config", row::setAutoTagConfig);
+        // ⭐ 2026-11-11：记下 profile_config 变更前后的开关状态。
+        //    源站 knowledgebase.go:756-758：开关从关变开时**立即**生成一次描述
+        //    （「Turning automatic description generation on should produce a description now,
+        //    not after the next upload.」）。
+        boolean profileEnabledBefore = profileEnabled(row.getProfileConfig());
         changed |= setJsonField(body, "profile_config", row::setProfileConfig);
+        boolean profileEnabledAfter = profileEnabled(row.getProfileConfig());
         changed |= setJsonField(body, "question_generation_config", row::setQuestionGenerationConfig);
         changed |= setJsonField(body, "wiki_config", row::setWikiConfig);
         changed |= setJsonField(body, "extract_config", row::setExtractConfig);
         changed |= setJsonField(body, "asr_config", row::setAsrConfig);
         changed |= setJsonField(body, "vlm_config", row::setVlmConfig);
+        changed |= setJsonField(body, "graph_store_config", row::setGraphStoreConfig);
         changed |= setJsonField(body, "indexing_strategy", row::setIndexingStrategy);
         changed |= setJsonField(body, "storage_provider_config", row::setStorageProviderConfig);
 
@@ -343,7 +380,29 @@ public class KnowledgeBaseService {
         // ⚠️ `update(row, false)`：显式写 NULL（清空配置必须走这条，见缺陷 9）
         mapper.update(row, false);
         log.info("[知识库] 已局部更新 id={} name={}", id, row.getName());
+        // ⭐ 2026-11-11：开关刚被打开 ⇒ 立即生成一次画像（照源站 knowledgebase.go:756-758）
+        if (!profileEnabledBefore && profileEnabledAfter && profileTrigger != null) {
+            profileTrigger.trigger(id, false);
+        }
         return toDto(requireRow(id));
+    }
+
+    /**
+     * 读 {@code profile_config.enabled}（画像自动生成开关）。
+     *
+     * <p>⚠️ 解析失败一律当「关」：一个坏 JSON 不该让「关→开」的判定变成真。
+     */
+    private static boolean profileEnabled(String profileConfigJson) {
+        if (profileConfigJson == null || profileConfigJson.isBlank()) {
+            return false;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode n =
+                new com.fasterxml.jackson.databind.ObjectMapper().readTree(profileConfigJson);
+            return n != null && n.isObject() && n.path("enabled").asBoolean(false);
+        } catch (Exception e) {
+            return false;
+        }
     }
 
     /** 取 JSON 文本；返回是否改动。传了 null ⇒ 置 null（清空）。 */
@@ -447,6 +506,9 @@ public class KnowledgeBaseService {
             r.getAutoTagConfig(),
             r.getAsrConfig(),
             r.getProfileConfig(),
-            r.getFaqConfig());
+            r.getFaqConfig(),
+            // ⭐ V281：图谱存储配置（本地 / 远程 Neo4j）。同上，读侧必须回传，
+            //    否则设置弹窗保存后仍显示「本地」，用户以为没生效。
+            r.getGraphStoreConfig());
     }
 }

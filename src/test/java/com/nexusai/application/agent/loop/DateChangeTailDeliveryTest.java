@@ -30,8 +30,14 @@ import static org.assertj.core.api.Assertions.assertThat;
  *       （CC {@code yield attachment; toolResults.push(attachment)}，query.ts:1580-1588），
  *       否则模型永远以为今天是会话开始日。</li>
  * </ol>
- * 另加两条 CC 状态机不变量：<b>首轮只记录不播报</b>（:1422-1426）、<b>同日无动作</b>（:1428-1430），
+ * 另加两条 CC 状态机不变量：<b>首轮播报日期</b>（真源 2.1.322 exe offset 308666094：
+ * {@code oe===undefined ⇒ oe!==Y ⇒ 发 `Today's date is ${date}.`}）、<b>同日无动作</b>（:1428-1430），
  * 以及一条本仓映射不变量：<b>lastEmittedDate 只随 /clear 复位</b>（caches.ts:69，全仓唯一 set(null)）。
+ *
+ * <p><b>[2.1.322 对齐变更]</b>判据从「会话级 {@code store.lastEmittedDate()}」改为
+ * 「<b>本 agent 消息历史</b>里的最后一次 date/date_change」（CC {@code Fki(e)} 语义）。
+ * WHY：子代理的消息从 initialMessages 起是全新的 ⇒ 历史无日期 ⇒ 首轮即播报；
+ * 若读会话槽位，子代理会因主线程当天已播报而恒判"同日"⇒ 永远拿不到日期。
  *
  * <p>隔离：store 注册表是进程级静态表，逐用例 {@link SessionPromptCacheRegistry#resetForTest()} 清空。
  */
@@ -61,11 +67,11 @@ class DateChangeTailDeliveryTest {
             null, java.util.List.of(), java.util.List.of(), null, false);
     }
 
-    // ── 不变量 1 · 首轮只记录不播报（CC :1422-1426）──
+    // ── 不变量 1 · 首轮播报日期（真源 2.1.322 · exe offset 308666094）──
 
     @Test
-    @DisplayName("首轮：lastEmittedDate 为 null ⇒ 只记录当天、零追加（否则每个会话开头白播一次）")
-    void firstTurn_recordsOnly() {
+    @DisplayName("首轮：历史无日期 ⇒ 尾部播报一条裸 `Today's date is YYYY-MM-DD.`（无免责声明包裹）")
+    void firstTurn_broadcastsDate() {
         String sessionId = newSessionId();
         AgentState state = new AgentState("sys", sessionId, null);
         state.appendMessage(userMsg(sessionId, "hello"));
@@ -74,22 +80,37 @@ class DateChangeTailDeliveryTest {
         AgentLoopContext.maybeEmitDateChange(state);
 
         assertThat(state.promptCacheStore().lastEmittedDate())
-            .as("首轮必须把当天落位（下次比对才有基线）")
+            .as("仍需把当天落位（观测用；判据已改为历史扫描）")
             .isEqualTo(today());
-        assertThat(state.rawMessages())
-            .as("首轮不得播报（CC :1424-1426 return []）")
-            .hasSize(before);
+        List<ChatMessageDto> after = state.rawMessages();
+        assertThat(after)
+            .as("首轮必须播报：CC 2.1.322 在 `oe===undefined` 时 `oe!==Y` 为真 ⇒ 发首次文案")
+            .hasSize(before + 1);
+
+        ChatMessageDto date = after.get(after.size() - 1);
+        assertThat(date.subtype()).as("subtype 与 CC attachment.type 同名").isEqualTo("date");
+        assertThat(date.isMeta()).as("isMeta ⇒ 前端隐藏、不污染用户转录").isTrue();
+        assertThat(date.author()).isEqualTo("attachment");
+        assertThat(date.content())
+            .as("⛔ 必须是裸文案 —— 不带 <system-reminder> 免责声明包裹。"
+                + "否则「may or may not be relevant … should not respond unless highly relevant」"
+                + "会让指定人格的模型把日期当噪声忽略（这正是本次修的缺陷）")
+            .isEqualTo("Today's date is " + today() + ".")
+            .doesNotContain("system-reminder")
+            .doesNotContain("may or may not be relevant");
     }
 
     // ── 不变量 2 · 同日无动作（CC :1428-1430）──
 
     @Test
-    @DisplayName("同日：零追加（跨午夜才播报，同一天反复调用不得每轮追加）")
+    @DisplayName("同日：零追加（历史里已有今天的 date ⇒ 不重复播报）")
     void sameDay_noop() {
         String sessionId = newSessionId();
         AgentState state = new AgentState("sys", sessionId, null);
-        state.promptCacheStore().setLastEmittedDate(today());
         state.appendMessage(userMsg(sessionId, "hello"));
+        ChatMessageDto todays = AgentLoopContext.todayDateMessage(sessionId, today());
+        assertThat(todays).isNotNull();
+        state.appendMessage(todays);
         int before = state.rawMessages().size();
 
         AgentLoopContext.maybeEmitDateChange(state);
@@ -101,14 +122,14 @@ class DateChangeTailDeliveryTest {
     // ── 不变量 3 · 跨午夜：尾部追加新日期消息，且头部消息不被回写 ──
 
     @Test
-    @DisplayName("跨午夜：尾部追加 date_change 真实消息（含新日期），messages[0] 逐字不变")
+    @DisplayName("跨日：尾部追加 date_change 真实消息（含新日期），messages[0] 逐字不变")
     void midnight_appendsTailMessage_headUntouched() {
         String sessionId = newSessionId();
         AgentState state = new AgentState("sys", sessionId, null);
         ChatMessageDto head = userMsg(sessionId, "昨天的请求");
         state.appendMessage(head);
-        // 模拟「昨天已播报过」：把状态停在昨天（生产上由昨天那一 run 的 maybeEmitDateChange 写入）
-        state.promptCacheStore().setLastEmittedDate("1999-01-01");
+        // 模拟「昨天已播报过」：历史里有一条昨天的 date 消息（生产上由昨天那一 run 写入）
+        state.appendMessage(AgentLoopContext.todayDateMessage(sessionId, "1999-01-01"));
         int before = state.rawMessages().size();
 
         AgentLoopContext.maybeEmitDateChange(state);
@@ -128,10 +149,12 @@ class DateChangeTailDeliveryTest {
         assertThat(dc.author()).as("attachment 通道产出（与 CC AttachmentMessage 同契约）").isEqualTo("attachment");
         assertThat(dc.subtype()).as("subtype 与 CC attachment.type 同名").isEqualTo("date_change");
         assertThat(dc.content())
-            .as("渲染文案对齐 CC messages.ts:4163-4167（含新日期 + 「不要向用户明说」）")
-            .contains("The date has changed. Today's date is now " + today() + ".")
-            .contains("DO NOT mention this to the user explicitly")
-            .startsWith("<system-reminder>");
+            .as("逐字对齐 CC 2.1.322 mLt（offset 299045186）changed 分支："
+                + "旧 2.1.88 的 `DO NOT mention … already aware` 已改，且不再包 system-reminder")
+            .isEqualTo("The date has changed. Today's date is now " + today() + ". "
+                + "No need to announce the new date \u2014 the user's own clock shows it.")
+            .doesNotContain("system-reminder")
+            .doesNotContain("DO NOT mention");
         assertThat(state.promptCacheStore().lastEmittedDate())
             .as("播报后落位新日期 ⇒ 同一 run 内多次迭代不重复播报")
             .isEqualTo(today());
@@ -143,15 +166,108 @@ class DateChangeTailDeliveryTest {
     @DisplayName("无会话标识：只记录不追加（无落库通道；CC simple 模式同样禁用附件）")
     void noSession_recordsOnly() {
         AgentState state = new AgentState("sys");
-        state.promptCacheStore().setLastEmittedDate("1999-01-01");
+        // 历史里有昨天日期 ⇒ 走「跨日」分支（首轮分支也需 sessionId，两条分支都必须守住不投递）
+        state.appendMessage(userMsg(null, "昨天的请求"));
+        state.appendMessage(AgentLoopContext.todayDateMessage(null, "1999-01-01"));
         int before = state.rawMessages().size();
 
         AgentLoopContext.maybeEmitDateChange(state);
 
         assertThat(state.rawMessages()).hasSize(before);
         assertThat(state.promptCacheStore().lastEmittedDate())
-            .as("仍需落位新日期：否则每次调用都重判为「跨午夜」")
+            .as("仍需落位新日期：否则每次调用都重判为「跨日」")
             .isEqualTo(today());
+    }
+
+    // ── 不变量 6 · auxiliary 分类：只看「从未发过」，跨日不再重发（CC Ci 的 S 分支）──
+
+    @Test
+    @DisplayName("auxiliary 来源：历史无日期 ⇒ 发；历史有旧日期 ⇒ 跨日也**不发**（CC `S ? oe===undefined : oe!==Y`）")
+    void auxiliary_onlyEmitsWhenNeverEmitted() {
+        // (a) 从未发过 ⇒ 发 · 用 MARBLE_ORIGAMI（auxiliary 但不是 fork/compaction 系）
+        //     ⛔ 不能用 COMPACT/SESSION_MEMORY/EXTRACT_MEMORIES/AUTO_DREAM/FORK —— 它们被
+        //     CC 的 bare/resumeActive 门挡掉（见 isBareOrResumeForkSource）。
+        String s1 = newSessionId();
+        AgentState st1 = new AgentState("sys", s1, null);
+        st1.appendMessage(userMsg(s1, "hello"));
+        AgentLoopContext.maybeEmitDateChange(st1, com.nexusai.application.agent.QuerySource.MARBLE_ORIGAMI);
+        assertThat(st1.rawMessages().get(st1.rawMessages().size() - 1).subtype())
+            .as("auxiliary + 历史无日期 ⇒ 必须发（oe===undefined）")
+            .isEqualTo("date");
+
+        // (b) 历史有昨天日期 ⇒ 不发（auxiliary 档 cross-day 语义被 S 分支短路）
+        String s2 = newSessionId();
+        AgentState st2 = new AgentState("sys", s2, null);
+        st2.appendMessage(userMsg(s2, "hello"));
+        st2.appendMessage(AgentLoopContext.todayDateMessage(s2, "1999-01-01"));
+        int before = st2.rawMessages().size();
+        AgentLoopContext.maybeEmitDateChange(st2, com.nexusai.application.agent.QuerySource.MARBLE_ORIGAMI);
+        assertThat(st2.rawMessages())
+            .as("auxiliary 档跨日**不重发**（CC: `S ? oe===undefined : oe!==Y` 取前者 ⇒ 有旧日期即不命中）")
+            .hasSize(before);
+    }
+
+    @Test
+    @DisplayName("fork/compaction 系：一律不发（CC Ci 开头 `if(s||n.bare)return[]`）")
+    void forkFamily_neverEmits() {
+        for (var qs : List.of(com.nexusai.application.agent.QuerySource.FORK,
+                com.nexusai.application.agent.QuerySource.COMPACT,
+                com.nexusai.application.agent.QuerySource.SESSION_MEMORY,
+                com.nexusai.application.agent.QuerySource.EXTRACT_MEMORIES,
+                com.nexusai.application.agent.QuerySource.AUTO_DREAM)) {
+            String sid = newSessionId();
+            AgentState st = new AgentState("sys", sid, null);
+            st.appendMessage(userMsg(sid, "hello"));
+            int before = st.rawMessages().size();
+            AgentLoopContext.maybeEmitDateChange(st, qs);
+            assertThat(st.rawMessages())
+                .as("fork/compaction 系不得追加 date（会破坏 fork 前缀 == 父前缀 的契约）: " + qs)
+                .hasSize(before);
+        }
+    }
+
+    @Test
+    @DisplayName("isAuxiliaryQuerySource：main/subagent 为 false，其余 true（对齐 CC ns() 三分）")
+    void auxiliaryClassification_matchesCcNs() {
+        assertThat(AgentLoopContext.isAuxiliaryQuerySource(null))
+            .as("CC ns(undefined)=undefined ⇒ 非 auxiliary").isFalse();
+        for (var qs : List.of(com.nexusai.application.agent.QuerySource.USER,
+                com.nexusai.application.agent.QuerySource.REPL_MAIN_THREAD,
+                com.nexusai.application.agent.QuerySource.SDK,
+                com.nexusai.application.agent.QuerySource.SUBAGENT,
+                com.nexusai.application.agent.QuerySource.FORK,
+                com.nexusai.application.agent.QuerySource.HOOK_AGENT)) {
+            assertThat(AgentLoopContext.isAuxiliaryQuerySource(qs))
+                .as("main/subagent 档不得归 auxiliary: " + qs).isFalse();
+        }
+        for (var qs : List.of(com.nexusai.application.agent.QuerySource.COMPACT,
+                com.nexusai.application.agent.QuerySource.SESSION_MEMORY,
+                com.nexusai.application.agent.QuerySource.EXTRACT_MEMORIES,
+                com.nexusai.application.agent.QuerySource.AUTO_DREAM,
+                com.nexusai.application.agent.QuerySource.MARBLE_ORIGAMI,
+                com.nexusai.application.agent.QuerySource.WORKFLOW)) {
+            assertThat(AgentLoopContext.isAuxiliaryQuerySource(qs))
+                .as("backend/auxiliary 查询必须归 auxiliary: " + qs).isTrue();
+        }
+    }
+
+    // ── 不变量 7 · UTC 文案（CC assumedUtc 分支）──
+
+    @Test
+    @DisplayName("dateAttachmentText：四分支逐字对齐 CC mLt（offset 299045186）")
+    void dateText_fourBranches_matchCcMlt() {
+        String d = "2026-11-11";
+        assertThat(AgentLoopContext.dateAttachmentText(d, false, false))
+            .isEqualTo("Today's date is 2026-11-11.");
+        assertThat(AgentLoopContext.dateAttachmentText(d, true, false))
+            .isEqualTo("The date has changed. Today's date is now 2026-11-11. "
+                + "No need to announce the new date \u2014 the user's own clock shows it.");
+        assertThat(AgentLoopContext.dateAttachmentText(d, false, true))
+            .startsWith("The UTC date is 2026-11-11. The user's local date can differ.")
+            .contains("that is the user's local date: treat it as today's date.");
+        assertThat(AgentLoopContext.dateAttachmentText(d, true, true))
+            .startsWith("The UTC date is now 2026-11-11. The user's local date can differ.")
+            .contains("other than an earlier \"Today's date is\" line");
     }
 
     // ── 不变量 5 · 清空点唯一：只有 /clear（CLEAR_SESSION_ALL）复位它（CC caches.ts:69）──

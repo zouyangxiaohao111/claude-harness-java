@@ -855,6 +855,10 @@ function systemRowLabel(m: ChatMessageDto): string {
     return n > 0 ? `技能清单已注入 · ${n} 项` : '技能清单已注入'
   }
   if (sub === 'edited_text_file') return '文件被外部修改'
+  // 首轮日期告知（CC 2.1.322 type:"date" 附件的非 changed 形态，后端
+  // AgentLoopContext.dateAttachmentMessage 产出 subtype='date'）。
+  // 与下方 date_change（跨日）同一族，标签分开——否则会落到默认分支显示英文正文。
+  if (sub === 'date') return '日期已告知'
   if (sub === 'date_change') return '日期变更提醒'
   if (sub === 'changed_files') return '已改动文件清单'
   if (sub === 'mcp_instructions_delta') return 'MCP 指令更新'
@@ -1177,6 +1181,8 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   const editAddedKeysRef = useRef<Set<string>>(new Set())
   const [copied, setCopied] = useState(false)
   const editInputRef = useRef<HTMLTextAreaElement>(null)
+  /** 编辑块本体（自动上拉的滚动目标，见下方 effect） */
+  const editBoxRef = useRef<HTMLDivElement>(null)
   const copiedTimerRef = useRef<number | null>(null)
   // 编辑框自动高度：1 行起，最多 8 行（超出滚动）；14px * 1.6 ≈ 22px/行
   useEffect(() => {
@@ -1186,6 +1192,22 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     const line = 23
     el.style.height = `${Math.min(Math.max(el.scrollHeight, line), line * 8)}px`
   }, [editing, editDraft])
+  /**
+   * [编辑态自动上拉] 编辑块展开后（多行文本 / 粘贴的图片行 / 底部的取消·发送）会把块的下沿
+   * 顶出 `.stream` 可视区 —— 消息本来就在视口下沿时尤其明显，用户得手动滚一下才点得到发送。
+   * 进入编辑态 / 文本增长 / 图片数量变化后各对齐一次：`block:'nearest'` 只在**不可见时**滚动，
+   * 完全可见是空操作 ⇒ 逐键触发也不会把正在查看历史的人拽走。
+   * 放在 rAF 里：上面那个 effect 刚改完 textarea 高度，要等这一帧布局落定再量位置。
+   */
+  useEffect(() => {
+    if (!editing) return
+    const id = requestAnimationFrame(() => {
+      const el = editBoxRef.current
+      // jsdom（单测环境）没有 scrollIntoView（与上方历史跳转同一处兜底）
+      if (el && typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'nearest' })
+    })
+    return () => cancelAnimationFrame(id)
+  }, [editing, editDraft, editAdded.length])
   // 进入编辑态即聚焦输入框（光标落在末尾，与气泡文本连续）
   useEffect(() => {
     const el = editInputRef.current
@@ -1407,6 +1429,21 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   const [noticeOpen, setNoticeOpen] = useState(false)
   // 图片附件放大预览（user-attach-img 点击 → lightbox）
   const [zoomImg, setZoomImg] = useState<string | null>(null)
+  /**
+   * [图片灯箱] Esc 关闭（此前只有「点遮罩」一条出口，用户报「关不掉」）。
+   * 捕获阶段 + 阻断冒泡：灯箱开着时 Esc 只关灯箱，不连带触发编辑框的 Esc 取消编辑。
+   */
+  useEffect(() => {
+    if (!zoomImg) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.preventDefault()
+      e.stopPropagation()
+      setZoomImg(null)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [zoomImg])
   // 图片渲染源：乐观追加 imageData（本地 base64）优先；否则按 imagePasteIds 从 imageCache 取（重拉后 batch 拉图）
   const imageCache = useChatStore((s) => s.imageCache)
   // [snip-persist] 该消息是否已被 Snip 裁剪（实时 STOMP message.boundary + F5 GET /messages 解析合并进 snippedIds）
@@ -1551,18 +1588,23 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
             /* [用户消息编辑重发] 编辑态：气泡位置换成输入块（底部提示 + 取消/发送）。
                [2026-11-01] 原消息的图片/附件在编辑态里**保留显示**：此前编辑块只有一个
                textarea ⇒ 用户看不到自己发过的图，也以为重发会把图带上（实际不会）。 */
-            <div className="user-edit">
+            <div className="user-edit" ref={editBoxRef}>
               {userImages.length > 0 && (
                 <div className="user-edit-attach">
-                  {userImages.map((img, i) => (
-                    <img
-                      key={i}
-                      src={`data:${img.mediaType};base64,${img.base64}`}
-                      alt="图片附件"
-                      className="user-edit-thumb"
-                      title="该图片会随重新发送一并带上"
-                    />
-                  ))}
+                  {userImages.map((img, i) => {
+                    const src = `data:${img.mediaType};base64,${img.base64}`
+                    return (
+                      <img
+                        key={i}
+                        src={src}
+                        alt="图片附件"
+                        className="user-edit-thumb"
+                        style={{ cursor: 'zoom-in' }}
+                        title="该图片会随重新发送一并带上 · 点击放大"
+                        onClick={() => setZoomImg(src)}
+                      />
+                    )
+                  })}
                 </div>
               )}
               {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).length ? (
@@ -1610,7 +1652,16 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                   {editAdded.map((a) => (
                     <span key={a.dedupKey} className="user-edit-added">
                       {a.base64
-                        ? <img src={a.base64} alt={a.filename} className="user-edit-thumb" title={a.filename} />
+                        ? (
+                          <img
+                            src={a.base64}
+                            alt={a.filename}
+                            className="user-edit-thumb"
+                            style={{ cursor: 'zoom-in' }}
+                            title={`${a.filename} · 点击放大`}
+                            onClick={() => setZoomImg(a.base64!)}
+                          />
+                        )
                         : <span className="user-edit-thumb pending" title={`${a.filename}（上传中…）`} />}
                       <button
                         type="button"
@@ -1811,6 +1862,14 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
       {zoomImg && (
         <div className="msg-img-zoom" onClick={() => setZoomImg(null)}>
           <img src={zoomImg} alt="图片预览" onClick={(e) => e.stopPropagation()} />
+          {/* 显式关闭出口：遮罩点击在图片占满视口时几乎点不到，Esc 也不是所有用户都会试 */}
+          <button
+            type="button"
+            className="msg-img-zoom-close"
+            title="关闭预览（Esc）"
+            aria-label="关闭预览"
+            onClick={(e) => { e.stopPropagation(); setZoomImg(null) }}
+          >×</button>
         </div>
       )}
     </div>
@@ -1827,10 +1886,24 @@ const MemoMessage = memo(Message)
 //   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
 //   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
 //   toolCalls 卡片。class 未动。
-const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null }: {
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null }: {
   sessionId: string
   blockId: string
   isStreamingTail: boolean
+  /**
+   * **该轮是否仍在跑**（父级传服务端运行态 `thinking`）。
+   *
+   * <p><b>WHY 不能用 `activeTurnKeys`</b>：那个集合是「哪些轮**当前有流式块**」，它遍历的正是
+   * `streamIds` ⇒ 只要块还在，它对每一轮恒为 `true`，无法区分「还在长」与「已写完但块未被收走」。
+   * 服务端运行态（thinking/streaming vs idle）才是「这一轮还在跑吗」的权威信号。
+   *
+   * <p><b>它能修掉的现象</b>：块存在 ≠ 内容还在增长。两种「已写完但块未消失」的窗口：
+   * ①一轮中途的工具调用之间 —— 前一段正文早写完，只是整轮没结束；
+   * ②服务端已 idle、complete 尚未到达（或要等兜底对账）—— 块还没被 finalizeBlocks 转成消息。
+   * 这两种情况下若仍按流式渲染（不跑 rescue），粘连的 `##标题`、表格会保持裸露，
+   * 要等用户手动展开触发一次重渲才「变好」。用本标志把它们切到非流式渲染。
+   */
+  turnRunning: boolean
   onRunHtml: (code: string) => void
   /** [轮次消息头合并] 同轮非首段流式块不渲染消息头（见 Message.showHeader） */
   showHeader?: boolean
@@ -1930,8 +2003,13 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
           </div>
         )}
         {/* 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含
-            SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。 */}
-        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownTextV2 text={b.content} streaming className="content md" onRunHtml={onRunHtml} />}
+            SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。
+
+            [收口重渲] streaming 只在「这一块还在长」时才是 true：`isStreamingTail` = 是最后一块，
+            `turnRunning` = 该轮仍在跑。两者都满足才走流式臂（不跑 rescue）。
+            其余情况（本块后面已有新块 / 该轮已结束但块未消失）⇒ 走收口臂，跑 rescue
+            —— 这正是「输出完成后点一下展开就变好」那条路径的自动版，无需用户手动触发。 */}
+        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownTextV2 text={b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />}
         {/* [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」） */}
         {renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })}
       </div>
@@ -3990,6 +4068,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               sessionId={row.sid}
               blockId={row.blockId}
               isStreamingTail={row.blockId === lastStreamId}
+              turnRunning={!!thinking}
               onRunHtml={openHtmlPreview}
               showHeader={firstAssistantRowKeys.has(row.key)}
               // [2026-11-02 修「发送后『正在执行』不显示，刷新才有」]

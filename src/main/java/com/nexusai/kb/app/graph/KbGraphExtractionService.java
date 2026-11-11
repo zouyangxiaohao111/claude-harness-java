@@ -14,9 +14,8 @@ import com.nexusai.kb.repo.entity.KbGraphEntityRecord;
 import com.nexusai.kb.repo.entity.KbGraphRelationRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
+import com.nexusai.kb.app.graph.store.KbGraphStore;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
-import com.nexusai.kb.repo.mapper.KbGraphEntityMapper;
-import com.nexusai.kb.repo.mapper.KbGraphRelationMapper;
 import com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper;
 import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
 import org.slf4j.Logger;
@@ -71,8 +70,14 @@ public class KbGraphExtractionService {
     private final KbKnowledgeMapper knowledgeMapper;
     private final KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbChunkMapper chunkMapper;
-    private final KbGraphEntityMapper entityMapper;
-    private final KbGraphRelationMapper relationMapper;
+    /**
+     * 图谱存储（本地 SQLite 或远程 Neo4j）。
+     *
+     * <p>⭐ 2026-11-11 抽接口：原直连两个 mapper，接远程 Neo4j 时这里必须跟着改。
+     * 现在写入统一走 {@link KbGraphStore#replaceGraph}（先清后写），
+     * 两种实现各自决定怎么落。
+     */
+    private final KbGraphStore graphStore;
     private final LlmSideCallClient sideCallClient;
 
     @Autowired(required = false)
@@ -82,15 +87,13 @@ public class KbGraphExtractionService {
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
         KbChunkMapper chunkMapper,
-        KbGraphEntityMapper entityMapper,
-        KbGraphRelationMapper relationMapper,
+        KbGraphStore graphStore,
         LlmSideCallClient sideCallClient
     ) {
         this.knowledgeMapper = knowledgeMapper;
         this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.chunkMapper = chunkMapper;
-        this.entityMapper = entityMapper;
-        this.relationMapper = relationMapper;
+        this.graphStore = graphStore;
         this.sideCallClient = sideCallClient;
     }
 
@@ -205,10 +208,15 @@ public class KbGraphExtractionService {
         }
         List<KbGraphWeights.Result> results = KbGraphWeights.compute(eIn, rIn);
 
-        // ── ④ 落库（先清后写）──────────────────────────────────────────
-        clearExisting(knowledgeId);
-        writeEntities(kbId, knowledgeId, entities, results, rIn);
-        writeRelations(kbId, knowledgeId, relations, rIn, results);
+        // ── ④ 落库（一次 replaceGraph：内部先清后写）────────────────────
+        //    ⚠️ 不能拆成「先 delete 再 insert 两次」：远程 Neo4j 实现需要在一个
+        //    session 里完成清理与写入，否则中途失败会留下「清空了但没写」的空图谱。
+        //    抽取失败路径（上面的 catch）不会走到这里，旧数据保持不动。
+        List<KbGraphEntityRecord> entityRows =
+            buildEntities(kbId, knowledgeId, entities, results, rIn);
+        List<KbGraphRelationRecord> relationRows =
+            buildRelations(kbId, knowledgeId, relations, rIn, results);
+        graphStore.replaceGraph(kbId, knowledgeId, entityRows, relationRows);
 
         log.info("[图谱] 抽取完成 knowledge={} 实体={} 关系={} 块={}",
             knowledgeId, entities.size(), relations.size(), chunks.size());
@@ -227,14 +235,16 @@ public class KbGraphExtractionService {
      * {@code WHERE deleted = 0} 让旧行不挡新行。
      */
     private void clearExisting(String knowledgeId) {
-        entityMapper.deleteByQuery(QueryWrapper.create().where("knowledge_id = ?", knowledgeId));
-        relationMapper.deleteByQuery(QueryWrapper.create().where("knowledge_id = ?", knowledgeId));
+        // ⚠️ 保留此方法只为「只删不写」的调用场景（如抽取失败但需清旧数据）。
+        //    正常写入路径已由 KbGraphStore#replaceGraph 内部先清后写。
+        graphStore.deleteByKnowledge(knowledgeId);
     }
 
-    private void writeEntities(
+    private List<KbGraphEntityRecord> buildEntities(
         String kbId, String knowledgeId, Map<String, Acc> entities,
         List<KbGraphWeights.Result> results, List<KbGraphWeights.RelationInput> rIn
     ) {
+        List<KbGraphEntityRecord> out = new ArrayList<>();
         String now = KbTimeFormat.now();
         // 度数：从关系里累加（同名实体在多个关系里出现就加多次）
         Map<String, Integer> degree = new LinkedHashMap<>();
@@ -255,16 +265,18 @@ public class KbGraphExtractionService {
             row.setFrequency(a.chunkIds.size());
             row.setDegree(degree.getOrDefault(a.name, 0));
             audit(row, now);
-            entityMapper.insert(row);
+            out.add(row);
         }
+        return out;
     }
 
-    private void writeRelations(
+    private List<KbGraphRelationRecord> buildRelations(
         String kbId, String knowledgeId,
         List<KbGraphParser.ExtractedRelation> relations,
         List<KbGraphWeights.RelationInput> rIn,
         List<KbGraphWeights.Result> results
     ) {
+        List<KbGraphRelationRecord> out = new ArrayList<>();
         String now = KbTimeFormat.now();
         for (int i = 0; i < relations.size(); i++) {
             KbGraphParser.ExtractedRelation r = relations.get(i);
@@ -282,8 +294,9 @@ public class KbGraphExtractionService {
             row.setCombinedDegree(res.combinedDegree());
             row.setChunkIds(toJson(List.copyOf(rIn.get(i).chunkIds())));
             audit(row, now);
-            relationMapper.insert(row);
+            out.add(row);
         }
+        return out;
     }
 
     /** 审计六列必须显式赋值（Flex 会把 null 也列进 INSERT ⇒ DB DEFAULT 不生效）。 */

@@ -67,10 +67,27 @@ public record CreateKnowledgeBaseRequest(
      * `KBPostProcessConfig` 侧，不受影响）。
      */
     @JsonProperty("indexing_strategy")
-    String indexingStrategy
+    String indexingStrategy,
+
+    /**
+     * 抽取配置 JSON（`extract_config`）—— 图谱开关的**第二个**字段。
+     *
+     * <p>⭐ 为什么创建时必须能写它：图谱派发判据是两字段的合取
+     * （{@code KbPostProcessConfig.graphEnabled}）：
+     * <pre>
+     * indexing_strategy.graph_enabled  ∧  extract_config.enabled
+     * </pre>
+     * 只写前者 ⇒ {@code extract_config} 为空 ⇒ {@code enabled} 取缺省 false
+     * ⇒ 用户勾了「知识图谱」但一个实体都不会抽，且零日志零报错。
+     * 源侧也是创建时同一个请求带上它（`KnowledgeBaseEditorModal.vue` 的 `data`）。
+     *
+     * <p>null = 不传 ⇒ 落库为 NULL（DB 列可空，下游 parse 成「未配置」）。
+     */
+    @JsonProperty("extract_config")
+    String extractConfig
 ) {
     /**
-     * 6 参兼容构造器（不带索引策略）。
+     * 6 参兼容构造器（不带索引策略 / 抽取配置）。
      *
      * <p>⚠️ 仅供**既有测试**使用 —— 那些用例只关心名称/类型/模型，不涉及索引策略。
      * 生产链路（`KnowledgeBaseController#create` → Jackson 反序列化）走规范构造器。
@@ -80,6 +97,6 @@ public record CreateKnowledgeBaseRequest(
         String name, String description, String type,
         String chunkingConfig, String embeddingModelId, String summaryModelId
     ) {
-        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId, null);
+        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId, null, null);
     }
 }

@@ -1,0 +1,26 @@
+-- ===================================================================
+-- V281: kb_knowledge_base 新增 graph_store_config 列（知识图谱存储后端）
+--
+-- 背景（2026-11-11 用户要求）：「兼容 Neo4j，随时可以配置远程 neo4j 实例」。
+--   本仓图谱默认存在本地 SQLite 两张表（kb_graph_entity / kb_graph_relation），
+--   但在有多实例/需要图算法时，用户希望把某个知识库的图谱放到自己的 Neo4j 上。
+--
+-- ⭐ 为什么放在知识库行上，而不是 settings（全局）：
+--   图谱是**知识库级**功能 —— 每个库可以独立决定图谱存在哪（就像 cos_config /
+--   vlm_config 都是每库一段 JSON）。放全局会导致「A 库想用远程、B 库想用本地」
+--   无法表达。用户明确指出：「这是知识库里面的，你放知识库中去」。
+--
+-- 结构（JSON 对象，缺省 '{}' = 用本地 SQLite，零行为变化）：
+--   {
+--     "store": "local" | "neo4j",          -- 缺省 local
+--     "uri": "bolt://host:7687",           -- store=neo4j 时必填
+--     "username": "neo4j",
+--     "password_encrypted": "..."          -- AES 密文（同 providers.api_key_encrypted 那套）
+--   }
+--
+-- ⚠️ 密码必须加密存储：本列会被 GET /knowledge-bases 原样回显给前端，
+--    明文密码等于把凭据暴露在每次列表请求里。
+-- ⚠️ 远程实例必须装 APOC 插件（写入依赖 apoc.merge.node）。
+-- ⚠️ 切换 store 后，已有本地图谱不会自动出现在 Neo4j —— 需点「迁移到 Neo4j」或重新解析文档。
+-- ===================================================================
+ALTER TABLE kb_knowledge_base ADD COLUMN graph_store_config TEXT NOT NULL DEFAULT '{}';

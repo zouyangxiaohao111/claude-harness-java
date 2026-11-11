@@ -2,9 +2,13 @@ import { useCallback, useEffect, useMemo, useState } from 'react'
 import { graphApi } from '@/api/graph'
 import type { GraphSearchResult } from '@/api/graph'
 import { ApiError } from '@/api/rest'
-import { KnowledgeGraphCanvas } from './KnowledgeGraphCanvas'
-import type { GraphNodeInput } from './graphTypes'
-import { buildGraphView } from './graphAdapter'
+import { KbWikiGraph } from './KbWikiGraph'
+import type { GraphTypeSchema } from './KbWikiGraph'
+import {
+  buildSvgGraph,
+  ENTITY_SLUG,
+  DOC_SLUG,
+} from './graphAdapter'
 
 interface GraphPanelProps {
   baseId: string
@@ -15,14 +19,60 @@ interface GraphPanelProps {
 }
 
 /**
- * 知识库图谱面板 · W7（接真实后端，替代 MOCK）。
+ * 关系图谱的节点视觉方案 —— **复用 Wiki 图谱同一套动画与交互**
+ * （用户 2026-11-11：「图谱按照 wiki 图谱动画样式来 完整实现」）。
  *
- * <p><b>⭐ 与 WikiPanel 里的图谱视图不是同一个东西</b>：
+ * <p>⭐ 图例只保留三种真实存在的类型：文档（hub）/ 实体 / 概念。
+ * ⛔ 不照搬 Wiki 的「综合 / 对比」—— 那两类在实体-关系图里没有对应物，
+ * 点了也不会有任何变化（假图例）。
+ *
+ * <p>⚠️ 必须是**模块级常量**：`KbWikiGraph` 的渲染依赖 `schema` 引用稳定，
+ * 每次渲染都新建对象会让整张图重建、力导向从 alpha=1 重跑（画面会跳）。
+ */
+const ENTITY_SCHEMA: GraphTypeSchema = {
+  colors: {
+    summary: '#0052d9',
+    entity: '#2ba471',
+    concept: '#e37318',
+    synthesis: '#0594fa',
+    comparison: '#d54941',
+    index: '#8c8c8c',
+  },
+  labels: {
+    summary: '文档',
+    entity: '实体',
+    concept: '概念',
+    synthesis: '关系',
+    comparison: '属性',
+    index: 'Index',
+  },
+  themes: {
+    summary: 'primary',
+    entity: 'success',
+    concept: 'warning',
+    synthesis: 'primary',
+    comparison: 'danger',
+    index: 'default',
+  },
+  legend: [
+    { type: 'summary', label: '文档', color: '#0052d9' },
+    { type: 'entity', label: '实体', color: '#2ba471' },
+    { type: 'concept', label: '概念', color: '#e37318' },
+  ],
+  all: ['summary', 'entity', 'concept'],
+}
+
+/**
+ * 知识库图谱面板 · W7（接真实后端）。
+ *
+ * <p><b>⭐ 与 WikiPanel 的图谱视图不是同一个东西</b>：
  * <ul>
  *   <li>WikiPanel 的图谱 = <b>Wiki 页面之间的 [[链接]]</b>（页面级）</li>
  *   <li>本面板 = <b>文档中抽取的实体与关系</b>（图谱抽取产物，`kb_graph_entity`）</li>
  * </ul>
- * 两者数据源完全不同，⛔ 不要合并成一个视图。
+ * 两者<b>数据源完全不同</b>，⛔ 不要合并数据；但<b>渲染引擎共用</b>
+ * （`KbWikiGraph`：SVG + 力导向 + 集群轮廓 + 标签避让 + pan/zoom + 展开子图），
+ * 这是用户 2026-11-11 明确要求的「按 wiki 图谱动画样式来」。
  *
  * <p><b>空态必须分成因</b>（三次踩过的坑）：
  * ① 库还没抽过图谱 → 引导去重建；
@@ -35,7 +85,6 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
   const [rebuilding, setRebuilding] = useState(false)
   const [data, setData] = useState<GraphSearchResult | null>(null)
   const [error, setError] = useState<string | null>(null)
-  const [query, setQuery] = useState('')
   const [selectedDoc, setSelectedDoc] = useState('')
 
   const load = useCallback(
@@ -59,14 +108,17 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
   // ⚠️ 换知识库必须重新拉（否则显示的是上一个库的图）
   useEffect(() => {
     void load('')
-    setQuery('')
+    setSelectedDoc('')
   }, [load])
 
-  const view = useMemo(() => buildGraphView(data, baseName || '知识库'), [data, baseName])
+  /** 文档 id → 标题（喂给文档 hub 节点）。 */
+  const docTitles = useMemo(
+    () => new Map(knowledgeOptions.map((k) => [k.id, k.title] as const)),
+    [knowledgeOptions]
+  )
 
-  const handleSelect = useCallback((n: GraphNodeInput | null) => {
-    if (n) showToast(`实体：${n.name}`, 'info')
-  }, [showToast])
+  /** 后端结果 → SVG 引擎输入（文档 hub + 实体 + 关系边）。 */
+  const svgGraph = useMemo(() => buildSvgGraph(data, docTitles), [data, docTitles])
 
   const handleRebuild = useCallback(async () => {
     if (!selectedDoc) {
@@ -86,26 +138,104 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
       } else {
         showToast(`重建失败：${r.detail}`, 'info')
       }
-      await load(query)
+      await load('')
     } catch (e) {
       showToast(e instanceof ApiError ? e.message : '重建失败', 'info')
     } finally {
       setRebuilding(false)
     }
-  }, [baseId, selectedDoc, showToast, load, query])
+  }, [baseId, selectedDoc, showToast, load])
+
+  /**
+   * 节点抽屉正文。
+   *
+   * <p>关系图谱的节点是**实体**（或文档 hub），没有 Wiki 页面正文 ⇒
+   * 这里渲染「属性 + 关联关系 + 证据片段」，数据全部来自已加载的 `GraphSearchResult`
+   * （⛔ 不再发请求：`source_chunks` 后端已经一并返回）。
+   */
+  const renderNodeBody = useCallback(
+    (slug: string) => {
+      if (!data) return null
+      const isDoc = slug.startsWith(DOC_SLUG)
+      const rawId = isDoc ? slug.slice(DOC_SLUG.length) : slug.slice(ENTITY_SLUG.length)
+
+      if (isDoc) {
+        const own = data.entities.filter((e) => e.knowledge_id === rawId)
+        return (
+          <div className="kb-entity-detail">
+            <p className="kb-entity-detail-meta">
+              该文档抽取到 <b>{own.length}</b> 个实体、<b>{data.relationships.filter((r) => own.some((e) => e.id === r.source_id || e.id === r.target_id)).length}</b> 条关系。
+            </p>
+            <p className="kb-entity-detail-meta">双击图谱中的实体节点可聚焦到它的子图。</p>
+          </div>
+        )
+      }
+
+      const entity = data.entities.find((e) => e.id === rawId)
+      if (!entity) return <p className="wiki-empty-desc">实体已不在当前图谱中</p>
+
+      const rels = data.relationships.filter(
+        (r) => r.source_id === entity.id || r.target_id === entity.id
+      )
+      const nameOf = new Map(data.entities.map((e) => [e.id, e.name] as const))
+
+      return (
+        <div className="kb-entity-detail">
+          {entity.entity_type ? (
+            <p className="kb-entity-detail-meta">类型：{entity.entity_type}</p>
+          ) : null}
+          {entity.knowledge_id ? (
+            <p className="kb-entity-detail-meta">
+              所属文档：{docTitles.get(entity.knowledge_id) || '（文档已删除）'}
+            </p>
+          ) : null}
+
+          <h4 className="kb-entity-detail-title">属性（{entity.attributes?.length ?? 0}）</h4>
+          {entity.attributes?.length ? (
+            <ul className="kb-entity-detail-list">
+              {entity.attributes.map((a, i) => (
+                <li key={i}>{a}</li>
+              ))}
+            </ul>
+          ) : (
+            <p className="wiki-empty-desc">该实体没有抽取到属性</p>
+          )}
+
+          <h4 className="kb-entity-detail-title">关系（{rels.length}）</h4>
+          {rels.length ? (
+            <ul className="kb-entity-detail-list">
+              {rels.map((r) => {
+                const out = r.source_id === entity.id
+                const other = nameOf.get(out ? r.target_id : r.source_id) || '未知'
+                return (
+                  <li key={r.id}>
+                    {out ? `→ ${r.type || '相关'} → ` : `← ${r.type || '相关'} ← `}
+                    <b>{other}</b>
+                  </li>
+                )
+              })}
+            </ul>
+          ) : (
+            <p className="wiki-empty-desc">该实体没有已抽取的关系</p>
+          )}
+        </div>
+      )
+    },
+    [data, docTitles]
+  )
 
   // ── 渲染 ──────────────────────────────────────────────────────
   // DOM 外壳照源站（KnowledgeBase.vue / WikiBrowser.vue）：
   //   .wiki-main-area > .wiki-browser > .wiki-graph
-  //     > .wiki-graph-search-container > .wiki-graph-search-row > .wiki-graph-search
-  //     > .wiki-graph-canvas（由 KnowledgeGraphCanvas 渲染）
-  //     > .wiki-reader-empty.wiki-graph-empty（空态覆盖层，absolute inset 0）
+  // 有数据时把整个画布交给 `KbWikiGraph`（与 Wiki 图谱同一个引擎）。
   if (loading && !data) {
     return (
       <div className="wiki-main-area">
         <div className="wiki-browser">
           <div className="wiki-graph">
-            <div className="wiki-reader-empty wiki-graph-empty">
+            {/* ⚠️ `is-open` 不能省：kb-04.css 里 `.wiki-graph-empty{display:none}`，
+                只有 `.is-open` 才 `display:flex`。 */}
+            <div className="wiki-reader-empty wiki-graph-empty is-open">
               <p className="wiki-empty-desc">正在加载图谱…</p>
             </div>
           </div>
@@ -118,7 +248,7 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
       <div className="wiki-main-area">
         <div className="wiki-browser">
           <div className="wiki-graph">
-            <div className="wiki-reader-empty wiki-graph-empty">
+            <div className="wiki-reader-empty wiki-graph-empty is-open">
               <div className="wiki-empty-icon" aria-hidden="true">◍</div>
               <p className="wiki-empty-title">图谱加载失败</p>
               <p className="wiki-empty-desc">{error}</p>
@@ -126,7 +256,7 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
                 type="button"
                 className="t-button t-button--variant-base t-button--theme-primary t-size-m"
                 style={{ marginTop: 16 }}
-                onClick={() => void load(query)}
+                onClick={() => void load('')}
               >
                 <span className="t-button__text">重试</span>
               </button>
@@ -137,22 +267,30 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
     )
   }
 
-  const hasEntities = view.nodeCount > 0
-  if (!hasEntities) {
+  if (svgGraph.nodes.length === 0) {
     return (
       <div className="wiki-main-area">
         <div className="wiki-browser">
           <div className="wiki-graph">
-            <div className="wiki-reader-empty wiki-graph-empty">
+            {/* ⚠️ `is-open` 不能省（见上） */}
+            <div className="wiki-reader-empty wiki-graph-empty is-open">
               <div className="wiki-empty-icon" aria-hidden="true">◍</div>
               <p className="wiki-empty-title">还没有图谱数据</p>
-              <p className="wiki-empty-desc">
-                图谱是从「已解析完成」的文档里抽取实体与关系得到的。
-                如果你刚上传文档，请等解析完成后重建一次；如果是纯图片文档，可能抽不到文字实体。
+              {/* ⭐ 文案必须与「自动抽取」的现行行为一致（2026-11-11）。
+                  旧文案写「请等解析完成后重建一次」，会让用户以为**本来就要手动**
+                  —— 实际开启图谱后上传的文档会在解析完成时自动派发抽取任务。
+                  只有两种情况需要手动点重建：① 开启图谱之前就已入库的存量文档；
+                  ② 当时抽取失败 / 没配模型。⛔ 不要把文案改回「必须手动」。
+                  ⚠️ maxWidth：`.wiki-reader-empty` 是 flex-column + align-items:center，
+                  子元素按**内容宽度**排布 ⇒ 这段文案会单行铺到 800+ px（实测 862px）。
+                  限宽后自然折行。 */}
+              <p className="wiki-empty-desc" style={{ maxWidth: 560 }}>
+                开启「知识图谱」后，新上传的文档会在解析完成时自动抽取实体与关系，无需手动操作。
+                若这是开启图谱之前就已入库的文档，或当时抽取失败，请在下方选中文档点「重建图谱」补抽。
+                纯图片文档可能抽不到文字实体。
               </p>
               {/* ⚠️ 重建入口是本仓特有（源站图谱视图没有「重建」）⇒ 没有对应源站类。
-                  `.wiki-reader-empty` 只给纵向居中，动作行用手写 flex 行内样式
-                  （与 W3 WikiPanel 空态动作行同一写法；⛔ 不新增 CSS 类）。 */}
+                  `.wiki-reader-empty` 只给纵向居中，动作行用手写 flex 行内样式。 */}
               <div
                 style={{
                   display: 'flex',
@@ -168,6 +306,9 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
                   value={selectedDoc}
                   onChange={(e) => setSelectedDoc(e.target.value)}
                   aria-label="选择要抽取图谱的文档"
+                  /* ⚠️ 必须限宽：`<select>` 的固有宽度跟随**最长 option**（实测被一个
+                     30 字的文档名撑到 563px），在居中的空态里显得极不协调。 */
+                  style={{ width: 260, minWidth: 0 }}
                 >
                   <option value="">选择要抽取的文档…</option>
                   {knowledgeOptions.map((k) => (
@@ -193,71 +334,23 @@ export function GraphPanel({ baseId, baseName, knowledgeOptions = [], showToast 
   return (
     <div className="wiki-main-area">
       <div className="wiki-browser">
-        <div className="wiki-graph">
-          <div className="wiki-graph-search-container">
-            <div className="wiki-graph-search-row">
-              <div className="wiki-graph-search">
-                <div className="t-input__wrap">
-                  <div className="t-input t-input--prefix">
-                    <span className="t-input__prefix t-input__prefix-icon" aria-hidden="true">⌕</span>
-                    <input
-                      className="t-input__inner"
-                      placeholder="按实体名筛选…（回车）"
-                      value={query}
-                      onChange={(e) => setQuery(e.target.value)}
-                      onKeyDown={(e) => { if (e.key === 'Enter') void load(query) }}
-                    />
-                  </div>
-                </div>
-              </div>
-              {/* ⚠️ 「刷新」是本仓特有（源站由响应式数据自动重绘，没有刷新按钮）。
-                  位置对应源站的 `.wiki-graph-help-trigger`（同行右侧 32px 方块），
-                  类名用 t-button 系列，⛔ 不借用 help-trigger 类。 */}
-              <button
-                type="button"
-                className={`t-button t-button--variant-outline t-button--theme-default t-size-s${loading ? ' t-is-disabled' : ''}`}
-                style={{ flexShrink: 0 }}
-                onClick={() => void load(query)}
-                disabled={loading}
-              >
-                <span className="t-button__text">{loading ? '刷新中…' : '刷新'}</span>
-              </button>
-            </div>
-            {/* 源站把「当前视图摘要」做成 legend 底部的 .wiki-graph-status-card。
-                本仓 legend 由 KnowledgeGraphCanvas 持有，而统计数字/截断原因属于本面板
-                （且 ⛔ 不许改子组件 props 形状）⇒ 放到搜索容器第二行。
-                ⚠️ `.wiki-graph-status-card` 自身只有 `border-top:1px dashed` + `padding-top:8px`
-                （设计上是塞在白卡 legend 里的分隔项，不是独立卡片）；直接放在画布上会让
-                深色文字压在深色画布上。⇒ 行内补 legend 同款卡片外观（值取自 kb-04.css
-                的 `.wiki-graph-legend`，var 后带 token 兜底，独立演示页也能降级）。 */}
-            <div
-              className="wiki-graph-status-card"
-              style={{
-                background: 'var(--td-bg-color-container, #fff)',
-                border: '1px solid var(--td-component-stroke, #e7e7e7)',
-                borderRadius: 'var(--app-radius-sm, 6px)',
-                boxShadow: 'var(--td-shadow-1, 0 1px 10px rgba(0,0,0,.05))',
-                padding: '8px 12px',
-              }}
-            >
-              <div className="status-card-header">
-                <span aria-hidden="true">◍</span>
-                <span className="status-card-title">全库概览</span>
-              </div>
-              <div className="status-card-primary">
-                {view.nodeCount} 个实体 / {view.edges.length} 条关系
-              </div>
-              {view.truncated || data?.meta?.truncated ? (
-                <div className="status-card-secondary">
-                  {view.truncated ? `已按度数截断到前 ${view.nodeCount} 个` : ''}
-                  {view.truncated && data?.meta?.truncated ? ' · ' : ''}
-                  {data?.meta?.truncated ? '后端已截断' : ''}
-                </div>
-              ) : null}
-            </div>
+        {svgGraph.truncated ? (
+          /* ⚠️ 截断必须显式告诉用户（⛔ 不能静默少画）：KbWikiGraph 状态卡只报
+             「已展示全部节点」，不知道后端还有多少没画。 */
+          <div className="wiki-graph-truncate-tip">
+            当前库实体过多，按关系数展示前 {svgGraph.nodes.length} 个（共 {svgGraph.total} 个）
           </div>
-          <KnowledgeGraphCanvas nodes={view.nodes} edges={view.edges} onSelect={handleSelect} />
-        </div>
+        ) : null}
+        <KbWikiGraph
+          baseId={baseId}
+          pages={[]}
+          dataOverride={svgGraph}
+          schema={ENTITY_SCHEMA}
+          renderNodeBody={renderNodeBody}
+          searchPlaceholder="搜索实体…"
+          searchEmptyText="没有找到匹配的实体"
+          statusTitle={baseName ? `${baseName} · 概览` : '全库概览'}
+        />
       </div>
     </div>
   )

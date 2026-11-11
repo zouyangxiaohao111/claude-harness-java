@@ -171,10 +171,21 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             ps = seen.get(0);
         }
         // 旧实现：QueryParams.forLoop 硬编码 Map.of() → hook 恒拿空上下文（空桩）。
+        // [对齐 CC 2.1.322] 本夹具无 claudeMd（claudemdEngine=null 且无项目 CLAUDE.md）⇒
+        //   userContext 原本只有 currentDate 一个键；currentDate 被摘除后**合法为空**。
+        //   CC 同样如此：`delete P.currentDate` 后若 claudeMd 为空 ⇒ userContext 空 ⇒
+        //   prependUserContext 不产 meta 消息（api.ts:457-459 空 context 不污染前缀）。
+        //   「材料收集不是空桩」的判据因此落在 systemContext（下方 gitStatus 断言）上。
         assertThat(ps.userContext())
-            .as("[验收2] userContext 必须非空（旧实现恒 Map.of() 空桩）——CC query.ts:183 getUserContext 产物")
-            .isNotEmpty();
-        assertThat(ps.userContext()).containsKey("currentDate");
+            .as("[对齐 CC 2.1.322] 无 claudeMd ⇒ 摘除 currentDate 后 userContext 为空是预期"
+                + "（CC 空 context 不贴 meta）；这里只保证不再残留 currentDate")
+            .doesNotContainKey("currentDate");
+        assertThat(ps.userContext())
+            .as("[对齐 CC 2.1.322] currentDate 已被从 userContext 摘除"
+                + "（exe offset 308659585 `delete P.currentDate`）—— 日期改由 date 附件单独供给，"
+                + "避免被 prependUserContext 的「may or may not be relevant」免责声明弱化"
+                + "（那正是「指定人格后不知道今天几号」的成因）")
+            .doesNotContainKey("currentDate");
         assertThat(ps.systemContext())
             .as("[验收2] systemContext 必须非空（旧实现恒 Map.of() 空桩）——CC query.ts:184 getSystemContext 产物"
                 + "（custom=null 时不短路）；注入的 gitStatus 必须原样到达 hook")
@@ -307,10 +318,15 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
             .as("[调用方边界] doRun 未收集材料 ⇒ append 尾段不会到达 provider（变异必红）；"
                 + "收集到位 ⇒ EffectiveSystemPromptBuilder 的 append 恒末尾段可见")
             .contains(appendMarker);
+        // [对齐 CC 2.1.322] currentDate 已从 userContext 摘除（exe offset 308659585
+        //   `delete P.currentDate`）⇒ 它**不得**再以任何形式出现在发给 provider 的消息里。
+        //   日期改走独立 date 附件（AgentLoopContext.maybeEmitDateChange），那里是裸文案、
+        //   不带 prependUserContext 的「may or may not be relevant」免责声明。
+        //   本夹具无 claudeMd ⇒ userContext 摘除后为空 ⇒ prependUserContext 不产 meta 消息
+        //   （与 CC 一致：空 context 不污染前缀）。
         assertThat(histories.get(0))
-            .as("[调用方边界] userContext 经 prependUserContext 前置 meta user 消息（currentDate 恒在）"
-                + "—— 仅当 doRun 收集了 userContext 才出现")
-            .anyMatch(m -> m.isMeta() && m.content() != null && m.content().contains("currentDate"));
+            .as("[对齐 CC 2.1.322] currentDate 不得出现在消息里（摘除生效的判据）")
+            .noneMatch(m -> m.content() != null && m.content().contains("Today's date is"));
     }
 
     // ═══════════════════════════ 脚手架 ═══════════════════════════

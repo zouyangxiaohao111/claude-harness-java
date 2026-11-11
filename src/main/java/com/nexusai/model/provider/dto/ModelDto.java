@@ -48,5 +48,19 @@ public record ModelDto(
     /** 重排默认返回条数（仅 type=rerank 生效）· models.rerank_top_n（V200）；null = 服务端默认 */
     Integer rerankTopN,
     /** 重排默认指令（仅 type=rerank 生效）· models.rerank_instruct（V200）；null/空 = 不发送 */
-    String rerankInstruct
+    String rerankInstruct,
+    /**
+     * 所属提供商 ID · {@code models.provider_id}。
+     *
+     * <p>⭐ 2026-11-11 用户裁定：模型选择项要显示成 {@code provider/modelName}，
+     * 否则同名模型（实测 {@code deepseek-v4.1-flash} 有三个 provider 各一份）在下拉里
+     * 完全分不清。此前 DTO 不暴露该列 ⇒ 前端无法分组。
+     */
+    String providerId,
+    /**
+     * 所属提供商显示名 · {@code providers.name}（如 {@code deepseek} / {@code oc_new}）。
+     *
+     * <p>取不到（provider 被删）时为 null；前端回退用 {@link #providerId}。
+     */
+    String providerName
 ) {}

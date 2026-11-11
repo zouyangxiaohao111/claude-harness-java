@@ -102,12 +102,40 @@ public class KbImageEnrichService {
      * @return 补成功的图片数
      */
     public int enrichKnowledge(String knowledgeId) {
+        return enrichKnowledge(knowledgeId, null);
+    }
+
+    /**
+     * 为某文档所有含图分块补 caption / OCR · <b>可指定模型</b>。
+     *
+     * <p>⭐ 2026-11-11 用户裁定「VLLM 视觉模型…单独选择也能其效果」：
+     * {@code modelIdOrName} 来自知识库 {@code image_processing_config.model_id}；
+     * 为空 ⇒ 视觉调用器自动回落全局 {@code settings.multimodalModelName}。
+     *
+     * @param knowledgeId   文档 ID
+     * @param modelIdOrName 库级指定模型（null/空 = 跟随全局默认）
+     * @return 补成功的图片数
+     */
+    public int enrichKnowledge(String knowledgeId, String modelIdOrName) {
         if (knowledgeId == null || knowledgeId.isBlank()) {
             return 0;
         }
-        if (imageStorage == null || visionCaller == null || !visionCaller.isAvailable()) {
+        if (imageStorage == null || visionCaller == null) {
+            log.info("[图片] 视觉调用通道缺失，跳过 caption/OCR knowledge={}", knowledgeId);
+            return 0;
+        }
+        final String model = modelIdOrName == null || modelIdOrName.isBlank() ? null : modelIdOrName.trim();
+        // ⭐ 判「有没有视觉能力」不能只看全局档位：知识库可能自己指定了模型，
+        //    此时即使 `settings.multimodalModelName` 没配，也该跑（用户裁定「单独选择也能其效果」）。
+        //    只有「库级没指定 且 全局不可用」才是真的没能力。
+        if (!visionCaller.isAvailable() && model == null) {
             log.info("[图片] 视觉能力未配置，跳过 caption/OCR knowledge={}", knowledgeId);
             return 0;
+        }
+        if (model != null) {
+            log.info("[图片] 使用知识库指定视觉模型 model={} knowledge={}", model, knowledgeId);
+        } else {
+            log.info("[图片] 使用全局多模态默认模型 knowledge={}", knowledgeId);
         }
         List<KbChunkRecord> chunks = chunkMapper.selectListByQuery(
             QueryWrapper.create()
@@ -135,7 +163,7 @@ public class KbImageEnrichService {
                     continue;
                 }
                 attempted++;
-                if (describeInto(img, local, chunk.getId())) {
+                if (describeInto(img, local, chunk.getId(), model)) {
                     changed = true;
                     done++;
                 }
@@ -194,11 +222,11 @@ public class KbImageEnrichService {
     // ── 内部 ────────────────────────────────────────────────────────────
 
     /** 调视觉模型描述一张图，成功则写进该 image 节点。 */
-    private boolean describeInto(ObjectNode img, Path local, String chunkId) {
+    private boolean describeInto(ObjectNode img, Path local, String chunkId, String model) {
         boolean ok = false;
         try {
-            String caption = visionCaller.describeImage(local, KbImagePrompts.CAPTION,
-                KbParseContext.defaults());
+            String caption = visionCaller.describeImageWithModel(local, KbImagePrompts.CAPTION,
+                KbParseContext.defaults(), model);
             if (!KbImagePrompts.isNoCaption(caption)) {
                 img.put("caption", clip(caption, MAX_CAPTION_CHARS));
                 ok = true;
@@ -208,8 +236,8 @@ public class KbImageEnrichService {
                 chunkId, local.getFileName(), e.getMessage());
         }
         try {
-            String ocr = visionCaller.describeImage(local, KbImagePrompts.OCR,
-                KbParseContext.defaults());
+            String ocr = visionCaller.describeImageWithModel(local, KbImagePrompts.OCR,
+                KbParseContext.defaults(), model);
             if (!KbImagePrompts.isNoTextReply(ocr)) {
                 img.put("ocr_text", clip(ocr, MAX_OCR_CHARS));
                 ok = true;

@@ -408,7 +408,7 @@ class McpInstructionsDeltaTailDeliveryTest {
     void wiring_perTurnCallSitsBetweenDateChangeAndChangedFiles() throws Exception {
         String src = Files.readString(Path.of(
             "src/main/java/com/nexusai/application/agent/LlmAgentLoop.java"));
-        int dateChange = src.indexOf("AgentLoopContext.maybeEmitDateChange(state)");
+        int dateChange = src.indexOf("AgentLoopContext.maybeEmitDateChange(state");
         int mcpDelta = src.indexOf("AgentLoopContext.maybeEmitMcpInstructionsDelta(");
         int changedFiles = src.indexOf("AgentLoopContext.maybeEmitChangedFiles(state, params.toolUseContext())");
         assertThat(dateChange).as("date_change 挂点必须在（CC attachments.ts:830）").isGreaterThan(-1);

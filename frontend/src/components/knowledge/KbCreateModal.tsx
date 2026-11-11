@@ -19,16 +19,30 @@ export interface KbCreateSubmit {
   chunkSize: number
   chunkOverlap: number
   /**
-   * 索引策略 —— RAG / Wiki 两个开关（对齐源码
+   * 索引策略 —— RAG / Wiki / 图谱三个开关（对齐源码
    * `KnowledgeBaseEditorModal.vue:1690-1694` 的 `data.indexing_strategy`）。
    *
-   * <p>⚠️ 这两个是**并列能力**，不是互斥类型：一个文档型知识库可以同时开 RAG 与 Wiki。
+   * <p>⚠️ 这三个是**并列能力**，不是互斥类型：一个文档型知识库可以同时开 RAG 与 Wiki。
    * 源侧注释写死「Wiki enablement is carried solely by `indexing_strategy.wiki_enabled`」
    * （`:1675`）⇒ Wiki 不是 `type` 的一个取值。
    *
-   * <p>传 `null` = 用户没动过这两项（FAQ 库不显示索引策略，也不该写空对象）。
+   * <p>传 `null` = 用户没动过这三项（FAQ 库不显示索引策略，也不该写空对象）。
    */
-  indexingStrategy: { vector_enabled: boolean; keyword_enabled: boolean; wiki_enabled: boolean } | null
+  indexingStrategy: {
+    vector_enabled: boolean
+    keyword_enabled: boolean
+    wiki_enabled: boolean
+    graph_enabled: boolean
+  } | null
+  /**
+   * 抽取配置 JSON（`extract_config`）。
+   *
+   * <p>⭐ 图谱判据是两字段合取（`KbPostProcessConfig.graphEnabled`）：
+   * `indexing_strategy.graph_enabled` ∧ `extract_config.enabled`。
+   * 只写前一个 ⇒ 后端 parse 出 `enabled=false` ⇒ 勾了图谱但一个实体都不抽。
+   * 本仓后端收 **String**（列是 TEXT 存 JSON）⇒ 这里已序列化好，⛔ api 层别再 stringify。
+   */
+  extract_config?: string | null
 }
 
 interface Props {
@@ -117,7 +131,15 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
   const [models, setModels] = useState<Model[]>([])
   const [vlm, setVlm] = useState(false)
   const [asr, setAsr] = useState(false)
-  const [graphOn, setGraphOn] = useState(true)
+  /**
+   * 知识图谱开关 —— **一处状态、两处入口**。
+   *
+   * <p>⭐ 索引策略第三张卡与「知识图谱」tab 的开关共用它，否则两处显示会打架
+   * （用户在 tab 里开了、策略卡还是关的，最终只写其中一个字段）。
+   * 提交时它会**同时**写 `indexing_strategy.graph_enabled` 与 `extract_config.enabled`
+   * —— 后端判据是这两者的合取（见 `KbPostProcessConfig.graphEnabled`）。
+   */
+  const [graph, setGraph] = useState(false)
   const [qgen, setQgen] = useState(false)
   const [autotag, setAutotag] = useState(false)
   const [faqSimilar, setFaqSimilar] = useState(true)
@@ -178,7 +200,12 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
               vector_enabled: rag,
               keyword_enabled: rag,
               wiki_enabled: wiki,
+              graph_enabled: graph,
             },
+        // ⭐ 图谱判据的另一半（`extract_config.enabled`）必须同时写，
+        //    只写 graph_enabled 的话后端 `graphEnabled()` 的合取恒 false ⇒ 静默不抽。
+        //    FAQ 库没有图谱流水线 ⇒ null，⛔ 不写空对象。
+        extract_config: type === 'faq' || !graph ? null : JSON.stringify({ enabled: true }),
       })
     } finally {
       setSubmitting(false)
@@ -387,6 +414,35 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                                 </span>
                               </label>
                               <p className="indexing-check-desc">自动生成互相关联的 Wiki 知识页面，构建结构化知识体系</p>
+                            </div>
+                            {/* ⭐ 第三张卡：知识图谱。与上面两张**完全同款** DOM
+                                （indexing-check-item / t-checkbox / indexing-check-title / indexing-check-desc），
+                                不加 NEW 徽标（不是新能力，只是之前没有写入入口）。
+                                ⚠️ 开关与「知识图谱」tab 共用同一个 state —— 两处必须联动。 */}
+                            <div
+                              className={`indexing-check-item${graph ? ' is-checked' : ''}`}
+                              onClick={() => setGraph((v) => !v)}
+                              role="checkbox"
+                              aria-checked={graph}
+                              tabIndex={0}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setGraph((v) => !v) }
+                              }}
+                            >
+                              <label className={`t-checkbox indexing-check-box${graph ? ' t-is-checked' : ''}`}>
+                                <input
+                                  type="checkbox"
+                                  className="t-checkbox__former"
+                                  checked={graph}
+                                  onChange={(e) => setGraph(e.target.checked)}
+                                  tabIndex={-1}
+                                />
+                                <span className="t-checkbox__input" />
+                                <span className="t-checkbox__label">
+                                  <span className="indexing-check-title">知识图谱</span>
+                                </span>
+                              </label>
+                              <p className="indexing-check-desc">用 LLM 从文档中抽取实体与关系，构建可检索的知识图谱</p>
                             </div>
                           </div>
                         </div>
@@ -848,11 +904,14 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                         <div className="setting-control">
                           <button
                             type="button"
-                            className={`t-switch t-size-m${graphOn ? ' t-is-checked' : ''}`}
+                            className={`t-switch t-size-m${graph ? ' t-is-checked' : ''}`}
                             role="switch"
-                            aria-checked={graphOn}
+                            aria-checked={graph}
                             aria-label="启用图谱抽取"
-                            onClick={() => { setGraphOn((v) => !v); notWiredInCreate('图谱抽取') }}
+                            /* ⭐ 与索引策略第三张卡同一个 state（两处显示必须一致）。
+                               后端 create 已收 extract_config ⇒ 不再是「创建后配置」，
+                               ⛔ 不能再弹 notWiredInCreate。 */
+                            onClick={() => setGraph((v) => !v)}
                           >
                             <span className="t-switch__handle" />
                           </button>

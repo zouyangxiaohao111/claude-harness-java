@@ -146,6 +146,21 @@ public class SubagentExecutor {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     /**
+     * 单次预加载技能数上限 · 对齐 CC exe runAgent 内 {@code var Hu=500, Ms=32}
+     * （chunk 起点 + 相对偏移 110170，v2.1.322 实测）。
+     *
+     * <p>CC 真源：
+     * <pre>
+     *   $o = L(e.skills ?? []), Ks = $o.slice(0, Ms);
+     *   if ($o.length > Ms) t(`[Agent: ${e.agentType}] Warning: the skills list has
+     *     ${$o.length} different names; only the first ${Ms} are preloaded`, {level:"warn"});
+     * </pre>
+     * ⇒ 只预加载前 32 个并告警。本仓旧实现无上限：声明 100 个就预加载 100 份技能正文，
+     * token 成本随声明数线性上涨（且 agent 作者通常不会意识到这一点）。
+     */
+    private static final int MAX_PRELOADED_SKILLS = 32;
+
+    /**
      * [IMP-SUB-25 D-3] handoff 复核提示词 · CC original:
      * "Sub-agent has finished and is handing back control to the main agent. Review the sub-agent's work
      * based on the block rules and let the main agent know if any file is dangerous (the main agent will see the reason)."
@@ -2323,7 +2338,24 @@ public class SubagentExecutor {
         // ── Step 14: SkillPreloader.preload → 推入 initialMessages ──
         // P1-11: 消费共享 SkillPreloader bean（内部共享 SkillRegistry @Bean），
         //   对齐 CC runAgent.ts:580 getSkillToolCommands 共享 memoized 源；不再 per-call new SkillRegistry。
+        //
+        // skills() 语义（与 CC / CCB 一致，见 exe runAgent `$o=L(e.skills??[])` /
+        //   CCB runAgent.ts:587）：
+        //   · Optional.empty()  = 未声明 ⇒ 不预加载
+        //   · Optional.of([])   = 显式 `skills: []` ⇒ 不预加载（与未声明同效）
+        //   · Optional.of([a,b])= 点名 ⇒ 预加载 a/b 的正文
+        //   · Optional.of(["*"])= CC 原样 ⇒ "*" 不是真技能名，findCommand 查不到 → warn + missingSkills
+        //     （⛔ 不实现「* = 全部预加载」；那会与 CC 源站冲突且 token 成本不可控）
+        //   ⚠️ 本字段只影响预加载，**不影响通告**（通告侧对 skills 零引用）。
         List<String> skillsToPreload = agentDefinition.skills().orElse(List.of());
+        // [Ms=32 上限 · CC 对齐] 见 MAX_PRELOADED_SKILLS javadoc。超限只取前 32 个（CC 同款告警文案）。
+        if (skillsToPreload.size() > MAX_PRELOADED_SKILLS) {
+            log.warn("[SubagentExecutor] Step 14: agent '{}' 声明 {} 个 skills，超过上限 {} —— "
+                    + "只预加载前 {} 个（CC exe runAgent: Ms=32）",
+                    agentDefinition.agentType(), skillsToPreload.size(),
+                    MAX_PRELOADED_SKILLS, MAX_PRELOADED_SKILLS);
+            skillsToPreload = skillsToPreload.subList(0, MAX_PRELOADED_SKILLS);
+        }
         if (!skillsToPreload.isEmpty()) {
             // fail loud: skillPreloader 未注入时不允许静默跳过预加载（无影子路径，规则十二）
             if (skillPreloader == null) {

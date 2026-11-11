@@ -6,6 +6,9 @@ import './styles/chat-code-block.css'
 // 代码高亮配色（照搬源站 GitHub Light/Dark）。
 // ⚠️ 必须有：highlight.js 只切 token 不配色，缺这个文件代码块全是单色（真机缺陷）。
 import './styles/chat-code-hljs.css'
+// Markdown 阅读排版 · 统一用「知识库那套」（Typora 风），只服务预览，⛔ 不影响对话消息。
+// 来源：kb-02.css 的 .kb-scope .md-content（59 条正文规则 + 33 个变量解析成字面量）。
+import './styles/markdown-prose.css'
 // 知识库设计稿对齐样式（自动从 weknora-bundle.css 提取，全表作用域在 .kb-scope 子树内）。
 // ⚠️ 必须排在 globals.css 之后：同权重时靠后者胜出。
 import './styles/kb/index.css'

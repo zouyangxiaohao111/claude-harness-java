@@ -1,0 +1,159 @@
+/**
+ * Markdown 阅读排版 · 统一「文件/文档/产物预览」的排版。
+ *
+ * <h2>⭐⭐ 来源与理由（用户 2026-11-11 裁定）</h2>
+ * 用户原话：「我记得 md 完整文件的渲染，我们知识库那边就很不错啊，为什么我们在线渲染就很差呢？」
+ * 并拍板「**统一用知识库那套**」+「**先不要影响现有主对话页面的 只是预览采用**」。
+ *
+ * 知识库那套排版来自 `styles/kb/kb-02.css` 的 `.kb-scope .md-content`（85 条规则），
+ * 其视觉本源是 **Typora 主题**（该 CSS 里残留 `#typora-sidebar` / `.md-fences` / `.cm-s-inner` 等专属类名）。
+ *
+ * <h2>⚠️ 三步必要处理</h2>
+ * <ol>
+ *   <li><b>只取 Markdown 正文规则</b>：85 条里剔掉 Typora 编辑器专属
+ *       （`.md-fences` / `.cm-s-inner` / `#typora-sidebar` / `md-end-block` 编号角标 等）
+ *       和知识库分块 UI（`.chunk-editor` / `.question-item` 等），剩 **59 条**。</li>
+ *   <li><b>去掉 `.kb-scope` 前缀</b>：改成 `.markdown-prose`，
+ *       让预览（不在 `.kb-scope` 子树里）也能命中。</li>
+ *   <li><b>补变量字面量</b>：那 59 条引用了 **33 个变量**，全部只在 `.kb-scope` 内定义。
+ *       预览容器不在该子树 ⇒ 取不到值 ⇒ 边框/背景/字号全失效。
+ *       这里按 `.kb-scope` 的浅色基准把值**解析成字面量**注入（值取自
+ *       `kb-scope.css` 的 `.kb-scope,.kb-scope[theme-mode=light]` 块，逐层 var() 展开）。
+ *       ⚠️ 这与「代码块纯白」是同一个根因，必须一起处理。</li>
+ * </ol>
+ *
+ * <h2>⛔ 不影响对话消息</h2>
+ * 作用域是 `.markdown-prose`（由预览容器显式添加）。
+ * 对话消息的排版仍由 `globals.css` 的 `.msg .content` 54 条负责 —— 两套互不干扰，
+ * 靠**祖先类名隔离**，不靠优先级打架。
+ */
+
+/* ── 变量（浅色基准 · 由 .kb-scope 解析而来） ───────────────────────────── */
+.markdown-prose {
+  --td-text-color-primary: rgba(0,0,0,.9);
+  --td-text-color-secondary: rgba(0,0,0,.6);
+  --td-text-color-placeholder: rgba(0,0,0,.4);
+  --td-text-color-disabled: rgba(0,0,0,.26);
+  --td-bg-color-container: #fff;
+  --td-bg-color-container-hover: #f3f3f3;
+  --td-bg-color-secondarycontainer: #f3f3f3;
+  --td-brand-color: #0052d9;
+  --td-brand-color-focus: #d9e1ff;
+  --td-brand-color-light: #f2f3ff;
+  --td-component-stroke: #e8e8e8;
+  --td-error-color: #d54941;
+  --td-error-color-light: #fff0ed;
+  --td-success-color: #2ba471;
+  --td-warning-color: #e37318;
+  --app-font-family: var(--font-sans);
+  --app-font-family-mono: var(--font-mono);
+  --app-text-2xs: 10px;
+  --app-text-xs: 11px;
+  --app-text-sm: 12px;
+  --app-text-md: 13px;
+  --app-text-base: 14px;
+  --app-text-lg: 15px;
+  --app-text-xl: 16px;
+  --app-text-2xl: 18px;
+  --app-text-3xl: 20px;
+  --app-text-4xl: 24px;
+  --app-radius-xs: 4px;
+  --app-radius-md: 8px;
+  --app-space-3: 12px;
+  --app-motion-base: 0.2s;
+  --app-motion-fast: 0.15s;}
+
+/* 深色主题：按本仓变量覆盖（同 `markdown-reader.css` 的挂载点判定） */
+html[theme-mode='dark'] .markdown-prose,
+.dark .markdown-prose,
+[data-theme='dark'] .markdown-prose {
+  --td-text-color-primary: rgba(255,255,255,.9);
+  --td-text-color-secondary: rgba(255,255,255,.6);
+  --td-text-color-placeholder: rgba(255,255,255,.4);
+  --td-text-color-disabled: rgba(255,255,255,.26);
+  --td-bg-color-container: #181818;
+  --td-bg-color-container-hover: #2c2c2c;
+  --td-bg-color-secondarycontainer: #2c2c2c;
+  --td-brand-color: #4582e6;
+  --td-brand-color-focus: #173463;
+  --td-brand-color-light: #1b2f51;
+  --td-component-stroke: #393939;
+  --td-error-color: #c64751;
+  --td-error-color-light: #472324;
+  --td-success-color: #059465;
+  --td-warning-color: #cf6e2d;
+}
+
+/* ⚠️ 代码块由 chat-code-block.css 独占控制 —— 这里复位 kb 规则给 pre 的样式，
+   否则会二次加框（与 GitHub 那套同样的坑）。 */
+
+.markdown-prose pre.chat-code-block__pre,
+.markdown-prose .chat-code-block pre {
+  margin: 0;
+  padding: 14px 16px;
+  background: color-mix(in srgb, var(--surface-2) 88%, var(--surface-1));
+  border-radius: 0;
+  font-size: 13px;
+  line-height: 1.6;
+}
+
+/* ══ 以下为 kb-02.css 提取的 59 条正文规则（去 .kb-scope 前缀） ══ */
+.markdown-prose{box-sizing:border-box!important}
+.markdown-prose img{max-width:444px;cursor:pointer}
+.markdown-prose .mermaid{margin:16px 0;padding:16px;background:var(--td-bg-color-secondarycontainer);border-radius:var(--app-radius-md);overflow-x:auto;text-align:center}
+.markdown-prose .mermaid svg{max-width:100%;height:auto}
+.markdown-prose h1, .markdown-prose h2, .markdown-prose h3, .markdown-prose h4, .markdown-prose h5, .markdown-prose h6{margin:20px 0 10px;font-weight:700;line-height:1.35;color:var(--td-text-color-primary);font-family:var(--app-font-family);transition:all var(--app-motion-base) ease-out}
+.markdown-prose h1{font-size:var(--app-text-4xl);margin-top:24px}
+.markdown-prose h2{font-size:var(--app-text-3xl);margin-top:22px}
+.markdown-prose h3{font-size:var(--app-text-2xl);font-weight:600;margin-top:18px;margin-bottom:8px}
+.markdown-prose h4{font-size:var(--app-text-xl);font-weight:600;margin-top:16px;margin-bottom:8px}
+.markdown-prose h5{font-size:var(--app-text-lg);font-weight:600;margin-top:14px;margin-bottom:6px}
+.markdown-prose h6{font-size:var(--app-text-base);font-weight:600;margin-top:12px;margin-bottom:6px}
+.markdown-prose>:first-child{margin-top:0}
+.markdown-prose .hljs-title, .markdown-prose .hljs-title.class_, .markdown-prose .hljs-title.class_.inherited__, .markdown-prose .hljs-title.function_{white-space:pre-wrap;word-break:break-all}
+.markdown-prose .proto{word-break:break-all;white-space:pre-wrap}
+.markdown-prose h1 tt, .markdown-prose h1 code{font-size:inherit!important}
+.markdown-prose h2 tt, .markdown-prose h2 code{font-size:inherit!important}
+.markdown-prose h3 tt, .markdown-prose h3 code{font-size:inherit!important}
+.markdown-prose h4 tt, .markdown-prose h4 code{font-size:inherit!important}
+.markdown-prose h5 tt, .markdown-prose h5 code{font-size:inherit!important}
+.markdown-prose h6 tt, .markdown-prose h6 code{font-size:inherit!important}
+.markdown-prose h2 a, .markdown-prose h3 a{color:var(--td-text-color-primary)}
+.markdown-prose p, .markdown-prose blockquote, .markdown-prose ul, .markdown-prose ol, .markdown-prose dl, .markdown-prose table{font-size:var(--app-text-base);margin:10px 0;font-family:var(--app-font-family)}
+.markdown-prose summary{font-size:var(--app-text-base);cursor:pointer}
+.markdown-prose hr{padding:0;margin:24px 0;height:1px;border:none;background:var(--td-component-stroke);overflow:hidden;box-sizing:content-box}
+.markdown-prose body>h2:first-child{margin-top:0;padding-top:0}
+.markdown-prose body>h1:first-child{margin-top:0;padding-top:0}
+.markdown-prose body>h1:first-child+h2{margin-top:0;padding-top:0}
+.markdown-prose body>h3:first-child, .markdown-prose body>h4:first-child, .markdown-prose body>h5:first-child, .markdown-prose body>h6:first-child{margin-top:0;padding-top:0}
+.markdown-prose a:first-child h1, .markdown-prose a:first-child h2, .markdown-prose a:first-child h3, .markdown-prose a:first-child h4, .markdown-prose a:first-child h5, .markdown-prose a:first-child h6{margin-top:0;padding-top:0}
+.markdown-prose p{margin:0 0 var(--app-space-3);line-height:1.75}
+.markdown-prose p:last-child{margin-bottom:0}
+.markdown-prose code{white-space:pre-wrap;word-break:break-all;padding:1px 5px;background:var(--td-bg-color-secondarycontainer);border-radius:var(--app-radius-xs);font-family:var(--app-font-family-mono);font-size:.92em}
+.markdown-prose pre{margin:14px 0;padding:12px 14px;background:var(--td-bg-color-secondarycontainer);border-radius:var(--app-radius-md);overflow-x:auto;font-size:var(--app-text-md);line-height:1.6;white-space:pre;word-break:normal}
+.markdown-prose pre code{padding:0;background:none;border-radius:0;font-size:inherit;white-space:pre;word-break:normal}
+.markdown-prose h1 p, .markdown-prose h2 p, .markdown-prose h3 p, .markdown-prose h4 p, .markdown-prose h5 p, .markdown-prose h6 p{margin-top:0}
+.markdown-prose li p.first{display:inline-block}
+.markdown-prose ul, .markdown-prose ol{padding-left:30px;margin:10px 0}
+.markdown-prose li{margin:2px 0;line-height:1.75}
+.markdown-prose li>ul, .markdown-prose li>ol{margin:4px 0;padding-left:26px}
+.markdown-prose li>p{margin:4px 0}
+.markdown-prose ul:first-child, .markdown-prose ol:first-child{margin-top:0}
+.markdown-prose ul:last-child, .markdown-prose ol:last-child{margin-bottom:0}
+.markdown-prose blockquote{padding:10px 16px;margin:14px 0;font-weight:400;line-height:1.75;color:var(--td-text-color-secondary);border-left:4px solid var(--td-brand-color);background:color-mix(in srgb,var(--td-brand-color) 6%,transparent);border-radius:0 var(--app-radius-md) var(--app-radius-md) 0}
+.markdown-prose blockquote>:first-child{margin-top:0}
+.markdown-prose blockquote>:last-child{margin-bottom:0}
+.markdown-prose table{padding:0;word-break:initial;border-collapse:collapse;border-spacing:0;width:100%}
+.markdown-prose table tr{border-top:1px solid var(--td-brand-color-focus);margin:0;padding:0}
+.markdown-prose table tr:nth-child(2n), .markdown-prose thead{background-color:var(--td-bg-color-secondarycontainer)}
+.markdown-prose table tr th{font-weight:700;border:1px solid var(--td-component-stroke);border-bottom:0;text-align:left;margin:0;padding:6px 13px}
+.markdown-prose table tr td{border:1px solid var(--td-component-stroke);text-align:left;margin:0;padding:6px 13px}
+.markdown-prose table tr th:first-child, .markdown-prose table tr td:first-child{margin-top:0}
+.markdown-prose table tr th:last-child, .markdown-prose table tr td:last-child{margin-bottom:0}
+.markdown-prose tt{margin:0 2px}
+.markdown-prose figure{border-radius:var(--app-radius-md);margin-left:0;margin-right:0;background:var(--td-bg-color-container)}
+.markdown-prose .md-task-list-item>input{margin-left:-1.3em}
+@media print{.markdown-prose html{font-size:var(--app-text-md)}
+.markdown-prose table, .markdown-prose pre{page-break-inside:avoid}
+.markdown-prose pre{word-wrap:break-word}}
+.markdown-prose{word-break:break-word;line-height:1.6;color:var(--td-text-color-primary)}

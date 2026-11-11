@@ -327,9 +327,16 @@ public class KnowledgeBaseAdvancedController {
         @com.fasterxml.jackson.annotation.JsonProperty("model") String model) {
     }
 
-    /** 画像响应。 */
+    /**
+     * 画像响应。
+     *
+     * <p>⚠️ 2026-11-11：{@code profile} 从 {@code String} 改成
+     * {@code KbKnowledgeBaseProfile} 对象 —— 前端早就按对象读（{@code r.profile?.gist}），
+     * 后端返字符串 ⇒ 契约错配。对象形态同时与源站 {@code KnowledgeBaseProfile} 对齐。
+     */
     public record ProfileResponse(
-        @com.fasterxml.jackson.annotation.JsonProperty("profile") String profile,
+        @com.fasterxml.jackson.annotation.JsonProperty("profile")
+        com.nexusai.kb.app.profile.KbKnowledgeBaseProfile profile,
         @com.fasterxml.jackson.annotation.JsonProperty("status") String status,
         @com.fasterxml.jackson.annotation.JsonProperty("document_count") int documentCount,
         @com.fasterxml.jackson.annotation.JsonProperty("model") String model) {

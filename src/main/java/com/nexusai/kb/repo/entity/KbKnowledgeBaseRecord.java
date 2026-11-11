@@ -80,6 +80,14 @@ public class KbKnowledgeBaseRecord extends KbBaseRecord {
     /** VLM 配置 JSON。 */
     private String vlmConfig;
 
+    /**
+     * 知识图谱存储配置 JSON（V281）。
+     *
+     * <p>{@code {"store":"local"|"neo4j","uri":...,"username":...,"password_encrypted":...}}；
+     * 缺省 {@code "{}"} = 本地 SQLite 两张表。
+     */
+    private String graphStoreConfig;
+
     /** 抽取配置 JSON（可空）。 */
     private String extractConfig;
 
@@ -174,6 +182,9 @@ public class KbKnowledgeBaseRecord extends KbBaseRecord {
     public void setCosConfig(String cosConfig) { this.cosConfig = cosConfig; }
     public String getVlmConfig() { return vlmConfig; }
     public void setVlmConfig(String vlmConfig) { this.vlmConfig = vlmConfig; }
+
+    public String getGraphStoreConfig() { return graphStoreConfig; }
+    public void setGraphStoreConfig(String v) { this.graphStoreConfig = v; }
     public String getExtractConfig() { return extractConfig; }
     public void setExtractConfig(String extractConfig) { this.extractConfig = extractConfig; }
     public String getFaqConfig() { return faqConfig; }

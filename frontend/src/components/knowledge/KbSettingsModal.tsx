@@ -488,10 +488,17 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
   /** AI 描述生成中的忙态（与整体 `busy` 分开：它不影响「保存并关闭」按钮）。 */
   const [profileBusy, setProfileBusy] = useState(false)
 
-  /** 已生成的画像文本（优先取本地刚生成的，其次取 DTO 的 `generated_profile`）。 */
-  const [profileOverride, setProfileOverride] = useState<string | null>(null)
+  /** 已生成的画像（优先取本地刚生成的，其次取 DTO 的 `generated_profile`）。 */
+  const [profileOverride, setProfileOverride] = useState<{
+    gist: string
+    topics: string[]
+    typicalQuestions: string[]
+    status?: string
+    error?: string
+  } | null>(null)
+  /** 画像正文（gist）。 */
   const profileText = (() => {
-    if (profileOverride !== null) return profileOverride
+    if (profileOverride !== null) return profileOverride.gist
     const raw = form.generated_profile
     if (!raw) return ''
     const g = parseJson<{ gist?: string }>(raw, {})
@@ -501,17 +508,41 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
   /**
    * 生成 AI 画像描述（`POST /api/v1/knowledge-bases/{id}/profile/generate`）。
    *
-   * <p>⚠️ 我先前在计划里判「本仓无此端点」是**错的**：`KnowledgeBaseAdvancedController`
-   * 有这个 `@PostMapping`，返回 `{profile, status, document_count, model}`。
+   * <p>⚠️ 2026-11-11：后端返回的 `profile` 从**字符串**改成**对象**
+   * （`{gist, topics, typical_questions, status, ...}`，照源站 `KnowledgeBaseProfile`）。
+   * 此前前端按对象读、后端返字符串 ⇒ 契约错配，按钮拿不到 gist。
+   *
+   * <p>后端状态：`generated`（真的生成了）/ `unchanged`（聚合未变，沿用旧描述）/
+   * `empty`（没有可聚合的内容）/ `failed` / `unavailable` / `unsupported`。
    */
   const generateProfile = async () => {
     setProfileBusy(true)
     try {
       const r = await knowledgeApi.generateProfile(base.id)
-      const gist = (r.profile?.gist || '').trim()
-      setProfileOverride(gist)
-      showToast(gist ? 'AI 描述已生成' : `未生成（状态：${r.status || '未知'}）`,
-        gist ? 'success' : 'info')
+      // ⚠️ 兼容旧后端：2026-11-11 之前后端把 profile 返成**字符串**（纯文本 gist），
+      //    新版返**对象**。前端优先读对象；读到字符串就当 gist 用。
+      //    ⇒ 后端未重启时按钮照样能用（不会出现「点了没反应」）。
+      const raw = r.profile as unknown
+      const obj = (raw && typeof raw === 'object') ? raw as {
+        gist?: string; topics?: string[]; typical_questions?: string[]
+        status?: string; error?: string
+      } : null
+      const gist = (obj?.gist ?? (typeof raw === 'string' ? raw : '') ?? '').trim()
+      setProfileOverride({
+        gist,
+        topics: obj?.topics ?? [],
+        typicalQuestions: obj?.typical_questions ?? [],
+        status: obj?.status,
+        error: obj?.error,
+      })
+      const msg =
+        r.status === 'unchanged' ? '内容未变化，沿用原描述'
+        : r.status === 'empty' ? '没有可聚合的文档内容'
+        : r.status === 'failed' ? `生成失败：${r.profile?.error || '未知原因'}`
+        : r.status === 'unsupported' ? '该知识库类型不支持自动描述'
+        : gist ? 'AI 描述已生成'
+        : `未生成（状态：${r.status || '未知'}）`
+      showToast(msg, gist ? 'success' : 'info')
       if (gist) onSaved()
     } catch (e) {
       showToast(toMessage(e), 'info')
@@ -611,12 +642,29 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
     await patch({ auto_tag_config: JSON.stringify({ ...cfg, ...next }) }, okMsg)
   }
 
-  /** 画像配置（⚠️ 本仓零消费者，面板里有警示）。 */
+  /**
+   * 画像配置（`profile_config`）。
+   *
+   * <p>⭐ 2026-11-11：执行链已接通（源站 `knowledgebase_profile.go`），
+   * 本仓已实现「聚合文档画像 → 指纹去重 → 调模型 → 写 generated_profile」。
+   */
   const profile = parseJson<{ enabled?: boolean; model_id?: string; custom_instructions?: string }>(
     form.profile_config, {})
   const saveProfile = async (next: Record<string, unknown>, okMsg = '画像配置已保存') => {
     const cfg = parseJson<Record<string, unknown>>(form.profile_config, {})
     await patch({ profile_config: JSON.stringify({ ...cfg, ...next }) }, okMsg)
+  }
+  /** 画像配置的本地态（textarea 边打字边显示，失焦才落库）。 */
+  const [profileLocal, setProfileLocalState] = useState<Record<string, unknown>>({})
+  useEffect(() => {
+    setProfileLocalState({})
+  }, [form.profile_config])
+  const setProfileLocal = (k: string, v: unknown) =>
+    setProfileLocalState((prev) => ({ ...prev, [k]: v }))
+  /** 文本域显示值：本地态优先，回落库里已存的。 */
+  const profileLocalText = (k: string, fallback: string) => {
+    const v = profileLocal[k]
+    return typeof v === 'string' ? v : fallback
   }
 
   /** 表格元数据要求的脏检查基准（同 savedWiki 的教训：只跟 base 走）。 */
@@ -660,18 +708,17 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
    * 图谱。
    *
    * <p>后端真实判据（`KbPostProcessConfig.graphEnabled`）是
-   * `indexing_strategy.graph_enabled` **∧** `extract_config.enabled` —— 两个都要。
+   * `indexing_strategy.graph_enabled` **∧** `extract_config.enabled`
+   * **∧** 有 LLM 模型（未配置时回落全局默认）—— 三个都要。
    * 本面板的开关操作 `extract_config.enabled`（「抽什么」），
    * 另一个开关在基本信息 → 索引策略里（「要不要图谱这条索引」）。
    *
-   * <p>`graphAvailable` = 图谱后端是否就绪。本仓没有图谱数据库配置端点，
-   * 用 `indexing_strategy.graph_enabled` 是否可写作为等价信号 ——
-   * 但当前库里它可写（实测 PATCH 成功），故恒为 true，走「真开关」分支。
-   * 图数据库真不可用时，后端会在抽图阶段 fail-soft，不影响其它流程。
+   * <p>⭐ 本仓**没有**「图数据库未启用」这个状态：图谱存在本地 SQLite
+   * （`kb_graph_entity` / `kb_graph_relation`），不依赖 Neo4j。
+   * 原来照抄源站的 `graphAvailable` 禁用态是死代码，2026-11-11 已删。
    */
   const extractCfg = parseJson<{ enabled?: boolean }>(form.extract_config, {})
   const graphOn = extractCfg.enabled === true
-  const graphAvailable = true
   const saveGraph = async (v: boolean) => {
     await patch({ extract_config: JSON.stringify({ ...extractCfg, enabled: v }) }, '图谱配置已保存')
   }
@@ -894,13 +941,50 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                               </label>
                               <p className="indexing-check-desc">自动生成互相关联的 Wiki 知识页面，构建结构化知识体系</p>
                             </div>
+                            {/* ⭐ 第三张卡：知识图谱（2026-11-11 用户裁定 A）。
+                                在此之前 `indexing_strategy.graph_enabled` **零 UI 写入点** ——
+                                设置弹窗「知识图谱」分节的开关只写 `extract_config.enabled`，
+                                而派发判据是两字段合取 ⇒ 界面建的库永远不抽图。
+                                ⚠️ **本卡不受 `indexingLocked` 约束**（不加 is-disabled、tabIndex 恒 0、
+                                    点击不看锁）：改 graph_enabled 只影响**后续入库**与**手动重建**，
+                                    不会破坏已有向量/关键词索引，因此不必等「清空知识库」。
+                                    RAG/Wiki 两张卡仍按原锁定行为（它们会改索引形态）。
+                                数据结构与上面两张完全同款，复用既有类名（⛔ 不需要新 CSS）。 */}
+                            <div
+                              className={`indexing-check-item${indexing.graph_enabled === true ? ' is-checked' : ''}`}
+                              role="checkbox"
+                              aria-checked={indexing.graph_enabled === true}
+                              tabIndex={0}
+                              onClick={() => void saveIndexing({ graph_enabled: indexing.graph_enabled !== true })}
+                              onKeyDown={(e) => {
+                                if (e.key === 'Enter' || e.key === ' ') {
+                                  e.preventDefault()
+                                  void saveIndexing({ graph_enabled: indexing.graph_enabled !== true })
+                                }
+                              }}
+                            >
+                              <label className={`t-checkbox${indexing.graph_enabled === true ? ' t-is-checked' : ''} indexing-check-box`}>
+                                <input
+                                  type="checkbox"
+                                  className="t-checkbox__former"
+                                  checked={indexing.graph_enabled === true}
+                                  tabIndex={-1}
+                                  readOnly
+                                />
+                                <span className="t-checkbox__input" />
+                                <span className="t-checkbox__label">
+                                  <span className="indexing-check-title">知识图谱</span>
+                                </span>
+                              </label>
+                              <p className="indexing-check-desc">用 LLM 从文档中抽取实体与关系，构建可检索的知识图谱</p>
+                            </div>
                           </div>
                           {indexingLocked && (
                             <p className="locked-tip">
                               <svg className="t-icon t-icon-lock-on locked-tip-icon" width="14" height="14" aria-hidden="true">
                                 <use href="#t-icon-lock-on" />
                               </svg>
-                              <span>知识库已有内容，索引策略暂不支持调整。如需变更，请先清空知识库。</span>
+                              <span>知识库已有内容，RAG 检索与 Wiki 知识库暂不支持调整（改动会破坏已有索引），如需变更请先清空知识库。知识图谱可随时开关。</span>
                             </p>
                           )}
                         </div>
@@ -1084,13 +1168,13 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                   >
                     <Row
                       label={<>LLM 大语言模型 <span className="required">*</span></>}
-                      desc="用于总结和摘要的大语言模型"
+                      desc="用于摘要、知识图谱、Wiki、问题生成和自动打标；不选则使用全局默认模型"
                     >
                       <ModelSelect
                         value={form.summary_model_id ?? ''}
                         models={models}
                         types={CHAT_MODEL_TYPES}
-                        placeholder="跟随全局默认"
+                        placeholder="使用全局默认"
                         onChange={(v) => void saveModelField('summary_model_id', v)}
                       />
                     </Row>
@@ -1118,6 +1202,12 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                         onChange={(v) => void saveWiki({ synthesis_model_id: v }, 'Wiki 合成模型已保存')}
                       />
                     </Row>
+                    {/* ⭐ 2026-11-11 用户要求「界面上添加一句提示（如果是空的话 使用全局默认）」。
+                        必须显式写出来：这句以前只是下拉框里的占位文字，用户看不出它是一条真规则。 */}
+                    <p className="form-tip">
+                      LLM 大语言模型留空时，自动使用「设置 → 模型 → 主模型」里的全局默认模型。
+                      摘要、知识图谱、Wiki、AI 问题生成、自动打标都用这个模型。
+                    </p>
                   </SettingSection>
                 )}
 
@@ -1401,15 +1491,21 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
 
                     {imageEnabled && (
                       <>
+                        {/* ⭐ 用户裁定（2026-11-11）：
+                            ① 「VLLM 视觉模型 是可以选择的，但是默认选中 使用全局默认」；
+                            ② 「单独选择也能其效果」。
+                            空值 = 跟随全局 `settings.multimodal_model_name`；选了具体模型
+                            ⇒ 后端 `IMAGE_UNDERSTAND` 任务把它透传导给视觉调用器。
+                            ⚠️ 选项标签统一 `provider/modelName`（见 ModelSelect）。 */}
                         <Row
-                          label={<>VLLM 视觉模型 <span className="required">*</span></>}
-                          desc="用于多模态理解的视觉语言模型（必选）"
+                          label="VLLM 视觉模型"
+                          desc="留空则跟随全局（设置 → 模型 → 多模态模型）"
                         >
                           <ModelSelect
                             value={imageCfg.model_id ?? ''}
                             models={models}
                             types={MULTIMODAL_MODEL_TYPES}
-                            placeholder="请选择 VLLM 模型（必选）"
+                            placeholder="使用全局默认"
                             onChange={(v) => void saveImage({ model_id: v }, 'VLLM 视觉模型已保存')}
                           />
                         </Row>
@@ -1546,38 +1642,43 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                           配置实体-关系提取功能，自动从文本中抽取实体和关系构建知识图谱（注意：这与 Wiki 知识库中的「页面链接图谱」是两回事——前者是基于 LLM 的实体-关系图，后者是 Wiki 页面之间的引用关系图）
                         </p>
                       </div>
-                      {!graphAvailable ? (
-                        <div className="graph-disabled">
-                          <span className="graph-disabled-icon">⚠</span>
-                          <div className="graph-disabled-text">
-                            知识图谱数据库未启用，实体关系提取功能将无法使用
-                          </div>
-                          <button
-                            type="button"
-                            className="t-button t-button--variant-outline t-button--theme-primary t-button--shape-rectangle t-size-s"
-                            onClick={() => showToast('图谱数据库在「平台设置 → 数据库」里配置，本仓暂未提供该入口', 'info')}
-                          >
-                            <span className="t-button__text">如何启用知识图谱？</span>
-                          </button>
-                        </div>
-                      ) : (
-                        <div className="settings-group">
-                          <Row
+                      {/* ⭐ 2026-11-11：这里原来照抄了源站的「图数据库未启用」禁用态
+                          （含一个指向 weknora 文档的「如何启用知识图谱？」按钮）。
+                          两条都删了，理由：
+                          ① 源站那个提示说的是「没装 Neo4j」——本仓用 SQLite 两张表
+                             （kb_graph_entity / kb_graph_relation）存图谱，不需要外部图数据库，
+                             也没有「未启用」这个状态（`graphAvailable` 恒 true，那分支本来就是死代码）；
+                          ② 那个文档链接指向一份跟本仓实现无关的说明，用户点了只会更困惑
+                             （实际已发生：用户被引导去看那份文档）。
+                          ⛔ 不要再把源站这套禁用态搬回来。 */}
+                      <div className="settings-group">
+                        <Row
+                          label="实体-关系提取"
+                          desc="解析文档时用 LLM 抽取实体和关系，构建可检索的知识图谱"
+                        >
+                          <Switch
+                            checked={graphOn}
                             label="实体-关系提取"
-                            desc="解析文档时用摘要模型抽取实体和关系，构建可检索的知识图谱"
-                          >
-                            <Switch
-                              checked={graphOn}
-                              label="实体-关系提取"
-                              onChange={(v) => void saveGraph(v)}
-                            />
-                          </Row>
-                          <p className="form-tip">
-                            ⚠️ 需要同时满足两个开关：本项 + 「索引策略 → 图谱」。
-                            只开一个不会抽任何东西（后端 `KbPostProcessConfig.graphEnabled` 是两个条件的合取）。
+                            onChange={(v) => void saveGraph(v)}
+                          />
+                        </Row>
+                        <p className="form-tip">
+                          ⚠️ 需要同时满足三个条件：① 本项开关；②「基本信息 → 索引策略 → 知识图谱」
+                          那张卡片（与 RAG / Wiki 并列的第三张）；③ 本知识库配了 LLM 模型
+                          （未配置时自动使用全局默认模型）。少一个都不会抽任何东西。
+                        </p>
+                        {/* ⭐ 显式提示「现在不会抽」：本次修复前正是这个组合（本项开了、索引策略没勾）
+                            导致用户以为已开启却零抽取、零日志。⛔ 不要删掉这条提示。 */}
+                        {graphOn && indexing.graph_enabled !== true && (
+                          <p className="form-tip" style={{ color: 'var(--td-warning-color, #e37318)' }}>
+                            ⚠️ 索引策略里的「知识图谱」卡片尚未勾选，当前上传的文档不会抽取图谱。
+                            请到「基本信息 → 索引策略」勾上，已有文档需要点图谱页的「重建图谱」补抽。
                           </p>
-                        </div>
-                      )}
+                        )}
+                        <p className="form-tip">
+                          图谱数据存在本地数据库里，不需要额外安装图数据库。
+                        </p>
+                      </div>
                     </div>
                   </div>
                 )}
@@ -1697,7 +1798,7 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                       </>
                     )}
 
-                    {/* ③ 自动生成知识库描述 */}
+                    {/* ③ 自动生成知识库描述（照源站 KBAdvancedSettings.vue:133-175）*/}
                     <Row
                       label="自动生成知识库描述"
                       desc="文档新增、删除或摘要更新后，从文档画像聚合自动生成知识库描述。聚合本身不调用模型，仅当聚合结果变化时才发起一次小模型调用。"
@@ -1708,13 +1809,43 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                         onChange={(v) => void saveProfile({ enabled: v }, '描述生成开关已保存')}
                       />
                     </Row>
-                    {/* ⚠️ `profile_config` 在本仓**零消费者**（全仓只有 Copy/Service 搬字段）
-                        ⇒ 如实告知，不假装生效。 */}
+                    {/* ⭐ 2026-11-11：执行链已接通（源站 knowledgebase_profile.go），
+                        原来那条「尚未接入」的黄色警示已删除 —— 它现在是假提示。
+                        开关打开时会**立即**生成一次，之后文档增删/摘要更新时自动重算。 */}
                     {profile.enabled === true && (
-                      <p className="form-tip" style={{ color: 'var(--td-warning-color, #e37318)' }}>
-                        ⚠️ 本仓尚未接入「自动生成知识库描述」执行链 —— 此开关会落库，但不会真的自动改写描述。
-                        要生成描述请到「基本信息 → AI 生成描述」手动触发。
-                      </p>
+                      <>
+                        <Row
+                          label="生成模型"
+                          desc="留空时使用知识库摘要模型。"
+                          stacked
+                        >
+                          <ModelSelect
+                            value={profile.model_id ?? ''}
+                            models={models}
+                            types={CHAT_MODEL_TYPES}
+                            placeholder="请选择生成模型"
+                            onChange={(v) => void saveProfile({ model_id: v }, '生成模型已保存')}
+                          />
+                        </Row>
+                        <Row
+                          label="描述生成要求"
+                          desc="补充面向的读者、需要保留的术语或表达风格，系统仍维护稳定的输出格式。"
+                          stacked
+                        >
+                          <div className="t-textarea" style={{ width: 280 }}>
+                            <textarea
+                              className="t-textarea__inner t-is-default t-resize-none"
+                              rows={2}
+                              maxLength={2000}
+                              placeholder="例如：面向售后客服，用通俗说法描述产品线，保留产品型号…"
+                              value={profileLocalText('custom_instructions', profile.custom_instructions ?? '')}
+                              onChange={(e) => setProfileLocal('custom_instructions', e.target.value)}
+                              onBlur={(e) => void saveProfile(
+                                { custom_instructions: e.target.value }, '描述生成要求已保存')}
+                            />
+                          </div>
+                        </Row>
+                      </>
                     )}
 
                     {/* ④ 表格元数据生成要求 */}
@@ -2079,6 +2210,23 @@ function Row({ label, desc, children, stacked, hint }: {
  * <p>⚠️ 源站是真下拉（`t-select` + `t-option`），**不是自由输入框** —— 早期版本我们写成
  * `<input>` 让用户手打模型名，与源站不符且极易打错（写错名字后模型调用静默失败）。
  *
+ * <h2>⭐⭐ 显示 `provider/modelName`，但**存的是 `models.id`**（2026-11-11 用户裁定）</h2>
+ * 用户要求「所有模型选择都要 provider/modelName」，同时也问了关键问题：
+ * 「通过 id 能否正常获取到这个提供者和模型，而不是会乱」。
+ *
+ * <p><b>答案是能，而且 ID 最安全</b>，所以两者分开：
+ * <ul>
+ *   <li><b>显示</b>：`provider/modelName` + 按 provider 分组的 `<optgroup>`。
+ *       同名模型确实并存（实测真库 3 份 `deepseek-v4.1-flash` 分属 oc / oc_new / oc2），
+ *       不显示全名用户分不清；</li>
+ *   <li><b>存储</b>：`models.id`（主键）。调用链是
+ *       {@code selectOneById(modelId)} → {@code model.getProviderId()} →
+ *       {@code selectOneById(providerId)} —— 两次主键命中，**数学上不可能串到别的提供商**。
+ *       ⛔ 不要改存 `provider/modelName`：`providers.name` 可以改名
+ *       （{@code ProviderService.update}），而改名后没有任何代码级联更新引用它的全名
+ *       ⇒ 已存的全名会解析失败、知识库模型突然不可用。</li>
+ * </ul>
+ *
  * <p>空值语义：`''` = 跟随全局默认（源站「跟随全局默认」/「跟随摘要模型」）。
  */
 function ModelSelect({ value, models, types, placeholder, disabled, onChange }: {
@@ -2090,9 +2238,25 @@ function ModelSelect({ value, models, types, placeholder, disabled, onChange }: 
   onChange: (v: string) => void
 }) {
   const options = models.filter((m) => types.includes(m.type))
-  /* 当前值不在清单里（模型被删 / 类型不符）时也要能显示出来，否则下拉会静默跳成空 ⇒
-     用户以为配置丢了。这与源站「已绑定但不可用」的处理一致（显示原值 + 不进候选）。 */
-  const orphan = value && !options.some((m) => m.id === value)
+  /** 显示用全名（`provider/modelName`）；providerName 缺失时退化成模型名。 */
+  const fullNameOf = (m: Model) => (m.providerName ? `${m.providerName}/${m.name}` : m.name)
+
+  /* 当前值不在候选里（模型被删 / 类型不符）时也要能显示出来，
+     ⛔ 不能静默跳成空 —— 用户会以为配置丢了。 */
+  const orphan = value !== '' && !options.some((m) => m.id === value)
+  /* 按 provider 分组（`<optgroup>`）。providerName 缺失 ⇒ 回退「其他」，
+     ⛔ 不能把半分组的项静默藏起来（那样用户会「找不到模型」）。 */
+  const groups = new Map<string, Model[]>()
+  for (const m of options) {
+    const key = m.providerName || '其他'
+    const arr = groups.get(key)
+    if (arr) arr.push(m)
+    else groups.set(key, [m])
+  }
+  /* 组内按模型名排序，组间按组名排序 —— 稳定顺序，避免每次渲染跳动。 */
+  const groupEntries = [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
+    .map(([name, list]) => [name, [...list].sort((a, b) => a.name.localeCompare(b.name))] as const)
   return (
     <div className="t-select__wrap" style={{ width: 280 }}>
       <select
@@ -2103,12 +2267,18 @@ function ModelSelect({ value, models, types, placeholder, disabled, onChange }: 
         onChange={(e) => onChange(e.target.value)}
       >
         <option value="">{placeholder}</option>
-        {options.map((m) => (
-          <option key={m.id} value={m.id}>
-            {/* ⚠️ alias 与 name 相同是常见情况（实测 `text-embedding-v4` 两者一致）
-                ⇒ 不加判断会渲染成「text-embedding-v4（text-embedding-v4）」。 */}
-            {m.name}{m.alias && m.alias !== m.name ? `（${m.alias}）` : ''}
-          </option>
+        {groupEntries.map(([providerName, list]) => (
+          <optgroup key={providerName} label={providerName}>
+            {list.map((m) => (
+              /* ⭐ value 用主键 id（精确、改名无忧）；标签用全名（可读、能区分同名）。
+                 重名不会导致选中错乱：两项 id 不同，<option value> 也就不同。 */
+              <option key={m.id} value={m.id}>
+                {/* ⚠️ alias 与 name 相同是常见情况（实测 `text-embedding-v4` 两者一致）
+                    ⇒ 不加判断会渲染成「text-embedding-v4（text-embedding-v4）」。 */}
+                {fullNameOf(m)}{m.alias && m.alias !== m.name ? `（${m.alias}）` : ''}
+              </option>
+            ))}
+          </optgroup>
         ))}
         {orphan && <option value={value}>{value}（已失效）</option>}
       </select>

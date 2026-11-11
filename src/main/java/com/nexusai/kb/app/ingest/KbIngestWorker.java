@@ -197,7 +197,13 @@ public class KbIngestWorker {
             case KbIngestTaskRecord.TYPE_IMAGE_UNDERSTAND: {
                 // ⭐ 与源侧同构：图片理解失败不阻塞文档完成（正文早已可检索），
                 //    但必须留痕 —— 失败计数会出现在返回的 detail 里。
-                int done = imageEnrichService.enrichKnowledge(knowledgeId);
+                //
+                // ⭐ 模型（用户裁定 2026-11-11）：payload.model 是**知识库设置里的 VLLM 视觉模型**。
+                //    空 ⇒ 视觉调用器回落 `settings.multimodalModelName`（默认行为）；
+                //    有值 ⇒ 该库专属模型，透传给 `enrichKnowledge` 真正生效。
+                JsonNode p = readPayload(task);
+                String model = p == null ? null : p.path("model").asText(null);
+                int done = imageEnrichService.enrichKnowledge(knowledgeId, model);
                 if (done == 0) {
                     return KbPostProcessOutcome.skipped("无可理解的图片（或视觉模型未配置）");
                 }

@@ -155,7 +155,7 @@ export function ArtifactPreviewModal({ sessionId, artifact, initialEdit = false,
             <pre className="artifact-modal-pre">{data.content ?? ''}</pre>
           ) : data && !data.binary && data.content != null && (
             isMarkdown
-              ? <MarkdownTextV2 text={data.content} className="content md artifact-modal-md" />
+              ? <MarkdownTextV2 text={data.content} className="content md artifact-modal-md markdown-prose" />
               : isHtml
                 ? <iframe className="artifact-modal-frame" title={artifact.title} sandbox="" srcDoc={data.content} />
                 : <pre className="artifact-modal-pre">{data.content}</pre>

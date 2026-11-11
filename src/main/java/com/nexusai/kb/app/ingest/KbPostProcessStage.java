@@ -8,8 +8,10 @@ import com.nexusai.kb.repo.entity.KbIngestTaskRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
+import com.nexusai.infra.llm.ModelConfigResolver;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
@@ -56,15 +58,60 @@ public class KbPostProcessStage {
     private final KbChunkMapper chunkMapper;
     private final KbKnowledgeStateRepository stateRepository;
     private final KbIngestTaskQueue queue;
+    /**
+     * 全局默认大模型解析器。
+     *
+     * <p>⭐ 2026-11-11 用户裁定 A：知识库未选 LLM 模型时（`summary_model_id` 为空）
+     * 回落到 {@code settings.main_model_name}，否则图谱/摘要/Wiki/问题生成/自动打标
+     * 会一起静默失效（详见 {@link KbPostProcessConfig#resolve(KbKnowledgeBaseRecord, String)}）。
+     *
+     * <p>{@code required = false}：精简装配（单测直构）下缺失 ⇒ 不回落，行为与改动前一致。
+     */
+    private final ModelConfigResolver modelConfigResolver;
 
+    /**
+     * 生产构造器（4 参）。
+     *
+     * <p>⚠️ 本类有<b>两个</b>构造器 ⇒ Spring 必须靠 {@code @Autowired} 选中这一个。
+     */
+    @Autowired
+    public KbPostProcessStage(
+        KbChunkMapper chunkMapper,
+        KbKnowledgeStateRepository stateRepository,
+        KbIngestTaskQueue queue,
+        @Autowired(required = false) ModelConfigResolver modelConfigResolver
+    ) {
+        this.chunkMapper = chunkMapper;
+        this.stateRepository = stateRepository;
+        this.queue = queue;
+        this.modelConfigResolver = modelConfigResolver;
+    }
+
+    /** 兼容构造（单测）：无全局模型回落。 */
     public KbPostProcessStage(
         KbChunkMapper chunkMapper,
         KbKnowledgeStateRepository stateRepository,
         KbIngestTaskQueue queue
     ) {
-        this.chunkMapper = chunkMapper;
-        this.stateRepository = stateRepository;
-        this.queue = queue;
+        this(chunkMapper, stateRepository, queue, null);
+    }
+
+    /**
+     * 全局默认大模型（{@code settings.main_model_name} → `provider/model` 全名）。
+     *
+     * @return 未配置 / 解析失败 ⇒ null（调用方按「不回落」处理）
+     */
+    private String globalChatModel() {
+        if (modelConfigResolver == null) {
+            return null;
+        }
+        try {
+            return modelConfigResolver.settingsTierModelName(
+                com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName);
+        } catch (RuntimeException e) {
+            log.warn("[后处理] 解析全局默认模型失败 原因={}", e.getMessage());
+            return null;
+        }
     }
 
     /**
@@ -86,7 +133,7 @@ public class KbPostProcessStage {
      */
     public void fanOut(KbKnowledgeRecord knowledge, KbKnowledgeBaseRecord kb, int attempt) {
         String knowledgeId = knowledge.getId();
-        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb);
+        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb, globalChatModel());
 
         List<Planned> planned = plan(knowledge, config, textChunksOf(knowledgeId));
 
@@ -189,9 +236,14 @@ public class KbPostProcessStage {
         //    len(options.StoredImages) > 0` 的差别：本阶段拿不到图片清单（要查库），
         //    代价是纯文本文档会多跑一个立刻 skip 的任务（一次查库，无模型调用）。
         //    ⛔ 反过来「在派发期查库算图片数」会引入第二个真源，与 plan() 的纯函数性质冲突。
+        //
+        // ⭐ 模型（用户裁定 2026-11-11：「可以选，默认使用全局默认，单独选择也能其效果」）：
+        //    空值 ⇒ 跟随 `settings.multimodalModelName`；有值 ⇒ 该库专属，由
+        //    `KbImageEnrichService#enrichKnowledge(id, model)` 透传给视觉调用器。
         if (config.image().runnable()) {
             Map<String, Object> payload = new LinkedHashMap<>();
-            payload.put("model", config.image().modelId());
+            // ⚠️ 空串也写进去：execute 侧按 isBlank 判「走全局」，两种形态语义一致。
+            payload.put("model", config.image().modelId() == null ? "" : config.image().modelId());
             out.add(new Planned(KbIngestTaskRecord.TYPE_IMAGE_UNDERSTAND, true, toJson(payload)));
         }
 

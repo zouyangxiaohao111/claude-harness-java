@@ -127,3 +127,28 @@
     background: var(--td-bg-color-container);
   }
 .kb-scope .wiki-graph-empty.is-open{ display: flex; }
+
+/* ── 关系图谱（GraphPanel）复用 Wiki 图谱引擎后的两处补充 ──────────────
+   ① 截断提示：图谱有上千实体时按度数截断，必须显式告诉用户（⛔ 不静默少画）。
+      画布是 absolute inset:0，提示条得浮在最上层不挡交互。 */
+.kb-scope .wiki-graph-truncate-tip{
+    position: absolute; top: 12px; left: 50%; transform: translateX(-50%);
+    z-index: 12; pointer-events: none;
+    padding: 4px 12px; border-radius: var(--app-radius-sm);
+    background: var(--td-warning-color-1); color: var(--td-warning-color-7);
+    font-size: var(--td-font-size-body-small);
+    box-shadow: var(--td-shadow-1);
+  }
+/* ② 实体详情（抽屉正文）：属性 / 关系清单。类名不借用 wiki 的
+   `.wiki-reader-body`（那是 markdown 渲染容器，有自己的一套排版规则）。 */
+.kb-scope .kb-entity-detail{ font-size: var(--td-font-size-body-medium); color: var(--td-text-color-primary); }
+.kb-scope .kb-entity-detail-meta{ margin: 0 0 8px; color: var(--td-text-color-secondary); }
+.kb-scope .kb-entity-detail-title{
+    margin: 16px 0 8px; font-size: var(--td-font-size-body-medium);
+    font-weight: 600; color: var(--td-text-color-primary);
+  }
+.kb-scope .kb-entity-detail-list{
+    margin: 0; padding-left: 18px; display: flex; flex-direction: column; gap: 6px;
+    color: var(--td-text-color-primary); word-break: break-word;
+  }
+

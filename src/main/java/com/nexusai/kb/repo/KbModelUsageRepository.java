@@ -77,21 +77,46 @@ public class KbModelUsageRepository {
      * @return 引用统计
      */
     public Usage countUsage(String modelId) {
-        if (modelId == null || modelId.isBlank()) {
+        return countUsage(modelId, null);
+    }
+
+    /**
+     * 统计某模型的引用情况 · <b>同时匹配 ID 与全名两种存储形态</b>。
+     *
+     * <h2>⭐⭐ 为什么必须两种都查（2026-11-11 用户裁定「存 provider/modelName」）</h2>
+     * 知识库的 {@code embedding_model_id} 等列此前存 {@code models.id}
+     * （{@code model-d4adf580}），现在改存 {@code provider/modelName}
+     * （{@code embed_dashscop/text-embedding-v4}）。两种形态会在同一张表里长期共存
+     * （存量行不会自动迁移），所以：
+     * <ul>
+     *   <li>只按 ID 查 ⇒ 新写入的全名引用**查不到** ⇒ 删除模型时不再拦住
+     *       ⇒ 知识库检索静默降级（正是这个类存在的理由，见类注释）；</li>
+     *   <li>只按全名查 ⇒ 存量 ID 引用查不到，同样漏拦。</li>
+     * </ul>
+     *
+     * @param modelId  模型 ID（{@code models.id}），可空
+     * @param fullName 模型全名（{@code provider/modelName}），可空
+     * @return 引用统计
+     */
+    public Usage countUsage(String modelId, String fullName) {
+        String id = modelId == null || modelId.isBlank() ? null : modelId.trim();
+        String full = fullName == null || fullName.isBlank() ? null : fullName.trim();
+        if (id == null && full == null) {
             return new Usage(0, 0, false);
         }
+        // 统一成「两个待匹配值」，SQL 用 IN (?, ?)；缺失的一侧传 null（= 永不命中）。
         long kbCount = queryLong(
             "SELECT COUNT(*) FROM kb_knowledge_base "
-                + "WHERE deleted = 0 AND (embedding_model_id = ? OR rerank_model_id = ?)",
-            modelId, modelId);
+                + "WHERE deleted = 0 AND (embedding_model_id IN (?, ?) OR rerank_model_id IN (?, ?))",
+            id, full, id, full);
         long knowledgeCount = queryLong(
             "SELECT COUNT(*) FROM kb_knowledge "
-                + "WHERE deleted = 0 AND embedding_model_id = ?",
-            modelId);
+                + "WHERE deleted = 0 AND embedding_model_id IN (?, ?)",
+            id, full);
         boolean global = queryLong(
             "SELECT COUNT(*) FROM settings "
-                + "WHERE kb_embedding_model_id = ? OR kb_rerank_model_id = ?",
-            modelId, modelId) > 0;
+                + "WHERE kb_embedding_model_id IN (?, ?) OR kb_rerank_model_id IN (?, ?)",
+            id, full, id, full) > 0;
         return new Usage(kbCount, knowledgeCount, global);
     }
 

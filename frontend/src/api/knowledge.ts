@@ -93,6 +93,16 @@ export interface CreateKnowledgeBaseBody {
     wiki_enabled: boolean
     graph_enabled?: boolean
   } | null
+  /**
+   * 抽取配置 JSON（`extract_config`）。
+   *
+   * <p>⭐ 图谱判据是 `indexing_strategy.graph_enabled` ∧ `extract_config.enabled`
+   * （`KbPostProcessConfig.graphEnabled`）⇒ 创建开图谱时必须两个字段一起写。
+   *
+   * <p>⚠️ 后端该字段是 **String**（TEXT 存 JSON）⇒ 调用方**已序列化**后传进来。
+   * 本层⛔ 不要再 `JSON.stringify`（会二次转义，落库成带引号的字符串）。
+   */
+  extract_config?: string | null
 }
 
 /** 更新知识库请求（null / 不传 = 不改）。 */
@@ -956,9 +966,35 @@ export const knowledgeApi = {
       unavailable_reason?: string
     }>>('/storage-backends'),
 
+  /**
+   * 生成知识库画像（源站 `POST /knowledge-bases/{id}/profile/generate`）。
+   *
+   * ⭐ 2026-11-11：`profile` 的形态从「字符串」改成「对象」，与后端新契约一致
+   * （后端此前返字符串、前端按对象读 ⇒ 契约错配，「AI 生成描述」按钮拿不到 gist）。
+   * 对象字段照源站 `KnowledgeBaseProfile`。
+   */
   generateProfile: (baseId: string, body?: { model?: string }) =>
     api<{
-      profile: { gist?: string; topics?: string[] } | null
+      profile: {
+        gist?: string
+        topics?: string[]
+        typical_questions?: string[]
+        status?: string
+        error?: string
+        model_id?: string
+        generated_at?: string
+        aggregate_hash?: string
+        stats?: {
+          document_count?: number
+          profiled_count?: number
+          earliest_at?: string
+          latest_at?: string
+          file_types?: string[]
+          tags?: string[]
+          folders?: string[]
+          raw_topics?: string[]
+        }
+      } | null
       status: string
       document_count: number
       model: string

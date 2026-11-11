@@ -6,12 +6,14 @@ import com.nexusai.kb.app.graph.KbGraphOutcome;
 import com.nexusai.kb.app.graph.KbGraphSearchService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper;
 import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
@@ -47,17 +49,49 @@ public class GraphController {
     private final KbGraphExtractionService extractionService;
     private final KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbKnowledgeMapper knowledgeMapper;
+    /**
+     * 全局默认大模型解析器（手动重建的模型回落）。
+     *
+     * <p>{@code required = false}：精简装配（单测直构）下缺失 ⇒ 不回落，
+     * 与「知识库未配模型 ⇒ 400」的旧行为一致。构造口径照抄
+     * {@code KbPostProcessStage#globalChatModel()}。
+     */
+    private final ModelConfigResolver modelConfigResolver;
 
+    @Autowired
     public GraphController(
         KbGraphSearchService searchService,
         KbGraphExtractionService extractionService,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
-        KbKnowledgeMapper knowledgeMapper
+        KbKnowledgeMapper knowledgeMapper,
+        @Autowired(required = false) ModelConfigResolver modelConfigResolver
     ) {
         this.searchService = searchService;
         this.extractionService = extractionService;
         this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.knowledgeMapper = knowledgeMapper;
+        this.modelConfigResolver = modelConfigResolver;
+    }
+
+    /**
+     * 全局默认大模型（{@code settings.main_model_name} → `provider/model` 全名）。
+     *
+     * <p>⭐ 照抄 {@code KbPostProcessStage#globalChatModel()}：取值口径必须与入库派发一致，
+     * 否则「自动抽图用全局默认、手动重建却说没配模型」—— 同一份配置两种结论。
+     *
+     * @return 未配置 / 解析失败 ⇒ null（调用方按「不回落」处理）
+     */
+    private String globalChatModel() {
+        if (modelConfigResolver == null) {
+            return null;
+        }
+        try {
+            return modelConfigResolver.settingsTierModelName(
+                com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName);
+        } catch (RuntimeException e) {
+            log.warn("[图谱API] 解析全局默认模型失败 原因={}", e.getMessage());
+            return null;
+        }
     }
 
     // ══════════════════════════════════════════════════════════
@@ -126,7 +160,7 @@ public class GraphController {
      *
      * @param id          知识库 ID
      * @param knowledgeId 文档 ID
-     * @param model       模型名（可空 ⇒ 用知识库的摘要模型）
+     * @param model       模型名（可空 ⇒ 知识库摘要模型 → 全局默认大模型）
      * @return 结果摘要
      */
     @PostMapping("/api/v1/knowledge-bases/{id}/graph/rebuild")
@@ -148,7 +182,14 @@ public class GraphController {
             modelName = kb.getSummaryModelId();
         }
         if (modelName == null || modelName.isBlank()) {
-            throw new ValidationException("未配置图谱抽取模型（知识库 summary_model_id 为空）");
+            // ⭐ 再回落全局默认（settings.main_model_name）—— 与入库派发同口径。
+            //    原先这里直接 400，未配 summary_model_id 的库连「手动重建」都走不通，
+            //    但自动抽图那条链在 2026-11-11 已支持全局默认回落 ⇒ 两条路不一致。
+            modelName = globalChatModel();
+        }
+        if (modelName == null || modelName.isBlank()) {
+            throw new ValidationException(
+                "知识库未配 LLM 模型，且全局默认模型解析失败（settings.main_model_name 为空或不可用），无法抽取图谱");
         }
         // ⭐ 必须传真实 attempt：传 0 会被 extract() 的陈旧任务守卫拦下，
         //    用户点「重建」什么也不会发生，而 HTTP 仍是 200。

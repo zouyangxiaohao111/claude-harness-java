@@ -5139,6 +5139,26 @@ public class LlmAgentLoop implements AgentLoop {
             // 3. coordinator userContext 并入（QueryEngine.ts:302-306 · 合并语义不变）
             java.util.Map<String, String> mergedUserContext =
                 mergeCoordinatorUserContext(ctx, runTuc, sysParts);
+            // [对齐 CC 2.1.322] 日期**不走** user 通道 —— CC 真源在 announce 点显式删掉该键
+            //   （exe offset 308659585 {@code delete P.currentDate} / offset 308659688
+            //   {@code delete w.currentDate}），改由每轮 {@code type:"date"} 附件单独供给
+            //   （{@code AgentLoopContext.maybeEmitDateChange}）。
+            // WHY 必须删：{@code prependUserContext} 会把 userContext 包进带
+            //   「this context may or may not be relevant … should not respond unless highly
+            //   relevant」免责声明的 {@code <system-reminder>} 里。指定人格后 system prompt 是强角色
+            //   指令，模型倾向把这条"可能不相关"的上下文当噪声忽略 ⇒ 表现为"不知道今天几号"。
+            //   独立的 date 消息是裸内容、无免责声明 ⇒ 人格再强也看得见。
+            // ⚠️ 必须**拷贝**后再删：{@code getUserContext()} 返回的是 provider 的 memoize 实例
+            //   （会话冻结），原地 remove 会污染跨 run 的缓存。
+            if (mergedUserContext != null && mergedUserContext.containsKey("currentDate")) {
+                java.util.Map<String, String> withoutDate = new java.util.LinkedHashMap<>(mergedUserContext);
+                withoutDate.remove("currentDate");
+                mergedUserContext = withoutDate;
+                if (log.isDebugEnabled()) {
+                    log.debug("[prompt-assembly-B] currentDate 已从 userContext 摘除（日期改由 date 附件供给）"
+                        + " · 对齐 CC 2.1.322 delete P.currentDate: 剩余键={}", withoutDate.keySet());
+                }
+            }
             com.nexusai.application.agent.loop.QueryParams out = params
                 // CC 回灌口径 = **pre-append** 形态（query.ts:648 的 appendSystemContext 产物是另一个
                 //   局部 const fullSystemPrompt，systemPrompt 本身从不重赋 —— 见 query.ts:393-411 注释）。
@@ -6167,7 +6187,7 @@ public class LlmAgentLoop implements AgentLoop {
             //   生成前缀，把整条会话变 cache_creation，每次跨午夜约 920K 有效 token」——
             //   本调用只做「尾部追加真实消息」，不触任何清集合入口（见 maybeEmitDateChange javadoc）。
             // 守卫（方法内）：会话首轮只记录不播报 / 同日无动作 / 无会话标识不追加。
-            AgentLoopContext.maybeEmitDateChange(state);
+            AgentLoopContext.maybeEmitDateChange(state, params.querySource());
 
             // ── [A1 · 每轮 mcp_instructions_delta 尾部投递] 对齐 CC attachments.ts:854-863
             //    `maybe('mcp_instructions_delta', () => getMcpInstructionsDeltaAttachment(...))`
@@ -10871,6 +10891,11 @@ public class LlmAgentLoop implements AgentLoop {
             }
             return;
         }
+        // 通告不读 agent frontmatter 的 skills 字段 · 对齐 CC exe q3r() / CCB attachments.ts:2743-2830：
+        //   两处实现里 skills 只用于预加载（CC runAgent `$o=L(e.skills??[])` / CCB runAgent.ts:587），
+        //   通告侧对 agent 定义的 skills 零引用 ⇒ 未声明 / [] / [a,b] / ["*"] 一律通告全量。
+        //   （CC exe 另有 sessionSkillAllowlist 过滤，但其数据源是 SDK initialize 请求的 options.skills，
+        //    不是 agent frontmatter；CCB 完全无此逻辑。）
         // [P2-9] listing 合并视图（本地 + MCP thread-in）· 对齐 CC attachments.ts:2677-2682
         //   getMcpSkillCommands(commands) + uniqBy([...local, ...mcp], 'name')。
         // [批 3c] 会话标识显式取本方法形参 state.sessionId()（本方法入口已守卫 state 非 null，且下方

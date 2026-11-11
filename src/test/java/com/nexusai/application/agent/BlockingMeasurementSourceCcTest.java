@@ -150,11 +150,19 @@ class BlockingMeasurementSourceCcTest {
     }
 
     private static AgentState stateWithOneUserMessage() {
-        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
+        String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        AgentState state = new AgentState("sys", sessionId, null);
         state.appendMessage(new ChatMessageDto(
             "m1", null, Role.user, "user", "question", null, List.of(),
             FinishReason.stop, null, null, "刚刚", OffsetDateTime.now(),
             null, null, null, List.of(), List.of()));
+        // [2026-11-11 对齐 CC 2.1.322] 预置「当天已播报」的 date 附件：
+        //   日期改为每轮尾部投递（AgentLoopContext.maybeEmitDateChange）后，首轮会在
+        //   messagesForQuery 快照**之前**追加一条 `Today's date is …` 真实消息 ⇒ 本用例的
+        //   基础链就不再只有那一条 user 消息，测量源断言会因多一条日期消息而漂移。
+        //   预置当天日期 ⇒ maybeEmitDateChange 判「同日无动作」= 零追加，测量源回到「基础链」语义。
+        state.appendMessage(AgentLoopContext.todayDateMessage(
+            sessionId, com.nexusai.application.agent.prompt.SessionPromptCacheStore.localIsoDate()));
         return state;
     }
 
@@ -181,12 +189,19 @@ class BlockingMeasurementSourceCcTest {
     /** 捕获 tokenCountWithEstimation 入参的 TokenBudgetBeans（固定 contextWindow / 低 tokenUsage）。 */
     private static AgentLoopContext.TokenBudgetBeans capturingTokenBudgetBeans(List<List<ChatMessageDto>> measured) {
         TokenEstimator te = Mockito.mock(TokenEstimator.class);
-        when(te.tokenCountWithEstimation(anyList())).thenAnswer(inv -> {
+        // ⚠️ 生产调用点（LlmAgentLoop blocking 预检）走 **2 参重载**（A5-2 provider 分派）：
+        //   `tokenCountWithEstimation(messagesForQuery, anthropic)`。只 stub 1 参 ⇒ Mockito 对 2 参
+        //   返回默认 0 且**不回调** ⇒ measured 恒空、tokenUsage 恒 0（本用例曾因此假红）。
+        //   两个重载都 stub，语义一致（同一个捕获 + 同一个固定测量值）。
+        org.mockito.stubbing.Answer<Integer> capture = inv -> {
             @SuppressWarnings("unchecked")
             List<ChatMessageDto> list = (List<ChatMessageDto>) inv.getArgument(0);
             measured.add(new ArrayList<>(list));
             return MOCK_TOKEN_USAGE;
-        });
+        };
+        when(te.tokenCountWithEstimation(anyList())).thenAnswer(capture);
+        when(te.tokenCountWithEstimation(anyList(), org.mockito.ArgumentMatchers.anyBoolean()))
+            .thenAnswer(capture);
         ModelMapper modelMapper = Mockito.mock(ModelMapper.class);
         ModelRecord model = new ModelRecord();
         model.setProviderId("p1");

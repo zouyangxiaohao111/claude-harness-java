@@ -130,7 +130,10 @@ public class KbAutoTagService {
         if (!"document".equals(kb.getType())) {
             return KbPostProcessOutcome.skipped("kb_not_document");
         }
-        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb);
+        KbPostProcessConfig config = KbPostProcessConfig.resolve(kb,
+            modelConfigResolver == null ? null
+                : modelConfigResolver.settingsTierModelName(
+                    com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName));
         if (!config.autoTag().runnable()) {
             return KbPostProcessOutcome.skipped("auto_tag_disabled");
         }
