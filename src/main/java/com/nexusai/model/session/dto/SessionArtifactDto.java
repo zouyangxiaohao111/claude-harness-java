@@ -40,6 +40,28 @@ public record SessionArtifactDto(
          */
         String sourceMessageId,
         /**
+         * 产出该产物的那一轮<b>用户提问原文</b>（后端已压成单行，超长截断到 500 汉字并加 {@code …}）。
+         *
+         * <p><b>WHY 出站</b>：右侧栏「产物」按对话分组，组头要显示「这一轮问了什么」。
+         * 此前由前端从聊天窗口的轮次里算，而聊天窗口只保留最近 2 轮
+         * （{@code FOLD_DEFAULT_TURNS=2}）⇒ 更早轮次的提问查不到，产物只能落到「历史产物」组。
+         * 改由后端按 {@code sourceMessageId} 联查消息表直出，分组不再依赖消息窗口。
+         *
+         * <p>⛔ <b>{@code null} 不是「空提问」，而是「归属不可判定」</b>：
+         * {@code sourceMessageId} 为空（历史行）、消息表查不到该 id（孤儿键）、
+         * 或该消息不是真人提问（{@code role} 非 {@code user} / {@code is_meta}=true /
+         * {@code subtype} 有值 / {@code user_message_id} 指向别的消息）时一律为 {@code null}。
+         * 前端据此决定<b>是否成组</b>：null ⇒ 归入「历史产物」，⛔ 不要伪造标题。
+         */
+        String turnQuestion,
+        /**
+         * 该提问消息的 {@code created_at} <b>原始字符串</b>（DB 直出，不二次解析，与
+         * {@code updatedAt} 同口径）。
+         *
+         * <p>{@code null} = 未知（与 {@link #turnQuestion} 同源：归属不可判定时一并返回 null）。
+         */
+        String turnCreatedAt,
+        /**
          * 产物来源通道 · {@code deliverables}（写进会话交付物目录）| {@code project-write}
          * （Write/Edit 写过的项目内文档）。
          *
@@ -55,16 +77,20 @@ public record SessionArtifactDto(
     /**
      * 行 → DTO（null 行 → null；字段原样透出，不做业务判断）。
      *
-     * @param r          产物行
-     * @param directory  {@code local_path} 是否指向目录（由服务层读时判定）
+     * @param r             产物行
+     * @param directory     {@code local_path} 是否指向目录（由服务层读时判定）
+     * @param turnQuestion  该轮提问原文（已压单行+截断）；{@code null} = 归属不可判定
+     * @param turnCreatedAt 该提问消息的 {@code created_at} 原始串；{@code null} = 未知
      */
-    public static SessionArtifactDto from(SessionArtifactRecord r, boolean directory) {
+    public static SessionArtifactDto from(SessionArtifactRecord r, boolean directory,
+                                          String turnQuestion, String turnCreatedAt) {
         if (r == null) {
             return null;
         }
         return new SessionArtifactDto(
                 r.getId(), r.getKind(), r.getTitle(), r.getLocalPath(), r.getUrl(),
                 r.getSizeBytes(), r.getSummary(), r.getSourceMessageId(),
+                turnQuestion, turnCreatedAt,
                 r.getOrigin(), r.getUpdatedAt(), directory);
     }
 }

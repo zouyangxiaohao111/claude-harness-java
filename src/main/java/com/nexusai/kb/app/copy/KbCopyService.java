@@ -129,6 +129,12 @@ public class KbCopyService {
         copy.setIsPinned(0);
         copy.setChunkingConfig(source.getChunkingConfig());
         copy.setImageProcessingConfig(source.getImageProcessingConfig());
+        // ⭐ V286 图片管线三项必须一起复制：三列 NOT NULL 且 Flex 会把 null 也列进 INSERT
+        //   ⇒ 漏拷会直接 NOT NULL constraint failed（不是「用默认值」）。
+        copy.setImageCaptionEnabled(source.getImageCaptionEnabled() == null ? 1 : source.getImageCaptionEnabled());
+        copy.setImageOcrEnabled(source.getImageOcrEnabled() == null ? 1 : source.getImageOcrEnabled());
+        copy.setImagePipeline(source.getImagePipeline() == null || source.getImagePipeline().isBlank()
+            ? "default" : source.getImagePipeline());
         copy.setCosConfig(source.getCosConfig());
         copy.setVlmConfig(source.getVlmConfig());
         copy.setExtractConfig(source.getExtractConfig());

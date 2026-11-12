@@ -65,8 +65,7 @@ class SettingsResponseTest {
     /** 内层 DTO：只有 theme 有值、其余全 null（避免手写 66 参）。 */
     private static SettingsDto dtoWithTheme(Theme theme) {
         return new SettingsDto(
-            theme, null, null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null, null, null,
+            theme, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,

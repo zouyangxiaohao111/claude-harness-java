@@ -227,7 +227,17 @@ public record ChatMessageDto(
     //   字段置于 canonical 末尾（userAttachments 之后），既有 45 参 canonical 调用方经
     //   45 参兼容构造器默认 null。
     @JsonIgnore
-    String queuedOrigin
+    String queuedOrigin,
+    // ── thinkingSignature · thinking 块的签名 · 对齐 CC {type:'thinking',thinking,signature} ──
+    // WHY（[thinking-passthrough] 2026-11-12）：Anthropic 协议在 thinking 模式下继续工具调用时，
+    //   要求把上一轮 assistant 的完整 content 数组（含 thinking 块）原样回传；不传时第三方兼容端点
+    //   按 tool_use id 恢复，恢复失败即 400「The content[].thinking in the thinking mode must be
+    //   passed back to the API」。本字段承载上游签发的 signature（流式 = signature_delta 事件，
+    //   非流式 = block.signature），随 assistant 消息落库/重放，送侧据此重建 thinking 块。
+    //   CC 实证：~/.claude/projects/*.jsonl 中 deepseek-flash 的 2148 个 thinking 块全带 signature。
+    //   null/空 = 上游未签发（DeepSeek 实测空签名可接受；真 Claude 会校验 → 走 400 兜底）。
+    //   非 @JsonIgnore：需随 transcript / 前端 round-trip 保留（出站多一字段，前端忽略即可）。
+    String thinkingSignature
 ) {
     /**
      * 附件快照项 · 对齐前端 userAttachments: [{ type, filename, mediaType, contentId, url }]
@@ -316,7 +326,8 @@ public record ChatMessageDto(
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
             contextTokensUsed, percentLeft, contextWindow, userAttachments,
-            null); // queuedOrigin null = 非排队消息（默认）
+            null, // queuedOrigin null = 非排队消息（默认）
+            null); // thinkingSignature null = 无签名（旧调用方 / 非 assistant 消息）
     }
 
     /**
@@ -707,7 +718,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 补 cwd（withSourceToolUseID 早期未重建 cwd，补全保字段）+ userMessageId 透传 + B7 decodeMs 透传
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature); // G13: 补 cwd（withSourceToolUseID 早期未重建 cwd，补全保字段）+ userMessageId 透传 + B7 decodeMs 透传
     }
 
     /**
@@ -732,7 +743,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -760,7 +771,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -785,7 +796,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
-            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -810,7 +821,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, newSnipMetadata,
             cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow,
-            userAttachments, queuedOrigin);
+            userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -854,7 +865,7 @@ public record ChatMessageDto(
             null, null,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -878,7 +889,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -902,7 +913,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin); // G13: 保留 cwd 戳 + B7 decodeMs 透传
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature); // G13: 保留 cwd 戳 + B7 decodeMs 透传
     }
 
     /**
@@ -925,7 +936,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -950,7 +961,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             newIsCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -970,7 +981,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, newIsVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -995,7 +1006,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1023,7 +1034,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1047,7 +1058,31 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
+    }
+
+    /**
+     * thinkingSignature 拷贝方法：附加 thinking 块的签名 · 对齐 CC
+     * {@code {type:'thinking', thinking, signature}}（thinking 正文走 {@link #reasoning()}）。
+     *
+     * <p>供 LlmAgentLoop 在 assistant 消息构建点（纯文本 / 工具轮）从 provider 响应携带的
+     * signature 附加；读侧 {@code MessageService.toDto} 从 DB 列回填。该字段与 reasoning
+     * 配对，送侧据此重建 thinking 块回传（Anthropic thinking 模式要求，见类字段注释）。
+     *
+     * @param thinkingSignature 上游签发的签名（null/空 = 未签发，回传按空签名）
+     * @return 与原 record 全字段相同、仅 thinkingSignature 覆盖的新实例
+     */
+    public ChatMessageDto withThinkingSignature(String thinkingSignature) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, toolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly,
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1072,7 +1107,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1097,7 +1132,7 @@ public record ChatMessageDto(
             inputCacheReadTokens, inputCacheCreationTokens,
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
-            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1124,7 +1159,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
-            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1581,7 +1616,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
-            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
     /**
@@ -1604,7 +1639,7 @@ public record ChatMessageDto(
             compactMetadata, microcompactMetadata, logicalParentUuid,
             isCompactSummary, isVisibleInTranscriptOnly,
             usage, level, matchedRule, snipMetadata, cwd, reasoningDurationMs, userMessageId, decodeMs,
-            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin);
+            contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
     }
 
 }

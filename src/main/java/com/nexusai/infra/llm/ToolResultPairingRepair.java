@@ -450,7 +450,7 @@ public final class ToolResultPairingRepair {
             m.compactMetadata(), m.microcompactMetadata(), m.logicalParentUuid(),
             m.isCompactSummary(), m.isVisibleInTranscriptOnly(), m.usage(), m.level(), m.matchedRule(), m.snipMetadata(),
             m.cwd(), m.reasoningDurationMs(), m.userMessageId(), m.decodeMs(), m.contextTokensUsed(), m.percentLeft(),
-            m.contextWindow(), m.userAttachments(), m.queuedOrigin());
+            m.contextWindow(), m.userAttachments(), m.queuedOrigin(), m.thinkingSignature());
     }
 
     private static String truncate(String s) {

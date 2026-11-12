@@ -10,6 +10,13 @@ import {
   parserGroupsWithDynamic,
 } from './kbParserGroups'
 import { IconSprite } from './IconSprite'
+import {
+  IMAGE_PIPELINE_OFF_HINT,
+  buildKbImagePipelinePatch,
+  imagePipelineOffHintVisible,
+  ocrOnUnobservedVisible,
+  readKbImagePipeline,
+} from './kbImagePipeline'
 
 interface Props {
   base: KnowledgeBase
@@ -610,6 +617,40 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
     if ('custom_instructions' in next) {
       setSavedImage({ custom_instructions: next.custom_instructions as string })
     }
+  }
+
+  /**
+   * 图片处理三项（V286 · **顶层列**）· 读侧只认 `image_caption_enabled` /
+   * `image_ocr_enabled` / `image_pipeline`（DTO 已回传，保存后父组件重拉 ⇒ 本组自动回填新值）。
+   *
+   * <h2>⚠️⚠️ 与上面 `imageCfg.image_pipeline` **同名不同义**（⛔ 别混）</h2>
+   * <ul>
+   *   <li>本组的 `image_pipeline`：`kb_knowledge_base` **顶层列**，取值 `default` |
+   *       `smartocr`，后端 `KbImageSettings.from(record)` 真消费（切换图片管线）；</li>
+   *   <li>`image_processing_config.image_pipeline`（旧键）：取值 `""` | `"attrs"`，
+   *       后端**零消费者**，只服务于上面那个「图片解析方案」下拉。</li>
+   * </ul>
+   * ⇒ ⛔ 不要拿旧键回填本组（`""` / `"attrs"` 都不是本组合法值，会把「智能」静默显示成
+   * 「默认」）；也不要改旧键的读写语义。
+   */
+  const imagePipeline = readKbImagePipeline(form)
+  const saveImagePipeline = (
+    next: {
+      captionEnabled?: boolean
+      ocrEnabled?: boolean
+      pipeline?: string
+      ocrOnUnobserved?: boolean
+    },
+    okMsg = '图片处理配置已保存'
+  ) => {
+    const body = buildKbImagePipelinePatch({
+      ...next,
+      // `ocr_on_unobserved` 存在 image_processing_config JSON 里；后端是整块替换，
+      // 所以改它时必须把原 JSON 带上做合并，否则会冲掉 enable_multimodal / model_id。
+      imageProcessingConfig: 'ocrOnUnobserved' in next ? form.image_processing_config : undefined,
+    })
+    if (Object.keys(body).length === 0) { showToast('没有改动', 'info'); return }
+    void patch(body, okMsg)
   }
 
   // ── B7：高级设置（问题生成 / 自动打标 / 画像 / 表格元数据）──────────
@@ -1580,6 +1621,75 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
                         </Row>
                       </>
                     )}
+
+                    {/* ── 图片处理（V286 顶层三列）───────────────────────────────
+                        ⭐ 这一组是**独立的三列**（`image_caption_enabled` /
+                        `image_ocr_enabled` / `image_pipeline`），不是上面
+                        `image_processing_config` 那段 JSON 的键。
+                        ⚠️ 与旧键 `image_processing_config.image_pipeline`（`""`/`"attrs"`，
+                        后端零消费者）**同名不同义**：本组取值 `default`/`smartocr`，
+                        后端 `KbImageSettings` 真消费。⛔ 两者不要互相回填 / 互相覆盖。 */}
+                    <div className="kb-image-pipeline-config">
+                      <h3 className="section-title">图片处理</h3>
+                      <Row
+                        label="生成图片描述（caption）"
+                        desc="入库时调用视觉模型为每张图片生成文字描述，图片内容才能被检索到"
+                      >
+                        <Switch
+                          checked={imagePipeline.captionEnabled}
+                          label="生成图片描述（caption）"
+                          onChange={(v) => saveImagePipeline({ captionEnabled: v }, '图片描述开关已保存')}
+                        />
+                      </Row>
+
+                      <Row
+                        label="识别图片内文字（OCR）"
+                        desc="入库时调用视觉模型识别图片里的文字；关闭后图片内的文字不进索引"
+                      >
+                        <Switch
+                          checked={imagePipeline.ocrEnabled}
+                          label="识别图片内文字（OCR）"
+                          onChange={(v) => saveImagePipeline({ ocrEnabled: v }, '图片 OCR 开关已保存')}
+                        />
+                      </Row>
+
+                      <Row
+                        label="处理方式"
+                        desc="默认：每张图分别调用描述与 OCR。智能：先观察一次（描述 + 是否含文字），只对含文字的图再做 OCR"
+                      >
+                        <div className="t-select__wrap" style={{ width: 280 }}>
+                          <select
+                            className="t-input__inner"
+                            style={{ width: '100%', height: 32 }}
+                            value={imagePipeline.pipeline}
+                            onChange={(e) => saveImagePipeline(
+                              { pipeline: e.target.value },
+                              '图片处理方式已保存')}
+                          >
+                            <option value="default">默认</option>
+                            <option value="smartocr">智能（先观察再决定是否 OCR）</option>
+                          </select>
+                        </div>
+                      </Row>
+
+                      {ocrOnUnobservedVisible(imagePipeline.pipeline) && (
+                        <Row
+                          label="属性没识别出来时仍做 OCR"
+                          desc="智能方式下，观察调用失败或模型没给出可判定属性时，仍然再跑一次 OCR —— 宁可多花一次调用，也不静默丢字"
+                        >
+                          <Switch
+                            checked={imagePipeline.ocrOnUnobserved}
+                            label="属性没识别出来时仍做 OCR"
+                            onChange={(v) => saveImagePipeline(
+                              { ocrOnUnobserved: v }, '兜底 OCR 开关已保存')}
+                          />
+                        </Row>
+                      )}
+
+                      {imagePipelineOffHintVisible(imagePipeline.captionEnabled, imagePipeline.ocrEnabled) && (
+                        <p className="form-tip">{IMAGE_PIPELINE_OFF_HINT}</p>
+                      )}
+                    </div>
 
                     <p className="form-tip">
                       图内文字会一起进索引 ⇒ 检索能命中图片里的内容。改完需对已有文档「重解析」才会补图。

@@ -156,6 +156,31 @@ public class KbKnowledgeBaseRecord extends KbBaseRecord {
     /** 置顶时间（源 000016 加）。 */
     private String pinnedAt;
 
+    /**
+     * 图片管线 · 是否生成 caption（V286）。
+     *
+     * <p>1/0；DB 默认 1（= 改造前恒定跑 caption，升级零行为变化）。
+     * 消费点：{@code KbImageEnrichService}（false ⇒ 不调 caption 提示词）。
+     */
+    private Integer imageCaptionEnabled;
+
+    /**
+     * 图片管线 · 是否做 OCR（V286）。
+     *
+     * <p>1/0；DB 默认 1。消费点：{@code KbImageEnrichService}
+     * （false ⇒ 不调 OCR 提示词；smartocr 下即使观察到有文字也不 OCR）。
+     */
+    private Integer imageOcrEnabled;
+
+    /**
+     * 图片管线方案（V286）：{@code default} | {@code smartocr}。
+     *
+     * <p>{@code default} = caption / OCR 各一次调用；
+     * {@code smartocr} = 先一次「观察」调用（描述 + 是否含文字），只对含文字的图再跑 OCR。
+     * ⛔ 值域在 {@code KnowledgeBaseService} 入口校验（其它值 400），本列 NOT NULL DEFAULT 'default'。
+     */
+    private String imagePipeline;
+
     // ── getter / setter ──────────────────────────────────────────────
     //
     // ⚠️ audit 字段（create_time / update_time / creator / updater / deleted / tenant_id）
@@ -223,4 +248,10 @@ public class KbKnowledgeBaseRecord extends KbBaseRecord {
     public void setIsPinned(Integer isPinned) { this.isPinned = isPinned; }
     public String getPinnedAt() { return pinnedAt; }
     public void setPinnedAt(String pinnedAt) { this.pinnedAt = pinnedAt; }
+    public Integer getImageCaptionEnabled() { return imageCaptionEnabled; }
+    public void setImageCaptionEnabled(Integer v) { this.imageCaptionEnabled = v; }
+    public Integer getImageOcrEnabled() { return imageOcrEnabled; }
+    public void setImageOcrEnabled(Integer v) { this.imageOcrEnabled = v; }
+    public String getImagePipeline() { return imagePipeline; }
+    public void setImagePipeline(String imagePipeline) { this.imagePipeline = imagePipeline; }
 }

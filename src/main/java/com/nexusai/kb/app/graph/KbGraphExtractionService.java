@@ -61,8 +61,9 @@ public class KbGraphExtractionService {
     /** 关系抽取时送进去的最大总字符数。 */
     static final int MAX_RELATION_CONTENT_CHARS = 12000;
 
-    private static final int MAX_TOKENS_ENTITIES = 4000;
-    private static final int MAX_TOKENS_RELATIONS = 4000;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS_ENTITIES / MAX_TOKENS_RELATIONS（原 4000）：
+    //   输出上限唯一入口 = models.max_tokens。写死 4000 会让大文档（如 288 实体、
+    //   80 块）的实体/关系输出被截断 ⇒ 静默丢关系（11-12 千岛湖高铁缺陷）。
 
     /** 图谱抽取的温度（源侧 {@code DefaultLLMTemperature = 0.1}，要稳定）。 */
     private static final double TEMPERATURE = 0.1;
@@ -158,7 +159,7 @@ public class KbGraphExtractionService {
             try {
                 String raw = sideCallClient.chat(
                     provider, apiModelName, KbGraphPrompts.EXTRACT_ENTITIES, clipped,
-                    options(MAX_TOKENS_ENTITIES, "graph_extract_entities"),
+                    options("graph_extract_entities"),
                     LlmSideCallClient.SideCallUsage.standalone(
                         UsageCategory.SIDE_CALL, "graph_extract_entities"));
                 got = KbGraphParser.parseEntities(raw);
@@ -187,7 +188,7 @@ public class KbGraphExtractionService {
             String raw = sideCallClient.chat(
                 provider, apiModelName, KbGraphPrompts.EXTRACT_RELATIONSHIPS,
                 KbGraphPrompts.relationshipUserMessage(entitiesJson, merged),
-                options(MAX_TOKENS_RELATIONS, "graph_extract_relations"),
+                options("graph_extract_relations"),
                 LlmSideCallClient.SideCallUsage.standalone(
                     UsageCategory.SIDE_CALL, "graph_extract_relations"));
             relations = new ArrayList<>(KbGraphParser.parseRelations(raw, names));
@@ -201,11 +202,23 @@ public class KbGraphExtractionService {
         for (Acc a : entities.values()) {
             eIn.add(new KbGraphWeights.EntityInput(a.name, List.copyOf(a.chunkIds)));
         }
+        // ⭐ 支撑块为空的边丢弃 · 对齐源侧 graph.go:273-277（{@code findRelationChunkIDs} 返回空 ⇒ skip）。
+        //   ⚠️ 源侧该方法实际取的是**并集**（source 或 target 任一实体的 chunkIDs），
+        //   与 {@link #relationChunks} 同义；只有「两端实体都没有 chunk」才会为空，
+        //   正常抽取不会触发，此处是语义对齐的兜底。
+        //   过滤必须同时作用于 relations —— buildRelations 按三元组下标对齐。
+        List<KbGraphParser.ExtractedRelation> keptRelations = new ArrayList<>(relations.size());
         List<KbGraphWeights.RelationInput> rIn = new ArrayList<>(relations.size());
         for (KbGraphParser.ExtractedRelation r : relations) {
-            rIn.add(new KbGraphWeights.RelationInput(
-                r.source(), r.target(), r.strength(), relationChunks(r, entities)));
+            List<String> support = relationChunks(r, entities);
+            if (support.isEmpty()) {
+                log.debug("[图谱] 丢弃无支撑块的关系 {}→{}", r.source(), r.target());
+                continue;
+            }
+            keptRelations.add(r);
+            rIn.add(new KbGraphWeights.RelationInput(r.source(), r.target(), r.strength(), support));
         }
+        relations = keptRelations;
         List<KbGraphWeights.Result> results = KbGraphWeights.compute(eIn, rIn);
 
         // ── ④ 落库（一次 replaceGraph：内部先清后写）────────────────────
@@ -438,12 +451,19 @@ public class KbGraphExtractionService {
         }
     }
 
-    private static LlmProvider.ChatRequestOptions options(int maxTokens, String label) {
+    /**
+     * 抽取调用选项。
+     *
+     * <p>⚠️ 2026-11-12 <b>不再传 max_tokens</b>（传 null）：输出上限唯一入口 =
+     * 模型配置页「生成参数 · max tokens」（{@code models.max_tokens}）。
+     * 原写死的 4000 导致 288 实体的大文档输出被截断 ⇒ 关系全部丢失（11-12 千岛湖高铁缺陷）。
+     */
+    private static LlmProvider.ChatRequestOptions options(String label) {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             // 抽取是「按格式搬运事实」，不需要推理链
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-            TEMPERATURE, label, null, maxTokens, null, null,
+            TEMPERATURE, label, null, null, null, null,
             null, null, null, null, null, null);
     }
 }

@@ -6,6 +6,7 @@ import {
   buildTurnContext,
   dedupeByFile,
   groupArtifactsByTurn,
+  mergeTurnContext,
 } from '@/utils/artifactGrouping'
 
 /**
@@ -31,6 +32,8 @@ const A = (over: Partial<SessionArtifactDto>): SessionArtifactDto => ({
   summary: null,
   sourceMessageId: over.sourceMessageId ?? null,
   origin: over.origin ?? 'deliverables',
+  turnQuestion: over.turnQuestion ?? null,
+  turnCreatedAt: over.turnCreatedAt ?? null,
   updatedAt: over.updatedAt ?? '2026-11-10T10:00:00+08:00',
   directory: false,
 })
@@ -106,13 +109,27 @@ describe('buildTurnContext · 只收真人提问', () => {
     expect(ctx.size).toBe(0)
   })
 
-  it('提问压成单行并截断到 160 字（组头只有两行高度）', () => {
+  it('提问压成单行并截断到 60 字（与组头两行容量对齐）', () => {
     const long = 'a\n\nb   c'.concat('x'.repeat(300))
     const ctx = buildTurnContext([M({ id: 'm1', content: long })])
     const q = ctx.get('m1')!.question
     expect(q).not.toContain('\n')
     expect(q.startsWith('a b c')).toBe(true)
     expect(q.endsWith('…')).toBe(true)
+    // ⭐ 必须钉住长度：原先只断言 endsWith('…')，把 160 改成 600 也是绿的。
+    //    超长文本会撑高卡片头部（用户实测「一下子很多就会出渲染问题」）。
+    //    60 字 + 1 个省略号 = 61。
+    expect(q.length).toBe(61)
+  })
+
+  it('产物自带的长 turnQuestion 走同一套 60 字截断（两条通道不允许口径漂移）', () => {
+    const longRow = A({
+      sourceMessageId: 'm1',
+      turnQuestion: 'y'.repeat(400),
+    })
+    const [group] = groupArtifactsByTurn([longRow], new Map())
+    expect(group.question).not.toBeNull()
+    expect(group.question!.length).toBe(61)
   })
 
   it('纯附件提问（正文为空）不进映射，避免组头空白', () => {
@@ -167,5 +184,123 @@ describe('groupArtifactsByTurn · 归组与兜底', () => {
       ctx,
     )
     expect(groups.map((g) => g.key)).toEqual(['new', 'old', HISTORY_GROUP_KEY])
+  })
+})
+
+/**
+ * 2026-11-12：产物自带 {@code turnQuestion / turnCreatedAt}（后端 join 带出）。
+ *
+ * <p><b>WHY</b>：窗口只保留最近 2 轮 ⇒ 更早轮次的产物此前全部落进「历史产物」。
+ * 这些用例钉住「优先用产物自带字段、窗口映射只作回退」这条两级规则。
+ */
+describe('产物自带 turnQuestion · 窗口之外的老轮次也能成组', () => {
+  it('窗口为空（只加载了最近 2 轮）→ 仍按产物自带字段成组', () => {
+    const groups = groupArtifactsByTurn(
+      [
+        A({
+          id: 'a1',
+          sourceMessageId: 'm-early',
+          localPath: 'C:/art/e.md',
+          turnQuestion: '早期的提问',
+          turnCreatedAt: '2026-11-01T08:00:00+08:00',
+        }),
+      ],
+      new Map(),
+    )
+    expect(groups).toHaveLength(1)
+    expect(groups[0].key).toBe('m-early')
+    expect(groups[0].question).toBe('早期的提问')
+    expect(groups[0].createdAt).toBe('2026-11-01T08:00:00+08:00')
+  })
+
+  it('产物带的提问是 hook 日志 → 历史产物组（组头不能是 hook 日志）', () => {
+    const groups = groupArtifactsByTurn(
+      [
+        A({
+          sourceMessageId: 'm-hook',
+          turnQuestion: 'A session-scoped Stop hook is now active',
+          turnCreatedAt: '2026-11-01T08:00:00+08:00',
+        }),
+      ],
+      new Map(),
+    )
+    expect(groups[0].key).toBe(HISTORY_GROUP_KEY)
+    expect(groups[0].question).toBeNull()
+  })
+
+  it('产物带的提问是成对 <system-reminder> 块 → 历史产物组', () => {
+    const groups = groupArtifactsByTurn(
+      [
+        A({
+          sourceMessageId: 'm-sys',
+          turnQuestion: '<system-reminder>技能清单…</system-reminder>',
+        }),
+      ],
+      new Map(),
+    )
+    expect(groups[0].key).toBe(HISTORY_GROUP_KEY)
+  })
+
+  it('老后端（无 turnQuestion）+ 窗口有该消息 → 仍按窗口映射成组', () => {
+    const ctx = buildTurnContext([M({ id: 'm1', content: '窗口里的提问' })])
+    const groups = groupArtifactsByTurn([A({ sourceMessageId: 'm1' })], ctx)
+    expect(groups[0].key).toBe('m1')
+    expect(groups[0].question).toBe('窗口里的提问')
+  })
+
+  it('老后端（无 turnQuestion）+ 窗口没有该消息 → 历史产物组（现状不变）', () => {
+    const groups = groupArtifactsByTurn([A({ sourceMessageId: 'm-old' })], new Map())
+    expect(groups[0].key).toBe(HISTORY_GROUP_KEY)
+  })
+
+  it('同一轮多产物只有一个带 turnQuestion → 仍合成 1 组', () => {
+    const groups = groupArtifactsByTurn(
+      [
+        A({ id: 'a1', sourceMessageId: 'm1', localPath: 'C:/art/1.md', turnQuestion: '同一轮的提问' }),
+        A({ id: 'a2', sourceMessageId: 'm1', localPath: 'C:/art/2.md' }),
+      ],
+      new Map(),
+    )
+    expect(groups).toHaveLength(1)
+    expect(groups[0].key).toBe('m1')
+    expect(groups[0].items.map((x) => x.id).sort()).toEqual(['a1', 'a2'])
+  })
+
+  it('产物字段覆盖同键窗口值（后端全量真源 > 窗口局部视图），且入参 Map 不被修改', () => {
+    const ctx = buildTurnContext([M({ id: 'm1', content: '窗口提问' })])
+    const before = [...ctx.entries()]
+    const merged = mergeTurnContext(
+      [A({ sourceMessageId: 'm1', turnQuestion: '产物里的提问', turnCreatedAt: '2026-11-01T08:00:00+08:00' })],
+      ctx,
+    )
+    expect(
+      merged.get('m1')!.question,
+      '⛔ 反了 ⇒ 默认用的是当前窗口（最近 2 轮）而不是全量真源',
+    ).toBe('产物里的提问')
+    expect(merged.get('m1')!.createdAt).toBe('2026-11-01T08:00:00+08:00')
+    expect(ctx.size).toBe(before.length)
+    expect([...ctx.entries()]).toEqual(before)
+    expect(merged).not.toBe(ctx)
+  })
+
+  it('产物带提问但没带时间 → 保留窗口已有的时间（⛔ 不能用 null 冲掉）', () => {
+    const ctx = buildTurnContext([
+      M({ id: 'm1', content: '窗口提问', createdAt: '2026-11-02T09:00:00+08:00' }),
+    ])
+    const merged = mergeTurnContext(
+      [A({ sourceMessageId: 'm1', turnQuestion: '产物里的提问', turnCreatedAt: null })],
+      ctx,
+    )
+    expect(merged.get('m1')!.question).toBe('产物里的提问')
+    expect(merged.get('m1')!.createdAt).toBe('2026-11-02T09:00:00+08:00')
+  })
+
+  it('产物没有合法提问（hook 日志）→ 不动窗口值（回退而不是清空）', () => {
+    const ctx = buildTurnContext([M({ id: 'm1', content: '窗口提问' })])
+    const merged = mergeTurnContext(
+      [A({ sourceMessageId: 'm1', turnQuestion: 'A session-scoped Stop hook is now active' })],
+      ctx,
+    )
+    expect(merged.get('m1')!.question).toBe('窗口提问')
   })
 })

@@ -73,6 +73,7 @@ import { SessionList } from '@/components/left/SessionList'
 import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
 import { AskUserPendingHint } from '@/components/center/AskUserPendingHint'
+import { SubagentRunningHint } from '@/components/center/SubagentRunningHint'
 import { DialogOpsModal } from '@/components/center/DialogOpsModal'
 import { RetryBanner } from '@/components/center/RetryBanner'
 import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
@@ -988,7 +989,9 @@ function App() {
   }, [currentPermission])
 
   // ---- ApiRetry 重试提示条 ----
-  const retry = useChatStore((s) => s.retry)
+  // [retry-per-session] 只取**当前会话**那一份：原先是全局单值 ⇒ A 会话重试显示在 B 会话上
+  //   （用户实测「会话1 没回复、会话2 显示出来了」），且任一会话 complete 会清掉别人的横幅。
+  const retry = useChatStore((s) => (activeSessionId ? (s.retry[activeSessionId] ?? null) : null))
   const setRetry = useChatStore((s) => s.setRetry)
 
   // ---- 合并「对话操作」：双击 Esc 触发弹窗（压缩 tab；消息非空且非 loading）----
@@ -2372,6 +2375,19 @@ function App() {
     }
   }, [setSessions, storeSessions, showToast])
 
+  // [V283] 会话置顶 / 取消置顶（会话栏 ⋯ → 置顶）：PATCH 后端 pinned + 本地同步。
+  //   sessionListSeqRef++ 丢弃在途轮询响应，避免刚置顶的会话被旧列表冲回去。
+  const pinSession = useCallback(async (id: string, pinned: boolean) => {
+    sessionListSeqRef.current++
+    try {
+      const updated = await sessionApi.update(id, { pinned })
+      setSessions(useChatStore.getState().sessions.map((s) =>
+        s.id === id ? { ...s, pinned: updated.pinned ?? pinned } : s))
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [setSessions, showToast])
+
   // 右栏 memo 化配套：这两个回调若内联，每次渲染都是新引用 ⇒ memo 恒失效。
   const setRightTabCb = useCallback(
     (t: RightTab) => uiDispatch({ type: 'SET_RIGHT_TAB', tab: t }),
@@ -2441,6 +2457,13 @@ function App() {
    */
   const openRightTab = useCallback((tab: 'artifacts' | 'files' | 'sources') => {
     uiDispatch({ type: 'SET_RIGHT_TAB', tab: tab as RightTab })
+    setRightDrawerOpen(true)
+  }, [uiDispatch])
+
+  // [subagent-hint] 点「子代理运行中」胶囊 → 打开右栏「运行」tab（runSection 第一块 = 子代理列表）。
+  //   ⚠️ 'run' 不在 @/types 的 RightTab 联合里（RightPanel 内部 PanelTab 更宽）⇒ 与 openRightTab 同款断言。
+  const openSubagentPanel = useCallback(() => {
+    uiDispatch({ type: 'SET_RIGHT_TAB', tab: 'run' as RightTab })
     setRightDrawerOpen(true)
   }, [uiDispatch])
 
@@ -3176,6 +3199,7 @@ function App() {
         onOpenSearch={handleWorkspaceSearch}
         onDeleteSession={handleDeleteSession}
         onRenameSession={renameSession}
+        onPinSession={pinSession}
         runningSessionIds={runningSessionIds}
         pendingSessionIds={pendingSessionIds}
         onToggleCollapse={() => setLeftCollapsed((v) => !v)}
@@ -3254,7 +3278,7 @@ function App() {
         )}
         {retry && (
           <div className="retry-wrap">
-            <RetryBanner attempt={retry.attempt} maxRetries={retry.maxRetries} retryDelayMs={retry.retryDelayMs} onClose={() => setRetry(null)} />
+            <RetryBanner attempt={retry.attempt} maxRetries={retry.maxRetries} retryDelayMs={retry.retryDelayMs} at={retry.at} onClose={() => { if (activeSessionId) setRetry(activeSessionId, null) }} />
           </div>
         )}
         {/* 上下文告警 / 压缩进度横幅：均按【当前活动会话】取那一份（多会话并行不串台） */}
@@ -3309,6 +3333,10 @@ function App() {
             }}
             hasGoal={!!currentGoal}
             goalCondition={currentGoal?.condition ?? null}
+            pendingHint={<AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />}
+            subagentHint={activeSessionId
+              ? <SubagentRunningHint sessionId={activeSessionId} onOpen={openSubagentPanel} />
+              : null}
             empty={storeMessages.length === 0 && !hasStream}
             onOpenUsageCost={() => setShowUsageCost(true)}
             onOpenChromePanel={() => setShowChromePanel(true)}
@@ -3679,9 +3707,6 @@ function App() {
       )}
       <Toast toast={ui.toast} />
       <UpdateCenter appName={appSettings?.appName ?? null} />
-      {/* [待回答浮层] 后台会话的工具在等用户回答时，右下角常驻提示（点击直达该会话）。
-          当前会话的提问由对话流里的 PermissionBubble 承担，故只显示非当前会话的。 */}
-      <AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />
     </div>
   )
 }

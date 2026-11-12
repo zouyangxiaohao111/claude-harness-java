@@ -295,7 +295,7 @@ public class KbWikiFinalizeStage {
             .replace("{{PAGES_OVERVIEW}}", overview.toString());
 
         LlmProvider.LlmInvocationResult r = invoke(
-            config, modelName, system, user, 800, 0.3, "wiki_index_intro");
+            config, modelName, system, user, 0.3, "wiki_index_intro");
         if (r == null || r.content() == null) {
             return new IndexIntro(null, null);
         }
@@ -433,7 +433,7 @@ public class KbWikiFinalizeStage {
 
     private LlmProvider.LlmInvocationResult invoke(
         ProviderConfig config, String modelName, String system, String user,
-        int maxTokens, double temperature, String label
+        double temperature, String label
     ) {
         try {
             return sideCallClient.message(
@@ -442,7 +442,7 @@ public class KbWikiFinalizeStage {
                     null, null, null,
                     LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
                     temperature, label,
-                    null, maxTokens, null, null,
+                    null, null, null, null,
                     null, null, null, null,
                     null, null),
                 LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, label));

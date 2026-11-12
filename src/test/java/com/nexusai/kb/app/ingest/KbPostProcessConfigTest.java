@@ -22,6 +22,9 @@ class KbPostProcessConfigTest {
             new com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord();
         r.setSummaryModelId(summaryModel);
         r.setEmbeddingModelId("emb-1");
+        // 索引策略默认「向量 + 关键词都开」——问句能否生成看的是这个，
+        // ⛔ 不是 embedding_model_id（见 QuestionGeneration#runnable 的注释）
+        r.setIndexingStrategy("{\"vector_enabled\":true,\"keyword_enabled\":true}");
         r.setQuestionGenerationConfig(qJson);
         r.setAutoTagConfig(tagJson);
         r.setWikiConfig(wikiJson);
@@ -77,11 +80,26 @@ class KbPostProcessConfigTest {
         }
 
         @Test
-        @DisplayName("⭐⭐ 没有嵌入模型 ⇒ runnable=false（问句没有向量可写，跑了也白跑）")
-        void needsEmbedding() {
+        @DisplayName("⭐⭐ 没配嵌入模型但索引策略开着 ⇒ 仍可执行（对齐源站 NeedsEmbeddingModel）")
+        void noEmbeddingModelStillRunnable() {
             com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord r =
                 kb("m1", "{\"enabled\":true}", null, null);
             r.setEmbeddingModelId(null);
+            // 源站判据 = IndexingStrategy.NeedsEmbedding() = VectorEnabled || KeywordEnabled
+            //   （knowledge_post_process.go:217 / indexing_strategy.go:34-36）
+            // ⛔ 不是「embedding_model_id 非空」—— 2026-11-12 实测这个偏离会让
+            //    「索引策略全开、只是没配嵌入模型」的知识库点辅助召回时静默跳过。
+            assertThat(KbPostProcessConfig.resolve(r).question().runnable())
+                .as("索引策略要求嵌入 ≠ 必须有 embedding_model_id")
+                .isTrue();
+        }
+
+        @Test
+        @DisplayName("⭐⭐ 索引策略全关 ⇒ 不可执行（问句无处可写）")
+        void noIndexingNoRunnable() {
+            com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord r =
+                kb("m1", "{\"enabled\":true}", null, null);
+            r.setIndexingStrategy("{\"vector_enabled\":false,\"keyword_enabled\":false}");
             assertThat(KbPostProcessConfig.resolve(r).question().runnable()).isFalse();
         }
 

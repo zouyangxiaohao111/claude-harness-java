@@ -1,4 +1,4 @@
-import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { projectPreview } from '@/markdown/plainPreview'
@@ -1042,7 +1042,7 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
 /** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
 type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
   onRunHtml?: (code: string) => void
@@ -1054,6 +1054,16 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
   highlighted?: boolean
   /** [轮次中间过程] 该轮展开态；undefined = 非轮次折叠宿主（子代理 transcript 等）→ 保持旧渲染 */
   processExpanded?: boolean
+  /** [2026-11-12 用户裁定] **收起态**下本行折叠区仍要露出的「尾部段数」（含本行最后的那几段）。
+   *  <p>WHY 是「段数」而不是布尔：一轮的中间过程跨多条 assistant 行，而「最新 3 段」常常
+   *  跨行（0 表示本行收干净；2 表示本行只露最后 2 段）。缺省/undefined = 收起态不露任何段（旧行为）。
+   *  <p>段的口径与展开态完全一致：思考块 / 灰色中间旁白 / 工具（整行合成 1 段：单卡或并行组）/ 每行系统注入。
+   *  只作用于**执行中的轮**（父级只给 running turn 计算该值）。 */
+  collapsedTailKeep?: number
+  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「还有 N 项」）。 */
+  hiddenSegCount?: number
+  /** [2026-11-12] 该轮是否有任何可折叠中间过程（纯正文开场的轮也要显示「已完成/正在执行」开关）。 */
+  turnHasIntermediate?: boolean
   /** [轮次最终段] 本行是否该轮**最后一条** assistant（决定 content 是「最终答复」还是「过程旁白」）。
    *  undefined（非轮次宿主）→ 一律按最终答复渲染，保持旧行为。 */
   isFinalOfTurn?: boolean
@@ -1543,6 +1553,39 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
       {showReasoning && <div className="thinking-body" ref={thinkingBodyRef}>{intermediateReasoning}</div>}
     </div>
   ) : null
+  /**
+   * [2026-11-12 用户裁定] 折叠区的**段序列**（展开态全量）。
+   *
+   * <p>段口径：思考块 / 灰色中间旁白 / 工具（整行合成 **1 段**：单卡或并行组）/ 每行系统注入 1 段。
+   * <p>⚠️ 必须与 {@link MessageListInner} 侧的 `intermediateSegCount` 逐条对齐 ——
+   * 那边算「尾部 N 段跨了哪些行」，这边按同一个 N 切片；口径一旦分叉，收起态露出的段就会错位。
+   * <p>收起态只渲染尾部 `collapsedTailKeep` 段（该值由父级跨行累加后分给本行）。
+   */
+  const foldSegments: { key: string; node: ReactNode }[] = []
+  if (!isUser && !isFallback && !isScheduledFire && !msg.isApiErrorMessage) {
+    if (intermediateReasoning !== '') foldSegments.push({ key: 'reasoning', node: reasoningBlock })
+    // [中间旁白正文] 非最终段的 content 是过程性碎句（「设计确认…」「现在实现后端…」）
+    // → 与思考/工具卡同处折叠区；展开时按原顺序显示在思考之后、工具之前。
+    // ⛔ 判据用 isFinalOfTurn（undefined = 非轮次宿主 → 一律算最终，保持旧行为）。
+    const narration = isFinalOfTurn === false ? (msg.content ?? '').trim() : ''
+    if (narration !== '') {
+      foldSegments.push({
+        key: 'narration',
+        node: <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} />,
+      })
+    }
+    // [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard
+    if (intermediateToolCalls.length > 0) {
+      foldSegments.push({
+        key: 'tools',
+        node: renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle }),
+      })
+    }
+    // [2026-11-02 系统注入行] 放折叠区末尾：它们不是「助手说了什么」，而是系统在本轮塞给模型的提示。
+    for (const m of systemRows ?? []) foldSegments.push({ key: `sys-${m.id}`, node: <SystemInjectedRow msg={m} /> })
+  }
+  /** 收起态要保留的尾部段数（展开态 = 0，不参与切片）。 */
+  const collapsedKeep = processExpanded === true ? 0 : (collapsedTailKeep ?? 0)
   // [用户消息 hover] 时间恒带日期（同一天也显示「10月29日 15:42」，用户要求「时间和日期」）；
   //   createdAt 解析失败才回落原有的相对时间文案。
   const userStamp = (() => {
@@ -1790,7 +1833,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                 {/* [2026-11-01 方案 3] 状态行：进行中 =「正在执行 · 动态时长」+ 波浪点（与「思考中」同款）；
                     已结束 =「已完成 · 时长」。两者都可点击收起/展开 —— 用户裁定「未完成也能收」。
                     进行中收起后仍保留这一行 + 扫光条 ⇒ 一眼看出还在跑，但不再占屏幕。 */}
-                {showProcessHeader && (hasIntermediate || isRunningTurn) && (
+                {showProcessHeader && (hasIntermediate || isRunningTurn || turnHasIntermediate) && (
                   <button
                     type="button"
                     className={`turn-process-toggle${isRunningTurn ? ' running' : ''}`}
@@ -1805,6 +1848,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                     {(isRunningTurn ? liveDuration : turnDuration) && (
                       <span className="turn-process-dur">· {isRunningTurn ? liveDuration : turnDuration}</span>
                     )}
+                    {/* [2026-11-12 用户裁定] 收起态提示「还有 N 项」，否则用户不知道箭头后还藏着内容。 */}
+                    {processExpanded !== true && (hiddenSegCount ?? 0) > 0 && (
+                      <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                    )}
                     <svg className={`turn-process-caret${processExpanded ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
                       <path d="M5 6.5L8 9.5L11 6.5" />
                     </svg>
@@ -1816,20 +1863,12 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                     assistant 都成立，用它画就会每段各出一条（用户实测「扫光条有好几个」）。
                     一轮只能有一条 —— 它属于「本轮状态」，不属于任何单个 assistant 段。 */}
                 {showProcessHeader && isRunningTurn && <div className="exec-scan-line" aria-hidden="true" />}
-                {processExpanded === true && hasIntermediate && (
+                {foldSegments.length > 0 && (processExpanded === true || collapsedKeep > 0) && (
                   <div className="turn-process-body">
-                    {reasoningBlock}
-                    {/* [中间旁白正文] 非最终段的 content 是过程性碎句（「设计确认…」「现在实现后端…」）
-                        → 与思考/工具卡同处折叠区；展开时按原顺序显示在思考之后、工具之前。
-                        ⛔ 判据用 isFinalOfTurn（undefined = 非轮次宿主 → 一律算最终，保持旧行为）。 */}
-                    {isFinalOfTurn === false && (msg.content ?? '').trim() !== '' && (
-                      <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} />
-                    )}
-                    {/* [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard */}
-                    {renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle })}
-                    {/* [2026-11-02] 系统注入行放折叠区末尾：它们不是「助手说了什么」，而是系统在本轮
-                        塞给模型的提示（技能清单 / 外部改文件 / hook 回执）。用户裁定「融合在已完成中」。 */}
-                    {systemRows?.map((m) => <SystemInjectedRow key={m.id} msg={m} />)}
+                    {(processExpanded === true
+                      ? foldSegments
+                      : foldSegments.slice(Math.max(0, foldSegments.length - collapsedKeep))
+                    ).map((seg) => <Fragment key={seg.key}>{seg.node}</Fragment>)}
                   </div>
                 )}
               </>
@@ -1886,7 +1925,7 @@ const MemoMessage = memo(Message)
 //   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
 //   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
 //   toolCalls 卡片。class 未动。
-const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null }: {
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null, turnKey, processExpanded, onToggleProcess, collapsedTailKeep = 0, hiddenSegCount = 0 }: {
   sessionId: string
   blockId: string
   isStreamingTail: boolean
@@ -1919,6 +1958,28 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   showProcessHeader?: boolean
   /** 进行中已耗时（父级每秒推进） */
   liveTurnMs?: number | null
+  /** [2026-11-12 用户裁定] 所属轮次键（状态行的折叠开关用 · 与落库段共享同一份轮级展开态）。 */
+  turnKey?: string
+  /**
+   * [2026-11-12 用户裁定] 该轮折叠态（轮级，与落库段共用 `processOpenByTurn`）。
+   *
+   * <p>用户原话：「正在执行 。。。 < 应该有收起来和展开的可点击的 现在不可以」。
+   * 原先这里写死 `static`（不可点、无箭头），理由是「流式块没有折叠区」——
+   * 但流式块本身就有 reasoning / 正文 / 工具，收起时应当只剩状态行 + 扫光条。
+   * <p>缺省 undefined = 保持旧行为（总是展示内容），供非轮次宿主使用。
+   */
+  processExpanded?: boolean
+  /** 折叠态切换（轮级；缺省则不渲染折叠开关，退回 static 状态行）。 */
+  onToggleProcess?: (turnKey: string, open: boolean) => void
+  /**
+   * [2026-11-12 用户裁定] 收起时本流式块仍要露出的**尾部段数**（由父级跨行累加后分配）。
+   * <p>与落库段的 `collapsedTailKeep` 同一口径：思考块 / 正文 / 工具整行 1 段。
+   * <p>WHY：用户实测「收起后下面全空」—— 流式块是**正在写的那段**，它才是最新内容；
+   * 若整块藏掉，收起态就没东西可看了。缺省/0 = 全藏（旧行为兜底）。
+   */
+  collapsedTailKeep?: number
+  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「还有 N 项」）。 */
+  hiddenSegCount?: number
 }) {
   // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
   const b = useChatStore(selectStreamBlock(sessionId, blockId))
@@ -1959,59 +2020,114 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   const tokenLabel = tokenText == null ? null : `${isEstimate ? '~' : ''}${tokenText}`
   /** 进行中：思考中 + 三点波浪（+ tokens）；完成：思考过程。 */
   const thinkingRunning = isStreamingTail
+  /**
+   * [2026-11-12 用户裁定] 本块的**段序列**（段口径与 {@link Message} 的 foldSegments /
+   * MessageListInner 的 intermediateSegCount 严格一致）：思考块 / 正文 / 工具（整行 1 段）。
+   * 收起态只渲染尾部 `collapsedTailKeep` 段 —— 用户实测「收起后下面全空」的修法。
+   */
+  const segNodes: { key: string; node: ReactNode }[] = []
+  if (reasoningText !== '') {
+    segNodes.push({
+      key: 'reasoning',
+      node: (
+        <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
+          <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
+            {/* [样式对齐 dsh] 思考图标 + 文案 + 折叠箭头（箭头单独 class ⇒ open 时只转箭头） */}
+            <svg className="thinking-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+              <path d="M8 2.2v2.6M8 11.2v2.6M2.2 8h2.6M11.2 8h2.6M4.1 4.1l1.8 1.8M10.1 10.1l1.8 1.8M11.9 4.1l-1.8 1.8M5.9 10.1l-1.8 1.8" strokeLinecap="round" />
+            </svg>
+            {/* [思考耗时] 思考中保持原样；已结束（不再尾块）= 思路同 DB 消息路径：思考过程 + 耗时 + tokens */}
+            <span>
+              {thinkingRunning
+                ? '思考中'
+                : `思考过程${reasoningLabel}${reasoningTokens > 0 ? ` · ${compactNumber(reasoningTokens)} tokens` : ''}`}
+            </span>
+            {thinkingRunning && (
+              <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+            )}
+            {thinkingRunning && tokenLabel != null && streamTokens != null && streamTokens > 0 && (
+              <span className="thinking-tokens">{tokenLabel}</span>
+            )}
+            <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+          </button>
+          {!collapsed && <div className="thinking-body" ref={thinkingBodyRef}>{reasoningText}</div>}
+        </div>
+      ),
+    })
+  }
+  // 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含
+  // SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。
+  // [收口重渲] streaming 只在「这一块还在长」时才是 true：`isStreamingTail` = 是最后一块，
+  //   `turnRunning` = 该轮仍在跑。两者都满足才走流式臂（不跑 rescue）。
+  if (b.content && !isBriefBlock(b.toolCalls)) {
+    segNodes.push({
+      key: 'content',
+      node: <MarkdownTextV2 text={b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />,
+    })
+  }
+  // [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」）
+  const toolNodes = renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })
+  if (toolNodes.length > 0) segNodes.push({ key: 'tools', node: toolNodes })
+  /** 展开 = 全量；收起 = 尾部 N 段（N 由父级跨行分配）。 */
+  const visibleSegs = processExpanded === false
+    ? segNodes.slice(Math.max(0, segNodes.length - Math.max(0, collapsedTailKeep)))
+    : segNodes
+  // [2026-11-12 实测] 收起态把本块**所有段都裁掉**时，外层消息壳仍会渲染 ⇒ 只剩 6px 外边距；一轮几十个块就累积成一大片空白（用户「最新没拉上去」）。
+  //   既没有头、也不承载状态行 ⇒ 整块不渲染。⚠️ 头/状态行必须保留（它们是本轮唯一入口）。
+  if (visibleSegs.length === 0 && !showHeader && !showProcessHeader) return null
   return (
     <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}${showHeader ? '' : ' turn-cont'}`}>
       {showHeader ? <div className="avatar">N</div> : <div className="avatar-gutter" aria-hidden />}
       <div className="body">
         {showHeader && <div className="author">nexus</div>}
         {/* [2026-11-02] 该轮还没有落库 assistant ⇒ 由本块承载「正在执行」状态行。
-            ⛔ 不可点：流式块的内容就是实时输出，没有「折叠区」可收，点它没有意义。 */}
+            [2026-11-12 用户裁定] 这一行**也要能点**（此前写死 static + 无箭头，用户原话
+            「正在执行 。。。 < 应该有收起来和展开的可点击的 现在不可以」）：
+            有 onToggleProcess 时渲成与落库段同款的开关（带 caret），收起后只剩状态行 + 扫光条。 */}
         {showProcessHeader && (
           <>
-            <div className="turn-process-toggle running static" role="status">
-              <span className="turn-process-status">正在执行</span>
-              <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
-              {formatTurnDuration(liveTurnMs) && (
-                <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
-              )}
-            </div>
+            {onToggleProcess ? (
+              <button
+                type="button"
+                className="turn-process-toggle running"
+                onClick={() => onToggleProcess(turnKey ?? '', processExpanded === true)}
+                aria-expanded={processExpanded === true}
+                title={processExpanded ? '收起本轮中间过程' : '展开本轮中间过程'}
+              >
+                <span className="turn-process-status">正在执行</span>
+                <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+                {formatTurnDuration(liveTurnMs) && (
+                  <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
+                )}
+                {processExpanded !== true && hiddenSegCount > 0 && (
+                  <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                )}
+                <svg className={`turn-process-caret${processExpanded ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
+                  <path d="M5 6.5L8 9.5L11 6.5" />
+                </svg>
+              </button>
+            ) : (
+              <div className="turn-process-toggle running static" role="status">
+                <span className="turn-process-status">正在执行</span>
+                <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+                {formatTurnDuration(liveTurnMs) && (
+                  <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
+                )}
+                {processExpanded !== true && hiddenSegCount > 0 && (
+                  <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                )}
+              </div>
+            )}
             <div className="exec-scan-line" aria-hidden="true" />
           </>
         )}
-        {reasoningText !== '' && (
-          <div className={`thinking-wrap${collapsed ? '' : ' open'}`}>
-            <button className="thinking-toggle" onClick={() => setCollapsed((v) => !v)}>
-              {/* [样式对齐 dsh] 思考图标 + 文案 + 折叠箭头（箭头单独 class ⇒ open 时只转箭头） */}
-              <svg className="thinking-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
-                <path d="M8 2.2v2.6M8 11.2v2.6M2.2 8h2.6M11.2 8h2.6M4.1 4.1l1.8 1.8M10.1 10.1l1.8 1.8M11.9 4.1l-1.8 1.8M5.9 10.1l-1.8 1.8" strokeLinecap="round" />
-              </svg>
-              {/* [思考耗时] 思考中保持原样；已结束（不再尾块）= 思路同 DB 消息路径：思考过程 + 耗时 + tokens */}
-              <span>
-                {thinkingRunning
-                  ? '思考中'
-                  : `思考过程${reasoningLabel}${reasoningTokens > 0 ? ` · ${compactNumber(reasoningTokens)} tokens` : ''}`}
-              </span>
-              {thinkingRunning && (
-                <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
-              )}
-              {thinkingRunning && tokenLabel != null && streamTokens != null && streamTokens > 0 && (
-                <span className="thinking-tokens">{tokenLabel}</span>
-              )}
-              <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
-            </button>
-            {!collapsed && <div className="thinking-body" ref={thinkingBodyRef}>{reasoningText}</div>}
+        {/* [2026-11-12] 展开 = 全量；收起 = 尾部 N 段（见上方 visibleSegs）。
+            包一层 **.turn-process-body** 与落库段同构 —— 灰旁白/工具卡间距等样式都挂在这个类下。 */}
+        {visibleSegs.length > 0 && (
+          <div className="turn-process-body">
+            {visibleSegs.map((seg) => <Fragment key={seg.key}>{seg.node}</Fragment>)}
           </div>
         )}
-        {/* 实时侧 dropText 等价（对齐 CC dropTextInBriefTurns 作用于流式文本）：本块含
-            SendUserMessage → 该轮助手正文是工作笔记，不展示（答案在工具正文里）。
-
-            [收口重渲] streaming 只在「这一块还在长」时才是 true：`isStreamingTail` = 是最后一块，
-            `turnRunning` = 该轮仍在跑。两者都满足才走流式臂（不跑 rescue）。
-            其余情况（本块后面已有新块 / 该轮已结束但块未消失）⇒ 走收口臂，跑 rescue
-            —— 这正是「输出完成后点一下展开就变好」那条路径的自动版，无需用户手动触发。 */}
-        {b.content && !isBriefBlock(b.toolCalls) && <MarkdownTextV2 text={b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />}
-        {/* [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」） */}
-        {renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })}
       </div>
     </div>
   )
@@ -2041,6 +2157,14 @@ const LOAD_OLDER_TURNS = 2
 const RUNNING_FOLD_TURNS = 1
 /** 稳定空集合（折叠态零态；模块级同引用 ⇒ 不触发无谓重渲）*/
 const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
+/**
+ * [2026-11-12 用户裁定] 执行中的轮**收起**时，默认露出「最新 N 段」中间过程。
+ *
+ * <p>用户原话：「正在执行不是可以点击收缩吗 收缩下面能否做到默认展示最新内部 3 个的？」
+ * 段口径与展开态完全一致（思考块 / 灰旁白 / 工具整行 1 段 / 每行系统注入 1 段），
+ * 只保留**尾部** N 段。⛔ 只对执行中的轮生效：已结束的轮收起后仍只留「已完成 · 时长」一行。
+ */
+const COLLAPSED_TAIL_SEGMENTS = 3
 
 function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, foldedTurnCount = 0, onExpandOlder }: MessageListProps) {
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
@@ -2048,6 +2172,13 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
   // [流式性能] 稳定行序订阅：引用只在块增/删/finalize/clear 变化；content 追加不触碰 → 父级不被打字机逐帧重渲
   const streamIds = useChatStore(selectStreamIds(sessionId))
+  // [2026-11-12 尾部 3 段] 流式块的「段数」只在内容**首现**时变化（思考首片 / 正文首片 / 首个工具）。
+  //   用 tick（appendChunk/appendReasoning 每次 +1）与工具数变化来触发重算；
+  //   ⛔ 不直接订阅整个 streams —— 内容逐帧推进会把整张消息表重渲。
+  const streamTick = useChatStore((s) => (sessionId ? (s.streamTicks[sessionId] ?? 0) : 0))
+  const streamToolCount = useChatStore((s) => (sessionId
+    ? (s.streams[sessionId] ?? []).reduce((n, b) => n + (b.toolCalls?.length ?? 0), 0)
+    : 0))
   // [产物口径] 产物 ≠ 修改的文件：数量来自后端轮末异步抽取结果。
   const artifactCount = artifacts?.deliverables.length ?? 0
   const changeCount = useChatStore((s) => (sessionId ? (s.changedFiles[sessionId] ?? NO_CHANGED_FILES).length : 0))
@@ -2212,12 +2343,19 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   const STICKY_BOTTOM_THRESHOLD = 60 // 距底部 < 60px 视为「贴近底部」
   const scrollElRef = useRef<HTMLElement | null>(null)
   const nearBottomRef = useRef(true) // 初始贴近底部（新会话从底部开始）
+  /** 上一次「我们自己贴底」写入后的 scrollTop（浏览器 clamp 后的真实值）。
+   *  onScroll 靠它区分「程序滚的」与「用户滚的」：流式内容在写入与 scroll 事件派发之间还会长高，
+   *  此时 scrollHeight 变大而 scrollTop 停在我们写的值上 —— 若按距离判会误判成「用户上滚」，
+   *  从此永久停止跟随（用户报的「在底部却不自动滚动」）。 */
+  const stickScrollTopRef = useRef(-1)
   // 贴底状态回调走 ref（effect 依赖 [messages.length] 重绑时避免闭包过期）
   const onNearBottomChangeRef = useRef(onNearBottomChange)
   onNearBottomChangeRef.current = onNearBottomChange
   const stickBottom = () => {
     const el = scrollElRef.current
-    if (el) el.scrollTop = el.scrollHeight
+    if (!el) return
+    el.scrollTop = el.scrollHeight
+    stickScrollTopRef.current = el.scrollTop // 读回 clamp 后的值
   }
   /** 贴底收敛：首帧写完 scrollTop 后，异步内容（图片 / 公式 / 字体 / markdown 增量）还会把高度撑大，
    *  一次性贴底会停在「差一截」的位置（用户报的「切会话后不是停在最底部」）。
@@ -2239,7 +2377,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   const onScroll = () => {
     const el = scrollElRef.current
     if (!el) return
-    nearBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight <= STICKY_BOTTOM_THRESHOLD
+    const distance = el.scrollHeight - el.scrollTop - el.clientHeight
+    // 「仍是我们写入的位置」也算贴底：内容刚长高 ⇒ 距离变大，但 scrollTop 没被用户动过。
+    // ⛔ 不能只看距离，否则高频流式下会被自己的贴底写入误判成用户上滚。
+    const untouched = stickScrollTopRef.current >= 0 && Math.abs(el.scrollTop - stickScrollTopRef.current) <= 1
+    nearBottomRef.current = distance <= STICKY_BOTTOM_THRESHOLD || untouched
     onNearBottomChangeRef.current?.(nearBottomRef.current)
   }
   // 绑定滚动容器：空态（messages 空 且 无流式）时组件 return null → streamWrapRef 无 DOM，
@@ -2249,6 +2391,20 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     scrollElRef.current = el
     el?.addEventListener('scroll', onScroll, { passive: true })
     return () => el?.removeEventListener('scroll', onScroll)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [messages.length, streamIds.length])
+  // [高度增长跟随] 工具卡新增 / 思考块出现 / 图片与公式加载 / markdown 增量撑高，
+  //   这类高度变化**不推进 streamTicks**（addToolCall、ensureStreamBlock 都不推进）
+  //   ⇒ 上面按 tick 与 lastMsgId 的两条滚底路径都不触发 ⇒ 内容长在视口外而页面不动。
+  //   直接观测内容高度：仍贴底就跟随；用户上翻时 nearBottomRef 为 false，不打扰。
+  useEffect(() => {
+    const inner = streamWrapRef.current
+    if (!inner || typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => {
+      if (nearBottomRef.current) stickBottom()
+    })
+    ro.observe(inner)
+    return () => ro.disconnect()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [messages.length, streamIds.length])
   // 新增消息：用户发送（user 角色）→ 无条件跳底部（用户要开始新回复）；助手落库（assistant）→ 仅贴近底部时跟随（看历史不拽）
@@ -3082,19 +3238,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     return out
   }, [flatRows, systemRowsByTurn])
   /**
-   * [2026-11-02] 哪些轮**已经有落库 assistant 消息**。
+   * [2026-11-12 用户裁定「另外我希望默认收起中间轮」] 轮级展开态 —— 落库段与流式块**共用同一份**。
    *
-   * <p>用途：状态行优先挂在落库段上（它能找到「第一条有中间过程」的落点，供折叠开关用）；
-   * 只有**还没有任何落库 assistant** 的轮（刚发消息、只有流式块在输出）才把状态行交给流式块。
-   * 这样一轮里状态行**始终只有一处**，不会重复。
+   * <p>默认 **false（收起）**：收起态会露「最新 3 段」，所以默认收起不会变成空白。
+   * 用户点过 ⇒ 按用户的（true 展开 / false 收起）。
    */
-  const turnsWithPersistedAssistant = useMemo(() => {
-    const out = new Set<string>()
-    for (const row of flatRows) {
-      if (row.kind === 'msg' && row.m.role === 'assistant') out.add(row.turnKey)
-    }
-    return out
-  }, [flatRows])
+  const turnOpenFor = useCallback(
+    (turnKey: string) => processOpenByTurn[turnKey] ?? false,
+    [processOpenByTurn],
+  )
   /** 每轮第一条「含中间过程」的 assistant 消息 → 该轮唯一的「已完成」开关落点。 */
   const firstIntermediateByTurn = useMemo(() => {
     const map = new Map<string, string>()
@@ -3174,6 +3326,98 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     const finalId = lastAssistantIdByTurn.get(row.turnKey)
     return finalId == null || finalId === row.m.id
   }, [lastAssistantIdByTurn])
+  /**
+   * [2026-11-12] 一行在展开态折叠区里占几个「段」。
+   *
+   * <p>⚠️ 必须与 {@code Message} 的 `foldSegments` / {@code StreamBlockRow} 的段组装逐条对齐
+   * （两边都按同一个段数切片）。
+   * <p>落库段：思考块 / 灰色中间旁白（仅非最终段）/ 工具（整行合成 **1 段**）/ 每行系统注入 1 段。
+   * <p>流式块：思考块 / 正文 / 工具（整块 1 段）—— 用户裁定「收起中间轮后也要展示最新三条输出，
+   * 包括思考组件和工具」，而执行中的最新内容几乎都在流式块里，不纳入就会「收起来后一片空白」。
+   */
+  const intermediateSegCount = useCallback((row: { kind: 'msg'; key: string; turnKey: string; m: ChatMessageDto } | { kind: 'blk'; key: string; sid: string; blockId: string }, sysRows?: ChatMessageDto[]) => {
+    if (row.kind === 'blk') {
+      const b = (useChatStore.getState().streams[row.sid] ?? []).find((x) => x.assistantMessageId === row.blockId)
+      if (!b) return 0
+      let n = 0
+      if (cleanReasoning(b.reasoning) !== '') n += 1
+      if (b.content && !isBriefBlock(b.toolCalls)) n += 1
+      if ((b.toolCalls ?? []).some((t) => !isSendUserMessage(t))) n += 1
+      return n
+    }
+    if (row.kind !== 'msg') return 0
+    const m = row.m
+    if (m.role !== 'assistant' || m.isApiErrorMessage) return 0
+    let n = 0
+    if (cleanReasoning(m.reasoning) !== '') n += 1
+    if (!isFinalOfTurnFor({ turnKey: row.turnKey, m }) && (m.content ?? '').trim() !== '') n += 1
+    if ((m.toolCalls ?? []).some((t) => !isSendUserMessage(t))) n += 1
+    n += sysRows?.length ?? 0
+    return n
+  }, [isFinalOfTurnFor])
+  /**
+   * [2026-11-12 用户裁定] 执行中的轮**收起**时要露出的尾部段 → 按行分配。
+   *
+   * <p><b>WHY 按「段」而不是按「行」</b>：一轮的中间过程分散在多条 assistant 行里，
+   * 而「最新 3 段」经常跨行（末行 2 段 + 上一行 1 段）。按行裁会把整行都露出来，条数失控。
+   *
+   * <p>算法：对每个运行中的轮，从**最后一行往前**累加段数，直到凑满 {@link COLLAPSED_TAIL_SEGMENTS}；
+   * 每个命中行记「它自己要被保留的尾部段数」。⛔ 只对执行中的轮计算 —— 已结束的轮收起后仍是干净一行。
+   */
+  const { tailKeepByRowKey, hiddenSegCountByTurn } = useMemo(() => {
+    const keep = new Map<string, number>()
+    /** [2026-11-12 用户裁定] 每轮被收起的段数：收起态要在状态行旁提示「还有 N 项」，
+     *  否则用户不知道下面还藏着内容、也就不点箭头展开（用户原话「不然用户不知道展开的」）。 */
+    const hidden = new Map<string, number>()
+    const empty = { tailKeepByRowKey: keep, hiddenSegCountByTurn: hidden }
+    // [2026-11-12] 「在跑」的轮键：⛔ 不能只用 `activeTurnKeys` 去 filter —— 块 uid 为 null 时
+    //   它会把所有块归到同一个 fallback key，而 flatRows 保留各自的块 key
+    //   ⇒ 口径不一致会漏行（实测：两个流式块只给到后一个，前一个整块消失）。
+    //   判据：流式块 = blockId 命中 streamIds；落库段 = activeTurnKeys。
+    const streamIdSet = new Set(streamIds)
+    const runningTurnKeys = new Set<string>()
+    for (const row of visibleRows) {
+      if (row.kind === 'blk') {
+        if (streamIdSet.has(row.blockId)) runningTurnKeys.add(row.turnKey)
+      } else if (row.kind === 'msg' && activeTurnKeys.has(row.turnKey)) {
+        runningTurnKeys.add(row.turnKey)
+      }
+    }
+    if (runningTurnKeys.size === 0) return empty
+    // [2026-11-12] 流式块也参与分配：执行中「最新的内容」几乎都在流式块里，
+    //   只数落库行会让收起态一片空白（用户实测截图）。
+    const rows = visibleRows.filter((r): r is
+      | { kind: 'msg'; key: string; turnKey: string; m: ChatMessageDto; seq: number }
+      | { kind: 'blk'; key: string; sid: string; blockId: string; turnKey: string; seq: number } =>
+      (r.kind === 'msg' && r.m.role === 'assistant') || r.kind === 'blk')
+    for (const turnKey of runningTurnKeys) {
+      const turnRows = rows.filter((r) => r.turnKey === turnKey)
+      const sysRows = systemRowsByTurn.get(turnKey)
+      const headerId = processHeaderIdByTurn.get(turnKey)
+      let need = COLLAPSED_TAIL_SEGMENTS
+      let total = 0
+      for (let i = turnRows.length - 1; i >= 0 && need > 0; i--) {
+        const row = turnRows[i]!
+        // 与 Message 的 systemRows 投放条件一致：只有状态行所在那条能拿到注入行
+        const rowSys = row.kind === 'msg' && headerId === row.m.id ? sysRows : undefined
+        const n = intermediateSegCount(row, rowSys)
+        if (n === 0) continue
+        total += n
+        const take = Math.min(n, need)
+        keep.set(row.key, take)
+        need -= take
+      }
+      // need 耗尽时 total 只统计到「够 3 段」为止 ⇒ 还需要把更早的行也算进来，才能给出真实提示数。
+      for (let i = 0; i < turnRows.length; i++) {
+        const row = turnRows[i]!
+        if (keep.has(row.key)) continue
+        const rowSys = row.kind === 'msg' && headerId === row.m.id ? sysRows : undefined
+        total += intermediateSegCount(row, rowSys)
+      }
+      if (total > COLLAPSED_TAIL_SEGMENTS) hidden.set(turnKey, total - COLLAPSED_TAIL_SEGMENTS)
+    }
+    return { tailKeepByRowKey: keep, hiddenSegCountByTurn: hidden }
+  }, [visibleRows, activeTurnKeys, streamIds, systemRowsByTurn, processHeaderIdByTurn, intermediateSegCount, streamTick, streamToolCount])
   /** [并行工具组] 同轮 `tool_use_summary` → 该轮**首个**多工具消息的工具组父行标题。
    *  同时记下被「消费」的那条摘要行 id：该轮展开时不再单独渲染它（摘要不显示两遍）；
    *  轮次收起时摘要行照常显示（组在折叠区里不可见，摘要是唯一线索）。 */
@@ -3619,6 +3863,8 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         }
         .turn-process-status { font-weight: 500; }
         .turn-process-dur { font-variant-numeric: tabular-nums; }
+        /* [2026-11-12] 收起态「还有 N 项」提示：比时长更弱，不抢视线。 */
+        .turn-process-more { color: var(--ink-faint); font-size: 11.5px; }
         .turn-process-caret { width: 12px; height: 12px; transition: transform 0.2s ease; }
         .turn-process-caret.open { transform: rotate(180deg); }
         .turn-process-body { margin: 2px 0 8px; }
@@ -3988,12 +4234,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           // [2026-11-02 系统注入行] 不单独占对话流 —— 由该轮折叠区统一渲染（见 systemRowsByTurn）。
           //   若这里放行，收起态仍会显示、且夹在工具卡之间打断阅读（用户要的是「融合在已完成中」）。
           if (isSystemInjectedRow(row.m)) return null
-          // [2026-11-01 方案 3] 进行中的轮**也允许收起**（用户裁定「未完成也能收」）：
-          //   默认展开（processOpenByTurn 无记录 = true），用户点过就按用户的来。
+          // [2026-11-12 用户裁定「默认不展开 就是收起状态」] 进行中的轮**默认收起**：
+          //   收起态会露出「最新 3 段」（见 tailKeepByRowKey），所以不再需要靠展开撑场面。
           //   ⛔ 收起后状态行 + 扫光条仍在（见 Message 的 isRunningTurn 分支），不会变成「看不出还活着」。
           const isRunningTurn = activeTurnKeys.has(row.turnKey)
-          const turnOpen = processOpenByTurn[row.turnKey] ?? isRunningTurn
+          const turnOpen = turnOpenFor(row.turnKey)
           // [并行工具组] 该轮展开时其 tool_use_summary 已并入工具组父行标题 → 独立摘要行不再重复显示
+          // [2026-11-12] 收起态**不**吸附：收起后折叠区仍会露尾部段（含工具组父行），
+          //   若同时隐藏摘要行又给组头 title ⇒ 摘要行成了唯一线索却看不见；若都显示 ⇒ 同一段摘要出现两次。
+          //   判据与上面的 turnOpen 同源 ⇒ 一条摘要恒只出现一次：展开在组头、收起在独立摘要行。
           if (turnOpen && toolGroupMeta.summaryIdByTurn.get(row.turnKey) === row.m.id) return null
           // 空壳 assistant 段不渲染：否则每段 margin 累加成大段空白。
           //   收起态下该段的工具卡/思考正文/中间旁白整段不可见，只剩外壳；判据全部满足才丢弃，
@@ -4006,18 +4255,38 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           //   故判据改为「收起态下该行没有任何可见内容」：正文为空 **或** 该行不是本轮的最终段
           //   （非最终段正文已进折叠区）。其余保留条件不变。
           const hasVisibleBody = (row.m.content ?? '').trim() !== '' && isFinalOfTurnFor(row)
-          const shellInCollapsedTurn = !turnOpen
-            && row.m.role === 'assistant'
+          // [2026-11-12] 收起态要露尾部段的行**不能**被当空壳丢掉 —— 它的内容在折叠区里。
+          const keepsTail = (tailKeepByRowKey.get(row.key) ?? 0) > 0
+          // [2026-11-12 用户实测「收起后中间一大片空白、最新的没拉上去」]
+          //   原判据只在**收起态**（!turnOpen）过滤空壳行；一旦该轮被用户点开过，
+          //   逐段的空 `.msg` 全部保留 —— 每段 6px margin 累积成一整屏空白，把最新的
+          //   内容推到下面（用户原话「中间只是把工具情况不展示 但是最新的没拉上去」）。
+          //   ⇒ 改为**与折叠态无关**的硬判据：该行渲染后必然没有可见内容就直接不渲染。
+          //   豁免项 = 承载头 / 状态行落点 / footer / 白正文 / 正文语义工具 / 裁剪徽章。
+          const hasIntermediateForRow = cleanReasoning(row.m.reasoning) !== ''
+            || (row.m.toolCalls ?? []).some((t) => !isSendUserMessage(t))
+          const rendersNothing = row.m.role === 'assistant'
             && !hasVisibleBody
+            && !keepsTail
             && !(row.m.toolCalls ?? []).some(isSendUserMessage)
+            // 展开态下该行自己的折叠区会有内容 ⇒ 不能删（同一份数据不能因折叠态而丢）
+            && !(turnOpen && (hasIntermediateForRow || (row.m.content ?? '').trim() !== ''))
             && !row.m.isApiErrorMessage
             && !row.m.isCompactSummary
             && row.m.subtype == null
             && !firstAssistantRowKeys.has(row.key)
             && !footerByRowKey.has(row.key)
-            && firstIntermediateByTurn.get(row.turnKey) !== row.m.id
+            // [2026-11-12 实测] ⛔ 删掉「firstIntermediate 豁免」：它的用途是保住状态行落点，
+            //   而落点已改为 firstAssistantRowKeys（上一行已豁免）。保留它会在**轮键退化成各自 id**
+            //   的会话里（压缩后 uid=null）让**每一条空壳都自称 firstIntermediate** ⇒ 全被豁免
+            //   ⇒ 29 条 × 6px 空白（用户截图「最新没拉上去」）。
+            //   状态行落点行已由 !firstAssistantRowKeys.has 保住，这里无需再豁免。
+            // [2026-11-12 实测] ⛔ 不能再要求 content 为空：中间旁白段（非最终段正文）在
+            //   收起态**既不在正文区、也不在尾部 3 段里** ⇒ 渲染结果就是空壳，
+            //   而它的 content 非空 ⇒ 旧判据放过它 ⇒ 实测一轮 26 条空壳、每条 6px margin
+            //   累计 156px，把最新内容推下去（用户原话「最新的没拉上去」）。
             && !(useChatStore.getState().snippedIds[row.m.sessionId] ?? []).includes(row.m.id)
-          if (shellInCollapsedTurn) return null
+          if (rendersNothing) return null
           return (
             <ErrorBoundary key={row.key} tag="MessageList.row.msg" compact
               title="这条消息显示失败" hint="其余内容不受影响。">
@@ -4026,6 +4295,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 footer={footerByRowKey.get(row.key)}
                 highlighted={row.m.id === highlightedMsgId}
                 processExpanded={turnOpen}
+                collapsedTailKeep={isRunningTurn ? (tailKeepByRowKey.get(row.key) ?? 0) : 0}
+                hiddenSegCount={isRunningTurn ? (hiddenSegCountByTurn.get(row.turnKey) ?? 0) : 0}
+                turnHasIntermediate={firstIntermediateByTurn.has(row.turnKey)}
                 isFinalOfTurn={isFinalOfTurnFor(row)}
                 isRunningTurn={activeTurnKeys.has(row.turnKey)}
                 liveTurnMs={(() => {
@@ -4039,11 +4311,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 // [2026-11-02 用户实测「扫描蓝条被顶掉」] 状态行落点改为两级优先：
                 //   该轮第一条**有中间过程**的 assistant 行 → 没有则回落该轮**第一条** assistant 行。
                 //   只认前者会让「首段纯正文」的轮次整轮没有状态行与扫光条。
-                showProcessHeader={processHeaderIdByTurn.get(row.turnKey) === row.m.id}
+                showProcessHeader={firstAssistantRowKeys.has(row.key)}
                 turnDurationMs={turnDurationByKey.get(row.turnKey) ?? null}
                 turnKey={row.turnKey}
                 showHeader={firstAssistantRowKeys.has(row.key)}
-                groupTitle={toolGroupMeta.titleByMsgId.get(row.m.id)}
+                groupTitle={turnOpen ? toolGroupMeta.titleByMsgId.get(row.m.id) : undefined}
                 summaryToolName={toolGroupMeta.toolNameByTurn.get(row.turnKey)}
                 systemRows={processHeaderIdByTurn.get(row.turnKey) === row.m.id
                   ? systemRowsByTurn.get(row.turnKey) : undefined}
@@ -4074,8 +4346,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               // [2026-11-02 修「发送后『正在执行』不显示，刷新才有」]
               //   本轮还没有落库 assistant（刚发消息 / 纯流式阶段）⇒ 由**首条流式块**承载状态行。
               //   一旦 assistant 落库，落点自动切回落库段（见 processHeaderIdByTurn），一轮恒一处。
-              showProcessHeader={!turnsWithPersistedAssistant.has(row.turnKey)
-                && firstAssistantRowKeys.has(row.key)
+              showProcessHeader={firstAssistantRowKeys.has(row.key)
                 && activeTurnKeys.has(row.turnKey)
                 // [2026-11-03] 与末尾占位**互斥**：占位正在承载状态行时（最新一轮还没有
                 //   「属于它自己」的 assistant 行），这个块多半是**旧轮的残留**（uid=null 的
@@ -4087,6 +4358,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 const st = turnStartByKey.get(row.turnKey)
                 return st == null ? null : Math.max(0, nowTick - st)
               })()}
+              // [2026-11-12 用户裁定「默认收起中间轮」] 流式块与落库段**共用同一份**轮级展开态：
+              //   一个 Map（processOpenByTurn），点哪一处都是整轮收起/展开 —— 不会出现
+              //   「流式块收起、落库段展开」这种半开状态。默认收起，收起态露尾部 3 段
+              //   （含流式块自己的思考/正文/工具），所以不会「收起后一片空白」。
+              turnKey={row.turnKey}
+              processExpanded={turnOpenFor(row.turnKey)}
+              collapsedTailKeep={tailKeepByRowKey.get(row.key) ?? 0}
+                hiddenSegCount={hiddenSegCountByTurn.get(row.turnKey) ?? 0}
+              onToggleProcess={toggleTurnProcess}
             />
           </ErrorBoundary>
         )
@@ -4114,40 +4394,31 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           这里**原来用会话级的 `thinking && streamIds.length === 0`** —— 中途消费时旧轮的块
           还挂在 streams 里 ⇒ `streamIds.length > 0` 且 `thinking=false` ⇒ 整个占位不渲染
           ⇒ 新轮下面一条「正在执行」都没有。现改用 {@link showPendingPlaceholder}（按轮判定）。 */}
-      {(showPendingPlaceholder || thinking) && (
+      {showPendingPlaceholder && (
         <div className="msg assistant streaming">
           {latestTurnHasAssistantRow ? <div className="avatar-gutter" aria-hidden /> : <div className="avatar">N</div>}
           <div className="body">
             {!latestTurnHasAssistantRow && <div className="author">nexus</div>}
-            {showPendingPlaceholder && (
-              <>
-                {/* 状态行：与 Message 里的 `.turn-process-toggle.running` 同款（同 class ⇒ 同观感） */}
-                <button
-                  type="button"
-                  className="turn-process-toggle running static"
-                  role="status"
-                  aria-live="polite"
-                >
-                  <span className="turn-process-status">正在执行</span>
-                  <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
-                  {placeholderDuration && (
-                    <span className="turn-process-dur">· {placeholderDuration}</span>
-                  )}
-                </button>
-                <div className="exec-scan-line" aria-hidden="true" />
-              </>
-            )}
-            {/* [2026-11-04 用户裁定] 这句静态「思考中…」去掉：它不承载内容、也不会变化，
-                和上面的「正在执行 · 时长」+ 扫光条重复，用户原话「这个静态的 不应该有的」。
-                ⚠️ 仅在**占位承载状态行**时去掉（showPendingPlaceholder=true）；窗口里没有任何
-                user 行那种边缘态（thinking-only 分支）仍保留它 —— 那时它是唯一的运行线索。 */}
-            {!showPendingPlaceholder && (
-              <div className="thinking-wrap open">
-                <div className="thinking-toggle">
-                  <span>思考中…</span>
-                </div>
-              </div>
-            )}
+            {/* 状态行：与 Message 里的 `.turn-process-toggle.running` 同款（同 class ⇒ 同观感） */}
+            <button
+              type="button"
+              className="turn-process-toggle running static"
+              role="status"
+              aria-live="polite"
+            >
+              <span className="turn-process-status">正在执行</span>
+              <span className="wave-dots" aria-hidden="true"><i /><i /><i /></span>
+              {placeholderDuration && (
+                <span className="turn-process-dur">· {placeholderDuration}</span>
+              )}
+            </button>
+            <div className="exec-scan-line" aria-hidden="true" />
+            {/* [2026-11-12 用户裁定] 原 thinking-only 分支的静态「思考中…」整块删除。
+                WHY：能走到该分支时本轮必有落库 assistant 行或流式块，而它在 turn 活跃时
+                自己会画「正在执行 · 时长」⇒ 这句恒重复且不可点、无内容，用户原话
+                「我又没展开 都缩起来了」「不应该有的」。
+                ⚠️ 只删这个占位上的静态文字；**可展开的思考块**（Message 的 reasoningBlock /
+                StreamBlockRow 的 thinking-wrap，带 toggle + caret + thinking-body）一律保留。 */}
           </div>
         </div>
       )}

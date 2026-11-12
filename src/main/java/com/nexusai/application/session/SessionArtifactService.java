@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.common.NexusaiDataRoots;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
@@ -94,6 +95,15 @@ public class SessionArtifactService {
     private static final int URL_MAX = 2048;
     private static final int SUMMARY_MAX = 2000;
 
+    /**
+     * 出站的「那一轮提问」正文上限（字）。
+     *
+     * <p>WHY 要截断：{@code messages.content} 是整段原始提问（可能带长附件说明 / 整篇粘贴），
+     * 产物列表是**分组标题**用途，几百 KB 的正文会把整个响应体和前端渲染拖死。
+     * 500 足够放下正常的提问句；超长加 {@code …} 明示「还有后文」。
+     */
+    private static final int TURN_QUESTION_MAX = 500;
+
     private static final String KIND_DELIVERABLE = "deliverable";
     private static final String KIND_SOURCE = "source";
 
@@ -176,6 +186,16 @@ public class SessionArtifactService {
     private static final String[] SOURCE_TOOL_KEYWORDS = {"websearch", "web_search", "webfetch", "web_fetch"};
 
     @Autowired private SessionArtifactMapper artifactMapper;
+
+    /**
+     * 消息表只读通道 · 用于把 {@code source_message_id} 还原成「那一轮问了什么」。
+     *
+     * <p><b>WHY {@code required = false}</b>：现有 12 个产物测试类都用
+     * {@code new SessionArtifactService()} + {@code ReflectionTestUtils.setField(..., "artifactMapper", mock)}
+     * 直构，本字段会是 null ⇒ 必须走「全部 turnQuestion=null」的降级分支，⛔ 绝不能 NPE。
+     * 非 Spring 运行时（直构单测）也只是退化：产物照常出站，只是组头没有提问原文。
+     */
+    @Autowired(required = false) private com.nexusai.repository.session.mapper.MessageMapper messageMapper;
 
     /**
      * [产物实时推送 2026-11-02] STOMP 会话级 topic 的发送器。
@@ -284,7 +304,7 @@ public class SessionArtifactService {
                 QueryWrapper.create()
                         .eq("session_id", sessionId)
                         .orderBy("updated_at", false));   // desc（新→旧）
-        return toBuckets(rows);
+        return toBuckets(rows, loadTurnInfo(sessionId, sourceMessageIdsOf(rows)));
     }
 
     /**
@@ -314,19 +334,156 @@ public class SessionArtifactService {
             q.eq("source_message_id", messageId);
         }
         List<SessionArtifactRecord> rows = artifactMapper.selectListByQuery(q);
-        return toBuckets(rows);
+        return toBuckets(rows, loadTurnInfo(sessionId, sourceMessageIdsOf(rows)));
     }
 
+    /**
+     * 从产物行里收集<b>非空</b>的 {@code source_message_id}（去重由 {@link #loadTurnInfo} 负责）。
+     *
+     * @param rows 产物行（null / 空 → 空集合）
+     */
+    private static java.util.Collection<String> sourceMessageIdsOf(List<SessionArtifactRecord> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return List.of();
+        }
+        List<String> ids = new ArrayList<>(rows.size());
+        for (SessionArtifactRecord row : rows) {
+            if (row != null && row.getSourceMessageId() != null && !row.getSourceMessageId().isBlank()) {
+                ids.add(row.getSourceMessageId());
+            }
+        }
+        return ids;
+    }
+
+    /**
+     * 归属消息 id → 「那一轮问了什么」（**一次查询，⛔ 不 N+1**）。
+     *
+     * <p><b>WHY 要联查消息表</b>：右侧栏按对话分组的组头要显示提问原文，而前端聊天窗口只保留
+     * 最近 2 轮（{@code FOLD_DEFAULT_TURNS=2}）⇒ 更早轮次的提问在前端查不到。产物行的
+     * {@code source_message_id} 本身是准确的（孤儿键 0 条），所以真源就在消息表里。
+     *
+     * <p><b>「真人提问」五条判据</b>（任一不满足 ⇒ 该 id 不入 Map ⇒ 出站两字段为 null）：
+     * <ol>
+     *   <li>{@code role} == {@code "user"}；</li>
+     *   <li>{@code is_meta} 不是 TRUE；</li>
+     *   <li>{@code subtype} 为 null 或空白（{@code tool_use_summary} 之类是系统行）；</li>
+     *   <li>锚点自洽：{@code user_message_id} 为 null <b>或</b> 等于自身 {@code id}
+     *       （不等 ⇒ 这是属于别的 flow 的注入行，不是本轮提问）；</li>
+     *   <li>{@code content} 压空白后非空。</li>
+     * </ol>
+     *
+     * <p>⛔ 正文层的前缀判定（{@code <system-reminder>} / {@code <task-notification>} /
+     * Stop hook 之类）由<b>前端既有判据</b>负责，这里不重复实现 —— 后端只负责
+     * 「这条消息到底是不是真人提问」的结构性判定。
+     *
+     * <p>正文压单行：{@code content.replaceAll("\\s+", " ").trim()}；超过
+     * {@link #TURN_QUESTION_MAX} 字取前 N 字加 {@code …}。
+     *
+     * @param sessionId  会话 id（查询必须带它，避免跨会话拿到同 id 的行）
+     * @param messageIds 候选归属 id（null/空白被过滤、去重）
+     * @return id → 提问简报；空集 / 未装配 mapper / 查询失败 → 空 Map（⛔ 不抛）
+     */
+    private Map<String, TurnBrief> loadTurnInfo(String sessionId, java.util.Collection<String> messageIds) {
+        if (messageMapper == null || sessionId == null || sessionId.isBlank()
+                || messageIds == null || messageIds.isEmpty()) {
+            return Map.of();
+        }
+        java.util.Set<String> ids = new java.util.LinkedHashSet<>();
+        for (String id : messageIds) {
+            if (id != null && !id.isBlank()) {
+                ids.add(id);
+            }
+        }
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        try {
+            List<com.nexusai.repository.session.entity.MessageRecord> rows = messageMapper.selectListByQuery(
+                    QueryWrapper.create()
+                            .select("id", "role", "content", "created_at", "is_meta", "subtype", "user_message_id")
+                            .where("session_id = ?", sessionId)
+                            .in("id", ids));
+            if (rows == null || rows.isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[artifact-turn] 归属消息全部查不到（孤儿键） session={} 请求={} 条",
+                            sessionId, ids.size());
+                }
+                return Map.of();
+            }
+            Map<String, TurnBrief> out = new LinkedHashMap<>();
+            for (com.nexusai.repository.session.entity.MessageRecord rec : rows) {
+                if (rec == null || rec.getId() == null) {
+                    continue;
+                }
+                // ① 只认真人提问：role / is_meta / subtype / 锚点自洽 / 正文非空
+                if (!"user".equals(rec.getRole())) {
+                    continue;
+                }
+                if (Boolean.TRUE.equals(rec.getIsMeta())) {
+                    continue;
+                }
+                if (rec.getSubtype() != null && !rec.getSubtype().isBlank()) {
+                    continue;
+                }
+                String anchor = rec.getUserMessageId();
+                if (anchor != null && !anchor.isBlank() && !anchor.equals(rec.getId())) {
+                    continue;
+                }
+                String question = oneLine(rec.getContent());
+                if (question == null) {
+                    continue;
+                }
+                out.put(rec.getId(), new TurnBrief(question, rec.getCreatedAt()));
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[artifact-turn] 归属提问解析 session={} 请求={} 条 取到真人提问={} 条",
+                        sessionId, ids.size(), out.size());
+            }
+            return out;
+        } catch (Exception e) {
+            // 旁路增强：查不到就降级成 null（⛔ 不能让消息表异常把产物列表打成 500）
+            log.warn("[artifact-turn] 归属提问查询失败（降级为 null） session={} 请求={} 条: {}",
+                    sessionId, ids.size(), e.toString());
+            return Map.of();
+        }
+    }
+
+    /** 提问正文压成单行 + 截断（空 → null）。 */
+    private static String oneLine(String content) {
+        if (content == null) {
+            return null;
+        }
+        String flat = content.replaceAll("\\s+", " ").trim();
+        if (flat.isEmpty()) {
+            return null;
+        }
+        return flat.length() <= TURN_QUESTION_MAX ? flat : flat.substring(0, TURN_QUESTION_MAX) + "…";
+    }
+
+    /**
+     * 一轮提问的简报。
+     *
+     * @param question  提问原文（已压单行 + 截断到 {@link #TURN_QUESTION_MAX}）
+     * @param createdAt 该消息的 {@code created_at} 原始串（DB 直出）
+     */
+    private record TurnBrief(String question, String createdAt) {}
+
     /** 行 → 两桶（未知 kind 忽略并留调试日志，存量脏行不抛错）。 */
-    private ArtifactBuckets toBuckets(List<SessionArtifactRecord> rows) {
+    private ArtifactBuckets toBuckets(List<SessionArtifactRecord> rows, Map<String, TurnBrief> turns) {
         List<SessionArtifactDto> deliverables = new ArrayList<>();
         List<SessionArtifactDto> sources = new ArrayList<>();
         if (rows != null) {
             for (SessionArtifactRecord row : rows) {
+                String owner = row.getSourceMessageId();
+                TurnBrief turn = (turns == null || owner == null) ? null : turns.get(owner);
+                String question = turn == null ? null : turn.question();
+                String createdAt = turn == null ? null : turn.createdAt();
                 if (KIND_DELIVERABLE.equals(row.getKind())) {
-                    deliverables.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath())));
+                    deliverables.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath()),
+                            question, createdAt));
                 } else if (KIND_SOURCE.equals(row.getKind())) {
-                    sources.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath())));
+                    sources.add(SessionArtifactDto.from(row, isDirectoryArtifact(row.getLocalPath()),
+                            question, createdAt));
                 } else if (log.isDebugEnabled()) {
                     log.debug("[artifact-extract] 忽略未知 kind={} id={}（存量脏行不抛错）",
                             row.getKind(), row.getId());
@@ -1213,8 +1370,8 @@ public class SessionArtifactService {
      * @return 归档根绝对路径（已 normalize）
      */
     static Path artifactsRoot() {
-        return Paths.get(NexusaiPaths.getAppConfigHomeDir(), ARTIFACTS_DIR_NAME)
-                .toAbsolutePath().normalize();
+        // [data-root] 安装目录 <install>/data/workspace/<user> 优先，configHome 兜底（用户 2026-11-12 裁定）
+        return NexusaiDataRoots.sub(ARTIFACTS_DIR_NAME);
     }
 
     /** 交付物目录名（会话产物目录下的子目录，Agent 按系统提示词写入这里）。 */

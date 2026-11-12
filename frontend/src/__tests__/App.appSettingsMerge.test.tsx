@@ -110,7 +110,7 @@ const base = (over: Partial<AppSettings> = {}): AppSettings => ({
   strongModelName: null,
   subagentModelName: null,
   autoCompactWindow: null,
-  maxOutputTokens: null,
+ 
   fallbackModelName: null,
   multimodalModelName: null,
   ttsModelName: null,

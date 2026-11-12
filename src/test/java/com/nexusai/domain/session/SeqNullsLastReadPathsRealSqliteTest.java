@@ -465,7 +465,8 @@ class SeqNullsLastReadPathsRealSqliteTest {
             null, null, null, null, null, null, null, null, null,
             null,   // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
             null,   // cacheHitRate（[cache-savings]，本 fixture 未设 → null）
-            null);  // kbToolsEnabled（V278 会话级知识库开关，本 fixture 未设 → null）
+            null,   // kbToolsEnabled（V278 会话级知识库开关，本 fixture 未设 → null）
+            null);  // pinned（V283 置顶标记，本 fixture 未设 → null）
     }
 
     /** 真 ChatService（真 mapper），仅替换标题链路需要的外部依赖。 */

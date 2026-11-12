@@ -2,6 +2,8 @@ package com.nexusai.kb.app.ingest;
 
 import com.mybatisflex.core.MybatisFlexBootstrap;
 import com.nexusai.kb.app.parser.KbOfficeParser;
+import com.nexusai.kb.app.parser.KbParseContext;
+import com.nexusai.kb.app.parser.KbParsedDocument;
 import com.nexusai.kb.app.parser.KbParserRegistry;
 import com.nexusai.kb.app.parser.KbTextParser;
 import com.nexusai.kb.domain.KnowledgeIngestService;
@@ -528,6 +530,175 @@ class KnowledgeIngestTest {
         assertThat(claimedIds.size()).isLessThanOrEqualTo(taskCount);
     }
 
+    // ── 用例 7：三池并发（真 SQLite · 用户裁定 8/2/12） ────────────────
+
+    /**
+     * ⭐⭐ 并发证据用例：6 条解析任务必须真的并发跑完，而不是排队串行。
+     *
+     * <p>判据不是「跑完了」，而是「同时达到过的最大在途数 &gt;= 2」—— 池装配了但提交路径
+     * 仍然逐条等待的实现，6 条也会全部 done、0 dead，只有 maxObservedInflight 恒为 1。
+     *
+     * <p>解析是毫秒级操作，不加延迟时「提交→跑完」会一个挨一个收尾，观测到的并发
+     * 取决于调度时序。这里在解析器里 sleep 200ms 并自己统计同时进入 parse 的线程数。
+     *
+     * <p>6 个线程同时写 SQLite 必然偶发 SQLITE_BUSY —— 这正是 requeue（不消耗
+     * retry_count）该起作用的场景，所以断言「最终全部 done、没有 dead」而不是「一轮跑完」。
+     */
+    @Test
+    @DisplayName("6 条解析任务并发：全部 done、0 dead、parse 池实测并发 >= 2")
+    void parsePoolExecutesTasksConcurrently() throws Exception {
+        final int taskCount = 6;
+        final AtomicInteger running = new AtomicInteger();
+        final AtomicInteger maxRunning = new AtomicInteger();
+
+        // 慢解析器：真解析 + 200ms 停留，并记录「同时在其中」的线程数
+        KbParserRegistry slowRegistry = new KbParserRegistry(
+            List.of(new KbTextParser() {
+                @Override
+                public KbParsedDocument parse(Path file, KbParseContext ctx) {
+                    int now = running.incrementAndGet();
+                    maxRunning.accumulateAndGet(now, Math::max);
+                    try {
+                        Thread.sleep(200L);
+                        return super.parse(file, ctx);
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        throw new IllegalStateException("并发测试被中断", e);
+                    } finally {
+                        running.decrementAndGet();
+                    }
+                }
+            }));
+
+        KbIndexWriter concurrentIndexWriter = new KbIndexWriter(
+            MybatisFlexBootstrap.getInstance().getMapper(KbEmbeddingMapper.class),
+            chunkMapper, new NoopEmbeddingPort(), sqlite());
+        KnowledgeParseProcessor concurrentProcessor = new KnowledgeParseProcessor(
+            knowledgeMapper, knowledgeBaseMapper, slowRegistry, stateRepository,
+            new KbChunkWriter(chunkMapper), concurrentIndexWriter, null,
+            sqliteEngineRegistry(concurrentIndexWriter, chunkMapper),
+            new KbPostProcessStage(chunkMapper, stateRepository, queue));
+        KbIngestWorker concurrentWorker = new KbIngestWorker(queue, concurrentProcessor,
+            noopSummary(), noopQuestions(), noopAutoTag(), noopWiki(), noopGraph(),
+            noopImageEnrich(), concurrentIndexWriter,
+            knowledgeMapper, knowledgeBaseMapper, stateRepository);
+
+        try {
+            // 池默认值必须与源站逐字一致（用户裁定 2026-11-12：8 / 2 / 12）
+            // ⚠️ 这里写死字面量，⛔ 不拿 DEFAULT_* 常量自比（自比恒真 = 假绿）
+            assertThat(KbIngestPoolProperties.DEFAULT_PARSE_CONCURRENCY)
+                .as("parse 池默认必须 = 源站 Core 8").isEqualTo(8);
+            assertThat(KbIngestPoolProperties.DEFAULT_POSTPROCESS_CONCURRENCY)
+                .as("postprocess 池默认必须 = 源站 PostProcess 2").isEqualTo(2);
+            assertThat(KbIngestPoolProperties.DEFAULT_ENRICHMENT_CONCURRENCY)
+                .as("enrichment 池默认必须 = 源站 Enrichment 12").isEqualTo(12);
+            assertThat(concurrentWorker.poolLimit(KbIngestPools.Kind.PARSE)).isEqualTo(8);
+            assertThat(concurrentWorker.poolLimit(KbIngestPools.Kind.POSTPROCESS)).isEqualTo(2);
+            assertThat(concurrentWorker.poolLimit(KbIngestPools.Kind.ENRICHMENT)).isEqualTo(12);
+
+            String baseId = insertKnowledgeBase();
+            List<Long> taskIds = new ArrayList<>();
+            for (int i = 0; i < taskCount; i++) {
+                Path file = tempTextFile("并发解析第" + i + "份" + "戊".repeat(600));
+                String knowledgeId = insertKnowledgeWithBase("pending", 0, file, baseId);
+                taskIds.add(queue.enqueue(
+                    knowledgeId, KbIngestTaskRecord.TYPE_PARSE, 0, null));
+            }
+
+            // 一轮 drainBatch(6) 会把 6 条一起提交（parse 池容量 8）；
+            // 被 BUSY 回队的任务由后续轮次继续消费，最多 20 轮。
+            int rounds = 0;
+            while (rounds < 20
+                && countTasksInState(taskIds, KbIngestTaskRecord.STATE_DONE) < taskCount) {
+                concurrentWorker.drainBatch(taskCount);
+                rounds++;
+            }
+
+            int obsInflight = concurrentWorker.maxObservedInflight(KbIngestPools.Kind.PARSE);
+            System.out.println("[并发实测] rounds=" + rounds
+                + " maxObservedInflight(PARSE)=" + obsInflight
+                + " maxConcurrentParsers=" + maxRunning.get()
+                + " busyRetry=" + concurrentWorker.busyRetryTotal()
+                + " done=" + countTasksInState(taskIds, KbIngestTaskRecord.STATE_DONE)
+                + " dead=" + countTasksInState(taskIds, KbIngestTaskRecord.STATE_DEAD));
+
+            assertThat(countTasksInState(taskIds, KbIngestTaskRecord.STATE_DONE))
+                .as("6 条解析任务必须全部 done").isEqualTo(taskCount);
+            assertThat(countTasksInState(taskIds, KbIngestTaskRecord.STATE_DEAD))
+                .as("并发不得把 BUSY 写成 dead（BUSY 必须回队列）").isZero();
+            assertThat(obsInflight)
+                .as("parse 池必须真并发：串行实现这里恒为 1").isGreaterThanOrEqualTo(2);
+            assertThat(maxRunning.get())
+                .as("解析器内部实测并发线程数").isGreaterThanOrEqualTo(2);
+        } finally {
+            concurrentWorker.destroy();
+        }
+    }
+
+    // ── 用例 8：application.yml 与类默认值同值 ────────────────────────
+
+    /**
+     * ⭐ yml 与类默认值必须同值：yml 键缺失（老部署的外部配置）时才落到类默认值，
+     * 两者不一致会让「配置里写的」和「实际跑的」分叉，而分叉只在并发度上悄悄体现。
+     */
+    @Test
+    @DisplayName("application.yml 三池并发度 = 8/2/12（与类默认值同值）")
+    void applicationYmlMatchesPoolDefaults() throws Exception {
+        String yml;
+        try (java.io.InputStream in = getClass().getResourceAsStream("/application.yml")) {
+            assertThat(in).as("classpath:/application.yml 必须可读").isNotNull();
+            yml = new String(in.readAllBytes(), StandardCharsets.UTF_8);
+        }
+        assertThat(hasKey(yml, "parse-concurrency", "8"))
+            .as("yml 的 parse-concurrency 必须 = 8").isTrue();
+        assertThat(hasKey(yml, "postprocess-concurrency", "2"))
+            .as("yml 的 postprocess-concurrency 必须 = 2").isTrue();
+        assertThat(hasKey(yml, "enrichment-concurrency", "12"))
+            .as("yml 的 enrichment-concurrency 必须 = 12").isTrue();
+    }
+
+    /**
+     * {@code ingest:} 块下某键是否等于给定值。
+     *
+     * <p>⚠️ 必须按缩进扫整块，⛔ 不能用「{@code ingest:} 后紧跟下一行」的正则：
+     * ingest 块里有三个键，第二个键离 {@code ingest:} 隔了一行，那种正则只对第一个键成立
+     * （实测：parse 过、postprocess/enrichment 恒失败）。
+     */
+    private static boolean hasKey(String yml, String key, String value) {
+        int start = yml.indexOf("ingest:");
+        if (start < 0) {
+            return false;
+        }
+        int blockIndent = indentOf(yml, start);
+        int i = yml.indexOf('\n', start) + 1;
+        while (i > 0 && i < yml.length()) {
+            int end = yml.indexOf('\n', i);
+            if (end < 0) {
+                end = yml.length();
+            }
+            String line = yml.substring(i, end).trim();
+            if (!line.isEmpty() && indentOf(yml, i) <= blockIndent) {
+                break;      // 同级或更外层键 ⇒ ingest 块结束
+            }
+            if (line.matches(java.util.regex.Pattern.quote(key)
+                    + ":\\s*" + java.util.regex.Pattern.quote(value))) {
+                return true;
+            }
+            i = end + 1;
+        }
+        return false;
+    }
+
+    /** 行首缩进空格数。 */
+    private static int indentOf(String s, int pos) {
+        int lineStart = s.lastIndexOf('\n', pos - 1) + 1;
+        int n = 0;
+        while (lineStart + n < s.length() && s.charAt(lineStart + n) == ' ') {
+            n++;
+        }
+        return n;
+    }
+
     // ── 支撑 ────────────────────────────────────────────────────────
 
     private static SQLiteDataSource sqlite() {
@@ -653,6 +824,17 @@ class KnowledgeIngestTest {
                  "SELECT COUNT(*) FROM kb_chunk WHERE knowledge_id = '" + knowledgeId + "'")) {
             return rs.next() ? rs.getInt(1) : 0;
         }
+    }
+
+    /** 统计给定任务里处于某状态（queued/running/done/dead）的条数 · 并发用例用。 */
+    private static int countTasksInState(List<Long> taskIds, String state) throws Exception {
+        int n = 0;
+        for (long id : taskIds) {
+            if (state.equals(readTaskState(id))) {
+                n++;
+            }
+        }
+        return n;
     }
 
     private static String readTaskState(long taskId) throws Exception {

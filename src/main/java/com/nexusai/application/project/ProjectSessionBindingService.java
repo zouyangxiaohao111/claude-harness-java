@@ -179,7 +179,9 @@ public class ProjectSessionBindingService {
             CacheHitRate.ofModels(CostTracker.parseModelUsageJson(s.getModelUsageJson()),
                 modelMapper, providerMapper),
             // [V278] 会话级「引入知识库」开关（0/1 → Boolean，null = 未设置）
-            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null
+            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null,
+            // [V283] 左栏置顶标记（0/1 → Boolean，null = 未设置）
+            s.getPinned() != null ? s.getPinned() != 0 : null
         );
     }
 

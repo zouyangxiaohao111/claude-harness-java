@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import {
   compareSessions,
   compareGroups,
+  sortSessionsWithPinned,
   latestUpdatedAt,
   type SessionGroupOrderKey,
   type SessionOrderKey,
@@ -175,5 +176,45 @@ describe('latestUpdatedAt', () => {
     // 空数组 / 全空值 → ''（降序比较时排最后，不抛）
     expect(latestUpdatedAt([])).toBe('')
     expect(latestUpdatedAt([s('a', null), s('b', undefined)])).toBe('')
+  })
+})
+
+describe('sortSessionsWithPinned（左栏置顶展示序）', () => {
+  const p = (id: string, updatedAt: string, pinned?: boolean | null) => ({ id, updatedAt, pinned })
+
+  it('置顶整体排最前 · WHY：置顶的语义就是「无论多久没动都固定在最上面」', () => {
+    const out = sortSessionsWithPinned([
+      p('new', '2026-09-12T12:00:00+08:00'),
+      p('old-pinned', '2026-01-01T00:00:00+08:00', true),
+    ])
+    expect(out.map((x) => x.id)).toEqual(['old-pinned', 'new'])
+  })
+
+  it('置顶区内部 / 未置顶区内部都按 updatedAt 降序 + id 兜底', () => {
+    const out = sortSessionsWithPinned([
+      p('p-old', '2026-01-01T00:00:00+08:00', true),
+      p('n-old', '2026-01-02T00:00:00+08:00'),
+      p('p-new', '2026-03-01T00:00:00+08:00', true),
+      p('n-new', '2026-04-01T00:00:00+08:00'),
+      p('n-same-b', '2026-05-01T00:00:00+08:00'),
+      p('n-same-a', '2026-05-01T00:00:00+08:00'),
+    ])
+    expect(out.map((x) => x.id)).toEqual(['p-new', 'p-old', 'n-same-a', 'n-same-b', 'n-new', 'n-old'])
+  })
+
+  it('pinned 为 null / undefined 一律视作未置顶 · WHY：后端 null = 未设置，不能被当成置顶', () => {
+    const out = sortSessionsWithPinned([
+      p('plain', '2026-02-01T00:00:00+08:00'),
+      p('null-pin', '2026-01-01T00:00:00+08:00', null),
+      p('real-pin', '2025-01-01T00:00:00+08:00', true),
+    ])
+    expect(out.map((x) => x.id)).toEqual(['real-pin', 'plain', 'null-pin'])
+  })
+
+  it('不改入参数组（纯函数）', () => {
+    const input = [p('b', '2026-01-01T00:00:00+08:00'), p('a', '2026-02-01T00:00:00+08:00', true)]
+    const before = input.map((x) => x.id)
+    sortSessionsWithPinned(input)
+    expect(input.map((x) => x.id)).toEqual(before)
   })
 })

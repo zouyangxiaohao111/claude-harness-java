@@ -6,8 +6,10 @@ import org.slf4j.LoggerFactory;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Set;
 
 /**
  * 解析引擎按库路由 · 对齐 WeKnora {@code ChunkingConfig.ResolveParserEngine}
@@ -25,10 +27,14 @@ import java.util.Locale;
  * {@code supports()} 命中的解析器，顺序 PDF(10) → anydoc(12) → 图片(15) → Office(20) → 文本(30)，
  * 与源站「anydoc 优先 / 类型默认」的结论等价（见 {@code KbParserRegistry} 类注释）。
  *
+ * <p><b>⭐ engine 名的可匹配范围</b>：解析器的 {@code name()}（类名，如 {@code KbPdfParser}）
+ * 与 {@link KbDocumentParser#engineFamilyNames()}（源站族名，如 {@code builtin} / {@code anydoc} /
+ * {@code paddleocr_vl}）都算命中，比较时忽略大小写与 {@code _}/{@code -} 差异。
+ * 这样源站原样迁移过来的 {@code parser_engine_rules} 不会静默失配。
+ *
  * <p><b>⭐ engine 名匹配不到时的处理（有意偏离源站）</b>：源站 engine 是族名，映射失败会让
  * docreader 返回 nil ⇒ 该文档解析失败。本仓<b>记 warn 并回落默认路由</b> —— 一个写错的库配置
- * 不该让整库文档全部解析失败；而且前端存的是类名（{@code KbAnydocParser}），用户更容易手抖
- * （大小写差异、改了类名）。回落时日志里带上「写的是什么、忽略后走了谁」。
+ * 不该让整库文档全部解析失败。回落时日志里带上「写的是什么、忽略后走了谁」。
  *
  * <p><b>⚠️ 可用性</b>：规则点名了某个解析器但它当前不可用（如 anydoc 在无原生库的平台）⇒
  * 同样回落默认。<b>不</b>强行选中一个不可用的解析器 —— 那会让 {@code parse()} 产出空文本
@@ -59,7 +65,7 @@ public final class KbParserEngineRouter {
 
         ParserEngineRule hit = firstMatching(rules, ext);
         if (hit != null) {
-            KbDocumentParser byName = findByName(registry, hit.engine());
+            KbDocumentParser byName = findByName(registry, hit.engine(), fileName);
             if (byName == null) {
                 log.warn("[解析路由] 规则指定的引擎不存在，回落默认 file={} 类型={} 配置引擎=\"{}\" 可用引擎={}",
                     fileName, ext, hit.engine(), names(registry));
@@ -126,21 +132,100 @@ public final class KbParserEngineRouter {
         return null;
     }
 
-    /** 按 {@code name()} 精确匹配（⛔ 不做模糊/前缀匹配：两套名字并存会让配置与日志对不上）。 */
-    static KbDocumentParser findByName(KbParserRegistry registry, String engine) {
+    /**
+     * 按 {@code name()} <b>或</b> {@link KbDocumentParser#engineFamilyNames()} 匹配。
+     *
+     * <p>为什么要认族名：源站规则里写的是 {@code builtin} / {@code anydoc} / {@code simple} /
+     * {@code paddleocr_vl} 这类引擎族名，而本仓 {@code name()} 是类名。只比类名会让照搬来的规则
+     * 静默失配、回落默认路由（PaddleOCR-VL 则完全无法被规则点名）。两侧都做规范化后比较：
+     * 去空白 + 小写 + {@code -} 视同 {@code _}。⛔ 仍不做前缀/模糊匹配。
+     *
+     * <p><b>主名优先</b>：先按 {@code name()} 精确匹配（存量配置的行为逐字不变），没有再比族名。
+     *
+     * <p><b>族名一对多时的消歧</b>：一个族名会覆盖多个解析器（{@code builtin} = PDF/HTML/XMind、
+     * {@code simple} = 文本/图片）。这时不按 {@code @Order} 盲取第一个 —— 那会让
+     * 「规则: html → builtin」落到 PDF 解析器上。改为优先取 {@code supports(fileName)} 认这个文件的
+     * 那一个；都不认（或判定抛异常）才退回 {@code @Order} 第一个，与既有兜底一致。
+     *
+     * @param registry 解析器注册表
+     * @param engine   规则里的 engine 名
+     * @param fileName 待解析文件名（族名一对多时用于消歧；可 null）
+     * @return 命中的解析器；无匹配 ⇒ null
+     */
+    static KbDocumentParser findByName(KbParserRegistry registry, String engine, String fileName) {
         if (engine == null || engine.isBlank()) {
             return null;
         }
+        String wanted = canonicalEngine(engine);
+        List<KbDocumentParser> aliasHits = new ArrayList<>(2);
         for (KbDocumentParser parser : registry.parsers()) {
-            if (engine.trim().equals(parser.name())) {
+            if (wanted.equals(canonicalEngine(parser.name()))) {
+                return parser;
+            }
+            if (matchesFamily(wanted, parser)) {
+                aliasHits.add(parser);
+            }
+        }
+        if (aliasHits.isEmpty()) {
+            return null;
+        }
+        for (KbDocumentParser parser : aliasHits) {
+            if (supportsQuietly(parser, fileName)) {
                 return parser;
             }
         }
-        return null;
+        return aliasHits.get(0);
     }
 
+    /** 规则里的 engine 是否命中该解析器声明的族名。 */
+    private static boolean matchesFamily(String canonical, KbDocumentParser parser) {
+        Set<String> families = parser.engineFamilyNames();
+        if (families == null) {
+            return false;
+        }
+        for (String family : families) {
+            if (canonical.equals(canonicalEngine(family))) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** {@code supports} 的异常不影响路由（与 {@link KbParserRegistry#select} 同口径：跳过该候选）。 */
+    private static boolean supportsQuietly(KbDocumentParser parser, String fileName) {
+        try {
+            return parser.supports(fileName == null ? "" : fileName, null);
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** engine 名规范化：去空白 + 小写 + 连字符等价下划线（{@code paddleocr-vl} ≡ {@code paddleocr_vl}）。 */
+    static String canonicalEngine(String engine) {
+        if (engine == null) {
+            return "";
+        }
+        return engine.trim().toLowerCase(Locale.ROOT).replace('-', '_');
+    }
+
+    /**
+     * 回落 warn 里列的「可写引擎名」· 主名之外带上族名别名（否则用户照提示改成 {@code anydoc}
+     * 仍会看到它被判为「不存在」）。
+     */
     private static List<String> names(KbParserRegistry registry) {
-        return registry.parsers().stream().map(KbDocumentParser::name).toList();
+        List<String> all = new ArrayList<>();
+        for (KbDocumentParser parser : registry.parsers()) {
+            all.add(parser.name());
+            Set<String> families = parser.engineFamilyNames();
+            if (families != null) {
+                for (String family : families) {
+                    if (!all.contains(family)) {
+                        all.add(family);
+                    }
+                }
+            }
+        }
+        return List.copyOf(all);
     }
 
     /** 取扩展名（小写、不含点）· 与 {@link KbParsers#extensionOf} 同源，此处只做 null 安全包装。 */

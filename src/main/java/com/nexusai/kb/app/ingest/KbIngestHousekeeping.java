@@ -53,19 +53,20 @@ import java.util.List;
  * <h2>⭐ 为什么不会误杀正常短任务</h2>
  * <ol>
  *   <li>只扫 {@code state='running'}；{@code queued} 是「积压」不是「卡死」，一律不动。</li>
- *   <li>判据是「<b>开始执行</b>已超过 {@link #STALE_TIMEOUT_MINUTES} 分钟」（30 分钟）。
- *       1024 页扫描版 PDF + 视觉补强的解析十几分钟内会完成，留足余量。</li>
+ *   <li>判据是「<b>开始执行</b>已超过阈值分钟数」（默认 130 分钟，照抄源站 2h + 10min）。
+ *       1024 页扫描版 PDF + 视觉补强可能跑很久，阈值必须留足余量。</li>
  *   <li>UPDATE 带 {@code AND state = 'running'}：与 {@code markFailure} 同款条件写，
  *       已被人改写的行不会被拽回来。</li>
  *   <li>文档状态只在「该文档<b>再无</b>其它活任务」时才置 failed（见
  *       {@link #hasLiveTask}）—— 还有子任务在排队的文档属于积压，不是孤儿。</li>
  * </ol>
  *
- * <h2>⚠️ 可能与 {@link KbIngestWorker} 抢调度线程</h2>
- * 本仓<b>没有显式配置</b> {@code spring.task.scheduling.pool-size}（实测 grep 零命中）
- * ⇒ 走 Spring 默认（单线程）。所以本扫描会短暂占住 {@code KbIngestWorker} 的轮询线程。
- * 因此每次最多处理 {@link #MAX_SWEEP_PER_TICK} 条 —— 正常情况下一轮只有个位数，
- * 异常时也不会把入库轮询卡住几十秒。
+ * <h2>调度线程池（2026-11-12 已配置）</h2>
+ * {@code spring.task.scheduling.pool.size = 8} + 线程名前缀 {@code nexusai-sched-}
+ * （{@code application.yml}）：所有 {@code @Scheduled} 方法不再共用 Spring 默认的<b>单线程</b>，
+ * 本扫描不会占住 {@link KbIngestWorker} 的入库 tick（源站把这些拆成独立 asynq 池，
+ * {@code internal/types/task.go:17-23}；Spring 侧最近的等价物就是有界调度池）。
+ * 仍保留每轮 {@link #MAX_SWEEP_PER_TICK} 条上限 —— 一轮异常积压不该让单次扫描跑很久。
  */
 @Component
 public class KbIngestHousekeeping {
@@ -77,8 +78,25 @@ public class KbIngestHousekeeping {
      */
     private static final long SWEEP_INTERVAL_MS = 300_000L;
 
-    /** 超期阈值：30 分钟。解析最慢的 PDF + 视觉补强可能十几分钟。 */
-    private static final long STALE_TIMEOUT_MINUTES = 30L;
+    /**
+     * 超期阈值默认值：<b>130 分钟</b>（照抄源站两段口径叠加）。
+     *
+     * <ul>
+     *   <li>{@code DocumentProcessTimeout} 默认 <b>2 小时</b>
+     *       —— {@code D:/tmp/WeKnora/internal/config/config.go:231}
+     *       {@code DefaultDocumentProcessTimeout = 2 * time.Hour}：单份文档处理任务的总时限；</li>
+     *   <li>housekeeping 阈值 {@code max(1h, DocumentProcessTimeout) + 10min}
+     *       —— {@code internal/application/service/knowledge_housekeeping.go:911-917}。</li>
+     * </ul>
+     * ⇒ 2h + 10min = <b>130 分钟</b>。本仓原来的 30 分钟会把「正跑着的 1024 页扫描 PDF」
+     * 当成卡死回收（源站不会）—— 属阈值口径偏离，不是保守。
+     */
+    public static final long DEFAULT_STALE_TIMEOUT_MINUTES = 130L;
+
+    /** 超期阈值（分钟）· 可配 {@code nexusai.knowledge.ingest.stale-timeout-minutes}。 */
+    @org.springframework.beans.factory.annotation.Value(
+        "${nexusai.knowledge.ingest.stale-timeout-minutes:130}")
+    private long staleTimeoutMinutes = DEFAULT_STALE_TIMEOUT_MINUTES;
 
     /** 单轮最多回收多少条（见类注释「可能与 KbIngestWorker 抢调度线程」）。 */
     private static final int MAX_SWEEP_PER_TICK = 200;
@@ -129,7 +147,7 @@ public class KbIngestHousekeeping {
     public int doSweep() {
         String now = KbTimeFormat.now();
         String cutoff = KbTimeFormat.format(
-            LocalDateTime.now().minusMinutes(STALE_TIMEOUT_MINUTES));
+            LocalDateTime.now().minusMinutes(staleTimeoutMinutes));
 
         List<StaleTask> candidates = jdbc.query(
             "SELECT id, knowledge_id FROM kb_ingest_task "
@@ -174,7 +192,7 @@ public class KbIngestHousekeeping {
         if (recoveredTasks > 0) {
             log.warn("[入库回收] 回收超期 running 任务 {} 条（阈值 {} 分钟），"
                     + "其中 {} 个文档置为 failed cutoff={}",
-                recoveredTasks, STALE_TIMEOUT_MINUTES, recoveredDocs, cutoff);
+                recoveredTasks, staleTimeoutMinutes, recoveredDocs, cutoff);
         }
         return recoveredTasks;
     }

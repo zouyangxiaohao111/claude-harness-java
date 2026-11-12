@@ -19,7 +19,11 @@ import java.util.Map;
 import java.util.Set;
 
 /**
- * 纯文本类解析器 · .txt / .md / .markdown / .html / .htm / .json / .csv / .log / .xml。
+ * 纯文本类解析器 · .txt / .md / .markdown / .json / .csv / .log / .xml。
+ *
+ * <p><b>⚠️ html / htm / xhtml 已让出</b>（2026-11）：这三个扩展名改由 {@link KbHtmlParser}
+ * （{@code @Order(25)}）接管，因为它能用 XHTML 事件流保住标题层级与表格结构；本类原先用
+ * {@code ToTextContentHandler} 只会拍成扁平文本。{@code canMapToOriginal} 里仍保留这三个分支作防御。
  *
  * <p><b>行为</b>：直接用 Tika {@code AutoDetectParser} 抽文本，普通文本<b>不做任何改写</b>，
  * 编码自动探测（Tika 带 juniversalchardet，GBK 文本也能出正确中文）。
@@ -50,9 +54,9 @@ public class KbTextParser implements KbDocumentParser {
     /** 结构化转换是否生效（{@code true} = CSV/TSV/JSON 已转成 Markdown 结构）。 */
     static final String META_STRUCTURED = "structured";
 
-    /** 本解析器明确支持的扩展名（小写、不带点）。 */
+    /** 本解析器明确支持的扩展名（小写、不带点）· ⛔ html/htm/xhtml 已让给 {@link KbHtmlParser}。 */
     private static final Set<String> EXTENSIONS = Set.of(
-        "txt", "text", "md", "markdown", "html", "htm", "xhtml",
+        "txt", "text", "md", "markdown",
         "json", "csv", "tsv", "log", "xml", "yaml", "yml", "properties", "sql", "ini", "conf"
     );
 
@@ -89,6 +93,12 @@ public class KbTextParser implements KbDocumentParser {
     @Override
     public String displayName() {
         return "内置文本解析";
+    }
+
+    /** 引擎族名别名 · 源站内置简单解析引擎为 {@code simple}（另收 {@code text}）。 */
+    @Override
+    public Set<String> engineFamilyNames() {
+        return Set.of("simple", "text");
     }
 
     @Override

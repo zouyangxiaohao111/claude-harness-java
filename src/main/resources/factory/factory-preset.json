@@ -51,7 +51,6 @@
     "accent": "#CC785C",
     "animations_enabled": true,
     "auto_compact_window": 1000000,
-    "max_output_tokens": 8000,
     "websearch_use_small_model": true,
     "agent_swarms_enabled": true,
     "permission_mode": "default",

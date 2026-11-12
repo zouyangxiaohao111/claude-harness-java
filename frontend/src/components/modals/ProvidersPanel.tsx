@@ -89,6 +89,34 @@ const PROTOCOL_OPTIONS = [
 ]
 
 /**
+ * Base URL 提示的文案表 · 按协议类型取值（新建 / 编辑共用）。
+ *
+ * <p><b>为什么必须写在界面上</b>：后端<b>从不</b>替用户补或删 `/v1` —— 只 trim 去掉尾部斜杠
+ * （`OpenAiSdkProvider.normalizeBaseUrl` / `AnthropicSdkProvider.normalizeBaseUrl`），
+ * 路径由各协议<b>固定拼接</b>：OpenAI 兼容 = 地址 + `/chat/completions`，
+ * Anthropic = 地址 + `/v1/messages`。⇒ 两种协议要求的结尾格式<b>正好相反</b>，
+ * 填错只会拿到 404，而后端文案是「baseUrl 不正确（404）」，看不出该带还是不该带。
+ *
+ * <p><b>为什么每条都写「请求 {base}/…」</b>：只写「填到 /v1 为止」用户仍要自己拼一次才能确认；
+ * 把最终路径摊开，用户拿自己的地址一对照就知道对不对。
+ *
+ * <p>导出仅为单测能直接对真值表断言 —— 走 UI 需要构造一个 `type: 'openai_response'` 的
+ * Provider，而 `Provider.type` 是后端枚举子集（无此值），只能 cast 硬造，那是在测不存在的世界。
+ */
+export const BASE_URL_HINT: Record<string, string> = {
+  openai_compatible: '填到 /v1 为止 · 请求 {base}/chat/completions',
+  anthropic: '只填域名、不带 /v1 · 请求 {base}/v1/messages',
+  // 后端 ProviderType 尚无此值（当前置灰不可选），文案先备好，避免将来放开时漏一条。
+  openai_response: '填到 /v1 为止 · 请求 {base}/responses',
+}
+
+/** 未知 / 空类型（新建表单初值、历史数据）按 OpenAI 兼容处理 —— 那也正是后端保存时的推断结果。 */
+export const baseUrlHint = (type: unknown): string => {
+  const t = typeof type === 'string' ? type : ''
+  return BASE_URL_HINT[t] ?? BASE_URL_HINT.openai_compatible
+}
+
+/**
  * 「自定义请求头」section（新建 / 编辑共用）。
  *
  * <p>值挂在 FormModal 的 `custom` 字段上（键名对齐 `Provider.extraHeaders`），由 KvEditor 维护；
@@ -371,7 +399,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
               fields: [
                 { type: 'text', name: 'name', label: '名称', placeholder: 'e.g. DeepSeek' },
                 { type: 'radio-segments', name: 'type', label: '协议类型', options: PROTOCOL_OPTIONS, hint: '决定请求走哪个 API 端点 · baseUrl 含 api.anthropic.com 会自动推断为 Anthropic' },
-                { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.example.com/v1' },
+                { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.example.com/v1', hint: (v) => baseUrlHint(v.type) },
                 { type: 'password', name: 'apiKeyMasked', label: 'API Key', placeholder: 'sk-****abcd', hint: '完整 key，后端脱敏后存储' },
               ],
             },
@@ -401,7 +429,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
               fields: [
                 { type: 'text', name: 'name', label: '名称', placeholder: 'e.g. OpenAI' },
                 { type: 'radio-segments', name: 'type', label: '协议类型', options: PROTOCOL_OPTIONS, hint: '决定请求走哪个 API 端点 · baseUrl 含 api.anthropic.com 会自动推断为 Anthropic' },
-                { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.openai.com/v1' },
+                { type: 'text', name: 'baseUrl', label: 'Base URL', placeholder: 'https://api.openai.com/v1', hint: (v) => baseUrlHint(v.type) },
                 { type: 'password', name: 'apiKeyMasked', label: 'API Key', placeholder: 'sk-****abcd' },
               ],
             },

@@ -3,12 +3,16 @@ import type { CSSProperties } from 'react'
 import { marked } from 'marked'
 import DOMPurify from 'dompurify'
 import {
+  deleteMemoryEntry,
   getMemoryConfig,
+  getMemoryEntry,
+  listMemoryEntries,
   listMemoryFiles,
+  saveMemoryEntry,
   saveMemoryFile,
   updateMemoryConfig,
 } from '@/api/memory'
-import type { MemoryConfig, MemoryFileEntry } from '@/api/memory'
+import type { MemoryConfig, MemoryEntrySummary, MemoryFileEntry } from '@/api/memory'
 import { ApiError } from '@/api/rest'
 
 interface MemoryEditorModalProps {
@@ -61,6 +65,39 @@ const VIEW_TABS: { id: ViewMode; label: string }[] = [
 
 /** type 分组顺序（下拉 optgroup）：User / Project / Managed（只读） */
 const TYPE_GROUPS: MemoryFileEntry['type'][] = ['User', 'Project', 'Managed']
+
+/**
+ * 记忆条目的四个内容分类（= 条目文件 frontmatter 的 `type:` 值）。
+ *
+ * 🔴 它们**不是目录**：本机实测 492 个 .md 全部平铺在 `memory/` 根下、零子目录。
+ * ⇒ 左栏的真实层级是「用户级 / 项目级」，这四类只是项目级内部的**筛选器**。
+ * 未知/缺失 type 的旧文件归「未分类」（`MemoryType.fromString` 对未知返回 null），⛔ 不丢。
+ */
+const ENTRY_CATEGORIES: { type: string; label: string }[] = [
+  { type: 'user', label: '关于你' },
+  { type: 'feedback', label: '偏好与反馈' },
+  { type: 'project', label: '项目背景' },
+  { type: 'reference', label: '参考资料' },
+]
+
+/** 条目时间：同一天只显示时分，跨天显示月日（列表窄，省宽度）。 */
+function fmtEntryTime(ms: number): string {
+  if (!ms || ms <= 0) return '—'
+  const d = new Date(ms)
+  const now = new Date()
+  const sameDay = d.toDateString() === now.toDateString()
+  const pad = (n: number) => String(n).padStart(2, '0')
+  return sameDay
+    ? `${pad(d.getHours())}:${pad(d.getMinutes())}`
+    : `${pad(d.getMonth() + 1)}-${pad(d.getDate())}`
+}
+
+/** 条目体积：1 KB 以下给字节，以上给 KB（499 条 × 几千字，行内必须压缩）。 */
+function fmtEntrySize(bytes: number): string {
+  if (bytes < 0) return '—'
+  if (bytes < 1024) return `${bytes} B`
+  return `${(bytes / 1024).toFixed(1)} KB`
+}
 
 /** option 唯一键 = `type|file`（file 为相对路径，不再用绝对 path 作键） */
 const entryKey = (f: MemoryFileEntry) => `${f.type}|${f.file}`
@@ -122,6 +159,24 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
   const [draft, setDraft] = useState('')
   const [mode, setMode] = useState<ViewMode>('split')
   const [saving, setSaving] = useState(false)
+  /** 上次载入/保存的正文基线（判「有没有未保存改动」）。 */
+  const [savedSnapshot, setSavedSnapshot] = useState('')
+
+  /* ── 记忆条目（memory/ 下平铺的单条 .md）────────────────────────────────────
+     ⚠️ 与上面的 `files`（三档指令文件 Managed/User/Project）**是两套数据**：
+     · files   → CLAUDE.md 这类指令文件，整份编辑
+     · entries → 项目记忆目录里一条一个 .md，按 frontmatter type 分类
+     🔴 四类（关于你/偏好与反馈/项目背景/参考资料）**不是目录**，只是条目文件里的
+        frontmatter `type:` 标签；本机实测 492 个 .md 全部平铺在 memory/ 根下，零子目录。
+     ⇒ UI 里「用户级 / 项目级」才是真实层级，四类只是项目级内部的筛选器。 */
+  const [entries, setEntries] = useState<MemoryEntrySummary[]>([])
+  const [entriesLoading, setEntriesLoading] = useState(true)
+  const [entriesError, setEntriesError] = useState('')
+  /** 当前选中的条目文件名；null = 选的是三档指令文件 */
+  const [selectedEntryFile, setSelectedEntryFile] = useState<string | null>(null)
+  /** 左栏当前筛选的记忆类（null = 全部） */
+  const [entryFilter, setEntryFilter] = useState<string | null>(null)
+  const [entryActionError, setEntryActionError] = useState('')
   /* ── 设计稿 14「长期记忆」开关（真接 GET/PUT /memory/config） ────────────────────────────
      `config` = 服务端最近一次返回的完整视图（含 dreamStatus / lastConsolidatedAtMs）；
      `configError` 非空 = 读失败，此时**开关降级为只读展示**（⛔ 不臆造 true/false 默认值：
@@ -131,6 +186,8 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
   const [configLoading, setConfigLoading] = useState(true)
   const [configError, setConfigError] = useState('')
   const [pendingKey, setPendingKey] = useState<ConfigKey | null>(null)
+
+
 
   // 挂载/切换会话时拉取记忆文件列表（type 三档视图）；失败 fail loud（error 态 + 关闭按钮仍可用）
   // [批 3a] 无活动会话 → 不发请求（后端 sessionId 必填，缺值 400），直接显式 error 态。
@@ -254,22 +311,153 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
   // 预览 = marked 渲染 + DOMPurify 清洗（防 XSS）；marked.parse 同步路径返回 string，cast 兼容 async 联合类型
   const previewHtml = useMemo(() => DOMPurify.sanitize(marked.parse(draft) as string), [draft])
 
+  /** 左栏条目：按四类筛选（null = 全部；`__none__` = 未分类的旧文件）。 */
+  const filteredEntries = useMemo(() => {
+    if (entryFilter === null) return entries
+    if (entryFilter === '__none__') return entries.filter((e) => !e.type)
+    return entries.filter((e) => e.type === entryFilter)
+  }, [entries, entryFilter])
+
+  /** 四类计数（左栏筛选器上的数字，含总数与未分类）。 */
+  const entryCounts = useMemo(() => {
+    const m: Record<string, number> = { __all__: entries.length, __none__: 0 }
+    for (const e of entries) {
+      const k = e.type ?? '__none__'
+      m[k] = (m[k] ?? 0) + 1
+    }
+    return m
+  }, [entries])
+
+  /** 左栏按真实层级分组：用户级（跨项目）/ 项目级（当前项目）/ 系统内置（只读）。 */
+  const filesByLayer = useMemo(
+    () => ({
+      User: files.filter((f) => f.type === 'User'),
+      Project: files.filter((f) => f.type === 'Project'),
+      Managed: files.filter((f) => f.type === 'Managed'),
+    }),
+    [files],
+  )
+
+
+
+  /** 条目清单加载。`sessionId` 缺失 → 空集（后端要 per-project 记忆目录）。 */
+  const loadEntries = useCallback(() => {
+    if (!sessionId) {
+      setEntries([])
+      setEntriesError('')
+      setEntriesLoading(false)
+      return () => {}
+    }
+    let alive = true
+    setEntriesLoading(true)
+    setEntriesError('')
+    listMemoryEntries(sessionId)
+      .then((list) => {
+        if (alive) setEntries(list)
+      })
+      .catch((e) => {
+        if (!alive) return
+        setEntries([])
+        setEntriesError(e instanceof ApiError ? e.userMessage() : String(e))
+      })
+      .finally(() => {
+        if (alive) setEntriesLoading(false)
+      })
+    return () => {
+      alive = false
+    }
+  }, [sessionId])
+
+  useEffect(() => loadEntries(), [loadEntries])
+
+  /** 有未保存改动时二次确认（切条目 / 删条目都走这里）。true = 允许丢弃草稿继续。 */
+  const confirmDiscard = useCallback((): boolean => {
+    if (draft === savedSnapshot) return true
+    return window.confirm('当前改动尚未保存，确定放弃吗？')
+  }, [draft, savedSnapshot])
+
+  /** 选中并载入一条记忆条目（列表不带正文，点击才拉）。 */
+  const pickMemoryEntry = useCallback(
+    (filename: string) => {
+      if (!sessionId || filename === selectedEntryFile) return
+      if (!confirmDiscard()) return
+      setEntryActionError('')
+      getMemoryEntry(sessionId, filename)
+        .then((d) => {
+          setSelectedEntryFile(filename)
+          setSelectedKey('')
+          setDraft(d.content)
+          setSavedSnapshot(d.content)
+        })
+        .catch((e) => {
+          setEntryActionError(e instanceof ApiError ? e.userMessage() : String(e))
+        })
+    },
+    [sessionId, selectedEntryFile, confirmDiscard],
+  )
+
+  /** 删除一条记忆条目（⛔ 不删 MEMORY.md 里指向它的那一行 —— 索引由模型维护）。 */
+  const handleDeleteEntry = useCallback(async () => {
+    if (!sessionId || !selectedEntryFile) return
+    const ok = window.confirm(
+      '确定删除「' +
+        selectedEntryFile +
+        '」？\n\n注意：MEMORY.md 索引里指向它的那一行不会被自动删除，需要另行处理。',
+    )
+    if (!ok) return
+    try {
+      await deleteMemoryEntry(sessionId, selectedEntryFile)
+      showToast('记忆已删除', 'success')
+      setSelectedEntryFile(null)
+      setSelectedKey('')
+      setDraft('')
+      setSavedSnapshot('')
+      loadEntries()
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [sessionId, selectedEntryFile, showToast, loadEntries])
+
   /** 选中某个记忆文件（列表行点击与下拉 change 共用同一条路径，避免两处状态分叉） */
   const pickEntry = useCallback((key: string) => {
+    if (key !== selectedKey && !confirmDiscard()) return
     setSelectedKey(key)
+    setSelectedEntryFile(null)
     const file = files.find((f) => entryKey(f) === key)
     setDraft(file?.content ?? '')
-  }, [files])
+    setSavedSnapshot(file?.content ?? '')
+  }, [files, selectedKey, confirmDiscard])
 
   const handlePick = (e: React.ChangeEvent<HTMLSelectElement>) => {
     pickEntry(e.target.value)
   }
 
   const handleSave = async () => {
-    if (!selected || readOnly || saving) return
+    if (saving) return
+    /* ① 选中的是「记忆条目」（memory/ 下平铺的单条 .md）→ PUT /memory/entries。
+       ⚠️ 保存后**不关窗**：条目是列表里的一条，关窗会让用户以为整段管理结束。
+       ⛔ 只写这一个 .md，不动 MEMORY.md（索引由模型维护）。 */
+    if (selectedEntryFile) {
+      if (!sessionId) return
+      setSaving(true)
+      try {
+        await saveMemoryEntry(sessionId, selectedEntryFile, draft)
+        setSavedSnapshot(draft)
+        showToast('记忆已保存', 'success')
+        loadEntries()
+      } catch (e) {
+        showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      } finally {
+        setSaving(false)
+      }
+      return
+    }
+    /* ② 选中的是「三档指令文件」→ 原有 PUT /memory/files（逻辑零改动） */
+    if (!selected || readOnly) return
     setSaving(true)
     try {
       await saveMemoryFile({ type: selected.type, file: selected.file, content: draft, sessionId })
+      setSavedSnapshot(draft)
       showToast('记忆已保存', 'success')
       onClose()
     } catch (e) {
@@ -454,108 +642,171 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
                     )}
                   </div>
 
-                  {/* ── 设计稿 13「我的记忆」列表区 ────────────────────────────────────────────
-                      ⭐ 契约关键：设计稿的 `memory-item` 是**一条记忆条目**（内容 + 分类 + 来源 + 时间）。
-                      本仓 `GET /memory/files` 返回的是**三档文件**（Managed/User/Project），
-                      没有条目级数据源（后端无 GET /memory/items 之类端点，实测 MemoryController
-                      只有 /files GET+POST+PUT、/config GET+PUT 五个映射）。
-                      ⇒ 这里 `memory-item` = **一个真实存在的记忆文件**，一行一个，⛔ 不把 content
-                      按行/按句拆成多个假条目，⛔ 不造「个人信息/偏好/自动提炼」分类。
-                      点行 = 选中该文件（与顶部下拉联动），编辑仍在下方编辑器里做。 */}
-                  <div className="list-section" style={PAGE_STYLE.listSection}>
-                    <div className="list-toolbar" style={PAGE_STYLE.listToolbar}>
-                      <div className="list-title" style={PAGE_STYLE.listTitle}>
-                        <h3 style={PAGE_STYLE.listTitleH3}>记忆列表</h3>
-                        {/* 「共 N 项」= 服务端返回的文件数（三档合计）。⛔ 不写「共 0 条」以外的假统计：
-                            加载中显示「加载中」，失败显示「—」。 */}
-                        <span className="list-count" style={PAGE_STYLE.listCount}>
-                          {loading ? '加载中…' : error ? '—' : `共 ${files.length} 项`}
+                  {/* ── 左栏（真实层级：用户级 / 项目级）──────────────────────────────────────
+                      🔴 用户明确纠正过：四类（关于你/偏好与反馈/项目背景/参考资料）**不是目录**，
+                      只是条目 frontmatter 的 `type:` 标签（本机 492 个 .md 全平铺、零子目录）。
+                      ⇒ 层级 = 用户级 / 项目级；四类是项目级内部的筛选器。
+                      ⛔ 不把四类画成可展开的容器。 */}
+                  <div className="mem-layout">
+                    <aside className="mem-side">
+                      <div className="mem-side-head">
+                        <span className="mem-side-title">记忆</span>
+                        <span className="mem-side-count">
+                          {entriesLoading ? '加载中…' : entriesError ? '—' : `共 ${entries.length} 条`}
                         </span>
                       </div>
-                      {/* 设计稿此处有「添加 / 导出 / 整理 / 清空」四个按钮。本仓后端：
-                          · 添加 → POST /memory/files 只允许创建**白名单内路径**，且 file 由 type 决定，
-                            前端无法指定新文件名 ⇒ 无可用形态，不做；
-                          · 导出 / 整理 / 清空 → 后端**无对应端点**（MemoryController 五个映射里没有
-                            delete / export / consolidate）⇒ 一律不做，⛔ 不挂假按钮。见报告 §8。 */}
-                    </div>
 
-                    <div className="memory-results" style={PAGE_STYLE.memoryResults}>
-                      {loading ? (
-                        <div className="mem-state">加载中…</div>
-                      ) : error ? (
-                        <div className="mem-state mem-state-error">
-                          <span>加载失败：{error}</span>
-                          <button className="mem-retry-btn" onClick={load}>重试</button>
+                      <div className="mem-side-scroll">
+                        {/* 用户级：跨所有项目的指令文件 */}
+                        <div className="mem-side-group">
+                          <div className="mem-side-group-title">用户级<span>全部项目</span></div>
+                          <ul className="mem-side-list">
+                            {filesByLayer.User.length === 0 ? (
+                              <li className="mem-side-empty">未发现</li>
+                            ) : (
+                              filesByLayer.User.map((f) => {
+                                const key = entryKey(f)
+                                return (
+                                  <li key={key}>
+                                    <button
+                                      type="button"
+                                      className={'mem-side-row' + (key === selectedKey ? ' is-on' : '')}
+                                      onClick={() => pickEntry(key)}
+                                    >
+                                      <span className="mem-side-name">{f.file}</span>
+                                      <span className="mem-side-meta">
+                                        {f.exists ? '已存在' : '待创建'} · 指令
+                                      </span>
+                                    </button>
+                                  </li>
+                                )
+                              })
+                            )}
+                          </ul>
                         </div>
-                      ) : files.length === 0 ? (
-                        <div className="mem-state">未发现记忆文件</div>
-                      ) : (
-                        <ul className="memory-list" style={PAGE_STYLE.memoryList}>
-                          {files.map((f, i) => {
-                            const key = entryKey(f)
-                            const isSelected = key === selectedKey
-                            const fileReadOnly = f.type === 'Managed' || (f.type === 'Project' && !f.editable)
-                            return (
-                              <li
-                                key={key}
-                                className="memory-item"
-                                style={{
-                                  ...PAGE_STYLE.memoryItem,
-                                  ...(i === files.length - 1 ? PAGE_STYLE.memoryItemLast : null),
-                                  ...(isSelected ? PAGE_STYLE.memoryItemSelected : null),
-                                }}
+
+                        {/* 项目级：当前项目的指令文件 + 记忆条目（四类筛选） */}
+                        {filesByLayer.Project.length > 0 && (
+                          <div className="mem-side-group">
+                            <div className="mem-side-group-title">项目级<span>当前项目 · 指令</span></div>
+                            <ul className="mem-side-list">
+                              {filesByLayer.Project.map((f) => {
+                                const key = entryKey(f)
+                                return (
+                                  <li key={key}>
+                                    <button
+                                      type="button"
+                                      className={'mem-side-row' + (key === selectedKey ? ' is-on' : '')}
+                                      onClick={() => pickEntry(key)}
+                                    >
+                                      <span className="mem-side-name">{f.file}</span>
+                                      <span className="mem-side-meta">
+                                        {f.exists ? '已存在' : '待创建'}
+                                        {f.type === 'Project' && !f.editable ? ' · 只读' : ' · 可编辑'}
+                                      </span>
+                                    </button>
+                                  </li>
+                                )
+                              })}
+                            </ul>
+                          </div>
+                        )}
+
+                        {/* 记忆条目：四类筛选器（标签，不是目录） */}
+                        <div className="mem-side-group">
+                          <div className="mem-side-group-title">
+                            项目级<span>当前项目 · 记忆条目</span>
+                          </div>
+                          <ul className="mem-side-list">
+                            <li>
+                              <button
+                                type="button"
+                                className={'mem-side-row mem-side-cat' + (entryFilter === null ? ' is-on' : '')}
+                                onClick={() => setEntryFilter(null)}
                               >
-                                {/* 行主体是 <button>：整行可点 + 可键盘聚焦（Enter/Space），
-                                    ⛔ 不再把 onClick 挂在 <li> 上 —— 那样键盘用户完全够不着，
-                                    且 li 里再放一个「编辑」按钮会形成嵌套交互元素。
-                                    这个按钮就是设计稿请求的「编辑」动作：选中该文件 → 编辑区载入它。 */}
+                                <span className="mem-side-name">全部</span>
+                                <span className="mem-side-num">{entryCounts.__all__ ?? 0}</span>
+                              </button>
+                            </li>
+                            {ENTRY_CATEGORIES.map((c) => (
+                              <li key={c.type}>
                                 <button
                                   type="button"
-                                  className="memory-main"
-                                  style={{
-                                    ...PAGE_STYLE.memoryMain,
-                                    display: 'block',
-                                    width: '100%',
-                                    textAlign: 'left',
-                                    border: 0,
-                                    padding: 0,
-                                    background: 'transparent',
-                                    font: 'inherit',
-                                    cursor: 'pointer',
-                                  }}
-                                  aria-pressed={isSelected}
-                                  onClick={() => pickEntry(key)}
+                                  className={'mem-side-row mem-side-cat' + (entryFilter === c.type ? ' is-on' : '')}
+                                  onClick={() => setEntryFilter(c.type)}
                                 >
-                                  {/* 主行 = 文件名（相对路径）+ type 档。这是服务端真实字段，
-                                      ⛔ 不是 content 的截断/首行 —— 那样会把一个文件伪装成一条记忆。 */}
-                                  <span className="memory-content" style={{ ...PAGE_STYLE.memoryContent, display: 'block' }}>{f.file}</span>
-                                  <span className="memory-meta" style={PAGE_STYLE.memoryMeta}>
-                                    <span>{f.type}</span>
-                                    <span aria-hidden="true" style={PAGE_STYLE.metaSep}>·</span>
-                                    <span>{f.exists ? '已存在' : '待创建'}</span>
-                                    <span aria-hidden="true" style={PAGE_STYLE.metaSep}>·</span>
-                                    <span>{fileReadOnly ? '只读' : '可编辑'}</span>
-                                  </span>
+                                  <span className="mem-side-name">{c.label}</span>
+                                  <span className="mem-side-num">{entryCounts[c.type] ?? 0}</span>
                                 </button>
-                                <div className="memory-actions" style={PAGE_STYLE.memoryActions}>
-                                  {/* 设计稿这里是「编辑 + 删除」两个图标按钮。删除在本仓**没有后端端点**
-                                      （MemoryController 五个映射里无 DELETE）⇒ 不挂假按钮；
-                                      编辑动作已由左侧整行按钮承担 ⇒ 此列只留真实状态文字。 */}
-                                  <span style={PAGE_STYLE.memoryReadonly}>{fileReadOnly ? '只读' : (isSelected ? '编辑中' : '可编辑')}</span>
-                                </div>
                               </li>
-                            )
-                          })}
-                        </ul>
-                      )}
-                    </div>
-                  </div>
+                            ))}
+                            {(entryCounts.__none__ ?? 0) > 0 && (
+                              <li>
+                                <button
+                                  type="button"
+                                  className={'mem-side-row mem-side-cat' + (entryFilter === '__none__' ? ' is-on' : '')}
+                                  onClick={() => setEntryFilter('__none__')}
+                                >
+                                  <span className="mem-side-name">未分类</span>
+                                  <span className="mem-side-num">{entryCounts.__none__}</span>
+                                </button>
+                              </li>
+                            )}
+                          </ul>
+                        </div>
 
+                        {/* 筛选结果：一条一项 */}
+                        <div className="mem-side-group">
+                          <ul className="mem-side-list mem-side-entries">
+                            {entriesLoading ? (
+                              <li className="mem-side-empty">加载中…</li>
+                            ) : entriesError ? (
+                              <li className="mem-side-empty">
+                                读取失败：{entriesError}
+                                <button type="button" className="mem-side-retry" onClick={loadEntries}>
+                                  重试
+                                </button>
+                              </li>
+                            ) : filteredEntries.length === 0 ? (
+                              <li className="mem-side-empty">这一类下没有记忆条目</li>
+                            ) : (
+                              filteredEntries.map((e) => (
+                                <li key={e.filename}>
+                                  <button
+                                    type="button"
+                                    className={
+                                      'mem-side-row mem-side-item' +
+                                      (e.filename === selectedEntryFile ? ' is-on' : '')
+                                    }
+                                    onClick={() => pickMemoryEntry(e.filename)}
+                                    title={e.description ?? e.filename}
+                                  >
+                                    <span className="mem-side-name mem-side-name-2">{e.name}</span>
+                                    <span className="mem-side-meta">
+                                      {fmtEntryTime(e.mtimeMs)} · {fmtEntrySize(e.sizeBytes)}
+                                    </span>
+                                  </button>
+                                </li>
+                              ))
+                            )}
+                          </ul>
+                        </div>
+
+                        {entryActionError && (
+                          <div className="mem-side-err" role="status">
+                            {entryActionError}
+                          </div>
+                        )}
+                      </div>
+                    </aside>
+                    <div className="mem-main">
                   {/* ── 编辑器块（原有 markdown 编辑/预览/分屏，逻辑零改动）────────────────────
                       给一个块级小标题，否则它接在文件列表后面会被读成列表的一部分。 */}
                   <div className="section-header" style={{ display: 'block', position: 'static', top: 'auto', margin: '24px 0 12px', padding: '0 32px 0 0', borderBottom: 0, background: 'none', zIndex: 'auto' }}>
                     <div className="section-header-text">
-                      <h3 style={{ margin: 0, fontSize: 'var(--app-text-xl)', fontWeight: 600, color: 'var(--td-text-color-primary)' }}>编辑记忆文件</h3>
+                      <h3 style={{ margin: 0, fontSize: 'var(--app-text-xl)', fontWeight: 600, color: 'var(--td-text-color-primary)' }}>
+                        {selectedEntryFile ? '编辑记忆条目' : '编辑记忆文件'}
+                      </h3>
                     </div>
                   </div>
 
@@ -567,6 +818,8 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
                       disabled={files.length === 0}
                       aria-label="选择记忆文件"
                     >
+                      {/* 选中「记忆条目」时 selectedKey 为空串 ⇒ 补一个 option，否则下拉显示空白 */}
+                      {selectedEntryFile && <option value="">记忆条目 · {selectedEntryFile}</option>}
                       {TYPE_GROUPS.map((type) => {
                         const group = files.filter((f) => f.type === type)
                         if (group.length === 0) return null
@@ -594,7 +847,13 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
                         </button>
                       ))}
                     </div>
-                    <span className="mem-toolbar-info">{readOnly ? '只读文件 · 保存已禁用' : '支持 Markdown 格式'}</span>
+                    <span className="mem-toolbar-info">
+                      {selectedEntryFile
+                        ? `记忆条目 · ${selectedEntryFile}`
+                        : readOnly
+                          ? '只读文件 · 保存已禁用'
+                          : '支持 Markdown 格式'}
+                    </span>
                   </div>
 
                   <div className="mem-body">
@@ -605,7 +864,7 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
                         <span>加载失败：{error}</span>
                         <button className="mem-retry-btn" onClick={load}>重试</button>
                       </div>
-                    ) : files.length === 0 ? (
+                    ) : files.length === 0 && !selectedEntryFile ? (
                       <div className="mem-state">未发现记忆文件</div>
                     ) : (
                       <>
@@ -624,6 +883,8 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
                       </>
                     )}
                   </div>
+                    </div>
+                  </div>
                 </div>
               </div>
             </div>
@@ -631,8 +892,22 @@ export function MemoryEditorModal({ onClose, showToast, sessionId }: MemoryEdito
             <div className="settings-footer">
               <p className="settings-footer-note">💾 修改将持久化到本地数据库</p>
               <div className="settings-footer-actions">
+                {/* 删除只对「记忆条目」开放（三档指令文件有 Managed/白名单约束，删不得）。
+                    ⚠️ 删的只是这一个 .md：MEMORY.md 里指向它的那一行**不会**跟着消失（索引由模型维护），
+                    弹窗二次确认里已明确写了这一点。 */}
+                {selectedEntryFile && (
+                  <button className="mem-delete-btn" onClick={handleDeleteEntry} disabled={saving}>
+                    删除这条
+                  </button>
+                )}
                 <button className="mem-cancel-btn" onClick={onClose}>取消</button>
-                <button className="mem-save-btn" disabled={saving || !selected || readOnly} onClick={handleSave}>保存修改</button>
+                <button
+                  className="mem-save-btn"
+                  disabled={saving || (!selectedEntryFile && (!selected || readOnly))}
+                  onClick={handleSave}
+                >
+                  保存修改
+                </button>
               </div>
             </div>
           </div>

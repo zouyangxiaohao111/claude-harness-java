@@ -12,6 +12,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
 import javax.imageio.ImageIO;
+import java.awt.Graphics2D;
+import java.awt.RenderingHints;
 import java.awt.image.BufferedImage;
 import java.io.File;
 import java.io.IOException;
@@ -58,6 +60,14 @@ public final class PdfSupport {
     public static final long PDF_EXTRACT_SIZE_THRESHOLD = 3L * 1024 * 1024;
     /** CC original: PDF_MAX_EXTRACT_SIZE (apiLimits.ts:72) = 100MB — 提取路径最大文件尺寸。本常量作文档默认值；生效值经 {@link #getMaxExtractSize()}（yml 可配）。 */
     public static final long PDF_MAX_EXTRACT_SIZE = 100L * 1024 * 1024;
+    /**
+     * 渲染图长边上限（px）· 源站 docreader {@code pdf_render_max_edge}（config.py:136-142）= 2000。
+     *
+     * <p>WHY 需要它：100 DPI 渲染下，超大页面（长边 &gt; 1440pt ≈ 20 英寸）会产出几千像素的页图，
+     * 视觉模型侧既慢又贵，且多数视觉编码器会把图再缩到 ~2K 以内 —— 在本地先缩到 2000 更省。
+     * 本常量作文档默认值；生效值由调用方经 5 参 {@link #extractPDFPages} 传入（yml 可配）。
+     */
+    public static final int PDF_RENDER_MAX_EDGE = 2000;
 
     // ════════════════════════════════════════════════════════════════════════
     // 可配置阈值 · yml nexusai.pdf.extract-size-threshold / max-extract-size → PdfSupportConfig
@@ -258,6 +268,10 @@ public final class PdfSupport {
      *   <li>0 页产出 → {@code corrupted}（pdf.ts:267-275 等价）</li>
      * </ol>
      *
+     * <p><b>旧 4 参签名保留</b>：委托 5 参重载并传默认长边上限 {@link #PDF_RENDER_MAX_EDGE}（2000），
+     * 既有调用方（ReadFileTool / VisionAnalyzeTool / PdfAttachmentProcessor）无需改动即可继续编译；
+     * 它们的页图在 100 DPI 下普遍 &lt; 2000px，故输出与改动前一致，只有超大页面才会被缩放。
+     *
      * @param filePath  PDF 文件绝对路径
      * @param outputDir 输出目录（由调用方计算；CC 为 {@code getToolResultsDir()/pdf-{uuid}}）
      * @param firstPage 起始页（1-based，含）；null → 第 1 页（CC pdf.ts:224-226 仅 truthy 才传 -f）
@@ -266,6 +280,21 @@ public final class PdfSupport {
      */
     public static PdfExtractResult extractPDFPages(Path filePath, Path outputDir,
                                                    Integer firstPage, Integer lastPage) {
+        return extractPDFPages(filePath, outputDir, firstPage, lastPage, PDF_RENDER_MAX_EDGE);
+    }
+
+    /**
+     * 同 {@link #extractPDFPages(Path, Path, Integer, Integer)}，但可指定渲染图<b>长边上限</b>
+     * （源站 docreader {@code pdf_render_max_edge}，config.py:136-142，默认 2000px）。
+     *
+     * <p>渲染后若图片长边 &gt; {@code maxEdge}，等比缩放到长边 = {@code maxEdge} 再写 JPEG；
+     * 长边未超限时<b>原样写出</b>（不做任何重采样，避免无谓的画质损失）。
+     * {@code maxEdge <= 0} 表示关闭缩放（仅供测试/排障）。
+     *
+     * @param maxEdge 长边上限（px）；&lt;= 0 → 不缩放
+     */
+    public static PdfExtractResult extractPDFPages(Path filePath, Path outputDir,
+                                                   Integer firstPage, Integer lastPage, int maxEdge) {
         try {
             long originalSize = Files.size(filePath);
             if (originalSize == 0) {
@@ -293,17 +322,37 @@ public final class PdfSupport {
                 int count = 0;
                 for (int p = from; p <= to; p++) {
                     // 100 DPI = pdftoppm -r 100（pdf.ts:223）
-                    BufferedImage img = renderer.renderImageWithDPI(p - 1, 100f, ImageType.RGB);
+                    BufferedImage rendered = renderer.renderImageWithDPI(p - 1, 100f, ImageType.RGB);
+                    int originalLongEdge = Math.max(rendered.getWidth(), rendered.getHeight());
+                    boolean scaled = false;
+                    BufferedImage img = rendered;
+                    if (maxEdge > 0 && originalLongEdge > maxEdge) {
+                        img = scaleToMaxEdge(rendered, maxEdge);
+                        scaled = true;
+                        // 缩放副本已生成 ⇒ 原始大图 raster 立即释放（超大页面单张可达数百 MB）
+                        rendered.flush();
+                    }
                     File out = outputDir.resolve(String.format("page-%02d.jpg", p)).toFile();
-                    if (!ImageIO.write(img, "jpeg", out)) {
+                    int outWidth = img.getWidth();
+                    int outHeight = img.getHeight();
+                    boolean written;
+                    try {
+                        written = ImageIO.write(img, "jpeg", out);
+                    } finally {
+                        img.flush();
+                    }
+                    if (!written) {
                         throw new IOException("JPEG writer unavailable for " + out);
                     }
-                    // [pdf-vision-align 内存修复] 渲染循环内立即释放大页图 raster，避免多页 BufferedImage 驻留堆内存
-                    // （页图 JPEG 已落盘，内存副本不再需要）。资源核验：PDDocument 走 try-with-resources 自动
-                    //   关闭（doc.close() → PDFBox 释放底层 RandomAccessRead/RandomAccessFile）；ImageIO.write 传
-                    //   File 目标时内部自建并关闭 ImageOutputStream（finally 关闭）；PDFRenderer 无 close()（PDFBox
-                    //   3.x，绑定 doc 生命周期，doc 关闭即释放）。readPDF 纯 Files.readAllBytes 无 PDFBox 对象。
-                    img.flush();
+                    // [pdf-vision-align 内存修复] 页图 JPEG 已落盘，内存副本不再需要（未缩放的路径由 img==rendered
+                    //   的 flush() 覆盖）。资源核验：PDDocument 走 try-with-resources 自动关闭（doc.close() →
+                    //   PDFBox 释放底层 RandomAccessRead/RandomAccessFile）；ImageIO.write 传 File 目标时内部自建
+                    //   并关闭 ImageOutputStream（finally 关闭）；PDFRenderer 无 close()（PDFBox 3.x，绑定 doc
+                    //   生命周期，doc 关闭即释放）。readPDF 纯 Files.readAllBytes 无 PDFBox 对象。
+                    if (scaled && log.isDebugEnabled()) {
+                        log.debug("PdfSupport: 页图缩放 page={} 原始长边={} 上限={} 输出={}x{}",
+                            p, originalLongEdge, maxEdge, outWidth, outHeight);
+                    }
                     count++;
                 }
                 if (count == 0) {
@@ -350,10 +399,38 @@ public final class PdfSupport {
         }
     }
 
+    /**
+     * 等比缩放到长边 = {@code maxEdge} · 对应源站 docreader {@code pdf_render_max_edge}（config.py:136-142）。
+     *
+     * <p>输出统一 {@link BufferedImage#TYPE_INT_RGB}（JPEG 无 alpha 通道；与渲染源同类型，避免额外转换）。
+     * 插值用双线性 + RENDER_QUALITY：页图以文字为主，双线性在 2000px 量级足够，且比 bicubic 快。
+     *
+     * @param src     源图（长边 &gt; maxEdge）
+     * @param maxEdge 目标长边（px，&gt; 0）
+     * @return 新图（长边 == maxEdge，短边按原比例四舍五入）
+     */
+    static BufferedImage scaleToMaxEdge(BufferedImage src, int maxEdge) {
+        int w = src.getWidth();
+        int h = src.getHeight();
+        double scale = (double) maxEdge / Math.max(w, h);
+        int tw = Math.min(maxEdge, Math.max(1, (int) Math.round(w * scale)));
+        int th = Math.min(maxEdge, Math.max(1, (int) Math.round(h * scale)));
+        BufferedImage out = new BufferedImage(tw, th, BufferedImage.TYPE_INT_RGB);
+        Graphics2D g = out.createGraphics();
+        try {
+            g.setRenderingHint(RenderingHints.KEY_INTERPOLATION,
+                RenderingHints.VALUE_INTERPOLATION_BILINEAR);
+            g.setRenderingHint(RenderingHints.KEY_RENDERING, RenderingHints.VALUE_RENDER_QUALITY);
+            g.drawImage(src, 0, 0, tw, th, null);
+        } finally {
+            g.dispose();
+        }
+        return out;
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // isPDFSupported · 对齐 CC pdfUtils.ts:59-61
     // ════════════════════════════════════════════════════════════════════════
-
     /**
      * 当前模型是否支持全 PDF document 块读取（对齐 CC {@code isPDFSupported}，pdfUtils.ts:59-61）。
      *

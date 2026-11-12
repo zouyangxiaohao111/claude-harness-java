@@ -56,7 +56,8 @@ class KbPostProcessStagePlanTest {
     private static KbPostProcessConfig cfg(boolean summary, boolean question, boolean wiki, boolean tag) {
         return new KbPostProcessConfig(
             summary, summary ? "m" : "",
-            new KbPostProcessConfig.QuestionGeneration(question, "m", 3, "", "emb"),
+            // 第 5 参是 indexingReady（索引策略是否要求嵌入），⛔ 不是 embedding_model_id
+            new KbPostProcessConfig.QuestionGeneration(question, "m", 3, "", true),
             new KbPostProcessConfig.AutoTag(tag, "m", 5, true), wiki, wiki ? "m" : "", false, IMG_OFF);
     }
 
@@ -142,7 +143,7 @@ class KbPostProcessStagePlanTest {
         private static KbPostProcessConfig withGraph(boolean graph) {
             return new KbPostProcessConfig(
                 false, "m",
-                new KbPostProcessConfig.QuestionGeneration(false, "m", 3, "", "emb"),
+                new KbPostProcessConfig.QuestionGeneration(false, "m", 3, "", true),
                 new KbPostProcessConfig.AutoTag(false, "m", 5, true),
                 false, "", graph, IMG_OFF);
         }
@@ -186,11 +187,12 @@ class KbPostProcessStagePlanTest {
         }
 
         @Test
-        @DisplayName("问题生成开着但没有嵌入模型 ⇒ 不派发")
+        @DisplayName("问题生成开着但索引策略全关 ⇒ 不派发")
         void questionWithoutEmbedding() {
             KbPostProcessConfig c = new KbPostProcessConfig(
                 false, "",
-                new KbPostProcessConfig.QuestionGeneration(true, "m", 3, "", ""),
+                // indexingReady=false 等价于「vector_enabled 与 keyword_enabled 都关」
+                new KbPostProcessConfig.QuestionGeneration(true, "m", 3, "", false),
                 new KbPostProcessConfig.AutoTag(false, "", 5, true), false, "", false, IMG_OFF);
             assertThat(stage.plan(knowledge(), c, chunks(5))).isEmpty();
         }

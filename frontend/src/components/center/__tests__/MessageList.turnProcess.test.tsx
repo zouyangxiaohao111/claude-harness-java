@@ -122,7 +122,7 @@ describe('[轮次中间过程折叠]', () => {
     expect(container.querySelectorAll('.thinking-body')).toHaveLength(0)
   })
 
-  it('轮次进行中（streaming）：不显示「已完成」，已落库的中间过程保持展开', () => {
+  it('轮次进行中（streaming）：不显示「已完成」，中间过程在收起态露出尾部段', () => {
     act(() => {
       useChatStore.getState().ensureStreamBlock(SID, 'blk-live', 'u1')
       useChatStore.getState().appendReasoning(SID, 'blk-live', '正在思考')
@@ -140,7 +140,7 @@ describe('[轮次中间过程折叠]', () => {
     const running = container.querySelector('.turn-process-toggle.running')
     expect(running, '进行中应显示「正在执行」状态行').not.toBeNull()
     expect(running!.textContent).toContain('正在执行')
-    // 已落库的中间过程仍正常展示（工具卡可见）
+    // [2026-11-12] 该轮默认收起，但收起态会露尾部 3 段 ⇒ 唯一的工具卡仍在（用户看得到在做啥）。
     expect(container.querySelectorAll('.tool-card')).toHaveLength(1)
     // 流式行自己的思考块保持展开（StreamBlockRow 尾块行为不变）
     const thinkingBodies = Array.from(container.querySelectorAll('.thinking-body')).map((el) => el.textContent ?? '')
@@ -663,7 +663,12 @@ describe('[2026-11-01 方案 3] 正在执行指示器', () => {
     expect(container.querySelector('.exec-scan-line'), '进行中必须有扫光条').not.toBeNull()
   })
 
-  it('⭐⭐ 进行中也能收起：收起后只剩状态行 + 扫光条，无思考/工具/正文', () => {
+  it('⭐⭐ 进行中默认收起：只露最新 3 段；点开 = 全量', () => {
+    // [2026-11-12 用户裁定] 推翻旧语义「收起后过程内容全消失」：
+    //   用户原话「正在执行不是可以点击收缩吗 收缩下面能否做到默认展示最新内部 3 个的？」
+    //   + 「默认不展开 就是收起状态」⇒ 进行中默认收起，且收起态露**尾部 3 段**。
+    // 段口径：思考块 1 段 + 工具整行 1 段 = 每行 2 段；4 行共 8 段 ⇒ 尾部 3 段 = 第4行(2) + 第3行(1)。
+    // 变异点：把 collapsedTailKeep 传成 0 / 把 turnOpen 默认改回 isRunningTurn ⇒ 本用例红。
     useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
     useChatStore.setState({
       streams: {
@@ -678,15 +683,158 @@ describe('[2026-11-01 方案 3] 正在执行指示器', () => {
     renderList([
       userMsg('u1', new Date(Date.now() - 60000).toISOString()),
       intermediateMsg('a1', 'u1'),
+      intermediateMsg('a2', 'u1'),
+      intermediateMsg('a3', 'u1'),
+      intermediateMsg('a4', 'u1'),
     ])
-    // 默认展开：思考块 + 工具卡都在
-    expect(container.querySelectorAll('.tool-card').length).toBeGreaterThan(0)
-    act(() => { runningToggle()!.click() })
-    // 收起后：状态行与扫光条仍在，过程内容消失
-    expect(runningToggle(), '收起不等于停止 —— 状态行必须还在').not.toBeNull()
+    // 默认收起：状态行 + 扫光条仍在（收起不等于停止）
+    const t = runningToggle()
+    expect(t, '收起不等于停止 —— 状态行必须还在').not.toBeNull()
+    expect(t!.getAttribute('aria-expanded'), '执行中的轮默认收起').toBe('false')
     expect(container.querySelector('.exec-scan-line'), '收起后扫光条必须还在（一眼看出还在跑）').not.toBeNull()
-    expect(container.querySelectorAll('.tool-card'), '收起后工具卡应消失').toHaveLength(0)
-    expect(container.querySelector('.turn-process-body'), '收起后折叠区应消失').toBeNull()
+    // 收起态露尾部 3 段（不是全量 8 段，也不是 0 段）
+    expect(container.querySelector('.turn-process-body'), '收起态仍要有折叠区（承载尾部段）').not.toBeNull()
+    expect(container.querySelectorAll('.tool-card'), '尾部 3 段 = 第4行工具 + 流式块正文占位').toHaveLength(1)
+    // 尾部 3 段 = [a4: 思考, 工具] + [流式块: 正文] —— 流式块是「正在写的那段」，
+    //   它在最末尾，必须优先占名额（用户实测：只数落库行 ⇒ 收起后一片空白）。
+    expect(container.querySelectorAll('.thinking-wrap'), '尾部 3 段里只有 1 段思考（a4）').toHaveLength(1)
+
+    // 点开 → 全量
+    act(() => { runningToggle()!.click() })
+    expect(runningToggle()!.getAttribute('aria-expanded'), '点开后进入展开态').toBe('true')
+    expect(container.querySelectorAll('.tool-card'), '展开 = 全量 4 段工具').toHaveLength(4)
+    expect(container.querySelectorAll('.thinking-wrap'), '展开 = 全量 4 段思考').toHaveLength(4)
+
+    // 再点 → 回到尾部 3 段（流式块占 1 段 ⇒ 落库段只露 a4 的工具）
+    act(() => { runningToggle()!.click() })
+    expect(container.querySelectorAll('.tool-card'), '再收起回到尾部 3 段').toHaveLength(1)
+  })
+
+  it('⭐⭐ 收起态仍露尾部段时，tool_use_summary 只出现一次（不重复）', () => {
+    // WHY（规则九）：执行中的轮默认收起，但收起态会露尾部 3 段；这 3 段里可能就有
+    //   带 tool_use_summary 标题的并行工具组父行。若同时再画那条独立摘要行 ⇒ 同一段摘要出现两次。
+    //   判据同源（turnOpen）：展开 ⇒ 摘要并进组头；收起 ⇒ 摘要作为独立行（组头不传 title）。
+    // 变异点：groupTitle 无条件传 / 摘要行无条件 hidden ⇒ 本用例红（计数变 2 或 0）。
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-sum', userMessageId: 'u1',
+          reasoning: '', content: '正在输出', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-sum'] },
+    })
+    const SUMMARY = '检查了两处渲染分支'
+    const multiToolMsg = (id: string, turnId: string): ChatMessageDto =>
+      baseMsg(id, 'assistant', {
+        toolCalls: [tool(`t1-${id}`), tool(`t2-${id}`)], finishReason: 'tool_calls', userMessageId: turnId,
+      })
+    renderList([
+      userMsg('u1', new Date(Date.now() - 60000).toISOString()),
+      multiToolMsg('a1', 'u1'),
+      baseMsg('sum1', 'assistant', { author: 'attachment', subtype: 'tool_use_summary', content: SUMMARY, userMessageId: 'u1' }),
+    ])
+    const countOf = () => (container.textContent ?? '').split(SUMMARY).length - 1
+    // 收起态：并行组在尾部段里 ⇒ 组头不传 title，摘要走独立行
+    expect(countOf(), '收起态摘要只出现一次').toBe(1)
+  })
+
+  it('⭐⭐ 刚发送（纯流式、无落库段）：状态行可点，收起后只剩状态行 + 扫光条', () => {
+    // [2026-11-12 用户裁定] 此前这条状态行写死 `static`（div、无箭头、不可点），
+    //   用户原话：「正在执行 。。。 < 应该有收起来和展开的可点击的 现在不可以」。
+    // 判据四件：①是 button ②带 caret ③默认展开（正在写的正文必须可见）④点击真的收起内容。
+    // 变异点：退回 static div / 默认值改成 false ⇒ 本用例红。
+    act(() => {
+      const st = useChatStore.getState()
+      st.ensureStreamBlock(SID, 'blk-fold', 'u1')
+      st.appendReasoning(SID, 'blk-fold', '正在思考')
+      st.appendChunk(SID, 'blk-fold', '实时正文')
+    })
+    renderList([userMsg('u1')], { thinking: true })
+    const t = () => container.querySelector<HTMLButtonElement>('.turn-process-toggle.running')
+    expect(t(), '流式阶段必须有状态行').not.toBeNull()
+    expect(t()!.tagName, '状态行必须是可点的 button（不是 static div）').toBe('BUTTON')
+    expect(t()!.getAttribute('aria-expanded'), '默认收起（用户裁定「默认收起中间轮」）').toBe('false')
+    expect(t()!.querySelector('.turn-process-caret'), '必须有展开箭头').not.toBeNull()
+    expect(t()!.getAttribute('title')).toBe('展开本轮中间过程')
+    // 收起态：2 段（思考 + 正文）≤ 3 ⇒ 全保留 —— **不能是空白**（用户实测的投诉）
+    expect(container.textContent, '收起态仍露最新段').toContain('实时正文')
+    expect(container.querySelectorAll('.thinking-wrap'), '收起态仍露思考块').toHaveLength(1)
+    expect(container.querySelector('.exec-scan-line'), '收起态扫光条仍在').not.toBeNull()
+
+    // 点一次 → 展开
+    act(() => { t()!.click() })
+    expect(t()!.getAttribute('aria-expanded')).toBe('true')
+    expect(t()!.getAttribute('title')).toBe('收起本轮中间过程')
+    expect(container.textContent).toContain('实时正文')
+
+    // 再点 → 回到收起（2 段仍在，因为 ≤ 3）
+    act(() => { t()!.click() })
+    expect(t()!.getAttribute('aria-expanded')).toBe('false')
+    expect(container.textContent).toContain('实时正文')
+  })
+
+  it('⭐⭐ 多个流式块：收起只留最后 3 段（更早的整块收起）', () => {
+    // 面数 > 3 才有切片：blk-1 = 思考 + 正文（2 段），blk-2 = 思考 + 正文 + 工具（3 段）
+    // ⇒ 尾部 3 段全落在 blk-2，blk-1 的内容必须消失。
+    // 变异点：收起时按「块」而不是按「段」裁 / 忽略流式块 ⇒ 本用例红。
+    act(() => {
+      const st = useChatStore.getState()
+      st.ensureStreamBlock(SID, 'blk-1', 'u1')
+      st.appendReasoning(SID, 'blk-1', '旧思考')
+      st.appendChunk(SID, 'blk-1', '实时甲')
+      st.ensureStreamBlock(SID, 'blk-2', 'u1')
+      st.appendReasoning(SID, 'blk-2', '新思考')
+      st.appendChunk(SID, 'blk-2', '实时乙')
+      st.addToolCall(SID, 'blk-2', tool('t-blk2'))
+    })
+    renderList([userMsg('u1')], { thinking: true })
+    const t = () => container.querySelector<HTMLButtonElement>('.turn-process-toggle.running')
+    // 默认收起：5 段 → 只留尾部 3 段（全落在 blk-2），blk-1 的内容不可见
+    expect(t()!.getAttribute('aria-expanded')).toBe('false')
+    expect(container.textContent, '默认收起时更早的流式块不显示').not.toContain('实时甲')
+    expect(container.textContent, '最新块内容保留').toContain('实时乙')
+    expect(container.querySelectorAll('.tool-card'), '尾部段里的工具卡保留').toHaveLength(1)
+
+    // 点开 → 全量：两块内容都在
+    act(() => { t()!.click() })
+    expect(t()!.getAttribute('aria-expanded')).toBe('true')
+    expect(container.textContent).toContain('实时甲')
+    expect(container.textContent).toContain('实时乙')
+    expect(container.textContent).toContain('新思考')
+    expect(container.querySelectorAll('.tool-card'), '展开后工具卡也在').toHaveLength(1)
+
+    // 再收起 → 回到尾部 3 段
+    act(() => { t()!.click() })
+    expect(container.textContent, '再收起时更早的块重新隐藏').not.toContain('实时甲')
+    expect(container.textContent).toContain('实时乙')
+  })
+
+  it('⭐⭐ 收起态要提示「还有 N 项」（用户：不然用户不知道能展开）', () => {
+    // [2026-11-12 用户裁定] 收起只露 3 段，用户不知道下面还藏着内容、就不会点箭头。
+    // 数据：3 条中间段 × 2 段（思考 + 工具）= 6 段 ⇒ 收起露 3、隐藏 3。
+    // 变异点：不渲染 .turn-process-more / 段数算错 ⇒ 本用例红。
+    useChatStore.setState({ messages: {}, streams: {}, streamOrder: {}, liveSeq: {} })
+    useChatStore.setState({
+      streams: {
+        [SID]: [{
+          assistantMessageId: 'blk-more', userMessageId: 'u1',
+          reasoning: '', content: '', toolCalls: [],
+          reasoningStartedAt: null, reasoningEndedAt: null,
+        }],
+      },
+      streamOrder: { [SID]: ['blk-more'] },
+    })
+    renderList([userMsg('u1'), intermediateMsg('a1', 'u1'), intermediateMsg('a2', 'u1'), intermediateMsg('a3', 'u1')])
+    const t = () => runningToggle()
+    const more = () => container.querySelector('.turn-process-more')
+    expect(more(), '收起态必须有「还有 N 项」提示').not.toBeNull()
+    expect(t()!.textContent).toContain('还有 3 项')
+    // 展开后不再提示
+    act(() => { t()!.click() })
+    expect(more(), '展开态不该再提示还有更多').toBeNull()
   })
 
   it('⭐⭐ 一轮多段 assistant：扫光条**只能有一条**（用户实测「每个 assistant 都有一个」）', () => {

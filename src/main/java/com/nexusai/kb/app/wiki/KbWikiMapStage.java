@@ -69,10 +69,10 @@ public class KbWikiMapStage {
     /** 去重判同的温度：0，它本质是二分类。 */
     private static final double TEMP_DEDUPE = 0.0;
 
-    private static final int MAX_TOKENS_CANDIDATE = 3000;
-    private static final int MAX_TOKENS_SUMMARY = 4000;
-    private static final int MAX_TOKENS_CITATION = 2000;
-    private static final int MAX_TOKENS_DEDUPE = 1200;
+    // ⚠️ 2026-11-12 删除本阶段 4 个输出预算常量（3000/4000/2000/1200）：
+    //   输出上限唯一入口 = 模型配置页「生成参数 · max tokens」（models.max_tokens），
+    //   调用点不再填值。原 4000 在 deepseek-flash（thinking 模型）上被思考链吃光，
+    //   实测 output_tokens=4000 顶格、正文 contentLen=0 ⇒ 摘要失败 / 候选 0 条。
 
     private final LlmSideCallClient sideCallClient;
 
@@ -232,7 +232,7 @@ public class KbWikiMapStage {
             .replace("{{DOCUMENT_CONTENT}}", content);
 
         String raw = callModel(config, modelName, KbWikiPrompts.CANDIDATE_SLUG_SYSTEM, user,
-            MAX_TOKENS_CANDIDATE, TEMP_CANDIDATE, "wiki_candidate_slug", null);
+            TEMP_CANDIDATE, "wiki_candidate_slug", null);
         return parseCandidates(raw);
     }
 
@@ -329,7 +329,7 @@ public class KbWikiMapStage {
             .replace("{{AVAILABLE_PAGES}}", renderAvailablePages(pages))
             .replace("{{DOCUMENT_CONTENT}}", content);
         String raw = callModel(config, modelName, KbWikiPrompts.SUMMARY_SYSTEM, user,
-            MAX_TOKENS_SUMMARY, TEMP_SUMMARY, "wiki_summary", null);
+            TEMP_SUMMARY, "wiki_summary", null);
         return raw == null || raw.isBlank() ? null : raw.trim();
     }
 
@@ -360,7 +360,7 @@ public class KbWikiMapStage {
                 .replace("{{CANDIDATE_SLUGS}}", candidateBlock)
                 .replace("{{CHUNKS}}", renderChunks(batch));
             String raw = callModel(config, modelName, KbWikiPrompts.CHUNK_CITATION_SYSTEM, user,
-                MAX_TOKENS_CITATION, TEMP_CITATION, "wiki_chunk_citation", "batch" + i);
+                TEMP_CITATION, "wiki_chunk_citation", "batch" + i);
             if (raw == null) {
                 log.warn("[Wiki] 引用分类第 {} 批失败，跳过该批（不阻塞其他批）", i);
                 continue;
@@ -492,7 +492,7 @@ public class KbWikiMapStage {
             .replace("{{NEW_SLUGS}}", renderNewSlugs(needDedupe))
             .replace("{{CANDIDATES_BY_SLUG}}", renderCandidatesBySlug(candidatesBySlug));
         String raw = callModel(config, modelName, KbWikiPrompts.DEDUPLICATION_SYSTEM, user,
-            MAX_TOKENS_DEDUPE, TEMP_DEDUPE, "wiki_dedup", null);
+            TEMP_DEDUPE, "wiki_dedup", null);
 
         Map<String, String> merges = parseMerges(raw);
         if (merges.isEmpty()) {
@@ -728,15 +728,21 @@ public class KbWikiMapStage {
         }
     }
 
-    /** 单发调用（失败返回 null，由调用方降级）。 */
+    /**
+     * 单发调用（失败返回 null，由调用方降级）。
+     *
+     * <p>⚠️ 2026-11-12 <b>不再传 max_tokens</b>（选项位传 null）：输出上限唯一入口 =
+     * 模型配置页「生成参数 · max tokens」（{@code models.max_tokens}），
+     * 非流式请求由 provider 侧压到 {@code MAX_NON_STREAMING_TOKENS}（64000）。
+     */
     private String callModel(
         ProviderConfig config, String modelName, String system, String user,
-        int maxTokens, double temperature, String label, String suffix
+        double temperature, String label, String suffix
     ) {
         try {
             if (log.isDebugEnabled()) {
-                log.debug("[Wiki] 调用模型 label={} model={} max_tokens={} 温度={}",
-                    label, modelName, maxTokens, temperature);
+                log.debug("[Wiki] 调用模型 label={} model={} max_tokens=按模型配置 温度={}",
+                    label, modelName, temperature);
             }
             return sideCallClient.chat(
                 config, modelName, system, user,
@@ -746,7 +752,7 @@ public class KbWikiMapStage {
                     LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
                     temperature,
                     suffix == null ? label : label + ":" + suffix,
-                    null, maxTokens, null, null,
+                    null, null, null, null,
                     null, null, null, null,
                     null, null),
                 // 无会话上下文（后台异步任务）⇒ standalone 归 UNKNOWN，仍统计

@@ -127,8 +127,15 @@ public class KbChunkService {
         }
         if (!includeParents) {
             // ⚠️ 必须同时放行 NULL：DDL 里 chunk_type 是 NOT NULL DEFAULT 'text'，
-            //    但历史脏数据可能是 NULL；`<> 'parent_text'` 对 NULL 求值为 NULL ⇒ 行被静默丢掉。
-            q.and("(chunk_type IS NULL OR chunk_type <> ?)", KbChunk.CHUNK_TYPE_PARENT_TEXT);
+            //    但历史脏数据可能是 NULL；`NOT IN (...)` 对 NULL 求值为 NULL ⇒ 行被静默丢掉。
+            // ⭐ 图片独立子块（image_caption / image_ocr）也在这里滤掉：它们与父块共用
+            //    chunk_index、正文只是「一句描述 / 一段图内文字」，混进列表会让
+            //    「按 chunk_index 拼回文档」的三个消费点（分块管理 / 预览 / agent 读文档）
+            //    把同一段位置输出两遍。父块总包含这些文字所在的正文。
+            q.and("(chunk_type IS NULL OR chunk_type NOT IN (?, ?, ?))",
+                KbChunk.CHUNK_TYPE_PARENT_TEXT,
+                KbChunk.CHUNK_TYPE_IMAGE_CAPTION,
+                KbChunk.CHUNK_TYPE_IMAGE_OCR);
         }
         q.orderBy("chunk_index", true);
         return new ArrayList<>(chunkMapper.selectListByQuery(q));

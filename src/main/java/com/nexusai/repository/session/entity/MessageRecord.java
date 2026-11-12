@@ -174,6 +174,20 @@ public class MessageRecord {
      */
     private String queuedOrigin;
     /**
+     * thinking 块的签名 · 对齐 CC {@code {type:'thinking', thinking, signature}} 块的 signature。
+     *
+     * <p>WHY（[thinking-passthrough] 2026-11-12）：Anthropic 协议在 thinking 模式下继续工具调用时，
+     * 要求把上一轮 assistant 的完整 content 数组（含 thinking 块及其 signature）原样回传；
+     * 不回传时第三方兼容端点按 tool_use id 恢复，恢复失败即 400
+     * 「The `content[].thinking` in the thinking mode must be passed back to the API」。
+     * 本列与 {@link #reasoning}（thinking 正文）配对，构成完整 thinking 块 —— 与 CC
+     * transcript 同构（CC 存的就是 thinking 文本 + signature 两样，不存块结构）。
+     *
+     * <p>V282 落库为 {@code thinking_signature} 列（MyBatis-Flex camelCase→snake_case 自动映射，
+     * 同 V41 reasoning_duration_ms 范式）。null/空 = 上游未签发签名（第三方端点常见）。
+     */
+    private String thinkingSignature;
+    /**
      * 会话内单调排序键 · <b>净新增字段（非 CC 对齐）—— 根治「created_at 既是时间又是位置」</b>。
      *
      * <p>WHY: {@code created_at} 此前双重语义 —— ① 展示时间（前端「X 分钟前」）② 会话内排序位置
@@ -241,6 +255,8 @@ public class MessageRecord {
     public void setContent(String content) { this.content = content; }
     public String getReasoning() { return reasoning; }
     public void setReasoning(String reasoning) { this.reasoning = reasoning; }
+    public String getThinkingSignature() { return thinkingSignature; }
+    public void setThinkingSignature(String thinkingSignature) { this.thinkingSignature = thinkingSignature; }
     public Long getReasoningDurationMs() { return reasoningDurationMs; }
     public void setReasoningDurationMs(Long reasoningDurationMs) { this.reasoningDurationMs = reasoningDurationMs; }
     public String getFinishReason() { return finishReason; }

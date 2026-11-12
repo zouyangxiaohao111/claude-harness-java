@@ -95,10 +95,18 @@ describe('[状态行] 同一轮只允许一条「正在执行」', () => {
     expect(scanLines().length, '扫光条同样恒一条').toBe(1)
   })
 
-  it('运行中不重复，且「思考中…」仍可见（让位的是状态行，不是整个占位）', () => {
+  it('删的只是占位上的静态「思考中…」，落库行的可展开思考块必须保留', () => {
+    // [2026-11-12 用户裁定] thinking-only 分支的静态「思考中…」整块删除（用户原话：
+    //   「我又没展开 都缩起来了」「不应该有的」）。它恒与上面的「正在执行 · 时长」重复，
+    //   且不可点、无内容。**内部可展开的思考块**（button.thinking-toggle + caret + thinking-body）
+    //   一个都不能少 —— 那是用户真正会点开的思考过程。
     renderList([userMsg('u1'), assistantMsg('a1', 'u1')], true)
-    const thinking = Array.from(container.querySelectorAll('.thinking-wrap'))
-    // 「思考中…」只在占位里出现（落库行追的是「思考过程」，条件不同）⇒ 仍应有这条线索
-    expect(thinking.length, '思考中线索不得被一起删掉').toBeGreaterThan(0)
+    const toggles = Array.from(container.querySelectorAll('.thinking-toggle'))
+    expect(toggles.length, '落库行的可展开思考块保留').toBe(1)
+    expect(toggles[0]!.tagName, '思考块必须是可点击的 button').toBe('BUTTON')
+    expect(toggles[0]!.textContent).toContain('思考过程')
+    // 占位上的静态块是 <div class="thinking-toggle">（不可点）⇒ 不得再有 div 形态
+    expect(toggles.filter((el) => el.tagName !== 'BUTTON').length,
+      '占位上的静态思考中…（div，不可点）不该再有').toBe(0)
   })
 })

@@ -85,6 +85,16 @@ public class KbIngestTaskRecord {
     /** 入队时间（{@code yyyy-MM-dd HH:mm:ss}）。 */
     private String createdAt;
 
+    /**
+     * 最早可被认领的时刻（{@code yyyy-MM-dd HH:mm:ss}，V288 增列）。
+     *
+     * <p>失败重试走指数退避：{@code markFailure} 写 now + min(base * 2^(n-1), max)，
+     * 认领 SQL 只捞 {@code available_at IS NULL OR available_at <= now} 的行。
+     * NULL 等价「立即可认领」（兼容 V288 之前的旧行语义）。
+     * {@code requeue}（SQLITE_BUSY 瞬时冲突）写 now，不退避。
+     */
+    private String availableAt;
+
     /** 开始执行时间。 */
     private String startedAt;
 
@@ -111,6 +121,8 @@ public class KbIngestTaskRecord {
     public void setPayload(String payload) { this.payload = payload; }
     public String getCreatedAt() { return createdAt; }
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
+    public String getAvailableAt() { return availableAt; }
+    public void setAvailableAt(String availableAt) { this.availableAt = availableAt; }
     public String getStartedAt() { return startedAt; }
     public void setStartedAt(String startedAt) { this.startedAt = startedAt; }
     public String getFinishedAt() { return finishedAt; }

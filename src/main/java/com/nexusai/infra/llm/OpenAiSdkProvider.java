@@ -101,6 +101,42 @@ public class OpenAiSdkProvider implements LlmProvider {
 
     @Resource NexusProperties properties;
 
+    /**
+     * [thinking-passthrough] 推理字段名静态快照 · 供 {@code static} 消息组装
+     * （{@link #toSdkMessageParams}）读取配置的首个推理字段。
+     *
+     * <p>WHY 需要静态：组装函数是 static（公开给测试/复用），而配置在实例字段
+     * {@link #properties} 上 —— 启动时把「首个推理字段」快照下来（默认 reasoning_content，
+     * 即 DeepSeek 回包用的名字）；无 Spring 上下文（单测直调）时保持默认值。
+     */
+    private static volatile String reasoningFieldName = "reasoning_content";
+
+    /** 启动时快照首个推理字段名 · 见 {@link #reasoningFieldName}。 */
+    @jakarta.annotation.PostConstruct
+    void snapshotReasoningFieldName() {
+        String first = firstReasoningFieldName();
+        if (first != null && !first.isBlank()) {
+            reasoningFieldName = first;
+        }
+    }
+
+    /** 配置的首个推理字段名（{@code nexusai.openai-reasoning-field} 首项）；无配置 → null。 */
+    String firstReasoningFieldName() {
+        if (properties == null) {
+            return null;
+        }
+        java.util.Set<String> fields = properties.getOpenaiReasoningField();
+        if (fields == null || fields.isEmpty()) {
+            return null;
+        }
+        for (String f : fields) {
+            if (f != null && !f.isBlank()) {
+                return f;
+            }
+        }
+        return null;
+    }
+
     /** [W2-3] DB models.max_tokens 解析（前端可配）· required=false：无 Spring 上下文时静默回落（不发送 max_tokens）。 */
     @Autowired(required = false) private ModelMapper modelMapper;
     /** [W2-3] DB 提供商 mapper（max_tokens 全名感知解析用，可 null → 按 name 兼容路径）。 */
@@ -1672,6 +1708,17 @@ public class OpenAiSdkProvider implements LlmProvider {
                     if (!tcs.isEmpty()) {
                         b.toolCalls(tcs);
                     }
+                }
+                // [thinking-passthrough 2026-11-12] 推理内容回传 · 与 Anthropic 通道同策：
+                //   开了思考就把历史思考带回去（用户裁定：两个协议都要带完整思考）。
+                //   字段名取配置的首个推理字段（nexusai.openai-reasoning-field，默认 reasoning_content），
+                //   即上游自己回包用的那个名字。
+                //   ⚠️ 为什么这样不会把严格端点搞崩：只有 reasoning 非空才加字段，而 reasoning 非空
+                //   意味着「这个端点此前确实回过思考内容」⇒ 它认识该字段，回传不会被 "extra fields
+                //   not permitted" 拒。从没给过思考的端点（严格 OpenAI / 部分 vLLM）永远不加字段，
+                //   出站字节与改动前一致。DeepSeek /chat/completions 实测带与不带都 200。
+                if (m.reasoning() != null && !m.reasoning().isBlank()) {
+                    b.putAdditionalProperty(reasoningFieldName, JsonValue.from(m.reasoning()));
                 }
                 yield ChatCompletionMessageParam.ofAssistant(b.build());
             }

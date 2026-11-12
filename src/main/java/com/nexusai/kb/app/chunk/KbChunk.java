@@ -64,6 +64,18 @@ public record KbChunk(
     public static final String CHUNK_TYPE_PARENT_TEXT = "parent_text";
 
     /**
+     * 分块类型常量 · 图片描述子块（源侧 {@code types.ChunkTypeImageCaption}）。
+     *
+     * <p>图片理解（{@code KbImageEnrichService}）为每张图写一条独立子块，
+     * {@code parent_chunk_id} 指向该图所属正文块 —— 这样「图里写了什么」既能被检索，
+     * 又不会把 caption 混进正文块的正文里（正文的位置不变式不受影响）。
+     */
+    public static final String CHUNK_TYPE_IMAGE_CAPTION = "image_caption";
+
+    /** 分块类型常量 · 图内 OCR 子块（源侧 {@code types.ChunkTypeImageOCR}）。 */
+    public static final String CHUNK_TYPE_IMAGE_OCR = "image_ocr";
+
+    /**
      * 兼容构造器 · 不带图片、不带溯源（切分器与既有单测用）。
      *
      * <p>record 允许额外构造器委托给规范构造器；保留它可以让「切分」与「图片归属」

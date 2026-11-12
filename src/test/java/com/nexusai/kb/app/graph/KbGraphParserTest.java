@@ -120,6 +120,25 @@ class KbGraphParserTest {
         }
 
         @Test
+        @DisplayName("⭐⭐ 同一对端点多条关系 ⇒ 合并成一条、强度加权平均（对齐源侧 graph.go）")
+        void dedupesSameEdge() {
+            // 实测现场：模型对同一对实体给出多条不同 type 的关系，直插会撞
+            // uq_kb_graph_relation_doc_edge(knowledge_id, source_name, target_name) ⇒ 整批中断。
+            // 源侧 graph.go:272-303 的合并语义 = 保留首条的 type/description + 强度加权平均。
+            List<KbGraphParser.ExtractedRelation> out = KbGraphParser.parseRelations(
+                "[{\"source\":\"甲\",\"target\":\"乙\",\"type\":\"约定\",\"description\":\"弱\",\"strength\":5},"
+                + "{\"source\":\"甲\",\"target\":\"乙\",\"type\":\"依据\",\"description\":\"强\",\"strength\":9}]",
+                KNOWN);
+            assertThat(out).hasSize(1);
+            assertThat(out.get(0).strength()).as("(5*1+9)/2 = 7").isEqualTo(7);
+            assertThat(out.get(0).type()).as("保留首次出现的 type").isEqualTo("约定");
+            // 反向边不受影响（有向）
+            assertThat(KbGraphParser.parseRelations(
+                "[{\"source\":\"甲\",\"target\":\"乙\",\"strength\":8},"
+                + "{\"source\":\"乙\",\"target\":\"甲\",\"strength\":7}]", KNOWN)).hasSize(2);
+        }
+
+        @Test
         @DisplayName("⭐⭐ 端点不在实体列表 ⇒ 丢弃（否则变成悬空边）")
         void dropsDangling() {
             assertThat(KbGraphParser.parseRelations(

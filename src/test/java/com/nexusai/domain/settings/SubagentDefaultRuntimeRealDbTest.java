@@ -75,7 +75,7 @@ class SubagentDefaultRuntimeRealDbTest {
     private static SettingsDto dtoWithDefaultRuntime(String defaultRuntime) {
         return new SettingsDto(
             null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,

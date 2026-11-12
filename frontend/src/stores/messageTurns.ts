@@ -95,7 +95,7 @@ const NON_USER_TURN_SUBTYPES = new Set<string>([
  * 是极端罕见场景，且即便命中，效果只是「不把它当轮次起点」（仍会作为一行的内容显示），
  * 不会丢消息 —— 代价可接受。
  */
-const NOTIFICATION_CONTENT_PREFIXES: ReadonlyArray<string> = [
+export const NOTIFICATION_CONTENT_PREFIXES: ReadonlyArray<string> = [
   '<task-notification>',
   'A background agent completed a task:',
   '<subagent-result>',

@@ -32,6 +32,20 @@ export interface SessionArtifactDto {
    * ⛔ 不要当成任一种来画角标，那会伪造来源。可选是为兼容未升级的后端。
    */
   origin?: 'deliverables' | 'project-write' | null
+  /**
+   * 产出该产物的那一轮的用户提问原文（后端 join messages 带出 · 已压单行、截断 500 字）。
+   *
+   * <p><b>WHY 需要（2026-11-12）</b>：右侧栏「产物」tab 按对话分组的组头就是这句话。
+   * 前端消息窗口只保留最近 2 轮（{@code FOLD_DEFAULT_TURNS=2}）⇒ 更早轮次的产物在窗口里
+   * 找不到提问，全部落进「历史产物」组（真机：1 个产物组 + 历史产物 3 个）。
+   * 本字段由后端 join 出来 ⇒ 与前端加载了多少消息无关。
+   *
+   * <p>{@code null} / {@code undefined} = 该轮不是真人提问 / 老后端 / 查不到消息 ——
+   * 前端据此回落窗口映射，仍取不到则进「历史产物」组。可选是为兼容未升级的后端。
+   */
+  turnQuestion?: string | null
+  /** 上述提问消息的 created_at 原串；未知为 {@code null}。 */
+  turnCreatedAt?: string | null
   updatedAt: string | null
   /**
    * `localPath` 指向的是**目录**而不是文件（后端**读时判定**，不落库）。

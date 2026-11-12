@@ -15,10 +15,12 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 
 /**
  * anydoc 原生库（C ABI）的 JNA 绑定层 · 把 Office 文档转成结构化 Markdown。
@@ -117,12 +119,13 @@ final class AnydocNative {
     }
 
     /**
-     * anydoc C ABI（逐字对应 {@code include/anydoc.h} 的 4 个函数）。
+     * anydoc C ABI（本仓用到的子集）。
      *
-     * <p>只映射本仓用到的子集：{@code to_markdown} / {@code string_free} / {@code last_error} /
-     * {@code format_from_path}。其余导出（{@code to_markdown_bytes} / {@code to_document} /
-     * {@code buffer_free} …）本仓不用 —— 入库链拿到的永远是磁盘文件，{@code to_document} 出的二进制
-     * 文档模型也没有下游消费者。
+     * <p>映射：{@code to_markdown} / {@code string_free} / {@code last_error} / {@code format_from_path}
+     * + {@code to_document} / {@code buffer_free}。后者专门用于<b>抽内嵌图片</b>：Markdown 接口
+     * （含 {@code with_asset_links} 变体）只给文本/链接，图片字节只在文档模型缓冲区里
+     * （见 {@link #documentAssets(Path)}）。{@code to_markdown_bytes} 本仓仍不用 —— 入库链拿到的
+     * 永远是磁盘文件。
      *
      * <p>{@code uintptr_t} 在 64 位 JVM 上是 8 字节，故用 {@link LongByReference}（本仓 JDK 25 仅 64 位）。
      */
@@ -143,6 +146,19 @@ final class AnydocNative {
 
         /** 按路径扩展名判格式，把格式 tag 写入 {@code *out}（未识别写 {@code ANYDOC_FORMAT_NONE}）。 */
         int anydoc_format_from_path(String path, IntByReference out);
+
+        /**
+         * 文件<b>内容</b> → 文档模型缓冲区（二进制）。成功时 {@code *out_buf} 为堆分配缓冲、
+         * {@code *out_len} 为其字节长度，必须用 {@link #anydoc_buffer_free} 并按同一长度释放。
+         *
+         * <p>签名已用探针实测（2026-11-12）：{@code (const uint8_t *data, uintptr_t len, int32_t format,
+         * uint8_t **out_buf, uintptr_t *out_len)}。⛔ 不是路径入参 —— 传路径字符串会因「按 0 字节读」
+         * 而报 {@code MALFORMED=2}。
+         */
+        int anydoc_to_document(byte[] data, long len, int format, PointerByReference outBuf, LongByReference outLen);
+
+        /** 释放 {@link #anydoc_to_document} 返回的缓冲区（ptr 与 len 必须与返回时一致）。 */
+        void anydoc_buffer_free(Pointer buf, long len);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -239,6 +255,245 @@ final class AnydocNative {
             throw new AnydocException(rc, describeFailure(lib, rc));
         }
         return out.getValue();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 内嵌图片（文档模型）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 文档内嵌的一张图片 · 二进制与其在源容器里的原始路径。
+     *
+     * @param mimeType   anydoc 归一化后的 MIME（如 {@code image/png}）
+     * @param sourcePath 源容器内的路径（如 {@code word/media/image1.png}）；仅作诊断/扩展名兜底
+     * @param data       图片字节（已从原生缓冲区复制出来，脱离原生内存生命周期）
+     */
+    record EmbeddedAsset(String mimeType, String sourcePath, byte[] data) {
+    }
+
+    /**
+     * 单文档抽图时的输入上限。
+     *
+     * <p>{@link java.nio.file.Files#readAllBytes} 的堆数组 + JNA 传给原生的缓冲会同时占两份内存，
+     * 超大文档（入库上限 500MB）会直接把后端推到 OOM。超过本值只放弃抽图，<b>正文仍照常解析</b>。
+     */
+    static final long MAX_ASSET_SOURCE_BYTES = 256L * 1024 * 1024;
+
+    /** 单张图片字节上限（防畸形容器声明一个巨大长度）。 */
+    private static final int MAX_ASSET_BYTES = 64 * 1024 * 1024;
+
+    /** 单文档图片数量上限（防 zip 炸弹式的小图海量刷盘）。 */
+    private static final int MAX_ASSETS = 500;
+
+    /**
+     * anydoc 会归一到这批 MIME（见 DLL 里 {@code src/shared/assets.rs} 的图片类型表）。
+     *
+     * <p>只收图片：文档模型里还可能有字体等其它嵌入资源，落盘没有下游消费者。
+     */
+    private static final Set<String> IMAGE_MIMES = Set.of(
+        "image/png", "image/jpeg", "image/gif", "image/bmp", "image/webp",
+        "image/tiff", "image/svg+xml", "image/emf", "image/wmf"
+    );
+
+    /**
+     * 抽取文档内嵌图片。
+     *
+     * <p><b>实测的 API 事实（2026-11-12，随包 DLL 0.2.4）</b>：
+     * <ul>
+     *   <li>{@code anydoc_to_markdown_with_asset_links(data, len, format, out_str, out_len)}
+     *       <b>只返回 Markdown</b>（图片位置写成 {@code ![](images/image-N.ext)}），
+     *       <b>不返回也不落盘图片字节</b> —— 探针跑完输出目录为空。</li>
+     *   <li>字节在 {@code anydoc_to_document} 的文档模型缓冲区里：图片记录是连续三元组
+     *       {@code [u32 mimeLen][mime][u32 pathLen][path][u32 dataLen][data]}。
+     *       文档模型尾部没有 Markdown，故正文仍由 {@link #toMarkdown(Path)} 提供，两者互不影响。</li>
+     * </ul>
+     *
+     * <p>解析采用「按三元组特征扫描 + 文件头魔数校验」而不是全量反序列化文档模型：模型里的
+     * 其它块（段落/表格/样式）没有稳定文档，扫描只认 MIME 白名单 + 可打印路径 + 合法长度 +
+     * 图片魔数四重条件，误判概率可忽略；模型升级新增字段也不影响。
+     *
+     * @param file 源文件
+     * @return 图片列表（无图 / 模型里没有资产时为空；顺序与文档内出现顺序一致）
+     * @throws AnydocException 原生库不可用、文件超限、调用失败或返回错误码
+     */
+    static List<EmbeddedAsset> documentAssets(Path file) throws AnydocException {
+        AnydocLib lib = requireLibrary();
+        if (file == null) {
+            throw new AnydocException(-1, "anydoc 抽图失败：file 为 null");
+        }
+        long size;
+        try {
+            size = Files.size(file);
+        } catch (IOException e) {
+            throw new AnydocException(-1, "anydoc 抽图失败：无法读取文件大小 " + file + " — " + e.getMessage(), e);
+        }
+        if (size <= 0) {
+            return List.of();
+        }
+        if (size > MAX_ASSET_SOURCE_BYTES) {
+            throw new AnydocException(-1, "文件大小 " + size + " 超过抽图上限 " + MAX_ASSET_SOURCE_BYTES + " 字节");
+        }
+        byte[] bytes;
+        try {
+            bytes = Files.readAllBytes(file);
+        } catch (IOException e) {
+            throw new AnydocException(-1, "anydoc 抽图失败：读取文件失败 " + file + " — " + e.getMessage(), e);
+        }
+        PointerByReference outBuf = new PointerByReference();
+        LongByReference outLen = new LongByReference();
+        int rc;
+        try {
+            // format = ANYDOC_FORMAT_NONE(-1)：让原生层按内容自动探测（探针已验证 docx 走通）
+            rc = lib.anydoc_to_document(bytes, bytes.length, FORMAT_NONE, outBuf, outLen);
+        } catch (Throwable t) {
+            throw new AnydocException(-1, "anydoc_to_document 调用异常: " + t, t);
+        }
+        if (rc != 0) {
+            throw new AnydocException(rc, describeFailure(lib, rc));
+        }
+        Pointer buf = outBuf.getValue();
+        long len = outLen.getValue();
+        if (buf == null || len <= 0) {
+            return List.of();
+        }
+        try {
+            if (len > Integer.MAX_VALUE) {
+                throw new AnydocException(rc, "文档模型长度异常: " + len);
+            }
+            return parseEmbeddedAssets(buf.getByteArray(0, (int) len));
+        } finally {
+            freeBufferQuietly(lib, buf, len);
+        }
+    }
+
+    /** 扫描文档模型缓冲区里的图片三元组（见 {@link #documentAssets(Path)} 的 javadoc）。 */
+    private static List<EmbeddedAsset> parseEmbeddedAssets(byte[] model) {
+        List<EmbeddedAsset> assets = new ArrayList<>();
+        int i = 0;
+        while (i + 16 <= model.length && assets.size() < MAX_ASSETS) {
+            int mimeLen = readIntLE(model, i);
+            if (mimeLen < 8 || mimeLen > 32 || i + 4 + mimeLen > model.length) {
+                i++;
+                continue;
+            }
+            String mime = new String(model, i + 4, mimeLen, StandardCharsets.US_ASCII);
+            if (!IMAGE_MIMES.contains(mime)) {
+                i++;
+                continue;
+            }
+            int p = i + 4 + mimeLen;
+            if (p + 4 > model.length) {
+                break;
+            }
+            int pathLen = readIntLE(model, p);
+            if (pathLen < 1 || pathLen > 4096 || p + 4 + pathLen + 4 > model.length) {
+                i++;
+                continue;
+            }
+            String sourcePath = printableUtf8(model, p + 4, pathLen);
+            if (sourcePath == null) {
+                i++;
+                continue;
+            }
+            int q = p + 4 + pathLen;
+            long dataLen = readIntLE(model, q) & 0xFFFF_FFFFL;
+            int dataStart = q + 4;
+            if (dataLen <= 0 || dataLen > MAX_ASSET_BYTES || dataStart + dataLen > model.length) {
+                i++;
+                continue;
+            }
+            int n = (int) dataLen;
+            if (!looksLikeImage(mime, model, dataStart, n)) {
+                i++;
+                continue;
+            }
+            assets.add(new EmbeddedAsset(mime, sourcePath, Arrays.copyOfRange(model, dataStart, dataStart + n)));
+            i = dataStart + n;
+        }
+        return assets;
+    }
+
+    private static int readIntLE(byte[] b, int off) {
+        return (b[off] & 0xFF)
+            | ((b[off + 1] & 0xFF) << 8)
+            | ((b[off + 2] & 0xFF) << 16)
+            | ((b[off + 3] & 0xFF) << 24);
+    }
+
+    /** 严格 UTF-8 解码 + 拒绝控制字符（路径是给日志/扩展名兜底用的，不该含 NUL 等）。 */
+    private static String printableUtf8(byte[] b, int off, int len) {
+        byte[] slice = Arrays.copyOfRange(b, off, off + len);
+        try {
+            String s = StandardCharsets.UTF_8.newDecoder().decode(java.nio.ByteBuffer.wrap(slice)).toString();
+            for (int k = 0; k < s.length(); k++) {
+                if (s.charAt(k) < 0x20 || s.charAt(k) == 0x7F) {
+                    return null;
+                }
+            }
+            return s;
+        } catch (java.nio.charset.CharacterCodingException e) {
+            return null;
+        }
+    }
+
+    /**
+     * 文件头魔数校验 · 拦掉「MIME 串恰好出现在正文里」这类偶然命中。
+     *
+     * <p>SVG 是文本、WMF/EMF 有多个合法变体，按各自的最小特征判。
+     */
+    private static boolean looksLikeImage(String mime, byte[] b, int off, int len) {
+        switch (mime) {
+            case "image/png":
+                return len >= 8 && (b[off] & 0xFF) == 0x89 && b[off + 1] == 0x50 && b[off + 2] == 0x4E
+                    && b[off + 3] == 0x47 && b[off + 4] == 0x0D && b[off + 5] == 0x0A
+                    && b[off + 6] == 0x1A && b[off + 7] == 0x0A;
+            case "image/jpeg":
+                return len >= 3 && (b[off] & 0xFF) == 0xFF && (b[off + 1] & 0xFF) == 0xD8
+                    && (b[off + 2] & 0xFF) == 0xFF;
+            case "image/gif":
+                return len >= 6 && b[off] == 'G' && b[off + 1] == 'I' && b[off + 2] == 'F' && b[off + 3] == '8';
+            case "image/bmp":
+                return len >= 2 && b[off] == 'B' && b[off + 1] == 'M';
+            case "image/webp":
+                return len >= 12 && b[off] == 'R' && b[off + 1] == 'I' && b[off + 2] == 'F'
+                    && b[off + 3] == 'F' && b[off + 8] == 'W' && b[off + 9] == 'E'
+                    && b[off + 10] == 'B' && b[off + 11] == 'P';
+            case "image/tiff":
+                return len >= 4 && ((b[off] == 'I' && b[off + 1] == 'I' && b[off + 2] == 0x2A && b[off + 3] == 0)
+                    || (b[off] == 'M' && b[off + 1] == 'M' && b[off + 2] == 0 && b[off + 3] == 0x2A));
+            case "image/svg+xml": {
+                // 允许前导空白 / UTF-8 BOM（部分导出器会带），第一个非空字符必须是 '<'
+                int max = Math.min(len, 32);
+                for (int k = 0; k < max; k++) {
+                    int c = b[off + k] & 0xFF;
+                    if (c == '<') {
+                        return true;
+                    }
+                    if (c != ' ' && c != '\t' && c != '\r' && c != '\n' && c != 0xEF && c != 0xBB && c != 0xBF) {
+                        return false;
+                    }
+                }
+                return false;
+            }
+            case "image/emf":
+                return len >= 4 && b[off] == 1 && b[off + 1] == 0 && b[off + 2] == 0 && b[off + 3] == 0;
+            case "image/wmf":
+                return len >= 4 && ((b[off] & 0xFF) == 0xD7 && (b[off + 1] & 0xFF) == 0xCD
+                    && (b[off + 2] & 0xFF) == 0xC6 && (b[off + 3] & 0xFF) == 0x9A
+                    || b[off] == 0x01 && b[off + 1] == 0 && b[off + 2] == 0x09 && b[off + 3] == 0
+                    || b[off] == 0x02 && b[off + 1] == 0 && b[off + 2] == 0x09 && b[off + 3] == 0);
+            default:
+                return false;
+        }
+    }
+
+    /** 释放文档模型缓冲区 · 释放失败不覆盖原始结果。 */
+    private static void freeBufferQuietly(AnydocLib lib, Pointer p, long len) {
+        try {
+            lib.anydoc_buffer_free(p, len);
+        } catch (Throwable t) {
+            log.warn("AnydocNative: anydoc_buffer_free 失败（原生内存未释放）原因={}", t.toString());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

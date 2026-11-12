@@ -54,7 +54,8 @@ public class KbDataAnalysisStage {
     /** 规划温度（源侧 {@code Temperature: 0.1}）。 */
     private static final double TEMPERATURE = 0.1;
 
-    private static final int MAX_TOKENS = 1000;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(1000)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
 
     /** 规划尝试次数（源侧 {@code maxAttempts = 2}：初次 + 一次修复）。 */
     static final int MAX_ATTEMPTS = 2;
@@ -231,7 +232,7 @@ public class KbDataAnalysisStage {
                 new LlmProvider.ChatRequestOptions(
                     null, null, null,
                     LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-                    TEMPERATURE, "qa_data_analysis_plan", null, MAX_TOKENS, null, null,
+                    TEMPERATURE, "qa_data_analysis_plan", null, null, null, null,
                     null, null, null, null, null, null),
                 LlmSideCallClient.SideCallUsage.standalone(
                     UsageCategory.SIDE_CALL, "qa_data_analysis_plan"));

@@ -64,7 +64,8 @@ public class KbAutoTagService {
     /** 置信度下限（源侧 {@code minimumAutoTagConfidence = 0.75}）。 */
     static final double MIN_CONFIDENCE = 0.75;
 
-    private static final int MAX_TOKENS = 1024;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(1024)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
     private static final double TEMPERATURE = 0.1;
 
     private final KbKnowledgeMapper knowledgeMapper;
@@ -185,7 +186,7 @@ public class KbAutoTagService {
                 provider, modelId,
                 KbPostProcessPrompts.autoTagSystem(maxTags),
                 KbPostProcessPrompts.autoTagUser(names, content),
-                options(TEMPERATURE, MAX_TOKENS, "document_auto_tag"),
+                options(TEMPERATURE, "document_auto_tag"),
                 LlmSideCallClient.SideCallUsage.standalone(
                     UsageCategory.SIDE_CALL, "document_auto_tag"));
             matches = parseMatches(raw);
@@ -396,12 +397,12 @@ public class KbAutoTagService {
     }
 
     private static LlmProvider.ChatRequestOptions options(
-        double temperature, int maxTokens, String label
+        double temperature, String label
     ) {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-            temperature, label, null, maxTokens, null, null,
+            temperature, label, null, null, null, null,
             null, null, null, null, null, null);
     }
 }

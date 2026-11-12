@@ -1,106 +1,1731 @@
-/* ⚠️ 自动生成，勿手改。
-   来源：deliverables/kb-design/assets/weknora-bundle.css
-   生成：deliverables/kb-design/scripts/extract_page_css.py
-   改了源站样式要重跑脚本，不要在本文件里手改。 */
+/* 处理 Trace（阶段时间线）组件样式 —— 手动移植。
+   来源：D:/tmp/WeKnora/frontend/src/components/knowledge-processing-timeline.vue
+        的 <style scoped lang="less"> 段（原文件行 2069-3791）。
+   移植方式：less 嵌套已展开为扁平 CSS，每个选择器统一加 `.kb-scope ` 前缀；
+            源站 Vue 的 scoped 穿透写法（deep 选择器）已去壳，保留为
+            `.kb-scope .kp-icon-btn-spin .t-icon` 这种普通后代选择器形态；
+            `@keyframes` 与 CSS 变量（--kp-grid-step / --kp-offset-position）原样保留。
+   这是【手动移植】，不是脚本生成 —— 改样式请对照上面那段源站原文，
+   不要凭本文件反推设计（曾经就是因为照设计稿自造类名，导致 .kp-dot 状态点全落灰）。 */
 
-/* 12-处理Trace.html 专属组件样式（bundle 0 条 + 内联 54 条） */
-.kb-scope .kp-drawer-wrap{ position: fixed; inset: 0; z-index: 130; display: flex; justify-content: flex-end; }
-.kb-scope .kp-secondary-drawer{
-    width: 820px; min-width: 820px; height: 100%; background: #fff;
-    display: flex; flex-direction: column;
-    box-shadow: -6px 0 24px rgba(0,0,0,.12);
+.kb-scope .kp-timeline {
+  font-family: var(--app-font-family);
+  font-size: var(--app-text-md);
+  color: var(--td-text-color-primary);
+  width: 100%;
+  height: 100%;
+  /* Defensive: never let waterfall rows / detail panel push past the
+     drawer's visible bounds even if the host width is unexpectedly
+     narrow. The horizontal scroll inside .kp-body handles legit cases
+     where labels are long. */
+  overflow: hidden;
+}
+
+.kb-scope .kp-shell {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  width: 100%;
+  min-height: 0;
+  min-width: 0;
+  background: var(--td-bg-color-container);
+  overflow: hidden;
+}
+
+/* ============== HEADER ============== */
+.kb-scope .kp-head {
+  flex: 0 0 auto;
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--td-component-stroke);
+  background: var(--td-bg-color-container);
+}
+
+.kb-scope .kp-head-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kb-scope .kp-head-titles {
+  flex: 1;
+  min-width: 0;
+}
+
+/* The panel's own name. It used to be the first crumb of the grey meta
+  sentence below the title, where it read as just another fact about the
+  document rather than as the label for the view you are looking at. */
+.kb-scope .kp-head-overline {
+  margin-bottom: 3px;
+  font-size: var(--app-text-2xs);
+  font-weight: 600;
+  letter-spacing: 0.08em;
+  line-height: 1.2;
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-head-title-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+/* Natural width, so the status tag sits against the filename instead of
+  being pushed across the header to sit among the toolbar buttons. */
+.kb-scope .kp-head-doc-title {
+  flex: 0 1 auto;
+  min-width: 0;
+  margin: 0;
+  font-size: var(--app-text-xl);
+  font-weight: 600;
+  line-height: 1.3;
+  color: var(--td-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-scope .kp-head-status-tag {
+  flex-shrink: 0;
+}
+
+/* LIVE badge — sits next to the title while polling, telegraphs the
+  pipeline is actively refreshing. Pulsing dot + uppercase mono label. */
+.kb-scope .kp-live-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 8px;
+  border-radius: var(--td-radius-medium);
+  background: var(--td-warning-color-light);
+  color: var(--td-warning-color);
+  font-size: var(--app-text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  line-height: 1;
+}
+
+.kb-scope .kp-live-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--td-warning-color);
+  animation: kpLivePulse 1.4s ease-in-out infinite;
+}
+
+.kb-scope .kp-live-text {
+  font-family: var(--app-font-family-mono);
+}
+
+@keyframes kpLivePulse {
+
+  0%,
+  100% {
+    opacity: 1;
+    transform: scale(1);
   }
-.kb-scope .kp-drawer-shell{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.kb-scope .kp-timeline{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.kb-scope .kp-shell{ flex: 1; min-height: 0; display: flex; flex-direction: column; }
-.kb-scope .kp-head{ flex: none; padding: 14px 18px 0; border-bottom: 1px solid var(--td-component-stroke); }
-.kb-scope .kp-head-toolbar{ display: flex; align-items: flex-start; gap: 10px; }
-.kb-scope .kp-title-block{ flex: 1; min-width: 0; }
-.kb-scope .kp-eyebrow{ font-size: 12px; color: var(--td-text-color-placeholder); margin-bottom: 4px; }
-.kb-scope .kp-title{ display: flex; align-items: center; gap: 8px; font-size: 15px; font-weight: 600; color: var(--td-text-color-primary); }
-.kb-scope .kp-title span.name{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kb-scope .kp-done-badge{
-    flex: none; font-size: 11px; font-weight: 500;
-    color: #2ba471; background: #e8f7ef; border-radius: 3px; padding: 1px 6px;
+
+  50% {
+    opacity: 0.45;
+    transform: scale(0.8);
   }
-.kb-scope .kp-head-actions{ display: flex; align-items: center; gap: 2px; flex: none; }
-.kb-scope .kp-iconbtn{
-    width: 26px; height: 26px; border: 0; border-radius: var(--app-radius-sm);
-    background: transparent; color: var(--td-text-color-secondary); font-size: 12px; cursor: pointer;
+}
+
+.kb-scope .kp-head-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  flex-shrink: 0;
+  margin-left: auto;
+}
+
+/* Label/value pairs in place of the old dot-joined run-on sentence.
+  Values are tabular mono so successive polls don't jiggle the row. */
+.kb-scope .kp-stat-strip {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 18px;
+  margin-top: 9px;
+}
+
+.kb-scope .kp-stat {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 5px;
+  min-width: 0;
+}
+
+.kb-scope .kp-stat-label {
+  font-size: var(--app-text-xs);
+  color: var(--td-text-color-placeholder);
+  white-space: nowrap;
+}
+
+.kb-scope .kp-stat-value {
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-sm);
+  font-weight: 600;
+  color: var(--td-text-color-secondary);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Prose values (task counts, "just now") read badly in tabular mono. */
+.kb-scope .kp-stat-value-text {
+  font-family: var(--app-font-family);
+  font-weight: 500;
+}
+
+.kb-scope .kp-stat-note {
+  color: var(--td-warning-color);
+}
+
+.kb-scope .kp-icon-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: transparent;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+  border-radius: var(--td-radius-default);
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-icon-btn:hover:not(:disabled) {
+  background: var(--td-bg-color-secondarycontainer);
+  color: var(--td-text-color-primary);
+}
+
+.kb-scope .kp-icon-btn:disabled {
+  cursor: not-allowed;
+  opacity: 0.4;
+}
+
+/* Stop-parse control — stays a quiet placeholder icon until hover, then
+  reveals its destructive intent with the error tint. Matches the other
+  header icon buttons rather than shouting with a full outline button. */
+.kb-scope .kp-icon-btn-danger:hover:not(:disabled) {
+  background: var(--td-error-color-light);
+  color: var(--td-error-color);
+}
+
+.kb-scope .kp-icon-btn-spin .t-icon {
+  animation: wk-spin 0.9s linear infinite;
+}
+
+/* Slow rotation while auto-polling — visually distinct from the
+  manual-refresh fast spin. Tells the user "refresh is happening on
+  its own" without an extra label or badge. */
+.kb-scope .kp-icon-btn-autoflow .t-icon {
+  animation: wk-spin 4s linear infinite;
+  color: var(--td-warning-color);
+}
+
+.kb-scope .kp-meta-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 12px;
+  height: 12px;
+  font-size: var(--app-text-xs);
+  line-height: 1;
+}
+
+.kb-scope .kp-glyph-done {
+  color: var(--td-success-color);
+}
+
+.kb-scope .kp-glyph-failed {
+  color: var(--td-error-color);
+}
+
+.kb-scope .kp-glyph-running {
+  color: var(--td-warning-color);
+  animation: kpLivePulse 1.4s ease-in-out infinite;
+}
+
+.kb-scope .kp-glyph-unknown {
+  color: var(--td-text-color-placeholder);
+}
+
+/* Attempts strip */
+.kb-scope .kp-attempts {
+  display: flex;
+  gap: 6px;
+  margin-top: 10px;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.kb-scope .kp-attempt {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 4px 10px;
+  border: 1px solid var(--td-component-border);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-sm);
+  line-height: 1.4;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background var(--app-motion-fast) ease, border-color var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-attempt:not(.kp-attempt-active):hover {
+  background: var(--td-bg-color-secondarycontainer);
+  border-color: var(--td-text-color-placeholder);
+  color: var(--td-text-color-primary);
+}
+
+.kb-scope .kp-attempt-active {
+  background: var(--td-brand-color);
+  color: var(--td-text-color-anti);
+  border-color: var(--td-brand-color);
+}
+
+.kb-scope .kp-attempt-active:hover {
+  background: var(--td-brand-color);
+  color: var(--td-text-color-anti);
+  border-color: var(--td-brand-color);
+}
+
+.kb-scope .kp-attempt-active .kp-attempt-glyph,
+.kb-scope .kp-attempt-active:hover .kp-attempt-glyph {
+  color: var(--td-text-color-anti) !important;
+}
+
+.kb-scope .kp-attempt-num {
+  font-weight: 600;
+  font-size: var(--app-text-xs);
+}
+
+.kb-scope .kp-attempt-glyph {
+  font-size: 9px;
+  line-height: 1;
+}
+
+/* ============== BODY (Waterfall) ============== */
+.kb-scope .kp-body {
+  flex: 1 1 auto;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  background: var(--td-bg-color-container);
+}
+
+/* Sized by its rows once the detail panel is open — see .kp-detail. */
+.kb-scope .kp-body-with-detail {
+  flex: 0 0 auto;
+  max-height: 60%;
+}
+
+.kb-scope .kp-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: auto;
+  padding-bottom: 16px;
+}
+
+.kb-scope .kp-state {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  flex: 1 1 auto;
+  padding: 56px 20px;
+  font-size: var(--app-text-md);
+  color: var(--td-text-color-placeholder);
+}
+
+/* Ruler — pinned above .kp-scroll, not inside the scroller */
+.kb-scope .kp-ruler {
+  flex: 0 0 auto;
+  display: grid;
+  grid-template-columns: minmax(210px, 32%) 76px 1fr;
+  height: 24px;
+  align-items: end;
+  padding: 10px 20px 6px;
+  background: var(--td-bg-color-container);
+  border-bottom: 1px dashed var(--td-component-stroke);
+  box-shadow: 0 4px 8px -6px rgba(0, 0, 0, 0.12);
+}
+
+.kb-scope .kp-ruler-spacer-name,
+.kb-scope .kp-ruler-spacer-meta {
+  height: 100%;
+}
+
+.kb-scope .kp-ruler-track {
+  position: relative;
+  height: 100%;
+  margin-right: 16px;
+}
+
+.kb-scope .kp-tick {
+  position: absolute;
+  bottom: 0;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  transform: translateX(-50%);
+  font-size: var(--app-text-2xs);
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-tick-first {
+  transform: translateX(0);
+  align-items: flex-start;
+}
+
+.kb-scope .kp-tick-last {
+  transform: translateX(-100%);
+  align-items: flex-end;
+}
+
+.kb-scope .kp-tick-line {
+  width: 1px;
+  height: 5px;
+  background: var(--td-component-border);
+}
+
+.kb-scope .kp-tick-label {
+  margin-top: 2px;
+  font-size: var(--app-text-2xs);
+  letter-spacing: 0.02em;
+}
+
+/* Rows */
+.kb-scope .kp-rows {
+  display: flex;
+  flex-direction: column;
+}
+
+.kb-scope .kp-row {
+  display: grid;
+  grid-template-columns: minmax(210px, 32%) 76px 1fr;
+  align-items: center;
+  height: 34px;
+  cursor: pointer;
+  position: relative;
+  padding: 0 20px;
+  transition: background var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-row::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 4px;
+  bottom: 4px;
+  width: 2px;
+  background: transparent;
+  border-radius: 0 2px 2px 0;
+  transition: background var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-row:hover {
+  background: var(--td-bg-color-secondarycontainer);
+}
+
+.kb-scope .kp-row-active {
+  background: var(--td-bg-color-secondarycontainer);
+}
+
+.kb-scope .kp-row-active::before {
+  background: var(--td-brand-color);
+}
+
+/* v1 painted three near-identical tints (root / stage / subspan) that
+  read as banding artifacts rather than as hierarchy, and fought the
+  hover tint on top of them. Depth is carried by the indent guides in
+  the name cell; background is reserved for hover and selection. */
+.kb-scope .kp-row-root {
+  font-weight: 600;
+  border-bottom: 1px solid var(--td-component-stroke);
+}
+
+/* Stages that never ran because an upstream stage failed. */
+.kb-scope .kp-row-inert {
+  opacity: 0.45;
+}
+
+.kb-scope .kp-row-expandable:hover .kp-tree-toggle {
+  color: var(--td-text-color-primary);
+  background: var(--td-bg-color-container-hover);
+}
+
+/* Name cell */
+.kb-scope .kp-cell-name {
+  min-width: 0;
+}
+
+.kb-scope .kp-name-inner {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  height: 100%;
+}
+
+/* One hairline per depth level, replacing v1's blind left padding. It
+  costs the same horizontal space but actually shows which parent a
+  nested subspan belongs to. */
+.kb-scope .kp-name-guide {
+  width: 1px;
+  align-self: stretch;
+  flex-shrink: 0;
+  margin-right: 8px;
+  background: var(--td-component-stroke);
+}
+
+.kb-scope .kp-tree-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  background: transparent;
+  padding: 0;
+  cursor: pointer;
+  color: var(--td-text-color-placeholder);
+  width: 22px;
+  height: 22px;
+  margin: -3px 0;
+  transition: color var(--app-motion-instant) ease, background var(--app-motion-fast) ease;
+  flex-shrink: 0;
+  border-radius: var(--td-radius-default);
+}
+
+.kb-scope .kp-tree-toggle:hover {
+  color: var(--td-text-color-primary);
+  background: var(--td-bg-color-container-hover);
+}
+
+.kb-scope .kp-tree-toggle-spacer {
+  width: 22px;
+  height: 22px;
+  display: inline-block;
+  flex-shrink: 0;
+  margin: -3px 0;
+}
+
+.kb-scope .kp-status-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  background: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-name-text {
+  font-size: var(--app-text-sm);
+  color: var(--td-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-scope .kp-name-mono {
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-xs);
+}
+
+.kb-scope .kp-name-root {
+  font-weight: 600;
+  font-size: var(--app-text-md);
+}
+
+/* Only rendered for `generation` spans now. v1 pushed a ROOT / STAGE /
+  SPAN label to the far right of the name column with margin-left:auto,
+  which opened a wide empty gap in every single row. */
+.kb-scope .kp-name-kind {
+  flex-shrink: 0;
+  margin-left: 6px;
+  padding: 1px 4px;
+  border-radius: var(--td-radius-small);
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-2xs);
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  color: var(--td-text-color-secondary);
+  background: var(--td-bg-color-component);
+}
+
+/* Duration cell */
+.kb-scope .kp-cell-dur {
+  font-size: var(--app-text-xs);
+  color: var(--td-text-color-secondary);
+  text-align: right;
+  padding-right: 14px;
+  letter-spacing: 0.02em;
+  font-variant-numeric: tabular-nums;
+}
+
+/* "Never ran" beats an em dash the reader has to decode. */
+.kb-scope .kp-dur-inert {
+  font-family: var(--app-font-family);
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-running-time {
+  color: var(--td-warning-color);
+  font-weight: 600;
+}
+
+/* Bar cell */
+.kb-scope .kp-cell-bar {
+  position: relative;
+  height: 34px;
+  margin-right: 16px;
+  /* Gridlines on every ruler tick. An 8px bar floating in 600px of
+     white cannot be read against an axis that only exists at the top of
+     a scrolling list; --kp-grid-step is set from the axis step. */
+  background-image: repeating-linear-gradient(to right,
+      var(--td-component-stroke) 0 1px,
+      transparent 1px var(--kp-grid-step, 25%));
+  border-right: 1px solid var(--td-component-stroke);
+}
+
+/* No ruler (sub-50ms trace) means no axis for the gridlines to line up
+  with, so they would just be decoration. */
+.kb-scope .kp-rows-gridless .kp-cell-bar {
+  background-image: none;
+  border-right: none;
+}
+
+/* Vertical "now" cursor — animates left during polling so the user can
+  visually confirm time is advancing even when the running bar grows
+  slowly toward the right edge of the trace. */
+.kb-scope .kp-now-marker {
+  position: absolute;
+  top: 4px;
+  bottom: 4px;
+  width: 1px;
+  background: var(--td-warning-color);
+  opacity: 0.65;
+  z-index: 1;
+  pointer-events: none;
+  transition: left 1s linear;
+}
+
+.kb-scope .kp-now-marker::before {
+  content: "";
+  position: absolute;
+  top: -2px;
+  left: -3px;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--td-warning-color);
+  animation: kpLivePulse 1.4s ease-in-out infinite;
+}
+
+.kb-scope .kp-bar {
+  position: absolute;
+  top: 13px;
+  height: 8px;
+  border-radius: var(--td-radius-small);
+  background: var(--td-text-color-placeholder);
+  min-width: 2px;
+  /* Smooth left/width changes so polling-driven re-renders feel like
+     the bar is growing, not jumping. The 1s easing matches the nowTick
+     1Hz cadence. */
+  transition: left 800ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    width 800ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    filter 150ms ease;
+  z-index: 2;
+}
+
+.kb-scope .kp-row:hover .kp-bar {
+  filter: brightness(1.05);
+}
+
+.kb-scope .kp-bar-tip {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  left: 50%;
+  transform: translateX(-50%);
+  background: var(--td-text-color-primary);
+  color: var(--td-text-color-anti);
+  font-size: var(--app-text-xs);
+  padding: 4px 8px;
+  border-radius: var(--td-radius-default);
+  white-space: nowrap;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity var(--app-motion-fast) ease;
+  z-index: 10;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.kb-scope .kp-bar-tip-name {
+  font-weight: 500;
+}
+
+.kb-scope .kp-bar-tip-sep {
+  color: var(--td-font-white-3);
+}
+
+.kb-scope .kp-bar:hover .kp-bar-tip {
+  opacity: 1;
+}
+
+/* ROOT row is the first row under the fixed ruler. The default
+  `bottom: calc(100% + 8px)` tooltip placement can clip against the
+  ruler band, so flip tooltips below the bar for the root row. */
+.kb-scope .kp-row-root .kp-bar-tip {
+  bottom: auto;
+  top: calc(100% + 8px);
+}
+
+/* Status palette — NOT all green. The project brand color happens
+  to be green, which made done/running visually identical (both
+  solid green). Done stays green (universal "success" semantic);
+  running goes amber + striped (CI-style "in progress" — recognized
+  everywhere from GitHub Actions to Jenkins). The two are now
+  unmistakably different at a glance. */
+.kb-scope .kp-bar-done {
+  background: var(--td-success-color);
+}
+
+.kb-scope .kp-bar-failed {
+  background: var(--td-error-color);
+}
+
+.kb-scope .kp-bar-cancelled {
+  background: transparent;
+  border: 1px dashed var(--td-error-color);
+  height: 6px;
+  top: 13px;
+}
+
+.kb-scope .kp-bar-skipped {
+  background: var(--td-text-color-placeholder);
+  opacity: 0.4;
+}
+
+.kb-scope .kp-bar-pending {
+  display: none;
+}
+
+.kb-scope .kp-bar-running {
+  /* Muted amber base. The diagonal stripes do the "in flight"
+     signaling — the tone just supplies a subtle hint. Earlier
+     iteration used full --td-warning-color + halo shadow + hard
+     white stripes; users found that visually screaming. */
+  background-color: var(--td-warning-color-3);
+  background-image: linear-gradient(135deg,
+      rgba(255, 255, 255, 0.22) 25%,
+      transparent 25%,
+      transparent 50%,
+      rgba(255, 255, 255, 0.22) 50%,
+      rgba(255, 255, 255, 0.22) 75%,
+      transparent 75%,
+      transparent);
+  background-size: 14px 14px;
+  animation: kpStripes 1.6s linear infinite;
+}
+
+@keyframes kpStripes {
+  to {
+    background-position: 14px 0;
   }
-.kb-scope .kp-iconbtn:hover{ background: var(--td-bg-color-container-hover); color: var(--td-text-color-primary); }
-.kb-scope .kp-stat-strip{
-    display: flex; align-items: center; gap: 18px; flex-wrap: wrap;
-    padding: 8px 0 12px; font-size: 12px; color: var(--td-text-color-secondary);
+}
+
+/* Wrapping outline bar — shows the full window from this span's start
+  to the latest descendant end. Used when async children extend past
+  the parent's own finished_at (e.g. postprocess stage closes fast but
+  its summary/question subspans run for a long time). */
+.kb-scope .kp-bar-wrap {
+  position: absolute;
+  top: 9px;
+  height: 14px;
+  border: 1px dashed var(--td-component-border);
+  border-radius: var(--td-radius-small);
+  background: transparent;
+  min-width: 4px;
+  z-index: 1;
+  pointer-events: auto;
+  transition: left 800ms cubic-bezier(0.2, 0.8, 0.2, 1),
+    width 800ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.kb-scope .kp-bar-wrap:hover {
+  border-color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-bar-wrap:hover .kp-bar-tip {
+  opacity: 1;
+}
+
+.kb-scope .kp-bar-wrap-done {
+  border-color: color-mix(in srgb, var(--td-brand-color) 35%, transparent);
+}
+
+.kb-scope .kp-bar-wrap-failed {
+  border-color: rgba(229, 87, 64, 0.5);
+}
+
+.kb-scope .kp-bar-wrap-running {
+  border-color: rgba(250, 157, 59, 0.5);
+}
+
+.kb-scope .kp-bar-wrap-cancelled {
+  border-color: rgba(229, 87, 64, 0.3);
+}
+
+/* Indeterminate sweep on the running bar — gives obvious motion while
+  waiting for the next poll. */
+.kb-scope .kp-bar-running-anim {
+  position: relative;
+  overflow: hidden;
+}
+
+.kb-scope .kp-bar-running-anim::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(90deg,
+      transparent 0%,
+      rgba(255, 255, 255, 0.5) 50%,
+      transparent 100%);
+  animation: kpSweep 1.6s linear infinite;
+}
+
+.kb-scope .kp-bar-placeholder {
+  right: 4px;
+  top: 13px;
+  height: 6px;
+  width: 14px;
+  background: transparent;
+  border: 1px dashed var(--td-component-border);
+  border-radius: var(--td-radius-small);
+  position: absolute;
+}
+
+.kb-scope .kp-bar-offset {
+  position: absolute;
+  bottom: 0;
+  /* Keep the offset centered on its start time where space allows, then
+     clamp the label inside the chart instead of letting it cover duration. */
+  left: clamp(0px, calc(var(--kp-offset-position) - 45px), max(0px, calc(100% - 90px)));
+  width: min(90px, 100%);
+  line-height: 11px;
+  font-size: 9px;
+  text-align: center;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--td-text-color-placeholder);
+  white-space: nowrap;
+  opacity: 0;
+  transition: opacity var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-row:hover .kp-bar-offset,
+.kb-scope .kp-row-active .kp-bar-offset {
+  opacity: 1;
+}
+
+@keyframes kpSweep {
+  0% {
+    transform: translateX(-100%);
   }
-.kb-scope .kp-stat b{ color: var(--td-text-color-primary); font-weight: 600; }
-.kb-scope .kp-stat.is-warn b{ color: #d54941; }
-.kb-scope .kp-stat.is-ok b{ color: #2ba471; }
-.kb-scope .kp-attempts{ display: flex; align-items: center; gap: 6px; padding: 0 0 12px; flex-wrap: wrap; }
-.kb-scope .kp-attempt{
-    height: 26px; padding: 0 10px; border: 1px solid var(--td-component-stroke);
-    border-radius: var(--app-radius-sm); background: #fff;
-    font: inherit; font-size: 12px; color: var(--td-text-color-secondary); cursor: pointer;
+
+  100% {
+    transform: translateX(100%);
   }
-.kb-scope .kp-attempt:hover{ border-color: var(--td-brand-color); color: var(--td-brand-color); }
-.kb-scope .kp-attempt.is-active{ background: var(--td-brand-color); border-color: var(--td-brand-color); color: #fff; }
-.kb-scope .kp-body{ flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
-.kb-scope .kp-ruler{
-    flex: none; height: 26px; display: flex; align-items: center;
-    margin-left: 268px; padding-right: 14px;
-    font-size: 11px; color: var(--td-text-color-placeholder);
-    border-bottom: 1px solid #f2f2f2;
+}
+
+/* Status dots (shared with compact mode) */
+.kb-scope .kp-dot-done {
+  background: var(--td-success-color);
+}
+
+.kb-scope .kp-dot-running {
+  background: var(--td-warning-color);
+  animation: kpLivePulse 1.4s ease-in-out infinite;
+}
+
+.kb-scope .kp-dot-failed {
+  background: var(--td-error-color);
+}
+
+.kb-scope .kp-dot-cancelled {
+  background: transparent;
+  border: 1px dashed var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-dot-skipped {
+  background: var(--td-text-color-placeholder);
+  opacity: 0.4;
+}
+
+.kb-scope .kp-dot-pending {
+  background: transparent;
+  border: 1px solid var(--td-component-border);
+}
+
+.kb-scope .kp-dot-placeholder {
+  background: transparent;
+  border: 1px dashed var(--td-component-border);
+}
+
+.kb-scope .kp-dot-completed {
+  background: var(--td-success-color);
+}
+
+.kb-scope .kp-dot-processing {
+  background: var(--td-warning-color);
+  animation: kpLivePulse 1.4s ease-in-out infinite;
+}
+
+.kb-scope .kp-dot-unknown {
+  background: var(--td-text-color-placeholder);
+}
+
+/* ============== LAST ERROR ==============
+  Pinned in the header so long trace trees don't bury it.
+
+  v1 stacked this the wrong way up: the headline was the error code, a
+  solid red pill repeated that same code on the right, the generic
+  "check the logs" filler sat in the middle at body size, and the one
+  line that actually explains the failure — the backend's message —
+  was last, smallest and greyest. v2 leads with the message, states the
+  code once quietly, and puts the recovery action in the card. */
+.kb-scope .kp-last-error {
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--td-error-color-light);
+  border: 1px solid var(--td-error-color-3);
+  border-left: 3px solid var(--td-error-color);
+  border-radius: var(--td-radius-medium);
+}
+
+.kb-scope .kp-err-top {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kb-scope .kp-err-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  background: var(--td-error-color);
+  color: var(--td-text-color-anti);
+  border-radius: 50%;
+  font-size: var(--app-text-xs);
+  font-weight: 700;
+  line-height: 1;
+  flex-shrink: 0;
+}
+
+/* Says WHERE it broke ("文档解析阶段失败"), which the raw code never did.
+  Deliberately NOT --td-error-color: that tone lands around 3:1 against
+  the card's own error tint in both themes. The red bar, glyph and
+  border already say "error"; the words just have to be readable. */
+.kb-scope .kp-err-where {
+  font-size: var(--app-text-sm);
+  font-weight: 600;
+  color: var(--td-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.kb-scope .kp-err-code {
+  margin-left: auto;
+  flex-shrink: 0;
+  padding: 2px 6px;
+  border-radius: var(--td-radius-small);
+  font-size: var(--app-text-2xs);
+  color: var(--td-error-color-7);
+  background: color-mix(in srgb, var(--td-error-color) 12%, transparent);
+  white-space: nowrap;
+}
+
+.kb-scope .kp-err-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  flex-shrink: 0;
+  border: none;
+  background: transparent;
+  color: var(--td-error-color);
+  opacity: 0.7;
+  border-radius: var(--td-radius-default);
+  cursor: pointer;
+  transition: opacity var(--app-motion-fast) ease, background var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-err-copy:hover {
+  opacity: 1;
+  background: color-mix(in srgb, var(--td-error-color) 12%, transparent);
+}
+
+/* The actual diagnostic, promoted from 11px grey to the card's primary
+  line. Stays mono because it is verbatim backend output, and stays
+  selectable because people paste it into bug reports. */
+.kb-scope .kp-err-message {
+  margin-top: 7px;
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-md);
+  line-height: 1.5;
+  color: var(--td-text-color-primary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+}
+
+.kb-scope .kp-err-hint {
+  margin-top: 5px;
+  font-size: var(--app-text-sm);
+  line-height: 1.5;
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-err-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+/* Recovery, not destruction — hence the outline rather than a solid
+  danger fill. It also replaces v1's brand-green outline button, which
+  sat in the toolbar glowing green against a red failure. */
+.kb-scope .kp-err-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--td-error-color);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+  color: var(--td-error-color-7);
+  font-size: var(--app-text-sm);
+  cursor: pointer;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-err-btn:hover {
+  background: var(--td-error-color);
+  color: var(--td-text-color-anti);
+}
+
+/* Same card shape as .kp-last-error in the warning tone: the run may still
+  finish, so this nudges rather than alarms. */
+.kb-scope .kp-stall {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  margin-top: 12px;
+  padding: 12px 14px;
+  background: var(--td-warning-color-light);
+  border: 1px solid var(--td-warning-color-3);
+  border-left: 3px solid var(--td-warning-color);
+  border-radius: var(--td-radius-medium);
+}
+
+/* Backlogged, not stuck: neutral tone, and no stop button to invite
+  cancelling work that will still finish. */
+.kb-scope .kp-stall-queued {
+  background: var(--td-bg-color-secondarycontainer);
+  border-color: var(--td-component-border);
+  border-left-color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-stall-queued .kp-stall-icon {
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-stall-icon {
+  flex-shrink: 0;
+  margin-top: 2px;
+  color: var(--td-warning-color);
+}
+
+.kb-scope .kp-stall-body {
+  flex: 1;
+  min-width: 0;
+}
+
+.kb-scope .kp-stall-title {
+  font-size: var(--app-text-sm);
+  font-weight: 600;
+  color: var(--td-text-color-primary);
+}
+
+.kb-scope .kp-stall-hint {
+  margin-top: 4px;
+  font-size: var(--app-text-sm);
+  line-height: 1.5;
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-stall-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  height: 28px;
+  padding: 0 12px;
+  border: 1px solid var(--td-warning-color);
+  border-radius: var(--td-radius-default);
+  background: var(--td-bg-color-container);
+  color: var(--td-warning-color-7);
+  font-size: var(--app-text-sm);
+  cursor: pointer;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-stall-btn:hover:not(:disabled) {
+  background: var(--td-warning-color);
+  color: var(--td-text-color-anti);
+}
+
+.kb-scope .kp-stall-btn:disabled {
+  cursor: default;
+  opacity: 0.6;
+}
+
+/* ============== DETAIL PANEL ==============
+  v1 gave the waterfall flex:1 and the detail a fixed 50% / 320px. On a
+  short trace that meant ~55% of the panel was blank whenever nothing
+  was selected, and rows got clipped mid-height as soon as something
+  was. Now the waterfall is content-sized (capped at 60% so a long
+  trace still leaves room) and the detail absorbs whatever is left. */
+.kb-scope .kp-detail {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-top: 1px solid var(--td-component-stroke);
+  background: var(--td-bg-color-container);
+  height: 0;
+  overflow: hidden;
+}
+
+/* flex-basis 0 (not auto) so the detail claims the remaining space
+  instead of its own content height — otherwise a tall detail body
+  squeezes the waterfall back out of view. */
+.kb-scope .kp-detail-open {
+  flex: 1 1 0;
+  height: auto;
+  min-height: 220px;
+  animation: kpDetailIn var(--app-motion-base) ease both;
+}
+
+@keyframes kpDetailIn {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
   }
-.kb-scope .kp-ruler .tick{ flex: 1; text-align: left; }
-.kb-scope .kp-scroll{ flex: 1; min-height: 0; overflow-y: auto; padding-bottom: 8px; }
-.kb-scope .kp-row{
-    display: flex; align-items: center; height: 26px;
-    font-size: 12px; color: var(--td-text-color-primary);
-    border-bottom: 1px solid #fafafa;
+
+  to {
+    opacity: 1;
+    transform: none;
   }
-.kb-scope .kp-row:hover{ background: #fafafa; }
-.kb-scope .kp-row.is-group{ background: #fcfcfc; font-weight: 600; }
-.kb-scope .kp-row.is-group .kp-node-label{ font-weight: 600; }
-.kb-scope .kp-node{
-    width: 268px; flex: none; display: flex; align-items: center; gap: 6px;
-    padding-left: 14px; min-width: 0;
-  }
-.kb-scope .kp-node-label{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.kb-scope .kp-node-dur{ margin-left: auto; padding-right: 10px; font-size: 11px; color: var(--td-text-color-secondary); font-variant-numeric: tabular-nums; }
-.kb-scope .kp-dot{ width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--td-text-color-placeholder); }
-.kb-scope .kp-dot.ok{ background: #2ba471; }
-.kb-scope .kp-dot.skip{ background: #d9d9d9; }
-.kb-scope .kp-caret{ width: 10px; font-size: 9px; color: var(--td-text-color-placeholder); flex: none; }
-.kb-scope .kp-indent{ display: inline-block; flex: none; }
-.kb-scope .kp-bar-area{ flex: 1; min-width: 0; position: relative; height: 100%; padding-right: 14px; }
-.kb-scope .kp-bar{
-    position: absolute; top: 50%; transform: translateY(-50%);
-    height: 8px; border-radius: 2px; background: var(--td-brand-color);
-  }
-.kb-scope .kp-bar.is-group{ height: 10px; background: #d5f2e1; border: 1px dashed #7fd4a3; }
-.kb-scope .kp-bar.is-skip{ background: transparent; border: 1px dashed #d9d9d9; height: 6px; }
-.kb-scope .kp-detail{
-    flex: none; max-height: 40%; overflow-y: auto;
-    border-top: 1px solid var(--td-component-stroke); background: #fcfcfc;
-  }
-.kb-scope .kp-detail-head{
-    display: flex; align-items: center; gap: 8px;
-    padding: 12px 18px 8px; font-size: 13px; font-weight: 600;
-  }
-.kb-scope .kp-detail-head .state{ font-size: 11px; font-weight: 500; color: #2ba471; background: #e8f7ef; border-radius: 3px; padding: 1px 6px; }
-.kb-scope .kp-detail-head .acts{ margin-left: auto; display: flex; gap: 2px; }
-.kb-scope .kp-tabs{
-    display: flex; align-items: center; gap: 16px;
-    padding: 0 18px; border-bottom: 1px solid var(--td-component-stroke);
-    font-size: 12px;
-  }
-.kb-scope .kp-tab{
-    height: 30px; border: 0; background: none; padding: 0;
-    font: inherit; font-size: 12px; color: var(--td-text-color-secondary); cursor: pointer;
-    border-bottom: 2px solid transparent;
-  }
-.kb-scope .kp-tab.is-active{ color: var(--td-brand-color); border-bottom-color: var(--td-brand-color); font-weight: 500; }
-.kb-scope .kp-detail-body{ padding: 14px 18px 18px; }
-.kb-scope .kp-kv{ display: flex; align-items: baseline; gap: 12px; padding: 6px 0; font-size: 12px; }
-.kb-scope .kp-kv .k{ width: 48px; flex: none; color: var(--td-text-color-placeholder); }
-.kb-scope .kp-kv .v{ color: var(--td-text-color-primary); font-variant-numeric: tabular-nums; }
+}
+
+.kb-scope .kp-detail-head {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 12px 20px 10px;
+  border-bottom: 1px solid var(--td-component-stroke);
+}
+
+.kb-scope .kp-detail-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.kb-scope .kp-detail-dot {
+  width: 8px;
+  height: 8px;
+  flex-shrink: 0;
+}
+
+.kb-scope .kp-detail-name {
+  font-weight: 600;
+  font-size: var(--app-text-md);
+  color: var(--td-text-color-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.kb-scope .kp-detail-kind {
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-2xs);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--td-text-color-placeholder);
+  flex-shrink: 0;
+}
+
+/* Status chip — soft tinted background using the brand/error/success
+  palette. Matches TDesign tag aesthetics. */
+.kb-scope .kp-status-chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 8px;
+  border-radius: var(--td-radius-default);
+  font-size: var(--app-text-xs);
+  font-weight: 500;
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-primary);
+  flex-shrink: 0;
+}
+
+.kb-scope .kp-chip-done {
+  background: var(--td-success-color-light);
+  color: var(--td-success-color);
+}
+
+.kb-scope .kp-chip-running {
+  background: var(--td-warning-color-light);
+  color: var(--td-warning-color);
+}
+
+.kb-scope .kp-chip-failed {
+  background: var(--td-error-color-light);
+  color: var(--td-error-color);
+}
+
+.kb-scope .kp-chip-cancelled {
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-chip-skipped {
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-chip-pending {
+  background: var(--td-bg-color-component);
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-detail-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Tabs */
+.kb-scope .kp-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 0;
+  padding: 0 20px;
+  border-bottom: 1px solid var(--td-component-stroke);
+  background: var(--td-bg-color-container);
+}
+
+.kb-scope .kp-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 9px 14px 10px;
+  border: none;
+  background: transparent;
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-md);
+  cursor: pointer;
+  position: relative;
+  transition: color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-tab:hover {
+  color: var(--td-text-color-primary);
+}
+
+.kb-scope .kp-tab-active {
+  color: var(--td-text-color-primary);
+  font-weight: 600;
+}
+
+.kb-scope .kp-tab-active::after {
+  content: "";
+  position: absolute;
+  left: 14px;
+  right: 14px;
+  bottom: -1px;
+  height: 2px;
+  background: var(--td-brand-color);
+  border-radius: 2px 2px 0 0;
+}
+
+.kb-scope .kp-tab-empty {
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-detail-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 16px 20px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+.kb-scope .kp-detail-empty {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 48px 0;
+  font-size: var(--app-text-md);
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-detail-hint {
+  font-size: var(--app-text-sm);
+  color: var(--td-text-color-secondary);
+  padding: 10px 12px;
+  background: var(--td-bg-color-secondarycontainer);
+  border-radius: var(--td-radius-medium);
+  border-left: 2px solid var(--td-component-border);
+}
+
+/* Sections */
+.kb-scope .kp-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kb-scope .kp-section-title {
+  font-size: var(--app-text-xs);
+  font-weight: 500;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-section-desc {
+  margin: 4px 0 8px;
+  font-size: var(--app-text-sm);
+  line-height: 1.5;
+  color: var(--td-text-color-placeholder);
+}
+
+.kb-scope .kp-section-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+
+.kb-scope .kp-section-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  border: 1px solid var(--td-component-border);
+  background: var(--td-bg-color-container);
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-xs);
+  padding: 3px 8px;
+  border-radius: var(--td-radius-default);
+  cursor: pointer;
+  transition: background var(--app-motion-fast) ease, color var(--app-motion-fast) ease, border-color var(--app-motion-fast) ease;
+}
+
+.kb-scope .kp-section-action:hover {
+  background: var(--td-brand-color);
+  color: var(--td-text-color-anti);
+  border-color: var(--td-brand-color);
+}
+
+.kb-scope .kp-section-action:hover .t-icon {
+  color: var(--td-text-color-anti);
+}
+
+/* KV grid — TDesign description list aesthetic. White card on the gray
+  page bg, soft 1px row separators, key/label color hierarchy. */
+.kb-scope .kp-kv {
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-container);
+  overflow: hidden;
+}
+
+.kb-scope .kp-kv-row {
+  display: grid;
+  grid-template-columns: 130px 1fr;
+  gap: 12px;
+  align-items: center;
+  font-size: var(--app-text-sm);
+  min-width: 0;
+  padding: 8px 12px;
+  background: var(--td-bg-color-container);
+}
+
+.kb-scope .kp-kv-row+.kp-kv-row {
+  border-top: 1px solid var(--td-bg-color-secondarycontainer);
+}
+
+.kb-scope .kp-kv-row-multiline {
+  align-items: flex-start;
+}
+
+.kb-scope .kp-kv-key {
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-xs);
+  font-weight: 500;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kb-scope .kp-kv-val {
+  color: var(--td-text-color-primary);
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+
+.kb-scope .kp-kv-truncate {
+  overflow: hidden;
+}
+
+.kb-scope .kp-kv-truncate .kp-kv-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+  flex: 1;
+}
+
+.kb-scope .kp-kv-multiline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  align-items: stretch;
+}
+
+.kb-scope .kp-kv-scalar {
+  font-size: var(--app-text-sm);
+}
+
+.kb-scope .kp-kv-running {
+  color: var(--td-warning-color);
+  font-style: italic;
+  font-family: var(--app-font-family);
+  font-size: var(--app-text-xs);
+}
+
+.kb-scope .kp-kv-tag-live {
+  display: inline-block;
+  margin-left: 6px;
+  padding: 0 6px;
+  font-size: 9px;
+  font-weight: 600;
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+  background: var(--td-warning-color-light);
+  color: var(--td-warning-color);
+  border-radius: var(--td-radius-small);
+  font-family: var(--app-font-family);
+}
+
+.kb-scope .kp-kv-copy {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: none;
+  background: transparent;
+  color: var(--td-text-color-placeholder);
+  cursor: pointer;
+  border-radius: var(--td-radius-small);
+  flex-shrink: 0;
+}
+
+.kb-scope .kp-kv-copy:hover {
+  background: var(--td-bg-color-container-hover);
+  color: var(--td-brand-color);
+}
+
+.kb-scope .kp-mono {
+  font-family: var(--app-font-family-mono);
+  font-size: var(--app-text-xs);
+  letter-spacing: 0;
+}
+
+.kb-scope .kp-bool-true {
+  color: var(--td-success-color);
+  font-weight: 500;
+}
+
+.kb-scope .kp-bool-false {
+  color: var(--td-error-color);
+  font-weight: 500;
+}
+
+.kb-scope .kp-kv-collapsible {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+/* Same vertical layout as collapsible, but with no toggle button —
+  used for short payloads that auto-expand inline. */
+.kb-scope .kp-kv-inline {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  min-width: 0;
+}
+
+.kb-scope .kp-kv-summary-static {
+  color: var(--td-text-color-placeholder);
+  font-size: var(--app-text-xs);
+}
+
+.kb-scope .kp-kv-toggle {
+  border: none;
+  background: transparent;
+  padding: 0;
+  text-align: left;
+  cursor: pointer;
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  color: var(--td-text-color-secondary);
+  font-size: var(--app-text-sm);
+  flex-wrap: wrap;
+}
+
+.kb-scope .kp-kv-summary {
+  color: var(--td-text-color-secondary);
+}
+
+.kb-scope .kp-kv-toggle-label {
+  font-size: var(--app-text-xs);
+  color: var(--td-brand-color);
+  font-weight: 500;
+}
+
+.kb-scope .kp-kv-toggle:hover .kp-kv-toggle-label {
+  text-decoration: underline;
+}
+
+/* Stage breakdown table inside root overview */
+.kb-scope .kp-breakdown {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-bg-color-container);
+  padding: 10px 12px;
+}
+
+.kb-scope .kp-breakdown-row {
+  display: grid;
+  grid-template-columns: 110px 1fr 64px;
+  gap: 10px;
+  align-items: center;
+  font-size: var(--app-text-sm);
+}
+
+.kb-scope .kp-breakdown-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--td-text-color-primary);
+}
+
+.kb-scope .kp-breakdown-track {
+  position: relative;
+  height: 6px;
+  background: var(--td-bg-color-secondarycontainer);
+  border-radius: var(--td-radius-small);
+  overflow: hidden;
+}
+
+.kb-scope .kp-breakdown-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  border-radius: var(--td-radius-small);
+  transition: width 800ms cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+
+.kb-scope .kp-breakdown-row.kp-breakdown-pending .kp-breakdown-bar {
+  display: none;
+}
+
+.kb-scope .kp-breakdown-dur {
+  text-align: right;
+  color: var(--td-text-color-secondary);
+}
+
+/* Error block in overview */
+.kb-scope .kp-error-block {
+  border: 1px solid var(--td-error-color-3);
+  border-radius: var(--td-radius-medium);
+  background: var(--td-error-color-light);
+  padding: 10px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.kb-scope .kp-error-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.kb-scope .kp-error-glyph {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  background: var(--td-error-color);
+  color: var(--td-text-color-anti);
+  border-radius: 50%;
+  font-size: var(--app-text-xs);
+  font-weight: 700;
+  flex-shrink: 0;
+}
+
+.kb-scope .kp-error-title {
+  font-weight: 600;
+  font-size: var(--app-text-sm);
+  color: var(--td-error-color);
+}
+
+.kb-scope .kp-error-code {
+  margin-left: auto;
+  font-size: var(--app-text-2xs);
+  background: var(--td-error-color);
+  color: var(--td-text-color-anti);
+  padding: 1px 6px;
+  border-radius: var(--td-radius-small);
+}
+
+.kb-scope .kp-error-msg {
+  margin: 0;
+  font-size: var(--app-text-xs);
+  color: var(--td-text-color-secondary);
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 160px;
+  overflow: auto;
+  padding: 8px 10px;
+  background: var(--td-bg-color-container);
+  border-radius: var(--td-radius-default);
+  border: 1px solid var(--td-component-stroke);
+}
+
+/* JSON viewer */
+.kb-scope .kp-json {
+  margin: 0;
+  padding: 10px 12px;
+  background: var(--td-bg-color-secondarycontainer);
+  border: 1px solid var(--td-component-stroke);
+  border-radius: var(--td-radius-medium);
+  max-height: 360px;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  font-size: var(--app-text-xs);
+  color: var(--td-text-color-primary);
+  line-height: 1.6;
+}
+
+.kb-scope .kp-json-large {
+  max-height: 480px;
+}
+
+/* ============== COMPACT MODE (untouched) ============== */
+.kb-scope .kp-compact {
+  max-width: 320px;
+  height: auto;
+}
+
+.kb-scope .kp-compact-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.kb-scope .kp-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: var(--td-text-color-placeholder);
+  display: inline-block;
+}
+
+.kb-scope .kp-compact-caption {
+  margin-top: 4px;
+  font-size: var(--app-text-sm);
+  color: var(--td-text-color-secondary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.kb-scope .kp-stage-emph {
+  color: var(--td-brand-color);
+  font-weight: 600;
+}
+
+.kb-scope .kp-proccfg-pop {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  padding: 2px 0;
+  max-width: 320px;
+}
+
+.kb-scope .kp-proccfg-title {
+  font-weight: 600;
+  font-size: var(--app-text-md);
+  color: var(--td-text-color-primary);
+  margin-bottom: 2px;
+}
+
+.kb-scope .kp-proccfg-line {
+  font-size: var(--app-text-sm);
+  line-height: 1.6;
+  color: var(--td-text-color-secondary);
+  word-break: break-word;
+}

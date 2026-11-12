@@ -118,8 +118,8 @@ class SessionArtifactDirectoryTest {
     void dtoCarriesDirectoryFlag() {
         SessionArtifactRecord r = row("art-dir", "D:/some/dir");
 
-        assertThat(SessionArtifactDto.from(r, true).directory()).isTrue();
-        assertThat(SessionArtifactDto.from(r, false).directory()).isFalse();
+        assertThat(SessionArtifactDto.from(r, true, null, null).directory()).isTrue();
+        assertThat(SessionArtifactDto.from(r, false, null, null).directory()).isFalse();
     }
 
     // ───────────────────────── helpers ─────────────────────────

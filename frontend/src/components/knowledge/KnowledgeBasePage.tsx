@@ -593,6 +593,13 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         // ⭐ 图谱判据的第二半（`extract_config.enabled`）。弹窗已序列化成字符串
         //    ⇒ 这里原样透传（⛔ 不再 stringify）。不转发的话 selection 白勾。
         extract_config: payload.extract_config ?? undefined,
+        // ⭐ 图片处理三项（V286，顶层列）。创建弹窗暂无控件 ⇒ 显式写后端默认值
+        //    （true / true / default），⛔ 不依赖「后端缺省」隐式生效。
+        //    ⚠️ 与 `image_processing_config.image_pipeline`（旧键，`""`/`"attrs"`，
+        //    后端零消费者）同名不同义，别把旧键透传到这里。
+        image_caption_enabled: payload.imageCaptionEnabled ?? true,
+        image_ocr_enabled: payload.imageOcrEnabled ?? true,
+        image_pipeline: payload.imagePipeline ?? 'default',
       })
       try {
         window.localStorage.setItem(
@@ -628,19 +635,16 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
 
   const handleUpload = async (fileList: FileList | null) => {
     if (!fileList || fileList.length === 0 || !activeBaseId) return
-    let ok = 0
-    const failures: string[] = []
-    for (const file of Array.from(fileList)) {
-      try {
-        await knowledgeApi.uploadKnowledge(activeBaseId, file)
-        ok++
-      } catch (e) {
-        failures.push(`${file.name}: ${toMessage(e)}`)
-      }
-    }
+    // ⭐ 与文档面板头的 KbUploadSource 共用同一个并发池（全局槽位恒 3）
+    const r = await knowledgeApi.uploadMany(
+      activeBaseId,
+      Array.from(fileList).map((file) => ({ file }))
+    )
     if (fileInputRef.current) fileInputRef.current.value = ''
-    if (ok > 0) showToast(`已上传 ${ok} 个文件，正在解析`, 'success')
-    if (failures.length > 0) showToast(failures.join('；'), 'info')
+    if (r.ok > 0) showToast(`已上传 ${r.ok} 个文件，正在解析`, 'success')
+    if (r.failures.length > 0) {
+      showToast(r.failures.map((f) => `${f.name}: ${f.message}`).join('；'), 'info')
+    }
     await loadItems()
   }
 

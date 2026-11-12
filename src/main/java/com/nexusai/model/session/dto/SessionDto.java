@@ -109,5 +109,10 @@ public record SessionDto(
      * <p>前端会话级设置读写本字段（PATCH /api/v1/sessions/{id}）；只影响工具可见性，
      * ⛔ 不改变 {@code LlmAgentLoop.loop()} 的执行逻辑。
      */
-    Boolean kbToolsEnabled
+    Boolean kbToolsEnabled,
+    /**
+     * 左栏置顶标记（V283 列 pinned）· 1/0 → Boolean，null 保持 null（未设置，读侧按未置顶处理）。
+     * 前端「任务」列表据此把置顶会话排到最前的独立置顶区；后端列表 ORDER BY 不感知本列。
+     */
+    Boolean pinned
 ) {}

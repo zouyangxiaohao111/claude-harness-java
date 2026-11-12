@@ -95,7 +95,8 @@ class SessionControllerTest {
             null,    // mainThreadAgent（SP-03 会话指定主线程 agent，本 fixture 未设 → null）
             null,    // coordinatorMode（V75 会话级 coordinator 覆盖，本 fixture 未设 → null）
             null,    // cacheHitRate（[cache-savings]，本 fixture 未设 → null）
-            null);   // kbToolsEnabled（V278 会话级知识库开关，本 fixture 未设 → null）
+            null,    // kbToolsEnabled（V278 会话级知识库开关，本 fixture 未设 → null）
+            null);   // pinned（V283 置顶标记，本 fixture 未设 → null）
     }
 
     @Test
@@ -162,7 +163,7 @@ class SessionControllerTest {
         when(sessionService.getById("sess-9")).thenReturn(
             new SessionDto("sess-9", "DS", "deepseek-chat", "需求分析", "刚刚",
                 SessionGroup.current, null, null, 12, OffsetDateTime.now(), OffsetDateTime.now(),
-                null, null, null, teamContext, null, null, null, null, null, null, null, null));
+                null, null, null, teamContext, null, null, null, null, null, null, null, null, null));
 
         mockMvc.perform(get("/api/v1/sessions/sess-9"))
             .andExpect(status().isOk())
@@ -180,7 +181,7 @@ class SessionControllerTest {
         when(sessionService.getById("sess-9")).thenReturn(
             new SessionDto("sess-9", "DS", "deepseek-chat", "需求分析", "刚刚",
                 SessionGroup.current, null, null, 12, OffsetDateTime.now(), OffsetDateTime.now(),
-                null, null, null, null, null, null, 0.0123, 1500L, null, null, null, null));
+                null, null, null, null, null, null, 0.0123, 1500L, null, null, null, null, null));
 
         mockMvc.perform(get("/api/v1/sessions/sess-9"))
             .andExpect(status().isOk())

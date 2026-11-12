@@ -58,9 +58,8 @@ public class KbQuestionGenerationService {
     private static final Logger log = LoggerFactory.getLogger(KbQuestionGenerationService.class);
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** 单次调用输出上限（源侧 2048，为 reasoning 型模型留余量）。 */
-    private static final int MAX_TOKENS = 2048;
-
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(2048)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
     private static final double TEMPERATURE = 0.7;
 
     /** 推理块（{@code <think>...</think>}）· 其内容是过程，不是问句。 */
@@ -149,8 +148,14 @@ public class KbQuestionGenerationService {
             modelConfigResolver == null ? null
                 : modelConfigResolver.settingsTierModelName(
                     com.nexusai.repository.settings.entity.SettingsRecord::getMainModelName));
-        if (!config.question().runnable()) {
-            return KbPostProcessOutcome.skipped("question_disabled");
+        // ⭐ 两个前提拆开返回，让前端能说清「到底缺哪一样」。
+        //    原来合成一个 question_disabled，用户只看到「未生成」却分不出是
+        //    「开关关着」还是「索引策略全关」—— 2026-11-12 实测就踩在这上面。
+        if (!config.question().enabled()) {
+            return KbPostProcessOutcome.skipped("question_off");
+        }
+        if (!config.question().indexingReady()) {
+            return KbPostProcessOutcome.skipped("question_no_indexing");
         }
 
         // ── 模型 ──────────────────────────────────────────────────────
@@ -205,7 +210,7 @@ public class KbQuestionGenerationService {
                     config.question().customInstructions());
                 String raw = sideCallClient.chat(
                     provider, apiModelName, null, prompt,
-                    options(TEMPERATURE, MAX_TOKENS, "question_generation"),
+                    options(TEMPERATURE, "question_generation"),
                     LlmSideCallClient.SideCallUsage.standalone(
                         UsageCategory.SIDE_CALL, "question_generation"));
                 questions = parseQuestions(raw, limit);
@@ -422,12 +427,12 @@ public class KbQuestionGenerationService {
     }
 
     private static LlmProvider.ChatRequestOptions options(
-        double temperature, int maxTokens, String label
+        double temperature, String label
     ) {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-            temperature, label, null, maxTokens, null, null,
+            temperature, label, null, null, null, null,
             null, null, null, null, null, null);
     }
 }

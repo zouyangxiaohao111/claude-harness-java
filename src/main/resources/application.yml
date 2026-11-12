@@ -10,6 +10,17 @@ spring:
   threads:
     virtual:
       enabled: true
+  # [2026-11-12] Spring default scheduler pool is ONE thread shared by every
+  # @Scheduled method: ingest tick (1.5s), permission poll, cron idle, ingest
+  # housekeeping sweep. One slow sweep delays all of them. Source WeKnora
+  # isolates these into separate asynq pools (internal/types/task.go:17-23);
+  # the closest Spring equivalent is a sized scheduler pool. 8 = source core
+  # pool size.
+  task:
+    scheduling:
+      pool:
+        size: 8
+      thread-name-prefix: nexusai-sched-
   application:
     # [G3 决策 D1 + 第二轮拍板] appName 固定 nexusai → NexusaiPaths.getAppConfigHomeDir() = {user.home}/.nexusai
     name: nexusai
@@ -126,11 +137,16 @@ spring:
   # POST /api/v1/attachments/upload 落盘。Spring Boot 默认 max-file-size=1MB /
   # max-request-size=10MB，无法承载 >5MB 上传；抬到 100MB 对齐
   # PdfSupport.PDF_MAX_EXTRACT_SIZE（CC constants/apiLimits.ts:72）。
+  #
+  # [2026-11-12] 100MB → 500MB（用户裁定）：知识库上传整本扫描件 PDF
+  # （实测单份 93~103MB）时 100MB 会直接把请求挡在 multipart 解析阶段
+  # （MaxUploadSizeExceededException），前端只看到「少了一个文件」。
+  # 注意 DataSize 的 MB 按 1024 计 ⇒ 500MB = 524,288,000 B。
   # ---------------------------------------------------------------
   servlet:
     multipart:
-      max-file-size: 100MB
-      max-request-size: 100MB
+      max-file-size: 500MB
+      max-request-size: 500MB
 
   # ---------------------------------------------------------------
   # Virtual Threads: requires JDK 21+; env is Java 17 so disabled.
@@ -189,6 +205,20 @@ nexusai:
   # ---------------------------------------------------------------
   attachments:
     local-read: true
+  # ---------------------------------------------------------------
+  # [入库三池并发] KbIngestWorker 认领 → 三个有界池并行执行（KbIngestPools）。
+  # 绑定类：com.nexusai.kb.app.ingest.KbIngestPoolProperties（@ConfigurationProperties，
+  #   前缀 nexusai.knowledge.ingest）；本段的字段默认值与该类常量同值，改一处必须同改另一处。
+  # 默认值逐字对齐源站 WeKnora asynq（D:/tmp/WeKnora/internal/types/task.go:17-19）：
+  #   Core=8 / PostProcess=2 / Enrichment=12 —— 用户裁定 2026-11-12，不取保守值。
+  # 为什么不靠降并发解决 SQLite 锁：BUSY 任务经 KbIngestTaskQueue.requeue 回 queued
+  #   （不消耗 retry_count），单条 UPDATE 由 SqliteBusyRetry 退避重试。
+  # ---------------------------------------------------------------
+  knowledge:
+    ingest:
+      parse-concurrency: 8
+      postprocess-concurrency: 2
+      enrichment-concurrency: 12
   # ---------------------------------------------------------------
   # [access-log 可配置] API 访问日志（ApiAccessLogInterceptor 消费 · nexusai.access-log）
   # 背景：前端轮询端点（/api/v1/schedules 定时任务 + /api/v1/tasks 异步任务 +

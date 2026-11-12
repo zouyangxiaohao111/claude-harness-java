@@ -24,12 +24,31 @@
  */
 import { useRef, useState, type ReactNode } from 'react'
 
+/**
+ * 字段下方的灰色说明文字。
+ *
+ * <p><b>可为函数</b>：有些提示的正确答案取决于**同一表单里另一个字段**的当前值
+ * （典型：Provider 的 Base URL —— OpenAI 兼容要填到 {@code /v1} 为止，Anthropic 反而
+ * 不能带 {@code /v1}，两条规则正好相反）。写死一句话就会误导另一半用户，因此允许
+ * {@code (values) => string} 按当前表单值现算。
+ *
+ * <p>⚠️ 函数形态只在三个渲染点被解析（普通字段 / json / toggle）；新增 hint 渲染点时
+ * 必须同样过 {@link resolveHint}，否则会把函数对象直接渲染进 DOM。
+ */
+export type FieldHint = string | ((values: Record<string, any>) => string)
+
+/** 把 {@link FieldHint} 收敛成字符串。 */
+function resolveHint(hint: FieldHint | undefined, values: Record<string, any>): string | undefined {
+  if (hint === undefined || hint === null) return undefined
+  return typeof hint === 'function' ? hint(values) : hint
+}
+
 export type FormField =
-  | { type: 'text' | 'mono'; name: string; label: string; placeholder?: string; hint?: string }
-  | { type: 'password'; name: string; label: string; placeholder?: string; hint?: string }
-  | { type: 'textarea'; name: string; label: string; placeholder?: string; hint?: string; rows?: number }
-  | { type: 'json'; name: string; label: string; placeholder?: string; hint?: string; rows?: number }
-  | { type: 'select'; name: string; label: string; options: { value: string; label: string }[]; hint?: string }
+  | { type: 'text' | 'mono'; name: string; label: string; placeholder?: string; hint?: FieldHint }
+  | { type: 'password'; name: string; label: string; placeholder?: string; hint?: FieldHint }
+  | { type: 'textarea'; name: string; label: string; placeholder?: string; hint?: FieldHint; rows?: number }
+  | { type: 'json'; name: string; label: string; placeholder?: string; hint?: FieldHint; rows?: number }
+  | { type: 'select'; name: string; label: string; options: { value: string; label: string }[]; hint?: FieldHint }
   /**
    * 卡片式单选 · 选项铺成网格（每项一张小卡：名称 + 说明 + 选中态圆点）。
    *
@@ -44,7 +63,7 @@ export type FormField =
       name: string
       label: string
       options: { value: string; label: string; desc?: string }[]
-      hint?: string
+      hint?: FieldHint
       /** 网格列数（默认 3）；选项少时传 2 更好看 */
       columns?: number
     }
@@ -59,7 +78,7 @@ export type FormField =
       name: string
       label: string
       options: { value: string; label: string; desc?: string }[]
-      hint?: string
+      hint?: FieldHint
     }
   /**
    * 分段控件单选 · 横排 pill 按钮组（每项：主标题 + 可选副标题）。
@@ -77,15 +96,15 @@ export type FormField =
       name: string
       label: string
       options: { value: string; label: string; desc?: string; disabled?: boolean }[]
-      hint?: string
+      hint?: FieldHint
     }
-  | { type: 'toggle'; name: string; label: string; hint?: string }
-  | { type: 'number'; name: string; label: string; placeholder?: string; min?: number; max?: number; hint?: string; nullable?: boolean }
+  | { type: 'toggle'; name: string; label: string; hint?: FieldHint }
+  | { type: 'number'; name: string; label: string; placeholder?: string; min?: number; max?: number; hint?: FieldHint; nullable?: boolean }
   | { type: 'locked'; label: string; render: () => ReactNode }
   // 受控自定义控件：值仍走表单 state（name 键），渲染交给调用方 —— 供 KvEditor 这类复合控件使用。
   // 刻意用 unknown 而非 any：调用方必须显式把 value 收窄成自己的类型，避免「忽略入参、自己拿外部
   // state」那种写法静默通过编译 —— 值一旦不在表单 state 里，保存时 payload 就会静默丢字段。
-  | { type: 'custom'; name: string; label: string; hint?: string; render: (value: unknown, set: (v: unknown) => void) => ReactNode }
+  | { type: 'custom'; name: string; label: string; hint?: FieldHint; render: (value: unknown, set: (v: unknown) => void) => ReactNode }
 
 export interface FormSection {
   title: string
@@ -272,6 +291,7 @@ function renderField(
   field: FormField,
   value: any,
   set: (name: string, v: any) => void,
+  values: Record<string, any>,
 ): ReactNode {
   switch (field.type) {
     case 'radio-cards':
@@ -357,7 +377,7 @@ function renderField(
           />
           {field.hint && (
             <div className={`fm-field-hint ${isValid ? '' : 'error'}`}>
-              {isValid ? field.hint : `✗ ${parseError}`}
+              {isValid ? resolveHint(field.hint, values) : `✗ ${parseError}`}
             </div>
           )}
         </>
@@ -378,7 +398,7 @@ function renderField(
           </div>
           <div className="toggle-label-block">
             <span className="fm-field-label">{field.label}</span>
-            {field.hint && <span className="fm-field-hint">{field.hint}</span>}
+            {field.hint && <span className="fm-field-hint">{resolveHint(field.hint, values)}</span>}
           </div>
         </div>
       )
@@ -534,12 +554,12 @@ export function FormModal<T extends Record<string, any>>({
                       return (
                         <div className="fm-field" key={fieldKey}>
                           {isFullRender ? (
-                            renderField(field, field.type === 'locked' ? undefined : values[field.name], set)
+                            renderField(field, field.type === 'locked' ? undefined : values[field.name], set, values)
                           ) : (
                             <>
                               <label className="fm-field-label">{field.label}</label>
-                              {renderField(field, values[field.name], set)}
-                              {field.hint && <div className="fm-field-hint">{field.hint}</div>}
+                              {renderField(field, values[field.name], set, values)}
+                              {field.hint && <div className="fm-field-hint">{resolveHint(field.hint, values)}</div>}
                             </>
                           )}
                         </div>

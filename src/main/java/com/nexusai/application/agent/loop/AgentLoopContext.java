@@ -2219,6 +2219,9 @@ public record AgentLoopContext(
                 //   ToolResultPairingRepair 告警打 session=null，运维无法定位会话（纯字段补充，
                 //   不参与任何判定：配对逻辑不读 sessionId）。
                 assistantText, toolCallDtos, msg.reasoning(), turnAssistantId, state.sessionId())
+                // [thinking-passthrough] thinking 块签名随消息走 —— Anthropic thinking 模式
+                //   要求下一轮把该轮的 thinking 块（thinking + signature）原样回传。
+                .withThinkingSignature(msg.thinkingSignature())
                 .withUsage(msg.usage())
                 // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
                 .withUsageCache(

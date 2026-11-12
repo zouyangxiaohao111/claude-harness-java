@@ -196,6 +196,12 @@ public class KnowledgeBaseService {
             }
             row.setExtractConfig(extract);
         }
+        // ⭐ V286 图片管线三项：null = 用默认（开关 true；管线 default）。
+        //    ⚠️ 必须显式填：Flex 会把 null 也列进 INSERT ⇒ DB 的 DEFAULT 不生效，
+        //    直接报 NOT NULL constraint failed（与 chunking_config 同一个坑）。
+        row.setImageCaptionEnabled(onOffOrDefault(req.imageCaptionEnabled()));
+        row.setImageOcrEnabled(onOffOrDefault(req.imageOcrEnabled()));
+        row.setImagePipeline(requireImagePipeline(req.imagePipeline()));
         // DB 列 NOT NULL 且无默认值 ⇒ 留空时写空串
         row.setEmbeddingModelId(req.embeddingModelId() == null ? "" : req.embeddingModelId());
         row.setSummaryModelId(req.summaryModelId() == null ? "" : req.summaryModelId());
@@ -239,6 +245,17 @@ public class KnowledgeBaseService {
         }
         if (req.summaryModelId() != null) {
             row.setSummaryModelId(req.summaryModelId());
+        }
+        // ⭐ V286 图片管线三项：null = 不改（PUT 的局部更新语义）。
+        if (req.imageCaptionEnabled() != null) {
+            row.setImageCaptionEnabled(req.imageCaptionEnabled() ? 1 : 0);
+        }
+        if (req.imageOcrEnabled() != null) {
+            row.setImageOcrEnabled(req.imageOcrEnabled() ? 1 : 0);
+        }
+        if (req.imagePipeline() != null) {
+            // ⚠️ 该列 NOT NULL 且是枚举 ⇒ 空串归默认（"清空" 无意义），非法值 400。
+            row.setImagePipeline(requireImagePipeline(req.imagePipeline()));
         }
         if (req.retrieverEngine() != null) {
             // 三态：null=不改；""=清空（回落全局默认）；值=覆盖。
@@ -360,6 +377,19 @@ public class KnowledgeBaseService {
             row.setStorageBackendId(orEmpty(text(body, "storage_backend_id")));
             changed = true;
         }
+        // ⭐ V286 图片管线三项：没传 = 不动；传 null = 回默认（true / default）。
+        if (body.has("image_caption_enabled")) {
+            row.setImageCaptionEnabled(switchOf(body.get("image_caption_enabled"), "image_caption_enabled"));
+            changed = true;
+        }
+        if (body.has("image_ocr_enabled")) {
+            row.setImageOcrEnabled(switchOf(body.get("image_ocr_enabled"), "image_ocr_enabled"));
+            changed = true;
+        }
+        if (body.has("image_pipeline")) {
+            row.setImagePipeline(requireImagePipeline(text(body, "image_pipeline")));
+            changed = true;
+        }
         if (body.has("retriever_engine")) {
             String engine = trimToNull(text(body, "retriever_engine"));
             if (engine != null && engineRegistry != null) {
@@ -427,6 +457,48 @@ public class KnowledgeBaseService {
     private static String text(com.fasterxml.jackson.databind.JsonNode body, String field) {
         com.fasterxml.jackson.databind.JsonNode v = body.get(field);
         return v == null || v.isNull() ? null : v.asText();
+    }
+
+    /** 图片管线 · 请求里的 Boolean → 1/0（null = 默认 1）。 */
+    private static int onOffOrDefault(Boolean v) {
+        return v == null || v ? 1 : 0;
+    }
+
+    /**
+     * 图片管线 · 值域校验 + 归一。
+     *
+     * <p>只允许 {@code default} / {@code smartocr}（大小写不敏感）；空白 ⇒ default；
+     * 其它值 ⇒ 400。⛔ 不静默存脏值：{@code image_pipeline} 是
+     * {@code KbImageEnrichService} 的分支判据，存进去一个拼错的值等于
+     * 「开关设了但实际走默认管线」，用户完全看不出来。
+     *
+     * @param raw 原始值
+     * @return {@code default} 或 {@code smartocr}
+     * @throws ValidationException 值域外
+     */
+    private static String requireImagePipeline(String raw) {
+        if (!com.nexusai.kb.app.image.KbImageSettings.isValidPipeline(raw)) {
+            throw new ValidationException("image_pipeline 只能是 default / smartocr，收到: " + raw);
+        }
+        return com.nexusai.kb.app.image.KbImageSettings.normalizePipeline(raw);
+    }
+
+    /**
+     * PATCH 的开关字段解析：接受布尔 / 0-1 数字（前端两种都可能传）；JSON null ⇒ 1（回默认）。
+     *
+     * @throws ValidationException 其它类型（字符串、对象、数组）
+     */
+    private static int switchOf(com.fasterxml.jackson.databind.JsonNode v, String field) {
+        if (v == null || v.isNull()) {
+            return 1;
+        }
+        if (v.isBoolean()) {
+            return v.asBoolean() ? 1 : 0;
+        }
+        if (v.isNumber()) {
+            return v.asInt() != 0 ? 1 : 0;
+        }
+        throw new ValidationException(field + " 必须是布尔值，收到: " + v);
     }
 
     private static String orEmpty(String s) {
@@ -509,6 +581,13 @@ public class KnowledgeBaseService {
             r.getFaqConfig(),
             // ⭐ V281：图谱存储配置（本地 / 远程 Neo4j）。同上，读侧必须回传，
             //    否则设置弹窗保存后仍显示「本地」，用户以为没生效。
-            r.getGraphStoreConfig());
+            r.getGraphStoreConfig(),
+            // ⭐ V286：图片管线三项。读侧必须回传（开关状态回显），
+            //    列 NOT NULL，null 只可能是未回填的旧对象 ⇒ 按默认 true/true/default 出站。
+            r.getImageCaptionEnabled() == null || r.getImageCaptionEnabled() != 0,
+            r.getImageOcrEnabled() == null || r.getImageOcrEnabled() != 0,
+            r.getImagePipeline() == null || r.getImagePipeline().isBlank()
+                ? com.nexusai.kb.app.image.KbImageSettings.PIPELINE_DEFAULT
+                : r.getImagePipeline());
     }
 }

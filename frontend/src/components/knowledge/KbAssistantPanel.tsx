@@ -16,6 +16,11 @@ interface Props {
   knowledgeId: string
   onClose: () => void
   showToast: (msg: string, type?: 'success' | 'info') => void
+  /**
+   * 挂载后自动提问一次（来源：抽屉里的「带 query 问助手」按钮）。
+   * 同一个值只消费一次（`consumedInitialRef`）；宿主改值可再触发一次。
+   */
+  initialQuestion?: string
 }
 
 /** 三条引导语 —— 与设计稿 11 页 `.assistant-starter` 逐字一致。 */
@@ -62,7 +67,7 @@ interface Turn {
  * 源站助手能「改文档 / 写操作」；本仓助手面板当前只做问答
  * ⇒ 输入框 placeholder 写「输入问题」，不写「或描述任务」。
  */
-export function KbAssistantPanel({ baseId, docTitle, knowledgeId, onClose, showToast }: Props) {
+export function KbAssistantPanel({ baseId, docTitle, knowledgeId, onClose, showToast, initialQuestion }: Props) {
   const [question, setQuestion] = useState('')
   const [turns, setTurns] = useState<Turn[]>([])
 
@@ -166,6 +171,25 @@ export function KbAssistantPanel({ baseId, docTitle, knowledgeId, onClose, showT
       showToast(msg, 'info')
     }
   }, [baseId, ensureSession, patchTurn, question, showToast])
+
+  /**
+   * 一次性消费 `initialQuestion`（宿主点「诊断」等按钮时带进来的问题）。
+   *
+   * ⚠️ 必须放在 `ask` 之后：`ask` 是 `useCallback`，提前引用会拿到 undefined。
+   * ⚠️ 必须用 ref 防重复：`ask` 的依赖里有 `question`，每次发送后 `setQuestion('')`
+   *    会让 `ask` 换身份 ⇒ effect 重跑；上一轮结束后 `activeTurnRef` 已清空，
+   *    那个 in-flight 闸门挡不住第二发 ⇒ 会重复发送同一个问题。
+   */
+  const consumedInitialRef = useRef<string | null>(null)
+  useEffect(() => {
+    const q = initialQuestion?.trim()
+    // 宿主把 initialQuestion 置回 undefined（关闭面板）时同步清 ref，
+    // 否则「关闭 → 再点同一个诊断按钮」会被 consumed 判据拦住、永远不再触发。
+    if (!q) { consumedInitialRef.current = null; return }
+    if (consumedInitialRef.current === q) return // 防重复发送
+    consumedInitialRef.current = q
+    void ask(q)
+  }, [initialQuestion, ask])
 
   /** 新会话：清空历史并丢弃旧 WS（下次提问重新建）。 */
   const resetThread = useCallback(() => {

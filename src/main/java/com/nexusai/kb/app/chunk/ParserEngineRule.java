@@ -11,12 +11,19 @@ import java.util.Locale;
  * 规则<b>按声明顺序</b>匹配，先命中者胜（源侧 {@code ResolveParserEngineRule} 的双层 for 循环，
  * {@code :359-365}）。
  *
- * <p><b>⚠️ engine 的取值口径（本仓与源站不同，有意为之）</b>：源站存的是
- * {@code anydoc} / {@code builtin} / {@code markitdown} 这类<b>引擎族名</b>，再由 Go 侧的
- * {@code resolveDocReader} 做一层映射。本仓解析器以 Spring bean 装配、{@code name()} 返回类名，
- * 故本字段直接存 {@link com.nexusai.kb.app.parser.KbDocumentParser#name()}（如 {@code KbAnydocParser}）。
- * ⛔ 不再引入源站那套族名映射 —— 两套名字并存时，「配置写 anydoc、实际选了谁」将无法从日志判定。
- * 前端下拉的展示名走 {@code displayName()}，与路由键严格分离。
+ * <p><b>engine 的取值口径（2026-11-12 起支持族名别名）</b>：源站存的是
+ * {@code anydoc} / {@code builtin} / {@code markitdown} 这类<b>引擎族名</b>。本仓解析器以
+ * Spring bean 装配，主名是 {@link com.nexusai.kb.app.parser.KbDocumentParser#name()}（类名），
+ * 但每个解析器同时声明 {@code engineFamilyNames()}（如 {@code anydoc} / {@code simple} /
+ * {@code paddleocr_vl}）。⇒ 本字段<b>两种写法都接受</b>：类名 或 族名（大小写不敏感、
+ * {@code -} 与 {@code _} 等价）。
+ *
+ * <p><b>族名天然一对多，匹配必须消歧</b>：{@code builtin} 同时是 PDF / HTML / XMind 的族名，
+ * {@code simple} 同时是 Image / Text 的族名。路由顺序固定为：先精确比 {@code name()}；
+ * 族名多命中时用 {@code supports(fileName)} 挑真正认这个文件的；都不认才退回 {@code @Order} 第一个。
+ * 命中与回落都会打日志，避免「配置写了族名、实际选了谁」无法判定。
+ *
+ * <p>前端下拉的展示名走 {@code displayName()}，与路由键严格分离。
  *
  * <p><b>类型规范化</b>：两侧都按源站 {@code normalizeParserFileType}（{@code knowledgebase.go:369-371}）
  * 做「小写 + 去空白 + 去前导点」，故配置里写 {@code ".PDF"} / {@code "pdf"} / {@code " pdf "} 等价。

@@ -42,6 +42,25 @@ export interface SessionOrderKey {
  * `SessionDto` 为唯一权威（`updatedAt?: string`，**ISO 字符串**，不是毫秒数），本接口是它的
  * 结构化子集 → 字段改名/改类型会在此处编译期暴露。
  */
+/**
+ * 左栏「任务」列表的**展示序**：置顶会话整体在前，其余不变。
+ *
+ * <p>规则：{@code pinned === true} 的会话排在最前；置顶区内部与未置顶区内部**都沿用**
+ * {@link compareSessions}（updatedAt 降序 + id 兜底）。⛔ 本函数不改 {@link compareSessions}
+ * 本体 —— 置顶只是前端**展示层**的额外汇总，后端 {@code GET /sessions} 的 ORDER BY
+ * 不感知该列（{@code list()} 仍是 updated_at DESC, id ASC）。
+ *
+ * <p>{@code pinned} 为 {@code null} / 缺省一律视作未置顶（与后端「null = 未设置」同义）。
+ */
+export function sortSessionsWithPinned<T extends SessionOrderKey & { pinned?: boolean | null }>(list: T[]): T[] {
+  const pinned: T[] = []
+  const rest: T[] = []
+  for (const s of list) (s.pinned === true ? pinned : rest).push(s)
+  pinned.sort(compareSessions)
+  rest.sort(compareSessions)
+  return [...pinned, ...rest]
+}
+
 export function compareSessions(a: SessionOrderKey, b: SessionOrderKey): number {
   // updatedAt 可空（后端 parseDateTime 失败 → null）：空值视作空串 → 降序时沉底。
   // 两端都空 → 落到 id 升序，仍是确定序（不返回 0 依赖 Array#sort 稳定性）。

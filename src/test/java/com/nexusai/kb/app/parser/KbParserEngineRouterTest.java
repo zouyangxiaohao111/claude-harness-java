@@ -69,19 +69,20 @@ class KbParserEngineRouterTest {
     }
 
     @Test
-    @DisplayName("engine 名大小写不符也算不存在（精确匹配，不做模糊）")
-    void engineNameIsCaseSensitive() {
+    @DisplayName("engine 名大小写不敏感（kbanydocparser 命中 KbAnydocParser）")
+    void engineNameIsCaseInsensitive() {
         KbParserRegistry reg = registry();
         KbDocumentParser picked = KbParserEngineRouter.select(reg, "a.docx",
             List.of(rule("kbanydocparser", "docx")));
-        assertThat(picked.name()).isEqualTo(reg.select("a.docx", null).name());
+        assertThat(picked.name()).isEqualTo("KbAnydocParser");
     }
 
     @Test
-    @DisplayName("规则为空 ⇒ 走默认 @Order 顺序（docx → anydoc 可用时 KbAnydocParser，否则 KbOfficeParser）")
+    @DisplayName("规则为空 ⇒ 走默认 @Order 顺序（docx → KbOfficeParser，anydoc 已让出默认）")
     void emptyRulesUseRegistryDefault() {
         KbParserRegistry reg = registry();
-        String expected = AnydocNative.isAvailable() ? "KbAnydocParser" : "KbOfficeParser";
+        // 2026-11-12 用户裁定：本仓 Office 默认走 Tika，anydoc 只在规则点名时使用
+        String expected = "KbOfficeParser";
 
         assertThat(KbParserEngineRouter.select(reg, "a.docx", List.of()).name())
             .isEqualTo(expected);

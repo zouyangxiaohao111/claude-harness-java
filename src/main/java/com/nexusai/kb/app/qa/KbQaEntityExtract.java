@@ -56,8 +56,8 @@ public class KbQaEntityExtract {
     /** 抽取温度：要稳定（沿用 W7 图谱抽取的口径）。 */
     private static final double TEMPERATURE = 0.1;
 
-    /** 输出 token 上限（源侧 {@code entityExtractionMaxTokens = 8192}）。 */
-    private static final int MAX_TOKENS = 8192;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(8192)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
 
     /**
      * 查询期实体抽取的系统提示词（逐字对齐源侧 {@code config/config.yaml:94-105}
@@ -235,7 +235,7 @@ public class KbQaEntityExtract {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-            TEMPERATURE, label, null, MAX_TOKENS, null, null,
+            TEMPERATURE, label, null, null, null, null,
             null, null, null, null, null, null);
     }
 

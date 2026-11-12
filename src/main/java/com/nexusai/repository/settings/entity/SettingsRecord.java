@@ -40,10 +40,8 @@ public class SettingsRecord {
     // [W3-1] 自动压缩窗口（V25 建列 auto_compact_window；CC 语义 = autoCompact.ts:40-42
     //   CLAUDE_CODE_AUTO_COMPACT_WINDOW env 的 DB 承载：数字窗口，null = 未配置不参与收窄）
     private Integer autoCompactWindow;
-    // [F1] max output tokens 有界 override（V27 建列 max_output_tokens；CC 语义 =
-    //   envValidation.ts:9-38 CLAUDE_CODE_MAX_OUTPUT_TOKENS 迁移为 settings 配置：
-    //   >0 生效、> 模型 upperLimit 封顶到 upperLimit、null 用模型默认）
-    private Integer maxOutputTokens;
+    // ⚠️ 2026-11-12 删除 maxOutputTokens 字段：V285 已 DROP 该列。
+    //   输出上限唯一入口 = models.max_tokens（模型配置页「生成参数 · max tokens」）。
     // [F4] fallback 模型名（V27 原建列 fallback_model_id，V28 RENAME → fallback_model_name；
     //   FALLBACK_MODEL_ID env → settings 迁移）。
     //   CC 无此 env（withRetry.ts:337-351 按调用传入 options.fallbackModel），Java 原以 env 提供
@@ -333,8 +331,6 @@ public class SettingsRecord {
     public void setSubagentModelName(String subagentModelName) { this.subagentModelName = subagentModelName; }
     public Integer getAutoCompactWindow() { return autoCompactWindow; }
     public void setAutoCompactWindow(Integer autoCompactWindow) { this.autoCompactWindow = autoCompactWindow; }
-    public Integer getMaxOutputTokens() { return maxOutputTokens; }
-    public void setMaxOutputTokens(Integer maxOutputTokens) { this.maxOutputTokens = maxOutputTokens; }
     public String getFallbackModelName() { return fallbackModelName; }
     public void setFallbackModelName(String fallbackModelName) { this.fallbackModelName = fallbackModelName; }
     public String getMultimodalModelName() { return multimodalModelName; }

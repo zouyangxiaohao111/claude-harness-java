@@ -7,8 +7,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.Set;
-import java.util.TreeSet;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -65,54 +63,37 @@ class KbAnydocParserTest {
     }
 
     @Test
-    @DisplayName("Office/ODF/RTF/EPUB 在原生库可用时被接管")
-    void takesOfficeFamilyWhenNativeAvailable() {
+    @DisplayName("原生库可用时也不抢默认路由（2026-11-12 用户裁定：Office 默认走 Tika）")
+    void givesUpDefaultRoutingEvenWhenNativeAvailable() {
         List<String> office = List.of(
             "a.doc", "a.docx", "a.docm", "a.dot", "a.dotx",
             "a.xls", "a.xlsx", "a.xlsm", "a.xlt", "a.xltx",
             "a.ppt", "a.pptx", "a.pptm", "a.pot", "a.potx",
             "a.rtf", "a.odt", "a.ods", "a.odp", "a.epub");
         for (String name : office) {
-            boolean expected = nativeAvailable();
             assertThat(parser.supports(name, null))
-                .as("%s 的 supports() 应与 isAvailable()=%s 一致", name, expected)
-                .isEqualTo(expected);
+                .as("%s 不该被 anydoc 默认接管（只允许 parser_engine_rules 点名）", name)
+                .isFalse();
         }
     }
 
     @Test
-    @DisplayName("声明的扩展名与 supports() 同源：声明了就一定被 supports 认（可用时）")
-    void declaredExtensionsMatchSupports() {
-        Set<String> declared = parser.supportedExtensions();
-        assertThat(new TreeSet<>(declared)).containsExactly(
-            "doc", "docm", "docx", "dot", "dotx",
-            "epub", "odp", "ods", "odt", "pot", "potx",
-            "ppt", "pptm", "pptx", "rtf",
-            "xls", "xlsm", "xlsx", "xlt", "xltx");
-
-        if (nativeAvailable()) {
-            for (String ext : declared) {
-                assertThat(parser.supports("sample." + ext, null))
-                    .as("声明了 .%s 却路由不到 ⇒ 前端假选项", ext)
-                    .isTrue();
-            }
-        }
+    @DisplayName("声明的扩展名为空（默认路由让给 Office；能力仍由 parse() 保留，供规则点名）")
+    void declaresNoExtensionsByDefault() {
+        assertThat(parser.supportedExtensions()).isEmpty();
+        assertThat(parser.displayName()).isNotBlank();
     }
 
     @Test
     @DisplayName("原生库不可用 ⇒ supports() 恒 false（让注册表路由到内置 Office 解析）")
     void unavailableMeansNoSupport() {
-        if (nativeAvailable()) {
-            // 本机有原生库时不构造假状态（改造静态状态会污染同 JVM 的其它用例），
-            // 只断言「可用 ⇒ supports true」这一侧；不可用侧在下一个用例里按条件断言。
-            assertThat(parser.supports("a.docx", null)).isTrue();
-            return;
-        }
-        assertThat(parser.isAvailable()).isFalse();
-        assertThat(parser.unavailableReason()).isNotBlank();
         assertThat(parser.supports("a.docx", null)).isFalse();
         assertThat(parser.supports("a.pptx", null)).isFalse();
         assertThat(parser.supports("a.epub", null)).isFalse();
+        if (!nativeAvailable()) {
+            assertThat(parser.isAvailable()).isFalse();
+            assertThat(parser.unavailableReason()).isNotBlank();
+        }
     }
 
     @Test
@@ -137,7 +118,8 @@ class KbAnydocParserTest {
             new KbPdfParser(null), parser, new KbImageParser(null),
             new KbOfficeParser(), new KbTextParser()));
 
-        String expectedDocx = nativeAvailable() ? "KbAnydocParser" : "KbOfficeParser";
+        // 2026-11-12 用户裁定：anydoc 让出默认路由 ⇒ docx/epub 都落 KbOfficeParser
+        String expectedDocx = "KbOfficeParser";
         assertThat(registry.select("a.docx", null).name()).isEqualTo(expectedDocx);
         assertThat(registry.select("a.epub", null).name()).isEqualTo(expectedDocx);
         // 三条不受 anydoc 影响的既有路由

@@ -34,7 +34,7 @@ function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
     theme: null, fontSize: null, accent: null, animationsEnabled: null,
     mainModelName: null, fastModelName: null, weakModelName: null, mediumModelName: null,
     strongModelName: null, subagentModelName: null, autoCompactWindow: null,
-    maxOutputTokens: null, fallbackModelName: null, multimodalModelName: null,
+    fallbackModelName: null, multimodalModelName: null,
     ttsModelName: null, asrModelName: null, autoMemoryEnabled: null, autoMemoryDirectory: null,
     ...over,
   }
@@ -59,7 +59,9 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
   /** 面板里「协调者模式」那一行的 checkbox。 */
   function coordinatorModeCheckbox(): HTMLInputElement {
     const rows = Array.from(container.querySelectorAll('.envc-row'))
-    const row = rows.find((r) => r.querySelector('.envc-name')?.textContent === FIELD_NAME)
+    // 行标题里可能追加代码标签（如「协调者模式 coordinator」）⇒ 用前缀匹配，
+    // 精确相等会把标签也算进 textContent 而匹配失败（2026-11-12 改版）。
+    const row = rows.find((r) => r.querySelector('.envc-name')?.textContent?.trim().startsWith(FIELD_NAME))
     if (!row) throw new Error(`未找到开关行：${FIELD_NAME}`)
     const box = row.querySelector('input[type="checkbox"]')
     if (!box) throw new Error('开关行内无 checkbox')

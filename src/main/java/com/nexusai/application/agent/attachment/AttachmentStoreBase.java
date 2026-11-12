@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.attachment;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.common.NexusaiDataRoots;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -82,12 +83,16 @@ public abstract class AttachmentStoreBase<T> {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 存储目录 · {@code {configHome}/{cacheDirName}/{sessionId}}。
+     * 存储目录 · {@code {dataRoot}/{cacheDirName}/{sessionId}}。
+     *
+     * <p>[data-root] {@code dataRoot} 由 {@link NexusaiDataRoots} 统一解析：安装目录
+     * {@code <install>/data/workspace/<user>} 优先，configHome 兜底（用户 2026-11-12 裁定）。
+     * ⭐ 读与写同源 —— 改这一处，image-cache / pdf-cache / media-cache 三个子类一起跟随。
      *
      * @param sessionId 会话 id（null/blank → 'unknown' 兜底）
      */
     protected Path storeDir(String sessionId) {
-        return Paths.get(NexusaiPaths.getAppConfigHomeDir(), cacheDirName(), resolveSessionId(sessionId));
+        return NexusaiDataRoots.sub(cacheDirName()).resolve(resolveSessionId(sessionId));
     }
 
     /**

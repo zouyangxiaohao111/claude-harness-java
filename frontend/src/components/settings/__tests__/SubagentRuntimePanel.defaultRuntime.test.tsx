@@ -52,7 +52,7 @@ function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
     theme: null, fontSize: null, accent: null, animationsEnabled: null,
     mainModelName: null, fastModelName: null, weakModelName: null, mediumModelName: null,
     strongModelName: null, subagentModelName: null, autoCompactWindow: null,
-    maxOutputTokens: null, fallbackModelName: null, multimodalModelName: null,
+    fallbackModelName: null, multimodalModelName: null,
     ttsModelName: null, asrModelName: null, autoMemoryEnabled: null, autoMemoryDirectory: null,
     ...over,
   } as AppSettings

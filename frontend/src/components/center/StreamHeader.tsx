@@ -31,7 +31,9 @@ export function StreamHeader({ centerTabId, sessions, mainProject }: StreamHeade
   const agentStatus = useChatStore((s) => s.agentStatus)
   const status = STATUS_META[agentStatus]
   // F37 · 用量展示：流式期间 streams 状态不携带 outputTokens，退而读 message.complete 落库的最近一次值；无数据静默
-  const retry = useChatStore((s) => s.retry)
+  // [retry-per-session] 只取本会话那一份：原读全局单值 s.retry ⇒ 别的会话在重试时，**所有**会话头部
+  //   都显示「已重试 3/10」（用户实测）。
+  const retry = useChatStore((s) => (centerTabId ? (s.retry[centerTabId] ?? null) : null))
   const centerMessages = useChatStore((s) => (centerTabId ? s.messages[centerTabId] : undefined))
   const lastTokens = lastOutputTokens(centerMessages)
   const title = sessions.find((s) => s.id === centerTabId)?.title || '当前会话'

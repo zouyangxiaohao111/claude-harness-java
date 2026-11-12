@@ -1,0 +1,29 @@
+-- ===================================================================
+-- V285: settings 表删除 max_output_tokens 列（孤儿列清理）
+--
+-- 背景（代码为准）：V27 建该列承载「输出 token 上限有界 override」，
+--   是 CC CLAUDE_CODE_MAX_OUTPUT_TOKENS env 的 Java 等价物，在
+--   AnthropicSdkProvider.resolveMaxOutputTokensForModel 的「DB 命中」分支里
+--   对 models.max_tokens 做「只收窄、不放宽」。
+--   前端设置控件早已撤掉（只剩 API DTO 透出），后端这一层成为唯一的实际消费者，
+--   形成「UI 撤了、计算链没撤」的半撤状态。
+--
+-- 2026-11-12 裁定：输出上限的唯一配置入口 = 模型配置页「生成参数 · max tokens」
+--   （models.max_tokens）。settings 这层已从计算链撤掉：
+--   - AnthropicSdkProvider：DB 命中直返 models.max_tokens（不再收窄）；
+--     readSettingsMaxOutputTokens / staticSettingsMapper / validateBoundedIntEnvVar 删除
+--   - MaxTokensHandler：删「settings 已配置 ⇒ 抑制 64k 升级」条件
+--   - SettingsService：不再接受写入；toDto 透出删除
+--   - FactoryPresetSeeder：预设不再导入
+--   - 前端 types.ts：字段删除
+--
+-- 保留 V27（已应用，删则校验和失配，只加本迁移）。V27 是 ADD COLUMN、
+--   本迁移是 DROP COLUMN，两条独立文件，合法。
+--
+-- 依赖检查（本机 nexusai.db 实测）：该列无索引 / 无视图 / 无触发器引用；
+--   全仓除 V27 与本文件外无任何 SQL 提及该列。
+-- SQLite ALTER TABLE DROP COLUMN 支持（SQLite >= 3.35.0，sqlite-jdbc 3.46.0.0）；
+--   本仓既有先例 V19 / V30 / V77（真库 flyway_schema_history 实测 success=1），
+--   同一 JDBC/驱动栈上已验证可行，无需脱离事务重建表（FK 安全，不触发级联删除）。
+-- ===================================================================
+ALTER TABLE settings DROP COLUMN max_output_tokens;

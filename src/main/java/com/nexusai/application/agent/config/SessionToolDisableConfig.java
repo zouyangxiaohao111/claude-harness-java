@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.config;
 
 import com.alibaba.fastjson2.JSON;
+import com.nexusai.application.agent.tool.SessionToolCategory;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
@@ -77,11 +78,25 @@ public class SessionToolDisableConfig {
     /**
      * 读取会话级禁用工具集合（sessions.disabled_tools，V34 列 JSON 数组）。
      *
-     * <p>优先级（硬约束）：当前会话 disabled_tools → 有值则用之（JSON 数组）；null / 空 /
-     * 无会话上下文 / SessionMapper 未注入 / DB 读取失败 → 空集合（不剔除任何工具）。
+     * <p><b>取值优先级（[tool-categories] 2026-11-12 用户裁定）</b>：
+     * <ol>
+     *   <li>列<b>非空</b> → 用该 JSON 数组（用户已显式设定，含 {@code "[]"} = 显式全部启用）；</li>
+     *   <li>列<b>为 null / blank</b>（该会话从未设置过）→ 返回 {@link SessionToolCategory#defaultDisabledNamesStatic()}
+     *       （电脑操作 + 知识库默认禁用，浏览器控制<b>不</b>默认禁用）；</li>
+     *   <li>无会话上下文 / SessionMapper 未注入 / 会话查不到 / DB 读取失败 → 空集（不剔除任何工具）。</li>
+     * </ol>
+     *
+     * <p><b>WHY 判据必须读原始串</b>：{@code null} 与 {@code "[]"} 语义不同 —— 前者「从未设置」
+     * 走默认禁用，后者「用户把默认禁用的 50 项全部手动打开」必须读回空集。若只看
+     * {@code Set} 是否为空就分不清两者，用户的打开操作会被默认规则静默吞掉
+     * （{@code SessionService.setDisabledTools} 已改为空集存 {@code "[]"}）。
+     *
+     * <p><b>本方法是默认禁用的唯一推断点</b>：两条消费链同时生效 ——
+     * {@code SessionToolsController.list}（面板显示 disabled=true）与
+     * {@code LlmAgentLoop.sessionVisibleTools}（模型 schema 剔除）。
      *
      * @param sessionId 会话标识（TUC.sessionId() 派生 UUID / MDC "sess-xxx" / null）
-     * @return 禁用工具名集合（不可变；未禁用 → 空集）
+     * @return 禁用工具名集合（不可变；显式全开 → 空集）
      */
     public static Set<String> getDisabledTools(String sessionId) {
         String key = normalizeSessionKey(sessionId);
@@ -89,8 +104,18 @@ public class SessionToolDisableConfig {
         if (key != null && mapper != null) {
             try {
                 SessionRecord s = mapper.selectOneById(key);
-                if (s != null && s.getDisabledTools() != null && !s.getDisabledTools().isBlank()) {
-                    List<String> list = JSON.parseArray(s.getDisabledTools(), String.class);
+                if (s != null) {
+                    String raw = s.getDisabledTools();
+                    if (raw == null || raw.isBlank()) {
+                        // 从未设置 → 默认禁用（电脑操作 + 知识库）
+                        Set<String> defaults = SessionToolCategory.defaultDisabledNamesStatic();
+                        if (log.isDebugEnabled()) {
+                            log.debug("会话级禁用工具集合：会话 '{}' disabled_tools 未设置 → 默认禁用 {} 个"
+                                    + "（CU+KB，[tool-categories]）", key, defaults.size());
+                        }
+                        return defaults;
+                    }
+                    List<String> list = JSON.parseArray(raw, String.class);
                     if (list != null && !list.isEmpty()) {
                         if (log.isDebugEnabled()) {
                             log.debug("会话级禁用工具集合：会话 '{}' disabled_tools={} 生效（V34 列）",
@@ -98,9 +123,14 @@ public class SessionToolDisableConfig {
                         }
                         return Set.copyOf(list);
                     }
+                    // "[]" = 用户显式全部启用（不回落默认禁用）
+                    if (log.isDebugEnabled()) {
+                        log.debug("会话级禁用工具集合：会话 '{}' disabled_tools 为 [] → 显式全开，不启动默认禁用", key);
+                    }
+                    return Set.of();
                 }
                 if (log.isDebugEnabled()) {
-                    log.debug("会话级禁用工具集合：会话 '{}' disabled_tools 未设置（null/空）→ 空集", key);
+                    log.debug("会话级禁用工具集合：会话 '{}' 查不到 → 空集（不启用默认禁用）", key);
                 }
             } catch (Exception e) {
                 log.warn("会话级禁用工具集合：会话 '{}' disabled_tools 读取失败（{}），降级空集",

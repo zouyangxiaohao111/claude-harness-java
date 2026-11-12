@@ -68,8 +68,6 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
-import com.nexusai.repository.settings.entity.SettingsRecord;
-import com.nexusai.repository.settings.mapper.SettingsMapper;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -106,7 +104,7 @@ import java.util.function.Consumer;
  *
  * <p>[RV-MERGE] 旧 {@code AnthropicProvider} 已删除，其静态 max-token 工具
  * （{@link #getMaxOutputTokensForModel} / {@link #isMaxTokensCapEnabled} /
- * {@link #validateBoundedIntEnvVar} / {@link #getModelMaxOutputTokens}）与 DEC-RV-03 流式→非流式
+ * {@link #getModelMaxOutputTokens}）与 DEC-RV-03 流式→非流式
  * 回退链（{@link #shouldUseNonStreamingFallback} / {@link #computeInitialConsecutive529Errors} /
  * {@link #nonStreamingFallback}）全部迁入本类；MaxTokensHandler / AgentLoopContext 已重指向本类。
  *
@@ -142,8 +140,6 @@ public class AnthropicSdkProvider implements LlmProvider {
     static final int CAPPED_DEFAULT_MAX_TOKENS = 8_000;
     /** [G-17] cap.max_tokens 生效下限 · CC original: {@code cap.max_tokens >= 4_096} (Open-ClaudeCode/src/utils/context.ts:204)。 */
     static final int MAX_OUTPUT_TOKENS_CAP_MIN = 4_096;
-    /** [F1] settings 表 singleton id=1（V1__init_schema.sql 已默认插入）· settings.maxOutputTokens 读取用。 */
-    private static final int SETTINGS_SINGLETON_ID = 1;
     /** [IMP-15] 64k 升级 feature gate 系统属性名 · CC original: {@code tengu_otk_slot_v1}
      *  growthbook flag（Open-ClaudeCode/src/query.ts:1195-1198 + claude.ts:3394-3397，默认 false）。 */
     static final String TENGU_OTK_SLOT_V1_PROPERTY = "nexusai.feature.tengu-otk-slot-v1";
@@ -166,12 +162,6 @@ public class AnthropicSdkProvider implements LlmProvider {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private volatile ProviderMapper providerMapper;
 
-    /** [F1] settings.maxOutputTokens 有界 override 来源（CC envValidation.ts:9-38 CLAUDE_CODE_MAX_OUTPUT_TOKENS
-     *  迁移为 settings 配置）· null（测试/未接线）→ 静默回落模型默认（等价 CC env 未设置分支）。
-     *  <p>实例注入供 {@link #bridgeDbMappersToStatic()} 桥接至静态持有（static 方法读 settings 行）。 */
-    @org.springframework.beans.factory.annotation.Autowired(required = false)
-    private volatile SettingsMapper settingsMapper;
-
     private volatile com.nexusai.application.agent.lsp.PromptCacheBreakDetection promptCacheBreak;
 
     // ════════════════════════════════════════════════════════════════════
@@ -183,9 +173,6 @@ public class AnthropicSdkProvider implements LlmProvider {
      *  max_tokens DB 优先解析（static 方法无法读实例字段）；未接线 → null → 回落 CC 家族表。 */
     private static volatile ModelMapper staticModelMapper;
     private static volatile ProviderMapper staticProviderMapper;
-    /** [F1] settings.maxOutputTokens 有界 override 来源 · 静态持有（static 方法读 settings 行）；
-     *  未接线 → null → 回落模型默认（等价 CC env 未设置分支）。 */
-    private static volatile SettingsMapper staticSettingsMapper;
 
     /**
      * [G-18] Spring 装配后桥接实例注入的 DB mapper 到静态持有（AgentColorCommand @PostConstruct
@@ -196,7 +183,6 @@ public class AnthropicSdkProvider implements LlmProvider {
     public void bridgeDbMappersToStatic() {
         staticModelMapper = this.modelMapper;
         staticProviderMapper = this.providerMapper;
-        staticSettingsMapper = this.settingsMapper;
         if (staticModelMapper == null || staticProviderMapper == null) {
             log.warn("[AnthropicSdkProvider] modelMapper/providerMapper 未注入（无 Spring 上下文），"
                 + "请求体 max_tokens 走 CC 家族表（G-18 DB 优先不可用，回落家族表保持单源）");
@@ -1050,6 +1036,7 @@ public class AnthropicSdkProvider implements LlmProvider {
     static AssistantMessage buildAssistantMessageFromMessage(Message message) {
         StringBuilder text = new StringBuilder();
         StringBuilder reasoning = new StringBuilder();
+        StringBuilder thinkingSignature = new StringBuilder();
         List<ToolUseBlock> toolCalls = new ArrayList<>();
         for (var block : message.content()) {
             if (block.isText()) {
@@ -1061,6 +1048,10 @@ public class AnthropicSdkProvider implements LlmProvider {
                 block.thinking().ifPresent(t -> {
                     String s = t.thinking();
                     if (s != null) reasoning.append(s);
+                    // [thinking-passthrough] 非流式响应里 signature 与 thinking 同块返回，
+                    //   必须留存以回传（否则下一轮 thinking 块无签名）。
+                    String sig = t.signature();
+                    if (sig != null && !sig.isEmpty()) thinkingSignature.append(sig);
                 });
             } else if (block.isToolUse()) {
                 var tu = block.asToolUse();
@@ -1092,7 +1083,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             log.debug("AnthropicSdkProvider 非流式 usage: {} · CC claude.ts:870-903", agentUsage);
         }
         return new AssistantMessage(text.toString(), finishReason, toolCalls,
-            reasoning.toString(), null, agentUsage);
+            reasoning.toString(), null, agentUsage, null,
+            thinkingSignature.length() == 0 ? null : thinkingSignature.toString());
     }
 
     /**
@@ -1254,6 +1246,12 @@ public class AnthropicSdkProvider implements LlmProvider {
                 state.toolCalls.put(acc.index, acc);
             } else if (block.isThinking()) {
                 state.thinkingBlockIdx = (int) cb.index();
+                // [thinking-passthrough] content_block_start 也可能直接带 signature
+                //   （非增量形态的上游）；空串不动，保留后续 signature_delta 累积结果。
+                String sig0 = block.asThinking().signature();
+                if (sig0 != null && !sig0.isEmpty()) {
+                    state.signature.append(sig0);
+                }
             }
         } else if (event.isContentBlockDelta()) {
             RawContentBlockDeltaEvent d = event.asContentBlockDelta();
@@ -1276,6 +1274,13 @@ public class AnthropicSdkProvider implements LlmProvider {
                 if (s != null) {
                     state.reasoning.append(s);
                     if (onReasoningChunk != null) onReasoningChunk.accept(s);
+                }
+            } else if (delta.isSignature()) {
+                // [thinking-passthrough] 签名增量（thinking 块收尾时上游下发一次）·
+                //   回传给下一轮请求的 thinking 块（同一模型必须原样带回）。
+                String sig = delta.asSignature().signature();
+                if (sig != null) {
+                    state.signature.append(sig);
                 }
             }
         } else if (event.isContentBlockStop()) {
@@ -2606,6 +2611,36 @@ public class AnthropicSdkProvider implements LlmProvider {
         return null;
     }
 
+    /**
+     * [thinking-passthrough] 该 assistant 消息是否应带 thinking 块。
+     *
+     * <p>判据 = {@code reasoning} 非空白（thinking 正文即推理文本，本仓与 CC 同构：
+     * 响应侧把 thinking 正文存进 reasoning，签名另存 thinkingSignature）。
+     * 空 reasoning 的消息（无思考轮 / 旧会话）不发 thinking 块 —— 出站字节与改动前一致。
+     */
+    static boolean hasThinkingBlock(ChatMessageDto m) {
+        return m != null && m.reasoning() != null && !m.reasoning().isBlank();
+    }
+
+    /**
+     * [thinking-passthrough] 往 assistant 的 content 数组头部追加 thinking 块 · 对齐 CC
+     * {@code {type:'thinking', thinking, signature}}（thinking 必须在 text/tool_use 之前）。
+     *
+     * <p>signature 取消息上留存的 {@link ChatMessageDto#thinkingSignature()}；缺失时发空串
+     * —— DeepSeek /anthropic 实测接受空签名（签名真校验只在真 Claude 端点，届时走 400 兜底链）。
+     * 不带任何 cache_control（CC same：thinking block 不可附 cache_control）。
+     */
+    static void appendThinkingBlock(List<ContentBlockParam> blocks, ChatMessageDto m) {
+        if (!hasThinkingBlock(m)) {
+            return;
+        }
+        String signature = m.thinkingSignature() == null ? "" : m.thinkingSignature();
+        blocks.add(ContentBlockParam.ofThinking(ThinkingBlockParam.builder()
+            .thinking(m.reasoning())
+            .signature(signature)
+            .build()));
+    }
+
     /** ChatMessageDto 数组 → SDK MessageParam 数组（tool_result / tool_use / 多模态）。 */
     private static List<MessageParam> buildSdkMessages(List<ChatMessageDto> history) {
         List<MessageParam> msgs = new ArrayList<>();
@@ -2716,6 +2751,14 @@ public class AnthropicSdkProvider implements LlmProvider {
             }
             if (m.role() == Role.assistant && m.toolCalls() != null && !m.toolCalls().isEmpty()) {
                 List<ContentBlockParam> blocks = new ArrayList<>();
+                // [thinking-passthrough 2026-11-12] thinking 块必须在 text/tool_use 之前回传。
+                //   WHY：Anthropic thinking 模式下继续工具调用时，上游要求把上一轮 assistant 的
+                //   content 数组（含 {type:'thinking', thinking, signature}）原样回传；不回传时
+                //   DeepSeek /anthropic 端点按 tool_use id 恢复，恢复失败即 400
+                //   「The `content[].thinking` in the thinking mode must be passed back to the API」
+                //   （实测：未知 tool_use id ∧ 无 thinking 块 ⇒ 400；补任意 thinking 块 ⇒ 200）。
+                //   CC original: assistantContent = [thinking?, text?, ...tool_use]（同模型原样透传）。
+                appendThinkingBlock(blocks, m);
                 if (m.content() != null && !m.content().isEmpty()) {
                     blocks.add(ContentBlockParam.ofText(TextBlockParam.builder()
                         .text(m.content()).build()));
@@ -2764,8 +2807,21 @@ public class AnthropicSdkProvider implements LlmProvider {
             } else {
                 MessageParam.Role r = m.role() == Role.assistant
                     ? MessageParam.Role.ASSISTANT : MessageParam.Role.USER;
-                msgs.add(MessageParam.builder().role(r)
-                    .content(m.content() == null ? "" : m.content()).build());
+                // [thinking-passthrough] 纯文本 assistant 也带 thinking 块（同模型历史必须原样回传）。
+                //   无 reasoning 时保持原 String content 形态 —— 出站字节零变化（老会话/无思考轮）。
+                if (r == MessageParam.Role.ASSISTANT && hasThinkingBlock(m)) {
+                    List<ContentBlockParam> blocks = new ArrayList<>();
+                    appendThinkingBlock(blocks, m);
+                    if (m.content() != null && !m.content().isEmpty()) {
+                        blocks.add(ContentBlockParam.ofText(TextBlockParam.builder()
+                            .text(m.content()).build()));
+                    }
+                    msgs.add(MessageParam.builder().role(MessageParam.Role.ASSISTANT)
+                        .contentOfBlockParams(blocks).build());
+                } else {
+                    msgs.add(MessageParam.builder().role(r)
+                        .content(m.content() == null ? "" : m.content()).build());
+                }
             }
         }
         // [CC 对齐 · fork-400 专项 2026-10-10] 收尾 flush：历史以工具结果结尾时的最后一段 tool 结果组
@@ -3123,9 +3179,11 @@ public class AnthropicSdkProvider implements LlmProvider {
      *       upperLimit，并应用 DB {@code models.max_tokens ≥ 4096} 抬 upperLimit（G-17，CC context.ts:203-207）</li>
      *   <li>{@code tengu_otk_slot_v1} gate 开启时 default 被 cap 到
      *       {@code CAPPED_DEFAULT_MAX_TOKENS=8000}（CC claude.ts:3408-3410）</li>
-     *   <li>{@code settings.maxOutputTokens} 有界 override 生效（CC envValidation.ts:9-38，迁移自
-     *       {@code CLAUDE_CODE_MAX_OUTPUT_TOKENS} env；upperLimit 已含 DB cap → 可命中更高上限）</li>
      * </ol>
+     *
+     * <p>⚠️ 2026-11-12 撤掉 {@code settings.maxOutputTokens} 有界 override 层：
+     * 输出上限的配置入口唯一化为 {@code models.max_tokens}（模型配置页「生成参数 · max tokens」）。
+     * 本仓该设置项前端控件早已撤掉，只剩后端这一层在静默把 DB 值收窄，属半撤状态。
      *
      * @param model          模型名
      * @param modelMapper    模型 mapper（null → 纯家族表，无 cap）
@@ -3134,30 +3192,9 @@ public class AnthropicSdkProvider implements LlmProvider {
      */
     public static int getMaxOutputTokensForModel(String model, ModelMapper modelMapper, ProviderMapper providerMapper) {
         ModelMaxOutputTokens maxOutputTokens = getModelMaxOutputTokens(model, modelMapper, providerMapper);
-        int defaultTokens = isMaxTokensCapEnabled()
+        return isMaxTokensCapEnabled()
             ? Math.min(maxOutputTokens.defaultTokens(), CAPPED_DEFAULT_MAX_TOKENS)
             : maxOutputTokens.defaultTokens();
-        Integer settingsMaxOutputTokens = readSettingsMaxOutputTokens();
-        if (settingsMaxOutputTokens != null && log.isDebugEnabled()) {
-            log.debug("[AnthropicSdkProvider] settings.maxOutputTokens 命中: value={} upperLimit={} default={}"
-                    + "（>0 生效 / 超 upperLimit 封顶 / 非法回落 default）· 迁移自 CLAUDE_CODE_MAX_OUTPUT_TOKENS env · CC envValidation.ts:9-38",
-                settingsMaxOutputTokens, maxOutputTokens.upperLimit(), defaultTokens);
-        }
-        return validateBoundedIntEnvVar(
-            "settings.maxOutputTokens",
-            settingsMaxOutputTokens,
-            defaultTokens, maxOutputTokens.upperLimit());
-    }
-
-    /** [F1] settings.maxOutputTokens 单源读取（V27 列 · 迁移自 {@code CLAUDE_CODE_MAX_OUTPUT_TOKENS} env）·
-     *  mapper 未接线（null）或行缺失 → null（等价 CC env 未设置分支）。public 供 MaxTokensHandler
-     *  64k 升级 gate 复用（E4 发现 C：env 残留改 settings 单源）。 */
-    public static Integer readSettingsMaxOutputTokens() {
-        if (staticSettingsMapper == null) {
-            return null;
-        }
-        SettingsRecord row = staticSettingsMapper.selectOneById(SETTINGS_SINGLETON_ID);
-        return row == null ? null : row.getMaxOutputTokens();
     }
 
     /**
@@ -3178,20 +3215,13 @@ public class AnthropicSdkProvider implements LlmProvider {
     public static int resolveMaxOutputTokensForModel(ModelMapper modelMapper, ProviderMapper providerMapper, String model) {
         Integer dbMaxTokens = ModelNameResolver.resolveMaxTokens(modelMapper, providerMapper, model);
         if (dbMaxTokens != null) {
-            // [E4-A] DB 命中仍套 settings.maxOutputTokens 有界 override（default=upperLimit=dbMaxTokens →
-            //   settings 只能收窄 DB 值、不可超 DB）。对齐 CC claude.ts:3399-3419 "cap 抬上限 + env bound"
-            //   组合语义：models.max_tokens（前端可配）承载 CC cap 角色，settings.maxOutputTokens
-            //   （F1 迁移自 CLAUDE_CODE_MAX_OUTPUT_TOKENS env）承载 env 语义恒最后生效。修复前 DB 命中
-            //   直返原值、settings override 静默失效（E4 发现 A / 复验报告三.A）。
-            Integer settingsMaxOutputTokens = readSettingsMaxOutputTokens();
-            int effective = validateBoundedIntEnvVar(
-                "settings.maxOutputTokens", settingsMaxOutputTokens, dbMaxTokens, dbMaxTokens);
+            // ⚠️ 2026-11-12 撤掉 settings.maxOutputTokens 收窄层：DB 命中即该值，
+            //   输出上限唯一入口 = 模型配置页「生成参数 · max tokens」（models.max_tokens）。
             if (log.isDebugEnabled()) {
-                log.debug("[AnthropicSdkProvider] max_tokens DB 命中优先: model={} dbMaxTokens={} settingsOverride={} effective={}"
-                        + "（models.max_tokens 前端可配 · settings 有界收窄 · G-18 单源）",
-                    model, dbMaxTokens, settingsMaxOutputTokens, effective);
+                log.debug("[AnthropicSdkProvider] max_tokens DB 命中: model={} dbMaxTokens={}（G-18 单源）",
+                    model, dbMaxTokens);
             }
-            return effective;
+            return dbMaxTokens;
         }
         if (log.isDebugEnabled()) {
             log.debug("[AnthropicSdkProvider] max_tokens DB 未命中/无效, 回落 CC 家族表: model={}",
@@ -3225,59 +3255,6 @@ public class AnthropicSdkProvider implements LlmProvider {
      */
     public static boolean isMaxTokensCapEnabled() {
         return Boolean.parseBoolean(System.getProperty(TENGU_OTK_SLOT_V1_PROPERTY, "false"));
-    }
-
-    /**
-     * 有界整数 env 解析 · 对齐 CC {@code utils/envValidation.ts:9-38 validateBoundedIntEnvVar}。
-     *
-     * <p>语义：env 缺失/空 → default；非数字/≤0 → default（invalid）；&gt; upperLimit → upperLimit
-     * （capped）；否则原值。Java 端暴露为 package-private 便于测试直接驱动（Java 无法在测试中改 env）。
-     *
-     * @param name          env 名（仅日志语义）
-     * @param value         env 值（null/空 = 未设置）
-     * @param defaultValue  未设置/非法时的回落值
-     * @param upperLimit    上限（超过封顶）
-     * @return effective 值
-     */
-    static int validateBoundedIntEnvVar(String name, String value, int defaultValue, int upperLimit) {
-        if (value == null || value.isBlank()) {
-            return defaultValue;
-        }
-        int parsed;
-        try {
-            parsed = Integer.parseInt(value.trim());
-        } catch (NumberFormatException e) {
-            log.debug("{} 非法值 \"{}\" (回落默认: {}) · CC envValidation.ts", name, value, defaultValue);
-            return defaultValue;
-        }
-        if (parsed <= 0) {
-            log.debug("{} 非法值 \"{}\" (回落默认: {}) · CC envValidation.ts", name, value, defaultValue);
-            return defaultValue;
-        }
-        if (parsed > upperLimit) {
-            log.debug("{} 超上限封顶: {} → {}", name, parsed, upperLimit);
-            return upperLimit;
-        }
-        return parsed;
-    }
-
-    /**
-     * [F1] 有界整数 settings 解析（Integer 变体）· 同 CC {@code utils/envValidation.ts:9-38
-     * validateBoundedIntEnvVar} 语义：null → default；≤0 → default（invalid）；&gt; upperLimit →
-     * upperLimit（capped）；否则原值。委托 String 变体（复用封顶/非法日志），name 仅日志语义
-     * （settings.maxOutputTokens）。
-     *
-     * @param name         settings 名（仅日志语义）
-     * @param value        settings 值（null = 未配置，回落默认）
-     * @param defaultValue 未配置/非法时的回落值
-     * @param upperLimit   上限（超过封顶）
-     * @return effective 值
-     */
-    static int validateBoundedIntEnvVar(String name, Integer value, int defaultValue, int upperLimit) {
-        if (value == null) {
-            return defaultValue;
-        }
-        return validateBoundedIntEnvVar(name, String.valueOf(value), defaultValue, upperLimit);
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -3364,6 +3341,13 @@ public class AnthropicSdkProvider implements LlmProvider {
     static class StreamState {
         final StringBuilder content = new StringBuilder();
         final StringBuilder reasoning = new StringBuilder();
+        // [thinking-passthrough] thinking 块 signature 累积（流式 = signature_delta 事件，
+        //   非流式 = block.signature）。Anthropic 协议要求 thinking 模式下继续工具调用时
+        //   把上一轮 assistant 的 thinking 块（thinking + signature）原样回传，否则 400
+        //   「The content[].thinking in the thinking mode must be passed back to the API」
+        //   （第三方兼容端点按 tool_use id 恢复失败时）；真 Claude 还校验签名归属。
+        //   CC original: claude.ts 流式分支 signature_delta → {type:'thinking',…,signature}。
+        final StringBuilder signature = new StringBuilder();
         final Map<Integer, ToolCallAccumulator> toolCalls = new LinkedHashMap<>();
         int thinkingBlockIdx = -1;
         String finishReason = null;
@@ -3455,7 +3439,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             state.reasoning.toString(),
             apiError,
             usage,
-            state.requestId
+            state.requestId,
+            state.signature.length() == 0 ? null : state.signature.toString()
         );
     }
 

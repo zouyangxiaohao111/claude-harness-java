@@ -124,7 +124,14 @@ public final class KbGraphParser {
         if (arr == null) {
             return List.of();
         }
-        List<ExtractedRelation> out = new ArrayList<>();
+        // ⭐⭐ 同一对端点合并成一条 · 对齐源侧 WeKnora service/graph.go:272-303：
+        //   内存 map["source#target"] 去重，命中已有边时累加 chunkIDs、强度取加权平均
+        //   (old*len(chunkIDs)+new)/(len(chunkIDs)+1)；写库再走 Neo4j MERGE（幂等）。
+        //
+        //   本仓只继承了「一对端点一条边」的 DB 唯一索引语义，漏了这层去重 ⇒ 模型对同一对
+        //   实体给多条关系时直插撞 uq_kb_graph_relation_doc_edge ⇒ 整批中断（11-12 千岛湖 500）。
+        Map<String, ExtractedRelation> byEdge = new LinkedHashMap<>();
+        Map<String, Integer> edgeHits = new LinkedHashMap<>();
         for (JsonNode n : arr) {
             String source = text(n, "source");
             String target = text(n, "target");
@@ -141,13 +148,32 @@ public final class KbGraphParser {
                 log.debug("[图谱] 丢弃悬空关系 {}→{}（端点不在实体列表）", source, target);
                 continue;
             }
-            out.add(new ExtractedRelation(
+            ExtractedRelation r = new ExtractedRelation(
                 source, target,
                 text(n, "type"),
                 text(n, "description"),
-                clampStrength(n.path("strength").asInt(KbGraphPrompts.MIN_STRENGTH))));
+                clampStrength(n.path("strength").asInt(KbGraphPrompts.MIN_STRENGTH)));
+            String key = source + "\u0000" + target;
+            ExtractedRelation prev = byEdge.get(key);
+            if (prev == null) {
+                byEdge.put(key, r);
+                edgeHits.put(key, 1);
+            } else {
+                // 合并语义同源侧：保留首次的 type/description，强度按出现次数加权平均
+                int hits = edgeHits.get(key);
+                int merged = (int) Math.round(
+                    (prev.strength() * (double) hits + r.strength()) / (hits + 1));
+                edgeHits.put(key, hits + 1);
+                byEdge.put(key, new ExtractedRelation(
+                    prev.source(), prev.target(), prev.type(), prev.description(),
+                    clampStrength(merged)));
+            }
         }
-        return List.copyOf(out);
+        if (byEdge.size() < arr.size()) {
+            log.debug("[图谱] 同端点关系合并：原始 {} 条 → {} 条（强度加权平均，对齐源侧）",
+                arr.size(), byEdge.size());
+        }
+        return List.copyOf(byEdge.values());
     }
 
     /**

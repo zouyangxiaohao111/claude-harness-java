@@ -1,11 +1,20 @@
 package com.nexusai.kb.app.parser;
 
+import org.apache.poi.xwpf.usermodel.XWPFDocument;
+import org.apache.poi.xwpf.usermodel.XWPFTable;
+import org.apache.poi.xwpf.usermodel.XWPFTableCell;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Nested;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTTcPr;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.CTVMerge;
+import org.openxmlformats.schemas.wordprocessingml.x2006.main.STMerge;
 
+import java.io.OutputStream;
+import java.nio.file.Files;
 import java.nio.file.Path;
+import java.util.Arrays;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -32,12 +41,20 @@ class KbOfficeParserTest {
     class Supports {
 
         @Test
-        @DisplayName("Word/Excel/PPT 新旧扩展名都被识别")
+        @DisplayName("Word/Excel(.xls)/PPT 新旧扩展名都被识别；OOXML 表格已让给 KbXlsxParser")
         void recognisesAllOfficeExtensions() {
-            for (String ext : new String[]{"doc", "docx", "xls", "xlsx", "ppt", "pptx"}) {
+            for (String ext : new String[]{"doc", "docx", "xls", "ppt", "pptx"}) {
                 assertThat(parser.supports("a." + ext, null))
                     .as("扩展名 %s 应被 Office 解析器接管", ext).isTrue();
             }
+            // 2026-11-12：xlsx/xlsm/xltx/xlt 让给 KbXlsxParser —— 只有逐行渲染才带得出 Excel 行号。
+            // 旧断言「xlsx 由 Office 接管」已迁移成「不再接管」，⛔ 未删除用例。
+            for (String ext : new String[]{"xlsx", "xlsm", "xltx", "xlt"}) {
+                assertThat(parser.supports("a." + ext, null))
+                    .as("扩展名 %s 已让给 KbXlsxParser", ext).isFalse();
+                assertThat(parser.supportedExtensions()).doesNotContain(ext);
+            }
+            assertThat(parser.supportedExtensions()).contains("xls");
             assertThat(parser.supports("a.txt", "text/plain")).isFalse();
             assertThat(parser.supports("a.pdf", "application/pdf")).isFalse();
         }
@@ -148,6 +165,82 @@ class KbOfficeParserTest {
             assertThat(result.metadata().get(KbParsedDocument.META_MIME_TYPE))
                 .as("MIME 必须由 Tika 探测出来（不是扩展名硬编）")
                 .contains("wordprocessingml");
+        }
+
+        // ── docx vMerge 物化（对齐源站 docx_merge.py）──
+
+        @Test
+        @DisplayName("纵向合并：续行单元格原本为空，物化后两行都出现 restart 内容")
+        void verticalMergeCopiedIntoContinueRows(@TempDir Path dir) throws Exception {
+            Path docx = writeDocxWithVMerge(dir, false);
+
+            KbParsedDocument result = parser.parse(docx, KbParseContext.defaults().withWorkDir(dir.resolve("imgs")));
+
+            assertThat(result.text())
+                .as("restart 行本身照常")
+                .contains("| 甲 | 10 |");
+            assertThat(result.text())
+                .as("⛔ 续行在 Word XML 里是空单元格；不物化就只剩 |  | 20 |")
+                .contains("| 甲 | 20 |");
+        }
+
+        @Test
+        @DisplayName("纵向合并：两列各自合并时，续行的两列都要拿到各自 restart 的值")
+        void verticalMergeFillsEachColumnIndependently(@TempDir Path dir) throws Exception {
+            Path docx = writeDocxWithVMerge(dir, true);
+
+            KbParsedDocument result = parser.parse(docx, KbParseContext.defaults().withWorkDir(dir.resolve("imgs")));
+
+            // ⚠️ 不能断言 contains("| 甲 | 通过 |") —— restart 那一行本来就长这样，会假绿。
+            //    判据 = 两列各自都出现了<b>两行</b>同值（restart 行 + continue 行）。
+            long jiaRows = rowsContaining(result.text(), "甲");
+            long passRows = rowsContaining(result.text(), "通过");
+            assertThat(jiaRows).as("第一列合并 ⇒ 甲 必须出现在 2 行（restart + continue）").isEqualTo(2);
+            assertThat(passRows).as("第二列合并 ⇒ 通过 必须出现在 2 行（⛔ 只填第一列是常见半套实现）").isEqualTo(2);
+        }
+
+        private static long rowsContaining(String text, String needle) {
+            return Arrays.stream(text.split("\\R")).filter(line -> line.contains(needle)).count();
+        }
+
+        /**
+         * 造一个 3 行 × 2 列的带 vMerge docx：
+         * <pre>
+         * 标段 | 金额
+         * 甲   | 10      ← restart
+         * (空) | 20      ← continue（第二列是否也合并由 {@code twoGroups} 决定）
+         * </pre>
+         */
+        private static Path writeDocxWithVMerge(Path dir, boolean twoGroups) throws Exception {
+            Path file = dir.resolve(twoGroups ? "双列合并.docx" : "纵向合并.docx");
+            try (XWPFDocument doc = new XWPFDocument()) {
+                XWPFTable table = doc.createTable(3, 2);
+                table.getRow(0).getCell(0).setText("标段");
+                table.getRow(0).getCell(1).setText("金额");
+                table.getRow(1).getCell(0).setText("甲");
+                table.getRow(1).getCell(1).setText(twoGroups ? "通过" : "10");
+                table.getRow(2).getCell(0).setText("");
+                table.getRow(2).getCell(1).setText(twoGroups ? "" : "20");
+
+                applyVMerge(table.getRow(1).getCell(0), STMerge.RESTART);
+                applyVMerge(table.getRow(2).getCell(0), STMerge.CONTINUE);
+                if (twoGroups) {
+                    applyVMerge(table.getRow(1).getCell(1), STMerge.RESTART);
+                    applyVMerge(table.getRow(2).getCell(1), STMerge.CONTINUE);
+                }
+                try (OutputStream out = Files.newOutputStream(file)) {
+                    doc.write(out);
+                }
+            }
+            return file;
+        }
+
+        private static void applyVMerge(XWPFTableCell cell, STMerge.Enum type) {
+            CTTcPr properties = cell.getCTTc().isSetTcPr()
+                ? cell.getCTTc().getTcPr()
+                : cell.getCTTc().addNewTcPr();
+            CTVMerge merge = properties.isSetVMerge() ? properties.getVMerge() : properties.addNewVMerge();
+            merge.setVal(type);
         }
     }
 

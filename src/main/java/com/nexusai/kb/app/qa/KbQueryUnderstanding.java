@@ -52,11 +52,9 @@ public class KbQueryUnderstanding {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    /** 改写输出的 token 上限（无图）。 */
-    private static final int MAX_TOKENS_TEXT = 150;
-
-    /** 改写输出的 token 上限（有图：要装整段 OCR 文本）。 */
-    private static final int MAX_TOKENS_WITH_IMAGE = 2048;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS_TEXT(150) / MAX_TOKENS_WITH_IMAGE(2048)：
+    //   输出上限唯一入口 = models.max_tokens，调用点不再填值
+    //   （非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
 
     /** 改写温度（源侧写死 0.3）。 */
     private static final double TEMPERATURE = 0.3;
@@ -182,13 +180,11 @@ public class KbQueryUnderstanding {
             WEEKDAYS[LocalDateTime.now().getDayOfWeek().getValue() - 1],
             queryBlock);
 
-        int maxTokens = hasImages ? MAX_TOKENS_WITH_IMAGE : MAX_TOKENS_TEXT;
-
         String raw;
         try {
             if (log.isDebugEnabled()) {
-                log.debug("[查询改写] 调用模型 model={} max_tokens={} 有图={} 原问题={}",
-                    modelName, maxTokens, hasImages, original);
+                log.debug("[查询改写] 调用模型 model={} max_tokens=按模型配置 有图={} 原问题={}",
+                    modelName, hasImages, original);
             }
             raw = sideCallClient.chat(
                 config, modelName, systemPrompt, userPrompt,
@@ -203,7 +199,7 @@ public class KbQueryUnderstanding {
                     LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
                     TEMPERATURE,
                     USAGE_LABEL,
-                    null, maxTokens, null, null,
+                    null, null, null, null,
                     null, null, null, null,
                     null, null),
                 usage);

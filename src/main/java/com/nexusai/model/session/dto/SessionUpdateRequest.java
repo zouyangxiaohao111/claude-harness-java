@@ -26,7 +26,12 @@ public record SessionUpdateRequest(
      * <p>只影响主线程<b>工具可见性</b>：打开时 4 个知识库专属工具进入默认池，
      * ⛔ 不改变 {@code LlmAgentLoop.loop()} 的执行逻辑，也不是「本轮走 RAG 链」的开关。
      */
-    Boolean kbToolsEnabled
+    Boolean kbToolsEnabled,
+    /**
+     * 可选 · 左栏置顶标记（V283 列 pinned）· true = 置顶，false = 取消置顶（显式写 0），
+     * null = <b>不改动</b>该列（与 bareMode / coordinatorMode 同款 PATCH 语义）。
+     */
+    Boolean pinned
 ) {
     /**
      * 七参兼容构造器 · 保留 V75 加列前的既有调用形态（{@code new SessionUpdateRequest(title, model,
@@ -35,7 +40,8 @@ public record SessionUpdateRequest(
      */
     public SessionUpdateRequest(String title, String model, String modelName, String mainProjectId,
                                 Boolean bareMode, String permissionMode, String mainThreadAgent) {
-        this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent, null, null);
+        this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
+            null, null, null);
     }
 
     /**
@@ -45,6 +51,17 @@ public record SessionUpdateRequest(
                                 Boolean bareMode, String permissionMode, String mainThreadAgent,
                                 Boolean coordinatorMode) {
         this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
-            coordinatorMode, null);
+            coordinatorMode, null, null);
+    }
+
+    /**
+     * 九参兼容构造器 · 保留 V283 加列前的既有调用形态（带 kbToolsEnabled 的八参写法）。
+     * pinned 不传 = 不改动该列。
+     */
+    public SessionUpdateRequest(String title, String model, String modelName, String mainProjectId,
+                                Boolean bareMode, String permissionMode, String mainThreadAgent,
+                                Boolean coordinatorMode, Boolean kbToolsEnabled) {
+        this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
+            coordinatorMode, kbToolsEnabled, null);
     }
 }

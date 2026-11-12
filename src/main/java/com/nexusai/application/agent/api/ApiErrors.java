@@ -404,4 +404,78 @@ public final class ApiErrors {
         return normalized.equals("1") || normalized.equals("true")
             || normalized.equals("yes") || normalized.equals("on");
     }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 用户可读终态文案 · 前端错误卡的正文（非 CC 对齐项，本仓展示需要）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 把终态异常翻译成**用户能看懂的一句话**（前端错误卡 {@code ApiErrorCard} 的正文本体）。
+     *
+     * <p><b>WHY</b>：原实现直接把异常 message 塞给用户，实测出现的是
+     * {@code HTTP 550:}、{@code Request failed} 这类串 —— 用户既不知道为什么失败、也不知道该做什么。
+     * {@link #classifyApiError(Throwable)} 的 25 类此前只喂遥测（本类 javadoc 自述），
+     * 本方法把它接到展示面（额度不足 / 限流 / 过载 / 鉴权 / 连接 / 超时）。
+     *
+     * <p><b>口径</b>：中文结论在前，原始错误串作括号补充（便于排查，不让用户面对纯技术串）。
+     * 未知类型只回原始串（不编造原因）。
+     *
+     * @param error 终态异常（可为 null）
+     * @return 用户可读文案（非空）
+     */
+    public static String userFacingErrorMessage(Throwable error) {
+        if (error == null) {
+            return "模型调用失败，请重试。";
+        }
+        String raw = error.getMessage() != null && !error.getMessage().isBlank()
+            ? error.getMessage()
+            : error.getClass().getSimpleName();
+        String type = classifyApiError(error);
+        String hint = switch (type) {
+            case "credit_balance_low" -> QUOTA_HINT;
+            case "rate_limit" -> "请求过于频繁（已触发对方限流），请稍后再试";
+            case "server_overload" -> "模型服务当前过载，请稍后再试";
+            case "repeated_529" -> "模型服务连续过载，已停止重试，请稍后再试";
+            case "api_timeout" -> "模型响应超时，请重试";
+            case "auth_error", "invalid_api_key", "token_revoked", "oauth_org_not_allowed" ->
+                "鉴权失败（API Key 无效或已过期），请到设置里检查该模型的凭据";
+            case "invalid_model" -> "模型名称无效，请到设置里确认该模型是否可用";
+            case "connection_error" -> "连不上模型服务（网络中断或对方不可达），请检查网络后重试";
+            case "ssl_cert_error" -> "与模型服务的 TLS 连接校验失败，请检查代理或证书设置";
+            case "prompt_too_long" -> "上下文过长（超出模型上限），请压缩对话或新建会话";
+            case "server_error" -> "模型服务返回了服务端错误，请稍后再试";
+            case "client_error" -> null;   // 见下方额度收口：402/insufficient_quota 都落这个类，必须先判额度
+            default -> null;
+        };
+        // [quota-first] 额度判断**必须先于** client_error 兜底：OpenAI 兼容网关（DeepSeek 等）用
+        //   402 / insufficient_quota 表达余额不足，classifyApiError 把它们归到 client_error（status ≥ 400）
+        //   ⇒ 若先取 client_error 的通用文案，"额度不足"这条永远显示不出来（实测踩过）。
+        if (hint == null) {
+            if (error instanceof LlmApiException lae && lae.status() == 402) {
+                hint = QUOTA_HINT;
+            } else if (raw.contains("insufficient_quota") || raw.contains("Insufficient Balance")
+                || raw.contains("insufficient balance") || raw.contains("insufficient_user_quota")) {
+                hint = QUOTA_HINT;
+            } else if ("client_error".equals(type)) {
+                hint = "请求被模型服务拒绝，请稍后再试";
+            }
+        }
+        if (hint == null) {
+            return raw;
+        }
+        return hint + "（" + abbreviate(raw, 200) + "）";
+    }
+
+    /** 额度不足的统一话术（CC credit_balance_low / 402 / insufficient_quota 共用，避免多处文案漂移）。 */
+    private static final String QUOTA_HINT =
+        "账户额度不足（余额已用完或需要付费），充值或更换可用的模型服务后再试";
+
+    /** 截断长错误串（保留可排查信息，不让错误卡被整段 body 撑爆）。 */
+    private static String abbreviate(String s, int max) {
+        if (s == null) {
+            return "";
+        }
+        String oneLine = s.replaceAll("\\s+", " ").trim();
+        return oneLine.length() <= max ? oneLine : oneLine.substring(0, max) + "…";
+    }
 }

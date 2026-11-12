@@ -326,6 +326,15 @@ public class SessionService {
             }
         }
 
+        // [V283] 左栏置顶：PATCH 语义（null 不改动），写 0/1。
+        //   置顶只影响前端展示层排序（置顶区置前），后端 list() 的 ORDER BY 不变。
+        if (req.pinned() != null) {
+            s.setPinned(req.pinned() ? 1 : 0);
+            if (log.isInfoEnabled()) {
+                log.info("[SessionService] update: session={} pinned={}", id, req.pinned());
+            }
+        }
+
         sessionMapper.update(s);
         // [批 4a · 用户裁定 #12] PATCH 改绑项目（mainProjectId）后必须让旧冻结值失效：
         //   SessionProjectRoot.setForSession 是 putIfAbsent 首写胜 ⇒ 不清缓存则改绑后
@@ -640,26 +649,35 @@ public class SessionService {
     }
 
     /**
-     * 写入会话级禁用工具集合（V34 列 disabled_tools，JSON 数组）· 待前端对接 §29。
+     * 写入会话级禁用工具集合（V34 列 disabled_tools，JSON 数组）。
      *
-     * <p>空集合 → 存 null（读回空集合）；非空 → JSON 数组串。session 不存在 → NotFoundException。
+     * <p><b>三态语义（[tool-categories] 2026-11-12）</b>：
+     * <ul>
+     *   <li>{@code null}（列未写入）= 该会话<b>从未设置</b> → 读侧按默认禁用推断
+     *       （电脑操作 + 知识库，{@code SessionToolDisableConfig.getDisabledTools}）；</li>
+     *   <li>{@code "[]"} = 用户<b>显式全部启用</b>（把默认禁用的工具都打开了）→ 读侧返回空集；</li>
+     *   <li>{@code ["A","B"]} = 该集合中的工具被禁用。</li>
+     * </ul>
+     *
+     * <p>⚠️ 空集合必须存 {@code "[]"} 而不是 {@code null}：若存 null，用户把默认禁用的 50 项
+     * 全部手动打开后，读侧又会按默认规则判成「全部禁用」，打开操作被静默吞掉。
      *
      * @param sessionId 会话 ID（DB 键）
-     * @param disabled  禁用工具名集合（null 视为空集 → 存 null）
+     * @param disabled  禁用工具名集合（null 视为空集 → 存 {@code "[]"}）
      * @throws NotFoundException session 不存在
      */
     public void setDisabledTools(String sessionId, Set<String> disabled) {
         SessionRecord s = sessionMapper.selectOneById(sessionId);
         if (s == null) throw new NotFoundException("Session " + sessionId + " not found");
-        Set<String> norm = disabled == null ? Set.of() : new LinkedHashSet<>(disabled);
+        Set<String> norm = disabled == null ? new LinkedHashSet<>() : new LinkedHashSet<>(disabled);
         norm.remove(null);
-        String json = norm.isEmpty() ? null : JSON.toJSONString(new ArrayList<>(norm));
+        String json = norm.isEmpty() ? "[]" : JSON.toJSONString(new ArrayList<>(norm));
         s.setDisabledTools(json);
         s.setUpdatedAt(OffsetDateTime.now().toString());
         sessionMapper.update(s);
         if (log.isInfoEnabled()) {
             log.info("[SessionService] setDisabledTools: session={} disabled={}（V34 列 disabled_tools，"
-                    + "gap29 会话级工具禁用）", sessionId, norm);
+                    + "[] = 显式全开 / null = 从未设置走默认禁用）", sessionId, norm);
         }
     }
 
@@ -934,7 +952,9 @@ public class SessionService {
             cacheHitRateOf(s.getModelUsageJson()),
             // [V278] 会话级「引入知识库」开关透出（0/1 → Boolean，null 保持 null =
             //   未设置；主对话工具策略只认 Integer.valueOf(1) ⇒ null 与 0 同义，但透传原始三态）
-            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null
+            s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null,
+            // [V283] 左栏置顶标记透出（0/1 → Boolean，null 保持 null = 未设置）
+            s.getPinned() != null ? s.getPinned() != 0 : null
         );
     }
 

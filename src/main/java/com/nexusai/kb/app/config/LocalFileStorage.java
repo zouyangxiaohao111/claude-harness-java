@@ -32,9 +32,13 @@ public class LocalFileStorage implements KbFileStorage {
     private final Path root;
 
     public LocalFileStorage(
-        @Value("${nexusai.knowledge.storage-dir:${user.home}/.nexusai/kb-storage}") String storageDir
+        @Value("${nexusai.knowledge.storage-dir:}") String storageDir
     ) {
-        this.root = Path.of(storageDir).toAbsolutePath().normalize();
+        // [data-root] 未显式配置 ⇒ 统一数据根（安装目录优先，configHome 兜底）
+        String dir = (storageDir == null || storageDir.isBlank())
+            ? com.nexusai.common.NexusaiDataRoots.sub("kb-storage").toString()
+            : storageDir;
+        this.root = Path.of(dir).toAbsolutePath().normalize();
     }
 
     @Override

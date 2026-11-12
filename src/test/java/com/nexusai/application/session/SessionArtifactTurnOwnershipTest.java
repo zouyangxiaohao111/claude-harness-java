@@ -167,7 +167,7 @@ class SessionArtifactTurnOwnershipTest {
     @DisplayName("DTO 出站带 sourceMessageId（前端按它分组）")
     void dtoExposesOwner() {
         SessionArtifactDto dto = SessionArtifactDto.from(
-                row("art-3", "deliverable", "a.docx", "msg-user-2"), false);
+                row("art-3", "deliverable", "a.docx", "msg-user-2"), false, null, null);
 
         assertThat(dto.sourceMessageId()).isEqualTo("msg-user-2");
     }

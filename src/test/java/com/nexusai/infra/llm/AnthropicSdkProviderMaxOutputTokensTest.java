@@ -74,25 +74,8 @@ class AnthropicSdkProviderMaxOutputTokensTest {
         }
     }
 
-    @Test
-    @DisplayName("CLAUDE_CODE_MAX_OUTPUT_TOKENS env override 封顶 upperLimit（CC envValidation.ts:28-36）")
-    void envOverrideCappedToUpperLimit() {
-        // opus-4-6 upperLimit=128_000，default=64_000；env=150_000 → 封顶 128_000
-        assertThat(AnthropicSdkProvider.validateBoundedIntEnvVar(
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "150000", 64_000, 128_000))
-            .as("parsed > upperLimit → 封顶 upperLimit（CC envValidation.ts:28-36）")
-            .isEqualTo(128_000);
-        // env 非法 → 回落 default
-        assertThat(AnthropicSdkProvider.validateBoundedIntEnvVar(
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "abc", 64_000, 128_000))
-            .as("非数字 → 回落 default（CC envValidation.ts:18-27）")
-            .isEqualTo(64_000);
-        // env 合法且在界内 → 用 env
-        assertThat(AnthropicSdkProvider.validateBoundedIntEnvVar(
-            "CLAUDE_CODE_MAX_OUTPUT_TOKENS", "20000", 64_000, 128_000))
-            .as("合法 env → 直接使用（CC envValidation.ts:37）")
-            .isEqualTo(20_000);
-    }
+    // ⚠️ 2026-11-12 删除 envOverrideCappedToUpperLimit：settings.maxOutputTokens 有界 override 层
+    //   已撤掉（输出上限唯一入口 = models.max_tokens），对应 validateBoundedIntEnvVar 一并删除。
 
     /**
      * [ER-IMP-07] finishReason 归一化：raw stop_reason 'max_tokens' / 'model_context_window_exceeded'

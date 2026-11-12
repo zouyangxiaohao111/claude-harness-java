@@ -17,6 +17,7 @@ import org.apache.pdfbox.util.Matrix;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.core.annotation.Order;
 import org.springframework.stereotype.Component;
 
@@ -29,11 +30,17 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.Callable;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
 import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
@@ -89,7 +96,9 @@ import java.util.regex.Pattern;
  * metadata 记 {@code visionFailed=true} + 原因，并打 {@code log.warn}。理由：入库的价值在「有内容」，
  * 一次视觉超时不该让用户的上传白费；失败可观测即可。
  *
- * <p><b>串行</b>：视觉调用逐页串行（派单书硬约束）—— 并发会把模型配额打爆，且失败时无法定位到页。
+ * <p><b>视觉并发（有界）</b>：页图渲染仍<b>串行</b>（{@code PDDocument}/{@code PDFRenderer} 非线程安全），
+ * 识别阶段改用<b>有界固定线程池</b>（{@code nexusai.knowledge.vision.page-concurrency}，默认 4）
+ * 并发调视觉模型，结果按页号升序回填 —— 并发度有界不会打爆模型配额，失败仍逐页可定位（WARN 带页号）。
  */
 @Component
 @Order(10)
@@ -111,7 +120,12 @@ public class KbPdfParser implements KbDocumentParser {
      * <p>WHY：避免把「没有文字的真正空白页」（无图）也渲成图送视觉，白花钱。
      */
     static final double LOW_TEXT_IMAGE_RATIO = 0.1;
-    /** 页数上限（派单书硬约束；超出只解析前 200 页并记 truncated）。 */
+    /**
+     * 页数上限<b>默认值</b>（派单书硬约束；超出只解析前 N 页并记 truncated）。
+     *
+     * <p>生效值经 {@link #maxPages} 注入（yml {@code nexusai.knowledge.pdf.max-pages}，缺省本常量）；
+     * 本常量保留作文档默认值与离线单测的参照。
+     */
     static final int MAX_PAGES = 200;
     /** 单文档文本上限（与 Office/文本解析器统一口径）。 */
     static final int MAX_TEXT_CHARS = 2_000_000;
@@ -196,9 +210,62 @@ public class KbPdfParser implements KbDocumentParser {
     /** 视觉能力（可 null → 只抽文本层；Spring 装配恒注入，单测可传 null）。 */
     private final KbVisionCaller visionCaller;
 
+    /**
+     * 视觉逐页识别的并发度（有界固定线程池大小）。
+     *
+     * <p>Spring 环境从 {@code nexusai.knowledge.vision.page-concurrency} 读取（缺省 4）；
+     * 离线单测不经 Spring ⇒ 字段初值 4 生效。渲染阶段仍是串行，见 {@link #applyVision}。
+     */
+    @Value("${nexusai.knowledge.vision.page-concurrency:4}")
+    private int pageConcurrency = 4;
+
+    /**
+     * 单文档解析页数上限（超出部分不解析，只在 metadata 记 {@code truncated}）。
+     *
+     * <p>Spring 环境从 {@code nexusai.knowledge.pdf.max-pages} 读取（缺省 {@value #MAX_PAGES}）；
+     * 离线单测不经 Spring ⇒ 字段初值 = {@link #MAX_PAGES}，也可经 3 参构造器显式指定。
+     */
+    @Value("${nexusai.knowledge.pdf.max-pages:200}")
+    private int maxPages = MAX_PAGES;
+
+    /**
+     * 页图渲染的长边上限（px）· 源站 docreader {@code pdf_render_max_edge}（config.py:136-142）。
+     *
+     * <p>Spring 环境从 {@code nexusai.knowledge.pdf.render-max-edge} 读取（缺省 2000）；
+     * 离线单测吃字段初值 2000 —— 与 {@link PdfSupport#PDF_RENDER_MAX_EDGE} 同一口径。
+     */
+    @Value("${nexusai.knowledge.pdf.render-max-edge:2000}")
+    private int renderMaxEdge = PdfSupport.PDF_RENDER_MAX_EDGE;
+
     @Autowired
     public KbPdfParser(KbVisionCaller visionCaller) {
         this.visionCaller = visionCaller;
+    }
+
+    /**
+     * 可注入并发度的构造器 · 供离线单测显式指定线程池大小。
+     *
+     * <p>为什么不靠 {@code @Value} 字段注入：离线单测不经 Spring，{@code @Value} 不生效，
+     * 只能吃字段初值 4 —— 想验证「并发度真的决定同时在跑的人数」就需要能显式指定。
+     *
+     * @param visionCaller    视觉能力（可 null）
+     * @param pageConcurrency 识别阶段并发度（&lt;1 时按 1 处理）
+     */
+    KbPdfParser(KbVisionCaller visionCaller, int pageConcurrency) {
+        this(visionCaller, pageConcurrency, MAX_PAGES);
+    }
+
+    /**
+     * 可注入并发度 + 页数上限的构造器 · 供离线单测显式指定（如「maxPages=3 时第 4 页不处理」）。
+     *
+     * @param visionCaller    视觉能力（可 null）
+     * @param pageConcurrency 识别阶段并发度（&lt;1 时按 1 处理）
+     * @param maxPages        页数上限（&lt;=0 时回落 {@link #MAX_PAGES}）
+     */
+    KbPdfParser(KbVisionCaller visionCaller, int pageConcurrency, int maxPages) {
+        this.visionCaller = visionCaller;
+        this.pageConcurrency = Math.max(1, pageConcurrency);
+        this.maxPages = maxPages > 0 ? maxPages : MAX_PAGES;
     }
 
     /** 无视觉能力的构造（弱降级：仅文本层）· 供离线单测使用。 */
@@ -232,6 +299,12 @@ public class KbPdfParser implements KbDocumentParser {
         return "内置 PDF 解析";
     }
 
+    /** 引擎族名别名 · 源站内置 PDF 引擎为 {@code builtin}（另收 {@code pdf} 便于按类型点名）。 */
+    @Override
+    public Set<String> engineFamilyNames() {
+        return Set.of("builtin", "pdf");
+    }
+
     @Override
     public KbParsedDocument parse(Path file, KbParseContext ctx) {
         String fileName = file.getFileName().toString();
@@ -244,9 +317,21 @@ public class KbPdfParser implements KbDocumentParser {
         List<String> pageTexts;
         List<Boolean> isTextPage = new ArrayList<>();
         List<Double> areaRatioPerPage = new ArrayList<>();
+        /**
+         * 每页是否存在图片绘制事件（与 {@code pageTexts} 同下标）。
+         *
+         * <p>用途只有一个：正文拼装时判断「无文字页要不要留标题」—— 有图的页即便没有文本层
+         * 也是真实内容页（图片引用会挂到这一页），不能当空白页跳过。
+         */
+        List<Boolean> hasImagePerPage = new ArrayList<>();
         /** 每页「分类时刻」的纯文本字符数（页眉页脚去重之前）—— 判定用它，日志也用它，避免两处口径漂移。 */
         List<Integer> plainLengths = new ArrayList<>();
         List<Integer> visionPages = new ArrayList<>();
+        /**
+         * 每页的版面几何（与 {@code pageTexts} 同下标）· 只用于给 source block 算 bbox，
+         * 不参与正文。旋转页与无字形的页存 {@link PageGeometry#NONE}（坐标不可用 ⇒ 不伪造）。
+         */
+        List<PageGeometry> pageGeometries = new ArrayList<>();
         List<ImageCandidate> imageCandidates = new ArrayList<>();
         Map<String, Integer> imageDropReasons = new HashMap<>();
         Path imageDir = KbImageSink.resolveImageDir(file, ctx);
@@ -254,7 +339,7 @@ public class KbPdfParser implements KbDocumentParser {
         // ── 1. 逐页：文本层（+字形）+ 图片绘制事件（面积比 + bbox）──
         try (PDDocument doc = Loader.loadPDF(file.toFile())) {
             pageCount = doc.getNumberOfPages();
-            parsedPages = Math.min(pageCount, MAX_PAGES);
+            parsedPages = Math.min(pageCount, maxPages);
             pageTexts = new ArrayList<>(parsedPages);
             areaRatioPerPage = new ArrayList<>(parsedPages);
 
@@ -280,6 +365,7 @@ public class KbPdfParser implements KbDocumentParser {
                 // ② 图片绘制事件（面积比是扫描页判定的主信号）
                 PageGraphics graphics = analyzePageGraphics(page);
                 areaRatioPerPage.add(graphics.areaRatio());
+                hasImagePerPage.add(!graphics.draws().isEmpty());
                 plainLengths.add(plain.length());
                 boolean scanned = needsVision(plain, graphics.areaRatio());
                 isTextPage.add(!scanned);
@@ -307,6 +393,13 @@ public class KbPdfParser implements KbDocumentParser {
                     collectImageCandidates(graphics, p, pageAreaOf(page), fileName,
                         imageCandidates, imageDropReasons);
                 }
+
+                // ⑤ 版面几何（source block 的 bbox 来源）
+                //   ⛔ 旋转页的 TextPosition 在「旋转后显示空间」，与 CropBox 不同源 ⇒ 坐标不可信，
+                //      不采信几何（各段 locator 只带页码、不带区域）。
+                pageGeometries.add(page.getRotation() % 360 == 0
+                    ? pageGeometry(glyphs)
+                    : PageGeometry.NONE);
             }
 
             // ── 2. 内嵌图：跨页重复/尺寸/上限筛选后落盘 ──
@@ -349,16 +442,66 @@ public class KbPdfParser implements KbDocumentParser {
                 }
             }
 
-            // ── 5. 按页拼 Markdown ──
+            // ── 5. 按页拼 Markdown（空页不产标题，对齐源站 pdf_parser.py 丢弃空文本块）──
+            //   「空页」= 无文字（分类时刻纯文本为空）且 未被判为扫描页 且 无图片。
+            //   ⚠️ 不要只看 body：页眉页脚去重会把「只有重复页眉」的文本页 body 清空，那仍是有文字的页。
+            //   ⭐ 本轮只**旁路记账** source block：正文拼接语句与顺序逐字不变，块只是同一批段落的坐标。
             StringBuilder sb = new StringBuilder();
+            List<PendingBlock> pendingBlocks = new ArrayList<>();
+            int headingPages = 0;
+            boolean anyBodyText = false;
+            List<Integer> skippedEmptyPages = new ArrayList<>();
             for (int i = 0; i < parsedPages; i++) {
+                int pageNo = i + 1;
+                boolean hasText = plainLengths.get(i) > 0;
+                boolean scanned = visionPages.contains(pageNo);
+                boolean hasImage = Boolean.TRUE.equals(hasImagePerPage.get(i));
+                if (!hasText && !scanned && !hasImage) {
+                    // 空白页：不产标题、不产正文 —— 否则正文会只剩 "## 第 N 页"，冒充「有内容」
+                    //   ⛔ 也不产 source block（没有正文可定位）
+                    skippedEmptyPages.add(pageNo);
+                    continue;
+                }
                 String body = pageTexts.get(i);
-                sb.append(pageHeading(i + 1)).append("\n\n");
+                sb.append(pageHeading(pageNo)).append("\n\n");
+                headingPages++;
                 if (!body.isEmpty()) {
+                    anyBodyText = true;
+                    int bodyStartChar = sb.length();
                     sb.append(body).append("\n\n");
+                    collectPageBlocks(pendingBlocks, pageNo, body, bodyStartChar, pageGeometries.get(i));
                 }
             }
-            result = KbParsers.truncate(sb.toString().strip(), MAX_TEXT_CHARS);
+            if (!skippedEmptyPages.isEmpty()) {
+                log.info("KbPdfParser: 空白页跳过 file={} 总页数={} 解析页={} 产出标题页数={} 跳过空页数={} 空页页号={}",
+                    fileName, pageCount, parsedPages, headingPages, skippedEmptyPages.size(),
+                    abbreviatePages(skippedEmptyPages));
+            } else {
+                log.info("KbPdfParser: 空白页跳过 file={} 总页数={} 解析页={} 产出标题页数={} 跳过空页数=0",
+                    fileName, pageCount, parsedPages, headingPages);
+            }
+            String rawText = sb.toString();
+            // strip 会吃掉前导空白：块区间按「未 strip 的正文」记的 char 下标，必须整体左移同样的码点数
+            int leadingCodePoints = rawText.codePointCount(0, rawText.length())
+                - rawText.stripLeading().codePointCount(0, rawText.stripLeading().length());
+            result = KbParsers.truncate(rawText.strip(), MAX_TEXT_CHARS);
+            List<KbSourceBlock> sourceBlocks =
+                toSourceBlocks(pendingBlocks, rawText, leadingCodePoints, result.text());
+            if (log.isInfoEnabled()) {
+                int totalCp = result.text().codePointCount(0, result.text().length());
+                int coveredCp = coveredCodePoints(sourceBlocks, totalCp);
+                int blockPages = coveredPages(sourceBlocks);
+                long withBbox = sourceBlocks.stream()
+                    .filter(b -> b.locator().bbox() != null).count();
+                log.info("KbPdfParser: 源位置块 file={} 总块数={} 覆盖页数={} 覆盖码点={}/{} 码点覆盖率={} 带bbox块数={}",
+                    fileName, sourceBlocks.size(), blockPages, coveredCp, totalCp,
+                    totalCp == 0 ? "0.0%" : String.format(Locale.ROOT, "%.1f%%", 100.0 * coveredCp / totalCp),
+                    withBbox);
+            }
+            if (sourceBlocks.isEmpty() && anyBodyText) {
+                log.warn("[溯源] PDF 正文非空但未产出 source block file={} 解析页={} chars={}",
+                    fileName, parsedPages, result.text().length());
+            }
 
             // ── 6. 元数据 ──
             KbParsers.fillCommonMetadata(meta, fileName, null, this);
@@ -396,13 +539,14 @@ public class KbPdfParser implements KbDocumentParser {
                     imageDominatedPages++;
                 }
             }
+            meta.put(KbParsedDocument.META_SOURCE_BLOCKS, String.valueOf(sourceBlocks.size()));
             log.info("KbPdfParser: 解析完成 file={} 页数={} 解析页={} 视觉页={} 视觉失败={} 图片={}"
-                    + "（内嵌图保留={} 丢弃={} 原因={} 图占半页以上的页={} 最大面积比={}） chars={}",
+                    + "（内嵌图保留={} 丢弃={} 原因={} 图占半页以上的页={} 最大面积比={}） chars={} sourceBlocks={}",
                 fileName, pageCount, parsedPages, visionDone, visionFailed, images.size(),
                 embeddedKept, embeddedDropped, imageDropReasons, imageDominatedPages,
-                fmt(maxAreaRatio), result.text().length());
+                fmt(maxAreaRatio), result.text().length(), sourceBlocks.size());
 
-            return new KbParsedDocument(result.text(), images, meta);
+            return new KbParsedDocument(result.text(), images, meta, sourceBlocks);
         } catch (IOException e) {
             throw new KbParseException("PDF 解析失败（文件损坏或加密）: " + fileName
                 + " — " + e.getMessage(), e);
@@ -414,10 +558,29 @@ public class KbPdfParser implements KbDocumentParser {
     // ════════════════════════════════════════════════════════════════════════
 
     /**
-     * 视觉补强 · 连续页合并成区间渲染（{@link PdfSupport#extractPDFPages} 只支持连续区间），
-     * 再按页序串行调视觉模型，结果原地写回 {@code pageTexts}。
+     * 扫描页专用视觉提示词 · <b>只对本解析器的页图使用</b>（其他路径的 prompt 不变）。
+     *
+     * <p>WHY 不能用「描述这张图」类通用提示：扫描页的页图就是整页文档，我们需要的不是对图片的
+     * 描述，而是<b>逐块转写</b>出的正文（入库/召回吃的是文字，图片说明对 RAG 无用）。
+     * 通用描述会让模型输出「这是一张黑白扫描的合同页面……」这类元叙述，既占 token 又污染正文。
+     *
+     * <p>语义对齐源站 docreader 的页级转写意图：逐块转写文字、保留表格/公式/版面顺序为 Markdown、
+     * 不描述图片内容本身。
+     */
+    static final String SCAN_PAGE_PROMPT = "这是一份 PDF 文档的扫描页图片。请逐块转写页面上的全部文字，"
+        + "保留表格、公式与版面顺序，输出为 Markdown；不要描述图片本身的内容或外观。";
+
+    /**
+     * 视觉补强 · <b>渲染阶段保持串行</b>（连续页合并成区间；{@link PdfSupport#extractPDFPages} 内部用
+     * {@code PDDocument}/{@code PDFRenderer}，非线程安全），<b>识别阶段</b>改用有界固定线程池
+     * （{@code nexusai.knowledge.vision.page-concurrency}，默认 4）并发调视觉模型，
+     * 结果按页号升序回填 {@code pageTexts} 与 {@code images}。
+     *
+     * <p><b>为什么回填前必须排序</b>：并发完成顺序不确定，但 {@code pageTexts} 的下标与
+     * {@code images} 的追加顺序必须与串行版<b>完全一致</b>（页号升序），否则正文页序会随线程调度漂移。
      *
      * <p>逐页独立 fail-soft：某页失败只影响该页（保留文本层），不让整份解析失败。
+     * 线程池在 {@code finally} 里 {@code shutdown}（含异常/中断路径）。
      *
      * @return 汇总结果（是否发生过失败 / 失败原因 / 成功页数）
      */
@@ -426,13 +589,18 @@ public class KbPdfParser implements KbDocumentParser {
                                       List<KbImageRef> images) {
         String fileName = file.getFileName().toString();
         Path renderDir = imageDir.resolve("pages");
-        int completed = 0;
+        // 预处理产物目录：只给「送视觉」的那份用，图片引用（KbImageRef）仍指原页图 ⇒ 用完即删。
+        Path preDir = renderDir.resolve("pre");
+        List<Path> preFiles = new ArrayList<>();
         List<String> failures = new ArrayList<>();
+        List<PageTask> tasks = new ArrayList<>();
 
+        // ── ① 渲染（串行）：页图落盘之后才进并发识别 ──
         for (int[] range : contiguousRanges(visionPages)) {
             int from = range[0];
             int to = range[1];
-            PdfSupport.PdfExtractResult extract = PdfSupport.extractPDFPages(file, renderDir, from, to);
+            PdfSupport.PdfExtractResult extract =
+                PdfSupport.extractPDFPages(file, renderDir, from, to, renderMaxEdge);
             if (!extract.success()) {
                 String reason = "第 " + from + "-" + to + " 页渲染失败: " + extract.error().message();
                 failures.add(reason);
@@ -446,31 +614,143 @@ public class KbPdfParser implements KbDocumentParser {
                     log.warn("KbPdfParser: 页图缺失 file={} page={}", fileName, p);
                     continue;
                 }
-                String absolute = jpg.toAbsolutePath().toString();
-                try {
-                    String described = visionCaller.describeImage(jpg, null, ctx);
-                    if (isNoTextSentinel(described)) {
-                        // 纯图/空白页：视觉模型明确回了 NO_TEXT，不把哨兵写进正文
-                        if (pageTexts.get(p - 1).isEmpty()) {
-                            pageTexts.set(p - 1, "");
-                        }
-                        images.add(new KbImageRef(p, absolute, "", KbImageRef.KIND_PDF_PAGE));
-                        completed++;
+                // 扫描页预处理（白边裁剪 + 小角度纠偏）· 只换「送视觉」的路径：
+                //   PageTask.jpg 是发给视觉模型的图，absolutePath 仍是原页图（图片引用不能被预处理路径污染）。
+                //   失败 / 开关关闭时 preprocess 原样返回 jpg ⇒ 走原图，不额外判空。
+                Path toSend = KbImagePreprocessor.preprocess(jpg, preDir);
+                if (!toSend.equals(jpg)) {
+                    preFiles.add(toSend);
+                }
+                tasks.add(new PageTask(p, toSend, jpg.toAbsolutePath().toString()));
+            }
+        }
+
+        int completed = 0;
+        int total = tasks.size();
+        int threads = Math.max(1, Math.min(pageConcurrency, total));
+        long startedAt = System.nanoTime();
+        if (total > 0) {
+            // ── ② 识别（并发，有界）：渲染已完成，按页提交；回填仍按页号升序 ──
+            //   ⛔ 不要在这里用 completedFuture（那是串行，会让并发用例恒为 1）
+            final java.util.concurrent.atomic.AtomicInteger threadNo =
+                new java.util.concurrent.atomic.AtomicInteger();
+            ExecutorService pool = Executors.newFixedThreadPool(threads, r -> {
+                Thread t = new Thread(r, "kb-pdf-vision-" + threadNo.incrementAndGet());
+                t.setDaemon(true);
+                return t;
+            });
+            List<Future<PageVisionResult>> futures = new ArrayList<>(total);
+            try {
+                for (PageTask task : tasks) {
+                    futures.add(pool.submit(() -> describePage(task, ctx)));
+                }
+            } finally {
+                pool.shutdown();
+            }
+
+            // ── ② 回填（单线程、页号升序）：顺序与下标同串行版一致 ──
+            //   finally 里删预处理产物：它只服务本次视觉调用，图片引用记的仍是原页图。
+            try {
+                List<PageVisionResult> results = new ArrayList<>(futures.size());
+                for (int i = 0; i < futures.size(); i++) {
+                    PageTask task = tasks.get(i);
+                    try {
+                        results.add(futures.get(i).get());
+                    } catch (InterruptedException e) {
+                        Thread.currentThread().interrupt();
+                        results.add(PageVisionResult.failed(task.page(), task.absolutePath(), "视觉调用被中断"));
+                    } catch (ExecutionException e) {
+                        Throwable cause = e.getCause() == null ? e : e.getCause();
+                        results.add(PageVisionResult.failed(task.page(), task.absolutePath(),
+                            String.valueOf(cause.getMessage())));
+                    }
+                }
+                results.sort(Comparator.comparingInt(PageVisionResult::page));
+
+                for (PageVisionResult r : results) {
+                    if (r.failed()) {
+                        failures.add("第 " + r.page() + " 页视觉调用失败: " + r.reason());
+                        log.warn("KbPdfParser: 视觉调用失败，该页保留文本层 file={} page={} 原因={}",
+                            fileName, r.page(), r.reason());
+                        images.add(KbImageRef.of(r.page(), r.imagePath(), KbImageRef.KIND_PDF_PAGE));
                         continue;
                     }
-                    pageTexts.set(p - 1, described.strip());
-                    images.add(new KbImageRef(p, absolute, truncateCaption(described), KbImageRef.KIND_PDF_PAGE));
+                    if (r.noText()) {
+                        // 纯图/空白页：视觉模型明确回了 NO_TEXT，不把哨兵写进正文
+                        if (pageTexts.get(r.page() - 1).isEmpty()) {
+                            pageTexts.set(r.page() - 1, "");
+                        }
+                        images.add(new KbImageRef(r.page(), r.imagePath(), "", KbImageRef.KIND_PDF_PAGE));
+                    } else {
+                        pageTexts.set(r.page() - 1, r.text());
+                        images.add(new KbImageRef(r.page(), r.imagePath(), r.caption(),
+                            KbImageRef.KIND_PDF_PAGE));
+                    }
                     completed++;
+                }
+            } finally {
+                for (Path pre : preFiles) {
+                    try {
+                        Files.deleteIfExists(pre);
+                    } catch (Exception e) {
+                        log.debug("KbPdfParser: 删除预处理临时图失败 path={} 原因={}", pre, e.getMessage());
+                    }
+                }
+                try {
+                    // 只在目录已空时才会成功；非空（别的解析同时在用 / 删除失败）就留在那儿，不算错
+                    Files.deleteIfExists(preDir);
+                } catch (java.nio.file.DirectoryNotEmptyException e) {
+                    log.debug("KbPdfParser: 预处理目录非空，保留 path={}", preDir);
                 } catch (Exception e) {
-                    failures.add("第 " + p + " 页视觉调用失败: " + e.getMessage());
-                    log.warn("KbPdfParser: 视觉调用失败，该页保留文本层 file={} page={} 原因={}",
-                        fileName, p, e.getMessage());
-                    images.add(KbImageRef.of(p, absolute, KbImageRef.KIND_PDF_PAGE));
+                    log.debug("KbPdfParser: 清理预处理目录失败 path={} 原因={}", preDir, e.getMessage());
                 }
             }
         }
+        long elapsedMs = (System.nanoTime() - startedAt) / 1_000_000L;
+        log.info("KbPdfParser: 视觉识别汇总 file={} 并发度={} 视觉页={} 待识别页={} 成功={} 失败页={} 耗时={}ms",
+            fileName, threads, visionPages.size(), total, completed, total - completed, elapsedMs);
         return new VisionOutcome(completed, !failures.isEmpty(),
             failures.isEmpty() ? null : String.join("；", failures.subList(0, Math.min(failures.size(), 3))));
+    }
+
+    /** 待识别的一页：页号 + 页图路径（渲染产物）· 只读快照，供并发任务使用。 */
+    private record PageTask(int page, Path jpg, String absolutePath) {
+    }
+
+    /**
+     * 一页的视觉识别结果（并发任务产物）。
+     *
+     * <p>{@code reason} 非空 ⇒ 该页失败（保留文本层）；{@code noText} ⇒ 模型回了 NO_TEXT 哨兵。
+     */
+    private record PageVisionResult(int page, String imagePath, String text, String caption,
+                                    boolean noText, String reason) {
+
+        static PageVisionResult failed(int page, String imagePath, String reason) {
+            return new PageVisionResult(page, imagePath, null, null, false, reason);
+        }
+
+        boolean failed() {
+            return reason != null;
+        }
+    }
+
+    /**
+     * 单页识别 · 在池线程里执行；<b>异常一律转成失败结果</b>（fail-soft，不让整份解析失败）。
+     *
+     * <p>提示词固定用 {@link #SCAN_PAGE_PROMPT}（逐块转写为 Markdown），不是「描述图片」——
+     * 见该常量 javadoc。改前传的是 {@code null}（由调用方实现决定默认提示），会把页图当普通图片描述。
+     */
+    private PageVisionResult describePage(PageTask task, KbParseContext ctx) {
+        try {
+            String described = visionCaller.describeImage(task.jpg(), SCAN_PAGE_PROMPT, ctx);
+            if (isNoTextSentinel(described)) {
+                return new PageVisionResult(task.page(), task.absolutePath(), "", "", true, null);
+            }
+            return new PageVisionResult(task.page(), task.absolutePath(), described.strip(),
+                truncateCaption(described), false, null);
+        } catch (Exception e) {
+            return PageVisionResult.failed(task.page(), task.absolutePath(), e.getMessage());
+        }
     }
 
     /** 视觉补强汇总（{@code appliedPages}=成功页数，{@code failed}=是否有失败页）。 */
@@ -2177,6 +2457,308 @@ public class KbPdfParser implements KbDocumentParser {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // 源位置块（page + bbox）· 对齐源站 docreader/parser/source_locator.py
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 一行版面文字的几何（PDF 用户空间 pt，原点 = CropBox 左下角，y 向上）。
+     *
+     * <p>只留矩形，<b>不持有字形</b>：几何要活到「正文拼装结束」才用得上，
+     * 若按页累积 {@link Glyph}，一份 200 页 PDF 会把整篇的字形都留在内存里。
+     */
+    private record LineGeom(String text, double x0, double y0, double x1, double y1) {
+    }
+
+    /** 一页的版面几何；{@link #NONE} 表示坐标不可用（旋转页 / 无字形 / 页框非法）。 */
+    private record PageGeometry(double width, double height, List<LineGeom> lines) {
+
+        static final PageGeometry NONE = new PageGeometry(0.0, 0.0, List.of());
+
+        boolean usable() {
+            return width > 0 && height > 0 && !lines.isEmpty();
+        }
+    }
+
+    /**
+     * 待落成 {@link KbSourceBlock} 的一段正文（尚未换算码点）。
+     *
+     * @param page      1-based 页号
+     * @param startChar {@code [start, end)} 是<b>正文 StringBuilder 的 char 下标</b>（拼装那一刻记的）
+     * @param endChar   同上（不含）
+     * @param bbox      比例值 0–1；{@code null} = 该页几何不可用（不伪造）
+     */
+    record PendingBlock(int page, int startChar, int endChar, double[] bbox) {
+    }
+
+    /**
+     * 抽取一页的版面几何（与 {@link #layoutMarkdown} 同一条「分栏 → 组行 → 标点合并」流水线）。
+     *
+     * <p><b>为什么必须复用同一条流水线</b>：段落文本就是 {@code layoutMarkdown} 的输出，
+     * 几何行只有用同样的分栏与标点合并才可能逐行对上。用「全页字形按 y 分组」时，双栏页会把
+     * 左右两栏同高的字拼成一行 —— 文本永远对不上，bbox 只能退化成整页文字区。
+     */
+    private static PageGeometry pageGeometry(PageGlyphData data) {
+        List<Glyph> chars = data == null ? List.of() : data.glyphs();
+        if (chars.isEmpty() || data.width() <= 0 || data.height() <= 0) {
+            return PageGeometry.NONE;
+        }
+        double scale = medianHeight(chars);
+        if (scale <= 0) {
+            scale = 1.0;
+        }
+        List<List<Glyph>> columns = filterReadingColumns(chars, scale, data.width(),
+            splitColumns(chars, scale, data.width(), 0));
+        List<LineGeom> lines = new ArrayList<>();
+        for (List<Glyph> col : columns) {
+            for (Line ln : mergeOrphanPunctuationLines(groupLines(col))) {
+                lines.add(new LineGeom(ln.text(), ln.x0(), ln.y0(), ln.x1(), ln.y1()));
+            }
+        }
+        return new PageGeometry(data.width(), data.height(), lines);
+    }
+
+    /**
+     * 一页正文按「空行」切段（返回各段的 {@code [start, end)} char 区间，已去首尾空白）。
+     *
+     * <p>口径与 {@link KbSourceIndex#textBlocks} 的段落一致：连续非空行组成一段，空行是段界。
+     * <b>只读切片</b> —— 正文仍由调用方原样拼接，本方法不产出任何文本。
+     */
+    static List<int[]> paragraphRanges(String body) {
+        List<int[]> out = new ArrayList<>();
+        if (body == null || body.isEmpty()) {
+            return out;
+        }
+        int paraStart = -1;
+        int paraEnd = -1;
+        int pos = 0;
+        while (pos <= body.length()) {
+            int nl = body.indexOf('\n', pos);
+            int lineEnd = nl < 0 ? body.length() : nl;
+            if (body.substring(pos, lineEnd).isBlank()) {
+                if (paraStart >= 0) {
+                    addParagraph(out, body, paraStart, paraEnd);
+                    paraStart = -1;
+                }
+            } else {
+                if (paraStart < 0) {
+                    paraStart = pos;
+                }
+                paraEnd = lineEnd;
+            }
+            if (nl < 0) {
+                break;
+            }
+            pos = nl + 1;
+        }
+        if (paraStart >= 0) {
+            addParagraph(out, body, paraStart, paraEnd);
+        }
+        return out;
+    }
+
+    private static void addParagraph(List<int[]> out, String body, int start, int end) {
+        while (start < end && Character.isWhitespace(body.charAt(start))) {
+            start++;
+        }
+        while (end > start && Character.isWhitespace(body.charAt(end - 1))) {
+            end--;
+        }
+        if (end > start) {
+            out.add(new int[]{start, end});
+        }
+    }
+
+    /**
+     * 段落 → 页面区域（比例值 0–1，原点在渲染页左上角）。
+     *
+     * <p>逐行在<b>该页已有几何行</b>里找对应矩形并求并集；一行都对不上时（{@code PDFTextStripper}
+     * 的换行/空格与几何行不同源、或正文来自视觉转写）退化为<b>该页文字区的合并矩形</b>。
+     * ⛔ 绝不写 {@code 0,0,0,0}：那会把「定位不到」伪装成「定位到页面左上角的一个点」。
+     *
+     * @return {@code [x0,y0,x1,y1]}（0–1）；几何不可用时 {@code null}
+     */
+    private static double[] paragraphBbox(PageGeometry geo, String paragraph) {
+        if (geo == null || !geo.usable()) {
+            return null;
+        }
+        List<LineGeom> lines = geo.lines();
+        boolean[] used = new boolean[lines.size()];
+        double minX = Double.POSITIVE_INFINITY;
+        double minY = Double.POSITIVE_INFINITY;
+        double maxX = Double.NEGATIVE_INFINITY;
+        double maxY = Double.NEGATIVE_INFINITY;
+        boolean matched = false;
+        for (String rawLine : paragraph.split("\n", -1)) {
+            String compact = compactForMatch(rawLine);
+            if (compact.isEmpty()) {
+                continue;
+            }
+            int idx = matchGeometryLine(lines, used, compact);
+            if (idx < 0) {
+                continue;
+            }
+            used[idx] = true;
+            LineGeom ln = lines.get(idx);
+            minX = Math.min(minX, ln.x0());
+            minY = Math.min(minY, ln.y0());
+            maxX = Math.max(maxX, ln.x1());
+            maxY = Math.max(maxY, ln.y1());
+            matched = true;
+        }
+        if (!matched) {
+            for (LineGeom ln : lines) {
+                minX = Math.min(minX, ln.x0());
+                minY = Math.min(minY, ln.y0());
+                maxX = Math.max(maxX, ln.x1());
+                maxY = Math.max(maxY, ln.y1());
+            }
+        }
+        return bboxRatio(geo.width(), geo.height(), minX, minY, maxX, maxY);
+    }
+
+    /** 在未使用的几何行里找与 {@code compact} 对应的一行：先精确相等，再退化为「该行是段落行的子串」。 */
+    private static int matchGeometryLine(List<LineGeom> lines, boolean[] used, String compact) {
+        for (int i = 0; i < lines.size(); i++) {
+            if (!used[i] && compactForMatch(lines.get(i).text()).equals(compact)) {
+                return i;
+            }
+        }
+        int best = -1;
+        int bestLen = 1;
+        for (int i = 0; i < lines.size(); i++) {
+            if (used[i]) {
+                continue;
+            }
+            String key = compactForMatch(lines.get(i).text());
+            if (key.length() > bestLen && compact.contains(key)) {
+                best = i;
+                bestLen = key.length();
+            }
+        }
+        return best;
+    }
+
+    /** 匹配用紧凑文本：去 Markdown 标题记号与全部空白（<b>只用于比对</b>，不参与正文）。 */
+    static String compactForMatch(String line) {
+        if (line == null || line.isEmpty()) {
+            return "";
+        }
+        int i = 0;
+        while (i < line.length() && line.charAt(i) == '#') {
+            i++;
+        }
+        if (i > 0) {
+            while (i < line.length() && Character.isWhitespace(line.charAt(i))) {
+                i++;
+            }
+        }
+        StringBuilder sb = new StringBuilder(line.length() - i);
+        for (; i < line.length(); i++) {
+            char c = line.charAt(i);
+            if (!Character.isWhitespace(c)) {
+                sb.append(c);
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * PDF 用户空间矩形 → 比例值 {@code [x0,y0,x1,y1]}（0–1，原点在渲染页左上角）。
+     *
+     * <p>用户空间 y 向上，locator 的 y 向下 ⇒ {@code top = height - y1}、{@code bottom = height - y0}。
+     * 出页框的坐标夹到 0–1（CropBox 与字形坐标系口径不一致时只丢精度，不产生负数）。
+     *
+     * @return 退化矩形（宽或高 ≤ 0）返回 {@code null}
+     */
+    private static double[] bboxRatio(double width, double height, double x0, double y0,
+                                      double x1, double y1) {
+        if (width <= 0 || height <= 0 || x1 <= x0 || y1 <= y0) {
+            return null;
+        }
+        double rx0 = clamp01(x0 / width);
+        double rx1 = clamp01(x1 / width);
+        double ry0 = clamp01((height - y1) / height);
+        double ry1 = clamp01((height - y0) / height);
+        if (rx1 - rx0 <= 0 || ry1 - ry0 <= 0) {
+            return null;
+        }
+        return new double[]{rx0, ry0, rx1, ry1};
+    }
+
+    private static double clamp01(double v) {
+        return v < 0 ? 0 : (v > 1 ? 1 : v);
+    }
+
+    /** 把一页正文的每个段落登记成 {@link PendingBlock}（char 下标平移 {@code bodyStartChar}）。 */
+    private static void collectPageBlocks(List<PendingBlock> out, int pageNo, String body,
+                                          int bodyStartChar, PageGeometry geo) {
+        for (int[] range : paragraphRanges(body)) {
+            out.add(new PendingBlock(pageNo, bodyStartChar + range[0], bodyStartChar + range[1],
+                paragraphBbox(geo, body.substring(range[0], range[1]))));
+        }
+    }
+
+    /**
+     * 待定块 → {@link KbSourceBlock}（<b>码点</b>口径，并对齐 {@code strip} / {@code truncate} 后的正文）。
+     *
+     * <p>三条硬约束：① {@code start}/{@code end} 必须落在 {@code text} 的码点范围内（截断后尾部块被裁剪）；
+     * ② {@code end > start}（否则丢弃，{@link KbSourceIndex#of} 也会丢）；③ 按 {@code start} 升序。
+     */
+    static List<KbSourceBlock> toSourceBlocks(List<PendingBlock> pending, String rawText,
+                                              int leadingCodePoints, String text) {
+        if (pending == null || pending.isEmpty() || rawText == null || text == null || text.isEmpty()) {
+            return List.of();
+        }
+        int total = text.codePointCount(0, text.length());
+        List<KbSourceBlock> out = new ArrayList<>(pending.size());
+        for (PendingBlock p : pending) {
+            int start = rawText.codePointCount(0, clampChar(rawText, p.startChar())) - leadingCodePoints;
+            int end = rawText.codePointCount(0, clampChar(rawText, p.endChar())) - leadingCodePoints;
+            int s = Math.max(0, Math.min(start, total));
+            int e = Math.max(0, Math.min(end, total));
+            if (e <= s) {
+                continue;
+            }
+            out.add(new KbSourceBlock(s, e, KbSourceLocator.pdf(p.page(), p.bbox())));
+        }
+        out.sort(Comparator.comparingInt(KbSourceBlock::start));
+        return out;
+    }
+
+    private static int clampChar(String s, int idx) {
+        return Math.max(0, Math.min(idx, s.length()));
+    }
+
+    /** 被 source block 覆盖的码点数（按码点去重）。 */
+    private static int coveredCodePoints(List<KbSourceBlock> blocks, int total) {
+        if (blocks == null || blocks.isEmpty() || total <= 0) {
+            return 0;
+        }
+        java.util.BitSet bits = new java.util.BitSet(total);
+        for (KbSourceBlock b : blocks) {
+            int from = Math.max(0, Math.min(b.start(), total));
+            int to = Math.max(from, Math.min(b.end(), total));
+            if (to > from) {
+                bits.set(from, to);
+            }
+        }
+        return bits.cardinality();
+    }
+
+    /** 有 source block 的页数（按 locator 的 page 去重）。 */
+    private static int coveredPages(List<KbSourceBlock> blocks) {
+        Set<Integer> pages = new java.util.HashSet<>();
+        if (blocks != null) {
+            for (KbSourceBlock b : blocks) {
+                if (b.locator() != null && b.locator().page() != null) {
+                    pages.add(b.locator().page());
+                }
+            }
+        }
+        return pages.size();
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // 小工具
     // ════════════════════════════════════════════════════════════════════════
 
@@ -2327,6 +2909,26 @@ public class KbPdfParser implements KbDocumentParser {
             idx += needle.length();
         }
         return count;
+    }
+
+    /** 页号清单的日志压缩形态：最多列前 10 个，其余给总数。 */
+    private static String abbreviatePages(List<Integer> pages) {
+        if (pages == null || pages.isEmpty()) {
+            return "-";
+        }
+        int limit = Math.min(10, pages.size());
+        StringBuilder sb = new StringBuilder("[");
+        for (int i = 0; i < limit; i++) {
+            if (i > 0) {
+                sb.append(", ");
+            }
+            sb.append(pages.get(i));
+        }
+        sb.append(']');
+        if (pages.size() > limit) {
+            sb.append(" 等共").append(pages.size()).append("页");
+        }
+        return sb.toString();
     }
 
     private static String abbreviate(Set<String> lines) {

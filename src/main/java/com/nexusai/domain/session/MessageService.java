@@ -2024,6 +2024,9 @@ public class MessageService {
         rec.setAuthor(dto.author());
         rec.setContent(dto.content() == null ? "" : dto.content());
         rec.setReasoning(dto.reasoning());
+        // [thinking-passthrough] thinking 块签名落库 · V282 列（与 reasoning 文本配对，
+        //   与 CC transcript 同构：只存 thinking 文本 + signature，不存块结构）。
+        rec.setThinkingSignature(dto.thinkingSignature());
         // [reasoningDurationMs] 后端测推理耗时 · V41 列落库（净新增字段，非 CC 对齐）
         rec.setReasoningDurationMs(dto.reasoningDurationMs());
         rec.setFinishReason(dto.finishReason() != null ? dto.finishReason().name() : null);
@@ -2151,6 +2154,9 @@ public class MessageService {
             rec.setAuthor(dto.author());
             rec.setContent(dto.content() == null ? "" : dto.content());
             rec.setReasoning(dto.reasoning());
+            // [thinking-passthrough] thinking 块签名落库 · V282 列（partial 压缩写回路径同样
+            //   持久化，否则 round-trip 破缺——kept 消息重插后 thinking 块丢签名 ⇒ 下一轮 400）。
+            rec.setThinkingSignature(dto.thinkingSignature());
             // [reasoningDurationMs] 后端测推理耗时 · V41 列落库（净新增字段，非 CC 对齐）
             rec.setReasoningDurationMs(dto.reasoningDurationMs());
             rec.setFinishReason(dto.finishReason() != null ? dto.finishReason().name() : null);
@@ -2501,6 +2507,7 @@ public class MessageService {
             .withReasoningDurationMs(m.getReasoningDurationMs()) // [reasoningDurationMs] 读侧回填（V41 列；GET /messages 出站唯一点）
             .withUserMessageId(m.getUserMessageId()) // [userMessageId] 读侧回填（V47 列；GET /messages 出站唯一点；旧行 NULL = 无归属容错）
             .withQueuedOrigin(m.getQueuedOrigin()) // [P0-1 OD-1/OD-3] 读侧回填（V67 queued_origin 列；resume 发送层按标记重新包壳；旧行 NULL = 非排队不包壳，与现状一致可接受）
+            .withThinkingSignature(m.getThinkingSignature()) // [thinking-passthrough] 读侧回填（V282 列；resume/重放时送侧据此重建 thinking 块；旧行 NULL = 无签名，按空签名回传）
             .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId())); // [userAttachments] 读侧回填（V62 列；GET /messages 出站唯一点；contentId 非空 → url 动态拼 /api/v1/attachments/content/{sessionId}/{contentId}；null 列 → 空列表，恒非 null）
         // [usage 读侧回填] DB 持久化 inputTokens/outputTokens + cache 4 字段 → 重拉投影回填 usage，
         //   使 F5 后消息 token 展示与实时 complete 事件一致（↑input ↓output + cache）。

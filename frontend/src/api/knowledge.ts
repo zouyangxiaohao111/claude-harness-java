@@ -1,6 +1,7 @@
-import { api } from './rest'
+import { api, ApiError } from './rest'
 import { API_V1_BASE } from './base'
 import type { ProjectDto } from './projects'
+import type { SpansResponse } from '../utils/knowledgeTrace'
 
 /**
  * 知识库 API 客户端 · 对齐 WeKnora 复刻后端（`/api/v1/knowledge-bases`）。
@@ -67,7 +68,24 @@ export interface KnowledgeBase {
    * 已补进出站 DTO。
    */
   indexing_strategy?: string | null
+  /**
+   * 图片管线 · 是否生成图片描述（`image_caption_enabled`，V286 顶层列）。
+   *
+   * <p>⭐ 读侧必读（`KnowledgeBaseDto` 已回传）—— 设置弹窗的三个控件靠它回显；
+   * 只写不读会复现「保存成功但永远显示旧值」。
+   *
+   * <p>⚠️ 与 `image_processing_config.image_pipeline`（同名不同义、取值 `""`/`"attrs"`、
+   * 后端零消费者）不是一回事，⛔ 不要拿旧键回填这三个控件。
+   */
+  image_caption_enabled?: boolean
+  /** 图片管线 · 是否做 OCR（`image_ocr_enabled`，V286 顶层列）。 */
+  image_ocr_enabled?: boolean
+  /** 图片管线方案（`image_pipeline`，V286 顶层列）：只允许 `default` | `smartocr`。 */
+  image_pipeline?: KbImagePipelineName
 }
+
+/** 图片管线方案（后端 `KbImageSettings.PIPELINE_*`）· 只此两值。 */
+export type KbImagePipelineName = 'default' | 'smartocr'
 
 /** 创建知识库请求。 */
 export interface CreateKnowledgeBaseBody {
@@ -103,6 +121,12 @@ export interface CreateKnowledgeBaseBody {
    * 本层⛔ 不要再 `JSON.stringify`（会二次转义，落库成带引号的字符串）。
    */
   extract_config?: string | null
+  /** 图片管线 · 是否生成图片描述（`image_caption_enabled`，V286；缺省 = 后端默认 true）。 */
+  image_caption_enabled?: boolean
+  /** 图片管线 · 是否做 OCR（`image_ocr_enabled`，V286；缺省 = 后端默认 true）。 */
+  image_ocr_enabled?: boolean
+  /** 图片管线方案（V286）：只允许 `default` | `smartocr`，其它值后端 400。 */
+  image_pipeline?: KbImagePipelineName
 }
 
 /** 更新知识库请求（null / 不传 = 不改）。 */
@@ -112,6 +136,10 @@ export interface UpdateKnowledgeBaseBody {
   embedding_model_id?: string | null
   summary_model_id?: string | null
   chunking_config?: string | null
+  /** 图片管线三项（V286）· 不传 = 不改。 */
+  image_caption_enabled?: boolean
+  image_ocr_enabled?: boolean
+  image_pipeline?: KbImagePipelineName
 }
 
 /** 解析状态机取值（后端 `parse_status`）。 */
@@ -343,6 +371,196 @@ export class KbRawBytesError extends Error {
   }
 }
 
+/**
+ * 上传并发上限 · 对齐源站 `stores/uploadTasksCore.ts` 的 `CONCURRENCY = 3`。
+ *
+ * <p>源站注释给的理由同样适用本仓：后端对每个文件「落盘 + 算哈希 + 入库」完才回包，
+ * 3 条并发既能把管道填满，又不会把 SQLite 单写锁压成 `SQLITE_BUSY_SNAPSHOT`。
+ */
+export const UPLOAD_CONCURRENCY = 3
+
+/**
+ * 解析状态轮询间隔 · 对齐源站 `stores/uploadTasksCore.ts` 的 `POLL_INTERVAL_MS = 3000`。
+ *
+ * <p>上传完成不等于可用：后端还要切块、建索引、生成摘要/问题。太快只会把数据库
+ * 连接占满（一次状态查询就要一条连接），太慢用户会以为卡住。
+ */
+export const UPLOAD_POLL_INTERVAL_MS = 3000
+
+/**
+ * 一次状态查询最多带多少个知识 id · 对齐源站 `POLL_CHUNK_SIZE = 40`。
+ *
+ * <p>钉住这个数是因为 `GET /knowledge/batch?ids=…` 走 query string：40 个 UUID
+ * 约 1.5KB，离 URL 长度上限还很远；再多就有被网关截断的风险。
+ */
+export const UPLOAD_POLL_CHUNK_SIZE = 40
+
+/** 同时在飞的**状态查询**条数上限 · 对齐源站 `POLL_CONCURRENCY = 4`（每条占一条后端数据库连接）。 */
+export const UPLOAD_POLL_CONCURRENCY = 4
+
+/** 连续几轮「查不到这一行」才判定文档已被删除（对齐源站 `MISSING_POLLS_BEFORE_DELETED = 3`）。 */
+export const MISSING_POLLS_BEFORE_DELETED = 3
+
+/** 一个待上传文件；`fileName` 非空 ⇒ 带目录的上传名（见 {@link buildUploadFileName}）。 */
+export interface UploadManyItem {
+  file: File
+  fileName?: string
+}
+
+/** 并发池里单个任务的结局（靠 `ok` 判别：成功必有 `value`，失败必有 `error`）。 */
+export type PoolOutcome<T, R> =
+  | { item: T; ok: true; value: R; error?: undefined }
+  | { item: T; ok: false; value?: undefined; error: unknown }
+
+/**
+ * 有界并发池（通用）。
+ *
+ * <h2>并发峰值为什么不会超过 `concurrency`</h2>
+ * 只创建 `min(concurrency, items.length)` 个 worker，每个 worker 的循环是
+ * 「取下一个下标 → await task → 结算后再取下一下标」——
+ * 同一 worker 绝不会同时持有两条在飞任务 ⇒ 在飞任务数 ≤ worker 数。
+ *
+ * <h2>为什么单个失败不中断其它文件</h2>
+ * worker 内部 `try/catch` 把异常收成 `{ok:false}`，既不打断自己的循环，
+ * 也不会让外层 `Promise.all` 提前 reject。
+ *
+ * <p>`outcomes` 与 `items` **同序**（按下标回填），调用方可直接对位。
+ */
+export async function runPool<T, R>(
+  items: readonly T[],
+  concurrency: number,
+  task: (item: T) => Promise<R>,
+  options: { onSettled?: (done: number, total: number) => void } = {}
+): Promise<Array<PoolOutcome<T, R>>> {
+  const total = items.length
+  if (total === 0) return []
+  const outcomes = new Array<PoolOutcome<T, R>>(total)
+  const workers = Math.min(Math.max(1, Math.floor(concurrency) || 1), total)
+  let next = 0
+  let done = 0
+  const worker = async () => {
+    for (;;) {
+      const index = next++
+      if (index >= total) return
+      const item = items[index]
+      try {
+        outcomes[index] = { item, ok: true, value: await task(item) }
+      } catch (error) {
+        outcomes[index] = { item, ok: false, error }
+      }
+      done++
+      options.onSettled?.(done, total)
+    }
+  }
+  await Promise.all(Array.from({ length: workers }, worker))
+  return outcomes
+}
+
+/**
+ * 全局上传槽位（模块级）。
+ *
+ * <p>⭐ 源站只有一个 `uploadQueue` 实例 ⇒ `CONCURRENCY = 3` 是**整个应用**的上限。
+ * 本仓有两个上传入口（文档面板头部的 `KbUploadSource` 与空态「上传文档」），
+ * 各自开池会叠成 6 ⇒ 这里用模块级信号量把总在飞 POST 钉在 3。
+ *
+ * <p>槽位「直接交接」：release 时若有等待者就<b>不减计数</b>、直接把名额转交给它，
+ * 避免「先减、被别人抢走、醒来再 ++」这条空窗 ⇒ 任何瞬间都不会超过 3。
+ */
+let uploadSlotsInUse = 0
+const uploadSlotWaiters: Array<() => void> = []
+
+function acquireUploadSlot(): Promise<void> {
+  if (uploadSlotsInUse < UPLOAD_CONCURRENCY) {
+    uploadSlotsInUse++
+    return Promise.resolve()
+  }
+  return new Promise<void>((resolve) => uploadSlotWaiters.push(resolve))
+}
+
+function releaseUploadSlot(): void {
+  const next = uploadSlotWaiters.shift()
+  if (next) next()
+  else uploadSlotsInUse--
+}
+
+/** 一个失败的上传项；`item` 原样保留，可直接再喂回 `uploadMany` 做重试。 */
+export interface UploadFailure {
+  /** 展示名：带目录时是 `规范/a.md`，否则是 `a.md` */
+  name: string
+  message: string
+  item: UploadManyItem
+}
+
+/**
+ * 一个**重复**文件：后端同库同 `file_hash` 返回 **409**（`ConflictException`）。
+ *
+ * <p>⭐ 重复不是失败：文件已经在库里，用户不需要重试，界面上要单列成「重复（已存在）」。
+ * 混进 `failures` 会让「明明传成功了」报成失败，还给出一个必然再 409 的重试按钮。
+ */
+export interface UploadDuplicate {
+  /** 展示名：带目录时是 `规范/a.md`，否则 `a.md` */
+  name: string
+  /** 后端 detail 原文（含既有条目标题；⛔ 不拿它当接口契约解析） */
+  message: string
+  item: UploadManyItem
+}
+
+/** 单条上传的终局。 */
+export type UploadItemState = 'uploaded' | 'failed' | 'duplicate' | 'cancelled'
+
+/** 一条输入的结局 · 上层据此做 item 级状态渲染与「只重跑这一条」。 */
+export interface UploadSettledItem {
+  item: UploadManyItem
+  name: string
+  state: UploadItemState
+  /** 成功上传创建的知识 id（读取解析状态要用） */
+  knowledgeId?: string
+  message?: string
+}
+
+/** {@link knowledgeApi.uploadMany} 的结果。 */
+export interface UploadManyResult {
+  /** 成功条数 */
+  ok: number
+  /** 失败项明细（含原始 item ⇒ 支持「重试失败项」） */
+  failures: UploadFailure[]
+  /** 重复文件（409）—— **不计入失败**，界面上单列 */
+  duplicates: UploadDuplicate[]
+  /** 被取消（AbortSignal）而没传完的项；已成功的不回滚 */
+  cancelled: UploadManyItem[]
+  /** 成功的响应体，按**输入顺序**（不是完成顺序） */
+  results: Knowledge[]
+  /** 每条输入的结局，**与输入同序**（item 级重试/状态渲染用） */
+  settled: UploadSettledItem[]
+}
+
+/** 整批取消时给池里还没跑完的任务用的哨兵错误（⛔ 不要与真实网络失败混为一谈）。 */
+export class UploadCancelledError extends Error {
+  constructor() {
+    super('已取消上传')
+    this.name = 'UploadCancelledError'
+  }
+}
+
+/** 该错误是不是「后端判重」（同库同 hash ⇒ 409）。 */
+export function isDuplicateUploadError(e: unknown): boolean {
+  return e instanceof ApiError && e.status === 409
+}
+
+/** 该错误是不是取消（AbortController 中断 / 池内哨兵）。 */
+export function isUploadCancellation(e: unknown): boolean {
+  if (e instanceof UploadCancelledError) return true
+  return typeof e === 'object' && e !== null
+    && (e as { name?: unknown }).name === 'AbortError'
+}
+
+/** 上传失败文案：优先用 `ApiError.userMessage()` 的中文 detail。 */
+function describeUploadError(e: unknown): string {
+  if (e instanceof ApiError) return e.userMessage()
+  if (e instanceof Error) return e.message
+  return String(e)
+}
+
 export const knowledgeApi = {
   // ── 知识库 ──────────────────────────────────────────────────────
   listBases: () => api<KnowledgeBase[]>('/knowledge-bases'),
@@ -391,6 +609,19 @@ export const knowledgeApi = {
     ),
 
   getKnowledge: (id: string) => api<Knowledge>(`/knowledge/${encodeURIComponent(id)}`),
+
+  /**
+   * 批量取知识条目（`GET /knowledge/batch?ids=a,b,c` · 后端 `KnowledgeExtController#batchGet`）。
+   *
+   * <p>⭐ 上传后的解析状态轮询走这条：后端**一次最多带 40 个 id**（见
+   * {@link UPLOAD_POLL_CHUNK_SIZE}）比逐条 `GET /knowledge/{id}` 省 N 倍连接。
+   *
+   * <p>⚠️ 响应是**裸数组** `KnowledgeDto[]`（⛔ 不是 `{success,data}` 包装），
+   * `ids` 用**逗号**分隔（后端 `splitIds` 只认 `,`，不是重复参数）。
+   * 查不到的 id 直接不返回（⛔ 不报 404）⇒ 调用方要自己按「缺席」处理。
+   */
+  batchGetKnowledge: (ids: string[]) =>
+    api<Knowledge[]>(`/knowledge/batch${toQuery({ ids: ids.join(',') })}`),
 
   /**
    * 列出某篇文档的全部分块。
@@ -540,6 +771,24 @@ export const knowledgeApi = {
   reparse: (id: string) =>
     api<{ task_id: number }>(`/knowledge/${encodeURIComponent(id)}/reparse`, { method: 'POST' }),
 
+  /**
+   * 某一次尝试的 span 树（后端 `GET /api/v1/knowledge/{id}/spans`）。
+   *
+   * <p>⚠️ 响应**带 `{success, data}` 包装**（与 `/system/parser-engines` 同一种「元数据」形状，
+   * 不像多数知识库端点是裸 DTO）⇒ 这里**不解包**：调用方要能区分「成功但没有 trace」与
+   * 「请求失败」，包装里的 `success` 是唯一判据（`KbProcessingTimeline.fetchSpans` 按
+   * `res?.success && res.data` 判定）。
+   *
+   * <p>`attempt` 只在 `> 0` 时才拼 query —— 后端 `?attempt=` 是「取第 N 次尝试」，
+   * 传 0/负数会落到「最新一次」的兜底分支，与不传等价但会污染日志。
+   */
+  getKnowledgeSpans: (id: string, attempt?: number) =>
+    api<{ success: boolean; data?: SpansResponse }>(
+      `/knowledge/${encodeURIComponent(id)}/spans${toQuery({
+        attempt: typeof attempt === 'number' && attempt > 0 ? attempt : undefined,
+      })}`,
+    ),
+
   cancelParse: (id: string) =>
     api<void>(`/knowledge/${encodeURIComponent(id)}/cancel-parse`, { method: 'POST' }),
 
@@ -566,21 +815,103 @@ export const knowledgeApi = {
    * @param baseId   知识库 ID
    * @param file     文件
    * @param fileName 自定义文件名（可空；带 `/` 时后端会拆出 folder_path）
+   * @param signal   取消信号（「取消全部」用；中断在飞的请求）
    */
-  uploadKnowledge: async (baseId: string, file: File, fileName?: string): Promise<Knowledge> => {
+  uploadKnowledge: async (
+    baseId: string,
+    file: File,
+    fileName?: string,
+    signal?: AbortSignal
+  ): Promise<Knowledge> => {
     const form = new FormData()
     form.append('file', file)
     if (fileName) form.append('fileName', fileName)
     const { API_V1_BASE } = await import('./base')
     const res = await fetch(
       `${API_V1_BASE}/knowledge-bases/${encodeURIComponent(baseId)}/knowledge/file`,
-      { method: 'POST', body: form, headers: { Accept: 'application/json', 'X-Client-Env': 'react' } }
+      {
+        method: 'POST',
+        body: form,
+        headers: { Accept: 'application/json', 'X-Client-Env': 'react' },
+        // ⚠️ 不能自己设 Content-Type：multipart 的 boundary 必须由浏览器生成
+        ...(signal ? { signal } : {}),
+      }
     )
     if (!res.ok) {
       const { parseProblem } = await import('./rest')
       throw await parseProblem(res)
     }
     return (await res.json()) as Knowledge
+  },
+
+  /**
+   * 多文件上传 · **并发池**（⛔ 不是 `for-await` 串行）。
+   *
+   * <p>对齐源站 `stores/uploadQueue.ts` 的 `pump()`：最多
+   * {@link UPLOAD_CONCURRENCY} 条 `POST /knowledge-bases/{id}/knowledge/file`
+   * 同时在飞。后端**没有批量端点**，所以每个文件仍是一次独立 POST（⛔ 不合并）。
+   *
+   * <p>单个文件失败只进 `failures`，不影响其它文件继续上传；
+   * `failures[i].item` 可原样再传给本方法 ⇒ 上层能实现「重试失败项」。
+   * ⭐ **重复文件（后端 409）进 `duplicates`，不计入 `failures`** —— 它不是失败。
+   *
+   * <p>⭐ 并发同时受两层约束：本池 worker 数（`concurrency`，默认 3）与
+   * **模块级全局槽位**（恒 3，跨入口共享）—— 见 {@link UPLOAD_CONCURRENCY}。
+   *
+   * @param options.concurrency 覆盖本池 worker 数（默认 3；全局槽位仍是 3）
+   * @param options.onProgress  每有一个文件结算（成功或失败）回调一次 `(done, total)`
+   * @param options.signal       取消信号（「取消全部」）；已成功的项不回滚，没跑完的进 `cancelled`
+   */
+  uploadMany: async (
+    baseId: string,
+    items: UploadManyItem[],
+    options: {
+      concurrency?: number
+      onProgress?: (done: number, total: number) => void
+      signal?: AbortSignal
+    } = {}
+  ): Promise<UploadManyResult> => {
+    const { signal } = options
+    const outcomes = await runPool(
+      items,
+      options.concurrency ?? UPLOAD_CONCURRENCY,
+      async (item) => {
+        // 已取消：⛔ 连槽位都不占（否则取消后还要排队等前一个传完）
+        if (signal?.aborted) throw new UploadCancelledError()
+        await acquireUploadSlot()
+        try {
+          if (signal?.aborted) throw new UploadCancelledError()
+          return await knowledgeApi.uploadKnowledge(baseId, item.file, item.fileName, signal)
+        } finally {
+          releaseUploadSlot()
+        }
+      },
+      { onSettled: options.onProgress }
+    )
+    const results: Knowledge[] = []
+    const failures: UploadFailure[] = []
+    const duplicates: UploadDuplicate[] = []
+    const cancelled: UploadManyItem[] = []
+    const settled: UploadSettledItem[] = []
+    for (const outcome of outcomes) {
+      const name = outcome.item.fileName || outcome.item.file.name
+      if (outcome.ok) {
+        results.push(outcome.value)
+        settled.push({ item: outcome.item, name, state: 'uploaded', knowledgeId: outcome.value.id })
+      } else if (isUploadCancellation(outcome.error)) {
+        cancelled.push(outcome.item)
+        settled.push({ item: outcome.item, name, state: 'cancelled' })
+      } else if (isDuplicateUploadError(outcome.error)) {
+        const message = describeUploadError(outcome.error)
+        duplicates.push({ name, message, item: outcome.item })
+        settled.push({ item: outcome.item, name, state: 'duplicate', message })
+      } else {
+        const message = describeUploadError(outcome.error)
+        failures.push({ name, message, item: outcome.item })
+        settled.push({ item: outcome.item, name, state: 'failed', message })
+      }
+    }
+    return { ok: results.length, failures, duplicates, cancelled, results, settled }
   },
 
   /**
@@ -591,9 +922,13 @@ export const knowledgeApi = {
    * `folder_path` + 文件名 —— 这就是子文件夹产生的<b>唯一</b>途径
    * （文件夹树是从 `folder_path` 派生的，没有「新建空文件夹」接口）。
    *
+   * <p>本方法是 {@link knowledgeApi.uploadMany} 的薄封装：目录名仍在**每个 item**
+   * 上拼好，再交给同一个并发池 ⇒ 保留目录结构与并发上传不冲突。
+   *
    * @param baseId       知识库 ID
    * @param files        目录选择得到的文件列表
    * @param targetFolder 目标文件夹（可空 = 根）
+   * @param onProgress   每结算一个文件回调 `(done, total)`
    */
   uploadFolder: async (
     baseId: string,
@@ -601,20 +936,15 @@ export const knowledgeApi = {
     targetFolder = '',
     onProgress?: (done: number, total: number) => void
   ): Promise<{ ok: number; failures: string[] }> => {
-    let ok = 0
-    const failures: string[] = []
-    for (let i = 0; i < files.length; i++) {
-      const f = files[i] as File & { webkitRelativePath?: string }
-      const name = buildUploadFileName(f, targetFolder)
-      try {
-        await knowledgeApi.uploadKnowledge(baseId, f, name)
-        ok++
-      } catch (e) {
-        failures.push(`${f.name}: ${e instanceof Error ? e.message : String(e)}`)
-      }
-      onProgress?.(i + 1, files.length)
-    }
-    return { ok, failures }
+    const r = await knowledgeApi.uploadMany(
+      baseId,
+      files.map((f) => ({
+        file: f,
+        fileName: buildUploadFileName(f as File & { webkitRelativePath?: string }, targetFolder),
+      })),
+      { onProgress }
+    )
+    return { ok: r.ok, failures: r.failures.map((f) => `${f.name}: ${f.message}`) }
   },
 
   // ── 知识库问答（RAG 链 · QA-13）─────────────────────────────────
@@ -1098,6 +1428,136 @@ export const knowledgeApi = {
       method: 'PUT',
       body: { custom_metadata: JSON.stringify(metadata) },
     }),
+}
+
+/**
+ * 解析完成（正文已可检索）。
+ *
+ * <p>`finalizing` 也算完成：源站的 `itemPhase` 把 `finalizing` 映射成 `ready` ——
+ * 切块/索引已经落好，摘要、问题生成、图谱这些后台增强还在跑。
+ */
+export function isParseCompleted(status: string | undefined): boolean {
+  return status === 'completed' || status === 'finalizing'
+}
+
+/**
+ * 是否还要继续轮询 · 与源站 `uploadTasksState.needsParsePolling` 同口径。
+ *
+ * <p>`finalizing` 仍要盯：下一轮它才会落成 `completed`（面板据此收敛）。
+ * 未取到状态（`undefined`）也算「还要轮」—— 刚上传那几秒后端就是这么答的。
+ */
+export function needsParsePolling(status: string | undefined): boolean {
+  if (status === undefined || status === '') return true
+  return status === 'unprocessed' || status === 'pending' || status === 'processing' || status === 'finalizing'
+}
+
+/** 终态（不再轮询）：`completed` / `failed` / `cancelled` / `deleting` / `deleted`。 */
+export function isParseSettled(status: string | undefined): boolean {
+  return !needsParsePolling(status)
+}
+
+/** 状态查询返回的一行（只要轮询用得上的两个字段）。 */
+export interface ParseStatusRow {
+  id: string
+  parse_status?: string
+}
+
+/** {@link pollParseStatuses} 的注入点（网络与等待都可替换 ⇒ 纯逻辑可测）。 */
+export interface PollParseStatusOptions {
+  /** 轮间隔，默认 {@link UPLOAD_POLL_INTERVAL_MS}（3000ms） */
+  intervalMs?: number
+  /** 单次查询最多带多少 id，默认 {@link UPLOAD_POLL_CHUNK_SIZE}（40） */
+  chunkSize?: number
+  /** 同时在飞的查询条数，默认 {@link UPLOAD_POLL_CONCURRENCY}（4） */
+  concurrency?: number
+  /** 硬上限轮数（默认 400 轮 ≈ 20 分钟），防后端永远不收敛时无限轮询 */
+  maxRounds?: number
+  signal?: AbortSignal
+  /** 每轮结束回调一份「id → parse_status」全量快照（面板据此实时刷新） */
+  onUpdate?: (statuses: Record<string, string>) => void
+  /** 单批查询；默认走 {@link knowledgeApi.batchGetKnowledge} */
+  query?: (ids: string[]) => Promise<ParseStatusRow[] | null>
+  /** 等待实现；默认 `setTimeout`（测试注入即可免等真 3 秒） */
+  sleep?: (ms: number) => Promise<void>
+}
+
+/**
+ * 轮询一批知识条目的解析状态，**全部 settled 后自动停止**。
+ *
+ * <h2>对齐源站 `uploadQueue.ts` 的 `pollNow()`</h2>
+ * <ul>
+ *   <li>间隔 {@link UPLOAD_POLL_INTERVAL_MS}（3000ms）</li>
+ *   <li>一次查询最多 {@link UPLOAD_POLL_CHUNK_SIZE}（40）个 id —— 走
+ *       `GET /knowledge/batch?ids=a,b,c`（源站同款 `batchQueryKnowledge`）</li>
+ *   <li>查询并发 ≤ {@link UPLOAD_POLL_CONCURRENCY}（4），每条各占一条后端数据库连接</li>
+ *   <li>某 id 连续 {@link MISSING_POLLS_BEFORE_DELETED}（3）轮查不到 ⇒ 记 `deleted`
+ *       并停止轮它（文档在别处被删；⛔ 一轮缺席就判死会误报）</li>
+ * </ul>
+ *
+ * <p>单次查询失败（网络抖动 / 500）只等下一轮，不把整批判死 —— 返回 `null` 即跳过本轮。
+ *
+ * @param ids     要轮询的知识 id（重复会被自然去重）
+ * @returns 最终「id → parse_status」表；未出现在表里 = 一直没查到
+ */
+export async function pollParseStatuses(
+  ids: readonly string[],
+  options: PollParseStatusOptions = {}
+): Promise<Record<string, string>> {
+  const intervalMs = options.intervalMs ?? UPLOAD_POLL_INTERVAL_MS
+  const chunkSize = Math.max(1, options.chunkSize ?? UPLOAD_POLL_CHUNK_SIZE)
+  const concurrency = Math.max(1, options.concurrency ?? UPLOAD_POLL_CONCURRENCY)
+  const maxRounds = Math.max(1, options.maxRounds ?? 400)
+  const sleep = options.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)))
+  const query = options.query ?? (async (batch: string[]) => {
+    try {
+      return await knowledgeApi.batchGetKnowledge(batch)
+    } catch {
+      return null
+    }
+  })
+
+  const statuses: Record<string, string> = {}
+  const pending = new Set(ids.filter(Boolean))
+  const misses = new Map<string, number>()
+
+  for (let round = 0; round < maxRounds && pending.size > 0; round++) {
+    if (options.signal?.aborted) break
+    const all = [...pending]
+    const chunks: string[][] = []
+    for (let i = 0; i < all.length; i += chunkSize) chunks.push(all.slice(i, i + chunkSize))
+
+    await runPool(chunks, concurrency, async (chunk) => {
+      const rows = await query(chunk)
+      // 查询失败 ⇒ 本轮跳过（下一轮再问），⛔ 不把条目判成失败
+      if (!rows || options.signal?.aborted) return
+      const byId = new Map(rows.map((r) => [r.id, r]))
+      for (const id of chunk) {
+        const row = byId.get(id)
+        if (!row) {
+          const n = (misses.get(id) ?? 0) + 1
+          misses.set(id, n)
+          if (n >= MISSING_POLLS_BEFORE_DELETED) {
+            statuses[id] = 'deleted'
+            pending.delete(id)
+            misses.delete(id)
+          }
+          continue
+        }
+        misses.delete(id)
+        const status = row.parse_status || 'pending'
+        statuses[id] = status
+        if (needsParsePolling(status)) pending.add(id)
+        else pending.delete(id)
+      }
+    })
+
+    options.onUpdate?.({ ...statuses })
+    if (pending.size === 0 || options.signal?.aborted) break
+    // ⭐ 已全部 settled ⇒ 不再等待（收敛后立刻停）
+    await sleep(intervalMs)
+  }
+
+  return statuses
 }
 
 /** FAQ 列表查询参数。 */

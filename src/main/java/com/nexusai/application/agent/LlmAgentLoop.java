@@ -314,6 +314,16 @@ public class LlmAgentLoop implements AgentLoop {
         java.util.concurrent.Executors.newVirtualThreadPerTaskExecutor();
     /** [OBS1] chunk 推送限流日志的最小间隔（ms）：chunk 极密集，逐条打日志会把日志刷爆。 */
     private static final long PUSH_LOG_INTERVAL_MS = 1000L;
+    /**
+     * [hang-hard-limit] 看门狗 abort 后的收口宽限：到点仍未收到 stream 结束回调 ⇒ 强制收口本轮。
+     * 只用于「provider 读超时也失效」的病态情形（正常路径 ≤ 一个读超时周期内必然返回）。
+     */
+    private static final long WATCHDOG_ABORT_GRACE_MS = 60_000L;
+    /**
+     * [hang-hard-limit] 单次模型调用绝对上限（看门狗关掉时唯一的上限）。
+     * 取 30min：远大于任何正常长回复，又能保证「停止键永驻」最多持续半小时而不是无限。
+     */
+    private static final long CALL_HARD_LIMIT_MS = 30 * 60_000L;
     private static final int DEFAULT_TOKEN_BUDGET = 180_000;
     private static final int ANT_TOKEN_BUDGET = 8_000;
     private static final int FALLBACK_TOKEN_BUDGET = 200_000;
@@ -7605,10 +7615,40 @@ public class LlmAgentLoop implements AgentLoop {
             //   身份载体改为 {@link ToolUseContext#teammateIdentity()} —— base TUC 在
             //   buildBaseToolUseContext 处显式盖章，随 per-turn TUC 沿链下传，虚拟线程内
             //   直接读 ctx 即可，不需要任何 ThreadLocal 回放（用户铁律：回放不算合规）。
+            // [retry-visible] 重试轮次在**发起请求的这一刻**就告知前端（retryDelayMs=0）。
+            //   WHY：一次上游调用可能静默挂几分钟（实测 3m45s 无字节），原先只在「失败后 sleep 前」推
+            //   api_retry，横幅只活 0.6~17 秒 ⇒ 用户看到的是「一直没反应、也不显示重试」。
+            //   本条推送让前端从尝试发起到出结果全程显示「第 N/10 次 · 已等待 Xs」。
+            //   attempt=0（首次尝试）不推 —— 那不是重试，走「思考中」即可。
+            if (retryAttemptHolder[0] > 0) {
+                yieldRetryAttemptStarted(ctx, retryAttemptHolder[0],
+                    WithRetryEngine.getDefaultMaxRetries());
+            }
             STREAM_EXECUTOR.execute(() -> {
                 // [批 4b-1] 原 projectRoot 回放（capture 原值 → set 回放值 → finally restore）已删：
                 //   ThreadLocal 载体删除。
-                params.deps().callModel(request);
+                // [exec-swallow-fix] 必须在此兜住一切 Throwable：ExecutorService.execute 会**丢弃**
+                //   返回的 Future ⇒ 任务体里冒出的异常既不打印也不传播，`done` 永不倒计数 ⇒ 等待循环
+                //   永不结束 ⇒ 不推 message.error / idle、不再发起任何请求、停止键永驻（实测故障形态）。
+                //   provider 契约是把错误交给 onError 回调，但 onError 自身（state.setError 之外的
+                //   日志/推送）也可能抛；此处兜底并**保证 done 一定倒计数**。
+                try {
+                    params.deps().callModel(request);
+                } catch (Throwable fatal) {
+                    log.error("[LlmAgentLoop] turn={} callModel 任务体异常逃逸（已兜底，防 done 永不到 0）: {}",
+                        state.turnCount(), fatal.toString(), fatal);
+                    if (capturedError[0] == null) {
+                        capturedError[0] = fatal;
+                    }
+                    errored[0] = true;
+                    String msg = fatal.getMessage() != null ? fatal.getMessage() : fatal.toString();
+                    try {
+                        state.setError(msg);
+                    } catch (Throwable ignore) {
+                        // state 写失败也不得挡住 done 倒计数
+                    }
+                    done.countDown();
+                }
             });
             if (log.isDebugEnabled()) {
                 log.debug("[LlmAgentLoop] turn={} callModel submitted via deps (model={})",
@@ -7623,10 +7663,43 @@ public class LlmAgentLoop implements AgentLoop {
                 //   buildClient 换挡说明），stall 随 onError 抵达下方 errored 路径 → 判决矩阵。
                 //   保留 500ms 轮询：与 state.cancelled() 感知共用同一路（Java 无 abort 透传的既有折衷）。
                 boolean streamCompleted = false;
+                // [hang-hard-limit] 等待段硬上限（二次兜底）：
+                //   ① 看门狗触发后只打 abort 标记，真正解阻塞靠 provider 侧读超时 —— 若那条路也失效
+                //      （实测出现过：请求不再发出、事件不再回来、停止键永驻），原循环在 watchdogFired
+                //      后只 `continue` ⇒ 永不退出 ⇒ 本 turn 永不收口。
+                //   ② 关掉看门狗（CLAUDE_ENABLE_STREAM_WATCHDOG=0）时更是完全没有上限。
+                //   故此处两级兜底：看门狗触发后再等 grace，仍不返回就强制收口；另加单次调用绝对上限。
+                long watchdogFiredAtNanos = 0L;
+                final long callStartNanos = System.nanoTime();
                 while (!streamCompleted && !state.cancelled()) {
                     streamCompleted = done.await(500, TimeUnit.MILLISECONDS);
-                    if (streamCompleted || state.cancelled() || streamIdleControl.idleTimeoutMs() <= 0
-                            || watchdogFired[0]) {
+                    if (streamCompleted || state.cancelled()) {
+                        continue;
+                    }
+                    if (watchdogFired[0]) {
+                        if (watchdogFiredAtNanos == 0L) {
+                            watchdogFiredAtNanos = System.nanoTime();
+                        }
+                        long sinceFireMs = (System.nanoTime() - watchdogFiredAtNanos) / 1_000_000L;
+                        if (sinceFireMs >= WATCHDOG_ABORT_GRACE_MS) {
+                            log.error("Stream watchdog abort 后 {}s 仍未结束（provider 读超时未生效），强制收口本轮",
+                                sinceFireMs / 1000);
+                            state.setError("API Error: 上游长时间无响应，已中止本次请求，请重试。");
+                            state.setExitReason(ExitReason.STREAM_TIMEOUT);
+                            break;
+                        }
+                        continue;
+                    }
+                    long callElapsedMs = (System.nanoTime() - callStartNanos) / 1_000_000L;
+                    if (callElapsedMs >= CALL_HARD_LIMIT_MS) {
+                        log.error("单次模型调用超过 {}s 未结束（看门狗未启用或未触发），强制收口本轮",
+                            callElapsedMs / 1000);
+                        state.setError("API Error: 本次请求超过 "
+                            + (CALL_HARD_LIMIT_MS / 60000) + " 分钟未完成，已中止，请重试。");
+                        state.setExitReason(ExitReason.STREAM_TIMEOUT);
+                        break;
+                    }
+                    if (streamIdleControl.idleTimeoutMs() <= 0) {
                         continue;
                     }
                     long idleMs = (System.nanoTime() - watchdogLastChunkNanos[0]) / 1_000_000L;
@@ -8515,12 +8588,19 @@ public class LlmAgentLoop implements AgentLoop {
                 //   打字机停、消息空、无提示。补发 message.error（与 withRetry 重试耗尽路径 :6971 同款模式）。
                 //   wsTemplate 为 null（非流式）时跳过。
                 if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
+                    // [err-readable] 与 withRetry 耗尽分支同口径：用户可见文案走 ApiErrors 翻译
+                    //   （额度不足/限流/过载/鉴权/连接…）。原实现只推 state.lastError() 原串，
+                    //   前端错误卡正文就是 "HTTP 550:" / "Request failed" 这类技术串。
+                    String userFacing = streamError != null
+                        ? ApiErrors.userFacingErrorMessage(streamError)
+                        : ApiErrors.userFacingErrorMessage(new RuntimeException(
+                            state.lastError() != null ? state.lastError() : "unknown model error"));
                     com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
                         com.nexusai.eventbus.ws.MessageErrorEvent.of(
                             ctx.streamSessionId(),
                             state.lastUserMessageId() != null ? state.lastUserMessageId() : ctx.streamUserMessageId(),
                             state.currentAssistantMessageId(), "model_error",
-                            state.lastError() != null ? state.lastError() : "unknown model error"));
+                            userFacing));
                     log.warn("[LlmAgentLoop] model_error 已补发 message.error 事件 (code=model_error, assistantMsgId={})",
                         state.currentAssistantMessageId());
                 }
@@ -8649,7 +8729,7 @@ public class LlmAgentLoop implements AgentLoop {
                 String maxTokensErrorContent = com.nexusai.application.agent.api.ApiErrors.API_ERROR_MESSAGE_PREFIX
                     + ": NexusAI's response exceeded the "
                     + AgentLoopContext.resolveRecoveryMaxTokens(effectiveModel, pendingMaxOutputTokensOverride)
-                    + " output token maximum. To configure this behavior, adjust the maxOutputTokens setting (settings.maxOutputTokens).";
+                    + " output token maximum. To configure this behavior, adjust the model's max tokens setting (settings · model max_tokens).";
                 if (mtResult.recoverable()) {
                     // R24-4 L1 真实: 显式区分两阶段（CC reason，ER-IMP-01 收敛命名）.
                     // 阶段 1: MAX_OUTPUT_TOKENS_ESCALATE — 升级 max_tokens 8K→64K, 原样重试不追加消息.
@@ -9051,6 +9131,8 @@ public class LlmAgentLoop implements AgentLoop {
             com.nexusai.model.session.dto.ChatMessageDto plainTextAssistantMsg =
                 toMessage(Role.assistant, text,
                     msg != null ? msg.reasoning() : null, turnAssistantId)
+                    // [thinking-passthrough] thinking 块签名随消息走（送侧重建 thinking 块用）
+                    .withThinkingSignature(msg != null ? msg.thinkingSignature() : null)
                     .withUsage(msg != null ? msg.usage() : null)
                     // [V52 B3] cache 用量透传（S4-2b）：Tokens.Usage.of 压缩基线/估算取真实 cache
                     .withUsageCache(
@@ -9590,12 +9672,16 @@ public class LlmAgentLoop implements AgentLoop {
             // [DEC-RV-05] 跳过（CC query.ts:996 在 handleStopHooks :1267 之前提前 return，不触达
             // stopHooks.ts:149 executeExtractMemories）。
             state.setExitReason(ExitReason.MODEL_ERROR);
+            // [err-readable] 终态文案走用户可读翻译（额度不足/限流/过载/鉴权/连接…）：
+            //   原实现直接把上游原始串交给前端，用户看到的是 "HTTP 550:" / "Request failed"。
+            //   state.lastError 仍是 loop 内部口径（selectStreamError / 日志消费），
+            //   只有「交给前端展示」的 message.error 用翻译后文案。
+            Throwable origError = cre.getOriginalError();
+            String userFacing = ApiErrors.userFacingErrorMessage(origError);
             if (state.lastError() == null || state.lastError().isBlank()) {
-                Throwable orig = cre.getOriginalError();
-                String errMsg = orig != null
-                    ? (orig.getMessage() != null ? orig.getMessage() : orig.toString())
-                    : "temporary error retry exhausted";
-                state.setError(errMsg);
+                state.setError(origError != null
+                    ? (origError.getMessage() != null ? origError.getMessage() : origError.toString())
+                    : "temporary error retry exhausted");
             }
             log.error("[LlmAgentLoop] withRetry 重试耗尽 CannotRetryException: {} · CC query.ts:996 → model_error",
                 cre.getMessage());
@@ -9610,7 +9696,7 @@ public class LlmAgentLoop implements AgentLoop {
                         ctx.streamSessionId(),
                         state.lastUserMessageId() != null ? state.lastUserMessageId() : ctx.streamUserMessageId(),
                         state.currentAssistantMessageId(), "model_error",
-                        state.lastError() != null ? state.lastError() : "temporary error retry exhausted"));
+                        userFacing));
                 log.warn("[LlmAgentLoop] withRetry 重试耗尽已补发 message.error 事件 (code=model_error, assistantMsgId={})",
                     state.currentAssistantMessageId());
             }
@@ -13089,6 +13175,39 @@ public class LlmAgentLoop implements AgentLoop {
         return captured != null
             ? captured
             : (lastError != null ? new RuntimeException(lastError) : null);
+    }
+
+    /**
+     * [retry-visible] 「第 N 次尝试已发起」事件 · 仅用于前端可见性，不对齐 CC（CC 无此事件）。
+     *
+     * <p>WHY：{@link #yieldApiRetryMessage} 只在**失败后、退避 sleep 前**推（delay=本次退避毫秒），
+     * 而真正让用户「干等」的是**单次上游调用本身**（实测一次挂 3m45s 无字节）。若只在 sleep 前推，
+     * 横幅只活 0.6~17 秒，长静默期反而什么都不显示。故在每次重试**发起请求前**再推一条
+     * {@code retryDelayMs=0} 的事件：前端据「有无正数延迟」区分「退避倒计时」与「尝试已发起·正计时」。
+     *
+     * <p>与 {@link #yieldApiRetryMessage} 的区别：**不做** APIError 资格闸 —— 那是 CC 对「错误通知」
+     * 的过滤（withRetry.ts:492/508），本事件不是错误通知，而是本次尝试的**起点标记**，与错误类型无关。
+     *
+     * @param ctx          循环上下文（wsTemplate/streamTopic null 时跳过）
+     * @param attempt      本次重试序号（1 起，= retryAttemptHolder）
+     * @param maxRetries   上限（env CLAUDE_CODE_MAX_RETRIES ?? 10）
+     */
+    static void yieldRetryAttemptStarted(AgentLoopContext ctx, int attempt, int maxRetries) {
+        if (ctx == null || ctx.wsTemplate() == null || ctx.streamTopic() == null) {
+            return;
+        }
+        try {
+            com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
+                new com.nexusai.eventbus.ws.ApiRetryEvent(
+                    ctx.streamSessionId(), ctx.streamUserMessageId(), "api_retry",
+                    attempt, maxRetries, 0L, null, null, null));
+        } catch (Exception e) {
+            log.warn("[LlmAgentLoop] 重试起点事件推送失败（不影响请求）: {}", e.getMessage());
+            return;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] api_retry 起点事件: attempt={} maxRetries={} (retryDelayMs=0)", attempt, maxRetries);
+        }
     }
 
     /**

@@ -74,3 +74,69 @@ export async function updateMemoryConfig(
 ): Promise<MemoryConfig> {
   return api<MemoryConfig>(`/memory/config?sessionId=${encodeURIComponent(sessionId)}`, { method: 'PUT', body: update })
 }
+
+/* ── 记忆条目（memory/ 下的单条 .md）────────────────────────────────────────────
+   与上面「三档文件」是两回事：
+   · /files   = 指令文件（Managed / User / Project 的 CLAUDE.md）
+   · /entries = 项目记忆目录里**平铺**的单条 .md（一条一项，type 来自 frontmatter）
+   ⚠️ 四类（user/feedback/project/reference）不是目录，只是条目的 frontmatter 标签。
+   ⛔ 本组端点只操作单条 .md，永不读写 MEMORY.md（索引由模型维护）。 */
+
+/** 记忆条目摘要（列表用 · 不含正文） */
+export interface MemoryEntrySummary {
+  /** frontmatter type 原值；缺失/非法 → null */
+  type: 'user' | 'feedback' | 'project' | 'reference' | null
+  /** frontmatter name（列表标题）；缺失回落文件名 */
+  name: string
+  /** frontmatter description；缺失 → null */
+  description: string | null
+  /** 相对记忆目录的文件名（单层 .md） */
+  filename: string
+  mtimeMs: number
+  /** 读不到 → -1 */
+  sizeBytes: number
+}
+
+/** 记忆条目详情（单条正文） */
+export interface MemoryEntryDetail {
+  type: string | null
+  filename: string
+  /** 全文（含 frontmatter） */
+  content: string
+  mtimeMs: number
+  sizeBytes: number
+}
+
+/** GET /api/v1/memory/entries?sessionId= · 记忆条目清单（mtime 降序，不含正文）。 */
+export async function listMemoryEntries(sessionId: string): Promise<MemoryEntrySummary[]> {
+  return api<MemoryEntrySummary[]>(`/memory/entries?sessionId=${encodeURIComponent(sessionId)}`)
+}
+
+/** GET /api/v1/memory/entries/{file}?sessionId= · 单条正文。 */
+export async function getMemoryEntry(sessionId: string, file: string): Promise<MemoryEntryDetail> {
+  return api<MemoryEntryDetail>(
+    `/memory/entries/${encodeURIComponent(file)}?sessionId=${encodeURIComponent(sessionId)}`,
+  )
+}
+
+/** PUT /api/v1/memory/entries?sessionId= · 覆盖写单条（⛔ 不改 MEMORY.md）。 */
+export async function saveMemoryEntry(
+  sessionId: string,
+  file: string,
+  content: string,
+): Promise<MemoryEntryDetail> {
+  return api<MemoryEntryDetail>(`/memory/entries?sessionId=${encodeURIComponent(sessionId)}`, {
+    method: 'PUT',
+    body: { file, content },
+  })
+}
+
+/** DELETE /api/v1/memory/entries?sessionId=&file= · 删单条（⛔ 不删索引里那一行）。 */
+export async function deleteMemoryEntry(
+  sessionId: string,
+  file: string,
+): Promise<{ deleted: boolean; file: string }> {
+  return api(`/memory/entries?sessionId=${encodeURIComponent(sessionId)}&file=${encodeURIComponent(file)}`, {
+    method: 'DELETE',
+  })
+}

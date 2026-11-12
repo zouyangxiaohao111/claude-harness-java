@@ -43,6 +43,17 @@ export interface KbCreateSubmit {
    * 本仓后端收 **String**（列是 TEXT 存 JSON）⇒ 这里已序列化好，⛔ api 层别再 stringify。
    */
   extract_config?: string | null
+  /**
+   * 图片处理三项（V286 顶层列）· 可选。
+   *
+   * <p>创建弹窗本批**没有**对应控件 ⇒ 不传时由调用方（`KnowledgeBasePage`）按后端默认
+   * `true` / `true` / `default` 显式补齐。⚠️ `imagePipeline` 只允许
+   * `default` | `smartocr`；它<b>不是</b> `image_processing_config.image_pipeline`
+   * （旧键，取值 `""`/`"attrs"`，后端零消费者）。
+   */
+  imageCaptionEnabled?: boolean
+  imageOcrEnabled?: boolean
+  imagePipeline?: 'default' | 'smartocr'
 }
 
 interface Props {

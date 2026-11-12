@@ -124,7 +124,7 @@ class FactoryPresetSeederTest {
         SettingsRecord s = settingsCaptor.getValue();
         assertThat(s.getPermissionMode()).as("permission_mode 强制 default（不照搬用户的 bypassPermissions）").isEqualTo("default");
         assertThat(s.getAutoCompactWindow()).isEqualTo(1000000);
-        assertThat(s.getMaxOutputTokens()).isEqualTo(8000);
+        // 2026-11-12：max_output_tokens 已废弃（V285 DROP 列），不再从预设导入
         assertThat(s.getWebsearchUseSmallModel()).isTrue();
         assertThat(s.getAgentSwarmsEnabled()).isTrue();
         assertThat(s.getAutoCompactEnabled()).isTrue();

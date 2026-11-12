@@ -52,10 +52,9 @@ public class KbWikiReduceStage {
 
     private static final double TEMP_MODIFY = 0.3;
 
-    private static final int MAX_TOKENS_MODIFY = 8000;
-
-    /** 续写轮用的 token 预算（比首页略小：它只写剩余部分）。 */
-    private static final int MAX_TOKENS_CONTINUE = 6000;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS_MODIFY(8000) / MAX_TOKENS_CONTINUE(6000)：
+    //   输出上限唯一入口 = 模型配置页「生成参数 · max tokens」（models.max_tokens）。
+    //   截断续写机制（isLengthFinish → 续写）保持不变，只是预算改由模型配置决定。
 
     /** 匹配历史遗留的 chunk 内联引用 {@code [c003]} / {@code [c12]}。 */
     private static final Pattern INLINE_CHUNK_CITATION =
@@ -329,7 +328,7 @@ public class KbWikiReduceStage {
 
         LlmProvider.LlmInvocationResult r = invoke(
             config, modelName, KbWikiPrompts.TAXONOMY_PLAN_SYSTEM, user,
-            3000, 0.1, "wiki_taxonomy");
+            0.1, "wiki_taxonomy");
         if (r == null || r.content() == null) {
             log.warn("[Wiki] 目录规划调用失败，保留原有归属");
             return Map.of();
@@ -412,7 +411,7 @@ public class KbWikiReduceStage {
         ProviderConfig config, String modelName, String system, String user, String slug
     ) {
         LlmProvider.LlmInvocationResult first = invoke(
-            config, modelName, system, user, MAX_TOKENS_MODIFY, TEMP_MODIFY, "wiki_page_modify");
+            config, modelName, system, user, TEMP_MODIFY, "wiki_page_modify");
         if (first == null) {
             return new RewriteOutcome(null, false);
         }
@@ -429,7 +428,7 @@ public class KbWikiReduceStage {
             LlmProvider.LlmInvocationResult r = invoke(
                 config, modelName,
                 KbWikiPrompts.PAGE_MODIFY_CONTINUATION_SYSTEM, continueUser,
-                MAX_TOKENS_CONTINUE, TEMP_MODIFY, "wiki_page_continue");
+                TEMP_MODIFY, "wiki_page_continue");
             if (r == null || r.content() == null || r.content().isBlank()) {
                 log.warn("[Wiki] 续写返回空，停止 slug={} 轮次={}", slug, round);
                 break;
@@ -741,11 +740,11 @@ public class KbWikiReduceStage {
      */
     private LlmProvider.LlmInvocationResult invoke(
         ProviderConfig config, String modelName, String system, String user,
-        int maxTokens, double temperature, String label
+        double temperature, String label
     ) {
         try {
             if (log.isDebugEnabled()) {
-                log.debug("[Wiki] 调用模型 label={} model={} max_tokens={}", label, modelName, maxTokens);
+                log.debug("[Wiki] 调用模型 label={} model={} max_tokens=按模型配置", label, modelName);
             }
             return sideCallClient.message(
                 config, modelName, system, user,
@@ -753,7 +752,7 @@ public class KbWikiReduceStage {
                     null, null, null,
                     LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
                     temperature, label,
-                    null, maxTokens, null, null,
+                    null, null, null, null,
                     null, null, null, null,
                     null, null),
                 LlmSideCallClient.SideCallUsage.standalone(UsageCategory.SIDE_CALL, label));

@@ -36,6 +36,32 @@ public class GlobalExceptionHandler {
 
     private static final Logger log = LoggerFactory.getLogger(GlobalExceptionHandler.class);
 
+    /**
+     * 当前生效的单文件上传上限（与 {@code spring.servlet.multipart.max-file-size} 同源）。
+     *
+     * <p>报错文案里必须写<b>真实</b>上限，⛔ 不要在字符串里硬编码 —— 配置改了文案会撒谎。
+     */
+    @org.springframework.beans.factory.annotation.Value("${spring.servlet.multipart.max-file-size:100MB}")
+    private String maxFileSize;
+
+    /**
+     * 上传超限 ⇒ <b>413</b>（[2026-11-12] 用户报「上传 4 个文件只进去 2 个」的第二个凶手）。
+     *
+     * <p><b>WHY 必须单独接</b>：该异常在 <b>multipart 解析阶段</b>抛出（早于 controller /
+     * 早于访问日志的「开始请求」），原本落进兜底 500 ⇒ 前端 toast 只显示
+     * {@code MaxUploadSizeExceededException: Maximum upload size exceeded}，
+     * 用户既不知道是哪个文件、也不知道上限是多少，观感就是「文件莫名其妙没上传」。
+     */
+    @ExceptionHandler(org.springframework.web.multipart.MaxUploadSizeExceededException.class)
+    public ResponseEntity<Problem> handleMaxUploadSize(
+        org.springframework.web.multipart.MaxUploadSizeExceededException ex, HttpServletRequest req) {
+        log.warn("[上传] 超过大小上限 path={} 上限={} 原因={}",
+            req.getRequestURI(), maxFileSize, ex.getMessage());
+        return ResponseEntity.status(HttpStatus.PAYLOAD_TOO_LARGE)
+            .body(withInstance(Problem.of(413, "Payload Too Large",
+                "文件超过上传上限（单个文件最大 " + maxFileSize + "），请压缩或拆分后再上传。"), req));
+    }
+
     @ExceptionHandler(NotFoundException.class)
     public ResponseEntity<Problem> handleNotFound(NotFoundException ex, HttpServletRequest req) {
         return ResponseEntity.status(HttpStatus.NOT_FOUND)

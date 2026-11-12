@@ -1,5 +1,5 @@
 import { api } from './rest'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionUsageResponse, ComputerUseApproval } from './types'
+import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval } from './types'
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
@@ -15,6 +15,12 @@ export const sessionApi = {
     api<SessionToolDto>(`/sessions/${encodeURIComponent(id)}/tools/${encodeURIComponent(toolName)}`, {
       method: 'PATCH',
       body: { enabled } satisfies SessionToolPatchRequest,
+    }),
+  /** 按分类批量启用/禁用（PATCH /sessions/{id}/tools · body {category, enabled} · 返回整表，前端整表替换） */
+  setCategoryEnabled: (id: string, category: SessionToolCategory, enabled: boolean) =>
+    api<SessionToolDto[]>(`/sessions/${encodeURIComponent(id)}/tools`, {
+      method: 'PATCH',
+      body: { category, enabled } satisfies SessionToolCategoryToggleRequest,
     }),
   /**
    * [usage-gateway] 会话级用量明细（GET /sessions/{id}/usage · 记账侧权威值）。

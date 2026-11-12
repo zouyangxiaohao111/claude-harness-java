@@ -261,4 +261,67 @@ class ChatServiceTurnEndIdleAlwaysPushedTest {
             .as("idle 必须是本轮最后一个推送")
             .isInstanceOf(SessionStatusEvent.class);
     }
+
+    /**
+     * ⭐ [catch-throwable] run() 抛的是 **Error**（不是 Exception）时也必须收口。
+     *
+     * <p><b>WHY（用户实测）</b>：「结束后后端没有访问了，前端也没收到，还是一直停止」。原实现
+     * {@code catch (Exception e)} ⇒ {@code Error}/{@code Throwable} 子类整条漏出去：既不推
+     * {@code message.error} 也不推 {@code session.status=idle}、不清 inProgress ⇒ 前端停止键永驻、
+     * 该会话之后再也发不出消息（只能 F5）。
+     *
+     * <p><b>反向实验</b>：把 catch 改回 {@code Exception} ⇒ 本用例必须红（error/idle 零推送）。
+     */
+    @Test
+    @DisplayName("⭐ run 抛 Error（非 Exception）⇒ 仍然必推 message.error + status=idle（否则停止键永驻）")
+    void errorNotException_stillClosesTurn() {
+        LlmAgentLoop mockLoop = mock(LlmAgentLoop.class);
+        when(mockLoop.run(any(RunRequest.class)))
+            .thenThrow(new StackOverflowError("模拟 Error 逃逸（原 catch (Exception) 接不住）"));
+        when(loopProvider.getObject()).thenReturn(mockLoop);
+
+        // WHEN: 主流程（no-throw 返回 —— Error 被新 catch 接住，不再冒泡出 processUserMessage）
+        service.processUserMessage(sid, "msg-user", new SendMessageRequest(
+            "主问题", null, null, null, null, null, null, null, null), wsTemplate);
+
+        // THEN: 前端两根救命信号都要有
+        List<Object> events = capturedEvents();
+        assertThat(events.stream().anyMatch(MessageErrorEvent.class::isInstance))
+            .as("Error 分支必须推 message.error —— 否则界面上什么都没有，用户以为还在跑")
+            .isTrue();
+        assertThat(statusEvents(events).stream().map(SessionStatusEvent::getStatus).toList())
+            .as("Error 分支必须推 status=idle —— 这是前端停止键唯一的解除信号")
+            .contains("idle");
+        assertThat(inFlightTasks())
+            .as("Error 分支收口不得残留 inProgress 条目（幽灵任务会让该会话再也发不出消息）")
+            .doesNotContainKey(sid);
+    }
+
+    /**
+     * ⭐ [err-readable] 终态文案必须是**用户能看懂的一句话**，不是上游原始技术串。
+     *
+     * <p><b>WHY（用户原话）</b>：「不跟 CC 一样显示 额度不足 啊 啥的」。原先直接透 {@code e.getMessage()}，
+     * 实测前端错误卡正文是 {@code HTTP 550:} / {@code Request failed}。
+     *
+     * <p><b>反向实验</b>：把 {@code errorMsg} 改回 {@code e.getMessage()} ⇒ 本用例必须红。
+     */
+    @Test
+    @DisplayName("⭐ 402 余额不足 ⇒ 错误卡正文出现「额度不足」（不再是纯 HTTP 串）")
+    void paymentRequiredRendersReadableQuotaMessage() {
+        LlmAgentLoop mockLoop = mock(LlmAgentLoop.class);
+        when(mockLoop.run(any(RunRequest.class)))
+            .thenThrow(new com.nexusai.infra.llm.LlmApiException(402, java.util.Map.of(), ""));
+        when(loopProvider.getObject()).thenReturn(mockLoop);
+
+        service.processUserMessage(sid, "msg-user", new SendMessageRequest(
+            "主问题", null, null, null, null, null, null, null, null), wsTemplate);
+
+        MessageErrorEvent err = capturedEvents().stream()
+            .filter(MessageErrorEvent.class::isInstance)
+            .map(MessageErrorEvent.class::cast)
+            .findFirst().orElseThrow();
+        assertThat(err.getMessage())
+            .as("用户必须看到「额度不足」这类人话，而不是 HTTP 402 裸串")
+            .contains("额度不足");
+    }
 }

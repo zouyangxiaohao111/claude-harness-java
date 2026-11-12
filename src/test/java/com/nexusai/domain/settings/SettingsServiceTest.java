@@ -47,8 +47,7 @@ class SettingsServiceTest {
     /** 仅 V61 插件双读配置有值、其余全 null 的请求（避免手写 66 参）。 */
     private static SettingsDto v61SettingsDto(Map<String, Boolean> enabledPlugins, Boolean pluginClaudeFallback) {
         return new SettingsDto(
-            null, null, null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null, null, null,
@@ -102,8 +101,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 "anysearch", "new-key", "new.proxy:8080", true,
                 "https://new.example.com",
@@ -141,8 +139,7 @@ class SettingsServiceTest {
         // 请求 6 字段全 null → 不覆盖
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, null, null, null,
                 null,
@@ -177,8 +174,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 "duckduckgo", null, null, false, null,
                 "https://new-check2.example.com/domain_info",
@@ -240,8 +236,7 @@ class SettingsServiceTest {
 
             SettingsDto req = new SettingsDto(
                     null, null, null, null,
-                    null, null, null, null, null, null,
-                    null, null, null, null, null,
+                    null, null, null, null, null, null, null, null, null, null,
                     null, null, null, null,
                     null, null, null, null, null,
                     null,
@@ -304,8 +299,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, null, null, null,
                 null,
@@ -334,8 +328,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, null, null, null,
                 null,
@@ -362,8 +355,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, null, null, null,
                 null,
@@ -391,8 +383,7 @@ class SettingsServiceTest {
 
         SettingsDto req = new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, null, null, null,
                 null,

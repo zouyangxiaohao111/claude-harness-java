@@ -9,6 +9,7 @@ import com.nexusai.kb.repo.mapper.KbChunkMapper;
 import com.nexusai.kb.repo.mapper.KbEmbeddingMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -48,6 +49,19 @@ public class KbIndexWriter {
 
     /** 单次 embedding 请求的块数上限（与 EmbeddingService.MAX_INPUTS 一致）。 */
     private static final int EMBED_BATCH = 64;
+
+    /**
+     * 图片文字是否已写成<b>独立子块</b>（{@code image_caption} / {@code image_ocr}）。
+     *
+     * <p>⭐ 与 {@code KbImageEnrichService} 读<b>同一个配置键</b>（默认 true）：
+     * <ul>
+     *   <li>true ⇒ caption/OCR 由子块自己进索引，正文块<b>不再拼</b>（否则同一段文字被索引两遍）；</li>
+     *   <li>false ⇒ 旧行为：拼进正文块的向量与 FTS 文本。</li>
+     * </ul>
+     */
+    @Value("${nexusai.knowledge.image.sub-chunks-enabled:true}")
+    private boolean imageSubChunksEnabled =
+        com.nexusai.kb.app.image.KbImageEnrichService.DEFAULT_SUB_CHUNKS_ENABLED;
 
     private final KbEmbeddingMapper embeddingMapper;
     private final KbChunkMapper chunkMapper;
@@ -349,11 +363,15 @@ public class KbIndexWriter {
      * {@code start_at/end_at} 有位置不变式，塞进正文会破坏文档重建与高亮。
      * 索引文本是派生物，可以随便拼。
      */
-    private static String indexTextOf(KbChunkRecord c) {
-        // ⭐ 图内文字（caption / OCR）必须进索引，否则「图片理解」等于白跑：
-        //    文字只躺在 image_info 里，向量与 FTS 都命中不到。
+    private String indexTextOf(KbChunkRecord c) {
+        // ⭐ 图内文字（caption / OCR）必须能被检索到 —— 但只走一条路：
+        //    · 子块模式（默认）：文字已写成 image_caption / image_ocr 独立块，由它们自己进索引；
+        //    · 旧模式：文字只躺在 image_info 里，必须拼进本块的索引文本（否则模型白跑）。
+        String imageText = imageSubChunksEnabled
+            ? ""
+            : com.nexusai.kb.app.image.KbImageEnrichService.imageTextForIndex(c.getImageInfo());
         return embeddingInputOf(c)
-            + com.nexusai.kb.app.image.KbImageEnrichService.imageTextForIndex(c.getImageInfo())
+            + imageText
             + com.nexusai.kb.app.ingest.KbGeneratedQuestions.indexText(c.getMetadata());
     }
 
@@ -368,11 +386,14 @@ public class KbIndexWriter {
                 ps.setString(2, c.getKnowledgeId());
                 ps.setString(3, c.getKnowledgeBaseId());
                 ps.setString(4, c.getContextHeader() == null ? "" : c.getContextHeader());
-                // ⭐ 与向量输入同构：正文 + 图内文字 + 生成的问题
+                // ⭐ 与向量输入同构：正文 + 图内文字（仅旧模式）+ 生成的问题
                 //    （否则「向量能召回、关键词召回不到」）
+                String imageText = imageSubChunksEnabled
+                    ? ""
+                    : com.nexusai.kb.app.image.KbImageEnrichService
+                        .imageTextForIndex(c.getImageInfo());
                 ps.setString(5, (c.getContent() == null ? "" : c.getContent())
-                    + com.nexusai.kb.app.image.KbImageEnrichService
-                        .imageTextForIndex(c.getImageInfo())
+                    + imageText
                     + com.nexusai.kb.app.ingest.KbGeneratedQuestions
                         .indexText(c.getMetadata()));
                 ps.addBatch();

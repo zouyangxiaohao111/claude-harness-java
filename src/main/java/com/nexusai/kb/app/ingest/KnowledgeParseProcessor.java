@@ -5,7 +5,10 @@ import com.nexusai.kb.app.chunk.KbChunkingConfigParser;
 import com.nexusai.kb.app.chunk.KbSplitterConfig;
 import com.nexusai.kb.app.chunk.KbTextSplitter;
 import com.nexusai.kb.app.image.KbImageStorage;
+import com.nexusai.kb.app.ingest.span.KbSpan;
+import com.nexusai.kb.app.ingest.span.KbSpanTracker;
 import com.nexusai.kb.app.parser.KbImageRef;
+import com.nexusai.kb.app.parser.KbMarkdownImageResolver;
 import com.nexusai.kb.app.parser.KbParseContext;
 import com.nexusai.kb.app.parser.KbParsedDocument;
 import com.nexusai.kb.app.parser.KbParserRegistry;
@@ -100,6 +103,16 @@ public class KnowledgeParseProcessor {
     private static final Pattern MARKDOWN_IMAGE =
         Pattern.compile("!\\[[^\\]]*\\](?:\\([^)]*\\))?");
 
+    /**
+     * 解析产出空正文时的失败文案（<b>逐字</b>写在这里，测试与实现同一个常量）。
+     *
+     * <p>为什么必须失败而不是「完成但 0 分块」：源站对空内容一律 {@code failed} ——
+     * 空文档没有任何可检索内容，标 completed 只会让用户在「已完成」里反复搜不到，
+     * 且没有任何可排查的线索。
+     */
+    static final String EMPTY_PARSE_MESSAGE =
+        "解析结果为空：文件无可提取文本（扫描件请确认视觉模型已配置，或改用 OCR 引擎）";
+
     private final KbKnowledgeMapper knowledgeMapper;
     private final KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbParserRegistry parserRegistry;
@@ -134,6 +147,16 @@ public class KnowledgeParseProcessor {
      * 本类只负责「解析成功之后叫它一声」。
      */
     private final KbPostProcessStage postProcessStage;
+
+    /**
+     * span 树写入口（trace 观测层）· 批 2 接线。
+     *
+     * <p><b>为什么用字段注入而不是构造器参数</b>：本类有<b>两个</b>构造器且都被单测直构使用
+     * ⇒ 改签名会连坐现有测试。字段注入 + {@code required = false} 让「老测试 / 精简装配」
+     * 全程走「不记 span」的降级路径，业务行为与改造前逐字一致。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private KbSpanTracker spanTracker;
 
     public KnowledgeParseProcessor(
         KbKnowledgeMapper knowledgeMapper,
@@ -228,6 +251,10 @@ public class KnowledgeParseProcessor {
         Path workDir = null;
         // 本次解析已落盘的图片存储键（失败时回滚，避免留下没人引用的孤儿文件）
         List<String> storedKeys = new ArrayList<>();
+        // ⭐ trace：本轮 attempt 以 kb_knowledge.parse_attempt 为准（见 openTraceAttempt）。
+        int traceAttempt = openTraceAttempt(knowledgeId, currentAttempt);
+        // 「尚未收口」的 stage —— catch 里据此把失败记到正确的阶段上（null ⇒ 只收口 root）
+        KbSpan openStage = null;
         try {
             Path file = resolveFile(knowledge);
             workDir = Files.createTempDirectory("kb-parse-");
@@ -238,8 +265,15 @@ public class KnowledgeParseProcessor {
             KbSplitterConfig splitterConfig = splitterConfigOf(knowledge);
 
             // ⭐ 解析路由：知识库配了 parser_engine_rules ⇒ 按规则选；否则走 @Order 默认顺序
+            KbSpan docreaderSpan = beginTraceStage(knowledgeId, traceAttempt, "docreader",
+                traceJson("file", file.getFileName() == null ? null : file.getFileName().toString()));
+            openStage = docreaderSpan;
             KbParsedDocument parsed = com.nexusai.kb.app.parser.KbParserEngineRouter.parse(
                 parserRegistry, file, ctx, splitterConfig.parserEngineRules());
+            endTraceStage(docreaderSpan, traceJson(
+                "chars", parsed.text().length(), "images", parsed.images().size(),
+                "engine", parsed.metadata().get(KbParsedDocument.META_PARSER)));
+            openStage = null;
 
             // ⭐ ⓪ 行尾归一（源侧 knowledge_create.go:1427 也在上游归一）。
             //   WHY 必须在切分之前：KbTextSplitter.split **不内部归一**（见 KbTextSplitter:360 注释：
@@ -252,8 +286,49 @@ public class KnowledgeParseProcessor {
             log.info("[入库] 行尾归一 knowledge={} 原长={} 归一后={} CR数={}",
                 knowledgeId, raw.length(), normalized.length(), crCount);
 
+            // ⭐ ⓪.5 空正文护栏（源站口径：解析成功但没有任何可提取文本 ⇒ failed）
+            //   WHY 必须在 persistImages / 切分 / 建索引 / fanOut 之前：空正文会被切成 0 块，
+            //   但旧实现照样 markIndexed + COMPLETED —— 用户看到「已完成」却一条内容都搜不到，
+            //   而且全程没有任何报错。
+            //   例外：解析器明确产出了图片 ⇒ 纯图文档（扫描件/照片），图片理解链会补文字。
+            if (hasNoExtractableText(normalized)) {
+                int producedImages = parsed.images() == null ? 0 : parsed.images().size();
+                String sourceName = fileNameOf(parsed, file);
+                String parserName = parsed.metadata().get(KbParsedDocument.META_PARSER);
+                long fileBytes = fileBytesOf(file);
+                if (producedImages > 0) {
+                    log.warn("[入库] 正文为空但有 {} 张图，按纯图文档继续（图片理解链补文字）"
+                            + "knowledge={} 文件={} 解析器={} 文件字节数={}",
+                        producedImages, knowledgeId, sourceName, parserName, fileBytes);
+                } else {
+                    log.warn("[入库] 解析结果为空（无任何可提取文本）knowledge={} 文件={} 解析器={} 文件字节数={}",
+                        knowledgeId, sourceName, parserName, fileBytes);
+                    // ⛔ 不写分块、不建索引、不 fanOut 后处理：空文档没有任何可检索内容，
+                    //    继续走完流程只会让用户看到「已完成却搜不到」。
+                    failTraceStage(docreaderSpan, "EMPTY_CONTENT", EMPTY_PARSE_MESSAGE, null);
+                    finalizeTraceAttemptFailed(knowledgeId, traceAttempt);
+                    stateRepository.markFailed(knowledgeId, EMPTY_PARSE_MESSAGE);
+                    return Outcome.FAILED;
+                }
+            }
+
             // ⭐ ① 先把图片搬到持久化存储：workDir 在 finally 里会被递归删掉
+            //    ⭐ ①.0 先补抽「只存在于正文里」的图：解析引擎只吐 Markdown 时，
+            //    parsed.images() 里没有任何图（图片二进制从未落盘）—— 对齐源侧 ImageResolver，
+            //    从 data URI / HTML img / 相对路径 / 远程 URL 里把图找回来。
+            //    ⛔ 只抽图，不改正文：分块 start/end 与溯源定位依赖原文偏移。
+            parsed = withMarkdownImages(knowledge, parsed, file, workDir);
+            KbSpan multimodalSpan = beginTraceStage(knowledgeId, traceAttempt, "multimodal",
+                traceJson("phase", "persist", "file", fileNameOf(parsed, file)));
+            openStage = multimodalSpan;
             List<KbChunk.Image> storedImages = persistImages(knowledge, parsed.images(), storedKeys);
+            if (storedImages.isEmpty()) {
+                // 纯文本文档：skipped（「我们选择不跑」）而不是 pending/running
+                skipTraceStage(multimodalSpan, "无图片");
+            } else {
+                endTraceStage(multimodalSpan, traceJson("images", storedImages.size()));
+            }
+            openStage = null;
 
             // ⭐ ② 切分（坐标系 = 归一后文本的 code point 偏移）
             //    父子模式：父块用 parentChunkSize、子块用 childChunkSize；
@@ -261,6 +336,9 @@ public class KnowledgeParseProcessor {
             //    ⚠️ 子块的重叠按源站 DeriveParentChildConfigs（strategy.go:246）取 childSize/5。
             List<KbChunk> textChunks;
             List<KbChunk> parentChunks = List.of();
+            KbSpan chunkingSpan = beginTraceStage(knowledgeId, traceAttempt, "chunking",
+                traceJson("parentChild", splitterConfig.enableParentChild()));
+            openStage = chunkingSpan;
             if (splitterConfig.enableParentChild()) {
                 KbSplitterConfig parentCfg = new KbSplitterConfig(
                     splitterConfig.parentChunkSize(), splitterConfig.chunkOverlap(),
@@ -296,6 +374,10 @@ public class KnowledgeParseProcessor {
 
             KbChunkWriter.WriteResult written =
                 chunkWriter.replaceChunks(knowledge, chunks, parentChunks);
+            endTraceStage(chunkingSpan, traceJson(
+                "chunks", chunks.size(), "parents", parentChunks.size(),
+                "bytes", written.contentBytes()));
+            openStage = null;
 
             // ⭐ 建索引（向量 + FTS）· 必须在转 enabled 之前 —— 否则文档已可检索但索引还没建
             //    （用户会看到「已完成」却搜不到内容）。源侧同样先 BatchIndex 再 finalizeIndexed。
@@ -305,6 +387,9 @@ public class KnowledgeParseProcessor {
             //    且没有任何报错）。这里必须先解析驱动，未接入的驱动会在 index() 抛 fail-loud。
             KbKnowledgeBaseRecord kb = kbOf(knowledge);
             String embedModelId = resolveEmbeddingModelId(knowledge, kb);
+            KbSpan embeddingSpan = beginTraceStage(knowledgeId, traceAttempt, "embedding",
+                traceJson("model", embedModelId));
+            openStage = embeddingSpan;
             com.nexusai.kb.app.retrieval.engine.KbRetrievalEngine engine =
                 engineRegistry.require(engineRegistry.resolveEngineType(knowledge.getKnowledgeBaseId()));
             engine.index(
@@ -319,6 +404,13 @@ public class KnowledgeParseProcessor {
             if (!stateRepository.markIndexed(knowledgeId, written.contentBytes())) {
                 log.warn("[入库] 分块已写但未能置 enabled（状态已变）knowledge={}", knowledgeId);
             }
+            // 没有嵌入模型不是错误：只建了关键词索引 ⇒ skipped（源站把这种情况记成 skipped）
+            if (embedModelId == null || embedModelId.isBlank()) {
+                skipTraceStage(embeddingSpan, "未配置嵌入模型（仅关键词检索）");
+            } else {
+                endTraceStage(embeddingSpan, traceJson("chunks", chunks.size()));
+            }
+            openStage = null;
 
             // ⭐ 后处理 fan-out：按知识库配置决定是否进入 finalizing 并派发子任务。
             //    ⚠️ 必须在 markIndexed 之后 —— 子任务要读已落库的分块；
@@ -330,12 +422,144 @@ public class KnowledgeParseProcessor {
 
         } catch (Exception e) {
             log.error("[入库] 解析失败 knowledge={} 原因={}", knowledgeId, e.getMessage(), e);
+            // trace：失败记到「尚未收口」的那个 stage 上；没有则只收口 root
+            failTraceStage(openStage, failCodeOf(openStage), describe(e), e);
+            finalizeTraceAttemptFailed(knowledgeId, traceAttempt);
             // ⭐ 已落盘的图片必须回滚：否则解析失败重试会不断堆积孤儿文件
             rollbackImages(storedKeys);
             stateRepository.markFailed(knowledgeId, describe(e));
             return Outcome.FAILED;
         } finally {
             cleanup(workDir);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // trace：五阶段 span 写入（对标源站 knowledge.go:307-437 的薄封装）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 只为把 input/output 快照拼成 JSON 文本（span 列是 TEXT）。 */
+    private static final com.fasterxml.jackson.databind.ObjectMapper TRACE_JSON =
+        new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /**
+     * 开本轮 attempt，返回「本次 span 使用」的 attempt 号。
+     *
+     * <p><b>⭐⭐ 为什么不能直接用 {@code openAttempt().attempt()}</b>：
+     * {@code kb_knowledge.parse_attempt} 是 attempt 的<b>既有真源</b>，而
+     * {@code KbSpanTracker#openAttempt} 自己算 {@code MAX(attempt)+1}。两者会不一致：
+     * <ul>
+     *   <li>本功能上线前的历史文档：{@code parse_attempt} 已经是 3，span 表还是空的（latest=0）；</li>
+     *   <li>reparse 后 span 写入失败 / 上次进程在 openAttempt 之前崩溃；</li>
+     *   <li>span 表比 {@code parse_attempt} 领先（理论上不该发生，仍以真源为准）。</li>
+     * </ul>
+     * 直接用 {@code openAttempt} 的返回值会让两轮的 span 串到同一 attempt 里，
+     * 前端按 attempt 切换时间线时整棵树错位。规则：
+     * <ol>
+     *   <li>{@code latest < currentAttempt}：循环 {@code openAttempt} 补齐到 currentAttempt
+     *       （中间轮次的 root 会被下一次 openAttempt 置 {@code ATTEMPT_SUPERSEDED}，语义正确）；</li>
+     *   <li>{@code latest >= currentAttempt}：沿用 currentAttempt（本轮 root 缺失时，
+     *       stage 会以「无父行」记录 —— tracker 自带的降级，且 finalizeAttempt 是幂等的）；</li>
+     *   <li>任何异常 ⇒ 仍返回 currentAttempt：trace 是旁路，⛔ 绝不影响入库结果。</li>
+     * </ol>
+     */
+    private int openTraceAttempt(String knowledgeId, int currentAttempt) {
+        if (spanTracker == null || knowledgeId == null || knowledgeId.isBlank() || currentAttempt <= 0) {
+            return currentAttempt;
+        }
+        try {
+            int latest = spanTracker.latestAttempt(knowledgeId);
+            if (latest >= currentAttempt) {
+                if (spanTracker.lookupSpanByName(knowledgeId, currentAttempt, "knowledge_processing") == null) {
+                    log.warn("[入库] span 表已有 attempt={}，但本轮 attempt={} 缺 root（按无父 stage 记录）knowledge={}",
+                        latest, currentAttempt, knowledgeId);
+                }
+                return currentAttempt;
+            }
+            // 逐步推进，直到 span 表的 MAX(attempt) 追上 parse_attempt。
+            // 上限 16 只为防病态数据无限插入；正常情况循环 1 次（新文档）或 1~2 次（重解析）。
+            int guard = 0;
+            int lastAttempt = 0;
+            while (guard < 16 && spanTracker.latestAttempt(knowledgeId) < currentAttempt) {
+                lastAttempt = spanTracker.openAttempt(knowledgeId).attempt();
+                guard++;
+            }
+            if (lastAttempt != currentAttempt) {
+                log.warn("[入库] span attempt 未能对齐 knowledge={} 目标={} 实际={}（可能是 attempt 跳跃过大）",
+                    knowledgeId, currentAttempt, lastAttempt);
+            }
+            return currentAttempt;
+        } catch (RuntimeException e) {
+            log.warn("[入库] 开启 span attempt 失败（降级为不记 span 的父节点）knowledge={} attempt={} 原因={}",
+                knowledgeId, currentAttempt, e.getMessage());
+            return currentAttempt;
+        }
+    }
+
+    /** 开一个 stage span；tracker 缺失 / attempt 非法 ⇒ null（调用方与 tracker 都容忍 null）。 */
+    private KbSpan beginTraceStage(String knowledgeId, int attempt, String stage, String inputJson) {
+        if (spanTracker == null || attempt <= 0) {
+            return null;
+        }
+        return spanTracker.beginStage(knowledgeId, attempt, stage, inputJson);
+    }
+
+    /** 成功收口一个 stage。 */
+    private void endTraceStage(KbSpan span, String outputJson) {
+        if (spanTracker != null) {
+            spanTracker.endSpan(span, outputJson);
+        }
+    }
+
+    /** 跳过（「我们选择不跑」）。 */
+    private void skipTraceStage(KbSpan span, String reason) {
+        if (spanTracker != null) {
+            spanTracker.skipSpan(span, reason);
+        }
+    }
+
+    /** 失败收口一个 stage（span 为 null ⇒ no-op）。 */
+    private void failTraceStage(KbSpan span, String errorCode, String message, Throwable detail) {
+        if (spanTracker != null) {
+            spanTracker.failSpan(span, errorCode, message, detail);
+        }
+    }
+
+    /** 收口本轮 root 为 failed（幂等；找不到 root 只 warn）。 */
+    private void finalizeTraceAttemptFailed(String knowledgeId, int attempt) {
+        if (spanTracker != null && attempt > 0) {
+            spanTracker.finalizeAttempt(knowledgeId, attempt, "failed", null);
+        }
+    }
+
+    /** 未收口 stage 对应的错误码（可读性优先于「统一一个码」）。 */
+    private static String failCodeOf(KbSpan span) {
+        if (span == null) {
+            return "PARSE_FAILED";
+        }
+        return switch (span.name == null ? "" : span.name) {
+            case "docreader" -> "DOCREADER_FAILED";
+            case "chunking" -> "CHUNK_FAILED";
+            case "embedding" -> "INDEX_FAILED";
+            case "multimodal" -> "MULTIMODAL_FAILED";
+            case "postprocess" -> "POSTPROCESS_FAILED";
+            default -> "PARSE_FAILED";
+        };
+    }
+
+    /** {@code Object...} 形式的键值对 → JSON 文本；无参数 / 序列化失败 ⇒ null。 */
+    private static String traceJson(Object... keyValues) {
+        if (keyValues == null || keyValues.length == 0) {
+            return null;
+        }
+        Map<String, Object> map = new LinkedHashMap<>();
+        for (int i = 0; i + 1 < keyValues.length; i += 2) {
+            map.put(String.valueOf(keyValues[i]), keyValues[i + 1]);
+        }
+        try {
+            return TRACE_JSON.writeValueAsString(map);
+        } catch (com.fasterxml.jackson.core.JsonProcessingException e) {
+            return null;
         }
     }
 
@@ -462,6 +686,82 @@ public class KnowledgeParseProcessor {
     // ════════════════════════════════════════════════════════════════════════
     // 图片链路
     // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 把「正文里的图片引用」补进解析产物（对齐源侧 {@code ImageResolver}）。
+     *
+     * <p><b>为什么需要</b>：只吐 Markdown 的解析引擎（anydoc / 纯文本类）不会产出任何图片文件，
+     * 图片只剩正文里的引用形态；{@code parsed.images()} 因此为空，分块投影里也就没有图。
+     * 本方法调 {@link KbMarkdownImageResolver} 把这些引用落回 {@code workDir/images}，
+     * 与解析器已产出的图片<b>按绝对路径去重</b>后合并。
+     *
+     * <p>⛔ <b>不改 {@code parsed.text()}</b>：分块坐标与溯源定位依赖原文字符偏移。
+     *
+     * <p><b>fail-soft</b>：抽图失败只 WARN 并返回原产物 —— 图片是补充材料，
+     * 不该让一份正文完好的文档解析失败。
+     *
+     * @param knowledge 知识条目（仅用于日志）
+     * @param parsed    解析产物
+     * @param file      原始文件（相对路径引用的基准目录）
+     * @param workDir   本次解析临时目录
+     * @return 合并后的产物（无新增图片时原样返回同一个实例）
+     */
+    private KbParsedDocument withMarkdownImages(KbKnowledgeRecord knowledge, KbParsedDocument parsed,
+                                                Path file, Path workDir) {
+        if (parsed == null) {
+            return null;
+        }
+        List<KbImageRef> extracted;
+        try {
+            extracted = KbMarkdownImageResolver.resolve(parsed.text(), file, workDir);
+        } catch (RuntimeException e) {
+            log.warn("[图片] 正文图片引用抽取失败，跳过（正文照常入库）knowledge={} 原因={}",
+                knowledge.getId(), e.toString());
+            return parsed;
+        }
+        if (extracted == null || extracted.isEmpty()) {
+            return parsed;
+        }
+        // 去重键 = 绝对路径（解析器已产出的图优先，语义相同只是来源不同）
+        Map<String, KbImageRef> merged = new LinkedHashMap<>();
+        for (KbImageRef ref : parsed.images()) {
+            String key = imagePathKey(ref);
+            if (key != null) {
+                merged.putIfAbsent(key, ref);
+            }
+        }
+        int before = merged.size();
+        int added = 0;
+        for (KbImageRef ref : extracted) {
+            String key = imagePathKey(ref);
+            if (key == null) {
+                continue;
+            }
+            if (merged.putIfAbsent(key, ref) == null) {
+                added++;
+            }
+        }
+        if (added == 0) {
+            log.info("[图片] 正文图片引用 {} 张全部与解析器产出重复 knowledge={}", extracted.size(), knowledge.getId());
+            return parsed;
+        }
+        log.info("[图片] 正文图片引用已合并 knowledge={} 解析器产出={} 正文新增={} 去重后={}",
+            knowledge.getId(), before, added, merged.size());
+        return new KbParsedDocument(parsed.text(), List.copyOf(merged.values()),
+            parsed.metadata(), parsed.sourceBlocks());
+    }
+
+    /** 图片去重键（规范化绝对路径）；路径为空返回 null（不可去重，直接丢）。 */
+    private static String imagePathKey(KbImageRef ref) {
+        if (ref == null || ref.imagePath() == null || ref.imagePath().isBlank()) {
+            return null;
+        }
+        try {
+            return Path.of(ref.imagePath()).toAbsolutePath().normalize().toString();
+        } catch (RuntimeException e) {
+            return ref.imagePath();
+        }
+    }
 
     /**
      * 把解析器产出的临时图片搬到持久化存储，返回已带 URL 的图片列表。
@@ -815,6 +1115,63 @@ public class KnowledgeParseProcessor {
     private static String describe(Exception e) {
         String msg = e.getMessage();
         return msg == null || msg.isBlank() ? e.getClass().getSimpleName() : msg;
+    }
+
+    /**
+     * 归一化正文是否「没有任何可提取文本」。
+     *
+     * <p>判据两条，任一成立即为空：
+     * <ol>
+     *   <li>{@code trim()} 后为空；</li>
+     *   <li>移除全部空白字符后长度为 0。</li>
+     * </ol>
+     *
+     * <p><b>为什么第二条不是冗余</b>：{@link String#trim()} 只裁 U+0020 及以下的 ASCII 空白，
+     * 中文文档里常见的全角空格 U+3000 / 不换行空格 U+00A0 会让 {@code trim()} 判为非空 ——
+     * 但它确实一个文字都没有，照常入库就是「已完成但搜不到」。
+     * ⚠️ 用 {@link Character#isWhitespace(int)} + {@link Character#isSpaceChar(int)} 而不是正则 {@code \s}：
+     * 后者默认只认 ASCII 空白，且 {@code isWhitespace} 有意排除不换行空格（须靠 {@code isSpaceChar} 补）。
+     *
+     * @param text 归一化后的正文（可 null）
+     * @return true = 没有任何可提取文字
+     */
+    static boolean hasNoExtractableText(String text) {
+        if (text == null || text.trim().isEmpty()) {
+            return true;
+        }
+        for (int i = 0; i < text.length(); i++) {
+            char c = text.charAt(i);
+            if (!Character.isWhitespace(c) && !Character.isSpaceChar(c)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * 源文件名（仅用于日志）：优先取解析产物里的 {@code fileName}，取不到回落到磁盘文件名。
+     */
+    private static String fileNameOf(KbParsedDocument parsed, Path file) {
+        String fromParsed = parsed == null
+            ? null : parsed.metadata().get(KbParsedDocument.META_FILE_NAME);
+        if (fromParsed != null && !fromParsed.isBlank()) {
+            return fromParsed;
+        }
+        Path name = file == null ? null : file.getFileName();
+        return name == null ? "" : name.toString();
+    }
+
+    /**
+     * 源文件字节数（仅用于日志）。
+     *
+     * <p>取不到时返回 -1：⛔ 不让「打日志」这一步与业务结果耦合（量不到大小不该把解析判失败）。
+     */
+    private static long fileBytesOf(Path file) {
+        try {
+            return file == null ? -1L : Files.size(file);
+        } catch (IOException e) {
+            return -1L;
+        }
     }
 
     /**

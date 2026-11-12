@@ -1,0 +1,11 @@
+-- [thinking-passthrough] thinking 块的签名（Anthropic thinking 模式的回传凭据）
+--
+-- WHY：Anthropic 协议在 thinking 模式下继续工具调用时，要求把上一轮 assistant 的
+--   content 数组（含 {type:'thinking', thinking, signature} 块）原样回传；不回传时
+--   第三方兼容端点按 tool_use id 恢复，恢复失败即 400
+--   「The `content[].thinking` in the thinking mode must be passed back to the API」。
+--
+-- 与既有 reasoning 列配对：reasoning 存 thinking 正文，本列存 signature —— 与 CC
+-- transcript 同构（CC 存的也只有 thinking 文本 + signature，不存块结构）。
+-- null/空 = 上游未签发签名（DeepSeek 等第三方端点实测空签名可接受）。
+ALTER TABLE messages ADD COLUMN thinking_signature TEXT;

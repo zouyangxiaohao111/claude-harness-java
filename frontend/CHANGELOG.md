@@ -2,6 +2,25 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.73] - 2026-11-12
+
+### Added
+
+- **知识库解析引擎与实体检索**：ParserEngine 规则路由（ParserEngineRule / KbParserEngineRouter）
+  + 实体检索（KbQaEntitySearch）+ 图谱存储抽象（KbGraphStore / Router / 本地 SQLite / Neo4j）
+  + 分块策略分层与溯源定位 + 抽取服务 + 图谱与 Wiki。
+- **记忆条目**：独立记忆存储（MemoryEntryStore）与记忆控制器，会话级可检索。
+- **工具分类**：会话工具按类别分组（SessionToolCategory）与分类开关（设置 + 会话工具面板）。
+- **会话置顶**：V283 `sessions.pinned` 持久化 + 顶部独立置顶区 + 行首金色五角星
+  + ⋯ 菜单「置顶 / 取消置顶」。
+
+### Fixed
+
+- **⋯ 菜单点击外部不收起**：补 document 级 mousedown 监听。
+- **流式协议**：Anthropic / OpenAI SDK 的 thinking 签名透传、工具结果配对修复（ToolResultPairingRepair）。
+- **用户可见错误文案**：检索失败归类与错误信息清理（ApiErrors / GlobalExceptionHandler）。
+- Composer 提示位：`pendingHint` 与 `subagentHint` 并存（输入框内随宽度走，不另起浮层）。
+
 ## [0.1.72] - 2026-11-12
 
 ### Fixed

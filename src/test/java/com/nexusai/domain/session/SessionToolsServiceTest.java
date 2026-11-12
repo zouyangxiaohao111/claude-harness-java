@@ -71,12 +71,23 @@ class SessionToolsServiceTest {
     }
 
     @Test
-    @DisplayName("setDisabledTools 空集 → 存 null（读回空集）")
-    void set_emptyStoresNull() {
+    @DisplayName("setDisabledTools 空集 → 存 \"[]\"（显式全开，⛔ 不是 null）")
+    void set_emptyStoresExplicitEmptyArray() {
+        // WHY（[tool-categories]）：null 与 "[]" 语义不同 —— null = 该会话从未设置
+        //   （读侧按默认禁用推断：电脑操作+知识库）；"[]" = 用户把默认禁用项全部手动启用。
+        //   若这里存 null，用户全开的操作会被读侧默认规则静默吞掉。
         service.setDisabledTools("sess-1", Set.of());
 
-        assertThat(record.getDisabledTools()).isNull();
+        assertThat(record.getDisabledTools()).isEqualTo("[]");
         assertThat(service.getDisabledTools("sess-1")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("setDisabledTools null 入参 → 同样存 \"[]\"（不落 null 哨兵）")
+    void set_nullInputStoresExplicitEmptyArray() {
+        service.setDisabledTools("sess-1", null);
+
+        assertThat(record.getDisabledTools()).isEqualTo("[]");
     }
 
     @Test

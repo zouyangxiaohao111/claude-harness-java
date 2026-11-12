@@ -542,8 +542,7 @@ class WebFetchToolTest {
     private static SettingsDto settingsDto(String proxy, String domainCheckUrl) {
         return new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, proxy, null, null,
                 domainCheckUrl,

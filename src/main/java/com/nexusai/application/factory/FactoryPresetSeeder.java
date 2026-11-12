@@ -360,9 +360,10 @@ public class FactoryPresetSeeder implements ApplicationRunner {
         m.put("font_size", (s, v) -> s.setFontSize(txt(v)));
         m.put("accent", (s, v) -> s.setAccent(txt(v)));
         m.put("animations_enabled", (s, v) -> s.setAnimationsEnabled(bool(v)));
-        // —— 环境数值档位（W3-1 auto_compact_window / F1 max_output_tokens）——
+        // —— 环境数值档位（W3-1 auto_compact_window）——
+        // ⚠️ 2026-11-12 max_output_tokens 已废弃，不再从预设导入
+        //   （输出上限唯一入口 = 模型配置页「生成参数 · max tokens」）。
         m.put("auto_compact_window", (s, v) -> s.setAutoCompactWindow(num(v)));
-        m.put("max_output_tokens", (s, v) -> s.setMaxOutputTokens(num(v)));
         // —— WebSearch 非密钥列（V37/V38/V39；api_key/proxy 含密钥可能不入库）——
         m.put("websearch_engine", (s, v) -> s.setWebsearchEngine(txt(v)));
         m.put("websearch_use_small_model", (s, v) -> s.setWebsearchUseSmallModel(bool(v)));

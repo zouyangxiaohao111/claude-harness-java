@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { createPortal } from 'react-dom'
 import { knowledgeApi } from '@/api/knowledge'
 import type { ChunkRevision, ChunkView, Knowledge } from '@/api/knowledge'
@@ -6,6 +6,11 @@ import { ApiError } from '@/api/rest'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { KbAssistantPanel } from './KbAssistantPanel'
 import { KbDocPreview, kbFileExtOf, kbPreviewKindOf } from './KbDocPreview'
+import {
+  KbProcessingTimeline,
+  type FetchSpansFn,
+  type TimelineSummary,
+} from './KbProcessingTimeline'
 
 interface Props {
   knowledge: Knowledge
@@ -39,6 +44,72 @@ type ViewMode = 'preview' | 'merged' | 'chunks'
  */
 const MAX_CONTENT_CHARS = 200_000
 
+// ══════════════════════════════════════════════════════════════════════════
+// 二级抽屉（处理流水线）宽度 —— 源站 `doc-content.vue:354-415` 逐字移植
+// ══════════════════════════════════════════════════════════════════════════
+
+/** 源站的 key 是 `weknora-trace-drawer-width`，本仓换掉品牌名（⛔ 不共用源站的键）。 */
+const TRACE_DRAWER_WIDTH_KEY = 'nexusai-trace-drawer-width'
+const TRACE_DRAWER_DEFAULT_WIDTH = 820
+const TRACE_DRAWER_MIN_WIDTH = 560
+
+/** 源站 `traceDrawerMaxWidth()`：`min(1400, max(560, floor(innerWidth * 0.92)))`。 */
+function traceDrawerMaxWidth(): number {
+  const inner = typeof window === 'undefined' ? TRACE_DRAWER_DEFAULT_WIDTH : window.innerWidth
+  return Math.min(1400, Math.max(TRACE_DRAWER_MIN_WIDTH, Math.floor(inner * 0.92)))
+}
+
+function clampTraceDrawerWidth(width: number): number {
+  return Math.max(TRACE_DRAWER_MIN_WIDTH, Math.min(traceDrawerMaxWidth(), width))
+}
+
+/**
+ * 耗时文案 —— 源站 `doc-content.vue:337-344`（`formatTimelineDuration`）。
+ *
+ * <p>⚠️ 与 `KbProcessingTimeline` 内部的 `formatDuration` **口径不同**：这里 `0` 显示 `—`、
+ * `<60s` 固定两位小数。⛔ 不要图省事复用组件里的那个（那是瀑布图条形标签的口径）。
+ */
+function formatTimelineDuration(ms: number): string {
+  if (!ms || ms < 0) return '—'
+  if (ms < 1000) return `${Math.round(ms)}ms`
+  if (ms < 60000) return `${(ms / 1000).toFixed(2)}s`
+  const mins = Math.floor(ms / 60000)
+  const rem = ((ms % 60000) / 1000).toFixed(1)
+  return `${mins}m${rem}s`
+}
+
+/**
+ * `traceEntryTheme` —— 源站 `doc-content.vue:493-506`。
+ *
+ * <p>⚠️ 用「theme 名」而不是整串 class：class 拼装只有一处，theme 名要单独判。
+ * `t-button--theme-success` 等字面量在下面的映射表里（测试按字面量锚定）。
+ */
+function traceEntryTheme(status: string): 'success' | 'danger' | 'warning' | 'default' {
+  switch (status) {
+    case 'done':
+    case 'completed':
+      return 'success'
+    case 'failed':
+      return 'danger'
+    case 'running':
+    case 'processing':
+    case 'pending':
+      return 'warning'
+    default:
+      return 'default'
+  }
+}
+
+/** theme 名 → tdesign 按钮类（⛔ 不要把 class 拼在 `t-button--theme-${x}` 里：
+ *  那样文件里就不存在 `t-button--theme-success` 字面量，既有对齐测试会假红）。 */
+const TRACE_THEME_CLASS: Record<ReturnType<typeof traceEntryTheme>, string> = {
+  success: 't-button--theme-success',
+  danger: 't-button--theme-danger',
+  warning: 't-button--theme-warning',
+  default: 't-button--theme-default',
+}
+
+
 /** 用户可见的报错文案（后端 RFC7807 detail 优先，其次原样消息）。 */
 function errorText(e: unknown): string {
   if (e instanceof ApiError) {
@@ -64,8 +135,15 @@ function errorText(e: unknown): string {
  */
 function regenerateReasonLabel(detail: string | null | undefined, status: string): string {
   const d = (detail ?? '').trim()
+  if (d === 'question_off') {
+    return '该知识库没有开启「问题生成」'
+  }
+  if (d === 'question_no_indexing') {
+    return '该知识库的「向量索引」和「关键词索引」都关着，问句没有可写入的索引通道'
+  }
+  // 兼容旧后端 / 历史日志里的合并值（2026-11-12 起后端已拆成上面两个）
   if (d === 'question_disabled') {
-    return '该知识库没有开启「问题生成」（或未配置嵌入模型）'
+    return '该知识库没有开启「问题生成」（或索引策略未启用向量/关键词索引）'
   }
   if (d === 'provider_not_configured') {
     return '问题生成模型未配置或不可用'
@@ -333,7 +411,6 @@ export function parseGeneratedQuestions(raw: string | null | undefined): Generat
  *   │            ├ 文件图标 + 文件名（可换行）
  *   │            └ 右上：下载 / 追溯 / 助手 三个图标按钮
  *   └─ body（padding 24px 32px 级别的分节）
- *        ├ kp-timeline   解析流水线圆点（8px 圆，done 绿 / skipped 灰）+「总耗时：1m47.1s」
  *        ├ 基本信息      两行 上传时间 / 类型（label 12px rgba(0,0,0,.6)）
  *        ├ 自定义元数据  「添加元数据字段」
  *        ├ 摘要         可折叠摘要正文
@@ -342,11 +419,11 @@ export function parseGeneratedQuestions(raw: string | null | undefined): Generat
  *
  * <h2>⚠️ 本仓的真实边界（如实说明，⛔ 不造假）</h2>
  * <ul>
- *   <li>`kp-timeline` 的五个阶段：本仓解析是**单阶段**（上传 → 解析 → 索引），
- *       所以只画真实存在的三段，⛔ 不复制源侧那五个圆点。</li>
+ *   <li>解析流水线圆点：2026-11-12 核对源站 `doc-content.vue` 抽屉 body **没有**这块
+ *       （源侧 `kp-timeline` 只用于卡片 hover 的 compact popover 与二级 Trace 抽屉），
+ *       本仓原先自造的三颗圆点已删除；真实处理进度走 Trace 二级抽屉（`KbProcessingTimeline`）。</li>
  *   <li>「自定义元数据」：本仓 `kb_knowledge` 无 metadata 列 ⇒ 显示「暂无元数据字段」，
  *       添加按钮点了如实说未接入。</li>
- *   <li>「摘要」：本仓有解析产出的 `summary` 字段就显示，没有就说明未生成。</li>
  *   <li>「摘要」：本仓有解析产出的 `summary` 字段就显示，没有就说明未生成。</li>
  *   <li>「预览」：按文件后缀分派 —— pdf → `PdfPreview`；docx → `DocxPreview`；
  *       xlsx → `ExcelPreview`；文本类 → 解析正文；其余如实说「不支持在线预览」+ 下载。
@@ -400,6 +477,22 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
   const [togglingChunkId, setTogglingChunkId] = useState<string | null>(null)
   /** 「问助手」是否展开右侧 440px 面板（设计稿 11 页两栏形态）。 */
   const [assistantOpen, setAssistantOpen] = useState(false)
+  /** 带问题打开助手时的一次性初始问题（`undefined` = 走正常空态）。 */
+  const [assistantInitialQuestion, setAssistantInitialQuestion] = useState<string | undefined>(undefined)
+
+  /**
+   * 带问题打开助手面板（Trace 里「诊断」按钮）。
+   *
+   * 源站 `AssistantActionButton.vue` 用 setPageSelection 传结构化上下文，
+   * 本仓没有 selection 机制 ⇒ 把 context 拼进问题正文，让模型能看到（登记为偏离）。
+   * 关面板时把 state 复位成 undefined ⇒ `KbAssistantPanel` 的 consumed ref 复位，
+   * 下次点同一个诊断按钮能再次触发。
+   */
+  const openAssistantWith = useCallback((question: string, context?: string) => {
+    const q = context?.trim() ? `${question}\n\n附带的错误信息：\n${context.trim()}` : question
+    setAssistantInitialQuestion(q)
+    setAssistantOpen(true)
+  }, [])
 
   // ── 摘要（源侧 summary-section）──────────────────────────────────
   /**
@@ -593,8 +686,30 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
     locators: SourceLocator[]
   } | null>(null)
 
-  /** 处理 Trace 弹层（源侧 `.kp-secondary-drawer` 820px 的前置形态）。 */
+  /**
+   * 二级抽屉（处理流水线 · 源侧 `.kp-secondary-drawer` 820px）是否打开。
+   *
+   * <p>⚠️ 变量名沿用 `traceOpen`：Esc 的层级判断（{@link modalOpen} / {@link closeTopModal}）
+   * 已经把它当「最上面一层」，换名字只会多一处漏改的风险。
+   */
   const [traceOpen, setTraceOpen] = useState(false)
+
+  /** 二级抽屉宽度（源站 `:354-415`：localStorage 记忆 + 拖拽 + resize 重夹）。 */
+  const [traceDrawerWidth, setTraceDrawerWidth] = useState(TRACE_DRAWER_DEFAULT_WIDTH)
+  const [traceDrawerResizing, setTraceDrawerResizing] = useState(false)
+  /** 拖拽起点（用 ref：mousemove 里要读最新值，且不需要触发重渲染）。 */
+  const traceResizeStart = useRef({ x: 0, width: TRACE_DRAWER_DEFAULT_WIDTH })
+
+  /**
+   * 隐藏挂载（`compact`）上报的两件事实。
+   *
+   * <p>⭐ 它们是 header 按钮的**唯一数据源**：没有这个隐藏挂载，用户在打开二级抽屉之前
+   * 按钮既不显示、也不知道状态色与耗时（源站 `doc-content.vue:1631-1637` 同款机制）。
+   */
+  const [, setHasTimelineSpans] = useState(false)
+  const [timelineSummary, setTimelineSummary] = useState<TimelineSummary>({
+    totalMs: 0, status: '', stageIndex: 0, stageTotal: 0, stageLabel: '',
+  })
 
   /** 是否有弹层打开 —— Esc 要先关弹层，再关抽屉（否则一次 Esc 直接退出、输入全丢）。 */
   const modalOpen =
@@ -680,29 +795,125 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
 
   const title = knowledge.title || knowledge.file_name || knowledge.id
   const sizeText = formatSize(knowledge.file_size)
-  const stage = useMemo(() => stageOf(knowledge.parse_status), [knowledge.parse_status])
+
+  // ══════════════════════════════════════════════════════════════════════
+  // 处理流水线（Trace）：取数 / 宽度拖拽 / 入口按钮（源站 doc-content.vue:325-518）
+  // ══════════════════════════════════════════════════════════════════════
 
   /**
-   * 处理耗时文本（源侧 Trace 按钮 title 是「查看 Trace · 1m47.1s」）。
+   * 取数函数（注入 `KbProcessingTimeline.fetchSpans`）。
    *
-   * <p>⚠️ 本仓**没有** `knowledge_processing_spans` 表（源侧用它存各阶段 span），
-   * 所以只能给出「上传 → 处理完成」这段**端到端**耗时 —— 这是真实数据
-   * （`created_at` → `processed_at`），⛔ 不编造阶段级耗时。
+   * <p>⛔ 不在这里抛异常：组件把「抛异常」和「success:false」都当失败，但只有后者能带
+   * 中文原因（`message` 会显示成「处理记录加载失败：{原因}」）。所以网络错/HTTP 错
+   * 都折成 `{ success: false, message }`。
+   *
+   * <p>⚠️ `success` **原样透传**后端包装里的布尔值 —— 后端判「没有 trace」时也返回
+   * 200 + `success:true` + 空 trace，那属于「真实的无记录」，不是加载失败。
    */
-  const traceDurationText = useMemo(() => {
-    const from = knowledge.created_at
-    const to = knowledge.processed_at
-    if (!from || !to) return ''
-    const a = Date.parse(from.replace(' ', 'T'))
-    const b = Date.parse(to.replace(' ', 'T'))
-    if (!Number.isFinite(a) || !Number.isFinite(b) || b < a) return ''
-    const ms = b - a
-    if (ms < 1000) return `${ms}ms`
-    const sec = ms / 1000
-    if (sec < 60) return `${sec.toFixed(1)}s`
-    const m = Math.floor(sec / 60)
-    return `${m}m${(sec - m * 60).toFixed(1)}s`
-  }, [knowledge.created_at, knowledge.processed_at])
+  const fetchSpans = useCallback<FetchSpansFn>(async (id, attempt) => {
+    try {
+      const res = await knowledgeApi.getKnowledgeSpans(id, attempt)
+      return { success: !!res?.success, data: res?.data }
+    } catch (e) {
+      return { success: false, message: errorText(e) }
+    }
+  }, [])
+
+  /**
+   * 「重新解析」（源站 `onRetry` 的上游动作）。
+   *
+   * <p>失败必须**重新抛出**：组件拿到异常就不做「重置四件 + 重拉」，否则用户会看到
+   * 一棵没变的老树、还以为是重试成功。提示在这里给（组件里那句注释是
+   * 「重试失败由调用方提示」）。
+   */
+  const retryParse = useCallback(async (id: string) => {
+    try {
+      await knowledgeApi.reparse(id)
+      showToast('已提交重新解析', 'success')
+    } catch (e) {
+      showToast(`重新解析失败：${errorText(e)}`, 'info')
+      throw e
+    }
+  }, [showToast])
+
+  // ── 宽度：初值从 localStorage 读（源站 :372-383）────────────────────
+  useEffect(() => {
+    try {
+      const raw = window.localStorage.getItem(TRACE_DRAWER_WIDTH_KEY)
+      const parsed = raw ? parseInt(raw, 10) : NaN
+      if (!Number.isNaN(parsed)) setTraceDrawerWidth(clampTraceDrawerWidth(parsed))
+    } catch {
+      /* ignore quota / private mode */
+    }
+  }, [])
+
+  // ── 窗口 resize 时重夹（源站 :416-421）──────────────────────────────
+  useEffect(() => {
+    const onResize = () => setTraceDrawerWidth((w) => clampTraceDrawerWidth(w))
+    window.addEventListener('resize', onResize)
+    return () => window.removeEventListener('resize', onResize)
+  }, [])
+
+  // ── 拖拽（源站 :385-415）：向右拖变窄、向左拖变宽 ────────────────────
+  useEffect(() => {
+    if (!traceDrawerResizing) return
+    // 收尾时要写 localStorage；用局部变量跟住最新值，避免把 width 塞进依赖
+    // （塞进去会让每次 mousemove 都拆挂一次监听器）。
+    let latest = traceResizeStart.current.width
+    const onMove = (e: MouseEvent) => {
+      // ⚠️ 是 `startX - clientX`（抽屉贴右，向左拖才是变宽）
+      latest = clampTraceDrawerWidth(traceResizeStart.current.width + traceResizeStart.current.x - e.clientX)
+      setTraceDrawerWidth(latest)
+    }
+    const onUp = () => {
+      setTraceDrawerResizing(false)
+      try {
+        window.localStorage.setItem(TRACE_DRAWER_WIDTH_KEY, String(latest))
+      } catch {
+        /* ignore */
+      }
+    }
+    document.addEventListener('mousemove', onMove)
+    document.addEventListener('mouseup', onUp)
+    // 源站把光标/选中态写在 body 上（拖出抽屉边界时不丢手型）
+    document.body.style.cursor = 'col-resize'
+    document.body.style.userSelect = 'none'
+    return () => {
+      document.removeEventListener('mousemove', onMove)
+      document.removeEventListener('mouseup', onUp)
+      document.body.style.cursor = ''
+      document.body.style.userSelect = ''
+    }
+  }, [traceDrawerResizing])
+
+  const startTraceDrawerResize = (e: { preventDefault: () => void; clientX: number }) => {
+    e.preventDefault()
+    traceResizeStart.current = { x: e.clientX, width: traceDrawerWidth }
+    setTraceDrawerResizing(true)
+  }
+
+  /**
+   * 换文档 ⇒ 清掉上一个文档的 span 事实（源站 `watch(() => props.details?.id)`，:331-335）。
+   *
+   * <p>⚠️ 不清的话：切到一篇「没有 span」的老文档时，按钮会沿用上一份的绿色 + 耗时。
+   */
+  useEffect(() => {
+    setHasTimelineSpans(false)
+    setTraceOpen(false)
+    setTimelineSummary({ totalMs: 0, status: '', stageIndex: 0, stageTotal: 0, stageLabel: '' })
+  }, [knowledge.id])
+
+  const traceTheme = traceEntryTheme(timelineSummary.status)
+  /** 源站 `traceEntryTitle`（:505-518）：有耗时显示耗时，否则显示阶段进度。 */
+  const traceEntryTitle = useMemo(() => {
+    let tip = '查看 Trace'
+    if (timelineSummary.totalMs > 0) {
+      tip += ` · ${formatTimelineDuration(timelineSummary.totalMs)}`
+    } else if (timelineSummary.stageTotal > 0) {
+      tip += ` · ${timelineSummary.stageIndex}/${timelineSummary.stageTotal}`
+    }
+    return tip
+  }, [timelineSummary])
 
   // ══════════════════════════════════════════════════════════════════════
   // 五个分块操作（编辑 / 历史 / 父块 / 辅助召回问题 / 溯源）
@@ -1048,17 +1259,29 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
                   <use href="#t-icon-download" />
                 </svg>
               </button>
-              <button
-                type="button"
-                className="t-button t-button--variant-text t-button--theme-success t-button--shape-square t-size-s t-button--icon-only header-action-btn trace-entry-btn"
-                title={traceDurationText ? `查看 Trace · ${traceDurationText}` : '查看 Trace'}
-                aria-label="查看 Trace"
-                onClick={() => setTraceOpen(true)}
-              >
-                <svg className="t-icon t-icon-chart-line" style={{ fontSize: 16 }} aria-hidden="true">
-                  <use href="#t-icon-chart-line" />
-                </svg>
-              </button>
+              {/* 查看 Trace（源站 `components/doc-content.vue:1616` 的判据是
+                  `v-if="details.id && hasTimelineSpans"`）。
+                  ① 入口**始终给**：只对齐 `details.id`（有文档就有入口），
+                     ⛔ **不对齐 `hasTimelineSpans`** —— 本仓 V284 建 span 表**之前**
+                     解析的文档在 `kb_processing_span` 里没有行，照抄该判据会让那些文档
+                     **完全没有 Trace 入口**（旧版那个无条件按钮已在本批删除）。
+                     点开无数据时组件自己渲染五段 pending 占位。
+                  ② theme 跟着最近一次 span 的状态变（done→success / failed→danger /
+                     running|pending→warning）；
+                  ③ title 里带瀑布图总耗时，没有耗时才退回「查看 Trace」。 */}
+              {knowledge.id && (
+                <button
+                  type="button"
+                  className={`t-button t-button--variant-text ${TRACE_THEME_CLASS[traceTheme]} t-button--shape-square t-size-s t-button--icon-only header-action-btn trace-entry-btn`}
+                  title={traceEntryTitle}
+                  aria-label="查看 Trace"
+                  onClick={() => setTraceOpen(true)}
+                >
+                  <svg className="t-icon t-icon-chart-line" style={{ fontSize: 16 }} aria-hidden="true">
+                    <use href="#t-icon-chart-line" />
+                  </svg>
+                </button>
+              )}
               <button
                 type="button"
                 className={`assistant-button is-icon-only${assistantOpen ? ' is-active' : ''}`}
@@ -1083,24 +1306,22 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
 
         <div className="t-drawer__body narrow-scrollbar">
           <div className="doc-markdown-root doc-drawer-body setting-drawer__body">
-            {/* 解析流水线（源侧 .kp-timeline.kp-compact；⛔ 不用 .kp-trigger-shadow
-                —— 那个类在源站是 display:none 的「隐藏挂载」语义，这里是可见区）*/}
-            <div className="kp-timeline kp-compact">
-              <div className="kp-compact-row">
-                {stage.dots.map((d, i) => (
-                  <span
-                    key={i}
-                    className={`kp-dot ${d.state === 'done' ? 'kp-dot-done' : d.state === 'active' ? 'kp-dot-running' : 'kp-dot-skipped'}`}
-                        /* ⚠️ kb-orphan.css（后导入）的 .kp-dot 带 background，会盖掉 kb-shared.css 里
-                           .kp-dot-done 的颜色（同权重、后胜）⇒ 行内补三态底色，值取自源站 token。 */
-                        style={{ background: d.state === 'done'
-                          ? 'var(--td-success-color)'
-                          : d.state === 'active' ? 'var(--td-warning-color)' : 'var(--td-text-color-placeholder)' }}
-                    title={d.label}
-                  />
-                ))}
-              </div>
-              <div className="kp-compact-caption">{stage.caption}</div>
+            {/* 隐藏挂载（源站 doc-content.vue:1630-1636 的 `div.kp-trigger-shadow`，
+                `.kp-trigger-shadow{display:none}` 见 kb-shared.css:345）。
+                ⭐ 缺了它，header 的「查看 Trace」按钮在用户**打开二级抽屉之前**
+                既不会出现、也不会有状态色和耗时 —— 数据全靠这棵离屏组件在轮询。
+                ⚠️ `gracePoll={false}`：关掉抽屉后不该为迟到的 wiki 子 span 一直打 /spans。 */}
+            <div className="kp-trigger-shadow" aria-hidden="true">
+              <KbProcessingTimeline
+                knowledgeId={knowledge.id}
+                parseStatus={knowledge.parse_status}
+                compact
+                gracePoll={false}
+                fetchSpans={fetchSpans}
+                onHasSpans={setHasTimelineSpans}
+                onSummary={setTimelineSummary}
+                showToast={showToast}
+              />
             </div>
 
             {/* 基本信息（源侧 .setting-drawer__section > .doc-detail-rows）*/}
@@ -1610,50 +1831,76 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
           baseId={knowledge.knowledge_base_id}
           knowledgeId={knowledge.id}
           docTitle={title}
-          onClose={() => setAssistantOpen(false)}
+          onClose={() => { setAssistantOpen(false); setAssistantInitialQuestion(undefined) }}
           showToast={showToast}
+          initialQuestion={assistantInitialQuestion}
         />
       )}
 
-      {/* 处理 Trace（源侧二级抽屉 `.kp-secondary-drawer` 820px 的概览版）。
-          ⚠️ 本仓没有 spans 表 ⇒ 只展示**真实存在**的字段：三阶段状态、
-          端到端耗时、分块数、图片数、失败原因。⛔ 不编造阶段级耗时。 */}
-      {traceOpen && (
-        <ChunkModal title="处理 Trace" onClose={() => setTraceOpen(false)}>
-          <ul className="kp-timeline kp-compact" style={{ listStyle: 'none', margin: 0, padding: 0 }}>
-            {stage.dots.map((d, i) => (
-              <li key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, padding: '6px 0' }}>
-                <span
-                  className={`kp-dot ${d.state === 'done' ? 'kp-dot-done' : d.state === 'active' ? 'kp-dot-running' : 'kp-dot-skipped'}`}
-                  aria-hidden="true"
-                />
-                <span style={{ fontSize: 'var(--app-text-base)' }}>{d.label}</span>
-                <span style={{ marginLeft: 'auto', fontSize: 'var(--app-text-sm)', color: 'var(--td-text-color-placeholder)' }}>
-                  {d.state === 'done' ? '完成' : d.state === 'active' ? '进行中' : '未执行'}
-                </span>
-              </li>
-            ))}
-          </ul>
-          <dl style={{ display: 'grid', gridTemplateColumns: 'auto 1fr', gap: '6px 16px', margin: '12px 0 0', fontSize: 'var(--app-text-sm)' }}>
-            <dt style={{ color: 'var(--td-text-color-placeholder)' }}>总耗时</dt>
-            <dd style={{ margin: 0 }}>{traceDurationText || '—'}</dd>
-            <dt style={{ color: 'var(--td-text-color-placeholder)' }}>上传时间</dt>
-            <dd style={{ margin: 0 }}>{knowledge.created_at || '—'}</dd>
-            <dt style={{ color: 'var(--td-text-color-placeholder)' }}>完成时间</dt>
-            <dd style={{ margin: 0 }}>{knowledge.processed_at || '—'}</dd>
-            <dt style={{ color: 'var(--td-text-color-placeholder)' }}>分块数</dt>
-            <dd style={{ margin: 0 }}>{chunks.length}</dd>
-            <dt style={{ color: 'var(--td-text-color-placeholder)' }}>图片数</dt>
-            <dd style={{ margin: 0 }}>{chunks.reduce((n, c) => n + parseImageCount(c.image_info), 0)}</dd>
-          </dl>
-          {knowledge.error_message && (
-            <p style={ERROR_TEXT_STYLE}>失败原因：{knowledge.error_message}</p>
-          )}
-          <p style={HINT_TEXT_STYLE}>
-            本仓暂无阶段级 span 明细（源侧用 `knowledge_processing_spans` 表记录每阶段耗时）。
-            这里只展示真实的端到端耗时与阶段状态，⛔ 不编造各阶段耗时。
-          </p>
-        </ChunkModal>
+      {/* 二级抽屉 · 处理流水线（源侧 `doc-content.vue:1639-1655`）。
+          ⚠️ 不复用 ChunkModal：源站是 **820px 贴右抽屉**（可拖宽），不是 640px 居中弹窗。
+          ⚠️ z-index 必须是 2100：现有主抽屉 1500、ChunkModal 1600、宽度拖拽把手 2101
+          —— 取 1500 / 1600 会被主抽屉或分块弹层盖住（面板打开了却看不见）。 */}
+      {traceOpen && createPortal(
+        /* `.kb-scope` 只做设计 token 宿主（portal 已脱离原 `.kb-scope` 子树，
+           不包这层 `var(--td-*)` 全部解析为空）—— 与 {@link ChunkModal} 同款处理。 */
+        <div className="kb-scope" style={{ display: 'contents' }}>
+          <div
+            role="presentation"
+            onClick={() => setTraceOpen(false)}
+            style={{ position: 'fixed', inset: 0, zIndex: 2099, background: 'rgba(0,0,0,0.45)' }}
+          />
+          {/* 宽度拖拽把手（源站 :1641-1646 + `.trace-drawer-resize-handle`，z-index 2101） */}
+          <div
+            className="trace-drawer-resize-handle"
+            style={{ right: traceDrawerWidth }}
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="拖拽调整面板宽度"
+            title="拖拽调整面板宽度"
+            onMouseDown={startTraceDrawerResize}
+          >
+            <div className="trace-drawer-resize-line" />
+          </div>
+          <div
+            className={`kp-secondary-drawer${traceDrawerResizing ? ' is-resizing' : ''}`}
+            role="dialog"
+            aria-modal="true"
+            aria-label="处理流水线"
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              // kb-02.css 把 `.kp-secondary-drawer` 钉成 820px 固定宽 ⇒ 拖拽必须行内覆盖
+              width: traceDrawerWidth,
+              minWidth: traceDrawerWidth,
+              maxWidth: '100vw',
+              position: 'fixed',
+              top: 0,
+              right: 0,
+              bottom: 0,
+              zIndex: 2100,
+              background: 'var(--td-bg-color-container, #fff)',
+              boxShadow: '-6px 0 24px rgba(0,0,0,.12)',
+              transition: traceDrawerResizing ? 'none' : undefined,
+            }}
+          >
+            <div className="kp-drawer-shell">
+              {/* 完整模式（compact=false）：头部工具栏 + 瀑布图 + 详情面板。
+                  `showClose` 的 ✕ 与 Esc 走同一个关闭动作（都是 setTraceOpen(false)）。 */}
+              <KbProcessingTimeline
+                knowledgeId={knowledge.id}
+                parseStatus={knowledge.parse_status}
+                docTitle={title}
+                showClose
+                onClose={() => setTraceOpen(false)}
+                fetchSpans={fetchSpans}
+                onRetryParse={retryParse}
+                showToast={showToast}
+                onOpenAssistant={openAssistantWith}
+              />
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {/* ── 分块弹层（z-index 高于抽屉的 1500）──────────────────────── */}
@@ -2280,42 +2527,6 @@ const PARENT_CONTENT_STYLE = {
   padding: '10px 12px',
   background: 'var(--td-bg-color-secondarycontainer, #f3f3f3)',
   borderRadius: 'var(--app-radius-sm, 6px)',
-}
-
-/** 解析阶段 → 三个圆点（本仓真实阶段：上传 / 解析 / 索引）。 */
-function stageOf(status: string | undefined): {
-  dots: Array<{ label: string; state: 'done' | 'active' | 'skipped' }>
-  caption: string
-} {
-  const s = status ?? ''
-  if (s === 'completed') {
-    return {
-      dots: [
-        { label: '已上传', state: 'done' },
-        { label: '已解析', state: 'done' },
-        { label: '已索引', state: 'done' },
-      ],
-      caption: '解析完成',
-    }
-  }
-  if (s === 'failed' || s === 'cancelled') {
-    return {
-      dots: [
-        { label: '已上传', state: 'done' },
-        { label: s === 'failed' ? '解析失败' : '已取消', state: 'skipped' },
-        { label: '未索引', state: 'skipped' },
-      ],
-      caption: s === 'failed' ? '解析失败' : '已取消',
-    }
-  }
-  return {
-    dots: [
-      { label: '已上传', state: 'done' },
-      { label: '解析中', state: 'active' },
-      { label: '待索引', state: 'skipped' },
-    ],
-    caption: '正在解析…',
-  }
 }
 
 /**

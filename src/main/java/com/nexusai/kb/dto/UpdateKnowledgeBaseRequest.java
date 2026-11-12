@@ -40,6 +40,33 @@ public record UpdateKnowledgeBaseRequest(
     String summaryModelId,
 
     @JsonProperty("retriever_engine")
-    String retrieverEngine
+    String retrieverEngine,
+
+    /** 图片管线 · 是否生成图片描述（null = 不改；V286）。 */
+    @JsonProperty("image_caption_enabled")
+    Boolean imageCaptionEnabled,
+
+    /** 图片管线 · 是否做 OCR（null = 不改；V286）。 */
+    @JsonProperty("image_ocr_enabled")
+    Boolean imageOcrEnabled,
+
+    /**
+     * 图片管线方案（null = 不改；{@code default} | {@code smartocr}，其它值 ⇒ 400；V286）。
+     *
+     * <p>⚠️ 与 {@code retriever_engine} 不同，这里<b>不接受空串清空</b> —— 该列 NOT NULL
+     * 且值域是枚举，「清空」没有意义（要回默认就传 {@code default}）。
+     */
+    @JsonProperty("image_pipeline")
+    String imagePipeline
 ) {
+    /**
+     * 6 参兼容构造器（既有测试用；新增 3 个图片管线字段恒 null = 不改）。
+     */
+    public UpdateKnowledgeBaseRequest(
+        String name, String description, String chunkingConfig,
+        String embeddingModelId, String summaryModelId, String retrieverEngine
+    ) {
+        this(name, description, chunkingConfig, embeddingModelId, summaryModelId, retrieverEngine,
+            null, null, null);
+    }
 }

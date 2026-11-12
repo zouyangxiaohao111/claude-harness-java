@@ -131,6 +131,22 @@ export function IconSprite() {
       {/* lock-on：源站「索引策略已锁定」提示用（`.locked-tip-icon`）。
           path 逐字取自 06-知识库设置.html 内联 sprite。 */}
       <symbol fill="none" viewBox="0 0 24 24" id="t-icon-lock-on"><path d="M4.5 10h15v11h-15V10Z" fill="transparent"></path><g stroke="currentColor" strokeWidth="2" strokeLinecap="square"><path d="M4.5 11h15v10h-15V11ZM7 7a5 5 0 0 1 10 0v4H7V7Z"></path></g><path d="M10 16h4" stroke="currentColor" strokeWidth="2" strokeLinecap="square"></path></symbol>
+
+      {/* ── 处理流水线（KP）所需的 4 个图标 ────────────────────────────
+          `KbProcessingTimeline` 里「复制 / 耗时 / 展开-收起」三处要用的 symbol。
+          path 来源逐个注明，⛔ 不是手画：
+          · copy          —— tdesign-icons-vue-next@0.4.12 `esm/components/copy.js`
+                              的 element（本仓设计稿里没有这个图标，故直接取官方包；
+                              官方定义带一个 mask 做填充挖空，但 fillColor1 默认未设 ⇒
+                              实际呈现就是两条描边，这里按本仓 sprite 的既有口径
+                              写成 transparent 填充 + stroke=currentColor）。
+          · time          —— 设计稿 `D:/tmp/06-kb-settings.html` 内联 sprite。
+          · chevron-right —— 设计稿 06 内联 sprite。
+          · chevron-down  —— 设计稿 `D:/tmp/03-Wiki.out.html` 内联 sprite。 */}
+      <symbol fill="none" viewBox="0 0 24 24" id="t-icon-copy"><path d="M10 10H21V21H10V10Z" fill="transparent"></path><g stroke="currentColor" strokeWidth="2" strokeLinecap="square"><path d="M10 10H21V21H10V10Z"></path><path d="M14 6.5V3L3 3L3 14H6.5"></path></g></symbol>
+      <symbol fill="none" viewBox="0 0 24 24" id="t-icon-time"><path d="M2 12C2 6.477 6.477 2 12 2s10 4.477 10 10-4.477 10-10 10S2 17.523 2 12Z" fill="transparent"></path><g stroke="currentColor" strokeWidth="2" strokeLinecap="square"><path d="M2 12C2 6.477 6.477 2 12 2s10 4.477 10 10-4.477 10-10 10S2 17.523 2 12Z"></path><path d="M12 6.5V12l3 3"></path></g></symbol>
+      <symbol fill="none" viewBox="0 0 24 24" id="t-icon-chevron-right"><path d="M9.5 17.5 15 12 9.5 6.5" stroke="currentColor" strokeWidth="2" strokeLinecap="square"></path></symbol>
+      <symbol fill="none" viewBox="0 0 24 24" id="t-icon-chevron-down"><path d="M17.5 9.5 12 15 6.5 9.5" stroke="currentColor" strokeWidth="2" strokeLinecap="square"></path></symbol>
     </svg>
   )
 }

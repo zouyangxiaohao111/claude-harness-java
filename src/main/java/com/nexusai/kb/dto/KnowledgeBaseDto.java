@@ -34,6 +34,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  * @param generatedProfile      已生成的知识库画像（W4）
  * @param createdAt             创建时间
  * @param updatedAt             更新时间
+ * @param imageCaptionEnabled   是否生成图片描述（V286）
+ * @param imageOcrEnabled       是否做 OCR（V286）
+ * @param imagePipeline         图片管线方案：default | smartocr（V286）
  */
 public record KnowledgeBaseDto(
     @JsonProperty("id") String id,
@@ -105,14 +108,31 @@ public record KnowledgeBaseDto(
      * <p>⚠️ 图谱是**知识库级**功能（每库可独立选存储），所以放这一行而不是全局 settings。
      * ⚠️ 读侧必须回传：设置弹窗要回显当前配置；⛔ 只写不读会导致「保存成功但永远显示旧值」。
      */
-    @JsonProperty("graph_store_config") String graphStoreConfig
+    @JsonProperty("graph_store_config") String graphStoreConfig,
+
+    /**
+     * 图片管线 · 是否生成图片描述（{@code image_caption_enabled}，V286）。
+     *
+     * <p>⭐ 读侧必须回传：设置弹窗的三个控件靠它回显当前值；只写不读 ⇒ 保存成功后仍显示旧值。
+     * 库列 NOT NULL，null（未回填的旧对象）按默认 {@code true} 出站。
+     */
+    @JsonProperty("image_caption_enabled") boolean imageCaptionEnabled,
+    /** 图片管线 · 是否做 OCR（{@code image_ocr_enabled}，V286）。同上，必须回传。 */
+    @JsonProperty("image_ocr_enabled") boolean imageOcrEnabled,
+    /**
+     * 图片管线方案（{@code image_pipeline}，V286）：{@code default} | {@code smartocr}。
+     *
+     * <p>null（未回填的旧对象）按 {@code default} 出站，⛔ 不让前端拿到 null 再自己猜。
+     */
+    @JsonProperty("image_pipeline") String imagePipeline
 ) {
 
     /**
-     * 兼容构造器 · 不带最后 4 个配置字段（既有测试与旧调用点用）。
+     * 兼容构造器 · 不带后续追加的配置字段（既有测试与旧调用点用）。
      *
      * <p>⚠️ 只为不破坏 20 参调用点（`KbWikiToolScopeThreeStateTest` 等）——
-     * 新增的 4 个字段在这些场景恒 `null`，等价于「未配置」，与引入前一致。
+     * 新增的配置字段在这些场景恒 `null`（图片管线三列取默认 true/true/default），
+     * 等价于「未配置」，与引入前一致。
      * ⛔ 生产代码（`KnowledgeBaseService.toDto`）必须走全参构造器，
      * 否则前端开关又会读不到值。
      */
@@ -127,6 +147,8 @@ public record KnowledgeBaseDto(
         this(id, name, description, type, isTemporary, chunkingConfig, imageProcessingConfig,
             embeddingModelId, summaryModelId, extractConfig, vectorStoreId, storageBackendId,
             retrieverEngine, isPinned, pinnedAt, generatedProfile, createdAt, updatedAt,
-            indexingStrategy, wikiConfig, null, null, null, null, null, null);
+            indexingStrategy, wikiConfig, null, null, null, null, null, null,
+            // V286 图片管线：未配置 ⇒ 默认全开 + default（与改造前行为一致）
+            true, true, "default");
     }
 }

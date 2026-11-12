@@ -63,7 +63,8 @@ public class KbProfileService {
      * <p>⚠️ 为什么不能太小：即使关掉思考，有些模型仍会花一点预算在 thinking 上，
      * 预算太小会返回**空补全**，整个描述就失败了（源站 issue #4221）。
      */
-    private static final int MAX_TOKENS = 2048;
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(2048)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
 
     /** 记账标签（与其它旁路调用的命名口径一致）。 */
     private static final String USAGE_LABEL = "kb_profile_generate";
@@ -283,7 +284,7 @@ public class KbProfileService {
             config, apiModelName,
             KbProfilePrompts.AGGREGATE_SYSTEM,
             KbProfilePrompts.aggregateUserMessage(kb.getName(), agg, profileCustomInstructions(kb)),
-            options(TEMPERATURE, MAX_TOKENS, USAGE_LABEL),
+            options(TEMPERATURE, USAGE_LABEL),
             LlmSideCallClient.SideCallUsage.standalone(
                 com.nexusai.infra.llm.UsageCategory.SIDE_CALL, "kb-profile"));
         var node = readJson(raw);
@@ -464,13 +465,13 @@ public class KbProfileService {
      * 构造 ChatRequestOptions（字段顺序照 {@code LlmProvider.ChatRequestOptions} 定义）。
      */
     private static LlmProvider.ChatRequestOptions options(
-        double temperature, int maxTokens, String usageLabel) {
+        double temperature, String usageLabel) {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             // 描述撰写是机械提炼，关掉思考（省时省钱，输出也更稳）
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
             temperature, usageLabel,
-            null, maxTokens, null, null,
+            null, null, null, null,
             null, null, null, null,
             null, null);
     }

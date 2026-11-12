@@ -46,6 +46,21 @@ public interface KbDocumentParser {
     }
 
     /**
+     * 引擎族名别名 · 供 {@code parser_engine_rules} 用源站口径（{@code builtin} / {@code anydoc} /
+     * {@code simple} / {@code paddleocr_vl} …）点名本解析器。
+     *
+     * <p><b>为什么需要别名</b>：{@link #name()} 返回类名（{@code KbPdfParser}），而源站
+     * {@code parser_engine_rules} 存的是引擎族名；只比 {@code name()} 会让原样迁移过来的规则静默
+     * 匹配不到、回落默认路由。别名只<b>追加</b>可匹配的名字，⛔ 不改 {@link #name()} / {@link #displayName()}
+     * 的既有取值（引擎清单与已存数据都依赖它们）。
+     *
+     * @return 别名集合（不可变；默认只有 {@link #name()}，非 null）
+     */
+    default Set<String> engineFamilyNames() {
+        return Set.of(name());
+    }
+
+    /**
      * 本解析器支持的扩展名（小写、不含点）· 用于注册表端点对外暴露能力。
      *
      * <p>默认空集合 = 「未声明」；实现类应返回 {@code supports()} 真正认的那批扩展名，

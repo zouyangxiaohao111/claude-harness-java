@@ -166,6 +166,23 @@ export interface ApiFlowError {
 /** 会话运行状态（对齐后端 SessionStatusEvent.status：thinking/streaming/idle）。 */
 export type AgentStatus = 'thinking' | 'streaming' | 'idle'
 
+/**
+ * [按会话键控] 重试提示态（后端 api_retry 事件驱动）。
+ *
+ * <p>at = 该状态写入时刻（ms）。后端两种 api_retry 载荷共用本结构：
+ * <ul>
+ *   <li>退避前：retryDelayMs = 本次等待时长 → 横幅倒计时；</li>
+ *   <li>尝试发起前（retryDelayMs = 0）→ 横幅改为「已等待」正计时（长静默期也能看到第 N/10 次）。</li>
+ * </ul>
+ */
+export interface RetryUiState {
+  attempt?: number
+  maxRetries?: number
+  retryDelayMs?: number
+  /** 客户端收到本状态的时刻（ms），用于「已等待」计时（不依赖服务端时钟） */
+  at?: number
+}
+
 /** 权限请求（3 种 kind 归一化：message/bridge/channel）。 */
 export interface PermissionRequestItem {
   kind: 'message' | 'bridge' | 'channel'
@@ -245,7 +262,11 @@ export interface ChatState {
    *  ① 载入 / 切会话 / 重连时 GET /sessions/{id}/running 重建 —— 这是 F5 后仍能看见停止键的唯一途径；
    *  ② session.status 事件实时翻转（thinking/streaming → true，idle → false）。 */
   serverRunning: Record<string, boolean>
-  retry: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null
+  /** [按会话键控] 重试提示态（sessionId -> 该会话的 api_retry · 键不存在 = 该会话没在重试）。
+   *  原先是「全局单值」：A 会话重试会显示在 B 会话上（用户实测「会话1 没回复、会话2 显示出来了」），
+   *  且任一会话的 complete 会把别人的重试横幅清掉。后端 api_retry 走会话级 stream topic ⇒ 必须按键隔离
+   *  （与 tokenWarning / compact / goal 同款）。读取侧一律取【当前会话】那一份。 */
+  retry: Record<string, RetryUiState>
   /** [按会话键控] 压缩警告（sessionId -> token_warning 事件 · 键不存在 = 该会话无警告）。
    *  后端推的是会话级 topic（/topic/sessions/{sid}/token-warning）→ 原全局单字段会让 A 会话的
    *  上下文告警出现在 B（切会话无清理）。读取侧一律取【当前会话】那一份（selectTokenWarning）。 */
@@ -342,7 +363,8 @@ export interface ChatState {
   enqueuePermission: (req: PermissionRequestItem) => void
   dequeuePermission: (requestId: string) => void
   expirePermission: (sessionId: string, requestId: string) => void
-  setRetry: (r: { attempt?: number; maxRetries?: number; retryDelayMs?: number } | null) => void
+  /** 写/清某会话的重试提示；**只动该 sessionId 的键**（null = 清除该会话的重试提示）。 */
+  setRetry: (sessionId: string, r: RetryUiState | null) => void
   /** 更新某会话的压缩警告（null = 清除该会话警告）；只影响该 sessionId 的键。 */
   setTokenWarning: (sessionId: string, w: TokenWarningEvent | null) => void
   /** 更新某会话的压缩进度 UI 态（compact-progress 事件经 reduceCompactTable 归一出完整状态后写入该会话的键；
@@ -423,7 +445,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   connection: 'idle',
   agentStatus: 'idle',
   serverRunning: {},   // [C6] sessionId -> 服务端 run 存活（键缺失 = 未查过/未在跑 ⇒ 一律 false）
-  retry: null,
+  retry: {},          // [按会话键控] sessionId -> 重试提示（键不存在 = 该会话没在重试）
   tokenWarning: {},   // [按会话键控] sessionId -> token_warning（键不存在 = 无警告）
   compact: {},        // [按会话键控] sessionId -> 压缩进度（键不存在 = 该会话无在飞压缩）
   goal: {},           // [goal V253 · 按会话键控] sessionId -> 目标（键不存在 = 该会话无目标）
@@ -587,6 +609,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const goal = { ...st.goal }
     // [C6] 服务端运行态同属会话级键：删会话一并释放
     const serverRunning = { ...st.serverRunning }
+    // [retry-per-session] 重试提示同属会话级键：删会话一并释放（否则删掉的会话重试横幅永不消失）
+    const retryMap = { ...st.retry }
     // [排队行序] 流式区到达号也是会话级键：删会话一并释放（会话 id 不复用，残留无意义）
     const liveSeq = { ...st.liveSeq }
     delete messages[sessionId]
@@ -603,9 +627,10 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete compact[sessionId]
     delete tokenWarning[sessionId]
     delete serverRunning[sessionId]
+    delete retryMap[sessionId]
     delete liveSeq[sessionId]
     delete goal[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning, liveSeq, goal }
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning, retry: retryMap, liveSeq, goal }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
@@ -858,7 +883,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       }] },
     }
   }),
-  setRetry: (retry) => set({ retry }),
+  // [按会话键控] 只写该 sessionId 的键；null = 删键（绝不触碰其它会话的那一份）
+  setRetry: (sessionId, retry) => set((st) => {
+    const next = { ...st.retry }
+    if (retry == null) delete next[sessionId]
+    else next[sessionId] = retry
+    return { retry: next }
+  }),
   // [按会话键控] 只写该 sessionId 的键，绝不触碰其它会话的那一份（多会话并行各自独立）
   setTokenWarning: (sessionId, w) => set((st) => {
     const tokenWarning = { ...st.tokenWarning }

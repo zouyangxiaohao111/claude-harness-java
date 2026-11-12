@@ -2,6 +2,8 @@ package com.nexusai.kb.app.ingest;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.kb.app.ingest.span.KbSpan;
+import com.nexusai.kb.app.ingest.span.KbSpanTracker;
 import com.nexusai.kb.repo.KbKnowledgeStateRepository;
 import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.entity.KbIngestTaskRecord;
@@ -70,6 +72,15 @@ public class KbPostProcessStage {
     private final ModelConfigResolver modelConfigResolver;
 
     /**
+     * span 树写入口（trace 观测层）。
+     *
+     * <p>{@code required = false}：单测直构本类（两个兼容构造器）时不装配 tracker，
+     * 全程走「不记 span」的降级路径，行为与改造前一致。
+     */
+    @Autowired(required = false)
+    private KbSpanTracker spanTracker;
+
+    /**
      * 生产构造器（4 参）。
      *
      * <p>⚠️ 本类有<b>两个</b>构造器 ⇒ Spring 必须靠 {@code @Autowired} 选中这一个。
@@ -135,10 +146,29 @@ public class KbPostProcessStage {
         String knowledgeId = knowledge.getId();
         KbPostProcessConfig config = KbPostProcessConfig.resolve(kb, globalChatModel());
 
+        // ⭐ trace：postprocess 阶段从「开始派发」到「全部入队完成」。
+        //    ⛔ 不在这里 finalizeAttempt —— 派发完 ≠ 跑完（子任务还要跑几分钟），
+        //    本轮真正的收口点在 KbIngestWorker#settle 的 promoted() 分支。
+        KbSpan postprocessSpan = null;
+        if (spanTracker != null && attempt > 0) {
+            Map<String, Object> spanInput = new LinkedHashMap<>();
+            spanInput.put("summary", config.summaryEnabled());
+            spanInput.put("question", config.question().runnable());
+            spanInput.put("graph", config.graphEnabled());
+            spanInput.put("wiki", config.wikiEnabled());
+            spanInput.put("image", config.image().runnable());
+            spanInput.put("autoTag", config.autoTag().runnable());
+            postprocessSpan = spanTracker.beginStage(knowledgeId, attempt, "postprocess",
+                toJson(spanInput));
+        }
+
         List<Planned> planned = plan(knowledge, config, textChunksOf(knowledgeId));
 
         if (planned.isEmpty()) {
             // 没有任何增强能力 ⇒ 直接完成（源侧 CompleteProcessingWithoutSubtasks）
+            if (spanTracker != null) {
+                spanTracker.skipSpan(postprocessSpan, "无子任务");
+            }
             stateRepository.completeWithoutSubtasks(knowledgeId);
             log.info("[后处理] 无子任务，直接完成 knowledge={}", knowledgeId);
             return;
@@ -149,6 +179,9 @@ public class KbPostProcessStage {
             // ⚠️ 必须先播种计数再派发：反过来的话任务可能跑得比播种快，
             //    递减打在 0 上 ⇒ 计数被 clamp，最后永远到不了 0。
             if (!stateRepository.setFinalizing(knowledgeId, (int) counted)) {
+                if (spanTracker != null) {
+                    spanTracker.skipSpan(postprocessSpan, "状态已变");
+                }
                 log.info("[后处理] 未能进入 finalizing（状态已变），不派发 knowledge={} 计划={}",
                     knowledgeId, planned.size());
                 return;
@@ -168,6 +201,14 @@ public class KbPostProcessStage {
                     stateRepository.finalizeSubtask(knowledgeId);
                 }
             }
+        }
+        // 入队失败的子任务不动 span（它根本没起来）；父 stage 的计数如实反映派发结果。
+        if (spanTracker != null) {
+            Map<String, Object> spanOutput = new LinkedHashMap<>();
+            spanOutput.put("planned", planned.size());
+            spanOutput.put("enqueued", enqueued);
+            spanOutput.put("counted", counted);
+            spanTracker.endSpan(postprocessSpan, toJson(spanOutput));
         }
         log.info("[后处理] 已派发 knowledge={} 计划={} 占槽={} 实际入队={}",
             knowledgeId, planned.size(), counted, enqueued);

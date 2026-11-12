@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
 import type { SessionDto } from '@/api/types'
-import { compareSessions, compareGroups } from '@/utils/sessionOrder'
+import { compareSessions, compareGroups, sortSessionsWithPinned } from '@/utils/sessionOrder'
 
 /**
  * 左侧栏 · 按项目路径分组，每路径下挂该项目的会话列表。
@@ -57,6 +57,8 @@ interface SessionListProps {
   doneUnreadIds?: Set<string>
   /** 重命名会话（App 调 sessionApi.update + 本地同步） */
   onRenameSession?: (id: string, title: string) => void
+  /** 置顶 / 取消置顶（App 调 sessionApi.update({ pinned }) + 本地同步） */
+  onPinSession?: (id: string, pinned: boolean) => void
   /** 折叠/展开左栏（App 持有状态 · 按钮在左栏头部三条横线） */
   onToggleCollapse?: () => void
   /** 已折叠：只渲染窄 rail（展开按钮 + 新建）· 对齐 deepseek-harness 收起留 rail、永不消失 */
@@ -119,7 +121,7 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
-export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules, schedulesActive, groupsDefaultCollapsed }: SessionListProps) {
+export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, onPinSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules, schedulesActive, groupsDefaultCollapsed }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 默认折叠口径：只记录**用户/自动展开过**的组（collapsedGroups 的反面）。
   // 两套 state 并存而不是合成一个 Map：默认展开与默认折叠是两种语义，用一个布尔直接翻转
@@ -129,6 +131,19 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const [menuId, setMenuId] = useState<string | null>(null)
   const [renameId, setRenameId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
+
+  // ⋯ 菜单点外部收起：命中菜单或菜单按钮本身不关（按钮自己负责 toggle），其余任意
+  // mousedown 都关闭 —— 此前没有任何 document 级监听，菜单会一直挂在界面上。
+  useEffect(() => {
+    if (menuId == null) return
+    const onDocMouseDown = (e: MouseEvent) => {
+      const el = e.target as Element | null
+      if (el && typeof el.closest === 'function' && el.closest('.session-menu, .session-menu-btn')) return
+      setMenuId(null)
+    }
+    document.addEventListener('mousedown', onDocMouseDown)
+    return () => document.removeEventListener('mousedown', onDocMouseDown)
+  }, [menuId])
 
   /** 当前会话所在组键（无会话 = null）。默认折叠口径下用它自动展开，保证当前会话可见。 */
   const activeGroupKey = useMemo(() => {
@@ -154,9 +169,13 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     return null
   }
 
+  // [V283] 置顶会话从项目分组中取出，单独渲染在最前的「置顶」块（跨项目、恒定展开）。
+  //   非置顶会话仍走原项目分组逻辑，行为逐字节不变。
+  const pinnedSessions = sessions.filter((s) => s.pinned === true)
+  const unpinnedSessions = sessions.filter((s) => s.pinned !== true)
   // 按 mainProjectId 分组；flatHistory 下全部归入单一隐式组 ⇒ 平铺、无分组标题。
   const groups = new Map<string, SessionDto[]>()
-  for (const s of sessions) {
+  for (const s of unpinnedSessions) {
     const key = flatHistory ? FLAT_GROUP_KEY : (s.mainProjectId ?? '__unbound__')
     const arr = groups.get(key) ?? []
     arr.push(s)
@@ -187,6 +206,60 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
       return next
     })
   }
+
+  /** 会话行 · 置顶块与项目组共用同一渲染（避免两份菜单/状态点逻辑漂移）。 */
+  const renderSessionRow = (s: SessionDto) => (
+    <div
+      key={s.id}
+      className={`session-item ${activeSession === s.id ? 'active' : ''}`}
+      onClick={() => switchSession(s.id)}
+    >
+      {/* [V283] 行首置顶五角星 · 未置顶 hover 才显示（灰色空心），已置顶常显（金色实心）；
+          点击直接切换置顶，不触发会话切换（stopPropagation）。 */}
+      <button
+        type="button"
+        className={`session-pin-btn${s.pinned === true ? ' pinned' : ''}`}
+        title={s.pinned === true ? '取消置顶' : '置顶'}
+        aria-label={s.pinned === true ? '取消置顶' : '置顶'}
+        onClick={(e) => { e.stopPropagation(); onPinSession?.(s.id, s.pinned !== true) }}
+      >
+        <svg viewBox="0 0 16 16" fill={s.pinned === true ? 'currentColor' : 'none'} stroke="currentColor" strokeWidth="1.3" strokeLinejoin="round">
+          <path d="M8 1.5l2.06 4.18 4.61.67-3.33 3.25.78 4.59L8 11.93l-4.12 2.26.78-4.59L1.33 6.35l4.61-.67L8 1.5z" />
+        </svg>
+      </button>
+      {/* 对齐 Harness sessionStatuses：等待权限（黄）优先于运行中（蓝） */}
+      {(() => {
+        const pend = pendingSessionIds?.has(s.id)
+        const run = runningSessionIds?.has(s.id)
+        const dn = doneUnreadIds?.has(s.id)
+        if (!pend && !run && !dn) return null
+        const cls = pend ? 'pending' : run ? 'running' : 'done'
+        const tip = pend ? '等待权限/回答（点开会话处理）' : run ? '运行中' : '已完成 · 未读'
+        return <span className={`status-dot ${cls}`} title={tip} />
+      })()}
+      {renameId === s.id ? (
+        <input
+          className="session-rename-input"
+          value={renameDraft}
+          autoFocus
+          onChange={(e) => setRenameDraft(e.target.value)}
+          onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') { onRenameSession?.(s.id, renameDraft); setRenameId(null) } if (e.key === 'Escape') setRenameId(null) }}
+          onBlur={() => setRenameId(null)}
+        />
+      ) : (
+        <span className="title">{s.title || '新会话'}</span>
+      )}
+      <span className="time">{formatRelativeTime(s.updatedAt ?? s.createdAt)}</span>
+      <span className="session-menu-btn" title="会话操作" onClick={(e) => { e.stopPropagation(); setMenuId(menuId === s.id ? null : s.id) }}>⋯</span>
+      {menuId === s.id && (
+        <div className="session-menu">
+          <div className="sm-item" onClick={(e) => { e.stopPropagation(); onPinSession?.(s.id, s.pinned !== true); setMenuId(null) }}>{s.pinned === true ? '取消置顶' : '置顶'}</div>
+          <div className="sm-item" onClick={(e) => { e.stopPropagation(); setRenameId(s.id); setRenameDraft(s.title || ''); setMenuId(null) }}>重命名</div>
+          <div className="sm-item danger" onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id) }}>删除</div>
+        </div>
+      )}
+    </div>
+  )
 
   // 左栏面板内折叠开关（顶格 · 无文字标签 · 对齐 deepseek-harness logoRow 样式）。
   // 改版场景（workspaceRedesign）把它渲染在滚动区**之外**的左栏顶部右侧：
@@ -278,6 +351,22 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         <div className="sidebar-empty">暂无会话 · 点击 + 新建</div>
       )}
 
+      {/* [V283] 置顶块 · 跨项目置前、恒定展开（不响应 groupsDefaultCollapsed） */}
+      {pinnedSessions.length > 0 && (
+        <div className="left-section">
+          {!flatHistory && (
+            <div className="label pinned-label">
+              <svg className="pin-mark" viewBox="0 0 16 16" fill="currentColor" role="img" aria-label="已置顶">
+                <path d="M8 1.5l2.06 4.18 4.61.67-3.33 3.25.78 4.59L8 11.93l-4.12 2.26.78-4.59L1.33 6.35l4.61-.67L8 1.5z" />
+              </svg>
+              <span className="group-path">置顶</span>
+              <span className="count">{pinnedSessions.length}</span>
+            </div>
+          )}
+          {sortSessionsWithPinned(pinnedSessions).map(renderSessionRow)}
+        </div>
+      )}
+
       {orderedKeys.map((key) => {
         const groupSessions = groups.get(key) ?? []
         if (groupSessions.length === 0) return null
@@ -312,44 +401,7 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                 )}
               </div>
             )}
-            {visible.map((s) => (
-              <div
-                key={s.id}
-                className={`session-item ${activeSession === s.id ? 'active' : ''}`}
-                onClick={() => switchSession(s.id)}
-              >
-                {/* 对齐 Harness sessionStatuses：等待权限（黄）优先于运行中（蓝） */}
-                {(() => {
-                  const pend = pendingSessionIds?.has(s.id)
-                  const run = runningSessionIds?.has(s.id)
-                  const dn = doneUnreadIds?.has(s.id)
-                  if (!pend && !run && !dn) return null
-                  const cls = pend ? 'pending' : run ? 'running' : 'done'
-                  const tip = pend ? '等待权限/回答（点开会话处理）' : run ? '运行中' : '已完成 · 未读'
-                  return <span className={`status-dot ${cls}`} title={tip} />
-                })()}
-                {renameId === s.id ? (
-                  <input
-                    className="session-rename-input"
-                    value={renameDraft}
-                    autoFocus
-                    onChange={(e) => setRenameDraft(e.target.value)}
-                    onKeyDown={(e) => { e.stopPropagation(); if (e.key === 'Enter') { onRenameSession?.(s.id, renameDraft); setRenameId(null) } if (e.key === 'Escape') setRenameId(null) }}
-                    onBlur={() => setRenameId(null)}
-                  />
-                ) : (
-                  <span className="title">{s.title || '新会话'}</span>
-                )}
-                <span className="time">{formatRelativeTime(s.updatedAt ?? s.createdAt)}</span>
-                <span className="session-menu-btn" title="会话操作" onClick={(e) => { e.stopPropagation(); setMenuId(menuId === s.id ? null : s.id) }}>⋯</span>
-                {menuId === s.id && (
-                  <div className="session-menu">
-                    <div className="sm-item" onClick={(e) => { e.stopPropagation(); setRenameId(s.id); setRenameDraft(s.title || ''); setMenuId(null) }}>重命名</div>
-                    <div className="sm-item danger" onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id) }}>删除</div>
-                  </div>
-                )}
-              </div>
-            ))}
+            {visible.map(renderSessionRow)}
           </div>
         )
       })}

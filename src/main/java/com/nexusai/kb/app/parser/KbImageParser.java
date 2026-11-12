@@ -121,6 +121,12 @@ public class KbImageParser implements KbDocumentParser {
         return "视觉模型解析";
     }
 
+    /** 引擎族名别名 · 源站图片走内置简单引擎 {@code simple}（另收 {@code image} 便于按类型点名）。 */
+    @Override
+    public Set<String> engineFamilyNames() {
+        return Set.of("simple", "image");
+    }
+
     @Override
     public KbParsedDocument parse(Path file, KbParseContext ctx) {
         String fileName = file.getFileName() == null ? "" : file.getFileName().toString();
@@ -138,6 +144,7 @@ public class KbImageParser implements KbDocumentParser {
         // BMP/TIFF/GIF 先转 PNG（见 NEEDS_PNG_CONVERSION）；超大原图先拒绝，免得白发一次请求
         Path toSend = file;
         Path converted = null;
+        Path preprocessed = null;
         try {
             long size = java.nio.file.Files.size(file);
             if (size > MAX_IMAGE_BYTES) {
@@ -148,6 +155,13 @@ public class KbImageParser implements KbDocumentParser {
             converted = convertIfNeeded(file, ctx);
             if (converted != null) {
                 toSend = converted;
+            }
+            // 扫描件 / 照片预处理（白边裁剪 + 小角度纠偏）· 只换「送视觉」的路径：
+            //   开关关闭或预处理失败时 preprocess 原样返回入参 ⇒ 走原图，不需在此判空。
+            Path pre = KbImagePreprocessor.preprocess(toSend, preprocessDir(ctx));
+            if (!pre.equals(toSend)) {
+                preprocessed = pre;
+                toSend = pre;
             }
         } catch (Exception e) {
             log.warn("KbImageParser: 图片预处理失败，降级为空文本 file={} 原因={}", fileName, e.getMessage());
@@ -162,6 +176,7 @@ public class KbImageParser implements KbDocumentParser {
             return degrade(fileName, file, e.getMessage() == null ? "视觉调用失败" : e.getMessage());
         } finally {
             deleteQuietly(converted);
+            deleteQuietly(preprocessed);
         }
 
         // ── 3. 模型返回空内容（含 null）同样按降级处理，但原因要能区分 ──
@@ -269,6 +284,19 @@ public class KbImageParser implements KbDocumentParser {
         int dot = n.lastIndexOf('.');
         String stem = dot > 0 ? n.substring(0, dot) : n;
         return stem.replaceAll("[\\\\/:*?\"<>|\\s]+", "_");
+    }
+
+    /**
+     * 预处理产物目录 · 落在调用方给的工作目录（{@code ctx.workDir()}）或临时目录。
+     *
+     * <p>与 {@link #convertIfNeeded} 同一口径：产物是临时文件，用完由 {@link #deleteQuietly(Path)} 删。
+     * ⛔ 不要写回原图所在目录 —— 那会往知识库存储里塞 {@code -pre.jpg} 垃圾。
+     */
+    private static Path preprocessDir(KbParseContext ctx) throws java.io.IOException {
+        if (ctx != null && ctx.workDir() != null) {
+            return ctx.workDir();
+        }
+        return java.nio.file.Files.createTempDirectory("kb-image-pre-");
     }
 
     /** 尽力删除临时文件（失败只记 debug：清理不成功不该把成功结果变失败）。 */

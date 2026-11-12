@@ -49,7 +49,6 @@ import java.util.List;
  *   <tr><td>GET</td><td>/knowledge/batch</td><td>批量取文档</td></tr>
  *   <tr><td>GET</td><td>/knowledge/{id}/download</td><td>下载原始文件</td></tr>
  *   <tr><td>GET</td><td>/knowledge/{id}/preview</td><td>预览（文本给正文；二进制给提示）</td></tr>
- *   <tr><td>GET</td><td>/knowledge/{id}/spans</td><td>Span 树 + 解析尝试历史</td></tr>
  *   <tr><td>POST</td><td>/knowledge-bases/{id}/knowledge/batch-download</td><td>批量下载（zip）</td></tr>
  *   <tr><td>POST</td><td>/knowledge-bases/{id}/knowledge/manual</td><td>手工创建</td></tr>
  *   <tr><td>POST</td><td>/knowledge-bases/{id}/knowledge/url</td><td>URL 导入</td></tr>
@@ -103,9 +102,16 @@ public class KnowledgeExtController {
     @Autowired
     private KbTagService tagService;
 
-    @org.springframework.beans.factory.annotation.Value(
-        "${nexusai.knowledge.storage-dir:${user.home}/.nexusai/kb-storage}")
+    @org.springframework.beans.factory.annotation.Value("${nexusai.knowledge.storage-dir:}")
     private String storageDir;
+
+    /** [data-root] 未显式配置 ⇒ 统一数据根（安装目录优先，configHome 兜底）；与 LocalFileStorage / KnowledgeController 同源。 */
+    @jakarta.annotation.PostConstruct
+    void initStorageDir() {
+        if (storageDir == null || storageDir.isBlank()) {
+            storageDir = com.nexusai.common.NexusaiDataRoots.sub("kb-storage").toString();
+        }
+    }
 
     // ── 批量取 ──────────────────────────────────────────────────────
 
@@ -359,18 +365,13 @@ public class KnowledgeExtController {
         @com.fasterxml.jackson.annotation.JsonProperty("detail") String detail) {
     }
 
-    // ── spans / 搜索 / 分块预览 ──────────────────────────────────────
-
-    @GetMapping("/api/v1/knowledge/{id}/spans")
-    public KbKnowledgeExtService.SpanTree spans(@PathVariable String id) {
-        return extService.spans(id);
-    }
-
-    /** 源侧还有一个 {@code /knowledge/{id}/stages} 别名。 */
-    @GetMapping("/api/v1/knowledge/{id}/stages")
-    public KbKnowledgeExtService.SpanTree stages(@PathVariable String id) {
-        return extService.spans(id);
-    }
+    // ── 搜索 / 分块预览 ──────────────────────────────────────────────
+    //
+    // ⭐ /knowledge/{id}/spans 与 /stages 已迁至 {@link KnowledgeController#spans}
+    //    （V284 真 span 表 + 源站契约：attempt 选择 / 五段 pending 占位 / stall 判定）。
+    //    这里曾留有一份「用分块按 start_at/end_at 投影成叶子 span」的旧实现，
+    //    与新版同路径 ⇒ Spring 启动期 Ambiguous mapping（两个 @RestController、同包、
+    //    无类级前缀）⇒ 已删除。{@code KbKnowledgeExtService#spans} 随之停用。
 
     @GetMapping("/api/v1/knowledge/search")
     public List<KnowledgeDto> search(@RequestParam("keyword") String keyword,

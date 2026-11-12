@@ -84,12 +84,39 @@ public record CreateKnowledgeBaseRequest(
      * <p>null = 不传 ⇒ 落库为 NULL（DB 列可空，下游 parse 成「未配置」）。
      */
     @JsonProperty("extract_config")
-    String extractConfig
+    String extractConfig,
+
+    /**
+     * 图片管线 · 是否生成图片描述（{@code image_caption_enabled}，V286）。
+     *
+     * <p>null = 用默认（<b>true</b>，与改造前恒跑 caption 一致）；
+     * false = 入库时不再调 caption 提示词。
+     */
+    @JsonProperty("image_caption_enabled")
+    Boolean imageCaptionEnabled,
+
+    /**
+     * 图片管线 · 是否做 OCR（{@code image_ocr_enabled}，V286）。
+     *
+     * <p>null = 用默认（<b>true</b>）；false = 入库时不再调 OCR 提示词。
+     */
+    @JsonProperty("image_ocr_enabled")
+    Boolean imageOcrEnabled,
+
+    /**
+     * 图片管线方案（{@code image_pipeline}，V286）：{@code default} | {@code smartocr}。
+     *
+     * <p>null/空白 = {@code default}（caption / OCR 各一次调用）；
+     * {@code smartocr} = 先一次「观察」（描述 + 是否含文字），只对含文字的图再跑 OCR。
+     * ⚠️ 其它值 ⇒ 400（值域在 {@code KnowledgeBaseService} 校验）。
+     */
+    @JsonProperty("image_pipeline")
+    String imagePipeline
 ) {
     /**
-     * 6 参兼容构造器（不带索引策略 / 抽取配置）。
+     * 6 参兼容构造器（不带索引策略 / 抽取配置 / 图片管线）。
      *
-     * <p>⚠️ 仅供**既有测试**使用 —— 那些用例只关心名称/类型/模型，不涉及索引策略。
+     * <p>⚠️ 仅供**既有测试**使用 —— 那些用例只关心名称/类型/模型，不涉及这些配置。
      * 生产链路（`KnowledgeBaseController#create` → Jackson 反序列化）走规范构造器。
      * 保留它是为了让「加一个可选字段」不用改 18 处调用点（纯噪音改动）。
      */
@@ -97,6 +124,22 @@ public record CreateKnowledgeBaseRequest(
         String name, String description, String type,
         String chunkingConfig, String embeddingModelId, String summaryModelId
     ) {
-        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId, null, null);
+        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId, null, null,
+            null, null, null);
+    }
+
+    /**
+     * 8 参兼容构造器（带索引策略 / 抽取配置，不带图片管线三项）。
+     *
+     * <p>⚠️ 同样只为既有测试保留（{@code KnowledgeBaseServiceTest} 等按位置传 8 个参数）。
+     * 图片管线三项恒 null = 用默认（true / true / default）。
+     */
+    public CreateKnowledgeBaseRequest(
+        String name, String description, String type,
+        String chunkingConfig, String embeddingModelId, String summaryModelId,
+        String indexingStrategy, String extractConfig
+    ) {
+        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId,
+            indexingStrategy, extractConfig, null, null, null);
     }
 }

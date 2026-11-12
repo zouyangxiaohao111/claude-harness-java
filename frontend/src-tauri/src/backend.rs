@@ -455,6 +455,14 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
     if needs_native_access_flag(&backend_dir.join("jre")) {
         cmd.arg("--enable-native-access=ALL-UNNAMED");
     }
+    // [data-root] 把**真实安装目录**（backend 的父目录）注入子进程环境：
+    //   后端据此把 artifacts / kb-storage / pdf-cache / image-cache 落到
+    //   <install>/data/workspace/<NEXUSAI_USER|default>（用户 2026-11-12 裁定）。
+    //   壳注入优先级高于安装器写入的用户级环境变量（进程环境覆盖注册表值），
+    //   因此即使注册表里残留旧路径也不会写错位置。dev 回退时 parent = src-tauri。
+    if let Some(install_dir) = backend_dir.parent() {
+        cmd.env("NEXUSAI_INSTALL_DIR", install_dir);
+    }
     let child = cmd
         .arg("-jar")
         .arg(&jar_path)

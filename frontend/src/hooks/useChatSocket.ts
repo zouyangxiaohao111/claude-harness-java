@@ -1289,6 +1289,10 @@ export function useChatSocket(
       //   正常发送乐观插入 id=resp.userMessageId=后端 uuid → 与推送同 id 被 appendMetaUser 幂等拦截，无双泡。
       if (evt.id) st.appendMetaUser(sid, evt.id, evt.content ?? null, evt.isMeta !== false)
     } else if (isChunk(evt)) {
+      // [retry-ok-clear] 收到本轮 chunk = 这次尝试已经拿到上游内容 ⇒ 重试成功，横幅立即消失
+      //   （对齐 CC：重试成功即消失）。原实现只在 message.complete 清 → 重试成功后整轮（可达数分钟）
+      //   仍挂着「正在重试 第 N/10 次」，用户看到的是「已经好了却还在重试」。
+      if (useChatStore.getState().retry[sid]) st.setRetry(sid, null)
       // 契约 #1：chunk.assistantMessageId = turnAssistantId（每轮真实稳定 id）→ 按轮惰性建块累积。
       //   'msg-stream' 兜底兼容旧后端（未改前所有 chunk 共享该 id → 归入同一条流式块）。
       const blockId = evt.assistantMessageId ?? 'msg-stream'
@@ -1394,7 +1398,8 @@ export function useChatSocket(
       if (evt.compacted) onCompactedReloadRef.current?.(sid)
       // 重试横幅清除：complete = 本轮 LLM 调用成功（api_retry 重试后成功）→ 隐藏「正在重试」
       //   横幅（对齐 CC：重试成功即消失；此前仅 onClose 手动关闭，残留导致「已完成仍显示重试」）
-      st.setRetry(null)
+      //   ⚠️ 必须传 sid：横幅按会话键控，清错键 = 别人的重试提示被抹掉而自己的残留。
+      st.setRetry(sid, null)
       // 会话 token/金额汇总（底部 footer · F5 恢复源）：complete 事件携带会话累计（total_cost_usd=累计金额、
       //   total_tokens=累计 tokens）→ 覆盖更新当前会话 SessionDto（非累加 —— 后端已是跨 turn 累计值）。
       //   [V101] total_tokens 取代原「自行对 modelUsage 逐模型 input+output 求和」：那个和是前端拼装，
@@ -1420,7 +1425,13 @@ export function useChatSocket(
       //   带 topic：App 侧校验当前登记的 topic 匹配才删（防旧 turn 终止事件误删刚登记的新 turn）
       onSessionDoneRef.current?.(sid, topic, 'complete')
     } else if (isRetry(evt)) {
-      st.setRetry({ attempt: evt.attempt, maxRetries: evt.maxRetries, retryDelayMs: evt.retryDelayMs })
+      // at = 本地收到时刻 → 横幅「已等待」正计时（长静默期也能看到第 N/10 次，不依赖服务端时钟）
+      st.setRetry(sid, {
+        attempt: evt.attempt,
+        maxRetries: evt.maxRetries,
+        retryDelayMs: evt.retryDelayMs,
+        at: Date.now(),
+      })
     } else if (isError(evt)) {
       // message.error → 对话流助手位置错误卡（对齐 CC assistant API error 展示 · 不再走顶部通知栏）
       st.addApiError(sid, {
@@ -1435,7 +1446,7 @@ export function useChatSocket(
       //   （用户 F5 才复活）。对齐 CC：API 错误即该请求收尾 —— flush 尾增量 + 清 retry + 丢无 complete 的
       //   流式残留块 + 通知 App 移除登记。
       flushStreamAppends()
-      st.setRetry(null)          // complete 分支才置 null；error 分支此前漏 → 重试横幅残留
+      st.setRetry(sid, null)     // complete 分支才置 null；error 分支此前漏 → 重试横幅残留
       st.clearStream(sid)        // error 轮无 complete，流式块不会 finalize → 清掉避免「思考中/打字机」卡住
       onSessionDoneRef.current?.(sid, topic, 'error')
     } else if (isCancelled(evt)) {

@@ -89,9 +89,7 @@ class LlmAgentLoopOdD2DrainSuppressionTest {
     }
 
     private MaxTokensHandler maxTokensHandler(boolean gate) {
-        MaxTokensHandler handler = new MaxTokensHandler(gate);
-        handler.setSettingsOverrideProvider(() -> null); // 无 settings.maxOutputTokens override
-        return handler;
+        return new MaxTokensHandler(gate);
     }
 
     /**

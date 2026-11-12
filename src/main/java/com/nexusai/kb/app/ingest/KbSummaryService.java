@@ -68,9 +68,8 @@ public class KbSummaryService {
     /** 可抽取文本的下限（code point）· 低于它认为是扫描件/图片文档。 */
     static final int MIN_CONTENT_CHARS = 40;
 
-    /** 摘要输出上限（源侧 {@code defaultSummaryMaxTokens = 1024}，每个字段都很短）。 */
-    private static final int MAX_TOKENS = 1024;
-
+    // ⚠️ 2026-11-12 删除 MAX_TOKENS(1024)：输出上限唯一入口 = models.max_tokens，
+    //   调用点不再填值（非流式由 provider 侧压到 MAX_NON_STREAMING_TOKENS=64000）。
     private static final double TEMPERATURE = 0.3;
 
     private final KbKnowledgeMapper knowledgeMapper;
@@ -227,7 +226,7 @@ public class KbSummaryService {
             raw = sideCallClient.chat(
                 provider, apiModelName,
                 KbPostProcessPrompts.SUMMARY_SYSTEM, content,
-                options(TEMPERATURE, MAX_TOKENS, "document_summary"),
+                options(TEMPERATURE, "document_summary"),
                 LlmSideCallClient.SideCallUsage.standalone(
                     UsageCategory.SIDE_CALL, "document_summary"));
         } catch (RuntimeException e) {
@@ -572,13 +571,13 @@ public class KbSummaryService {
     }
 
     private static LlmProvider.ChatRequestOptions options(
-        double temperature, int maxTokens, String label
+        double temperature, String label
     ) {
         return new LlmProvider.ChatRequestOptions(
             null, null, null,
             // 摘要是「整理已有事实」，不需要推理链（省 token、更稳定）
             LlmProvider.ChatRequestOptions.ThinkingConfig.disabled(),
-            temperature, label, null, maxTokens, null, null,
+            temperature, label, null, null, null, null,
             null, null, null, null, null, null);
     }
 }

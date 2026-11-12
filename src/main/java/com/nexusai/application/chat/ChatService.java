@@ -1094,14 +1094,20 @@ public class ChatService {
                 taskBudgetOf(),                                  // [IMP2-10 · MISS-2] taskBudget 生产注入（OD-13: 配置→默认值）
                 req != null ? req.jsonSchema() : null,           // [IMP-HR-08 · OPD-WF6-01-06-?-3] 主循环 structured output jsonSchema 透传（HTTP 请求体 → RunRequest.jsonSchema → LlmAgentLoop 注册 enforcement）
                 attachments));                                   // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
-        } catch (Exception e) {
+        } catch (Throwable e) {
+            // [catch-throwable] 原 catch (Exception)：任务体抛 Error（OOM/StackOverflow/NoClassDefFound…）
+            //   会整条漏出去 —— 既不推 message.error 也不推 status=idle ⇒ 前端停止键永驻、
+            //   该会话之后再也发不出消息（用户实测「结束后后端没有访问了，前端还是停止」）。
+            //   InterruptedException 的取消语义保持不变（下方 errorCode 判定）。
             log.error("AGENT failed: model={}", modelName, e);
             // [实时落库 2026-09-03] error 分支删除 reenqueueInjectedQueuedMessages（对齐 CC
             //   messageQueueManager.ts：无 requeue API，消费即移除；query 崩溃已消费命令不自动回队）。
             //   已注入命令若已 append 已实时落库留痕（DB + 前端气泡）；未注入仍在队列由 CronIdleExecutor
             //   自然消费——规则十二显式失败：不再静默重放。
             String errorCode = (e instanceof InterruptedException) ? "cancelled" : "llm_error";
-            String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
+            // [err-readable] 用户可见文案走 ApiErrors 翻译（额度不足/限流/过载/鉴权/连接…），
+            //   原始串作括号补充；未识别类型才原样透出（不编造原因）。
+            String errorMsg = com.nexusai.application.agent.api.ApiErrors.userFacingErrorMessage(e);
             // [reflect-blocker] 终态事件同源（error 分支）：run() 抛异常 → state 恒 null（赋值未完成），
             //   无法经 state 取末条 assistant id；sessionAgentStateRegistry 持当前轮在飞 state
             //   （LlmAgentLoop:2013-2017 run() 流式开始前注册），currentAssistantMessageId() =
@@ -1931,6 +1937,9 @@ public class ChatService {
                     MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
                     rec.setContent(m.content() == null ? "" : m.content());
                     rec.setReasoning(m.reasoning());
+                    // [thinking-passthrough] thinking 块签名落库（V282 列）—— 送侧下一轮据此
+                    //   重建 thinking 块；缺失则不回传 → DeepSeek 端按 tool_use id 恢复失败即 400。
+                    rec.setThinkingSignature(m.thinkingSignature());
                     rec.setReasoningDurationMs(m.reasoningDurationMs());
                     rec.setFinishReason("tool_calls");
                     rec.setCreatedAt(ts.toString());
@@ -1976,6 +1985,8 @@ public class ChatService {
                     MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
                     rec.setContent(m.content() == null ? "" : m.content());
                     rec.setReasoning(m.reasoning());
+                    // [thinking-passthrough] 纯文本 assistant 同样留签名（V282 列）
+                    rec.setThinkingSignature(m.thinkingSignature());
                     rec.setReasoningDurationMs(m.reasoningDurationMs());
                     rec.setFinishReason(fr);
                     AgentUsage usage = m.usage();

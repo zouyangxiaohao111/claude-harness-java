@@ -1,6 +1,9 @@
 package com.nexusai.kb.app.qa;
 
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.kb.app.chunk.KbChunk;
 import com.nexusai.kb.app.retrieval.KbHybridSearcher;
 import com.nexusai.kb.repo.entity.KbChunkRecord;
 import com.nexusai.kb.repo.mapper.KbChunkMapper;
@@ -72,6 +75,8 @@ public class KbMergeStage {
     /** 父块类型（源侧同名常量）。 */
     static final String CHUNK_TYPE_PARENT_TEXT = "parent_text";
 
+    private static final ObjectMapper JSON = new ObjectMapper();
+
     private final KbChunkMapper chunkMapper;
 
     public KbMergeStage(KbChunkMapper chunkMapper) {
@@ -90,12 +95,27 @@ public class KbMergeStage {
      * @param chunkIndex      块序号（合并组的起始序号）
      * @param score           组内最高分
      * @param subChunkIds     被合并进来的其它块 ID（引用溯源用）
+     * @param imageKey        命中的是图片子块（{@code image_caption} / {@code image_ocr}）时
+     *                        带回的图片去重键，供前端显示原图；其它块为 null
      */
     public record MergedChunk(
         String chunkId, String knowledgeId, String knowledgeBaseId,
         String content, String contextHeader, String chunkType,
-        int chunkIndex, double score, List<String> subChunkIds
+        int chunkIndex, double score, List<String> subChunkIds, String imageKey
     ) {
+
+        /**
+         * 兼容构造 · 不带 imageKey（既有调用点：数据分析生成的虚拟片段、测试）。
+         *
+         * <p>⚠️ 保留它而不是让所有调用方补 {@code null}：{@code MergedChunk} 是
+         * 「正文 + 分数 + 溯源」的契约，图片键只对图片子块有意义。
+         */
+        public MergedChunk(String chunkId, String knowledgeId, String knowledgeBaseId,
+                           String content, String contextHeader, String chunkType,
+                           int chunkIndex, double score, List<String> subChunkIds) {
+            this(chunkId, knowledgeId, knowledgeBaseId, content, contextHeader, chunkType,
+                chunkIndex, score, subChunkIds, null);
+        }
     }
 
     /**
@@ -136,6 +156,11 @@ public class KbMergeStage {
         work = dedup("初始去重", work);
         // 3. 父块解析
         work = resolveParents(work, records);
+        // 3.5 图片子块展开（命中 image_caption / image_ocr ⇒ 换成所属正文块正文）
+        work = expandImageSubChunks(work, records);
+        // 3.6 展开后可能和「同位置的正文块命中」内容完全相同 ⇒ 立刻去重一次
+        //     （否则第 4 步顺序合并会把同一段正文拼成「A\n\nA」）
+        work = dedup("图片展开后去重", work);
         // 4. 同文档同类型分组，顺序块合并
         work = groupAndMergeSequential(work);
         // 4.5 FAQ 答案回填（对齐源侧 merge_faq.go：用 metadata 里的标准问 + 答案替换正文）
@@ -212,6 +237,10 @@ public class KbMergeStage {
                 if (first != null) {
                     // 内容完全一样 ⇒ 保留先到的，把 id 记进子块（引用不丢）
                     first.addSubChunk(w.chunkId);
+                    // ⭐ 图片键不能因为「同内容先到的正好是父块正文」就丢掉
+                    if (first.imageKey == null) {
+                        first.imageKey = w.imageKey;
+                    }
                     continue;
                 }
                 bySignature.put(sig, w);
@@ -288,6 +317,9 @@ public class KbMergeStage {
                 removed[victim] = true;
                 int keptIdx = victim == i ? j : i;
                 work.get(keptIdx).addSubChunk(work.get(victim).chunkId);
+                if (work.get(keptIdx).imageKey == null) {
+                    work.get(keptIdx).imageKey = work.get(victim).imageKey;
+                }
                 if (log.isDebugEnabled()) {
                     log.debug("[合并] 近似重复剔除 留在={} 删掉={} 子串判定={}",
                         work.get(keptIdx).chunkId, work.get(victim).chunkId, contained);
@@ -408,6 +440,94 @@ public class KbMergeStage {
             }
         }
         return work;
+    }
+
+    // ── 3.5 图片子块展开 ────────────────────────────────────────────
+
+    /**
+     * 图片子块（{@code image_caption} / {@code image_ocr}）命中的展开。
+     *
+     * <p><b>⭐ 为什么必须展开</b>：子块的正文只有「一句描述 / 一段图内文字」，
+     * 直接当资料喂给模型等于「答案只有图片说明」。子块的 {@code parent_chunk_id}
+     * 指向该图所属<b>正文块</b>，展开成父块正文才是用户要的上下文。
+     *
+     * <p><b>⭐ 为什么一次只展开一个</b>：同一张图可能同时命中 caption 与 ocr 两条子块
+     * （都挂在同一个父块上）。两条都展开就是同一段正文出现两遍。
+     * ⇒ 按父块去重：后到的子块只记进 {@code subChunkIds}（引用溯源不丢），不再产生新片段。
+     *
+     * <p>父块不存在 / 正文为空 ⇒ <b>原文返回</b>（子块自己的文字仍有效，不能丢）。
+     *
+     * <p>展开后把 {@code chunkType} 改成父块类型并保留父块 {@code chunkIndex}
+     * ⇒ 与命中的同位置正文块走同一分组，最后由去重合并成一条。
+     */
+    private List<Work> expandImageSubChunks(List<Work> work, Map<String, KbChunkRecord> cache) {
+        Map<String, Work> byParent = new HashMap<>();
+        List<Work> out = new ArrayList<>(work.size());
+        int expanded = 0;
+        int collapsed = 0;
+        for (Work w : work) {
+            if (!isImageSubChunk(w.chunkType)) {
+                out.add(w);
+                continue;
+            }
+            String parentId = w.parentChunkId;
+            if (parentId == null || parentId.isBlank()) {
+                out.add(w);   // 没有父指针 ⇒ 保持子块原文
+                continue;
+            }
+            KbChunkRecord parent = fetchIfMissing(cache, parentId);
+            if (parent == null || parent.getContent() == null || parent.getContent().isEmpty()) {
+                // ⛔ 不登记 byParent：父块不可用时钟子块彼此独立，合并会丢信息
+                out.add(w);
+                continue;
+            }
+            Work first = byParent.get(parentId);
+            if (first != null) {
+                first.addSubChunk(w.chunkId);
+                if (first.imageKey == null) {
+                    first.imageKey = w.imageKey;
+                }
+                collapsed++;
+                continue;
+            }
+            w.content = parent.getContent();
+            w.contentRewritten = true;
+            w.addSubChunk(w.chunkId);
+            // 展开后语义等同父块正文 ⇒ 归入父块类型，避免同位置的正文输出两遍
+            w.chunkType = parent.getChunkType() == null || parent.getChunkType().isBlank()
+                ? CHUNK_TYPE_TEXT : parent.getChunkType();
+            if (w.chunkIndex <= 0 && parent.getChunkIndex() != null) {
+                w.chunkIndex = parent.getChunkIndex();
+            }
+            byParent.put(parentId, w);
+            out.add(w);
+            expanded++;
+        }
+        if (expanded > 0 || collapsed > 0) {
+            log.info("[合并] 图片子块展开 {} 条（同父块合并 {} 条）", expanded, collapsed);
+        }
+        return out;
+    }
+
+    /** 是否是图片独立子块。 */
+    static boolean isImageSubChunk(String chunkType) {
+        return KbChunk.CHUNK_TYPE_IMAGE_CAPTION.equals(chunkType)
+            || KbChunk.CHUNK_TYPE_IMAGE_OCR.equals(chunkType);
+    }
+
+    /** 从子块 {@code metadata} 读图片去重键（{@code image_key}）。 */
+    private static String imageKeyOf(String metadata) {
+        if (metadata == null || metadata.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode n = JSON.readTree(metadata);
+            JsonNode v = n == null ? null : n.get("image_key");
+            return v == null || v.isNull() ? null : v.asText(null);
+        } catch (Exception e) {
+            // metadata 坏了只是拿不到图片键，不影响合并主流程
+            return null;
+        }
     }
 
     // ── 4/6. 分组顺序合并 ────────────────────────────────────────────
@@ -738,7 +858,7 @@ public class KbMergeStage {
         for (Work w : work) {
             out.add(new MergedChunk(w.chunkId, w.knowledgeId, w.knowledgeBaseId,
                 w.content, w.contextHeader, w.chunkType, w.chunkIndex, w.score,
-                List.copyOf(w.subChunkIds)));
+                List.copyOf(w.subChunkIds), w.imageKey));
         }
         return out;
     }
@@ -758,8 +878,9 @@ public class KbMergeStage {
         String knowledgeBaseId;
         String content;
         final String contextHeader;
-        final String chunkType;
-        final int chunkIndex;
+        /** ⚠️ 可变：图片子块展开后要改成父块类型（归入同一分组，避免同位置正文输出两遍）。 */
+        String chunkType;
+        int chunkIndex;
         double score;
         final List<String> subChunkIds;
 
@@ -768,6 +889,8 @@ public class KbMergeStage {
         int contentRevision;
         boolean contentRewritten;
         String parentChunkId;
+        /** 图片子块带回的图片键（{@code metadata.image_key}）；非图片块为 null。 */
+        String imageKey;
         /** 原始块记录（FAQ 需要从 metadata 回填答案，⛔ 不要重复查库）。 */
         final KbChunkRecord record;
 
@@ -789,6 +912,9 @@ public class KbMergeStage {
             this.endAt = record.getEndAt() == null ? 0 : record.getEndAt();
             this.contentRevision = record.getContentRevision() == null ? 0 : record.getContentRevision();
             this.parentChunkId = record.getParentChunkId();
+            // ⚠️ 只对图片子块解析 metadata（其它块的 metadata 可能是大段问句，没必要每次合并都解析）
+            this.imageKey = KbMergeStage.isImageSubChunk(this.chunkType)
+                ? imageKeyOf(record.getMetadata()) : null;
         }
 
         void addSubChunk(String id) {

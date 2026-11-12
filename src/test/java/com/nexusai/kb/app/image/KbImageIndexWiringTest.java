@@ -38,7 +38,8 @@ class KbImageIndexWiringTest {
     @DisplayName("⭐⭐ 向量索引文本必须拼接图内文字")
     void embeddingTextIncludesImageText() throws IOException {
         String s = source();
-        int i = s.indexOf("private static String indexTextOf(KbChunkRecord c)");
+        // ⭐ V-E5 后该方法由 static 改为实例方法（要读子块开关），锚点随之更新
+        int i = s.indexOf("private String indexTextOf(KbChunkRecord c)");
         assertThat(i).as("找不到 indexTextOf").isGreaterThan(0);
         String body = s.substring(i, Math.min(i + 600, s.length()));
         assertThat(body)

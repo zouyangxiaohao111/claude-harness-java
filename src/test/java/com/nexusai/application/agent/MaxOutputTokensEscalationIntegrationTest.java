@@ -56,15 +56,13 @@ class MaxOutputTokensEscalationIntegrationTest {
      * 结构 · GR-3 后无压缩组件位）。
      */
     /**
-     * 创建 MaxTokensHandler 并注入 settings provider（返回 null 表示无 settings.maxOutputTokens
-     * override → 64k 升级 gate 可达）。F1 迁移后 gate 判定读 settings.maxOutputTokens（CC
-     * env.CLAUDE_CODE_MAX_OUTPUT_TOKENS 等价，E4 发现 C）；无 Spring 上下文时 staticSettingsMapper
-     * 未桥接默认即 null，此处显式注入固守"无 override"语义（隔离 CI 环境可能注入的配置）。
+     * 创建 MaxTokensHandler（gate 显式注入）。
+     *
+     * <p>⚠️ 2026-11-12 撤掉 settings.maxOutputTokens 抑制条件后，升级判定只剩
+     * {@code gate && override==null}，不再需要注入 settings 读取器。
      */
     private MaxTokensHandler maxTokensHandler(boolean gate) {
-        MaxTokensHandler handler = new MaxTokensHandler(gate);
-        handler.setSettingsOverrideProvider(() -> null); // 无 settings.maxOutputTokens override
-        return handler;
+        return new MaxTokensHandler(gate);
     }
 
     private AgentLoopContext recoveryCtx(LlmProviderFactory factory, MaxTokensHandler handler) {
@@ -260,12 +258,11 @@ class MaxOutputTokensEscalationIntegrationTest {
     @Test
     @DisplayName("接线：override=64000 时 resolveRecoveryMaxTokens 返回 64000；override=null 委托 getMaxOutputTokensForModel")
     void wiring_resolveRecoveryMaxTokens() {
-        // override=null（未升级）→ 委托 getMaxOutputTokensForModel（模型族 default + settings
-        //   maxOutputTokens 有界 override 的模型解析，F1 迁移后无 env——断言与 AnthropicSdkProvider
-        //   实际解析一致，不硬编码配置相关值）
+        // override=null（未升级）→ 委托 getMaxOutputTokensForModel（模型族 default；
+        //   2026-11-12 后不再有 settings.maxOutputTokens 收窄层，DB models.max_tokens 直用）
         int expectedDefault = com.nexusai.infra.llm.AnthropicSdkProvider.getMaxOutputTokensForModel("claude-sonnet-4-6");
         assertThat(AgentLoopContext.resolveRecoveryMaxTokens("claude-sonnet-4-6", null))
-            .as("override=null（未升级）委托 getMaxOutputTokensForModel（模型族 default + settings.maxOutputTokens 有界 override）")
+            .as("override=null（未升级）委托 getMaxOutputTokensForModel（模型族 default）")
             .isEqualTo(expectedDefault);
         // override=64000（升级）→ 64000（ESCALATED_MAX_TOKENS，环境无关）
         assertThat(AgentLoopContext.resolveRecoveryMaxTokens("claude-sonnet-4-6",

@@ -166,6 +166,18 @@ interface ComposerProps {
   hasGoal?: boolean
   /** 当前目标条件（已有目标时点「目标」→ 面板预填，避免看起来像目标没了） */
   goalCondition?: string | null
+  /**
+   * 输入框上方右侧的提示节点（App 传 `<AskUserPendingHint />`）。
+   *
+   * <p>放在 `.composer-inner` 内而不是 App 的 fixed 浮层：随输入区宽度/位置走，
+   * 用户视线落在输入框时就能看到「其他会话有工具在等回答」，不用去右下角找。
+   */
+  pendingHint?: ReactNode
+  /**
+   * 「子代理运行中」胶囊（App 传 `<SubagentRunningHint />`）· 与「停止所有」同一操作组，
+   * 主会话里也能看到后台子代理还在跑，点击打开右栏「运行」tab。
+   */
+  subagentHint?: ReactNode
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -287,7 +299,7 @@ function renderHighlighted(
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition }: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint }: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -576,10 +588,12 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     return () => document.removeEventListener('mousedown', onDoc)
   }, [plusOpen])
 
-  // 会话工具面板（功能2：禁用/恢复 · 会话级临时禁用）；点击外部 / Esc 收起
+  // 会话工具面板（功能2：禁用/恢复 · 会话级临时禁用）；鼠标移出组合延时收起 / Esc 逐层收
   const [toolsOpen, setToolsOpen] = useState(false)
   const [toolsDisabledCount, setToolsDisabledCount] = useState(0)
   const toolsPanelRef = useRef<HTMLDivElement>(null)
+  /** hover 关闭延时句柄（鼠标穿越 chip↔一级↔二级的 7px 缝隙时不误收） */
+  const hoverCloseTimer = useRef<number | null>(null)
   useEffect(() => {
     if (!toolsOpen) return
     const onDoc = (e: MouseEvent) => {
@@ -588,6 +602,10 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     document.addEventListener('mousedown', onDoc)
     return () => document.removeEventListener('mousedown', onDoc)
   }, [toolsOpen])
+  // 卸载时清掉未执行的延时，避免对已卸载组件 setState
+  useEffect(() => () => {
+    if (hoverCloseTimer.current != null) window.clearTimeout(hoverCloseTimer.current)
+  }, [])
   // 会话切换 → 重置禁用角标（面板打开时 SessionToolsPanel 按 sessionId 自动重新拉取）
   useEffect(() => {
     setToolsDisabledCount(0)
@@ -1002,8 +1020,11 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               </div>
             )}
           </div>
-          {/* 输入框上方右缘操作组（右对齐输入框右缘）：回到底部（离底时）+ 停止所有（运行中） */}
+          {/* [subagent-hint] 子代理运行提示：紧挨 full 模式右侧（位置在视线区，不再放右缘操作组） */}
+          {subagentHint}
+          {/* 输入框上方右缘操作组（右对齐输入框右缘）：待回答提示 + 回到底部（离底时）+ 停止所有（运行中） */}
           <div className="composer-top-actions">
+            {pendingHint}
             {showToBottom && (
               <button
                 className="composer-top-btn"
@@ -1393,18 +1414,28 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   <span>浏览器</span>
                 </div>
               )}
-              {/* 会话工具面板（功能2 · 禁用/恢复 · 会话级临时禁用） */}
-              <div className="tools-chip-wrap" ref={toolsPanelRef}>
-                <div
-                  className={`tool-chip tools-chip${toolsOpen ? ' active' : ''}`}
-                  onClick={() => setToolsOpen((v) => !v)}
-                  title="会话工具禁用/恢复"
-                >
-                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <path d="M6 3a3 3 0 1 0 0 6 3 3 0 0 0 0-6zM1 6h.01M11 6h.01M6 1v.01M6 11v.01" />
-                  </svg>
-                  <span>工具</span>
-                  {toolsDisabledCount > 0 && <span className="tools-badge">{toolsDisabledCount}</span>}
+              {/* 会话工具：齿轮入口（默认只显图标，hover 滑出「工具」）→ 一级分类目录 → 二级明细 */}
+              <div
+                className={`tools-chip-wrap${toolsOpen ? ' open' : ''}`}
+                ref={toolsPanelRef}
+                onMouseEnter={() => {
+                  if (hoverCloseTimer.current != null) { window.clearTimeout(hoverCloseTimer.current); hoverCloseTimer.current = null }
+                  setToolsOpen(true)
+                }}
+                onMouseLeave={() => {
+                  if (hoverCloseTimer.current != null) window.clearTimeout(hoverCloseTimer.current)
+                  hoverCloseTimer.current = window.setTimeout(() => setToolsOpen(false), 200)
+                }}
+              >
+                <div className="tool-chip tool-entry" title="工具">
+                  <span className="entry-ico">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
+                      <circle cx="12" cy="12" r="3" />
+                      <path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z" />
+                    </svg>
+                  </span>
+                  <span className="entry-label">工具</span>
+                  {toolsDisabledCount > 0 && <span className="entry-dot" title="有工具被禁用" />}
                 </div>
                 {toolsOpen && (
                   <SessionToolsPanel
@@ -1412,6 +1443,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                     showToast={showToast}
                     onClose={() => setToolsOpen(false)}
                     onCountChange={setToolsDisabledCount}
+                    onOpenChromePanel={onOpenChromePanel}
                   />
                 )}
               </div>

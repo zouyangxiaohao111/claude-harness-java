@@ -74,7 +74,7 @@ class SettingsServiceSubagentDefaultRuntimeTest {
     private static SettingsDto req(String defaultRuntime) {
         return new SettingsDto(
             null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
+            null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,

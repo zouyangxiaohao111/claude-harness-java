@@ -29,10 +29,8 @@ public record SettingsDto(
     String mediumModelName,
     String strongModelName,
     String subagentModelName,
-    // [F1] max output tokens 有界 override（V27 列 max_output_tokens，可空；CC 语义 =
-    //   envValidation.ts:9-38 CLAUDE_CODE_MAX_OUTPUT_TOKENS 迁移为 settings 配置：
-    //   >0 生效、> 模型 upperLimit 封顶到 upperLimit、null 用模型默认）
-    Integer maxOutputTokens,
+    // ⚠️ 2026-11-12 删除 maxOutputTokens：V285 已 DROP 该列。
+    //   输出上限唯一入口 = models.max_tokens（模型配置页「生成参数 · max tokens」）。
     // [F4] 回落模型（V27 原列 fallback_model_id，V28 RENAME → fallback_model_name，可空）
     String fallbackModelName,
     // [TN1] 多模态/TTS/ASR 档位模型（V28 建列 multimodal_model_name/tts_model_name/asr_model_name，
@@ -243,7 +241,6 @@ public record SettingsDto(
         String mediumModelName,
         String strongModelName,
         String subagentModelName,
-        Integer maxOutputTokens,
         String fallbackModelName,
         String multimodalModelName,
         String ttsModelName,
@@ -306,7 +303,7 @@ public record SettingsDto(
     ) {
         this(theme, fontSize, accent, animationsEnabled, mainModelName, fastModelName,
             weakModelName, mediumModelName, strongModelName, subagentModelName,
-            maxOutputTokens, fallbackModelName, multimodalModelName, ttsModelName, asrModelName,
+            fallbackModelName, multimodalModelName, ttsModelName, asrModelName,
             autoCompactWindow, autoMemoryDirectory, autoMemoryEnabled, autoDreamEnabled,
             websearchEngine, apiKey, proxy, websearchUseSmallModel, websearchBaseUrl,
             websearchDomainCheckUrl, agentSwarmsEnabled, permissionMode, classifierModel,

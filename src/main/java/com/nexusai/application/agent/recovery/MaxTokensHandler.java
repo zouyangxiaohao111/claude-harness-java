@@ -23,9 +23,10 @@ import org.slf4j.LoggerFactory;
  *
  * <p><b>[IMP-15 DRIFT-11] 64k 升级 gate</b>：CC 的升级受 {@code tengu_otk_slot_v1}
  * growthbook flag 门控（3P 默认 false）。gate 关闭时跳过升级、直走多轮续写（≤3）；
- * gate 开启且未升级且无 {@code settings.maxOutputTokens} override（F1 迁移自
- * {@code CLAUDE_CODE_MAX_OUTPUT_TOKENS} env，CC query.ts:1199-1203 同读 env；E4 发现 C）
- * 时才升级。
+ * gate 开启且上一请求未带 override 时才升级。
+ *
+ * <p>⚠️ 2026-11-12 撤掉原「{@code settings.maxOutputTokens} 已配置 ⇒ 抑制升级」条件：
+ * 该设置项已从配置面移除，输出上限唯一入口 = {@code models.max_tokens}。
  */
 public class MaxTokensHandler {
 
@@ -38,19 +39,6 @@ public class MaxTokensHandler {
      * {@code nexusai.feature.tengu-otk-slot-v1}）注入；测试可显式传入。
      */
     private final boolean tenguOtkSlotV1Enabled;
-
-    /**
-     * settings.maxOutputTokens 读取器 · 单源解析（F1 迁移自 {@code CLAUDE_CODE_MAX_OUTPUT_TOKENS} env）。
-     * 可注入便于测试（默认 {@link AnthropicSdkProvider#readSettingsMaxOutputTokens()}）。
-     *
-     * <p><b>WHY（可测试性）</b>: {@code canEscalate} 判定依赖 settings.maxOutputTokens 为 null
-     * （未配置 → 64k 升级 gate 可达）。无 Spring 上下文时 staticSettingsMapper 未桥接 → null →
-     * 等价"未配置 override"（测试天然可升级）。原 envProvider（读 CLAUDE_CODE_MAX_OUTPUT_TOKENS env，
-     * 因 Java 无法直接改 System.getenv）随 F1 迁移已删除，本 Supplier 承载同款可注入 seam
-     * （E4 发现 C：env 残留改 settings 单源）。
-     */
-    private java.util.function.Supplier<Integer> settingsOverrideProvider =
-        AnthropicSdkProvider::readSettingsMaxOutputTokens;
 
     /** 默认构造器 · gate 从系统属性读取（对齐 CC growthbook flag 默认 false）。 */
     public MaxTokensHandler() {
@@ -67,15 +55,6 @@ public class MaxTokensHandler {
     }
 
     /**
-     * 注入 settings.maxOutputTokens 读取器（测试可注入 mock 模拟"已配置 override → 抑制 64k 升级"）。
-     */
-    public void setSettingsOverrideProvider(java.util.function.Supplier<Integer> settingsOverrideProvider) {
-        this.settingsOverrideProvider = settingsOverrideProvider != null
-            ? settingsOverrideProvider
-            : AnthropicSdkProvider::readSettingsMaxOutputTokens;
-    }
-
-    /**
      * 处理 max_tokens 截断事件（调用方仅在 {@code msg.isMaxOutputTokensError()} 时调用）。
      *
      * @param state                   当前恢复状态（会被修改）
@@ -85,16 +64,13 @@ public class MaxTokensHandler {
      */
     public RecoveryResult handle(RecoveryState state, Integer maxOutputTokensOverride) {
         // [IMP-15 DRIFT-11] 64k 升级 gate · CC query.ts:1199-1203
-        //   gate 开启 && override===undefined && 无 settings.maxOutputTokens override → 升级；否则走多轮续写。
-        //   [E4-C] F1 迁移：CC 的 env.CLAUDE_CODE_MAX_OUTPUT_TOKENS 判定 → settings.maxOutputTokens 单源
-        //   （AnthropicSdkProvider.readSettingsMaxOutputTokens）。无 Spring 上下文 → null → 等价"未配置"。
+        //   gate 开启 && override===undefined → 升级；否则走多轮续写。
+        //   ⚠️ 2026-11-12 撤掉 settings.maxOutputTokens 抑制条件：该设置项已从配置面移除，
+        //   输出上限唯一入口 = models.max_tokens（模型配置页「生成参数 · max tokens」）。
         //   [ER-IMP-07 / DC-22] 升级判定从 RecoveryState.hasEscalated 粘性字段改为
         //   override===undefined re-arm（CC query.ts:1201）：升级后 override=64k（LlmAgentLoop
         //   注入），续写后回落 undefined，天然 re-arm —— 比 Java 粘性一次更贴近 CC。
-        Integer settingsOverride = settingsOverrideProvider.get();
-        boolean canEscalate = tenguOtkSlotV1Enabled
-            && maxOutputTokensOverride == null
-            && settingsOverride == null;
+        boolean canEscalate = tenguOtkSlotV1Enabled && maxOutputTokensOverride == null;
         if (canEscalate) {
             // 路径 1a: 首次截断 + gate 开启 → 升级 max_tokens（不追加消息）
             return escalate(state);
@@ -102,11 +78,6 @@ public class MaxTokensHandler {
         if (!tenguOtkSlotV1Enabled) {
             log.info("MaxTokensHandler: tengu_otk_slot_v1 gate 关闭, 跳过 64k 升级, 直走多轮续写 (≤{}) · CC query.ts:1199",
                 QueryConstants.MAX_OUTPUT_TOKENS_RECOVERY_LIMIT);
-        } else if (settingsOverride != null) {
-            // [E4-C] 数据流日志：settings.maxOutputTokens override 已配置 → 抑制 64k 升级（CC query.ts:1199-1203
-            //   同读 env 判定"无 override 前置"，F1 迁移后 Java 读 settings 单源）
-            log.info("MaxTokensHandler: settings.maxOutputTokens override 已配置={}, 抑制 64k 升级, 直走多轮续写 (≤{}) · CC query.ts:1202 · E4-C",
-                settingsOverride, QueryConstants.MAX_OUTPUT_TOKENS_RECOVERY_LIMIT);
         }
 
         if (state.getContinuationCount() >= QueryConstants.MAX_OUTPUT_TOKENS_RECOVERY_LIMIT) {

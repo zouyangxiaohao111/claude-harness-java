@@ -5,6 +5,7 @@ import com.nexusai.application.agent.context.ClaudemdEngine;
 import com.nexusai.application.agent.context.ClaudemdMemoryType;
 import com.nexusai.application.agent.context.MemoryFileInfo;
 import com.nexusai.application.agent.memory.ConsolidationLock;
+import com.nexusai.application.agent.memory.MemoryEntryStore;
 import com.nexusai.application.agent.memory.MemoryStorage;
 import com.nexusai.application.agent.skill.BundledSkillEnabledGates;
 import com.nexusai.application.agent.skill.ClaudePaths;
@@ -15,11 +16,15 @@ import com.nexusai.infra.exception.ForbiddenException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.fasterxml.jackson.annotation.JsonInclude;
+import com.nexusai.model.memory.dto.MemoryEntryDetailDto;
+import com.nexusai.model.memory.dto.MemoryEntrySummaryDto;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.MediaType;
+import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
+import org.springframework.web.bind.annotation.PathVariable;
 import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
@@ -84,6 +89,10 @@ public class MemoryController {
      *  装配（ToolRegistrationConfig.memoryStorage），required=false 容错单测反射注入。 */
     @Autowired(required = false)
     private MemoryStorage memoryStorage;
+
+    /** 记忆条目 CRUD（UI 用 · 只操作单条 .md，永不碰 MEMORY.md）。 */
+    @Autowired(required = false)
+    private MemoryEntryStore memoryEntryStore;
     /** 遥测发射器（CC logEvent 等价 · Telemetry.recordEvent）· @Autowired(required=false) 容错
      *  单测不注入（null → 静默跳过，对齐 CC logEvent 可空上下文惯例）。 */
     @Autowired(required = false)
@@ -210,6 +219,133 @@ public class MemoryController {
      * User 档记忆文件（决策 D1：nexusai 自有根）：{@code ~/.{appName}/CLAUDE.md}。
      * 写 nexusai、不写 claude；读缺失时由调用方回落 {@code ~/.claude/CLAUDE.md}（兼容读）。
      */
+    // ════════════════════════════════════════════════════════════════
+    // 记忆条目 CRUD（/memory 编辑器左列表用）
+    //
+    // WHY 单独一组端点而非复用 /files：/files 是「指令文件三档」（Managed/User/Project），
+    //   白名单来自 ClaudemdEngine.getMemoryFiles 的 PROJECT 条目 —— 记忆条目（memory/*.md）
+    //   不在其中，PUT /files 写不了它们。这组端点直接走 MemoryEntryStore（条目级 + 路径校验）。
+    //
+    // ⛔ 本组端点永不读写 MEMORY.md（索引由模型维护，见 MemoryEntryStore 类注释）。
+    // ════════════════════════════════════════════════════════════════
+
+    /**
+     * 列出记忆条目（不含正文）· GET /api/v1/memory/entries?sessionId=。
+     *
+     * @param sessionIdParam query {@code ?sessionId=}（必填 —— 记忆目录是 per-project）
+     * @return 条目摘要列表（mtime 降序）；无绑定项目 → 空列表
+     */
+    @GetMapping(value = "/entries", produces = MediaType.APPLICATION_JSON_VALUE)
+    public List<MemoryEntrySummaryDto> listEntries(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
+        String sessionId = requireSession(sessionIdParam, "GET /memory/entries");
+        MemoryEntryStore store = resolveEntryStore();
+        List<MemoryEntrySummaryDto> list = store.list(sessionId);
+        if (log.isDebugEnabled()) {
+            log.debug("[MemoryController] GET /memory/entries: session={} 条数={}", sessionId, list.size());
+        }
+        return list;
+    }
+
+    /**
+     * 读取单条记忆详情（含正文）· GET /api/v1/memory/entries/{file}?sessionId=。
+     *
+     * @param file           条目文件名（单层 .md；含分隔符 / .. → 400）
+     * @param sessionIdParam query {@code ?sessionId=}（必填）
+     * @return 详情
+     */
+    @GetMapping(value = "/entries/{file}", produces = MediaType.APPLICATION_JSON_VALUE)
+    public MemoryEntryDetailDto getEntry(
+            @PathVariable("file") String file,
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam) {
+        String sessionId = requireSession(sessionIdParam, "GET /memory/entries/{file}");
+        try {
+            return resolveEntryStore().detail(sessionId, file);
+        } catch (IllegalArgumentException e) {
+            log.warn("[MemoryController] GET /memory/entries/{} 拒绝: {}", file, e.getMessage());
+            throw new ValidationException(e.getMessage());
+        }
+    }
+
+    /**
+     * 覆盖写单条记忆 · PUT /api/v1/memory/entries?sessionId=，body {@code {file, content}}。
+     *
+     * <p>⚠️ 只写这一个 .md，<b>不改 MEMORY.md</b>（索引由模型维护）。
+     *
+     * @param sessionIdParam query {@code ?sessionId=}（必填）
+     * @param request        {@code {file, content}}
+     * @return 写入后的详情
+     */
+    @PutMapping(value = "/entries", consumes = MediaType.APPLICATION_JSON_VALUE,
+        produces = MediaType.APPLICATION_JSON_VALUE)
+    public MemoryEntryDetailDto saveEntry(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestBody(required = false) MemoryEntrySaveRequest request) {
+        String sessionId = requireSession(sessionIdParam, "PUT /memory/entries");
+        if (request == null || request.file() == null || request.file().isBlank()) {
+            throw new ValidationException("file is required");
+        }
+        if (request.content() == null) {
+            throw new ValidationException("content is required");
+        }
+        MemoryEntryStore store = resolveEntryStore();
+        try {
+            store.write(sessionId, request.file(), request.content());
+            return store.detail(sessionId, request.file());
+        } catch (IllegalArgumentException e) {
+            log.warn("[MemoryController] PUT /memory/entries 拒绝: {}", e.getMessage());
+            throw new ValidationException(e.getMessage());
+        }
+    }
+
+    /**
+     * 删除单条记忆 · DELETE /api/v1/memory/entries?sessionId=&amp;file=。
+     *
+     * <p>⚠️ <b>不删 MEMORY.md 里指向它的那一行</b>（索引由模型维护）—— 残留索引行由 UI 提示用户处理。
+     *
+     * @param sessionIdParam query {@code ?sessionId=}（必填）
+     * @param file           条目文件名（单层 .md）
+     * @return {@code {deleted:true, file:...}}
+     */
+    @DeleteMapping(value = "/entries", produces = MediaType.APPLICATION_JSON_VALUE)
+    public java.util.Map<String, Object> deleteEntry(
+            @RequestParam(value = "sessionId", required = false) String sessionIdParam,
+            @RequestParam(value = "file", required = false) String file) {
+        String sessionId = requireSession(sessionIdParam, "DELETE /memory/entries");
+        MemoryEntryStore store = resolveEntryStore();
+        try {
+            store.delete(sessionId, file);
+        } catch (IllegalArgumentException e) {
+            log.warn("[MemoryController] DELETE /memory/entries 拒绝: {}", e.getMessage());
+            throw new ValidationException(e.getMessage());
+        }
+        return java.util.Map.of("deleted", true, "file", file == null ? "" : file);
+    }
+
+    /** sessionId 必填校验（本组端点全部依赖 per-project 记忆目录）。 */
+    private String requireSession(String sessionIdParam, String api) {
+        if (sessionIdParam == null || sessionIdParam.isBlank()) {
+            log.warn("[MemoryController] {} 缺少会话标识 ?sessionId= → 400", api);
+            throw new ValidationException("sessionId is required (" + api + ")");
+        }
+        return sessionIdParam;
+    }
+
+    /** MemoryEntryStore 兜底解析（@Autowired 未触发时 fail loud，不静默返回空）。 */
+    private MemoryEntryStore resolveEntryStore() {
+        MemoryEntryStore store = memoryEntryStore;
+        if (store == null) {
+            throw new IllegalStateException(
+                "[MemoryController] MemoryEntryStore 未注入 —— 检查组件扫描是否包含 "
+                    + "com.nexusai.application.agent.memory");
+        }
+        return store;
+    }
+
+    /** PUT /memory/entries 请求体。 */
+    public record MemoryEntrySaveRequest(String file, String content) {
+    }
+
     private static Path userMemoryPath() {
         return Paths.get(NexusaiPaths.getAppConfigHomeDir(), "CLAUDE.md");
     }

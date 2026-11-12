@@ -46,6 +46,12 @@ import java.util.Objects;
  * @param requestId    [RF-1] 父 assistant message 的 API request_id（CC original:
  *                     assistantMessage.requestId, AgentTool.tsx:723/:778；nullable，流式
  *                     provider 未捕获 request_id 时 null）
+ * @param thinkingSignature [thinking-passthrough] thinking 块的 signature（CC original:
+ *                     {@code {type:'thinking', thinking, signature}} 块的 signature 字段）。
+ *                     Anthropic 协议要求 thinking 模式继续工具调用时原样回传上一轮 thinking 块；
+ *                     signature 由上游签发（流式 = signature_delta 事件，非流式 = block.signature）。
+ *                     null/空 = 上游未给签名（第三方兼容端点常见）——回传时按空心块发送，
+ *                     DeepSeek 实测接受；真 Claude 会校验（届时走 400 兜底链）。
  */
 public record AssistantMessage(
     String content,
@@ -54,7 +60,8 @@ public record AssistantMessage(
     String reasoning,
     String apiError,
     AgentUsage usage,
-    String requestId
+    String requestId,
+    String thinkingSignature
 ) {
 
     public AssistantMessage {
@@ -71,7 +78,13 @@ public record AssistantMessage(
      *  AnthropicSdkProvider / OpenAiSdkProvider / MockLlmProvider 等流式/非流式构建点）。 */
     public AssistantMessage(String content, String finishReason, List<ToolUseBlock> toolCalls,
                             String reasoning, String apiError, AgentUsage usage) {
-        this(content, finishReason, toolCalls, reasoning, apiError, usage, null);
+        this(content, finishReason, toolCalls, reasoning, apiError, usage, null, null);
+    }
+
+    /** 7-arg 兼容构造器（thinkingSignature=null · 保留既有 (…usage, requestId) 形状的调用方）。 */
+    public AssistantMessage(String content, String finishReason, List<ToolUseBlock> toolCalls,
+                            String reasoning, String apiError, AgentUsage usage, String requestId) {
+        this(content, finishReason, toolCalls, reasoning, apiError, usage, requestId, null);
     }
 
     /**

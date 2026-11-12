@@ -294,8 +294,7 @@ class WebSearchToolTest {
         SettingsService settingsService = mock(SettingsService.class);
         when(settingsService.get()).thenReturn(new SettingsDto(
                 null, null, null, null,
-                null, null, null, null, null, null,
-                null, null, null, null, null,
+                null, null, null, null, null, null, null, null, null, null,
                 null, null, null, null,
                 null, null, "proxy.example.com:8080", null, null,
                 null,

@@ -159,6 +159,24 @@ public class KnowledgeService {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.nexusai.kb.app.profile.KbProfileTrigger profileTrigger;
 
+    /**
+     * 短事务模板（可选注入；生产 bean = MyBatis-Flex 的 {@code FlexTransactionManager}）。
+     *
+     * <p><b>WHY 需要它（而不是 {@code @Transactional}）</b>：上传落库要能在
+     * {@code SQLITE_BUSY_SNAPSHOT} 时<b>换新事务重试</b> —— 同一事务内重试拿不到新读快照，
+     * 重试恒失败。{@link com.nexusai.application.agent.compact.SqliteBusyRetry} 的契约就是
+     * 「每次尝试经 {@code TransactionTemplate} 开新事务」，故此处持有模板。
+     *
+     * <p>{@code null} 只出现在「直接 new 出来的单测/脚本」⇒ 直调（无事务语义）。
+     */
+    private org.springframework.transaction.support.TransactionTemplate txTemplate;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setTransactionManager(
+        org.springframework.transaction.PlatformTransactionManager transactionManager) {
+        this.txTemplate = new org.springframework.transaction.support.TransactionTemplate(transactionManager);
+    }
+
     public KnowledgeService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -202,7 +220,6 @@ public class KnowledgeService {
      * @param metadataJson    元数据 JSON（可空）
      * @return 创建后的知识条目
      */
-    @Transactional
     public KnowledgeDto createFromFile(
         String knowledgeBaseId, String fileName, InputStream content,
         Path storageDir, String metadataJson
@@ -241,13 +258,55 @@ public class KnowledgeService {
             throw new IllegalStateException("SHA-256 不可用", e);
         }
 
+        // ── 落库段：**短事务 + SQLITE_BUSY 重试** ────────────────────────────
+        // ⭐ 事务必须只包「查重 → INSERT → 入队」这三件（毫秒级）。
+        //    ⛔ 上面那步「100MB 落盘 + 边写边算 SHA-256」绝不能包进事务 ——
+        //    2026-11-12 15:15 实测：4 个 PDF 只落了 2 个。机制是
+        //    ① 事务第一句 SELECT（requireKnowledgeBase）就拿住了 WAL 读快照；
+        //    ② 接着花 ~540ms 落盘 + 哈希（不写库，但事务开着）；
+        //    ③ 同窗口解析 worker 提交任意一次写（认领任务 / 写 chunk）；
+        //    ④ 随后的 INSERT 必然 SQLITE_BUSY_SNAPSHOT —— SQLite 不允许把过期读快照
+        //       升级成写事务，JDBC 的 busy_timeout 对它无效 ⇒ 整个请求 500、行没插进去。
+        //    ⇒ 把慢 IO 挪出事务后，窗口从数百毫秒降到毫秒级；剩下的极小概率冲突由
+        //      SqliteBusyRetry 换新事务重试（BUSY_SNAPSHOT 只能整事务重来）。
+        final String hashFinal = hash;
+        final long sizeFinal = size;
+        final String nameFinal = safeName;
+        final String extFinal = ext;
+        final Path savedFinal = saved;
+        java.util.function.Supplier<KnowledgeDto> write = () ->
+            insertNewFileKnowledge(kb, knowledgeBaseId, id, nameFinal, extFinal, sizeFinal,
+                hashFinal, savedFinal, fileName);
+        try {
+            if (txTemplate == null) {
+                // 仅「直接 new 出来」的单测/脚本会走到这里（无事务管理器）⇒ 直调
+                return write.get();
+            }
+            return com.nexusai.application.agent.compact.SqliteBusyRetry.executeInTxWithBusyRetry(
+                "[知识] 创建文件知识", txTemplate, write, null);
+        } catch (RuntimeException e) {
+            // 行没落成 ⇒ 刚落的盘是孤儿文件，删掉（重复 / 重试耗尽 / 其它失败都走这里）
+            deleteQuietly(saved);
+            throw e;
+        }
+    }
+
+    /**
+     * 落库段 · 查重 + INSERT + 入队。
+     *
+     * <p>★ 必须与 {@code createFromFile} 的落盘/哈希<b>分开</b>：本方法只做 DB 写，
+     * 由 {@code SqliteBusyRetry} 在<b>新事务</b>里执行（BUSY_SNAPSHOT 只能整事务重来）。
+     */
+    private KnowledgeDto insertNewFileKnowledge(
+        KbKnowledgeBaseRecord kb, String knowledgeBaseId, String id, String safeName,
+        String ext, long size, String hash, Path saved, String fileName
+    ) {
         // 同库内同 hash ⇒ 重复（源侧 409 DuplicateFile）
         List<KbKnowledgeRecord> same = knowledgeMapper.selectListByQuery(
             QueryWrapper.create()
                 .where("knowledge_base_id = ?", knowledgeBaseId)
                 .and("file_hash = ?", hash));
         if (!same.isEmpty()) {
-            deleteQuietly(saved);
             KbKnowledgeRecord existing = same.get(0);
             throw new ConflictException(
                 "文件已存在（同名同内容）: " + existing.getTitle() + "（id=" + existing.getId() + "）");

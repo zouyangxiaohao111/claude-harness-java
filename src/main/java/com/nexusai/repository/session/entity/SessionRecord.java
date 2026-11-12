@@ -43,10 +43,15 @@ public class SessionRecord {
     private Integer bareMode;
     /**
      * 会话级禁用工具集合（V34 列 disabled_tools，TEXT JSON 数组，如 ["Bash","WebSearch"]）·
-     * 待前端对接 §29「点 × 临时禁用 → 该工具从模型 schema 移除，会话内生效」——CC 无内置机制
+     * 前端「点 × 临时禁用 → 该工具从模型 schema 移除，会话内生效」——CC 无内置机制
      * （G24 用户拍板），Java 端复刻 CC blanket deny 的 schema 阶段剔除效果（tools.ts:262-269）。
-     * 可空：null = 未禁用；空集合 → 存 null（读回空集合）。JSON 序列化走 fastjson2
-     * （SessionService.get/setDisabledTools，对齐 MessageService serializeMap/parseMap 通道）。
+     *
+     * <p><b>三态（[tool-categories] 2026-11-12）</b>：{@code null} = 该会话从未设置
+     * （读侧按默认禁用推断：电脑操作 + 知识库）；{@code "[]"} = 用户显式全部启用；
+     * 非空数组 = 该集合中的工具被禁用。空集合<b>必须</b>存 {@code "[]"} 而非 null，
+     * 否则用户把默认禁用项全部打开后会被读侧重新判成禁用。
+     * JSON 序列化走 fastjson2（SessionService.get/setDisabledTools，对齐
+     * MessageService serializeMap/parseMap 通道）。
      */
     private String disabledTools;
     /**
@@ -230,8 +235,17 @@ public class SessionRecord {
      */
     private Integer kbToolsEnabled = 0;
 
+    /**
+     * 左栏置顶标记（V283 列 pinned，三态可空）。
+     * 1 = 置顶；0 = 显式取消；null = 未设置（读侧按未置顶处理）。
+     * 置顶排序只在前端展示层做，后端 {@code list()} 的 ORDER BY 不变。
+     */
+    private Integer pinned;
+
     public Integer getKbToolsEnabled() { return kbToolsEnabled; }
     public void setKbToolsEnabled(Integer v) { this.kbToolsEnabled = v; }
+    public Integer getPinned() { return pinned; }
+    public void setPinned(Integer pinned) { this.pinned = pinned; }
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }

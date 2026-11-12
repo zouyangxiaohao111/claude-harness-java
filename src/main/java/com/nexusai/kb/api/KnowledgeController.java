@@ -1,11 +1,18 @@
 package com.nexusai.kb.api;
 
+import com.mybatisflex.core.query.QueryWrapper;
+import com.nexusai.kb.api.dto.KnowledgeSpansDto;
+import com.nexusai.kb.app.ingest.span.KbSpanTracker;
+import com.nexusai.kb.app.ingest.span.KbSpanTreeBuilder;
 import com.nexusai.kb.domain.KnowledgeService;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.kb.dto.HybridSearchRequest;
 import com.nexusai.kb.dto.KnowledgeDto;
 import com.nexusai.kb.dto.KnowledgePageResponse;
 import com.nexusai.kb.dto.SearchResultDto;
+import com.nexusai.kb.repo.entity.KbProcessingSpanRecord;
+import com.nexusai.kb.repo.mapper.KbIngestTaskMapper;
+import com.nexusai.kb.repo.mapper.KbProcessingSpanMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -46,8 +53,9 @@ import java.util.List;
  *
  * <p><b>未实现的端点及原因</b>（依赖后续批次）：
  * 手工/URL 创建（需 B6 摘要与抓取）、批量操作（需跨行事务语义确认）、
- * download/preview（需对象存储抽象）、spans（需 B6 span 表）、文件夹树（需 B9）、
+ * download/preview（需对象存储抽象）、文件夹树（需 B9）、
  * tags（需 B9）、images（需 B6）、hybrid-search（需 B3）。
+ * （{@code spans} 已在 Trace 批 2 实现，见 {@link #spans}。）
  */
 @RestController
 public class KnowledgeController {
@@ -59,12 +67,36 @@ public class KnowledgeController {
      *
      * <p>⚠️ 刻意做成可配置而不是写死：单机默认落在配置根下，测试与多实例部署可覆盖。
      */
-    @org.springframework.beans.factory.annotation.Value(
-        "${nexusai.knowledge.storage-dir:${user.home}/.nexusai/kb-storage}")
+    @org.springframework.beans.factory.annotation.Value("${nexusai.knowledge.storage-dir:}")
     private String storageDir;
+
+    /** [data-root] 未显式配置 ⇒ 统一数据根（安装目录优先，configHome 兜底）；与 LocalFileStorage 同源。 */
+    @jakarta.annotation.PostConstruct
+    void initStorageDir() {
+        if (storageDir == null || storageDir.isBlank()) {
+            storageDir = com.nexusai.common.NexusaiDataRoots.sub("kb-storage").toString();
+        }
+    }
 
     @Autowired
     private KnowledgeService knowledgeService;
+
+    /**
+     * span 树写入口（trace 观测层）。
+     *
+     * <p>{@code required = false}：精简装配（单测直构 controller）下缺失 ⇒ 端点
+     * 降级成「无 trace」（五个 stage 全 pending 占位），而不是启动失败。
+     */
+    @Autowired(required = false)
+    private KbSpanTracker spanTracker;
+
+    /** span 行查询（端点自己查整棵树；缺省 ⇒ 视为「库无 span 行」）。 */
+    @Autowired(required = false)
+    private KbProcessingSpanMapper spanMapper;
+
+    /** 入库任务队列查询（仅用于 stalled / queued 的判别；缺省 ⇒ 只给 stalled）。 */
+    @Autowired(required = false)
+    private KbIngestTaskMapper ingestTaskMapper;
 
     /**
      * 从文件创建知识（multipart）。
@@ -161,6 +193,81 @@ public class KnowledgeController {
         knowledgeService.cancelParse(id);
         log.info("[知识API] POST /api/v1/knowledge/{}/cancel-parse → 已取消", id);
         return ResponseEntity.noContent().build();
+    }
+
+    /**
+     * 处理阶段 span 树 · 对齐源侧 {@code GET /knowledge/{id}/spans}。
+     *
+     * <p><b>源侧把 {@code /spans} 与 {@code /stages} 两个路径挂到同一 handler</b>
+     * （{@code routes_knowledge.go:132-133}）⇒ 本仓用<b>一个注解多路径</b>等价实现
+     * （⛔ 不是两个 mapping 注解 —— 那样第二个会被 Spring 静默丢弃）。
+     *
+     * <p><b>attempt 选择</b>（源站同款）：显式 {@code ?attempt=N} 优先；否则取 span 表里
+     * 最新的 attempt。完全没有 span 行时 attempt=0，仍返回「五段全 pending」的占位树，
+     * 前端照常渲染。
+     *
+     * <p>响应 JSON 键名是 <b>snake_case</b>（{@link KnowledgeSpansDto} 里逐字锁定）。
+     *
+     * @param id      知识条目 ID（不存在 ⇒ 404，由 {@link KnowledgeService#getById} 抛）
+     * @param attempt 指定 attempt（可空）
+     * @return span 树 + 派生状态
+     */
+    @GetMapping({"/api/v1/knowledge/{id}/spans", "/api/v1/knowledge/{id}/stages"})
+    public KnowledgeSpansDto spans(
+        @PathVariable String id,
+        @RequestParam(value = "attempt", required = false) Integer attempt
+    ) {
+        KnowledgeDto knowledge = knowledgeService.getById(id);
+        int latestAttempt = spanTracker == null ? 0 : spanTracker.latestAttempt(id);
+        int currentAttempt = attempt != null && attempt > 0 ? attempt : latestAttempt;
+
+        List<KbProcessingSpanRecord> rows = List.of();
+        if (spanMapper != null && currentAttempt > 0) {
+            List<KbProcessingSpanRecord> queried = spanMapper.selectListByQuery(QueryWrapper.create()
+                .where("knowledge_id = ?", id)
+                .and("attempt = ?", currentAttempt)
+                .orderBy("id", true));
+            if (queried != null) {
+                rows = queried;
+            }
+        }
+
+        KbSpanTreeBuilder.Built built = KbSpanTreeBuilder.build(
+            id, currentAttempt, rows, knowledge.parseStatus(), knowledge.errorMessage(),
+            knowledge.updatedAt(), hasQueuedIngestWork(id), java.time.LocalDateTime.now());
+
+        return new KnowledgeSpansDto(
+            id, currentAttempt, latestAttempt, knowledge.parseStatus(), currentAttempt,
+            built.currentStage(), built.trace(), built.lastActivityAt(),
+            built.stallState(), built.lastError());
+    }
+
+    /**
+     * 该文件是否还有排队 / 执行中的入库任务。
+     *
+     * <p>用途：区分「排队中（queued）」与「卡住（stalled）」—— 源站用 housekeeping 的
+     * {@code QueuedWork} 探针（含 asynq 待消费任务）；本仓没有 asynq，等价物就是
+     * {@code kb_ingest_task} 里还有 {@code queued/running} 的行。
+     *
+     * <p>⚠️ 查询失败 ⇒ 返回 false（给 stalled），与源站「探针不可用 ⇒ 不给判定」的区别：
+     * 本仓只在已经超过 20 分钟无活动时才走到这里，此时「没看到排队任务」信息量足够。
+     *
+     * @param knowledgeId 知识条目 ID
+     * @return true = 仍有排队/执行中的入库任务
+     */
+    private boolean hasQueuedIngestWork(String knowledgeId) {
+        if (ingestTaskMapper == null) {
+            return false;
+        }
+        try {
+            long count = ingestTaskMapper.selectCountByQuery(QueryWrapper.create()
+                .where("knowledge_id = ?", knowledgeId)
+                .and("state IN ('queued', 'running')"));
+            return count > 0;
+        } catch (RuntimeException e) {
+            log.warn("[知识API] 查询入库队列状态失败 knowledge={} 原因={}", knowledgeId, e.getMessage());
+            return false;
+        }
     }
 
     /**

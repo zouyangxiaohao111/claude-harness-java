@@ -476,8 +476,8 @@ export interface AppSettings {
   /** 流空闲超时（毫秒；stream_idle_timeout_ms 列 V78）：超过该时长没有任何输出时自动中断；
    *  留空=默认 300000（5 分钟）；有效下限 300000（低于下限会被抬到 300s）。「通用」页可配。 */
   streamIdleTimeoutMs?: number | null
-  /** 输出 token 上限（V27 max_output_tokens）：>0 生效、> 模型上限封顶、null 用模型默认 */
-  maxOutputTokens: number | null
+  // 2026-11-12 删除 maxOutputTokens：V285 DROP 列；输出上限唯一入口 =
+  // 模型配置页「生成参数 · max tokens」（models.max_tokens）
   /** 回落模型全名（V28 RENAME fallback_model_name） */
   fallbackModelName: string | null
   // 0.4.0 新增档位（使用先不使用 · 后端 settings 列 multimodal/tts/asr_model_name）
@@ -786,6 +786,8 @@ export interface SessionDto {
   /** [V101] 会话累计缓存命中率（**0-1 比率** · 后端由 `sessions.model_usage_json` 派生，与 usage 记账同源）·
    *  底部「X%（累计）」的**重拉回退源**（实时优先用 complete 事件透传值）；无数据 = null → 不渲染，⛔ 不臆造 0。 */
   cacheHitRate?: number | null
+  /** [V283] 左栏置顶标记 · true = 置顶（排在最前独立置顶区）；false/null = 未置顶 */
+  pinned?: boolean | null
 }
 export type SessionGroup = 'current' | 'today' | 'yesterday' | 'week'
 
@@ -1104,7 +1106,7 @@ export interface CreateTeamRequest {
 /** 会话创建请求 · mainProjectId 必填（后端 @NotBlank）：空串/null 一律 400，不产生「未绑定会话」 */
 export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId: string }
 /** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
-export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null }
+export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null; /** V283 左栏置顶 · true=置顶，false=取消，不传=不改动 */ pinned?: boolean | null }
 /** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */
 export interface AgentListItem {
   agentType: string
@@ -1321,17 +1323,28 @@ export interface TodoUpdateEvent {
 }
 
 // ---- 会话工具（GET/PATCH /sessions/{id}/tools · 会话级临时禁用）----
+/** 工具分类（后端 SessionToolCategory.of 判定 · 前端只消费不推导） */
+export type SessionToolCategory = 'CU' | 'KB' | 'BR' | 'SYS'
 /** 单个会话工具状态（对齐后端 SessionToolDto · 被禁工具仍在列表，disabled=true 供恢复） */
 export interface SessionToolDto {
   /** 工具名（如 Bash/Read/Agent · PATCH 路径段） */
   name: string
   /** 展示名（如「Bash（终端）」） */
   userFacingName: string
+  /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / SYS=系统工具 */
+  category: SessionToolCategory
+  /** 工具描述原文（后端不截断 · 前端按行数截断展示） */
+  description: string
   /** 是否已禁用（bare 模式仅 Bash/Read/Edit 可见） */
   disabled: boolean
 }
 /** PATCH /sessions/{id}/tools/{toolName} 请求体（注意非 toggle，enabled=false 禁用 / true 恢复） */
 export interface SessionToolPatchRequest {
+  enabled: boolean
+}
+/** PATCH /sessions/{id}/tools 请求体（按分类批量启用/禁用 · 返回整表） */
+export interface SessionToolCategoryToggleRequest {
+  category: SessionToolCategory
   enabled: boolean
 }
 

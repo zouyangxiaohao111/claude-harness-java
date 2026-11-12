@@ -63,15 +63,31 @@ public record KbPostProcessConfig(
      * @param modelId            问句模型（空 = 继承摘要模型）
      * @param questionCount      每块生成几条（1..10）
      * @param customInstructions 额外指令（可空）
-     * @param embeddingModelId   知识库的嵌入模型（空 ⇒ 不能跑）
+     * @param indexingReady      知识库的索引策略是否要求嵌入（`vector_enabled || keyword_enabled`）
      */
     public record QuestionGeneration(
         boolean enabled, String modelId, int questionCount,
-        String customInstructions, String embeddingModelId
+        String customInstructions, boolean indexingReady
     ) {
-        /** 是否真的可以跑（开关 + 有嵌入模型）。 */
+        /**
+         * 是否真的可以跑（开关 ∧ 索引策略要求嵌入）。
+         *
+         * <p>⭐ <b>判据对齐源站</b> {@code knowledge_post_process.go:217}：
+         * <pre>willSpawnQuestion = len(textChunks) &gt; 0 &amp;&amp; kb.NeedsEmbeddingModel() &amp;&amp; Enabled</pre>
+         * 而 {@code NeedsEmbeddingModel()} = {@code IndexingStrategy.NeedsEmbedding()}
+         * = <b>{@code VectorEnabled || KeywordEnabled}</b>（{@code indexing_strategy.go:34-36}）。
+         *
+         * <p>⛔ <b>不能判「embedding_model_id 非空」</b>：本仓曾这么写，2026-11-12 实测——
+         * 一个 {@code vector_enabled/keyword_enabled} 全开、只是没配嵌入模型的知识库里
+         * （「合同库测试」babed158），点「辅助召回问题」后端 18ms 返回
+         * {@code SKIPPED / question_no_indexing}、一条都不生成；而按源站口径它<b>应该</b>生成
+         * （问句写进 chunk metadata，索引由 FTS 兜底即可，索引层本就支持无嵌入模型）。
+         *
+         * <p>⚠️ 与同文件摘要那条（见 {@code resolve} 里 {@code true} 的注释）是同一类错误的两个实例：
+         * <b>把「依赖就绪」写进派发判据 ⇒ 静默不执行，用户只看到「点了没反应」</b>。
+         */
         public boolean runnable() {
-            return enabled && embeddingModelId != null && !embeddingModelId.isBlank();
+            return enabled && indexingReady;
         }
     }
 
@@ -125,7 +141,7 @@ public record KbPostProcessConfig(
 
     /** 全部关闭（单测 / 兜底用）。 */
     public static final KbPostProcessConfig NONE = new KbPostProcessConfig(
-        false, "", new QuestionGeneration(false, "", DEFAULT_QUESTION_COUNT, "", ""),
+        false, "", new QuestionGeneration(false, "", DEFAULT_QUESTION_COUNT, "", false),
         new AutoTag(false, "", DEFAULT_MAX_TAGS, true), false, "", false,
         new ImageUnderstanding(false, ""));
 
@@ -216,7 +232,7 @@ public record KbPostProcessConfig(
             true,
             summaryModel,
             new QuestionGeneration(qEnabled, qModel, qCount,
-                trim(text(q, "custom_instructions")), trim(kb.getEmbeddingModelId())),
+                trim(text(q, "custom_instructions")), questionIndexingReady(kb)),
             new AutoTag(tEnabled, tModel, tMax, skipIfTagged),
             // ⭐ Wiki 是否「可执行」= 开关开着 **且** 有模型。
             //    只判开关的话，没配模型的知识库也会派发一个必然 skip 的 Wiki 任务，
@@ -273,6 +289,31 @@ public record KbPostProcessConfig(
         }
         JsonNode extract = parse(kb.getExtractConfig(), "extract_config");
         return bool(extract, "enabled", false);
+    }
+
+    /**
+     * 问句生成的前提之一：索引策略是否「要求嵌入」。
+     *
+     * <p>⭐ 对齐源站 {@code NeedsEmbeddingModel()}（{@code knowledgebase.go:1021-1023}）
+     * = {@code IndexingStrategy.NeedsEmbedding()}（{@code indexing_strategy.go:34-36}）
+     * = <b>{@code VectorEnabled || KeywordEnabled}</b>。
+     *
+     * <p>⚠️ <b>不是</b>「{@code embedding_model_id} 非空」—— 那一条本仓曾用在
+     * {@link QuestionGeneration#runnable()} 里，2026-11-12 实测导致
+     * 「索引策略全开但没配嵌入模型」的知识库点「辅助召回问题」时静默跳过。
+     *
+     * <p>⚠️ fail-soft：配置缺失 / 坏 JSON ⇒ false（按「未配置」处理，与源站结构体零值同口径）。
+     *
+     * @param kb 知识库行
+     * @return true = 向量索引或关键词索引至少开了一个
+     */
+    public static boolean questionIndexingReady(KbKnowledgeBaseRecord kb) {
+        if (kb == null) {
+            return false;
+        }
+        JsonNode strategy = parse(kb.getIndexingStrategy(), "indexing_strategy");
+        return bool(strategy, "vector_enabled", false)
+            || bool(strategy, "keyword_enabled", false);
     }
 
     // ── JSON 小工具（全部 fail-soft：坏配置按「未配置」处理，不让整个入库失败）──

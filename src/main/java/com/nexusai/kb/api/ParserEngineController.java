@@ -4,7 +4,6 @@ import com.nexusai.kb.app.parser.KbParserRegistry;
 import com.nexusai.kb.app.parser.ParserEngineInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.RequestMapping;
 import org.springframework.web.bind.annotation.RestController;
@@ -29,10 +28,11 @@ import java.util.Map;
  * {@code docreader_addr}、{@code docreader_transport}、{@code msg} 本仓<b>没有</b>对应设施（无 docreader 服务），
  * 故不输出，⛔ 不编造占位值。
  *
- * <p><b>本仓只有 3 个解析器</b>（PDF / Office / 文本兜底），全部可用；源侧另有
- * {@code simple}/{@code anydoc}/{@code weknoracloud}/{@code mineru}/{@code mineru_cloud}/
- * {@code paddleocr_vl}/{@code paddleocr_vl_cloud}/{@code markitdown}/{@code opendataloader}，
- * 本仓均未实现，故不会出现在响应里。
+ * <p><b>可用性从哪来</b>：注册表在 {@link KbParserRegistry#describeEngines()} 里逐条问解析器 ——
+ * 实现了 {@code SelfDescribingAvailability} 的解析器自报 {@code isAvailable()} 与
+ * {@code unavailableReason()}（如 anydoc 依赖随包原生库、paddleocr_vl 依赖外部服务地址），
+ * 未实现的按「恒可用」处理。故 {@code Available}/{@code UnavailableReason} 是真实能力，
+ * ⛔ 不是写死的常量。
  */
 @RestController
 @RequestMapping("/api/v1/system")
@@ -40,8 +40,16 @@ public class ParserEngineController {
 
     private static final Logger log = LoggerFactory.getLogger(ParserEngineController.class);
 
-    @Autowired
-    private KbParserRegistry parserRegistry;
+    private final KbParserRegistry parserRegistry;
+
+    /**
+     * 构造注入 · Spring 单构造器自动装配；单测可直接 {@code new ParserEngineController(registry)}（不启 Spring）。
+     *
+     * @param parserRegistry 解析器注册表（唯一持有 {@code @Order} 排序结果）
+     */
+    public ParserEngineController(KbParserRegistry parserRegistry) {
+        this.parserRegistry = parserRegistry;
+    }
 
     /** 解析引擎清单 · 供前端渲染各文件类型的引擎下拉。 */
     @GetMapping("/parser-engines")

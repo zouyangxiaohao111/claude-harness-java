@@ -158,8 +158,9 @@ public class SettingsService {
         if (req.mediumModelName() != null) s.setMediumModelName(req.mediumModelName());
         if (req.strongModelName() != null) s.setStrongModelName(req.strongModelName());
         if (req.subagentModelName() != null) s.setSubagentModelName(req.subagentModelName());
-        // [F1] max output tokens 有界 override merge（null = 不覆盖；CC envValidation.ts:9-38 迁移）
-        if (req.maxOutputTokens() != null) s.setMaxOutputTokens(req.maxOutputTokens());
+        // ⚠️ 2026-11-12 max_output_tokens 已废弃：输出上限唯一入口 = 模型配置页
+        //   「生成参数 · max tokens」（models.max_tokens）。本设置项不再参与 max_tokens 解析，
+        //   也不再接受写入（原 [F1] 有界 override 层已从 AnthropicSdkProvider 撤掉）。
         // [F4] 回落模型 merge（null = 不覆盖）
         if (req.fallbackModelName() != null) s.setFallbackModelName(req.fallbackModelName());
         // [TN1] 多模态/TTS/ASR 档位 merge（null = 不覆盖；使用先不使用：可配置可读取，不上发 LLM）
@@ -642,8 +643,6 @@ public class SettingsService {
             s.getMediumModelName(),
             s.getStrongModelName(),
             s.getSubagentModelName(),
-            // [F1] max output tokens 有界 override 透出（可空）
-            s.getMaxOutputTokens(),
             // [F4] 回落模型透出（可空）
             s.getFallbackModelName(),
             // [TN1] 多模态/TTS/ASR 档位透出（可空；使用先不使用）
