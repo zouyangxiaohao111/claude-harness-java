@@ -1,57 +1,62 @@
-# ===== Build outputs =====
-target/
-dist/
-dist-electron/
-node_modules/
-*.class
-*.jar
 
-# ===== IDE =====
-.idea/
-*.iml
-.vscode/
-.DS_Store
+# Tauri 打包后端产物（prepare-backend 生成，不入库）；保留 .gitkeep 占位使目录常驻
+#   （tauri build.rs 会校验 bundle.resources 的 backend 路径存在，缺失会导致 tauri dev/build 失败）
+front/src-tauri/backend/*
+!front/src-tauri/backend/.gitkeep
 
-# ===== Runtime data / local config =====
-*.log
-nexusai.db
-nexusai.db-journal
-nexusai.db-wal
-nexusai.db-shm
-nexusai.db.bak-*
-.env
-settings.json
+# Tauri 扩展 zip 产物（make-extension-zip.mjs 生成，不入库）；保留 .gitkeep 占位使目录常驻
+#   （tauri bundle.resources 校验 extension-pack 路径存在，缺失会导致 tauri dev/build 失败）
+front/src-tauri/extension-pack/*
+!front/src-tauri/extension-pack/.gitkeep
 
-# ===== Tauri / Rust =====
-src-tauri/target/
-src-tauri/nexusai-debug.log
-
-# ===== MCP local config (user-specific) =====
-.mcp.json
-.nexusai.json
-
-# ===== Index / tooling =====
-.gitnexus/
-.nexusai/
-.worktrees/
-
-# ===== Tauri 打包产物（同步自 nexusai master .gitignore，front/→frontend/ 路径重映射）=====
-# 后端产物（prepare-backend 生成，不入库）；保留 .gitkeep 占位使目录常驻
-#   （tauri build.rs 校验 bundle.resources 的 backend 路径存在，缺失导致 tauri dev/build 失败）
-frontend/src-tauri/backend/*
-!frontend/src-tauri/backend/.gitkeep
-# 扩展 zip 产物（make-extension-zip.mjs 生成，不入库）；保留 .gitkeep 占位使目录常驻
-#   （tauri bundle.resources 校验 extension-pack 路径存在，缺失导致 tauri dev/build 失败）
-frontend/src-tauri/extension-pack/*
-!frontend/src-tauri/extension-pack/.gitkeep
 # 本地打包产物目录（不入库，供 pack.bat/sh 输出与人工取用）
 release/
+/node_modules/
 
-# 一次性探针 / 路由转储（临时验证产物，不入库；路径按 harness 布局重映射）
-target_routes.tsv
-frontend/.rev03/
-frontend/cmp.mjs
-frontend/md-compare.html
+# 【内网秘钥】全新安装出厂预设的本地叠加（仅内网打包机存在；⛔ 不入库，GitHub 版本必须没有）
+backend/src/main/resources/factory/factory-preset.local.json
+# 【内网凭据】启动错误上报的 MinIO 只写 key（仅内网打包机存在；⛔ 不入库，GitHub 版本不得带上报能力）
+front/src-tauri/error-report.local.json
+# 内网构建标记（构建脚本创建/删除；⛔ 不入库）
+front/src-tauri/.error-report-internal
 
-# GitNexus analyze 自动生成的技能副本（可再生，非源码 ⇒ 不入库）
-/.claude/skills/
+# 运行日志（35MB，不入库）
+logs/
+
+# IDE 配置
+.idea/
+
+# 根目录误生成的空 lockfile（无根 package.json）
+/package-lock.json
+
+# ── 本地产物 / 工具目录（不入库）────────────────────────────
+#   根 dist/ 与 front/dist/ 是前端构建产物；/src-tauri/ 是误落在仓库根的
+#   Rust 构建目录（真实 Tauri 工程在 front/src-tauri/）。
+/dist/
+/.vite/
+/src-tauri/
+/.archify/
+/.zjkycode/
+/.nexusai/
+**/__pycache__/
+# 本地 SQLite / 运行时残留
+/nexusai.db
+/q.db
+/turns.json
+# 一次性浏览器探针脚本（临时验证用，不入库）
+/front/.tmp-*.mjs
+
+# 一次性探针 / 路由转储（临时验证产物，不入库）
+/target_routes.tsv
+/front/.rev03/
+/front/cmp.mjs
+
+# GitNexus analyze 自动生成的技能副本（可再生，非本仓源码 ⇒ 不入库；
+# 且历史上被误提交后又被误删，徒增噪音 —— 一律忽略）
+/.claude/skills/gitnexus-cli/
+/.claude/skills/gitnexus-debugging/
+/.claude/skills/gitnexus-exploring/
+/.claude/skills/gitnexus-guide/
+/.claude/skills/gitnexus-impact-analysis/
+/.claude/skills/gitnexus-refactoring/
+/.claude/skills/gitnexus/
