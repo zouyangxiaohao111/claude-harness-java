@@ -346,6 +346,39 @@ pub fn resolve_backend_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     None
 }
 
+/// 读随包 JRE 的 `release` 文件，取 `JAVA_VERSION="25.0.3"` 的 **major** 号。
+///
+/// <p>WHY 需要它：JDK 24 起，未声明的 native access 会打
+/// `WARNING: A restricted method in java.lang.System has been called` /
+/// `A terminally deprecated method in sun.misc.Unsafe has been called`
+/// （本仓触发方：SQLite JDBC 的 `System.load`、Netty 的 `Unsafe::allocateMemory`）。
+/// 消除办法是加 `--enable-native-access=ALL-UNNAMED`，但**该选项 JDK 24 才有** ——
+/// 将来若把运行时降到 JDK 21/23，JVM 会因「不认识的选项」直接启动失败 ⇒ 必须先探版本再加。
+///
+/// <p>读不到版本（文件缺失 / 格式变）⇒ 返回 `None` ⇒ **不加该选项**（保守：宁可留噪音，
+/// 也不能让 JVM 起不来）。
+fn jre_major_version(jre_dir: &std::path::Path) -> Option<u32> {
+    let release = std::fs::read_to_string(jre_dir.join("release")).ok()?;
+    for line in release.lines() {
+        let line = line.trim();
+        let Some(v) = line.strip_prefix("JAVA_VERSION=\"") else {
+            continue;
+        };
+        let v = v.strip_suffix('"')?;
+        let major = v.split('.').next()?.trim();
+        return major.parse::<u32>().ok();
+    }
+    None
+}
+
+/// 该 JRE 是否需要 `--enable-native-access=ALL-UNNAMED`（JDK ≥ 24 才有此选项）。
+///
+/// <p>本仓运行时 JRE 由 `prepare-backend.mjs` 用 **JDK 25** 的 jlink 裁出 ⇒ 恒为 true；
+/// 保留版本判定是为了将来换 JDK 时不会把 JVM 弄挂。
+fn needs_native_access_flag(jre_dir: &std::path::Path) -> bool {
+    matches!(jre_major_version(jre_dir), Some(major) if major >= 24)
+}
+
 /// spawn 后端：以 `jre/bin/javaw(.exe) -jar backend/nexusai-backend.jar --spring.profiles.active=prod`
 /// 启动，stdout/stderr 均追加写入 `{data_dir}/logs/backend.log`，工作目录切到数据根。
 /// Windows 用 javaw.exe（GUI 版）替代 java.exe —— 不申请控制台，从根上消除 cmd 黑窗。
@@ -393,7 +426,15 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
 
     // 5) spawn：工作目录 = 数据根（应用相对路径产物落 .nexusai），prod profile
     let data_root = data_dir();
-    let child = Command::new(&java_path)
+    // JDK 24+：未声明的 native access 会打一堆 WARNING（SQLite JDBC 的 System.load、
+    // Netty 的 Unsafe::allocateMemory）。ALL-UNNAMED 一次授权即可消除。
+    // ⚠️ 必须放在 `-jar` **之前**（放后面会被当成 Spring Boot 的应用参数）。
+    // ⚠️ 且只在 JDK ≥ 24 时加 —— 更早的 JDK 不认识该选项会直接启动失败。
+    let mut cmd = Command::new(&java_path);
+    if needs_native_access_flag(&backend_dir.join("jre")) {
+        cmd.arg("--enable-native-access=ALL-UNNAMED");
+    }
+    let child = cmd
         .arg("-jar")
         .arg(&jar_path)
         .arg("--spring.profiles.active=prod")
@@ -474,6 +515,36 @@ mod log_roll_tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("建临时目录");
         dir
+    }
+
+    /// JDK 版本探测：`release` 里的 `JAVA_VERSION="25.0.3"` ⇒ major=25。
+    #[test]
+    fn jre_major_version_reads_release_file() {
+        let dir = temp_dir("jrever");
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"25.0.3\"\nMODULES=\"java.base\"\n").unwrap();
+        assert_eq!(jre_major_version(&dir), Some(25));
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"21.0.5\"\n").unwrap();
+        assert_eq!(jre_major_version(&dir), Some(21));
+        // 读不到 / 格式不认识 ⇒ None（⇒ 不加 native access 参数，保守）
+        std::fs::write(dir.join("release"), "OS_NAME=\"Windows\"\n").unwrap();
+        assert_eq!(jre_major_version(&dir), None);
+        std::fs::remove_file(dir.join("release")).unwrap();
+        assert_eq!(jre_major_version(&dir), None);
+    }
+
+    /// `--enable-native-access=ALL-UNNAMED` **只对 JDK ≥ 24 加**：
+    /// 更早的 JDK 不认识该选项 ⇒ JVM 会直接启动失败（比留噪音严重得多）。
+    #[test]
+    fn native_access_flag_only_for_jdk24_plus() {
+        let dir = temp_dir("jrever24");
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"24.0.1\"\n").unwrap();
+        assert!(needs_native_access_flag(&dir), "JDK 24 应加 native access 参数");
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"25.0.3\"\n").unwrap();
+        assert!(needs_native_access_flag(&dir), "JDK 25 应加 native access 参数");
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"23.0.2\"\n").unwrap();
+        assert!(!needs_native_access_flag(&dir), "JDK 23 不认识该选项 ⇒ 绝不能加");
+        std::fs::write(dir.join("release"), "JAVA_VERSION=\"21.0.5\"\n").unwrap();
+        assert!(!needs_native_access_flag(&dir), "JDK 21 不认识该选项 ⇒ 绝不能加");
     }
 
     /// 超过阈值 → 活跃文件被归档（内容不丢），且活跃路径不再存在（下次 append 从空开始）。

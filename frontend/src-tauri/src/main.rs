@@ -243,6 +243,39 @@ fn install_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// 「托盘退出」要做的三件事（抽成纯函数便于单测断言真实语义）。
+///
+/// <h2>WHY 抽出来</h2>
+/// 这三件事是「点了右键退出 ⇒ 应用真的没了」的全部保证，抽成纯函数后可直接断言，
+/// 不必真起一个 Tauri 应用（托盘/窗口在测试环境里造不出来）。
+///
+/// <ul>
+///   <li><b>放行关闭钩子</b>：否则主窗口的 CloseRequested 被判成「隐藏到托盘」，
+///       窗口只是 hide，进程照旧活着。</li>
+///   <li><b>回收后端进程树</b>：否则 java 进程成孤儿（`RunEvent::ExitRequested` 兜底分支
+///       只在进程真的退出时才跑，而这里正是「进程不退出」的场景 ⇒ 兜底永远等不到）。</li>
+///   <li><b>结束进程</b>：托盘图标常驻 ⇒ Tauri v2 里**关掉所有窗口不会结束进程**
+///       （用户 2026-11-12 报障「右键退出不会自行退出」）。</li>
+/// </ul>
+#[derive(Debug, PartialEq, Eq)]
+struct QuitPlan {
+    /// 是否要放行「关窗即销毁」（否则窗口被 hide，进程活着）。
+    release_close_hook: bool,
+    /// 要回收的后端 pid（`None` = 无自启后端 / 已回收过）。
+    backend_pid: Option<u32>,
+    /// 是否要主动结束进程（托盘常驻时关窗不够）。
+    exit_process: bool,
+}
+
+/// 计算「托盘退出」的执行计划。纯函数：不碰 app、不杀进程。
+fn quit_plan(backend_pid: Option<u32>) -> QuitPlan {
+    QuitPlan {
+        release_close_hook: true,
+        backend_pid,
+        exit_process: true,
+    }
+}
+
 /// 托盘菜单的统一分发（**应用级**处理器）。
 ///
 /// <h2>WHY 挂在 Builder 上而不是 TrayIconBuilder 上</h2>
@@ -256,12 +289,24 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
     match id.as_str() {
         TRAY_MENU_SHOW => show_main_window(app),
         TRAY_MENU_QUIT => {
+            let plan = quit_plan(app.state::<BackendState>().0.lock().unwrap().take());
             // 先放行关闭钩子，再关窗 —— 顺序不能反（反了钩子会把这次关闭也当成「隐藏」）
-            app.state::<HideOnClose>()
-                .0
-                .store(false, std::sync::atomic::Ordering::SeqCst);
+            if plan.release_close_hook {
+                app.state::<HideOnClose>()
+                    .0
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+            }
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = window.close();
+            }
+            // 兜底回收后端：窗口已隐藏时 close 不触发钩子 ⇒ 这里补杀（take 幂等）
+            if let Some(p) = plan.backend_pid {
+                backend::log_launcher(&format!("托盘退出，回收后端进程树 pid={}", p));
+                backend::kill_process_tree(p);
+            }
+            // ⛔ 必须结束进程：托盘常驻 ⇒ 关掉所有窗口不会结束进程（详见 quit_plan 的文档）
+            if plan.exit_process {
+                app.exit(0);
             }
         }
         other => {
@@ -733,6 +778,30 @@ mod tests {
         assert_eq!(*state.lock().unwrap(), None);
         // 无 pid（启动时复用外部后端）⇒ 无事发生
         assert_eq!(reclaim_target_on_close("main", &state_of(None)), None);
+    }
+
+    /// 托盘「退出」⇒ 必须**主动结束进程**（用户 2026-11-12 报障「右键退出不会自行退出」）。
+    ///
+    /// WHY：托盘图标常驻 ⇒ Tauri v2 里关掉所有窗口**不会**结束进程；只关窗等于没退。
+    #[test]
+    fn tray_quit_must_exit_process_not_only_close_window() {
+        let plan = quit_plan(Some(4242));
+        assert!(
+            plan.exit_process,
+            "托盘退出必须结束进程（托盘常驻 ⇒ 关窗不结束进程）"
+        );
+        // 关闭钩子也要放行，否则主窗口被 hide 而不是销毁
+        assert!(plan.release_close_hook, "托盘退出必须放行关窗钩子");
+        // 后端 pid 要在退出前回收，否则 java 成孤儿
+        assert_eq!(plan.backend_pid, Some(4242));
+    }
+
+    /// 托盘「退出」在**无自启后端**（pid 已被回收）时仍必须结束进程。
+    #[test]
+    fn tray_quit_exits_even_without_backend_pid() {
+        let plan = quit_plan(None);
+        assert!(plan.exit_process, "无后端 pid 也必须结束进程");
+        assert_eq!(plan.backend_pid, None);
     }
 
     /// 独立预览子窗口（PDF/Word/HTML/Excel/图片）关闭 → **绝不**回收后端。

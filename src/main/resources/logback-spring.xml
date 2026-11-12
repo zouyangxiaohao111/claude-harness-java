@@ -8,7 +8,16 @@
     <springProperty scope="context" name="log-rolling-max-file-size" source="logging.logback.rollingpolicy.max-file-size" defaultValue="32MB"/>
     <springProperty scope="context" name="log-rolling-total-size-cap" source="logging.logback.rollingpolicy.total-size-cap" defaultValue="512MB"/>
     <springProperty scope="context" name="log-rolling-max-history" source="logging.logback.rollingpolicy.max-history" defaultValue="14"/>
-    <springProperty scope="context" name="log-rolling-clean-history-on-start" source="logging.logback.rollingpolicy.clean-history-on-start" defaultValue="false"/>
+    <!-- 过期归档在**启动时**清一次，而不是等滚动时才清。
+         WHY（用户 2026-11-12 报障）：默认 false 时 logback 只在滚动路径上清理过期归档 ⇒
+           长期不滚动就一路积压（实测客户机上留了 35 天前的 info-2026-10-08.0.log.zip）；
+           升级后首次写入触发滚动 ⇒ 集中删除这批陈旧归档，而此时杀毒/索引服务正扫描它们
+           ⇒ Windows 上文件被占用 ⇒ `TimeBasedArchiveRemover - Failed to delete file` 刷屏。
+         启动时清（此刻通常无扫描占用）成功率高，且清完之后滚动时已无过期文件可删 ⇒ 不再刷。
+         ⚠️ 保留期语义不变（maxHistory 仍是 14 天），只是把清理**时机**提前。
+         ⚠️ 启动时若仍删不掉（恰好被占用）⇒ 退化回原行为（滚动时再试），不会更差。
+         需要 logback ≥ 1.1.7（本仓为 1.5.18，SizeAndTimeBasedRollingPolicy 支持）。 -->
+    <springProperty scope="context" name="log-rolling-clean-history-on-start" source="logging.logback.rollingpolicy.clean-history-on-start" defaultValue="true"/>
 
     <!-- 控制台格式：%highlight 颜色（INFO 绿/WARN 黄/ERROR 红，logback 自带，不依赖 SkyWalking）
          [批 3c · 2026-09-13] 已移除 MDC 前缀 [s=%X{sessionId}] [r=%X{reqId}]：

@@ -2,6 +2,25 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.71] - 2026-11-11
+
+### Fixed
+
+- **托盘右键「退出 NexusAI」不生效**（用户 2026-11-12 报障）：托盘图标常驻 ⇒ Tauri v2 里
+  **关掉所有窗口不会结束进程**（托盘仍持有 app 生命周期）⇒ 原实现只做 `window.close()`，
+  点了退出窗口没了、进程与托盘图标还在。现退出项显式 `app.exit(0)`，并在退出前回收后端进程树
+  （`RunEvent::ExitRequested` 兜底只在进程真退出时才跑，而这里正是「进程不退出」的场景）。
+  （托盘是 0.1.67 引入的，此前没有常驻托盘、关窗即退，故从那时起才暴露。）
+- **JDK 24+ 的 native access 警告刷屏**（`A restricted method in java.lang.System has been called`
+  ← SQLite JDBC 的 `System.load`；`A terminally deprecated method in sun.misc.Unsafe has been called`
+  ← Netty 的 `Unsafe::allocateMemory`）：本仓运行时 JRE 由 jlink 从 JDK 25 裁出 ⇒ 必然出现。
+  现 spawn 时加 `--enable-native-access=ALL-UNNAMED`（须置于 `-jar` 之前），
+  且**只在 JDK ≥ 24 时加** —— 更早的 JDK 不认识该选项会直接启动失败。
+- **logback 过期归档删除失败刷屏**（`TimeBasedArchiveRemover - Failed to delete file
+  ...info-2026-10-08.0.log.zip`）：`cleanHistoryOnStart` 默认 false ⇒ 过期归档只在滚动时清
+  ⇒ 长期积压，升级后首次滚动集中删除、恰逢杀毒/索引服务扫描占用 ⇒ 失败刷屏。
+  现改为**启动即清**（此刻通常无扫描占用），清完后滚动时无过期文件可删；保留期语义不变。
+
 ## [0.1.70] - 2026-11-11
 
 ### Added
