@@ -47,6 +47,7 @@ import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedU
 import { computeTurnRunning } from '@/utils/turnRunning'
 import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
+import { useRunningSubagentSessionIds, useSubagentRunningReconcile } from '@/hooks/useSubagentRunning'
 import { sendSystemNotification, ensureNotificationPermissionOnGesture } from '@/utils/systemNotify'
 import { onSystemNotificationClick } from '@/utils/systemNotify'
 import { showMainWindow } from '@/utils/tauri-bridge'
@@ -945,6 +946,10 @@ function App() {
   //   ⛔ 不要再退回只看 streamOrder（那正是用户报的缺陷）。
   const streamOrderMap = useChatStore((s) => s.streamOrder)
   const serverRunningMap = useChatStore((s) => s.serverRunning)
+  // [2026-11-12] 子代理仍在跑 ⇒ 侧栏保持运行点（主代理完成后不得翻绿）。
+  //   ⛔ 只并进侧栏这一路；serverRunning / turnRunning（停止键 / Esc）不碰。
+  const subagentRunningIds = useRunningSubagentSessionIds()
+  useSubagentRunningReconcile()
   const runningSessionIds = useMemo(() => {
     const out = new Set<string>(Object.keys(streamOrderMap))
     // 本地登记：本页发送后立刻写入（`await chatApi.send` 之前），含「还没收到第一个 chunk」的窗口
@@ -952,8 +957,10 @@ function App() {
     // 服务端权威：后端起轮即推 status=thinking（ChatService:956）→ useChatSocket 写本表；
     //   也覆盖「后台 drain / cron / F5 后本页无登记」的 run。
     for (const [sid, on] of Object.entries(serverRunningMap)) if (on) out.add(sid)
+    // 子代理运行态（独立于主 turn）：主代理 complete 后子代理可能仍在跑。
+    for (const sid of subagentRunningIds) out.add(sid)
     return out
-  }, [streamOrderMap, serverRunningMap, activeStreams])
+  }, [streamOrderMap, serverRunningMap, activeStreams, subagentRunningIds])
 
   // ---- 权限冒泡：持久队列头部 + 决策出队 ----
   const permissionQueue = useChatStore((s) => s.permissionQueue)
@@ -1932,9 +1939,11 @@ function App() {
    */
   const createSession = useCallback(async (mainProjectId: string) => {
     const pickFrom = defaultNewSessionModel
-    // 单项目模式：工作组下已有「无对话空会话」则禁止再次创建（用户需求）
+    // 单项目模式：工作组下已有「无对话空会话」则不再创建（用户需求）——
+    // 但必须**切到那个空会话**：用户点「新建会话」要的就是一个可对话的空会话，已有则复用。
+    // 只弹提示就 return 会让按钮看起来没反应（左栏高亮也不动）。
     const chatMessages = useChatStore.getState().messages
-    const hasEmptySessionInGroup = storeSessions.some((s) => {
+    const emptySession = storeSessions.find((s) => {
       // 同工作组（同 mainProjectId；无绑定会话视为同一默认组）
       const sameGroup = (s.mainProjectId ?? null) === (mainProjectId ?? null)
       if (!sameGroup) return false
@@ -1944,8 +1953,16 @@ function App() {
       //   （有历史但本端未拉）不再误判为空 → messageCount>0 或前端已有消息皆非空，两者皆无才判空
       return (s.messageCount ?? 0) <= 0 && msgs.length === 0 && !isStreaming
     })
-    if (hasEmptySessionInGroup) {
-      showToast('当前工作区已有空会话，请先在已有会话中对话', 'info')
+    if (emptySession) {
+      // 与 switchSession 同序（App.tsx:1772）：先回对话页再判，否则主区仍被定时任务/知识库页盖住
+      setWorkspacePage('chat')
+      if (emptySession.id !== activeSessionId) {
+        sessionDispatch({ type: 'SWITCH', sessionId: emptySession.id })
+        sessionDispatch({ type: 'ADD_TAB', tabId: emptySession.id })
+        showToast('当前工作区已有空会话，已切换到该会话', 'info')
+      } else {
+        showToast('当前工作区已有空会话，请直接对话', 'info')
+      }
       return
     }
     let created: SessionDto
@@ -1975,7 +1992,7 @@ function App() {
       },
     }))
     showToast('已创建新会话', 'success')
-  }, [sessionDispatch, showToast, setSessions, storeSessions, realProjects, defaultNewSessionModel])
+  }, [sessionDispatch, showToast, setSessions, storeSessions, realProjects, defaultNewSessionModel, activeSessionId])
 
   /**
    * 添加工作区（新项目工作组）：给已校验的绝对目录 → 注册/取项目 → 创建该项目首个会话并置顶左栏。
@@ -3094,16 +3111,23 @@ function App() {
               await handleAddWorkspace()
               return
             }
-            // 单项目模式：该项目下已有空会话则禁止再次创建
+            // 单项目模式：该项目下已有空会话则**切过去**（不新建）——只弹提示会让「+」看起来没反应
             const chatMessages = useChatStore.getState().messages
-            const hasEmpty = storeSessions.some((s) => {
+            const emptySession = storeSessions.find((s) => {
               const sameGroup = (s.mainProjectId ?? null) === targetPid
               if (!sameGroup) return false
               // 后端 messageCount 权威（同 createSession：前端 messages 未加载不算空）
               return (s.messageCount ?? 0) <= 0 && (chatMessages[s.id] ?? []).length === 0 && !useChatStore.getState().streams[s.id]
             })
-            if (hasEmpty) {
-              showToast('该项目下已有空会话，请先对话', 'info')
+            if (emptySession) {
+              setWorkspacePage('chat')
+              if (emptySession.id !== activeSessionId) {
+                sessionDispatch({ type: 'SWITCH', sessionId: emptySession.id })
+                sessionDispatch({ type: 'ADD_TAB', tabId: emptySession.id })
+                showToast('该项目下已有空会话，已切换到该会话', 'info')
+              } else {
+                showToast('该项目下已有空会话，请直接对话', 'info')
+              }
               return
             }
             const pickFrom = defaultNewSessionModel

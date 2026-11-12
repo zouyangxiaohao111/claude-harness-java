@@ -268,6 +268,33 @@ export function subagentListOfSession(
   return out
 }
 
+/**
+ * [侧栏运行点] 仍有子代理在跑的会话 id 集合（纯函数 · 供 side bar 的 `.status-dot.running`）。
+ *
+ * <p><b>WHY</b>：主代理 turn 收口（complete）时子代理可能还在跑（AutonomousAgentLoop 不发
+ * session.status）—— 侧栏原本只看主 turn 的三路信号 ⇒ 主代理一完成就翻成绿点，
+ * 用户看到「已完成」而子代理其实还在干活。本函数把「子代理仍在 running」这一路并进侧栏判据。
+ *
+ * <p><b>⛔ 只喂侧栏状态点</b>：不得并入 {@code serverRunning} / {@code turnRunning}（停止键、Esc、
+ * 草稿链只代表主 turn）。
+ *
+ * <p><b>去重</b>：{@link SubagentState.register} 把同一 identity 对象同时挂在 taskId 与 toolUseId
+ * 两个键下 ⇒ 按对象身份去重（同一个子代理只算一次）。`restored`（冷启动恢复）也算 running ——
+ * 幽灵由 {@code sweepRestoredRunningSubagents} 兜底，判据本身不做特殊处理。
+ */
+export function runningSubagentSessionIds(bySession: SubagentBySession): Set<string> {
+  const out = new Set<string>()
+  for (const [sid, session] of Object.entries(bySession ?? {})) {
+    const seen = new Set<SubagentIdentity>()
+    for (const id of Object.values(session ?? {})) {
+      if (!id || seen.has(id)) continue
+      seen.add(id)
+      if (id.status === 'running') { out.add(sid); break }
+    }
+  }
+  return out
+}
+
 /** 失败原因文本的占位符（useChatSocket 在 summary/output_file 都缺时写入 '…' —— 不是真原因）。 */
 const FAILURE_REASON_PLACEHOLDER = '…'
 

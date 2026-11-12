@@ -1,8 +1,8 @@
 //! 后端进程生命周期管理（T12）。
 //!
-//! 职责：探活 `http://localhost:3458/actuator/health` → 未就绪则用随安装包分发的裁剪 JRE
+//! 职责：探活 `http://localhost:3458/api/v1/settings` → 未就绪则用随安装包分发的裁剪 JRE
 //! spawn `java -jar nexusai-backend.jar --spring.profiles.active=prod`（数据落 `%USERPROFILE%/.nexusai`）
-//! → 等待健康就绪；窗口关闭 / 应用退出时把 java 进程**整树**回收（防孤儿）。
+//! → 等待就绪；窗口关闭 / 应用退出时把 java 进程**整树**回收（防孤儿）。
 //!
 //! 约束：不引第三方 HTTP / 进程 crate，全部走 std。
 
@@ -14,10 +14,17 @@ use std::time::Duration;
 
 use tauri::Manager;
 
-/// 后端健康检查端口（与 Spring Boot prod 配置对齐）。
-const HEALTH_PORT: u16 = 3458;
-/// 健康检查 HTTP 路径。
-const HEALTH_PATH: &str = "/actuator/health";
+/// 后端监听端口（与 Spring Boot prod 配置 `server.port` 对齐）。
+const BACKEND_PORT: u16 = 3458;
+/// 就绪探针路径。
+///
+/// <p>⛔ **不能用 `/actuator/health`**（2026-11-12 事故根因）：它把「可选外部依赖不健康」也算进
+/// 总体状态。neo4j-java-driver 一进 pom，`Neo4jReactiveHealthIndicator` 就无条件激活、默认连
+/// `localhost:7687`，本机没跑 Neo4j ⇒ health 恒 503 ⇒ 后端明明已能服务（业务端点 200），
+/// 壳却判「没起来」并 60s 后 `taskkill` ⇒ 用户侧所有请求变成 `Network Error`。
+/// 判据必须与前端 `LaunchGate` 同一条（`front/src/components/startup/LaunchGate.tsx` 也探
+/// `GET /api/v1/settings`）——「能不能服务」只有业务端点说了算，健康项只作诊断用。
+const READY_PATH: &str = "/api/v1/settings";
 /// 单次连接/读取超时。
 const PROBE_TIMEOUT: Duration = Duration::from_millis(1500);
 /// 等待后端健康就绪的总超时：Spring Boot prod 冷启动（首次 Flyway 全量迁移 / c3p0 /
@@ -43,12 +50,12 @@ pub fn silent_command(program: &str) -> Command {
     cmd
 }
 
-/// 探活：GET http://localhost:3458/actuator/health 返回 2xx 即视为后端就绪。
+/// 探活：GET http://localhost:3458/api/v1/settings 返回 2xx 即视为后端就绪。
 ///
 /// 用 std::net::TcpStream::connect_timeout 手写一个最简 HTTP/1.1 GET，
-/// 读响应前 256 字节，包含 "200" 即 true；连接失败 / 超时 / 非 200 一律 false，不 panic。
+/// 读响应前 256 字节，**只从状态行**取三位状态码判 2xx；连接失败 / 超时 / 非 2xx 一律 false，不 panic。
 pub fn backend_ready() -> bool {
-    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), HEALTH_PORT);
+    let addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), BACKEND_PORT);
 
     // 连接超时（1.5s）：连不上说明端口未监听，直接 not ready
     let mut stream = match TcpStream::connect_timeout(&addr, PROBE_TIMEOUT) {
@@ -61,7 +68,7 @@ pub fn backend_ready() -> bool {
     // 手写 HTTP/1.1 GET（不带 Host 头以外的多余头，Connection: close 让服务端发完即关）
     let request = format!(
         "GET {} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n",
-        HEALTH_PATH
+        READY_PATH
     );
     if stream.write_all(request.as_bytes()).is_err() {
         return false;
@@ -74,7 +81,21 @@ pub fn backend_ready() -> bool {
         Err(_) => 0,
     };
     let head = String::from_utf8_lossy(&buf[..n]);
-    head.contains("200")
+    is_ready_status(&head)
+}
+
+/// 从 HTTP 响应首行取状态码，判是否 2xx。
+///
+/// <p><b>WHY 不用 `head.contains("200")`</b>：那是整串子串匹配，响应体/头部里出现 "200"
+/// （日期、长度、JSON 里的数字）就会把非 2xx 误判成就绪，反之 503 + 带 "200" 的正文也会误判。
+/// 状态行是唯一权威 ⇒ 只解析第 2 个空白分段。
+fn is_ready_status(head: &str) -> bool {
+    head.lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .and_then(|code| code.parse::<u16>().ok())
+        .map(|code| (200..300).contains(&code))
+        .unwrap_or(false)
 }
 
 /// 用户数据根：Windows 取 `%USERPROFILE%/.nexusai`，其它取 `$HOME/.nexusai`
@@ -499,6 +520,30 @@ pub fn kill_process_tree(pid: u32) {
     }
     // 本次 kill 的目标即本会话自启后端（pid 文件只写过自启 pid）→ 顺带清 pid 记录
     clear_backend_pid();
+}
+
+#[cfg(test)]
+mod ready_status_tests {
+    use super::*;
+
+    /// 判据必须只看状态行：2xx 才算就绪。
+    ///
+    /// <p>WHY（2026-11-12 事故）：旧判据 `head.contains("200")` + 探 `/actuator/health`，
+    /// 后者在 Neo4j 不可用时恒 503 ⇒ 后端被 60s 后误杀。锁住两件事：
+    /// ① 503 绝不算就绪（哪怕正文/头部里有 "200"）；② 200/204 必须算就绪。
+    #[test]
+    fn only_2xx_status_line_counts_as_ready() {
+        assert!(is_ready_status("HTTP/1.1 200 \r\nContent-Type: application/json\r\n\r\n{}"));
+        assert!(is_ready_status("HTTP/1.1 204 \r\n\r\n"));
+        assert!(!is_ready_status("HTTP/1.1 503 \r\n\r\n{\"status\":\"DOWN\"}"));
+        // 反例：非 2xx 的正文里带 "200" 不得被误判（旧的 contains 判据会判就绪）
+        assert!(!is_ready_status(
+            "HTTP/1.1 503 \r\nContent-Length: 200\r\n\r\n{\"retryAfter\":200}"
+        ));
+        // 空响应 / 非 HTTP（端口被别的服务占着时的乱码）不算就绪
+        assert!(!is_ready_status(""));
+        assert!(!is_ready_status("garbage"));
+    }
 }
 
 #[cfg(test)]

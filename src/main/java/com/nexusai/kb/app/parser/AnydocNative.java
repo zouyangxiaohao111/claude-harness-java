@@ -9,6 +9,7 @@ import com.sun.jna.ptr.PointerByReference;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.io.IOException;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -64,6 +65,29 @@ final class AnydocNative {
 
     /** Linux 随包文件名。 */
     private static final String LIBRARY_FILE_LINUX = "libanydoc_go.so";
+
+    /**
+     * anydoc crate 版本（{@code Cargo.toml} 的 {@code anydoc = "=0.2.4"}）。
+     *
+     * <p>只用于<b>缓存目录隔离</b>：升级库后换个版本号，旧缓存自动作废、重新提取。
+     * 与 {@code RipgrepRunner.RG_VERSION} 同一用意。
+     */
+    static final String ANYDOC_VERSION = "0.2.4";
+
+    /**
+     * 内置原生库所在的 classpath 前缀（对齐 {@code RipgrepRunner} 的 {@code /rg/}）。
+     *
+     * <p>布局：{@code resources/anydoc/<arch>-<os>/<libname>}，六平台命名与 rg 完全一致：
+     * {@code x64-win32} / {@code x64-darwin} / {@code x64-linux} / {@code arm64-win32} /
+     * {@code arm64-darwin} / {@code arm64-linux}。
+     *
+     * <p><b>⚠️ 目前只随包了 {@code x64-win32}</b>：Rust {@code cdylib} 必须在其目标平台上链接 ——
+     * macOS 需要 Apple SDK（且系统对 dylib 有签名要求），Linux 需要 glibc sysroot；
+     * musl 目标则<b>根本不支持 cdylib</b>（Rust 会丢弃该 crate-type，只出 {@code .a} 静态库）。
+     * ⇒ 其余平台的目录需要在对应平台的构建机（或 CI）上用同一份
+     * {@code third_party/anydoc-go} 编出后放进来，本仓代码不用改。
+     */
+    private static final String BUNDLED_RESOURCE_PREFIX = "/anydoc/";
 
     /**
      * 当前平台的库文件名 · 按 {@code os.name} 推导。
@@ -252,13 +276,37 @@ final class AnydocNative {
         return loaded;
     }
 
-    /** 真实加载逻辑：库名 → 候选绝对路径（任何平台都走同一套查找）。 */
+    /** 真实加载逻辑：内置资源（主）→ 库名 → 候选绝对路径（兜底）。 */
     private static void loadInternal() {
         String osName = System.getProperty("os.name", "");
         String libFile = libraryFileName();
         List<String> tried = new ArrayList<>();
+        /** 当前平台是否随包了内置库（false ⇒ 失败文案要说「未随包」而不是「找不到」）。 */
+        boolean bundledForPlatform = true;
 
-        // ── 1. 按库名加载：JNA 搜索 jna.library.path → 应用目录 → 系统 PATH → 当前目录 ──
+        // ── 1. 随包内置（classpath → 临时目录）· 与 RipgrepRunner 同一套机制 ──
+        //    这是**安装包的真实形态**：库随 jar 走，不依赖用户把文件放到哪个目录。
+        try {
+            Path bundled = extractBundledLibrary();
+            if (bundled != null) {
+                try {
+                    AnydocLib lib = Native.load(bundled.toAbsolutePath().toString(), AnydocLib.class, loadOptions());
+                    loaded = lib;
+                    log.info("AnydocNative: 已加载内置原生库 {}（平台 {}）", bundled, platformDirName());
+                    return;
+                } catch (Throwable t) {
+                    // 资源在但加载失败（架构不符 / 依赖缺失）⇒ 继续走兜底，并把原因记下来
+                    tried.add("内置 " + bundled + "：" + briefMessage(t));
+                }
+            } else {
+                bundledForPlatform = false;
+                tried.add("内置 " + resourceName() + "（当前平台未随包）");
+            }
+        } catch (IOException e) {
+            tried.add("提取内置库失败：" + e.getMessage());
+        }
+
+        // ── 2. 按库名加载：JNA 搜索 jna.library.path → 应用目录 → 系统 PATH → 当前目录 ──
         //    Native.load 本身跨平台（JNA 自动补 .dll / lib*.dylib / lib*.so 前后缀），保留这一级。
         try {
             AnydocLib lib = Native.load(LIBRARY_BASE_NAME, AnydocLib.class, loadOptions());
@@ -286,8 +334,15 @@ final class AnydocNative {
             }
         }
 
-        failureReason = clip("未找到可加载的 " + libFile + "（os=" + osName + "）；已尝试 —— "
-            + String.join("；", tried));
+        failureReason = bundledForPlatform
+            ? clip("未找到可加载的 " + libFile + "（os=" + osName + "）；已尝试 —— "
+                + String.join("；", tried))
+            : clip("当前平台（" + platformDirName() + "）未随包内置 " + libFile
+                + " —— anydoc 目前只随包了 x64-win32 的产物（Rust cdylib 必须在目标平台上链接："
+                + "macOS 需 Apple SDK、Linux 需 glibc sysroot、musl 不支持 cdylib）。"
+                + "如需在本平台启用，请按 front/scripts/build-anydoc.md 编译后放入 "
+                + "backend/src/main/resources/anydoc/" + platformDirName() + "/ 再重新打包；"
+                + "日志里有全部尝试明细。");
         log.warn("AnydocNative: {}（anydoc 引擎将不可用，Office 文档回落内置 Office 解析）", failureReason);
     }
 
@@ -408,6 +463,106 @@ final class AnydocNative {
             return LIBRARY_FILE_MAC;
         }
         return LIBRARY_FILE_LINUX;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // 平台标识（与 RipgrepRunner 逐字同口径：<arch>-<os>，即 Node 的 process.arch-platform）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** {@code os.name} → {@code win32} / {@code darwin} / {@code linux}（对齐 {@code process.platform}）。 */
+    static String resolveOs() {
+        String os = System.getProperty("os.name", "").toLowerCase(Locale.ROOT);
+        if (os.contains("win")) {
+            return "win32";
+        }
+        if (os.contains("mac") || os.contains("darwin")) {
+            return "darwin";
+        }
+        return "linux";
+    }
+
+    /** {@code os.arch} → {@code x64} / {@code arm64}（对齐 {@code process.arch}）。 */
+    static String resolveArch() {
+        String arch = System.getProperty("os.arch", "").toLowerCase(Locale.ROOT);
+        if (arch.equals("aarch64") || arch.equals("arm64")) {
+            return "arm64";
+        }
+        // amd64 / x86_64 / x64 / 以及未知值都归 x64：
+        // 未知架构下二进制必然缺失，由「未随包」文案兜底（同 RipgrepRunner.resolveArch）
+        return "x64";
+    }
+
+    /** 平台目录名 · 如 {@code x64-win32}（与 {@code resources/anydoc/} 下的目录名一致）。 */
+    static String platformDirName() {
+        return resolveArch() + "-" + resolveOs();
+    }
+
+    /** 当前平台的内置库资源路径 · 如 {@code /anydoc/x64-win32/anydoc_go.dll}。 */
+    static String resourceName() {
+        return BUNDLED_RESOURCE_PREFIX + platformDirName() + "/" + libraryFileName();
+    }
+
+    /**
+     * 从 classpath 提取内置原生库到临时目录并返回其路径。
+     *
+     * <p><b>WHY 必须提取</b>：Spring Boot fat jar 里的资源是<b>压缩条目</b>，
+     * {@code Native.load} 只能加载<b>文件系统上的</b>动态库 —— 必须先把字节落到磁盘
+     * （与 {@code RipgrepRunner.ensureRgBinary} 同一个原因）。
+     *
+     * <p>缓存位置 {@code ${java.io.tmpdir}/nexusai-anydoc/{版本}/{平台}/}：
+     * 带版本与平台两段，升级库或换机器都不会复用错的旧文件；
+     * 已存在且<b>大小一致</b>时直接复用（大小不符 = 上次半写 / 被截断，重新提取）。
+     *
+     * @return 提取后的绝对路径；当前平台<b>未随包</b>时返回 null（不算错误，由调用方降级）
+     * @throws IOException 资源存在但读写失败（磁盘满 / 权限）
+     */
+    private static Path extractBundledLibrary() throws IOException {
+        String resource = resourceName();
+        String libFile = libraryFileName();
+        Path cacheDir = Path.of(System.getProperty("java.io.tmpdir", "/tmp"))
+            .resolve("nexusai-anydoc")
+            .resolve(ANYDOC_VERSION)
+            .resolve(platformDirName());
+        Path target = cacheDir.resolve(libFile);
+
+        try (java.io.InputStream probe = AnydocNative.class.getResourceAsStream(resource)) {
+            if (probe == null) {
+                // 当前平台没有随包库（目前除 x64-win32 之外的五个平台都是这条路）
+                return null;
+            }
+            long resourceSize = probe.available();
+            if (Files.isRegularFile(target) && resourceSize > 0 && Files.size(target) == resourceSize) {
+                return target;   // 缓存可用（含进程重启后的复用）
+            }
+        }
+
+        Files.createDirectories(cacheDir);
+        try (java.io.InputStream in = AnydocNative.class.getResourceAsStream(resource)) {
+            if (in == null) {
+                return null;
+            }
+            // 先写临时文件再原子移动：避免「JVM 崩溃留下半截 dll，下次被当成完好的缓存」
+            Path tmp = cacheDir.resolve(libFile + ".tmp" + System.nanoTime());
+            try {
+                Files.copy(in, tmp, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                try {
+                    Files.move(tmp, target,
+                        java.nio.file.StandardCopyOption.ATOMIC_MOVE,
+                        java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+                    Files.move(tmp, target, java.nio.file.StandardCopyOption.REPLACE_EXISTING);
+                }
+            } catch (IOException e) {
+                try {
+                    Files.deleteIfExists(tmp);
+                } catch (IOException ignored) {
+                    // 清理失败不掩盖原始错误
+                }
+                throw e;
+            }
+        }
+        log.info("AnydocNative: 内置原生库已提取 → {}（来源 classpath {}）", target, resource);
+        return target;
     }
 
     // ════════════════════════════════════════════════════════════════════════

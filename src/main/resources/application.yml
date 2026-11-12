@@ -602,6 +602,19 @@ management:
     web:
       exposure:
         include: health,info
+  # Neo4j 健康项必须关掉（2026-11-12 事故）。
+  # WHY：pom 里引入了 neo4j-java-driver（知识图谱可选后端），Spring Boot 的
+  #   Neo4jAutoConfiguration 只要看到该 driver 就**无条件**建一个 Driver bean 并连带激活
+  #   Neo4jReactiveHealthIndicator，默认连 bolt://localhost:7687。本仓 99% 的用户根本没跑 Neo4j
+  #   （图谱默认走本地 SQLite，见 KbGraphStoreRouter），于是 /actuator/health 恒返回 503 DOWN。
+  # 后果：Tauri 壳的就绪探针当时按 health 里的 "200" 判就绪 ⇒ 后端每次启动都被判「没起来」
+  #   ⇒ 60 秒后 taskkill 整树 ⇒ 用户看到「点对话/新建会话全是 Network Error」。
+  #   业务端点其实一直是 200，健康项把「可选依赖」当成了「整体不可用」。
+  # 关掉无副作用：图谱的 Neo4j 连接由 KbGraphStoreRouter/Neo4jDriverBacked 自己
+  #   GraphDatabase.driver() 建（不依赖这个自动配置的 bean），本仓没有任何代码注入它。
+  health:
+    neo4j:
+      enabled: false
 
 # =====================================================================
 # Springdoc / OpenAPI 3

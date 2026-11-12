@@ -71,7 +71,7 @@ function printSummary(jreDir, jarPath) {
 }
 
 /**
- * anydoc 原生库就位（**只警告，不 fail**）。
+ * anydoc 原生库就位检查（**只警告，不 fail**）。
  *
  * <p>WHY 不 fail：`anydoc_go.dll` 由 Rust 从 WeKnora 的 `third_party/anydoc-go` 编译而来
  * （步骤见同目录 `build-anydoc.md`），**不属于本仓可复现的构建产物** —— GitHub 上的 CI/打包机
@@ -79,14 +79,51 @@ function printSummary(jreDir, jarPath) {
  * 让 Office 文档回落内置 Office 解析（`KbAnydocParser.supports()` 会返回 false），
  * 应用本身照常可用。
  *
- * <p><b>⚠️ 2026-11-11 修（0.1.68 漏打的实证）</b>：原实现只认 `out`（`front/src-tauri/backend/`）
- * 一个位置，而该目录被 `.gitignore` 全忽略 ⇒ **干净 worktree / CI 上必然找不到**；同时本仓又把
- * `anydoc_go.dll` 提交在了仓库根的 `backend/`（那里 `prepare-backend` 从不看）⇒ 0.1.68 的打包日志
- * 实打实是「⚠️ 未找到 anydoc 原生库」，装出来的包缺这个库、Office 文档回落 Tika。
- * ⇒ 现在按「out 优先、仓库 `backend/` 兜底」查找，**找到就拷进 out**（out 才是随包分发的目录，
- * `tauri.conf.json` 的 bundle.resources 指的是它）。
+ * <p><b>⭐⭐ 2026-11-12 改为「随 jar 内置」（与 ripgrep 同一机制）</b>：原生库现在放在
+ * `backend/src/main/resources/anydoc/<arch>-<os>/`（如 `anydoc/x64-win32/anydoc_go.dll`），
+ * 由 Maven 打进 jar 的 `BOOT-INF/classes/anydoc/`，运行时 `AnydocNative` 从 classpath
+ * 提取到临时目录再 `Native.load`。
+ * <ul>
+ *   <li><b>好处</b>：安装包不再依赖「某个目录里恰好躺着一个 dll」，也不依赖 Tauri 的
+ *       bundle.resources 拷贝 —— 库跟着 jar 走，dev / IDEA / 安装包三条路径同构。</li>
+ *   <li><b>所以本函数的判据改为「jar 里有没有」</b>：有就报 OK（不再往 out 拷一份重复 8MB）；
+ *       jar 里没有才退回旧的「out / 仓库 backend/ 找 dll」兜底逻辑。</li>
+ * </ul>
+ *
+ * <p>⚠️ 目前只随包 `x64-win32`：Rust `cdylib` 必须在其目标平台上链接（macOS 需 Apple SDK、
+ * Linux 需 glibc sysroot、musl 不支持 cdylib）⇒ 其余平台需在对应构建机上编出后放入
+ * `resources/anydoc/<arch>-<os>/`。代码侧无需再改。
+ *
+ * @param jarPath jar 绝对路径（判据来源）
+ * @param jarTool JDK 的 jar 可执行文件（列条目用）
  */
-export function checkAnydocNative() {
+export function checkAnydocNative(jarPath, jarTool) {
+  // ── ① 优先：jar 内是否已内置平台库 ──
+  if (jarPath && jarTool && existsSync(jarPath)) {
+    let bundled = []
+    try {
+      const listing = execSync(`"${jarTool}" --list --file "${jarPath}"`, { encoding: 'utf8' })
+      bundled = listing
+        .split(/\r?\n/)
+        .map((l) => l.trim())
+        .filter((e) => e.startsWith('BOOT-INF/classes/anydoc/') && !e.endsWith('/'))
+    } catch (e) {
+      console.warn(`[prepare-backend] 读取 jar 条目失败（跳过内置库检查）: ${e.message}`)
+    }
+    if (bundled.length > 0) {
+      const platforms = [...new Set(bundled.map((e) => e.split('/')[3]))].sort()
+      console.log(
+        `[prepare-backend] anydoc 原生库：已随 jar 内置（平台 ${platforms.join(', ')}，` +
+          `${bundled.length} 个文件）—— 运行时由 AnydocNative 从 classpath 提取`
+      )
+      if (!platforms.includes('x64-win32')) {
+        console.warn('[prepare-backend] ⚠️ 内置库里没有 x64-win32 —— Windows 安装包会回落 Tika 解析 Office 文档')
+      }
+      return true
+    }
+  }
+
+  // ── ② 兜底：jar 里没有 ⇒ 旧的「外部 dll」路径（Tauri resources 目录随包） ──
   const dll = resolve(out, 'anydoc_go.dll')
   if (existsSync(dll)) {
     const sizeMB = (statSync(dll).size / 1024 / 1024).toFixed(1)
@@ -103,11 +140,11 @@ export function checkAnydocNative() {
     return true
   }
   console.warn('')
-  console.warn('[prepare-backend] ⚠️ 未找到 anydoc 原生库：' + dll)
+  console.warn('[prepare-backend] ⚠️ 未找到 anydoc 原生库（jar 内无 BOOT-INF/classes/anydoc/，外部也无）：' + dll)
   console.warn('  影响：Office/ODF/RTF/EPUB 文档将回落「内置 Office 解析」(Apache Tika)，')
   console.warn('        不会拿到 anydoc 的结构化 Markdown。应用本身可正常打包/运行。')
-  console.warn('  处置：按 front/scripts/build-anydoc.md 自行编译，把产物 anydoc_go.dll')
-  console.warn('        放到 <仓库根>/backend/ 或 front/src-tauri/backend/ 后重新运行本脚本。')
+  console.warn('  处置：按 front/scripts/build-anydoc.md 编译，把产物放到')
+  console.warn('        backend/src/main/resources/anydoc/<arch>-<os>/ 后重新 mvn package。')
   console.warn('')
   return false
 }
@@ -228,8 +265,9 @@ function main() {
   assertUniqueMigrationVersions(jarPath, tools.jar)
 
   // 3.5) anydoc 原生库检查（只警告不 fail —— 见 checkAnydocNative 的 WHY）
-  console.log(`[prepare-backend] [4/6] 检查 anydoc 原生库: ${resolve(out, 'anydoc_go.dll')}`)
-  checkAnydocNative()
+  //      ⭐ 判据已改为「jar 里有没有」：库随 jar 内置（resources/anydoc/<arch>-<os>/）
+  console.log(`[prepare-backend] [4/6] 检查 anydoc 原生库（jar 内置 → 外部兜底）`)
+  checkAnydocNative(jarPath, tools.jar)
 
   // 4) jdeps 求基线模块，与补丁集并集去重排序 → --add-modules 串
   console.log(`[prepare-backend] [5/6] jdeps 分析模块依赖: ${jarPath}`)

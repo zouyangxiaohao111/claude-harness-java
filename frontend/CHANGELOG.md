@@ -2,6 +2,24 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.72] - 2026-11-12
+
+### Fixed
+
+- **启动后端被自己杀掉 ⇒ 用户侧所有请求变成 Network Error**（用户 2026-11-12 报障）：
+  引入 `neo4j-java-driver` 后 `Neo4jReactiveHealthIndicator` 无条件激活、默认连
+  `localhost:7687` ⇒ 本机没跑 Neo4j ⇒ `/actuator/health` **恒 503** ⇒ 壳判「后端没起来」、
+  60s 后 `taskkill` ⇒ 而后端其实早已能服务（业务端点 200）。
+  判据改为业务端点 `GET /api/v1/settings` —— 与前端 `LaunchGate` 同一条
+  （「能不能服务」只有业务端点说了算，健康项只作诊断用）。
+- **anydoc 原生库随 jar 内置**：改放 `backend/src/main/resources/anydoc/<arch>-<os>/`
+  （如 `x64-win32/anydoc_go.dll`），由 Maven 打进 jar，运行时从 classpath 提取再 `Native.load`。
+  安装包不再依赖「某个目录里恰好躺着一个 dll」，dev / IDEA / 安装包三条路径同构。
+
+### Added
+
+- **子代理运行态**：左栏与会话列表显示子代理正在运行。
+
 ## [0.1.71] - 2026-11-11
 
 ### Fixed

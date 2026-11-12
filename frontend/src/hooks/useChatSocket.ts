@@ -19,6 +19,23 @@ import { parseDrainedQueueItems, type DrainedQueueItem } from '../utils/queuedUs
 import { askQuestionSummary, markAskUserQuestionNotified } from '../utils/askUserNotice'
 import { sendSystemNotification } from '../utils/systemNotify'
 import { isQueuedCommandEditable } from './useCommandQueue'
+import { refreshServerRunning } from './useServerRunning'
+
+/**
+ * [多会话运行点] 按 sid 一次性重查服务端运行态（非轮询 · 并发上限 6 · 失败静默）。
+ *
+ * <p>WHY 需要：{@code useServerRunningRebuild} / 切会话重建都只查**当前会话** ⇒ F5 / 重启后
+ * 后台仍在跑的 run 在侧栏无点（用户实测「后端还在跑，左侧没有反应」）。本函数补上「全部已知会话」这一面，
+ * 只在连接建立（onConnect）与列表新增会话时各跑一次；实时翻转仍由 status topic 事件驱动。
+ *
+ * <p>失败静默由 {@link refreshServerRunning} 内置（查不到不写 store）—— 不猜「空闲」也不误标「运行中」。
+ */
+async function rebuildKnownRunning(sids: string[]): Promise<void> {
+  const list = sids.filter(Boolean)
+  for (let i = 0; i < list.length; i += 6) {
+    await Promise.all(list.slice(i, i + 6).map((sid) => refreshServerRunning(sid)))
+  }
+}
 
 /** [打字机节流 2026-09-09] 流式 append 合并调度 → requestAnimationFrame 单帧合并（对齐 deepseek-harness
  *  notifier.markFrameDirty：N 次 markDirty 折叠为一次动画帧 flush，通知推迟到下一帧）。
@@ -479,6 +496,10 @@ export function useChatSocket(
   /** 名单经 ref 读最新值（onConnect 闭包用） */
   const knownSessionIdsRef = useRef<string[]>(knownSessionIds ?? [])
   knownSessionIdsRef.current = knownSessionIds ?? []
+  /** [多会话运行点] 上次已处理的已知会话集合（差集守卫）。null = 尚未初始化（首次 effect 只记账不重查，
+   *  载入那一次由 onConnect 的全量重建覆盖）—— storeSessions 每 5s 刷新 ⇒ knownSessionIds 引用每次都变，
+   *  全量重建会退化成「每 5s × N 个 GET」。 */
+  const knownIdsSnapRef = useRef<Set<string> | null>(null)
   // 多会话订阅：sessionId -> stream sub / permission subs（activeStreams 增删时动态增删）
   const activeStreamsRef = useRef(activeStreams)
   activeStreamsRef.current = activeStreams
@@ -725,6 +746,21 @@ export function useChatSocket(
     }
   }
 
+  /**
+   * [多会话运行点 · 2026-11-12] 为「已知会话」补订 status topic（幂等，{@link subscribeStatusTopic} 内判重）。
+   *
+   * <p>WHY：{@code session.status} 只在 `/topic/sessions/{sid}/status` 上推，而原实现只订**当前会话**
+   * ⇒ F5 / 重启后其它会话的 run 起轮/收口事件无人接收，侧栏运行点永远不亮（用户实测）。
+   * handler 本身已按 sid 写 store（{@code setServerRunning}），故只要订阅面扩大即生效。
+   */
+  function syncKnownStatusSubscriptions(client: Client): void {
+    if (!client?.connected) return
+    for (const sid of knownSessionIdsRef.current) {
+      if (!sid) continue
+      subscribeStatusTopic(client, sid)
+    }
+  }
+
   function ensureSessionStream(client: Client, sid: string) {
     if (!sid || streamSubsRef.current.has(sid)) return
     const topic = `/topic/sessions/${sid}/stream`
@@ -782,6 +818,15 @@ export function useChatSocket(
       syncAllStreams(client)
       // [会话状态同步] 连接建立/重连 → 为已知会话补订 permission-requests（实时黄点）
       syncKnownPermSubscriptions(client)
+      // [多会话运行点] 已知会话的 status topic 全部补订（非当前会话的起轮/收口事件才有人收）
+      syncKnownStatusSubscriptions(client)
+      // [多会话运行点] 连接建立/重连 → 一次性重建**全部**已知会话的服务端运行态（F5/重启后侧栏点的唯一补齐途径）。
+      //   ⛔ 放在所有订阅之后，别做成轮询（实时翻转走上面的 status 事件）。
+      {
+        const known = knownSessionIdsRef.current.filter(Boolean)
+        knownIdsSnapRef.current = new Set(known)
+        void rebuildKnownRunning(known)
+      }
       // 后台任务 SDK 事件通道（/topic/tasks）：drain 出站为 JSON 数组；tool_use_summary 为单对象
       client.subscribe(TASKS_TOPIC, (msg) => {
         const raw = JSON.parse(msg.body)
@@ -865,7 +910,19 @@ export function useChatSocket(
   // [会话状态同步] 会话列表变化 → 为新增会话补订 permission-requests（幂等；已订阅会话跳过）
   useEffect(() => {
     const client = clientRef.current
-    if (client?.connected) syncKnownPermSubscriptions(client)
+    if (client?.connected) {
+      syncKnownPermSubscriptions(client)
+      // [多会话运行点] 新进列表的会话也要订 status topic（幂等）
+      syncKnownStatusSubscriptions(client)
+    }
+    // [多会话运行点] 只对**本次新增**的 sid 重查运行态（差集守卫；全量重查 = 每 5s × N 个 GET）
+    const cur = (knownSessionIds ?? []).filter(Boolean)
+    const prevSnap = knownIdsSnapRef.current
+    knownIdsSnapRef.current = new Set(cur)
+    if (prevSnap) {
+      const added = cur.filter((sid) => !prevSnap.has(sid))
+      if (added.length > 0) void rebuildKnownRunning(added)
+    }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [knownSessionIds])
 
@@ -1392,7 +1449,9 @@ export function useChatSocket(
       // session.status → 驱动 StreamHeader 状态点；非法值回落 idle（防御后端脏数据）
       const raw = (evt as SessionStatusEvent).status
       const status = raw === 'thinking' || raw === 'streaming' ? raw : 'idle'
-      st.setAgentStatus(status)
+      // [多会话运行点] agentStatus 是**当前会话** StreamHeader 状态点的全局单值：status topic 现已覆盖
+      //   全部已知会话 ⇒ 无守卫时后台会话的 thinking/idle 会让当前会话头部闪。（sid 为空 = 归属不明，按旧行为写）
+      if (sid === sessionIdRef.current || !sid) st.setAgentStatus(status)
       // [C6 · 停止键可见性] 同一事件兼作「服务端运行态」的实时信号（按会话键控）：
       //   thinking/streaming → 该会话有 run 在跑（后台 drain 起的 run 也走这条通道，此前该路径
       //   不推任何 status ⇒ UI 无从显示停止键）；idle → run 收口，停止键消失。
@@ -1419,7 +1478,9 @@ export function useChatSocket(
       } else if (sid) {
         const sawComplete = turnSawCompleteRef.current.get(sid) === true
         turnSawCompleteRef.current.set(sid, false)
-        if (!sawComplete) onReconnectReloadRef.current?.(sid)
+        // [多会话运行点] 尾窗重拉只服务**当前会话**的显示（status topic 现覆盖全部已知会话 ⇒ 无守卫时
+        //   每个后台会话每次收口都会多拉一次尾页）。保持「原来只订当前会话」的既有语义。
+        if (!sawComplete && sid === sessionIdRef.current) onReconnectReloadRef.current?.(sid)
       }
     } else if (isTokenWarning(evt)) {
       // 压缩警告抑制态（契约）：suppressed=true（压缩成功）→ 清除该会话告警（写 null）。

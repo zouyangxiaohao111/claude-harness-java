@@ -655,14 +655,14 @@ fn main() {
                         *app.state::<BackendState>().0.lock().unwrap() = Some(pid);
                         eprintln!("[backend] 已启动本地后端，pid={}，后台等待健康就绪…", pid);
 
-                        // 3) 关键：setup 不阻塞主线程 —— 起后台线程轮询 /actuator/health 最多 60s，
+                        // 3) 关键：setup 不阻塞主线程 —— 起后台线程轮询业务端点 /api/v1/settings 最多 60s，
                         //    窗口首帧立即渲染 loader（Spring Boot prod 冷启动实测 >8s：首次 Flyway 全量迁移 /
                         //    c3p0 / Quartz bean 初始化）。就绪 / 超时都经事件通知前端（事件名定死，L2 前端 listen）：
                         //    - backend-ready：后端已就绪，前端据此放大窗口到 85%
                         //    - backend-error：启动超时，前端据此提示；超时先 kill_process_tree(pid) 防孤儿
                         std::thread::spawn(move || {
                             if backend::wait_backend_ready(backend::WAIT_BACKEND_READY_TIMEOUT) {
-                                eprintln!("[backend] 本地后端已就绪：http://localhost:3458/actuator/health");
+                                eprintln!("[backend] 本地后端已就绪：http://localhost:3458/api/v1/settings");
                                 let _ = handle.emit("backend-ready", ());
                             } else {
                                 backend::kill_process_tree(pid);

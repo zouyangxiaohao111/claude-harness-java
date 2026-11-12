@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { beforeEach, describe, expect, it, vi } from 'vitest'
-import { failureReasonOf, subagentListOfSession, useSubagentStore } from '../subagentStore'
+import { failureReasonOf, runningSubagentSessionIds, subagentListOfSession, useSubagentStore } from '../subagentStore'
 
 /** 与 store 内 STORAGE_KEY 同值（loadSaved 用例需要预置 localStorage）。 */
 const STORAGE_KEY = 'nexusai-subagents'
@@ -170,5 +170,41 @@ describe('subagentStore · usage 统计（D2/D3 数据源）', () => {
 
     useSubagentStore.getState().register(null, 't-3', 'carol', 'local_agent', 's1')
     expect(failureReasonOf(useSubagentStore.getState().bySession['s1']!['t-3']!)).toBeNull()
+  })
+
+  it('[侧栏运行点] runningSubagentSessionIds：running 才收（含 restored），终态不收、别名不重复计、多会话独立', () => {
+    // 别名键：同一 identity 挂 taskId + toolUseId 两个键 ⇒ 只算一次（集合语义天然去重，此处钉行为）
+    useSubagentStore.getState().register('tu-1', 't-1', 'alice', 'local_agent', 's1')
+    expect(Array.from(runningSubagentSessionIds(useSubagentStore.getState().bySession))).toEqual(['s1'])
+
+    // 终态（done / failed / stopped）不收 ⇒ 会话从集合里退出
+    useSubagentStore.getState().addActivity('t-1', { type: 'done', text: 'ok', ts: 1 }, 's1')
+    expect(runningSubagentSessionIds(useSubagentStore.getState().bySession).has('s1')).toBe(false)
+
+    useSubagentStore.getState().register(null, 't-2', 'bob', 'local_agent', 's1')
+    useSubagentStore.getState().addActivity('t-2', { type: 'failed', text: 'x', ts: 1 }, 's1')
+    useSubagentStore.getState().register(null, 't-3', 'carol', 'local_agent', 's1')
+    useSubagentStore.getState().addActivity('t-3', { type: 'stopped', text: 'x', ts: 1 }, 's1')
+    expect(runningSubagentSessionIds(useSubagentStore.getState().bySession).has('s1')).toBe(false)
+
+    // 多会话各自独立：s2 有 running、s1 全终态
+    useSubagentStore.getState().register(null, 't-9', 'dave', 'local_agent', 's2')
+    expect(Array.from(runningSubagentSessionIds(useSubagentStore.getState().bySession))).toEqual(['s2'])
+
+    // restored=true 的 running 也收（冷启动幽灵由清扫兜底，判据本身不排除）
+    useSubagentStore.setState({
+      sessionId: null,
+      bySession: {
+        s3: {
+          't-8': {
+            name: 'ghost', color: '#000', taskId: 't-8', status: 'running', currentTool: null,
+            restored: true, activities: [],
+          },
+        },
+      },
+    })
+    expect(runningSubagentSessionIds(useSubagentStore.getState().bySession).has('s3')).toBe(true)
+    // 空 map / 无会话 → 空集合
+    expect(runningSubagentSessionIds({}).size).toBe(0)
   })
 })
