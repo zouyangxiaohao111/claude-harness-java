@@ -34,7 +34,10 @@ while [ $# -gt 0 ]; do
   esac
 done
 
-REPO=$(detect_repo "$REPO")
+# ⚠️ 必须转**绝对路径**：--repo . 时 detect_repo 返回 "."，
+#    CARGO_TARGET 会变成相对路径 ⇒ cygpath 对相对路径保持相对 ⇒ Tauri 按相对解析
+#    ⇒ 产物落到 <src-tauri>/front/src-tauri/target/ 这种嵌套目录里。
+REPO="$(cd "$(detect_repo "$REPO")" && pwd)"
 [ -n "$VERSION" ] || VERSION=$(repo_version "$REPO")
 [ -n "$OUT" ] || OUT="${TMPDIR:-/tmp}/nexusai-release-$VERSION"
 [ -n "$CARGO_TARGET" ] || CARGO_TARGET="$REPO/front/src-tauri/target"
@@ -117,7 +120,7 @@ fi
 APPEXE="$CARGO_TARGET/release/nexusai-client.exe"
 [ -f "$APPEXE" ] && assert_exe_no_secret "$APPEXE" "$REPO/front/src-tauri/error-report.local.json" && _ok "app exe 内无错误上报 key"
 if [ "$SKIP_ANYDOC" = "0" ]; then
-  if [ -n "$JAR" ] && (unzip -l "$JAR" 2>/dev/null | grep -q "anydoc"); then
+  if [ -n "$JAR" ] && (unzip -l "$JAR" 2>/dev/null | grep -q "anydoc/x64-win32/anydoc_go.dll"); then
     _ok "anydoc 原生库已随 jar 内置"
   else
     _warn "jar 内未见 anydoc 原生库（若该功能启用，需确认是否随包）"

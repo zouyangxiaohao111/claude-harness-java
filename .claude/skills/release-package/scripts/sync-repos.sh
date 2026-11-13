@@ -104,6 +104,25 @@ else
   fi
 fi
 
+# ── 3b. 场景合并后的**依赖自检**（场景专属依赖易被 master 覆盖）──────
+#   坑：场景线的 backend/pom.xml 携带**场景专属依赖**（langgraph4j-core / milvus-sdk-java
+#   及其版本属性）。合并 master 时若整份 pom 取 master ⇒ 这两个依赖消失 ⇒
+#   场景后端编译报「找不到 org.bsc.langgraph4j / io.milvus」⇒ 场景线直接构建不出来。
+#   ⇒ 合并后必须跑一次场景后端编译；缺依赖时按场景原 pom 的块并回。
+_step "sync" "场景依赖自检"
+if [ -n "$SCENE_WT" ] && [ -d "$SCENE_WT/backend" ]; then
+  MISSING=""
+  for pat in "langgraph4j-core" "milvus-sdk-java"; do
+    grep -q "$pat" "$SCENE_WT/backend/pom.xml" || MISSING="$MISSING $pat"
+  done
+  if [ -n "$MISSING" ]; then
+    _warn "场景 pom 缺少场景专属依赖:$MISSING ⇒ 场景后端编译会失败（取 master 的 pom 覆盖所致）"
+    _warn "  修法：从场景合并前的 pom（git show <合并前 commit>:backend/pom.xml）取回该 <dependency> 块与版本属性"
+  else
+    _ok "场景专属依赖在位"
+  fi
+fi
+
 # ── 4. SVN 场景（只进 SVN）─────────────────────────────────────────
 _step "sync" "SVN 场景"
 if [ "$SKIP_SCENE" = "1" ]; then
