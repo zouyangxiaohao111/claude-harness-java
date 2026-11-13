@@ -172,7 +172,11 @@ public class InProcessMcpTransport implements McpTransport {
             try {
                 JsonNode node = mapper.readTree(frame);
                 if (peer.requestHandler == null) {
-                    log.warn("[InProcessMcpTransport] peer has no requestHandler, dropping id={}", requestId);
+                    // [必达] 无处理器也必须给调用方一个终态：原实现只 warn 后 return，
+                    //   发送侧的 pending future 永远不被完成（实测可挂到 MCP 27.8h 默认超时）。
+                    log.warn("[InProcessMcpTransport] peer has no requestHandler, 请求以错误返回 id={}", requestId);
+                    completePendingExceptionally(requestId,
+                        new IllegalStateException("peer has no requestHandler"));
                     return;
                 }
                 String method = node.path("method").asText();
@@ -180,8 +184,14 @@ public class InProcessMcpTransport implements McpTransport {
                 Object result = peer.requestHandler.apply(method, params);
                 // A5: handler 返回值即 response.result
                 sendResponseBack(requestId, result);
-            } catch (Exception e) {
-                // A5 错误路径: handler 抛错 → response.error
+            } catch (Throwable e) {
+                // [必达] A5 错误路径: 原 catch 只包 Exception ⇒ 处理链抛 Error
+                //   (LinkageError / StackOverflowError / OutOfMemoryError…) 时既不回包也不打日志，
+                //   调用方的 tools/call future 永远 pending（实测 open_application 卡整轮 turn）。
+                //   这里连 Error 一起兜底回 error 响应，保证调用方必定拿到终态。
+                if (e instanceof Error) {
+                    log.error("[InProcessMcpTransport] 请求处理抛 Error（已回 error 响应）id={}", requestId, e);
+                }
                 sendErrorBack(requestId, e);
             }
         });
@@ -247,18 +257,35 @@ public class InProcessMcpTransport implements McpTransport {
         }
     }
 
-    private void sendErrorBack(long requestId, Exception handlerError) {
+    private void sendErrorBack(long requestId, Throwable handlerError) {
         try {
             var errorResponse = new LinkedHashMap<String, Object>();
             errorResponse.put("jsonrpc", "2.0");
             errorResponse.put("id", requestId);
             errorResponse.put("error", Map.of(
                 "code", -32603,
-                "message", handlerError.getMessage() == null ? "internal error" : handlerError.getMessage()
+                "message", handlerError.getMessage() == null
+                    ? handlerError.getClass().getSimpleName() : handlerError.getMessage()
             ));
             handleIncomingFrame(mapper.writeValueAsString(errorResponse));
         } catch (Exception e) {
             log.warn("[InProcessMcpTransport] failed to send error response: {}", e.getMessage());
+            // [必达] 回包自身失败也要给调用方终态，否则 future 永久 pending
+            completePendingExceptionally(requestId, handlerError);
+        }
+    }
+
+    /**
+     * [必达] 以异常完成发送侧等待中的请求（幂等；无等待者时 no-op）。
+     *
+     * @param requestId 请求 id
+     * @param cause     失败原因
+     */
+    private void completePendingExceptionally(long requestId, Throwable cause) {
+        CompletableFuture<JsonNode> fut = pending.remove(requestId);
+        if (fut != null) {
+            fut.completeExceptionally(cause instanceof Exception e
+                ? e : new IllegalStateException(cause.getClass().getSimpleName() + ": " + cause.getMessage(), cause));
         }
     }
 

@@ -296,7 +296,7 @@ describe('[轮次中间过程折叠]', () => {
 
 describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
   /** 数「nexus」消息头（不是正文里出现的字样） */
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
     .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
 
   it('基线：一轮=1 user + 多条 assistant 段 → 只能有 1 个 nexus 头', () => {
@@ -386,7 +386,7 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
 })
 
 describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
     .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
 
   it('⭐ 一轮内：已落库 assistant 段 + 尾部流式块 → 只能有 1 个 nexus 头', () => {
@@ -434,7 +434,7 @@ describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
 })
 
 describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assistant）', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
     .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
 
   it('⭐ 两条 user 紧邻 + 之后多段 assistant → 不得出现 2 个 nexus 头', () => {
@@ -465,7 +465,7 @@ describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assista
 })
 
 describe('[2026-11-01 用户报告] 窗口首条无 user 行（滑动窗口截断）', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author'))
+  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
     .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
 
   it('⭐⭐ 窗口从 assistant 开始（前面的 user 已滑出）→ 后续多个用户轮仍各一个头', () => {
@@ -812,7 +812,7 @@ describe('[2026-11-01 方案 3] 正在执行指示器', () => {
     expect(container.textContent).toContain('实时乙')
   })
 
-  it('⭐⭐ 收起态要提示「还有 N 项」（用户：不然用户不知道能展开）', () => {
+  it('⭐⭐ 收起态要提示「隐藏了 N 项」（用户：不然用户不知道能展开）', () => {
     // [2026-11-12 用户裁定] 收起只露 3 段，用户不知道下面还藏着内容、就不会点箭头。
     // 数据：3 条中间段 × 2 段（思考 + 工具）= 6 段 ⇒ 收起露 3、隐藏 3。
     // 变异点：不渲染 .turn-process-more / 段数算错 ⇒ 本用例红。
@@ -830,8 +830,8 @@ describe('[2026-11-01 方案 3] 正在执行指示器', () => {
     renderList([userMsg('u1'), intermediateMsg('a1', 'u1'), intermediateMsg('a2', 'u1'), intermediateMsg('a3', 'u1')])
     const t = () => runningToggle()
     const more = () => container.querySelector('.turn-process-more')
-    expect(more(), '收起态必须有「还有 N 项」提示').not.toBeNull()
-    expect(t()!.textContent).toContain('还有 3 项')
+    expect(more(), '收起态必须有「隐藏了 N 项」提示').not.toBeNull()
+    expect(t()!.textContent).toContain('隐藏了 3 项')
     // 展开后不再提示
     act(() => { t()!.click() })
     expect(more(), '展开态不该再提示还有更多').toBeNull()

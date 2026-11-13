@@ -13,6 +13,7 @@ import java.util.function.Function;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.ArgumentMatchers.argThat;
 import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.doThrow;
 import static org.mockito.Mockito.mock;
@@ -122,16 +123,35 @@ class EffortCommandTest {
     void invalidArg_errorsWithValidOptions() {
         EffortCommand.EffortCommandResult r = command.handle("foo", SESSION);
         assertThat(r.message()).isEqualTo(
-            "Invalid argument: foo. Valid options are: low, medium, high, xhigh, max, ultracode, auto");
+            "Invalid argument: foo. Valid options are: off, low, medium, high, xhigh, max, ultracode, auto");
         assertThat(r.effortValue()).isNull();
         verify(sessionMapper, never()).update(any(SessionRecord.class));
+    }
+
+    @Test
+    @DisplayName("/effort off → 写入 sessions.effort_level='off'（关闭思考档）")
+    void setOff_writesThinkingOffSentinel() {
+        EffortCommand.EffortCommandResult r = command.handle("off", SESSION);
+
+        assertThat(r.message()).contains("Set effort level to off");
+        assertThat(r.effortValue()).isEqualTo("off");
+        // ⛔ 不能落成 null（那等于「未设置 → 回落模型默认」，用户以为关了其实没关）
+        verify(sessionMapper).update(argThat(
+            (SessionRecord rec) -> "off".equals(rec.getEffortLevel())));
+    }
+
+    @Test
+    @DisplayName("/effort OFF（大写）同样识别为关闭思考")
+    void setOff_isCaseInsensitive() {
+        EffortCommand.EffortCommandResult r = command.handle("OFF", SESSION);
+        assertThat(r.effortValue()).isEqualTo("off");
     }
 
     @Test
     @DisplayName("/effort help / -h / --help → 用法说明（CC effort.tsx:9 + 173-176）")
     void help_showsUsage() {
         String help = command.handle("help", SESSION).message();
-        assertThat(help).startsWith("Usage: /effort [low|medium|high|max|auto]");
+        assertThat(help).startsWith("Usage: /effort [off|low|medium|high|xhigh|max|auto]");
         assertThat(help).contains("- low: Quick, straightforward implementation");
         assertThat(command.handle("-h", SESSION).message()).isEqualTo(help);
         assertThat(command.handle("--help", SESSION).message()).isEqualTo(help);

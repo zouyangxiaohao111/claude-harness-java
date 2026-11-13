@@ -130,6 +130,29 @@ interface ComposerProps {
   ultracodeEnabled?: boolean | null
   /** 会话级精简模式（V33 bare_mode）· true = simple 模式（工具只显 [Bash, Read, Edit]） */
   bareMode?: boolean | null
+  /** 知识库场景：四种模式（= 四个内置 KB 专家）· 传了则 + 菜单平铺这些项，替代 simple/full 模式 */
+  agentModes?: Array<{ key: string; label: string; title?: string; active: boolean; onPick: () => void }>
+  /** 极简外框：隐藏「项目绑定 / 模式 / 运行」三个胶囊（知识库弹窗用） */
+  minimalChrome?: boolean
+  /** 快速问答：只留「文件 / 知识库」两个入口（+ 菜单 / 浏览器 / 工具面板都不显示） */
+  minimalTools?: boolean
+  /** 输入框内、textarea 之上的自定义区（知识库场景放已选库 chip；不传 = 无） */
+  topChips?: ReactNode
+  /**
+   * 空态欢迎区的推荐问题（知识库新对话用）。
+   *
+   * <p>传了就**替换**默认的三个快捷动作（⚡生成实体提取脚本…）—— 那些是主会话的固定提示，
+   * 与知识库无关；位置对齐源站：欢迎语下面紧跟「你可以这样问我」+ 换一批 + 问题列表。
+   */
+  emptySuggestions?: {
+    questions: string[]
+    onPick: (q: string) => void
+    onRefresh: () => void
+  }
+  /** @ 候选改为这组条目（知识库场景：@ 选知识库，替代项目文件树） */
+  atItems?: Array<{ id: string; label: string; hint?: string; sub?: string; kind?: 'kb' | 'file'; kbId?: string }>
+  /** @ 选中某条目（知识库场景用来记入选中的库/文件；不传则只按文本插入） */
+  onAtPickItem?: (item: { id: string; label: string; hint?: string; sub?: string; kind?: 'kb' | 'file'; kbId?: string }) => void
   /** Mode 切换（App 调 sessionApi.update({bareMode})）· true = simple */
   onModeChange?: (simple: boolean) => void
   /** 上拉抽屉点「模型」行 → 打开模型选择弹窗（App 处理） */
@@ -184,6 +207,9 @@ interface ComposerProps {
 const TOKEN_BUDGET_RE = /\+\d+[kmb]?/gi
 
 // 高亮层与 textarea 共用同一套排版参数，保证逐字对齐（背景透明 textarea + 前置高亮层）
+const AT_COUNT: CSSProperties = { marginLeft: 'auto', fontSize: 12, color: 'var(--ink-faint)' }
+const AT_SUB: CSSProperties = { marginLeft: 'auto', fontSize: 11, color: 'var(--ink-faint)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
+
 const HIGHLIGHT_TEXT_STYLE: CSSProperties = {
   fontFamily: 'var(--font-sans)',
   fontSize: 14,
@@ -299,7 +325,21 @@ function renderHighlighted(
   return nodes
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint }: ComposerProps) {
+const SUG_WRAP: React.CSSProperties = { width: '100%', maxWidth: 760, margin: '0 auto', padding: '0 4px' }
+const SUG_HEAD: React.CSSProperties = { display: 'flex', alignItems: 'center', justifyContent: 'space-between', margin: '4px 0 8px' }
+const SUG_TITLE: React.CSSProperties = { fontSize: 13, fontWeight: 600, color: '#1f2329' }
+const SUG_REFRESH: React.CSSProperties = {
+  border: 0, background: 'transparent', color: '#1664ff', fontSize: 12, cursor: 'pointer', padding: '2px 4px',
+}
+const SUG_GRID: React.CSSProperties = { display: 'grid', gridTemplateColumns: 'repeat(3, minmax(0, 1fr))', gap: 8 }
+const SUG_CARD: React.CSSProperties = {
+  padding: '10px 12px', borderRadius: 10, border: '1px solid #e5e6eb', background: '#fff',
+  fontSize: 12.5, color: '#1f2329', cursor: 'pointer', textAlign: 'left', lineHeight: 1.45,
+  display: '-webkit-box', WebkitLineClamp: 2, WebkitBoxOrient: 'vertical',
+  overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
+}
+
+export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -482,8 +522,21 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     const segStartAbs = lastNl >= 0 ? lastNl + 1 + seg : seg
     return { segStartAbs, prefix: tail.slice(1) }
   })()
-  const atActive = !!atTailIndex && !!boundProjectId && !streaming
+  const atActive = !!atTailIndex && (!!boundProjectId || !!atItems?.length) && !streaming
   const [atIndex, setAtIndex] = useState(0)
+  /** 点「@ 知识库」按钮直接展开面板（源站行为：点按钮只弹窗，不往输入框写 @） */
+  const [atOpen, setAtOpen] = useState(false)
+  /** 知识库面板的二级分类：null = 一级（知识库 / 文件两行） */
+  const [atGroup, setAtGroup] = useState<null | 'kb' | 'file'>(null)
+  /** 知识库 @ 面板（两级）是否展开 · 关闭时回到一级 */
+  const kbPanelOpen = !!atItems?.length && (atOpen || !!atTailIndex) && !streaming
+  const kbGroupCounts = useMemo(() => {
+    const list = atItems ?? []
+    return {
+      kb: list.filter((i) => (i.kind ?? 'kb') === 'kb').length,
+      file: list.filter((i) => i.kind === 'file').length,
+    }
+  }, [atItems])
   const atMenuRef = useRef<HTMLDivElement>(null)
   const hadAtRef = useRef(false)
   const [projFiles, setProjFiles] = useState<string[] | null>(null)
@@ -509,12 +562,27 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [atActive, boundProjectId])
   const atMatches = useMemo(() => {
-    if (!atActive || projFiles === null || !atTailIndex) return null
+    // 知识库面板：一级只有「知识库 / 文件」两行，二级才出候选
+    if (atItems?.length && (atOpen || atTailIndex)) {
+      if (!atGroup) return null
+      const q = (atTailIndex?.prefix ?? '').toLowerCase()
+      const list = atItems
+        .filter((i) => (i.kind ?? 'kb') === atGroup && (!q || i.label.toLowerCase().includes(q)))
+        .slice(0, 40).map((i) => i.label)
+      return list.length ? list : null
+    }
+    if (!atActive || !atTailIndex) return null
     const q = atTailIndex.prefix.toLowerCase()
+    // 知识库场景：候选是知识库名（⛔ 不走项目文件树 —— 弹窗没有绑定项目）
+    if (atItems?.length) {
+      const list = atItems.filter((i) => !q || i.label.toLowerCase().includes(q)).slice(0, 40).map((i) => i.label)
+      return list.length ? list : null
+    }
+    if (projFiles === null) return null
     const list = projFiles.filter((p) => !q || p.toLowerCase().includes(q)).slice(0, 40)
     return list.length ? list : null
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [atActive, projFiles, atTailIndex])
+  }, [atActive, projFiles, atTailIndex, atItems, atOpen, atGroup])
   // 候选出现/变化 → 重置选中；随 ↑↓ 联动滚动
   useEffect(() => {
     if (atMatches && !hadAtRef.current) setAtIndex(0)
@@ -527,6 +595,21 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   }, [atIndex, atMatches])
   /** 选中候选 → 把行尾 @token 替换为 @path（保留前导空白/标点分隔符） */
   const applyAtPick = (path: string) => {
+    const hit = atItems?.find((i) => i.label === path)
+    if (hit) {
+      // 知识库项：选中 = 一个 chip（宿主渲染），⛔ 不往输入框写 @库名
+      onAtPickItem?.(hit)
+      if (atTailIndex) {
+        const head = atTailIndex.segStartAbs >= 0 ? composerText.slice(0, atTailIndex.segStartAbs + 1) : ''
+        setComposerText(head.replace(/\s+$/, head.trim() ? ' ' : ''))
+      }
+      // 选「知识库」= 范围已定，面板立即收起（对齐源站行为）；
+      // 选「文件」保持展开可连续多选（用户 2026-11-13 要求的多选只针对文件）。
+      if (hit.kind === 'kb') setAtOpen(false)
+      setAtIndex(0)
+      textareaRef.current?.focus()
+      return
+    }
     if (!atTailIndex) return
     const head = atTailIndex.segStartAbs >= 0 ? composerText.slice(0, atTailIndex.segStartAbs + 1) : ''
     setComposerText(`${head}@${path} `)
@@ -960,11 +1043,25 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         <div className="welcome">
           <CatArtBody className="welcome-logo" />
           <div className="hero-title">你好，今天有什么可以帮忙的</div>
-          <div className="quick-actions">
-            <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>⚡ 生成实体提取脚本</div>
-            <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>📝 优化代码注释</div>
-            <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>🔍 检查架构逻辑</div>
-          </div>
+          {emptySuggestions && emptySuggestions.questions.length > 0 ? (
+            <div style={SUG_WRAP}>
+              <div style={SUG_HEAD}>
+                <span style={SUG_TITLE}>你可以这样问我</span>
+                <button type="button" style={SUG_REFRESH} title="换一批" onClick={emptySuggestions.onRefresh}>换一批</button>
+              </div>
+              <div style={SUG_GRID}>
+                {emptySuggestions.questions.map((q) => (
+                  <button key={q} type="button" style={SUG_CARD} title={q} onClick={() => emptySuggestions.onPick(q)}>{q}</button>
+                ))}
+              </div>
+            </div>
+          ) : (
+            <div className="quick-actions">
+              <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>⚡ 生成实体提取脚本</div>
+              <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>📝 优化代码注释</div>
+              <div className="action-card" onClick={() => showToast('快捷动作开发中', 'info')}>🔍 检查架构逻辑</div>
+            </div>
+          )}
         </div>
       )}
       <div className="composer-inner">
@@ -975,6 +1072,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         <QueuedCommandsBar queuedCommands={queuedCommands} onEdit={() => void handlePopEditable()} />
         {/* 输入框上方一行：左=项目绑定，右=模型选择器（设计稿 v7） */}
         <div className="composer-top">
+          {!minimalChrome && (
           <div
             className={`project-binder${modeLocked ? ' locked' : ''}`}
             title={modeLocked ? '对话进行中不可切换项目（仅新会话可切换）' : '选择项目'}
@@ -995,7 +1093,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               <path d="M3 4.5L6 7.5L9 4.5" />
             </svg>
           </div>
+          )}
           {/* Mode 下拉（原型）：simple/full · 对话进行中锁定（仅新会话可切换） */}
+          {!minimalChrome && (
           <div
             className={`toolbar-select${modeLocked ? ' locked' : ''}`}
             title={modeLocked ? '对话进行中不可切换模式（仅新会话可切换）' : '切换模式'}
@@ -1020,8 +1120,9 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
               </div>
             )}
           </div>
+          )}
           {/* [subagent-hint] 子代理运行提示：紧挨 full 模式右侧（位置在视线区，不再放右缘操作组） */}
-          {subagentHint}
+          {!minimalChrome && subagentHint}
           {/* 输入框上方右缘操作组（右对齐输入框右缘）：待回答提示 + 回到底部（离底时）+ 停止所有（运行中） */}
           <div className="composer-top-actions">
             {pendingHint}
@@ -1070,6 +1171,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           <GoalHead sessionId={sessionId ?? null} />
         )}
         <div className="input-box">
+          {topChips}
           <div style={{ position: 'relative' }}>
             <div
               ref={highlightRef}
@@ -1211,9 +1313,61 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 ))}
               </div>
             )}
-            {atMatches && (
+            {/* 知识库 @ 面板：两级（对齐源站 —— 一级「知识库 / 文件」两行，二级是条目） */}
+            {kbPanelOpen ? (
               <div className="at-menu" ref={atMenuRef}>
-                <div className="at-menu-cap">@ 引用文件 · {boundProjectName ?? '绑定项目'}</div>
+                {atGroup === null ? (
+                  <>
+                    <div className="at-menu-cap">选择</div>
+                    <div className="at-item" onClick={() => { setAtGroup('kb'); setAtIndex(0) }}>
+                      <span className="at-at">▤</span>
+                      <span className="at-path">知识库</span>
+                      <span style={AT_COUNT}>{kbGroupCounts.kb} ›</span>
+                    </div>
+                    <div className="at-item" onClick={() => { setAtGroup('file'); setAtIndex(0) }}>
+                      <span className="at-at">▦</span>
+                      <span className="at-path">文件</span>
+                      <span style={AT_COUNT}>{kbGroupCounts.file} ›</span>
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="at-menu-cap">
+                      <span
+                        role="button"
+                        title="返回"
+                        style={{ cursor: 'pointer', marginRight: 6 }}
+                        onClick={(e) => { e.stopPropagation(); setAtGroup(null); setAtIndex(0) }}
+                      >‹</span>
+                      {atGroup === 'kb' ? '知识库' : '文件'}
+                      <span style={{ float: 'right', fontSize: 11 }}>共 {atMatches?.length ?? 0} 项</span>
+                    </div>
+                    {(atMatches ?? []).map((p, i) => {
+                      const entry = atItems?.find((x) => x.label === p)
+                      const active = i === atIndex % (atMatches?.length ?? 1)
+                      return (
+                        <div
+                          key={p}
+                          className={`at-item ${active ? 'active' : ''}`}
+                          onMouseEnter={() => setAtIndex(i)}
+                          onClick={() => applyAtPick(p)}
+                          title={p}
+                        >
+                          <span className="at-at">{atGroup === 'kb' ? '▤' : '▦'}</span>
+                          <span className="at-path">{p}</span>
+                          {entry?.sub && <span style={AT_SUB}>{entry.sub}</span>}
+                        </div>
+                      )
+                    })}
+                    {!atMatches && (
+                      <div className="at-item" style={{ cursor: 'default', color: 'var(--ink-faint)' }}>没有匹配项</div>
+                    )}
+                  </>
+                )}
+              </div>
+            ) : atMatches && (
+              <div className="at-menu" ref={atMenuRef}>
+                <div className="at-menu-cap">{`@ 引用文件 · ${boundProjectName ?? '绑定项目'}`}</div>
                 {atMatches.map((p, i) => (
                   <div
                     key={p}
@@ -1305,6 +1459,25 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                       </button>
                     )}
                     {/* 模式：右侧 flyout（不再是盲切一项；modeLocked 时只提示不切换） */}
+                    {agentModes ? (
+                      <>
+                        {agentModes.map((m) => (
+                          <button
+                            key={m.key}
+                            type="button"
+                            className="plus-item"
+                            role="menuitemradio"
+                            aria-checked={m.active}
+                            title={m.title}
+                            onClick={() => { closePlusMenu(); m.onPick() }}
+                          >
+                            <span>{m.active ? '●' : '○'}</span>
+                            <span>{m.label}</span>
+                            {m.active && <span className="plus-badge on">当前</span>}
+                          </button>
+                        ))}
+                      </>
+                    ) : (
                     <div className="plus-sub-anchor">
                       <button
                         type="button"
@@ -1345,6 +1518,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                         </div>
                       )}
                     </div>
+                    )}
                     {/* 专家：复用现有技能市场弹窗（专家 tab） */}
                     {onOpenMarket && (
                       <button type="button" className="plus-item" role="menuitem" onClick={() => { closePlusMenu(); onOpenMarket?.('expert') }}>
@@ -1404,8 +1578,20 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   <span>清空</span>
                 </button>
               )}
+              {/* 知识库选择（快速问答唯一入口）：点它等价于在文本末尾敲 @，复用同一套候选面板 */}
+              {!!atItems?.length && (
+                <button
+                  type="button"
+                  className="tool-chip"
+                  title="选择知识库（等同于输入 @）"
+                  onClick={() => { setAtOpen((v) => !v); setAtIndex(0) }}
+                >
+                  <span aria-hidden="true">@</span>
+                  <span>知识库</span>
+                </button>
+              )}
               {/* NexusAI in Chrome：输入框工具栏浏览器按钮 → 打开 ChromePanel（检查/安装/连接引导） */}
-              {onOpenChromePanel && (
+              {onOpenChromePanel && !minimalTools && (
                 <div className="tool-chip" onClick={onOpenChromePanel} title="NexusAI in Chrome：浏览器自动化扩展（检查/安装/连接）">
                   <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <circle cx="6" cy="6" r="4" />
@@ -1415,6 +1601,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 </div>
               )}
               {/* 会话工具：齿轮入口（默认只显图标，hover 滑出「工具」）→ 一级分类目录 → 二级明细 */}
+              {!minimalTools && (
               <div
                 className={`tools-chip-wrap${toolsOpen ? ' open' : ''}`}
                 ref={toolsPanelRef}
@@ -1447,6 +1634,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   />
                 )}
               </div>
+              )}
             </div>
             <div className="right-tools">
               {onPermissionModeChange && (
@@ -1482,7 +1670,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 <div className="model-effort-pill-wrap" ref={pillRef}>
                   <div className="model-effort-pill" onClick={() => setPillOpen((v) => !v)} title="模型与推理等级">
                     <span className="mep-model">{shortModel || '选择模型'}</span>
-                    <span className="mep-effort">{ultracodeEnabled ? 'ultracode' : (effortLevel ?? 'high')}</span>
+                    <span className="mep-effort">{ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')}</span>
                     <svg className={`mep-chevron ${pillOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 13, height: 13 }}>
                       <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
@@ -1498,7 +1686,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                       {onOpenEffort && (
                         <div className="pill-row" onClick={() => { setPillOpen(false); onOpenEffort() }}>
                           <span className="pill-label">推理等级</span>
-                          <span className="pill-value">{ultracodeEnabled ? 'ultracode' : (effortLevel ?? 'high')} ›</span>
+                          <span className="pill-value">{ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')} ›</span>
                         </div>
                       )}
                     </div>

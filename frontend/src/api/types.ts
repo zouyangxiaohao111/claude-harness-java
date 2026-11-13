@@ -760,8 +760,10 @@ export interface SessionDto {
   group: SessionGroup | null
   tabId: string | null
   mainProjectId: string | null
-  /** 会话级思考深度（V31 effort_level）· low/medium/high/xhigh/max */
-  effortLevel: 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null
+  /** 会话级思考深度（V31 effort_level）· off/low/medium/high/xhigh/max
+   *  ⚠️ 'off' = 关闭思考（后端映射 thinking:{type:"disabled"}，且不发 effort），
+   *     ⛔ 它不是 effort 档位，别当成 'low' 的别名。 */
+  effortLevel: 'off' | 'low' | 'medium' | 'high' | 'xhigh' | 'max' | null
   /** 会话级 ultracode 开关（V32）· ultracode = xhigh effort + workflows 编排（effortLevel 同步 xhigh） */
   ultracodeEnabled: boolean | null
   /** 会话级精简模式（V33 bare_mode）· 精简会话工具列表只显 [Bash, Read, Edit] */
@@ -1105,6 +1107,10 @@ export interface CreateTeamRequest {
 }
 /** 会话创建请求 · mainProjectId 必填（后端 @NotBlank）：空串/null 一律 400，不产生「未绑定会话」 */
 export interface SessionCreateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId: string }
+/** 分叉请求 · throughMessageId = 分叉点所在轮的**最后一条消息**（后端按 messages.seq 截断） */
+export interface ForkSessionRequest { throughMessageId: string }
+/** 分叉响应 · 新会话 + 复制的消息条数（前端拿到 session 即可插入左栏并跳转） */
+export interface ForkSessionResponse { session: SessionDto; copiedMessages: number }
 /** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
 export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null; /** V283 左栏置顶 · true=置顶，false=取消，不传=不改动 */ pinned?: boolean | null }
 /** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */
@@ -1394,6 +1400,17 @@ export interface StopHookSummaryPayload {
   /** 阻止继续的原因（CC stopReason · 仅 preventedContinuation=true 时有值） */
   stopReason?: string | null
 }
+/** 知识库问答引用（STOMP type='citations' 推送，与 GET /messages/{id}/citations 同源） */
+export interface CitationItem {
+  ref_index: number
+  chunk_id?: string | null
+  knowledge_id?: string | null
+  knowledge_base_id?: string | null
+  knowledge_title?: string | null
+  snippet?: string | null
+  chunk_index?: number | null
+}
+
 export interface ChatMessageDto {
   id: string
   sessionId: string
@@ -1710,6 +1727,11 @@ export interface MessageToolResultEvent extends StreamEventBase {
   toolCallId?: string | null
   result?: string | null
   isError?: boolean | null
+  /**
+   * 本次调用耗时（毫秒）。后端 2026-11-13 起在 `message.tool_result` 上带出，
+   * 供时间线/工具卡显示「耗时 7s」；旧服务端不传 ⇒ `undefined`（⛔ 不要当 0）。
+   */
+  durationMs?: number | null
 }
 export interface MessageCancelledEvent extends StreamEventBase {
   type: 'message.cancelled'

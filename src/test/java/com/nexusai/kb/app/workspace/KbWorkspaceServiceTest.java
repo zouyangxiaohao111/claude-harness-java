@@ -51,7 +51,7 @@ class KbWorkspaceServiceTest {
         Path configHome = tmp.resolve("confighome-register");
         NexusaiPaths.setConfigHomeDirOverride(configHome.toString());
         ProjectDto expected = dto("proj-kb", "知识库",
-            configHome.resolve("workspace/kb").toString().replace('\\', '/'));
+            configHome.resolve("kb").resolve("chat").toString().replace('\\', '/'));
         ProjectService svc = mockProjectService(expected);
 
         ProjectDto got = new KbWorkspaceService(svc).resolveProject();
@@ -61,9 +61,9 @@ class KbWorkspaceServiceTest {
         Mockito.verify(svc, Mockito.times(1)).register(captor.capture());
 
         String sentPath = captor.getValue().path();
-        // 必须落在降级链的第 3 级目录上，且是正斜杠（DB path UNIQUE 靠字面一致）
+        // 必须落在数据根下的 kb/chat 子目录（configHome 兜底时数据根 = configHome），且是正斜杠
         assertThat(sentPath).isEqualTo(
-            configHome.resolve("workspace/kb").toAbsolutePath().normalize().toString().replace('\\', '/'));
+            configHome.resolve("kb").resolve("chat").toAbsolutePath().normalize().toString().replace('\\', '/'));
         assertThat(sentPath).doesNotContain("\\");
         // 目录必须真的建出来了（会话一旦绑定，后端会拿它当 cwd，不存在即全工具失败）
         assertThat(Path.of(sentPath)).exists().isDirectory();
@@ -71,7 +71,7 @@ class KbWorkspaceServiceTest {
     }
 
     @Test
-    @DisplayName("项目名固定为「知识库」（左栏分组显示名，不取目录名 kb）")
+    @DisplayName("项目名固定为「知识库对话」（左栏分组显示名，不取目录名 chat）")
     void usesFixedProjectName() {
         NexusaiPaths.setConfigHomeDirOverride(tmp.resolve("confighome-name").toString());
         ProjectService svc = mockProjectService(dto("proj-kb", "知识库", "x"));
@@ -81,7 +81,7 @@ class KbWorkspaceServiceTest {
         ArgumentCaptor<ProjectCreateRequest> captor =
             ArgumentCaptor.forClass(ProjectCreateRequest.class);
         Mockito.verify(svc).register(captor.capture());
-        assertThat(captor.getValue().name()).isEqualTo("知识库");
+        assertThat(captor.getValue().name()).isEqualTo("知识库对话");
     }
 
     @Test

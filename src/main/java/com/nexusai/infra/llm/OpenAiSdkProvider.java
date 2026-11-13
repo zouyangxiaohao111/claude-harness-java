@@ -1497,9 +1497,20 @@ public class OpenAiSdkProvider implements LlmProvider {
         // [H13-GAP-3 v3] thinkingConfig disabled → thinking:{type:'disabled'}（CC execPromptHook.ts:71）.
         // [goal V253] 扩展：adaptive → thinking:{type:'adaptive'}（兼容强制思考的模型，如 MiniMax-M3.1-Flash）；
         //   null → 不发 thinking 字段（让模型走自身默认）。
-        if (thinkingType != null && !thinkingType.isBlank()) {
+        // ⭐ 「关闭思考」档（sessions.effort_level='off'）· 与 Anthropic 侧同义：
+        //   显式 thinkingConfig 优先（hook agent 等内部调用可能强制指定），
+        //   否则 effortValue='off' ⇒ thinking:{type:"disabled"}。
+        //   ⚠️ OpenAI 兼容端点的「关思考」字段不统一：官方 o 系用 reasoning_effort（无关闭值），
+        //   DeepSeek / MiniMax / Qwen 这类兼容层才认 thinking.type。本仓按兼容层口径发，
+        //   不认这个字段的端点会静默忽略（不会 400）—— 这是当前可用的最广形态。
+        String effectiveThinkingType = thinkingType;
+        if ((effectiveThinkingType == null || effectiveThinkingType.isBlank())
+                && EffortSupport.isThinkingOff(effortValue)) {
+            effectiveThinkingType = "disabled";
+        }
+        if (effectiveThinkingType != null && !effectiveThinkingType.isBlank()) {
             Map<String, Object> thinking = new LinkedHashMap<>();
-            thinking.put("type", thinkingType);
+            thinking.put("type", effectiveThinkingType);
             b.putAdditionalBodyProperty("thinking", JsonValue.from(thinking));
         }
         // [P2-16] temperature（非 null 才发送，对齐 CC claude.ts:1717）

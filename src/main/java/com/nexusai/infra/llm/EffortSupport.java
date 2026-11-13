@@ -32,6 +32,31 @@ public final class EffortSupport {
     private static final String[] EFFORT_LEVELS = {"low", "medium", "high", "xhigh", "max"};
 
     /**
+     * 「关闭思考」档位值 · 与 effort 档位同存于 {@code sessions.effort_level}（V31 列）。
+     *
+     * <p><b>WHY 单列一个值而不是新字段</b>：用户心智里「关掉推理」和「推理多深」是同一个滑块
+     * （UI 上就在 EffortModal 的最左一格）。存两个字段会逼出「effort=low 且 thinking=off」
+     * 这种自相矛盾的组合。
+     *
+     * <p><b>与 CC 的对应</b>：CC 用 {@code max_thinking_tokens = 0} 表达
+     * {@code thinking: {type:"disabled"}}；本仓没有该字段，故用 effort 列的这个哨兵值承载同一语义。
+     *
+     * <p>⛔ 它<b>不是</b> effort 档位：{@link #isEffortLevel} 对它返回 false（不会被当成
+     * {@code output_config.effort} 发给 API，API 只接受 5 档）。
+     */
+    public static final String THINKING_OFF = "off";
+
+    /**
+     * 该值是否表示「关闭思考」。
+     *
+     * @param value 原值（大小写不敏感；null → false）
+     * @return true = 本轮应发 {@code thinking:{type:"disabled"}} 且不发 effort
+     */
+    public static boolean isThinkingOff(String value) {
+        return value != null && THINKING_OFF.equalsIgnoreCase(value.trim());
+    }
+
+    /**
      * 是否为合法 effort 等级 · CC original: {@code isEffortLevel} (effort.ts:70-72)。
      *
      * @param value 待判定字符串（null → false）
@@ -267,6 +292,9 @@ public final class EffortSupport {
         if (value == null) {
             return "Balanced approach with standard implementation and testing";
         }
+        if (isThinkingOff(value)) {
+            return "Thinking disabled — no reasoning output, fastest and cheapest";
+        }
         return getEffortLevelDescription(value);
     }
 
@@ -281,6 +309,11 @@ public final class EffortSupport {
      * @return 展示档位（恒非 null）
      */
     public static String getDisplayedEffortLevel(String model, String appStateEffort) {
+        // 「关闭思考」要如实展示 off —— ⛔ 不能落进下面的 'high' 兜底（那会把用户关掉的思考
+        // 显示成一个并不生效的高档位）。
+        if (isThinkingOff(appStateEffort)) {
+            return THINKING_OFF;
+        }
         String resolved = resolveAppliedEffort(model, appStateEffort);
         return resolved != null ? resolved : "high";
     }
@@ -340,6 +373,11 @@ public final class EffortSupport {
         // 无效/数值（ant-only 不建模）→ null 回落模型默认（对齐 CC：appState.effortValue 已是
         // 合法 EffortValue，Java 需自行校验，concern ②）。
         String resolved;
+        // 「关闭思考」：不注入 effort（API 只认 5 档，发 'off' 会 400）。
+        // env 覆盖优先（用户用 env 钉死档位时以 env 为准），未被 env 覆盖才吃会话值。
+        if (envEffort == null && isThinkingOff(appStateEffortValue)) {
+            return null;
+        }
         if (envEffort != null) {
             resolved = envEffort;
         } else if (appStateEffortValue != null) {

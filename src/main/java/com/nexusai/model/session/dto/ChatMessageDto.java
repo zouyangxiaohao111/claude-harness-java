@@ -775,6 +775,31 @@ public record ChatMessageDto(
     }
 
     /**
+     * 拷贝方法：仅替换 {@code toolCalls}，其余字段全透传（record 拷贝模式，同 {@link #withContent}）。
+     *
+     * <p><b>WHY（发送边界剔除失效工具调用）</b>：会话工具被禁用后，历史里仍留着引用这些工具的
+     * {@code tool_use} 块；Anthropic 要求「历史引用的工具必须在本次请求的 tools 里」，否则整轮
+     * 400（{@code tool reference 'X' not found in available tools}）。发送边界
+     * {@code LlmAgentLoop.pruneUnavailableToolCalls} 需要生成「去掉失效 toolCalls」的副本 ——
+     * ⛔ 只改 API-bound 副本，不污染 {@code state.rawMessages()}（历史真相仍保留，恢复工具后又能用）。
+     *
+     * @param newToolCalls 新的工具调用列表（可为 null / 空 = 本条消息不再携带工具调用）
+     * @return 与原 record 全字段相同、仅 toolCalls 覆盖的新实例
+     */
+    public ChatMessageDto withToolCalls(List<ToolCallDto> newToolCalls) {
+        return new ChatMessageDto(
+            id, sessionId, role, author, content, reasoning, newToolCalls, finishReason,
+            inputTokens, outputTokens, time, createdAt, toolCallId, assistantMessageId,
+            acceptFeedback, contentBlocks, imagePasteIds, structuredOutput, isMeta, isError,
+            sourceToolUseID, subtype,
+            isApiErrorMessage, apiError, error, errorDetails,
+            inputCacheReadTokens, inputCacheCreationTokens,
+            compactMetadata, microcompactMetadata, logicalParentUuid,
+            isCompactSummary, isVisibleInTranscriptOnly, usage, level, matchedRule, snipMetadata,
+            cwd, reasoningDurationMs, userMessageId, decodeMs, contextTokensUsed, percentLeft, contextWindow, userAttachments, queuedOrigin, thinkingSignature);
+    }
+
+    /**
      * [实时落库 2026-09-03] 拷贝方法：仅替换 {@code subtype}，其余字段全透传 · 镜像 CC spread
      * {@code {...m, subtype}}（messages.ts:4539/4569 subtype 判别字段）· 与 {@link #withContent}
      * / {@link #withSnipMetadata} 同款 record 拷贝模式（仅第 22 参 subtype 覆盖为 newSubtype）。

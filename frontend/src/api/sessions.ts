@@ -1,10 +1,16 @@
 import { api } from './rest'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval } from './types'
+import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse } from './types'
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
   get: (id: string) => api<SessionDto>(`/sessions/${encodeURIComponent(id)}`),
   create: (req: SessionCreateRequest) => api<SessionDto>('/sessions', { method: 'POST', body: req }),
+  /** 分叉：从某轮末消息截断复制出一个新会话（标题追加「 分叉」，产物/附件按新会话 id 复制） */
+  fork: (id: string, throughMessageId: string) =>
+    api<ForkSessionResponse>(`/sessions/${encodeURIComponent(id)}/fork`, {
+      method: 'POST',
+      body: { throughMessageId } satisfies ForkSessionRequest,
+    }),
   update: (id: string, req: SessionUpdateRequest) =>
     api<SessionDto>(`/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: req }),
   remove: (id: string) => api<void>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),

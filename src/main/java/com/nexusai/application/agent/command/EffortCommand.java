@@ -48,8 +48,9 @@ public class EffortCommand {
     private static final List<String> COMMON_HELP_ARGS = List.of("help", "-h", "--help");
 
     /** CC effort.tsx:174-175 call() onDone 帮助字面量（原样镜像）。 */
-    private static final String HELP_TEXT = "Usage: /effort [low|medium|high|max|auto]\n\n"
+    private static final String HELP_TEXT = "Usage: /effort [off|low|medium|high|xhigh|max|auto]\n\n"
         + "Effort levels:\n"
+        + "- off: Thinking disabled (no reasoning tokens)\n"
         + "- low: Quick, straightforward implementation\n"
         + "- medium: Balanced approach with standard testing\n"
         + "- high: Comprehensive implementation with extensive testing\n"
@@ -163,8 +164,15 @@ public class EffortCommand {
         if ("ultracode".equals(normalized)) {
             return setUltracodeMode(sessionId);
         }
+        // 「关闭思考」档：与 effort 同存 sessions.effort_level，但语义是 thinking:{type:"disabled"}，
+        // ⛔ 不是 effort 档位（isEffortLevel 对它返回 false，避免被当 output_config.effort 发出去）。
+        if (EffortSupport.isThinkingOff(normalized)) {
+            return setEffortValue(EffortSupport.THINKING_OFF, sessionId);
+        }
+
         if (!EffortSupport.isEffortLevel(normalized)) {
-            String message = "Invalid argument: " + args + ". Valid options are: low, medium, high, xhigh, max, ultracode, auto";
+            String message = "Invalid argument: " + args
+                + ". Valid options are: off, low, medium, high, xhigh, max, ultracode, auto";
             if (log.isDebugEnabled()) {
                 log.debug("[EffortCommand] /effort 非法参数 '{}' → 报错列合法值", args);
             }

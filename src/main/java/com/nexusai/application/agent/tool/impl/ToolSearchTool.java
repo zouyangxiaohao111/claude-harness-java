@@ -3,6 +3,7 @@ package com.nexusai.application.agent.tool.impl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.config.SessionToolDisableConfig;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.ContentBlockParam;
 import com.nexusai.application.agent.tool.Tool;
@@ -23,6 +24,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
@@ -208,6 +210,13 @@ public class ToolSearchTool implements Tool {
         // CC 工具全集来自 call 上下文 options.tools；Java 端取 ctx.availableTools（单参路径为 null → 降级）。
         List<Tool> allTools = ctx != null && ctx.availableTools() != null
                 ? ctx.availableTools() : List.of();
+        // ⭐ [fix · 禁用工具仍可被搜出] ctx.availableTools() 是**原始池**（会话禁用的剔除只写在
+        //   LlmAgentLoop.sessionVisibleTools 的 <b>schema 口径</b>里，没同步到这里）。
+        //   ⇒ 只过滤 schema 不过滤候选池 = 模型「看不见」禁用工具的 schema，却仍能 ToolSearch
+        //   把它们 select 出来；返回的 tool_reference 一旦进入历史，下一轮请求就 400
+        //   （Anthropic: tool reference 'X' not found in available tools）。
+        //   ⇒ 候选池必须与 LLM schema 同源：先剔掉会话禁用集合。
+        allTools = excludeSessionDisabled(allTools, ctx != null ? ctx.sessionId() : null);
         if (allTools.isEmpty() && log.isDebugEnabled()) {
             log.debug("[ToolSearchTool] ctx 无可用工具（单参 execute 路径）→ select/fast-path 降级（CC 依赖 options.tools 全集）");
         }
@@ -682,5 +691,26 @@ public class ToolSearchTool implements Tool {
      */
     private static String getToolLocationHint() {
         return "Deferred tools appear by name in <system-reminder> messages.";
+    }
+
+    /**
+     * 剔除「本会话已禁用」的工具（模态：纯函数，可单测）。
+     *
+     * <p><b>WHY 必须有这一步</b>：{@code ctx.availableTools()} 是<b>原始池</b> ——
+     * 会话禁用的剔除只写在 {@code LlmAgentLoop.sessionVisibleTools}（LLM schema 口径）里，
+     * 没有同步到这里。结果就是：模型<b>看不见</b>禁用工具的 schema，却仍能从这里把它们
+     * {@code select} 出来；返回的 {@code tool_reference} 一旦进入历史，下一轮请求就会
+     * 400（{@code tool reference 'X' not found in available tools}）。
+     *
+     * <p>⇒ 候选池必须与 LLM schema 同源。
+     *
+     * @param allTools  原始可用工具池（可为 null）
+     * @param sessionId 会话标识；null / 无绑定 mapper → 空集禁用 ⇒ 原样返回
+     * @return 过滤后的新列表；无禁用 → 原引用
+     */
+    static List<Tool> excludeSessionDisabled(List<Tool> allTools, String sessionId) {
+        // 逻辑单点收敛到 SessionToolDisableConfig.filterDisabled —— 与 deferred_tools_delta 等
+        // 其他「需要和 LLM schema 同源」的旁路池共用同一实现，避免两处各写一遍再漂移。
+        return SessionToolDisableConfig.filterDisabled(allTools, sessionId);
     }
 }

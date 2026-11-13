@@ -167,6 +167,45 @@ public class KbCitationWriter {
         }
     }
 
+    /**
+     * 把某轮的引用行改挂到**落库后**的 assistant 消息 id 上。
+     *
+     * <p>WHY：写引用时 assistant 还没落库，只能用受理阶段返回的占位 id（{@code msg-stub-pending} 之类）；
+     * 落库后真实 id 是另一条（{@code msg-xxxx}）。不回填的话 {@code GET /messages/{id}/citations}
+     * 永远查不到 —— 前端「历史回放引用」正是按真实 id 查的（2026-11-13 用户实测右侧来源面板刷新后为空）。
+     *
+     * @param sessionId 会话 id（限定范围，防止跨会话误改）
+     * @param fromId    写库时的占位 id
+     * @param toId      落库后的真实 assistant 消息 id
+     * @return 改写的行数（失败 ⇒ 0，⛔ 不抛）
+     */
+    public int reassignAssistantMessageId(String sessionId, String fromId, String toId) {
+        if (sessionId == null || sessionId.isBlank()
+            || fromId == null || fromId.isBlank()
+            || toId == null || toId.isBlank()
+            || fromId.equals(toId)) {
+            return 0;
+        }
+        try {
+            List<KbCitationRecord> rows = citationMapper.selectListByQuery(QueryWrapper.create()
+                .where("session_id = ?", sessionId)
+                .and("assistant_message_id = ?", fromId)
+                .and("deleted = 0"));
+            int n = 0;
+            for (KbCitationRecord row : rows) {
+                row.setAssistantMessageId(toId);
+                citationMapper.update(row);
+                n++;
+            }
+            log.info("[引用] 回填 assistant id session={} {} → {} 条数={}", sessionId, fromId, toId, n);
+            return n;
+        } catch (RuntimeException e) {
+            log.warn("[引用] 回填 assistant id 失败 session={} {} → {} 原因={}",
+                sessionId, fromId, toId, e.getMessage());
+            return 0;
+        }
+    }
+
     /** 截断到快照上限（按码点，不切断代理对）。 */
     private static String truncate(String content) {
         if (content == null) {

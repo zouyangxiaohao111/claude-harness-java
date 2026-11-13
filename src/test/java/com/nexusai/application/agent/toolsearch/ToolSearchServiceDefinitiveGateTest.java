@@ -3,7 +3,7 @@ package com.nexusai.application.agent.toolsearch;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.ToolSearchTool;
-import com.nexusai.application.agent.tool.impl.WebSearchTool;
+import com.nexusai.application.agent.tool.impl.NotebookEditTool;
 import com.nexusai.infra.llm.CountTokensClient;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -30,11 +30,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class ToolSearchServiceDefinitiveGateTest {
 
-    /** Bash(非 deferred) + ToolSearch + WebSearch(shouldDefer=true，H3 接线) · 均非 SPECIAL_TOOLS. */
+    /** Bash(非 deferred) + ToolSearch + NotebookEdit(shouldDefer=true，H3 接线) · 均非 SPECIAL_TOOLS. */
     private static final List<Tool> TOOLS_WITH_SEARCH =
-            List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+            List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
     /** 无 ToolSearch 的列表（模拟 disallowedTools 剔除）. */
-    private static final List<Tool> TOOLS_NO_SEARCH = List.of(new BashTool(), new WebSearchTool());
+    private static final List<Tool> TOOLS_NO_SEARCH = List.of(new BashTool(), new NotebookEditTool());
 
     @AfterEach
     void resetEnv() {
@@ -134,7 +134,7 @@ class ToolSearchServiceDefinitiveGateTest {
     @DisplayName("isToolSearchEnabled：tst-auto 阈值 char fallback（默认 10%×200k×2.5=50k chars）→ 小工具集 false")
     void isToolSearchEnabled_tstAuto_belowThreshold_false() {
         // WHY: CC toolSearch.ts:742-754 char fallback（token 计数不可得时）。默认阈值 50,000 chars，
-        //   Bash/ToolSearch/WebSearch 描述远低于 → deferred 工具量不足时自动模式保持关闭（防全量预声明）。
+        //   Bash/ToolSearch/NotebookEdit 描述远低于 → deferred 工具量不足时自动模式保持关闭（防全量预声明）。
         ToolSearchService.envOverride = Map.of("ENABLE_TOOL_SEARCH", "auto");
         assertThat(ToolSearchService.isToolSearchEnabled(TOOLS_WITH_SEARCH, "claude-sonnet-4-5")).isFalse();
     }
@@ -143,7 +143,7 @@ class ToolSearchServiceDefinitiveGateTest {
     @DisplayName("isToolSearchEnabled：tst-auto token 优先——count_tokens 返回超阈值 → true（char fallback 本应 false）")
     void isToolSearchEnabled_tstAuto_tokenPath_takesPrecedence() {
         // WHY: CC checkAutoThreshold toolSearch.ts:712-738 先走精确 token 计数，非 null 即用 token 阈值
-        //   （不回退 char）。char fallback（50k chars）下 WebSearch 描述远低于阈值 → false；
+        //   （不回退 char）。char fallback（50k chars）下 NotebookEdit 描述远低于阈值 → false；
         //   但 token client 返回 100_000（raw）→ max(0,100000-500) ≥ 10%×200k=20_000 tokens → true。
         //   若实现退化回纯 char fallback（或 token 结果被忽略），本用例变红——锁定 token 优先契约。
         CountTokensClient highTokenClient = new CountTokensClient() {
@@ -176,17 +176,17 @@ class ToolSearchServiceDefinitiveGateTest {
     void filterToolsForSchema_enabledThreeBranches() {
         // WHY: claude.ts:1163-1168 动态工具加载语义——未预声明的 deferred 工具绝不进 schema，
         //   只有消息历史 tool_reference 已发现的才发送（消除全量预声明 + 数量上限）。
-        Set<String> deferred = Set.of("WebSearch");
+        Set<String> deferred = Set.of("NotebookEdit");
 
         List<Tool> noDiscovery = ToolSearchService.filterToolsForSchema(TOOLS_WITH_SEARCH, true, deferred, Set.of());
         assertThat(names(noDiscovery))
-                .as("deferred 未发现 → 剔除 WebSearch，Bash/ToolSearch 恒留")
+                .as("deferred 未发现 → 剔除 NotebookEdit，Bash/ToolSearch 恒留")
                 .containsExactlyInAnyOrder("Bash", "ToolSearch");
 
-        List<Tool> withDiscovery = ToolSearchService.filterToolsForSchema(TOOLS_WITH_SEARCH, true, deferred, Set.of("WebSearch"));
+        List<Tool> withDiscovery = ToolSearchService.filterToolsForSchema(TOOLS_WITH_SEARCH, true, deferred, Set.of("NotebookEdit"));
         assertThat(names(withDiscovery))
                 .as("deferred 已发现 → 三工具全留")
-                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "NotebookEdit");
     }
 
     @Test
@@ -200,20 +200,20 @@ class ToolSearchServiceDefinitiveGateTest {
         // ① 无 deferred：排除 ToolSearch + 全量（CC :1170-1172）
         List<Tool> noDeferred = ToolSearchService.filterToolsForSchema(TOOLS_WITH_SEARCH, false, null, null);
         assertThat(names(noDeferred))
-                .as("useToolSearch=false → 排除 ToolSearch，其余全量（含 WebSearch）")
-                .containsExactlyInAnyOrder("Bash", "WebSearch");
+                .as("useToolSearch=false → 排除 ToolSearch，其余全量（含 NotebookEdit）")
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
         // ② deferred 未发现 → 不参与过滤，仍全量（CC 恒等式）
         List<Tool> withDeferred = ToolSearchService.filterToolsForSchema(
-                TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of());
+                TOOLS_WITH_SEARCH, false, Set.of("NotebookEdit"), Set.of());
         assertThat(names(withDeferred))
                 .as("deferred 未发现也照发（false 分支 deferred 不参与过滤）")
-                .containsExactlyInAnyOrder("Bash", "WebSearch");
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
         // ③ deferred 已 discovered → 结果与 ② 逐项相同（deferred/discovered 均为恒等式输入）
         List<Tool> discovered = ToolSearchService.filterToolsForSchema(
-                TOOLS_WITH_SEARCH, false, Set.of("WebSearch"), Set.of("WebSearch"));
+                TOOLS_WITH_SEARCH, false, Set.of("NotebookEdit"), Set.of("NotebookEdit"));
         assertThat(names(discovered))
                 .as("discovered 不改变结果 —— false 分支对 deferred/discovered 恒等（CC 回归核心）")
-                .containsExactlyInAnyOrder("Bash", "WebSearch");
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
         // ④ 中性证明：filterToolsForSchema(false, deferred=∅)（旧非 anthropic 生产形态：豁免清空 deferred）
         //    === filterToolsForSchema(false, deferred 非空)（R8 新形态：门控直接 false，deferred 保留）
         //    → 非 anthropic 最终工具集与改动前逐项一致。
@@ -234,10 +234,10 @@ class ToolSearchServiceDefinitiveGateTest {
         Object prevInstance = injectInstance(new ToolSearchService());
         try {
             ToolSearchService.modeOverride = "activate";
-            assertThat(ToolSearchService.activateTools(List.of("WebSearch")))
+            assertThat(ToolSearchService.activateTools(List.of("NotebookEdit")))
                     .as("mode=activate → 命中 defer 名写入激活集并回传（ToolSearchTool 据此发激活提示）")
-                    .containsExactly("WebSearch");
-            assertThat(ToolSearchService.isActivated("WebSearch"))
+                    .containsExactly("NotebookEdit");
+            assertThat(ToolSearchService.isActivated("NotebookEdit"))
                     .as("激活集已写入 → filterToolsForSchema 将其视为 discovered 保留")
                     .isTrue();
 

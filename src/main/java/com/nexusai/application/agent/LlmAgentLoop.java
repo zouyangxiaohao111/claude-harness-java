@@ -2839,6 +2839,13 @@ public class LlmAgentLoop implements AgentLoop {
                         filterIncompleteAssistantToolCalls(
                             messageService.listForResumeExcluding(resumeRawTranscript, streamUserMessageId)));
                 }
+                // [历史图片恢复] 冷路径历史 user 消息只有文本 + image_paste_ids（DB 不存 contentBlocks，
+                //   MessageService.toDto:2611 恒空）→ 按 id 从 image-cache 读回 base64 重建 image block，
+                //   对齐 CC transcript 里历史图片原样回传（见 restoreHistoryImageBlocks 头注）。
+                //   热路径（账本快照）已带 blocks，本方法只补空块消息，不重复处理。
+                resumeHistory = restoreHistoryImageBlocks(resumeHistory, imageAttachmentStore,
+                    imageSessionKey(streamSessionId),
+                    modelSupportsImage(modelMapper, providerMapper, modelName));
                 if (resumeHistory != null && !resumeHistory.isEmpty()) {
                     // [C 级 2026-09-07] 恢复注入块只把 DB 既有历史灌入 state.rawMessages()（注册 prePersisted +
                     //   appendMessage 循环，供消息产出钩子跳过历史 id）。§14 SessionStart 是否执行由进程级
@@ -3824,6 +3831,8 @@ public class LlmAgentLoop implements AgentLoop {
                 effectiveUserPrompt, modelName,
                 imageSessionKey(sessionId), null, false,
                 resolveMultimodalModelName() /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/));
+            appendSyntheticFileReadMessages(state, params.attachments(), this.attachmentService);
+            appendPdfReferenceMessages(state, pdfAttachmentProcessor);
             for (String p : batchPrompts) {
                 state.appendMessage(toMessage(Role.user, p, null, null, false));
             }
@@ -3870,6 +3879,8 @@ public class LlmAgentLoop implements AgentLoop {
                 effectiveUserPrompt, modelName,
                 imageSessionKey(sessionId), null, false,
                 resolveMultimodalModelName() /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/));
+            appendSyntheticFileReadMessages(state, params.attachments(), this.attachmentService);
+            appendPdfReferenceMessages(state, pdfAttachmentProcessor);
         }
         // ── [skill-listing-cc-align 2026-09-10] skill_listing 注入点已下移至 loop() turn-0 drain 之后 ──
         //   CC：skill_listing 是 attachment，由 processTextPrompt 以 messages:[userMessage, ...attachments]
@@ -7297,18 +7308,59 @@ public class LlmAgentLoop implements AgentLoop {
             //   cc_bundle.js + claude.exe 双产物 0 命中 ⇒ delta 恒启用）；该 DB 列已由 V77 迁移
             //   DROP COLUMN 清除。
             if (toolsAssembly.useToolSearch()) {
+                // ⭐ [fix · 关闭工具后仍宣布「可用」] delta 的 announce diff 必须走**剔除会话禁用**后的池：
+                //   原实现传 perTurnTuc.availableTools()（原始池）⇒ 被禁用的工具仍在 poolNames 里，
+                //   removed 判定（!deferredNames && !poolNames）永不成立 ⇒ 不会告诉模型「这些工具已不可用，
+                //   别去搜」⇒ 模型继续对已下架工具发 tool_reference ⇒ 下一轮 400。开启方向同理：
+                //   added 也按真实可用集算，模型才会知道「现在能搜到它们了」。
                 ChatMessageDto dtd = PostCompactAttachmentRestorer.deferredToolsDeltaAttachment(
-                        perTurnTuc.availableTools(), effectiveModel, perTurnTuc.effectiveProviderType(),
+                        com.nexusai.application.agent.config.SessionToolDisableConfig.filterDisabled(
+                                perTurnTuc.availableTools(), perTurnTuc.sessionId()),
+                        effectiveModel, perTurnTuc.effectiveProviderType(),
                         messagesForLlm);
                 if (dtd != null) {
                     messagesForLlm = new ArrayList<>(messagesForLlm);
                     String rendered = PostCompactAttachmentRestorer.renderDeferredToolsDelta(dtd.content());
-                    messagesForLlm.add(0, rendered != null ? dtd.withContent(rendered) : dtd);
+                    // ⭐ 位置 = **队尾追加**（对齐 CC claude.ts:1328-1330 的 {@code $o.push(...)}）。
+                    //   ⛔ 原实现 add(0) 队首插入：prompt cache 按「tools + system + messages 前缀」
+                    //   逐字节匹配，队首插一条会让其后全部内容整体位移 ⇒ 前缀全断，本轮命中归零。
+                    //   追加到队尾则既有前缀一字节不动，且与 state.appendMessage(dtd) 的持久化落点
+                    //   一致（都在末尾）⇒ 下一轮从历史重建时位置相同，不会二次抖动。
+                    messagesForLlm.add(rendered != null ? dtd.withContent(rendered) : dtd);
                     state.appendMessage(dtd);
                     if (log.isDebugEnabled()) {
                         log.debug("[LlmAgentLoop] G16① deferred_tools_delta 前置注入: turn={} subtype={}"
                                 + " rendered={} (CC claude.ts:1328-1330 persisted attachment + CTX-09 人类可读渲染)",
                             state.turnCount(), dtd.subtype(), rendered != null);
+                    }
+                }
+            } else {
+                // ⭐ 全量内联路径（非 anthropic provider / anthropic 但模型不支持 tool_reference）：
+                //   这些情况下工具 schema 每轮都完整发给模型，没有 ToolSearch、也没有 deferred 概念。
+                //   用户在会话中途开关工具时，模型只会看到「tools 数组这一轮变长了」，没有任何显式提示。
+                //   ⇒ 补一条 tools_delta 通知（首次写不可见基线，之后只在有增减时注入）。
+                //   ⚠️ 两个路径互斥：useToolSearch=true 时由上面的 deferred_tools_delta 负责，
+                //      这里不再重复宣布，否则模型会收到两条语义相同的 system-reminder。
+                List<Tool> visibleForDelta = sessionVisibleTools(perTurnTuc, params.querySource());
+                ChatMessageDto td = PostCompactAttachmentRestorer.toolsDeltaAttachment(
+                        visibleForDelta, messagesForLlm);
+                if (td != null) {
+                    messagesForLlm = new ArrayList<>(messagesForLlm);
+                    String rendered = PostCompactAttachmentRestorer.renderToolsDelta(td.content());
+                    // rendered == null ⇒ 首轮基线，模型不可见但必须落历史（后续 diff 的比对源）
+                    // ⭐ 位置 = **队尾追加**，⛔ 不是 add(0) 队首插入。
+                    //   WHY（前缀缓存）：prompt cache 按「tools + system + messages 前缀」逐字节匹配。
+                    //   往队首插一条 ⇒ 其后所有内容整体位移 ⇒ 前缀全断，本轮命中归零。
+                    //   追加到队尾则「已有前缀一个字节都不动」，只多出一条尾巴 ⇒ 前缀照常命中。
+                    //   且 state.appendMessage(td) 也是追加到 state 末尾 ⇒ 本次请求的落点与持久化落点
+                    //   一致，下一轮从历史里重建时位置相同，不会再抖一次。
+                    //   注意：真正的分水岭是 tools 数组本身变了 —— 那一步缓存必然失效一次（tools 在
+                    //   前缀最前面），跟这条通知放哪无关；能做的只是别让它再多断一次。
+                    messagesForLlm.add(rendered != null ? td.withContent(rendered) : td);
+                    state.appendMessage(td);
+                    if (log.isDebugEnabled()) {
+                        log.debug("[LlmAgentLoop] tools_delta 队尾追加: turn={} 可见工具={} 模型可见={}",
+                            state.turnCount(), visibleForDelta.size(), rendered != null);
                     }
                 }
             }
@@ -7339,6 +7391,14 @@ public class LlmAgentLoop implements AgentLoop {
             //   让模型能引用消息 ID 调用 SnipTool。只改发送副本（ChatMessageDto.withContent），
             //   不污染 state.rawMessages()；门关 → 原引用（零行为变化）。
             messagesForLlm = AgentLoopContext.maybeAppendSnipIdTags(ctx, settingsResolver, messagesForLlm);
+            // ⭐ [fix · HTTP 400 tool reference not found] 剔除历史里指向「本次请求不可用工具」的调用。
+            //   WHY: 会话禁用 / agent 工具范围 / provider 不支持 tool_reference 等情况下，本次 tools 数组
+            //     里没有某工具，但会话历史里仍留着引用它的 tool_use（例如禁用电脑操作前跑过的那次
+            //     mcp__computer-use__activate_window）。Anthropic 要求「历史引用的工具必须存在于本次
+            //     tools」，否则整轮 400 且无法自愈（重试永远一样）。
+            //   ⇒ 在发送边界生成「去掉失效 toolCalls」的副本，并连带丢掉孤儿 tool 结果消息。
+            //   ⚠️ 只改 API 副本，不动 state.rawMessages() —— 历史真相保留，工具重新启用后还能用。
+            messagesForLlm = pruneUnavailableToolCalls(messagesForLlm, toolsAssembly, state.turnCount());
             // [bg-wait-hint Layer-1] 消费 doRun 暂存的后台等待提示（每 run 仅一次：takePending 清空）
             if (ctx.sessionState() != null) {
                 String bgHint = ctx.sessionState().takePendingBgWaitHint();
@@ -7758,6 +7818,32 @@ public class LlmAgentLoop implements AgentLoop {
             if (errored[0] || state.lastError() != null) {
                 // s11.x + [FIX-14] 使用原始异常对象（保留 LlmApiException 的 HTTP headers 供 Retry-After 提取）
                 Throwable streamError = selectStreamError(capturedError[0], state.lastError());
+
+                // ── [tool-search-refused] 端点不认 defer_loading ⇒ 剔除 deferred 重发一次 ──
+                //   CC 2.1.323：jJ(e) = 400/422 且消息匹配 /\bdefer_loading\b/ ⇒ 重发，并写
+                //   "[ToolSearch] HTTP …; sending the request again without deferred tools.
+                //    ENABLE_TOOL_SEARCH=false avoids the refused request"。
+                //   本仓等价：标记本会话拒绝（llmToolsArray 门控转 false ⇒ 全量内联、不发 defer_loading），
+                //   然后 continue —— do-while 体从头执行，toolsAssembly 会按新门控重建。
+                if (ToolSearchService.isDeferLoadingRefusal(streamError)) {
+                    String refusedSid = turnSessionId(ctx, perTurnTuc);
+                    if (ToolSearchService.isToolSearchRefused(refusedSid)) {
+                        // 已降级过一次仍被同样拒绝 ⇒ 不再循环，落到下方常规错误路径。
+                        log.error("[LlmAgentLoop] turn={} 已降级为全量内联后仍被拒绝 defer_loading，放弃工具搜索重试",
+                            state.turnCount());
+                    } else {
+                        ToolSearchService.markToolSearchRefused(refusedSid);
+                        int refusedStatus = streamError instanceof com.nexusai.infra.llm.LlmApiException laeRef
+                            ? laeRef.status() : -1;
+                        log.warn("[LlmAgentLoop] turn={} 端点拒绝 defer_loading (status={}, session={})，"
+                                + "本会话改走全量内联并重发 · 对齐 CC「sending the request again without deferred tools」",
+                            state.turnCount(), refusedStatus, refusedSid);
+                        state.clearError();
+                        errored[0] = false;
+                        state.markNeedsFollowUp();
+                        continue;
+                    }
+                }
 
                 // ── [H7-arch Phase 5 P4 C3] model fallback · 对齐 CC query.ts:894-953 ──
                 // FallbackTriggeredError（provider 抛出 / TransientErrorHandler 529 阈值抛出）且
@@ -10588,6 +10674,9 @@ public class LlmAgentLoop implements AgentLoop {
                 }
             }
             state.appendMessage(appended);
+            appendSyntheticFileReadMessages(state, item.attachments(),
+                ctx.sessionState() != null ? ctx.sessionState().attachmentService() : null);
+            appendPdfReferenceMessages(state, pdfProcessor);
             // [P0-2 OD-D9] mid-turn busy-queued 补推 /stream message.user（content=原文 RAW，
             //   isMeta=false，uuid=item.uuid()）→ 前端「原文气泡」：排队框移除后气泡显示原文（CC
             //   气泡显示 attachment.prompt 原文 AttachmentMessage.tsx:232-243）。仅 mid-turn drain；
@@ -10693,6 +10782,107 @@ public class LlmAgentLoop implements AgentLoop {
      * @param messagesForLlm 当前 LLM 请求消息列表（发送边界注入目标；只改副本）
      * @return 包壳后的新列表；无 queuedOrigin 命中 → 原引用（零行为变化）
      */
+    /**
+     * 剔除「本次请求不可用工具」在历史里的调用痕迹 · 防 Anthropic 400。
+     *
+     * <p><b>WHY</b>：模型的每次请求都带完整会话历史。历史里的 assistant 消息可能携带
+     * {@code tool_use}（Java 侧 = {@link ChatMessageDto#toolCalls()}），而 Anthropic 要求
+     * <b>历史中引用的工具必须存在于本次请求的 tools 数组</b>，否则：
+     * <pre>400 messages.N.content.0: tool reference 'X' not found in available tools</pre>
+     *
+     * <p>工具被「会话禁用」后只是从本次 tools 里剔除，<b>历史消息不会跟着变</b>
+     * ⇒ 任何「用过该工具」的会话在禁用后就永久 400（重试永远是同一个请求）。
+     *
+     * <p><b>判定集 = 本次 tools 数组的工具名</b>（{@code toolsAssembly.tools()}）。
+     * ⚠️ 注意 deferred 工具（带 {@code defer_loading}）的名字<b>仍然在</b> tools 数组里，
+     * 只是 schema 不下发 —— 它们经 ToolSearch 的 {@code tool_reference} 引用是合法的，
+     * ⛔ 不要把它们当失效剔掉。
+     *
+     * <p><b>处理方式</b>：
+     * <ol>
+     *   <li>assistant 消息：{@code toolCalls} 里 name 不在判定集 → 从列表中移除（保留该消息的文本）；</li>
+     *   <li>role=tool 的孤儿消息：{@code toolCallId} 命中被移除的调用 id → 整条丢弃
+     *       （否则 tool_result 找不到对应 tool_use，同样 400）。</li>
+     * </ol>
+     *
+     * <p>只作用于 API-bound 副本（{@code withToolCalls} 返回新实例），
+     * {@code state.rawMessages()} 与 DB 落库不变 ⇒ 工具重新启用后历史自动可用。
+     *
+     * @param messages 发送面消息列表（可为 null）
+     * @param assembly 本轮工具装配结果（{@code tools()} 为给 API 的 schema 数组）
+     * @param turnNo   轮次（仅日志）
+     * @return 剔除后的新列表；无失效调用 → 原引用（零行为变化）
+     */
+    static List<ChatMessageDto> pruneUnavailableToolCalls(
+            List<ChatMessageDto> messages,
+            ToolsAssembly assembly,
+            int turnNo) {
+        if (messages == null || messages.isEmpty() || assembly == null || assembly.tools() == null) {
+            return messages;
+        }
+        Set<String> availableToolNames = new java.util.HashSet<>();
+        for (JsonNode t : assembly.tools()) {
+            if (t != null && t.hasNonNull("name")) {
+                availableToolNames.add(t.get("name").asText());
+            }
+        }
+        // 空 tools = 本轮没有任何工具（极罕见）；此时任何 tool_use 都非法，但剔光可能让整段历史失义
+        // ⇒ 交给上游（模型会返回与工具无关的回复），本方法不处理。
+        if (availableToolNames.isEmpty()) {
+            return messages;
+        }
+
+        Set<String> droppedCallIds = new java.util.HashSet<>();
+        List<ChatMessageDto> filtered = new java.util.ArrayList<>(messages.size());
+        boolean anyDropped = false;
+        for (ChatMessageDto m : messages) {
+            if (m == null) {
+                filtered.add(null);
+                continue;
+            }
+            List<ToolCallDto> calls = m.toolCalls();
+            if (calls == null || calls.isEmpty()) {
+                filtered.add(m);
+                continue;
+            }
+            List<ToolCallDto> kept = new java.util.ArrayList<>(calls.size());
+            boolean dropped = false;
+            for (ToolCallDto tc : calls) {
+                if (tc != null && tc.name() != null && availableToolNames.contains(tc.name())) {
+                    kept.add(tc);
+                } else {
+                    dropped = true;
+                    if (tc != null && tc.id() != null) {
+                        droppedCallIds.add(tc.id());
+                    }
+                }
+            }
+            if (!dropped) {
+                filtered.add(m);
+                continue;
+            }
+            anyDropped = true;
+            filtered.add(m.withToolCalls(kept));
+        }
+        if (!anyDropped) {
+            return messages;
+        }
+
+        List<ChatMessageDto> out = new java.util.ArrayList<>(filtered.size());
+        for (ChatMessageDto m : filtered) {
+            if (m != null && m.toolCallId() != null && droppedCallIds.contains(m.toolCallId())) {
+                continue;
+            }
+            out.add(m);
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[LlmAgentLoop] turn={} 发送边界剔除失效工具调用 {} 个 / 孤儿结果消息 {} 条"
+                    + "（本轮可见工具 {} 个 · 防 400 tool reference not found）",
+                turnNo, droppedCallIds.size(), filtered.size() - out.size(), availableToolNames.size());
+        }
+        return out;
+    }
+
     static List<ChatMessageDto> wrapQueuedMessagesForApi(List<ChatMessageDto> messagesForLlm) {
         if (messagesForLlm == null || messagesForLlm.isEmpty()) {
             return messagesForLlm;
@@ -13546,7 +13736,10 @@ public class LlmAgentLoop implements AgentLoop {
             //   「排除 ToolSearch + 全量 schema 内联直发」，绝不发 defer_loading（willDefer = useToolSearch && …，
             //   claude.ts:1208-1209）—— 非 anthropic 靠门控为 false 拿全量，不再靠「清空 deferred」豁免。
             boolean useToolSearch = ToolSearchService.isToolSearchEnabled(available, modelName, tokenClient)
-                    && ToolSearchService.toolReferenceUsable(tuc.effectiveProviderType(), modelName);
+                    && ToolSearchService.toolReferenceUsable(tuc.effectiveProviderType(), modelName)
+                    // [tool-search-refused] 端点曾以「不认 defer_loading」400/422 拒绝过 ⇒ 本会话永走
+                    //   全量内联（对齐 CC：拒绝后会话内不再发 deferred，ENABLE_TOOL_SEARCH=false 语义）。
+                    && !ToolSearchService.isToolSearchRefused(tuc.sessionId());
             Set<String> deferredToolNames = ToolSearchService.computeDeferredToolNames(available);
             // [vision-defer-model 2026-09-03 / R12 2026-09-12 判据单点化] vision_analyze 懒加载豁免
             //   （装配层按主模型能力判定）：仅「能用 tool_reference」AND 多模态（supportsImage）才保留懒 ——
@@ -14458,11 +14651,14 @@ public class LlmAgentLoop implements AgentLoop {
         //    Read pages 分段 / 文本主模型调 Agent 派多模态子代理），系统不自动 fork；模型不支持（≤10 页）→
         //    文本说明，不注入媒体块 ──
         StringBuilder pdfNotes = new StringBuilder();
+        // [pdf_reference 独立消息 · 对齐 CC messages.ts:4032-4044] >10 页引导不再拼当轮 prompt，
+        //   暂存到 PdfAttachmentProcessor，主 user 消息 append 后由调用点生成独立 isMeta 消息（落库）。
+        List<String> pdfRefNotes = new ArrayList<>();
         for (PdfAttachmentProcessor.PendingPdf pdf : pdfs) {
             if (pdf.needsSubagent()) {
-                // [U2 · 自主引导] 分页决策 >10 页 → 注入按主模型能力分流的引导文本（不自动 fork；对齐 CC
+                // [U2 · 自主引导] 分页决策 >10 页 → 按主模型能力分流的引导文本（不自动 fork；对齐 CC
                 //   pdf_reference：文件名 + 路径 + 页数 + 能力对应动作，主模型自主 Read pages / Agent 派子代理）
-                pdfNotes.append(buildPdfGuidanceNote(pdf, pdfSupported, multimodalModelName));
+                pdfRefNotes.add(buildPdfGuidanceNote(pdf, pdfSupported, multimodalModelName));
             } else if (pdfSupported) {
                 for (ContentBlockParam block : pdf.blocks()) {
                     mediaBlocks.add(contentBlockToJson(block));
@@ -14544,6 +14740,11 @@ public class LlmAgentLoop implements AgentLoop {
         if (log.isDebugEnabled()) {
             log.debug("[A4] 主 user 消息文本路由：图片数={} PDF数={} 模型={}（图片超限={} / 不支持媒体 / PDF 需 subagent / PDF 文本模型页图注册）→ 文本提示 + contentId + PDF 说明 + imagePasteIds={}",
                 images.size(), pdfs.size(), modelName, imageNotes.length() > 0, imagePasteIds);
+        }
+        // [pdf_reference 独立消息] 暂存 >10 页引导，调用点在主 user 消息 append 后消费并 append，
+        //   写 transcript（历史第二轮仍在）。CC 真源：pdf_reference 是独立 isMeta 消息。
+        if (pdfProcessor != null && !pdfRefNotes.isEmpty()) {
+            pdfProcessor.stashReferenceNotes(sessionIdKey, pdfRefNotes);
         }
         // [图片 F5 回传] 多模态/路径说明分支也携带 imagePasteIds（7 参 toMessage）——图片 id 落 user
         //   消息 image_paste_ids（replayAndPersist 回写），前端 F5 按 imagePasteIds batch 拉图，
@@ -14873,6 +15074,297 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [历史图片恢复] 冷路径历史 user 消息 → 按 {@code image_paste_ids} 从 image-cache 读回 base64，
+     * 重建 contentBlocks（text + image blocks）· 对齐 CC transcript 存 image block、resume 原样回传。
+     *
+     * <p>WHY：本仓 DB 只存文本 content + image_paste_ids（V46），{@code MessageService.toDto} 的
+     * contentBlocks 恒空（:2611）⇒ 后端重启/账本不新鲜时历史图片对模型完全失忆。CC 则把
+     * {@code {type:'image',source:{type:'base64',...}}} 原样写进 transcript（exe {@code Nk}；
+     * CCB attachments.ts:1169-1177）。本方法在模型面历史注入前按 id 从 image-cache 还原，
+     * 两条 provider 共用同一 DTO blocks：Anthropic {@code appendSdkContentBlock} 与
+     * OpenAI {@code toSdkUserContentPart}（拼 data URL）都按标准 image block 渲染。
+     *
+     * <p>边界：
+     * <ul>
+     *   <li>只补 {@code contentBlocks} 为空的消息（热路径账本快照已带块 → 不重复处理）；</li>
+     *   <li>当前模型不支持图片（{@code supportsImage=false}）→ 不补（否则 DeepSeek 等 400）；</li>
+     *   <li>image-cache 未命中（200 上限逐出 / 会话清理）/ 超 5MB → 该图跳过、保持纯文本；
+     *       ⛔ 不用文件名占位冒充图片。</li>
+     * </ul>
+     *
+     * @param messages      历史消息（模型面）
+     * @param store         图片缓存（null → 原样返回）
+     * @param sessionKey    image-cache 会话键（{@link #imageSessionKey}）
+     * @param supportsImage 当前模型是否支持 image block
+     * @return 恢复后的列表；无需恢复时返回原实例
+     */
+    static List<ChatMessageDto> restoreHistoryImageBlocks(List<ChatMessageDto> messages,
+                                                          ImageAttachmentStore store,
+                                                          String sessionKey,
+                                                          boolean supportsImage) {
+        if (messages == null || messages.isEmpty() || store == null
+            || sessionKey == null || sessionKey.isBlank() || !supportsImage) {
+            return messages;
+        }
+        List<ChatMessageDto> out = new ArrayList<>(messages.size());
+        boolean changed = false;
+        int restoredImages = 0;
+        int missedImages = 0;
+        for (ChatMessageDto m : messages) {
+            if (m == null || m.role() != Role.user
+                || (m.contentBlocks() != null && !m.contentBlocks().isEmpty())
+                || m.imagePasteIds() == null || m.imagePasteIds().isEmpty()) {
+                out.add(m);
+                continue;
+            }
+            List<Object> blocks = new ArrayList<>(m.imagePasteIds().size() + 1);
+            if (m.content() != null && !m.content().isEmpty()) {
+                ObjectNode textBlock = JsonNodeFactory.instance.objectNode();
+                textBlock.put("type", "text");
+                textBlock.put("text", m.content());
+                blocks.add(textBlock);
+            }
+            int restoredInMessage = 0;
+            for (String rawId : m.imagePasteIds()) {
+                long imageId;
+                try {
+                    imageId = Long.parseLong(rawId);
+                } catch (NumberFormatException e) {
+                    missedImages++;
+                    continue;
+                }
+                ImageAttachmentStore.Base64Content content = store.getBase64OrDisk(sessionKey, imageId);
+                if (content == null || content.base64() == null || content.base64().isBlank()
+                    || store.isOversize(content.base64())) {
+                    missedImages++;
+                    continue;
+                }
+                blocks.add(imageContentBlock(content.mediaType(), content.base64()));
+                restoredInMessage++;
+                restoredImages++;
+            }
+            if (restoredInMessage == 0) {
+                out.add(m);
+                continue;
+            }
+            changed = true;
+            out.add(m.withContentBlocks(blocks));
+        }
+        if (changed && log.isDebugEnabled()) {
+            log.debug("[历史图片恢复] session={} user 消息补 image block：恢复 {} 张，未命中/超限 {} 张",
+                sessionKey, restoredImages, missedImages);
+        }
+        return changed ? out : messages;
+    }
+
+    /** [CCB/exe 对齐] 文件预读合成消息 subtype（两条 isMeta user 文本，author=attachment 触发实时落库出口）。 */
+    public static final String SYNTHETIC_FILE_READ_SUBTYPE = "file_read_synthetic";
+
+    /** [CCB messages.ts:3994-3997] 预读截断行数 · 与 CCB {@code MAX_LINES_TO_READ} 同值。 */
+    private static final int MAX_PRE_READ_LINES = 2000;
+
+    /** [CCB messages.ts:4032-4044] 大 PDF 引导消息 subtype · 独立 isMeta user 消息、落库。 */
+    public static final String PDF_REFERENCE_SUBTYPE = "pdf_reference";
+
+    /**
+     * [文件附件 · 完全对齐 CC/CCB] 文本类文件预读 → 两条 {@code isMeta:true} 的 user 纯文本消息，
+     * 当轮即进模型请求、同时由 {@code ChatService.persistAppendedMessage}（isMeta && author=attachment）
+     * 实时落库 ⇒ 历史天然带正文（不再依赖「模型当轮自己 Read」）。
+     *
+     * <p><b>真源核对（2026-11-13）</b>：CCB {@code messages.ts:4765-4773 / 4728-4763} 与
+     * claude.exe 2.1.323（off≈320,946,194/320,946,388）逐字一致：
+     * <pre>
+     *   Called the ${toolName} tool with the following input: ${jsonStringify(input)}
+     *   Result of calling the ${tool.name} tool:\n${content}
+     * </pre>
+     * 两条都是 {@code createUserMessage({content, isMeta:true})}（不是 tool_use/tool_result 块）。
+     *
+     * <p><b>边界</b>：二进制（docx/xlsx/pptx…，{@link ReadFileTool#isNonTextExtension}）与超 256KB
+     * 文本 → 不预读；CC 在此直接 {@code return null}（零提示，依赖用户原文的 {@code @path}），
+     * 本仓上传入口原文无路径 ⇒ 按红线十二生成<b>一条</b>路径说明（{@link #fileUnreadNote}），
+     * 保证模型知道文件存在、可按路径自行读取。图片/PDF/video/audio 各有独立通道，本方法只处理
+     * {@code type=file}。
+     */
+    public static List<ChatMessageDto> buildSyntheticFileReadMessages(
+            List<AttachmentRequest> attachments,
+            com.nexusai.domain.session.AttachmentService attachmentService,
+            String sessionId) {
+        if (attachments == null || attachments.isEmpty()) {
+            return List.of();
+        }
+        List<ChatMessageDto> out = new ArrayList<>();
+        for (AttachmentRequest att : attachments) {
+            if (att == null || !"file".equalsIgnoreCase(att.type())) {
+                continue;
+            }
+            String path = resolveFileAttachmentPath(att, attachmentService);
+            if (path == null || path.isBlank()) {
+                log.warn("[合成 Read] file 附件无可用路径，预读放弃（模型不可见）: filename={} contentId={}",
+                    att.filename(), att.contentId());
+                continue;
+            }
+            String ext = path.substring(path.lastIndexOf('.') + 1);
+            if (com.nexusai.application.agent.tool.impl.ReadFileTool.isNonTextExtension(ext)) {
+                log.warn("[合成 Read] 二进制附件不预读（对齐 CC validateInput 拒绝），保留路径说明: "
+                    + "filename={} path={}", att.filename(), path);
+                out.add(syntheticFileReadMessage(sessionId,
+                    fileUnreadNote(att, path, "二进制文件，Read 工具无法直接读取，可用其他工具解析该路径")));
+                continue;
+            }
+            String body;
+            try {
+                java.nio.file.Path p = java.nio.file.Path.of(path);
+                long size = java.nio.file.Files.size(p);
+                if (size > TEXT_ATTACHMENT_INLINE_MAX_BYTES) {
+                    log.warn("[合成 Read] 文本附件 {}B 超上限 {}B，不预读（CC 静默 return null；本仓红线保留路径说明）: "
+                        + "filename={}", size, TEXT_ATTACHMENT_INLINE_MAX_BYTES, att.filename());
+                    out.add(syntheticFileReadMessage(sessionId, fileUnreadNote(att, path,
+                        "文本 " + size + "B 超过预读上限 " + TEXT_ATTACHMENT_INLINE_MAX_BYTES
+                            + "B，可用 Read 工具按 offset/limit 分段读取该路径")));
+                    continue;
+                }
+                body = java.nio.file.Files.readString(p, java.nio.charset.StandardCharsets.UTF_8);
+            } catch (Exception e) {
+                log.warn("[合成 Read] 读取失败，保留路径说明: filename={} path={} err={}",
+                    att.filename(), path, e.toString());
+                out.add(syntheticFileReadMessage(sessionId,
+                    fileUnreadNote(att, path, "预读失败（" + e.getClass().getSimpleName()
+                        + "），可用 Read 工具读取该路径")));
+                continue;
+            }
+            // [CCB messages.ts:3994-3997] 超 2000 行 → 第二条只给前 2000 行 + 第三条 meta Note
+            String[] lines = body.split("\n", -1);
+            boolean truncated = lines.length > MAX_PRE_READ_LINES;
+            String resultBody = truncated
+                ? String.join("\n", java.util.Arrays.copyOfRange(lines, 0, MAX_PRE_READ_LINES))
+                : body;
+            String toolName = com.nexusai.application.agent.tool.ToolNameConstants.FILE_READ_TOOL_NAME;
+            ObjectNode inputNode = JSON.createObjectNode();
+            inputNode.put("file_path", path);
+            String inputJson = inputNode.toString();
+            out.add(syntheticFileReadMessage(sessionId,
+                "Called the " + toolName + " tool with the following input: " + inputJson));
+            out.add(syntheticFileReadMessage(sessionId,
+                "Result of calling the " + toolName + " tool:\n" + resultBody));
+            if (truncated) {
+                String name = (att.filename() != null && !att.filename().isBlank())
+                    ? att.filename() : path;
+                out.add(syntheticFileReadMessage(sessionId,
+                    "Note: The file " + name + " was too large and has been truncated to the first "
+                        + MAX_PRE_READ_LINES + " lines. Don't tell the user about this truncation. "
+                        + "Use " + toolName + " to read more of the file if you need."));
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[合成 Read] file 附件预读 → {} 条 meta user 消息（对齐 CC/CCB）: filename={} path={} chars={} lines={} truncated={}",
+                    truncated ? 3 : 2, att.filename(), path, resultBody.length(), lines.length, truncated);
+            }
+        }
+        return out;
+    }
+
+    private static ChatMessageDto syntheticFileReadMessage(String sessionId, String content) {
+        return new ChatMessageDto(
+            "msg-file-read-" + java.util.UUID.randomUUID(), sessionId, Role.user, "attachment",
+            wrapInSystemReminder(content),
+            null, null, null, null, null, null, null, null, null, null,
+            List.of(), List.of(), null, true)
+            .withSubtype(SYNTHETIC_FILE_READ_SUBTYPE);
+    }
+
+    /** 对齐 CCB {@code messages.ts:3488-3490}：合成附件消息统一包 {@code <system-reminder>}。 */
+    private static String wrapInSystemReminder(String content) {
+        return "<system-reminder>\n" + content + "\n</system-reminder>";
+    }
+
+    /**
+     * [fail loud] 未预读的 file 附件 → 一条 meta user 路径说明。
+     *
+     * <p>CC 在 {@code generateFileAttachment} 里对二进制/超限文件直接 {@code return null}（零提示，
+     * 路径只存在于用户手打的 {@code @path} 里）；本仓是上传入口、原文无路径 ⇒ 按红线十二保留
+     * 「文件名 + 本地路径 + 未预读原因」，模型仍可按路径自行 Read（文本超限用 offset/limit 分段）
+     * 或改用其他解析工具（二进制）。与 CC 的差异仅此一条，成功预读时仍严格是 CC 的两条合成消息。
+     */
+    private static String fileUnreadNote(AttachmentRequest att, String path, String reason) {
+        String name = (att.filename() != null && !att.filename().isBlank()) ? att.filename() : "(未命名)";
+        String mediaType = (att.mediaType() == null || att.mediaType().isBlank()) ? "" : att.mediaType();
+        long bytes = -1;
+        try {
+            bytes = java.nio.file.Files.size(java.nio.file.Path.of(path));
+        } catch (Exception ignored) {
+            // 路径不可 stat → 省略尺寸，说明仍给模型
+        }
+        StringBuilder sb = new StringBuilder("- file 附件 ").append(name);
+        if (!mediaType.isEmpty() || bytes >= 0) {
+            sb.append("（").append(mediaType);
+            if (bytes >= 0) {
+                sb.append("，").append(bytes).append("B");
+            }
+            sb.append("）");
+        }
+        sb.append("，本地路径=").append(path)
+            .append("。\n  说明：内容未预读（").append(reason).append("）。");
+        return sb.toString();
+    }
+
+    /**
+     * [pdf_reference 独立消息] 主 user 消息 append 后，把 {@code >10 页} PDF 的引导文本落成独立的
+     * {@code isMeta:true} user 消息（{@code author="attachment"} 命中落库出口）。
+     *
+     * <p>对齐 CC {@code messages.ts:4032-4044}：{@code pdf_reference} 是一条独立 meta 消息写进
+     * transcript，历史第二轮仍在；本仓此前把它拼进当轮 prompt（不落库），第二轮就丢了。
+     */
+    private static void appendPdfReferenceMessages(AgentState state,
+                                                   PdfAttachmentProcessor pdfProcessor) {
+        if (state == null || pdfProcessor == null) {
+            return;
+        }
+        for (String note : pdfProcessor.drainReferenceNotes(imageSessionKey(state.sessionId()))) {
+            if (note == null || note.isBlank()) {
+                continue;
+            }
+            state.appendMessage(pdfReferenceMessage(state.sessionId(), note));
+        }
+    }
+
+    /** 大 PDF 引导 → 一条 {@code isMeta:true}、{@code author="attachment"} 的 user 消息（落库出口同合成 Read）。 */
+    static ChatMessageDto pdfReferenceMessage(String sessionId, String note) {
+        return new ChatMessageDto(
+            "msg-pdf-ref-" + java.util.UUID.randomUUID(), sessionId, Role.user, "attachment",
+            wrapInSystemReminder(note.strip()),
+            null, null, null, null, null, null, null, null, null, null,
+            List.of(), List.of(), null, true)
+            .withSubtype(PDF_REFERENCE_SUBTYPE);
+    }
+
+    /** 当前轮主 user 消息之后追加文件预读合成消息（当轮请求 + 实时落库同源）。 */
+    private static void appendSyntheticFileReadMessages(AgentState state, List<AttachmentRequest> attachments,
+                                                        com.nexusai.domain.session.AttachmentService attachmentService) {
+        if (state == null) {
+            return;
+        }
+        for (ChatMessageDto m : buildSyntheticFileReadMessages(attachments, attachmentService,
+                state.sessionId())) {
+            state.appendMessage(m);
+        }
+    }
+
+    /** file 附件真实路径：path 直读优先，否则 contentId → 附件表。 */
+    private static String resolveFileAttachmentPath(AttachmentRequest att,
+                                                    com.nexusai.domain.session.AttachmentService attachmentService) {
+        if (att.path() != null && !att.path().isBlank()) {
+            return att.path();
+        }
+        if (attachmentService == null || att.contentId() == null || att.contentId().isBlank()) {
+            return null;
+        }
+        try {
+            return attachmentService.getPath(Long.parseLong(att.contentId().trim()));
+        } catch (NumberFormatException e) {
+            return null;
+        }
+    }
+
+    /**
      * [A4] base64 超 5MB 图片的媒体说明 · 不注入 image content block（Anthropic image block
      * base64 ≤5MB 硬限制，CC apiLimits.ts:19 {@code API_IMAGE_MAX_BASE64_SIZE}），对齐
      * {@link #buildMediaAttachmentNotes} 风格拼单行说明，供模型按本地路径引用（像素级理解本期不做）。
@@ -15084,6 +15576,12 @@ public class LlmAgentLoop implements AgentLoop {
         StringBuilder sb = new StringBuilder();
         for (AttachmentRequest att : attachments) {
             if (!isMediaAttachmentType(att.type())) {
+                continue;
+            }
+            // [CC 对齐 · 2026-11-13] file 类不再拼「文件名+路径」说明：改由
+            //   buildSyntheticFileReadMessages 生成两条 meta user 文本消息（当轮请求 + 实时落库）；
+            //   二进制预读在该方法内按 CC 语义放弃（仅 WARN，不生成模型可见消息）。
+            if ("file".equalsIgnoreCase(att.type())) {
                 continue;
             }
             // ① path 附件（local-read 外部绝对路径）→ 直读外部 path（真实路径，无需 store/附件表）

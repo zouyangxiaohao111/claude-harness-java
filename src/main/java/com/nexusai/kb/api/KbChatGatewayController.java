@@ -112,9 +112,9 @@ public class KbChatGatewayController {
     private GatewayAccepted viaRag(String sessionId, GatewayRequest req) {
         KbQaPipeline.Request pipelineReq = new KbQaPipeline.Request(
             sessionId, null, null, req.content(),
-            req.knowledgeBaseIds(), req.modelName(),
+            req.knowledgeBaseIds(), req.knowledgeIds(), req.modelName(),
             Boolean.TRUE.equals(req.webSearchEnabled()), new AtomicBoolean(false));
-        KbQaTurnService.Accepted accepted = turnService.accept(sessionId, req.content(), pipelineReq);
+        KbQaTurnService.Accepted accepted = turnService.accept(sessionId, req.content(), pipelineReq, req.attachments());
         return new GatewayAccepted(accepted.userMessageId(), accepted.assistantMessageId(),
             accepted.streamTopic(), false, Route.RAG.name());
     }
@@ -132,7 +132,7 @@ public class KbChatGatewayController {
             req.content(),
             req.modelName(),
             null,                 // useFastModel：网关不指定，走会话默认
-            List.of(),            // attachments：本入口暂不承载附件
+            req.attachments() == null ? List.of() : req.attachments(),
             null,                 // appendSystemPrompt
             null,                 // fallbackModel
             null,                 // permissionMode
@@ -209,6 +209,10 @@ public class KbChatGatewayController {
     public record GatewayRequest(
         String content,
         List<String> knowledgeBaseIds,
+        /** 文档级范围（@ 选的文件）· 对齐源站 {@code knowledge_ids} */
+        List<String> knowledgeIds,
+        /** 本轮 @ 选中的知识库/文件快照（落 user 气泡胶囊；不参与检索范围） */
+        List<com.nexusai.model.session.dto.AttachmentRequest> attachments,
         String modelName,
         Boolean webSearchEnabled
     ) {

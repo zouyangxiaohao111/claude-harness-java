@@ -16,6 +16,7 @@ import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
 // [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
+import { NexusMark } from './NexusMark'
 import { ArtifactCards } from '@/components/right/ArtifactCards'
 
 /** 稳定空文件列表（changedFiles 零态 selector 兜底 · 避免每次新数组引用触发无限重渲染） */
@@ -60,6 +61,20 @@ import { useChatStore, selectStreamIds, selectStreamBlock, LIVE_SEQ_BASE } from 
 import type { ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
 import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePreview'
+
+/** 知识库 @引用 chip（数值照源站 chat-resource-chips.less：mentioned_items flex-end / tag 26px 高、3px 8px 内边距） */
+const USER_REF_ITEMS: React.CSSProperties = {
+  display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '100%', marginBottom: 2,
+}
+const USER_REF_CHIP: React.CSSProperties = {
+  display: 'inline-flex', alignItems: 'center', gap: 5,
+  minHeight: 26, maxWidth: 200, padding: '3px 8px', borderRadius: 6, boxSizing: 'border-box',
+  background: '#f2f3f5', border: '1px solid #e3e6ea', color: '#1f2329',
+  fontSize: 12, fontWeight: 500, lineHeight: '18px', cursor: 'default',
+}
+const USER_REF_NAME: React.CSSProperties = {
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+}
 
 /** 附件胶囊类型图标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
 function attachIcon(a: NonNullable<ChatMessageDto['userAttachments']>[number]) {
@@ -168,6 +183,71 @@ function CopyButton({ text }: { text: string }) {
     >
       {copied ? '已复制' : '复制'}
     </button>
+  )
+}
+
+/**
+ * 轮末操作条（分叉 / 复制正文）· 只有该轮**最终 assistant 行**、且不在运行中时由父级渲染。
+ *
+ * <p>默认 opacity:0 不占视觉，hover 父级 `.msg` 时浮现（见 globals.css `.msg-turn-actions`）。
+ * 复制 = 该条回答的 Markdown 原文（`content`），不含工具卡/思考/时间戳。
+ */
+function TurnActions({ sessionId, messageId, content, onFork }: {
+  sessionId: string
+  messageId: string
+  content: string
+  onFork?: (sessionId: string, throughMessageId: string) => Promise<void>
+}) {
+  const [forking, setForking] = useState(false)
+  const [copied, setCopied] = useState(false)
+  const hasContent = content.trim() !== ''
+  return (
+    <div className="msg-turn-actions">
+      {onFork && (
+        <button
+          type="button"
+          className="msg-act"
+          title="从这条回答继续分叉"
+          aria-label="从这条回答继续分叉"
+          disabled={forking}
+          onClick={() => {
+            if (forking) return
+            setForking(true)
+            void onFork(sessionId, messageId).catch(() => {}).finally(() => setForking(false))
+          }}
+        >
+          <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+            <circle cx="12.4" cy="3.4" r="1.7" />
+            <circle cx="3.6" cy="8" r="1.7" />
+            <circle cx="12.4" cy="12.6" r="1.7" />
+            <path d="M5.1 7.2l5.6-2.9M5.1 8.8l5.6 2.9" />
+          </svg>
+        </button>
+      )}
+      {hasContent && (
+        <button
+          type="button"
+          className="msg-act"
+          title={copied ? '已复制' : '复制回答'}
+          aria-label="复制回答"
+          onClick={() => {
+            void navigator.clipboard?.writeText(content).then(() => {
+              setCopied(true)
+              window.setTimeout(() => setCopied(false), 1200)
+            }).catch(() => {})
+          }}
+        >
+          {copied ? (
+            <span className="msg-act-copied">已复制</span>
+          ) : (
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
+              <rect x="5.6" y="5.6" width="8" height="8" rx="1.4" />
+              <path d="M10.4 5.6V4.2A1.4 1.4 0 009 2.8H4.2A1.4 1.4 0 002.8 4.2V9A1.4 1.4 0 004.2 10.4h1.4" />
+            </svg>
+          )}
+        </button>
+      )}
+    </div>
   )
 }
 
@@ -343,7 +423,6 @@ const FINISH_REASON_LABEL: Record<string, string | undefined> = {
   stop: undefined,
   length: '已截断',
   error: '出错',
-  tool_calls: '工具调用',
   max_turns: '达到轮次上限',
   max_tokens: '达到长度上限',
   content_filter: '内容被过滤',
@@ -353,7 +432,6 @@ const FINISH_REASON_LABEL: Record<string, string | undefined> = {
 const FINISH_REASON_COLOR: Record<string, string> = {
   length: 'var(--warning)',
   error: 'var(--error)',
-  tool_calls: 'var(--running)',
   max_turns: 'var(--warning)',
   max_tokens: 'var(--warning)',
   content_filter: 'var(--warning)',
@@ -371,6 +449,20 @@ interface MessageListProps {
   scrollSignal?: number
   /** turn 运行中且无流式块（thinking/重试等待期）→ 消息流末尾显示「nexus 思考中…」占位，消除发送后空白间隙 */
   thinking?: boolean
+  /**
+   * 知识库引用点击（正文里的 `[N]` chip）。
+   *
+   * <p>传了才把 `[N]` 渲染成可点 chip（主会话不传 ⇒ 行为零变化）。
+   * App/知识库面板据此打开右侧「文档来源」并定位到该条引用。
+   */
+  onCitationClick?: (msgId: string, refIndex: number) => void
+  /** assistant 消息 id → (引用编号 → 文档名)；同一条会话不同消息的 [1] 指向不同文档 */
+  citationTitlesByMessage?: Record<string, Record<number, string>>
+  /**
+   * 挂在**最后一条 assistant 消息**的 footer 顶部（正文之后、复制/操作条之前的左下角）。
+   * 知识库用它放「引用 · N」入口 —— 源站引用入口就贴在回答末尾，⛔ 不要浮在输入框上方。
+   */
+  tailFooter?: ReactNode
   /** [Phase3] 点击 @引用文件卡片 → 打开文件预览（App 用绑定项目 + path 打开 FileViewModal） */
   onOpenRefFile?: (path: string) => void
   /** 滚动贴底状态回调（「回到底部」按钮由 Composer 工具栏渲染 · 离底时 App 传 showToBottom=true） */
@@ -399,6 +491,9 @@ interface MessageListProps {
    *  编辑态只覆盖「裁剪」这一小段，裁剪一完成就退出编辑态，发送随后走普通路径
    *  （乐观气泡 + 登记 activeStreams ⇒ 消息区出现「思考中…」），不让用户盯着「发送中…」。 */
   onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
+  /** [分叉] 轮末操作条：从该轮最后一条消息截断复制出新会话（App 注入；缺省 ⇒ 不渲染操作条）。
+   *  `throughMessageId` 传该轮最终 assistant 行的 id，后端按 messages.seq 截断。 */
+  onForkTurn?: (sessionId: string, throughMessageId: string) => Promise<void>
   /** [折叠 = 真删 · 2026-11-02] store 里**已被移出内存**的轮数（不止是没渲染 —— 内存真的释放了）。 */
   foldedTurnCount?: number
   /** [折叠 = 真删] 点折叠行 → 向后端重拉更早一轮并 prepend（App 实现；缺省 = 只能展开内存里已有的轮） */
@@ -907,7 +1002,45 @@ function StopHookSummaryRow({ payload }: { payload: NonNullable<ChatMessageDto['
  *  代码块缩进会被抹平 —— 均为已拍板接受的取舍。 */
 const HEAVY_CONTENT_CHARS = 20_000
 const HEAVY_PREVIEW_CHARS = 5_000
-function ContentGuard({ text, className, onRunHtml, streaming }: { text: string; className: string; onRunHtml?: (code: string) => void; streaming?: boolean }) {
+/**
+ * 知识库引用标记 → 可点 chip。
+ *
+ * <p>把正文里的 `[N]`（模型输出、后端已把 `<ref id="chunk://N"/>` 展开成这个）转成 markdown 链接
+ * `[N](#kb-cite-N)`：渲染成 `<a>`，点击由 MessageList 的委托转成 `onCitationClick(N)`
+ * （知识库新对话据此打开右侧「文档来源」并定位到该条）。
+ *
+ * <p>⚠️ 只在宿主传了 `onCitationClick` 时启用（主会话零影响）；
+ * 负向断言 `(?!\()` 保证不碰已有的 markdown 链接 `[1](url)`。
+ */
+/**
+ * 正文 `[N]` 是否渲染成可点 chip 的**渲染期开关**。
+ *
+ * <p>为什么用模块级而不是逐层 props：`Message` / `StreamBlockRow` 都在 memo 深处，
+ * props 链要穿过十几个参数；这里只在「知识库新对话」宿主传了 `onCitationClick` 时置 true，
+ * 主会话（不传）保持 false ⇒ 行为与之前一致。点击处理本身仍走宿主的 `onCitationClick`。
+ */
+let citationChipEnabled = false
+/** assistant 消息 id → (引用编号 → 文档名)：chip 上显示「▤ 文档名」，与源站一致 */
+let citationTitlesByMessage: Record<string, Record<number, string>> = {}
+const EMPTY_CITATION_TITLES: Record<number, string> = {}
+
+function citeLinkify(text: string, msgId?: string): string {
+  const titles = (msgId ? citationTitlesByMessage[msgId] : undefined) ?? EMPTY_CITATION_TITLES
+  return text.replace(/\[(\d{1,3})\](?!\()/g, (_m, n: string) => {
+    const title = titles[Number(n)]
+    // 源站 chip = 图标 + 文档名；没有标题（旧数据/未命中）就退回编号
+    const raw = title || n
+    // 文档名里可能带 []（如 2021-12-13[千岛湖高铁].pdf）——方括号会把 markdown 链接标签提前闭合，
+    // 渲染成「[▤ 2021-12-13」纯文本 + 只剩中段可点。chip 文案去掉方括号，title 仍保留全名。
+    const safe = raw.replace(/[\[\]]/g, '')
+    const label = safe.length > 14 ? safe.slice(0, 14) + '…' : safe
+    // markdown 链接的 title 语法 → 渲染成 <a title="…">，hover 显示完整文档名
+    const tip = raw.replace(/"/g, '')
+    return `[▤ ${label}](#kb-cite-${n} "${tip}")`
+  })
+}
+
+function ContentGuard({ text, className, onRunHtml, streaming, citeLink, citeMsgId}: { text: string; className: string; onRunHtml?: (code: string) => void; streaming?: boolean; citeLink?: boolean; citeMsgId?: string}) {
   const heavy = text.length > HEAVY_CONTENT_CHARS
   const [expanded, setExpanded] = useState(false)
   // 预览：先按字符截断源文、再投影（顺序不可换 —— 反过来会对 >20KB 全文 parse，
@@ -925,7 +1058,8 @@ function ContentGuard({ text, className, onRunHtml, streaming }: { text: string;
     () => (heavy ? projectPreview(text, HEAVY_PREVIEW_CHARS) : ''),
     [text, heavy],
   )
-  if (!heavy || expanded) return <MarkdownTextV2 text={text} className={className} streaming={streaming} onRunHtml={onRunHtml} />
+  const body = (citeLink ?? citationChipEnabled) ? citeLinkify(text, citeMsgId) : text
+  if (!heavy || expanded) return <MarkdownTextV2 text={body} className={className} streaming={streaming} onRunHtml={onRunHtml} />
   return (
     <div className={className}>
       <pre className="heavy-preview">{shown}{text.length > HEAVY_PREVIEW_CHARS ? '…' : ''}</pre>
@@ -1042,13 +1176,15 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
 /** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
 type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
   onRunHtml?: (code: string) => void
   onOpenRefFile?: (path: string) => void
   /** [用户消息编辑重发] 见 MessageListProps */
   onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
+  /** [分叉] 从该行所在轮分叉；缺省（子代理 transcript 等非会话宿主）⇒ 不渲染操作条 */
+  onForkTurn?: (sessionId: string, throughMessageId: string) => Promise<void>
   footer?: ReactNode
   /** [历史提问跳转] 本次跳转目标正是这行 → 加 .jump-highlight（1.5s 后由宿主清除） */
   highlighted?: boolean
@@ -1060,7 +1196,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
    *  <p>段的口径与展开态完全一致：思考块 / 灰色中间旁白 / 工具（整行合成 1 段：单卡或并行组）/ 每行系统注入。
    *  只作用于**执行中的轮**（父级只给 running turn 计算该值）。 */
   collapsedTailKeep?: number
-  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「还有 N 项」）。 */
+  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「隐藏了 N 项」）。 */
   hiddenSegCount?: number
   /** [2026-11-12] 该轮是否有任何可折叠中间过程（纯正文开场的轮也要显示「已完成/正在执行」开关）。 */
   turnHasIntermediate?: boolean
@@ -1571,7 +1707,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
     if (narration !== '') {
       foldSegments.push({
         key: 'narration',
-        node: <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} />,
+        node: <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} citeMsgId={msg.id} />,
       })
     }
     // [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard
@@ -1735,6 +1871,23 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
             </div>
           ) : (
             <>
+              {/* [知识库 @引用 2026-11-13] 对齐源站 usermsg.vue：@ 的库/文件是**正文上方**独立一行
+                  （.mentioned_items / .mentioned_tag），不是气泡内正文之后的附件行。
+                  只渲染 type==='kb'（知识库面板写入）；上传附件仍走下面原有附件行 ⇒ 主会话零影响。 */}
+              {msg.userAttachments?.some((a) => a.type === 'kb') ? (
+                <div style={USER_REF_ITEMS}>
+                  {msg.userAttachments.filter((a) => a.type === 'kb').map((a, i) => (
+                    <span key={i} style={USER_REF_CHIP} title={a.filename}>
+                      <span style={{ color: '#1664ff', display: 'inline-flex', flexShrink: 0 }}>
+                        <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.4">
+                          <path d="M2 4.6C2 3.8 2.6 3.1 3.5 3.1h2.2l1.2 1.6h4.6c.9 0 1.5.7 1.5 1.5v5.3c0 .8-.6 1.5-1.5 1.5h-8c-.9 0-1.5-.7-1.5-1.5z" strokeLinejoin="round" />
+                        </svg>
+                      </span>
+                      <span style={USER_REF_NAME}>{a.filename}</span>
+                    </span>
+                  ))}
+                </div>
+              ) : null}
               <div className="user-bubble">
                 {/* [Phase3 @引用] 正文里的 @token 直接渲染为内联可点 chip（单份 · 不再额外加引用卡片行）。
                     无 @引用时仍走原有 ContentGuard markdown 渲染。 */}
@@ -1745,7 +1898,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                 ) : (
                   <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
                 )}
-                {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
+                {msg.userAttachments?.filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename).map((a, i) => (
                   <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a })}>
                     {attachIcon(a)}
                     <span className="uaf-name">{a.filename}</span>
@@ -1795,19 +1948,23 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
         </div>
       ) : (
         <>
-          {renderHeader ? <div className="avatar">N</div> : <div className="avatar-gutter" aria-hidden />}
           <div className="body">
             {renderHeader ? (
               <div className="author">
-                {showSubagent ? (
-                  <>
-                    <span
-                      className="subagent-dot"
-                      style={{ background: subagentId?.color ?? subagentColor(subagentName ?? msg.author) }}
-                    />
-                    @{subagentName ?? '子代理'}
-                  </>
-                ) : 'nexus'}
+                <span className="author-chip">
+                  <NexusMark />
+                  <span className="author-name">
+                    {showSubagent ? (
+                      <>
+                        <span
+                          className="subagent-dot"
+                          style={{ background: subagentId?.color ?? subagentColor(subagentName ?? msg.author) }}
+                        />
+                        @{subagentName ?? '子代理'}
+                      </>
+                    ) : 'nexus'}
+                  </span>
+                </span>
                 <span
                   className="ts"
                   title={showAbsTime ? '点击切换为相对时间' : '点击切换为绝对时间'}
@@ -1848,9 +2005,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                     {(isRunningTurn ? liveDuration : turnDuration) && (
                       <span className="turn-process-dur">· {isRunningTurn ? liveDuration : turnDuration}</span>
                     )}
-                    {/* [2026-11-12 用户裁定] 收起态提示「还有 N 项」，否则用户不知道箭头后还藏着内容。 */}
+                    {/* [2026-11-12 用户裁定] 收起态提示「隐藏了 N 项」，否则用户不知道箭头后还藏着内容。
+                        [2026-11-13] 文案由「还有 N 项」改为「隐藏了 N 项」（用户要求）。 */}
                     {processExpanded !== true && (hiddenSegCount ?? 0) > 0 && (
-                      <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                      <span className="turn-process-more">· 隐藏了 {hiddenSegCount} 项</span>
                     )}
                     <svg className={`turn-process-caret${processExpanded ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
                       <path d="M5 6.5L8 9.5L11 6.5" />
@@ -1882,8 +2040,19 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
               /* [中间旁白正文] 非最终段的正文已在折叠区渲染过 → 正文区不再重复。
                  非轮次宿主（isFinalOfTurn === undefined）与最终段照常渲染。 */
               isFinalOfTurn !== false && (
-                <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} />
+                <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} citeMsgId={msg.id} />
               )
+            )}
+            {/* [分叉/复制] 只有该轮最终段、非运行中：操作条紧贴**正文下方**（工具卡/产物之前）。
+                `isFinalOfTurn === undefined`（子代理 transcript）不渲染，保持旧行为。
+                ⛔ 不要放到 `footer` 前——footer 含产物卡片，放那里会跑到「所有产物」下面。 */}
+            {isFinalOfTurn === true && msg.role === 'assistant' && !isRunningTurn && !msg.isApiErrorMessage && (
+              <TurnActions
+                sessionId={msg.sessionId}
+                messageId={msg.id}
+                content={msg.content ?? ''}
+                onFork={onForkTurn}
+              />
             )}
             {/* [每轮消耗上收] 原先每条 assistant 消息底部各渲染一次 ↑输入/↓输出（同轮多段反复显示）；
                 现改为每轮只在 TurnFooter 汇总一行（见 TurnFooter / usageLabelByTurn）。 */}
@@ -1978,7 +2147,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
    * 若整块藏掉，收起态就没东西可看了。缺省/0 = 全藏（旧行为兜底）。
    */
   collapsedTailKeep?: number
-  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「还有 N 项」）。 */
+  /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「隐藏了 N 项」）。 */
   hiddenSegCount?: number
 }) {
   // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
@@ -2062,12 +2231,22 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   if (b.content && !isBriefBlock(b.toolCalls)) {
     segNodes.push({
       key: 'content',
-      node: <MarkdownTextV2 text={b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />,
+      node: <MarkdownTextV2 text={citationChipEnabled ? citeLinkify(b.content, b.assistantMessageId ?? '') : b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />,
     })
   }
   // [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」）
   const toolNodes = renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })
   if (toolNodes.length > 0) segNodes.push({ key: 'tools', node: toolNodes })
+  // [段到达顺序 2026-11-13] 上面按「思考→正文→工具」建段；但模型可能先跑工具再思考/出正文
+  //   （RAG 的 query_understand 排在首个 chunk 之前），固定顺序会把晚到的思考/正文倒挂到工具上方。
+  //   块上有 store 记的首次到达次序就按它重排；缺省（历史块）保持原顺序。
+  if (b.segOrder?.length) {
+    const rank = (key: string) => {
+      const i = b.segOrder!.indexOf(key)
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i
+    }
+    segNodes.sort((x, y) => rank(x.key) - rank(y.key))
+  }
   /** 展开 = 全量；收起 = 尾部 N 段（N 由父级跨行分配）。 */
   const visibleSegs = processExpanded === false
     ? segNodes.slice(Math.max(0, segNodes.length - Math.max(0, collapsedTailKeep)))
@@ -2077,9 +2256,15 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   if (visibleSegs.length === 0 && !showHeader && !showProcessHeader) return null
   return (
     <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}${showHeader ? '' : ' turn-cont'}`}>
-      {showHeader ? <div className="avatar">N</div> : <div className="avatar-gutter" aria-hidden />}
       <div className="body">
-        {showHeader && <div className="author">nexus</div>}
+        {showHeader && (
+          <div className="author">
+            <span className="author-chip">
+              <NexusMark />
+              <span className="author-name">nexus</span>
+            </span>
+          </div>
+        )}
         {/* [2026-11-02] 该轮还没有落库 assistant ⇒ 由本块承载「正在执行」状态行。
             [2026-11-12 用户裁定] 这一行**也要能点**（此前写死 static + 无箭头，用户原话
             「正在执行 。。。 < 应该有收起来和展开的可点击的 现在不可以」）：
@@ -2100,7 +2285,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
                   <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
                 )}
                 {processExpanded !== true && hiddenSegCount > 0 && (
-                  <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                  <span className="turn-process-more">· 隐藏了 {hiddenSegCount} 项</span>
                 )}
                 <svg className={`turn-process-caret${processExpanded ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
                   <path d="M5 6.5L8 9.5L11 6.5" />
@@ -2114,7 +2299,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
                   <span className="turn-process-dur">· {formatTurnDuration(liveTurnMs)}</span>
                 )}
                 {processExpanded !== true && hiddenSegCount > 0 && (
-                  <span className="turn-process-more">· 还有 {hiddenSegCount} 项</span>
+                  <span className="turn-process-more">· 隐藏了 {hiddenSegCount} 项</span>
                 )}
               </div>
             )}
@@ -2166,7 +2351,24 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, foldedTurnCount = 0, onExpandOlder }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter }: MessageListProps) {
+  // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
+  citationChipEnabled = !!onCitationClick
+  citationTitlesByMessage = citationTitleMapByMsg ?? {}
+  // 点击正文里的引用 chip → 交给宿主（知识库面板据此打开右侧来源并定位）
+  useEffect(() => {
+    if (!onCitationClick) return
+    const onDocClick = (e: MouseEvent) => {
+      const a = (e.target as HTMLElement | null)?.closest?.('a[href^="#kb-cite-"]') as HTMLAnchorElement | null
+      if (!a) return
+      e.preventDefault()
+      const n = Number(a.getAttribute('href')!.replace('#kb-cite-', ''))
+      const msgId = (e.target as HTMLElement | null)?.closest?.('[data-msg-id]')?.getAttribute('data-msg-id') ?? ''
+      if (Number.isFinite(n)) onCitationClick(msgId, n)
+    }
+    document.addEventListener('click', onDocClick)
+    return () => document.removeEventListener('click', onDocClick)
+  }, [onCitationClick])
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
@@ -2656,6 +2858,24 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (gErr) rows.push({ key: `err:${g.key}`, kind: 'err', err: gErr, seq: g.maxSeq + 0.5, turnKey: g.key })
     }
     rows.sort((a, b) => (a.seq - b.seq) || a.key.localeCompare(b.key))
+    // [同轮顺序兜底] 用户提问必须在助手输出之前。
+    //   WHY：正式 user 行常常在流式块之后才插入（拿到后端 userMessageId 后再落一条带附件的行），
+    //   它的 renderSeq 比块大 ⇒ 单靠 seq 会渲染成「assistant 在上、user 在下」（2026-11-13 用户截图）。
+    //   只在本轮组内前移提问行，跨轮顺序仍由 seq 决定；无提问行的轮原样返回。
+    const isAsk = (r: (typeof rows)[number]) => r.kind === 'msg' && isUserTurnRow(r.m)
+    if (rows.some(isAsk)) {
+      const byTurn = new Map<string, (typeof rows)>()
+      for (const r of rows) {
+        const arr = byTurn.get(r.turnKey)
+        if (arr) arr.push(r)
+        else byTurn.set(r.turnKey, [r])
+      }
+      const out: typeof rows = []
+      for (const arr of byTurn.values()) {
+        out.push(...arr.filter(isAsk), ...arr.filter((r) => !isAsk(r)))
+      }
+      return out
+    }
     return rows
   }, [groups, apiErrorMap, rowKey])
   // 【贴底·切会话】reset 的判据是【会话身份】（sessionId + conversationId）——
@@ -3138,6 +3358,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (row.kind !== 'msg' || row.m.role !== 'assistant') continue
       lastAssistantRowByTurn.set(row.turnKey, { key: row.key, msgId: row.m.id })
     }
+    // [引用入口] 全会话最后一条 assistant 行的 key（tailFooter 只挂这一条）
+    let tailRowKey = ''
+    for (const row of flatRows) {
+      if (row.kind === 'msg' && row.m.role === 'assistant') tailRowKey = row.key
+    }
     const prevCache = footerCacheRef.current
     const nextCache = new Map<string, { key: string; node: ReactNode }>()
     const result = new Map<string, ReactNode>()
@@ -3149,14 +3374,16 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       //   已结束的历史轮同样显示自己那轮 —— 不再把整会话产物堆到最后一条 assistant 下。
       const turnDeliverables = deliverablesByTurn.get(turnKey) ?? NO_ARTIFACTS
       const withArtifacts = turnDeliverables.length > 0
-      if (!usageLabel && !withLinks && !withArtifacts) continue
-      const cacheKey = `${usageLabel ?? ''}\u0000${withLinks ? 1 : 0}\u0000${artifactCount}\u0000${changeCount}`
+      const withTailFooter = row.key === tailRowKey && tailFooter != null
+      if (!usageLabel && !withLinks && !withArtifacts && !withTailFooter) continue
+      const cacheKey = `${usageLabel ?? ''}\u0000${withLinks ? 1 : 0}\u0000${artifactCount}\u0000${changeCount}\u0000${withTailFooter ? 1 : 0}`
         + `\u0000${withArtifacts ? artifactSigOf(turnDeliverables) : ''}`
       const cached = prevCache.get(row.key)
       const node = cached && cached.key === cacheKey
         ? cached.node
         : (
           <>
+            {withTailFooter && tailFooter}
             {withArtifacts && (
               <TurnArtifacts
                 items={turnDeliverables}
@@ -3177,7 +3404,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     footerCacheRef.current = nextCache
     return result
   }, [flatRows, activeTurnKeys, usageLabelByTurn, lastAssistantId, turnEnded, artifactCount, changeCount,
-      onOpenRightTab, deliverablesByTurn, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser])
+      onOpenRightTab, deliverablesByTurn, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, tailFooter])
   /** 用户手动展开/收起的历史轮次（缺省 = 已结束轮次收起、进行中轮次展开）。 */
   const [processOpenByTurn, setProcessOpenByTurn] = useState<Record<string, boolean>>({})
   const toggleTurnProcess = useCallback((key: string, open: boolean) => {
@@ -3366,7 +3593,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
    */
   const { tailKeepByRowKey, hiddenSegCountByTurn } = useMemo(() => {
     const keep = new Map<string, number>()
-    /** [2026-11-12 用户裁定] 每轮被收起的段数：收起态要在状态行旁提示「还有 N 项」，
+    /** [2026-11-12 用户裁定] 每轮被收起的段数：收起态要在状态行旁提示「隐藏了 N 项」，
      *  否则用户不知道下面还藏着内容、也就不点箭头展开（用户原话「不然用户不知道展开的」）。 */
     const hidden = new Map<string, number>()
     const empty = { tailKeepByRowKey: keep, hiddenSegCountByTurn: hidden }
@@ -3563,6 +3790,47 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       >
       {/* 对话裁剪 hover 按钮样式（组件内联 · 对齐 CommandPalette 先例）；确认弹窗已并入 DialogOpsModal 裁剪 tab */}
       <style>{`
+/* [2026-11-14] 引用 chip：数值照抄源站 components/css/chat-citations.less（.citation / .citation-kb）
+   —— 浅底不描边、secondary 灰字、0.72em、pill 圆角、图标 1em 占 68% 不透明度。
+   ⛔ 不要再自造蓝色 pill / 固定 11px / 竖线分隔。 */
+.content.md a[href^="#kb-cite-"] {
+  display: inline-flex; align-items: center; gap: 2px;
+  box-sizing: border-box; max-width: 180px; padding: 0 5px; margin: 0 0.06em;
+  vertical-align: baseline; transform: translateY(-0.04em);
+  border: 0; border-radius: 999px;
+  background: rgba(0, 0, 0, 0.06); color: rgba(0, 0, 0, 0.6);
+  font-size: 0.72em; font-weight: 400; line-height: 1.45;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  text-decoration: none; cursor: pointer;
+  transition: background .15s ease, color .15s ease;
+}
+.content.md a[href^="#kb-cite-"]::before {
+  content: ''; width: 1em; height: 1em; flex-shrink: 0; opacity: .68;
+  background-color: currentColor;
+  -webkit-mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3Cpath%20fill-rule%3D%22evenodd%22%20clip-rule%3D%22evenodd%22%20d%3D%22M2%203C2%202.17157%202.67157%201.5%203.5%201.5H12C12.2761%201.5%2012.5%201.72386%2012.5%202V11C12.5%2011.2761%2012.2761%2011.5%2012%2011.5H4C3.44772%2011.5%203%2011.9477%203%2012.5C3%2013.0523%203.44772%2013.5%204%2013.5H13V2.5H14V14C14%2014.2761%2013.7761%2014.5%2013.5%2014.5H4C2.89543%2014.5%202%2013.6046%202%2012.5V3ZM3%2010.7676C3.29417%2010.5974%203.63571%2010.5%204%2010.5H11.5V2.5H3.5C3.22386%202.5%203%202.72386%203%203V10.7676ZM12.5%2013H3.5V12H12.5V13Z%22%20fill%3D%22%23000%22%2F%3E%3C%2Fsvg%3E") center / contain no-repeat;
+  mask: url("data:image/svg+xml,%3Csvg%20xmlns%3D%22http%3A%2F%2Fwww.w3.org%2F2000%2Fsvg%22%20viewBox%3D%220%200%2016%2016%22%3E%3Cpath%20fill-rule%3D%22evenodd%22%20clip-rule%3D%22evenodd%22%20d%3D%22M2%203C2%202.17157%202.67157%201.5%203.5%201.5H12C12.2761%201.5%2012.5%201.72386%2012.5%202V11C12.5%2011.2761%2012.2761%2011.5%2012%2011.5H4C3.44772%2011.5%203%2011.9477%203%2012.5C3%2013.0523%203.44772%2013.5%204%2013.5H13V2.5H14V14C14%2014.2761%2013.7761%2014.5%2013.5%2014.5H4C2.89543%2014.5%202%2013.6046%202%2012.5V3ZM3%2010.7676C3.29417%2010.5974%203.63571%2010.5%204%2010.5H11.5V2.5H3.5C3.22386%202.5%203%202.72386%203%203V10.7676ZM12.5%2013H3.5V12H12.5V13Z%22%20fill%3D%22%23000%22%2F%3E%3C%2Fsvg%3E") center / contain no-repeat;
+}
+.content.md a[href^="#kb-cite-"]:hover { background: rgba(0, 0, 0, 0.10); color: rgba(0, 0, 0, 0.9); }
+.content.md a[href^="#kb-cite-"]:focus-visible { outline: 2px solid rgba(0, 0, 0, 0.15); outline-offset: 2px; }
+
+/* 引用入口（知识库「本次引用了 N 个文档」）：浅绿 pill —— 与来源/文件语义同色，轻、不抢正文 */
+.kb-cite-open {
+  display: inline-flex; align-items: center; gap: 4px;
+  padding: 2px 10px; border-radius: 999px;
+  border: 1px solid #c9ead8;
+  background: #eefaf3;
+  color: #0e8a4a;
+  font-size: 12px; font-weight: 400; line-height: 20px;
+  cursor: pointer;
+  transition: background .15s ease, color .15s ease, border-color .15s ease;
+}
+.kb-cite-open:hover {
+  background: #e2f6ea;
+  border-color: #a9e3c2;
+  color: #0b7a41;
+}
+.kb-cite-open:focus-visible { outline: 2px solid #c9ead8; outline-offset: 2px; }
+
         .msg-hover-actions {
           position: absolute;
           top: 4px;
@@ -3863,7 +4131,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         }
         .turn-process-status { font-weight: 500; }
         .turn-process-dur { font-variant-numeric: tabular-nums; }
-        /* [2026-11-12] 收起态「还有 N 项」提示：比时长更弱，不抢视线。 */
+        /* [2026-11-12] 收起态「隐藏了 N 项」提示：比时长更弱，不抢视线。 */
         .turn-process-more { color: var(--ink-faint); font-size: 11.5px; }
         .turn-process-caret { width: 12px; height: 12px; transition: transform 0.2s ease; }
         .turn-process-caret.open { transform: rotate(180deg); }
@@ -4292,6 +4560,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               title="这条消息显示失败" hint="其余内容不受影响。">
               <MemoMessage msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile}
                 onEditResend={onEditResend}
+                onForkTurn={onForkTurn}
                 footer={footerByRowKey.get(row.key)}
                 highlighted={row.m.id === highlightedMsgId}
                 processExpanded={turnOpen}
@@ -4396,9 +4665,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           ⇒ 新轮下面一条「正在执行」都没有。现改用 {@link showPendingPlaceholder}（按轮判定）。 */}
       {showPendingPlaceholder && (
         <div className="msg assistant streaming">
-          {latestTurnHasAssistantRow ? <div className="avatar-gutter" aria-hidden /> : <div className="avatar">N</div>}
           <div className="body">
-            {!latestTurnHasAssistantRow && <div className="author">nexus</div>}
+            {!latestTurnHasAssistantRow && (
+              <div className="author">
+                <span className="author-chip">
+                  <NexusMark />
+                  <span className="author-name">nexus</span>
+                </span>
+              </div>
+            )}
             {/* 状态行：与 Message 里的 `.turn-process-toggle.running` 同款（同 class ⇒ 同观感） */}
             <button
               type="button"

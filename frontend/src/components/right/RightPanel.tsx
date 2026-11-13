@@ -688,9 +688,25 @@ export const RightPanel = memo(function RightPanel({
     e.preventDefault()
     const startX = e.clientX
     const startW = drawerW
+    const appEl = document.querySelector('.app') as HTMLElement | null
+    // [2026-11-13 用户裁定] 中间内容列被压到下限后，右栏就**不能再继续拖宽**：
+    //   主区可用宽 = 窗口 - 左栏 - 右栏；内容列最小 = `--content-min`（非全屏 550 / 全屏 787），
+    //   宽度公式还留了左右各 32px 边距（calc(100% - 64px)），所以右栏上限 = 窗口 - 左栏 - 下限 - 64。
+    const cs = appEl ? getComputedStyle(appEl) : null
+    const contentMin = Number.parseFloat(cs?.getPropertyValue('--content-min') ?? '') || 575
+    const leftW = appEl?.classList.contains('left-collapsed')
+      ? 0
+      : (Number.parseFloat(cs?.getPropertyValue('--left-w') ?? '') || 280)
+    const maxByCenter = Math.max(320, Math.round(window.innerWidth - leftW - contentMin - 64))
+    const maxW = Math.min(Math.max(420, Math.round(window.innerWidth * 0.7)), maxByCenter)
     const move = (ev: MouseEvent) => {
-      const maxW = Math.max(420, Math.round(window.innerWidth * 0.7))
-      setDrawerW(Math.max(320, Math.min(maxW, startW - (ev.clientX - startX))))
+      const w = Math.max(320, Math.min(maxW, startW - (ev.clientX - startX)))
+      // [2026-11-13 用户实测「拖动时中间栏压缩有延迟、不同步」]
+      //   抽屉宽度和中间栏（grid 第三列）都由 `--right-drawer-w` 驱动。原来只 setDrawerW，
+      //   变量要等 React 渲染 → useEffect 才写上去 ⇒ 慢一帧，拖起来中间栏跟不上鼠标。
+      //   这里先同步写变量（浏览器立刻重排），setState 只负责让 React 状态跟上（持久化仍走 effect）。
+      appEl?.style.setProperty('--right-drawer-w', `${w}px`)
+      setDrawerW(w)
     }
     const up = () => {
       document.removeEventListener('mousemove', move)

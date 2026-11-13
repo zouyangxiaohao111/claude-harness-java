@@ -291,6 +291,11 @@ public class MessageRecord {
     public void setCwd(String cwd) { this.cwd = cwd; }
     public String getImagePasteIds() { return imagePasteIds; }
     public void setImagePasteIds(String imagePasteIds) { this.imagePasteIds = imagePasteIds; }
+    /** [RAG 时间线] 快速问答阶段工具（JSON，形状同 ToolCallDto[]）；ReAct 轮为 null。 */
+    private String agentSteps;
+
+    public String getAgentSteps() { return agentSteps; }
+    public void setAgentSteps(String agentSteps) { this.agentSteps = agentSteps; }
     public String getUserAttachments() { return userAttachments; }
     public void setUserAttachments(String userAttachments) { this.userAttachments = userAttachments; }
     public String getUserMessageId() { return userMessageId; }

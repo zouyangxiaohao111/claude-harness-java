@@ -64,8 +64,9 @@ public class KnowledgeChatController {
      * @param webSearchEnabled  联网检索开关
      */
     public record AskRequest(
-        String content, List<String> knowledgeBaseIds, String modelName,
-        Boolean webSearchEnabled
+        String content, List<String> knowledgeBaseIds, List<String> knowledgeIds, String modelName,
+        Boolean webSearchEnabled,
+        List<com.nexusai.model.session.dto.AttachmentRequest> attachments
     ) {
     }
 
@@ -97,9 +98,9 @@ public class KnowledgeChatController {
         }
         KbQaPipeline.Request pipelineReq = new KbQaPipeline.Request(
             sessionId, null, null, req.content(),
-            req.knowledgeBaseIds(), req.modelName(),
+            req.knowledgeBaseIds(), req.knowledgeIds(), req.modelName(),
             Boolean.TRUE.equals(req.webSearchEnabled()), new AtomicBoolean(false));
-        KbQaTurnService.Accepted accepted = turnService.accept(sessionId, req.content(), pipelineReq);
+        KbQaTurnService.Accepted accepted = turnService.accept(sessionId, req.content(), pipelineReq, req.attachments());
         log.info("[知识问答] 受理 session={} userMsg={} assistantMsg={} 库数={} 问题长度={}",
             sessionId, accepted.userMessageId(), accepted.assistantMessageId(),
             req.knowledgeBaseIds() == null ? "全部" : req.knowledgeBaseIds().size(),
@@ -179,5 +180,22 @@ public class KnowledgeChatController {
     @GetMapping("/api/v1/messages/{messageId}/citations")
     public List<KbCitationRecord> citations(@PathVariable String messageId) {
         return citationWriter.listByMessage(messageId);
+    }
+
+    /**
+     * 会话级引用：返回该会话全部引用行（含 assistantMessageId）。
+     *
+     * <p>对齐源站 {@code message.KnowledgeReferences}：引用挂在 assistant 消息上，刷新后每一轮
+     * 都能重画 chip 的文档名。前端按 assistantMessageId 分桶写回 store。
+     *
+     * @param sessionId 会话 id
+     * @return 会话内引用行；无则空数组
+     */
+    @GetMapping("/api/v1/sessions/{sessionId}/citations")
+    public List<KbCitationRecord> citationsBySession(@PathVariable String sessionId) {
+        // 源站把引用挂在 assistant 消息上（message.KnowledgeReferences），刷新后每一轮都能重画；
+        // 旧实现只留最新一轮 ⇒ 历史轮次的 chip 只能退回编号。这里返回会话内全部行，
+        // 由前端按 assistantMessageId 分桶，保证「刷新后每轮都显示文档名」。
+        return citationWriter.listRecentBySession(sessionId, 500);
     }
 }

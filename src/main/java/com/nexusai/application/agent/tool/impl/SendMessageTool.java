@@ -251,6 +251,24 @@ public class SendMessageTool implements Tool {
     }
 
     /**
+     * 常驻初始 tools 数组 · 用户 2026-11-13 裁定「AskUserQuestion 与 SendMessage 都要常驻」。
+     *
+     * <p><b>⚠️ 相对 CC 的刻意偏离</b>：exe 2.1.323 里 CC 的 SendMessage 只有 {@code shouldDefer:!0}；
+     * 它强制常驻的是另一个工具 {@code SendUserMessage}（{@code BRIEF_TOOL_NAME}，即本仓 {@link BriefTool}）。
+     * 本仓团队协作链路以 SendMessage 为主，故一并豁免。
+     *
+     * <p>生效路径：{@code ToolSearchService.isDeferredTool} 首条规则 {@code alwaysLoad} 优先级高于
+     * {@code shouldDefer} ⇒ 不进 {@code deferredToolNames} ⇒ 不发 {@code defer_loading}、不进
+     * {@code deferred_tools_delta}。
+     *
+     * @return 恒 {@code true}
+     */
+    @Override
+    public boolean alwaysLoad() {
+        return true;
+    }
+
+    /**
      * agent-swarms 门控 · 对齐 CC SendMessageTool.ts:535-537 {@code isEnabled() { return isAgentSwarmsEnabled() }}。
      *
      * <p>与 TeamCreateTool.ts:88-89 / TeamDeleteTool.ts:46-47 同门（tools.ts:228-230 门控起始点）：

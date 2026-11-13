@@ -1,6 +1,9 @@
 package com.nexusai.apis.session;
 
 import com.nexusai.application.agent.permission.PermissionConfigProvider;
+import com.nexusai.application.session.SessionForkService;
+import com.nexusai.model.session.dto.ForkSessionRequest;
+import com.nexusai.model.session.dto.ForkSessionResponse;
 import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
@@ -19,6 +22,7 @@ import java.util.List;
 public class SessionController {
 
     @Autowired private SessionService sessionService;
+    @Autowired private SessionForkService sessionForkService;
 
     /**
      * [usage-gateway] 会话级用量聚合（{@code GET /{id}/usage}）· 用量明细的 owner 是 stats 域
@@ -102,6 +106,23 @@ public class SessionController {
             bypassPermissionsKillswitch.resetBypassPermissionsCheck();
         }
         return sessionService.create(req);
+    }
+
+    /**
+     * 分叉会话 · 从某条消息所在轮末截断复制出一个新会话。
+     *
+     * <p>入参 {@code throughMessageId} = 该轮最后一条消息（前端取轮末行）；后端按
+     * {@code messages.seq <= pivotSeq} 复制。标题追加 {@code " 分叉"}，自动跳转由前端完成。
+     *
+     * @param id  源会话 ID
+     * @param req 分叉点（该轮最后一条消息）
+     * @return 新会话 + 复制的消息条数（201）
+     */
+    @PostMapping("/{id}/fork")
+    @ResponseStatus(HttpStatus.CREATED)
+    public ForkSessionResponse fork(@PathVariable String id,
+                                    @Valid @RequestBody ForkSessionRequest req) {
+        return sessionForkService.fork(id, req.throughMessageId());
     }
 
     /**

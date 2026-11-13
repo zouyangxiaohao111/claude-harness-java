@@ -409,6 +409,26 @@ public class WebFetchTool implements Tool {
         return true;
     }
 
+    /**
+     * 常驻初始 tools 数组 · 对齐 CC {@code non_deferrable_builtins} 豁免
+     * （{@code isDeferredTool} 首条规则：{@code alwaysLoad()} 优先级最高，命中即不 defer）。
+     *
+     * <p><b>WHY</b>（用户 2026-11-13 裁定）：WebFetch 属于高频基础能力，藏到 ToolSearch 后面
+     * 要多付一轮检索往返；CC 侧该名单由 GrowthBook {@code tengu_non_deferrable_builtins} /
+     * settings {@code non_deferrable_builtins} 下发（exe 2.1.323 {@code function tO()}，
+     * 二进制内默认值 {@code var c=[]} 为空，实际名单来自服务端）。本仓无 GrowthBook 通道，
+     * 故把高频两件（WebFetch / WebSearch）直接写进工具的 alwaysLoad 豁免。
+     *
+     * <p>效果：`computeDeferredToolNames` 不再收录本工具 ⇒ 不发 {@code defer_loading}
+     * ⇒ schema 完整内联，{@code deferred_tools_delta} 也不会把它当成「新增可用工具」宣布。
+     *
+     * @return 恒 {@code true}
+     */
+    @Override
+    public boolean alwaysLoad() {
+        return true;
+    }
+
     /** 只读 · 对齐 CC WebFetchTool.ts:98-100 isReadOnly() → true。 */
     @Override
     public boolean isReadOnly(JsonNode input) {

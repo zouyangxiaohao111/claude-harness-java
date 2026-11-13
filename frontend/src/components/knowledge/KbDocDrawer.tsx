@@ -16,6 +16,11 @@ interface Props {
   knowledge: Knowledge
   onClose: () => void
   showToast: (msg: string, type?: 'success' | 'info') => void
+  /**
+   * 打开时定位并高亮该分块（知识库回答的「引用」点击跳转用，对齐源站 ChatReferencesDrawer 的来源视图）。
+   * 传了就直接进「分块」视图并滚到该块。
+   */
+  initialChunkId?: string
 }
 
 /**
@@ -430,7 +435,12 @@ export function parseGeneratedQuestions(raw: string | null | undefined): Generat
  *       三个渲染器都是本仓已有的 `components/preview/*`，本抽屉只负责取字节与分派。</li>
  * </ul>
  */
-export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
+/** 引用跳转后的分块高亮（源站用整段浅黄底标示「命中的原文区域」） */
+const HIGHLIGHT_CHUNK: React.CSSProperties = {
+  background: '#fffbe6', boxShadow: 'inset 3px 0 0 #f7ba1e', borderRadius: 6,
+}
+
+export function KbDocDrawer({ knowledge, onClose, showToast, initialChunkId }: Props) {
   /**
    * 是否有「原格式预览」—— 逐条对齐源码 `doc-content.vue:754` 的 `canPreview()`：
    *
@@ -467,8 +477,25 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
    * 可原格式预览 ⇒ `preview`；否则 ⇒ `merged`（全文）。
    * ⚠️ 预览不可用时**不**自动跳分块 —— 那样会闪一下且用户不知道发生了什么。
    */
-  const [view, setView] = useState<ViewMode>(previewable ? 'preview' : 'merged')
+  // 引用跳转：直接进「分块」视图（源站来源视图就是在原文里定位该块）
+  const [view, setView] = useState<ViewMode>(initialChunkId ? 'chunks' : (previewable ? 'preview' : 'merged'))
+
+
+  /** 高亮的分块 id（引用跳转带进来的；仅视觉标记，不参与编辑） */
+  const [highlightChunkId] = useState<string | null>(initialChunkId ?? null)
   const [chunks, setChunks] = useState<ChunkView[]>([])
+
+  // 引用跳转：分块加载完滚到目标块（居中），让用户一眼看到「这段原文出自哪」
+  useEffect(() => {
+    if (!highlightChunkId) return
+    const t = window.setTimeout(() => {
+      const el = document.querySelector(`[data-chunk-id="${highlightChunkId}"]`)
+      if (el && typeof (el as HTMLElement).scrollIntoView === 'function') {
+        (el as HTMLElement).scrollIntoView({ block: 'center', behavior: 'smooth' })
+      }
+    }, 300)
+    return () => window.clearTimeout(t)
+  }, [highlightChunkId, chunks.length])
   const [loading, setLoading] = useState(true)
   const [chunkError, setChunkError] = useState<string | null>(null)
   /** 分块重试计数器（「正文加载失败 → 重试」用；+1 重新拉一次） */
@@ -1674,7 +1701,12 @@ export function KbDocDrawer({ knowledge, onClose, showToast }: Props) {
                     const locators = parseLocators(c.source_locators)
                     const locSummary = locatorSummary(locators)
                     return (
-                    <div className="chunk-item" key={c.id}>
+                    <div
+                      className="chunk-item"
+                      key={c.id}
+                      data-chunk-id={c.id}
+                      style={highlightChunkId === c.id ? HIGHLIGHT_CHUNK : undefined}
+                    >
                       <div className="chunk-header">
                         <div className="chunk-heading">
                           <span className="chunk-index">片段 {i + 1}</span>

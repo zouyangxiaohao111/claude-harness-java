@@ -1,7 +1,11 @@
 //! NexusAI 自动更新（自研轻量，非 plugin-updater）。
 //!
 //! 清单 latest.json（每源根）：{ version, notes, published, platforms: {
-//!   "windows-x86_64": { url, sha256 } } }。
+//!   windows-x86_64: { url, sha256 },
+//!   darwin-aarch64: { url, sha256 }   ← 各平台各一条，客户端按运行平台取
+//! } }。
+//! ⛔ 平台键由 platform_key() 按运行平台算出；清单里没有本平台 ⇒ 「无可用更新」
+//!    （⛔ 不得回退到别的平台 —— 否则 mac 会拿到 Windows 安装包，2026-11-13 实测）。
 //! 多源顺序尝试（NEXUSAI_UPDATER_SOURCES / 内置默认 → GitHub release），sha256 校验替代 minisign（免私钥管理）。
 //! 命令：update_check( currentVersion, sources? ) / update_download( info ) / update_install( path )
 //! 事件：update://found / update://progress / update://installing / update://error
@@ -11,6 +15,51 @@ use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::time::Duration;
 use tauri::{AppHandle, Emitter};
+
+/// 平台名（Tauri updater 的 `{target}-{arch}` 风格；macOS 的 target 叫 `darwin`）。
+const PLATFORM_OS: &str = if cfg!(target_os = "windows") {
+    "windows"
+} else if cfg!(target_os = "macos") {
+    "darwin"
+} else if cfg!(target_os = "linux") {
+    "linux"
+} else {
+    "unknown"
+};
+
+/// 架构名。
+const PLATFORM_ARCH: &str = if cfg!(target_arch = "x86_64") {
+    "x86_64"
+} else if cfg!(target_arch = "aarch64") {
+    "aarch64"
+} else {
+    "unknown"
+};
+
+/// 纯函数：os+arch → 清单里的平台键。
+///
+/// <p>抽成纯函数是为了能在**任意宿主**上单测全部组合 —— `cfg!` 决定的
+/// `PLATFORM_OS`/`PLATFORM_ARCH` 在本机（Windows）只能覆盖一种组合。
+fn platform_key_for(os: &str, arch: &str) -> String {
+    format!("{os}-{arch}")
+}
+
+/// 本进程的平台键 = 清单 `platforms` 里应查的键。
+fn platform_key() -> String {
+    platform_key_for(PLATFORM_OS, PLATFORM_ARCH)
+}
+
+/// 从清单的 `platforms` 里取**指定平台**的条目。
+///
+/// <p>返回 `None` = 清单里没有这个平台 ⇒ 调用方判定「本平台无可用更新」。
+/// ⛔ **不得**在取不到时回退到别的平台 —— 那正是 2026-11-13「mac 拿到 Windows
+/// 安装包」的根因（当时这里是写死的 `windows-x86_64`）。
+fn platform_entry<'a>(
+    platforms: &'a serde_json::Value,
+    key: &str,
+) -> Option<&'a serde_json::Value> {
+    platforms.get(key)
+}
 
 /// 默认源（内网 MinIO 主源 + 公开 GitHub release latest.json 外网兜底）。
 ///
@@ -171,16 +220,30 @@ fn fetch_one(src: &str, current: &str) -> Result<UpdateInfo, String> {
             source: src.to_string(),
         });
     }
-    let win = m
-        .platforms
-        .get("windows-x86_64")
-        .ok_or("清单缺少 windows-x86_64".to_string())?;
-    let url = win
+    // ⛔ 按**当前运行平台**取条目：清单里没有本平台 ⇒ 判定「本平台无可用更新」。
+    //    （原实现硬编码 "windows-x86_64" ⇒ mac 客户端会拿到 Windows 安装包，
+    //      2026-11-13 用户实测：mac 提示更新并下到 .exe。）
+    let key = platform_key();
+    let entry = match platform_entry(&m.platforms, &key) {
+        Some(v) => v,
+        None => {
+            return Ok(UpdateInfo {
+                available: false,
+                version: m.version,
+                notes: String::new(),
+                published: None,
+                url: String::new(),
+                sha256: String::new(),
+                source: src.to_string(),
+            })
+        }
+    };
+    let url = entry
         .get("url")
         .and_then(|v| v.as_str())
         .ok_or("缺少下载 url".to_string())?
         .to_string();
-    let sha256 = win
+    let sha256 = entry
         .get("sha256")
         .and_then(|v| v.as_str())
         .unwrap_or("")
@@ -202,7 +265,10 @@ pub async fn update_download(info: UpdateInfo, app: AppHandle) -> Result<String,
     let handle = tauri::async_runtime::spawn_blocking(move || -> Result<String, String> {
         let dir = std::env::temp_dir().join("nexusai-update");
         std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
-        let path = dir.join(format!("NexusAI_{}_x64-setup.exe", info.version));
+        // 文件名从 URL 推导（⛔ 不再写死 `_x64-setup.exe` —— mac 包是 .dmg/.app.tar.gz）
+        let file_name = sanitized_file_name(&info.url)
+            .unwrap_or_else(|| format!("NexusAI_{}_x64-setup.exe", info.version));
+        let path = dir.join(file_name);
 
         // 断点续传：上次失败留下的完整/半截文件直接 Range 续传；服务端忽略 Range 则从头覆盖。
         let mut existing = std::fs::metadata(&path).map(|m| m.len()).unwrap_or(0);
@@ -334,7 +400,21 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
         .map_err(|e| format!("启动静默安装器失败: {e}"))
 }
 
-#[cfg(not(target_os = "windows"))]
+/// macOS：没有 NSIS 静默安装的概念 —— 打开 `.dmg` 让用户把 `.app` 拖进 Applications。
+///
+/// <p>⛔ **不做自动替换**（替换运行中的 app 需要停进程 + 提权 + 处理签名/只读卷）——
+/// 见计划「明确不做」章节。
+#[cfg(target_os = "macos")]
+fn spawn_silent_installer(path: &str) -> Result<(), String> {
+    std::process::Command::new("open")
+        .arg(path)
+        .spawn()
+        .map(|_| ())
+        .map_err(|e| format!("打开安装镜像失败: {e}"))
+}
+
+/// 其余非 Windows 平台（Linux 等）：维持原行为。
+#[cfg(not(any(target_os = "windows", target_os = "macos")))]
 fn spawn_silent_installer(path: &str) -> Result<(), String> {
     std::process::Command::new(path)
         .arg("-S")
@@ -353,6 +433,31 @@ pub fn update_install(path: String, app: AppHandle) -> Result<(), String> {
 
 fn hex_digest(d: &[u8]) -> String {
     d.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// 从下载 URL 取文件名：只取 basename，且只保留安全字符（防路径穿越 / 非法字符）。
+///
+/// <p>mac 包名是 `.dmg` / `.app.tar.gz`，Windows 是 `_x64-setup.exe` ⇒ 不能写死。
+///
+/// <p>⛔ URL 里出现 `..` 路径段一律拒绝：basename 看着安全（如 `passwd`）也可能是
+/// 穿越链的一环，宁可回退到调用方的默认文件名。
+fn sanitized_file_name(url: &str) -> Option<String> {
+    let base = url.split(['?', '#']).next().unwrap_or(url);
+    if base.split('/').any(|seg| seg == "..") {
+        return None;
+    }
+    let name = base.rsplit('/').next()?.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let safe: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_'))
+        .collect();
+    if safe.is_empty() || safe == "." || safe == ".." {
+        return None;
+    }
+    Some(safe)
 }
 
 #[cfg(test)]
@@ -593,6 +698,80 @@ mod tests {
             bad_stdout.contains(r#"\""#),
             "对照组必须复现 Rust 的引号转义（否则本测试没有判别力）：{bad_stdout}"
         );
+    }
+
+    /// 平台键映射（意图）：**清单查什么键由运行平台决定**，不能写死某一个平台。
+    ///
+    /// <p>抽成纯函数是为了能在**任意宿主**上单测全部组合 —— 本机是 Windows，
+    /// `cfg!` 里的 mac 组合在 Windows 上永远走不到，测不到就等于没写。
+    #[test]
+    fn platform_key_for_maps_all_targets() {
+        assert_eq!(platform_key_for("windows", "x86_64"), "windows-x86_64");
+        assert_eq!(platform_key_for("darwin", "aarch64"), "darwin-aarch64");
+        assert_eq!(platform_key_for("darwin", "x86_64"), "darwin-x86_64");
+        assert_eq!(platform_key_for("linux", "x86_64"), "linux-x86_64");
+    }
+
+    /// 守护：生产**代码**不得出现字面量 `"windows-x86_64"`。
+    /// 出现即说明有人把平台键写死了 ⇒ mac 会重新拿到 Windows 安装包（2026-11-13 实测）。
+    ///
+    /// <p>⚠️ **只检查代码，不检查注释**：注释里保留 `"windows-x86_64"` 字样是**有意的**
+    /// （记录根因与实测背景，见文件头与 `fetch_one` 旁的说明）⇒ 连注释一起匹配会误伤
+    /// 正确的实现（2026-11-13 实测踩过一次假红：实现已改成 `platform_key()`，
+    /// 测试却因注释里的字面量而红）。剔注释的方式是逐行砍掉 `//` 之后的部分 ——
+    /// 代码里的字符串 `"windows-x86_64"` 前没有 `//` ⇒ 仍会被抓到，判别力不丢。
+    #[test]
+    fn production_code_must_not_hardcode_windows_platform_key() {
+        let code: String = prod_src()
+            .lines()
+            .map(|l| match l.find("//") {
+                Some(i) => &l[..i],
+                None => l,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !code.contains("\"windows-x86_64\""),
+            "⛔ updater.rs 生产代码不得硬编码平台键 \"windows-x86_64\" —— \
+             平台键必须由 platform_key() 按运行平台算出，否则 mac 会拿到 Windows 安装包。"
+        );
+    }
+
+    /// 核心行为（意图）：清单里**没有本平台** ⇒ 取不到条目 ⇒ 判定「本平台无可用更新」。
+    ///
+    /// <p>这是 2026-11-13 那个 bug 的**行为级**钉子：mac 客户端拿到只含
+    /// `windows-x86_64` 的清单时，必须**取不到**条目（而不是回退去拿 Windows 的）。
+    #[test]
+    fn manifest_without_this_platform_yields_no_entry() {
+        let manifest: serde_json::Value = serde_json::from_str(
+            r#"{"windows-x86_64":{"url":"http://h/NexusAI_0.1.74_x64-setup.exe","sha256":"abc"}}"#,
+        )
+        .expect("清单 JSON 应可解析");
+        assert!(
+            platform_entry(&manifest, "darwin-aarch64").is_none(),
+            "⛔ 清单里没有 darwin-aarch64 ⇒ 必须取不到条目（否则 mac 会拿到 Windows 安装包）"
+        );
+        assert!(
+            platform_entry(&manifest, "windows-x86_64").is_some(),
+            "清单里有 windows-x86_64 ⇒ 必须取得到条目"
+        );
+    }
+
+    /// 文件名清洗（意图）：下载文件名从 URL 推导（mac 包是 .dmg/.app.tar.gz，
+    /// 不能写死 `_x64-setup.exe`），且**不得**允许路径穿越。
+    #[test]
+    fn sanitized_file_name_takes_basename_and_rejects_traversal() {
+        assert_eq!(
+            sanitized_file_name("http://h/nexusai/updater/NexusAI_0.1.74_x64-setup.exe").as_deref(),
+            Some("NexusAI_0.1.74_x64-setup.exe")
+        );
+        assert_eq!(
+            sanitized_file_name("http://h/nexusai/updater/NexusAI_0.1.74_aarch64.dmg?x=1").as_deref(),
+            Some("NexusAI_0.1.74_aarch64.dmg")
+        );
+        assert_eq!(sanitized_file_name("http://h/../../etc/passwd"), None);
+        assert_eq!(sanitized_file_name("http://h/"), None);
+        assert_eq!(sanitized_file_name(""), None);
     }
 
     #[test]

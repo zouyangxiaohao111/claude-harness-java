@@ -125,6 +125,26 @@ public class AskUserQuestionTool implements Tool {
         return true;
     }
 
+    /**
+     * 常驻初始 tools 数组 · 用户 2026-11-13 裁定「AskUserQ 默认打开」。
+     *
+     * <p><b>⚠️ 这是相对 CC 的刻意偏离</b>：exe 2.1.323 里 AskUserQuestion 只有
+     * {@code shouldDefer:!0}，且不在 {@code u(e,o=tO())} 的强制常驻名单内
+     * （该名单 = ToolSearch / StructuredOutput / Agent(fork 开启时) / SendUserMessage / bg 下的
+     * EnterWorktree）；{@code non_deferrable_builtins} 在二进制里默认是空数组，实际名单由服务端下发。
+     *
+     * <p>本仓无该服务端通道，按用户裁定把它写进工具的 {@code alwaysLoad()} 豁免 ——
+     * {@code isDeferredTool} 首条规则优先级高于 {@code shouldDefer}，因此
+     * {@code computeDeferredToolNames} 不再收录 ⇒ 不发 {@code defer_loading} ⇒ schema 完整内联，
+     * 模型不必先 ToolSearch 一轮才能问用户。
+     *
+     * @return 恒 {@code true}
+     */
+    @Override
+    public boolean alwaysLoad() {
+        return true;
+    }
+
     /** 搜索提示 · 对齐 CC AskUserQuestionTool.tsx:111 searchHint。 */
     @Override
     public String searchHint() {

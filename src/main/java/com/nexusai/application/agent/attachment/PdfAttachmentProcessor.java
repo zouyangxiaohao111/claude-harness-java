@@ -130,6 +130,13 @@ public final class PdfAttachmentProcessor {
     /** 锁：保护 {@link #pendingPdfs} 复合操作（get + put / remove）。 */
     private final Object lock = new Object();
 
+    /**
+     * [pdf_reference 独立消息] 会话 → 大 PDF 引导文本（{@code buildUserMessageWithImages} 生成，
+     * 主 user 消息 append 后由调用点消费）。对齐 CC {@code messages.ts:4032-4044}：
+     * {@code pdf_reference} 是一条独立 {@code isMeta} 消息、写 transcript，不是拼进当轮 prompt。
+     */
+    private final Map<String, List<String>> pendingReferenceNotes = new HashMap<>();
+
     /** PDF 路径存储 · 路径通道 contentId → 磁盘路径解析（base64 通道可 null → 系统临时目录兜底）。 */
     @Autowired(required = false)
     private PdfAttachmentStore pdfAttachmentStore;
@@ -497,6 +504,31 @@ public final class PdfAttachmentProcessor {
         String key = normalizeSessionKey(sessionKey);
         synchronized (lock) {
             List<PendingPdf> drained = pendingPdfs.remove(key);
+            return drained == null ? List.of() : drained;
+        }
+    }
+
+    /**
+     * 暂存大 PDF 引导文本（{@code needsSubagent} 分支生成）· 主 user 消息构造时调用。
+     *
+     * @param sessionKey 会话键（与 {@link #drainPendingPdfs} 相同）
+     * @param notes      引导文本列表（空 → 无操作）
+     */
+    public void stashReferenceNotes(String sessionKey, List<String> notes) {
+        if (notes == null || notes.isEmpty()) {
+            return;
+        }
+        String key = normalizeSessionKey(sessionKey);
+        synchronized (lock) {
+            pendingReferenceNotes.computeIfAbsent(key, k -> new ArrayList<>()).addAll(notes);
+        }
+    }
+
+    /** 消费并清除本会话暂存的大 PDF 引导文本（主 user 消息 append 后调用）。 */
+    public List<String> drainReferenceNotes(String sessionKey) {
+        String key = normalizeSessionKey(sessionKey);
+        synchronized (lock) {
+            List<String> drained = pendingReferenceNotes.remove(key);
             return drained == null ? List.of() : drained;
         }
     }

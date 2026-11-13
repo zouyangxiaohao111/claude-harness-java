@@ -354,6 +354,24 @@ public class StreamingToolExecutor {
     private final Map<String, TrackedTool> tools = new LinkedHashMap<>();
     private final AtomicInteger erroredCount = new AtomicInteger(0);
     private volatile boolean discarded = false;
+
+    /**
+     * [user-cancel] drain 等待的轮询间隔（毫秒）。
+     *
+     * <p><b>WHY 需要轮询</b>：工具可以卡在<b>无超时</b>的外部调用上（实测
+     * {@code mcp__computer-use__open_application} 的 MCP future 卡 5min+）。用户按停止/Esc 时
+     * {@code AgentState.cancelled()} 只置标志，无法中断已在跑的 {@code CompletableFuture}，
+     * 所以 {@link #drainNextBatch()} 必须周期性醒来重查取消态，否则 turn 永远退不出。
+     * 250ms 对齐本仓 abort 感知 ≤500ms 的既有折衷。
+     */
+    private static final long USER_CANCEL_POLL_INTERVAL_MS = 250L;
+
+    /**
+     * [user-cancel] 本次 drain 是否因用户停止而提前收口。
+     * 仅用于选择 synthetic 文案（{@code user_interrupted} = CC REJECT_MESSAGE），
+     * 与 {@code streaming_fallback}（流式回退丢弃）区分。
+     */
+    private volatile boolean userCancelDrain = false;
     /**
      * [R32-b15 C10] 已 drain 的工具 ID 集合 · 对齐 CC StreamingToolExecutor.ts:407-440
      * getCompletedResults() 非阻塞返回已 COMPLETED 工具, 已返回的不再重复. Set 用于 O(1) 去重.
@@ -2808,6 +2826,19 @@ public class StreamingToolExecutor {
     }
 
     /**
+     * [user-cancel] 会话是否已被用户停止（前端停止键 / Esc → {@code ChatService.cancelSession}
+     * → {@code AgentState.abortStream("user-cancel")} → {@code cancelled=true}）。
+     *
+     * <p>null-safe：未注入 AgentState（单测 / 非 Spring 直构）⇒ 恒 false，行为与改动前一致。
+     *
+     * @return true = 用户已停止本轮
+     */
+    private boolean userCancelled() {
+        com.nexusai.application.agent.AgentState st = this.agentStateRef;
+        return st != null && st.cancelled();
+    }
+
+    /**
      * [Session F ALI-1] 拉取下一批已完成结果 · 对齐 CC getRemainingResults 循环体
      * (StreamingToolExecutor.ts:458-485): {@code while hasUnfinishedTools: processQueue →
      * yield completed → 无产出时等 in-flight 完成}.
@@ -2822,6 +2853,16 @@ public class StreamingToolExecutor {
                 if (!ready.isEmpty()) {
                     return ready;
                 }
+                // [user-cancel] 用户停止（前端停止键 / Esc → AgentState.abortStream → cancelled）：
+                //   工具可能卡在无超时的外部调用上（实测 MCP future.join 卡 5min+），不能无限等。
+                //   直接收口：置 discarded，剩余 QUEUED/EXECUTING 工具由 drainDiscardedRemaining
+                //   补 user_interrupted synthetic（CC REJECT_MESSAGE），turn 立即退出。
+                if (userCancelled()) {
+                    userCancelDrain = true;
+                    discarded = true;
+                    log.info("TOOL drain: 检测到 user-cancel，立即收口（不再等待在飞工具 promise）");
+                    break;
+                }
                 // 无完成结果 → 等**任一** in-flight 完成 (CC StreamingToolExecutor.ts:482-483:
                 //   Promise.race(executingPromises, progressPromise) — 任一完成即唤醒重查,
                 //   快工具结果不会被慢工具拖住). 阻塞版 getRemainingResults 用 allOf (等全部)
@@ -2834,7 +2875,12 @@ public class StreamingToolExecutor {
                 }
                 if (!all.isEmpty()) {
                     try {
-                        CompletableFuture.anyOf(all.toArray(new CompletableFuture[0])).join();
+                        // [user-cancel] 带超时等待（原 join() 无超时会永久阻塞）：超时即回 while 顶部
+                        //   重查取消态与新完成结果；未取消时该路径与 join 行为等价。
+                        CompletableFuture.anyOf(all.toArray(new CompletableFuture[0]))
+                            .get(USER_CANCEL_POLL_INTERVAL_MS, java.util.concurrent.TimeUnit.MILLISECONDS);
+                    } catch (java.util.concurrent.TimeoutException te) {
+                        // 轮询边界：本轮无工具完成且未取消 → 下一轮继续等
                     } catch (Throwable th) {
                         // discarded + abort path → 抛 CompletionException (cause=AbortException)
                         // 此为预期, 不上报. 详见 executeAsync catch 分支 (同阻塞版).
@@ -2879,9 +2925,12 @@ public class StreamingToolExecutor {
             }
             if (t.result == null) {
                 // 阻塞版 discarded 分支: result==null → synthetic streaming_fallback
+                // [user-cancel] 用户停止触发的收口用 user_interrupted（CC REJECT_MESSAGE），
+                //   与流式回退丢弃（streaming_fallback）区分。
                 // [IMP-C2 返工] 合成错误回写 t.result + 同步标记 isError/COMPLETED
                 //   （getResultErrorFlags 配对推导依赖 status==COMPLETED + isError）
-                ToolResult synthetic = createSyntheticErrorMessage(t.call.id(), "streaming_fallback");
+                ToolResult synthetic = createSyntheticErrorMessage(t.call.id(),
+                    userCancelDrain ? "user_interrupted" : "streaming_fallback");
                 t.result = synthetic;
                 t.isError = true;
                 t.status = Status.COMPLETED;

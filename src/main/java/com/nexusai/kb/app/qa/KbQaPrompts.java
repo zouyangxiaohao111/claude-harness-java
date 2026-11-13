@@ -115,4 +115,14 @@ public final class KbQaPrompts {
     public static String systemPrompt(boolean hasContext) {
         return hasContext ? SYSTEM_WITH_CONTEXT : SYSTEM_NO_CONTEXT;
     }
+
+    /** 引用句柄标签 → 可读编号（`<ref id="chunk://N"/>` → `[N]`）· 流式展开器之外的整段兜底。 */
+    static String stripRefTags(String text) {
+        if (text == null || text.isEmpty()) {
+            return text;
+        }
+        return java.util.regex.Pattern.compile("<ref\\s+id=\"chunk://(\\d+)\"\\s*/?>")
+            .matcher(text)
+            .replaceAll(mr -> "[" + mr.group(1) + "]");
+    }
 }

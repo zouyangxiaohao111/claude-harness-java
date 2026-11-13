@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
-import type { CSSProperties } from 'react'
+import type { CSSProperties, ReactNode } from 'react'
 import { ApiError } from '@/api/rest'
 import { knowledgeApi } from '@/api/knowledge'
 import type { KnowledgeBase, KnowledgeListQuery } from '@/api/knowledge'
@@ -72,6 +72,8 @@ export interface KbSceneNavProps {
   onOpenSharedSpace?: () => void
   /** 底部「知识库列表」入口（场景内返回列表页）*/
   onBackToList?: () => void
+  /** 导航项下方追加的内容（独立窗口用它挂「历史对话」列表；主窗口浮层不传 ⇒ 零变化） */
+  sessionsSlot?: ReactNode
 }
 
 /**
@@ -85,7 +87,7 @@ const NAV_ITEMS: Array<{
   key: string
   label: string
   glyph: string
-  handlerKey: keyof Omit<KbSceneNavProps, 'activeKey' | 'onBackToList'>
+  handlerKey: keyof Omit<KbSceneNavProps, 'activeKey' | 'onBackToList' | 'sessionsSlot'>
 }> = [
   { key: 'chat',       label: '新对话',   glyph: '✎', handlerKey: 'onNewChat' },
   { key: 'knowledge',  label: '知识库',   glyph: '▤', handlerKey: 'onNewChat' },
@@ -269,6 +271,7 @@ export function KbSceneNav(props: KbSceneNavProps) {
               </button>
             )
           })}
+          {props.sessionsSlot}
         </div>
 
         {/* 左下角用户区（`.kb-aside-top` 的 flex:1 已把它顶到底部，⛔ 不要再加 marginTop:auto） */}

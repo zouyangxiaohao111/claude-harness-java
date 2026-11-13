@@ -1,4 +1,5 @@
 import { create } from 'zustand'
+import type { CitationItem } from '@/api/types'
 import type { ChatMessageDto, SessionDto, TokenWarningEvent, ToolCallDto, MessageUsageDto, ModelUsageEntry, StopHookSummaryPayload, PermissionUpdate, ComputerUseApproval } from '../api/types'
 import type { SessionFile } from '../types'
 import { EMPTY_COMPACT, type CompactUiState } from '../utils/compactProgress'
@@ -153,6 +154,11 @@ export interface StreamBlock {
   /** [排队行序 2026-10-23] 流式区到达序号（仅在「本轮有实时块时」由 store 盖，见 LIVE_SEQ_BASE）。
    *  渲染行序优先用它；缺省 = 历史位次（重拉/落库行不盖，DB 顺序即位置）。 */
   renderSeq?: number
+  /** [段到达顺序 2026-11-13] 'reasoning' / 'content' / 'tools' 各自**首次**到达的次序。
+   *  块内渲染按此排序 —— 模型可能先跑工具再思考（RAG 的 query_understand 就是先到），
+   *  固定「思考→正文→工具」会把晚到的思考/正文倒挂到工具上方（用户实测）。
+   *  缺省（历史块）走 reasoning → content → tools 的原顺序。 */
+  segOrder?: string[]
 }
 
 /** 会话流式 API 错误（message.error 事件 → 对话流助手位置错误卡渲染 · 对齐 CC assistant API error 语义） */
@@ -381,6 +387,9 @@ export interface ChatState {
   clearApiErrors: (sessionId: string) => void
   /** 后端推送的 user 消息（message.user）：isMeta=true/缺省 = cron/Ask 后台落库占位不显示（保 flow 顺序）；
    *  isMeta=false = 正式 user 气泡（含 busy-queued 排队插队注入）。按 id 幂等去重。 */
+  /** 知识库问答引用：assistantMessageId → 引用项（RAG 在生成前推一次 'citations' 事件）。 */
+  citations: Record<string, Record<string, CitationItem[]>>
+  setCitations: (sessionId: string, assistantMessageId: string, items: CitationItem[]) => void
   appendMetaUser: (sessionId: string, id: string, content?: string | null, isMeta?: boolean) => void
   /** 实时插入 tool_use_summary 展示行（/topic/tasks 事件 · id 幂等 + userMessageId flow 锚定，防双通道重复） */
   addToolUseSummary: (sessionId: string, row: { id: string; content: string; userMessageId?: string | null }) => void
@@ -427,6 +436,7 @@ export interface ChatState {
 const createChatStoreCreator = () => create<ChatState>()((set) => ({
   sessions: [],
   messages: {},
+  citations: {},
   hasMore: {},              // [window-paging] 会话是否有更早历史（GET /messages/page）
   msgTotals: {},            // [trace-count] 会话消息总数（GET /messages/page total · 轨迹徽标全量）
   changedFiles: {},
@@ -693,6 +703,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const cur = next[idx]
     next[idx] = {
       ...cur, content: cur.content + delta,
+      // [段到达顺序] 正文首次到达才记一次（逐帧 append 不重复建数组）
+      segOrder: cur.segOrder?.includes('content') ? cur.segOrder : [...(cur.segOrder ?? []), 'content'],
       // [思考耗时] 正文开始 = 思考阶段结束：仅在「已有思考且尚未收口」时补终点（不覆盖首片已记的值）
       reasoningEndedAt: cur.reasoning !== '' && cur.reasoningEndedAt == null ? Date.now() : cur.reasoningEndedAt,
     }
@@ -712,6 +724,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const cur = next[idx]
     next[idx] = {
       ...cur, reasoning: cur.reasoning + reasoning,
+      segOrder: cur.segOrder?.includes('reasoning') ? cur.segOrder : [...(cur.segOrder ?? []), 'reasoning'],
       reasoningStartedAt: cur.reasoningStartedAt ?? now, reasoningEndedAt: now,
     }
     return {
@@ -730,6 +743,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const cur = next[idx]
     next[idx] = {
       ...cur, toolCalls: [...cur.toolCalls, tool],
+      segOrder: cur.segOrder?.includes('tools') ? cur.segOrder : [...(cur.segOrder ?? []), 'tools'],
       // [思考耗时] 工具调用到达 = 思考阶段结束（同上：仅补一次，不覆盖已有值）
       reasoningEndedAt: cur.reasoning !== '' && cur.reasoningEndedAt == null ? Date.now() : cur.reasoningEndedAt,
     }
@@ -924,6 +938,12 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const { [sessionId]: _drop, ...rest } = st.apiErrors
     return { apiErrors: rest }
   }),
+  setCitations: (sessionId, assistantMessageId, items) => set((st) => ({
+    citations: {
+      ...st.citations,
+      [sessionId]: { ...(st.citations[sessionId] ?? {}), [assistantMessageId]: items },
+    },
+  })),
   appendMetaUser: (sessionId, id, content, isMeta = true) => set((st) => {
     const msgs = st.messages[sessionId] ?? []
     // 幂等：同 id 已存在（重拉/重复推送）不重复插入

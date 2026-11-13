@@ -1298,9 +1298,13 @@ html {
   overflow: hidden;
 }
 
+/* [2026-11-13 用户裁定] 对话内容与输入框同宽、左右居中：
+   内容列 = clamp(505px, 61.5vw, 962px)（1920→962 / 1440→886 / 1280→787 / 最低 505）。
+   ⛔ 不再「贴左右栏全宽」——那正是用户说的「中间栏没有左右对齐」。 */
 .stream-inner {
-  /* 全宽：贴左右栏（对齐 deepseek_html_20260823 stream 布局） */
-  padding: 0 32px;
+  width: clamp(var(--content-min, 575px), var(--content-w, 962px), calc(100% - 64px));
+  margin: 0 auto;
+  padding: 0;
 }
 
 /* [paging-boundary] 对话流滚动容器：**「加载更多」按钮必须是第一个可见元素** ——
@@ -1341,7 +1345,9 @@ html {
 .msg { margin-bottom: 24px; gap: 12px; }
 .msg .avatar { width: 32px; height: 32px; border-radius: 8px; background: #0a49a8; font-weight: 700; }
 .msg.assistant .avatar { background: #0a49a8; }
-.msg.assistant .body { max-width: 85%; background: transparent; font-size: var(--fs-body, 15px); line-height: 1.7; color: #333; }
+/* [2026-11-13 用户裁定] 正文列与输入框同宽：去掉 `max-width: 85%`
+   （原先正文只有内容列的 85%，比输入框窄一截；现在两者都吃满 `.stream-inner` / `.composer-inner`）。 */
+.msg.assistant .body { max-width: 100%; background: transparent; font-size: var(--fs-body, 15px); line-height: 1.7; color: #333; }
 .msg .content { font-size: 16px; line-height: 28px; color: #333; }
 .msg .content p { color: #333; }
 /* [2026-10-09] 旧 .user-bubble 视觉块已删除：该块被文末「User Bubble」块（约 :2230）全量覆盖成
@@ -1389,6 +1395,49 @@ html {
   color: var(--ink-tertiary);
   font-weight: 400;
   font-size: 12px;
+}
+
+/* [2026-11-13 用户裁定 · 参照 WorkBuddy 头标] 「N + nexus」合成一块**无底色**品牌标：
+   圆形笑脸机器人图标 + 粗体名字，与正文/输入框同一左缘。
+   原先 `N` 是挂在 `.msg` 左侧的 30px 外挂头像（+12px gap）⇒ 头部比正文更左 42px，
+   用户要求「整体和对话对齐」「正在执行 和对话框 左对齐」⇒ 去掉外挂列，图标挪进 body 首行。 */
+.msg .author-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+.msg .author-chip .nx-mark {
+  position: relative;
+  display: inline-block;
+  width: 20px;
+  height: 20px;
+  flex-shrink: 0;
+}
+/* 身体：CatArtBody 是 733×673 的宽扁剪影，压进 16.5px 宽后自然居中 */
+.msg .author-chip .nx-mark .nx-body {
+  position: absolute;
+  left: 0;
+  top: 3.5px;
+  width: 16.5px;
+  height: auto;
+}
+/* 尾巴：CatTail 是 158×564 的细长条，贴在身体右后方并后仰，露出卷曲部分 */
+.msg .author-chip .nx-mark .nx-tail {
+  position: absolute;
+  right: -0.5px;
+  top: 1px;
+  width: 4px;
+  height: auto;
+  transform: rotate(26deg);
+  transform-origin: top center;
+}
+.msg .author-chip .author-name {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 14.5px;
+  font-weight: 700;
+  color: var(--ink);
 }
 
 /* F4 · t/s 速度徽标（output_tokens ÷ decode_ms · 作者行 · 弱化展示） */
@@ -1931,13 +1980,15 @@ html {
   display: inline-flex;
 }
 .perm-mode-pill {
+  box-sizing: border-box;
   display: flex;
   align-items: center;
   gap: 6px;
-  padding: 4px 10px;
+  height: 28px;
+  padding: 0 10px;
   border-radius: var(--r-md);
   background: transparent;
-  border: none;
+  border: 1px solid var(--hairline);
   cursor: pointer;
   transition: background 120ms var(--ease);
   user-select: none;
@@ -2564,7 +2615,10 @@ html {
 
 /* Composer */
 .composer {
-  padding: 10px 32px 32px;
+  /* [2026-11-13 用户裁定「中间栏没有左右对齐」] 水平 padding 归零：
+     原先 `32px` 让输入框与消息列居中于**不同宽度**的父容器 ⇒ 左右缘天然差 32px。
+     现在两者都相对 `.center` 全宽居中，再由各自 `calc(100% - 64px)` 留窄窗边距。 */
+  padding: 10px 0 32px;
   background: var(--canvas);
 }
 
@@ -2587,8 +2641,12 @@ html {
   text-align: center;
 }
 .composer-empty .composer-inner {
-  width: 100%;
-  margin: 0;   /* 空态居中布局不受会话内输入框的 margin-left 影响（2026-10-09） */
+  /* [2026-11-13 用户裁定] 欢迎页 / 新建空白会话的输入框与有会话时**同一套档位**：
+     常态 787、两侧栏都隐藏 962、全屏 962 / 1120，最窄 575（全屏 787）。
+     原来这里是 `width: 100%` ⇒ 直接吃满主区，跟档位无关；而 `.ws-center-empty` 那几条规则
+     在源码里根本没有生产者（类不加），所以一直没生效。 */
+  width: clamp(var(--content-min, 575px), var(--content-w, 962px), 100%);
+  margin: 0 auto;
 }
 .composer-empty .project-binder {
   margin-bottom: 16px;
@@ -2629,14 +2687,11 @@ html {
      选 `inline-size` 是因为只关心水平方向；`normal` 对 flex 子项无副作用。 */
   container-type: inline-size;
   container-name: composer-inner;
-  max-width: none;
-  margin: 0 0 0 42px;
-  /* [2026-11-02 修] 原 `width: 85%` 是**百分比**：右侧抽屉展开时 `.center` 变窄，
-     输入框跟着按比例缩，而 `.right-tools`（权限胶囊 + 模型胶囊 + 发送键）是固定宽度的
-     flex 行且不换行 ⇒ 空间不足时溢出被裁（用户实测「发送键/模型选择被遮挡」）。
-     改为占满可用宽度，并把原来的 85% 语义挪到 max-width 上 —— 宽屏观感不变，窄屏不再溢出。 */
-  width: 100%;
-  max-width: 85%;
+  /* [2026-11-13 用户最终裁定] 输入框与对话内容同一条内容列：宽度 = clamp(505, 61.5vw, 962)，
+     相对 `.center` 左右居中（两侧留白恒相等）；右栏展开**压缩主区**（`.right-drawer-open` 占网格列），
+     不覆盖内容。上界再夹 `calc(100% - 64px)` 防窄窗溢出。 */
+  width: clamp(var(--content-min, 575px), var(--content-w, 962px), calc(100% - 64px));
+  margin: 0 auto;
   display: flex;
   flex-direction: column;
   align-items: stretch;
@@ -2648,6 +2703,8 @@ html {
 }
 .composer-inner .input-box {
   width: 100%;
+  /* [2026-11-13 用户裁定] 输入框高度 136（内容更多时 textarea 在框内自适应到上限） */
+  min-height: 136px;
 }
 
 .composer .input-box {
@@ -2985,9 +3042,9 @@ html {
      `box-sizing:border-box` 保证 1px 边框算在 26px 内，不会把相邻项挤歪。 */
   .composer .toolbar .left-tools .tool-chip {
     box-sizing: border-box;
-    width: 26px;
-    height: 26px;
-    min-width: 26px;
+    width: 28px;
+    height: 28px;
+    min-width: 28px;
     padding: 0;
     justify-content: center;
     gap: 0;
@@ -8356,6 +8413,17 @@ html {
   z-index: 10;
   pointer-events: none;
 }
+/* 关闭思考档的说明（只在选中 off 时出现，不占位） */
+.eff-hint {
+  margin: 0 16px 10px;
+  padding: 7px 10px;
+  border-radius: 8px;
+  background: #F5F6F8;
+  color: #6B7280;
+  font-size: 11px;
+  line-height: 1.55;
+  text-align: center;
+}
 .eff-footer {
   display: flex;
   justify-content: center;
@@ -8632,12 +8700,16 @@ html {
 .composer .tool-chip { border: 1px solid #EEE; border-radius: 20px; padding: 6px 10px; color: #666; font-size: 13px; }
 .composer .tool-chip:hover { color: #0a49a8; border-color: #bfd8fa; background: #eaf2fe; }
 /* 模型/推理 pill → model-pill 白底圆角20 */
-.composer .right-tools .model-effort-pill { background: #F9FAFB; border: 1px solid #EEE; border-radius: 20px; padding: 6px 14px; }
+.composer .right-tools .model-effort-pill { background: #F9FAFB; border: 1px solid #EEE; border-radius: 8px; height: 28px; box-sizing: border-box; padding: 0 14px; }
 .composer .right-tools .model-effort-pill:hover { background: #eaf2fe; border-color: #bfd8fa; }
 .composer .right-tools .mep-effort { color: #0a49a8; }
 
 /* 欢迎页 → welcome + quick-actions（主界面原型） */
 .welcome { text-align: center; display: flex; flex-direction: column; align-items: center; }
+/* [2026-11-13 用户裁定] 欢迎页 hero（猫 + 标题 + 快捷卡）整体上移：
+   与输入框之间补一段间距，避免快捷卡直接贴在输入框上方的工具条上。
+   `.composer-empty` 是 flex 垂直居中，这段 margin 会被居中分配 ⇒ hero 上移、输入框下移各一半。 */
+.composer-empty .welcome { margin-bottom: 56px; }
 .welcome-logo { width: 60px; height: 60px; stroke: none; animation: float 3s ease-in-out infinite; margin-bottom: 15px; }
 @keyframes float { 0% { transform: translateY(0); } 50% { transform: translateY(-10px); } 100% { transform: translateY(0); } }
 .quick-actions { display: flex; gap: 12px; margin-top: 40px; }
@@ -8813,7 +8885,15 @@ html {
 .session-item { padding-left: 46px; }
 
 /* 附件/计划模式按钮更小（框框缩小） */
-.composer .tool-chip { padding: 3px 8px; border-radius: 6px; font-size: 12px; }
+/* [2026-11-13 用户实测] 选中专家后，专家胶囊与「浏览器 / 权限模式 / 模型」高度参差。
+   规格统一为与左下角「+」同一套框：height 28px（box-sizing 含 1px 边框）+ radius 8px。 */
+.composer .tool-chip {
+  box-sizing: border-box;
+  height: 28px;
+  padding: 0 9px;
+  border-radius: 8px;
+  font-size: 12px;
+}
 .composer .tool-chip svg { width: 11px; height: 11px; }
 
 /* 工作区标题放大（大过会话项） */
@@ -10393,7 +10473,8 @@ html {
    样式全部复用现有 .tool-chip / .tools-panel / .tool-row / .toggle-btn，本条只补分类结构所需。 */
 
 /* 齿轮入口：静止只有图标，hover / 展开 / 聚焦时滑出文字 */
-.tools-chip-wrap .tool-entry { padding: 6px 7px; gap: 0; }
+/* [2026-11-13] 高度交给 .tool-chip 统一 28px，这里只覆盖左右内边距（原 6px 会把内容压成 16px）。 */
+.tools-chip-wrap .tool-entry { padding: 0 9px; gap: 0; }
 .tools-chip-wrap .entry-ico {
   display: flex; align-items: center; justify-content: center;
   width: 13px; height: 13px; flex: none;
@@ -11985,7 +12066,16 @@ html {
    说明：globals.css 前有大量叠压块，本功能样式一律追加在文件末（last-wins），
    绝不插入旧的 .app/.left/.right/.right-tabs 块之间。
    ============================================================ */
-:root { --left-w: 260px; --right-w: 300px; }
+:root {
+  --left-w: 260px;
+  --right-w: 300px;
+  /* [2026-11-13 用户裁定 · 四档] 内容列宽（对话正文 / 输入框共用）：
+     非全屏 787 / 非全屏且两侧栏都收起 962 / 全屏 962 / 全屏且两侧栏都收起 1120；
+     任何情况最窄 550（右栏被拉大、主区被压时兜底）。见 `.app.workspace-surface` 与末尾媒体查询。 */
+  --content-w: 787px;
+  /* 内容列**最窄**：非全屏 575（右栏拖大时压到这里为止）；全屏 787（见末尾媒体查询）。 */
+  --content-min: 575px;
+}
 .app { grid-template-columns: var(--left-w, 260px) 1fr var(--right-w, 300px); }
 .app.left-collapsed { grid-template-columns: 0 1fr var(--right-w, 300px); }
 .app.right-collapsed { grid-template-columns: var(--left-w, 260px) 1fr 0; }
@@ -13386,16 +13476,18 @@ html {
 .composer .plus-check svg { width: 12px; height: 12px; }
 
 /* 当前专家胶囊（+ 右侧 · 绿色头像）· hover 胶囊出 × 清除 */
+/* [2026-11-13] 外框与「+」一致（28px 高 / 8px 圆角），不再用 999px 胶囊高 26px。 */
 .composer .agent-pill {
+  box-sizing: border-box;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   max-width: 220px;
-  height: 26px;
+  height: 28px;
   padding: 0 10px 0 4px;
   background: var(--surface-2);
   border: 1px solid var(--hairline);
-  border-radius: 999px;
+  border-radius: 8px;
 }
 
 .composer .agent-pill-ava {
@@ -13485,7 +13577,14 @@ html {
 .app.workspace-surface {
   /* 新工作区布局（与业务场景无关）：左栏 280px；:root 的 260px 供旧布局继续使用。 */
   --left-w: 280px;
-  /* 右侧抽屉占位：展开时由 .right-drawer-open 设成抽屉宽度 ⇒ 中间栏真正变窄，不再被遮挡 */
+  /* [content-column 2026-11-13 用户裁定 · 四档]
+     ① 非全屏 + 至少一侧栏开着：787
+     ② 非全屏 + 两侧栏都隐藏：962（见 `.left-collapsed:not(.right-drawer-open)`）
+     ③ 全屏（窗口 ≥1800）+ 至少一侧栏开着：962（见文件末尾媒体查询）
+     ④ 全屏 + 两侧栏都收起：1120
+     任何档位最窄 550（宽度公式里的 clamp 下限）。 */
+  --content-w: 787px;
+  /* 右侧抽屉**不占列**：中间栏不被压缩，抽屉以 absolute 覆盖层从右侧滑出 */
   --right-col: 0px;
   position: relative;
   grid-template-rows: minmax(0, 1fr);
@@ -13505,7 +13604,9 @@ html {
 .app.workspace-surface.left-collapsed { grid-template-columns: 0 1fr var(--right-col); }
 
 .app.workspace-surface { transition: grid-template-columns .26s var(--ease, ease); }
-/* 右栏抽屉展开：中间栏让出抽屉宽度（此前是 absolute 覆盖 ⇒ 会压在内容上） */
+/* [2026-11-13 用户裁定·最终] 右栏展开**占网格列**：中栏让出抽屉宽度（压缩中栏，避免覆盖内容）。
+   ⚠️ 曾短暂改成 absolute 覆盖（不压缩），用户实测「会覆盖」⇒ 恢复占列。
+   内容列宽度按 `--content-w` 随中栏可用宽度收缩，仍保持左右居中。 */
 .app.workspace-surface.right-drawer-open { --right-col: var(--right-drawer-w, 384px); }
 .app.workspace-surface.right-drawer-open.left-collapsed { grid-template-columns: 0 1fr var(--right-col); }
 
@@ -13712,8 +13813,9 @@ html {
    而标题从 124px 起）——`.ws-head` 的内边距只护住了标题那一行，`.stream-inner`
    仍是 `padding: 0 32px`。这里补同样的左侧让位，保证收起前后正文左基线一致。
    ⚠️ 只加左内边距（右侧维持 32px），否则消息宽度会突然变窄。 */
-.app.workspace-surface.left-collapsed .stream-inner { padding-left: 124px; }
-.app.workspace-surface.left-collapsed .stream:has(> .stream-inner) { padding-left: 0; }
+/* [2026-11-13 用户裁定] 左栏收起**不再给内容列加左侧让位**：
+   「不管左右侧栏展不展开，中间内容左右两边距离一致」⇒ 内容列恒居中。
+   代价：红绿灯/开合按钮（浮在顶栏）可能压住内容列左缘一小块；这是居中的必然取舍。 */
 /* ⚠️ 输入框也要对齐正文，但**不能**直接加 124px：
    `.stream-inner` 的 124px 是「让开红绿灯+开合按钮」；输入框外面还有 `.composer { padding: 10px 32px }`，
    再往里 `.composer-inner { margin-left: 42px }` 是给**头像列**（30px 头像 + 12px gap）让位的。
@@ -13722,8 +13824,7 @@ html {
    ⇒ 收起态把 composer 的左内边距与 composer-inner 的 42px 一起算平：
      composer padding-left 由 32 → 124-42 = 82px？不，需实测。
    这里先按「composer 左缘 124、inner 不再额外缩进」实现，再看实测值调整。 */
-.app.workspace-surface.left-collapsed .composer { padding-left: 124px; }
-.app.workspace-surface.left-collapsed .composer-inner { margin-left: 0; }
+/* 同上：输入框也不再跟随左栏偏移 —— 与消息列同一条居中内容列。 */
 
 /* 顶栏左栏开合按钮（红绿灯右侧，原型 window-controls） */
 .topbar-side-toggle {
@@ -13747,7 +13848,30 @@ html {
 
 .app.workspace-surface.right-collapsed { grid-template-columns: var(--left-w, 280px) 1fr; }
 
-.app.workspace-surface.left-collapsed.right-collapsed { grid-template-columns: 0 1fr; }
+.app.workspace-surface.left-collapsed.right-collapsed {
+  grid-template-columns: 0 1fr;
+}
+
+/* [2026-11-13 用户裁定 · 「两侧栏都隐藏」的真实判据]
+   ⚠️ 右栏自 2026-10-28 改成抽屉后，`right-collapsed` 这个类**再也不会被加上**
+   （App.tsx 里 `rightCollapsed` 恒 false，只有 `right-drawer-open` 在动）⇒
+   原先用 `.left-collapsed.right-collapsed` 判断等于永不命中，宽度一直停在 787。
+   真实判据 = 左栏收起 ∧ 右栏抽屉没打开 ∧ 产物停靠栏没打开。 */
+.app.workspace-surface.left-collapsed:not(.right-drawer-open):not(.artifact-dock-open) {
+  --content-w: 962px;
+}
+
+/* [2026-11-13 用户裁定 · 全屏档] 窗口够宽（≥1800，即最大化/全屏）：
+   ① 至少一侧栏开着 → 962；② 两侧栏都收起 → 1120；③ 内容列最窄 787（非全屏是 550）。 */
+@media (min-width: 1800px) {
+  .app.workspace-surface {
+    --content-w: 962px;
+    --content-min: 787px;
+  }
+  .app.workspace-surface.left-collapsed:not(.right-drawer-open):not(.artifact-dock-open) {
+    --content-w: 1120px;
+  }
+}
 
 .app.workspace-surface.work-surface.left-collapsed { grid-template-columns: 0 1fr; }
 
@@ -14420,7 +14544,9 @@ html {
 }
 
 .app.workspace-surface .center.ws-center-empty .composer-inner {
-  width: min(720px, calc(100% - 48px));
+  /* [2026-11-13] 原先是写死 `min(720px, ...)` ⇒ 欢迎页（空态）不管窗口怎么拉都不变宽。
+     现与有会话时同一套四档 --content-w：787 / 962 / 1120，最窄 550。 */
+  width: clamp(var(--content-min, 575px), var(--content-w, 962px), calc(100% - 48px));
   margin: 0 auto;
 }
 
@@ -17811,15 +17937,58 @@ html {
 [data-theme="dark"] .kb-scene-popout:hover { background: #2c2c2e; color: #fff; }
 
 /* ── 独立窗口（Tauri 新 WebView）的根容器
-   ⚠️ 这里**没有** overlay / 拖动条 / ✕：整个窗口就是知识库，
-      铺满即可（关窗 = 关系统窗口）。 */
+   ⚠️ 这里**没有** overlay / ✕：整个窗口就是知识库，铺满即可
+      （关窗 = 自绘标题栏上的关闭按钮）。
+   ⚠️ 2026-11-13：窗口改 `decorations:false` ⇒ 顶部是**自绘**标题栏；
+      它 absolute 覆盖、透明底、不占布局 ⇒ 左侧栏 #f9f9f9 从 y=0 铺到窗口底（与主会话一致）。 */
 .kb-window-root { position: fixed; inset: 0; display: flex; background: #fff; }
 .kb-window-panel {
-  flex: 1; min-width: 0;
+  flex: 1; min-height: 0; min-width: 0;
   /* 覆盖浮层形态的尺寸限制：独立窗口里应当铺满，而不是 92%/90vh */
   width: 100%; height: 100%; max-width: none; max-height: none;
   border-radius: 0; box-shadow: none;
 }
+
+/* 自绘标题栏 · Windows 惯例（关闭/最大化/最小化 在最右，从右往左）
+   ⛔ 不做任何品牌色染色 —— 用户反馈的就是「顶上一整条异色」。 */
+.kb-window-titlebar {
+  position: absolute; top: 0; left: 0; right: 0;
+  height: 36px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  /* 透明：让下面的侧栏/主区底色透出来，⛔ 不要给底色 */
+  background: transparent;
+  user-select: none;
+  -webkit-app-region: drag;
+  app-region: drag;
+}
+.kb-window-titlebar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: stretch;
+  height: 100%;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+.kb-window-titlebar-btn {
+  width: 46px;
+  height: 100%;
+  border: 0;
+  background: transparent;
+  color: var(--td-text-color-primary, rgba(0, 0, 0, .9));
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+  transition: background var(--app-motion-fast, .15s) ease;
+}
+.kb-window-titlebar-btn:hover { background: #e9e9e9; }
+.kb-window-titlebar-btn.is-close:hover { background: #e81123; color: #fff; }
+
+/* 独立窗口里侧栏顶部让给覆盖式标题栏（`:64` 那条 32px 是给弹窗拖动条的，这里不要）。
+   背景色不受 padding 影响 ⇒ #f9f9f9 仍从 y=0 铺到窗口底（用户 2026-11-13 要求「和主会话一致」）。 */
+.kb-window-panel > .kb-aside { padding-top: 40px; }
 
 /* ══════════════════════════════════════════════════════════
    知识库页版式 —— 逐值对齐设计稿 方案A-主区换页.html
@@ -18189,3 +18358,47 @@ html {
 }
 .mem-delete-btn:hover:not(:disabled) { background: #FBEAEA; }
 .mem-delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
+/* ------------------------------------------------------------------ */
+/* 轮末操作条（分叉 / 复制正文）· 默认不显眼，hover 该条消息才浮现          */
+/* ------------------------------------------------------------------ */
+.msg-turn-actions {
+  /* 紧贴正文末尾的流内占位（24px）：位置必须在工具卡/产物卡片之前，⛔ 不能绝对定位到 .msg 底部 */
+  display: flex;
+  align-items: center;
+  gap: 2px;
+  margin-top: 4px;
+  height: 24px;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 0.12s ease;
+}
+.msg:hover .msg-turn-actions,
+.msg-turn-actions:focus-within {
+  opacity: 1;
+  pointer-events: auto;
+}
+.msg-act {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 26px;
+  height: 26px;
+  padding: 0 4px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-tertiary, #8a8f98);
+  cursor: pointer;
+}
+.msg-act:hover:not(:disabled) {
+  background: var(--bg-hover, rgba(0, 0, 0, 0.06));
+  color: var(--text-secondary, #5b6068);
+}
+.msg-act:disabled { opacity: 0.5; cursor: not-allowed; }
+.msg-act svg { width: 15px; height: 15px; }
+.msg-act-copied { font-size: 11px; white-space: nowrap; }
+/* 无 hover 的设备（触屏）：常显，否则入口不可达 */
+@media (hover: none) {
+  .msg-turn-actions { opacity: 1; pointer-events: auto; }
+}

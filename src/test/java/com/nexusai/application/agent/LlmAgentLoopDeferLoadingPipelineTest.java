@@ -10,6 +10,7 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.ToolSearchTool;
+import com.nexusai.application.agent.tool.impl.NotebookEditTool;
 import com.nexusai.application.agent.tool.impl.WebFetchTool;
 import com.nexusai.application.agent.tool.impl.WebSearchTool;
 import com.nexusai.application.agent.toolsearch.ToolSearchService;
@@ -100,17 +101,17 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         // WHY: CC claude.ts:1208-1209 willDefer + api.ts:223-225 schema.defer_loading=true。
         //   变异点：toOpenAiToolsArray 不写 defer_loading → 本用例红。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
                 tuc(available), QuerySource.USER,
-                List.of(userMsgWithToolReference("WebSearch")), SUPPORTED_MODEL);
+                List.of(userMsgWithToolReference("NotebookEdit")), SUPPORTED_MODEL);
 
         assertThat(assembly.useToolSearch()).isTrue();
         List<String> names = schemaNames(assembly.tools());
-        assertThat(names).containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
-        JsonNode webSearch = findSchema(assembly.tools(), "WebSearch");
-        assertThat(webSearch.path("defer_loading").asBoolean(false))
+        assertThat(names).containsExactlyInAnyOrder("Bash", "ToolSearch", "NotebookEdit");
+        JsonNode notebook = findSchema(assembly.tools(), "NotebookEdit");
+        assertThat(notebook.path("defer_loading").asBoolean(false))
                 .as("discovered deferred 工具 wrapper 顶层写 defer_loading=true（CC api.ts:223-225）")
                 .isTrue();
         JsonNode bash = findSchema(assembly.tools(), "Bash");
@@ -141,7 +142,7 @@ class LlmAgentLoopDeferLoadingPipelineTest {
     void pipeline_filteredTools_dropsUndeclaredDeferred() {
         // WHY: 未预声明的 deferred 工具绝不进 schema（消除全量预声明），仅 tool_reference 已发现才发送。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
                 tuc(available), QuerySource.USER, List.of(), SUPPORTED_MODEL);
@@ -162,17 +163,17 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         //   变异 (i)：把门控 AND 去掉 → 非 anthropic 仍走 true 分支（deepseek 过模型名单、isToolSearchEnabled=true，
         //   deferred 非空不短路）→ ToolSearch 保留 + defer_loading 发射 → 本用例红（退回 09-01 死锁方向）。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
                 tuc(available, "openai_compatible"), QuerySource.USER,
-                List.of(userMsgWithToolReference("WebSearch")), OPENAI_COMPAT_MODEL);
+                List.of(userMsgWithToolReference("NotebookEdit")), OPENAI_COMPAT_MODEL);
 
         assertThat(assembly.useToolSearch()).isFalse();
         assertThat(schemaNames(assembly.tools()))
-                .as("非 anthropic → 排除 ToolSearch，其余（含 deferred WebSearch）全量内联")
-                .containsExactlyInAnyOrder("Bash", "WebSearch");
-        assertThat(findSchema(assembly.tools(), "WebSearch").has("defer_loading"))
+                .as("非 anthropic → 排除 ToolSearch，其余（含 deferred NotebookEdit）全量内联")
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
+        assertThat(findSchema(assembly.tools(), "NotebookEdit").has("defer_loading"))
                 .as("非 anthropic 绝不发 defer_loading（CC claude.ts:1208-1209 willDefer=false）")
                 .isFalse();
         assertThat(findSchema(assembly.tools(), "Bash").has("defer_loading")).isFalse();
@@ -184,17 +185,17 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         // WHY（R8）：anthropic 下 haiku 不解析 tool_reference（toolSearch.ts:200-204）→ toolReferenceUsable=false
         //   → useToolSearch=false → CC 全发。旧实现靠「清空 deferred」豁免到达同一形态；R8 由门控 AND 直接判。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
                 tuc(available, "anthropic"), QuerySource.USER,
-                List.of(userMsgWithToolReference("WebSearch")), "claude-haiku-4-5");
+                List.of(userMsgWithToolReference("NotebookEdit")), "claude-haiku-4-5");
 
         assertThat(assembly.useToolSearch()).isFalse();
         assertThat(schemaNames(assembly.tools()))
                 .as("haiku → 排除 ToolSearch，其余全量内联")
-                .containsExactlyInAnyOrder("Bash", "WebSearch");
-        assertThat(findSchema(assembly.tools(), "WebSearch").has("defer_loading")).isFalse();
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
+        assertThat(findSchema(assembly.tools(), "NotebookEdit").has("defer_loading")).isFalse();
     }
 
     @Test
@@ -204,7 +205,7 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         //   → true 分支：ToolSearch 保留、未 discovered 的 deferred（WebSearch）剔除。此即被删
         //   LlmAgentLoopOpenAiDeferExemptTest 中「anthropic 保留 deferred」语义的管线级替代。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly noDiscovery = LlmAgentLoop.llmToolsArray(
                 tuc(available, "anthropic"), QuerySource.USER, List.of(), SUPPORTED_MODEL);
@@ -215,10 +216,10 @@ class LlmAgentLoopDeferLoadingPipelineTest {
 
         LlmAgentLoop.ToolsAssembly discovered = LlmAgentLoop.llmToolsArray(
                 tuc(available, "anthropic"), QuerySource.USER,
-                List.of(userMsgWithToolReference("WebSearch")), SUPPORTED_MODEL);
+                List.of(userMsgWithToolReference("NotebookEdit")), SUPPORTED_MODEL);
         assertThat(schemaNames(discovered.tools()))
                 .as("discovered 后 WebSearch 进 schema（懒加载发现闭环）")
-                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebSearch");
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "NotebookEdit");
     }
 
     @Test
@@ -226,41 +227,95 @@ class LlmAgentLoopDeferLoadingPipelineTest {
     void legacyTwoArgSignature_oldBehavior() {
         // ToolSearchTool.isEnabled() → isToolSearchEnabledOptimistic() 读 env → 固定默认 mode(tst) 保确定性。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebSearchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
         ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(available), QuerySource.USER);
         assertThat(schemaNames(schema))
                 .as("2 参签名无 tool-search 过滤（defer_loading 管线不参与）")
-                .contains("Bash", "ToolSearch", "WebSearch");
-        assertThat(findSchema(schema, "WebSearch").has("defer_loading")).isFalse();
+                .contains("Bash", "ToolSearch", "NotebookEdit");
+        assertThat(findSchema(schema, "NotebookEdit").has("defer_loading")).isFalse();
     }
 
     @Test
-    @DisplayName("[R12] anthropic + sonnet → WebFetch 保留懒加载（tool_reference 可激活）；非 anthropic → 全量内联")
-    void pipeline_anthropicKeepsWebFetchDeferred() {
+    @DisplayName("[R12] anthropic + sonnet → 未发现的 deferred（NotebookEdit）剔除，发现后进 schema")
+    void pipeline_anthropicKeepsDeferredLazyLoadForNotebookEdit() {
         // WHY（R12 2026-09-12 承接自被删 LlmAgentLoopWebSearchDeferExemptTest 的「anthropic 保留 deferred」语义）：
-        //   anthropic × sonnet → toolReferenceUsable=true → useToolSearch=true → WebFetch（deferred 未发现）
-        //   不进初始 schema，discovered 后进 schema（懒加载发现闭环）。非 anthropic 侧「WebSearch/WebFetch
-        //   恒在初始 schema」语义由 pipeline_nonAnthropic_sendsAllInlineNoDeferLoading 管线级覆盖（R8 全发）。
-        //   R12 删 exemptWebSearchDeferForOpenAi/exemptSendMessageDeferForOpenAi 后，此处锁定 anthropic 侧不漂移。
+        //   anthropic × sonnet → toolReferenceUsable=true → useToolSearch=true → 未发现的 deferred
+        //   不进初始 schema，discovered 后进 schema（懒加载发现闭环）。
+        //   [2026-11-13 改主体] 原用例用 WebFetch 当被 defer 的工具；用户裁定 WebFetch/WebSearch
+        //   改为 alwaysLoad 常驻后，改用仍按 shouldDefer 走懒加载的 NotebookEdit 承载同一管线语义。
         ToolSearchService.envOverride = Map.of();
-        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new WebFetchTool());
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         LlmAgentLoop.ToolsAssembly noDiscovery = LlmAgentLoop.llmToolsArray(
                 tuc(available, "anthropic"), QuerySource.USER, List.of(), SUPPORTED_MODEL);
         assertThat(noDiscovery.useToolSearch()).isTrue();
         assertThat(schemaNames(noDiscovery.tools()))
-                .as("anthropic → WebFetch（deferred 未发现）不进初始 schema，Bash/ToolSearch 保留")
+                .as("anthropic → NotebookEdit（deferred 未发现）不进初始 schema，Bash/ToolSearch 保留")
                 .containsExactlyInAnyOrder("Bash", "ToolSearch");
 
         LlmAgentLoop.ToolsAssembly discovered = LlmAgentLoop.llmToolsArray(
                 tuc(available, "anthropic"), QuerySource.USER,
-                List.of(userMsgWithToolReference("WebFetch")), SUPPORTED_MODEL);
+                List.of(userMsgWithToolReference("NotebookEdit")), SUPPORTED_MODEL);
         assertThat(schemaNames(discovered.tools()))
-                .as("discovered 后 WebFetch 进 schema")
-                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebFetch");
-        assertThat(findSchema(discovered.tools(), "WebFetch").path("defer_loading").asBoolean(false))
+                .as("discovered 后 NotebookEdit 进 schema")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "NotebookEdit");
+        assertThat(findSchema(discovered.tools(), "NotebookEdit").path("defer_loading").asBoolean(false))
                 .as("discovered deferred 工具发射 defer_loading=true（CC api.ts:223-225）")
                 .isTrue();
+    }
+
+    @Test
+    @DisplayName("[2026-11-13] anthropic + sonnet → WebFetch/WebSearch 常驻初始 schema（不 defer、无 defer_loading）")
+    void pipeline_webFetchAndWebSearchAlwaysInline() {
+        // WHY（用户 2026-11-13 裁定）：WebFetch/WebSearch 是高频基础能力，藏到 ToolSearch 后面要多付
+        //   一轮检索往返。实现 = 工具自身 alwaysLoad() 豁免（isDeferredTool 首条规则，优先级高于
+        //   shouldDefer），对齐 CC 的 non_deferrable_builtins 名单（exe 2.1.323 function tO()）。
+        //   ⇒ 即便 anthropic×sonnet 且从未被 discovered，它们的 schema 也必须完整内联、不带 defer_loading。
+        //   同时保留一个真 deferred（NotebookEdit）以免工具搜索被短路（deferred 空 → useToolSearch=false）。
+        ToolSearchService.envOverride = Map.of();
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(),
+                new NotebookEditTool(), new WebFetchTool(), new WebSearchTool());
+
+        LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
+                tuc(available), QuerySource.USER, List.of(), SUPPORTED_MODEL);
+
+        assertThat(assembly.useToolSearch())
+                .as("仍有真 deferred（NotebookEdit）→ 工具搜索不短路")
+                .isTrue();
+        assertThat(schemaNames(assembly.tools()))
+                .as("WebFetch/WebSearch 未 discovered 也必须在内；NotebookEdit 被剔除")
+                .containsExactlyInAnyOrder("Bash", "ToolSearch", "WebFetch", "WebSearch");
+        assertThat(findSchema(assembly.tools(), "WebFetch").has("defer_loading")).isFalse();
+        assertThat(findSchema(assembly.tools(), "WebSearch").has("defer_loading")).isFalse();
+    }
+
+    @Test
+    @DisplayName("[2026-11-13] 本会话被判 defer_loading 拒绝 → 门控转 false：全量内联、ToolSearch 不进 schema")
+    void pipeline_toolSearchRefusedFallsBackToInline() {
+        // WHY（对齐 CC 2.1.323）: 端点以 400/422 + defer_loading 拒绝后，CC 会「sending the request again
+        //   without deferred tools」并在会话内记住。本仓用会话级标记 + 装配门控实现同等降级：
+        //   useToolSearch=false ⇒ 不发 defer_loading、且 ToolSearch 自身被排除（模型无从发现）。
+        ToolSearchService.envOverride = Map.of();
+        String sid = "sess-refused-" + java.util.UUID.randomUUID();
+        ToolSearchService.markToolSearchRefused(sid);
+        List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
+
+        ToolUseContext refusedTuc = new ToolUseContext(
+                UUID.randomUUID(), sid, PermissionMode.DEFAULT, Map.of(),
+                available, null, AbortController.NOOP, List.of(),
+                (ToolPermissionContext) null, PermissionMode.DEFAULT)
+            .withEffectiveProviderType("anthropic");
+
+        LlmAgentLoop.ToolsAssembly assembly = LlmAgentLoop.llmToolsArray(
+                refusedTuc, QuerySource.USER, List.of(), SUPPORTED_MODEL);
+
+        assertThat(assembly.useToolSearch()).as("被拒 ⇒ 工具搜索关闭").isFalse();
+        assertThat(schemaNames(assembly.tools()))
+                .as("全量内联 + 排除 ToolSearch")
+                .containsExactlyInAnyOrder("Bash", "NotebookEdit");
+        assertThat(findSchema(assembly.tools(), "NotebookEdit").has("defer_loading"))
+                .as("降级后绝不发 defer_loading")
+                .isFalse();
     }
 
     private static JsonNode findSchema(ArrayNode schema, String name) {

@@ -116,10 +116,13 @@ export async function openKnowledgeWindow(state: Omit<KbWindowState, 'v'>): Prom
         minHeight: 480,
         // ⚠️ 不指定 center：让系统按上次位置/默认位置摆，用户拖到副屏后重开不会跳回主屏
         focus: true,
-        // ⭐ 用户 2026-11-09 裁定：独立窗口**用系统标题栏**（有原生关闭/最小化/拖拽）。
-        //   主窗口是 `decorations:false` 的无边框窗，但这里必须显式打开 ——
-        //   否则新窗也没有标题栏，用户只能靠 Alt+F4 关，且无法用系统级拖拽挪到别的屏。
-        decorations: true,
+        // ⚠️ 2026-11-13 改判：原先 `decorations: true`（2026-11-09 裁定「必须能原生拖拽/关闭」），
+        //   但系统标题栏的底色不受页面 CSS 控制，用户在独立窗口里看到顶上一整条异色，
+        //   反馈「看着很别扭」。现改为无边框 + 前端自绘标题栏
+        //   （`KbWindowTitleBar`：同样有拖拽 / 最小化 / 最大化 / 关闭，只是颜色跟内容一致）。
+        decorations: false,
+        // 无边框 + 不透明：页面自己铺满（`.kb-window-root` 已是 `background:#fff`）
+        transparent: false,
       })
       return true
     } catch {

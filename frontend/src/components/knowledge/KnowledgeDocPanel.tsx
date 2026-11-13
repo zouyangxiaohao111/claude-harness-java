@@ -5,6 +5,8 @@ import { knowledgeApi, PARSE_STATUS_LABEL, PARSE_STATUS_TONE } from '@/api/knowl
 import type { KbFolderNode, KbTag, Knowledge, SearchHit } from '@/api/knowledge'
 import { KbUploadSource } from './KbUploadSource'
 import { KbDocDrawer } from './KbDocDrawer'
+import { KbProcessingTimeline } from './KbProcessingTimeline'
+import type { FetchSpansFn } from './KbProcessingTimeline'
 import { IconSprite } from './IconSprite'
 
 interface KnowledgeDocPanelProps {
@@ -17,36 +19,10 @@ interface KnowledgeDocPanelProps {
 
 type ViewMode = 'list' | 'grid'
 
-/**
- * 「查看 Trace」所需的最小形状（后端 `GET /knowledge/{id}/stages` 的 SpanTree）。
- *
- * <p>⚠️ 本仓的 span **就是分块**（`KbKnowledgeExtService#spans` 用 chunk 拼叶子），
- * 不是源侧那种细粒度解析步骤 ⇒ 界面如实标注，⛔ 不编造阶段名。
- */
-interface KnowledgeStages {
-  knowledge_id: string
-  title: string | null
-  parse_status: string | null
-  spans: Array<{
-    id: string
-    type: string | null
-    preview: string | null
-    start_at: number | null
-    end_at: number | null
-    chunk_index: number | null
-    enabled: boolean
-    children: unknown[]
-  }>
-  attempts: Array<{
-    id: number | null
-    task_type: string | null
-    state: string | null
-    attempt: number | null
-    error_message: string | null
-    started_at: string | null
-    finished_at: string | null
-  }>
-}
+// ⚠️ 2026-11-13 删除本地 KnowledgeStages 类型：
+//   它声明的是 {title, spans[], attempts[]}，而 /stages 与 /spans 是同一个后端 handler，
+//   实际返回 KnowledgeSpansDto（{knowledge_id, attempt, trace, current_stage, …}）——
+//   字段一个都对不上。Trace 弹层已改为复用 KbProcessingTimeline（与抽屉内一致）。
 
 /** 「移动到…」的目标知识库（后端 `KbAdvancedService.MoveTarget`）。 */
 interface MoveTarget {
@@ -73,43 +49,6 @@ function kbTypeLabel(t: string | null | undefined): string {
   }
 }
 
-/** 解析任务类型 → 中文（后端 `kb_ingest_task.task_type`）。 */
-function taskTypeLabel(t: string | null | undefined): string {
-  switch (t) {
-    case 'parse':
-      return '解析入库'
-    case 'wiki':
-      return 'Wiki 生成'
-    case '':
-    case null:
-    case undefined:
-      return '任务'
-    default:
-      return t
-  }
-}
-
-/** 解析任务状态 → 中文（后端 `kb_ingest_task.state`）。 */
-function taskStateLabel(s: string | null | undefined): string {
-  switch (s) {
-    case 'pending':
-      return '排队中'
-    case 'running':
-      return '执行中'
-    case 'done':
-      return '完成'
-    case 'failed':
-      return '失败'
-    case 'cancelled':
-      return '已取消'
-    case '':
-    case null:
-    case undefined:
-      return '未知状态'
-    default:
-      return s
-  }
-}
 
 const VIEW_MODE_KEY = 'nexusai.kb.docs.viewMode'
 
@@ -407,12 +346,9 @@ export function KnowledgeDocPanel({
    * <p>⚠️ 用 state 而不是 `<details>`：Trace 与「移动到…」是异步弹层，
    * 需要「先关菜单再开弹层」；`<details>` 的 open 状态不受控，弹层打开时菜单会留在原地。
    */
-  const [traceState, setTraceState] = useState<{
-    row: Knowledge
-    loading: boolean
-    error: string | null
-    data: KnowledgeStages | null
-  } | null>(null)
+  // Trace 抽屉只记「打开哪一行」——数据由 KbProcessingTimeline 自己取
+  // （对齐源站 `doc-content.vue:346 openTimeline()`，列表入口与抽屉内复用同一组件）
+  const [traceState, setTraceState] = useState<{ row: Knowledge } | null>(null)
   const [moveTargetState, setMoveTargetState] = useState<{
     row: Knowledge
     loading: boolean
@@ -473,18 +409,45 @@ export function KnowledgeDocPanel({
     setDrawerDoc(row)
   }
 
-  /** 打开 Trace 弹层（先关菜单，再异步取数据）。 */
-  const openTrace = async (row: Knowledge) => {
-    setTraceState({ row, loading: true, error: null, data: null })
+  /**
+   * Trace 取数（注入 KbProcessingTimeline）。
+   *
+   * <p>⚠️ 后端 `/spans` 返回 `{success, data}` 包装（对齐源侧 DataResponse），
+   * `success` 原样透传 —— 后端判「没有 trace」时也是 200 + success:true + 空 trace，
+   * 那是「真实的无记录」，不是加载失败。
+   */
+  const fetchSpans = useCallback<FetchSpansFn>(async (id, attempt) => {
     try {
-      const data = await knowledgeApi.getKnowledgeStages(row.id)
-      setTraceState({ row, loading: false, error: null, data })
+      const res = await knowledgeApi.getKnowledgeSpans(id, attempt)
+      return { success: !!res?.success, data: res?.data }
     } catch (e) {
-      const msg = toMessage(e)
-      console.warn(`[文档列表] Trace 加载失败 knowledge=${row.id} 原因=${msg}`)
-      setTraceState({ row, loading: false, error: msg, data: null })
+      return { success: false, message: toMessage(e) }
     }
+  }, [])
+
+  /** 打开 Trace 抽屉（对齐源站：只开 trace 抽屉，不弹文档详情抽屉）。 */
+  const openTrace = (row: Knowledge) => {
+    setTraceState({ row })
   }
+
+  /**
+   * Esc 只关 Trace 抽屉。
+   *
+   * <p>⭐⭐ 与 PanelModal 同一理由：`App.tsx` 也在 window 上监听 Esc（非对话页按 Esc
+   * 会把整个知识库场景退掉）。必须捕获阶段 + stopPropagation，否则用户按一次 Esc
+   * 连场景一起关。
+   */
+  useEffect(() => {
+    if (!traceState) return
+    const onKey = (e: KeyboardEvent) => {
+      if (e.key !== 'Escape') return
+      e.stopPropagation()
+      e.preventDefault()
+      setTraceState(null)
+    }
+    window.addEventListener('keydown', onKey, true)
+    return () => window.removeEventListener('keydown', onKey, true)
+  }, [traceState])
 
   /** 打开「移动到…」（跨知识库）弹层。 */
   const openMoveTargets = async (row: Knowledge) => {
@@ -1451,52 +1414,44 @@ export function KnowledgeDocPanel({
 
       {/* ── ⋯ 菜单的三个弹层（Trace / 移动到… / 编辑标签）────────────── */}
 
-      {/* 1. 查看 Trace：后端 SpanTree。⚠️ 本仓 span = 分块，不是源侧的细粒度阶段 */}
-      {traceState && (
-        <PanelModal
-          title={`处理流水线 · ${traceState.row.title || traceState.row.file_name || traceState.row.id}`}
-          onClose={() => setTraceState(null)}
-        >
-          {traceState.loading && <p style={PANEL_HINT_STYLE}>正在加载处理记录…</p>}
-          {!traceState.loading && traceState.error && (
-            <p style={PANEL_ERROR_STYLE}>处理记录加载失败：{traceState.error}</p>
-          )}
-          {!traceState.loading && !traceState.error && traceState.data && (
-            <>
-              <div style={{ display: 'flex', gap: 12, flexWrap: 'wrap', marginBottom: 10 }}>
-                <span style={PANEL_META_STYLE}>状态：{traceState.data.parse_status || '—'}</span>
-                <span style={PANEL_META_STYLE}>分块数：{traceState.data.spans?.length ?? 0}</span>
-                <span style={PANEL_META_STYLE}>解析任务：{traceState.data.attempts?.length ?? 0} 次</span>
-              </div>
-              {(traceState.data.attempts?.length ?? 0) === 0 ? (
-                <p style={PANEL_HINT_STYLE}>该文档没有处理流水线记录</p>
-              ) : (
-                <ol style={{ margin: 0, paddingLeft: 18, display: 'flex', flexDirection: 'column', gap: 6 }}>
-                  {traceState.data.attempts.map((a, i) => (
-                    <li key={a.id ?? i} style={{ fontSize: 'var(--app-text-sm)' }}>
-                      <b>{taskTypeLabel(a.task_type)}</b>
-                      <span style={{ marginLeft: 6, color: 'var(--td-text-color-secondary)' }}>
-                        {taskStateLabel(a.state)}
-                      </span>
-                      <span style={PANEL_META_STYLE}> · 第 {a.attempt ?? 1} 次</span>
-                      <span style={PANEL_META_STYLE}>
-                        {' '}· {a.started_at || '—'} → {a.finished_at || '—'}
-                      </span>
-                      {a.error_message ? (
-                        <div style={{ ...PANEL_ERROR_STYLE, marginTop: 2 }}>{a.error_message}</div>
-                      ) : null}
-                    </li>
-                  ))}
-                </ol>
-              )}
-              <p style={PANEL_HINT_STYLE}>
-                本仓的流水线记录是「解析任务 + 分块」两级：任务表来自入库队列，
-                分块条目即解析产物。源站的 OCR / 版面 / 切分等细分阶段本仓未单独记录，
-                因此此处不展示那些阶段。
-              </p>
-            </>
-          )}
-        </PanelModal>
+      {/* 1. 查看 Trace · 对齐源站：右侧抽屉装「完整模式」的处理流水线
+          （`doc-content.vue:1639-1655`：t-drawer placement=right size=820，
+           内嵌 KnowledgeProcessingTimeline）。源站注释 :2021-2023 明确
+           「只开 trace 抽屉，不弹文档详情抽屉」。
+          ⚠️ 不再自造「解析任务列表」——那条链的字段（title/spans/attempts）
+             与后端 KnowledgeSpansDto 一个都对不上，已删除。 */}
+      {traceState && createPortal(
+        <div className="kb-scope">
+          <div
+            role="presentation"
+            onClick={() => setTraceState(null)}
+            style={{ position: 'fixed', inset: 0, zIndex: 2050, background: 'rgba(0,0,0,0.45)' }}
+          />
+          <div
+            role="dialog"
+            aria-modal="true"
+            aria-label={`处理流水线 · ${traceState.row.title || traceState.row.file_name || traceState.row.id}`}
+            style={{
+              position: 'fixed', top: 0, right: 0, bottom: 0, zIndex: 2100,
+              width: 'min(820px, 92vw)',
+              display: 'flex', flexDirection: 'column',
+              background: 'var(--td-bg-color-container, #fff)',
+              boxShadow: '-6px 0 24px rgba(0,0,0,.12)',
+            }}
+          >
+            <div className="kp-drawer-shell">
+              <KbProcessingTimeline
+                knowledgeId={traceState.row.id}
+                parseStatus={traceState.row.parse_status}
+                docTitle={traceState.row.title || traceState.row.file_name || undefined}
+                showClose
+                onClose={() => setTraceState(null)}
+                fetchSpans={fetchSpans}
+              />
+            </div>
+          </div>
+        </div>,
+        document.body,
       )}
 
       {/* 2. 移动到…（跨知识库） */}

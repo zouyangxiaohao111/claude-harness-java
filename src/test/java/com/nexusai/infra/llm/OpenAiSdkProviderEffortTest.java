@@ -215,6 +215,29 @@ class OpenAiSdkProviderEffortTest {
             model, null, List.of(userMsg("hi")), null, null, false, null, effortValue, null);
     }
 
+    @Test
+    @DisplayName("effort='off' → thinking:{type:'disabled'} 且不注入 reasoning_effort")
+    void effortOff_sendsDisabledThinkingAndNoReasoningEffort() throws Exception {
+        var params = buildParams("deepseek-chat", "off");
+
+        assertThat(params.reasoningEffort())
+            .as("⛔ 'off' 不是 reasoning_effort 档位，注入了会被端点当非法值")
+            .isEmpty();
+
+        // additionalBodyProperties 才是 thinking 的落点（SDK 的普通 getter 序列化不含它）
+        var extra = params._additionalBodyProperties();
+        assertThat(extra).as("关闭思考必须真的发出去，否则相当于没关").containsKey("thinking");
+        assertThat(String.valueOf(extra.get("thinking")))
+            .contains("disabled");
+    }
+
+    @Test
+    @DisplayName("effort='high' → 不出现 thinking 字段（不能把默认路径带偏）")
+    void effortHigh_noThinkingField() throws Exception {
+        var params = buildParams("deepseek-chat", "high");
+        assertThat(params._additionalBodyProperties()).doesNotContainKey("thinking");
+    }
+
     /** reasoning_effort 注入值（SDK params.getter）· ChatCompletionCreateParams 直接序列化产出 {} → 不走 wire。 */
     private static Optional<String> reasoningEffortWire(String model, String effortValue) throws Exception {
         return buildParams(model, effortValue).reasoningEffort()

@@ -2,6 +2,7 @@ package com.nexusai.application.agent.config;
 
 import com.alibaba.fastjson2.JSON;
 import com.nexusai.application.agent.tool.SessionToolCategory;
+import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
@@ -10,6 +11,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.util.ArrayList;
 import java.util.List;
 import java.util.Set;
 
@@ -98,6 +100,45 @@ public class SessionToolDisableConfig {
      * @param sessionId 会话标识（TUC.sessionId() 派生 UUID / MDC "sess-xxx" / null）
      * @return 禁用工具名集合（不可变；显式全开 → 空集）
      */
+    /**
+     * 按会话禁用集过滤工具池（元素级，保序）· 供「需要与 LLM schema 同源」的旁路池使用。
+     *
+     * <p><b>WHY 抽出这个方法</b>：会话禁用的剔除原先只写在
+     * {@code LlmAgentLoop.sessionVisibleTools}（发给模型的 tools schema）里，但下游还有两处
+     * <b>自己拿原始池</b>做判断的地方：
+     * <ol>
+     *   <li>{@code ToolSearchTool} 的候选集 —— 用原始池 ⇒ 模型看不见禁用的工具，却仍能把它
+     *       {@code select} 出来，返回的 {@code tool_reference} 进历史后下一轮直接 400；</li>
+     *   <li>{@code deferred_tools_delta} 的 announce diff —— 用原始池 ⇒ 关闭工具时该工具仍在
+     *       {@code poolNames} 里，{@code removed} 判定永不成立 ⇒ <b>不会</b>告诉模型「这些工具
+     *       已不可用，别去搜」，模型继续 tool_reference 那些已下架的工具。</li>
+     * </ol>
+     *
+     * @param tools     原始工具池（可为 null）
+     * @param sessionId 会话标识（null → 原样返回）
+     * @return 过滤后的新列表；无禁用 → 原引用（零行为变化、零分配）
+     */
+    public static List<Tool> filterDisabled(List<Tool> tools, String sessionId) {
+        if (tools == null || tools.isEmpty() || sessionId == null) {
+            return tools;
+        }
+        Set<String> disabled = getDisabledTools(sessionId);
+        if (disabled.isEmpty()) {
+            return tools;
+        }
+        List<Tool> out = new ArrayList<>(tools.size());
+        for (Tool t : tools) {
+            if (t != null && !disabled.contains(t.name())) {
+                out.add(t);
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("会话禁用过滤工具池：session={} {}→{}（剔除 {}）",
+                sessionId, tools.size(), out.size(), tools.size() - out.size());
+        }
+        return out;
+    }
+
     public static Set<String> getDisabledTools(String sessionId) {
         String key = normalizeSessionKey(sessionId);
         SessionMapper mapper = sessionMapper;

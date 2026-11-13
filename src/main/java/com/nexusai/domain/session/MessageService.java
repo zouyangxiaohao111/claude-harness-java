@@ -648,7 +648,86 @@ public class MessageService {
                     + "（compact boundary 切片 + snip 投影 + preservedSegment 重挂，CC query.ts:523 等价）",
                 sessionId, raw.size(), modelView.size());
         }
-        return modelView;
+        return appendHistoryAttachments(modelView);
+    }
+
+    /**
+     * [KB 多模式兼容 · 不可丢] RAG 线历史附件清单。
+     *
+     * <p><b>为什么必须挂在这里</b>：{@code KbQaPipeline.loadHistory} 是 RAG 问答链的模型面历史装配点，
+     * 它对 user 行显式 {@code if (m.isMeta()) continue}（工具回执 / 注入行不算）⇒ ReAct 线写入的
+     * 合成消息（{@code file_read_synthetic}，{@code isMeta=true}）在 RAG 历史里<b>看不到</b>。
+     * 同一 KB 会话可能 RAG / ReAct 两种模式并存，RAG 轮仍必须知道「上一轮带过哪些附件」，
+     * 所以把清单挂到<b>真实 user 消息</b>的 content 上（非 isMeta，过滤不掉）。
+     *
+     * <p><b>为什么只挂这一条通道</b>：{@code listForResume*}（主会话 / ReAct）已有合成 Read 消息
+     * （含正文与 {@code file_path}），再挂清单就是重复噪声。
+     *
+     * <p>只输出非图片项：图片在 RAG 线没有块可回放，只给 {@code image.png} 是噪声
+     * （ReAct 线的图片走 {@code restoreHistoryImageBlocks}）。
+     */
+    private static List<ChatMessageDto> appendHistoryAttachments(List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return messages;
+        }
+        List<ChatMessageDto> out = new ArrayList<>(messages.size());
+        for (ChatMessageDto m : messages) {
+            String block = attachmentHistoryPrompt(m);
+            if (block.isEmpty()) {
+                out.add(m);
+            } else {
+                out.add(m.withContent((m.content() == null ? "" : m.content()) + block));
+            }
+        }
+        return out;
+    }
+
+    /** 单条 user 消息的附件清单块；非 user / isMeta / 无附件 / 全是图片 → 空串。 */
+    private static String attachmentHistoryPrompt(ChatMessageDto m) {
+        if (m == null || m.role() != com.nexusai.model.session.dto.Role.user || m.isMeta()) {
+            return "";
+        }
+        List<ChatMessageDto.UserAttachmentInfo> atts = m.userAttachments();
+        if (atts == null || atts.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        int kept = 0;
+        for (ChatMessageDto.UserAttachmentInfo a : atts) {
+            if (a == null || isImageAttachmentInfo(a)) {
+                continue;
+            }
+            if (kept == 0) {
+                sb.append("\n\n<attachments>");
+            }
+            kept++;
+            sb.append("\n<attachment");
+            if (a.filename() != null && !a.filename().isBlank()) {
+                sb.append(" name=\"").append(escapeXmlAttr(a.filename())).append('"');
+            }
+            if (a.type() != null && !a.type().isBlank()) {
+                sb.append(" type=\"").append(escapeXmlAttr(a.type())).append('"');
+            }
+            if (a.contentId() != null && !a.contentId().isBlank()) {
+                sb.append(" document_id=\"").append(escapeXmlAttr(a.contentId())).append('"');
+            }
+            sb.append(" />");
+        }
+        if (kept == 0) {
+            return "";
+        }
+        return sb.append("\n</attachments>").toString();
+    }
+
+    private static boolean isImageAttachmentInfo(ChatMessageDto.UserAttachmentInfo a) {
+        if (a.type() != null && "image".equalsIgnoreCase(a.type())) {
+            return true;
+        }
+        return a.mediaType() != null && a.mediaType().toLowerCase().startsWith("image/");
+    }
+
+    private static String escapeXmlAttr(String v) {
+        return v.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
     }
 
     /** [window-paging] 每页默认条数 · 对齐 deepseek-harness session.ts PAGE_MESSAGES=50。 */
@@ -1356,7 +1435,8 @@ public class MessageService {
      */
     public List<ChatMessageDto> listForResume(String sessionId) {
         List<ChatMessageDto> raw = listRawForTranscript(sessionId);
-        return SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages();
+        return stripPipelineToolCalls(
+            SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages());
     }
 
     /**
@@ -1403,7 +1483,8 @@ public class MessageService {
             return List.of();
         }
         if (excludeMessageId == null || excludeMessageId.isBlank()) {
-            return SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages();
+            return stripPipelineToolCalls(
+                SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages());
         }
         List<ChatMessageDto> filtered = new ArrayList<>(raw.size());
         for (ChatMessageDto m : raw) {
@@ -1416,7 +1497,65 @@ public class MessageService {
             log.debug("[MessageService] listForResumeExcluding(raw): raw={} filtered={}（排除在途用户消息 {}）",
                 raw.size(), filtered.size(), excludeMessageId);
         }
-        return SessionResumeDeserializer.deserializeWithInterruptDetection(filtered).messages();
+        return stripPipelineToolCalls(
+            SessionResumeDeserializer.deserializeWithInterruptDetection(filtered).messages());
+    }
+
+    /** RAG 时间线工具前缀（对齐源站 types.PipelineToolCallIDPrefix）。 */
+    private static final String PIPELINE_TOOL_CALL_PREFIX = "ragpipe-";
+
+    /**
+     * 历史回放剔除 RAG 时间线工具（对齐源站 agent_history.go filterNonTerminalToolCalls）。
+     *
+     * <p>WHY：RAG 轮把 query_understand / knowledge_search 作为「展示用工具」写进 agent_steps，
+     * 模型并没有发过这些调用、本轮工具集里也可能没有 ⇒ 原样回放会让请求协议对不上
+     * （源站注释原文：asking the model to account for calls it never issued breaks the request protocol）。
+     * 只影响模型面读取，前端展示仍走 listRawForTranscript / GET messages。
+     */
+    private static List<ChatMessageDto> stripPipelineToolCalls(List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return messages;
+        }
+        boolean any = false;
+        for (ChatMessageDto m : messages) {
+            if (m == null || m.toolCalls() == null) {
+                continue;
+            }
+            for (ToolCallDto tc : m.toolCalls()) {
+                if (tc != null && tc.id() != null && tc.id().startsWith(PIPELINE_TOOL_CALL_PREFIX)) {
+                    any = true;
+                    break;
+                }
+            }
+            if (any) {
+                break;
+            }
+        }
+        if (!any) {
+            return messages;
+        }
+        List<ChatMessageDto> out = new ArrayList<>(messages.size());
+        for (ChatMessageDto m : messages) {
+            if (m == null || m.toolCalls() == null || m.toolCalls().isEmpty()) {
+                out.add(m);
+                continue;
+            }
+            List<ToolCallDto> kept = new ArrayList<>(m.toolCalls().size());
+            for (ToolCallDto tc : m.toolCalls()) {
+                if (tc != null && tc.id() != null && tc.id().startsWith(PIPELINE_TOOL_CALL_PREFIX)) {
+                    continue;
+                }
+                kept.add(tc);
+            }
+            if (kept.isEmpty()) {
+                out.add(m.withToolCalls(null));
+            } else if (kept.size() == m.toolCalls().size()) {
+                out.add(m);
+            } else {
+                out.add(m.withToolCalls(kept));
+            }
+        }
+        return out;
     }
 
     public ChatMessageDto getById(String id) {
@@ -2023,6 +2162,8 @@ public class MessageService {
         rec.setRole(dto.role() != null ? dto.role().name() : Role.system.name());
         rec.setAuthor(dto.author());
         rec.setContent(dto.content() == null ? "" : dto.content());
+        // [RAG 时间线] 快问阶段的检索工具随消息落库（ReAct 轮 toolCalls 为空 → 不写）
+        rec.setAgentSteps(serializeToolCalls(dto.toolCalls()));
         rec.setReasoning(dto.reasoning());
         // [thinking-passthrough] thinking 块签名落库 · V282 列（与 reasoning 文本配对，
         //   与 CC transcript 同构：只存 thinking 文本 + signature，不存块结构）。
@@ -2508,7 +2649,16 @@ public class MessageService {
             .withUserMessageId(m.getUserMessageId()) // [userMessageId] 读侧回填（V47 列；GET /messages 出站唯一点；旧行 NULL = 无归属容错）
             .withQueuedOrigin(m.getQueuedOrigin()) // [P0-1 OD-1/OD-3] 读侧回填（V67 queued_origin 列；resume 发送层按标记重新包壳；旧行 NULL = 非排队不包壳，与现状一致可接受）
             .withThinkingSignature(m.getThinkingSignature()) // [thinking-passthrough] 读侧回填（V282 列；resume/重放时送侧据此重建 thinking 块；旧行 NULL = 无签名，按空签名回传）
-            .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId())); // [userAttachments] 读侧回填（V62 列；GET /messages 出站唯一点；contentId 非空 → url 动态拼 /api/v1/attachments/content/{sessionId}/{contentId}；null 列 → 空列表，恒非 null）
+            .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId()));
+        // [userAttachments] 读侧回填（V62 列；GET /messages 出站唯一点；contentId 非空 → url 动态拼
+        //   /api/v1/attachments/content/{sessionId}/{contentId}；null 列 → 空列表，恒非 null）
+        //
+        // [RAG 时间线] 读回检索阶段工具（V290 列）：**仅当 agent_steps 非空才覆盖**。
+        //   ⚠️ ReAct 轮不写 agent_steps（工具调用在 tool_calls 子表，上面 :2597 已读出），
+        //   若无条件覆盖会把子表的真实 toolCalls 清成空 ⇒ 主会话工具卡全部消失（已踩过）。
+        if (m.getAgentSteps() != null && !m.getAgentSteps().isBlank()) {
+            dto = dto.withToolCalls(parseToolCalls(m.getAgentSteps()));
+        }
         // [usage 读侧回填] DB 持久化 inputTokens/outputTokens + cache 4 字段 → 重拉投影回填 usage，
         //   使 F5 后消息 token 展示与实时 complete 事件一致（↑input ↓output + cache）。
         //   仅 assistant 消息（tokens 非 null）回填；user/tool 消息不回填（避免 ↑0 ↓0 假值）。
@@ -2703,6 +2853,37 @@ public class MessageService {
      * @param list 附件快照列表（可 null/空）
      * @return JSON 数组文本；null/空/序列化失败 → null
      */
+    /**
+     * [RAG 时间线] 阶段工具序列化（形状与前端 {@code toolCalls[]} 一致）。
+     *
+     * <p>源站把这条时间线存在 {@code messages.agent_steps}；本仓没有 AgentStep 概念，
+     * 直接存 {@link ToolCallDto} 数组 —— 出站时展平成 {@code ChatMessageDto.toolCalls}。
+     */
+    private static String serializeToolCalls(List<ToolCallDto> list) {
+        if (list == null || list.isEmpty()) {
+            return null;
+        }
+        try {
+            return JSON.writeValueAsString(list);
+        } catch (Exception e) {
+            log.warn("[MessageService] 阶段工具序列化失败（降级 null）: {}", e.toString());
+            return null;
+        }
+    }
+
+    /** [RAG 时间线] 阶段工具反序列化；null/坏 JSON → 空列表（不是每轮都有）。 */
+    private static List<ToolCallDto> parseToolCalls(String json) {
+        if (json == null || json.isBlank()) {
+            return List.of();
+        }
+        try {
+            return JSON.readValue(json, new TypeReference<List<ToolCallDto>>() { });
+        } catch (Exception e) {
+            log.warn("[MessageService] 阶段工具反序列化失败（降级空列表）: {}", e.toString());
+            return List.of();
+        }
+    }
+
     private static String serializeUserAttachments(List<UserAttachmentInfo> list) {
         if (list == null || list.isEmpty()) {
             return null;

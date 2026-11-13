@@ -108,6 +108,31 @@ public final class NexusaiDataRoots {
         return dataRoot().resolve(name).toAbsolutePath().normalize();
     }
 
+    /** 知识库域子目录名（{@code <数据根>/kb}）· 知识库相关目录都收在它下面。 */
+    public static final String KB_DIR_NAME = "kb";
+
+    /** 知识库「新对话」子目录名（会话的 mainProjectId 指向这里 ⇒ {@code <数据根>/kb/chat}）。 */
+    public static final String CHAT_DIR_NAME = "chat";
+
+    /**
+     * 知识库「新对话」工作区目录（{@code <数据根>/kb/chat}）。
+     *
+     * <p>会话必须绑一条已注册的项目，而项目 = 一条目录；这里给知识库弹窗内的新对话一个
+     * <b>固定归属</b>，避免落到用户正在用的仓库下（改造前 {@code projectApi.list()[0]}
+     * 的形态）。目录不存在则创建；建不出来即抛 —— 不能静默降级到别的目录。
+     *
+     * @return 已创建成功的绝对路径
+     */
+    public static Path chatRoot() {
+        Path dir = sub(KB_DIR_NAME).resolve(CHAT_DIR_NAME);
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException | SecurityException e) {
+            throw new IllegalStateException("知识库对话目录创建失败: " + dir, e);
+        }
+        return dir;
+    }
+
     /**
      * 可注入版本（单测用）。
      *
@@ -117,6 +142,15 @@ public final class NexusaiDataRoots {
      */
     static Path resolve(Function<String, String> env, Path configHome) {
         String install = env == null ? null : env.apply(INSTALL_DIR_ENV);
+        // 环境变量是唯一真源；未设置时从**运行位置**推导（jar 部署 = <install>/backend/xxx.jar）。
+        // ⛔ 不写死任何安装路径 —— 换机器 / 换安装位置都必须自动正确，推不出来才回落配置根。
+        if (install == null || install.isBlank()) {
+            Path inferred = inferInstallDir();
+            if (inferred != null) {
+                log.info("[数据根] 未设置 {}，按运行位置推导安装目录：{}", INSTALL_DIR_ENV, inferred);
+                install = inferred.toString();
+            }
+        }
         if (install != null && !install.isBlank()) {
             Path installDir = Paths.get(install.trim()).toAbsolutePath().normalize();
             if (!Files.isDirectory(installDir)) {
@@ -136,6 +170,38 @@ public final class NexusaiDataRoots {
         Path fallback = configHome.toAbsolutePath().normalize();
         log.info("[数据根] 采用配置根：{}（未设置 {} 或安装目录不可用）", fallback, INSTALL_DIR_ENV);
         return fallback;
+    }
+
+    /**
+     * 从运行位置推导安装目录（{@code NEXUSAI_INSTALL_DIR} 未设置时的兜底）。
+     *
+     * <p>只认「jar 部署」形态：{@code <install>/backend/xxx.jar} ⇒ 祖父目录 = {@code <install>}。
+     * 开发态（{@code target/classes} 目录）与测试环境推不出来 ⇒ 返回 {@code null}，
+     * 由调用方回落配置根（与改造前行为一致）。
+     *
+     * <p>⛔ 不猜固定路径、不读注册表：本推导完全由「代码从哪加载」决定，跨机器自然正确。
+     *
+     * @return 安装目录；无法推导返回 {@code null}
+     */
+    static Path inferInstallDir() {
+        try {
+            java.security.ProtectionDomain pd = NexusaiDataRoots.class.getProtectionDomain();
+            if (pd == null || pd.getCodeSource() == null || pd.getCodeSource().getLocation() == null) {
+                return null;
+            }
+            Path loc = java.nio.file.Paths.get(pd.getCodeSource().getLocation().toURI())
+                .toAbsolutePath().normalize();
+            if (Files.isDirectory(loc)) {
+                // 开发态（target/classes）或解包目录：不是安装目录
+                return null;
+            }
+            Path backendDir = loc.getParent();      // <install>/backend
+            Path install = backendDir == null ? null : backendDir.getParent();   // <install>
+            return install != null && Files.isDirectory(install) ? install : null;
+        } catch (RuntimeException | java.net.URISyntaxException | LinkageError e) {
+            // SecurityException / 非常规类加载器：一律当作推不出
+            return null;
+        }
     }
 
     /**

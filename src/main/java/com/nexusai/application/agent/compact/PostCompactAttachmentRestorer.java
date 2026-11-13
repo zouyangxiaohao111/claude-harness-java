@@ -1260,6 +1260,152 @@ public final class PostCompactAttachmentRestorer {
         }
     }
     // ════════════════════════════════════════════════════════════════════
+    // tools_delta · 「全量内联」路径的工具增减通知
+    // ────────────────────────────────────────────────────────────────────
+    // WHY 需要它：deferred_tools_delta 只服务「工具被 defer、模型必须靠 ToolSearch 才能拿到
+    //   schema」的路径。而下面两种情况下工具是<b>全量内联</b>的，压根没有 ToolSearch：
+    //     ① 非 anthropic provider（openai / 兼容端点）—— 没有 tool_reference 这个形态；
+    //     ② anthropic 但模型不支持 tool_reference（haiku 等，见
+    //        ToolSearchService.DEFAULT_UNSUPPORTED_MODEL_PATTERNS）。
+    //   这两条路上，用户在会话中途打开/关闭工具时，模型不会收到任何提示 —— 它只能靠
+    //   「tools 数组这一轮变长了」自己察觉。本附件补上这条显式通知。
+    //
+    // 与 deferred_tools_delta 的差别（刻意如此）：
+    //   · 首轮写一条 baseline=true 的附件，渲染时返回 null ⇒ 模型看不到（tools 数组里本来
+    //     就全是完整 schema，再宣布一遍上百个名字纯粹浪费 token）；
+    //   · 之后只在「工具集相对基线有增减」时才产出可见通知。
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 附件类型字面量 · tools_delta（本仓自有；CC 全量内联路径不做通知，无对应物） */
+    public static final String DELTA_TYPE_TOOLS = "tools_delta";
+
+    /**
+     * tools_delta 生产 · 全量内联路径的工具增减通知。
+     *
+     * <p>首个调用（历史里还没有 tools_delta）⇒ 写一条 baseline 附件（模型不可见），
+     * 后续按 diff 产出 added/removed。
+     *
+     * @param visibleTools 本轮**实际发给模型**的工具（调用方须先剔除会话禁用等不可用项）
+     * @param messages     历史消息（基线与 diff 的扫描源）
+     * @return 附件；无变化 / 工具集为空 → {@code null}
+     */
+    public static ChatMessageDto toolsDeltaAttachment(
+            List<Tool> visibleTools, List<ChatMessageDto> messages) {
+        if (visibleTools == null || visibleTools.isEmpty()) {
+            return null;
+        }
+        List<String> current = new ArrayList<>();
+        for (Tool t : visibleTools) {
+            if (t != null && t.name() != null && !t.name().isBlank()) {
+                current.add(t.name());
+            }
+        }
+        if (current.isEmpty()) {
+            return null;
+        }
+        current.sort(String::compareTo);
+
+        boolean hasBaseline = false;
+        if (messages != null) {
+            for (ChatMessageDto m : messages) {
+                if (m != null && ATTACHMENT_AUTHOR.equals(m.author())
+                        && DELTA_TYPE_TOOLS.equals(m.subtype())) {
+                    hasBaseline = true;
+                    break;
+                }
+            }
+        }
+        if (!hasBaseline) {
+            String payload = "{\"type\":\"" + DELTA_TYPE_TOOLS + "\",\"baseline\":true,\"addedNames\":"
+                + jsonArray(current) + ",\"addedLines\":" + jsonArray(current) + ",\"removedNames\":[]}";
+            return deltaAttachment(DELTA_TYPE_TOOLS, payload);
+        }
+
+        Set<String> announced = scanAnnouncedDeltaNames(messages, DELTA_TYPE_TOOLS,
+            "addedNames", "removedNames");
+        List<String> added = new ArrayList<>();
+        for (String n : current) {
+            if (!announced.contains(n)) {
+                added.add(n);
+            }
+        }
+        List<String> removed = new ArrayList<>();
+        for (String n : announced) {
+            if (!current.contains(n)) {
+                removed.add(n);
+            }
+        }
+        removed.sort(String::compareTo);
+        if (added.isEmpty() && removed.isEmpty()) {
+            return null;
+        }
+        String payload = "{\"type\":\"" + DELTA_TYPE_TOOLS + "\",\"addedNames\":"
+            + jsonArray(added) + ",\"addedLines\":" + jsonArray(added)
+            + ",\"removedNames\":" + jsonArray(removed) + "}";
+        if (log.isInfoEnabled()) {
+            log.info("[tools_delta] 全量内联路径工具增减：新增 {} 个 {} · 移除 {} 个 {}",
+                added.size(), added, removed.size(), removed);
+        }
+        return deltaAttachment(DELTA_TYPE_TOOLS, payload);
+    }
+
+    /**
+     * tools_delta 人类可读渲染 · 结构与 {@link #renderDeferredToolsDelta} 一致
+     * （{@code <system-reminder>} 包 added/removed 两段），措辞按「无 ToolSearch」改写。
+     *
+     * @param jsonPayload 附件持久化 JSON
+     * @return 人类可读文本；baseline / 两段皆空 / 解析失败 → {@code null}（模型不可见）
+     */
+    public static String renderToolsDelta(String jsonPayload) {
+        if (jsonPayload == null || jsonPayload.isBlank()) {
+            return null;
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode node = SKILL_JSON.readTree(jsonPayload);
+            if (node == null || !node.isObject()) {
+                return null;
+            }
+            // 基线附件对模型不可见：它这一轮就能看到完整 tools 数组，再列一遍名字是噪声。
+            if (node.path("baseline").asBoolean(false)) {
+                return null;
+            }
+            List<String> added = new ArrayList<>();
+            com.fasterxml.jackson.databind.JsonNode addedNode = node.path("addedNames");
+            if (addedNode.isArray()) {
+                for (com.fasterxml.jackson.databind.JsonNode n : addedNode) {
+                    if (n.isTextual()) {
+                        added.add(n.asText());
+                    }
+                }
+            }
+            List<String> removed = new ArrayList<>();
+            com.fasterxml.jackson.databind.JsonNode removedNode = node.path("removedNames");
+            if (removedNode.isArray()) {
+                for (com.fasterxml.jackson.databind.JsonNode n : removedNode) {
+                    if (n.isTextual()) {
+                        removed.add(n.asText());
+                    }
+                }
+            }
+            if (added.isEmpty() && removed.isEmpty()) {
+                return null;
+            }
+            List<String> parts = new ArrayList<>();
+            if (!added.isEmpty()) {
+                parts.add("The following tools are now available:\n" + String.join("\n", added));
+            }
+            if (!removed.isEmpty()) {
+                parts.add("The following tools are no longer available. Do not call them — "
+                    + "they will fail:\n" + String.join("\n", removed));
+            }
+            return "<system-reminder>\n" + String.join("\n\n", parts) + "\n</system-reminder>";
+        } catch (Exception e) {
+            log.debug("[PostCompactAttachmentRestorer] renderToolsDelta: 解析失败, 返回 null (subtype=tools_delta)");
+            return null;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // [IMP2-03] 生产接线 · async-agent/plan/plan_mode 填充 + 3×delta 重宣布
     // （CC compact.ts:545-585 · ✗-1..✗-4 · INV-15；deferred_tools / agent_listing 两门默认关，
     //   mcp_instructions 门已于 2026-09-21 删除 ⇒ 该支无条件重宣布）
@@ -1391,8 +1537,12 @@ public final class PostCompactAttachmentRestorer {
         }
         String model = ctx.getModel();
         // 1. deferred_tools_delta（compact.ts:567-574）· providerType 从 tuc 透传（单点 toolReferenceUsable 消费）
+        // ⭐ 与主循环同源：delta 的 diff 必须走剔除会话禁用后的池，否则「关闭工具」不会产生
+        //   removed 条目（工具仍在原始池里），模型会继续搜那些已下架的工具。
         ChatMessageDto dtd = deferredToolsDeltaAttachment(
-                tuc.availableTools(), model, tuc.effectiveProviderType(), preservedMessages);
+                com.nexusai.application.agent.config.SessionToolDisableConfig.filterDisabled(
+                        tuc.availableTools(), tuc.sessionId()),
+                model, tuc.effectiveProviderType(), preservedMessages);
         if (dtd != null) {
             out.add(dtd);
         }

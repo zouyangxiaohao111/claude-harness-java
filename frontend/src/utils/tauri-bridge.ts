@@ -6,7 +6,7 @@
  * 避免「模块加载时检测未完成、用户点击时 tauriAvailable 仍为 false」的时序 bug。
  */
 
-async function isTauriEnv(): Promise<boolean> {
+export async function isTauriEnv(): Promise<boolean> {
   try {
     const { isTauri } = await import('@tauri-apps/api/core')
     return isTauri()

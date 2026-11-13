@@ -526,6 +526,67 @@ public final class ToolSearchService {
         return "anthropic".equalsIgnoreCase(providerType) && modelSupportsToolReference(model);
     }
 
+    // ═══════════════════════════════════════════════════════════════════════
+    // 工具搜索被端点拒绝 · 对齐 CC 2.1.323 的「去掉 deferred 工具重发一次」
+    // ═══════════════════════════════════════════════════════════════════════
+
+    /** 端点拒绝 {@code defer_loading} 的会话集合（进程内、会话级，等价 CC「会话内不再试」）。 */
+    private static final Set<String> REFUSED_SESSIONS = ConcurrentHashMap.newKeySet();
+
+    /** CC {@code /\bdefer_loading\b/} —— 用于识别「端点不认 defer_loading」的 400/422。 */
+    private static final java.util.regex.Pattern DEFER_LOADING_PATTERN =
+        java.util.regex.Pattern.compile("\\bdefer_loading\\b");
+
+    /**
+     * 本会话是否已被端点拒绝过工具搜索。
+     *
+     * @param sessionId 会话 id（null → false）
+     * @return true = 已拒绝，调用方应走「全量内联、不发 defer_loading」路径
+     */
+    public static boolean isToolSearchRefused(String sessionId) {
+        return sessionId != null && REFUSED_SESSIONS.contains(sessionId);
+    }
+
+    /**
+     * 标记本会话工具搜索被拒（幂等）。
+     *
+     * <p>对齐 CC：{@code [ToolSearch] HTTP 400 …; sending the request again without deferred tools.
+     * ENABLE_TOOL_SEARCH=false avoids the refused request} —— CC 只在本次请求重发时降级，并在会话内记住。
+     *
+     * @param sessionId 会话 id（null → no-op）
+     */
+    public static void markToolSearchRefused(String sessionId) {
+        if (sessionId != null) {
+            REFUSED_SESSIONS.add(sessionId);
+        }
+    }
+
+    /** 测试用：清空拒绝集合。 */
+    static void clearRefusedSessionsForTest() {
+        REFUSED_SESSIONS.clear();
+    }
+
+    /**
+     * 判断异常是否属「端点不认 defer_loading」· 对齐 CC {@code jJ}：
+     * {@code status===400||422 && /\bdefer_loading\b/.test(message)}。
+     *
+     * @param err 上游异常（可 null）
+     * @return true = 应剔除 deferred 工具后重发
+     */
+    public static boolean isDeferLoadingRefusal(Throwable err) {
+        if (!(err instanceof com.nexusai.infra.llm.LlmApiException api)) {
+            return false;
+        }
+        if (api.status() != 400 && api.status() != 422) {
+            return false;
+        }
+        String body = api.body();
+        if (body == null || body.isEmpty()) {
+            body = api.getMessage();
+        }
+        return body != null && DEFER_LOADING_PATTERN.matcher(body).find();
+    }
+
 
     /**
      * definitive 门控（纯 char fallback）· 对齐 CC {@code isToolSearchEnabled}（toolSearch.ts:385-473）·
@@ -648,14 +709,21 @@ public final class ToolSearchService {
     // ═══════════════════════════════════════════════════════════════════════
 
     /**
-     * 过滤发送给 API 的工具 schema · 对齐 CC {@code filteredTools}（claude.ts:1154-1172）。
+     * 过滤发送给 API 的工具 schema · 对齐 CC {@code filteredTools}（exe 2.1.323 {@code function A1}）。
      *
      * <p>{@code useToolSearch=true}（Anthropic/Claude，动态工具加载）：
      * <ul>
-     *   <li>非 deferred 恒留（claude.ts:1163-1164）</li>
-     *   <li>ToolSearch 恒留（:1165-1166，模型可继续发现工具）</li>
-     *   <li>deferred 工具仅当在 discovered set 中才留（:1167-1168，tool_reference 已发现）</li>
+     *   <li>非 deferred 恒留</li>
+     *   <li>ToolSearch 恒留（模型可继续发现工具）</li>
+     *   <li>deferred <b>仅 discovered / 已激活才发</b> —— 依据 exe {@code A1} 末行
+     *       {@code return !o.has(e.name)}，以及配套用户可见文案
+     *       「This tool's schema was not sent to the API — it was not in the discovered-tool set
+     *       derived from message history」</li>
      * </ul>
+     *
+     * <p>⚠️ 2026-11-13 复核：我曾据「{@code q_} 里有 defer_loading 条目 / {@code UP = q_.filter(非 defer_loading)}」
+     * 推断 CC 会全量声明未发现的 deferred —— <b>该推断错误</b>，已回退。`q_` 里的 deferred 条目是
+     * 「已 discovered 的那部分」，{@code defer_loading} 仍按名字打。
      *
      * <p>{@code useToolSearch=false}（非 anthropic / anthropic×haiku / 显式关闭，<b>2026-09-11 R8
      * 回归 CC claude.ts:1170-1172</b>）→ <b>恒</b>「排除 ToolSearchTool + 其余（含 deferred/MCP）全量
@@ -664,8 +732,8 @@ public final class ToolSearchService {
      *
      * @param tools              可用工具列表
      * @param useToolSearch      本 turn 工具搜索开关（true=Anthropic tool_reference 语义；false=CC 全发）
-     * @param deferredToolNames  预计算 deferred 名（可 null；false 分支不参与过滤）
-     * @param discoveredToolNames 消息历史发现的 tool_reference 名集合（可 null；false 分支不参与过滤）
+     * @param deferredToolNames  预计算 deferred 名（可 null）
+     * @param discoveredToolNames 消息历史发现的 tool_reference 名集合（可 null；决定 deferred 是否发 schema）
      * @return 过滤后的工具列表
      */
     public static List<Tool> filterToolsForSchema(
@@ -686,7 +754,10 @@ public final class ToolSearchService {
                     if (matchesToolSearchName(t)) {
                         return true;                  // ToolSearch 恒留
                     }
-                    // [activate-on-search] discovered（CC tool_reference 语义）或 ToolSearch 激活（Java 扩展）含才留
+                    // deferred 仅 discovered/tool_reference 已激活才发（exe `function A1` 末行
+                    // `return !o.has(e.name)`：不在 discovered 集合 ⇒ 不发 schema；配套用户可见文案
+                    // 「This tool's schema was not sent to the API — it was not in the discovered-tool
+                    // set derived from message history」）
                     return discovered.contains(t.name()) || isActivated(t.name());
                 })
                 .toList();

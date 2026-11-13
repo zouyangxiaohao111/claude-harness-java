@@ -11,6 +11,12 @@ export function parseStreamEvent(raw: unknown): StreamEvent {
 export const isChunk = (e: StreamEvent): e is MessageChunkEvent => e.type === 'message.chunk'
 export const isPushedUser = (e: StreamEvent): e is PushedUserMessageEvent => e.type === 'message.user'
 export const isComplete = (e: StreamEvent): e is MessageCompleteEvent => e.type === 'message.complete'
+/** 知识库问答引用（后端在生成前推一次；与 complete 同 topic） */
+export const isCitations = (e: StreamEvent): e is StreamEvent & {
+  assistantMessageId?: string
+  assistant_message_id?: string
+  citations?: import('@/api/types').CitationItem[]
+} => e.type === 'citations'
 /** 消息级 usage 快照守卫（消息级完成、非 turn 终态 —— isComplete 对 message.usage 恒 false → 不退订） */
 export const isMessageUsage = (e: StreamEvent): e is MessageUsageEvent => e.type === 'message.usage'
 export const isToolCall = (e: StreamEvent): e is MessageToolCallEvent => e.type === 'message.tool_call'

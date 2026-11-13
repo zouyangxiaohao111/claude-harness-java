@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.75] - 2026-11-13
+
+### Fixed
+
+- 修复 mac 客户端误获取 Windows 更新包的问题：更新检查改为按运行平台取包（清单里没有本平台即视为无可用更新），发布侧按产物实际平台生成多平台更新清单
+- 文件附件能力对齐 CCB：合成 Read / pdf_reference / 知识库清单
+
 ## [0.1.74] - 2026-11-13
 
 ### Fixed

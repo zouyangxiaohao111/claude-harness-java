@@ -3,7 +3,7 @@ import { Client, type StompSubscription } from '@stomp/stompjs'
 import { parseGoalPayload } from '@/utils/goalState'
 import { useChatStore, type PermissionRequestItem } from '../stores/chatStore'
 import { sessionApi, type PermissionEventPayload } from '../api/sessions'
-import { createSocketClient, subscribeStream, notifySocketConnect, isChunk, isPushedUser, isComplete, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
+import { createSocketClient, subscribeStream, notifySocketConnect, isChunk, isPushedUser, isComplete, isCitations, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
@@ -1330,7 +1330,11 @@ export function useChatSocket(
       //   不改「id 不匹配就忽略」的防挂错轮语义——这里建用的就是事件 id）。
       flushStreamAppends()
       const callBlockId = evt.assistantMessageId ?? 'msg-stream'
-      st.ensureStreamBlock(sid, callBlockId, null)
+      // ⚠️ 必须带事件自身的 userMessageId：RAG（KbQaPipeline）的进度 tool_call **先于首个 chunk** 到达，
+      //   块在这里以 userMessageId=null 建出来；后续 chunk 走 ensureStreamBlock 幂等 no-op（不改归属）
+      //   ⇒ 整块挂不上本轮（渲染成第二个 nexus 头）且 finalize 出来的消息轮键为 null（完成后像空白）。
+      //   这里传的就是「事件自己声明的轮」，不改变「id 不匹配就忽略」的防挂错轮语义。
+      st.ensureStreamBlock(sid, callBlockId, evt.userMessageId ?? null)
       // 契约 #6：回放推 tool_call → 按块 id 精确挂工具卡片（arguments Map → JSON 字符串对齐 ToolCallDto.arguments）。
       st.addToolCall(sid, callBlockId, {
         id: evt.toolCallId ?? null,
@@ -1370,6 +1374,13 @@ export function useChatSocket(
           cacheHitRate: evt.cache_hit_rate ?? null,
         })
       }
+    } else if (isCitations(evt)) {
+      // 知识库问答引用：后端在「生成开始前」就推一次（检索结果已定）⇒ 回答逐字出现时右侧来源已可显示。
+      // 与 GET /messages/{id}/citations 同源；这里只做实时增量（历史回放走 REST，暂未接）。
+      const aid = (evt as { assistantMessageId?: string; assistant_message_id?: string }).assistantMessageId
+        ?? (evt as { assistant_message_id?: string }).assistant_message_id
+        ?? ''
+      st.setCitations(sid, aid, (evt as { citations?: import('@/api/types').CitationItem[] }).citations ?? [])
     } else if (isComplete(evt)) {
       // 标记本轮已收到 complete，idle 据此决定是否需要兜底对账
       turnSawCompleteRef.current.set(sid, true)

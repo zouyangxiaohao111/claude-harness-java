@@ -299,6 +299,42 @@ class AnthropicSdkProviderEffortTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
+    // 「关闭思考」档（sessions.effort_level='off'）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("effort='off' → thinking:{type:'disabled'}，且不发 output_config.effort")
+    void effortOff_sendsDisabledThinkingAndNoEffort() throws Exception {
+        JsonNode body = buildParamsWire("claude-sonnet-4-6", null, "off");
+
+        JsonNode thinking = body.get("thinking");
+        assertThat(thinking).as("关闭思考必须显式发 disabled（CC max_thinking_tokens=0 等价）").isNotNull();
+        assertThat(thinking.path("type").asText()).isEqualTo("disabled");
+
+        assertThat(body.has("output_config"))
+            .as("⛔ 'off' 不是 effort 档位 —— 发 output_config.effort='off' 会被 API 400")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("effort='high' → 仍是 adaptive thinking（关闭档不能把默认路径带偏）")
+    void effortHigh_keepsAdaptiveThinking() throws Exception {
+        JsonNode body = buildParamsWire("claude-sonnet-4-6", null, "high");
+
+        JsonNode thinking = body.get("thinking");
+        assertThat(thinking).isNotNull();
+        assertThat(thinking.path("type").asText()).isEqualTo("adaptive");
+    }
+
+    @Test
+    @DisplayName("effort=null → 仍是 adaptive thinking")
+    void effortNull_keepsAdaptiveThinking() throws Exception {
+        JsonNode body = buildParamsWire("claude-sonnet-4-6", null, null);
+
+        assertThat(body.get("thinking").path("type").asText()).isEqualTo("adaptive");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
     // helpers
     // ════════════════════════════════════════════════════════════════════
 

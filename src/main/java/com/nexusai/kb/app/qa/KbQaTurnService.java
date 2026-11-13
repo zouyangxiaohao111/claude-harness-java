@@ -72,6 +72,8 @@ public class KbQaTurnService {
     @Autowired(required = false) private ChatService chatService;
     @Autowired(required = false)
     private com.nexusai.application.session.SessionArtifactService sessionArtifactService;
+    /** 引用落库后回填真实 assistant id（见 reassignAssistantMessageId 的 WHY）。 */
+    @Autowired(required = false) private KbCitationWriter citationWriter;
 
     /**
      * 一次受理结果。
@@ -97,6 +99,16 @@ public class KbQaTurnService {
      * @throws com.nexusai.infra.exception.ValidationException 问题为空 / 会话不存在
      */
     public Accepted accept(String sessionId, String content, KbQaPipeline.Request req) {
+        return accept(sessionId, content, req, null);
+    }
+
+    /**
+     * 同 {@link #accept(String, String, KbQaPipeline.Request)}，额外把「本轮 @ 选中的知识库/文件」
+     * 以附件快照落进 user 消息（{@code messages.user_attachments}）—— 前端 user 气泡直接复用
+     * 现成的附件胶囊渲染，⛔ 不需要为 mention 新增列。
+     */
+    public Accepted accept(String sessionId, String content, KbQaPipeline.Request req,
+                           java.util.List<com.nexusai.model.session.dto.AttachmentRequest> attachments) {
         if (content == null || content.isBlank()) {
             throw new com.nexusai.infra.exception.ValidationException("content 不能为空");
         }
@@ -114,7 +126,7 @@ public class KbQaTurnService {
             // SendMessageRequest 9 字段：content / modelName / useFastModel / attachments /
             //   appendSystemPrompt / fallbackModel / permissionMode / dangerouslySkipPermissions / jsonSchema
             created = messageService.createUserMessage(
-                sessionId, new SendMessageRequest(content, req.modelName(), null, null,
+                sessionId, new SendMessageRequest(content, req.modelName(), null, attachments,
                     null, null, null, null, null));
         } catch (com.nexusai.infra.exception.NotFoundException e) {
             throw new com.nexusai.infra.exception.ValidationException("会话不存在：" + sessionId);
@@ -143,7 +155,7 @@ public class KbQaTurnService {
 
         KbQaPipeline.Request runReq = new KbQaPipeline.Request(
             sessionId, userMessageId, assistantMessageId,
-            content, req.knowledgeBaseIds(), req.modelName(),
+            content, req.knowledgeBaseIds(), req.knowledgeIds(), req.modelName(),
             req.webSearchEnabled(), cancelled);
 
         // ④ 异步执行（HTTP 立刻返回 202，内容走 STOMP）
@@ -198,12 +210,19 @@ public class KbQaTurnService {
         // 落 assistant 消息（用户停止 / 失败也要落，否则刷新后这一轮凭空消失）
         ChatMessageDto saved = null;
         try {
-            saved = persistAssistant(sessionId, userMessageId, answer, finishReason);
+            saved = persistAssistant(sessionId, userMessageId, answer, finishReason, result.stageTools());
         } catch (RuntimeException e) {
             log.warn("[问答轮] 落 assistant 消息失败 session={} 原因={}", sessionId, e.getMessage());
         }
         String resolvedAssistantId = saved != null && saved.id() != null
             ? saved.id() : assistantMessageId;
+
+        // 引用行的 assistant_message_id 是受理时的占位 id ⇒ 落库后回填真实 id，
+        // 否则 GET /messages/{id}/citations 恒空（前端历史回放没有来源面板的根因）。
+        if (citationWriter != null && assistantMessageId != null
+            && !assistantMessageId.equals(resolvedAssistantId)) {
+            citationWriter.reassignAssistantMessageId(sessionId, assistantMessageId, resolvedAssistantId);
+        }
 
         // 收口事件：content 为全文（与主对话 complete 同款）。
         // 用 9 参重载：问答链不做工具轮，input/output tokens 与上下文快照暂不上报
@@ -226,14 +245,15 @@ public class KbQaTurnService {
 
     /** 落 assistant 消息行（返回落库后 DTO，失败 → null）。 */
     private ChatMessageDto persistAssistant(String sessionId, String userMessageId,
-                                            String content, String finishReason) {
+                                            String content, String finishReason,
+                                            List<com.nexusai.model.session.dto.ToolCallDto> stageTools) {
         // 19 参构造器（与 KnowledgeQaService.generate 里构造 user 消息同款形状）：
         //   id/sessionId/role/author/content/reasoning/toolCalls/finishReason/
         //   inputTokens/outputTokens/time/createdAt/toolCallId/assistantMessageId/
         //   acceptFeedback/contentBlocks/imagePasteIds/structuredOutput/isMeta
         ChatMessageDto dto = new ChatMessageDto(
             null, sessionId, com.nexusai.model.session.dto.Role.assistant, "nexus",
-            content, null, null,
+            content, null, stageTools,
             com.nexusai.model.session.dto.FinishReason.parse(finishReason),
             null, null, null, null,
             null, null,

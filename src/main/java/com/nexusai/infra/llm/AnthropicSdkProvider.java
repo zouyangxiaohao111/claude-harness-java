@@ -2081,10 +2081,17 @@ public class AnthropicSdkProvider implements LlmProvider {
             //   → 空收尾（用户报「直接结束」）。直连实测该参数被 DeepSeek 端点接受、adaptive 令模型
             //   「适可而止地想」。display=OMITTED 与 CC 同形（DeepSeek 实测仍回 thinking 内容，不影响
             //   本仓思考展示；真 Claude 侧与 CC 行为一致）。
-            .thinking(ThinkingConfigParam.ofAdaptive(
-                ThinkingConfigAdaptive.builder()
-                    .display(ThinkingConfigAdaptive.Display.OMITTED)
-                    .build()));
+            .thinking(com.nexusai.infra.llm.EffortSupport.isThinkingOff(effortValue)
+                // 「关闭思考」档（sessions.effort_level='off'）⇒ 显式 disabled，对齐 CC
+                // max_thinking_tokens=0 → {type:"disabled"}。⚠️ 极少数模型拒绝 disabled
+                // （CC 能力表有 rejects_disabled_thinking，本仓暂无该表）—— 若端点报错，
+                // 回落到 adaptive 即可，不改存储值。
+                ? ThinkingConfigParam.ofDisabled(
+                    com.anthropic.models.messages.ThinkingConfigDisabled.builder().build())
+                : ThinkingConfigParam.ofAdaptive(
+                    ThinkingConfigAdaptive.builder()
+                        .display(ThinkingConfigAdaptive.Display.OMITTED)
+                        .build()));
 
         // [C-31] output_config: task_budget + effort + format 共享单节点（CC claude.ts:1559-1565）
         OutputConfig.Builder ocb = null;

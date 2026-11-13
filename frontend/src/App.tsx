@@ -83,6 +83,7 @@ import { Composer, SUMMON_TRAILING_SPACES } from '@/components/center/Composer'
 import { WorkspaceHeader } from '@/components/center/WorkspaceHeader'
 import { SchedulesPage } from '@/components/center/SchedulesPage'
 import { KnowledgeBasePage, KbSceneNav } from '@/components/knowledge/KnowledgeBasePage'
+import { KbNewChatPane } from '@/components/knowledge/KbNewChatPane'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
@@ -325,6 +326,15 @@ function App() {
 
   /** 知识库场景内的当前面：知识库 / 共享空间（侧栏切换） */
   const [kbScene, setKbScene] = useState<'knowledge' | 'shared'>('knowledge')
+  /** 知识库弹窗主区视图：列表 / 新对话（弹窗内换页，不关弹窗） */
+  const [kbView, setKbView] = useState<'knowledge' | 'chat'>('knowledge')
+  /** 「新对话」信号：自增 ⇒ 弹窗内强制进入空白会话（与独立窗口同一套规则） */
+  const [kbNewChatToken, setKbNewChatToken] = useState(0)
+  // 每次打开知识库都回到列表页：否则上次停在「新对话」（一条空会话）
+  // 再次打开看起来就是「空白弹窗」。关闭时不动 state，交给这里重置。
+  useEffect(() => {
+    if (showKnowledge) setKbView('knowledge')
+  }, [showKnowledge])
   /** 斜杠前缀 chip 的显示别名（召唤技能时携带中文显示名；Composer 仅在前缀名匹配时使用） */
   const [slashAlias, setSlashAlias] = useState<{ name: string; display: string } | null>(null)
   /** sendMessage 内读取最新别名的 ref（避免把 alias 加进 useCallback 依赖列表） */
@@ -1998,6 +2008,28 @@ function App() {
   }, [sessionDispatch, showToast, setSessions, storeSessions, realProjects, defaultNewSessionModel, activeSessionId])
 
   /**
+   * [分叉] 从某轮末消息截断复制出新会话并自动切过去。
+   *
+   * <p>复制（消息 / 工具调用 / 产物目录 / 附件）全在后端完成，前端只负责：
+   * 按 `compareSessions` 插入左栏（与 {@link createSession} 同一口径，避免 F5 后错序）+
+   * SWITCH + ADD_TAB。失败由按钮侧 catch（不跳转），这里只提示。
+   */
+  const handleForkTurn = useCallback(async (sourceSessionId: string, throughMessageId: string) => {
+    try {
+      const res = await sessionApi.fork(sourceSessionId, throughMessageId)
+      sessionListSeqRef.current++  // 丢弃在途列表响应，避免新会话闪一下又消失
+      setSessions([res.session, ...storeSessions].sort(compareSessions))
+      setWorkspacePage('chat')
+      sessionDispatch({ type: 'SWITCH', sessionId: res.session.id })
+      sessionDispatch({ type: 'ADD_TAB', tabId: res.session.id })
+      showToast(`已分叉：${res.session.title}（复制 ${res.copiedMessages} 条消息）`, 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+      throw e
+    }
+  }, [sessionDispatch, setSessions, storeSessions, showToast])
+
+  /**
    * 添加工作区（新项目工作组）：给已校验的绝对目录 → 注册/取项目 → 创建该项目首个会话并置顶左栏。
    *
    * <p>「欢迎页（无会话）绑定项目」与左栏「添加工作区 +」共用此路径——保证任一入口绑定目录后
@@ -2314,7 +2346,7 @@ function App() {
           ? { ...s, effortLevel: isUltra ? 'xhigh' : v, ultracodeEnabled: isUltra }
           : s,
       ))
-      showToast(`推理等级 → ${isUltra ? 'ultracode' : v}`, 'success')
+      showToast(`推理等级 → ${isUltra ? 'ultracode' : v === 'off' ? '关闭思考' : v}`, 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
@@ -2772,8 +2804,17 @@ function App() {
    *   而 composerText 是闭包旧值 ⇒ 先 setComposerText 再调本函数会读到旧文本、发出空消息）。
    *   省略 = 用输入框当前草稿（所有既有调用点行为不变）。
    */
-  const sendMessage = useCallback(async (attachments?: AttachmentRequest[], textOverride?: string) => {
-    let text = (textOverride ?? composerText).trim()
+  const sendMessage = useCallback(async (attachments?: AttachmentRequest[], textOverride?: string,
+    /** 作用域：省略 = 当前会话（主对话，行为不变）；传 = 知识库弹窗内的会话 */
+    scope?: { sessionId: string; text: string }) => {
+    // ── 作用域解析：主对话走默认（activeSessionId / composerText），弹窗传自己的 ──
+    const sid = scope?.sessionId ?? activeSessionId
+    const draft = scope?.text ?? composerText
+    // 绑定项目按**作用域会话**判定（弹窗会话也有自己的 mainProjectId）
+    const scopeSession = scope
+      ? useChatStore.getState().sessions.find((x) => x.id === sid)
+      : activeSession
+    let text = (textOverride ?? draft).trim()
     // [v6 · 2026-10-19] 召唤技能的输入框文本 = 中文显示名 ⇒ 发送时先还原为真实斜杠命令
     // （下面的命令分发/执行逻辑依赖 "/" 开头，必须先于它还原）。
     const alias = slashAliasRef.current
@@ -2782,16 +2823,16 @@ function App() {
       else if (text.startsWith(alias.display + ' ')) text = '/' + alias.name + ' ' + text.slice(alias.display.length + 1)
     }
     // 允许纯图片附件发送（无文字时 content 传空串）；完全无内容不发
-    if ((!text && !attachments?.length) || !activeSessionId) return
+    if ((!text && !attachments?.length) || !sid) return
     // [2026-11-04 系统通知] 在**用户手势**里顺手申请通知权限。
     //   WHY 必须在发送这个手势内：浏览器只允许手势内弹权限框，轮次结束时（异步）
     //   再请求必被静默拒。这里 fire-and-forget：不 await、不阻塞发送、失败静默。
     //   只在 permission==='default'（从没问过）时真正弹框，见 systemNotify 里的说明。
     void ensureNotificationPermissionOnGesture()
     // 新 user 消息 → 清除上一轮 API 错误卡（错误卡属上一轮对话 · message.error 已渲染在消息流）
-    useChatStore.getState().clearApiErrors(activeSessionId)
+    useChatStore.getState().clearApiErrors(sid)
     // #1 绑定策略：未绑定项目的会话拦截发送（不发请求到后端）
-    if (!activeSession?.mainProjectId) {
+    if (!scopeSession?.mainProjectId) {
       showToast('请先绑定项目再发送', 'info')
       return
     }
@@ -2873,12 +2914,12 @@ function App() {
       //   所以 await 之后那次 setActiveStreams 只是**同值覆盖**，不产生额外副作用。
       //   ⚠️ 提前登记不会导致重复订阅：useChatSocket.ensureSessionStream 按 sid 幂等
       //   （streamSubsRef.current.has(sid) → 直接 return）。
-      streamRegGenRef.current[activeSessionId] = (streamRegGenRef.current[activeSessionId] ?? 0) + 1
+      streamRegGenRef.current[sid] = (streamRegGenRef.current[sid] ?? 0) + 1
       setActiveStreams((prev) => (
-        prev[activeSessionId] ? prev : { ...prev, [activeSessionId]: `/topic/sessions/${activeSessionId}/stream` }
+        prev[sid] ? prev : { ...prev, [sid]: `/topic/sessions/${sid}/stream` }
       ))
       // F20：attachments（PDF 绝对路径字符串数组）透传给后端，服务端 PDFBox 解析
-      const resp = await chatApi.send(activeSessionId, { content: text, attachments })
+      const resp = await chatApi.send(sid, { content: text, attachments })
       const st = useChatStore.getState()
       // 排队分支（B1/B5 · 对齐 CC）：turn 运行中再发消息 → 后端入队返回 queued=true。
       //   【不】乐观插入气泡（交给排队框展示暗色条）、【不】覆盖 activeStreams（保持原 topic 收流），
@@ -2892,7 +2933,7 @@ function App() {
         //   （它就是收旧轮 chunk 的通道）。预登记只多加了轮次号 —— 这里退回去，
         //   否则 reclaimStreamRegistration 的判据（登记晚于最近一次 true ⇒ 不收）会把旧轮的收口
         //   误判成「上一轮的」⇒ 旧轮登记永不回收 ⇒ 停止键卡住。
-        streamRegGenRef.current[activeSessionId] = Math.max(0, (streamRegGenRef.current[activeSessionId] ?? 1) - 1)
+        streamRegGenRef.current[sid] = Math.max(0, (streamRegGenRef.current[sid] ?? 1) - 1)
         if (showToast) showToast('消息已排队，当前轮结束后自动发送', 'info')
         return
       }
@@ -2919,14 +2960,14 @@ function App() {
           const cid = a.contentId ?? null
           return {
             type: a.type, filename: a.filename!, mediaType: a.mediaType ?? null, contentId: cid,
-            url: cid ? `/attachments/content/${activeSessionId}/${cid}` : null,
+            url: cid ? `/attachments/content/${sid}/${cid}` : null,
             base64: a.base64 ?? null, path: a.path ?? null,
           }
         }) ?? []
       // [有界窗口] 发送成功的乐观 user 气泡是追加路径 → appendMessages（内部 capTail）统一裁剪；
       //   勿用 setMessages([...prev, new])（不裁剪，是内存无界的漏洞口）。
-      st.appendMessages(activeSessionId, [
-        { id: resp.userMessageId, sessionId: activeSessionId, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, /* [2026-11-02 修「正在执行没有时间」] 乐观气泡必须带 createdAt —— MessageList 的 turnStartByKey 靠它算本轮起点，缺了就算不出时长（`formatTurnDuration(null)` → 空） */ createdAt: new Date().toISOString(), toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
+      st.appendMessages(sid, [
+        { id: resp.userMessageId, sessionId: sid, role: 'user', author: '你', content: text, reasoning: null, toolCalls: null, finishReason: null, inputTokens: null, outputTokens: null, reasoningDurationMs: null, time: null, /* [2026-11-02 修「正在执行没有时间」] 乐观气泡必须带 createdAt —— MessageList 的 turnStartByKey 靠它算本轮起点，缺了就算不出时长（`formatTurnDuration(null)` → 空） */ createdAt: new Date().toISOString(), toolCallId: null, assistantMessageId: null, userMessageId: resp.userMessageId, subtype: null, isMeta: false, isApiErrorMessage: false, apiError: null, error: null, errorDetails: null, matchedRule: null, imageData: imageData.length ? imageData : null, userAttachments: userAttachments.length ? userAttachments : null },
       ])
       // 注意：发送时【不】clearStream —— 正常流程上一轮 complete 已清 streams（finalizeBlocks 返回 rest）；
       //   若发送时 clearStream，会触发 wasRunning 检测「streams 从有到无」→ 误移除刚登记的 activeStreams
@@ -2938,18 +2979,18 @@ function App() {
       //   否则一轮会被算成两轮 ⇒ reclaimStreamRegistration 的判据（登记晚于最近一次 true ⇒ 不收）
       //   会把本轮的收口误判成「上一轮的」⇒ 登记永不回收 ⇒ 停止键卡住。
       //   topic 用 resp.streamTopic 覆盖（与预置的会话级常量同值 ⇒ 实质是幂等写）。
-      setActiveStreams((prev) => ({ ...prev, [activeSessionId]: resp.streamTopic }))
+      setActiveStreams((prev) => ({ ...prev, [sid]: resp.streamTopic }))
     } catch (e) {
       // [2026-11-03] **回滚发送前的预登记**：发送失败时后端根本没有 run，
       //   若不撤销，`activeStreams` 会永远挂着这个 sid ⇒ 停止键常驻「停止」且点下去没东西可停。
       //   （实测：发送失败后 composer 一直显示「停止」而会话是空的。）
       //   与排队分支同一处理：退掉预加的轮次号 + 移除登记（**只移除本次自己加的那个**：
       //   若发送前该 sid 已经在跑，`prev[sid]` 本来就有值，此时不该删）。
-      streamRegGenRef.current[activeSessionId] = Math.max(0, (streamRegGenRef.current[activeSessionId] ?? 1) - 1)
+      streamRegGenRef.current[sid] = Math.max(0, (streamRegGenRef.current[sid] ?? 1) - 1)
       setActiveStreams((prev) => {
-        if (!prev[activeSessionId]) return prev
+        if (!prev[sid]) return prev
         const next = { ...prev }
-        delete next[activeSessionId]
+        delete next[sid]
         return next
       })
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
@@ -3243,7 +3284,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }} />
           )}
         </div>
         {currentPermission && (
@@ -3576,23 +3617,27 @@ function App() {
             {/* ⭐ 场景内左侧栏（设计稿 <aside class="aside"> 的 7 项）
                 ⚠️ 只在弹窗里；主窗口会话栏（SessionList）不动 */}
             <KbSceneNav
-              activeKey={kbScene === 'shared' ? 'shared' : 'knowledge'}
-              onNewChat={() => { setShowKnowledge(false); void handleNewSession() }}
+              activeKey={kbView === 'chat' ? 'chat' : (kbScene === 'shared' ? 'shared' : 'knowledge')}
+              onNewChat={() => { setKbNewChatToken((t) => t + 1); setKbView('chat') }}
               onOpenArtifacts={() => { setShowKnowledge(false); openRightTab('artifacts') }}
               onOpenAgents={() => { setShowKnowledge(false); setShowAgentsPanel(true) }}
               onOpenSchedules={() => { setShowKnowledge(false); setWorkspacePage('schedules') }}
               onOpenToolbox={() => { setShowKnowledge(false); setShowMarket(true) }}
               // ⭐ 共享空间 = 场景内的独立一页（不关弹窗、不重开）
               onOpenSharedSpace={() => setKbScene('shared')}
-              onBackToList={() => setKbScene('knowledge')}
+              onBackToList={() => { setKbView('knowledge'); setKbScene('knowledge') }}
             />
             <div className="kb-scene-main">
-              <KnowledgeBasePage
-                showToast={showToast}
-                scene={kbScene}
-                onBackToChat={() => setShowKnowledge(false)}
-                onRequestClose={() => setShowKnowledge(false)}
-              />
+              {kbView === 'chat' ? (
+                <KbNewChatPane showToast={showToast} newChatToken={kbNewChatToken} />
+              ) : (
+                <KnowledgeBasePage
+                  showToast={showToast}
+                  scene={kbScene}
+                  onBackToChat={() => setShowKnowledge(false)}
+                  onRequestClose={() => setShowKnowledge(false)}
+                />
+              )}
             </div>
           </div>
         </div>

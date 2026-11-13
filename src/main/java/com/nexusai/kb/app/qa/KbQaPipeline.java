@@ -156,13 +156,16 @@ public class KbQaPipeline {
      * @param assistantMessageId 本轮 assistant 消息 id
      * @param question          用户原始问题
      * @param knowledgeBaseIds  检索范围（null/空 ⇒ 智能体范围 > 全部库）
+     * @param knowledgeIds      文档级范围（@ 选的文件 · null/空 ⇒ 不限文档）。对齐源站
+     *                          {@code knowledge_ids}（{@code qa.go:300 mergeKnowledgeTargets}：
+     *                          {@code mentioned_items} 里 type=kb 并进 kbIds、type=file 并进本字段）
      * @param modelName         生成模型（null ⇒ settings.mainModelName）
      * @param webSearchEnabled  联网检索开关
      * @param cancelled         取消标志（调用方维护；本类在每个阶段边界检查）
      */
     public record Request(
         String sessionId, String userMessageId, String assistantMessageId,
-        String question, List<String> knowledgeBaseIds, String modelName,
+        String question, List<String> knowledgeBaseIds, List<String> knowledgeIds, String modelName,
         boolean webSearchEnabled, AtomicBoolean cancelled
     ) {
     }
@@ -181,7 +184,9 @@ public class KbQaPipeline {
      */
     public record Result(
         String answer, String reasoning, String intent, boolean retrieved,
-        int contextChunks, int citationCount, boolean cancelled, boolean failed
+        int contextChunks, int citationCount, boolean cancelled, boolean failed,
+        /** [RAG 时间线] 本轮检索阶段工具（ragpipe- 前缀）；落库用，回放给模型时过滤 */
+        List<com.nexusai.model.session.dto.ToolCallDto> stageTools
     ) {
     }
 
@@ -194,12 +199,19 @@ public class KbQaPipeline {
      */
     public Result run(Request req, SimpMessagingTemplate ws) {
         if (req == null || req.question() == null || req.question().isBlank()) {
-            return new Result("问题不能为空", null, null, false, 0, 0, false, true);
+            return new Result("问题不能为空", null, null, false, 0, 0, false, true, null);
         }
         String sessionId = req.sessionId();
         String topic = "/topic/sessions/" + sessionId + "/stream";
         String question = req.question().strip();
         KbConfigService.QaParams params = kbConfigService.readQaParams();
+        // 检索进度窗口（源站 `BeginRetrievalProgress` / `ShouldCloseRetrievalProgress`）：
+        // 声明在 try 外 —— 检索段抛异常时 catch 里也要能把它关掉，否则前端那个
+        // knowledge_search 工具卡会一直转圈（源站就是为这个专门加了 stageErr 分支）。
+        KbQaProgress.Stage retrievalStage = null;
+        // [RAG 时间线] 本轮检索阶段工具（对齐源站 ragpipe- 前缀）；随 assistant 消息落库，
+        //   刷新后前端据此重画时间线。⛔ 回放给模型的历史上下文里必须过滤掉（模型没发过这些调用）。
+        List<com.nexusai.model.session.dto.ToolCallDto> stageTools = new java.util.ArrayList<>();
 
         try {
             // ── 阶段 0：历史 ──────────────────────────────────────
@@ -219,8 +231,27 @@ public class KbQaPipeline {
             String memoryBackground = recallBackground();
 
             // ── 阶段 2：改写 + 意图 ───────────────────────────────
+            // 进度窗口 · 对齐源站 `ShouldEmitQueryUnderstandProgress`（`progress.go:31-36`）：
+            // 改写开关打开才发；本仓问答链不接受图片输入，故没有 `Images > 0` 那半个条件。
+            KbQaProgress.Stage understandStage = params.enableRewrite()
+                ? KbQaProgress.beginQueryUnderstand(ws, topic, sessionId,
+                    req.userMessageId(), req.assistantMessageId(), question)
+                : null;
             KbQueryUnderstanding.Result understanding =
                 understand(req, question, history, params, memoryBackground);
+            // 降级（解析不出改写模型 ⇒ 用原问题）如实报失败：源站那一格是 stageErr，
+            // ⛔ 不能显示「已完成问题理解」而实际没跑模型（显式失败，别掩盖）。
+            KbQaProgress.endQueryUnderstand(understandStage, !understanding.degraded(),
+                understanding.degraded() ? "未使用改写模型，已按原问题检索" : null);
+            // [RAG 时间线] 问题理解这一格落库（只在真发过进度事件时收；ragpipe- 前缀 = 模型没发过的调用）
+            if (understandStage != null) {
+                stageTools.add(new com.nexusai.model.session.dto.ToolCallDto(
+                    "ragpipe-" + understandStage.toolCallId(), understandStage.toolName(),
+                    "{\"query\":\"" + jsonEscape(question) + "\"}",
+                    understanding.degraded() ? "未使用改写模型，已按原问题检索"
+                        : "改写为：" + understanding.rewriteQuery(),
+                    understanding.degraded()));
+            }
             boolean needsRetrieval = understanding.needsRetrieval(req.webSearchEnabled());
             log.info("[问答链] ② 改写完成 session={} 意图={}({}) 要检索={} 降级={}",
                 sessionId, understanding.intent().wire(), understanding.intent().label(),
@@ -233,8 +264,9 @@ public class KbQaPipeline {
             // ── 阶段 3：实体抽取（源侧 extract_entity，由改写触发）──────
             // ⚠️ 只对「开启图谱」的库做；全关 ⇒ 一次模型都不调（见 KbQaEntityExtract 类注释）
             KbQaEntityExtract.Outcome entityOutcome = KbQaEntityExtract.Outcome.empty();
+            // 检索范围提到 if 外：下面算 search_source 要用（源站 `retrievalSearchSource`）
+            List<String> scope = needsRetrieval ? resolveKbScope(req) : List.of();
             if (needsRetrieval) {
-                List<String> scope = resolveKbScope(req);
                 String extractQuery = understanding.rewriteQuery() == null
                     || understanding.rewriteQuery().isBlank()
                     ? question : understanding.rewriteQuery();
@@ -249,6 +281,17 @@ public class KbQaPipeline {
                 log.warn("[问答链] ④ 意图要检索但无查询文本，跳过检索 session={}", sessionId);
             }
             final KbQaEntityExtract.Outcome entities = entityOutcome;
+            // 检索窗口 · 对齐源站 `BeginRetrievalProgress`（`progress.go:79-106`）：
+            // 在「搜索 → 重排 → 合并」整段之前发一条 tool_call，前端据此显示一个工具卡。
+            // `search_source` 用**检索前已知的配置**判定（源站 `retrievalSearchSource`）。
+            String retrievalQuery = understanding.rewriteQuery() == null
+                || understanding.rewriteQuery().isBlank()
+                ? question : understanding.rewriteQuery();
+            retrievalStage = needsRetrieval
+                ? KbQaProgress.beginRetrieval(ws, topic, sessionId, req.userMessageId(),
+                    req.assistantMessageId(), retrievalQuery,
+                    retrievalSearchSource(scope, req.webSearchEnabled()))
+                : null;
             CompletableFuture<List<KbHybridSearcher.Hit>> hitsFuture = willRetrieve
                 ? CompletableFuture.supplyAsync(() -> retrieve(req, queries, params), ioPool)
                 : CompletableFuture.completedFuture(List.<KbHybridSearcher.Hit>of());
@@ -312,6 +355,23 @@ public class KbQaPipeline {
             log.info("[问答链] ⑩ 上下文就绪 session={} 命中={} 入上下文={}",
                 sessionId, hits.size(), rendered.candidateCount());
 
+            // ⭐ count 必须是「真正进了上下文的条数」而不是召回条数（源站 `progress.go:185-199`）：
+            //   召回了 N 条但阈值把它们全筛掉时，答案里一条引用都不会有 —— 这时报 N 就是骗人，
+            //   改报「命中 N 条候选，相关性不足，未用于回答」。
+            KbQaProgress.endRetrieval(retrievalStage,
+                !hits.isEmpty() && rendered.candidateCount() == 0,
+                rendered.candidateCount(), hits.size(), null);
+            // [RAG 时间线] 检索这一格落库（result 文案带命中数，供刷新后重画）
+            if (retrievalStage != null) {
+                stageTools.add(new com.nexusai.model.session.dto.ToolCallDto(
+                    "ragpipe-" + retrievalStage.toolCallId(), retrievalStage.toolName(),
+                    "{\"query\":\"" + jsonEscape(retrievalQuery) + "\"}",
+                    rendered.candidateCount() > 0
+                        ? "找到 " + rendered.candidateCount() + " 个结果"
+                        : "未找到相关内容",
+                    false));
+            }
+
             // ── 阶段 12 补：**生成前**推一次引用（源侧 references 事件同位置）──
             //   ⚠️ 必须在这里，不能等生成完：引用只依赖检索结果，生成还没开始就已经确定；
             //   放到 complete 之后推，前端会在「回答流完」到「引用出现」之间有一段空白。
@@ -337,14 +397,21 @@ public class KbQaPipeline {
             recordWebSources(req, webSegments);
 
             return new Result(gen.answer(), gen.reasoning(), understanding.intent().wire(),
-                retrieved, rendered.candidateCount(), citationCount, false, gen.failed());
+                retrieved, rendered.candidateCount(), citationCount, false, gen.failed(), stageTools);
 
+        } catch (CancelledRunException ce) {
+            log.info("[问答链] 已按用户停止收口 session={}", sessionId);
+            KbQaProgress.endRetrieval(retrievalStage, false, 0, 0, "已停止");
+            return cancelledResult("已停止");
         } catch (RuntimeException e) {
             log.error("[问答链] 执行失败 session={} 原因={}", sessionId, e.getMessage(), e);
+            // 检索窗口还开着（检索段抛异常）⇒ 必须关掉，否则前端工具卡一直转圈。
+            // 已正常收口过的窗口在这里是空操作（KbQaProgress 按 toolCallId 只发一次）。
+            KbQaProgress.endRetrieval(retrievalStage, false, 0, 0, e.getMessage());
             StreamEventSeq.send(ws, topic, new MessageErrorEvent(
                 sessionId, req.userMessageId(), req.assistantMessageId(),
                 "knowledge_qa_failed", "问答执行失败：" + e.getMessage()));
-            return new Result("问答执行失败：" + e.getMessage(), null, null, false, 0, 0, false, true);
+            return new Result("问答执行失败：" + e.getMessage(), null, null, false, 0, 0, false, true, null);
         }
     }
 
@@ -555,6 +622,27 @@ public class KbQaPipeline {
         return listSearchableKnowledgeBaseIds();
     }
 
+    /**
+     * 检索来源标签 · 对齐源站 {@code retrievalSearchSource}（{@code progress.go:262-273}）。
+     *
+     * <p>判定依据是<b>检索前已知的配置</b>，不是检索结果 —— 源站在 begin 阶段就要把它塞进
+     * tool_call 的 arguments 里，那时结果还不存在。
+     *
+     * @param scope            本轮检索范围（空 = 没有知识库目标）
+     * @param webSearchEnabled 是否开联网
+     * @return {@code knowledge} / {@code web} / {@code mixed}
+     */
+    private static String retrievalSearchSource(List<String> scope, boolean webSearchEnabled) {
+        boolean hasKb = scope != null && !scope.isEmpty();
+        if (hasKb && webSearchEnabled) {
+            return KbQaProgress.SOURCE_MIXED;
+        }
+        if (webSearchEnabled) {
+            return KbQaProgress.SOURCE_WEB;
+        }
+        return KbQaProgress.SOURCE_KNOWLEDGE;
+    }
+
     // ── 阶段 4：检索 ────────────────────────────────────────────────
 
     private List<KbHybridSearcher.Hit> retrieve(
@@ -574,8 +662,9 @@ public class KbQaPipeline {
                     params.vectorThreshold(), params.keywordThreshold()));
             }
         }
-        List<KbHybridSearcher.Hit> hits = new ArrayList<>(searchFanOut.searchAllScoped(
-            plans, Math.max(params.embeddingTopK() * 3, params.rerankTopK())));
+        List<KbHybridSearcher.Hit> hits = filterByKnowledgeIds(
+            new ArrayList<>(searchFanOut.searchAllScoped(
+                plans, Math.max(params.embeddingTopK() * 3, params.rerankTopK()))), req);
         log.info("[问答链] ④ 检索完成 库数={} 查询数={} 命中={} 向量模型={} 阈值(v/k)={}/{}",
             kbIds.size(), queries.size(), hits.size(),
             embeddingModelId == null ? "未配置" : embeddingModelId,
@@ -586,11 +675,36 @@ public class KbQaPipeline {
             List<KbHybridSearcher.Hit> expanded = expandQueries(
                 req, kbIds, queries, params, embeddingModelId);
             if (!expanded.isEmpty()) {
-                hits = mergeHits(hits, expanded);
+                hits = mergeHits(hits, filterByKnowledgeIds(expanded, req));
                 log.info("[问答链] ④ 查询扩展补入 {} 条，合并后 {} 条", expanded.size(), hits.size());
             }
         }
         return hits;
+    }
+
+    /**
+     * 文档级范围过滤（对齐源站 {@code knowledge_ids} 的 {@code allow} 语义，
+     * 见 {@code KnowledgeService.java:611-625}）。
+     *
+     * <p>⚠️ 是<b>事后过滤</b>：召回的 limit 已按 {@code embeddingTopK * 3} 放大，一般够用；
+     * 若某文档块数少导致命中变稀，靠阶段 4b 的查询扩展补一轮（扩展结果同样过本过滤）。
+     */
+    private List<KbHybridSearcher.Hit> filterByKnowledgeIds(
+        List<KbHybridSearcher.Hit> hits, Request req) {
+        List<String> docIds = req.knowledgeIds();
+        if (docIds == null || docIds.isEmpty() || hits.isEmpty()) {
+            return hits;
+        }
+        java.util.Set<String> allow = new java.util.HashSet<>(docIds);
+        List<KbHybridSearcher.Hit> kept = new ArrayList<>(hits.size());
+        for (KbHybridSearcher.Hit h : hits) {
+            if (h != null && allow.contains(h.knowledgeId())) {
+                kept.add(h);
+            }
+        }
+        log.info("[问答链] ④ 文档范围过滤 指定文档={} 命中 {} → {} session={}",
+            docIds.size(), hits.size(), kept.size(), req.sessionId());
+        return kept;
     }
 
     /**
@@ -1031,7 +1145,20 @@ public class KbQaPipeline {
     // ── 阶段 11：生成 ───────────────────────────────────────────────
 
     /** 生成结果（回答 + 思考流 + 是否失败）。 */
+    /** 用户主动停止：从生成段抛出，由 {@code run()} 转成 cancelledResult（⛔ 不当作失败）。 */
+    private static final class CancelledRunException extends RuntimeException {
+        CancelledRunException() { super("用户已停止"); }
+    }
+
     private record Gen(String answer, String reasoning, boolean failed) {
+    }
+
+    /** [RAG 时间线] 极简 JSON 字符串转义（工具参数里只放查询文本）。 */
+    private static String jsonEscape(String v) {
+        if (v == null) {
+            return "";
+        }
+        return v.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", " ");
     }
 
     /**
@@ -1083,73 +1210,127 @@ public class KbQaPipeline {
         StringBuilder answer = new StringBuilder();
         StringBuilder reasoningBuf = new StringBuilder();
         AtomicReference<Throwable> error = new AtomicReference<>();
-        AtomicBoolean completed = new AtomicBoolean(false);
         AtomicBoolean truncatedEmpty = new AtomicBoolean(false);
-        // 阶段 11 补：finishReason 从完整 assistant 消息里取（stream 回调没有该字段）
-        AtomicReference<String> finishReason = new AtomicReference<>();
-        CompletableFuture<Void> done = new CompletableFuture<>();
 
-        ModelRequest request = new ModelRequest(
-            config, modelName,
-            List.of(new SystemPromptBlock(systemPrompt, CacheScope.NULL)),
-            "knowledge_qa",
-            messages,
-            null, null, null, null, null,
-            delta -> {
-                if (delta == null || delta.isEmpty()) {
-                    return;
+        String finish = null;
+        String text = "";
+        boolean lengthTruncated = false;
+
+        // 生成最多 2 次：首次「正常结束但一个字都没出」时自动重试一次（用户 2026-11-13 定）。
+        // ⛔ 三条不重试：①已经推过正文（delta 收不回，重来会让用户看到重复内容）
+        //   ②已经推过思考（重试会把思考再推一遍）③长度截断（输出预算问题，重试必然同样撞顶）
+        for (int attempt = 1; attempt <= 2; attempt++) {
+            answer.setLength(0);
+            reasoningBuf.setLength(0);
+            error.set(null);
+            // 用户「停止」要能真中断上游流：传真实 controller，轮询取消标志后 abort（NOOP 只能等阶段边界）
+            AbortController abortCtl = new AbortController();
+            AtomicBoolean completed = new AtomicBoolean(false);
+            AtomicReference<String> finishReason = new AtomicReference<>();
+            CompletableFuture<Void> done = new CompletableFuture<>();
+            // 引用句柄 → 可读编号 `[N]` 的流式展开器（每个 attempt 重建，重试不残留半截标签）
+            RefTagStreamExpander refTagStream = new RefTagStreamExpander();
+
+            ModelRequest request = new ModelRequest(
+                config, modelName,
+                List.of(new SystemPromptBlock(systemPrompt, CacheScope.NULL)),
+                "knowledge_qa",
+                messages,
+                null, null, null, null, null,
+                delta -> {
+                    if (delta == null || delta.isEmpty()) {
+                        return;
+                    }
+                    answer.append(delta);
+                    // ⭐ 逐块推送，前端才是真流式（攒完再推等于非流式）。
+                    // [2026-11-13 源站引用协议] 提示词要求模型输出 `<ref id="chunk://N"/>`（对齐
+                    //   WeKnora modelcontext/citations.go 的 system-owned 协议）。这里做源站同款
+                    //   「stream expander」：把句柄标签就地展开成可读编号 `[N]` 再推，
+                    //   并**扣住跨 chunk 的半截标签**（否则用户会看到 `<ref id="chu` 这种裸文本）。
+                    String safe = refTagStream.accept(delta);
+                    if (!safe.isEmpty()) {
+                        StreamEventSeq.send(ws, topic, MessageChunkEvent.of(
+                            req.sessionId(), req.userMessageId(), req.assistantMessageId(), safe));
+                    }
+                },
+                msg -> {
+                    // 阶段 11 补：拿 finishReason（stop / length / tool_calls …）。
+                    // ⚠️ provider 在流结束时给完整消息；缺失 ⇒ 保持 null，由后续判据兜底。
+                    if (msg != null && msg.finishReason() != null) {
+                        finishReason.set(msg.finishReason());
+                    }
+                },
+                toolCall -> { /* 问答不产生工具调用 */ },
+                reasoning -> {
+                    if (reasoning == null || reasoning.isEmpty()) {
+                        return;
+                    }
+                    reasoningBuf.append(reasoning);
+                    StreamEventSeq.send(ws, topic, MessageChunkEvent.ofReasoning(
+                        req.sessionId(), req.userMessageId(), req.assistantMessageId(), reasoning));
+                },
+                () -> log.debug("[问答链] ⑪ 流式降级为非流式 session={}", req.sessionId()),
+                error::set,
+                () -> {
+                    if (completed.compareAndSet(false, true)) {
+                        done.complete(null);
+                    }
+                },
+                abortCtl,
+                null, null, null, null,
+                com.nexusai.infra.llm.StreamIdleControl.NONE);
+
+            LlmInvocationGateway.stream(providerFactory, modelConfigResolver, request);
+
+            try {
+                while (true) {
+                    try {
+                        done.get(200, TimeUnit.MILLISECONDS);
+                        break;
+                    } catch (java.util.concurrent.TimeoutException te) {
+                        if (req.cancelled() != null && req.cancelled().get()) {
+                            // 用户点了停止：先中断上游流，再等最多 2s 收尾（provider 不响应也照常收口）
+                            abortCtl.abort("user_cancelled");
+                            try {
+                                done.get(2, TimeUnit.SECONDS);
+                            } catch (Exception ignore) {
+                                // 收尾超时：按已取消处理，不再等
+                            }
+                            throw new CancelledRunException();
+                        }
+                    }
                 }
-                answer.append(delta);
-                // ⭐ 逐块推送，前端才是真流式（攒完再推等于非流式）
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                throw new IllegalStateException("生成被中断");
+            } catch (java.util.concurrent.ExecutionException e) {
+                throw new IllegalStateException("生成失败：" + e.getCause());
+            }
+
+            finish = finishReason.get();
+            // 先把展开器缓冲的尾巴推完（对齐源站：流结束才吐出被扣住的残片）
+            String refTail = refTagStream.flush();
+            if (!refTail.isEmpty() && ws != null) {
                 StreamEventSeq.send(ws, topic, MessageChunkEvent.of(
-                    req.sessionId(), req.userMessageId(), req.assistantMessageId(), delta));
-            },
-            msg -> {
-                // 阶段 11 补：拿 finishReason（stop / length / tool_calls …）。
-                // ⚠️ provider 在流结束时给完整消息；缺失 ⇒ 保持 null，由后续判据兜底。
-                if (msg != null && msg.finishReason() != null) {
-                    finishReason.set(msg.finishReason());
-                }
-            },
-            toolCall -> { /* 问答不产生工具调用 */ },
-            reasoning -> {
-                if (reasoning == null || reasoning.isEmpty()) {
-                    return;
-                }
-                reasoningBuf.append(reasoning);
-                StreamEventSeq.send(ws, topic, MessageChunkEvent.ofReasoning(
-                    req.sessionId(), req.userMessageId(), req.assistantMessageId(), reasoning));
-            },
-            () -> log.debug("[问答链] ⑪ 流式降级为非流式 session={}", req.sessionId()),
-            error::set,
-            () -> {
-                if (completed.compareAndSet(false, true)) {
-                    done.complete(null);
-                }
-            },
-            AbortController.NOOP,
-            null, null, null, null,
-            com.nexusai.infra.llm.StreamIdleControl.NONE);
+                    req.sessionId(), req.userMessageId(), req.assistantMessageId(), refTail));
+            }
+            // 落库/complete 用整段清洗后的文本：否则完成后重渲染又会冒出 `<ref .../>` 原文
+            text = KbQaPrompts.stripRefTags(answer.toString());
+            lengthTruncated = KbQaPrompts.isLengthFinishReason(finish);
 
-        LlmInvocationGateway.stream(providerFactory, modelConfigResolver, request);
-
-        try {
-            done.get(GENERATE_TIMEOUT_SECONDS, TimeUnit.SECONDS);
-        } catch (java.util.concurrent.TimeoutException e) {
-            throw new IllegalStateException("生成超时（" + GENERATE_TIMEOUT_SECONDS + " 秒）");
-        } catch (InterruptedException e) {
-            Thread.currentThread().interrupt();
-            throw new IllegalStateException("生成被中断");
-        } catch (java.util.concurrent.ExecutionException e) {
-            throw new IllegalStateException("生成失败：" + e.getCause());
+            // 自动重试一次：仅「无错误 + 零正文 + 零思考 + 非长度截断」
+            if (attempt == 1 && error.get() == null && text.isBlank()
+                && reasoningBuf.length() == 0 && !lengthTruncated) {
+                log.warn("[问答链] ⑪ 模型返回空回答（非截断），自动重试一次 session={} 模型={} finishReason={}",
+                    req.sessionId(), modelName, finish);
+                continue;
+            }
+            break;
         }
 
-        // ── 阶段 11 四补（源侧 chat_completion_stream.go）────────────────
-        String finish = finishReason.get();
-        String text = answer.toString();
         boolean failed = false;
-        boolean lengthTruncated = KbQaPrompts.isLengthFinishReason(finish);
 
+        // ── 阶段 11 四补（源侧 chat_completion_stream.go）────────────────
         // 补 1：Done && finishReason == incomplete/length 且有正文 ⇒ 不是「短答案」，
         //   是**被截断的答案**。源侧把它转成错误；本仓在末尾追加明确的截断提示，
         //   让用户知道「后面还有」而不是以为模型就答到这。
@@ -1166,7 +1347,7 @@ public class KbQaPipeline {
             truncatedEmpty.set(true);
             StreamEventSeq.send(ws, topic, MessageChunkEvent.of(
                 req.sessionId(), req.userMessageId(), req.assistantMessageId(), text));
-            log.warn("[问答链] ⑪ 模型返回空回答 session={} 模型={} finishReason={} 长度截断={}",
+            log.warn("[问答链] ⑪ 模型返回空回答（已重试） session={} 模型={} finishReason={} 长度截断={}",
                 req.sessionId(), modelName, finish, lengthTruncated);
         } else if (lengthTruncated) {
             // 有正文但被截断 ⇒ 追加提示（⛔ 不改写已推出去的正文）
@@ -1397,6 +1578,6 @@ public class KbQaPipeline {
     }
 
     private static Result cancelledResult(String note) {
-        return new Result(note, null, null, false, 0, 0, true, false);
+        return new Result(note, null, null, false, 0, 0, true, false, null);
     }
 }

@@ -733,37 +733,9 @@ export const knowledgeApi = {
       { method: 'DELETE', body: { question_id: questionText } }
     ),
 
-  /**
-   * 文档处理流水线（后端 `GET /knowledge/{id}/stages`，返回 SpanTree）。
-   *
-   * <p>⚠️ 本仓的 span **就是分块本身**（`KbKnowledgeExtService#spans` 用 chunk 拼出叶子），
-   * 不是源侧那种细粒度解析步骤 ⇒ 界面要如实说明，⛔ 不编造「OCR/布局/切分」阶段。
-   */
-  getKnowledgeStages: (id: string) =>
-    api<{
-      knowledge_id: string
-      title: string | null
-      parse_status: string | null
-      spans: Array<{
-        id: string
-        type: string | null
-        preview: string | null
-        start_at: number | null
-        end_at: number | null
-        chunk_index: number | null
-        enabled: boolean
-        children: unknown[]
-      }>
-      attempts: Array<{
-        id: number | null
-        task_type: string | null
-        state: string | null
-        attempt: number | null
-        error_message: string | null
-        started_at: string | null
-        finished_at: string | null
-      }>
-    }>(`/knowledge/${encodeURIComponent(id)}/stages`),
+  // ⚠️ 2026-11-13 删除 getKnowledgeStages：它声明的 title/spans/attempts 与后端
+  //   /stages 实际返回的 KnowledgeSpansDto（/spans 同一 handler）一个字段都对不上，
+  //   全仓零调用方。处理流水线统一走 getKnowledgeSpans + KbProcessingTimeline。
 
   deleteKnowledge: (id: string) =>
     api<void>(`/knowledge/${encodeURIComponent(id)}`, { method: 'DELETE' }),
@@ -968,6 +940,20 @@ export const knowledgeApi = {
     }),
 
   /**
+   * 知识库对话**统一入口**（`POST /api/v1/kb/chat/{sid}`）。
+   *
+   * <p>后端按会话绑定的 agent 的 `agent_mode` 分流：`quick-answer` → RAG 流水线，
+   * 其余 → ReAct 工具循环。⛔ 调用方不要自己判断模式 —— 那等于把分流规则抄两遍。
+   *
+   * <p>返回 202；内容走 STOMP `/topic/sessions/{sid}/stream`（与两条链同一个 topic）。
+   */
+  kbChat: (sessionId: string, body: { content: string; knowledgeBaseIds?: string[]; knowledgeIds?: string[]; attachments?: Array<{ type: string; filename: string }>; modelName?: string }) =>
+    api<{ route?: string; userMessageId?: string; assistantMessageId?: string; streamTopic?: string }>(
+      `/kb/chat/${encodeURIComponent(sessionId)}`,
+      { method: 'POST', body },
+    ),
+
+  /**
    * 知识库工作区项目（`GET /api/v1/kb/workspace/project`）。
    *
    * <p>助手 / 问答面板建专用会话时，`mainProjectId` 必须传它 —— ⛔ 不要再取
@@ -995,6 +981,26 @@ export const knowledgeApi = {
    */
   listCitations: (messageId: string) =>
     api<KbCitation[]>(`/messages/${encodeURIComponent(messageId)}/citations`),
+
+  /**
+   * 会话级引用（全部行，含 assistantMessageId）。
+   *
+   * <p>对齐源站 {@code message.KnowledgeReferences}：刷新后前端按消息分桶，
+   * 每一轮都能重画 chip 的文档名（不只最新一轮）。
+   */
+  listSessionCitations: (sessionId: string) =>
+    api<KbCitation[]>(`/sessions/${encodeURIComponent(sessionId)}/citations`),
+
+  /**
+   * 知识库图谱（`GET /knowledge-bases/{id}/graph`）。
+   *
+   * <p>只用于「推荐问题」取真实业务概念：实体名比文档标题更接近人话
+   * （源站推荐问题样本就是「介绍一下义乌市绣诚…」「什么是人工智能+治理能力？」）。
+   */
+  getGraph: (baseId: string) => api<{
+    entities?: Array<{ id?: string; name?: string; entity_type?: string; source_chunk_ids?: string[] }>
+    relationships?: unknown[]
+  }>(`/knowledge-bases/${encodeURIComponent(baseId)}/graph`),
 
   // ── 文档文件夹（派生树 · 源侧 KbFolderTree）────────────────────────
   /**
@@ -1677,6 +1683,8 @@ export interface KbQaSearchHit {
  * 事件侧在 socket 层就地转换（见 `KbQaPanel`）。
  */
 export interface KbCitation {
+  /** 归属的 assistant 消息 id（会话级接口按它分桶，刷新后每轮各自重画 chip） */
+  assistantMessageId?: string
   refIndex: number
   chunkId: string
   knowledgeId: string
