@@ -1501,6 +1501,19 @@ public class MessageService {
             SessionResumeDeserializer.deserializeWithInterruptDetection(filtered).messages());
     }
 
+    /** 是否「全是展示用阶段工具」（ragpipe- 前缀）——空列表返回 false。 */
+    private static boolean hasOnlyPipelineToolCalls(List<ToolCallDto> tools) {
+        if (tools == null || tools.isEmpty()) {
+            return false;
+        }
+        for (ToolCallDto tc : tools) {
+            if (tc == null || tc.id() == null || !tc.id().startsWith(PIPELINE_TOOL_CALL_PREFIX)) {
+                return false;
+            }
+        }
+        return true;
+    }
+
     /** RAG 时间线工具前缀（对齐源站 types.PipelineToolCallIDPrefix）。 */
     private static final String PIPELINE_TOOL_CALL_PREFIX = "ragpipe-";
 
@@ -2162,8 +2175,12 @@ public class MessageService {
         rec.setRole(dto.role() != null ? dto.role().name() : Role.system.name());
         rec.setAuthor(dto.author());
         rec.setContent(dto.content() == null ? "" : dto.content());
-        // [RAG 时间线] 快问阶段的检索工具随消息落库（ReAct 轮 toolCalls 为空 → 不写）
-        rec.setAgentSteps(serializeToolCalls(dto.toolCalls()));
+        // [RAG 时间线] 只落「展示用阶段工具」（全部带 ragpipe- 前缀）。
+        //   ⚠️ 主会话 ReAct 的工具调用存在 tool_calls 子表，这里不能重复写：
+        //   一旦写进 agent_steps，读侧会把子表的真实调用覆盖掉（已踩过一次，主会话工具卡全灭）。
+        if (hasOnlyPipelineToolCalls(dto.toolCalls())) {
+            rec.setAgentSteps(serializeToolCalls(dto.toolCalls()));
+        }
         rec.setReasoning(dto.reasoning());
         // [thinking-passthrough] thinking 块签名落库 · V282 列（与 reasoning 文本配对，
         //   与 CC transcript 同构：只存 thinking 文本 + signature，不存块结构）。
@@ -2656,7 +2673,8 @@ public class MessageService {
         // [RAG 时间线] 读回检索阶段工具（V290 列）：**仅当 agent_steps 非空才覆盖**。
         //   ⚠️ ReAct 轮不写 agent_steps（工具调用在 tool_calls 子表，上面 :2597 已读出），
         //   若无条件覆盖会把子表的真实 toolCalls 清成空 ⇒ 主会话工具卡全部消失（已踩过）。
-        if (m.getAgentSteps() != null && !m.getAgentSteps().isBlank()) {
+        //   子表已有真实工具调用（ReAct 轮）时**绝不用 agent_steps 覆盖** —— 子表才是权威。
+        if (toolDtos.isEmpty() && m.getAgentSteps() != null && !m.getAgentSteps().isBlank()) {
             dto = dto.withToolCalls(parseToolCalls(m.getAgentSteps()));
         }
         // [usage 读侧回填] DB 持久化 inputTokens/outputTokens + cache 4 字段 → 重拉投影回填 usage，
