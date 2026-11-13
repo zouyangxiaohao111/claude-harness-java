@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.76] - 2026-11-13
+
+### Fixed
+
+- 修复恢复会话时 RAG 轮回答丢失：改为先剔除展示用阶段工具（ragpipe-）再反序列化，反过来会被「未配对 tool_use 剥离」删掉整条 RAG 轮 assistant
+- 修复主会话工具卡全部消失：`agent_steps` 只落展示用阶段工具，读侧不再覆盖 `tool_calls` 子表里的真实工具调用
+
 ## [0.1.75] - 2026-11-13
 
 ### Fixed

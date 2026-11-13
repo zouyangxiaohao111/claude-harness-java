@@ -73,6 +73,7 @@ public class ExternalMarketService {
                     text(n.get("displayName")),
                     text(n.get("description")),
                     text(n.get("version")),
+                    text(n.get("fingerprint")),
                     text(n.get("category")),
                     strList(n.get("tags")),
                     text(n.get("createdAt")),
@@ -287,7 +288,7 @@ public class ExternalMarketService {
                 ? p.downloadCount()
                 : longOrNull(firstPresent(s, "download", "downloadCount"));
             out.add(new ExternalPluginDto(
-                p.name(), p.displayName(), p.description(), p.version(), p.category(),
+                p.name(), p.displayName(), p.description(), p.version(), p.fingerprint(), p.category(),
                 p.tags(), p.createdAt(), use, download,
                 p.authorName(), p.authorVerified(), p.authorAvatarUrl(), p.authorEmail()));
         }

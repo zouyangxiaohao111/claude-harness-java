@@ -154,8 +154,18 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const [marketName, setMarketName] = useState('zjky-market')
   // 远程下载的插件专家（source='plugin'）· 供建科市场「使用」按钮定位 agentType（不混入本地来源）
   const [pluginAgents, setPluginAgents] = useState<AgentListItem[]>([])
-  // 已安装插件明细（「本地」来源展示；含版本/安装路径）
+  /** 已安装插件明细（「本地」来源展示；含版本/安装路径） */
   const [pluginDetails, setPluginDetails] = useState<InstalledPluginDetail[]>([])
+
+  /** 应用已装插件明细：同步明细列表 + 名称→指纹映射（判定「可更新」的数据源）。 */
+  const applyInstalledDetails = (list: InstalledPluginDetail[] | null | undefined) => {
+    setPluginDetails(list ?? [])
+    const map: Record<string, string> = {}
+    for (const d of list ?? []) {
+      if (d.name && d.fingerprint) map[d.name] = d.fingerprint
+    }
+    setInstalledFp(map)
+  }
 
   // ---- 数据（按来源加载 · Promise.allSettled 容错：单个源失败不影响其余渲染）----
   const [localAgents, setLocalAgents] = useState<AgentListItem[]>([])
@@ -232,12 +242,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     // 本地指纹（判定「市场有更新」）：市场条目指纹 ≠ 本地安装目录指纹 ⇒ 显示更新
     void marketApi.listInstalledDetails().then((list) => {
       if (cancelled) return
-      setPluginDetails(list ?? [])
-      const map: Record<string, string> = {}
-      for (const d of list ?? []) {
-        if (d.name && d.fingerprint) map[d.name] = d.fingerprint
-      }
-      setInstalledFp(map)
+      applyInstalledDetails(list)
     }).catch(() => { /* 指纹不可得 → 不显示更新提示（不影响安装） */ })
 
     // [2026-11-01 v4] **两个源并行加载**（原来是 if/else 二选一）。
@@ -388,6 +393,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     }
     // 同一插件已在安装中 → 直接忽略（按钮虽已禁用，键盘/连点仍可能进来）
     if (installing.has(pluginName)) return
+    const isUpdate = installed.has(pluginName)
     const pluginId = `${pluginName}@${marketName}`
     setInstalling((prev) => new Set(prev).add(pluginName))
     setProgress((prev) => ({ ...prev, [pluginName]: { pluginId, stage: 'PREPARING', percent: 2, message: '准备市场索引', updatedAt: Date.now() } }))
@@ -405,7 +411,13 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
       })
       if (r.success) {
         setInstalled((prev) => new Set(prev).add(pluginName))
-        showToast(`已安装 ${r.pluginName || pluginName}`, 'success')
+        showToast(`${isUpdate ? '已更新' : '已安装'} ${r.pluginName || pluginName}`, 'success')
+        // 更新后必须重算本地指纹，否则「可更新」标记不会消失
+        if (isUpdate) {
+          void marketApi.listInstalledDetails()
+            .then((list) => applyInstalledDetails(list))
+            .catch(() => { /* 刷新失败：保留旧指纹，下次打开弹窗再对齐 */ })
+        }
       } else {
         showToast(r.message || '安装失败', 'info')
       }
@@ -794,6 +806,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           hasUpdate={hasUpdate(s.marketId, s.fingerprint)}
                           onSummon={() => summonSkill(s)}
                           onInstall={(id) => void installMarketPlugin(id)}
+                          onUpdate={(id) => void installMarketPlugin(id)}
                           onOpenDetail={() => setDetailSkill(s)}
                           onUninstall={(sk, local) => void handleUninstall(sk, local)}
                           menuOpen={openMenuId === s.marketId}
@@ -1071,7 +1084,7 @@ function RingProgress({ percent }: { percent: number }) {
  */
 function SkillCard({
   skill, fromLocal = false, installedNow = false, installing = false, installPercent = 0,
-  hasUpdate = false, onSummon, onInstall, onOpenDetail, onUninstall, menuOpen, onToggleMenu, onCloseMenu,
+  hasUpdate = false, onSummon, onInstall, onUpdate, onOpenDetail, onUninstall, menuOpen, onToggleMenu, onCloseMenu,
 }: {
   skill: MarketSkill
   /** 来自「本机已装」子 tab（无市场统计、恒为已安装） */
@@ -1082,6 +1095,8 @@ function SkillCard({
   hasUpdate?: boolean
   onSummon: () => void
   onInstall: (marketId: string) => void
+  /** 市场内容比本地新：重新安装覆盖（与首次安装同一条链） */
+  onUpdate: (marketId: string) => void
   onOpenDetail: () => void
   /** 卸载（已二次确认后才会被调用）· fromLocal 决定文案是「技能」还是「插件」 */
   onUninstall: (skill: MarketSkill, fromLocal: boolean) => void
@@ -1134,7 +1149,18 @@ function SkillCard({
           <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
         </button>
         {installed ? (
-          <button className="sk-summon" onClick={onSummon} title={`召唤到输入框：/${skill.name || skill.marketId}`}>召唤</button>
+          hasUpdate ? (
+            <button
+              className={`sk-summon accent${installing ? ' installing' : ''}`}
+              disabled={installing}
+              onClick={() => onUpdate(skill.marketId)}
+              title={installing ? `正在更新 ${nm}… ${Math.round(installPercent)}%` : `更新 ${nm}`}
+            >
+              {installing ? `${Math.round(installPercent)}%` : '更新'}
+            </button>
+          ) : (
+            <button className="sk-summon" onClick={onSummon} title={`召唤到输入框：/${skill.name || skill.marketId}`}>召唤</button>
+          )
         ) : (
           <button
             className={`sk-summon accent${installing ? ' installing' : ''}`}

@@ -133,6 +133,8 @@ class ExternalMarketServiceStatsTest {
         assertThat(m0.name()).isEqualTo("docx");
         assertThat(m0.useCount()).isEqualTo(6_156_400L);
         assertThat(m0.downloadCount()).isEqualTo(232_200L);
+        // 内容指纹必须原样保留：前端据此判定「市场里的内容比本地新」
+        assertThat(m0.fingerprint()).isEqualTo("sha256:docx");
         // 没有统计的条目：保持 null
         assertThat(merged.get(1).useCount()).isNull();
         assertThat(merged.get(1).downloadCount()).isNull();
@@ -180,7 +182,7 @@ class ExternalMarketServiceStatsTest {
 
     private static ExternalPluginDto plugin(String name, Long use, Long download) {
         return new ExternalPluginDto(
-            name, name, "desc", "1.0.0", "skill", List.of(), null,
+            name, name, "desc", "1.0.0", "sha256:" + name, "skill", List.of(), null,
             use, download, ExternalPluginDto.DEFAULT_AUTHOR_NAME, false, null, null);
     }
 }

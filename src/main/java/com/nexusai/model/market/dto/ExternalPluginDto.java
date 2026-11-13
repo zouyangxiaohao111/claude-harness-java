@@ -22,6 +22,7 @@ import java.util.List;
  * @param displayName    中文展示名
  * @param description    描述
  * @param version        版本号
+ * @param fingerprint    内容指纹（sha256:...，上架时写入；缺省 null = 较早的数据没有指纹）
  * @param category       分类（expert / skill / connector）
  * @param tags           标签
  * @param createdAt      创建时间（ISO 8601）
@@ -37,6 +38,7 @@ public record ExternalPluginDto(
         String displayName,
         String description,
         String version,
+        String fingerprint,
         String category,
         List<String> tags,
         String createdAt,

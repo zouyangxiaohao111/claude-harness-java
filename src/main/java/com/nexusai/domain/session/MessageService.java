@@ -1435,8 +1435,10 @@ public class MessageService {
      */
     public List<ChatMessageDto> listForResume(String sessionId) {
         List<ChatMessageDto> raw = listRawForTranscript(sessionId);
-        return stripPipelineToolCalls(
-            SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages());
+        // ⚠️ 顺序：先剔 ragpipe-（展示用调用，无独立 tool_result），再跑反序列化。
+        //   反过来会让「未配对 tool_use 剥离」把整条 RAG 轮 assistant 删掉（回答丢失）。
+        return SessionResumeDeserializer.deserializeWithInterruptDetection(
+            stripPipelineToolCalls(raw)).messages();
     }
 
     /**
@@ -1483,8 +1485,8 @@ public class MessageService {
             return List.of();
         }
         if (excludeMessageId == null || excludeMessageId.isBlank()) {
-            return stripPipelineToolCalls(
-                SessionResumeDeserializer.deserializeWithInterruptDetection(raw).messages());
+            return SessionResumeDeserializer.deserializeWithInterruptDetection(
+                stripPipelineToolCalls(raw)).messages();
         }
         List<ChatMessageDto> filtered = new ArrayList<>(raw.size());
         for (ChatMessageDto m : raw) {
@@ -1497,8 +1499,8 @@ public class MessageService {
             log.debug("[MessageService] listForResumeExcluding(raw): raw={} filtered={}（排除在途用户消息 {}）",
                 raw.size(), filtered.size(), excludeMessageId);
         }
-        return stripPipelineToolCalls(
-            SessionResumeDeserializer.deserializeWithInterruptDetection(filtered).messages());
+        return SessionResumeDeserializer.deserializeWithInterruptDetection(
+            stripPipelineToolCalls(filtered)).messages();
     }
 
     /** 是否「全是展示用阶段工具」（ragpipe- 前缀）——空列表返回 false。 */
