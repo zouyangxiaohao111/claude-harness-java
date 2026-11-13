@@ -2,6 +2,20 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.74] - 2026-11-13
+
+### Fixed
+
+- **知识库「解析记录」恒为空**（11-13 安吉灵峰实测：span 表里有 22 条却显示「暂无解析记录」）：
+  `GET /api/v1/knowledge/spans` 裸返 DTO ⇒ 前端取数判据 `res?.success && res.data` 恒不成立。
+  现按源侧 swagger（`handler.DataResponse{data=...}`，WeKnora internal/handler/knowledge.go:686）
+  包成 `{success, data}`。
+
+### Changed
+
+- 打包脚本 `release-package/scripts/build.sh`：`CARGO_TARGET_DIR` 改用 Windows 路径
+  （cargo / Tauri CLI 是原生 Windows 程序，不认 MSYS 的 `/d/...`，否则产物落到嵌套目录）。
+
 ## [0.1.73] - 2026-11-12
 
 ### Added

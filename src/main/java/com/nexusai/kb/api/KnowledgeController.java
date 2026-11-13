@@ -213,7 +213,7 @@ public class KnowledgeController {
      * @return span 树 + 派生状态
      */
     @GetMapping({"/api/v1/knowledge/{id}/spans", "/api/v1/knowledge/{id}/stages"})
-    public KnowledgeSpansDto spans(
+    public java.util.Map<String, Object> spans(
         @PathVariable String id,
         @RequestParam(value = "attempt", required = false) Integer attempt
     ) {
@@ -236,10 +236,16 @@ public class KnowledgeController {
             id, currentAttempt, rows, knowledge.parseStatus(), knowledge.errorMessage(),
             knowledge.updatedAt(), hasQueuedIngestWork(id), java.time.LocalDateTime.now());
 
-        return new KnowledgeSpansDto(
+        // ⚠️ 2026-11-13 必须包 {success, data}（对齐源侧 swagger：
+        //   {@code handler.DataResponse{data=handler.KnowledgeSpansData}}，见
+        //   WeKnora internal/handler/knowledge.go:686）。
+        //   前端 api/knowledge.ts#getKnowledgeSpans 与 KbProcessingTimeline 的取数判据是
+        //   {@code res?.success && res.data}；裸返 DTO 时 success=undefined ⇒ 判失败
+        //   ⇒ 界面恒落「暂无解析记录」，即使 span 表里有 22 条（11-13 安吉灵峰实测）。
+        return java.util.Map.of("success", true, "data", new KnowledgeSpansDto(
             id, currentAttempt, latestAttempt, knowledge.parseStatus(), currentAttempt,
             built.currentStage(), built.trace(), built.lastActivityAt(),
-            built.stallState(), built.lastError());
+            built.stallState(), built.lastError()));
     }
 
     /**

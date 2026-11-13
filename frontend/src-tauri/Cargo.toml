@@ -1,6 +1,6 @@
 [package]
 name = "nexusai-client"
-version = "0.1.73"
+version = "0.1.74"
 description = "NexusAI Tauri Client"
 authors = ["NexusAI"]
 edition = "2021"
