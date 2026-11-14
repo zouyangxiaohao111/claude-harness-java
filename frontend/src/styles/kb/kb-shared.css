@@ -442,6 +442,25 @@
 /* ⭐ 列表行的「文件名 + 元信息」排版 · 逐字照抄源站 DocumentListView.vue:740-778。
    本仓 JSX 用了 `.row-file-text` / `.row-file-meta` 两个类，但 **CSS 里一条都没有**
    ⇒ meta 行继承 14px 正文色，与源站的 12px 灰字完全不同（用户报「列表字体没对齐」）。*/
+/* ⭐ 元数据**显示态** · 源站 doc-content.vue:2386-2440：
+   `.metadata-display{min-width:0}` / `.metadata-grid{flex;wrap;gap:7px 18px}` /
+   `.metadata-item{inline-flex;baseline;gap:5px}` / key 带冒号、value 用主文本色。
+   本仓这几个类同样只有模板没有样式 ⇒ 已有元数据时会挤成一行。*/
+.kb-scope .t-drawer.doc-main-drawer .metadata-display{min-width:0}
+.kb-scope .t-drawer.doc-main-drawer .metadata-grid{display:flex;align-items:center;flex-wrap:wrap;gap:7px 18px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-item{display:inline-flex;align-items:baseline;gap:5px;min-width:0}
+.kb-scope .t-drawer.doc-main-drawer .metadata-item-key,
+.kb-scope .t-drawer.doc-main-drawer .metadata-item-value{
+  display:block;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.kb-scope .t-drawer.doc-main-drawer .metadata-item-key{
+  color:var(--td-text-color-placeholder,rgba(0,0,0,.4));font-size:var(--app-text-sm,12px)}
+.kb-scope .t-drawer.doc-main-drawer .metadata-item-key::after{content:':'}
+.kb-scope .t-drawer.doc-main-drawer .metadata-item-value{
+  color:var(--td-text-color-primary,rgba(0,0,0,.9));font-size:var(--app-text-md,14px)}
+/* ⭐「添加元数据字段」在源站源码里是 `width: fit-content`（只有文字宽度）；
+   用户要的是**整行宽**可点区域 ⇒ 这里显式撑满，文字仍靠左。*/
+.kb-scope .t-drawer.doc-main-drawer .metadata-empty-action,
+.kb-scope .t-drawer.doc-main-drawer .metadata-add-row{width:100%}
 .kb-scope .row-file-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
 .kb-scope .row-file-meta{display:flex;align-items:center;gap:6px;
   font-variant-numeric:tabular-nums;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;

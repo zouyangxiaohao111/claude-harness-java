@@ -2,6 +2,13 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.78] - 2026-11-14
+
+### Fixed
+
+- 知识库文档列表的空标签列改为渲染「+ 添加标签」按钮（对齐源站；此前是破折号，用户根本不知道这里可以打标签）
+- 抽屉关闭按钮与元数据/列表按钮补全源站样式（此前是裸 button，无样式）
+
 ## [0.1.77] - 2026-11-14
 
 ### Added
