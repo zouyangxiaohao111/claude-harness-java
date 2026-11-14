@@ -9,6 +9,14 @@ All notable changes to NexusAI will be documented in this file.
 - 知识库文档列表的空标签列改为渲染「+ 添加标签」按钮（对齐源站；此前是破折号，用户根本不知道这里可以打标签）
 - 抽屉关闭按钮与元数据/列表按钮补全源站样式（此前是裸 button，无样式）
 
+### Changed
+
+- 发版核验脚本 `release-package/scripts/verify-release.sh`：① SVN 核验基准改用**工作副本的
+  Last Changed Rev**（此前取 pom.xml 的 rev —— 该文件本次未镜像时 rev 偏旧 ⇒ `svn diff` 把本次
+  镜像的内容误报成差异 ⇒ 误判镜像不完整）；② `svn diff | head` 改 `sed -n '1,5p'`
+  （head 提前关闭管道 ⇒ svn 收 SIGPIPE ⇒ `set -o pipefail` 下整条命令非 0 ⇒ 脚本在赋值那步
+  **静默中止**，连 die 消息都打不出来）。`sync-repos.sh` / `bump-version.sh` 里同款 `| head` 一并改。
+
 ## [0.1.77] - 2026-11-14
 
 ### Added
