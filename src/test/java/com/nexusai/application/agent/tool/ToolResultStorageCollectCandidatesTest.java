@@ -237,4 +237,61 @@ class ToolResultStorageCollectCandidatesTest {
         assertThat(groups.get(0)).extracting(ChatMessageDto::toolCallId)
             .containsExactly("call_t1", "call_t2");
     }
+
+    // ── 2026-11-14 · 线上 sess-a4a11222：截图被当成 98KB 大文本替换掉 ──────────────
+
+    @Test
+    @DisplayName("T11 文本载荷里的 image（MCP 路径，图片不在 contentBlocks）同样不收集")
+    void t11_textPayloadImage_notCollected() {
+        // WHY: 线上截图走 MCP 路径，结果被序列化成 JSON 字符串进 content；
+        //   旧实现只看 contentBlocks ⇒ 判定恒 false ⇒ 98KB 截图被换成 <persisted-output> 指针，
+        //   模型再也看不到屏幕（CC 的 jAs 会钻进 tool_result.content 里找 image）。
+        String imageJson = "{\"content\":[{\"type\":\"image\",\"source\":"
+            + "{\"type\":\"base64\",\"media_type\":\"image/jpeg\",\"data\":\"AAAA\"}}]}";
+
+        List<List<ChatMessageDto>> groups = ToolResultStorage.collectCandidatesByMessage(
+            List.of(asst("asst-1", "X"), toolWithContent("tool-img", "call_img", "X", imageJson)));
+
+        assertThat(groups).as("含 image 的 tool_result 不是替换候选").isEmpty();
+        assertThat(ToolResultStorage.isImageBearingToolResult(
+            toolWithContent("t", "c", "X", imageJson))).isTrue();
+    }
+
+    @Test
+    @DisplayName("T12 含图片的结果预算按 2000 计（对齐 CC OHr 的 MHr），普通结果按实际长度")
+    void t12_imageBudgetSize() {
+        String bigBase64 = "A".repeat(90_000);
+        String imageAnthropicShape = "{\"type\":\"image\",\"source\":{\"type\":\"base64\","
+            + "\"media_type\":\"image/jpeg\",\"data\":\"" + bigBase64 + "\"}}";
+        // openai 侧同一张图在消息层的形态（data 直挂），必须有同样结论 —— 判定发生在
+        // provider 序列化之前的预算层，与哪条 wire 无关。
+        String imageOpenAiShape = "{\"type\":\"image\",\"media_type\":\"image/jpeg\","
+            + "\"data\":\"" + bigBase64 + "\"}";
+        String plain = "x".repeat(500);
+
+        ChatMessageDto imgA = toolWithContent("t1", "c1", "X", imageAnthropicShape);
+        ChatMessageDto imgB = toolWithContent("t2", "c2", "X", imageOpenAiShape);
+        ChatMessageDto normal = toolWithContent("t3", "c3", "X", plain);
+
+        assertThat(ToolResultStorage.budgetSizeOf(imgA))
+            .as("90KB base64 只按 2000 计入预算").isEqualTo(ToolResultStorage.IMAGE_RESULT_BUDGET_CHARS);
+        assertThat(ToolResultStorage.budgetSizeOf(imgB))
+            .as("openai 形态同结论").isEqualTo(ToolResultStorage.IMAGE_RESULT_BUDGET_CHARS);
+        assertThat(ToolResultStorage.budgetSizeOf(normal)).as("普通结果按实际长度").isEqualTo(500);
+        assertThat(ToolResultStorage.budgetSizeOf(null)).isZero();
+    }
+
+    @Test
+    @DisplayName("T13 双 provider 等价：同一判定在两条 wire 之前完成（含 image 一律既不计量也不替换）")
+    void t13_providerAgnostic() {
+        String imageJson = "{\"type\":\"image\",\"source\":{\"data\":\"AAAA\"}}";
+        ChatMessageDto tool = toolWithContent("t1", "c1", "X", imageJson);
+        assertThat(ToolResultStorage.isImageBearingToolResult(tool)).isTrue();
+        assertThat(ToolResultStorage.budgetSizeOf(tool))
+            .isEqualTo(ToolResultStorage.IMAGE_RESULT_BUDGET_CHARS);
+        assertThat(ToolResultStorage.collectCandidatesByMessage(
+            List.of(asst("asst-1", "X"), tool)))
+            .as("预算层就排除 ⇒ Anthropic / OpenAI 两条序列化链都不会把它变成文本指针")
+            .isEmpty();
+    }
 }

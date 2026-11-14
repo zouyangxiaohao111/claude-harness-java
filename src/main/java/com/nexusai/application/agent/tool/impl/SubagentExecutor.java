@@ -571,7 +571,11 @@ public class SubagentExecutor {
             source.agentContext(),
             // [S1-T1] teammateIdentity 透传 — 同 subagentName/isBuiltIn/agentContext：record-copy
             //   wither 只做派生视图，非身份来源；不透传会把盖章点（withTeammateIdentity）的值清掉。
-            source.teammateIdentity()
+            source.teammateIdentity(),
+            // [request-extras 批 1] requestExtras 透传 — 同上：本方法是 TUC 的 record-copy wither
+            //   （派生视图），非来源；漏传会让子代理侧丢掉请求级透传（当前生产恒空 map ⇒ 行为不变）。
+            //   ⛔ record 加组件后**所有全参构造调用都必须跟上**，否则编译报「找不到匹配的构造器」。
+            source.requestExtras()
         );
     }
 

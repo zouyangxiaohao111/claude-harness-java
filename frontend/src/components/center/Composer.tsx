@@ -18,6 +18,7 @@ import { projectApi } from '@/api/projects'
 import { compactNumber } from '@/utils/format'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
 import { u8ToBase64 } from '@/utils/base64'
+import '@/styles/kb-mention.css'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
@@ -207,8 +208,6 @@ interface ComposerProps {
 const TOKEN_BUDGET_RE = /\+\d+[kmb]?/gi
 
 // 高亮层与 textarea 共用同一套排版参数，保证逐字对齐（背景透明 textarea + 前置高亮层）
-const AT_COUNT: CSSProperties = { marginLeft: 'auto', fontSize: 12, color: 'var(--ink-faint)' }
-const AT_SUB: CSSProperties = { marginLeft: 'auto', fontSize: 11, color: 'var(--ink-faint)', maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }
 
 const HIGHLIGHT_TEXT_STYLE: CSSProperties = {
   fontFamily: 'var(--font-sans)',
@@ -526,6 +525,8 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   const [atIndex, setAtIndex] = useState(0)
   /** 点「@ 知识库」按钮直接展开面板（源站行为：点按钮只弹窗，不往输入框写 @） */
   const [atOpen, setAtOpen] = useState(false)
+  /** @ 面板内的搜索词（对齐源站 MentionSelector 的 .mention-search；空则用输入框 @ 后的文本过滤） */
+  const [atSearch, setAtSearch] = useState('')
   /** 知识库面板的二级分类：null = 一级（知识库 / 文件两行） */
   const [atGroup, setAtGroup] = useState<null | 'kb' | 'file'>(null)
   /** 知识库 @ 面板（两级）是否展开 · 关闭时回到一级 */
@@ -565,14 +566,14 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     // 知识库面板：一级只有「知识库 / 文件」两行，二级才出候选
     if (atItems?.length && (atOpen || atTailIndex)) {
       if (!atGroup) return null
-      const q = (atTailIndex?.prefix ?? '').toLowerCase()
+      const q = (atSearch.trim() || (atTailIndex?.prefix ?? '')).toLowerCase()
       const list = atItems
         .filter((i) => (i.kind ?? 'kb') === atGroup && (!q || i.label.toLowerCase().includes(q)))
         .slice(0, 40).map((i) => i.label)
       return list.length ? list : null
     }
     if (!atActive || !atTailIndex) return null
-    const q = atTailIndex.prefix.toLowerCase()
+    const q = (atSearch.trim() || atTailIndex.prefix).toLowerCase()
     // 知识库场景：候选是知识库名（⛔ 不走项目文件树 —— 弹窗没有绑定项目）
     if (atItems?.length) {
       const list = atItems.filter((i) => !q || i.label.toLowerCase().includes(q)).slice(0, 40).map((i) => i.label)
@@ -582,7 +583,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     const list = projFiles.filter((p) => !q || p.toLowerCase().includes(q)).slice(0, 40)
     return list.length ? list : null
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [atActive, projFiles, atTailIndex, atItems, atOpen, atGroup])
+  }, [atActive, projFiles, atTailIndex, atItems, atOpen, atGroup, atSearch])
   // 候选出现/变化 → 重置选中；随 ↑↓ 联动滚动
   useEffect(() => {
     if (atMatches && !hadAtRef.current) setAtIndex(0)
@@ -590,7 +591,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
   }, [atMatches])
   useEffect(() => {
     if (!atMatches || !atMenuRef.current) return
-    const el = atMenuRef.current.children[atIndex % atMatches.length] as HTMLElement | undefined
+    const el = atMenuRef.current.querySelector<HTMLElement>(`[data-idx="${atIndex}"]`)
     el?.scrollIntoView({ block: 'nearest' })
   }, [atIndex, atMatches])
   /** 选中候选 → 把行尾 @token 替换为 @path（保留前导空白/标点分隔符） */
@@ -603,9 +604,10 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
         const head = atTailIndex.segStartAbs >= 0 ? composerText.slice(0, atTailIndex.segStartAbs + 1) : ''
         setComposerText(head.replace(/\s+$/, head.trim() ? ' ' : ''))
       }
-      // 选「知识库」= 范围已定，面板立即收起（对齐源站行为）；
-      // 选「文件」保持展开可连续多选（用户 2026-11-13 要求的多选只针对文件）。
-      if (hit.kind === 'kb') setAtOpen(false)
+      // 选中任意一项（知识库 / 文件）面板立即收起：它盖在输入框上方，
+      // 用户选完就想直接写字（2026-11-14 用户报「选了文件面板不消失」）。
+      // 想继续多选再按一次 @ 重新打开即可。
+      setAtOpen(false)
       setAtIndex(0)
       textareaRef.current?.focus()
       return
@@ -1313,57 +1315,105 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                 ))}
               </div>
             )}
-            {/* 知识库 @ 面板：两级（对齐源站 —— 一级「知识库 / 文件」两行，二级是条目） */}
+            {/* 知识库 @ 面板 · 结构与样式逐项对齐源站 `components/MentionSelector.vue`：
+                搜索框（二级带「‹ 组名」面包屑）+ 根层级分组入口 + 二级条目（图标/名称/计数/箭头）。
+                ⛔ 不要退回自造的 .at-menu 结构。 */}
             {kbPanelOpen ? (
-              <div className="at-menu" ref={atMenuRef}>
-                {atGroup === null ? (
-                  <>
-                    <div className="at-menu-cap">选择</div>
-                    <div className="at-item" onClick={() => { setAtGroup('kb'); setAtIndex(0) }}>
-                      <span className="at-at">▤</span>
-                      <span className="at-path">知识库</span>
-                      <span style={AT_COUNT}>{kbGroupCounts.kb} ›</span>
-                    </div>
-                    <div className="at-item" onClick={() => { setAtGroup('file'); setAtIndex(0) }}>
-                      <span className="at-at">▦</span>
-                      <span className="at-path">文件</span>
-                      <span style={AT_COUNT}>{kbGroupCounts.file} ›</span>
-                    </div>
-                  </>
-                ) : (
-                  <>
-                    <div className="at-menu-cap">
-                      <span
-                        role="button"
+              <div className="kb-mention mention-menu">
+                <div className="mention-search">
+                  <div className="mention-search__box">
+                    <span className="mention-search__icon">
+                      <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-search" /></svg>
+                    </span>
+                    {atGroup !== null && (
+                      <button
+                        type="button"
+                        className="mention-search__crumb"
                         title="返回"
-                        style={{ cursor: 'pointer', marginRight: 6 }}
-                        onClick={(e) => { e.stopPropagation(); setAtGroup(null); setAtIndex(0) }}
-                      >‹</span>
-                      {atGroup === 'kb' ? '知识库' : '文件'}
-                      <span style={{ float: 'right', fontSize: 11 }}>共 {atMatches?.length ?? 0} 项</span>
-                    </div>
-                    {(atMatches ?? []).map((p, i) => {
-                      const entry = atItems?.find((x) => x.label === p)
-                      const active = i === atIndex % (atMatches?.length ?? 1)
-                      return (
-                        <div
-                          key={p}
-                          className={`at-item ${active ? 'active' : ''}`}
-                          onMouseEnter={() => setAtIndex(i)}
-                          onClick={() => applyAtPick(p)}
-                          title={p}
-                        >
-                          <span className="at-at">{atGroup === 'kb' ? '▤' : '▦'}</span>
-                          <span className="at-path">{p}</span>
-                          {entry?.sub && <span style={AT_SUB}>{entry.sub}</span>}
-                        </div>
-                      )
-                    })}
-                    {!atMatches && (
-                      <div className="at-item" style={{ cursor: 'default', color: 'var(--ink-faint)' }}>没有匹配项</div>
+                        onClick={() => { setAtGroup(null); setAtIndex(0); setAtSearch('') }}
+                      >
+                        <svg width={12} height={12} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-chevron-left" /></svg>
+                        <span>{atGroup === 'kb' ? '知识库' : '文件'}</span>
+                      </button>
                     )}
-                  </>
-                )}
+                    <input
+                      className="mention-search__input"
+                      value={atSearch}
+                      onChange={(e) => { setAtSearch(e.target.value); setAtIndex(0) }}
+                      placeholder={atGroup === null ? '选择要引用的类别' : '搜索'}
+                      autoComplete="off"
+                      spellCheck={false}
+                    />
+                  </div>
+                </div>
+                <div className="mention-list" ref={atMenuRef}>
+                  {atGroup === null ? (
+                    <>
+                      <button
+                        type="button"
+                        className="mention-row mention-group-entry"
+                        data-idx={0}
+                        onClick={() => { setAtGroup('kb'); setAtIndex(0); setAtSearch('') }}
+                      >
+                        <span className="mention-row__icon">
+                          <svg width={14} height={14} viewBox="0 0 20 20" aria-hidden="true"><use href="#t-icon-kb-resource" /></svg>
+                        </span>
+                        <span className="mention-row__name">知识库</span>
+                        <span className="mention-row__meta">{kbGroupCounts.kb}</span>
+                        <svg className="mention-row__arrow" width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-chevron-right" /></svg>
+                      </button>
+                      <button
+                        type="button"
+                        className="mention-row mention-group-entry"
+                        data-idx={1}
+                        onClick={() => { setAtGroup('file'); setAtIndex(0); setAtSearch('') }}
+                      >
+                        <span className="mention-row__icon">
+                          <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-file" /></svg>
+                        </span>
+                        <span className="mention-row__name">文件</span>
+                        <span className="mention-row__meta">{kbGroupCounts.file}</span>
+                        <svg className="mention-row__arrow" width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-chevron-right" /></svg>
+                      </button>
+                    </>
+                  ) : (
+                    <>
+                      {(atMatches ?? []).map((p, i) => {
+                        const entry = atItems?.find((x) => x.label === p)
+                        const active = i === atIndex % (atMatches?.length ?? 1)
+                        const q = (atSearch.trim() || (atTailIndex?.prefix ?? '')).trim()
+                        const hit = q ? p.toLowerCase().indexOf(q.toLowerCase()) : -1
+                        return (
+                          <div
+                            key={p}
+                            className={`mention-row mention-item ${active ? 'active' : ''}`}
+                            data-idx={i}
+                            onMouseEnter={() => setAtIndex(i)}
+                            onClick={() => applyAtPick(p)}
+                            title={p}
+                          >
+                            <span className="mention-row__icon">
+                              <svg width={14} height={14} viewBox={atGroup === 'kb' ? '0 0 20 20' : '0 0 24 24'} aria-hidden="true">
+                                <use href={atGroup === 'kb' ? '#t-icon-kb-resource' : '#t-icon-file'} />
+                              </svg>
+                            </span>
+                            <span className="mention-row__name">
+                              {hit >= 0 ? (
+                                <>
+                                  {p.slice(0, hit)}
+                                  <mark className="mention-hit">{p.slice(hit, hit + q.length)}</mark>
+                                  {p.slice(hit + q.length)}
+                                </>
+                              ) : p}
+                            </span>
+                            {entry?.sub && <span className="mention-row__meta mention-row__meta--text">{entry.sub}</span>}
+                          </div>
+                        )
+                      })}
+                      {!atMatches && <div className="empty">没有匹配项</div>}
+                    </>
+                  )}
+                </div>
               </div>
             ) : atMatches && (
               <div className="at-menu" ref={atMenuRef}>

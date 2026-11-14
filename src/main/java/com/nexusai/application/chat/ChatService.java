@@ -1093,7 +1093,10 @@ public class ChatService {
                 req != null && Boolean.TRUE.equals(req.dangerouslySkipPermissions()), // [RV-11 · REV-FIX-2] dangerouslySkip（HTTP 请求体 → RunRequest.dangerouslySkipPermissions）
                 taskBudgetOf(),                                  // [IMP2-10 · MISS-2] taskBudget 生产注入（OD-13: 配置→默认值）
                 req != null ? req.jsonSchema() : null,           // [IMP-HR-08 · OPD-WF6-01-06-?-3] 主循环 structured output jsonSchema 透传（HTTP 请求体 → RunRequest.jsonSchema → LlmAgentLoop 注册 enforcement）
-                attachments));                                   // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
+                attachments)                                     // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
+                // [request-extras 批 1] 请求级通用透传（HTTP 请求体 → RunRequest.requestExtras → base TUC → per-turn TUC → 工具）。
+                //   本批骨架空转：KbChatGatewayController 尚未写入 ⇒ 主会话恒 null ⇒ withRequestExtras 短路返回同一实例。
+                .withRequestExtras(req != null ? req.requestExtras() : null));
         } catch (Throwable e) {
             // [catch-throwable] 原 catch (Exception)：任务体抛 Error（OOM/StackOverflow/NoClassDefFound…）
             //   会整条漏出去 —— 既不推 message.error 也不推 status=idle ⇒ 前端停止键永驻、

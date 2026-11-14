@@ -27,6 +27,9 @@ import { ModelPickerModal } from '@/components/modals/ModelPickerModal'
 import { EffortModal } from '@/components/modals/EffortModal'
 import { Composer } from '@/components/center/Composer'
 import { MessageList } from '@/components/center/MessageList'
+import { PermissionBubble } from '@/components/center/PermissionBubble'
+import { IconSprite } from './IconSprite'
+import { sendPermissionResponse } from '@/api/socket'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { useChatStore } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
@@ -100,8 +103,39 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
   sessionId: string | null
   activeStreams: Record<string, string>
 }) {
-  useChatSocket(sessionId, activeStreams)
-  return null
+  const { clientRef } = useChatSocket(sessionId, activeStreams)
+  // ⚠️ 权限 / AskUserQuestion 弹窗必须在本窗口渲染：主窗口 App 的 PermissionBubble 按
+  //   `activeSessionId` 过滤，知识库会话不是主会话的活动会话 ⇒ 弹不到这里（2026-11-14 用户报
+  //   「Ask 弹窗跑到主会话去了，当前知识库页面没有」）。
+  //   clientRef 就在本作用域内，回响应不需要跨组件传引用。
+  const permissionQueue = useChatStore((s) => s.permissionQueue)
+  const dequeuePermission = useChatStore((s) => s.dequeuePermission)
+  const perm = permissionQueue.find((r) => r.sessionId === sessionId && r.kind === 'message')
+    ?? permissionQueue.find((r) => r.sessionId === sessionId)
+  if (!perm) return null
+  const sid = perm.sessionId ?? sessionId ?? ''
+  return (
+    <PermissionBubble
+      request={perm}
+      // 知识库独立窗口没有「项目」概念，也没有 appSettings 上下文 ⇒ 两个可选文案来源都传 null
+      projectLabel={null}
+      selfDirName={null}
+      onDecision={(id, d, answers, annotations, permissionUpdates) => {
+        if (clientRef.current) {
+          sendPermissionResponse(clientRef.current, sid, perm.kind, id, d, { answers, annotations, permissionUpdates })
+        }
+        useChatStore.getState().markToolAnswered(sid, perm.toolUseId ?? id)
+        dequeuePermission(id)
+      }}
+      onAbort={() => {
+        if (clientRef.current) {
+          sendPermissionResponse(clientRef.current, sid, perm.kind, perm.requestId, 'deny', {})
+        }
+        useChatStore.getState().markToolAnswered(sid, perm.toolUseId ?? perm.requestId)
+        dequeuePermission(perm.requestId)
+      }}
+    />
+  )
 }
 
 export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, newChatToken }: KbNewChatPaneProps) {
@@ -368,6 +402,11 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
             // type=kb 让气泡按源站「@引用」渲染（正文上方 chip）；filename 只放名称，类型由图标区分
             type: p.kind === 'kb' ? 'kb' : 'file',
             filename: p.label,
+            // ⭐ 文件项 = 知识库文档 ⇒ 把文档 id 带进快照（contentId 承载）。
+            //   气泡点击预览时走 `/api/v1/knowledge/{id}/download`，
+            //   ⛔ 不走附件 base64/path 三态 —— 知识库文档本来就没有那些源
+            //   （2026-11-14 用户报「独立预览报『附件内容不可用（缺少 url/path/base64 源）』」）。
+            contentId: p.kind === 'file' ? p.id : undefined,
           }))
         : undefined
       useChatStore.getState().appendMessages(sid, [{
@@ -693,6 +732,7 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
     // ⚠️ `.kb-new-chat` 没有全局样式（globals.css 里零命中）⇒ 必须自带 flex 高度上下文，
     //    否则 `.center` 量不到高度，消息区/输入框会全部堆到面板顶部。
     <div className="kb-new-chat" style={{ flex: 1, display: 'flex', flexDirection: 'column', minHeight: 0 }}>
+      <IconSprite />
       <SelfSocketBridge sessionId={sessionId} activeStreams={activeStreams} />
       {/* 左上角会话标题（对齐主会话 CenterTabs 的 tab 形态：模型标签 + 标题） */}
       <div style={TITLE_BAR}>
@@ -981,11 +1021,17 @@ const TITLE_TEXT: React.CSSProperties = {
 // ── 已选 chip 样式 · 数值逐条对齐源站 .mention-chip（Input-field.vue:3484-3579）
 const PICKED_WRAP: React.CSSProperties = {
   display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 10px 0', maxWidth: '100%',
+  // 源站 `.chat-mentioned-items { margin-bottom: 2px }` —— chip 与下方文字留一点气口
+  marginBottom: 2,
 }
 const PICKED_CHIP: React.CSSProperties = {
   display: 'inline-flex', alignItems: 'center', gap: 5,
-  minHeight: 26, padding: '3px 7px 3px 6px', borderRadius: 6, boxSizing: 'border-box',
+  minHeight: 26, // ⭐ 源站 `.chat-mentioned-tag` 的 max-width:200px 落在**chip**上，
+  maxWidth: 200, //    不是名字上 —— 名字若单独限宽会提前一半就截断（旧值 100px）
+  padding: '3px 8px', borderRadius: 6, boxSizing: 'border-box',
   background: '#f2f3f5', border: '1px solid #e3e6ea',
+  // 源站 `.chat-resource-chip-surface()` 的 inset 高光，缺了会显得发灰发平
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.72)',
   fontSize: 12, fontWeight: 500, lineHeight: '18px', color: '#1f2329',
 }
 const PICKED_ICON_WRAP: React.CSSProperties = {
@@ -993,7 +1039,8 @@ const PICKED_ICON_WRAP: React.CSSProperties = {
   alignItems: 'center', justifyContent: 'center', flexShrink: 0,
 }
 const PICKED_NAME: React.CSSProperties = {
-  maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+  // ⛔ 不再单独限宽：截断由 chip 的 max-width:200px 统一决定（与源站 .tag_name 一致）
+  overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap',
 }
 const PICKED_X: React.CSSProperties = {
   display: 'inline-flex', alignItems: 'center', justifyContent: 'center',

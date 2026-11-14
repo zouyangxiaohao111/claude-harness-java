@@ -111,25 +111,75 @@ public record CreateKnowledgeBaseRequest(
      * ⚠️ 其它值 ⇒ 400（值域在 {@code KnowledgeBaseService} 校验）。
      */
     @JsonProperty("image_pipeline")
-    String imagePipeline
+    String imagePipeline,
+
+    /**
+     * Wiki 配置 JSON（{@code wiki_config}）—— 只放 Wiki 专属可调项
+     * （{@code auto_generate} / {@code synthesis_model_id} / {@code max_pages_per_ingest} …）。
+     *
+     * <p>⚠️ Wiki 的**开关**不在这里，而在 {@code indexing_strategy.wiki_enabled}
+     * （源侧注释原话："Wiki enablement is carried solely by indexing_strategy.wiki_enabled"）。
+     *
+     * <p>null / 空白 = 不设（落库 NULL）。
+     */
+    @JsonProperty("wiki_config")
+    String wikiConfig,
+
+    /**
+     * 图片处理配置 JSON（{@code image_processing_config}）。
+     *
+     * <p>⚠️ 与 {@code image_pipeline} 不同：这一列承载属性观察 / 图片向量 / 方案槽位参数
+     * （源侧 {@code buildImageProcessingConfig} 产出的整份快照）。
+     * null / 空白 = 用 DB 默认 {@code {"enable_multimodal": false, "model_id": ""}}。
+     */
+    @JsonProperty("image_processing_config")
+    String imageProcessingConfig,
+
+    /** ASR 语音识别配置 JSON（{@code asr_config}；null / 空白 = 不设）。 */
+    @JsonProperty("asr_config")
+    String asrConfig,
+
+    /** 问题生成配置 JSON（{@code question_generation_config}；null / 空白 = 不设）。 */
+    @JsonProperty("question_generation_config")
+    String questionGenerationConfig,
+
+    /** 自动打标配置 JSON（{@code auto_tag_config}；null / 空白 = 不设）。 */
+    @JsonProperty("auto_tag_config")
+    String autoTagConfig,
+
+    /** 知识库画像配置 JSON（{@code profile_config}；null / 空白 = 不设）。 */
+    @JsonProperty("profile_config")
+    String profileConfig,
+
+    /** FAQ 配置 JSON（{@code faq_config}；null / 空白 = 不设）。 */
+    @JsonProperty("faq_config")
+    String faqConfig,
+
+    /** 绑定的向量库 ID（{@code vector_store_id}；null / 空白 = 不绑）。 */
+    @JsonProperty("vector_store_id")
+    String vectorStoreId,
+
+    /** 绑定的存储后端 ID（{@code storage_backend_id}；null / 空白 = 不绑）。 */
+    @JsonProperty("storage_backend_id")
+    String storageBackendId
 ) {
     /**
-     * 6 参兼容构造器（不带索引策略 / 抽取配置 / 图片管线）。
+     * 6 参兼容构造器（不带索引策略 / 抽取配置 / 图片管线 / 其余配置）。
      *
      * <p>⚠️ 仅供**既有测试**使用 —— 那些用例只关心名称/类型/模型，不涉及这些配置。
      * 生产链路（`KnowledgeBaseController#create` → Jackson 反序列化）走规范构造器。
-     * 保留它是为了让「加一个可选字段」不用改 18 处调用点（纯噪音改动）。
+     * 保留它是为了让「加一个可选字段」不用改调用点（纯噪音改动）。
      */
     public CreateKnowledgeBaseRequest(
         String name, String description, String type,
         String chunkingConfig, String embeddingModelId, String summaryModelId
     ) {
         this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId, null, null,
-            null, null, null);
+            null, null, null, null, null, null, null, null, null, null, null, null);
     }
 
     /**
-     * 8 参兼容构造器（带索引策略 / 抽取配置，不带图片管线三项）。
+     * 8 参兼容构造器（带索引策略 / 抽取配置，不带图片管线三项与其余配置）。
      *
      * <p>⚠️ 同样只为既有测试保留（{@code KnowledgeBaseServiceTest} 等按位置传 8 个参数）。
      * 图片管线三项恒 null = 用默认（true / true / default）。
@@ -140,6 +190,24 @@ public record CreateKnowledgeBaseRequest(
         String indexingStrategy, String extractConfig
     ) {
         this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId,
-            indexingStrategy, extractConfig, null, null, null);
+            indexingStrategy, extractConfig, null, null, null, null, null, null, null, null, null,
+            null, null, null);
+    }
+
+    /**
+     * 11 参兼容构造器（含图片管线三项，不含本次新增的 9 项配置）。
+     *
+     * <p>⚠️ 既有测试 {@code KbImagePipelineConfigDbTest} 按位置传 11 个参数。
+     * 新增 9 项恒 null = 不设。
+     */
+    public CreateKnowledgeBaseRequest(
+        String name, String description, String type,
+        String chunkingConfig, String embeddingModelId, String summaryModelId,
+        String indexingStrategy, String extractConfig,
+        Boolean imageCaptionEnabled, Boolean imageOcrEnabled, String imagePipeline
+    ) {
+        this(name, description, type, chunkingConfig, embeddingModelId, summaryModelId,
+            indexingStrategy, extractConfig, imageCaptionEnabled, imageOcrEnabled, imagePipeline,
+            null, null, null, null, null, null, null, null, null);
     }
 }

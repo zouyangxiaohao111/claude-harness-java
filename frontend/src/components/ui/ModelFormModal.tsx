@@ -69,6 +69,7 @@ export function ModelFormModal({ initial, providerTag, mode = 'edit', onSave, on
       // 类型切换后清掉不属于当前类型的专用参数，避免「页面上看不到却仍落库」
       embeddingDimensions: emb ? m.embeddingDimensions : null,
       embeddingBatchSize: emb ? m.embeddingBatchSize : null,
+      maxConcurrency: emb ? m.maxConcurrency : null,
       rerankTopN: rr ? m.rerankTopN : null,
       rerankInstruct: rr ? m.rerankInstruct : null,
     })
@@ -127,7 +128,13 @@ export function ModelFormModal({ initial, providerTag, mode = 'edit', onSave, on
           rows: [
             [
               { type: 'number', name: 'embeddingDimensions', label: '向量维度', nullable: true, placeholder: '1024', hint: '百炼 text-embedding-v4：2048/1536/1024/768/512/256/128/64 · 留空=服务端默认' },
-              { type: 'number', name: 'embeddingBatchSize', label: '批大小', nullable: true, placeholder: '10', hint: '单次请求最多几条文本 · 百炼上限 10 · 留空=10' },
+              { type: 'number', name: 'embeddingBatchSize', label: '批大小', nullable: true, placeholder: '10', hint: '单次请求最多几条文本 · 百炼上限 10 · 留空=按模型推断' },
+            ],
+            [
+              // 对齐源站「后台并发上限」（ModelEditorDialog.vue:545）：
+              // 只限制后台向量化（文档入库 / 图片向量化）对同一模型的并发调用数，
+              // 交互式问答的查询编码不受影响。0/空 = 全局默认 32。
+              { type: 'number', name: 'maxConcurrency', label: '后台并发上限', nullable: true, placeholder: '32', hint: '文档入库/图片向量化对同一模型的并发调用数 · 按模型共享 · 留空=32 · 不影响交互式问答' },
             ],
           ],
         },

@@ -548,6 +548,7 @@ public class ProviderService {
             // [V200] 向量嵌入 + 重排配置
             m.getEmbeddingDimensions(),
             m.getEmbeddingBatchSize(),
+            m.getMaxConcurrency(),
             m.getRerankTopN(),
             m.getRerankInstruct(),
             // ⭐ 2026-11-11：带上提供商，前端模型下拉显示成 `provider/modelName`。

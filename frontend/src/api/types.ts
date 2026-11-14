@@ -86,6 +86,12 @@ export interface Model {
   embeddingDimensions?: number | null
   /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效 · models.embedding_batch_size）；null/≤0 = 10 */
   embeddingBatchSize?: number | null
+  /**
+   * 后台并发上限（仅后台向量化生效 · models.max_concurrency，V291）。
+   * 限制文档入库/图片向量化对同一模型的并发调用数，按模型 ID 共享；null/0 = 全局默认 32，负数 = 不限。
+   * 交互式问答的查询编码不受影响。
+   */
+  maxConcurrency?: number | null
   /** 重排默认返回条数（仅 type=rerank 生效 · models.rerank_top_n）；null = 服务端默认 */
   rerankTopN?: number | null
   /** 重排默认指令（仅 type=rerank 生效 · models.rerank_instruct）；null/空 = 不发送 */
@@ -119,6 +125,8 @@ export interface CreateModelRequest {
   embeddingDimensions?: number | null
   /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效）；null/≤0 = 10 */
   embeddingBatchSize?: number | null
+  /** 后台并发上限（仅后台向量化生效）；null/0 = 全局默认 32 */
+  maxConcurrency?: number | null
   /** 重排默认返回条数（仅 type=rerank 生效）；null = 服务端默认 */
   rerankTopN?: number | null
   /** 重排默认指令（仅 type=rerank 生效）；null/空 = 不发送 */
@@ -143,6 +151,8 @@ export interface UpdateModelRequest {
   embeddingDimensions?: number | null
   /** 单次 embedding 请求文本条数上限（仅 type=embedding 生效）· PATCH 语义：null 不更新 */
   embeddingBatchSize?: number | null
+  /** 后台并发上限（仅后台向量化生效）· PATCH 语义：null 不更新 */
+  maxConcurrency?: number | null
   /** 重排默认返回条数（仅 type=rerank 生效）· PATCH 语义：null 不更新 */
   rerankTopN?: number | null
   /** 重排默认指令（仅 type=rerank 生效）· PATCH 语义：null 不更新，空串显式清空 */
@@ -521,6 +531,14 @@ export interface AppSettings {
    *  ⚠️ 值域是 **runtime id**，不是 agentType（codex-external 那种）——
    *  后端写侧只认 runtime id，派发侧也按 runtime id 反查 agentType。 */
   subagentDefaultRuntime?: string | null
+  /**
+   * 后台向量化并发上限的全局默认（settings.model_max_concurrency，V292）。
+   *
+   * <p>对齐源站系统设置 `model.max_concurrency`：模型未单独配置
+   * `models.max_concurrency` 时用本值；null/0 = 后端常量 32。
+   * 只影响后台入库/图片向量化，不影响交互式问答。
+   */
+  modelMaxConcurrency?: number | null
   /** [V259 external-agent] 外部运行时总开关。null/undefined = 未配置（yml 兜底）；
    *  false = 用户显式关闭（压过 yml 的 true，避免「关了重启又活」）。 */
   subagentExternalEnabled?: boolean | null

@@ -264,6 +264,16 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       think: m.think || null,
       // [2026-10-22] 模型级额外请求体（逐键合并进请求体；空 → null 不写）
       extraBody: m.extraBody || null,
+      // ⚠️ 2026-11-14 修复断链：这几项在表单里能填，但此前请求体没带 ⇒ 永远落不了库。
+      //    清空（undefined/null）按 0 提交 = 回到默认值（PATCH 语义里 null 是「不改」，
+      //    不传 0 就无法把已配的值改回默认）。
+      embeddingDimensions: m.embeddingDimensions ?? 0,
+      embeddingBatchSize: m.embeddingBatchSize ?? 0,
+      maxConcurrency: m.maxConcurrency ?? 0,
+      // ⚠️ rerank 两项保持 null（PATCH null = 不改）：0 / 空串在 rerank 里不是「默认值」，
+      //    写 0 会被当成真的 topN=0。填了值才落库。
+      rerankTopN: m.rerankTopN ?? null,
+      rerankInstruct: m.rerankInstruct ?? null,
       enabled: m.enabled,
     }
     void wrap(async () => {
@@ -288,6 +298,12 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
       think: m.think || null,
       // [2026-10-22] 模型级额外请求体（逐键合并进请求体；空 → null 不写）
       extraBody: m.extraBody || null,
+      // ⚠️ 2026-11-14 修复断链：表单可填但此前请求体没带（同更新路径）。
+      embeddingDimensions: m.embeddingDimensions ?? null,
+      embeddingBatchSize: m.embeddingBatchSize ?? null,
+      maxConcurrency: m.maxConcurrency ?? null,
+      rerankTopN: m.rerankTopN ?? null,
+      rerankInstruct: m.rerankInstruct ?? null,
       enabled: m.enabled,
     }
     void wrap(async () => {

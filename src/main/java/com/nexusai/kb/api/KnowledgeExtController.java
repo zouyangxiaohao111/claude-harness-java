@@ -567,12 +567,34 @@ public class KnowledgeExtController {
             return null;
         }
         Path base = Path.of(storageDir).toAbsolutePath().normalize();
-        if (!file.startsWith(base)) {
+        // ⭐ 必须按**真实路径**比较：数据根迁移后 `~/.nexusai/kb-storage` 是一个 **Junction**，
+        //   指向新根 `<install>/data/workspace/<user>/kb-storage`；库里存的 file_path 是旧的
+        //   联接路径。`Path.startsWith` 是纯字面比较、不解引用联接 ⇒ 同一份文件被判成
+        //   「不在允许范围内」（2026-11-14 用户报预览 400「文件路径不在允许范围内」）。
+        //   解引用后两边都落到同一个真实目录，安全边界不变（仍然必须在 storage-dir 之下）。
+        Path realBase = resolveRealPath(base);
+        Path realFile = resolveRealPath(file);
+        if (!realFile.startsWith(realBase)) {
             // ⚠️ 不返回具体路径给外部：那是信息泄露
             log.error("[知识API] 拒绝下载：文档 {} 的 file_path 不在 storage-dir 内", row.getId());
             throw new ValidationException("该文档的文件路径不在允许范围内，拒绝访问");
         }
         return Files.exists(file) ? file : null;
+    }
+
+    /**
+     * 取真实路径（解引用 Junction / 符号链接）；路径不存在或解析失败时退回原路径。
+     *
+     * <p>为什么需要：数据根迁移把 `kb-storage` 做成了 Junction，库里存的是联接路径，
+     * 而 storage-dir 配的是真实目录 —— 字面比较必然不等。只在**两边都真实存在**时才能
+     * `toRealPath()`（不存在会抛 IOException）。
+     */
+    private static Path resolveRealPath(Path p) {
+        try {
+            return Files.exists(p) ? p.toRealPath() : p;
+        } catch (IOException e) {
+            return p;
+        }
     }
 
     private static String classify(KbKnowledgeRecord row) {

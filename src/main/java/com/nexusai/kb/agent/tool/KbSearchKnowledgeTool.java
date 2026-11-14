@@ -60,6 +60,7 @@ public class KbSearchKnowledgeTool implements Tool {
     @Autowired private KbHybridSearcher searcher;
     @Autowired private KnowledgeBaseService knowledgeBaseService;
     @Autowired private KbConfigService kbConfigService;
+    @Autowired private KbHandleResolver handleResolver;
 
     /** 供 {@link KbAgentToolScope} 注入「本会话允许的库」。可 null（= 全部库）。 */
     @Autowired(required = false)
@@ -106,6 +107,7 @@ public class KbSearchKnowledgeTool implements Tool {
         kbIds.put("type", "array");
         kbIds.put("description",
             "要检索的知识库 id 列表（最多 " + MAX_KB_IDS + " 个）。"
+                + "可传 kb:// 句柄（如 kb://babed158）或完整 id。"
                 + "省略时检索本智能体被授权的全部知识库；"
                 + "有多个相关库时优先只传相关的那几个，而不是全部一起搜。");
         ObjectNode items = JSON.objectNode();
@@ -152,7 +154,19 @@ public class KbSearchKnowledgeTool implements Tool {
             }
 
             // ── 解析请求的知识库范围：显式传入的 ∩ 授权的 ──────────────────────────
-            List<String> requested = readStringArray(in, "knowledge_base_ids", MAX_KB_IDS);
+            //   ⭐ 参数先过句柄解析（kb://xxxx）：无效 / 多命中 ⇒ 明确报错，让模型改正再试。
+            //   ⛔ 不能把解析失败的值直接拿去和授权列表比 —— 那会变成「未授权」的误导性错误。
+            List<String> requested = new ArrayList<>();
+            try {
+                for (String raw : readStringArray(in, "knowledge_base_ids", MAX_KB_IDS)) {
+                    String id = handleResolver.resolveKnowledgeBase(raw);
+                    if (!requested.contains(id)) {
+                        requested.add(id);
+                    }
+                }
+            } catch (com.nexusai.kb.app.parser.KbParseException e) {
+                return ToolResult.error(call.id(), e.getMessage());
+            }
             List<String> kbIds;
             String scopeNote = "";
             if (requested.isEmpty()) {
@@ -188,6 +202,22 @@ public class KbSearchKnowledgeTool implements Tool {
                     log.warn("[search_knowledge] 库检索失败 kb={} 原因={}", kbId, e.toString());
                 }
             }
+            // ⭐ 文件级范围：用户只 @ 了具体文档时，只保留这些文档的命中。
+            //   不加这层的话，「这个文件讲了什么」会从**同库其它文档**里取内容回答，
+            //   引用还会指到别的文件（2026-11-14 用户报）。
+            //   ⚠️ 只在「没 @ 整个库」时生效 —— 源站 SearchTargets 是并集语义：
+            //   @ 库 = 整库覆盖，@ 文件 = 单文件覆盖，两者并存时库范围已经包含文件。
+            List<String> pinnedDocIds = pinnedDocumentIds(ctx);
+            if (!pinnedDocIds.isEmpty()) {
+                int before = hits.size();
+                hits.removeIf(h -> h.knowledgeId() == null || !pinnedDocIds.contains(h.knowledgeId()));
+                log.info("[search_knowledge] 按 @ 文件范围过滤 {} → {} 条（文档数={}）",
+                    before, hits.size(), pinnedDocIds.size());
+                if (hits.isEmpty()) {
+                    return ToolResult.success(call.id(),
+                        "[]（本轮用户只指定了具体文件，但这些文件里没有与问题相关的内容）");
+                }
+            }
             hits.sort((a, b) -> Double.compare(b.score(), a.score()));
             if (hits.size() > limit) {
                 hits = hits.subList(0, limit);
@@ -216,6 +246,40 @@ public class KbSearchKnowledgeTool implements Tool {
             log.error("[search_knowledge] 执行失败", e);
             return ToolResult.error(call.id(), "检索失败：" + e.getMessage());
         }
+    }
+
+    /**
+     * 本轮「用户只 @ 了具体文件」的文档 id 列表（文件级硬约束）。
+     *
+     * <p>来源 {@code ToolUseContext.requestExtras()["kbScope"]}（由 KB 网关写入）。
+     *
+     * <p>⛔ 用户同时 @ 了整个库时返回空列表：库范围已经覆盖该库下所有文件，
+     * 再按文件过滤会把「整库检索」缩成「只搜那几个文件」，与用户选择不符
+     * （源站 SearchTargets 是多个 target 的并集，库 target 本身就是全库）。
+     *
+     * @return 非空 = 只允许这些文档；空 = 不做文件级过滤
+     */
+    private static List<String> pinnedDocumentIds(ToolUseContext ctx) {
+        java.util.Map<String, Object> extras = ctx == null ? null : ctx.requestExtras();
+        if (extras == null || extras.isEmpty()) {
+            return List.of();
+        }
+        if (!(extras.get("kbScope") instanceof java.util.Map<?, ?> scope)) {
+            return List.of();
+        }
+        if (scope.get("knowledgeBaseIds") instanceof List<?> kbs && !kbs.isEmpty()) {
+            return List.of();
+        }
+        if (scope.get("knowledgeIds") instanceof List<?> docs) {
+            List<String> out = new ArrayList<>(docs.size());
+            for (Object item : docs) {
+                if (item instanceof String id && !id.isBlank()) {
+                    out.add(id);
+                }
+            }
+            return out;
+        }
+        return List.of();
     }
 
     private static int clampLimit(int v) {

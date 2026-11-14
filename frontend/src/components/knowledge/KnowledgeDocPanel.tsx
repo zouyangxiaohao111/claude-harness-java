@@ -8,6 +8,7 @@ import { KbDocDrawer } from './KbDocDrawer'
 import { KbProcessingTimeline } from './KbProcessingTimeline'
 import type { FetchSpansFn } from './KbProcessingTimeline'
 import { IconSprite } from './IconSprite'
+import { FileTypeIcon } from './FileTypeIcon'
 
 interface KnowledgeDocPanelProps {
   baseId: string
@@ -1105,7 +1106,9 @@ export function KnowledgeDocPanel({
                         </label>
                       </div>
                       <div className="cell cell-name" role="cell">
-                        <span className="row-file-icon-wrap">{meta.mark}</span>
+                        <span className="row-file-icon-wrap">
+                          <FileTypeIcon ext={row.file_type || row.file_name?.split('.').pop()} size={32} />
+                        </span>
                         {/* 源侧 .row-file-text：文件名 + meta 两行。
                             ⭐ 文件名可点 → 打开右侧详情抽屉（源侧点行即开抽屉）。 */}
                         <div className="row-file-text">
@@ -1323,7 +1326,7 @@ export function KnowledgeDocPanel({
                       <div className="card-content">
                         <div className="card-content-nav">
                           <div className="card-file-icon" title={`${meta.label} · ${formatSize(row.file_size)}`}>
-                            <span style={{ fontSize: 20, lineHeight: 1 }}>{meta.mark}</span>
+                            <FileTypeIcon ext={row.file_type || row.file_name?.split('.').pop()} size={32} />
                           </div>
                           <button
                             type="button"

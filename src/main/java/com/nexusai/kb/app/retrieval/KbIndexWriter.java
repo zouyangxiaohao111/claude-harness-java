@@ -9,6 +9,7 @@ import com.nexusai.kb.repo.mapper.KbChunkMapper;
 import com.nexusai.kb.repo.mapper.KbEmbeddingMapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
 import org.springframework.transaction.annotation.Transactional;
@@ -47,8 +48,18 @@ public class KbIndexWriter {
 
     private static final Logger log = LoggerFactory.getLogger(KbIndexWriter.class);
 
-    /** 单次 embedding 请求的块数上限（与 EmbeddingService.MAX_INPUTS 一致）。 */
+    /** 单次 embedding 请求的页大小（本类先按页切，子批 5 条由 KbEmbeddingBatchExecutor 再切）。 */
     private static final int EMBED_BATCH = 64;
+
+    /**
+     * 单条索引文本的字符上限 · 对齐源站 {@code sanitizeForEmbedding} 的 {@code safetyMaxChars = 20000}
+     * （{@code internal/application/service/retriever/keywords_vector_hybrid_indexer.go:25}）。
+     *
+     * <p>源站的做法是<b>入库前截断 + WARN</b>，不是报错：超长块（病态大块 / 整篇塞进一块）
+     * 若直接拒绝，整份文档的索引就失败了。截断只影响「这段内容的向量」，
+     * 正文与 FTS 不受影响（FTS 走另一条写入路径）。
+     */
+    private static final int MAX_INDEX_TEXT_CHARS = 20_000;
 
     /**
      * 图片文字是否已写成<b>独立子块</b>（{@code image_caption} / {@code image_ocr}）。
@@ -62,6 +73,23 @@ public class KbIndexWriter {
     @Value("${nexusai.knowledge.image.sub-chunks-enabled:true}")
     private boolean imageSubChunksEnabled =
         com.nexusai.kb.app.image.KbImageEnrichService.DEFAULT_SUB_CHUNKS_ENABLED;
+
+    /**
+     * 后台向量化并发闸（字段注入 · 不改进构造器签名，避免既有直构测试编译失败）。
+     *
+     * <p>null（非 Spring 单测 / 未装配）⇒ 直通，行为与接入前逐字相同。
+     */
+    @Autowired(required = false)
+    private KbEmbeddingConcurrencyGate embeddingGate;
+
+    /**
+     * 子批并发执行器（字段注入 · 同上：不改进构造器签名）。
+     *
+     * <p>对齐源站 {@code BatchEmbedWithPool}：文本按 5 条切子批、进程级 5 线程并发、
+     * 任一子批失败其余跳过。null（单测直构）⇒ 退回串行直调。
+     */
+    @Autowired(required = false)
+    private KbEmbeddingBatchExecutor embeddingBatchExecutor;
 
     private final KbEmbeddingMapper embeddingMapper;
     private final KbChunkMapper chunkMapper;
@@ -187,7 +215,16 @@ public class KbIndexWriter {
         for (int start = 0; start < inputs.size(); start += EMBED_BATCH) {
             int end = Math.min(start + EMBED_BATCH, inputs.size());
             List<String> batch = inputs.subList(start, end);
-            List<float[]> got = embeddingPort.embed(modelId, batch);
+            // ① 子批并发（对齐源站 batch.go）：5 条一子批、进程级 5 线程池并发、
+            //    任一子批失败其余跳过。
+            // ② 每个子批仍过每模型并发闸（对齐源站 limiter.GateNamedN）：池大小是全局粗闸，
+            //    这里按模型再兜一层；两道同时存在，与源站一致。
+            List<float[]> got;
+            if (embeddingBatchExecutor != null) {
+                got = embeddingBatchExecutor.embedInSubBatches(batch, subBatch -> callEmbed(modelId, subBatch));
+            } else {
+                got = callEmbed(modelId, batch);
+            }
             if (got == null || got.size() != batch.size()) {
                 throw new IllegalStateException(
                     "嵌入返回条数与请求不一致：请求 " + batch.size()
@@ -230,6 +267,17 @@ public class KbIndexWriter {
         log.info("[索引] 文档索引完成 knowledge={} 块数={} 模型={} 维度={}",
             knowledgeId, chunks.size(), modelId, vectors.isEmpty() ? 0 : vectors.get(0).length);
         return chunks.size();
+    }
+
+    /**
+     * 一次嵌入调用（子批或整页）：过并发闸后转调端口。
+     *
+     * <p>抽出来是为了「有池 / 无池」两条路径共用同一调用语义，避免闸只挂在其中一条上。
+     */
+    private List<float[]> callEmbed(String modelId, List<String> texts) {
+        return embeddingGate == null
+            ? embeddingPort.embed(modelId, texts)
+            : embeddingGate.call(modelId, () -> embeddingPort.embed(modelId, texts));
     }
 
     /**
@@ -370,9 +418,29 @@ public class KbIndexWriter {
         String imageText = imageSubChunksEnabled
             ? ""
             : com.nexusai.kb.app.image.KbImageEnrichService.imageTextForIndex(c.getImageInfo());
-        return embeddingInputOf(c)
+        String raw = embeddingInputOf(c)
             + imageText
             + com.nexusai.kb.app.ingest.KbGeneratedQuestions.indexText(c.getMetadata());
+        return clipIndexText(raw, c.getId());
+    }
+
+    /**
+     * 截断超长索引文本（对齐源站 {@code safetyMaxChars}）。
+     *
+     * <p>⚠️ 截断点按 UTF-16 码元算（{@code String.length()}），源站按 rune（码点）算 ——
+     * 对中文两者一致；含 emoji 时本仓会少切几个码点，只会更保守，不会超限。
+     * 哈希比对（{@link #indexTextOf} 的两处调用）走同一方法 ⇒ 截断后仍自洽。
+     */
+    private static String clipIndexText(String text, String chunkId) {
+        if (text == null) {
+            return "";
+        }
+        if (text.length() <= MAX_INDEX_TEXT_CHARS) {
+            return text;
+        }
+        log.warn("[索引] 索引文本超长已截断: chunk={} {} → {} 字符（对齐源站 safetyMaxChars）",
+            chunkId, text.length(), MAX_INDEX_TEXT_CHARS);
+        return text.substring(0, MAX_INDEX_TEXT_CHARS);
     }
 
     private void writeFts(List<KbChunkRecord> chunks) {

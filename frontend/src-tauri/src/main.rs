@@ -16,7 +16,10 @@ mod frontlog;
 
 /// 本会话由 Tauri 壳自启的后端 java 进程 pid。
 /// None = 启动时 3458 已有外部后端在跑（复用）或尚未自启 —— 此时关窗不回收外部进程。
-struct BackendState(std::sync::Mutex<Option<u32>>);
+///
+/// ⛔ 可见性放宽到 `pub(crate)`：`updater::update_install` 要读它取后端 pid ——
+///    jar 被 java 占着时覆盖安装必然失败（2026-11-14 用户实测「静默装了没生效」）。
+pub(crate) struct BackendState(std::sync::Mutex<Option<u32>>);
 
 /// 「点关闭按钮 → 只隐藏到托盘」的开关。
 ///

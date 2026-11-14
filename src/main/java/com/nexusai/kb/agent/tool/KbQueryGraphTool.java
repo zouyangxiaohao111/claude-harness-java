@@ -50,6 +50,7 @@ public class KbQueryGraphTool implements Tool {
     private static final int MAX_KB_IDS = 10;
 
     @Autowired private KbGraphSearchService graphSearchService;
+    @Autowired private KbHandleResolver handleResolver;
 
     @Autowired(required = false)
     private KbAgentToolScope scope;
@@ -77,6 +78,7 @@ public class KbQueryGraphTool implements Tool {
         kbIds.put("type", "array");
         kbIds.put("description",
             "要查询的知识库 id 列表（最多 " + MAX_KB_IDS + " 个）。"
+                + "可传 kb:// 句柄或完整 id。"
                 + "省略时查本智能体被授权的全部知识库。");
         ObjectNode items = JSON.objectNode();
         items.put("type", "string");
@@ -100,8 +102,19 @@ public class KbQueryGraphTool implements Tool {
         try {
             JsonNode in = call.input();
             String query = in.path("query").asText("").trim();
-            List<String> requested = KbSearchKnowledgeTool.readStringArray(
-                in, "knowledge_base_ids", MAX_KB_IDS);
+            // ⭐ 句柄 kb://xxxx → 全 id；无效 / 多命中 ⇒ 明确报错，让模型改正再试。
+            List<String> requested = new java.util.ArrayList<>();
+            try {
+                for (String raw : KbSearchKnowledgeTool.readStringArray(
+                        in, "knowledge_base_ids", MAX_KB_IDS)) {
+                    String id = handleResolver.resolveKnowledgeBase(raw);
+                    if (!requested.contains(id)) {
+                        requested.add(id);
+                    }
+                }
+            } catch (com.nexusai.kb.app.parser.KbParseException e) {
+                return ToolResult.error(call.id(), e.getMessage());
+            }
 
             List<String> allowed = scope == null ? null : scope.allowedKnowledgeBaseIds(ctx);
             if (allowed != null && allowed.isEmpty()) {

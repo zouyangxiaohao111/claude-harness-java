@@ -444,6 +444,7 @@ class ExecAgentHookSemanticsTest {
             null, null, null, null, null, null, null, null,
             null, /* extraBody（V104） */
             null, null, /* embeddingDimensions / embeddingBatchSize（V200） */
+            null, /* maxConcurrency（V291） */
             null, null, /* rerankTopN / rerankInstruct（V200） */
             "p1", "provider-1" /* providerId / providerName（2026-11-11 模型下拉分组） */);
         ProviderDto provider = new ProviderDto("p1", "provider-1", ProviderType.openai_compatible,

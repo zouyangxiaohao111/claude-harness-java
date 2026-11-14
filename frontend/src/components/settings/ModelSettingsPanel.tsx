@@ -1,4 +1,5 @@
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
+import { settingsApi } from '@/api/settings'
 import type { AppSettings, ModelTierRole, Provider } from '@/api/types'
 import { tagToClass } from '@/data'
 import { Icon } from '@/icons'
@@ -92,6 +93,37 @@ export function ModelSettingsPanel({ providers, settings, onBindTier, onBindAllT
   const [confirmClearAll, setConfirmClearAll] = useState(false)
   const [applyAllFor, setApplyAllFor] = useState<string | null>(null)
   const [pending, setPending] = useState(false)
+
+  // ── 后台向量化并发（对齐源站系统设置 model.max_concurrency）──
+  //   与档位绑定分开存：这是 settings 单例上的一个数字列，不走「档位 → 模型」那套。
+  const [concDraft, setConcDraft] = useState<string>(
+    settings?.modelMaxConcurrency == null ? '' : String(settings.modelMaxConcurrency),
+  )
+  const [concSaving, setConcSaving] = useState(false)
+  const [concMsg, setConcMsg] = useState('')
+  useEffect(() => {
+    setConcDraft(settings?.modelMaxConcurrency == null ? '' : String(settings.modelMaxConcurrency))
+  }, [settings?.modelMaxConcurrency])
+
+  const saveConc = async () => {
+    const raw = concDraft.trim()
+    const value = raw === '' ? 0 : Number(raw)
+    if (!Number.isFinite(value) || value < 0 || value > 4096) {
+      setConcMsg('请输入 0~4096 的数字')
+      return
+    }
+    setConcSaving(true)
+    setConcMsg('')
+    try {
+      // PATCH 语义：只带这一个字段，其余字段不传 => 后端不改
+      await settingsApi.update({ modelMaxConcurrency: value })
+      setConcMsg('已保存（实时生效）')
+    } catch (e) {
+      setConcMsg('保存失败: ' + (e instanceof Error ? e.message : String(e)))
+    } finally {
+      setConcSaving(false)
+    }
+  }
 
   const currentTier = TIERS.find((t) => t.role === role)!
 
@@ -199,6 +231,32 @@ export function ModelSettingsPanel({ providers, settings, onBindTier, onBindAllT
             一键清除全部
           </button>
         )}
+      </div>
+
+      {/* 后台向量化并发 · 对齐源站「系统设置 → model.max_concurrency」 */}
+      <div style={{
+        display: 'flex', alignItems: 'center', flexWrap: 'wrap', gap: 8,
+        padding: '8px 12px', marginBottom: 10,
+        border: '1px solid #e3e6ea', borderRadius: 8, background: '#fafbfc',
+      }}>
+        <span style={{ fontSize: 12, fontWeight: 600, color: '#1f2329' }}>后台向量化并发</span>
+        <input
+          type="number" min={0} max={4096}
+          value={concDraft}
+          onChange={(e) => setConcDraft(e.target.value)}
+          placeholder="32"
+          style={{ width: 84, height: 26, padding: '0 6px', border: '1px solid #dcdfe6', borderRadius: 4, fontSize: 12 }}
+        />
+        <button
+          type="button"
+          disabled={concSaving}
+          onClick={() => void saveConc()}
+          style={{ height: 26, padding: '0 10px', border: '1px solid #dcdfe6', borderRadius: 4, background: '#fff', fontSize: 12, cursor: concSaving ? 'default' : 'pointer' }}
+        >{concSaving ? '保存中…' : '保存'}</button>
+        <span style={{ fontSize: 11, color: '#909399' }}>
+          文档入库 / 图片向量化对同一模型的默认并发上限 · 留空或 0 = 32 · 不影响交互式问答
+        </span>
+        {concMsg && <span style={{ fontSize: 11, color: '#0e8a4a' }}>{concMsg}</span>}
       </div>
 
       <div className="ms-split">

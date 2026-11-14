@@ -298,7 +298,8 @@ export function KbQaPanel({ baseId, baseName, bases, showToast }: KbQaPanelProps
               onClick={() => toggleScope(b.id)}
               title={b.description || b.name}
             >
-              ▤ {b.name}
+              <svg width={12} height={12} viewBox="0 0 20 20" aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }}><use href="#t-icon-kb-resource" /></svg>
+              {b.name}
             </button>
           ))}
         </div>

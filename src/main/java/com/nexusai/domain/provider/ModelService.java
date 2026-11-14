@@ -108,6 +108,7 @@ public class ModelService {
         // [V200] 向量嵌入配置（仅 type=embedding 有意义；null = 用服务端默认）
         m.setEmbeddingDimensions(req.embeddingDimensions());
         m.setEmbeddingBatchSize(req.embeddingBatchSize());
+        m.setMaxConcurrency(req.maxConcurrency());
         m.setRerankTopN(req.rerankTopN());
         m.setRerankInstruct(req.rerankInstruct());
         m.setEnabled(req.enabled() == null ? Boolean.TRUE : req.enabled());
@@ -148,6 +149,7 @@ public class ModelService {
         // [V200] PATCH 语义：null 不改
         if (req.embeddingDimensions() != null) m.setEmbeddingDimensions(req.embeddingDimensions());
         if (req.embeddingBatchSize() != null) m.setEmbeddingBatchSize(req.embeddingBatchSize());
+        if (req.maxConcurrency() != null) m.setMaxConcurrency(req.maxConcurrency());
         if (req.rerankTopN() != null) m.setRerankTopN(req.rerankTopN());
         if (req.rerankInstruct() != null) m.setRerankInstruct(req.rerankInstruct());
         if (req.enabled() != null) {
@@ -305,6 +307,7 @@ public class ModelService {
             // [V200] 向量嵌入 + 重排配置
             m.getEmbeddingDimensions(),
             m.getEmbeddingBatchSize(),
+            m.getMaxConcurrency(),
             m.getRerankTopN(),
             m.getRerankInstruct(),
             // ⭐ 2026-11-11 用户裁定：模型下拉要显示 `provider/modelName` ⇒ 必须带上提供商。
@@ -336,7 +339,7 @@ public class ModelService {
             base.cacheReadPricePeak(), base.cacheReadPriceOffpeak(),
             base.cacheWritePricePeak(), base.cacheWritePriceOffpeak(),
             base.extraBody(), base.embeddingDimensions(), base.embeddingBatchSize(),
-            base.rerankTopN(), base.rerankInstruct(),
+            base.maxConcurrency(), base.rerankTopN(), base.rerankInstruct(),
             base.providerId(), name);
     }
 

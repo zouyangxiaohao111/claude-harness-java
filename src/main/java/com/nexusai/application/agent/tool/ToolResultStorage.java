@@ -639,7 +639,7 @@ public final class ToolResultStorage {
     private static boolean isEligibleToolResultCandidate(ChatMessageDto m) {
         return m.toolCallId() != null && m.content() != null
             && !m.content().startsWith(ToolResultStorage.PERSISTED_OUTPUT_TAG)
-            && !hasImageBlock(m.contentBlocks());
+            && !isImageBearingToolResult(m);
     }
 
     /**
@@ -671,9 +671,56 @@ public final class ToolResultStorage {
         return false;
     }
 
+    /** 预算度量里「含图片的 tool 结果」按此固定大小计 · 对齐 CC {@code OHr} 的 {@code MHr=2000}。 */
+    public static final int IMAGE_RESULT_BUDGET_CHARS = 2000;
+
+    /** JSON 形态的 image 标记（Jackson 序列化无空格，这里兼容带空格写法）。 */
+    private static final java.util.regex.Pattern IMAGE_JSON_MARKER =
+        java.util.regex.Pattern.compile("\"type\"\\s*:\\s*\"image\"");
+
+    /**
+     * tool 结果是否含图片 · <b>双通道</b>判定（对齐 CC {@code jAs}/{@code oqe} 的意图）。
+     *
+     * <p><b>Why 两条通道</b>（2026-11-14 线上缺陷 sess-a4a11222）：CC 的 tool_result 是 user 消息
+     * content 数组里的块，图片天然在 {@code content} 里，一个 {@code content.some(b=>b.type==='image')}
+     * 就够；本仓把 tool_result 扁平化成 {@code Role.tool} 消息，图片有两种落法：
+     * <ul>
+     *   <li><b>块数组路径</b>（原生 Tool，如 {@code ComputerUseScreenshotTool}）→ 在
+     *       {@link ChatMessageDto#contentBlocks()}；</li>
+     *   <li><b>文本载荷路径</b>（MCP 结果被序列化成 JSON 字符串）→ 图片以
+     *       {@code "type":"image"} 形式嵌在 {@link ChatMessageDto#content()}。</li>
+     * </ul>
+     * ⇒ 只看 {@code contentBlocks} 会漏掉第二类，截图被当成 98KB 大文本替换成
+     * {@code <persisted-output>} 指针，模型再也看不到屏幕。
+     *
+     * @param m tool 结果消息（可 null）
+     * @return 含图片 → true
+     */
+    public static boolean isImageBearingToolResult(ChatMessageDto m) {
+        if (m == null) return false;
+        if (hasImageBlock(m.contentBlocks())) return true;
+        String content = m.content();
+        return content != null && content.length() >= 12
+            && IMAGE_JSON_MARKER.matcher(content).find();
+    }
+
+    /**
+     * 预算度量用的大小 · 含图片的结果按 {@link #IMAGE_RESULT_BUDGET_CHARS} 计（对齐 CC {@code OHr}
+     * 的 {@code r.type==="image" → MHr}）。
+     *
+     * <p>WHY：图片的真实载荷是 base64（一张截图 ~100KB），按字符数计入总预算会立刻把整轮顶爆；
+     * CC 只给它记 2000 字符，所以截图永远进不了「最大结果」候选。
+     *
+     * @param m 消息（可 null）
+     * @return 参与预算的字符数
+     */
+    public static int budgetSizeOf(ChatMessageDto m) {
+        if (m == null || m.content() == null) return 0;
+        return isImageBearingToolResult(m) ? IMAGE_RESULT_BUDGET_CHARS : m.content().length();
+    }
+
     /** flush 当前组（对齐 CC collectCandidatesByMessage 的 {@code flush()}，:606-609）。 */
-    private static void flush(List<ChatMessageDto> current, List<List<ChatMessageDto>> groups) {
-        if (!current.isEmpty()) {
+    private static void flush(List<ChatMessageDto> current, List<List<ChatMessageDto>> groups) {        if (!current.isEmpty()) {
             groups.add(new ArrayList<>(current));
             current.clear();
         }

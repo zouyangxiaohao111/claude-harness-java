@@ -743,7 +743,7 @@ public record AgentLoopContext(
         int totalSize = 0;
         for (java.util.List<ChatMessageDto> group : groups) {
             for (ChatMessageDto m : group) {
-                if (m.content() != null) totalSize += m.content().length();
+                totalSize += com.nexusai.application.agent.tool.ToolResultStorage.budgetSizeOf(m);
             }
         }
         if (totalSize <= limit) return messagesForQuery;
@@ -856,11 +856,11 @@ public record AgentLoopContext(
         return replaceToolResultContents(messagesForQuery, replacementMap);
     }
 
-    /** 计算 messages 的 content length 总和（null-safe） */
+    /** 计算 messages 的 content length 总和（null-safe）· 含图片的结果按 2000 计（对齐 CC OHr） */
     private static int sumSize(java.util.List<ChatMessageDto> messages) {
         int total = 0;
         for (ChatMessageDto m : messages) {
-            if (m.content() != null) total += m.content().length();
+            total += com.nexusai.application.agent.tool.ToolResultStorage.budgetSizeOf(m);
         }
         return total;
     }

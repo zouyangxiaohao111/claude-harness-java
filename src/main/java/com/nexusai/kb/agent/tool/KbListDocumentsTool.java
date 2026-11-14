@@ -47,6 +47,7 @@ public class KbListDocumentsTool implements Tool {
     static final int MAX_PAGE_SIZE = 100;
 
     @Autowired private KnowledgeService knowledgeService;
+    @Autowired private KbHandleResolver handleResolver;
 
     @Autowired(required = false)
     private KbAgentToolScope scope;
@@ -72,7 +73,7 @@ public class KbListDocumentsTool implements Tool {
 
         ObjectNode kbId = JSON.objectNode();
         kbId.put("type", "string");
-        kbId.put("description", "知识库 id（必填）");
+        kbId.put("description", "知识库 id（必填，可传 kb:// 句柄或完整 id）");
         props.set("knowledge_base_id", kbId);
 
         ObjectNode keyword = JSON.objectNode();
@@ -109,10 +110,18 @@ public class KbListDocumentsTool implements Tool {
     public AgentToolResult<?> execute(ToolUseBlock call, ToolUseContext ctx) {
         try {
             JsonNode in = call.input();
-            String kbId = in.path("knowledge_base_id").asText("").trim();
-            if (kbId.isEmpty()) {
+            String rawKbId = in.path("knowledge_base_id").asText("").trim();
+            if (rawKbId.isEmpty()) {
                 return ToolResult.error(call.id(),
                     "knowledge_base_id 不能为空（先用 search_knowledge 或不带过滤的方式确定库 id）");
+            }
+            // ⭐ 句柄 kb://xxxx → 全 id。必须在作用域校验**之前**解析：
+            //   授权白名单里存的是全 id，拿句柄去比会误判「越权」。
+            String kbId;
+            try {
+                kbId = handleResolver.resolveKnowledgeBase(rawKbId);
+            } catch (com.nexusai.kb.app.parser.KbParseException e) {
+                return ToolResult.error(call.id(), e.getMessage());
             }
 
             // ── 作用域校验：⛔ 不能只信模型传进来的 kbId ──────────────────────

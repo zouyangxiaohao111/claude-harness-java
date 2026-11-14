@@ -69,6 +69,7 @@ public class KbReadDocumentTool implements Tool {
     private static final String CHUNK_PREFIX = "chunk://";
 
     @Autowired private KbChunkService chunkService;
+    @Autowired private KbHandleResolver handleResolver;
 
     @Autowired(required = false)
     private KbAgentToolScope scope;
@@ -97,7 +98,8 @@ public class KbReadDocumentTool implements Tool {
         ObjectNode id = JSON.objectNode();
         id.put("type", "string");
         id.put("description",
-            "文档或分块的引用。doc://N 读整篇文档（N 为 knowledge_id）；"
+            "文档或分块的引用。doc://N 读整篇文档（N 为 knowledge_id 或其前 8 位稳定句柄，"
+                + "如 doc://77a74fe1）；"
                 + "chunk://N 读单个分块（N 为 chunk_id）。");
         props.set("id", id);
 
@@ -164,18 +166,27 @@ public class KbReadDocumentTool implements Tool {
             if (rawId.startsWith(CHUNK_PREFIX)) {
                 return readChunk(call, rawId.substring(CHUNK_PREFIX.length()).trim(), context, ctx);
             }
-            if (rawId.startsWith(DOC_PREFIX)) {
-                String knowledgeId = rawId.substring(DOC_PREFIX.length()).trim();
-                if (knowledgeId.isEmpty()) {
-                    return ToolResult.error(call.id(), "doc:// 后面缺少 knowledge_id");
-                }
-                int offset = Math.max(0, in.path("offset").asInt(0));
-                return readDoc(call, knowledgeId, offset, limit, query, regex, ctx);
+            // ⭐ 文档 id 先过句柄解析（doc://xxxx）：无效 / 多命中 ⇒ 明确报错，让模型改正再试。
+            //   ⛔ 不能 catch 后继续用原值 —— 那会把「写错句柄」变成「文档没有可用分块」，
+            //   模型会以为文档是空的（防幻觉的核心价值就在这里）。
+            String rawDocId = rawId.startsWith(DOC_PREFIX)
+                ? rawId.substring(DOC_PREFIX.length()).trim()
+                : rawId;
+            if (rawDocId.isEmpty()) {
+                return ToolResult.error(call.id(), "doc:// 后面缺少 knowledge_id");
             }
-            // 容错：没带前缀但看起来像 knowledge_id（历史调用 / 模型简化）
-            log.warn("[read_document] id 缺少 doc:// 或 chunk:// 前缀，按文档处理 id={}", rawId);
+            if (!rawId.startsWith(DOC_PREFIX)) {
+                // 容错：没带前缀但看起来像 knowledge_id（历史调用 / 模型简化）
+                log.warn("[read_document] id 缺少 doc:// 或 chunk:// 前缀，按文档处理 id={}", rawId);
+            }
+            String knowledgeId;
+            try {
+                knowledgeId = handleResolver.resolveDocument(rawDocId);
+            } catch (com.nexusai.kb.app.parser.KbParseException e) {
+                return ToolResult.error(call.id(), e.getMessage());
+            }
             int offset = Math.max(0, in.path("offset").asInt(0));
-            return readDoc(call, rawId, offset, limit, query, regex, ctx);
+            return readDoc(call, knowledgeId, offset, limit, query, regex, ctx);
         } catch (RuntimeException e) {
             log.error("[read_document] 执行失败", e);
             return ToolResult.error(call.id(), "读取失败：" + e.getMessage());

@@ -10,6 +10,19 @@ import {
 } from './kbParserGroups'
 import type { Model } from '@/api/types'
 import { IconSprite } from './IconSprite'
+import {
+  CHUNK_STRATEGIES,
+  CHUNK_SIZE_MARKS,
+  CHUNK_OVERLAP_MARKS,
+  PARENT_CHUNK_SIZE_MARKS,
+  CHILD_CHUNK_SIZE_MARKS,
+  SEPARATOR_OPTIONS,
+  LANGUAGE_OPTIONS,
+  Row,
+  Slider,
+  Switch,
+  TagInput,
+} from './KbSettingsModal'
 
 export interface KbCreateSubmit {
   name: string
@@ -18,6 +31,17 @@ export interface KbCreateSubmit {
   embeddingModelId: string | null
   chunkSize: number
   chunkOverlap: number
+  /**
+   * 分块配置 JSON（`chunking_config`，**已序列化**）。
+   *
+   * <p>后端 {@code KbChunkingConfigParser} 认的键名：
+   * {@code chunk_size / chunk_overlap / split_markers / strategy /
+   * enable_parent_child / parent_chunk_size / child_chunk_size / token_limit / languages}。
+   * ⛔ 不传这个字段时后端用 DB 默认值 —— 用户改了滑块也会被静默丢弃（改造前的真实状态）。
+   *
+   * <p>FAQ 型知识库没有分块流水线 ⇒ 传 null。
+   */
+  chunkingConfig?: string | null
   /**
    * 索引策略 —— RAG / Wiki / 图谱三个开关（对齐源码
    * `KnowledgeBaseEditorModal.vue:1690-1694` 的 `data.indexing_strategy`）。
@@ -54,6 +78,39 @@ export interface KbCreateSubmit {
   imageCaptionEnabled?: boolean
   imageOcrEnabled?: boolean
   imagePipeline?: 'default' | 'smartocr'
+  /**
+   * Wiki 专属可调项 JSON（`wiki_config`，**已序列化**）。
+   *
+   * <p>⭐ Wiki 的**开关**不在这里（见 {@link indexingStrategy.wiki_enabled}），
+   * 这里只放源站 `wiki_config` 的五个键：`auto_generate` / `synthesis_model_id` /
+   * `max_pages_per_ingest` / `extraction_granularity` / `content_instructions` /
+   * `extraction_instructions`（`KnowledgeBaseEditorModal.vue:1677-1686`）。
+   *
+   * <p>FAQ 型没有 Wiki 流水线 ⇒ 传 null。
+   */
+  wikiConfig?: string | null
+  /**
+   * 图片处理配置 JSON（`image_processing_config`，**已序列化**）。
+   *
+   * <p>本仓后端从这段 JSON 读两项：`enable_multimodal` ∧ `model_id`（`KbPostProcessConfig`）。
+   * 源站其余键（`description_language` / `custom_instructions` / `enable_image_vector`）
+   * 一并落库，供图片理解链路后续消费。
+   */
+  imageProcessingConfig?: string | null
+  /** ASR 配置 JSON（`asr_config`，**已序列化**）：`{enabled, model_id, language}`。 */
+  asrConfig?: string | null
+  /** 问题生成配置 JSON（`question_generation_config`，**已序列化**）。 */
+  questionGenerationConfig?: string | null
+  /** 自动打标配置 JSON（`auto_tag_config`，**已序列化**）。 */
+  autoTagConfig?: string | null
+  /** 知识库画像配置 JSON（`profile_config`，**已序列化**）。 */
+  profileConfig?: string | null
+  /** FAQ 配置 JSON（`faq_config`，**已序列化**）：`{index_mode, question_index_mode}`。 */
+  faqConfig?: string | null
+  /** 绑定的向量库实例 ID（`vector_store_id`）；null/空 = 系统默认。 */
+  vectorStoreId?: string | null
+  /** 绑定的存储实例 ID（`storage_backend_id`）；null/空 = 租户默认。 */
+  storageBackendId?: string | null
 }
 
 interface Props {
@@ -79,7 +136,155 @@ const SECTION_HEADER_FLAT = {
   borderBottom: 'none',
 } as const
 
+/**
+ * 模型可选类型（对齐本仓 `Model.type`）。
+ *
+ * <p>源站用 `KnowledgeQA` / `VLLM` / `ASR` 三种模型类型；本仓 `/api/v1/models`
+ * 的枚举是 `chat|multimodal|embedding|...`，因此按语义等价映射：
+ * 文本生成 = `chat + multimodal`；视觉 = `multimodal`；语音识别 = `asr`（兼容旧 `audio`）。
+ */
+const CHAT_MODEL_TYPES = ['chat', 'multimodal'] as const
+const VISION_MODEL_TYPES = ['multimodal', 'vision'] as const
+const ASR_MODEL_TYPES = ['asr', 'audio'] as const
 
+/** Wiki 抽取粒度三档（文案/提示照抄 `knowledgeEditor.wiki.granularity*`）。 */
+const WIKI_GRANULARITY_OPTIONS = [
+  { value: 'focused', label: '聚焦', hint: '只抽取文档的主角（如简历 → 人物和项目）。最干净，但可能漏掉次要实体。' },
+  { value: 'standard', label: '标准', hint: '抽取主角 + 被详细描述的次要实体/概念。跳过一带而过的通用名词。适合大多数场景。' },
+  { value: 'exhaustive', label: '详尽', hint: '抽取所有可识别的命名实体与概念，包括一带而过的技术栈。适合将知识库当作术语表使用。' },
+] as const
+
+/**
+ * 模型下拉（同 `KbSettingsModal` 内部 `ModelSelect` 的实现口径：显示全名、存 `models.id`）。
+ *
+ * <p>⛔ 不复用 `KbSettingsModal` 的私有组件（未导出）；控件 DOM 与它逐字一致，
+ * 避免两处下拉外观/取值语义漂移。
+ */
+function ModelSelect({ value, models, types, placeholder, onChange }: {
+  value: string
+  models: Model[]
+  types: readonly string[]
+  placeholder: string
+  onChange: (v: string) => void
+}) {
+  const options = models.filter((m) => types.includes(m.type))
+  const fullNameOf = (m: Model) => (m.providerName ? `${m.providerName}/${m.name}` : m.name)
+  const groups = new Map<string, Model[]>()
+  for (const m of options) {
+    const key = m.providerName || '其他'
+    const arr = groups.get(key)
+    if (arr) arr.push(m)
+    else groups.set(key, [m])
+  }
+  const groupEntries = [...groups.entries()]
+    .sort((a, b) => a[0].localeCompare(b[0], 'zh-CN'))
+    .map(([name, list]) => [name, [...list].sort((a, b) => a.name.localeCompare(b.name))] as const)
+  const orphan = value !== '' && !options.some((m) => m.id === value)
+  return (
+    <div className="t-select__wrap" style={{ width: 280 }}>
+      <select
+        className="t-input__inner"
+        style={{ width: '100%', height: 32 }}
+        value={value}
+        onChange={(e) => onChange(e.target.value)}
+      >
+        <option value="">{placeholder}</option>
+        {groupEntries.map(([providerName, list]) => (
+          <optgroup key={providerName} label={providerName}>
+            {list.map((m) => (
+              <option key={m.id} value={m.id}>{fullNameOf(m)}</option>
+            ))}
+          </optgroup>
+        ))}
+        {orphan && <option value={value}>{value}（已失效）</option>}
+      </select>
+    </div>
+  )
+}
+
+/**
+ * 可自由输入的标签多选（对齐源站 `t-select multiple creatable`）。
+ *
+ * <p>⛔ 不用 `KbSettingsModal` 导出的 `TagInput`：它只能从固定选项里挑，
+ * 而图谱「关系类型」必须允许用户输入自定义标签（源站 `creatable`）。
+ */
+function FreeTagInput({ value, placeholder, onChange }: {
+  value: string[]
+  placeholder: string
+  onChange: (v: string[]) => void
+}) {
+  const [draft, setDraft] = useState('')
+  const add = () => {
+    const v = draft.trim()
+    if (!v) return
+    if (!value.includes(v)) onChange([...value, v])
+    setDraft('')
+  }
+  return (
+    <div className="t-tag-input t-tag-input--break-line" style={{ width: 280 }}>
+      <div
+        className="t-input__wrap"
+        style={{ display: 'flex', flexWrap: 'wrap', gap: 4, alignItems: 'center', padding: 4, minHeight: 32 }}
+      >
+        {value.map((v) => (
+          <span key={v} className="t-tag t-tag--default t-tag--light t-size-s" style={{ display: 'inline-flex', alignItems: 'center', gap: 4 }}>
+            <span className="t-tag__text">{v}</span>
+            <span
+              role="button"
+              tabIndex={0}
+              aria-label={`移除 ${v}`}
+              style={{ cursor: 'pointer', lineHeight: 1 }}
+              onClick={() => onChange(value.filter((x) => x !== v))}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter' || e.key === ' ') {
+                  e.preventDefault()
+                  onChange(value.filter((x) => x !== v))
+                }
+              }}
+            >
+              ×
+            </span>
+          </span>
+        ))}
+        <input
+          className="t-input__inner"
+          style={{ flex: 1, minWidth: 100, height: 24, border: 'none', background: 'transparent' }}
+          value={draft}
+          placeholder={value.length ? '＋ 添加' : placeholder}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => { if (e.key === 'Enter') { e.preventDefault(); add() } }}
+          onBlur={add}
+        />
+      </div>
+    </div>
+  )
+}
+
+/** 数字输入（源站 `t-input-number`，min/max clamp）。 */
+function NumberInput({ value, min, max, onChange }: {
+  value: number
+  min: number
+  max: number
+  onChange: (v: number) => void
+}) {
+  return (
+    <div className="t-input-number t-size-m t-input-number--normal">
+      <input
+        type="number"
+        className="t-input__inner"
+        style={{ width: 120, height: 32 }}
+        min={min}
+        max={max}
+        value={value}
+        onChange={(e) => {
+          const n = Number(e.target.value)
+          if (!Number.isFinite(n)) return
+          onChange(Math.min(max, Math.max(min, Math.trunc(n))))
+        }}
+      />
+    </div>
+  )
+}
 
 /**
  * 「新建知识库」配置弹窗 · 逐项对齐源侧真机
@@ -107,11 +312,13 @@ const SECTION_HEADER_FLAT = {
  *
  * <h2>⚠️ 与源侧的差异（本仓后端不具备的，如实收窄而非画空壳）</h2>
  * <ul>
- *   <li>「向量存储 / 解析引擎 / 图像处理 / 音频处理 / 知识图谱 / 高级设置 / 存储引擎」
- *       这些分组本仓有独立配置页（知识库设置里），**创建时不暴露** ——
- *       画了也没后端字段可写，属于假开关。只保留真正写进 `CreateKnowledgeBaseRequest` 的四节。</li>
  *   <li>知识库类型只有 `文档` / `问答`（后端 `type` 枚举），源侧的 `Wiki` 是本仓的索引策略。</li>
- *   <li>「Wiki 索引」勾选在本仓对应 `type=wiki`，但创建接口暂不支持 ⇒ 灰置 + 提示。</li>
+ *   <li>Wiki / 向量存储 / 解析引擎 / 图像 / 音频 / 图谱 / 高级设置 / 存储引擎
+ *       本批均已接进 `CreateKnowledgeBaseRequest` 的新增字段，控件真写入。</li>
+ *   <li>源站的图片属性观察面板（`ImagePipelineSettings` + `/image-attrs/schema`）
+ *       本仓无注册表接口 ⇒ 不画；图片管线只保留后端真有的 `default` / `smartocr` 下拉。</li>
+ *   <li>「AI 生成描述」卡片在源站是**编辑态**动作（需要知识库 ID + 已解析文档）
+ *       ⇒ 创建态只放说明，不放按钮。</li>
  * </ul>
  */
 export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) {
@@ -123,6 +330,28 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
   const [wiki, setWiki] = useState(false)
   const [chunkSize, setChunkSize] = useState(512)
   const [chunkOverlap, setChunkOverlap] = useState(80)
+  /**
+   * 分块设置其余 7 项（与设置弹窗同一组）。默认值对齐源站：
+   * 策略空 = 按长度切分；分隔符 = 段落 → 句子 → 标点；父子关闭、父 4096 / 子 384；
+   * token 上限 0 = 关闭；语言空 = 自动检测。
+   */
+  const [chunk, setChunk] = useState<{
+    strategy: string
+    separators: string[]
+    enableParentChild: boolean
+    parentChunkSize: number
+    childChunkSize: number
+    tokenLimit: number
+    languages: string[]
+  }>({
+    strategy: '',
+    separators: ['\n\n', '\n', '。'],
+    enableParentChild: false,
+    parentChunkSize: 4096,
+    childChunkSize: 384,
+    tokenLimit: 0,
+    languages: [],
+  })
   /** 设计稿 01 页 create-modal 里存在、但本仓**创建接口写不进去**的字段。
    *  ⚠️ 只在本弹窗内维护（点了会记录 + 提示「创建后可配置」），⛔ 不进提交载荷。 */
   const [summaryModel, setSummaryModel] = useState('')
@@ -140,8 +369,43 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
    * 早先版本写成了 `<input>`（可自由输入），与设计稿不符 —— 已按设计稿改回下拉。
    */
   const [models, setModels] = useState<Model[]>([])
+
+  /**
+   * Wiki 专属配置（源站 `knowledgeEditor.wiki` 四项 + 合成模型已在「模型配置」节）。
+   *
+   * <p>⭐ 只在 `wiki` 勾选时显示（源码 `:84/:91/:112/:130` 全是
+   * `v-if="!isFAQ && formData.indexingStrategy.wikiEnabled"`）。
+   */
+  const [wikiCfg, setWikiCfg] = useState<{
+    autoGenerate: boolean
+    granularity: 'focused' | 'standard' | 'exhaustive'
+    contentInstructions: string
+    extractionInstructions: string
+  }>({ autoGenerate: true, granularity: 'standard', contentInstructions: '', extractionInstructions: '' })
+
+  /** 向量库实例（`GET /api/v1/vector-stores`）：空值 = 系统默认。 */
+  const [vectorStores, setVectorStores] = useState<Array<{ id: string; name: string; engine_type?: string }>>([])
+  const [vectorStoreId, setVectorStoreId] = useState('')
+  /** 存储后端实例（`GET /api/v1/storage-backends`）：空值 = 租户默认。 */
+  const [storageBackends, setStorageBackends] = useState<Array<{ id: string; name: string; provider: string; is_default?: boolean }>>([])
+  const [storageBackendId, setStorageBackendId] = useState('')
+
+  /** 图像处理（源站 multimodal 节，`v-if` 都挂在「多模态开关」上）。 */
   const [vlm, setVlm] = useState(false)
+  const [vlmModelId, setVlmModelId] = useState('')
+  const [imageDescLanguage, setImageDescLanguage] = useState('')
+  const [imageInstructions, setImageInstructions] = useState('')
+  const [imageVector, setImageVector] = useState(false)
+  /**
+   * 图片管线 —— **顶层列** `image_pipeline`（本仓后端真消费：`KbImageSettings`）。
+   * ⚠️ 与 `image_processing_config.image_pipeline`（旧键、`""`/`"attrs"`、零消费者）同名不同义。
+   */
+  const [imagePipeline, setImagePipeline] = useState<'default' | 'smartocr'>('default')
+
+  /** 音频（ASR）。 */
   const [asr, setAsr] = useState(false)
+  const [asrModelId, setAsrModelId] = useState('')
+
   /**
    * 知识图谱开关 —— **一处状态、两处入口**。
    *
@@ -151,14 +415,40 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
    * —— 后端判据是这两者的合取（见 `KbPostProcessConfig.graphEnabled`）。
    */
   const [graph, setGraph] = useState(false)
-  const [qgen, setQgen] = useState(false)
-  const [autotag, setAutotag] = useState(false)
-  const [faqSimilar, setFaqSimilar] = useState(true)
-  const [faqNegative, setFaqNegative] = useState(true)
+  /** 图谱抽取配置（源站 `GraphSettings.vue`；写进 `extract_config`）。 */
+  const [graphInstructions, setGraphInstructions] = useState('')
+  const [graphTags, setGraphTags] = useState<string[]>([])
+  const [graphText, setGraphText] = useState('')
+  const [graphNodes, setGraphNodes] = useState<Array<{ name: string; attributes: string[] }>>([])
 
-  /** 创建时不支持写入的字段，点了如实说明（⛔ 不假装生效）。 */
-  const notWiredInCreate = (what: string) =>
-    showToast(`${what}：创建接口不支持写入，创建后可在该库的 ⚙ 设置里配置`, 'info')
+  /** 高级设置 · AI 问题生成 4 项。 */
+  const [qgen, setQgen] = useState(false)
+  const [qgenModelId, setQgenModelId] = useState('')
+  const [qgenCount, setQgenCount] = useState(3)
+  const [qgenInstructions, setQgenInstructions] = useState('')
+  /** 高级设置 · 自动关联标签 4 项。 */
+  const [autotag, setAutotag] = useState(false)
+  const [autotagModelId, setAutotagModelId] = useState('')
+  const [autotagMaxTags, setAutotagMaxTags] = useState(3)
+  const [autotagSkipIfTagged, setAutotagSkipIfTagged] = useState(true)
+  /** 高级设置 · 自动生成知识库描述 3 项。 */
+  const [profileEnabled, setProfileEnabled] = useState(false)
+  const [profileModelId, setProfileModelId] = useState('')
+  const [profileInstructions, setProfileInstructions] = useState('')
+  /** 高级设置 · 表格元数据要求（写进 `chunking_config.table_metadata_instructions`）。 */
+  const [tableMetadataInstructions, setTableMetadataInstructions] = useState('')
+
+  /** FAQ 索引方式（源站 `knowledgeEditor.faq` 两组单选）。 */
+  const [faqIndexMode, setFaqIndexMode] = useState<'question_only' | 'question_answer'>('question_only')
+  /**
+   * 问题索引方式 · 默认 `combined`（`separate` 后端零消费者）。
+   *
+   * <p>⚠️ 与「知识库设置」弹窗同一事实：`question_index_mode` 在 backend 没有实现
+   * （设置弹窗 `KbSettingsModal` 的 FAQ 节已如实标注「本仓暂不支持分别索引」）。
+   * 创建态旧值默认是 `separate` 且可自由点选 ⇒ 与设置弹窗自相矛盾，
+   * 用户选了 `separate` 却拿不到该行为（2026-11-14 用户报「创建和设置不一致」）。
+   */
+  const [faqQuestionIndexMode, setFaqQuestionIndexMode] = useState<'combined' | 'separate'>('combined')
 
   // 拉真实模型清单（失败静默：下拉留空，用户仍可点「创建」）
   useEffect(() => {
@@ -166,6 +456,28 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
     api<Model[]>('/models')
       .then((list) => { if (alive) setModels(list.filter((m) => m.enabled)) })
       .catch(() => { /* 静默：模型列表拿不到不影响创建 */ })
+    return () => { alive = false }
+  }, [])
+
+  /** 向量库实例清单（`GET /api/v1/vector-stores`）：拿不到就只显示「系统默认」。 */
+  useEffect(() => {
+    let alive = true
+    knowledgeApi.listVectorStores()
+      .then((list) => { if (alive) setVectorStores(list || []) })
+      .catch(() => { /* 静默：等价于不绑定，后端回落环境变量存储 */ })
+    return () => { alive = false }
+  }, [])
+
+  /** 存储后端实例清单（`GET /api/v1/storage-backends`）：空值 = 租户默认。 */
+  useEffect(() => {
+    let alive = true
+    knowledgeApi.listStorageBackends()
+      .then((list) => {
+        if (!alive) return
+        // 源站只列 active 实例（`KBStorageSettings.vue` 的 filter）；缺失状态视为可用。
+        setStorageBackends((list || []).filter((b) => !b.status || b.status === 'active'))
+      })
+      .catch(() => { /* 静默：只显示「跟随默认存储」 */ })
     return () => { alive = false }
   }, [])
 
@@ -193,8 +505,31 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
       showToast('请填写知识库名称', 'info')
       return
     }
+    // 源站 `validateForm` 同款判据：开了多模态就必须选 VLLM 模型。
+    if (vlm && !vlmModelId) {
+      showToast('请选择 VLLM 视觉模型（必选）', 'info')
+      setTab('image')
+      return
+    }
     setSubmitting(true)
     try {
+      /**
+       * 解析引擎规则（`chunking_config.parser_engine_rules`）。
+       *
+       * <p>源站格式 `[{file_types:[...], engine:"..."}]`；本仓后端
+       * `KbChunkingConfigParser#parserEngineRulesOf` 按**声明顺序**取第一条命中的规则。
+       * ⚠️ 只写「用户显式选过、或本仓能算出默认」的组 —— 空值组不落规则，
+       * 让后端继续走 `@Order` 默认路由（写空 engine 的规则反而会命中后回落）。
+       */
+      const parserEngineRules = type === 'faq'
+        ? []
+        : parserGroupsWithDynamic(parserEngines).flatMap((g) => {
+            const selected = engineRules[g.key]
+              ?? defaultEngineForGroup(enginesForExtensions(parserEngines, g.extensions), g.extensions)
+              ?? ''
+            return selected ? [{ file_types: g.extensions, engine: selected }] : []
+          })
+
       await onCreate({
         name: name.trim(),
         description: description.trim(),
@@ -202,6 +537,25 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
         embeddingModelId: null,
         chunkSize,
         chunkOverlap,
+        // 源站创建时同一个请求就带完整分块配置（`KnowledgeBaseEditorModal.vue` 的 chunking_config）。
+        // ⛔ 少传这个字段 = 用户的滑块选择被静默丢弃（后端回落 DB 默认 512/80）。
+        chunkingConfig: type === 'faq'
+          ? null
+          : JSON.stringify({
+              chunk_size: chunkSize,
+              chunk_overlap: chunkOverlap,
+              // 后端两个键都认（`split_markers` 优先、`separators` 兜底）；沿用本仓既有键。
+              split_markers: chunk.separators,
+              strategy: chunk.strategy,
+              enable_parent_child: chunk.enableParentChild,
+              parent_chunk_size: chunk.parentChunkSize,
+              child_chunk_size: chunk.childChunkSize,
+              token_limit: chunk.tokenLimit,
+              languages: chunk.languages,
+              table_metadata_instructions: tableMetadataInstructions,
+              // 空数组不写：后端对无规则的类型走默认路由。
+              ...(parserEngineRules.length ? { parser_engine_rules: parserEngineRules } : {}),
+            }),
         // ⭐ 只有文档型才有索引策略（源码 `:43` 是 `v-if="!isFAQ"`）。
         //    FAQ 库没有分块/向量/Wiki 这条流水线 ⇒ 传 null，⛔ 不写空对象。
         indexingStrategy: type === 'faq'
@@ -215,8 +569,74 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
             },
         // ⭐ 图谱判据的另一半（`extract_config.enabled`）必须同时写，
         //    只写 graph_enabled 的话后端 `graphEnabled()` 的合取恒 false ⇒ 静默不抽。
+        //    键名照源站 `buildSubmitData` 的 extract_config（`enabled` / `text` / `tags` /
+        //    `nodes` / `relations` / `custom_instructions`）。
         //    FAQ 库没有图谱流水线 ⇒ null，⛔ 不写空对象。
-        extract_config: type === 'faq' || !graph ? null : JSON.stringify({ enabled: true }),
+        extract_config: type === 'faq'
+          ? null
+          : JSON.stringify({
+              enabled: graph,
+              text: graphText,
+              tags: graphTags,
+              nodes: graphNodes,
+              relations: [],
+              custom_instructions: graphInstructions,
+            }),
+        // ⭐ Wiki 开关只由 indexing_strategy.wiki_enabled 承载；这里只放 Wiki 可调项。
+        //    键名照源站 `buildSubmitData`（`:1677-1686`）。
+        wikiConfig: type === 'faq'
+          ? null
+          : JSON.stringify({
+              auto_generate: wikiCfg.autoGenerate,
+              synthesis_model_id: wikiModel,
+              max_pages_per_ingest: 0,
+              extraction_granularity: wikiCfg.granularity,
+              content_instructions: wikiCfg.contentInstructions,
+              extraction_instructions: wikiCfg.extractionInstructions,
+            }),
+        // 图片处理：本仓后端从这段 JSON 读 `enable_multimodal` + `model_id`
+        // （`KbPostProcessConfig#imageUnderstanding`）。其余三个键一并落库。
+        // ⚠️ 图片管线方案走**顶层** image_pipeline，⛔ 不写进这段 JSON 的旧键。
+        imageProcessingConfig: type === 'faq'
+          ? null
+          : JSON.stringify({
+              enable_multimodal: vlm,
+              model_id: vlm ? vlmModelId : '',
+              description_language: imageDescLanguage,
+              custom_instructions: imageInstructions,
+              enable_image_vector: imageVector,
+            }),
+        asrConfig: JSON.stringify({
+          enabled: asr,
+          model_id: asr ? asrModelId : '',
+          language: '',
+        }),
+        questionGenerationConfig: JSON.stringify({
+          model_id: qgenModelId,
+          enabled: qgen,
+          question_count: qgenCount,
+          custom_instructions: qgenInstructions,
+        }),
+        autoTagConfig: JSON.stringify({
+          enabled: autotag,
+          model_id: autotagModelId,
+          max_tags: autotagMaxTags,
+          skip_if_tagged: autotagSkipIfTagged,
+        }),
+        profileConfig: JSON.stringify({
+          enabled: profileEnabled,
+          model_id: profileModelId,
+          custom_instructions: profileInstructions,
+        }),
+        faqConfig: type === 'faq'
+          ? JSON.stringify({
+              index_mode: faqIndexMode,
+              question_index_mode: faqQuestionIndexMode,
+            })
+          : null,
+        // 源站只在用户选了非默认实例时才带这两个 id（空 = 后端用默认）。
+        vectorStoreId: vectorStoreId || null,
+        storageBackendId: storageBackendId || null,
       })
     } finally {
       setSubmitting(false)
@@ -459,6 +879,80 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                         </div>
                         )}
 
+                        {/* ⭐ Wiki 四项只在勾了「Wiki 知识库」时出现 —— 源码
+                            `KnowledgeBaseEditorModal.vue:84 / :91 / :112 / :130` 的
+                            `v-if="!isFAQ && formData.indexingStrategy.wikiEnabled"`。
+                            ⚠️ 这部分是 `wiki_config` 的可调项；Wiki 的**开关**仍是
+                            `indexing_strategy.wiki_enabled`。 */}
+                        {type !== 'faq' && wiki && (
+                          <>
+                            <div className="form-item">
+                              <label className="form-label">自动生成 Wiki 页面</label>
+                              <p className="form-tip">关闭后仍可浏览和手工维护 Wiki 页面，但文档处理不会自动调用 LLM 生成或更新页面</p>
+                              <Switch
+                                checked={wikiCfg.autoGenerate}
+                                label="自动生成 Wiki 页面"
+                                onChange={(v) => setWikiCfg((c) => ({ ...c, autoGenerate: v }))}
+                              />
+                            </div>
+
+                            <div className="form-item">
+                              <label className="form-label">提取粒度</label>
+                              <p className="form-tip">控制每篇文档抽取的 Wiki 实体/概念数量。粒度越细，索引越聚焦；粒度越粗，索引越详尽</p>
+                              <div className="t-radio-group t-radio-group__outline t-size-m">
+                                {WIKI_GRANULARITY_OPTIONS.map((o) => (
+                                  <label
+                                    key={o.value}
+                                    className={`t-radio-button${wikiCfg.granularity === o.value ? ' t-is-checked' : ''}`}
+                                  >
+                                    <input
+                                      type="radio"
+                                      className="t-radio-button__former"
+                                      name="wiki-granularity"
+                                      checked={wikiCfg.granularity === o.value}
+                                      onChange={() => setWikiCfg((c) => ({ ...c, granularity: o.value }))}
+                                    />
+                                    <span className="t-radio-button__label">{o.label}</span>
+                                  </label>
+                                ))}
+                              </div>
+                              <p className="form-tip">
+                                {WIKI_GRANULARITY_OPTIONS.find((o) => o.value === wikiCfg.granularity)?.hint}
+                              </p>
+                            </div>
+
+                            <div className="form-item">
+                              <label className="form-label">Wiki 内容生成要求</label>
+                              <p className="form-tip">控制摘要、页面和首页的表达重点；引用、合并与防幻觉规则由系统固定维护。修改后需重新解析才能影响已有内容。</p>
+                              <div className="t-textarea">
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="例如：使用法务审阅口吻，优先展示责任主体、时间线和风险提示…"
+                                  value={wikiCfg.contentInstructions}
+                                  onChange={(e) => setWikiCfg((c) => ({ ...c, contentInstructions: e.target.value }))}
+                                />
+                              </div>
+                            </div>
+
+                            <div className="form-item">
+                              <label className="form-label">Wiki 提取重点</label>
+                              <p className="form-tip">说明应重点识别的领域实体和概念，不会替换系统的 JSON 与引用协议。</p>
+                              <div className="t-textarea">
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="例如：重点识别产品、版本、组织、负责人和关键技术概念…"
+                                  value={wikiCfg.extractionInstructions}
+                                  onChange={(e) => setWikiCfg((c) => ({ ...c, extractionInstructions: e.target.value }))}
+                                />
+                              </div>
+                            </div>
+                          </>
+                        )}
+
                         <div className="form-item">
                           <label className="form-label">知识库名称 <span className="required">*</span></label>
                           <div className="t-input__wrap">
@@ -489,6 +983,21 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                               <span className="t-textarea__limit">{description.length}/200</span>
                             </div>
                           </div>
+                        </div>
+
+                        {/* 知识库画像（源站 basic 节末尾的 profile 块）。
+                            ⚠️ 源站这个卡片是 `v-if="editorMode === 'edit' && !isFAQ"` ——
+                            它的「生成」按钮走 `POST /knowledge-bases/{id}/profile/generate`，
+                            需要**已存在的知识库 ID + 已解析文档**；创建态没有 id，点了必然失败。
+                            ⇒ 这里只保留说明卡片，⛔ 不画一个创建时点不动的按钮。 */}
+                        <div className="form-item">
+                          <label className="form-label">AI 生成描述</label>
+                          <div className="kb-profile-card is-empty">
+                            <p className="kb-profile-empty">
+                              创建并上传文档、生成摘要后，可在该知识库的 ⚙ 设置 → 基本信息中生成。
+                            </p>
+                          </div>
+                          <p className="form-tip">由文档画像聚合生成，不会覆盖上方手写描述；智能体会同时读取两者来判断问题是否该在本知识库中检索。</p>
                         </div>
                       </div>
                     </div>
@@ -593,8 +1102,8 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                 )}
 
                 {tab === 'chunk' && (
-                  /* 源侧 KBChunkingSettings.vue —— .kb-chunking-settings > .section-header > .settings-group
-                     ⚠️ 这一节的 sticky 页头源站**真的这么写**（kb-settings-panel.css）⇒ 保留全局 sticky 规则 */
+                  /* 与「知识库设置」弹窗同一组控件与常量（Row / Slider / TagInput / Switch），
+                     ⛔ 不复制一份实现。9 项逐条对齐源站 `KBChunkingSettings.vue`。 */
                   <div className="section">
                     <div className="kb-chunking-settings">
                       <div className="section-header">
@@ -602,135 +1111,231 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                         <p className="section-description">控制文档切分粒度，影响检索召回精度</p>
                       </div>
                       <div className="settings-group">
-                        <div className="setting-row">
-                          <div className="setting-info">
-                            <label>分块大小</label>
-                            <p className="desc">默认 512，范围 100–7500。</p>
+                        <Row label="分块策略" desc="选择文档的分块方式。自动模式会分析每个文档的结构并选择最佳策略。">
+                          <div className="t-select__wrap" style={{ width: 280 }}>
+                            <select
+                              className="t-input__inner"
+                              style={{ width: '100%', height: 32 }}
+                              value={chunk.strategy}
+                              onChange={(e) => setChunk((c) => ({ ...c, strategy: e.target.value }))}
+                            >
+                              <option value="">选择分块策略（不填则按长度切分）</option>
+                              {CHUNK_STRATEGIES.map((o) => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
                           </div>
-                          <div className="setting-control">
-                            <div className="t-input__wrap">
-                              <div className="t-input">
-                                <input
-                                  className="t-input__inner"
-                                  type="number"
-                                  min={100}
-                                  max={7500}
-                                  value={chunkSize}
-                                  onChange={(e) => setChunkSize(Number(e.target.value) || 512)}
-                                />
-                              </div>
-                            </div>
+                        </Row>
+                        <Row label="分块大小" desc="每个分块的最大字符数（100-4000）。默认 512 ≈ 中文 300 tokens / 英文 100-130 tokens。">
+                          <Slider
+                            min={100}
+                            max={4000}
+                            step={1}
+                            value={chunkSize}
+                            marks={CHUNK_SIZE_MARKS}
+                            unit="字符"
+                            onChange={setChunkSize}
+                          />
+                        </Row>
+                        <Row label="分块重叠" desc="相邻分块之间共享的字符数（0-500）。默认 80 ≈ 分块大小的 15%。">
+                          <Slider
+                            min={0}
+                            max={500}
+                            step={1}
+                            value={chunkOverlap}
+                            marks={CHUNK_OVERLAP_MARKS}
+                            unit="字符"
+                            onChange={setChunkOverlap}
+                          />
+                        </Row>
+                        <Row label="分隔符" desc="切分时优先使用的字符或字符串。优先级高的分隔符先尝试；默认顺序优先段落 → 句子 → 标点。">
+                          <TagInput
+                            value={chunk.separators}
+                            options={SEPARATOR_OPTIONS}
+                            placeholder="选择或自定义分隔符"
+                            onChange={(v) => setChunk((c) => ({ ...c, separators: v }))}
+                          />
+                        </Row>
+                        <Row
+                          label="父子分块"
+                          desc="两级分块：小的子块用于向量匹配（精准命中），大的父块返回给 LLM（更丰富上下文）。建议用于长文档（>10 页）。"
+                        >
+                          <Switch
+                            checked={chunk.enableParentChild}
+                            label="父子分块"
+                            onChange={(v) => setChunk((c) => ({ ...c, enableParentChild: v }))}
+                          />
+                        </Row>
+                        <Row label="父块大小" desc="返回给 LLM 的上下文块大小（512-8192）。默认 4096。">
+                          <Slider
+                            min={512}
+                            max={8192}
+                            step={1}
+                            value={chunk.parentChunkSize}
+                            marks={PARENT_CHUNK_SIZE_MARKS}
+                            unit="字符"
+                            disabled={!chunk.enableParentChild}
+                            onChange={(v) => setChunk((c) => ({ ...c, parentChunkSize: v }))}
+                          />
+                        </Row>
+                        <Row label="子块大小" desc="用于向量匹配的嵌入块大小（64-2048）。默认 384。">
+                          <Slider
+                            min={64}
+                            max={2048}
+                            step={1}
+                            value={chunk.childChunkSize}
+                            marks={CHILD_CHUNK_SIZE_MARKS}
+                            unit="字符"
+                            disabled={!chunk.enableParentChild}
+                            onChange={(v) => setChunk((c) => ({ ...c, childChunkSize: v }))}
+                          />
+                        </Row>
+                        <Row label="每块 Token 上限" desc="每个分块的硬性 Token 上限（0-8192）。0 = 关闭（仅按字符数）。">
+                          <div className="t-input-number t-size-m t-input-number--normal">
+                            <input
+                              type="number"
+                              className="t-input__inner"
+                              style={{ width: 120, height: 32 }}
+                              min={0}
+                              max={8192}
+                              value={chunk.tokenLimit}
+                              onChange={(e) => setChunk((c) => ({ ...c, tokenLimit: Number(e.target.value) || 0 }))}
+                            />
                           </div>
-                        </div>
-                        <div className="setting-row">
-                          <div className="setting-info">
-                            <label>重叠长度</label>
-                            <p className="desc">默认 80，重叠越大上下文越连续。</p>
-                          </div>
-                          <div className="setting-control">
-                            <div className="t-input__wrap">
-                              <div className="t-input">
-                                <input
-                                  className="t-input__inner"
-                                  type="number"
-                                  min={0}
-                                  max={500}
-                                  value={chunkOverlap}
-                                  onChange={(e) => setChunkOverlap(Number(e.target.value) || 80)}
-                                />
-                              </div>
-                            </div>
-                          </div>
-                        </div>
+                        </Row>
+                        <Row label="语言提示" desc="限制启发式模式只识别选定的语言。留空 = 自动检测。">
+                          <TagInput
+                            value={chunk.languages}
+                            options={LANGUAGE_OPTIONS}
+                            placeholder="自动检测"
+                            onChange={(v) => setChunk((c) => ({ ...c, languages: v }))}
+                          />
+                        </Row>
                       </div>
                     </div>
                   </div>
                 )}
 
-                {/* ── 以下 7 节逐字对齐设计稿 01 页 `#create-modal` 的 data-navpanel ──
-                    ⚠️ 本仓创建接口 `CreateKnowledgeBaseRequest` **只接受**
-                    name / description / type / chunking_config / embedding_model_id，
-                    其余字段（解析引擎/图像/音频/图谱/存储…）创建时写不进去。
-                    ⇒ 按设计稿**完整呈现**（用户要求「完整按 HTML」），
-                    但控件点击时如实提示「创建后可在此库的 ⚙ 设置里配置」，
-                    ⛔ 不假装写入、也不隐藏设计稿有的项。「向量存储」「解析引擎」「存储引擎」
-                    这三节在设计稿里本来就是**只读展示**（vs-badge / mock-badge），照抄即可。 */}
+                {/* ── 以下各节逐字对齐源站 `KnowledgeBaseEditorModal` 的 data-navpanel ──
+                    创建接口（`CreateKnowledgeBaseRequest`）本批已开放：wiki_config /
+                    image_processing_config / asr_config / question_generation_config /
+                    auto_tag_config / profile_config / faq_config / vector_store_id /
+                    storage_backend_id ⇒ 每节控件都真写进请求体，⛔ 不再有「创建后配置」占位。 */}
 
                 {tab === 'faq' && (
-                  /* FAQ 型专属（用户 2026-11-08 规格）：问答库没有分块/解析流水线，
-                     只有「条目怎么导入 / 相似问法怎么用」这几个开关。 */
+                  /* FAQ 型专属 —— 源站 `KnowledgeBaseEditorModal.vue:278-310`：
+                     两组必选单选（索引方式 / 问题索引方式），提交进 `faq_config`。
+                     ⚠️ 本仓原来这里是三个自造的开关（相似问法/否定问法/答案直接返回），
+                     源站没有对应字段 ⇒ 已按源站换成真实可写入的两组单选。 */
                   <div className="section">
                     <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>FAQ 设置</h2>
-                      <p className="section-description">结构化问答对：命中标准问题或相似问法时直接返回答案</p>
+                      <h2>问答</h2>
+                      <p className="section-description">设置 FAQ 知识库的索引策略和问答组织方式</p>
                     </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>启用相似问法匹配</label>
-                          <p className="desc">除标准问题外，用户用同义说法提问也能命中</p>
+                    <div className="section-body">
+                      <div className="form-item">
+                        <label className="form-label">索引方式 <span className="required">*</span></label>
+                        <div className="t-radio-group t-radio-group__outline t-size-m">
+                          {([
+                            { value: 'question_only', label: '仅标准问/相似问' },
+                            { value: 'question_answer', label: '标准问 + 答案' },
+                          ] as const).map((o) => (
+                            <label
+                              key={o.value}
+                              className={`t-radio-button${faqIndexMode === o.value ? ' t-is-checked' : ''}`}
+                            >
+                              <input
+                                type="radio"
+                                className="t-radio-button__former"
+                                name="faq-index-mode"
+                                checked={faqIndexMode === o.value}
+                                onChange={() => setFaqIndexMode(o.value)}
+                              />
+                              <span className="t-radio-button__label">{o.label}</span>
+                            </label>
+                          ))}
                         </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${faqSimilar ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={faqSimilar}
-                            aria-label="启用相似问法匹配"
-                            onClick={() => { setFaqSimilar((v) => !v); notWiredInCreate('相似问法匹配') }}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                        <p className="form-tip">仅索引问题可提升精度，索引问答可提高召回率</p>
                       </div>
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>启用否定问法排除</label>
-                          <p className="desc">标注「不是这个问题」的说法，避免误命中</p>
+
+                      <div className="form-item">
+                        <label className="form-label">问题索引方式 <span className="required">*</span></label>
+                        <div className="t-radio-group t-radio-group__outline t-size-m">
+                          {([
+                            { value: 'combined', label: '合并索引' },
+                            { value: 'separate', label: '分别索引' },
+                          ] as const).map((o) => (
+                            /* ⭐ `separate`（分别索引）后端**零消费者** —— 与「知识库设置」弹窗
+                               同一事实（那边已标注「本仓暂不支持分别索引」）。
+                               ⛔ 创建态不能让它可选：选了也拿不到该行为，两处还会自相矛盾。 */
+                            <label
+                              key={o.value}
+                              className={`t-radio-button${faqQuestionIndexMode === o.value ? ' t-is-checked' : ''}${o.value === 'separate' ? ' t-is-disabled' : ''}`}
+                              onClick={o.value === 'separate'
+                                ? (e) => {
+                                    e.preventDefault()
+                                    showToast('问题索引方式：本仓后端尚未实现「分别索引」，当前固定按合并索引处理', 'info')
+                                  }
+                                : undefined}
+                            >
+                              <input
+                                type="radio"
+                                className="t-radio-button__former"
+                                name="faq-question-index-mode"
+                                checked={faqQuestionIndexMode === o.value}
+                                disabled={o.value === 'separate'}
+                                onChange={() => setFaqQuestionIndexMode(o.value)}
+                              />
+                              <span className="t-radio-button__label">{o.label}</span>
+                            </label>
+                          ))}
                         </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${faqNegative ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={faqNegative}
-                            aria-label="启用否定问法排除"
-                            onClick={() => { setFaqNegative((v) => !v); notWiredInCreate('否定问法排除') }}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                        <p className="form-tip">
+                          合并索引：标准问和相似问合并索引；分别索引：标准问和每个相似问独立索引，检索更精确但需要更多存储
+                        </p>
+                        {/* 与知识库设置弹窗逐字一致：如实告知后端未实现，别让用户以为选了就生效 */}
+                        <p className="form-tip" style={{ color: 'var(--td-warning-color, #e37318)' }}>
+                          ⚠️ 本仓暂不支持「分别索引」—— 该项仅展示，实际固定按合并索引处理。
+                        </p>
                       </div>
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>答案直接返回</label>
-                          <p className="desc">命中后跳过 LLM 生成，直接把标准答案返回给用户</p>
-                        </div>
-                        <div className="setting-control">
-                          <span className="ext-tag">已启用（FAQ 库默认行为）</span>
-                        </div>
-                      </div>
+
+                      <p className="form-tip">FAQ 条目由标准问、相似问、反例和多个答案组成，可在知识库详情中批量导入、编辑。</p>
                     </div>
                   </div>
                 )}
 
                 {tab === 'vector' && (
+                  /* 源站 `KBVectorStoreSettings.vue` create 态：一行下拉，
+                     「系统默认」（空值）+ 用户实例。 */
                   <div className="section">
                     <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
                       <h2>向量存储</h2>
-                      <p className="section-description">选择此知识库要写入的向量存储。绑定不可更改。</p>
+                      <p className="section-description">选择此知识库要写入的向量存储。绑定不可更改 — 如需将现有 KB 迁移到其他存储，请创建新 KB 并重新索引。</p>
                     </div>
                     <div className="settings-group">
                       <div className="setting-row">
                         <div className="setting-info">
-                          <label>已绑定的向量存储</label>
-                          <p className="desc">向量存储绑定在创建后无法更改。</p>
+                          <label>向量存储</label>
+                          <p className="desc">从全局向量存储配置中选择，或保持系统默认以使用空间的默认检索引擎。</p>
                         </div>
                         <div className="setting-control">
-                          <span className="vs-badge vs-badge-env">
-                            <span className="vs-badge-name">系统默认</span>
-                            <span className="vs-badge-engine">(sqlite)</span>
-                          </span>
+                          <div className="t-select__wrap" style={{ width: 280 }}>
+                            <select
+                              className="t-input__inner"
+                              style={{ width: '100%', height: 32 }}
+                              aria-label="向量存储"
+                              value={vectorStoreId}
+                              onChange={(e) => setVectorStoreId(e.target.value)}
+                            >
+                              <option value="">系统默认</option>
+                              {vectorStores.map((s) => (
+                                <option key={s.id} value={s.id}>
+                                  {s.name}{s.engine_type ? `（${s.engine_type}）` : ''}
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                          <p className="ext-tag" style={{ marginTop: 8 }}>创建后不可更改。如需迁移，请创建一个绑定到目标存储的新 KB 并重新索引。</p>
                         </div>
                       </div>
                     </div>
@@ -837,163 +1442,453 @@ export function KbCreateModal({ showToast, onClose, onCreate, initial }: Props) 
                         })}
                       </div>
                     </div>
-                    {/* ⛔ 不能假装保存：`CreateKnowledgeBaseRequest` 不收解析引擎规则。 */}
-                    <p className="desc">创建接口暂不写入解析引擎规则；此处选择仅作预览，不影响入库。</p>
                   </div>
                 )}
 
                 {tab === 'image' && (
+                  /* 源站 `KnowledgeBaseEditorModal.vue:341-488` 的 multimodal 节：
+                     开关 + 5 行（VLLM / 描述语言 / 解析要求 / 图片向量 / 解析方案）。
+                     后四行都在 `v-if="formData.multimodalConfig.enabled"` 里。
+                     ⚠️ 源站的图片属性面板（`ImagePipelineSettings` + `/image-attrs/schema`）
+                     本仓没有对应注册表接口 ⇒ 不画假控件；只保留后端真有的方案下拉
+                     （顶层 `image_pipeline`：default / smartocr）。 */
                   <div className="section">
-                    <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>图像处理配置</h2>
-                      <p className="section-description">配置图像内容理解能力</p>
-                    </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>多模态功能</label>
-                          <p className="desc">启用图片等多模态内容的理解能力</p>
-                        </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${vlm ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={vlm}
-                            aria-label="多模态功能"
-                            onClick={() => { setVlm((v) => !v); notWiredInCreate('多模态功能') }}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                    <div className="kb-multimodal-settings">
+                      <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
+                        <h2>图像处理配置</h2>
+                        <p className="section-description">配置图像内容理解能力，启用后支持图片等非文本内容的解析和检索</p>
+                      </div>
+                      <div className="settings-group">
+                        <Row label="多模态功能" desc="启用图片等多模态内容的理解能力">
+                          <Switch checked={vlm} label="多模态功能" onChange={setVlm} />
+                        </Row>
+
+                        {vlm && (
+                          <>
+                            <Row
+                              label={<>VLLM 视觉模型 <span className="required">*</span></>}
+                              desc="用于多模态理解的视觉语言模型（必选）"
+                            >
+                              <ModelSelect
+                                value={vlmModelId}
+                                models={models}
+                                types={VISION_MODEL_TYPES}
+                                placeholder="请选择 VLLM 模型（必选）"
+                                onChange={setVlmModelId}
+                              />
+                            </Row>
+
+                            <Row label="图片描述语言" desc="留空时跟随文档语言；不再强制使用中文">
+                              <div className="t-select__wrap" style={{ width: 280 }}>
+                                <select
+                                  className="t-input__inner"
+                                  style={{ width: '100%', height: 32 }}
+                                  aria-label="图片描述语言"
+                                  value={imageDescLanguage}
+                                  onChange={(e) => setImageDescLanguage(e.target.value)}
+                                >
+                                  <option value="">自动跟随文档语言</option>
+                                  <option value="Chinese">中文</option>
+                                  <option value="English">English</option>
+                                  <option value="Korean">한국어</option>
+                                  <option value="Russian">Русский</option>
+                                </select>
+                              </div>
+                            </Row>
+
+                            <Row
+                              label="图片解析要求"
+                              desc="补充需要重点识别的视觉信息，OCR 和 Markdown 格式协议保持不变"
+                              stacked
+                            >
+                              <div className="t-textarea" style={{ width: '100%' }}>
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="例如：重点识别设备铭牌、型号、告警代码和表格中的单位…"
+                                  value={imageInstructions}
+                                  onChange={(e) => setImageInstructions(e.target.value)}
+                                />
+                              </div>
+                            </Row>
+
+                            <Row
+                              label="图片向量检索"
+                              desc="开启后，生成图片描述之后再用向量模型直接对图片编码，检索时按图片内容召回描述没写到的信息。需要向量模型支持图片输入；每张图片多一次向量调用，向量检索的候选范围也会放大。只对此后入库或重新解析的文档生效，扫描件 PDF 页不生成"
+                            >
+                              <Switch checked={imageVector} label="图片向量检索" onChange={setImageVector} />
+                            </Row>
+
+                            <Row
+                              label="图片解析方案"
+                              desc="默认：每张图分别调用描述与 OCR。智能：先观察一次（描述 + 是否含文字），只对含文字的图再做 OCR"
+                            >
+                              <div className="t-select__wrap" style={{ width: 280 }}>
+                                <select
+                                  className="t-input__inner"
+                                  style={{ width: '100%', height: 32 }}
+                                  aria-label="图片解析方案"
+                                  value={imagePipeline}
+                                  onChange={(e) => setImagePipeline(e.target.value as 'default' | 'smartocr')}
+                                >
+                                  <option value="default">默认</option>
+                                  <option value="smartocr">智能（先观察再决定是否 OCR）</option>
+                                </select>
+                              </div>
+                            </Row>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
                 )}
 
                 {tab === 'audio' && (
+                  /* 源站 `KnowledgeBaseEditorModal.vue:490-532`：开关 + ASR 模型（必选）。 */
                   <div className="section">
-                    <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>音频语音识别</h2>
-                      <p className="section-description">配置音频内容转写能力</p>
-                    </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>启用音频语音识别</label>
-                          <p className="desc">启用后可上传音频并自动转写为文本</p>
-                        </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${asr ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={asr}
-                            aria-label="启用音频语音识别"
-                            onClick={() => { setAsr((v) => !v); notWiredInCreate('音频语音识别') }}
+                    <div className="kb-multimodal-settings">
+                      <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
+                        <h2>音频语音识别</h2>
+                        <p className="section-description">
+                          配置语音识别（ASR），启用后可上传音频文件并整段转写为文本（常见格式：mp3、wav、m4a、flac、ogg 等）。暂不支持视频上传。
+                        </p>
+                      </div>
+                      <div className="settings-group">
+                        <Row
+                          label="启用音频语音识别"
+                          desc="启用后可上传音频到知识库，系统自动将语音转写为文本并参与解析与检索"
+                        >
+                          <Switch checked={asr} label="启用音频语音识别" onChange={setAsr} />
+                        </Row>
+
+                        {asr && (
+                          <Row
+                            label={<>ASR 模型 <span className="required">*</span></>}
+                            desc="用于音频中语音转文本的识别模型（如 OpenAI Whisper）"
                           >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                            <ModelSelect
+                              value={asrModelId}
+                              models={models}
+                              types={ASR_MODEL_TYPES}
+                              placeholder="请选择 ASR 模型"
+                              onChange={setAsrModelId}
+                            />
+                          </Row>
+                        )}
                       </div>
                     </div>
                   </div>
                 )}
 
                 {tab === 'graph' && (
+                  /* 源站 `settings/GraphSettings.vue`：开关 +（开时）自定义说明 / 关系类型 /
+                     示例文本 / 实体列表。本仓 `extract_config` 已收这些键。 */
                   <div className="section">
-                    <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>知识图谱</h2>
-                      <p className="section-description">从文档中抽取实体与关系</p>
-                    </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>启用图谱抽取</label>
-                          <p className="desc">每篇文档单独抽取，跨文档不合并</p>
-                        </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${graph ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={graph}
-                            aria-label="启用图谱抽取"
-                            /* ⭐ 与索引策略第三张卡同一个 state（两处显示必须一致）。
-                               后端 create 已收 extract_config ⇒ 不再是「创建后配置」，
-                               ⛔ 不能再弹 notWiredInCreate。 */
-                            onClick={() => setGraph((v) => !v)}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                    <div className="graph-settings">
+                      <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
+                        <h2>知识图谱配置</h2>
+                        <p className="section-description">开启后将自动从文本中提取实体和关系</p>
+                      </div>
+                      <div className="settings-group">
+                        <Row label="启用实体关系提取" desc="开启后将自动从文本中提取实体和关系">
+                          <Switch checked={graph} label="启用实体关系提取" onChange={setGraph} />
+                        </Row>
+
+                        {graph && (
+                          <>
+                            <Row
+                              label="额外提取要求"
+                              desc="补充领域范围、实体筛选和属性提取要求；系统仍负责结构化输出协议"
+                              stacked
+                            >
+                              <div className="t-textarea" style={{ width: '100%' }}>
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="例如：重点提取合同主体、金额、履约期限和违约责任…"
+                                  value={graphInstructions}
+                                  onChange={(e) => setGraphInstructions(e.target.value)}
+                                />
+                              </div>
+                            </Row>
+
+                            <Row label="关系类型" desc="定义要提取的关系类型标签，多个标签用逗号分隔">
+                              <FreeTagInput
+                                value={graphTags}
+                                placeholder="输入关系类型，如：工作于、同事、朋友等"
+                                onChange={setGraphTags}
+                              />
+                            </Row>
+
+                            <Row label="示例文本" desc="用于测试实体关系提取的示例文本" stacked>
+                              <div className="t-textarea" style={{ width: '100%' }}>
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={6}
+                                  maxLength={5000}
+                                  placeholder="输入一段包含实体和关系的文本..."
+                                  value={graphText}
+                                  onChange={(e) => setGraphText(e.target.value)}
+                                />
+                                <div className="t-textarea__info_wrapper">
+                                  <span className="t-textarea__limit">{graphText.length}/5000</span>
+                                </div>
+                              </div>
+                            </Row>
+
+                            {graphNodes.length > 0 && (
+                              <Row label="实体列表" desc="从文本中提取的实体及其属性" stacked>
+                                <div style={{ display: 'flex', flexDirection: 'column', gap: 12, width: '100%' }}>
+                                  {graphNodes.map((node, i) => (
+                                    <div
+                                      key={i}
+                                      style={{
+                                        border: '1px solid var(--td-component-stroke)',
+                                        borderRadius: 6,
+                                        padding: 12,
+                                        display: 'flex',
+                                        flexDirection: 'column',
+                                        gap: 8,
+                                      }}
+                                    >
+                                      <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                                        <input
+                                          className="t-input__inner"
+                                          style={{ flex: 1, height: 32 }}
+                                          placeholder="输入实体名称"
+                                          value={node.name}
+                                          onChange={(e) => setGraphNodes((list) => list.map((n, j) =>
+                                            j === i ? { ...n, name: e.target.value } : n))}
+                                        />
+                                        <button
+                                          type="button"
+                                          className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                                          onClick={() => setGraphNodes((list) => list.filter((_, j) => j !== i))}
+                                        >
+                                          <span className="t-button__text">删除</span>
+                                        </button>
+                                      </div>
+                                      {node.attributes.map((attr, ai) => (
+                                        <div key={ai} style={{ display: 'flex', gap: 8, alignItems: 'center', paddingLeft: 24 }}>
+                                          <input
+                                            className="t-input__inner"
+                                            style={{ flex: 1, height: 32 }}
+                                            placeholder="输入属性值"
+                                            value={attr}
+                                            onChange={(e) => setGraphNodes((list) => list.map((n, j) =>
+                                              j === i
+                                                ? { ...n, attributes: n.attributes.map((a, k) => (k === ai ? e.target.value : a)) }
+                                                : n))}
+                                          />
+                                          <button
+                                            type="button"
+                                            className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                                            onClick={() => setGraphNodes((list) => list.map((n, j) =>
+                                              j === i ? { ...n, attributes: n.attributes.filter((_, k) => k !== ai) } : n))}
+                                          >
+                                            <span className="t-button__text">×</span>
+                                          </button>
+                                        </div>
+                                      ))}
+                                      <button
+                                        type="button"
+                                        className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                                        style={{ alignSelf: 'flex-start' }}
+                                        onClick={() => setGraphNodes((list) => list.map((n, j) =>
+                                          j === i ? { ...n, attributes: [...n.attributes, ''] } : n))}
+                                      >
+                                        <span className="t-button__text">添加属性</span>
+                                      </button>
+                                    </div>
+                                  ))}
+                                </div>
+                              </Row>
+                            )}
+
+                            <Row label="管理实体" desc="添加或删除实体节点">
+                              <button
+                                type="button"
+                                className="t-button t-button--variant-base t-button--theme-primary t-size-s"
+                                onClick={() => setGraphNodes((list) => [...list, { name: '', attributes: [] }])}
+                              >
+                                <span className="t-button__text">添加实体</span>
+                              </button>
+                            </Row>
+                          </>
+                        )}
                       </div>
                     </div>
                   </div>
                 )}
 
                 {tab === 'advanced' && (
+                  /* 源站 `settings/KBAdvancedSettings.vue`：问题生成 4 项 / 自动打标 4 项 /
+                     知识库描述 3 项 / 表格元数据要求。 */
                   <div className="section">
-                    <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>高级设置</h2>
-                      <p className="section-description">创建后可随时在知识库设置里调整</p>
-                    </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>AI 问题生成</label>
-                          <p className="desc">为每个分块生成相关问题，提高召回率</p>
-                        </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${qgen ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={qgen}
-                            aria-label="AI 问题生成"
-                            onClick={() => { setQgen((v) => !v); notWiredInCreate('AI 问题生成') }}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                    <div className="kb-advanced-settings">
+                      <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
+                        <h2>高级设置</h2>
+                        <p className="section-description">配置问题生成等高级功能</p>
                       </div>
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>自动关联标签</label>
-                          <p className="desc">从已有标签中选择合适标签自动关联</p>
-                        </div>
-                        <div className="setting-control">
-                          <button
-                            type="button"
-                            className={`t-switch t-size-m${autotag ? ' t-is-checked' : ''}`}
-                            role="switch"
-                            aria-checked={autotag}
-                            aria-label="自动关联标签"
-                            onClick={() => { setAutotag((v) => !v); notWiredInCreate('自动关联标签') }}
-                          >
-                            <span className="t-switch__handle" />
-                          </button>
-                        </div>
+                      <div className="settings-group">
+                        {/* 源站 `KBAdvancedSettings.vue:10` 是 `v-if="ragEnabled !== false"`：
+                            问题生成只对 RAG 索引有用，RAG 关掉时不显示。 */}
+                        {rag && (
+                          <>
+                        <Row label="AI 问题生成" desc="解析文档时调用大模型为每个分块生成相关问题，提高检索召回率。启用后会增加文档解析耗时。">
+                          <Switch checked={qgen} label="AI 问题生成" onChange={setQgen} />
+                        </Row>
+
+                        {qgen && (
+                          <>
+                            <Row label="问题生成模型" desc="留空时使用知识库摘要模型。">
+                              <ModelSelect
+                                value={qgenModelId}
+                                models={models}
+                                types={CHAT_MODEL_TYPES}
+                                placeholder="请选择问题生成模型"
+                                onChange={setQgenModelId}
+                              />
+                            </Row>
+                            <Row label="生成问题数量" desc="每个文档分块生成的问题数量（1-10）">
+                              <NumberInput value={qgenCount} min={1} max={10} onChange={setQgenCount} />
+                            </Row>
+                            <Row
+                              label="问题生成要求"
+                              desc="指定问题面向的人群、场景和表达方式，系统仍维护稳定输出格式"
+                              stacked
+                            >
+                              <div className="t-textarea" style={{ width: '100%' }}>
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={3}
+                                  maxLength={4000}
+                                  placeholder="例如：生成客服用户常问的自然语言问题，避免考试题式表达…"
+                                  value={qgenInstructions}
+                                  onChange={(e) => setQgenInstructions(e.target.value)}
+                                />
+                              </div>
+                            </Row>
+                          </>
+                        )}
+                          </>
+                        )}
+
+                        <Row label="自动关联标签" desc="文档解析完成后，从当前知识库已有标签中选择合适标签自动关联。不会创建或删除标签，并会增加一次模型调用。">
+                          <Switch checked={autotag} label="自动关联标签" onChange={setAutotag} />
+                        </Row>
+
+                        {autotag && (
+                          <>
+                            <Row label="分类模型" desc="留空时使用知识库摘要模型。">
+                              <ModelSelect
+                                value={autotagModelId}
+                                models={models}
+                                types={CHAT_MODEL_TYPES}
+                                placeholder="请选择分类模型"
+                                onChange={setAutotagModelId}
+                              />
+                            </Row>
+                            <Row label="单篇文档最多标签数" desc="每篇文档最多自动关联 1-10 个已有标签。">
+                              <NumberInput value={autotagMaxTags} min={1} max={10} onChange={setAutotagMaxTags} />
+                            </Row>
+                            <Row label="跳过已有标签的文档" desc="开启后，上传时已手动设置标签的文档不再自动打标签，避免覆盖人工分类意图。">
+                              <Switch
+                                checked={autotagSkipIfTagged}
+                                label="跳过已有标签的文档"
+                                onChange={setAutotagSkipIfTagged}
+                              />
+                            </Row>
+                          </>
+                        )}
+
+                        <Row label="自动生成知识库描述" desc="文档新增、删除或摘要更新后，从文档画像聚合自动生成知识库描述。聚合本身不调用模型，仅当聚合结果变化时才发起一次小模型调用。">
+                          <Switch checked={profileEnabled} label="自动生成知识库描述" onChange={setProfileEnabled} />
+                        </Row>
+
+                        {profileEnabled && (
+                          <>
+                            <Row label="生成模型" desc="留空时使用知识库摘要模型。">
+                              <ModelSelect
+                                value={profileModelId}
+                                models={models}
+                                types={CHAT_MODEL_TYPES}
+                                placeholder="请选择生成模型"
+                                onChange={setProfileModelId}
+                              />
+                            </Row>
+                            <Row
+                              label="描述生成要求"
+                              desc="补充面向的读者、需要保留的术语或表达风格，系统仍维护稳定的输出格式。"
+                              stacked
+                            >
+                              <div className="t-textarea" style={{ width: '100%' }}>
+                                <textarea
+                                  className="t-textarea__inner"
+                                  rows={2}
+                                  maxLength={2000}
+                                  placeholder="例如：面向售后客服，用通俗说法描述产品线，保留产品型号…"
+                                  value={profileInstructions}
+                                  onChange={(e) => setProfileInstructions(e.target.value)}
+                                />
+                              </div>
+                            </Row>
+                          </>
+                        )}
+
+                        <Row
+                          label="表格元数据生成要求"
+                          desc="为 CSV/Excel 摘要补充业务背景和字段语义，帮助后续检索理解表格内容"
+                          stacked
+                        >
+                          <div className="t-textarea" style={{ width: '100%' }}>
+                            <textarea
+                              className="t-textarea__inner"
+                              rows={3}
+                              maxLength={4000}
+                              placeholder="例如：这是销售订单表，金额单位为元，status 字段使用公司内部状态码…"
+                              value={tableMetadataInstructions}
+                              onChange={(e) => setTableMetadataInstructions(e.target.value)}
+                            />
+                          </div>
+                        </Row>
                       </div>
                     </div>
                   </div>
                 )}
 
                 {tab === 'storage' && (
+                  /* 源站 `settings/KBStorageSettings.vue`：存储实例下拉（含 provider 与「默认」标记）。 */
                   <div className="section">
-                    <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
-                      <h2>存储引擎</h2>
-                      <p className="section-description">原文文件保存在哪里</p>
-                    </div>
-                    <div className="settings-group">
-                      <div className="setting-row">
-                        <div className="setting-info">
-                          <label>存储后端</label>
-                          <p className="desc">创建后可迁移</p>
-                        </div>
-                        <div className="setting-control">
-                          <span className="ext-tag">本地磁盘 ~/.nexusai/kb-storage</span>
-                        </div>
+                    <div className="kb-storage-settings">
+                      <div className="section-header" style={{ ...SECTION_HEADER_FLAT, margin: '0 0 20px' }}>
+                        <h2>存储引擎</h2>
+                        <p className="section-description">选择此知识库绑定的具体存储实例。</p>
+                      </div>
+                      <div className="settings-group">
+                        <Row
+                          label="存储实例"
+                          desc="同一种存储类型可以配置多个不同 Endpoint、Bucket 或凭据的实例。"
+                        >
+                          <div className="t-select__wrap" style={{ width: 280 }}>
+                            <select
+                              className="t-input__inner"
+                              style={{ width: '100%', height: 32 }}
+                              aria-label="存储实例"
+                              value={storageBackendId}
+                              onChange={(e) => setStorageBackendId(e.target.value)}
+                            >
+                              <option value="">跟随默认存储</option>
+                              {storageBackends.map((b) => (
+                                <option key={b.id} value={b.id}>
+                                  {b.name}（{b.provider.toUpperCase()}{b.is_default ? ' · 默认' : ''}）
+                                </option>
+                              ))}
+                            </select>
+                          </div>
+                        </Row>
                       </div>
                     </div>
                   </div>

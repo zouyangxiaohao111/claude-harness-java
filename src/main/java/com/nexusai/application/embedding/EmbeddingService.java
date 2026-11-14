@@ -92,13 +92,39 @@ public class EmbeddingService {
         ModelEndpointResolver.assertType(model, "embedding");
     }
 
-    /** 模型级批大小：null/≤0 → 10；上限 64。 */
+    /**
+     * 模型级批大小：显式配置优先；未配置时按模型名推断（对齐源站 catalog 的 max_batch_size）。
+     *
+     * <p>源站每个模型的上限不同（`text-embedding-v4`=10 / `v3`=10 / `qwen3.7-text-embedding`=20 /
+     * `v2`=25，见 `internal/models/catalog/data/overrides.json`）。本仓没有模型目录，
+     * 用名称近似映射覆盖常见百炼模型；识别不了就走默认 10（安全值）。
+     *
+     * <p>硬上限 64 不变：即使配置写大也不给单请求塞更多条（服务端通常远低于此值）。
+     */
     static int resolveBatchSize(ModelRecord model) {
         Integer configured = model.getEmbeddingBatchSize();
         if (configured == null || configured <= 0) {
-            return DEFAULT_BATCH_SIZE;
+            return inferBatchSizeFromName(model.getName());
         }
         return Math.min(configured, 64);
+    }
+
+    /** 模型名 → 单请求上限推断；未识别 ⇒ {@link #DEFAULT_BATCH_SIZE}。 */
+    static int inferBatchSizeFromName(String modelName) {
+        if (modelName == null || modelName.isBlank()) {
+            return DEFAULT_BATCH_SIZE;
+        }
+        String name = modelName.toLowerCase(java.util.Locale.ROOT);
+        if (name.contains("qwen3.7-text-embedding")) {
+            return 20;
+        }
+        if (name.contains("text-embedding-v2")) {
+            return 25;
+        }
+        if (name.contains("text-embedding-v4") || name.contains("text-embedding-v3")) {
+            return 10;
+        }
+        return DEFAULT_BATCH_SIZE;
     }
 
     /** 维度优先级：请求覆盖 > 模型级配置；null/≤0 → null（不发送 dimensions）。 */

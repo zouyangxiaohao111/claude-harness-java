@@ -6,6 +6,7 @@ import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.AttachmentRequest;
 
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
 
 /**
@@ -155,7 +156,24 @@ public record RunRequest(
      *
      * @see PermissionModeSource
      */
-    PermissionModeSource permissionModeSource
+    PermissionModeSource permissionModeSource,
+    /**
+     * [request-extras 批 1] <b>请求级通用透传 map</b>（可空 · 不落库 · 不进 AgentState / STOMP /
+     * LLM payload）。
+     *
+     * <p><b>WHY</b>：知识库 ReAct 入口（{@code KbChatGatewayController.viaReact}）只能经
+     * {@link #appendSystemPrompt} 把「用户 @ 了哪些库/文件」写成文本交给模型，<b>没有请求级参数</b>
+     * 能直达工具 ⇒ 模型不填 {@code knowledge_base_ids} 时工具回落到 agent 白名单（可能是全部库）。
+     * 本字段即该请求级通道的载体：HTTP 请求体
+     * （{@code SendMessageRequest.requestExtras}，本批仅骨架）→ 本字段 → base
+     * {@code ToolUseContext.requestExtras} → per-turn TUC → 工具 {@code execute} 形参。
+     *
+     * <p><b>本批为空转</b>：{@code KbChatGatewayController} 尚未写入（批 2 才接），故生产恒
+     * null ⇒ 工具侧读到空 map ⇒ 行为与改动前逐字节一致。
+     *
+     * <p>null = 本请求无附加透传参数（主会话 / cron / 验证入口，行为与现状一致）。
+     */
+    Map<String, Object> requestExtras
 ) {
     /**
      * 紧凑构造器：校验 userPrompt / querySource / permissionModeSource 必传（对齐 CC 运行时检查）。
@@ -181,6 +199,24 @@ public record RunRequest(
     }
 
     /**
+     * [request-extras 批 1] <b>旧全参转发构造器</b>（{@code requestExtras} 缺省 = null）·
+     * 供既有 18 处 {@code new RunRequest(...)} 零改动编译（canonical 已扩为 22 组件）。
+     */
+    public RunRequest(String userPrompt, ProviderConfig config, String modelName, QuerySource querySource,
+                      String sessionId, UUID agentId, String systemPrompt, Integer maxTurns,
+                      TaskBudget taskBudget, String fallbackModel, Boolean skipCacheWrite,
+                      Integer maxOutputTokensOverride, String appendSystemPrompt, String permissionModeCli,
+                      boolean dangerouslySkipPermissions, JsonNode jsonSchema,
+                      List<AttachmentRequest> attachments, List<String> batchUserPrompts,
+                      String boundProject, com.nexusai.application.agent.subagent.AgentContext agentContext,
+                      PermissionModeSource permissionModeSource) {
+        this(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt, maxTurns,
+            taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
+            permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
+            boundProject, agentContext, permissionModeSource, null);
+    }
+
+    /**
      * [批 1 · 方向 C] 返回携带显式项目锚的副本（其余字段不变）。
      *
      * <p>唯一生产调用方 = {@code CronIdleExecutor.runAgentLoop}（DURABLE cron fire：把
@@ -197,7 +233,26 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource);
+            boundProject, agentContext, permissionModeSource, requestExtras);
+    }
+
+    /**
+     * [request-extras 批 1] 返回携带请求级透传 map 的副本（其余字段不变）。
+     *
+     * <p>唯一生产调用方 = {@code ChatService.processUserMessage}（把
+     * {@code SendMessageRequest.requestExtras()} 挂到本 run 上 → base TUC → per-turn TUC → 工具）。
+     * 与 {@link #withBoundProject(String)} 同款写法（null / 同值短路返回 {@code this}）。
+     *
+     * @param requestExtras 请求级透传参数（null = 无 → 返回 {@code this}）
+     */
+    public RunRequest withRequestExtras(Map<String, Object> requestExtras) {
+        if (requestExtras == null || requestExtras.equals(this.requestExtras)) {
+            return this;
+        }
+        return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
+            maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
+            permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
+            boundProject, agentContext, permissionModeSource, requestExtras);
     }
 
     /**
@@ -219,7 +274,7 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource);
+            boundProject, agentContext, permissionModeSource, requestExtras);
     }
 
     // ── [IMP2-10 · MISS-2 · OD-13] taskBudget 生产来源解析 ──

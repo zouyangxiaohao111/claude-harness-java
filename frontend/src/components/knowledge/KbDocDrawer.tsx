@@ -5,6 +5,7 @@ import type { ChunkRevision, ChunkView, Knowledge } from '@/api/knowledge'
 import { ApiError } from '@/api/rest'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { KbAssistantPanel } from './KbAssistantPanel'
+import { FileTypeIcon } from './FileTypeIcon'
 import { KbDocPreview, kbFileExtOf, kbPreviewKindOf } from './KbDocPreview'
 import {
   KbProcessingTimeline,
@@ -1254,7 +1255,9 @@ export function KbDocDrawer({ knowledge, onClose, showToast, initialChunkId }: P
         <div className="t-drawer__header">
           <div className="doc-drawer-header">
             <div className="doc-drawer-header-icon">
-              <span className="row-file-icon-wrap" style={{ width: 32, height: 38, fontSize: 20 }}>📄</span>
+              <span className="row-file-icon-wrap" style={{ width: 32, height: 38 }}>
+                <FileTypeIcon ext={knowledge.file_type || knowledge.file_name?.split('.').pop()} size={32} />
+              </span>
             </div>
             <div className="doc-drawer-header-text">
               <div className="doc-drawer-header-title" title={title}>{title}</div>

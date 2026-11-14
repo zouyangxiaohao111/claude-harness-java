@@ -20,18 +20,20 @@ import java.util.Set;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
- * anydoc 解析器 · 仅供 {@code parser_engine_rules} <b>显式点名</b>的 Office 解析引擎。
+ * anydoc 解析器 · Office 类格式的<b>默认</b>解析引擎（对齐源站 {@code preferAnydocWhenAvailable}）。
  *
- * <p><b>2026-11-12 用户裁定</b>：本仓 Office 类格式<b>默认改走 Tika</b>（{@link KbOfficeParser}），
- * anydoc 不再默认接管任何扩展名。理由是用户需要 <b>source block</b>（页码/段落/行号/单元格溯源）
- * 与<b>内嵌图片</b>，而 anydoc 只出 markdown、不提供结构（{@code to_markdown} 连图片引用都不产）。
- * 本类保留的用途：知识库配置里用 {@code anydoc} / {@code KbAnydocParser} 点名时仍能工作，
- * 故 {@link #engineFamilyNames()} 与 {@link #parse} 的完整能力（markdown + 内嵌图片）都保留。
+ * <p><b>2026-11-14 用户裁定</b>：Office 类格式（doc/docx/xls/xlsx/ppt/pptx/rtf/odt/ods/odp/epub）
+ * <b>默认走 anydoc</b>，与源站一致；{@link KbOfficeParser}（Tika）保留为兜底 —— anydoc 原生库
+ * 不可用、或规则显式点名 {@code builtin} 时才落到 Tika。
  *
- * <p><b>为什么默认不选它（能力取舍）</b>：anydoc 直接从文档模型出<b>结构化 GFM Markdown</b>
- * （标题层级、列表标记、合并单元格、脚注都天然保留），markdown 质量优于 Tika 的 XHTML 往返；
- * 但它<b>不产出结构定位</b>（没有 source block），下游引用无法指回原文。需要最高 markdown 质量
- * 且不要求溯源时，可在 {@code parser_engine_rules} 里显式点名 {@code anydoc}。
+ * <p><b>⚠️ 与 2026-11-12 裁定的关系</b>：11-12 曾裁定「默认改走 Tika」，理由是 Tika 产 source block
+ * （页码/段落/行号溯源）而 anydoc 只出 markdown ⇒ 走 anydoc 时引用无法定位回原文。11-14 用户
+ * 明确要求「默认 anydoc 而不是内置」，故恢复源站行为；<b>该代价仍然存在</b>：默认 anydoc 解析的
+ * 文档没有结构定位，引用只能指向块文本、不能指回页码/段落。需要溯源时在
+ * {@code parser_engine_rules} 里把对应扩展名点名为 {@code builtin}。
+ *
+ * <p><b>anydoc 的优势</b>：直接从文档模型出<b>结构化 GFM Markdown</b>（标题层级、列表标记、
+ * 合并单元格、脚注都天然保留），markdown 质量优于 Tika 的 XHTML 往返。
  *
  * <p><b>为什么不接管 PDF（{@code ERR_PDF_NO_MODEL=7}）</b>：anydoc 对 PDF 没有 document model，
  * 只能走 {@code pdf-inspector} 出<b>扁平</b> markdown —— 图表、表格与版面一律丢失，且扫描件直接报
@@ -47,14 +49,13 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * {@code csvCellReplacer} 逐字对齐，不能换成两套不一样的结果。
  *
  * <p><b>{@code @Order(12)}</b>：路由按 {@code @Order} 升序取第一个 {@code supports()} 命中的解析器。
- * 本类现在 {@link #supports} 恒返回 false（{@link #ANYDOC_EXT} 已清空），故 {@code @Order} 对
- * <b>默认路由已无影响</b>；保留 12 只是让诊断端点里引擎顺序与历史一致，且将来若恢复某类格式时
- * 位置仍排在 {@link KbPdfParser}(10) 之后、{@link KbImageParser}(15) / {@link KbOfficeParser}(20) 之前。
+ * 本类排在 {@link KbPdfParser}(10) 之后、{@link KbImageParser}(15) / {@link KbOfficeParser}(20) 之前
+ * ⇒ Office 类扩展名<b>先命中本类</b>，正是「Office 默认 anydoc」的落地方式。
  *
- * <p><b>默认路由落点</b>：{@link #supports} 恒 false ⇒ 注册表继续往后走，Office 类文件落到
- * {@link KbOfficeParser}（Tika）。⛔ 规则点名且库不可用时由 {@link KbParserEngineRouter} 先判
- * {@link AnydocNative#isAvailable()} 并回落默认 —— 不能「接住再返回空文本」：那会让文档
- * 「解析成功但内容为空」入库，比解析失败更糟。
+ * <p><b>默认路由落点</b>：anydoc 原生库不可用（{@link AnydocNative#isAvailable()} false）时
+ * {@link #supports} 返回 false ⇒ 注册表继续往后走，落到 {@link KbOfficeParser}（Tika）兜底。
+ * ⛔ 规则点名且库不可用时由 {@link KbParserEngineRouter} 先判库可用性并回落默认 —— 不能「接住再
+ * 返回空文本」：那会让文档「解析成功但内容为空」入库，比解析失败更糟。
  *
  * <p><b>fail-soft（对齐 {@link KbPdfParser}）</b>：库可用但这次转换失败（文件损坏 / 加密 /
  * 超资源上限），catch 住返回<b>空文本 + 失败原因</b>，⛔ 不抛 {@link KbParseException} ——
@@ -93,7 +94,7 @@ public class KbAnydocParser implements KbDocumentParser, SelfDescribingAvailabil
      *
      * <p>为什么保留字段而不是让 {@link #supports} 无条件 false：
      * <ul>
-     *   <li>{@link #supportedExtensions()} 与 {@link #supports} 仍同源，前端引擎清单不会出现「假选项」；</li>
+     *   <li>{@link #supportedExtensions()} 与 {@link #supports} 同源，前端引擎清单不会出现「假选项」；</li>
      *   <li>显式点名（{@code parser_engine_rules} 写 {@code anydoc} / {@code KbAnydocParser}）走的是
      *       {@code name()} / {@link #engineFamilyNames()} + {@link #parse}，<b>不经过</b> {@link #supports}，
      *       故「默认不接管」与「仍可被点名」并不冲突。</li>
@@ -103,7 +104,13 @@ public class KbAnydocParser implements KbDocumentParser, SelfDescribingAvailabil
      * {@code csv/md/txt/json} 等简单格式（{@link KbTextParser}）、{@code mhtml}（anydoc 不支持，
      * 留给 {@link KbOfficeParser}）。
      */
-    static final Set<String> ANYDOC_EXT = Set.of();
+    static final Set<String> ANYDOC_EXT = Set.of(
+        "doc", "docm", "docx", "dot", "dotx",
+        "xls", "xlsm", "xlsx", "xlt", "xltx",
+        "ppt", "pptm", "pptx", "pot", "potx",
+        "rtf", "odt", "ods", "odp",
+        "epub"
+    );
 
     /**
      * 明确<b>不</b>接管的后缀 · 双保险（与 {@link ANYDOC_EXT} 无交集，防将来有人往集合里误加）。
@@ -135,9 +142,7 @@ public class KbAnydocParser implements KbDocumentParser, SelfDescribingAvailabil
      * 是否接管该文件（<b>默认路由</b>用）。
      *
      * <p>判定顺序：① 原生库不可用 → false；② 扩展名在 {@link #NEVER_EXT} → false；
-     * ③ 扩展名在 {@link #ANYDOC_EXT} → true。当前 {@link #ANYDOC_EXT} 为空集，故本方法
-     * <b>恒返回 false</b>：Office 类默认落到 {@link KbOfficeParser}（Tika），以拿到 source block
-     * 与内嵌图片。显式点名不受影响（{@link KbParserEngineRouter} 走类名/族名，不看本方法）。
+     * ③ 扩展名在 {@link #ANYDOC_EXT} → true。Office 类扩展名因此默认由本类接管（对齐源站）。
      *
      * <p>⛔ 不看 MIME：本引擎认的是一批<b>容器格式</b>，MIME 探测（Tika）对它们可能给出
      * {@code application/zip} / {@code application/octet-stream} 这类泛值，按 MIME 放行会把无关 zip 抢走；
@@ -158,7 +163,7 @@ public class KbAnydocParser implements KbDocumentParser, SelfDescribingAvailabil
         return ANYDOC_EXT.contains(ext);
     }
 
-    /** 能力声明 · 直接复用 {@link #supports} 用的扩展名常量（⛔ 不另抄一份，防止两处漂移）。 */
+    /** 能力声明 · 与 {@link #supports} 同源（默认路由范围 = 下拉可选范围，两处不会漂移）。 */
     @Override
     public Set<String> supportedExtensions() {
         return ANYDOC_EXT;

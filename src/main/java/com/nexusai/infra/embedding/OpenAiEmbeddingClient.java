@@ -44,6 +44,21 @@ public class OpenAiEmbeddingClient implements EmbeddingClient {
     /** 硬上限 · 防止误配成超大单请求（服务端通常远低于此值）。 */
     static final int MAX_BATCH_SIZE = 64;
 
+    /**
+     * 可重试错误的尝试次数（含首次）。
+     *
+     * <p>对齐源站 {@code batchEmbedWithBackoff}：{@code embedRetryAttempts = 5}
+     * （{@code internal/application/service/retriever/keywords_vector_hybrid_indexer.go:30}）。
+     */
+    static final int MAX_ATTEMPTS = 5;
+
+    /**
+     * 首次退避 200ms，之后每次翻倍：200 / 400 / 800 / 1600 / 3200 ms。
+     *
+     * <p>与源站 {@code embedRetryBaseDelay = 200 * time.Millisecond} 同值。
+     */
+    static final long BASE_BACKOFF_MS = 200L;
+
     @Override
     public Result embed(ProviderConfig config, String modelName, List<String> inputs,
                         Integer dimensions, int batchSize) {
@@ -71,7 +86,7 @@ public class OpenAiEmbeddingClient implements EmbeddingClient {
                 if (dimensions != null && dimensions > 0) {
                     params.dimensions(dimensions.longValue());
                 }
-                CreateEmbeddingResponse response = client.embeddings().create(params.build());
+                CreateEmbeddingResponse response = createWithRetry(client, params.build(), modelName);
 
                 List<Embedding> data = new ArrayList<>(response.data());
                 // 响应 index 是批内下标；排序后与 batch 顺序对齐（防御服务端乱序返回）
@@ -110,5 +125,52 @@ public class OpenAiEmbeddingClient implements EmbeddingClient {
                 (System.nanoTime() - startedAt) / 1_000_000);
         }
         return new Result(List.copyOf(vectors), modelName, actualDimensions, promptTokens, batches);
+    }
+
+    /**
+     * 单次请求 + 指数退避重试。
+     *
+     * <p>只对「限流 / 服务端 5xx / 超时」重试；其它错误（400 参数错、401 鉴权错）立即抛出 ——
+     * 重试只会把同一个错误再打一遍。
+     */
+    private static CreateEmbeddingResponse createWithRetry(
+            OpenAIClient client, EmbeddingCreateParams params, String modelName) {
+        long backoff = BASE_BACKOFF_MS;
+        for (int attempt = 1; ; attempt++) {
+            try {
+                return client.embeddings().create(params);
+            } catch (RuntimeException e) {
+                if (attempt >= MAX_ATTEMPTS || !isRetryable(e)) {
+                    throw e;
+                }
+                log.warn("[OpenAiEmbeddingClient] 可重试错误，{}ms 后重试（第 {}/{} 次）: model={} err={}",
+                    backoff, attempt, MAX_ATTEMPTS - 1, modelName, e.toString());
+                try {
+                    Thread.sleep(backoff);
+                } catch (InterruptedException interrupted) {
+                    Thread.currentThread().interrupt();
+                    throw e;
+                }
+                backoff *= 2;
+            }
+        }
+    }
+
+    /** 异常链任一层命中限流 / 5xx / 超时 ⇒ 可重试。 */
+    static boolean isRetryable(Throwable error) {
+        for (Throwable t = error; t != null; t = t.getCause()) {
+            String text = (t.getClass().getSimpleName() + " " + t.getMessage()).toLowerCase();
+            if (text.contains("429")
+                    || text.contains("rate limit")
+                    || text.contains("insufficient_quota")
+                    || text.contains("too many requests")
+                    || text.contains("overloaded")
+                    || text.contains("timeout")
+                    || text.contains("timed out")
+                    || java.util.regex.Pattern.compile("\\b(500|502|503|504)\\b").matcher(text).find()) {
+                return true;
+            }
+        }
+        return false;
     }
 }

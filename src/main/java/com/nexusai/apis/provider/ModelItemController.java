@@ -192,6 +192,7 @@ public class ModelItemController {
         String extraBody,
         Integer embeddingDimensions,
         Integer embeddingBatchSize,
+        Integer maxConcurrency,
         Integer rerankTopN,
         String rerankInstruct
     ) {
@@ -201,7 +202,7 @@ public class ModelItemController {
                 maxContextTokens,
                 inputPricePeak, inputPriceOffpeak, outputPricePeak, outputPriceOffpeak,
                 cacheReadPricePeak, cacheReadPriceOffpeak, cacheWritePricePeak, cacheWritePriceOffpeak,
-                extraBody, embeddingDimensions, embeddingBatchSize, rerankTopN, rerankInstruct);
+                extraBody, embeddingDimensions, embeddingBatchSize, maxConcurrency, rerankTopN, rerankInstruct);
         }
     }
 

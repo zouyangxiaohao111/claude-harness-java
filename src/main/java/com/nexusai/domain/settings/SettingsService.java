@@ -169,6 +169,8 @@ public class SettingsService {
         if (req.asrModelName() != null) s.setAsrModelName(req.asrModelName());
         // [W3-1] 压缩窗口上限 merge（null = 不覆盖；CC autoCompact.ts:40-46）
         if (req.autoCompactWindow() != null) s.setAutoCompactWindow(req.autoCompactWindow());
+        // [V292] 后台向量化并发全局默认（PATCH 语义：null 不改）
+        if (req.modelMaxConcurrency() != null) s.setModelMaxConcurrency(req.modelMaxConcurrency());
 
         // [C-05 · OPD-CM5-C-05] autoMemoryDirectory 存 DB 列（V34 列 auto_memory_directory，
         // 前端"模型配置页-环境配置"可配置，对齐 CC 给默认值；null = 不覆盖）。
@@ -751,7 +753,9 @@ public class SettingsService {
             s.getGoalCheckinMinutes(),
             // [V259 external-agent] 子代理外部运行时透出（不补这两行 ⇒ 前端面板恒显示空/默认）
             s.getSubagentDefaultRuntime(),
-            s.getSubagentExternalEnabled()
+            s.getSubagentExternalEnabled(),
+            // [V292] 后台向量化并发全局默认透出（不补这行前端恒显示空）
+            s.getModelMaxConcurrency()
         );
     }
 

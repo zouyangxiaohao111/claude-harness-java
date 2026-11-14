@@ -17,6 +17,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import com.nexusai.kb.app.parser.KbParseException;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
@@ -200,9 +201,22 @@ public class KbWikiSearchTool implements Tool {
      *
      * @return 目标库列表；空列表 = 未授权任何库（调用方应如实返回空结果）
      */
+    @Autowired(required = false)
+    private KbHandleResolver handleResolver;
+
     private List<String> resolveTargets(JsonNode in, ToolUseContext ctx) {
         List<String> allowed = scope == null ? null : scope.allowedKnowledgeBaseIds(ctx);
-        List<String> requested = KbSearchKnowledgeTool.readStringArray(in, "knowledge_base_ids", MAX_KB_IDS);
+        // ⭐ 句柄解析：模型可能给 kb://<前8位>（runtime_context 里就是这么写的）
+        List<String> requested = new ArrayList<>();
+        try {
+            for (String raw : KbSearchKnowledgeTool.readStringArray(in, "knowledge_base_ids", MAX_KB_IDS)) {
+                requested.add(handleResolver.resolveKnowledgeBase(raw));
+            }
+        } catch (KbParseException e) {
+            // 明确报错而不是静默当全库 —— 让模型按提示改用完整 id
+            log.warn("[wiki_search] 句柄解析失败: {}", e.getMessage());
+            requested = List.of();
+        }
 
         List<String> effective = allowed != null ? allowed : allKbIds();
         if (requested.isEmpty()) {

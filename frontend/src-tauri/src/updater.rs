@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::io::Read;
 use std::time::Duration;
-use tauri::{AppHandle, Emitter};
+use tauri::{AppHandle, Emitter, Manager};
 
 /// 平台名（Tauri updater 的 `{target}-{arch}` 风格；macOS 的 target 叫 `darwin`）。
 const PLATFORM_OS: &str = if cfg!(target_os = "windows") {
@@ -359,32 +359,55 @@ pub fn app_version(app: tauri::AppHandle) -> String {
     app.package_info().version.to_string()
 }
 
-/// 静默安装命令行（Windows NSIS）：延迟约 2.5s → `/S` 无向导覆盖安装 → 安装器退出后启动当前 exe。
+/// 静默安装命令行（Windows NSIS）：延迟 → **杀掉旧 app 与后端** → `/S` 无向导覆盖安装
+/// → 安装器退出后启动当前 exe。
 ///
 /// <p>⛔ 调用方必须用 `CommandExt::raw_arg` 原样传这行；不能 `.args(["/C", line])`
 /// （Rust 会把内部引号转义成 `\"`，cmd.exe 不认 ⇒「Windows 找不到 '\\' 文件」）。
 ///
-/// <p>延迟的目的：让前端 `getCurrentWindow().close()` 先走 `main.rs` 的正常关窗路径
-/// （`CloseRequested` → `kill_process_tree(backend_pid)` 回收 Java 后端）。否则 NSIS 静默模式
-/// 会直接 kill 主进程，后端仍占用 `backend/nexusai-backend.jar` ⇒ 覆盖安装失败。
-fn installer_command_line(path: &str, app_exe: &str) -> String {
+/// <p>⛔ **必须先杀掉运行中的 app**（2026-11-14 用户实测：「静默安装了，但没自动重启，
+/// 装完用户没感知」）。根因是主窗口「点 X」= 隐藏到托盘（2026-11-04 裁定）⇒ 前端
+/// `getCurrentWindow().close()` **不退出进程** ⇒
+/// ① `nexusai-client.exe` 被文件锁 ⇒ NSIS 替换不掉它却仍报「安装完成」⇒ 装完还是旧版；
+/// ② 新实例被 `tauri_plugin_single_instance` 顶掉（并把焦点给那个**已隐藏**的旧窗口）
+/// ⇒ 用户完全没感知。
+///
+/// <p>后端 java 进程也要杀：否则 `backend/nexusai-backend.jar` 被锁 ⇒ 覆盖安装失败。
+/// ⛔ 按**精确 pid** 杀（`/PID`），不用 `/IM java.exe` —— 那会误杀同机别的 Java 进程。
+///
+/// <p>开头的延迟只为了让用户看到「正在安装…」而不是被突然杀掉；真正保证 exe 解锁的是
+/// 紧随其后的 `taskkill`（它发生在前端关窗之后）。
+fn installer_command_line(path: &str, app_exe: &str, backend_pid: Option<u32>) -> String {
     let installer = path.replace('"', "");
     let app = app_exe.replace('"', "");
+    // 按映像名杀（/IM）：一次清掉所有旧实例（用户可能同时开了多个）。
+    let app_file = app
+        .rsplit(['\\', '/'])
+        .next()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("nexusai-client.exe")
+        .to_string();
+    let kill_backend = backend_pid
+        .map(|p| format!("taskkill /PID {p} /T /F & "))
+        .unwrap_or_default();
     if app.is_empty() {
-        // 取不到当前 exe（极罕见）：至少完成安装，不尝试重启
-        format!("ping -n 4 127.0.0.1 >NUL & start \"\" /wait \"{installer}\" /S")
+        // 取不到当前 exe（极罕见）：至少完成安装，不尝试重启。
+        // ⚠️ 此时**不杀 app** —— 杀了就再也起不来。
+        format!("ping -n 4 127.0.0.1 >NUL & {kill_backend}start \"\" /wait \"{installer}\" /S")
     } else {
         // ⛔ 不给安装器传 `/R`：它的 RunAsUser 重启分支在部分机器上会报
         //    「Windows 找不到 '\\' 文件」（2026-10-27 用户实测）。
         //    改为 `start /wait` 等安装器退出后，由本命令自己启动当前 exe。
+        // ⚠️ taskkill 之后留 2s（ping -n 3）：等文件锁真正释放，否则安装器仍替换不掉 exe。
         format!(
-            "ping -n 4 127.0.0.1 >NUL & start \"\" /wait \"{installer}\" /S & start \"\" \"{app}\""
+            "ping -n 4 127.0.0.1 >NUL & taskkill /IM {app_file} /F & {kill_backend}\
+             ping -n 3 127.0.0.1 >NUL & start \"\" /wait \"{installer}\" /S & start \"\" \"{app}\""
         )
     }
 }
 
 #[cfg(target_os = "windows")]
-fn spawn_silent_installer(path: &str) -> Result<(), String> {
+fn spawn_silent_installer(path: &str, backend_pid: Option<u32>) -> Result<(), String> {
     // ⭐ raw_arg：cmd 的命令行必须**原样**传。若用 `.args(["/C", line])`，Rust 的 Windows
     //    参数引用会把内部引号转义成 `\"`，而 cmd.exe 不认 `\"` ⇒ `start` 把反斜杠当程序名
     //    ⇒ 弹「Windows 找不到 '\\' 文件」（2026-10-27 用户实测；即使已经去掉 NSIS `/R`）。
@@ -394,7 +417,7 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
         .unwrap_or_default();
     crate::backend::silent_command("cmd")
         .arg("/C")
-        .raw_arg(installer_command_line(path, &app_exe))
+        .raw_arg(installer_command_line(path, &app_exe, backend_pid))
         .spawn()
         .map(|_| ())
         .map_err(|e| format!("启动静默安装器失败: {e}"))
@@ -405,7 +428,7 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
 /// <p>⛔ **不做自动替换**（替换运行中的 app 需要停进程 + 提权 + 处理签名/只读卷）——
 /// 见计划「明确不做」章节。
 #[cfg(target_os = "macos")]
-fn spawn_silent_installer(path: &str) -> Result<(), String> {
+fn spawn_silent_installer(path: &str, _backend_pid: Option<u32>) -> Result<(), String> {
     std::process::Command::new("open")
         .arg(path)
         .spawn()
@@ -415,7 +438,7 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
 
 /// 其余非 Windows 平台（Linux 等）：维持原行为。
 #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-fn spawn_silent_installer(path: &str) -> Result<(), String> {
+fn spawn_silent_installer(path: &str, _backend_pid: Option<u32>) -> Result<(), String> {
     std::process::Command::new(path)
         .arg("-S")
         .spawn()
@@ -426,9 +449,16 @@ fn spawn_silent_installer(path: &str) -> Result<(), String> {
 #[tauri::command]
 pub fn update_install(path: String, app: AppHandle) -> Result<(), String> {
     let _ = app.emit("update://installing", ());
+    // ⛔ 必须把**后端 pid**取出来交给命令行：jar 被 java 进程占着 ⇒ 覆盖安装必然失败。
+    //    这里只**读**不 take —— 关窗钩子那边仍要按它回收（两边都杀是幂等的）。
+    let backend_pid = {
+        let state = app.state::<crate::BackendState>();
+        let guard = state.0.lock().unwrap();
+        *guard
+    };
     // ⭐ 无感升级：静默覆盖安装（/S）；安装器退出后由 cmd 包装器重启当前 exe。
     // 数据目录（~/.nexusai）与安装目录分离，覆盖安装不影响用户数据。
-    spawn_silent_installer(&path)
+    spawn_silent_installer(&path, backend_pid)
 }
 
 fn hex_digest(d: &[u8]) -> String {
@@ -644,6 +674,7 @@ mod tests {
         let line = installer_command_line(
             r"C:\tmp\NexusAI_0.1.60_x64-setup.exe",
             r"D:\software\NexusAI\nexusai-client.exe",
+            None,
         );
         assert!(line.contains("ping -n 4"), "必须先延迟，让关窗路径回收后端：{line}");
         assert!(line.contains("/S"), "必须静默安装（不弹 NSIS 向导）：{line}");
@@ -659,6 +690,69 @@ mod tests {
         assert!(
             line.contains(r#""D:\software\NexusAI\nexusai-client.exe""#),
             "安装完必须自行重启当前 exe：{line}"
+        );
+    }
+
+    /// ⛔ 守护（2026-11-14 用户实测：「静默安装了，但没自动重启，装完用户没感知」）：
+    /// 安装器要替换 `nexusai-client.exe`，该 exe **必须没被占用**。
+    ///
+    /// <p>WHY 必须杀 app：主窗口「点 X」= 隐藏到托盘（2026-11-04 裁定）⇒ 前端
+    /// `getCurrentWindow().close()` **不退出进程** ⇒ exe 被文件锁 ⇒ NSIS 静默安装
+    /// 替换不掉它却仍报「安装完成」⇒ 装完还是旧版；且新实例被单实例插件顶掉
+    /// （并把焦点给那个**已隐藏**的旧窗口）⇒ 用户完全没感知。
+    #[test]
+    fn installer_command_line_must_kill_app_before_installing() {
+        let line = installer_command_line(
+            r"C:\tmp\NexusAI_0.1.77_x64-setup.exe",
+            r"D:\software\NexusAI\nexusai-client.exe",
+            None,
+        );
+        assert!(
+            line.contains("taskkill /IM nexusai-client.exe /F"),
+            "⛔ 必须先杀掉运行中的 app（taskkill /IM）：exe 被文件锁 ⇒ 覆盖安装替换不掉它。{line}"
+        );
+        let kill_at = line.find("taskkill /IM").expect("必须含 taskkill /IM");
+        let start_at = line.find("start \"\" /wait").expect("必须含 start /wait");
+        assert!(
+            kill_at < start_at,
+            "⛔ taskkill 必须在启动安装器**之前**（先装后杀 ⇒ 锁还在，替换仍然失败）。{line}"
+        );
+        assert!(
+            line.contains("start \"\" \"D:\\software\\NexusAI\\nexusai-client.exe\""),
+            "杀完 app、安装完之后仍必须拉起新实例。{line}"
+        );
+    }
+
+    /// 后端 java 进程树必须被杀：否则 `backend/nexusai-backend.jar` 被锁 ⇒ 覆盖安装失败。
+    ///
+    /// <p>⛔ 必须按**精确 pid** 杀（`/PID`），不能用 `/IM java.exe` —— 那会误杀
+    /// 同机的 IDEA / 其他 Java 进程（2026-11-14 定）。
+    #[test]
+    fn installer_command_line_must_kill_backend_process_tree_when_pid_known() {
+        let with_pid =
+            installer_command_line(r"C:\tmp\i.exe", r"D:\s\nexusai-client.exe", Some(4242));
+        assert!(
+            with_pid.contains("taskkill /PID 4242 /T /F"),
+            "⛔ 必须按精确 pid 杀后端进程树（jar 被锁 ⇒ 覆盖安装失败）。{with_pid}"
+        );
+        let without_pid =
+            installer_command_line(r"C:\tmp\i.exe", r"D:\s\nexusai-client.exe", None);
+        assert!(
+            !without_pid.contains("taskkill /PID"),
+            "⛔ 不知道后端 pid 时不得输出空的 taskkill /PID。{without_pid}"
+        );
+    }
+
+    /// ⛔ 守护：更新前必须把**后端 pid** 取出来交给命令行 ——
+    /// 否则 jar 被 java 进程占着 ⇒ NSIS 覆盖安装必然失败。
+    #[test]
+    fn update_install_must_pass_backend_pid_to_command_line() {
+        let body = fn_body(prod_src(), "pub fn update_install")
+            .expect("update_install 必须存在（前端经 invoke('update_install') 触发安装）");
+        assert!(
+            body.contains("BackendState"),
+            "⛔ update_install 必须读取后端进程 pid（BackendState）并传给 installer_command_line —— \
+             否则 nexusai-backend.jar 被锁 ⇒ 覆盖安装失败。实得：{body}"
         );
     }
 

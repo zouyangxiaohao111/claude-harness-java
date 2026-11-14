@@ -78,6 +78,16 @@ public class KbChatGatewayController {
     @Autowired private ChatService chatService;
     @Autowired private com.nexusai.domain.session.MessageService messageService;
     @Autowired private SimpMessagingTemplate wsTemplate;
+    @Autowired private com.nexusai.kb.domain.KnowledgeBaseService knowledgeBaseService;
+    @Autowired private com.nexusai.kb.domain.KnowledgeService knowledgeService;
+
+    /** 仅用于解析 `indexing_strategy` / `chunking_config` 这类 TEXT 列里的 JSON 小片段。 */
+    private static final com.fasterxml.jackson.databind.ObjectMapper JSON =
+        new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /** 稳定句柄前缀 · 与 {@code KbHandleResolver} 一致（工具侧按同一前缀解析）。 */
+    private static final String KB_PREFIX = com.nexusai.kb.agent.tool.KbHandleResolver.KB_PREFIX;
+    private static final String DOC_PREFIX = com.nexusai.kb.agent.tool.KbHandleResolver.DOC_PREFIX;
 
     /**
      * 统一对话入口。
@@ -128,21 +138,231 @@ public class KbChatGatewayController {
      * 那会让两条路径的排队行为出现分叉。
      */
     private GatewayAccepted viaReact(String sessionId, GatewayRequest req) {
+        // ⭐ 检索范围以 `<runtime_context scope="this_turn">` 块拼进 **user content**（对齐源站语义）。
+        //
+        //   ⛔ 为什么不用 appendSystemPrompt：它真的追加到 system prompt 末尾
+        //     （EffectiveSystemPromptBuilder:187/217/259），而范围每轮都变 ⇒ 系统提示前缀每轮不同
+        //     ⇒ prompt cache 整体失效；语义上 system 是长期指令，也不该装「本轮」数据。
+        //
+        //   ⭐ 原样入库（2026-11-14 用户裁定）：不 strip。历史重放时 content 与当轮实际发送
+        //     完全一致 ⇒ 前缀缓存连续。代价是后续轮次会在历史里看到旧的 scope 快照 ——
+        //     因此**每轮都注入**（没选库时也注入空块 + 明确文案，见 buildRuntimeContextBlock）。
+        //
+        //   前端气泡按 `stripRuntimeContextForDisplay` 过滤后只显示用户原话。
+        String llmContent = buildRuntimeContextBlock(req) + "\n\n" + req.content();
         SendMessageRequest sendReq = new SendMessageRequest(
-            req.content(),
+            llmContent,
             req.modelName(),
             null,                 // useFastModel：网关不指定，走会话默认
             req.attachments() == null ? List.of() : req.attachments(),
-            null,                 // appendSystemPrompt
+            null,                 // appendSystemPrompt：范围已进 user content，这里保持 null
             null,                 // fallbackModel
             null,                 // permissionMode
             null,                 // dangerouslySkipPermissions
-            null);                // jsonSchema
+            null,                 // jsonSchema
+            // ⭐ 请求级检索范围（@ 的库/文件）。批 1 已把 requestExtras 打通到 ToolUseContext，
+            //   KbAgentToolScope 用它把工具作用域收窄到用户本次的选择。
+            //   null = 用户没选任何库/文件 ⇒ 工具范围仍只由会话绑定的 kb_agent 配置决定（原行为）。
+            kbScopeExtras(req));
         chatService.validateFallbackModelDistinct(sessionId, sendReq);
         MessageCreatedResponse resp = messageService.createUserMessage(sessionId, sendReq);
         chatService.processUserMessage(sessionId, resp.userMessageId(), sendReq, wsTemplate);
         return new GatewayAccepted(resp.userMessageId(), resp.assistantMessageId(),
             resp.streamTopic(), resp.queued(), Route.REACT.name());
+    }
+
+    /**
+     * 把「用户在面板里选中的知识库 / 文件」拼成模型可见的范围说明（ReAct 链专用）。
+     *
+     * <p><b>为什么是系统提示而不是正文</b>：正文要落库并显示给用户，范围说明属于给模型的
+     * 附属信息（与 RAG 链的 {@code <attachments>} 清单同一性质），不该出现在气泡里。
+     *
+     * <p>拼名称而不是只给 id：模型对 id 没有语义，报「要查哪个库」正是因为看不到名字；
+     * id 同时给出是为了让它调用 {@code knowledge_search} 时能填 {@code knowledge_base_ids}。
+     *
+     * @return 范围说明；用户没选任何库/文件 ⇒ {@code null}（不改变任何既有行为）
+     */
+    /**
+     * 请求级检索范围（`requestExtras["kbScope"]`）—— 工具执行期的硬约束来源。
+     *
+     * <p>与 {@link #reactScopePrompt} 的分工：那段文本是给**模型看**的（让它填对参数），
+     * 这里是给**工具**看的（模型不填也搜不到范围外）。源站对应 `SearchTargets`。
+     *
+     * <p>只放原始 id，不做解析：文档 → 父库的推导在 {@code KbAgentToolScope} 里做（那里已有
+     * 知识库/文档服务），网关不做数据查询。
+     *
+     * @return {@code {"kbScope": {"knowledgeBaseIds": [...], "knowledgeIds": [...]}}}；
+     *         两个列表都空 ⇒ {@code null}（不改变任何既有行为）
+     */
+    private java.util.Map<String, Object> kbScopeExtras(GatewayRequest req) {
+        java.util.List<String> kbIds = req.knowledgeBaseIds() == null ? java.util.List.of() : req.knowledgeBaseIds();
+        java.util.List<String> docIds = req.knowledgeIds() == null ? java.util.List.of() : req.knowledgeIds();
+        if (kbIds.isEmpty() && docIds.isEmpty()) {
+            return null;
+        }
+        java.util.Map<String, Object> scope = new java.util.LinkedHashMap<>();
+        scope.put("knowledgeBaseIds", java.util.List.copyOf(kbIds));
+        scope.put("knowledgeIds", java.util.List.copyOf(docIds));
+        return java.util.Map.of("kbScope", scope);
+    }
+
+    /**
+     * 本轮检索范围的模型可见形式（`<runtime_context scope="this_turn">`）。
+     *
+     * <p>对齐源站 `internal/agent/observe.go:612 buildRuntimeContextBlock`：范围以结构化 XML
+     * 信封给出，而不是自由散文 —— 模型更容易把它当数据而不是指令，后续也便于程序处理。
+     *
+     * <p><b>⭐ 每轮都生成，没选也给空块</b>：因为这块会**原样入库**并随历史重放，模型在第二轮
+     * 会同时看到「上一轮的范围快照」和「本轮的范围」。若不注入空块，它会以为上一轮的范围还生效
+     * （第 1 轮 @ 了 A 库、第 2 轮什么都没选 ⇒ 模型仍只查 A）。
+     *
+     * <p>⚠️ 本方法只做「给模型看」的部分；执行期硬约束走 `requestExtras.kbScope`
+     * （见 {@link #kbScopeExtras}），两者独立，缺一个都不算对齐。
+     *
+     * @param req 网关请求（取用户选的库/文件 id）
+     * @return XML 块（永不为 null / 空白）
+     */
+    private String buildRuntimeContextBlock(GatewayRequest req) {
+        List<String> kbIds = req.knowledgeBaseIds() == null ? List.of() : req.knowledgeBaseIds();
+        List<String> docIds = req.knowledgeIds() == null ? List.of() : req.knowledgeIds();
+        StringBuilder sb = new StringBuilder(512);
+        sb.append("<runtime_context scope=\"this_turn\">\n");
+        if (kbIds.isEmpty() && docIds.isEmpty()) {
+            sb.append("  <bound_knowledge_bases />\n");
+            sb.append("  <pinned_documents />\n");
+            sb.append("  <note>本轮用户未指定知识库/文件范围，可在全部可检索范围内检索。</note>\n");
+            sb.append("</runtime_context>");
+            return sb.toString();
+        }
+        sb.append("  <bound_knowledge_bases>\n");
+        for (String id : kbIds) {
+            com.nexusai.kb.dto.KnowledgeBaseDto dto = null;
+            try {
+                dto = knowledgeBaseService.getById(id);
+            } catch (RuntimeException e) {
+                log.debug("[KB对话入口] 查库信息失败 id={} 原因={}", id, e.toString());
+            }
+            String name = dto != null && dto.name() != null && !dto.name().isBlank() ? dto.name() : id;
+            String type = dto != null && dto.type() != null && !dto.type().isBlank() ? dto.type() : "document";
+            String caps = capabilitiesOf(dto);
+            String desc = dto == null ? null : dto.description();
+            // ⭐ 给模型看的是稳定句柄（kb://前8位），不是 36 字符 UUID。
+            //   执行期范围仍走 kbScopeExtras 的全 id —— 两者不能混。
+            sb.append("    <knowledge_base id=\"").append(escapeXml(handle(KB_PREFIX, id)))
+              .append("\" name=\"").append(escapeXml(name))
+              .append("\" type=\"").append(escapeXml(type))
+              .append("\" capabilities=\"").append(escapeXml(caps)).append("\"");
+            if (desc == null || desc.isBlank()) {
+                sb.append(" />\n");
+            } else {
+                sb.append(">\n      <description>").append(escapeXml(desc)).append("</description>\n");
+                sb.append("    </knowledge_base>\n");
+            }
+        }
+        sb.append("  </bound_knowledge_bases>\n");
+        sb.append("  <pinned_documents scope=\"authoritative_for_this_turn\">\n");
+        for (String id : docIds) {
+            String title = docTitleOf(id);
+            String ext = fileTypeOf(id);
+            sb.append("    <document knowledge_id=\"").append(escapeXml(handle(DOC_PREFIX, id)))
+              .append("\" title=\"").append(escapeXml(title)).append("\"");
+            if (!ext.isEmpty()) {
+                sb.append(" file_type=\"").append(escapeXml(ext)).append("\"");
+            }
+            sb.append(" />\n");
+        }
+        sb.append("  </pinned_documents>\n");
+        sb.append("  <note>工具参数里的知识库/文档请使用上面的 kb:// / doc:// 句柄；")
+          .append("也可直接使用完整 id。</note>\n");
+        sb.append("</runtime_context>");
+        return sb.toString();
+    }
+
+    /**
+     * 库的检索能力（`chunks` / `wiki`）—— 让模型据此选工具，而不是盲搜。
+     *
+     * <p>来源：`indexing_strategy` JSON 的 `vector_enabled` / `keyword_enabled` / `wiki_enabled`。
+     * 解析失败返回空串（模型看不到能力，退回通用策略，不影响正确性）。
+     */
+    private String capabilitiesOf(com.nexusai.kb.dto.KnowledgeBaseDto dto) {
+        if (dto == null) {
+            return "";
+        }
+        String raw = dto.indexingStrategy();
+        if (raw == null || raw.isBlank()) {
+            return "";
+        }
+        try {
+            var node = JSON.readTree(raw);
+            java.util.List<String> caps = new java.util.ArrayList<>(2);
+            if (node.path("vector_enabled").asBoolean(false) || node.path("keyword_enabled").asBoolean(false)) {
+                caps.add("chunks");
+            }
+            if (node.path("wiki_enabled").asBoolean(false)) {
+                caps.add("wiki");
+            }
+            return String.join(",", caps);
+        } catch (Exception e) {
+            log.debug("[KB对话入口] 解析 indexing_strategy 失败: {}", e.toString());
+            return "";
+        }
+    }
+
+    /** 文档扩展名（用于 `file_type`）· 查不到返回空串。 */
+    private String fileTypeOf(String id) {
+        try {
+            var dto = knowledgeService.getById(id);
+            String name = dto == null ? null : (dto.fileName() != null ? dto.fileName() : dto.title());
+            if (name == null) {
+                return "";
+            }
+            int dot = name.lastIndexOf('.');
+            return dot < 0 || dot == name.length() - 1 ? "" : name.substring(dot + 1).toLowerCase();
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
+    /** 稳定句柄：前缀 + id 前 8 位（与工具侧 {@code KbHandleResolver} 的前缀匹配同一套规则）。 */
+    private static String handle(String prefix, String id) {
+        return com.nexusai.kb.agent.tool.KbHandleResolver.toHandle(prefix, id);
+    }
+
+    /** XML 属性/文本转义 —— 库名、文档名里可能带 `&` `<` `"`，不转义会破坏信封结构。 */
+    private static String escapeXml(String s) {
+        if (s == null) {
+            return "";
+        }
+        return s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("\"", "&quot;");
+    }
+
+    /** 库名 · 查不到时回落 id（⛔ 不编造名称）。 */
+    private String kbNameOf(String id) {
+        try {
+            var dto = knowledgeBaseService.getById(id);
+            if (dto != null && dto.name() != null && !dto.name().isBlank()) {
+                return dto.name();
+            }
+        } catch (RuntimeException e) {
+            log.debug("[KB对话入口] 查库名失败 id={} 原因={}", id, e.toString());
+        }
+        return id;
+    }
+
+    /** 文档名 · 查不到时回落 id。 */
+    private String docTitleOf(String id) {
+        try {
+            var dto = knowledgeService.getById(id);
+            if (dto != null) {
+                String t = dto.title() != null && !dto.title().isBlank() ? dto.title() : dto.fileName();
+                if (t != null && !t.isBlank()) {
+                    return t;
+                }
+            }
+        } catch (RuntimeException e) {
+            log.debug("[KB对话入口] 查文档名失败 id={} 原因={}", id, e.toString());
+        }
+        return id;
     }
 
     // ── 分流判据 ──────────────────────────────────────────────────────────────

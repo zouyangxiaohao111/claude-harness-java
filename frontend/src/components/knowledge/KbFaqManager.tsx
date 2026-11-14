@@ -200,7 +200,10 @@ export function KbFaqManager({ baseId, showToast }: Props) {
                   className="t-button t-button--variant-base t-button--theme-primary t-size-s"
                   onClick={() => setCreating(true)}
                 >
-                  <span className="t-button__text">＋ 新建问答</span>
+                  <span className="t-button__text">
+                    <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }}><use href="#t-icon-add" /></svg>
+                    新建问答
+                  </span>
                 </button>
               </div>
             </div>
@@ -462,7 +465,7 @@ function FaqEditor({ baseId, entry, tags, showToast, onClose, onSaved }: {
     <div className="kb-mini-modal kb-mini-lg" role="dialog" aria-modal="true" aria-label={entry ? '编辑问答' : '新建问答'}>
       <div className="kb-mini-head">
         <strong>{entry ? '编辑问答' : '新建问答'}</strong>
-        <button type="button" className="kb-mini-x" onClick={onClose}>✕</button>
+        <button type="button" className="kb-mini-x" onClick={onClose}><svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-close" /></svg></button>
       </div>
       <div className="kb-mini-body faq-editor-form">
         <div className="form-item">

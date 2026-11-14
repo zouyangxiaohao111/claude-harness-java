@@ -45,6 +45,8 @@ public record ModelDto(
     Integer embeddingDimensions,
     /** 单次 embedding 请求文本条数上限 · models.embedding_batch_size（V200）；null/≤0 = 10 */
     Integer embeddingBatchSize,
+    /** 后台并发上限（仅后台向量化生效）· models.max_concurrency（V291）；null/0 = 全局默认 32，负数 = 不限 */
+    Integer maxConcurrency,
     /** 重排默认返回条数（仅 type=rerank 生效）· models.rerank_top_n（V200）；null = 服务端默认 */
     Integer rerankTopN,
     /** 重排默认指令（仅 type=rerank 生效）· models.rerank_instruct（V200）；null/空 = 不发送 */

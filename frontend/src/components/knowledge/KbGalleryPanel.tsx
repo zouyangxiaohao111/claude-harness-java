@@ -99,10 +99,10 @@ export function KbGalleryPanel({ baseId, showToast }: Props) {
             </div>
           </div>
           <button type="button" className="ig-tool-btn" title="筛选" onClick={() => showToast('图片筛选：本仓暂未接入图片抽取', 'info')}>
-            ⚗
+            <svg width={15} height={15} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-filter" /></svg>
           </button>
           <button type="button" className="ig-tool-btn" title="视图" onClick={() => showToast('视图切换：当前只有网格视图', 'info')}>
-            ▦
+            <svg width={15} height={15} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-image" /></svg>
           </button>
           <button type="button" className="ig-tool-btn ig-sort-trigger" title="排序">
             <span className="ig-sort-trigger__label">排序 · 创建时间</span>
@@ -152,7 +152,7 @@ export function KbGalleryPanel({ baseId, showToast }: Props) {
                     {img.title || '未命名图片'}
                   </div>
                   <div className="ig-card__source" title={img.sourceTitle}>
-                    <span aria-hidden="true">▤</span>
+                    <svg width={12} height={12} viewBox="0 0 24 24" aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }}><use href="#t-icon-file" /></svg>
                     <span>{img.sourceTitle || '—'}</span>
                   </div>
                 </div>

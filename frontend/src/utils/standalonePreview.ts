@@ -38,6 +38,13 @@ export interface StandalonePayload {
   project?: { id: string; path: string }
   /** 会话产物（docx/xlsx/pdf/image 走后端 artifacts/{id}/raw 端点取字节/源） */
   artifact?: { sessionId: string; artifactId: string }
+  /**
+   * 知识库文档（走 `GET /api/v1/knowledge/{id}/download` 取原始文件）。
+   *
+   * <p>⚠️ 知识库场景**必须**用这条源：文档没有附件三态（url/path/base64），
+   * 走 `item` 会报「附件内容不可用」。
+   */
+  kb?: { knowledgeId: string }
   /** html：内联内容（对话代码块运行 / FileViewModal 运行） */
   code?: string
 }

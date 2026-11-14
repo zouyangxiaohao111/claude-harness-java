@@ -127,6 +127,36 @@ export interface CreateKnowledgeBaseBody {
   image_ocr_enabled?: boolean
   /** 图片管线方案（V286）：只允许 `default` | `smartocr`，其它值后端 400。 */
   image_pipeline?: KbImagePipelineName
+  /**
+   * Wiki 配置 JSON（`wiki_config`，**已序列化**）。
+   *
+   * <p>⚠️ Wiki 的**开关**在 `indexing_strategy.wiki_enabled`，这里只放可调项
+   * （`auto_generate` / `synthesis_model_id` / `max_pages_per_ingest` /
+   * `extraction_granularity` / `content_instructions` / `extraction_instructions`）。
+   */
+  wiki_config?: string | null
+  /**
+   * 图片处理配置 JSON（`image_processing_config`，**已序列化**）。
+   *
+   * <p>后端 `KbPostProcessConfig` 读 `enable_multimodal` ∧ `model_id` 决定图片理解是否派发；
+   * 其余键（`description_language` / `custom_instructions` / `enable_image_vector`）一并落库。
+   * ⚠️ 与顶层列 `image_pipeline` 不是同一字段，⛔ 不要把旧键 `image_pipeline`（`""`/`"attrs"`）写进来。
+   */
+  image_processing_config?: string | null
+  /** ASR 配置 JSON（`asr_config`，**已序列化**）：`{enabled, model_id, language}`。 */
+  asr_config?: string | null
+  /** 问题生成配置 JSON（`question_generation_config`，**已序列化**）。 */
+  question_generation_config?: string | null
+  /** 自动打标配置 JSON（`auto_tag_config`，**已序列化**）。 */
+  auto_tag_config?: string | null
+  /** 知识库画像配置 JSON（`profile_config`，**已序列化**）。 */
+  profile_config?: string | null
+  /** FAQ 配置 JSON（`faq_config`，**已序列化**）：`{index_mode, question_index_mode}`。 */
+  faq_config?: string | null
+  /** 绑定的向量库实例 ID（`vector_store_id`）；不传/空 = 系统默认。 */
+  vector_store_id?: string | null
+  /** 绑定的存储实例 ID（`storage_backend_id`）；不传/空 = 租户默认。 */
+  storage_backend_id?: string | null
 }
 
 /** 更新知识库请求（null / 不传 = 不改）。 */
@@ -369,6 +399,91 @@ export class KbRawBytesError extends Error {
   get isMissingFile(): boolean {
     return this.status === 404
   }
+}
+
+/**
+ * 单个文件的上传字节进度（与浏览器 `ProgressEvent` 对齐）。
+ *
+ * <p>源站 `UploadItem.loaded` 的语义（`stores/uploadTasksState.ts:19`）：
+ * 「已发送的文件正文字节数，由 multipart 进度换算」——本仓用 XHR 的
+ * `upload.onprogress` 拿到同样的数值。
+ */
+export interface UploadByteProgress {
+  /** 已发送字节 */
+  loaded: number
+  /** 总字节（浏览器报不出时用 file.size 兜底） */
+  total: number
+}
+
+/**
+ * 带上传进度的 multipart POST（XHR 实现）。
+ *
+ * <p><b>为什么不用 fetch</b>：fetch 没有请求体上传进度事件。源站用 axios 的
+ * `onUploadProgress`（`utils/request.ts:244`），本仓没有 axios ⇒ 直接用 XHR。
+ *
+ * <p>错误形态与 `api()` 一致：非 2xx 抛 {@link ApiError}（`status` 必须保留 ——
+ * 409 重复判定靠它，见 {@link isDuplicateUploadError}）。
+ */
+function uploadFormWithProgress(
+  url: string,
+  form: FormData,
+  signal?: AbortSignal,
+  onProgress?: (progress: UploadByteProgress) => void,
+): Promise<Knowledge> {
+  return new Promise<Knowledge>((resolve, reject) => {
+    if (signal?.aborted) {
+      reject(new UploadCancelledError())
+      return
+    }
+    const xhr = new XMLHttpRequest()
+    xhr.open('POST', url)
+    xhr.setRequestHeader('Accept', 'application/json')
+    xhr.setRequestHeader('X-Client-Env', 'react')
+    // ⚠️ 不设 Content-Type：multipart 的 boundary 必须由浏览器生成
+    xhr.upload.onprogress = (e) => {
+      if (!onProgress) return
+      onProgress({ loaded: e.loaded, total: e.lengthComputable ? e.total : 0 })
+    }
+    xhr.onload = () => {
+      if (xhr.status >= 200 && xhr.status < 300) {
+        try {
+          resolve(JSON.parse(xhr.responseText) as Knowledge)
+        } catch (parseError) {
+          reject(new ApiError('上传响应不是合法 JSON', { status: xhr.status }))
+        }
+        return
+      }
+      reject(apiErrorFromXhr(xhr))
+    }
+    xhr.onerror = () => reject(new ApiError('网络错误：上传请求失败', { status: 0 }))
+    xhr.ontimeout = () => reject(new ApiError('上传超时', { status: 0 }))
+    xhr.onabort = () => reject(new UploadCancelledError())
+    if (signal) {
+      signal.addEventListener('abort', () => xhr.abort(), { once: true })
+    }
+    xhr.send(form)
+  })
+}
+
+/** 把 XHR 的失败响应转成 {@link ApiError}（problem+json 能解就解，解不了用状态码）。 */
+function apiErrorFromXhr(xhr: XMLHttpRequest): ApiError {
+  let title: string | undefined
+  let detail: string | undefined
+  let type: string | undefined
+  try {
+    const body = JSON.parse(xhr.responseText || '{}') as Record<string, unknown>
+    if (typeof body.title === 'string') title = body.title
+    if (typeof body.detail === 'string') detail = body.detail
+    if (typeof body.type === 'string') type = body.type
+  } catch {
+    // 非 JSON 错误体（网关 HTML 等）⇒ 保持 undefined
+  }
+  return new ApiError(detail || title || `HTTP ${xhr.status}`, {
+    status: xhr.status,
+    title,
+    detail,
+    type,
+  })
 }
 
 /**
@@ -793,27 +908,20 @@ export const knowledgeApi = {
     baseId: string,
     file: File,
     fileName?: string,
-    signal?: AbortSignal
+    signal?: AbortSignal,
+    onProgress?: (progress: UploadByteProgress) => void
   ): Promise<Knowledge> => {
     const form = new FormData()
     form.append('file', file)
     if (fileName) form.append('fileName', fileName)
-    const { API_V1_BASE } = await import('./base')
-    const res = await fetch(
+    // ⚠️ fetch 没有上传进度事件（只有下载流过 ReadableStream）⇒ 必须用 XHR。
+    //    源站走 axios 的 onUploadProgress（utils/request.ts:244 postUpload），同一语义。
+    return uploadFormWithProgress(
       `${API_V1_BASE}/knowledge-bases/${encodeURIComponent(baseId)}/knowledge/file`,
-      {
-        method: 'POST',
-        body: form,
-        headers: { Accept: 'application/json', 'X-Client-Env': 'react' },
-        // ⚠️ 不能自己设 Content-Type：multipart 的 boundary 必须由浏览器生成
-        ...(signal ? { signal } : {}),
-      }
+      form,
+      signal,
+      onProgress
     )
-    if (!res.ok) {
-      const { parseProblem } = await import('./rest')
-      throw await parseProblem(res)
-    }
-    return (await res.json()) as Knowledge
   },
 
   /**
@@ -839,7 +947,10 @@ export const knowledgeApi = {
     items: UploadManyItem[],
     options: {
       concurrency?: number
+      /** 每个文件结算（成功/失败）时回调一次 */
       onProgress?: (done: number, total: number) => void
+      /** 单个文件的**字节**进度（源站 onUploadProgress 同语义；对齐面板逐行进度条） */
+      onItemProgress?: (item: UploadManyItem, progress: UploadByteProgress) => void
       signal?: AbortSignal
     } = {}
   ): Promise<UploadManyResult> => {
@@ -853,7 +964,10 @@ export const knowledgeApi = {
         await acquireUploadSlot()
         try {
           if (signal?.aborted) throw new UploadCancelledError()
-          return await knowledgeApi.uploadKnowledge(baseId, item.file, item.fileName, signal)
+          return await knowledgeApi.uploadKnowledge(
+            baseId, item.file, item.fileName, signal,
+            (progress) => options.onItemProgress?.(item, progress)
+          )
         } finally {
           releaseUploadSlot()
         }

@@ -10,6 +10,7 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.kb.app.parser.KbParseException;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import com.nexusai.kb.repo.mapper.KbKnowledgeMapper;
 import org.slf4j.Logger;
@@ -42,6 +43,9 @@ public class KbDataSchemaTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbDataSchemaTool.class);
     private static final JsonNodeFactory JSON = JsonNodeFactory.instance;
+
+    @Autowired(required = false)
+    private KbHandleResolver handleResolver;
 
     @Autowired private KbDuckDbDataset dataset;
 
@@ -91,6 +95,15 @@ public class KbDataSchemaTool implements Tool {
             String knowledgeId = call.input().path("knowledge_id").asText("").trim();
             if (knowledgeId.isEmpty()) {
                 return ToolResult.error(call.id(), "knowledge_id 不能为空");
+            }
+            // ⭐ 句柄解析：模型拿到的是 doc://<前8位>（runtime_context 里的形式）
+            if (handleResolver != null) {
+                try {
+                    knowledgeId = handleResolver.resolveDocument(knowledgeId);
+                } catch (KbParseException e) {
+                    log.warn("[data_schema] 句柄解析失败: {}", e.getMessage());
+                    return ToolResult.error(call.id(), e.getMessage());
+                }
             }
 
             KbKnowledgeRecord row = lookup(knowledgeId);

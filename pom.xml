@@ -14,7 +14,7 @@
 
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
-    <version>0.1.76</version>
+    <version>0.1.77</version>
     <name>nexusai-backend</name>
     <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 
@@ -204,6 +204,17 @@
             <groupId>cn.hutool</groupId>
             <artifactId>hutool-all</artifactId>
             <version>5.8.35</version>
+        </dependency>
+
+        <!-- [pattern-re2-guard 2026-11-14] RE2 校验器 · Anthropic 用 RE2 编译工具的 JSON Schema
+             `pattern`，不认 `\uXXXX`、lookbehind、反向引用等 JS 合法写法 ⇒ 一处不合规整轮 400
+             （线上实例：rea MCP 的 `^[\uD800-\uDFFF]$`）。发送前用 re2j 预编译：能过就原样发，
+             不能过先做 Unicode 转义改写，仍不能过则删该 pattern（保留工具可用性）。
+             纯 Java 实现，无 native 依赖。 -->
+        <dependency>
+            <groupId>com.google.re2j</groupId>
+            <artifactId>re2j</artifactId>
+            <version>1.1</version>
         </dependency>
 
         <!-- [P-CC-01] Apache PDFBox · PDF 解析（对齐 CC utils/pdf.ts readPDF/extractPDFPages，

@@ -261,7 +261,17 @@ public record ToolUseContext(
         //
         // @JsonIgnore: local-only。身份不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 agentContext / subagentName / effectiveModelName / readFileState 约束）。
-        @JsonIgnore com.nexusai.application.agent.team.TeammateIdentity teammateIdentity
+        @JsonIgnore com.nexusai.application.agent.team.TeammateIdentity teammateIdentity,
+        // ═══════ [request-extras 批 1] 请求级通用透传 map（第 54 组件 · local-only）═══════
+        // WHY：知识库 ReAct 入口只能经 appendSystemPrompt 把「用户 @ 了哪些库/文件」写成文本，
+        //   没有请求级参数能直达工具 ⇒ 模型不填 knowledge_base_ids 时工具回落 agent 白名单（可能是全部库）。
+        //   载体链：SendMessageRequest.requestExtras → RunRequest.requestExtras →
+        //   本字段（base TUC）→ per-turn TUC（wither 透传）→ 工具 execute 形参。
+        // 本批为空转：KbChatGatewayController 尚未写入（批 2），生产恒空 map ⇒ 工具侧行为不变。
+        // null 入参 → compact ctor 兜底 Map.of()；非 null 入参 → Map.copyOf 不可变快照。
+        // @JsonIgnore: 请求级运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 teammateIdentity / agentContext / readFileState local-only 约束）。
+        @JsonIgnore Map<String, Object> requestExtras
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -538,6 +548,9 @@ public record ToolUseContext(
         if (queryTracking != null) {
             queryTracking = Map.copyOf(queryTracking);
         }
+        // [request-extras 批 1] 请求级透传 map 兜底空快照（null → Map.of()；非 null → 不可变副本，
+        //   与 queryTracking 同一写法）。本批生产恒空 ⇒ 工具侧行为不变。
+        requestExtras = requestExtras == null ? Map.of() : Map.copyOf(requestExtras);
         // agentType / toolUseId / criticalReminder 兜底 null, userModified 默认 false (record 默认)
         // [Session L+ R1] readFileState 兜底 null → createFileStateCache() 双限真 LRU.
         // [P-CC-02] WHY: 1) dedup cache 跨工具共享, 必须可变 (ReadFileTool / EditFileTool /
@@ -711,7 +724,8 @@ public record ToolUseContext(
              null,     // [tuc-subagent-identity] subagentName 缺省 → null（非子代理上下文；唯一产出点盖章）
              false,    // [tuc-subagent-identity] isBuiltIn 缺省 → false
              null,    // [批 5b-1] agentContext 缺省 → null（非 agent 上下文；唯一盖章入口 withAgentContext）
-             null);   // [S1-T1] teammateIdentity 缺省 → null（非 teammate 上下文；唯一盖章入口 withTeammateIdentity）
+             null,    // [S1-T1] teammateIdentity 缺省 → null（非 teammate 上下文；唯一盖章入口 withTeammateIdentity）
+             null);   // [request-extras 批 1] requestExtras 缺省 → null（compact ctor 兜底 Map.of()）
     }
 
     /** Stage 3.1 4 参兼容构造器. */
@@ -1500,7 +1514,7 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1538,7 +1552,7 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     /**
@@ -1574,7 +1588,7 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     /**
@@ -1607,7 +1621,7 @@ public record ToolUseContext(
             modelName,
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     /**
@@ -1656,7 +1670,7 @@ public record ToolUseContext(
             effectiveModelName(),
             providerType, subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     /**
@@ -1707,7 +1721,7 @@ public record ToolUseContext(
             //   {@link #withAgentContext} 单点盖章（两者盖章时机同在 SubagentExecutor TUC 定稿步，
             //   但语义不同 —— 一个是「本 agent 是谁」，一个是「本 invocation 的归因边载荷」）。
             agentContext(),
-            teammateIdentity());  // [S1-T1] 身份透传：withSubagentIdentity 只覆写子代理身份名，teammate 身份原样保留
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传：withSubagentIdentity 只覆写子代理身份名，teammate 身份原样保留
     }
 
     /**
@@ -1757,7 +1771,7 @@ public record ToolUseContext(
             isBuiltIn(),
             agentContext,
             // [S1-T1] 身份透传：本 wither 只覆写 agentContext，teammate 身份原样保留。
-            this.teammateIdentity());
+            this.teammateIdentity(), requestExtras());
     }
 
     /**
@@ -1804,7 +1818,51 @@ public record ToolUseContext(
             subagentName(),
             isBuiltIn(),
             agentContext(),
-            teammateIdentity);
+            teammateIdentity,
+            requestExtras());
+    }
+
+    /**
+     * [request-extras 批 1] 覆盖请求级通用透传 map（{@code null} 参数 → 保留现有）。
+     *
+     * <p><b>唯一生产盖章点</b> = {@code LlmAgentLoop.doRun}（{@code RunRequest.requestExtras()} →
+     * base TUC）；per-turn TUC 由 base 经 {@code withQueryTracking / withMessages} 派生时按引用透传
+     * （各 wither 已带本字段），故工具 {@code execute} 形参恒可读到本轮请求级范围。
+     *
+     * <p>本批为空转：生产传 null（KB 入口尚未写入）⇒ 返回同一实例，零行为变化。
+     *
+     * @param extras 请求级透传参数；null / 同值 → 返回 {@code this}
+     * @return 带该 map 的新 TUC（其余字段原样透传）
+     */
+    public ToolUseContext withRequestExtras(Map<String, Object> extras) {
+        if (extras == null || extras.equals(this.requestExtras())) {
+            return this;
+        }
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            effectiveProviderType(),
+            subagentName(),
+            isBuiltIn(),
+            agentContext(),
+            teammateIdentity(),
+            extras);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1848,7 +1906,7 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity());  // [S1-T1] 身份透传 (null 保留)
+            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -2059,7 +2117,11 @@ public record ToolUseContext(
             //   是「新 agent 的 TUC」构造点，新 agent 的身份由唯一盖章入口
             //   {@link #withTeammateIdentity} 装配。取 null 而非继承父 = 失败方向取「身份缺失」
             //   而不是「身份归到父 teammate」。
-            null);
+            null,
+            // [request-extras 批 1] 透传父值（与 subagentName/isBuiltIn/agentContext 不同）：
+            //   本字段是「请求级」范围（用户 @ 的库/文件），不是「本 agent 身份」⇒ 同一请求内派生出的
+            //   子代理理应看到同一范围，故原样保留（父空 map → 子空 map，行为不变）。
+            requestExtras());
     }
 
     /**

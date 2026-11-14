@@ -57,16 +57,68 @@ public record UpdateKnowledgeBaseRequest(
      * 且值域是枚举，「清空」没有意义（要回默认就传 {@code default}）。
      */
     @JsonProperty("image_pipeline")
-    String imagePipeline
+    String imagePipeline,
+
+    /** Wiki 配置 JSON（null = 不改）。开关在 {@code indexing_strategy.wiki_enabled}。 */
+    @JsonProperty("wiki_config")
+    String wikiConfig,
+
+    /** 图片处理配置 JSON（null = 不改）。 */
+    @JsonProperty("image_processing_config")
+    String imageProcessingConfig,
+
+    /** ASR 配置 JSON（null = 不改）。 */
+    @JsonProperty("asr_config")
+    String asrConfig,
+
+    /** 问题生成配置 JSON（null = 不改）。 */
+    @JsonProperty("question_generation_config")
+    String questionGenerationConfig,
+
+    /** 自动打标配置 JSON（null = 不改）。 */
+    @JsonProperty("auto_tag_config")
+    String autoTagConfig,
+
+    /** 知识库画像配置 JSON（null = 不改）。 */
+    @JsonProperty("profile_config")
+    String profileConfig,
+
+    /** FAQ 配置 JSON（null = 不改）。 */
+    @JsonProperty("faq_config")
+    String faqConfig,
+
+    /** 绑定的向量库 ID（null = 不改；"" = 解绑）。 */
+    @JsonProperty("vector_store_id")
+    String vectorStoreId,
+
+    /** 绑定的存储后端 ID（null = 不改；"" = 解绑）。 */
+    @JsonProperty("storage_backend_id")
+    String storageBackendId
 ) {
     /**
-     * 6 参兼容构造器（既有测试用；新增 3 个图片管线字段恒 null = 不改）。
+     * 6 参兼容构造器（既有测试用；其余字段恒 null = 不改）。
      */
     public UpdateKnowledgeBaseRequest(
         String name, String description, String chunkingConfig,
         String embeddingModelId, String summaryModelId, String retrieverEngine
     ) {
         this(name, description, chunkingConfig, embeddingModelId, summaryModelId, retrieverEngine,
-            null, null, null);
+            null, null, null, null, null, null, null, null, null, null, null, null);
+    }
+
+    /**
+     * 9 参兼容构造器（含图片管线三项，不含本次新增的 9 项配置）。
+     *
+     * <p>⚠️ 既有测试 {@code KbImagePipelineConfigDbTest} 按位置传 9 个参数。
+     * 新增 9 项恒 null = 不改。
+     */
+    public UpdateKnowledgeBaseRequest(
+        String name, String description, String chunkingConfig,
+        String embeddingModelId, String summaryModelId, String retrieverEngine,
+        Boolean imageCaptionEnabled, Boolean imageOcrEnabled, String imagePipeline
+    ) {
+        this(name, description, chunkingConfig, embeddingModelId, summaryModelId, retrieverEngine,
+            imageCaptionEnabled, imageOcrEnabled, imagePipeline,
+            null, null, null, null, null, null, null, null, null);
     }
 }

@@ -62,6 +62,19 @@ import type { ApiFlowError } from '@/stores/chatStore'
 import { tasksApi } from '@/api/tasks'
 import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePreview'
 
+/**
+ * 知识库 ReAct 轮的用户消息 content 开头带 `<runtime_context scope="this_turn">…</runtime_context>`
+ * 块（后端**原样入库**，为了历史重放时前缀与当轮实际发送一致，缓存不断）。
+ * 气泡只该显示用户原话，渲染前把这块剥掉。
+ *
+ * <p>⚠️ 只在**开头**匹配完整信封，且要求 `scope="this_turn"` ——
+ * 用户自己在消息里粘贴这几个字时不会被误删。
+ */
+function stripRuntimeContextForDisplay(text: string): string {
+  const m = text.match(/^<runtime_context scope="this_turn">[\s\S]*?<\/runtime_context>\s*/)
+  return m ? text.slice(m[0].length) : text
+}
+
 /** 知识库 @引用 chip（数值照源站 chat-resource-chips.less：mentioned_items flex-end / tag 26px 高、3px 8px 内边距） */
 const USER_REF_ITEMS: React.CSSProperties = {
   display: 'flex', flexWrap: 'wrap', gap: 6, justifyContent: 'flex-end', maxWidth: '100%', marginBottom: 2,
@@ -70,6 +83,7 @@ const USER_REF_CHIP: React.CSSProperties = {
   display: 'inline-flex', alignItems: 'center', gap: 5,
   minHeight: 26, maxWidth: 200, padding: '3px 8px', borderRadius: 6, boxSizing: 'border-box',
   background: '#f2f3f5', border: '1px solid #e3e6ea', color: '#1f2329',
+  boxShadow: 'inset 0 1px 0 rgba(255,255,255,0.72)',
   fontSize: 12, fontWeight: 500, lineHeight: '18px', cursor: 'default',
 }
 const USER_REF_NAME: React.CSSProperties = {
@@ -1877,7 +1891,21 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
               {msg.userAttachments?.some((a) => a.type === 'kb') ? (
                 <div style={USER_REF_ITEMS}>
                   {msg.userAttachments.filter((a) => a.type === 'kb').map((a, i) => (
-                    <span key={i} style={USER_REF_CHIP} title={a.filename}>
+                    <span
+                      key={i}
+                      style={{ ...USER_REF_CHIP, cursor: a.contentId ? 'pointer' : 'default' }}
+                      // 知识库文档引用（带 contentId = 文档 id）⇒ 点开独立预览，走知识库原文接口。
+                      // ⚠️ 旧实现把它当普通附件（item 三态）打开 ⇒ 「缺少 url/path/base64 源」。
+                      title={a.contentId ? `点击预览：${a.filename}` : (a.filename ?? undefined)}
+                      role={a.contentId ? 'button' : undefined}
+                      onClick={a.contentId
+                        ? () => openStandalone({
+                            type: previewKindOfAttachment({ filename: a.filename }),
+                            title: a.filename ?? '预览',
+                            kb: { knowledgeId: a.contentId as string },
+                          })
+                        : undefined}
+                    >
                       <span style={{ color: '#1664ff', display: 'inline-flex', flexShrink: 0 }}>
                         <svg viewBox="0 0 16 16" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.4">
                           <path d="M2 4.6C2 3.8 2.6 3.1 3.5 3.1h2.2l1.2 1.6h4.6c.9 0 1.5.7 1.5 1.5v5.3c0 .8-.6 1.5-1.5 1.5h-8c-.9 0-1.5-.7-1.5-1.5z" strokeLinejoin="round" />
@@ -1891,13 +1919,17 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
               <div className="user-bubble">
                 {/* [Phase3 @引用] 正文里的 @token 直接渲染为内联可点 chip（单份 · 不再额外加引用卡片行）。
                     无 @引用时仍走原有 ContentGuard markdown 渲染。 */}
-                {extractAtRefs(msg.content).length > 0 ? (
-                  <div className="user-text user-ref-text">
-                    {renderUserRefText(msg.content ?? '', onOpenRefFile)}
-                  </div>
-                ) : (
-                  <ContentGuard text={msg.content ?? ''} className="user-text md" onRunHtml={onRunHtml} />
-                )}
+                {(() => {
+                  // 知识库轮次的 content 前缀是给模型的 runtime_context 块 ⇒ 展示前剥掉
+                  const shown = stripRuntimeContextForDisplay(msg.content ?? '')
+                  return extractAtRefs(shown).length > 0 ? (
+                    <div className="user-text user-ref-text">
+                      {renderUserRefText(shown, onOpenRefFile)}
+                    </div>
+                  ) : (
+                    <ContentGuard text={shown} className="user-text md" onRunHtml={onRunHtml} />
+                  )
+                })()}
                 {msg.userAttachments?.filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename).map((a, i) => (
                   <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a })}>
                     {attachIcon(a)}

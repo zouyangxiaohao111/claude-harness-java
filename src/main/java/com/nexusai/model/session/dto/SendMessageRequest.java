@@ -3,6 +3,7 @@ package com.nexusai.model.session.dto;
 import com.fasterxml.jackson.databind.JsonNode;
 import jakarta.validation.constraints.NotBlank;
 import java.util.List;
+import java.util.Map;
 
 /** POST /api/v1/sessions/{sessionId}/messages 请求 */
 public record SendMessageRequest(
@@ -24,7 +25,19 @@ public record SendMessageRequest(
     Boolean dangerouslySkipPermissions, // [RV-11 · REV-FIX-2] 可选 · 本次调用是否跳过全部权限检查
                                      // CC original: --dangerously-skip-permissions（main.tsx:621 rawCliArgs.includes）
                                      // null/false = 不跳过
-    JsonNode jsonSchema              // [IMP-HR-08 · OPD-WF6-01-06-?-3] 可选 · 本次调用主循环结构化输出 JSON Schema
+    JsonNode jsonSchema,             // [IMP-HR-08 · OPD-WF6-01-06-?-3] 可选 · 本次调用主循环结构化输出 JSON Schema
                                      // CC original: --json-schema（main.tsx:1880-1883 + QueryEngine.ts:327-333）
                                      // null = 未指定 → 主循环不注册 structured output enforcement
-) {}
+    Map<String, Object> requestExtras // 可选 · 请求级通用透传参数（本批仅骨架空转 · 不落库 · 不参与任何行为）
+                                     // 供工具执行期读取本轮「用户 @ 的库/文件」等请求级范围；null = 无
+                                     // （批 2 才由 kb/api/KbChatGatewayController.viaReact 写入）
+) {
+    /** 旧 9 参转发构造器（requestExtras 缺省 = null · 既有调用点零改动）。 */
+    public SendMessageRequest(String content, String modelName, Boolean useFastModel,
+                              List<AttachmentRequest> attachments, String appendSystemPrompt,
+                              String fallbackModel, String permissionMode,
+                              Boolean dangerouslySkipPermissions, JsonNode jsonSchema) {
+        this(content, modelName, useFastModel, attachments, appendSystemPrompt, fallbackModel,
+            permissionMode, dangerouslySkipPermissions, jsonSchema, null);
+    }
+}

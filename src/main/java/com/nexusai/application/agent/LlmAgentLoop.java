@@ -3594,6 +3594,13 @@ public class LlmAgentLoop implements AgentLoop {
             // [批 rfs-replay-3b] 跨进程 readFileState 恢复的原料 = 本方法 :2662-2671 已读到的
             //   那一次 DB 原始转录（⛔ 不再新增第二次 DB I/O；null/空 ⇒ replay 软降级跳过）。
             resumeRawTranscript);
+        // [request-extras 批 1] 请求级通用透传：RunRequest.requestExtras() → base TUC →
+        //   per-turn TUC（AgentLoopContext.toolExecContext 的 with* 派生按引用透传）→ 工具 execute 形参。
+        //   本批骨架空转：KB 入口尚未写入 ⇒ params.requestExtras() 恒 null ⇒ withRequestExtras
+        //   短路返回同一实例（零新实例、零行为变化）。
+        if (baseTuc != null) {
+            baseTuc = baseTuc.withRequestExtras(params.requestExtras());
+        }
         // ── [批 A2b] 会话 SESSION 档授权回读注入 · 对齐 CC appState.toolPermissionContext（会话内存态）──
         //   背景：CC 的 appState.toolPermissionContext 活在长驻进程里（文件类弹窗「Yes, during this
         //   session」destination='session'，permissionOptions.tsx:49-52 / usePermissionHandler.ts:123），

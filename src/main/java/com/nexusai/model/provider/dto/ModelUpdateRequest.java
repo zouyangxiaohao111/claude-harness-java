@@ -42,6 +42,8 @@ public record ModelUpdateRequest(
     Integer embeddingDimensions,
     /** 单次 embedding 请求文本条数上限 · PATCH 语义：null 不改 */
     Integer embeddingBatchSize,
+    /** 后台并发上限 · PATCH 语义：null 不改 */
+    Integer maxConcurrency,
     /** 重排默认返回条数 · PATCH 语义：null 不改 */
     Integer rerankTopN,
     /** 重排默认指令 · PATCH 语义：null 不改，空串显式清空 */

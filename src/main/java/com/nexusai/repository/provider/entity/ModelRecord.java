@@ -44,6 +44,13 @@ public class ModelRecord {
      */
     private Integer embeddingBatchSize;
     /**
+     * 后台并发上限 · V291 列 {@code max_concurrency}。
+     *
+     * <p>null / 0 = 沿用全局默认（32）；负数 = 关闭限制。只作用于后台向量化（见
+     * {@code KbEmbeddingConcurrencyGate}）。
+     */
+    private Integer maxConcurrency;
+    /**
      * 重排默认返回条数（仅 {@code type=rerank} 生效）· V200 列 {@code rerank_top_n}。
      * null = 请求不携带 {@code top_n}（服务端默认）。
      */
@@ -111,6 +118,7 @@ public class ModelRecord {
         // [V200] 向量嵌入配置 → 领域对象
         m.setEmbeddingDimensions(embeddingDimensions);
         m.setEmbeddingBatchSize(embeddingBatchSize);
+        m.setMaxConcurrency(maxConcurrency);
         m.setRerankTopN(rerankTopN);
         m.setRerankInstruct(rerankInstruct);
         // [V-TOK 实施] 价格 8 列 → 领域对象（与 toDomain 对称，ModelCostCalculator 读）
@@ -146,6 +154,7 @@ public class ModelRecord {
         // [V200] 领域对象 → 向量嵌入配置（与 toDomain 对称）
         r.setEmbeddingDimensions(m.getEmbeddingDimensions());
         r.setEmbeddingBatchSize(m.getEmbeddingBatchSize());
+        r.setMaxConcurrency(m.getMaxConcurrency());
         r.setRerankTopN(m.getRerankTopN());
         r.setRerankInstruct(m.getRerankInstruct());
         // [V-TOK 实施] 领域对象 → 价格 8 列（与 toDomain 对称）
@@ -198,6 +207,8 @@ public class ModelRecord {
     public void setEmbeddingDimensions(Integer embeddingDimensions) { this.embeddingDimensions = embeddingDimensions; }
     public Integer getEmbeddingBatchSize() { return embeddingBatchSize; }
     public void setEmbeddingBatchSize(Integer embeddingBatchSize) { this.embeddingBatchSize = embeddingBatchSize; }
+    public Integer getMaxConcurrency() { return maxConcurrency; }
+    public void setMaxConcurrency(Integer maxConcurrency) { this.maxConcurrency = maxConcurrency; }
     public Integer getRerankTopN() { return rerankTopN; }
     public void setRerankTopN(Integer rerankTopN) { this.rerankTopN = rerankTopN; }
     public String getRerankInstruct() { return rerankInstruct; }

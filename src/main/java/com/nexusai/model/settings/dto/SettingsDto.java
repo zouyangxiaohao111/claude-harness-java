@@ -219,7 +219,18 @@ public record SettingsDto(
     //   runtime id 去 registry 里反查 agentType ⇒ 这里存 agentType 会永远查不到 ⇒ 回落内置。
     //   ⛔ 写侧（SettingsService.update）只认 runtime id，传 agentType 一律 400（fail loud）。
     String subagentDefaultRuntime,
-    Boolean subagentExternalEnabled
+    Boolean subagentExternalEnabled,
+    /**
+     * 后台向量化并发上限的全局默认 · settings.model_max_concurrency（V292）。
+     *
+     * <p>对齐源站系统设置 {@code model.max_concurrency}。模型级
+     * {@code models.max_concurrency} 未配（null/0）时用本值；null/≤0 再回落常量 32。
+     * 只影响后台入库/图片向量化，不影响交互式问答。
+     *
+     * <p>⚠️ 三处必须同步（同 channelsEnabled）：① 本字段 ② SettingsService.toDto
+     * ③ update 的 merge 分支。放在末尾以保持既有构造点参数顺序不变。
+     */
+    Integer modelMaxConcurrency
 ) {
 
     /**
@@ -318,6 +329,6 @@ public record SettingsDto(
             skillSearchIntentEnabled, scratchpadEnabled, frcEnabled, agentMainThreadEnabled,
             verifyPlanReminderEnabled, language, outputStyle, enabledPlugins, pluginClaudeFallback,
             allowDynamicHeaderValues, streamIdleTimeoutMs, webfetchEngine, marketAdminEnabled,
-            channelsEnabled, null, null, null);
+            channelsEnabled, null, null, null, null);
     }
 }

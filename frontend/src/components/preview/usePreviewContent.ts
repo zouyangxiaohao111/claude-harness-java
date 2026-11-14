@@ -16,6 +16,11 @@ export interface PreviewContent {
 
 const backendUrl = (u: string) => (u.startsWith('http') ? u : `${BASE_URL}${u}`)
 
+/** 知识库文档原始文件端点（`KnowledgeExtController:130` 的 GET /knowledge/{id}/download）。 */
+export function kbDownloadUrl(knowledgeId: string): string {
+  return `${BASE_URL}/knowledge/${knowledgeId}/download`
+}
+
 /** 项目文件 raw 端点（项目内 docx/xlsx/pdf/image/视频等二进制走此端点取字节/源）。 */
 export function projectRawUrl(id: string, path: string): string {
   return `${BASE_URL}/projects/${id}/raw?path=${encodeURIComponent(path)}`
@@ -60,6 +65,7 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
     const item = payload.item
     const project = payload.project
     const artifact = payload.artifact
+    const kb = payload.kb
 
     // html：内联 code 直接给；html 产物 → 取 raw 端点的文本
     if (payload.type === 'html' && !artifact) { setCode(payload.code); return }
@@ -86,6 +92,12 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
       }
       if (artifact) {
         const res = await fetch(artifactRawUrl(artifact.sessionId, artifact.artifactId))
+        if (!res.ok) throw new Error(`HTTP ${res.status}`)
+        return new Uint8Array(await res.arrayBuffer())
+      }
+      if (kb) {
+        // 知识库原始文件：后端 /knowledge/{id}/download
+        const res = await fetch(kbDownloadUrl(kb.knowledgeId))
         if (!res.ok) throw new Error(`HTTP ${res.status}`)
         return new Uint8Array(await res.arrayBuffer())
       }
@@ -119,6 +131,13 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
             setBytes(await readBytes())
           } else {
             if (!cancelled) setUrl(projectRawUrl(project.id, project.path))
+          }
+        } else if (kb) {
+          // 知识库文档：pdf/image/video/audio 直接给下载端点 url；docx/xlsx 走 readBytes
+          if (isByteKind) {
+            setBytes(await readBytes())
+          } else {
+            if (!cancelled) setUrl(kbDownloadUrl(kb.knowledgeId))
           }
         } else if (artifact) {
           if (payload.type === 'html') {

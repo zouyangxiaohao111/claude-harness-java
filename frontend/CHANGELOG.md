@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.77] - 2026-11-14
+
+### Added
+
+- KB 检索范围对齐源站：runtime_context 进 user content、请求级硬约束、稳定句柄 kb://doc://
+
 ## [0.1.76] - 2026-11-13
 
 ### Fixed

@@ -33,6 +33,15 @@ public class Model {
      * null/≤0 = 10（百炼单请求上限）。
      */
     private Integer embeddingBatchSize;
+    /**
+     * 后台并发上限（仅后台向量化生效）· V291 列 {@code max_concurrency}。
+     *
+     * <p>语义对齐源站 {@code model.max_concurrency}：限制文档入库 / 图片向量化等**后台任务**
+     * 对同一模型的并发调用数，按模型 ID 共享；交互式问答的查询编码不受影响。
+     * null / 0 = 沿用全局默认（{@code KbEmbeddingConcurrencyGate.DEFAULT_MAX_CONCURRENCY} = 32）；
+     * 负数 = 关闭限制。
+     */
+    private Integer maxConcurrency;
     /** 重排默认返回条数（仅 type=rerank 生效）· V200 列 rerank_top_n；null = 服务端默认。 */
     private Integer rerankTopN;
     /** 重排默认指令（仅 type=rerank 生效）· V200 列 rerank_instruct；null/空 = 不发送。 */
@@ -114,6 +123,8 @@ public class Model {
     public void setEmbeddingDimensions(Integer embeddingDimensions) { this.embeddingDimensions = embeddingDimensions; }
     public Integer getEmbeddingBatchSize() { return embeddingBatchSize; }
     public void setEmbeddingBatchSize(Integer embeddingBatchSize) { this.embeddingBatchSize = embeddingBatchSize; }
+    public Integer getMaxConcurrency() { return maxConcurrency; }
+    public void setMaxConcurrency(Integer maxConcurrency) { this.maxConcurrency = maxConcurrency; }
     public Integer getRerankTopN() { return rerankTopN; }
     public void setRerankTopN(Integer rerankTopN) { this.rerankTopN = rerankTopN; }
     public String getRerankInstruct() { return rerankInstruct; }

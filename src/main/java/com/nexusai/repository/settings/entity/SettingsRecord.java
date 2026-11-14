@@ -19,6 +19,14 @@ public class SettingsRecord {
 
     /** 子代理外部运行时默认值（V259）。 */
     private String subagentDefaultRuntime;
+    /**
+     * 后台向量化并发上限的<b>全局默认</b> · V292 列 {@code model_max_concurrency}。
+     *
+     * <p>对齐源站系统设置 {@code model.max_concurrency}：模型未单独配置
+     * {@code models.max_concurrency}（null/0）时用这个值；null/≤0 再回落常量 32。
+     * 只作用于后台任务（文档入库 / 图片向量化），交互式问答不受影响。
+     */
+    private Integer modelMaxConcurrency;
 
     /** 外部子代理总开关（V259）。 */
     private Boolean subagentExternalEnabled;
@@ -471,6 +479,8 @@ public class SettingsRecord {
     public Integer getGoalCheckinMinutes() { return goalCheckinMinutes; }
     public void setGoalCheckinMinutes(Integer goalCheckinMinutes) { this.goalCheckinMinutes = goalCheckinMinutes; }
 
+    public Integer getModelMaxConcurrency() { return modelMaxConcurrency; }
+    public void setModelMaxConcurrency(Integer modelMaxConcurrency) { this.modelMaxConcurrency = modelMaxConcurrency; }
     public String getSubagentDefaultRuntime() { return subagentDefaultRuntime; }
     public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
     public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }

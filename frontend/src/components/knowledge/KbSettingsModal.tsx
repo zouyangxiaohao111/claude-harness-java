@@ -54,7 +54,7 @@ const CHAT_MODEL_TYPES = ['chat', 'multimodal'] as const
 const EMBEDDING_MODEL_TYPES = ['embedding'] as const
 
 /** 分块策略（源站 `KBChunkingSettings.vue:290-315`，**4 项**，无 `recursive`）。 */
-const CHUNK_STRATEGIES = [
+export const CHUNK_STRATEGIES = [
   { value: 'auto', label: '自动' },
   { value: 'heading', label: '按标题切分' },
   { value: 'heuristic', label: '结构感知' },
@@ -62,13 +62,13 @@ const CHUNK_STRATEGIES = [
 ] as const
 
 /** 滑块刻度（源站 `KBChunkingSettings.vue:268-271` 逐字）。 */
-const CHUNK_SIZE_MARKS = [100, 1000, 2000, 4000]
-const CHUNK_OVERLAP_MARKS = [0, 250, 500]
-const PARENT_CHUNK_SIZE_MARKS = [512, 2048, 4096, 8192]
-const CHILD_CHUNK_SIZE_MARKS = [64, 384, 1024, 2048]
+export const CHUNK_SIZE_MARKS = [100, 1000, 2000, 4000]
+export const CHUNK_OVERLAP_MARKS = [0, 250, 500]
+export const PARENT_CHUNK_SIZE_MARKS = [512, 2048, 4096, 8192]
+export const CHILD_CHUNK_SIZE_MARKS = [64, 384, 1024, 2048]
 
 /** 分隔符候选（源站 `chunking.separators` 的 8 项）。 */
-const SEPARATOR_OPTIONS = [
+export const SEPARATOR_OPTIONS = [
   { value: '\n\n', label: '双换行 (\n\n)' },
   { value: '\n', label: '单换行 (\n)' },
   { value: '。', label: '中文句号 (。)' },
@@ -85,7 +85,7 @@ const MULTIMODAL_MODEL_TYPES = ['multimodal'] as const
 const ASR_MODEL_TYPES = ['asr'] as const
 
 /** 语言提示候选（源站只支持这三种）。 */
-const LANGUAGE_OPTIONS = [
+export const LANGUAGE_OPTIONS = [
   { value: 'zh', label: '中文 (ZH)' },
   { value: 'en', label: '英文 (EN)' },
   { value: 'de', label: '德文 (DE)' },
@@ -731,7 +731,14 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
   const faqCfg = parseJson<{ index_mode?: string; question_index_mode?: string }>(
     form.faq_config ?? '', {})
   const faqIndexMode = faqCfg.index_mode === 'question_answer' ? 'question_answer' : 'question_only'
-  const faqQuestionIndexMode = faqCfg.question_index_mode === 'combined' ? 'combined' : 'separate'
+  /**
+   * 问题索引方式 · **收敛为 combined**。
+   *
+   * <p>后端对 `question_index_mode` 零消费（见上），固不读库里的值：
+   * 越是把历史上存过的 `separate` 读出来显示，越会让人以为「分别索引」在本仓生效。
+   * 库里旧值不回写、不清理 —— 只影响显示口径。
+   */
+  const faqQuestionIndexMode: 'combined' | 'separate' = 'combined'
   const saveFaq = async (next: Record<string, unknown>, okMsg = 'FAQ 配置已保存') => {
     const cfg = parseJson<Record<string, unknown>>(form.faq_config ?? '', {})
     await patch({ faq_config: JSON.stringify({ ...cfg, ...next }) }, okMsg)
@@ -2293,7 +2300,7 @@ function SettingSection({ rootClass, title, desc, headerReset = true, headerMarg
  *                排在控件**下方**，不是右侧）
  * @param hint    控件下方的一行提示（源站 `.locked-hint`）
  */
-function Row({ label, desc, children, stacked, hint }: {
+export function Row({ label, desc, children, stacked, hint }: {
   label: React.ReactNode
   desc?: string
   children: React.ReactNode
@@ -2397,7 +2404,7 @@ function ModelSelect({ value, models, types, placeholder, disabled, onChange }: 
 }
 
 /** 开关（源侧 t-switch：handle + content，选中态 t-is-checked）。 */
-function Switch({ checked, label, onChange }: {
+export function Switch({ checked, label, onChange }: {
   checked: boolean; label: string; onChange: (v: boolean) => void
 }) {
   return (
@@ -2429,7 +2436,7 @@ function Switch({ checked, label, onChange }: {
  * <p>交互：点击轨道任意位置跳转 + 拖动把手。⚠️ 提交用 `onChange`（拖动过程中**不**落库），
  * 松手才 PATCH —— 否则拖一次会打十几次请求。
  */
-function Slider({ min, max, step, value, marks, unit, disabled, onChange }: {
+export function Slider({ min, max, step, value, marks, unit, disabled, onChange }: {
   min: number; max: number; step: number; value: number
   marks?: readonly number[]
   unit?: string
@@ -2523,7 +2530,7 @@ function Slider({ min, max, step, value, marks, unit, disabled, onChange }: {
  * <p>本仓无该组件运行时 ⇒ 手搭同款结构。⚠️ 值域必须去重 —— 重复分隔符会让切分器
  * 在同一位置反复尝试，白白多跑几轮。
  */
-function TagInput({ value, options, placeholder, onChange }: {
+export function TagInput({ value, options, placeholder, onChange }: {
   value: string[]
   options: readonly { value: string; label: string }[]
   placeholder: string

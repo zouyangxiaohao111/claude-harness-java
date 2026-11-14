@@ -32,6 +32,10 @@ interface TrackedUpload {
   state: TrackState
   message?: string
   knowledgeId?: string
+  /** 文件总字节（进度条分母；对齐源站 UploadItem.size） */
+  size: number
+  /** 已发送字节（XHR upload.onprogress；对齐源站 UploadItem.loaded） */
+  loaded: number
 }
 
 /**
@@ -178,10 +182,12 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         name: item.fileName || item.file.name,
         item,
         state: 'uploading' as const,
+        size: item.file.size,
+        loaded: 0,
       })))
     } else {
       setTracked((prev) => prev.map((t) => (
-        keySet.has(t.key) ? { ...t, state: 'uploading', message: undefined } : t
+        keySet.has(t.key) ? { ...t, state: 'uploading', message: undefined, loaded: 0 } : t
       )))
     }
     setProgress({ done: baseDone, total })
@@ -194,6 +200,15 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         signal: controller.signal,
         onProgress: (done) => {
           if (baseIdRef.current === runFor) setProgress({ done: baseDone + done, total })
+        },
+        // 字节级进度：按 item 引用定位行（同一个对象，⛔ 不用文件名，目录上传可能重名）
+        onItemProgress: (item, p) => {
+          if (baseIdRef.current !== runFor) return
+          setTracked((prev) => prev.map((t) => (
+            t.item === item
+              ? { ...t, loaded: p.loaded, size: p.total > 0 ? p.total : t.size }
+              : t
+          )))
         },
       })
       // 上传期间切了库：结果属于旧库，不能显示在当前库的面板上（否则重试会传错库）
@@ -348,7 +363,14 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         onClick={() => setOpen((v) => !v)}
         aria-expanded={open}
       >
-        {busy ? '处理中…' : '＋ 添加文档'}
+        {busy ? '处理中…' : (
+          <>
+            <svg width={16} height={16} viewBox="0 0 24 24" aria-hidden="true" style={{ verticalAlign: '-3px', marginRight: 4 }}>
+              <use href="#t-icon-file-add" />
+            </svg>
+            添加文档
+          </>
+        )}
       </button>
 
       {showResult && (
@@ -378,11 +400,51 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
                   aria-label="关闭上传结果"
                   onClick={closeResult}
                 >
-                  ✕
+                  <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-close" /></svg>
                 </button>
               )}
             </div>
           </div>
+          {tracked.length > 0 && (
+            <ul style={{ listStyle: 'none', margin: '6px 0 0', padding: 0 }}>
+              {tracked.map((t) => {
+                // 阶段折叠（对齐源站 itemPhase：uploading / saving / parsing / ready / …）
+                const pct = t.size > 0 ? Math.min(100, Math.round((t.loaded / t.size) * 100)) : 0
+                const saving = t.state === 'uploading' && t.size > 0 && t.loaded >= t.size
+                const parseStatus = t.knowledgeId ? parseStatuses[t.knowledgeId] : undefined
+                const parsing = t.state === 'uploaded'
+                  && (!parseStatus || parseStatus === 'pending' || parseStatus === 'processing' || parseStatus === 'finalizing')
+                const ready = t.state === 'uploaded' && !parsing
+                const phase = t.state === 'uploading'
+                  ? (saving ? '已发送，等待入库…' : `上传中 ${pct}%`)
+                  : t.state === 'uploaded'
+                    ? (parsing ? '解析中…' : '已完成')
+                    : t.state === 'failed' ? '失败'
+                      : t.state === 'duplicate' ? '重复'
+                        : '已取消'
+                return (
+                  <li key={t.key} style={{
+                    display: 'flex', alignItems: 'center', gap: 8,
+                    fontSize: 12, lineHeight: '18px', padding: '2px 0',
+                  }}>
+                    <span style={{
+                      flex: '0 0 auto', maxWidth: 220, overflow: 'hidden',
+                      textOverflow: 'ellipsis', whiteSpace: 'nowrap',
+                    }} title={t.name}>{t.name}</span>
+                    <span style={{ flex: 1, minWidth: 60, height: 4, borderRadius: 2, background: '#eef0f3', overflow: 'hidden' }}>
+                      <span style={{
+                        display: 'block', height: '100%',
+                        width: t.state === 'uploading' ? `${saving ? 100 : pct}%` : (ready ? '100%' : '0%'),
+                        background: t.state === 'failed' ? '#d9534f' : (ready ? '#0e8a4a' : '#0f5fd4'),
+                        transition: 'width .15s linear',
+                      }} />
+                    </span>
+                    <span style={{ flex: '0 0 auto', color: '#8a9099', minWidth: 88, textAlign: 'right' }}>{phase}</span>
+                  </li>
+                )
+              })}
+            </ul>
+          )}
           {failed.length > 0 && (
             <>
               {/* ⚠️ 失败清单必须逐条列出（名字 + 原因）：只弹一句「失败」用户无从下手 */}
@@ -442,7 +504,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
               role="menuitem"
               onClick={() => { setOpen(false); fileRef.current?.click() }}
             >
-              <span className="ic">📄</span>
+              <span className="ic"><svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-file-add" /></svg></span>
               <span>
                 <b>上传文件</b>
                 <em>pdf / word / excel / ppt / md / txt</em>
@@ -453,7 +515,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
               role="menuitem"
               onClick={() => { setOpen(false); dirRef.current?.click() }}
             >
-              <span className="ic">📁</span>
+              <span className="ic"><svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-folder-add" /></svg></span>
               <span>
                 <b>上传文件夹</b>
                 <em>保留目录结构</em>
@@ -464,7 +526,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
               role="menuitem"
               onClick={() => { setOpen(false); setUrlOpen(true) }}
             >
-              <span className="ic">🔗</span>
+              <span className="ic"><svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-link" /></svg></span>
               <span>
                 <b>URL 导入</b>
                 <em>抓取网页正文入库</em>
@@ -475,7 +537,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
               role="menuitem"
               onClick={() => { setOpen(false); setManualOpen(true) }}
             >
-              <span className="ic">✎</span>
+              <span className="ic"><svg width={18} height={18} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-edit" /></svg></span>
               <span>
                 <b>手工录入</b>
                 <em>直接写标题与正文</em>
@@ -489,7 +551,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         <div className="kb-mini-modal" role="dialog" aria-modal="true" aria-label="URL 导入">
           <div className="kb-mini-head">
             <strong>URL 导入</strong>
-            <button type="button" className="kb-mini-x" onClick={() => setUrlOpen(false)}>✕</button>
+            <button type="button" className="kb-mini-x" onClick={() => setUrlOpen(false)}><svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-close" /></svg></button>
           </div>
           <div className="kb-mini-body">
             <label className="kb-mini-label">网页地址</label>
@@ -516,7 +578,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         <div className="kb-mini-modal kb-mini-lg" role="dialog" aria-modal="true" aria-label="手工录入">
           <div className="kb-mini-head">
             <strong>手工录入</strong>
-            <button type="button" className="kb-mini-x" onClick={() => setManualOpen(false)}>✕</button>
+            <button type="button" className="kb-mini-x" onClick={() => setManualOpen(false)}><svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-close" /></svg></button>
           </div>
           <div className="kb-mini-body">
             <label className="kb-mini-label">标题</label>

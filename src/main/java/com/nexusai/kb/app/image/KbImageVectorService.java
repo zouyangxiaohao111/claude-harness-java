@@ -76,6 +76,13 @@ public class KbImageVectorService {
     private final KbEmbeddingPort embeddingPort;
 
     /**
+     * 后台向量化并发闸（字段注入 · ⛔ 查询编码 {@code search()} 不走闸，只有入库路径走）。
+     * null（单测直构）⇒ 直通。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.app.retrieval.KbEmbeddingConcurrencyGate embeddingGate;
+
+    /**
      * 图片向量模型 ID。
      *
      * <p>⚠️ 用字段注入而不是构造器参数：本类有「生产 3 参 + 单测 4 参」两个构造器，
@@ -329,7 +336,10 @@ public class KbImageVectorService {
 
         float[] vector;
         try {
-            List<float[]> got = embeddingPort.embed(model, List.of(text));
+            // 入库路径：与正文块向量化共用同一并发闸（同模型共享在途上限）。
+            List<float[]> got = embeddingGate == null
+                ? embeddingPort.embed(model, List.of(text))
+                : embeddingGate.call(model, () -> embeddingPort.embed(model, List.of(text)));
             vector = got == null || got.isEmpty() ? null : got.get(0);
         } catch (RuntimeException e) {
             log.warn("[图片向量] 单条编码失败（不影响其他）knowledge={} image={} source={} 原因={}",

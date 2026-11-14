@@ -11,6 +11,7 @@ import org.springframework.stereotype.Component;
 import java.util.ArrayList;
 import java.util.HashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
 
 /**
@@ -45,6 +46,10 @@ public class KbAgentToolScope {
     @Autowired(required = false)
     private KnowledgeBaseService knowledgeBaseService;
 
+    /** 文档服务 · 仅用于把「请求里 @ 的文档 id」解析成它所属的知识库 id。 */
+    @Autowired(required = false)
+    private com.nexusai.kb.domain.KnowledgeService knowledgeService;
+
     /**
      * 本会话允许访问的知识库。
      *
@@ -52,6 +57,79 @@ public class KbAgentToolScope {
      * @return {@code null} = 不限制；空列表 = 明确不允许；非空 = 白名单
      */
     public List<String> allowedKnowledgeBaseIds(ToolUseContext ctx) {
+        // ① 会话/智能体级白名单（原逻辑）
+        List<String> agentScope = resolveAgentScope(ctx);
+        // ② 请求级范围（用户在 KB 面板 @ 的库/文件）—— 本轮唯一权威
+        List<String> requestScope = requestScopeKnowledgeBaseIds(ctx);
+        if (requestScope == null) {
+            return agentScope;              // 未指定 ⇒ 与原行为逐字节一致（主会话走这条）
+        }
+        if (agentScope == null) {
+            return requestScope;            // 无 agent 约束 ⇒ 直接用请求范围
+        }
+        // ③ 交集：两者都能看到才允许检索（⛔ 任一为空都不放行，避免「收窄失效」）
+        List<String> merged = new ArrayList<>();
+        for (String id : requestScope) {
+            if (agentScope.contains(id)) {
+                merged.add(id);
+            }
+        }
+        if (merged.size() != requestScope.size()) {
+            log.warn("[kb_agent 工具范围] 请求范围与智能体白名单取交集后收窄 {} → {} 个库",
+                requestScope.size(), merged.size());
+        }
+        return merged;
+    }
+
+    /**
+     * 请求级检索范围 · 读 {@code ToolUseContext.requestExtras()["kbScope"]}。
+     *
+     * <p>为什么由本类解析而不是网关：文档 → 父知识库的推导要查库（{@code kb_knowledge}），
+     * 网关只搬运 id；这里已经有 {@link KnowledgeBaseService}，再加一个文档服务即可。
+     *
+     * @return {@code null} = 本轮没有请求级范围（主会话 / 用户没选）⇒ 调用方按原逻辑处理
+     */
+    private List<String> requestScopeKnowledgeBaseIds(ToolUseContext ctx) {
+        Map<String, Object> extras = ctx == null ? null : ctx.requestExtras();
+        if (extras == null || extras.isEmpty()) {
+            return null;
+        }
+        Object raw = extras.get("kbScope");
+        if (!(raw instanceof Map<?, ?> scope)) {
+            return null;
+        }
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
+        if (scope.get("knowledgeBaseIds") instanceof List<?> list) {
+            for (Object item : list) {
+                if (item instanceof String id && !id.isBlank()) {
+                    out.add(id);
+                }
+            }
+        }
+        // @ 的是单个文件 ⇒ 解析它所属的知识库（本仓检索工具目前只支持库级过滤）
+        if (scope.get("knowledgeIds") instanceof List<?> list && knowledgeService != null) {
+            for (Object item : list) {
+                if (!(item instanceof String kid) || kid.isBlank()) {
+                    continue;
+                }
+                try {
+                    var dto = knowledgeService.getById(kid);
+                    if (dto != null && dto.knowledgeBaseId() != null && !dto.knowledgeBaseId().isBlank()) {
+                        out.add(dto.knowledgeBaseId());
+                    }
+                } catch (RuntimeException e) {
+                    // 单个文档查不到不该放宽范围：跳过即可（宁可少查，不可多查）
+                    log.warn("[kb_agent 工具范围] 请求范围里的文档 {} 解析失败，已忽略: {}", kid, e.toString());
+                }
+            }
+        }
+        return out.isEmpty() ? java.util.List.of() : new ArrayList<>(out);
+    }
+
+    /**
+     * 会话绑定智能体的知识库白名单（原 {@code allowedKnowledgeBaseIds} 的实现，逐字未改）。
+     */
+    private List<String> resolveAgentScope(ToolUseContext ctx) {
         if (kbAgentService == null || sessionMapper == null) {
             return null;
         }

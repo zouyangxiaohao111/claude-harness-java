@@ -11,6 +11,7 @@ import { KbSettingsModal } from './KbSettingsModal'
 import { KbFaqManager } from './KbFaqManager'
 import { KbSharedSpace } from './KbSharedSpace'
 import { KbCreateModal } from './KbCreateModal'
+import { IconSprite } from './IconSprite'
 import type { KbCreateSubmit } from './KbCreateModal'
 import { KbGalleryPanel } from './KbGalleryPanel'
 import { KbSceneSettingsModal } from './KbSceneSettingsModal'
@@ -590,6 +591,9 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         name: payload.name,
         description: payload.description || undefined,
         type: payload.type,
+        // ⭐ 分块配置：弹窗已序列化（键名照后端 KbChunkingConfigParser）。
+        //    ⚠️ 改造前这里**没传** ⇒ 用户调的分块大小/重叠/策略全部被静默丢弃。
+        chunking_config: payload.chunkingConfig ?? undefined,
         // ⭐ RAG / Wiki / 图谱开关 —— Wiki 的启用**只**由这个字段承载
         //    （源码 KnowledgeBaseEditorModal.vue:1675）。null ⇒ 不写（FAQ 库走这条）。
         indexing_strategy: payload.indexingStrategy ?? undefined,
@@ -603,6 +607,15 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
         image_caption_enabled: payload.imageCaptionEnabled ?? true,
         image_ocr_enabled: payload.imageOcrEnabled ?? true,
         image_pipeline: payload.imagePipeline ?? 'default',
+        wiki_config: payload.wikiConfig ?? undefined,
+        image_processing_config: payload.imageProcessingConfig ?? undefined,
+        asr_config: payload.asrConfig ?? undefined,
+        question_generation_config: payload.questionGenerationConfig ?? undefined,
+        auto_tag_config: payload.autoTagConfig ?? undefined,
+        profile_config: payload.profileConfig ?? undefined,
+        faq_config: payload.faqConfig ?? undefined,
+        vector_store_id: payload.vectorStoreId || undefined,
+        storage_backend_id: payload.storageBackendId || undefined,
       })
       try {
         window.localStorage.setItem(
@@ -681,6 +694,7 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   if (view === 'list') {
     return (
       <>
+      <IconSprite />
       <div className="kb-list-container">
         <div className="kb-list-content">
           {/* 页头：源站 KnowledgeBaseList.vue:4-25 —— header > header-title > title-row > (h2 + header-actions) */}
@@ -695,8 +709,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                       由 background-color 填充遮罩；本仓没有该组件，改用真 <svg> 自绘 ⇒
                       必须把 `background-color:currentColor` 清掉，否则 24×24 会变成实心色块。
                       （设计稿 mock-chrome.css:343 对同一元素就是 `background:none !important`） */}
-                  <svg className="resource-icon" width={24} height={24} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round" style={{ backgroundColor: 'transparent' }}>
-                    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />
+                  <svg className="resource-icon" width={24} height={24} viewBox="0 0 20 20" aria-hidden="true" style={{ backgroundColor: 'transparent' }}>
+                    <use href="#t-icon-kb-resource" />
                   </svg>
                   知识库
                 </h2>
@@ -725,7 +739,10 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                     className="t-button t-button--variant-text t-button--theme-default t-button--shape-rectangle t-size-s header-action-btn"
                     onClick={() => setCreateOpen(true)}
                   >
-                    <span className="t-button__text">＋ 新建知识库</span>
+                    <span className="t-button__text">
+                      <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true" style={{ verticalAlign: '-2px', marginRight: 4 }}><use href="#t-icon-add" /></svg>
+                      新建知识库
+                    </span>
                   </button>
                 </div>
               </div>
@@ -806,8 +823,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
             {!loadingBases && bases.length === 0 && (
               <div className="wk-empty-state">
                 <div className="wk-empty-state__icon">
-                  <svg width={32} height={32} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M3 7.5A2.5 2.5 0 0 1 5.5 5H10l2 2h6.5A2.5 2.5 0 0 1 21 9.5v8A2.5 2.5 0 0 1 18.5 20h-13A2.5 2.5 0 0 1 3 17.5z" />
+                  <svg width={32} height={32} viewBox="0 0 20 20" aria-hidden="true">
+                    <use href="#t-icon-kb-resource" />
                   </svg>
                 </div>
                 <div className="wk-empty-state__title">还没有知识库</div>
@@ -861,7 +878,9 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                             }
                           }}
                         >
-                          {base.is_pinned ? '★' : '☆'}
+                          <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true">
+                            <use href={base.is_pinned ? '#t-icon-star-filled' : '#t-icon-star'} />
+                          </svg>
                         </button>
                         <div className="card-header">
                           {/* 类型图标：源站 KbTypeAvatar.vue —— 16px SVG，不是字符 */}
@@ -899,10 +918,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                               setOpenMenuId((v) => (v === base.id ? null : base.id))
                             }}
                           >
-                            <svg viewBox="0 0 24 24" fill="currentColor" width="16" height="16" aria-hidden="true">
-                              <circle cx="5" cy="12" r="1.8" />
-                              <circle cx="12" cy="12" r="1.8" />
-                              <circle cx="19" cy="12" r="1.8" />
+                            <svg width={16} height={16} viewBox="0 0 24 24" aria-hidden="true">
+                              <use href="#t-icon-ellipsis" />
                             </svg>
                           </button>
                           {/* 菜单：源站是 t-popup（overlayClassName=card-more-popup）；
@@ -1005,6 +1022,7 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
   // ══════════════════════════════════════════════════════════════
   return (
     <div className="kb-page">
+      <IconSprite />
       <div className="kb-list-content">
         {/* 面包屑：知识库 › 当前库（点「知识库」回列表 —— 这就是用户要的退出路径） */}
         {/* ⚠️ 容器类名必须是 `document-header`（不是自造的 kb-header）：
@@ -1023,19 +1041,19 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
               <button type="button" className="breadcrumb-link" onClick={() => setView('list')}>
                 知识库
               </button>
-              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                <path d="M9 5l7 7-7 7" />
+              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                <use href="#t-icon-chevron-right" />
               </svg>
               <button type="button" className="breadcrumb-link dropdown" disabled={!activeBaseId}>
                 <span>{activeBase?.name ?? '—'}</span>
                 {bases.length > 1 && (
-                  <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <path d="M6 9l6 6 6-6" />
+                  <svg viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                    <use href="#t-icon-chevron-down" />
                   </svg>
                 )}
               </button>
-              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                <path d="M9 5l7 7-7 7" />
+              <svg className="breadcrumb-separator" viewBox="0 0 24 24" width="14" height="14" aria-hidden="true">
+                <use href="#t-icon-chevron-right" />
               </svg>
               {/* ⭐ tabs：文档 / Wiki / 图谱 / 画廊 —— **四个恒定显示**。
                   ⚠️ 设计稿 02（文档列表）、03（Wiki）、04（图谱）三页的 header
@@ -1051,8 +1069,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                   aria-selected={detailTab === 'docs'}
                   onClick={() => setDetailTab('docs')}
                 >
-                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <path d="M4 22h16V8h-6V2H4v20Z" /><path d="M14 2v6h6m-6-6h1l5 5v1m-6-6H4v20h16V8" />
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <use href="#t-icon-file" />
                   </svg>
                   <span>文档</span>
                 </button>
@@ -1062,8 +1080,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                   aria-selected={detailTab === 'wiki'}
                   onClick={() => setDetailTab('wiki')}
                 >
-                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <path d="M2 4h9v17H2V4Zm11 0h9v17h-9V4Z" /><path d="M5 8h3M5 12h3M5 16h3M16 8h3M16 12h3" />
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <use href="#t-icon-book-open" />
                   </svg>
                   <span>Wiki</span>
                 </button>
@@ -1073,9 +1091,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                   aria-selected={detailTab === 'graph'}
                   onClick={() => setDetailTab('graph')}
                 >
-                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <circle cx="6" cy="6" r="2.6" /><circle cx="18" cy="7" r="2.6" /><circle cx="12" cy="18" r="2.6" />
-                    <path d="M8.2 7.2 15.6 8M7.3 8.3l3.5 7.6M16.7 9.2l-3.4 6.6" />
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <use href="#t-icon-relation" />
                   </svg>
                   <span>图谱</span>
                 </button>
@@ -1090,9 +1107,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                       · 图谱 = Wiki 页面之间的 [[链接]]（WikiPanel 的 graph 视图，源站同款）
                       · 关系图谱 = 从文档正文抽出的**实体-关系**（kb_graph_entity / kb_graph_relation）
                       用户明确指出「还有关系图谱页面也没有 不是 wiki图谱哦」。 */}
-                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <circle cx="12" cy="5" r="2.4" /><circle cx="5" cy="19" r="2.4" /><circle cx="19" cy="19" r="2.4" />
-                    <path d="M12 7.4v4.2M6.4 16.9l4.3-3.7M17.6 16.9l-4.3-3.7" />
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <use href="#t-icon-chart-bubble" />
                   </svg>
                   <span>关系图谱</span>
                 </button>
@@ -1102,8 +1118,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                   aria-selected={detailTab === 'gallery'}
                   onClick={() => setDetailTab('gallery')}
                 >
-                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                    <rect x="2.5" y="4.5" width="19" height="15" rx="2" /><circle cx="8.5" cy="10" r="1.6" /><path d="M4 17l5-4.5 4 3.5 3.5-3L21 17" />
+                  <svg className="kb-view-tab__icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                    <use href="#t-icon-image" />
                   </svg>
                   <span>画廊</span>
                 </button>
@@ -1121,7 +1137,7 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                   title="关闭知识库"
                   aria-label="关闭知识库"
                 >
-                  ✕
+                  <svg width={14} height={14} viewBox="0 0 24 24" aria-hidden="true"><use href="#t-icon-close" /></svg>
                 </button>
               )}
               <button
@@ -1131,8 +1147,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                 aria-label="知识库信息"
                 onClick={() => setInfoOpen((v) => !v)}
               >
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                  <circle cx="12" cy="12" r="9.2" /><path d="M12 11v6M12 7.6v.8" />
+                <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                  <use href="#t-icon-info-circle" />
                 </svg>
               </button>
               <button
@@ -1143,9 +1159,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
                 disabled={!activeBaseId}
                 onClick={() => setSettingsOpen(true)}
               >
-                <svg viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.7} aria-hidden="true">
-                  <circle cx="12" cy="12" r="3.1" />
-                  <path d="M19.4 15a1.7 1.7 0 0 0 .34 1.87l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06A1.7 1.7 0 0 0 15 19.4a1.7 1.7 0 0 0-1 1.55V21a2 2 0 1 1-4 0v-.09A1.7 1.7 0 0 0 9 19.4a1.7 1.7 0 0 0-1.87.34l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.7 1.7 0 0 0 4.6 15a1.7 1.7 0 0 0-1.55-1H3a2 2 0 1 1 0-4h.09A1.7 1.7 0 0 0 4.6 9a1.7 1.7 0 0 0-.34-1.87l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06A1.7 1.7 0 0 0 9 4.6a1.7 1.7 0 0 0 1-1.55V3a2 2 0 1 1 4 0v.09a1.7 1.7 0 0 0 1 1.55 1.7 1.7 0 0 0 1.87-.34l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06A1.7 1.7 0 0 0 19.4 9v0a1.7 1.7 0 0 0 1.55 1H21a2 2 0 1 1 0 4h-.09a1.7 1.7 0 0 0-1.51 1Z" />
+                <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                  <use href="#t-icon-setting" />
                 </svg>
               </button>
             </div>
@@ -1157,8 +1172,8 @@ export function KnowledgeBasePage({ showToast, onBackToChat, onRequestClose, sce
           {/* ⭐ 源码 KnowledgeBase.vue:2508-2515：有不可解析的扩展名时提示去配置（点整行走设置） */}
           {unsupportedFileTypes.length > 0 && (
             <p className="parser-hint" onClick={() => setSettingsOpen(true)}>
-              <svg className="parser-hint-icon" viewBox="0 0 24 24" width="16" height="16" fill="none" stroke="currentColor" strokeWidth={1.8} aria-hidden="true">
-                <circle cx="12" cy="12" r="9.2" /><path d="M12 11v6M12 7.6v.8" />
+              <svg className="parser-hint-icon" viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                <use href="#t-icon-info-circle" />
               </svg>
               <span>
                 部分文档类型（{unsupportedFileTypes.map((t) => '.' + t).join('、')}）暂无可用解析引擎，上传后将无法解析

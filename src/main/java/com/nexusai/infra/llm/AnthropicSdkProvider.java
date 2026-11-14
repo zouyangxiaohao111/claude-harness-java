@@ -3019,6 +3019,9 @@ public class AnthropicSdkProvider implements LlmProvider {
         Tool.InputSchema.Builder isb = Tool.InputSchema.builder();
         JsonNode params = fn.get("parameters");
         if (params != null && params.isObject()) {
+            // [schema-pattern-guard 2026-11-14] Anthropic/RE2 不接受含 UTF-16 代理项转义的 pattern
+            //   （线上 400：rea MCP 的「^[U+D800-U+DFFF]$」 ⇒ "is not a regex"）⇒ 先剔除再透传。
+            params = sanitizeAnthropicSchemaPatterns(params, fn.path("name").asText());
             // input_schema = parameters（type/properties/required 全字段透传）
             params.fields().forEachRemaining(en ->
                 isb.putAdditionalProperty(en.getKey(), JsonValue.fromJsonNode(en.getValue())));
@@ -3046,6 +3049,265 @@ public class AnthropicSdkProvider implements LlmProvider {
             }
         }
         return ToolUnion.ofTool(tb.build());
+    }
+
+    /**
+     * 把 JSON Schema {@code pattern} 改写成 Anthropic（RE2）能接受的等价写法。
+     *
+     * <p><b>WHY</b>（2026-11-14 线上 400）：接入 rea MCP 后 ant 通道报
+     * {@code Invalid schema for function 'mcp__rea__extract_artifact': "...^[U+D800-U+DFFF]$" is not a regex}。
+     * 该 pattern 由 MCP server 自己生成（本仓不生成）；Anthropic 侧用 RE2 校验，RE2 <b>不认</b>
+     * {@code u 加四位十六进制} 的转义（要用 {@code \x{...}}）⇒ 整轮 400。
+     *
+     * <p>改写规则（纯文本改写，不需要 JS 引擎）：
+     * <ol>
+     *   <li>{@code uXXXX}（非代理区）→ {@code \x{XXXX}} —— 语义不变，只是换 RE2 认的写法</li>
+     *   <li>{@code uXXXX uYYYY} 组成合法代理对（astral 字符）→ 合并成 {@code \x{1F600}} 这类单码点</li>
+     *   <li>孤立代理项（RE2 的 Unicode 标量值不含 D800–DFFF，<b>无法表达</b>）→ 返回 {@code null}，
+     *       调用方删除该 {@code pattern}（JSON/UTF-8 本就不允许孤立代理项，删了不损失可执行约束）</li>
+     *   <li>{@code \\u}（转义反斜杠后跟 u，不是 Unicode 转义）与其它转义（{@code \d} 等）原样保留</li>
+     * </ol>
+     *
+     * <p>只在 anthropic 通道做；openai 侧不改（JS 正则原生支持这些转义写法，改了反而错）。
+     *
+     * @param schema   工具 parameters（应为对象）
+     * @param toolName 工具名（日志用）
+     * @return 处理后的副本（不改入参；非对象原样返回）
+     */
+    static JsonNode sanitizeAnthropicSchemaPatterns(JsonNode schema, String toolName) {
+        if (schema == null || !schema.isObject()) {
+            return schema;
+        }
+        JsonNode copy = schema.deepCopy();
+        rewritePatternsForRe2(copy, toolName);
+        return copy;
+    }
+
+    /** 递归处理 {@code pattern}：RE2 能编译就原样发，否则改写，仍不行才删（其余字段一律不动）。 */
+    private static void rewritePatternsForRe2(JsonNode node, String toolName) {
+        if (node instanceof ObjectNode obj) {
+            JsonNode pattern = obj.get("pattern");
+            if (pattern != null && pattern.isTextual()) {
+                String raw = pattern.asText();
+                String resolved = resolvePatternForRe2(raw);
+                if (resolved == null) {
+                    obj.remove("pattern");
+                    log.warn("AnthropicSdkProvider: 工具 '{}' 的 schema.pattern 无法用 RE2 表达，已剔除"
+                        + "（否则 Anthropic 会整轮 400 invalid_request_error）：{}", toolName, raw);
+                } else if (!resolved.equals(raw)) {
+                    obj.put("pattern", resolved);
+                    log.debug("AnthropicSdkProvider: 工具 '{}' 的 schema.pattern 已改写为 RE2 写法：{} → {}",
+                        toolName, raw, resolved);
+                }
+            }
+            obj.fields().forEachRemaining(e -> rewritePatternsForRe2(e.getValue(), toolName));
+            return;
+        }
+        if (node instanceof ArrayNode arr) {
+            for (JsonNode child : arr) {
+                rewritePatternsForRe2(child, toolName);
+            }
+        }
+    }
+
+    /**
+     * 把一个 JSON Schema {@code pattern} 归一成 RE2 能编译的写法（带缓存）。
+     *
+     * <p>顺序：<b>原样能编译就用原样</b>（绝大多数 pattern 走这条，零改写）→ 否则做 Unicode 转义
+     * 改写后再编译 → 仍不行返回 {@code null}（调用方删掉 pattern）。
+     *
+     * <p>用 re2j 而不是自己枚举规则：RE2 拒绝的远不止 {@code uXXXX}——lookbehind、反向引用、
+     * 原子组、占有量词等 JS 合法语法它都不认。让真正的 RE2 引擎判一次，才是「以后所有同类问题
+     * 一次覆盖」，不用每遇到一种写法就补一条规则。
+     *
+     * @param raw 原 pattern
+     * @return 归一后的 pattern；{@code null} = RE2 无法表达，应删除
+     */
+    static String resolvePatternForRe2(String raw) {
+        if (raw == null || raw.isEmpty()) {
+            return raw;
+        }
+        java.util.Optional<String> cached = RE2_PATTERN_CACHE.get(raw);
+        if (cached != null) {
+            return cached.orElse(null);
+        }
+        String resolved = computeRe2Pattern(raw);
+        if (RE2_PATTERN_CACHE.size() < 4096) {
+            RE2_PATTERN_CACHE.put(raw, java.util.Optional.ofNullable(resolved));
+        }
+        return resolved;
+    }
+
+    /** 实际决策：原样能过 → 原样；改写后能过 → 改写；都不行 → null。 */
+    private static String computeRe2Pattern(String raw) {
+        // 先判文字层：pattern 里若真的存在孤立代理项字符，序列化成 UTF-8 就已经是坏数据
+        //   （re2j 对这类字符串可能照样编译通过，但服务端收到的是替换字符）⇒ 直接判不可用。
+        if (hasLoneSurrogateChar(raw)) {
+            return null;
+        }
+        if (compilesInRe2(raw)) {
+            return raw;
+        }
+        String rewritten = toRe2Pattern(raw);
+        if (rewritten != null && !rewritten.equals(raw) && compilesInRe2(rewritten)) {
+            return rewritten;
+        }
+        return null;
+    }
+
+    /** 字符串里是否有孤立（未配对）的 UTF-16 代理项字符。 */
+    static boolean hasLoneSurrogateChar(String p) {
+        if (p == null || p.isEmpty()) {
+            return false;
+        }
+        for (int k = 0; k < p.length(); k++) {
+            char ch = p.charAt(k);
+            if (Character.isHighSurrogate(ch)) {
+                if (k + 1 >= p.length() || !Character.isLowSurrogate(p.charAt(k + 1))) {
+                    return true;
+                }
+                k++;
+            } else if (Character.isLowSurrogate(ch)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /** 用 re2j（纯 Java 的 RE2 移植）试编译。 */
+    private static boolean compilesInRe2(String pattern) {
+        try {
+            com.google.re2j.Pattern.compile(pattern);
+            return true;
+        } catch (RuntimeException e) {
+            return false;
+        }
+    }
+
+    /** pattern → 归一结果缓存（含「不可用」结论），避免每轮为同一批工具重复编译。 */
+    private static final java.util.Map<String, java.util.Optional<String>> RE2_PATTERN_CACHE =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * 把 JS 风格的 Unicode 转义改写成 RE2 的 {@code \x{...}}。
+     *
+     * @param p 原 pattern
+     * @return 改写后的 pattern；含无法表达的孤立代理项 → {@code null}
+     */
+    static String toRe2Pattern(String p) {
+        if (p == null || p.isEmpty()) {
+            return p;
+        }
+        // 字面孤立代理项（不是转义文本）：RE2 无法表达 ⇒ 直接判不可用
+        if (hasLoneSurrogateChar(p)) {
+            return null;
+        }
+        if (p.indexOf('\\') < 0) {
+            return p;
+        }
+        StringBuilder out = new StringBuilder(p.length() + 8);
+        int i = 0;
+        int n = p.length();
+        while (i < n) {
+            char c = p.charAt(i);
+            if (c != '\\' || i + 1 >= n) {
+                out.append(c);
+                i++;
+                continue;
+            }
+            char next = p.charAt(i + 1);
+            // `\\` = 转义的反斜杠本身：成对吐出，绝不当 Unicode 转义处理
+            if (next == '\\') {
+                out.append("\\\\");
+                i += 2;
+                continue;
+            }
+            if (next != 'u') {
+                // 其它转义（\d \w \. 等）原样：吐 `\`，下一轮把 next 当普通字符
+                out.append(c);
+                i++;
+                continue;
+            }
+            // 形式一：`u{1F600}`
+            if (i + 2 < n && p.charAt(i + 2) == '{') {
+                int close = p.indexOf('}', i + 3);
+                if (close > 0) {
+                    String hex = p.substring(i + 3, close);
+                    int cp = parseCodePoint(hex);
+                    if (cp >= 0) {
+                        if (isSurrogate(cp)) {
+                            return null;
+                        }
+                        out.append("\\x{").append(Integer.toHexString(cp)).append('}');
+                        i = close + 1;
+                        continue;
+                    }
+                }
+                // 不是合法 `u{...}` → 按字面保留
+                out.append(c);
+                i++;
+                continue;
+            }
+            // 形式二：`uXXXX`（可再跟 `uYYYY` 组成代理对）
+            int first = parseHex4(p, i + 2);
+            if (first < 0) {
+                out.append(c);
+                i++;
+                continue;
+            }
+            if (Character.isHighSurrogate((char) first)) {
+                int second = parseHex4(p, i + 8);
+                if (second >= 0 && Character.isLowSurrogate((char) second)) {
+                    int cp = Character.toCodePoint((char) first, (char) second);
+                    out.append("\\x{").append(Integer.toHexString(cp)).append('}');
+                    i += 12;
+                    continue;
+                }
+                return null;   // 孤立高代理项
+            }
+            if (Character.isLowSurrogate((char) first)) {
+                return null;   // 孤立低代理项
+            }
+            out.append("\\x{").append(Integer.toHexString(first)).append('}');
+            i += 6;
+        }
+        return out.toString();
+    }
+
+    /** 解析 {@code p[pos..pos+4)} 为 4 位十六进制；不合法返回 -1。 */
+    private static int parseHex4(String p, int pos) {
+        if (pos < 0 || pos + 4 > p.length()) {
+            return -1;
+        }
+        int v = 0;
+        for (int k = 0; k < 4; k++) {
+            int d = Character.digit(p.charAt(pos + k), 16);
+            if (d < 0) {
+                return -1;
+            }
+            v = (v << 4) | d;
+        }
+        return v;
+    }
+
+    /** 解析十六进制码点（1–6 位）；不合法或越界返回 -1。 */
+    private static int parseCodePoint(String hex) {
+        if (hex == null || hex.isEmpty() || hex.length() > 6) {
+            return -1;
+        }
+        int v = 0;
+        for (int k = 0; k < hex.length(); k++) {
+            int d = Character.digit(hex.charAt(k), 16);
+            if (d < 0) {
+                return -1;
+            }
+            v = (v << 4) | d;
+        }
+        return v <= Character.MAX_CODE_POINT ? v : -1;
+    }
+
+    private static boolean isSurrogate(int cp) {
+        return cp >= Character.MIN_SURROGATE && cp <= Character.MAX_SURROGATE;
     }
 
     /**

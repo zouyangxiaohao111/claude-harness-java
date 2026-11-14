@@ -169,7 +169,20 @@ public class KnowledgeBaseService {
         //    （实测 NOT NULL constraint failed）⇒ 默认值必须在 Service 显式填。
         row.setChunkingConfig(
             isBlank(req.chunkingConfig()) ? DEFAULT_CHUNKING_CONFIG : req.chunkingConfig());
-        row.setImageProcessingConfig(DEFAULT_IMAGE_PROCESSING_CONFIG);
+        // 图片处理配置同样有 DB 默认值 ⇒ 留空时必须显式填默认（Flex 会把 null 写进 INSERT）。
+        row.setImageProcessingConfig(
+            isBlank(req.imageProcessingConfig())
+                ? DEFAULT_IMAGE_PROCESSING_CONFIG : req.imageProcessingConfig().trim());
+        // ⭐ 本次开放的其余 8 项配置（源侧创建时同一个请求就带上）：
+        //    留空 = 不设（JSON 配置落 NULL，下游按「未配置」处理；两个 ID 落 NULL = 不绑）。
+        setIfPresent(req.wikiConfig(), row::setWikiConfig);
+        setIfPresent(req.asrConfig(), row::setAsrConfig);
+        setIfPresent(req.questionGenerationConfig(), row::setQuestionGenerationConfig);
+        setIfPresent(req.autoTagConfig(), row::setAutoTagConfig);
+        setIfPresent(req.profileConfig(), row::setProfileConfig);
+        setIfPresent(req.faqConfig(), row::setFaqConfig);
+        setIfPresent(req.vectorStoreId(), row::setVectorStoreId);
+        setIfPresent(req.storageBackendId(), row::setStorageBackendId);
         row.setCosConfig(DEFAULT_COS_CONFIG);
         row.setVlmConfig(DEFAULT_VLM_CONFIG);
         // ⚠️ 必须显式填：Flex 会把 null 也列进 INSERT ⇒ DB 的 DEFAULT '{}' 不生效，
@@ -257,6 +270,16 @@ public class KnowledgeBaseService {
             // ⚠️ 该列 NOT NULL 且是枚举 ⇒ 空串归默认（"清空" 无意义），非法值 400。
             row.setImagePipeline(requireImagePipeline(req.imagePipeline()));
         }
+        // ⭐ 本次开放的 9 项配置：null = 不改；"" = 清空（两列及 JSON 列均可空）。
+        setIfNotNull(req.wikiConfig(), row::setWikiConfig);
+        setIfNotNull(req.imageProcessingConfig(), row::setImageProcessingConfig);
+        setIfNotNull(req.asrConfig(), row::setAsrConfig);
+        setIfNotNull(req.questionGenerationConfig(), row::setQuestionGenerationConfig);
+        setIfNotNull(req.autoTagConfig(), row::setAutoTagConfig);
+        setIfNotNull(req.profileConfig(), row::setProfileConfig);
+        setIfNotNull(req.faqConfig(), row::setFaqConfig);
+        setIfNotNull(req.vectorStoreId(), row::setVectorStoreId);
+        setIfNotNull(req.storageBackendId(), row::setStorageBackendId);
         if (req.retrieverEngine() != null) {
             // 三态：null=不改；""=清空（回落全局默认）；值=覆盖。
             String engine = trimToNull(req.retrieverEngine());
@@ -503,6 +526,25 @@ public class KnowledgeBaseService {
 
     private static String orEmpty(String s) {
         return s == null ? "" : s;
+    }
+
+    /**
+     * 创建语义 · 「传了就写、留空不写」：null / 空白 ⇒ 不设（列可空，保持 NULL）。
+     *
+     * <p>与 update 的 {@link #setIfNotNull} 不同 —— 创建时空白串没有「清空」含义，
+     * 只是前端没填，落 NULL 比落 "" 更贴近「未配置」。
+     */
+    private static void setIfPresent(String raw, java.util.function.Consumer<String> setter) {
+        if (raw != null && !raw.isBlank()) {
+            setter.accept(raw.trim());
+        }
+    }
+
+    /** 更新语义 · null = 不改；非 null（含 ""）= 写入（"" 用于解绑 / 清空）。 */
+    private static void setIfNotNull(String raw, java.util.function.Consumer<String> setter) {
+        if (raw != null) {
+            setter.accept(raw);
+        }
     }
 
     // ── 内部 ─────────────────────────────────────────────────────────
