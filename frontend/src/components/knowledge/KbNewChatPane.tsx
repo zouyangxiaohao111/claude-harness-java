@@ -32,6 +32,7 @@ import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
 import { IconSprite } from './IconSprite'
 import { sendPermissionResponse } from '@/api/socket'
+import { kbPermissionOwnership } from '@/utils/kbPermissionOwnership'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { useChatStore } from '@/stores/chatStore'
 import { useChatSocket } from '@/hooks/useChatSocket'
@@ -109,6 +110,11 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
   activeStreams: Record<string, string>
 }) {
   const { clientRef } = useChatSocket(sessionId, activeStreams)
+  // 本窗口接管的会话：主窗口据此不再弹同一会话的权限/提问（否则两边各弹一次）。
+  useEffect(() => {
+    kbPermissionOwnership.claim(sessionId)
+    return () => kbPermissionOwnership.release(sessionId)
+  }, [sessionId])
   // ⚠️ 权限 / AskUserQuestion 弹窗必须在本窗口渲染：主窗口 App 的 PermissionBubble 按
   //   `activeSessionId` 过滤，知识库会话不是主会话的活动会话 ⇒ 弹不到这里（2026-11-14 用户报
   //   「Ask 弹窗跑到主会话去了，当前知识库页面没有」）。
@@ -119,7 +125,15 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
     ?? permissionQueue.find((r) => r.sessionId === sessionId)
   if (!perm) return null
   const sid = perm.sessionId ?? sessionId ?? ''
+  // ⚠️ `.permission-bubble` 是**文档流内**的块（`margin: 0 auto 12px`），主会话把它放在消息流末尾；
+  //   本窗口若直接渲染，会变成 flex 顶部的第一个子项（2026-11-14 用户报「不在正中央」）。
+  //   ⇒ 这里自带一层 fixed 居中舞台，把它浮到窗口正中；外层 pointer-events:none 让空白处点击穿透。
   return (
+    <div style={{
+      position: 'fixed', inset: 0, display: 'flex', alignItems: 'center', justifyContent: 'center',
+      zIndex: 60, pointerEvents: 'none', padding: '24px',
+    }}>
+      <div style={{ pointerEvents: 'auto', width: '100%', display: 'flex', justifyContent: 'center' }}>
     <PermissionBubble
       request={perm}
       // 知识库独立窗口没有「项目」概念，也没有 appSettings 上下文 ⇒ 两个可选文案来源都传 null
@@ -140,6 +154,8 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
         dequeuePermission(perm.requestId)
       }}
     />
+      </div>
+    </div>
   )
 }
 
@@ -384,9 +400,25 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [initialSessionId])
 
-  // 进入页面即建会话（用户看到的就是一条可对话的空会话）
+  // 进入页面：优先恢复上次会话，没有（或已失效）才建/复用空白会话
+  //   ⚠️ 此前 KB_CHAT_SESSION_KEY 只写不读 ⇒ 每次打开知识库窗口都落在一条新的空白会话上，
+  //     历史消息永远看不到（主会话有 activeSessionId 恢复逻辑，所以只有主会话「有历史」）。
   useEffect(() => {
     if (initialSessionId) return   // 宿主已指定会话：由切换 effect 负责，别再多建一条空会话
+    let saved: string | null = null
+    try { saved = localStorage.getItem(KB_CHAT_SESSION_KEY) } catch { /* 隐私模式忽略 */ }
+    if (saved) {
+      void sessionApi.get(saved)
+        .then((sess) => {
+          setSessionId(saved as string)
+          onSessionChange?.(saved as string)
+          applyMeta(sess)
+          if (sess.mainThreadAgent) setAgentMode(sess.mainThreadAgent)
+        })
+        // 会话已被删除 / 不属于本工作区 ⇒ 回到「建一条空白会话」，不把用户卡在空白页
+        .catch(() => { void ensureSession() })
+      return
+    }
     void ensureSession()
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])

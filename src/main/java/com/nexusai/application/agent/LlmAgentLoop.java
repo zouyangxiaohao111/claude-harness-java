@@ -4881,8 +4881,26 @@ public class LlmAgentLoop implements AgentLoop {
         //   模型「看不见」的工具。两处调用同一纯函数，幂等（第二次解析结果相同）。
         if (ref[0] != null && ref[0].sessionId() != null
                 && isTopLevelLoopSource(params.querySource())) {
+            // [对齐 CC · 2026-11-14] 输入池必须永远是「原始全量池」，⛔ 不能用 ref[0].availableTools()。
+            //
+            //   CC 的 {@code resolveAgentTools(agentDef, availableTools, …)} 每次都吃
+            //   {@code useMergedTools()} 现算出来的全量池，解析结果只作为本次请求的
+            //   {@code toolUseContext.options.tools}，**从不写回、也从不当下一次解析的输入**。
+            //
+            //   本仓此前用 ref[0].availableTools() ⇒ 一旦某个环节把「已收窄的池」当成了 base
+            //   （真机 2026-11-14 实测：schema 侧 池=108→6，执行侧 池=2→2，4 个 KB 工具消失，
+            //   模型只能看到 Read + AskUserQuestion，还拿工具名当文件路径去 Read），
+            //   就会**逐轮塌缩且不可逆**——因为显式名单放行专属工具、通配分支剔除专属工具，
+            //   同一份数据过两遍必然缩水。
+            //
+            //   多会话安全：base TUC 的 availableTools 是 {@code toolRegistry.all()} 的快照副本，只读；
+            //   applySessionAgentToolPolicy 本身无状态（只按 sessionId 查各自的行）⇒ 并发会话互不影响。
+            List<Tool> pool = params.toolUseContext() != null
+                    && params.toolUseContext().availableTools() != null
+                    && !params.toolUseContext().availableTools().isEmpty()
+                    ? params.toolUseContext().availableTools() : ref[0].availableTools();
             List<Tool> scoped = applySessionAgentToolPolicy(
-                    ref[0].sessionId(), ref[0].availableTools(), ref[0].requestExtras());
+                    ref[0].sessionId(), pool, ref[0].requestExtras());
             ref[0] = ref[0].withAvailableTools(scoped);
         }
         return ref[0];
@@ -14064,6 +14082,32 @@ public class LlmAgentLoop implements AgentLoop {
         java.util.List<Tool> resolved =
                 com.nexusai.application.agent.tool.AgentToolPolicy.apply(
                         available, def.tools(), def.disallowedTools());
+        // [工具池塌缩诊断 · 2026-11-14] 打印「入参池 / 声明名单 / 解析结果 / 缺失」。
+        //   WHY：真机出现「池=108 池内知识库工具=4 → 池=2 → 知识库工具=0」的塌缩，
+        //   而 AgentToolPolicy 显式名单分支本身不会剔专属工具（见
+        //   AgentToolPolicyKbPoolShrinkTest ①）。没有这一行就看不出是哪一次调用
+        //   把收窄后的池又喂了回去 ⇒ 只能靠猜。⛔ 纯日志，不改任何装配行为。
+        if (log.isInfoEnabled()) {
+            java.util.List<String> requested = def.tools().orElse(null);
+            java.util.List<String> resolvedNames = new java.util.ArrayList<>(resolved.size());
+            for (Tool t : resolved) {
+                if (t != null && t.name() != null) {
+                    resolvedNames.add(t.name());
+                }
+            }
+            java.util.List<String> missing = new java.util.ArrayList<>();
+            if (requested != null) {
+                for (String name : requested) {
+                    if (name != null && !name.isBlank() && !resolvedNames.contains(name.trim())) {
+                        missing.add(name.trim());
+                    }
+                }
+            }
+            log.info("[LlmAgentLoop] 工具池装配结果: session={} agent={} 池={} 名单={} 结果={} 缺失={}",
+                    sessionId, agentType, available.size(),
+                    requested == null ? "通配" : requested + "(" + requested.size() + ")",
+                    resolvedNames.size() + " " + resolvedNames, missing);
+        }
         // ⭐ 对齐源站 agent_service.go:1292-1295 `withoutWikiWriteTools`：
         //   本轮没有可写知识库 ⇒ 把 6 个 wiki 写/变更工具从工具池摘掉。
         //   装配期摘掉（模型看不见）比「看得见但调用被拒」更贴近源站行为。

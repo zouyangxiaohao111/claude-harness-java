@@ -84,6 +84,7 @@ import { WorkspaceHeader } from '@/components/center/WorkspaceHeader'
 import { SchedulesPage } from '@/components/center/SchedulesPage'
 import { KnowledgeBasePage, KbSceneNav } from '@/components/knowledge/KnowledgeBasePage'
 import { KbNewChatPane } from '@/components/knowledge/KbNewChatPane'
+import { kbPermissionOwnership } from '@/utils/kbPermissionOwnership'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
@@ -980,8 +981,12 @@ function App() {
   // 同一 tool_use 会同时推 message + bridge 两条权限事件（bridge 竞速 racer）——本地桌面优先渲染
   //   message（AskUserForm 选择题）；bridge 请求入队后由 dismiss 事件（permission-bridge-dismiss）
   //   清除，不独立弹出第二个「需要权限」通用弹窗。仅当无 message 请求（如 leader inbox 走 bridge）才回退。
-  const currentPermission = permissionQueue.find((r) => r.sessionId === activeSessionId && r.kind === 'message')
-    ?? permissionQueue.find((r) => r.sessionId === activeSessionId)
+  //   ⛔ 知识库窗口已接管的会话不再在本窗口弹（否则同一请求两处各弹一次 ·
+  //   2026-11-14 用户报「知识库选择了，主会话还在」）。没有知识库窗口时该集合恒空 ⇒ 行为不变。
+  const currentPermission = permissionQueue.find((r) => r.sessionId === activeSessionId
+      && !kbPermissionOwnership.has(r.sessionId) && r.kind === 'message')
+    ?? permissionQueue.find((r) => r.sessionId === activeSessionId
+      && !kbPermissionOwnership.has(r.sessionId))
   // 等待权限/提问的会话 id 集合（侧栏黄点 · 对齐 Harness pendingInteraction 优先于运行）
   const pendingSessionIds = useMemo(() => new Set(permissionQueue.map((r) => r.sessionId)), [permissionQueue])
   // 权限卡片出现 → 滚底信号（值变化时 MessageList 强制滚到底部，确保权限弹窗对准最新内容）
