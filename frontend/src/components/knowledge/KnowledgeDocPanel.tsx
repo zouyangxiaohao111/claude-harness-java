@@ -1143,7 +1143,17 @@ export function KnowledgeDocPanel({
                       <div className="cell cell-tags" role="cell">
                         <div className="row-tag-trigger">
                           {rowTags.length === 0 ? (
-                            <span className="row-muted">—</span>
+                            /* 源站 DocumentListView.vue:366 —— 空标签列渲染「+ 添加标签」虚线按钮，
+                               ⛔ 不是破折号：破折号让用户根本不知道这里可以打标签。 */
+                            <button
+                              type="button"
+                              className="row-tag-add"
+                              title="添加标签"
+                              onClick={() => openRowTags(row)}
+                            >
+                              <svg width={12} height={12} aria-hidden="true"><use href="#t-icon-add" /></svg>
+                              <span>添加标签</span>
+                            </button>
                           ) : (
                             <div className="row-tags">
                               {rowTags.slice(0, 5).map((t) => (

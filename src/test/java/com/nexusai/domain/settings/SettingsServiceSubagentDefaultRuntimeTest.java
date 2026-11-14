@@ -82,7 +82,7 @@ class SettingsServiceSubagentDefaultRuntimeTest {
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, defaultRuntime,
-            null);
+            null, null);
     }
 
     @Test

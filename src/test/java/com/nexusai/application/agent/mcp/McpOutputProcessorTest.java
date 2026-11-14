@@ -86,16 +86,25 @@ class McpOutputProcessorTest {
     }
 
     @Test
-    @DisplayName("processMCPResult: 含图片 → 截断而非落盘（CC :2758-2765）")
+    @DisplayName("processMCPResult: 含图片 → 不整串截断、不落盘（保留 image 块，只截 text 兄弟块）")
     void process_containsImages_truncatedNotPersisted() throws Exception {
         Path dir = Files.createTempDirectory("mcp-output-image-test");
-        String content = "{\"type\":\"image\",\"source\":{\"type\":\"base64\",\"media_type\":\"image/png\",\"data\":\"A\"}}";
-        // 超阈值但含图片 → 截断
-        String big = content + "a".repeat(1000);
-        var transformed = new McpResultTransformer.TransformedMCPResult(big, "contentArray", null, true);
+        // 2026-11-14 改判（线上 sess-a4a11222）：旧行为「整串 JSON 截断」会把 base64 切成半截，
+        // 模型看到坏图。现行为：块数组原样保留（resolveData 取 contentNode），text 兄弟块按预算截短。
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        var blocks = mapper.createArrayNode();
+        blocks.addObject().put("type", "image")
+            .putObject("source").put("type", "base64")
+            .put("media_type", "image/png").put("data", "A");
+        blocks.addObject().put("type", "text").put("text", "a".repeat(10_000));
+        var transformed = new McpResultTransformer.TransformedMCPResult(
+            blocks.toString(), "contentArray", null, true, blocks);
         var ctx = new McpResultTransformer.TransformContext(dir, "sess1");
+
         String result = McpOutputProcessor.processMCPResult(transformed, "tool", "srv", ctx, MAX_TOKENS);
-        assertThat(result).contains("[OUTPUT TRUNCATED");
+
+        assertThat(result).as("保留块数组而非整串截断").contains("\"type\":\"image\"");
+        assertThat(result).doesNotContain("[OUTPUT TRUNCATED");
         // 不应落盘
         assertThat(Files.walk(dir).noneMatch(p -> p.toString().endsWith(".txt"))).isTrue();
     }
@@ -125,6 +134,37 @@ class McpOutputProcessorTest {
         assertThat(instructions).contains("格式：JSON，schema: {x: number}");
         assertThat(instructions).contains("直到 100% 的内容已被读取");
         assertThat(instructions).contains("您必须明确描述您已读取内容的哪些部分");
+    }
+
+    @Test
+    @DisplayName("含图片结果：保留 image 块原样，只截短超长 text 兄弟块（线上截图被切成 base64 的回归）")
+    void containsImages_keepsImageBlockTruncatesTextOnly() throws Exception {
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        var blocks = mapper.createArrayNode();
+        String base64 = "A".repeat(90_000);
+        blocks.addObject().put("type", "image")
+            .putObject("source").put("type", "base64")
+            .put("media_type", "image/jpeg").put("data", base64);
+        blocks.addObject().put("type", "text").put("text", "B".repeat(500_000));
+
+        String out = McpOutputProcessor.truncateOversizedTextBlocks(blocks, 25_000);
+
+        assertThat(out).isNotNull();
+        var parsed = mapper.readTree(out);
+        assertThat(parsed.get(0).path("source").path("data").asText())
+            .as("⛔ image 块必须逐字节保留（截断 base64 = 模型看到坏图）")
+            .isEqualTo(base64);
+        assertThat(parsed.get(1).path("text").asText().length())
+            .as("text 块按 maxTokens*4 截断").isLessThan(500_000).isGreaterThan(99_000);
+        assertThat(parsed.get(1).path("text").asText()).contains("output truncated");
+    }
+
+    @Test
+    @DisplayName("无块数组 → truncateOversizedTextBlocks 返回 null（调用方回退旧路径）")
+    void truncateBlocks_noArray_returnsNull() {
+        assertThat(McpOutputProcessor.truncateOversizedTextBlocks(null, 1000)).isNull();
+        var mapper = new com.fasterxml.jackson.databind.ObjectMapper();
+        assertThat(McpOutputProcessor.truncateOversizedTextBlocks(mapper.createObjectNode(), 1000)).isNull();
     }
 
     // ═══════════ 5. getFormatDescription（mcpOutputStorage.ts:16-28）═══════════

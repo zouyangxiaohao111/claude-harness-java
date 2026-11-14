@@ -544,6 +544,49 @@ function RuntimeConfigPanel({
     }
   }
 
+  /**
+   * API key **自动保存**（去抖 800ms）。
+   *
+   * <p>用户要求（2026-11-14）：改完 key 不该再回上面点「保存」；
+   * 输入**全空格** ⇒ 视为清空该 key（⛔ 不是"存一个空格"）。
+   *
+   * <p>secrets 是**整体替换**语义（见 {@link save} 的注释）⇒ 每次提交都要带上
+   * 「本次没改、但已保存」的那些 key 的掩码，否则会被这次替换清掉。
+   */
+  const saveSecrets = useCallback(async (draft: Record<string, string>) => {
+    const names = Object.keys(draft)
+    if (names.length === 0) return
+    setBusy(true)
+    try {
+      // 未改动的已保存 key：用掩码占位，后端识别掩码后保留原明文
+      const next: Record<string, string> = {}
+      for (const [name, masked] of Object.entries(config.secrets)) {
+        if (!(name in draft)) next[name] = masked
+      }
+      for (const name of names) {
+        const value = (draft[name] ?? '').trim()
+        if (value) {
+          next[name] = value          // 有值 ⇒ 覆盖
+        }
+        // ⚠️ value 为空 ⇒ 不写入 next ⇒ 该 key 被这次整体替换清除
+      }
+      const res = await cliRuntimeConfigApi.save(config.runtime, { secrets: next })
+      setSecretDraft({})
+      onSaved({ runtime: config.runtime, secrets: res.secrets, apiKeySet: res.apiKeySet })
+    } catch (e) {
+      onError(e instanceof Error ? e.message : String(e))
+    } finally {
+      setBusy(false)
+    }
+  }, [config.runtime, config.secrets, onSaved, onError])
+
+  // 去抖：连续敲键只在停顿 800ms 后保存一次
+  useEffect(() => {
+    if (Object.keys(secretDraft).length === 0) return
+    const t = window.setTimeout(() => { void saveSecrets(secretDraft) }, 800)
+    return () => window.clearTimeout(t)
+  }, [secretDraft, saveSecrets])
+
   const clearSecrets = async () => {
     setBusy(true)
     try {
@@ -709,8 +752,9 @@ function RuntimeConfigPanel({
           高级：代理与自定义路径
         </summary>
         <p className="cli-advanced-hint">
-          覆盖该 CLI 的底层环境变量：API key、代理 base URL、自定义 home 或非标准可执行文件路径。
-          不填时 CLI 用自己的默认配置。密钥只保存在本地配置中，并且只传给所选 CLI。
+          覆盖该 CLI 的环境变量（API key / 代理 base URL / 配置目录 / 可执行文件路径）。
+          留空 = 用 CLI 自己的默认配置；API key 改完自动保存，输入全空格即清除该项。
+          密钥只保存在本地，且只传给所选 CLI。
         </p>
 
         <div className="cli-advanced-grid">
@@ -777,18 +821,33 @@ function RuntimeConfigPanel({
                 API key
                 <code className="cli-env-name">{envName}</code>
               </span>
-              <input
-                className="cli-input"
-                type="password"
-                placeholder={
-                  config.secrets[envName]
-                    ? `已保存 ${config.secrets[envName]}（留空不修改）`
-                    : `粘贴 ${envName}`
-                }
-                disabled={busy}
-                value={secretDraft[envName] ?? ''}
-                onChange={(e) => setSecretDraft((s) => ({ ...s, [envName]: e.target.value }))}
-              />
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                <input
+                  className="cli-input"
+                  type="password"
+                  placeholder={
+                    config.secrets[envName]
+                      ? `已保存 ${config.secrets[envName]}（直接输入可替换）`
+                      : `粘贴 ${envName}（自动保存）`
+                  }
+                  disabled={busy}
+                  value={secretDraft[envName] ?? ''}
+                  onChange={(e) => setSecretDraft((s) => ({ ...s, [envName]: e.target.value }))}
+                />
+                {/* ⭐ 显式「置空」：只清这一项（2026-11-14 用户报「本仓没有置空的按钮」）。
+                    走 saveSecrets 的空值分支 ⇒ 提交时该项不进 secrets ⇒ 后端整体替换后即被清除。 */}
+                {config.secrets[envName] && (
+                  <button
+                    type="button"
+                    className="cli-link-btn"
+                    title={`清空已保存的 ${envName}`}
+                    disabled={busy}
+                    onClick={() => void saveSecrets({ [envName]: '' })}
+                  >
+                    置空
+                  </button>
+                )}
+              </div>
             </label>
           ))}
         </div>

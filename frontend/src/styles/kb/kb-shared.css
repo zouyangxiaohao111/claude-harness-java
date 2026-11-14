@@ -365,15 +365,94 @@
 .kb-scope .chunk-toolbar-divider{width:1px;height:16px;margin:0 6px;background:var(--td-component-stroke)}
 .kb-scope .question-inline-editor .t-input{flex:1}
 .kb-scope .question-composer .t-input{flex:1}
+/* ⭐ 知识库独立窗口有**自绘标题栏**（36px，含最小化/最大化/关闭三枚按钮）。
+   抽屉若仍从窗口 top:0 开始铺满全高，它的 header 与右上的关闭按钮就会和
+   窗口标题栏的三枚按钮**矩形重叠**（实测：抽屉 × 在 x1888–1912/y16–40，
+   窗口 × 在 x1874–1920/y0–32）⇒ 用户看到两个 × 叠在一起，以为图标画错了。
+   源站是浏览器应用、没有自绘标题栏，所以它的 top:0 在源站是对的；本仓必须让出这一条。*/
+.kb-scope .t-drawer.doc-main-drawer{top:36px;height:calc(100% - 36px)}
 .kb-scope .t-drawer.doc-main-drawer .t-drawer__header{padding:14px 18px;border-bottom:1px solid var(--td-component-stroke)}
 /* 关闭按钮 · 源站真机读数（doc-content.vue 的 t-drawer closeBtn）：
    24×24 / top 16px / right 8px / radius 3px / 白底 / 图标 16×16。
    tdesign 默认用 `top:calc((--td-comp-size-xxxl - --td-comp-size-xs)/2)` 反推居中，
    那依赖 header 恰好 56px 高；本仓 header 是 67px（14×2 padding + 39 内容），
    算出来的 top 与源站差 1px。⇒ 显式写死真机值，与源站逐像素一致。 */
-.kb-scope .t-drawer.doc-main-drawer .t-drawer__close-btn{top:16px;right:8px;width:24px;height:24px;border-radius:3px}
+/* ⭐ 本仓**没有引入 tdesign 的组件样式包** ⇒ `.t-drawer__close-btn` 只剩下面那三条定位规则，
+   按钮退回浏览器默认外观（实测 border: 2px outset 黑框 + 纯白底），看起来就是一个「很原始的 ×」。
+   这里补齐 tdesign 默认（无边框 / 透明底 / 居中 / hover 浅底），与同排三个 t-button 视觉一致。*/
+/* ⭐ 垂直对齐：header 高 67px，同排三个 t-button 是 28px（中心 y=69）；
+   关闭按钮 24px 要居中就得 top=(67-24)/2=21.5。原值 16 是早期 header 更矮时的读数，
+   现在会让 × 比左边三个图标**高 5px**（实测中心 64 vs 69）。*/
+.kb-scope .t-drawer.doc-main-drawer .t-drawer__close-btn{top:21px;right:8px;width:24px;height:24px;border-radius:3px;
+  border:0;background:transparent;padding:0;cursor:pointer;
+  display:inline-flex;align-items:center;justify-content:center;
+  color:var(--td-text-color-primary,rgba(0,0,0,.9));
+  transition:background var(--app-motion-base) ease,color var(--app-motion-base) ease}
+.kb-scope .t-drawer.doc-main-drawer .t-drawer__close-btn:hover{background:var(--td-bg-color-container-hover,#f3f3f3)}
+.kb-scope .t-drawer.doc-main-drawer .t-drawer__close-btn:focus-visible{outline:2px solid var(--td-brand-color,#0052d9);outline-offset:2px}
 .kb-scope .t-drawer.doc-main-drawer .t-drawer__close-btn .t-icon{font-size:16px;vertical-align:baseline}
 .kb-scope .t-drawer.doc-main-drawer .t-drawer__body{padding:16px 18px}
+/* ⭐「添加元数据字段」按钮 · 逐字照抄源站 doc-content.vue:2444-2465 的
+   `.metadata-empty-action, .metadata-add-row`（本仓原先**完全没有这条样式**，
+   <button> 退回浏览器默认外观 ⇒ 用户看到的是一个未对齐的「+ 添加元数据字段」）。*/
+.kb-scope .t-drawer.doc-main-drawer .metadata-empty-action,
+.kb-scope .t-drawer.doc-main-drawer .metadata-add-row{
+  display:flex;align-items:center;justify-content:flex-start;gap:5px;
+  width:fit-content;min-height:28px;padding:0 4px;
+  border:none;border-radius:var(--app-radius-xs,2px);
+  color:var(--td-text-color-secondary,rgba(0,0,0,.6));
+  background:transparent;cursor:pointer;
+  font:inherit;font-size:var(--app-text-sm,13px)}
+.kb-scope .t-drawer.doc-main-drawer .metadata-empty-action:hover,
+.kb-scope .t-drawer.doc-main-drawer .metadata-add-row:hover{
+  color:var(--td-brand-color,#0052d9);
+  background:var(--td-brand-color-light,#f2f3ff)}
+/* ⭐ 元数据**编辑态**布局 · 逐字照抄源站 doc-content.vue:2369 / :2467-2500。
+   本仓原来只写了模板（三列 input/select/input + 删除 + 取消/保存），**一行 CSS 都没有**
+   ⇒ `.metadata-editor-row` 没有 display:flex，三列竖着堆叠，与源站（图二）完全不同。*/
+.kb-scope .t-drawer.doc-main-drawer .metadata-editor{display:flex;flex-direction:column;gap:8px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-editor-row{display:flex;align-items:center;gap:6px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-key-input{flex:0 1 30%;min-width:100px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-type-select{flex:0 0 92px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-value-input,
+.kb-scope .t-drawer.doc-main-drawer .metadata-null-value{flex:1;min-width:110px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-null-value{height:32px;padding:0 10px;
+  border:1px solid var(--td-component-border,#dcdcdc);border-radius:3px;
+  color:var(--td-text-color-placeholder,rgba(0,0,0,.4));
+  background:var(--td-bg-color-component-disabled,#f3f3f3);
+  font-size:var(--app-text-md,14px);line-height:30px}
+.kb-scope .t-drawer.doc-main-drawer .metadata-remove-btn:hover{
+  color:var(--td-error-color,#e34d59);background:var(--td-error-color-light,#fff0f0)}
+.kb-scope .t-drawer.doc-main-drawer .metadata-actions{display:flex;align-items:center;gap:8px;
+  margin-top:8px;justify-content:flex-end}
+/* ⭐ 文档列表「+ 添加标签」按钮 · 逐字照抄源站 DocumentListView.vue:848-870 `.row-tag-add`
+   （本仓原先标签列为空时渲染的是一个破折号，用户看不出这里能打标签）。*/
+.kb-scope .row-tag-add{
+  display:inline-flex;align-items:center;gap:4px;
+  padding:2px 7px;border:1px dashed var(--td-component-stroke,#e3e6ea);border-radius:5px;
+  background:transparent;color:var(--td-text-color-placeholder,rgba(0,0,0,.4));
+  font:inherit;font-size:var(--app-text-sm,12px);line-height:18px;white-space:nowrap;cursor:pointer;
+  transition:color var(--app-motion-fast,.2s) ease,border-color var(--app-motion-fast,.2s) ease,
+    background var(--app-motion-fast,.2s) ease}
+.kb-scope .row-tag-add:hover{
+  color:var(--td-text-color-secondary,rgba(0,0,0,.6));
+  border-color:var(--td-component-stroke,#e3e6ea);
+  background:var(--td-bg-color-container-hover,#f3f3f3)}
+.kb-scope .row-tag-add:focus-visible{outline:2px solid var(--td-brand-color,#0052d9);outline-offset:1px}
+/* ⭐ 列表行的「文件名 + 元信息」排版 · 逐字照抄源站 DocumentListView.vue:740-778。
+   本仓 JSX 用了 `.row-file-text` / `.row-file-meta` 两个类，但 **CSS 里一条都没有**
+   ⇒ meta 行继承 14px 正文色，与源站的 12px 灰字完全不同（用户报「列表字体没对齐」）。*/
+.kb-scope .row-file-text{flex:1;min-width:0;display:flex;flex-direction:column;gap:4px}
+.kb-scope .row-file-meta{display:flex;align-items:center;gap:6px;
+  font-variant-numeric:tabular-nums;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;
+  font-size:var(--app-text-sm,12px);color:var(--td-text-color-placeholder,rgba(0,0,0,.4))}
+.kb-scope .row-source{display:inline-flex;align-items:center;gap:2px}
+@media (max-width:720px){
+  .kb-scope .t-drawer.doc-main-drawer .metadata-editor-row{flex-wrap:wrap}
+  .kb-scope .t-drawer.doc-main-drawer .metadata-key-input,
+  .kb-scope .t-drawer.doc-main-drawer .metadata-value-input,
+  .kb-scope .t-drawer.doc-main-drawer .metadata-null-value{flex:1 1 calc(50% - 50px)}
+}
 .kb-scope .t-drawer.doc-main-drawer--resizing .t-drawer__content{transition:none!important}
 .kb-scope .t-drawer.kp-secondary-drawer .t-drawer__body{padding:0!important}
 .kb-scope .t-drawer.kp-secondary-drawer .t-drawer__content{background:var(--td-bg-color-container)}

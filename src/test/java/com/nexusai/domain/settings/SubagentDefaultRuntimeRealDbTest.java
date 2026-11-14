@@ -83,7 +83,7 @@ class SubagentDefaultRuntimeRealDbTest {
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, null,
             null, null, null, null, null, null, null, defaultRuntime,
-            null);
+            null, null);
     }
 
     @Test

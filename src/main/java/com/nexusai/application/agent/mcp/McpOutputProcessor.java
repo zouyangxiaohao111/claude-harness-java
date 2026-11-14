@@ -35,6 +35,41 @@ public final class McpOutputProcessor {
     }
 
     /**
+     * 含图片的结果：保留块数组，只截短「超长的 text 兄弟块」。
+     *
+     * <p><b>WHY</b>（2026-11-14 线上 sess-a4a11222）：旧实现对含图结果走
+     * {@link #truncateMcpContentIfNeeded(String, int)}，那是按<b>整串 JSON</b>切字符 ——
+     * 截图 base64 被从中间切断，image 块彻底作废，模型只能看到一坨 base64 文本。
+     * 图片既不该被文本化，也不该被截断，所以这里只动 text 块。
+     *
+     * @param contentNode 已转换块数组（可 null；null → 返回 null 让调用方走旧路径）
+     * @param maxTokens   输出 token 上限（字符预算 = maxTokens*4）
+     * @return 处理后的块数组 JSON 字符串；无块数组 → null
+     */
+    static String truncateOversizedTextBlocks(com.fasterxml.jackson.databind.JsonNode contentNode, int maxTokens) {
+        if (contentNode == null || !contentNode.isArray()) {
+            return null;
+        }
+        int maxChars = Math.max(1, maxTokens) * 4;
+        for (com.fasterxml.jackson.databind.JsonNode block : contentNode) {
+            if (!(block instanceof com.fasterxml.jackson.databind.node.ObjectNode obj)) {
+                continue;
+            }
+            if (!"text".equals(obj.path("type").asText())) {
+                continue;   // image / document 等一律不动
+            }
+            com.fasterxml.jackson.databind.JsonNode textNode = obj.get("text");
+            if (textNode == null || !textNode.isTextual() || textNode.asText().length() <= maxChars) {
+                continue;
+            }
+            String text = textNode.asText();
+            obj.put("text", text.substring(0, maxChars)
+                + "\n\n[output truncated: " + text.length() + " chars total, showing first " + maxChars + "]");
+        }
+        return contentNode.toString();
+    }
+
+    /**
      * 处理 MCP 工具结果：超阈值 → 落盘 + 读取指令；否则原样返回。
      * 对齐 CC {@code processMCPResult}（client.ts:2720-2799）。
      *
@@ -61,8 +96,13 @@ public final class McpOutputProcessor {
         int sizeEstimate = getContentSizeEstimate(content, maxTokens);
         // CC ENABLE_MCP_LARGE_OUTPUT_FILES 生产默认开 → 走落盘；含图片 → 截断（:2758-2765）
         if (transformed.containsImages()) {
+            // [image-block-preserve 2026-11-14] ⛔ 不能把整串 JSON 当文本截断 —— 那会把 image 块
+            //   截成半个 base64（线上 sess-a4a11222：截图 98KB 被截成文本，模型再也看不到屏幕）。
+            //   含图片时保留块数组（返回原 content ⇒ McpServerTool.resolveData 取 contentNode），
+            //   只把「超长的 text 兄弟块」就地截短；image/document 块原样不动。
+            String preserved = truncateOversizedTextBlocks(transformed.contentNode(), maxTokens);
             logEvent("tengu_mcp_large_result_handled", "truncated", "contains_images", sizeEstimate);
-            return truncateMcpContentIfNeeded(content, maxTokens);
+            return preserved != null ? preserved : transformed.content();
         }
         if (ctx == null || ctx.workspaceDir() == null || ctx.sessionId() == null) {
             // 无落盘上下文 → 截断降级（不悬挂）

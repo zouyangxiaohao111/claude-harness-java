@@ -288,8 +288,13 @@ function main() {
   // 若不删则重复 tauri build 时 jlink 必然失败
   rmSync(jreDir, { recursive: true, force: true })
   console.log(`[prepare-backend] [6/6] jlink 裁剪 JRE → ${jreDir}`)
+  // ⚠️ 必须限堆：jlink 默认堆 = 物理内存的 1/4（本机 31.4GB ⇒ 默认 7.8GB），
+  //   而打包常与 IDE / 其它会话的编译并发，可用内存只剩 1~2GB
+  //   ⇒ JVM 申请堆失败、进程被系统 OOM killer 杀掉（2026-11-14 实测：
+  //   日志停在 jdeps 之后戛然而止，无任何 Java 异常）。
+  //   jlink 裁 JRE 实际只需几百 MB ⇒ 限 1g 足够。
   execSync(
-    `"${tools.jlink}" --add-modules ${addModules} --output "${jreDir}" --strip-debug --no-man-pages --no-header-files --compress=zip-6`,
+    `"${tools.jlink}" -J-Xmx1g --add-modules ${addModules} --output "${jreDir}" --strip-debug --no-man-pages --no-header-files --compress=zip-6`,
     { stdio: 'inherit' }
   )
   cpSync(jarPath, resolve(out, 'nexusai-backend.jar'))
