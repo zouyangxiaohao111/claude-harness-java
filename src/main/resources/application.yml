@@ -216,9 +216,19 @@ nexusai:
   # ---------------------------------------------------------------
   knowledge:
     ingest:
+      # 六个池与源站逐一对应（internal/types/task.go:17-24）：
+      #   core=8 / postprocess=2 / enrichment=12 / wiki=8 / maintenance=4 / shared=6
+      #   上游合计 32 = core+post+enrich+maint+shared（**不含 wiki**，与源站同口径）
       parse-concurrency: 8
       postprocess-concurrency: 2
       enrichment-concurrency: 12
+      # Wiki 生成独立池：源站从 postprocess 拆出来正是因为它是长任务（几十页），
+      #   挤在 2 并发里会拖慢摘要/问题生成（后者才是「文档可用」的前置）。
+      wiki-concurrency: 8
+      # 维护池（本仓暂无对应任务类型，保留配置位以便与源站口径对读）。
+      maintenance-concurrency: 4
+      # 弹性池（源站可借 core/enrichment 空闲容量；本仓不实现借用，仅对齐合计口径）。
+      shared-concurrency: 6
       # [向量化并发 · 对齐源站 2026-11-14]
       #   embed-sub-batch = 子批大小（源站 BATCH_EMBED_SIZE 默认 5）
       #   embed-pool-size = 进程级子批并发线程数（源站 CONCURRENCY_POOL_SIZE 默认 5）

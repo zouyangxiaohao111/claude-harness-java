@@ -101,6 +101,13 @@ interface ComposerProps {
   composerText: string
   setComposerText: (v: string) => void
   sendMessage: (attachments?: AttachmentRequest[]) => void
+  /**
+   * 附件上传通道（默认 {@code uploadAttachment} → 主会话 {@code /attachments/upload}）。
+   *
+   * <p>知识库对话传入自己的上传端点（`/kb/chat/{sid}/attachments`，上传即解析成正文），
+   * 返回的 `contentId` 就是临时附件 id。⛔ 主会话不传 ⇒ 行为零变化。
+   */
+  attachmentUploader?: (file: File, sessionId: string) => Promise<{ contentId: string; filename: string; size: number }>
   showToast: (msg: string, type?: 'success' | 'info') => void
   streaming: boolean
   onStop: () => void
@@ -338,7 +345,7 @@ const SUG_CARD: React.CSSProperties = {
   overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -539,6 +546,33 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
     }
   }, [atItems])
   const atMenuRef = useRef<HTMLDivElement>(null)
+  /**
+   * 点「@ 知识库」面板外部时收起。
+   *
+   * <p>⚠️ 之前只有「选中某一项」才关门（{@link applyAtPick}），点别处（消息区、空白、
+   * 别条工具栏）面板会一直浮着，用户必须选一个或手动再点按钮才能关 —— 2026-11-14 用户报。
+   *
+   * <p>排除三类内部点击：面板本身、输入框（点输入框是继续打字，不该关）、
+   * 「@ 知识库」触发按钮（它自己是 toggle，重复处理会让面板点了没反应）。
+   */
+  useEffect(() => {
+    if (!kbPanelOpen || !atOpen) return
+    const onDocMouseDown = (e: MouseEvent) => {
+      const t = e.target as Node | null
+      if (!t) return
+      // ⭐ 判定基准：**只认面板自己的 DOM**。点输入框也算外部（用户 2026-11-14 明确要求）。
+      //   唯一例外是「@ 知识库」触发按钮 —— 它自己是 toggle，若在这里先关掉，
+      //   随后 onClick 又会 `setAtOpen(!v)` 打开，表现为「点按钮关不掉」。
+      if (atMenuRef.current?.contains(t)) return
+      const el = t as HTMLElement
+      if (el.closest?.('[data-at-trigger]')) return
+      setAtOpen(false)
+      setAtGroup(null)
+      setAtSearch('')
+    }
+    document.addEventListener('mousedown', onDocMouseDown)
+    return () => document.removeEventListener('mousedown', onDocMouseDown)
+  }, [kbPanelOpen, atOpen])
   const hadAtRef = useRef(false)
   const [projFiles, setProjFiles] = useState<string[] | null>(null)
   // 懒加载一次绑定项目 git 文件（扁平文件路径；失败静默，@ 仍可手输）
@@ -747,7 +781,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
           const bytes = new Uint8Array(await file.arrayBuffer())
           return { dataUrl: `data:${mediaType};base64,${u8ToBase64(bytes)}`, bytes }
         },
-        upload: (file, sid) => uploadAttachment(file, sid),
+        upload: (file, sid) => (attachmentUploader ?? uploadAttachment)(file, sid),
       })
       console.warn(`[attach] addFiles 汇总 接受=${summary.accepted} 拒绝=${summary.rejected.length}`
         + ` 重复=${summary.duplicates.length} 读取失败=${summary.failed.length}`)
@@ -798,7 +832,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
             continue
           }
           const file = new File([bytes], name, { type: mediaType })
-          const r = await uploadAttachment(file, sessionId)
+          const r = await (attachmentUploader ?? uploadAttachment)(file, sessionId)
           pending.push({ type, filename: name, mediaType, contentId: r.contentId, size: bytes.length, dedupKey: fileDedupKey(name, bytes.length) })
           console.warn(`[attach] 结局=${name} → pending（通道=upload contentId=${r.contentId} ${bytes.length}B）`)
         } else {
@@ -1634,6 +1668,7 @@ export function Composer({ composerText, setComposerText, sendMessage, showToast
                   type="button"
                   className="tool-chip"
                   title="选择知识库（等同于输入 @）"
+                  data-at-trigger=""
                   onClick={() => { setAtOpen((v) => !v); setAtIndex(0) }}
                 >
                   <span aria-hidden="true">@</span>

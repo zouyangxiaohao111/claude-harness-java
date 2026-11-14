@@ -4043,6 +4043,21 @@ public class LlmAgentLoop implements AgentLoop {
         // 事件 4：loop 退出
         publishEvent(new AgentLoopExitedEvent(out, out.exitReason(), out.turnCount()));
 
+        // [goal-terminal 2026-11-14] 每轮终态分流 · 对齐 CC v2.1.325 的 Pc()/ch(reason)：
+        //   Stop hook 只在走到 Stop 事件时判定；API 错误 / 模型错误 / 中止 / 上下文超限等终态
+        //   此前没有任何 goal 分支 ⇒ 目标停在 ACTIVE（用户读成「中断不可用」）。
+        //   只在主 agent 出口补这一层；子代理 / fork 走 queryLoop，不经 run()。
+        if (agentId == null && sessionId != null && !sessionId.isBlank() && mainCtx != null) {
+            try {
+                com.nexusai.application.agent.goal.GoalService gs = mainCtx.goalService();
+                if (gs != null) {
+                    gs.handleTurnTerminal(sessionId, out.exitReason());
+                }
+            } catch (Exception e) {
+                log.warn("[goal] 终态分流失败（不影响本轮退出）session={}: {}", sessionId, e.toString());
+            }
+        }
+
         // ── §14: SessionEnd hooks — 会话结束（对齐 CC executeSessionEndHooks hooks.ts:4097-4141）──
         // [IMP-HOOKS-S5 D-01/D-02] executeEvent 折叠 + injectHookResultMessage → 
         //   hookRegistry.executeSessionEndHooks（1500ms 超时 cap + per-hook 缺省 + 失败逐结果
@@ -4867,7 +4882,7 @@ public class LlmAgentLoop implements AgentLoop {
         if (ref[0] != null && ref[0].sessionId() != null
                 && isTopLevelLoopSource(params.querySource())) {
             List<Tool> scoped = applySessionAgentToolPolicy(
-                    ref[0].sessionId(), ref[0].availableTools());
+                    ref[0].sessionId(), ref[0].availableTools(), ref[0].requestExtras());
             ref[0] = ref[0].withAvailableTools(scoped);
         }
         return ref[0];
@@ -13934,7 +13949,7 @@ public class LlmAgentLoop implements AgentLoop {
         //   顺序 = 权限链（bare/deny/coordinator/会话禁用）之后 —— 白名单不能复活被权限挡掉的工具。
         if (available != null && tuc != null && tuc.sessionId() != null
                 && isTopLevelLoopSource(querySource)) {
-            available = applySessionAgentToolPolicy(tuc.sessionId(), available);
+            available = applySessionAgentToolPolicy(tuc.sessionId(), available, tuc.requestExtras());
         }
         return available;
     }
@@ -13959,7 +13974,8 @@ public class LlmAgentLoop implements AgentLoop {
      * @param available     已过 bare/deny/coordinator/会话禁用的当轮工具池
      * @return 最终可见工具列表
      */
-    private static List<Tool> applySessionAgentToolPolicy(String sessionId, List<Tool> available) {
+    private static List<Tool> applySessionAgentToolPolicy(String sessionId, List<Tool> available,
+                                                          java.util.Map<String, Object> requestExtras) {
         java.util.Optional<java.util.List<String>> noList = java.util.Optional.empty();
         com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
 
@@ -14048,12 +14064,58 @@ public class LlmAgentLoop implements AgentLoop {
         java.util.List<Tool> resolved =
                 com.nexusai.application.agent.tool.AgentToolPolicy.apply(
                         available, def.tools(), def.disallowedTools());
+        // ⭐ 对齐源站 agent_service.go:1292-1295 `withoutWikiWriteTools`：
+        //   本轮没有可写知识库 ⇒ 把 6 个 wiki 写/变更工具从工具池摘掉。
+        //   装配期摘掉（模型看不见）比「看得见但调用被拒」更贴近源站行为。
+        resolved = dropWikiWriteToolsWhenUnwritable(sessionId, agentType, requestExtras, resolved);
         if (log.isDebugEnabled()) {
             log.debug("[LlmAgentLoop] 主线程 agent 工具白名单生效: session={} agent={} 池 {}→{}（tools 声明 {} 项）",
                     sessionId, agentType, available.size(), resolved.size(),
                     def.tools().map(java.util.List::size).orElse(-1));
         }
         return resolved;
+    }
+
+    /** 6 个 wiki 写/变更工具 · 与源站 {@code withoutWikiWriteTools} 的名单逐字一致。 */
+    private static final java.util.Set<String> WIKI_WRITE_TOOLS = java.util.Set.of(
+            "wiki_flag_issue", "wiki_update_issue", "wiki_write_page",
+            "wiki_replace_text", "wiki_rename_page", "wiki_delete_page");
+
+    /**
+     * 本轮无可写知识库 ⇒ 摘掉 wiki 写工具。
+     *
+     * <p>可写范围由网关按人格算好放进 {@code kbScope.writableKbIds}（wiki 修订 = 只允许 @ 的库，
+     * 其他人格 = 读范围）。⚠️ 字段存在但为空是<b>明确不可写</b>，⛔ 不能当「没配置」去放行。
+     *
+     * @return 过滤后的工具列表（无可写范围时不含 6 个写工具）
+     */
+    private static List<Tool> dropWikiWriteToolsWhenUnwritable(
+            String sessionId, String agentId,
+            java.util.Map<String, Object> requestExtras, List<Tool> tools) {
+        if (tools == null || tools.isEmpty() || requestExtras == null) {
+            return tools;
+        }
+        Object raw = requestExtras.get("kbScope");
+        if (!(raw instanceof java.util.Map<?, ?> scope)) {
+            return tools;
+        }
+        if (!(scope.get("writableKbIds") instanceof java.util.List<?> writable)) {
+            return tools;   // 旧请求没有该字段 ⇒ 不改变既有行为
+        }
+        for (Object item : writable) {
+            if (item instanceof String s && !s.isBlank()) {
+                return tools;   // 有可写库 ⇒ 全量保留
+            }
+        }
+        java.util.List<Tool> kept = new java.util.ArrayList<>(tools.size());
+        for (Tool tool : tools) {
+            if (tool == null || !WIKI_WRITE_TOOLS.contains(tool.name())) {
+                kept.add(tool);
+            }
+        }
+        log.info("[agent-tool-scope] 本轮无可写知识库 ⇒ 摘掉 wiki 写工具 {}→{}: session={} agent={}",
+                tools.size(), kept.size(), sessionId, agentId);
+        return kept;
     }
 
     /**

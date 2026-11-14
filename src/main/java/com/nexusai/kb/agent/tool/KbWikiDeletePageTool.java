@@ -101,7 +101,7 @@ public class KbWikiDeletePageTool implements Tool {
                 return ToolResult.error(call.id(), "slug 不能为空");
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_delete_page] 拒绝越权删除 kb={} slug={}", kbId, slug);
                 return ToolResult.error(call.id(), denied + "，不能删除");

@@ -18,7 +18,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { ApiError } from '@/api/rest'
 import { chatApi } from '@/api/chat'
 import { knowledgeApi } from '@/api/knowledge'
-import type { ChunkView } from '@/api/knowledge'
+import type { ChunkView, Knowledge } from '@/api/knowledge'
+import { KbDocPreview } from './KbDocPreview'
+import { kbFileExtOf } from './KbDocPreview'
 import { sessionApi } from '@/api/sessions'
 import { settingsApi } from '@/api/settings'
 import { providerApi } from '@/api/providers'
@@ -73,6 +75,9 @@ const KB_MODES = [
   { key: 'builtin-smart-reasoning', label: '智能推理', title: '多步 ReAct · 可调 5 个知识库工具' },
   { key: 'builtin-data-analyst', label: '数据分析', title: 'CSV / Excel → DuckDB SQL' },
   { key: 'builtin-wiki-researcher', label: '维基问答', title: '在 Wiki 页面间导航 · 只读' },
+  // 后端 KbBuiltInAgentDefs.wikiFixer() 早已注册，此前只是缺这个入口。
+  // 源站该人格 kb_selection_mode=selected ⇒ 写操作只允许用户 @ 的库（守卫见 KbWikiToolSupport.checkKbWritable）。
+  { key: 'builtin-wiki-fixer', label: '维基修订', title: '整理 Wiki 页面结构、修正内容与链接（只写 @ 的知识库）' },
 ] as const
 
 /** 默认模式：快速问答（零工具，弹窗内不触发权限门）。 */
@@ -179,6 +184,17 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
   const [sourceLoading, setSourceLoading] = useState(false)
   /** 右侧「文档来源」是否展开 —— 默认关闭，点回答下方「引用 · N」才打开（对齐源站按需抽屉） */
   const [citeOpen, setCiteOpen] = useState(false)
+  /**
+   * 会话临时附件（`kba-` 开头）的展示：解析后的正文在右栏纯文本显示。
+   * ⛔ 不能走 `citeSource`（那条按 knowledge_id 查 /chunks），临时附件没有分块。
+   */
+  const [tempDoc, setTempDoc] = useState<{
+    id: string
+    name: string
+    loading: boolean
+    content: string
+    error?: string
+  } | null>(null)
 
   // ── 空态推荐问题（对齐源站「你可以这样问我」+ 换一批）──
   // 源站优先用 agent 配置的 starters（curated），未配置才从范围内知识库取候选生成；
@@ -393,11 +409,11 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
   /** 独立窗口发送：登记活跃流（驱动 {@link useChatSocket} 订阅），再调会话发送接口。
    *  流式块 / 工具卡由主会话那条「STOMP → store」管道写入本窗口 store，MessageList 直接渲染。 */
   const selfSend = useCallback(
-    async (sid: string, content: string) => {
+    async (sid: string, content: string, uploaded?: AttachmentRequest[]) => {
       // 本地先插 user 气泡（与主对话 sendMessage 同做法；assistant 内容由 STOMP 流入 store）
       const localUserId = `local-u-${Date.now()}`
-      // 选中的库/文件 = 本条消息的附件快照（后端落 messages.user_attachments，气泡上显示胶囊）
-      const attachments = picked.length
+      // ① @ 选中的库/文件 = 知识库范围快照（后端落 messages.user_attachments，气泡上显示胶囊）
+      const pickedSnapshot = picked.length
         ? picked.map((p) => ({
             // type=kb 让气泡按源站「@引用」渲染（正文上方 chip）；filename 只放名称，类型由图标区分
             type: p.kind === 'kb' ? 'kb' : 'file',
@@ -408,11 +424,14 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
             //   （2026-11-14 用户报「独立预览报『附件内容不可用（缺少 url/path/base64 源）』」）。
             contentId: p.kind === 'file' ? p.id : undefined,
           }))
-        : undefined
+        : []
+      // ② 输入框里**主动上传的文件**（Composer 的附件通道）必须一并带上 —— 此前被整条丢弃：
+      //   后端收不到 ⇒ 模型读不到、气泡也不显示（2026-11-14 用户报「上传的 xlsx 无法读取、气泡没有附件」）。
+      const attachments = [...pickedSnapshot, ...(uploaded ?? [])]
       useChatStore.getState().appendMessages(sid, [{
         id: localUserId, sessionId: sid, role: 'user', author: '你',
         content, reasoning: null, toolCalls: null, finishReason: null,
-        userAttachments: attachments,
+        userAttachments: attachments.length ? attachments : undefined,
       } as ChatMessageDto])
       setActiveStreams((prev) => ({ ...prev, [sid]: `/topic/sessions/${sid}/stream` }))
       try {
@@ -429,8 +448,13 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
             if (p.kbId) kbIds.add(p.kbId)
           }
         }
+        // 上传文件的临时附件 id（后端据此把正文内联进 user content）
+        const attachmentIds = (uploaded ?? [])
+          .map((a) => a.contentId)
+          .filter((x): x is string => !!x)
         const body = {
           content,
+          attachmentIds: attachmentIds.length ? attachmentIds : undefined,
           // 改写/实体抽取/生成都用这个模型（不传 ⇒ 后端「无可用改写模型」直接降级为原问题，
           // 用户实测 query_understand 报「未使用改写模型，已按原问题检索」就是这个原因）
           modelName: meta.modelName || undefined,
@@ -484,14 +508,15 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
 
   /** 发送：主窗口走 App 运行时；独立窗口走自建通道。 */
   const doSend = useCallback(
-    // 附件暂不传：统一入口的请求体（GatewayRequest）只有 content / knowledgeBaseIds / modelName / webSearchEnabled
-    (_attachments?: AttachmentRequest[]) => {
+    // 附件必传：Composer 里主动上传的文件走这条（后端 GatewayRequest.attachments 原样收下）。
+    // 旧注释「附件暂不传」已过时 —— 不传就是模型读不到、气泡也不显示。
+    (attachments?: AttachmentRequest[]) => {
       const sid = sessionId
       if (!sid) {
         void ensureSession()
         return
       }
-      void selfSend(sid, text)
+      void selfSend(sid, text, attachments)
       setText('')
     },
     [ensureSession, selfSend, sessionId, text],
@@ -519,6 +544,15 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
       void sessionApi.update(sessionId, { mainThreadAgent: key }).catch((e) => {
         showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       })
+      // ⚠️ 切模式后强制重拉一次历史：本轮 store 里若只有刚才那几轮（或只有当轮），
+      //    而「进入会话」的加载条件是「store 非空就不拉」⇒ 历史会永久缺失，
+      //    用户看到的就是「只剩当轮」（2026-11-14 用户报）。
+      //    切模式时不可能在流式，覆盖安全。
+      void chatApi.listMessagesPage(sessionId, { limit: 200 })
+        .then((r) => {
+          if (r.messages.length > 0) useChatStore.getState().setMessages(sessionId, r.messages)
+        })
+        .catch(() => { /* 拉不到就保持现状，不阻断 */ })
     },
     [sessionId, showToast],
   )
@@ -760,6 +794,31 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
               conversationId={conversationId}
               // 正文里的 [N] chip 点击 → 打开右侧「文档来源」并滚到该条（对齐源站：点引用直接看来源）
               citationTitlesByMessage={citationTitlesByMessage}
+              // 用户气泡里的知识库文件 chip → 在同一右侧抽屉打开原文。
+              // ⛔ 不要退回 openStandalone（独立窗口）：知识库场景期望在页面内预览，
+              //    且独立窗口走 /knowledge/{id}/download，这条链在本页没有登录上下文时取不到字节。
+              onOpenKbDoc={(knowledgeId, title) => {
+                // `kba-` = 会话临时附件（上传解析那条链）⇒ 走附件详情，不查分块
+                if (knowledgeId.startsWith('kba-')) {
+                  setTempDoc({ id: knowledgeId, name: title ?? '附件', loading: true, content: '' })
+                  if (!sessionId) return
+                  void knowledgeApi.getChatAttachment(sessionId, knowledgeId)
+                    .then((r) => setTempDoc((cur) => (cur && cur.id === knowledgeId
+                      ? {
+                          ...cur,
+                          loading: false,
+                          content: r.content ?? '',
+                          error: r.status === 'ready' ? undefined : (r.errorMessage || '附件尚未解析完成'),
+                        }
+                      : cur)))
+                    .catch((e) => setTempDoc((cur) => (cur && cur.id === knowledgeId
+                      ? { ...cur, loading: false, error: e instanceof Error ? e.message : String(e) }
+                      : cur)))
+                  return
+                }
+                setCiteOpen(true)
+                setCiteSource({ ref_index: 0, knowledge_id: knowledgeId, knowledge_title: title ?? null })
+              }}
               // 引用入口挂在最后一条回答的左下角（正文之后、复制/操作条之上），与源站一致
               tailFooter={citations.length > 0 && !citeOpen ? (
                 <div style={{ display: 'flex', paddingTop: 8 }}>
@@ -784,6 +843,14 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
           composerText={text}
           setComposerText={setText}
           sendMessage={(attachments) => doSend(attachments)}
+          // 知识库对话的上传走独立端点（上传即解析成正文）；主会话不传此 prop，链路不变
+          attachmentUploader={async (file, sid) => {
+            const r = await knowledgeApi.uploadChatAttachment(sid, file)
+            if (r.status !== 'ready') {
+              throw new Error(r.errorMessage || '附件解析中，请稍后再发送')
+            }
+            return { contentId: r.id, filename: r.fileName, size: file.size }
+          }}
           showToast={showToast}
           streaming={streaming}
           onStop={doStop}
@@ -862,20 +929,56 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
           />
         )}
       </div>
-      {/* 文档来源（对齐源站 ChatReferencesDrawer：回答右侧列出本轮引用） */}
-      {citations.length > 0 && citeOpen && (
+      {/* 文档来源（对齐源站 ChatReferencesDrawer：回答右侧列出本轮引用）
+          ⚠️ 打开条件不能只看 citations：用户气泡里的知识库文件 chip 会直接设置
+             citeSource（该轮可能没有任何引用）⇒ 必须把「有来源视图」也算进去，
+             否则点了 chip 右侧栏根本不出现（用户 2026-11-14 报）。 */}
+      {((citeOpen && citations.length > 0) || citeSource || tempDoc) && (
         <aside style={CIT_PANEL} aria-label="文档来源">
-          {!citeSource && (
+          {!citeSource && !tempDoc && (
           <div style={CIT_HEAD}>
             <span>文档来源<span style={CIT_COUNT}> · {citations.length}</span></span>
             <button type="button" style={CIT_CLOSE} title="关闭" onClick={() => setCiteOpen(false)}>×</button>
           </div>
           )}
-          {citeSource ? (
+          {tempDoc ? (
+            <>
+              <div style={CIT_HEAD}>
+                <span style={CIT_SRC_TITLE} title={tempDoc.name}>{tempDoc.name}</span>
+                <button type="button" style={CIT_CLOSE} title="关闭" onClick={() => setTempDoc(null)}>×</button>
+              </div>
+              <div style={CIT_LIST}>
+                {tempDoc.loading ? (
+                  <div style={CIT_HINT}>正在读取附件…</div>
+                ) : tempDoc.error ? (
+                  <div style={CIT_HINT}>{tempDoc.error}</div>
+                ) : (
+                  // ⭐ 用**现成的原格式渲染器**（PDF / docx-preview / exceljs / markdown），
+                  //   ⛔ 不再把解析后的纯文本摊出来（用户 2026-11-14 要求）。
+                  //   取字节走临时附件自己的 raw 端点，不影响知识库文档那条下载链。
+                  <KbDocPreview
+                    knowledge={{
+                      id: tempDoc.id,
+                      file_name: tempDoc.name,
+                      title: tempDoc.name,
+                      file_type: kbFileExtOf({ file_name: tempDoc.name } as unknown as Knowledge),
+                    } as unknown as Knowledge}
+                    chunks={[]}
+                    chunksLoading={false}
+                    chunksError={null}
+                    mode="auto"
+                    onSwitchToChunks={() => {}}
+                    rawBytesLoader={() => knowledgeApi.chatAttachmentBytes(sessionId ?? '', tempDoc.id)}
+                  />
+                )}
+              </div>
+            </>
+          ) : citeSource ? (
             <>
               <div style={CIT_HEAD}>
                 <button type="button" style={CIT_BACK} onClick={() => setCiteSource(null)}>
-                  ‹ 全部引用<span style={CIT_COUNT}> · {citations.length}</span>
+                  {citations.length > 0 ? `‹ 全部引用` : `‹ 返回`}
+                  {citations.length > 0 && <span style={CIT_COUNT}> · {citations.length}</span>}
                 </button>
                 <button type="button" style={CIT_CLOSE} title="关闭" onClick={() => { setCiteSource(null); setCiteOpen(false) }}>×</button>
               </div>

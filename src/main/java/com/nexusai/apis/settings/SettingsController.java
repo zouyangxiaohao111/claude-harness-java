@@ -1,6 +1,9 @@
 package com.nexusai.apis.settings;
 
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.kb.app.ingest.IngestConcurrencyConfig;
+import com.nexusai.kb.app.ingest.KbIngestPoolProperties;
+import com.nexusai.kb.app.ingest.KbIngestWorker;
 import com.nexusai.model.settings.dto.ModelTierRole;
 import com.nexusai.model.settings.dto.SettingsDto;
 import com.nexusai.model.settings.dto.SettingsResponse;
@@ -26,6 +29,12 @@ public class SettingsController {
 
     /** 检索驱动注册表（W1）：驱动清单来自 Spring 容器，⛔ 前端不硬编码。 */
     @Autowired private com.nexusai.kb.app.retrieval.engine.KbRetrievalEngineRegistry engineRegistry;
+
+    /** 入库六池并发的 yml 侧配置（DB 未配置时的回落值 · V293）。 */
+    @Autowired private KbIngestPoolProperties ingestPoolProperties;
+
+    /** 入库 worker · 热调必须落在它持有的那一个池实例上（⛔ 不要 new Worker / new Pools）。 */
+    @Autowired private KbIngestWorker ingestWorker;
 
     /** GET：响应 = {@link SettingsResponse}（内层 SettingsDto 摊平 + appName/configHome 两个只读键）。
      *  ⛔ 这两个键只在这里出站：PUT 的入参/出参仍是 {@link SettingsDto} ⇒ 结构上写不动（见 SettingsResponse javadoc）。 */
@@ -151,6 +160,139 @@ public class SettingsController {
      */
     public record RetrievalEnginesResponse(
         String current, java.util.List<String> registered, java.util.List<String> available
+    ) {
+    }
+
+    /**
+     * GET 入库流水线六池并发配置（V293）。
+     *
+     * <p><b>契约固定</b>（前端按此写）：
+     * <pre>
+     * 200 {"parse":8,"postprocess":2,"enrichment":12,"wiki":8,
+     *      "maintenance":4,"shared":6,"maxTasksPerTick":5,"source":"db"|"yml"}
+     * </pre>
+     *
+     * <p>{@code source} 语义：{@code db} = 用户显式保存过
+     * （{@code settings.ingest_concurrency_config} 有值）；{@code yml} = 没保存过，
+     * 返回的是 {@code nexusai.knowledge.ingest.*} 的默认值。前端据此区分
+     * 「用户设置」与「系统默认」，⛔ 不要自己猜。
+     *
+     * @return 生效中的完整配置 + 来源
+     */
+    @GetMapping("/ingest-concurrency")
+    public IngestConcurrencyResponse getIngestConcurrency() {
+        IngestConcurrencyConfig stored = IngestConcurrencyConfig.parse(
+            settingsService.readIngestConcurrencyConfig());
+        IngestConcurrencyConfig effective = stored == null
+            ? IngestConcurrencyConfig.ymlDefaults(ingestPoolProperties)
+            : stored.resolve(ingestPoolProperties);
+        return toIngestConcurrencyResponse(effective, stored == null ? "yml" : "db");
+    }
+
+    /**
+     * PUT 入库流水线六池并发配置（V293）· 写库 + <b>热生效</b>（不重启）。
+     *
+     * <p><b>请求语义</b>：字段<b>全部可选</b>，缺失（{@code null}）= 不改这一项
+     * —— 与 settings 其它 PUT 的 merge 契约一致。合并基线 = 「DB 已存值，缺的回落 yml」，
+     * 因此一次只改一个池也能得到完整对象。
+     *
+     * <p><b>校验（fail loud → 400）</b>：六个池 1..64，{@code maxTasksPerTick} 1..50；
+     * 越界错误信息带字段名（用户要能知道是哪一项填错了）。
+     *
+     * <p><b>⭐ 热生效顺序</b>：写库 → {@link KbIngestWorker#applyConcurrency}
+     * （内部先覆盖 properties，再 resize 池；旧池在途归零后才 shutdown，⛔ 不打断在途任务）。
+     * 前端拿到的返回对象就是<b>此刻真正生效</b>的值。
+     *
+     * @param req 请求体（可空对象；各字段可空）
+     * @return 生效后的完整对象（同 GET 结构，{@code source=db}）
+     */
+    @PutMapping("/ingest-concurrency")
+    public IngestConcurrencyResponse updateIngestConcurrency(@RequestBody(required = false) IngestConcurrencyRequest req) {
+        IngestConcurrencyRequest patch = req == null
+            ? new IngestConcurrencyRequest(null, null, null, null, null, null, null) : req;
+        IngestConcurrencyConfig stored = IngestConcurrencyConfig.parse(
+            settingsService.readIngestConcurrencyConfig());
+        IngestConcurrencyConfig base = stored == null
+            ? IngestConcurrencyConfig.ymlDefaults(ingestPoolProperties)
+            : stored.resolve(ingestPoolProperties);
+        // 先校验（越界直接 400，⛔ 不落库、不动池）
+        IngestConcurrencyConfig overlay = new IngestConcurrencyConfig(
+            validatePoolConcurrency("parse", patch.parse()),
+            validatePoolConcurrency("postprocess", patch.postprocess()),
+            validatePoolConcurrency("enrichment", patch.enrichment()),
+            validatePoolConcurrency("wiki", patch.wiki()),
+            validatePoolConcurrency("maintenance", patch.maintenance()),
+            validatePoolConcurrency("shared", patch.shared()),
+            validateMaxTasksPerTick(patch.maxTasksPerTick()));
+        IngestConcurrencyConfig merged = base.overlay(overlay);
+        settingsService.updateIngestConcurrencyConfig(merged.toJson());
+        ingestWorker.applyConcurrency(
+            merged.parse(), merged.postprocess(), merged.enrichment(), merged.wiki(),
+            merged.maintenance(), merged.shared(), merged.maxTasksPerTick());
+        return toIngestConcurrencyResponse(merged, "db");
+    }
+
+    /** 单池并发校验（null = 不改；越界 → 400，错误信息带字段名）。 */
+    private static Integer validatePoolConcurrency(String field, Integer value) {
+        if (value == null) {
+            return null;
+        }
+        if (value < 1 || value > 64) {
+            throw new ValidationException(field + " 非法（有效域 1..64）: " + value);
+        }
+        return value;
+    }
+
+    /** 每轮认领上限校验（null = 不改；越界 → 400）。 */
+    private static Integer validateMaxTasksPerTick(Integer value) {
+        if (value == null) {
+            return null;
+        }
+        if (value < 1 || value > 50) {
+            throw new ValidationException("maxTasksPerTick 非法（有效域 1..50）: " + value);
+        }
+        return value;
+    }
+
+    /** 组装固定契约的响应（字段顺序 = 契约顺序）。 */
+    private static IngestConcurrencyResponse toIngestConcurrencyResponse(
+        IngestConcurrencyConfig config, String source) {
+        return new IngestConcurrencyResponse(
+            config.parse(), config.postprocess(), config.enrichment(), config.wiki(),
+            config.maintenance(), config.shared(), config.maxTasksPerTick(), source);
+    }
+
+    /**
+     * 入库六池并发 · 请求体（全部可选，缺失 = 不改）。
+     *
+     * <p>⚠️ 键名是前后端契约：{@code parse / postprocess / enrichment / wiki /
+     * maintenance / shared / maxTasksPerTick} —— ⛔ 不要改名。
+     */
+    public record IngestConcurrencyRequest(
+        Integer parse,
+        Integer postprocess,
+        Integer enrichment,
+        Integer wiki,
+        Integer maintenance,
+        Integer shared,
+        Integer maxTasksPerTick
+    ) {
+    }
+
+    /**
+     * 入库六池并发 · 响应体（GET/PUT 同结构）。
+     *
+     * @param source {@code db} = 值来自 settings 列；{@code yml} = 尚未保存过，返回 yml 默认值
+     */
+    public record IngestConcurrencyResponse(
+        int parse,
+        int postprocess,
+        int enrichment,
+        int wiki,
+        int maintenance,
+        int shared,
+        int maxTasksPerTick,
+        String source
     ) {
     }
 

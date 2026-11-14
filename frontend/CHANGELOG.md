@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.79] - 2026-11-14
+
+### Fixed
+
+- 修复 0.1.78 安装包缺少两个数据库迁移（V293 入库并发配置 / V294 知识库对话附件）的问题：0.1.78 打包时这两个迁移尚未纳入版本库，安装包内没有它们，而已应用 V293 的环境升级后会报「applied migration not resolved locally」导致应用无法启动。**已装 0.1.78 且启动失败的用户，请手动下载安装 0.1.79**
+
 ## [0.1.78] - 2026-11-14
 
 ### Fixed

@@ -3,6 +3,7 @@ package com.nexusai.application.agent.config;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.goal.GoalService;
+import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.domain.session.SessionGoal;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -45,7 +46,8 @@ public class GoalCommandRegistrationConfig {
     public GoalSlashRegistration goalSlashRegistration(
             UserInputDispatcher dispatcher,
             @Autowired(required = false) GoalService goalService,
-            @Autowired(required = false) SessionAgentStateRegistry sessionRegistry) {
+            @Autowired(required = false) SessionAgentStateRegistry sessionRegistry,
+            @Autowired(required = false) HookRegistry hookRegistry) {
         if (dispatcher == null) {
             log.warn("[GoalCommandRegistrationConfig] UserInputDispatcher 未注入，/goal handler 注册跳过");
             return new GoalSlashRegistration();
@@ -55,7 +57,8 @@ public class GoalCommandRegistrationConfig {
             return new GoalSlashRegistration();
         }
         dispatcher.registerSlashCommandResult("goal",
-            (args, sessionId, inFlightUserMessageId) -> handleGoal(args, sessionId, goalService, sessionRegistry));
+            (args, sessionId, inFlightUserMessageId) ->
+                handleGoal(args, sessionId, goalService, sessionRegistry, hookRegistry));
         log.info("[GoalCommandRegistrationConfig] /goal 已注册为生产 slash command · 对齐 CC goal 斜杠命令");
         return new GoalSlashRegistration();
     }
@@ -74,8 +77,8 @@ public class GoalCommandRegistrationConfig {
      */
     private UserInputDispatcher.LocalCommandResult handleGoal(
             String args, String sessionId, GoalService goalService,
-            SessionAgentStateRegistry sessionRegistry) {
-        return handleGoalForTest(args, sessionId, goalService, sessionRegistry);
+            SessionAgentStateRegistry sessionRegistry, HookRegistry hookRegistry) {
+        return handleGoalForTest(args, sessionId, goalService, sessionRegistry, hookRegistry);
     }
 
     /**
@@ -93,6 +96,17 @@ public class GoalCommandRegistrationConfig {
     public UserInputDispatcher.LocalCommandResult handleGoalForTest(
             String args, String sessionId, GoalService goalService,
             SessionAgentStateRegistry sessionRegistry) {
+        return handleGoalForTest(args, sessionId, goalService, sessionRegistry, null);
+    }
+
+    /**
+     * [/goal handler] 带 hooks 政策门的版本 · 对齐 CC v2.1.325 {@code uGt()} 的 {@code T6n()} 门控。
+     *
+     * @param hookRegistry hooks 注册中心（null = 未接线 → 不做门控）
+     */
+    public UserInputDispatcher.LocalCommandResult handleGoalForTest(
+            String args, String sessionId, GoalService goalService,
+            SessionAgentStateRegistry sessionRegistry, HookRegistry hookRegistry) {
         String raw = args == null ? "" : args.trim();
 
         // ── 无参：显示当前目标（CC：Goal active: <c> (N turns) / No goal set）──
@@ -110,7 +124,17 @@ public class GoalCommandRegistrationConfig {
             if (cleared == null) {
                 return UserInputDispatcher.LocalCommandResult.text("No goal set");
             }
-            return UserInputDispatcher.LocalCommandResult.text("Goal cleared");
+            // 逐字对齐 CC：「Goal cleared: <condition>」（不是裸的 Goal cleared）
+            return UserInputDispatcher.LocalCommandResult.text("Goal cleared: " + cleared);
+        }
+
+        // ── 设定门 · 对齐 CC v2.1.325 hooks_gate ──
+        //   hooks 被策略禁用（disableAllHooks / allowManagedHooksOnly）时 goal 的 Stop hook
+        //   根本不会执行 ⇒ 设了也是死目标。CC 直接拒绝并给这句文案（逐字）。
+        if (hookRegistry != null && hookRegistry.isHooksRestricted()) {
+            return UserInputDispatcher.LocalCommandResult.text(
+                "/goal can't run while hooks are restricted (disableAllHooks or "
+                + "allowManagedHooksOnly is set in settings or by policy).");
         }
 
         // ── 设定目标 ──

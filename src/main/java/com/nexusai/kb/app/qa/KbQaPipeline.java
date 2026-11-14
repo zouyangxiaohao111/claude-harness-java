@@ -15,10 +15,13 @@ import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.kb.app.retrieval.KbHybridSearcher;
 import com.nexusai.kb.app.retrieval.KbRerankStage;
 import com.nexusai.kb.config.KbConfigService;
 import com.nexusai.kb.domain.KnowledgeBaseService;
+import com.nexusai.kb.repo.entity.KbChunkRecord;
+import com.nexusai.kb.repo.mapper.KbChunkMapper;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import jakarta.annotation.PreDestroy;
 import org.slf4j.Logger;
@@ -83,6 +86,14 @@ public class KbQaPipeline {
     private final SettingsService settingsService;
     private final KbConfigService kbConfigService;
     private final MessageService messageService;
+
+    /**
+     * 文档兜底召回用（字段注入 · 单测可不装配）。
+     *
+     * <p>只在「用户显式 @ 了文档，但向量/关键词都没命中」时使用 —— 见 {@link #explicitDocFallback}。
+     */
+    @Autowired(required = false)
+    private KbChunkMapper chunkMapper;
 
     @Autowired(required = false) private LlmProviderFactory providerFactory;
     @Autowired(required = false) private ModelConfigResolver modelConfigResolver;
@@ -679,7 +690,56 @@ public class KbQaPipeline {
                 log.info("[问答链] ④ 查询扩展补入 {} 条，合并后 {} 条", expanded.size(), hits.size());
             }
         }
+        // ⭐ 指定文档兜底：用户 @ 了文档但两路都没召回（典型「这个文件讲了什么」——
+        //    泛问与任何块都不相似，全库 topK 又基本来自别的文档 ⇒ 事后过滤后归零）。
+        //    此时直接取该文档的前 N 个文本块，保证模型至少看到这份文件的内容。
+        if (hits.isEmpty() && req.knowledgeIds() != null && !req.knowledgeIds().isEmpty()) {
+            hits = explicitDocFallback(req, Math.max(4, params.embeddingTopK()));
+            log.info("[问答链] ④ 指定文档未命中，改用文档兜底 文档数={} 块数={} session={}",
+                req.knowledgeIds().size(), hits.size(), req.sessionId());
+        }
         return hits;
+    }
+
+    /**
+     * 指定文档的兜底召回：按 {@code chunk_index} 取该文档前 N 个启用中的文本块。
+     *
+     * <p><b>为什么需要</b>：`filterByKnowledgeIds` 是<b>事后过滤</b>，而「这个文件讲了什么」
+     * 这类概括性问题与任何具体块的相似度都低 ⇒ 召回的全库 topK 里几乎没有该文档，
+     * 过滤后为 0，模型只能回答「没找到」。
+     *
+     * <p>⚠️ 这是**兜底**，不是主路径：正常命中时不会走到这里（{@code hits.isEmpty()} 前置）。
+     * 分数给恒定值（0.5）—— 下游只按顺序拼接上下文，不参与排序。
+     */
+    private List<KbHybridSearcher.Hit> explicitDocFallback(Request req, int limit) {
+        if (chunkMapper == null) {
+            return List.of();
+        }
+        List<KbHybridSearcher.Hit> out = new ArrayList<>();
+        for (String docId : req.knowledgeIds()) {
+            if (docId == null || docId.isBlank()) {
+                continue;
+            }
+            List<KbChunkRecord> rows;
+            try {
+                rows = chunkMapper.selectListByQuery(QueryWrapper.create()
+                    .where("knowledge_id = ?", docId)
+                    .and("deleted = 0")
+                    .and("is_enabled = 1")
+                    .and("chunk_type = 'text'")
+                    .orderBy("chunk_index", true)
+                    .limit(limit));
+            } catch (RuntimeException e) {
+                log.warn("[问答链] 文档兜底查询失败 doc={} 原因={}", docId, e.toString());
+                continue;
+            }
+            for (KbChunkRecord r : rows) {
+                out.add(new KbHybridSearcher.Hit(
+                    r.getId(), r.getKnowledgeId(), r.getContent(), "", 0.5, 0, 0,
+                    r.getChunkType() == null ? KbHybridSearcher.Hit.TYPE_TEXT : r.getChunkType()));
+            }
+        }
+        return out;
     }
 
     /**

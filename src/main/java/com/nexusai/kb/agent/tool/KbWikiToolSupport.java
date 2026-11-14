@@ -44,6 +44,41 @@ final class KbWikiToolSupport {
         return null;
     }
 
+    /**
+     * 写操作的作用域校验：该知识库是否在<b>本轮可写</b>范围内。
+     *
+     * <p>⭐ 与 {@link #checkKbAllowed} 分开是必须的：读范围在不 @ 时会展开成「全部库」，
+     * 写工具若沿用读范围，就等于给了全部库的写权限。源站对应
+     * {@code writableWikiKBIDs = intersectStrings(wikiKBIDs, config.WritableKBIDs)}
+     * （{@code agent_service.go:1292}）。
+     *
+     * <p>口径：
+     * <ul>
+     *   <li>{@code builtin-wiki-fixer} ⇒ 只允许用户本轮 @ 的库，没 @ ⇒ 一律拒绝</li>
+     *   <li>其他人格 ⇒ 本轮读范围（与源站 all 模式下「有写权限就能写」一致）</li>
+     * </ul>
+     *
+     * @param scope 会话作用域（可 {@code null} = 未绑定智能体 = 不限制）
+     * @param ctx   工具上下文（可能为 null）
+     * @param kbId  目标知识库
+     * @return 拒绝理由；通过时返回 {@code null}
+     */
+    static String checkKbWritable(KbAgentToolScope scope,
+                                  com.nexusai.application.agent.tool.ToolUseContext ctx,
+                                  String kbId) {
+        if (scope == null) {
+            return null;
+        }
+        List<String> writable = scope.writableKnowledgeBaseIds(ctx);
+        if (writable.isEmpty()) {
+            return "本轮未指定可写知识库（写操作只允许在用户 @ 的知识库内进行）";
+        }
+        if (!writable.contains(kbId)) {
+            return "该知识库不在本轮可写范围内（只能在用户 @ 的知识库内修改）";
+        }
+        return null;
+    }
+
     /** 页面 → 紧凑 JSON（slug / title / page_type / summary / 内容长度，不含正文）。 */
     static String pageBrief(KbWikiPageRecord p) {
         return "{\"slug\":\"" + esc(p.getSlug())

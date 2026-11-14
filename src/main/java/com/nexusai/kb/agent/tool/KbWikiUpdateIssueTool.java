@@ -122,7 +122,7 @@ public class KbWikiUpdateIssueTool implements Tool {
                     "status 取值非法：" + status + "。允许：" + String.join(" / ", ALLOWED_STATUS));
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_update_issue] 拒绝越权更新 kb={}", kbId);
                 return ToolResult.error(call.id(), denied + "，不能更新");

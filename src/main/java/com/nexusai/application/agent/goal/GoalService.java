@@ -1,11 +1,13 @@
 package com.nexusai.application.agent.goal;
 
+import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.permission.hook.GenericHook;
 import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.hook.PromptHook;
 import com.nexusai.domain.session.SessionGoal;
 import com.nexusai.domain.session.SessionService;
+import com.nexusai.domain.stats.StatsService;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Service;
@@ -93,6 +95,14 @@ public class GoalService {
     /** Hook 注册中心（懒解析；未接线 → null ⇒ 目标机制不生效）。 */
     private HookRegistry hookRegistry() {
         return hookRegistryProvider == null ? null : hookRegistryProvider.getIfAvailable();
+    }
+
+    /** 输出 token 聚合（可选注入；未接线 → 终态附件的 tokens 记 null，不回落 0）。 */
+    private StatsService statsService;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setStatsService(StatsService statsService) {
+        this.statsService = statsService;
     }
 
     /** 推送目标状态（publisher 未接线 → 跳过；前端会在下次拉取时拿到真值）。 */
@@ -368,7 +378,7 @@ public class GoalService {
             SessionGoal done = recordImpossible(sessionId);
             log.info("[goal] 评估器判定条件不可能达成 → 目标停止推进（session={}）", sessionId);
             return new GoalVerdict(GoalVerdict.Kind.IMPOSSIBLE,
-                done == null ? null : buildTerminalTraceMessage(done));
+                done == null ? null : buildTerminalTraceMessage(sessionId, done));
         }
         // ③ 评估器自身失败（非本目标的 blocking 语义）
         //   [B6 2026-11-04] 对齐 CC v2.1.318：error 不是「目标失败」，而是「这次判定没做成」——
@@ -388,7 +398,7 @@ public class GoalService {
             SessionGoal done = recordAchieved(sessionId);
             log.info("[goal] 评估器判定条件已满足 → 目标达成（session={}）", sessionId);
             return new GoalVerdict(GoalVerdict.Kind.MET,
-                done == null ? null : buildTerminalTraceMessage(done));
+                done == null ? null : buildTerminalTraceMessage(sessionId, done));
         }
         // ⑤ 未达成：blockingError ⇒ iterations++ + lastReason
         if (result.blockingError() != null) {
@@ -480,7 +490,8 @@ public class GoalService {
         if (condition.length() > SessionGoal.MAX_CONDITION_LENGTH) {
             // CC：超长直接拒绝并回报实际长度（bor=4000）
             throw new IllegalArgumentException(
-                "目标条件长度超过上限 " + SessionGoal.MAX_CONDITION_LENGTH + " 字符（实际 " + condition.length() + "）");
+                // 逐字对齐 CC：Goal condition is limited to 4000 characters
+                "Goal condition is limited to " + SessionGoal.MAX_CONDITION_LENGTH + " characters");
         }
 
         // 1. 先摘掉旧目标（若有）—— CC Sor() 先 remove 所有旧 prompt Stop hook
@@ -615,6 +626,65 @@ public class GoalService {
      */
     public SessionGoal recordImpossible(String sessionId) {
         return finish(sessionId, SessionGoal.Phase.IMPOSSIBLE);
+    }
+
+    /**
+     * 每轮终态分流 · 对齐 CC v2.1.325 的 {@code Pc() / ch(reason) / mh(goalPass)}
+     * （claude.exe 偏移 ≈329,278,xxx）。
+     *
+     * <p><b>WHY 需要这一层</b>：Stop hook 只在「本轮走到 Stop 事件」时给出 goal 判定；
+     * 若本轮以 API 错误 / 模型错误 / 中止 / 上下文超限等终态结束，CC 仍会把 reason 过一遍
+     * 分流表（none / retry / pause / clear），本仓此前没有任何对应分支 ⇒ 目标停在 ACTIVE、
+     * hook 可能已被 SessionEnd 摘掉，用户看到「目标还在但不再推进」。
+     *
+     * <p>分流口径（逐条对齐 {@code ch(reason)}）：
+     * <ul>
+     *   <li>NORMAL —— Stop hook 链路已处理，这里不重复；</li>
+     *   <li>ABORTED / MAX_TURNS / INTERRUPTED —— none（对齐 aborted_* / max_turns）；</li>
+     *   <li>STOP_HOOK_PREVENTED / HOOK_STOPPED —— pause(hook_stopped)；</li>
+     *   <li>BLOCKING_LIMIT / PROMPT_TOO_LONG —— clear(context_limit)；</li>
+     *   <li>MODEL_ERROR —— pause(turn_error)；</li>
+     *   <li>STOP_HOOK_BLOCKING_LIMIT_EXCEEDED —— pause(goal_check_capped)；</li>
+     *   <li>其余（IMAGE_ERROR / STREAM_ERROR / STREAM_TIMEOUT / MAX_OUTPUT_TOKENS /
+     *       STRUCTURED_OUTPUT_RETRIES_EXCEEDED / NO_ASSISTANT_TEXT）—— retry。</li>
+     * </ul>
+     *
+     * <p>⛔ 不照抄 CC 的 {@code isNonInteractiveSession} 短路：本仓 Web 后端所有会话都算
+     * 非交互，照抄会让整层永不生效。
+     *
+     * @param sessionId 会话 ID
+     * @param reason    本轮 ExitReason（可 null）
+     */
+    public void handleTurnTerminal(String sessionId, AgentState.ExitReason reason) {
+        if (sessionId == null || sessionId.isBlank() || reason == null) {
+            return;
+        }
+        SessionGoal goal = getGoal(sessionId);
+        // 只处理推进态：PAUSED 已是「等用户发消息」的显式状态，重复暂停只会反复 publish；
+        // 终态（ACHIEVED / IMPOSSIBLE）不再推进。
+        if (goal == null || !goal.isActive()) {
+            return;
+        }
+        switch (reason) {
+            case NORMAL, ABORTED, MAX_TURNS, INTERRUPTED -> {
+                // CC aborted_streaming / aborted_tools / max_turns → {kind:"none"}：不动目标
+            }
+            case STOP_HOOK_PREVENTED, HOOK_STOPPED -> {
+                recordPaused(sessionId, "本轮被 hook 提前结束 · 发消息继续", false);
+            }
+            case BLOCKING_LIMIT, PROMPT_TOO_LONG -> {
+                if (clearGoal(sessionId) != null) {
+                    log.warn("[goal] 上下文达到上限，目标已清除（需重新 /goal）session={}", sessionId);
+                }
+            }
+            case MODEL_ERROR -> {
+                recordPaused(sessionId, "模型调用失败，本轮未完成 · 发消息继续", false);
+            }
+            case STOP_HOOK_BLOCKING_LIMIT_EXCEEDED -> {
+                recordPaused(sessionId, "目标检查连续未通过，本轮已结束 · 发消息继续", false);
+            }
+            default -> scheduleEvaluatorRetry(sessionId, goal);
+        }
     }
 
     /**
@@ -819,11 +889,38 @@ public class GoalService {
      * @param goal 目标终态快照
      * @return 可 append 到消息流的消息
      */
-    public com.nexusai.model.session.dto.ChatMessageDto buildTerminalTraceMessage(SessionGoal goal) {
+    public com.nexusai.model.session.dto.ChatMessageDto buildTerminalTraceMessage(
+            String sessionId, SessionGoal goal) {
         boolean met = goal.phase() == SessionGoal.Phase.ACHIEVED;
+        boolean failed = goal.phase() == SessionGoal.Phase.IMPOSSIBLE;
         String content = met
             ? "◎ 目标已达成 · " + goal.iterations() + " 轮"
             : "◎ 目标无法达成 · " + goal.iterations() + " 轮";
+        // [goal-align 2026-11-14] 对齐 CC v2.1.325 的 goal_status 附件字段：
+        //   {type, condition, met, failed, reason, iterations, durationMs, tokens}。
+        //   durationMs = 评估结束 - 设定时刻；tokens = 目标期间 output token 合计
+        //   （与「用量与花费」页同源；取不到记 null，⛔ 不回落 0）。
+        java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+        payload.put("type", "goal_status");
+        payload.put("condition", goal.condition());
+        payload.put("met", met);
+        payload.put("failed", failed);
+        if (goal.lastReason() != null && !goal.lastReason().isBlank()) {
+            payload.put("reason", goal.lastReason());
+        }
+        payload.put("iterations", goal.iterations());
+        payload.put("durationMs", Math.max(0L, System.currentTimeMillis() - goal.setAt()));
+        Long tokens = null;
+        if (statsService != null && sessionId != null && !sessionId.isBlank()) {
+            try {
+                tokens = statsService.outputTokensSince(sessionId, goal.setAt());
+            } catch (Exception e) {
+                log.warn("[goal] goal_status tokens 聚合失败（记 null）session={}: {}", sessionId, e.toString());
+            }
+        }
+        if (tokens != null) {
+            payload.put("tokens", tokens);
+        }
         return new com.nexusai.model.session.dto.ChatMessageDto(
             java.util.UUID.randomUUID().toString(),
             null,
@@ -832,7 +929,7 @@ public class GoalService {
             content,
             null, null, null, null, null, null, null,
             null, null, null,
-            java.util.List.of(), java.util.List.of(), null,
+            java.util.List.of(), java.util.List.of(), payload,   // 第 18 参 = structuredOutput
             true,                              // isMeta = true（系统注入，不是用户气泡）
             false, null,
             "goal_status",                    // subtype（前端 systemRowLabel 据此出人话）

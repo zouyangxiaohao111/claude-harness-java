@@ -1061,11 +1061,89 @@ export const knowledgeApi = {
    *
    * <p>返回 202；内容走 STOMP `/topic/sessions/{sid}/stream`（与两条链同一个 topic）。
    */
-  kbChat: (sessionId: string, body: { content: string; knowledgeBaseIds?: string[]; knowledgeIds?: string[]; attachments?: Array<{ type: string; filename: string }>; modelName?: string }) =>
+  kbChat: (sessionId: string, body: { content: string; knowledgeBaseIds?: string[]; knowledgeIds?: string[]; attachmentIds?: string[]; attachments?: Array<{ type: string; filename: string; contentId?: string }>; modelName?: string }) =>
     api<{ route?: string; userMessageId?: string; assistantMessageId?: string; streamTopic?: string }>(
       `/kb/chat/${encodeURIComponent(sessionId)}`,
       { method: 'POST', body },
     ),
+
+  /**
+   * 知识库对话 · 会话临时附件上传（`POST /api/v1/kb/chat/{sid}/attachments`）。
+   *
+   * <p>⛔ 与主会话的 `uploadAttachment`（`/attachments/upload`）是两条独立链路：
+   * 这里上传即解析成正文，发消息时后端按 token 预算内联进 user content
+   * （对齐源站 TemporaryDocument）。
+   *
+   * @return `status=ready` 表示正文可用；`failed` 时 `errorMessage` 给原因
+   */
+  uploadChatAttachment: async (sessionId: string, file: File): Promise<{
+    id: string
+    fileName: string
+    fileType: string
+    fileSize: number
+    status: string
+    tokenCount: number
+    errorMessage?: string | null
+  }> => {
+    const form = new FormData()
+    form.append('file', file)
+    const res = await fetch(
+      `${API_V1_BASE}/kb/chat/${encodeURIComponent(sessionId)}/attachments`,
+      {
+        method: 'POST',
+        body: form,
+        headers: { Accept: 'application/json', 'X-Client-Env': 'react' },
+      },
+    )
+    if (!res.ok) {
+      const { parseProblem } = await import('./rest')
+      throw await parseProblem(res)
+    }
+    return (await res.json()) as {
+      id: string
+      fileName: string
+      fileType: string
+      fileSize: number
+      status: string
+      tokenCount: number
+      errorMessage?: string | null
+    }
+  },
+
+  /**
+   * 读取一条会话临时附件（含解析后正文）· 气泡点击展示用。
+   *
+   * <p>⛔ 与知识库文档的 `listChunks` 是两条链：`kba-` 开头的是临时附件 id，
+   * 不能拿去查 `/chunks/{id}`。
+   */
+  getChatAttachment: (sessionId: string, id: string) =>
+    api<{
+      id: string
+      fileName: string
+      fileType: string
+      fileSize: number
+      status: string
+      tokenCount: number
+      errorMessage?: string | null
+      content?: string | null
+    }>(`/kb/chat/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(id)}`),
+
+  /**
+   * 会话临时附件的**原始字节** —— 交给现成的原格式渲染器（PDF / docx-preview / exceljs）预览。
+   *
+   * <p>⛔ 不复用 `rawBytes(knowledgeId)`：那条打的是 `/knowledge/{id}/download`，
+   * 临时附件 id（`kba-`）在知识库表里不存在。
+   */
+  chatAttachmentBytes: async (sessionId: string, id: string): Promise<Uint8Array> => {
+    const res = await fetch(
+      `${API_V1_BASE}/kb/chat/${encodeURIComponent(sessionId)}/attachments/${encodeURIComponent(id)}/raw`,
+      { headers: { 'X-Client-Env': 'react' } },
+    )
+    if (!res.ok) {
+      throw new Error(`附件读取失败 HTTP ${res.status}`)
+    }
+    return new Uint8Array(await res.arrayBuffer())
+  },
 
   /**
    * 知识库工作区项目（`GET /api/v1/kb/workspace/project`）。

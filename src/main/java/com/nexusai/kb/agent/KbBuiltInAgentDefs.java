@@ -82,14 +82,20 @@ public final class KbBuiltInAgentDefs {
         "read_document",
         "list_documents",
         "query_knowledge_graph",
-        "AskUserQuestion"
+        "AskUserQuestion",
+        // ⭐ 读会话临时附件（解析后的 .md，见 KbChatAttachmentService）——
+        //    源站清单里没有它（agent 轮用 read_file 读 attachment://），本仓用同名 Read 工具。
+        "Read"
     );
 
     /** data-analyst 的 3 个工具（源站 :127-130）。 */
     static final List<String> TOOLS_DATA_ANALYST = List.of(
         "data_schema",
         "data_analysis",
-        "AskUserQuestion"
+        "AskUserQuestion",
+        // ⭐ 读会话临时附件（解析后的 .md，见 KbChatAttachmentService）——
+        //    源站清单里没有它（agent 轮用 read_file 读 attachment://），本仓用同名 Read 工具。
+        "Read"
     );
 
     /** wiki-researcher 的 4 个工具（源站 :169-173）。 */
@@ -97,7 +103,10 @@ public final class KbBuiltInAgentDefs {
         "wiki_search",
         "wiki_read_page",
         "read_document",
-        "wiki_flag_issue"
+        "wiki_flag_issue",
+        // ⭐ 读会话临时附件（解析后的 .md，见 KbChatAttachmentService）——
+        //    源站清单里没有它（agent 轮用 read_file 读 attachment://），本仓用同名 Read 工具。
+        "Read"
     );
 
     /** wiki-fixer 的 9 个工具（源站 :213-222）。 */
@@ -110,7 +119,10 @@ public final class KbBuiltInAgentDefs {
         "wiki_rename_page",
         "wiki_delete_page",
         "wiki_read_issue",
-        "wiki_update_issue"
+        "wiki_update_issue",
+        // ⭐ 读会话临时附件（解析后的 .md，见 KbChatAttachmentService）——
+        //    源站清单里没有它（agent 轮用 read_file 读 attachment://），本仓用同名 Read 工具。
+        "Read"
     );
 
     /**
@@ -134,7 +146,10 @@ public final class KbBuiltInAgentDefs {
         "wiki_delete_page",
         "wiki_flag_issue",
         "wiki_read_issue",
-        "wiki_update_issue"
+        "wiki_update_issue",
+        // ⭐ 读会话临时附件（解析后的 .md，见 KbChatAttachmentService）——
+        //    源站清单里没有它（agent 轮用 read_file 读 attachment://），本仓用同名 Read 工具。
+        "Read"
     );
 
     private KbBuiltInAgentDefs() {

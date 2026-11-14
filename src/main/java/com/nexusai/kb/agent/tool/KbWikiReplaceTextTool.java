@@ -122,7 +122,7 @@ public class KbWikiReplaceTextTool implements Tool {
                 return ToolResult.error(call.id(), "old_text 与 new_text 相同，替换无意义");
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_replace_text] 拒绝越权写入 kb={} slug={}", kbId, slug);
                 return ToolResult.error(call.id(), denied + "，不能写入");

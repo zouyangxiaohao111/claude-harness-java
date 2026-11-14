@@ -28,6 +28,22 @@ public class SettingsRecord {
      */
     private Integer modelMaxConcurrency;
 
+    /**
+     * 入库流水线六池并发配置 · V293 列 {@code ingest_concurrency_config}（TEXT）。
+     *
+     * <p>存 JSON 文本：{@code {"parse":8,"postprocess":2,"enrichment":12,"wiki":8,
+     * "maintenance":4,"shared":6,"maxTasksPerTick":5}}；null/空 = 未配置 → 回落
+     * {@code nexusai.knowledge.ingest.*}（yml）。
+     *
+     * <p>读写统一走 {@code /api/v1/settings/ingest-concurrency}（GET/PUT）；PUT 由
+     * {@code KbIngestWorker#applyConcurrency} 热调池。⛔ 不塞进 SettingsDto：那是
+     * 用户全局偏好的扁平 DTO，这里是一份有独立契约的能力配置（同 kb-models 端点的取舍）。
+     *
+     * <p>命名：MyBatis-Flex camelCase→snake 精确映射（ingestConcurrencyConfig →
+     * ingest_concurrency_config）。
+     */
+    private String ingestConcurrencyConfig;
+
     /** 外部子代理总开关（V259）。 */
     private Boolean subagentExternalEnabled;
 
@@ -481,6 +497,9 @@ public class SettingsRecord {
 
     public Integer getModelMaxConcurrency() { return modelMaxConcurrency; }
     public void setModelMaxConcurrency(Integer modelMaxConcurrency) { this.modelMaxConcurrency = modelMaxConcurrency; }
+    // [V293] ingest_concurrency_config ↔ ingestConcurrencyConfig（JSON 文本；null/空 = 回落 yml）
+    public String getIngestConcurrencyConfig() { return ingestConcurrencyConfig; }
+    public void setIngestConcurrencyConfig(String ingestConcurrencyConfig) { this.ingestConcurrencyConfig = ingestConcurrencyConfig; }
     public String getSubagentDefaultRuntime() { return subagentDefaultRuntime; }
     public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
     public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }

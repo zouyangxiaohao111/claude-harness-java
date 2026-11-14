@@ -90,14 +90,84 @@ public class KbAgentToolScope {
      * @return {@code null} = 本轮没有请求级范围（主会话 / 用户没选）⇒ 调用方按原逻辑处理
      */
     private List<String> requestScopeKnowledgeBaseIds(ToolUseContext ctx) {
+        Map<?, ?> scope = scopeMap(ctx);
+        if (scope == null) {
+            return null;
+        }
+        // ⭐ 优先读网关算好的「本轮完整读范围」。它与 `<runtime_context>` 里列的是同一份 id，
+        //   两处口径必须一致（否则模型看到一个库、工具却查另一个）。
+        List<String> effective = stringList(scope.get("effectiveKbIds"));
+        if (!effective.isEmpty()) {
+            return effective;
+        }
+        // 兼容没有 effectiveKbIds 的旧请求 / 其他调用方：退回「@ 的库 + @ 文件所属库」。
+        java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>(explicitKbIds(scope));
+        return out.isEmpty() ? java.util.List.of() : new ArrayList<>(out);
+    }
+
+    /**
+     * 本轮<b>可写</b>的知识库 · 对齐源站 {@code writableWikiKBIDs}（{@code agent_service.go:1292}）。
+     *
+     * <p>⭐ 与 {@link #allowedKnowledgeBaseIds} 分开是<b>必须</b>的：不 @ 时读范围会变成
+     * 「全部库」，如果写工具也读那份范围，就等于顺手给了全部库的写权限。
+     *
+     * <p>口径（源站 {@code wiki_fixer} = {@code kb_selection_mode: "selected"}）：
+     * <ul>
+     *   <li>{@code builtin-wiki-fixer} ⇒ 只允许用户本轮 @ 的库（含 @ 文件所属库）；没 @ ⇒ 空</li>
+     *   <li>其他人格 ⇒ 本轮读范围（源站 all 模式下有写权限就能写）</li>
+     * </ul>
+     *
+     * @return 空列表 = 本轮没有可写库（调用方必须拒绝写操作）
+     */
+    public List<String> writableKnowledgeBaseIds(ToolUseContext ctx) {
+        Map<?, ?> scope = scopeMap(ctx);
+        if (scope == null) {
+            return List.of();
+        }
+        // ⭐ 网关已按人格算好写范围（`writableKbIds`）—— 这里只读，不重算，三处口径必须同一份。
+        //   ⚠️ 字段存在但为空 = 明确不可写，⛔ 不能当「没配置」去回落。
+        if (scope.get("writableKbIds") instanceof List<?> rawWritable) {
+            return stringList(rawWritable);
+        }
+        // 兼容没有 writableKbIds 的旧请求 / 其他调用方
+        List<String> explicit = explicitKbIds(scope);
+        if (com.nexusai.kb.agent.KbBuiltInAgentDefs.WIKI_FIXER.equals(boundAgentId(ctx))) {
+            return explicit;
+        }
+        List<String> effective = stringList(scope.get("effectiveKbIds"));
+        return effective.isEmpty() ? explicit : effective;
+    }
+
+    /** {@code requestExtras["kbScope"]} 的 Map 形态；没有就返回 null（主会话 / 没选）。 */
+    private static Map<?, ?> scopeMap(ToolUseContext ctx) {
         Map<String, Object> extras = ctx == null ? null : ctx.requestExtras();
         if (extras == null || extras.isEmpty()) {
             return null;
         }
         Object raw = extras.get("kbScope");
-        if (!(raw instanceof Map<?, ?> scope)) {
-            return null;
+        return raw instanceof Map<?, ?> scope ? scope : null;
+    }
+
+    /** 把 JSON 数组读成字符串列表（忽略非字符串/空白项）。 */
+    private static List<String> stringList(Object raw) {
+        if (!(raw instanceof List<?> list)) {
+            return List.of();
         }
+        List<String> out = new ArrayList<>(list.size());
+        for (Object item : list) {
+            if (item instanceof String s && !s.isBlank()) {
+                out.add(s);
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 用户<b>真正 @ 的</b>知识库（库 + @ 文件所属库）。
+     *
+     * <p>⛔ 不读 {@code effectiveKbIds}：那是「本轮可读的全部库」，不是用户的选择。
+     */
+    private List<String> explicitKbIds(Map<?, ?> scope) {
         java.util.LinkedHashSet<String> out = new java.util.LinkedHashSet<>();
         if (scope.get("knowledgeBaseIds") instanceof List<?> list) {
             for (Object item : list) {
@@ -123,7 +193,27 @@ public class KbAgentToolScope {
                 }
             }
         }
-        return out.isEmpty() ? java.util.List.of() : new ArrayList<>(out);
+        return out.isEmpty() ? List.of() : new ArrayList<>(out);
+    }
+
+    /** 会话绑定的 agent id（写权限口径要用它区分 wiki-fixer）· 读不到返回 null。 */
+    private String boundAgentId(ToolUseContext ctx) {
+        if (sessionMapper == null || ctx == null) {
+            return null;
+        }
+        String sessionId = ctx.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            var row = sessionMapper.selectOneById(sessionId);
+            String agent = row == null ? null : row.getMainThreadAgent();
+            return agent == null || agent.isBlank() ? null : agent.trim();
+        } catch (RuntimeException e) {
+            log.warn("[kb_agent 工具范围] 读会话失败（写权限按非 wiki-fixer 处理）session={} 原因={}",
+                sessionId, e.toString());
+            return null;
+        }
     }
 
     /**

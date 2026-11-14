@@ -6,6 +6,7 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.EnumMap;
+import java.util.Iterator;
 import java.util.List;
 import java.util.Map;
 import java.util.concurrent.LinkedBlockingQueue;
@@ -61,8 +62,29 @@ public final class KbIngestPools {
             KbIngestTaskRecord.TYPE_SUMMARY,
             KbIngestTaskRecord.TYPE_QUESTION,
             KbIngestTaskRecord.TYPE_AUTO_TAG,
-            KbIngestTaskRecord.TYPE_WIKI,
             KbIngestTaskRecord.TYPE_NOOP)),
+        /**
+         * Wiki 生成 · 源站独立 {@code wiki} 池（并发 8）。
+         *
+         * <p>⭐ 为什么单独一池：源站把它从 postprocess 拆出来就是因为 Wiki 生成是**长任务**
+         * （一个库可能要生成几十页），挤在 postprocess 的 2 并发里会同时拖慢摘要/问题生成，
+         * 而后者才是「文档可用」的前置条件。
+         */
+        WIKI("wiki", List.of(KbIngestTaskRecord.TYPE_WIKI)),
+        /**
+         * 维护任务池 · 源站 {@code maintenance}=4（物理队列名仍是 {@code low}）。
+         *
+         * <p>本仓暂无对应任务类型（空列表 ⇒ 不路由任何任务，线程池不预创建线程、零开销）。
+         * 保留它的目的：① 并发配置项与源站同名可对照；② 将来加清理/补偿类任务时有现成归属。
+         */
+        MAINTENANCE("maintenance", List.of()),
+        /**
+         * 弹性池 · 源站 {@code shared}=6（可借 core / enrichment 的空闲容量）。
+         *
+         * <p>⚠️ 本仓**不实现借用**（跨池信号量在 SQLite 单写锁下收益小于缺陷面，见类注释）；
+         * 这里建池是为了「池并发合计」与源站口径一致，任务为空。
+         */
+        SHARED("shared", List.of()),
         /** 增强 · 源站 Enrichment 池（源站 12，本仓默认 8；每个任务都是一次外部模型调用）。 */
         ENRICHMENT("enrichment", List.of(
             KbIngestTaskRecord.TYPE_GRAPH,
@@ -89,6 +111,25 @@ public final class KbIngestPools {
 
     private final Map<Kind, Pool> pools = new EnumMap<>(Kind.class);
 
+    /**
+     * 热调后被替换下来的旧池。
+     *
+     * <p>⛔ 换池时<b>不立即 shutdown</b>（虽然 {@code shutdown()} 本身不打断在途任务，但保留旧池
+     * 可以让我们按「该池自己的在途数归零」这一精确信号关闭它，而不是靠猜测）。
+     * 等池内 {@code inflight == 0} 时调 {@code executor.shutdown()}；⛔ 全程不 {@code shutdownNow}。
+     */
+    private final List<Pool> retired = new ArrayList<>();
+
+    /**
+     * 名额归属（占位 / 归还必须落到<b>同一个池实例</b>）。
+     *
+     * <p>⭐ 这是热调最容易漏的一处：任务在旧池上占的名额，若 {@link #release(Kind)} 按
+     * {@code pools.get(kind)} 归还，就会记到<b>新池</b>上 ⇒ 旧池在途永远 &gt; 0（永不关闭），
+     * 新池在途被减成负数（背压容量被悄悄放大）。所以占位时把 Pool 记在本线程上，
+     * 归还时优先按它归还。调度线程（占位后认领失败）与任务线程（{@link #submit} 包装）都覆盖。
+     */
+    private final ThreadLocal<Pool> reservationPool = new ThreadLocal<>();
+
     /** 在途计数归零时唤醒 {@link #awaitIdle(long)} 的监视器。 */
     private final Object idleMonitor = new Object();
 
@@ -103,12 +144,110 @@ public final class KbIngestPools {
      * @param enrichmentConcurrency  enrichment 池并发度（&lt;= 0 按 1）
      */
     public KbIngestPools(int parseConcurrency, int postprocessConcurrency,
-                         int enrichmentConcurrency) {
+                         int enrichmentConcurrency,
+                         int wikiConcurrency, int maintenanceConcurrency, int sharedConcurrency) {
         pools.put(Kind.PARSE, new Pool(Kind.PARSE, Math.max(1, parseConcurrency)));
         pools.put(Kind.POSTPROCESS,
             new Pool(Kind.POSTPROCESS, Math.max(1, postprocessConcurrency)));
         pools.put(Kind.ENRICHMENT,
             new Pool(Kind.ENRICHMENT, Math.max(1, enrichmentConcurrency)));
+        pools.put(Kind.WIKI, new Pool(Kind.WIKI, Math.max(1, wikiConcurrency)));
+        pools.put(Kind.MAINTENANCE, new Pool(Kind.MAINTENANCE, Math.max(1, maintenanceConcurrency)));
+        pools.put(Kind.SHARED, new Pool(Kind.SHARED, Math.max(1, sharedConcurrency)));
+    }
+
+    /**
+     * 兼容构造器（3 池）· 既有单测与直构点用，缺省值取源站同名并发。
+     */
+    public KbIngestPools(int parseConcurrency, int postprocessConcurrency,
+                         int enrichmentConcurrency) {
+        this(parseConcurrency, postprocessConcurrency, enrichmentConcurrency,
+            KbIngestPoolProperties.DEFAULT_WIKI_CONCURRENCY,
+            KbIngestPoolProperties.DEFAULT_MAINTENANCE_CONCURRENCY,
+            KbIngestPoolProperties.DEFAULT_SHARED_CONCURRENCY);
+    }
+
+    /**
+     * 热调六池并发度（{@code /api/v1/settings/ingest-concurrency} PUT / 启动时应用 DB 配置）。
+     *
+     * <p><b>语义</b>：
+     * <ul>
+     *   <li>新 limit == 旧 limit ⇒ <b>不动</b>（不换池 = 不产生任何抖动）；</li>
+     *   <li>否则新建 {@link Pool} 替换，旧池放进 {@link #retired}；</li>
+     *   <li>旧池<b>不立即关闭</b>，等它自己的在途数归零再 {@code executor.shutdown()}
+     *       （在途任务必须跑完整，⛔ 不 {@code shutdownNow}）。</li>
+     * </ul>
+     *
+     * <p>⚠️ 换池后「旧池在途」仍被 {@link #totalInflight()} / {@link #awaitIdle(long)} /
+     * {@link #describe()} 计入（见各自实现），否则 drain 判断会在旧任务还没跑完时就返回。
+     *
+     * @param parseConcurrency       parse 池并发度（&lt;= 0 按 1）
+     * @param postprocessConcurrency postprocess 池并发度（&lt;= 0 按 1）
+     * @param enrichmentConcurrency  enrichment 池并发度（&lt;= 0 按 1）
+     * @param wikiConcurrency        wiki 池并发度（&lt;= 0 按 1）
+     * @param maintenanceConcurrency maintenance 池并发度（&lt;= 0 按 1）
+     * @param sharedConcurrency      shared 池并发度（&lt;= 0 按 1）
+     */
+    public synchronized void resize(int parseConcurrency, int postprocessConcurrency,
+                                    int enrichmentConcurrency, int wikiConcurrency,
+                                    int maintenanceConcurrency, int sharedConcurrency) {
+        if (shutdown) {
+            // 停机后换池会造出一个谁也收不到的线程池 ⇒ 直接拒绝（配置下次启动生效）
+            log.warn("[入库worker] 已停机，忽略池并发热调");
+            return;
+        }
+        resizeKind(Kind.PARSE, parseConcurrency);
+        resizeKind(Kind.POSTPROCESS, postprocessConcurrency);
+        resizeKind(Kind.ENRICHMENT, enrichmentConcurrency);
+        resizeKind(Kind.WIKI, wikiConcurrency);
+        resizeKind(Kind.MAINTENANCE, maintenanceConcurrency);
+        resizeKind(Kind.SHARED, sharedConcurrency);
+        reapRetiredLocked();
+    }
+
+    /** 换单个池（调用方持有 {@code this} 锁）。 */
+    private void resizeKind(Kind kind, int requested) {
+        int limit = Math.max(1, requested);
+        Pool current = pools.get(kind);
+        if (current != null && current.limit == limit) {
+            return;
+        }
+        Pool replacement = new Pool(kind, limit);
+        if (current != null) {
+            // 并发度实测值跨代保留：maxObserved 是「本次进程内见过的最多同时在做几件」，换池不改写这个事实
+            replacement.maxObserved.set(current.maxObserved.get());
+            retired.add(current);
+            log.info("[入库worker] 池并发热调 kind={} {} → {}（旧池在途={}，归零后关闭）",
+                kind.id(), current.limit, limit, current.inflight.get());
+        } else {
+            log.info("[入库worker] 池并发初始 kind={} limit={}", kind.id(), limit);
+        }
+        pools.put(kind, replacement);
+    }
+
+    /**
+     * 关闭已经排空的旧池（调用方持有 {@code this} 锁）。
+     *
+     * <p>判定用<b>旧池自己的</b> in-flight 计数，而不是全局计数 —— 别的池还在跑并不妨碍
+     * 这个旧池已经没人了。{@code shutdown()} 只停止接收新任务、不打断在途任务。
+     */
+    private void reapRetiredLocked() {
+        Iterator<Pool> it = retired.iterator();
+        while (it.hasNext()) {
+            Pool pool = it.next();
+            if (pool.inflight.get() <= 0) {
+                pool.executor.shutdown();
+                it.remove();
+                log.info("[入库worker] 旧池已排空并关闭 kind={} limit={}", pool.kind.id(), pool.limit);
+            }
+        }
+    }
+
+    /** 关闭已排空旧池（无锁入口 · 归还会员时调用）。 */
+    private void reapRetired() {
+        synchronized (this) {
+            reapRetiredLocked();
+        }
     }
 
     /**
@@ -153,6 +292,8 @@ public final class KbIngestPools {
             }
             if (pool.inflight.compareAndSet(current, current + 1)) {
                 pool.maxObserved.accumulateAndGet(current + 1, Math::max);
+                // 记下名额归属：热调换池后，归还必须落到这个（可能已退休的）池实例上
+                reservationPool.set(pool);
                 return true;
             }
         }
@@ -167,21 +308,44 @@ public final class KbIngestPools {
      * @param kind 池
      */
     public void release(Kind kind) {
-        Pool pool = pool(kind);
+        // ⭐ 优先还给「占位时的那个池」：热调换池后 pools.get(kind) 已是新池，
+        //    按新池归还会把旧池的在途永久留存（永不排空）+ 新池计数减成负数。
+        Pool reserved = reservationPool.get();
+        Pool pool;
+        if (reserved != null && reserved.kind == kind) {
+            reservationPool.remove();
+            pool = reserved;
+        } else {
+            pool = pool(kind);
+        }
         int left = pool.inflight.decrementAndGet();
         if (left < 0) {
             // 多还了：把计数夹回 0 并留痕（异常路径要能查出来，⛔ 不静默）
             pool.inflight.compareAndSet(left, 0);
             log.warn("[入库worker] 名额归还次数超过占位次数 pool={} 计数已夹回 0", kind.id());
         }
+        // 旧池可能刚排空 ⇒ 顺手关闭（在途归零 → shutdown，不打断任何任务）
+        reapRetired();
         synchronized (idleMonitor) {
             idleMonitor.notifyAll();
         }
     }
 
-    /** 当前在途数。 */
+    /**
+     * 当前在途数（含该池热调前旧池里还没跑完的任务）。
+     *
+     * <p>⚠️ 不含 retired 的话，日志会显示「在途 0」但实际还有任务在跑（热调窗口内）。
+     */
     public int inflight(Kind kind) {
-        return pool(kind).inflight.get();
+        int total = pool(kind).inflight.get();
+        synchronized (this) {
+            for (Pool pool : retired) {
+                if (pool.kind == kind) {
+                    total += pool.inflight.get();
+                }
+            }
+        }
+        return total;
     }
 
     /** 池容量。 */
@@ -194,24 +358,40 @@ public final class KbIngestPools {
         return pool(kind).maxObserved.get();
     }
 
-    /** 三池在途总和。 */
+    /**
+     * 六池在途总和（<b>含热调后 retired 旧池的在途</b>）。
+     *
+     * <p>⚠️ 漏掉 retired 会让 {@link #awaitIdle(long)} 在旧池任务还没跑完时就返回 true ——
+     * 测试里表现为「drain 完成但任务还在写库」，生产里表现为停机过早。
+     */
     public int totalInflight() {
         int total = 0;
-        for (Pool pool : pools.values()) {
-            total += pool.inflight.get();
+        synchronized (this) {
+            for (Pool pool : pools.values()) {
+                total += pool.inflight.get();
+            }
+            for (Pool pool : retired) {
+                total += pool.inflight.get();
+            }
         }
         return total;
     }
 
-    /** 各池 {@code inflight/limit} 快照（日志用）。 */
+    /** 各池 {@code inflight/limit} 快照（日志用；热调后未排空的旧池带 {@code @retired} 后缀）。 */
     public String describe() {
         StringBuilder sb = new StringBuilder();
-        for (Pool pool : pools.values()) {
-            if (sb.length() > 0) {
-                sb.append(',');
+        synchronized (this) {
+            for (Pool pool : pools.values()) {
+                if (sb.length() > 0) {
+                    sb.append(',');
+                }
+                sb.append(pool.kind.id()).append('=')
+                    .append(pool.inflight.get()).append('/').append(pool.limit);
             }
-            sb.append(pool.kind.id()).append('=')
-                .append(pool.inflight.get()).append('/').append(pool.limit);
+            for (Pool pool : retired) {
+                sb.append(',').append(pool.kind.id()).append("@retired=")
+                    .append(pool.inflight.get()).append('/').append(pool.limit);
+            }
         }
         return sb.toString();
     }
@@ -238,7 +418,24 @@ public final class KbIngestPools {
      * @throws java.util.concurrent.RejectedExecutionException 池已停机
      */
     public void submit(Kind kind, Runnable task) {
-        pool(kind).executor.execute(task);
+        // ⭐ 提交也按「占位时的池」走：调度线程可能刚在旧池上占好名额、还没提交就撞上热调换池。
+        //    若这里改用当前池，名额会留在旧池（旧池永不排空）而新池被多减一次。
+        //    旧池此时 inflight >= 1（本次占位）⇒ 一定还没被 reap 关闭，提交安全。
+        Pool reserved = reservationPool.get();
+        final Pool target = reserved != null && reserved.kind == kind ? reserved : pool(kind);
+        target.executor.execute(() -> {
+            Pool previous = reservationPool.get();
+            reservationPool.set(target);
+            try {
+                task.run();
+            } finally {
+                if (previous == null) {
+                    reservationPool.remove();
+                } else {
+                    reservationPool.set(previous);
+                }
+            }
+        });
     }
 
     /** 是否已停机。 */
@@ -281,12 +478,18 @@ public final class KbIngestPools {
      */
     public boolean shutdownAndAwait(long timeoutMs) {
         shutdown = true;
-        for (Pool pool : pools.values()) {
+        // 快照当前池 + 所有旧池：旧池里可能还有在途任务（刚热调过），停机必须一并等
+        List<Pool> all;
+        synchronized (this) {
+            all = new ArrayList<>(pools.values());
+            all.addAll(retired);
+        }
+        for (Pool pool : all) {
             pool.executor.shutdown();
         }
         long deadline = System.currentTimeMillis() + Math.max(0L, timeoutMs);
         boolean terminated = true;
-        for (Pool pool : pools.values()) {
+        for (Pool pool : all) {
             long remain = deadline - System.currentTimeMillis();
             try {
                 if (remain <= 0 || !pool.executor.awaitTermination(remain, TimeUnit.MILLISECONDS)) {
@@ -299,7 +502,7 @@ public final class KbIngestPools {
         }
         if (!terminated) {
             // 超时：中断剩余任务（它们的 finally 仍会归名额），⛔ 不把停机拖成无限等
-            for (Pool pool : pools.values()) {
+            for (Pool pool : all) {
                 if (!pool.executor.isTerminated()) {
                     pool.executor.shutdownNow();
                 }

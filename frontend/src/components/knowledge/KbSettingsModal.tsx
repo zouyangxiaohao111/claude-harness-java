@@ -2,6 +2,11 @@ import { Fragment, useCallback, useEffect, useMemo, useState } from 'react'
 import { api, ApiError } from '@/api/rest'
 import { knowledgeApi } from '@/api/knowledge'
 import type { KnowledgeBase, ParserEngineInfo } from '@/api/knowledge'
+import {
+  getIngestConcurrency,
+  putIngestConcurrency,
+} from '@/api/settings'
+import type { IngestConcurrencyConfig } from '@/api/settings'
 import type { Model } from '@/api/types'
 import {
   engineOptionsForGroup,
@@ -202,7 +207,7 @@ export function KbSettingsModal({ base, showToast, onClose, onSaved }: Props) {
   const visibleSections = SECTIONS.filter((s) => {
     if (s.faqOnly) return isFaq
     // 文档专属：FAQ 库不显示（源站 else 分支里的那 6 项）
-    const DOC_ONLY = new Set(['parser', 'chunking', 'multimodal', 'asr', 'graph', 'advanced', 'storage', 'datasource'])
+    const DOC_ONLY = new Set(['parser', 'chunking', 'multimodal', 'asr', 'graph', 'advanced', 'concurrency', 'storage', 'datasource'])
     return !isFaq || !DOC_ONLY.has(s.key)
   })
   const [busy, setBusy] = useState(false)
@@ -2318,6 +2323,222 @@ export function Row({ label, desc, children, stacked, hint }: {
         {hint && <p className="locked-hint">{hint}</p>}
       </div>
     </div>
+  )
+}
+
+/**
+ * 入库并发的七个数值字段（六个池 + 每轮认领上限）。
+ *
+ * <p>范围逐字对齐后端契约：每池 1~64，`maxTasksPerTick` 1~50。
+ * ⛔ 不要把 min/max 放宽 —— 后端会拒（400），前端先拦住才能给出可读提示。
+ */
+type IngestConcurrencyFieldKey = keyof Omit<IngestConcurrencyConfig, 'source'>
+
+const INGEST_CONCURRENCY_FIELDS: ReadonlyArray<{
+  key: IngestConcurrencyFieldKey
+  label: string
+  desc: string
+  min: number
+  max: number
+}> = [
+  { key: 'parse', label: '解析并发', desc: '解析主流程（PDF / Office 等拆块）同时执行的任务数；1~64', min: 1, max: 64 },
+  { key: 'postprocess', label: '后处理并发', desc: '摘要、AI 问题生成等让文档可用的后处理任务数；1~64', min: 1, max: 64 },
+  { key: 'enrichment', label: '富化并发', desc: '知识图谱抽取、图片理解等增强任务数；1~64', min: 1, max: 64 },
+  { key: 'wiki', label: 'Wiki 生成并发', desc: 'Wiki 页面生成（长任务，独立并发池）；1~64', min: 1, max: 64 },
+  { key: 'maintenance', label: '维护并发', desc: '维护类后台任务的并发上限（当前版本暂无此类任务）；1~64', min: 1, max: 64 },
+  { key: 'shared', label: '弹性并发', desc: '弹性池容量（当前版本不实现跨池借用，保留以对齐配置口径）；1~64', min: 1, max: 64 },
+  { key: 'maxTasksPerTick', label: '每轮最多认领', desc: '调度线程每轮最多从队列认领的任务条数；1~50', min: 1, max: 50 },
+]
+
+/** 「恢复默认」填入的值，与后端 `KbIngestPoolProperties.DEFAULT_*` 逐字一致。 */
+const INGEST_CONCURRENCY_DEFAULTS: Record<IngestConcurrencyFieldKey, number> = {
+  parse: 8,
+  postprocess: 2,
+  enrichment: 12,
+  wiki: 8,
+  maintenance: 4,
+  shared: 6,
+  maxTasksPerTick: 5,
+}
+
+/** 数值 → 输入框草稿（用字符串是为了允许用户先删空再重输，保存时统一校验）。 */
+function ingestConcurrencyDrafts(
+  v: Record<IngestConcurrencyFieldKey, number>,
+): Record<IngestConcurrencyFieldKey, string> {
+  const out = {} as Record<IngestConcurrencyFieldKey, string>
+  for (const f of INGEST_CONCURRENCY_FIELDS) out[f.key] = String(v[f.key])
+  return out
+}
+
+/** 入库并发 API 的错误 → 可读中文（`ApiError` 优先取后端 detail / 字段错误）。 */
+function ingestConcurrencyError(e: unknown): string {
+  if (e instanceof ApiError) return e.userMessage()
+  return e instanceof Error ? e.message : String(e)
+}
+
+/**
+ * 「入库并发」分节的表单主体（六池 + 每轮认领 + 保存/恢复默认）。
+ *
+ * <p><b>为什么是独立组件</b>：这七个输入有一份自己的草稿/加载/错误状态，
+ * 塞进主组件会让一个已经 2000+ 行的弹窗再多 5 个 useState。
+ *
+ * <p><b>失败语义</b>：GET 失败（含后端尚未就绪的 404）只渲染「读取失败：…」并保留
+ * 表单（默认值），⛔ 不抛异常、不白屏；PUT 失败同样落成可见文案 + toast。
+ */
+export function IngestConcurrencySection({ showToast }: {
+  showToast: (msg: string, type?: 'success' | 'info') => void
+}) {
+  const [phase, setPhase] = useState<'loading' | 'ready' | 'error'>('loading')
+  const [source, setSource] = useState<'db' | 'yml' | null>(null)
+  const [draft, setDraft] = useState<Record<IngestConcurrencyFieldKey, string>>(
+    () => ingestConcurrencyDrafts(INGEST_CONCURRENCY_DEFAULTS),
+  )
+  const [saving, setSaving] = useState(false)
+  const [message, setMessage] = useState('')
+  const [failed, setFailed] = useState(false)
+
+  useEffect(() => {
+    let alive = true
+    setPhase('loading')
+    getIngestConcurrency()
+      .then((v) => {
+        if (!alive) return
+        setDraft(ingestConcurrencyDrafts(v))
+        setSource(v.source)
+        setPhase('ready')
+      })
+      .catch((e) => {
+        if (!alive) return
+        // ⚠️ 后端未就绪（404）也走这里：只显示可读失败提示，表单仍可用。
+        setMessage(`读取失败：${ingestConcurrencyError(e)}`)
+        setFailed(true)
+        setPhase('error')
+      })
+    return () => { alive = false }
+  }, [])
+
+  const setField = (key: IngestConcurrencyFieldKey, value: string) =>
+    setDraft((d) => ({ ...d, [key]: value }))
+
+  /** 恢复默认：只填草稿，⛔ 不自动提交（用户还要能改完再点保存）。 */
+  const restoreDefaults = () => {
+    setDraft(ingestConcurrencyDrafts(INGEST_CONCURRENCY_DEFAULTS))
+    setFailed(false)
+    setMessage('已填入默认值，点击「保存」后生效')
+  }
+
+  const save = async () => {
+    const values = {} as Record<IngestConcurrencyFieldKey, number>
+    for (const f of INGEST_CONCURRENCY_FIELDS) {
+      const raw = draft[f.key].trim()
+      if (raw === '') {
+        setFailed(true)
+        setMessage(`「${f.label}」不能为空`)
+        showToast(`「${f.label}」不能为空`, 'info')
+        return
+      }
+      const n = Number(raw)
+      if (!Number.isInteger(n) || n < f.min || n > f.max) {
+        const text = `「${f.label}」必须是 ${f.min}~${f.max} 的整数`
+        setFailed(true)
+        setMessage(text)
+        showToast(text, 'info')
+        return
+      }
+      values[f.key] = n
+    }
+    setSaving(true)
+    setFailed(false)
+    setMessage('')
+    try {
+      // 用**返回的生效值**回填（后端落库后热调池，返回的就是此刻真正生效的配置）
+      const applied = await putIngestConcurrency(values)
+      setDraft(ingestConcurrencyDrafts(applied))
+      setSource(applied.source)
+      setPhase('ready')
+      setMessage('已保存，新的并发数已生效')
+      showToast('并发设置已保存', 'success')
+    } catch (e) {
+      const text = `保存失败：${ingestConcurrencyError(e)}`
+      setFailed(true)
+      setMessage(text)
+      showToast(text, 'info')
+    } finally {
+      setSaving(false)
+    }
+  }
+
+  const sourceText = phase === 'error'
+    ? '未知（读取失败）'
+    : source === 'db'
+      ? '已自定义'
+      : source === 'yml'
+        ? '当前为配置文件默认值'
+        : phase === 'ready'
+          ? '未知'
+          : '正在读取…'
+
+  return (
+    <>
+      <Row
+        label="配置来源"
+        desc="已自定义 = 配置已保存到数据库；当前为配置文件默认值 = 尚未自定义，按 application.yml 生效"
+      >
+        <span className="value-display">{sourceText}</span>
+      </Row>
+
+      {INGEST_CONCURRENCY_FIELDS.map((f) => (
+        <Row key={f.key} label={f.label} desc={f.desc}>
+          <input
+            type="number"
+            className="t-input__inner"
+            style={{ width: 120, height: 32 }}
+            min={f.min}
+            max={f.max}
+            step={1}
+            aria-label={f.label}
+            value={draft[f.key]}
+            onChange={(e) => setField(f.key, e.target.value)}
+          />
+        </Row>
+      ))}
+
+      <p className="form-tip">并发调整会立即生效；正在执行的任务不会中断，新任务按新并发调度。</p>
+      {message && (
+        <p
+          className="form-tip"
+          role={failed ? 'alert' : undefined}
+          style={{ color: failed ? 'var(--td-error-color, #d54941)' : 'var(--td-success-color, #008858)' }}
+        >
+          {message}
+        </p>
+      )}
+
+      <div className="setting-row">
+        <div className="setting-info">
+          <label>应用并发</label>
+          <p className="desc">保存后按新的并发数调度新任务；恢复默认只填值，不会自动提交。</p>
+        </div>
+        <div className="setting-control" style={{ display: 'flex', gap: 8 }}>
+          <button
+            type="button"
+            className="t-button t-button--variant-outline t-button--theme-default"
+            disabled={saving}
+            onClick={restoreDefaults}
+          >
+            <span className="t-button__text">恢复默认</span>
+          </button>
+          <button
+            type="button"
+            className="t-button t-button--variant-base t-button--theme-primary"
+            disabled={saving || phase === 'loading'}
+            onClick={() => void save()}
+          >
+            <span className="t-button__text">{saving ? '保存中…' : '保存'}</span>
+          </button>
+        </div>
+      </div>
+    </>
   )
 }
 

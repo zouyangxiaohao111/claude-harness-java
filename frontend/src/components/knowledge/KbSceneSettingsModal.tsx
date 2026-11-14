@@ -6,6 +6,7 @@ import { KbSettingsAccount } from './KbSettingsAccount'
 import { KbSettingsWorkspace } from './KbSettingsWorkspace'
 import { KbSettingsDataExt } from './KbSettingsDataExt'
 import { KbSettingsPlaceholder } from './KbSettingsPlaceholders'
+import { IngestConcurrencySection } from './KbSettingsModal'
 
 /**
  * 知识库场景 · 「全部设置」弹窗外壳（左 6 组导航 + 右面板）。
@@ -60,6 +61,23 @@ function renderPanel(navKey: string): JSX.Element {
       return <KbSettingsWorkspace navKey={navKey} />
     case 'data_extensions':
       return <KbSettingsDataExt navKey={navKey} />
+    case 'system_administration':
+      // ⭐「任务队列」= 入库流水线六池并发的配置入口（用户 2026-11-14 指定放这里）。
+      //   其余系统管理项后端没有能力 ⇒ 仍走下面的占位面板。
+      if (navKey === 'runtime-queues') {
+        return (
+          <div className="section">
+            <div className="section-header" style={{ margin: '0 0 16px' }}>
+              <h2>任务队列</h2>
+              <p className="section-description">
+                知识库文档入库流水线各阶段的工作线程数。该配置是全局的，对所有知识库生效。
+              </p>
+            </div>
+            <IngestConcurrencySection showToast={() => {}} />
+          </div>
+        )
+      }
+      return <KbSettingsPlaceholder groupKey={group.key} navKey={navKey} />
     // 发布集成 / 系统管理 / 平台：后端没有对应能力 ⇒ 统一「暂未开发」占位面板
     // （组 key 原样传下去，占位面板自己按两级 key 找标题）
     default:

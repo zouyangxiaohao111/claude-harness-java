@@ -219,6 +219,19 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
     }
 
     /**
+     * [/goal 设置门] hooks 是否被策略限制 · 对齐 CC v2.1.325 的 {@code hooks_gate}。
+     *
+     * <p>CC 在 {@code uGt()} 设目标前判 {@code p()} = {@code Nh() || DGt() || f4s()}
+     * （disableAllHooks / allowManagedHooksOnly / 等价策略）——被限制时 goal 的 Stop hook
+     * 根本不会执行，设了也是死目标，所以直接拒绝并给明确文案。
+     *
+     * @return true = 全部 hooks 被禁用，或仅允许 managed hooks
+     */
+    public boolean isHooksRestricted() {
+        return shouldDisableAllHooksIncludingManaged() || shouldAllowManagedHooksOnly();
+    }
+
+    /**
      * [IMPL-01 D1-2/OD-10] 政策闸门: 是否仅允许 managed hooks · 对齐 CC
      * shouldAllowManagedHooksOnly (hooksConfigSnapshot.ts:62-76).
      *

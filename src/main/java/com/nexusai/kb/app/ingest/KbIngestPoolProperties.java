@@ -51,6 +51,23 @@ public class KbIngestPoolProperties {
     /** enrichment 池默认并发（与源站 Enrichment=12 逐字一致 · 用户裁定 2026-11-12 不取保守值）。 */
     public static final int DEFAULT_ENRICHMENT_CONCURRENCY = 12;
 
+    /** Wiki 池默认并发（与源站 {@code DefaultWikiWorkerConcurrency=8} 一致）。 */
+    public static final int DEFAULT_WIKI_CONCURRENCY = 8;
+
+    /** 维护池默认并发（与源站 {@code DefaultMaintenanceWorkerConcurrency=4} 一致）。 */
+    public static final int DEFAULT_MAINTENANCE_CONCURRENCY = 4;
+
+    /** 弹性池默认并发（与源站 {@code DefaultSharedWorkerConcurrency=6} 一致）。 */
+    public static final int DEFAULT_SHARED_CONCURRENCY = 6;
+
+    /**
+     * 上游池并发合计（源站 {@code DefaultUpstreamWorkerConcurrency} = core+postprocess+
+     * enrichment+maintenance+shared = 32，**不含 wiki**）。仅用于日志/诊断对读。
+     */
+    public static final int DEFAULT_UPSTREAM_CONCURRENCY =
+        DEFAULT_PARSE_CONCURRENCY + DEFAULT_POSTPROCESS_CONCURRENCY + DEFAULT_ENRICHMENT_CONCURRENCY
+            + DEFAULT_MAINTENANCE_CONCURRENCY + DEFAULT_SHARED_CONCURRENCY;
+
     /** 轮询间隔默认值（毫秒）· 与改造前 {@code POLL_INTERVAL_MS} 逐字相同。 */
     public static final long DEFAULT_POLL_INTERVAL_MS = 1500L;
 
@@ -65,6 +82,15 @@ public class KbIngestPoolProperties {
 
     /** enrichment 池并发度（默认 12，与源站一致）。 */
     private int enrichmentConcurrency = DEFAULT_ENRICHMENT_CONCURRENCY;
+
+    /** wiki 池并发度（默认 8，与源站独立池一致）。 */
+    private int wikiConcurrency = DEFAULT_WIKI_CONCURRENCY;
+
+    /** 维护池并发度（默认 4，与源站一致）。 */
+    private int maintenanceConcurrency = DEFAULT_MAINTENANCE_CONCURRENCY;
+
+    /** 弹性池并发度（默认 6，与源站一致；本仓不实现借用）。 */
+    private int sharedConcurrency = DEFAULT_SHARED_CONCURRENCY;
 
     /**
      * 轮询间隔（毫秒，默认 1500）。
@@ -101,6 +127,30 @@ public class KbIngestPoolProperties {
 
     public void setEnrichmentConcurrency(int enrichmentConcurrency) {
         this.enrichmentConcurrency = enrichmentConcurrency;
+    }
+
+    public int getWikiConcurrency() {
+        return wikiConcurrency;
+    }
+
+    public void setWikiConcurrency(int wikiConcurrency) {
+        this.wikiConcurrency = wikiConcurrency;
+    }
+
+    public int getMaintenanceConcurrency() {
+        return maintenanceConcurrency;
+    }
+
+    public void setMaintenanceConcurrency(int maintenanceConcurrency) {
+        this.maintenanceConcurrency = maintenanceConcurrency;
+    }
+
+    public int getSharedConcurrency() {
+        return sharedConcurrency;
+    }
+
+    public void setSharedConcurrency(int sharedConcurrency) {
+        this.sharedConcurrency = sharedConcurrency;
     }
 
     public long getPollIntervalMs() {

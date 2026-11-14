@@ -618,6 +618,53 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [V293 ingest-concurrency] 读入库六池并发配置的原始 JSON 文本。
+     *
+     * <p>返回 {@code null} = 未配置（列 NULL/空 / 行缺失 / 读库异常）→ 调用方回落 yml。
+     * <b>不解析、不做默认值填充</b>：解析与 merge 都在
+     * {@code com.nexusai.kb.app.ingest.IngestConcurrencyConfig} 里，避免出现两套字段口径。
+     *
+     * <p>不缓存：{@code PUT /api/v1/settings/ingest-concurrency} 后下一次 GET/热调即读到新值。
+     */
+    public String readIngestConcurrencyConfig() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            if (s == null) {
+                return null;
+            }
+            String json = s.getIngestConcurrencyConfig();
+            return json == null || json.isBlank() ? null : json;
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.ingestConcurrencyConfig 失败，回落 yml 默认: {}",
+                    e.toString());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * [V293 ingest-concurrency] 写入入库六池并发配置（完整 JSON 文本）。
+     *
+     * <p>调用方（Controller）负责校验与 merge，这里只做「整份替换」。
+     * 用完整实体 + 默认 {@code update(entity)}：目标值非 null，NOT_NULL 策略不影响；
+     * 其它列保持 DB 原值（不会因 null 被置空）。
+     *
+     * @param json 完整配置 JSON（⛔ 不接受 null —— 清空请走后续独立语义，当前不需要）
+     */
+    public void updateIngestConcurrencyConfig(String json) {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) {
+            throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
+        }
+        s.setIngestConcurrencyConfig(json);
+        settingsMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] 入库并发配置已落库: {}", json);
+        }
+    }
+
     // ══════════════ 知识库域配置：已全部迁出 → KbConfigService ══════════════
     //
     // ⭐ 用户 2026-11-05 最终裁定：「8 个 kb_* 字段全部搬到 kb_config，settings 一个不留」。

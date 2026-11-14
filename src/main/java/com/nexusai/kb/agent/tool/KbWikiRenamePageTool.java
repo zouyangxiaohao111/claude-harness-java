@@ -115,7 +115,7 @@ public class KbWikiRenamePageTool implements Tool {
                 return ToolResult.error(call.id(), "slug 与 new_slug 相同，无需改名");
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_rename_page] 拒绝越权写入 kb={} slug={}", kbId, slug);
                 return ToolResult.error(call.id(), denied + "，不能改名");

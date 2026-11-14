@@ -1816,7 +1816,7 @@ public class ChatService {
                         && "hook_additional_context".equals(m.subtype())) {
                     if (messageService != null) {
                         try {
-                            messageService.appendMessage(m, ts);
+                            messageService.appendMessage(withSessionIfAbsent(m, sessionId), ts);
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: SessionStart hook_additional_context 注入消息落库: session={} id={} len={}",
                                     sessionId, abbreviate(m.id(), 16),
@@ -1848,7 +1848,7 @@ public class ChatService {
                 if (m.isMeta() && "skill_listing".equals(m.subtype())) {
                     if (messageService != null) {
                         try {
-                            messageService.appendMessage(m, ts);
+                            messageService.appendMessage(withSessionIfAbsent(m, sessionId), ts);
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: skill_listing 注入消息落库: session={} id={} len={}",
                                     sessionId, abbreviate(m.id(), 16),
@@ -1908,7 +1908,7 @@ public class ChatService {
                 if (m.isMeta() && "attachment".equals(m.author())) {
                     if (messageService != null) {
                         try {
-                            messageService.appendMessage(m, ts);
+                            messageService.appendMessage(withSessionIfAbsent(m, sessionId), ts);
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: 尾部 attachment 消息落库: session={} id={} subtype={}"
                                         + " len={}（对齐 2.1.278「不排除任何附件类型」）",
@@ -3113,6 +3113,39 @@ public class ChatService {
             return -1L;
         }
         return messageService.nextSeq(sessionId);
+    }
+
+    /**
+     * 落库前补齐 {@code session_id} · 尾部 meta 消息（hook / skill_listing / attachment）专用。
+     *
+     * <p><b>WHY</b>（2026-11-14 线上）：{@code PostCompactAttachmentRestorer.buildAttachmentMessage}
+     * 造 DTO 时第 2 参 sessionId 传的是 {@code null}（producer 不持有会话上下文），而
+     * {@code MessageService.appendMessage} 直接 {@code rec.setSessionId(dto.sessionId())}；
+     * {@code messages.session_id} 是 <b>TEXT NOT NULL</b> + 外键 ⇒ 插入必败。
+     * 症状：{@code deferred_tools_delta} 等附件「best-effort 落库失败」被 warn 吞掉，
+     * 当前轮不受影响，但跨 run 从 DB 重建历史时这条 meta 消息消失（工具延迟增量上下文丢失）。
+     *
+     * <p>在<b>落库出口</b>补齐而不是改 producer：这些 producer 是共享的（压缩恢复 / hook /
+     * skill 清单都走同一构造），出口补一次即可覆盖所有未来附件，不必逐个传 sessionId。
+     *
+     * <p>⚠️ 与 {@code MessageService.withSession(dto, sessionId)}（compact 路径专用）语义不同：
+     * 那个是<b>无条件覆盖</b>（来源 DTO 的 sessionId 恒为 null，覆盖无风险）；本方法<b>只填空白、
+     * 不覆盖已有值</b> —— 尾部流里可能出现显式带其他会话的消息（teammate/remote 回写），
+     * 覆盖会把它们写到当前会话去。
+     *
+     * @param m         待落库消息（可 null）
+     * @param sessionId 当前会话 ID
+     * @return sessionId 为空时补上；已有值则原样返回（不覆盖）
+     */
+    static ChatMessageDto withSessionIfAbsent(ChatMessageDto m, String sessionId) {
+        if (m == null || sessionId == null) {
+            return m;
+        }
+        String current = m.sessionId();
+        if (current != null && !current.isBlank()) {
+            return m;
+        }
+        return m.withSessionId(sessionId);
     }
 
     private static String abbreviate(String s, int max) {

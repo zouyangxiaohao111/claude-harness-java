@@ -44,6 +44,13 @@ class GoalCommandAutoExecuteTest {
         return cfg.handleGoalForTest(args, sessionId, goalService, null);
     }
 
+    private UserInputDispatcher.LocalCommandResult callGoal(
+            String args, String sessionId,
+            com.nexusai.application.agent.permission.hook.HookRegistry hookRegistry) {
+        GoalCommandRegistrationConfig cfg = new GoalCommandRegistrationConfig();
+        return cfg.handleGoalForTest(args, sessionId, goalService, null, hookRegistry);
+    }
+
     @Test
     @DisplayName("设定目标 ⇒ kind=query（触发执行），带 kickoff 提示词")
     void setGoal_returnsQuery_withKickoff() {
@@ -106,7 +113,7 @@ class GoalCommandAutoExecuteTest {
         UserInputDispatcher.LocalCommandResult r = callGoal("clear", "sess-1");
 
         assertThat(r.kind()).isEqualTo("text");
-        assertThat(r.value()).isEqualTo("Goal cleared");
+        assertThat(r.value()).isEqualTo("Goal cleared: 旧目标");
         assertThat(r.prompt()).isNull();
     }
 
@@ -116,12 +123,29 @@ class GoalCommandAutoExecuteTest {
         goalService = mock(GoalService.class);
         when(goalService.getGoal(anyString())).thenReturn(null);
         when(goalService.setGoal(anyString(), anyString(), anyLong()))
-                .thenThrow(new IllegalArgumentException("目标条件长度超过上限 4000 字符（实际 4001）"));
+                .thenThrow(new IllegalArgumentException("Goal condition is limited to 4000 characters"));
 
         UserInputDispatcher.LocalCommandResult r = callGoal("x".repeat(4001), "sess-1");
 
         assertThat(r.kind()).isEqualTo("text");
         assertThat(r.value()).contains("4000");
         assertThat(r.prompt()).isNull();
+    }
+
+    @Test
+    @DisplayName("hooks 被策略禁用 ⇒ 拒绝设定（对齐 CC hooks_gate）")
+    void hooksRestricted_rejectsSetGoal() {
+        goalService = mock(GoalService.class);
+        when(goalService.getGoal(anyString())).thenReturn(null);
+        com.nexusai.application.agent.permission.hook.HookRegistry registry =
+            mock(com.nexusai.application.agent.permission.hook.HookRegistry.class);
+        when(registry.isHooksRestricted()).thenReturn(true);
+
+        UserInputDispatcher.LocalCommandResult r = callGoal("cond", "sess-1", registry);
+
+        assertThat(r.kind()).isEqualTo("text");
+        assertThat(r.value()).contains("hooks are restricted");
+        org.mockito.Mockito.verify(goalService, org.mockito.Mockito.never())
+            .setGoal(anyString(), anyString(), anyLong());
     }
 }

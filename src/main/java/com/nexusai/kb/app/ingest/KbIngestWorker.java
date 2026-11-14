@@ -13,6 +13,8 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.DisposableBean;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.boot.context.event.ApplicationReadyEvent;
+import org.springframework.context.event.EventListener;
 import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.stereotype.Component;
 
@@ -118,11 +120,36 @@ public class KbIngestWorker implements DisposableBean {
     @Autowired(required = false)
     private com.nexusai.kb.app.image.KbImageVectorService imageVectorService;
 
+    /**
+     * settings.ingest_concurrency_config 读源（启动时应用 DB 配置）。
+     *
+     * <p>{@code required = false}：单测直构 worker（兼容构造器）不启 Spring ⇒ 不读库，
+     * 行为与加这条链之前逐步一致。
+     */
+    @Autowired(required = false)
+    private com.nexusai.domain.settings.SettingsService settingsService;
+
     /** 三池（有界并发 + 背压 + 停机收尾）。 */
     private final KbIngestPools pools;
 
-    /** 单轮最多认领多少条（配置值，&gt;= 1）。 */
-    private final int maxTasksPerTick;
+    /**
+     * yml 侧的并发配置（与 pools 同源装配）。
+     *
+     * <p>热调 / 启动应用 DB 配置时先覆盖这里的六个值，再 {@link KbIngestPools#resize} ——
+     * 「先覆盖 properties，再调池」，避免出现「池变了、配置对象还是旧的」两份口径。
+     * 兼容构造器（POJO 单测）为 null。
+     */
+    private final KbIngestPoolProperties properties;
+
+    /**
+     * 单轮最多认领多少条（配置值，&gt;= 1 · 可热调）。
+     *
+     * <p>用 {@code final AtomicInteger} 而不是 {@code volatile int}：① 热调要能改它；
+     * ② 本仓单例会话态审计闸门（{@code BeanSingletonSessionStateAuditTest}）把单例 bean 上
+     * 「非 static 非 final」字段视为候选可变状态 —— {@code final} 容器不在扫描面内，
+     * 这一项配置不需要走该闸门的登记流程。
+     */
+    private final AtomicInteger maxTasksPerTick;
 
     /** 停机标志：置位后不再认领（在途任务照常跑完）。 */
     private volatile boolean shuttingDown;
@@ -162,8 +189,12 @@ public class KbIngestWorker implements DisposableBean {
             new KbIngestPools(
                 properties.getParseConcurrency(),
                 properties.getPostprocessConcurrency(),
-                properties.getEnrichmentConcurrency()),
-            properties.getMaxTasksPerTick());
+                properties.getEnrichmentConcurrency(),
+                properties.getWikiConcurrency(),
+                properties.getMaintenanceConcurrency(),
+                properties.getSharedConcurrency()),
+            properties.getMaxTasksPerTick(),
+            properties);
     }
 
     /**
@@ -192,8 +223,12 @@ public class KbIngestWorker implements DisposableBean {
             new KbIngestPools(
                 KbIngestPoolProperties.DEFAULT_PARSE_CONCURRENCY,
                 KbIngestPoolProperties.DEFAULT_POSTPROCESS_CONCURRENCY,
-                KbIngestPoolProperties.DEFAULT_ENRICHMENT_CONCURRENCY),
-            KbIngestPoolProperties.DEFAULT_MAX_TASKS_PER_TICK);
+                KbIngestPoolProperties.DEFAULT_ENRICHMENT_CONCURRENCY,
+                KbIngestPoolProperties.DEFAULT_WIKI_CONCURRENCY,
+                KbIngestPoolProperties.DEFAULT_MAINTENANCE_CONCURRENCY,
+                KbIngestPoolProperties.DEFAULT_SHARED_CONCURRENCY),
+            KbIngestPoolProperties.DEFAULT_MAX_TASKS_PER_TICK,
+            null);
     }
 
     /** 全参构造（唯一真正赋值的构造器）。 */
@@ -211,7 +246,8 @@ public class KbIngestWorker implements DisposableBean {
         com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper knowledgeBaseMapper,
         KbKnowledgeStateRepository stateRepository,
         KbIngestPools pools,
-        int maxTasksPerTick
+        int maxTasksPerTick,
+        KbIngestPoolProperties properties
     ) {
         this.queue = queue;
         this.parseProcessor = parseProcessor;
@@ -226,14 +262,98 @@ public class KbIngestWorker implements DisposableBean {
         this.knowledgeBaseMapper = knowledgeBaseMapper;
         this.stateRepository = stateRepository;
         this.pools = pools;
-        this.maxTasksPerTick = Math.max(1, maxTasksPerTick);
-        log.info("[入库worker] 并发池已装配 parse={} postprocess={} enrichment={} 每轮最多认领={}"
-                + "（与源站 8/2/12 逐字一致；SQLite 锁冲突由 BUSY 回队 + SqliteBusyRetry 兜底，"
-                + "不靠降并发，可在 nexusai.knowledge.ingest.* 覆盖）",
+        this.properties = properties;
+        this.maxTasksPerTick = new AtomicInteger(Math.max(1, maxTasksPerTick));
+        log.info("[入库worker] 并发池已装配 parse={} postprocess={} enrichment={} wiki={} "
+                + "maintenance={} shared={} 上游合计={} 每轮最多认领={}"
+                + "（与源站 core8/post2/enrich12/wiki8/maint4/shared6 一致；SQLite 锁冲突由 BUSY 回队"
+                + " + SqliteBusyRetry 兜底，不靠降并发，可在 nexusai.knowledge.ingest.* 覆盖）",
             pools.limit(KbIngestPools.Kind.PARSE),
             pools.limit(KbIngestPools.Kind.POSTPROCESS),
             pools.limit(KbIngestPools.Kind.ENRICHMENT),
-            this.maxTasksPerTick);
+            pools.limit(KbIngestPools.Kind.WIKI),
+            pools.limit(KbIngestPools.Kind.MAINTENANCE),
+            pools.limit(KbIngestPools.Kind.SHARED),
+            pools.limit(KbIngestPools.Kind.PARSE) + pools.limit(KbIngestPools.Kind.POSTPROCESS)
+                + pools.limit(KbIngestPools.Kind.ENRICHMENT) + pools.limit(KbIngestPools.Kind.MAINTENANCE)
+                + pools.limit(KbIngestPools.Kind.SHARED),
+            this.maxTasksPerTick.get());
+    }
+
+    /**
+     * 热调六池并发 + 每轮认领上限（{@code /api/v1/settings/ingest-concurrency} PUT 与
+     * 启动应用 DB 配置共用这条入口）。
+     *
+     * <p><b>⭐ 顺序不能反</b>：先覆盖 {@link KbIngestPoolProperties} 的六个值，再
+     * {@link KbIngestPools#resize} —— 否则下一次读配置会拿到旧的 yml 值（两份口径分叉）。
+     *
+     * <p><b>⭐ 池实例是 Worker 持有的那一个</b>：Controller ⛔ 不要自己 {@code new KbIngestPools}
+     * 或 {@code new KbIngestWorker}，否则热调的是一个没人提交任务的池。
+     *
+     * @param parse        parse 池并发（1..64）
+     * @param postprocess  postprocess 池并发（1..64）
+     * @param enrichment   enrichment 池并发（1..64）
+     * @param wiki         wiki 池并发（1..64）
+     * @param maintenance  maintenance 池并发（1..64）
+     * @param shared       shared 池并发（1..64）
+     * @param maxTasksPerTick 单轮最多认领条数（1..50）
+     */
+    public synchronized void applyConcurrency(int parse, int postprocess, int enrichment,
+                                              int wiki, int maintenance, int shared,
+                                              int maxTasksPerTick) {
+        int tick = Math.max(1, maxTasksPerTick);
+        // ① 先覆盖配置对象（yml 侧的权威值 = 当前生效值）
+        if (properties != null) {
+            properties.setParseConcurrency(parse);
+            properties.setPostprocessConcurrency(postprocess);
+            properties.setEnrichmentConcurrency(enrichment);
+            properties.setWikiConcurrency(wiki);
+            properties.setMaintenanceConcurrency(maintenance);
+            properties.setSharedConcurrency(shared);
+            properties.setMaxTasksPerTick(tick);
+        }
+        this.maxTasksPerTick.set(tick);
+        // ② 再调池（旧池在途归零后才关闭）
+        pools.resize(parse, postprocess, enrichment, wiki, maintenance, shared);
+        log.info("[入库worker] 并发配置已热生效 parse={} postprocess={} enrichment={} wiki={} "
+                + "maintenance={} shared={} 每轮最多认领={} 各池={}",
+            parse, postprocess, enrichment, wiki, maintenance, shared, tick, pools.describe());
+    }
+
+    /**
+     * 启动时应用 {@code settings.ingest_concurrency_config}（V293 列）。
+     *
+     * <p><b>为什么用 {@link ApplicationReadyEvent} 而不是 {@code @PostConstruct}</b>：
+     * 这条链要读库，而 Flyway 迁移（含本表新列）在 bean 初始化阶段的先后并不由本类控制 ——
+     * 事件在上下文完全就绪（迁移已提交、库可用）后触发，读到的才是「迁移后的表」。
+     * 池在构造时已按 yml 建好，这里再 resize 一次 ⇒ DB 配置真正生效（不是「配了永远不生效」）。
+     *
+     * <p>DB 未配置 / 行或列读不到 / JSON 非法 ⇒ 保持 yml 默认（⛔ 不让一次读库失败把 worker 打挂）。
+     * POJO 单测不启 Spring ⇒ {@code settingsService} 为 null ⇒ 本方法直接返回（零行为变化）。
+     */
+    @EventListener(ApplicationReadyEvent.class)
+    public synchronized void applyPersistedConcurrency() {
+        if (settingsService == null) {
+            return;
+        }
+        IngestConcurrencyConfig stored;
+        try {
+            stored = IngestConcurrencyConfig.parse(settingsService.readIngestConcurrencyConfig());
+        } catch (RuntimeException e) {
+            log.warn("[入库worker] 读取 settings.ingest_concurrency_config 失败，保持 yml 默认: {}",
+                e.toString());
+            return;
+        }
+        if (stored == null) {
+            log.info("[入库worker] settings 未配置入库并发（ingest_concurrency_config 空），"
+                + "保持 yml 默认 各池={}", pools.describe());
+            return;
+        }
+        IngestConcurrencyConfig effective = stored.resolve(properties);
+        applyConcurrency(effective.parse(), effective.postprocess(), effective.enrichment(),
+            effective.wiki(), effective.maintenance(), effective.shared(),
+            effective.maxTasksPerTick());
+        log.info("[入库worker] 已应用 settings.ingest_concurrency_config");
     }
 
     /**
@@ -250,7 +370,7 @@ public class KbIngestWorker implements DisposableBean {
             return;
         }
         try {
-            submitUpTo(maxTasksPerTick);
+            submitUpTo(maxTasksPerTick.get());
         } catch (RuntimeException e) {
             // 调度线程抛异常会被静默吞掉且后续 tick 可能停止 ⇒ 必须自己兜住并记录
             log.error("[入库worker] 本轮轮询异常: {}", e.getMessage(), e);

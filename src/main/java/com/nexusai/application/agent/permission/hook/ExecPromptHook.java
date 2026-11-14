@@ -275,7 +275,19 @@ public class ExecPromptHook {
         java.util.function.Consumer<AbortController> parentAbortListener = null;
         try {
             // 1. 替换 $ARGUMENTS 占位符 · 对齐 CC execPromptHook.ts:35 addArgumentsToPrompt
-            String processedPrompt = substituteArguments(hook.prompt(), jsonInput);
+            String basePrompt = substituteArguments(hook.prompt(), jsonInput);
+            final String processedPrompt = (hookEvent != null
+                    && (hookEvent.type() == HookEventType.STOP
+                        || hookEvent.type() == HookEventType.SUBAGENT_STOP))
+                ? "Based on the conversation transcript above, has the following "
+                    + "stopping condition been satisfied? Answer based on transcript evidence only."
+                    + "\n\nCondition: " + basePrompt
+                : basePrompt;
+            // [goal-align 2026-11-14] 对齐 CC v2.1.325 stop-condition 的 userPrompt：
+            //   CC 在 transcript 之上明确写出「评估什么、只依据 transcript 证据」，再用
+            //   `Condition: <条件>` 分隔；本仓此前直接把条件原文当 userPrompt ⇒ 长 transcript
+            //   下模型容易不知道自己在评估什么。⛔ 只对 Stop / SubagentStop 生效：其它 hook
+            //   事件在 CC 走另一套评估提示，不能一起改。
             if (log.isDebugEnabled()) {
                 log.debug("ExecPromptHook: 处理后 prompt (hook={}): {}", hookName, processedPrompt);
             }

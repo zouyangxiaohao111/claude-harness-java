@@ -72,7 +72,12 @@ import { openStandalone, previewKindOfAttachment } from '@/utils/standalonePrevi
  */
 function stripRuntimeContextForDisplay(text: string): string {
   const m = text.match(/^<runtime_context scope="this_turn">[\s\S]*?<\/runtime_context>\s*/)
-  return m ? text.slice(m[0].length) : text
+  const withoutRuntime = m ? text.slice(m[0].length) : text
+  // 会话临时附件的正文（`<kb_attachments>…</kb_attachments>`）同样只给模型看：
+  // 后端内联后原样入库 ⇒ 展示前剥掉，否则气泡里会铺满整份文档正文。
+  // 复用主会话同一套标签 `<attachments>`（后端 KB 网关拼进 content 的是它，落库后需剥掉）。
+  // ⚠️ 锚定开头：主会话的 `<attachments>` 只在模型侧投影里，不进 content，故不会误伤。
+  return withoutRuntime.replace(/^<attachments>[\s\S]*?<\/attachments>\s*/, '')
 }
 
 /** 知识库 @引用 chip（数值照源站 chat-resource-chips.less：mentioned_items flex-end / tag 26px 高、3px 8px 内边距） */
@@ -479,6 +484,16 @@ interface MessageListProps {
   tailFooter?: ReactNode
   /** [Phase3] 点击 @引用文件卡片 → 打开文件预览（App 用绑定项目 + path 打开 FileViewModal） */
   onOpenRefFile?: (path: string) => void
+  /**
+   * 点击用户气泡里的**知识库文档 chip**（`userAttachments[].type === 'kb'`）。
+   *
+   * <p>知识库面板传它 ⇒ 在页面右侧抽屉里打开原文（与引用同一套视图）；
+   * 不传（主会话）⇒ 退回独立预览窗口，行为不变。
+   *
+   * @param knowledgeId 文档 id（chip 的 `contentId`）
+   * @param title       显示名（chip 上的 filename）
+   */
+  onOpenKbDoc?: (knowledgeId: string, title?: string | null) => void
   /** 滚动贴底状态回调（「回到底部」按钮由 Composer 工具栏渲染 · 离底时 App 传 showToBottom=true） */
   onNearBottomChange?: (atBottom: boolean) => void
   /** [window-paging] 顶部「加载更早」（hasMore 时显示）：App 取窗口首条 beforeMessageId 拉前页 prependMessages */
@@ -1190,11 +1205,13 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
 /** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
 type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
   onRunHtml?: (code: string) => void
   onOpenRefFile?: (path: string) => void
+  /** 知识库文档 chip 点击：传了就在页面内右侧抽屉打开（见 {@link MessageListProps.onOpenKbDoc}） */
+  onOpenKbDoc?: (knowledgeId: string, title?: string | null) => void
   /** [用户消息编辑重发] 见 MessageListProps */
   onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
   /** [分叉] 从该行所在轮分叉；缺省（子代理 transcript 等非会话宿主）⇒ 不渲染操作条 */
@@ -1899,11 +1916,13 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                       title={a.contentId ? `点击预览：${a.filename}` : (a.filename ?? undefined)}
                       role={a.contentId ? 'button' : undefined}
                       onClick={a.contentId
-                        ? () => openStandalone({
-                            type: previewKindOfAttachment({ filename: a.filename }),
-                            title: a.filename ?? '预览',
-                            kb: { knowledgeId: a.contentId as string },
-                          })
+                        ? () => (onOpenKbDoc
+                            ? onOpenKbDoc(a.contentId as string, a.filename)
+                            : openStandalone({
+                                type: previewKindOfAttachment({ filename: a.filename }),
+                                title: a.filename ?? '预览',
+                                kb: { knowledgeId: a.contentId as string },
+                              }))
                         : undefined}
                     >
                       <span style={{ color: '#1664ff', display: 'inline-flex', flexShrink: 0 }}>
@@ -1931,7 +1950,16 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onEditResend,
                   )
                 })()}
                 {msg.userAttachments?.filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename).map((a, i) => (
-                  <button key={i} className="user-attach-file" title={`点击预览：${a.filename}`} onClick={() => openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a })}>
+                  <button
+                    key={i}
+                    className="user-attach-file"
+                    title={`点击预览：${a.filename}`}
+                    // 知识库 @ 的文件就是走这条（type='file' + contentId=文档 id），不是上面的 type==='kb'。
+                    // 宿主传了 onOpenKbDoc ⇒ 在页面右侧抽屉打开；主会话不传 ⇒ 仍走独立预览窗口。
+                    onClick={() => (onOpenKbDoc && a.contentId
+                      ? onOpenKbDoc(a.contentId, a.filename)
+                      : openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a }))}
+                  >
                     {attachIcon(a)}
                     <span className="uaf-name">{a.filename}</span>
                   </button>
@@ -2383,7 +2411,7 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter }: MessageListProps) {
   // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
   citationChipEnabled = !!onCitationClick
   citationTitlesByMessage = citationTitleMapByMsg ?? {}
@@ -4590,7 +4618,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           return (
             <ErrorBoundary key={row.key} tag="MessageList.row.msg" compact
               title="这条消息显示失败" hint="其余内容不受影响。">
-              <MemoMessage msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile}
+              <MemoMessage msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} onOpenKbDoc={onOpenKbDoc}
                 onEditResend={onEditResend}
                 onForkTurn={onForkTurn}
                 footer={footerByRowKey.get(row.key)}

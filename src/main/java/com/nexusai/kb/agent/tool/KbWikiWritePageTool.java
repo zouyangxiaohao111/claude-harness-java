@@ -123,7 +123,7 @@ public class KbWikiWritePageTool implements Tool {
                     "content 不能为空。整页写入必须提供完整正文，不得使用省略占位符。");
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_write_page] 拒绝越权写入 kb={} slug={}", kbId, slug);
                 return ToolResult.error(call.id(), denied + "，不能写入");

@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.goal;
 
+import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.permission.hook.GenericHook;
 import com.nexusai.application.agent.permission.hook.HookCommand;
 import com.nexusai.application.agent.permission.hook.HookEventType;
@@ -471,5 +472,62 @@ class GoalServiceTest {
 
         goalService.recordAchieved(SID);
         assertThat(goalService.hasActiveGoal(SID)).as("达成后不再是 active").isFalse();
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // 终端 reason 分流（对齐 CC Pc()/ch(reason)）
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("handleTurnTerminal：MODEL_ERROR ⇒ 暂停且不增加轮数")
+    void handleTurnTerminal_modelError_pausesWithoutIncrement() {
+        goalService.setGoal(SID, "条件", 0L);
+        goalService.recordNotMet(SID, "未完成");
+        goalService.recordNotMet(SID, "仍未完成");
+        assertThat(columnStore.get(SID).iterations()).isEqualTo(2);
+
+        goalService.handleTurnTerminal(SID, AgentState.ExitReason.MODEL_ERROR);
+
+        SessionGoal after = columnStore.get(SID);
+        assertThat(after.phase()).isEqualTo(SessionGoal.Phase.PAUSED);
+        assertThat(after.iterations()).as("pause 不算一轮评估（CC pause 不 +1）").isEqualTo(2);
+        assertThat(after.lastReason()).contains("模型调用失败");
+    }
+
+    @Test
+    @DisplayName("handleTurnTerminal：ABORTED / MAX_TURNS ⇒ 不动目标（none）")
+    void handleTurnTerminal_abortedKeepsGoalUntouched() {
+        goalService.setGoal(SID, "条件", 0L);
+        clearInvocations(sessionService);
+
+        goalService.handleTurnTerminal(SID, AgentState.ExitReason.ABORTED);
+        goalService.handleTurnTerminal(SID, AgentState.ExitReason.MAX_TURNS);
+
+        verify(sessionService, org.mockito.Mockito.never()).setGoal(anyString(), any());
+        assertThat(columnStore.get(SID).phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+    }
+
+    @Test
+    @DisplayName("handleTurnTerminal：BLOCKING_LIMIT ⇒ 清目标")
+    void handleTurnTerminal_contextLimit_clearsGoal() {
+        goalService.setGoal(SID, "条件", 0L);
+
+        goalService.handleTurnTerminal(SID, AgentState.ExitReason.BLOCKING_LIMIT);
+
+        assertThat(columnStore.get(SID)).isNull();
+        assertThat(goalService.isArmed(SID)).isFalse();
+    }
+
+    @Test
+    @DisplayName("handleTurnTerminal：STREAM_ERROR ⇒ 排自动重试（不暂停）")
+    void handleTurnTerminal_streamError_schedulesRetry() {
+        goalService.setGoal(SID, "条件", 0L);
+
+        goalService.handleTurnTerminal(SID, AgentState.ExitReason.STREAM_ERROR);
+
+        SessionGoal after = columnStore.get(SID);
+        assertThat(after.phase()).isEqualTo(SessionGoal.Phase.ACTIVE);
+        assertThat(after.retryAt()).isNotNull();
+        assertThat(after.retryCount()).isEqualTo(1);
     }
 }

@@ -71,6 +71,20 @@ class KbWikiToolScopeThreeStateTest {
             null, null, null, null, null, null, false, null, null, null, null, null, null);
     }
 
+    /**
+     * 句柄解析替身：原样返回入参。
+     *
+     * <p>⚠️ 这两个用例传了 {@code knowledge_base_ids}，工具会先过
+     * {@link KbHandleResolver#resolveKnowledgeBase(String)}；不注入的话是 NPE
+     * （存量测试腐烂，与本次改动无关 —— HEAD 版本的 KbWikiSearchTool 已依赖该字段）。
+     */
+    private static KbHandleResolver fakeResolver() {
+        KbHandleResolver r = org.mockito.Mockito.mock(KbHandleResolver.class);
+        org.mockito.Mockito.when(r.resolveKnowledgeBase(org.mockito.ArgumentMatchers.anyString()))
+            .thenAnswer(inv -> inv.getArgument(0));
+        return r;
+    }
+
     /** 反射注入（字段是 private，测试里不引入 Spring）。 */
     private static void inject(Object target, String field, Object value) {
         try {
@@ -158,6 +172,7 @@ class KbWikiToolScopeThreeStateTest {
         KbWikiSearchTool tool = new KbWikiSearchTool();
         inject(tool, "scope", new FixedScope(List.of("kb-1")));
         inject(tool, "knowledgeBaseService", fakeKbService(List.of("kb-1", "kb-2")));
+        inject(tool, "handleResolver", fakeResolver());
 
         List<String> got = resolveTargets(tool,
             input("{\"knowledge_base_ids\":[\"kb-1\",\"kb-2\"]}"), null);
@@ -171,6 +186,7 @@ class KbWikiToolScopeThreeStateTest {
         KbWikiSearchTool tool = new KbWikiSearchTool();
         inject(tool, "scope", null);
         inject(tool, "knowledgeBaseService", fakeKbService(List.of("kb-1", "kb-2")));
+        inject(tool, "handleResolver", fakeResolver());
 
         List<String> got = resolveTargets(tool,
             input("{\"knowledge_base_ids\":[\"kb-2\"]}"), null);

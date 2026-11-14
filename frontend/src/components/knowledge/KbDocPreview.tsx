@@ -80,6 +80,14 @@ interface Props {
    * </ul>
    */
   mode?: 'auto' | 'merged'
+  /**
+   * 自定义「取原始字节」通道（缺省 = `knowledgeApi.rawBytes(knowledge.id)`）。
+   *
+   * <p>知识库对话的**会话临时附件**没有 `kb_knowledge` 行，下载端点也不认它的 id
+   * （`kba-` 开头）⇒ 宿主传入自己的取字节函数（`/kb/chat/{sid}/attachments/{id}/raw`）。
+   * ⛔ 主链路（知识库文档抽屉）不传 ⇒ 行为零变化。
+   */
+  rawBytesLoader?: () => Promise<Uint8Array>
   /** 失败态里的「切到分块」——由抽屉切 view，⛔ 本组件不自己跳（会闪） */
   onSwitchToChunks: () => void
   onRetryChunks?: () => void
@@ -142,6 +150,7 @@ export function KbDocPreview({
   chunksLoading,
   chunksError,
   mode = 'auto',
+  rawBytesLoader,
   onSwitchToChunks,
   onRetryChunks,
 }: Props) {
@@ -216,8 +225,7 @@ export function KbDocPreview({
       `[KbDocPreview] 开始取原始字节 id=${knowledge.id} 分支=${kind} 后缀=${ext}` +
       ` 下载地址=${knowledgeApi.downloadUrl(knowledge.id)} 尝试=${reloadKey + 1}`
     )
-    knowledgeApi
-      .rawBytes(knowledge.id)
+    ;(rawBytesLoader ?? (() => knowledgeApi.rawBytes(knowledge.id)))()
       .then((b) => {
         if (cancelled) return
         const ms = Math.round(performance.now() - t0)

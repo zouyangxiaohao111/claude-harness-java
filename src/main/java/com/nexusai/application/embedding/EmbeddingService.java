@@ -124,6 +124,23 @@ public class EmbeddingService {
         if (name.contains("text-embedding-v4") || name.contains("text-embedding-v3")) {
             return 10;
         }
+        // ⭐ 以下条目照抄源站 catalog `overrides.json`（2026-11-14 实读，17 条 max_batch_size）：
+        //   多模态/向量模型的上限与文本模型**不同**，按 10 发会被服务端拒或被截断。
+        if (name.contains("qwen3-vl-embedding")) {
+            return 20;
+        }
+        if (name.contains("qwen2.5-vl-embedding")) {
+            return 1;      // 源站 catalog: aliyun qwen2.5-vl-embedding = 1
+        }
+        if (name.contains("multimodal-embedding")) {
+            return 20;     // aliyun multimodal-embedding-v1 = 20
+        }
+        if (name.contains("tao-8k")) {
+            return 1;      // qianfan tao-8k = 1
+        }
+        if (name.contains("zhipu") && name.contains("embedding-3")) {
+            return 64;     // zhipu embedding-3 = 64（硬上限同为 64）
+        }
         return DEFAULT_BATCH_SIZE;
     }
 

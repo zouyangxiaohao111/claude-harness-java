@@ -5,6 +5,52 @@
 import { api } from './rest'
 import type { AppSettings, ModelTierRole, UpdateSettingsRequest } from './types'
 
+/**
+ * 知识库入库流水线的六池并发配置 · `GET/ PUT /api/v1/settings/ingest-concurrency`。
+ *
+ * <p>字段名逐字照抄后端契约（⛔ 不要改成 snake_case / 别的名字，改了会静默读不到）：
+ * 六个池 `parse` / `postprocess` / `enrichment` / `wiki` / `maintenance` / `shared`
+ * 加每次调度认领上限 `maxTasksPerTick`。
+ *
+ * <p>`source` 是后端算好的**只读**来源标记，不是配置项：
+ * <ul>
+ *   <li>{@code db}：settings 表 `ingest_concurrency_config` 存过（用户自定义）；</li>
+ *   <li>{@code yml}：未自定义，生效的是 `application.yml` 的
+ *       `nexusai.knowledge.ingest.*` 默认值。</li>
+ * </ul>
+ */
+export interface IngestConcurrencyConfig {
+  parse: number
+  postprocess: number
+  enrichment: number
+  wiki: number
+  maintenance: number
+  shared: number
+  maxTasksPerTick: number
+  source: 'db' | 'yml'
+}
+
+/** PUT 请求体：全部数值字段可选（未传的键保持现值），`source` 不可写。 */
+export type IngestConcurrencyPatch = Partial<Omit<IngestConcurrencyConfig, 'source'>>
+
+/** GET — 读取当前生效的入库并发配置（含来源标记）。 */
+export function getIngestConcurrency(): Promise<IngestConcurrencyConfig> {
+  return api<IngestConcurrencyConfig>('/settings/ingest-concurrency')
+}
+
+/**
+ * PUT — 部分更新入库并发配置，返回**生效后**的完整配置（`source=db`）。
+ *
+ * <p>⚠️ 必须用返回值回填界面：它来自后端落库并热调池之后的同一份对象，
+ * 是此刻真正生效的值；拿请求体当结果会在后端校验/回落时显示成与运行值不一致的数字。
+ * 越界（每池 1~64 / 每轮 1~50）后端直接 400，错误信息带字段名。
+ */
+export function putIngestConcurrency(
+  patch: IngestConcurrencyPatch,
+): Promise<IngestConcurrencyConfig> {
+  return api<IngestConcurrencyConfig>('/settings/ingest-concurrency', { method: 'PUT', body: patch })
+}
+
 export const settingsApi = {
   /** GET /api/v1/settings — 读取全局设置 */
   get: () => api<AppSettings>('/settings'),

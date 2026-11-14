@@ -149,7 +149,7 @@ public class KbWikiFlagIssueTool implements Tool {
                     "issue_type 取值非法：" + issueType + "。允许：" + String.join(" / ", ALLOWED_TYPES));
             }
 
-            String denied = KbWikiToolSupport.checkKbAllowed(scope, ctx, kbId);
+            String denied = KbWikiToolSupport.checkKbWritable(scope, ctx, kbId);
             if (denied != null) {
                 log.warn("[wiki_flag_issue] 拒绝越权上报 kb={} slug={}", kbId, slug);
                 return ToolResult.error(call.id(), denied + "，不能上报");

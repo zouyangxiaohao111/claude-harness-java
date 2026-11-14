@@ -145,17 +145,29 @@ export function openStandalone(payload: StandalonePayload): void {
           try { await existing.setFocus() } catch { /* 窗口可能正关闭中 */ }
           return
         }
-        new WebviewWindow(WINDOW_LABEL, {
+        // ⚠️ Tauri v2：创建失败**不会抛异常**，而是发 `tauri://error` 事件 —— 旧代码的
+        //    try/catch 永远进不去，用户只看到「点了没反应」。这里显式监听并回退浏览器开窗。
+        //    不指定 center：与能正常打开的知识库窗口（kbWindow.ts）保持同一组参数。
+        const win = new WebviewWindow(WINDOW_LABEL, {
           title: p.title || '预览',
           url: standaloneUrl(),
           width: 1280,
           height: 840,
           minWidth: 480,
           minHeight: 360,
-          center: true,
           focus: true,
         })
-      } catch { /* Tauri 环境异常（缺 capability 等）：静默 */ }
+        void win.once('tauri://error', (event) => {
+          console.error('[standalonePreview] 创建独立窗口失败，回退 window.open', event)
+          const fallback = window.open(standaloneUrl(), BROWSER_TAB_NAME)
+          try { fallback?.focus() } catch { /* ignore */ }
+        })
+      } catch (e) {
+        // import 失败 / 非 Tauri 注入等同步异常：同样回退，不再静默
+        console.error('[standalonePreview] Tauri 开窗异常，回退 window.open', e)
+        const fallback = window.open(standaloneUrl(), BROWSER_TAB_NAME)
+        try { fallback?.focus() } catch { /* ignore */ }
+      }
     })()
     return
   }
