@@ -228,12 +228,41 @@ public class ToolRegistrationConfig {
     @org.springframework.beans.factory.annotation.Value("${nexusai.feature.monitor-tool:true}")
     private boolean monitorToolFeatureEnabled;
 
-    /** [monitor-cc-align] CC 契约的命令/WebSocket 监控执行器。 */
+    /**
+     * [monitor-cc-align] CC 契约的命令/WebSocket 监控执行器。
+     *
+     * <p>⛔ 必须 {@code @Lazy}：否则 Spring 上下文加载失败（2026-11-15 用户实测「循环依赖」）。
+     * <pre>
+     * toolRegistrationConfig ─(本字段 monitorTaskRunner)─▶ monitorTaskRunner
+     *        ▲                                                     │(构造器形参 backgroundTaskRunner)
+     *        │                                                     ▼
+     *        │                                    backgroundTaskRunner ─(形参 spawnInProcess)─▶ spawnInProcess
+     *        │                                                     │(字段 subagentExecutor)     │
+     *        └────────── subagentExecutor(@Bean <b>在本类</b>) ◀────────────────────────────────┘
+     * </pre>
+     * 成因：{@code 422dce96}「Monitor 工具按 CC 真源重写」给本类加了本字段 —— 此前本类
+     * 不依赖它 ⇒ 环不成立；加上这一刀即闭环（⛔ 影响范围：仅 0.1.80，0.1.79 及之前正常）。
+     *
+     * <p>⭐ 为何**只**断这里、且用字段上的 {@code @Lazy}（而不是给环上其它边加）：
+     * <ul>
+     *   <li>本类持有的是<b>工具 bean</b>（monitor / bash），它们只在**运行期**被用
+     *       （注册 monitor 工具时），构造期用不到 ⇒ 延迟解析语义零改变；</li>
+     *   <li>⚠️ <b>不能</b>给 {@code @Bean} 方法加 {@code @Lazy}：那只延迟 refresh 的
+     *       「预实例化阶段」，<b>依赖注入点照样立即创建该 bean</b> ⇒ 断不了环
+     *       （2026-11-15 实测：改 @Bean 无效，仍报同一环）；</li>
+     *   <li>⚠️ <b>也不能</b>给环上其它边（spawnInProcess 形参 / subagentExecutor 字段）加
+     *       {@code @Lazy}：那会改变其它 bean 的创建顺序 ⇒ 把原本靠「创建顺序」侥幸能解的
+     *       环（如 autoCompactor ⇄ agentLoopContextFactory）暴露成新的环
+     *       （2026-11-15 实测：加了之后报错从 toolRegistrationConfig 变成 autoCompactor）。</li>
+     * </ul>
+     */
     @Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
     private com.nexusai.application.agent.tasks.MonitorTaskRunner monitorTaskRunner;
 
     /** [monitor-cc-align] command 模式的权限判定复用 Bash 权限链。 */
     @Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
     private com.nexusai.application.agent.tool.impl.BashTool bashToolForMonitor;
 
     /**

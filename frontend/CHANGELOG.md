@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.81] - 2026-11-15
+
+### Fixed
+
+- 修复 0.1.80 起应用无法启动的问题：工具注册与任务执行之间存在 Spring 循环依赖，已打断
+
 ## [0.1.80] - 2026-11-15
 
 ### Added
