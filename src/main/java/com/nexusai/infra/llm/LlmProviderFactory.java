@@ -36,6 +36,7 @@ public class LlmProviderFactory {
     @Autowired private LlmProvider mockLlmProvider;
     @Autowired private LlmProvider openAiSdkProvider;
     @Autowired private AnthropicSdkProvider anthropicProvider;
+    @Autowired private ResponsesSdkProvider responsesSdkProvider;
 
     /**
      * 按 provider type + config 路由。
@@ -55,6 +56,7 @@ public class LlmProviderFactory {
             case "openai_compatible" -> openAiSdkProvider;   // [ODF-B2] 默认路由走官方 SDK
             case "openai_sdk" -> openAiSdkProvider;
             case "anthropic" -> anthropicProvider;
+            case "openai_response" -> responsesSdkProvider;   // Responses 协议（/v1/responses）
             default -> openAiSdkProvider; // 未知 → 假设 OpenAI 兼容（事实标准）· 官方 SDK 优先
         };
     }

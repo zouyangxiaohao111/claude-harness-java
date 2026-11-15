@@ -54,6 +54,17 @@ public class GoalCheckinScheduler {
     /** tick 间隔 —— 足够细，让 60 秒档的重试也能按时触发。 */
     private static final long TICK_INTERVAL_SECONDS = 30L;
 
+    /**
+     * goal steering（重试/check-in）的 workload 标记 · 让 CronIdleExecutor 在会话空闲时代跑。
+     *
+     * <p>⛔ 不能传 null：null 会被当成「真实会话用户 prompt」留给会话自身 turn，
+     * 而 goal 重试是在空闲时注入的，没有 turn 来消费 ⇒ 永久滞留。
+     */
+    static final String WORKLOAD_GOAL_STEERING = "goal-steering";
+
+    /** 队列已有同类 steering 时的复查间隔 · 对齐 CC `Zd(e, _s)` 的 60s。 */
+    static final long RETRY_RECHECK_MS = 60_000L;
+
     private final SessionService sessionService;
     private final NotificationQueue notificationQueue;
     /**
@@ -176,7 +187,10 @@ public class GoalCheckinScheduler {
             }
             return;
         }
-        deliverCheckin(snap.sessionId(), goal, now, waited);
+        // 未注入（目标已清 / 队列已有同类项）→ 不推进 checkinCount，下个 tick 再试
+        if (!deliverCheckin(snap.sessionId(), goal, now, waited)) {
+            return;
+        }
         persistDeferral(snap.sessionId(), goal, now, count + 1, now);
     }
 
@@ -194,6 +208,15 @@ public class GoalCheckinScheduler {
         if (!stillLive(sessionId)) {
             return;
         }
+        // [goal-retry-align 2026-11-15] 幂等守卫 · 对齐 CC Kf()：
+        //   `if (忙 || hasQueued(goalReprompt)) { 重新排 1 分钟后再试 }`。
+        //   队列里已有同类 steering ⇒ 不重复注入；重排 retryAt 保证「那条被清掉也不丢」。
+        if (hasQueuedGoalSteering(sessionId)) {
+            sessionService.setGoal(sessionId, goal.withRetry(
+                System.currentTimeMillis() + RETRY_RECHECK_MS, goal.retryCount()));
+            log.info("[goal-checkin] session={} 队列已有 goal steering ⇒ 1 分钟后再检查", sessionId);
+            return;
+        }
         SessionGoal consumed = goal.consumeRetry();
         sessionService.setGoal(sessionId, consumed);
         String body = "<goal_steering type=\"retry\">\n"
@@ -205,16 +228,27 @@ public class GoalCheckinScheduler {
             sessionId, goal.retryCount() == null ? 0 : goal.retryCount());
     }
 
-    /** 注入 check-in 提示（对齐 CC {@code Ha()} 的文案结构）。 */
-    private void deliverCheckin(String sessionId, SessionGoal goal, long now, long deferredMs) {
+    /**
+     * 注入 check-in 提示（对齐 CC {@code Ha()} 的文案结构）。
+     *
+     * @return true = 已注入（调用方推进 checkinCount）；false = 未注入（已清/队列已有同类项）
+     */
+    private boolean deliverCheckin(String sessionId, SessionGoal goal, long now, long deferredMs) {
         // [goal-clear-race 2026-11-04] 注入前同样复核：目标已清还注入 check-in，会让模型
         //   继续追一个用户已经取消的目标（白烧一轮 LLM）。
         if (!stillLive(sessionId)) {
-            return;
+            return false;
         }
         if (notificationQueue == null) {
             log.warn("[goal-checkin] session={} NotificationQueue 未注入，check-in 无法投递", sessionId);
-            return;
+            return false;
+        }
+        // 幂等 · 对齐 CC Qf()：队列里已有同类 steering → 本轮不注入（下个 tick 再试）。
+        if (hasQueuedGoalSteering(sessionId)) {
+            if (log.isDebugEnabled()) {
+                log.debug("[goal-checkin] session={} 队列已有 goal steering，跳过本次 check-in", sessionId);
+            }
+            return false;
         }
         long minutes = Math.max(1, Math.round(deferredMs / 60_000.0));
         String body = "<goal_steering type=\"checkin\">\n"
@@ -226,6 +260,7 @@ public class GoalCheckinScheduler {
             + "</goal_steering>";
         enqueueMetaPrompt(sessionId, body);
         log.info("[goal-checkin] session={} 已注入 check-in（延迟 {} 分钟）", sessionId, minutes);
+        return true;
     }
 
     /**
@@ -234,10 +269,26 @@ public class GoalCheckinScheduler {
      * <p>只填最少字段：{@code value}（提示正文）+ {@code mode="prompt"} + {@code isMeta=true}
      * + {@code sessionId}（会话归属，CronIdleExecutor 据此判定目标会话是否空闲）。
      */
+    /** 队列里是否已有本会话的 goal steering（重试/check-in 同类项） · 对齐 CC {@code hasQueued(lBr)}。 */
+    private boolean hasQueuedGoalSteering(String sessionId) {
+        if (notificationQueue == null || sessionId == null || sessionId.isBlank()) {
+            return false;
+        }
+        return notificationQueue.peek(item ->
+            WORKLOAD_GOAL_STEERING.equals(item.workload())
+                && sessionId.equals(item.sessionId())).isPresent();
+    }
+
     private void enqueueMetaPrompt(String sessionId, String text) {
+        // [goal-retry-stuck 2026-11-15] workload 必须非 null。
+        //   WHY：CronIdleExecutor 的消费谓词把「mode=prompt && workload==null」一律当成
+        //   **真实会话用户 prompt**（留给该会话自己的 turn，执行器绝不打捞）。而 goal 重试
+        //   是在会话**空闲**时由 30s 调度器注入的 —— 没有 turn 会来消费它 ⇒ 注入永久滞留，
+        //   表现就是「重试 1/3 之后不动了」（retryCount=1、retryAt=null、phase=active）。
+        //   打上 workload 后走「空闲会话 → 执行器代跑」分支（与 busy-queued / 通知同一条路）。
         NotificationQueue.QueueItem item = new NotificationQueue.QueueItem(
             text, "prompt", null, null, java.util.UUID.randomUUID().toString(),
-            true, null, true, null, sessionId, null, null);
+            true, WORKLOAD_GOAL_STEERING, true, null, sessionId, null, null);
         notificationQueue.enqueue(item);
     }
 

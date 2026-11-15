@@ -4,10 +4,10 @@ import com.nexusai.infra.llm.OpenAiSdkProvider;
 import com.nexusai.infra.llm.ProviderConfig;
 
 import com.openai.client.OpenAIClient;
-import com.openai.models.CreateEmbeddingResponse;
-import com.openai.models.Embedding;
-import com.openai.models.EmbeddingCreateParams;
-import com.openai.models.EmbeddingModel;
+import com.openai.models.embeddings.CreateEmbeddingResponse;
+import com.openai.models.embeddings.Embedding;
+import com.openai.models.embeddings.EmbeddingCreateParams;
+import com.openai.models.embeddings.EmbeddingModel;
 import java.util.ArrayList;
 import java.util.Comparator;
 import java.util.List;
@@ -92,10 +92,10 @@ public class OpenAiEmbeddingClient implements EmbeddingClient {
                 // 响应 index 是批内下标；排序后与 batch 顺序对齐（防御服务端乱序返回）
                 data.sort(Comparator.comparingLong(Embedding::index));
                 for (Embedding embedding : data) {
-                    List<Double> raw = embedding.embedding();
+                    List<Float> raw = embedding.embedding();
                     float[] vector = new float[raw.size()];
                     for (int i = 0; i < raw.size(); i++) {
-                        vector[i] = raw.get(i).floatValue();
+                        vector[i] = raw.get(i);
                     }
                     vectors.add(vector);
                 }

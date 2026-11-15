@@ -85,7 +85,7 @@ const tagForNewModel = (providerName: string, modelName: string, fallback: strin
 const PROTOCOL_OPTIONS = [
   { value: 'openai_compatible', label: 'OpenAI 兼容', desc: '/v1/chat/completions' },
   { value: 'anthropic', label: 'Anthropic 原生', desc: '/v1/messages' },
-  { value: 'openai_response', label: 'OpenAI Responses', desc: '/v1/responses · 暂不支持', disabled: true },
+  { value: 'openai_response', label: 'OpenAI Responses', desc: '/v1/responses' },
 ]
 
 /**
@@ -106,7 +106,6 @@ const PROTOCOL_OPTIONS = [
 export const BASE_URL_HINT: Record<string, string> = {
   openai_compatible: '填到 /v1 为止 · 请求 {base}/chat/completions',
   anthropic: '只填域名、不带 /v1 · 请求 {base}/v1/messages',
-  // 后端 ProviderType 尚无此值（当前置灰不可选），文案先备好，避免将来放开时漏一条。
   openai_response: '填到 /v1 为止 · 请求 {base}/responses',
 }
 
@@ -189,7 +188,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
     const inferred = (p.baseUrl ?? '').toLowerCase().includes('api.anthropic.com') ? 'anthropic' : 'openai_compatible'
     const req: UpdateProviderRequest = {
       name: p.name,
-      type: p.type === 'anthropic' ? 'anthropic' : inferred,
+      type: p.type === 'anthropic' || p.type === 'openai_response' ? p.type : inferred,
       baseUrl: p.baseUrl,
       // 编辑时若 key 字段未被修改（仍为后端掩码 sk-****）则不发送 apiKey，
       // 避免把掩码字符串当明文存库导致 API 401（后端 req.apiKey null 时不更新）
@@ -211,7 +210,7 @@ export function ProvidersPanel({ providersApi, showToast }: ProvidersPanelProps)
     const inferred = (p.baseUrl ?? '').toLowerCase().includes('api.anthropic.com') ? 'anthropic' : 'openai_compatible'
     const req: CreateProviderRequest = {
       name: p.name,
-      type: p.type === 'anthropic' ? 'anthropic' : inferred,
+      type: p.type === 'anthropic' || p.type === 'openai_response' ? p.type : inferred,
       baseUrl: p.baseUrl,
       apiKey: p.apiKeyMasked,    // raw key
       enabled: p.enabled ?? true,

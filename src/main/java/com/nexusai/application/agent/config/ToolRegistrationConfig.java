@@ -219,6 +219,24 @@ public class ToolRegistrationConfig {
     private MonitorMcpTaskRunner monitorMcpTaskRunner;
 
     /**
+     * [monitor-cc] Monitor 工具配置开关 · <b>默认开启</b>（新版 Claude Code 已把 Monitor
+     * 从实验功能转正，用户 2026-11-14 裁定跟随）。
+     *
+     * <p>关闭方式：application.yml {@code nexusai.feature.monitor-tool: false}
+     * 或环境变量 {@code NEXUSAI_FEATURE_MONITOR_TOOL=false}。
+     */
+    @org.springframework.beans.factory.annotation.Value("${nexusai.feature.monitor-tool:true}")
+    private boolean monitorToolFeatureEnabled;
+
+    /** [monitor-cc-align] CC 契约的命令/WebSocket 监控执行器。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.tasks.MonitorTaskRunner monitorTaskRunner;
+
+    /** [monitor-cc-align] command 模式的权限判定复用 Bash 权限链。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.tool.impl.BashTool bashToolForMonitor;
+
+    /**
      * [IMP2-03] 任务框架服务（async-agent 附件数据源）· CC appState.tasks local_agent
      * （compact.ts:1571-1574）。@Bean 在 TaskConfiguration；required=false 容错直构测试。
      */
@@ -319,10 +337,14 @@ public class ToolRegistrationConfig {
         // [monitor-rework] MonitorTool 真实现注册：flag 开 → 注册并注入 MonitorMcpTaskRunner
         // （execute 生产接线 registerTask+monitor）；flag 关 → 不注册（对齐 CC flag-off null）。
         // 不走通用 registerFeatureGatedStub（其 factory 只收 FeatureFlags，无法传 runner）。
-        if (featureFlags != null && featureFlags.monitorTool()) {
-            tools.add(new MonitorTool(featureFlags, monitorMcpTaskRunner));
+        if (featureFlags != null && (featureFlags.monitorTool() || monitorToolFeatureEnabled)) {
+            MonitorTool monitorTool = new MonitorTool(
+                featureFlags, monitorMcpTaskRunner, monitorTaskRunner, monitorToolFeatureEnabled);
+            monitorTool.setBashTool(bashToolForMonitor);
+            tools.add(monitorTool);
             log.info("[B5] MONITOR_TOOL（CC tools.ts:39/237）门控开启 → 注册 MonitorTool 真实现"
-                + "（monitorMcpTaskRunner={}）", monitorMcpTaskRunner != null);
+                + "（monitorTaskRunner={}，bashTool={}）",
+                monitorTaskRunner != null, bashToolForMonitor != null);
         } else if (log.isDebugEnabled()) {
             log.debug("[B5] MONITOR_TOOL（CC tools.ts:39/237）门控关闭 → 不注册（对齐 CC flag-off null）");
         }

@@ -49,6 +49,9 @@ class McpServerApprovalFlowTest {
 
     private static McpServerMapper mapper;
     private static McpServerService service;
+    /** [V295] 运行时连接态模拟（status 改由 isServerConnected 推导）。 */
+    private static final java.util.concurrent.atomic.AtomicBoolean CONNECTED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @BeforeAll
     static void setUpDatabase() throws Exception {
@@ -76,7 +79,12 @@ class McpServerApprovalFlowTest {
             Mockito.mock(McpTransportFactory.class));
         McpToolPool pool = Mockito.mock(McpToolPool.class);
         Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any()))
-            .thenReturn(List.of());
+            .thenAnswer(inv -> { CONNECTED.set(true); return List.of(); });
+        Mockito.when(pool.isServerConnected(Mockito.anyString()))
+            .thenAnswer(inv -> CONNECTED.get());
+        Mockito.when(pool.isConnecting(Mockito.anyString())).thenReturn(false);
+        Mockito.doAnswer(inv -> { CONNECTED.set(false); return null; })
+            .when(pool).teardown(Mockito.anyString());
         Mockito.when(pool.fetchMcpSkills(Mockito.anyString())).thenReturn(List.of());
         ReflectionTestUtils.setField(service, "mcpToolPool", pool);
         // [impl-I-3 rework #2] start() 内 channelNotificationGate.setAllowedChannelsSupplier（基线修复补 mock）
@@ -92,6 +100,7 @@ class McpServerApprovalFlowTest {
 
     @BeforeEach
     void clean() {
+        CONNECTED.set(false);
         for (McpServerRecord r : mapper.selectAll()) {
             mapper.deleteById(r.getId());
         }
@@ -105,8 +114,9 @@ class McpServerApprovalFlowTest {
         s.setCommand("python");
         s.setArgs(null);
         s.setEnv(null);
-        s.setStatus("stopped");
+        // [V295] status 列已删（运行时态不落库）；pending 行只需 enabled=false
         s.setEnabled(Boolean.FALSE);
+        s.setAutoStart(Boolean.FALSE);
         s.setType("stdio");
         s.setApprovalStatus("pending");
         s.setCreatedAt(java.time.OffsetDateTime.now()

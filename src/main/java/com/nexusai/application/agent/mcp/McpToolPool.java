@@ -486,6 +486,16 @@ public class McpToolPool {
     private McpConnectivityStatusRegistry connectivityRegistry;
 
     /**
+     * 「本进程正在连接」的 server 名集合 · 运行时 {@code pending} 态的唯一来源。
+     *
+     * <p>WHY 需要：{@link McpTransport.State} 只有 NOT_CONNECTED/CONNECTED/CLOSED 三态，
+     * 没有 CONNECTING；而 CC 的 {@code pending} 确实存在（MCPServerConnection.type）。
+     * 这里用内存集合在连接窗口内标 pending，连接结束（成功/失败）即移除 —— 纯运行时，
+     * ⛔ 不落库（V295 已删 status 列）。
+     */
+    private final java.util.Set<String> connectingNames = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /**
      * [S3] MCP OAuth token 持久化（DB，Q-01=A keychain→DB）· 供 {@link #hasDiscoveryButNoToken}
      * （CC hasMcpDiscoveryButNoToken auth.ts:349-363）读「已发现但无 token」状态 + 构建
      * {@link McpAuth}（performMCPOAuthFlow 编排）。
@@ -1526,14 +1536,21 @@ public class McpToolPool {
         } else {
             invalidateFetchCaches(serverName);
         }
-        McpTransport transport = connectTransport(serverName, config, connectSessionId);
-        serverConfigKeys.put(serverName, key);
-        // [impl-I-4 F2 rework] ConcurrentHashMap 不允许 null 值：null-config（fake factory 自决）
-        // 不 put serverConfigs（装配过标记由 serverConfigKeys 承接，ensureConnectedClient 已改判）。
-        if (config != null) {
-            serverConfigs.put(serverName, config);
+        // [V295 runtime-status] 连接窗口标 pending（对齐 CC MCPServerConnection.type='pending'）；
+        // 结束即移除 —— 纯内存，不落库。
+        connectingNames.add(serverName);
+        try {
+            McpTransport transport = connectTransport(serverName, config, connectSessionId);
+            serverConfigKeys.put(serverName, key);
+            // [impl-I-4 F2 rework] ConcurrentHashMap 不允许 null 值：null-config（fake factory 自决）
+            // 不 put serverConfigs（装配过标记由 serverConfigKeys 承接，ensureConnectedClient 已改判）。
+            if (config != null) {
+                serverConfigs.put(serverName, config);
+            }
+            return transport;
+        } finally {
+            connectingNames.remove(serverName);
         }
-        return transport;
     }
 
     /**
@@ -2047,6 +2064,43 @@ public class McpToolPool {
     public boolean isServerConnected(String serverName) {
         McpTransport transport = activeTransports.get(serverName);
         return transport != null && transport.getState() == McpTransport.State.CONNECTED;
+    }
+
+    /**
+     * 运行时连接态原始值 · 对齐 CC {@code client.type}
+     * （connected / failed / needs-auth；未知 → null）。
+     *
+     * <p>供 {@code McpServerService.toDto} 合成 {@code runtimeStatus}；⛔ 不读 DB
+     * （V295 已删 {@code mcp_servers.status}，旧值会跨进程残留成假 running）。
+     *
+     * @param serverName MCP server 名
+     * @return connected / failed / needs-auth / null
+     */
+    public String runtimeTypeOf(String serverName) {
+        return connectivity().typeOf(serverName);
+    }
+
+    /**
+     * 本进程是否正在连接该 server（pending 态 · 对齐 CC {@code type='pending'}）。
+     *
+     * @param serverName MCP server 名
+     * @return true = 连接进行中
+     */
+    public boolean isConnecting(String serverName) {
+        return serverName != null && connectingNames.contains(serverName);
+    }
+
+    /**
+     * 当前已连接 transport 的子进程 PID（stdio 才有；未连接 → null）。
+     *
+     * <p>供 {@code mcp_servers.pid} 持久化 + 启动期僵尸清理（PID + 进程名双重校验）。
+     *
+     * @param serverName MCP server 名
+     * @return 子进程 PID 或 null
+     */
+    public Long currentPid(String serverName) {
+        McpTransport transport = activeTransports.get(serverName);
+        return transport == null ? null : transport.pid();
     }
 
     /** 单个 server 的工具列表. */

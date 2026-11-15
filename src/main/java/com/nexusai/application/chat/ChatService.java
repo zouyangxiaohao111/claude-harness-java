@@ -936,6 +936,10 @@ public class ChatService {
         //   已达成 / 已放弃的目标不复活；恢复只重挂 hook，进度字段原样保留（⛔ 不重置轮数）。
         restoreGoalForResume(sessionId);
 
+        // [monitor-cc] 插件 monitors 的 when=always 分支：会话启动时按会话幂等挂载
+        //   （对齐 CC kae() 的 session start arm）。
+        armPluginMonitorsForSession(sessionId);
+
         String modelName = resolveModelNameForSession(session, req != null ? req.modelName() : null);
         // [P1 · slash-align] 技能级 model 覆盖（prompt 型命令 command.model，CC :917）
         if (slashModelOverride != null) {
@@ -4301,6 +4305,22 @@ public class ChatService {
      * 所以绝不能在这里重置任何计数 —— 否则评估器刚记下的轮数会被下一条用户消息清零
      * （真机缺陷：目标头恒显示「第 1 轮」）。
      */
+    /** [monitor-cc] 插件 monitors 自动挂载（required=false：未装配时整层 no-op）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.plugin.PluginMonitorArmService pluginMonitorArmService;
+
+    private void armPluginMonitorsForSession(String sessionId) {
+        if (pluginMonitorArmService == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            pluginMonitorArmService.armForSession(sessionId);
+        } catch (Exception e) {
+            log.warn("[ChatService] 插件 monitors 挂载失败（不影响本轮对话）session={}: {}",
+                sessionId, e.toString());
+        }
+    }
+
     private void restoreGoalForResume(String sessionId) {
         com.nexusai.application.agent.goal.GoalService goalService =
             goalServiceProvider != null ? goalServiceProvider.getIfAvailable() : null;

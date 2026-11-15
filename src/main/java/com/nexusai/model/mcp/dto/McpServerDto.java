@@ -28,7 +28,12 @@ public record McpServerDto(
     Map<String, Object> oauth,     // 远程 oauth（来自 .mcp.json 条目，DB 无 oauth 列）
     String scope,           // 写目标 scope（create/update 特有）
     String filePath,        // = describeMcpConfigFilePath(scope)（create/update 特有）
-    List<String> warnings   // create/update 特有，stdio 非阻断警告
+    List<String> warnings,  // create/update 特有，stdio 非阻断警告
+    // ── [V295] 启动自启（本仓扩展层）+ 运行时状态（不落库）──
+    //   status 保留三态映射（running/stopped/error）供既有前端消费；
+    //   runtimeStatus 是更细的运行时真值（connected/pending/failed/needsAuth/disabled/stopped）。
+    boolean autoStart,
+    McpRuntimeStatus runtimeStatus
 ) {
     public McpServerDto {
         warnings = warnings == null ? List.of() : warnings;
@@ -40,6 +45,7 @@ public record McpServerDto(
                         boolean enabled, OffsetDateTime createdAt, String type,
                         String approvalStatus) {
         this(id, name, command, args, env, status, lastError, enabled, createdAt,
-            type, approvalStatus, null, false, null, null, null, null, null, null);
+            type, approvalStatus, null, false, null, null, null, null, null, null,
+            false, McpRuntimeStatus.stopped);
     }
 }

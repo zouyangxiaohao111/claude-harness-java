@@ -527,9 +527,20 @@ public class CompactThresholdSystem {
      *                          由调用方传入，DISABLE_* env 判定归 IMP-07）
      */
     public TokenWarningState calculateTokenWarningState(int tokenUsage, String model, boolean autoCompactEnabled) {
-        int autoCompactThreshold = getAutoCompactThreshold(model);
+        return calculateTokenWarningState(tokenUsage, model, autoCompactEnabled, null);
+    }
+
+    /**
+     * token 警告四态（带显式窗口覆盖）· 供 agent 级 {@code autoCompactWindow} 使用。
+     *
+     * <p>覆盖值只应「收窄」继承窗口；调用方负责 Math.min。
+     */
+    public TokenWarningState calculateTokenWarningState(int tokenUsage, String model, boolean autoCompactEnabled,
+                                                        Integer contextWindowOverride) {
+        int autoCompactThreshold = getAutoCompactThreshold(model, contextWindowOverride);
         // CC autoCompact.ts:104-106 — auto 启用时用 auto 阈值，否则用有效窗口
-        int threshold = autoCompactEnabled ? autoCompactThreshold : getEffectiveContextWindowSize(model);
+        int threshold = autoCompactEnabled ? autoCompactThreshold
+            : getEffectiveContextWindowSize(model, contextWindowOverride);
 
         // CC autoCompact.ts:108-111 — percentLeft = max(0, round((threshold - usage) / threshold * 100))
         int percentLeft = Math.max(0,

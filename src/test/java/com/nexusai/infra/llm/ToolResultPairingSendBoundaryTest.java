@@ -64,7 +64,7 @@ class ToolResultPairingSendBoundaryTest {
 
     /** 生产 SDK wire（OpenAI 通道）：buildSdkMessages → ObjectMappers JSON（同 R32B9/PdfDelivery 先例）。 */
     private static JsonNode openAiWire(List<ChatMessageDto> history) throws Exception {
-        List<com.openai.models.ChatCompletionMessageParam> msgs =
+        List<com.openai.models.chat.completions.ChatCompletionMessageParam> msgs =
             OpenAiSdkProvider.buildSdkMessages(history);
         return JSON.readTree(com.openai.core.ObjectMappers.jsonMapper().writeValueAsString(msgs));
     }

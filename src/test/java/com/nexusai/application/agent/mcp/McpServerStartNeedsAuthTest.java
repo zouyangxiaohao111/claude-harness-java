@@ -100,17 +100,20 @@ class McpServerStartNeedsAuthTest {
     }
 
     @Test
-    @DisplayName("start() 连接期 401 → 注册 mcp__<server>__authenticate 伪工具且 status=running")
+    @DisplayName("start() 连接期 401 → 注册 mcp__<server>__authenticate 伪工具且 runtimeStatus=needsAuth")
     void start_connect401_registersAuthPseudoTool() {
         // mcp-add 三分发：远程 http 走 url 独立字段（非 command 字段）
         McpServerDto created = service.create(new McpCreateRequest(
             "auth-srv", null, null, null, true, "http",
-            "http://localhost:9", null, null, null, "project"));
+            "http://localhost:9", null, null, null, "project", null));
 
         McpServerDto started = service.start(created.id());
 
-        // start() 不因 needs-auth 失败——status=running，伪工具进入 LLM 池（模型可见可触发 OAuth）
-        assertThat(started.status()).isEqualTo(McpStatus.running);
+        // [V295] 运行时态对齐 CC client.type：401 → needs-auth（不是 connected）。
+        //   三态 status 仅兼容旧前端 → error；面板优先展示 runtimeStatus=needsAuth。
+        assertThat(started.runtimeStatus())
+            .isEqualTo(com.nexusai.model.mcp.dto.McpRuntimeStatus.needsAuth);
+        assertThat(started.status()).isEqualTo(McpStatus.error);
         List<Tool> tools = service.getCurrentTools();
         assertThat(tools).extracting(Tool::name)
             .contains("mcp__auth-srv__authenticate");

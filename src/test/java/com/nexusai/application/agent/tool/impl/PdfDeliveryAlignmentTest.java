@@ -317,7 +317,7 @@ class PdfDeliveryAlignmentTest {
 
     /** [OpenAI-SDK 迁移] 生产 SDK wire：OpenAiSdkProvider.buildSdkMessages → ObjectMappers 序列化。 */
     private static JsonNode invokeOpenAiSdkBuildMessages(List<ChatMessageDto> history) throws Exception {
-        java.util.List<com.openai.models.ChatCompletionMessageParam> msgs =
+        java.util.List<com.openai.models.chat.completions.ChatCompletionMessageParam> msgs =
             com.nexusai.infra.llm.OpenAiSdkProvider.buildSdkMessages(history);
         return JSON.readTree(com.openai.core.ObjectMappers.jsonMapper()
             .writeValueAsString(msgs));

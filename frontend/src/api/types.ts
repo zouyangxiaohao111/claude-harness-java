@@ -7,18 +7,13 @@
 /**
  * 提供商协议类型（后端 `ProviderType` 枚举的子集）。
  *
- * <p>⚠️ `openai_response`（OpenAI Responses API · /v1/responses）**当前后端未实现** ——
- * 后端 `ProviderType` 枚举无此值，`ProviderService.toProviderDto` 走 `ProviderType.valueOf(...)`
- * ⇒ 真发出去会 500。故：
- * <ul>
- *   <li>界面上**显示**这一模式（让用户知道存在，只是暂不支持）但**置灰不可选**；</li>
- *   <li>本类型里**不含**它 —— 它只是 UI 层的展示项，值永远不会被提交。</li>
- * </ul>
+ * <p>`openai_response`（OpenAI Responses API · `/v1/responses`）已由后端
+ * `ResponsesSdkProvider` 实现，可正常提交并调用。
  */
-export type ProviderType = 'openai_compatible' | 'anthropic'
+export type ProviderType = 'openai_compatible' | 'openai_response' | 'anthropic'
 
-/** 协议类型下拉/分段控件的**展示项**（含未实现模式）· 与 ProviderType 区分开。 */
-export type ProviderProtocolOption = ProviderType | 'openai_response'
+/** 协议类型下拉/分段控件的**展示项** · 与 ProviderType 同集合（保留该别名避免大范围改调用方）。 */
+export type ProviderProtocolOption = ProviderType
 
 /** 后端响应：ProviderDto（含嵌套 models） */
 export interface Provider {
@@ -289,7 +284,20 @@ export interface McpServer {
   scope?: string | null
   filePath?: string | null
   warnings?: string[] | null
+  /** [V295] 启动自启（本仓对 CC 的扩展层）：应用启动时自动连接。enabled=false 时恒 false。 */
+  autoStart?: boolean
+  /** [V295] 运行时状态（不落库 · 后端现算，优先于 status 用于徽标） */
+  runtimeStatus?: McpRuntimeStatus
 }
+
+/** MCP 运行时状态（对齐后端 McpRuntimeStatus；CC 五态 + 本仓 stopped） */
+export type McpRuntimeStatus =
+  | 'connected'
+  | 'pending'
+  | 'failed'
+  | 'needsAuth'
+  | 'disabled'
+  | 'stopped'
 export interface CreateMcpRequest {
   name: string
   /** stdio 传输时必填启动命令；sse/http 远程 server 用 url（后端条件校验，command 去 @NotBlank） */
@@ -309,6 +317,8 @@ export interface CreateMcpRequest {
   clientSecret?: string
   /** 写目标 scope（local|user|project|...，REST 缺省 project） */
   scope?: string
+  /** [V295] 启动自启 · 缺省 = enabled（对齐 CC「启用即启动即连」） */
+  autoStart?: boolean
 }
 /** 远程 OAuth 配置（对齐后端 McpOAuthRequest） */
 export interface McpOAuthRequest {

@@ -83,6 +83,19 @@ public class GlobalExceptionHandler {
             .body(withInstance(Problem.of(409, "Conflict", ex.getMessage(), errorCode), req));
     }
 
+    /**
+     * 子代理 resume 前置校验失败 ⇒ 409（对齐 CC 的 {@code subagent_resume_*} 错误族：
+     * 请求本身可解析，但当前状态不允许恢复）。errorCode 透出 CC 的码名。
+     */
+    @ExceptionHandler(com.nexusai.application.agent.subagent.ResumeErrorCode.ResumeException.class)
+    public ResponseEntity<Problem> handleResumeRefused(
+            com.nexusai.application.agent.subagent.ResumeErrorCode.ResumeException ex,
+            HttpServletRequest req) {
+        return ResponseEntity.status(HttpStatus.CONFLICT)
+            .body(withInstance(Problem.of(409, "Conflict", ex.getMessage(),
+                ex.errorCode().code()), req));
+    }
+
     @ExceptionHandler(ValidationException.class)
     public ResponseEntity<Problem> handleValidation(ValidationException ex, HttpServletRequest req) {
         return ResponseEntity.status(HttpStatus.BAD_REQUEST)

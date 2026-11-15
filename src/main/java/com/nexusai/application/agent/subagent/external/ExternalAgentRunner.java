@@ -159,7 +159,7 @@ public final class ExternalAgentRunner {
             }
 
             // transcript 落盘：成功/失败都写（失败也有诊断价值）
-            recordTranscript(sessionId, agentId, description, def, parsed, exit, stderr);
+            recordTranscript(sessionId, agentId, description, def, parsed, exit, stderr, cwd);
 
             if (exit != 0 && parsed.text().isBlank()) {
                 return fail("外部运行时 '" + spec.runtime() + "' 退出码 " + exit
@@ -208,7 +208,8 @@ public final class ExternalAgentRunner {
      */
     private static void recordTranscript(String sessionId, String agentId, String description,
                                          com.nexusai.application.agent.subagent.AgentDefinition.ExternalAgentDefinition def,
-                                         ExternalStreamParser.Parsed parsed, int exit, String stderr) {
+                                         ExternalStreamParser.Parsed parsed, int exit, String stderr,
+                                         Path cwd) {
         if (sessionId == null || agentId == null) {
             log.warn("[ExternalAgentRunner] sessionId/agentId 为空，跳过 transcript 落盘");
             return;
@@ -216,7 +217,8 @@ public final class ExternalAgentRunner {
         try {
             Path sessionDir = ResumeService.resolveSessionDir(sessionId);
             AgentTranscript.writeMetadata(sessionDir, sessionId, agentId,
-                    new AgentTranscript.AgentMetadata(def.agentType(), null, description));
+                    new AgentTranscript.AgentMetadata(def.agentType(), null, description,
+                            cwd != null ? cwd.toString() : null));
 
             String ts = OffsetDateTime.now().toString();
             List<Map<String, Object>> messages =

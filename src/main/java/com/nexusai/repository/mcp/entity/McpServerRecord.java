@@ -19,10 +19,11 @@ public class McpServerRecord {
     private String command;
     private String args;            // JSON array
     private String env;             // JSON object
-    private String status;          // 'running'|'stopped'|'error'
     private String lastError;
     private Integer pid;
     private Boolean enabled;
+    /** [V295] 启动自启（本仓对 CC 的扩展层）；enabled 为总开关。 */
+    private Boolean autoStart;
     private String createdAt;
     private String type;            // 'stdio'|'sse'|'sse-ide'|'ws-ide'|'http'|'ws'|'sdk'|'claudeai-proxy'
     private String approvalStatus;  // 'approved'|'rejected'|'pending'
@@ -37,10 +38,10 @@ public class McpServerRecord {
         s.setCommand(command);
         s.setArgs(args);
         s.setEnv(env);
-        s.setStatus(status);
         s.setLastError(lastError);
         s.setPid(pid);
         s.setEnabled(enabled);
+        s.setAutoStart(autoStart);
         s.setCreatedAt(createdAt);
         s.setType(type);
         s.setApprovalStatus(approvalStatus);
@@ -55,10 +56,10 @@ public class McpServerRecord {
         r.setCommand(s.getCommand());
         r.setArgs(s.getArgs());
         r.setEnv(s.getEnv());
-        r.setStatus(s.getStatus());
         r.setLastError(s.getLastError());
         r.setPid(s.getPid());
         r.setEnabled(s.getEnabled());
+        r.setAutoStart(s.getAutoStart());
         r.setCreatedAt(s.getCreatedAt());
         r.setType(s.getType());
         r.setApprovalStatus(s.getApprovalStatus());
@@ -78,14 +79,14 @@ public class McpServerRecord {
     public void setArgs(String args) { this.args = args; }
     public String getEnv() { return env; }
     public void setEnv(String env) { this.env = env; }
-    public String getStatus() { return status; }
-    public void setStatus(String status) { this.status = status; }
     public String getLastError() { return lastError; }
     public void setLastError(String lastError) { this.lastError = lastError; }
     public Integer getPid() { return pid; }
     public void setPid(Integer pid) { this.pid = pid; }
     public Boolean getEnabled() { return enabled; }
     public void setEnabled(Boolean enabled) { this.enabled = enabled; }
+    public Boolean getAutoStart() { return autoStart; }
+    public void setAutoStart(Boolean autoStart) { this.autoStart = autoStart; }
     public String getCreatedAt() { return createdAt; }
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getType() { return type; }

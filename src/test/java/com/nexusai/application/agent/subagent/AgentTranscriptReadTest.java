@@ -234,7 +234,7 @@ class AgentTranscriptReadTest {
             .resolve("agent-roundtrip.meta.json");
         Files.createDirectories(p1.getParent());
         AgentTranscript.AgentMetadata withFields =
-            new AgentTranscript.AgentMetadata("fork", "/wt/path", "desc");
+            new AgentTranscript.AgentMetadata("fork", "/wt/path", "desc", "/work/dir");
         AgentTranscript.writeMetadata(tmpDir, "session-1", "roundtrip", withFields);
 
         Optional<AgentTranscript.AgentMetadata> readBack =
@@ -243,6 +243,7 @@ class AgentTranscriptReadTest {
         assertThat(readBack.get().agentType()).isEqualTo("fork");
         assertThat(readBack.get().worktreePath()).isEqualTo("/wt/path");
         assertThat(readBack.get().description()).isEqualTo("desc");
+        assertThat(readBack.get().cwd()).isEqualTo("/work/dir");
 
         // 旧 meta 残留 model 键 → 忽略（3 字段读回正常）
         Path p2 = tmpDir.resolve("session-1").resolve("subagents")

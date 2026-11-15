@@ -2,7 +2,7 @@ package com.nexusai.infra.llm;
 
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.tool.ToolUseBlock;
-import com.openai.models.ChatCompletionChunk;
+import com.openai.models.chat.completions.ChatCompletionChunk;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 

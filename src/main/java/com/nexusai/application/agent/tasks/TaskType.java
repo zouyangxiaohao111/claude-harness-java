@@ -25,6 +25,14 @@ public enum TaskType {
     IN_PROCESS_TEAMMATE("in_process_teammate", "t"),
     LOCAL_WORKFLOW("local_workflow", "w"),
     MONITOR_MCP("monitor_mcp", "m"),
+    /**
+     * Monitor 工具的命令 / WebSocket 任务（CC v2.1.325 的 kind=monitor）。
+     *
+     * <p>CC 把 monitor 存在 local_bash 的 {@code kind} 字段上；本仓 BackgroundTask 无 kind，
+     * 因此用独立 type 让任务面板能显示「监控」而不是「命令」。id 前缀 'o' 避开
+     * MONITOR_MCP 已占用的 'm'（前缀只影响 id 可读性，不影响行为）。
+     */
+    MONITOR("monitor", "o"),
     DREAM("dream", "d");
 
     private final String typeString;

@@ -6,6 +6,9 @@ import com.nexusai.domain.session.SessionService;
 import com.nexusai.repository.session.entity.SessionRecord;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
+
+import static org.assertj.core.api.Assertions.assertThat;
 
 import java.util.List;
 
@@ -94,5 +97,83 @@ class GoalCheckinSchedulerClearRaceTest {
 
         verify(queue).enqueue(any());
         verify(sessionService).setGoal(anyString(), any());
+    }
+
+    /** retry 已到期的目标行。 */
+    private static SessionRecord retryRow(long retryAt, int retryCount) {
+        SessionGoal g = new SessionGoal(
+            "e2e 全绿", SessionGoal.Phase.ACTIVE, 1,
+            System.currentTimeMillis(), 0L, null,
+            null, null, null, retryAt, retryCount);
+        SessionRecord rec = new SessionRecord();
+        rec.setId(SID);
+        rec.setGoal(SessionGoal.toJson(g));
+        return rec;
+    }
+
+    @Test
+    @DisplayName("评估器重试到期 ⇒ steering 必须带 workload（否则被当成用户 prompt 永不消费）")
+    void retrySteering_carriesWorkload() {
+        long retryAt = System.currentTimeMillis() - 1_000L;
+        SessionService sessionService = mock(SessionService.class);
+        NotificationQueue queue = mock(NotificationQueue.class);
+
+        when(sessionService.listSessionsWithGoal()).thenReturn(List.of(retryRow(retryAt, 1)));
+        // 重读：目标仍存活（stillLive 守卫放行）
+        when(sessionService.getGoal(SID)).thenReturn(new SessionGoal(
+            "e2e 全绿", SessionGoal.Phase.ACTIVE, 1,
+            System.currentTimeMillis(), 0L, null,
+            null, null, null, retryAt, 1));
+
+        GoalCheckinScheduler scheduler = new GoalCheckinScheduler(sessionService, queue, () -> 30);
+        scheduler.tick();
+
+        ArgumentCaptor<NotificationQueue.QueueItem> cap =
+            ArgumentCaptor.forClass(NotificationQueue.QueueItem.class);
+        verify(queue).enqueue(cap.capture());
+        assertThat(cap.getValue().workload())
+            .as("workload=null 会被 CronIdleExecutor 当成用户 prompt 永不打捞 ⇒ 重试卡死")
+            .isEqualTo(GoalCheckinScheduler.WORKLOAD_GOAL_STEERING);
+    }
+
+    private static NotificationQueue.QueueItem queuedSteering() {
+        return new NotificationQueue.QueueItem(
+            "steering", "prompt", null, null, null, true,
+            GoalCheckinScheduler.WORKLOAD_GOAL_STEERING, true, null, SID, null, null);
+    }
+
+    @Test
+    @DisplayName("队列已有同类 steering ⇒ 重试不重复注入，只重排 retryAt（对齐 CC hasQueued）")
+    void retryWithQueuedSteering_rearmsOnly() {
+        long retryAt = System.currentTimeMillis() - 1_000L;
+        SessionService sessionService = mock(SessionService.class);
+        NotificationQueue queue = mock(NotificationQueue.class);
+        when(sessionService.listSessionsWithGoal()).thenReturn(List.of(retryRow(retryAt, 1)));
+        when(sessionService.getGoal(SID)).thenReturn(new SessionGoal(
+            "e2e 全绿", SessionGoal.Phase.ACTIVE, 1,
+            System.currentTimeMillis(), 0L, null,
+            null, null, null, retryAt, 1));
+        when(queue.peek(any())).thenReturn(java.util.Optional.of(queuedSteering()));
+
+        new GoalCheckinScheduler(sessionService, queue, () -> 30).tick();
+
+        verify(queue, never()).enqueue(any());
+        verify(sessionService).setGoal(anyString(), any());   // 只重排 retryAt，保证不丢
+    }
+
+    @Test
+    @DisplayName("队列已有同类 steering ⇒ check-in 本轮跳过（不注入、不推进计数）")
+    void checkinWithQueuedSteering_skipped() {
+        long deferredSince = System.currentTimeMillis() - 31 * 60_000L;
+        SessionService sessionService = mock(SessionService.class);
+        NotificationQueue queue = mock(NotificationQueue.class);
+        when(sessionService.listSessionsWithGoal()).thenReturn(List.of(deferredRow(deferredSince)));
+        when(sessionService.getGoal(SID)).thenReturn(liveGoal(deferredSince));
+        when(queue.peek(any())).thenReturn(java.util.Optional.of(queuedSteering()));
+
+        new GoalCheckinScheduler(sessionService, queue, () -> 30).tick();
+
+        verify(queue, never()).enqueue(any());
+        verify(sessionService, never()).setGoal(anyString(), any());
     }
 }

@@ -415,9 +415,11 @@ class ExecPromptHookSemanticsTest {
     }
 
     @Test
-    @DisplayName("父工具集透传 → chatWithOptions.tools 非空（CC :72 tools: toolUseContext.options.tools）")
-    void execPromptHook_chatWithOptions_carriesParentTools() {
-        // WHY: CC 把父 toolUseContext.options.tools 传给 queryModelWithoutStreaming, 让 LLM 评估时可感知工具集。
+    @DisplayName("CC prompt hook 是 tools:[] 一次性问答 → chatWithOptions.tools 为空")
+    void execPromptHook_chatWithOptions_hasNoTools() {
+        // WHY: CC v2.1.325 的 prompt hook 调用是 `tools: []`（off≈323,188,000）——
+        //   评估器没有 Read/Bash/Grep，只能基于 transcript 判定。携带父工具集会让模型
+        //   返回 tool_use 而不是 JSON，反而制造 evaluator error。
         AtomicReference<LlmProvider.ChatRequestOptions> capturedOptions = new AtomicReference<>();
         LlmProvider capturing = new LlmProvider() {
             @Override public String type() { return "test"; }
@@ -470,9 +472,9 @@ class ExecPromptHookSemanticsTest {
 
         assertThat(capturedOptions.get()).isNotNull();
         assertThat(capturedOptions.get().tools()).isNotNull();
-        assertThat(capturedOptions.get().tools().size()).isEqualTo(1);
-        assertThat(capturedOptions.get().tools().get(0).path("function").path("name").asText())
-            .isEqualTo("Read");
+        assertThat(capturedOptions.get().tools().size())
+            .as("prompt hook 不携带父工具集（CC tools:[]）")
+            .isZero();
     }
 
     // ════════════════════════════════════════════════════════════════════════

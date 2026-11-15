@@ -338,7 +338,7 @@ class AnthropicSdkProviderSystemBlocksTest {
     void openAiProvider_noCacheControl() throws Exception {
         // [OpenAI-SDK 迁移] 旧 OpenAiProvider.buildRequestBody 已删除 → 生产 SDK wire：
         //   OpenAiSdkProvider.buildRequestParams → _body() 序列化 JsonNode
-        com.openai.models.ChatCompletionCreateParams params = OpenAiSdkProvider.buildRequestParams(
+        com.openai.models.chat.completions.ChatCompletionCreateParams params = OpenAiSdkProvider.buildRequestParams(
             "gpt-test", "sys", List.of(userMessage("hello")), null,
             null, false, null, null, null);
         // [OpenAI-SDK] ChatCompletionCreateParams 直接序列化产出 {} → 断言 messages 通道（cache marker 所在通道）无 cache_control

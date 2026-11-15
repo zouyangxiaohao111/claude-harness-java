@@ -158,6 +158,19 @@ public class AgentState {
     private boolean needsFollowUp = false;
     private boolean cancelled = false;
     /**
+     * [agent-align 2026-11-15] 本 run 是否跳过 CLAUDE.md 注入。
+     *
+     * <p>来源：Agent 定义的 {@code omitClaudeMd}（CC loadAgentsDir.ts:132）——子代理
+     * 不该继承 user/project/local 的 CLAUDE.md，但 managed policy 仍保留。
+     */
+    private boolean omitClaudeMd = false;
+    /**
+     * [agent-align 2026-11-15] Agent 定义的 {@code autoCompactWindow}（token 数）。
+     *
+     * <p>只收窄本 run 的 compact 窗口，不影响主会话/其他子代理；null = 不覆盖。
+     */
+    private Integer autoCompactWindow;
+    /**
      * [R28] 当前 run() 的 AbortController · LlmAgentLoop.run() 构造 runAbortController 后 attach。
      * 对齐 CC REPL.tsx abortController 持有者 —— cancelSession 经 {@link #abortStream(String)}
      * abort() 硬中断在飞 LLM 流（provider chunk 边界检查立即停止，对齐 CC abort('user-cancel')）。
@@ -1496,6 +1509,18 @@ public class AgentState {
     }
 
     /** [D4] 设置会话级 agent 颜色（/color 命令 setAppStateColor 写侧）。 */
+    /** [agent-align] 设置本 run 是否跳过 CLAUDE.md（Agent 定义的 omitClaudeMd）。 */
+    public void setOmitClaudeMd(boolean omitClaudeMd) { this.omitClaudeMd = omitClaudeMd; }
+
+    /** [agent-align] 本 run 是否跳过 CLAUDE.md。 */
+    public boolean isOmitClaudeMd() { return omitClaudeMd; }
+
+    /** [agent-align] Agent 级 compact 窗口（null = 不覆盖）。 */
+    public void setAutoCompactWindow(Integer autoCompactWindow) { this.autoCompactWindow = autoCompactWindow; }
+
+    /** [agent-align] Agent 级 compact 窗口（null = 不覆盖）。 */
+    public Integer getAutoCompactWindow() { return autoCompactWindow; }
+
     public void setColor(String color) {
         this.color = color;
     }

@@ -14,7 +14,7 @@
 
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
-    <version>0.1.79</version>
+    <version>0.1.80</version>
     <name>nexusai-backend</name>
     <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 
@@ -32,7 +32,7 @@
         <flyway-sqlite.version>10.20.1</flyway-sqlite.version>
         <springdoc.version>2.7.0</springdoc.version>
         <native-maven-plugin.version>0.10.2</native-maven-plugin.version>
-        <openai-java.version>0.25.0</openai-java.version>
+        <openai-java.version>4.101.0</openai-java.version>
         <!-- [DEC-RV-07] Anthropic 官方 Java SDK · 对齐 CC @anthropic-ai/sdk
              (Open-ClaudeCode/src/services/api/client.ts:1). 与 openai-java 同 Stainless 生成族. -->
         <anthropic-java.version>2.53.0</anthropic-java.version>

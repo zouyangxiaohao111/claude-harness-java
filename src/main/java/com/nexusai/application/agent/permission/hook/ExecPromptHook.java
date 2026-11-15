@@ -595,7 +595,11 @@ public class ExecPromptHook {
         return new LlmProvider.ChatRequestOptions(
             // [H2/CCJ-EXEC-01] history = CC messages 参数（可 null/空 = 仅 userMessage，CC :46-48）
             messages != null ? messages : List.of(),
-            toOpenAiToolsArray(tools),
+            // [goal-align 2026-11-14] 空工具集 · 对齐 CC v2.1.325 prompt hook：
+            //   `tools: []`（off≈323,188,000）。评估器是**一次性问答**，没有 Read/Bash/Grep，
+            //   不会读文件；带工具反而可能让模型返回 tool_use → JSON 解析失败。
+            //   agent 型 hook（ExecAgentHook）才有工具集，两者不要混。
+            objectMapper.createArrayNode(),
             LlmProvider.ChatRequestOptions.OutputFormat.jsonSchema(schema),
             thinkingConfig,
             null,   // [P2-16] temperature — CC execPromptHook.ts 未设 temperatureOverride (claude.ts:1693-1694 缺省 1)

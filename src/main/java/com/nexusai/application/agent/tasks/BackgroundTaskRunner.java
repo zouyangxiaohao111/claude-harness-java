@@ -39,6 +39,15 @@ public class BackgroundTaskRunner {
     /** s13-p2: 保存 LocalBashTaskRunner 引用 — 供 cancel() 时 destroyForcibly */
     private final ConcurrentMap<String, LocalBashTaskRunner> runnerMap = new ConcurrentHashMap<>();
     /**
+     * 外部执行器的停止钩子 · taskId → stop action。
+     *
+     * <p><b>WHY</b>：Monitor 的命令模式与 WebSocket 模式由
+     * {@link MonitorTaskRunner} 自己持有进程/连接（不是 {@link LocalBashTaskRunner}），
+     * 但任务仍要能被 TaskStop 停掉。stopTask 命中 LOCAL_BASH 时优先调用这里的钩子，
+     * 再回落到 spawn 路径的 cancel()。
+     */
+    private final ConcurrentMap<String, Runnable> externalStoppers = new ConcurrentHashMap<>();
+    /**
      * G1-2: 前台 → 后台任务的 StallWatchdog 注册表 · 对齐 CC backgroundExistingForegroundTask 的
      * {@code cancelStallWatchdog}（LocalShellTask.tsx:442/:446）。前台任务转后台时启动 watchdog，
      * 完成 watcher 在进程结束后 {@code stop()} 并移除 — 防 leak（CC cleanup）。
@@ -50,6 +59,17 @@ public class BackgroundTaskRunner {
      * killAsyncAgent 经 {@code abort()} 直接中断 worker 查询循环（对齐 CC LocalAgentTask.tsx:288）。
      */
     private final ConcurrentMap<String, AbortController> taskAbortControllers = new ConcurrentHashMap<>();
+    /**
+     * CC {@code stopPendingAgentIds} 等价物（claude.exe agentProcessRegistry: {@code I6e}/{@code Hmo}/{@code Gq}）：
+     * stop 请求已登记、但 worker 尚未退出。
+     *
+     * <p><b>WHY</b>：{@link #killAsyncAgent} 立即把任务置 KILLED 并 abort，但 worker 线程真正退出
+     * 有一个窗口。该窗口内 resume 会起第二个 worker（同一 transcript 双写、结果交错）。CC 在
+     * resume 前用 {@code Gq(agentId)} 检查本集合，命中即拒绝并提示「still stopping」。
+     *
+     * <p><b>生命周期</b>：kill 时加入；worker 线程 finally 经 {@link #clearStopPending} 移除。
+     */
+    private final java.util.Set<String> stopPendingAgentIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
     private final NotificationQueue notificationQueue;
     private final TaskFrameworkService frameworkService;
     /** SDK 事件队列（可为 null —— 测试直构无 bean 时不发 SDK 事件）· OPD-TS-22 task_notification 通道 */
@@ -419,6 +439,43 @@ public class BackgroundTaskRunner {
         } catch (IOException e) {
             log.warn("BackgroundTaskRunner: failed to read output for task {}: {}", taskId, e.getMessage());
             return "Failed to read output for task: " + taskId;
+        }
+    }
+
+    /**
+     * 登记一个「外部执行器持有资源」的任务（Monitor 命令 / WebSocket 模式）。
+     *
+     * <p>任务同时进入本地 {@code tasks}（TaskStop 的 validateInput 依赖它查得到）与
+     * framework 统一 store（前端任务面板可见）。停止动作由调用方提供的 {@code stopper}
+     * 负责（杀进程 / 关连接），{@link #stopTask} 优先调用它。
+     *
+     * @param task    任务快照（type=LOCAL_BASH，status=RUNNING）
+     * @param stopper 停止动作（可 null = 不可停）
+     */
+    public void registerExternalTask(BackgroundTask task, Runnable stopper) {
+        if (task == null || task.id() == null || task.id().isBlank()) {
+            throw new IllegalArgumentException("registerExternalTask 需要非空 task.id");
+        }
+        tasks.put(task.id(), task);
+        if (stopper != null) {
+            externalStoppers.put(task.id(), stopper);
+        }
+        frameworkService.registerTask(task);
+        log.info("BackgroundTaskRunner: external task {} registered (type={}, stopper={})",
+            task.id(), task.type().getTypeString(), stopper != null);
+    }
+
+    /** 外部任务结束/被停止后摘除停止钩子（任务快照保留，供 TaskOutput 读取）。 */
+    public void unregisterExternalTask(String taskId) {
+        if (taskId != null) {
+            externalStoppers.remove(taskId);
+        }
+    }
+
+    /** 外部任务资源就绪后补登停止钩子（不重复 registerTask / SDK task_started）。 */
+    public void setExternalStopper(String taskId, Runnable stopper) {
+        if (taskId != null && stopper != null) {
+            externalStoppers.put(taskId, stopper);
         }
     }
 
@@ -1245,6 +1302,33 @@ public class BackgroundTaskRunner {
     }
 
     /**
+     * 该 task（taskId === agentId）是否「已请求停止、但 worker 尚未退出」。
+     *
+     * <p>对齐 CC {@code Gq()}（claude.exe agentProcessRegistry: {@code stopPendingAgentIds.has(id)}）：
+     * resume 入口据此拒绝并提示等待，避免与正在退出的旧 worker 并发。
+     */
+    public boolean isStopPending(String taskId) {
+        return taskId != null && stopPendingAgentIds.contains(taskId);
+    }
+
+    /**
+     * worker 线程退出后清理 stop-pending 标记（幂等）。
+     *
+     * <p>由 worker 的 {@code finally} 调用（spawn / resume 两条 worker 都要调）——否则标记永久残留，
+     * 该 agent 之后所有 resume 都被误判为「still stopping」。
+     */
+    public void clearStopPending(String taskId) {
+        if (taskId != null) {
+            stopPendingAgentIds.remove(taskId);
+        }
+    }
+
+    /** 按 taskId 查任务（taskId === agentId）；不存在 → null。 */
+    public BackgroundTask getTaskById(String taskId) {
+        return taskId != null ? tasks.get(taskId) : null;
+    }
+
+    /**
      * Phase 3: 杀死 async agent task（携带部分结果）· 对齐 CC runAsyncAgentLifecycle AbortError
      * 路径 (agentToolUtils.ts:640-668 killAsyncAgent + extractPartialResult).
      *
@@ -1278,6 +1362,9 @@ public class BackgroundTaskRunner {
             }
             return false;
         }
+        // 对齐 CC bqe(): kill 发起即登记 stop-pending（此刻 worker 可能还没退出）→ resume 在此之前
+        // 出现时按「still stopping」拒绝，而不是并发起第二个 worker。
+        stopPendingAgentIds.add(taskId);
         BackgroundTask killed = current
             .withStatus(BackgroundTaskStatus.KILLED)
             .withEndTime(System.currentTimeMillis())
@@ -1603,13 +1690,41 @@ public class BackgroundTaskRunner {
             return new StopTaskResult(taskId, taskType, command, StopTaskErrorCode.NOT_RUNNING);
         }
         if (LocalShellTaskGuards.isLocalShellTask(task)) {
-            // CC stopTask.ts:65 LocalShellTask.kill → killTask（killShellTasks.ts:16-46）
-            // cancel() 内置：killProcess 杀子进程 + KILLED + notified=true + emitTerminatedSdk('stopped')
-            boolean cancelled = cancel(taskId);
-            log.info("BackgroundTaskRunner.stopTask: bash task {} cancelled={} (killProcess)", taskId, cancelled);
+            // 外部执行器（Monitor 命令/ws）自己持有进程或连接 → 先走它登记的 stopping 钩子。
+            // markKilled 已闭环 KILLED + notified + SDK 'stopped'，与 cancel() 的终态语义一致。
+            Runnable externalStopper = externalStoppers.remove(taskId);
+            if (externalStopper != null) {
+                try {
+                    externalStopper.run();
+                } catch (Exception e) {
+                    log.warn("BackgroundTaskRunner.stopTask: external stopper for {} threw: {}", taskId, e.toString());
+                }
+                markKilled(taskId);
+                log.info("BackgroundTaskRunner.stopTask: external bash task {} stopped (monitor stopper)", taskId);
+            } else {
+                // CC stopTask.ts:65 LocalShellTask.kill → killTask（killShellTasks.ts:16-46）
+                // cancel() 内置：killProcess 杀子进程 + KILLED + notified=true + emitTerminatedSdk('stopped')
+                boolean cancelled = cancel(taskId);
+                log.info("BackgroundTaskRunner.stopTask: bash task {} cancelled={} (killProcess)", taskId, cancelled);
+            }
+        } else if (task.type() == TaskType.MONITOR) {
+            // Monitor 工具的命令/ws 任务：进程/连接由 MonitorTaskRunner 持有 → 走外部 stopper。
+            Runnable monitorStopper = externalStoppers.remove(taskId);
+            if (monitorStopper != null) {
+                try {
+                    monitorStopper.run();
+                } catch (Exception e) {
+                    log.warn("BackgroundTaskRunner.stopTask: monitor stopper for {} threw: {}", taskId, e.toString());
+                }
+            }
+            markKilled(taskId);
+            log.info("BackgroundTaskRunner.stopTask: monitor task {} stopped", taskId);
         } else if (task.type() == TaskType.LOCAL_AGENT) {
             // CC stopTask.ts:65 LocalAgentTask.kill → killAsyncAgent（LocalAgentTask.tsx:281-303）
             boolean killed = killAsyncAgent(taskId, null);
+            if (killed) {
+                markAsyncAgentStoppedByUser(task);
+            }
             log.info("BackgroundTaskRunner.stopTask: local_agent task {} killed={} (killAsyncAgent)", taskId, killed);
         } else if (task.type() == TaskType.DREAM) {
             // OPD-TP-09: DreamTask.kill（DreamTask.ts:132-156）—— 防御分支（dream 任务通常不在
@@ -1930,9 +2045,34 @@ public class BackgroundTaskRunner {
             return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command,
                 StopTaskErrorCode.NOT_RUNNING);
         }
+        markAsyncAgentStoppedByUser(task);
         log.info("BackgroundTaskRunner.stopTask: local_agent task {} killed (killAsyncAgent, 统一 store 回退)",
             taskId);
         return new StopTaskResult(taskId, TaskType.LOCAL_AGENT.getTypeString(), command, null);
+    }
+
+    /**
+     * 用户显式停止 local_agent 时落「stopped-by-user」伴生标记 · 对齐 CC agent-stop sidecar
+     * （{@code c4o.stoppedByUser = ".stopped-by-user"}）。
+     *
+     * <p><b>只在 TaskStop 路径调用</b>：系统侧 kill（会话结束、父 abort、团队解散）不写，
+     * 否则模型之后的自动 resume 会被误拦。resume 侧读该标记的语义见
+     * {@code ResumeService} 的 stoppedByUser 门。
+     */
+    private void markAsyncAgentStoppedByUser(BackgroundTask task) {
+        if (task == null || task.sessionId() == null || task.agentId() == null) {
+            return;
+        }
+        try {
+            java.nio.file.Path sessionDir = com.nexusai.application.agent.tool.SessionStorage
+                .sessionProjectDir(task.sessionId());
+            String agentIdHex = com.nexusai.application.agent.subagent.AgentContext
+                .unpackAgentId(task.agentId());
+            com.nexusai.application.agent.subagent.AgentTranscript
+                .markStoppedByUser(sessionDir, task.sessionId(), agentIdHex);
+        } catch (Exception e) {
+            log.warn("BackgroundTaskRunner: 写 stopped-by-user 标记失败 task={}: {}", task.id(), e.toString());
+        }
     }
 
     /**

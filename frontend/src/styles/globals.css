@@ -18402,3 +18402,41 @@ html {
 @media (hover: none) {
   .msg-turn-actions { opacity: 1; pointer-events: auto; }
 }
+
+/* [monitor-cc] 监控任务：左侧细色条 + 专属圆点，任务列表里一眼区分「监控」与普通命令 */
+.todo-row.monitor { position: relative; }
+.todo-row.monitor::before {
+  content: "";
+  position: absolute;
+  left: 0;
+  top: 7px;
+  bottom: 7px;
+  width: 2px;
+  border-radius: 2px;
+  background: #6c8cff;
+  opacity: 0.8;
+}
+.todo-row.monitor .todo-row-dot.in_progress {
+  background: #6c8cff;
+  box-shadow: 0 0 0 3px rgba(108, 140, 255, 0.18);
+}
+.todo-row.monitor .todo-row-sub { color: #6c8cff; }
+.td-monitor-hint .td-val { line-height: 1.6; color: var(--text-secondary, #5b6068); }
+
+/* [monitor-cc] 「正在监听」胶囊：蓝色系，与子代理胶囊并排；无运行中的监控时组件返回 null */
+.monitor-running-hint {
+  max-width: min(52ch, 60vw);
+  border-color: #9db3ff; background: #eef2ff; color: #3b4fa8;
+  animation: mrhBreath 1.8s ease-in-out infinite;
+}
+.monitor-running-hint:hover { filter: saturate(1.12); }
+.monitor-running-hint .srh-dot.monitor { background: #6c8cff; animation: srhDot 1.8s ease-in-out infinite; }
+.monitor-running-hint .srh-count { background: rgba(108, 140, 255, 0.18); color: #33459b; }
+.monitor-running-hint .srh-arrow { color: #7e93e8; }
+.monitor-running-hint .mrh-label {
+  max-width: 34ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+@keyframes mrhBreath {
+  0%, 100% { background: #eef2ff; border-color: #9db3ff; box-shadow: 0 0 0 0 rgba(108, 140, 255, 0.30); }
+  50% { background: #dce4ff; border-color: #6c8cff; box-shadow: 0 0 0 7px rgba(108, 140, 255, 0); }
+}

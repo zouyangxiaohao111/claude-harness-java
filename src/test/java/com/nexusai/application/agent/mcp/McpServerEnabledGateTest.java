@@ -48,6 +48,12 @@ class McpServerEnabledGateTest {
     private static McpServerService service;
     /** 工具池 mock（assembleToolPool 调用计数用于断言「不重复 start」幂等）。 */
     private static McpToolPool pool;
+    /**
+     * [V295] 运行时连接态模拟：status 不再来自 DB，而是 isServerConnected。
+     * assembleToolPool（start 路径）→ true；teardown（stop 路径）→ false。
+     */
+    private static final java.util.concurrent.atomic.AtomicBoolean CONNECTED =
+        new java.util.concurrent.atomic.AtomicBoolean(false);
 
     @BeforeAll
     static void setUpDatabase() throws Exception {
@@ -77,7 +83,12 @@ class McpServerEnabledGateTest {
             Mockito.mock(McpTransportFactory.class));
         pool = Mockito.mock(McpToolPool.class);
         Mockito.when(pool.assembleToolPool(Mockito.anyString(), Mockito.any(), Mockito.any()))
-            .thenReturn(List.of());
+            .thenAnswer(inv -> { CONNECTED.set(true); return List.of(); });
+        Mockito.when(pool.isServerConnected(Mockito.anyString()))
+            .thenAnswer(inv -> CONNECTED.get());
+        Mockito.when(pool.isConnecting(Mockito.anyString())).thenReturn(false);
+        Mockito.doAnswer(inv -> { CONNECTED.set(false); return null; })
+            .when(pool).teardown(Mockito.anyString());
         Mockito.when(pool.fetchMcpSkills(Mockito.anyString())).thenReturn(List.of());
         ReflectionTestUtils.setField(service, "mcpToolPool", pool);
         // [impl-I-3 rework #2] start() 内 channelNotificationGate.setAllowedChannelsSupplier
@@ -94,6 +105,7 @@ class McpServerEnabledGateTest {
 
     @BeforeEach
     void clean() {
+        CONNECTED.set(false);
         for (McpServerRecord r : mapper.selectAll()) {
             mapper.deleteById(r.getId());
         }

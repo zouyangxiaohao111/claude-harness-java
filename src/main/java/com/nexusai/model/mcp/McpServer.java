@@ -12,10 +12,14 @@ public class McpServer {
     private String command;
     private String args;            // JSON array
     private String env;             // JSON object
-    private String status;          // 'running'|'stopped'|'error'
     private String lastError;
     private Integer pid;
     private Boolean enabled;
+    /**
+     * [V295] 启动自启 · 本仓对 CC 的扩展层（CC 无独立字段，语义是「enabled 即启动即连」）。
+     * enabled=总开关（允许连接）；autoStart=应用启动时是否自动连。
+     */
+    private Boolean autoStart;
     private String createdAt;
     private String type;            // 'stdio'|'sse'|'sse-ide'|'ws-ide'|'http'|'ws'|'sdk'|'claudeai-proxy'
     private String approvalStatus;  // 'approved'|'rejected'|'pending'
@@ -31,14 +35,14 @@ public class McpServer {
     public void setArgs(String args) { this.args = args; }
     public String getEnv() { return env; }
     public void setEnv(String env) { this.env = env; }
-    public String getStatus() { return status; }
-    public void setStatus(String status) { this.status = status; }
     public String getLastError() { return lastError; }
     public void setLastError(String lastError) { this.lastError = lastError; }
     public Integer getPid() { return pid; }
     public void setPid(Integer pid) { this.pid = pid; }
     public Boolean getEnabled() { return enabled; }
     public void setEnabled(Boolean enabled) { this.enabled = enabled; }
+    public Boolean getAutoStart() { return autoStart; }
+    public void setAutoStart(Boolean autoStart) { this.autoStart = autoStart; }
     public String getCreatedAt() { return createdAt; }
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getType() { return type; }

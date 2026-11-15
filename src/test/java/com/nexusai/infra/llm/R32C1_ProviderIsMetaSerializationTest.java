@@ -241,7 +241,7 @@ class R32C1_ProviderIsMetaSerializationTest {
 
         // [OpenAI-SDK 迁移] 旧 OpenAiProvider.buildRequestBody 已删除 → 生产 SDK wire：
         //   OpenAiSdkProvider.buildSdkMessages → ObjectMappers 序列化（与 R32B9 同模式）
-        java.util.List<com.openai.models.ChatCompletionMessageParam> msgs =
+        java.util.List<com.openai.models.chat.completions.ChatCompletionMessageParam> msgs =
             OpenAiSdkProvider.buildSdkMessages(history);
         String body = com.openai.core.ObjectMappers.jsonMapper().writeValueAsString(msgs);
         JsonNode root = JSON.readTree(body);

@@ -2,6 +2,18 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.80] - 2026-11-15
+
+### Added
+
+- 新增 OpenAI Responses API provider（按 Responses API 形态发请求与解析用量）
+- MCP 服务器支持「启动自启」开关（可用但不自动连接）
+- MCP 运行时状态改为内存态五态（连接中 / 已连接 / 连接失败 / 需授权 / 已停用），不再落库 —— 消除「显示上个进程的运行中」假状态
+
+### Fixed
+
+- 修复 MCP 全局预取总闸只能改配置文件、不能在界面里开关的问题
+
 ## [0.1.79] - 2026-11-14
 
 ### Fixed

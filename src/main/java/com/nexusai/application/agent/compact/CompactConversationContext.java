@@ -65,6 +65,15 @@ public class CompactConversationContext {
     private String agentId;
     private String model;
     private String agentType;
+    /**
+     * [agent-align 2026-11-15] Agent 定义的 autoCompactWindow（token 数）。
+     *
+     * <p>语义对齐 CC：只**收窄**子代理继承的上下文窗口，不影响主会话；null = 不覆盖。
+     */
+    private Integer autoCompactWindowOverride;
+
+    public Integer getAutoCompactWindowOverride() { return autoCompactWindowOverride; }
+    public void setAutoCompactWindowOverride(Integer v) { this.autoCompactWindowOverride = v; }
     private String querySource = "compact";
     private Path workspaceDir;
     private SessionStorage.SessionMetadata sessionMetadata;

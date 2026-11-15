@@ -75,6 +75,20 @@ public class ResumeService {
 
     /** 异步续跑执行器（@Component bean，setter 注入；plain JUnit 直接 setter mock → 缺省 null fail loud）。 */
     private SubagentTool subagentTool;
+    /**
+     * 后台任务注册表 · resume 门禁的状态源（对齐 CC taskRegistry + stopPendingAgentIds）。
+     *
+     * <p>@Autowired(required=false)：plain JUnit 不注入 → 门 2/3 跳过（仍保留并发门 1）。
+     */
+    private com.nexusai.application.agent.tasks.BackgroundTaskRunner backgroundTaskRunner;
+    /**
+     * 并发 resume 集合 · 对齐 CC {@code Nn().resumesInFlight}（gt() 的 in-flight 门）。
+     *
+     * <p>只在 {@link #resumeAgentBackground} 的方法调用期间持有：进入即 add，finally remove。
+     * 之后「仍在跑」由任务表状态判定（门 3）。
+     */
+    private final java.util.Set<String> resumesInFlight =
+        java.util.concurrent.ConcurrentHashMap.newKeySet();
     /** 会话级主 AgentState 注册表 · fork resume 父 system prompt 来源（AgentState.systemPrompt()）。 */
     private SessionAgentStateRegistry sessionAgentStateRegistry;
 
@@ -111,6 +125,13 @@ public class ResumeService {
     @org.springframework.beans.factory.annotation.Autowired
     public void setSubagentTool(SubagentTool subagentTool) {
         this.subagentTool = subagentTool;
+    }
+
+    /** 后台任务注册表注入（resume 门 2/3 的状态源）；plain JUnit 不注入 → 跳过门 2/3。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setBackgroundTaskRunner(
+            com.nexusai.application.agent.tasks.BackgroundTaskRunner backgroundTaskRunner) {
+        this.backgroundTaskRunner = backgroundTaskRunner;
     }
 
     @org.springframework.beans.factory.annotation.Autowired
@@ -154,7 +175,69 @@ public class ResumeService {
     public ResumeAgentResult resumeAgentBackground(UUID agentId, String prompt,
                                                    Path sessionDir, String sessionId,
                                                    ContentReplacementState parentContentReplacementState) {
+        // 5 参 = 用户显式 resume（REST /resume），不受 stoppedByUser 门限制。
+        return resumeAgentBackground(agentId, prompt, sessionDir, sessionId,
+            parentContentReplacementState, true);
+    }
+
+    /**
+     * 6 参重载 · {@code userInitiated} 区分「用户显式 resume」与「模型/系统自动 resume」。
+     *
+     * <p>对齐 CC resume 的 {@code J}（userInitiated）：agent 被用户显式停止后，只有用户本人
+     * 可以再把它恢复；模型经 SendMessage 自动 resume 会被 {@link ResumeErrorCode#AGENT_STOPPED_BY_USER}
+     * 拒绝（CC {@code AgentStoppedByUserError}）。
+     *
+     * @param userInitiated true = 用户显式发起（REST /resume）；false = 模型/系统自动发起
+     */
+    public ResumeAgentResult resumeAgentBackground(UUID agentId, String prompt,
+                                                   Path sessionDir, String sessionId,
+                                                   ContentReplacementState parentContentReplacementState,
+                                                   boolean userInitiated) {
         String agentIdStr = agentId.toString();
+        // ── 门 1：并发 resume（对齐 CC gt(): resumesInFlight 集合）──
+        //   同一 agent 的两次并发 resume 会起两个 worker 写同一 transcript。
+        if (!resumesInFlight.add(agentIdStr)) {
+            throw new ResumeErrorCode.ResumeException(
+                ResumeErrorCode.SUBAGENT_RESUME_ALREADY_RUNNING,
+                "Agent " + agentIdStr + " is already running or being resumed");
+        }
+        try {
+            // ── 门 2：still stopping（对齐 CC uo(): Gq(agentId) = stopPendingAgentIds.has(id)）──
+            //   killAsyncAgent 已置 KILLED 并 abort，但旧 worker 尚未退出；此时 resume 会与它并发。
+            if (backgroundTaskRunner != null) {
+                if (backgroundTaskRunner.isStopPending(agentIdStr)) {
+                    throw new ResumeErrorCode.ResumeException(
+                        ResumeErrorCode.SUBAGENT_RESUME_STILL_STOPPING,
+                        "Agent " + agentIdStr + " is still stopping \u2014 its previous run was stopped "
+                            + "but has not exited. Re-run TaskStop on it or wait for it to exit "
+                            + "before resuming.");
+                }
+                // ── 门 3：仍在运行（CC uo(): taskRegistry status 非终态 → already running）──
+                com.nexusai.application.agent.tasks.BackgroundTask runningTask =
+                    backgroundTaskRunner.getTaskById(agentIdStr);
+                if (runningTask != null
+                        && runningTask.status()
+                            == com.nexusai.application.agent.tasks.BackgroundTaskStatus.RUNNING) {
+                    throw new ResumeErrorCode.ResumeException(
+                        ResumeErrorCode.SUBAGENT_RESUME_ALREADY_RUNNING,
+                        "Agent " + agentIdStr + " is already running or being resumed");
+                }
+            }
+            return doResumeAgentBackground(agentId, prompt, sessionDir, sessionId,
+                parentContentReplacementState, agentIdStr, userInitiated);
+        } finally {
+            resumesInFlight.remove(agentIdStr);
+        }
+    }
+
+    /**
+     * resume 主体（读 transcript → 过滤 → 重建 → 后台续跑）。门禁在
+     * {@link #resumeAgentBackground} —— 本方法假定三门已过。
+     */
+    private ResumeAgentResult doResumeAgentBackground(UUID agentId, String prompt,
+                                                      Path sessionDir, String sessionId,
+                                                      ContentReplacementState parentContentReplacementState,
+                                                      String agentIdStr, boolean userInitiated) {
         String sessionIdStr = sessionId;
         // [R3-WF-F IMP-SUB-12 返工] a+16hex transcript 键（D18/B2）：子代理域以
         //   AgentContext.createAgentId() 生成 a+16hex，经 S-12 pack 桥存 ToolUseContext.agentId(UUID)，
@@ -219,6 +302,15 @@ public class ResumeService {
                 parentContentReplacementState != null, resumedReplacementState != null);
         }
 
+        // ── 4.5 cwd 校验（对齐 CC uo(): Yt(s?.cwd) → subagent_resume_cwd_refused）──
+        //   记录里的目录已不可进入 → 拒绝恢复，而不是悄悄换到别的目录继续跑。
+        verifyMetadataCwd(meta);
+
+        // ── 4.6 stoppedByUser 门（对齐 CC uo(): (s?.stoppedByUser || 伴生标记) && !J）──
+        //   用户显式停止过的 agent，只有用户本人可以恢复；模型自动 resume 一律拒绝。
+        //   observer-activity 在 CC 是例外，本仓 observer 走 executeResumeAsync 不经此方法 ⇒ 天然例外。
+        verifyNotStoppedByUser(sessionDir, sessionIdStr, agentIdHex, agentIdStr, userInitiated);
+
         // ── 5. worktree stat 校验 + 父 cwd 兜底 + utimes（CC :82-97）──
         String resumedWorktreePath = resolveWorktreePath(meta);
 
@@ -238,8 +330,10 @@ public class ResumeService {
             forkParentSystemPrompt = resolveForkParentSystemPrompt(sessionId);
             if (forkParentSystemPrompt == null || forkParentSystemPrompt.isBlank()) {
                 log.warn("[ResumeService] fork resume 无法重建父 system prompt, 抛错: agentId={}", agentIdStr);
-                throw new IllegalArgumentException(
-                    "Cannot resume fork agent: unable to reconstruct parent system prompt");
+                throw new ResumeErrorCode.ResumeException(
+                    ResumeErrorCode.SUBAGENT_RESUME_FORK_DROPPED,
+                    "Cannot resume this fork agent: unable to reconstruct its parent system prompt."
+                        + ResumeErrorCode.START_NEW_AGENT_SUFFIX);
             }
         }
 
@@ -262,6 +356,11 @@ public class ResumeService {
             forkParentSystemPrompt, resumedMessages, resumedWorktreePath, resumedReplacementState,
             sessionId);
 
+        // resume 已启动 → 清「被用户停止」标记（对齐 CC eKt(): 恢复成功后删伴生文件，
+        // 否则该 agent 之后的任何自动 resume 都会被同一个标记拦住）。
+        AgentTranscript.clearStoppedByUser(sessionDir, sessionIdStr, agentIdHex);
+        AgentTranscript.clearStoppedByUser(sessionDir, sessionIdStr, agentIdStr);
+
         // ── 9. 返回（CC :260-264）──
         // [R-A45 B-4 D18/B2] agentId 返回 a+16hex（前端入参同形制）：CC resumeAgent.ts:261
         //   {@code agentId} 即原 a+16hex string。前端以返回的 a+16hex 再入二次 resume →
@@ -279,6 +378,63 @@ public class ResumeService {
     // ────────────────────────────────────────────────────────────────────────
     // 子步骤（对齐 CC resumeAgent.ts 对应函数）
     // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * stoppedByUser 门 · 对齐 CC {@code uo()} 的
+     * {@code (s?.stoppedByUser || 伴生标记) && y?.kind !== "observer-activity"} → {@code !J} 抛错。
+     *
+     * <p>用户显式发起（{@code userInitiated=true}）一律放行；自动 resume 命中标记 → 拒绝，
+     * 文案逐字取 CC {@code jgr()}（{@code AgentStoppedByUserError}）。
+     */
+    static void verifyNotStoppedByUser(Path sessionDir, String sessionId,
+                                       String agentIdHex, String agentIdStr, boolean userInitiated) {
+        if (userInitiated) {
+            return;
+        }
+        if (!isStoppedByUser(sessionDir, sessionId, agentIdHex, agentIdStr)) {
+            return;
+        }
+        throw new ResumeErrorCode.ResumeException(
+            ResumeErrorCode.AGENT_STOPPED_BY_USER,
+            "Agent " + agentIdStr + " was stopped and won't be resumed. "
+                + "Treat its work as cancelled; only launch a new agent if the user explicitly asks.");
+    }
+
+    /** stopped-by-user 标记双键查找（a+16hex 新格式优先，UUID 旧格式兜底）。 */
+    static boolean isStoppedByUser(Path sessionDir, String sessionId,
+                                   String agentIdHex, String agentIdStr) {
+        return AgentTranscript.isStoppedByUser(sessionDir, sessionId, agentIdHex)
+            || AgentTranscript.isStoppedByUser(sessionDir, sessionId, agentIdStr);
+    }
+
+    /**
+     * cwd 校验 · 对齐 CC resume 的 {@code Yt(s?.cwd)} 分支。
+     *
+     * <p>判据：meta 记录了 cwd，且该目录<b>不是可进入的目录</b>（不存在 / 是文件 / 不可访问）
+     * → {@code subagent_resume_cwd_refused}，文案逐字取 CC：
+     * {@code Cannot resume this agent in the directory its record names: <cwd>. Start a new agent instead.}
+     *
+     * <p>meta 无 cwd（旧文件 / 外部运行时未传）→ 不阻断，resume 走当前项目目录（CC 对未记录 cwd
+     * 的旧记录同样回退到当前会话 cwd）。
+     */
+    static void verifyMetadataCwd(AgentTranscript.AgentMetadata meta) {
+        if (meta == null || meta.cwd() == null || meta.cwd().isBlank()) {
+            return;
+        }
+        boolean usable;
+        try {
+            usable = Files.isDirectory(Paths.get(meta.cwd()));
+        } catch (Exception e) {
+            // InvalidPathException / 安全异常：记录里的路径无法评价 ⇒ 与「不可进入」同处理
+            usable = false;
+        }
+        if (!usable) {
+            throw new ResumeErrorCode.ResumeException(
+                ResumeErrorCode.SUBAGENT_RESUME_CWD_REFUSED,
+                "Cannot resume this agent in the directory its record names: " + meta.cwd()
+                    + ". Start a new agent instead.");
+        }
+    }
 
     /**
      * worktree stat 校验 + 父 cwd 兜底 + utimes · 对齐 CC resumeAgent.ts:82-97。
@@ -599,6 +755,27 @@ public class ResumeService {
      *                  项目 / <b>无法判定</b>（回源器未接线、抛错、违约返回 null）⇒ <b>fail-loud 抛</b>
      *                  （⛔ 不是「回落 user.dir 兜底层」）
      */
+    /**
+     * 解析 agentId 字符串为 resume 入参 UUID · 对齐 CC {@code asAgentId}（ids.ts:31-33）。
+     *
+     * <p>支持两种形态：{@code a+16hex}（现代 spawn 键）与 legacy UUID 字符串。
+     * 无法解析 → null（调用方按「不可 resume」处理，fail loud）。
+     */
+    public static java.util.UUID parseAgentIdString(String agentId) {
+        if (agentId == null || agentId.isBlank()) {
+            return null;
+        }
+        try {
+            return AgentContext.packAgentId(agentId.trim());
+        } catch (Exception ignored) {
+        }
+        try {
+            return java.util.UUID.fromString(agentId.trim());
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
     public static Path resolveSessionDir(String sessionId) {
         return com.nexusai.application.agent.tool.SessionStorage.sessionProjectDir(sessionId);
     }

@@ -596,6 +596,16 @@ public class AutoCompactor {
      */
     public boolean shouldAutoCompact(List<ChatMessageDto> messages, String model, String querySource,
                                      int snipTokensFreed) {
+        return shouldAutoCompact(messages, model, querySource, snipTokensFreed, null);
+    }
+
+    /**
+     * 判断是否应执行自动压缩（带 agent 级窗口覆盖）· 供 {@code autoCompactWindow} 使用。
+     *
+     * @param contextWindowOverride agent 级窗口上限（已由调用方取 min；null = 不覆盖）
+     */
+    public boolean shouldAutoCompact(List<ChatMessageDto> messages, String model, String querySource,
+                                     int snipTokensFreed, Integer contextWindowOverride) {
         // ── 递归守卫（INV-6，autoCompact.ts:169-183）──
         // IMP2-01（S-3）：判定入口 canonical 归一——生产传 name() 大写枚举名
         // （SESSION_MEMORY/COMPACT/MARBLE_ORIGAMI）先归一 CC 小写值域再比较；
@@ -682,7 +692,7 @@ public class AutoCompactor {
         // percentLeft/warning/error/blocking 一并计算——CC TokenWarning.tsx 消费 warning/error
         // 作 UI 展示（Java 端数据流日志承载，供后续通知/前端接线）。
         CompactThresholdSystem.TokenWarningState warningState =
-            thresholdSystem.calculateTokenWarningState(tokenCount, model, true);
+            thresholdSystem.calculateTokenWarningState(tokenCount, model, true, contextWindowOverride);
 
         if (log.isDebugEnabled()) {
             log.debug("[AutoCompactor] tokens={} snipFreed={} model={} querySource={} 四态: percentLeft={} "
@@ -836,7 +846,8 @@ public class AutoCompactor {
 
         // ── 3. shouldAutoCompact（递归守卫 + DISABLE env + 阈值 − snipTokensFreed，autoCompact.ts:268-277）──
         // INV-9: tokenCount = count(messages) − snipTokensFreed（autoCompact.ts:225）
-        if (!shouldAutoCompact(messages, model, querySource, snipTokensFreed)) {
+        Integer windowOverride = ccContext != null ? ccContext.getAutoCompactWindowOverride() : null;
+        if (!shouldAutoCompact(messages, model, querySource, snipTokensFreed, windowOverride)) {
             if (log.isDebugEnabled()) {
                 log.debug("[AutoCompactor] 未达阈值（含 snipTokensFreed={} 减法），跳过自动压缩",
                     snipTokensFreed);
@@ -845,7 +856,7 @@ public class AutoCompactor {
         }
 
         int originalTokens = tokenCounter.count(messages);
-        int threshold = thresholdSystem.getAutoCompactThreshold(model);
+        int threshold = thresholdSystem.getAutoCompactThreshold(model, windowOverride);
         log.info("[AutoCompactor] autoCompactIfNeeded 开始: {} tokens, 阈值={}, querySource={}",
             originalTokens, threshold, querySource);
 

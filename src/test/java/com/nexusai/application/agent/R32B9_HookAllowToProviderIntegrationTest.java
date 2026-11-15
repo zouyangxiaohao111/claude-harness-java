@@ -123,7 +123,7 @@ class R32B9_HookAllowToProviderIntegrationTest {
     private static JsonNode invokeBuildRequestBodyOpenAi(List<ChatMessageDto> history) throws Exception {
         // [OpenAI-SDK 迁移] 旧 OpenAiProvider.buildRequestBody 已删除 → 生产 SDK wire：
         //   OpenAiSdkProvider.buildSdkMessages → ObjectMappers 序列化
-        java.util.List<com.openai.models.ChatCompletionMessageParam> msgs =
+        java.util.List<com.openai.models.chat.completions.ChatCompletionMessageParam> msgs =
             com.nexusai.infra.llm.OpenAiSdkProvider.buildSdkMessages(history);
         return JSON.readTree(com.openai.core.ObjectMappers.jsonMapper()
             .writeValueAsString(msgs));

@@ -209,6 +209,8 @@ interface ComposerProps {
    * 主会话里也能看到后台子代理还在跑，点击打开右栏「运行」tab。
    */
   subagentHint?: ReactNode
+  /** 「正在监听」胶囊（App 传 `<MonitorRunningHint />`）· 显示 Monitor 正在盯什么。 */
+  monitorHint?: ReactNode
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -345,7 +347,7 @@ const SUG_CARD: React.CSSProperties = {
   overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -1159,6 +1161,8 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
           )}
           {/* [subagent-hint] 子代理运行提示：紧挨 full 模式右侧（位置在视线区，不再放右缘操作组） */}
           {!minimalChrome && subagentHint}
+          {/* [monitor-cc] 「正在监听：…」：显示 Monitor 在盯什么，点开右栏运行 tab */}
+          {!minimalChrome && monitorHint}
           {/* 输入框上方右缘操作组（右对齐输入框右缘）：待回答提示 + 回到底部（离底时）+ 停止所有（运行中） */}
           <div className="composer-top-actions">
             {pendingHint}

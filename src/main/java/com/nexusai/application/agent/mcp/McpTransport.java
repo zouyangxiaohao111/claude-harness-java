@@ -60,6 +60,18 @@ public interface McpTransport {
     /** 当前状态. */
     State getState();
 
+    /**
+     * 子进程 PID（仅进程型 transport 有值）。
+     *
+     * <p>用途：① {@code mcp_servers.pid} 持久化（V295 后仍保留该列）供启动期僵尸清理
+     * 做「PID + 进程名」双重校验；② 运行时诊断。非进程型返回 null。
+     *
+     * @return 子进程 PID，或 null
+     */
+    default Long pid() {
+        return null;
+    }
+
     /** transport 生命周期状态. */
     enum State { NOT_CONNECTED, CONNECTED, CLOSED }
 

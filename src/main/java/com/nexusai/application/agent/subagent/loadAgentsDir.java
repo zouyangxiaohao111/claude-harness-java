@@ -580,6 +580,31 @@ public class loadAgentsDir {
             builder.mainModel(mm.trim());
         }
 
+        // [agent-align 2026-11-15] autoCompactWindow / observer / observerMessage
+        //   （CC frontmatter，off≈163,231,276）
+        Object acw = fm.get("autoCompactWindow");
+        if (acw instanceof Number acwNum) {
+            builder.autoCompactWindow(acwNum.intValue());
+        } else if (acw instanceof String acwStr && !acwStr.isBlank()) {
+            try {
+                builder.autoCompactWindow(Integer.parseInt(acwStr.trim()));
+            } catch (NumberFormatException e) {
+                log.warn("[loadAgentsDir] agent 文件 {} 非法 autoCompactWindow '{}'，已忽略", filePath, acwStr);
+            }
+        }
+        Object obs = fm.get("observer");
+        if (obs != null && !obs.toString().isBlank()) {
+            builder.observer(obs.toString().trim());
+        }
+        Object obsMsg = fm.get("observerMessage");
+        if (obsMsg != null && !obsMsg.toString().isBlank()) {
+            builder.observerMessage(obsMsg.toString());
+        }
+        Object obsSub = fm.get("observeSubagents");
+        if (obsSub != null) {
+            builder.observeSubagents(Boolean.TRUE.equals(obsSub) || "true".equals(obsSub));
+        }
+
         // background · CC :575 ('true'/true -> true, 其余忽略)
         Object bg = fm.get("background");
         if (Boolean.TRUE.equals(bg) || "true".equals(bg)) builder.background(true);

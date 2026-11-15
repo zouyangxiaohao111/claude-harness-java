@@ -32,18 +32,32 @@ public class McpStartupPrefetcher implements ApplicationRunner {
     private static final Logger log = LoggerFactory.getLogger(McpStartupPrefetcher.class);
 
     private final McpServerService mcpServerService;
-    private final boolean prefetchOnStartup;
+    /** [V295] 全局总闸真源 = settings 表；yml 仅作 DB 未配置时的兜底。 */
+    private final com.nexusai.domain.settings.SettingsService settingsService;
+    private final boolean prefetchOnStartupYmlDefault;
 
+    @org.springframework.beans.factory.annotation.Autowired
     public McpStartupPrefetcher(McpServerService mcpServerService,
-                                @Value("${nexusai.mcp.prefetch-on-startup:true}") boolean prefetchOnStartup) {
+                                com.nexusai.domain.settings.SettingsService settingsService,
+                                @Value("${nexusai.mcp.prefetch-on-startup:true}") boolean prefetchOnStartupYmlDefault) {
         this.mcpServerService = mcpServerService;
-        this.prefetchOnStartup = prefetchOnStartup;
+        this.settingsService = settingsService;
+        this.prefetchOnStartupYmlDefault = prefetchOnStartupYmlDefault;
+    }
+
+    /** 测试/老装配兼容（无 settings 服务 → 只看 yml 值）。 */
+    public McpStartupPrefetcher(McpServerService mcpServerService, boolean prefetchOnStartupYmlDefault) {
+        this(mcpServerService, null, prefetchOnStartupYmlDefault);
     }
 
     @Override
     public void run(ApplicationArguments args) {
+        // [V295] 配置全部入 SQL：settings.mcp_prefetch_on_startup 优先，yml 兜底
+        Boolean dbValue = settingsService != null ? settingsService.readMcpPrefetchOnStartup() : null;
+        boolean prefetchOnStartup = dbValue != null ? dbValue : prefetchOnStartupYmlDefault;
         if (!prefetchOnStartup) {
-            log.info("[McpStartupPrefetcher] 启动预取关闭（nexusai.mcp.prefetch-on-startup=false），跳过");
+            log.info("[McpStartupPrefetcher] 启动预取关闭（source={} enabled=false），跳过",
+                dbValue != null ? "db" : "yml");
             return;
         }
         // 异步预取：不阻塞启动（CC prefetchAllMcpResources 异步 pendingCount）

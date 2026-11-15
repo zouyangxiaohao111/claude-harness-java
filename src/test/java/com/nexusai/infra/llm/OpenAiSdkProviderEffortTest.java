@@ -6,8 +6,8 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.infra.properties.NexusProperties;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
-import com.openai.models.ChatCompletionCreateParams;
-import com.openai.models.ChatCompletionReasoningEffort;
+import com.openai.models.chat.completions.ChatCompletionCreateParams;
+import com.openai.models.ReasoningEffort;
 import com.sun.net.httpserver.HttpServer;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -241,7 +241,7 @@ class OpenAiSdkProviderEffortTest {
     /** reasoning_effort 注入值（SDK params.getter）· ChatCompletionCreateParams 直接序列化产出 {} → 不走 wire。 */
     private static Optional<String> reasoningEffortWire(String model, String effortValue) throws Exception {
         return buildParams(model, effortValue).reasoningEffort()
-            .map(ChatCompletionReasoningEffort::asString);
+            .map(ReasoningEffort::asString);
     }
 
     /** new OpenAiSdkProvider() + 反射注入 NexusProperties（stream 解析 reasoning 字段依赖 properties）. */

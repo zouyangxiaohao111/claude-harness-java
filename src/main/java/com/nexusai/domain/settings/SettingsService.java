@@ -665,6 +665,33 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [V295] 读 MCP 启动预取全局总闸。
+     *
+     * @return DB 值；null = 从未配置 → 调用方回落 yml {@code nexusai.mcp.prefetch-on-startup}
+     */
+    public Boolean readMcpPrefetchOnStartup() {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        return s == null ? null : s.getMcpPrefetchOnStartup();
+    }
+
+    /**
+     * [V295] 写 MCP 启动预取全局总闸（下一次应用启动生效；运行中的进程不重连）。
+     *
+     * @param enabled true = 启动时自动连接 auto_start 的 server
+     */
+    public void updateMcpPrefetchOnStartup(boolean enabled) {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) {
+            throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
+        }
+        s.setMcpPrefetchOnStartup(enabled);
+        settingsMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] MCP 启动预取总闸已落库: {}", enabled);
+        }
+    }
+
     // ══════════════ 知识库域配置：已全部迁出 → KbConfigService ══════════════
     //
     // ⭐ 用户 2026-11-05 最终裁定：「8 个 kb_* 字段全部搬到 kb_config，settings 一个不留」。

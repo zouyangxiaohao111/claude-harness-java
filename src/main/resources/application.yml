@@ -617,9 +617,9 @@ nexusai:
       list-enabled: false
 
     # [impl-I-4 T3] 启动异步预取 enabled MCP servers · CC original: main.tsx bootstrap 启动即预取
-    # (prefetchAllMcpResources client.ts:2408-2473)。默认 true（对齐 CC 启动即预取）；
-    # false → 维持 REST 手动 start。
-    prefetch-on-startup: false
+    # (prefetchAllMcpResources client.ts:2408-2473)。默认 true（对齐 CC 启动即预取）。
+    # [V295] 真源已迁到 settings.mcp_prefetch_on_startup（DB 优先）；本键仅作 DB 未配置时的兜底。
+    prefetch-on-startup: true
 
     # [RES-07d] official MCP registry 启动 prefetch · CC original: CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC
     # 门控 + main.tsx:418 prefetchOfficialMcpUrls（officialRegistry.ts:33-60）。默认 true（对齐 CC 启动即

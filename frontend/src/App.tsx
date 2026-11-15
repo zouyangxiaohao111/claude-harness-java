@@ -74,6 +74,7 @@ import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
 import { AskUserPendingHint } from '@/components/center/AskUserPendingHint'
 import { SubagentRunningHint } from '@/components/center/SubagentRunningHint'
+import { MonitorRunningHint } from '@/components/center/MonitorRunningHint'
 import { DialogOpsModal } from '@/components/center/DialogOpsModal'
 import { RetryBanner } from '@/components/center/RetryBanner'
 import { TokenWarningBanner } from '@/components/center/TokenWarningBanner'
@@ -3382,6 +3383,9 @@ function App() {
             pendingHint={<AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />}
             subagentHint={activeSessionId
               ? <SubagentRunningHint sessionId={activeSessionId} onOpen={openSubagentPanel} />
+              : null}
+            monitorHint={activeSessionId
+              ? <MonitorRunningHint sessionId={activeSessionId} onOpen={openSubagentPanel} />
               : null}
             empty={storeMessages.length === 0 && !hasStream}
             onOpenUsageCost={() => setShowUsageCost(true)}

@@ -51,6 +51,22 @@ export function putIngestConcurrency(
   return api<IngestConcurrencyConfig>('/settings/ingest-concurrency', { method: 'PUT', body: patch })
 }
 
+/** [V295] MCP 启动预取全局总闸（`GET/PUT /settings/mcp-prefetch`）。source=db 用户设置过，yml = 系统默认。 */
+export interface McpPrefetchConfig {
+  enabled: boolean
+  source: 'db' | 'yml'
+}
+
+/** GET — 读取总闸生效值 + 来源。 */
+export function getMcpPrefetch(): Promise<McpPrefetchConfig> {
+  return api<McpPrefetchConfig>('/settings/mcp-prefetch')
+}
+
+/** PUT — 写总闸（下一次应用启动生效；不热连）。 */
+export function putMcpPrefetch(enabled: boolean): Promise<McpPrefetchConfig> {
+  return api<McpPrefetchConfig>('/settings/mcp-prefetch', { method: 'PUT', body: { enabled } })
+}
+
 export const settingsApi = {
   /** GET /api/v1/settings — 读取全局设置 */
   get: () => api<AppSettings>('/settings'),

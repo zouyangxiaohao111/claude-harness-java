@@ -51,6 +51,44 @@ public class SettingsController {
         return settingsService.update(req);
     }
 
+    /** [V295] MCP 启动预取总闸的 yml 兜底值（DB 从未配置时生效）。 */
+    @org.springframework.beans.factory.annotation.Value("${nexusai.mcp.prefetch-on-startup:true}")
+    private boolean mcpPrefetchYmlDefault;
+
+    /** [V295] 总闸响应：{@code source=db|yml} 让前端区分「用户设置」与「系统默认」。 */
+    public record McpPrefetchResponse(boolean enabled, String source) {}
+
+    /**
+     * GET MCP 启动预取总闸（V295）。
+     *
+     * @return 生效值 + 来源（db = 用户设置过；yml = 从未配置，回落默认）
+     */
+    @GetMapping("/mcp-prefetch")
+    public McpPrefetchResponse getMcpPrefetch() {
+        Boolean db = settingsService.readMcpPrefetchOnStartup();
+        return new McpPrefetchResponse(
+            db != null ? db : mcpPrefetchYmlDefault,
+            db != null ? "db" : "yml");
+    }
+
+    /**
+     * PUT MCP 启动预取总闸（V295）· 落 settings 表，下一次应用启动生效。
+     *
+     * <p>⛔ 不热连：运行中的连接不重建；关闭后已连接的 server 保持连接，直到手动 stop。
+     *
+     * @param body {@code {"enabled": true|false}}
+     * @return 写入后的值（source=db）
+     */
+    @PutMapping("/mcp-prefetch")
+    public McpPrefetchResponse updateMcpPrefetch(@RequestBody java.util.Map<String, Object> body) {
+        Object v = body == null ? null : body.get("enabled");
+        if (!(v instanceof Boolean b)) {
+            throw new ValidationException("enabled (boolean) required");
+        }
+        settingsService.updateMcpPrefetchOnStartup(b);
+        return new McpPrefetchResponse(b, "db");
+    }
+
     /**
      * GET 知识库模型全局默认。
      *

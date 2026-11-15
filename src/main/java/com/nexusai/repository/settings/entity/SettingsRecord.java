@@ -44,6 +44,14 @@ public class SettingsRecord {
      */
     private String ingestConcurrencyConfig;
 
+    /**
+     * [V295] MCP 启动预取全局总闸（1 = 应用启动时自动连接 enabled && auto_start 的 server）。
+     *
+     * <p>DB 优先、yml {@code nexusai.mcp.prefetch-on-startup} 兜底；新建行默认 1。
+     * 单条 server 的自启由 {@code mcp_servers.auto_start} 控制，本列只是总闸。
+     */
+    private Boolean mcpPrefetchOnStartup;
+
     /** 外部子代理总开关（V259）。 */
     private Boolean subagentExternalEnabled;
 
@@ -500,6 +508,9 @@ public class SettingsRecord {
     // [V293] ingest_concurrency_config ↔ ingestConcurrencyConfig（JSON 文本；null/空 = 回落 yml）
     public String getIngestConcurrencyConfig() { return ingestConcurrencyConfig; }
     public void setIngestConcurrencyConfig(String ingestConcurrencyConfig) { this.ingestConcurrencyConfig = ingestConcurrencyConfig; }
+    // [V295] mcp_prefetch_on_startup ↔ mcpPrefetchOnStartup（null = 未配置 → 回落 yml）
+    public Boolean getMcpPrefetchOnStartup() { return mcpPrefetchOnStartup; }
+    public void setMcpPrefetchOnStartup(Boolean mcpPrefetchOnStartup) { this.mcpPrefetchOnStartup = mcpPrefetchOnStartup; }
     public String getSubagentDefaultRuntime() { return subagentDefaultRuntime; }
     public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
     public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }

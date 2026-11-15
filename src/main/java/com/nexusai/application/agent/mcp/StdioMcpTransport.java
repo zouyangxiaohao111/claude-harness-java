@@ -282,6 +282,16 @@ public class StdioMcpTransport implements McpTransport {
         return state.get();
     }
 
+    /**
+     * 子进程 PID · 供 {@code mcp_servers.pid} 持久化与启动期僵尸清理
+     * （PID + 命令名双重校验；见 McpServerService#cleanupZombieProcesses）。
+     */
+    @Override
+    public Long pid() {
+        Process p = process;
+        return p != null ? p.pid() : null;
+    }
+
     // ────────────────────── 内部辅助 ──────────────────────
 
     private void writeFrame(Object obj) {

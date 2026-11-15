@@ -1,9 +1,10 @@
-import { useState } from 'react'
+import { useEffect, useState } from 'react'
 import { FormModal } from '@/components/ui/FormModal'
 import { Icon } from '@/icons'
 import { ApiError } from '@/api/rest'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
-import type { CreateMcpRequest, McpOAuthRequest, McpServer, McpStatus } from '@/api/types'
+import { getMcpPrefetch, putMcpPrefetch } from '@/api/settings'
+import type { CreateMcpRequest, McpOAuthRequest, McpRuntimeStatus, McpServer, McpStatus } from '@/api/types'
 import type { UseMcp } from '@/hooks/useMcp'
 import { parseMcpCommandLine } from '@/utils/mcpCliParse'
 
@@ -92,6 +93,19 @@ const CONN_STATE: Record<McpStatus, { cls: 'connected' | 'needs-auth' | 'failed'
   pending: { cls: 'needs-auth', label: 'needs-auth' },
 }
 
+/**
+ * [V295] 运行时状态徽标（对齐后端 McpRuntimeStatus，优先于 status 使用）。
+ * 只复用既有三种 CSS 类（connected/needs-auth/failed），不新增样式。
+ */
+const RUNTIME_LABEL: Record<McpRuntimeStatus, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
+  connected: { cls: 'connected', label: 'connected' },
+  pending: { cls: 'needs-auth', label: 'pending' },
+  failed: { cls: 'failed', label: 'failed' },
+  needsAuth: { cls: 'needs-auth', label: 'needs-auth' },
+  disabled: { cls: 'needs-auth', label: 'disabled' },
+  stopped: { cls: 'needs-auth', label: 'stopped' },
+}
+
 const parseArgs = (raw: string): string[] => raw.split(/\s+/).filter(Boolean)
 
 /** 把 "K=V\nK=V" 解析为对象；非法行（无 =）返回 null 触发 toast */
@@ -138,6 +152,25 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const [importDetail, setImportDetail] = useState<{ blocked: string[]; suppressed: string[] } | null>(null)
   const [approving, setApproving] = useState(false)
   const [selected, setSelected] = useState<string[]>([])
+  /** [V295] 全局总闸：DB 优先 / yml 兜底，source 用于提示「系统默认 vs 用户设置」 */
+  const [prefetch, setPrefetch] = useState<{ enabled: boolean; source: 'db' | 'yml' } | null>(null)
+
+  useEffect(() => {
+    let alive = true
+    getMcpPrefetch()
+      .then((v) => { if (alive) setPrefetch(v) })
+      .catch(() => { /* 老后端无该端点 → 不显示总闸 */ })
+    return () => { alive = false }
+  }, [])
+
+  const onTogglePrefetch = () => {
+    if (!prefetch) return
+    const next = !prefetch.enabled
+    void wrap(async () => {
+      const saved = await putMcpPrefetch(next)
+      setPrefetch(saved)
+    }, next ? '已开启：下次启动自动连接自启的服务器' : '已关闭：下次启动不再自动连接')
+  }
 
   const set = (patch: Partial<McpFormState>) => setForm((p) => ({ ...p, ...patch }))
 
@@ -274,6 +307,18 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const onToggle = (m: McpServer) => {
     const display = m.userFacingName ?? m.name
     void wrap(() => toggleMcp(m.id, !m.enabled), `${display} ${m.enabled ? '已停用' : '已启用'}`)
+  }
+
+  /** [V295] 启动自启开关（PATCH autoStart；enabled 总开关关闭时后端归一化为 false）。 */
+  const onToggleAutoStart = (m: McpServer) => {
+    const display = m.userFacingName ?? m.name
+    const next = !m.autoStart
+    // 显式带 scope：后端 McpCreateRequest 对 scope 有 "project" 缺省，单传 autoStart 会把原有
+    // user/local scope 覆盖成 project（既有 PATCH 契约缺陷，此处规避）。
+    void wrap(
+      () => updateMcp(m.id, { autoStart: next, scope: m.scope ?? undefined }),
+      `${display} 启动自启${next ? '已开启' : '已关闭'}`,
+    )
   }
 
   const onStart = (m: McpServer) => {
@@ -595,6 +640,23 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
         </div>
       </div>
 
+      {/* ── [V295] 全局总闸：启动时自动连接「自启」的服务器 ── */}
+      {prefetch && (
+        <div className="settings-row" style={{ marginTop: 6 }}>
+          <div>
+            <div className="settings-row-label">启动时自动连接</div>
+            <div className="settings-row-desc">
+              总闸 · 下次启动生效（{prefetch.source === 'db' ? '已自定义' : '系统默认'}）。
+              逐个服务器还需打开「自启」。
+            </div>
+          </div>
+          <label className="settings-switch" title={prefetch.enabled ? '关闭总闸' : '开启总闸'}>
+            <input type="checkbox" checked={prefetch.enabled} onChange={onTogglePrefetch} disabled={pending} />
+            <span></span>
+          </label>
+        </div>
+      )}
+
       {/* ── 已配置的服务器 列表 ── */}
       <div className="settings-row" style={{ borderBottom: 'none', paddingBottom: 4, marginTop: 6 }}>
         <div>
@@ -649,7 +711,11 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
         const remote = type !== 'stdio'
         const approval = APPROVAL_LABEL[m.approvalStatus ?? 'approved'] ?? APPROVAL_LABEL.approved
         const status = STATUS_LABEL[m.status]
-        const conn = CONN_STATE[m.status]
+        // [V295] 运行时状态优先（后端现算，不落库）；老后端无 runtimeStatus → 回落三态映射
+        const conn = m.runtimeStatus ? RUNTIME_LABEL[m.runtimeStatus] : CONN_STATE[m.status]
+        const isConnected = m.runtimeStatus
+          ? m.runtimeStatus === 'connected'
+          : m.status === 'running'
         const desc = remote
           ? `URL: ${m.url ?? m.command}`
           : `Command: ${m.command}${m.args && m.args.length > 0 ? ' ' + m.args.join(' ') : ''}`
@@ -667,7 +733,9 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                 <span className={`mcp-badge status ${status.cls}`}>{status.label}</span>
                 <span
                   className={`mcp-badge conn ${conn.cls}`}
-                  title="连接状态（FM-3 预留，后端未定案；当前由运行态映射展示）"
+                  title={m.runtimeStatus
+                    ? '运行时连接状态（后端现算，不落库）'
+                    : '连接状态（后端未返回 runtimeStatus，按三态映射）'}
                 >
                   <span className="mcp-badge-dot" />
                   {conn.label}
@@ -683,7 +751,23 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                 <input type="checkbox" checked={m.enabled} onChange={() => onToggle(m)} disabled={pending} />
                 <span></span>
               </label>
-              {m.status === 'running' ? (
+              {/* [V295] 启动自启：本仓扩展（CC 无此字段）。enabled=false 时置灰（不可用却自启是矛盾配置） */}
+              <label
+                className="settings-switch"
+                title={m.enabled
+                  ? (m.autoStart ? '启动自启：开（下次启动自动连接）' : '启动自启：关（仅手动启动）')
+                  : '先启用该服务器才能设置启动自启'}
+              >
+                <input
+                  type="checkbox"
+                  checked={!!m.autoStart && m.enabled}
+                  onChange={() => onToggleAutoStart(m)}
+                  disabled={pending || !m.enabled}
+                />
+                <span></span>
+              </label>
+              <span className="mcp-badge" style={{ alignSelf: 'center', fontSize: 10.5 }}>自启</span>
+              {isConnected ? (
                 <button className="mcp-text-btn" onClick={() => onStop(m)} disabled={pending}>
                   停止
                 </button>

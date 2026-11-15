@@ -80,7 +80,13 @@ public class AgentTranscript {
     public record AgentMetadata(
         String agentType,
         String worktreePath,
-        String description
+        String description,
+        /**
+         * 该 agent 启动时的有效工作目录 · 对齐 CC sidecar 的 {@code cwd}（resume 用它判定
+         * {@code subagent_resume_cwd_refused}：记录里的目录已不可进入时拒绝恢复，而不是
+         * 悄悄换到别的目录继续跑）。null = 旧 meta / 无法确定（resume 退回当前项目目录）。
+         */
+        String cwd
     ) {}
 
     /**
@@ -281,9 +287,58 @@ public class AgentTranscript {
         if (metadata.description() != null) {
             node.put("description", metadata.description());
         }
+        if (metadata.cwd() != null) {
+            node.put("cwd", metadata.cwd());
+        }
         // [#25] model 字段已删（对齐 CC sessionStorage.ts:264-272 AgentMetadata 无 model 字段）——不再写入。
         Files.writeString(path, JSON.writeValueAsString(node));
         log.info("已写入 agent 元数据: agentId={}, type={}", agentId, metadata.agentType());
+    }
+
+    /**
+     * 「被用户停止」伴生标记路径 · 对齐 CC {@code c4o.stoppedByUser}（{@code Qte()} 把
+     * {@code agent-x.meta.json} 换成 {@code agent-x.stopped-by-user}）。
+     */
+    public static Path getStoppedByUserPath(Path sessionDir, String sessionId, String agentId) {
+        Path meta = getMetadataPath(sessionDir, sessionId, agentId);
+        return meta.resolveSibling(
+            meta.getFileName().toString().replace(".meta.json", ".stopped-by-user"));
+    }
+
+    /**
+     * 写入「被用户停止」标记（幂等）· 对齐 CC agent-stop sidecar。
+     *
+     * <p>停止（TaskStop）时落盘；resume 时若标记存在且<b>不是用户显式发起</b>，拒绝恢复
+     * （CC {@code AgentStoppedByUserError}）。失败只 warn，不影响停止本身。
+     */
+    public static void markStoppedByUser(Path sessionDir, String sessionId, String agentId) {
+        try {
+            Path marker = getStoppedByUserPath(sessionDir, sessionId, agentId);
+            Files.createDirectories(marker.getParent());
+            Files.write(marker, new byte[0]);
+            log.info("已写入 stopped-by-user 标记: agentId={}", agentId);
+        } catch (Exception e) {
+            log.warn("写入 stopped-by-user 标记失败 agentId={}: {}", agentId, e.getMessage());
+        }
+    }
+
+    /** 是否存在「被用户停止」标记。 */
+    public static boolean isStoppedByUser(Path sessionDir, String sessionId, String agentId) {
+        try {
+            return Files.exists(getStoppedByUserPath(sessionDir, sessionId, agentId));
+        } catch (Exception e) {
+            // 路径非法等 → 视为无标记（不阻断 resume；对齐 CC 读 sidecar 失败 treating as absent）
+            return false;
+        }
+    }
+
+    /** 清除「被用户停止」标记 · 对齐 CC {@code eKt()}（resume 启动成功后删伴生文件）。 */
+    public static void clearStoppedByUser(Path sessionDir, String sessionId, String agentId) {
+        try {
+            Files.deleteIfExists(getStoppedByUserPath(sessionDir, sessionId, agentId));
+        } catch (Exception e) {
+            log.warn("清除 stopped-by-user 标记失败 agentId={}: {}", agentId, e.getMessage());
+        }
     }
 
     /**
@@ -299,7 +354,8 @@ public class AgentTranscript {
             return Optional.of(new AgentMetadata(
                 node.path("agentType").asText(),
                 node.path("worktreePath").isMissingNode() ? null : node.path("worktreePath").asText(),
-                node.path("description").isMissingNode() ? null : node.path("description").asText()
+                node.path("description").isMissingNode() ? null : node.path("description").asText(),
+                node.path("cwd").isMissingNode() ? null : node.path("cwd").asText()
             ));
         } catch (Exception e) {
             log.warn("读取 agent 元数据失败 {}: {}", path, e.getMessage());

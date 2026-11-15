@@ -26,7 +26,10 @@ public record McpCreateRequest(
     Map<String, String> headers,                      // 远程请求头（sse/http）
     McpOAuthRequest oauth,                            // 远程 OAuth 配置（sse/http）
     String clientSecret,                              // OAuth client secret（仅当 clientId 同时存在才落 keychain）
-    @Size(max = 32) String scope                      // local|user|project|dynamic|enterprise|claudeai|managed
+    @Size(max = 32) String scope,                     // local|user|project|dynamic|enterprise|claudeai|managed
+    // [V295] 启动自启 · 本仓对 CC 的扩展层（CC 无独立字段）。缺省 = enabled（对齐 CC「启用即启动即连」）；
+    //   enabled=false 时后端归一化为 false（不可用却自启是矛盾配置）。
+    Boolean autoStart
 ) {
     public McpCreateRequest {
         // REST 缺省 project（G5 以 .mcp.json 为对象；CC CLI 缺省 local 是 CLI 交互选择，AC-1.3 显式偏离）
@@ -36,6 +39,17 @@ public record McpCreateRequest(
     /** 既有 6 参便捷构造（缺省远程字段 + scope=project）· 兼容既有调用方/测试。 */
     public McpCreateRequest(String name, String command, List<String> args,
                             Map<String, String> env, Boolean enabled, String type) {
-        this(name, command, args, env, enabled, type, null, null, null, null, null);
+        this(name, command, args, env, enabled, type, null, null, null, null, null, null);
+    }
+
+    /**
+     * 既有 11 参构造（V295 前）· {@code autoStart} 缺省 null（= 跟随 enabled）。
+     * <p>保留是为了不破坏既有调用方/测试；新代码请用 canonical 构造显式传 autoStart。
+     */
+    public McpCreateRequest(String name, String command, List<String> args,
+                            Map<String, String> env, Boolean enabled, String type,
+                            String url, Map<String, String> headers, McpOAuthRequest oauth,
+                            String clientSecret, String scope) {
+        this(name, command, args, env, enabled, type, url, headers, oauth, clientSecret, scope, null);
     }
 }

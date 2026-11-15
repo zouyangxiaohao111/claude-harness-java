@@ -8,11 +8,13 @@ import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolResult;
+import com.nexusai.domain.session.AttachmentService;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.ChatMessageDto;
+import com.nexusai.repository.session.entity.AttachmentRecord;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
@@ -413,5 +415,121 @@ class VisionAnalyzeToolTest {
             .as("items 必须是 schema 对象 {" + "\"type\":\"integer\"" + "}（putObject），非字符串数组（putArray+add('integer')）")
             .isTrue();
         assertThat(items.get("type").asText()).isEqualTo("integer");
+    }
+
+    // ── [multi-image 2026-11-15] 多图（contentIds / paths） ──
+
+    @Test
+    @DisplayName("[multi-image] contentIds 多图：一次消息发 N 张（text + N image），结果占位符列出全部源")
+    void analyze_multiContentIds_sendsAllImagesInOneMessage() {
+        store.storeWithId("sess-1", 1L, PNG_BASE64, "image/png");
+        store.storeWithId("sess-1", 2L, PNG_BASE64, "image/png");
+        store.storeWithId("sess-1", 3L, PNG_BASE64, "image/png");
+        stubSuccessChain("三张图分别是一棵树、一条河、一座桥。");
+
+        AgentToolResult<?> result = tool.execute(
+            call("toolcall-multi",
+                "{\"type\":\"analyze\",\"prompt\":\"对比这三张图\",\"contentIds\":[\"1\",\"2\",\"3\"]}"),
+            ToolUseContext.of(null, "sess-1"));
+
+        assertThat(result).isInstanceOf(ToolResult.class);
+        String data = ((ToolResult<String>) result).data();
+        assertThat(data).contains("[images:1,2,3]").doesNotContain(PNG_BASE64);
+
+        ArgumentCaptor<LlmProvider.ChatRequestOptions> optionsCaptor =
+            ArgumentCaptor.forClass(LlmProvider.ChatRequestOptions.class);
+        verify(sideCallClient).chat(
+            any(ProviderConfig.class), eq("vision-model"), isNull(), isNull(), optionsCaptor.capture(), any());
+        List<ChatMessageDto> history = optionsCaptor.getValue().history();
+        assertThat(history).hasSize(1);
+        List<?> blocks = history.get(0).contentBlocks();
+        assertThat(blocks).as("text + 3 image").hasSize(4);
+        assertThat(blocks.get(0).toString()).contains("对比这三张图");
+        for (int i = 1; i < 4; i++) {
+            assertThat(blocks.get(i).toString()).contains("\"image\"").contains(PNG_BASE64);
+        }
+    }
+
+    @Test
+    @DisplayName("[multi-image] 超过 8 张 → fail-loud，不调用视觉模型")
+    void analyze_multiImages_exceedsMax_returnsError() {
+        String ids = "\"1\",\"2\",\"3\",\"4\",\"5\",\"6\",\"7\",\"8\",\"9\"";
+        AgentToolResult<?> result = tool.execute(
+            call("{\"type\":\"analyze\",\"prompt\":\"x\",\"contentIds\":[" + ids + "]}"));
+
+        assertThat(((ToolResult<String>) result).data())
+            .contains("too many images").contains("max 8");
+        verifyNoInteractions(sideCallClient);
+    }
+
+    @Test
+    @DisplayName("[multi-image] 单值源与数组源互斥 → error")
+    void analyze_singleAndArraySources_mutuallyExclusive() {
+        AgentToolResult<?> result = tool.execute(
+            call("{\"type\":\"analyze\",\"prompt\":\"x\",\"contentId\":\"1\",\"contentIds\":[\"2\"]}"));
+
+        assertThat(((ToolResult<String>) result).data())
+            .contains("either contentId/path").contains("contentIds/paths");
+        verifyNoInteractions(sideCallClient);
+    }
+
+    @Test
+    @DisplayName("[multi-image] 多图 + contentType=pdf → error（PDF 走 pages 多页通道）")
+    void analyze_multiImagesWithPdfContentType_returnsError() {
+        AgentToolResult<?> result = tool.execute(
+            call("{\"type\":\"analyze\",\"prompt\":\"x\",\"contentIds\":[\"1\"],\"contentType\":\"pdf\"}"));
+
+        assertThat(((ToolResult<String>) result).data())
+            .contains("only accept images").contains("pages");
+        verifyNoInteractions(sideCallClient);
+    }
+
+    @Test
+    @DisplayName("[multi-image] paths 含 PDF → 给可自纠用法（contentType=pdf + pages），不发模型")
+    void analyze_multiPaths_withPdf_returnsGuidance() {
+        AgentToolResult<?> result = tool.execute(
+            call("{\"type\":\"analyze\",\"prompt\":\"x\",\"paths\":[\"/tmp/a.pdf\"]}"));
+
+        assertThat(((ToolResult<String>) result).data())
+            .contains("PDF").contains("contentType=\"pdf\"").contains("pages");
+        verifyNoInteractions(sideCallClient);
+    }
+
+    @Test
+    @DisplayName("[multi-image] contentIds 命中 PDF 附件 → 给用法指引，不报 cache miss")
+    void analyze_multiContentIds_withPdfAttachment_returnsGuidance() {
+        AttachmentService attachmentService = mock(AttachmentService.class);
+        AttachmentRecord pdf = new AttachmentRecord();
+        pdf.setPath("C:/tmp/x.pdf");
+        pdf.setMediaType("application/pdf");
+        when(attachmentService.getContent(7L)).thenReturn(pdf);
+
+        VisionAnalyzeTool pdfTool = new VisionAnalyzeTool(
+            store, modelConfigResolver, llmProviderFactory, attachmentService);
+        org.springframework.test.util.ReflectionTestUtils.setField(pdfTool, "sideCallClient", sideCallClient);
+
+        AgentToolResult<?> result = pdfTool.execute(
+            call("{\"type\":\"analyze\",\"prompt\":\"x\",\"contentIds\":[\"7\"]}"));
+
+        String data = ((ToolResult<String>) result).data();
+        assertThat(data).contains("PDF").contains("contentType=\"pdf\"").contains("pages");
+        assertThat(data).doesNotContain("cache miss");
+        verifyNoInteractions(sideCallClient);
+    }
+
+    @Test
+    @DisplayName("[multi-image] schema 暴露 contentIds/paths 且 items 为对象；pages 文案推荐多页")
+    void inputSchema_exposesMultiImageFields_andRecommendsPages() {
+        JsonNode props = tool.inputSchema().path("properties");
+        for (String field : List.of("contentIds", "paths")) {
+            JsonNode node = props.path(field);
+            assertThat(node.get("type").asText()).as(field).isEqualTo("array");
+            assertThat(node.get("items").isObject()).as(field + " items 必须是对象").isTrue();
+            assertThat(node.get("items").get("type").asText()).isEqualTo("string");
+        }
+        String pagesDesc = props.path("pages").get("description").asText();
+        assertThat(pagesDesc).as("pages 文案须提醒默认多页并推荐多页")
+            .contains("默认").contains("推荐");
+        assertThat(props.path("contentIds").get("description").asText()).contains("8");
     }
 }

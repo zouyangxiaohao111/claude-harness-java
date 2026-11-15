@@ -490,8 +490,19 @@ public class ToolRegistry {
                 // [R32-#14] uniqBy builtin 覆盖 MCP: 对齐 CC tools.ts:357-365.
                 // builtin 已经在 tools Map 中, 如果 MCP 同名则跳过 (builtin 优先).
                 // 这是与上一版不同的语义 (旧版是 MCP 覆盖 builtin).
+                //
+                // [2026-11-14 修正] 判据必须是「同名旧 entry 是不是 MCP 工具」，⛔ 不能只看
+                //   mcpToolNames 是否收录。原因是 registerServerTools()（McpToolPool 的批连接/
+                //   手动 start 路径）直接 toolRegistry.register()，从不登记 mcpToolNames ⇒
+                //   已经注册的真 MCP 工具会被误判成 builtin：每轮 assemble 打一条
+                //   "builtin overrides MCP"，16:42–16:50 实测刷了 89,017 行；
+                //   且替换语义失效（真 MCP 更新无法覆盖旧 entry）。
+                //   Tool.isMcp() 默认由 mcpInfo() 推导（Tool.java:585），McpServerTool /
+                //   AgentMcpTool / McpAuthTool 都实现 mcpInfo() ⇒ 这是准确判据。
                 String name = newTool.name();
-                if (tools.containsKey(name) && !mcpToolNames.contains(name)) {
+                Tool existing = tools.get(name);
+                boolean existingIsBuiltin = existing != null && !existing.isMcp();
+                if (existingIsBuiltin && !mcpToolNames.contains(name)) {
                     // builtin 已存在同名 → 跳过 MCP, builtin 优先
                     log.info("ToolRegistry.assemble_tool_pool: builtin overrides MCP '{}' (skipping MCP)", name);
                     skipped++;

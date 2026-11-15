@@ -11,7 +11,7 @@ import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
-import com.openai.models.ChatCompletionCreateParams;
+import com.openai.models.chat.completions.ChatCompletionCreateParams;
 import com.openai.models.FunctionDefinition;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.DisplayName;
@@ -123,7 +123,7 @@ class StrictPassthroughGateTest {
     void openAiTransmitsStrictWhenGatePasses() {
         System.setProperty(StructuredOutputsSupport.TENGU_TOOL_PEAR_PROPERTY, "true");
         ChatCompletionCreateParams params = openAiParams("gpt-4o-2024-08-06");
-        FunctionDefinition fn = params.tools().orElseThrow().get(0).function();
+        FunctionDefinition fn = params.tools().orElseThrow().get(0).function().orElseThrow().function();
         assertThat(fn.strict())
             .as("OpenAI 白名单模型+flag 开 → strict 必须透传（Java 多 provider 扩展 ⊕）").hasValue(true);
     }
@@ -133,7 +133,7 @@ class StrictPassthroughGateTest {
     void openAiDropsStrictWhenFlagOff() {
         System.clearProperty(StructuredOutputsSupport.TENGU_TOOL_PEAR_PROPERTY);
         ChatCompletionCreateParams params = openAiParams("gpt-4o");
-        FunctionDefinition fn = params.tools().orElseThrow().get(0).function();
+        FunctionDefinition fn = params.tools().orElseThrow().get(0).function().orElseThrow().function();
         assertThat(fn.strict()).as("flag 关 → OpenAI 请求无 strict 字段").isEmpty();
     }
 
@@ -142,7 +142,7 @@ class StrictPassthroughGateTest {
     void openAiDropsStrictWhenModelNotWhitelisted() {
         System.setProperty(StructuredOutputsSupport.TENGU_TOOL_PEAR_PROPERTY, "true");
         ChatCompletionCreateParams params = openAiParams("gpt-3.5-turbo");
-        FunctionDefinition fn = params.tools().orElseThrow().get(0).function();
+        FunctionDefinition fn = params.tools().orElseThrow().get(0).function().orElseThrow().function();
         assertThat(fn.strict()).as("OpenAI 白名单外模型 → 不传 strict").isEmpty();
     }
 
@@ -153,7 +153,7 @@ class StrictPassthroughGateTest {
         // WHY：CC api.ts:189 `options.model` 是 4 条件门控之一——model 缺失时视为不支持 strict，
         //    必须静默降级，否则空 model 场景会直传 strict 触发网关 400。
         ChatCompletionCreateParams params = openAiParams(null);
-        FunctionDefinition fn = params.tools().orElseThrow().get(0).function();
+        FunctionDefinition fn = params.tools().orElseThrow().get(0).function().orElseThrow().function();
         assertThat(fn.strict()).as("OpenAI model null → 请求无 strict 字段").isEmpty();
     }
 

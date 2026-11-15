@@ -5221,6 +5221,19 @@ public class LlmAgentLoop implements AgentLoop {
                         + " · 对齐 CC 2.1.322 delete P.currentDate: 剩余键={}", withoutDate.keySet());
                 }
             }
+            // [agent-align 2026-11-15] 子代理定义的 omitClaudeMd=true ⇒ 本 run 的 userContext
+            //   移除 claudeMd（对齐 CC：子代理不继承 user/project/local CLAUDE.md；
+            //   managed policy 不走 user 通道，仍保留）。同样先拷贝再删，避免污染会话级 memoize。
+            if (state.isOmitClaudeMd() && mergedUserContext != null
+                    && mergedUserContext.containsKey("claudeMd")) {
+                java.util.Map<String, String> withoutMd = new java.util.LinkedHashMap<>(mergedUserContext);
+                withoutMd.remove("claudeMd");
+                mergedUserContext = withoutMd;
+                if (log.isDebugEnabled()) {
+                    log.debug("[agent-align] omitClaudeMd=true ⇒ 本 run 已摘除 claudeMd（剩余键={}）",
+                        withoutMd.keySet());
+                }
+            }
             com.nexusai.application.agent.loop.QueryParams out = params
                 // CC 回灌口径 = **pre-append** 形态（query.ts:648 的 appendSystemContext 产物是另一个
                 //   局部 const fullSystemPrompt，systemPrompt 本身从不重赋 —— 见 query.ts:393-411 注释）。
@@ -6664,6 +6677,11 @@ public class LlmAgentLoop implements AgentLoop {
                     // 已存在」失实；该 prepend 通道已按 2.1.278 整段删除（现状：无
                     // <available-deferred-tools> prepend 通道）；agent list/mcp instructions 默认通道存在。
                     ccCtx.setToolUseContext(params.toolUseContext());
+                    // [agent-align 2026-11-15] Agent 定义的 autoCompactWindow：
+                    //   只收窄本 run 的 compact 窗口（阈值系统内部已做 Math.min）。
+                    if (state.getAutoCompactWindow() != null) {
+                        ccCtx.setAutoCompactWindowOverride(state.getAutoCompactWindow());
+                    }
                     // [S3-B2] 第二参透传 snipTokensFreed（CC query.ts:466 autocompact 第 6 参；
                     // autoCompact.ts:225 tokenCount = tokenCountWithEstimation(messages) - snipTokensFreed）
                     // —— 阈值判定反映 snip 已释放的量，非硬编码 0（INV-9）。

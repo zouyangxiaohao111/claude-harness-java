@@ -47,6 +47,18 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
     Optional<String> pendingSnapshotUpdate();
     Optional<Boolean> omitClaudeMd();
 
+    /** CC original: autoCompactWindow · agent 级 compact 窗口（只收窄继承值，不影响主会话）。 */
+    default Optional<Integer> autoCompactWindow() { return Optional.empty(); }
+
+    /** CC original: observer · 运行本 agent 时自动 spawn 的观察者类型（逗号分隔，最多 4 个）。 */
+    default Optional<String> observer() { return Optional.empty(); }
+
+    /** CC original: observerMessage · 观察者活动摘要的补充后记。 */
+    default Optional<String> observerMessage() { return Optional.empty(); }
+
+    /** CC original: observeSubagents · 子代理活动是否继续 fan-out（缺省 true）。 */
+    default Optional<Boolean> observeSubagents() { return Optional.empty(); }
+
     /**
      * 主线程模型覆盖（{@code provider/name}）· **本仓扩展，CC 无此字段**。
      *
@@ -351,7 +363,15 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
         /** 自定义 Agent 来源 · 对齐 CC source */
         String customSource,  // 'userSettings' | 'projectSettings' | 'policySettings' | 'flagSettings'
         /** 系统提示内容（静态）· 对齐 CC getSystemPrompt */
-        String systemPromptContent
+        String systemPromptContent,
+        /** CC original: autoCompactWindow · 子代理 compact 窗口（只收窄继承值） */
+        Optional<Integer> autoCompactWindow,
+        /** CC original: observer · 自动 spawn 的观察者类型（逗号分隔，最多 4 个） */
+        Optional<String> observer,
+        /** CC original: observerMessage · 观察者摘要的补充后记 */
+        Optional<String> observerMessage,
+        /** CC original: observeSubagents · 子代理活动是否继续 fan-out 给观察者（默认 true） */
+        Optional<Boolean> observeSubagents
     ) implements AgentDefinition {
         
         @Override
@@ -431,6 +451,10 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
             private Optional<String> pendingSnapshotUpdate = Optional.empty();
             private Optional<Boolean> omitClaudeMd = Optional.empty();
             private Optional<String> mainModel = Optional.empty();
+            private Optional<Integer> autoCompactWindow = Optional.empty();
+            private Optional<String> observer = Optional.empty();
+            private Optional<String> observerMessage = Optional.empty();
+            private Optional<Boolean> observeSubagents = Optional.empty();
 
             private Builder(String agentType, String whenToUse, String customSource,
                              String systemPromptContent) {
@@ -491,9 +515,22 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
                     criticalSystemReminder, requiredMcpServers, background,
                     initialPrompt, memory, isolation, pendingSnapshotUpdate, omitClaudeMd,
                     mainModel,
-                    customSource, systemPromptContent
+                    customSource, systemPromptContent,
+                    autoCompactWindow, observer, observerMessage, observeSubagents
                 );
             }
+
+            /** CC original: autoCompactWindow（只收窄子代理 compact 窗口）。 */
+            public Builder autoCompactWindow(Integer v) { this.autoCompactWindow = Optional.ofNullable(v); return this; }
+
+            /** CC original: observer（逗号分隔，最多 4 个；运行本 agent 时自动 spawn）。 */
+            public Builder observer(String v) { this.observer = Optional.ofNullable(v); return this; }
+
+            /** CC original: observerMessage（观察者摘要的补充后记）。 */
+            public Builder observerMessage(String v) { this.observerMessage = Optional.ofNullable(v); return this; }
+
+            /** CC original: observeSubagents（子代理活动是否继续 fan-out）。 */
+            public Builder observeSubagents(Boolean v) { this.observeSubagents = Optional.ofNullable(v); return this; }
         }
     }
     

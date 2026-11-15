@@ -33,6 +33,7 @@ import com.nexusai.model.command.CommandSource;
 import com.nexusai.model.mcp.McpServer;
 import com.nexusai.model.mcp.dto.McpCreateRequest;
 import com.nexusai.model.mcp.dto.McpOAuthRequest;
+import com.nexusai.model.mcp.dto.McpRuntimeStatus;
 import com.nexusai.model.mcp.dto.McpServerDto;
 import com.nexusai.model.mcp.dto.McpStatus;
 import com.nexusai.model.provider.dto.TestConnectionResponse;
@@ -320,7 +321,9 @@ public class McpServerService {
 
         // 3. DB 唯一源：直接 upsert DB（scope 列 V59 持久化来源 scope）
         boolean enabled = req.enabled() == null ? Boolean.TRUE : req.enabled();
-        upsertServer(req.name(), config, scope, "approved", enabled);
+        // [V295] 缺省 autoStart = enabled（对齐 CC「启用即启动即连」）；enabled=false 强制 false
+        boolean autoStart = enabled && (req.autoStart() == null || req.autoStart());
+        upsertServer(req.name(), config, scope, "approved", enabled, autoStart);
         log.info("[McpServerService] create 完成 server={} scope={} type={}（已 upsert DB，DB 唯一源）",
             req.name(), scope, type);
 
@@ -380,19 +383,39 @@ public class McpServerService {
             }
         }
 
+        // [V295] 先取运行时与配置旧值：
+        //   - wasConnected 决定「级联 stop / 是否自动 start」（⛔ 不能在 teardown 之后读，
+        //     否则刚断开的连接会被误判成「原本没连」→ 每次 PATCH 都重启一次）
+        //   - 配置前后对比决定是否必须 teardown（仅改 enabled/autoStart 不该拆连接）
+        boolean wasConnected = mcpToolPool.isServerConnected(oldName);
+        String oldCommand = s.getCommand();
+        String oldArgs = s.getArgs();
+        String oldEnv = s.getEnv();
+        String oldType = s.getType();
+
         // 应用更新 → DB（改名直接改既有行；scope 列 V59 持久化）
         s.setName(newName);
         s.setType(type);
         s.setScope(scope);
         applyServerConfig(s, config);
+        boolean configChanged = !java.util.Objects.equals(oldCommand, s.getCommand())
+            || !java.util.Objects.equals(oldArgs, s.getArgs())
+            || !java.util.Objects.equals(oldEnv, s.getEnv())
+            || !java.util.Objects.equals(oldType, s.getType());
         boolean enabled = req.enabled() != null ? req.enabled() : Boolean.TRUE.equals(s.getEnabled());
         s.setEnabled(enabled);
+        // [V295] 启动自启更新：显式传值优先；未传但 enabled 变 false → 强制关（矛盾配置归一化）
+        if (req.autoStart() != null) {
+            s.setAutoStart(enabled && req.autoStart());
+        } else if (!enabled) {
+            s.setAutoStart(false);
+        }
 
         // T6: PATCH enabled=false 对 running server → 级联 stop（既有逻辑保留）
-        if (Boolean.FALSE.equals(enabled) && McpStatus.running.name().equals(s.getStatus())) {
+        // [V295] running 判据改运行时（DB status 列已删，旧值会跨进程残留成假 running）。
+        if (Boolean.FALSE.equals(enabled) && wasConnected) {
             log.info("[McpServerService] PATCH enabled=false 级联停止 server={}", newName);
-            stop(id);                       // teardown + 置 stopped + update
-            s.setStatus(McpStatus.stopped.name());  // 内存对齐，下方 update 落库
+            stop(id);                       // teardown + 清 pid + update
         }
 
         mcpServerMapper.update(McpServerRecord.fromDomain(s));
@@ -403,13 +426,14 @@ public class McpServerService {
         // [AM-CC-20260825] update 改 type/command 后断开旧 transport：McpToolPool 复用
         //   activeTransports 旧实例（改 type=sse→http 后仍走 SseMcpTransport，2026-08-25 联调实测），
         //   显式 teardown → 下次 assembleToolPool 用新配置重建连接（对齐 CC 配置变更即生效）
-        if (McpStatus.running.name().equals(s.getStatus())) {
-            log.info("[McpServerService] update 触发 transport 重建 server={}（type/command 变更生效）", newName);
+        if (wasConnected && configChanged) {
+            log.info("[McpServerService] update 触发 transport 重建 server={}（配置变更生效）", newName);
             mcpToolPool.teardown(newName);
         }
 
-        // [S06] enable 自动重连（既有逻辑保留）
-        if (Boolean.TRUE.equals(enabled) && !McpStatus.running.name().equals(s.getStatus())) {
+        // [S06] enable 自动重连（既有逻辑保留）· 只有「原本未连接」才 start：
+        //   原本已连接且配置未变（如只 PATCH autoStart）→ 连接不该被拆，也不该重启。
+        if (Boolean.TRUE.equals(enabled) && !wasConnected) {
             log.info("[McpServerService] PATCH enabled=true 触发自动 start server={} "
                     + "（对齐 CC toggleMcpServer enable 分支）", newName);
             return start(id);
@@ -428,21 +452,27 @@ public class McpServerService {
         if (req.args() != null) s.setArgs(serializeArgs(req.args()));
         if (req.env() != null) s.setEnv(serializeEnv(req.env()));
         if (req.enabled() != null) s.setEnabled(req.enabled());
+        // [V295] 同 update()：自启显式值优先，enabled=false 强制关
+        if (req.autoStart() != null) {
+            s.setAutoStart(Boolean.TRUE.equals(s.getEnabled()) && req.autoStart());
+        } else if (!Boolean.TRUE.equals(s.getEnabled())) {
+            s.setAutoStart(false);
+        }
         if (req.type() != null && !req.type().isBlank()) s.setType(req.type());
         if (req.scope() != null && !req.scope().isBlank()) s.setScope(req.scope());
 
         // T6: PATCH enabled=false 对 running server → 级联 stop（既有逻辑保留）
-        if (Boolean.FALSE.equals(req.enabled()) && McpStatus.running.name().equals(s.getStatus())) {
+        // [V295] 运行时判据（DB status 列已删）
+        if (Boolean.FALSE.equals(req.enabled()) && mcpToolPool.isServerConnected(s.getName())) {
             log.info("[McpServerService] PATCH enabled=false 级联停止 server={}（legacy 非 REST 类型）", s.getName());
-            stop(id);                       // teardown + 置 stopped + update
-            s.setStatus(McpStatus.stopped.name());  // 内存对齐，下方 update 落库
+            stop(id);                       // teardown + 清 pid + update
         }
 
         mcpServerMapper.update(McpServerRecord.fromDomain(s));
 
         // [S06] enable 自动重连（既有逻辑保留）
         if (Boolean.TRUE.equals(req.enabled())
-                && !McpStatus.running.name().equals(s.getStatus())) {
+                && !mcpToolPool.isServerConnected(s.getName())) {
             return start(id);
         }
         return toDto(s);
@@ -590,7 +620,8 @@ public class McpServerService {
             String status = McpServerUtils.getProjectMcpServerStatus(name, projectSettings,
                 skipDangerousModePermissionPrompt, nonInteractiveSession, projectSettingsEnabled);
             boolean enabled = "approved".equals(status);
-            upsertServer(name, e.getValue(), sourceScope, status, enabled);
+            // [V295] 导入项缺省自启 = enabled（对齐 CC「启用即启动即连」）
+            upsertServer(name, e.getValue(), sourceScope, status, enabled, enabled);
             imported++;
         }
         List<String> suppressed = deduped.suppressed().stream()
@@ -723,7 +754,7 @@ public class McpServerService {
 
     /** 按 name upsert（name UNIQUE；重复导入覆盖更新不新增；scope 列 V59 持久化来源 scope）。 */
     private void upsertServer(String name, Map<String, Object> config, String scope,
-            String approvalStatus, boolean enabled) {
+            String approvalStatus, boolean enabled, boolean autoStart) {
         McpServerRecord existing = mcpServerMapper.selectOneByName(name);
         McpServer s;
         if (existing != null) {
@@ -732,7 +763,6 @@ public class McpServerService {
             s = new McpServer();
             s.setId(generateId("mcp"));
             s.setName(name);
-            s.setStatus(McpStatus.stopped.name());
             s.setCreatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
         }
         String type = String.valueOf(config.getOrDefault("type", "stdio"));
@@ -740,6 +770,8 @@ public class McpServerService {
         s.setScope(scope);
         s.setApprovalStatus(approvalStatus);
         s.setEnabled(enabled);
+        // [V295] 归一化：enabled=false（不可用）时 auto_start 必须为 0，避免「不可用却自启」矛盾配置
+        s.setAutoStart(enabled && autoStart);
         s.setLastError(null);
         applyServerConfig(s, config);
         if (existing != null) {
@@ -1036,7 +1068,8 @@ public class McpServerService {
         return new McpServerDto(base.id(), base.name(), base.command(), base.args(), base.env(),
             base.status(), base.lastError(), base.enabled(), base.createdAt(), base.type(),
             base.approvalStatus(), base.userFacingName(), base.channelPermissions(),
-            url, headers, oauth, scope, filePath, warnings);
+            url, headers, oauth, scope, filePath, warnings,
+            base.autoStart(), base.runtimeStatus());
     }
 
     private static Map<String, String> headersFromConfig(Map<String, Object> config) {
@@ -1167,7 +1200,8 @@ public class McpServerService {
             if (config == null || config.isEmpty()) {
                 continue;
             }
-            upsertServer(e.getKey(), config, "dynamic", "approved", true);
+            // [V295] dynamic 由 SSE 推送产生 → 立即可用且自启（对齐 CC dynamic server 行为）
+            upsertServer(e.getKey(), config, "dynamic", "approved", true, true);
             upserted++;
         }
         if (log.isDebugEnabled()) {
@@ -1264,7 +1298,11 @@ public class McpServerService {
             //  skill:// 过滤 + write-once registry + fetchMcpSkillsForClient 对齐）
             // 拍板#2: 同时落库 fetchCommands 产物（prompts，无 loadedFrom）
             refreshMcpCommands(s.getName());
-            s.setStatus(McpStatus.running.name());
+            // [V295] status 不落库：连接态由 McpConnectivityStatusRegistry 运行时提供。
+            //   DB 只保留 pid（启动期僵尸清理用）与 last_error；ignoreNulls=true 跳过 null，
+            //   故「无 pid」用 0 表示（stop / 启动失败均写 0）。
+            Long pid = mcpToolPool.currentPid(s.getName());
+            s.setPid(pid != null ? pid.intValue() : 0);
             // [AM-CC-20260825] 默认 update(entity) ignoreNulls=true 跳过 null → last_error 残留
             //   （前端刷新仍显示旧 500，2026-08-25 实测）。空串（非 null）确保默认 update 写 DB 清；
             //   消费侧按 blank 判空（toDto 透出，前端 if(lastError) 空串不显示）。
@@ -1274,7 +1312,8 @@ public class McpServerService {
                 s.getName(), entries.size(), mcpToolCount());
             return toDto(s);
         } catch (Exception e) {
-            s.setStatus(McpStatus.error.name());
+            // [V295] 失败态由连接注册表（updateFailed）提供；DB 只清 pid + 记错误原因
+            s.setPid(0);
             s.setLastError(e.getMessage());
             mcpServerMapper.update(McpServerRecord.fromDomain(s));
             log.error("[McpServerService] start failed server={}: {}", s.getName(), e.getMessage(), e);
@@ -1302,7 +1341,8 @@ public class McpServerService {
             // fetchCommandsForClient 缓存 :1393；停服后 getMcpPromptCommandsForSearch 立即空）
             mcpPromptCommands.removeIf(cmd -> cmd != null && cmd.getName() != null
                 && cmd.getName().startsWith(prefix));
-            s.setStatus(McpStatus.stopped.name());
+            // [V295] stopped 态由运行时（无连接 + 未 connecting）推导，不落库；清 pid 供僵尸清理跳过
+            s.setPid(0);
             s.setLastError("");  // [AM-CC-20260825] 同 start：ignoreNulls 跳过 null → 空串写 DB 清残留
             mcpServerMapper.update(McpServerRecord.fromDomain(s));
             log.info("[McpServerService] stopped server={} poolSize={}", s.getName(), mcpToolCount());
@@ -1350,7 +1390,98 @@ public class McpServerService {
      *
      * @return 全部 server 处理完成后的 CompletableFuture（T3 启动预取异步 join）
      */
+    /**
+     * 启动期僵尸子进程清理 · <b>本仓多进程才需要</b>（CC 单进程时 MCP 子进程随 CLI 退出）。
+     *
+     * <p>后端被强杀时 stdio 子进程在 Windows 上可能残留；新进程再 spawn 一份会撞资源
+     * （端口 / 临时目录 / Ghidra 工程锁）。判据 = DB {@code pid} 非 0
+     * <b>且</b> ProcessHandle 存活 <b>且</b> 进程名与配置 command 的 basename 一致
+     * （args[0] 可用时再校验命令行包含它）—— 双重校验避免 PID 复用导致误杀。
+     *
+     * <p>只处理「上一次持久化的 pid」，不碰任何当前 activeTransports 里的连接。
+     *
+     * @return 实际 kill 的进程数（best-effort；失败只记日志）
+     */
+    public int cleanupZombieProcesses() {
+        int killed = 0;
+        for (McpServerRecord r : mcpServerMapper.selectAll()) {
+            Integer pid = r.getPid();
+            if (pid == null || pid <= 0) {
+                continue;
+            }
+            try {
+                ProcessHandle ph = ProcessHandle.of(pid).orElse(null);
+                if (ph == null || !ph.isAlive()) {
+                    clearPidQuietly(r);
+                    continue;
+                }
+                String expectedName = processBaseName(r.getCommand());
+                String actualName = ph.info().command().map(McpServerService::processBaseName).orElse("");
+                if (expectedName.isEmpty() || !expectedName.equalsIgnoreCase(actualName)) {
+                    log.warn("[McpServerService] 僵尸清理跳过：PID {} 进程名不匹配（期望 '{}' 实际 '{}'）",
+                        pid, expectedName, actualName);
+                    clearPidQuietly(r);
+                    continue;
+                }
+                List<String> args = deserializeArgs(r.getArgs());
+                String marker = args != null && !args.isEmpty() ? args.get(0) : null;
+                if (marker != null && !marker.isBlank()) {
+                    String cmdline = ph.info().commandLine().orElse("");
+                    if (!cmdline.isBlank() && !cmdline.contains(marker)) {
+                        log.warn("[McpServerService] 僵尸清理跳过：PID {} 命令行不含脚本 '{}'（疑似 PID 复用）",
+                            pid, marker);
+                        clearPidQuietly(r);
+                        continue;
+                    }
+                }
+                boolean ok = ph.destroyForcibly();
+                log.info("[McpServerService] 僵尸清理 server={} pid={} name={} killed={}",
+                    r.getName(), pid, actualName, ok);
+                if (ok) {
+                    killed++;
+                }
+                clearPidQuietly(r);
+            } catch (Exception e) {
+                log.warn("[McpServerService] 僵尸清理失败 server={} pid={}: {}",
+                    r.getName(), pid, e.getMessage());
+            }
+        }
+        return killed;
+    }
+
+    /** 进程名 basename（去目录、去 .exe 后缀，小写比较由调用方处理）。 */
+    private static String processBaseName(String path) {
+        if (path == null || path.isBlank()) {
+            return "";
+        }
+        String name = path.replace('\\', '/');
+        int slash = name.lastIndexOf('/');
+        if (slash >= 0) {
+            name = name.substring(slash + 1);
+        }
+        if (name.toLowerCase().endsWith(".exe")) {
+            name = name.substring(0, name.length() - 4);
+        }
+        return name;
+    }
+
+    /** 清 pid（0 = 无 pid；列 NOT NULL 语义由 0 承担，update ignoreNulls 不会误清其它列）。 */
+    private void clearPidQuietly(McpServerRecord r) {
+        try {
+            McpServer dom = r.toDomain();
+            dom.setPid(0);
+            mcpServerMapper.update(McpServerRecord.fromDomain(dom));
+        } catch (Exception e) {
+            log.debug("[McpServerService] 清 pid 失败 server={}: {}", r.getName(), e.getMessage());
+        }
+    }
+
     public CompletableFuture<Void> startEnabledBatch() {
+        // [V295] 先清上一次进程遗留的 stdio 子进程（pid + 进程名双重校验），再连
+        int zombies = cleanupZombieProcesses();
+        if (zombies > 0) {
+            log.info("[McpServerService] 启动预取前清理僵尸 MCP 子进程 {} 个", zombies);
+        }
         // 复用 start() 内接线（P2-15 skill 门控 + P3-5 索引清除 + I-3 channel fail-closed）
         mcpToolPool.setMcpSkillsGate(mcpSkillsGate);
         // 拍板#2: 刷新回调覆盖 skills + prompts 两池（CC :731-738 updateServer({commands})）
@@ -1375,6 +1506,8 @@ public class McpServerService {
         for (McpServerRecord r : mcpServerMapper.selectAll()) {
             McpServer s = r.toDomain();
             if (!Boolean.TRUE.equals(s.getEnabled())) continue;              // enabled 门控（T6）
+            // [V295] 启动自启闸：enabled=可用，autoStart=应用启动时自动连（本仓扩展层，CC 无）
+            if (!Boolean.TRUE.equals(s.getAutoStart())) continue;
             if ("pending".equals(s.getApprovalStatus())) continue;           // 审批门控（T7）
             entries.add(new McpToolPool.McpServerConfigEntry(s.getName(), transportConfig(s)));
         }
@@ -1391,12 +1524,13 @@ public class McpServerService {
                 // （CC onConnectionAttempt → updateServer({commands: [...mcpPrompts, ...mcpSkills]})，
                 //  不再只 log commands.size()）
                 refreshMcpCommands(name);
-                // DB 状态 running（对齐 start() 末尾）
+                // [V295] status 不落库（运行时态来自连接注册表）；只写 pid 供下次启动僵尸清理
                 McpServerRecord rec = mcpServerMapper.selectOneByName(name);
                 if (rec != null) {
                     McpServer dom = rec.toDomain();
-                    dom.setStatus(McpStatus.running.name());
-                    dom.setLastError(null);
+                    Long pid = mcpToolPool.currentPid(name);
+                    dom.setPid(pid != null ? pid.intValue() : 0);
+                    dom.setLastError("");
                     mcpServerMapper.update(McpServerRecord.fromDomain(dom));
                 }
                 log.info("[McpServerService] 批连接已注册 server={} tools={} commands={}",
@@ -1463,8 +1597,10 @@ public class McpServerService {
         McpServerRecord rec = mcpServerMapper.selectOneByName(serverName);
         if (rec != null) {
             McpServer dom = rec.toDomain();
-            dom.setStatus(McpStatus.running.name());
-            dom.setLastError(null);
+            // [V295] status 不落库；只更新 pid + 清错误
+            Long pid = mcpToolPool.currentPid(serverName);
+            dom.setPid(pid != null ? pid.intValue() : 0);
+            dom.setLastError("");
             mcpServerMapper.update(McpServerRecord.fromDomain(dom));
         }
         log.info("[McpServerService] OAuth 认证成功，已替换 server={} 真实工具={}", serverName, entries.size());
@@ -1807,15 +1943,24 @@ public class McpServerService {
         } else {
             dtoEnv = deserializeEnv(s.getEnv());
         }
+        // [V295] status 不再是 DB 列：由运行时连接态映射三态（前端既有枚举不变），
+        //   runtimeStatus 给更细的真值。⛔ 不读旧列（已删）。
+        boolean enabled = Boolean.TRUE.equals(s.getEnabled());
+        McpRuntimeStatus runtimeStatus = resolveRuntimeStatus(s.getName(), enabled);
+        McpStatus status = switch (runtimeStatus) {
+            case connected -> McpStatus.running;
+            case failed, needsAuth -> McpStatus.error;
+            default -> McpStatus.stopped;
+        };
         return new McpServerDto(
             s.getId(),
             s.getName(),
             s.getCommand(),
             deserializeArgs(s.getArgs()),
             dtoEnv,
-            s.getStatus() != null ? McpStatus.valueOf(s.getStatus()) : McpStatus.stopped,
+            status,
             s.getLastError(),
-            Boolean.TRUE.equals(s.getEnabled()),
+            enabled,
             parseDateTime(s.getCreatedAt()),
             s.getType(),
             s.getApprovalStatus(),
@@ -1829,8 +1974,46 @@ public class McpServerService {
             oauth,
             s.getScope(),  // DB 唯一源：scope 列（V59）
             null,          // filePath（create/update 响应经 withAddMeta 填）
-            null           // warnings（create/update 响应经 withAddMeta 填）
+            null,          // warnings（create/update 响应经 withAddMeta 填）
+            Boolean.TRUE.equals(s.getAutoStart()),
+            runtimeStatus
         );
+    }
+
+    /**
+     * 运行时状态合成 · 对齐 CC {@code MCPServerConnection.type}（types.ts:221-226）。
+     *
+     * <p>优先级：禁用（enabled=false）→ 连接中 → 已连接 → 失败/需认证 → 停止。
+     * 真源 = {@link McpToolPool}（连接注册表 + 内存 connecting 集合），⛔ 不读 DB。
+     *
+     * @param name    server 名
+     * @param enabled 是否启用（disabled 态唯一 DB 来源）
+     * @return 运行时状态
+     */
+    private McpRuntimeStatus resolveRuntimeStatus(String name, boolean enabled) {
+        if (!enabled) {
+            return McpRuntimeStatus.disabled;
+        }
+        if (mcpToolPool.isConnecting(name)) {
+            return McpRuntimeStatus.pending;
+        }
+        // transport 实际状态优先于注册表：stdio 子进程崩溃后 transport=CLOSED，
+        // 但 connectedTypes 可能残留 connected（无 onclose 回写）→ 只信 isServerConnected。
+        if (mcpToolPool.isServerConnected(name)) {
+            return McpRuntimeStatus.connected;
+        }
+        String runtimeType = mcpToolPool.runtimeTypeOf(name);
+        if ("connected".equals(runtimeType)) {
+            // 注册表说 connected 但 transport 已不在连接态 → 视为停止（假 connected 收敛）
+            return McpRuntimeStatus.stopped;
+        }
+        if ("failed".equals(runtimeType)) {
+            return McpRuntimeStatus.failed;
+        }
+        if ("needs-auth".equals(runtimeType)) {
+            return McpRuntimeStatus.needsAuth;
+        }
+        return McpRuntimeStatus.stopped;
     }
 
     private static String generateId(String prefix) {

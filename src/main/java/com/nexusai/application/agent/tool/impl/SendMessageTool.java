@@ -126,6 +126,15 @@ public class SendMessageTool implements Tool {
     @Autowired(required = false)
     private com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry;
 
+    /** [agent-resume-align] 已结束子代理的 resume 通道（CC：「a send resumes it from its transcript」）。 */
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<
+        com.nexusai.application.agent.subagent.ResumeService> resumeServiceProvider;
+
+    /** 运行态判定（taskId === agentId）· CC auto-resume 只在 agent 已停止时触发。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.tasks.BackgroundTaskRunner backgroundTaskRunner;
+
     /**
      * [team-frontend-channel B1] STOMP 出站模板 · writeToMailbox 后推送
      * {@code /topic/sessions/{leadSessionId}/team-messages}（leadSessionId 从 team config 反查，
@@ -164,6 +173,18 @@ public class SendMessageTool implements Tool {
     /** [IMP-G4 C7] 测试/接线用 setter（agentNameRegistry · 按名 in-process 子代理路由）· 对齐 setSpawnInProcess 模式。 */
     public void setAgentNameRegistry(com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry) {
         this.agentNameRegistry = agentNameRegistry;
+    }
+
+    /** 测试/接线用 setter（resume 通道）。 */
+    public void setResumeServiceProvider(org.springframework.beans.factory.ObjectProvider<
+            com.nexusai.application.agent.subagent.ResumeService> p) {
+        this.resumeServiceProvider = p;
+    }
+
+    /** 测试/接线用 setter（运行态判定）。 */
+    public void setBackgroundTaskRunner(
+            com.nexusai.application.agent.tasks.BackgroundTaskRunner runner) {
+        this.backgroundTaskRunner = runner;
     }
 
     /** [team-frontend-channel B1] 测试/接线用 setter（ws · STOMP 出站模板）· 对齐 LeaderPermissionConfirmBridge.setWs 模式。 */
@@ -230,7 +251,7 @@ public class SendMessageTool implements Tool {
             | `"researcher"` | Teammate by name |
             | `"*"` | Broadcast to all teammates — expensive (linear in team size), use only when everyone genuinely needs it |
 
-            Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox. Refer to teammates by name, never by UUID. When relaying, don't quote the original — it's already rendered to the user.
+            Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox. Refer to agents by name — names keep working after an agent completes (a send resumes it from its transcript). Use the raw `agentId` (format `a...-...`) from its spawn result only when the agent has no name, or when a newer agent took the name (latest wins). When relaying, don't quote the original — it's already rendered to the user.
 
             ## Protocol responses (legacy)
 
@@ -568,7 +589,7 @@ public class SendMessageTool implements Tool {
             //   appState.agentNameRegistry.get(input.to) → 命中注册名 → queuePendingMessage
             //   （子 agent 下一轮 SubagentExecutor runSubagentQueryLoop drain 消费）。非注册名 →
             //   降级 handleMessage（mailbox）。agentNameRegistry 未注入 → 降级。
-            AgentToolResult routed = routeToRegisteredSubagent(call, to, content);
+            AgentToolResult routed = routeToRegisteredSubagent(call, to, content, ctx);
             if (routed != null) {
                 return routed;
             }
@@ -643,7 +664,8 @@ public class SendMessageTool implements Tool {
      * @param content 消息文本
      * @return 路由结果；非注册名 / 未接线 → null
      */
-    private AgentToolResult routeToRegisteredSubagent(ToolUseBlock call, String to, String content) {
+    private AgentToolResult routeToRegisteredSubagent(ToolUseBlock call, String to, String content,
+                                                       ToolUseContext ctx) {
         if (agentNameRegistry == null) {
             return null;
         }
@@ -651,7 +673,15 @@ public class SendMessageTool implements Tool {
         if (agentId == null) {
             return null;
         }
-        // 已注册 → 待办队列投递（CC queuePendingMessage 等价），子 agent 下一轮消费
+        // [agent-resume-align 2026-11-15] 对齐 CC SendMessageTool.ts:815-874：
+        //   名字在 agent 完成后仍可寻址 —— 发送会从 transcript 热启动它。
+        if (!isAgentRunning(agentId)) {
+            AgentToolResult resumed = resumeStoppedAgent(call, to, agentId, content, ctx);
+            if (resumed != null) {
+                return resumed;
+            }
+        }
+        // 已注册且运行中 → 待办队列投递（CC queuePendingMessage 等价），子 agent 下一轮消费
         agentNameRegistry.queue(agentId, content);
         if (log.isDebugEnabled()) {
             log.debug("[SendMessageTool] [IMP-G4 C7] in-process 子代理按名路由: to='{}' agentId={} "
@@ -663,6 +693,56 @@ public class SendMessageTool implements Tool {
         out.put("message", "Message queued for delivery to " + to
                 + " at its next tool round.");
         return ToolResult.success(call.id(), out);
+    }
+
+    /** agent 是否仍在运行（taskId === agentId）。无法判定 → 视为运行中（保持旧的入队行为）。 */
+    private boolean isAgentRunning(String agentId) {
+        if (backgroundTaskRunner == null || agentId == null) {
+            return true;
+        }
+        return backgroundTaskRunner.getTask(agentId)
+            .map(t -> t.status()
+                == com.nexusai.application.agent.tasks.BackgroundTaskStatus.RUNNING)
+            .orElse(false);
+    }
+
+    /** 已停止 agent 的 resume · 对齐 CC：「a send resumes it from its transcript」。 */
+    private AgentToolResult resumeStoppedAgent(ToolUseBlock call, String to, String agentId,
+                                               String content, ToolUseContext ctx) {
+        if (resumeServiceProvider == null) {
+            return null;
+        }
+        com.nexusai.application.agent.subagent.ResumeService resume =
+            resumeServiceProvider.getIfAvailable();
+        if (resume == null) {
+            return null;
+        }
+        java.util.UUID uuid =
+            com.nexusai.application.agent.subagent.ResumeService.parseAgentIdString(agentId);
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        if (uuid == null || sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            // 模型发起的自动 resume（非用户显式）：用户 TaskStop 过的 agent 会被 stoppedByUser 门拒绝
+            // （对齐 CC J=false → AgentStoppedByUserError）。
+            resume.resumeAgentBackground(uuid, content,
+                com.nexusai.application.agent.subagent.ResumeService.resolveSessionDir(sessionId),
+                sessionId, null, false);
+            ObjectNode out = JsonNodeFactory.instance.objectNode();
+            out.put("success", true);
+            out.put("message", "Resumed " + to + " from its transcript and delivered the message.");
+            log.info("[SendMessageTool] [agent-resume-align] 已停止子代理按名热启动: to={} agentId={}",
+                to, agentId);
+            return ToolResult.success(call.id(), out);
+        } catch (Exception e) {
+            log.warn("[SendMessageTool] resume 已结束子代理失败 to={} agentId={}: {}",
+                to, agentId, e.toString());
+            ObjectNode out = JsonNodeFactory.instance.objectNode();
+            out.put("success", false);
+            out.put("message", "Could not resume " + to + ": " + e.getMessage());
+            return ToolResult.success(call.id(), out);
+        }
     }
 
     /**

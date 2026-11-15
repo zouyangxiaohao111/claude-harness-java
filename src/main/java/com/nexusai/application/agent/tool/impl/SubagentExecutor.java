@@ -1305,6 +1305,10 @@ public class SubagentExecutor {
      */
     private java.util.function.Function<String, AgentDefinition> agentDefinitionResolver;
 
+    /** [agent-observer 2026-11-15] 观察者机制（可选；未装配 → 不投递 digest）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.subagent.AgentObserverService agentObserverService;
+
     public void setAgentDefinitionResolver(java.util.function.Function<String, AgentDefinition> agentDefinitionResolver) {
         this.agentDefinitionResolver = agentDefinitionResolver;
     }
@@ -2419,9 +2423,12 @@ public class SubagentExecutor {
         // DEL-SP-10：buildAgentOptions 第 8 实参原错传 agentSystemPrompt 给 appendSystemPrompt 参数
         //   （CC runAgent.ts:673 真语义是继承父 appendSystemPrompt，字段名与承载值双错）——删除该传递；
         //   agentSystemPrompt 仍由 Step 9 :864 resolve，并在 Step 20 runSubagentQueryLoop 使用，不受影响。
+        // [agent-observer] fan-out：记录调用方（父）agent 类型，供子代理继承观察关系
+        ToolUseContext observerParent = parentTucOverride != null ? parentTucOverride : parentToolUseContext;
+        String parentAgentType = observerParent != null ? observerParent.agentType() : null;
         AgentRunOptions agentOptions = buildAgentOptions(allTools, effectiveModel, isAsync, useExactTools,
                 agentDefinition, querySource, mcpInitResult.clients(),
-                thinkingConfig);
+                thinkingConfig, parentAgentType);
 
         // ── Step 18: writeAgentMetadata ──
         // s18 P1-5/6: effectiveIsolation == "worktree" 且 worktreeService 已注入时,
@@ -2555,11 +2562,17 @@ public class SubagentExecutor {
             // [#25] AgentMetadata.model 字段已删（对齐 CC sessionStorage.ts:264-272 无 model）——
             //   resume 模型改现算（ResumeService 读 AgentState.currentModel()，CC resumeAgent.ts:131），
             //   不再持久化 spawn 时有效模型。
+            // 对齐 CC sidecar 的 cwd：记录该 agent 启动时的有效目录（隔离 worktree 优先，
+            // 否则父会话项目根）。resume 侧据此判定 cwd_refused，不再静默换目录。
+            Path metadataCwdPath = worktreePath != null
+                ? java.nio.file.Paths.get(worktreePath)
+                : parentSessionCwdOrNull(agentTuc, sessionId != null ? sessionId.toString() : null);
             AgentTranscript.writeMetadata(sessionDir, sessionId.toString(), agentIdHex,
                     new AgentTranscript.AgentMetadata(
                             agentDefinition.agentType(),
                             worktreePath,
-                            description));
+                            description,
+                            metadataCwdPath != null ? metadataCwdPath.toString() : null));
             if (log.isDebugEnabled()) {
                 log.debug("[SubagentExecutor] Step 18: 已写入 agent 元数据 agent={} (a+16hex={}, worktree={})", agentId, agentIdHex, worktreePath);
             }
@@ -4703,7 +4716,9 @@ public class SubagentExecutor {
             Map<String, AgentDefinition> agentDefinitions,
             boolean verbose,
             // [OD-11 对齐 CC 无默认] null = 无限轮 (CC query.ts:190 不设默认值)
-            Integer maxTurns) {
+            Integer maxTurns,
+            /** [agent-observer 2026-11-15] 调用方（父）agent 类型 · observer fan-out 用。 */
+            String parentAgentType) {
         AgentRunOptions {
             if (tools == null) tools = List.of();
             if (thinkingConfig == null) thinkingConfig = Map.of();
@@ -4752,7 +4767,7 @@ public class SubagentExecutor {
             List<Tool> allTools, String effectiveModel, boolean isAsync,
             boolean useExactTools, AgentDefinition agentDefinition,
             String querySource, List<AgentMcpServers.McpServerConnection> mcpClients,
-            Map<String, Object> inheritedThinkingConfig) {
+            Map<String, Object> inheritedThinkingConfig, String parentAgentType) {
         // [OD-11 对齐 CC 无默认] null = 无限轮 (CC query.ts:190 不设默认值)
         Integer maxTurns = agentDefinition.maxTurns().orElse(null);
         // [ODF-C3] 非 fork 子 Agent 同样携带附加 agents map（SDK request.agents 对齐 print.ts:4381-4383）
@@ -4765,7 +4780,7 @@ public class SubagentExecutor {
                 inheritedThinkingConfig, querySource,
                 mcpClients,
                 Map.of(), agentDefs,
-                false, maxTurns);
+                false, maxTurns, parentAgentType);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -4978,6 +4993,15 @@ public class SubagentExecutor {
 
         // 构造 subagent AgentState（隔离 messages/turnCount/maxTurns/systemPrompt）
         AgentState state = new AgentState(agentSystemPrompt, sessionId, agentId);
+        // [agent-align 2026-11-15] Agent 定义的 omitClaudeMd ⇒ 本子代理 run 不注入 CLAUDE.md
+        //   （对齐 CC：子代理不继承 user/project/local 的 CLAUDE.md；managed policy 仍保留）。
+        if (agentDefinition != null) {
+            if (Boolean.TRUE.equals(agentDefinition.omitClaudeMd().orElse(false))) {
+                state.setOmitClaudeMd(true);
+            }
+            // [agent-align 2026-11-15] agent 级 compact 窗口（只收窄本 run）
+            agentDefinition.autoCompactWindow().ifPresent(state::setAutoCompactWindow);
+        }
         // ── [usage-gateway] 子代理记账归属 + 会话账本绑定 ──
         // 用户裁定：子代理用量必须并入父会话账目；归属用父节点派生以保留层级
         // （session → 主 agent(depth 0) → 子代理(1) → 嵌套子代理(2)…），账本按此树聚合
@@ -5114,7 +5138,54 @@ public class SubagentExecutor {
             //   （fork 共享父 setResponseLength，子 agent 运行期间 spinner 反映子 agent 响应长度）。
             java.util.concurrent.atomic.AtomicLong subagentResponseLength =
                 new java.util.concurrent.atomic.AtomicLong(0L);
+            // [agent-observer 2026-11-15] 逐轮 digest 收集器（CC：每轮结束投递一次）
+            com.nexusai.application.agent.subagent.ObserverDigestCollector observerDigest =
+                new com.nexusai.application.agent.subagent.ObserverDigestCollector();
+            // observer 类型存在性校验集合（CC bbr：declared observer 必须匹配可用 agent type）
+            java.util.Set<String> observerAvailableTypes = new java.util.HashSet<>();
+            for (AgentDefinition d : BuiltInAgents.getBuiltInAgents()) {
+                if (d != null) observerAvailableTypes.add(d.agentType());
+            }
+            observerAvailableTypes.addAll(additionalAgentDefinitions.keySet());
+            // observer 定义解析（resume 需要 selectedAgent）
+            java.util.function.Function<String, AgentDefinition> observerDefResolver = type -> {
+                AgentDefinition d = BuiltInAgents.get(type);
+                return d != null ? d : additionalAgentDefinitions.get(type);
+            };
+            // [agent-observer fan-out] 子代理自身无 observer 时，继承父的观察关系（depth+1，上限 2）
+            final AgentDefinition observerOwnerDef;
+            final int observerFanoutDepth;
+            AgentDefinition inheritedObserver = null;
+            if (agentObserverService != null && agentDefinition.observer().isEmpty()
+                    && agentOptions.parentAgentType() != null) {
+                inheritedObserver = agentObserverService
+                    .observedDefinitionOf(agentOptions.parentAgentType());
+            }
+            if (inheritedObserver != null) {
+                observerOwnerDef = inheritedObserver;
+                observerFanoutDepth = 1;
+            } else {
+                observerOwnerDef = agentDefinition;
+                observerFanoutDepth = 0;
+            }
             state.setAppendListener(msg -> {
+                // [agent-observer] 收集本轮活动（assistant 文本 / 工具调用 / 工具结果）
+                try {
+                    if (msg.role() == Role.assistant) {
+                        if (msg.content() != null && !msg.content().isBlank()) {
+                            observerDigest.assistant(msg.content());
+                        }
+                        if (msg.toolCalls() != null) {
+                            for (var tc : msg.toolCalls()) {
+                                observerDigest.toolCall(tc.name(), tc.arguments());
+                            }
+                        }
+                    } else if (msg.role() == Role.tool) {
+                        observerDigest.toolResult(msg.content());
+                    }
+                } catch (Exception ignored) {
+                    // 收集失败不影响主链（observer 是旁路能力）
+                }
                 // [IMP-G4 E5] assistant 消息 token 计数接线 · 对齐 CC AgentTool.tsx:1094-1102：
                 //   getAssistantMessageContentLength（tokens.ts:183-207 文本/thinking/tool_use input 求和）
                 //   → setResponseLength(len => len + contentLength)。Java ChatMessageDto content=文本、
@@ -5199,6 +5270,29 @@ public class SubagentExecutor {
                 //   （messageSink==null async/非流式不产出）仍成立。
                 if (!(out instanceof SubagentMessage.ProgressMessage) && msg.id() != null) {
                     currentParentUuid.set(msg.id());
+                }
+                // [agent-observer 2026-11-15] assistant 且没有后续工具调用 ⇒ 本轮结束 →
+                //   渲染 digest（nonce/标签/2000/64000 截断）并投递。CC 每轮一次。
+                if (agentObserverService != null && agentDefinition != null
+                        && msg.role() == Role.assistant
+                        && (msg.toolCalls() == null || msg.toolCalls().isEmpty())
+                        && !observerDigest.isEmpty()) {
+                    try {
+                        observerDigest.turnEnded(msg.finishReason() != null
+                            ? String.valueOf(msg.finishReason()) : "completed");
+                        String rendered = observerDigest.render(
+                            java.util.UUID.randomUUID().toString(),
+                            agentDefinition.agentType(),
+                            observerOwnerDef.observerMessage().orElse(null));
+                        agentObserverService.publishDigest(
+                            observerOwnerDef, rendered, subagentCtx, sessionId,
+                            observerAvailableTypes, observerDefResolver, observerFanoutDepth);
+                    } catch (Exception e) {
+                        log.warn("[SubagentExecutor] observer digest 投递失败 agentId={}: {}",
+                            agentId, e.toString());
+                    } finally {
+                        observerDigest.reset();
+                    }
                 }
             });
 
@@ -6322,6 +6416,36 @@ public class SubagentExecutor {
      * @param recordedIds       已落转录 id 集（就地写入）
      * @param currentParentUuid 当前链尾（就地更新）
      */
+    /**
+     * 构建只读活动摘要 · 供 observer 消费（CC digest 的最小版本）。
+     *
+     * <p>只取子代理自身消息（跳过 initialMsgCount 前缀）的 assistant 文本，尾部附最终结论；
+     * 上限 10 段，避免观察者被整段 transcript 淹没（CC 也有 16KB/64KB 的 delivery cap）。
+     */
+    static String buildObserverDigest(List<com.nexusai.model.session.dto.ChatMessageDto> messages,
+                                      int from, String summary) {
+        StringBuilder sb = new StringBuilder();
+        int taken = 0;
+        if (messages != null) {
+            for (int i = Math.max(0, from); i < messages.size() && taken < 10; i++) {
+                com.nexusai.model.session.dto.ChatMessageDto m = messages.get(i);
+                if (m == null || m.role() != com.nexusai.model.session.dto.Role.assistant) continue;
+                String text = m.content();
+                if (text == null || text.isBlank()) continue;
+                sb.append("- assistant: ").append(clip(text, 400)).append('\n');
+                taken++;
+            }
+        }
+        if (summary != null && !summary.isBlank()) {
+            sb.append("- final: ").append(clip(summary, 1200)).append('\n');
+        }
+        return sb.toString();
+    }
+
+    private static String clip(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max) + "…";
+    }
+
     static void armCompactTranscriptPersist(AgentState state, Path sessionDir, String sessionId,
                                             String agentId, Set<String> recordedIds,
                                             java.util.concurrent.atomic.AtomicReference<String> currentParentUuid) {

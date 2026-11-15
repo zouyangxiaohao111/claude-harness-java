@@ -249,8 +249,14 @@ public record FeatureFlags(
         @org.springframework.beans.factory.annotation.Value("${nexusai.feature.workflow-scripts:false}")
         private boolean workflowScripts;
 
-        /** {@code MONITOR_TOOL} flag · CC tools.ts:39-40（MonitorTool 条件构建门）· 默认 false。 */
-        @org.springframework.beans.factory.annotation.Value("${nexusai.feature.monitor-tool:false}")
+        /**
+         * {@code MONITOR_TOOL} · MonitorTool 条件构建门。
+         *
+         * <p><b>默认 true（2026-11-14 用户裁定）</b>：新版 Claude Code 已把 Monitor 从实验功能
+         * 转为默认开启；本仓跟随，不再要求显式配置。仍可用
+         * {@code nexusai.feature.monitor-tool=false} 关闭（保留回退能力）。
+         */
+        @org.springframework.beans.factory.annotation.Value("${nexusai.feature.monitor-tool:true}")
         private boolean monitorTool;
 
         /** {@code NODE_ENV==='test'} env gate · CC tools.ts:244（TestingPermissionTool 注册点）· 默认 false（仅 test 环境）。 */

@@ -3,7 +3,7 @@ package com.nexusai.infra.llm;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
-import com.openai.models.ChatCompletionMessageToolCall;
+import com.openai.models.chat.completions.ChatCompletionMessageToolCall;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
@@ -359,7 +359,7 @@ class OutboundWireProjectionWireFidelityTest {
         List<ChatCompletionMessageToolCall> tcs =
             OpenAiSdkProvider.toSdkMessage(m).asAssistant().toolCalls().orElseThrow();
         assertThat(tcs).as("前置：toSdkMessage 必须真的产出 tool_call（否则本用例不可观测）").hasSize(1);
-        return tcs.get(0).function().arguments();
+        return tcs.get(0).function().orElseThrow().function().arguments();
     }
 
     /** 头部探针在 {@code messages[0]} 上的指纹（= 真实探针的 hash 输入，不是复制的一份口径）。 */

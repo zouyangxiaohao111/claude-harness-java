@@ -1,11 +1,14 @@
 package com.nexusai.application.agent.tool.impl;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.loop.FeatureFlags;
+import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
 import com.nexusai.application.agent.tasks.MonitorMcpTaskRunner;
+import com.nexusai.application.agent.tasks.MonitorTaskRunner;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolNameConstants;
@@ -14,128 +17,128 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+
+import java.util.ArrayList;
+import java.util.List;
 
 /**
- * MonitorTool 真实现 · 对齐 CC {@code tools.ts:39-40, 237} 接线 glue + LocalShellTask.tsx
- * kind='monitor' 语义。
+ * Monitor 工具 · 对齐 claude.exe v2.1.325 的 MonitorTool（off≈164,355,xxx）。
  *
- * <p><b>WHY（OPD-10 注册桩 → 生产接线）</b>: CC 中 {@code MonitorTool = feature('MONITOR_TOOL')
- * ? require(...).MonitorTool : null}（tools.ts:39-40），flag 关时工具为 {@code null}、不进入
- * getAllBaseTools 数组（tools.ts:237）。Java 端原为 fail-loud stub（execute 直接报"未实现"）。
- * 本类接入 {@link MonitorMcpTaskRunner}：execute 注册 MONITOR_MCP 任务 + 独立线程跑流式监控，
- * 使 MonitorTool 从 0 生产调用方 → 1。
+ * <p><b>CC 真契约</b>（本次用 REA 从二进制挖出，取代此前的推断实现）：
+ * <ul>
+ *   <li>{@code command} 与 {@code ws} <b>二选一</b>（原文 {@code exactly one of command or ws}）；</li>
+ *   <li>{@code command}：<i>Shell command or script. Each stdout line is an event; exit ends the watch.</i></li>
+ *   <li>{@code description}：给人看的监控描述（任务面板与通知摘要）；</li>
+ *   <li>{@code timeout_ms}：到点自动结束；{@code allowed_domains}：命令模式域名白名单。</li>
+ * </ul>
  *
- * <p><b>门控语义</b>: {@link #isEnabled()} = {@code featureFlags.monitorTool()}
- * （{@code MONITOR_TOOL} flag · CC tools.ts:39），默认全关 → isEnabled()==false 不暴露。
+ * <p>工具说明原文：<i>When you are about to check a log, process or job again and again to
+ * catch each new event, use it and not repeated Bash calls or sleeps.</i>
  *
- * <p><b>DEC-1 显式冲突标注（规则七）</b>: CC MonitorTool 本体 TS 模块被 DCE 剔除，由 glue+语义
- * 推得输入为 {@code command}（任意 shell 脚本，流式重定向到 outputFile）；Java
- * {@link MonitorMcpTaskRunner#monitor} 固定轮询 McpServerService（running/error/stopped + 池大小），
- * 无任意 shell 执行。裁决：选 <b>Java 语义</b>（监控对象固定为 MCP server 状态），接口名 / 摘要
- * （{@code Monitor "desc" stream ended}，LocalShellTask.tsx:136）/ 生命周期语义逐字对齐 CC；
- * 不伪造 {@code command} 死参数（inputSchema 只暴露 description，DEC-2）。
- *
- * <p>CC 门控原名/行号: {@code MONITOR_TOOL} (Open-ClaudeCode/src/tools.ts:39-40)。
- * CC 注册点: Open-ClaudeCode/src/tools.ts:237。
- * CC monitor 摘要: Open-ClaudeCode/src/tasks/LocalShellTask/LocalShellTask.tsx:129-144。
+ * <p>门控：{@code MONITOR_TOOL} feature flag（默认关，对齐 CC flag-off null）。
  */
 public class MonitorTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(MonitorTool.class);
 
-    /** CC 工具名 · {@code tools.ts:39-40} MonitorTool（无源码，以类名/工具名为准）。 */
     public static final String NAME = ToolNameConstants.MONITOR_TOOL_NAME;
 
     private final FeatureFlags featureFlags;
-
-    /** MONITOR_MCP 流式监控执行器（可为 null —— 测试直构无 bean 时 execute fail-loud）。 */
+    /** 历史 MCP 状态监控执行器（保留构造兼容；command/ws 模式不用它）。 */
     private final MonitorMcpTaskRunner monitorMcpTaskRunner;
+    /** CC 契约的命令/连接执行器。 */
+    private final MonitorTaskRunner monitorTaskRunner;
+    /** 配置强制开启（nexusai.feature.monitor-tool=true）· 与 CC 的实验 flag 并存。 */
+    private final boolean forceEnabled;
+    /** 权限判定复用 Bash 链（setter 注入，避免改注册方法签名）。 */
+    private BashTool bashTool;
 
     public MonitorTool() {
-        this(FeatureFlags.ALL_DISABLED, null);
+        this(FeatureFlags.ALL_DISABLED, null, null, false);
     }
 
-    /** 注册桩兼容构造器（保留既有 feature-gated 注册路径）。 */
     public MonitorTool(FeatureFlags featureFlags) {
-        this(featureFlags, null);
+        this(featureFlags, null, null, false);
     }
 
-    /**
-     * 生产构造器 · 对齐 CC MonitorTool feature('MONITOR_TOOL') 条件构建。
-     *
-     * @param featureFlags        MONITOR_TOOL 门控（{@code FeatureFlags.ALL_DISABLED} 时工具不暴露）
-     * @param monitorMcpTaskRunner MCP 状态监控执行器（{@code @Component}；null 时 execute fail-loud）
-     */
+    /** 旧构造器（MCP 模式）兼容。 */
     public MonitorTool(FeatureFlags featureFlags, MonitorMcpTaskRunner monitorMcpTaskRunner) {
+        this(featureFlags, monitorMcpTaskRunner, null, false);
+    }
+
+    public MonitorTool(FeatureFlags featureFlags, MonitorMcpTaskRunner monitorMcpTaskRunner,
+                       MonitorTaskRunner monitorTaskRunner) {
+        this(featureFlags, monitorMcpTaskRunner, monitorTaskRunner, false);
+    }
+
+    public MonitorTool(FeatureFlags featureFlags, MonitorMcpTaskRunner monitorMcpTaskRunner,
+                       MonitorTaskRunner monitorTaskRunner, boolean forceEnabled) {
         this.featureFlags = featureFlags != null ? featureFlags : FeatureFlags.ALL_DISABLED;
         this.monitorMcpTaskRunner = monitorMcpTaskRunner;
+        this.monitorTaskRunner = monitorTaskRunner;
+        this.forceEnabled = forceEnabled;
+    }
+
+    @Autowired(required = false)
+    public void setBashTool(BashTool bashTool) {
+        this.bashTool = bashTool;
     }
 
     @Override
     public String name() {
-        if (log.isDebugEnabled()) {
-            log.debug("MonitorTool.name(): 返回 CC 工具名 MONITOR_TOOL_NAME='Monitor'（对齐 tools.ts:39-40）");
-        }
         return NAME;
     }
 
     @Override
     public String description() {
-        return "Start a streaming monitor of MCP server status (pool size, running/error/stopped counts). " +
-               "Each 2s observation is appended to an output file; read it with TaskOutput. " +
-               "The stream ends when stopped (TaskStop) or the monitor exits.";
+        return "Watch, monitor, or keep an eye on a process/log/command or WebSocket — "
+            + "stream each stdout line as a live notification. "
+            + "Use it when you are about to check a log, process or job again and again to "
+            + "catch each new event, instead of repeated Bash calls or sleeps.";
     }
 
     @Override
     public JsonNode inputSchema() {
-        // DEC-2 · 对齐 CC MonitorTool 的 description 承载摘要（LocalShellTask.tsx:129 `Monitor "desc" ...`）。
-        // Java monitor 固定监控 MCP server 状态 → 无 command 死参数。
         ObjectNode schema = JsonNodeFactory.instance.objectNode();
         schema.put("type", "object");
-        ObjectNode properties = schema.putObject("properties");
-        ObjectNode desc = JsonNodeFactory.instance.objectNode();
-        desc.put("type", "string");
-        desc.put("description", "监控描述，用于状态摘要（CC: Monitor \"desc\" ...）。可省，缺省用 task id 占位。");
-        properties.set("description", desc);
+        ObjectNode props = schema.putObject("properties");
+        props.putObject("command").put("type", "string").put("description",
+            "Shell command or script. Each stdout line is an event; exit ends the watch.");
+        props.putObject("ws").put("type", "string").put("description",
+            "WebSocket URL (ws:// or wss://). Each message is an event.");
+        props.putObject("description").put("type", "string").put("description",
+            "Short human-readable description of what you are monitoring (shown in notifications).");
+        props.putObject("timeout_ms").put("type", "integer").put("description",
+            "How long the monitor may run before it is stopped.");
+        ObjectNode domains = props.putObject("allowed_domains");
+        domains.put("type", "array");
+        domains.putObject("items").put("type", "string");
+        domains.put("description", "allowed_domains applies only to a command monitor");
+        schema.putArray("required").add("description");
         schema.put("additionalProperties", false);
         return schema;
     }
 
     @Override
     public boolean isEnabled() {
-        boolean enabled = this.featureFlags.monitorTool();
-        if (log.isDebugEnabled()) {
-            log.debug("MonitorTool.isEnabled() = {}（MONITOR_TOOL 门控，CC tools.ts:39）", enabled);
-        }
-        return enabled;
+        return forceEnabled || featureFlags.monitorTool();
     }
 
     /**
-     * 权限表态 · 对齐 CC MonitorTool.tsx:90-93 {@code checkPermissions = bashToolHasPermission(...)}
-     * 的结构（H-17「MonitorTool 无 checkPermissions → 权限绕过」修复）。
-     *
-     * <p><b>DEC-1 适配</b>: CC 对任意 shell {@code command} 复用 Bash 权限链（bashPermissions.ts）；
-     * Java MonitorTool 按 DEC-1 拍板固定监控 MCP server 状态（{@link MonitorMcpTaskRunner} 轮询，
-     * 无 command 输入）→ 无 bash 内容可检。返回显式 {@link PermissionResult.Allow}（decisionReason
-     * 标注 MCP 只读轮询语义），补上该 override 使权限面显式、可审计（非基类「default allow」盲区）；
-     * whole-tool deny/ask 规则仍由管线 1a/1b 层在 1c 之前先行裁决，不受本 override 影响。
-     *
-     * @return Allow（decisionReason=Other「Monitor MCP 状态轮询（DEC-1）只读」）
+     * 权限 · command 模式复用 Bash 权限链（对齐 CC bashToolHasPermission 结构）；
+     * ws 模式由 execute 做协议与域名校验。
      */
     @Override
     public PermissionResult checkPermissions(JsonNode input, ToolUseContext ctx) {
-        if (log.isDebugEnabled()) {
-            log.debug("MonitorTool.checkPermissions: MCP 状态轮询（DEC-1 无 shell command），"
-                    + "自动放行（对齐 CC MonitorTool.tsx:90-93 结构，Java 无 command 输入）");
+        String command = input != null ? input.path("command").asText("") : "";
+        if (!command.isBlank() && bashTool != null) {
+            return bashTool.checkPermissions(input, ctx);
         }
         return new PermissionResult.Allow(
-                input,
-                new com.nexusai.application.agent.permission.PermissionDecisionReason.Other(
-                        "Monitor MCP 状态轮询（DEC-1 无 shell command）只读监控自动放行"),
-                null,
-                false,
-                null,
-                java.util.List.of());
+            input,
+            new PermissionDecisionReason.Other("monitor_allow"),
+            null, false, null, List.of());
     }
 
     @Override
@@ -143,61 +146,52 @@ public class MonitorTool implements Tool {
         return execute(call, null);
     }
 
-    /**
-     * 生产接线 execute · DEC-3：
-     * <ol>
-     *   <li>读 input.description（缺省 → 空串，monitor() 用 taskId 占位）</li>
-     *   <li>{@code registerTask(description, call.id(), ctx.agentId())} — ctx.agentId() 为 subagent
-     *       时 → {@code killMonitorMcpTasksForAgent} 可按 agent 归属命中（CC runAgent.ts:852-861）；
-     *       main-thread ctx null / 不归属 → 不被 subagent 结束批量 kill</li>
-     *   <li>独立线程跑 {@code monitor(taskId, description, null)}（monitor 是阻塞轮询循环，
-     *       Thread.sleep，必须异步，design §1.1）</li>
-     *   <li>返回 BashTool.executeBackground 同款模型契约：taskId + TaskOutput 读 outputFile</li>
-     *   <li>错误处理：runner 未装配 → ToolResult.error（fail-loud）；{@link MonitorMcpTaskRunner#isMonitorAvailable()}
-     *       为 false（McpServerService 无 bean）→ execute 在启动线程前同步返回 error（monitor 抛错在子线程，
-     *       execute 无法捕获——前置校验保证不"假启动"）</li>
-     * </ol>
-     */
     @Override
     public AgentToolResult<?> execute(ToolUseBlock call, ToolUseContext ctx) {
-        if (monitorMcpTaskRunner == null) {
-            log.warn("[MonitorTool] execute: MonitorMcpTaskRunner 未装配（MONITOR_TOOL 开但无 runner bean）call.id={}", call.id());
+        if (monitorTaskRunner == null) {
             return ToolResult.error(call.id(),
-                "Monitor 工具不可用：MonitorMcpTaskRunner 未装配（MONITOR_TOOL 需 task 系统运行时）");
+                "Monitor 工具不可用：MonitorTaskRunner 未装配（MONITOR_TOOL 需 task 系统运行时）");
         }
-        if (!monitorMcpTaskRunner.isMonitorAvailable()) {
-            log.error("[MonitorTool] execute: McpServerService 未装配，无法监控 MCP 状态 call.id={}", call.id());
-            return ToolResult.error(call.id(),
-                "Monitor 工具不可用：McpServerService 未装配，无法轮询 MCP 服务器状态");
+        JsonNode input = call.input();
+        String command = input.path("command").asText("");
+        String ws = input.path("ws").asText("");
+        boolean hasCommand = !command.isBlank();
+        boolean hasWs = !ws.isBlank();
+        if (hasCommand == hasWs) {
+            return ToolResult.error(call.id(), "Exactly one of command or ws is required");
         }
-
-        String description = call.input().path("description").asText("");
-        // Phase 4 (cron-notify): 透传创建会话 sessionId（ctx.sessionId()）→ monitor 终态通知
-        // 注入创建会话回合（对齐 CC monitor 终态通知注入当前循环，LocalShellTask.tsx:166-171）。
-        String monitorSessionId = ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null;
-        String taskId = monitorMcpTaskRunner.registerTask(
-            description, call.id(), ctx != null ? ctx.agentId() : null, monitorSessionId);
-        // [批 3b-D7] 输出根所属会话显式传入（本方法已从 ctx.sessionId() 取到）
-        String outputFile = monitorMcpTaskRunner.outputFileFor(monitorSessionId, taskId);
-
-        // monitor() 是阻塞轮询循环（2s/次），必须在独立线程运行；终态由 monitor() 内部
-        // transitionTerminal（updateTaskState + SDK + notificationQueue priority=NEXT）闭环。
-        Thread t = new Thread(() -> {
-            try {
-                monitorMcpTaskRunner.monitor(taskId, description, null);
-            } catch (Throwable e) {
-                // fail-loud：monitor() 已先 transitionTerminal(failed)（LocalShellTask.tsx:139
-                // "script failed"），此处补日志防子线程静默死亡（不吞错误）。
-                log.error("[MonitorTool] monitor 线程异常终止 taskId={}: {}", taskId, e.getMessage(), e);
+        String description = input.path("description").asText("");
+        if (description.isBlank()) {
+            return ToolResult.error(call.id(), "description is required");
+        }
+        long timeoutMs = input.path("timeout_ms").asLong(0L);
+        if (timeoutMs < 0) {
+            return ToolResult.error(call.id(), "timeout_ms must be >= 0");
+        }
+        List<String> domains = new ArrayList<>();
+        JsonNode domainsNode = input.path("allowed_domains");
+        if (domainsNode.isArray()) {
+            for (JsonNode d : domainsNode) {
+                if (d.isTextual()) {
+                    domains.add(d.asText());
+                }
             }
-        }, "monitor-mcp-" + taskId);
-        t.setDaemon(true);
-        t.start();
-
-        log.info("[MonitorTool] Monitor started: taskId={}, desc={}, outputFile={}（流式监控已接线，"
-            + "TaskOutput 可读 outputFile，TaskStop 可终止）", taskId, description, outputFile);
-        return ToolResult.success(call.id(),
-            "Monitor started: " + taskId
-            + "\nUse TaskOutput to read the stream from: " + outputFile);
+        }
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        var agentId = ctx != null ? ctx.agentId() : null;
+        try {
+            String taskId = hasCommand
+                ? monitorTaskRunner.startCommand(command, description, timeoutMs, call.id(), agentId, sessionId)
+                : monitorTaskRunner.startWebSocket(ws, domains, description, timeoutMs, call.id(), agentId, sessionId);
+            log.info("[MonitorTool] started taskId={} mode={} desc={}",
+                taskId, hasCommand ? "command" : "ws", description);
+            return ToolResult.success(call.id(),
+                "Monitor started: " + taskId + "\nUse TaskOutput to read the stream; TaskStop to stop it.");
+        } catch (IllegalArgumentException e) {
+            return ToolResult.error(call.id(), e.getMessage());
+        } catch (Exception e) {
+            log.error("[MonitorTool] start failed: {}", e.getMessage(), e);
+            return ToolResult.error(call.id(), "Monitor failed to start: " + e.getMessage());
+        }
     }
 }

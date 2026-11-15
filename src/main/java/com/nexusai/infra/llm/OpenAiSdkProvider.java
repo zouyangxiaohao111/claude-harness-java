@@ -2,6 +2,7 @@ package com.nexusai.infra.llm;
 
 import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
+import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
@@ -28,6 +29,8 @@ import com.openai.core.JsonValue;
 import com.openai.core.http.StreamResponse;
 import com.openai.errors.OpenAIServiceException;
 import com.openai.models.*;
+import com.openai.models.chat.completions.*;
+import com.openai.models.completions.CompletionUsage;
 import jakarta.annotation.Resource;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -1117,8 +1120,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             return List.of();
         }
         List<ToolUseBlock> blocks = new ArrayList<>();
-        for (ChatCompletionMessageToolCall tc : toolCallsOpt.get()) {
-            if (tc == null || tc.id() == null || tc.id().isBlank()
+        for (ChatCompletionMessageToolCall tc0 : toolCallsOpt.get()) {
+            if (tc0 == null || tc0.function().isEmpty()) {
+                continue;
+            }
+            ChatCompletionMessageFunctionToolCall tc = tc0.function().get();
+            if (tc.id() == null || tc.id().isBlank()
                 || tc.function() == null || tc.function().name() == null
                 || tc.function().name().isBlank()) {
                 continue;
@@ -1525,7 +1532,7 @@ public class OpenAiSdkProvider implements LlmProvider {
         String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
         String reasoningEffort = mapToOpenAiReasoningEffort(resolvedEffort);
         if (reasoningEffort != null && EffortSupport.modelSupportsEffort(modelName)) {
-            b.reasoningEffort(ChatCompletionReasoningEffort.of(reasoningEffort));
+            b.reasoningEffort(ReasoningEffort.of(reasoningEffort));
             if (log.isDebugEnabled()) {
                 log.debug("OpenAI 请求注入 reasoning_effort={} model={} · CC original 无对应，Java 多 provider 扩展 ⊕",
                     reasoningEffort, modelName);
@@ -1707,14 +1714,15 @@ public class OpenAiSdkProvider implements LlmProvider {
                             || tc.name() == null || tc.name().isBlank()) {
                             continue;
                         }
-                        tcs.add(ChatCompletionMessageToolCall.builder()
+                        tcs.add(ChatCompletionMessageToolCall.ofFunction(
+                            ChatCompletionMessageFunctionToolCall.builder()
                             .id(tc.id())
                             .type(JsonValue.from("function"))
-                            .function(ChatCompletionMessageToolCall.Function.builder()
+                            .function(ChatCompletionMessageFunctionToolCall.Function.builder()
                                 .name(tc.name())
                                 .arguments(tc.arguments() == null ? "{}" : tc.arguments())
                                 .build())
-                            .build());
+                            .build()));
                     }
                     if (!tcs.isEmpty()) {
                         b.toolCalls(tcs);
@@ -1744,7 +1752,7 @@ public class OpenAiSdkProvider implements LlmProvider {
                     yield null;
                 }
                 ChatCompletionToolMessageParam.Builder tb =
-                    com.openai.models.ChatCompletionToolMessageParam.builder()
+                    ChatCompletionToolMessageParam.builder()
                         .toolCallId(m.toolCallId());
                 // [R32-b9 / R32-b14] acceptFeedback + contentBlocks(text 块) → content 数组
                 //   （独立 text part · Fix E 结构化注入）。
@@ -1930,10 +1938,11 @@ public class OpenAiSdkProvider implements LlmProvider {
                 }
             }
 
-            return ChatCompletionTool.builder()
+            return ChatCompletionTool.ofFunction(
+                ChatCompletionFunctionTool.builder()
                 .type(typeJson)
                 .function(fnBuilder.build())
-                .build();
+                .build());
         } catch (Exception e) {
             log.warn("OpenAiSdkProvider: 转换 tool 条目失败 {} (已跳过): {}",
                 truncate(toolNode.toString(), 200), e.getMessage(), e);
@@ -2074,7 +2083,23 @@ public class OpenAiSdkProvider implements LlmProvider {
             } catch (Exception ignore) {
                 // header 转换失败不阻断错误上浮
             }
-            String body = se.body() == null ? "" : se.body();
+            // openai-java 4.x：body() 由 String 改为 JsonValue。⛔ 不能用 body().toString()
+            // （Kotlin Map/List 形态 {error={message=...}}，不是 JSON）；用 Jackson 按 JSON 序列化。
+            JsonValue bodyJson = se.body();
+            String body;
+            if (bodyJson == null || bodyJson.isNull() || bodyJson.isMissing()) {
+                body = "";
+            } else if (bodyJson.asString().isPresent()) {
+                // JsonValue 继承原始 JsonField（泛型擦除）⇒ asString().get() 是 Object，用 asStringOrThrow 取 String
+                body = bodyJson.asStringOrThrow();
+            } else {
+                try {
+                    body = JSON.writeValueAsString(bodyJson);
+                } catch (JsonProcessingException ex) {
+                    log.debug("OpenAiSdkProvider: 序列化异常 body 失败: {}", ex.toString());
+                    body = String.valueOf(bodyJson);
+                }
+            }
             return LlmApiException.isImageErrorBody(body)
                 ? LlmApiException.imageError(status, headers, body)
                 : new LlmApiException(status, headers, body);

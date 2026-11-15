@@ -1813,7 +1813,13 @@ public class ReadFileTool implements Tool {
         }
         boolean antDirectFormat = com.nexusai.application.agent.compact.ContextUsageCalculator.isAnthropic(
             modelMapper, providerMapper, modelName);
-        return antDirectFormat
+        // Responses 协议同样开放 Read 直给通道（tool_result 可带图）：openai_response 走
+        // input_image + function_call_output.output 数组；openai_compatible（chat/completions）
+        // 协议不支持 tool 消息带图，保持不直给（直给必丢图）。
+        String providerType = com.nexusai.application.agent.compact.ContextUsageCalculator.providerType(
+            modelMapper, providerMapper, modelName);
+        boolean directFormat = antDirectFormat || "openai_response".equals(providerType);
+        return directFormat
             ? ReadDirectCapability.DIRECT
             : ReadDirectCapability.FORMAT_NO_DIRECT;
     }

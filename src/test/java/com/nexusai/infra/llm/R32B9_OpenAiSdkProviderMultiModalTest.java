@@ -5,7 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
-import com.openai.models.ChatCompletionMessageParam;
+import com.openai.models.chat.completions.ChatCompletionMessageParam;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 

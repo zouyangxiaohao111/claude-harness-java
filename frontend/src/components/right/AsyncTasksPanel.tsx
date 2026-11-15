@@ -15,7 +15,9 @@ import { RunMoreButton, capRunRows } from './CollapsibleGroup'
  */
 const TASK_TYPE_LABEL: Record<string, string> = {
   local_bash: '命令', local_agent: '子代理', in_process_teammate: '队友',
-  local_workflow: 'workflow', monitor_mcp: '监控',
+  local_workflow: 'workflow', monitor_mcp: 'MCP 监控',
+  // Monitor 工具（命令/WebSocket 事件流）· 对齐 CC kind=monitor
+  monitor: '监控',
 }
 const TASK_STATUS_LABEL: Record<string, string> = {
   pending: '等待', running: '运行中', completed: '已完成', failed: '失败', killed: '已停止',
@@ -217,7 +219,8 @@ export function AsyncTasksPanel({ activeSessionId, showToast, hideHeader = false
             const statusLabel = TASK_STATUS_LABEL[t.status] ?? t.status
             const typeLabel = TASK_TYPE_LABEL[t.type] ?? t.type
             return (
-              <div key={t.id} className="todo-row" onClick={() => setDetail(t)} title="查看任务详情">
+              <div key={t.id} className={`todo-row${t.type === 'monitor' ? ' monitor' : ''}`}
+                onClick={() => setDetail(t)} title="查看任务详情">
                 <span className={`todo-row-dot ${running ? 'in_progress' : t.status === 'completed' ? 'completed' : 'pending'}`} />
                 <span className="todo-row-main">
                   {/* 长命令单行截断（hover 看全）：整条命令当标题会把卡片撑成 3-4 行 */}
@@ -291,6 +294,12 @@ function AsyncTaskDetailModal({ task, onClose, onKill }: {
             <span className="td-id">{typeLabel}</span>
             {task.isBackgrounded && <span className="td-id">后台</span>}
           </div>
+          {task.type === 'monitor' && (
+            <div className="td-sec td-monitor-hint">
+              <div className="td-label">监控方式</div>
+              <div className="td-val">命令或连接的每一行输出都会作为一条事件推送到对话；停止或退出即结束。</div>
+            </div>
+          )}
           <div className="td-sec">
             <div className="td-label">{running ? '已运行' : '耗时'}</div>
             <div className="td-val">{fmt(Math.max(0, elapsed))}</div>

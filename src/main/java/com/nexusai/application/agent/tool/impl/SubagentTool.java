@@ -3491,6 +3491,10 @@ public class SubagentTool implements Tool {
                         finalizer.finalizeFailed(ag.toString(),
                             "Subagent " + sel.agentType() + " failed: " + e.getMessage());
                     } finally {
+                        // 对齐 CC stop-pending：worker 真正退出后才清标记（killAsyncAgent 发起 stop 时加入）。
+                        //   spawn 与 resume 两条 worker 都必须清 —— 否则标记永久残留，该 agent 后续 resume
+                        //   会被误判为「still stopping」。
+                        runnerRef.clearStopPending(ag.toString());
                         // P0-2 修复: 异步线程结束时清理 tracker key, 阻止 sessionCwd map 无界增长.
                         //   [acc8 复核 · 理由已更正] 原注释写「避免 activeSessionCount 单调递增」——
                         //   该读点实测 0 调用方（:2173-2179 已登记）、且该访问器已随 misc1 删除，故理由
@@ -4009,6 +4013,9 @@ public class SubagentTool implements Tool {
                 // [fix-toolcall-fault B] 同主路径：异常 → finalizeFailed（旧 finalize 会写 COMPLETED）
                 finalizer.finalizeFailed(ag.toString(),
                     "Subagent " + sel.agentType() + " resume failed: " + e.getMessage());
+            } finally {
+                // 对齐 CC stop-pending：resume worker 真正退出后才清标记（killAsyncAgent 发起时加入）。
+                runnerRef.clearStopPending(ag.toString());
             }
         }, "resume-subagent-" + ag);
         asyncWorker.setDaemon(true);
