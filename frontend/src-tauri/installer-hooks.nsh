@@ -45,6 +45,61 @@
 !macro NSIS_HOOK_POSTINSTALL
   WriteRegExpandStr HKCU "Environment" "NEXUSAI_INSTALL_DIR" "$INSTDIR"
   System::Call 'user32::SendMessageTimeoutW(i 0xFFFF, i 0x001A, i 0, w "Environment", i 0, i 5000, *i .r0)'
+
+  ; ── 随包 Git（MinGit）环境变量 · 三层注入的第二层 ──
+  ;
+  ; WHY 必须写真实环境变量：后端不一定由 Tauri 拉起（dev / 脚本 / 独立部署），
+  ; 这些路径没有 spawn_backend 的进程级注入，Agent 运行时找不到 Git Bash。
+  ;
+  ; 策略：
+  ;   · PATH **末尾追加**（不是前置）⇒ 系统 Git 仍优先命中；
+  ;   · CLAUDE_CODE_GIT_BASH_PATH 只在系统没有 Git 时写，避免抢用户已有版本；
+  ;   · 写入的段记在 HKCU\Software\NexusAI\BundledGit，供升级/卸载**精确**移除。
+  IfFileExists "$INSTDIR\backend\git\bin\bash.exe" 0 nexusai_git_done
+
+  StrCpy $R0 "$INSTDIR\backend\git\cmd;$INSTDIR\backend\git\bin;$INSTDIR\backend\git\usr\bin"
+  ReadRegStr $R1 HKCU "Software\NexusAI\BundledGit" "InjectedSegment"
+  ReadRegStr $R2 HKCU "Environment" "PATH"
+
+  ; ① 旧版本注入段（安装路径可能变化）→ 仅在末尾命中时精确移除
+  StrCmp $R1 "" nexusai_git_need_append
+  StrLen $R3 "$R1"
+  StrCpy $R4 "$R2" "" -$R3
+  StrCmp $R4 "$R1" nexusai_git_remove_old nexusai_git_need_append
+  nexusai_git_remove_old:
+    StrCpy $R2 "$R2" -$R3
+    ; 去掉截断后残留的末尾分号（否则反复升级会累积空项 ";;"）
+    StrCpy $R4 "$R2" 1 -1
+    StrCmp $R4 ";" 0 nexusai_git_need_append
+      StrCpy $R2 "$R2" -1
+
+  ; ② 新段已在末尾 ⇒ 幂等跳过
+  nexusai_git_need_append:
+  StrLen $R3 "$R0"
+  StrCpy $R4 "$R2" "" -$R3
+  StrCmp $R4 "$R0" nexusai_git_path_ready nexusai_git_do_append
+  nexusai_git_do_append:
+    StrCmp $R2 "" nexusai_git_path_empty nexusai_git_path_nonempty
+  nexusai_git_path_empty:
+    StrCpy $R2 "$R0"
+    Goto nexusai_git_path_ready
+  nexusai_git_path_nonempty:
+    StrCpy $R2 "$R2;$R0"
+  nexusai_git_path_ready:
+  WriteRegExpandStr HKCU "Environment" "PATH" "$R2"
+  WriteRegStr HKCU "Software\NexusAI\BundledGit" "InjectedSegment" "$R0"
+
+  ; ③ 系统已有 Git（Git for Windows 注册表项）⇒ 不写 bash 路径，保证系统优先。
+  ;    便携版/手工解压的 Git 检测不到，会落到随包 Git —— 可用性不受影响，仅版本选择不同。
+  ReadRegStr $R5 HKLM "SOFTWARE\GitForWindows" "InstallPath"
+  StrCmp $R5 "" 0 nexusai_git_broadcast
+  ReadRegStr $R5 HKCU "SOFTWARE\GitForWindows" "InstallPath"
+  StrCmp $R5 "" 0 nexusai_git_broadcast
+    WriteRegExpandStr HKCU "Environment" "CLAUDE_CODE_GIT_BASH_PATH" "$INSTDIR\backend\git\bin\bash.exe"
+
+  nexusai_git_broadcast:
+  System::Call 'user32::SendMessageTimeoutW(i 0xFFFF, i 0x001A, i 0, w "Environment", i 0, i 5000, *i .r0)'
+  nexusai_git_done:
 !macroend
 
 !macro NSIS_HOOK_PREUNINSTALL
@@ -54,6 +109,32 @@
     DeleteRegValue HKCU "Environment" "NEXUSAI_INSTALL_DIR"
     System::Call 'user32::SendMessageTimeoutW(i 0xFFFF, i 0x001A, i 0, w "Environment", i 0, i 5000, *i .r0)'
   ${EndIf}
+
+  ; --- 随包 Git 环境变量：只移除本产品写入的部分 ---
+  ; ⛔ 绝不整条覆盖 PATH（会删掉用户其它路径）。判据 = 记录的段仍位于**末尾**，
+  ;    命中才截掉；用户手动调整过顺序的边界情况保持原样（宁可不删，不可误删）。
+  ReadRegStr $R1 HKCU "Software\NexusAI\BundledGit" "InjectedSegment"
+  StrCmp $R1 "" nexusai_git_env_check_done
+    ReadRegStr $R2 HKCU "Environment" "PATH"
+    StrLen $R3 "$R1"
+    StrCpy $R4 "$R2" "" -$R3
+    StrCmp $R4 "$R1" 0 nexusai_git_env_check_done
+      StrCpy $R2 "$R2" -$R3
+      ; 去掉截断后可能残留的末尾分号
+      StrCpy $R4 "$R2" 1 -1
+      StrCmp $R4 ";" 0 nexusai_git_env_write
+        StrCpy $R2 "$R2" -1
+      nexusai_git_env_write:
+      WriteRegExpandStr HKCU "Environment" "PATH" "$R2"
+  nexusai_git_env_check_done:
+  DeleteRegKey HKCU "Software\NexusAI\BundledGit"
+
+  ; CLAUDE_CODE_GIT_BASH_PATH 仅在仍指向本次安装时删除
+  ReadRegStr $R2 HKCU "Environment" "CLAUDE_CODE_GIT_BASH_PATH"
+  StrCmp $R2 "$INSTDIR\backend\git\bin\bash.exe" 0 nexusai_git_bash_keep
+    DeleteRegValue HKCU "Environment" "CLAUDE_CODE_GIT_BASH_PATH"
+    System::Call 'user32::SendMessageTimeoutW(i 0xFFFF, i 0x001A, i 0, w "Environment", i 0, i 5000, *i .r0)'
+  nexusai_git_bash_keep:
 
   ; --- 这里刻意不提示、不删除任何数据 ---
   ; 删除与否由用户在**卸载确认页的复选框**决定，

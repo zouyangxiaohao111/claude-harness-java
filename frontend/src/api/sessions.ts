@@ -22,11 +22,19 @@ export const sessionApi = {
       method: 'PATCH',
       body: { enabled } satisfies SessionToolPatchRequest,
     }),
-  /** 按分类批量启用/禁用（PATCH /sessions/{id}/tools · body {category, enabled} · 返回整表，前端整表替换） */
-  setCategoryEnabled: (id: string, category: SessionToolCategory, enabled: boolean) =>
+  /**
+   * 按分类批量启用/禁用（PATCH /sessions/{id}/tools · body {category, enabled, mcpServer?}
+   * · 返回整表，前端整表替换）。
+   *
+   * <p>`mcpServer` 是三级联动的中间一级：传 server 名时只开关该 MCP server 的工具
+   * （`{category:'MCP', mcpServer:'rea'}`）；不传时行为与旧版一致（整个分类）。
+   */
+  setCategoryEnabled: (id: string, category: SessionToolCategory, enabled: boolean, mcpServer?: string) =>
     api<SessionToolDto[]>(`/sessions/${encodeURIComponent(id)}/tools`, {
       method: 'PATCH',
-      body: { category, enabled } satisfies SessionToolCategoryToggleRequest,
+      body: (mcpServer
+        ? { category, enabled, mcpServer }
+        : { category, enabled }) satisfies SessionToolCategoryToggleRequest,
     }),
   /**
    * [usage-gateway] 会话级用量明细（GET /sessions/{id}/usage · 记账侧权威值）。

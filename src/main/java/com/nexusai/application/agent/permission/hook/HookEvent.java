@@ -46,6 +46,12 @@ import java.util.Map;
  *                         字段（对齐 CC coreSchemas.ts:414-765 各 HookInputSchema）；
  *                         {@link #data()} 提供兼容的 KV Map 视图
  * @param timestampMs      事件时间戳
+ * @param promptId         CC original: {@code prompt_id}（claude.exe v2.1.325 base {@code j()}
+ *                         off≈311,039,6xx）；同一用户提问引发的所有事件 + OTel {@code prompt.id}
+ *                         的关联键。[Wave1-A] 追加字段；为 null 时序列化省略（CC 首个输入前 absent）
+ * @param effortLevel      CC original: {@code effort.level}（同 base schema）；当前轮推理档位
+ *                         （low/medium/high/xhigh/max），命令 hook 侧对应 {@code CLAUDE_EFFORT}
+ *                         env。[Wave1-A] 追加字段；null = 该模型/事件无 effort
  */
 public record HookEvent(
     HookEventType type,
@@ -61,7 +67,9 @@ public record HookEvent(
     List<Map<String, Object>> permissionSuggestions,
     Map<String, Object> requestedSchema,
     HookEventData dataRecord,
-    long timestampMs
+    long timestampMs,
+    String promptId,
+    String effortLevel
 ) {
     public HookEvent {
         if (type == null) {
@@ -76,6 +84,21 @@ public record HookEvent(
         if (timestampMs <= 0) {
             timestampMs = System.currentTimeMillis();
         }
+    }
+
+    /**
+     * [Wave1-A] 旧 14 参转发构造器 · {@code promptId}/{@code effortLevel} 缺失。
+     *
+     * <p>WHY: 加两个 base 字段前本 record 为 14 字段（52 处构造点）；纯追加字段后用转发
+     * 构造器承接（两字段 = null，序列化时省略 = CC absent 语义），不构成"兼容壳"——
+     * 唯一真源仍是 16 字段 record。需要透传时走 canonical 16 参构造。
+     */
+    public HookEvent(HookEventType type, String sessionId, String transcriptPath, String cwd,
+                     String permissionMode, String agentId, String toolName, JsonNode input,
+                     JsonNode result, String toolUseId, List<Map<String, Object>> permissionSuggestions,
+                     Map<String, Object> requestedSchema, HookEventData dataRecord, long timestampMs) {
+        this(type, sessionId, transcriptPath, cwd, permissionMode, agentId, toolName, input, result,
+            toolUseId, permissionSuggestions, requestedSchema, dataRecord, timestampMs, null, null);
     }
 
     /**
@@ -99,8 +122,18 @@ public record HookEvent(
 
     /** PreToolUse: tool_name, tool_input, tool_use_id · [H4] tool_use_id 必传 (CC coreSchemas.ts:417). */
     public static HookEvent toolPre(String toolName, JsonNode input, String sessionId, String agentId, String toolUseId) {
+        return toolPre(toolName, input, sessionId, agentId, toolUseId, null);
+    }
+
+    /**
+     * [Wave3-input] PreToolUse + {@code mcp_server}（v2.1.325 {@code {name, source}}）。
+     *
+     * @param mcpServer MCP 工具来源信息；非 MCP / 无来源 → null（序列化省略）
+     */
+    public static HookEvent toolPre(String toolName, JsonNode input, String sessionId, String agentId,
+                                    String toolUseId, Map<String, Object> mcpServer) {
         return new HookEvent(HookEventType.PRE_TOOL_USE, sessionId, null, null, null, agentId,
-            toolName, input, null, toolUseId, null, null, new HookEventData.PreToolUse(null), 0);
+            toolName, input, null, toolUseId, null, null, new HookEventData.PreToolUse(null, mcpServer), 0);
     }
 
     /** 测试/匹配场景便捷重载: 无 tool_use_id 上下文. [IMPL-03 X5] 生产路径禁止使用
@@ -112,8 +145,21 @@ public record HookEvent(
 
     /** PostToolUse: tool_name, tool_input, tool_response, tool_use_id · [H4] tool_use_id 必传 (CC coreSchemas.ts:444). */
     public static HookEvent toolPost(String toolName, JsonNode input, JsonNode result, String sessionId, String agentId, String toolUseId) {
+        return toolPost(toolName, input, result, sessionId, agentId, toolUseId, null, null);
+    }
+
+    /**
+     * [Wave3-input] PostToolUse + {@code mcp_server}/{@code duration_ms}（v2.1.325）。
+     *
+     * @param mcpServer  MCP 工具来源信息；非 MCP → null
+     * @param durationMs 工具本身耗时（不含权限询问/hook）；无计时 → null
+     */
+    public static HookEvent toolPost(String toolName, JsonNode input, JsonNode result, String sessionId,
+                                     String agentId, String toolUseId,
+                                     Map<String, Object> mcpServer, Long durationMs) {
         return new HookEvent(HookEventType.POST_TOOL_USE, sessionId, null, null, null, agentId,
-            toolName, input, result, toolUseId, null, null, new HookEventData.PostToolUse(null), 0);
+            toolName, input, result, toolUseId, null, null,
+            new HookEventData.PostToolUse(null, mcpServer, durationMs), 0);
     }
 
     /** 测试/匹配场景便捷重载: 无 tool_use_id 上下文. [IMPL-03 X5] 生产路径走 6 参重载. */
@@ -140,7 +186,19 @@ public record HookEvent(
     public static HookEvent toolPostFailure(String toolName, JsonNode input, JsonNode result,
                                             String error, boolean isInterrupt, String toolUseId,
                                             String sessionId, String agentId) {
-        HookEventData data = new HookEventData.PostToolUseFailure(error, isInterrupt, toolUseId, null);
+        return toolPostFailure(toolName, input, result, error, isInterrupt, toolUseId,
+            sessionId, agentId, null, null);
+    }
+
+    /**
+     * [Wave3-input] PostToolUseFailure + {@code mcp_server}/{@code duration_ms}（v2.1.325）。
+     */
+    public static HookEvent toolPostFailure(String toolName, JsonNode input, JsonNode result,
+                                            String error, boolean isInterrupt, String toolUseId,
+                                            String sessionId, String agentId,
+                                            Map<String, Object> mcpServer, Long durationMs) {
+        HookEventData data = new HookEventData.PostToolUseFailure(error, isInterrupt, toolUseId, null,
+            mcpServer, durationMs);
         return new HookEvent(HookEventType.POST_TOOL_USE_FAILURE, sessionId, null, null, null, agentId,
             toolName, input, result, null, null, null, data, 0);
     }
@@ -153,8 +211,17 @@ public record HookEvent(
     public static HookEvent permissionRequest(String toolName, JsonNode input,
                                                List<Map<String, Object>> permissionSuggestions,
                                                String sessionId, String agentId) {
+        return permissionRequest(toolName, input, permissionSuggestions, sessionId, agentId, null);
+    }
+
+    /** [Wave3-input] PermissionRequest + {@code mcp_server}（v2.1.325）。 */
+    public static HookEvent permissionRequest(String toolName, JsonNode input,
+                                               List<Map<String, Object>> permissionSuggestions,
+                                               String sessionId, String agentId,
+                                               Map<String, Object> mcpServer) {
         return new HookEvent(HookEventType.PERMISSION_REQUEST, sessionId, null, null, null, agentId,
-            toolName, input, null, null, permissionSuggestions, null, new HookEventData.PermissionRequest(null), 0);
+            toolName, input, null, null, permissionSuggestions, null,
+            new HookEventData.PermissionRequest(null, mcpServer), 0);
     }
 
     /**
@@ -178,9 +245,19 @@ public record HookEvent(
                                                List<Map<String, Object>> permissionSuggestions,
                                                String permissionMode, String toolUseId,
                                                String sessionId, String agentId) {
+        return permissionRequest(toolName, input, permissionSuggestions, permissionMode, toolUseId,
+            sessionId, agentId, null);
+    }
+
+    /** [Hook v2.1.325] PermissionRequest 全参 + {@code mcp_server}。 */
+    public static HookEvent permissionRequest(String toolName, JsonNode input,
+                                               List<Map<String, Object>> permissionSuggestions,
+                                               String permissionMode, String toolUseId,
+                                               String sessionId, String agentId,
+                                               Map<String, Object> mcpServer) {
         return new HookEvent(HookEventType.PERMISSION_REQUEST, sessionId, null, null, permissionMode,
             agentId, toolName, input, null, toolUseId, permissionSuggestions, null,
-            new HookEventData.PermissionRequest(null), 0);
+            new HookEventData.PermissionRequest(null, mcpServer), 0);
     }
 
     /** PermissionDenied: tool_name, tool_input, tool_use_id, reason. */
@@ -199,7 +276,14 @@ public record HookEvent(
      */
     public static HookEvent permissionDenied(String toolName, JsonNode input, String reason,
                                              String toolUseId, String sessionId, String agentId) {
-        HookEventData data = new HookEventData.PermissionDenied(reason, toolUseId, null, null);
+        return permissionDenied(toolName, input, reason, toolUseId, sessionId, agentId, null);
+    }
+
+    /** [Wave3-input] PermissionDenied + {@code mcp_server}（v2.1.325）。 */
+    public static HookEvent permissionDenied(String toolName, JsonNode input, String reason,
+                                             String toolUseId, String sessionId, String agentId,
+                                             Map<String, Object> mcpServer) {
+        HookEventData data = new HookEventData.PermissionDenied(reason, toolUseId, null, null, mcpServer);
         return new HookEvent(HookEventType.PERMISSION_DENIED, sessionId, null, null, null, agentId,
             toolName, input, null, null, null, null, data, 0);
     }
@@ -210,7 +294,24 @@ public record HookEvent(
 
     /** SessionStart: source (startup/resume/clear/compact), agent_type, model. */
     public static HookEvent sessionStart(String sessionId, String agentId, String source, String agentType, String model) {
-        HookEventData data = new HookEventData.SessionStart(source, agentType, model);
+        return sessionStart(sessionId, agentId, source, agentType, model, null, null, null, null, null);
+    }
+
+    /**
+     * [Wave3-input] SessionStart + v2.1.325 追加观测字段（source 含 {@code fork}）。
+     *
+     * @param sessionTitle             hook 可见的会话标题（无来源 → null）
+     * @param secondsSinceLastResponse resume/fork：距 transcript 最后一条 assistant 响应的秒数
+     * @param contextTokens            resume/fork：上次请求 input+cache_read+cache_creation+output
+     * @param promptCacheLikelyExpired 距最后响应超过 prompt cache TTL
+     * @param estimatedCacheWriteUsd   重缓存的估算成本（无定价来源 → null）
+     */
+    public static HookEvent sessionStart(String sessionId, String agentId, String source, String agentType,
+                                         String model, String sessionTitle, Long secondsSinceLastResponse,
+                                         Long contextTokens, Boolean promptCacheLikelyExpired,
+                                         Double estimatedCacheWriteUsd) {
+        HookEventData data = new HookEventData.SessionStart(source, agentType, model, sessionTitle,
+            secondsSinceLastResponse, contextTokens, promptCacheLikelyExpired, estimatedCacheWriteUsd);
         return new HookEvent(HookEventType.SESSION_START, sessionId, null, null, null, agentId,
             null, null, null, null, null, null, data, 0);
     }
@@ -277,8 +378,23 @@ public record HookEvent(
      */
     public static HookEvent stop(String sessionId, String agentId, boolean stopHookActive,
                                  String lastAssistantMessage, String agentType, String permissionMode) {
+        return stop(sessionId, agentId, stopHookActive, lastAssistantMessage, agentType, permissionMode,
+            null, null);
+    }
+
+    /**
+     * [Wave3-input] Stop + {@code background_tasks}/{@code session_crons}（v2.1.325）。
+     *
+     * @param backgroundTasks CC original: {@code background_tasks}（在飞后台工作）；无 → null
+     * @param sessionCrons    CC original: {@code session_crons}（会话级 cron）；无 → null
+     */
+    public static HookEvent stop(String sessionId, String agentId, boolean stopHookActive,
+                                 String lastAssistantMessage, String agentType, String permissionMode,
+                                 List<Map<String, Object>> backgroundTasks,
+                                 List<Map<String, Object>> sessionCrons) {
         String agentTypeCc = agentType != null && !agentType.isBlank() ? agentType : null;
-        HookEventData data = new HookEventData.Stop(stopHookActive, lastAssistantMessage, agentTypeCc);
+        HookEventData data = new HookEventData.Stop(stopHookActive, lastAssistantMessage, agentTypeCc,
+            backgroundTasks, sessionCrons);
         return new HookEvent(HookEventType.STOP, sessionId, null, null, permissionMode, agentId,
             null, null, null, null, null, null, data, 0);
     }
@@ -323,7 +439,19 @@ public record HookEvent(
 
     /** UserPromptSubmit with prompt. */
     public static HookEvent userPromptSubmit(String sessionId, String agentId, String prompt) {
-        HookEventData data = new HookEventData.UserPromptSubmit(prompt);
+        return userPromptSubmit(sessionId, agentId, prompt, null, null);
+    }
+
+    /**
+     * [Wave3-input] UserPromptSubmit + {@code source}/{@code session_title}（v2.1.325）。
+     *
+     * @param source       CC original: {@code source}（user/sdk/system/loop_wakeup/
+     *                     schedule_wakeup/poll_event）；无法判定 → null
+     * @param sessionTitle CC original: {@code session_title}；无来源 → null
+     */
+    public static HookEvent userPromptSubmit(String sessionId, String agentId, String prompt,
+                                             String source, String sessionTitle) {
+        HookEventData data = new HookEventData.UserPromptSubmit(prompt, source, sessionTitle);
         return new HookEvent(HookEventType.USER_PROMPT_SUBMIT, sessionId, null, null, null, agentId,
             null, null, null, null, null, null, data, 0);
     }
@@ -395,8 +523,20 @@ public record HookEvent(
     public static HookEvent subagentStop(String agentId, String agentType, String sessionId,
                                           boolean stopHookActive, String agentTranscriptPath, String lastAssistantMessage,
                                           String permissionMode) {
+        return subagentStop(agentId, agentType, sessionId, stopHookActive, agentTranscriptPath,
+            lastAssistantMessage, permissionMode, null, null);
+    }
+
+    /**
+     * [Wave3-input] SubagentStop + {@code background_tasks}/{@code session_crons}（v2.1.325）。
+     */
+    public static HookEvent subagentStop(String agentId, String agentType, String sessionId,
+                                          boolean stopHookActive, String agentTranscriptPath,
+                                          String lastAssistantMessage, String permissionMode,
+                                          List<Map<String, Object>> backgroundTasks,
+                                          List<Map<String, Object>> sessionCrons) {
         HookEventData data = new HookEventData.SubagentStop(agentId, agentType, stopHookActive,
-            agentTranscriptPath, lastAssistantMessage, null);
+            agentTranscriptPath, lastAssistantMessage, null, backgroundTasks, sessionCrons);
         return new HookEvent(HookEventType.SUBAGENT_STOP, sessionId, agentTranscriptPath, null, permissionMode, agentId,
             null, null, null, null, null, null, data, 0);
     }
@@ -605,6 +745,125 @@ public record HookEvent(
     public static HookEvent fileChanged(String filePath, String event, String sessionId) {
         HookEventData data = new HookEventData.FileChanged(filePath, event);
         return new HookEvent(HookEventType.FILE_CHANGED, sessionId, null, null, null, null,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [Wave1-A] v2.1.325 新增 6 事件工厂
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * PostToolBatch: tool_calls[] · 对齐 claude.exe v2.1.325 {@code R2} schema。
+     *
+     * <p>一批工具调用全部 resolved 后<b>只触发一次</b>（PostToolUse 是逐工具）。
+     * 每个元素为 {@code {tool_name, tool_input, tool_use_id, tool_response?}} 的 KV map。
+     *
+     * @param toolCalls 本批调用列表（CC original: {@code tool_calls}）
+     * @param sessionId 会话 ID（CC original: {@code session_id}）
+     * @param agentId   agent ID（CC original: {@code agent_id}；主线程 null）
+     */
+    public static HookEvent postToolBatch(List<Map<String, Object>> toolCalls, String sessionId, String agentId) {
+        HookEventData data = new HookEventData.PostToolBatch(toolCalls);
+        return new HookEvent(HookEventType.POST_TOOL_BATCH, sessionId, null, null, null, agentId,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    /**
+     * UserPromptExpansion: 斜杠命令 / MCP prompt 展开前 · 对齐 v2.1.325 {@code x2} schema。
+     *
+     * @param expansionType CC original: {@code expansion_type}（slash_command|mcp_prompt）
+     * @param commandName   CC original: {@code command_name}
+     * @param commandArgs   CC original: {@code command_args}
+     * @param commandSource CC original: {@code command_source}（optional）
+     * @param prompt        CC original: {@code prompt}（展开前原文）
+     * @param sessionId     会话 ID
+     * @param agentId       agent ID（主线程 null）
+     */
+    public static HookEvent userPromptExpansion(String expansionType, String commandName, String commandArgs,
+                                                String commandSource, String prompt,
+                                                String sessionId, String agentId) {
+        HookEventData data = new HookEventData.UserPromptExpansion(expansionType, commandName,
+            commandArgs, commandSource, prompt);
+        return new HookEvent(HookEventType.USER_PROMPT_EXPANSION, sessionId, null, null, null, agentId,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    /**
+     * PreModelSwitch: 模型切换前 · 对齐 v2.1.325 {@code H2} + {@code lC(["command","picker","sdk"])}。
+     *
+     * @param fromModel              CC original: {@code from_model}
+     * @param toModel                CC original: {@code to_model}（matcher 匹配字段）
+     * @param requestedModel         CC original: {@code requested_model}（nullable）
+     * @param source                 CC original: {@code source}（command|picker|sdk）
+     * @param contextTokens          CC original: {@code context_tokens}
+     * @param promptCacheWarm        CC original: {@code prompt_cache_warm}
+     * @param cacheTtl               CC original: {@code cache_ttl}（5m|1h）
+     * @param estimatedCacheWriteUsd CC original: {@code estimated_cache_write_usd}
+     * @param pricing                CC original: {@code pricing}（configured|catalog|default）
+     * @param sessionId              会话 ID
+     */
+    public static HookEvent preModelSwitch(String fromModel, String toModel, String requestedModel,
+                                           String source, Long contextTokens, Boolean promptCacheWarm,
+                                           String cacheTtl, Double estimatedCacheWriteUsd, String pricing,
+                                           String sessionId) {
+        HookEventData data = new HookEventData.PreModelSwitch(fromModel, toModel, requestedModel, source,
+            contextTokens, promptCacheWarm, cacheTtl, estimatedCacheWriteUsd, pricing);
+        return new HookEvent(HookEventType.PRE_MODEL_SWITCH, sessionId, null, null, null, null,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    /**
+     * PostModelSwitch: 模型切换后 · 对齐 v2.1.325 {@code G2}
+     * + {@code lC(["command","picker","sdk","auto","resume"])}（字段同 PreModelSwitch）。
+     *
+     * @param fromModel              CC original: {@code from_model}
+     * @param toModel                CC original: {@code to_model}
+     * @param requestedModel         CC original: {@code requested_model}（nullable）
+     * @param source                 CC original: {@code source}
+     * @param contextTokens          CC original: {@code context_tokens}
+     * @param promptCacheWarm        CC original: {@code prompt_cache_warm}
+     * @param cacheTtl               CC original: {@code cache_ttl}
+     * @param estimatedCacheWriteUsd CC original: {@code estimated_cache_write_usd}
+     * @param pricing                CC original: {@code pricing}
+     * @param sessionId              会话 ID
+     */
+    public static HookEvent postModelSwitch(String fromModel, String toModel, String requestedModel,
+                                            String source, Long contextTokens, Boolean promptCacheWarm,
+                                            String cacheTtl, Double estimatedCacheWriteUsd, String pricing,
+                                            String sessionId) {
+        HookEventData data = new HookEventData.PostModelSwitch(fromModel, toModel, requestedModel, source,
+            contextTokens, promptCacheWarm, cacheTtl, estimatedCacheWriteUsd, pricing);
+        return new HookEvent(HookEventType.POST_MODEL_SWITCH, sessionId, null, null, null, null,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    /**
+     * DirectoryAdded: 工作目录新增后 · 对齐 v2.1.325 {@code iX} schema。
+     *
+     * @param directory 新增目录绝对路径（CC original: {@code directory}）
+     * @param source    CC original: {@code source}（slash_command=/add-dir；register_repo_root=SDK）
+     * @param sessionId 会话 ID
+     */
+    public static HookEvent directoryAdded(String directory, String source, String sessionId) {
+        HookEventData data = new HookEventData.DirectoryAdded(directory, source);
+        return new HookEvent(HookEventType.DIRECTORY_ADDED, sessionId, null, null, null, null,
+            null, null, null, null, null, null, data, 0);
+    }
+
+    /**
+     * MessageDisplay: 助手消息每批新行显示时 · 对齐 v2.1.325 {@code lX} schema。
+     *
+     * @param turnId     当前轮 UUID（CC original: {@code turn_id}）
+     * @param messageId  被显示消息 UUID（CC original: {@code message_id}）
+     * @param index      该消息内 delta 序号（CC original: {@code index}）
+     * @param finalFlush 是否最后一次 flush（CC original: {@code final}；Java 关键字避让）
+     * @param delta      自上次 flush 起新完成的行（CC original: {@code delta}）
+     * @param sessionId  会话 ID
+     */
+    public static HookEvent messageDisplay(String turnId, String messageId, Integer index,
+                                           Boolean finalFlush, String delta, String sessionId) {
+        HookEventData data = new HookEventData.MessageDisplay(turnId, messageId, index, finalFlush, delta);
+        return new HookEvent(HookEventType.MESSAGE_DISPLAY, sessionId, null, null, null, null,
             null, null, null, null, null, null, data, 0);
     }
 

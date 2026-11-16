@@ -4,6 +4,9 @@ node_modules/
 # Build output
 dist/
 
+# 随包运行时缓存（MinGit 等离线包，45MB+，不入库）
+.runtime-cache/
+
 # Tauri build artifacts
 src-tauri/target/
 src-tauri/gen/

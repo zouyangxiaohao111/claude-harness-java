@@ -2,6 +2,21 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.82] - 2026-11-16
+
+### Added
+
+- Provider 支持 OAuth 登录：新增 Claude 与 Codex 的 OAuth 授权流程（浏览器授权 + 本地回调）
+- 新增出站代理设置：可配置 HTTP 代理并提供连通性探测
+- 新增内置 provider 目录：常用服务商可直接选择
+- 新增 Hook 类型：MCP 工具调用钩子、提交后复审钩子
+- 会话工具按类别分组，可在设置里逐类启用/停用
+- 新增「诊断」页与运行时探测：缺运行时依赖时给出安装提示
+
+### Fixed
+
+- 修复 0.1.81 安装包缺少三个数据库迁移的问题（已升级过数据库的环境无法启动）
+
 ## [0.1.81] - 2026-11-15
 
 ### Fixed

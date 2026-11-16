@@ -1,5 +1,6 @@
 package com.nexusai.application.terminal;
 
+import com.nexusai.common.BundledGit;
 import com.nexusai.infra.exception.ValidationException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -99,13 +100,16 @@ public final class TerminalShellResolver {
      */
     public List<String> candidates() {
         if (isWindows()) {
-            return List.of(
-                "pwsh.exe",
-                "powershell.exe",
-                "cmd.exe",
-                "C:\\Program Files\\Git\\bin\\bash.exe",
-                "C:\\Program Files (x86)\\Git\\bin\\bash.exe",
-                WSL);
+            List<String> windows = new ArrayList<>(7);
+            windows.add("pwsh.exe");
+            windows.add("powershell.exe");
+            windows.add("cmd.exe");
+            windows.add("C:\\Program Files\\Git\\bin\\bash.exe");
+            windows.add("C:\\Program Files (x86)\\Git\\bin\\bash.exe");
+            // 随包 MinGit（新装机器无系统 Git 时的唯一 Git Bash）· 排在 WSL 前
+            BundledGit.bashExe().map(Path::toString).ifPresent(windows::add);
+            windows.add(WSL);
+            return List.copyOf(windows);
         }
         List<String> unix = new ArrayList<>(4);
         String envShell = envGet(env, "SHELL");

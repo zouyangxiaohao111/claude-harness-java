@@ -123,11 +123,16 @@ export function PermissionBubble({ request, onDecision, onAbort, projectLabel, s
     return (
       <div className="permission-bubble">
         <div className="pb-title">
-          {request.isLeaderInbox ? `队友请求使用工具：${request.toolName}` : `需要权限：${request.toolName}`}
+          {request.permissionDisplay?.title
+            || (request.isLeaderInbox
+              ? `队友请求使用工具：${request.permissionDisplay?.displayName || request.toolName}`
+              : `需要权限：${request.permissionDisplay?.displayName || request.toolName}`)}
         </div>
         {request.isLeaderInbox && <WorkerBadge color={request.workerBadgeColor} />}
         {request.warning && <div className="pb-warning">{request.warning}</div>}
-        {request.description && <div className="pb-desc">{request.description}</div>}
+        {(request.permissionDisplay?.description || request.description) && (
+          <div className="pb-desc">{request.permissionDisplay?.description || request.description}</div>
+        )}
         {request.isLeaderInbox && (
           <div className="pb-worker">{request.workerName ? `来自 ${request.workerName}` : '来自队友（名称待后端补字段）'}</div>
         )}

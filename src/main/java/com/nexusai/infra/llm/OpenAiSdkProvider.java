@@ -1196,6 +1196,13 @@ public class OpenAiSdkProvider implements LlmProvider {
         if (readIdleMs != null && readIdleMs > 0) {
             builder.timeout(java.time.Duration.ofMillis(readIdleMs));
         }
+        // 出站代理：⭐ 按 baseUrl 主机判断，只对境外官方域名生效。
+        // buildClient 被所有 OpenAI 兼容 provider（DeepSeek / Qwen / Azure / Codex）共用，
+        // 无条件挂代理会把国内模型也送进代理（用户明确要求不要）。
+        java.net.Proxy outbound = OutboundProxy.httpProxyFor(config.baseUrl());
+        if (outbound != null) {
+            builder.proxy(outbound);
+        }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
     }
@@ -1916,6 +1923,10 @@ public class OpenAiSdkProvider implements LlmProvider {
 
             JsonNode paramsNode = fnNode.get("parameters");
             if (paramsNode != null && paramsNode.isObject()) {
+                // [schema-pattern-guard 2026-11-16] 与 Responses/Anthropic 同源问题：服务端不认
+                //   反斜杠加 u 四位十六进制的 Unicode 转义（rea MCP 的代理项排除 pattern）⇒ 复用同一守卫。
+                paramsNode = AnthropicSdkProvider.sanitizeAnthropicSchemaPatterns(
+                    paramsNode, nameNode.asText());
                 Map<String, JsonValue> paramsMap = new LinkedHashMap<>();
                 Iterator<Map.Entry<String, JsonNode>> it = paramsNode.fields();
                 while (it.hasNext()) {

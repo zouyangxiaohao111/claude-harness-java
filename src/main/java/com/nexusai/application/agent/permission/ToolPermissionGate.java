@@ -780,7 +780,8 @@ public class ToolPermissionGate {
                 permCtx != null && permCtx.mode() != null ? modeToCcString(permCtx.mode()) : null,
                 toolUseId,
                 ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
-                ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null);
+                ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
+                HookRegistry.mcpServerNameOf(ctx, tool.name()));
             GenericHook.HookResult hookResult = hookRegistry.executeEvent(event);
             PermissionRequestResult prr = hookResult != null ? hookResult.permissionRequestResult() : null;
             if (prr instanceof PermissionRequestResult.Allow allow) {
@@ -1013,7 +1014,8 @@ public class ToolPermissionGate {
                     input,
                     call.id(),
                     ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
-                    ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null);
+                    ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
+                    HookRegistry.mcpServerNameOf(ctx, tool.name()));
                 Optional<CoordinatorPermissionHandler.PermissionDecision> coordDecision =
                     coordinatorHandler.handle(cParams);
                 if (coordDecision.isPresent()) {
@@ -1293,7 +1295,8 @@ public class ToolPermissionGate {
             //    [canUseTool v2] description/suggestions/blockedPath 进弹窗
             //    (CC useCanUseTool.tsx:56-60 + interactiveHandler.ts:250-253).
             long promptStart = System.currentTimeMillis();
-            PermissionPromptDetails promptDetails = promptDetailsOf(effectiveResult, tool, input, permCtx);
+            PermissionPromptDetails promptDetails = promptDetailsOf(effectiveResult, tool, input, permCtx,
+                hookRegistry != null ? hookRegistry.takePermissionDisplay(call.id()) : null);
             PermissionResult afterPrompt = interactiveHandler.awaitUserDecision(
                 tool, input, promptReasonOf(effectiveResult), ctx, call.id(), promptDetails);
             return mapPromptResult(afterPrompt, tool, input, ctx, call, promptStart);
@@ -1543,7 +1546,8 @@ public class ToolPermissionGate {
      */
     private static PermissionPromptDetails promptDetailsOf(PermissionResult askOrPassthrough,
                                                            Tool tool, JsonNode input,
-                                                           ToolPermissionContext permCtx) {
+                                                           ToolPermissionContext permCtx,
+                                                           java.util.Map<String, Object> permissionDisplay) {
         List<PermissionUpdate> suggestions = List.of();
         String blockedPath = null;
         PermissionResult.PendingClassifierCheck pendingCheck = null;
@@ -1565,7 +1569,7 @@ public class ToolPermissionGate {
         // CC :411 — hooks 后台竞速仅非 awaitAutomatedChecks
         return new PermissionPromptDetails(
             describe(tool, input), suggestions, blockedPath,
-            classifierRace, !awaitAutomatedChecks);
+            classifierRace, !awaitAutomatedChecks, permissionDisplay);
     }
 
     /**

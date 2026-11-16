@@ -13,6 +13,7 @@ import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.AbortController;
+import com.nexusai.common.BundledGit;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.common.SessionProjectRoot;
 import com.nexusai.infra.exception.UnresolvedProjectRootException;
@@ -115,15 +116,40 @@ public class CommandHookExecutor {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
 
-    /** CC execCommandHook 返回结构 (hooks.ts:760-767) · Java 端 6 字段 record. */
+    /**
+     * CC execCommandHook 返回结构 (hooks.ts:760-767) · Java 端 7 字段 record.
+     *
+     * <p><b>[Wave2-D] {@code failClosed}</b>：本次执行的 hook 配置了
+     * {@code onFailure:"block"} 且事件允许该语义（非 async、非
+     * Stop/SubagentStop/TaskCompleted/TeammateIdle）—— 由 {@link #execute} 在<b>执行点</b>
+     * 判定（只有它有 {@link CommandHook} + {@link HookEvent}），再由
+     * {@link #toHookResultCore} 在 non-blocking 出口把它升级为 blocking。
+     *
+     * <p>WHY 放在结果里而不是 {@code toHookResult} 参数：{@code toHookResult} 的
+     * String 重载（HookRegistry 主路径）只拿得到 {@code command} 串，拿不到
+     * {@code onFailure} 配置；承载在执行结果上，两条消费路径（普通 / collecting）自动生效。
+     *
+     * @param failClosed {@code onFailure:"block"} 且事件未在忽略名单 → true
+     */
     public record CommandHookResult(
         String stdout,
         String stderr,
         String output,
         int status,
         boolean aborted,
-        boolean backgrounded
+        boolean backgrounded,
+        boolean failClosed
     ) {
+        /** 兼容构造器 · {@code failClosed=false}（既有 21 处构点零改动）. */
+        public CommandHookResult(String stdout, String stderr, String output, int status,
+                                 boolean aborted, boolean backgrounded) {
+            this(stdout, stderr, output, status, aborted, backgrounded, false);
+        }
+
+        /** 同内容副本 · 仅置 {@code failClosed}。 */
+        CommandHookResult withFailClosed() {
+            return new CommandHookResult(stdout, stderr, output, status, aborted, backgrounded, true);
+        }
     }
 
     /**
@@ -201,6 +227,12 @@ public class CommandHookExecutor {
      */
     private volatile NotificationQueue notificationQueue;
 
+    /**
+     * 用户侧 WebSocket 通道 · asyncRewake exit 2 的 {@code rewakeSummary}（CC 用户可见摘要）
+     * 经会话流 topic 推给前端；null = Spring 外手动构造，跳过推送（只发模型侧通知）。
+     */
+    private volatile org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate;
+
     /** 注入 async hook 注册表 (Spring 可选). */
     @Autowired(required = false)
     public void setAsyncHookRegistry(AsyncHookRegistry asyncHookRegistry) {
@@ -217,6 +249,12 @@ public class CommandHookExecutor {
     @Autowired(required = false)
     public void setNotificationQueue(NotificationQueue notificationQueue) {
         this.notificationQueue = notificationQueue;
+    }
+
+    /** 注入用户侧 WS 通道 (Spring 可选) · rewakeSummary 推送用. */
+    @Autowired(required = false)
+    public void setWsTemplate(org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate) {
+        this.wsTemplate = wsTemplate;
     }
 
     /** Spring 无参构造 · 全部默认实现. */
@@ -427,9 +465,21 @@ public class CommandHookExecutor {
             : Function.identity();
 
         // 3. 命令变换 · ${CLAUDE_PLUGIN_ROOT} / ${CLAUDE_PLUGIN_DATA} / .sh prepend (CC :822-866)
-        String command = buildFinalCommand(hook, isPowerShell, isWindows(), pluginRoot, pluginId,
-            toHookPath, pathExists, pluginDataDirResolver);
-        String finalCommand = applyShellPrefix(command, isPowerShell, envResolver);
+        //   [Wave2-D] exec 形式（hook.args() != null）：command 是可执行文件本身，args 逐元素
+        //   传入、不经 shell ⇒ 不套 .sh prepend、不套 CLAUDE_CODE_SHELL_PREFIX
+        //   （CC {@code pg()} 原文："When present, `command` is resolved as an executable and
+        //    spawned directly with these arguments — no shell."）。
+        boolean execForm = hook.args() != null;
+        //   exec 形式不做 .sh prepend（那是「交给 bash 执行」的补偿，exec 形式无 shell）
+        String command = execForm
+            ? substitutePluginPlaceholders(hook.command() != null ? hook.command() : "",
+                pluginRoot, pluginId, toHookPath, pathExists, pluginDataDirResolver)
+            : buildFinalCommand(hook, isPowerShell, isWindows(), pluginRoot, pluginId,
+                toHookPath, pathExists, pluginDataDirResolver);
+        String finalCommand = execForm ? command : applyShellPrefix(command, isPowerShell, envResolver);
+
+        // 3b. [Wave2-D] onFailure 语义可用性判定（执行点唯一有 hook + event 的地方）
+        boolean failClosed = isFailClosedOnFailure(hook, hookEvent != null ? hookEvent.type() : null);
 
         // 4. timeout · 对齐 CC :877-879 · [IMP-HOOKS-S5 D-01] 缺省超时由调用方注入
         long hookTimeoutMs = resolveTimeoutMs(hook.timeout(), defaultTimeoutMs);
@@ -444,15 +494,18 @@ public class CommandHookExecutor {
             ? hookCwd : null;
 
         if (log.isDebugEnabled()) {
-            log.debug("CommandHook '{}' 准备执行: shell={} ps={} cmd='{}' timeout={}ms cwd={}",
-                hookName, shellType, isPowerShell, finalCommand, hookTimeoutMs, safeCwd);
+            log.debug("CommandHook '{}' 准备执行: shell={} ps={} exec={} cmd='{}' timeout={}ms cwd={}",
+                hookName, shellType, isPowerShell, execForm, finalCommand, hookTimeoutMs, safeCwd);
         }
 
         // 7. spawn (CC :957-984) — 构造 argv, pwsh 缺失时抛错 (CC :961-966)
         ProcessSpec spec;
         try {
-            spec = buildProcessSpec(finalCommand, shellType, isPowerShell, isWindows(), env, safeCwd,
-                envResolver, pathExists);
+            spec = execForm
+                ? new ProcessSpec(buildExecArgv(hook, command, pluginRoot, pluginId, toHookPath,
+                    pathExists, pluginDataDirResolver), env, safeCwd)
+                : buildProcessSpec(finalCommand, shellType, isPowerShell, isWindows(), env, safeCwd,
+                    envResolver, pathExists);
         } catch (IllegalStateException e) {
             // pwsh 找不到 → 等价 CC :961-966 throw, 调用方按 non-blocking 处理
             log.warn("CommandHook '{}' spawn 前置检查失败: {}", hookName, e.getMessage());
@@ -463,16 +516,104 @@ public class CommandHookExecutor {
         //   IMP-RS-01 DEL-01e 补回)
         try {
             HookProcess child = processLauncher.launch(spec);
-            return runProcess(child, hook, hookName, jsonInput, hookTimeoutMs,
+            CommandHookResult r = runProcess(child, hook, hookName, jsonInput, hookTimeoutMs,
                 forceSyncExecution, shouldEmitDiag, diagStartMs,
                 hookEvent, pluginId, parentAbort, requestPrompt);
+            return failClosed ? r.withFailClosed() : r;
         } catch (IOException e) {
             // spawn 失败 (ENOENT 等) → 等价 CC childErrorPromise reject (CC :1219-1221, :1283-1318)
             String errorMsg = e.getMessage() != null ? e.getMessage() : e.getClass().getSimpleName();
             String errOutput = "Error occurred while executing hook command: " + errorMsg;
             log.error("CommandHook '{}' 进程启动失败: {}", hookName, errorMsg);
-            return new CommandHookResult("", errOutput, errOutput, 1, false, false);
+            CommandHookResult r = new CommandHookResult("", errOutput, errOutput, 1, false, false);
+            return failClosed ? r.withFailClosed() : r;
         }
+    }
+
+    /**
+     * [Wave2-D] {@code onFailure:"block"} 是否生效 · 对齐 CC {@code pg()} 命令子 schema 原文
+     * "What a failure of this hook does: … 'block': the failure counts as exit code 2, so the
+     * action the event guards … is blocked. <b>Ignored for async hooks and on Stop, SubagentStop,
+     * TaskCompleted and TeammateIdle</b>."
+     *
+     * <p>async 的忽略由消费端保证：config-async 路径返回 {@code backgrounded=true}，
+     * {@link #toHookResultCore} 在 failClosed 判定之前就已 early-return proceed。
+     *
+     * @param hook      命令 hook 配置（null → 不生效）
+     * @param eventType 触发事件（null = 无事件上下文 → 不参与忽略名单）
+     * @return true = 失败应按 exit 2 处理
+     */
+    static boolean isFailClosedOnFailure(CommandHook hook, HookEventType eventType) {
+        // CC onFailure 是 z.enum(["continue","block"])（大小写敏感、无 catch）⇒ 只认字面 "block"
+        if (hook == null || !"block".equals(hook.onFailure())) {
+            return false;
+        }
+        if (eventType == null) {
+            return true;
+        }
+        return switch (eventType) {
+            case STOP, SUBAGENT_STOP, TASK_COMPLETED, TEAMMATE_IDLE -> false;
+            default -> true;
+        };
+    }
+
+    /**
+     * [Wave2-D] exec 形式 argv · 对齐 CC {@code pg()} command 子 schema 的 {@code args}：
+     * {@code command} 作为可执行文件解析、{@code args} 逐元素传入，<b>不经 shell</b>；
+     * {@code ${CLAUDE_PLUGIN_ROOT}} / {@code ${CLAUDE_PLUGIN_DATA}} 按<b>元素</b>作纯字符串替换
+     * （CC 原文："Path placeholders … are substituted per-element as plain strings, so paths
+     * with quotes, $, or backticks never reach a shell parser."）。
+     *
+     * @param hook        命令 hook（{@code args() != null} 才走本路径）
+     * @param resolvedCmd 已做插件根/数据目录替换的 command（可执行文件）
+     * @return argv（首元素 = 可执行文件）
+     */
+    static List<String> buildExecArgv(CommandHook hook, String resolvedCmd, String pluginRoot,
+                                      String pluginId, Function<String, String> toHookPath,
+                                      Function<String, Boolean> pathExists,
+                                      Function<String, String> pluginDataDirResolver) {
+        List<String> argv = new ArrayList<>();
+        argv.add(resolvedCmd);
+        List<String> args = hook.args();
+        if (args == null) {
+            return argv;
+        }
+        for (String a : args) {
+            argv.add(substitutePluginPlaceholders(a, pluginRoot, pluginId, toHookPath,
+                pathExists, pluginDataDirResolver));
+        }
+        return argv;
+    }
+
+    /**
+     * 单字符串做插件占位符替换（exec 形式按元素调用；shell 形式由
+     * {@link #buildFinalCommand} 对整个 command 串调用同一段逻辑）。
+     *
+     * <p>插件目录不存在 → 抛 {@link IllegalStateException}（CC :831-836 防 exit-2-missing-script
+     * 误判为 block）；{@code ${user_config.X}} 未知 key 替换为空串（H2 简化，pluginOpts 空）。
+     */
+    static String substitutePluginPlaceholders(String text, String pluginRoot, String pluginId,
+                                               Function<String, String> toHookPath,
+                                               Function<String, Boolean> pathExists,
+                                               Function<String, String> pluginDataDirResolver) {
+        if (text == null) {
+            return null;
+        }
+        if (pluginRoot == null) {
+            return text;
+        }
+        if (!Boolean.TRUE.equals(pathExists.apply(pluginRoot))) {
+            throw new IllegalStateException(
+                "Plugin directory does not exist: " + pluginRoot
+                    + (pluginId != null ? " (" + pluginId + " — run /plugin to reinstall)" : ""));
+        }
+        String out = text.replace("${CLAUDE_PLUGIN_ROOT}", toHookPath.apply(pluginRoot));
+        if (pluginId != null) {
+            String dataPath = toHookPath.apply(pluginDataDirResolver.apply(pluginId));
+            out = out.replace("${CLAUDE_PLUGIN_DATA}", dataPath);
+            out = substituteUserConfigVariables(out, Map.of());
+        }
+        return out;
     }
 
     /**
@@ -585,7 +726,9 @@ public class CommandHookExecutor {
                 new HookJSONOutput.AsyncHookOutput(true, hookTimeoutMs),
                 hookEvent != null ? hookEvent.type() : null, hookName,
                 hook.command() != null ? hook.command() : "",
-                Boolean.TRUE.equals(hook.asyncRewake()), pluginId,
+                Boolean.TRUE.equals(hook.asyncRewake()), pluginId, hook.rewakeMessage(),
+                hook.rewakeSummary(),
+                hookEvent != null ? hookEvent.sessionId() : null,
                 asyncOutReader, asyncErrReader);
             if (!backgrounded) {
                 // 注册表未注入 (Spring 外手动 new) → 占位降级, Fail Loud. 不能 fall-through
@@ -846,6 +989,13 @@ public class CommandHookExecutor {
      * @param command       CC original: command (:198)
      * @param asyncRewake   CC original: asyncRewake (:199); true=bypass registry
      * @param pluginId      CC original: pluginId (:200)
+     * @param rewakeMessage [Wave2-D] CC original: {@code rewakeMessage}（config 字段）——
+     *                      asyncRewake exit 2 时注入模型的 system-reminder 前缀；null → 缺省
+     *                      {@code Stop hook blocking error from command "<hookName>": }
+     * @param rewakeSummary CC original: {@code rewakeSummary}（config 字段）——
+     *                      asyncRewake exit 2 时给用户的一行摘要；null → 缺省
+     *                      {@code Stop hook feedback}
+     * @param sessionId     会话 id · rewakeSummary 的 WS topic 路由键
      * @param stdoutReader  config-async 路径的 stdout 读取线程 (watcher 完成时 join 排空);
      *                      stdout 首行 async 路径传 null (读取线程以 daemon 持续累积到 ref,
      *                      wrapper 的 supplier 直接读 ref, 无 join 需求)
@@ -856,7 +1006,8 @@ public class CommandHookExecutor {
                                         PendingAsyncHook.AsyncHookProcess wrapper,
                                         HookJSONOutput.AsyncHookOutput asyncResponse,
                                         HookEventType hookEvent, String hookName, String command,
-                                        boolean asyncRewake, String pluginId,
+                                        boolean asyncRewake, String pluginId, String rewakeMessage,
+                                        String rewakeSummary, String sessionId,
                                         Thread stdoutReader, Thread stderrReader) {
         if (asyncRewake) {
             // CC :205-240 asyncRewake bypass: 不注册 registry, 完成回调直接交付
@@ -866,7 +1017,8 @@ public class CommandHookExecutor {
             //   completeAsyncRewake 的 response 与执行入口 started 同 hookId 配对.
             Thread watcher = new Thread(
                 () -> completeAsyncRewake(hookId, hookName, ccEventName, child, wrapper,
-                    stdoutReader, stderrReader),
+                    stdoutReader, stderrReader, rewakeMessage, rewakeSummary, sessionId,
+                    command),
                 "nexusai-hook-reawake-" + hookName);
             watcher.setDaemon(true);
             watcher.start();
@@ -896,7 +1048,8 @@ public class CommandHookExecutor {
      */
     private void completeAsyncRewake(String hookId, String hookName, String ccEventName,
                                      HookProcess child, PendingAsyncHook.AsyncHookProcess wrapper,
-                                     Thread stdoutReader, Thread stderrReader) {
+                                     Thread stdoutReader, Thread stderrReader, String rewakeMessage,
+                                     String rewakeSummary, String sessionId, String command) {
         try {
             while (!child.waitFor(1000, TimeUnit.MILLISECONDS)) {
                 if (Thread.currentThread().isInterrupted()) {
@@ -925,6 +1078,9 @@ public class CommandHookExecutor {
                 hookName, exitCode);
         }
         if (exitCode == 2) {
+            // CC asyncRewake exit 2 的用户侧摘要（rewakeSummary）→ 会话流 system 消息；
+            //   模型侧继续走下面的 NotificationQueue，两条通道互不影响。
+            emitRewakeSummary(sessionId, hookName, command, rewakeSummary, stdout, stderr, exitCode);
             NotificationQueue queue = notificationQueue;
             if (queue != null) {
                 // [P0-5 F-6b/OD-D16 · 2026-09-04] 本处【不改】：exit=2 预包 <system-reminder> = CC 真源
@@ -935,9 +1091,17 @@ public class CommandHookExecutor {
                 // CC :234 wrapInSystemReminder + :232-238 enqueuePendingNotification(task-notification)
                 // JS (stderr || stdout) 真值语义 → Java 非空串优先 stderr
                 String blockingText = (stderr != null && !stderr.isEmpty()) ? stderr : stdout;
+                // [Wave2-D] rewakeMessage 配置前缀替代硬编码（CC pg() 原文："Custom prefix for
+                //   the system-reminder shown to the model when an asyncRewake hook exits with
+                //   code 2. The hook output is appended after this prefix."）—— 缺省保持原文案。
+                //   ⚠️ rewakeSummary（用户侧一行摘要，CC 缺省 "Stop hook feedback"）本仓无
+                //   用户可见通知通道（NotificationQueue 只有模型侧 system-reminder 一条），
+                //   故只登记不实现（不造假通道）。
+                String prefix = (rewakeMessage != null && !rewakeMessage.isBlank())
+                    ? rewakeMessage + " "
+                    : "Stop hook blocking error from command \"" + hookName + "\": ";
                 queue.enqueuePendingNotification(new NotificationQueue.QueueItem(
-                    "<system-reminder>\nStop hook blocking error from command \"" + hookName + "\": "
-                        + blockingText + "\n</system-reminder>",
+                    "<system-reminder>\n" + prefix + blockingText + "\n</system-reminder>",
                     "task-notification"));
                 if (log.isInfoEnabled()) {
                     log.info("HOOK command hook '{}' exit=2 → 已入队 task-notification 唤醒模型", hookName);
@@ -950,6 +1114,41 @@ public class CommandHookExecutor {
             log.info("HOOK command hook '{}' asyncRewake 后台完成: exit={} stdoutBytes={} stderrBytes={}",
                 hookName, exitCode, stdout.length(), stderr.length());
         }
+    }
+
+    /**
+     * asyncRewake exit 2 的用户侧摘要 · 对齐 CC {@code rewakeSummary}（缺省
+     * "Stop hook feedback"）。推送到会话流 topic，前端按 {@code type=system /
+     * subtype=async_wake_summary} 渲染非阻塞 toast；模型侧通知仍走 NotificationQueue。
+     */
+    private void emitRewakeSummary(String sessionId, String hookName, String command,
+                                   String rewakeSummary, String stdout, String stderr, int exitCode) {
+        var ws = wsTemplate;
+        if (ws == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            ObjectNode node = MAPPER.createObjectNode();
+            node.put("type", "system");
+            node.put("subtype", "async_wake_summary");
+            node.put("uuid", UUID.randomUUID().toString());
+            node.put("session_id", sessionId);
+            node.put("hook_name", hookName);
+            node.put("summary", (rewakeSummary != null && !rewakeSummary.isBlank())
+                ? rewakeSummary : "Stop hook feedback");
+            node.put("command", command != null ? capForWire(command, 2000) : "");
+            node.put("exit_code", exitCode);
+            node.put("stdout", stdout != null ? capForWire(stdout, 4000) : "");
+            node.put("stderr", stderr != null ? capForWire(stderr, 4000) : "");
+            node.put("timestamp_ms", System.currentTimeMillis());
+            ws.convertAndSend("/topic/tasks", node);
+        } catch (Exception e) {
+            log.warn("HOOK command hook '{}' rewakeSummary 推送失败: {}", hookName, e.getMessage());
+        }
+    }
+
+    private static String capForWire(String s, int max) {
+        return s.length() <= max ? s : s.substring(0, max);
     }
 
     /** 静默 join (≤2s) · 读取线程排空用; 中断则恢复中断位. */
@@ -1156,7 +1355,7 @@ public class CommandHookExecutor {
             () -> stdoutRef.get(), () -> stderrRef.get());
         boolean backgrounded = executeInBackground(processId, hookId, child, wrapper,
             asyncResponse, hookEvent != null ? hookEvent.type() : null, hookName,
-            hookCommand, false, pluginId, null, null);
+            hookCommand, false, pluginId, null, null, null, null, null);
         if (backgrounded) {
             // CC :1146-1150 asyncResolve({stdout, stderr, output, status: 0}) — 检测时刻的部分输出
             String partialStdout = stdoutSb.toString();
@@ -1265,25 +1464,11 @@ public class CommandHookExecutor {
                                            Function<String, String> toHookPath, Function<String, Boolean> pathExists,
                                            Function<String, String> pluginDataDirResolver) {
         String command = hook.command() != null ? hook.command() : "";
-        if (pluginRoot != null) {
-            if (!Boolean.TRUE.equals(pathExists.apply(pluginRoot))) {
-                // CC :831-836: 插件目录被删 → throw (防 exit-2-missing-script 误判为 block)
-                throw new IllegalStateException(
-                    "Plugin directory does not exist: " + pluginRoot
-                        + (pluginId != null ? " (" + pluginId + " — run /plugin to reinstall)" : ""));
-            }
-            // CC :844-845 内联 ROOT 替换 (String.replace 字面量替换, 防 $ 模式解释; PS 原生路径)
-            command = command.replace("${CLAUDE_PLUGIN_ROOT}", toHookPath.apply(pluginRoot));
-            if (pluginId != null) {
-                String dataPath = toHookPath.apply(pluginDataDirResolver.apply(pluginId));
-                command = command.replace("${CLAUDE_PLUGIN_DATA}", dataPath);
-            }
-            if (pluginId != null) {
-                // CC :855 substituteUserConfigVariables — H2 settings 来源 pluginOpts 空,
-                // 未知 key 替换为空串 (CC loadPluginOptions 未配置会 throw, H2 简化).
-                command = substituteUserConfigVariables(command, Map.of());
-            }
-        }
+        // 插件根/数据目录替换 + 插件目录存在性校验（CC :831-845 内联 ROOT 替换，
+        // String.replace 字面量替换防 $ 模式解释；PS 原生路径）——与 exec 形式的
+        // 「按元素替换」共用同一段实现（Wave2-D）。
+        command = substitutePluginPlaceholders(command, pluginRoot, pluginId, toHookPath,
+            pathExists, pluginDataDirResolver);
         // Windows bash .sh prepend · 对齐 CC :862-866 (/\.sh(\s|$|")/)
         if (isWindows && !isPowerShell) {
             String trimmed = command.trim();
@@ -1391,6 +1576,10 @@ public class CommandHookExecutor {
             // nexusai 命名（决策 D1/D6 自有根语义），同一路径两键，兼容两类脚本。
             env.put("CLAUDE_PROJECT_DIR", projectDir);
             env.put("NEXUSAI_PROJECT_DIR", projectDir);
+        }
+        // [Wave2-I] CC base.effort 同时以 CLAUDE_EFFORT env 暴露给命令 hook（exe base j()）。
+        if (hookEvent != null && hookEvent.effortLevel() != null && !hookEvent.effortLevel().isBlank()) {
+            env.put("CLAUDE_EFFORT", hookEvent.effortLevel());
         }
         if (pluginRoot != null) {
             env.put("CLAUDE_PLUGIN_ROOT", toHookPath.apply(pluginRoot));
@@ -1504,6 +1693,11 @@ public class CommandHookExecutor {
             if (bashPath != null && Boolean.TRUE.equals(exists.apply(bashPath))) {
                 return bashPath;
             }
+        }
+        // 随包 MinGit 兜底（系统 PATH 无 git 时）· BundledGit 仅 Windows 返回非空
+        String bundled = BundledGit.bashExe().map(Path::toString).orElse(null);
+        if (bundled != null && Boolean.TRUE.equals(exists.apply(bundled))) {
+            return bundled;
         }
         return "bash";
     }
@@ -1639,14 +1833,16 @@ public class CommandHookExecutor {
                 log.warn("HOOK command hook '{}' stdout JSON 校验失败, 视为 non_blocking_error: {}",
                     hookCommand, pr.validationError());
             }
-            return new GenericHook.HookResult(false, null, null, null,
-                AttachmentMessageDto.hookNonBlockingError(
-                    hookName, toolUseID, hookEvent,
-                    "JSON validation failed: " + pr.validationError(),
-                    result.stdout() != null ? result.stdout() : "", 1,
-                    hookCommand, durationMs),
-                null, null, null, null,
-                GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null);
+            return failClosedOr(result,
+                new GenericHook.HookResult(false, null, null, null,
+                    AttachmentMessageDto.hookNonBlockingError(
+                        hookName, toolUseID, hookEvent,
+                        "JSON validation failed: " + pr.validationError(),
+                        result.stdout() != null ? result.stdout() : "", 1,
+                        hookCommand, durationMs),
+                    null, null, null, null,
+                    GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null),
+                hookCommand, "JSON validation failed: " + pr.validationError());
         }
         if (pr.json() instanceof HookJSONOutput.SyncHookOutput sync) {
             // CC :2533-2613 json → processHookJSONOutput (任意 status)
@@ -1678,13 +1874,15 @@ public class CommandHookExecutor {
                     log.warn("HOOK command hook '{}' stdout JSON 处理失败, 视为 non_blocking_error: {}",
                         hookCommand, e.getMessage());
                 }
-                return new GenericHook.HookResult(false, null, null, null,
-                    AttachmentMessageDto.hookNonBlockingError(
-                        hookName, toolUseID, hookEvent,
-                        "Failed to run: " + e.getMessage(), "", 1,
-                        hookCommand, durationMs),
-                    null, null, null, null,
-                    GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null);
+                return failClosedOr(result,
+                    new GenericHook.HookResult(false, null, null, null,
+                        AttachmentMessageDto.hookNonBlockingError(
+                            hookName, toolUseID, hookEvent,
+                            "Failed to run: " + e.getMessage(), "", 1,
+                            hookCommand, durationMs),
+                        null, null, null, null,
+                        GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null),
+                    hookCommand, "Failed to run: " + e.getMessage());
             }
             return GenericHook.HookResult.proceed();
         }
@@ -1719,14 +1917,48 @@ public class CommandHookExecutor {
             log.info("HOOK command hook '{}' exit={} 非 0/2, non_blocking_error", hookCommand, result.status());
         }
         String errText = stderr.trim().isEmpty() ? "No stderr output" : stderr.trim();
-        return new GenericHook.HookResult(false, null, null, null,
-            AttachmentMessageDto.hookNonBlockingError(
-                hookName, toolUseID, hookEvent,
-                "Failed with non-blocking status code: " + errText,
-                result.stdout() != null ? result.stdout() : "", result.status(),
-                hookCommand, durationMs),
-            null, null, null, null,
-            GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null);
+        return failClosedOr(result,
+            new GenericHook.HookResult(false, null, null, null,
+                AttachmentMessageDto.hookNonBlockingError(
+                    hookName, toolUseID, hookEvent,
+                    "Failed with non-blocking status code: " + errText,
+                    result.stdout() != null ? result.stdout() : "", result.status(),
+                    hookCommand, durationMs),
+                null, null, null, null,
+                GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, null, null, null, null, null),
+            hookCommand, errText);
+    }
+
+    /**
+     * [Wave2-D] {@code onFailure:"block"} 升级点 · 对齐 CC {@code pg()} 命令子 schema：
+     * "'block': the failure counts as exit code 2, so the action the event guards is blocked."
+     *
+     * <p>覆盖三类失败：(a) 输出 JSON 非法/校验失败、(b) JSON 处理抛错、(c) 退出码非 0/2
+     * （含超时被强杀后的 exitValue 兜底 1）。<b>不覆盖</b>：正常 exit 0、正常 exit 2
+     * （本就是 blocking）、aborted/cancelled、async 后台占位——后两者在方法更早处已分流。
+     *
+     * <p>升级后的 blockingError 文本与 CC exit-2 分支同形：{@code [<command>]: <errText>}。
+     *
+     * @param result          执行结果（{@code failClosed=true} 才升级）
+     * @param nonBlocking     原 non_blocking 结果
+     * @param hookCommand     hook 命令串
+     * @param errText         失败原因文本
+     * @return 升级后的 blocking 结果，或原样 non_blocking
+     */
+    private static GenericHook.HookResult failClosedOr(CommandHookResult result,
+                                                       GenericHook.HookResult nonBlocking,
+                                                       String hookCommand, String errText) {
+        if (result == null || !result.failClosed()) {
+            return nonBlocking;
+        }
+        String msg = "[" + hookCommand + "]: " + (errText == null || errText.isEmpty()
+            ? "No stderr output" : errText);
+        if (log.isInfoEnabled()) {
+            log.info("HOOK command hook '{}' onFailure=block, 失败升级为 blocking: {}", hookCommand, msg);
+        }
+        return new GenericHook.HookResult(true,
+            new HookBlockingError(msg, hookCommand), null, null, null, null, null,
+            null, null, GenericHook.HookOutcome.BLOCKING, msg, null, null, null, null, null, null, null);
     }
 
     /**
@@ -2046,7 +2278,9 @@ public class CommandHookExecutor {
         }
         return new HookEvent(event.type(), sessionId, transcriptPath, cwd, permissionMode, agentId,
             event.toolName(), event.input(), event.result(), event.toolUseId(),
-            event.permissionSuggestions(), event.requestedSchema(), dataRecord, event.timestampMs());
+            event.permissionSuggestions(), event.requestedSchema(), dataRecord, event.timestampMs(),
+            // [Wave2-I] 重建时必须透传 v2.1.325 base 追加字段，否则被 null 覆盖。
+            event.promptId(), event.effortLevel());
     }
 
     /**
@@ -2157,6 +2391,11 @@ public class CommandHookExecutor {
         //   permission_mode 与 permission_suggestions 此前被丢弃 (只存 HookEvent 顶层字段),
         //   配置驱动 PermissionRequest hook 的 stdin 收不到建议列表与权限模式 → 决策信息不全.
         if (event.permissionMode() != null) node.put("permission_mode", event.permissionMode());
+        // [Wave2-I] v2.1.325 base：prompt_id + effort{level}（CC off≈311,039,6xx）。
+        if (event.promptId() != null) node.put("prompt_id", event.promptId());
+        if (event.effortLevel() != null) {
+            node.putObject("effort").put("level", event.effortLevel());
+        }
         if (event.permissionSuggestions() != null) {
             node.putPOJO("permission_suggestions", event.permissionSuggestions());
         }

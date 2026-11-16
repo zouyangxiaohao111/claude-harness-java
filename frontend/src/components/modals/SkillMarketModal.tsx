@@ -78,6 +78,15 @@ function colorOf(name: string): string {
   return AVATAR_COLORS[h % AVATAR_COLORS.length]
 }
 
+/** ISO 时间 → 「2026-11-15 22:08」（本地时区）· 缺失/解析失败 → null（不渲染空占位） */
+function formatPublishedAt(iso?: string | null): string | null {
+  if (!iso) return null
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return null
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 /** 归一化专家卡片视图（本地/远端同构，供两列大卡统一渲染） */
 interface ExpertCard {
   key: string
@@ -93,16 +102,28 @@ interface ExpertCard {
   iconText: string
   /** 已安装（本地恒 true · 远端 preinstalled） */
   installed: boolean
+  /** 市场内容指纹/版本（远端专家才有；用于判定「可更新」） */
+  fingerprint?: string | null
+  version?: string | null
+  /** 最近一次上架时间（ISO 8601 · 远端专家才有） */
+  publishedAt?: string | null
   /** 当前会话正在使用（mainThreadAgent === 该 agentType/agentName） */
   inUse: boolean
 }
 
-export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUseLocalAgent, onSummonSkill, showToast }: {
+export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initialTab, onClose, onUseLocalAgent, onSummonSkill, showToast }: {
   /** 当前会话 id（/agents/list + /market/* + POST use 需要） */
   sessionId: string
+  /** 打开时停在哪个 tab（输入框 + 菜单「专家/技能/连接器」指定）· 缺省专家 */
+  initialTab?: MarketTab
   /** 当前会话主线程 agent（null/空串=默认模式 · 专家卡「使用中」判定 + 使用后胶囊回显） */
   currentAgent?: string | null
-  /** 对话进行中（turn 运行）· 禁用「使用」（浏览不受限） */
+  /**
+   * 对话进行中标记（turn 运行）。
+   * <p>⛔ <b>不作为任何操作门禁</b>：安装/更新/召唤/使用专家都不与对话互斥
+   * （用户 2026-10-27 / 2026-11-06 / 2026-11-15 三次裁定）。
+   * 保留参数是为了回归测试能显式传 busy=true 验证「仍可操作」。
+   */
   busy?: boolean
   /** 关闭弹窗（✕ / 遮罩 / App Esc） */
   onClose: () => void
@@ -113,7 +134,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   /** 轻提示 */
   showToast: (msg: string, type?: 'success' | 'info') => void
 }) {
-  const [tab, setTab] = useState<MarketTab>('expert')
+  const [tab, setTab] = useState<MarketTab>(initialTab ?? 'expert')
   /**
    * 技能 tab 的子来源（v4 用户拍板：拆子 tab、**默认停在「市场」**）。
    *
@@ -146,6 +167,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const [installed, setInstalled] = useState<Set<string>>(new Set())
   // 已装插件的本地内容指纹（key=插件名）· 与市场指纹比对判定「有更新」
   const [installedFp, setInstalledFp] = useState<Record<string, string>>({})
+  // 已装插件的本地版本（key=插件名）· 内容没变但版本号变了也算「有更新」
+  const [installedVer, setInstalledVer] = useState<Record<string, string>>({})
   // 安装中的市场 id 集合：按钮就地转圈 + 禁用重复点击（安装是下载 + 解包，耗时可达数秒，
   // 没有反馈时用户会以为没点上而反复点，产生并发安装）。
   const [installing, setInstalling] = useState<Set<string>>(new Set())
@@ -160,11 +183,14 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   /** 应用已装插件明细：同步明细列表 + 名称→指纹映射（判定「可更新」的数据源）。 */
   const applyInstalledDetails = (list: InstalledPluginDetail[] | null | undefined) => {
     setPluginDetails(list ?? [])
-    const map: Record<string, string> = {}
+    const fpMap: Record<string, string> = {}
+    const verMap: Record<string, string> = {}
     for (const d of list ?? []) {
-      if (d.name && d.fingerprint) map[d.name] = d.fingerprint
+      if (d.name && d.fingerprint) fpMap[d.name] = d.fingerprint
+      if (d.name && d.version) verMap[d.name] = d.version
     }
-    setInstalledFp(map)
+    setInstalledFp(fpMap)
+    setInstalledVer(verMap)
   }
 
   // ---- 数据（按来源加载 · Promise.allSettled 容错：单个源失败不影响其余渲染）----
@@ -184,6 +210,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
   const toMarketExpert = (p: ExternalMarketPlugin): MarketExpert => ({
     marketId: p.name, agentName: p.name, displayName: p.displayName, description: p.description,
     tags: p.tags ?? [], categories: p.category ? [p.category] : [], remote: true,
+    version: p.version ?? null,
+    fingerprint: p.fingerprint ?? null,
+    publishedAt: p.publishedAt ?? null,
     useCount: p.useCount ?? null,
     authorName: p.authorName ?? null,
     authorVerified: p.authorVerified ?? false,
@@ -196,6 +225,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     categories: [p.category ?? '', ...(p.tags ?? [])].filter(Boolean), remote: true,
     fingerprint: p.fingerprint,
     version: p.version ?? null,
+    publishedAt: p.publishedAt ?? null,
     useCount: p.useCount ?? null,
     downloadCount: p.downloadCount ?? null,
     authorName: p.authorName ?? null,
@@ -373,6 +403,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
         iconText: (nm ?? '?').charAt(0).toUpperCase(),
         installed: !!e.preinstalled,
         inUse: !!currentAgent && currentAgent === e.agentName,
+        fingerprint: e.fingerprint ?? null,
+        version: e.version ?? null,
+        publishedAt: e.publishedAt ?? null,
       })
     }
     return cards.filter((c) => matchAny(c.name, c.subtitle, c.desc))
@@ -380,17 +413,18 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
 
   // ---- 安装建科市场插件（POST /api/plugins/install · 后端自动 reconcile 市场 + 安装链）----
   /**
-   * 市场里有更新？名称相同、指纹不同即算 —— 版本号可能没变（重新上架覆盖内容），
-   * 所以只认内容指纹（用户裁定 2026-10-21）。
+   * 市场里有更新？内容指纹不同（重新上架覆盖内容）或版本号不同（只改版本号发版）都算。
+   * 版本号必须参与：新版若只改版本、内容字节一致，单看指纹会永远显示「已安装」。
    */
-  const hasUpdate = (marketId: string, marketFp?: string | null) =>
-    !!marketFp && !!installedFp[marketId] && marketFp !== installedFp[marketId]
+  const hasUpdate = (marketId: string, marketFp?: string | null, marketVer?: string | null) =>
+    (!!marketFp && !!installedFp[marketId] && marketFp !== installedFp[marketId]) ||
+    (!!marketVer && !!installedVer[marketId] && marketVer !== installedVer[marketId])
 
   const installMarketPlugin = async (pluginName: string) => {
-    if (busy) {
-      showToast('对话进行中，请稍后再安装', 'info')
-      return
-    }
+    // ⭐ 安装/更新**不受对话进行中互斥**（用户 2026-11-15：更新技能不该提示「对话进行中」）。
+    //   理由与召唤/使用专家同一条裁定：安装只是下载解包 + 刷注册表，不发消息、不切轮；
+    //   正在跑的那一轮已固化技能定义，刷新对它是安全的。
+    //   ⛔ 不要在这里加 busy 门。防重复点击靠下面的 installing 集合。
     // 同一插件已在安装中 → 直接忽略（按钮虽已禁用，键盘/连点仍可能进来）
     if (installing.has(pluginName)) return
     const isUpdate = installed.has(pluginName)
@@ -534,8 +568,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
     //   而后端在**每轮开头**读一次该列（LlmAgentLoop.collectRunMaterial 的 SP-03 段）⇒
     //   切换对**正在跑的那一轮无影响**（它已固化定义），从下一轮起生效。
     //   ⛔ 不要在这里加 busy 门 —— 与「召唤技能」同一条裁定：设定 ≠ 发送。
-    //   ⚠️ 市场专家的「使用」实际是**安装插件**（写磁盘 + reconcile），那是安装语义，
-    //   仍由 installMarketPlugin 自己的 busy 门拦截（见其函数首行），不在本处拦。
+    //   ⚠️ 市场专家的「使用」/「安装/更新」实际是**安装插件**（写磁盘 + reconcile）；
+    //   安装同样不与对话互斥（用户 2026-11-15），故整条链都不看 busy。
     if (card.inUse) return
     // v4：按卡片种类分流（两个源同时在场，不能再用「当前来源」判断）
     if (card.kind === 'remote') {
@@ -703,8 +737,23 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           {c.kind === 'remote' ? (
                             installed.has(c.marketId) ? (
                               <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                <span className="sm-installed-mark">已安装</span>
-                                <button className="sm-use-btn" onClick={() => useInstalledPlugin(c.marketId)} title={`使用 ${c.name} 驱动会话`}>使用</button>
+                                {hasUpdate(c.marketId, c.fingerprint, c.version) ? (
+                                  <button
+                                    className={`sm-use-btn${installing.has(c.marketId) ? ' installing' : ''}`}
+                                    disabled={installing.has(c.marketId)}
+                                    onClick={() => void installMarketPlugin(c.marketId)}
+                                    title={installing.has(c.marketId) ? `正在更新 ${c.name}…` : `市场有新版本，更新 ${c.name}`}
+                                  >
+                                    {installing.has(c.marketId)
+                                      ? <><RingProgress percent={progress[c.marketId]?.percent ?? 0} /><span>{progress[c.marketId]?.percent ?? 0}%</span></>
+                                      : '更新'}
+                                  </button>
+                                ) : (
+                                  <>
+                                    <span className="sm-installed-mark">已安装</span>
+                                    <button className="sm-use-btn" onClick={() => useInstalledPlugin(c.marketId)} title={`使用 ${c.name} 驱动会话`}>使用</button>
+                                  </>
+                                )}
                               </div>
                             ) : (
                               <button
@@ -733,6 +782,11 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                         {c.tags.length > 0 && (
                           <div className="sm-tags">
                             {c.tags.map((t) => <span key={t} className="sm-tag">{t}</span>)}
+                          </div>
+                        )}
+                        {c.publishedAt && (
+                          <div className="sm-card-sub" title={c.publishedAt}>
+                            上架时间：{formatPublishedAt(c.publishedAt)}
                           </div>
                         )}
                       </div>
@@ -803,7 +857,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy, onClose, onUse
                           installedNow={installed.has(s.marketId)}
                           installing={installing.has(s.marketId)}
                           installPercent={progress[s.marketId]?.percent ?? 0}
-                          hasUpdate={hasUpdate(s.marketId, s.fingerprint)}
+                          hasUpdate={hasUpdate(s.marketId, s.fingerprint, s.version)}
                           onSummon={() => summonSkill(s)}
                           onInstall={(id) => void installMarketPlugin(id)}
                           onUpdate={(id) => void installMarketPlugin(id)}
@@ -979,7 +1033,7 @@ function PublishDialog({ category, onClose, onDone, showToast }: {
         showToast(`已上架 ${r.name} v${r.version}`, 'success')
         onDone()
       } else if (r.status === 'unchanged') {
-        showToast(`内容没有变化，未创建新版本（当前 v${r.version}）`, 'info')
+        showToast(r.message || `内容没有变化，未创建新版本（当前 v${r.version}）`, 'info')
       } else {
         showToast(r.message || '上架失败', 'info')
       }
@@ -1109,6 +1163,7 @@ function SkillCard({
   const useLabel = formatCountW(skill.useCount)
   const dlLabel = formatCountW(skill.downloadCount)
   const author = skill.authorName
+  const publishedLabel = formatPublishedAt(skill.publishedAt)
 
   return (
     <div
@@ -1222,6 +1277,13 @@ function SkillCard({
             {dlLabel}
           </span>
         )}
+        {/* 上架时间（市场条目才有；本机技能没有该信息 ⇒ 整项不渲染） */}
+        {publishedLabel && (
+          <span className="sk-stat" title={skill.publishedAt ?? undefined}>
+            <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M12 7.5V12l3 2" /></svg>
+            上架时间：{publishedLabel}
+          </span>
+        )}
         {hasUpdate && installed ? (
           <span className="sk-status" style={{ color: 'var(--warning)' }}>可更新</span>
         ) : installed ? (
@@ -1255,8 +1317,9 @@ function SkillDetailDialog({ skill, fromLocal, installed, onClose, onSummon, onO
   const useLabel = formatCountW(skill.useCount)
   const dlLabel = formatCountW(skill.downloadCount)
   const author = skill.authorName
+  const publishedLabel = formatPublishedAt(skill.publishedAt)
   // 统计格数就地计算：没有的格子根本不渲染（用 auto-fit 核心由 CSS 处理）
-  const statCount = 1 + (useLabel ? 1 : 0) + (dlLabel ? 1 : 0) + (author ? 1 : 0)
+  const statCount = 1 + (useLabel ? 1 : 0) + (dlLabel ? 1 : 0) + (author ? 1 : 0) + (publishedLabel ? 1 : 0)
 
   return (
     <div className="detail-mask" onClick={onClose}>
@@ -1324,6 +1387,12 @@ function SkillDetailDialog({ skill, fromLocal, installed, onClose, onSummon, onO
                 {author}
               </div>
               <div className="dt-stat-l">开发者</div>
+            </div>
+          )}
+          {publishedLabel && (
+            <div className="dt-stat">
+              <div className="dt-stat-v" style={{ fontSize: 13 }} title={skill.publishedAt ?? undefined}>{publishedLabel}</div>
+              <div className="dt-stat-l">上架时间</div>
             </div>
           )}
         </div>

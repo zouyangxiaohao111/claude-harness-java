@@ -47,8 +47,9 @@ function t(
   category: SessionToolDto['category'],
   disabled = false,
   userFacingName = name,
+  mcpServer?: string,
 ): SessionToolDto {
-  return { name, userFacingName, category, description: `${name} description`, disabled }
+  return { name, userFacingName, category, description: `${name} description`, disabled, mcpServer }
 }
 
 const FIXTURE: SessionToolDto[] = [
@@ -58,6 +59,10 @@ const FIXTURE: SessionToolDto[] = [
   // KB：默认禁用
   t('search_knowledge', 'KB', true, '检索知识库'),
   // BR：0 项（未装扩展）
+  // MCP：第三方 server（rea 半开 / other 全开）· 一个 server 多工具，需要三级开关
+  t('mcp__rea__inspect_plist', 'MCP', false, '读取 plist', 'rea'),
+  t('mcp__rea__list_names', 'MCP', true, '列出符号', 'rea'),
+  t('mcp__other__do_thing', 'MCP', false, '其它工具', 'other'),
   // SYS：部分禁用（半开）
   t('Bash', 'SYS', false, 'Bash（终端）'),
   t('Read', 'SYS', true, '读取文件'),
@@ -95,16 +100,17 @@ afterEach(() => {
 })
 
 describe('SessionToolsPanel · 分类分组', () => {
-  it('4 类按 CU→KB→BR→SYS 顺序渲染，并显示 N 个 · M 个已启用', async () => {
+  it('5 类按 CU→KB→BR→MCP→SYS 顺序渲染，并显示 N 个 · M 个已启用', async () => {
     await mount()
     const names = Array.from(container.querySelectorAll('.l1-name')).map((n) => n.textContent)
-    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', '系统工具'])
+    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', 'MCP 工具', '系统工具'])
 
     const subs = Array.from(container.querySelectorAll('.l1-sub')).map((n) => n.textContent)
     expect(subs[0]).toBe('2 个 · 0 个已启用')   // CU 全部禁用
     expect(subs[1]).toBe('1 个 · 0 个已启用')   // KB 全部禁用
     expect(subs[2]).toBe('需安装 Chrome 扩展')  // BR 空组
-    expect(subs[3]).toBe('3 个 · 2 个已启用')   // SYS 半开
+    expect(subs[3]).toBe('3 个 · 2 个已启用')   // MCP 半开（third-party 工具不再混进系统工具）
+    expect(subs[4]).toBe('3 个 · 2 个已启用')   // SYS 半开
   })
 })
 
@@ -138,7 +144,7 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     await act(async () => { closeBtn.click() })
     expect(container.querySelector('.tools-panel')).toBeNull()
     // 一级目录仍在
-    expect(container.querySelectorAll('.l1-item').length).toBe(4)
+    expect(container.querySelectorAll('.l1-item').length).toBe(5)
   })
 
   it('切换到另一类后二级内容随之变化', async () => {
@@ -146,7 +152,7 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     const items = container.querySelectorAll('.l1-item')
     await act(async () => { (items[0] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('电脑操作')
-    await act(async () => { (items[3] as HTMLElement).click() })
+    await act(async () => { (items[4] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('系统工具')
   })
 })
@@ -167,7 +173,7 @@ describe('SessionToolsPanel · 分类开关', () => {
   it('半开组点开关 → 全部启用', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    const sw = items[3].querySelector('.tc-sw') as HTMLElement
+    const sw = items[4].querySelector('.tc-sw') as HTMLElement
     await act(async () => { sw.click() })
     await act(async () => { await Promise.resolve() })
     expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'SYS', true])
@@ -184,11 +190,104 @@ describe('SessionToolsPanel · 分类开关', () => {
   })
 })
 
+describe('SessionToolsPanel · MCP 三级开关（总类 → server → 单工具）', () => {
+  /** 按一级标签找行（⛔ 不写死下标：MCP 插入后下标会漂） */
+  const l1ByLabel = (label: string) =>
+    Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === label) as HTMLElement
+  /** 二级分组头（`.tools-panel-list > div > .tool-row`） */
+  const serverHeaders = () =>
+    Array.from(container.querySelectorAll('.tools-panel-list > .tool-row')) as HTMLElement[]
+  const headerOf = (server: string) =>
+    serverHeaders().find((h) => h.querySelector('.tool-name')?.textContent === server)!
+  /** 当前列表面板里出现的工具名（第二层只有 server 行，第三层才是工具）。 */
+  const listKeyTexts = () =>
+    Array.from(container.querySelectorAll('.tools-panel-list .tool-key'))
+      .map((n) => n.textContent)
+
+  it('⭐ 展开 MCP → 只列 server（第二层），点 server 进第三层才看到工具', async () => {
+    await mount()
+    await act(async () => { l1ByLabel('MCP 工具').click() })
+
+    const names = serverHeaders().map((h) => h.querySelector('.tool-name')?.textContent)
+    expect(names).toEqual(['other', 'rea'])
+    expect(headerOf('rea').querySelector('.tool-key')?.textContent).toBe('1 / 2 已启用')
+    // 第二层不铺工具行：一个 server 可能带 255 个工具，不能一口气全渲染
+    expect(listKeyTexts()).toEqual(['1 / 1 已启用', '1 / 2 已启用'])
+
+    await act(async () => { headerOf('rea').click() })
+    expect(listKeyTexts()).toContain('mcp__rea__inspect_plist')
+    expect(listKeyTexts()).not.toContain('mcp__other__do_thing')
+    expect(container.querySelector('.crumb-cur')?.textContent).toBe('rea')
+  })
+
+  it('⭐ server 开关 → PATCH {category:MCP, mcpServer:rea}（只关这一个 server）', async () => {
+    await mount()
+    await act(async () => { l1ByLabel('MCP 工具').click() })
+
+    const sw = headerOf('rea').querySelector('.tc-sw') as HTMLElement
+    expect(sw.className).toContain('mixed')
+    await act(async () => { sw.click() })
+    await act(async () => { await Promise.resolve() })
+
+    expect(setCategoryEnabled).toHaveBeenCalledTimes(1)
+    expect(setCategoryEnabled.mock.calls[0]).toEqual(['sess-1', 'MCP', true, 'rea'])
+    // ⛔ server 开关不得进入第三层（只切开关，不改视图）
+    expect(container.querySelector('.crumb-cur')).toBeNull()
+  })
+
+  it('一级 MCP 开关 → PATCH {category:MCP}（不带 mcpServer = 整个 MCP 类）', async () => {
+    await mount()
+    const sw = l1ByLabel('MCP 工具').querySelector('.tc-sw') as HTMLElement
+    await act(async () => { sw.click() })
+    await act(async () => { await Promise.resolve() })
+
+    expect(setCategoryEnabled).toHaveBeenCalledTimes(1)
+    expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'MCP', true])
+  })
+
+  it('第三层面包屑返回 server 列表（不再是折叠语义）', async () => {
+    await mount()
+    await act(async () => { l1ByLabel('MCP 工具').click() })
+    await act(async () => { headerOf('rea').click() })
+    expect(container.querySelector('.crumb-cur')?.textContent).toBe('rea')
+
+    await act(async () => { (container.querySelector('.crumb-root') as HTMLElement).click() })
+    expect(container.querySelector('.crumb-cur')).toBeNull()
+    expect(serverHeaders().map((h) => h.querySelector('.tool-name')?.textContent))
+      .toEqual(['other', 'rea'])
+  })
+})
+
+describe('SessionToolsPanel · 单工具开关（目标状态语义）', () => {
+  it('⭐ 点「禁用」发 enabled=false、点「启用」发 enabled=true', async () => {
+    await mount()
+    const items = container.querySelectorAll('.l1-item')
+    await act(async () => { (items[4] as HTMLElement).click() })
+
+    const rowOf = (name: string) =>
+      Array.from(container.querySelectorAll('.tool-row'))
+        .find((r) => r.querySelector('.tool-key')?.textContent === name)!
+
+    // 当前可用（disabled=false）→ 按钮「禁用」→ 目标 enabled=false
+    setToolEnabled.mockResolvedValue({ ...FIXTURE.find((f) => f.name === 'Bash')!, disabled: true })
+    await act(async () => { (rowOf('Bash').querySelector('.toggle-btn') as HTMLButtonElement).click() })
+    await act(async () => { await Promise.resolve() })
+    expect(setToolEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'Bash', false])
+
+    // 当前已禁用（disabled=true）→ 按钮「启用」→ 目标 enabled=true
+    setToolEnabled.mockResolvedValue({ ...FIXTURE.find((f) => f.name === 'Read')!, disabled: false })
+    await act(async () => { (rowOf('Read').querySelector('.toggle-btn') as HTMLButtonElement).click() })
+    await act(async () => { await Promise.resolve() })
+    expect(setToolEnabled.mock.calls[1].slice(0, 3)).toEqual(['sess-1', 'Read', true])
+  })
+})
+
 describe('SessionToolsPanel · 核心工具保护', () => {
   it('Agent 的禁用按钮是 disabled（后端会 400）', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    await act(async () => { (items[3] as HTMLElement).click() })
+    await act(async () => { (items[4] as HTMLElement).click() })
     const rows = Array.from(container.querySelectorAll('.tool-row'))
     const agentRow = rows.find((r) => r.querySelector('.tool-key')?.textContent === 'Agent')
     expect(agentRow, '应能找到 Agent 行').toBeTruthy()

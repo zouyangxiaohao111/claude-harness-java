@@ -818,18 +818,14 @@ class HookRegistryDispatchTest {
     }
 
     private static MatchedHook promptHookMatched(String prompt) {
-        // [FINAL-SETTLE-T1] pluginRoot 置 null —— Java 插件 hook 仅能声明 CommandHook
-        //   （PluginLoader.parsePluginHookCommand 恒返回 CommandHook），prompt hook 只可能是
-        //   配置驱动（settings/userSettings 源）；原 "plugin-x" 会触发 IMP-HR-02 统一单链的
-        //   插件源跳过（executeConfiguredHooks:4274-4284 → 走 genericHooks 链）导致本用例
-        //   G07 拒绝结果丢失（results 空）。置 null 后走 executeConfiguredHooks → G07 门禁。
+        // pluginRoot 置 null 仅为保持本用例的 settings 源语义。Wave2-J2 起插件 hooks.json
+        // 也支持 prompt/agent 等 5 类型，且 executeConfiguredHooks 不再跳过插件源 matched hook。
         return new MatchedHook(new PromptHook(prompt, null, null, "model-x", null, null),
             null, null, null, "userSettings");
     }
 
     private static MatchedHook agentHookMatched(String prompt) {
-        // [FINAL-SETTLE-T1] pluginRoot 置 null —— 同 promptHookMatched：agent hook 只可能是
-        //   配置驱动源（Java 插件无法声明 agent hook），原 "plugin-y" 触发插件源跳过。
+        // pluginRoot 置 null 仅为保持本用例的 settings 源语义（J2 起插件也支持 agent hook）。
         return new MatchedHook(new AgentHook(prompt, null, null, "model-y", null, null),
             null, null, null, "userSettings");
     }

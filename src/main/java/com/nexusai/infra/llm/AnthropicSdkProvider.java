@@ -126,6 +126,18 @@ public class AnthropicSdkProvider implements LlmProvider {
      *  PROMPT_CACHING_SCOPE_BETA_HEADER（constants/betas.ts:17-18）。firstParty 全局缓存场景
      *  必须随 anthropic-beta 下发（claude.ts:1217-1222），否则 API 400 / 缓存不生效（§10 风险 1）。 */
     static final String PROMPT_CACHING_SCOPE_BETA_HEADER = "prompt-caching-scope-2026-01-05";
+    /** [claude-subscription-oauth] Claude 订阅态必须随 anthropic-beta 下发的两条 beta
+     *  （CC 订阅登录的固定形状；缺任一条订阅令牌会被拒）。 */
+    static final String CLAUDE_CODE_BETA = "claude-code-20250219";
+    static final String OAUTH_BETA = "oauth-2025-04-20";
+    /** 客户端层 anthropic-beta 单头两值（逗号分隔，与 CC 单头多值同形）。 */
+    static final String CLAUDE_CODE_OAUTH_BETA_HEADER = CLAUDE_CODE_BETA + "," + OAUTH_BETA;
+    /** [claude-subscription-oauth] CC CLI 身份头值（订阅态出站形状的一部分）。 */
+    static final String CLAUDE_CLI_USER_AGENT = "claude-cli/2.1.75";
+    static final String CLAUDE_CLI_X_APP = "cli";
+    /** [claude-subscription-oauth] system 首段固定身份句（CC 订阅态逐字相同；ASCII 撇号）。 */
+    static final String CLAUDE_CODE_IDENTITY_SYSTEM =
+        "You are Claude Code, Anthropic's official CLI for Claude.";
     /** [DEC-RV-09] 非流式请求 max_tokens 硬 cap · CC original: MAX_NON_STREAMING_TOKENS
      *  (Open-ClaudeCode/src/services/api/claude.ts:3354) = 64_000。
      *  非流式请求有 10 分钟硬上限（platform docs long-requests）；SDK 默认 21333-token cap 由
@@ -245,10 +257,27 @@ public class AnthropicSdkProvider implements LlmProvider {
      * @param readIdleMs 流式读超时毫秒（null/≤0 = 不武装，保持现状）
      */
     static AnthropicClient buildClient(ProviderConfig config, String sessionId, Long readIdleMs) {
-        AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder()
-            .apiKey(config.apiKey())
-            // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
-            .maxRetries(0);
+        AnthropicOkHttpClient.Builder builder = AnthropicOkHttpClient.builder();
+        // [claude-subscription-oauth] 凭据形态二选一：Claude 订阅 OAuth 令牌走
+        //   `.authToken(...)`（SDK 侧 StaticAuthHeaders 只会落 `Authorization: Bearer <token>`，
+        //   且 apiKey 为 null ⇒ 不发 x-api-key）；普通 API Key 路径逐字保持 `.apiKey(...)`。
+        //   ⛔ 两条分支不共存：两者都设时 SDK 会同时发 x-api-key + Authorization。
+        if (isClaudeOAuthToken(config.apiKey())) {
+            builder.authToken(config.apiKey());
+            // Claude Code 身份头（对齐 CC 订阅态出站形状）——**放在 ProviderHeaderInjector.apply 之前**，
+            //   让 provider 自定义头仍可覆盖（injector 后写）。
+            //   ⚠️ anthropic-beta 在 params 层另有一份（见 buildMessageParams 的 betas 列表）：
+            //   SDK 的 PrepareRequest 先 putAllHeaders(clientOptions.headers()) 再
+            //   replaceAllHeaders(params._headers())（anthropic-java-core 2.53.0 字节码实测），
+            //   即**params 层同名头会整条替换**客户端层 → 只写客户端层会在 effort/task-budget 模型上被顶掉。
+            builder.putHeader("anthropic-beta", CLAUDE_CODE_OAUTH_BETA_HEADER)
+                .putHeader("user-agent", CLAUDE_CLI_USER_AGENT)
+                .putHeader("x-app", CLAUDE_CLI_X_APP);
+        } else {
+            builder.apiKey(config.apiKey());
+        }
+        // [CC claude.ts:1781] Disabled auto-retry in favor of manual implementation
+        builder.maxRetries(0);
         if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
             builder.baseUrl(normalizeBaseUrl(config.baseUrl()));
         }
@@ -261,6 +290,18 @@ public class AnthropicSdkProvider implements LlmProvider {
         }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
+    }
+
+    /**
+     * Claude 订阅 OAuth 令牌判定：上游同为凭证前缀判定（pi-ai providers/anthropic.js:583）。
+     *
+     * <p>判据 = 凭据字符串含 {@code sk-ant-oat}（OAuth access token 前缀）⇒ 走
+     * {@code .authToken(...)} + CC 身份头 + system 身份段；否则普通 API Key 路径零变化。
+     * ⚠️ 刻意<b>不</b>给 {@link ProviderConfig} 加「是否 OAuth」字段：该 record 有 57 处构造点，
+     * 凭证前缀判定与上游同源，单点即可。
+     */
+    static boolean isClaudeOAuthToken(String apiKey) {
+        return apiKey != null && apiKey.contains("sk-ant-oat");
     }
 
     /**
@@ -441,7 +482,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             //   CC claude.ts:3224/:3243 markerIndex = skipCacheWrite ? len-2 : len-1
             MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
                 maxOutputTokensOverride, taskBudget, effortValue, null, skipCacheWrite, null,
-                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
+                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config,
+                isClaudeOAuthToken(config.apiKey()));   // [claude-subscription-oauth] system 身份段
 
             String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
             if (log.isDebugEnabled()) {
@@ -1018,7 +1060,8 @@ public class AnthropicSdkProvider implements LlmProvider {
         // [C] 流式失败回退路径同样透传 skipCacheWrite（原硬编码 null）——回退链与流式链 marker 语义一致
         MessageCreateParams params = buildMessageParams(modelName, systemPromptBlocks, history, tools,
             maxOutputTokensOverride, taskBudget, effortValue, null, skipCacheWrite, null,
-            StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
+            StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config,
+            isClaudeOAuthToken(config.apiKey()));
         // [DEC-RV-09] 非流式硬 cap 64000 · CC claude.ts:3364-3389 adjustParamsForNonStreaming
         //   （buildMessageParams 之后、create 之前无条件应用；claude.ts:857-860）
         params = adjustParamsForNonStreaming(params);
@@ -1343,7 +1386,8 @@ public class AnthropicSdkProvider implements LlmProvider {
                         null, null, null, null, null, null, null, null, null,
                         null, java.util.List.of(), java.util.List.of())),
                 null, null, null, null, null, null, null,
-                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
+                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config,
+                isClaudeOAuthToken(config.apiKey()));
 
             // [DEC-RV-09] 非流式硬 cap 64000（CC claude.ts:857-860 executeNonStreamingRequest 内
             // adjustParamsForNonStreaming(retryParams, MAX_NON_STREAMING_TOKENS)——buildMessageParams 之后、create 之前无条件应用）
@@ -1453,7 +1497,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             MessageCreateParams params = buildMessageParams(modelName, toSingleOrgBlock(systemPrompt), history, tools,
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
-                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
+                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config,
+                isClaudeOAuthToken(config.apiKey()));
             if (temperature != null && params.thinking().isEmpty()) {
                 // [P2-16] thinking disabled 时写 temperature（CC claude.ts:1693-1694）
                 // [thinking-adaptive 2026-10-10] 判据显式化：请求带 thinking（现恒 adaptive）时不写
@@ -1616,7 +1661,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             MessageCreateParams params = buildMessageParams(modelName, toSingleOrgBlock(systemPrompt), history, tools,
                 maxTokens, null, null, outputFormat, skipCacheWrite,
                 options != null ? options.enablePromptCaching() : null,
-                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config);
+                StructuredOutputsSupport.isFirstPartyAnthropicBaseUrl(config.baseUrl()), config,
+                isClaudeOAuthToken(config.apiKey()));
             if (temperature != null && params.thinking().isEmpty()) {
                 // [P2-16] thinking disabled 时写 temperature（CC claude.ts:1693-1694）
                 // [thinking-adaptive 2026-10-10] 判据显式化：请求带 thinking（现恒 adaptive）时不写
@@ -2052,6 +2098,34 @@ public class AnthropicSdkProvider implements LlmProvider {
                                                          Boolean enablePromptCaching,
                                                          boolean firstParty,
                                                          ProviderConfig config) {
+        // 既有 public 签名保持不变（三条链 + 全仓测试沿用 12 参重载）· 非 OAuth 恒 false。
+        return buildMessageParams(modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
+            taskBudget, effortValue, outputFormat, skipCacheWrite, enablePromptCaching, firstParty, config,
+            false);
+    }
+
+    /**
+     * [claude-subscription-oauth] 全参 + Claude Code 身份段判定 · 最终重载。
+     *
+     * <p>{@code claudeCodeIdentity=true}（= 订阅 OAuth 令牌）时 system 变<b>两段</b>：
+     * 首段固定身份句 {@link #CLAUDE_CODE_IDENTITY_SYSTEM}（<b>不带</b> cache_control），
+     * 第二段起是原有 blocks（cache_control 语义逐字不变）；原有 blocks 为空时仍发
+     * <b>只有身份段</b>的 system（不可省略，订阅端点依赖该身份段）。
+     * 非 OAuth 完全走原逻辑（含 {@code null blocks → 无 system 字段}）。
+     */
+    public static MessageCreateParams buildMessageParams(String modelName,
+                                                         List<SystemPromptBlock> systemPromptBlocks,
+                                                         List<ChatMessageDto> history,
+                                                         ArrayNode tools,
+                                                         Integer maxOutputTokensOverride,
+                                                         TaskBudgetParam taskBudget,
+                                                         String effortValue,
+                                                         LlmProvider.ChatRequestOptions.OutputFormat outputFormat,
+                                                         Boolean skipCacheWrite,
+                                                         Boolean enablePromptCaching,
+                                                         boolean firstParty,
+                                                         ProviderConfig config,
+                                                         boolean claudeCodeIdentity) {
         // [批 3c] 会话键解析（单点判据，与 header 注入链同源）——本次请求构造全程复用这一份，
         //   绝不读环境态会话槽（裸 MDC 会话槽已随批 3c 删除）。可能为 null（history 无会话
         //   标识）→ MicroCompactor 侧走一次性 WARN 兜底，不在此处发明。
@@ -2130,7 +2204,20 @@ public class AnthropicSdkProvider implements LlmProvider {
         boolean caching = enablePromptCaching != null
             ? enablePromptCaching
             : PromptCaching.getPromptCachingEnabled(modelName);
-        if (systemPromptBlocks != null && !systemPromptBlocks.isEmpty()) {
+        boolean hasSystemBlocks = systemPromptBlocks != null && !systemPromptBlocks.isEmpty();
+        if (claudeCodeIdentity) {
+            // [claude-subscription-oauth] CC 订阅态 system = [身份句] + 原 blocks。
+            //   身份段**不带** cache_control（不是缓存断点，附上会改变 CC 的断点语义）；
+            //   原 blocks 的 cache_control 由 SystemPromptBlocksBuilder 产出、逐字保留。
+            //   原 blocks 为空 → 仍发只有身份段的 system（不能省）。
+            List<TextBlockParam> identitySystem = new ArrayList<>(hasSystemBlocks ? 3 : 1);
+            identitySystem.add(TextBlockParam.builder().text(CLAUDE_CODE_IDENTITY_SYSTEM).build());
+            if (hasSystemBlocks) {
+                identitySystem.addAll(toSdkSystemBlocks(
+                    SystemPromptBlocksBuilder.buildSystemPromptBlocks(systemPromptBlocks, caching)));
+            }
+            b.systemOfTextBlockParams(identitySystem);
+        } else if (hasSystemBlocks) {
             b.systemOfTextBlockParams(toSdkSystemBlocks(
                 SystemPromptBlocksBuilder.buildSystemPromptBlocks(systemPromptBlocks, caching)));
         }
@@ -2186,7 +2273,15 @@ public class AnthropicSdkProvider implements LlmProvider {
         }
 
         // anthropic-beta header（task-budgets / effort / structured-outputs / tool-search / prompt-caching-scope，逗号分隔）
-        java.util.ArrayList<String> betas = new java.util.ArrayList<>(2);
+        java.util.ArrayList<String> betas = new java.util.ArrayList<>(4);
+        // [claude-subscription-oauth] 订阅态两条 beta 必须在算进 params 的 anthropic-beta：
+        //   SDK 的 PrepareRequest 先 putAllHeaders(clientOptions.headers()) 再
+        //   replaceAllHeaders(params._headers()) ⇒ params 层同名头**整条替换**客户端层，
+        //   只在 buildClient 里写 anthropic-beta 会在 effort/task-budget 模型上被顶掉。
+        if (claudeCodeIdentity) {
+            betas.add(CLAUDE_CODE_BETA);
+            betas.add(OAUTH_BETA);
+        }
         if (taskBudget != null) betas.add(TASK_BUDGETS_BETA_HEADER);
         if (modelSupportsEffortLocal(modelName)) betas.add(EFFORT_BETA_HEADER);
         if (outputFormat != null) betas.add(STRUCTURED_OUTPUTS_BETA_HEADER);

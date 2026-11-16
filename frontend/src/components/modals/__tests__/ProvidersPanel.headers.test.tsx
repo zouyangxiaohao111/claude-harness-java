@@ -101,6 +101,12 @@ describe('ProvidersPanel · 自定义请求头', () => {
     draw(api)
 
     act(() => byText('button', '+ 添加提供商').click())
+    // [V299] 添加的第一步是「选品牌」；本用例走自定义（不预填品牌）
+    act(() => {
+      const custom = container.querySelector<HTMLButtonElement>('.brand-picker-custom')
+      if (!custom) throw new Error('未找到自定义连接入口')
+      custom.click()
+    })
     act(() => typeInto(container.querySelector<HTMLInputElement>('input[placeholder="e.g. OpenAI"]')!, 'MyGW'))
     act(() => typeInto(container.querySelector<HTMLInputElement>('input[placeholder="https://api.openai.com/v1"]')!, 'https://gw.local/v1'))
     act(() => typeInto(container.querySelector<HTMLInputElement>('input[placeholder="sk-****abcd"]')!, 'sk-live-1'))

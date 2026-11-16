@@ -145,6 +145,8 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
         }
         useChatStore.getState().markToolAnswered(sid, perm.toolUseId ?? id)
         dequeuePermission(id)
+        // 同 App：同一 tool_use 的 bridge 条目要一并清掉，否则左栏黄点清不掉
+        useChatStore.getState().clearPermissionByToolUse(sid, perm.toolUseId ?? id)
       }}
       onAbort={() => {
         if (clientRef.current) {

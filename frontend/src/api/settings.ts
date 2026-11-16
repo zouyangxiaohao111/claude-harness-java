@@ -67,6 +67,56 @@ export function putMcpPrefetch(enabled: boolean): Promise<McpPrefetchConfig> {
   return api<McpPrefetchConfig>('/settings/mcp-prefetch', { method: 'PUT', body: { enabled } })
 }
 
+/**
+ * [V298] LLM 出站线路（HTTP 代理）· `GET/PUT /api/v1/settings/http-proxy`。
+ *
+ * <p>⚠️ 这是 **LLM 专用**（ChatGPT 登录 + 对话）：WebSearch / WebFetch 走各自的
+ * `settings.proxy`，两条通道互不影响 —— 改这里不会让搜索/抓网页跟着走代理。
+ *
+ * <p>`proxy = null` 表示未配置（出站回落环境变量/直连）。
+ */
+export interface HttpProxyConfig {
+  proxy: string | null
+}
+
+/** GET — 读取当前 LLM 出站代理。 */
+export function getHttpProxy(): Promise<HttpProxyConfig> {
+  return api<HttpProxyConfig>('/settings/http-proxy')
+}
+
+/** PUT — 保存 LLM 出站代理；传 `null` / 空串 = 直连（清空配置），下一次请求即生效。 */
+export function putHttpProxy(proxy: string | null): Promise<HttpProxyConfig> {
+  return api<HttpProxyConfig>('/settings/http-proxy', { method: 'PUT', body: { proxy } })
+}
+
+/** 探测命中的本机代理（按延迟升序）。 */
+export interface HttpProxyCandidate {
+  port: number
+  latencyMs: number
+}
+
+/**
+ * GET — 探测本机常见代理端口。
+ *
+ * <p>判据不是「端口开着」，而是**真的经它取到一次 HTTPS 204** ⇒ SOCKS 端口、
+ * 被别的服务占用的端口都会被排除。范围仅本机回环，不扫局域网。
+ */
+export function probeHttpProxy(): Promise<{ candidates: HttpProxyCandidate[] }> {
+  return api<{ candidates: HttpProxyCandidate[] }>('/settings/http-proxy/probe')
+}
+
+/** 实测一条代理能否转发 HTTPS；`ok=false` 时 `error` 是可读短句。 */
+export interface HttpProxyTestResult {
+  ok: boolean
+  latencyMs: number
+  error: string | null
+}
+
+/** POST — 记住之前实测（失败不拦截保存，只提示）。 */
+export function testHttpProxy(proxy: string): Promise<HttpProxyTestResult> {
+  return api<HttpProxyTestResult>('/settings/http-proxy/test', { method: 'POST', body: { proxy } })
+}
+
 export const settingsApi = {
   /** GET /api/v1/settings — 读取全局设置 */
   get: () => api<AppSettings>('/settings'),

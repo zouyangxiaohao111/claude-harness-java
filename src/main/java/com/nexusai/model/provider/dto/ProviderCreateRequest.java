@@ -9,5 +9,7 @@ public record ProviderCreateRequest(
     String baseUrl,
     String apiKey,
     Map<String, String> extraHeaders,
-    Boolean enabled
+    Boolean enabled,
+    /** [V299] 归属品牌 key（为空则按 host/name 自动识别一次）。 */
+    String brandKey
 ) {}

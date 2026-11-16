@@ -18,6 +18,15 @@ public class ProviderController {
     @GetMapping
     public List<ProviderDto> list() { return providerService.listAll(); }
 
+    /**
+     * 内置品牌目录 + 每个品牌是否已配置（只读 · 不建记录）。
+     *
+     * <p>⚠️ 必须声明在 {@code /{id}} 之前也不影响匹配：Spring 的字面量路径优先级高于路径变量，
+     * {@code /builtin} 不会被 {@link #get(String)} 抢走。
+     */
+    @GetMapping("/builtin")
+    public List<ProviderService.BuiltinStatus> builtin() { return providerService.listBuiltinStatuses(); }
+
     @GetMapping("/{id}")
     public ProviderDto get(@PathVariable String id) { return providerService.getById(id); }
 

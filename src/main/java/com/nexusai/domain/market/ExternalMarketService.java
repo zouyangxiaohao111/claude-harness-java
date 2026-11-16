@@ -77,6 +77,8 @@ public class ExternalMarketService {
                     text(n.get("category")),
                     strList(n.get("tags")),
                     text(n.get("createdAt")),
+                    // 上架时间：清单的 publishedAt 每次上架/回滚刷新；旧数据缺失 → null
+                    text(n.get("publishedAt")),
                     // [2026-11-01 v4] 统计：原始整数；缺失保持 null（前端不显示该统计，不显示 0）
                     longOrNull(n.get("useCount")),
                     longOrNull(n.get("downloadCount")),
@@ -289,7 +291,7 @@ public class ExternalMarketService {
                 : longOrNull(firstPresent(s, "download", "downloadCount"));
             out.add(new ExternalPluginDto(
                 p.name(), p.displayName(), p.description(), p.version(), p.fingerprint(), p.category(),
-                p.tags(), p.createdAt(), use, download,
+                p.tags(), p.createdAt(), p.publishedAt(), use, download,
                 p.authorName(), p.authorVerified(), p.authorAvatarUrl(), p.authorEmail()));
         }
         if (log.isDebugEnabled()) {

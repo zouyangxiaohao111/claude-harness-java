@@ -2253,7 +2253,8 @@ public class StreamingToolExecutor {
                             GenericHook.HookResult postOutcome = hookRegistry.executePostToolUse(
                                 t.call.name(),
                                 t.executedInput != null ? t.executedInput : t.call.input(),
-                                baseResult, ctx);
+                                baseResult, ctx, false,
+                                t.toolDurationMs > 0 ? t.toolDurationMs : null);
                             // [A2 强化] 数据流日志: PostToolUse hook 成功执行
                             // WHY: PostToolUse 在 tool.execute 之后调 (CC line 1483 runPostToolUseHooks),
                             //      是 MCP-specific 分流 (updatedMCPToolOutput) + non-MCP feedback
@@ -2261,11 +2262,16 @@ public class StreamingToolExecutor {
                             //      直接 grep 到 PostToolUse 是否跑了 / 是否替换了 tool output.
                             // [IMP-HOOKS-S6 ⊕2] postHookNames 名单打印已删除 (CC 无对应),
                             //   decision 归因保留.
+                            // [Wave2-F] 归因补 updatedToolOutput（v2.1.325 全工具替换字段，
+                            //   优先于 updatedMCPToolOutput；后者仅 MCP 工具生效）。
                             String postDecision = postOutcome != null
-                                && postOutcome.updatedMCPToolOutput() != null ? "MCP_OUTPUT_REPLACED"
-                                : (postOutcome != null && postOutcome.blockingError() != null ? "FEEDBACK_APPENDED"
+                                && postOutcome.updatedToolOutput() != null ? "OUTPUT_REPLACED"
+                                : (postOutcome != null && postOutcome.updatedMCPToolOutput() != null
+                                    ? "MCP_OUTPUT_REPLACED"
+                                : (postOutcome != null && postOutcome.blockingError() != null
+                                    ? "FEEDBACK_APPENDED"
                                 : (postOutcome != null && postOutcome.preventContinuation() ? "STOPPED"
-                                : "PROCEED"));
+                                : "PROCEED")));
                             log.info("PostToolUse hook executed, hookName={}, toolName={}, decision={}",
                                 "PostToolUse:" + t.call.name(), t.call.name(), postDecision);
                             if (postOutcome != null) {
@@ -2296,9 +2302,17 @@ public class StreamingToolExecutor {
                                 //   /1585-1587) → 附件先注入 state.attachments() 通道, MCP toolOutput 替换后置, 与 CC
                                 //   代码序一致 (旧实现替换在前、注入在后, X-PROBE EV-XP-W3-026 代码序相反).
                                 injectPostToolUseHookAttachments(t, postOutcome, ctx, "PostToolUse");
-                                // MCP-specific 分流: updatedMCPToolOutput → 替换 toolOutput (CC 最后 yield)
-                                if (isMcp && postOutcome.updatedMCPToolOutput() != null) {
-                                    Object updated = postOutcome.updatedMCPToolOutput();
+                                // 工具输出替换（CC 最后 yield）· 对齐 claude.exe v2.1.325
+                                //   PostToolUse.hookSpecificOutput 两字段（exe off≈311,055,676）：
+                                //   `updatedToolOutput` 适用于**所有工具**且优先；
+                                //   `updatedMCPToolOutput` 仅 MCP 工具（旧字段，CC 描述 "Prefer
+                                //   updatedToolOutput, which works for all tools"）。
+                                //   旧实现只认 updatedMCPToolOutput + isMcp 门控 → 内置工具
+                                //   （Read/Bash/WebFetch…）的脱敏/改写 hook 静默无效（安全 P0）。
+                                Object updated = postOutcome.updatedToolOutput() != null
+                                    ? postOutcome.updatedToolOutput()
+                                    : (isMcp ? postOutcome.updatedMCPToolOutput() : null);
+                                if (updated != null) {
                                     String updatedContent = updated instanceof String
                                         ? (String) updated : String.valueOf(updated);
                                     // [IMP-ST-01] 对齐 CC toolExecution.ts:1400-1401/1467/1541: updatedMCPToolOutput
@@ -2311,9 +2325,22 @@ public class StreamingToolExecutor {
                                     //   4 字段构造保留 contextModifier/mcpMeta 对齐 [IMP-ST-01] 语义.
                                     t.result = new ToolResult<>(updatedContent, null,
                                         baseResult.contextModifier(), baseResult.mcpMeta());
-                                    log.info("TOOL PostToolUse MCP output replaced: name={} id={}",
+                                    log.info("TOOL PostToolUse output replaced: field={} name={} id={}",
+                                        postOutcome.updatedToolOutput() != null
+                                            ? "updatedToolOutput" : "updatedMCPToolOutput",
                                         t.call.name(), abbreviate(t.call.id(), 24));
                                 }
+                                // [Wave2-F · classifierContext N/A 登记]
+                                //   CC `PostToolUse.hookSpecificOutput.classifierContext`
+                                //   （exe off≈311,055,676）是"宿主断言、与本调用的结果一起给 auto 模式
+                                //   权限分类器看"的输入（≤2000 UTF-16、仅同步响应生效）。
+                                //   本仓分类器入口 = PermissionPipeline.java:574
+                                //   `yoloClassifier.classify(toolName, input, fullTranscript(ctx), ctx)`，
+                                //   在**权限决策时**（工具执行前）调用一次，证据是 transcript 快照；
+                                //   本类（执行后）没有任何回灌分类器的通道，也没有
+                                //   "per-result host assertion" 结构 ⇒ 不伪造通道。
+                                //   字段本身已由 HookOutputParser 解析进 HookResult.classifierContext，
+                                //   等未来分类器支持结果侧断言时在此消费。
                             }
                         } catch (Throwable th) {
                             // hook 抛异常 → best-effort, 不挂掉 tool batch
@@ -2414,7 +2441,8 @@ public class StreamingToolExecutor {
                             t.call.name(),
                             t.executedInput != null ? t.executedInput : t.call.input(),
                             (ToolResult<?>) t.result, ctx, false, isAbort,
-                            t.call.id(), t.isError);
+                            t.call.id(), t.isError,
+                            t.toolDurationMs > 0 ? t.toolDurationMs : null);
                         // [H5] failure 路径 attachment 注入 (CC runPostToolUseFailureHooks yield 4 类 attachment)
                         injectPostToolUseHookAttachments(t, failureOutcome, ctx, "PostToolUseFailure");
                         // [A2 强化] 数据流日志: catch 路径失败事件已发出 (与 line 1601 成功分支呼应)

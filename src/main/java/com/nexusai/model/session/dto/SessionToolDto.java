@@ -9,10 +9,14 @@ package com.nexusai.model.session.dto;
  * （{@code Tool.userFacingName()}，Tool.java:660 default = name），disabled =
  * 是否在该会话禁用集合（sessions.disabled_tools，V34 列）中。
  *
- * <p><b>[tool-categories] category</b>：工具分类（{@code CU}/{@code KB}/{@code BR}/{@code SYS}），
+ * <p><b>[tool-categories] category</b>：工具分类（{@code CU}/{@code KB}/{@code BR}/{@code MCP}/{@code SYS}），
  * 由 {@link com.nexusai.application.agent.tool.SessionToolCategory#of} 判定
  * （MCP server 名前缀 / 实现类包名），前端据此分组渲染。分类归属只在后端判一次，
  * 前端不写死前缀（否则同一规则多处各抄一份，工具改名必漏）。
+ *
+ * <p><b>[tool-categories] mcpServer</b>：{@code category=MCP} 时该工具所属 MCP server 名
+ * （如 {@code rea}），非 MCP 类为 {@code null}。前端「MCP 工具」二级视图按它分组，
+ * 二级开关的请求体也用它（{@code {category:"MCP", mcpServer:"rea", enabled:false}}）。
  *
  * <p><b>[tool-categories] description</b>：{@code Tool.description()} 原文，<b>不截断</b> ——
  * 截断由前端按行数做（CSS line-clamp），避免后端与前端两套截断口径漂移。
@@ -22,10 +26,12 @@ public record SessionToolDto(
     String name,
     /** 展示名 = tool.userFacingName()（Tool.java:660 default） */
     String userFacingName,
-    /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / SYS=系统工具 */
+    /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / MCP=第三方 MCP / SYS=系统工具 */
     String category,
     /** 工具描述原文（Tool.description()，不截断） */
     String description,
     /** 是否在该会话禁用集合中（V34 列 disabled_tools） */
-    boolean disabled
+    boolean disabled,
+    /** MCP server 名（category=MCP 时非 null，如 "rea"；其余分类为 null） */
+    String mcpServer
 ) {}

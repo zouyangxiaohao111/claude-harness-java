@@ -85,6 +85,8 @@ export interface MarketManagedPlugin {
   /** 内容指纹 sha256:...· 用于判断「内容有没有变」 */
   fingerprint?: string
   updatedAt?: string
+  /** 最近一次上架时间（每次上架/回滚刷新） */
+  publishedAt?: string
   /** 全部历史版本（不删包，可回滚） */
   versions?: MarketVersionEntry[]
 }
@@ -106,6 +108,8 @@ export interface PublishPluginRequest {
   tags?: string[]
   /** 留空 → 自动 patch +1 */
   version?: string
+  /** 市场卡片「开发者」名；留空时新条目默认 zjky、已有条目保留原值 */
+  author?: string
 }
 
 /** 上架 / 回滚结果 */

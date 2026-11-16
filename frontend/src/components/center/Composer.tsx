@@ -435,6 +435,14 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   //   完整路径（path 附件）。详见 `utils/attachmentDelivery.ts` 的「去重键 = 身份，不是名字」段。
   //   ⛔ 三个释放点都必须用 chip 上的 `dedupKey`（见下面 chip 移除、清空、doSend）。
   const addedKeysRef = useRef<Set<string>>(new Set())
+  // [跨会话附件隔离 2026-11-16] 待发附件是「当前会话的草稿」，⛔ 不得跟着切到另一个会话。
+  //   组件本身在切换会话时不会重挂载（挂载方是 App，无 key）⇒ 必须按 sessionId 显式清空 + 释放去重键。
+  //   ⚠️ 发送时 doSend 已先 setAttachments([])，所以「新建会话 → 首条发送 → sessionId 落地」这
+  //   一步变化不会误清用户正在编辑的附件（那时 attachments 本来就空）。
+  useEffect(() => {
+    setAttachments([])
+    addedKeysRef.current.clear()
+  }, [sessionId])
   // 点击缩略图 → 放大预览（lightbox）
   const [zoomImg, setZoomImg] = useState<string | null>(null)
   // Mode 下拉（受控 · V33 bare_mode：simple=精简 true / full=完整 false）
@@ -1506,14 +1514,23 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                 }}
               />
               {/* 左下角「+」：统一收纳 添加文件 / 模式 / 专家 / 技能 / 连接器 */}
-              <div className="plus-wrap" ref={plusRef}>
+              {/* 悬停即展开（用户 2026-11-15）：鼠标移到 + 上直接出菜单，不再需要点击。
+                  点击保留为「打开」（键盘 Enter/Space 的可达路径），⛔ 不再做开/合切换——
+                  指针悬停时菜单本来就已展开，点击若切换会把它关掉。
+                  离开整个 plus-wrap（按钮 + 菜单 + CSS 过渡桥）才收起。 */}
+              <div
+                className="plus-wrap"
+                ref={plusRef}
+                onMouseEnter={() => setPlusOpen(true)}
+                onMouseLeave={closePlusMenu}
+              >
                 <button
                   type="button"
                   className={`plus-btn${plusOpen ? ' active' : ''}`}
                   title="添加文件、模式、专家、技能、连接器"
                   aria-label="添加文件、模式、专家、技能、连接器"
                   aria-expanded={plusOpen}
-                  onClick={() => { if (plusOpen) closePlusMenu(); else setPlusOpen(true) }}
+                  onClick={() => setPlusOpen(true)}
                 >
                   <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
                     <path d="M6 2V10M2 6H10" />

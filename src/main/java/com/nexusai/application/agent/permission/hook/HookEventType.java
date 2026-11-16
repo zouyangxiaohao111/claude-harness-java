@@ -7,21 +7,22 @@ import java.util.Set;
 import java.util.stream.Collectors;
 
 /**
- * Hook 事件类型 · 对齐 CC coreTypes.ts:25-53 全部 27 种事件 +
- * [IMP-CF-03] 2 个 CC coreTypes 之外的 execCommandHook marker 事件
+ * Hook 事件类型 · 对齐 claude.exe v2.1.325 全部 33 种事件（事件数组 {@code E2}
+ * off≈309,279,7xx）+ [IMP-CF-03] 2 个 CC 事件枚举之外的 execCommandHook marker 事件
  * (StatusLine/FileSuggestion，不进 HOOK_EVENTS_ORDER)。
  *
- * <p>9 大类：
+ * <p>10 大类：
  * <ul>
- *   <li>工具相关（3）：PreToolUse, PostToolUse, PostToolUseFailure</li>
+ *   <li>工具相关（4）：PreToolUse, PostToolUse, PostToolUseFailure, PostToolBatch</li>
  *   <li>权限相关（2）：PermissionRequest, PermissionDenied</li>
  *   <li>会话相关（5）：SessionStart, SessionEnd, Stop, StopFailure, Setup</li>
- *   <li>用户交互（2）：UserPromptSubmit, Notification</li>
+ *   <li>用户交互（3）：UserPromptSubmit, UserPromptExpansion, Notification</li>
  *   <li>子代理（2）：SubagentStart, SubagentStop</li>
- *   <li>压缩相关（2）：PreCompact, PostCompact</li>
+ *   <li>压缩/模型（4）：PreCompact, PostCompact, PreModelSwitch, PostModelSwitch</li>
  *   <li>团队/任务（3）：TeammateIdle, TaskCreated, TaskCompleted</li>
  *   <li>MCP（2）：Elicitation, ElicitationResult</li>
  *   <li>配置/环境（6）：ConfigChange, InstructionsLoaded, WorktreeCreate, WorktreeRemove, CwdChanged, FileChanged</li>
+ *   <li>目录/展示（2）：DirectoryAdded, MessageDisplay</li>
  * </ul>
  *
  * <p><b>[Session H10] ccName() 映射</b>: CC 事件名是 PascalCase 字符串 (HOOK_EVENTS,
@@ -32,14 +33,22 @@ import java.util.stream.Collectors;
  */
 public enum HookEventType {
 
-    // ==================== 工具相关 (3) ====================
+    // ==================== 工具相关 (4) ====================
 
-    /** CC original: PreToolUse (coreTypes.ts:26) */
+    /** CC original: PreToolUse (exe 事件数组 E2 off≈309,279,7xx) */
     PRE_TOOL_USE,
-    /** CC original: PostToolUse (coreTypes.ts:27) */
+    /** CC original: PostToolUse */
     POST_TOOL_USE,
-    /** CC original: PostToolUseFailure (coreTypes.ts:28) */
+    /** CC original: PostToolUseFailure */
     POST_TOOL_USE_FAILURE,
+    /**
+     * CC original: PostToolBatch · [Wave1-A] 一批工具调用全部 resolved 后只触发一次
+     * （输入 {@code tool_calls[]}，exe off≈311,040,xxx {@code R2} schema）。
+     *
+     * <p>matcher 语义：CC {@code Eon} switch（off≈323,293,8xx）无此分支 → matchQuery undefined
+     * ⇒ 全部 matcher 放行（matcherMetadata 缺失，不支持 matcher）。
+     */
+    POST_TOOL_BATCH,
 
     // ==================== 权限相关 (2) ====================
 
@@ -61,11 +70,20 @@ public enum HookEventType {
     /** CC original: Setup (coreTypes.ts:41) */
     SETUP,
 
-    // ==================== 用户交互 (2) ====================
+    // ==================== 用户交互 (3) ====================
 
-    /** CC original: UserPromptSubmit (coreTypes.ts:30) */
+    /** CC original: UserPromptSubmit */
     USER_PROMPT_SUBMIT,
-    /** CC original: Notification (coreTypes.ts:29) */
+    /**
+     * CC original: UserPromptExpansion · [Wave1-A] 斜杠命令 / MCP prompt 展开前触发
+     * （输入 {@code expansion_type, command_name, command_args, command_source?, prompt}，
+     * exe off≈311,040,xxx {@code x2} schema）。
+     *
+     * <p>matchQuery = {@code command_name}（exe {@code Eon} off≈323,293,8xx
+     * {@code case"UserPromptExpansion":return e.command_name}）。
+     */
+    USER_PROMPT_EXPANSION,
+    /** CC original: Notification */
     NOTIFICATION,
 
     // ==================== 子代理 (2) ====================
@@ -75,12 +93,27 @@ public enum HookEventType {
     /** CC original: SubagentStop (coreTypes.ts:36) */
     SUBAGENT_STOP,
 
-    // ==================== 压缩相关 (2) ====================
+    // ==================== 压缩/模型 (4) ====================
 
-    /** CC original: PreCompact (coreTypes.ts:37) */
+    /** CC original: PreCompact */
     PRE_COMPACT,
-    /** CC original: PostCompact (coreTypes.ts:38) */
+    /** CC original: PostCompact */
     POST_COMPACT,
+    /**
+     * CC original: PreModelSwitch · [Wave1-A] 模型切换前（输入 {@code from_model, to_model,
+     * requested_model, source, context_tokens, prompt_cache_warm, cache_ttl,
+     * estimated_cache_write_usd, pricing}，exe {@code H2}/{@code lC} off≈311,04x,xxx）。
+     * 输出可给 {@code permissionDecision}(allow/deny/ask) 拦/放行切换。
+     *
+     * <p>matchQuery = {@code to_model}（exe {@code Eon} off≈323,293,8xx；CC 另有 model-id
+     * 形状门控 {@code L_n}，本仓未复刻 ⇒ 见 HookMatcherEngine 注释）。
+     */
+    PRE_MODEL_SWITCH,
+    /**
+     * CC original: PostModelSwitch · [Wave1-A] 模型切换后（同 PreModelSwitch 字段；
+     * 输出 {@code additionalContext} 进新模型下一次请求）。
+     */
+    POST_MODEL_SWITCH,
 
     // ==================== 团队/任务 (3) ====================
 
@@ -108,10 +141,27 @@ public enum HookEventType {
     WORKTREE_CREATE,
     /** CC original: WorktreeRemove (coreTypes.ts:49) */
     WORKTREE_REMOVE,
-    /** CC original: CwdChanged (coreTypes.ts:51) */
+    /** CC original: CwdChanged */
     CWD_CHANGED,
-    /** CC original: FileChanged (coreTypes.ts:52) */
+    /** CC original: FileChanged */
     FILE_CHANGED,
+    /**
+     * CC original: DirectoryAdded · [Wave1-A] {@code /add-dir} 或 SDK {@code register_repo_root}
+     * 注册新工作目录后触发（输入 {@code directory, source(slash_command|register_repo_root)}，
+     * exe off≈311,04x,xxx {@code iX} schema）。
+     *
+     * <p>matchQuery = {@code source}（exe {@code Eon} off≈323,293,8xx
+     * {@code case"DirectoryAdded":return e.source}）—— <b>不是 directory</b>。
+     */
+    DIRECTORY_ADDED,
+    /**
+     * CC original: MessageDisplay · [Wave1-A] 助手消息每批新行显示时触发
+     * （输入 {@code turn_id, message_id, index, final, delta}，输出 {@code displayContent}
+     * 只改屏幕、不改存储与模型上下文，exe off≈311,04x,xxx {@code lX} schema）。
+     *
+     * <p>matcher 语义：CC {@code Eon} 无此分支 → matchQuery undefined ⇒ 全部 matcher 放行。
+     */
+    MESSAGE_DISPLAY,
 
     // ==================== 状态行 / 文件建议 marker 事件 (2) ====================
 
@@ -131,8 +181,9 @@ public enum HookEventType {
     FILE_SUGGESTION;
 
     /**
-     * CC HOOK_EVENTS 27 项固定顺序 (coreTypes.ts:25-53) · 供无 event 的全量查询遍历
-     * (D-05, sessionHooks.ts:322-327 / :381-389 {@code for (const evt of HOOK_EVENTS)}).
+     * CC 事件枚举 33 项固定顺序（claude.exe v2.1.325 事件数组 {@code E2} off≈309,279,7xx）·
+     * 供无 event 的全量查询遍历 (D-05, sessionHooks.ts:322-327 / :381-389
+     * {@code for (const evt of HOOK_EVENTS)}).
      *
      * <p><b>WHY 不用 {@code values()}</b>: Java 枚举声明序 ≠ CC 序 — 自验差异:
      * NOTIFICATION/USER_PROMPT_SUBMIT 在 CC #4/#5 而 Java #12/#11; PERMISSION_REQUEST/
@@ -142,25 +193,25 @@ public enum HookEventType {
      * {@code HOOK_EVENTS_ORDER 与 ccEventNames() 同源} 用例兜底.
      */
     public static final List<HookEventType> HOOK_EVENTS_ORDER = List.of(
-        PRE_TOOL_USE, POST_TOOL_USE, POST_TOOL_USE_FAILURE,
-        NOTIFICATION, USER_PROMPT_SUBMIT,
+        PRE_TOOL_USE, POST_TOOL_USE, POST_TOOL_USE_FAILURE, POST_TOOL_BATCH,
+        NOTIFICATION, USER_PROMPT_SUBMIT, USER_PROMPT_EXPANSION,
         SESSION_START, SESSION_END, STOP, STOP_FAILURE,
         SUBAGENT_START, SUBAGENT_STOP,
-        PRE_COMPACT, POST_COMPACT,
+        PRE_COMPACT, POST_COMPACT, PRE_MODEL_SWITCH, POST_MODEL_SWITCH,
         PERMISSION_REQUEST, PERMISSION_DENIED, SETUP,
         TEAMMATE_IDLE, TASK_CREATED, TASK_COMPLETED,
         ELICITATION, ELICITATION_RESULT,
         CONFIG_CHANGE, WORKTREE_CREATE, WORKTREE_REMOVE,
-        INSTRUCTIONS_LOADED, CWD_CHANGED, FILE_CHANGED
+        INSTRUCTIONS_LOADED, CWD_CHANGED, FILE_CHANGED, DIRECTORY_ADDED, MESSAGE_DISPLAY
     );
 
     /**
-     * 全部 27 个 CC 事件名 (coreTypes.ts:25-52 HOOK_EVENTS) · 供 HookEventBus 白名单.
+     * 全部 33 个 CC 事件名 · 供 HookEventBus 白名单.
      *
      * <p><b>[IMP-CF-03]</b>: 推导自 {@link #HOOK_EVENTS_ORDER} 而非 {@link #values()}
-     * —— 枚举新增 {@link #STATUS_LINE}/{@link #FILE_SUGGESTION} 两个 CC coreTypes
-     * 之外的 marker 事件后，values() 为 29 项；HookEventBus 白名单必须仍为 CC 的
-     * 27 项（SessionHookStoreTest "HOOK_EVENTS_ORDER 与 ccEventNames() 同源" 契约）。
+     * —— 枚举新增 {@link #STATUS_LINE}/{@link #FILE_SUGGESTION} 两个 CC 事件枚举
+     * 之外的 marker 事件后，values() 为 35 项；HookEventBus 白名单必须仍为 CC 的
+     * 33 项（SessionHookStoreTest "HOOK_EVENTS_ORDER 与 ccEventNames() 同源" 契约）。
      */
     private static final Set<String> CC_EVENT_NAMES = HOOK_EVENTS_ORDER.stream()
         .map(HookEventType::ccName)

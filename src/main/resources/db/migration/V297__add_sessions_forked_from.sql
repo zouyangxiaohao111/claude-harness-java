@@ -1,0 +1,12 @@
+-- ===================================================================
+-- V297: 会话分叉来源标记（SessionStart hook source=fork 的显式载体）
+--
+-- 背景（Hook v2.1.325 对齐）：
+--   CC SessionStart.source union 含 fork；本仓 SessionForkService 只把标题
+--   改成 "<原标题> 分叉"，没有可判定的持久标记 ⇒ SessionStart 只能判
+--   startup/resume。标题是用户可改的展示文案，不能当协议判据。
+--   新增可空列 forked_from（源会话 id），由 SessionForkService 在复制事务内写入；
+--   读侧 SessionService.isForkedSession 判非空 → source='fork'。
+--   历史分叉行保持 NULL（无法回溯，不猜）。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN forked_from TEXT;

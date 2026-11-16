@@ -84,6 +84,7 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Base64;
@@ -1279,10 +1280,17 @@ public class ChatService {
                                      String streamTopic,
                                      org.springframework.messaging.simp.SimpMessagingTemplate wsTemplate,
                                      long turnStartMs, String realAssistantId) {
-        String finalContent = state.lastAssistant() == null ? "" : state.lastAssistant();
+        // [CC 对齐 2026-11-16] 失败轮不得回退到历史 assistant 文本。
+        //   CC 的 error_during_execution result 是 zeroed 的（内容清零、错误只走 errors[]）；
+        //   本方法原来取「messages 里最后一条 assistant」—— 本轮成功时它就是本轮答案，
+        //   但本轮失败时列表里没有新的，于是取到**上一轮**的回答并当本轮结果发出（真机复现：
+        //   12:15 失败轮的 complete 内容是 12:08 那轮的答案）。故按 CC 口径：本轮有错误 ⇒ 内容为空。
+        boolean turnFailed = state.lastError() != null && !state.lastError().isBlank();
+        String finalContent = turnFailed || state.lastAssistant() == null ? "" : state.lastAssistant();
         // [bugfix] 前端收口消息思考丢失：reasoning 由 null 改为末条 assistant 的真实 reasoning
         //   （对齐 replayAndPersist finalReasoning 捕获语义，:432 finalReasoning = m.reasoning()）
-        String finalReasoning = lastAssistantReasoning(state);
+        //   ⚠️ 与 finalContent 同一口径：失败轮同样不得回退到上一轮的 reasoning。
+        String finalReasoning = turnFailed ? null : lastAssistantReasoning(state);
         // [usage-push] complete.usage 口径从末条单条改为本轮累计 totalUsage（对齐 CC result.usage =
         //   query 级累计 totalUsage，QueryEngine.ts:790-816/:861）——run 级累计由 LlmAgentLoop 3 处
         //   withUsage append 后 publishMessageUsage → state.accumulateRunUsage 累加。无任何 assistant
@@ -2409,10 +2417,52 @@ public class ChatService {
             log.warn("Provider {} no apiKey → mock fallback", provider.getId());
             return ProviderConfig.empty();
         }
-        // [provider-custom-headers 任务 6] extraHeaders 随 ProviderConfig 一起流动（DB JSON 字符串 → Map；
-        //   未配置 → null）。展开/敏感头过滤由注入侧 ProviderHeaderInjector 单点负责。
-        return new ProviderConfig(provider.getBaseUrl(), rawKey,
-            ProviderService.deserializeHeaders(provider.getExtraHeaders()));
+        return assembleProviderConfig(provider, rawKey);
+    }
+
+    // ───────────────────── codex_oauth 请求装配 (C2c) ─────────────────────
+
+    /** codex_oauth 强制端点：SDK 在其后拼 {@code /responses}（实测实发 {@code POST /backend-api/codex/responses}）。 */
+    static final String CODEX_OAUTH_BASE_URL = "https://chatgpt.com/backend-api/codex";
+
+    /** codex CLI 的 originator 标识；ChatGPT 后端按此识别客户端。 */
+    static final String CODEX_OAUTH_ORIGINATOR = "codex_cli_rs";
+
+    /**
+     * 组装 {@link ProviderConfig} —— 请求装配的单点判据源（C2c）。
+     *
+     * <p>两种凭据形态：
+     * <ul>
+     *   <li>{@code api_key}（含 {@code auth_mode} 为 null 的历史行）→ baseUrl 与 extraHeaders
+     *       <b>原样</b>，与改造前逐字等价；</li>
+     *   <li>{@code codex_oauth} → baseUrl <b>强制</b> {@link #CODEX_OAUTH_BASE_URL}（用户填的
+     *       baseUrl 被忽略），并注入 {@code chatgpt-account-id}（accountId 非空时才加）与
+     *       {@code originator}。</li>
+     * </ul>
+     *
+     * <p><b>为什么复制成 {@code LinkedHashMap}</b>：{@code deserializeHeaders} 解析失败会返回
+     * {@code Map.of()}、Jackson 也可能给出不可变视图 ⇒ 直接 {@code put} 会在运行期抛
+     * {@link UnsupportedOperationException}。null（未配置）同样需要新建。
+     *
+     * @param provider 已查出的 provider 行（非 null）
+     * @param rawKey   已解析的明文凭据（apiKey 或 OAuth access token）
+     */
+    static ProviderConfig assembleProviderConfig(ProviderRecord provider, String rawKey) {
+        boolean codexOauth = ProviderService.AUTH_MODE_CODEX_OAUTH.equals(provider.getAuthMode());
+        Map<String, String> baseHeaders = ProviderService.deserializeHeaders(provider.getExtraHeaders());
+        if (!codexOauth) {
+            return new ProviderConfig(provider.getBaseUrl(), rawKey, baseHeaders);
+        }
+        Map<String, String> headers = new LinkedHashMap<>();
+        if (baseHeaders != null) {
+            headers.putAll(baseHeaders);
+        }
+        String accountId = provider.getOauthAccountId();
+        if (accountId != null && !accountId.isBlank()) {
+            headers.put("chatgpt-account-id", accountId);
+        }
+        headers.put("originator", CODEX_OAUTH_ORIGINATOR);
+        return new ProviderConfig(CODEX_OAUTH_BASE_URL, rawKey, headers);
     }
 
     String providerTypeForModel(String modelName) {

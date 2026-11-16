@@ -318,19 +318,32 @@ public class HookMatcherEngine {
     }
 
     /**
-     * 提取 matchQuery · 等价 CC getMatchingHooks switch (hooks.ts:1615-1670).
+     * 提取 matchQuery · 等价 CC {@code Eon} switch（claude.exe v2.1.325 off≈323,293,8xx；
+     * 旧快照 hooks.ts:1615-1670）。
      *
      * <p>WHY: 各事件用不同字段匹配 matcher (工具事件用 tool_name; 会话事件用 source/trigger;
      * FileChanged 用 file_path 的 basename; 其余无 matchQuery → null → 全部 matcher 通过).
+     *
+     * <p><b>[Wave1-A] v2.1.325 新增 6 事件的 CC 取值</b>（exe {@code Eon} 逐分支实读）:
+     * <ul>
+     *   <li>{@code UserPromptExpansion} → {@code command_name}（不是 expansion_type）</li>
+     *   <li>{@code DirectoryAdded} → {@code source}（不是 directory）</li>
+     *   <li>{@code PreModelSwitch}/{@code PostModelSwitch} → {@code to_model}
+     *       （CC 另有 model-id 形状门控 {@code L_n(ECt(to_model))}：形状不符时返回 undefined
+     *       ⇒ 全部 matcher 放行；本仓未复刻该门控，直接透传 to_model —— 已登记的偏差）</li>
+     *   <li>{@code PostToolBatch}/{@code MessageDisplay} → default（undefined，全部放行）</li>
+     * </ul>
      */
     private String extractMatchQuery(HookEvent event) {
         return switch (event.type()) {
             case PRE_TOOL_USE, POST_TOOL_USE, POST_TOOL_USE_FAILURE,
                  PERMISSION_REQUEST, PERMISSION_DENIED -> event.toolName();
-            case SESSION_START, CONFIG_CHANGE -> dataStr(event, "source");
+            case SESSION_START, CONFIG_CHANGE, DIRECTORY_ADDED -> dataStr(event, "source");
             case SETUP, PRE_COMPACT, POST_COMPACT -> dataStr(event, "trigger");
             case NOTIFICATION -> dataStr(event, "notification_type");
             case SESSION_END -> dataStr(event, "reason");
+            case USER_PROMPT_EXPANSION -> dataStr(event, "command_name");
+            case PRE_MODEL_SWITCH, POST_MODEL_SWITCH -> dataStr(event, "to_model");
             case STOP_FAILURE -> {
                 // CC hookInput.error (hooks.ts:1654) · [IMP-HOOKS-S5 D-18] error 现为字符串
                 //   载荷（CC hooks.ts:3612 `lastMessage.error ?? 'unknown'`），String.valueOf
@@ -349,8 +362,10 @@ public class HookMatcherEngine {
             // [编译协调修复] STATUS_LINE/FILE_SUGGESTION (IMP-CF-03 新增事件): CC 无对应 matcher
             //   语义 (executeStatusLineCommand/executeFileSuggestionCommand 按配置存在执行, 非 matcher 匹配)
             //   → 与其他无 matchQuery 事件同归 null
+            // [Wave1-A] POST_TOOL_BATCH / MESSAGE_DISPLAY: CC Eon default 分支 → undefined
             case TEAMMATE_IDLE, TASK_CREATED, TASK_COMPLETED, STOP, USER_PROMPT_SUBMIT,
                  WORKTREE_CREATE, WORKTREE_REMOVE, CWD_CHANGED,
+                 POST_TOOL_BATCH, MESSAGE_DISPLAY,
                  STATUS_LINE, FILE_SUGGESTION -> null;
         };
     }
@@ -431,12 +446,14 @@ public class HookMatcherEngine {
         Map<String, MatchedHook> prompt = new LinkedHashMap<>();
         Map<String, MatchedHook> agent = new LinkedHashMap<>();
         Map<String, MatchedHook> http = new LinkedHashMap<>();
+        Map<String, MatchedHook> mcpTool = new LinkedHashMap<>();
         for (MatchedHook m : matchedHooks) {
             Map<String, MatchedHook> target = switch (m.hook().hookType()) {
                 case COMMAND -> command;
                 case PROMPT -> prompt;
                 case AGENT -> agent;
                 case HTTP -> http;
+                case MCP_TOOL -> mcpTool;
             };
             target.put(dedupKey(m), m);
         }
@@ -446,6 +463,7 @@ public class HookMatcherEngine {
         out.addAll(prompt.values());
         out.addAll(agent.values());
         out.addAll(http.values());
+        out.addAll(mcpTool.values());
         return out;
     }
 
@@ -464,6 +482,12 @@ public class HookMatcherEngine {
             case PROMPT -> ((PromptHook) m.hook()).prompt() + "\0" + ifCond;
             case AGENT -> ((AgentHook) m.hook()).prompt() + "\0" + ifCond;
             case HTTP -> ((HttpHook) m.hook()).url() + "\0" + ifCond;
+            case MCP_TOOL -> {
+                // CC isHookEqual mcp_tool: server + tool + input（null 视同 {}）+ 公共字段
+                McpToolHook mcp = (McpToolHook) m.hook();
+                yield mcp.server() + "\0" + mcp.tool() + "\0"
+                    + String.valueOf(mcp.input()) + "\0" + ifCond;
+            }
         };
         return prefix + "\0" + payload;
     }
@@ -619,7 +643,8 @@ public class HookMatcherEngine {
         return h.hookType() == HookCommand.HookType.COMMAND
             || h.hookType() == HookCommand.HookType.PROMPT
             || h.hookType() == HookCommand.HookType.AGENT
-            || h.hookType() == HookCommand.HookType.HTTP;
+            || h.hookType() == HookCommand.HookType.HTTP
+            || h.hookType() == HookCommand.HookType.MCP_TOOL;
     }
 
     private static boolean hasIf(HookCommand h) {
@@ -633,6 +658,7 @@ public class HookMatcherEngine {
             case PROMPT -> ((PromptHook) h).ifCondition();
             case AGENT -> ((AgentHook) h).ifCondition();
             case HTTP -> ((HttpHook) h).ifCondition();
+            case MCP_TOOL -> ((McpToolHook) h).ifCondition();
         };
     }
 

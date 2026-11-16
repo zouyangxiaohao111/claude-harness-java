@@ -163,7 +163,26 @@ public interface GenericHook {
         //   CC 侧：ok=false + impossible=true → outcome='success' + impossible:true + stopReason
         //   （条件根本不可能达成 ⇒ 交还控制权，而不是继续 block 到撞连续 block 上限）。
         //   本仓普通 prompt hook 不产出该值（null = 不适用）；只有 stop-condition 分支会置 true。
-        Boolean impossible
+        Boolean impossible,
+        // ─── [Wave1-B] 8 字段补齐 · 对齐 claude.exe v2.1.325 输出面 ───
+        //   CC 顶层 terminalSequence（exe off≈311,059,830）+ 各 hookSpecificOutput 变体
+        //   新增字段。旧构造点走转发构造器（8 字段全 null），不构成"兼容壳"。
+        /** CC original: {@code terminalSequence} (exe off≈311,059,830) · 代 CLI 发的终端 OSC/BEL. */
+        String terminalSequence,
+        /** CC original: {@code updatedToolOutput} (exe off≈311,055,676) · 替换<b>所有</b>工具输出，优先于 updatedMCPToolOutput. */
+        Object updatedToolOutput,
+        /** CC original: {@code classifierContext} (exe off≈311,055,676) · auto 模式权限分类器宿主断言（≤2000 UTF-16）. */
+        String classifierContext,
+        /** CC original: {@code sessionTitle} (SessionStart / UserPromptSubmit) · hook 给会话起名. */
+        String sessionTitle,
+        /** CC original: {@code suppressOriginalPrompt} · decision:block 时不回显原 prompt. */
+        Boolean suppressOriginalPrompt,
+        /** CC original: {@code reloadSkills} (SessionStart) · 同会话重扫技能/命令目录. */
+        Boolean reloadSkills,
+        /** CC original: {@code displayContent} (MessageDisplay) · 仅替换屏幕上的 delta. */
+        String displayContent,
+        /** CC original: {@code permissionDisplay} (PreToolUse) · Desktop ask 卡片文案. */
+        HookSpecificOutput.PermissionDisplay permissionDisplay
         // ─── [IMP-DA-01 TY-01] 第 19 字段 allBlockingErrors 已删除 · 对齐 CC HookResult 无此字段 ───
         //   CC executeHooks 逐结果 yield blockingError (hooks.ts:2759-2763) →
         //   runPostToolUseHooks 逐 result.blockingError 产独立 hook_blocking_error 附件
@@ -182,6 +201,28 @@ public interface GenericHook {
             if (additionalContexts != null) {
                 additionalContexts = List.copyOf(additionalContexts);
             }
+        }
+
+        /**
+         * [Wave1-B] 19 参转发构造器 · Wave1-B 的 8 个新字段全 null。
+         *
+         * <p>WHY: 加 {@code terminalSequence}/{@code updatedToolOutput}/... 前 record 为 19 字段，
+         * HookRegistry 等既有构造点按 19 参调用；纯追加后用本构造器承接。
+         */
+        public HookResult(boolean preventContinuation, HookBlockingError blockingError,
+                          java.util.List<String> systemMessages, java.util.List<String> additionalContexts,
+                          Object message, Map<String, Object> updatedInput, Object updatedMCPToolOutput,
+                          Boolean retry, String hookPermissionDecisionReason,
+                          HookOutcome outcome, String stopReason, PermissionBehavior permissionBehavior,
+                          PermissionRequestResult permissionRequestResult, HookCommand hook,
+                          String initialUserMessage, java.util.List<String> watchPaths,
+                          ElicitationResponse elicitationResponse, ElicitationResponse elicitationResultResponse,
+                          Boolean impossible) {
+            this(preventContinuation, blockingError, systemMessages, additionalContexts,
+                message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
+                outcome, stopReason, permissionBehavior, permissionRequestResult, hook,
+                initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
+                impossible, null, null, null, null, null, null, null, null);
         }
 
         /**
@@ -229,7 +270,9 @@ public interface GenericHook {
                 message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
                 outcome, stopReason, permissionBehavior, prr, hook,
                 initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
-                impossible);   // [goal V253] 透传 impossible（wither 不得丢字段）
+                impossible,   // [goal V253] 透传 impossible（wither 不得丢字段）
+                terminalSequence, updatedToolOutput, classifierContext, sessionTitle,
+                suppressOriginalPrompt, reloadSkills, displayContent, permissionDisplay);
         }
 
         /**
@@ -246,7 +289,9 @@ public interface GenericHook {
                 message, updatedInput, updatedMCPToolOutput, retry, hookPermissionDecisionReason,
                 outcome, stopReason, permissionBehavior, permissionRequestResult, hook,
                 initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
-                impossible);   // [goal V253] 透传 impossible（wither 不得丢字段）
+                impossible,   // [goal V253] 透传 impossible（wither 不得丢字段）
+                terminalSequence, updatedToolOutput, classifierContext, sessionTitle,
+                suppressOriginalPrompt, reloadSkills, displayContent, permissionDisplay);
         }
 
         /**

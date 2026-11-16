@@ -32,21 +32,32 @@ public record PermissionPromptDetails(
         List<PermissionUpdate> suggestions,
         String blockedPath,
         PermissionResult.PendingClassifierCheck pendingClassifierCheck,
-        boolean runHookRace
+        boolean runHookRace,
+        /** [Hook v2.1.325] PreToolUse.permissionDisplay（title/description/displayName）；无 → null。 */
+        java.util.Map<String, Object> permissionDisplay
 ) {
     public PermissionPromptDetails {
         suggestions = suggestions == null ? List.of() : List.copyOf(suggestions);
         // description / blockedPath 可为 null（CC 可空字段）
         // pendingClassifierCheck 可为 null（无分类器检查）
+        permissionDisplay = permissionDisplay == null
+            ? null : java.util.Map.copyOf(permissionDisplay);
+    }
+
+    /** 5 参兼容构造器 · 无 permissionDisplay。 */
+    public PermissionPromptDetails(String description, List<PermissionUpdate> suggestions,
+                                   String blockedPath, PermissionResult.PendingClassifierCheck pendingClassifierCheck,
+                                   boolean runHookRace) {
+        this(description, suggestions, blockedPath, pendingClassifierCheck, runHookRace, null);
     }
 
     /** 3 参兼容构造器 · 无分类器竞速 + 无 hook 竞速（旧调用方/测试桩无需改动）。 */
     public PermissionPromptDetails(String description, List<PermissionUpdate> suggestions, String blockedPath) {
-        this(description, suggestions, blockedPath, null, false);
+        this(description, suggestions, blockedPath, null, false, null);
     }
 
     /** 空细节（无 description / suggestions / blockedPath / 竞速）· 调用方不关心弹窗展示细节时用。 */
     public static PermissionPromptDetails none() {
-        return new PermissionPromptDetails(null, List.of(), null, null, false);
+        return new PermissionPromptDetails(null, List.of(), null, null, false, null);
     }
 }

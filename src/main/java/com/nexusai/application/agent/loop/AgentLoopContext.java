@@ -440,7 +440,24 @@ public record AgentLoopContext(
             com.nexusai.application.agent.permission.InteractiveHandler interactiveHandler,
             // [U6-A1] BASH_CLASSIFIER 特性开关 · 投机竞速门控 (gate fallback 路径透传,
             //   feature 恒 false → 竞速恒跳过回落 interactive)
-            com.nexusai.application.agent.permission.BashClassifierFeature bashClassifierFeature) {}
+            com.nexusai.application.agent.permission.BashClassifierFeature bashClassifierFeature,
+            // [Hook v2.1.325] Stop/SubagentStop session_crons 数据源（可空）
+            com.nexusai.domain.schedule.ScheduleService scheduleService) {
+        /** 兼容构造器 · 旧 12 参调用点 scheduleService=null。 */
+        public ToolExecutionBeans(Telemetry telemetry, ToolPermissionGate permissionGate,
+                                  PermissionPipeline permissionPipeline, PermissionPrompter permissionPrompter,
+                                  InputSanitizer inputSanitizer, ToolInputValidator inputValidator,
+                                  boolean transcriptClassifierEnabled,
+                                  com.nexusai.application.agent.permission.sandbox.SandboxManager sandboxManager,
+                                  com.nexusai.application.agent.permission.CoordinatorPermissionHandler coordinatorHandler,
+                                  com.nexusai.application.agent.permission.SwarmWorkerPermissionHandler swarmWorkerHandler,
+                                  com.nexusai.application.agent.permission.InteractiveHandler interactiveHandler,
+                                  com.nexusai.application.agent.permission.BashClassifierFeature bashClassifierFeature) {
+            this(telemetry, permissionGate, permissionPipeline, permissionPrompter, inputSanitizer,
+                inputValidator, transcriptClassifierEnabled, sandboxManager, coordinatorHandler,
+                swarmWorkerHandler, interactiveHandler, bashClassifierFeature, null);
+        }
+    }
 
     /**
      * [D5] token 预算 beans · 供 estimateTurnTokens / estimateMessagesTokens /
@@ -2497,6 +2514,20 @@ public record AgentLoopContext(
             }
         }
 
+        // ── [Wave2-G] PostToolBatch hook · 对齐 claude.exe v2.1.325 ──
+        //   一批工具调用全部 resolved 后、下一模型请求前**只触发一次**（PostToolUse 是逐工具并发触发）。
+        //   输入 tool_calls[] 用真实 toolName/input/useId/response（response = 该工具真实 ToolResult.data）。
+        //   输出 additionalContext → 本轮内存消息（appendSilently，对齐 CC「本批附件」不落 transcript）;
+        //   continue:false → 终止本轮（对齐 executeHooks 通用 preventContinuation 语义）。
+        if (runPostToolBatchHook(ctx, perTurnTuc, state, msg.toolCalls(), results,
+                outcome.resultToolUseIds())) {
+            String stopReason = "Stopped by PostToolBatch hook";
+            log.info("HOOK PostToolBatch prevented continuation（session={}）", state.sessionId());
+            state.appendMessage(LlmAgentLoop.toMessage(Role.assistant, stopReason, null));
+            state.setExitReason(AgentState.ExitReason.NORMAL);
+            return "exit";
+        }
+
         state.setFinishReason("tool_calls");
         publishEvent(ctx, new com.nexusai.application.agent.event.AgentTurnCompletedEvent(
             state, state.turnCount(), chunkCount, assistantText.length(), "tool_calls"));
@@ -2537,6 +2568,114 @@ public record AgentLoopContext(
                 log.debug("TOOL newMessages flush after tool_result: toolName={} id={} count={} · CC toolExecution.ts:1478 addToolResult 先 / :1566 newMessages 后",
                     toolName, abbreviate(toolUseId, 24), pending.size());
             }
+        }
+    }
+
+    /**
+     * [Wave2-G] PostToolBatch hook · 对齐 claude.exe v2.1.325（exe 输入 schema off≈311,040,xxx
+     * {@code R2}：{@code {hook_event_name, tool_calls[]}}）。
+     *
+     * <p><b>WHY</b>: CC 的 PostToolUse 逐工具并发触发（一批 10 个工具 = 10 次），没有「整批看完再判」
+     * 的时机；PostToolBatch 补上这个点（整批审计 / 统一改写 / 给分类器补上下文）。
+     *
+     * <p><b>输入真实性</b>: {@code tool_calls[]} 逐项取本批真实 {@link ToolUseBlock}（name/input/id）
+     * 与真实结果 {@code ToolResult.data}（按 {@code drainedToolUseIds} 配对）；没有结果（aborted /
+     * 配对缺口）时省略 {@code tool_response}，⛔ 不编造。
+     *
+     * <p><b>短路</b>: {@code hookRegistry == null} 或配置里没有该事件 → 直接返回
+     * （{@link HookRegistry#hasHookForEvent} 廉价门，避免每批无条件序列化 tool_calls）。
+     *
+     * <p><b>输出消费</b>:
+     * <ul>
+     *   <li>{@code additionalContext} → 一条 {@code hook_additional_context} 内存消息
+     *       （{@link AgentState#appendSilently}：对齐 CC「本批附件」语义，不落 transcript，
+     *       避免每批持久化使历史无限增长）；</li>
+     *   <li>{@code continue:false} → 返回 true，调用方终止本轮（通用 preventContinuation）；</li>
+     *   <li>CC 的 PostToolBatch hookSpecificOutput 只有 {@code additionalContext}，无专属权限决策字段，
+     *       故顶层 {@code decision:block} 只留 warn 可观测，不改变控制流。</li>
+     * </ul>
+     *
+     * @param ctx        loop 基础设施（取 hookRegistry）
+     * @param perTurnTuc 本轮 ToolUseContext（agent hook 继承父权限规则用）
+     * @param state      会话状态（sessionId / agentId / rawMessages 来源）
+     * @param calls      本批 tool_calls（顺序 = LLM 产出序）
+     * @param results    drain 出的真实结果（与 {@code resultIds} 同序）
+     * @param resultIds  结果对应的 toolUseId
+     * @return true = hook 要求终止本轮；false = 继续
+     */
+    private static boolean runPostToolBatchHook(AgentLoopContext ctx,
+                                                com.nexusai.application.agent.tool.ToolUseContext perTurnTuc,
+                                                AgentState state,
+                                                List<ToolUseBlock> calls,
+                                                List<com.nexusai.application.agent.tool.ToolResult> results,
+                                                List<String> resultIds) {
+        HookRegistry registry = ctx != null ? ctx.hookRegistry() : null;
+        if (registry == null || state == null || calls == null || calls.isEmpty()) {
+            return false;
+        }
+        try {
+            String eventName = com.nexusai.application.agent.permission.hook.HookEventType
+                .POST_TOOL_BATCH.ccName();
+            String sessionId = state.sessionId();
+            if (!registry.hasHookForEvent(eventName, sessionId)) {
+                return false;
+            }
+            java.util.Map<String, com.nexusai.application.agent.tool.ToolResult> byId =
+                pairResultsByToolUseId(results, resultIds);
+            List<java.util.Map<String, Object>> toolCalls = new java.util.ArrayList<>(calls.size());
+            for (ToolUseBlock call : calls) {
+                java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+                m.put("tool_name", call.name());
+                m.put("tool_input", call.input());
+                m.put("tool_use_id", call.id());
+                com.nexusai.application.agent.tool.ToolResult r = byId.get(call.id());
+                if (r != null && r.data() != null) {
+                    m.put("tool_response", r.data());
+                }
+                toolCalls.add(m);
+            }
+            com.nexusai.application.agent.permission.hook.HookEvent event =
+                com.nexusai.application.agent.permission.hook.HookEvent.postToolBatch(
+                    toolCalls, sessionId, state.agentId() != null ? state.agentId().toString() : null);
+            com.nexusai.application.agent.permission.hook.GenericHook.HookResult r =
+                registry.executeEvent(event, state.rawMessages(), perTurnTuc);
+            if (r == null) {
+                return false;
+            }
+            List<String> raw = r.additionalContexts();
+            if (raw != null && !raw.isEmpty()) {
+                List<String> contexts = new java.util.ArrayList<>(raw.size());
+                for (String ac : raw) {
+                    if (ac != null && !ac.isBlank()) {
+                        contexts.add(ac);
+                    }
+                }
+                if (!contexts.isEmpty()) {
+                    String wrapped = "<system-reminder>\nPostToolBatch hook additional context: "
+                        + String.join("\n", contexts) + "\n</system-reminder>";
+                    com.nexusai.model.session.dto.ChatMessageDto dto =
+                        LlmAgentLoop.toMessage(Role.user, wrapped, null,
+                            java.util.UUID.randomUUID().toString(), true);
+                    // 仅内存（CC：该附件属本批，不进 transcript）
+                    state.appendSilently(dto);
+                    if (log.isDebugEnabled()) {
+                        log.debug("HOOK PostToolBatch additionalContext 注入 {} 段（calls={} session={}）",
+                            contexts.size(), calls.size(), sessionId);
+                    }
+                }
+            }
+            if (r.preventContinuation()) {
+                return true;
+            }
+            if (r.blockingError() != null) {
+                log.warn("HOOK PostToolBatch 返回 blockingError（CC 该事件无专属决策字段，不改变控制流）: {}",
+                    r.blockingError().blockingError());
+            }
+            return false;
+        } catch (Exception e) {
+            // hook 异常不影响工具批结果（对齐 CC best-effort）
+            log.warn("HOOK PostToolBatch 执行失败（忽略）: {}", e.toString());
+            return false;
         }
     }
 

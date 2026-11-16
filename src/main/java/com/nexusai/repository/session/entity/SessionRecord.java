@@ -225,6 +225,15 @@ public class SessionRecord {
     private String goal;
 
     /**
+     * 分叉来源会话 id（V297 列 forked_from，可空）。
+     *
+     * <p>SessionStart hook 的 {@code source='fork'} 判据；由
+     * {@code SessionForkService.buildForkSession} 在复制事务内写入源会话 id。
+     * 历史分叉行保持 NULL（无法回溯，⛔ 不靠标题后缀判断）。
+     */
+    private String forkedFrom;
+
+    /**
      * 主对话「引入知识库」开关（V278，2026-11-06）。
      *
      * <p><b>语义</b>：1 = 4 个知识库专属工具进入主线程工具池；
@@ -317,4 +326,8 @@ public class SessionRecord {
     // [goal V253] 会话级目标状态 getter/setter（V253 会话列 goal，MyBatis-Flex snake↔camel 映射）
     public String getGoal() { return goal; }
     public void setGoal(String goal) { this.goal = goal; }
+
+    // [hook-v2.1.325 V297] 分叉来源会话 id（会话列 forked_from，可空；SessionStart source=fork 判据）
+    public String getForkedFrom() { return forkedFrom; }
+    public void setForkedFrom(String forkedFrom) { this.forkedFrom = forkedFrom; }
 }

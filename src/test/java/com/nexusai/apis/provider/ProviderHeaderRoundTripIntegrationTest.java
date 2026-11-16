@@ -139,7 +139,7 @@ class ProviderHeaderRoundTripIntegrationTest {
     private ProviderDto createWithHeaders(Map<String, String> headers) {
         return providerService.create(new ProviderCreateRequest(
             uniqueName(), ProviderType.openai_compatible,
-            "https://gw.example.com/v1", "sk-live-headers-test", headers, Boolean.TRUE));
+            "https://gw.example.com/v1", "sk-live-headers-test", headers, Boolean.TRUE, null));
     }
 
     // ════════════════════════════════════════════════════════════════════

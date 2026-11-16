@@ -33,10 +33,11 @@ package com.nexusai.application.agent.permission.hook;
  * @see FunctionHook
  * @see SessionHookStore
  */
-public sealed interface SessionHook permits CommandHook, PromptHook, HttpHook, AgentHook, FunctionHook {
+public sealed interface SessionHook permits CommandHook, PromptHook, HttpHook, AgentHook,
+        McpToolHook, FunctionHook {
 
     /**
-     * CC original: {@code type} — 'command'|'prompt'|'http'|'agent'|'function'.
+     * CC original: {@code type} — 'command'|'prompt'|'http'|'agent'|'mcp_tool'|'function'.
      *
      * <p>WHY: isHookEqual (hooksSettings.ts:33-64) 首先按 type 分派, 不同类型直接不等;
      * getSessionHooks/getSessionFunctionHooks 也按 type 过滤. Java 端统一以字符串 type 对齐 CC,

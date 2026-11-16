@@ -257,6 +257,9 @@ public class SessionForkService {
         s.setModelTag(src.getModelTag());
         s.setModelName(src.getModelName());
         s.setTitle(src.getTitle() + " 分叉");
+        // [hook-v2.1.325 V297] 显式分叉标记 → SessionStart source=fork 判据；
+        //   标题后缀只是展示文案，不参与协议判定。
+        s.setForkedFrom(src.getId());
         s.setTime("现在");
         s.setSessionGroup(SessionGroup.current.name());
         s.setTabId(null);

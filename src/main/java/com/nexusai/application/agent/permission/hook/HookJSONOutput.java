@@ -21,7 +21,7 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  * <p><b>WHY (规则三 + Pattern #8)</b>: CC 的 hook stdout JSON 是 async ∪ sync 两个 discriminated
  * union, async 判别 ({@code 'async' in json && json.async === true}, types/hooks.ts:192) 决定
  * 是否后台化 (backgrounded). Java 端用 sealed interface + 2 record 表达: {@link AsyncHookOutput}
- * 对应 async 分支, {@link SyncHookOutput} 对应 sync 7 顶层字段 + hookSpecificOutput.
+ * 对应 async 分支, {@link SyncHookOutput} 对应 sync 8 顶层字段 + hookSpecificOutput.
  *
  * <p>字段全 nullable (除 async), 对齐 CC Zod optional 语义.
  *
@@ -53,7 +53,8 @@ public sealed interface HookJSONOutput {
     }
 
     /**
-     * CC syncHookResponseSchema 7 顶层字段 (types/hooks.ts:50-166) + hookSpecificOutput.
+     * CC syncHookResponseSchema 8 顶层字段 (types/hooks.ts:50-166 + CC v2.1.325 新增
+     * {@code terminalSequence}) + hookSpecificOutput.
      *
      * @param continueExecution  CC original: {@code continue} (types/hooks.ts:52-55);
      *                           false=阻止继续, optional; Java 关键字 {@code continue} 避让
@@ -67,8 +68,14 @@ public sealed interface HookJSONOutput {
      *                           决策原因文本, optional
      * @param systemMessage      CC original: {@code systemMessage} (types/hooks.ts:66-69);
      *                           展示给用户的警告消息, optional
+     * @param terminalSequence   CC original: {@code terminalSequence} (exe off≈311,059,830,
+     *                           {@code NX} 顶层第 6 字段);
+     *                           CLI 代 hook 发出的终端转义序列（通知/标题 OSC）。
+     *                           白名单：OSC 0/1/2/9/99/777 与 BEL；OSC 9 body 不得以数字开头
+     *                           （9;4 进度形式除外），越界由 CLI 拒绝
+     *                           （exe 文案 off≈172,143,697）
      * @param hookSpecificOutput CC original: {@code hookSpecificOutput} (types/hooks.ts:70-164);
-     *                           15 子类型 union, optional
+     *                           22 子类型 union, optional
      */
     record SyncHookOutput(
         @JsonProperty("continue") Boolean continueExecution,
@@ -77,8 +84,23 @@ public sealed interface HookJSONOutput {
         @JsonProperty("decision") String decision,
         @JsonProperty("reason") String reason,
         @JsonProperty("systemMessage") String systemMessage,
+        @JsonProperty("terminalSequence") String terminalSequence,
         @JsonProperty("hookSpecificOutput") HookSpecificOutput hookSpecificOutput
     ) implements HookJSONOutput {
+
+        /**
+         * [Wave1-B] 7 参转发构造器 · {@code terminalSequence} 缺失（旧调用点零改动）。
+         *
+         * <p>WHY: 加 {@code terminalSequence} 前本 record 为 7 字段，AsyncHookRegistry 等
+         * 构造点按 7 参调用；纯追加字段后用转发构造器承接（terminalSequence=null），
+         * 不构成"兼容壳"——唯一真源仍是 8 字段 record。
+         */
+        public SyncHookOutput(Boolean continueExecution, Boolean suppressOutput, String stopReason,
+                              String decision, String reason, String systemMessage,
+                              HookSpecificOutput hookSpecificOutput) {
+            this(continueExecution, suppressOutput, stopReason, decision, reason, systemMessage,
+                null, hookSpecificOutput);
+        }
     }
 
     /**

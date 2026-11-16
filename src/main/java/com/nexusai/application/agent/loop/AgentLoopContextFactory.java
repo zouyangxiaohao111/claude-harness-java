@@ -94,6 +94,8 @@ public class AgentLoopContextFactory {
     @Autowired(required = false) private ToolRegistry toolRegistry;
     @Autowired(required = false) private HookRegistry hookRegistry;
     @Autowired(required = false) private McpServerService mcpServerService;
+    /** [Hook v2.1.325] Stop/SubagentStop session_crons 数据源（可空）。 */
+    @Autowired(required = false) private com.nexusai.domain.schedule.ScheduleService scheduleService;
     @Autowired(required = false) private NotificationQueue notificationQueue;
     @Autowired(required = false) private CommandLifecycleNotifier commandLifecycleNotifier;
     /** [OPD-TS-22 · WF3-01] SDK 事件队列（TaskConfiguration 单例 bean · turn 顶部 drain 出站） */
@@ -486,7 +488,8 @@ public class AgentLoopContextFactory {
             new AgentLoopContext.ToolExecutionBeans(telemetry, permissionGate, permissionPipeline,
                 permissionPrompter, inputSanitizer, inputValidator, transcriptClassifierEnabled,
                 sandboxManager, coordinatorPermissionHandler,
-                swarmWorkerPermissionHandler, interactivePermissionHandler, bashClassifierFeature),
+                swarmWorkerPermissionHandler, interactivePermissionHandler, bashClassifierFeature,
+                scheduleService),
             new AgentLoopContext.TokenBudgetBeans(tokenEstimator, modelMapper, providerMapper),
             new AgentLoopContext.EventBridge(eventPublisher, traceRecorder, overridePublisher),
             permissionContextBuilder,

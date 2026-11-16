@@ -25,7 +25,8 @@ import java.util.List;
  * @param fingerprint    内容指纹（sha256:...，上架时写入；缺省 null = 较早的数据没有指纹）
  * @param category       分类（expert / skill / connector）
  * @param tags           标签
- * @param createdAt      创建时间（ISO 8601）
+ * @param createdAt      创建时间（ISO 8601 · 市场条目的初始创建时间）
+ * @param publishedAt    最近一次上架时间（ISO 8601 · 每次上架/回滚都会刷新；旧数据可能为 null）
  * @param useCount       使用次数（市场统计 · 原始整数 · null = 无数据）
  * @param downloadCount  下载次数（市场统计 · 原始整数 · null = 无数据）
  * @param authorName     开发者名（缺省 → {@link #DEFAULT_AUTHOR_NAME}）
@@ -42,6 +43,7 @@ public record ExternalPluginDto(
         String category,
         List<String> tags,
         String createdAt,
+        String publishedAt,
         Long useCount,
         Long downloadCount,
         String authorName,

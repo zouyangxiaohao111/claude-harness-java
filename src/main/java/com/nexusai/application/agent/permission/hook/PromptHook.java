@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.permission.hook;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 /**
@@ -20,6 +21,11 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  *   <li>{@code if} (:74) — 权限规则过滤条件</li>
  *   <li>{@code timeout} (:75-79) — 超时秒数 (正整数)</li>
  *   <li>{@code model} (:81-86) — 指定模型, 缺省走默认 fast model</li>
+ *   <li>{@code continueOnBlock} — [Wave1-C] prompt 判 {@code ok=false}（产
+ *       {@code decision:"block"}）时给 {@code continue} 用什么值；缺省 false（结束本轮）。
+ *       CC 原文 "Whether continue:true lets the turn proceed depends on the event's
+ *       decision:'block' semantics. On PostToolUse, the reason is fed back to Claude and
+ *       the turn continues."</li>
  *   <li>{@code statusMessage} (:87-90) — 自定义 spinner 文案</li>
  *   <li>{@code once} (:91-94) — true=执行一次后移除</li>
  * </ul>
@@ -28,8 +34,9 @@ import com.fasterxml.jackson.annotation.JsonProperty;
  * @param ifCondition   CC original: if (schemas/hooks.ts:74)
  * @param timeout       CC original: timeout (schemas/hooks.ts:75)
  * @param model         CC original: model (schemas/hooks.ts:81)
- * @param statusMessage CC original: statusMessage (schemas/hooks.ts:87)
- * @param once          CC original: once (schemas/hooks.ts:91)
+ * @param statusMessage    CC original: statusMessage (schemas/hooks.ts:87)
+ * @param once             CC original: once (schemas/hooks.ts:91)
+ * @param continueOnBlock  CC original: continueOnBlock（[Wave1-C] ok=false 时的 continue 值）
  */
 public record PromptHook(
     String prompt,
@@ -37,8 +44,21 @@ public record PromptHook(
     Integer timeout,
     String model,
     String statusMessage,
-    Boolean once
+    Boolean once,
+    @JsonProperty("continueOnBlock") Boolean continueOnBlock
 ) implements HookCommand, SessionHook {
+
+    /**
+     * [Wave1-C] 6 参转发构造器 · {@code continueOnBlock} 缺失（旧调用点零改动）。
+     *
+     * <p>{@code @JsonCreator(DISABLED)} 同 {@link CommandHook}：防止 -parameters +
+     * ParameterNamesModule 把本构造器当成隐式 creator 与规范构造器冲突。
+     */
+    @JsonCreator(mode = JsonCreator.Mode.DISABLED)
+    public PromptHook(String prompt, String ifCondition, Integer timeout, String model,
+                      String statusMessage, Boolean once) {
+        this(prompt, ifCondition, timeout, model, statusMessage, once, null);
+    }
 
     @Override
     public HookType hookType() {

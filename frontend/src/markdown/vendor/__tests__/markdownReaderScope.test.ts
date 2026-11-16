@@ -100,10 +100,13 @@ describe('预览排版 · 接线', () => {
     }
   })
 
-  it('⭐⭐ 对话消息不带 markdown-prose（用户明确要求主对话页面不变）', () => {
-    for (const rel of ['../../../components/center/MessageList.tsx']) {
-      const p = fileURLToPath(new URL(rel, import.meta.url))
-      expect(read(p), `${rel} 不该带预览排版类`).not.toContain('markdown-prose')
-    }
+  it('⭐⭐ 对话消息只在用户气泡 / 子代理 transcript 使用预览排版（主会话助手正文不变）', () => {
+    const p = fileURLToPath(new URL('../../../components/center/MessageList.tsx', import.meta.url))
+    const s = read(p)
+    // 用户气泡：无条件用预览排版（2026-11-16 用户裁定：与项目 tab 点 md 的渲染一致 · 14px）
+    expect(s, '用户气泡缺 markdown-prose').toContain('user-text md markdown-prose')
+    // 助手正文：只在 prose 模式下追加 —— 主会话不传 ⇒ 行为零变化
+    expect(s, '助手正文被无条件套上预览排版').not.toContain('className="content md markdown-prose"')
+    expect(s, '助手正文缺 prose 条件分支').toContain('content md${prose ?')
   })
 })

@@ -234,7 +234,7 @@ export function SettingsModal({
               <NavItem key={n.id} n={n} current={settingsTab} setSettingsTab={setSettingsTab} />
             ))}
           </div>
-          <div className="settings-content">
+          <div className={`settings-content${settingsTab === 'providers' ? ' is-providers' : ''}`}>
             {settingsTab === 'general' && (
               <>
                 <div className="settings-row">
@@ -359,7 +359,16 @@ export function SettingsModal({
                 onOpenProviders={() => setSettingsTab('providers')}
               />
             )}
-            {settingsTab === 'providers' && <ProvidersPanel providers={providers} providersApi={providersApi} showToast={showToast} />}
+            {settingsTab === 'providers' && (
+              <ProvidersPanel
+                providers={providers}
+                providersApi={providersApi}
+                showToast={showToast}
+                /* 模型行 ⋯ 菜单的「设为当前 / 配置到所有档位」：复用 App 的唯一写入口，
+                   写完 appSettings 即更新（新建会话马上用上新主模型） */
+                onSaveSettings={onSaveSettings}
+              />
+            )}
             {settingsTab === 'mcp' && <MCPPanel mcpApi={mcpApi} showToast={showToast} sessionId={sessionId} />}
             {settingsTab === 'database' && <DatabasePanel databasesApi={databasesApi} showToast={showToast} />}
             {settingsTab === 'schedules' && <SchedulesPanel schedulesApi={schedulesApi} showToast={showToast} />}

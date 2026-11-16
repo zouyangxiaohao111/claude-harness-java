@@ -240,6 +240,7 @@ export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active
             messages={chatMessages}
             onDelete={noop}
             thinking={running}
+            prose
           />
         )}
       </div>

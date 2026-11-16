@@ -103,6 +103,20 @@ public class MessagePermissionRequestEvent extends StreamEvent {
     private final String warning;
 
     /**
+     * [Hook v2.1.325] PreToolUse {@code permissionDisplay}：{title, description, displayName}。
+     * 由 WebSocketPermissionPrompter 在发送前 set；null → 前端走默认文案。
+     */
+    private java.util.Map<String, Object> permissionDisplay;
+
+    public java.util.Map<String, Object> getPermissionDisplay() {
+        return permissionDisplay;
+    }
+
+    public void setPermissionDisplay(java.util.Map<String, Object> permissionDisplay) {
+        this.permissionDisplay = permissionDisplay;
+    }
+
+    /**
      * [perm-timeout #132] worker 徽标色 · CC original: {@code WorkerBadgeProps.color}
      * （WorkerBadge.tsx:8）+ useInboxPoller.ts:292（{@code entry.workerBadge.color}）。
      *

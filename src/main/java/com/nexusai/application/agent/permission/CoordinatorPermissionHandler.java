@@ -156,7 +156,8 @@ public final class CoordinatorPermissionHandler {
         }
         HookEvent event = HookEvent.permissionRequest(
             params.toolName(), params.input(), toPermissionSuggestionMaps(params.suggestions()),
-            params.permissionMode(), params.toolUseId(), params.sessionId(), params.agentId());
+            params.permissionMode(), params.toolUseId(), params.sessionId(), params.agentId(),
+            params.mcpServer());
         GenericHook.HookResult result = hookRegistry.executeEvent(event);
         PermissionRequestResult prr = result != null ? result.permissionRequestResult() : null;
         if (prr instanceof PermissionRequestResult.Allow allow) {
@@ -304,8 +305,18 @@ public final class CoordinatorPermissionHandler {
         JsonNode input,
         String toolUseId,
         String sessionId,
-        String agentId
-    ) {}
+        String agentId,
+        /** [Hook v2.1.325] PermissionRequest {@code mcp_server}；非 MCP/无来源 → null。 */
+        Map<String, Object> mcpServer
+    ) {
+        /** 9 参兼容构造器（旧调用点）· mcpServer=null。 */
+        public Params(PendingClassifierCheck pendingClassifierCheck, Map<String, Object> updatedInput,
+                      List<Object> suggestions, String permissionMode, String toolName, JsonNode input,
+                      String toolUseId, String sessionId, String agentId) {
+            this(pendingClassifierCheck, updatedInput, suggestions, permissionMode, toolName, input,
+                toolUseId, sessionId, agentId, null);
+        }
+    }
 
     /**
      * Hook 执行器 (注入) · 对齐 CC {@code ctx.runHooks} (PermissionContext.ts:216-263).

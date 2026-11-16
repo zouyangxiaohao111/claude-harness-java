@@ -419,9 +419,9 @@ public class ParseSkillFrontmatter {
     /**
      * CC 原名：HookCommand 的 type 判别值（Open-ClaudeCode/src/schemas/hooks.ts:32-163
      * discriminatedUnion('type', [BashCommandHook, PromptHook, HttpHook, AgentHook])）。
-     * hooks 数组每项必带 type ∈ {command, prompt, http, agent}，且按 type 须带对应必填字段。
+     * hooks 数组每项必带 type ∈ {command, prompt, http, agent, mcp_tool}，且按 type 须带对应必填字段。
      */
-    private static final Set<String> HOOK_COMMAND_TYPES = Set.of("command", "prompt", "http", "agent");
+    private static final Set<String> HOOK_COMMAND_TYPES = Set.of("command", "prompt", "http", "agent", "mcp_tool");
 
     /**
      * CC 原名：parseEffortValue（Open-ClaudeCode/src/utils/effort.ts:71-87）。
@@ -622,6 +622,9 @@ public class ParseSkillFrontmatter {
                 return hm.get("prompt") != null;
             case "http":
                 return hm.get("url") != null;
+            case "mcp_tool":
+                // CC McpToolHookSchema: server/tool 必填
+                return hm.get("server") instanceof String && hm.get("tool") instanceof String;
             default:
                 return false;
         }

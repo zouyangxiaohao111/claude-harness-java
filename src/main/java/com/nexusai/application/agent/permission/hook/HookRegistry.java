@@ -557,17 +557,48 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         //   getMatchingHooks 的 matcher 列表, 随后统一 matcher 过滤/去重/if (hooks.ts:1681-1848).
         //   managedOnly 门控在构造 registered 源时应用 (CC hooks.ts:1524 跳过插件 matchers).
         List<HookMatcherEngine.RegisteredHookMatcher> registered = registeredMatchersFor(event);
+        java.util.List<MatchedHook> matched;
         if (engine == null) {
-            return sessionMatched;
-        }
-        // 无 session hooks + 无 registered 源 → 走 1 参重载 (测试 stub 引擎/既有调用方只覆写
-        //   1 参版本, 行为不变); 仅 session → 2 参 (既有 stub 覆写路径); 含 registered → 3 参.
-        if (registered.isEmpty()) {
-            return sessionMatched.isEmpty()
+            matched = sessionMatched;
+        } else if (registered.isEmpty()) {
+            // 无 session hooks + 无 registered 源 → 走 1 参重载 (测试 stub 引擎/既有调用方只覆写
+            //   1 参版本, 行为不变); 仅 session → 2 参 (既有 stub 覆写路径); 含 registered → 3 参.
+            matched = sessionMatched.isEmpty()
                 ? engine.getMatchingHooks(event)
                 : engine.getMatchingHooks(event, sessionMatched);
+        } else {
+            matched = engine.getMatchingHooks(event, sessionMatched, registered);
         }
-        return engine.getMatchingHooks(event, sessionMatched, registered);
+        return filterConsumedOnce(event.type(), matched);
+    }
+
+    /**
+     * [Wave2-I] 过滤已执行过的 {@code once:true} hook · CC "runs once and is removed after
+     * execution"。
+     */
+    private java.util.List<MatchedHook> filterConsumedOnce(HookEventType type,
+                                                           java.util.List<MatchedHook> hooks) {
+        if (hooks == null || hooks.isEmpty() || consumedOnceHooks.isEmpty()) {
+            return hooks;
+        }
+        java.util.List<MatchedHook> out = new java.util.ArrayList<>(hooks.size());
+        for (MatchedHook mh : hooks) {
+            if (Boolean.TRUE.equals(mh.hook().once())
+                && consumedOnceHooks.contains(onceKey(type, mh))) {
+                continue;
+            }
+            out.add(mh);
+        }
+        return out;
+    }
+
+    /** [Wave2-I] once 稳定身份 · event + source 命名空间 + display text（配置内容）。 */
+    private static String onceKey(HookEventType type, MatchedHook mh) {
+        String ns = mh.pluginRoot() != null ? mh.pluginRoot() : mh.skillRoot();
+        // record.toString() 覆盖该 hook 全部配置字段（command/prompt/url/server+tool/if/timeout…），
+        // 避免同命令不同 if 的两条 once hook 被误判为同一条。
+        return type.name() + "\0" + (ns != null ? ns : "") + "\0"
+            + (mh.hookSource() != null ? mh.hookSource() : "") + "\0" + mh.hook();
     }
 
     /**
@@ -672,6 +703,29 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
 
     /** Generic hooks · LinkedHashMap 保证按注册顺序遍历 */
     private final Map<String, GenericHook> genericHooks = new LinkedHashMap<>();
+
+    /**
+     * [Wave2-I] {@code once:true} 已执行 hook 的稳定身份集合（CC "runs once and is removed
+     * after execution"）。内存、进程内；执行后标记，匹配时过滤；不写 settings。
+     */
+    private final java.util.Set<String> consumedOnceHooks = java.util.concurrent.ConcurrentHashMap.newKeySet();
+
+    /** [Wave2-I] mcp_tool hook 执行依赖（Spring 外手动 new → null ⇒ 该 hook non_blocking_error）。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.mcp.McpToolPool mcpToolPool;
+
+    /** [Hook v2.1.325] {@code mcp_server.source} 的 DB scope 来源（可空）。 */
+    @Autowired(required = false)
+    private com.nexusai.domain.mcp.McpServerService mcpServerService;
+
+    /** [Hook v2.1.325] PreToolUse ask 的 permissionDisplay，按 toolUseId 暂存给权限弹窗消费。 */
+    private final java.util.Map<String, java.util.Map<String, Object>> pendingPermissionDisplays =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /** 取走某次工具调用的 permissionDisplay（消费一次即删）。 */
+    public java.util.Map<String, Object> takePermissionDisplay(String toolUseId) {
+        return toolUseId == null ? null : pendingPermissionDisplays.remove(toolUseId);
+    }
 
     /** [MPL7] 已注册插件 hook 名 → 所属 plugin 名（HookSource.PLUGIN_HOOK 跟踪，供 clear/prune）。 */
     private final Map<String, String> pluginHookOwners = new LinkedHashMap<>();
@@ -985,6 +1039,11 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                     case HTTP -> {
                         d.put("type", "http");
                         d.put("command", ((HttpHook) mh.hook()).url());
+                    }
+                    case MCP_TOOL -> {
+                        McpToolHook m = (McpToolHook) mh.hook();
+                        d.put("type", "mcp_tool");
+                        d.put("command", m.server() + "/" + m.tool());
                     }
                     // CC getHookDefinitionsForTelemetry 无 agent 分支 → {type:'unknown'}
                     default -> d.put("type", "unknown");
@@ -2037,7 +2096,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             //   导致 buildJsonInput session_id=agentId，偏离 CC。
             ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
             ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
-            toolUseId);
+            toolUseId, mcpServerOf(ctx, toolName));
         List<MatchedHook> matched = getMatchingHooks(toolPreEvent);
         List<Map.Entry<String, PreToolUseHook>> snapshot;
         synchronized (this) {
@@ -2360,6 +2419,52 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
     }
 
     /**
+     * [Wave2-E] classifierContext 折叠 · 对齐 claude.exe v2.1.325
+     * {@code PostToolUse.classifierContext} 描述（exe off≈311,055,676）：
+     * "Capped at 2000 UTF-16 code units, a budget shared across all hooks that contribute to
+     * one call (surrogate-pair-safe...). Honored on synchronous hook responses only".
+     *
+     * <p><b>折叠语义</b>：按 hook 顺序追加（空/空白值跳过），多个 hook 的断言以换行分隔；
+     * 累计超 {@link #CLASSIFIER_CONTEXT_MAX_UTF16} 时截断，且不切断代理对（surrogate pair）。
+     * 一旦预算耗尽，后续 hook 的断言整条丢弃（CC 同一预算语义）。
+     *
+     * <p><b>仅同步响应</b>：本方法只在同步折叠点调用；async hook 的迟到响应由
+     * {@link AsyncHookRegistry} 交付，不经过本折叠（CC 对迟到响应中的该字段静默忽略）。
+     *
+     * @param buf   累计缓冲（调用方持有）
+     * @param next  单个 hook 的 classifierContext（可 null/空白）
+     */
+    static void appendClassifierContext(StringBuilder buf, String next) {
+        if (buf == null || next == null || next.isBlank()) {
+            return;
+        }
+        int remaining = CLASSIFIER_CONTEXT_MAX_UTF16 - buf.length();
+        if (remaining <= 0) {
+            return;
+        }
+        if (buf.length() > 0) {
+            buf.append('\n');
+            remaining--;
+            if (remaining <= 0) {
+                return;
+            }
+        }
+        if (next.length() <= remaining) {
+            buf.append(next);
+            return;
+        }
+        // 截断点若落在代理对中间 → 回退一个 UTF-16 单元（surrogate-pair-safe）
+        int cut = remaining;
+        if (cut > 0 && Character.isHighSurrogate(next.charAt(cut - 1))) {
+            cut--;
+        }
+        buf.append(next, 0, cut);
+    }
+
+    /** [Wave2-E] classifierContext 共享预算上限（CC 原文 2000 UTF-16 code units）。 */
+    static final int CLASSIFIER_CONTEXT_MAX_UTF16 = 2000;
+
+    /**
      * [IMPL-03 D6-1 / OD-05] GenericHook.HookResult → AggregatedHookResult · 配置驱动 hook
      * 结果并入 PreToolUse 聚合链 (对齐 CC 单链: config+registered+session 同链).
      *
@@ -2383,9 +2488,9 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
      * @param toolUseId 工具调用 ID (CC original: tool_use_id)
      * @return 16 字段 AHR; 无任何干预字段 → null (调用方跳过合并)
      */
-    private static AggregatedHookResult toAggregatedHookResult(GenericHook.HookResult r,
-                                                               String toolName, JsonNode input,
-                                                               String toolUseId) {
+    private AggregatedHookResult toAggregatedHookResult(GenericHook.HookResult r,
+                                                        String toolName, JsonNode input,
+                                                        String toolUseId) {
         if (r == null || !hasIntervention(r)) {
             return null;
         }
@@ -2454,7 +2559,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
      * @param input     工具原输入 (Allow 占位)
      * @param toolUseId 工具调用 ID
      */
-    private static PermissionResult toPermissionResult(GenericHook.HookResult r,
+    private PermissionResult toPermissionResult(GenericHook.HookResult r,
                                                        String toolName, JsonNode input,
                                                        String toolUseId) {
         com.nexusai.application.agent.hook.PermissionBehavior pb = r.permissionBehavior();
@@ -2491,6 +2596,22 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 //   updatedInput (X-PROBE EV-XP-W3-004). hook 未给 updatedInput → null
                 //   (CC updatedInput? optional, askInput 回落 input).
                 JsonNode askUpdatedInput = r.updatedInput() != null ? toJsonNode(r.updatedInput()) : null;
+                // [Hook v2.1.325] permissionDisplay：只对 ask 生效，暂存给权限弹窗（按 toolUseId 取）。
+                if (r.permissionDisplay() != null && toolUseId != null) {
+                    java.util.Map<String, Object> d = new java.util.LinkedHashMap<>();
+                    if (r.permissionDisplay().title() != null) {
+                        d.put("title", r.permissionDisplay().title());
+                    }
+                    if (r.permissionDisplay().description() != null) {
+                        d.put("description", r.permissionDisplay().description());
+                    }
+                    if (r.permissionDisplay().displayName() != null) {
+                        d.put("displayName", r.permissionDisplay().displayName());
+                    }
+                    if (!d.isEmpty()) {
+                        pendingPermissionDisplays.put(toolUseId, d);
+                    }
+                }
                 return new PermissionResult.Ask(askMsg, dr, List.of(), null, askUpdatedInput, null,
                     false, null, List.of());
             }
@@ -2717,13 +2838,25 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         return executePostToolUse(toolName, input, result, ctx, false);
     }
     public GenericHook.HookResult executePostToolUse(String toolName, JsonNode input, ToolResult<?> result, ToolUseContext ctx, boolean stopHookActive) {
+        return executePostToolUse(toolName, input, result, ctx, stopHookActive, null);
+    }
+
+    /** [Wave3-input] 带真实工具耗时（duration_ms）的 PostToolUse 入口。 */
+    public GenericHook.HookResult executePostToolUse(String toolName, JsonNode input, ToolResult<?> result,
+                                                     ToolUseContext ctx, boolean stopHookActive, Long durationMs) {
         // [IMP-C2] toolUseId/isError 由执行器推导透传（ToolResult 4 字段契约；对齐 CC executePostToolHooks 无 errorCategory）
         return executePostToolUse(toolName, input, result, ctx, stopHookActive,
             ctx != null ? ctx.toolUseId() : null,
-            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(result != null ? result.data() : null));
+            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(result != null ? result.data() : null),
+            durationMs);
     }
     public GenericHook.HookResult executePostToolUse(String toolName, JsonNode input, ToolResult<?> result, ToolUseContext ctx, boolean stopHookActive,
                                                     String toolUseId, boolean isError) {
+        return executePostToolUse(toolName, input, result, ctx, stopHookActive, toolUseId, isError, null);
+    }
+
+    public GenericHook.HookResult executePostToolUse(String toolName, JsonNode input, ToolResult<?> result, ToolUseContext ctx, boolean stopHookActive,
+                                                    String toolUseId, boolean isError, Long durationMs) {
         // [IMPL-01 D1-5 / INV-11 / OD-07] 政策闸门: programmatic PostToolUse 链不豁免
         //   (对齐 CC runPostToolUseHooks = yield* executeHooks, 入口短路 hooks.ts:1978-1980).
         if (shouldDisableAllHooksIncludingManaged()) {
@@ -2754,7 +2887,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             // [EX-HOOK R7 修正] 载荷 session_id 恒主会话（CC 双轨语义，见 executePreToolUse 注释）
             ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
             ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
-            toolUseId);
+            toolUseId, mcpServerOf(ctx, toolName), durationMs);
         List<MatchedHook> matched = getMatchingHooks(toolPostEvent);
         long toolChainStartMs = System.currentTimeMillis();
         ToolChainOutcomes outcomes = new ToolChainOutcomes();
@@ -2793,6 +2926,18 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         java.util.List<String> systemMessages = new java.util.ArrayList<>();
         // [H-WF5a-02 折叠链项5] updatedMCPToolOutput last-wins (CC toolHooks.ts:145-151, 后到覆盖)
         Object updatedOutput = null;
+        // [Wave2-E] v2.1.325 输出面折叠（exe off≈311,055,676 / 311,059,830）:
+        //   · updatedToolOutput — 替换任意工具输出, CC 原文 "Prefer updatedToolOutput, which
+        //     works for all tools" ⇒ 与 updatedMCPToolOutput 并列承载、各自 last-wins;
+        //     两者同时存在时的优先级由消费端按 updatedToolOutput 优先解析.
+        //   · classifierContext — auto 模式权限分类器宿主断言; 多 hook 共享 2000 UTF-16 code
+        //     unit 预算, 按 hook 顺序拼接后截断 (surrogate-pair-safe); 仅同步响应生效 —— 到达本
+        //     折叠的结果都是同步结果, async hook 的迟到响应走 AsyncHookRegistry 不进本折叠.
+        //   · terminalSequence — CC 由 CLI 在 hook 执行时发射 OSC/BEL; 本仓无终端渲染层
+        //     ⇒ 只做 last-wins 折叠承载, 不发射 (发射 N/A, 见类注释).
+        Object updatedToolOutput = null;
+        String terminalSequence = null;
+        StringBuilder classifierContextBuf = new StringBuilder();
         String firstHookPermissionDecisionReason = null;
         java.util.List<String> additionalContexts = new java.util.ArrayList<>();
         if (!snapshot.isEmpty()) {
@@ -2875,6 +3020,15 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 if (hookResult.updatedMCPToolOutput() != null) {
                     updatedOutput = hookResult.updatedMCPToolOutput(); // last-wins (CC toolHooks.ts:147-148)
                 }
+                // [Wave2-E] updatedToolOutput last-wins (任意工具) + terminalSequence last-wins
+                //   + classifierContext 按序累加 (共享 2000 UTF-16 预算, 同步响应)
+                if (hookResult.updatedToolOutput() != null) {
+                    updatedToolOutput = hookResult.updatedToolOutput();
+                }
+                if (hookResult.terminalSequence() != null) {
+                    terminalSequence = hookResult.terminalSequence();
+                }
+                appendClassifierContext(classifierContextBuf, hookResult.classifierContext());
                 if (firstHookPermissionDecisionReason == null
                     && hookResult.hookPermissionDecisionReason() != null) {
                     firstHookPermissionDecisionReason = hookResult.hookPermissionDecisionReason();
@@ -2966,6 +3120,14 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             if (configuredResult.updatedMCPToolOutput() != null) {
                 updatedOutput = configuredResult.updatedMCPToolOutput(); // last-wins
             }
+            // [Wave2-E] 配置驱动段的同名三字段 (语义同 programmatic 段)
+            if (configuredResult.updatedToolOutput() != null) {
+                updatedToolOutput = configuredResult.updatedToolOutput();
+            }
+            if (configuredResult.terminalSequence() != null) {
+                terminalSequence = configuredResult.terminalSequence();
+            }
+            appendClassifierContext(classifierContextBuf, configuredResult.classifierContext());
             if (firstHookPermissionDecisionReason == null
                 && configuredResult.hookPermissionDecisionReason() != null) {
                 firstHookPermissionDecisionReason = configuredResult.hookPermissionDecisionReason();
@@ -2980,10 +3142,19 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             }
         }
 
+        // [Hook v2.1.325] classifierContext：按 toolUseId 暂存，供下一次 auto-mode 分类器在
+        // transcript 中看到（CC 仅同步响应、共享 2000 UTF-16 预算，折叠层已截断）。
+        if (classifierContextBuf.length() > 0) {
+            com.nexusai.application.agent.permission.ClassifierContextStore.put(
+                toolUseId, classifierContextBuf.toString());
+        }
+
         // 是否完全无干预 → proceed()
         boolean allNull = !preventContinuation
             && firstBlockingError == null && systemMessages.isEmpty()
             && messages.isEmpty() && updatedOutput == null
+            && updatedToolOutput == null && terminalSequence == null
+            && classifierContextBuf.length() == 0
             && firstHookPermissionDecisionReason == null
             && additionalContexts.isEmpty();
         if (allNull) {
@@ -2998,7 +3169,11 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             null, firstHookPermissionDecisionReason,
             // [Session I P3-1 + M.2.2] 3 字段扩展 · CC HookOutcome + stopReason + permissionBehavior
             // [IMP-DA-01 TY-01] allBlockingErrors 参数已删除 — blocking 附件经 messages 逐条承载
-            GenericHook.HookOutcome.SUCCESS, firstReason, null, null, null, null, null, null, null);
+            GenericHook.HookOutcome.SUCCESS, firstReason, null, null, null, null, null, null, null, null,
+            // [Wave2-E] v2.1.325 输出面 3 字段（canonical 27 参构造，不经 19 参转发构造器以免丢值）
+            terminalSequence, updatedToolOutput,
+            classifierContextBuf.length() == 0 ? null : classifierContextBuf.toString(),
+            null, null, null, null, null);
     }
 
     /**
@@ -3038,20 +3213,42 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         //   toolUseId —— IMP-C2 已删字段, 由 ctx.toolUseId() 推导, 对齐 tool-v3 5 参便捷重载）
         return executePostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive, false,
             ctx != null ? ctx.toolUseId() : null,
-            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(errorResult != null ? errorResult.data() : null));
+            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(errorResult != null ? errorResult.data() : null),
+            null);
     }
+
+    /** [Wave3-input] 带真实工具耗时的 PostToolUseFailure 入口。 */
+    public GenericHook.HookResult executePostToolUseFailure(String toolName, JsonNode input,
+                                                            ToolResult<?> errorResult, ToolUseContext ctx,
+                                                            boolean stopHookActive, Long durationMs) {
+        return executePostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive, false,
+            ctx != null ? ctx.toolUseId() : null,
+            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(errorResult != null ? errorResult.data() : null),
+            durationMs);
+    }
+
     public GenericHook.HookResult executePostToolUseFailure(String toolName, JsonNode input,
                                                             ToolResult<?> errorResult, ToolUseContext ctx,
                                                             boolean stopHookActive, boolean isInterrupt) {
         // [P-25] isInterrupt 显式入参（CC isInterrupt = error instanceof AbortError, toolExecution.ts:1694）
         return executePostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive, isInterrupt,
             ctx != null ? ctx.toolUseId() : null,
-            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(errorResult != null ? errorResult.data() : null));
+            com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(errorResult != null ? errorResult.data() : null),
+            null);
     }
+
     public GenericHook.HookResult executePostToolUseFailure(String toolName, JsonNode input,
                                                             ToolResult<?> errorResult, ToolUseContext ctx,
                                                             boolean stopHookActive, boolean isInterrupt,
                                                             String toolUseId, boolean isError) {
+        return executePostToolUseFailure(toolName, input, errorResult, ctx, stopHookActive, isInterrupt,
+            toolUseId, isError, null);
+    }
+
+    public GenericHook.HookResult executePostToolUseFailure(String toolName, JsonNode input,
+                                                            ToolResult<?> errorResult, ToolUseContext ctx,
+                                                            boolean stopHookActive, boolean isInterrupt,
+                                                            String toolUseId, boolean isError, Long durationMs) {
         // [IMPL-01 D1-5 / INV-11 / OD-07] 政策闸门: programmatic PostToolUseFailure 链不豁免
         //   (对齐 CC runPostToolUseFailureHooks = yield* executeHooks, 入口短路 hooks.ts:1978-1980).
         if (shouldDisableAllHooksIncludingManaged()) {
@@ -3086,7 +3283,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             toolUseId,
             // [EX-HOOK R7 修正] 载荷 session_id 恒主会话（CC 双轨语义，见 executePreToolUse 注释）
             ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
-            ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null);
+            ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
+            mcpServerOf(ctx, toolName), durationMs);
         List<MatchedHook> matched = getMatchingHooks(toolPostFailureEvent);
         long toolChainStartMs = System.currentTimeMillis();
         ToolChainOutcomes outcomes = new ToolChainOutcomes();
@@ -3120,6 +3318,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         // [H-WF5a-02 折叠链5项 + 5-W3-4] message/systemMessage/additionalContext 折叠改 List 全保留
         java.util.List<Object> messages = new java.util.ArrayList<>();
         java.util.List<String> systemMessages = new java.util.ArrayList<>();
+        // [Wave2-E] terminalSequence last-wins 承载（失败链同为 hook 输出顶层字段；本仓无终端层不发射）
+        String terminalSequence = null;
         String firstHookPermissionDecisionReason = null;
         java.util.List<String> additionalContexts = new java.util.ArrayList<>();
         if (!snapshot.isEmpty()) {
@@ -3191,6 +3391,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 }
                 if (hookResult.message() != null) {
                     messages.add(hookResult.message());
+                }
+                // [Wave2-E] terminalSequence last-wins（失败链）
+                if (hookResult.terminalSequence() != null) {
+                    terminalSequence = hookResult.terminalSequence();
                 }
                 if (firstHookPermissionDecisionReason == null
                     && hookResult.hookPermissionDecisionReason() != null) {
@@ -3282,6 +3486,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             if (configuredResult.message() != null) {
                 messages.add(configuredResult.message());
             }
+            // [Wave2-E] terminalSequence last-wins（失败链 · 配置驱动段）
+            if (configuredResult.terminalSequence() != null) {
+                terminalSequence = configuredResult.terminalSequence();
+            }
             if (firstHookPermissionDecisionReason == null
                 && configuredResult.hookPermissionDecisionReason() != null) {
                 firstHookPermissionDecisionReason = configuredResult.hookPermissionDecisionReason();
@@ -3299,6 +3507,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         boolean allNull = !preventContinuation
             && firstBlockingError == null && systemMessages.isEmpty()
             && messages.isEmpty()
+            && terminalSequence == null
             && firstHookPermissionDecisionReason == null && additionalContexts.isEmpty();
         if (allNull) {
             return GenericHook.HookResult.proceed();
@@ -3311,7 +3520,9 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             null, null,
             null, firstHookPermissionDecisionReason,
             // [IMP-DA-01 TY-01] allBlockingErrors 参数已删除 — blocking 附件经 messages 逐条承载
-            GenericHook.HookOutcome.SUCCESS, firstReason, null, null, null, null, null, null, null);
+            GenericHook.HookOutcome.SUCCESS, firstReason, null, null, null, null, null, null, null, null,
+            // [Wave2-E] terminalSequence 承载（canonical 27 参构造）
+            terminalSequence, null, null, null, null, null, null, null);
     }
 
     /**
@@ -3495,6 +3706,12 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         //   从 HookResult 顶层读取; CC runHooks 取首个带决策的结果 (PermissionContext.ts:231-259),
         //   故按"首非空"折叠, 随折叠结果透传给消费方.
         PermissionRequestResult firstPermissionRequestResult = null;
+        // [Wave2-E] v2.1.325 输出面事件级聚合：updatedToolOutput / terminalSequence last-wins；
+        //   classifierContext 按 hook 顺序累加（共享 2000 UTF-16 预算）。只有同步结果进入本循环，
+        //   async hook 的迟到响应由 AsyncHookRegistry 交付、不参与本折叠（CC 对迟到响应忽略该字段）。
+        Object eventUpdatedToolOutput = null;
+        String eventTerminalSequence = null;
+        StringBuilder eventClassifierContext = new StringBuilder();
 
         // [MT-04 / OPD-WF2-MT-04] session 作用域临时 hook 执行 · 聚合序对齐 CC 完成序.
         //   [X-PROBE EV-XP-W2-001~007] CC getHooksConfig (hooks.ts:1552-1562) 把 session
@@ -3538,6 +3755,14 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             if (hookResult.permissionRequestResult() != null && firstPermissionRequestResult == null) {
                 firstPermissionRequestResult = hookResult.permissionRequestResult();
             }
+            // [Wave2-E] 事件级 v2.1.325 输出字段累加（本条 = 同步结果）
+            if (hookResult.updatedToolOutput() != null) {
+                eventUpdatedToolOutput = hookResult.updatedToolOutput();
+            }
+            if (hookResult.terminalSequence() != null) {
+                eventTerminalSequence = hookResult.terminalSequence();
+            }
+            appendClassifierContext(eventClassifierContext, hookResult.classifierContext());
             // [H7-v3 Gap①] 折叠首个非阻断结果 (outcome=CANCELLED/NON_BLOCKING_ERROR)
             // [H3 v4 Gap①] 扩展到任何带 message 的结果 (含 SUCCESS 的 hook_success)
             if (firstMessageResult == null && (isNonBlockingOutcome(hookResult) || hookResult.message() != null)) {
@@ -3580,6 +3805,14 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             if (hookResult.permissionRequestResult() != null && firstPermissionRequestResult == null) {
                 firstPermissionRequestResult = hookResult.permissionRequestResult();
             }
+            // [Wave2-E] 事件级 v2.1.325 输出字段累加（本条 = 同步结果）
+            if (hookResult.updatedToolOutput() != null) {
+                eventUpdatedToolOutput = hookResult.updatedToolOutput();
+            }
+            if (hookResult.terminalSequence() != null) {
+                eventTerminalSequence = hookResult.terminalSequence();
+            }
+            appendClassifierContext(eventClassifierContext, hookResult.classifierContext());
             // [H7-v3 Gap①] 折叠首个非阻断结果 (outcome=CANCELLED/NON_BLOCKING_ERROR).
             //   含 message 的完整结果 — 保留 message + hook 字段供调用方注入 LLM.
             // [H3 v4 Gap①] 扩展到任何带 message 的结果 (含 SUCCESS 的 hook_success): 非工具事件
@@ -3591,7 +3824,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         }
 
         if (genericHooks.isEmpty()) {
-            return resolveEventResult(firstStop, firstBlockingError, firstBlockingResult, firstRetry, firstMessageResult, firstPermissionRequestResult);
+            return applyEventLevelV2Fields(
+                resolveEventResult(firstStop, firstBlockingError, firstBlockingResult, firstRetry, firstMessageResult, firstPermissionRequestResult),
+                eventUpdatedToolOutput, eventTerminalSequence,
+                eventClassifierContext.length() == 0 ? null : eventClassifierContext.toString());
         }
         if (!snapshot.isEmpty()) {
             // [H4] programmatic generic hook 并行执行 · 对齐 CC executeHooks all(hookPromises) (hooks.ts:2744).
@@ -3654,6 +3890,16 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                         && firstPermissionRequestResult == null) {
                     firstPermissionRequestResult = result.permissionRequestResult();
                 }
+                // [Wave2-E] 事件级 v2.1.325 输出字段累加（programmatic 段）
+                if (result != null) {
+                    if (result.updatedToolOutput() != null) {
+                        eventUpdatedToolOutput = result.updatedToolOutput();
+                    }
+                    if (result.terminalSequence() != null) {
+                        eventTerminalSequence = result.terminalSequence();
+                    }
+                    appendClassifierContext(eventClassifierContext, result.classifierContext());
+                }
                 // [H7-v3 Gap①] 折叠首个非阻断结果 (outcome=CANCELLED/NON_BLOCKING_ERROR)
                 // [H3 v4 Gap①] 扩展到任何带 message 的结果 (含 SUCCESS 的 hook_success);
                 //   result 可为 null (hook 失败/返回 null 的 future 归一化) → 先判 null
@@ -3663,7 +3909,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 }
             }
         }
-        return resolveEventResult(firstStop, firstBlockingError, firstBlockingResult, firstRetry, firstMessageResult, firstPermissionRequestResult);
+        return applyEventLevelV2Fields(
+            resolveEventResult(firstStop, firstBlockingError, firstBlockingResult, firstRetry, firstMessageResult, firstPermissionRequestResult),
+            eventUpdatedToolOutput, eventTerminalSequence,
+            eventClassifierContext.length() == 0 ? null : eventClassifierContext.toString());
     }
 
     /**
@@ -4266,6 +4515,74 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
      * [R6-IMP] Stop summary 命令清单提取 · CC getHookDisplayText 等价
      * (hooksSettings.ts:68-90)：statusMessage 优先，缺省 command/prompt/url。
      */
+    /**
+     * [Wave3-input] 工具事件的 {@code mcp_server:{name,source}} · 从真实 Tool.mcpInfo() 取；
+     * 非 MCP / tool 不在 ctx.availableTools() → null（CC 该字段 absent）。source 本仓无来源 → 不下发。
+     */
+    private Map<String, Object> mcpServerOf(
+            com.nexusai.application.agent.tool.ToolUseContext ctx, String toolName) {
+        if (ctx == null || toolName == null || ctx.availableTools() == null) {
+            return null;
+        }
+        for (com.nexusai.application.agent.tool.Tool t : ctx.availableTools()) {
+            if (t == null || !toolName.equals(t.name())) {
+                continue;
+            }
+            com.nexusai.application.agent.tool.McpServerInfo info = t.mcpInfo();
+            if (info != null && info.serverName() != null && !info.serverName().isBlank()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("name", info.serverName());
+                // [Hook v2.1.325] mcp_server.source = DB 配置 scope（project/user/local/enterprise/
+                // dynamic/claudeai）；无 service/未找到 → 省略（CC source 可 absent）。
+                String source = mcpServerService != null
+                    ? mcpServerService.getScopeByName(info.serverName()) : null;
+                if (source != null && !source.isBlank()) {
+                    m.put("source", source);
+                }
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * [Hook v2.1.325] 仅 name 的 {@code mcp_server}（外部 PermissionRequest 构造点用；source
+     * 需 DB 注入，这些点无 service → 省略）。非 MCP/找不到 tool → null。
+     */
+    public static Map<String, Object> mcpServerNameOf(
+            com.nexusai.application.agent.tool.ToolUseContext ctx, String toolName) {
+        if (ctx == null || toolName == null || ctx.availableTools() == null) {
+            return null;
+        }
+        for (com.nexusai.application.agent.tool.Tool t : ctx.availableTools()) {
+            if (t == null || !toolName.equals(t.name())) {
+                continue;
+            }
+            com.nexusai.application.agent.tool.McpServerInfo info = t.mcpInfo();
+            if (info != null && info.serverName() != null && !info.serverName().isBlank()) {
+                Map<String, Object> m = new LinkedHashMap<>();
+                m.put("name", info.serverName());
+                return m;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * [Wave2-I] {@code onFailure:"block"} 是否适用于该 hook/事件 · CC 原文：
+     * "Ignored for async hooks and on Stop, SubagentStop, TaskCompleted and TeammateIdle"。
+     * 仅 CommandHook/HttpHook 有该字段；mcp_tool/prompt/agent 无。
+     */
+    private static boolean onFailureBlocks(HookCommand hook, HookEventType type) {
+        String v = hook instanceof CommandHook c ? c.onFailure()
+            : hook instanceof HttpHook h ? h.onFailure() : null;
+        if (!"block".equals(v)) {
+            return false;
+        }
+        return !(type == HookEventType.STOP || type == HookEventType.SUBAGENT_STOP
+            || type == HookEventType.TASK_COMPLETED || type == HookEventType.TEAMMATE_IDLE);
+    }
+
     private static String stopHookCommandOf(HookCommand hook) {
         if (hook == null) {
             return null;
@@ -4278,6 +4595,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             case PROMPT -> ((PromptHook) hook).prompt();
             case AGENT -> ((AgentHook) hook).prompt();
             case HTTP -> ((HttpHook) hook).url();
+            case MCP_TOOL -> {
+                McpToolHook mcp = (McpToolHook) hook;
+                yield mcp.server() + "/" + mcp.tool();
+            }
         };
     }
 
@@ -4400,22 +4721,11 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         // Lazy-once stringify of hookInput · 对齐 CC getJsonInput() (hooks.ts:2124-2140),
         // 全部 command/prompt/agent/http hook 共享同一 jsonInput.
         String jsonInput = CommandHookExecutor.buildJsonInput(enriched);
-        // [MT-02 / OPD-WF2-MT-02] 执行链 reconciliation：registered/插件源 MatchedHook
-        //   （getMatchingHooks 统一单链返回，含 plugin context）不在此并行执行 —— 插件
-        //   native hooks 执行经 PluginLoader.buildPluginGenericHook → genericHooks 链
-        //   （对齐 CC 插件 hook 由 executeHooks 执行，Java 端保留既有执行链），避免
-        //   插件 hook 双发（matched 链 + genericHooks 链各一次）。
+        // [Wave2-J2] 插件 hooks **只走统一 matched 链**（PluginLoader 已删除 command-only 的
+        //   genericHooks 双轨）⇒ 不再跳过插件源 matched hook。pluginRoot/pluginId 经 MatchedHook
+        //   透传进 executeOneConfiguredHook（command 执行器 env 需要），5 类统一分发。
         java.util.List<MatchedHook> execMatched = new ArrayList<>(matched.size());
-        for (MatchedHook mh : matched) {
-            if (mh.pluginId() != null || mh.pluginRoot() != null) {
-                if (log.isDebugEnabled()) {
-                    log.debug("executeConfiguredHooks: 跳过插件源 matched hook {} (执行走 genericHooks 链, 防双发)",
-                        stopHookCommandOf(mh.hook()));
-                }
-                continue;
-            }
-            execMatched.add(mh);
-        }
+        execMatched.addAll(matched);
         if (execMatched.isEmpty()) {
             return List.of();
         }
@@ -4435,8 +4745,16 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             int hookIndex = i;
             futures.add(CompletableFuture.supplyAsync(() -> {
                 // [IMP-A2-1 · MG-5] 批级 abort 透传 executeOneConfiguredHook → 执行器 parentAbort
-                GenericHook.HookResult r = executeOneConfiguredHook(enriched, mh, jsonInput,
-                    parentTuc, hookIndex, messages, defaultTimeoutMs, promptRequester, batchAbort);
+                GenericHook.HookResult r;
+                try {
+                    r = executeOneConfiguredHook(enriched, mh, jsonInput,
+                        parentTuc, hookIndex, messages, defaultTimeoutMs, promptRequester, batchAbort);
+                } finally {
+                    // [Wave2-I] CC once = "runs once and is removed after execution"（不要求成功）
+                    if (Boolean.TRUE.equals(mh.hook().once())) {
+                        consumedOnceHooks.add(onceKey(enriched.type(), mh));
+                    }
+                }
                 completed.add(new IndexedHookResult(hookIndex, r));
                 return r;
             }, HOOK_EXECUTOR));
@@ -4598,7 +4916,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 //   （对齐 CC executeHooksOutsideREPL http 分支传 signal hooks.ts:2299-2301）
                 return executeConfiguredHttp(event, mh, httpHook, jsonInput, parentTuc, batchAbort);
             }
-            // 未知类型 → 跳过不抛 (sealed interface 保证 4 类型穷尽, 此分支为防御性兜底)
+            if (hook instanceof McpToolHook mcpToolHook) {
+                return executeConfiguredMcpTool(event, mh, mcpToolHook, jsonInput);
+            }
+            // 未知类型 → 跳过不抛 (sealed interface 保证 5 类型穷尽, 此分支为防御性兜底)
             if (log.isDebugEnabled()) {
                 log.debug("配置驱动 hook 未知类型, 跳过: type={}", hook.hookType());
             }
@@ -5577,6 +5898,40 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         return httpToHookResult(httpResult, httpHook, hookName, event.type().ccName(), event.toolUseId());
     }
 
+    /**
+     * [Wave2-I] 配置驱动 McpToolHook 执行 · 对齐 CC v2.1.325 {@code mcp_tool} 子 schema：
+     * 调用已配置 MCP server 的 tool，把返回 JSON 按 hook 输出解释。mcp_tool 无 onFailure
+     * ⇒ 失败一律 non_blocking_error（CC schema 未给失败策略字段）。
+     */
+    private GenericHook.HookResult executeConfiguredMcpTool(HookEvent event, MatchedHook mh,
+                                                            McpToolHook hook, String jsonInput) {
+        String hookName = hookNameFor(mh);
+        com.nexusai.application.agent.mcp.McpToolPool pool = this.mcpToolPool;
+        if (pool == null) {
+            return mcpToolNonBlocking(event, hookName, hook,
+                "mcp_tool hook cannot run: McpToolPool 未注入");
+        }
+        try {
+            // CC mcp_tool timeout 单位=秒；缺省 60s（与 agent hook 缺省一致）。
+            return new ExecMcpToolHook(pool).exec(hook, hookName, event, jsonInput, 60_000L);
+        } catch (Exception e) {
+            return mcpToolNonBlocking(event, hookName, hook,
+                "Failed to run mcp_tool: " + e.getMessage());
+        }
+    }
+
+    /** [Wave2-I] mcp_tool 失败 attachment（non_blocking_error）。 */
+    private static GenericHook.HookResult mcpToolNonBlocking(HookEvent event, String hookName,
+                                                             McpToolHook hook, String message) {
+        String display = hook.server() + "/" + hook.tool();
+        AttachmentMessageDto att = AttachmentMessageDto.hookNonBlockingError(
+            hookName, event != null ? event.toolUseId() : null,
+            event != null ? event.type().ccName() : null, message, "", 1, display, 0L);
+        return new GenericHook.HookResult(false, null, null, null, att,
+            null, null, null, null, GenericHook.HookOutcome.NON_BLOCKING_ERROR,
+            null, null, null, hook, null, null, null, null);
+    }
+
     // ════════════════════════════════════════════════════════════════════════
     // [IMPL-06 OD-EX-04] attachment command/durationMs 注入 · 对齐 CC hooks.ts:2241-2250/2281-2290
     // ════════════════════════════════════════════════════════════════════════
@@ -5614,12 +5969,16 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 System.currentTimeMillis() - hookStartMs);
         // [goal V253] 必须透传 impossible —— 18 参构造器会把它置 null。
         // 丢失 ⇒ 评估器判「不可能达成」的结果被降级成普通 success ⇒ 目标永不停。
+        // [Wave2-E] 同时透传 v2.1.325 的 8 个输出字段（19 参转发构造器会把它们置 null）。
         return new GenericHook.HookResult(result.preventContinuation(), result.blockingError(),
             result.systemMessages(), result.additionalContexts(), enriched,
             result.updatedInput(), result.updatedMCPToolOutput(), result.retry(),
             result.hookPermissionDecisionReason(), result.outcome(), result.stopReason(),
             result.permissionBehavior(), null, result.hook(), null, null, null, null,
-            result.impossible());
+            result.impossible(),
+            result.terminalSequence(), result.updatedToolOutput(), result.classifierContext(),
+            result.sessionTitle(), result.suppressOriginalPrompt(), result.reloadSkills(),
+            result.displayContent(), result.permissionDisplay());
     }
 
     /** CC getHookDisplayText 等价（hooksSettings.ts:68-90）· statusMessage 优先，缺省 prompt/url/command. */
@@ -5668,6 +6027,18 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
      *                          hookSpecificOutput 事件名校验 (仅测试/无事件上下文场景)
      * @param toolUseId         工具调用 ID · attachment.toolUseID 字段 (非工具事件 → null)
      */
+    /**
+     * [Wave2-I] HTTP {@code onFailure:"block"} 是否生效（CC 原文：忽略 Stop/SubagentStop/
+     * TaskCompleted/TeammateIdle；HTTP hook 无 async 字段）。{@code aborted} 不算失败，不升级。
+     */
+    private static boolean httpOnFailureBlocks(HttpHook hook, String expectedEvent) {
+        if (hook == null || !"block".equals(hook.onFailure())) {
+            return false;
+        }
+        return !("Stop".equals(expectedEvent) || "SubagentStop".equals(expectedEvent)
+            || "TaskCompleted".equals(expectedEvent) || "TeammateIdle".equals(expectedEvent));
+    }
+
     static GenericHook.HookResult httpToHookResult(ExecHttpHook.HttpHookResult r, HttpHook hook,
                                                    String hookName, String expectedHookEvent, String toolUseId) {
         if (r == null) {
@@ -5685,6 +6056,14 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
         if (r.error() != null || !r.ok()) {
             String stderr = r.error() != null ? r.error()
                 : "HTTP " + r.statusCode() + " from " + hook.url();
+            if (httpOnFailureBlocks(hook, expectedHookEvent)) {
+                String msg = "[" + hook.url() + "]: " + stderr;
+                return new GenericHook.HookResult(true,
+                    new HookBlockingError(msg, hook.url()),
+                    null, null, null, null, null, null, null,
+                    GenericHook.HookOutcome.BLOCKING, msg, null, null, hook,
+                    null, null, null, null, null);
+            }
             AttachmentMessageDto errAtt = AttachmentMessageDto.hookNonBlockingError(
                 hookName, toolUseId, expectedHookEvent, stderr, "", 0);
             return new GenericHook.HookResult(false, null, null, null, errAtt, null, null,
@@ -5699,9 +6078,17 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 log.warn("HTTP hook '{}' body 非 JSON (validationError={}), 视为 non_blocking_error",
                     hookName, parsed.validationError());
             }
+            String validationText = "JSON validation failed: " + parsed.validationError();
+            if (httpOnFailureBlocks(hook, expectedHookEvent)) {
+                String msg = "[" + hook.url() + "]: " + validationText;
+                return new GenericHook.HookResult(true,
+                    new HookBlockingError(msg, hook.url()),
+                    null, null, null, null, null, null, null,
+                    GenericHook.HookOutcome.BLOCKING, msg, null, null, hook,
+                    null, null, null, null, null);
+            }
             AttachmentMessageDto validationAtt = AttachmentMessageDto.hookNonBlockingError(
-                hookName, toolUseId, expectedHookEvent,
-                "JSON validation failed: " + parsed.validationError(), r.body(), 0);
+                hookName, toolUseId, expectedHookEvent, validationText, r.body(), 0);
             return new GenericHook.HookResult(false, null, null, null, validationAtt, null, null,
                 null, null, GenericHook.HookOutcome.NON_BLOCKING_ERROR, null, null, null, hook, null, null, null, null);
         }
@@ -5767,6 +6154,10 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             case PROMPT -> "config-prompt:" + ((PromptHook) mh.hook()).prompt();
             case AGENT -> "config-agent:" + ((AgentHook) mh.hook()).prompt();
             case HTTP -> "config-http:" + ((HttpHook) mh.hook()).url();
+            case MCP_TOOL -> {
+                McpToolHook mcp = (McpToolHook) mh.hook();
+                yield "config-mcp_tool:" + mcp.server() + "/" + mcp.tool();
+            }
         };
     }
 
@@ -6080,7 +6471,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             //   硬编码 null → 配置 hook deny/allow 决策在聚合折叠时丢失, 工具链不可见).
             // [2026-08-12 △-01] awaiting 4 字段随 firstStop 保留 (CC executeHooks 逐 result
             //   yield initialUserMessage/watchPaths/elicitation* hooks.ts:2780-2810).
-            return new GenericHook.HookResult(firstStop.preventContinuation(),
+            return carryV2OutputFields(carryV2OutputFields(new GenericHook.HookResult(firstStop.preventContinuation(),
             firstBlockingError,
             firstStop.systemMessages(),
             firstStop.additionalContexts(),
@@ -6093,7 +6484,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             GenericHook.HookOutcome.SUCCESS, firstStop.stopReason(),
             firstStop.permissionBehavior(), firstPermissionRequestResult, firstStop.hook(),
             firstStop.initialUserMessage(), firstStop.watchPaths(),
-            firstStop.elicitationResponse(), firstStop.elicitationResultResponse());
+            firstStop.elicitationResponse(), firstStop.elicitationResultResponse()),
+                firstMessageResult), firstBlockingResult);
         }
         if (firstBlockingError != null) {
             if (log.isInfoEnabled()) {
@@ -6116,7 +6508,7 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             GenericHook.HookResult stop = GenericHook.HookResult.stop(null,
                 firstBlockingError.blockingError() != null ? firstBlockingError.blockingError() : null);
             if (blockingMessage != null) {
-                return new GenericHook.HookResult(stop.preventContinuation(), stop.blockingError(),
+                return carryV2OutputFields(carryV2OutputFields(new GenericHook.HookResult(stop.preventContinuation(), stop.blockingError(),
                     stop.systemMessages(), stop.additionalContexts(), blockingMessage,
                     stop.updatedInput(), stop.updatedMCPToolOutput(), stop.retry(),
                     // [IMPL-03 D6-1] blockingError 结果携带的决策字段保留 (permissionBehavior/
@@ -6131,10 +6523,11 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                     firstBlockingResult != null ? firstBlockingResult.initialUserMessage() : null,
                     firstBlockingResult != null ? firstBlockingResult.watchPaths() : null,
                     firstBlockingResult != null ? firstBlockingResult.elicitationResponse() : null,
-                    firstBlockingResult != null ? firstBlockingResult.elicitationResultResponse() : null);
+                    firstBlockingResult != null ? firstBlockingResult.elicitationResultResponse() : null),
+                        firstMessageResult), firstBlockingResult);
             }
             // 无 message 时同样保留决策字段 (构造等价 stop + 决策字段)
-            return new GenericHook.HookResult(stop.preventContinuation(), stop.blockingError(),
+            return carryV2OutputFields(carryV2OutputFields(new GenericHook.HookResult(stop.preventContinuation(), stop.blockingError(),
                 stop.systemMessages(), stop.additionalContexts(), null,
                 stop.updatedInput(), stop.updatedMCPToolOutput(), stop.retry(),
                 firstBlockingResult != null ? firstBlockingResult.hookPermissionDecisionReason() : null,
@@ -6145,7 +6538,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 firstBlockingResult != null ? firstBlockingResult.initialUserMessage() : null,
                 firstBlockingResult != null ? firstBlockingResult.watchPaths() : null,
                 firstBlockingResult != null ? firstBlockingResult.elicitationResponse() : null,
-                firstBlockingResult != null ? firstBlockingResult.elicitationResultResponse() : null);
+                firstBlockingResult != null ? firstBlockingResult.elicitationResultResponse() : null),
+                    firstMessageResult), firstBlockingResult);
         }
         if (firstRetry != null) {
             if (log.isInfoEnabled()) {
@@ -6154,14 +6548,15 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             }
             GenericHook.HookResult retry = GenericHook.HookResult.withRetry();
             if (firstMessageResult != null && firstMessageResult.message() != null) {
-                return new GenericHook.HookResult(retry.preventContinuation(), retry.blockingError(),
+                return carryV2OutputFields(new GenericHook.HookResult(retry.preventContinuation(), retry.blockingError(),
                     retry.systemMessages(), retry.additionalContexts(), firstMessageResult.message(),
                     retry.updatedInput(), retry.updatedMCPToolOutput(), retry.retry(),
                     retry.hookPermissionDecisionReason(), retry.outcome(), retry.stopReason(),
                     retry.permissionBehavior(), firstPermissionRequestResult, retry.hook(),
                     // [2026-08-12 △-01] awaiting 4 字段随 firstMessageResult 保留
                     firstMessageResult.initialUserMessage(), firstMessageResult.watchPaths(),
-                    firstMessageResult.elicitationResponse(), firstMessageResult.elicitationResultResponse());
+                    firstMessageResult.elicitationResponse(), firstMessageResult.elicitationResultResponse()),
+                    firstMessageResult);
             }
             return retry;
         }
@@ -6185,6 +6580,84 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
                 .withPermissionRequestResult(firstPermissionRequestResult);
         }
         return GenericHook.HookResult.proceed();
+    }
+
+    /**
+     * [Wave2-E] 折叠结果补携带 claude.exe v2.1.325 的 8 个输出字段。
+     *
+     * <p><b>WHY</b>: {@link #resolveEventResult} 的 4 个重建分支用 19 参转发构造器合成结果
+     * （或只传 18 参），这会把 {@code terminalSequence / updatedToolOutput / classifierContext /
+     * sessionTitle / suppressOriginalPrompt / reloadSkills / displayContent / permissionDisplay}
+     * 全部置 null ⇒ 配置驱动 PostToolUse hook 的 {@code updatedToolOutput} 在到达
+     * {@code executePostToolUse} 折叠前就丢失。
+     *
+     * <p><b>语义</b>: 只填空（{@code built} 已有值不覆盖），调用方按优先级链式调用 ——
+     * {@code carry(carry(built, 低优先源), 高优先源)}。
+     *
+     * @param built  已构造的折叠结果
+     * @param source 提供缺失字段的源结果（null → 原样返回）
+     * @return 补齐后的结果
+     */
+    private static GenericHook.HookResult carryV2OutputFields(GenericHook.HookResult built,
+                                                              GenericHook.HookResult source) {
+        if (built == null || source == null) {
+            return built;
+        }
+        return new GenericHook.HookResult(built.preventContinuation(), built.blockingError(),
+            built.systemMessages(), built.additionalContexts(), built.message(),
+            built.updatedInput(), built.updatedMCPToolOutput(), built.retry(),
+            built.hookPermissionDecisionReason(), built.outcome(), built.stopReason(),
+            built.permissionBehavior(), built.permissionRequestResult(), built.hook(),
+            built.initialUserMessage(), built.watchPaths(), built.elicitationResponse(),
+            built.elicitationResultResponse(), built.impossible(),
+            built.terminalSequence() != null ? built.terminalSequence() : source.terminalSequence(),
+            built.updatedToolOutput() != null ? built.updatedToolOutput() : source.updatedToolOutput(),
+            built.classifierContext() != null ? built.classifierContext() : source.classifierContext(),
+            built.sessionTitle() != null ? built.sessionTitle() : source.sessionTitle(),
+            built.suppressOriginalPrompt() != null ? built.suppressOriginalPrompt() : source.suppressOriginalPrompt(),
+            built.reloadSkills() != null ? built.reloadSkills() : source.reloadSkills(),
+            built.displayContent() != null ? built.displayContent() : source.displayContent(),
+            built.permissionDisplay() != null ? built.permissionDisplay() : source.permissionDisplay());
+    }
+
+    /**
+     * [Wave2-E] executeEvent 事件级 v2.1.325 输出字段回填。
+     *
+     * <p><b>WHY</b>: {@link #resolveEventResult} 只折叠"首个"结果，多个 hook 的
+     * {@code classifierContext} 会只剩一条；而 CC 的预算说明明确是"shared across all hooks
+     * that contribute to one call"。本方法把事件级累加结果补到折叠结果的空位上。
+     *
+     * <p>只填空：折叠结果自带的非空值优先（CC 逐 hook yield、后到覆盖的字段已在折叠器内定案）。
+     *
+     * @param built            折叠结果
+     * @param updatedToolOutput 事件内 last-wins 的 updatedToolOutput（可 null）
+     * @param terminalSequence  事件内 last-wins 的 terminalSequence（可 null）
+     * @param classifierContext 事件内按序累加的 classifierContext（可 null/空）
+     * @return 补填后的结果
+     */
+    private static GenericHook.HookResult applyEventLevelV2Fields(GenericHook.HookResult built,
+                                                                  Object updatedToolOutput,
+                                                                  String terminalSequence,
+                                                                  String classifierContext) {
+        if (built == null) {
+            return null;
+        }
+        if (built.updatedToolOutput() != null && built.terminalSequence() != null
+            && built.classifierContext() != null) {
+            return built;
+        }
+        return new GenericHook.HookResult(built.preventContinuation(), built.blockingError(),
+            built.systemMessages(), built.additionalContexts(), built.message(),
+            built.updatedInput(), built.updatedMCPToolOutput(), built.retry(),
+            built.hookPermissionDecisionReason(), built.outcome(), built.stopReason(),
+            built.permissionBehavior(), built.permissionRequestResult(), built.hook(),
+            built.initialUserMessage(), built.watchPaths(), built.elicitationResponse(),
+            built.elicitationResultResponse(), built.impossible(),
+            built.terminalSequence() != null ? built.terminalSequence() : terminalSequence,
+            built.updatedToolOutput() != null ? built.updatedToolOutput() : updatedToolOutput,
+            built.classifierContext() != null ? built.classifierContext() : classifierContext,
+            built.sessionTitle(), built.suppressOriginalPrompt(), built.reloadSkills(),
+            built.displayContent(), built.permissionDisplay());
     }
 
     /**
@@ -6468,7 +6941,8 @@ public class HookRegistry implements SessionFileAccessHooks.PostToolUseRegistrar
             ? ctx.sessionId() : null;
         String agentId = ctx != null && ctx.agentId() != null
             ? ctx.agentId().toString() : null;
-        HookEvent event = HookEvent.permissionDenied(toolName, input, reason, toolUseId, sessionId, agentId);
+        HookEvent event = HookEvent.permissionDenied(toolName, input, reason, toolUseId, sessionId, agentId,
+            mcpServerOf(ctx, toolName));
         // [fix-ts04 IMPL-01 OD-TS04-01] PermissionDenied retry check ctx 在手 → 3 参透传批级
         //   (enrich 注入 agent_type/permission_mode, 对齐 CC executePermissionDeniedHooks agentInfo).
         GenericHook.HookResult result = executeEvent(event, null, ctx);

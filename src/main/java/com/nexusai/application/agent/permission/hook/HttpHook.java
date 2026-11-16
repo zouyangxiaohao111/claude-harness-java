@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.permission.hook;
 
+import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
 
 import java.util.List;
@@ -19,6 +20,9 @@ import java.util.Map;
  *   <li>{@code timeout} (:101-105) — 超时秒数</li>
  *   <li>{@code headers} (:106-111) — 附加请求头, 值可用 $VAR_NAME 插值环境变量</li>
  *   <li>{@code allowedEnvVars} (:112-117) — 允许插值的环境变量名白名单</li>
+ *   <li>{@code onFailure} — [Wave1-C] 失败语义 {@code continue|block}：请求起不来 / 超时 /
+ *       返回非 2xx / body 非法 JSON 时，{@code block} 视同 exit 2 拦住该事件守护的动作；
+ *       缺省 {@code continue}（exe 描述同 command 的 {@code onFailure}）</li>
  *   <li>{@code statusMessage} (:118-121) — 自定义 spinner 文案</li>
  *   <li>{@code once} (:122-125) — true=执行一次后移除</li>
  * </ul>
@@ -30,6 +34,7 @@ import java.util.Map;
  * @param allowedEnvVars CC original: allowedEnvVars (schemas/hooks.ts:112)
  * @param statusMessage  CC original: statusMessage (schemas/hooks.ts:118)
  * @param once           CC original: once (schemas/hooks.ts:122)
+ * @param onFailure      CC original: onFailure（[Wave1-C] continue|block，缺省 continue）
  */
 public record HttpHook(
     String url,
@@ -38,8 +43,21 @@ public record HttpHook(
     Map<String, String> headers,
     List<String> allowedEnvVars,
     String statusMessage,
-    Boolean once
+    Boolean once,
+    String onFailure
 ) implements HookCommand, SessionHook {
+
+    /**
+     * [Wave1-C] 7 参转发构造器 · {@code onFailure} 缺失（旧调用点零改动）。
+     *
+     * <p>{@code @JsonCreator(DISABLED)} 同 {@link CommandHook}：防止 -parameters +
+     * ParameterNamesModule 把本构造器当成隐式 creator 与规范构造器冲突。
+     */
+    @JsonCreator(mode = JsonCreator.Mode.DISABLED)
+    public HttpHook(String url, String ifCondition, Integer timeout, Map<String, String> headers,
+                    List<String> allowedEnvVars, String statusMessage, Boolean once) {
+        this(url, ifCondition, timeout, headers, allowedEnvVars, statusMessage, once, null);
+    }
 
     @Override
     public HookType hookType() {

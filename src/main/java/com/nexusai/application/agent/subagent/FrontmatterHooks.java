@@ -34,11 +34,11 @@ import java.util.*;
  * {@link CommandHook} / {@link PromptHook} / {@link HttpHook} / {@link AgentHook} (DRY, 规则#7 不调和冲突),
  * 删除内嵌脏 record. HooksSettings 改为 {@code Map<HookEventType, List<HookMatcher>>} (27 事件全支持).
  *
- * <p><b>本期范围</b> [IMP-HOOKS-S8 H7]: frontmatter hook 的 4 类型
- * {@code command}/{@code prompt}/{@code agent}/{@code http} 全部注册进 SessionHookStore
+ * <p><b>本期范围</b> [IMP-HOOKS-S8 H7]: frontmatter hook 的 5 类型
+ * {@code command}/{@code prompt}/{@code agent}/{@code http}/{@code mcp_tool} 全部注册进 SessionHookStore
  * （对齐 CC registerFrontmatterHooks.ts:55-58 无类型过滤），执行走标准 session hook 链
- * HookRegistry.executeOneConfiguredHook 的 4 分支分发（prompt/agent/http executor 字段面
- * 完整对齐属 T4 域）；command 类型保留 command 字段必填 fail-loud 守卫（镜像 CC
+ * HookRegistry.executeOneConfiguredHook 的分支分发（mcp_tool 执行属后续批次）；
+ * command 类型保留 command 字段必填 fail-loud 守卫（镜像 CC
  * BashCommandHookSchema {@code command: z.string()} 必填, schemas/hooks.ts:34）。
  *
  * <p><b>[IMP-SUB-10 D15] zod 整体校验对齐</b>（FH-37/39/40）：CC {@code parseHooksFromFrontmatter}
@@ -53,7 +53,7 @@ public class FrontmatterHooks {
 
     /** CC HookCommandSchema discriminatedUnion type（schemas/hooks.ts:176-189） */
     private static final java.util.Set<String> HOOK_COMMAND_TYPES =
-        java.util.Set.of("command", "prompt", "agent", "http");
+        java.util.Set.of("command", "prompt", "agent", "http", "mcp_tool");
 
     /** CC SHELL_TYPES（utils/shell/shellProvider.ts:1）= ['bash', 'powershell'] */
     private static final java.util.Set<String> SHELL_TYPES =
@@ -192,7 +192,7 @@ public class FrontmatterHooks {
         }
         Object type = h.get("type");
         if (!(type instanceof String ts) || !HOOK_COMMAND_TYPES.contains(ts)) {
-            return "type 非 command/prompt/http/agent (CC discriminatedUnion('type'))";
+            return "type 非 command/prompt/http/agent/mcp_tool (CC discriminatedUnion('type'))";
         }
         switch (ts) {
             case "command":
@@ -219,6 +219,12 @@ public class FrontmatterHooks {
                     return "prompt 字段缺失或非字符串 (CC prompt: z.string() 必填, hooks.ts:138)";
                 }
                 return validateCommandOptionalFields(h, "agent");
+            case "mcp_tool":
+                // CC McpToolHookSchema (exe pg() off≈309,299,683): server/tool 均 z.string() 必填
+                if (!(h.get("server") instanceof String) || !(h.get("tool") instanceof String)) {
+                    return "server/tool 字段缺失或非字符串 (CC server/tool: z.string() 必填)";
+                }
+                return validateCommandOptionalFields(h, "mcp_tool");
             default:
                 return "未知 type '" + ts + "'";
         }

@@ -2,6 +2,8 @@ import { useEffect, useState } from 'react'
 import { FormModal } from '@/components/ui/FormModal'
 import { Icon } from '@/icons'
 import { ApiError } from '@/api/rest'
+import { doctorApi } from '@/api/doctor'
+import type { RuntimeEnvResponse } from '@/api/doctor'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
 import { getMcpPrefetch, putMcpPrefetch } from '@/api/settings'
 import type { CreateMcpRequest, McpOAuthRequest, McpRuntimeStatus, McpServer, McpStatus } from '@/api/types'
@@ -154,6 +156,8 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const [selected, setSelected] = useState<string[]>([])
   /** [V295] 全局总闸：DB 优先 / yml 兜底，source 用于提示「系统默认 vs 用户设置」 */
   const [prefetch, setPrefetch] = useState<{ enabled: boolean; source: 'db' | 'yml' } | null>(null)
+  /** Node / Python 探测结果：缺失时提示，不阻塞任何操作 */
+  const [runtimeEnv, setRuntimeEnv] = useState<RuntimeEnvResponse | null>(null)
 
   useEffect(() => {
     let alive = true
@@ -162,6 +166,20 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       .catch(() => { /* 老后端无该端点 → 不显示总闸 */ })
     return () => { alive = false }
   }, [])
+
+  useEffect(() => {
+    let alive = true
+    doctorApi.runtime()
+      .then((v) => { if (alive) setRuntimeEnv(v) })
+      .catch(() => { /* 老后端无该端点 → 不显示运行时提示 */ })
+    return () => { alive = false }
+  }, [])
+
+  const refreshRuntime = () => {
+    doctorApi.runtime()
+      .then(setRuntimeEnv)
+      .catch(() => { /* 探测失败静默：不把 MCP 面板拖进错误态 */ })
+  }
 
   const onTogglePrefetch = () => {
     if (!prefetch) return
@@ -306,7 +324,13 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   // ── 每行操作：启停 / 测试 / 删除 / enabled 开关 ──
   const onToggle = (m: McpServer) => {
     const display = m.userFacingName ?? m.name
-    void wrap(() => toggleMcp(m.id, !m.enabled), `${display} ${m.enabled ? '已停用' : '已启用'}`)
+    void wrap(async () => {
+      const saved = await toggleMcp(m.id, !m.enabled)
+      // 正在编辑同一台时同步 editing，避免「编辑」表单里的自启行用旧的 enabled 置灰
+      setEditing((prev) => (prev && prev.id === saved.id
+        ? { ...prev, enabled: saved.enabled, autoStart: saved.autoStart }
+        : prev))
+    }, `${display} ${m.enabled ? '已停用' : '已启用'}`)
   }
 
   /** [V295] 启动自启开关（PATCH autoStart；enabled 总开关关闭时后端归一化为 false）。 */
@@ -315,10 +339,11 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     const next = !m.autoStart
     // 显式带 scope：后端 McpCreateRequest 对 scope 有 "project" 缺省，单传 autoStart 会把原有
     // user/local scope 覆盖成 project（既有 PATCH 契约缺陷，此处规避）。
-    void wrap(
-      () => updateMcp(m.id, { autoStart: next, scope: m.scope ?? undefined }),
-      `${display} 启动自启${next ? '已开启' : '已关闭'}`,
-    )
+    void wrap(async () => {
+      const saved = await updateMcp(m.id, { autoStart: next, scope: m.scope ?? undefined })
+      // 编辑表单里的自启行读的是 editing，同步一次否则勾选态要等重新点编辑才刷新
+      setEditing((prev) => (prev && prev.id === saved.id ? { ...prev, autoStart: saved.autoStart } : prev))
+    }, `${display} 启动自启${next ? '已开启' : '已关闭'}`)
   }
 
   const onStart = (m: McpServer) => {
@@ -515,6 +540,32 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
               ))}
             </select>
           </div>
+          {/* [V295] 启动自启：从列表行移到此处（原行内与 enabled 并排成两个无文字开关，易被看成重复开关）。
+              新增时后端默认 true，不需要出此项；编辑时改一次即 PATCH 一次（带 scope，见 onToggleAutoStart）。 */}
+          {editing && (
+            <div className="mcp-add-row">
+              <label>启动时自动连接此服务</label>
+              <div style={{ flex: 1, minWidth: 0, paddingTop: 4 }}>
+                <label
+                  className="settings-switch"
+                  /* .mcp-add-row label 会把宽度压成 130px（选择器比开关自身类更具体），此处按开关原宽还原 */
+                  style={{ width: 44, paddingTop: 0 }}
+                  title={editing.enabled ? '启动时自动连接此服务（全局总闸关闭时仍不会连）' : '先启用该服务器才能设置启动自启'}
+                >
+                  <input
+                    type="checkbox"
+                    checked={!!editing.autoStart && editing.enabled}
+                    onChange={() => onToggleAutoStart(editing)}
+                    disabled={pending || !editing.enabled}
+                  />
+                  <span></span>
+                </label>
+                <div style={{ fontSize: 10.5, color: 'var(--ink-faint)', marginTop: 4, lineHeight: 1.5 }}>
+                  开启后，应用启动时会自动连上这个服务；关闭则每次手动点启动。
+                </div>
+              </div>
+            </div>
+          )}
           {form.type === 'stdio' ? (
             <>
               <div className="mcp-add-row">
@@ -657,6 +708,37 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
         </div>
       )}
 
+      {/* ── 运行时缺失提示（Node / Python / uv）· 只提醒，不静默安装 ── */}
+      {runtimeEnv && runtimeEnv.missingForMcp.length > 0 && (
+        <div className="settings-row" style={{ marginTop: 6, alignItems: 'flex-start' }}>
+          <div style={{ flex: 1 }}>
+            <div className="settings-row-label">缺少 MCP 运行时</div>
+            <div className="settings-row-desc">
+              未检测到 {runtimeEnv.missingForMcp.join(' / ')}，npx / uvx 类型的服务器无法启动。
+              安装后点「重新检测」。
+            </div>
+            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
+              {runtimeEnv.missingForMcp.map((name) => {
+                const info = runtimeEnv.runtimes[name]
+                if (!info?.installCommand) return null
+                return (
+                  <div key={name} style={{ fontSize: 10.5, color: 'var(--ink-subtle)' }}>
+                    <span style={{ fontFamily: 'var(--font-mono)' }}>{info.installCommand}</span>
+                    {info.installUrl && (
+                      <>
+                        {' · '}
+                        <a href={info.installUrl} target="_blank" rel="noreferrer">下载页</a>
+                      </>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          </div>
+          <button className="mcp-add-btn ghost" onClick={refreshRuntime}>重新检测</button>
+        </div>
+      )}
+
       {/* ── 已配置的服务器 列表 ── */}
       <div className="settings-row" style={{ borderBottom: 'none', paddingBottom: 4, marginTop: 6 }}>
         <div>
@@ -747,26 +829,16 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
               )}
             </div>
             <div className="mcp-meta" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+              <span className="mcp-switch-label">启用</span>
               <label className="settings-switch" title={m.enabled ? '停用' : '启用'}>
                 <input type="checkbox" checked={m.enabled} onChange={() => onToggle(m)} disabled={pending} />
                 <span></span>
               </label>
-              {/* [V295] 启动自启：本仓扩展（CC 无此字段）。enabled=false 时置灰（不可用却自启是矛盾配置） */}
-              <label
-                className="settings-switch"
-                title={m.enabled
-                  ? (m.autoStart ? '启动自启：开（下次启动自动连接）' : '启动自启：关（仅手动启动）')
-                  : '先启用该服务器才能设置启动自启'}
-              >
-                <input
-                  type="checkbox"
-                  checked={!!m.autoStart && m.enabled}
-                  onChange={() => onToggleAutoStart(m)}
-                  disabled={pending || !m.enabled}
-                />
-                <span></span>
-              </label>
-              <span className="mcp-badge" style={{ alignSelf: 'center', fontSize: 10.5 }}>自启</span>
+              {/* [V295] 启动自启：本仓扩展（CC 无此字段）。开关已移入「编辑服务器」表单卡，行内只留纯文字标记，
+                  避免两个外观相同、无文字的开关并排被看成重复开关 */}
+              {m.enabled && m.autoStart && (
+                <span className="mcp-auto-mark" title="启动时自动连接（在「编辑」里修改）">自启</span>
+              )}
               {isConnected ? (
                 <button className="mcp-text-btn" onClick={() => onStop(m)} disabled={pending}>
                   停止

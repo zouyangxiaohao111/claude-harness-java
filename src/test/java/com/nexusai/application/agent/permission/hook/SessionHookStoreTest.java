@@ -297,15 +297,18 @@ class SessionHookStoreTest {
      * 测试内再硬编码一遍 CC 名列表, 防止将来枚举重排/增删时 Java 顺序与 CC 静默脱钩.
      */
     @Test
-    @DisplayName("HOOK_EVENTS_ORDER 与 CC coreTypes.ts:25-53 硬编码 27 项顺序一致 (防漂移)")
+    @DisplayName("HOOK_EVENTS_ORDER 与 CC v2.1.325 事件数组 E2 硬编码 33 项顺序一致 (防漂移)")
     void hookEventsOrder_matchesCcHardcodedOrder() {
+        // claude.exe v2.1.325 事件数组 E2（off≈309,279,7xx）
         List<String> ccOrder = List.of(
-                "PreToolUse", "PostToolUse", "PostToolUseFailure", "Notification", "UserPromptSubmit",
+                "PreToolUse", "PostToolUse", "PostToolUseFailure", "PostToolBatch",
+                "Notification", "UserPromptSubmit", "UserPromptExpansion",
                 "SessionStart", "SessionEnd", "Stop", "StopFailure", "SubagentStart", "SubagentStop",
-                "PreCompact", "PostCompact", "PermissionRequest", "PermissionDenied", "Setup",
+                "PreCompact", "PostCompact", "PreModelSwitch", "PostModelSwitch",
+                "PermissionRequest", "PermissionDenied", "Setup",
                 "TeammateIdle", "TaskCreated", "TaskCompleted", "Elicitation", "ElicitationResult",
                 "ConfigChange", "WorktreeCreate", "WorktreeRemove", "InstructionsLoaded", "CwdChanged",
-                "FileChanged");
+                "FileChanged", "DirectoryAdded", "MessageDisplay");
 
         assertThat(HookEventType.HOOK_EVENTS_ORDER.stream().map(HookEventType::ccName).toList())
                 .containsExactlyElementsOf(ccOrder);
@@ -316,9 +319,9 @@ class SessionHookStoreTest {
      * 枚举增删时两者同步 (数量 27 + 名称集合一致), 防止白名单与遍历序漂移成两套事实.
      */
     @Test
-    @DisplayName("HOOK_EVENTS_ORDER 与 ccEventNames() 同源: 27 项名称集合一致")
+    @DisplayName("HOOK_EVENTS_ORDER 与 ccEventNames() 同源: 33 项名称集合一致")
     void hookEventsOrder_sameSourceAsCcEventNames() {
-        assertThat(HookEventType.HOOK_EVENTS_ORDER).hasSize(27);
+        assertThat(HookEventType.HOOK_EVENTS_ORDER).hasSize(33);
         assertThat(HookEventType.HOOK_EVENTS_ORDER.stream().map(HookEventType::ccName)
                 .collect(java.util.stream.Collectors.toSet()))
                 .isEqualTo(HookEventType.ccEventNames());

@@ -128,6 +128,8 @@ public class MarketplaceHttpDownloader {
         // 断点续传：固定 .part 路径（同一插件的同一版本目录 ⇒ 同一 URL），失败保留、成功后删除。
         // 旧实现用 createTempFile 随机名且 finally 必删 ⇒ 网络一断就从头再来。
         Path partFile = partFileFor(dir);
+        // 解压临时目录（与目标同卷）：解压成功后才整体替换目标目录；成功/失败都不留。
+        Path stagedDir = null;
         boolean extracted = false;
         try {
             long existing = Files.isRegularFile(partFile) ? Files.size(partFile) : 0L;
@@ -209,7 +211,14 @@ public class MarketplaceHttpDownloader {
                 Files.deleteIfExists(partFile);
                 throw new IOException("插件包不是 zip（无法解压）: " + redact(url));
             }
-            extractZip(partFile, dir);
+            Path parent = dir.getParent() != null ? dir.getParent() : dir;
+            String name = dir.getFileName() != null ? dir.getFileName().toString() : "plugin";
+            stagedDir = Files.createTempDirectory(parent, "." + name + ".extract-");
+            extractZip(partFile, stagedDir);
+            // 整体替换：旧实现直接覆盖解压，目标目录里上一版残留的文件（如 __pycache__/*.pyc）
+            // 会混进新包 ⇒ 本地指纹永远对不上市场指纹（2026-11-16「更新后仍显示可更新」）。
+            replaceDirectory(stagedDir, dir);
+            stagedDir = null; // 已整体移入目标目录
             extracted = true;
             if (log.isInfoEnabled()) {
                 log.info("[MarketplaceHttpDownloader] 插件包已解压 {} → {}", redact(url), dir);
@@ -218,6 +227,8 @@ public class MarketplaceHttpDownloader {
             Thread.currentThread().interrupt();
             throw new IOException("插件包下载被中断: " + redact(url), e);
         } finally {
+            // 临时解压目录：成功（已 move 走）与失败（解压/替换中断）都必须清理，磁盘不留残目录。
+            deleteDirectoryQuietly(stagedDir);
             if (extracted) {
                 try {
                     Files.deleteIfExists(partFile);
@@ -378,6 +389,65 @@ public class MarketplaceHttpDownloader {
                 }
                 zis.closeEntry();
             }
+        }
+    }
+
+    /**
+     * 用已解压好的临时目录整体替换目标目录（是「替换」不是「覆盖合并」）。
+     *
+     * <p>顺序：旧目录 rename 成备份 → 新目录 rename 到目标 → 删备份；新目录移入失败则把备份换回来。
+     * 保证目标目录内容严格等于包内容，上一版残留文件（如 {@code __pycache__/*.pyc}）不会被带进新版本。
+     */
+    private static void replaceDirectory(Path staged, Path target) throws IOException {
+        Path backup = null;
+        if (Files.exists(target)) {
+            String name = target.getFileName() != null ? target.getFileName().toString() : "plugin";
+            backup = target.resolveSibling("." + name + ".old-"
+                + java.util.UUID.randomUUID().toString().substring(0, 8));
+            moveDirectory(target, backup);
+        }
+        try {
+            moveDirectory(staged, target);
+        } catch (IOException e) {
+            if (backup != null && !Files.exists(target)) {
+                try {
+                    moveDirectory(backup, target);
+                    backup = null; // 已回滚
+                } catch (IOException restoreError) {
+                    log.warn("[MarketplaceHttpDownloader] 替换目录失败且回滚失败 target={}: {}",
+                        target, restoreError.getMessage());
+                }
+            }
+            throw e;
+        }
+        // 旧目录备份：成功路径必须删（用户要求临时目录成功/失败都不留）
+        deleteDirectoryQuietly(backup);
+    }
+
+    /** 目录移动（同卷 rename；文件系统不支持 ATOMIC_MOVE 时退回普通 move）。 */
+    private static void moveDirectory(Path src, Path dst) throws IOException {
+        try {
+            Files.move(src, dst, StandardCopyOption.ATOMIC_MOVE);
+        } catch (java.nio.file.AtomicMoveNotSupportedException e) {
+            Files.move(src, dst);
+        }
+    }
+
+    /** 清理临时/备份目录：成功与失败路径都调用；删除失败只记日志，不冒泡。 */
+    private static void deleteDirectoryQuietly(Path dir) {
+        if (dir == null || !Files.exists(dir)) {
+            return;
+        }
+        try (var stream = Files.walk(dir)) {
+            stream.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException e) {
+                    log.warn("[MarketplaceHttpDownloader] 清理目录失败 {}: {}", p, e.getMessage());
+                }
+            });
+        } catch (IOException e) {
+            log.warn("[MarketplaceHttpDownloader] 清理目录失败 {}: {}", dir, e.getMessage());
         }
     }
 

@@ -129,6 +129,28 @@ public class SettingsService {
         }
     }
 
+    /**
+     * [V298] 装配 settings.http_proxy 实时 DB 读源到
+     * {@link com.nexusai.infra.llm.OutboundProxy}（LLM 专用出站代理）。
+     *
+     * <p><b>位置照抄</b>上一方法 {@link #bridgeChannelsEnabledSource}（同为「static 代码要读
+     * DB settings」的既有范式）：安装点在 @PostConstruct，读源是本类自己的
+     * {@link #readDbHttpProxy()}。保存后下一次出站请求即读到新值（OutboundProxy 每请求调
+     * supplier，不缓存）⇒ 改代理不用重启。
+     *
+     * <p>⛔ 只桥给 LLM：WebSearch / WebFetch 走各自的 {@code settings.proxy}，
+     * 本读源不会也不该被 web 侧消费。
+     *
+     * <p>POJO 单测不触发 Spring → 读源不安装 → OutboundProxy 回落环境变量（零行为变化）。
+     */
+    @PostConstruct
+    void bridgeHttpProxySource() {
+        com.nexusai.infra.llm.OutboundProxy.installDbSource(this::readDbHttpProxy);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] httpProxy 实时 DB 读源注入完成（LLM 专用出站代理，保存后下一次请求生效）");
+        }
+    }
+
     public SettingsDto get() {
         SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
         if (s == null) throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
@@ -593,6 +615,74 @@ public class SettingsService {
     }
 
     // ============== helpers ==============
+
+    /**
+     * [V298] {@code http_proxy} 实时读源 —— <b>LLM 专用出站代理</b>（ChatGPT 登录 + 对话）。
+     *
+     * <p>被 {@link com.nexusai.infra.llm.OutboundProxy#endpoint()} 每请求读取（由本类
+     * {@code @PostConstruct} {@link #bridgeHttpProxySource()} 安装）⇒ 前端「记住」后
+     * 下一次出站即生效，不用重启。
+     *
+     * <p>返回值<b>三态</b>（不可折叠，否则「留空 = 直连」会失效）：
+     * <ul>
+     *   <li>{@code null} —— 列 NULL = <b>未配置</b> ⇒ 调用方回落环境变量，再回落直连；</li>
+     *   <li>{@code ""} —— 列空串 = <b>用户显式选择直连</b> ⇒ 调用方<b>不得</b>再回落环境变量
+     *       （否则机器上残留 {@code HTTPS_PROXY} 会让「留空」静默变回代理）；</li>
+     *   <li>非空 —— 该代理地址。</li>
+     * </ul>
+     * 读库异常 → <b>null + warn</b>（不抛）：不让一次 DB 抖动把已经能用的直连/代理链路打死。
+     *
+     * <p>⛔ 只有 LLM 走本方法；WebSearch / WebFetch 的代理是 {@code settings.proxy}（V37），
+     * 两条通道互不影响。
+     */
+    public String readDbHttpProxy() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            if (s == null) {
+                return null;
+            }
+            String v = s.getHttpProxy();
+            return v == null ? null : (v.isBlank() ? "" : v.trim());
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.httpProxy 失败，回落环境变量/直连: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
+    /**
+     * [V298] 写 {@code http_proxy}（LLM 专用出站代理）。
+     *
+     * <p><b>三态落库</b>：{@code null} → NULL（未配置，回落环境变量）；
+     * 空串/空白 → <b>空串</b>（显式直连，压过环境变量）；非空 → trim 后存入。
+     * 必须用 {@code update(entity, false)}，因为 mybatis-flex {@code update(entity)} 默认
+     * NOT_NULL 策略会跳过 null 字段 ⇒ 用户「留空保存」根本清不掉旧代理
+     * （同 {@link #clearModelTier(ModelTierRole)} 的写法与教训）。
+     *
+     * @param proxy 形如 {@code http://127.0.0.1:7897}；null = 未配置；空串 = 直连
+     */
+    public void writeDbHttpProxy(String proxy) {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) {
+            throw new NotFoundException("Settings row not found (id=" + SINGLETON_ID + ")");
+        }
+        String normalized;
+        if (proxy == null) {
+            normalized = null;
+        } else if (proxy.isBlank()) {
+            // 显式直连哨兵：空串 ≠ NULL（NULL 会回落环境变量，空串不会）
+            normalized = "";
+        } else {
+            normalized = proxy.trim();
+        }
+        s.setHttpProxy(normalized);
+        settingsMapper.update(s, false);
+        if (log.isInfoEnabled()) {
+            log.info("[SettingsService] LLM 出站代理已落库: {}",
+                normalized == null ? "NULL（未配置）" : (normalized.isEmpty() ? "空串（显式直连）" : normalized));
+        }
+    }
 
     /**
      * [V258 goal-checkin] 实时读目标 check-in 间隔（分钟）· 供 {@code GoalCheckinScheduler} 消费。

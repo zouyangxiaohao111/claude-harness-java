@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.plugin;
 
+import com.nexusai.common.BundledGit;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -146,6 +147,11 @@ public final class GitProcessRunner {
                     }
                 }
             }
+        }
+        // 系统 PATH 无 git → 随包 MinGit 兜底（BundledGit 仅 Windows 返回非空）
+        String bundled = BundledGit.gitExe().map(Path::toString).orElse(null);
+        if (bundled != null) {
+            return bundled;
         }
         return "git";
     }

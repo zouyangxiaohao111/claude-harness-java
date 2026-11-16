@@ -18,6 +18,20 @@ public class Provider {
     private Boolean enabled;
     private String createdAt;
     private String updatedAt;
+    /** 凭据形态：{@code api_key} | {@code codex_oauth}（V296）。 */
+    private String authMode;
+    /** OAuth access token 密文（CryptoUtil），⛔ 明文不落库、不出 DTO。 */
+    private String oauthAccessEncrypted;
+    /** OAuth refresh token 密文（CryptoUtil）。 */
+    private String oauthRefreshEncrypted;
+    /** access token 过期时刻（epoch 毫秒；null = 无过期信息）。 */
+    private Long oauthExpiresAt;
+    /** OAuth 账号标识（chatgpt account id）。 */
+    private String oauthAccountId;
+    /** 登录流程在途的一次性 state（CSRF）。 */
+    private String oauthState;
+    /** [V299] 归属品牌 key（BuiltinProviderCatalog.BRANDS[].key；null = 自定义连接）。 */
+    private String brandKey;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -41,4 +55,18 @@ public class Provider {
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(String updatedAt) { this.updatedAt = updatedAt; }
+    public String getAuthMode() { return authMode; }
+    public void setAuthMode(String authMode) { this.authMode = authMode; }
+    public String getOauthAccessEncrypted() { return oauthAccessEncrypted; }
+    public void setOauthAccessEncrypted(String oauthAccessEncrypted) { this.oauthAccessEncrypted = oauthAccessEncrypted; }
+    public String getOauthRefreshEncrypted() { return oauthRefreshEncrypted; }
+    public void setOauthRefreshEncrypted(String oauthRefreshEncrypted) { this.oauthRefreshEncrypted = oauthRefreshEncrypted; }
+    public Long getOauthExpiresAt() { return oauthExpiresAt; }
+    public void setOauthExpiresAt(Long oauthExpiresAt) { this.oauthExpiresAt = oauthExpiresAt; }
+    public String getOauthAccountId() { return oauthAccountId; }
+    public void setOauthAccountId(String oauthAccountId) { this.oauthAccountId = oauthAccountId; }
+    public String getOauthState() { return oauthState; }
+    public void setOauthState(String oauthState) { this.oauthState = oauthState; }
+    public String getBrandKey() { return brandKey; }
+    public void setBrandKey(String brandKey) { this.brandKey = brandKey; }
 }

@@ -52,6 +52,20 @@ public class SettingsRecord {
      */
     private Boolean mcpPrefetchOnStartup;
 
+    /**
+     * [V298] LLM 出站 HTTP 代理（V298 建列 {@code http_proxy} TEXT）。
+     *
+     * <p>形如 {@code http://127.0.0.1:7897}（也接受裸 {@code host:port}）；null/空 = 未配置。
+     * 只给 LLM 出站用（ChatGPT 登录 + 对话），消费链 = {@code OutboundProxy.endpoint()}
+     * 的 DB 读源（由 {@code SettingsService} 的 {@code @PostConstruct} 安装）。
+     *
+     * <p>⛔ 与 WebSearch / WebFetch 的 {@code proxy} 列（V37）是<b>两条独立通道</b>：
+     * web 侧只读 {@code settings.proxy}，本列对 web 不可见；改本列不会影响 websearch。
+     *
+     * <p>命名：MyBatis-Flex camelCase→snake 精确映射（httpProxy → http_proxy）。
+     */
+    private String httpProxy;
+
     /** 外部子代理总开关（V259）。 */
     private Boolean subagentExternalEnabled;
 
@@ -511,6 +525,9 @@ public class SettingsRecord {
     // [V295] mcp_prefetch_on_startup ↔ mcpPrefetchOnStartup（null = 未配置 → 回落 yml）
     public Boolean getMcpPrefetchOnStartup() { return mcpPrefetchOnStartup; }
     public void setMcpPrefetchOnStartup(Boolean mcpPrefetchOnStartup) { this.mcpPrefetchOnStartup = mcpPrefetchOnStartup; }
+    // [V298] http_proxy ↔ httpProxy（LLM 专用出站代理；null/空 = 未配置。⛔ 与 web 的 proxy 列无关）
+    public String getHttpProxy() { return httpProxy; }
+    public void setHttpProxy(String httpProxy) { this.httpProxy = httpProxy; }
     public String getSubagentDefaultRuntime() { return subagentDefaultRuntime; }
     public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
     public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }

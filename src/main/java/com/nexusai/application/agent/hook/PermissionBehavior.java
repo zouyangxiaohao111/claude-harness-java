@@ -22,5 +22,18 @@ public enum PermissionBehavior {
     ALLOW,
     DENY,
     ASK,
-    PASSTHROUGH
+    PASSTHROUGH,
+    /**
+     * [Wave1-B] CC v2.1.325 {@code PreToolUse.permissionDecision} 第四值 {@code 'defer'}
+     * （exe 文案 off≈172,143,7xx "Valid types are: allow, deny, ask, defer"）。
+     *
+     * <p><b>CC 语义（off≈166,345,674 / 318,019,570 / 323,789,763）</b>:
+     * print 模式下"先不拍板"—把这次调用挂起，等恢复后再执行；仅<b>单条</b>调用生效
+     * （批量忽略，siblings 会成孤儿）；交互模式忽略（defer is print-mode only）；
+     * 云端 served call 直接拒绝（无 resume 机制）。
+     *
+     * <p>本枚举值只承载"hook 要求挂起"这一决议，执行侧是否具备挂起通道由消费方判定
+     * （与 CC 的 print-only / solo-only 限制同构）。
+     */
+    DEFER
 }

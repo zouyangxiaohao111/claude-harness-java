@@ -492,9 +492,10 @@ public class CommandRegistrationConfig28 {
                 log.warn("[CommandRegistrationConfig28] /hooks 未注入 HookRegistry（web 端 hook 配置走 REST）");
                 return;
             }
-            log.info("[CommandRegistrationConfig28] /hooks 执行完成: genericHooks={} pluginHookNames={} pluginConfigs={}（对齐 CC hooks.tsx HooksConfigMenu）",
-                hookRegistry.genericHookCount(), hookRegistry.pluginHookNames().size(),
-                hookRegistry.getRegisteredPluginHookConfigs().size());
+            int pluginConfigs = hookRegistry.getRegisteredPluginHookConfigs().size();
+            log.info("[CommandRegistrationConfig28] /hooks 执行完成: genericHooks={} pluginConfigs={}（对齐 CC hooks.tsx HooksConfigMenu；"
+                    + "插件 hook 现走统一 registered 链，pluginHookNames 恒空）",
+                hookRegistry.genericHookCount(), pluginConfigs);
         });
         log.info("[CommandRegistrationConfig28] /hooks 已注册为生产 slash command（对齐 CC commands/hooks/index.ts + hooks.tsx call）");
     }

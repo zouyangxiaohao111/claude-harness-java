@@ -2,9 +2,15 @@ package com.nexusai.application.agent;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.stereotype.Component;
 
 import com.nexusai.application.agent.agent.CwdResolution;
+import com.nexusai.application.agent.permission.hook.GenericHook;
+import com.nexusai.application.agent.permission.hook.HookEvent;
+import com.nexusai.application.agent.permission.hook.HookEventType;
+import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.tool.SessionStorage;
 
 import java.util.Map;
@@ -53,6 +59,21 @@ public class UserInputDispatcher {
      */
     private final Map<String, Function<SlashCommandContext, LocalCommandResult>> slashCommandResultHandlers =
         new ConcurrentHashMap<>();
+
+    /**
+     * [Wave2-G] Hook 注册表 · {@code UserPromptExpansion} 事件展开前闸门（可选注入）。
+     *
+     * <p><b>WHY</b>: claude.exe v2.1.325 的 {@code UserPromptExpansion} 在斜杠命令 / MCP prompt
+     * <b>展开前</b>触发，hook 可用 {@code decision:'block'} / {@code permissionDecision:'deny'}
+     * 拦下展开（{@code suppressOriginalPrompt} 决定拦截文案是否回显原 prompt）。本类是所有
+     * 命名 slash command 的唯一分派点（{@link #dispatch} / {@link #dispatchResult}），故闸门放这里。
+     *
+     * <p><b>{@code @Lazy}</b>: 避免容器装配期的循环依赖（HookRegistry 侧不依赖本类，但本类在
+     * 命令注册链上被广泛注入）；null = 未注入（单测/无 hook 场景）→ 闸门恒放行。
+     */
+    @Lazy
+    @Autowired(required = false)
+    private HookRegistry hookRegistry;
 
     /** {@code (args, sessionId, inFlightUserMessageId) → void} · JDK 无三参 Consumer，本地声明。
      *
@@ -336,6 +357,73 @@ public class UserInputDispatcher {
     }
 
     /**
+     * [Wave2-G] UserPromptExpansion 闸门 · 对齐 claude.exe v2.1.325（输入 schema off≈311,040,xxx
+     * {@code x2}：{@code expansion_type, command_name, command_args, command_source?, prompt}）。
+     *
+     * <p><b>时机</b>: 命名 slash command <b>展开前</b>（本类在确认 handler 存在之后、执行 handler
+     * 之前调用）—— 与 CC「展开前可拦」一致：未注册的命令不会触发本事件。
+     *
+     * <p><b>输入真实性</b>: {@code expansion_type=slash_command}；{@code command_name}/{@code
+     * command_args} 取分派点已解析出的 name/args；{@code prompt} 取完整原始输入。本仓无 MCP prompt
+     * 通道（无 {@code mcp_prompt} 展开入口）⇒ 该取值恒定 {@code slash_command}，不编造。
+     *
+     * <p><b>拦截语义</b>: {@code preventContinuation}（{@code continue:false}）或 hook 权限决策
+     * {@code DENY} → 返回拦截文案（调用方不执行命令）；{@code suppressOriginalPrompt=true} 时文案
+     * 不回显原 prompt/参数（隐私，CC 原文 "When decision is block, omit the original prompt from
+     * the block message"）。
+     *
+     * @param name      命令名（不含前导 '/'）
+     * @param args      命令参数（已 trim，可为空串）
+     * @param input     完整原始 slash 输入（{@code /name args}）
+     * @param sessionId 会话 ID（可为 null）
+     * @return null = 放行；非 null = 拦截文案（调用方不得执行该命令）
+     */
+    private String expansionBlockMessage(String name, String args, String input, String sessionId) {
+        HookRegistry registry = this.hookRegistry;
+        if (registry == null || name == null) {
+            return null;
+        }
+        try {
+            // 廉价门：配置里没有该事件 → 零开销短路（不序列化 prompt）
+            if (!registry.hasHookForEvent(HookEventType.USER_PROMPT_EXPANSION.ccName(), sessionId)) {
+                return null;
+            }
+            HookEvent event = HookEvent.userPromptExpansion(
+                "slash_command", name, args, null, input, sessionId, null);
+            GenericHook.HookResult r = registry.executeEvent(event, null);
+            if (r == null) {
+                return null;
+            }
+            boolean denied = r.permissionBehavior() == com.nexusai.application.agent.hook.PermissionBehavior.DENY;
+            if (!r.preventContinuation() && !denied) {
+                if (r.blockingError() != null) {
+                    // noinspection unused
+                    log.debug("UserPromptExpansion hook 返回 blockingError 但未置 preventContinuation/deny"
+                        + "（不拦截展开）: {}", r.blockingError().blockingError());
+                }
+                return null;
+            }
+            String reason = r.hookPermissionDecisionReason();
+            if (reason == null || reason.isBlank()) {
+                reason = r.blockingError() != null ? r.blockingError().blockingError() : r.stopReason();
+            }
+            boolean suppress = Boolean.TRUE.equals(r.suppressOriginalPrompt());
+            String subject = suppress
+                ? "slash command"
+                : "slash command \"/" + name + (args == null || args.isBlank() ? "" : " " + args) + "\"";
+            String msg = subject + " was blocked by a UserPromptExpansion hook"
+                + (reason != null && !reason.isBlank() ? ": " + reason : "");
+            log.info("HOOK UserPromptExpansion 拦截展开: name={} suppressOriginalPrompt={} session={}",
+                name, suppress, sessionId);
+            return msg;
+        } catch (Exception e) {
+            // hook 异常不得阻断用户命令（对齐 CC best-effort）
+            log.warn("HOOK UserPromptExpansion 执行失败（放行）: {}", e.toString());
+            return null;
+        }
+    }
+
+    /**
      * 构造执行上下文 · 供两个分派点复用。
      *
      * <p><b>本方法不触发任何会话解析</b>（两个 resolver 只作为方法引用传入，惰性约束见
@@ -374,6 +462,11 @@ public class UserInputDispatcher {
         String args = space == -1 ? "" : rest.substring(space + 1).trim();
         Function<SlashCommandContext, LocalCommandResult> rh = slashCommandResultHandlers.get(name);
         if (rh != null) {
+            // [Wave2-G] 展开前闸门：hook 拦截 → 不执行命令，直接回拦截文案
+            String blocked = expansionBlockMessage(name, args, input, sessionId);
+            if (blocked != null) {
+                return LocalCommandResult.text(blocked);
+            }
             LocalCommandResult result = rh.apply(newSlashCommandContext(args, sessionId, inFlightUserMessageId));
             if (log.isDebugEnabled()) {
                 log.debug("分发命名 slash command result: session={} inFlightUserMessage={} name={} args={} kind={}",
@@ -383,6 +476,11 @@ public class UserInputDispatcher {
         }
         Consumer<SlashCommandContext> cmd = slashCommandHandlers.get(name);
         if (cmd != null) {
+            // [Wave2-G] 展开前闸门：hook 拦截 → 不执行命令，回拦截文案
+            String blocked = expansionBlockMessage(name, args, input, sessionId);
+            if (blocked != null) {
+                return LocalCommandResult.text(blocked);
+            }
             if (log.isDebugEnabled()) {
                 log.debug("分发命名 slash command（void 回落，结果不可得 → skip）: session={} inFlightUserMessage={} name={} args={}",
                     sessionId, inFlightUserMessageId, name, args);
@@ -412,6 +510,12 @@ public class UserInputDispatcher {
             String args = space == -1 ? "" : rest.substring(space + 1).trim();
             Consumer<SlashCommandContext> cmd = slashCommandHandlers.get(name);
             if (cmd != null) {
+                // [Wave2-G] 展开前闸门：hook 拦截 → 不执行命令（payload 携带拦截文案，
+                //   调用方按 SLASH_COMMAND 处理时不进入 LLM 展开）
+                String blocked = expansionBlockMessage(name, args, input, sessionId);
+                if (blocked != null) {
+                    return new RoutingResult(InputKind.SLASH_COMMAND, name, blocked);
+                }
                 if (log.isDebugEnabled()) {
                     log.debug("分发命名 slash command: session={} inFlightUserMessage={} name={} args={}",
                         sessionId, inFlightUserMessageId, name, args);

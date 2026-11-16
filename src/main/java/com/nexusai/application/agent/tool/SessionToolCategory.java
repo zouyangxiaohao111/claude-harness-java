@@ -1,5 +1,6 @@
 package com.nexusai.application.agent.tool;
 
+import com.nexusai.application.agent.mcp.McpStringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -10,7 +11,7 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 会话工具分类 · 前端工具管理 UI 的 4 类分组（[tool-categories]）。
+ * 会话工具分类 · 前端工具管理 UI 的 5 类分组（[tool-categories]）。
  *
  * <h2>为什么单独一个类</h2>
  * <p>分类归属必须<b>只判一次</b>：前端面板按 category 分组渲染，默认禁用集按 category 取值。
@@ -23,6 +24,8 @@ import java.util.Set;
  *       工具，server 名见 {@code ComputerUseMcpServer.SERVER_NAME = "computer-use"}</li>
  *   <li>{@code mcp__nexusai-in-chrome__*} → {@link #BR} —— 浏览器扩展 MCP 工具
  *       （前缀见 {@code BrowserToolRegistry.TOOL_PREFIX}）</li>
+ *   <li>其余 {@code mcp__*} → {@link #MCP} —— 第三方 MCP server 的工具（如 rea）。
+ *       ⚠️ 必须在 CU / BR 之后判，二者是专属前缀</li>
  *   <li>实现类在 {@code com.nexusai.kb.} 包下 → {@link #KB} —— 知识库专属工具
  *       （{@code kb/agent/tool/} 下 15 个，均标 {@code @ExclusiveTool}）</li>
  *   <li>其余 → {@link #SYS}</li>
@@ -32,9 +35,14 @@ import java.util.Set;
  * {@code wiki_read_page} ...），与系统工具的 PascalCase 无统一前缀可分；而它们的实现类
  * 同处 {@code com.nexusai.kb} 包，按包名判定是稳定的（改名不影响）。
  *
+ * <p><b>[tool-categories] MCP 三级联动（2026-11-16）</b>：MCP 工具名形如
+ * {@code mcp__<server>__<tool>}，一个 server 下可有上百个工具（rea 有 255 个）。故前端面板提供
+ * 三级开关：①{@link #MCP} 整类 ②单个 server（{@link #mcpServerOf(String)}） ③单个工具。
+ *
  * <h2>默认禁用（[tool-categories] 用户 2026-11-12 裁定）</h2>
  * <p>只有 {@link #CU} 与 {@link #KB} 两类默认禁用；{@link #BR} <b>不</b>默认禁用
- * （未装扩展时该组天然 0 项，装上后立即生效，无需用户再手动开）。
+ * （未装扩展时该组天然 0 项，装上后立即生效，无需用户再手动开）；
+ * {@link #MCP} 也<b>不</b>默认禁用（第三方能力由用户在会话内按需关闭）。
  *
  * <p><b>静态桥接</b>：{@link #defaultDisabledNamesStatic()} 为静态 —— 消费方
  * {@code SessionToolDisableConfig.getDisabledTools} 在 {@code LlmAgentLoop} 的 static
@@ -55,13 +63,17 @@ public class SessionToolCategory {
     /** 知识库 · 工具实现类所在包前缀。 */
     public static final String KB_PACKAGE_PREFIX = "com.nexusai.kb.";
 
+    /** 第三方 MCP 工具 · 工具名前缀（{@code mcp__<server>__<tool>}，见 {@code McpStringUtils.MCP_PREFIX}）。 */
+    public static final String MCP_PREFIX = "mcp__";
+
     public static final String CU = "CU";
     public static final String KB = "KB";
     public static final String BR = "BR";
+    public static final String MCP = "MCP";
     public static final String SYS = "SYS";
 
     /** 合法分类集合（请求体校验用）。 */
-    public static final Set<String> ALL = Set.of(CU, KB, BR, SYS);
+    public static final Set<String> ALL = Set.of(CU, KB, BR, MCP, SYS);
 
     /** 工具注册表静态桥接（null = 未注入，POJO 单测/无 Spring）。 */
     private static volatile ToolRegistry toolRegistry;
@@ -89,7 +101,7 @@ public class SessionToolCategory {
      * 判定单个工具的分类。
      *
      * @param tool 工具（null → {@link #SYS}，防御性）
-     * @return {@link #CU} / {@link #KB} / {@link #BR} / {@link #SYS}
+     * @return {@link #CU} / {@link #KB} / {@link #BR} / {@link #MCP} / {@link #SYS}
      */
     public static String of(Tool tool) {
         if (tool == null) {
@@ -97,17 +109,43 @@ public class SessionToolCategory {
         }
         String name = tool.name();
         if (name != null) {
+            // ⚠️ 顺序不可换：CU / BR 是各自 server 的专属前缀，必须先判；
+            //    否则 mcp__computer-use__* / mcp__nexusai-in-chrome__* 会被下面的 MCP 兜底吃掉。
             if (name.startsWith(CU_PREFIX)) {
                 return CU;
             }
             if (name.startsWith(BR_PREFIX)) {
                 return BR;
             }
+            if (name.startsWith(MCP_PREFIX)) {
+                return MCP;
+            }
         }
         if (tool.getClass().getName().startsWith(KB_PACKAGE_PREFIX)) {
             return KB;
         }
         return SYS;
+    }
+
+    /**
+     * 从 {@code mcp__<server>__<tool>} 取 server 名；非 MCP 形态 → {@code null}。
+     *
+     * <p>解析口径与全仓唯一实现 {@link com.nexusai.application.agent.mcp.McpStringUtils#mcpInfoFromString}
+     * 完全一致（server = 前缀后的第一段）：本仓工具名由
+     * {@code McpStringUtils.buildMcpToolName} 生成（server 段与 tool 段都经
+     * {@code normalizeNameForMCP} 规范化），沿用同一函数才能与 MCP 服务端的
+     * {@code getMcpPrefix(server)} 剥离逻辑对齐。
+     *
+     * <p>⚠️ 不能用「最后一个 {@code __}」来切：工具名段本身可能含 {@code __}
+     * （原始名里连续两个非 {@code [a-zA-Z0-9_-]} 字符会被规范化成 {@code __}），
+     * 那样会把 tool 段的一部分误当 server，分组凭空多出一个假 server。
+     *
+     * @param toolName 工具全名（如 {@code mcp__rea__inspect_plist}）
+     * @return server 名（如 {@code rea}）；非 MCP / 解析不出 → null
+     */
+    public static String mcpServerOf(String toolName) {
+        McpStringUtils.McpInfo info = McpStringUtils.mcpInfoFromString(toolName);
+        return info == null ? null : info.serverName();
     }
 
     /**

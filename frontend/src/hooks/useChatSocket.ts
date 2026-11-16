@@ -1113,6 +1113,15 @@ export function useChatSocket(
       return
     }
     switch (evt.subtype) {
+      // asyncRewake exit 2 的用户侧摘要（对齐 CC rewakeSummary）→ 非阻塞 toast；
+      //   模型侧 system-reminder 仍由后端 NotificationQueue 独立投递。
+      case 'async_wake_summary': {
+        const summary = typeof evt.summary === 'string' && evt.summary
+          ? evt.summary
+          : 'Stop hook feedback'
+        if (showToast) showToast(`Hook：${summary}`, 'info')
+        break
+      }
       case 'task_started': {
         const taskId = evt.task_id ?? evt.uuid ?? null
         const detail = evt.description ?? evt.task_type

@@ -21,7 +21,9 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
  * </ul>
  *
  * <p><b>不包含 function hook</b> — CC 注释 (hooks.ts:174) 明确 "excludes function hooks -
- * they can't be persisted". 本 sealed interface 仅覆盖 4 个可持久化类型.
+ * they can't be persisted". 本 sealed interface 覆盖 5 个可持久化类型（v2.1.325 起含
+ * {@code mcp_tool}；{@code script} 形式在 CC settings schema 中不存在，只有 hook-pins /
+ * 内部注册，故不复刻）。
  *
  * <p><b>UI 集成预留</b>: 前端 hook 配置面板按 {@code type} 渲染不同表单, 提交后 Jackson
  * 反序列化为对应子类 record.
@@ -33,11 +35,12 @@ import com.fasterxml.jackson.annotation.JsonTypeInfo;
     @JsonSubTypes.Type(name = "prompt", value = PromptHook.class),
     @JsonSubTypes.Type(name = "http", value = HttpHook.class),
     @JsonSubTypes.Type(name = "agent", value = AgentHook.class),
+    @JsonSubTypes.Type(name = "mcp_tool", value = McpToolHook.class),
 })
-public sealed interface HookCommand permits CommandHook, PromptHook, HttpHook, AgentHook {
+public sealed interface HookCommand permits CommandHook, PromptHook, HttpHook, AgentHook, McpToolHook {
 
-    /** CC discriminatedUnion 的 4 个 type 字面量 · 对齐 schemas/hooks.ts:176-189. */
-    enum HookType { COMMAND, PROMPT, HTTP, AGENT }
+    /** CC discriminatedUnion 的 5 个 type 字面量（v2.1.325 {@code pg()}：command/prompt/agent/http/mcp_tool）. */
+    enum HookType { COMMAND, PROMPT, HTTP, AGENT, MCP_TOOL }
 
     /** 返回本 hook 的类型标识 (用于 isHookEqual/getHookDisplayText 分支, 不参与 Jackson 序列化). */
     HookType hookType();
@@ -49,7 +52,7 @@ public sealed interface HookCommand permits CommandHook, PromptHook, HttpHook, A
      * 无需在 4 子类逐个补 {@code type()} 实现. {@code statusMessage()}/{@code once()}
      * 由 4 子类 record accessor 天然满足, 无需实现.
      *
-     * @return CC type 字面量 (command/prompt/http/agent)
+     * @return CC type 字面量 (command/prompt/http/agent/mcp_tool)
      */
     default String type() {
         return switch (hookType()) {
@@ -57,6 +60,7 @@ public sealed interface HookCommand permits CommandHook, PromptHook, HttpHook, A
             case PROMPT -> "prompt";
             case HTTP -> "http";
             case AGENT -> "agent";
+            case MCP_TOOL -> "mcp_tool";
         };
     }
 

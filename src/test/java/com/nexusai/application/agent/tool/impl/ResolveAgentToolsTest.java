@@ -177,4 +177,56 @@ class ResolveAgentToolsTest {
             .as("tools=['Bash','*'] → by-name 精确解析: 仅 Bash, Read 不得全量漏入")
             .containsExactly(ToolNameConstants.BASH_TOOL_NAME);
     }
+
+    @com.nexusai.application.agent.tool.ExclusiveTool
+    static class FakeExclusiveTool implements Tool {
+        private final String name;
+        FakeExclusiveTool(String name) { this.name = name; }
+        @Override public String name() { return name; }
+        @Override public String description() { return "exclusive"; }
+        @Override public com.fasterxml.jackson.databind.JsonNode inputSchema() {
+            return com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+        }
+        @Override public com.nexusai.application.agent.tool.AgentToolResult<?> execute(
+                com.nexusai.application.agent.tool.ToolUseBlock call) {
+            return null;
+        }
+    }
+
+    @Test
+    @DisplayName("CC 2.1.325 对齐: 子代理通配 = 默认池, 剔除 @ExclusiveTool")
+    void resolveAgentTools_wildcard_excludesExclusiveTools() {
+        // WHY: CC worker 池 = assembleToolPool(permissionContext, mcp, {skipReplFilter:true})，
+        //   即「全新会话按权限上下文装配的默认池」，不是全量注册表；主线程 agent 只在 REPL 侧
+        //   resolveAgentTools(..., isMainThread=true) 收窄。本仓默认池口径 = 剔除 @ExclusiveTool
+        //   （W10 知识库工具默认不激活）⇒ 通配子代理也只拿 COMMON。
+        ToolRegistry registry = new ToolRegistry();
+        registry.register(tool(ToolNameConstants.BASH_TOOL_NAME));
+        registry.register(new FakeExclusiveTool("search_knowledge"));
+
+        List<Tool> resolved = executorWith(registry).resolveAgentTools(builtInWildcardAgent());
+
+        assertThat(resolved).extracting(Tool::name)
+            .as("通配 = 默认池：保留 Bash，剔除 @ExclusiveTool")
+            .containsExactly(ToolNameConstants.BASH_TOOL_NAME)
+            .doesNotContain("search_knowledge");
+    }
+
+    @Test
+    @DisplayName("点名 @ExclusiveTool 仍然可见（by-name 分支不受默认池限制）")
+    void resolveAgentTools_byName_includesExclusiveTool() {
+        ToolRegistry registry = new ToolRegistry();
+        registry.register(tool(ToolNameConstants.BASH_TOOL_NAME));
+        registry.register(new FakeExclusiveTool("search_knowledge"));
+        AgentDefinition def = AgentDefinition.BuiltInAgentDefinition.builder(
+                "test-agent", "when to use", (ctx, dirs) -> "system prompt")
+            .tools(List.of("search_knowledge"))
+            .build();
+
+        List<Tool> resolved = executorWith(registry).resolveAgentTools(def);
+
+        assertThat(resolved).extracting(Tool::name)
+            .as("显式点名专属工具必须生效（W10 的「在 MD 中指定就行」）")
+            .containsExactly("search_knowledge");
+    }
 }

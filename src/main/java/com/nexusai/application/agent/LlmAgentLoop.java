@@ -1653,6 +1653,38 @@ public class LlmAgentLoop implements AgentLoop {
     public void setMessageService(MessageService messageService) {
         this.messageService = messageService;
     }
+
+    /**
+     * [Hook v2.1.325] 会话标题来源（{@code SessionStart/UserPromptSubmit.session_title}）。
+     * 非 Spring/单测 → null（标题字段省略，不编造）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.domain.session.SessionService sessionService;
+
+    public void setSessionService(com.nexusai.domain.session.SessionService sessionService) {
+        this.sessionService = sessionService;
+    }
+
+    /** [Hook v2.1.325] Stop/SubagentStop {@code session_crons} 数据源（可空）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.domain.schedule.ScheduleService scheduleService;
+
+    /** 取会话标题；无来源/异常 → null。 */
+    private String sessionTitleOf(String sessionId) {
+        if (sessionService == null || sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            var dto = sessionService.getById(sessionId);
+            return dto != null && dto.title() != null && !dto.title().isBlank()
+                ? dto.title() : null;
+        } catch (RuntimeException e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[Hook] 读取会话标题失败, session_title 省略: {}", e.toString());
+            }
+            return null;
+        }
+    }
     /** R22: 模型与 Provider metadata 查询，手动构造 loop 时为空并回退 200K。 */
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ModelMapper modelMapper;
@@ -3219,6 +3251,12 @@ public class LlmAgentLoop implements AgentLoop {
         // ⛔ 交付物目录扫描（Bash/cp/脚本产物）**保留** —— 工具 hook 看不见它们。
         registerArtifactCollectionHooks();
 
+        // ── [Wave3-E] Ultrareview post-commit 提示 hook 生产接线 ──
+        // 对齐 CC v2.1.325 registerUltrareviewPostCommitHook（off≈352,170,157）：
+        // PostToolUse（Bash/PowerShell）检测到 git commit 后提示 /ultrareview，
+        // **只提示、不执行审查**（CC 无 Review 类事件）。
+        registerUltrareviewPostCommitHook();
+
         // ── §14: SessionStart hooks — 会话开始（对齐 CC sessionHooks.ts）──
         // [2026-08-12 △-03] initialUserMessage/watchPaths 消费 · 对齐 CC processSessionStartHooks
         //   (sessionStart.ts:150-161): initialUserMessage → pendingInitialUserMessage（首轮
@@ -3259,12 +3297,18 @@ public class LlmAgentLoop implements AgentLoop {
                 //   - resume：续聊既有会话（会话已有历史；CC REPL.tsx:1782 processSessionStartHooks('resume')）
                 //   - clear：前端 /clear 命令（CC conversation.ts:245，经 CommandController /clear 分支发射）
                 //   - compact：压缩后（CC compact.ts:592/981，经 CompactHooks.processSessionStartHooks 发射）
+                SessionStartMetrics startMetrics = resolveSessionStartMetrics(agentId);
                 HookEvent startEvent = HookEvent.sessionStart(
                     sessionId,
                     agentId != null ? agentId.toString() : null,
-                    resolveSessionStartSource(agentId),  // source: startup/resume/clear/compact
+                    startMetrics.source(),  // source: startup/resume
                     null,       // agentType
-                    modelName   // model
+                    modelName,  // model
+                    sessionTitleOf(sessionId),
+                    startMetrics.secondsSinceLastResponse(),
+                    startMetrics.contextTokens(),
+                    startMetrics.promptCacheLikelyExpired(),
+                    startMetrics.estimatedCacheWriteUsd()
                 );
                 GenericHook.HookResult startResult = hookRegistry.executeEvent(startEvent);
                 // [H3 v4 Gap①] 注入 executeEvent message attachment → LLM 可见通道
@@ -3441,7 +3485,10 @@ public class LlmAgentLoop implements AgentLoop {
                 HookEvent promptEvent = HookEvent.userPromptSubmit(
                     sessionId,
                     agentId != null ? agentId.toString() : null,
-                    userPrompt
+                    userPrompt,
+                    // [Wave3-input] CC v2.1.325 source + [Hook v2.1.325] session_title 真实来源
+                    hookPromptSource(params.querySource()),
+                    sessionTitleOf(sessionId)
                 );
                 // [H-WF4-03 · 5-W4-5] UserPromptSubmit abort 透传 · CC executeUserPromptSubmitHooks
                 //   把 toolUseContext.abortController.signal 传 executeHooks（hooks.ts:3850）→ 入口
@@ -4192,7 +4239,7 @@ public class LlmAgentLoop implements AgentLoop {
                 sandboxManager, coordinatorPermissionHandler,
                 swarmWorkerPermissionHandler, interactivePermissionHandler,
                 // [U6-A1] fallback 路径无 bashClassifierFeature 实例字段 → null = feature 恒 false（投机竞速恒跳过）
-                null),
+                null, scheduleService),
             new AgentLoopContext.TokenBudgetBeans(tokenEstimator, modelMapper, providerMapper),
             new AgentLoopContext.EventBridge(eventPublisher, traceRecorder, overrideEventPublisher),
             permissionContextBuilder,
@@ -5818,6 +5865,204 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [Wave2-G] 模型切换来源判定 · 对齐 claude.exe v2.1.325 的 {@code source} 枚举语义
+     * （PreModelSwitch: command|picker|sdk；PostModelSwitch: command|picker|sdk|auto|resume）。
+     *
+     * <p><b>判据来自代码路径，不是猜测</b>：{@link #resolveTurnEffectiveModel} 的两条来源 ——
+     * <ul>
+     *   <li>{@code deps.resolveModel()} 非空且等于本 turn 有效模型 ⇒ 模型来自会话配置/命令解析，
+     *       记为 {@code command}（本仓无 picker/sdk 独立入口）；</li>
+     *   <li>否则有效模型来自 {@code recoveryState}（fallback 切换后模型）⇒ 记为 {@code auto}
+     *       （对齐 CC "auto: automatic fallback or other programmatic change"）。</li>
+     * </ul>
+     * 本仓没有 resume 期切换的独立触发点（resume 走初始解析，不构成切换），故不产生 {@code resume}。
+     *
+     * @param params         loop 参数载体（deps.resolveModel 来源）
+     * @param effectiveModel 本 turn 有效模型
+     * @return {@code "command"} 或 {@code "auto"}
+     */
+    /**
+     * [Hook v2.1.325] 模型切换 {@code context_tokens} · 本 run 已累计的
+     * input + output + cache_read + cache_creation（CC 口径是"下次请求要重发的 token"，
+     * 本仓无逐响应快照，用 run 累计作 best-effort；全 0 → null）。
+     */
+    private static Long modelSwitchContextTokens(AgentState state) {
+        if (state == null) {
+            return null;
+        }
+        com.nexusai.application.agent.tool.AgentUsage u = state.runUsage();
+        if (u == null) {
+            return null;
+        }
+        long total = u.inputTokens() + u.outputTokens()
+            + (u.cacheReadInputTokens() != null ? u.cacheReadInputTokens() : 0L)
+            + (u.cacheCreationInputTokens() != null ? u.cacheCreationInputTokens() : 0L);
+        return total > 0 ? total : null;
+    }
+
+    private static String modelSwitchSource(com.nexusai.application.agent.loop.QueryParams params,
+                                            String effectiveModel) {
+        String resolvedForCall = params != null && params.deps() != null
+            ? params.deps().resolveModel() : null;
+        boolean fromConfig = resolvedForCall != null && !resolvedForCall.isBlank()
+            && resolvedForCall.equals(effectiveModel);
+        return fromConfig ? "command" : "auto";
+    }
+
+    /**
+     * [Wave2-G] PreModelSwitch hook · 对齐 claude.exe v2.1.325（输入 schema {@code H2} +
+     * {@code lC(["command","picker","sdk"])}；输出 {@code permissionDecision} allow/deny/ask）。
+     *
+     * <p><b>触发条件</b>：上一轮有效模型非空、且与本轮新解析值不同（= 真正的切换）；首轮不触发。
+     * CC 的 PreModelSwitch <b>不含 auto 源</b>（auto/resume 只在 PostModelSwitch）⇒ 自动 fallback
+     * 不触发本事件，避免 hook 误阻恢复路径。
+     *
+     * <p><b>输出语义</b>：
+     * <ul>
+     *   <li>{@code deny} → 取消本次切换（返回上一轮模型）；</li>
+     *   <li>{@code ask} → CC 交互模式询问用户、headless 直接拒；本仓该路径<b>无交互确认通道</b>
+     *       ⇒ 按 headless 语义拒绝切换并 warn 披露（不假实现确认 UI）；</li>
+     *   <li>{@code allow} / 无决策 → 按新模型切换。</li>
+     * </ul>
+     *
+     * <p><b>⛔ 字段真实性</b>：{@code context_tokens} / {@code prompt_cache_warm} / {@code cache_ttl} /
+     * {@code estimated_cache_write_usd} / {@code pricing} 本仓无可靠来源 → 传 null（不编造）；
+     * {@code requested_model} 用 {@code params.modelName()}（会话配置请求值，可为 null）。
+     *
+     * @param state      会话状态（sessionId 来源，可 null）
+     * @param registry   HookRegistry（null = 未注入 → 直接放行）
+     * @param params     loop 参数载体
+     * @param tuc        本轮 ToolUseContext（agent hook 继承父权限规则用）
+     * @param fromModel  上一轮有效模型（null = 首轮，不触发）
+     * @param toModel    本轮解析出的模型
+     * @return 最终采用的模型（deny/ask 拒绝时 = fromModel）
+     */
+    private static String applyPreModelSwitchHook(AgentState state,
+                                                  com.nexusai.application.agent.permission.hook.HookRegistry registry,
+                                                  com.nexusai.application.agent.loop.QueryParams params,
+                                                  com.nexusai.application.agent.tool.ToolUseContext tuc,
+                                                  String fromModel, String toModel) {
+        if (registry == null || fromModel == null || fromModel.equals(toModel)) {
+            return toModel;
+        }
+        String source = modelSwitchSource(params, toModel);
+        if ("auto".equals(source)) {
+            // CC PreModelSwitch 源不含 auto ⇒ 自动 fallback 不触发（PostModelSwitch 覆盖）
+            return toModel;
+        }
+        try {
+            String sessionId = state != null ? state.sessionId() : null;
+            if (!registry.hasHookForEvent(
+                    com.nexusai.application.agent.permission.hook.HookEventType.PRE_MODEL_SWITCH.ccName(),
+                    sessionId)) {
+                return toModel;
+            }
+            String requestedModel = params != null ? params.modelName() : null;
+            Long contextTokens = modelSwitchContextTokens(state);
+            Double estimatedCacheWriteUsd = contextTokens != null
+                ? com.nexusai.application.agent.cost.DeepSeekPricing
+                    .estimateCacheWriteUsd(contextTokens)
+                : null;
+            com.nexusai.application.agent.permission.hook.HookEvent event =
+                com.nexusai.application.agent.permission.hook.HookEvent.preModelSwitch(
+                    fromModel, toModel, requestedModel, source,
+                    contextTokens, null, null, estimatedCacheWriteUsd, "configured", sessionId);
+            com.nexusai.application.agent.permission.hook.GenericHook.HookResult r =
+                registry.executeEvent(event, null, tuc);
+            if (r == null) {
+                return toModel;
+            }
+            com.nexusai.application.agent.hook.PermissionBehavior behavior = r.permissionBehavior();
+            boolean deny = behavior == com.nexusai.application.agent.hook.PermissionBehavior.DENY;
+            boolean ask = behavior == com.nexusai.application.agent.hook.PermissionBehavior.ASK;
+            if (deny || ask) {
+                String reason = r.hookPermissionDecisionReason() != null
+                    ? r.hookPermissionDecisionReason()
+                    : (r.blockingError() != null ? r.blockingError().blockingError() : r.stopReason());
+                log.warn("HOOK PreModelSwitch {} 切换: {} → {} source={} reason={}"
+                        + (ask ? "（ask 在本路径无交互确认通道，按 headless 拒绝处理）" : ""),
+                    deny ? "deny 取消" : "ask 拒绝", fromModel, toModel, source, reason);
+                return fromModel;
+            }
+        } catch (Exception e) {
+            // hook 异常不得阻断模型切换（对齐 CC best-effort）
+            log.warn("HOOK PreModelSwitch 执行失败（放行切换）: {}", e.toString());
+        }
+        return toModel;
+    }
+
+    /**
+     * [Wave2-G] PostModelSwitch hook · 对齐 claude.exe v2.1.325（输入 {@code G2} +
+     * {@code lC(["command","picker","sdk","auto","resume"])}；输出 {@code additionalContext}）。
+     *
+     * <p>切换<b>已生效</b>（{@code state.setCurrentModel} 之后）触发；{@code additionalContext}
+     * 注入一条内存消息（{@link AgentState#appendSilently}，isMeta + {@code <system-reminder>}），
+     * 使新模型的下一次请求可见，且不落 transcript（对齐 CC 附件语义）。
+     *
+     * @param state      会话状态
+     * @param registry   HookRegistry（null → 跳过）
+     * @param params     loop 参数载体（source 判定）
+     * @param tuc        本轮 ToolUseContext
+     * @param fromModel  切换前模型
+     * @param toModel    切换后模型
+     */
+    private static void firePostModelSwitchHook(AgentState state,
+                                                com.nexusai.application.agent.permission.hook.HookRegistry registry,
+                                                com.nexusai.application.agent.loop.QueryParams params,
+                                                com.nexusai.application.agent.tool.ToolUseContext tuc,
+                                                String fromModel, String toModel) {
+        if (registry == null || state == null || toModel == null) {
+            return;
+        }
+        if (fromModel != null && fromModel.equals(toModel)) {
+            return; // 未发生切换
+        }
+        try {
+            String sessionId = state.sessionId();
+            if (!registry.hasHookForEvent(
+                    com.nexusai.application.agent.permission.hook.HookEventType.POST_MODEL_SWITCH.ccName(),
+                    sessionId)) {
+                return;
+            }
+            String source = modelSwitchSource(params, toModel);
+            String requestedModel = params != null ? params.modelName() : null;
+            Long contextTokens = modelSwitchContextTokens(state);
+            Double estimatedCacheWriteUsd = contextTokens != null
+                ? com.nexusai.application.agent.cost.DeepSeekPricing
+                    .estimateCacheWriteUsd(contextTokens)
+                : null;
+            com.nexusai.application.agent.permission.hook.HookEvent event =
+                com.nexusai.application.agent.permission.hook.HookEvent.postModelSwitch(
+                    fromModel, toModel, requestedModel, source,
+                    contextTokens, null, null, estimatedCacheWriteUsd, "configured", sessionId);
+            com.nexusai.application.agent.permission.hook.GenericHook.HookResult r =
+                registry.executeEvent(event, null, tuc);
+            if (r == null || r.additionalContexts() == null || r.additionalContexts().isEmpty()) {
+                return;
+            }
+            java.util.List<String> contexts = new java.util.ArrayList<>();
+            for (String ac : r.additionalContexts()) {
+                if (ac != null && !ac.isBlank()) {
+                    contexts.add(ac);
+                }
+            }
+            if (contexts.isEmpty()) {
+                return;
+            }
+            String wrapped = "<system-reminder>\nPostModelSwitch hook additional context: "
+                + String.join("\n", contexts) + "\n</system-reminder>";
+            state.appendSilently(toMessage(Role.user, wrapped, null,
+                java.util.UUID.randomUUID().toString(), true));
+            if (log.isDebugEnabled()) {
+                log.debug("HOOK PostModelSwitch additionalContext 注入 {} 段（{} → {} source={} session={}）",
+                    contexts.size(), fromModel, toModel, source, sessionId);
+            }
+        } catch (Exception e) {
+            log.warn("HOOK PostModelSwitch 执行失败（忽略）: {}", e.toString());
+        }
+    }
+
+    /**
      * [OD-01 provider 接线] 最近一次 API 响应的累计 cache_deleted_input_tokens ·
      * 对齐 CC query.ts:874-878 {@code lastAssistant.message.usage.cache_deleted_input_tokens ?? 0}。
      *
@@ -6850,6 +7095,13 @@ public class LlmAgentLoop implements AgentLoop {
             //   ——多排队连续消费时每轮归属 = 该轮回答的 user，事件/落库同源（替代旧 queuedFlowUuid ThreadLocal）。
             String lastUserMsg = state.lastUserMessageId();
             String turnUserMessageId = lastUserMsg != null ? lastUserMsg : ctx.streamUserMessageId();
+            // [Hook v2.1.325 MessageDisplay] 只有配置了该事件才启用行级缓冲；
+            //   未配置时零行为变化（chunk 原样推送）。displayContent 只替换发给前端的 delta，
+            //   原始 chunk 仍进 acc/transcript。
+            boolean messageDisplayEnabled = ctx.hookRegistry() != null && state.sessionId() != null
+                && ctx.hookRegistry().hasHookForEvent("MessageDisplay", state.sessionId());
+            StringBuilder displayBuf = new StringBuilder();
+            int[] displayIndex = {0};
             // Phase 6·s02.5: 真流式并行 — StreamingToolExecutor 在 provider.stream 期间
             //   就 add+execute 工具, LLM 还在写时工具就在跑。对齐 CC query.ts:561 addTool 行为。
             // s05-P1-2: 注入 ToolUseContext, 工具执行时可读 agentId/sessionId（对齐 CC call(input, context)）
@@ -7147,7 +7399,17 @@ public class LlmAgentLoop implements AgentLoop {
             // override → loop.getModelForCall()；Subagent/Hook 默认 null → 回落 recoveryState）。
             // [IMP-CM-06 G-2] 有效模型解析统一经 resolveTurnEffectiveModel（与 autocompact 阈值
             // 同源 single-source-of-truth，对齐 CC mainLoopModel 语义）。
-            String effectiveModel = resolveTurnEffectiveModel(params, recoveryState);
+            String resolvedTurnModel = resolveTurnEffectiveModel(params, recoveryState);
+            // [Wave2-G] PreModelSwitch hook · 对齐 claude.exe v2.1.325（输入 `H2`/`lC(["command","picker","sdk"])`）。
+            //   仅在「真正的模型切换」成立时触发（上一轮有效模型非空且与新解析值不同）；首轮/首次解析不触发。
+            //   ⛔ 字段真实性：context_tokens / prompt_cache_warm / cache_ttl / estimated_cache_write_usd /
+            //   pricing 本仓无可靠来源 → 一律 null（不编造）；requested_model 取 params.modelName()（会话配置值）。
+            //   deny → 取消本次切换（沿用上一轮模型）；ask → 本仓该路径无交互确认通道 → 拒绝切换（headless 语义，
+            //   与 CC "a headless session refuses instead" 一致），并 warn 披露。
+            String effectiveModel = applyPreModelSwitchHook(state, ctx.hookRegistry(), params, perTurnTuc,
+                previousEffectiveModel, resolvedTurnModel);
+            // 切换前模型快照（下方 previousEffectiveModel 会被覆盖；PostModelSwitch 需要真实 from/to）
+            final String modelSwitchFrom = previousEffectiveModel;
             // [R25-8] fallback 切换检测 · 对齐 CC withRetry.ts:337-351 显式重置 4 数组
             // 若当前 turn 的 effectiveModel 与上次不同 → fallback 已发生. 显式重置
             // per-turn 累积状态 (seenToolIds/seenToolCalls/acc/reasoningBuf), 避免
@@ -7171,6 +7433,10 @@ public class LlmAgentLoop implements AgentLoop {
                 log.debug("[LlmAgentLoop] 每轮模型更新 state.currentModel: model={}, sessionId={}, turn={}",
                     effectiveModel, state.sessionId(), state.turnCount());
             }
+            // [Wave2-G] PostModelSwitch hook · 切换已生效后触发；additionalContext 注入下一条模型请求可见的
+            //   内存消息（appendSilently，不落 transcript）。CC 该事件 source 含 auto/resume。
+            firePostModelSwitchHook(state, ctx.hookRegistry(), params, perTurnTuc,
+                modelSwitchFrom, effectiveModel);
 
             // ── [H7-arch Phase 5 P4 C1] blocking-limit 预检 · 对齐 CC query.ts:615-648 ──
             // callModel 前 tokenCountWithEstimation(messagesForQuery) 超窗 → 直接 yield
@@ -7549,13 +7815,29 @@ public class LlmAgentLoop implements AgentLoop {
                         System.currentTimeMillis(), java.util.Map.of("len", chunk.length())));
                     // Phase 6·s02.6: 真流式 content (LLM 还在写时立即推 STOMP)
                     if (ctx.wsTemplate() != null && ctx.streamTopic() != null) {
-                        com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
-                            com.nexusai.eventbus.ws.MessageChunkEvent.of(
-                                ctx.streamSessionId(), turnUserMessageId,
-                                turnAssistantId,
-                                chunk));
-                        // [OBS1] 推送留痕（限流：同 turn 内每秒最多 1 条）—— 日志里可直接判定「后端推没推」
-                        logChunkPushRateLimited("正文", state.turnCount(), ctx.streamTopic(), wsPushTextStat);
+                        String pushText = chunk;
+                        if (messageDisplayEnabled) {
+                            displayBuf.append(chunk);
+                            int nl = displayBuf.lastIndexOf("\n");
+                            if (nl >= 0) {
+                                String batch = displayBuf.substring(0, nl + 1);
+                                displayBuf.delete(0, nl + 1);
+                                pushText = messageDisplayText(ctx, state.sessionId(),
+                                    turnAssistantId, turnAssistantId, displayIndex[0]++, false, batch);
+                            } else {
+                                // 半行：等下一次 chunk 凑成完整行再触发（CC「每批新行」语义）
+                                pushText = null;
+                            }
+                        }
+                        if (pushText != null && !pushText.isEmpty()) {
+                            com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
+                                com.nexusai.eventbus.ws.MessageChunkEvent.of(
+                                    ctx.streamSessionId(), turnUserMessageId,
+                                    turnAssistantId,
+                                    pushText));
+                            // [OBS1] 推送留痕（限流：同 turn 内每秒最多 1 条）—— 日志里可直接判定「后端推没推」
+                            logChunkPushRateLimited("正文", state.turnCount(), ctx.streamTopic(), wsPushTextStat);
+                        }
                     }
                 },
                 msg -> {
@@ -9004,6 +9286,19 @@ public class LlmAgentLoop implements AgentLoop {
             String text = acc.length() > 0 ? acc.toString()
                 : (msg != null && msg.content() != null ? msg.content() : "");
 
+            // [MessageDisplay] 流末 flush 剩余半行（final=true）；只影响前端显示，不改 text/acc。
+            if (messageDisplayEnabled && ctx.wsTemplate() != null && ctx.streamTopic() != null) {
+                String tail = displayBuf.length() > 0 ? displayBuf.toString() : "";
+                displayBuf.setLength(0);
+                String shown = messageDisplayText(ctx, state.sessionId(), turnAssistantId,
+                    turnAssistantId, displayIndex[0]++, true, tail);
+                if (shown != null && !shown.isEmpty()) {
+                    com.nexusai.eventbus.ws.StreamEventSeq.send(ctx.wsTemplate(), ctx.streamTopic(),
+                        com.nexusai.eventbus.ws.MessageChunkEvent.of(
+                            ctx.streamSessionId(), turnUserMessageId, turnAssistantId, shown));
+                }
+            }
+
             // ── phase 日志: 把"turn N"替换成语义化 phase
             //    LLM 一次响应可能含: reasoning(思考) + preamble(调工具前的话) + tool_calls(1..N)
             //    一次 AssistantMessage 同时可包含这些字段
@@ -9405,10 +9700,16 @@ public class LlmAgentLoop implements AgentLoop {
                             state.sessionId(),
                             effectiveStopHookActive,
                             loopTranscriptPath != null ? loopTranscriptPath.toString() : null,
-                            text, stopPermissionMode)
+                            text, stopPermissionMode,
+                            // [Wave3-input] background_tasks 用真实在飞任务；session_crons 本仓
+                            //   在 static loop 内无调度依赖 → null（登记）
+                            hookBackgroundTasks(ctx, state.sessionId()),
+                            hookSessionCrons(ctx, state.sessionId()))
                         : HookEvent.stop(
                             state.sessionId(),
-                            null, effectiveStopHookActive, text, stopAgentType, stopPermissionMode);
+                            null, effectiveStopHookActive, text, stopAgentType, stopPermissionMode,
+                            hookBackgroundTasks(ctx, state.sessionId()),
+                            hookSessionCrons(ctx, state.sessionId()));
                     // [H-WF4-01 · 5-W4-10] 阶段 4 extract/dream 每轮触发 · CC stopHooks.ts:141-156
                     //   （在 hook 执行前 fire-and-forget；对齐 CC query.ts:1267 handleStopHooks 每轮调用内
                     //     stopHooks.ts:149 executeExtractMemories + :155 executeAutoDream）
@@ -9942,13 +10243,18 @@ public class LlmAgentLoop implements AgentLoop {
                         state.sessionId(),
                         effectiveStopHookActive,
                         transcriptPath != null ? transcriptPath.toString() : null,
-                        lastAssistantText, stopPermissionMode)
+                        lastAssistantText, stopPermissionMode,
+                        // [Wave3-input] 真实在飞后台任务；session_crons 无调度依赖 → null
+                        hookBackgroundTasks(ctx, state.sessionId()),
+                            hookSessionCrons(ctx, state.sessionId()))
                     : HookEvent.stop(
                         state.sessionId(),
                         null,
                         effectiveStopHookActive,
                         lastAssistantText,
-                        stopAgentType, stopPermissionMode);
+                        stopAgentType, stopPermissionMode,
+                        hookBackgroundTasks(ctx, state.sessionId()),
+                            hookSessionCrons(ctx, state.sessionId()));
                 // [R6-IMP] DEL-TH-06 恢复：executeEvent（折叠单条）→ executeStopHooksCollecting
                 //   （executeEventAll 逐 hook，对齐 CC stopHooks.ts:175-333 逐 result 累计）。
                 // [H2/CCJ-EXEC-01] messages 透传 · CC hooks.ts:3688-3696 executeStopHooks
@@ -11893,6 +12199,30 @@ public class LlmAgentLoop implements AgentLoop {
      * @param state   当前 AgentState（sessionId → session_id）
      * @param summary 已折叠/记录的 Stop hook 摘要（{@link CollapseHookSummaries.HookMessage}）
      */
+    /**
+     * [Hook v2.1.325 MessageDisplay] 调一次显示层 hook；返回 {@code null}=保持原 delta
+     * （未配置/异常/无 displayContent），空串=该批不显示。只替换 STOMP delta，
+     * 不参与 state/transcript。
+     */
+    private static String messageDisplayText(AgentLoopContext ctx, String sessionId,
+            String turnId, String messageId, int index, boolean finalFlush, String delta) {
+        HookRegistry registry = ctx != null ? ctx.hookRegistry() : null;
+        if (registry == null) {
+            return delta;
+        }
+        try {
+            GenericHook.HookResult r = registry.executeEvent(
+                HookEvent.messageDisplay(turnId, messageId, index, finalFlush, delta, sessionId));
+            if (r != null && r.displayContent() != null) {
+                return r.displayContent();
+            }
+            return delta;
+        } catch (Exception e) {
+            log.warn("[MessageDisplay] hook 执行失败，回落原始 delta: {}", e.getMessage());
+            return delta;
+        }
+    }
+
     private static void emitStopHookSummarySdkMessage(AgentLoopContext ctx,
             AgentState state,
             CollapseHookSummaries.HookMessage summary) {
@@ -12414,6 +12744,35 @@ public class LlmAgentLoop implements AgentLoop {
             new com.nexusai.application.agent.permission.hook.ArtifactCollectionHooks(
                 sessionArtifactService, sessionAgentStateRegistry);
         hooks.registerArtifactCollectionHooks(hookRegistry);
+    }
+
+    /**
+     * [Wave3-E] Ultrareview post-commit 提示 hook 生产接线 · 对齐 CC v2.1.325
+     * {@code registerUltrareviewPostCommitHook}（off≈352,170,157）。
+     *
+     * <p><b>语义</b>：PostToolUse（Bash/PowerShell）内建 callback，检测到一次成功的
+     * {@code git commit} 后给用户一条 {@code systemMessage}，建议先跑 {@code /ultrareview}
+     * 再 push。<b>只提示，不执行审查</b>——CC 没有 Review 类事件，也没有"执行完自动审查"的内建 hook。
+     *
+     * <p>门控与 {@code /ultrareview} 命令同源（GrowthBook {@code tengu_review_bughunter_config}
+     * 的 {@code enabled}；无 GrowthBook 时 env {@code NEXUSAI_FEATURE_ULTRA_REVIEW} 可开）。
+     * 同名重复注册 = LinkedHashMap.put 覆盖，幂等；每会话 run() 入口注册安全。
+     */
+    private void registerUltrareviewPostCommitHook() {
+        if (hookRegistry == null) {
+            return;
+        }
+        try {
+            com.nexusai.application.agent.permission.hook.UltrareviewPostCommitHook hook =
+                com.nexusai.application.agent.permission.hook.UltrareviewPostCommitHook
+                    .production(telemetry);
+            hook.register(hookRegistry);
+        } catch (RuntimeException e) {
+            // 提示型 hook 失败不得影响主流程（对齐 CC 内建 hook best-effort）
+            if (log.isDebugEnabled()) {
+                log.debug("HOOK registerUltrareviewPostCommitHook 失败（忽略）: {}", e.toString());
+            }
+        }
     }
 
     // ── H3 v4 Gap①: executeEvent message attachment 生产者侧注入 ──
@@ -13138,7 +13497,24 @@ public class LlmAgentLoop implements AgentLoop {
      * @param agentId 当前 run 的 agentId（doRun 局部；主线程=null；子代理/后台任务非 null）
      * @return SessionStart hook 的 source 载荷（'startup' 或 'resume'）
      */
-    private String resolveSessionStartSource(UUID agentId) {
+    /**
+     * [Hook v2.1.325] SessionStart source + resume/fork 观测字段。
+     *
+     * @param source                    startup/resume（本路径无法区分 fork；fork 需会话分叉标记）
+     * @param secondsSinceLastResponse  距 transcript 最后一条 assistant 的秒数；无 → null
+     * @param contextTokens             最后响应的 input+output tokens；无 → null
+     * @param promptCacheLikelyExpired  距最后响应 > 5m（DeepSeek prompt cache 默认 TTL）
+     * @param estimatedCacheWriteUsd    按 DeepSeek 列表价估算重缓存成本
+     */
+    private record SessionStartMetrics(String source, Long secondsSinceLastResponse,
+                                       Long contextTokens, Boolean promptCacheLikelyExpired,
+                                       Double estimatedCacheWriteUsd) {
+        static SessionStartMetrics startup() {
+            return new SessionStartMetrics("startup", null, null, null, null);
+        }
+    }
+
+    private SessionStartMetrics resolveSessionStartMetrics(UUID agentId) {
         if (agentId == null && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
@@ -13150,12 +13526,45 @@ public class LlmAgentLoop implements AgentLoop {
                     log.info("HOOK SessionStart source 判定: session={} 转录 {} 条 resume={}（对齐 CC processSessionStartHooks('resume')）",
                         streamSessionId, transcript == null ? 0 : transcript.size(), resume);
                 }
-                return resume ? "resume" : "startup";
+                // [Hook v2.1.325 V297] 分叉会话有显式 forked_from 标记 → source='fork'
+                boolean forked = sessionService != null
+                    && sessionService.isForkedSession(streamSessionId);
+                if (!resume && !forked) {
+                    return SessionStartMetrics.startup();
+                }
+                ChatMessageDto lastAssistant = null;
+                if (transcript != null) {
+                    for (ChatMessageDto m : transcript) {
+                        if (m != null && m.role() == Role.assistant) {
+                            lastAssistant = m;
+                        }
+                    }
+                }
+                Long seconds = null;
+                if (lastAssistant != null && lastAssistant.createdAt() != null) {
+                    long s = java.time.Duration.between(
+                        lastAssistant.createdAt().toInstant(), java.time.Instant.now()).getSeconds();
+                    seconds = Math.max(0L, s);
+                }
+                Long contextTokens = null;
+                if (lastAssistant != null
+                        && (lastAssistant.inputTokens() != null || lastAssistant.outputTokens() != null)) {
+                    long t = (lastAssistant.inputTokens() != null ? lastAssistant.inputTokens() : 0L)
+                        + (lastAssistant.outputTokens() != null ? lastAssistant.outputTokens() : 0L);
+                    contextTokens = t > 0 ? t : null;
+                }
+                Boolean cacheExpired = seconds != null ? seconds > 300L : null;
+                Double est = contextTokens != null
+                    ? com.nexusai.application.agent.cost.DeepSeekPricing
+                        .estimateCacheWriteUsd(contextTokens)
+                    : null;
+                return new SessionStartMetrics(forked ? "fork" : "resume",
+                    seconds, contextTokens, cacheExpired, est);
             } catch (Exception e) {
                 log.warn("HOOK SessionStart source 判定失败, 回落 startup: {}", e.getMessage());
             }
         }
-        return "startup";
+        return SessionStartMetrics.startup();
     }
 
     /**
@@ -17207,5 +17616,161 @@ public class LlmAgentLoop implements AgentLoop {
             : new HookPermissionResolver();
         return resolver.resolve(
             hookPermissionResult, hookUpdatedInput, tool, input, ctx, toolUseId, canUseTool);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // [Wave3-input] CLAUDE v2.1.325 hook 输入观测字段
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * [Wave3-input] QuerySource → CC {@code UserPromptSubmit.source} 值域。
+     *
+     * <p>CC 值域：user / sdk / system / loop_wakeup / schedule_wakeup / poll_event。
+     * 本仓 QuerySource 无 loop/schedule/poll 三类独立值（它们经 NotificationQueue 复用
+     * 既有 run 入口）⇒ 只能给出 user/sdk/system；⛔ 不猜测成更细的值。
+     *
+     * @param qs 本轮查询来源（可 null）
+     * @return CC source 值；无法判定 → null（序列化省略）
+     */
+    static String hookPromptSource(com.nexusai.application.agent.QuerySource qs) {
+        if (qs == null) {
+            return null;
+        }
+        return switch (qs) {
+            case USER, REPL_MAIN_THREAD -> "user";
+            case SDK -> "sdk";
+            default -> "system";
+        };
+    }
+
+    /**
+     * [Wave3-input] Stop/SubagentStop 的 {@code background_tasks[]}（CC v2.1.325）。
+     *
+     * <p>只报**真实在飞**（非终态）且属于该会话的任务；字段映射（CC：
+     * {@code id/type/status/description/command/agent_type/server/tool/name}）中
+     * 本仓 {@code BackgroundTask} 能提供的只有前 4 项：
+     * <ul>
+     *   <li>{@code type} 用 CC 友好标签（shell/subagent/teammate/workflow/monitor/dream）；</li>
+     *   <li>{@code description} 按 CC 上限 1000 截断并追加 {@code … [+N chars]}。</li>
+     * </ul>
+     * {@code command}（shell 命令行）/ {@code agent_type}（子代理类型名）/ {@code server}/{@code tool} /
+     * {@code name} 在 {@code BackgroundTask} 中<b>无对应字段</b> ⇒ 不下发（⛔ 不编造）。
+     *
+     * <p>数据源 = {@code ctx.taskFrameworkService()}（统一 task store）；仅在它非 null 时可用，
+     * 不可用 → null（序列化省略，而非伪空数组）。
+     *
+     * @param ctx       循环上下文（task store 来源）
+     * @param sessionId 会话 ID
+     * @return 任务快照列表；无来源 → null；无在飞任务 → 空列表（CC 明确 empty array）
+     */
+    static java.util.List<java.util.Map<String, Object>> hookBackgroundTasks(
+            com.nexusai.application.agent.loop.AgentLoopContext ctx, String sessionId) {
+        if (ctx == null) {
+            return null;
+        }
+        com.nexusai.application.agent.tasks.TaskFrameworkService store = ctx.taskFrameworkService();
+        if (store == null) {
+            return null;
+        }
+        java.util.List<com.nexusai.application.agent.tasks.BackgroundTask> all;
+        try {
+            all = store.listAll();
+        } catch (RuntimeException e) {
+            log.debug("[Wave3-input] 读取后台任务失败，background_tasks 省略: {}", e.toString());
+            return null;
+        }
+        java.util.List<java.util.Map<String, Object>> out = new java.util.ArrayList<>();
+        for (com.nexusai.application.agent.tasks.BackgroundTask t : all) {
+            if (t == null || t.status() == null || t.status().isTerminal()) {
+                continue;
+            }
+            if (sessionId != null && t.sessionId() != null && !sessionId.equals(t.sessionId())) {
+                continue;
+            }
+            java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id", t.id());
+            m.put("type", hookTaskTypeLabel(t.type()));
+            m.put("status", t.status().getStatusString());
+            m.put("description", capDescription(t.description(), 1000));
+            out.add(m);
+        }
+        return out;
+    }
+
+    /**
+     * [Hook v2.1.325] Stop/SubagentStop 的 {@code session_crons[]}（CC CronCreate/ScheduleWakeup
+     * 等会唤醒本会话的定时任务）。
+     *
+     * <p>字段映射：{@code id} / {@code schedule}（cron 或 interval/runAt 描述）/
+     * {@code recurring}（kind!=once）/ {@code prompt}（Schedule.command，按 CC 1000 字符截断）。
+     * 数据源 {@code ScheduleService.listBySession}；无 service → null（省略），空列表 → 空数组。
+     */
+    static java.util.List<java.util.Map<String, Object>> hookSessionCrons(
+            com.nexusai.application.agent.loop.AgentLoopContext ctx, String sessionId) {
+        if (ctx == null || sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        com.nexusai.application.agent.loop.AgentLoopContext.ToolExecutionBeans beans =
+            ctx.toolExecutionBeans();
+        com.nexusai.domain.schedule.ScheduleService svc = beans != null ? beans.scheduleService() : null;
+        if (svc == null) {
+            return null;
+        }
+        java.util.List<com.nexusai.model.schedule.dto.ScheduleDto> list;
+        try {
+            list = svc.listBySession(sessionId);
+        } catch (RuntimeException e) {
+            log.debug("[Hook] 读取 session_crons 失败，省略: {}", e.toString());
+            return null;
+        }
+        if (list == null) {
+            return java.util.List.of();
+        }
+        java.util.List<java.util.Map<String, Object>> out = new java.util.ArrayList<>(list.size());
+        for (com.nexusai.model.schedule.dto.ScheduleDto d : list) {
+            if (d == null) {
+                continue;
+            }
+            String schedule = d.cron() != null && !d.cron().isBlank()
+                ? d.cron()
+                : (d.kind() == com.nexusai.model.schedule.dto.ScheduleKind.interval
+                    && d.intervalSeconds() != null
+                    ? "every " + d.intervalSeconds() + "s"
+                    : d.runAt());
+            java.util.Map<String, Object> m = new java.util.LinkedHashMap<>();
+            m.put("id", d.id());
+            if (schedule != null && !schedule.isBlank()) {
+                m.put("schedule", schedule);
+            }
+            m.put("recurring", d.kind() != com.nexusai.model.schedule.dto.ScheduleKind.once);
+            if (d.command() != null && !d.command().isBlank()) {
+                m.put("prompt", capDescription(d.command(), 1000));
+            }
+            out.add(m);
+        }
+        return out;
+    }
+
+    /** [Wave3-input] TaskType → CC 后台任务友好类型标签（CC {@code type} 描述原文）。 */
+    private static String hookTaskTypeLabel(com.nexusai.application.agent.tasks.TaskType type) {
+        if (type == null) {
+            return null;
+        }
+        return switch (type) {
+            case LOCAL_BASH -> "shell";
+            case LOCAL_AGENT, REMOTE_AGENT -> "subagent";
+            case IN_PROCESS_TEAMMATE -> "teammate";
+            case LOCAL_WORKFLOW -> "workflow";
+            case MONITOR_MCP, MONITOR -> "monitor";
+            case DREAM -> "dream";
+        };
+    }
+
+    /** [Wave3-input] 描述截断 · CC 上限 1000 chars，超出追加 {@code … [+N chars]}。 */
+    private static String capDescription(String s, int max) {
+        if (s == null || s.length() <= max) {
+            return s;
+        }
+        return s.substring(0, max) + "… [+" + (s.length() - max) + " chars]";
     }
 }

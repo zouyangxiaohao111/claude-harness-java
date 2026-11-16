@@ -27,6 +27,23 @@ export interface Provider {
   models: Model[]
   createdAt?: string
   updatedAt?: string
+  /**
+   * 鉴权模式（后端 `providers.auth_mode`）：
+   * `api_key` = 走下方 API Key；`codex_oauth` = ChatGPT 订阅登录；`claude_oauth` = Claude 订阅登录
+   */
+  authMode?: 'api_key' | 'codex_oauth' | 'claude_oauth'
+  /**
+   * 订阅账号标识（后端 `providers.oauth_account_id`）。
+   * 仅 `codex_oauth` 有值 —— Claude 的 token 响应不带账号标识，恒为 null。
+   */
+  oauthAccountId?: string | null
+  /** 订阅 token 过期时间（后端 `providers.oauth_expires_at`）；仅供展示/判断，前端不自行刷新 */
+  oauthExpiresAt?: number | null
+  /**
+   * [V299] 归属品牌 key（`BuiltinProviderCatalog.BRANDS[].key`）。
+   * 一个品牌可以有多条连接（不同 Key / 不同账号）；null = 自定义连接。
+   */
+  brandKey?: string | null
 }
 
 /** POST 请求：完整 key 由后端脱敏 */
@@ -37,6 +54,8 @@ export interface CreateProviderRequest {
   apiKey: string
   extraHeaders?: Record<string, string>
   enabled?: boolean
+  /** [V299] 归属品牌；不传时后端按 host/name 自动识别一次 */
+  brandKey?: string
 }
 
 /** PATCH 请求：所有字段可选 */
@@ -47,6 +66,8 @@ export interface UpdateProviderRequest {
   apiKey?: string
   extraHeaders?: Record<string, string> | null
   enabled?: boolean
+  /** [V299] null/缺省 = 不改；空串 = 移出品牌（改回自定义） */
+  brandKey?: string | null
 }
 
 // ---- Model ----
@@ -182,6 +203,18 @@ export interface RemoteModelsResponse {
   ok: boolean
   models: RemoteModel[]
   message: string
+}
+
+// ---- OAuth（ChatGPT 订阅登录）----
+/** `POST /providers/{id}/oauth/authorize`：返回要在浏览器打开的授权地址 */
+export interface OAuthAuthorizeResponse {
+  url: string
+}
+
+/** `POST /providers/{id}/oauth/complete`：ok=false 时带中文原因（HTTP 400） */
+export interface OAuthCompleteResponse {
+  ok: boolean
+  message?: string
 }
 
 // ---- Skill ----
@@ -1182,6 +1215,12 @@ export interface MarketExpert {
   featured?: boolean | null
   /** 远端来源标识 */
   remote?: boolean
+  /** 版本号（判定市场是否有更新） */
+  version?: string | null
+  /** 市场条目内容指纹（与本地已装目录比对判定更新） */
+  fingerprint?: string | null
+  /** 最近一次上架时间（ISO 8601） */
+  publishedAt?: string | null
   // ---- [skill-market v4 2026-11-01] 开发者（useCount 上方已存在，不重复声明）----
   /** 开发者名（后端缺省填「数字公司开发组」） */
   authorName?: string | null
@@ -1211,6 +1250,8 @@ export interface MarketSkill {
   fingerprint?: string | null
   /** 版本号（详情页「版本」格 · 本机技能无此信息时为 null） */
   version?: string | null
+  /** 最近一次上架时间（ISO 8601 · 本机技能无此信息时为 null） */
+  publishedAt?: string | null
   // ---- [skill-market v4 2026-11-01] 统计与开发者（卡片/详情页展示）----
   /** 使用次数（原始整数 · null = 市场无此项统计 ⇒ 不渲染，⛔ 不显示 0） */
   useCount?: number | null
@@ -1254,8 +1295,10 @@ export interface ExternalMarketPlugin {
   category?: string | null
   /** 标签 */
   tags?: string[] | null
-  /** 创建时间（ISO 8601） */
+  /** 创建时间（ISO 8601 · 市场条目初始创建时间） */
   createdAt?: string | null
+  /** 最近一次上架时间（ISO 8601 · 旧数据可能为空） */
+  publishedAt?: string | null
   /** 内容指纹 sha256:...（上架时写入；较早的数据可能为空） */
   fingerprint?: string | null
   // ---- [skill-market v4 2026-11-01] 市场真实统计（来自 stats.json · 原始整数）----
@@ -1358,19 +1401,21 @@ export interface TodoUpdateEvent {
 
 // ---- 会话工具（GET/PATCH /sessions/{id}/tools · 会话级临时禁用）----
 /** 工具分类（后端 SessionToolCategory.of 判定 · 前端只消费不推导） */
-export type SessionToolCategory = 'CU' | 'KB' | 'BR' | 'SYS'
+export type SessionToolCategory = 'CU' | 'KB' | 'BR' | 'MCP' | 'SYS'
 /** 单个会话工具状态（对齐后端 SessionToolDto · 被禁工具仍在列表，disabled=true 供恢复） */
 export interface SessionToolDto {
   /** 工具名（如 Bash/Read/Agent · PATCH 路径段） */
   name: string
   /** 展示名（如「Bash（终端）」） */
   userFacingName: string
-  /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / SYS=系统工具 */
+  /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / MCP=第三方 MCP / SYS=系统工具 */
   category: SessionToolCategory
   /** 工具描述原文（后端不截断 · 前端按行数截断展示） */
   description: string
   /** 是否已禁用（bare 模式仅 Bash/Read/Edit 可见） */
   disabled: boolean
+  /** MCP server 名（category=MCP 时非空，如 rea；其余分类为 null）· 老后端无此字段 */
+  mcpServer?: string | null
 }
 /** PATCH /sessions/{id}/tools/{toolName} 请求体（注意非 toggle，enabled=false 禁用 / true 恢复） */
 export interface SessionToolPatchRequest {
@@ -1380,6 +1425,8 @@ export interface SessionToolPatchRequest {
 export interface SessionToolCategoryToggleRequest {
   category: SessionToolCategory
   enabled: boolean
+  /** 可选 · MCP server 名（仅 category=MCP 合法；不传 = 整个 MCP 分类） */
+  mcpServer?: string
 }
 
 // ---- ChatMessage（对齐后端 ChatMessageDto，重构现有 mock 形状） ----
@@ -1998,6 +2045,7 @@ export const TASKS_TOPIC = '/topic/tasks'
 export type TaskEventSubtype =
   | 'task_started' | 'task_progress' | 'task_notification' | 'session_state_changed'
   | 'stop_hook_summary'
+  | 'async_wake_summary'
 
 /** 任务 usage 内部对象（对齐后端 SdkEventQueue.TaskUsage） */
 export interface TaskEventUsage {
@@ -2109,6 +2157,23 @@ export interface StopHookSummaryEvent extends TaskEventBase {
   total_duration_ms?: number | null
 }
 
+/**
+ * asyncRewake exit 2 的用户侧摘要（CC {@code rewakeSummary}，缺省 "Stop hook feedback"）·
+ * type='system' + subtype='async_wake_summary'，经 /topic/tasks；模型侧 system-reminder 另走
+ * NotificationQueue。前端只做非阻塞 toast，不写会话正文。
+ */
+export interface AsyncWakeSummaryEvent extends TaskEventBase {
+  type: 'system'
+  subtype: 'async_wake_summary'
+  hook_name?: string | null
+  summary?: string | null
+  command?: string | null
+  exit_code?: number | null
+  stdout?: string | null
+  stderr?: string | null
+  timestamp_ms?: number | null
+}
+
 /** /topic/tasks 载荷（drain 出站为 JSON 数组）单条事件联合 */
 export type TaskEvent =
   | TaskStartedEvent
@@ -2117,6 +2182,7 @@ export type TaskEvent =
   | SessionStateChangedEvent
   | ToolUseSummaryEvent
   | StopHookSummaryEvent
+  | AsyncWakeSummaryEvent
   | TaskNotificationWireEvent
 
 /** 子代理 transcript 单条消息（对齐后端 AgentMessage record · GET /sessions/{sid}/subagents/{agentId}/transcript） */
@@ -2149,12 +2215,12 @@ export interface AgentTranscriptMessage {
 
 /**
  * Hook 命令载荷 · 对齐后端 {@code HookCommand} sealed interface
- * （Jackson {@code @JsonTypeInfo} 按 type 字段多态：command/prompt/http/agent）。
+ * （Jackson {@code @JsonTypeInfo} 按 type 字段多态：command/prompt/http/agent/mcp_tool）。
  * 仅取 UI 展示所需字段（type/statusMessage/once + 各子类型的命令串）。
  */
 export interface HookCommandConfig {
-  /** CC 字面量：command / prompt / http / agent */
-  type: 'command' | 'prompt' | 'http' | 'agent'
+  /** CC 字面量：command / prompt / http / agent / mcp_tool */
+  type: 'command' | 'prompt' | 'http' | 'agent' | 'mcp_tool'
   /** 自定义状态文案（getHookDisplayText 优先用其做展示） */
   statusMessage?: string | null
   /** true = 执行一次后移除 */
@@ -2165,6 +2231,10 @@ export interface HookCommandConfig {
   prompt?: string | null
   /** HttpHook.url */
   url?: string | null
+  /** McpToolHook.server */
+  server?: string | null
+  /** McpToolHook.tool */
+  tool?: string | null
 }
 
 /**

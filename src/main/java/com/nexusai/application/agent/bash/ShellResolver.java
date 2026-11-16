@@ -1,6 +1,9 @@
 package com.nexusai.application.agent.bash;
 
+import com.nexusai.common.BundledGit;
+
 import java.io.File;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.function.Function;
@@ -178,6 +181,14 @@ public final class ShellResolver {
                         return bash.getAbsolutePath();
                     }
                 }
+            }
+        }
+        // 随包 MinGit 兜底（系统 PATH 无 git 时才走到这里）· BundledGit 只认
+        // bin/bash.exe + cmd/git.exe 同时存在的目录；仍走 exists 谓词以保持可测性
+        if (windows) {
+            String bundled = BundledGit.bashExe().map(Path::toString).orElse(null);
+            if (bundled != null && Boolean.TRUE.equals(exists.apply(bundled))) {
+                return bundled;
             }
         }
         return null;

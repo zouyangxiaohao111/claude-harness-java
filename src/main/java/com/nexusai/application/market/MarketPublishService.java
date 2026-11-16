@@ -34,7 +34,8 @@ import java.util.zip.ZipOutputStream;
  * {@code version}（当前生效版本）、{@code fingerprint}（内容指纹）、{@code versions[]}（全部历史）。
  *
  * <p><b>版本策略</b>（用户裁定）：上架时手填版本；不填则对当前版本 patch +1（0.1.0 → 0.1.1）。
- * 内容指纹未变 → 直接判定「无变化」，不建新版本。
+ * 内容指纹未变 → 判定「无变化」，不建新版本；但<b>手填了与当前版本不同的版本号时视为明确发版</b>，
+ * 即使指纹相同也建新版本（版本号不参与指纹，否则「只改版本号」永远发不出去）。
  *
  * <p><b>回滚</b>：只改清单指向（version/source/fingerprint），**不删任何历史包**
  * （用户裁定：历史全部保留，管理页可视化回滚）。
@@ -106,20 +107,49 @@ public class MarketPublishService {
         }
 
         try {
-            // 无变化判定只看用户内容指纹（不含自动生成的 plugin.json）
-            String fingerprint = fingerprint(dir);
             ObjectNode manifest = readManifest();
             ArrayNode plugins = (ArrayNode) manifest.withArray("plugins");
             ObjectNode existing = findEntry(plugins, dirName);
+            String currentVersion = existing != null ? existing.path("version").asText("0.1.0") : null;
 
-            if (existing != null && fingerprint.equals(existing.path("fingerprint").asText(""))) {
-                log.info("[MarketPublish] 无变化，跳过上架 plugin={} fingerprint={}", dirName, shortFp(fingerprint));
-                return PublishResult.unchanged(dirName, existing.path("version").asText(), fingerprint);
+            // 开发者（市场卡片「开发者」名）：可手填；留空时新条目默认 zjky、已有条目保留原值。
+            String requestedAuthor = req.author() == null ? "" : req.author().trim();
+            String existingAuthor = existing == null ? null : existing.path("author").asText("zjky");
+            String author = requestedAuthor.isEmpty()
+                ? (existingAuthor == null ? "zjky" : existingAuthor)
+                : requestedAuthor;
+
+            // 手填版本被视为「明确要发这个版本」：即使内容指纹相同也建新版本。
+            // 指纹判据只认内容，而版本号在裸技能/自动生成 plugin.json 的包里根本不参与指纹，
+            // 因此过去「只改版本号重新上架」必然被判 unchanged（用户 2026-11-15 反馈）。
+            String requestedVersion = req.version() == null ? null : req.version().trim();
+            boolean explicitNewVersion = requestedVersion != null && !requestedVersion.isEmpty()
+                && !requestedVersion.equals(currentVersion);
+
+            // 指纹按「发布产物」口径算（zip 内用户清单的 version 会被覆盖成发行版本），
+            // 与安装目录自算的指纹同口径；对比旧条目时用旧条目的 version 参与覆盖，
+            // 否则「包内 version 落后于清单」的历史条目会永远被判有变化。
+            String fingerprint = productFingerprint(dir, currentVersion);
+            if (existing != null && !explicitNewVersion
+                    && fingerprint.equals(existing.path("fingerprint").asText(""))) {
+                // 只改开发者时内容指纹不变：若不在这里落库，「已有条目改作者」永远被判 unchanged 而改不掉。
+                // 作者只属于清单元数据，不改变包内容，因此不新建版本。
+                if (!author.equals(existingAuthor)) {
+                    existing.put("author", author);
+                    existing.put("updatedAt", ISO.format(Instant.now()));
+                    writeManifest(manifest);
+                    log.info("[MarketPublish] 内容未变，仅更新开发者 plugin={} author={}", dirName, author);
+                    return PublishResult.ok(dirName, currentVersion, existing.path("source").asText(""),
+                        fingerprint, 0);
+                }
+                log.info("[MarketPublish] 无变化，跳过上架 plugin={} version={} fingerprint={}",
+                    dirName, currentVersion, shortFp(fingerprint));
+                return PublishResult.unchanged(dirName, currentVersion, fingerprint);
             }
 
-            String currentVersion = existing != null ? existing.path("version").asText("0.1.0") : null;
             String version = resolveVersion(req.version(), currentVersion);
             // 版本确定后再打包：裸技能包需要把 version 写进自动生成的 plugin.json
+            String publishedFingerprint = productFingerprint(dir, version);
             byte[] zip = buildZip(dir, dirName, version, req.description());
             String source = categoryDir(category) + "/" + dirName + "/" + version;
             String now = ISO.format(Instant.now());
@@ -134,7 +164,7 @@ public class MarketPublishService {
             entry.put("version", version);
             entry.put("createdAt", existing == null ? now : existing.path("createdAt").asText(now));
             entry.put("updatedAt", now);
-            entry.put("author", existing == null ? "zjky" : existing.path("author").asText("zjky"));
+            entry.put("author", author);
             entry.put("category", category);
             ArrayNode tags = entry.putArray("tags");
             List<String> tagList = req.tags() != null && !req.tags().isEmpty()
@@ -144,20 +174,20 @@ public class MarketPublishService {
             entry.put("source", source);
             entry.put("strict", false);
             entry.withArray("dependencies");
-            entry.put("fingerprint", fingerprint);
+            entry.put("fingerprint", publishedFingerprint);
             entry.put("publishedAt", now);
             ArrayNode versions = entry.withArray("versions");
             ObjectNode v = versions.addObject();
             v.put("version", version);
             v.put("source", source);
-            v.put("fingerprint", fingerprint);
+            v.put("fingerprint", publishedFingerprint);
             v.put("publishedAt", now);
             v.put("size", zip.length);
 
             writeManifest(manifest);
             log.info("[MarketPublish] 上架成功 plugin={} version={} source={} bytes={} fingerprint={}",
-                dirName, version, source, zip.length, shortFp(fingerprint));
-            return PublishResult.ok(dirName, version, source, fingerprint, zip.length);
+                dirName, version, source, zip.length, shortFp(publishedFingerprint));
+            return PublishResult.ok(dirName, version, source, publishedFingerprint, zip.length);
         } catch (IOException e) {
             log.error("[MarketPublish] 上架失败 plugin={}: {}", dirName, e.getMessage());
             return PublishResult.fail("上架失败：" + e.getMessage());
@@ -248,14 +278,19 @@ public class MarketPublishService {
      */
     static byte[] buildZip(Path dir, String pluginName, String version, String description) throws IOException {
         List<Path> files = publishableFiles(dir);
+        // 版本以市场清单为准：zip 内的用户 plugin.json 副本把 version 覆盖成发行版本（不动磁盘源文件）。
+        // 否则安装链按包内 version 登记，本地版本永远落后于市场 ⇒ 界面反复提示「更新」。
+        java.util.Map<String, byte[]> versionOverrides = manifestVersionOverrides(dir, version);
         ByteArrayOutputStream bos = new ByteArrayOutputStream();
         try (ZipOutputStream zos = new ZipOutputStream(bos, StandardCharsets.UTF_8)) {
             for (Path f : files) {
                 String rel = dir.relativize(f).toString().replace('\\', '/');
+                byte[] bytes = versionOverrides.containsKey(rel)
+                    ? versionOverrides.get(rel) : Files.readAllBytes(f);
                 ZipEntry entry = new ZipEntry(rel);
                 entry.setTime(0L); // 固定时间戳：同内容重复打包得到同一份 zip 字节
                 zos.putNextEntry(entry);
-                zos.write(Files.readAllBytes(f));
+                zos.write(bytes);
                 zos.closeEntry();
             }
             if (pluginName != null && !pluginName.isBlank() && version != null && !version.isBlank()
@@ -277,8 +312,51 @@ public class MarketPublishService {
         return bos.toByteArray();
     }
 
+    /**
+     * 用户自带 plugin.json 的版本覆盖表（相对路径 → 改写后的字节）。
+     *
+     * <p>只改 zip 内的副本，源文件保持原样；JSON 非法时跳过该文件（不拦上架）。
+     */
+    private static java.util.Map<String, byte[]> manifestVersionOverrides(Path dir, String version) throws IOException {
+        if (version == null || version.isBlank()) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, byte[]> out = new java.util.HashMap<>();
+        for (String rel : List.of(GENERATED_MANIFEST_PATH, "plugin.json")) {
+            Path f = dir.resolve(rel);
+            if (!Files.isRegularFile(f) || isGeneratedManifest(dir, f)) {
+                continue;
+            }
+            try {
+                JsonNode node = JSON.readTree(Files.readAllBytes(f));
+                if (node == null || !node.isObject()) {
+                    continue;
+                }
+                // 版本本来就一致 → 保留原字节：重新序列化会改变字节，让老条目误判「内容变了」
+                if (version.equals(node.path("version").asText(""))) {
+                    continue;
+                }
+                ((ObjectNode) node).put("version", version);
+                out.put(rel, JSON.writerWithDefaultPrettyPrinter().writeValueAsBytes(node));
+            } catch (Exception e) {
+                log.warn("[MarketPublish] 包内清单无法解析，保留原版本号 path={}: {}", f, e.getMessage());
+            }
+        }
+        return out;
+    }
+
+    /** 发布产物指纹：zip 内用户清单 version 会被打成发行版本，与安装目录自算的指纹同口径。 */
+    static String productFingerprint(Path dir, String version) throws IOException {
+        return fingerprint(dir, manifestVersionOverrides(dir, version));
+    }
+
     /** 内容指纹：排序后的「相对路径 + 文件字节」逐个喂进 SHA-256（不依赖 zip 元数据）。 */
     public static String fingerprint(Path dir) throws IOException {
+        return fingerprint(dir, java.util.Map.of());
+    }
+
+    /** 指纹主体：overrides = zip 内被改写的相对路径 → 字节（未命中的文件读磁盘原字节）。 */
+    private static String fingerprint(Path dir, java.util.Map<String, byte[]> overrides) throws IOException {
         List<Path> files = publishableFiles(dir);
         MessageDigest md;
         try {
@@ -287,9 +365,10 @@ public class MarketPublishService {
             throw new IllegalStateException("SHA-256 不可用", e);
         }
         for (Path f : files) {
-            md.update(dir.relativize(f).toString().replace('\\', '/').getBytes(StandardCharsets.UTF_8));
+            String rel = dir.relativize(f).toString().replace('\\', '/');
+            md.update(rel.getBytes(StandardCharsets.UTF_8));
             md.update((byte) 0);
-            md.update(Files.readAllBytes(f));
+            md.update(overrides.containsKey(rel) ? overrides.get(rel) : Files.readAllBytes(f));
             md.update((byte) 0);
         }
         StringBuilder sb = new StringBuilder("sha256:");
@@ -427,8 +506,14 @@ public class MarketPublishService {
      * @param tags        标签
      * @param version     版本（空 → 自动 patch +1）
      */
+    /**
+     * 上架请求。
+     *
+     * @param author 市场卡片「开发者」名（可选）：留空时新条目默认 {@code zjky}、已有条目保留原值
+     */
     public record PublishRequest(String sourcePath, String name, String displayName,
-                                 String description, String category, List<String> tags, String version) {
+                                 String description, String category, List<String> tags, String version,
+                                 String author) {
     }
 
     /**
@@ -450,7 +535,9 @@ public class MarketPublishService {
         }
 
         static PublishResult unchanged(String name, String version, String fp) {
-            return new PublishResult("unchanged", "内容无变化，未创建新版本", name, version, null, fp, 0);
+            return new PublishResult("unchanged",
+                "内容与当前版本 " + version + " 完全一致，未创建新版本；如需发新版本请填写新的版本号",
+                name, version, null, fp, 0);
         }
 
         static PublishResult fail(String message) {

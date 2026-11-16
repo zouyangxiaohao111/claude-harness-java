@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
 import org.springframework.test.web.servlet.setup.MockMvcBuilders;
@@ -19,9 +20,12 @@ import org.springframework.test.web.servlet.setup.MockMvcBuilders;
 import java.util.List;
 import java.util.Set;
 
+import static org.hamcrest.Matchers.nullValue;
+import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
@@ -181,5 +185,70 @@ class SessionToolsControllerTest {
                 .contentType(APPLICATION_JSON)
                 .content("{\"enabled\":false}"))
             .andExpect(status().isBadRequest());
+    }
+
+    @Test
+    @DisplayName("[tool-categories] PATCH {category:MCP, mcpServer:rea} → 只禁用 rea 的工具，其它 MCP server 不受影响")
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void patch_mcpServer_disablesOnlyThatServer() throws Exception {
+        // WHY: 三级联动的中间一级。变异点：忽略 mcpServer → 整类 255 个 MCP 工具一起被关 → 红；
+        //   或过滤条件写反（只留非该 server 的）→ 红。
+        //
+        // ⚠️ 判据取「写入集合」（setDisabledTools 入参），⛔ 不取返回列表的 disabled 标志：
+        //   本单测里 SessionMapper 静态桥未注入 ⇒ SessionToolDisableConfig 读回恒为空集，
+        //   返回列表的 disabled 永远是 false（这是既有测试环境事实，不是本功能的行为）。
+        givenAllTools(tool("mcp__rea__inspect_plist"), tool("mcp__rea__list_names"),
+            tool("mcp__other__do_thing"), tool("Bash"));
+        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+
+        mockMvc.perform(patch("/api/v1/sessions/sess-1/tools")
+                .contentType(APPLICATION_JSON)
+                .content("{\"category\":\"MCP\",\"mcpServer\":\"rea\",\"enabled\":false}"))
+            .andExpect(status().isOk())
+            // 返回整表（按工具名排序），每条带 mcpServer（非 MCP 为 null）
+            .andExpect(jsonPath("$[0].name").value("Bash"))
+            .andExpect(jsonPath("$[0].mcpServer").value(nullValue()))
+            .andExpect(jsonPath("$[1].name").value("mcp__other__do_thing"))
+            .andExpect(jsonPath("$[1].mcpServer").value("other"))
+            .andExpect(jsonPath("$[2].name").value("mcp__rea__inspect_plist"))
+            .andExpect(jsonPath("$[2].mcpServer").value("rea"))
+            .andExpect(jsonPath("$[3].name").value("mcp__rea__list_names"))
+            .andExpect(jsonPath("$[3].mcpServer").value("rea"));
+
+        ArgumentCaptor<Set> captor = ArgumentCaptor.forClass(Set.class);
+        verify(sessionService).setDisabledTools(eq("sess-1"), captor.capture());
+        assertEquals(Set.of("mcp__rea__inspect_plist", "mcp__rea__list_names"), captor.getValue(),
+            "只应写入 rea 的两个工具：其它 server 与 SYS 工具不得被连带禁用");
+    }
+
+    @Test
+    @DisplayName("[tool-categories] PATCH {category:MCP, enabled:false}（无 mcpServer）→ 整个 MCP 类")
+    @SuppressWarnings({"unchecked", "rawtypes"})
+    void patch_mcpCategoryWithoutServer_disablesWholeCategory() throws Exception {
+        givenAllTools(tool("mcp__rea__inspect_plist"), tool("mcp__other__do_thing"), tool("Bash"));
+        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+
+        mockMvc.perform(patch("/api/v1/sessions/sess-1/tools")
+                .contentType(APPLICATION_JSON)
+                .content("{\"category\":\"MCP\",\"enabled\":false}"))
+            .andExpect(status().isOk());
+
+        ArgumentCaptor<Set> captor = ArgumentCaptor.forClass(Set.class);
+        verify(sessionService).setDisabledTools(eq("sess-1"), captor.capture());
+        assertEquals(Set.of("mcp__rea__inspect_plist", "mcp__other__do_thing"), captor.getValue(),
+            "整类 = 两个 MCP server 的全部工具；SYS 工具不得被连带禁用");
+    }
+
+    @Test
+    @DisplayName("[tool-categories] mcpServer 与 category≠MCP 组合 → 400（不静默忽略）")
+    void patch_mcpServerWithNonMcpCategory_returns400() throws Exception {
+        givenAllTools(tool("Bash"));
+        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+
+        mockMvc.perform(patch("/api/v1/sessions/sess-1/tools")
+                .contentType(APPLICATION_JSON)
+                .content("{\"category\":\"SYS\",\"mcpServer\":\"rea\",\"enabled\":false}"))
+            .andExpect(status().isBadRequest());
+        verify(sessionService, never()).setDisabledTools(eq("sess-1"), any(Set.class));
     }
 }

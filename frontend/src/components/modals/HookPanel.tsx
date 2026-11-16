@@ -44,6 +44,7 @@ const hookDisplayText = (c: HookCommandConfig): string => {
   if (c.type === 'command' && c.command) return c.command
   if ((c.type === 'prompt' || c.type === 'agent') && c.prompt) return c.prompt
   if (c.type === 'http' && c.url) return c.url
+  if (c.type === 'mcp_tool' && c.server && c.tool) return `${c.server}/${c.tool}`
   return c.type
 }
 

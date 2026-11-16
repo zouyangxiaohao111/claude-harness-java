@@ -37,12 +37,12 @@ class HookEventTest {
     }
 
     @Test
-    @DisplayName("sealed HookEventData 恰含 27 个 record 变体（对齐 CC HookInputSchema 27 事件）")
+    @DisplayName("sealed HookEventData 恰含 33 个 record 变体（对齐 CC v2.1.325 HookInputSchema 33 事件）")
     void hookEventData_hasExactly27PermittedSubtypes() {
-        // CC coreSchemas.ts:767-797 HookInputSchema union 恰 27 种事件输入
+        // claude.exe v2.1.325 事件数组 E2（off≈309,279,7xx）共 33 种事件输入
         assertThat(HookEventData.class.getPermittedSubclasses())
-            .as("HookEventData sealed interface 必须恰有 27 个 record 变体（OPD-WF1-TY-02）")
-            .hasSize(27);
+            .as("HookEventData sealed interface 必须恰有 33 个 record 变体（OPD-WF1-TY-02）")
+            .hasSize(33);
     }
 
     @Test

@@ -743,6 +743,17 @@ public class PermissionPipeline {
         return ctx.messages().stream()
             .filter(m -> m instanceof ChatMessageDto)
             .map(m -> (ChatMessageDto) m)
+            .map(m -> {
+                // [Hook v2.1.325] PostToolUse.classifierContext：把宿主断言附加到对应 tool 结果，
+                // 下一次分类器读 transcript 时可见（CC "shown alongside this tool call's result"）。
+                String cc = ClassifierContextStore.get(m.toolCallId());
+                if (cc == null || cc.isBlank()) {
+                    return m;
+                }
+                String base = m.content() == null ? "" : m.content();
+                return m.withContent(base + "\n\n<classifier_context>\n" + cc
+                    + "\n</classifier_context>");
+            })
             .toList();
     }
 

@@ -33,6 +33,9 @@ import org.slf4j.LoggerFactory;
  * </ol>
  *
  * <h2>边界（刻意不做的事）</h2>
+ * <p><b>主线程与子代理同一「默认池」口径</b>：子代理走 {@code SubagentExecutor.resolveAgentTools}，
+ * 其通配池同样剔除 {@link ToolScope#EXCLUSIVE}——对应 CC 的「按权限上下文重装的默认池」
+ * （exe `assembleToolPool(..., {skipReplFilter:true})`），不是全量注册表。改一处前先看另一处。
  * <ul>
  *   <li><b>只读过滤，不构造/发现工具</b>：名单里的名字必须在<b>当轮已过滤池</b>里存在。
  *       从全局 Spring registry 回补被 deny / 会话禁用 / bare 裁掉的工具会绕过全部权限门

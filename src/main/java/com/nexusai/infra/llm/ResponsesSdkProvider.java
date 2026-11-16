@@ -84,6 +84,15 @@ public class ResponsesSdkProvider implements LlmProvider {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private ProviderMapper providerMapper;
 
+    /**
+     * 401 自愈：强制刷新 OAuth 凭据（可空：无 Spring 上下文 / 单测时降级为「不重试」）。
+     *
+     * <p>infra → domain 的依赖在本仓已有先例；⛔ 不注入 ProviderMapper + CryptoUtil 自己解密 ——
+     * 加密/刷新口径必须单一（见 {@code ProviderService#saveOAuthCredential}）。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.domain.provider.ProviderService providerService;
+
     @Override
     public String type() {
         return PROVIDER_TYPE;
@@ -131,7 +140,8 @@ public class ResponsesSdkProvider implements LlmProvider {
         }
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             effortValue, onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            aborted, onError, onComplete, scope, streamIdleControl);
+            aborted, onError, onComplete, scope, streamIdleControl,
+            new AtomicBoolean(false));
     }
 
     /** 流式核心 · {@code responses().createStreaming} + 事件映射。 */
@@ -150,7 +160,8 @@ public class ResponsesSdkProvider implements LlmProvider {
                           Consumer<Throwable> onError,
                           Runnable onComplete,
                           LlmCallScope scope,
-                          StreamIdleControl streamIdleControl) {
+                          StreamIdleControl streamIdleControl,
+                          AtomicBoolean authRetried) {
         if (config == null || !config.isUsable()) {
             LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
             onError.accept(new IllegalStateException(
@@ -234,6 +245,26 @@ public class ResponsesSdkProvider implements LlmProvider {
         } catch (Throwable e) {
             if (aborted.get()) {
                 return;   // 用户取消：onError 已由 abort listener 交付
+            }
+            // [C2e-2 401 自愈] access token 被上游判失效 ⇒ 强制刷新一次并用新 token 原样重试。
+            if (isAuthError(e)) {
+                String refreshedAccess = authRetried.compareAndSet(false, true)
+                    ? forceRefreshAccess(config.apiKey()) : null;
+                if (refreshedAccess != null) {
+                    log.info("ResponsesSdkProvider: access token 已失效，刷新后重试一次 model={}", modelName);
+                    // 只换 apiKey：baseUrl / extraHeaders / extraBody 必须与首次尝试完全一致。
+                    ProviderConfig retried = new ProviderConfig(
+                        config.baseUrl(), refreshedAccess, config.extraHeaders(), config.extraBody());
+                    doStream(retried, modelName, systemPromptBlocks, history, tools,
+                        maxOutputTokensOverride, effortValue, onChunk, onAssistantMessage,
+                        onToolCallComplete, onReasoningChunk, aborted, onError, onComplete,
+                        scope, streamIdleControl, authRetried);
+                    return;
+                }
+                // 拿不到新 token（或已经重试过）⇒ 可读错误，不再二次刷新。
+                LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
+                onError.accept(withReloginHint(OpenAiSdkProvider.translateSdkError(e)));
+                return;
             }
             LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
             onError.accept(OpenAiSdkProvider.translateSdkError(e));
@@ -425,18 +456,127 @@ public class ResponsesSdkProvider implements LlmProvider {
         if (config == null || !config.isUsable()) {
             throw new IllegalStateException("ResponsesSdkProvider.chat 调用时 ProviderConfig 不可用");
         }
+        ProviderConfig attempt = config;
+        boolean authRetried = false;
+        while (true) {
+            try {
+                Response response = createOnce(attempt, modelName, systemPrompt, userMessage);
+                String text = extractText(response);
+                if (log.isDebugEnabled()) {
+                    log.debug("ResponsesSdkProvider chat -> model={} outputItems={} textLen={}",
+                        modelName, response.output() == null ? 0 : response.output().size(), text.length());
+                }
+                return text;
+            } catch (RuntimeException e) {
+                // [C2e-2 401 自愈] 同流式：只允许刷新重试一次，第二次认证失败直接交出可读错误。
+                if (isAuthError(e)) {
+                    String refreshedAccess = authRetried ? null : forceRefreshAccess(attempt.apiKey());
+                    authRetried = true;
+                    if (refreshedAccess != null) {
+                        log.info("ResponsesSdkProvider chat: access token 已失效，刷新后重试一次 model={}",
+                            modelName);
+                        attempt = new ProviderConfig(attempt.baseUrl(), refreshedAccess,
+                            attempt.extraHeaders(), attempt.extraBody());
+                        continue;
+                    }
+                    throw withReloginHint(OpenAiSdkProvider.translateSdkError(e));
+                }
+                throw e;
+            }
+        }
+    }
+
+    /** 非流式单次发送（chat 的重试循环复用；⛔ 不做凭据处理）。 */
+    private Response createOnce(ProviderConfig config, String modelName,
+                                String systemPrompt, String userMessage) {
         OpenAIClient client = OpenAiSdkProvider.buildClient(config, null);
         List<ResponseInputItem> input = new ArrayList<>();
         input.add(buildUserItem(null, userMessage, resolveImageDetail(config),
             ModelCapabilityResolver.supportsImage(modelMapper, providerMapper, modelName)));
         ResponseCreateParams params = buildParams(modelName, systemPrompt, input, List.of(), null, null);
-        Response response = client.responses().create(params);
-        String text = extractText(response);
-        if (log.isDebugEnabled()) {
-            log.debug("ResponsesSdkProvider chat -> model={} outputItems={} textLen={}",
-                modelName, response.output() == null ? 0 : response.output().size(), text.length());
+        return client.responses().create(params);
+    }
+
+    // ===================== 401 自愈 =====================
+
+    /**
+     * 认证类失败判定（401 自愈的唯一判据）。
+     *
+     * <p>沿 cause 链找可读状态：401 一律算；403 只有 body 明确说 token 被撤销时才算
+     * （{@code token has been revoked}）—— 其余 403 是权限问题，重新登录无用。
+     * 入参可能是 {@link LlmApiException}（翻译后）或 SDK 原生
+     * {@code OpenAIServiceException}（doStream 未翻译前），也可能被包在别的异常里。
+     */
+    static boolean isAuthError(Throwable t) {
+        Throwable cur = t;
+        for (int depth = 0; cur != null && depth < 16; depth++) {
+            if (cur instanceof LlmApiException api) {
+                if (api.status() == 401) return true;
+                if (api.status() == 403 && isRevokedBody(api.body())) return true;
+            } else if (cur instanceof com.openai.errors.OpenAIServiceException se) {
+                int status = se.statusCode();
+                if (status == 401) return true;
+                if (status == 403 && isRevokedBody(serviceBodyText(se))) return true;
+            }
+            Throwable next = cur.getCause();
+            if (next == cur) break;
+            cur = next;
         }
-        return text;
+        return false;
+    }
+
+    private static boolean isRevokedBody(String body) {
+        return body != null && body.toLowerCase(java.util.Locale.ROOT).contains("token has been revoked");
+    }
+
+    /** {@code OpenAIServiceException.body()} → 文本（JsonValue 是字符串就直取，否则退回 toString）。 */
+    private static String serviceBodyText(com.openai.errors.OpenAIServiceException se) {
+        try {
+            JsonValue body = se.body();
+            if (body == null || body.isNull() || body.isMissing()) {
+                return "";
+            }
+            try {
+                return body.asStringOrThrow();
+            } catch (Exception ignore) {
+                return String.valueOf(body);
+            }
+        } catch (Exception e) {
+            return "";
+        }
+    }
+
+    /**
+     * 认证失效的可读错误：保留原 HTTP 状态，消息追加「重新登录」提示。
+     *
+     * <p>{@link LlmApiException} 的 message 由 body 截断构造（300 字符），故提示追加到 body 尾部
+     * 再重建异常，而不是另起一层包装（保住 status 让上游重试/分类逻辑继续可用）。
+     */
+    static RuntimeException withReloginHint(RuntimeException translated) {
+        String hint = "（登录已失效，请重新登录 ChatGPT 订阅）";
+        if (translated instanceof LlmApiException api) {
+            if (api.body() != null && api.body().contains("登录已失效")) {
+                return api;
+            }
+            return new LlmApiException(api.status(), api.headers(),
+                (api.body() == null ? "" : api.body() + "\n") + hint, api.kind());
+        }
+        String msg = translated.getMessage() == null ? "" : translated.getMessage();
+        return new IllegalStateException(msg + hint, translated);
+    }
+
+    /** 反查并强制刷新 OAuth 凭据；未接线 / 查找失败 / 刷新失败 → null（⛔ 不抛）。 */
+    private String forceRefreshAccess(String currentAccess) {
+        com.nexusai.domain.provider.ProviderService service = this.providerService;
+        if (service == null || currentAccess == null || currentAccess.isBlank()) {
+            return null;
+        }
+        try {
+            return service.forceRefreshByAccessToken(currentAccess);
+        } catch (Exception e) {
+            log.warn("ResponsesSdkProvider: 401 后强制刷新 OAuth 凭据失败: {}", e.getMessage());
+            return null;
+        }
     }
 
     // ===================== 请求构造 =====================
@@ -742,6 +882,13 @@ public class ResponsesSdkProvider implements LlmProvider {
             }
             JsonNode schema = fn.get("parameters");
             if (schema != null && schema.isObject()) {
+                // [schema-pattern-guard 2026-11-16] OpenAI 服务端与 Anthropic/RE2 一样<b>不认</b>
+                //   反斜杠加 u 四位十六进制的 Unicode 转义（线上实测：rea MCP 的
+                //   「排除代理项区间 U+D800..U+DFFF」pattern ⇒ HTTP 200 但 body 报
+                //   invalid_function_parameters ... is not a "regex" ⇒ 整轮工具不可用）。
+                //   复用 Anthropic 侧的守卫：RE2 能编译就原样发，不能则改写/剔除。
+                //   ⚠️ 早前 Anthropic 侧注释写「openai 侧不改」是错的——OpenAI 不是 JS 正则。
+                schema = AnthropicSdkProvider.sanitizeAnthropicSchemaPatterns(schema, name);
                 FunctionTool.Parameters.Builder pb = FunctionTool.Parameters.builder();
                 Iterator<Map.Entry<String, JsonNode>> fields = schema.fields();
                 while (fields.hasNext()) {

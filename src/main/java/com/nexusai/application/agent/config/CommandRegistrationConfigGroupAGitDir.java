@@ -9,6 +9,10 @@ import com.nexusai.application.agent.permission.PermissionUpdate;
 import com.nexusai.application.agent.permission.PermissionUpdateApplier;
 import com.nexusai.application.agent.permission.PermissionUpdatePersister;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.application.agent.permission.hook.GenericHook;
+import com.nexusai.application.agent.permission.hook.HookEvent;
+import com.nexusai.application.agent.permission.hook.HookEventType;
+import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.prompt.GitStatusProvider;
 import com.nexusai.application.agent.skill.BundledSkillDefinition;
 import com.nexusai.application.agent.skill.BundledSkills;
@@ -281,7 +285,8 @@ public class CommandRegistrationConfigGroupAGitDir {
     public CommandLocalSlashRegistrationGroupA commandLocalSlashRegistrationGroupA(
             UserInputDispatcher dispatcher,
             @Autowired(required = false) PermissionUpdatePersister permissionUpdatePersister,
-            @Autowired(required = false) PermissionUpdateApplier permissionUpdateApplier) {
+            @Autowired(required = false) PermissionUpdateApplier permissionUpdateApplier,
+            @Autowired(required = false) HookRegistry hookRegistry) {
         if (dispatcher == null) {
             log.warn("[CommandRegistrationConfigGroupAGitDir] UserInputDispatcher 未注入，local 命令执行 handler 注册跳过");
             return new CommandLocalSlashRegistrationGroupA();
@@ -289,7 +294,7 @@ public class CommandRegistrationConfigGroupAGitDir {
         registerBranchHandler(dispatcher);
         registerDiffHandler(dispatcher);
         registerRewindHandler(dispatcher);
-        registerAddDirHandler(dispatcher, permissionUpdatePersister, permissionUpdateApplier);
+        registerAddDirHandler(dispatcher, permissionUpdatePersister, permissionUpdateApplier, hookRegistry);
         if (log.isDebugEnabled()) {
             log.debug("[CommandRegistrationConfigGroupAGitDir] local 命令执行 handler 注册完成：branch/diff/rewind/add-dir");
         }
@@ -389,7 +394,8 @@ public class CommandRegistrationConfigGroupAGitDir {
      */
     private void registerAddDirHandler(UserInputDispatcher dispatcher,
                                        PermissionUpdatePersister persister,
-                                       PermissionUpdateApplier applier) {
+                                       PermissionUpdateApplier applier,
+                                       HookRegistry hookRegistry) {
         dispatcher.registerSlashCommand("add-dir", (args, sessionId, inFlightUserMessageId) -> {
             String directoryPath = args != null ? args.trim() : "";
             if (directoryPath.isEmpty()) {
@@ -420,12 +426,61 @@ public class CommandRegistrationConfigGroupAGitDir {
                 }
                 log.info("[CommandRegistrationConfigGroupAGitDir] /add-dir 执行完成: Added {} as a working directory（CC add-dir.tsx:95-107 handleAddDirectory）",
                     success.absolutePath());
+                // [Wave2-G] DirectoryAdded hook · 对齐 claude.exe v2.1.325（输入 schema off≈311,040,xxx
+                //   {@code iX}：{@code directory, source(slash_command|register_repo_root)}）。
+                //   CC 时机 = 目录已加入、沙箱配置已刷新之后（纯观察点，监听类 hook 做索引/审计）。
+                //   matcher 匹配字段是 source（不是 directory）。
+                //   ⚠️ 该事件无专属 hookSpecificOutput 变体；且此刻目录已持久化 —— 权限否决/阻断
+                //   无法回滚（persister 无撤销 API），故只做可观测记录，不假装能拦住。
+                fireDirectoryAddedHook(hookRegistry, sessionId, success.absolutePath());
             } else {
                 log.warn("[CommandRegistrationConfigGroupAGitDir] /add-dir 校验失败: {}（CC add-dir.tsx:117-121 addDirHelpMessage）",
                     AddDirValidator.addDirHelpMessage(result));
             }
         });
         log.info("[CommandRegistrationConfigGroupAGitDir] /add-dir 已注册为生产 slash command（对齐 CC commands/add-dir/add-dir.tsx call）");
+    }
+
+    /**
+     * [Wave2-G] 触发 {@code DirectoryAdded} hook · 对齐 claude.exe v2.1.325。
+     *
+     * <p><b>输入</b>：{@code directory} = 新增目录绝对路径（{@link AddDirValidator.SuccessResult#absolutePath()}），
+     * {@code source} = {@code slash_command}（本入口仅 /add-dir；SDK {@code register_repo_root} 在本仓无通道）。
+     * matcher 匹配字段 = {@code source}。
+     *
+     * <p><b>消费</b>：本事件无专属 hookSpecificOutput；此处只作观察点 —— 目录已持久化，
+     * 权限否决/阻断无回滚通道（{@link PermissionUpdatePersister} 无撤销 API），因此 blocking 只
+     * warn 记录，不声称已拦截（避免假实现）。
+     *
+     * @param registry  Hook 注册表（可 null = 未注入，直接跳过）
+     * @param sessionId 会话 ID（可 null）
+     * @param directory 已加入的目录绝对路径
+     */
+    private static void fireDirectoryAddedHook(HookRegistry registry, String sessionId, String directory) {
+        if (registry == null || directory == null || directory.isBlank()) {
+            return;
+        }
+        try {
+            String eventName = HookEventType.DIRECTORY_ADDED.ccName();
+            if (!registry.hasHookForEvent(eventName, sessionId)) {
+                return;
+            }
+            HookEvent event = HookEvent.directoryAdded(directory, "slash_command", sessionId);
+            GenericHook.HookResult r = registry.executeEvent(event, null);
+            if (r == null) {
+                return;
+            }
+            if (r.preventContinuation() || r.blockingError() != null
+                || r.permissionBehavior() == com.nexusai.application.agent.hook.PermissionBehavior.DENY) {
+                log.warn("[CommandRegistrationConfigGroupAGitDir] DirectoryAdded hook 要求阻断，但目录已持久化"
+                        + "（无撤销通道）：directory={} reason={}",
+                    directory,
+                    r.hookPermissionDecisionReason() != null ? r.hookPermissionDecisionReason()
+                        : (r.blockingError() != null ? r.blockingError().blockingError() : r.stopReason()));
+            }
+        } catch (Exception e) {
+            log.warn("[CommandRegistrationConfigGroupAGitDir] DirectoryAdded hook 执行失败（忽略）: {}", e.toString());
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════════

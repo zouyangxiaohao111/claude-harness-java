@@ -956,15 +956,28 @@ public class PluginInstaller {
         }
     }
 
-    /** 递归删除（对齐 CC rm -rf force）。 */
+    /**
+     * 递归删除（对齐 CC rm -rf force）。
+     *
+     * <p><b>必须逆序</b>：{@code Files.walk} 先返回父目录再返回子项，直接按流序删父目录会抛
+     * {@code DirectoryNotEmptyException} 并中断整个循环 ⇒ 非空目录永远删不掉（旧实现即如此）。
+     * 删不掉旧目录会让后续 move 退化成 copy 合并，把上一版本的残留文件带进新版本目录
+     * （2026-11-16「更新后仍显示可更新」的根因）。
+     */
     static void deleteRecursively(Path path) {
         if (path == null || !Files.exists(path)) {
             return;
         }
         try (Stream<Path> stream = Files.walk(path)) {
-            for (Path p : (Iterable<Path>) stream::iterator) {
-                Files.deleteIfExists(p);
-            }
+            stream.sorted(java.util.Comparator.reverseOrder()).forEach(p -> {
+                try {
+                    Files.deleteIfExists(p);
+                } catch (IOException e) {
+                    if (log.isDebugEnabled()) {
+                        log.debug("删除失败 {}: {}", p, e.getMessage());
+                    }
+                }
+            });
         } catch (IOException e) {
             if (log.isDebugEnabled()) {
                 log.debug("递归删除失败 {}: {}", path, e.getMessage());

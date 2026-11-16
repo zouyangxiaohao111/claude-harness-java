@@ -448,7 +448,9 @@ class ExecAgentHookSemanticsTest {
             null, null, /* rerankTopN / rerankInstruct（V200） */
             "p1", "provider-1" /* providerId / providerName（2026-11-11 模型下拉分组） */);
         ProviderDto provider = new ProviderDto("p1", "provider-1", ProviderType.openai_compatible,
-            "http://llm.local", null, Map.of(), true, List.of(model), null, null);
+            "http://llm.local", null, Map.of(), true, List.of(model), null, null,
+            "api_key", null, null /* [V296] authMode / oauthAccountId / oauthExpiresAt */,
+            null /* [V299] brandKey */);
         ProviderService ps = new ProviderService() {
             @Override public List<ProviderDto> listAll() { return List.of(provider); }
             @Override public String getDecryptedApiKey(String id) { return "sk-real"; }

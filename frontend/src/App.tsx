@@ -105,7 +105,7 @@ import { EffortModal } from '@/components/modals/EffortModal'
 import { ContextAnalyzeModal } from '@/components/modals/ContextAnalyzeModal'
 import { UsageCostModal } from '@/components/modals/UsageCostModal'
 import { MemoryEditorModal } from '@/components/modals/MemoryEditorModal'
-import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
+import { SkillMarketModal, type MarketTab } from '@/components/modals/SkillMarketModal'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { describeIncludeStatusProbeFailure, getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
@@ -243,6 +243,12 @@ function App() {
 
   // ---- 技能市场弹窗（Composer 顶部 agent 胶囊点击触发 · App 持有开关 + 渲染 SkillMarketModal）----
   const [showMarket, setShowMarket] = useState(false)
+  /** 打开市场时停在哪个 tab（+ 菜单「专家/技能/连接器」指定；其它入口默认专家） */
+  const [marketTab, setMarketTab] = useState<MarketTab>('expert')
+  const openMarket = (tab: MarketTab = 'expert') => {
+    setMarketTab(tab)
+    setShowMarket(true)
+  }
   /**
    * 知识库浮层（2026-11-06 用户裁定：知识库是**独立场景**，用弹窗承载，
    * ⛔ 不再替换主区 —— 主对话保持原位可见）。
@@ -3224,7 +3230,7 @@ function App() {
         // 左栏「定时任务」→ 主区换页（走现有 useSchedules，不弹设置）
         onOpenSchedules={() => setWorkspacePage('schedules')}
         schedulesActive={showSchedulesPage}
-        onOpenAgentMarket={() => setShowMarket(true)}
+        onOpenAgentMarket={() => openMarket('expert')}
         onOpenKnowledgeBase={() => {
           // ⭐ 用户 2026-11-09 裁定：「点开默认就是独立窗口」。
           //   知识库不再先弹浮层 —— 直接开**新的 Tauri 窗口**（系统级窗口，可拖到另一块屏）。
@@ -3312,6 +3318,8 @@ function App() {
               //   tool_result 到达时由 fillToolResult 自动清除（事件缺失时不再无限「执行中」）
               useChatStore.getState().markToolAnswered(targetSession, currentPermission.toolUseId ?? id)
               dequeuePermission(id)
+              // 同一 tool_use 的 bridge 条目 requestId 不同 ⇒ 只删本条会留一条 ⇒ 左栏黄点常亮
+              useChatStore.getState().clearPermissionByToolUse(targetSession, currentPermission.toolUseId ?? id)
             }}
             onAbort={() => {
               // 中止权限请求（对齐 CC Ctrl+C onReject · 用户放弃决策 → deny + dequeue，解除 worker 等待）
@@ -3371,7 +3379,7 @@ function App() {
             currentAgent={currentAgent}
             onClearAgent={() => void handleAgentChange(null)}
             slashAlias={slashAlias}
-            onOpenMarket={() => setShowMarket(true)}
+            onOpenMarket={(tab) => openMarket(tab)}
             onSetGoal={async (condition) => {
               // 只有真正设成功才关面板：runBuiltin 内部已 catch 并弹 toast，失败时返回 false
               //   ⇒ 保持面板打开，条件不丢（用户可改后重试）。
@@ -3631,7 +3639,7 @@ function App() {
               onOpenArtifacts={() => { setShowKnowledge(false); openRightTab('artifacts') }}
               onOpenAgents={() => { setShowKnowledge(false); setShowAgentsPanel(true) }}
               onOpenSchedules={() => { setShowKnowledge(false); setWorkspacePage('schedules') }}
-              onOpenToolbox={() => { setShowKnowledge(false); setShowMarket(true) }}
+              onOpenToolbox={() => { setShowKnowledge(false); openMarket('expert') }}
               // ⭐ 共享空间 = 场景内的独立一页（不关弹窗、不重开）
               onOpenSharedSpace={() => setKbScene('shared')}
               onBackToList={() => { setKbView('knowledge'); setKbScene('knowledge') }}
@@ -3656,6 +3664,7 @@ function App() {
           sessionId={activeSessionId ?? ''}
           currentAgent={currentAgent}
           busy={turnRunning}
+          initialTab={marketTab}
           onClose={() => setShowMarket(false)}
           onUseLocalAgent={handleMarketUseLocal}
           onSummonSkill={(cmd, display) => {

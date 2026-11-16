@@ -284,6 +284,16 @@ public final class HookOutputParser {
         String stopReason = null;
         PermissionBehavior permissionBehavior = null;
 
+        // [Wave1-B] v2.1.325 输出面 8 字段 · 各自有归属变体（见下方 switch）
+        String terminalSequence = json.terminalSequence();
+        Object updatedToolOutput = null;
+        String classifierContext = null;
+        String sessionTitle = null;
+        Boolean suppressOriginalPrompt = null;
+        Boolean reloadSkills = null;
+        String displayContent = null;
+        HookSpecificOutput.PermissionDisplay permissionDisplay = null;
+
         // awaiting 5 字段 → ParsedHookJSONOutput 载体 (不进 HookResult)
         String initialUserMessage = null;
         PermissionRequestResult permissionRequestResult = null;
@@ -336,9 +346,13 @@ public final class HookOutputParser {
                 case "ask":
                     permissionBehavior = PermissionBehavior.ASK;
                     break;
+                case "defer":
+                    // [Wave1-B] CC v2.1.325 第四值：print 模式挂起单条调用（见 PermissionBehavior.DEFER）
+                    permissionBehavior = PermissionBehavior.DEFER;
+                    break;
                 default:
                     throw new IllegalArgumentException("Unknown hook permissionDecision type: "
-                        + pre.permissionDecision() + ". Valid types are: allow, deny, ask");
+                        + pre.permissionDecision() + ". Valid types are: allow, deny, ask, defer");
             }
         }
 
@@ -370,6 +384,8 @@ public final class HookOutputParser {
                                     hookCommand);
                             }
                             case "ask" -> permissionBehavior = PermissionBehavior.ASK;
+                            // [Wave1-B] defer：print 模式挂起单条调用
+                            case "defer" -> permissionBehavior = PermissionBehavior.DEFER;
                         }
                     }
                     hookPermissionDecisionReason = pre.permissionDecisionReason();
@@ -377,25 +393,66 @@ public final class HookOutputParser {
                         updatedInput = pre.updatedInput();
                     }
                     additionalContext = pre.additionalContext();
+                    permissionDisplay = pre.permissionDisplay();
                 }
-                case HookSpecificOutput.UserPromptSubmit up ->
+                case HookSpecificOutput.UserPromptSubmit up -> {
                     additionalContext = up.additionalContext();
+                    sessionTitle = up.sessionTitle();
+                    suppressOriginalPrompt = up.suppressOriginalPrompt();
+                }
+                case HookSpecificOutput.UserPromptExpansion upe -> {
+                    // [Wave1-B] 展开前拦截：上下文与"不回显原 prompt"各自承载
+                    additionalContext = upe.additionalContext();
+                    suppressOriginalPrompt = upe.suppressOriginalPrompt();
+                }
                 case HookSpecificOutput.SessionStart ss -> {
                     additionalContext = ss.additionalContext();
                     initialUserMessage = ss.initialUserMessage();
                     if (ss.watchPaths() != null) {
                         watchPaths = ss.watchPaths();
                     }
+                    sessionTitle = ss.sessionTitle();
+                    reloadSkills = ss.reloadSkills();
                 }
                 case HookSpecificOutput.Setup setup -> additionalContext = setup.additionalContext();
+                case HookSpecificOutput.PreModelSwitch pms -> {
+                    // [Wave1-B] 换模型前：与 PreToolUse 同契约的 allow/deny/ask
+                    String pd = pms.permissionDecision();
+                    if ("allow".equals(pd)) {
+                        permissionBehavior = PermissionBehavior.ALLOW;
+                    } else if ("deny".equals(pd)) {
+                        permissionBehavior = PermissionBehavior.DENY;
+                        blockingError = new HookBlockingError(
+                            pms.permissionDecisionReason() != null ? pms.permissionDecisionReason()
+                                : (json.reason() != null ? json.reason() : "Model switch blocked by hook"),
+                            hookCommand);
+                    } else if ("ask".equals(pd)) {
+                        permissionBehavior = PermissionBehavior.ASK;
+                    }
+                    if (pms.permissionDecisionReason() != null) {
+                        hookPermissionDecisionReason = pms.permissionDecisionReason();
+                    }
+                }
+                case HookSpecificOutput.PostModelSwitch pms2 -> additionalContext = pms2.additionalContext();
                 case HookSpecificOutput.SubagentStart sa -> additionalContext = sa.additionalContext();
                 case HookSpecificOutput.PostToolUse post -> {
                     additionalContext = post.additionalContext();
+                    classifierContext = post.classifierContext();
+                    // [Wave1-B] updatedToolOutput 优先：适用于所有工具；updatedMCPToolOutput 仅 MCP
+                    if (post.updatedToolOutput() != null) {
+                        updatedToolOutput = post.updatedToolOutput();
+                    }
                     if (post.updatedMCPToolOutput() != null) {
                         updatedMCPToolOutput = post.updatedMCPToolOutput();
                     }
                 }
                 case HookSpecificOutput.PostToolUseFailure pf -> additionalContext = pf.additionalContext();
+                case HookSpecificOutput.PostToolBatch ptb -> additionalContext = ptb.additionalContext();
+                case HookSpecificOutput.Stop stopHso -> additionalContext = stopHso.additionalContext();
+                case HookSpecificOutput.SubagentStop subStop ->
+                    // [Wave1-B] CC 非错误反馈：送给子代理并让它继续（绝不产 blockingError）
+                    additionalContext = subStop.additionalContext();
+                case HookSpecificOutput.MessageDisplay md -> displayContent = md.displayContent();
                 case HookSpecificOutput.PermissionDenied pd -> retry = pd.retry();
                 case HookSpecificOutput.Notification ignored ->
                     // CC 无 case = no-op (types/hooks.ts:117-119)
@@ -484,7 +541,10 @@ public final class HookOutputParser {
             // [2026-08-12 △-01] awaiting 4 字段回填 HookResult 顶层 · 对齐 CC HookResult 18 字段
             //   (utils/hooks.ts:338-357): 旧实现只存 ParsedHookJSONOutput, executeEvent 折叠链
             //   上静默丢失. 现在直接构造进 result, 消费方 (ElicitationHandler/SessionStart) 可取.
-            initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse);
+            initialUserMessage, watchPaths, elicitationResponse, elicitationResultResponse,
+            // [Wave1-B] 8 个 v2.1.325 输出字段（canonical 27 参构造，不经转发构造器以免丢值）
+            null, terminalSequence, updatedToolOutput, classifierContext, sessionTitle,
+            suppressOriginalPrompt, reloadSkills, displayContent, permissionDisplay);
 
         if (log.isDebugEnabled()) {
             log.debug("HOOK JSON 处理完成: preventContinuation={} permissionBehavior={} blockingError={}",
@@ -706,6 +766,9 @@ public final class HookOutputParser {
         }
         String reason = textOrThrow(node, "reason", "reason");
         String systemMessage = textOrThrow(node, "systemMessage", "systemMessage");
+        // [Wave1-B] terminalSequence: z.string().optional()（exe off≈311,059,830, NX 顶层第 6 字段）
+        //   CC 只校验"是字符串"，OSC/BEL 白名单在 CLI 落地时做（本仓无终端渲染层 → 原样承载）。
+        String terminalSequence = textOrThrow(node, "terminalSequence", "terminalSequence");
         // hookSpecificOutput: z.union(...).optional() (types/hooks.ts:70-164) — 存在但非对象 → 拒绝
         HookSpecificOutput hso = null;
         if (node.has("hookSpecificOutput")) {
@@ -721,6 +784,7 @@ public final class HookOutputParser {
             decision,
             reason,
             systemMessage,
+            terminalSequence,
             hso);
     }
 
@@ -759,6 +823,8 @@ public final class HookOutputParser {
         String decision = textOrNull(node, "decision");
         String reason = textOrNull(node, "reason");
         String systemMessage = textOrNull(node, "systemMessage");
+        // [Wave1-B] 宽松提取 terminalSequence（类型偏差 → null，绝不 throw）
+        String terminalSequence = textOrNull(node, "terminalSequence");
         HookSpecificOutput hso = null;
         if (node.has("hookSpecificOutput") && node.get("hookSpecificOutput").isObject()) {
             try {
@@ -777,11 +843,12 @@ public final class HookOutputParser {
             decision,
             reason,
             systemMessage,
+            terminalSequence,
             hso);
     }
 
     /**
-     * 手动按 hookEventName 构造 15 子类型 HookSpecificOutput · [S4 G17] zod 严格化.
+     * 手动按 hookEventName 构造 22 子类型 HookSpecificOutput · [S4 G17] zod 严格化.
      *
      * <p>WHY (H2-GAP-2 + S4 G17): 手动 switch hookEventName 按 CC types/hooks.ts:70-163
      * 逐子类型构造字段. [S4] 对齐 CC zod union 语义 — hookEventName 缺失/非文本/未知名
@@ -803,21 +870,40 @@ public final class HookOutputParser {
         String eventName = eventNameNode.asText();
         switch (eventName) {
             case "PreToolUse":
+                // [Wave1-B] permissionDecision 第四值 defer（CC v2.1.325 S2 = allow/deny/ask/defer）
                 return new HookSpecificOutput.PreToolUse(
-                    enumOrThrow(node, "permissionDecision", "permissionDecision", "allow", "deny", "ask"),
+                    enumOrThrow(node, "permissionDecision", "permissionDecision",
+                        "allow", "deny", "ask", "defer"),
                     textOrThrow(node, "permissionDecisionReason", "permissionDecisionReason"),
                     objMapOrThrow(node, "updatedInput"),
-                    textOrThrow(node, "additionalContext", "additionalContext"));
+                    textOrThrow(node, "additionalContext", "additionalContext"),
+                    parsePermissionDisplay(node));
             case "UserPromptSubmit":
                 return new HookSpecificOutput.UserPromptSubmit(
-                    textOrThrow(node, "additionalContext", "additionalContext"));
+                    textOrThrow(node, "additionalContext", "additionalContext"),
+                    textOrThrow(node, "sessionTitle", "sessionTitle"),
+                    boolOrThrow(node, "suppressOriginalPrompt"));
+            case "UserPromptExpansion":
+                return new HookSpecificOutput.UserPromptExpansion(
+                    textOrThrow(node, "additionalContext", "additionalContext"),
+                    boolOrThrow(node, "suppressOriginalPrompt"));
             case "SessionStart":
                 return new HookSpecificOutput.SessionStart(
                     textOrThrow(node, "additionalContext", "additionalContext"),
                     textOrThrow(node, "initialUserMessage", "initialUserMessage"),
-                    strListOrThrow(node, "watchPaths"));
+                    strListOrThrow(node, "watchPaths"),
+                    textOrThrow(node, "sessionTitle", "sessionTitle"),
+                    boolOrThrow(node, "reloadSkills"));
             case "Setup":
                 return new HookSpecificOutput.Setup(
+                    textOrThrow(node, "additionalContext", "additionalContext"));
+            case "PreModelSwitch":
+                // [Wave1-B] CC schema 三值 allow/deny/ask（defer 不进本事件）
+                return new HookSpecificOutput.PreModelSwitch(
+                    enumOrThrow(node, "permissionDecision", "permissionDecision", "allow", "deny", "ask"),
+                    textOrThrow(node, "permissionDecisionReason", "permissionDecisionReason"));
+            case "PostModelSwitch":
+                return new HookSpecificOutput.PostModelSwitch(
                     textOrThrow(node, "additionalContext", "additionalContext"));
             case "SubagentStart":
                 return new HookSpecificOutput.SubagentStart(
@@ -826,9 +912,21 @@ public final class HookOutputParser {
                 return new HookSpecificOutput.PostToolUse(
                     textOrThrow(node, "additionalContext", "additionalContext"),
                     node.has("updatedMCPToolOutput") && !node.get("updatedMCPToolOutput").isNull()
-                        ? MAPPER.convertValue(node.get("updatedMCPToolOutput"), Object.class) : null);
+                        ? MAPPER.convertValue(node.get("updatedMCPToolOutput"), Object.class) : null,
+                    textOrThrow(node, "classifierContext", "classifierContext"),
+                    node.has("updatedToolOutput") && !node.get("updatedToolOutput").isNull()
+                        ? MAPPER.convertValue(node.get("updatedToolOutput"), Object.class) : null);
             case "PostToolUseFailure":
                 return new HookSpecificOutput.PostToolUseFailure(
+                    textOrThrow(node, "additionalContext", "additionalContext"));
+            case "PostToolBatch":
+                return new HookSpecificOutput.PostToolBatch(
+                    textOrThrow(node, "additionalContext", "additionalContext"));
+            case "Stop":
+                return new HookSpecificOutput.Stop(
+                    textOrThrow(node, "additionalContext", "additionalContext"));
+            case "SubagentStop":
+                return new HookSpecificOutput.SubagentStop(
                     textOrThrow(node, "additionalContext", "additionalContext"));
             case "PermissionDenied":
                 return new HookSpecificOutput.PermissionDenied(
@@ -857,11 +955,33 @@ public final class HookOutputParser {
                         "WorktreeCreate.worktreePath is required");
                 }
                 return new HookSpecificOutput.WorktreeCreate(node.get("worktreePath").asText());
+            case "MessageDisplay":
+                return new HookSpecificOutput.MessageDisplay(
+                    textOrThrow(node, "displayContent", "displayContent"));
             default:
                 // 未知名 → union 无匹配成员 → 拒绝 (CC zod union 语义; 旧 lenient null 降级已删)
                 throw new IllegalArgumentException(
                     "Unknown hookEventName: " + eventName);
         }
+    }
+
+    /**
+     * PreToolUse.{@code permissionDisplay} 解析 · CC v2.1.325 {@code sZs}.
+     *
+     * <p><b>宽松语义（CC 原文 {@code .catch(void 0)}）</b>: 该字段畸形时<b>整字段丢弃</b>，
+     * 不让整个 hook 输出失效 —— 与同变体其它字段的 zod 拒绝语义不同，故单独解析。
+     * 缺失/非对象 → null；子字段非字符串 → 该子字段 null。
+     *
+     * @param hso hookSpecificOutput 对象
+     * @return {@link HookSpecificOutput.PermissionDisplay}；缺失/畸形 → null
+     */
+    private static HookSpecificOutput.PermissionDisplay parsePermissionDisplay(JsonNode hso) {
+        JsonNode n = hso.get("permissionDisplay");
+        if (n == null || n.isNull() || !n.isObject()) {
+            return null;
+        }
+        return new HookSpecificOutput.PermissionDisplay(
+            textOrNull(n, "title"), textOrNull(n, "description"), textOrNull(n, "displayName"));
     }
 
     /**

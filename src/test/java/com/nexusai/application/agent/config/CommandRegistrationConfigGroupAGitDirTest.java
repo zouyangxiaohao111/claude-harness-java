@@ -134,7 +134,7 @@ class CommandRegistrationConfigGroupAGitDirTest {
     @DisplayName("local 命令执行 handler 注册进 UserInputDispatcher：/name 触发后端执行")
     void localSlashHandlersRegisteredAndDispatchable() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
-        config.commandLocalSlashRegistrationGroupA(dispatcher, null, null);
+        config.commandLocalSlashRegistrationGroupA(dispatcher, null, null, null);
 
         // [批 3c] 本用例只验证「handler 注册面 → 命名路由/结果种类」，不涉会话 → 以下分派一律显式
         //   传 null（旧实现里等价于 MDC 为空；会话驱动的真实执行由带 sessionId 的用例覆盖）

@@ -736,6 +736,21 @@ public class McpServerService {
         return java.util.Optional.of(serverConfig(r.toDomain()));
     }
 
+    /**
+     * [Hook v2.1.325] 按 server 名取配置 scope（hook 输入 {@code mcp_server.source} 用）。
+     * DB scope 是唯一运行时源（V59）：project/user/local/enterprise/dynamic/claudeai。
+     *
+     * @param name MCP server 名
+     * @return scope；未找到 → null
+     */
+    public String getScopeByName(String name) {
+        if (name == null || name.isBlank()) {
+            return null;
+        }
+        McpServerRecord r = mcpServerMapper.selectOneByName(name);
+        return r != null ? r.getScope() : null;
+    }
+
     /** 单 server → config Map（stdio→command+args；远程→command 列存 url）。 */
     private Map<String, Object> serverConfig(McpServer s) {
         Map<String, Object> cfg = new LinkedHashMap<>();

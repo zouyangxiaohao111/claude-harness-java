@@ -25,6 +25,15 @@ public class ProviderRecord {
     private Boolean enabled;
     private String createdAt;
     private String updatedAt;
+    /** [V296] 凭据形态：api_key | codex_oauth（NOT NULL DEFAULT 'api_key'）。 */
+    private String authMode;
+    private String oauthAccessEncrypted;
+    private String oauthRefreshEncrypted;
+    private Long oauthExpiresAt;
+    private String oauthAccountId;
+    private String oauthState;
+    /** [V299] 归属品牌 key（null = 自定义连接）。 */
+    private String brandKey;
 
     public Provider toDomain() {
         Provider p = new Provider();
@@ -39,6 +48,13 @@ public class ProviderRecord {
         p.setEnabled(enabled);
         p.setCreatedAt(createdAt);
         p.setUpdatedAt(updatedAt);
+        p.setAuthMode(authMode);
+        p.setOauthAccessEncrypted(oauthAccessEncrypted);
+        p.setOauthRefreshEncrypted(oauthRefreshEncrypted);
+        p.setOauthExpiresAt(oauthExpiresAt);
+        p.setOauthAccountId(oauthAccountId);
+        p.setOauthState(oauthState);
+        p.setBrandKey(brandKey);
         return p;
     }
 
@@ -55,6 +71,13 @@ public class ProviderRecord {
         r.setEnabled(p.getEnabled());
         r.setCreatedAt(p.getCreatedAt());
         r.setUpdatedAt(p.getUpdatedAt());
+        r.setAuthMode(p.getAuthMode());
+        r.setOauthAccessEncrypted(p.getOauthAccessEncrypted());
+        r.setOauthRefreshEncrypted(p.getOauthRefreshEncrypted());
+        r.setOauthExpiresAt(p.getOauthExpiresAt());
+        r.setOauthAccountId(p.getOauthAccountId());
+        r.setOauthState(p.getOauthState());
+        r.setBrandKey(p.getBrandKey());
         return r;
     }
 
@@ -80,4 +103,18 @@ public class ProviderRecord {
     public void setCreatedAt(String createdAt) { this.createdAt = createdAt; }
     public String getUpdatedAt() { return updatedAt; }
     public void setUpdatedAt(String updatedAt) { this.updatedAt = updatedAt; }
+    public String getAuthMode() { return authMode; }
+    public void setAuthMode(String authMode) { this.authMode = authMode; }
+    public String getOauthAccessEncrypted() { return oauthAccessEncrypted; }
+    public void setOauthAccessEncrypted(String oauthAccessEncrypted) { this.oauthAccessEncrypted = oauthAccessEncrypted; }
+    public String getOauthRefreshEncrypted() { return oauthRefreshEncrypted; }
+    public void setOauthRefreshEncrypted(String oauthRefreshEncrypted) { this.oauthRefreshEncrypted = oauthRefreshEncrypted; }
+    public Long getOauthExpiresAt() { return oauthExpiresAt; }
+    public void setOauthExpiresAt(Long oauthExpiresAt) { this.oauthExpiresAt = oauthExpiresAt; }
+    public String getOauthAccountId() { return oauthAccountId; }
+    public void setOauthAccountId(String oauthAccountId) { this.oauthAccountId = oauthAccountId; }
+    public String getOauthState() { return oauthState; }
+    public void setOauthState(String oauthState) { this.oauthState = oauthState; }
+    public String getBrandKey() { return brandKey; }
+    public void setBrandKey(String brandKey) { this.brandKey = brandKey; }
 }

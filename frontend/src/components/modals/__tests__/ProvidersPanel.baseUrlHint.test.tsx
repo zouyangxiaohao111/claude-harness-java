@@ -112,6 +112,12 @@ describe('ProvidersPanel · Base URL 提示按协议切换', () => {
   it('新建：默认 OpenAI 兼容 → 提示「填到 /v1 为止 · 请求 {base}/chat/completions」', () => {
     draw(makeApi([]))
     act(() => byText('button', '+ 添加提供商').click())
+    // [V299] 添加的第一步是「选品牌」；本文件用例走自定义
+    act(() => {
+      const custom = container.querySelector<HTMLButtonElement>('.brand-picker-custom')
+      if (!custom) throw new Error('未找到自定义连接入口')
+      custom.click()
+    })
 
     expect(renderedHint('https://api.openai.com/v1')).toBe(OPENAI_HINT)
   })
@@ -119,6 +125,12 @@ describe('ProvidersPanel · Base URL 提示按协议切换', () => {
   it('新建：切到 Anthropic 原生 → 提示变成「只填域名、不带 /v1 · 请求 {base}/v1/messages」', () => {
     draw(makeApi([]))
     act(() => byText('button', '+ 添加提供商').click())
+    // [V299] 添加的第一步是「选品牌」；本文件用例走自定义
+    act(() => {
+      const custom = container.querySelector<HTMLButtonElement>('.brand-picker-custom')
+      if (!custom) throw new Error('未找到自定义连接入口')
+      custom.click()
+    })
     pickProtocol('Anthropic 原生')
 
     expect(renderedHint('https://api.openai.com/v1')).toBe(ANTHROPIC_HINT)
@@ -127,6 +139,12 @@ describe('ProvidersPanel · Base URL 提示按协议切换', () => {
   it('新建：切回 OpenAI 兼容 → 提示还原（不是单向切换）', () => {
     draw(makeApi([]))
     act(() => byText('button', '+ 添加提供商').click())
+    // [V299] 添加的第一步是「选品牌」；本文件用例走自定义
+    act(() => {
+      const custom = container.querySelector<HTMLButtonElement>('.brand-picker-custom')
+      if (!custom) throw new Error('未找到自定义连接入口')
+      custom.click()
+    })
     pickProtocol('Anthropic 原生')
     pickProtocol('OpenAI 兼容')
 

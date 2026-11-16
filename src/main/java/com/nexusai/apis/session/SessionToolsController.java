@@ -41,9 +41,10 @@ import java.util.UUID;
  * <b>不含</b>会话禁用剔除）——被禁工具必须仍在列表（disabled=true），否则前端无法恢复。
  * LLM schema 口径（含剔除）在 LlmAgentLoop.sessionVisibleTools 内，本控制器不重复实现。
  *
- * <p><b>[tool-categories] 分类与批量开关</b>：每条工具带 {@code category}（CU/KB/BR/SYS，由
+ * <p><b>[tool-categories] 分类与批量开关</b>：每条工具带 {@code category}（CU/KB/BR/MCP/SYS，由
  * {@link SessionToolCategory#of} 判定）与 {@code description} 原文；{@code PATCH /tools} 按分类
- * 批量启用/禁用（跳过核心编排工具），返回整表供前端一次替换。
+ * 批量启用/禁用（跳过核心编排工具），返回整表供前端一次替换。MCP 类另带 {@code mcpServer}，
+ * 支持「只开关某个 MCP server」的中间一级（{@code {category:"MCP", mcpServer:"rea"}}）。
  */
 @RestController
 @RequestMapping("/api/v1/sessions/{sessionId}/tools")
@@ -86,18 +87,22 @@ public class SessionToolsController {
     }
 
     /**
-     * 分类批量启用/禁用 · PATCH /api/v1/sessions/{sessionId}/tools。
+     * 分类（或 MCP server）批量启用/禁用 · PATCH /api/v1/sessions/{sessionId}/tools。
      *
      * <p><b>WHY</b>: 前端一级目录每类的开关只发一次请求（⛔ 不是循环 N 次单工具 PATCH）。
      * {@code enabled=false} → 该分类全部工具加入禁用集合，<b>跳过</b>核心编排工具
      * （Agent/TaskStop/SendMessage 后端禁用会 400，跳过而不是整组失败）；
      * {@code enabled=true} → 该分类全部移出禁用集合。
      *
+     * <p><b>[tool-categories] MCP 三级联动</b>：{@code category=MCP} 且 {@code mcpServer} 非空时，
+     * 只操作该 server 的工具（{@code mcpServerOf(name).equals(mcpServer)}）；{@code mcpServer}
+     * 为空 → 整个 MCP 分类（等价于「关闭全部 MCP 工具」）。{@code mcpServer} 与其它分类组合 → 400。
+     *
      * <p><b>起点口径</b>：若该会话 {@code disabled_tools} 为 null（从未设置），起点用默认禁用集
      * （电脑操作 + 知识库）——否则「打开浏览器组」会把默认禁用的 50 项一起算成未禁用。
      *
      * @param sessionId 会话 ID（路径变量）
-     * @param req       { category, enabled }
+     * @param req       { category, enabled, mcpServer? }
      * @return 200 更新后的完整列表（与 GET 同形，前端整表替换）
      */
     @PatchMapping
@@ -108,6 +113,15 @@ public class SessionToolsController {
             throw new ValidationException("Invalid tool category: " + category
                 + " (expected one of " + SessionToolCategory.ALL + ")");
         }
+        String mcpServer = req.mcpServer() == null ? null : req.mcpServer().trim();
+        if (mcpServer != null && mcpServer.isEmpty()) {
+            mcpServer = null;
+        }
+        // mcpServer 只对 MCP 分类有意义：与其它分类组合必须明确失败（⛔ 不静默忽略）
+        if (mcpServer != null && !SessionToolCategory.MCP.equals(category)) {
+            throw new ValidationException("mcpServer is only supported with category=MCP (got category="
+                + category + ", mcpServer=" + mcpServer + ")");
+        }
         // 起点：DB 实际值；列为 null（从未设置）→ 默认禁用集
         Set<String> disabled = new LinkedHashSet<>(effectiveDisabledNames(sessionId));
         List<String> categoryNames = new ArrayList<>();
@@ -117,6 +131,10 @@ public class SessionToolsController {
                 continue;
             }
             if (!category.equals(SessionToolCategory.of(t))) {
+                continue;
+            }
+            // MCP 三级联动的中间一级：只收该 server 的工具（null = 整类）
+            if (mcpServer != null && !mcpServer.equals(SessionToolCategory.mcpServerOf(t.name()))) {
                 continue;
             }
             categoryNames.add(t.name());
@@ -135,9 +153,9 @@ public class SessionToolsController {
         }
         sessionService.setDisabledTools(sessionId, disabled);
         if (log.isInfoEnabled()) {
-            log.info("SessionToolsController.setCategoryEnabled: session={} category={} enabled={} "
+            log.info("SessionToolsController.setCategoryEnabled: session={} category={} mcpServer={} enabled={} "
                     + "affected={} skippedCore={}（[tool-categories] 批量开关）",
-                sessionId, category, req.enabled(), categoryNames.size(), skippedCore);
+                sessionId, category, mcpServer, req.enabled(), categoryNames.size(), skippedCore);
         }
         return buildList(sessionId, effectiveDisabledNames(sessionId));
     }
@@ -184,14 +202,19 @@ public class SessionToolsController {
             disabled.add(toolName);
         }
         sessionService.setDisabledTools(sessionId, disabled);
-        boolean nowDisabled = !req.enabled();
+        // [真值回读 · 2026-11-15] 必须按**写入后的实际生效集合**回报，⛔ 不能 `!req.enabled()` 硬算：
+        //   硬算会让前端显示与真实状态分叉（真机：点「启用」后仍显示「已禁用」，
+        //   而日志里只能看到前端算出来的值，无法区分是写入失败还是显示错误）。
+        //   口径与列表接口、LLM schema 剔除完全同一份（effectiveDisabledNames）。
+        boolean nowDisabled = effectiveDisabledNames(sessionId).contains(toolName);
         if (log.isInfoEnabled()) {
             log.info("SessionToolsController.toggle: session={} tool={} disabled={}（V34 列，"
                     + "LLM schema 剔除语义对齐 CC blanket deny tools.ts:262-269）",
                 sessionId, toolName, nowDisabled);
         }
         return new SessionToolDto(target.name(), target.userFacingName(),
-            SessionToolCategory.of(target), target.description(), nowDisabled);
+            SessionToolCategory.of(target), target.description(), nowDisabled,
+            SessionToolCategory.mcpServerOf(target.name()));
     }
 
     /**
@@ -239,7 +262,8 @@ public class SessionToolsController {
                 continue;
             }
             result.add(new SessionToolDto(t.name(), t.userFacingName(),
-                SessionToolCategory.of(t), t.description(), disabled.contains(t.name())));
+                SessionToolCategory.of(t), t.description(), disabled.contains(t.name()),
+                SessionToolCategory.mcpServerOf(t.name())));
         }
         result.sort(Comparator.comparing(SessionToolDto::name));
         if (log.isDebugEnabled()) {

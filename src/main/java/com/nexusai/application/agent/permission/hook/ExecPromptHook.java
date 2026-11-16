@@ -460,7 +460,8 @@ public class ExecPromptHook {
                     log.info("ExecPromptHook: hook={} 条件未满足, outcome=blocking, reason={}", hookName, reasonText);
                 }
                 return blocking(reason, hook.prompt(),
-                    "Prompt hook condition was not met: " + reasonText);
+                    "Prompt hook condition was not met: " + reasonText,
+                    hook.continueOnBlock());
             }
 
             // ok=true → success + hook_success attachment · 对齐 CC :172-182
@@ -682,9 +683,17 @@ public class ExecPromptHook {
      * <p><b>[CCJ-EXEC-15]</b> stopReason = {@code parsed.data.reason} 原样（可 null，CC :166）；
      * blockingError 文本由调用方按 CC 模板字面量拼接（reason 缺失 → "…: undefined"）。
      */
-    private static HookResult blocking(String stopReason, String hookPrompt, String blockingErrorText) {
+    private static HookResult blocking(String stopReason, String hookPrompt, String blockingErrorText,
+                                       Boolean continueOnBlock) {
+        // [Wave2-D] {@code continueOnBlock}（config 字段，CC 原文）：
+        //   "Sets the continue value for the decision:'block' produced when ok is false.
+        //    Default false (turn ends). Whether continue:true lets the turn proceed depends on
+        //    the event's decision:'block' semantics. On PostToolUse, the reason is fed back to
+        //    Claude and the turn continues." ⇒ continue = continueOnBlock（缺省 false）,
+        //   本仓 HookResult 用 preventContinuation 表达其反义。
+        boolean preventContinuation = !Boolean.TRUE.equals(continueOnBlock);
         return new HookResult(
-            true,                                       // preventContinuation（CC :165 prompt blocking 显式 true）
+            preventContinuation,
             new HookBlockingError(blockingErrorText, hookPrompt),  // blockingError（CC :161-164）
             null, null, null, null, null,                // systemMessage, additionalContext, message, updatedInput, updatedMCPToolOutput
             null, null,                                  // retry, hookPermissionDecisionReason

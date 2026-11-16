@@ -527,6 +527,9 @@ interface MessageListProps {
   foldedTurnCount?: number
   /** [折叠 = 真删] 点折叠行 → 向后端重拉更早一轮并 prepend（App 实现；缺省 = 只能展开内存里已有的轮） */
   onExpandOlder?: () => void
+  /** [正文排版] 助手正文追加 `markdown-prose`（预览那套 · 14px 字号）。
+   *  子代理 transcript 传 true；主会话不传 ⇒ 行为零变化。 */
+  prose?: boolean
 }
 
 /** [紧凑过程行] 工具行标题参数摘要：从 arguments JSON 取「动作对象」字段（command/cmd/path/pattern/query…），
@@ -817,7 +820,7 @@ export function ToolGroup({ tools, matchedRule, sessionId, title, live = false }
  *
  * <p>附件行对齐 CC {@code AttachmentList}（UI.tsx:98-100）：{@code [image]}/{@code [file]} + 路径 + 大小。
  */
-function SendUserMessageBody({ tool }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number] }) {
+function SendUserMessageBody({ tool, prose = false }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; prose?: boolean }) {
   const payload = useMemo(() => briefPayload(tool), [tool])
   // 失败态：不渲染正文/附件，只给失败文案（对齐 CC UserToolResultMessage.tsx:71-86
   //   is_error → UserToolErrorMessage，BriefTool 无 renderToolUseErrorMessage ⇒ 红字兜底）。
@@ -827,7 +830,7 @@ function SendUserMessageBody({ tool }: { tool: NonNullable<ChatMessageDto['toolC
   if (!payload) return null
   return (
     <div className="sum-body">
-      {payload.message !== '' && <MarkdownTextV2 text={payload.message} className="content md" />}
+      {payload.message !== '' && <MarkdownTextV2 text={payload.message} className={`content md${prose ? ' markdown-prose' : ''}`} />}
       {payload.attachments.length > 0 && (
         <div className="sum-attachments">
           {payload.attachments.map((a) => (
@@ -848,7 +851,7 @@ function SendUserMessageBody({ tool }: { tool: NonNullable<ChatMessageDto['toolC
  *  `groupTitle`（同轮 tool_use_summary 文本）只交给本条消息里的第一个组，避免标题重复。 */
 function renderToolCalls(
   calls: ToolCallDto[],
-  opts: { matchedRule: string | null; sessionId: string; live?: boolean; groupTitle?: string },
+  opts: { matchedRule: string | null; sessionId: string; live?: boolean; groupTitle?: string; prose?: boolean },
 ): ReactNode[] {
   const out: ReactNode[] = []
   let run: ToolCallDto[] = []
@@ -876,7 +879,7 @@ function renderToolCalls(
   for (const t of calls) {
     if (isSendUserMessage(t)) {
       flush()
-      out.push(<SendUserMessageBody key={t.id ?? `sum-${out.length}`} tool={t} />)
+      out.push(<SendUserMessageBody key={t.id ?? `sum-${out.length}`} tool={t} prose={opts.prose} />)
     } else {
       run.push(t)
     }
@@ -1205,7 +1208,7 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
 /** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
 type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows, prose = false }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
   onRunHtml?: (code: string) => void
@@ -1257,6 +1260,8 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
    *  只由**状态行所在的那一条** assistant 接收（一轮一处，见 processHeaderIdByTurn）⇒ 折叠区里渲染一次。
    *  缺省 undefined = 该轮没有注入行（零渲染开销）。 */
   systemRows?: ChatMessageDto[]
+  /** [正文排版] 见 {@link MessageListProps.prose} */
+  prose?: boolean
 }) {
   const isUser = msg.role === 'user'
   // [轮次消息头合并] 同轮后续段不渲染头像/作者/时间/徽标；仍留同宽头像占位，保证正文/工具行与首段左对齐。
@@ -1738,14 +1743,14 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     if (narration !== '') {
       foldSegments.push({
         key: 'narration',
-        node: <ContentGuard text={msg.content ?? ''} className="content md turn-process-text" onRunHtml={onRunHtml} citeMsgId={msg.id} />,
+        node: <ContentGuard text={msg.content ?? ''} className={`content md turn-process-text${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />,
       })
     }
     // [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard
     if (intermediateToolCalls.length > 0) {
       foldSegments.push({
         key: 'tools',
-        node: renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle }),
+        node: renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose }),
       })
     }
     // [2026-11-02 系统注入行] 放折叠区末尾：它们不是「助手说了什么」，而是系统在本轮塞给模型的提示。
@@ -1946,7 +1951,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                       {renderUserRefText(shown, onOpenRefFile)}
                     </div>
                   ) : (
-                    <ContentGuard text={shown} className="user-text md" onRunHtml={onRunHtml} />
+                    <ContentGuard text={shown} className="user-text md markdown-prose" onRunHtml={onRunHtml} />
                   )
                 })()}
                 {msg.userAttachments?.filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename).map((a, i) => (
@@ -2100,7 +2105,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
               /* [中间旁白正文] 非最终段的正文已在折叠区渲染过 → 正文区不再重复。
                  非轮次宿主（isFinalOfTurn === undefined）与最终段照常渲染。 */
               isFinalOfTurn !== false && (
-                <ContentGuard text={msg.content ?? ''} className="content md" onRunHtml={onRunHtml} citeMsgId={msg.id} />
+                <ContentGuard text={msg.content ?? ''} className={`content md${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />
               )
             )}
             {/* [分叉/复制] 只有该轮最终段、非运行中：操作条紧贴**正文下方**（工具卡/产物之前）。
@@ -2121,7 +2126,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                 非轮次折叠宿主（子代理 transcript）保持旧的按序渲染。 */}
             {collapsible
               ? briefToolCalls.map((t, i) => <SendUserMessageBody key={t.id ?? i} tool={t} />)
-              : renderToolCalls(msg.toolCalls ?? [], { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle })}
+              : renderToolCalls(msg.toolCalls ?? [], { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose })}
             {/* [任务结束入口] 仅最后一条 assistant 消息、且本轮不在运行/流式中时传入（见 MessageListInner） */}
             {footer}
           </div>
@@ -2154,7 +2159,7 @@ const MemoMessage = memo(Message)
 //   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
 //   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
 //   toolCalls 卡片。class 未动。
-const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null, turnKey, processExpanded, onToggleProcess, collapsedTailKeep = 0, hiddenSegCount = 0 }: {
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null, turnKey, processExpanded, onToggleProcess, collapsedTailKeep = 0, hiddenSegCount = 0, prose = false }: {
   sessionId: string
   blockId: string
   isStreamingTail: boolean
@@ -2209,6 +2214,8 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   collapsedTailKeep?: number
   /** [2026-11-12 用户裁定] 收起态还剩多少段没露（状态行旁提示「隐藏了 N 项」）。 */
   hiddenSegCount?: number
+  /** [正文排版] 见 {@link MessageListProps.prose} */
+  prose?: boolean
 }) {
   // 只订自身块对象：append 后该块是新对象 → 重渲；其它块 append（数组换新但本块对象引用不变）→ bail
   const b = useChatStore(selectStreamBlock(sessionId, blockId))
@@ -2291,11 +2298,11 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   if (b.content && !isBriefBlock(b.toolCalls)) {
     segNodes.push({
       key: 'content',
-      node: <MarkdownTextV2 text={citationChipEnabled ? citeLinkify(b.content, b.assistantMessageId ?? '') : b.content} streaming={isStreamingTail && turnRunning} className="content md" onRunHtml={onRunHtml} />,
+      node: <MarkdownTextV2 text={citationChipEnabled ? citeLinkify(b.content, b.assistantMessageId ?? '') : b.content} streaming={isStreamingTail && turnRunning} className={prose ? 'content md markdown-prose' : 'content md'} onRunHtml={onRunHtml} />,
     })
   }
   // [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」）
-  const toolNodes = renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true })
+  const toolNodes = renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true, prose })
   if (toolNodes.length > 0) segNodes.push({ key: 'tools', node: toolNodes })
   // [段到达顺序 2026-11-13] 上面按「思考→正文→工具」建段；但模型可能先跑工具再思考/出正文
   //   （RAG 的 query_understand 排在首个 chunk 之前），固定顺序会把晚到的思考/正文倒挂到工具上方。
@@ -2411,7 +2418,7 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false }: MessageListProps) {
   // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
   citationChipEnabled = !!onCitationClick
   citationTitlesByMessage = citationTitleMapByMsg ?? {}
@@ -4648,6 +4655,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 summaryToolName={toolGroupMeta.toolNameByTurn.get(row.turnKey)}
                 systemRows={processHeaderIdByTurn.get(row.turnKey) === row.m.id
                   ? systemRowsByTurn.get(row.turnKey) : undefined}
+                prose={prose}
                 onToggleProcess={toggleTurnProcess} />
             </ErrorBoundary>
           )
@@ -4695,6 +4703,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               processExpanded={turnOpenFor(row.turnKey)}
               collapsedTailKeep={tailKeepByRowKey.get(row.key) ?? 0}
                 hiddenSegCount={hiddenSegCountByTurn.get(row.turnKey) ?? 0}
+              prose={prose}
               onToggleProcess={toggleTurnProcess}
             />
           </ErrorBoundary>

@@ -91,6 +91,9 @@ export function ModelFormModal({ initial, providerTag, mode = 'edit', onSave, on
               { type: 'text', name: 'name', label: '模型名称', placeholder: 'e.g. deepseek-v3.2' },
               { type: 'text', name: 'alias', label: '别名', placeholder: 'e.g. DS-V3', hint: '显示在选择器中' },
             ],
+            [
+              { type: 'text', name: 'desc', label: '描述', placeholder: '选模型时显示的说明，可留空' },
+            ],
           ],
         },
         {

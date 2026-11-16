@@ -57,10 +57,24 @@ const ROLE_TOUR: Partial<Record<ModelTierRole, string>> = {
  * <p><b>为什么排除 TTS / ASR</b>：这两个档位是**专用语音模型**（语音合成 / 语音转文字），
  * 把通用对话模型一键绑过去只会得到一个配错的档位 —— 用户明确要求不参与。
  * 与其让用户事后逐个清掉，不如一开始就不写它们。
+ *
+ * <p>导出给「提供商」面板（{@code ProvidersPanel} 模型行 ⋯ 菜单的「配置到所有档位」）复用：
+ * 一键配置的档位范围只此一份，⛔ 别在别处再抄一份清单。
  */
-const APPLY_ALL_ROLES: ModelTierRole[] = [
+export const APPLY_ALL_ROLES: ModelTierRole[] = [
   'main', 'strong', 'fast', 'subagent', 'weak', 'medium', 'multimodal', 'fallback', 'classifier',
 ]
+
+/**
+ * 「一键配置到全部档位」要写的 settings 字段名（与 {@link APPLY_ALL_ROLES} 同序）。
+ *
+ * <p>由 {@link TIERS} 的 {@code field} 派生 —— 角色→列的映射在面板里只有这一份；
+ * ⚠️ 注意 {@code classifier} 的列名是 {@code classifierModel}（不是 classifierModelName），
+ * 所以调用方必须用这里的字段名，⛔ 不许按角色名拼字符串。
+ */
+export const APPLY_ALL_TIER_FIELDS: (keyof AppSettings)[] = APPLY_ALL_ROLES.map(
+  (r) => TIERS.find((t) => t.role === r)!.field,
+)
 
 interface Props {
   providers: Provider[]

@@ -186,6 +186,16 @@ public class SessionService {
         return toDto(s);
     }
 
+    /**
+     * 是否分叉会话（V297 列 {@code forked_from} 非空）· SessionStart hook
+     * {@code source='fork'} 的判据。读不到会话 → false（不抛，hook 侧按 startup 兜底）。
+     */
+    public boolean isForkedSession(String id) {
+        if (id == null || id.isBlank()) return false;
+        SessionRecord s = sessionMapper.selectOneById(id);
+        return s != null && s.getForkedFrom() != null && !s.getForkedFrom().isBlank();
+    }
+
     public SessionDto create(SessionCreateRequest req) {
         // 业务校验：title 与 modelName 至少传一个
         boolean hasTitle = req.title() != null && !req.title().isBlank();

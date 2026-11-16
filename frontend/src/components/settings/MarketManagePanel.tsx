@@ -3,6 +3,15 @@ import { marketApi, type MarketManagedPlugin, type MarketVersionEntry } from '@/
 import { ApiError } from '@/api/rest'
 import { selectProjectFolder } from '@/utils/projectFolder'
 
+/** ISO 时间 → 「2026-11-15 22:08」（本地时区）· 缺失/解析失败原样返回（不显示 undefined） */
+function fmtTime(iso?: string): string {
+  if (!iso) return ''
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}`
+}
+
 /**
  * 设置页「市场管理」：上架本地技能 / 查看版本历史 / 回滚。
  *
@@ -80,7 +89,7 @@ export function MarketManagePanel({ showToast }: {
         setVersion('')
         await load()
       } else if (r.status === 'unchanged') {
-        showToast(`内容没有变化，未创建新版本（当前 ${r.version}）`, 'info')
+        showToast(r.message || `内容没有变化，未创建新版本（当前 ${r.version}）`, 'info')
       } else {
         showToast(r.message || '上架失败', 'info')
       }
@@ -202,7 +211,9 @@ export function MarketManagePanel({ showToast }: {
                 <span className="mm-fp" title={p.fingerprint || ''}>
                   {(p.fingerprint || '').replace('sha256:', '').slice(0, 10) || '无指纹'}
                 </span>
-                <span className="mm-time">{p.updatedAt || ''}</span>
+                <span className="mm-time" title="最近一次上架时间">
+                  {fmtTime(p.publishedAt || p.updatedAt)}
+                </span>
                 <span className="mm-count">{versions.length} 个版本</span>
               </div>
 
@@ -217,7 +228,7 @@ export function MarketManagePanel({ showToast }: {
                         <span className="mm-fp" title={v.fingerprint}>
                           {v.fingerprint.replace('sha256:', '').slice(0, 10)}
                         </span>
-                        <span className="mm-time">{v.publishedAt}</span>
+                        <span className="mm-time" title={v.publishedAt}>{fmtTime(v.publishedAt)}</span>
                         <span className="mm-size">{v.size ? `${(v.size / 1024).toFixed(1)} KB` : ''}</span>
                         {current
                           ? <span className="mm-current-mark">当前版本</span>

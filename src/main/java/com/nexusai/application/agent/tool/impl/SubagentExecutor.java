@@ -4023,9 +4023,10 @@ public class SubagentExecutor {
         boolean hasWildcard = agentDefinition.tools().isEmpty() || agentDefinition.usesAllTools();
         List<String> toolNames = agentDefinition.tools().orElse(List.of());
         if (hasWildcard) {
-            // [agent-tool-scope] 专属工具不进通配池：只有 AgentDefinition.tools 逐名点名才可见。
-            //   与主线程 LlmAgentLoop.applySessionAgentToolPolicy 共用同一判定（ToolScope 单一来源）。
-            //   显式列表分支不需改：by-name 解析天然允许点名专属工具。
+            // [用户裁定 2026-11-15] 破坏性工具不得进通配池：通配子代理仍按 @ExclusiveTool 排除，
+            //   只有 AgentDefinition.tools 逐名点名才可见（例如 feasibility-section-writer 点名检索工具）。
+            //   CC 2.1.325 的 h0() 通配会返回整池（CC 无专属概念），但本仓知识库工具含 wiki 写/删，
+            //   照搬 CC 会把删除能力下放给任意通配子代理 ⇒ 有意保留本仓语义，不跟 CC。
             List<Tool> commonOnly = new ArrayList<>(filtered.stream()
                     .filter(t -> com.nexusai.application.agent.tool.ToolScope.of(t)
                             == com.nexusai.application.agent.tool.ToolScope.COMMON)

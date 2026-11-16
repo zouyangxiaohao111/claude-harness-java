@@ -9,5 +9,7 @@ public record ProviderUpdateRequest(
     String baseUrl,
     String apiKey,
     Map<String, String> extraHeaders,
-    Boolean enabled
+    Boolean enabled,
+    /** [V299] 归属品牌 key（null = 不改；空串 = 改为自定义）。 */
+    String brandKey
 ) {}

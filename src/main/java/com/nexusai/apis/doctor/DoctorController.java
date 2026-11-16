@@ -1,6 +1,9 @@
 package com.nexusai.apis.doctor;
 
+import com.nexusai.common.BundledGit;
 import com.nexusai.infra.util.GitAvailabilityChecker;
+import com.nexusai.infra.util.RuntimeInstallHints;
+import com.nexusai.infra.util.RuntimeProbe;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -94,6 +97,80 @@ public class DoctorController {
         return warnings;
     }
 
+    /**
+     * Node / Python 等外部运行时探测（只读，不安装）。
+     *
+     * <p>WHY 单独端点：MCP 的 stdio server 常用 {@code npx} / {@code uvx} 启动，
+     * 缺运行时表现为「MCP 起不来」而不是「环境缺东西」。这里把可用性、路径、版本与
+     * 安装提示一次性给前端，避免用户面对裸 {@code CreateProcess error=2}。
+     *
+     * <p>判据见 {@link RuntimeProbe}：实际执行 {@code --version}，0 字节的 Windows
+     * Store 别名会被排除（不执行、不弹商店）。
+     */
+    @GetMapping("/runtime")
+    public Map<String, Object> runtime() {
+        Map<String, Object> runtimes = new LinkedHashMap<>();
+        runtimes.put("node", withHint(RuntimeProbe.probe("node", "--version", "node")));
+        runtimes.put("npm", withHint(RuntimeProbe.probe("npm", "--version", "npm")));
+        runtimes.put("npx", withHint(RuntimeProbe.probe("npx", "--version", "npx")));
+        runtimes.put("python", withHint(RuntimeProbe.probe("python", "--version", "python", "python3", "py")));
+        runtimes.put("pip", withHint(RuntimeProbe.probe("pip", "--version", "pip", "pip3")));
+        runtimes.put("uv", withHint(RuntimeProbe.probe("uv", "--version", "uv")));
+        runtimes.put("uvx", withHint(RuntimeProbe.probe("uvx", "--version", "uvx")));
+
+        // 缺失项按具体运行时名列出（前端据此取安装提示）：
+        //   npx 类 stdio server 需要 node；uvx 类需要 uv；python 类需要 python。
+        List<String> missingForMcp = new ArrayList<>();
+        for (String name : List.of("node", "python", "uv")) {
+            if (!Boolean.TRUE.equals(((Map<?, ?>) runtimes.get(name)).get("available"))) {
+                missingForMcp.add(name);
+            }
+        }
+
+        Map<String, Object> response = new LinkedHashMap<>();
+        response.put("platform", System.getProperty("os.name"));
+        response.put("runtimes", runtimes);
+        response.put("missingForMcp", missingForMcp);
+        return response;
+    }
+
+    /** RuntimeProbe.Result → 可序列化 Map + 安装提示（不执行安装，只给命令与地址）。 */
+    private static Map<String, Object> withHint(RuntimeProbe.Result r) {
+        Map<String, Object> m = new LinkedHashMap<>();
+        m.put("available", r.available());
+        m.put("path", r.path());
+        m.put("version", r.version());
+        m.put("error", r.error());
+        Map<String, String> hint = installHintOf(r.name());
+        if (!hint.isEmpty()) {
+            m.put("installCommand", hint.get("command"));
+            m.put("installUrl", hint.get("url"));
+        }
+        return m;
+    }
+
+    /** 运行时名 → 安装提示（命令按 os.name 平台化：windows / macos / linux）。 */
+    private static Map<String, String> installHintOf(String name) {
+        String runtime = switch (name) {
+            case "node", "npm", "npx" -> "node";
+            case "python", "pip" -> "python";
+            case "uv", "uvx" -> "uv";
+            default -> null;
+        };
+        if (runtime == null) {
+            return Map.of();
+        }
+        RuntimeInstallHints.Hint hint = RuntimeInstallHints.of(runtime);
+        Map<String, String> m = new LinkedHashMap<>();
+        if (!hint.command().isBlank()) {
+            m.put("command", hint.command());
+        }
+        if (!hint.url().isBlank()) {
+            m.put("url", hint.url());
+        }
+        return m;
+    }
+
     @GetMapping("/diagnostics")
     public Map<String, Object> diagnostics() {
         Map<String, Object> response = new LinkedHashMap<>();
@@ -134,6 +211,21 @@ public class DoctorController {
                 }
             });
             boolean available = checker.checkGitAvailable();
+            if (!available) {
+                // 随包 PortableGit 兜底：新装机器 PATH 上没有系统 Git，但安装目录里有。
+                // 不做这一步，doctor 会在「Bash 工具其实可用」的机器上误报 git unavailable。
+                Path bundled = BundledGit.gitExe().orElse(null);
+                if (bundled != null) {
+                    String bundledVersion = readVersionOf(bundled);
+                    if (bundledVersion != null) {
+                        result.put("available", true);
+                        result.put("version", bundledVersion);
+                        result.put("path", bundled.toString());
+                        result.put("bundled", true);
+                        return result;
+                    }
+                }
+            }
             result.put("available", available);
             if (available) {
                 result.put("version", readGitVersion());
@@ -147,6 +239,26 @@ public class DoctorController {
             result.put("error", e.getMessage());
         }
         return result;
+    }
+
+    /** 读指定 git 可执行文件的版本号（随包 PortableGit 用绝对路径，不依赖 PATH）。 */
+    private static String readVersionOf(Path gitExe) {
+        try {
+            Process p = new ProcessBuilder(gitExe.toString(), "--version")
+                    .redirectErrorStream(true).start();
+            if (!p.waitFor(5, TimeUnit.SECONDS) || p.exitValue() != 0) {
+                p.destroyForcibly();
+                return null;
+            }
+            try (InputStream in = p.getInputStream()) {
+                String out = new String(in.readAllBytes(), StandardCharsets.UTF_8).trim();
+                int idx = out.lastIndexOf(' ');
+                return idx >= 0 ? out.substring(idx + 1) : out;
+            }
+        } catch (Exception e) {
+            log.warn("[DoctorController] bundled git --version failed: {}", e.getMessage());
+            return null;
+        }
     }
 
     private static String readGitVersion() {

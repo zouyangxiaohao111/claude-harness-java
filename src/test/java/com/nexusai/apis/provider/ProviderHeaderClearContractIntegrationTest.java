@@ -116,13 +116,13 @@ class ProviderHeaderClearContractIntegrationTest {
     private ProviderDto createWithHeaders(Map<String, String> headers) {
         return providerService.create(new ProviderCreateRequest(
             uniqueName(), ProviderType.openai_compatible,
-            "https://gw.example.com/v1", "sk-live-clear-test", headers, Boolean.TRUE));
+            "https://gw.example.com/v1", "sk-live-clear-test", headers, Boolean.TRUE, null));
     }
 
     /** 只改 extraHeaders，其余字段一律传 null（= 不覆盖）。 */
     private void updateHeaders(String id, Map<String, String> extraHeaders) {
         providerService.update(id, new ProviderUpdateRequest(
-            null, null, null, null, extraHeaders, null));
+            null, null, null, null, extraHeaders, null, null));
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -201,7 +201,7 @@ class ProviderHeaderClearContractIntegrationTest {
         ProviderDto p = createWithHeaders(Map.of("x-tenant", "acme"));
         // 先把几个字段改成非默认值，确保它们"有值可丢"
         providerService.update(p.id(), new ProviderUpdateRequest(
-            p.name(), null, "https://gw2.example.com/v1", null, null, Boolean.FALSE));
+            p.name(), null, "https://gw2.example.com/v1", null, null, Boolean.FALSE, null));
         ProviderDto before = providerService.getById(p.id());
         assertFalse(before.enabled(), "前置：enabled 已置为 false");
         assertEquals("https://gw2.example.com/v1", before.baseUrl(), "前置：baseUrl 已改");

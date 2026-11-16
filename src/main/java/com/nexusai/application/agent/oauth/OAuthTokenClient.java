@@ -58,16 +58,50 @@ public final class OAuthTokenClient {
     /** CC exchangeCodeForTokens / refreshOAuthToken timeout: 15000（client.ts:128 / :167）。 */
     private static final Duration TOKEN_TIMEOUT = Duration.ofSeconds(15);
 
-    private final HttpClient httpClient;
+    private final HttpClient injectedClient;
+    private final HttpClient directClient;
+    private final HttpClient proxiedClient;
 
     public OAuthTokenClient() {
-        this(HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build());
+        this(null);
     }
 
+    /**
+     * @param httpClient 测试注入的 client；null → 用内置两套（按端点决定是否走代理）
+     *
+     * <p><b>为什么要两个 client</b>：{@code java.net.http.HttpClient} 的代理在构造时固定，
+     * 而 token 端点分两类 —— OpenAI（{@code auth.openai.com}，境内直连会被地区限制拒绝）需要代理，
+     * GitHub（MCP 线的 device code）不需要。按端点选 client，避免给 GitHub 平白绕一层。
+     */
     public OAuthTokenClient(HttpClient httpClient) {
-        this.httpClient = httpClient == null
-            ? HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build()
-            : httpClient;
+        if (httpClient != null) {
+            this.injectedClient = httpClient;
+            this.directClient = httpClient;
+            this.proxiedClient = httpClient;
+        } else {
+            this.injectedClient = null;
+            this.directClient = buildClient(false);
+            this.proxiedClient = buildClient(true);
+        }
+    }
+
+    private static HttpClient buildClient(boolean useProxy) {
+        HttpClient.Builder builder = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10));
+        if (useProxy) {
+            // ⭐ 必须用 dynamicSelector（每次 select 现读 DB），不能用 selector()：
+            //    proxy(...) 在构造时只取一次，那时用户可能还没在设置页配代理 ⇒ 永久直连。
+            builder.proxy(com.nexusai.infra.llm.OutboundProxy.dynamicSelector());
+        }
+        return builder.build();
+    }
+
+    /** 按 token 端点域名选 client：境外官方端点走代理，其它（如 GitHub）直连。 */
+    private HttpClient clientFor(String tokenEndpoint) {
+        if (injectedClient != null) {
+            return injectedClient;
+        }
+        return com.nexusai.infra.llm.OutboundProxy.selectorFor(tokenEndpoint) != null
+            ? proxiedClient : directClient;
     }
 
     /**
@@ -131,7 +165,7 @@ public final class OAuthTokenClient {
                 .header("Accept", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body, StandardCharsets.UTF_8))
                 .build();
-            HttpResponse<String> resp = httpClient.send(req,
+            HttpResponse<String> resp = clientFor(tokenEndpoint).send(req,
                 HttpResponse.BodyHandlers.ofString(StandardCharsets.UTF_8));
 
             if (resp.statusCode() < 200 || resp.statusCode() >= 300) {

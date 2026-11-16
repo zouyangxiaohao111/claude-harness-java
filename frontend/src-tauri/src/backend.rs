@@ -367,6 +367,32 @@ pub fn resolve_backend_dir(app: &tauri::AppHandle) -> Option<PathBuf> {
     None
 }
 
+/// 随包 Git（MinGit）目录：`<backend>/git`，要求 `bin/bash.exe` 与 `cmd/git.exe`
+/// 同时存在（只看目录是否存在会把半个解压目录当成可用运行时）。
+fn bundled_git_dir(backend_dir: &std::path::Path) -> Option<PathBuf> {
+    let dir = backend_dir.join("git");
+    if dir.join("bin").join("bash.exe").is_file() && dir.join("cmd").join("git.exe").is_file() {
+        Some(dir)
+    } else {
+        None
+    }
+}
+
+/// 系统是否已有可用 Git（实际执行 `git --version`，退出码 0 才算）。
+///
+/// 不能用「PATH 里存在 git.exe」代替：Windows Store 的 App Execution Alias 与
+/// 残留的坏 shim 都会让文件存在但执行失败。
+fn system_git_available() -> bool {
+    silent_command("git")
+        .arg("--version")
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
 /// 读随包 JRE 的 `release` 文件，取 `JAVA_VERSION="25.0.3"` 的 **major** 号。
 ///
 /// <p>WHY 需要它：JDK 24 起，未声明的 native access 会打
@@ -462,6 +488,33 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
     //   因此即使注册表里残留旧路径也不会写错位置。dev 回退时 parent = src-tauri。
     if let Some(install_dir) = backend_dir.parent() {
         cmd.env("NEXUSAI_INSTALL_DIR", install_dir);
+    }
+
+    // 随包 Git（PortableGit，⛔ 不是 MinGit：后者不含 bin/bash.exe）：
+    // 新装机器没有 Git 时，BashTool 找不到 Git Bash 会直接报
+    // "No suitable shell found"（ShellResolver 无 cmd 回退）。
+    //
+    // 优先级 = 系统 Git 优先：只有系统没有 Git 时才注入 CLAUDE_CODE_GIT_BASH_PATH
+    // 并把随包 bin 前置到 PATH；否则仅注入 NEXUSAI_BUNDLED_GIT_DIR 供 Java 侧兜底
+    // （系统 Git 可用但缺 bash.exe 时仍能落到随包）。
+    if let Some(git_dir) = bundled_git_dir(&backend_dir) {
+        cmd.env("NEXUSAI_BUNDLED_GIT_DIR", &git_dir);
+        if !system_git_available() {
+            cmd.env("CLAUDE_CODE_GIT_BASH_PATH", git_dir.join("bin").join("bash.exe"));
+            let mut paths: Vec<PathBuf> = vec![
+                git_dir.join("cmd"),
+                git_dir.join("bin"),
+                git_dir.join("usr").join("bin"),
+            ];
+            if let Some(existing) = std::env::var_os("PATH") {
+                paths.extend(std::env::split_paths(&existing));
+            }
+            if let Ok(joined) = std::env::join_paths(paths) {
+                cmd.env("PATH", joined);
+            } else {
+                log_launcher("[backend] ⚠️ 随包 Git PATH 组装失败，仅依赖 CLAUDE_CODE_GIT_BASH_PATH");
+            }
+        }
     }
     let child = cmd
         .arg("-jar")

@@ -3,12 +3,17 @@ package com.nexusai.application.agent.plugin;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
+import com.nexusai.application.agent.permission.hook.AgentHook;
 import com.nexusai.application.agent.permission.hook.CommandHook;
 import com.nexusai.application.agent.permission.hook.GenericHook;
+import com.nexusai.application.agent.permission.hook.HookCommand;
 import com.nexusai.application.agent.permission.hook.HookEventType;
 import com.nexusai.application.agent.permission.hook.HookMatcherEngine;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.hook.HooksConfigSnapshot;
+import com.nexusai.application.agent.permission.hook.HttpHook;
+import com.nexusai.application.agent.permission.hook.McpToolHook;
+import com.nexusai.application.agent.permission.hook.PromptHook;
 import jakarta.annotation.PostConstruct;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -86,6 +91,9 @@ public class PluginLoader {
 
     /** [MPL7] hooks.json 解析器 · CC loadPluginHooksFile 用 JSON.parse（pluginLoader.ts:1234-1235）。 */
     private final ObjectMapper objectMapper = new ObjectMapper();
+
+    /** [Wave2-J2] 解析期 JsonNode → Map 转换（纯静态，不依赖实例）。 */
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     /**
      * [ODF-C3R] 已装 plugins 注册表 · 生产 feed 数据源（对齐 CC loadAllPluginsCacheOnly
@@ -778,10 +786,12 @@ public class PluginLoader {
                     }
                     for (JsonNode matcherNode : entry.getValue()) {
                         String matcher = matcherNode.path("matcher").asText("");
-                        List<CommandHook> matcherHooks = new ArrayList<>();
+                        List<HookCommand> matcherHooks = new ArrayList<>();
                         for (JsonNode hookNode : matcherNode.path("hooks")) {
-                            CommandHook cmd = parsePluginHookCommand(hookNode, plugin.name());
-                            matcherHooks.add(cmd);
+                            HookCommand cmd = parsePluginHookCommand(hookNode, plugin.name());
+                            if (cmd != null) {
+                                matcherHooks.add(cmd);
+                            }
                         }
                         if (!matcherHooks.isEmpty()) {
                             // [IMP-GAP03 补] 同一插件同一事件可挂多个 matcher 组
@@ -804,18 +814,20 @@ public class PluginLoader {
                     + " for plugin " + plugin.name() + ": " + e.getMessage(), e);
             }
         }
-        // 原子换：先清空旧 GenericHook，再注册全部 enabled 插件（CC loadPluginHooks.ts:147-148 clear-then-register）
+        // 原子换：先清空旧插件 matchers，再注册全部 enabled 插件（CC loadPluginHooks.ts:147-148
+        // clear-then-register）。
+        //
+        // [Wave2-J2] 插件 hook **只走统一 registered 匹配链**：删除旧的 command-only
+        // genericHooks 双轨（{@code registerPluginHook} + {@code buildPluginGenericHook}）——
+        //   ① 双轨只支持 command，prompt/agent/http/mcp_tool 会永不执行；
+        //   ② 双轨与 matched 链并行时，HookRegistry.executeConfiguredHooks 必须跳过插件源
+        //      matched hook 防双发，导致 5 类型插件 hook 全被跳过。
+        // 现在统一由 HookRegistry.executeOneConfiguredHook 按实例类型分发，pluginRoot/pluginId
+        // 经 MatchedHook 透传（command 执行器 env 需要），once 也统一在 executeConfiguredHooks 标记。
         HookRegistry registry = this.hookRegistry;
         if (registry != null) {
             registry.clearPluginHooks();
             for (PluginHookRegistration reg : registrations) {
-                registry.registerPluginHook(reg.name(), reg.pluginName(),
-                    buildPluginGenericHook(reg), reg.event());
-                // [MT-02 / OPD-WF2-MT-02] registered/插件源并入 getMatchingHooks 统一单链:
-                //   把插件 hook 的 matcher 数据注册为 registered matcher (对齐 CC getHooksConfig
-                //   把 PluginHookMatcher 并入 getMatchingHooks, hooks.ts:1519-1529) —— 使
-                //   getMatchingHooks 返回集包含插件 hooks, 跨模块消费(遥测/executeEvent 聚合/Stop)
-                //   基于统一链. pluginRoot/pluginId 与 buildPluginGenericHook 同源解析 (cache).
                 LoadedPlugin plugin = cache.get(reg.pluginName());
                 String pluginRoot = plugin != null && plugin.localPath() != null
                     ? plugin.localPath().toString() : null;
@@ -829,7 +841,7 @@ public class PluginLoader {
             hooksConfigSnapshot.captureHooksConfigSnapshot();
         }
         if (log.isInfoEnabled()) {
-            log.info("[MPL7] loadPluginHooks: 注册 {} 个插件 GenericHook (对齐 CC loadPluginHooks.ts:91)",
+            log.info("[MPL7] loadPluginHooks: 注册 {} 个插件 hook matcher 组到统一 registered 链 (对齐 CC loadPluginHooks.ts:91)",
                 registrations.size());
         }
     }
@@ -838,70 +850,14 @@ public class PluginLoader {
      * [MPL7] 插件 hook 注册条目（name/owner/event/matcher/命令列表）· 供 clear-then-register swap。
      *
      * <p>[IMP-GAP03] matcher 字段承载 CC PluginHookMatcher.matcher（loadPluginHooks.ts:74-81），
-     * {@link #buildPluginGenericHook} 执行前按事件 matchQuery 过滤（CC getMatchingHooks
-     * hooks.ts:1683-1686）—— 决定「该组 hooks 是否适用于当前事件」，防插件 hook 对同事件
-     * 全部执行（过度执行）。
+     * 由 {@link HookRegistry#getMatchingHooks} 统一链按事件 matchQuery 过滤（CC getMatchingHooks
+     * hooks.ts:1683-1686）。
+     *
+     * <p>[Wave2-J2] hooks 从 {@code List<CommandHook>} 泛化为 {@code List<HookCommand>}：
+     * 5 类（command/prompt/agent/http/mcp_tool）统一经 registered 匹配链执行。
      */
     private record PluginHookRegistration(String name, String pluginName, HookEventType event,
-                                          String matcher, List<CommandHook> hooks) {}
-
-    /**
-     * [MPL7] 构造插件 hook GenericHook · 对齐 CC PluginHookMatcher（loadPluginHooks.ts:74-81）
-     * matcher + hooks 数组 + plugin 上下文。onEvent 时经 {@link com.nexusai.application.agent.permission.hook.CommandHookExecutor}
-     * 顺序执行命令；首个 preventContinuation 结果短路返回。
-     *
-     * <p>[IMP-GAP03] matcher 过滤（CC getMatchingHooks hooks.ts:1683-1686）：matcher 非空/非 '*'
-     * 时经 {@link HookMatcherEngine#matchesMatcher(HookEvent, String)} 判定本组 hooks 是否适用于
-     * 当前事件（extractMatchQuery 事件字段映射 + matchesPattern 模式匹配，hooks.ts:1615-1670/
-     * :1346-1381）。不匹配 → 直接 proceed，不执行该组 hooks（修复：Java 曾丢弃 matcher →
-     * 插件 hook 对同事件全部执行 = 过度执行）。matchQuery 无法提取的事件（Stop/UserPromptSubmit
-     * 等，fromCcName 白名单内无匹配字段）→ matchesMatcher 恒 true，不过滤（CC :1684 全部保留）。
-     * engine 未注入（测试/直构）→ 回退不过滤，保持现状。
-     */
-    private GenericHook buildPluginGenericHook(PluginHookRegistration reg) {
-        return event -> {
-            // [IMP-GAP03] matcher 过滤 · CC PluginHookMatcher（loadPluginHooks.ts:74-81）+
-            // getMatchingHooks matcher 过滤（hooks.ts:1683-1686）：matcher 非空/非 '*'
-            // 且事件 matchQuery 不匹配 → 本组 hooks 不执行（直接 proceed）。
-            String matcher = reg.matcher();
-            if (matcher != null && !matcher.isEmpty() && !"*".equals(matcher)) {
-                HookMatcherEngine engine = this.hookMatcherEngine;
-                if (engine != null && !engine.matchesMatcher(event, matcher)) {
-                    if (log.isDebugEnabled()) {
-                        log.debug("[IMP-GAP03] 插件 hook '{}' 因 matcher '{}' 不匹配事件 {} 跳过 (CC hooks.ts:1683-1686)",
-                            reg.name(), matcher, event.type());
-                    }
-                    return GenericHook.HookResult.proceed();
-                }
-            }
-            com.nexusai.application.agent.permission.hook.CommandHookExecutor ex = commandHookExecutor;
-            if (ex == null) {
-                return GenericHook.HookResult.proceed();
-            }
-            String jsonInput = com.nexusai.application.agent.permission.hook.CommandHookExecutor.buildJsonInput(event);
-            LoadedPlugin plugin = cache.get(reg.pluginName());
-            String pluginRoot = plugin != null && plugin.localPath() != null ? plugin.localPath().toString() : null;
-            String pluginId = plugin != null && plugin.source() != null ? plugin.source().name() : null;
-            GenericHook.HookResult first = null;
-            for (CommandHook cmd : reg.hooks()) {
-                try {
-                    com.nexusai.application.agent.permission.hook.CommandHookExecutor.CommandHookResult r =
-                        ex.execute(cmd, event, reg.name(), jsonInput, pluginRoot, pluginId, null, 0, false);
-                    GenericHook.HookResult res =
-                        com.nexusai.application.agent.permission.hook.CommandHookExecutor.toHookResult(r, cmd.command());
-                    if (res != null && res.preventContinuation()) {
-                        return res;
-                    }
-                    if (first == null && res != null) {
-                        first = res;
-                    }
-                } catch (Exception e) {
-                    log.warn("[MPL7] plugin hook '{}' 执行失败, 不阻断: {}", reg.name(), e.toString());
-                }
-            }
-            return first != null ? first : GenericHook.HookResult.proceed();
-        };
-    }
+                                          String matcher, List<HookCommand> hooks) {}
 
     /**
      * [MPL7] 移除不再 enabled 插件的 hooks · 对齐 CC pruneRemovedPluginHooks（loadPluginHooks.ts:179-204）。
@@ -918,17 +874,17 @@ public class PluginLoader {
         for (LoadedPlugin p : loadAllPluginsCacheOnly().enabled()) {
             enabledNames.add(p.name());
         }
-        // GenericHook 执行路径 prune（HookRegistry.pluginHookOwners 跟踪）
+        // [Wave2-J2] 插件 hook 只存在于 registered 匹配链 ⇒ 必须无条件 prune（旧守卫
+        //   `!pluginHookNames().isEmpty()` 在无 genericHooks 时会跳过 registered matcher 剪除）。
         HookRegistry registry = this.hookRegistry;
-        if (registry != null && !registry.pluginHookNames().isEmpty()) {
+        if (registry != null) {
             registry.prunePluginHooks(enabledNames);
         }
         if (this.hooksConfigSnapshot != null) {
             hooksConfigSnapshot.captureHooksConfigSnapshot();
         }
         if (log.isInfoEnabled()) {
-            log.info("[MPL7] pruneRemovedPluginHooks: 剩余 {} 个插件 GenericHook (禁用/卸载插件 hooks 移除, CC loadPluginHooks.ts:179-204)",
-                registry != null ? registry.pluginHookNames().size() : 0);
+            log.info("[MPL7] pruneRemovedPluginHooks: 已完成 registered 插件 matcher 剪除 (禁用/卸载插件 hooks 移除, CC loadPluginHooks.ts:179-204)");
         }
     }
 
@@ -976,21 +932,178 @@ public class PluginLoader {
     }
 
     /**
-     * 解析插件 hooks.json 单个 hook 条目 → CommandHook。
-     * 支持字符串（命令）与对象（{type:'command', command, shell, timeout, ...}，CC schemas/hooks.ts:32-65）。
+     * 解析插件 hooks.json 单个 hook 条目 → {@link HookCommand}（CC 5 类 discriminated union）。
+     *
+     * <p>[Wave2-J1] 插件 hooks.json 是 <b>snake_case</b> 变体（cc exe off≈317,019,038）：
+     * {@code on_failure / status_message / async_rewake / rewake_message / rewake_summary / args /
+     * continue_on_block / allowed_env_vars}；{@code on_failure} 缺省/非法值是 <b>block</b>
+     * （CC {@code .nullish().catch("block")}），与 settings camelCase 缺省 {@code continue} 不同。
+     * 两种写法都接受（旧插件配置不静默失效）。
+     *
+     * <p>[Wave2-J2] 支持 5 类：command / prompt / agent / http / mcp_tool；缺必填字段 →
+     * warn + 返回 null（调用方跳过），⛔ 不猜默认值。无 {@code type} 的字符串简写按 command。
+     *
+     * @param hookNode   hooks.json 单个 hook 条目
+     * @param pluginName 插件名（日志用）
+     * @return 对应 HookCommand；未知 type / 缺必填 → null（调用方跳过）
      */
-    private static CommandHook parsePluginHookCommand(JsonNode hookNode, String pluginName) {
+    static HookCommand parsePluginHookCommand(JsonNode hookNode, String pluginName) {
         if (hookNode.isTextual()) {
-            return new CommandHook(hookNode.asText(), null, null, null, null, null, null, null);
+            return new CommandHook(hookNode.asText(), null, null, null, null, null, null, null,
+                null, "block", null, null, null);
         }
-        String command = hookNode.path("command").asText(null);
-        if (command == null) {
-            command = hookNode.asText("");
+        String type = firstText(hookNode, "type");
+        if (type == null || type.isBlank()) {
+            type = "command"; // 无判别器的旧条目按 command（CC settings 对象形同）
         }
-        String shell = hookNode.path("shell").asText(null);
+        String ifCondition = firstText(hookNode, "if");
         Integer timeout = hookNode.path("timeout").isInt() ? hookNode.path("timeout").asInt() : null;
-        String statusMessage = hookNode.path("statusMessage").asText(null);
+        String statusMessage = firstText(hookNode, "status_message", "statusMessage");
         Boolean once = hookNode.path("once").isBoolean() ? hookNode.path("once").asBoolean() : null;
-        return new CommandHook(command, null, shell, timeout, statusMessage, once, null, null);
+        switch (type) {
+            case "command": {
+                String command = firstText(hookNode, "command");
+                if (command == null || command.isBlank()) {
+                    log.warn("[MPL7] 插件 {} 的 command hook 缺 command 字段，跳过", pluginName);
+                    return null;
+                }
+                JsonNode argsNode = hookNode.path("args");
+                List<String> args = null;
+                if (argsNode.isArray()) {
+                    args = new ArrayList<>();
+                    for (JsonNode a : argsNode) {
+                        if (a.isTextual()) {
+                            args.add(a.asText());
+                        }
+                    }
+                }
+                return new CommandHook(command, ifCondition, firstText(hookNode, "shell"), timeout,
+                    statusMessage, once, boolOrNull(hookNode, "async"),
+                    boolOrNull(hookNode, "async_rewake", "asyncRewake"), args,
+                    pluginOnFailure(hookNode), firstText(hookNode, "rewake_message", "rewakeMessage"),
+                    firstText(hookNode, "rewake_summary", "rewakeSummary"), null);
+            }
+            case "prompt": {
+                String prompt = firstText(hookNode, "prompt");
+                if (prompt == null || prompt.isBlank()) {
+                    log.warn("[MPL7] 插件 {} 的 prompt hook 缺 prompt 字段，跳过", pluginName);
+                    return null;
+                }
+                return new PromptHook(prompt, ifCondition, timeout, firstText(hookNode, "model"),
+                    statusMessage, once,
+                    boolOrNull(hookNode, "continue_on_block", "continueOnBlock"));
+            }
+            case "agent": {
+                String prompt = firstText(hookNode, "prompt");
+                if (prompt == null || prompt.isBlank()) {
+                    log.warn("[MPL7] 插件 {} 的 agent hook 缺 prompt 字段，跳过", pluginName);
+                    return null;
+                }
+                return new AgentHook(prompt, ifCondition, timeout, firstText(hookNode, "model"),
+                    statusMessage, once);
+            }
+            case "http": {
+                String url = firstText(hookNode, "url");
+                if (url == null || url.isBlank()) {
+                    log.warn("[MPL7] 插件 {} 的 http hook 缺 url 字段，跳过", pluginName);
+                    return null;
+                }
+                return new HttpHook(url, ifCondition, timeout, headersMap(hookNode),
+                    stringList(hookNode, "allowed_env_vars", "allowedEnvVars"), statusMessage, once,
+                    pluginOnFailure(hookNode));
+            }
+            case "mcp_tool": {
+                String server = firstText(hookNode, "server");
+                String tool = firstText(hookNode, "tool");
+                if (server == null || server.isBlank() || tool == null || tool.isBlank()) {
+                    log.warn("[MPL7] 插件 {} 的 mcp_tool hook 缺 server/tool 字段，跳过", pluginName);
+                    return null;
+                }
+                return new McpToolHook(server, tool, objectMap(hookNode, "input"), ifCondition,
+                    timeout, statusMessage, once);
+            }
+            default:
+                log.warn("[MPL7] 插件 {} 的 hook type={} 未知（CC discriminatedUnion 仅 5 类），跳过该条",
+                    pluginName, type);
+                return null;
+        }
+    }
+
+    /** 插件侧 {@code on_failure}：缺省/非法 → block（CC {@code .nullish().catch("block")}）。 */
+    private static String pluginOnFailure(JsonNode hookNode) {
+        String onFailure = firstText(hookNode, "on_failure", "onFailure");
+        if ("continue".equals(onFailure) || "block".equals(onFailure)) {
+            return onFailure;
+        }
+        return "block";
+    }
+
+    /** 插件 http hook {@code headers}：对象 → Map&lt;String,String&gt;（非文本值跳过）。 */
+    private static Map<String, String> headersMap(JsonNode hookNode) {
+        JsonNode h = hookNode.path("headers");
+        if (!h.isObject()) {
+            return null;
+        }
+        Map<String, String> out = new java.util.LinkedHashMap<>();
+        for (Iterator<Map.Entry<String, JsonNode>> it = h.fields(); it.hasNext(); ) {
+            Map.Entry<String, JsonNode> e = it.next();
+            if (e.getValue().isTextual()) {
+                out.put(e.getKey(), e.getValue().asText());
+            }
+        }
+        return out;
+    }
+
+    /** 字符串数组字段（snake/camel 两写法）；缺失/非数组 → null。 */
+    private static List<String> stringList(JsonNode node, String... names) {
+        for (String name : names) {
+            JsonNode v = node.get(name);
+            if (v != null && v.isArray()) {
+                List<String> out = new ArrayList<>();
+                for (JsonNode item : v) {
+                    if (item.isTextual()) {
+                        out.add(item.asText());
+                    }
+                }
+                return out;
+            }
+        }
+        return null;
+    }
+
+    /** 对象字段 → Map&lt;String,Object&gt;；缺失/非对象 → null。 */
+    private static Map<String, Object> objectMap(JsonNode node, String name) {
+        JsonNode v = node.get(name);
+        if (v == null || !v.isObject()) {
+            return null;
+        }
+        try {
+            return JSON.convertValue(v,
+                new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+        } catch (RuntimeException e) {
+            return null;
+        }
+    }
+
+    /** snake_case 优先、camelCase 兼容取文本；缺失/非文本 → null。 */
+    private static String firstText(JsonNode node, String... names) {
+        for (String name : names) {
+            JsonNode v = node.get(name);
+            if (v != null && v.isTextual()) {
+                return v.asText();
+            }
+        }
+        return null;
+    }
+
+    /** 布尔取 null-safe（snake/camel 两写法）。 */
+    private static Boolean boolOrNull(JsonNode node, String... names) {
+        for (String name : names) {
+            JsonNode v = node.get(name);
+            if (v != null && v.isBoolean()) {
+                return v.asBoolean();
+            }
+        }
+        return null;
     }
 }

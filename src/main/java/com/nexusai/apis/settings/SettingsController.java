@@ -15,6 +15,8 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.web.bind.annotation.*;
 
+import java.util.List;
+
 /** Settings REST 端点（singleton） */
 @RestController
 @RequestMapping("/api/v1/settings")
@@ -87,6 +89,103 @@ public class SettingsController {
         }
         settingsService.updateMcpPrefetchOnStartup(b);
         return new McpPrefetchResponse(b, "db");
+    }
+
+    /**
+     * [V298] GET LLM 出站 HTTP 代理（ChatGPT 登录 + 对话专用）。
+     *
+     * <p>⛔ 与 WebSearch / WebFetch 的代理是两条通道：那边读 {@code settings.proxy}，
+     * 本端点只读写 {@code settings.http_proxy}，互不影响。
+     *
+     * @return {@code {"proxy":"http://127.0.0.1:7897"}}；未配置返回 {@code proxy: null}
+     */
+    @GetMapping("/http-proxy")
+    public HttpProxyResponse getHttpProxy() {
+        return new HttpProxyResponse(settingsService.readDbHttpProxy());
+    }
+
+    /**
+     * [V298] PUT LLM 出站 HTTP 代理 · 落 settings 表，<b>下一次请求即生效</b>（不重启）。
+     *
+     * <p><b>三态</b>：{@code null} = 未配置（出站回落环境变量/直连）；空串 = 用户显式选择直连
+     * （压过环境变量，`OutboundProxy` 不再回落）；非空 = 该代理。
+     * 格式校验在前端（「试一下」）做，这里只做归一化（trim）；非法格式交给
+     * {@code OutboundProxy.parse} 记 warn 并当直连，不阻断保存。
+     *
+     * @param body {@code {"proxy":"http://127.0.0.1:7897"}}
+     * @return 写入后的值（未配置时 {@code proxy: null}）
+     */
+    @PutMapping("/http-proxy")
+    public HttpProxyResponse updateHttpProxy(@RequestBody(required = false) HttpProxyRequest body) {
+        settingsService.writeDbHttpProxy(body == null ? null : body.proxy());
+        return new HttpProxyResponse(settingsService.readDbHttpProxy());
+    }
+
+    /**
+     * LLM 出站代理请求体。
+     *
+     * @param proxy 形如 {@code http://host:port}；null = 未配置；空串 = 显式直连
+     */
+    public record HttpProxyRequest(String proxy) {
+    }
+
+    /**
+     * [代理自动检测 2026-11-16] 探测本机常见代理端口 · {@code GET /api/v1/settings/http-proxy/probe}。
+     *
+     * <p><b>判据不是「端口开着」</b>：并发用各端口<b>当 HTTP 代理</b>去取一次
+     * {@code https://www.gstatic.com/generate_204}，拿到 2xx/3xx 才算命中 ⇒ SOCKS 端口、
+     * 被别的服务占用的端口都会被正确排除。详见 {@link com.nexusai.infra.llm.ProxyProbe}。
+     *
+     * <p>范围仅本机回环（不扫局域网）。前端在此结果上**只做提示**，是否填入由用户决定。
+     *
+     * @return 命中列表（按延迟升序；可能为空）
+     */
+    @GetMapping("/http-proxy/probe")
+    public ProxyProbeResponse probeHttpProxy() {
+        return new ProxyProbeResponse(com.nexusai.infra.llm.ProxyProbe.probeLocal());
+    }
+
+    /**
+     * [代理自动检测 2026-11-16] 实测一条代理是否可用 · {@code POST /api/v1/settings/http-proxy/test}。
+     *
+     * <p>「记住」之前调用：{@code ok=false} 时前端仍会保存（用户明确要求），只把 {@code error}
+     * 显示成可读提示，不拦截。
+     *
+     * @param body {@code {"proxy":"http://127.0.0.1:7897"}}
+     * @return {@code {ok, latencyMs, error}}
+     */
+    @PostMapping("/http-proxy/test")
+    public ProxyTestResponse testHttpProxy(@RequestBody(required = false) HttpProxyRequest body) {
+        String proxy = body == null ? null : body.proxy();
+        com.nexusai.infra.llm.ProxyProbe.TestResult r =
+            com.nexusai.infra.llm.ProxyProbe.test(proxy);
+        return new ProxyTestResponse(r.ok(), r.latencyMs(), r.error());
+    }
+
+    /**
+     * 代理探测响应。
+     *
+     * @param candidates 命中的本机代理（按延迟升序）
+     */
+    public record ProxyProbeResponse(List<com.nexusai.infra.llm.ProxyProbe.Candidate> candidates) {
+    }
+
+    /**
+     * 代理实测响应。
+     *
+     * @param ok        是否真的能经该代理取到 HTTPS 204
+     * @param latencyMs 往返耗时
+     * @param error     失败原因（可读短句）；成功为 null
+     */
+    public record ProxyTestResponse(boolean ok, long latencyMs, String error) {
+    }
+
+    /**
+     * LLM 出站代理响应。
+     *
+     * @param proxy 当前配置；{@code null} = 未配置（出站回落环境变量/直连）
+     */
+    public record HttpProxyResponse(String proxy) {
     }
 
     /**

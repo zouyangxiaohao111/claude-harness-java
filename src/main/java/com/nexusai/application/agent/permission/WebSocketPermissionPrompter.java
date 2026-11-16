@@ -767,6 +767,10 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 computerUse,
                 isClassifierFeatureEnabled()
             );
+            // [Hook v2.1.325] PreToolUse.permissionDisplay → 前端 ask 卡片文案
+            if (details != null && details.permissionDisplay() != null) {
+                event.setPermissionDisplay(details.permissionDisplay());
+            }
             ws.convertAndSend(topic, event);
             // [会话状态同步] 推送同时留快照 —— 供切会话/重连时 GET /sessions/{id}/state 补拉
             //   （事件本身是即时的：订阅缺失/断线期间到达的请求否则永久不可见）
@@ -928,7 +932,8 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                     ctx != null ? ToolPermissionGate.modeToCcString(ctx.permissionMode()) : null,
                     requestId,
                     ctx != null && ctx.sessionId() != null ? ctx.sessionId() : null,
-                    ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null
+                    ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null,
+                    HookRegistry.mcpServerNameOf(ctx, tool.name())
                 );
                 GenericHook.HookResult result = hookRegistry.executeEvent(requestEvent);
                 HookRaceOutcome outcome = toHookRaceDecision(result, input, requestId);

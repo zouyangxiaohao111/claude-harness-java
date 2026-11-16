@@ -219,6 +219,8 @@ export interface PermissionRequestItem {
   /** 一键授权建议（后端 PermissionPromptDetails.suggestions）· 弹窗按 destination 渲染第三档，
    *  点选后**原样**回传 updatedPermissions（前端不做结构转换）。空/缺省 → 不渲染第三档。 */
   suggestions?: PermissionUpdate[] | null
+  /** [Hook v2.1.325] PreToolUse permissionDisplay：自定义 ask 卡片文案（缺省走默认） */
+  permissionDisplay?: { title?: string; description?: string; displayName?: string } | null
   /**
    * 桌面控制授权载荷（后端算好的应用清单 + 授权范围文案 + 被请求的额外能力）。
    * null/缺省 ⇒ 不是桌面控制请求（走普通 allow/deny 分支）。
@@ -368,6 +370,8 @@ export interface ChatState {
   }) => void
   enqueuePermission: (req: PermissionRequestItem) => void
   dequeuePermission: (requestId: string) => void
+  /** 按工具调用清掉该会话里同一 tool_useId 的全部权限项（message + bridge 双推的兜底清理） */
+  clearPermissionByToolUse: (sessionId: string, toolUseId: string | null | undefined) => void
   expirePermission: (sessionId: string, requestId: string) => void
   /** 写/清某会话的重试提示；**只动该 sessionId 的键**（null = 清除该会话的重试提示）。 */
   setRetry: (sessionId: string, r: RetryUiState | null) => void
@@ -879,8 +883,32 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   setConversationId: (sessionId, conversationId) => set((st) => ({
     conversationIds: { ...st.conversationIds, [sessionId]: conversationId },
   })),
-  enqueuePermission: (req) => set((st) => ({ permissionQueue: [...st.permissionQueue, req] })),
+  // [同一 tool_use 只保留一条 · 2026-11-15] 后端对同一个工具调用会推 **两条** 权限事件
+  //   （message = AskUser/权限面板，bridge = racer）；两条 requestId 不同，回答时按 requestId
+  //   只能删掉被回答的那条 ⇒ 另一条永久留在队列 ⇒ `pendingSessionIds` 常亮，左栏黄点一直闪
+  //   （真机症状：右下角已提示本轮完成，左栏仍闪黄点）。
+  //   规则：同 sessionId + 同 toolUseId 时——
+  //     · 新来的是 message ⇒ 顶掉全部旧项（message 是最完整的那个）；
+  //     · 新来的是 bridge/channel ⇒ 只顶掉旧的非 message 项，已有的 message 保留。
+  //   toolUseId 缺失（老事件）⇒ 不去重，退回原行为。
+  enqueuePermission: (req) => set((st) => {
+    const sameCall = (r: PermissionRequestItem) =>
+      !!req.toolUseId && r.sessionId === req.sessionId && r.toolUseId === req.toolUseId
+    const kept = st.permissionQueue.filter(r => {
+      if (!sameCall(r)) return true
+      return req.kind !== 'message' && r.kind === 'message'
+    })
+    return { permissionQueue: [...kept, req] }
+  }),
   dequeuePermission: (requestId) => set((st) => ({ permissionQueue: st.permissionQueue.filter(r => r.requestId !== requestId) })),
+  // 兜底：回答某条请求后，把**同一工具调用**的其余权限项一并清掉（message 与 bridge 的
+  //   requestId 不同，只按 requestId 删会留下另一条 ⇒ 左栏黄点常亮）。
+  //   toolUseId 缺失 ⇒ 不动队列（⛔ 不能按 sessionId 清，会把别的等待中请求一起抹掉）。
+  clearPermissionByToolUse: (sessionId, toolUseId) => set((st) => ({
+    permissionQueue: toolUseId
+      ? st.permissionQueue.filter(r => !(r.sessionId === sessionId && r.toolUseId === toolUseId))
+      : st.permissionQueue,
+  })),
   expirePermission: (sessionId, requestId) => set((st) => {
     const req = st.permissionQueue.find(r => r.requestId === requestId)
     if (!req) return st

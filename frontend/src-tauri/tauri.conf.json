@@ -1,13 +1,13 @@
 {
   "$schema": "https://raw.githubusercontent.com/tauri-apps/tauri/dev/crates/tauri-config-schema/schema.json",
   "productName": "NexusAI",
-  "version": "0.1.81",
+  "version": "0.1.82",
   "identifier": "com.nexusai.client",
   "build": {
     "frontendDist": "../dist",
     "devUrl": "http://localhost:3000",
     "beforeDevCommand": "npm run dev",
-    "beforeBuildCommand": "node scripts/prepare-error-report.mjs && npm run build && node scripts/prepare-backend.mjs && node scripts/make-extension-zip.mjs"
+    "beforeBuildCommand": "node scripts/prepare-error-report.mjs && npm run build && node scripts/prepare-backend.mjs && node scripts/prepare-runtime.mjs && node scripts/make-extension-zip.mjs"
   },
   "app": {
     "macOSPrivateApi": true,
