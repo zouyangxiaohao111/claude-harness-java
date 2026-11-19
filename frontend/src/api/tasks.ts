@@ -17,6 +17,10 @@ export interface BackgroundTaskDto {
   agentId?: string | null
   /** 是否已后台化（true=真异步后台任务 · false=前台同步任务如 Bash 工具卡已展示）· 后端 TaskDto 透出 */
   isBackgrounded?: boolean
+  /** in-process teammate 的 agent 名（对齐 CC Task.owner 的匹配源） */
+  ownerName?: string | null
+  /** running teammate 的最近活动摘要（对齐 CC TaskListV2 进行中任务第二行） */
+  activity?: string | null
 }
 
 export const tasksApi = {
@@ -30,6 +34,11 @@ export const tasksApi = {
   list: (sessionId: string) => api<BackgroundTaskDto[]>(`/tasks?sessionId=${encodeURIComponent(sessionId)}`),
   /** 任务清单合并端点（TaskCreate V2 + TodoWrite V1 · V1/V2 互斥，前端按非空方显示）· GET /tasks/list?sessionId */
   listSnapshot: (sessionId: string) => api<TaskListSnapshotDto>(`/tasks/list?sessionId=${encodeURIComponent(sessionId)}`),
+  /** 重置 V2 任务清单（对齐 CC resetTaskList：提水位 + 删任务文件）。
+   *  调用时机同 CC useTasksV2：全部任务 completed 后 5 秒。 */
+  resetTaskList: (sessionId: string) =>
+    api<{ success: boolean; taskListId?: string }>(
+      `/tasks/reset?sessionId=${encodeURIComponent(sessionId)}`, { method: 'POST' }),
   /** 停止单任务（404 无该任务 / 409 非 running） */
   killTask: (taskId: string) => api<{ success: boolean }>(`/tasks/${encodeURIComponent(taskId)}/kill`, { method: 'POST' }),
   /** 前台任务转后台（对齐 CC Ctrl+B task:background · 后端 backgroundExistingForegroundTask） */

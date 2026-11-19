@@ -6,6 +6,11 @@ import { ArtifactCards } from '@/components/right/ArtifactCards'
 import { artifactKindOf, isTextArtifact } from '@/utils/artifactKind'
 import type { SessionArtifactDto } from '@/api/artifacts'
 
+// 右键「打开所在文件夹」只在桌面端出现（Tauri revealItemInDir）
+const openerMocks = vi.hoisted(() => ({ revealItemInDir: vi.fn(async () => undefined) }))
+vi.mock('@tauri-apps/api/core', () => ({ isTauri: () => true }))
+vi.mock('@tauri-apps/plugin-opener', () => ({ revealItemInDir: openerMocks.revealItemInDir }))
+
 /**
  * 意图（为什么不只是「断言调了什么」）：
  * - 产物区是「最终交付物」的入口，用户扫一眼就要知道这是个网页 / 文档 / 表格还是图片
@@ -162,16 +167,17 @@ describe('ArtifactCards', () => {
     expect(new Set(sigs).size).toBe(7)
   })
 
-  it('图标按类型分底色（k-html / k-docx …）', () => {
+  it('图标按类型分色（与待发附件同一套 DSH 实心文档：pdf 红 / word 蓝 / 图片紫）', () => {
     render({ items: [art('1', 'a.html'), art('2', 'b.docx'), art('3', 'c.png')] })
-    expect(container.querySelector('.ac-ico.k-html')).toBeTruthy()
-    expect(container.querySelector('.ac-ico.k-docx')).toBeTruthy()
-    expect(container.querySelector('.ac-ico.k-img')).toBeTruthy()
+    const colors = Array.from(container.querySelectorAll('.ac-ico svg')).map((s) => s.getAttribute('style') ?? '')
+    expect(colors.some((s) => s.includes('rgb(65, 118, 230)')), 'html/code 蓝').toBe(true)
+    expect(colors.some((s) => s.includes('rgb(86, 134, 254)')), 'docx 蓝').toBe(true)
+    expect(colors.some((s) => s.includes('rgb(139, 118, 246)')), '图片紫').toBe(true)
   })
 
   it('[2026-11-01] 标题没有扩展名 ⇒ 按归档路径的真实扩展名上色（否则满屏无色图标）', () => {
     // 实测：抽取出来的 18 条交付物**标题全都没有后缀**（"思考块与补问交互设计稿 v2"…）
-    // ⇒ 只看标题会全落进 k-file（无色）⇒ 必须看 localPath（…-agri-react-thinking-and-ask-user.html）
+    // ⇒ 只看标题会全落进 other（灰文档）⇒ 必须看 localPath（…-agri-react-thinking-and-ask-user.html）
     render({
       items: [
         art('1', '思考块与补问交互设计稿 v2', { localPath: 'C:/artifacts/s1/aaa-agri-react-thinking.html' }),
@@ -179,19 +185,20 @@ describe('ArtifactCards', () => {
         art('3', '柱状图渲染证据 SVG', { localPath: 'C:/artifacts/s1/ccc-chart_bar_proof.svg' }),
       ],
     })
-    expect(container.querySelector('.ac-ico.k-html')).toBeTruthy()
-    expect(container.querySelector('.ac-ico.k-md')).toBeTruthy()
-    expect(container.querySelector('.ac-ico.k-img')).toBeTruthy()
-    // 没有一条落进 k-file（=无色兜底）
-    expect(container.querySelector('.ac-ico.k-file')).toBeFalsy()
+    const colors = Array.from(container.querySelectorAll('.ac-ico svg')).map((s) => s.getAttribute('style') ?? '')
+    expect(colors.some((s) => s.includes('rgb(65, 118, 230)')), 'html/md 蓝').toBe(true)
+    expect(colors.some((s) => s.includes('rgb(139, 118, 246)')), 'svg 图片紫').toBe(true)
+    // 没有一条落进 other 的灰兜底
+    expect(colors.every((s) => !s.includes('rgb(207, 211, 214)')), '不得落进无色兜底').toBe(true)
   })
 
   it('[2026-11-01] 路径优先于标题（真源是归档文件 ⇒ 标题写错后缀也不影响打开/配色）', () => {
     render({
       items: [art('1', '证据服务走查页面.html', { localPath: 'C:/artifacts/s1/ddd-report.pdf' })],
     })
-    expect(container.querySelector('.ac-ico.k-pdf')).toBeTruthy()
-    expect(container.querySelector('.ac-ico.k-html')).toBeFalsy()
+    const style = container.querySelector('.ac-ico svg')?.getAttribute('style') ?? ''
+    expect(style, '按 localPath 判成 PDF（红）').toContain('rgb(236, 19, 19)')
+    expect(style, '不得按标题判成 html（蓝）').not.toContain('rgb(65, 118, 230)')
   })
 
   it('「在浏览器中打开」**只有 html 有**（其它类型不是网页 ⇒ 外链打开无意义）', () => {
@@ -267,5 +274,39 @@ describe('ArtifactCards', () => {
   it('空列表不渲染任何东西（避免右栏出现空网格占位）', () => {
     render({ items: [] })
     expect(container.querySelector('.artifact-cards')).toBeFalsy()
+  })
+})
+
+describe('产物右键菜单（打开所在文件夹 / 复制路径）', () => {
+  const openMenu = async () => {
+    const card = container.querySelector('.artifact-card') as HTMLElement
+    act(() => {
+      card.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, clientX: 20, clientY: 30 }))
+    })
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    return Array.from(document.querySelectorAll('.project-context-menu .ctx-menu-item'))
+  }
+
+  it('桌面端：「打开所在文件夹」调 revealItemInDir(localPath) 并关闭菜单', async () => {
+    openerMocks.revealItemInDir.mockClear()
+    render({ items: [art('1', 'a.pdf')] })
+    const items = await openMenu()
+    const item = items.find((n) => (n.textContent ?? '').includes('打开所在文件夹'))
+    expect(item, '桌面端菜单必须有「打开所在文件夹」').toBeTruthy()
+    act(() => { item!.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
+    expect(openerMocks.revealItemInDir).toHaveBeenCalledWith('/home/u/.nexusai/artifacts/s1/a.pdf')
+    expect(document.querySelector('.project-context-menu'), '点完应关闭').toBeNull()
+  })
+
+  it('菜单项「复制路径」把归档副本绝对路径写进剪贴板', async () => {
+    const writeText = vi.fn(async () => undefined)
+    Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true })
+    render({ items: [art('1', 'a.docx')] })
+    const items = await openMenu()
+    const item = items.find((n) => (n.textContent ?? '').includes('复制路径'))
+    expect(item, '必须能复制路径').toBeTruthy()
+    act(() => { item!.dispatchEvent(new MouseEvent('click', { bubbles: true })) })
+    expect(writeText).toHaveBeenCalledWith('/home/u/.nexusai/artifacts/s1/a.docx')
   })
 })

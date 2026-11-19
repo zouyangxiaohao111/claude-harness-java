@@ -589,7 +589,8 @@ public class SendMessageTool implements Tool {
             //   appState.agentNameRegistry.get(input.to) → 命中注册名 → queuePendingMessage
             //   （子 agent 下一轮 SubagentExecutor runSubagentQueryLoop drain 消费）。非注册名 →
             //   降级 handleMessage（mailbox）。agentNameRegistry 未注入 → 降级。
-            AgentToolResult routed = routeToRegisteredSubagent(call, to, content, ctx);
+            AgentToolResult routed = routeToRegisteredSubagent(
+                call, to, content, readString(input, "summary"), ctx);
             if (routed != null) {
                 return routed;
             }
@@ -662,10 +663,11 @@ public class SendMessageTool implements Tool {
      * @param call    工具调用块
      * @param to      收件人（注册名）
      * @param content 消息文本
+     * @param summary SendMessage 的 5-10 词 UI 摘要（前端通知条优先展示；可空）
      * @return 路由结果；非注册名 / 未接线 → null
      */
     private AgentToolResult routeToRegisteredSubagent(ToolUseBlock call, String to, String content,
-                                                       ToolUseContext ctx) {
+                                                       String summary, ToolUseContext ctx) {
         if (agentNameRegistry == null) {
             return null;
         }
@@ -681,12 +683,17 @@ public class SendMessageTool implements Tool {
                 return resumed;
             }
         }
-        // 已注册且运行中 → 待办队列投递（CC queuePendingMessage 等价），子 agent 下一轮消费
-        agentNameRegistry.queue(agentId, content);
+        // 已注册且运行中 → 待办队列投递（CC queuePendingMessage 等价），子 agent 下一轮消费。
+        // [agent-notice] 入队即生成稳定 ID，并携带来源/摘要/会话：子 agent 消费时落成一条
+        //   user 消息（author=from, subtype=agent_message, isMeta=true），前端据此显示通知条。
+        String sender = resolveSenderName(ctx);
+        String origin = Teammate.isTeammate(identityOf(ctx)) ? "peer" : "coordinator";
+        agentNameRegistry.queue(agentId,
+            ctx != null ? ctx.sessionId() : null, sender, content, summary, origin);
         if (log.isDebugEnabled()) {
             log.debug("[SendMessageTool] [IMP-G4 C7] in-process 子代理按名路由: to='{}' agentId={} "
-                    + "消息长度={} 已入待办队列 (CC SendMessageTool.ts:800-813 queuePendingMessage)",
-                to, agentId, content == null ? 0 : content.length());
+                    + "from={} origin={} 消息长度={} 已入待办队列 (CC SendMessageTool.ts:800-813 queuePendingMessage)",
+                to, agentId, sender, origin, content == null ? 0 : content.length());
         }
         ObjectNode out = JsonNodeFactory.instance.objectNode();
         out.put("success", true);

@@ -1,0 +1,18 @@
+-- ===================================================================
+-- V302: settings 表新增 show_clear_context_on_plan_accept 列
+--
+-- 背景：plan 审批卡的「批准并清空上下文执行」对齐 CC
+--   （`showClearContextOnPlanAccept`）。此前本仓只有 SettingsSchemaGenerator 的 schema 声明，
+--   没有实际列与读写通道 ⇒ 前端只能让该按钮常显（已登记偏离）。
+-- 语义：null/0 = 关闭（审批卡只显示「保留上下文」）；1 = 显示清空上下文选项。
+--   不加 DEFAULT，null = 未配置，与 V78/V54 先例一致（Boolean 三态由后端 null-skip merge 保持）。
+-- 映射：Java 字段 showClearContextOnPlanAccept ↔ 列 show_clear_context_on_plan_accept
+--   （MyBatis-Flex snake_case 自动映射）。
+--
+-- 版本号说明（勿再改回 102）：初版误编为 V102，与已落库的
+--   V102__add_settings_webfetch_engine.sql 撞号 ⇒ Flyway 报
+--   "Found more than one migration with version 102" ⇒ 整个 Spring 上下文起不来。
+--   V102 已落库、字节冻结不可动；V301 归 DSH 副本自有的
+--   V301__create_console_operation_ledger.sql（与主仓共用同一真库）⇒ 本迁移取 V302。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN show_clear_context_on_plan_accept INTEGER;

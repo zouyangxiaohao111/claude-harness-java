@@ -40,13 +40,19 @@ function blk(id: string, seq: number, opts: Partial<StreamBlock> = {}): StreamBl
 let container: HTMLDivElement
 let root: Root
 
-function renderList(thinking: boolean) {
+/**
+ * @param thinking     `turnRunning && !hasStream`（占位信号，与 App 同源）
+ * @param turnRunning  宿主权威运行态（2026-11-18 起 MessageList 用它决定 streaming 臂）；
+ *                      不传 = 回落 `!turnEnded`。idle 时必须显式传 false —— 否则「块仍在
+ *                      streams 里」会被当成仍在跑，收口臂永远不触发。
+ */
+function renderList(thinking: boolean, turnRunning?: boolean) {
   if (root) act(() => { root.unmount() })
   root = createRoot(container)
   act(() => {
     root.render(
       <MessageList sessionId={SID} messages={[]} onDelete={noop} conversationId={null}
-        thinking={thinking} onNearBottomChange={noop} onLoadOlder={noop} />,
+        thinking={thinking} turnRunning={turnRunning} onNearBottomChange={noop} onLoadOlder={noop} />,
     )
   })
 }
@@ -78,7 +84,7 @@ describe('[收口重渲] 流式块在该轮结束后按非流式渲染', () => {
   })
 
   it('服务端已 idle（thinking=false）：块仍在 streams 也必须走收口臂 → 粘连被 rescue 修好', () => {
-    renderList(false)
+    renderList(false, false)
     expect(countIn('.md-content h2')).toBe(1)
     expect(countIn('.md-content table')).toBe(1)
     // `##` 不再以字面出现在正文里
@@ -87,7 +93,7 @@ describe('[收口重渲] 流式块在该轮结束后按非流式渲染', () => {
   })
 
   it('服务端仍在跑（thinking=true）且是尾块：保持流式臂（不跑 rescue）', () => {
-    renderList(true)
+    renderList(true, true)
     expect(countIn('.md-content h2')).toBe(0)
     expect(countIn('.md-content table')).toBe(0)
   })
@@ -96,12 +102,12 @@ describe('[收口重渲] 流式块在该轮结束后按非流式渲染', () => {
     // 用户诉求原话：「流式结束重新完整渲染一次正文不行吗」
     // 这条用例就是在验证这件事：props 里 streaming 由 true 变 false，
     // MarkdownTextV2 的 useMemo 依赖 [text, streaming] 变化 ⇒ 整份 HTML 重新生成。
-    renderList(true)
+    renderList(true, true)
     expect(countIn('.md-content h2')).toBe(0)      // 流式中：粘连保持字面
     expect(countIn('.md-content table')).toBe(0)
 
     // 服务端 idle（模拟 complete 到达）—— 同一块、同一份 text，只翻 turnRunning
-    renderList(false)
+    renderList(false, false)
     expect(countIn('.md-content h2')).toBe(1)      // 已收口：完整重渲后表头/表格回来
     expect(countIn('.md-content table')).toBe(1)
   })

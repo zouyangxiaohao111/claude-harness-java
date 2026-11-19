@@ -29,6 +29,11 @@ import jakarta.annotation.Nullable;
  * @param isBackgrounded 是否已后台化 · true=真异步后台任务（spawn/Ctrl+B 后台化）·
  *                       false=前台同步（前台 Bash 直执行，注册后立即完成）· CC original:
  *                       isBackgrounded (LocalShellTask.tsx:281 / LocalAgentTask.tsx:565)
+ * @param ownerName   in-process teammate 的 agent 名（对齐 CC Task.owner 的匹配源·
+ *                    identity.agentName，types.ts:13）；非 teammate 任务为 null
+ * @param activity    进行中 teammate 的最近活动摘要（对齐 CC
+ *                    {@code TaskListV2} 第二行 {@code progress.recentActivities} 合并结果）；
+ *                    非 teammate / 无活动 / 非 running 为 null
  */
 public record TaskDto(
         String id,
@@ -39,16 +44,32 @@ public record TaskDto(
         long startTime,
         @Nullable Long endTime,
         @Nullable String agentId,
-        @Nullable Boolean isBackgrounded
+        @Nullable Boolean isBackgrounded,
+        @Nullable String ownerName,
+        @Nullable String activity
 ) {
 
     /**
      * 从后端 {@link BackgroundTask} 映射（枚举 → CC 小写值域，agentId UUID → 串）。
+     * 不含 teammate 活动（无 registry 数据源）；需要活动时用 {@link #from(BackgroundTask, String, String)}。
      *
      * @param task 后端统一 store 中的任务快照
      * @return 前端 DTO
      */
     public static TaskDto from(BackgroundTask task) {
+        return from(task, null, null);
+    }
+
+    /**
+     * 带 teammate 活动信息的映射 · in-process teammate 任务由 {@code TaskController} 从
+     * {@code InProcessTeammateTaskRegistry} 取 {@code identity.agentName} 与活动摘要后传入。
+     *
+     * @param task      后端统一 store 中的任务快照
+     * @param ownerName teammate agent 名（非 teammate 传 null）
+     * @param activity  活动摘要（无活动/非 running 传 null）
+     * @return 前端 DTO
+     */
+    public static TaskDto from(BackgroundTask task, @Nullable String ownerName, @Nullable String activity) {
         return new TaskDto(
                 task.id(),
                 task.type().getTypeString(),
@@ -58,7 +79,9 @@ public record TaskDto(
                 task.startTime(),
                 task.endTime(),
                 task.agentId() != null ? task.agentId().toString() : null,
-                task.isBackgrounded()
+                task.isBackgrounded(),
+                ownerName,
+                activity
         );
     }
 }

@@ -117,6 +117,64 @@ public final class SessionPermissionOverlay {
      * @return 只含 SESSION 条目的 ToolPermissionContext；<b>列无 SESSION 条目 / 解析失败 → null</b>
      *         （null = 不注入，调用方不得建 appState 键 —— 对齐 todos 回读空态语义）
      */
+    /**
+     * 会话当前<b>实际生效</b>的权限模式（CC 串）· 供会话 DTO 透出，使胶囊与运行时同源。
+     *
+     * <p><b>WHY</b>：胶囊读 {@code sessions.permission_mode}，而 per-turn 合并里 V75
+     * {@code session_permission_rules} 的 setMode 会覆盖它（AgentLoopContext 合并语义
+     * 「appState 侧 mode 胜出」）⇒ 两源不一致时会出现「显示 plan、实际 acceptEdits」。
+     * 这里按同一优先级给出有效值：列里有 SESSION setMode 用它，否则回落 permission_mode。
+     *
+     * @param columnJson        session_permission_rules 原始 JSON（可 null）
+     * @param fallbackCcLiteral 列 permission_mode 原值（可 null）
+     * @return CC 串（default / plan / acceptEdits / bypassPermissions / dontAsk / auto）
+     */
+    public static String effectiveModeCcLiteral(String columnJson, String fallbackCcLiteral) {
+        Parsed p = parse(columnJson);
+        if (p == null || p.mode() == null) {
+            return fallbackCcLiteral;
+        }
+        return switch (p.mode()) {
+            case DEFAULT -> "default";
+            case PLAN -> "plan";
+            case ACCEPT_EDITS -> "acceptEdits";
+            case BYPASS_PERMISSIONS -> "bypassPermissions";
+            case DONT_ASK -> "dontAsk";
+            case AUTO -> "auto";
+            case BUBBLE -> fallbackCcLiteral;
+        };
+    }
+
+    /**
+     * [权限胶囊切换] 把会话列里<b>已有</b>的 SESSION setMode 同步成用户显式选择的模式。
+     *
+     * <p><b>WHY</b>：V75 {@code session_permission_rules} 的 SESSION setMode 在 per-turn 合并中
+     * 优先于 {@code permission_mode} 列（appState 侧 mode 胜出，见
+     * {@link #effectiveModeCcLiteral} 与 {@code AgentLoopContext:1622}）。用户在权限胶囊里切换
+     * 模式时若只写 {@code permission_mode} 列，会被列里的旧 setMode 盖回去 ⇒ 胶囊弹回、运行时
+     * 仍用旧模式（实测 sess-2cc5c97b：{@code permission_mode=bypassPermissions} 但列
+     * {@code mode=acceptEdits}，点「绕过权限」不生效）。
+     *
+     * <p><b>只改 mode</b>：已授权的 allow/deny/ask 规则与附加目录原样保留。列里<b>本来没有
+     * mode</b>（未在弹窗里选过「本次会话」档）→ 原样返回，不凭空造 SESSION 条目 —— 此时
+     * {@code permission_mode} 列本身就是唯一真源，无需写。
+     *
+     * @param columnJson 会话列原始 JSON（可 null/空白）
+     * @param mode       用户显式选择的权限模式（{@link PermissionMode#BUBBLE} 是内部标记，忽略）
+     * @return 同步后的 JSON；无需变更时返回原引用（调用方可用引用相等判「未变」）
+     */
+    public static String syncMode(String columnJson, PermissionMode mode) {
+        if (columnJson == null || columnJson.isBlank() || mode == null
+                || mode == PermissionMode.BUBBLE) {
+            return columnJson;
+        }
+        Parsed parsed = parse(columnJson);
+        if (parsed.mode() == null || parsed.mode() == mode) {
+            return columnJson;
+        }
+        return toJson(new Parsed(mode, parsed.rules(), parsed.directories()));
+    }
+
     public static ToolPermissionContext toContext(String columnJson, PermissionMode baseMode) {
         Parsed parsed = parse(columnJson);
         if (parsed == null || parsed.isEmpty()) {

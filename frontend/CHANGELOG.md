@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.83] - 2026-11-19
+
+### Added
+
+- 新增计划审批卡「批准并清空上下文执行」开关与任务列表面板，修复迁移版本号冲突导致应用无法启动
+
 ## [0.1.82] - 2026-11-16
 
 ### Added

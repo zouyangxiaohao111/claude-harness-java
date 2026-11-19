@@ -29,6 +29,11 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class PlanModeAttachmentsTest {
 
+    /** 计划文件路径 = provider 真实派生（词对 slug）· 对齐 CC plans.ts。 */
+    private static Path planPath(Path tmp, String sessionId) {
+        return Path.of(new PlanProviderImpl(sessionId, tmp.toString()).getPlanFilePath(null));
+    }
+
     /** 最小 user 消息（节流测试仅需 messages 非空）。 */
     private static ChatMessageDto userMsg(String content) {
         return new ChatMessageDto("m1", null, Role.user, null, content,
@@ -63,14 +68,14 @@ class PlanModeAttachmentsTest {
         assertThat(planMode.type()).isEqualTo("plan_mode");
         assertThat(planMode.reminderType()).isEqualTo("full"); // count=0+1=1, %5==1 → full
         assertThat(planMode.planExists()).isFalse();
-        assertThat(planMode.plan().planFilePath()).endsWith(sessionId + ".md");
+        assertThat(planMode.plan().planFilePath()).isEqualTo(planPath(tmp, sessionId).toString());
     }
 
     @Test
     @DisplayName("plan 模式有文件 → planExists=true")
     void planModeWithFilePlanExistsTrue(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId),"plan", StandardCharsets.UTF_8);
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
 
         List<AttachmentMessageDto> out = PlanModeAttachments.getPlanModeAttachments(
@@ -105,7 +110,7 @@ class PlanModeAttachmentsTest {
     @DisplayName("reentry：hasExitedPlanModeInSession 且文件存在 → 注入 plan_mode_reentry + plan_mode 并清 flag")
     void reentryWhenExitedAndFileExists(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId),"plan", StandardCharsets.UTF_8);
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
         PlanModeAttachments.PlanModeFlags flags = new PlanModeAttachments.PlanModeFlags();
         flags.setHasExitedPlanModeInSession(true);

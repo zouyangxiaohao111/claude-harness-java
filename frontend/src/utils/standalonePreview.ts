@@ -13,7 +13,7 @@
  */
 
 /** 独立预览载荷类型。 */
-export type PreviewType = 'html' | 'pdf' | 'docx' | 'xlsx' | 'image' | 'video' | 'audio' | 'file'
+export type PreviewType = 'html' | 'pdf' | 'docx' | 'xlsx' | 'image' | 'video' | 'audio' | 'markdown' | 'file'
 
 /** 对话附件内容源（结构兼容 ChatMessageDto.userAttachments 元素，缺省可空）。 */
 export interface StandaloneAttachment {
@@ -96,6 +96,7 @@ export function trimItemForTransfer(item: StandaloneAttachment): StandaloneAttac
 /** 附件 → 预览类型（docx/xlsx 按扩展名；pdf/video/audio 按 type 或扩展名；其余 file）。 */
 export function previewKindOfAttachment(a: StandaloneAttachment): PreviewType {
   const name = a.filename ?? ''
+  if (/\.(md|mdx|markdown)$/i.test(name)) return 'markdown'
   if (/\.docx$/i.test(name)) return 'docx'
   if (/\.xlsx$/i.test(name)) return 'xlsx'
   if (a.type === 'pdf' || /\.pdf$/i.test(name)) return 'pdf'
@@ -156,6 +157,10 @@ export function openStandalone(payload: StandalonePayload): void {
           minWidth: 480,
           minHeight: 360,
           focus: true,
+          // 与知识库独立窗同一裁定：系统标题栏底色不受页面 CSS 控制，会顶出一条异色
+          // ⇒ 无边框 + 前端自绘（StandalonePreviewView 的 stand-bar 三按钮）。
+          decorations: false,
+          transparent: false,
         })
         void win.once('tauri://error', (event) => {
           console.error('[standalonePreview] 创建独立窗口失败，回退 window.open', event)

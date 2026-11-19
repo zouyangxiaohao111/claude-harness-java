@@ -469,18 +469,22 @@ class PathValidationTest {
     @Test
     @DisplayName("读白名单 plan 文件 → allow；写 plan 按 OD-20 passthrough")
     void plan_branches() {
-        String planFile = "C:/Users/u/.claude/plans/session-1.md";
-        PathValidation.InternalPathResult read = PathValidation.checkReadableInternalPath(planFile, env());
+        // [对齐 CC plans.ts] 文件名是词对 slug，路径必须由 env 派生（⛔ 不要硬编码 sessionId.md）
+        PathValidationEnv env = env();
+        String planFile = env.plansPrefix() + ".md";
+        PathValidation.InternalPathResult read = PathValidation.checkReadableInternalPath(planFile, env);
         assertThat(read.allowed())
             .as("CC :1645-1654 plan 读分支 auto-allow")
             .isTrue();
         assertThat(read.decisionReason())
             .isEqualTo(new PermissionDecisionReason.Other("Plan files for current session are allowed for reading"));
 
-        PathValidation.InternalPathResult write = PathValidation.checkEditableInternalPath(planFile, env());
+        PathValidation.InternalPathResult write = PathValidation.checkEditableInternalPath(planFile, env);
         assertThat(write.allowed())
-            .as("OD-20 子项4：plan 写盘走 ask（CC :1488-1497 auto-allow 在 Java 不采用）")
-            .isFalse();
+            .as("对齐 CC :1488-1497：当前会话 plan 文件写盘 auto-allow（OD-20 偏差已撤销）")
+            .isTrue();
+        assertThat(write.decisionReason())
+            .isEqualTo(new PermissionDecisionReason.Other("Plan files for current session are allowed for writing"));
     }
 
     @Test

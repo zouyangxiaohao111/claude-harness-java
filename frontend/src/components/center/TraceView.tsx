@@ -406,7 +406,7 @@ export function TraceView({ messages, snippedIds = EMPTY_SNIPPED_IDS }: TraceVie
                     title={r.full != null ? '点击查看完整内容' : undefined}
                   >
                     <div className="kp-cell-name">
-                      <span className="kp-name-inner">
+                      <span className={`kp-name-inner${r.toolClass ? ` ${r.toolClass}` : ''}`}>
                         <span className={`kp-dot ${r.snipped ? 'kp-dot-skipped' : 'kp-dot-done'}`} />
                         <span className="kp-name-kind">{r.kind}</span>
                         {r.snipped && <span className="kp-chip-skipped" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span>}
@@ -418,7 +418,7 @@ export function TraceView({ messages, snippedIds = EMPTY_SNIPPED_IDS }: TraceVie
                           新结构里透明由 `.kp-row-inert`(0.45) 承担，删除线在此显式保留（否则「已裁剪」
                           只剩一个灰 chip，正文看上去与正常消息无异）。 */}
                       {r.kind === 'tool' ? (
-                        <span className="kp-name-text kp-name-mono" style={r.snipped ? SNIPPED_TEXT_STYLE : undefined}>{r.toolName}</span>
+                        <span className={`kp-name-text kp-name-mono${r.toolClass ? ` ${r.toolClass}` : ''}`} style={r.snipped ? SNIPPED_TEXT_STYLE : undefined}>{r.toolName}</span>
                       ) : (
                         <span className="kp-name-text" style={r.snipped ? SNIPPED_TEXT_STYLE : undefined}>{r.txt}</span>
                       )}

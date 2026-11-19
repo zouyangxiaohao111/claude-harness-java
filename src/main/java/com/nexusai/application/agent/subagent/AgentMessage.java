@@ -55,7 +55,12 @@ public record AgentMessage(
     //   同步补齐；缺省值（旧转录无这些键）= false / null，与 CC undefined 同义（非双轨）。
     boolean isMeta,
     String author,
-    String subtype
+    String subtype,
+    // [agent-notice] SendMessage 通知行的 UI 摘要（SendMessage.summary）· CC 无对应字段
+    //   （CC queued_command 不携带 summary —— 见 exe 2.1.328 queuePendingMessage 队列项）。
+    //   本仓产品增强：transcript 落该键，前端通知条优先展示；模型面只看到 content 正文。
+    //   惰性写入：非通知行为 null（与 author/subtype 同先例）。
+    String summary
 ) {
     /** CC original: tool_use 块 id/name/input (messages.ts:2795 block.id / block.name). */
     public record ToolCallInfo(String id, String name, String arguments) {}
@@ -75,7 +80,7 @@ public record AgentMessage(
                         boolean isSidechain, String uuid, String parentUuid,
                         List<ToolCallInfo> toolCalls, String toolCallId) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, null, null, false, null, null);
+            toolCalls, toolCallId, null, null, false, null, null, null);
     }
 
     /** 兼容构造（含 timestamp，无 reasoning）· 既有测试/调用方沿用 10 参。 */
@@ -83,7 +88,7 @@ public record AgentMessage(
                         boolean isSidechain, String uuid, String parentUuid,
                         List<ToolCallInfo> toolCalls, String toolCallId, String timestamp) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, timestamp, null, false, null, null);
+            toolCalls, toolCallId, timestamp, null, false, null, null, null);
     }
 
     /** 兼容构造（含 timestamp + reasoning，无系统注入三件套）· 11 参。 */
@@ -92,11 +97,11 @@ public record AgentMessage(
                         List<ToolCallInfo> toolCalls, String toolCallId, String timestamp,
                         String reasoning) {
         this(role, content, isApiError, agentId, isSidechain, uuid, parentUuid,
-            toolCalls, toolCallId, timestamp, reasoning, false, null, null);
+            toolCalls, toolCallId, timestamp, reasoning, false, null, null, null);
     }
 
     public static AgentMessage of(String role, String content) {
         return new AgentMessage(role, content, false, null, false, null, null,
-            List.<ToolCallInfo>of(), null, null, null, false, null, null);
+            List.<ToolCallInfo>of(), null, null, null, false, null, null, null);
     }
 }

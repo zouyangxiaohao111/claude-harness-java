@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { capTailTurns, headAnchorKeyOf, isDialogueRow, isLiveDisplayRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../messageTurns'
+import { capTailTurns, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isLiveDisplayRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../messageTurns'
 import type { ChatMessageDto } from '../../api/types'
 
 /** 测试用最小 ChatMessageDto。 */
@@ -60,6 +60,42 @@ describe('[2026-11-02 用户实测「nexus 回复被切成多段」] 后台通�
     const keys = new Set(all.filter(isDialogueRow).map((m) => turnKeyOf(m, 'u1')))
     expect(keys.size).toBe(1)
     expect([...keys][0]).toBe('u1')
+  })
+})
+
+describe('[agent-notice] SendMessage 协作通知行：可见、不开新轮、不进系统折叠区', () => {
+  /** 后端 AgentNotificationMessages 产出的契约：isMeta=true + subtype=agent_message + author=发送方 */
+  const notice = (patch: Partial<ChatMessageDto> = {}): ChatMessageDto =>
+    msg('n1', {
+      author: 'team-lead',
+      subtype: 'agent_message',
+      isMeta: true,
+      content: '请补充审计结论',
+      summary: '补查审计结论',
+      ...patch,
+    })
+
+  it('isAgentNotificationRow：只认 role=user + subtype=agent_message', () => {
+    expect(isAgentNotificationRow(notice())).toBe(true)
+    // 对照组：普通 user / assistant / 别的 subtype
+    expect(isAgentNotificationRow(msg('u1'))).toBe(false)
+    expect(isAgentNotificationRow(msg('a1', { role: 'assistant', subtype: 'agent_message' }))).toBe(false)
+    expect(isAgentNotificationRow(msg('u2', { subtype: 'task_notification' }))).toBe(false)
+  })
+
+  it('isDialogueRow：isMeta 通知行仍必须进对话流（否则 isMeta 判据会整条丢弃）', () => {
+    expect(isDialogueRow(notice())).toBe(true)
+    // 对照组：普通 isMeta 行仍按旧规则丢弃
+    expect(isDialogueRow(msg('m1', { isMeta: true }))).toBe(false)
+  })
+
+  it('isUserTurnRow / isSystemInjectedRow：不开新轮、不进「已完成」折叠区', () => {
+    expect(isUserTurnRow(notice())).toBe(false)
+    expect(isSystemInjectedRow(notice())).toBe(false)
+  })
+
+  it('turnKeyOf：通知行沿用上一提问的轮键', () => {
+    expect(turnKeyOf(notice(), 'u1')).toBe('u1')
   })
 })
 

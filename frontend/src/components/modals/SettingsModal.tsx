@@ -297,6 +297,20 @@ export function SettingsModal({
                     <button className="envc-save" onClick={saveIdleTimeout}>保存</button>
                   </div>
                 </div>
+                <div className="settings-row">
+                  <div>
+                    <div className="settings-row-label">计划审批显示「清空上下文」</div>
+                    <div className="settings-row-desc">开启后，批准计划时可选择清空当前上下文、在新会话执行计划</div>
+                  </div>
+                  <label className="settings-switch">
+                    <input
+                      type="checkbox"
+                      checked={appSettings?.showClearContextOnPlanAccept === true}
+                      onChange={(e) => void onSaveSettings({ showClearContextOnPlanAccept: e.target.checked })}
+                    />
+                    <span></span>
+                  </label>
+                </div>
               </>
             )}
             {settingsTab === 'appearance' && (

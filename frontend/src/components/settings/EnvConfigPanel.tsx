@@ -113,9 +113,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
   const [wsFetchEngine, setWsFetchEngine] = useState<string>(settings?.webfetchEngine ?? 'builtin')
 
-  // 协调者模式
-  const [coordinatorModeOn, setCoordinatorModeOn] = useState<boolean>(settings?.coordinatorModeEnabled ?? false)
-
   // away-summary 门控（localStorage · 两开关都开才触发 blur 摘要）
   const [gates, setGates] = useState<{ AWAY_SUMMARY?: boolean; tengu_sedge_lantern?: boolean }>(() => {
     try { return JSON.parse(localStorage.getItem(AWAY_GATES_KEY) ?? '{}') } catch { return {} }
@@ -141,10 +138,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     setWsDomainCheckUrl(settings?.websearchDomainCheckUrl ?? '')
     setWsFetchEngine(settings?.webfetchEngine ?? 'builtin')
   }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl, settings?.webfetchEngine])
-
-  useEffect(() => {
-    setCoordinatorModeOn(settings?.coordinatorModeEnabled ?? false)
-  }, [settings?.coordinatorModeEnabled])
 
   // 挂载时读 /memory/config 开关；失败 fail loud（内联错误文案，不阻塞其他区块）
   // 无活动会话 → 不发请求（后端 sessionId 必填会 400），直接内联错误态。
@@ -1159,26 +1152,6 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                   </div>
                 )}
               </div>
-            </div>
-          </div>
-
-          <div className="envc-row">
-            <div className="envc-label-group">
-              <span className="envc-name">协调者模式 <span className="envc-tag mono">coordinator</span></span>
-              <span className="envc-desc">开启后主模型只负责拆解与派发，具体执行交给子代理。默认关闭。</span>
-            </div>
-            <div className="envc-control">
-              <label className="settings-switch">
-                <input
-                  type="checkbox"
-                  checked={coordinatorModeOn}
-                  onChange={(e) => {
-                    setCoordinatorModeOn(e.target.checked)
-                    void onSaveSettings({ coordinatorModeEnabled: e.target.checked })
-                  }}
-                />
-                <span></span>
-              </label>
             </div>
           </div>
 

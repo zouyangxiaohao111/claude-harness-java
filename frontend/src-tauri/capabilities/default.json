@@ -31,6 +31,7 @@
     "notification:allow-request-permission",
     "opener:default",
     "opener:allow-open-path",
+    "opener:allow-reveal-item-in-dir",
     "fs:allow-read-file",
     "fs:allow-write-text-file",
     "fs:allow-stat",

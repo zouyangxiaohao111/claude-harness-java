@@ -93,7 +93,9 @@ class MonitorToolTest {
 
         var r = tool.execute(call("{\"command\":\"tail -f app.log\",\"description\":\"看日志\"}"));
 
-        assertThat(String.valueOf(r.data())).contains("Monitor started: b1234567");
+        assertThat(String.valueOf(r.data()))
+            .contains("Monitor started (task b1234567, persistent — runs until TaskStop or session end)");
+        assertThat(String.valueOf(r.data())).contains("Keep working — do not poll or sleep.");
         verify(runner).startCommand(eq("tail -f app.log"), eq("看日志"), eq(0L), eq("call-1"), eq(null), eq(null));
     }
 

@@ -2,6 +2,7 @@ package com.nexusai.apis.command;
 
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
+import com.nexusai.application.agent.UserInputDispatcher;
 import com.nexusai.application.agent.command.EffortCommand;
 import com.nexusai.application.agent.lsp.PromptCacheBreakDetection;
 import com.nexusai.application.agent.skill.SkillRegistry;
@@ -191,6 +192,26 @@ class CommandControllerBuiltInCommandsTest {
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.name").value("init"))
             .andExpect(jsonPath("$.type").value("prompt"));
+    }
+
+    @Test
+    @DisplayName("[plan-command] POST /builtins/plan/execute 委托已注册 plan handler 真实执行（不再 404）")
+    void executeBuiltin_plan_delegatesToSlashHandler() throws Exception {
+        // WHY：/plan 元数据在 CommandRegistrationConfig28（BundledSkills），不在 BuiltInCommands
+        //   ⇒ 旧实现 findByName 必 null → 404「Built-in command 'plan' not found」（计划模式 chip
+        //   与命令面板的实际报错）。真实执行体已注册为 UserInputDispatcher 的 slash handler，
+        //   通用执行端点必须显式委托它；若退回 404 或只回元数据，本用例 fail。
+        UserInputDispatcher dispatcher = mock(UserInputDispatcher.class);
+        when(dispatcher.dispatchResult("/plan", "sess-cmd-test", null))
+            .thenReturn(new UserInputDispatcher.LocalCommandResult("skip", null));
+        ReflectionTestUtils.setField(controller, "userInputDispatcher", dispatcher);
+
+        mockMvc.perform(post("/api/command/builtins/plan/execute").param("sessionId", "sess-cmd-test"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.name").value("plan"))
+            .andExpect(jsonPath("$.executed").value(true));
+
+        verify(dispatcher).dispatchResult("/plan", "sess-cmd-test", null);
     }
 
     @Test

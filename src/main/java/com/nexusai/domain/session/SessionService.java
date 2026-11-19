@@ -6,6 +6,7 @@ import com.nexusai.application.agent.compact.MicroCompactor;
 import com.nexusai.application.agent.cost.CacheHitRate;
 import com.nexusai.application.agent.cost.CostTracker;
 import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
 import com.nexusai.application.agent.permission.hook.SkillImprovementSuggestionStore;
 import com.nexusai.application.agent.subagent.AgentDefinitionRegistry;
 import com.nexusai.application.agent.team.SpawnInProcess;
@@ -276,7 +277,22 @@ public class SessionService {
                 throw new ValidationException(
                     "permissionMode 非法（允许 default/plan/acceptEdits/bypassPermissions/dontAsk/auto）");
             }
-            s.setPermissionMode(req.permissionMode().trim());
+            String ccLiteral = req.permissionMode().trim();
+            s.setPermissionMode(ccLiteral);
+            // [权限胶囊同步] 只写列不够：V75 SESSION setMode 在 per-turn 合并中优先于本列
+            //   （appState 侧 mode 胜出）⇒ 列里的旧 setMode 会把胶囊/运行时盖回去
+            //   （实测：permission_mode=bypassPermissions 但列 mode=acceptEdits，点「绕过权限」弹回）。
+            //   用户显式切换 = 显式 setMode(session)：同步覆盖层 mode，allow/deny/ask 规则原样保留；
+            //   列里本来没有 mode 时 syncMode 返回原引用（permission_mode 列就是唯一真源）。
+            String syncedRules = SessionPermissionOverlay.syncMode(
+                s.getSessionPermissionRules(), PermissionMode.fromString(ccLiteral));
+            if (syncedRules != s.getSessionPermissionRules()) {
+                s.setSessionPermissionRules(syncedRules);
+                if (log.isInfoEnabled()) {
+                    log.info("[SessionService] update: session={} permissionMode={} → 同步会话权限覆盖层"
+                            + " mode（V75 SESSION setMode 优先级高于 permission_mode 列）", id, ccLiteral);
+                }
+            }
         }
         // [SP-03] 会话指定主线程 agent（V58 列 main_thread_agent）：PATCH 语义，仅显式传入时更新
         //   （null 不改动）。存 CC agentType 串原样（AgentDefinitionRegistry.findAgent 等价 lookup）；
@@ -947,7 +963,11 @@ public class SessionService {
             parseTodos(s.getTodos()),
             // [V44] 会话级权限模式覆盖透出（V44 列 permission_mode；null = 未覆盖 → 回落全局
             //   settings.permission_mode → 磁盘 settings.json defaultMode → default）。存 CC 串原样。
-            s.getPermissionMode(),
+            // [plan-approval] 胶囊与运行时同源：V75 session_permission_rules 里的 SESSION setMode
+            //   在 per-turn 合并中会覆盖 permission_mode 列（appState 侧 mode 胜出）⇒ 这里按同一
+            //   优先级给出有效值，避免「显示 plan、实际 acceptEdits」。
+            com.nexusai.application.agent.permission.SessionPermissionOverlay.effectiveModeCcLiteral(
+                s.getSessionPermissionRules(), s.getPermissionMode()),
             // [V48] 会话累计花费（元）· 前端会话底部 token/金额汇总（F5 恢复 · sessions 表持久化）
             s.getTotalCostYuan(),
             sumTokensFromModelUsage(s.getModelUsageJson()),

@@ -1072,6 +1072,12 @@ html {
   margin: 4px 0;
 }
 
+/* 正文外链右键菜单（复用 project-context-menu 的视觉；层级要盖过消息区浮层） */
+.external-link-menu {
+  min-width: 210px;
+  z-index: 500;
+}
+
 /* 项目文件树右键菜单 + 新建/重命名弹窗 */
 .file-tree-menu { min-width: 192px; padding: 4px 0; }
 .file-op-dialog {
@@ -1447,42 +1453,61 @@ html {
 
 .msg .content {
   color: var(--ink-strong);
-  font-size: var(--fs-body, 16px); /* 2026-10-09 用户拍板对齐 dsh：正文 16px / 行高 28px（原 15px 紧凑折中） */
+  /* 2026-11-18 实测 chat.deepseek.com 正文：16px / 28px（不是 DSH 桌面 bundle 的默认 14） */
+  font-size: 16px;
   line-height: 28px;
 }
 
-.msg .content p {
+/* ⚠️ 选择器带 `.md` 升特异性：KB 窗口/浮层里的会话也在 `.kb-scope` 下，
+   kb-02.css 的「文档预览」排版（`.kb-scope .md-content p{font-size:14px;margin:10px 0}`）
+   会把这些消息一起改小。`.msg .content.md`(3 类) 稳定压过它，口径锁回主会话。 */
+.msg .content.md p {
   margin: 16px 0; /* dsh: .markdown p { margin: 16px 0 } */
+  font-size: 16px;
+  line-height: 28px;
 }
 
 /* dsh：首/尾子元素贴边（原仅 p:last-child 一条） */
-.msg .content > *:first-child {
+.msg .content.md > *:first-child {
   margin-top: 0;
 }
 
-.msg .content > *:last-child {
+.msg .content.md > *:last-child {
   margin-bottom: 0;
 }
 
-.msg .content code {
-  font-family: var(--font-sans); /* 与用户消息同字体（现代化 sans）· 用户要求不用等宽 */
-  font-size: 12.5px;
-  background: var(--surface-2);
-  padding: 1px 6px;
-  border-radius: var(--r-sm);
+.msg .content.md code {
+  font-family: var(--font-mono); /* chat.deepseek.com 实测：行内 code 等宽、0.875em、灰底、无边框 */
+  font-size: 0.875em;
+  background: #EBEEF2; /* chat.deepseek.com 实测行内 code 底色 */
+  padding: 0 5px;
+  border-radius: 6px;
   color: var(--ink-strong);
-  border: 1px solid var(--hairline);
+  border: none;
+  /* kb 在 code 上写了 pre-wrap/break-all ⇒ 这里改回继承：行内 code 跟段落、代码块里的 code 跟 pre */
+  white-space: inherit;
+  word-break: inherit;
 }
 
-.msg .content pre {
+/* [2026-11-19 对齐 DSH / chat-demo] 行内 code 用 inline-flex：宽度按可用空间收缩后
+   在盒子内部折行（继承根上的 overflow-wrap:anywhere），跨行时背景保持一整块、不会断成两截。
+   只作用于「非 pre 内的 code」——代码块里的 code 由 `.chat-code-block__pre code` 接管。 */
+.msg .content.md :not(pre) > code {
+  display: inline-flex;
+  align-items: center;
+  box-sizing: border-box;
+  max-width: 100%;
+}
+
+.msg .content.md pre {
   background: var(--surface-1);
   border: 1px solid var(--hairline);
   border-radius: var(--r-md);
   padding: 12px 14px;
   margin: 16px 0; /* 2026-10-09 对齐 dsh：pre { margin: 16px 0 } */
   overflow-x: auto;
-  font-size: 12px;
-  line-height: 1.55;
+  font-size: 13px; /* chat-demo: --dsw-font-markdown-code-block 13px/22px */
+  line-height: 22px;
 }
 
 .msg .content pre code {
@@ -1497,98 +1522,133 @@ html {
   font-weight: 600;
 }
 
-/* md 渲染（marked + DOMPurify）：标题/列表/链接/引用/表格/分割线 */
-.msg .content.md h1, .msg .content.md h2, .msg .content.md h3, .msg .content.md h4 {
-  margin: 32px 0 16px; /* 2026-10-09 对齐 dsh（h1-h3 32px/16px） */
-  font-weight: 600;
-  color: var(--ink);
-  line-height: 1.4;
+/* md 渲染（marked + DOMPurify）· 2026-11-18 按 chat.deepseek.com 实测值对齐（正文 16 基准） */
+/* [2026-11-18] KB 会话（独立窗/浮层）也走这套 MessageList，但整块在 `.kb-scope` 下，
+   kb-02.css 的 `.kb-scope .md-content{color;line-height:1.6}` 同特异性且后加载 ⇒ 压过 `.msg .content`。
+   带 `.md` 升到 3 类，把根色/行高/字体锁回主会话口径（文档预览不在 .msg 下，不受影响）。 */
+.msg .content.md {
+  color: var(--ink-strong);
+  line-height: 28px;
+  font-family: var(--font-sans);
+  /* `.kb-scope` 根带 word-break:break-word，长英文词断行方式与主会话不同 ⇒ 锁回 normal */
+  word-break: normal;
+  /* [2026-11-19 源实现兜底] 无空格长串（行内 code 里的 `Set([...])`、长 URL/路径）必须在
+     正文内折断，否则会撑破内容列、让 `.stream` 出现整列横向滚动条。
+     DSH：`.markdown { overflow-wrap: anywhere }`；chat-demo：`body { word-break: break-word }`。
+     ⛔ 用 anywhere 而不是 break-word：前者连内在尺寸一起收紧，且不改变正常分词位置。 */
+  overflow-wrap: anywhere;
 }
-/* dsh：h4 单独 16px；:where(h5,h6) 同 16px */
+/* kb 的 `.kb-scope .md-content p/ul/table/h*` 直接写了 font-family ⇒ 子元素要显式 inherit 回来 */
+.msg .content.md p,
+.msg .content.md ul,
+.msg .content.md ol,
+.msg .content.md li,
+.msg .content.md dl,
+.msg .content.md blockquote,
+.msg .content.md table,
+.msg .content.md th,
+.msg .content.md td,
+.msg .content.md h1, .msg .content.md h2, .msg .content.md h3,
+.msg .content.md h4, .msg .content.md h5, .msg .content.md h6 {
+  font-family: inherit;
+}
+
+.msg .content.md h1, .msg .content.md h2, .msg .content.md h3, .msg .content.md h4 {
+  margin: 32px 0 16px;
+  font-weight: 700;
+  color: var(--ink);
+}
 .msg .content.md h4, .msg .content.md h5, .msg .content.md h6 {
   margin: 16px 0;
+  font-weight: 600;
 }
-.msg .content.md h1 { font-size: 1.35em; }
-.msg .content.md h2 { font-size: 1.25em; }
-.msg .content.md h3 { font-size: 1.1em; }
-.msg .content.md h4 { font-size: 1em; }
+.msg .content.md h1 { font-size: 24px; line-height: 34px; }
+.msg .content.md h2 { font-size: 22px; line-height: 32px; }
+.msg .content.md h3 { font-size: 20px; line-height: 30px; }
+.msg .content.md h4 { font-size: 16px; line-height: 28px; }
+.msg .content.md h5, .msg .content.md h6 { font-size: 16px; line-height: 28px; }
 .msg .content.md ul, .msg .content.md ol {
-  margin: 16px 0; /* 2026-10-09 对齐 dsh；padding-left 22px 是 marker 缩进补偿（非间距），保持不动 */
-  padding-left: 22px;
+  margin: 16px 0;
+  padding-left: 18px;
+  /* KB 的 `.kb-scope .md-content ul{font-size:14px}` 会顺着 li 继承下去 ⇒ 这里显式回 16 */
+  font-size: 16px;
+  line-height: 28px;
 }
 .msg .content.md li { margin: 0; }
-.msg .content.md li:not(:first-child) { margin-top: 6px; } /* dsh */
-.msg .content.md li > p { margin: 8px 0; } /* dsh: li > p { margin: 8px 0 } */
+.msg .content.md li:not(:first-child) { margin-top: 6px; }
+.msg .content.md li > p { margin: 8px 0; }
+.msg .content.md li::marker { font-size: 16px; color: #61666b; }
 .msg .content.md a {
-  color: var(--accent);
+  color: #4176E6;
+  font-weight: 500;
   text-decoration: none;
 }
-.msg .content.md a:hover { text-decoration: underline; }
+.msg .content.md a:hover { text-decoration: underline dotted #4176E6; text-underline-offset: 3px; }
+/* kb 给 md 图片挂了 cursor:pointer（文档预览里可点放大）；会话正文里的图片不可点 ⇒ 对齐主会话 */
+.msg .content.md img { cursor: auto; }
 .msg .content.md blockquote {
-  border-left: 3px solid var(--hairline);
-  padding: 2px 0 2px 12px;
-  margin: 16px 0 0; /* 2026-10-09 对齐 dsh：blockquote { margin: 16px 0 0 } */
-  color: var(--ink-muted);
+  border-left: 2px solid #ADB2B8;
+  padding: 0 0 0 14px;
+  margin: 16px 0 0;
+  color: inherit;
+  /* KB 里引用块是「绿左边 + 绿 6% 底 + 8px 圆角 + 14px」⇒ 这里全部锁回主会话的灰线无底 */
+  font-size: 16px;
+  line-height: 28px;
+  background: transparent;
+  border-radius: 0;
 }
+.msg .content.md blockquote p { margin: 16px 0; }
 .msg .content.md table {
   border-collapse: collapse;
-  margin: 10px 0;
-  font-size: 13px;
-  /* [2026-11-03 表格行高] 祖先 .msg .content 是 16px/28px（见 1402 行），此处只改字号不改行高
-     ⇒ 13px 的字被撑在 28px 行高里（字高:行高 = 1:2.15，正常是 1:1.5）⇒ 表格整体发松。
-     这里按字号重设，⛔ 不动祖先（16/28 是 2026-10-09 对齐 dsh 的正文口径）。 */
-  line-height: 1.55;
+  margin: 16px 0;
+  font-size: 15px;
+  line-height: 25px;
   max-width: 100%;
   display: block;
   overflow-x: auto;
 }
 .msg .content.md th, .msg .content.md td {
-  border: 1px solid var(--hairline);
-  padding: 8px 12px;
+  border: none;
+  border-bottom: 0.5px solid rgba(0, 0, 0, 0.1);
+  padding: 10px 16px 10px 0;
   text-align: left;
-  line-height: 1.55;
-  /* 长路径/长内容换行时，同排其它格不会被顶到中间 */
+  line-height: 25px;
   vertical-align: top;
 }
-.msg .content.md th {
-  /* [2026-11-03 用户选定 · 品牌淡蓝表头] 原来的 surface-2 灰底在深浅两主题下都偏"抽"，
-     改用品牌色：淡蓝底 + 品牌蓝字，与 accent 系控件同源。 */
-  background: var(--accent-soft);
-  color: var(--accent);
-  font-weight: 600;
-  white-space: nowrap;
-  border-bottom: 1px solid var(--accent-soft-strong);
-}
-/* 深色下 --accent(#0f5fd4) 压在深底上对比不足 → 用浅蓝；底色也提一档不透明度 */
-.app[data-theme="dark"] .msg .content.md th {
-  background: rgba(91, 155, 255, 0.16);
-  color: #79aeff;
-  border-bottom-color: rgba(91, 155, 255, 0.34);
-}
+.msg .content.md th { font-weight: 500; white-space: nowrap; }
+/* KB 的表格会给每行加绿顶线、给表头/偶数行加底色 ⇒ 主会话只有底部 0.5px 横线，这里清掉 */
+.msg .content.md table tr { border-top: none; }
+.msg .content.md table thead,
+.msg .content.md table tr:nth-child(2n) { background-color: transparent; }
 .msg .content.md hr {
   border: none;
-  border-top: 1px solid var(--hairline);
-  margin: 32px 0; /* 2026-10-09 对齐 dsh：hr { margin: 32px 0 } */
+  height: 0.5px;
+  background: rgba(0, 0, 0, 0.1);
+  margin: 32px 0;
 }
 
 /* ===== mdast 增量渲染器（MarkdownText / CodeBlock）样式 · 移植 deepseek-harness ===== */
 /* 代码块容器：banner + 正文 pre（覆盖 .msg .content pre 的通用边框/背景/圆角） */
 .msg .content.md .md-code-block,
 .msg.user .user-bubble .md-code-block {
-  margin: 16px 0; /* 2026-10-09 对齐 dsh：pre { margin: 16px 0 } */
-  border: 1px solid var(--hairline);
-  border-radius: var(--r-md);
-  background: var(--surface-1);
+  margin: 16px 0 11px; /* chat-demo/网页版：:not(:last-child) 底距 11 */
+  border: none;
+  border-radius: 12px; /* chat.deepseek.com 实测代码块圆角 */
+  background: #F9FAFB; /* dsh: --dsw-alias-markdown-code-block (neutral-bluish-50) */
   overflow: hidden;
+}
+.app[data-theme="dark"] .msg .content.md .md-code-block,
+.app[data-theme="dark"] .msg.user .user-bubble .md-code-block {
+  background: #1e1f24;
 }
 .md-code-banner {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 10px;
-  padding: 5px 10px;
-  background: var(--surface-2);
-  border-bottom: 1px solid var(--hairline);
+  gap: 12px;
+  padding: 9px 14px; /* dsh */
+  background: transparent;
+  border-bottom: none;
 }
 .md-code-lang {
   font-size: 11px;
@@ -1633,7 +1693,8 @@ html {
   border: 0;
   border-radius: 0;
   background: transparent;
-  padding: 10px 12px;
+  padding: 16px; /* dsh: .block pre { padding: 16px } */
+  line-height: 22px; /* chat-demo: 代码块 13px/22px（覆盖 chat-code-block.css 的 1.55） */
   overflow-x: auto;
 }
 .msg .content.md .md-code-block pre code,
@@ -1642,8 +1703,51 @@ html {
   padding: 0;
   border: none;
   color: var(--ink-muted);
-  font-size: 12px;
-  line-height: 1.55;
+  font-size: 13px; /* chat-demo: 13px/22px */
+  line-height: 22px;
+}
+
+/* ⭐ 代码块真身：正文实际渲染的是 `.chat-code-block`（不是 `.md-code-block`）。
+   2026-11-18 按 chat.deepseek.com 实测对齐：单层 #F9FAFB、radius 12、无边框、满宽、
+   banner 9/14（同底色无分割线）、pre 16、13/22；⛔ code 必须 transparent（否则吃到行内 code 的灰底）。 */
+.msg .content.md .chat-code-block,
+.msg.user .user-bubble .chat-code-block {
+  margin: 16px 0 11px;
+  border: none;
+  border-radius: 12px;
+  background: #F9FAFB;
+  box-shadow: none;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+}
+.app[data-theme="dark"] .msg .content.md .chat-code-block,
+.app[data-theme="dark"] .msg.user .user-bubble .chat-code-block {
+  background: #1e1f24;
+}
+.msg .content.md .chat-code-block__header,
+.msg.user .user-bubble .chat-code-block__header {
+  padding: 9px 14px;
+  background: transparent;
+  border-bottom: none;
+}
+.msg .content.md .chat-code-block__pre,
+.msg.user .user-bubble .chat-code-block__pre {
+  margin: 0;
+  padding: 16px;
+  border: none;
+  border-radius: 0;
+  background: transparent;
+  font-size: 13px;
+  line-height: 22px;
+}
+.msg .content.md .chat-code-block__pre code,
+.msg.user .user-bubble .chat-code-block__pre code {
+  background: transparent !important;
+  padding: 0 !important;
+  border-radius: 0;
+  font-size: 13px !important;
+  line-height: 22px;
 }
 
 /* 表格：横向滚动容器（覆盖旧 .content.md table 的 display:block 双滚动） */
@@ -1660,6 +1764,32 @@ html {
   width: max-content;
   margin: 0;
   border-collapse: collapse;
+}
+
+/* [2026-11-19] 同上，但 V2 渲染器（MarkdownTextV2）的表格壳是
+   `chatPostProcess.wrapChatMarkdownTables` 产出的 `div.chat-markdown-table`（V1 才是
+   `.md-table-scroll`，两套并存）。壳只做兜底：正常表格吃满内容列、单元格内换行；
+   只有列多到压不下（不可断长串/列数过多）时才在壳内横向滚动。 */
+.msg .content.md .chat-markdown-table {
+  max-width: 100%;
+  overflow-x: auto;
+  overscroll-behavior-x: contain;
+  margin: 16px 0;
+}
+.msg .content.md .chat-markdown-table table {
+  display: table;
+  /* auto：短表保持自然宽、不硬拉满；长内容在列宽内折行（表头/单元格均已允许断词）。 */
+  width: auto;
+  max-width: 100%;
+  overflow: visible;
+  margin: 0;
+}
+/* 表头默认 `white-space: nowrap`（:1603）会把长表头列撑宽 ⇒ 壳内改回可换行。
+   单元格也显式允许断词，长路径/多列内容在列宽内折行，而不是把表格顶出容器。 */
+.msg .content.md .chat-markdown-table th,
+.msg .content.md .chat-markdown-table td {
+  white-space: normal;
+  overflow-wrap: anywhere;
 }
 
 /* 图片与占位 alt；KaTeX 横向溢出 */
@@ -1877,6 +2007,29 @@ html {
 }
 .stand-hint { font-size: 11.5px; color: var(--ink-muted); }
 .stand-bar .spacer { flex: 1; }
+/* 自绘标题栏窗控（无边框独立窗 · decorations:false 后由这里提供最小化/最大化/关闭） */
+.stand-win-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  -webkit-app-region: no-drag;
+  app-region: no-drag;
+}
+.stand-win-btn {
+  width: 26px;
+  height: 26px;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-muted);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  cursor: pointer;
+}
+.stand-win-btn:hover { background: rgba(20, 24, 31, 0.08); }
+.stand-win-btn.is-close:hover { background: #e81123; color: #fff; }
+.stand-bar .stand-reload { -webkit-app-region: no-drag; app-region: no-drag; }
 .stand-reload {
   border: 1px solid var(--hairline);
   background: var(--surface-1);
@@ -1899,6 +2052,20 @@ html {
 .stand-img { margin: auto; max-width: 100%; max-height: 100%; object-fit: contain; }
 .stand-media { width: 100%; max-height: 100%; }
 .stand-audio { width: 100%; margin: auto; }
+/* Markdown 预览：与主对话同一渲染器（content md markdown-prose）+ 正文式留白与列宽 */
+.stand-md,
+.attach-preview-md {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 28px 40px 56px;
+  background: var(--surface-1);
+}
+.stand-md > .content,
+.attach-preview-md > .content {
+  max-width: 820px;
+  margin: 0 auto;
+}
 
 /* ===== 超长单条消息：截断预览 + 展开（防 350KB 级单条把整会话渲染钉死）===== */
 .heavy-preview {
@@ -2468,8 +2635,8 @@ html {
   border: 1px solid var(--hairline);
   padding: 14px 20px;
   border-radius: 20px 20px 4px 20px;
-  font-size: var(--fs-body, 15px);
-  line-height: 1.7;
+  font-size: 16px; /* chat-demo 用户气泡：16px / 24px（背景色保持本仓，不跟它） */
+  line-height: 24px;
   color: var(--ink);
   word-break: break-word;
   box-shadow: 0 2px 10px rgba(20,24,31, 0.06), 0 1px 3px rgba(20,24,31, 0.04), 0 0 0 1px var(--glass-hairline);
@@ -2481,14 +2648,14 @@ html {
 }
 /* 气泡内文字：flex 子项可收缩折行（不强制占满 → 短文字与附件胶囊同行 · 气泡宽度随内容动态增长）
    + overflow-wrap: anywhere —— 长无空格串（URL/路径/堆栈）在气泡内折行，不溢出边界（2026-10-09） */
-.msg.user .user-bubble .user-text { min-width: 0; flex: 0 1 auto; overflow-wrap: anywhere; }
+.msg.user .user-bubble .user-text { min-width: 0; flex: 0 1 auto; overflow-wrap: anywhere; font-size: 16px; line-height: 24px; }
 /* [2026-10-09 用户报] 用户气泡 markdown 排版补偿：全局 reset `*{margin:0;padding:0}`（:104）清零了列表
    默认缩进，助手侧有 22px 补偿（.msg .content.md ul/ol），用户侧此前缺失 ⇒ 列表 marker（outside 定位）
    贴气泡左缘、段落无常规间距。取值与助手侧一致（22px）。 */
 .msg.user .user-bubble .user-text ul,
-.msg.user .user-bubble .user-text ol { margin: 4px 0; padding-left: 22px; }
-.msg.user .user-bubble .user-text li { margin: 2px 0; }
-.msg.user .user-bubble .user-text p { margin: 0 0 8px; }
+.msg.user .user-bubble .user-text ol { margin: 4px 0; padding-left: 22px; font-size: 16px; line-height: 24px; }
+.msg.user .user-bubble .user-text li { margin: 2px 0; line-height: 24px; }
+.msg.user .user-bubble .user-text p { margin: 0 0 8px; font-size: 16px; line-height: 24px; }
 .msg.user .user-bubble .user-text p:last-child { margin-bottom: 0; }
 
 /* ===== 用户消息就地编辑（2026-11-06）=====
@@ -2551,18 +2718,24 @@ html {
   transition: background 120ms var(--ease);
 }
 .user-edit-added-x:hover { background: rgba(20,24,31,.86); }
-/* 非图片附件（原消息自带的 PDF/Word 等）也在这里显示 */
+/* 非图片附件（原消息自带的 PDF/Word 等）也在这里显示；可移除（右侧留出 × 的位置） */
 .user-edit-file {
+  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 6px;
   max-width: 220px;
-  padding: 4px 10px;
+  padding: 4px 26px 4px 10px;
   border: 1px solid var(--hairline);
   border-radius: var(--r-pill);
   background: var(--surface-2);
   font-size: 12px;
   color: var(--ink-subtle);
+}
+.user-edit-file .user-edit-added-x {
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
 }
 .user-edit-input {
   width: 100%;
@@ -2712,7 +2885,7 @@ html {
   backdrop-filter: blur(24px) saturate(1.6);
   -webkit-backdrop-filter: blur(24px) saturate(1.6);
   border: none;
-  border-radius: 20px;
+  border-radius: 24px; /* chat-demo 输入框 */
   padding: 10px 14px;
   box-shadow: 0 2px 10px rgba(20,24,31, 0.06), 0 1px 3px rgba(20,24,31, 0.04), 0 0 0 1px var(--glass-hairline);
   transition: all 120ms var(--ease);
@@ -2756,13 +2929,20 @@ html {
 
 /* 附件预览区（拖拽/选择图片 → 缩略图 + 删除；attachment-multimodal） */
 .composer .attach-preview {
-  display: flex; flex-wrap: wrap; gap: 8px;
-  padding: 8px 2px 0;
+  /* chat-demo DraftAttachments：单行横向滚动（不换行）· 底对齐 · gap 10
+     水平 padding 归零：外层 .input-box 已有 14px，再给 12 会让附件比正文右缩 12px */
+  display: flex;
+  flex-wrap: nowrap;
+  gap: 10px;
+  padding: 0 0 8px;
+  align-items: flex-end;
+  overflow-x: auto;
+  cursor: default;
 }
 .composer .attach-item {
   position: relative;
   width: 64px; height: 64px;
-  border-radius: var(--r-md);
+  border-radius: 16px; /* chat-demo 待发图片 64×64 / radius 16 */
   overflow: hidden;
   border: 1px solid var(--hairline);
   background: var(--surface-2);
@@ -2772,12 +2952,102 @@ html {
   object-fit: cover;
   display: block;
 }
-.composer .attach-file {
+/* 文件卡片 · chat-demo `FileCard` 原值：240×64、radius 16、图标 28、名称 14/22、sub 12/18 */
+.attach-file-card {
+  position: relative;
+  display: inline-flex; align-items: center; gap: 10px;
+  width: 240px; max-width: 100%; min-height: 64px;
+  padding: 0 12px 0 14px; box-sizing: border-box;
+  border: 1px solid var(--hairline);
+  border-radius: 16px;
+  background: var(--surface-2);
+  text-align: left;
+  cursor: pointer;
+}
+.attach-file-card:hover { border-color: var(--hairline-strong); }
+.attach-file-card:focus-visible { outline: 2px solid rgba(43, 124, 240, 0.5); outline-offset: 1px; }
+.attach-file-icon {
+  flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px;
+}
+.attach-file-body {
+  display: flex; flex-direction: column; flex: 1; min-width: 0;
+  padding: 10px 0;
+}
+.attach-file-name {
+  font-size: 14px; font-weight: 400; line-height: 22px;
+  color: var(--ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.attach-file-card:hover .attach-file-name { padding-right: 16px; }
+.attach-file-meta {
+  font-size: 12px; line-height: 18px;
+  color: var(--ink-subtle);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.composer .attach-file-remove {
+  position: absolute; top: 4px; right: 4px;
+  width: 16px; height: 16px;
+  border: none; border-radius: 50%;
+  background: rgba(20,24,31, 0.6); color: #fff;
+  font-size: 12px; line-height: 1; cursor: pointer;
   display: flex; align-items: center; justify-content: center;
-  width: 100%; height: 100%;
-  font-size: 10px; color: var(--ink-subtle);
-  text-align: center; padding: 4px;
-  overflow: hidden; box-sizing: border-box;
+  padding: 0; opacity: 0;
+  transition: opacity .2s ease-in-out;
+}
+.composer .attach-file-card:hover .attach-file-remove,
+.composer .attach-file-remove:focus-visible { opacity: 1; }
+@media (pointer: coarse) { .composer .attach-file-remove { opacity: 1; } }
+
+/* 待发附件预览弹层（与发送后的独立预览共用 PdfPreview / DocxPreview / ExcelPreview） */
+.attach-preview-modal {
+  pointer-events: auto;
+  display: flex; flex-direction: column;
+  width: min(50.7vw, 980px);
+  height: 100vh;
+  background: #fff;
+  border: none;
+  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 0;
+  box-shadow: none;
+  overflow: hidden;
+  animation: sidePreviewIn 180ms var(--ease);
+}
+.attach-preview-head {
+  display: flex; align-items: center; gap: 12px;
+  height: 60px;
+  padding: 0 20px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  flex-shrink: 0;
+}
+.attach-preview-title {
+  flex: 1; min-width: 0;
+  font-size: 14px; font-weight: 500; color: #0f1115;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.attach-preview-close {
+  flex-shrink: 0;
+  width: 36px; height: 24px;
+  border: none; border-radius: 6px;
+  background: transparent; color: #81858c;
+  font-size: 16px; line-height: 1; cursor: pointer;
+  display: flex; align-items: center; justify-content: center;
+  padding: 0;
+}
+.attach-preview-close:hover { background: var(--surface-2); color: var(--ink); }
+.attach-preview-body {
+  flex: 1; min-height: 0;
+  display: flex; flex-direction: column;
+  overflow: hidden;
+}
+.attach-preview-img {
+  max-width: 100%; max-height: 100%;
+  margin: auto; object-fit: contain;
+}
+.attach-preview-media {
+  max-width: 100%; max-height: 100%;
+  margin: auto;
 }
 .composer .attach-remove {
   position: absolute; top: 2px; right: 2px;
@@ -3065,6 +3335,8 @@ html {
   /* 专家胶囊同理：窄栏只留头像点，名字收起 */
   .composer .toolbar .left-tools .agent-pill .agent-pill-name { display: none; }
   .composer .toolbar .left-tools .agent-pill { padding-right: 4px; }
+  /* 计划/协调者：窄栏收成 28×28 纯图标，7px 状态点塞不下 ⇒ 隐藏（状态由 active 底色表达） */
+  .composer .toolbar .left-tools .tool-chip.plan-mode .plan-indicator { display: none; }
 }
 
 .tool-chip:hover {
@@ -3082,6 +3354,34 @@ html {
   width: 12px;
   height: 12px;
 }
+
+/* [2026-11-19 用户裁定] 协调者模式 chip（输入框工具区）：整块就是开关，点击即切换。
+   激活视觉**直接复用计划模式**（`.plan-mode`）那套：浅蓝底 + 蓝边 + 蓝字 + 外圈 +
+   7px 指示点呼吸（关闭=灰点）。⛔ 不再自造金色/小开关。 */
+.tool-chip.coordinator-chip {
+  gap: 6px;
+  user-select: none;
+}
+
+/* [2026-11-19 用户裁定] 计划模式「已排队」（turn 运行中点击后的独立态）。
+   与 active 区分：虚线边框 + 无外圈 + 指示点半亮闪烁 = 尚未生效；
+   active 才是实线边框 + 3px 外圈 + 蓝点呼吸 = 已生效。 */
+.tool-chip.plan-mode-chip.pending {
+  color: var(--accent-hover);
+  border-color: var(--accent);
+  border-style: dashed;
+  background: var(--accent-soft);
+}
+.tool-chip.plan-mode-chip.pending .plan-indicator {
+  background: var(--accent);
+  opacity: 0.35;
+  animation: plan-pending-blink 1.2s var(--ease) infinite;
+}
+@keyframes plan-pending-blink {
+  0%, 100% { opacity: 0.25; }
+  50% { opacity: 0.9; }
+}
+
 
 /* Send Button */
 .send-btn {
@@ -5261,6 +5561,101 @@ html {
 
 /* 已停用 server 行（enabled=false） */
 .mcp-row.disabled { opacity: 0.55; }
+
+/* ----- MCP 列表（版式对齐 CLI 设置页：单列卡片，点开才展开） ----- */
+.mcp-head-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mcp-head-actions .cli-ghost-btn { min-width: 0; height: 30px; padding: 0 12px; font-size: 12px; }
+.mcp-head-actions .cli-primary-btn { height: 30px; padding: 0 14px; font-size: 12.5px; border-radius: 999px; }
+.cli-config-head .cli-ghost-btn { min-width: 0; height: 30px; padding: 0 12px; font-size: 12px; }
+
+.mcp-card-icon {
+  flex: 0 0 32px;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  background: var(--surface-3);
+  color: var(--ink-subtle);
+}
+.mcp-card-icon svg { width: 16px; height: 16px; }
+.mcp-card.is-off .mcp-card-icon { opacity: 0.6; }
+.mcp-card.is-off .cli-card-title { color: var(--ink-subtle); }
+
+/* 启用开关放在点击区右侧（与 CLI 页「设为默认」同位） */
+.mcp-card-tail {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  align-self: stretch;
+  padding: 0 12px 0 8px;
+}
+.mcp-card-actions { display: flex; align-items: center; gap: 8px; }
+.mcp-detail-badges { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+
+.mcp-detail { display: flex; flex-direction: column; gap: 10px; padding: 14px 18px 16px; }
+.mcp-detail-cmd {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  line-height: 1.5;
+  color: var(--ink-subtle);
+  background: var(--surface-2);
+  border-radius: 8px;
+  padding: 8px 10px;
+  word-break: break-all;
+}
+.mcp-detail-row { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
+.mcp-detail-label { font-size: 12px; font-weight: 600; color: var(--ink); }
+.mcp-detail-desc { margin-top: 2px; font-size: 11.5px; line-height: 1.5; color: var(--ink-subtle); }
+.mcp-detail-error { font-size: 11.5px; color: var(--error); word-break: break-all; }
+.mcp-detail-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+}
+.mcp-detail-foot .spacer { flex: 1; }
+
+/* 添加/编辑表单（展开在卡片内 · 中性配色，不抢焦点） */
+.mcp-form-wrap { padding: 14px 18px 16px; }
+.mcp-form-wrap .mcp-add-form { gap: 9px; }
+.mcp-form-wrap .mcp-add-row .settings-input { background: var(--surface-2); border-color: var(--hairline-strong); }
+.mcp-form-wrap .mcp-add-row .settings-input:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  outline: none;
+}
+.mcp-form-wrap .mcp-cli-input { background: var(--surface-2); }
+.mcp-add-card-cli { background: var(--surface-1); }
+
+.mcp-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 12px;
+  margin-top: 10px;
+  padding: 10px 12px;
+  border: 1px solid rgba(201, 148, 23, 0.25);
+  border-radius: 10px;
+  background: rgba(201, 148, 23, 0.07);
+}
+.mcp-import-detail {
+  margin-top: 10px;
+  padding: 12px 14px;
+  border: 1px solid var(--hairline);
+  border-radius: 10px;
+  background: var(--surface-2);
+}
+.mcp-import-path {
+  font-family: var(--font-mono);
+  font-size: 10.5px;
+  color: var(--ink-subtle);
+  margin-top: 3px;
+  word-break: break-all;
+  line-height: 1.5;
+}
 
 /* 编辑 / 删除 文字按钮（hover 橙色） */
 .mcp-text-btn {
@@ -8331,13 +8726,12 @@ html {
   50% { box-shadow: 0 0 0 4px rgba(15,95,212,0); }
 }
 
-/* ===== Effort 选择弹窗（/effort · 科技感滑块） ===== */
-/* ===== Effort 选择弹窗（柔和淡青 · 会话级 effort） ===== */
+/* ===== 推理等级选择弹窗（会话级 · 简洁单选列表） ===== */
 .eff-backdrop {
   position: fixed;
   inset: 0;
   z-index: 450;
-  background: rgba(20,24,31, 0.35);
+  background: rgba(20, 24, 31, 0.35);
   backdrop-filter: blur(6px);
   -webkit-backdrop-filter: blur(6px);
   display: flex;
@@ -8346,100 +8740,103 @@ html {
   animation: fadeIn 120ms var(--ease);
 }
 .eff-modal {
-  width: 520px;
-  padding: 20px;
+  position: relative;
+  width: 420px;
+  max-width: calc(100vw - 32px);
+  padding: 18px;
   border-radius: 16px;
-  background: rgba(255, 255, 255, 0.75);
-  backdrop-filter: blur(12px);
-  -webkit-backdrop-filter: blur(12px);
-  box-shadow: 0 4px 20px rgba(0, 0, 0, 0.06);
+  background: var(--surface-1);
+  border: 1px solid var(--hairline-strong);
+  box-shadow: 0 18px 48px rgba(20, 24, 31, 0.18);
   color: var(--ink);
-  animation: dropdownIn 200ms var(--spring);
+  animation: dropdownIn 160ms var(--spring);
 }
-.eff-header {
+.eff-head {
   display: flex;
+  align-items: baseline;
   justify-content: space-between;
-  align-items: center;
-  margin-bottom: 20px;
+  gap: 12px;
+  margin-bottom: 10px;
+  padding-right: 26px;
 }
-.eff-title { font-size: 15px; font-weight: bold; color: #555; }
-.eff-status {
-  background: rgba(94, 234, 212, 0.2);
-  color: #2c7a7b;
-  padding: 3px 10px;
-  border-radius: 20px;
-  font-size: 11px;
-  font-weight: bold;
-}
-.eff-track {
-  position: relative;
+.eff-title { font-size: 14px; font-weight: 600; color: var(--ink); }
+.eff-sub { font-size: 11.5px; color: var(--ink-faint); }
+.eff-options { display: flex; flex-direction: column; gap: 2px; }
+.eff-item {
   display: flex;
   align-items: center;
-  height: 36px;
-  border-radius: 18px;
-  background: linear-gradient(90deg,
-    rgba(94, 234, 212, 0.05),
-    rgba(94, 234, 212, 0.2),
-    rgba(94, 234, 212, 0.4),
-    rgba(94, 234, 212, 0.65));
-  margin-bottom: 20px;
+  gap: 12px;
+  width: 100%;
+  padding: 9px 10px;
+  border: none;
+  border-radius: 9px;
+  background: transparent;
+  font-family: var(--font-sans);
+  text-align: left;
   cursor: pointer;
-  user-select: none;
-  touch-action: none;
+  transition: background 120ms var(--ease);
 }
-.eff-option {
+.eff-item:hover { background: var(--surface-2); }
+/* 当前生效档位：常驻高亮 + 右侧「当前」标记（不跟鼠标/键盘临时选中混在一起） */
+.eff-item.is-current { background: var(--accent-soft); }
+.eff-item.is-active { background: var(--accent-soft); }
+.eff-item.is-active:not(.is-current) { box-shadow: inset 0 0 0 1.5px var(--accent-soft-strong); }
+.eff-item-label {
+  flex: 0 0 76px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--ink);
+}
+.eff-item.is-active .eff-item-label,
+.eff-item.is-current .eff-item-label { color: var(--accent); }
+.eff-item-desc {
   flex: 1;
-  display: flex;
-  justify-content: center;
-  align-items: center;
-  position: relative;
-  user-select: none;
-  height: 100%;
-  cursor: pointer;
+  min-width: 0;
+  font-size: 11.5px;
+  line-height: 1.45;
+  color: var(--ink-subtle);
 }
-.eff-option-text {
-  font-size: 12px;
-  font-weight: bold;
-  color: #4a5568;
+.eff-item.is-active .eff-item-desc,
+.eff-item.is-current .eff-item-desc { color: var(--ink-muted); }
+.eff-item-current {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border: 1px solid var(--accent-soft-strong);
+  border-radius: 999px;
+  background: var(--surface-1);
+  color: var(--accent);
+  font-size: 10.5px;
+  font-weight: 600;
+  white-space: nowrap;
 }
-.eff-dot {
-  position: absolute;
-  top: 50%;
-  left: 50%;
-  transform: translate(-50%, -50%);
-  width: 13px;
-  height: 13px;
-  background: rgba(255, 255, 255, 0.9);
-  border-radius: 50%;
-  box-shadow: 0 2px 6px rgba(45, 212, 191, 0.3);
-  z-index: 10;
-  pointer-events: none;
-}
-/* 关闭思考档的说明（只在选中 off 时出现，不占位） */
-.eff-hint {
-  margin: 0 16px 10px;
-  padding: 7px 10px;
-  border-radius: 8px;
-  background: #F5F6F8;
-  color: #6B7280;
-  font-size: 11px;
-  line-height: 1.55;
+.eff-item-check { display: inline-flex; color: var(--accent); }
+.eff-item-check svg { width: 14px; height: 14px; }
+.eff-foot {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px solid var(--hairline);
+  font-size: 10.5px;
+  color: var(--ink-faint);
   text-align: center;
 }
-.eff-footer {
-  display: flex;
+.eff-close {
+  position: absolute;
+  top: 12px;
+  right: 12px;
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
   justify-content: center;
-  gap: 12px;
-  color: #aaa;
-  font-size: 10px;
+  border: none;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--ink-faint);
+  cursor: pointer;
+  transition: background 120ms var(--ease), color 120ms var(--ease);
 }
-.eff-key {
-  border: 1px solid #eee;
-  border-radius: 4px;
-  padding: 2px 5px;
-  background: rgba(255, 255, 255, 0.8);
-  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.03);
-}
+.eff-close:hover { background: var(--surface-2); color: var(--ink); }
+.eff-close svg { width: 12px; height: 12px; }
 .med-backdrop {
   position: fixed;
   inset: 0;
@@ -8684,7 +9081,7 @@ html {
 /* 欢迎 hero */
 .composer-empty .hero-title { font-size: 28px; font-weight: 600; color: #333; }
 /* 输入框 → prompt-container */
-.composer .input-box { background: #FFFFFF; border: 1px solid #F0F0F0; border-radius: 16px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
+.composer .input-box { background: #FFFFFF; border: 1px solid #F0F0F0; border-radius: 24px; box-shadow: 0 10px 30px rgba(0,0,0,0.06); }
 .composer .input-box:focus-within { border-color: #0f5fd4; box-shadow: 0 0 0 4px rgba(15,95,212,0.15), 0 10px 30px rgba(0,0,0,0.08); }
 /* 发送按钮 → 渐变橙 */
 .send-btn { background: linear-gradient(135deg, #2672d8, #0f5fd4); border-radius: 12px; box-shadow: 0 4px 12px rgba(15,95,212,0.2); }
@@ -8726,7 +9123,7 @@ html {
    10-09 裁定的「85% 纯百分比自适应」——收起两侧边栏时输入框不随中心列平铺（用户报障）。
    宽度口径现由 2333 行单点承担（max-width:none + width:85% + margin-left:42px）。 */
 .composer textarea { height: 60px; max-height: 200px; min-height: 60px; font-size: 16px; }
-.composer .input-box { padding: 16px; border-radius: 16px; }
+.composer .input-box { padding: 16px; border-radius: 24px; }
 .composer .toolbar { margin-top: 4px; }
 .composer .tool-chip { background: #F7F8FA; border: 1px solid #F0F0F0; border-radius: 8px; box-shadow: 0 1px 2px rgba(0,0,0,0.02); }
 /* 快捷键栏：左对齐紧凑 */
@@ -10097,6 +10494,11 @@ html {
   font-size: 12px;
   color: var(--ink-subtle);
 }
+.pb-plan-more {
+  margin: 6px 0 0;
+  font-size: 12px;
+  color: var(--ink-faint);
+}
 
 /* ===== 记忆编辑器（Memory Editor Modal · mem- 前缀）=====
    照搬设计稿 deepseek_html_20260823_8dd6ed.html。色板独立变量 --mem- 前缀，不覆盖全局 --accent。 */
@@ -10475,7 +10877,8 @@ html {
    → 点某类右侧并排弹出明细（可再点同一行 / × / Esc 收起）。
    样式全部复用现有 .tool-chip / .tools-panel / .tool-row / .toggle-btn，本条只补分类结构所需。 */
 
-/* 齿轮入口：静止只有图标，hover / 展开 / 聚焦时滑出文字 */
+/* 齿轮入口：[2026-11-19 用户裁定] 「工具」二字**常驻**，不再靠 hover 滑出
+   （鼠标一移开就不知道这图标是干嘛的）。窄栏由下面的 container query 收成纯图标。 */
 /* [2026-11-13] 高度交给 .tool-chip 统一 28px，这里只覆盖左右内边距（原 6px 会把内容压成 16px）。 */
 .tools-chip-wrap .tool-entry { padding: 0 9px; gap: 0; }
 .tools-chip-wrap .entry-ico {
@@ -10483,18 +10886,8 @@ html {
   width: 13px; height: 13px; flex: none;
 }
 .tools-chip-wrap .entry-label {
-  max-width: 0; opacity: 0; overflow: hidden; white-space: nowrap; margin-left: 0;
-  transition: max-width 180ms var(--ease), opacity 110ms var(--ease), margin-left 180ms var(--ease);
+  max-width: 44px; opacity: 1; overflow: hidden; white-space: nowrap; margin-left: 5px;
 }
-.tools-chip-wrap:hover .entry-label,
-.tools-chip-wrap.open .entry-label,
-.tools-chip-wrap:focus-within .entry-label { max-width: 44px; opacity: 1; margin-left: 5px; }
-/* 有工具被禁用时的 4px 黄点（⛔ 不显示数字，用户 2026-11-12 明确） */
-.tools-chip-wrap .entry-dot {
-  width: 4px; height: 4px; border-radius: 50%;
-  background: #B98A2B; flex: none; margin-left: 3px;
-}
-
 /* 弹层容器：向上展开（一级 + 二级并排） */
 .tools-chip-wrap .tool-menu-layer {
   position: absolute; bottom: calc(100% + 7px); left: 0; z-index: 60;
@@ -11196,8 +11589,80 @@ html {
 
 /* ---- 技能 Tab：分类胶囊 + 精选横条 + 推荐 3 列 ---- */
 .sm-skill-wrap { display: flex; flex-direction: column; gap: 10px; }
-.sm-cat-row { display: flex; flex-wrap: wrap; gap: 6px; }
+/* 来源切换（本机已装 / 市场）：胶囊分段控件 —— 灰色轨道 + 白色浮起选中段（2026-11-17 设计） */
+.sm-subtabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  width: fit-content;
+  border-radius: 10px;
+  background: var(--surface-2, #eff2f8);
+  border: 1px solid var(--hairline, #E7E9EE);
+}
+.sm-subtab {
+  appearance: none;
+  border: 0;
+  background: transparent;
+  border-radius: 8px;
+  padding: 5px 12px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  color: var(--ink-subtle, #5f6875);
+  cursor: pointer;
+  transition: color 140ms var(--ease), background 140ms var(--ease), box-shadow 140ms var(--ease);
+}
+.sm-subtab:hover { color: var(--ink, #14181f); }
+.sm-subtab:focus-visible { outline: 2px solid var(--accent, #0f5fd4); outline-offset: 1px; }
+.sm-subtab.active {
+  background: #FFFFFF;
+  color: var(--ink, #14181f);
+  font-weight: 600;
+  box-shadow: 0 1px 2px rgba(16, 24, 40, 0.08), 0 1px 3px rgba(16, 24, 40, 0.06);
+}
+.sm-subtab .cnt {
+  min-width: 18px;
+  padding: 2px 6px;
+  border-radius: var(--r-pill, 9999px);
+  background: rgba(16, 24, 40, 0.06);
+  color: var(--ink-faint, #9aa3b2);
+  font-size: 10.5px;
+  font-weight: 500;
+  line-height: 1.2;
+  text-align: center;
+  font-variant-numeric: tabular-nums;
+  transition: background 140ms var(--ease), color 140ms var(--ease);
+}
+.sm-subtab.active .cnt {
+  background: var(--accent-soft, rgba(15, 95, 212, 0.12));
+  color: var(--accent, #0f5fd4);
+}
+.sm-cat-row { display: flex; align-items: center; gap: 6px; min-width: 0; }
+/* 分类胶囊只占一行：超出部分横向滚动，用 ›/‹ 翻页（用户 2026-11-17） */
+.sm-cat-scroll {
+  display: flex; flex-wrap: nowrap; gap: 6px;
+  flex: 1; min-width: 0;
+  overflow-x: auto; overflow-y: hidden;
+  scrollbar-width: none; -ms-overflow-style: none;
+}
+.sm-cat-scroll::-webkit-scrollbar { display: none; }
+.sm-cat-page {
+  flex: none; width: 22px; height: 22px; padding: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  border: 1px solid var(--hairline-strong, #E2E2E2); border-radius: 50%;
+  background: #FFFFFF; color: var(--ink-subtle, #5f6875);
+  font-size: 13px; line-height: 1; cursor: pointer;
+  transition: all 140ms var(--ease);
+}
+.sm-cat-page:hover { border-color: var(--accent, #0f5fd4); color: var(--accent, #0f5fd4); }
+.sm-cat-page.off { visibility: hidden; pointer-events: none; }
 .sm-cat {
+  flex: none;
+  white-space: nowrap;
   border: 1px solid var(--hairline-strong, #E2E2E2);
   background: #FFFFFF;
   border-radius: var(--r-pill, 9999px);
@@ -13504,6 +13969,19 @@ html {
   border-radius: 8px;
 }
 
+/* 知识库场景：胶囊当菜单锚点用（替代「+」按钮）⇒ 需要可点击的视觉与键盘可达性 */
+.composer button.agent-pill-btn {
+  cursor: pointer;
+  font: inherit;
+  color: inherit;
+}
+.composer button.agent-pill-btn:hover,
+.composer button.agent-pill-btn.active {
+  background: var(--surface-3, var(--surface-2));
+  border-color: var(--accent, var(--hairline));
+}
+.composer button.agent-pill-btn .plus-chev { margin-left: 2px; opacity: 0.6; }
+
 .composer .agent-pill-ava {
   width: 19px;
   height: 19px;
@@ -13662,9 +14140,10 @@ html {
   flex-direction: column;
   min-width: 0;
   overflow: hidden;
-  background: rgba(250, 250, 252, 0.98);
-  border-left: 1px solid var(--hairline, #eceef2);
-  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.07);
+  /* 按 chat.deepseek.com 右侧预览栏：白底、左 1px 分隔、无重阴影 */
+  background: #fff;
+  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  box-shadow: none;
   z-index: 22;
 }
 
@@ -13675,10 +14154,12 @@ html {
 }
 .artifact-dock .ad-resizer:hover { background: rgba(15, 95, 212, 0.14); }
 
-/* 顶部：类型图标 + 文件名 + 操作 */
+/* 顶部：类型图标 + 文件名 + 操作（DeepSeek 右侧栏 header：60 高、左右 20） */
 .artifact-dock .ad-head {
   display: flex; align-items: center; gap: 8px;
-  padding: 9px 10px; border-bottom: 1px solid var(--hairline, #eceef2);
+  height: 60px;
+  padding: 0 20px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
   flex-shrink: 0;
 }
 .artifact-dock .ad-ico {
@@ -13697,9 +14178,25 @@ html {
 .artifact-dock .ad-ico.k-file { background: #8E8E93; }
 .artifact-dock .ad-ico.k-dir { background: #5E5CE6; }
 .artifact-dock .ad-name {
-  flex: 1; min-width: 0; font-size: 12.5px; font-weight: 600; color: var(--ink, #1d1d1f);
+  flex: 1; min-width: 0; font-size: 14px; font-weight: 500; color: #0f1115;
   overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
+
+/* 轨迹视图 · 工具类型配色（2026-11-18 用户「不同工具不同颜色，现在全灰」）。
+   类别来自 TraceView.toolKind()：bash / edit / glob / read / task / other；
+   工具名与左侧圆点同色（圆点用 currentColor，跳过「已裁剪」灰点）。 */
+.kb-scope .kp-name-text.tool-bash, .kb-scope .kp-name-inner.tool-bash { color: #6B4FD8; }
+.kb-scope .kp-name-text.tool-edit, .kb-scope .kp-name-inner.tool-edit { color: #E37318; }
+.kb-scope .kp-name-text.tool-glob, .kb-scope .kp-name-inner.tool-glob { color: #9C6B00; }
+.kb-scope .kp-name-text.tool-read, .kb-scope .kp-name-inner.tool-read { color: #0F5FD4; }
+.kb-scope .kp-name-text.tool-task, .kb-scope .kp-name-inner.tool-task { color: #2BA471; }
+.kb-scope .kp-name-text.tool-other, .kb-scope .kp-name-inner.tool-other { color: #8A9099; }
+.kb-scope .kp-name-inner[class*="tool-"] .kp-dot:not(.kp-dot-skipped) { background: currentColor; }
+/* kind 标签（tool）跟随工具色：kb-12/kb-orphan 给它写死了次要灰，这里 inherit 顶掉（2026-11-18 用户裁定） */
+.kb-scope .kp-name-inner[class*="tool-"] .kp-name-kind { color: inherit; }
+/* 琥珀色在深色底不可读 → 提亮 */
+.app[data-theme="dark"] .kb-scope .kp-name-text.tool-glob,
+.app[data-theme="dark"] .kb-scope .kp-name-inner.tool-glob { color: #C99A2E; }
 .artifact-dock .ad-acts { display: flex; gap: 1px; flex-shrink: 0; }
 .artifact-dock .ad-btn {
   width: 26px; height: 26px; border: none; border-radius: 7px; background: transparent;
@@ -15865,35 +16362,51 @@ html {
 
 /* ===== [2026-10-29] 产物只读预览弹窗（ArtifactPreviewModal · 浏览器通道）=====
    产物 = 归档副本（{configHome}/artifacts/<sessionId>/…），不在项目根内 ⇒ 不走项目文件通道。 */
-.artifact-overlay { align-items: center; padding-top: 0; }
+/* 产物/附件预览：按 chat.deepseek.com 右侧预览栏（满高贴右 · 白底 · 左 1px 分隔 · 无圆角/阴影/遮罩）。
+   ⭐ pointer-events:none 让主对话仍可操作（DeepSeek 就是没有遮罩）；面板自身 auto。 */
+.artifact-overlay {
+  align-items: stretch;
+  justify-content: flex-end;
+  padding-top: 0;
+  background: transparent;
+  pointer-events: none;
+}
 
 .artifact-modal {
+  pointer-events: auto;
   display: flex;
   flex-direction: column;
-  width: min(920px, calc(100vw - 80px));
-  height: min(78vh, 860px);
-  background: var(--surface-1);
-  border: 1px solid var(--hairline-strong);
-  border-radius: var(--r-lg);
-  box-shadow: 0 16px 48px rgba(20, 24, 31, 0.16), 0 4px 12px rgba(20, 24, 31, 0.08);
+  width: min(50.7vw, 980px);
+  height: 100vh;
+  background: #fff;
+  border: none;
+  border-left: 1px solid rgba(0, 0, 0, 0.1);
+  border-radius: 0;
+  box-shadow: none;
   overflow: hidden;
-  animation: dropdownIn 200ms var(--spring);
+  animation: sidePreviewIn 180ms var(--ease);
+}
+@keyframes sidePreviewIn {
+  from { transform: translateX(24px); opacity: 0.6; }
+  to { transform: none; opacity: 1; }
 }
 
 .artifact-modal-header {
   display: flex;
   align-items: center;
   gap: 10px;
-  padding: 12px 16px;
-  border-bottom: 1px solid var(--hairline);
+  height: 60px;
+  padding: 0 20px;
+  border-bottom: 1px solid rgba(0, 0, 0, 0.1);
+  flex-shrink: 0;
 }
 
 .artifact-modal-title {
   flex: 1;
   min-width: 0;
   font-size: 14px;
-  font-weight: 600;
-  color: var(--ink);
+  font-weight: 500;
+  color: #0f1115;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -15907,7 +16420,7 @@ html {
 }
 
 .artifact-modal-close {
-  width: 24px;
+  width: 36px; /* DeepSeek 右侧栏关闭：36×24、图标 16、灰 #81858c */
   height: 24px;
   display: flex;
   align-items: center;
@@ -15915,7 +16428,7 @@ html {
   background: none;
   border: none;
   border-radius: 6px;
-  color: var(--ink-muted);
+  color: #81858c;
   font-size: 14px;
   cursor: pointer;
 }
@@ -16086,11 +16599,10 @@ html {
   outline-offset: 1px;
 }
 
-/* 图标底色（按类型 · 设计稿「图标总表」） */
+/* 图标槽（产物图标与待发附件同一套 DSH 实心文档 · 目录仍用线框 + 底色） */
 .ac-ico {
-  width: 30px;
-  height: 30px;
-  border-radius: 8px;
+  width: 24px;
+  height: 24px;
   display: grid;
   place-items: center;
   flex: 0 0 auto;

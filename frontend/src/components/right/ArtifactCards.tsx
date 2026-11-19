@@ -1,6 +1,9 @@
-import { memo } from 'react'
+import { memo, useEffect, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { ReactNode } from 'react'
+import { isTauri } from '@tauri-apps/api/core'
 import type { SessionArtifactDto } from '@/api/artifacts'
+import { AttachFileIcon } from '@/components/center/AttachFileIcon'
 import { formatFileSize } from '@/utils/format'
 import { artifactKindOf, isTextArtifact, type ArtifactKind } from '@/utils/artifactKind'
 
@@ -110,9 +113,39 @@ export const ArtifactCards = memo(function ArtifactCards({
   compact = false,
   showOrigin = false,
 }: ArtifactCardsProps) {
+  /** 产物右键菜单（按 clientX/Y 定位 · portal 到 body：正文/右栏祖先有 containment，fixed 会被裁） */
+  const [menu, setMenu] = useState<{ x: number; y: number; a: SessionArtifactDto } | null>(null)
+  useEffect(() => {
+    if (!menu) return
+    const close = () => setMenu(null)
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    window.addEventListener('click', close)
+    window.addEventListener('keydown', onKey)
+    return () => {
+      window.removeEventListener('click', close)
+      window.removeEventListener('keydown', onKey)
+    }
+  }, [menu])
+
+  /** 打开产物归档副本所在文件夹（桌面端系统文件管理器并选中该文件）。 */
+  const revealInFolder = (a: SessionArtifactDto) => {
+    setMenu(null)
+    const path = a.localPath
+    if (!path) return
+    void import('@tauri-apps/plugin-opener')
+      .then(({ revealItemInDir }) => revealItemInDir(path))
+      .catch((e) => console.warn('[artifact] 打开所在文件夹失败', e))
+  }
+  const copyPath = (a: SessionArtifactDto) => {
+    setMenu(null)
+    if (!a.localPath) return
+    void navigator.clipboard?.writeText(a.localPath).catch(() => {})
+  }
+
   if (items.length === 0) return null
   return (
-    <div className={`artifact-cards${compact ? ' compact' : ''}`}>
+    <>
+      <div className={`artifact-cards${compact ? ' compact' : ''}`}>
       {items.map((a) => {
         const kind = artifactKindOf(a)
         const editable = isTextArtifact(a)
@@ -127,6 +160,10 @@ export const ArtifactCards = memo(function ArtifactCards({
             className="artifact-card"
             title={a.localPath ?? a.title}
             onClick={() => onOpen?.(a)}
+            onContextMenu={(e) => {
+              e.preventDefault()
+              setMenu({ x: e.clientX, y: e.clientY, a })
+            }}
             role="button"
             tabIndex={0}
             onKeyDown={(e) => {
@@ -136,8 +173,11 @@ export const ArtifactCards = memo(function ArtifactCards({
             {showOrigin && originLabel && (
               <span className={`src ${a.origin}`}>{originLabel}</span>
             )}
-            <span className={`ac-ico k-${kind}`}>
-              <ArtifactKindIcon kind={kind} />
+            {/* 图标与待发附件同一套（DSH 实心文档 + 类型色）；目录仍用线框文件夹 */}
+            <span className={`ac-ico${kind === 'dir' ? ' k-dir' : ''}`}>
+              {kind === 'dir'
+                ? <ArtifactKindIcon kind="dir" size={22} />
+                : <AttachFileIcon name={a.localPath ?? a.title} size={24} />}
             </span>
             <span className="ac-text">
               <span className="ac-name" title={a.title}>{a.title}</span>
@@ -183,6 +223,29 @@ export const ArtifactCards = memo(function ArtifactCards({
           </div>
         )
       })}
-    </div>
+      </div>
+      {menu && createPortal(
+        <div className="project-context-menu" style={{ left: menu.x, top: menu.y }}>
+          {isTauri() && menu.a.localPath && (
+            <div className="ctx-menu-item" onClick={() => revealInFolder(menu.a)}>
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                <path d="M1.5 4.2c0-.8.6-1.4 1.4-1.4h2.4l1.4 1.7h4.4c.8 0 1.4.6 1.4 1.4v4.6c0 .8-.6 1.4-1.4 1.4H2.9c-.8 0-1.4-.6-1.4-1.4z" />
+              </svg>
+              <span>打开所在文件夹</span>
+            </div>
+          )}
+          {menu.a.localPath && (
+            <div className="ctx-menu-item" onClick={() => copyPath(menu.a)}>
+              <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                <rect x="2" y="2" width="10" height="10" rx="1" />
+                <path d="M5 7h4" />
+              </svg>
+              <span>复制路径</span>
+            </div>
+          )}
+        </div>,
+        document.body,
+      )}
+    </>
   )
 })

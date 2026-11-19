@@ -744,9 +744,12 @@ public class AgentTranscript {
             ? node.path("author").asText(null) : null;
         String subtype = node.has("subtype") && !node.get("subtype").isNull()
             ? node.path("subtype").asText(null) : null;
+        // [agent-notice] SendMessage 通知行 UI 摘要（惰性键，旧转录无 → null）。
+        String summary = node.has("summary") && !node.get("summary").isNull()
+            ? node.path("summary").asText(null) : null;
         return new AgentMessage(role, content, isApiError, agentId, isSidechain,
             uuid, parentUuid, toolCalls, toolCallId, timestamp, reasoning,
-            isMeta, author, subtype);
+            isMeta, author, subtype, summary);
     }
 
     /**

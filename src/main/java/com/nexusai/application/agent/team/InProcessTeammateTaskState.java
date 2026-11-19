@@ -54,7 +54,13 @@ public record InProcessTeammateTaskState(
     AbortControllerFactory.AbortControllerRef abortController,
     AbortControllerFactory.AbortControllerRef currentWorkAbortController,
     Runnable unregisterCleanup,
-    List<Runnable> onIdleCallbacks
+    List<Runnable> onIdleCallbacks,
+    /**
+     * 最近工具活动（≤5 条）· 对齐 CC {@code InProcessTeammateTaskState.progress.recentActivities}
+     * （types.ts:47 progress?: AgentProgress → LocalAgentTask.tsx:110-131）。
+     * 本仓只对齐「活动摘要」这一子集：toolUseCount/tokenCount 不在此承载（由 AgentProgressTracker 管）。
+     */
+    List<com.nexusai.application.agent.tasks.MainSessionTaskState.ToolActivity> recentActivities
 ) {
     /** W8-02 REWORK: 带 error 的新副本 · 对齐 CC failed 转换 error: errorMessage（inProcessRunner.ts:1490）。 */
     public InProcessTeammateTaskState withError(String newError) {
@@ -62,7 +68,8 @@ public record InProcessTeammateTaskState(
             taskId, identity, prompt, model, awaitingPlanApproval, permissionMode,
             newError, messages, inProgressToolUseIDs, pendingUserMessages, isIdle,
             shutdownRequested, lastReportedToolCount, lastReportedTokenCount,
-            abortController, currentWorkAbortController, unregisterCleanup, onIdleCallbacks);
+            abortController, currentWorkAbortController, unregisterCleanup, onIdleCallbacks,
+            recentActivities);
     }
 
     /** W8-02 REWORK: 带 isIdle 的新副本 · 对齐 CC failed 转换 isIdle:true（inProcessRunner.ts:1491）。 */
@@ -71,7 +78,8 @@ public record InProcessTeammateTaskState(
             taskId, identity, prompt, model, awaitingPlanApproval, permissionMode,
             error, messages, inProgressToolUseIDs, pendingUserMessages, newIsIdle,
             shutdownRequested, lastReportedToolCount, lastReportedTokenCount,
-            abortController, currentWorkAbortController, unregisterCleanup, onIdleCallbacks);
+            abortController, currentWorkAbortController, unregisterCleanup, onIdleCallbacks,
+            recentActivities);
     }
 
     /** W8-02 REWORK (GAP-6): 带 currentWorkAbortController 的新副本 · 对齐 CC inProcessRunner.ts:1059-1063
@@ -82,6 +90,36 @@ public record InProcessTeammateTaskState(
             taskId, identity, prompt, model, awaitingPlanApproval, permissionMode,
             error, messages, inProgressToolUseIDs, pendingUserMessages, isIdle,
             shutdownRequested, lastReportedToolCount, lastReportedTokenCount,
-            abortController, newCurrentWorkAbortController, unregisterCleanup, onIdleCallbacks);
+            abortController, newCurrentWorkAbortController, unregisterCleanup, onIdleCallbacks,
+            recentActivities);
+    }
+
+    /** 带最近活动列表的新副本 · 对齐 CC progress.recentActivities 更新（LocalAgentTask.tsx:110-131）。 */
+    public InProcessTeammateTaskState withRecentActivities(
+            List<com.nexusai.application.agent.tasks.MainSessionTaskState.ToolActivity> newRecentActivities) {
+        return new InProcessTeammateTaskState(
+            taskId, identity, prompt, model, awaitingPlanApproval, permissionMode,
+            error, messages, inProgressToolUseIDs, pendingUserMessages, isIdle,
+            shutdownRequested, lastReportedToolCount, lastReportedTokenCount,
+            abortController, currentWorkAbortController, unregisterCleanup, onIdleCallbacks,
+            newRecentActivities == null ? List.of() : List.copyOf(newRecentActivities));
+    }
+
+    /**
+     * 18 参便利构造器（新增 {@code recentActivities} 之前的形态）· 活动列表默认空。
+     * 保留给既有构造点/测试，避免因新增活动摘要字段而全量改动调用方。
+     */
+    public InProcessTeammateTaskState(
+            String taskId, TeammateIdentity identity, String prompt, String model,
+            boolean awaitingPlanApproval, String permissionMode, String error,
+            List<String> messages, Set<String> inProgressToolUseIDs, List<String> pendingUserMessages,
+            boolean isIdle, boolean shutdownRequested, int lastReportedToolCount, int lastReportedTokenCount,
+            AbortControllerFactory.AbortControllerRef abortController,
+            AbortControllerFactory.AbortControllerRef currentWorkAbortController,
+            Runnable unregisterCleanup, List<Runnable> onIdleCallbacks) {
+        this(taskId, identity, prompt, model, awaitingPlanApproval, permissionMode, error,
+                messages, inProgressToolUseIDs, pendingUserMessages, isIdle, shutdownRequested,
+                lastReportedToolCount, lastReportedTokenCount, abortController,
+                currentWorkAbortController, unregisterCleanup, onIdleCallbacks, List.of());
     }
 }

@@ -228,7 +228,7 @@ export function extractCitationHtmlPlaceholders(
   return { content, htmlSnippets }
 }
 
-export function restoreCitationHtmlPlaceholders(html: string, htmlSnippets: string[]): string {
+export function restoreCitationHtmlPlaceholders(html: string, htmlSnippets: readonly string[]): string {
   if (!htmlSnippets.length) return html
   return html.replace(HTML_PLACEHOLDER_RE, (_match, idx) => htmlSnippets[Number(idx)] || '')
 }

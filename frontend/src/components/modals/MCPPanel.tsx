@@ -5,8 +5,7 @@ import { ApiError } from '@/api/rest'
 import { doctorApi } from '@/api/doctor'
 import type { RuntimeEnvResponse } from '@/api/doctor'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
-import { getMcpPrefetch, putMcpPrefetch } from '@/api/settings'
-import type { CreateMcpRequest, McpOAuthRequest, McpRuntimeStatus, McpServer, McpStatus } from '@/api/types'
+import type { CreateMcpRequest, McpOAuthRequest, McpRuntimeStatus, McpServer } from '@/api/types'
 import type { UseMcp } from '@/hooks/useMcp'
 import { parseMcpCommandLine } from '@/utils/mcpCliParse'
 
@@ -69,30 +68,9 @@ const isScope = (s: string | null | undefined): s is Scope =>
 
 /** 审批态徽标（对齐 McpServerDto.approvalStatus） */
 const APPROVAL_LABEL: Record<string, { cls: string; label: string }> = {
-  approved: { cls: 'approved', label: 'approved' },
-  rejected: { cls: 'rejected', label: 'rejected' },
-  pending: { cls: 'pending', label: 'pending' },
-}
-
-/** 运行态徽标（对齐 McpServerDto.status：running/stopped/error） */
-const STATUS_LABEL: Record<McpStatus, { cls: string; label: string }> = {
-  running: { cls: 'running', label: '运行中' },
-  stopped: { cls: 'stopped', label: '已停止' },
-  error: { cls: 'error', label: '错误' },
+  approved: { cls: 'approved', label: '已通过' },
+  rejected: { cls: 'rejected', label: '已拒绝' },
   pending: { cls: 'pending', label: '待审批' },
-}
-
-/**
- * 连接状态徽标（设计稿「功能4」三态：connected 绿 / needs-auth 黄 / failed 红）· FM-3 预留。
- * <p>后端仅暴露运行时 status，暂无 needs-auth 分类（FM-8 半程，见 docs/后端待提供能力清单.md）——
- * 此处按设计稿做展示位映射：running → connected；error → failed；stopped 落入 needs-auth。
- * 待后端定案连接状态投递通道后替换为真实字段。
- */
-const CONN_STATE: Record<McpStatus, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
-  running: { cls: 'connected', label: 'connected' },
-  stopped: { cls: 'needs-auth', label: 'needs-auth' },
-  error: { cls: 'failed', label: 'failed' },
-  pending: { cls: 'needs-auth', label: 'needs-auth' },
 }
 
 /**
@@ -100,12 +78,20 @@ const CONN_STATE: Record<McpStatus, { cls: 'connected' | 'needs-auth' | 'failed'
  * 只复用既有三种 CSS 类（connected/needs-auth/failed），不新增样式。
  */
 const RUNTIME_LABEL: Record<McpRuntimeStatus, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
-  connected: { cls: 'connected', label: 'connected' },
-  pending: { cls: 'needs-auth', label: 'pending' },
-  failed: { cls: 'failed', label: 'failed' },
-  needsAuth: { cls: 'needs-auth', label: 'needs-auth' },
-  disabled: { cls: 'needs-auth', label: 'disabled' },
-  stopped: { cls: 'needs-auth', label: 'stopped' },
+  connected: { cls: 'connected', label: '已连接' },
+  pending: { cls: 'needs-auth', label: '待审批' },
+  failed: { cls: 'failed', label: '连接失败' },
+  needsAuth: { cls: 'needs-auth', label: '待授权' },
+  disabled: { cls: 'needs-auth', label: '已停用' },
+  stopped: { cls: 'needs-auth', label: '未连接' },
+}
+
+/** 老后端无 runtimeStatus 时按 status 回落 */
+const CONN_STATE: Record<string, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
+  running: { cls: 'connected', label: '已连接' },
+  stopped: { cls: 'needs-auth', label: '未连接' },
+  error: { cls: 'failed', label: '连接失败' },
+  pending: { cls: 'needs-auth', label: '待审批' },
 }
 
 const parseArgs = (raw: string): string[] => raw.split(/\s+/).filter(Boolean)
@@ -136,12 +122,11 @@ const parseJsonObject = (raw: string): Record<string, string> | undefined | null
 }
 
 /**
- * MCPPanel · 按设计稿「功能4」+ 后端 MCP 契约（McpServerController / McpCreateRequest 11 字段）重构
+ * MCPPanel · 版式对齐「CLI 设置」页：
+ * 单列卡片列表（默认只显示一行摘要，点哪行才展开哪行），添加/编辑表单在同一处展开，
+ * 避免一进页面就被一张常驻表单抢注意力。
  *
- * <p>顶部「添加新服务器」表单卡（橙底 #eaf2fe）：名称 + 传输类型 select（切换联动 Command /
- * URL+Headers+OAuth）+ 作用域。下方「已配置的服务器」列表：transport / scope / approvalStatus /
- * status / 连接状态（预留）徽标 + enabled 开关 + 启停/测试/去授权(预留)/编辑/删除。
- * <p>导入 .mcp.json + 待审批弹窗（approve/reject）。CRUD 复用 useMcp hook。
+ * <p>「启动时自动连接」是每个服务器自己的开关（新增默认开启），跟着列表行走，没有全局总闸。
  */
 export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps) {
   const { list, loading, error, refresh, createMcp, updateMcp, deleteMcp, toggleMcp } = mcpApi
@@ -154,18 +139,12 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const [importDetail, setImportDetail] = useState<{ blocked: string[]; suppressed: string[] } | null>(null)
   const [approving, setApproving] = useState(false)
   const [selected, setSelected] = useState<string[]>([])
-  /** [V295] 全局总闸：DB 优先 / yml 兜底，source 用于提示「系统默认 vs 用户设置」 */
-  const [prefetch, setPrefetch] = useState<{ enabled: boolean; source: 'db' | 'yml' } | null>(null)
+  /** 当前展开（聚焦）的服务器行；同一时刻只展开一行 */
+  const [openId, setOpenId] = useState<string | null>(null)
+  /** 「添加新服务器」表单是否展开 */
+  const [formOpen, setFormOpen] = useState(false)
   /** Node / Python 探测结果：缺失时提示，不阻塞任何操作 */
   const [runtimeEnv, setRuntimeEnv] = useState<RuntimeEnvResponse | null>(null)
-
-  useEffect(() => {
-    let alive = true
-    getMcpPrefetch()
-      .then((v) => { if (alive) setPrefetch(v) })
-      .catch(() => { /* 老后端无该端点 → 不显示总闸 */ })
-    return () => { alive = false }
-  }, [])
 
   useEffect(() => {
     let alive = true
@@ -179,15 +158,6 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     doctorApi.runtime()
       .then(setRuntimeEnv)
       .catch(() => { /* 探测失败静默：不把 MCP 面板拖进错误态 */ })
-  }
-
-  const onTogglePrefetch = () => {
-    if (!prefetch) return
-    const next = !prefetch.enabled
-    void wrap(async () => {
-      const saved = await putMcpPrefetch(next)
-      setPrefetch(saved)
-    }, next ? '已开启：下次启动自动连接自启的服务器' : '已关闭：下次启动不再自动连接')
   }
 
   const set = (patch: Partial<McpFormState>) => setForm((p) => ({ ...p, ...patch }))
@@ -209,6 +179,12 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const resetForm = () => {
     setForm(EMPTY_FORM)
     setEditing(null)
+  }
+
+  /** 关闭添加/编辑表单（编辑时回到该行的详情态） */
+  const closeForm = () => {
+    resetForm()
+    setFormOpen(false)
   }
 
   /** 命令行快速添加：解析 `claude mcp add ...` / 纯命令 → 填入表单（失败 toast；成功清掉 OAuth 残留回到新建态） */
@@ -253,6 +229,8 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       type: form.type,
       scope: form.scope,
       enabled: editing ? editing.enabled : true,
+      // 新增默认「启动时自动连接」（编辑时沿用原值，不回写覆盖；undefined 会被后端视为不改）
+      autoStart: editing ? editing.autoStart : true,
     }
     if (form.type === 'stdio') {
       if (!form.command.trim()) {
@@ -287,6 +265,7 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     void wrap(async () => {
       await createMcp(req)
       resetForm()
+      setFormOpen(false)
     }, `已添加: ${req.name}`)
   }
 
@@ -297,6 +276,13 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       await updateMcp(editing.id, req)
       resetForm()
     }, `已更新: ${req.name}`)
+  }
+
+  const startAdd = () => {
+    resetForm()
+    setCliLine('')
+    setFormOpen(true)
+    setOpenId(null)
   }
 
   const startEdit = (m: McpServer) => {
@@ -319,6 +305,8 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       clientSecret: '',
     })
     setEditing(m)
+    setFormOpen(false)
+    setOpenId(m.id)
   }
 
   // ── 每行操作：启停 / 测试 / 删除 / enabled 开关 ──
@@ -384,7 +372,10 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const onRemove = (m: McpServer) => {
     const display = m.userFacingName ?? m.name
     if (!confirm(`删除 MCP server "${display}"？`)) return
-    void wrap(() => deleteMcp(m.id), `已删除: ${display}`)
+    void wrap(async () => {
+      await deleteMcp(m.id)
+      setOpenId((cur) => (cur === m.id ? null : cur))
+    }, `已删除: ${display}`)
   }
 
   // ── 导入 .mcp.json + 待审批（FM-1：pending 行必须经 approve 才能 start） ──
@@ -455,420 +446,465 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
 
   const enabledCount = list.filter((m) => m.enabled).length
 
-  return (
-    <div className="mcp-list">
-      {/* ── 顶部操作行 ── */}
-      <div className="settings-row" style={{ borderBottom: 'none', paddingBottom: 4 }}>
-        <div>
-          <div className="settings-row-label">MCP 服务器</div>
-          <div className="settings-row-desc">
-            Model Context Protocol 工具接入 · {enabledCount}/{list.length} 已启用
-            {pendingList.length > 0 && ` · ${pendingList.length} 个待审批`}
-            {loading && ' · 加载中…'}
-            {error && <span style={{ color: 'var(--error)', marginLeft: 8 }}>· {error}</span>}
-          </div>
-        </div>
-        <div className="settings-row" style={{ gap: 6, marginLeft: 'auto' }}>
-          {pendingList.length > 0 && (
-            <button
-              className="settings-add-btn"
-              onClick={() => {
-                setSelected(pendingList.map((m) => m.id))
-                setApproving(true)
-              }}
-              disabled={pending}
-            >
-              待审批 ({pendingList.length})
-            </button>
-          )}
-          <button className="settings-add-btn" onClick={() => setImporting(true)} disabled={pending}>
-            导入 .mcp.json
+  /** 添加 / 编辑共用的表单主体（在卡片内展开，不常驻页面顶部） */
+  const renderForm = () => (
+    <>
+      {!editing && (
+        <div className="mcp-cli-row">
+          <input
+            className="settings-input mcp-cli-input"
+            value={cliLine}
+            onChange={(e) => setCliLine(e.target.value)}
+            placeholder="claude mcp add <name> -- npx -y @modelcontextprotocol/server-filesystem /tmp"
+            onKeyDown={(e) => { if (e.key === 'Enter') onCliParse() }}
+            disabled={pending}
+          />
+          <button className="mcp-cli-btn" onClick={onCliParse} disabled={pending}>
+            解析填入
           </button>
-        </div>
-      </div>
-
-      {/* ── 添加 / 编辑 服务器表单卡（设计稿「功能4」· 橙底 #eaf2fe） ── */}
-      <div className="mcp-add-card">
-        <div className="mcp-add-title">{editing ? '编辑服务器' : '添加新服务器'}</div>
-        {!editing && (
-          <div className="mcp-cli-row">
-            <input
-              className="settings-input mcp-cli-input"
-              value={cliLine}
-              onChange={(e) => setCliLine(e.target.value)}
-              placeholder="claude mcp add <name> -- npx -y @modelcontextprotocol/server-filesystem /tmp"
-              onKeyDown={(e) => { if (e.key === 'Enter') onCliParse() }}
-              disabled={pending}
-            />
-            <button className="mcp-cli-btn" onClick={onCliParse} disabled={pending}>
-              解析填入
-            </button>
-          </div>
-        )}
-        <div className="mcp-add-form">
-          <div className="mcp-add-row">
-            <label>服务器名称</label>
-            <input
-              className="settings-input"
-              value={form.name}
-              onChange={(e) => set({ name: e.target.value })}
-              placeholder="e.g. filesystem"
-              disabled={pending}
-            />
-          </div>
-          <div className="mcp-add-row">
-            <label>传输类型</label>
-            <select
-              className="settings-input"
-              value={form.type}
-              onChange={(e) => set({ type: e.target.value as Transport, url: '', headersJson: '' })}
-              disabled={pending}
-            >
-              {TRANSPORT_TYPES.map((t) => (
-                <option key={t.value} value={t.value}>{t.label}</option>
-              ))}
-            </select>
-            <label className="mcp-add-inline-label">作用域</label>
-            <select
-              className="settings-input"
-              value={form.scope}
-              onChange={(e) => set({ scope: e.target.value as Scope })}
-              disabled={pending}
-            >
-              {SCOPE_OPTIONS.map((s) => (
-                <option key={s.value} value={s.value}>{s.label}</option>
-              ))}
-            </select>
-          </div>
-          {/* [V295] 启动自启：从列表行移到此处（原行内与 enabled 并排成两个无文字开关，易被看成重复开关）。
-              新增时后端默认 true，不需要出此项；编辑时改一次即 PATCH 一次（带 scope，见 onToggleAutoStart）。 */}
-          {editing && (
-            <div className="mcp-add-row">
-              <label>启动时自动连接此服务</label>
-              <div style={{ flex: 1, minWidth: 0, paddingTop: 4 }}>
-                <label
-                  className="settings-switch"
-                  /* .mcp-add-row label 会把宽度压成 130px（选择器比开关自身类更具体），此处按开关原宽还原 */
-                  style={{ width: 44, paddingTop: 0 }}
-                  title={editing.enabled ? '启动时自动连接此服务（全局总闸关闭时仍不会连）' : '先启用该服务器才能设置启动自启'}
-                >
-                  <input
-                    type="checkbox"
-                    checked={!!editing.autoStart && editing.enabled}
-                    onChange={() => onToggleAutoStart(editing)}
-                    disabled={pending || !editing.enabled}
-                  />
-                  <span></span>
-                </label>
-                <div style={{ fontSize: 10.5, color: 'var(--ink-faint)', marginTop: 4, lineHeight: 1.5 }}>
-                  开启后，应用启动时会自动连上这个服务；关闭则每次手动点启动。
-                </div>
-              </div>
-            </div>
-          )}
-          {form.type === 'stdio' ? (
-            <>
-              <div className="mcp-add-row">
-                <label>Command</label>
-                <input
-                  className="settings-input"
-                  value={form.command}
-                  onChange={(e) => set({ command: e.target.value })}
-                  placeholder="npx -y @modelcontextprotocol/server-filesystem /tmp"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>Args</label>
-                <input
-                  className="settings-input"
-                  value={form.argsStr}
-                  onChange={(e) => set({ argsStr: e.target.value })}
-                  placeholder="-y @modelcontextprotocol/server-fs /tmp"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>Env</label>
-                <textarea
-                  className="settings-input mcp-add-textarea"
-                  value={form.envStr}
-                  onChange={(e) => set({ envStr: e.target.value })}
-                  placeholder={'API_KEY=xxx\nLOG_LEVEL=info'}
-                  rows={2}
-                  disabled={pending}
-                />
-              </div>
-            </>
-          ) : (
-            <>
-              <div className="mcp-add-row">
-                <label>URL</label>
-                <input
-                  className="settings-input"
-                  value={form.url}
-                  onChange={(e) => set({ url: e.target.value })}
-                  placeholder="https://mcp.example.com/sse"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>Headers JSON</label>
-                <textarea
-                  className="settings-input mcp-add-textarea"
-                  value={form.headersJson}
-                  onChange={(e) => set({ headersJson: e.target.value })}
-                  placeholder='{ "Authorization": "Bearer xxxxx" }'
-                  rows={2}
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-subtitle">OAuth（可选）</div>
-              <div className="mcp-add-row">
-                <label>Client ID</label>
-                <input
-                  className="settings-input"
-                  value={form.oauthClientId}
-                  onChange={(e) => set({ oauthClientId: e.target.value })}
-                  placeholder="e.g. my-app-client"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>Callback Port</label>
-                <input
-                  className="settings-input"
-                  value={form.oauthCallbackPort}
-                  onChange={(e) => set({ oauthCallbackPort: e.target.value })}
-                  placeholder="8080"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>Metadata URL</label>
-                <input
-                  className="settings-input"
-                  value={form.oauthMetadataUrl}
-                  onChange={(e) => set({ oauthMetadataUrl: e.target.value })}
-                  placeholder="https://auth.example.com/.well-known/openid-configuration"
-                  disabled={pending}
-                />
-              </div>
-              <div className="mcp-add-row">
-                <label>XAA</label>
-                <label className="settings-switch" style={{ marginTop: 3 }}>
-                  <input
-                    type="checkbox"
-                    checked={form.oauthXaa}
-                    onChange={(e) => set({ oauthXaa: e.target.checked })}
-                    disabled={pending}
-                  />
-                  <span></span>
-                </label>
-              </div>
-              <div className="mcp-add-row">
-                <label>Client Secret</label>
-                <input
-                  className="settings-input"
-                  value={form.clientSecret}
-                  onChange={(e) => set({ clientSecret: e.target.value })}
-                  placeholder="仅当填写 OAuth Client ID 时生效"
-                  disabled={pending}
-                />
-              </div>
-            </>
-          )}
-        </div>
-        <div className="mcp-add-actions">
-          {editing && (
-            <button className="mcp-add-btn ghost" onClick={resetForm} disabled={pending}>
-              取消
-            </button>
-          )}
-          <button className="mcp-add-btn primary" onClick={editing ? onSaveEdit : onAdd} disabled={pending}>
-            {editing ? '保存修改' : '添加服务器'}
-          </button>
-        </div>
-      </div>
-
-      {/* ── [V295] 全局总闸：启动时自动连接「自启」的服务器 ── */}
-      {prefetch && (
-        <div className="settings-row" style={{ marginTop: 6 }}>
-          <div>
-            <div className="settings-row-label">启动时自动连接</div>
-            <div className="settings-row-desc">
-              总闸 · 下次启动生效（{prefetch.source === 'db' ? '已自定义' : '系统默认'}）。
-              逐个服务器还需打开「自启」。
-            </div>
-          </div>
-          <label className="settings-switch" title={prefetch.enabled ? '关闭总闸' : '开启总闸'}>
-            <input type="checkbox" checked={prefetch.enabled} onChange={onTogglePrefetch} disabled={pending} />
-            <span></span>
-          </label>
         </div>
       )}
-
-      {/* ── 运行时缺失提示（Node / Python / uv）· 只提醒，不静默安装 ── */}
-      {runtimeEnv && runtimeEnv.missingForMcp.length > 0 && (
-        <div className="settings-row" style={{ marginTop: 6, alignItems: 'flex-start' }}>
-          <div style={{ flex: 1 }}>
-            <div className="settings-row-label">缺少 MCP 运行时</div>
-            <div className="settings-row-desc">
-              未检测到 {runtimeEnv.missingForMcp.join(' / ')}，npx / uvx 类型的服务器无法启动。
-              安装后点「重新检测」。
+      <div className="mcp-add-form">
+        <div className="mcp-add-row">
+          <label>服务器名称</label>
+          <input
+            className="settings-input"
+            value={form.name}
+            onChange={(e) => set({ name: e.target.value })}
+            placeholder="e.g. filesystem"
+            disabled={pending}
+          />
+        </div>
+        <div className="mcp-add-row">
+          <label>传输类型</label>
+          <select
+            className="settings-input"
+            value={form.type}
+            onChange={(e) => set({ type: e.target.value as Transport, url: '', headersJson: '' })}
+            disabled={pending}
+          >
+            {TRANSPORT_TYPES.map((t) => (
+              <option key={t.value} value={t.value}>{t.label}</option>
+            ))}
+          </select>
+          <label className="mcp-add-inline-label">作用域</label>
+          <select
+            className="settings-input"
+            value={form.scope}
+            onChange={(e) => set({ scope: e.target.value as Scope })}
+            disabled={pending}
+          >
+            {SCOPE_OPTIONS.map((s) => (
+              <option key={s.value} value={s.value}>{s.label}</option>
+            ))}
+          </select>
+        </div>
+        {form.type === 'stdio' ? (
+          <>
+            <div className="mcp-add-row">
+              <label>Command</label>
+              <input
+                className="settings-input"
+                value={form.command}
+                onChange={(e) => set({ command: e.target.value })}
+                placeholder="npx -y @modelcontextprotocol/server-filesystem /tmp"
+                disabled={pending}
+              />
             </div>
-            <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
-              {runtimeEnv.missingForMcp.map((name) => {
-                const info = runtimeEnv.runtimes[name]
-                if (!info?.installCommand) return null
-                return (
-                  <div key={name} style={{ fontSize: 10.5, color: 'var(--ink-subtle)' }}>
-                    <span style={{ fontFamily: 'var(--font-mono)' }}>{info.installCommand}</span>
-                    {info.installUrl && (
+            <div className="mcp-add-row">
+              <label>Args</label>
+              <input
+                className="settings-input"
+                value={form.argsStr}
+                onChange={(e) => set({ argsStr: e.target.value })}
+                placeholder="-y @modelcontextprotocol/server-fs /tmp"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>Env</label>
+              <textarea
+                className="settings-input mcp-add-textarea"
+                value={form.envStr}
+                onChange={(e) => set({ envStr: e.target.value })}
+                placeholder={'API_KEY=xxx\nLOG_LEVEL=info'}
+                rows={2}
+                disabled={pending}
+              />
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="mcp-add-row">
+              <label>URL</label>
+              <input
+                className="settings-input"
+                value={form.url}
+                onChange={(e) => set({ url: e.target.value })}
+                placeholder="https://mcp.example.com/sse"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>Headers JSON</label>
+              <textarea
+                className="settings-input mcp-add-textarea"
+                value={form.headersJson}
+                onChange={(e) => set({ headersJson: e.target.value })}
+                placeholder='{ "Authorization": "Bearer xxxxx" }'
+                rows={2}
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-subtitle">OAuth（可选）</div>
+            <div className="mcp-add-row">
+              <label>Client ID</label>
+              <input
+                className="settings-input"
+                value={form.oauthClientId}
+                onChange={(e) => set({ oauthClientId: e.target.value })}
+                placeholder="e.g. my-app-client"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>Callback Port</label>
+              <input
+                className="settings-input"
+                value={form.oauthCallbackPort}
+                onChange={(e) => set({ oauthCallbackPort: e.target.value })}
+                placeholder="8080"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>Metadata URL</label>
+              <input
+                className="settings-input"
+                value={form.oauthMetadataUrl}
+                onChange={(e) => set({ oauthMetadataUrl: e.target.value })}
+                placeholder="https://auth.example.com/.well-known/openid-configuration"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>XAA</label>
+              <label className="settings-switch" style={{ marginTop: 3 }}>
+                <input
+                  type="checkbox"
+                  checked={form.oauthXaa}
+                  onChange={(e) => set({ oauthXaa: e.target.checked })}
+                  disabled={pending}
+                />
+                <span></span>
+              </label>
+            </div>
+            <div className="mcp-add-row">
+              <label>Client Secret</label>
+              <input
+                className="settings-input"
+                value={form.clientSecret}
+                onChange={(e) => set({ clientSecret: e.target.value })}
+                placeholder="仅当填写 OAuth Client ID 时生效"
+                disabled={pending}
+              />
+            </div>
+          </>
+        )}
+      </div>
+      <div className="mcp-add-actions">
+        <button className="mcp-add-btn ghost" onClick={closeForm} disabled={pending}>
+          取消
+        </button>
+        <button className="mcp-add-btn primary" onClick={editing ? onSaveEdit : onAdd} disabled={pending}>
+          {editing ? '保存修改' : '添加服务器'}
+        </button>
+      </div>
+    </>
+  )
+
+  return (
+    <div className="mcp-list cli-panel">
+      <section className="cli-section">
+        <div className="cli-group-head" style={{ marginBottom: 8 }}>
+          <h4>MCP 服务器（{list.length}）</h4>
+          <div className="mcp-head-actions">
+            {pendingList.length > 0 && (
+              <button
+                className="cli-ghost-btn"
+                onClick={() => {
+                  setSelected(pendingList.map((m) => m.id))
+                  setApproving(true)
+                }}
+                disabled={pending}
+              >
+                待审批 ({pendingList.length})
+              </button>
+            )}
+            <button className="cli-ghost-btn" onClick={() => setImporting(true)} disabled={pending}>
+              导入 .mcp.json
+            </button>
+            <button className="cli-primary-btn" onClick={startAdd} disabled={pending}>
+              添加服务器
+            </button>
+          </div>
+        </div>
+
+        <p className="cli-hint">
+          Model Context Protocol 工具接入 · {enabledCount}/{list.length} 已启用
+          {loading && ' · 加载中…'}
+          {error && <span style={{ color: 'var(--error)' }}> · {error}</span>}
+        </p>
+
+        {/* ── 运行时缺失提示（Node / Python / uv）· 只提醒，不静默安装 ── */}
+        {runtimeEnv && runtimeEnv.missingForMcp.length > 0 && (
+          <div className="mcp-warn">
+            <div style={{ flex: 1 }}>
+              <div className="mcp-detail-label">缺少 MCP 运行时</div>
+              <div className="mcp-detail-desc">
+                未检测到 {runtimeEnv.missingForMcp.join(' / ')}，npx / uvx 类型的服务器无法启动。安装后点「重新检测」。
+              </div>
+              <div style={{ marginTop: 6, display: 'flex', flexDirection: 'column', gap: 4 }}>
+                {runtimeEnv.missingForMcp.map((name) => {
+                  const info = runtimeEnv.runtimes[name]
+                  if (!info?.installCommand) return null
+                  return (
+                    <div key={name} style={{ fontSize: 10.5, color: 'var(--ink-subtle)' }}>
+                      <span style={{ fontFamily: 'var(--font-mono)' }}>{info.installCommand}</span>
+                      {info.installUrl && (
+                        <>
+                          {' · '}
+                          <a href={info.installUrl} target="_blank" rel="noreferrer">下载页</a>
+                        </>
+                      )}
+                    </div>
+                  )
+                })}
+              </div>
+            </div>
+            <button className="cli-ghost-btn" onClick={refreshRuntime}>重新检测</button>
+          </div>
+        )}
+
+        {importDetail && (importDetail.blocked.length > 0 || importDetail.suppressed.length > 0) && (
+          <div className="mcp-import-detail">
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
+              <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink)' }}>导入明细</span>
+              {/* 「关闭明细」是中性动作，不是破坏性操作 ⇒ 用普通 icon-btn + 关闭图标，
+                  不复用 .skill-remove（那是删除语义 · hover 红色警示）。 */}
+              <button className="icon-btn" onClick={() => setImportDetail(null)} title="关闭">
+                <Icon.CloseLg />
+              </button>
+            </div>
+            {importDetail.blocked.length > 0 && (
+              <div style={{ marginBottom: importDetail.suppressed.length > 0 ? 8 : 0 }}>
+                <div style={{ fontSize: 10.5, fontWeight: 500, color: 'var(--error-dark)' }}>
+                  blocked · 策略拦截未导入（{importDetail.blocked.length}）
+                </div>
+                <div className="mcp-import-path">{importDetail.blocked.join('、')}</div>
+              </div>
+            )}
+            {importDetail.suppressed.length > 0 && (
+              <div>
+                <div style={{ fontSize: 10.5, fontWeight: 500, color: 'var(--ink-muted)' }}>
+                  suppressed · scope 去重已跳过（{importDetail.suppressed.length}）
+                </div>
+                <div className="mcp-import-path">{importDetail.suppressed.join('、')}</div>
+              </div>
+            )}
+          </div>
+        )}
+
+        {list.length === 0 && !loading && !error && !formOpen && (
+          <div className="cli-empty">暂无已配置的服务器 · 点右上角「添加服务器」</div>
+        )}
+
+        <div className="cli-list" style={{ marginTop: list.length > 0 || formOpen ? 8 : 0 }}>
+          {/* 添加新服务器：点右上角按钮才展开 */}
+          {formOpen && !editing && (
+            <div className="cli-card mcp-add-card-cli is-open">
+              <div className="cli-config">
+                <div className="cli-config-head">
+                  <span className="cli-config-name">添加新服务器</span>
+                </div>
+                <div className="mcp-form-wrap">{renderForm()}</div>
+              </div>
+            </div>
+          )}
+
+          {list.map((m) => {
+            const type = m.type ?? 'stdio'
+            const remote = type !== 'stdio'
+            const approval = APPROVAL_LABEL[m.approvalStatus ?? 'approved'] ?? APPROVAL_LABEL.approved
+            // [V295] 运行时状态优先（后端现算，不落库）；老后端无 runtimeStatus → 回落三态映射
+            const conn = m.runtimeStatus ? RUNTIME_LABEL[m.runtimeStatus] : (CONN_STATE[m.status] ?? CONN_STATE.stopped)
+            const isConnected = m.runtimeStatus
+              ? m.runtimeStatus === 'connected'
+              : m.status === 'running'
+            const desc = remote
+              ? `URL: ${m.url ?? m.command}`
+              : `Command: ${m.command}${m.args && m.args.length > 0 ? ' ' + m.args.join(' ') : ''}`
+            const display = m.userFacingName ?? m.name
+            const scopeText = m.scope ?? (remote ? 'remote' : 'local')
+            const isOpen = openId === m.id
+            const editingThis = editing?.id === m.id
+            const approvalNote = m.approvalStatus === 'pending'
+              ? '待审批 · '
+              : m.approvalStatus === 'rejected' ? '已拒绝 · ' : ''
+            return (
+              <div
+                key={m.id}
+                className={`cli-card mcp-card${isOpen ? ' is-open' : ''}${m.enabled ? '' : ' is-off'}`}
+              >
+                <div
+                  role="button"
+                  tabIndex={0}
+                  className="cli-card-hit"
+                  aria-expanded={isOpen}
+                  onClick={() => setOpenId(isOpen ? null : m.id)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      setOpenId(isOpen ? null : m.id)
+                    }
+                  }}
+                >
+                  <span className="mcp-card-icon" aria-hidden="true">
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
+                         strokeLinecap="round" strokeLinejoin="round">
+                      <rect x="3.5" y="4.5" width="17" height="6" rx="2" />
+                      <rect x="3.5" y="13.5" width="17" height="6" rx="2" />
+                      <path d="M7 7.5h.01M7 16.5h.01" />
+                    </svg>
+                  </span>
+                  <span className="cli-card-body">
+                    <span className="cli-card-name">
+                      <span className="cli-card-title">{display}</span>
+                      <span className="cli-card-divider" aria-hidden="true">·</span>
+                      <span className="cli-card-tagline">{type} · {scopeText}</span>
+                      {isConnected && <span className="cli-dot" title="已连接" aria-hidden="true" />}
+                    </span>
+                    <span className="cli-card-meta">
+                      {approvalNote}{m.enabled && m.autoStart ? '自启 · ' : ''}{conn.label} · {desc}
+                    </span>
+                  </span>
+                  <svg
+                    className="cli-card-chevron"
+                    viewBox="0 0 12 12"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.6"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden="true"
+                  >
+                    <path d="M3 4.5L6 7.5L9 4.5" />
+                  </svg>
+                </div>
+
+                {/* 启用开关放在点击区外：它是独立动作，嵌在整行点击区里容易误触 */}
+                <div className="mcp-card-tail">
+                  <span className="mcp-switch-label">启用</span>
+                  <label className="settings-switch" title={m.enabled ? '停用' : '启用'}>
+                    <input
+                      type="checkbox"
+                      checked={m.enabled}
+                      onChange={() => onToggle(m)}
+                      disabled={pending}
+                    />
+                    <span></span>
+                  </label>
+                </div>
+
+                {isOpen && (
+                  <div className="cli-config">
+                    {editingThis ? (
                       <>
-                        {' · '}
-                        <a href={info.installUrl} target="_blank" rel="noreferrer">下载页</a>
+                        <div className="cli-config-head">
+                          <span className="cli-config-name">编辑服务器</span>
+                        </div>
+                        <div className="mcp-form-wrap">{renderForm()}</div>
+                      </>
+                    ) : (
+                      <>
+                        <div className="cli-config-head">
+                          <span className="mcp-detail-badges">
+                            {m.approvalStatus && m.approvalStatus !== 'approved' && (
+                              <span className={`mcp-badge approval ${approval.cls}`}>{approval.label}</span>
+                            )}
+                            <span
+                              className={`mcp-badge conn ${conn.cls}`}
+                              title={m.runtimeStatus
+                                ? '运行时连接状态（后端现算，不落库）'
+                                : '连接状态（后端未返回 runtimeStatus，按三态映射）'}
+                            >
+                              <span className="mcp-badge-dot" />
+                              {conn.label}
+                            </span>
+                          </span>
+                          <div className="mcp-card-actions">
+                            {isConnected ? (
+                              <button className="cli-card-action" onClick={() => onStop(m)} disabled={pending}>
+                                停止
+                              </button>
+                            ) : (
+                              <button
+                                className="cli-card-action"
+                                onClick={() => onStart(m)}
+                                disabled={pending || m.status === 'pending'}
+                                title={m.status === 'pending' ? '待审批，需先通过后才能启动' : '启动'}
+                              >
+                                启动
+                              </button>
+                            )}
+                            <button className="cli-card-action" onClick={() => onTest(m)} disabled={pending}>
+                              测试
+                            </button>
+                          </div>
+                        </div>
+                        <div className="mcp-detail">
+                          {m.lastError && <div className="mcp-detail-error">✗ {m.lastError}</div>}
+                          <div className="mcp-detail-cmd">{desc}</div>
+                          <div className="mcp-detail-row">
+                            <div>
+                              <div className="mcp-detail-label">启动时自动连接</div>
+                              <div className="mcp-detail-desc">
+                                开启后，应用启动时会自动连上这个服务；关闭则每次手动启动。
+                                {!m.enabled && '（先启用该服务器）'}
+                              </div>
+                            </div>
+                            <label
+                              className="settings-switch"
+                              title={m.enabled ? '启动时自动连接此服务（全局总闸关闭时仍不会连）' : '先启用该服务器才能设置启动自启'}
+                            >
+                              <input
+                                type="checkbox"
+                                checked={!!m.autoStart && m.enabled}
+                                onChange={() => onToggleAutoStart(m)}
+                                disabled={pending || !m.enabled}
+                              />
+                              <span></span>
+                            </label>
+                          </div>
+                          <div className="mcp-detail-foot">
+                            <button className="cli-card-action" onClick={() => startEdit(m)} disabled={pending}>
+                              编辑
+                            </button>
+                            <span className="spacer" />
+                            <button className="mcp-text-btn danger" onClick={() => onRemove(m)} disabled={pending}>
+                              删除
+                            </button>
+                          </div>
+                        </div>
                       </>
                     )}
                   </div>
-                )
-              })}
-            </div>
-          </div>
-          <button className="mcp-add-btn ghost" onClick={refreshRuntime}>重新检测</button>
+                )}
+              </div>
+            )
+          })}
         </div>
-      )}
-
-      {/* ── 已配置的服务器 列表 ── */}
-      <div className="settings-row" style={{ borderBottom: 'none', paddingBottom: 4, marginTop: 6 }}>
-        <div>
-          <div className="settings-row-label">已配置的服务器</div>
-          <div className="settings-row-desc">
-            共 {list.length} 个 · 每行可启停 / 测试 / 编辑 / 删除
-          </div>
-        </div>
-      </div>
-
-      {importDetail && (importDetail.blocked.length > 0 || importDetail.suppressed.length > 0) && (
-        <div className="fm-model-empty" style={{ padding: '12px 14px', textAlign: 'left' }}>
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 6 }}>
-            <span style={{ fontSize: 11, fontWeight: 600, color: 'var(--ink)' }}>导入明细</span>
-            {/* 「关闭明细」是中性动作，不是破坏性操作 ⇒ 用普通 icon-btn + 关闭图标，
-                不复用 .skill-remove（那是删除语义 · hover 红色警示）。 */}
-            <button className="icon-btn" onClick={() => setImportDetail(null)} title="关闭">
-              <Icon.CloseLg />
-            </button>
-          </div>
-          {importDetail.blocked.length > 0 && (
-            <div style={{ marginBottom: importDetail.suppressed.length > 0 ? 8 : 0 }}>
-              <div style={{ fontSize: 10.5, fontWeight: 500, color: 'var(--error-dark)' }}>
-                blocked · 策略拦截未导入（{importDetail.blocked.length}）
-              </div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-subtle)', marginTop: 3, wordBreak: 'break-all', lineHeight: 1.5 }}>
-                {importDetail.blocked.join('、')}
-              </div>
-            </div>
-          )}
-          {importDetail.suppressed.length > 0 && (
-            <div>
-              <div style={{ fontSize: 10.5, fontWeight: 500, color: 'var(--ink-muted)' }}>
-                suppressed · scope 去重已跳过（{importDetail.suppressed.length}）
-              </div>
-              <div style={{ fontFamily: 'var(--font-mono)', fontSize: 10.5, color: 'var(--ink-subtle)', marginTop: 3, wordBreak: 'break-all', lineHeight: 1.5 }}>
-                {importDetail.suppressed.join('、')}
-              </div>
-            </div>
-          )}
-        </div>
-      )}
-
-      {list.length === 0 && !loading && !error && (
-        <div className="fm-model-empty" style={{ padding: '28px 12px', textAlign: 'center' }}>
-          暂无已配置的服务器 · 在上方表单添加
-        </div>
-      )}
-
-      {list.map((m) => {
-        const type = m.type ?? 'stdio'
-        const remote = type !== 'stdio'
-        const approval = APPROVAL_LABEL[m.approvalStatus ?? 'approved'] ?? APPROVAL_LABEL.approved
-        const status = STATUS_LABEL[m.status]
-        // [V295] 运行时状态优先（后端现算，不落库）；老后端无 runtimeStatus → 回落三态映射
-        const conn = m.runtimeStatus ? RUNTIME_LABEL[m.runtimeStatus] : CONN_STATE[m.status]
-        const isConnected = m.runtimeStatus
-          ? m.runtimeStatus === 'connected'
-          : m.status === 'running'
-        const desc = remote
-          ? `URL: ${m.url ?? m.command}`
-          : `Command: ${m.command}${m.args && m.args.length > 0 ? ' ' + m.args.join(' ') : ''}`
-        const display = m.userFacingName ?? m.name
-        return (
-          <div key={m.id} className={`mcp-row ${m.enabled ? '' : 'disabled'}`}>
-            <div className="mcp-info">
-              <div className="mcp-name">
-                <span>{display}</span>
-                <span className={`mcp-badge transport ${remote ? 'remote' : 'stdio'}`}>{type}</span>
-              </div>
-              <div className="mcp-badges">
-                <span className={`mcp-badge scope ${remote ? 'remote' : 'local'}`}>{remote ? 'Remote' : 'Local'}</span>
-                <span className={`mcp-badge approval ${approval.cls}`}>{approval.label}</span>
-                <span className={`mcp-badge status ${status.cls}`}>{status.label}</span>
-                <span
-                  className={`mcp-badge conn ${conn.cls}`}
-                  title={m.runtimeStatus
-                    ? '运行时连接状态（后端现算，不落库）'
-                    : '连接状态（后端未返回 runtimeStatus，按三态映射）'}
-                >
-                  <span className="mcp-badge-dot" />
-                  {conn.label}
-                </span>
-              </div>
-              <div className="mcp-cmd">{desc}</div>
-              {m.lastError && (
-                <div className="mcp-env" style={{ color: 'var(--error)' }}>✗ {m.lastError}</div>
-              )}
-            </div>
-            <div className="mcp-meta" style={{ flexWrap: 'wrap', justifyContent: 'flex-end' }}>
-              <span className="mcp-switch-label">启用</span>
-              <label className="settings-switch" title={m.enabled ? '停用' : '启用'}>
-                <input type="checkbox" checked={m.enabled} onChange={() => onToggle(m)} disabled={pending} />
-                <span></span>
-              </label>
-              {/* [V295] 启动自启：本仓扩展（CC 无此字段）。开关已移入「编辑服务器」表单卡，行内只留纯文字标记，
-                  避免两个外观相同、无文字的开关并排被看成重复开关 */}
-              {m.enabled && m.autoStart && (
-                <span className="mcp-auto-mark" title="启动时自动连接（在「编辑」里修改）">自启</span>
-              )}
-              {isConnected ? (
-                <button className="mcp-text-btn" onClick={() => onStop(m)} disabled={pending}>
-                  停止
-                </button>
-              ) : (
-                <button
-                  className="mcp-text-btn"
-                  onClick={() => onStart(m)}
-                  disabled={pending || m.status === 'pending'}
-                  title={m.status === 'pending' ? '待审批，需先通过后才能启动' : '启动'}
-                >
-                  启动
-                </button>
-              )}
-              <button className="mcp-text-btn" onClick={() => onTest(m)} disabled={pending}>
-                测试
-              </button>
-              <button className="mcp-text-btn" disabled title="去授权（FM-4 预留，后端未定案）">
-                去授权
-              </button>
-              <button className="mcp-text-btn" onClick={() => startEdit(m)} disabled={pending}>
-                编辑
-              </button>
-              <button className="mcp-text-btn danger" onClick={() => onRemove(m)} disabled={pending}>
-                删除
-              </button>
-            </div>
-          </div>
-        )
-      })}
+      </section>
 
       {/* ── 导入 .mcp.json 弹窗 ── */}
       {importing && (

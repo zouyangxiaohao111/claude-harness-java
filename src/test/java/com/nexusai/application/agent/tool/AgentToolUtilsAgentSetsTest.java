@@ -28,7 +28,7 @@ class AgentToolUtilsAgentSetsTest {
         Assertions.assertThat(ToolNameConstants.buildAllAgentDisallowed(false, false))
             .as("WORKFLOW_SCRIPTS 关 → Workflow 不在 ALL_AGENT_DISALLOWED")
             .doesNotContain(ToolNameConstants.WORKFLOW_TOOL_NAME)
-            .contains(ToolNameConstants.TASK_OUTPUT_TOOL_NAME)
+            .doesNotContain("TaskOutput")   // claude.exe 2.1.328 已从集合移除
             .contains(AgentToolConstants.AGENT_TOOL_NAME);
     }
 

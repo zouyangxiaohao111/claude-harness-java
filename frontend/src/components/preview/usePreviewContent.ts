@@ -105,9 +105,15 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
     }
 
     const isByteKind = payload.type === 'docx' || payload.type === 'xlsx'
+    /** markdown：取文本（与字节同源，仅解码不同） */
+    const readText = async (): Promise<string> => new TextDecoder('utf-8').decode(await readBytes())
     setLoading(true)
     ;(async () => {
       try {
+        if (payload.type === 'markdown') {
+          setCode(await readText())
+          return
+        }
         if (item) {
           if (isByteKind) {
             setBytes(await readBytes())

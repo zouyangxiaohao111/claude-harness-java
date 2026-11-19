@@ -39,7 +39,7 @@ import java.util.regex.Pattern;
  *   <li>{@link ReadPermissionChecker}/{@link WritePermissionChecker} 的可疑 Windows 模式检查
  *       （步骤 2 / 1.7 检查①）委派 {@link #hasSuspiciousWindowsPathPattern}（OPD-WF5-02-01 补齐 7 类）；</li>
  *   <li>内部路径白名单（OPD-WF5-02-02 补齐 17 分支）委派 {@link #checkEditableInternalPath} /
- *       {@link #checkReadableInternalPath}；plan 写分支按 OD-20 约束 passthrough（写盘仍走 ask）；</li>
+ *       {@link #checkReadableInternalPath}；plan 写分支按 CC auto-allow（当前会话计划文件）；</li>
  *   <li>工作目录判定（OPD-WF5-02-03 大小写归一 + macOS /private 归一）委派
  *       {@link #pathInWorkingPath}。</li>
  * </ul>
@@ -599,14 +599,16 @@ public final class PathValidation {
         }
 
         // ── plan 文件（CC :1488-1497）──
-        // OD-20 子项4：plan 写盘走 ask 而非 CC auto-allow（UX 偏差已登记），故 passthrough。
-        // 读分支（checkReadableInternalPath）仍按 CC auto-allow。
+        // [plan-approval] 对齐 CC auto-allow：计划文件是模型在 plan 模式下的唯一可写文件，
+        //   若写它仍走 ask，模型会被弹窗卡住、审批卡先出现的是 Write 而不是 ExitPlanMode。
+        //   读分支（checkReadableInternalPath）同一路径同样 auto-allow。
+        //   命中即 return Allow ⇒ 不再落入 1.7（.{appName} 敏感目录）safety Ask。
         if (isSessionPlanFile(normalized, env)) {
             if (log.isDebugEnabled()) {
-                log.debug("[PathValidation] checkEditableInternalPath: plan 文件命中但按 OD-20 passthrough（写盘走 ask）: {}",
+                log.debug("[PathValidation] checkEditableInternalPath: plan 文件命中 → allow（CC :1488-1497）: {}",
                     absolutePath);
             }
-            return InternalPathResult.passthrough();
+            return InternalPathResult.allow("Plan files for current session are allowed for writing");
         }
 
         // ── scratchpad 目录（CC :1500-1509，isScratchpadEnabled 门）──

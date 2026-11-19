@@ -4,9 +4,16 @@ import com.nexusai.application.agent.permission.PermissionConfigProvider;
 import com.nexusai.application.session.SessionForkService;
 import com.nexusai.model.session.dto.ForkSessionRequest;
 import com.nexusai.model.session.dto.ForkSessionResponse;
+import com.nexusai.model.session.dto.PlanExitRequest;
+import com.nexusai.model.session.dto.PlanExitResponse;
 import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
+import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.permission.PermissionUpdate;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
+import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.domain.stats.StatsService;
 import jakarta.validation.Valid;
@@ -23,6 +30,10 @@ public class SessionController {
 
     @Autowired private SessionService sessionService;
     @Autowired private SessionForkService sessionForkService;
+
+    /** [plan-approval] 会话权限列写入（V75 SESSION setMode）。非 Spring 单测为 null。 */
+    @Autowired(required = false)
+    private SessionMapper sessionMapper;
 
     /**
      * [usage-gateway] 会话级用量聚合（{@code GET /{id}/usage}）· 用量明细的 owner 是 stats 域
@@ -123,6 +134,74 @@ public class SessionController {
     public ForkSessionResponse fork(@PathVariable String id,
                                     @Valid @RequestBody ForkSessionRequest req) {
         return sessionForkService.fork(id, req.throughMessageId());
+    }
+
+    /**
+     * [plan-approval] 计划审批「退出并执行」· 对齐 CC ExitPlanMode 审批后的两条写入：
+     * 恢复会话权限模式；若 clearContext=true 则另建会话在干净上下文里执行。
+     *
+     * <p>为什么需要端点而不是前端两次调用：{@code session_permission_rules}(V75) 的
+     * SESSION setMode 在 per-turn 合并中优先于 {@code permission_mode} 列，前端 PATCH 列
+     * 清不掉它 —— 不在这里改，原会话下一条消息会再次进入 plan。
+     *
+     * <p>本端点<b>不发送消息、不调用模型</b>：新会话创建后由前端沿用既有发送链路发出
+     * 「Implement the following plan」。
+     *
+     * @param id  正在退出 plan 的会话
+     * @param req 计划正文 + 执行方式 + 是否清空上下文
+     * @return 继续执行的目标会话
+     */
+    @PostMapping("/{id}/plan/exit")
+    public PlanExitResponse exitPlan(@PathVariable String id,
+                                     @RequestBody PlanExitRequest req) {
+        if (req == null || req.mode() == null || req.mode().isBlank()) {
+            throw new ValidationException("mode is required");
+        }
+        // 显式校验原串：PermissionMode.fromString 对未知串折叠成 DEFAULT（会静默放行错值）
+        if (!java.util.Set.of("acceptEdits", "default", "bypassPermissions", "dontAsk", "auto")
+                .contains(req.mode())) {
+            throw new ValidationException("mode must be one of: acceptEdits, default, bypassPermissions, dontAsk, auto");
+        }
+        PermissionMode mode = PermissionMode.fromString(req.mode());
+        // 源会话：恢复执行模式（V75 SESSION setMode）
+        persistPlanExitMode(id, mode);
+
+        if (!Boolean.TRUE.equals(req.clearContext())) {
+            return new PlanExitResponse(id, false);
+        }
+        SessionDto src = sessionService.getById(id);
+        if (src == null || src.mainProjectId() == null || src.mainProjectId().isBlank()) {
+            throw new ValidationException("session has no bound project");
+        }
+        SessionDto created = sessionService.create(new SessionCreateRequest(
+            planTitle(req.plan(), src.title()), src.model(), src.modelName(),
+            src.mainProjectId(), null));
+        // 新会话同样以执行模式启动，避免沿用全局 settings 的 plan
+        persistPlanExitMode(created.id(), mode);
+        return new PlanExitResponse(created.id(), true);
+    }
+
+    /** 写目标会话的 SESSION setMode；mapper 缺失时显式告警（不静默假装成功）。 */
+    private void persistPlanExitMode(String sessionId, PermissionMode mode) {
+        if (sessionMapper == null) {
+            throw new ValidationException("session permission store unavailable");
+        }
+        SessionPermissionOverlay.persistSessionUpdates(sessionMapper, sessionId,
+            List.of(new PermissionUpdate.SetMode(PermissionUpdate.Destination.SESSION, mode)),
+            "plan_exit");
+    }
+
+    /** 新会话标题：计划第一个非空行（去 Markdown 标记），截断 40 字符；无计划用「计划执行」。 */
+    private static String planTitle(String plan, String fallback) {
+        if (plan != null) {
+            for (String line : plan.split("\\R")) {
+                String cleaned = line.replaceAll("^[#>*\\-\\s]+", "").trim();
+                if (!cleaned.isEmpty()) {
+                    return cleaned.length() <= 40 ? cleaned : cleaned.substring(0, 40);
+                }
+            }
+        }
+        return fallback != null && !fallback.isBlank() ? fallback + " · 执行计划" : "计划执行";
     }
 
     /**

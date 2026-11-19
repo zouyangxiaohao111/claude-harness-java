@@ -24,14 +24,12 @@ import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.when;
 
 /**
- * [IMP-G3] TaskOutputTool 对齐 CC TaskOutputTool.tsx（组 6-3）。
+ * [IMP-G3] TaskOutputTool 历史实现测试（工具已于 claude.exe 2.1.328 移除）。
  *
- * <p>WHY（规则九，验证意图）：CC TaskOutputTool.tsx:150 aliases ['AgentOutputTool','BashOutputTool']
- * 反查 --resume 断链（EV-G2-021）；isEnabled 恒启用 vs isTodoV2Enabled 门控（△-2）；输出契约
- * 嵌套 {retrieval_status, task} + XML mapper（EV-G2-025 输出契约漂移 HIGH）。本测试验证：
- * aliases/isEnabled/inputSchema 删 synchronous|wait/outputSchema 嵌套/execute 嵌套输出。
+ * <p>保留原因：类仍在仓内（仅去掉 Spring 注册），execute/schema/mapper 的既有行为仍需回归。
+ * aliases 断言随 2.1.328 的 removed-tools 语义改为空；isEnabled/嵌套输出契约测试保留。
  */
-@DisplayName("[IMP-G3] TaskOutputTool 对齐 CC（aliases + 恒启用 + 嵌套输出契约）")
+@DisplayName("[IMP-G3] TaskOutputTool 历史实现（aliases 空 + 恒启用 + 嵌套输出契约）")
 class TaskOutputToolTest {
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
@@ -49,12 +47,11 @@ class TaskOutputToolTest {
     }
 
     @Test
-    @DisplayName("aliases 包含 AgentOutputTool/BashOutputTool（CC TaskOutputTool.tsx:150，--resume 反查）")
-    void aliases_containsCcBackCompatNames() {
-        // WHY: EV-G2-021 —— CC aliases ['AgentOutputTool','BashOutputTool'] 供历史 transcript 反查；
-        // Java 未 override aliases → ToolRegistry findToolByName 断链（Tool.java:756）。
-        assertThat(newTool().aliases())
-            .containsExactly("AgentOutputTool", "BashOutputTool");
+    @DisplayName("aliases 为空（claude.exe 2.1.328 已将 TaskOutput/AgentOutputTool/BashOutputTool 一并移除）")
+    void aliases_empty_afterRemoval() {
+        // WHY: 2.1.328 extracted set nXe 含 TaskOutput/AgentOutputTool/BashOutputTool，
+        // 旧名按 expected-absent 处理，不再反查到任何工具。
+        assertThat(newTool().aliases()).isEmpty();
     }
 
     @Test

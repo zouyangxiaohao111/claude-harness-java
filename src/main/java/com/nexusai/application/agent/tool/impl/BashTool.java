@@ -555,10 +555,10 @@ public class BashTool implements Tool {
                         sleepPattern);
                 }
                 return ValidationResult.fail("10",
-                    "Blocked: " + sleepPattern + ". Run blocking commands in the background with "
-                        + "run_in_background: true — you'll get a completion notification when done. "
-                        + "For streaming events (watching logs, polling APIs), use the Monitor tool. "
-                        + "If you genuinely need a delay (rate limiting, deliberate pacing), keep it under 2 seconds.");
+                    "Blocked: " + sleepPattern + ". To wait for a condition, use Monitor with an "
+                        + "until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command "
+                        + "you started, use run_in_background: true. Do not chain shorter sleeps to "
+                        + "work around this block.");
             }
         }
         return ValidationResult.pass();
@@ -2805,9 +2805,15 @@ public class BashTool implements Tool {
         backgroundTaskRunner.spawn(task, command, createSessionId);
 
         log.info("BashTool: background task {} spawned, output={}, createSessionId={}, agentId={}", taskId, outputFile, createSessionId, taskAgentId);
+        // 结果文案 · 对齐 CC v2.1.325 Bash 后台结果（off≈317,520,236 的 kt 分支）：
+        // 完成会自动送达通知；禁止轮询输出文件，需要结果时才用一条前台阻塞命令等它出现。
         return ToolResult.success(toolUseId,
             "Background task started: " + taskId
-            + "\nUse TaskOutput to read the result from: " + outputFile);
+            + "\nOutput is written to: " + outputFile
+            + "\nYou will be notified when it exits — do not poll its output file while waiting. "
+            + "If you need that result before you reply and nothing else is left to do, wait with one "
+            + "foreground shell command that blocks until the output file shows what you need; "
+            + "otherwise continue with other work.");
     }
 
     private static String abbreviate(String s, int max) {

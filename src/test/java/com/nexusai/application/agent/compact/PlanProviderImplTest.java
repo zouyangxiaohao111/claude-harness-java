@@ -30,9 +30,8 @@ class PlanProviderImplTest {
     void getPlanReturnsFullContentWhenFileExists(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         String content = "# My Plan\n\n- step 1\n- step 2\n";
-        Files.writeString(tmp.resolve(sessionId + ".md"), content, StandardCharsets.UTF_8);
-
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
+        Files.writeString(Path.of(provider.getPlanFilePath(null)), content, StandardCharsets.UTF_8);
 
         assertThat(provider.getPlan(null)).isEqualTo(content);
     }
@@ -77,21 +76,24 @@ class PlanProviderImplTest {
         // 正向对照：真实会话 ⇒ 路径含真实 slug 且可读回
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         PlanProvider withSession = new PlanProviderImpl(sessionId, tmp.toString());
+        // [对齐 CC plans.ts] slug = 随机词对，不再是 sessionId
         assertThat(withSession.getPlanFilePath(null))
-            .isEqualTo(tmp.resolve(sessionId + ".md").toString());
+            .startsWith(tmp.toString())
+            .endsWith(".md")
+            .doesNotContain(sessionId);
     }
 
     @Test
-    @DisplayName("getPlanFilePath: 主会话 null agentId → {sessionId}.md；子代理 → {sessionId}-agent-{agentId}.md")
+    @DisplayName("getPlanFilePath: 主会话 → {slug}.md；子代理 → {slug}-agent-{agentId}.md（CC plans.ts:119-129）")
     void getPlanFilePathMainVsSubagent(@TempDir Path tmp) {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         UUID agentId = UUID.randomUUID();
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
 
-        assertThat(provider.getPlanFilePath(null))
-            .isEqualTo(tmp.resolve(sessionId + ".md").toString());
+        String main = provider.getPlanFilePath(null);
+        assertThat(main).startsWith(tmp.toString()).endsWith(".md");
         assertThat(provider.getPlanFilePath(agentId))
-            .isEqualTo(tmp.resolve(sessionId + "-agent-" + agentId + ".md").toString());
+            .isEqualTo(main.replace(".md", "-agent-" + agentId + ".md"));
     }
 
     @Test
@@ -107,13 +109,13 @@ class PlanProviderImplTest {
     void createPlanAttachmentIfNeededReturnsPlanRefWithPathAndContent(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         String content = "plan full text";
-        Files.writeString(tmp.resolve(sessionId + ".md"), content, StandardCharsets.UTF_8);
-
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
+        Files.writeString(Path.of(provider.getPlanFilePath(null)), content, StandardCharsets.UTF_8);
+
         AttachmentMessageDto.PlanRef ref = provider.createPlanAttachmentIfNeeded(null);
 
         assertThat(ref).isNotNull();
-        assertThat(ref.planFilePath()).isEqualTo(tmp.resolve(sessionId + ".md").toString());
+        assertThat(ref.planFilePath()).isEqualTo(provider.getPlanFilePath(null));
         assertThat(ref.planContent()).isEqualTo(content);
     }
 
@@ -122,10 +124,9 @@ class PlanProviderImplTest {
     void getPlanReadsSubagentFile(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         UUID agentId = UUID.randomUUID();
-        Files.writeString(tmp.resolve(sessionId + "-agent-" + agentId + ".md"),
-            "sub plan", StandardCharsets.UTF_8);
-
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
+        Files.writeString(Path.of(provider.getPlanFilePath(agentId)),
+            "sub plan", StandardCharsets.UTF_8);
 
         assertThat(provider.getPlan(agentId)).isEqualTo("sub plan");
         assertThat(provider.getPlan(null)).as("主会话文件不存在 → null").isNull();

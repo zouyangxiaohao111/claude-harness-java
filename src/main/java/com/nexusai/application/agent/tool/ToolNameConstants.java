@@ -205,7 +205,6 @@ public final class ToolNameConstants {
     public static final String TASK_CREATE_TOOL_NAME = "TaskCreate";
     public static final String TASK_GET_TOOL_NAME = "TaskGet";
     public static final String TASK_LIST_TOOL_NAME = "TaskList";
-    public static final String TASK_OUTPUT_TOOL_NAME = "TaskOutput";
     public static final String TASK_UPDATE_TOOL_NAME = "TaskUpdate";
     public static final String TASK_STOP_TOOL_NAME = "TaskStop";
 
@@ -295,10 +294,9 @@ public final class ToolNameConstants {
      * [B6] ALL_AGENT_DISALLOWED_TOOLS · 单一权威 · 对齐 CC
      * {@code Open-ClaudeCode/src/constants/tools.ts:36-46}（DEL-WFB-03 双定义合并）。
      *
-     * <p>CC 真源（B6 实读 tools.ts:36-46，非抄报告）：
+     * <p>CC 真源（B6 实读 tools.ts:36-46，非抄报告；claude.exe 2.1.328 已移除 TaskOutput 条目）：
      * <pre>
      * export const ALL_AGENT_DISALLOWED_TOOLS = new Set([
-     *   TASK_OUTPUT_TOOL_NAME,
      *   EXIT_PLAN_MODE_V2_TOOL_NAME,
      *   ENTER_PLAN_MODE_TOOL_NAME,
      *   ...(process.env.USER_TYPE === 'ant' ? [] : [AGENT_TOOL_NAME]),
@@ -338,7 +336,6 @@ public final class ToolNameConstants {
      */
     public static Set<String> buildAllAgentDisallowed(boolean isAntUser, boolean isWorkflowScripts) {
         LinkedHashSet<String> set = new LinkedHashSet<>();
-        set.add(TASK_OUTPUT_TOOL_NAME);            // TaskOutput — 防递归
         set.add(EXIT_PLAN_MODE_TOOL_NAME);         // ExitPlanMode — 主线程抽象
         set.add(ENTER_PLAN_MODE_TOOL_NAME);        // EnterPlanMode — 主线程抽象
         if (!isAntUser) {

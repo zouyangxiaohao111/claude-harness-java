@@ -154,7 +154,8 @@ public class PermissionController {
         prompter.onResponse(event.getRequestId(), event.getDecision(),
             event.getUpdatedPermissions(),
             event.getAcceptFeedback(), event.getContentBlocks(),
-            event.getAnswers(), event.getAnnotations());
+            event.getAnswers(), event.getAnnotations(),
+            event.getUpdatedInput());
     }
 
     /**

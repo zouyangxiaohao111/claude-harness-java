@@ -467,12 +467,15 @@ public record PathValidationEnv(
         return AutoMemPaths.sanitizePath(Path.of(projectRoot).toString());
     }
 
-    /** CC getPlansDirectory() + getPlanSlug()（plans.ts:79-111；Java PlanProviderImpl sessionId-as-slug）。 */
+    /** CC getPlansDirectory() + getPlanSlug()（plans.ts:79-111）· 词对 slug 与 PlanProviderImpl 同源。 */
     public String plansPrefix() {
-        if (sessionId == null) {
-            return null;
+        if (sessionId == null || sessionId.isBlank()) {
+            return null; // 无会话 → 不派生（slugFor 对空白 sessionId 抛 IAE，避免每轮权限检查炸）
         }
-        return Path.of(nexusaiConfigHomeDir, "plans", sessionId).normalize().toString();
+        // 与 PlanProviderImpl 同源：白名单前缀 = {plansDir}/{planSlug}（CC plans.ts:245-255）
+        String plansDir = Path.of(nexusaiConfigHomeDir, "plans").normalize().toString();
+        return Path.of(plansDir, com.nexusai.infra.util.PlanPaths.slugFor(plansDir, sessionId))
+            .normalize().toString();
     }
 
     /** CC getToolResultsDir()（toolResultStorage.ts:97-105）· Java 真实介质 = nexusaiConfigHome/projects/{slug}/sessionId/tool-results（S2 迁移）。 */

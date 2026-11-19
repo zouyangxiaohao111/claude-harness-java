@@ -353,7 +353,8 @@ public class SpawnInProcess {
                     }
                     abortController.abort();
                 },
-                new ArrayList<>() // onIdleCallbacks
+                new ArrayList<>(), // onIdleCallbacks
+                List.of() // recentActivities（活动摘要初始为空，运行时逐条采集）
             );
 
             // 创建 + 接线 AutonomousAgentLoop（生产调用方，R1 阻断项）

@@ -259,6 +259,12 @@ export function formatSuggestionLabel(
   toolName: string,
   projectLabel?: string | null,
   selfDirName?: string | null,
+  /**
+   * 当前会话权限模式。仅用于「提示后果」：plan 模式下接受 setMode:acceptEdits
+   * 会退出计划模式（CC filesystem.ts:1449-1456 有意在 plan 下也给该建议），
+   * 必须在文案里说清楚，否则用户不知道点了会切走模式。
+   */
+  currentMode?: string | null,
 ): string {
   // ⭐ 作用域短语单点：项目级带项目标识 / 用户级明说「所有项目」/ 会话级「本次会话内」。
   //   判据 = 后端 PermissionUpdatePersister.java:112-114（cliArg / session 都不落盘）。
@@ -275,7 +281,8 @@ export function formatSuggestionLabel(
     case 'setMode':
       // acceptEdits = 「接受所有编辑」（文件类工具的主模式建议）
       if (update.mode === 'acceptEdits') {
-        return `允许，且${scope}接受所有编辑`
+        const exitsPlan = currentMode === 'plan'
+        return `允许，且${scope}接受所有编辑${exitsPlan ? '（会退出计划模式）' : ''}`
       }
       return fallbackLabel(update)
     case 'removeDirectories':
@@ -300,7 +307,12 @@ export function buildSuggestionOptions(
   toolName: string,
   projectLabel?: string | null,
   selfDirName?: string | null,
+  /** 当前会话模式（见 {@link formatSuggestionLabel} 的 currentMode） */
+  currentMode?: string | null,
 ): { label: string; update: PermissionUpdate }[] {
   if (!suggestions || suggestions.length === 0) return []
-  return suggestions.map((update) => ({ label: formatSuggestionLabel(update, toolName, projectLabel, selfDirName), update }))
+  return suggestions.map((update) => ({
+    label: formatSuggestionLabel(update, toolName, projectLabel, selfDirName, currentMode),
+    update,
+  }))
 }

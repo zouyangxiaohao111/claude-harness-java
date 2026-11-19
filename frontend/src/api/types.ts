@@ -529,6 +529,9 @@ export interface AppSettings {
   /** 流空闲超时（毫秒；stream_idle_timeout_ms 列 V78）：超过该时长没有任何输出时自动中断；
    *  留空=默认 300000（5 分钟）；有效下限 300000（低于下限会被抬到 300s）。「通用」页可配。 */
   streamIdleTimeoutMs?: number | null
+  /** [V302] 计划审批卡是否显示「批准并清空上下文执行」（show_clear_context_on_plan_accept 列）·
+   *  null/未设置 = 关闭（只显示保留上下文）。「通用」页可配。 */
+  showClearContextOnPlanAccept?: boolean | null
   // 2026-11-12 删除 maxOutputTokens：V285 DROP 列；输出上限唯一入口 =
   // 模型配置页「生成参数 · max tokens」（models.max_tokens）
   /** 回落模型全名（V28 RENAME fallback_model_name） */
@@ -1372,6 +1375,8 @@ export interface TaskItem {
   description?: string | null
   /** 进行中文案（如「正在执行任务一」） */
   activeForm?: string | null
+  /** 任务所有者 agent 名（对齐 CC Task.owner；TaskUpdate 设 owner 后透出） */
+  owner?: string | null
   status: TodoStatus
   /** 阻塞该任务的任务 id 列表 */
   blocks?: string[]
@@ -1504,6 +1509,9 @@ export interface ChatMessageDto {
   toolCallId: string | null
   assistantMessageId: string | null
   subtype: string | null
+  /** [agent-notice] SendMessage 协作通知行的 UI 摘要（后端 AgentMessage.summary；
+   *  仅 subtype='agent_message' 的行携带，其余缺省）。 */
+  summary?: string | null
   isMeta: boolean
   /** IMP2-14 · compact 摘要 user 消息标记（CC original: isCompactSummary, messages.ts:465/480）：
    *  true = 该 user 消息是 compact 摘要正文（后端 CompactConversation.buildCompactSummaryMessage 产出，
@@ -1601,7 +1609,10 @@ export interface SendMessageRequest {
   attachments?: AttachmentRequest[]
   appendSystemPrompt?: string
   fallbackModel?: string
+  /** [plan-approval] 本消息的初始权限模式（后端 SendMessageRequest.permissionMode → CLI 槽） */
+  permissionMode?: PermissionMode
 }
+
 /** [批 A5] POST /sessions/{id}/queue/pop 响应 · 对齐 CC PopAllEditableResult
  *  （utils/messageQueueManager.ts:415-419 {text, cursorOffset, images}）的 web 等价物。
  *  - text = 全部【可编辑】排队项文本 + 输入框草稿，`\n` join（CC :455-456 逐字）；
@@ -1894,6 +1905,22 @@ export interface PermissionUpdateSetModeWire {
   type: 'setMode'
   mode: PermissionModeCcLiteral
   destination: PermissionUpdateDestination
+}
+
+/** [plan-approval] 计划审批「退出并执行」请求（POST /sessions/{id}/plan/exit） */
+export interface PlanExitRequest {
+  /** 用户批准的计划正文（可含编辑） */
+  plan: string
+  /** 执行方式（CC 串） */
+  mode: PermissionModeCcLiteral
+  /** true = 新建会话在干净上下文执行；false/缺省 = 当前会话继续 */
+  clearContext?: boolean
+}
+
+/** [plan-approval] 计划审批「退出并执行」响应 */
+export interface PlanExitResponse {
+  sessionId: string
+  cleared: boolean
 }
 /** 目录型更新 */
 export interface PermissionUpdateDirectoriesWire {
@@ -2211,6 +2238,8 @@ export interface AgentTranscriptMessage {
   author?: string | null
   /** 注入 subtype（skill_listing / edited_text_file / …）· 用于摘要文案。 */
   subtype?: string | null
+  /** [agent-notice] SendMessage 协作通知行的 UI 摘要（后端 AgentMessage.summary） */
+  summary?: string | null
 }
 
 /**

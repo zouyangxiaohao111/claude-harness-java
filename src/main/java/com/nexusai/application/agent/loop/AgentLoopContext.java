@@ -3208,17 +3208,14 @@ public record AgentLoopContext(
         try {
             Map<String, Object> appState = tuc.getAppState().apply(null);
             PermissionMode mode = readAppStatePlanMode(appState);
-            // [AM-CC-20260825] 对齐 CC attachments.ts:933-934 maybe('plan_mode',...) 首行短路
-            //   （getPlanModeAttachments:595-600 `if (permissionContext.mode !== 'plan') return []`）：
-            //   非 plan 模式直接返回，避免空跑 getOrCreateFlags / getPlanModeExitAttachment 等
-            //   深逻辑 NPE（e.getMessage()=null 的 NPE，2026-08-25 联调实测每 tool 轮 warn）。
-            //   内层 getPlanModeAttachments 虽有同款短路，但 getOrCreateFlags(2424) /
-            //   getPlanModeExitAttachment(2429) 在其外仍执行 —— 本短路是 CC 语义的完整对齐。
-            if (mode != PermissionMode.PLAN) {
-                return messagesForLlm;
-            }
+            // ⛔ 不能在这里按「非 PLAN 直接返回」：CC 的 plan_mode_exit 恰恰只在**退出后**
+            //   （mode !== 'plan'）产出（exe Ajs: `if (Z(o).mode === "plan") return []`）。
+            //   旧实现先早退再调 getPlanModeExitAttachment，后者永远不可达 —— 模型收不到
+            //   「已退出计划模式」的一次性提醒。这里改为：两个生产器都调，内部各自判模式。
             PlanProvider provider = new PlanProviderImpl(state.sessionId());
-            PlanModeAttachments.PlanModeFlags flags = PlanModeAttachments.getOrCreateFlags(appState);
+            // 会话级 flags（生产 appState 是不可变快照，且跨 send 不活）
+            PlanModeAttachments.PlanModeFlags flags =
+                PlanModeAttachments.getOrCreateFlagsBySession(state.sessionId());
 
             List<AttachmentMessageDto> produced = new ArrayList<>();
             // [D10 双视图] 选边 = modelView()（模型面）：plan_mode 附件是**注入给模型的**
@@ -3703,9 +3700,15 @@ public record AgentLoopContext(
      * @param dynamicSkillDirTriggers 共享可变触发 Set（文件工具 .add / 本方法 clear）
      * @param cwd                    展示路径基准（CC getCwd() 等价 · displayPath = relative(cwd, skillDir)）
      */
+    /**
+     * @param skillAllowlist 会话级技能白名单（null = 不过滤；空列表 = 全禁）· 对齐 CC
+     *                       dynamic_skill 生产侧 {@code if(e.agentId===void 0) y=Tve(y,DX())}
+     *                       （仅主线程套用，由调用方判定后传入）
+     */
     public static void collectDynamicSkillAttachments(AgentState state,
                                                       java.util.Set<String> dynamicSkillDirTriggers,
-                                                      Path cwd) {
+                                                      Path cwd,
+                                                      java.util.List<String> skillAllowlist) {
         if (state == null || dynamicSkillDirTriggers == null || dynamicSkillDirTriggers.isEmpty()) {
             return;
         }
@@ -3726,12 +3729,16 @@ public record AgentLoopContext(
                             }
                         }
                     }
-                    if (!skillNames.isEmpty()) {
+                    // [CC 对齐] 白名单只作用在「新发现技能」的名字上（null = 不过滤）。
+                    java.util.List<String> allowedNames =
+                        com.nexusai.application.agent.skill.SessionSkillAllowlistRegistry
+                            .filterNamesByAllowlist(skillNames, skillAllowlist);
+                    if (allowedNames != null && !allowedNames.isEmpty()) {
                         String displayPath = displayPathOf(cwd, skillDir);
-                        state.appendAttachment(AttachmentMessageDto.dynamicSkill(skillDir, skillNames, displayPath));
+                        state.appendAttachment(AttachmentMessageDto.dynamicSkill(skillDir, allowedNames, displayPath));
                         if (log.isInfoEnabled()) {
                             log.info("[P1-2] 动态技能 attachment 装配: dir={} skills={} display={} · CC attachments.ts:2547-2601",
-                                skillDir, skillNames.size(), displayPath);
+                                skillDir, allowedNames.size(), displayPath);
                         }
                     }
                 } catch (Exception e) {
@@ -4202,11 +4209,40 @@ public record AgentLoopContext(
                 //   （planModeV2.ts:5-38，Java 无 Statsig 通道）不实现，登记注释。
                 //   isSubAgent 守卫：CC getPlanModeV2Instructions 对 subAgent 返回 []（:3214-3216）；Java
                 //   plan_mode attachment 仅主线程生产（PermissionMode.PLAN 判定），防御返回 null。
+                String planFilePath = a.plan() != null ? a.plan().planFilePath() : null;
+                // 子代理分支（CC rqi）：子代理不能写计划文件、不能走主会话审批，只要求它把结论
+                // 完整写进最终消息。旧实现 return null 把这条约束整条丢掉了。
                 if (a.isSubAgent()) {
-                    return null;
+                    String subPlanFileInfo = a.planExists() && planFilePath != null
+                        ? "A plan file already exists at " + planFilePath
+                            + ". You can read it and make incremental edits using the Edit tool if you need to."
+                        : planFilePath != null
+                            ? "No plan file exists yet. You should create your plan at " + planFilePath
+                                + " using the Write tool if you need to."
+                            : "No plan file exists yet. Do not write a plan file.";
+                    String subContent = "Plan mode is active. The user indicated that they do not want you to execute yet "
+                        + "-- you MUST NOT make any edits, run any non-readonly tools (including changing configs or "
+                        + "making commits), or otherwise make any changes to the system. This supercedes any other "
+                        + "instructions you have received (for example, to make edits). Instead, you should:\n\n"
+                        + "## Plan File Info:\n" + subPlanFileInfo + "\n"
+                        + "You should build your plan incrementally by writing to or editing this file. NOTE that this "
+                        + "is the only file you are allowed to edit - other than this you are only allowed to take "
+                        + "READ-ONLY actions.\nAnswer the user's query comprehensively, using the AskUserQuestion tool "
+                        + "if you need to ask the user clarifying questions. If you do use AskUserQuestion, make sure "
+                        + "you ask all clarifying questions you need to fully understand the user's intent before proceeding.";
+                    return "<system-reminder>\n" + subContent + "\n</system-reminder>";
+                }
+                // sparse 分支（CC oqi）：完整五阶段只在首轮/状态变化时发，其余轮发一句简短提醒。
+                // 旧实现不看 reminderType，每个 tool 轮都重复整份 workflow（约 4.7K 字符）。
+                if ("sparse".equals(a.reminderType())) {
+                    String sparsePath = planFilePath != null ? planFilePath : "(no plan file)";
+                    String sparseContent = "Plan mode still active (see full instructions earlier in conversation). "
+                        + "Read-only except plan file (" + sparsePath + "). Follow 5-phase workflow. "
+                        + "End turns with AskUserQuestion (for clarifications) or ExitPlanMode (for plan approval). "
+                        + "Never ask about plan approval via text or AskUserQuestion.";
+                    return "<system-reminder>\n" + sparseContent + "\n</system-reminder>";
                 }
                 String planFileInfo;
-                String planFilePath = a.plan() != null ? a.plan().planFilePath() : null;
                 if (a.planExists() && planFilePath != null) {
                     planFileInfo = "A plan file already exists at " + planFilePath
                         + ". You can read it and make incremental edits using the Edit tool.";
@@ -4374,9 +4410,7 @@ public record AgentLoopContext(
                 }
                 if ("running".equals(t.status())) {
                     // CC:3973-3995 — 防重复 spawn (该 attachment 仅压缩后 emit, 原始 spawn 消息已消失)
-                    // [prompt-align CTX-08] 工具名细节：running 分支补 `with ${SEND_MESSAGE_TOOL_NAME}`（'SendMessage'，
-                    //   SendMessageTool/constants.ts:1）；TASK_OUTPUT_TOOL_NAME 全名 'TaskOutput'
-                    //   （TaskOutputTool/constants.ts:1）替代 Java 'task_output tool' 缩写。
+                    // [prompt-align CTX-08] running 分支补 with SendMessage（claude.exe 2.1.328 无文件分支原文）
                     StringBuilder parts = new StringBuilder("Background agent \"" + t.description() + "\" ("
                         + t.taskId() + ") is still running.");
                     if (t.deltaSummary() != null && !t.deltaSummary().isBlank()) {
@@ -4386,7 +4420,7 @@ public record AgentLoopContext(
                         parts.append(" Do NOT spawn a duplicate. You will be notified when it completes. You can read partial output at ")
                             .append(t.outputFilePath()).append(" or send it a message with SendMessage.");
                     } else {
-                        parts.append(" Do NOT spawn a duplicate. You will be notified when it completes. You can check its progress with the TaskOutput tool or send it a message with SendMessage.");
+                        parts.append(" Do NOT spawn a duplicate. You will be notified when it completes. Send it a message with SendMessage if you need a progress report before then.");
                     }
                     return "<system-reminder>\n" + parts + "\n</system-reminder>";
                 }
@@ -4401,8 +4435,8 @@ public record AgentLoopContext(
                 if (t.outputFilePath() != null && !t.outputFilePath().isBlank()) {
                     msg.append(" Read the output file to retrieve the result: ").append(t.outputFilePath());
                 } else {
-                    // [prompt-align CTX-08] completed 无文件分支补 ${TASK_OUTPUT_TOOL_NAME} 全名（'TaskOutput'）
-                    msg.append(" You can check its output using the TaskOutput tool.");
+                    // [prompt-align CTX-08] completed 无文件分支：claude.exe 2.1.328 原文（TaskOutput 已移除）
+                    msg.append(" Send it a message with SendMessage to retrieve its result.");
                 }
                 return "<system-reminder>\n" + msg + "\n</system-reminder>";
             }

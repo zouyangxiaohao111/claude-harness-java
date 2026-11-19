@@ -80,22 +80,22 @@ class ResolveAgentToolsTest {
     }
 
     @Test
-    @DisplayName("wildcard agent: ALL_AGENT_DISALLOWED_TOOLS (Agent/TaskOutput) 被过滤 (CC agentToolUtils.ts:142)")
+    @DisplayName("wildcard agent: ALL_AGENT_DISALLOWED_TOOLS (Agent/ExitPlanMode) 被过滤 (CC agentToolUtils.ts:142)")
     void resolveAgentTools_shouldFilterDisallowedTools_forWildcard() {
-        // WHY: Agent/TaskOutput 是递归/主线程抽象工具 — 漏进子 Agent 池 = 嵌套子 Agent 递归风险.
-        //   CC constants/tools.ts:36-46 ALL_AGENT_DISALLOWED_TOOLS.
+        // WHY: Agent/ExitPlanMode 是递归/主线程抽象工具 — 漏进子 Agent 池 = 嵌套子 Agent 递归风险.
+        //   CC constants/tools.ts:36-46 ALL_AGENT_DISALLOWED_TOOLS（2.1.328 已移除 TaskOutput 条目）.
         ToolRegistry registry = new ToolRegistry();
         registry.register(tool(ToolNameConstants.BASH_TOOL_NAME));
         registry.register(tool(ToolNameConstants.FILE_READ_TOOL_NAME));
         registry.register(tool(AgentToolConstants.AGENT_TOOL_NAME));          // Agent — 必须被过滤
-        registry.register(tool(ToolNameConstants.TASK_OUTPUT_TOOL_NAME));     // TaskOutput — 必须被过滤
+        registry.register(tool(ToolNameConstants.EXIT_PLAN_MODE_TOOL_NAME));  // ExitPlanMode — 必须被过滤
 
         List<Tool> resolved = executorWith(registry).resolveAgentTools(builtInWildcardAgent());
 
         assertThat(resolved).extracting(Tool::name)
-            .as("ALL_AGENT_DISALLOWED_TOOLS 必须剔除 (Agent/TaskOutput), 保留 Bash/Read")
+            .as("ALL_AGENT_DISALLOWED_TOOLS 必须剔除 (Agent/ExitPlanMode), 保留 Bash/Read")
             .containsExactly(ToolNameConstants.BASH_TOOL_NAME, ToolNameConstants.FILE_READ_TOOL_NAME)
-            .doesNotContain(AgentToolConstants.AGENT_TOOL_NAME, ToolNameConstants.TASK_OUTPUT_TOOL_NAME);
+            .doesNotContain(AgentToolConstants.AGENT_TOOL_NAME, ToolNameConstants.EXIT_PLAN_MODE_TOOL_NAME);
     }
 
     @Test

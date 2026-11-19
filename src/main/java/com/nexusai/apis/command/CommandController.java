@@ -394,6 +394,17 @@ public class CommandController {
 
     /** {@link #executeBuiltin} 主体 · 会话标识由包装层显式传入（不再读请求线程 MDC）。 */
     private Object executeBuiltinInternal(String name, ResumeExecuteRequest request, String sessionIdParam) {
+        // [plan-command 2026-11-19] /plan 真实执行分派。
+        //   WHY 必须在 findByName 之前：/plan 元数据注册在 CommandRegistrationConfig28（BundledSkills，
+        //   GET /api/command 可列出），但本类 BuiltInCommands 注册表**不含** plan ⇒ 落到下方 findByName
+        //   必然 null → 404「Built-in command 'plan' not found」（前端计划模式 chip / 命令面板执行
+        //   /plan 时就报这句）。真实执行体（切会话 plan 模式）已注册为 UserInputDispatcher 的 slash
+        //   handler（CommandRegistrationConfig28.registerPlanHandler），此处显式委托 —— 与 /compact
+        //   （P2-18）、/goal（V253）同一教训：宁可 500 fail loud，也不返回「已执行」的假成功。
+        String normalizedName = name != null && name.startsWith("/") ? name.substring(1) : name;
+        if ("plan".equals(normalizedName)) {
+            return executePlanBuiltin(sessionIdParam);
+        }
         Command hit = BuiltInCommands.findByName(name);
         if (hit == null) {
             if (log.isDebugEnabled()) {
@@ -682,6 +693,43 @@ public class CommandController {
                 + "（对齐 CC effort.tsx call）", args, sessionIdParam);
         }
         return effortCommand.handle(args, sessionIdParam);
+    }
+
+    /**
+     * [plan-command 2026-11-19] /plan 后端真实执行 · 委托 {@link #userInputDispatcher} 已注册的
+     * slash handler（CommandRegistrationConfig28.registerPlanHandler：写会话 AgentState.planMode +
+     * session_permission_rules SESSION setMode=PLAN）。
+     *
+     * <p><b>WHY 不把 plan 注册进 BuiltInCommands</b>：plan 的元数据已在 CommandRegistrationConfig28
+     * 注册为 BundledSkills（GET /api/command 可列出，命令面板/斜杠补全可见）；重复注册会改变
+     * GET /builtins 的清单（既有测试断言 12 条）。本方法只补「执行通道」，不动命令目录。
+     *
+     * <p>plan handler 是 void 形态 ⇒ {@code dispatchResult} 命中后回 {@code skip}（已执行、无文本）。
+     * 回 null = handler 未注册（Spring 装配异常）⇒ 500 fail loud，绝不回「已执行」的假成功。
+     *
+     * @param sessionId 会话标识（外层 {@link #executeBuiltin} 已校验必填）
+     * @return 命令元数据（前端只判 HTTP 成功，不需要正文）
+     */
+    private Object executePlanBuiltin(String sessionId) {
+        if (userInputDispatcher == null) {
+            log.error("[CommandController] executePlanBuiltin: UserInputDispatcher 未注入"
+                + "（非容器上下文），无法执行 /plan");
+            throw new IllegalStateException("UserInputDispatcher not wired into CommandController");
+        }
+        com.nexusai.application.agent.UserInputDispatcher.LocalCommandResult r =
+            userInputDispatcher.dispatchResult("/plan", sessionId, null);
+        if (r == null) {
+            log.error("[CommandController] executePlanBuiltin: /plan handler 未注册"
+                + "（dispatchResult null；CommandRegistrationConfig28.registerPlanHandler 未执行？）");
+            throw new IllegalStateException("/plan 无法执行：/plan 命令未注册");
+        }
+        log.info("[CommandController] executePlanBuiltin: /plan 执行完成 session={} kind={}"
+            + "（真实切换会话 plan 模式，对齐 CC commands/plan/index.ts）", sessionId, r.kind());
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("type", "local");
+        result.put("name", "plan");
+        result.put("executed", true);
+        return result;
     }
 
     /**

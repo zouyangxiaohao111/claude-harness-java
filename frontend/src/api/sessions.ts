@@ -1,5 +1,5 @@
 import { api } from './rest'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse } from './types'
+import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse, PlanExitRequest, PlanExitResponse } from './types'
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
@@ -13,6 +13,12 @@ export const sessionApi = {
     }),
   update: (id: string, req: SessionUpdateRequest) =>
     api<SessionDto>(`/sessions/${encodeURIComponent(id)}`, { method: 'PATCH', body: req }),
+  /** [plan-approval] 计划审批「退出并执行」：恢复会话权限模式；clearContext=true 时新建干净会话。 */
+  exitPlan: (id: string, req: PlanExitRequest) =>
+    api<PlanExitResponse>(`/sessions/${encodeURIComponent(id)}/plan/exit`, {
+      method: 'POST',
+      body: req,
+    }),
   remove: (id: string) => api<void>(`/sessions/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   /** 会话工具列表（GET /sessions/{id}/tools · 被禁工具仍在列表，disabled=true 供恢复） */
   listTools: (id: string) => api<SessionToolDto[]>(`/sessions/${encodeURIComponent(id)}/tools`),

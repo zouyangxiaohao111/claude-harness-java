@@ -139,6 +139,36 @@ public class SessionToolDisableConfig {
         return out;
     }
 
+    /**
+     * 该会话当前生效的禁用集合是否来自<b>默认禁用集</b>（{@code disabled_tools} 为 null/blank）。
+     *
+     * <p><b>为什么需要这个判据</b>：2026-11-18 用户拍板「人格优先」——默认禁用集与人格点名
+     * 冲突时，人格指定的工具生效，非冲突项照旧禁用。但这条规则<b>只适用于默认集</b>：
+     * 用户显式写进 {@code disabled_tools} 的项是用户的明确意图，⛔ 不允许被人格定义覆盖。
+     *
+     * @param sessionId 会话 id
+     * @return true = 走默认禁用集（可被豁免）；false = 显式列值 / 无会话 / 读失败（按显式处理）
+     */
+    public static boolean isDefaultDisabledSet(String sessionId) {
+        String key = normalizeSessionKey(sessionId);
+        SessionMapper mapper = sessionMapper;
+        if (key == null || mapper == null) {
+            return false;
+        }
+        try {
+            SessionRecord s = mapper.selectOneById(key);
+            if (s == null) {
+                return false;
+            }
+            String raw = s.getDisabledTools();
+            return raw == null || raw.isBlank();
+        } catch (RuntimeException e) {
+            // 读失败 ⇒ 按「显式列值」处理（不豁免），宁可少放行不可多放行
+            log.warn("会话级禁用工具来源判定失败（按显式列值处理）: 会话 '{}' 原因={}", key, e.toString());
+            return false;
+        }
+    }
+
     public static Set<String> getDisabledTools(String sessionId) {
         String key = normalizeSessionKey(sessionId);
         SessionMapper mapper = sessionMapper;
@@ -150,9 +180,12 @@ public class SessionToolDisableConfig {
                     if (raw == null || raw.isBlank()) {
                         // 从未设置 → 默认禁用（电脑操作 + 知识库）
                         Set<String> defaults = SessionToolCategory.defaultDisabledNamesStatic();
-                        if (log.isDebugEnabled()) {
-                            log.debug("会话级禁用工具集合：会话 '{}' disabled_tools 未设置 → 默认禁用 {} 个"
-                                    + "（CU+KB，[tool-categories]）", key, defaults.size());
+                        // [诊断 · 2026-11-18] 「池 110 → 2」只剩这一条能解释的路径：默认禁用集过大。
+                        //   升级为 INFO 并打样例，重启后一次复现即可判定（诊断完可降回 DEBUG）。
+                        if (log.isInfoEnabled()) {
+                            log.info("会话级禁用工具集合：会话 '{}' disabled_tools 未设置 → 默认禁用 {} 个"
+                                    + "（CU+KB，[tool-categories]）样例={}", key, defaults.size(),
+                                    defaults.stream().limit(8).toList());
                         }
                         return defaults;
                     }

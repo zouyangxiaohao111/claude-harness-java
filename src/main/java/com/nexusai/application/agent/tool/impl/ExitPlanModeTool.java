@@ -12,8 +12,11 @@ import com.nexusai.application.agent.permission.GetNextPermissionMode;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionResult;
+import com.nexusai.application.agent.permission.PermissionUpdate;
 import com.nexusai.application.agent.permission.PermissionUpdateApplier;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.tool.AgentToolConstants;
 import com.nexusai.application.agent.tool.AgentToolResult;
@@ -67,6 +70,14 @@ public class ExitPlanModeTool implements Tool {
     /** [WF-13 接线] 危险规则剥离/恢复器（S04 统一入口依赖）· 生产由 Spring 注入；测试懒建。 */
     @Autowired(required = false)
     private DangerousPatternDetector dangerousPatternDetector;
+
+    /**
+     * [plan-approval] 会话列写入器 · 退出后的恢复模式必须写回 sessions.session_permission_rules，
+     * 否则下一条消息仍按 permission_mode=plan 启动（用户「退出后又被拉回 plan」）。
+     * 审批已按用户选择持久化时（mode 已非 plan），这里不覆盖。
+     */
+    @Autowired(required = false)
+    private SessionMapper sessionMapper;
 
     /**
      * [IMP-T G15] AnalyticsTracker 遥测统一通道 · 对齐 CC logEvent('tengu_exit_plan_mode_called_outside_plan')
@@ -223,6 +234,46 @@ public class ExitPlanModeTool implements Tool {
         return false; // CC :182-184 "Now writes to disk"
     }
 
+    /**
+     * 审批前注入磁盘计划正文 · 对齐 CC {@code normalizeToolInput} 的 ExitPlanMode 分支
+     * （exe 2.1.328 {@code qyt}，偏移 326613822：读盘后返回 {@code {plan, planFilePath}} 并入
+     * 权限可见输入）。
+     *
+     * <p><b>WHY</b>：模型按提示只调用 {@code ExitPlanMode()}，计划正文在磁盘上；若不回填，
+     * 权限事件里的 toolInput 是空对象，审批卡只能显示工具名，用户实际批准的不是计划内容。
+     * 回填只作用于 hook / 权限可见输入，{@link #execute} 仍用原始 call.input()（CC
+     * callInput 不突变契约）。
+     */
+    @Override
+    public JsonNode backfillObservableInput(JsonNode input, ToolUseContext ctx) {
+        if (ctx == null || input == null || !input.isObject()) {
+            return input;
+        }
+        try {
+            PlanProvider provider = new PlanProviderImpl(ctx.sessionId());
+            String plan = provider.getPlan(null);
+            String planFilePath = provider.getPlanFilePath(null);
+            if (plan == null && planFilePath == null) {
+                return input;
+            }
+            ObjectNode out = ((ObjectNode) input).deepCopy();
+            if (!out.has("plan") && plan != null) {
+                out.put("plan", plan);
+            }
+            if (!out.has("planFilePath") && planFilePath != null) {
+                out.put("planFilePath", planFilePath);
+            }
+            if (log.isDebugEnabled()) {
+                log.debug("[ExitPlanModeTool] 审批前回填计划: path={} planChars={} inputKeys={}",
+                    planFilePath, plan == null ? 0 : plan.length(), out.size());
+            }
+            return out;
+        } catch (Exception e) {
+            log.warn("[ExitPlanModeTool] 审批前回填计划失败（按原输入继续）: {}", e.getMessage());
+            return input;
+        }
+    }
+
     @Override
     public boolean requiresUserInteraction() {
         // CC :185-194 — 非 teammate 需要用户确认。Java 无 teammate 概念（OPD-IMP-F1-2）→ 恒 true
@@ -333,10 +384,18 @@ public class ExitPlanModeTool implements Tool {
         if (log.isDebugEnabled()) {
             log.debug("[ExitPlanModeTool] checkPermissions 返回 Ask('Exit plan mode?')（CC ExitPlanModeV2Tool.ts:234-238）");
         }
+        // [plan-approval] 审批卡「执行方式」的可选项（对齐 CC buildPlanApprovalOptions）：
+        //   保留上下文执行 → setMode(acceptEdits)；手动逐次批准 → setMode(default)。
+        //   两者都是 SESSION 级（本次会话），与 CC 的 destination='session' 一致。
+        //   用户点选后前端原样回传 updatedPermissions → onResponse 先 apply 再 complete，
+        //   ExitPlanMode.execute 读到 mode != PLAN 即不再覆盖（CC 同序）。
+        List<PermissionUpdate> suggestions = List.of(
+            new PermissionUpdate.SetMode(PermissionUpdate.Destination.SESSION, PermissionMode.ACCEPT_EDITS),
+            new PermissionUpdate.SetMode(PermissionUpdate.Destination.SESSION, PermissionMode.DEFAULT));
         return new PermissionResult.Ask(
             "Exit plan mode?",
             new PermissionDecisionReason.Other("ExitPlanMode checkPermissions ask"),
-            List.of(), null, input, null, false, null, List.of());
+            suggestions, null, input, null, false, null, List.of());
     }
 
     @Override
@@ -364,10 +423,37 @@ public class ExitPlanModeTool implements Tool {
             writePlanFile(filePath, inputPlan);
         }
 
+        // [plan-approval] 退出后的恢复模式写回会话列（跨 send）：只在「审批没替我们切模式」时做；
+        // 用户已选执行方式（onResponse 先持久化 setMode）时 mode 已非 plan，不覆盖用户选择。
+        ToolPermissionContext beforeExit = appStateTpc(ctx);
+        if (beforeExit != null && beforeExit.mode() == PermissionMode.PLAN
+                && sessionMapper != null && ctx.sessionId() != null && !ctx.sessionId().isBlank()) {
+            try {
+                PermissionMode restoreMode = restoreFromPlanMode(beforeExit, transitionConfig()).mode();
+                SessionPermissionOverlay.persistSessionUpdates(sessionMapper, ctx.sessionId(),
+                    List.of(new PermissionUpdate.SetMode(
+                        PermissionUpdate.Destination.SESSION, restoreMode)),
+                    "exit_plan_mode");
+            } catch (Throwable t) {
+                log.warn("[ExitPlanModeTool] 退出模式持久化失败（本次 run 内仍生效）: {}", t.toString());
+            }
+        }
+
         // CC :357-403 setAppState 恢复 prePlanMode + 清 prePlanMode；guard：mode!=='plan' 原样返回
         ctx.setAppState().accept(prev -> {
             ToolPermissionContext current = permissionContextFrom(prev);
-            if (current == null || current.mode() != PermissionMode.PLAN) {
+            if (current == null) {
+                return prev != null ? prev : Map.of();
+            }
+            // 会话级载体（appState 生产快照不可变，put 会抛 UOE；且 appState 跨 send 不活）
+            PlanModeAttachments.PlanModeFlags flags =
+                PlanModeAttachments.getOrCreateFlagsBySession(ctx.sessionId());
+            if (current.mode() != PermissionMode.PLAN) {
+                // 审批阶段用户已选定执行方式（onResponse 先 apply 了 setMode → mode 已不是 plan）
+                // ⇒ CC 在审批组件里直接置位（ExitPlanModePermissionRequest 的 cV/eQ），本工具
+                //   execute 的 guard 会早退；但退出提醒必须照发，故这里同样置位（幂等）。
+                flags.setHasExitedPlanModeInSession(true);
+                flags.setNeedsPlanModeExitAttachment(true);
                 return prev != null ? prev : Map.of();
             }
             ToolPermissionContext restored = restoreFromPlanMode(current, transitionConfig());
@@ -375,7 +461,6 @@ public class ExitPlanModeTool implements Tool {
             next.put(KEY_TOOL_PERMISSION_CONTEXT, restored);
             // CC ExitPlanModeV2Tool.ts:358-360 —— 退出 plan 模式时一次性置 reentry/exit 标志
             // （plan_mode_reentry / plan_mode_exit 附件由 loop 的 maybeInjectPlanModeAttachments 消费）
-            PlanModeAttachments.PlanModeFlags flags = PlanModeAttachments.getOrCreateFlags(next);
             flags.setHasExitedPlanModeInSession(true);
             flags.setNeedsPlanModeExitAttachment(true);
             return next;
@@ -450,7 +535,7 @@ public class ExitPlanModeTool implements Tool {
         boolean hasExitedPlanModeInSession = false;
         if (ctx != null) {
             PlanModeAttachments.PlanModeFlags flags =
-                PlanModeAttachments.getOrCreateFlags(ctx.getAppState().apply(null));
+                PlanModeAttachments.getOrCreateFlagsBySession(ctx.sessionId());
             hasExitedPlanModeInSession = flags.hasExitedPlanModeInSession();
         }
         analyticsTracker.logEvent("tengu_exit_plan_mode_called_outside_plan",
@@ -552,6 +637,18 @@ public class ExitPlanModeTool implements Tool {
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {
         if (!(result instanceof ToolResult<?> tr)) {
             return null;
+        }
+        // ⛔ 错误/拒绝结果必须原样回传：旧实现无视 isError 继续走 approvedPlanEcho(null,…)，
+        //   把「用户拒绝」的 tool_result 伪装成 "User has approved exiting plan mode" ——
+        //   真机 e2e 实测：用户点拒绝并写意见，模型却收到「已批准」。
+        if (isError) {
+            String errorContent = tr.data() instanceof String s && !s.isEmpty()
+                ? s : "ExitPlanMode failed";
+            if (log.isDebugEnabled()) {
+                log.debug("[ExitPlanModeTool] mapToToolResultBlockParam: 错误/拒绝结果原样回传 isError=true length={}",
+                    errorContent.length());
+            }
+            return new ToolResultBlockParam(toolUseId, "tool_result", errorContent, true);
         }
         Map<String, Object> so = ToolResult.presentationMeta(tr);
         String plan = so.get("plan") instanceof String s ? s : null;

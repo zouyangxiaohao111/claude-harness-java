@@ -8,7 +8,8 @@ import com.nexusai.application.agent.tool.Tool;
 /**
  * Task V2 工具抽象基类 · s12.5 L3 v2.1
  *
- * <p>封装 6 个 Task V2 工具（Create/Get/Update/List/Stop/Output）的公共默认行为：
+ * <p>封装 5 个 Task V2 工具（Create/Get/Update/List/Stop）的公共默认行为；
+ * TaskOutput 已于 claude.exe 2.1.328 移除（{@link TaskOutputTool} 保留实现但不再注册）：
  * <ul>
  *   <li>{@code isEnabled()} → {@code isTodoV2Enabled()}</li>
  *   <li>{@code shouldDefer()} → {@code false}（2026-09-01 用户拍板：V2 系列直接开放，不懒加载——
@@ -17,10 +18,10 @@ import com.nexusai.application.agent.tool.Tool;
  *   <li>{@code maxResultSizeChars()} → {@code 100_000}</li>
  * </ul>
  *
- * <p>[IMP-G] G25③ 修正过时 Javadoc：TaskStopTool / TaskOutputTool 均 override
- * {@code maxResultSizeChars} 为 {@code 100_000}（对齐 CC TaskStopTool.ts:45 / TaskOutputTool.tsx:147），
- * {@code shouldDefer} 恒 {@code true}（CC 同值，显式 override 文档化）；{@code isConcurrencySafe}
- * 基类返回 {@code true}（CC TaskStopTool.ts:54-56 / TaskOutputTool.tsx:160-162 均为 true）。
+ * <p>[IMP-G] G25③ 修正过时 Javadoc：TaskStopTool override {@code maxResultSizeChars} 为
+ * {@code 100_000}（对齐 CC TaskStopTool.ts:45），{@code shouldDefer} 恒 {@code true}；
+ * {@code isConcurrencySafe} 基类返回 {@code true}（CC TaskStopTool.ts:54-56 为 true）。
+ * （TaskOutputTool 的同类说明随 2.1.328 移除而删除。）
  */
 public abstract class AbstractTaskTool implements Tool {
 

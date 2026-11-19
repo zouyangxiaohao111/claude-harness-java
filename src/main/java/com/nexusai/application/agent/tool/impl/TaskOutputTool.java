@@ -11,8 +11,6 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.stereotype.Component;
 
 import java.util.ArrayList;
 import java.util.LinkedHashMap;
@@ -20,20 +18,21 @@ import java.util.List;
 import java.util.Map;
 
 /**
- * TaskOutput 工具 · 对齐 CC TaskOutputTool.tsx（完整实现，非 stub）。
+ * TaskOutput 工具 · <b>claude.exe 2.1.328 已移除</b>（removed tools 集合成员）。
  *
- * <p>[IMP-G] G25②：删除「Task system not available」stub 回退分支（生产恒注入
- * {@link BackgroundTaskRunner}）；G25③：description/prompt/userFacingName 逐字对齐 CC +
- * errorCode 校验上移 {@link #validateInput} 层（缺失 task_id → 1 / 未找到 → 2）。
+ * <p>保留本类仅为历史实现留档：<b>不再加 {@code @Component}</b>，因此不进 {@code ToolRegistry}
+ * 的工具池、不出现在 LLM 的 tools[] 里。后台任务输出改由 Read 直接读任务的 output 文件，
+ * 实时事件用 {@link MonitorTool}，停止任务用 {@link TaskStopTool}。
+ *
+ * <p>历史说明（已过期，勿据此接回）：原对齐 CC TaskOutputTool.tsx 的完整实现。
  */
-@Component // s12-3.2: Spring bean 自动注册到 ToolRegistry
+@Deprecated(forRemoval = true)
 public class TaskOutputTool extends AbstractTaskTool {
 
     private static final Logger log = LoggerFactory.getLogger(TaskOutputTool.class);
     private static final String NAME = "TaskOutput";
 
-    /** 后台任务输出读取 · 生产恒注入（G25② 删除 stub 回退） */
-    @Autowired(required = false)
+    /** 后台任务输出读取 · 仅测试反射注入；类已非 Spring bean，不参与生产装配。 */
     private BackgroundTaskRunner backgroundTaskRunner;
 
     @Override
@@ -49,24 +48,17 @@ public class TaskOutputTool extends AbstractTaskTool {
 
     @Override
     public String description() {
-        // 对齐 CC TaskOutputTool.tsx:157-159 description()
-        return "[Deprecated] — prefer Read on the task output file path";
+        // claude.exe 2.1.328 原文是 taskOutputMaxChars 的弃用说明：
+        // "the TaskOutput tool was removed. Read a background task's output file with the Read tool instead."
+        return "[Removed] — read the task's output file with the Read tool instead";
     }
 
     @Override
     public String prompt() {
-        // 对齐 CC TaskOutputTool.tsx:172-182 prompt()（逐字）
-        return "DEPRECATED: Prefer using the Read tool on the task's output file path instead. "
-                + "Background tasks return their output file path in the tool result, and you receive "
-                + "a <task-notification> with the same path when the task completes — Read that file directly.\n"
-                + "\n"
-                + "- Retrieves output from a running or completed task (background shell, agent, or remote session)\n"
-                + "- Takes a task_id parameter identifying the task\n"
-                + "- Returns the task output along with status information\n"
-                + "- Use block=true (default) to wait for task completion\n"
-                + "- Use block=false for non-blocking check of current status\n"
-                + "- Task IDs can be found using the /tasks command\n"
-                + "- Works with all task types: background shells, async agents, and remote sessions";
+        return "REMOVED: the TaskOutput tool was removed. Read a background task's output file with "
+                + "the Read tool instead. Background tasks return their output file path in the tool result, "
+                + "and you receive a <task-notification> with the same path when the task completes. "
+                + "For recurring events use Monitor; to stop a task use TaskStop.";
     }
 
     @Override
@@ -76,15 +68,12 @@ public class TaskOutputTool extends AbstractTaskTool {
     }
 
     /**
-     * 工具别名 · 对齐 CC TaskOutputTool.tsx:150 {@code aliases: ['AgentOutputTool', 'BashOutputTool']}。
-     *
-     * <p>WHY（规则九，EV-G2-021）：历史 transcript / SDK 以 AgentOutputTool / BashOutputTool
-     * 名反查 --resume 重放，Java 未 override aliases → 查表断链。ToolRegistry findToolByName
-     * 按 name + alias 双路径（Tool.java:756 toolMatchesName）。
+     * 工具别名 · claude.exe 2.1.328 已把 TaskOutput/AgentOutputTool/BashOutputTool 一并列入
+     * removed tools 集合，历史 transcript 里的旧名不再反查（与 CC 语义一致：expected-absent）。
      */
     @Override
     public List<String> aliases() {
-        return List.of("AgentOutputTool", "BashOutputTool");
+        return List.of();
     }
 
     /**

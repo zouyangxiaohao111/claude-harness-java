@@ -6,19 +6,13 @@ import { EnvConfigPanel } from '../EnvConfigPanel'
 import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
 
 /**
- * [coord-mode] 「协调者模式」开关 —— 前端可配置 + 保存链路。
+ * [coord-mode 2026-11-19 用户裁定] 协调者模式**不再有全局开关**，改为按会话激活
+ * （输入框「协调者」chip 写 `sessions.coordinator_mode`）。
  *
- * WHY（规则 9）：该开关决定主 Claude 是否退化为「只派发、不执行」的协调者（后端
- * PromptAlignSettingsResolver.coordinatorModeEnabled 读 → LlmAgentLoop 的 coordinator 分支门）。
- * 此前前端完全没有这一项（AppSettings 无字段、面板无 UI）→ 后端 DB 列虽在但用户只能靠 API 或
- * 直接改库打开。本用例锁死四件事：① 未配置/null 默认关闭（后端默认 false）；② settings 带 true
- * 时回填为开；③ 勾选后经 onSaveSettings 以 `coordinatorModeEnabled` 键写回 true（后端 PUT /settings merge 生效）；
- * ④ 取消勾选写回 false。
- *
- * 变异自证：把 checkbox 的 onChange 改成写别的键（或不写）→ 第 4/5 条断言红；把默认值改成
- * `?? true` → 第 1/2 条断言红。
+ * <p>WHY 要锁住「不存在」：这个开关原先在设置页，一旦被误加回来，用户会再次面临
+ * 「全局一开、所有会话都显示为开」的困惑——这与按会话激活的产品语义直接冲突。
+ * 用例断言面板里根本没有这一行，而不是断言某个 checkbox 的值。
  */
-
 vi.mock('@/api/memory', () => ({
   getMemoryConfig: () => Promise.resolve({
     autoMemoryEnabled: false, autoDreamEnabled: false,
@@ -26,8 +20,6 @@ vi.mock('@/api/memory', () => ({
   }),
   updateMemoryConfig: () => Promise.resolve({}),
 }))
-
-const FIELD_NAME = '协调者模式'
 
 function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
   return {
@@ -40,7 +32,7 @@ function baseSettings(over: Partial<AppSettings> = {}): AppSettings {
   }
 }
 
-describe('EnvConfigPanel · 协调者模式开关', () => {
+describe('EnvConfigPanel · 协调者模式全局开关已移除', () => {
   let container: HTMLDivElement
   let root: Root
 
@@ -56,18 +48,6 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
     vi.restoreAllMocks()
   })
 
-  /** 面板里「协调者模式」那一行的 checkbox。 */
-  function coordinatorModeCheckbox(): HTMLInputElement {
-    const rows = Array.from(container.querySelectorAll('.envc-row'))
-    // 行标题里可能追加代码标签（如「协调者模式 coordinator」）⇒ 用前缀匹配，
-    // 精确相等会把标签也算进 textContent 而匹配失败（2026-11-12 改版）。
-    const row = rows.find((r) => r.querySelector('.envc-name')?.textContent?.trim().startsWith(FIELD_NAME))
-    if (!row) throw new Error(`未找到开关行：${FIELD_NAME}`)
-    const box = row.querySelector('input[type="checkbox"]')
-    if (!box) throw new Error('开关行内无 checkbox')
-    return box as HTMLInputElement
-  }
-
   async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<boolean>) {
     await act(async () => {
       root.render(<EnvConfigPanel settings={settings} onOpenMemoryEditor={() => {}} onSaveSettings={onSave} />)
@@ -75,44 +55,10 @@ describe('EnvConfigPanel · 协调者模式开关', () => {
     })
   }
 
-  it('settings 未配置该字段 → 默认关闭（checkbox 未勾选）', async () => {
-    await render(baseSettings(), async () => true)
-    expect(coordinatorModeCheckbox().checked).toBe(false)
-  })
-
-  it('settings.coordinatorModeEnabled=null → 默认关闭', async () => {
-    await render(baseSettings({ coordinatorModeEnabled: null }), async () => true)
-    expect(coordinatorModeCheckbox().checked).toBe(false)
-  })
-
-  it('settings.coordinatorModeEnabled=true → 回填为开', async () => {
+  it('即使 settings 里 coordinatorModeEnabled=true，面板也不再渲染该行', async () => {
     await render(baseSettings({ coordinatorModeEnabled: true }), async () => true)
-    expect(coordinatorModeCheckbox().checked).toBe(true)
-  })
-
-  it('勾选 → 经 onSaveSettings 以 coordinatorModeEnabled 键写回 true', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
-    await render(baseSettings({ coordinatorModeEnabled: false }), onSave)
-
-    const box = coordinatorModeCheckbox()
-    await act(async () => {
-      box.click()
-      await Promise.resolve()
-    })
-
-    expect(onSave).toHaveBeenCalledTimes(1)
-    expect(onSave.mock.calls[0][0]).toEqual({ coordinatorModeEnabled: true })
-  })
-
-  it('取消勾选 → 写回 false', async () => {
-    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
-    await render(baseSettings({ coordinatorModeEnabled: true }), onSave)
-
-    await act(async () => {
-      coordinatorModeCheckbox().click()
-      await Promise.resolve()
-    })
-
-    expect(onSave.mock.calls[0][0]).toEqual({ coordinatorModeEnabled: false })
+    const names = Array.from(container.querySelectorAll('.envc-name'))
+      .map((n) => n.textContent?.trim() ?? '')
+    expect(names.some((n) => n.startsWith('协调者模式'))).toBe(false)
   })
 })

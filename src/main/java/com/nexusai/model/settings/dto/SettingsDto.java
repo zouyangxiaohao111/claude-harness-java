@@ -230,7 +230,13 @@ public record SettingsDto(
      * <p>⚠️ 三处必须同步（同 channelsEnabled）：① 本字段 ② SettingsService.toDto
      * ③ update 的 merge 分支。放在末尾以保持既有构造点参数顺序不变。
      */
-    Integer modelMaxConcurrency
+    Integer modelMaxConcurrency,
+    /**
+     * [V302] 计划审批卡是否显示「批准并清空上下文执行」（settings.show_clear_context_on_plan_accept）。
+     * null/0 = 关闭（审批卡只显示保留上下文）；1 = 显示清空上下文选项并二次确认。
+     * ⚠️ 三处必须同步：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
+     */
+    Boolean showClearContextOnPlanAccept
 ) {
 
     /**
@@ -329,6 +335,6 @@ public record SettingsDto(
             skillSearchIntentEnabled, scratchpadEnabled, frcEnabled, agentMainThreadEnabled,
             verifyPlanReminderEnabled, language, outputStyle, enabledPlugins, pluginClaudeFallback,
             allowDynamicHeaderValues, streamIdleTimeoutMs, webfetchEngine, marketAdminEnabled,
-            channelsEnabled, null, null, null, null);
+            channelsEnabled, null, null, null, null, null);
     }
 }

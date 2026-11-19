@@ -4,6 +4,8 @@ import type { MouseEvent as ReactMouseEvent, ReactNode } from 'react'
 import { isTauri } from '@tauri-apps/api/core'
 import type { SettingsTab, Project, SessionFile, RightTab } from '@/types'
 import { projectApi, type FileNode } from '@/api/projects'
+import { classifyFileType, FILE_KIND_COLORS } from '@/utils/fileType'
+import { FileTypeIcon } from './FileTypeIcon'
 import { workflowApi } from '@/api/workflows'
 import { tasksApi } from '@/api/tasks'
 import { subagentApi, type SubagentSummary } from '@/api/subagents'
@@ -133,6 +135,27 @@ interface SaRow {
   ts: number
   live?: SubagentIdentity
   hist?: SubagentSummary
+}
+
+/**
+ * 实时 taskId（UUID）→ transcript 键 a+16hex。
+ *
+ * <p><b>WHY（承重）</b>：子代理 async 路径 taskId === agentId（UUID，
+ * SubagentTool.executeAsync:3312-3313），而 transcript 文件名用 {@code unpackAgentId} 还原的
+ * a+16hex（'a' + UUID mostSignificantBits 的 16 位 hex，AgentContext.unpackAgentId）。
+ * 两个源键**不同源** ⇒ 不做归一，同一个子代理在「实时身份」与「历史 transcript」里各出一行，
+ * 历史那行的状态又是磁盘末行推断（运行中/无收尾文本 ⇒「未收尾/未知」），与点进去看到的
+ * 执行记录对不上（用户 2026-11-19：「点进去已经完成，上面还是未知/未完成」）。
+ *
+ * @param taskId 任务事件/后台任务的 id（UUID 串；非 UUID → null，不猜）
+ * @return a+16hex（与后端同名算法同构）；非 UUID → null
+ */
+function transcriptKeyOf(taskId: string | null | undefined): string | null {
+  if (!taskId) return null
+  // mostSignificantBits = UUID 字符串去掉连字符后的**前 16 个** hex（8+4+4），不含第 4 段
+  const m = /^([0-9a-fA-F]{8})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-([0-9a-fA-F]{4})-[0-9a-fA-F]{12}$/
+    .exec(taskId)
+  return m ? `a${(m[1] + m[2] + m[3]).toLowerCase()}` : null
 }
 
 /** 结局归一：实时 status 与历史 status 不同源，统一成 SaKind */
@@ -346,6 +369,8 @@ function FileTreeNode({
   onMenu: (e: ReactMouseEvent, node: FileNode) => void
 }) {
   const isDir = node.type === 'dir'
+  const kind = isDir ? 'folder' : classifyFileType(node.name)
+  const iconColor = FILE_KIND_COLORS[kind]
   const expanded = isDir ? expandedDirs.has(node.path) : false
   const paddingLeft = 8 + depth * 14
   return (
@@ -370,16 +395,8 @@ function FileTreeNode({
         ) : (
           <span className="dot"></span>
         )}
-        <span className={`icon ${isDir ? 'dir' : 'file'}`}>
-          {isDir ? (
-            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-              <path d="M2 4.5C2 3.5 2.5 3 3.5 3H5L6 4.5H10.5C11.5 4.5 12 5 12 6V10C12 11 11.5 11.5 10.5 11.5H3.5C2.5 11.5 2 11 2 10V4.5Z" />
-            </svg>
-          ) : (
-            <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 12, height: 12 }}>
-              <path d="M4 2H7L10 5V12H4V2Z" />
-            </svg>
-          )}
+        <span className={`icon ${isDir ? 'dir' : 'file'}`} style={{ color: iconColor }}>
+          <FileTypeIcon kind={kind} size={12} open={isDir && expanded} />
         </span>
         <span className="name">{node.name}</span>
       </div>
@@ -654,8 +671,12 @@ export const RightPanel = memo(function RightPanel({
   // 任务 tab 数据：定时任务（真实后端）+ 子代理身份（/topic/tasks 事件登记）
   // [cwd3] 传本面板的 activeSessionId：定时任务创建必须带会话锚（见 useSchedules javadoc）。
   const schedules = useSchedules(activeSessionId)
-  /** 右栏对话视图（F2）：点子代理/成员 → 内容区切换成该 agent 的执行记录 */
-  const [viewing, setViewing] = useState<{ agentId: string; name: string; subtitle?: string; active: boolean } | null>(null)
+  /** 右栏对话视图（F2）：点子代理/成员 → 内容区切换成该 agent 的执行记录。
+   *  [cross-session] 必须带 sessionId：切换会话后旧 viewing 不得继续用新会话 ID 请求
+   *  transcript（否则 404 并按运行态重试 20 次）。 */
+  const [viewing, setViewing] = useState<{ sessionId: string; agentId: string; name: string; subtitle?: string; active: boolean;
+    /** 点击行的真实结局 · 详情 badge 不再把「未知/未收尾」二值化成「已完成」 */
+    kind?: SaKind } | null>(null)
   /** 历史子代理（磁盘 transcript 目录 · 切会话重拉）：补上「重启后 /tasks 里没有」的那部分 */
   const [historySubs, setHistorySubs] = useState<SubagentSummary[]>([])
   /**
@@ -674,7 +695,12 @@ export const RightPanel = memo(function RightPanel({
     setRunShowAllByGroup((v) => ({ ...v, [key]: !v[key] }))
   /** ⤢ 扩大：右栏向左覆盖中间对话区（用户 2026-10-21：不要弹窗） */
   const [expandedView, setExpandedView] = useState(false)
-  /** 抽屉宽度（可拖拽左缘调整；持久化 localStorage） */
+  // [cross-session] 切换会话 → 退出子代理详情（连同全屏态），避免用新会话 ID 请求旧 agent 的
+  //   transcript（后端按 sessionDir 定位，必 404 且按运行态重试 20 次）。
+  useEffect(() => {
+    setViewing(null)
+    setExpandedView(false)
+  }, [activeSessionId])  /** 抽屉宽度（可拖拽左缘调整；持久化 localStorage） */
   const [drawerW, setDrawerW] = useState<number>(() => {
     const saved = typeof localStorage !== 'undefined' ? Number(localStorage.getItem('nexusai-right-drawer-w')) : 0
     return Number.isFinite(saved) && saved >= 320 ? saved : 384
@@ -717,9 +743,12 @@ export const RightPanel = memo(function RightPanel({
   }
   const subagentIdentities = useSubagentStore((s) => s.bySession[activeSessionId ?? ''] ?? EMPTY_IDENTITY_MAP)
   const tasksCount = schedules.list.length + Object.keys(subagentIdentities).length
+  // [cross-session] 只渲染属于当前会话的子代理详情；effect 已清空，这里再兜一帧（避免用新会话 ID
+  //   请求旧 agent 的 transcript）。
+  const viewingHere = viewing && viewing.sessionId === (activeSessionId ?? '') ? viewing : null
   // [F2] 进入 agent 对话视图 → 右栏临时加宽到 420（退出恢复用户原宽度）
   useEffect(() => {
-    if (!viewing) return
+    if (!viewingHere) return
     const root = document.documentElement
     const prev = root.style.getPropertyValue('--right-w')
     // 进入对话视图 420；用户仍可用 resizer 拖拽（resizer 改的就是这个变量）。
@@ -729,16 +758,29 @@ export const RightPanel = memo(function RightPanel({
       if (prev) root.style.setProperty('--right-w', prev)
       else root.style.removeProperty('--right-w')
     }
-  }, [viewing, expandedView])
+  }, [viewingHere, expandedView])
 
-  // 切会话 → 拉该会话的历史子代理（磁盘真源）；失败静默（不影响实时数据）
+  // 切会话 → 拉该会话的历史子代理（磁盘真源）· 5s 轮询兜底刷新。
+  //   WHY 轮询：历史行的状态由后端按 transcript **末行**推断（inferStatus），
+  //   「运行中」的末行常是 tool/user ⇒ 先判为未收尾/未知；任务收尾后末行才变成 assistant。
+  //   原先只在切会话时拉一次 ⇒ 列表永久停在那一刻的推断，点进去（transcript 每次都重拉）
+  //   已是完整记录 ⇒ 两处对不上（用户 2026-11-19 报的症状）。失败不清空既有列表。
   useEffect(() => {
     if (!activeSessionId) { setHistorySubs([]); return }
     let cancelled = false
-    subagentApi.list(activeSessionId, HISTORY_FETCH_LIMIT)
-      .then((list) => { if (!cancelled) setHistorySubs(list ?? []) })
-      .catch(() => { if (!cancelled) setHistorySubs([]) })
-    return () => { cancelled = true }
+    const load = () => {
+      subagentApi.list(activeSessionId, HISTORY_FETCH_LIMIT)
+        .then((list) => {
+          if (cancelled) return
+          const next = list ?? []
+          // 内容守卫：轮询数据未变不 setState（避免每 5s 触发整面板重渲染）
+          setHistorySubs((prev) => (JSON.stringify(prev) === JSON.stringify(next) ? prev : next))
+        })
+        .catch(() => { /* 静默：保留上一次列表，不影响实时数据 */ })
+    }
+    load()
+    const timer = window.setInterval(load, 5000)
+    return () => { cancelled = true; window.clearInterval(timer) }
   }, [activeSessionId])
 
   // 切会话 → 筛选与分页回到默认（否则上一会话翻到第 40 条会带过来）
@@ -1226,7 +1268,7 @@ export const RightPanel = memo(function RightPanel({
           showToast={showToast}
           hideHeader
           onCount={setTeamCount}
-          onViewMember={(agentId, name, active) => setViewing({ agentId, name, subtitle: active ? '运行中' : '离线', active })}
+          onViewMember={(agentId, name, active) => setViewing({ sessionId: activeSessionId ?? '', agentId, name, subtitle: active ? '运行中' : '离线', active })}
           renderEmpty={(onCreate) => (
             <DrawerEmpty
               icon="team"
@@ -1259,8 +1301,16 @@ export const RightPanel = memo(function RightPanel({
       seen.add(key)
       return true
     })
-    // 历史项（磁盘 transcript）：实时里已有的按 taskId 去重（两者键不同源，能对上就排除）
-    const liveIds = new Set(subs.map((x) => x.taskId).filter(Boolean) as string[])
+    // 历史项（磁盘 transcript）：实时里已有的排除。
+    //   实时键 = taskId（UUID）/ 少数路径写 a+16hex；历史键 = agentId（a+16hex）⇒ 两种形态都收，
+    //   否则同一子代理出现两行（一行实时、一行历史推断态）。
+    const liveIds = new Set<string>()
+    for (const x of subs) {
+      if (!x.taskId) continue
+      liveIds.add(x.taskId)
+      const hex = transcriptKeyOf(x.taskId)
+      if (hex) liveIds.add(hex)
+    }
     const hist = historySubs.filter((h) => !liveIds.has(h.agentId))
     const totalCount = subs.length + hist.length
 
@@ -1339,10 +1389,12 @@ export const RightPanel = memo(function RightPanel({
                       onClick={() => {
                         if (!agentId) return
                         setViewing({
+                          sessionId: activeSessionId ?? '',
                           agentId,
                           name: r.live ? r.live.name : (r.hist?.agentType || '子代理'),
                           subtitle: SA_KIND_LABEL[r.kind],
                           active: r.kind === 'running',
+                          kind: r.kind,
                         })
                       }}
                       title="查看该子代理的对话"
@@ -1601,14 +1653,15 @@ export const RightPanel = memo(function RightPanel({
           </button>
         </div>
         {/* 终端要占满整个抽屉高度（xterm 自适应依赖容器真高度）→ 该 tab 去掉 body 的滚动与内边距 */}
-        <div className={`right-drawer-body${shownTab === 'terminal' && !viewing ? ' term-body' : ''}`}>
-          {viewing ? (
+        <div className={`right-drawer-body${shownTab === 'terminal' && !viewingHere ? ' term-body' : ''}`}>
+          {viewingHere ? (
             <AgentTranscriptView
               sessionId={activeSessionId}
-              agentId={viewing.agentId}
-              name={viewing.name}
-              subtitle={viewing.subtitle}
-              active={viewing.active}
+              agentId={viewingHere.agentId}
+              name={viewingHere.name}
+              subtitle={viewingHere.subtitle}
+              active={viewingHere.active}
+              statusKind={viewingHere.kind}
               onBack={() => setViewing(null)}
               showToast={showToast}
               clientRef={socketClientRef}
@@ -1690,13 +1743,14 @@ export const RightPanel = memo(function RightPanel({
         )}
       </div>
       <div className="right-main">
-        {viewing ? (
+        {viewingHere ? (
           <AgentTranscriptView
             sessionId={activeSessionId}
-            agentId={viewing.agentId}
-            name={viewing.name}
-            subtitle={viewing.subtitle}
-            active={viewing.active}
+            agentId={viewingHere.agentId}
+            name={viewingHere.name}
+            subtitle={viewingHere.subtitle}
+            active={viewingHere.active}
+            statusKind={viewingHere.kind}
             onBack={() => { setViewing(null); setExpandedView(false) }}
             expanded={expandedView}
             onExpand={() => setExpandedView((v) => !v)}

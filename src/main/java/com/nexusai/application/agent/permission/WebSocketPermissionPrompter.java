@@ -2055,6 +2055,24 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                            List<JsonNode> updatedPermissions,
                            String acceptFeedback, List<JsonNode> contentBlocks,
                            JsonNode answers, JsonNode annotations) {
+        // 旧 7 参调用方：无 updatedInput（Allow.updatedInput 仍由原 input 构造）
+        onResponse(requestId, decision, updatedPermissions, acceptFeedback, contentBlocks,
+            answers, annotations, null);
+    }
+
+    /**
+     * [plan-approval] 8 参主实现 · 追加 {@code responseUpdatedInput}（用户改写后的工具输入）。
+     *
+     * <p>对齐 CC {@code onAllow(updatedInput, permissionUpdates, feedback, contentBlocks)}：
+     * updatedInput 是 <b>full replace</b>，用户改过的计划经此回传，工具 execute 看到的是
+     * 用户批准的那一版（{@code HookPermissionResolver} 把 Allow.updatedInput 作为
+     * resolved.input 继续下传）。
+     */
+    public void onResponse(String requestId, String decision,
+                           List<JsonNode> updatedPermissions,
+                           String acceptFeedback, List<JsonNode> contentBlocks,
+                           JsonNode answers, JsonNode annotations,
+                           JsonNode responseUpdatedInput) {
         if (requestId == null || requestId.isBlank()) {
             log.warn("PERMISSION onResponse: requestId is blank, ignoring");
             return;
@@ -2108,7 +2126,9 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             // [FIX-E askuser-answers] Allow.updatedInput = originalInput 浅拷贝 + answers/annotations
             //   （合并语义对齐 CC AskUserQuestionPermissionRequest.tsx:398-407 submitAnswers）。
             //   originalInput 为 null 时以空对象兜底（Allow.updatedInput 恒非 null）。
-            JsonNode updatedInput = buildUpdatedInput(originalInput, answers, annotations);
+            // 用户改写后的输入优先（计划审批的编辑计划走这里）；否则用原输入 + answers/annotations。
+            JsonNode baseInput = responseUpdatedInput != null ? responseUpdatedInput : originalInput;
+            JsonNode updatedInput = buildUpdatedInput(baseInput, answers, annotations);
             // [R32-b9] 透传 STOMP feedback/blocks 到 Allow 决策(CC addToolResult allow 路径)
             String fb = (acceptFeedback != null && !acceptFeedback.isBlank()) ? acceptFeedback : null;
             List<JsonNode> blocks = (contentBlocks != null && !contentBlocks.isEmpty())
@@ -2126,8 +2146,16 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
         } else {
             // decision 是 null / 未知 / "deny" 都视为 deny
+            // [plan-approval] 用户拒绝时携带的修改意见必须回传给模型（CC
+            //   REJECT_MESSAGE_WITH_REASON_PREFIX：用户不想继续 + 用户说：<feedback>）。
+            //   旧实现无条件丢弃 acceptFeedback，模型只收到固定 "User denied via WebSocket"，
+            //   无法按用户意见改计划。
+            String denyFeedback = (acceptFeedback != null && !acceptFeedback.isEmpty())
+                ? acceptFeedback : null;
+            String denyMessage = PermissionRejectMessages.buildRejectMessage(
+                promptCtx != null && promptCtx.agentType() != null, denyFeedback);
             result = new PermissionResult.Deny(
-                "User denied via WebSocket",
+                denyMessage,
                 new PermissionDecisionReason.Other("user_denied"),
                 null);
 

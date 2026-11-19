@@ -1266,7 +1266,10 @@ public class AutonomousAgentLoop {
                 null,
                 model,
                 forkParams,
-                msg -> appendMessage(describeMessage(msg)),
+                msg -> {
+                    appendMessage(describeMessage(msg));
+                    recordToolActivities(msg);
+                },
                 bridge,
                 leaderParentTuc,
                 teammateIdentity
@@ -1304,6 +1307,42 @@ public class AutonomousAgentLoop {
             messages.add(text);
             if (messages.size() > com.nexusai.application.agent.team.InProcessTeammateTypes.TEAMMATE_MESSAGES_UI_CAP) {
                 messages.remove(0);
+            }
+        }
+    }
+
+    /**
+     * 采集本条 assistant 消息里的 tool_use → taskState.recentActivities（≤5 条）·
+     * 对齐 CC {@code updateProgressFromMessage}（LocalAgentTask.tsx:145-176）。
+     *
+     * <p>活动摘要随 {@code /tasks} 清单透出（TaskController 读 registry → taskState），
+     * 前端进行中任务第二行显示。只采集 assistant 消息携带的 tool_calls，user/tool 消息跳过
+     * （CC 首行 {@code message.type !== 'assistant' return}）。
+     *
+     * <p>并发：{@code taskState} 是 volatile 字段，read-modify-write 用本对象锁串行化；
+     * 写入方只有本循环线程，锁成本可忽略。
+     */
+    private void recordToolActivities(com.nexusai.application.agent.tool.impl.SubagentMessage msg) {
+        if (!(msg instanceof com.nexusai.application.agent.tool.impl.SubagentMessage.AssistantMessage am)
+                || am.toolCalls().isEmpty()) {
+            return;
+        }
+        synchronized (this) {
+            com.nexusai.application.agent.team.InProcessTeammateTaskState state = taskState;
+            if (state == null) {
+                return;
+            }
+            java.util.List<com.nexusai.application.agent.tasks.MainSessionTaskState.ToolActivity> acts =
+                state.recentActivities();
+            for (com.nexusai.model.session.dto.ToolCallDto tc : am.toolCalls()) {
+                acts = com.nexusai.application.agent.tasks.ToolActivitySummary.append(
+                    acts,
+                    com.nexusai.application.agent.tasks.ToolActivitySummary.toActivity(tc.name(), tc.arguments()));
+            }
+            taskState = state.withRecentActivities(acts);
+            if (log.isDebugEnabled()) {
+                log.debug("[AutonomousAgentLoop] 活动采集 agent={} toolCalls={} recent={}",
+                    agentId, am.toolCalls().size(), acts.size());
             }
         }
     }

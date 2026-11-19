@@ -96,8 +96,9 @@ function mountHost(): Harness {
     container,
     root,
     textarea: () => container.querySelector('textarea') as HTMLTextAreaElement,
-    chipCount: () => container.querySelectorAll('.attach-item').length,
-    chipFilenames: () => Array.from(container.querySelectorAll('.attach-item .attach-file')).map((e) => e.textContent ?? ''),
+    // 图片 = 缩略图 `.attach-item`，文件 = DSH 卡片 `.attach-file-card`；chip 数按预览区子项数
+    chipCount: () => container.querySelectorAll('.attach-preview > *').length,
+    chipFilenames: () => Array.from(container.querySelectorAll('.attach-file-card .attach-file-name')).map((e) => e.textContent ?? ''),
     pressEscape: () => {
       act(() => {
         dispatchEscape(container)

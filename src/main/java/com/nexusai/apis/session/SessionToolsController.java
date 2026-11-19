@@ -231,7 +231,29 @@ public class SessionToolsController {
     private Set<String> effectiveDisabledNames(String sessionId) {
         // SessionService.getDisabledTools 先做存在性校验（不存在 → 404）
         sessionService.getDisabledTools(sessionId);
-        return com.nexusai.application.agent.config.SessionToolDisableConfig.getDisabledTools(sessionId);
+        Set<String> disabled = com.nexusai.application.agent.config.SessionToolDisableConfig
+            .getDisabledTools(sessionId);
+        // [2026-11-18 用户拍板 · 面板与模型同一口径]
+        //   默认禁用集与人格点名冲突时人格优先 —— 装配侧已在 LlmAgentLoop.sessionVisibleTools
+        //   做同款豁免；面板不做就会「显示已禁用、模型实际能调用」。
+        //   ⛔ 只豁免默认集：用户显式写入 disabled_tools 的项仍显示禁用（那是明确意图）。
+        if (!disabled.isEmpty()
+                && com.nexusai.application.agent.config.SessionToolDisableConfig
+                    .isDefaultDisabledSet(sessionId)) {
+            Set<String> named = com.nexusai.application.agent.LlmAgentLoop.agentNamedTools(sessionId);
+            if (!named.isEmpty()) {
+                Set<String> merged = new LinkedHashSet<>(disabled);
+                merged.removeAll(named);
+                if (merged.size() != disabled.size()) {
+                    if (log.isInfoEnabled()) {
+                        log.info("SessionToolsController: 人格优先豁免默认禁用 session={} 豁免={}",
+                            sessionId, named.stream().filter(disabled::contains).toList());
+                    }
+                    return merged;
+                }
+            }
+        }
+        return disabled;
     }
 
     /**

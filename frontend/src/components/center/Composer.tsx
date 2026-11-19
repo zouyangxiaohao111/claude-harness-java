@@ -1,10 +1,12 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
 import { CatArtBody } from '../startup/CatArt'
 import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
+import { Icon } from '@/icons'
 import type { AttachmentRequest, SessionDto, ChatMessageDto } from '@/api/types'
 import { uploadAttachment } from '@/api/chat'
 import { isTauri } from '@tauri-apps/api/core'
@@ -15,18 +17,30 @@ import { GoalHead } from './GoalHead'
 import { GoalSetPanel } from './GoalSetPanel'
 import { commandApi, type CommandDto } from '@/api/command'
 import { projectApi } from '@/api/projects'
-import { compactNumber } from '@/utils/format'
+import { compactNumber, formatFileSize } from '@/utils/format'
+import { AttachFileIcon } from './AttachFileIcon'
+import { AttachPreviewModal } from './AttachPreviewModal'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
 import { u8ToBase64 } from '@/utils/base64'
 import '@/styles/kb-mention.css'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
+import { useShallow } from 'zustand/react/shallow'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
 /** 稳定空数组（streams[sessionId] 不存在时回落，防 selector 每次返回新引用触发重渲染）。 */
 const EMPTY_BLOCKS: StreamBlock[] = []
+
+/** [流式性能] usageProbe 的空值（无会话时回落；稳定引用 + 标量字段供 useShallow 浅比较）。 */
+const EMPTY_USAGE_PROBE = {
+  ctxUsed: null as number | null,
+  ctxWindow: null as number | null,
+  ctxPct: null as number | null,
+  turnCacheRate: null as number | null,
+  lastSpeedTs: null as number | null,
+}
 
 /** Tauri：拖拽被 WebView 拦截，用 onDragDropEvent 拿真实路径 → fs 读文件 → base64/upload */
 const IS_TAURI = isTauri()
@@ -175,6 +189,16 @@ interface ComposerProps {
   onOpenUsageCost?: () => void
   /** NexusAI in Chrome：输入框工具栏浏览器图标 → 打开 ChromePanel（检查/安装/连接引导，App 处理） */
   onOpenChromePanel?: () => void
+  /** 进入计划模式（claude.exe EnterPlanMode 等价：App 走 `/plan` 命令链路，写会话 permission rules） */
+  onEnterPlanMode?: () => void
+  /** 退出计划模式（= 切回进入前的权限模式；对齐 CC Shift+Tab，随时可切） */
+  onExitPlanMode?: () => void
+  /** 「进入计划模式」已排队（turn 运行中点击）：chip 显示「排队中」，⛔ 不代表已生效 */
+  planPending?: boolean
+  /** 协调者模式（会话级；只认本会话 coordinator_mode，全局开关已移除） */
+  coordinatorMode?: boolean
+  /** 切换协调者模式（App 调 sessionApi.update({coordinatorMode}) · 写入会话级覆盖） */
+  onCoordinatorModeChange?: (on: boolean) => void
   /** 回到底部按钮（离底时显示 · 对齐 deepseek-harness ChatView toBottom · 由 MessageList onScroll 驱动） */
   showToBottom?: boolean
   /** 回到底部点击 → 滚动对话到底（App 触发 MessageList scrollSignal） */
@@ -211,6 +235,11 @@ interface ComposerProps {
   subagentHint?: ReactNode
   /** 「正在监听」胶囊（App 传 `<MonitorRunningHint />`）· 显示 Monitor 正在盯什么。 */
   monitorHint?: ReactNode
+  /**
+   * [task-list-inline] TaskCreate 任务清单 dock（App 传 `<TaskListDock />`）。
+   * 放在 `.composer-inner` 顶部：清单是状态区，不进入消息流；工具调用仍在对话里滚动。
+   */
+  taskListHint?: ReactNode
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -347,7 +376,7 @@ const SUG_CARD: React.CSSProperties = {
   overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
+export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, onEnterPlanMode, onExitPlanMode, planPending, coordinatorMode, onCoordinatorModeChange, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, taskListHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
@@ -362,7 +391,37 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   //   MessageService.applyContextSnapshotToLastAssistant 同义切片）→ 无快照即不显示（对齐 CC
   //   getCurrentUsage 找不到 → 指示器归零），否则会拿压缩前的值顶上来（数字不降）。
   const msgs = useChatStore((s) => (sessionId ? (s.messages[sessionId] ?? EMPTY_MESSAGES) : EMPTY_MESSAGES))
-  const liveBlocks = useChatStore((s) => (sessionId ? (s.streams[sessionId] ?? EMPTY_BLOCKS) : EMPTY_BLOCKS))
+  // [流式性能 2026-11-18 · 对齐 dsh 节点级订阅] 原实现订阅整个 `streams[sid]` 数组
+  //   （appendChunk 每帧换引用）⇒ 这个 1900 行的输入框组件**每帧整块重渲**。
+  //   改为 useShallow 订阅「底部只需要的 5 个标量」：文本增长帧字段不变 ⇒ 组件不重渲。
+  //   扫描逻辑与原先的 usageScan 同源（msgs 尾部 + live 块尾部，从后往前取最新快照）。
+  const usageProbe = useChatStore(useShallow((s) => {
+    const sid = sessionId
+    if (!sid) return EMPTY_USAGE_PROBE
+    const scan = [
+      ...(s.messages[sid] ?? EMPTY_MESSAGES),
+      ...(s.streams[sid] ?? EMPTY_BLOCKS),
+    ] as Array<ChatMessageDto & StreamBlock>
+    const ctx = resolveCtxInfo(scan)
+    let turnCacheRate: number | null = null
+    let lastSpeedTs: number | null = null
+    for (let i = scan.length - 1; i >= 0 && (turnCacheRate === null || lastSpeedTs === null); i--) {
+      const m = scan[i]!
+      if (turnCacheRate === null && m.cacheHitRate != null) turnCacheRate = m.cacheHitRate
+      if (lastSpeedTs === null && (!m.role || m.role === 'assistant')) {
+        const outputTokens = m.usage?.output_tokens ?? m.outputTokens ?? 0
+        const decodeMs = m.usage?.decode_ms ?? m.decodeMs ?? 0
+        if (outputTokens > 0 && decodeMs > 0) lastSpeedTs = Math.round((outputTokens * 1000) / decodeMs)
+      }
+    }
+    return {
+      ctxUsed: ctx?.used ?? null,
+      ctxWindow: ctx?.window ?? null,
+      ctxPct: ctx?.pct ?? null,
+      turnCacheRate,
+      lastSpeedTs,
+    }
+  }))
   // [D1 usage-source] 底部数字只统计「用户自己的请求」：同会话后台任务（cron 调度 / 任务通知 run）
   //   复用同一 stream topic 推 message.usage（实测 63% 事件出自 cron-idle-* 线程）→ 不过滤则
   //   footer 的「缓存% / 当前上下文 / t/s」会被后台任务那轮顶掉（数字与用户操作无关地跳变）。
@@ -374,22 +433,19 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   //   唤醒的**主会话轮**（主会话收到消息并回复了）属于主会话对话，底部数字应随之刷新——「后台轮
   //   顶掉」在用户视角下正是当前活动；真正要排除的「子代理/fork 的 usage」结构性不进本流
   //   （不推 message.usage），无需过滤。
-  const usageScan = useMemo(() => [...msgs, ...liveBlocks], [msgs, liveBlocks])
-  const ctxInfo = useMemo(() => resolveCtxInfo(usageScan), [usageScan])
+  const ctxInfo = useMemo(
+    () => (usageProbe.ctxUsed != null && usageProbe.ctxWindow != null
+      ? { used: usageProbe.ctxUsed, window: usageProbe.ctxWindow, pct: usageProbe.ctxPct }
+      : null),
+    [usageProbe.ctxUsed, usageProbe.ctxWindow, usageProbe.ctxPct],
+  )
   // F1 · 缓存利用率：**消费后端权威命中率**（事件顶层 `cache_hit_rate` · **0-1 比率**）。
   //   [V101 口径上收] 删除前端「按 provider type 自行分派算法」的旧实现（anthropic → cr/(input+cr+cc)；
   //   openai/deepseek → cr/input）：该分派已在后端 ContextUsageCalculator.computeCacheHitRate 单点，
   //   前端重复实现必然漂移（历史教训：自定义命名 ant provider 名判 → 算出 3383%）。
   //   取数 = 最近一条带该值的消息/流式块（该条 assistant **自身**命中率，message.usage 事件透传）。
   //   缺值（后端 NON_NULL 省略）→ 不显示，⛔ 不臆造 0（仓内约定见 utils/subagentStats.ts:14）。
-  const turnCacheRate = useMemo(() => {
-    const scanned = usageScan
-    for (let i = scanned.length - 1; i >= 0; i--) {
-      const r = scanned[i]?.cacheHitRate
-      if (r != null) return r
-    }
-    return null
-  }, [usageScan])
+  const turnCacheRate = usageProbe.turnCacheRate
   // [缓存%双显示] 第二个数：**会话累计**命中率。优先级：
   //   ① 最近一条 assistant 消息上的 `sessionCacheHitRate`（message.complete 事件顶层 `cache_hit_rate` 透传 ·
   //      实时最新 · 0-1 比率）；
@@ -415,21 +471,13 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   //   速率在块转消息（complete）前即可读 —— 多轮 agent 每条 assistant 结束实时刷新，不再等 turn 完成落库。
   //   live 块无 role（隐含 assistant）；decode_ms 语义 = 首 token→完成整段计时，故速率是「每段输出收尾即跳」。
   //   [D1 usage-source] 同源于 message.usage → 与缓存%/上下文条统一只统计 user 来源（底部数字口径一致）。
-  const lastSpeedTs = useMemo(() => {
-    const scanned = usageScan as Array<ChatMessageDto & StreamBlock>
-    for (let i = scanned.length - 1; i >= 0; i--) {
-      const m = scanned[i]
-      if (m.role && m.role !== 'assistant') continue
-      const ot = m.usage?.output_tokens ?? m.outputTokens ?? 0
-      const dm = m.usage?.decode_ms ?? m.decodeMs ?? 0
-      if (ot > 0 && dm > 0) return Math.round((ot * 1000) / dm)
-    }
-    return null
-  }, [usageScan])
+  const lastSpeedTs = usageProbe.lastSpeedTs
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const highlightRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
+  /** 待发附件预览（点击文件卡片 / 图片缩略图以外的文件类型） */
+  const [previewAtt, setPreviewAtt] = useState<PendingAttachment | null>(null)
   // 去重：Tauri onDragDropEvent 与浏览器 drop 可能双触发，同一份文件只添加一次。
   // ⭐ 批 ATT-DEDUP-KEY：键**不是文件名** —— 内容 md5（图片/≤5MB）/ 名+大小（大文件 upload）/
   //   完整路径（path 附件）。详见 `utils/attachmentDelivery.ts` 的「去重键 = 身份，不是名字」段。
@@ -717,9 +765,21 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
     return () => document.removeEventListener('mousedown', onDoc)
   }, [plusOpen])
 
+  // 知识库场景：模式胶囊自己弹模式列表（+ 菜单里不再放「模式」这一项）。
+  // 两个菜单互斥：开一个就关另一个，否则叠在一起。
+  const [modeMenuOpen, setModeMenuOpen] = useState(false)
+  const modeMenuRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!modeMenuOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (modeMenuRef.current && !modeMenuRef.current.contains(e.target as Node)) setModeMenuOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [modeMenuOpen])
+
   // 会话工具面板（功能2：禁用/恢复 · 会话级临时禁用）；鼠标移出组合延时收起 / Esc 逐层收
   const [toolsOpen, setToolsOpen] = useState(false)
-  const [toolsDisabledCount, setToolsDisabledCount] = useState(0)
   const toolsPanelRef = useRef<HTMLDivElement>(null)
   /** hover 关闭延时句柄（鼠标穿越 chip↔一级↔二级的 7px 缝隙时不误收） */
   const hoverCloseTimer = useRef<number | null>(null)
@@ -735,11 +795,6 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   useEffect(() => () => {
     if (hoverCloseTimer.current != null) window.clearTimeout(hoverCloseTimer.current)
   }, [])
-  // 会话切换 → 重置禁用角标（面板打开时 SessionToolsPanel 按 sessionId 自动重新拉取）
-  useEffect(() => {
-    setToolsDisabledCount(0)
-  }, [sessionId])
-
   // 附件（A1 契约 · 批 ATT-DROP）：**投递决策全在 utils/attachmentDelivery（有单测）**，本函数只做副作用接线。
   //   ⛔ 红线：不允许「已显示 chip、模型收不到」的静默丢弃 —— 每个 File 必须落进
   //   「真的进入投递通道（base64 / upload）」或「同步拒绝（提示 + 不生成 chip）」。
@@ -1167,6 +1222,8 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
             )}
           </div>
           )}
+          {/* [task-list-inline] 任务胶囊：与子代理/监控同排，样式复用监控的蓝色呼吸胶囊 */}
+          {!minimalChrome && taskListHint}
           {/* [subagent-hint] 子代理运行提示：紧挨 full 模式右侧（位置在视线区，不再放右缘操作组） */}
           {!minimalChrome && subagentHint}
           {/* [monitor-cc] 「正在监听：…」：显示 Monitor 在盯什么，点开右栏运行 tab */}
@@ -1220,6 +1277,60 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
         )}
         <div className="input-box">
           {topChips}
+          {attachments.length > 0 && (
+            <div className="attach-preview">
+              {attachments.map((a, i) => {
+                const remove = () => {
+                  // ⭐ 释放点①：必须用该 chip 的 **dedupKey**（键已不是文件名 —— 用 filename 释放
+                  //   会「移除了 chip 但键还在」⇒ 同一张图再也加不回来）
+                  addedKeysRef.current.delete(a.dedupKey)
+                  setAttachments((prev) => prev.filter((_, j) => j !== i))
+                }
+                // 图片：缩略图；其余：DSH `FileCard` 同款横卡（类型图标 + 文件名 + 扩展名/大小）
+                if (a.preview) {
+                  return (
+                    <div key={`${a.filename}-${i}`} className="attach-item" title={a.filename}>
+                      <img src={a.preview} alt={a.filename} className="attach-thumb" onClick={() => setZoomImg(a.preview!)} style={{ cursor: 'zoom-in' }} />
+                      <button className="attach-remove" onClick={remove} title="移除附件">×</button>
+                    </div>
+                  )
+                }
+                const ext = /\.([^./\\]+)$/.exec(a.filename)?.[1]?.toUpperCase().slice(0, 8) ?? ''
+                const meta = [ext, a.size != null ? formatFileSize(a.size) : ''].filter(Boolean).join(' ')
+                const openPreview = () => {
+                  if (a.contentId === '__uploading__') {
+                    showToast('附件上传中，完成后可预览', 'info')
+                    return
+                  }
+                  setPreviewAtt(a)
+                }
+                return (
+                  <div
+                    key={`${a.filename}-${i}`}
+                    className="attach-file-card"
+                    title={`点击预览：${a.filename}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={openPreview}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openPreview() }
+                    }}
+                  >
+                    <span className="attach-file-icon"><AttachFileIcon name={a.filename} size={28} /></span>
+                    <span className="attach-file-body">
+                      <span className="attach-file-name">{a.filename}</span>
+                      {meta && <span className="attach-file-meta">{meta}</span>}
+                    </span>
+                    <button
+                      className="attach-file-remove"
+                      onClick={(e) => { e.stopPropagation(); remove() }}
+                      title="移除附件"
+                    >×</button>
+                  </div>
+                )
+              })}
+            </div>
+          )}
           <div style={{ position: 'relative' }}>
             <div
               ref={highlightRef}
@@ -1479,26 +1590,13 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
               </div>
             )}
           </div>
-          {attachments.length > 0 && (
-            <div className="attach-preview">
-              {attachments.map((a, i) => (
-                <div key={`${a.filename}-${i}`} className="attach-item" title={a.filename}>
-                  {a.preview
-                    ? <img src={a.preview} alt={a.filename} className="attach-thumb" onClick={() => setZoomImg(a.preview!)} style={{ cursor: 'zoom-in' }} />
-                    : <span className="attach-file">{a.filename}</span>}
-                  <button
-                    className="attach-remove"
-                    onClick={() => {
-                      // ⭐ 释放点①：必须用该 chip 的 **dedupKey**（键已不是文件名 —— 用 filename 释放
-                      //   会「移除了 chip 但键还在」⇒ 同一张图再也加不回来）
-                      addedKeysRef.current.delete(a.dedupKey)
-                      setAttachments((prev) => prev.filter((_, j) => j !== i))
-                    }}
-                    title="移除附件"
-                  >×</button>
-                </div>
-              ))}
-            </div>
+          {previewAtt && createPortal(
+            <AttachPreviewModal
+              att={previewAtt}
+              sessionId={sessionId ?? ''}
+              onClose={() => setPreviewAtt(null)}
+            />,
+            document.body,
           )}
           <div className="toolbar">
             <div className="left-tools">
@@ -1547,7 +1645,7 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                     <div className="plus-sep" />
                     {/* 目标：会话行为设定（与「模式」同级），不是内容附件 ⇒ 单独成组、排在添加文件之后。
                         右侧徽章随状态：无目标=「设定」，有目标=「追踪中」。点开 → 输入框顶部就地变面板。 */}
-                    {onSetGoal && (
+                    {!agentModes && onSetGoal && (
                       <button
                         type="button"
                         className="plus-item"
@@ -1564,25 +1662,9 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                       </button>
                     )}
                     {/* 模式：右侧 flyout（不再是盲切一项；modeLocked 时只提示不切换） */}
-                    {agentModes ? (
-                      <>
-                        {agentModes.map((m) => (
-                          <button
-                            key={m.key}
-                            type="button"
-                            className="plus-item"
-                            role="menuitemradio"
-                            aria-checked={m.active}
-                            title={m.title}
-                            onClick={() => { closePlusMenu(); m.onPick() }}
-                          >
-                            <span>{m.active ? '●' : '○'}</span>
-                            <span>{m.label}</span>
-                            {m.active && <span className="plus-badge on">当前</span>}
-                          </button>
-                        ))}
-                      </>
-                    ) : (
+                    {/* 模式：主会话有（simple/full）；知识库没有这一项 —— 模式改由左下角
+                        模式胶囊自己弹出（用户 2026-11-18：「知识库菜单少了模式选择和目标」）。 */}
+                    {!agentModes && (
                     <div className="plus-sub-anchor">
                       <button
                         type="button"
@@ -1657,8 +1739,48 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                   </div>
                 )}
               </div>
-              {/* 当前专家：绿色胶囊（在 + 右侧）· hover 出 × 清除（App → handleAgentChange(null)） */}
-              {currentAgent && currentAgent.trim() && (
+              {/* 当前专家/模式胶囊（在 + 右侧）
+                  · 主会话：纯展示，hover 出 × 清除（App → handleAgentChange(null)）
+                  · 知识库（agentModes）：可点击，自己弹模式列表 —— + 菜单里不再放「模式」 */}
+              {agentModes && currentAgent && currentAgent.trim() ? (
+                <div className="plus-wrap" ref={modeMenuRef}>
+                  <button
+                    type="button"
+                    className={`agent-pill agent-pill-btn${modeMenuOpen ? ' active' : ''}`}
+                    title={`当前模式：${currentAgent} · 点击切换`}
+                    aria-label="切换知识库对话模式"
+                    aria-expanded={modeMenuOpen}
+                    onClick={() => { closePlusMenu(); setModeMenuOpen((v) => !v) }}
+                  >
+                    <span className="agent-pill-ava" aria-hidden="true">
+                      <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <path d="M2.5 6.2l2.2 2.2 4.8-4.8" />
+                      </svg>
+                    </span>
+                    <span className="agent-pill-name">{currentAgent}</span>
+                    <span className="plus-chev" aria-hidden="true">▾</span>
+                  </button>
+                  {modeMenuOpen && (
+                    <div className="plus-menu" role="menu">
+                      {agentModes.map((m) => (
+                        <button
+                          key={m.key}
+                          type="button"
+                          className="plus-item"
+                          role="menuitemradio"
+                          aria-checked={m.active}
+                          title={m.title}
+                          onClick={() => { setModeMenuOpen(false); m.onPick() }}
+                        >
+                          <span>{m.active ? '●' : '○'}</span>
+                          <span>{m.label}</span>
+                          {m.active && <span className="plus-badge on">当前</span>}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              ) : currentAgent && currentAgent.trim() && (
                 <span className="agent-pill" title={`当前专家：${currentAgent}`}>
                   {onClearAgent && (
                     <span
@@ -1696,14 +1818,70 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                   <span>知识库</span>
                 </button>
               )}
-              {/* NexusAI in Chrome：输入框工具栏浏览器按钮 → 打开 ChromePanel（检查/安装/连接引导） */}
-              {onOpenChromePanel && !minimalTools && (
-                <div className="tool-chip" onClick={onOpenChromePanel} title="NexusAI in Chrome：浏览器自动化扩展（检查/安装/连接）">
-                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">
-                    <circle cx="6" cy="6" r="4" />
-                    <path d="M2 6h8M6 2a4.5 4.5 0 0 1 0 8M6 2a4.5 4.5 0 0 0 0 8" />
+              {/* [2026-11-19 用户裁定 · 对齐 CC]
+                  计划模式 = claude.exe 的 EnterPlanMode（`/plan` 链路），⛔ 不是权限模式下拉的普通选项。
+                  · 进入：空闲立即生效；turn 运行中**排队**（CC 语义：输入 /plan 入队，消费后执行），
+                    前端先乐观显示「已进入」——排队逻辑在 App，chip 不做拦截。
+                  · 退出：= 切换权限模式（CC Shift+Tab 随时可切，无 busy 守卫），恢复进入前模式。
+                  激活态读会话有效 permissionMode（SessionService 已合并 session_permission_rules）。 */}
+              {(onEnterPlanMode || onExitPlanMode) && !minimalTools && (
+                <div
+                  className={`tool-chip plan-mode plan-mode-chip${permissionMode === 'plan' ? ' active' : ''}${planPending ? ' pending' : ''}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={permissionMode === 'plan' ? 'true' : 'false'}
+                  title={permissionMode === 'plan'
+                    ? '退出计划模式（切换回进入前的权限模式）'
+                    : planPending
+                      ? '已排队：当前任务结束后进入计划模式'
+                      : streaming
+                        ? '进入计划模式（当前任务结束后生效）'
+                        : '进入计划模式（EnterPlanMode）：先探索、出计划，批准后再动手'}
+                  onClick={() => {
+                    if (permissionMode === 'plan') onExitPlanMode?.()
+                    else if (planPending) showToast('已排队：当前任务结束后进入计划模式', 'info')
+                    else onEnterPlanMode?.()
+                  }}
+                  onKeyDown={(e) => {
+                    if (e.key !== 'Enter' && e.key !== ' ') return
+                    e.preventDefault()
+                    if (permissionMode === 'plan') onExitPlanMode?.()
+                    else if (planPending) showToast('已排队：当前任务结束后进入计划模式', 'info')
+                    else onEnterPlanMode?.()
+                  }}
+                >
+                  <Icon.PlanMode />
+                  <span>计划</span>
+                  <i className="plan-indicator" aria-hidden="true" />
+                </div>
+              )}
+              {/* [2026-11-19] 浏览器入口挪走（AI 已知道怎么用浏览器）⇒ 原位换成「协调者」。
+                  点击 chip 即切换会话级覆盖；激活态复用计划模式样式（浅蓝底 + 点呼吸），
+                  不开小开关——整个 chip 就是开关。 */}
+              {onCoordinatorModeChange && !minimalTools && (
+                <div
+                  className={`tool-chip plan-mode coordinator-chip${coordinatorMode ? ' active' : ''}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-pressed={coordinatorMode ? 'true' : 'false'}
+                  title={`协调者模式：主线程作为协调者调度子代理（本会话${coordinatorMode ? '已开启' : '已关闭'}，覆盖全局设置）`}
+                  onClick={() => onCoordinatorModeChange(!coordinatorMode)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter' || e.key === ' ') {
+                      e.preventDefault()
+                      onCoordinatorModeChange(!coordinatorMode)
+                    }
+                  }}
+                >
+                  <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="3" cy="3" r="1.6" />
+                    <circle cx="9" cy="6" r="1.6" />
+                    <circle cx="3" cy="9" r="1.6" />
+                    <path d="M4.4 3.6l3 1.9M4.4 8.4l3-1.9" />
                   </svg>
-                  <span>浏览器</span>
+                  <span>协调者</span>
+                  {/* 复用计划模式的激活语言：关闭灰点 / 开启蓝点呼吸（用户指定「之前的计划模式样式」） */}
+                  <i className="plan-indicator" aria-hidden="true" />
                 </div>
               )}
               {/* 会话工具：齿轮入口（默认只显图标，hover 滑出「工具」）→ 一级分类目录 → 二级明细 */}
@@ -1721,21 +1899,21 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                 }}
               >
                 <div className="tool-chip tool-entry" title="工具">
-                  <span className="entry-ico">
+                  {/* 用 <i> 而不是 <span>：窄栏（<620px）的 `tool-chip > span` 收文字规则
+                      会把图标一起 display:none 掉——图标必须常驻，文字才收。 */}
+                  <i className="entry-ico">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" strokeLinejoin="round">
                       <circle cx="12" cy="12" r="3" />
                       <path d="M19.4 15a1.7 1.7 0 00.3 1.9l.1.1a2 2 0 11-2.8 2.8l-.1-.1a1.7 1.7 0 00-1.9-.3 1.7 1.7 0 00-1 1.5V21a2 2 0 11-4 0v-.1a1.7 1.7 0 00-1.1-1.5 1.7 1.7 0 00-1.9.3l-.1.1a2 2 0 11-2.8-2.8l.1-.1a1.7 1.7 0 00.3-1.9 1.7 1.7 0 00-1.5-1H3a2 2 0 110-4h.1a1.7 1.7 0 001.5-1.1 1.7 1.7 0 00-.3-1.9l-.1-.1a2 2 0 112.8-2.8l.1.1a1.7 1.7 0 001.9.3H9a1.7 1.7 0 001-1.5V3a2 2 0 114 0v.1a1.7 1.7 0 001 1.5 1.7 1.7 0 001.9-.3l.1-.1a2 2 0 112.8 2.8l-.1.1a1.7 1.7 0 00-.3 1.9V9a1.7 1.7 0 001.5 1H21a2 2 0 110 4h-.1a1.7 1.7 0 00-1.5 1z" />
                     </svg>
-                  </span>
+                  </i>
                   <span className="entry-label">工具</span>
-                  {toolsDisabledCount > 0 && <span className="entry-dot" title="有工具被禁用" />}
                 </div>
                 {toolsOpen && (
                   <SessionToolsPanel
                     sessionId={sessionId ?? ''}
                     showToast={showToast}
                     onClose={() => setToolsOpen(false)}
-                    onCountChange={setToolsDisabledCount}
                     onOpenChromePanel={onOpenChromePanel}
                   />
                 )}

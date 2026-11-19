@@ -111,12 +111,19 @@ public final class BashToolPrompt {
     private static final String AVOID_COMMANDS =
         "`find`, `grep`, `cat`, `head`, `tail`, `sed`, `awk`, or `echo`";
 
-    /** CC original: getBackgroundUsageNote()（prompt.ts:35-40，CLAUDE_CODE_DISABLE_BACKGROUND_TASKS 未设置时） */
+    /**
+     * CC original（v2.1.325，Bash prompt off≈321,048,101）：run_in_background 段。
+     *
+     * <p>旧版（Open-ClaudeCode 2026-04 {@code getBackgroundUsageNote()}）只说「完成会通知」；
+     * v2.1.325 追加了硬约束 {@code You will be notified when it exits — do not poll its output file
+     * while waiting.}，这是抑制轮询输出文件的关键句（2.1.328 起 TaskOutput 工具已移除，读输出走 Read）。
+     */
     private static final String BACKGROUND_NOTE =
         "You can use the `run_in_background` parameter to run the command in the background. "
-            + "Only use this if you don't need the result immediately and are OK being notified when the command completes later. "
-            + "You do not need to check the output right away - you'll be notified when it finishes. "
-            + "You do not need to use '&' at the end of the command when using this parameter.";
+            + "Only use this if you don't need the result immediately; you'll be notified if it finishes "
+            + "while you are still working. "
+            + "You do not need to use '&' at the end of the command when using this parameter. "
+            + "You will be notified when it exits — do not poll its output file while waiting.";
 
     private BashToolPrompt() {
     }
@@ -295,25 +302,28 @@ public final class BashToolPrompt {
     }
 
     /**
-     * CC original: sleepSubitems（prompt.ts:310-328）· feature('MONITOR_TOOL') 分叉。
-     * monitorToolEnabled=false → 「轮询外部进程用 check 命令」+「sleep 保持 1-5s」两行（Java 默认）。
+     * CC original（v2.1.325 off≈321,048,101）：sleep 段。
+     *
+     * <p>开启 Monitor 时的原文：
+     * {@code Foreground `sleep` is blocked; use Monitor with an until-loop to wait on a condition.}
+     * （旧版 Open-ClaudeCode 是「Use the Monitor tool to stream events... / 一次性等待用 run_in_background」，
+     * 没有「等某个条件」这条分流的明确说法。）
+     *
+     * <p>monitorToolEnabled=false → 保留旧版「轮询外部进程用 check 命令」+「sleep 保持 1-5s」两行。
      */
     private static List<Object> sleepSubitems(boolean monitorToolEnabled) {
         List<Object> sub = new ArrayList<>();
         sub.add("Do not sleep between commands that can run immediately — just run them.");
         if (monitorToolEnabled) {
-            sub.add("Use the Monitor tool to stream events from a background process (each stdout line is a notification). "
-                + "For one-shot \"wait until done,\" use Bash with run_in_background instead.");
+            sub.add("Foreground `sleep` is blocked; use Monitor with an until-loop to wait on a condition "
+                + "(e.g. `until <check>; do sleep 2; done`).");
         }
         sub.add("If your command is long running and you would like to be notified when it finishes — "
             + "use `run_in_background`. No sleep needed.");
         sub.add("Do not retry failing commands in a sleep loop — diagnose the root cause.");
         sub.add("If waiting for a background task you started with `run_in_background`, you will be notified when it "
             + "completes — do not poll.");
-        if (monitorToolEnabled) {
-            sub.add("`sleep N` as the first command with N ≥ 2 is blocked. If you need a delay (rate limiting, "
-                + "deliberate pacing), keep it under 2 seconds.");
-        } else {
+        if (!monitorToolEnabled) {
             sub.add("If you must poll an external process, use a check command (e.g. `gh run view`) rather than "
                 + "sleeping first.");
             sub.add("If you must sleep, keep the duration short (1-5 seconds) to avoid blocking the user.");

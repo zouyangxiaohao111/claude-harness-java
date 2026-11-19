@@ -435,10 +435,10 @@ public class PowerShellTool implements Tool {
                         sleepPattern);
                 }
                 return ValidationResult.fail("10",
-                    "Blocked: " + sleepPattern + ". Run blocking commands in the background with "
-                        + "run_in_background: true — you'll get a completion notification when done. "
-                        + "For streaming events (watching logs, polling APIs), use the Monitor tool. "
-                        + "If you genuinely need a delay (rate limiting, deliberate pacing), keep it under 2 seconds.");
+                    "Blocked: " + sleepPattern + ". To wait for a condition, use Monitor with an "
+                        + "until-loop (e.g. `until <check>; do sleep 2; done`). To wait for a command "
+                        + "you started, use run_in_background: true. Do not chain shorter sleeps to "
+                        + "work around this block.");
             }
         }
         return ValidationResult.pass();
@@ -1113,7 +1113,11 @@ public class PowerShellTool implements Tool {
             "assistantAutoBackgrounded", false);
         return ToolResult.successWithStructuredOutput(toolUseId,
             "Background task started: " + taskId
-                + "\nUse TaskOutput to read the result from: " + outputFile,
+                + "\nOutput is written to: " + outputFile
+                + "\nYou will be notified when it exits — do not poll its output file while waiting. "
+                + "If you need that result before you reply and nothing else is left to do, wait with one "
+                + "foreground shell command that blocks until the output file shows what you need; "
+                + "otherwise continue with other work.",
             structuredOutput);
     }
 

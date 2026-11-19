@@ -165,8 +165,8 @@ class BashToolTest {
             false, false, false, false, false, false, false, true, false, false, false, false, false);
         bashTool.setFeatureFlags(flags);
         String p = bashTool.prompt();
-        assertThat(p).contains("Use the Monitor tool to stream events from a background process");
-        assertThat(p).contains("`sleep N` as the first command with N ≥ 2 is blocked.");
+        assertThat(p).contains("Foreground `sleep` is blocked; use Monitor with an until-loop to wait on a condition");
+        assertThat(p).contains("You will be notified when it exits — do not poll its output file while waiting.");
         // 非 Monitor 变体子项应消失（feature('MONITOR_TOOL') 分叉）
         assertThat(p).doesNotContain("If you must poll an external process, use a check command (e.g. `gh run view`)");
     }

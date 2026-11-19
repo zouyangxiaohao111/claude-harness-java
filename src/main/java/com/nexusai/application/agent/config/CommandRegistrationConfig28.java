@@ -9,8 +9,11 @@ import com.nexusai.application.agent.command.InsightsCollector;
 import com.nexusai.application.agent.compact.PlanProviderImpl;
 import com.nexusai.application.agent.context.ContextAnalyzeService;
 import com.nexusai.application.agent.permission.PermissionBehavior;
+import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionRule;
 import com.nexusai.application.agent.permission.PermissionRuleSource;
+import com.nexusai.application.agent.permission.PermissionUpdate;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
 import com.nexusai.application.agent.permission.classifier.DenialTracker;
 import com.nexusai.application.agent.permission.hook.HookRegistry;
 import com.nexusai.application.agent.permission.source.LocalSettingsLoader;
@@ -30,6 +33,7 @@ import com.nexusai.domain.mcp.McpServerService;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.model.command.Command;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.model.command.CommandSource;
 import com.nexusai.model.mcp.dto.McpServerDto;
 import com.nexusai.model.session.dto.ChatMessageDto;
@@ -288,6 +292,7 @@ public class CommandRegistrationConfig28 {
             @Autowired(required = false) ContextAnalyzeService contextAnalyzeService,
             @Autowired(required = false) AnalyticsTracker analyticsTracker,
             @Autowired(required = false) SessionAgentStateRegistry sessionRegistry,
+            @Autowired(required = false) SessionMapper sessionMapper,
             @Autowired(required = false) UserSettingsLoader userSettingsLoader,
             @Autowired(required = false) ProjectSettingsLoader projectSettingsLoader,
             @Autowired(required = false) LocalSettingsLoader localSettingsLoader,
@@ -301,7 +306,7 @@ public class CommandRegistrationConfig28 {
         }
         registerMcpHandler(dispatcher, mcpServerService);
         registerPermissionsHandler(dispatcher, userSettingsLoader, projectSettingsLoader, localSettingsLoader, denialTracker);
-        registerPlanHandler(dispatcher, sessionRegistry);
+        registerPlanHandler(dispatcher, sessionRegistry, sessionMapper);
         registerHooksHandler(dispatcher, hookRegistry);
         registerSkillsHandler(dispatcher, skillRegistry);
         registerAgentsHandler(dispatcher, subagentTool, agentSummaryService);
@@ -448,7 +453,8 @@ public class CommandRegistrationConfig28 {
      * <p>PlanProviderImpl 以 sessionId 为 slug 直构（非 Spring bean）。sessionRegistry 未注入或无
      * 活跃 AgentState（会话空闲）→ planMode 仅本次日志记录（受控差异：AgentState 生命周期内有效）。
      */
-    private void registerPlanHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry) {
+    private void registerPlanHandler(UserInputDispatcher dispatcher, SessionAgentStateRegistry sessionRegistry,
+                                     SessionMapper sessionMapper) {
         dispatcher.registerSlashCommand("plan", (args, sessionId, inFlightUserMessageId) -> {
             // [批 3c] 会话标识取 handler 形参（不再读裸 MDC）
             String trimmed = args != null ? args.trim() : "";
@@ -463,8 +469,11 @@ public class CommandRegistrationConfig28 {
             if (!planMode) {
                 // CC plan.tsx:73-82 —— 非 plan 模式 → 启用 plan 模式
                 writeSessionPlanMode(sessionRegistry, sessionId, true);
+                // [plan-approval] 同步写统一权限源：工具/提醒读的是会话权限上下文，不是
+                // AgentState.planMode（旧实现只写后者 ⇒ /plan 对模型「没有发生」）。
+                persistPlanMode(sessionMapper, sessionId, PermissionMode.PLAN);
                 boolean shouldQuery = !trimmed.isBlank() && !"open".equals(trimmed);
-                log.info("[CommandRegistrationConfig28] /plan → 已启用 plan 模式（web 会话级 AgentState.planMode=true）"
+                log.info("[CommandRegistrationConfig28] /plan → 已启用 plan 模式（session_permission_rules + AgentState.planMode）"
                     + " shouldQuery={}（对齐 CC plan.tsx:75-89 handlePlanModeTransition + setAppState mode='plan'）",
                     shouldQuery);
                 return;
@@ -903,6 +912,28 @@ public class CommandRegistrationConfig28 {
             return;
         }
         state.setPlanMode(planMode);
+    }
+
+    /**
+     * [plan-approval] /plan 写统一权限源 · sessions.session_permission_rules 的 SESSION setMode。
+     *
+     * <p>旧实现只写 AgentState.planMode（唯一消费者是 PromptSuggestion），工具与提醒读的是
+     * 会话权限上下文 ⇒ 用户输入 /plan 后模型侧「没有进入 plan」。
+     */
+    private static void persistPlanMode(SessionMapper sessionMapper, String sessionId, PermissionMode mode) {
+        if (sessionMapper == null || sessionId == null || sessionId.isBlank()) {
+            log.warn("[CommandRegistrationConfig28] /plan 无法写会话权限源（{} 缺失）⇒ 本命令仅内存记录",
+                sessionMapper == null ? "sessionMapper" : "sessionId");
+            return;
+        }
+        try {
+            SessionPermissionOverlay.persistSessionUpdates(sessionMapper, sessionId,
+                java.util.List.of(new PermissionUpdate.SetMode(
+                    PermissionUpdate.Destination.SESSION, mode)),
+                "slash_plan");
+        } catch (Throwable t) {
+            log.warn("[CommandRegistrationConfig28] /plan 写会话权限源失败（本次内存记录仍保留）: {}", t.toString());
+        }
     }
 
     /** 渲染会话 markdown 导出摘要 · 对齐 ExportController.renderMarkdown 核心段（title + 消息数 + 逐条 role/content）。 */

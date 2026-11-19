@@ -103,14 +103,14 @@ class QueryLoopForkedAgentIdTest {
         // ══ 1. 捕获 fork 的 AgentState.agentId（唯一非公开出口 = 每轮 drain SendMessage 待办）══
         AgentNameRegistry registry = mock(AgentNameRegistry.class);
         // 空队列 → drain 命中后立即返回（不进 coordinator 包裹链 ⇒ 断言面只有 agentId 本身）
-        when(registry.drain(anyString())).thenReturn(List.of());
+        when(registry.drainPending(anyString())).thenReturn(List.of());
         loopForRegistryBridge = new LlmAgentLoop(mock(LlmProviderFactory.class));
         loopForRegistryBridge.setAgentNameRegistry(registry);
 
         RunForkedAgent.run(extractForkParams(), newQueryLoop());
 
         ArgumentCaptor<String> capturedId = ArgumentCaptor.forClass(String.class);
-        verify(registry, atLeastOnce()).drain(capturedId.capture());
+        verify(registry, atLeastOnce()).drainPending(capturedId.capture());
         String forkAgentId = capturedId.getValue();
 
         assertThat(forkAgentId)

@@ -193,6 +193,10 @@ public class SettingsService {
         if (req.autoCompactWindow() != null) s.setAutoCompactWindow(req.autoCompactWindow());
         // [V292] 后台向量化并发全局默认（PATCH 语义：null 不改）
         if (req.modelMaxConcurrency() != null) s.setModelMaxConcurrency(req.modelMaxConcurrency());
+        // [V302 plan-approval] 计划审批卡「清空上下文」选项开关（null = 不改）
+        if (req.showClearContextOnPlanAccept() != null) {
+            s.setShowClearContextOnPlanAccept(req.showClearContextOnPlanAccept());
+        }
 
         // [C-05 · OPD-CM5-C-05] autoMemoryDirectory 存 DB 列（V34 列 auto_memory_directory，
         // 前端"模型配置页-环境配置"可配置，对齐 CC 给默认值；null = 不覆盖）。
@@ -919,7 +923,9 @@ public class SettingsService {
             s.getSubagentDefaultRuntime(),
             s.getSubagentExternalEnabled(),
             // [V292] 后台向量化并发全局默认透出（不补这行前端恒显示空）
-            s.getModelMaxConcurrency()
+            s.getModelMaxConcurrency(),
+            // [V302] 计划审批卡「清空上下文」选项（null = 未配置 → 前端按关闭处理）
+            s.getShowClearContextOnPlanAccept()
         );
     }
 

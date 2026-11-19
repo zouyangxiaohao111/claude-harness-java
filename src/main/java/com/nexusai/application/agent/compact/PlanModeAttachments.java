@@ -8,7 +8,9 @@ import org.slf4j.LoggerFactory;
 
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
  * tool 轮 plan_mode 附件生产器 · 对齐 CC {@code utils/attachments.ts:1186-1273}
@@ -55,6 +57,21 @@ public final class PlanModeAttachments {
     public static final String APP_STATE_FLAGS_KEY = "planModeFlags";
 
     /**
+     * 会话级 PlanModeFlags registry · 对齐 CC {@code bootstrap/state.ts} 的进程级 STATE 布尔。
+     *
+     * <p><b>WHY 不继续只挂 appState</b>：ToolUseContext 的 getAppState 桥返回
+     * {@code Map.copyOf(appStateRef)}（LlmAgentLoop#getAppStateSnapshot），是不可变快照；在它上面
+     * {@code put} 会抛 {@link UnsupportedOperationException}，被注入链 catch 吞掉后 plan_mode 附件
+     * 整轮丢失。同时 LlmAgentLoop 是 prototype（每次 send 新实例），appStateRef 活不过下一条用户
+     * 消息 ⇒ 退出标志/计数在跨 send 后消失。CC 的这两个布尔本就是长驻进程 STATE，按会话 ID 存
+     * 静态表才是等价载体。
+     *
+     * <p>生命周期：进程内按会话保留；会话删除时由 {@link #clearSessionFlags(String)} 清理。
+     * 进程重启丢失与 CC 一致。
+     */
+    private static final Map<String, PlanModeFlags> SESSION_FLAGS = new ConcurrentHashMap<>();
+
+    /**
      * 从 appState 读取或创建会话级 PlanModeFlags（get-or-create）· 供 loop（每轮）与
      * EnterPlanModeTool / ExitPlanModeTool（置 flag）共用，保证三方操作同一会话级对象。
      *
@@ -62,16 +79,42 @@ public final class PlanModeAttachments {
      * @return 已存在 / 新建并回写的 PlanModeFlags
      */
     public static PlanModeFlags getOrCreateFlags(java.util.Map<String, Object> appState) {
+        // ⚠ 兼容入口：只用于测试/旧调用。生产一律走 getOrCreateFlagsBySession ——
+        //   生产 getAppState 是 Map.copyOf 的不可变快照，put 会抛 UOE（注入被吞）。
         if (appState != null) {
             Object existing = appState.get(APP_STATE_FLAGS_KEY);
             if (existing instanceof PlanModeFlags flags) {
                 return flags;
             }
             PlanModeFlags flags = new PlanModeFlags();
-            appState.put(APP_STATE_FLAGS_KEY, flags);
+            try {
+                appState.put(APP_STATE_FLAGS_KEY, flags);
+            } catch (UnsupportedOperationException e) {
+                log.debug("[PlanModeAttachments] appState 为不可变快照，flags 不落 appState（改用会话级 registry）");
+            }
             return flags;
         }
         return new PlanModeFlags();
+    }
+
+    /**
+     * 会话级 PlanModeFlags（生产入口）· 同会话三方（loop / Enter / Exit）共享同一实例。
+     *
+     * @param sessionId 会话 ID；null/空白 → 返回未注册的新实例（不共享，调用方不得依赖跨轮）
+     * @return 稳定的会话级 flags
+     */
+    public static PlanModeFlags getOrCreateFlagsBySession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return new PlanModeFlags();
+        }
+        return SESSION_FLAGS.computeIfAbsent(sessionId, k -> new PlanModeFlags());
+    }
+
+    /** 会话删除时清理 flags（避免静态表泄漏）。 */
+    public static void clearSessionFlags(String sessionId) {
+        if (sessionId != null) {
+            SESSION_FLAGS.remove(sessionId);
+        }
     }
 
     /**
@@ -226,6 +269,14 @@ public final class PlanModeAttachments {
         private boolean hasExitedPlanModeInSession = false;
         private boolean needsPlanModeExitAttachment = false;
         private int lastPlanModeAttachmentTurn = -1;
+        /**
+         * [2026-11-19 权限模式转移] 上一轮已应用过的权限模式 · loop 每轮拿本轮 desiredMode 与它比较，
+         * 不同才走 {@code GetNextPermissionMode.transitionPermissionMode}（同值不调，避免重复副作用）。
+         * null = 本进程内还没 apply 过（首轮按当前模式直接落值，不触发转换）。
+         */
+        private PermissionMode lastAppliedMode = null;
+        /** auto_mode_exit 附件一次性标志（离开 auto 置位；渲染端 AgentLoopContext 已有 case）。 */
+        private boolean needsAutoModeExitAttachment = false;
 
         public boolean hasExitedPlanModeInSession() { return hasExitedPlanModeInSession; }
         public void setHasExitedPlanModeInSession(boolean v) { this.hasExitedPlanModeInSession = v; }
@@ -233,5 +284,9 @@ public final class PlanModeAttachments {
         public void setNeedsPlanModeExitAttachment(boolean v) { this.needsPlanModeExitAttachment = v; }
         public int lastPlanModeAttachmentTurn() { return lastPlanModeAttachmentTurn; }
         public void setLastPlanModeAttachmentTurn(int v) { this.lastPlanModeAttachmentTurn = v; }
+        public PermissionMode lastAppliedMode() { return lastAppliedMode; }
+        public void setLastAppliedMode(PermissionMode v) { this.lastAppliedMode = v; }
+        public boolean needsAutoModeExitAttachment() { return needsAutoModeExitAttachment; }
+        public void setNeedsAutoModeExitAttachment(boolean v) { this.needsAutoModeExitAttachment = v; }
     }
 }

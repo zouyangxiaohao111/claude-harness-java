@@ -100,7 +100,7 @@ export type PermissionKind = 'message' | 'bridge' | 'channel'
  *  `permissionUpdates` = 用户点「一键授权」时后端推来的 suggestions **原样**回传
  *  （wire 键 `updatedPermissions`，CC 判别联合形状）→ 后端 apply 到 ctx + 落盘。
  *  ⛔ 前端不做任何结构转换；仅点击第三档时携带（普通允许/拒绝不传 → 不产生规则）。 */
-export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations; permissionUpdates?: PermissionUpdate[] }) {
+export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations; permissionUpdates?: PermissionUpdate[]; acceptFeedback?: string; updatedInput?: unknown }) {
   const dest = {
     message: `/app/sessions/${sessionId}/permission-response`,
     bridge: `/app/sessions/${sessionId}/permission-bridge-response`,
@@ -112,6 +112,14 @@ export function sendPermissionResponse(client: Client, sessionId: string, kind: 
   // 空数组不发（与后端 @JsonInclude(NON_NULL) 对齐：无更新 = 不传字段）
   if (extra?.permissionUpdates !== undefined && extra.permissionUpdates.length > 0) {
     payload.updatedPermissions = extra.permissionUpdates
+  }
+  // [plan-approval] 拒绝时的修改意见 / 批准时附带的说明（CC acceptFeedback）
+  if (extra?.acceptFeedback !== undefined && extra.acceptFeedback !== '') {
+    payload.acceptFeedback = extra.acceptFeedback
+  }
+  // [plan-approval] 用户编辑后的工具输入（如审批卡里改过的计划）· CC updatedInput full replace
+  if (extra?.updatedInput !== undefined) {
+    payload.updatedInput = extra.updatedInput
   }
   client.publish({ destination: dest, body: JSON.stringify(payload) })
 }

@@ -163,8 +163,13 @@ describe('图片处理（V286）· 创建请求体', () => {
     expect(block).toContain('image_caption_enabled: payload.imageCaptionEnabled ?? true')
     expect(block).toContain('image_ocr_enabled: payload.imageOcrEnabled ?? true')
     expect(block).toContain("image_pipeline: payload.imagePipeline ?? 'default'")
-    // ⛔ 不能把旧 JSON 键透传成顶层字段（注释里可以提到它，但不能有赋值）
-    expect(block).not.toMatch(/image_processing_config\s*:/)
+    // ⛔ 不能把旧 JSON 键里的 `image_pipeline` 当成本组三列的来源。
+    // 注意：`image_processing_config` 本身是**另一份配置**（其它槽位如
+    // `smartocr.ocr_on_unobserved`），整体透传是合法的（`image_processing_config:
+    // payload.imageProcessingConfig ?? undefined`）—— 原断言 `not.toMatch(/image_processing_config\s*:/)`
+    // 把这条合法透传也挡住了，属断言过宽。这里只挡「旧键 ⟶ image_pipeline」的绑定形态。
+    expect(block).not.toMatch(/image_processing_config\s*:\s*\{[^}]*image_pipeline/)
+    expect(block).not.toMatch(/image_pipeline\s*:[^\n]*image_processing_config/)
   })
 })
 

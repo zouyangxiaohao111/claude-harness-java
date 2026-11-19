@@ -15,10 +15,13 @@
  * 新实现：流式期**照常解析**，靠 `streamingGuards` 修好未闭合语法。
  * 这正是「采用源侧做法」的要求，会推翻 2026-09-18 的旧裁定。
  */
-import { memo, useCallback, useMemo, useRef } from 'react'
+import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { createPortal } from 'react-dom'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import type { Renderer } from 'marked'
+
+import { isExternalLinkHref, openLinkInAppWindow, openLinkInBrowser } from '@/utils/externalLink'
 
 // 代码高亮：highlight.js（照抄源站，含 highlightAuto 兜底）
 import { highlightCode } from './codeHighlight'
@@ -30,6 +33,8 @@ import { repair, PROD_REPAIR_OPTS } from '@/markdown/rescue'
 
 import {
   renderChatMarkdown,
+  renderChatMarkdownIncremental,
+  type BlockFreezeCache,
   type RenderChatMarkdownOptions,
 } from './chatMarkdownRenderer'
 
@@ -105,6 +110,58 @@ export interface MarkdownTextV2Props {
    * ⛔ 不用内联 `onclick` —— 会被 DOMPurify 剥掉，且是 XSS 面。
    */
   onRunHtml?: (code: string) => void
+  /**
+   * 块级冻结（流式期增量渲染）：前部块复用上帧 HTML，只重解析尾部。
+   *
+   * <p><b>默认开</b>（2026-11-18 拍板）。缺省 undefined 时读
+   * `window.__NEXUS_MD_BLOCK_FREEZE__`（显式 false 可临时关，用于线上对比/回滚）；
+   * 显式 true/false 优先。只影响「文本增长的帧」，历史单渲/收口帧恒走全量。
+   *
+   * <p>前部块不再被 `innerHTML` 重写，选区/图片/高亮不再每帧被清掉。
+   */
+  blockFreeze?: boolean
+}
+
+/**
+ * 块级冻结开关（2026-11-18 用户拍板**默认开**）。
+ *
+ * 优先级：显式 prop → `window.__NEXUS_MD_BLOCK_FREEZE__`（显式 false 可临时关，
+ * 用于线上对比/回滚）→ 默认 `true`。
+ *
+ * <p>实际只影响「本次 text 是上次的追加」的帧（流式增长期）；历史消息首渲/收口帧
+ * 仍走全量单容器，DOM 结构不变。
+ */
+function blockFreezeEnabled(explicit?: boolean): boolean {
+  if (explicit !== undefined) return explicit
+  if (typeof window !== 'undefined') {
+    const flag = (window as { __NEXUS_MD_BLOCK_FREEZE__?: boolean }).__NEXUS_MD_BLOCK_FREEZE__
+    if (flag !== undefined) return flag === true
+  }
+  return true
+}
+
+/**
+ * 正文里的外链右键菜单状态（坐标 + 目标 href）。
+ *
+ * <p>左键点外链一律交系统浏览器；右键才出这个菜单，可选「客户端内新窗口」。
+ */
+interface LinkMenuState {
+  x: number
+  y: number
+  href: string
+}
+
+/**
+ * 从事件目标向上找**外链** `<a>`；hash / 相对路径 / 代码块按钮一律返回 null。
+ *
+ * <p>用 {@code getAttribute('href')} 判协议而不是 {@code anchor.href}：后者会把相对地址
+ * 绝对化成当前应用 origin 的 http: 地址，从而把站内链接误判成外链。
+ */
+function externalAnchorOf(target: EventTarget | null): HTMLAnchorElement | null {
+  const element = target as HTMLElement | null
+  const anchor = element?.closest?.('a[href]') as HTMLAnchorElement | null
+  if (!anchor) return null
+  return isExternalLinkHref(anchor.getAttribute('href') ?? '') ? anchor : null
 }
 
 /**
@@ -118,11 +175,19 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
   renderer,
   className,
   onRunHtml,
+  blockFreeze,
 }: MarkdownTextV2Props) {
   const rootRef = useRef<HTMLDivElement | null>(null)
+  const [linkMenu, setLinkMenu] = useState<LinkMenuState | null>(null)
+  /** [实验 · 块级冻结] 帧间缓存：前部块的 token.raw + 成品 HTML。 */
+  const freezeRef = useRef<BlockFreezeCache | null>(null)
+  /** 上一次渲染的源文本 —— 只有「本次是上次的追加」才值得走块级增量。 */
+  const lastTextRef = useRef<string | null>(null)
 
-  const html = useMemo(() => {
-    if (!text || !text.trim()) return ''
+  /** 块级冻结时返回按块拆开的 HTML（每块一个 DOM 容器，前部块不会被重写）；
+   *  否则返回整段 html（现状路径，单次 innerHTML）。 */
+  const rendered = useMemo<{ html: string; blocks: readonly { html: string }[] | null }>(() => {
+    if (!text || !text.trim()) return { html: '', blocks: null }
     // ⭐⭐ 分工：CC 管「流式期」，rescue 管「收口」。
     //
     // 流式期（streaming=true）**不跑 rescue** —— 与 V1 的取舍一致
@@ -146,13 +211,32 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
       streaming,
     }
     try {
-      return renderChatMarkdown(source, opts)
+      /* [实验 · 块级冻结] 只在「本次源文本是上次的追加」时启用：
+       *  - 首帧 / 历史消息单次渲染 / 收口帧 ⇒ 全量单容器（与现状结构完全一致）；
+       *  - 流式增长帧 ⇒ 块级增量（前部块 DOM 不重写），文本被替换时自愈成全量。
+       *  ⚠️ 判据不依赖 streaming prop —— 本仓流式期该 prop 实际恒为 false
+       *  （`turnRunning={!!thinking}`，而有块时 thinking=turnRunning&&!hasStream=false），
+       *  依赖它会让实验永不生效。该传参缺陷单独记录，不在本实验内改行为。 */
+      const previousText = lastTextRef.current
+      const growing = previousText !== null
+        && text.length > previousText.length
+        && text.startsWith(previousText)
+      lastTextRef.current = text
+      if (blockFreezeEnabled(blockFreeze) && growing) {
+        const result = renderChatMarkdownIncremental(source, opts, freezeRef.current)
+        freezeRef.current = result.cache
+        return { html: result.html, blocks: result.cache.blocks }
+      }
+      freezeRef.current = null
+      return { html: renderChatMarkdown(source, opts), blocks: null }
     } catch (e) {
       // 渲染失败不能让整条消息消失：降级成转义后的纯文本
       console.warn('[MarkdownTextV2] 渲染失败，降级纯文本', e)
-      return `<pre class="md-fallback">${escapeHtml(text)}</pre>`
+      freezeRef.current = null
+      return { html: `<pre class="md-fallback">${escapeHtml(text)}</pre>`, blocks: null }
     }
-  }, [text, streaming, renderer, onRunHtml])
+  }, [text, streaming, renderer, onRunHtml, blockFreeze])
+  const html = rendered.html
 
   /**
    * 点击委托：代码块的「复制」与 HTML 块的「运行」。
@@ -167,6 +251,14 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
   const onClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement | null
     if (!target) return
+
+    // ⓪ 外链：拦掉 webview 内导航（Tauri 里没有地址栏/后退键），交系统浏览器。
+    const anchor = externalAnchorOf(target)
+    if (anchor) {
+      e.preventDefault()
+      void openLinkInBrowser(anchor.href)
+      return
+    }
 
     // ① 运行（HTML 代码块）
     const runBtn = target.closest('.chat-code-block__run') as HTMLElement | null
@@ -194,18 +286,111 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
     })
   }, [onRunHtml])
 
+  /** 右键外链：只拦外链的默认菜单，其它区域保持系统菜单（复制文字等）。 */
+  const onContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
+    const anchor = externalAnchorOf(e.target)
+    if (!anchor) return
+    e.preventDefault()
+    setLinkMenu({ x: e.clientX, y: e.clientY, href: anchor.href })
+  }, [])
+
+  // 菜单打开后：点别处 / 滚动 / Esc / 失焦都关掉（mousedown 用冒泡，
+  // 菜单项自己的 onMouseDown 会 stopPropagation 先执行动作）。
+  useEffect(() => {
+    if (!linkMenu) return
+    const close = () => setLinkMenu(null)
+    const onKeyDown = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    window.addEventListener('mousedown', close)
+    window.addEventListener('scroll', close, true)
+    window.addEventListener('blur', close)
+    window.addEventListener('keydown', onKeyDown)
+    return () => {
+      window.removeEventListener('mousedown', close)
+      window.removeEventListener('scroll', close, true)
+      window.removeEventListener('blur', close)
+      window.removeEventListener('keydown', onKeyDown)
+    }
+  }, [linkMenu])
+
   // ⭐ mermaid 两段式的第二段：mount 后把占位块异步渲染成 SVG。
   //    流式期间跳过（每帧都在变，异步渲染只会产生废弃任务 + 闪烁）。
   useMermaidRender(rootRef, html, streaming)
 
   if (!html) return null
   return (
-    <div
-      ref={rootRef}
-      className={className ? `md-content ${className}` : 'md-content'}
-      onClick={onClick}
-      dangerouslySetInnerHTML={{ __html: html }}
-    />
+    <>
+      {rendered.blocks === null ? (
+        /* 现状路径：单次 innerHTML（收口期 / 未开实验开关） */
+        <div
+          ref={rootRef}
+          className={className ? `md-content ${className}` : 'md-content'}
+          onClick={onClick}
+          onContextMenu={onContextMenu}
+          dangerouslySetInnerHTML={{ __html: html }}
+        />
+      ) : (
+        /* [实验 · 块级冻结] 每块一个容器（display:contents 不生成盒子 ⇒ 排版与
+         *  单容器逐像素一致，选择器按后代匹配不受影响）；前部块的 DOM 不重写。 */
+        <div
+          ref={rootRef}
+          className={className ? `md-content ${className}` : 'md-content'}
+          onClick={onClick}
+          onContextMenu={onContextMenu}
+        >
+          {rendered.blocks.map((block, index) => (
+            <div
+              key={index}
+              style={{ display: 'contents' }}
+              dangerouslySetInnerHTML={{ __html: block.html }}
+            />
+          ))}
+        </div>
+      )}
+      {linkMenu && createPortal(
+        <div
+          className="project-context-menu external-link-menu"
+          style={{
+            left: Math.max(8, Math.min(linkMenu.x, window.innerWidth - 220)),
+            top: Math.max(8, Math.min(linkMenu.y, window.innerHeight - 100)),
+          }}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div
+            className="ctx-menu-item"
+            role="menuitem"
+            onMouseDown={(e) => {
+              e.stopPropagation()
+              const href = linkMenu.href
+              setLinkMenu(null)
+              void openLinkInBrowser(href)
+            }}
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+              <circle cx="8" cy="8" r="5.5" />
+              <path d="M2.5 8h11M8 2.5c1.6 1.5 2.4 3.4 2.4 5.5S9.6 12 8 13.5C6.4 12 5.6 10.1 5.6 8S6.4 4 8 2.5z" />
+            </svg>
+            在浏览器中打开
+          </div>
+          <div
+            className="ctx-menu-item"
+            role="menuitem"
+            onMouseDown={(e) => {
+              e.stopPropagation()
+              const href = linkMenu.href
+              setLinkMenu(null)
+              void openLinkInAppWindow(href)
+            }}
+          >
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+              <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+              <path d="M2.5 6h11" />
+            </svg>
+            在客户端内打开（新窗口）
+          </div>
+        </div>,
+        document.body,
+      )}
+    </>
   )
 })
 

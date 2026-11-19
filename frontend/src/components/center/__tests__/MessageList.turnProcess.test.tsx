@@ -295,9 +295,8 @@ describe('[轮次中间过程折叠]', () => {
 })
 
 describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
-  /** 数「nexus」消息头（不是正文里出现的字样） */
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
-    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+  /** 数每轮首个 assistant 段（与已删除的 nexus 头同生同灭：showHeader/非 turn-cont） */
+  const msgHeads = () => Array.from(container.querySelectorAll('.msg.assistant:not(.turn-cont)'))
 
   it('基线：一轮=1 user + 多条 assistant 段 → 只能有 1 个 nexus 头', () => {
     renderList([
@@ -305,7 +304,7 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
       intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
       finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 
   it('⭐ 中间插入 isMeta 的 edited_text_file 段（role=user）→ 仍只能有 1 个 nexus 头', () => {
@@ -318,7 +317,7 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
       baseMsg('e1', 'user', { author: 'attachment', subtype: 'edited_text_file', isMeta: true, content: '改了什么' }),
       finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 
   it('⭐ 助手段 userMessageId 缺失（后台/注入行）→ 仍只能有 1 个 nexus 头', () => {
@@ -327,7 +326,7 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
       baseMsg('a1', 'assistant', { reasoning: 'r', content: '第一段', finishReason: 'stop', userMessageId: null }),
       baseMsg('a2', 'assistant', { content: '第二段', finishReason: 'stop', userMessageId: null }),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 
   /**
@@ -369,7 +368,7 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
       baseMsg('a2', 'assistant', { content: '第二段旁白', finishReason: 'tool_calls', userMessageId: 'u1' }),
       baseMsg('a3', 'assistant', { content: '第三段旁白', finishReason: 'stop', userMessageId: 'u1' }),
     ])
-    expect(nexusHeads(), '一轮只能有一个 nexus 头').toHaveLength(1)
+    expect(msgHeads(), '一轮只能有一个 nexus 头').toHaveLength(1)
     expect(container.querySelectorAll('.turn-process-toggle'), '一轮只能有一个状态行').toHaveLength(1)
   })
 
@@ -381,13 +380,12 @@ describe('[2026-11-01 用户报告] 一轮内出现多个 nexus 头', () => {
       baseMsg('inj1', 'user', { content: '任务通知内容', userMessageId: 'u1' }),
       finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 })
 
 describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
-    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+  const msgHeads = () => Array.from(container.querySelectorAll('.msg.assistant:not(.turn-cont)'))
 
   it('⭐ 一轮内：已落库 assistant 段 + 尾部流式块 → 只能有 1 个 nexus 头', () => {
     // 真实时序：模型输出被切成多个 assistant 落库段，最后一段还在流式输出。
@@ -407,7 +405,7 @@ describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
       userMsg('u1', '2026-10-28T10:00:00Z'),
       intermediateMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 
   it('⭐⭐ 切会话后 store 残留上一会话流式块 → 当前会话不得出现多余 nexus 头', () => {
@@ -428,14 +426,13 @@ describe('[2026-11-01 用户报告] 流式块与已落库段并存', () => {
       userMsg('u1', '2026-10-28T10:00:00Z'),
       finalMsg('a1', 'u1', '2026-10-28T10:01:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
     expect(container.textContent).not.toContain('上一会话残留')
   })
 })
 
 describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assistant）', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
-    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+  const msgHeads = () => Array.from(container.querySelectorAll('.msg.assistant:not(.turn-cont)'))
 
   it('⭐ 两条 user 紧邻 + 之后多段 assistant → 不得出现 2 个 nexus 头', () => {
     // 真实数据实测：sess-d2dc1d51 有 2 处这种形态（用户快速追问 / 方案确认）。
@@ -448,7 +445,7 @@ describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assista
       intermediateMsg('a1', 'u2', '2026-10-28T10:01:00Z'),
       finalMsg('a2', 'u2', '2026-10-28T10:02:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 
   it('第二条 user 插在两段同轮 assistant 之间 → 头数 = 2（这是行序判据的已知边界）', () => {
@@ -460,13 +457,12 @@ describe('[2026-11-01 用户报告] 连续两条 user 提问（中间无 assista
       userMsg('u2', '2026-10-28T10:00:01Z'),
       finalMsg('a2', 'u1', '2026-10-28T10:02:00Z'),
     ])
-    expect(nexusHeads()).toHaveLength(2)
+    expect(msgHeads()).toHaveLength(2)
   })
 })
 
 describe('[2026-11-01 用户报告] 窗口首条无 user 行（滑动窗口截断）', () => {
-  const nexusHeads = () => Array.from(container.querySelectorAll('.msg .author-name'))
-    .filter((el) => (el.textContent ?? '').trim().startsWith('nexus'))
+  const msgHeads = () => Array.from(container.querySelectorAll('.msg.assistant:not(.turn-cont)'))
 
   it('⭐⭐ 窗口从 assistant 开始（前面的 user 已滑出）→ 后续多个用户轮仍各一个头', () => {
     // 用户描述：「对话多到一定程度就可能会出现，几个回复收缩在一个 nexus 中」。
@@ -495,7 +491,7 @@ describe('[2026-11-01 用户报告] 窗口首条无 user 行（滑动窗口截�
       baseMsg('aaa-a2', 'assistant', { content: '段2', finishReason: 'stop', userMessageId: 'u1', createdAt: t }),
     ])
     // 两段同轮 ⇒ 只 1 个头（行序判据；排序不影响结论，但能暴露 key 兜底是否打断分组）
-    expect(nexusHeads()).toHaveLength(1)
+    expect(msgHeads()).toHaveLength(1)
   })
 })
 

@@ -103,9 +103,6 @@ export function ModelPickerModal({ providers, activeSessionModelName, close, pic
                           <span className="mp-model-name">{fullName} <span className="m-type">{m.type}</span></span>
                           <span className="mp-model-desc">{m.desc}</span>
                         </div>
-                        <div className="mp-model-badges">
-                          {isCurrent && <span className="mp-badge">当前</span>}
-                        </div>
                       </div>
                     )
                   })}

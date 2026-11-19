@@ -2379,7 +2379,8 @@ public class SubagentExecutor {
                 //   权限预检用 agentTuc（含 fork 工具授权 getAppState 包装）。
                 String preloadSessionId = agentTuc != null ? agentTuc.sessionId() : null;
                 SkillPreloader.PreloadResult preloadResult =
-                    skillPreloader.preload(skillsToPreload, preloadSessionId, agentTuc);
+                    skillPreloader.preload(skillsToPreload, preloadSessionId, agentTuc,
+                        agentDefinition.agentType());
                 if (!preloadResult.initialMessages().isEmpty()) {
                     initialMessages.addAll(preloadResult.initialMessages());
                     log.info("[SubagentExecutor] Step 14: 已预加载 {} 个 skills agent={}",
@@ -5051,50 +5052,14 @@ public class SubagentExecutor {
                 ChatMessageDto msg = convertToChatMessageDto(raw, sessionId);
                 if (msg != null) state.appendMessage(msg);
             }
-            // [IMP-G4 C7] 按名路由待办消息消费 · 对齐 CC queuePendingMessage（SendMessageTool.ts:810-813
-            //   → LocalAgentTask 每轮消费 pendingMessages）。本 agent 存活期间 SendMessage 按名投递的
-            //   待办消息在此 drain 为 user 消息前置到对话（"Message queued for delivery ... at its next
-            //   tool round" 语义）。agentNameRegistry 未注入 → no-op（不破坏既有调用）。
-            if (agentNameRegistry != null) {
-                List<String> pending = agentNameRegistry.drain(agentId.toString());
-                if (!pending.isEmpty()) {
-                    // [UP-01] coordinator 包裹门控 · 对齐 CC getAgentPendingMessageAttachments
-                    //   （attachments.ts:1085-1102 → drained.map → {type:'queued_command',
-                    //   origin:{kind:'coordinator'}, isMeta:true}）+ wrapCommandText case 'coordinator'
-                    //   （messages.ts:5502-5505，逐字）+ wrapMessagesInSystemReminder（messages.ts:3784）。
-                    //   门控：settings.coordinator_mode_enabled（DB 实时读源）非 null → 用 DB 值；
-                    //   null → CoordinatorMode.isCoordinatorMode() 回落（feature+env 双真，默认关
-                    //   = 未配置零行为变化）。CC 本无条件包 coordinator（concern 1 文档化偏差，owner 可拍板）。
-                    //   [coordinator 单一来源] 判定收敛为唯一实现（DB 覆盖 → 回落 feature+env）；
-                    //   与 LlmAgentLoop.drainPendingAgentMessages 的消费端同源（同一 DB 读源）。
-                    // [coordinator-session V75] 会话感知入口 · 会话层来源 = 本方法内 sessionId
-                    //   （= subagentCtx.sessionId()，子代理归属会话）→ 父会话的会话级覆盖对子代理可见。
-                    boolean coordGate = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
-                        .coordinatorModeActiveForSession(sessionId, promptAlignSettingsResolver, coordinatorMode);
-                    int coordinatorWrapped = 0;
-                    for (String pm : pending) {
-                        if (coordGate) {
-                            // CC wrapCommandText case 'coordinator'（messages.ts:5502-5505）逐字 +
-                            //   :3784 system-reminder 包裹（与 UP-03 queued_command 消费端模式一致）；
-                            //   isMeta=true → 前端隐藏、模型可见（对齐 CC queued_command isMeta:true）。
-                            String wrapped = "<system-reminder>\n"
-                                + "The coordinator sent a message while you were working:\n" + pm
-                                + "\n\nAddress this before completing your current task.\n</system-reminder>";
-                            state.appendMessage(LlmAgentLoop.toMessage(Role.user, wrapped, null, null, true));
-                            coordinatorWrapped++;
-                        } else {
-                            Map<String, Object> pendingMsg = new LinkedHashMap<>();
-                            pendingMsg.put("role", "user");
-                            pendingMsg.put("content", pm);
-                            ChatMessageDto dto = convertToChatMessageDto(pendingMsg, sessionId);
-                            if (dto != null) state.appendMessage(dto);
-                        }
-                    }
-                    log.info("[SubagentExecutor] [IMP-G4 C7] 消费按名路由待办消息 {} 条 → 前置 user 消息 "
-                            + "(agentId={}, coordGate={}, coordinatorWrapped={}, CC queuePendingMessage)",
-                        pending.size(), agentId, coordGate, coordinatorWrapped);
-                }
-            }
+            // [IMP-G4 C7] 按名路由待办消息 · 启动瞬间先取出（CC queuePendingMessage →
+            //   LocalAgentTask 每轮消费）。⚠️ 此刻 appendListener 尚未武装（下方 S4-1 才接线）——
+            //   若直接 appendMessage，这批消息只进 state、不写转录、不推实时，resume/刷新即丢。
+            //   故这里只 drain 暂存，等 listener 武装后统一 append（见下方「启动段待办落地」）。
+            java.util.List<com.nexusai.application.agent.subagent.AgentNameRegistry.PendingAgentMessage>
+                startupPending = agentNameRegistry != null
+                    ? agentNameRegistry.drainPending(agentId.toString())
+                    : java.util.List.of();
             int initialMsgCount = state.rawMessages().size();
 
             // [S4-1 流式化] 初始消息加载完成后武装 appendListener (mid-flight 单点方案):
@@ -5296,6 +5261,21 @@ public class SubagentExecutor {
                     }
                 }
             });
+
+            // ── 启动段待办落地 · listener 已武装，append 才同时落转录 + 推实时 ──
+            //   对齐 CC pending message 消费：每条成为一条真实 user 消息，追加在初始消息之后；
+            //   coordinator 门控只改模型副本（本轮 messagesForQuery 从 state 重建，故此处不包壳，
+            //   与运行中 drain 的「历史存原文」契约一致）。
+            if (!startupPending.isEmpty()) {
+                for (com.nexusai.application.agent.subagent.AgentNameRegistry.PendingAgentMessage pm
+                        : startupPending) {
+                    state.appendMessage(com.nexusai.application.agent.subagent.AgentNotificationMessages
+                        .toChatMessage(pm));
+                }
+                log.info("[SubagentExecutor] [agent-notice] 启动段消费按名路由待办消息 {} 条 → "
+                        + "落 state/转录/实时 (agentId={}, CC queuePendingMessage)",
+                    startupPending.size(), agentId);
+            }
 
             // ── [G2] 压缩产物落进**子代理自己的** transcript · 对齐 CC runAgent.ts:792-805 ──
             //   CC 把压缩产物当普通消息 yield 出 query()，子代理侧 isRecordableMessage
@@ -6356,7 +6336,8 @@ public class SubagentExecutor {
             return new SubagentMessage.AssistantMessage(
                 msg.content() != null ? msg.content() : "",
                 usage,
-                toolContent, agentId);
+                toolContent, agentId,
+                msg.toolCalls() != null ? msg.toolCalls() : List.of());
         }
         if (msg.role() == Role.user || msg.role() == Role.tool) {
             boolean toolContent = msg.role() == Role.tool && msg.toolCallId() != null;
@@ -7396,6 +7377,15 @@ public class SubagentExecutor {
         }
         if (msg.author() != null) {
             map.put("author", msg.author());
+        }
+        // [agent-notice] SendMessage 通知行的 UI 摘要 · 见 AgentNotificationMessages：
+        //   summary 放在 structuredOutput.agent_summary（provider 不序列化该字段，模型不可见）。
+        //   只有通知行会携带；普通消息无此键（惰性写入，读侧缺省 null）。
+        if (msg.structuredOutput() != null) {
+            Object agentSummary = msg.structuredOutput().get("agent_summary");
+            if (agentSummary instanceof String s && !s.isBlank()) {
+                map.put("summary", s);
+            }
         }
         return map;
     }

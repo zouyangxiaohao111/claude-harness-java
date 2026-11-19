@@ -27,14 +27,16 @@ import { providerApi } from '@/api/providers'
 import { commandApi } from '@/api/command'
 import { ModelPickerModal } from '@/components/modals/ModelPickerModal'
 import { EffortModal } from '@/components/modals/EffortModal'
+import { SkillMarketModal } from '@/components/modals/SkillMarketModal'
 import { Composer } from '@/components/center/Composer'
 import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
 import { IconSprite } from './IconSprite'
 import { sendPermissionResponse } from '@/api/socket'
-import { kbPermissionOwnership } from '@/utils/kbPermissionOwnership'
+import { kbPermissionOwnership, broadcastKbAnswered, broadcastKbOwnershipChanged } from '@/utils/kbPermissionOwnership'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { useChatStore } from '@/stores/chatStore'
+import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { useChatSocket } from '@/hooks/useChatSocket'
 import { PERMISSION_MODE_LABELS } from '@/api/types'
 import type { AttachmentRequest, ChatMessageDto, CitationItem, PermissionMode, Provider, SessionDto } from '@/api/types'
@@ -110,10 +112,32 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
   activeStreams: Record<string, string>
 }) {
   const { clientRef } = useChatSocket(sessionId, activeStreams)
-  // 本窗口接管的会话：主窗口据此不再弹同一会话的权限/提问（否则两边各弹一次）。
+  // 本窗口接管的会话：主窗口据此不再弹**这一条**会话的权限/提问。
+  //
+  // ⚠️ 判据是「**本窗口有焦点**」而不是「本窗口开着」：用户裁定 —— 知识库会话若在主会话里
+  //   继续回答，主会话必须能弹窗（谁在看谁接管）。所以失焦即释放：
+  //     · 用户看知识库窗口         ⇒ claim  ⇒ 主窗口不弹这条会话
+  //     · 用户切回主窗口继续聊它   ⇒ blur   ⇒ release ⇒ 主窗口恢复弹窗
+  //     · 主会话里其它会话         ⇒ 完全不受影响（按 sessionId 精确匹配）
+  // ⚠️ 独立窗口是**另一个 webview**，进程内 Set 传不过去 ⇒ 归属变化还要广播
+  //   （2026-11-18 用户报「两边都弹」）。
   useEffect(() => {
-    kbPermissionOwnership.claim(sessionId)
-    return () => kbPermissionOwnership.release(sessionId)
+    if (!sessionId) return
+    const apply = (owned: boolean) => {
+      if (owned) kbPermissionOwnership.claim(sessionId)
+      else kbPermissionOwnership.release(sessionId)
+      void broadcastKbOwnershipChanged(sessionId, owned)
+    }
+    apply(document.hasFocus())
+    const onFocus = () => apply(true)
+    const onBlur = () => apply(false)
+    window.addEventListener('focus', onFocus)
+    window.addEventListener('blur', onBlur)
+    return () => {
+      window.removeEventListener('focus', onFocus)
+      window.removeEventListener('blur', onBlur)
+      apply(false)
+    }
   }, [sessionId])
   // ⚠️ 权限 / AskUserQuestion 弹窗必须在本窗口渲染：主窗口 App 的 PermissionBubble 按
   //   `activeSessionId` 过滤，知识库会话不是主会话的活动会话 ⇒ 弹不到这里（2026-11-14 用户报
@@ -147,6 +171,9 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
         dequeuePermission(id)
         // 同 App：同一 tool_use 的 bridge 条目要一并清掉，否则左栏黄点清不掉
         useChatStore.getState().clearPermissionByToolUse(sid, perm.toolUseId ?? id)
+        // 跨窗口：主窗口是同一条请求的另一个副本 ⇒ 让它也把这请求删掉
+        //   （否则「KB 已经选了，主会话弹窗不消失」）。
+        void broadcastKbAnswered(sid, id, perm.toolUseId)
       }}
       onAbort={() => {
         if (clientRef.current) {
@@ -154,6 +181,7 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
         }
         useChatStore.getState().markToolAnswered(sid, perm.toolUseId ?? perm.requestId)
         dequeuePermission(perm.requestId)
+        void broadcastKbAnswered(sid, perm.requestId, perm.toolUseId)
       }}
     />
       </div>
@@ -193,6 +221,9 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
   const [providers, setProviders] = useState<Provider[]>([])
   const [showModelPicker, setShowModelPicker] = useState(false)
   const [showEffort, setShowEffort] = useState(false)
+  /** 技能市场（模式胶囊菜单里的「专家 / 技能 / 连接器」三项共用这个弹窗，只切初始 tab） */
+  const [showMarket, setShowMarket] = useState(false)
+  const [marketTab, setMarketTab] = useState<'expert' | 'skill' | 'connector'>('expert')
   /**
    * 右侧抽屉的「来源视图」：点引用卡片后**在抽屉内**直接看原文并高亮命中块。
    * ⛔ 不复用知识库文档抽屉（那是带编辑/分块管理的管理视图）—— 对齐源站 ChatReferenceSourceView。
@@ -254,6 +285,8 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
 
   // ── 按会话切片：与主对话互不干扰 ──
   const messages = useChatStore((s) => (sessionId ? s.messages[sessionId] ?? EMPTY_MESSAGES : EMPTY_MESSAGES))
+  /** 被内存裁剪掉的轮数（渲染层「⋯ 已折叠 N 轮对话」的入口判据 · 与主会话同一份 store 状态） */
+  const foldedTurnCount = useChatStore((s) => (sessionId ? (s.foldedTurnCounts[sessionId] ?? 0) : 0))
   const blocks = useChatStore((s) => (sessionId ? s.streams[sessionId] ?? EMPTY_BLOCKS : EMPTY_BLOCKS))
   const serverRunning = useChatStore((s) => (sessionId ? !!s.serverRunning[sessionId] : false))
   const conversationId = useChatStore((s) => (sessionId ? s.conversationIds[sessionId] ?? null : null))
@@ -438,6 +471,28 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
       })
       .catch(() => { /* 拉不到就显示空，不阻断发送 */ })
     return () => { alive = false }
+  }, [sessionId])
+
+  /** 展开「⋯ 已折叠 N 轮对话」：store 只留最近 {@link FOLD_DEFAULT_TURNS} 轮（真删），
+   *  更早的轮**不在内存里** ⇒ 必须向后端按轮翻页重拉，与主会话 App.handleExpandOlder
+   *  同一端点、同一分页单位。
+   *  ⛔ 只靠 MessageList 的本地展开没有用（它的 foldedTurnKeys 只能在 store 已有的行里做隐藏）。 */
+  const expandOlderTurns = useCallback(async () => {
+    if (!sessionId) return
+    const msgs = useChatStore.getState().messages[sessionId] ?? []
+    // 窗口内最早一轮的用户提问 id（后端对非提问行 beforeTurnId 直接 400）
+    const firstAsk = msgs.find((m) => isUserTurnRow(m))
+    if (!firstAsk?.id) return
+    try {
+      const { messages: older, hasMore } = await chatApi.listTurns(sessionId, {
+        turns: FOLD_DEFAULT_TURNS, beforeTurnId: firstAsk.id,
+      })
+      const st = useChatStore.getState()
+      if (older.length > 0) st.revealOlderTurns(sessionId, older)
+      st.setHasMore(sessionId, hasMore)
+    } catch {
+      // 拉不到就保持折叠行可见（用户可再点一次），不打断对话
+    }
   }, [sessionId])
 
   /** 独立窗口发送：登记活跃流（驱动 {@link useChatSocket} 订阅），再调会话发送接口。
@@ -775,17 +830,38 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
   useEffect(() => {
     if (!sessionId || streaming) return
     let alive = true
-    const pull = () => {
-      void sessionApi.get(sessionId)
-        .then((sess) => { if (alive && sess.title) setMeta((m) => ({ ...m, title: sess.title ?? m.title })) })
-        .catch(() => { /* 读不到保持旧标题 */ })
+    let tries = 0
+    let timer: number | undefined
+    // 判定「已总结」：标题非空且不等于模型名（建会话时后端把 title 默认成 modelName）。
+    const summarized = (title: string, modelName: string) => {
+      const t = title.trim()
+      const m = modelName.trim()
+      return !!t && t !== m && t !== m.split('/').pop()
     }
-    // 后端 maybeGenerateTitle 是在 complete 之后另起异步任务 ⇒ 立刻拉一次多半还是旧标题，
-    // 再补两次延时拉取（标题只会从空/模型名变成总结文案，多拉无副作用）。
+    const pull = () => {
+      if (!alive) return
+      tries++
+      void sessionApi.get(sessionId)
+        .then((sess) => {
+          if (!alive) return
+          const title = (sess.title ?? '').trim()
+          if (!title) return
+          setMeta((m) => ({ ...m, title }))
+          if (summarized(title, meta.modelName) && timer !== undefined) {
+            window.clearInterval(timer)   // 已拿到总结文案 ⇒ 停轮询
+          }
+        })
+        .catch(() => { /* 读不到保持旧标题，下一轮再试 */ })
+    }
+    // 后端 maybeGenerateTitle 在 complete 之后另起异步任务，耗时不定（常超过固定 6s）
+    // ⇒ 固定两次延时必然漏（真机：后台已生成、页面仍显示旧标题，得刷新）。
+    //   改为有上限的轮询：每 3s 一次，最多 20 次（≈60s），拿到总结文案即停。
     pull()
-    const t1 = window.setTimeout(pull, 2500)
-    const t2 = window.setTimeout(pull, 6000)
-    return () => { alive = false; window.clearTimeout(t1); window.clearTimeout(t2) }
+    timer = window.setInterval(() => {
+      if (tries >= 20) { window.clearInterval(timer); return }
+      pull()
+    }, 3000)
+    return () => { alive = false; if (timer !== undefined) window.clearInterval(timer) }
   }, [sessionId, streaming])
 
   /** 标题栏文案：后端建会话时把 title 默认成 modelName ⇒ 那种值等于「没标题」，显示「新对话」。 */
@@ -824,6 +900,10 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
               key={citations.map((c) => `${c.ref_index}:${c.knowledge_title ?? ''}`).join('|') || 'no-cite'}
               sessionId={sessionId}
               messages={messages}
+              // 历史不是「看不到」而是被内存裁掉了（store 只留最近 2 轮）：
+              //   传下去这两项，MessageList 才会画「⋯ 已折叠 N 轮对话（点击展开）」并按需回拉。
+              foldedTurnCount={foldedTurnCount}
+              onExpandOlder={() => { void expandOlderTurns() }}
               onDelete={() => {}}
               conversationId={conversationId}
               // 正文里的 [N] chip 点击 → 打开右侧「文档来源」并滚到该条（对齐源站：点引用直接看来源）
@@ -901,6 +981,8 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
           onOpenEffort={() => setShowEffort(true)}
           empty={isEmpty}
           currentAgent={KB_MODES.find((m) => m.key === agentMode)?.label ?? null}
+          // 模式胶囊菜单里的「专家 / 技能 / 连接器」→ 技能市场弹窗（与主会话同一份弹窗，只切初始 tab）
+          onOpenMarket={(tab) => { setMarketTab(tab ?? 'expert'); setShowMarket(true) }}
           agentModes={KB_MODES.map((m) => ({
             key: m.key,
             label: m.label,
@@ -1067,6 +1149,25 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
         </aside>
       )}
       </div>
+      {/* 技能市场（模式胶囊菜单 → 专家 / 技能 / 连接器）：
+          知识库是独立窗口/页，主窗口的弹窗不会透过来 ⇒ 必须在本组件内自己渲染一份。
+          选「专家」= 改会话 main_thread_agent（与挑 KB 模式同一个字段，选中即替换当前模式）。 */}
+      {showMarket && (
+        <SkillMarketModal
+          sessionId={sessionId ?? ''}
+          currentAgent={KB_MODES.find((m) => m.key === agentMode)?.label ?? null}
+          busy={streaming}
+          initialTab={marketTab}
+          onClose={() => setShowMarket(false)}
+          onUseLocalAgent={(agentType) => { setShowMarket(false); pickMode(agentType) }}
+          onSummonSkill={(cmd, display) => {
+            setShowMarket(false)
+            // 与主会话同一文本协议：召唤技能 = 输入框写入「中文显示名」或「/命令名 」前缀
+            setText(display || `/${cmd} `)
+          }}
+          showToast={showToast}
+        />
+      )}
     </div>
   )
 }
@@ -1157,9 +1258,11 @@ const TITLE_TEXT: React.CSSProperties = {
 
 // ── 已选 chip 样式 · 数值逐条对齐源站 .mention-chip（Input-field.vue:3484-3579）
 const PICKED_WRAP: React.CSSProperties = {
-  display: 'flex', flexWrap: 'wrap', gap: 6, padding: '8px 10px 0', maxWidth: '100%',
-  // 源站 `.chat-mentioned-items { margin-bottom: 2px }` —— chip 与下方文字留一点气口
-  marginBottom: 2,
+  display: 'flex', flexWrap: 'wrap', gap: 6, maxWidth: '100%',
+  // [2026-11-18 对齐源站] 左右 padding 归零：`.composer .input-box` 已有 10px/14px 内边距，
+  //   这里再叠 10px 会让 chip 比光标多缩进一截、看着像浮在框顶的独立区块
+  //   （用户报「指定了知识库不该和光标一起吗」）。上下留极小间距，读起来是正文第一行。
+  padding: '2px 0 6px',
 }
 const PICKED_CHIP: React.CSSProperties = {
   display: 'inline-flex', alignItems: 'center', gap: 5,

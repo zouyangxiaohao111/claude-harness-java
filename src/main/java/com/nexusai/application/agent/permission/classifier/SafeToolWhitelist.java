@@ -33,7 +33,6 @@ import java.util.Set;
  *   <tr><td>{@code TASK_UPDATE_TOOL_NAME}（:70）</td><td>TaskUpdate</td><td>TaskUpdateTool</td></tr>
  *   <tr><td>{@code TASK_LIST_TOOL_NAME}（:71）</td><td>TaskList</td><td>TaskListTool</td></tr>
  *   <tr><td>{@code TASK_STOP_TOOL_NAME}（:72）</td><td>TaskStop</td><td>TaskStopTool</td></tr>
- *   <tr><td>{@code TASK_OUTPUT_TOOL_NAME}（:73）</td><td>TaskOutput</td><td>TaskOutputTool</td></tr>
  *   <tr><td>{@code ASK_USER_QUESTION_TOOL_NAME}（:75）</td><td>AskUserQuestion</td><td>AskUserQuestionTool</td></tr>
  *   <tr><td>{@code ENTER_PLAN_MODE_TOOL_NAME}（:76）</td><td>EnterPlanMode</td><td>EnterPlanModeTool</td></tr>
  *   <tr><td>{@code EXIT_PLAN_MODE_TOOL_NAME}（:77）</td><td>ExitPlanMode</td><td>ExitPlanModeTool</td></tr>
@@ -55,10 +54,10 @@ import java.util.Set;
  *       （CLAUDE_CODE_VERIFY_PLAN env 门控），同上</li>
  * </ul>
  *
- * <p>Java 最终 21 项 = 21 固定（22 固定中 classify_result N/A）+ 0 条件（4 条件项均不纳入白名单，见上）。
+ * <p>Java 最终 20 项 = 20 固定（21 固定中 classify_result N/A）+ 0 条件（4 条件项均不纳入白名单，见上）。
  * {@code Skill} 免检已移除（CC 无 skill 免检概念，旧 Java 独有 —— T07 R5 登记）。
  *
- * <p>注：CC 26 项口径（22+4）与 Java 21 项（21+0）的差 = 5 项 N/A（classify_result +
+ * <p>注：CC 25 项口径（21+4）与 Java 20 项（20+0）的差 = 5 项 N/A（classify_result +
  * 4 条件项），N/A 依据已在上文逐项登记，不进入对齐分母（对齐度规则 §5.4）。
  */
 @Component
@@ -87,7 +86,6 @@ public class SafeToolWhitelist {
             "TaskUpdate",           // CC :70
             "TaskList",             // CC :71
             "TaskStop",             // CC :72
-            "TaskOutput",           // CC :73
             // ── Plan mode / UI ──
             "AskUserQuestion",      // CC 'AskUserQuestion'（:75）
             "EnterPlanMode",        // CC :76

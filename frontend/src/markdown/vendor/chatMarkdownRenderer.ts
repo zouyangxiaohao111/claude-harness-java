@@ -40,7 +40,7 @@
  * @see ./chatPostProcess.ts   第 20 步里的三个后处理
  */
 import { marked } from 'marked'
-import type { Renderer } from 'marked'
+import type { Renderer, Token, TokensList } from 'marked'
 
 import {
   collapseStandaloneCitationParagraphs,
@@ -89,21 +89,26 @@ export interface RenderChatMarkdownOptions {
   entityLinkLabels?: EntityLinkLabels
 }
 
+/** 预处理产物：marked 能稳定解析的文本 + 第 16 步抽出的引用 HTML 片段表。 */
+export interface PreprocessedChatMarkdown {
+  /** 第 1–17 步处理后的 markdown（即 `marked.parse` 的入参）。 */
+  readonly markdown: string
+  /** 引用 HTML 片段（占位符 → HTML）；块级渲染时每块都要用它还原。 */
+  readonly htmlSnippets: readonly string[]
+}
+
 /**
- * 渲染聊天 Markdown。
+ * 流式流水线第 1–17 步（**不含解析**）：把原始文本修成 marked 能稳定解析的形态。
  *
- * @param rawMarkdown 原始文本（任何类型，非字符串会被 String() 化）
- * @param options     渲染选项
- * @returns 可直接塞进 `dangerouslySetInnerHTML` 的 HTML（已净化）
+ * <p>抽出来是为了让块级冻结（{@link renderChatMarkdownIncremental}）与全量
+ * （{@link renderChatMarkdown}）共用同一份预处理 —— 两边各写一份必然漂移。
  */
-export function renderChatMarkdown(
+export function preprocessChatMarkdown(
   rawMarkdown: unknown,
   options: RenderChatMarkdownOptions,
-): string {
+): PreprocessedChatMarkdown {
   const rawText = typeof rawMarkdown === 'string' ? rawMarkdown : String(rawMarkdown || '')
-  if (!rawText.trim()) return ''
-
-  configureMarkedForChatMarkdown()
+  if (!rawText.trim()) return { markdown: '', htmlSnippets: [] }
 
   // ── 第 1–2 步：末尾悬挂的列表标记 / 分隔线 ──────────────────────────────
   const streamingSafeText = options.streaming
@@ -153,6 +158,27 @@ export function renderChatMarkdown(
   // ── 第 17 步：转义 ──────────────────────────────────────────────────────
   const escapedMarkdown = options.escapeMarkdown(markdownWithPlaceholders)
 
+  return { markdown: escapedMarkdown, htmlSnippets }
+}
+
+/**
+ * 渲染聊天 Markdown。
+ *
+ * @param rawMarkdown 原始文本（任何类型，非字符串会被 String() 化）
+ * @param options     渲染选项
+ * @returns 可直接塞进 `dangerouslySetInnerHTML` 的 HTML（已净化）
+ */
+export function renderChatMarkdown(
+  rawMarkdown: unknown,
+  options: RenderChatMarkdownOptions,
+): string {
+  const rawText = typeof rawMarkdown === 'string' ? rawMarkdown : String(rawMarkdown || '')
+  if (!rawText.trim()) return ''
+
+  configureMarkedForChatMarkdown()
+
+  const { markdown: escapedMarkdown, htmlSnippets } = preprocessChatMarkdown(rawText, options)
+
   // ── 第 18 步：真正解析 ──────────────────────────────────────────────────
   const html = marked.parse(escapedMarkdown, {
     renderer: options.renderer,
@@ -174,4 +200,130 @@ export function renderChatMarkdown(
   const strongTitleHtml = markStandaloneStrongParagraphs(tableWrappedHtml)
   const sanitized = options.sanitizeHtml(strongTitleHtml)
   return options.streaming ? applyStreamingTailFade(sanitized) : sanitized
+}
+
+/* ==========================================================================
+ * 实验：流式期「块级冻结」增量渲染
+ *
+ * <p><b>WHY</b>：全量路径每帧 `marked.parse(全文)` + DOMPurify + innerHTML 整树重建，
+ * 成本随回复长度线性增长（实测正文 3.6K 字时峰值 6.6ms/帧）。
+ *
+ * <p><b>做法</b>：预处理仍是全文（17 步是正则，比 marked 便宜且是块边界的前提），
+ * 解析按 marked 顶层 token 切块 —— 前部块只要 `token.raw` 与上帧一致就复用其成品
+ * HTML，只重解析尾部；组件层再按块渲染，前部块的 DOM 不再被重写。
+ *
+ * <p><b>已知偏差（与 dsh 的 prefix-freeze 同源）</b>：
+ * <ul>
+ *   <li>独占段落的引用折叠（{@link collapseStandaloneCitationParagraphs}）在拼接后
+ *       对全文再跑一次，保住跨块语义；没有 citation 时零成本短路。</li>
+ *   <li>引用定义（`[x][ref]` 的 `def` token）通过共享 `tokens.links` 传给每个单块
+ *       parser，因此跨块引用仍能解析。</li>
+ * </ul>
+ * ========================================================================== */
+
+/** 一个已定稿（或本帧刚定稿）的顶层块。 */
+export interface FrozenMarkdownBlock {
+  /** 预处理后文本中的起始偏移 —— 流式追加时前部块恒稳定，用作帧间对齐。 */
+  readonly start: number
+  /** token 原文：与上帧相同 ⇒ 该块的解析结果不可能变，可复用 HTML。 */
+  readonly raw: string
+  /** 成品 HTML（已还原引用片段、已净化、已做块局部后处理）。 */
+  readonly html: string
+}
+
+/** 帧间缓存。调用方按「会话:消息」持有；文本非追加时自动整体重建。 */
+export interface BlockFreezeCache {
+  readonly blocks: readonly FrozenMarkdownBlock[]
+  /**
+   * 上一帧 lexer 收集到的引用定义表指纹。
+   *
+   * <p><b>WHY 必须参与复用判据</b>：`[x][ref]` 的解析依赖**全文**定义表，而定义可以
+   * 出现在正文之后（流式期后到）。后到时前面块的 `token.raw` 没变，但它的链接解析结果
+   * 变了 —— 只看 raw 会复用上一帧的字面量 HTML（测试实测踩到）。
+   * 定义表变化 ⇒ 本帧不复用（全量重解析一次），下一次追加恢复复用。
+   */
+  readonly linksKey: string
+}
+
+/** 增量渲染结果。`cache` 传给下一帧；`reusedBlocks` 仅用于观测/测试。 */
+export interface IncrementalChatMarkdown {
+  readonly html: string
+  readonly cache: BlockFreezeCache
+  readonly reusedBlocks: number
+}
+
+/** 块内局部后处理（与全量第 19–20 步同序，⛔ 不含跨块的引用段落折叠）。 */
+function finalizeBlockHtml(
+  rawHtml: string,
+  htmlSnippets: readonly string[],
+  options: RenderChatMarkdownOptions,
+): string {
+  let out = restoreCitationHtmlPlaceholders(rawHtml, htmlSnippets)
+  if (options.entityLinkLabels) out = renderEntityLinks(out, options.entityLinkLabels)
+  out = wrapChatMarkdownTables(out)
+  out = markStandaloneStrongParagraphs(out)
+  return options.sanitizeHtml(out)
+}
+
+/**
+ * 块级冻结渲染（实验，与 {@link renderChatMarkdown} 输出应逐字节一致）。
+ *
+ * @param rawMarkdown 原始文本（流式期每帧的完整累积值）
+ * @param options     与全量路径同一份选项
+ * @param cache       上一帧返回的缓存（首帧传 null）
+ */
+export function renderChatMarkdownIncremental(
+  rawMarkdown: unknown,
+  options: RenderChatMarkdownOptions,
+  cache: BlockFreezeCache | null,
+): IncrementalChatMarkdown {
+  const rawText = typeof rawMarkdown === 'string' ? rawMarkdown : String(rawMarkdown || '')
+  if (!rawText.trim()) return { html: '', cache: { blocks: [], linksKey: '' }, reusedBlocks: 0 }
+
+  configureMarkedForChatMarkdown()
+
+  const { markdown, htmlSnippets } = preprocessChatMarkdown(rawText, options)
+  const tokens = marked.lexer(markdown)
+  // 最后一块永远处于「可能被追加改写」的状态 ⇒ 不复用（其余靠 raw 相等判定）。
+  const reusableLimit = tokens.length - 1
+  const parseOptions = { renderer: options.renderer, breaks: true }
+  // 引用定义表变化 ⇒ 前部块的链接解析结果可能变 ⇒ 本帧全部重解析。
+  const linksKey = JSON.stringify(tokens.links ?? {})
+  const cacheUsable = cache !== null && cache.linksKey === linksKey
+
+  const blocks: FrozenMarkdownBlock[] = []
+  let offset = 0
+  let reusedBlocks = 0
+
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i] as Token
+    const start = offset
+    offset += token.raw.length
+
+    const previous = cacheUsable ? cache?.blocks[i] : undefined
+    if (
+      i < reusableLimit
+      && previous !== undefined
+      && previous.start === start
+      && previous.raw === token.raw
+    ) {
+      blocks.push(previous)
+      reusedBlocks++
+      continue
+    }
+
+    // 单块解析：把全文的引用定义表挂到单元素列表上，跨块 `[x][ref]` 才不会退化成字面量。
+    const single = [token] as unknown as TokensList
+    single.links = tokens.links
+    const blockHtml = marked.parser(single, parseOptions)
+    blocks.push({ start, raw: token.raw, html: finalizeBlockHtml(blockHtml, htmlSnippets, options) })
+  }
+
+  let html = blocks.map(block => block.html).join('')
+  // 跨块语义：独占段落的引用折叠必须在拼接后跑（全量路径也是全文级）。
+  if (options.collapseStandaloneCitations !== false) {
+    html = collapseStandaloneCitationParagraphs(html)
+  }
+  if (options.streaming) html = applyStreamingTailFade(html)
+  return { html, cache: { blocks, linksKey }, reusedBlocks }
 }

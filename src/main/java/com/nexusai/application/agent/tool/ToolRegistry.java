@@ -156,7 +156,6 @@ public class ToolRegistry {
     private static final java.util.List<String> CC_TOOL_ORDER = java.util.List.of(
         // ── tools.ts:195-219 主干 + 门控（按 CC 字面量顺序）──
         com.nexusai.application.agent.tool.AgentToolConstants.AGENT_TOOL_NAME,       // AgentTool :195
-        ToolNameConstants.TASK_OUTPUT_TOOL_NAME,                                     // TaskOutputTool :196
         ToolNameConstants.BASH_TOOL_NAME,                                            // BashTool :197
         ToolNameConstants.GLOB_TOOL_NAME,                                            // GlobTool :201
         ToolNameConstants.GREP_TOOL_NAME,                                            // GrepTool :201

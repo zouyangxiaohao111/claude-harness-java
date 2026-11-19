@@ -46,6 +46,8 @@ export function isSystemInjectedRow(m: ChatMessageDto): boolean {
   if (m.role !== 'user') return false
   if (m.isCompactSummary === true) return false
   if (isLiveDisplayRow(m)) return false
+  // [agent-notice] 协作通知行走自己的通知条，不能落进「已完成」折叠区。
+  if (isAgentNotificationRow(m)) return false
   // ① 精确判据：后端出站带 isMeta + author（新写入的 transcript / GET /messages 均满足）
   if (m.isMeta) return m.author === 'attachment' || m.author === 'system'
   // ② 兜底判据（正文特征）· 2026-11-02 用户实测「子代理里 `<system-reminder>` 还是用户气泡」
@@ -76,7 +78,23 @@ const NON_USER_TURN_SUBTYPES = new Set<string>([
   'scheduled_task_fire', 'cron', 'queue', 'away_summary',
   'compact_boundary', 'microcompact_boundary', 'snip_boundary', 'snip_marker',
   'subagent_result', 'subagent_receipt', 'subagent_start', 'subagent_stop',
+  // [agent-notice] SendMessage 通知行（后端 AgentNotificationMessages 产出的真实 user 消息）
+  'agent_message',
 ])
+
+/**
+ * 子代理协作通知行 · SendMessage 在子代理实际消费时落的一条 user 消息。
+ *
+ * <p>后端契约（`AgentNotificationMessages.toChatMessage`）：`role=user`、`isMeta=true`、
+ * `author=<发送方>`、`subtype='agent_message'`、`content=原文`、`summary=SendMessage.summary`。
+ *
+ * <p>它不是真人提问，也不是系统注入 —— 前端以「通知条」单独渲染（不画用户气泡、不新轮次、
+ * 不当作工具卡）。判据必须被对话流/轮次/系统注入三处统一排除，否则：
+ * isMeta 会让它被 {@link isDialogueRow} 整条丢弃（用户看不到），或反过来被当成用户提问。
+ */
+export function isAgentNotificationRow(m: ChatMessageDto): boolean {
+  return m.role === 'user' && m.subtype === 'agent_message'
+}
 
 /**
  * 后台通知 / 子代理回执的正文特征（**前端兜底防御**）。
@@ -150,6 +168,9 @@ export function isDialogueRow(m: ChatMessageDto): boolean {
   if (m.role === 'tool') return false
   // [transcript-only] 仅 transcript 可见的 user 消息不进普通对话流（TraceView 不过滤，本模块也不涉及）
   if (m.role === 'user' && m.isVisibleInTranscriptOnly === true) return false
+  // [agent-notice] 协作通知行是 isMeta=true，但必须进对话流显示（走专属通知条渲染）——
+  //   不加这一条会被下面的 isMeta 判据整条丢弃。
+  if (isAgentNotificationRow(m)) return true
   // isMeta 默认跳过；tool_use_summary / stop_hook_summary 两个实时展示行放行，
   // [2026-11-02] 系统注入行（技能清单 / 外部改文件 / hook 回执…）也放行 —— 它们要显示成
   //   「已完成」折叠区里的系统提示，而不是被整条丢弃（用户裁定，见 {@link isSystemInjectedRow}）。

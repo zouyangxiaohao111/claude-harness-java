@@ -141,7 +141,9 @@ class ReadPermissionCheckerInternalPathTest {
         ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), emptyRulesCtx(), PermissionMode.DEFAULT,
             Map.of(), false, "", cwdDir());
-        Path planFile = configHomeDir.resolve("plans").resolve(tuc.sessionId().toString() + ".md");
+        // [对齐 CC plans.ts] 词对 slug：路径由与生产同一工具派生，而不是 {sessionId}.md
+        Path planFile = Path.of(com.nexusai.infra.util.PlanPaths.planFilePath(
+            configHomeDir.resolve("plans").toString(), tuc.sessionId(), null));
 
         PermissionResult result = checker().check(new ReadFileTool(new PathGuard(cwdDir())),
             input(planFile.toString()), tuc);
@@ -149,8 +151,12 @@ class ReadPermissionCheckerInternalPathTest {
         assertThat(result)
             .as("CC checkReadableInternalPath plan 分支（filesystem.ts:1645-1654）应静默 allow")
             .isInstanceOf(PermissionResult.Allow.class);
+        // CC 读检查顺序：step5 edit-implies-read 先跑 checkWritePermissionForTool
+        // （CCB filesystem.ts:1126 → 1493-1502 写分支 allow），因此读当前会话 plan 文件时
+        // 命中写分支的 reason（"…allowed for writing"），不会走到 1650 的读分支。
+        // 旧断言锁的是「写分支 passthrough」时代的兜底文案；写分支对齐 CC 后此处随同一顺序变化。
         assertThat(((PermissionResult.Allow) result).reason())
-            .isEqualTo(new PermissionDecisionReason.Other("Plan files for current session are allowed for reading"));
+            .isEqualTo(new PermissionDecisionReason.Other("Plan files for current session are allowed for writing"));
     }
 
     @Test

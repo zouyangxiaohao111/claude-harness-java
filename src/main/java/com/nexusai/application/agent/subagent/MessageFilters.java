@@ -220,11 +220,18 @@ public final class MessageFilters {
         List<AgentMessage> merged = new ArrayList<>(filtered.size());
         for (AgentMessage msg : filtered) {
             AgentMessage prev = merged.isEmpty() ? null : merged.get(merged.size() - 1);
-            if ("user".equals(msg.role()) && prev != null && "user".equals(prev.role())) {
+            // [agent-notice] 通知行（subtype=agent_message）不参与合并：合并会把
+            //   isMeta/author/subtype/summary 洗成上一条普通 user，前端就再也认不出它是通知，
+            //   且原文会被拼进相邻提问气泡。任一侧是通知 → 各自独立成条。
+            boolean msgNotice = "agent_message".equals(msg.subtype());
+            boolean prevNotice = prev != null && "agent_message".equals(prev.subtype());
+            if ("user".equals(msg.role()) && prev != null && "user".equals(prev.role())
+                    && !msgNotice && !prevNotice) {
                 merged.set(merged.size() - 1, new AgentMessage(
                     prev.role(), join(prev.content(), msg.content()), prev.isApiError(),
                     prev.agentId(), prev.isSidechain(), prev.uuid(), prev.parentUuid(),
-                    prev.toolCalls(), prev.toolCallId()));
+                    prev.toolCalls(), prev.toolCallId(), prev.timestamp(), prev.reasoning(),
+                    prev.isMeta(), prev.author(), prev.subtype(), prev.summary()));
             } else {
                 merged.add(msg);
             }

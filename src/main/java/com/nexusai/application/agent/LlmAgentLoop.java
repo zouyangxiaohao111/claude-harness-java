@@ -86,6 +86,7 @@ import com.nexusai.application.agent.loop.ContextCollapse;
 import com.nexusai.application.agent.loop.FeatureFlags;
 import com.nexusai.application.agent.skill.SkillChangeDetector;
 import com.nexusai.application.agent.skill.SkillDiscoveryPrefetch;
+import com.nexusai.application.agent.skill.SessionSkillAllowlistRegistry;
 import com.nexusai.application.agent.skill.SkillListingFilter;
 import com.nexusai.application.agent.skill.SkillListingSentRegistry;
 import com.nexusai.application.agent.skillsearch.SkillSearchPrefetch;
@@ -4804,9 +4805,10 @@ public class LlmAgentLoop implements AgentLoop {
      *
      * <p><b>WHY</b>：现状唯一消费点是 SubagentExecutor.runSubagentQueryLoop 启动段（drain 一次），
      * 运行中投递的消息（fork/后台子代理存活期间 SendMessage 按名投递）排到本轮结束才可见。
-     * 本方法在每轮模型请求前（messagesForLlm 定稿段）调用，把排队待办 drain 为 user 消息前置
-     * （"Message queued for delivery ... at its next tool round" 语义，与启动段互补：
-     * drain 取走即清 → 同条只前置一次，无双发）。
+     * 本方法在每轮模型请求前（messagesForLlm 定稿段）调用，把排队待办 drain 成真实 user 消息：
+     * 先 {@code state.appendMessage}（appendListener 落转录 + 推实时，只调一次），再追加到本轮
+     * {@code messagesForLlm} **末尾**（对齐 CC query.ts:1894-1904 把 queued_command push 进
+     * toolResults，而非插到消息头部）。消息因此留在历史里，下一轮从 state 重建仍可见。
      *
      * <p><b>守卫</b>：主线程（REPL/主会话，state.agentId()==null）绝不 drain —— 否则会吃掉
      * 用户 prompt 队列语义（AgentNameRegistry 队列按 agentId 投递，主线程 agentId 无注册条目）；
@@ -4830,8 +4832,9 @@ public class LlmAgentLoop implements AgentLoop {
         if (registry == null) {
             return messagesForLlm; // 未注入 bean → no-op（不破坏单测/POJO）
         }
-        java.util.List<String> pending = registry.drain(state.agentId().toString());
-        if (pending.isEmpty()) {
+        java.util.List<com.nexusai.application.agent.subagent.AgentNameRegistry.PendingAgentMessage> pending =
+            registry.drainPending(state.agentId().toString());
+        if (pending == null || pending.isEmpty()) {
             return messagesForLlm;
         }
         // [sendmsg-inbox] coordinator 包裹门控 · 与 SubagentExecutor.runSubagentQueryLoop 启动段
@@ -4844,28 +4847,29 @@ public class LlmAgentLoop implements AgentLoop {
             .coordinatorModeActiveForSession(ctx.streamSessionId(), promptAlignResolverFromCtx(ctx), coordinatorMode);
         java.util.List<ChatMessageDto> out = new java.util.ArrayList<>(messagesForLlm);
         int coordinatorWrapped = 0;
-        // FIFO 队列保持投递序：逆序遍历 + add(0) → 前置到本轮 messagesForLlm 顶部
-        for (int i = pending.size() - 1; i >= 0; i--) {
-            String pm = pending.get(i);
-            ChatMessageDto meta;
+        // 对齐 CC pending message 消费：每条成为一个真实 user 消息，追加到本轮消息序列**末尾**
+        //   （CC query.ts:1894-1904 把 queued_command attachment push 进 toolResults，而非插到头部）。
+        //   state.appendMessage 只调一次 —— appendListener 负责写子代理转录 + 实时推送；
+        //   消息因此留在历史里（下一轮从 state 重建仍可见），不再「只活一轮」。
+        for (com.nexusai.application.agent.subagent.AgentNameRegistry.PendingAgentMessage pm : pending) {
+            ChatMessageDto notify = com.nexusai.application.agent.subagent.AgentNotificationMessages
+                .toChatMessage(pm);
+            state.appendMessage(notify);
+            ChatMessageDto modelView = notify;
             if (coordGate) {
-                // CC wrapCommandText case 'coordinator'（messages.ts:5502-5505）逐字 +
-                //   :3784 system-reminder 包裹；isMeta=true → 前端隐藏、模型可见
-                //   （对齐 CC queued_command origin:{kind:'coordinator'} isMeta:true）。
+                // CC wrapCommandText case 'coordinator'（messages.ts:5991-6008）逐字 +
+                //   :3784 system-reminder 包裹；只改本轮模型副本，state/转录存原文。
                 String wrapped = "<system-reminder>\n"
-                    + "The coordinator sent a message while you were working:\n" + pm
+                    + "The coordinator sent a message while you were working:\n" + pm.text()
                     + "\n\nAddress this before completing your current task.\n</system-reminder>";
-                meta = toMessage(Role.user, wrapped, null, null, true);
+                modelView = toMessage(Role.user, wrapped, null, pm.id(), true);
                 coordinatorWrapped++;
-            } else {
-                // 与 SubagentExecutor 启动段 coordGate=false 分支同形态：裸 user 消息
-                meta = toMessage(Role.user, pm, null, null, false);
             }
-            out.add(0, meta);
+            out.add(modelView);
         }
         if (log.isInfoEnabled()) {
-            log.info("[LlmAgentLoop] [sendmsg-inbox] 每轮消费 SendMessage 待办 {} 条 → 前置本轮 "
-                    + "消息顶部 (agentId={} coordGate={} coordinatorWrapped={} · CC drainPendingMessages "
+            log.info("[LlmAgentLoop] [sendmsg-inbox] 每轮消费 SendMessage 待办 {} 条 → 落历史并追加本轮 "
+                    + "消息末尾 (agentId={} coordGate={} coordinatorWrapped={} · CC drainPendingMessages "
                     + "+ queued_command)",
                 pending.size(), state.agentId(), coordGate, coordinatorWrapped);
         }
@@ -4946,6 +4950,14 @@ public class LlmAgentLoop implements AgentLoop {
                     && params.toolUseContext().availableTools() != null
                     && !params.toolUseContext().availableTools().isEmpty()
                     ? params.toolUseContext().availableTools() : ref[0].availableTools();
+            // [诊断 · 2026-11-18] 「执行侧池只剩 2」必须能区分是 base params 被收窄、
+            //   还是 derive 出来的 ref 被收窄（MCP 池刷新那段会重建 registry）。
+            if (log.isInfoEnabled()) {
+                log.info("[LlmAgentLoop] deriveTurnTuc 池来源: session={} params池={} ref池={} 采用={}",
+                    ref[0].sessionId(),
+                    params.toolUseContext() == null ? -1 : params.toolUseContext().availableTools().size(),
+                    ref[0].availableTools().size(), pool.size());
+            }
             List<Tool> scoped = applySessionAgentToolPolicy(
                     ref[0].sessionId(), pool, ref[0].requestExtras());
             ref[0] = ref[0].withAvailableTools(scoped);
@@ -6719,9 +6731,15 @@ public class LlmAgentLoop implements AgentLoop {
             // CC 明确 dynamic_skill 仅供 UI（messages.ts:3723-3727 return []），不注入 LLM。
             try {
                 if (params.toolUseContext() != null) {
+                    // [CC 对齐] dynamic_skill 只对主线程套白名单（CC {@code e.agentId===void 0}；
+                    //   fork / 普通子代理不过滤）。null = 未配置 → 不过滤。
+                    java.util.List<String> dynamicSkillAllowlist =
+                        SessionSkillAllowlistRegistry.appliesToDynamicSkill(state.agentId())
+                            ? SessionSkillAllowlistRegistry.get(state.sessionId()) : null;
                     AgentLoopContext.collectDynamicSkillAttachments(state,
                         params.toolUseContext().dynamicSkillDirTriggers(),
-                        params.toolUseContext().effectiveCwd());
+                        params.toolUseContext().effectiveCwd(),
+                        dynamicSkillAllowlist);
                 }
             } catch (Exception e) {
                 log.warn("[LlmAgentLoop] 动态技能 attachment 装配失败, 不阻塞主链: {}", e.getMessage());
@@ -11572,6 +11590,19 @@ public class LlmAgentLoop implements AgentLoop {
         if (commands == null) {
             commands = java.util.List.of();
         }
+        // [CC 对齐] 会话级技能白名单（sessionSkillAllowlist）· 只过滤通告，不影响预加载 / Skill 工具调用。
+        //   未配置 = 不过滤（聊天默认）；[] = 一条都不通告；["a","b"] = 只留匹配项。
+        //   作用范围对齐 CC H$(agentContext)：主线程 / 后台化主会话 / fork 子代理；普通子代理不过滤。
+        java.util.List<String> skillAllowlist = SessionSkillAllowlistRegistry.get(state.sessionId());
+        if (skillAllowlist != null && SessionSkillAllowlistRegistry.appliesToListing(
+                state.agentId(),
+                baseTuc != null ? baseTuc.subagentName() : null,
+                baseTuc != null && baseTuc.isBuiltIn())) {
+            commands = SessionSkillAllowlistRegistry.filterByAllowlist(commands, skillAllowlist);
+            log.info("[LlmAgentLoop] skill_listing 白名单过滤: session={} allowlist={} → 候选 {} 条{} · CC H$/Tve",
+                state.sessionId(), skillAllowlist, commands.size(),
+                commands.isEmpty() ? "（全禁，不注入）" : "");
+        }
         String agentKey = agentKey(state);
         java.util.List<String> allNames = commands.stream().map(Command::getName).toList();
         SkillListingSentRegistry.Decision decision = SkillListingSentRegistry.decide(
@@ -11680,6 +11711,22 @@ public class LlmAgentLoop implements AgentLoop {
      * [RV-11 · REV-FIX-2] 1 参便捷重载（向后兼容 / 反射测试 R32B15Stage3_3）· 委托 3 参重载，
      * Input=empty（等价旧行为：无 CLI/settings 输入 → 初始 mode 解析回 DEFAULT）。
      */
+    /**
+     * [2026-11-19 权限模式转移] 以 transition 结果为基础只替换 mode。
+     *
+     * <p>{@code GetNextPermissionMode.transitionPermissionMode} 按 CC 约定**不设置 mode**
+     * （permissionSetup.ts:590-591「Caller is responsible for setting the mode」），
+     * 由调用方在本方法里补写。
+     */
+    private static com.nexusai.application.agent.permission.ToolPermissionContext withPermissionMode(
+            com.nexusai.application.agent.permission.ToolPermissionContext c, PermissionMode mode) {
+        return new com.nexusai.application.agent.permission.ToolPermissionContext(
+            mode, c.alwaysAllowRules(), c.alwaysDenyRules(), c.alwaysAskRules(),
+            c.additionalWorkingDirectories(), c.isBypassPermissionsModeAvailable(), c.isAutoModeAvailable(),
+            c.strippedDangerousRules(), c.shouldAvoidPermissionPrompts(),
+            c.awaitAutomatedChecksBeforeDialog(), c.prePlanMode());
+    }
+
     private ToolUseContext buildBaseToolUseContext(AgentState state) {
         // [S1-T2] 便捷重载：无 teammate 身份承载体 → 显式 null（非 teammate 上下文）。
         // [S1-T7] 无 agent 归因上下文承载体 → 显式 null（非 agent 上下文）。
@@ -11764,6 +11811,53 @@ public class LlmAgentLoop implements AgentLoop {
                         log.debug("[WF-8] bypassPermissions killswitch 门检: mode={} bypassAvailable={} "
                                 + "（对齐 CC useKickOffCheckAndDisableBypassPermissionsIfNeeded）",
                             mode, permCtx.isBypassPermissionsModeAvailable());
+                    }
+                }
+                // [2026-11-19 权限模式转移副作用 · 对齐 CC]
+                //   本轮 desiredMode 与上一轮 lastAppliedMode 不同才走统一入口 transitionPermissionMode：
+                //   进入 auto → setAutoModeActive(true) + 剥离危险规则；离开 auto → 恢复；
+                //   进入/离开 plan 的 prePlanMode 处理也在这里统一发生。同值不调（避免重复副作用）。
+                if (permCtx != null) {
+                    com.nexusai.application.agent.compact.PlanModeAttachments.PlanModeFlags pmFlags =
+                        com.nexusai.application.agent.compact.PlanModeAttachments
+                            .getOrCreateFlagsBySession(state.sessionId());
+                    PermissionMode desired = permCtx.mode();
+                    PermissionMode last = pmFlags.lastAppliedMode();
+                    if (last == null) {
+                        // 首轮：直接记基线，不触发转换（进程启动时没有「上一个模式」可言）
+                        pmFlags.setLastAppliedMode(desired);
+                    } else if (last != desired) {
+                        try {
+                            com.nexusai.application.agent.permission.ToolPermissionContext transitioned =
+                                com.nexusai.application.agent.permission.GetNextPermissionMode
+                                    .transitionPermissionMode(last, desired, permCtx,
+                                        com.nexusai.application.agent.permission.PermissionTransitionConfigs
+                                            .standard(autoModeGate != null ? autoModeGate::isEnabled : null));
+                            permCtx = withPermissionMode(transitioned, desired);
+                            // plan 进/出的一次性附件标志（渲染端 AgentLoopContext 已有 plan_mode_exit /
+                            // auto_mode_exit case，此前缺 producer）
+                            if (last == PermissionMode.PLAN && desired != PermissionMode.PLAN) {
+                                pmFlags.setNeedsPlanModeExitAttachment(true);
+                                pmFlags.setHasExitedPlanModeInSession(true);
+                            } else if (desired == PermissionMode.PLAN && last != PermissionMode.PLAN) {
+                                pmFlags.setNeedsPlanModeExitAttachment(false);
+                            }
+                            if (desired == PermissionMode.AUTO && last != PermissionMode.AUTO) {
+                                pmFlags.setNeedsAutoModeExitAttachment(false);
+                            } else if (last == PermissionMode.AUTO && desired != PermissionMode.AUTO) {
+                                pmFlags.setNeedsAutoModeExitAttachment(true);
+                            }
+                            pmFlags.setLastAppliedMode(desired);
+                            mode = permCtx.mode();
+                            if (log.isInfoEnabled()) {
+                                log.info("[LlmAgentLoop] 权限模式转移 {}→{} 副作用已应用（统一入口）session={}",
+                                    last, desired, state.sessionId());
+                            }
+                        } catch (Exception e) {
+                            // 转移失败不阻断本轮：保留原 permCtx（fail-soft），lastAppliedMode 也不更新
+                            log.warn("[LlmAgentLoop] 权限模式转移 {}→{} 失败（保留原上下文）session={}: {}",
+                                last, desired, state.sessionId(), e.toString());
+                        }
                     }
                 }
                 if (log.isDebugEnabled()) {
@@ -14375,10 +14469,36 @@ public class LlmAgentLoop implements AgentLoop {
         List<Tool> available = sessionVisibleToolsBase(tuc, querySource);
         if (available != null && tuc != null && tuc.sessionId() != null) {
             Set<String> disabled = SessionToolDisableConfig.getDisabledTools(tuc.sessionId());
-            if (!disabled.isEmpty()) {
+            // [2026-11-18 用户拍板 · 人格优先] 默认禁用集与人格点名冲突时，**人格指定的工具生效**，
+            //   其余非冲突项照旧禁用。
+            //
+            //   WHY：会话 disabled_tools 为 null 时读侧回落到「电脑操作 + 知识库」默认禁用集，
+            //   而 KB 人格（builtin-smart-reasoning / builtin-data-analyst 等）点名的正是知识库工具
+            //   ⇒ 默认集把人格要用的工具全剔掉，模型只能看到 AskUserQuestion + Read
+            //   （真机 2026-11-18 sess-2f77e856：池内知识库工具 4 → 0，结果 6 → 2）。
+            //
+            //   ⛔ 只豁免**默认集**：用户显式写进 disabled_tools 的项仍禁用 —— 那是用户的明确意图，
+            //   不该被人格定义覆盖（对齐 CC：deny 规则先于 agent 名单生效，见 tools.ts:310 +
+            //   REPL.tsx:824；本处是「默认值」层面的产品裁定，不是改 CC 的顺序语义）。
+            Set<String> effectiveDisabled = disabled;
+            if (!disabled.isEmpty() && SessionToolDisableConfig.isDefaultDisabledSet(tuc.sessionId())) {
+                Set<String> named = agentNamedTools(tuc.sessionId());
+                if (!named.isEmpty()) {
+                    Set<String> merged = new java.util.LinkedHashSet<>(disabled);
+                    merged.removeAll(named);
+                    if (merged.size() != disabled.size()) {
+                        log.info("[LlmAgentLoop] 人格优先豁免默认禁用: session={} 豁免={} 剩余禁用={}",
+                                tuc.sessionId(),
+                                named.stream().filter(disabled::contains).toList(), merged.size());
+                    }
+                    effectiveDisabled = merged;
+                }
+            }
+            if (!effectiveDisabled.isEmpty()) {
                 int before = available.size();
+                final Set<String> skip = effectiveDisabled;
                 available = available.stream()
-                        .filter(t -> t != null && !disabled.contains(t.name()))
+                        .filter(t -> t != null && !skip.contains(t.name()))
                         .toList();
                 if (log.isDebugEnabled() && available.size() != before) {
                     log.debug("sessionVisibleTools: 会话禁用工具剔除 {} 个（gap29 · V34 disabled_tools，"
@@ -14397,6 +14517,56 @@ public class LlmAgentLoop implements AgentLoop {
             available = applySessionAgentToolPolicy(tuc.sessionId(), available, tuc.requestExtras());
         }
         return available;
+    }
+
+    /**
+     * 会话主线程人格<b>逐名点名</b>的工具（用于「人格优先」豁免默认禁用集）。
+     *
+     * <p>与 {@link #applySessionAgentToolPolicy} 读同一份定义（同一个
+     * {@link com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry} 快照），
+     * 不另开解析分支 —— 否则「豁免名单」和「装配名单」可能不一致。
+     *
+     * <p>以下情况返回空集（= 不做豁免，退回原行为）：
+     * <ul>
+     *   <li>会话没绑定 {@code main_thread_agent}；</li>
+     *   <li>SubagentTool 未接线 / registry 未命中人格；</li>
+     *   <li>人格 {@code tools} 是通配（{@code null} / 空 / 单个 {@code "*"}）—— 通配不是「点名」，
+     *       不构成与默认禁用集的冲突。</li>
+     * </ul>
+     *
+     * @param sessionId 会话 id（非 null 非空白由调用方保证）
+     * @return 人格点名的工具名集合（不含通配符、不含空串）
+     */
+    public static Set<String> agentNamedTools(String sessionId) {
+        com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
+        String agentType = row == null ? null : row.getMainThreadAgent();
+        if (agentType == null || agentType.isBlank()) {
+            return Set.of();
+        }
+        com.nexusai.application.agent.tool.impl.SubagentTool subagentTool = findSubagentTool();
+        if (subagentTool == null) {
+            return Set.of();
+        }
+        final String agentTypeKey = agentType.trim();
+        com.nexusai.application.agent.subagent.AgentDefinition def =
+                com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry.resolve(
+                        sessionId, agentTypeKey,
+                        () -> subagentTool.agentRegistry(sessionId).findAgent(agentTypeKey));
+        if (def == null || def.tools().isEmpty()) {
+            return Set.of();
+        }
+        java.util.List<String> declared = def.tools().get();
+        if (declared.size() == 1 && "*".equals(declared.get(0))) {
+            return Set.of();
+        }
+        Set<String> out = new java.util.LinkedHashSet<>();
+        for (String name : declared) {
+            if (name == null || name.isBlank() || "*".equals(name.trim())) {
+                continue;
+            }
+            out.add(name.trim());
+        }
+        return out;
     }
 
     /**

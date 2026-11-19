@@ -15,6 +15,8 @@ import com.openai.client.OpenAIClient;
 import com.openai.core.JsonValue;
 import com.openai.core.RequestOptions;
 import com.openai.core.http.StreamResponse;
+import com.openai.models.Reasoning;
+import com.openai.models.ReasoningEffort;
 import com.openai.models.responses.EasyInputMessage;
 import com.openai.models.responses.FunctionTool;
 import com.openai.models.responses.Response;
@@ -196,7 +198,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                 ? streamIdleControl.idleTimeoutMs() : null;
             OpenAIClient client = OpenAiSdkProvider.buildClient(config, sessionId, idleTimeoutMs);
             ResponseCreateParams params = buildParams(modelName, instructions, input, sdkTools,
-                maxOutputTokensOverride, sessionId);
+                maxOutputTokensOverride, sessionId, resolvedEffort);
             if (log.isDebugEnabled()) {
                 log.debug("ResponsesSdkProvider stream -> model={} inputItems={} tools={} effort={} session={}",
                     modelName, input.size(), sdkTools.size(), resolvedEffort, sessionId);
@@ -493,7 +495,7 @@ public class ResponsesSdkProvider implements LlmProvider {
         List<ResponseInputItem> input = new ArrayList<>();
         input.add(buildUserItem(null, userMessage, resolveImageDetail(config),
             ModelCapabilityResolver.supportsImage(modelMapper, providerMapper, modelName)));
-        ResponseCreateParams params = buildParams(modelName, systemPrompt, input, List.of(), null, null);
+        ResponseCreateParams params = buildParams(modelName, systemPrompt, input, List.of(), null, null, null);
         return client.responses().create(params);
     }
 
@@ -587,13 +589,18 @@ public class ResponsesSdkProvider implements LlmProvider {
      *
      * <p>⚠️ 4.101.0 的 {@code ResponseCreateParams.Builder} <b>没有 stream(...)</b> 访问器
      * （javap 实测）；流式标记由 {@code createStreaming} 通道自行注入，非流式走 {@code create}。
+     *
+     * @param reasoningEffort 已解析的 effort 档（{@code EffortSupport.resolveAppliedEffort} 结果）；
+     *                        合法档由 {@link OpenAiSdkProvider#mapToOpenAiReasoningEffort} 映射后写入
+     *                        {@code reasoning.effort}，null / {@code off} / 模型不支持 → 不发（走上游默认）
      */
     private ResponseCreateParams buildParams(String modelName,
                                              String instructions,
                                              List<ResponseInputItem> input,
                                              List<Tool> toolsList,
                                              Integer maxOutputTokens,
-                                             String promptCacheKey) {
+                                             String promptCacheKey,
+                                             String reasoningEffort) {
         ResponseCreateParams.Builder b = ResponseCreateParams.builder()
             .model(modelName)
             .inputOfResponse(input == null ? List.of() : input)
@@ -610,7 +617,37 @@ public class ResponsesSdkProvider implements LlmProvider {
         if (promptCacheKey != null && !promptCacheKey.isBlank()) {
             b.promptCacheKey(promptCacheKey);
         }
+        // [C-31 ⊕] effort → Responses {@code reasoning.effort}（Completions 侧是 reasoning_effort）。
+        //   判据与 {@link OpenAiSdkProvider} 完全同源：mapToOpenAiReasoningEffort（max→high、
+        //   非法档→null）+ modelSupportsEffort，⛔ 不另写一套映射（本仓有「同一能力两套判据」前科）。
+        //   「关思考」（effortValue='off'）在 Responses 协议无等价字段 → 映射为 null 即不发。
+        Reasoning reasoning = reasoningOf(modelName, reasoningEffort);
+        if (reasoning != null) {
+            b.reasoning(reasoning);
+            if (log.isDebugEnabled()) {
+                log.debug("ResponsesSdkProvider 请求注入 reasoning.effort={} model={}",
+                    reasoning.effort().map(Object::toString).orElse("?"), modelName);
+            }
+        }
         return b.build();
+    }
+
+    /**
+     * effort 档 → Responses {@code reasoning} 对象（null = 不注入）。
+     *
+     * <p>判据单点复用 {@link OpenAiSdkProvider#mapToOpenAiReasoningEffort(String)}
+     * + {@code EffortSupport.modelSupportsEffort}，与 Completions 侧逐字同源。
+     *
+     * @param modelName       模型名（能力门控）
+     * @param reasoningEffort 已解析 effort（低/中/高/max/xhigh/off/null）
+     * @return Reasoning 或 null；{@code off} / 空 / 模型不支持 → null（不发，走上游默认）
+     */
+    static Reasoning reasoningOf(String modelName, String reasoningEffort) {
+        String openAiEffort = OpenAiSdkProvider.mapToOpenAiReasoningEffort(reasoningEffort);
+        if (openAiEffort == null || !EffortSupport.modelSupportsEffort(modelName)) {
+            return null;
+        }
+        return Reasoning.builder().effort(ReasoningEffort.of(openAiEffort)).build();
     }
 
     /** systemPromptBlocks → 顶层 instructions（多块按空行 join；cacheScope 无对应物 → 忽略）。 */

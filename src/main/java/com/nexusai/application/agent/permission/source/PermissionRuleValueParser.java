@@ -49,8 +49,8 @@ import java.util.*;
  * <ul>
  *   <li>{@code Task} → {@code Agent}（CC 旧版 Task 工具被 Agent 取代）</li>
  *   <li>{@code KillShell} → {@code TaskStop}（CC 改名）</li>
- *   <li>{@code AgentOutputTool} → {@code TaskOutput}（CC 别名，permissionRuleParser.ts:24）</li>
- *   <li>{@code BashOutputTool} → {@code TaskOutput}（CC 别名，permissionRuleParser.ts:25）</li>
+ *   <li>{@code AgentOutputTool} / {@code BashOutputTool} → TaskOutput —— claude.exe 2.1.328 已移除
+ *       TaskOutput 工具，映射随之删除；旧 settings 里点名这些工具的规则成了死规则（不再匹配任何工具）</li>
  *   <li>{@code WebFetch} → {@code WebFetch}（CC 占位，未来可能重命名）——O12 已删</li>
  * </ul>
  *
@@ -75,19 +75,14 @@ public class PermissionRuleValueParser {
      * <p><b>O12 删除说明（S13）</b>: KillBash→TaskStop 条目已删——CC 全仓 0 命中；
      * WebFetch→WebFetch 自映射已删（identity 无行为，映射无意义）。
      *
-     * <p><b>补登说明（S13 r1，OPD-PERM-10「补登缺失」）</b>: 补齐
-     * AgentOutputTool→TaskOutput / BashOutputTool→TaskOutput 两条——CC
-     * {@code LEGACY_TOOL_NAME_ALIASES}（permissionRuleParser.ts:21-29）含
-     * Task/KillShell/AgentOutputTool/BashOutputTool（+KAIROS 门控 Brief）；
-     * canonical {@code "TaskOutput"} = CC {@code TASK_OUTPUT_TOOL_NAME}
-     * （tools/TaskOutputTool/constants.ts:1）= Java {@code TaskOutputTool.NAME}
-     * （tool/impl/TaskOutputTool.java:28），已核一致。
+     * <p><b>2.1.328 删除说明</b>: AgentOutputTool/BashOutputTool → TaskOutput 两条已删——
+     * claude.exe 2.1.328 把 TaskOutput 放进「removed tools」集合，并跳过点名它的权限规则
+     * （{@code Permission ... rule names a removed tool}）；Java 无该工具后再保留映射只会指向
+     * 一个不存在的 canonical 名。
      */
     private static final Map<String, String> LEGACY_TO_CANONICAL = Map.of(
         "Task", "Agent",
-        "KillShell", "TaskStop",
-        "AgentOutputTool", "TaskOutput",
-        "BashOutputTool", "TaskOutput"
+        "KillShell", "TaskStop"
     );
 
     /**
@@ -100,7 +95,6 @@ public class PermissionRuleValueParser {
         Map<String, List<String>> reverse = new HashMap<>();
         reverse.put("Agent", List.of("Task"));
         reverse.put("TaskStop", List.of("KillShell"));
-        reverse.put("TaskOutput", List.of("AgentOutputTool", "BashOutputTool"));
         CANONICAL_TO_LEGACY = Collections.unmodifiableMap(reverse);
     }
 

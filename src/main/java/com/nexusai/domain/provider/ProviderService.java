@@ -510,22 +510,32 @@ public class ProviderService {
         }
 
         List<BuiltinStatus> out = new ArrayList<>(BuiltinProviderCatalog.BRANDS.size());
+
+        // providerId → 最终品牌 key。
+        // ① 显式 brand_key 优先；② 未归属的记录按 host/name 推断**一次**（只归第一个命中的品牌）。
+        // ⚠️ 不能「品牌没命中才回落」：同一品牌既有 brand_key 命中、又有未归属的老记录时，
+        //    老记录会被漏掉（用户 2026-11-17 报：大写 Kimi / api.moonshot.cn 留在自定义组）。
+        Map<String, String> brandOf = new HashMap<>();
+        for (ProviderRecord r : records) {
+            if (r.getId() != null && r.getBrandKey() != null && !r.getBrandKey().isBlank()) {
+                brandOf.put(r.getId(), r.getBrandKey());
+            }
+        }
+        for (ProviderRecord r : records) {
+            if (r.getId() == null || brandOf.containsKey(r.getId())) continue;
+            for (BuiltinProviderCatalog.Brand b : BuiltinProviderCatalog.BRANDS) {
+                if (baseUrlHostMatches(r.getBaseUrl(), b.matchHosts())
+                    || providerNameMatches(r.getName(), b.matchNames())) {
+                    brandOf.put(r.getId(), b.key());
+                    break;
+                }
+            }
+        }
+
         for (BuiltinProviderCatalog.Brand brand : BuiltinProviderCatalog.BRANDS) {
             List<ProviderRecord> hits = new ArrayList<>();
-            // ① brand_key 精确命中（V299 之后的新路径，支持一品牌多连接）
             for (ProviderRecord r : records) {
-                if (brand.key().equals(r.getBrandKey())) hits.add(r);
-            }
-            // ② 老数据（未写 brand_key）：host 优先、名字兜底 —— 与 V299 之前的判据一致
-            if (hits.isEmpty()) {
-                List<ProviderRecord> byHost = new ArrayList<>();
-                List<ProviderRecord> byName = new ArrayList<>();
-                for (ProviderRecord r : records) {
-                    if (r.getBrandKey() != null) continue;   // 已归属其它品牌，不参与猜测
-                    if (baseUrlHostMatches(r.getBaseUrl(), brand.matchHosts())) byHost.add(r);
-                    else if (providerNameMatches(r.getName(), brand.matchNames())) byName.add(r);
-                }
-                hits = byHost.isEmpty() ? byName : byHost;
+                if (r.getId() != null && brand.key().equals(brandOf.get(r.getId()))) hits.add(r);
             }
             List<BuiltinConnection> connections = hits.stream()
                 .filter(r -> r.getId() != null)

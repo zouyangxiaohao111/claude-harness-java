@@ -176,7 +176,7 @@ class CommandRegistrationConfig28Test {
     void localSlashHandlersRegisteredAndDispatchable() {
         UserInputDispatcher dispatcher = new UserInputDispatcher();
         config.commandLocalSlashRegistration28(dispatcher, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null);
+            null, null, null, null, null, null, null, null, null);
 
         for (String name : List.of("mcp", "permissions", "plan", "hooks", "skills", "agents",
             "tasks", "export", "context", "status", "tag", "usage", "stats", "diff")) {
@@ -225,7 +225,7 @@ class CommandRegistrationConfig28Test {
 
             config.commandLocalSlashRegistration28(dispatcher,
                 null, null, skillRegistry, null, sessionService, null, null,
-                sessionRegistry, userLoader, null, null, null, subagentTool, summaryService, messageService);
+                sessionRegistry, null, userLoader, null, null, null, subagentTool, summaryService, messageService);
 
             // 6 个真实执行命令（本类注册；/btw 在 GroupB 注册不含）逐个触发 → 不抛 + 路由命中
             // 先触发 /permissions /agents（真实/handler 走真实路径），再 /export

@@ -84,6 +84,11 @@ public final class BuiltinProviderCatalog {
             "Mistral API Key",
             Set.of("api.mistral.ai"),
             Set.of("mistral")),
+        new Brand("opencode", GROUP_INTL, "OpenCode", "openai_compatible",
+            "https://opencode.ai/zen/go/v1",
+            "OpenCode Zen",
+            Set.of("opencode.ai"),
+            Set.of("opencode", "oc", "oc2", "oc_new")),
 
         // ---------------- 国内 ----------------
         new Brand("deepseek", GROUP_CN, "DeepSeek", "openai_compatible",

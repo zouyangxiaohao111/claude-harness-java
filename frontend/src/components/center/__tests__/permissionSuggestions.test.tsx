@@ -406,6 +406,85 @@ function buttons(): HTMLButtonElement[] {
   return Array.from(container.querySelectorAll('button'))
 }
 
+describe('[计划审批卡 2026-11-19] 折叠态截断提示 + 计划文件基名', () => {
+  const planFilePath = '/home/u/proj/.nexusai/plans/refactor-plan.md'
+  const planOf = (n: number) => Array.from({ length: n }, (_, i) => `${i + 1}. 第 ${i + 1} 步`).join('\n')
+
+  it('⭐ >8 行 ⇒ 折叠态追加「还有 N 行未展开」（N = 总行数 − 8），文件行只显示基名、完整路径在 title', () => {
+    // WHY：折叠态原先静默截到前 8 行，用户看不出下面还有正文，会以为计划就这么短；
+    //   整条绝对路径又占满一行。两处都是纯展示问题 ⇒ 判据只能是「渲染层看得见什么」。
+    render(
+      <PermissionBubble
+        request={req({ toolName: 'ExitPlanMode', toolInput: { plan: planOf(12), planFilePath } })}
+        onDecision={vi.fn()}
+      />,
+    )
+    expect(container.textContent).toContain('还有 4 行未展开')
+    const fileRow = container.querySelector('.pb-worker[title]')
+    expect(fileRow?.textContent).toContain('refactor-plan.md')
+    expect(fileRow?.textContent).not.toContain('/home/u/proj')
+    expect(fileRow?.getAttribute('title')).toBe(planFilePath)
+  })
+
+  it('Windows 反斜杠路径 ⇒ 同样只显示基名（/ 与 \\ 都要切）', () => {
+    render(
+      <PermissionBubble
+        request={req({
+          toolName: 'ExitPlanMode',
+          toolInput: { plan: planOf(3), planFilePath: 'C:\\proj\\.nexusai\\plans\\win-plan.md' },
+        })}
+        onDecision={vi.fn()}
+      />,
+    )
+    const fileRow = container.querySelector('.pb-worker[title]')
+    expect(fileRow?.textContent).toContain('win-plan.md')
+    expect(fileRow?.textContent).not.toContain('C:\\proj')
+    expect(fileRow?.getAttribute('title')).toBe('C:\\proj\\.nexusai\\plans\\win-plan.md')
+  })
+
+  it('路径只有分隔符 ⇒ 整行不渲染（不留一个空的「计划文件：」行）', () => {
+    render(
+      <PermissionBubble
+        request={req({ toolName: 'ExitPlanMode', toolInput: { plan: planOf(3), planFilePath: '/' } })}
+        onDecision={vi.fn()}
+      />,
+    )
+    expect(container.textContent).not.toContain('计划文件：')
+    expect(container.querySelector('.pb-worker[title]')).toBeNull()
+  })
+
+  it('8 行整 ⇒ 不出现截断提示（提示只在真的被截断时才有）', () => {
+    render(
+      <PermissionBubble
+        request={req({ toolName: 'ExitPlanMode', toolInput: { plan: planOf(8), planFilePath } })}
+        onDecision={vi.fn()}
+      />,
+    )
+    expect(container.textContent).not.toContain('未展开')
+  })
+
+  it('⭐ 统计行含计划总行数：12 行 ⇒「共 12 行」；空计划 ⇒「共 0 行」且无截断提示', () => {
+    // WHY：折叠态只截 8 行 + 提示「还有 N 行」，没给总量参照，用户仍不知道计划到底多长。
+    //   判据只看渲染层文案；空计划的 split 结果是 ['']，很容易被算成 1 行 ⇒ 一并钉住。
+    render(
+      <PermissionBubble
+        request={req({ toolName: 'ExitPlanMode', toolInput: { plan: planOf(12), planFilePath } })}
+        onDecision={vi.fn()}
+      />,
+    )
+    expect(container.textContent).toContain('共 12 行')
+
+    render(
+      <PermissionBubble
+        request={req({ toolName: 'ExitPlanMode', toolInput: { plan: '', planFilePath } })}
+        onDecision={vi.fn()}
+      />,
+    )
+    expect(container.textContent).toContain('共 0 行')
+    expect(container.textContent).not.toContain('未展开')
+  })
+})
+
 describe('[批 A3] PermissionBubble 第三档渲染', () => {
   it('有 suggestions ⇒ 渲染第三档，文案与工具匹配，且在既有三档之外', () => {
     const onDecision = vi.fn()

@@ -22,7 +22,7 @@ import {
   brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile, RightTab } from '@/types'
-import type { AppSettings, AttachmentRequest, ModelTierRole, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
+import type { AppSettings, AskUserAnnotations, AskUserAnswers, AttachmentRequest, ModelTierRole, PermissionUpdate, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
 import { projectApi, type ProjectDto } from '@/api/projects'
@@ -72,6 +72,7 @@ import { MenuBar } from '@/components/layout/MenuBar'
 import { SessionList } from '@/components/left/SessionList'
 import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
+import { TaskListDock } from '@/components/center/TaskListDock'
 import { AskUserPendingHint } from '@/components/center/AskUserPendingHint'
 import { SubagentRunningHint } from '@/components/center/SubagentRunningHint'
 import { MonitorRunningHint } from '@/components/center/MonitorRunningHint'
@@ -85,7 +86,7 @@ import { WorkspaceHeader } from '@/components/center/WorkspaceHeader'
 import { SchedulesPage } from '@/components/center/SchedulesPage'
 import { KnowledgeBasePage, KbSceneNav } from '@/components/knowledge/KnowledgeBasePage'
 import { KbNewChatPane } from '@/components/knowledge/KbNewChatPane'
-import { kbPermissionOwnership } from '@/utils/kbPermissionOwnership'
+import { kbPermissionOwnership, onKbAnswered, onKbOwnershipChanged } from '@/utils/kbPermissionOwnership'
 import { TraceView } from '@/components/center/TraceView'
 import { useCommandQueue, type PoppedQueueInput } from '@/hooks/useCommandQueue'
 import { CommandPalette, isDisabledCommand, isKnownCommand } from '@/components/center/CommandPalette'
@@ -762,6 +763,16 @@ function App() {
     serverRunning,
   })
   /**
+   * [流式渲染 2026-11-18] MessageList 的「正文走流式臂」判据 = 本轮**尚未收口**。
+   *
+   * <p>⛔ 不能用 `turnRunning`：它含 `hasStream`（有内容 ≠ 还在跑）。服务端 idle 后块可能
+   * 还在 streams 里（complete 的 finalize 是异步收口），此时 `turnRunning` 仍为 true ⇒
+   * 正文永远不切收口臂、粘连 markdown 不会被 rescue 修好（用户明确诉求：idle 就要完整重渲一次）。
+   *
+   * <p>本值只看「本地登记 + 服务端权威运行态」两路（`utils/turnRunning.ts` 的前两路之①③）。
+   */
+  const turnLive = !!activeStreams[activeSessionId] || serverRunning
+  /**
    * [2026-11-02] turnRunning 的 ref 镜像 —— 供**异步回调**读当前值。
    *
    * <p>WHY：`handleArtifactPush` 是在 STOMP 订阅闭包里被调用的（建立于连接时），
@@ -990,12 +1001,95 @@ function App() {
   //   清除，不独立弹出第二个「需要权限」通用弹窗。仅当无 message 请求（如 leader inbox 走 bridge）才回退。
   //   ⛔ 知识库窗口已接管的会话不再在本窗口弹（否则同一请求两处各弹一次 ·
   //   2026-11-14 用户报「知识库选择了，主会话还在」）。没有知识库窗口时该集合恒空 ⇒ 行为不变。
+  // [2026-11-18 用户裁定] 只隐藏**知识库窗口此刻正在显示**的那条会话，别的一律照旧：
+  //   · 主会话里其它会话的弹窗不受影响（过滤仍按 sessionId 精确匹配）；
+  //   · 用户在主会话里切到这条知识库会话继续回答 ⇒ 知识库窗口失焦 ⇒ 它 release ⇒
+  //     主窗口恢复弹窗（谁在看谁接管）。
+  //   ownership = 本窗口集合（页内知识库）+ 远端镜像（独立 Tauri 窗口通过事件同步）。
+  const [remoteOwned, setRemoteOwned] = useState<Set<string>>(new Set())
+  const isPermissionOwnedElsewhere = (sid: string | null | undefined): boolean =>
+    kbPermissionOwnership.has(sid) || (!!sid && remoteOwned.has(sid))
   const currentPermission = permissionQueue.find((r) => r.sessionId === activeSessionId
-      && !kbPermissionOwnership.has(r.sessionId) && r.kind === 'message')
+      && !isPermissionOwnedElsewhere(r.sessionId) && r.kind === 'message')
     ?? permissionQueue.find((r) => r.sessionId === activeSessionId
-      && !kbPermissionOwnership.has(r.sessionId))
+      && !isPermissionOwnedElsewhere(r.sessionId))
+  // [plan-approval inline] ExitPlanMode 走消息流内联（按 toolUseId 锚定工具卡）；其余工具仍用浮卡
+  const pendingPlanApproval = currentPermission && currentPermission.toolName === 'ExitPlanMode'
+      && currentPermission.toolUseId ? currentPermission : null
+  // 兜底：当前消息里找不到该 toolUseId（历史/重放/工具卡被折叠丢弃）⇒ 仍走浮卡，避免审批入口丢失
+  const inlinePlanApproval = pendingPlanApproval && (
+      storeMessages.some((m) => (m.toolCalls ?? []).some((t) => t.id === pendingPlanApproval.toolUseId))
+      // 审批常发生在工具刚执行、消息尚未落库时 ⇒ 流式块里的 toolCalls 也算锚点
+      || (useChatStore.getState().streams[activeSessionId] ?? []).some(
+        (b) => (b.toolCalls ?? []).some((t) => t.id === pendingPlanApproval.toolUseId)))
+    ? pendingPlanApproval : null
+  // 稳定回调（useCallback）：否则每次渲染都换引用 ⇒ MessageList(memo) 失效 ⇒ 打字整表重渲
+  const planClearHandler = useCallback(async (plan: string) => {
+    const req = currentPermission
+    if (!req || appSettings?.showClearContextOnPlanAccept !== true) return
+    const src = req.sessionId ?? activeSessionId
+    if (!src || !plan) return
+    try {
+      if (clientRef.current) {
+        sendPermissionResponse(clientRef.current, src, req.kind, req.requestId, 'deny', {
+          acceptFeedback: '用户选择清空上下文执行：计划已转入新会话，请不要在当前会话继续。',
+        })
+      }
+      useChatStore.getState().dequeuePermission(req.requestId)
+      useChatStore.getState().clearPermissionByToolUse(src, req.toolUseId ?? req.requestId)
+      const r = await sessionApi.exitPlan(src, { plan, mode: 'acceptEdits', clearContext: true })
+      const list = await sessionApi.list()
+      setSessions(list)
+      sessionDispatch({ type: 'SWITCH', sessionId: r.sessionId })
+      await chatApi.send(r.sessionId, {
+        content: `Implement the following plan:\n\n${plan}`,
+        permissionMode: 'acceptEdits',
+      })
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [appSettings?.showClearContextOnPlanAccept, currentPermission, activeSessionId, setSessions, sessionDispatch, showToast])
+
+  const permissionDecisionHandler = useCallback((
+    id: string, d: 'allow' | 'deny',
+    answers?: AskUserAnswers, annotations?: AskUserAnnotations,
+    permissionUpdates?: PermissionUpdate[], acceptFeedback?: string, updatedInput?: unknown,
+  ) => {
+    const req = currentPermission
+    if (!req) return
+    const targetSession = req.sessionId ?? activeSessionId
+    if (clientRef.current) {
+      sendPermissionResponse(clientRef.current, targetSession, req.kind, id, d, {
+        answers, annotations, permissionUpdates, acceptFeedback, updatedInput,
+      })
+    }
+    useChatStore.getState().markToolAnswered(targetSession, req.toolUseId ?? id)
+    dequeuePermission(id)
+    useChatStore.getState().clearPermissionByToolUse(targetSession, req.toolUseId ?? id)
+  }, [currentPermission, activeSessionId, dequeuePermission])
   // 等待权限/提问的会话 id 集合（侧栏黄点 · 对齐 Harness pendingInteraction 优先于运行）
   const pendingSessionIds = useMemo(() => new Set(permissionQueue.map((r) => r.sessionId)), [permissionQueue])
+  // 跨窗口同步（Tauri 独立窗口才有事件；浏览器/单测下两个函数是空操作）：
+  //   · ownership 变化 ⇒ 重新求值 currentPermission（isKbSession / has 都是渲染时读的）
+  //   · KB 窗口已回答 ⇒ 把这条请求从本窗口队列删掉，弹窗立刻消失
+  useEffect(() => {
+    let disposeChanged: (() => void) | undefined
+    let disposeAnswered: (() => void) | undefined
+    void onKbOwnershipChanged(({ sessionId, owned }) => {
+      setRemoteOwned((prev) => {
+        const next = new Set(prev)
+        if (owned) next.add(sessionId)
+        else next.delete(sessionId)
+        return next
+      })
+    }).then((d) => { disposeChanged = d })
+    void onKbAnswered(({ sessionId, requestId, toolUseId }) => {
+      useChatStore.getState().dequeuePermission(requestId)
+      // 同一 tool_use 的 message + bridge 两条 requestId 不同 ⇒ 按 toolUseId 一并清掉
+      if (toolUseId) useChatStore.getState().clearPermissionByToolUse(sessionId, toolUseId)
+    }).then((d) => { disposeAnswered = d })
+    return () => { disposeChanged?.(); disposeAnswered?.() }
+  }, [])
   // 权限卡片出现 → 滚底信号（值变化时 MessageList 强制滚到底部，确保权限弹窗对准最新内容）
   const [permScrollSignal, setPermScrollSignal] = useState(0)
   // 回到底部按钮（Composer 工具栏 · 对齐 deepseek-harness ChatView toBottom）：对话贴底状态 + 触发滚底信号
@@ -1032,30 +1126,23 @@ function App() {
    *  否则「先发的慢请求后返回」会把新结果覆盖成旧窗口。 */
   const reconcileSeqRef = useRef<Record<string, number>>({})
   /**
-   * [尾部对账] 切会话 / 断连重连 / idle 兜底 三处共用：拉一次尾窗，**只比尾部消息 id**，
-   * 变了才整表替换（无变化时完全不写 store ⇒ foldedTurnCounts 不归零、用户展开过的更早轮保留）。
+   * [尾部对账] 切会话 / 断连重连 / idle 兜底 三处共用：拉一次尾窗并**整表安装**（对齐 dsh
+   * `installWindow` / `repairGap` 语义）。
    *
-   * <p>本地尾部可能是**服务端不可达**的合成行（`away-*` 离开摘要 / `perm-*` 权限超时留痕，
-   * 只存在于前端）⇒ 比对前跳过它们，取最后一条服务端可达的行。
+   * <p><b>为什么不比尾部 id</b>：尾部 id 相同不能证明内容相同 —— 本地可能是 finalize 出来的空壳
+   * （正文 chunk 在切走期间丢了），id 一样但正文为空；只比 id 会让它永久幸存，用户只能 F5。
+   * 服务端窗口是唯一权威 ⇒ 直接装。
+   *
+   * <p>唯一例外：服务端返回空而本地非空 ⇒ 视为窗口未就绪（新建会话 / 落库未回），不覆盖本地乐观内容。
    */
   const reconcileTail = useCallback(async (sid: string): Promise<void> => {
     const token = (reconcileSeqRef.current[sid] ?? 0) + 1
     reconcileSeqRef.current[sid] = token
     try {
       const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
-      const localMsgs = useChatStore.getState().messages[sid] ?? []
       // 过期守卫：期间又发起了更新的对账 → 本次结果作废
       if (reconcileSeqRef.current[sid] !== token) return
-      let localTailId: string | null = null
-      for (let i = localMsgs.length - 1; i >= 0; i--) {
-        const id = localMsgs[i]?.id ?? null
-        if (!id || id.startsWith('away-') || id.startsWith('perm-')) continue
-        localTailId = id
-        break
-      }
-      const serverTailId = messages.length > 0 ? messages[messages.length - 1]?.id ?? null : null
-      // 尾部一致（且服务器非空、本地尾部 id 非空）→ 内容没变，不写 store
-      if (messages.length > 0 && localTailId != null && localTailId === serverTailId) return
+      if (messages.length === 0 && (useChatStore.getState().messages[sid]?.length ?? 0) > 0) return
       setMessages(sid, messages)
       useChatStore.getState().setHasMore(sid, hasMore)
     } catch (e) {
@@ -1420,42 +1507,43 @@ function App() {
     return () => window.removeEventListener('keydown', onKey)
   }, [ui, settings.settingsTab, providersApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
 
-  // ---- 历史回放：会话切换 —— 有常驻缓存仍校验尾部；仅从未载入的会话才 GET 初始化 ----
+  // ---- 历史回放：会话切换 —— 未在跑就与后端整表对账（对齐 dsh repairGap 语义）----
   // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻」：messages/streams 已常驻
   //   chatStore，实时链路（chunk append / message.user / complete finalize / queue.drained）持续增量维护。
   //   旧实现每次切会话都 setMessages(activeSessionId, []) + GET 重拉 → 对仍正流式输出的会话切回瞬间历史
-  //   闪没、整列表重排抖动。故缓存命中（历史非空）时不整表重拉；仅 undefined/空缓存（首次切到未载入会话）
-  //   才 GET 初始化。
-  //   [切会话尾部校验] 缓存非空 ≠ 内容最新：后台任务/子代理起的 run 不登记 activeStreams（本页只在
-  //   sendMessage / queue.drained 登记），useChatSocket 的「切回补拉」仅在 activeStreams 命中时触发 ⇒
-  //   兜底不生效，后台产出的新消息要 F5 才出现。故缓存命中时仍走一次 reconcileTail（拉尾窗，只比对
-  //   **尾部消息 id**，变了才整表替换 —— 无变化时完全不写 store ⇒ foldedTurnCounts 不归零、用户展开过
-  //   的更早轮保留）。运行中的会话跳过校验（避免拿到「已落库但缺最后一小段」的窗口把流式尾巴回退）。
-  //   校验失败静默：这是后台行为，一次失败不该打断用户。
+  //   闪没、整列表重排抖动。故「在跑」时不发请求，只靠常驻订阅增量维护。
+  //
+  //   [切回对账 v2] 判定「在跑」只用两路权威信号：activeStreams 登记 + serverRunning。
+  //   ⛔ 不再看 streams 有没有块：块残留 ≠ 在跑（complete/idle 帧丢失时块会留在 store），
+  //   旧判据会因此跳过对账；而本 effect 不依赖运行态 ⇒ 跳过之后永不重试 ⇒ 用户只能 F5。
+  //   现在把 sessionLive 放进依赖：切回时还在跑 → 不发请求；随后收口（true→false）→ 自动对账一次。
+  //   未在跑时先清残留块（否则渲染层 turnEnded=false，把历史窗口锁成 1 轮），再整表安装尾窗。
   const isRealActive = storeSessions.some((s) => s.id === activeSessionId)
+  const sessionLive = !!activeStreams[activeSessionId] || serverRunning
   useEffect(() => {
-    if (!isRealActive) return
-    let cancelled = false
-    const cached = useChatStore.getState().messages[activeSessionId]
+    if (!isRealActive || sessionLive) return
+    const sid = activeSessionId
+    const cached = useChatStore.getState().messages[sid]
+    if ((useChatStore.getState().streams[sid]?.length ?? 0) > 0) clearStream(sid)
     if (Array.isArray(cached) && cached.length > 0) {
-      // 运行中（本页已登记，或 store 里有流式块）→ 跳过校验
-      if (activeStreams[activeSessionId] || (useChatStore.getState().streams?.[activeSessionId]?.length ?? 0) > 0) return
       // 竞态守卫在 reconcileTail 内（按 sid 的调用序号），这里无需 cancelled
-      void reconcileTail(activeSessionId)
+      void reconcileTail(sid)
       return
     }
     // [turn-paging] 无缓存 → 最近 3 轮（有界窗口，不再全量；hasMore 供顶部「加载更多」）
-    chatApi.listTurns(activeSessionId, { turns: FOLD_DEFAULT_TURNS })
+    let cancelled = false
+    chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
       .then(({ messages, hasMore }) => {
         if (cancelled) return
-        setMessages(activeSessionId, messages)
-        useChatStore.getState().setHasMore(activeSessionId, hasMore)
+        setMessages(sid, messages)
+        useChatStore.getState().setHasMore(sid, hasMore)
       })
       .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
     return () => { cancelled = true }
-    // 运行中登记的增减不触发本校验（否则每次起停流都会重发 listTurns）
+    // sessionLive 必须在依赖里：切回时还在跑 → 本次不发请求；收口后（true→false）要自动补一次对账。
+    // ⛔ 不加 messages/streams —— 内容推进不应重发 listTurns。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, isRealActive, setMessages, showToast])
+  }, [activeSessionId, isRealActive, sessionLive, setMessages, showToast, reconcileTail, clearStream])
 
   // [Phase2] 切到真实会话 → GET /files 对账（补订阅前/断连期间的改动文件 · 与 files.changed 事件同源整表替换）
   const realChangedSession = storeSessions.some((s) => s.id === activeSessionId) ? activeSessionId : null
@@ -1695,7 +1783,7 @@ function App() {
   //   重拉 GET /messages 补偿缺口（DB 已逐条落库 realtime-persist）。reloadMessages 锁 activeSessionId
   //   （F5/当前会话专用）,后台会话断连需按 sid 拉 → 独立实现。finalizeBlocks 按 id 幂等去重保证不重复。
   const handleReconnectReload = useCallback(async (sid: string) => {
-    // 断线重连 / 缺口修复 / idle 兜底三处共用 reconcileTail（尾部 id 一致则不写 store）
+    // 断线重连 / 缺口修复 / idle 兜底三处共用 reconcileTail（整表安装服务端尾窗）
     await reconcileTail(sid)
     // [C6 · 停止键可见性] 断连窗口内 run 的起轮 / 收口事件可能推给了零订阅者（STOMP topic 非持久）
     //   → 连上就重查一次服务端运行态，避免「run 早已结束但停止键仍挂着」/「run 在跑却没停止键」。
@@ -2387,6 +2475,19 @@ function App() {
     }
   }, [activeSessionId, setSessions, showToast, storeSessions])
 
+  // 会话级协调者模式（V75 coordinator_mode · Composer 工具区开关）：PATCH 后端 + 本地同步。
+  //   UI 显示值 = 会话值 ?? 全局 coordinatorModeEnabled ?? false；用户一拨就写**会话级** true/false，
+  //   之后该会话不再跟随全局（后端 PromptAlignSettingsResolver 逐次按 sessionId 读）。
+  const handleCoordinatorModeChange = useCallback(async (on: boolean) => {
+    if (!activeSessionId) return
+    try {
+      const updated = await sessionApi.update(activeSessionId, { coordinatorMode: on })
+      setSessions(storeSessions.map((s) => s.id === activeSessionId ? updated : s))
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [activeSessionId, setSessions, showToast, storeSessions])
+
   // 会话级主线程 agent（V58 main_thread_agent · Composer 顶部胶囊）：PATCH 后端 + 本地同步
   //   agentType=null/空串 均表示清除 → 后端传空串（PATCH 语义：null=不改动，空串=清除）
   const handleAgentChange = useCallback(async (agentType: string | null) => {
@@ -2806,6 +2907,93 @@ function App() {
       return false
     }
   }, [showToast, activeSessionId, reloadMessages])
+
+  /**
+   * 进入计划模式 · claude.exe EnterPlanMode 的等价入口（⛔ 不是权限模式下拉的普通选项）。
+   *
+   * <p>对齐 CC 的 `/plan` 提交语义（`handlePromptSubmit.ts:323-352`）：
+   * · 空闲 → 立即走 `/plan` 命令链路（后端写 AgentState.planMode + session_permission_rules 的
+   *   SESSION `setMode=PLAN`）；
+   * · turn 运行中 → **排队**：记 pending（chip 显示「排队中」独立视觉），等本会话 turn 结束后执行。
+   *   ⛔ 不伪造 `permissionMode='plan'`：排队期间后端并未生效，UI 不应假装已生效。
+   *
+   * <p>退出时的目标模式（prePlanMode）先按会话存 localStorage；后端落库在后续批次接入。
+   */
+  const PRE_PLAN_MODE_KEY = (sid: string) => `nexusai.prePlanMode.${sid}`
+  const readPrePlanMode = (sid: string): PermissionMode => {
+    try {
+      const v = localStorage.getItem(PRE_PLAN_MODE_KEY(sid))
+      if (v === 'default' || v === 'plan' || v === 'acceptEdits'
+          || v === 'bypassPermissions' || v === 'dontAsk' || v === 'auto') return v
+    } catch { /* ignore */ }
+    return 'default'
+  }
+  /** 已排队「进入计划模式」的会话（跨会话保留；chip 据此显示 pending 态）。 */
+  const [pendingPlanEnter, setPendingPlanEnter] = useState<Set<string>>(() => new Set())
+
+  const applyEnterPlanMode = useCallback(async (sid: string): Promise<boolean> => {
+    // 排队期间切走了会话 → 不把计划模式落到别的会话
+    if (sid !== activeSessionId) return false
+    const ok = await runBuiltin('plan')
+    if (ok) {
+      try { setSessions(await sessionApi.list()) } catch { /* 下次 list 会同步 */ }
+      showToast('已进入计划模式', 'success')
+    }
+    return ok
+  }, [activeSessionId, runBuiltin, setSessions, showToast])
+
+  const handleEnterPlanMode = useCallback(async () => {
+    const sid = activeSessionId
+    if (!sid) return
+    // 记录「进入前是什么模式」——退出时恢复（CC ExitPlanMode 的 prePlanMode 语义）
+    if (activePermissionMode !== 'plan') {
+      try { localStorage.setItem(PRE_PLAN_MODE_KEY(sid), activePermissionMode) } catch { /* ignore */ }
+    }
+    if (turnRunning) {
+      // CC：运行中输入 /plan 入队，当前 turn 消费后执行。UI 只标「排队中」，不改 permissionMode。
+      setPendingPlanEnter((prev) => {
+        if (prev.has(sid)) return prev
+        const next = new Set(prev)
+        next.add(sid)
+        return next
+      })
+      showToast('已排队：当前任务结束后进入计划模式', 'info')
+      return
+    }
+    await applyEnterPlanMode(sid)
+  }, [activeSessionId, activePermissionMode, turnRunning, showToast, applyEnterPlanMode])
+
+  // 会话空闲 + 当前会话有排队项 → 兑现（切回该会话且已空闲时也会执行）
+  useEffect(() => {
+    if (turnRunning || !activeSessionId || !pendingPlanEnter.has(activeSessionId)) return
+    // 先摘除再执行，防 effect 重入重复发请求
+    setPendingPlanEnter((prev) => {
+      const next = new Set(prev)
+      next.delete(activeSessionId)
+      return next
+    })
+    void applyEnterPlanMode(activeSessionId)
+  }, [turnRunning, activeSessionId, pendingPlanEnter, applyEnterPlanMode])
+
+  /**
+   * 退出计划模式 = **切换权限模式**（对齐 CC Shift+Tab：随时可切，无 busy 守卫）。
+   *
+   * <p>目标 = 进入前的模式（prePlanMode）。`sessionApi.update({permissionMode})` 在后端
+   * `SessionService` 里会同步 `session_permission_rules` 的 SESSION `setMode`
+   * （`SessionPermissionOverlay.syncMode`）⇒ 不会被 rules 里的旧 PLAN 盖回去。
+   */
+  const handleExitPlanMode = useCallback(async () => {
+    if (!activeSessionId) return
+    const target = readPrePlanMode(activeSessionId)
+    try {
+      const updated = await sessionApi.update(activeSessionId, { permissionMode: target })
+      setSessions(storeSessions.map((s) => s.id === activeSessionId ? updated : s))
+      try { localStorage.removeItem(PRE_PLAN_MODE_KEY(activeSessionId)) } catch { /* ignore */ }
+      showToast('已退出计划模式', 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [activeSessionId, setSessions, storeSessions, showToast])
 
   // ---- composer ----
   /**
@@ -3296,10 +3484,13 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }} />
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} turnRunning={turnLive} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }}
+              pendingPlanApproval={inlinePlanApproval}
+              onPlanClearContext={appSettings?.showClearContextOnPlanAccept === true ? planClearHandler : undefined}
+              onPlanDecision={permissionDecisionHandler} />
           )}
         </div>
-        {currentPermission && (
+        {currentPermission && !inlinePlanApproval && (
           <PermissionBubble
             request={currentPermission}
             // [批 A4c P3] 项目级档位文案的「项目标识」。currentPermission 已按
@@ -3309,18 +3500,9 @@ function App() {
             // [appName 通道 2026-09-23] 「编辑配置目录」档位的自有根标记由 appName 派生。
             //   取不到（settings 未加载完 / 后端未透出）⇒ null ⇒ 回落 .nexusai/（与落地前逐字相同）。
             selfDirName={appSettings?.appName ?? null}
-            onDecision={(id, d, answers, annotations, permissionUpdates) => {
-              // 路由到请求来源会话（用户切走标签时仍发回正确的 session）
-              const targetSession = currentPermission.sessionId ?? activeSessionId
-              // permissionUpdates 仅「一键授权」档位携带（原样回传后端 suggestions）；允许/拒绝为 undefined
-              if (clientRef.current) sendPermissionResponse(clientRef.current, targetSession, currentPermission.kind, id, d, { answers, annotations, permissionUpdates })
-              // [2026-10-22 问答收敛] 已回答 → 给对应工具卡打「已回答 · 等待结果」标记；
-              //   tool_result 到达时由 fillToolResult 自动清除（事件缺失时不再无限「执行中」）
-              useChatStore.getState().markToolAnswered(targetSession, currentPermission.toolUseId ?? id)
-              dequeuePermission(id)
-              // 同一 tool_use 的 bridge 条目 requestId 不同 ⇒ 只删本条会留一条 ⇒ 左栏黄点常亮
-              useChatStore.getState().clearPermissionByToolUse(targetSession, currentPermission.toolUseId ?? id)
-            }}
+            permissionMode={activePermissionMode}
+            onPlanClearContext={appSettings?.showClearContextOnPlanAccept === true ? planClearHandler : undefined}
+            onDecision={permissionDecisionHandler}
             onAbort={() => {
               // 中止权限请求（对齐 CC Ctrl+C onReject · 用户放弃决策 → deny + dequeue，解除 worker 等待）
               const targetSession = currentPermission.sessionId ?? activeSessionId
@@ -3344,6 +3526,9 @@ function App() {
         {/* 轨迹视图只查看，不展示对话输入框 */}
         {/* 发送键 ⇄ 停止键切换用 turnRunning（activeStreams 登记 = turn 运行中，含 thinking/重试期；
             非 仅 streamOrder 有块 —— 重试/thinking 期无流式块会误显示发送键） */}
+        {/* [2026-11-19 用户裁定] 协调者按**会话**激活：只认本会话的 coordinator_mode，
+            ⛔ 不再回落到设置页的全局开关（否则全局一开，所有会话都显示为开，切换会话看不出区别）。
+            未设置 = 关；用户一点就写本会话的 true/false。 */}
         {centerView === 'chat' && (
           <Composer
             composerText={composerText}
@@ -3352,6 +3537,11 @@ function App() {
             showToast={showToast}
             permissionMode={activePermissionMode}
             onPermissionModeChange={handlePermissionModeChange}
+            onEnterPlanMode={handleEnterPlanMode}
+            onExitPlanMode={handleExitPlanMode}
+            planPending={pendingPlanEnter.has(activeSessionId)}
+            coordinatorMode={activeSession?.coordinatorMode ?? false}
+            onCoordinatorModeChange={handleCoordinatorModeChange}
             streaming={turnRunning || compactActive}
             onStop={stopStreaming}
             queuedCommands={commandQueue.queuedCommands}
@@ -3389,6 +3579,18 @@ function App() {
             hasGoal={!!currentGoal}
             goalCondition={currentGoal?.condition ?? null}
             pendingHint={<AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />}
+            taskListHint={activeSessionId
+              ? <TaskListDock
+                  sessionId={activeSessionId}
+                  running={turnRunning}
+                  onRemind={() => {
+                    // [task-reminder] 人工提醒：发一条消息让模型重新核对并更新清单（不自动判定）
+                    const text = '【任务清单提醒】请核对 TaskCreate 任务清单并更新进度：已完成的标记 completed，'
+                      + '正在做的标记 in_progress，遗漏的步骤补上；若已全部完成请说明。'
+                    void sendMessage(undefined, text, { sessionId: activeSessionId, text })
+                  }}
+                />
+              : null}
             subagentHint={activeSessionId
               ? <SubagentRunningHint sessionId={activeSessionId} onOpen={openSubagentPanel} />
               : null}
@@ -3553,6 +3755,10 @@ function App() {
             if (name === 'agents') { setShowAgentsPanel(true); return }
             if (name === 'memory') { setShowMemoryEditor(true); return }
             if (name === 'chrome') { setShowChromePanel(true); return }
+            // /plan 走计划模式入口（与 chip 同链路）：turn 运行中排队 + 记录 prePlanMode +
+            //   成功后刷新 sessions。直接 runBuiltin('plan') 后端虽已切模式，但胶囊/会话态不刷新，
+            //   用户会认为「点了没生效」。
+            if (name === 'plan') { void handleEnterPlanMode(); return }
             void runBuiltin(name)
           }}
         />

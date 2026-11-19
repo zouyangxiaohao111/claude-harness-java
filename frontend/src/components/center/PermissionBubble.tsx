@@ -1,4 +1,6 @@
 import { useEffect, useMemo, useState } from 'react'
+import { createPortal } from 'react-dom'
+import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { JsonBlock } from '@/markdown/JsonBlock'
 import type { PermissionRequestItem } from '@/stores/chatStore'
 import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion, PermissionUpdate } from '@/api/types'
@@ -7,7 +9,9 @@ import { ComputerUseApprovalError, ComputerUseApprovalPanel, isComputerUseTool }
 
 interface Props {
   request: PermissionRequestItem
-  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations, permissionUpdates?: PermissionUpdate[]) => void
+  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations, permissionUpdates?: PermissionUpdate[], acceptFeedback?: string, updatedInput?: unknown) => void
+  /** [plan-approval] 清空上下文后执行（对齐 CC clear-context 批准）：由 App 负责新建会话并发送执行指令 */
+  onPlanClearContext?: (plan: string) => void
   /** 中止权限请求（用户放弃决策 → App 发 deny + dequeue · 对齐 CC Ctrl+C onReject，解除 worker 等待） */
   onAbort?: () => void
   /**
@@ -28,6 +32,11 @@ interface Props {
    * 取不到时传 null ⇒ 回落 `.nexusai/`（与落地前逐字相同，不猜、不编造）。
    */
   selfDirName?: string | null
+  /**
+   * 当前会话权限模式（CC 串）。仅用于「提示后果」：plan 模式下接受带 setMode 的档位
+   * 会切走计划模式，档位文案必须写明。
+   */
+  permissionMode?: string | null
 }
 
 /** 每问勾选态：question 文本 → 单选 label / 多选 label[] */
@@ -80,16 +89,20 @@ function ToolInput({ toolInput }: { toolInput: unknown }) {
   return <JsonBlock label="工具参数" payload={typeof toolInput === 'string' ? tryParse(toolInput) ?? toolInput : toolInput} defaultOpen />
 }
 
-export function PermissionBubble({ request, onDecision, onAbort, projectLabel, selfDirName }: Props) {
+export function PermissionBubble({ request, onDecision, onPlanClearContext, onAbort, projectLabel, selfDirName, permissionMode }: Props) {
   const questions = extractQuestions(request)
   const elapsed = useElapsed(request.timestampMs)
   // 一键授权档位（后端 suggestions → 文案）· useMemo：useElapsed 每秒触发重渲染，
   //   不 memo 会让「未识别形态」的 warn 每秒刷屏。
   //   ⚠️ selfDirName 必须进依赖数组：漏了会让 appName 变化（settings 加载完成）后文案不重算。
   const suggestionOptions = useMemo(
-    () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel, selfDirName),
-    [request.suggestions, request.toolName, projectLabel, selfDirName],
+    () => buildSuggestionOptions(request.suggestions, request.toolName, projectLabel, selfDirName, permissionMode),
+    [request.suggestions, request.toolName, projectLabel, selfDirName, permissionMode],
   )
+  // plan 模式下，带 setMode 的档位会切换会话模式（CC 有意保留该建议）⇒ 显式警示一次，
+  // 避免用户以为只是「允许这次写入」，结果悄悄退出计划模式。
+  const planModeSwitchWarning = permissionMode === 'plan' &&
+    suggestionOptions.some((o) => o.update.type === 'setMode' && o.update.mode !== 'plan')
   // [桌面控制审批面板] 后端带 computerUse ⇒ 渲染应用清单 + 授权范围（整组授予）。
   //   插在普通分支之前：该请求**没有** questions，且普通分支会把它当成「允许执行这个工具」——
   //   那样用户看不到要控制哪些应用、能控制到什么程度。
@@ -118,6 +131,20 @@ export function PermissionBubble({ request, onDecision, onAbort, projectLabel, s
       />
     )
   }
+  // [plan-approval] 计划审批：正文是主角，选项是「执行方式」，不是普通工具授权。
+  if (isPlanApprovalRequest(request)) {
+    if (suggestionOptions.length > 0) {
+      console.warn('[perm] 计划审批使用专属卡片，忽略后端通用 suggestions', request.requestId)
+    }
+    return (
+      <PlanApprovalCard
+        request={request}
+        onDecision={onDecision}
+        onPlanClearContext={onPlanClearContext}
+        onAbort={onAbort}
+      />
+    )
+  }
   // 无 questions → 保持原 allow/deny 弹窗（+ 中止按钮）
   if (questions.length === 0) {
     return (
@@ -129,6 +156,11 @@ export function PermissionBubble({ request, onDecision, onAbort, projectLabel, s
               : `需要权限：${request.permissionDisplay?.displayName || request.toolName}`)}
         </div>
         {request.isLeaderInbox && <WorkerBadge color={request.workerBadgeColor} />}
+        {planModeSwitchWarning && (
+          <div className="pb-warning">
+            当前处于计划模式：下方带「会退出计划模式」的档位会切换会话模式，之后 ExitPlanMode 将不可用。
+          </div>
+        )}
         {request.warning && <div className="pb-warning">{request.warning}</div>}
         {(request.permissionDisplay?.description || request.description) && (
           <div className="pb-desc">{request.permissionDisplay?.description || request.description}</div>
@@ -272,6 +304,262 @@ function AskUserForm({ request, questions, onDecision, onAbort }: {
         <button className="fm-btn" onClick={() => onDecision(request.requestId, 'deny')}>拒绝</button>
         <button className="fm-btn primary" onClick={confirm}>确认</button>
       </div>
+    </div>
+  )
+}
+
+/** [plan-approval] ExitPlanMode 专属审批（对齐 CC ExitPlanModePermissionRequest）。 */
+function isPlanApprovalRequest(request: PermissionRequestItem): boolean {
+  return request.toolName === 'ExitPlanMode'
+}
+
+/** toolInput 可能是对象或 JSON 字符串；解析失败返回 null。 */
+function parseToolInputObject(request: PermissionRequestItem): Record<string, unknown> | null {
+  const raw = (request as PermissionRequestItem & { toolInput?: unknown }).toolInput
+  if (raw == null) return null
+  const parsed = typeof raw === 'string' ? tryParse(raw) : raw
+  return typeof parsed === 'object' && parsed !== null && !Array.isArray(parsed)
+    ? (parsed as Record<string, unknown>)
+    : null
+}
+
+/** 计划规模摘要（只做确定性统计，不调用模型）。 */
+function summarizePlan(plan: string): { points: number; files: number } {
+  const points = (plan.match(/^\s*(?:\d+\.|[-*])\s+/gm) ?? []).length
+  const files = new Set(
+    (plan.match(/`[^`\n]+`/g) ?? [])
+      .map((s) => s.slice(1, -1).trim())
+      .filter((s) => /[./\\]/.test(s) || /^[A-Z][A-Za-z0-9]+$/.test(s)),
+  ).size
+  return { points, files }
+}
+
+export function PlanApprovalCard({
+  request,
+  onDecision,
+  onPlanClearContext,
+  onAbort,
+}: {
+  request: PermissionRequestItem
+  onDecision: Props['onDecision']
+  onPlanClearContext?: Props['onPlanClearContext']
+  onAbort?: () => void
+}) {
+  const elapsed = useElapsed(request.timestampMs)
+  const toolInput = parseToolInputObject(request)
+  const plan = typeof toolInput?.plan === 'string' ? toolInput.plan : ''
+  const planFilePath = typeof toolInput?.planFilePath === 'string' ? toolInput.planFilePath : ''
+  const [expanded, setExpanded] = useState(false)
+  const [editing, setEditing] = useState(false)
+  const [editedPlan, setEditedPlan] = useState(plan)
+  const [feedbackOpen, setFeedbackOpen] = useState(false)
+  const [feedback, setFeedback] = useState('')
+  const [feedbackError, setFeedbackError] = useState(false)
+  const [confirmClear, setConfirmClear] = useState(false)
+  const summary = useMemo(() => summarizePlan(plan), [plan])
+
+  const modeUpdate = (mode: 'acceptEdits' | 'default'): PermissionUpdate[] => [
+    { type: 'setMode', mode, destination: 'session' },
+  ]
+
+  function approve(mode: 'acceptEdits' | 'default') {
+    const planChanged = editing && editedPlan !== plan
+    const updatedInput = planChanged ? { ...(toolInput ?? {}), plan: editedPlan, planFilePath } : undefined
+    onDecision(
+      request.requestId,
+      'allow',
+      undefined,
+      undefined,
+      modeUpdate(mode),
+      feedback.trim() || undefined,
+      updatedInput,
+    )
+  }
+
+  function submitFeedback() {
+    if (!feedback.trim()) {
+      setFeedbackError(true)
+      return
+    }
+    setFeedbackError(false)
+    onDecision(request.requestId, 'deny', undefined, undefined, undefined, feedback.trim())
+  }
+
+  const planLines = plan.split('\n')
+  // 空计划 split 会得到 ['']，展示口径必须是 0 行。
+  const planLineCount = plan.length === 0 ? 0 : planLines.length
+  const hiddenLines = plan.length === 0 ? 0 : Math.max(0, planLines.length - 8)
+  const collapsed = plan.length === 0
+    ? 'No plan found. Please write your plan to the plan file first.'
+    : planLines.slice(0, 8).join('\n')
+  // 计划文件行只显示基名（完整路径放 title），`/` 与 `\` 都要切。
+  const planFileName = planFilePath.split(/[\\/]/).filter(Boolean).pop() ?? ''
+
+  return (
+    <div className="permission-bubble plan-approval-inline">
+      {/* [plan-approval inline] 内联在消息流里：去掉浮卡的居中/阴影/限高，贴着工具卡 */}
+      <style>{'.plan-approval-inline{width:100%;max-width:none;margin:0 0 12px;box-shadow:none;'
+        + 'border-radius:0 8px 8px 0;border-left:3px solid var(--accent,#0f5fd4);'
+        + 'max-height:none;overflow:visible;z-index:auto}'}</style>
+      <div className="pb-title">准备好开始了吗？</div>
+      <div className="pb-desc">
+        {request.permissionDisplay?.description || `这是 ${request.toolName} 的计划：`}
+      </div>
+      {planFileName && (
+        <div
+          className="pb-worker"
+          title={planFilePath}
+          style={{ fontFamily: 'ui-monospace, Consolas, monospace' }}
+        >
+          计划文件：{planFileName}
+        </div>
+      )}
+      <div
+        className="pb-desc"
+        style={{
+          border: '1px solid var(--border, #eee)',
+          borderRadius: 6,
+          padding: '8px 10px',
+          background: 'var(--surface-2, #eff2f8)',
+          whiteSpace: 'pre-wrap',
+          maxHeight: expanded ? 320 : 180,
+          overflow: 'auto',
+          fontFamily: 'ui-monospace, Consolas, monospace',
+          fontSize: 12,
+          lineHeight: 1.7,
+        }}
+      >
+        {expanded || editing ? (editing ? editedPlan : plan) : collapsed}
+        {!expanded && !editing && hiddenLines > 0 && (
+          <div className="pb-plan-more">… 还有 {hiddenLines} 行未展开（点『查看全文』展开）</div>
+        )}
+      </div>
+      <div className="pb-worker">
+        正文 {plan.length} 字符 · 共 {planLineCount} 行 · {summary.points} 个要点 · {summary.files} 处文件引用
+      </div>
+      <div className="pb-actions" style={{ justifyContent: 'flex-start' }}>
+        <button className="fm-btn" onClick={() => setExpanded((v) => !v)}>
+          {expanded ? '收起全文' : '查看全文'}
+        </button>
+        <button
+          className="fm-btn"
+          onClick={() => {
+            if (!editing) setEditedPlan(plan)
+            setEditing((v) => !v)
+            setExpanded(true)
+          }}
+        >
+          {editing ? '取消编辑' : '编辑计划'}
+        </button>
+      </div>
+      {editing && createPortal(
+        <div
+          onClick={() => setEditing(false)}
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1200, display: 'flex', alignItems: 'center',
+            justifyContent: 'center', padding: 24, background: 'rgba(20,24,31,.45)',
+          }}
+        >
+          <div
+            onClick={(e) => e.stopPropagation()}
+            style={{
+              width: 'min(920px, 92vw)', height: 'min(72vh, 720px)', background: '#fff',
+              borderRadius: 12, display: 'flex', flexDirection: 'column', overflow: 'hidden',
+              boxShadow: '0 24px 60px rgba(20,24,31,.28)',
+            }}
+          >
+            <div style={{
+              display: 'flex', alignItems: 'center', padding: '12px 16px',
+              borderBottom: '1px solid #EEEEEE', fontSize: 14, fontWeight: 650, color: '#14181f',
+            }}>
+              编辑计划
+              <span style={{ marginLeft: 8, fontSize: 12, fontWeight: 400, color: '#8a93a2' }}>
+                左侧编辑，右侧实时预览 Markdown
+              </span>
+              <button
+                onClick={() => setEditing(false)}
+                style={{ marginLeft: 'auto', border: 0, background: 'transparent', color: '#8a93a2', cursor: 'pointer', fontSize: 13 }}
+              >
+                关闭
+              </button>
+            </div>
+            <div style={{ flex: 1, display: 'flex', minHeight: 0 }}>
+              <textarea
+                value={editedPlan}
+                onChange={(e) => setEditedPlan(e.target.value)}
+                spellCheck={false}
+                style={{
+                  flex: 1, minWidth: 0, border: 0, borderRight: '1px solid #EEEEEE',
+                  padding: '12px 14px', fontFamily: 'ui-monospace, Consolas, monospace',
+                  fontSize: 13, lineHeight: 1.7, resize: 'none', outline: 'none',
+                }}
+              />
+              <div style={{ flex: 1, minWidth: 0, overflow: 'auto', padding: '12px 16px' }}>
+                <MarkdownTextV2 text={editedPlan} className="content md" />
+              </div>
+            </div>
+            <div style={{
+              display: 'flex', gap: 8, justifyContent: 'flex-end',
+              padding: '10px 16px', borderTop: '1px solid #EEEEEE',
+            }}>
+              <button className="fm-btn" onClick={() => setEditing(false)}>取消</button>
+              <button
+                className="fm-btn primary"
+                onClick={() => { setEditing(false); setExpanded(true) }}
+              >
+                保存计划
+              </button>
+            </div>
+          </div>
+        </div>,
+        document.body,
+      )}
+      {request.timestampMs && <div className="pb-waiting">已等待 {elapsed}s</div>}
+      <div className="pb-actions">
+        {onAbort && <button className="pb-abort" onClick={onAbort}>中止</button>}
+        <button className="fm-btn" onClick={() => setFeedbackOpen((v) => !v)}>不，继续规划</button>
+        <button className="fm-btn" onClick={() => approve('default')}>手动逐次批准</button>
+        {onPlanClearContext && (
+          <button className="fm-btn" onClick={() => setConfirmClear(true)}>批准并清空上下文执行</button>
+        )}
+        <button className="fm-btn primary" onClick={() => approve('acceptEdits')}>批准并执行</button>
+      </div>
+      {confirmClear && onPlanClearContext && (
+        <div className="pb-warning" style={{ padding: '0 0 10px' }}>
+          清空上下文后执行？当前对话历史会保留为历史，计划会作为新会话的第一条输入。
+          <div className="pb-actions" style={{ justifyContent: 'flex-start', marginTop: 8 }}>
+            <button className="fm-btn" onClick={() => setConfirmClear(false)}>取消</button>
+            <button
+              className="fm-btn primary"
+              onClick={() => {
+                setConfirmClear(false)
+                onPlanClearContext(editing && editedPlan !== plan ? editedPlan : plan)
+              }}
+            >
+              确认，清空并执行
+            </button>
+          </div>
+        </div>
+      )}
+      {feedbackOpen && (
+        <div style={{ padding: '0 0 10px' }}>
+          <textarea
+            className="pb-custom-input"
+            style={{ width: '100%', minHeight: 64 }}
+            placeholder="告诉模型要改什么（提交后计划退回修改）"
+            value={feedback}
+            onChange={(e) => {
+              setFeedback(e.target.value)
+              if (feedbackError && e.target.value.trim()) setFeedbackError(false)
+            }}
+          />
+          {feedbackError && <div className="pb-warning">请先写下要修改的内容。</div>}
+          <div className="pb-actions" style={{ justifyContent: 'flex-start' }}>
+            <button className="fm-btn" onClick={() => setFeedbackOpen(false)}>取消</button>
+            <button className="fm-btn primary" onClick={submitFeedback}>提交修改意见</button>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

@@ -137,7 +137,7 @@ public class SkillPreloader {
         //   原经裸 MDC 读取，已删。生产调用方走 3 参重载（SubagentExecutor 显式传 preloadSessionId）。
         log.warn("[SkillPreloader] preload(List) 无会话入参 → 技能清单按进程默认解析（SkillsLoader 回落 "
             + "user.dir），绑定会话的 per-session 技能可能不同: skills={}", skillsToPreload);
-        return preload(skillsToPreload, null, null);
+        return preload(skillsToPreload, null, null, null);
     }
 
     /**
@@ -170,6 +170,28 @@ public class SkillPreloader {
      * @return 预加载结果
      */
     public PreloadResult preload(List<String> skillsToPreload, String sessionId, ToolUseContext ctx) {
+        return preload(skillsToPreload, sessionId, ctx, null);
+    }
+
+    /**
+     * [CC 对齐] 带 agentType 的预加载 · 供技能名三策略解析使用。
+     *
+     * <p><b>CC 真源</b>：CCB {@code runAgent.ts:586-647} —— {@code allSkills = getSkillToolCommands(...)}
+     * （Java 等价 {@link SkillRegistry#getModelInvocableCommands(String)}，同款过滤链：type=prompt /
+     * !disableModelInvocation / source!=builtin …），随后逐名走 {@code resolveSkillName}：
+     * <ol>
+     *   <li>直接匹配（{@code hasCommand}：name / userFacingName / aliases）；</li>
+     *   <li>插件前缀：{@code agentDefinition.agentType.split(':')[0]} → {@code `${pluginPrefix}:${skill}`}；</li>
+     *   <li>后缀匹配：命令 name 以 {@code ":skillName"} 结尾，首个命中者胜。</li>
+     * </ol>
+     * exe v2.1.325 同形（{@code Zu(e,n,s)} @328392337），仅第 ②③ 步多一道
+     * {@code tjn} 过滤（排除 memoryStore / MCP / allowlistedByFullNameOnly 命令）——Java 的
+     * {@code getModelInvocableCommands} 数据源本身不含 MCP，其余两类本仓不存在 ⇒ N/A。
+     *
+     * @param agentType agent 类型（插件 agent 形如 {@code pluginName:agentName}）；null/空 → 跳过前缀策略
+     */
+    public PreloadResult preload(List<String> skillsToPreload, String sessionId, ToolUseContext ctx,
+                                 String agentType) {
 
         if (skillsToPreload == null || skillsToPreload.isEmpty()) {
             return new PreloadResult(List.of(), List.of());
@@ -181,22 +203,33 @@ public class SkillPreloader {
         List<String> missingSkills = new ArrayList<>();
         List<Skill> validSkills = new ArrayList<>();
 
+        // CCB runAgent.ts:588 `allSkills = getSkillToolCommands(getProjectRoot())` —— 预加载的解析基座
+        //   是「模型可调用技能」子集，不是全量命令（旧实现用 findCommand 搜全量，会命中 builtin 命令）。
+        List<Command> allSkills = registry.getModelInvocableCommands(sessionId);
+
         for (String skillName : skillsToPreload) {
             // [批 3c] 会话标识显式取自本方法形参 sessionId（生产调用方 SubagentExecutor:1751 传
             //   preloadSessionId）——技能名解析基座随会话绑定项目变化。原经裸 MDC 读取，已删。
-            Command cmd = registry.findCommand(skillName, sessionId);
+            Command cmd = resolveSkillName(skillName, allSkills, agentType);
             if (cmd == null) {
-                log.warn("[SkillPreloader] Skill '{}' 在共享 registry 中未找到 (bundled + file system + MCP + dynamic)",
-                        skillName);
+                // CCB runAgent.ts:607-612 告警文案（逐字对齐）
+                log.warn("[SkillPreloader] [Agent: {}] Warning: Skill '{}' specified in frontmatter was not found",
+                        agentType, skillName);
                 missingSkills.add(skillName);
+            } else if (!"prompt".equals(cmd.getType())) {
+                // CCB runAgent.ts:616-622。allSkills 已按 type=prompt 预滤 ⇒ 与 CCB 一样是防御性分支
+                //   （数据源恒为 prompt；保留以对齐 CCB 源码形状）。
+                log.warn("[SkillPreloader] [Agent: {}] Warning: Skill '{}' is not a prompt-based skill",
+                        agentType, skillName);
             } else {
                 String content = deriveContent(cmd, sessionId, ctx);
                 String progressMsg = cmd.getProgressMessage() != null
                     ? cmd.getProgressMessage()
                     : "Preloaded skill: " + cmd.getName();
                 validSkills.add(new Skill(cmd.getName(), content, progressMsg));
-                log.info("[SkillPreloader] Skill '{}' 预加载命中 (name={}, source={}, contentLen={})",
-                        skillName, cmd.getName(), cmd.getSource(),
+                // CCB runAgent.ts:638-640 `Preloaded skill '${skillName}'`
+                log.info("[SkillPreloader] [Agent: {}] Preloaded skill '{}' (name={}, source={}, contentLen={})",
+                        agentType, skillName, cmd.getName(), cmd.getSource(),
                         content == null ? 0 : content.length());
             }
         }
@@ -235,6 +268,49 @@ public class SkillPreloader {
                 validSkills.size(), missingSkills.size(), registry.getSkillsRoot());
 
         return new PreloadResult(initialMessages, missingSkills);
+    }
+
+    /**
+     * 技能名三策略解析 · 对齐 CCB {@code runAgent.ts:931-959 resolveSkillName}
+     * （exe v2.1.325 同形 {@code Zu(e,n,s)}）。
+     *
+     * <p>顺序严格：直接匹配 → 插件前缀 → 后缀匹配；任一命中即返回，全不命中返回 null。
+     * 直接匹配走 {@link SkillRegistry#findCommandByName}（CC {@code hasCommand} 同语义：
+     * name / userFacingName / aliases）。
+     *
+     * @param skillName frontmatter 里写的技能名（未规范化）
+     * @param allSkills 解析基座（模型可调用技能子集）
+     * @param agentType agent 类型（插件 agent 为 {@code pluginName:agentName}）；null/空 → 跳过前缀策略
+     * @return 命中的命令；未命中 null
+     */
+    static Command resolveSkillName(String skillName, List<Command> allSkills, String agentType) {
+        if (skillName == null || skillName.isBlank() || allSkills == null || allSkills.isEmpty()) {
+            return null;
+        }
+        // 1. 直接匹配 · CCB runAgent.ts:936-939
+        Command direct = SkillRegistry.findCommandByName(skillName, allSkills);
+        if (direct != null) {
+            return direct;
+        }
+        // 2. 插件前缀 · CCB runAgent.ts:941-949：agentType.split(':')[0]（无冒号时取整串，同 JS split）
+        if (agentType != null && !agentType.isEmpty()) {
+            int sep = agentType.indexOf(':');
+            String pluginPrefix = sep >= 0 ? agentType.substring(0, sep) : agentType;
+            if (!pluginPrefix.isEmpty()) {
+                Command qualified = SkillRegistry.findCommandByName(pluginPrefix + ":" + skillName, allSkills);
+                if (qualified != null) {
+                    return qualified;
+                }
+            }
+        }
+        // 3. 后缀匹配 · CCB runAgent.ts:951-956：首个 name 以 ":skillName" 结尾者胜
+        String suffix = ":" + skillName;
+        for (Command cmd : allSkills) {
+            if (cmd.getName() != null && cmd.getName().endsWith(suffix)) {
+                return cmd;
+            }
+        }
+        return null;
     }
 
     /**

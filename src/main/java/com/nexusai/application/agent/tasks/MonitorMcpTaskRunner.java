@@ -226,7 +226,7 @@ public class MonitorMcpTaskRunner {
     }
 
     /**
-     * 任务输出文件路径（供 MonitorTool 返回契约 "Use TaskOutput to read the stream from: ..."）。
+     * 任务输出文件路径（供 MonitorTool 返回契约「Read the output file to read the stream from: ...」）。
      *
      * <p>与 {@link #registerTask} 内部 {@code defaultOutputFile(taskId)} 同一计算（确定性
      * 唯一根 {@code {tmpRoot}/claude-{uid}/{sanitizedCwd}/{sessionId}/tasks/<taskId>.output}，批次Y Q3

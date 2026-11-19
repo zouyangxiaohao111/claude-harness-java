@@ -376,7 +376,8 @@ public class TodoWriteTool implements Tool {
      * 旧的 {@code sessionId} 字段 + 构造器注入（默认 {@code "default"} 回退）已删除：Java 同 CC
      * 为无状态工具，会话分桶全部由 {@link #resolveTodoKey(ToolUseContext)} 在调用时解析。
      *
-     * <p>装配入口：{@code ToolRegistrationConfig:217 new TodoWriteTool()}（无参，保留）。
+     * <p>装配入口：<b>无</b>（2026-11-19 起 V1 停止 Spring 装配，ToolRegistrationConfig 不再创建本工具；
+     * 类与 isEnabled 语义保留，对齐 CC 仍有 TodoWrite 实现但默认走 V2）。
      */
     public TodoWriteTool() {
     }

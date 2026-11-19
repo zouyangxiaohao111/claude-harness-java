@@ -78,7 +78,8 @@ async function flush(): Promise<void> {
   await act(async () => { await new Promise((r) => setTimeout(r, 0)) })
 }
 
-const chipCount = (c: HTMLElement) => c.querySelectorAll('.attach-item').length
+// 图片走缩略图 `.attach-item`，其余文件走 DSH 卡片 `.attach-file-card` —— chip 数按预览区子项数
+const chipCount = (c: HTMLElement) => c.querySelectorAll('.attach-preview > *').length
 
 /** 取 `console.warn` 的留痕行（本仓 `[attach]` 观测日志都走它 —— 现场判据就是这些行）。 */
 function warnLines(spy: { mock: { calls: unknown[][] } }): string[] {

@@ -83,6 +83,9 @@ public class TaskController {
     private final BackgroundTaskRunner backgroundTaskRunner;
     private final TaskFrameworkService taskFrameworkService;
     private final TaskService taskService;
+    /** [activity-summary] in-process teammate 状态源（ownerLabel + 最近活动）· 无 bean → 活动字段为 null。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.team.InProcessTeammateTaskRegistry teammateTaskRegistry;
     /** [task-v2-merge] V1 todo 读取：sessions.todos 列（DB-first，同 TodoStatusController）· 无 bean → 空桶。 */
     @Autowired(required = false)
     private SessionMapper sessionMapper;
@@ -122,7 +125,26 @@ public class TaskController {
                     continue;
                 }
             }
-            result.add(TaskDto.from(task));
+            // [activity-summary] teammate 的 owner 名与最近活动 · 对齐 CC TaskListV2：
+            //   owner 匹配 identity.agentName/agentId；activity 只在 running 时取自
+            //   progress.recentActivities（本仓落在 InProcessTeammateTaskState.recentActivities）。
+            String ownerName = null;
+            String activity = null;
+            if (teammateTaskRegistry != null
+                    && task.type() == com.nexusai.application.agent.tasks.TaskType.IN_PROCESS_TEAMMATE) {
+                com.nexusai.application.agent.team.InProcessTeammateTaskState st =
+                    teammateTaskRegistry.get(task.id())
+                        .map(com.nexusai.application.agent.subagent.AutonomousAgentLoop::taskState)
+                        .orElse(null);
+                if (st != null && st.identity() != null) {
+                    ownerName = st.identity().agentName();
+                    if (task.status() == BackgroundTaskStatus.RUNNING) {
+                        activity = com.nexusai.application.agent.tasks.ToolActivitySummary
+                            .summarize(st.recentActivities());
+                    }
+                }
+            }
+            result.add(TaskDto.from(task, ownerName, activity));
         }
         if (log.isDebugEnabled()) {
             log.debug("[TaskController] GET /api/v1/tasks sessionId={} → {} 个任务（全量 {} 个）",
@@ -182,6 +204,33 @@ public class TaskController {
                 sid, taskListId, v2Tasks.size(), v1Todos.size());
         }
         return new TaskListSnapshotDto(taskListId, v2Tasks, v1Todos, updatedAt);
+    }
+
+    /**
+     * 重置 V2 任务清单 · POST /api/v1/tasks/reset?sessionId=
+     *
+     * <p>对齐 CC {@code resetTaskList}（tasks.ts:147-188）：先提升 high water mark 防 ID 复用，
+     * 再删除任务目录下所有 {@code *.json}（跳过点文件）。CC 的调用点是
+     * {@code useTasksV2.ts:157-176}——全部任务 completed 后 5 秒触发；本仓由前端
+     * {@code TaskListDock} 在同一时机调用。
+     *
+     * <p>sessionId <b>必填</b>（同 {@link #listTasksMerged}）：任务清单必须锚定单个会话，
+     * 缺值无从解析 taskListId ⇒ 400（fail loud，不回落 MDC）。
+     *
+     * @param sessionId query {@code ?sessionId=}（必填）
+     * @return {@code {success: true, taskListId}}
+     */
+    @PostMapping("/reset")
+    public Map<String, Object> resetTaskList(@RequestParam(value = "sessionId", required = false) String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            log.warn("[TaskController] POST /api/v1/tasks/reset 缺少会话标识 ?sessionId= → 400");
+            throw new ValidationException("sessionId is required (POST /api/v1/tasks/reset)");
+        }
+        String taskListId = TaskService.getTaskListId(sessionId, null);
+        taskService.resetTaskList(taskListId);
+        log.info("[TaskController] POST /api/v1/tasks/reset sessionId={} taskListId={} → 任务文件已清空（保留高水位）",
+            sessionId, taskListId);
+        return Map.of("success", true, "taskListId", taskListId);
     }
 
     /** [task-v2-merge] V1 todo 桶读取 · sessions.todos 列 DB-first（同 TodoStatusController.readBuckets 语义）·

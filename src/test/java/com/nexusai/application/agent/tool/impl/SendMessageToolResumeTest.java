@@ -90,7 +90,8 @@ class SendMessageToolResumeTest {
         tool.execute(new ToolUseBlock("c2", "SendMessage",
             JSON.readTree("{\"to\":\"researcher\",\"message\":\"status?\"}")), ctx);
 
-        verify(registry).queue("a1234567890abcdef", "status?");
+        // [agent-notice] 入队携带来源/会话/origin（稳定 ID 由 registry 生成，此处只校验路由参数）
+        verify(registry).queue("a1234567890abcdef", "sess-1", "team-lead", "status?", null, "coordinator");
         verify(resume, never()).resumeAgentBackground(any(), anyString(), any(), anyString(), any(),
             org.mockito.ArgumentMatchers.anyBoolean());
     }

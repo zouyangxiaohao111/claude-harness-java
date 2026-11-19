@@ -8,6 +8,19 @@ import type { AgentTranscriptMessage, ChatMessageDto } from '@/api/types'
 import { MessageList } from '@/components/center/MessageList'
 import { useSubagentStore } from '@/stores/subagentStore'
 
+/** 子代理结局（与右栏列表 SaKind 同构 · 详情 badge 用真实结局，不二值化） */
+type AgentOutcome = 'running' | 'completed' | 'failed' | 'stopped' | 'incomplete' | 'unknown'
+
+/** 结局文案/badge 样式（incomplete/unknown 走灰色 pending，不能涂成「已完成」的绿色） */
+const OUTCOME_META: Record<AgentOutcome, { label: string; cls: string }> = {
+  running: { label: '运行中', cls: 'in_progress' },
+  completed: { label: '已完成', cls: 'completed' },
+  failed: { label: '失败', cls: 'stopped' },
+  stopped: { label: '已停止', cls: 'stopped' },
+  incomplete: { label: '未收尾', cls: 'pending' },
+  unknown: { label: '未知', cls: 'pending' },
+}
+
 /**
  * 右栏「agent 对话视图」（2026-10-21 用户裁定 F2）。
  *
@@ -27,7 +40,7 @@ import { useSubagentStore } from '@/stores/subagentStore'
  * <p>已停止的 agent 底部会出现输入框：发送即走内置 `/resume`（对齐 CC
  *「给已停止的 agent 发消息 = 自动 resume」，`SendMessage` → `resumeAgentBackground`）。
  */
-export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active, onBack, onExpand, expanded = false, showToast, clientRef }: {
+export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active, statusKind, onBack, onExpand, expanded = false, showToast, clientRef }: {
   sessionId: string | null
   agentId: string
   name: string
@@ -35,6 +48,14 @@ export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active
   subtitle?: string
   /** 进入视图时的运行态快照；实时态以 subagent store 为准（见下） */
   active?: boolean
+  /**
+   * 点击行的真实结局（右栏列表 SaKind）。
+   *
+   * <p>WHY：原 badge 把一切非运行态都渲染成「已完成」——「未收尾/未知/失败」的子代理点进去
+   * 也显示已完成，与列表行状态互相矛盾（用户 2026-11-19：「点进去已经完成，上面还是未知/未完成」）。
+   * store 里有实时身份时仍以 store 为准；本字段只用于无身份的历史行。
+   */
+  statusKind?: AgentOutcome
   onBack: () => void
   /** ⤢ 扩大：右栏向左覆盖中间区（不是弹窗） */
   onExpand?: () => void
@@ -65,7 +86,20 @@ export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active
   const running = identity
     ? identity.status === 'running'
     : hadIdentityRef.current ? false : !!active
-  const stopped = !running && (identity ? identity.status === 'stopped' : (subtitle ?? '').includes('已停止'))
+  /**
+   * 真实结局（badge 展示）。
+   *
+   * <p>优先级：store 实时状态 > 点击行快照 statusKind > subtitle 兜底（「已停止」）> 已完成。
+   * subtitle 兜底只为兼容不传 statusKind 的入口（TeamPanel 成员视图）。
+   */
+  const outcome: AgentOutcome = running
+    ? 'running'
+    : identity
+      ? identity.status === 'failed' ? 'failed'
+        : identity.status === 'stopped' ? 'stopped'
+        : 'completed'
+      : (statusKind && statusKind !== 'running' ? statusKind
+        : (subtitle ?? '').includes('已停止') ? 'stopped' : 'completed')
 
   // 首次拉取完整执行记录（transcript 接口 · 三键查找含历史 a+16hex / taskId）。
   // 运行中的 agent 可能还没落第一条 transcript（404）→ 1.2s 后重试；上限 20 次（≈24s）
@@ -205,8 +239,8 @@ export function AgentTranscriptView({ sessionId, agentId, name, subtitle, active
           <div className="atv-name">{name}</div>
           {subtitle && (
             <div className="atv-meta">
-              <span className={`td-badge ${running ? 'in_progress' : stopped ? 'stopped' : 'completed'}`}>
-                {running ? '运行中' : stopped ? '已停止' : '已完成'}
+              <span className={`td-badge ${OUTCOME_META[outcome].cls}`}>
+                {OUTCOME_META[outcome].label}
               </span>
               <span className="td-id">{subtitle}</span>
             </div>
@@ -292,6 +326,8 @@ function toChatMessage(
     author: m.author ?? null,
     isMeta: m.isMeta === true,
     subtype: m.subtype ?? null,
+    // [agent-notice] SendMessage 协作通知行的 UI 摘要（transcript 惰性键，旧记录缺省）
+    summary: m.summary ?? null,
     content: m.content ?? null,
     reasoning: m.reasoning ?? null,
     toolCalls: (m.toolCalls ?? []).map((t) => ({

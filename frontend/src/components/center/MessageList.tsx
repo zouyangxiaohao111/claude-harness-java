@@ -1,5 +1,5 @@
-import { Fragment, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
+import { Fragment, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
+import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { projectPreview } from '@/markdown/plainPreview'
 import type { AttachmentRequest, ChatMessageDto, ToolCallDto } from '@/api/types'
@@ -8,6 +8,7 @@ import type { TurnUsageDto } from '@/api/usageTurns'
 import type { SessionFile } from '@/types'
 import { subagentColor } from '@/api/types'
 import { compactNumber, formatFileSize } from '@/utils/format'
+import { AttachFileIcon } from './AttachFileIcon'
 import { deliverAttachmentFiles, type AcceptedAttachment } from '@/utils/attachmentDelivery'
 import { u8ToBase64 } from '@/utils/base64'
 import { uploadAttachment } from '@/api/chat'
@@ -16,8 +17,21 @@ import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
 // [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
-import { NexusMark } from './NexusMark'
 import { ArtifactCards } from '@/components/right/ArtifactCards'
+import { PlanApprovalCard } from './PermissionBubble'
+import type { PermissionRequestItem } from '@/stores/chatStore'
+
+/**
+ * [plan-approval inline] 待审批的 ExitPlanMode 请求 → 按 toolUseId 锚定到对应工具卡之后。
+ * 由 App 在 MessageList 外层提供；ToolCard 读到本会话的待审批请求时插入审批卡。
+ */
+interface PlanApprovalSlotValue {
+  request: PermissionRequestItem
+  // 参数形状由 App 的实现决定，这里只做透传（组件内部以 as never 交给 PlanApprovalCard）
+  onDecision: (...args: any[]) => void
+  onPlanClearContext?: (plan: string) => void
+}
+export const PlanApprovalSlot = createContext<PlanApprovalSlotValue | null>(null)
 
 /** 稳定空文件列表（changedFiles 零态 selector 兜底 · 避免每次新数组引用触发无限重渲染） */
 const NO_CHANGED_FILES: SessionFile[] = []
@@ -96,21 +110,6 @@ const USER_REF_NAME: React.CSSProperties = {
 }
 
 /** 附件胶囊类型图标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
-function attachIcon(a: NonNullable<ChatMessageDto['userAttachments']>[number]) {
-  const lower = a.filename.toLowerCase()
-  if (a.type === 'pdf' || lower.endsWith('.pdf')) return <span className="uaf-badge pdf">PDF</span>
-  if (lower.endsWith('.docx') || lower.endsWith('.doc')) return <span className="uaf-badge word">W</span>
-  if (lower.endsWith('.xlsx') || lower.endsWith('.xls')) return <span className="uaf-badge excel">X</span>
-  if (a.type === 'video') return (
-    <span className="uaf-badge icon video"><svg viewBox="0 0 24 24" fill="currentColor"><path d="M8 5v14l11-7z" /></svg></span>
-  )
-  if (a.type === 'audio') return (
-    <span className="uaf-badge icon audio"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"><path d="M9 18V5l12-2v13" /><circle cx="6" cy="18" r="3" /><circle cx="18" cy="16" r="3" /></svg></span>
-  )
-  return (
-    <span className="uaf-badge icon file"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" /><path d="M14 2v6h6" /></svg></span>
-  )
-}
 
 /** 消息时间：优先后端人读相对时间（GET /messages time：刚刚/N分钟前/N小时前/N天前/≥30天 yyyy-MM-dd）；
  *  无则回落 createdAt HH:MM（live 消息兜底）；都缺省 → '' */
@@ -129,6 +128,87 @@ function formatMsgTimeAbsolute(msg: ChatMessageDto): string {
   }
   return ''
 }
+
+/**
+ * [流式性能 2026-11-18 · 对齐 dsh `useThrottledVisualUpdate`]
+ * 把非必要视觉对齐合并为「每 N 帧最多一次」。
+ *
+ * <p><b>WHY</b>：思考块滚底要在每次 reasoningText 变化时读 `scrollHeight`
+ * （强制同步布局，成本随全文长度增长）。每帧都读等于把布局抖动打进流式帧；
+ * 降为 3 帧一次在视觉上无感（dsh 同款默认值）。
+ */
+function useThrottledVisualUpdate(update: () => void, intervalFrames = 3): () => void {
+  const updateRef = useRef(update)
+  updateRef.current = update
+  const pendingRef = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (pendingRef.current !== null) cancelAnimationFrame(pendingRef.current)
+    pendingRef.current = null
+  }, [])
+  return useCallback(() => {
+    if (pendingRef.current !== null) return
+    let remaining = intervalFrames
+    const advance = () => {
+      remaining -= 1
+      if (remaining > 0) {
+        pendingRef.current = requestAnimationFrame(advance)
+        return
+      }
+      pendingRef.current = null
+      updateRef.current()
+    }
+    pendingRef.current = requestAnimationFrame(advance)
+  }, [intervalFrames])
+}
+
+/**
+ * [流式性能 2026-11-18 · C1] 纯文本「前缀冻结 + 尾段替换」（思考块专用）。
+ *
+ * <p><b>WHY</b>：`{text}` 直接放 DOM 时每帧替换**整段**文本节点，成本 O(全文)——
+ * 几千字思考到后期每帧都要重新布局整段（虽然 CSS 只露 64px，DOM 仍是全文）。
+ *
+ * <p><b>做法：多段冻结 + 单个尾节点</b>。文本按「满 1KB 且遇换行」切成若干**已冻结段**
+ * （每段一个 `<span>`，key 稳定、内容永不变化），最后剩一段 ≤1KB 的尾文本节点每帧替换。
+ * ⛔ 不能用「单个前缀节点」——那样每次继续冻结都会重写整段前缀（成本仍 O(前缀)）；
+ * 多段才保证每帧只动 ≤1KB。
+ *
+ * <p>视觉/复制/选中一致：span 默认 inline、`thinking-body` 是 pre-wrap ⇒ 排版与整段文本相同。
+ * 非追加（文本被整体替换，极罕见）→ 段列表清空、整体重建（兜底）。
+ */
+// 阈值取 512 字（实测思考常见 0.8–4K 字，1KB 阈值会让相当一部分轮次永不冻结）。
+// 每段一个 span：5K 字思考 ≈ 10 个节点，可接受；每帧只替换 ≤512 字的尾节点。
+const FREEZE_STREAM_TEXT_MIN = 512
+const FrozenStreamText = memo(function FrozenStreamText({ text }: { text: string }) {
+  const stateRef = useRef({ segs: [] as string[], tail: '', frozenLen: 0, total: '' })
+  const view = useMemo(() => {
+    const st = stateRef.current
+    if (!text.startsWith(st.total)) {
+      // 非追加：整体重建（前缀假设失效时的唯一安全落点）
+      st.segs = []
+      st.frozenLen = 0
+    }
+    let rest = text.slice(st.frozenLen)
+    while (rest.length > FREEZE_STREAM_TEXT_MIN) {
+      // 在「阈值附近及之前」找行边界：段长 ≈1KB（⛔ 不是 `rest.length - 阈值`——
+      // 那会在文本刚过阈值时只切出几十字，每帧多一个碎片 span）。
+      const cut = rest.lastIndexOf('\n', FREEZE_STREAM_TEXT_MIN)
+      if (cut <= 0) break
+      const seg = rest.slice(0, cut + 1)
+      st.segs.push(seg)
+      st.frozenLen += seg.length
+      rest = rest.slice(seg.length)
+    }
+    st.tail = rest
+    st.total = text
+    return { segs: st.segs, tail: st.tail }
+  }, [text])
+  return (
+    <>
+      {view.segs.map((seg, index) => <span key={index}>{seg}</span>)}
+      {view.tail}
+    </>
+  )
+})
 
 /** 思考文本清理：过滤 null 重复串（流式累积残留）+ trim；空 → ''（不展示） */
 function cleanReasoning(s?: string | null): string {
@@ -457,6 +537,10 @@ const FINISH_REASON_COLOR: Record<string, string> = {
 }
 
 interface MessageListProps {
+  /** [plan-approval inline] 待审批的 ExitPlanMode 请求：按 toolUseId 锚定到对应工具卡之后 */
+  pendingPlanApproval?: PermissionRequestItem | null
+  onPlanDecision?: PlanApprovalSlotValue['onDecision']
+  onPlanClearContext?: (plan: string) => void
   /** 当前会话 id：父级订阅流式【稳定行序】（selectStreamIds → streamOrder）；流式块内容订阅下沉到每行
    *  StreamBlockRow（selectStreamBlock → streams[sid] 块对象），不再由 App 顶层订阅整条 streams 引用 */
   sessionId: string
@@ -468,6 +552,16 @@ interface MessageListProps {
   scrollSignal?: number
   /** turn 运行中且无流式块（thinking/重试等待期）→ 消息流末尾显示「nexus 思考中…」占位，消除发送后空白间隙 */
   thinking?: boolean
+  /**
+   * [流式渲染 2026-11-18] **本轮是否仍在跑**（宿主权威值）。
+   *
+   * <p>WHY 不能复用 `thinking`：`thinking = turnRunning && !hasStream`，有流式块时恒 false
+   * ⇒ 正文整个流式期被当成「已收口」（`streaming=false`，每帧跑 rescue + 全量管线），
+   * `streamingGuards` 从未在流式期生效。这里显式由 App 传真正的运行态。
+   *
+   * <p>缺省（知识库等其它宿主未传）→ 回落 `!turnEnded`（有块且未 idle ⇒ 仍在跑）。
+   */
+  turnRunning?: boolean
   /**
    * 知识库引用点击（正文里的 `[N]` chip）。
    *
@@ -580,6 +674,10 @@ function shortToolArgSummary(raw: string | null | undefined): string {
 export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string }) {
   // 工具卡片默认折叠（用户手动点击展开 IN/OUT）· 对齐 Harness ToolRow；组件本地展开态
   const [expanded, setExpanded] = useState(false)
+  // [plan-approval inline] 本卡就是待审批的 ExitPlanMode → 卡后插入内联审批卡
+  const planSlot = useContext(PlanApprovalSlot)
+  const pendingPlan = planSlot && planSlot.request.toolUseId && planSlot.request.toolUseId === tool.id
+    ? planSlot : null
   const rule = matchedRule
   const name = cleanToolName(tool.name) // FM-14 · 剥离 mcp__<server>__ 前缀等
   // F21 · isDestructive 工具名标红（后端 DTO 未出站该字段，无数据时静默）
@@ -662,6 +760,7 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
     } catch { /* fail loud：保留按钮可重试 */ }
   }
   return (
+    <>
     <div className={`tool-card${expanded ? ' open' : ''}`}>
       <button
         type="button"
@@ -737,6 +836,14 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
         </div>
       ))}
     </div>
+    {pendingPlan && (
+      <PlanApprovalCard
+        request={pendingPlan.request}
+        onDecision={pendingPlan.onDecision as never}
+        onPlanClearContext={pendingPlan.onPlanClearContext}
+      />
+    )}
+    </>
   )
 }
 
@@ -887,6 +994,26 @@ function renderToolCalls(
   flush()
   return out
 }
+
+/**
+ * [流式性能 2026-11-18 · 对齐 dsh 工具独立节点] 流式块的工具栏（**独立 memo 组件**）。
+ *
+ * <p><b>WHY</b>：`appendChunk` 只换块对象，`b.toolCalls` 数组沿用原引用
+ * （`chatStore.appendChunk`：`{...cur, content}`）⇒ 纯文本帧本组件 props 不变、直接 bail。
+ * 改造前工具栏内联在 `StreamBlockRow` 里，每帧 `renderToolCalls` 重建全部 `ToolCard`
+ * （ToolCard 无 memo，函数体含 JSON 解析/参数摘要）—— 工具越多，整条流越慢。
+ *
+ * <p>⚠️ props 必须全稳定：`toolCalls` 数组引用 / `sessionId` / `prose`。
+ */
+const StreamToolList = memo(function StreamToolList({
+  toolCalls, sessionId, prose = false,
+}: {
+  toolCalls: NonNullable<ChatMessageDto['toolCalls']>
+  sessionId: string
+  prose?: boolean
+}) {
+  return <>{renderToolCalls(toolCalls, { matchedRule: null, sessionId, live: true, prose })}</>
+})
 
 /** [P2-13] compact 摘要专用渲染 · 对齐 CC {@code components/CompactSummary.tsx:74-104}（auto-compact 默认分支）
  *  + {@code components/Message.tsx:140-142}（{@code case 'user': if (message.isCompactSummary) return <CompactSummary/>}）。
@@ -1291,6 +1418,18 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
   // [2026-11-02 用户实测「nexus 回复被切成多段」] 后台任务通知注入行（见 isNotificationInjectedUserRow）。
   //   渲染为一行可展开的弱化通知，⛔ 不是用户气泡、也不开新轮。
   const isNotificationInjected = isNotificationInjectedUserRow(msg)
+  // [agent-notice] SendMessage 协作通知行（后端在子代理实际消费时落的一条 isMeta user 消息）。
+  //   与上一条同视觉、不同语义：来源是 agent 名 / 「主代理」，摘要优先用 SendMessage.summary。
+  const isAgentNotice = isAgentNotificationRow(msg)
+  const agentNoticeLabel = (() => {
+    if (!isAgentNotice) return ''
+    const from = (msg.author ?? '').trim()
+    const who = from === '' || from === 'team-lead' ? '主代理' : from
+    const head = `收到${who}通知`
+    const detail = (msg.summary ?? '').trim()
+      || (msg.content ?? '').trim().replace(/\s+/g, ' ').slice(0, 80)
+    return [head, formatMsgTimeAbsolute(msg), detail].filter(Boolean).join(' · ')
+  })()
   /** 通知行标题：从 XML 的 <summary> 里取一句人话；取不到回落固定文案。 */
   const notificationSummary = (() => {
     if (!isNotificationInjected) return ''
@@ -1357,6 +1496,12 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
    * （后端 `Base64.decode` 与图像 block 都要求纯 base64）；`contentId` = 走 upload 腿的大图。
    */
   const [editAdded, setEditAdded] = useState<EditAttachmentChip[]>([])
+  /**
+   * 编辑态里**被移除的原消息附件**（图片/文件都要能删）。
+   * 键：`img:<userImages 索引>` / `file:<userAttachments 索引>` —— 用原数组索引，
+   * 删除只记标记、不重排数组 ⇒ 其余项的键保持不变。
+   */
+  const [editRemoved, setEditRemoved] = useState<Set<string>>(new Set())
   /** 正在上传的附件数（上传未回填 contentId 时禁止发送，避免发出「有 chip 收不到」） */
   const [editUploading, setEditUploading] = useState(0)
   /** 编辑态附件去重键（与 Composer.addedKeysRef 同源语义：一个 chip 一个键，移除时按键释放） */
@@ -1404,9 +1549,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     setEditDraft(msg.content ?? '')
     setEditError(null)
     setEditSlow(false)
-    // 每次进入编辑态都是全新草稿：新加的图片不跨次残留（去重键也一并清）
+    // 每次进入编辑态都是全新草稿：新加的图片不跨次残留（去重键也一并清）；原附件的删除标记也归零
     setEditAdded([])
     setEditUploading(0)
+    setEditRemoved(new Set())
     editAddedKeysRef.current.clear()
     setEditing(true)
   }
@@ -1513,9 +1659,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     //   用户看到编辑框里还显示着图，自然会以为图还在）。base64 直传通道：后端 resolveAttachments
     //   的 `base64 非空白` 分支直接消费，不依赖 upload 缓存（裁剪后原 contentId 可能已失效）。
     const attachments: AttachmentRequest[] = []
-    for (const img of userImages) {
+    userImages.forEach((img, i) => {
+      if (editRemoved.has(`img:${i}`)) return
       attachments.push({ type: 'image', base64: img.base64, mediaType: img.mediaType })
-    }
+    })
     // [2026-11-06] 编辑态**新加**的图片/附件（本次修复：此前编辑态无法补图）
     for (const a of editAdded) {
       let b64 = a.base64
@@ -1532,8 +1679,9 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
         ...(a.contentId ? { contentId: a.contentId } : {}),
       })
     }
-    for (const a of msg.userAttachments ?? []) {
-      if (a.type === 'image' || !a.filename) continue
+    ;(msg.userAttachments ?? []).forEach((a, i) => {
+      if (a.type === 'image' || !a.filename) return
+      if (editRemoved.has(`file:${i}`)) return
       attachments.push({
         type: a.type as AttachmentRequest['type'],
         filename: a.filename,
@@ -1541,7 +1689,7 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
         ...(a.contentId ? { contentId: a.contentId } : {}),
         ...(a.path ? { path: a.path } : {}),
       })
-    }
+    })
     // [慢裁剪提示] 裁剪若超过 1s（大会话 / 磁盘慢）才提示「正在裁剪并重新发送…」——
     //   正常路径（后端区间删除，毫秒级）不显示，避免每次都闪一下长文案。
     const slowTimer = window.setTimeout(() => setEditSlow(true), 1000)
@@ -1605,8 +1753,6 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     if (el && showReasoning) el.scrollTop = el.scrollHeight
   }, [showReasoning, intermediateReasoning])
   const toggleProcess = () => onToggleProcess?.(turnKey ?? '', processExpanded === true)
-  // 消息时间切换：默认相对时间（44分钟前）· 点击切绝对时间（HH:MM）· 再点切回
-  const [showAbsTime, setShowAbsTime] = useState(false)
   /** [2026-11-02] 通知行展开态（「收到子代理通知」点开看原始 XML）。 */
   const [noticeOpen, setNoticeOpen] = useState(false)
   // 图片附件放大预览（user-attach-img 点击 → lightbox）
@@ -1637,6 +1783,8 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
       .map((id) => imageCache[msg.sessionId]?.[id])
       .filter((v): v is { mediaType: string; base64: string } => !!v)
   }, [msg.imageData, msg.imagePasteIds, msg.sessionId, imageCache])
+  /** 文件附件（非图片、非知识库引用）· 与图片同一条 attachment 行（chat-demo 结构） */
+  const userFileAtts = (msg.userAttachments ?? []).filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename)
   // 对齐 Harness ChatView：展开思考/工具块是内容变化而非流尖推进，不触发滚动跟随。
   //   用户上滚查历史时点开思考下拉，滚动位置保持不动（治「点开思考回到底部」）。
   // snip_marker：snip 内部标记消息，前端不渲染（仅占位记录，避免气泡噪音）
@@ -1660,6 +1808,36 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
           {summaryToolName ? <ToolTypeIcon name={summaryToolName} /> : '⚒'}
         </span>
         <span className="tus-text" title={msg.content ?? ''}>{msg.content}</span>
+      </div>
+    )
+  }
+  // [agent-notice] SendMessage 协作通知行 → 与后台通知同视觉的通知条。
+  //   不是工具卡（不伪装成工具调用）、不是用户气泡（isMeta）、不开新轮（isUserTurnRow 已排除）。
+  //   摘要优先 SendMessage.summary，缺失时回落正文首行；点开看全文。
+  if (isAgentNotice) {
+    return (
+      <div className="msg task-notice agent-notice" data-msg-id={msg.id}>
+        <button
+          type="button"
+          className="tn-head"
+          onClick={() => setNoticeOpen((v) => !v)}
+          aria-expanded={noticeOpen}
+          title={noticeOpen ? '收起通知内容' : '展开通知内容'}
+        >
+          <span className="tn-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.4} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 2.5a3.5 3.5 0 0 1 3.5 3.5v3l1 1.5H3.5l1-1.5V6A3.5 3.5 0 0 1 8 2.5Z" />
+              <path d="M6.6 12.4a1.6 1.6 0 0 0 2.8 0" />
+            </svg>
+          </span>
+          <span className="tn-text">{agentNoticeLabel}</span>
+          <svg className={`tn-caret${noticeOpen ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
+            <path d="M5 6.5L8 9.5L11 6.5" />
+          </svg>
+        </button>
+        {noticeOpen && (
+          <pre className="tn-body">{msg.content ?? ''}</pre>
+        )}
       </div>
     )
   }
@@ -1794,9 +1972,48 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
           {isSnipped && (
             <div className="user-snipped"><span className="snipped-badge" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span></div>
           )}
-          {userImages.map((img, i) => (
-            <img key={i} src={`data:${img.mediaType};base64,${img.base64}`} alt="图片附件" className="user-attach-img" style={{ cursor: 'zoom-in' }} onClick={() => setZoomImg(`data:${img.mediaType};base64,${img.base64}`)} />
-          ))}
+          {/* 附件行（chat-demo `UserMessage.files`）：图片与文件同一个 wrap 容器、右对齐、gap 10；
+              有文件时图片缩到 64（--message-file-image-size 同款机制） */}
+          {(userImages.length > 0 || userFileAtts.length > 0) && (
+            <div className={`user-files${userFileAtts.length > 0 ? ' with-docs' : ''}`}>
+              {userImages.map((img, i) => (
+                <button
+                  key={`img-${i}`}
+                  type="button"
+                  className="user-file-image"
+                  title="点击放大"
+                  onClick={() => setZoomImg(`data:${img.mediaType};base64,${img.base64}`)}
+                >
+                  <img src={`data:${img.mediaType};base64,${img.base64}`} alt="图片附件" />
+                </button>
+              ))}
+              {userFileAtts.map((a, i) => {
+                const ext = /\.([^./\\]+)$/.exec(a.filename ?? '')?.[1]?.toUpperCase().slice(0, 8) ?? ''
+                const open = () => (onOpenKbDoc && a.contentId
+                  ? onOpenKbDoc(a.contentId, a.filename)
+                  : openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a }))
+                return (
+                  <div
+                    key={`file-${i}`}
+                    className="attach-file-card user-file-card"
+                    title={`点击预览：${a.filename}`}
+                    role="button"
+                    tabIndex={0}
+                    onClick={open}
+                    onKeyDown={(e) => {
+                      if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); open() }
+                    }}
+                  >
+                    <span className="attach-file-icon"><AttachFileIcon name={a.filename ?? ''} size={28} /></span>
+                    <span className="attach-file-body">
+                      <span className="attach-file-name">{a.filename}</span>
+                      {ext && <span className="attach-file-meta">{ext}</span>}
+                    </span>
+                  </div>
+                )
+              })}
+            </div>
+          )}
           {/* 文件附件（PDF/Word/视频/音频）内联在 user 气泡里（文字下方 · 点击预览）——
               图片附件走上方缩略图 imageData/imagePasteIds 通道 */}
           {editing ? (
@@ -1807,29 +2024,47 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
               {userImages.length > 0 && (
                 <div className="user-edit-attach">
                   {userImages.map((img, i) => {
+                    if (editRemoved.has(`img:${i}`)) return null
                     const src = `data:${img.mediaType};base64,${img.base64}`
                     return (
-                      <img
-                        key={i}
-                        src={src}
-                        alt="图片附件"
-                        className="user-edit-thumb"
-                        style={{ cursor: 'zoom-in' }}
-                        title="该图片会随重新发送一并带上 · 点击放大"
-                        onClick={() => setZoomImg(src)}
-                      />
+                      <span key={i} className="user-edit-added">
+                        <img
+                          src={src}
+                          alt="图片附件"
+                          className="user-edit-thumb"
+                          style={{ cursor: 'zoom-in' }}
+                          title="该图片会随重新发送一并带上 · 点击放大"
+                          onClick={() => setZoomImg(src)}
+                        />
+                        <button
+                          type="button"
+                          className="user-edit-added-x"
+                          title="移除这张图"
+                          onClick={() => setEditRemoved((prev) => new Set(prev).add(`img:${i}`))}
+                        >×</button>
+                      </span>
                     )
                   })}
                 </div>
               )}
-              {msg.userAttachments?.filter((a) => a.type !== 'image' && a.filename).length ? (
+              {msg.userAttachments?.some((a) => a.type !== 'image' && a.filename) ? (
                 <div className="user-edit-attach">
-                  {msg.userAttachments.filter((a) => a.type !== 'image' && a.filename).map((a, i) => (
-                    <span key={i} className="user-edit-file" title="该附件会随重新发送一并带上">
-                      {attachIcon(a)}
-                      <span className="uaf-name">{a.filename}</span>
-                    </span>
-                  ))}
+                  {(msg.userAttachments ?? []).map((a, i) => {
+                    if (a.type === 'image' || !a.filename) return null
+                    if (editRemoved.has(`file:${i}`)) return null
+                    return (
+                      <span key={i} className="user-edit-added user-edit-file" title="该附件会随重新发送一并带上">
+                        <span className="attach-file-icon"><AttachFileIcon name={a.filename ?? ''} size={20} /></span>
+                        <span className="uaf-name">{a.filename}</span>
+                        <button
+                          type="button"
+                          className="user-edit-added-x"
+                          title="移除该附件"
+                          onClick={() => setEditRemoved((prev) => new Set(prev).add(`file:${i}`))}
+                        >×</button>
+                      </span>
+                    )
+                  })}
                 </div>
               ) : null}
               <textarea
@@ -1954,21 +2189,6 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                     <ContentGuard text={shown} className="user-text md markdown-prose" onRunHtml={onRunHtml} />
                   )
                 })()}
-                {msg.userAttachments?.filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename).map((a, i) => (
-                  <button
-                    key={i}
-                    className="user-attach-file"
-                    title={`点击预览：${a.filename}`}
-                    // 知识库 @ 的文件就是走这条（type='file' + contentId=文档 id），不是上面的 type==='kb'。
-                    // 宿主传了 onOpenKbDoc ⇒ 在页面右侧抽屉打开；主会话不传 ⇒ 仍走独立预览窗口。
-                    onClick={() => (onOpenKbDoc && a.contentId
-                      ? onOpenKbDoc(a.contentId, a.filename)
-                      : openStandalone({ type: previewKindOfAttachment(a), title: a.filename ?? '预览', item: a }))}
-                  >
-                    {attachIcon(a)}
-                    <span className="uaf-name">{a.filename}</span>
-                  </button>
-                ))}
               </div>
               {/* [用户消息编辑重发] 气泡下方 meta 行：默认隐藏 · hover 淡入（时间 + 编辑 + 复制） */}
               <div className={`user-msg-meta${hovered ? ' show' : ''}`}>
@@ -2015,29 +2235,19 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
         <>
           <div className="body">
             {renderHeader ? (
-              <div className="author">
-                <span className="author-chip">
-                  <NexusMark />
-                  <span className="author-name">
-                    {showSubagent ? (
-                      <>
-                        <span
-                          className="subagent-dot"
-                          style={{ background: subagentId?.color ?? subagentColor(subagentName ?? msg.author) }}
-                        />
-                        @{subagentName ?? '子代理'}
-                      </>
-                    ) : 'nexus'}
+              (showSubagent || isSnipped || exitLabel) && <div className="author">
+                {showSubagent && (
+                  <span className="author-chip">
+                    <span className="author-name">
+                      <span
+                        className="subagent-dot"
+                        style={{ background: subagentId?.color ?? subagentColor(subagentName ?? msg.author) }}
+                      />
+                      @{subagentName ?? '子代理'}
+                    </span>
                   </span>
-                </span>
-                <span
-                  className="ts"
-                  title={showAbsTime ? '点击切换为相对时间' : '点击切换为绝对时间'}
-                  onClick={() => setShowAbsTime((v) => !v)}
-                  style={{ cursor: 'pointer' }}
-                >
-                  {showAbsTime ? (formatMsgTimeAbsolute(msg) || formatMsgTime(msg)) : formatMsgTime(msg)}
-                </span>
+                )}
+                {/* [2026-11-18 用户裁定] 消息头不再渲染时间（末尾已有），随品牌标一并移除。 */}
                 {/* [snip-persist] 已被 Snip 裁剪的消息右上角标注「已裁剪」 */}
                 {isSnipped && (
                   <span className="snipped-badge" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span>
@@ -2229,10 +2439,14 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   // [思考窗口] 固定高度（约 3 行）滚动窗口：展开且流式增量时自动滚到底 —— 只露最新内容，不整段铺开
   const reasoningText = cleanReasoning(b?.reasoning)
   const thinkingBodyRef = useRef<HTMLDivElement>(null)
-  useEffect(() => {
+  // [流式性能 2026-11-18] 滚底降为每 3 帧一次（原本每帧读 scrollHeight = 强制同步布局）。
+  const scheduleThinkingScroll = useThrottledVisualUpdate(() => {
     const el = thinkingBodyRef.current
     if (el && !collapsed) el.scrollTop = el.scrollHeight
-  }, [collapsed, reasoningText])
+  })
+  useEffect(() => {
+    scheduleThinkingScroll()
+  }, [collapsed, reasoningText, scheduleThinkingScroll])
   if (!b) return null
   // [思考耗时] 完成态展示与 DB 消息路径同口径：秒数 = 块内起止墙钟差；token = 字符/4 估算
   const reasoningTokens = b.reasoning ? Math.ceil(b.reasoning.length / 4) : 0
@@ -2286,7 +2500,8 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
             )}
             <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
           </button>
-          {!collapsed && <div className="thinking-body" ref={thinkingBodyRef}>{reasoningText}</div>}
+          {/* [流式性能 C1] 前缀冻结 + 尾段替换（视觉/复制与整段文本一致） */}
+          {!collapsed && <div className="thinking-body" ref={thinkingBodyRef}><FrozenStreamText text={reasoningText} /></div>}
         </div>
       ),
     })
@@ -2302,8 +2517,10 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
     })
   }
   // [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」）
-  const toolNodes = renderToolCalls(b.toolCalls, { matchedRule: null, sessionId, live: true, prose })
-  if (toolNodes.length > 0) segNodes.push({ key: 'tools', node: toolNodes })
+  // [流式性能 2026-11-18] 抽成 memo 组件：纯文本帧 `toolCalls` 引用不变 ⇒ 不重建任何工具卡。
+  if (b.toolCalls.length > 0) {
+    segNodes.push({ key: 'tools', node: <StreamToolList toolCalls={b.toolCalls} sessionId={sessionId} prose={prose} /> })
+  }
   // [段到达顺序 2026-11-13] 上面按「思考→正文→工具」建段；但模型可能先跑工具再思考/出正文
   //   （RAG 的 query_understand 排在首个 chunk 之前），固定顺序会把晚到的思考/正文倒挂到工具上方。
   //   块上有 store 记的首次到达次序就按它重排；缺省（历史块）保持原顺序。
@@ -2324,14 +2541,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   return (
     <div className={`msg assistant${isStreamingTail ? ' streaming' : ''}${showHeader ? '' : ' turn-cont'}`}>
       <div className="body">
-        {showHeader && (
-          <div className="author">
-            <span className="author-chip">
-              <NexusMark />
-              <span className="author-name">nexus</span>
-            </span>
-          </div>
-        )}
+        {/* [2026-11-18 用户裁定] 移除「nexus 品牌标」消息头（蓝猫 + 名字），主会话/知识库会话均不渲染。 */}
         {/* [2026-11-02] 该轮还没有落库 assistant ⇒ 由本块承载「正在执行」状态行。
             [2026-11-12 用户裁定] 这一行**也要能点**（此前写死 static + 无箭头，用户原话
             「正在执行 。。。 < 应该有收起来和展开的可点击的 现在不可以」）：
@@ -2418,7 +2628,7 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, turnRunning: turnRunningProp, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false, pendingPlanApproval, onPlanDecision, onPlanClearContext }: MessageListProps) {
   // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
   citationChipEnabled = !!onCitationClick
   citationTitlesByMessage = citationTitleMapByMsg ?? {}
@@ -2442,9 +2652,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   // [流式性能] 稳定行序订阅：引用只在块增/删/finalize/clear 变化；content 追加不触碰 → 父级不被打字机逐帧重渲
   const streamIds = useChatStore(selectStreamIds(sessionId))
   // [2026-11-12 尾部 3 段] 流式块的「段数」只在内容**首现**时变化（思考首片 / 正文首片 / 首个工具）。
-  //   用 tick（appendChunk/appendReasoning 每次 +1）与工具数变化来触发重算；
+  // [2026-11-18 对齐 dsh 节点级订阅] 原用 streamTicks（每次 append +1）⇒ **纯文本增长帧也重渲整表**；
+  //   改用 streamShape（段数之和，只在段首现/块增删变化）⇒ 文本增长帧整表 0 次重渲，
+  //   只有目标 StreamBlockRow 自己重渲（滚动仍用 streamTicks 的 store.subscribe，不触发渲染）。
   //   ⛔ 不直接订阅整个 streams —— 内容逐帧推进会把整张消息表重渲。
-  const streamTick = useChatStore((s) => (sessionId ? (s.streamTicks[sessionId] ?? 0) : 0))
+  const streamShape = useChatStore((s) => (sessionId ? (s.streamShape[sessionId] ?? 0) : 0))
   const streamToolCount = useChatStore((s) => (sessionId
     ? (s.streams[sessionId] ?? []).reduce((n, b) => n + (b.toolCalls?.length ?? 0), 0)
     : 0))
@@ -3711,7 +3923,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (total > COLLAPSED_TAIL_SEGMENTS) hidden.set(turnKey, total - COLLAPSED_TAIL_SEGMENTS)
     }
     return { tailKeepByRowKey: keep, hiddenSegCountByTurn: hidden }
-  }, [visibleRows, activeTurnKeys, streamIds, systemRowsByTurn, processHeaderIdByTurn, intermediateSegCount, streamTick, streamToolCount])
+  }, [visibleRows, activeTurnKeys, streamIds, systemRowsByTurn, processHeaderIdByTurn, intermediateSegCount, streamShape, streamToolCount])
   /** [并行工具组] 同轮 `tool_use_summary` → 该轮**首个**多工具消息的工具组父行标题。
    *  同时记下被「消费」的那条摘要行 id：该轮展开时不再单独渲染它（摘要不显示两遍）；
    *  轮次收起时摘要行照常显示（组在折叠区里不可见，摘要是唯一线索）。 */
@@ -3843,7 +4055,11 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     const s = turnStartByKey.get(latestTurnKey)
     return s == null ? null : formatTurnDuration(Math.max(0, nowTick - s))
   })()
+  const planSlotValue = pendingPlanApproval && onPlanDecision
+    ? { request: pendingPlanApproval, onDecision: onPlanDecision, onPlanClearContext }
+    : null
   return (
+    <PlanApprovalSlot.Provider value={planSlotValue}>
     <>
     <div className="stream-inner" ref={streamWrapRef}>
       {/* [OBS2] 消息区整层边界：兜住「按 flow 组装本区域的 JSX 本身出错」这类容器级异常
@@ -3909,57 +4125,38 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         /* 用户消息：顶部恒定留白（28px）供删除按钮 absolute 右上——按钮不占文档流，
            不因 hover 改变布局（不抖动），且气泡在留白下方不被覆盖 */
         .msg.user { padding-top: 28px; }
-        /* 用户消息图片附件缩略图（乐观追加 imageData · base64 直传图） */
-        .user-attach-img {
-          max-width: 220px;
-          max-height: 220px;
-          border-radius: 8px;
-          object-fit: cover;
+        /* 用户消息附件行（chat-demo UserMessage.files）：图片与文件同一个 wrap 容器 · 右对齐 ·
+           底对齐 · gap 10；消息里有文件时图片缩到 64（同 message-file-image-size 机制） */
+        .user-files {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: flex-end;
+          justify-content: flex-end;
+          gap: 10px;
+          max-width: 100%;
+          margin-bottom: 8px;
+          --user-file-image-size: 120px;
+        }
+        .user-files.with-docs { --user-file-image-size: 64px; }
+        .user-file-image {
+          flex: none;
+          width: var(--user-file-image-size);
+          height: var(--user-file-image-size);
+          padding: 0;
+          border: 1px solid var(--hairline);
+          border-radius: 16px;
+          background: var(--surface-2);
+          overflow: hidden;
+          cursor: zoom-in;
+        }
+        .user-file-image img {
           display: block;
-          margin-bottom: 6px;
+          width: 100%;
+          height: 100%;
+          object-fit: cover;
         }
-        /* 用户消息文件附件（PDF/Word/视频/音频）卡片：白底 + 阴影 + hover 阴影加深 · 点击预览 */
-        .user-attach-file {
-          display: inline-flex;
-          align-items: center;
-          gap: 8px;
-          max-width: 320px;
-          padding: 7px 12px;
-          background: #fff;
-          border: 1px solid rgba(0,0,0,.08);
-          border-radius: 10px;
-          font-size: 12.5px;
-          color: var(--ink);
-          cursor: pointer;
-          font-family: inherit;
-          line-height: 1.5;
-          text-align: left;
-          box-shadow: 0 1px 3px rgba(20,24,31,.08), 0 1px 2px rgba(20,24,31,.04);
-          transition: box-shadow .15s ease;
-        }
-        .user-attach-file:hover { box-shadow: 0 6px 16px rgba(20,24,31,.14), 0 2px 6px rgba(20,24,31,.08); }
-        .user-attach-file .uaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-        /* 类型徽标：PDF 红 / Word 蓝 / Excel 绿 文字徽标；视频/音频/文件 SVG 图标 */
-        .uaf-badge {
-          flex-shrink: 0;
-          display: inline-flex;
-          align-items: center;
-          justify-content: center;
-          min-width: 22px;
-          height: 17px;
-          padding: 0 4px;
-          border-radius: 4px;
-          font-size: 10px;
-          font-weight: 700;
-          color: #fff;
-        }
-        .uaf-badge.pdf { background: #FA5151; }
-        .uaf-badge.word { background: #2B579A; }
-        .uaf-badge.excel { background: #217346; }
-        .uaf-badge.icon { background: transparent; color: #666; min-width: 16px; padding: 0; }
-        .uaf-badge.icon svg { width: 15px; height: 15px; display: block; }
-        .uaf-badge.icon.video { color: #E4572E; }
-        .uaf-badge.icon.audio { color: #6B5BCE; }
+        .user-edit-file .uaf-name,
+        .uaf-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
         /* CRON 定时任务触发系统通知（scheduled_task_fire · 对齐 CC SystemTextMessage「❋ 任务执行中」） */
         .msg.system-notice { justify-content: flex-start; padding: 4px 0; }
         .system-notice {
@@ -4149,7 +4346,8 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         /* [同轮段间距] 同一轮内连续 assistant 段（后段带 .turn-cont）：24px → 6px。
            只收窄「后面紧跟同轮段」的那一条 ⇒ 轮次之间、用户↔助手之间仍是 24px。 */
         .stream-inner > .msg.assistant:has(+ .msg.assistant.turn-cont) { margin-bottom: 6px; }
-        /* [轮次中间过程折叠] 已结束轮次顶部的收起开关行（状态文案 + 时长 + 箭头） */
+        /* [轮次中间过程折叠] 已结束轮次顶部的收起开关行（状态文案 + 时长 + 箭头）
+           [2026-11-18 用户裁定] 字号与正文一致（16px，含时长里的数字） */
         .turn-process-toggle {
           display: inline-flex;
           align-items: center;
@@ -4159,7 +4357,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           border: 0;
           background: none;
           font-family: inherit;
-          font-size: 12.5px;
+          font-size: 16px;
           line-height: 1.5;
           color: var(--ink-faint);
           cursor: pointer;
@@ -4198,8 +4396,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         }
         .turn-process-status { font-weight: 500; }
         .turn-process-dur { font-variant-numeric: tabular-nums; }
-        /* [2026-11-12] 收起态「隐藏了 N 项」提示：比时长更弱，不抢视线。 */
-        .turn-process-more { color: var(--ink-faint); font-size: 11.5px; }
+        /* [2026-11-12] 收起态「隐藏了 N 项」提示：比时长更弱，不抢视线。
+           [2026-11-18 用户裁定] 字号随状态行统一 16px（含数字），只靠颜色弱化。 */
+        .turn-process-more { color: var(--ink-faint); }
         .turn-process-caret { width: 12px; height: 12px; transition: transform 0.2s ease; }
         .turn-process-caret.open { transform: rotate(180deg); }
         .turn-process-body { margin: 2px 0 8px; }
@@ -4677,7 +4876,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               sessionId={row.sid}
               blockId={row.blockId}
               isStreamingTail={row.blockId === lastStreamId}
-              turnRunning={!!thinking}
+              // [2026-11-18 修] 原为 `!!thinking`，而 `thinking = turnRunning && !hasStream`
+              //   ⇒ 有流式块时 hasStream=true ⇒ 恒 false ⇒ 正文整个流式期 `streaming=false`，
+              //   每帧跑的是**收口分支**（repair 763 行 + 全量管线），streamingGuards 从没生效过。
+              //   语义应为「该轮仍在跑」：优先用宿主权威值（App 传 turnRunning），
+              //   其它宿主未传时回落 `!turnEnded`（有块且未 idle ⇒ 仍在跑）。
+              turnRunning={turnRunningProp ?? !turnEnded}
               onRunHtml={openHtmlPreview}
               showHeader={firstAssistantRowKeys.has(row.key)}
               // [2026-11-02 修「发送后『正在执行』不显示，刷新才有」]
@@ -4735,14 +4939,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       {showPendingPlaceholder && (
         <div className="msg assistant streaming">
           <div className="body">
-            {!latestTurnHasAssistantRow && (
-              <div className="author">
-                <span className="author-chip">
-                  <NexusMark />
-                  <span className="author-name">nexus</span>
-                </span>
-              </div>
-            )}
+            {/* 品牌标已移除（2026-11-18 用户裁定） */}
             {/* 状态行：与 Message 里的 `.turn-process-toggle.running` 同款（同 class ⇒ 同观感） */}
             <button
               type="button"
@@ -4769,6 +4966,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       </ErrorBoundary>
     </div>
     </>
+    </PlanApprovalSlot.Provider>
   )
 }
 

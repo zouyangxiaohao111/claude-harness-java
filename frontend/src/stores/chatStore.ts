@@ -253,6 +253,13 @@ export interface ChatState {
    *  供滚底订阅按会话隔离——只在本会话内容推进时才滚，避免「A 会话仍在打字、切到 B 查看时每帧把 B 的
    *  容器拉到底部」（对齐 deepseek：每个 Session 自带 notifier/follow，互不劫持）。 */
   streamTicks: Record<string, number>
+  /** [流式渲染 2026-11-18] 会话「段形签名」：所有流式块的**段数之和**（思考 1 / 正文 1 / 工具 1）。
+   *  只在「段首次出现」或块增删时变化，**纯文本增长不推进**。
+   *
+   *  <p>WHY：`streamTicks` 每帧 +1 ⇒ MessageList 整表每帧重渲（`visibleRows.map` + 每行
+   *  `cleanReasoning` 全文正则）。对齐 dsh 的节点级订阅后，文本增长帧只让目标
+   *  `StreamBlockRow` 重渲，整表 0 次。 */
+  streamShape: Record<string, number>
   /** [snip-persist] 会话级被裁剪消息 id 集合（Snip 后前端标注「已裁剪」· 实时 STOMP + F5 boundary 解析合并） */
   snippedIds: Record<string, string[]>
   /** [排队行序 2026-10-23] 流式区到达序号（sessionId -> 已分配的最大号；0/缺省 = 本次页面内尚无实时行）。
@@ -448,6 +455,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   streams: {},
   streamOrder: {},         // [流式性能] 会话流式块稳定顺序（块增删才换引用 · content 追加不触碰）
   streamTicks: {},          // [chat-switch-stream-align] 会话流式活动节拍（appendChunk/Reasoning 递增 · 滚底按会话隔离）
+  streamShape: {},          // [流式渲染] 段形签名（只在段首现/块增删变化 ⇒ 整表不因纯文本增长重渲）
   snippedIds: {},          // [snip-persist] 会话级被裁剪消息 id（Snip 后「已裁剪」角标）
   liveSeq: {},             // [排队行序] 流式区到达序号（实时块 + 本轮中途追加的行共用）
   foldedTurnCounts: {},    // [折叠 = 真删] 会话 -> 已移出内存的轮数（渲染层「已折叠 N 轮」）
@@ -616,6 +624,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     const msgTotals = { ...st.msgTotals }
     const snippedIds = { ...st.snippedIds }
     const streamTicks = { ...st.streamTicks }
+    const streamShape = { ...st.streamShape }
     // [按会话键控] 压缩进度 / 压缩警告也是会话级键：删会话一并释放（否则该键永不再被读，纯残留）
     const compact = { ...st.compact }
     const tokenWarning = { ...st.tokenWarning }
@@ -638,13 +647,14 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     delete msgTotals[sessionId]
     delete snippedIds[sessionId]
     delete streamTicks[sessionId]
+    delete streamShape[sessionId]
     delete compact[sessionId]
     delete tokenWarning[sessionId]
     delete serverRunning[sessionId]
     delete retryMap[sessionId]
     delete liveSeq[sessionId]
     delete goal[sessionId]
-    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, compact, tokenWarning, serverRunning, retry: retryMap, liveSeq, goal }
+    return { messages, streams, streamOrder, conversationIds, apiErrors, changedFiles, imageCache, hasMore, msgTotals, snippedIds, streamTicks, streamShape, compact, tokenWarning, serverRunning, retry: retryMap, liveSeq, goal }
   }),
   setConnection: (connection) => set({ connection }),
   setAgentStatus: (agentStatus) => set({ agentStatus }),
@@ -705,6 +715,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (idx < 0) return st
     const next = [...blocks]
     const cur = next[idx]
+    const firstContent = cur.content === ''
     next[idx] = {
       ...cur, content: cur.content + delta,
       // [段到达顺序] 正文首次到达才记一次（逐帧 append 不重复建数组）
@@ -715,6 +726,10 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     return {
       streams: { ...st.streams, [sessionId]: next },
       streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
+      // 段形签名只在「正文段首次出现」推进（纯文本增长不推进 ⇒ 整表不重渲）
+      ...(firstContent
+        ? { streamShape: { ...st.streamShape, [sessionId]: (st.streamShape[sessionId] ?? 0) + 1 } }
+        : {}),
     }
   }),
   appendReasoning: (sessionId, assistantMessageId, reasoning) => set((st) => {
@@ -726,6 +741,7 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     // [思考耗时] 首片记起点、每片刷「最近一次思考活动」；终点由正文/工具到达时补齐（见 appendChunk/addToolCall）
     const now = Date.now()
     const cur = next[idx]
+    const firstReasoning = cur.reasoning === ''
     next[idx] = {
       ...cur, reasoning: cur.reasoning + reasoning,
       segOrder: cur.segOrder?.includes('reasoning') ? cur.segOrder : [...(cur.segOrder ?? []), 'reasoning'],
@@ -734,6 +750,9 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     return {
       streams: { ...st.streams, [sessionId]: next },
       streamTicks: { ...st.streamTicks, [sessionId]: (st.streamTicks[sessionId] ?? 0) + 1 },
+      ...(firstReasoning
+        ? { streamShape: { ...st.streamShape, [sessionId]: (st.streamShape[sessionId] ?? 0) + 1 } }
+        : {}),
     }
   }),
   addToolCall: (sessionId, assistantMessageId, tool) => set((st) => {
@@ -745,13 +764,20 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     if (idx < 0) return st
     const next = [...blocks]
     const cur = next[idx]
+    const firstTool = cur.toolCalls.length === 0
     next[idx] = {
       ...cur, toolCalls: [...cur.toolCalls, tool],
       segOrder: cur.segOrder?.includes('tools') ? cur.segOrder : [...(cur.segOrder ?? []), 'tools'],
       // [思考耗时] 工具调用到达 = 思考阶段结束（同上：仅补一次，不覆盖已有值）
       reasoningEndedAt: cur.reasoning !== '' && cur.reasoningEndedAt == null ? Date.now() : cur.reasoningEndedAt,
     }
-    return { streams: { ...st.streams, [sessionId]: next } }
+    return {
+      streams: { ...st.streams, [sessionId]: next },
+      // 工具段首次出现才推进段形签名（后续工具增加不改变段数 ⇒ 不触发整表）
+      ...(firstTool
+        ? { streamShape: { ...st.streamShape, [sessionId]: (st.streamShape[sessionId] ?? 0) + 1 } }
+        : {}),
+    }
   }),
   fillToolResult: (sessionId, toolCallId, result, isError) => set((st) => {
     // [2026-10-22 问答收敛] 工具结果到达 ⇒ 清除「已回答」标记（无论块是否还在：块已收口时也要清）
@@ -863,11 +889,13 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
     }
     const { [sessionId]: _drop, ...rest } = st.streams
     const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
+    const { [sessionId]: _dropShape, ...restShape } = st.streamShape
     // [折叠 = 真删] 块转消息也是追加路径 → 同一收口
     const { kept, droppedTurns } = pruneToTurns(ordered, FOLD_DEFAULT_TURNS)
     return {
       streams: rest,
       streamOrder: restOrder,
+      streamShape: restShape,
       messages: { ...st.messages, [sessionId]: kept },
       foldedTurnCounts: droppedTurns > 0
         ? { ...st.foldedTurnCounts, [sessionId]: (st.foldedTurnCounts[sessionId] ?? 0) + droppedTurns }
@@ -878,7 +906,8 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   clearStream: (sessionId) => set((st) => {
     const { [sessionId]: _drop, ...rest } = st.streams
     const { [sessionId]: _dropOrder, ...restOrder } = st.streamOrder
-    return { streams: rest, streamOrder: restOrder }
+    const { [sessionId]: _dropShape, ...restShape } = st.streamShape
+    return { streams: rest, streamOrder: restOrder, streamShape: restShape }
   }),
   setConversationId: (sessionId, conversationId) => set((st) => ({
     conversationIds: { ...st.conversationIds, [sessionId]: conversationId },

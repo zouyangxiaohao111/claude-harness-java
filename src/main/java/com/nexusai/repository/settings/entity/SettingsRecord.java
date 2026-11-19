@@ -29,6 +29,13 @@ public class SettingsRecord {
     private Integer modelMaxConcurrency;
 
     /**
+     * [V302] 计划审批卡是否显示「批准并清空上下文执行」· 列 {@code show_clear_context_on_plan_accept}。
+     *
+     * <p>对齐 CC {@code showClearContextOnPlanAccept}：null/0 = 关闭（审批卡只显示保留上下文）。
+     */
+    private Boolean showClearContextOnPlanAccept;
+
+    /**
      * 入库流水线六池并发配置 · V293 列 {@code ingest_concurrency_config}（TEXT）。
      *
      * <p>存 JSON 文本：{@code {"parse":8,"postprocess":2,"enrichment":12,"wiki":8,
@@ -519,6 +526,11 @@ public class SettingsRecord {
 
     public Integer getModelMaxConcurrency() { return modelMaxConcurrency; }
     public void setModelMaxConcurrency(Integer modelMaxConcurrency) { this.modelMaxConcurrency = modelMaxConcurrency; }
+    // [V302] show_clear_context_on_plan_accept ↔ showClearContextOnPlanAccept（null = 未配置 → 关闭）
+    public Boolean getShowClearContextOnPlanAccept() { return showClearContextOnPlanAccept; }
+    public void setShowClearContextOnPlanAccept(Boolean showClearContextOnPlanAccept) {
+        this.showClearContextOnPlanAccept = showClearContextOnPlanAccept;
+    }
     // [V293] ingest_concurrency_config ↔ ingestConcurrencyConfig（JSON 文本；null/空 = 回落 yml）
     public String getIngestConcurrencyConfig() { return ingestConcurrencyConfig; }
     public void setIngestConcurrencyConfig(String ingestConcurrencyConfig) { this.ingestConcurrencyConfig = ingestConcurrencyConfig; }

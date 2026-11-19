@@ -133,6 +133,25 @@ class ResponsesSdkProviderWireTest {
         assertThat(json).doesNotContain("\"function\":{");
     }
 
+    /**
+     * [C-31 ⊕] effort → Responses {@code reasoning.effort}：与 Completions 同源映射。
+     * high/medium 原样、max→high、off/空/null/xhigh 不注入（xhigh 上游不认）。
+     */
+    @Test
+    void effortMapsToReasoningEffort() throws Exception {
+        assertThat(JSON.writeValueAsString(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", "high")))
+            .contains("\"effort\":\"high\"");
+        assertThat(JSON.writeValueAsString(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", "medium")))
+            .contains("\"effort\":\"medium\"");
+        // max → high（mapToOpenAiReasoningEffort 的既有映射，不另写一份）
+        assertThat(JSON.writeValueAsString(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", "max")))
+            .contains("\"effort\":\"high\"");
+
+        assertThat(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", "off")).isNull();
+        assertThat(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", "xhigh")).isNull();
+        assertThat(ResponsesSdkProvider.reasoningOf("gpt-6.1-sol", null)).isNull();
+    }
+
     /** 17 参兼容构造器造 tool 消息（toolCallId=call_1）。 */
     private static ChatMessageDto tool(String content, JsonNode image) {
         return new ChatMessageDto("id", "sess", Role.tool, "tool", content, null,

@@ -1157,6 +1157,27 @@ public class SkillRegistry {
     }
 
     /**
+     * 在调用方给定的命令列表上做三维匹配 · 对齐 CC {@code hasCommand}/{@code findCommand}
+     * （commands.ts:788-806：name / getCommandName / aliases）。
+     *
+     * <p><b>WHY 需要独立入口</b>：agent frontmatter 的 skills 预加载先取
+     * {@link #getModelInvocableCommands(String)}（= CC getSkillToolCommands），再在该子集上做
+     * 直接匹配 / 插件前缀 / 后缀三策略（CCB runAgent.ts:931-959），不能复用 {@link #findCommand}
+     * （后者搜全量 {@link #getAllCommands}，会命中 builtin 等非技能命令）。
+     *
+     * @param name     技能名（可带前导 '/'）
+     * @param commands 搜索基座（null/空 → null）
+     * @return 命中命令；未命中 null
+     */
+    public static Command findCommandByName(String name, List<Command> commands) {
+        if (name == null || name.isBlank() || commands == null || commands.isEmpty()) {
+            return null;
+        }
+        String normalized = name.startsWith("/") ? name.substring(1) : name;
+        return findCommandIn(normalized, commands);
+    }
+
+    /**
      * 三维匹配（CC commands.ts:688-698 findCommand）· name 精确 / userFacingName / aliases，
      * 首个命中者胜。抽取自 {@link #findCommand}，供纯本地与含 MCP 搜索基座共用。
      */

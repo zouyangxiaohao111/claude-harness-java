@@ -146,11 +146,8 @@ public class PlanProviderImpl implements PlanProvider {
             }
             return null;
         }
-        String slug = sessionId;
-        if (agentId == null) {
-            return Path.of(plansDirectory, slug + ".md").toString();
-        }
-        return Path.of(plansDirectory, slug + "-agent-" + agentId + ".md").toString();
+        // [对齐 CC plans.ts:119-129] 词对 slug（按会话缓存、冲突重试 10 次），不再是 sessionId
+        return com.nexusai.infra.util.PlanPaths.planFilePath(plansDirectory, sessionId, agentId);
     }
 
     @Override

@@ -1203,8 +1203,23 @@ public class OpenAiSdkProvider implements LlmProvider {
         if (outbound != null) {
             builder.proxy(outbound);
         }
+        // [codex-cache-affinity 2026-11-18] ChatGPT Codex 订阅通道按 `session_id` 请求头做
+        //   prompt cache 亲和：缺这条头时，同一会话的连续请求会被路由到不同后端分片，
+        //   `input_tokens_details.cached_tokens` 大多返回 0（实测该会话 26 次调用仅 6 次命中：
+        //   命中 ≈0.03 元/次、未命中 ≈0.55 元/次；直连同账号 8k 相同前缀连发 6 次全 0）。
+        //   补上后同前缀 4/6~5/6 命中（首次为预热）。仅 codex 端点注入，其它 provider 的 wire 不变；
+        //   放在 ProviderHeaderInjector 之前 ⇒ 用户在 extraHeaders 里配的同名头仍可覆盖。
+        if (sessionId != null && !sessionId.isBlank() && isCodexEndpoint(config.baseUrl())) {
+            builder.putHeader("session_id", sessionId);
+        }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();
+    }
+
+    /** 是否 ChatGPT Codex 订阅端点（{@code /backend-api/codex}）· 缓存亲和头只对该通道注入。 */
+    private static boolean isCodexEndpoint(String baseUrl) {
+        return baseUrl != null
+            && baseUrl.toLowerCase(Locale.ROOT).contains("/backend-api/codex");
     }
 
     /** [AM-CC-20260825] SDK model 名剥 provider 前缀（resolveSdkModelName，未命中回落）·

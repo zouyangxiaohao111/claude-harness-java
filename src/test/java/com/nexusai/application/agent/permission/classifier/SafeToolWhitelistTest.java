@@ -35,7 +35,7 @@ class SafeToolWhitelistTest {
             // Task management (metadata only)
             "TodoWrite",
             "TaskCreate", "TaskGet", "TaskUpdate",
-            "TaskList", "TaskStop", "TaskOutput",
+            "TaskList", "TaskStop",
             // Plan mode / UI
             "AskUserQuestion", "EnterPlanMode", "ExitPlanMode",
             // Swarm coordination

@@ -49,8 +49,8 @@ import static org.mockito.Mockito.when;
  *   <li><b>写侧</b>：会话级设定真落库（{@code sessions.coordinator_mode} V75）+
  *       transcript 出现 {@code mode} 行（值与判定同源）；</li>
  *   <li><b>读侧 / 对齐</b>：判定按 sessionId 读会话列（CC 翻进程 env 的 Web 多会话等价物）；</li>
- *   <li><b>三层优先级</b>：会话列 &gt; settings &gt; feature&amp;&amp;env，
- *       任一层为 null 才回落下一层；</li>
+ *   <li><b>优先级</b>：会话列 &gt; feature&amp;&amp;env；全局 settings 层已于 2026-11-19 移除
+ *       （会话列 null 时直接看 feature&amp;&amp;env，喂 settings 值也不生效）；</li>
  *   <li><b>门接点</b>：会话层必须真的走到生产门（工具池 / 权限链），否则「设了会话级却不生效」
  *       = 半激活。</li>
  * </ol>
@@ -68,7 +68,7 @@ import static org.mockito.Mockito.when;
  * <p><b>本类不含</b> PATCH 写库路径（{@code SessionService.update}）——那在
  * {@code SessionServiceTest#update_persistsCoordinatorMode*}。
  */
-@DisplayName("[V75] 会话级 coordinator 模式 · 写侧落库 / 读侧对齐 / 三层优先级 / 门接点")
+@DisplayName("[V75] 会话级 coordinator 模式 · 写侧落库 / 读侧对齐 / 会话+env 两层 / 门接点")
 class CoordinatorSessionModeTest {
 
     @TempDir
@@ -176,7 +176,7 @@ class CoordinatorSessionModeTest {
     }
 
     // ════════════════════════════════════════════════════════════════════
-    // 1. 三层优先级矩阵（唯一判定 · 会话列 → settings → feature&&env）
+    // 1. 优先级矩阵（唯一判定 · 会话列 → feature&&env；settings 层已移除）
     // ════════════════════════════════════════════════════════════════════
 
     @Test
@@ -196,17 +196,17 @@ class CoordinatorSessionModeTest {
     }
 
     @Test
-    @DisplayName("三层优先级: 会话列 NULL → 回落 settings（有值即用，false 也压过 env 真）")
-    void threeLayers_nullSessionFallsBackToSettings() {
+    @DisplayName("会话列 NULL → 不再回落 settings（全局层已移除，直接看 feature+env）")
+    void nullSession_ignoresSettingsLayer() {
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(
                 SESSION_A, withSession(resolver(true), SESSION_A, null), envFeatureOff()))
-            .as("会话列 NULL + settings=true → true（回落第二层）")
-            .isTrue();
+            .as("会话列 NULL + settings=true + feature/env 关 → false（全局值不再生效）")
+            .isFalse();
 
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(
                 SESSION_A, withSession(resolver(false), SESSION_A, null), envFeatureOn()))
-            .as("会话列 NULL + settings=false + feature/env 双真 → false（settings 显式关也是「有值」）")
-            .isFalse();
+            .as("会话列 NULL + settings=false + feature/env 双真 → true（settings 不再压过末层）")
+            .isTrue();
     }
 
     @Test
@@ -229,18 +229,18 @@ class CoordinatorSessionModeTest {
     }
 
     @Test
-    @DisplayName("三层优先级: 两层重载（无会话身份）与会话重载同源，会话层缺席时逐位一致")
+    @DisplayName("两层重载（无会话身份）: 会话层缺席 → 只回落 feature+env（settings 已移除）")
     void twoArgOverload_isSessionLayerAbsent() {
         // 无会话身份调用方（启动期装配 / Tool.prompt()）走的入口：等价 sessionOverride=null
         assertThat(PromptAlignSettingsResolver.coordinatorModeActive(resolver(true), envFeatureOff()))
-            .as("两层重载 = 会话层缺席，回落 settings")
-            .isTrue();
+            .as("两层重载 = 会话层缺席 + settings 层已移除 → feature/env 关 = false")
+            .isFalse();
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(
                 null, resolver(true), envFeatureOff()))
-            .as("sessionId=null → 会话层缺席，与两层重载同值（来源解析在调用方，优先级只有一份）")
-            .isTrue();
+            .as("sessionId=null → 与会话重载同值（来源解析在调用方，优先级只有一份）")
+            .isFalse();
         assertThat(PromptAlignSettingsResolver.coordinatorModeActive(resolver(null), null))
-            .as("三层全缺 → fail-closed false")
+            .as("无回落层 → fail-closed false")
             .isFalse();
     }
 
@@ -330,7 +330,7 @@ class CoordinatorSessionModeTest {
         assertThat(r.sessionCoordinatorMode(SESSION_A))
             .as("查询异常 → null（fail-soft，同 settings 单行读失败范式）").isNull();
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(SESSION_A, r, envFeatureOff()))
-            .as("读失败 → 回落 settings=true → 仍为 true（不因异常把门关掉）").isTrue();
+            .as("读失败 → 会话层 null → 不再回落 settings（已移除）→ feature/env 关 = false").isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════
@@ -344,10 +344,10 @@ class CoordinatorSessionModeTest {
         assertThat(PromptAlignSettingsResolver.coordinatorSessionModeLabel(
                 SESSION_A, withSession(resolver(false), SESSION_A, 1), envFeatureOff()))
             .as("会话列=1 → coordinator 标签").isEqualTo("coordinator");
-        // 会话列 NULL + settings=true → "coordinator"（回落层也参与，等价 CC saveMode(isCoordinatorMode())）
+        // 会话列 NULL + settings=true → "normal"（全局层已移除；标签只跟 session/feature+env）
         assertThat(PromptAlignSettingsResolver.coordinatorSessionModeLabel(
                 SESSION_A, withSession(resolver(true), SESSION_A, null), envFeatureOff()))
-            .as("回落 settings=true → coordinator 标签").isEqualTo("coordinator");
+            .as("会话列 NULL + settings=true（已忽略）→ normal 标签").isEqualTo("normal");
         // 全关 → "normal"
         assertThat(PromptAlignSettingsResolver.coordinatorSessionModeLabel(
                 SESSION_A, withSession(resolver(null), SESSION_A, null), envFeatureOff()))

@@ -266,9 +266,15 @@ public class HookPermissionResolver {
                 hookPermissionResult == null ? "null" : hookPermissionResult.getClass().getSimpleName(),
                 forceDecision != null ? "hook ask" : "null");
         }
-        return new ResolvedPermission(
-            gateDecisionToPermission(canUseTool.canUse(tool, askInput, ctx, toolUseId, forceDecision), askInput),
-            askInput);
+        // [plan-approval] 用户/弹窗改写后的输入必须成为生效输入：CC onAllow 的 updatedInput
+        //   是 full replace，后续 tool.execute 看到的就是用户批准的那一版（例如审批卡里编辑过
+        //   的计划）。旧实现固定回传 askInput，改写被静默丢弃。
+        PermissionResult gateDecision = gateDecisionToPermission(
+            canUseTool.canUse(tool, askInput, ctx, toolUseId, forceDecision), askInput);
+        JsonNode effectiveInput = (gateDecision instanceof PermissionResult.Allow allow
+                && allow.updatedInput() != null)
+            ? allow.updatedInput() : askInput;
+        return new ResolvedPermission(gateDecision, effectiveInput);
     }
 
     /**

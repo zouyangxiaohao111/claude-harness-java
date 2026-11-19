@@ -162,16 +162,16 @@ class LlmAgentLoopPromptOptionsGateTest {
     }
 
     @Test
-    @DisplayName("门控回落: DB 有值覆盖回落链 —— coordinator=false 压过 isCoordinatorMode()=true，agent/proactive=true 生效")
-    void buildOptions_resolverGates_overrideFallback() throws Exception {
-        // WHY: DB settings 列（V56）非 null 时覆盖原判定链（PromptAlignSettingsResolver 实时读源）。
-        //   变异点：DB 值被忽略（恒回落）→ coordinator 误判 true → 红。
-        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> true, () -> "1")); // 回落链本应 true
+    @DisplayName("门控回落: DB coordinator=false 已被忽略 → 回落 isCoordinatorMode()=true；agent/proactive 仍生效")
+    void buildOptions_coordinatorDbIgnored_otherGatesOverride() throws Exception {
+        // [2026-11-19] 全局 coordinator DB 层已移除；同一次读取里 agent/proactive 两层不受影响。
+        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> true, () -> "1")); // 回落链 true
         PromptAlignSettingsResolver r = resolverWith(true, true, false, null);
 
         EffectivePromptOptions opts = invokeBuildOptions(ctxWithResolver(r));
 
-        assertThat(opts.coordinatorModeEnabled()).as("DB coordinator=false 覆盖 isCoordinatorMode()=true").isFalse();
+        assertThat(opts.coordinatorModeEnabled())
+            .as("DB coordinator=false 不再覆盖 → 回落 isCoordinatorMode()=true").isTrue();
         assertThat(opts.agentMainThreadEnabled()).as("DB agentMainThread=true 生效").isTrue();
         assertThat(opts.proactiveEnabled()).as("DB proactive=true 生效").isTrue();
     }
@@ -240,16 +240,11 @@ class LlmAgentLoopPromptOptionsGateTest {
     }
 
     @Test
-    @DisplayName("合并: DB coordinator=1 + isCoordinatorMode()=false → workerToolsContext 仍并入（DB 门为权威，内层复检不击穿）")
-    void mergeCoordinator_dbGateTrue_featureEnvOff_workerToolsStillMerged() throws Exception {
-        // WHY: 批次 F 起 coordinator 分支门 = resolver.coordinatorModeEnabled()（DB settings 列，
-        //   DB 有值覆盖 feature/env 链，实施计划.md:71）。prompt 分支经 buildEffectivePromptOptions
-        //   已吃 DB 覆盖值；若 userContext 并入仍被内层 isCoordinatorMode()（feature+env 双真）
-        //   复检击穿 → DB coordinator=1 + feature/env OFF → coordinator 提示注入但
-        //   workerToolsContext 未合并（半激活，SP-02 返工）。变异点：三参重载误用
-        //   isCoordinatorMode()（而非 caller 已解析 coordinatorActive）→ workerToolsContext 缺失 → 红。
-        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> "1")); // feature OFF → isCoordinatorMode()=false
-        AgentLoopContext ctx = ctxWithResolver(resolverWith(null, null, true, false)); // DB coordinator=1
+    @DisplayName("合并: DB coordinator=1 已被忽略 + feature/env 关 → 返回原引用（不做 worker 包裹）")
+    void mergeCoordinator_dbGateIgnored_featureEnvOff_returnsOriginal() throws Exception {
+        // [2026-11-19] 全局 coordinator DB 层已移除：门只看 feature/env（此处双假）⇒ 不合并。
+        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> "1")); // isCoordinatorMode()=false
+        AgentLoopContext ctx = ctxWithResolver(resolverWith(null, null, true, false)); // DB=1（应被忽略）
         Map<String, String> base = new LinkedHashMap<>();
         base.put("claudeMd", "md-content");
         SystemPromptParts parts = new SystemPromptParts(List.of(), base, Map.of());
@@ -257,10 +252,8 @@ class LlmAgentLoopPromptOptionsGateTest {
         Map<String, String> merged = invokeMergeCoordinatorUserContext(
             ctx, tucWithMcp(Map.of("github", new McpClientRuntime("github", "t1", "i1"))), parts);
 
-        assertThat(merged).as("DB 门真 → 合并（非原引用）").isNotSameAs(parts.userContext());
-        assertThat(merged).as("workerToolsContext 已并入").containsKey("workerToolsContext");
-        assertThat(merged.get("workerToolsContext"))
-            .as("workerToolsContext 内容含已连接 MCP server 名（coordinatorMode.ts:99-102）")
-            .contains("github");
+        assertThat(merged)
+            .as("协调者未激活 → 必须返回原引用（DB=1 不再能凭空激活）")
+            .isSameAs(parts.userContext());
     }
 }

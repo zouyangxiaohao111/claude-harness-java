@@ -84,6 +84,10 @@ public class MessagePermissionResponseEvent {
     // [FIX-E askuser-answers] 每问注解（preview/notes）· CC original: annotations
     //   (AskUserQuestionTool.tsx:57，AskUserQuestionPermissionRequest.tsx:398-407)
     private final JsonNode annotations;
+    // [plan-approval] 用户改写后的工具输入（如审批卡里编辑过的计划）·
+    //   CC onAllow 第 1 参 updatedInput（interactiveHandler.ts:154-167，full replace）。
+    //   旧前端不传 → null（保持原 input）。
+    private final JsonNode updatedInput;
 
     /**
      * 兼容旧调用:仅 requestId + decision(后端按 null 处理新字段)。
@@ -140,7 +144,8 @@ public class MessagePermissionResponseEvent {
             @JsonProperty("contentBlocks") List<JsonNode> contentBlocks,
             @JsonProperty("updatedPermissions") List<JsonNode> updatedPermissions,
             @JsonProperty("answers") JsonNode answers,
-            @JsonProperty("annotations") JsonNode annotations) {
+            @JsonProperty("annotations") JsonNode annotations,
+            @JsonProperty("updatedInput") JsonNode updatedInput) {
         this.requestId = requestId;
         this.decision = decision;
         this.acceptFeedback = acceptFeedback;
@@ -148,6 +153,16 @@ public class MessagePermissionResponseEvent {
         this.updatedPermissions = updatedPermissions;
         this.answers = answers;
         this.annotations = annotations;
+        this.updatedInput = updatedInput;
+    }
+
+    /** 7 参兼容构造器 · 无 updatedInput（旧测试/旧调用语义）。 */
+    public MessagePermissionResponseEvent(String requestId, String decision,
+                                          String acceptFeedback, List<JsonNode> contentBlocks,
+                                          List<JsonNode> updatedPermissions,
+                                          JsonNode answers, JsonNode annotations) {
+        this(requestId, decision, acceptFeedback, contentBlocks, updatedPermissions,
+            answers, annotations, null);
     }
 
     public String getRequestId() { return requestId; }
@@ -164,6 +179,11 @@ public class MessagePermissionResponseEvent {
      * Java 端由 PermissionController 透传 → WebSocketPermissionPrompter 合并进 Allow.updatedInput。
      */
     public JsonNode getAnswers() { return answers; }
+    /**
+     * [plan-approval] 用户改写后的工具输入（如审批卡编辑过的 {@code {plan, planFilePath}}）。
+     * 对齐 CC {@code onAllow(updatedInput, ...)} 的 full-replace 语义；null = 用原 input。
+     */
+    public JsonNode getUpdatedInput() { return updatedInput; }
     /**
      * [FIX-E askuser-answers] 每问注解（preview/notes；可为 null）。
      *

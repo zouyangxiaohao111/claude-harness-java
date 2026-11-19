@@ -59,6 +59,14 @@ class PlanAttachmentInjectionTest {
             null, null, null, get, set, m -> {}, s -> {});
     }
 
+    /**
+     * 计划文件路径 = provider 真实派生（词对 slug）· 对齐 CC plans.ts。
+     * ⛔ 不要再硬编码 `{sessionId}.md`：slug 已改为随机词对。
+     */
+    private static Path planPath(Path tmp, String sessionId) {
+        return Path.of(new PlanProviderImpl(sessionId, tmp.toString()).getPlanFilePath(null));
+    }
+
     /** 构造并注册主会话 AgentState + registry（populatePlanAttachment 的 typed 写入面）。 */
     private static AgentState registerState(SessionAgentStateRegistry registry, String sessionId) {
         AgentState state = new AgentState("test");
@@ -71,7 +79,7 @@ class PlanAttachmentInjectionTest {
     void populatePlanAttachmentInjectsWhenFileExists(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         String content = "disk plan full text";
-        Files.writeString(tmp.resolve(sessionId + ".md"), content, StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId), content, StandardCharsets.UTF_8);
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
         AgentState state = registerState(registry, sessionId);
@@ -87,7 +95,7 @@ class PlanAttachmentInjectionTest {
         assertThat(attachments.get(0).type()).isEqualTo("plan_file_reference");
         assertThat(attachments.get(0).plan()).isNotNull();
         assertThat(attachments.get(0).plan().planContent()).contains(content);
-        assertThat(attachments.get(0).plan().planFilePath()).contains(sessionId + ".md");
+        assertThat(attachments.get(0).plan().planFilePath()).isEqualTo(planPath(tmp, sessionId).toString());
     }
 
     @Test
@@ -109,7 +117,7 @@ class PlanAttachmentInjectionTest {
     @DisplayName("populatePlanAttachment: registry 未注册该会话 → 跳过不抛错")
     void populatePlanAttachmentSkipsWhenSessionNotRegistered(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId), "plan", StandardCharsets.UTF_8);
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry(); // 空 registry
         CompactConversationContext ctx = new CompactConversationContext()
             .setSessionId(sessionId.toString())
@@ -124,7 +132,7 @@ class PlanAttachmentInjectionTest {
     @DisplayName("populatePlanModeAttachment: plan 模式 + 有文件 → 注入 plan_mode（planExists=true + 真实路径）")
     void populatePlanModeAttachmentInjectsWhenInPlanModeAndFileExists(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId), "plan", StandardCharsets.UTF_8);
 
         CompactConversationContext ctx = new CompactConversationContext()
             .setSessionId(sessionId.toString())
@@ -138,14 +146,15 @@ class PlanAttachmentInjectionTest {
         assertThat(attachments).hasSize(1);
         assertThat(attachments.get(0).subtype()).isEqualTo("plan_mode");
         assertThat(attachments.get(0).content()).contains("\"planExists\":true");
-        assertThat(attachments.get(0).content()).contains(sessionId + ".md");
+        // JSON 里路径的反斜杠是转义的 ⇒ 只比对文件名（词对 slug）
+        assertThat(attachments.get(0).content()).contains(planPath(tmp, sessionId).getFileName().toString());
     }
 
     @Test
     @DisplayName("populatePlanModeAttachment: 非 plan 模式 → 跳过不注入")
     void populatePlanModeAttachmentSkipsWhenNotInPlanMode(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId), "plan", StandardCharsets.UTF_8);
 
         CompactConversationContext ctx = new CompactConversationContext()
             .setSessionId(sessionId.toString())
@@ -161,7 +170,7 @@ class PlanAttachmentInjectionTest {
     @DisplayName("组合: plan_file_reference 走 typed state.attachments()，plan_mode 走 additionalPostCompactAttachments（双通道各归其位）")
     void injectsPlanReferenceTypedAndPlanModeChatMessage(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        Files.writeString(tmp.resolve(sessionId + ".md"), "plan", StandardCharsets.UTF_8);
+        Files.writeString(planPath(tmp, sessionId), "plan", StandardCharsets.UTF_8);
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
         AgentState state = registerState(registry, sessionId);

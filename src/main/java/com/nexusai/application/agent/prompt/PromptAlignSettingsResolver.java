@@ -313,9 +313,13 @@ public class PromptAlignSettingsResolver {
      *
      * <p><b>优先级（唯一一份，就在本方法体内）</b>：
      * ① 会话级 {@code sessions.coordinator_mode}（V75 会话列，tri-state）
-     * → ② 全局 {@code settings.coordinator_mode_enabled}（V56 单例列）
-     * → ③ {@code feature('COORDINATOR_MODE') && env(CLAUDE_CODE_COORDINATOR_MODE)}
+     * → ② {@code feature('COORDINATOR_MODE') && env(CLAUDE_CODE_COORDINATOR_MODE)}
      * （{@link CoordinatorMode#isCoordinatorMode()}）。<b>低层只有在本层为 null 时才被求值</b>。
+     *
+     * <p><b>[2026-11-19 用户裁定] 全局 {@code settings.coordinator_mode_enabled} 层已移除</b>：
+     * 协调者按<b>会话</b>激活（输入框「协调者」chip 写会话列），设置页也不再提供全局开关。
+     * 历史 DB 值（若有）不再参与判定——否则「全局一开、所有会话都显示为开」会与按会话的
+     * 产品语义直接冲突。{@code dbResolver} 形参仅为签名兼容保留，方法内不再读。
      *
      * <p><b>WHY 存在（本方法要修的故障形态）</b>：coordinator 的激活来源散在
      * 会话列 / DB settings / feature / env 多处（前两者都是「有值即覆盖」语义）——
@@ -341,9 +345,9 @@ public class PromptAlignSettingsResolver {
      *
      * @param sessionOverride   会话级层（{@code sessions.coordinator_mode} V75，经
      *                          {@link #sessionCoordinatorMode(String)} 取出；null = 该会话未设置）
-     * @param dbResolver        DB 读源（{@link #coordinatorModeEnabled()} 的数据源；null = 无 DB 层）
+     * @param dbResolver        已废弃：全局 settings 层于 2026-11-19 移除，仅为签名兼容保留（不读）
      * @param envFeatureFallback feature+env 回落层（null = 无回落层，末层判 false）
-     * @return true = coordinator 激活（三层任一有值即用；全 null → 回落层的 {@code isCoordinatorMode()}）
+     * @return true = coordinator 激活（会话列有值即用；null → 回落层的 {@code isCoordinatorMode()}）
      */
     public static boolean coordinatorModeActive(
             Boolean sessionOverride,
@@ -352,21 +356,13 @@ public class PromptAlignSettingsResolver {
         if (sessionOverride != null) {
             if (log.isDebugEnabled()) {
                 log.debug("[PromptAlignSettingsResolver] coordinator 门统一判定: 会话级(sessions.coordinator_mode)"
-                    + "={} 覆盖 settings / feature+env 层（会话列 NULL 才回落）", sessionOverride);
+                    + "={} 生效（全局 settings 层已移除，会话列 NULL 才回落 feature+env）", sessionOverride);
             }
             return sessionOverride;
         }
-        Boolean dbValue = (dbResolver == null) ? null : dbResolver.coordinatorModeEnabled();
-        if (dbValue != null) {
-            if (log.isDebugEnabled()) {
-                log.debug("[PromptAlignSettingsResolver] coordinator 门统一判定: DB(settings.coordinator_mode_enabled)"
-                    + "={} 覆盖 feature+env 层（无 dbResolver 或该列为 null 才回落）", dbValue);
-            }
-            return dbValue;
-        }
         boolean fallback = envFeatureFallback != null && envFeatureFallback.isCoordinatorMode();
         if (log.isDebugEnabled()) {
-            log.debug("[PromptAlignSettingsResolver] coordinator 门统一判定: 会话列未设置 + DB 未配置"
+            log.debug("[PromptAlignSettingsResolver] coordinator 门统一判定: 会话列未设置"
                 + " → 回落 feature('COORDINATOR_MODE') && env(CLAUDE_CODE_COORDINATOR_MODE)={}", fallback);
         }
         return fallback;

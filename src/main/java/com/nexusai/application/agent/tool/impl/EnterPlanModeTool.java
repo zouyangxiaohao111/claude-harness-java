@@ -9,7 +9,9 @@ import com.nexusai.application.agent.permission.GetNextPermissionMode;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.PermissionUpdate;
 import com.nexusai.application.agent.permission.PermissionUpdateApplier;
+import com.nexusai.application.agent.permission.SessionPermissionOverlay;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -22,6 +24,7 @@ import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 import java.util.LinkedHashMap;
+import java.util.List;
 import java.util.Map;
 
 /**
@@ -59,6 +62,14 @@ public class EnterPlanModeTool implements Tool {
     /** [WF-13 接线] 危险规则剥离/恢复器（S04 统一入口依赖）· 生产由 Spring 注入；测试懒建。 */
     @Autowired(required = false)
     private DangerousPatternDetector dangerousPatternDetector;
+
+    /**
+     * [plan-approval] 会话列写入器 · 让 plan 模式跨 send 存活（CC 的 appState 是长驻进程态；
+     * 本仓 loop 是 prototype，每 send 新实例 ⇒ 必须写 sessions.session_permission_rules）。
+     * 测试/非 Spring 未注入 → 跳过持久化（本次 run 内仍生效）。
+     */
+    @Autowired(required = false)
+    private SessionMapper sessionMapper;
 
     private PermissionUpdateApplier applier() {
         // 测试直 new 时无 Spring 注入 → 懒建（applier 无状态）
@@ -286,12 +297,26 @@ public class EnterPlanModeTool implements Tool {
             next.put(KEY_TOOL_PERMISSION_CONTEXT, updated);
             // CC handlePlanModeTransition（state.ts:1350-1356）：切换 TO plan 时清 pending exit 附件标志，
             //   防快速切换时 plan_mode 与 plan_mode_exit 同发。
-            PlanModeAttachments.PlanModeFlags flags = PlanModeAttachments.getOrCreateFlags(next);
+            // 会话级载体（appState 生产快照不可变，put 会抛 UOE；且 appState 跨 send 不活）
+            PlanModeAttachments.PlanModeFlags flags =
+                PlanModeAttachments.getOrCreateFlagsBySession(ctx.sessionId());
             flags.setNeedsPlanModeExitAttachment(false);
             return next;
         });
 
         ToolPermissionContext current = appStateTpc(ctx);
+        // [plan-approval] 跨 send 持久化：写 sessions.session_permission_rules 的 SESSION setMode。
+        // CC 的 appState 是长驻进程态，本仓 loop 每 send 重建 ⇒ 不写列则下一条消息回落 default。
+        if (sessionMapper != null && ctx.sessionId() != null && !ctx.sessionId().isBlank()) {
+            try {
+                SessionPermissionOverlay.persistSessionUpdates(sessionMapper, ctx.sessionId(),
+                    List.of(new PermissionUpdate.SetMode(
+                        PermissionUpdate.Destination.SESSION, PermissionMode.PLAN)),
+                    "enter_plan_mode");
+            } catch (Throwable t) {
+                log.warn("[EnterPlanModeTool] plan 模式持久化失败（本次 run 内仍生效）: {}", t.toString());
+            }
+        }
         log.info("[EnterPlanModeTool] 会话 {} 已进入 plan 模式 prePlanMode={}（对齐 CC EnterPlanModeTool.ts:88-94 setAppState 写 permission mode）",
             ctx.sessionId(), current != null ? current.prePlanMode() : null);
         return ToolResult.success(call.id(), buildOutput());

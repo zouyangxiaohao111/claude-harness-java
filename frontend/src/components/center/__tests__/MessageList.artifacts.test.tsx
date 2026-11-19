@@ -147,13 +147,14 @@ describe('[产物卡片] 正文最多 5 张（最新）+ 全量计数', () => {
     expect(onOpenArtifact.mock.calls[1][0].title).toBe('无路径.html')
   })
 
-  it('按类型画不同图标（正文与右栏同一套 ⇒ 同一个 .ac-ico.k-* 底色类）', () => {
+  it('按类型画不同图标（正文与右栏同一套 ⇒ 同一种 DSH 类型色）', () => {
     renderList([userMsg('u1'), assistantMsg('m1')], {
       deliverables: [art('a1', '报告.html', 'D:/out/a.html'), art('a2', '清单.xlsx', 'D:/out/b.xlsx')],
       sources: [],
     })
-    expect(container.querySelector('.ac-ico.k-html')).not.toBeNull()
-    expect(container.querySelector('.ac-ico.k-xlsx')).not.toBeNull()
+    const colors = Array.from(container.querySelectorAll('.ac-ico svg')).map((s) => s.getAttribute('style') ?? '')
+    expect(colors.some((s) => s.includes('rgb(65, 118, 230)')), 'html 蓝').toBe(true)
+    expect(colors.some((s) => s.includes('rgb(34, 197, 94)')), 'xlsx 绿').toBe(true)
   })
 
   it('[2026-10-29] 无产物 → 不渲染卡片区，但入口恒显示并计 0（产物/变更/来源是一组）', () => {

@@ -953,6 +953,8 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
     }
     void wrap(async () => {
       await updateProvider(p.id, req)
+      // 改名 / 改地址都可能改变品牌归属 ⇒ 同步刷新左栏分组
+      await refreshBuiltin()
       setEditingProvider(null)
     }, `已更新: ${p.name}`)
   }
@@ -973,6 +975,23 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
     }
     void wrap(async () => {
       const created = await createProvider(req)
+      // 乐观归组：先把新连接挂到所选品牌下 —— 图标 / 分组立刻正确，不等后端返回。
+      if (builtinPrefill) {
+        const bk = builtinPrefill.key
+        setBuiltinStatuses((prev) => prev.map((b) => (b.key === bk
+          ? {
+              ...b,
+              configured: true,
+              providerId: b.providerId ?? created.id,
+              connections: [
+                ...(b.connections ?? []),
+                { id: created.id, name: created.name, modelCount: 0, enabled: true },
+              ],
+            }
+          : b)))
+      }
+      // 再拉一次校准（后端按 brand_key / host 的最终归属）
+      await refreshBuiltin()
       setAddingProvider(false)
       setBuiltinPrefill(null)
       // L4b-2 首启引导信号：带 created 详情（内含 models），引导据此判断是否需补插「添加模型」步

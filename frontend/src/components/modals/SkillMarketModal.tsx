@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState, type ReactNode } from 'react'
+import { useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
 import { commandApi, type CommandDto } from '@/api/command'
@@ -76,6 +76,18 @@ function colorOf(name: string): string {
   let h = 0
   for (let i = 0; i < name.length; i++) h = (h * 31 + name.charCodeAt(i)) >>> 0
   return AVATAR_COLORS[h % AVATAR_COLORS.length]
+}
+
+/**
+ * 技能的「唯一分类」：取第一个非内部标记的 category/tag（`skill` 是内部标记，不展示）。
+ * 一个技能只贡献、也只命中一个分类胶囊（用户 2026-11-17：胶囊太多，一个技能就一个）。
+ */
+function primaryCategoryLabel(categories?: string[] | null): string | null {
+  for (const c of categories ?? []) {
+    if (!c || c === 'skill') continue
+    return CATEGORY_LABELS[c] ?? c
+  }
+  return null
 }
 
 /** ISO 时间 → 「2026-11-15 22:08」（本地时区）· 缺失/解析失败 → null（不渲染空占位） */
@@ -347,21 +359,47 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
       ? skills.length
       : connectors.filter((c) => c.isConnected).length
 
-  // ---- 技能分类胶囊（category + tags → 中文标签，按显示名去重；`skill` 是内部标记不展示）----
+  // ---- 技能分类胶囊（每个技能只取一个分类 → 中文标签；按显示名去重）----
   const skillCategories = useMemo(() => {
     const labels: string[] = []
     // 分类胶囊只取当前子 tab 的条目（两边分类集合不同，混在一起会给出无结果的胶囊）
     const pool = skillSrc === 'local' ? skills : marketSkills
     for (const s of pool) {
-      for (const c of s.categories ?? []) {
-        if (!c || c === 'skill') continue
-        const label = CATEGORY_LABELS[c] ?? c
-        if (!labels.includes(label)) labels.push(label)
-      }
+      const label = primaryCategoryLabel(s.categories)
+      if (label && !labels.includes(label)) labels.push(label)
     }
     return labels
   }, [skills, marketSkills, skillSrc])
   const [cat, setCat] = useState<string>('全部')
+
+  // ---- 分类胶囊单行 + 翻页（超出部分点 ›/‹ 横向滚动，用户 2026-11-17）----
+  const catRowRef = useRef<HTMLDivElement | null>(null)
+  const [catNav, setCatNav] = useState({ prev: false, next: false })
+  const refreshCatNav = () => {
+    const el = catRowRef.current
+    if (!el) return
+    setCatNav({
+      prev: el.scrollLeft > 2,
+      next: el.scrollLeft + el.clientWidth < el.scrollWidth - 2,
+    })
+  }
+  const pageCat = (dir: 1 | -1) => {
+    const el = catRowRef.current
+    if (!el) return
+    el.scrollBy({ left: dir * Math.max(120, el.clientWidth - 80), behavior: 'smooth' })
+  }
+  useEffect(() => {
+    refreshCatNav()
+    const el = catRowRef.current
+    if (!el) return
+    // jsdom / 老环境没有 ResizeObserver（测试里会直接抛 ReferenceError 把整个弹窗打挂）。
+    // 与 MessageList 的滚动跟随守卫同款：能力缺失时静默跳过，不影响首屏渲染。
+    if (typeof ResizeObserver === 'undefined') return
+    const ro = new ResizeObserver(() => refreshCatNav())
+    ro.observe(el)
+    return () => ro.disconnect()
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [skillCategories, skillSrc, installedOnly, tab])
 
   // ---- 搜索匹配（名字/展示名/描述 contains · 大小写不敏感）----
   const keyword = q.trim().toLowerCase()
@@ -591,7 +629,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     : (skillSrc === 'local' ? skills : marketSkills)
   const filteredSkills = useMemo(() => {
     return srcSkills.filter((s) => {
-      if (cat !== '全部' && !(s.categories ?? []).some((c) => (CATEGORY_LABELS[c] ?? c) === cat)) return false
+      if (cat !== '全部' && primaryCategoryLabel(s.categories) !== cat) return false
       return matchAny(s.displayName, s.name, s.description)
     })
   }, [srcSkills, cat, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
@@ -829,13 +867,27 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
                     </button>
                   </div>
 
-                  {/* 分类胶囊 + 计数：始终常驻（筛选后结果变少也不会失去退回「全部」的入口） */}
+                  {/* 分类胶囊（单行 + 左右翻页）+ 计数：始终常驻（筛选后结果变少也不会失去退回「全部」的入口） */}
                   <div className="sm-cat-row">
-                    {['全部', ...skillCategories].map((c) => (
-                      <button key={c} className={`sm-cat${cat === c ? ' active' : ''}`} onClick={() => setCat(c)}>
-                        {c}
-                      </button>
-                    ))}
+                    <div className="sm-cat-scroll" ref={catRowRef} onScroll={refreshCatNav}>
+                      {['全部', ...skillCategories].map((c) => (
+                        <button key={c} className={`sm-cat${cat === c ? ' active' : ''}`} onClick={() => setCat(c)}>
+                          {c}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      className={`sm-cat-page${catNav.prev ? '' : ' off'}`}
+                      onClick={() => pageCat(-1)}
+                      aria-label="上一页分类"
+                      tabIndex={catNav.prev ? 0 : -1}
+                    >‹</button>
+                    <button
+                      className={`sm-cat-page${catNav.next ? '' : ' off'}`}
+                      onClick={() => pageCat(1)}
+                      aria-label="下一页分类"
+                      tabIndex={catNav.next ? 0 : -1}
+                    >›</button>
                     <span className="sm-result-count">{filteredSkills.length} 个技能</span>
                   </div>
 

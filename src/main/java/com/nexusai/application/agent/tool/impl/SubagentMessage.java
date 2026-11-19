@@ -1,6 +1,9 @@
 package com.nexusai.application.agent.tool.impl;
 
 import com.nexusai.application.agent.tool.AgentUsage;
+import com.nexusai.model.session.dto.ToolCallDto;
+
+import java.util.List;
 
 /**
  * 子 Agent 流式消息 · 对齐 CC {@code runAgent.ts:248} {@code AsyncGenerator<Message, void>} 的
@@ -58,12 +61,26 @@ public sealed interface SubagentMessage {
      * @param usage       CC original: message.usage (agentToolUtils.ts:355)
      * @param toolContent CC original: content.some(tool_use|tool_result) (SkillTool.ts:246-248)
      * @param agentId     CC original: onProgress.data.agentId (SkillTool.ts:256)
+     * @param toolCalls   本条 assistant 消息的工具调用（对齐 CC content 里的 tool_use 块）；
+     *                    teammate 活动摘要采集用（SubagentMessage 此前只带 toolContent 布尔，
+     *                    无法拿到工具名/入参）。空列表 = 无工具调用。
      */
-    record AssistantMessage(String content, AgentUsage usage, boolean toolContent, String agentId)
+    record AssistantMessage(String content, AgentUsage usage, boolean toolContent, String agentId,
+                            List<ToolCallDto> toolCalls)
             implements SubagentMessage {
+        /** 规范化 null（record 紧凑构造器）。 */
+        public AssistantMessage {
+            toolCalls = toolCalls == null ? List.of() : List.copyOf(toolCalls);
+        }
+
         /** 2 参便利构造器 (向后兼容 · P1-18 前调用点). */
         public AssistantMessage(String content, AgentUsage usage) {
-            this(content, usage, false, null);
+            this(content, usage, false, null, List.of());
+        }
+
+        /** 4 参便利构造器（P1-18 形态 · 不携带 tool_use 明细）. */
+        public AssistantMessage(String content, AgentUsage usage, boolean toolContent, String agentId) {
+            this(content, usage, toolContent, agentId, List.of());
         }
     }
 

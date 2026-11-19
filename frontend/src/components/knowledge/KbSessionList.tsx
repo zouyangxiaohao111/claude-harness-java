@@ -55,6 +55,27 @@ export function KbSessionList({ activeSessionId, onPick, onDeleted }: Props) {
 
   useEffect(() => { void refresh() }, [refresh, activeSessionId])
 
+  // [标题/排序实时化 · 2026-11-18] 与主会话同款静默轮询。
+  //   WHY：后端在首轮之后自动总结会话标题、每条消息也会写 sessions.updated_at，
+  //   但前端**没有任何推送事件**（主会话靠 App.tsx:626-640 的 5s 轮询才看得到）。
+  //   知识库左栏原来只在切会话时 refresh 一次 ⇒ 标题已入库却要手动切/重开才显示。
+  //   ⚠️ 静默语义同主会话：成功不提示、失败不打扰（下一轮自然重试）；页面不可见时跳过。
+  useEffect(() => {
+    let cancelled = false
+    const poll = () => {
+      if (cancelled || document.visibilityState === 'hidden') return
+      void refresh()
+    }
+    const timer = window.setInterval(poll, 5000)
+    const onVisible = () => { if (document.visibilityState === 'visible') poll() }
+    document.addEventListener('visibilitychange', onVisible)
+    return () => {
+      cancelled = true
+      window.clearInterval(timer)
+      document.removeEventListener('visibilitychange', onVisible)
+    }
+  }, [refresh])
+
   // 点菜单外面关闭（与主会话 SessionList 同一判据：落在 .session-menu / .session-menu-btn 内不关）
   useEffect(() => {
     if (menuId == null) return

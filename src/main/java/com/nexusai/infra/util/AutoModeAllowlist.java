@@ -34,7 +34,7 @@ public final class AutoModeAllowlist {
         "ListMcpResourcesTool", "ReadMcpResourceTool",
         // Task management (metadata only)
         "TodoWrite",
-        "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TaskStop", "TaskOutput",
+        "TaskCreate", "TaskGet", "TaskUpdate", "TaskList", "TaskStop",
         // Plan mode / UI
         "AskUserQuestion",
         "EnterPlanMode", "ExitPlanMode",

@@ -77,10 +77,10 @@ import java.util.UUID;
 /**
  * 工具注册配置 · 对齐 CC tools.ts:208-220
  *
- * <p>根据 {@link TaskSystemConfig#isTodoV2Enabled()} 决定注册哪些工具：
+ * <p>工具装配策略（2026-11-19 起）：<b>V2 恒为默认</b>，TodoWrite（V1）不再交给本配置装配。
  * <ul>
- *   <li>V1 模式：注册 {@link TodoWriteTool}</li>
- *   <li>V2 模式：注册 {@link TaskCreateTool}, {@link TaskGetTool}, {@link TaskUpdateTool}, {@link TaskListTool}</li>
+ *   <li>V1：{@link TodoWriteTool} 类保留（对齐 CC 仍有实现），但本配置不创建/不注册</li>
+ *   <li>V2：注册 {@link TaskCreateTool}, {@link TaskGetTool}, {@link TaskUpdateTool}, {@link TaskListTool}</li>
  * </ul>
  *
  * <h2>CC 对齐</h2>
@@ -289,8 +289,9 @@ public class ToolRegistrationConfig {
      * {@code @Resource(name="todoTaskTools")} 显式注入并在 {@code init()} 内
      * {@link ToolRegistry#registerAll(List)} 逐个注册（B5 OPD-TOOL-02-1）。
      *
-     * <p>内容：V1 的 {@link TodoWriteTool} + feature 门控的 {@link DiscoverSkillsTool} + 8 个
-     * feature/env 门控桩。SkillTool / LSPTool 不在此 List（已作独立 {@code @Bean Tool} 收集）。
+     * <p>内容：feature 门控的 {@link DiscoverSkillsTool} + 8 个 feature/env 门控桩。
+     * <b>不含 TodoWriteTool</b>（V1 已停止 Spring 装配，2026-11-19）。
+     * SkillTool / LSPTool 不在此 List（已作独立 {@code @Bean Tool} 收集）。
      *
      * <p>s12-3.2: Task V2 工具（TaskCreate/TaskGet/TaskUpdate/TaskList）
      * 通过 @Component 自动注册到 ToolRegistry，不再在此处手动创建。
@@ -299,29 +300,11 @@ public class ToolRegistrationConfig {
     public List<Tool> todoTaskTools() {
         List<Tool> tools = new ArrayList<>();
 
-        if (!TaskSystemConfig.isTodoV2Enabled()) {
-            // V1 模式：注册 TodoWrite 工具
-            // [todo-rest-stream] 注入 wsTemplate（STOMP 推流）+ sessionStateResolver（AgentState 同步/REST 读侧）
-            //   —— 两者 @Autowired(required=false) 字段缺省 null 时不接线（测试/孤立运行降级 no-op）。
-            log.info("Task V1 enabled: registering TodoWrite tool");
-            TodoWriteTool todoWrite = new TodoWriteTool();
-            if (wsTemplate != null) {
-                todoWrite.setWsTemplate(wsTemplate);
-            }
-            if (sessionAgentStateRegistry != null) {
-                todoWrite.setSessionStateResolver(sessionAgentStateRegistry::get);
-            }
-            if (sessionMapper != null) {
-                todoWrite.setSessionMapper(sessionMapper);
-            }
-            log.info("[todo-rest-stream] TodoWrite 装配: wsTemplate={} sessionStateResolver={} sessionMapper={}"
-                    + "（V1 分支接线，照抄 skillTool() setSessionStateResolver 模式；"
-                    + "sessionMapper 为 [R3] sessions.todos DB 持久化通道）",
-                wsTemplate != null, sessionAgentStateRegistry != null, sessionMapper != null);
-            tools.add(todoWrite);
-        } else {
-            log.info("Task V2 enabled: Task tools registered via @Component auto-injection");
-        }
+        // [V1-deprecate 2026-11-19] TodoWrite（V1）不再交给 Spring 装配：无论 isTodoV2Enabled
+        //   取值，本 List 都不注册 TodoWriteTool（类保留，对齐 CC 仍有实现但默认走 V2）。
+        //   显式关闭 V2（nexusai.tasks.enabled=false）时任务工具将整体不可用 —— 这是用户
+        //   「默认 V2、V1 工具不给 Spring 管理」的裁定，不再回落 V1。
+        log.info("Task V2 enabled: Task tools registered via @Component auto-injection（TodoWrite V1 不再装配）");
 
         // B5 (OPD-TOOL-02-1): SkillTool / LSPTool 不再加入本 List —— 二者已作为独立
         // `@Bean Tool` 方法（skillTool() / lspTool()）被 ToolRegistry 构造器的
@@ -738,7 +721,7 @@ public class ToolRegistrationConfig {
      *   <li>subagentToolRegistry: 直接传主 {@link ToolRegistry} @Component (懒代理) —
      *       工具在 ApplicationReadyEvent 才注册 (ToolRegistry.init), bean 构造期不可复制;
      *       执行期 (会话中) 已填充, resolveAgentTools 内部 filterToolsForAgent 已剔除递归工具
-     *       (Agent/TaskOutput/ExitPlanMode), Skill 保留 (CC 允许嵌套 skill)</li>
+     *       (Agent/ExitPlanMode), Skill 保留 (CC 允许嵌套 skill)</li>
      *   <li>hookRegistry: @Component</li>
      *   <li>parentLoop: null — SubagentExecutor.java:270-274 注释确认 '不再用于子 Agent 主循环'</li>
      *   <li>llmProviderFactory: @Component</li>
