@@ -59,7 +59,7 @@ class R32B15Stage2_AssistantMessageLineageTest {
 
     @BeforeEach
     void setUp() {
-        state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         pool = Executors.newFixedThreadPool(4, r -> {
             Thread t = new Thread(r, "test-" + System.nanoTime());
             t.setDaemon(true);

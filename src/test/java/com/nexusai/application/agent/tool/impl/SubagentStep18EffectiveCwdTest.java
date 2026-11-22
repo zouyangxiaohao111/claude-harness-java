@@ -63,7 +63,7 @@ class SubagentStep18EffectiveCwdTest {
     /** 父会话 TUC：绑定项目根 = {@code sessionProject}（与进程 user.dir 必然不同）。 */
     private static ToolUseContext parentTucBoundTo(Path sessionProject) {
         SessionProjectRoot.setForSession(PARENT_SESSION, sessionProject.toString());
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), PARENT_SESSION);
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), PARENT_SESSION);
         // 前置条件：父 ctx 的会话项目根确实解析出来了，且 ≠ 进程启动目录（否则本类断言无鉴别力）
         assertThat(tuc.effectiveCwd()).as("前置条件：父 TUC effectiveCwd = 会话项目根").isNotNull();
         assertThat(tuc.effectiveCwd().toString())

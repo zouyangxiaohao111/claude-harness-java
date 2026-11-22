@@ -18,7 +18,6 @@ import org.sqlite.SQLiteDataSource;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -81,7 +80,7 @@ class ComputerUseScreenshotFilteringTest {
         input.put("reason", "理由");
 
         var result = tool.execute(new ToolUseBlock("c1", tool.name(), input),
-                ToolUseContext.of((UUID) null, SESSION));
+                ToolUseContext.of((String) null, SESSION));
 
         JsonNode data = (JsonNode) ((ToolResult<?>) result).data();
         assertThat(data.path("screenshotFiltering").asText()).isEqualTo("none");
@@ -103,7 +102,7 @@ class ComputerUseScreenshotFilteringTest {
         input.putArray("coordinate").add(10).add(20);
 
         var result = tool.execute(new ToolUseBlock("c1", "mcp__computer-use__left_click", input),
-                ToolUseContext.of((UUID) null, SESSION));
+                ToolUseContext.of((String) null, SESSION));
 
         assertThat(ComputerUseRequestAccessResult.SCREENSHOT_FILTERING).isEqualTo("none");
         assertThat(((ToolResult<?>) result).data().toString())

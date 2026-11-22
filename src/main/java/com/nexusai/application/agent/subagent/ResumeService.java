@@ -26,6 +26,8 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.attribute.FileTime;
+import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -122,9 +124,45 @@ public class ResumeService {
      */
     private MessageMapper messageMapper;
 
+    /**
+     * [resume-quota] 会话级并发槽 · 对齐 CC {@code roomForResume}/{@code $xt}/{@code Tr}
+     * （claude.exe 2.1.328 偏移 326611441 / 329287293 / 334052811）。未注入（plain JUnit）→ 跳过配额门。
+     */
+    private ResumeQuota resumeQuota;
+
+    /**
+     * [stop-double-write] 内存停止标记 · 对齐 CC {@code Fat()}（偏移 334311557）。
+     * 未注入 → 只读磁盘伴生文件（旧行为）。
+     */
+    private StopMarkers stopMarkers;
+
     @org.springframework.beans.factory.annotation.Autowired
     public void setSubagentTool(SubagentTool subagentTool) {
         this.subagentTool = subagentTool;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setResumeQuota(ResumeQuota resumeQuota) {
+        this.resumeQuota = resumeQuota;
+    }
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setStopMarkers(StopMarkers stopMarkers) {
+        this.stopMarkers = stopMarkers;
+    }
+
+    /**
+     * [lineage] 会话用量账本注册表 · 父子血统的<b>真实数据源</b>（节点上的 parentAgentId
+     * 由 spawn 点写入、跨 turn 由 {@code sessions.usage_tree_json} 恢复）。
+     *
+     * <p>未注入（plain JUnit / 会话无账本）→ lineage 恒 false（⛔ 不猜真、不写死真）。
+     */
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageAccountingRegistry;
+
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setUsageAccountingRegistry(
+            com.nexusai.application.agent.cost.SessionUsageAccountingRegistry registry) {
+        this.usageAccountingRegistry = registry;
     }
 
     /** 后台任务注册表注入（resume 门 2/3 的状态源）；plain JUnit 不注入 → 跳过门 2/3。 */
@@ -159,8 +197,8 @@ public class ResumeService {
     /**
      * resume 后台续跑子 Agent · 对齐 CC resumeAgent.ts:42-265。
      *
-     * @param agentId   待恢复 sub-agent UUID（S-12 可逆桥编码：a+16hex 原键经 packAgentId 入参 /
-     *                  legacy UUID 兼容；transcript/metadata 双键查找，见 {@link #resumeAgentBackground} 首段）
+     * @param agentId   待恢复 sub-agent 的 agentId（CC 单一形态 a+16hex；原样作为 transcript 键，
+     *                  旧 UUID 键不再还原 —— Breaking）
      * @param prompt    resume 追加用户指令
      * @param sessionDir 会话目录根（[R1] config-home 项目 slug 目录，与 SubagentExecutor.resolveSessionDir 同源）
      * @param sessionId 主会话 UUID
@@ -172,7 +210,7 @@ public class ResumeService {
      *         [R-A45 B-4 D18/B2] agentId 返回 a+16hex（前端入参同形制，CC resumeAgent.ts:261
      *         {@code agentId} 即原 string），前端可持返回值再入二次 resume 回环
      */
-    public ResumeAgentResult resumeAgentBackground(UUID agentId, String prompt,
+    public ResumeAgentResult resumeAgentBackground(String agentId, String prompt,
                                                    Path sessionDir, String sessionId,
                                                    ContentReplacementState parentContentReplacementState) {
         // 5 参 = 用户显式 resume（REST /resume），不受 stoppedByUser 门限制。
@@ -189,10 +227,115 @@ public class ResumeService {
      *
      * @param userInitiated true = 用户显式发起（REST /resume）；false = 模型/系统自动发起
      */
-    public ResumeAgentResult resumeAgentBackground(UUID agentId, String prompt,
+    public ResumeAgentResult resumeAgentBackground(String agentId, String prompt,
                                                    Path sessionDir, String sessionId,
                                                    ContentReplacementState parentContentReplacementState,
                                                    boolean userInitiated) {
+        return resumeAgentBackground(agentId, prompt, sessionDir, sessionId,
+            parentContentReplacementState, userInitiated, false);
+    }
+
+    /**
+     * 血统感知的恢复入口 · 由<b>恢复发起方</b>的 agentId 现算 {@code lineage}（⛔ 不从工具入参取）。
+     *
+     * <p>对齐 CC 偏移 333967189：{@code lineage !== undefined} 时跳过 stoppedByUser 探测与 k9。
+     * 本仓的 lineage = <b>发起方是目标的后代</b>（目标在发起方的祖先链上）—— 对应 CC 唯一生产点
+     * 「恢复 fork 子代理时先递归恢复它的父」，级联里被走过的是<b>祖先</b>：
+     * <ul>
+     *   <li>子代理：父子链取会话用量账本节点上的 {@code parentAgentId}（spawn 点写入，
+     *       跨 turn 由 {@code usage_tree_json} 恢复）；</li>
+     *   <li>父恢复子 / 兄弟 / 无关方 → false（⛔ 父级恢复子代理不是 lineage，不放行 k9）；</li>
+     *   <li>账本不可得 / 发起方未知 → false（退回 k9 判据，⛔ 不放行）。</li>
+     * </ul>
+     *
+     * @param initiatorAgentId 发起方 agentId（调用方 ToolUseContext.agentId() 的字符串形态；
+     *                         null/空白 = 主会话）—— 由 orchestrator 提供，不由模型填写
+     */
+    public ResumeAgentResult resumeAgentBackgroundForLineage(String agentId, String prompt,
+                                                             Path sessionDir, String sessionId,
+                                                             ContentReplacementState parentContentReplacementState,
+                                                             boolean userInitiated,
+                                                             String initiatorAgentId) {
+        boolean lineage = computeLineage(
+            usageAccountingRegistry != null ? usageAccountingRegistry.peek(sessionId) : null,
+            initiatorAgentId, agentId, sessionId);
+        if (lineage) {
+            log.info("[ResumeService][lineage] 同血统续跑放行 k9: agentId={} initiator={} session={}",
+                agentId, initiatorAgentId, sessionId);
+        }
+        return resumeAgentBackground(agentId, prompt, sessionDir, sessionId,
+            parentContentReplacementState, userInitiated, lineage);
+    }
+
+    /**
+     * lineage 计算（纯函数，便于用例直接锁判据）。
+     *
+     * <p>方向（对齐 CC）：true = <b>发起方是目标的后代</b>（target 在 initiator 的祖先链上）。
+     * 父恢复子 / 兄弟 / 无关方 → false。
+     *
+     * @param ledger           会话用量账本（父子边的唯一真源；null → false）
+     * @param initiatorAgentId 发起方（UUID 串 / a+16hex / 会话 id / name@team）
+     * @param targetAgentId    被恢复的 agent
+     * @param sessionId        会话 id（主会话节点的键 = 会话 id）
+     * @return true = 发起方是目标的后代（目标在其祖先链上）
+     */
+    public static boolean computeLineage(com.nexusai.application.agent.cost.SessionUsageLedger ledger,
+                                  String initiatorAgentId, String targetAgentId, String sessionId) {
+        if (ledger == null || targetAgentId == null) {
+            return false;
+        }
+        String targetKey = resolveNodeKey(ledger, targetAgentId, targetAgentId);
+        String initiatorKey = resolveNodeKey(ledger,
+            normalizeInitiator(initiatorAgentId, sessionId), initiatorAgentId);
+        return AgentLineage.linked(initiatorKey, targetKey,
+            key -> {
+                com.nexusai.infra.llm.UsageAttribution who = ledger.attributionOf(key);
+                return who == null ? null : who.parentAgentId();
+            });
+    }
+
+    /**
+     * 账本节点键归一：UUID 串 → a+16hex（{@link AgentContext#canonicalAgentId}）。
+     * 主会话传的是会话 id → 原样（主节点键 = 会话 id）。
+     */
+    private static String normalizeInitiator(String initiatorAgentId, String sessionId) {
+        if (initiatorAgentId == null || initiatorAgentId.isBlank()) {
+            return sessionId;
+        }
+        if (initiatorAgentId.equals(sessionId)) {
+            return initiatorAgentId;
+        }
+        String canonical = AgentContext.canonicalAgentId(initiatorAgentId);
+        return canonical == null ? initiatorAgentId : canonical;
+    }
+
+    /** 取账本里真实存在的节点键（候选按顺序命中第一个存在的；都不存在 → 首个候选）。 */
+    private static String resolveNodeKey(com.nexusai.application.agent.cost.SessionUsageLedger ledger,
+                                         String... candidates) {
+        for (String c : candidates) {
+            if (c != null && ledger.attributionOf(c) != null) {
+                return c;
+            }
+        }
+        for (String c : candidates) {
+            if (c != null) {
+                return c;
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 7 参重载 · 增加 {@code lineage}（同一血统的续跑）· 对齐 CC 恢复门
+     * {@code (meta.stoppedByUser || 伴生文件 found) && !userInitiated && !lineage}（偏移 333967189
+     * {@code A=L!==void 0}；有 lineage 时连伴生探测都跳过 {@code he=...{found:false}}）。
+     *
+     * @param lineage true = 本次恢复是同一血统的续跑（跳过停止标记探测）
+     */
+    public ResumeAgentResult resumeAgentBackground(String agentId, String prompt,
+                                                   Path sessionDir, String sessionId,
+                                                   ContentReplacementState parentContentReplacementState,
+                                                   boolean userInitiated, boolean lineage) {
         String agentIdStr = agentId.toString();
         // ── 门 1：并发 resume（对齐 CC gt(): resumesInFlight 集合）──
         //   同一 agent 的两次并发 resume 会起两个 worker 写同一 transcript。
@@ -201,6 +344,9 @@ public class ResumeService {
                 ResumeErrorCode.SUBAGENT_RESUME_ALREADY_RUNNING,
                 "Agent " + agentIdStr + " is already running or being resumed");
         }
+        // [stop] 门 B 用的停止周期快照（CC resume 开始时快照 sn，准入后比对）。
+        int stopSnapshot = stopMarkers != null ? stopMarkers.stopCount(agentIdStr) : 0;
+        ResumeQuota.Release slot = null;
         try {
             // ── 门 2：still stopping（对齐 CC uo(): Gq(agentId) = stopPendingAgentIds.has(id)）──
             //   killAsyncAgent 已置 KILLED 并 abort，但旧 worker 尚未退出；此时 resume 会与它并发。
@@ -208,9 +354,7 @@ public class ResumeService {
                 if (backgroundTaskRunner.isStopPending(agentIdStr)) {
                     throw new ResumeErrorCode.ResumeException(
                         ResumeErrorCode.SUBAGENT_RESUME_STILL_STOPPING,
-                        "Agent " + agentIdStr + " is still stopping \u2014 its previous run was stopped "
-                            + "but has not exited. Re-run TaskStop on it or wait for it to exit "
-                            + "before resuming.");
+                        ResumeErrorCode.stillStoppingText(agentIdStr));
                 }
                 // ── 门 3：仍在运行（CC uo(): taskRegistry status 非终态 → already running）──
                 com.nexusai.application.agent.tasks.BackgroundTask runningTask =
@@ -223,28 +367,71 @@ public class ResumeService {
                         "Agent " + agentIdStr + " is already running or being resumed");
                 }
             }
+            // ── 门 4：会话级并发槽 · 对齐 CC roomForResume（满即拒，不排队）──
+            if (resumeQuota != null) {
+                slot = resumeQuota.tryAcquire(sessionId);
+                if (slot == null) {
+                    throw new ResumeErrorCode.ResumeException(
+                        ResumeErrorCode.SESSION_FULL,
+                        ResumeErrorCode.sessionFullText(agentIdStr));
+                }
+            }
+            // ── 门 5：自动续跑预算 · 对齐 CC restartResumes>=yYa(5) → resumes_spent ──
+            if (!userInitiated) {
+                int spent = readRestartResumeCount(sessionDir, sessionId, agentId, agentIdStr);
+                if (spent >= ResumeErrorCode.MAX_RESTART_RESUMES) {
+                    throw new ResumeErrorCode.ResumeException(
+                        ResumeErrorCode.SUBAGENT_RESUME_RESUMES_SPENT,
+                        "Agent " + agentIdStr + " has already been resumed "
+                            + ResumeErrorCode.MAX_RESTART_RESUMES
+                            + " times automatically since the last restart; it will not be resumed"
+                            + " automatically again." + ResumeErrorCode.START_NEW_AGENT_SUFFIX);
+                }
+            }
             return doResumeAgentBackground(agentId, prompt, sessionDir, sessionId,
-                parentContentReplacementState, agentIdStr, userInitiated);
+                parentContentReplacementState, agentIdStr, userInitiated, lineage, stopSnapshot);
         } finally {
+            if (slot != null) {
+                slot.release();
+            }
             resumesInFlight.remove(agentIdStr);
         }
+    }
+
+
+    private int readRestartResumeCount(Path sessionDir, String sessionId, String agentId, String agentIdStr) {
+        String key = resumeMetaKey(sessionDir, sessionId, agentId, agentIdStr);
+        return AgentTranscript.readRestartResumes(sessionDir, sessionId, key);
+    }
+
+
+
+    /** 台账落在实际存在的 meta 键上（a+16hex 新格式优先，UUID 旧格式兜底）。 */
+    private static String resumeMetaKey(Path sessionDir, String sessionId, String agentId, String agentIdStr) {
+        String hex = agentId;
+        if (AgentTranscript.metadataState(sessionDir, sessionId, hex)
+                != AgentTranscript.MetadataState.MISSING) {
+            return hex;
+        }
+        return agentIdStr;
     }
 
     /**
      * resume 主体（读 transcript → 过滤 → 重建 → 后台续跑）。门禁在
      * {@link #resumeAgentBackground} —— 本方法假定三门已过。
      */
-    private ResumeAgentResult doResumeAgentBackground(UUID agentId, String prompt,
+    private ResumeAgentResult doResumeAgentBackground(String agentId, String prompt,
                                                       Path sessionDir, String sessionId,
                                                       ContentReplacementState parentContentReplacementState,
-                                                      String agentIdStr, boolean userInitiated) {
+                                                      String agentIdStr, boolean userInitiated,
+                                                      boolean lineage, int stopSnapshot) {
         String sessionIdStr = sessionId;
         // [R3-WF-F IMP-SUB-12 返工] a+16hex transcript 键（D18/B2）：子代理域以
         //   AgentContext.createAgentId() 生成 a+16hex，经 S-12 pack 桥存 ToolUseContext.agentId(UUID)，
         //   transcript/metadata 键还原 a+16hex。resume 请求携带 packed UUID → unpackAgentId 还原
         //   a+16hex 查找新格式 transcript（CC resumeAgent.ts:63-66 getAgentTranscript(asAgentId(agentId))）；
         //   旧格式（UUID 键）经 uuidKey fallback 兼容（pre-migration transcript 不丢）。
-        String agentIdHex = AgentContext.unpackAgentId(agentId);
+        String agentIdHex = agentId;
 
         // ── 1. 读 transcript + meta（CC :63-66）── 双键查找（a+16hex 新格式优先，UUID 旧格式兜底）
         Optional<AgentTranscript.AgentTranscriptResult> transcriptOpt =
@@ -254,10 +441,14 @@ public class ResumeService {
             AgentTranscript.readMetadata(sessionDir, sessionIdStr, agentIdHex)
                 .or(() -> AgentTranscript.readMetadata(sessionDir, sessionIdStr, agentIdStr)).orElse(null);
 
-        // ── 2. 无 transcript 抛错（CC :67-69 throw new Error; REST 语义 → 404 NotFound）──
+        // ── 2. 无 transcript 抛错（CC :67-69 throw new ResumeAgentStateError{transcriptMissing:true}）──
+        //   [五档对齐] CC 把它映射到遥测 {@code no_transcript}（Ks，偏移 356128040），
+        //   SendMessage 回执用 degradedClass 保留该档；本仓 REST 仍要求 404（CommandController
+        //   的行为契约），故抛 NotFoundException 的子类并携带同样的错误码/分档。
         if (transcriptOpt.isEmpty()) {
             log.warn("[ResumeService] 未找到 transcript, 抛错: agentId={}", agentIdStr);
-            throw new NotFoundException("No transcript found for agent ID: " + agentIdStr);
+            throw new ResumeErrorCode.ResumeTranscriptMissingException(
+                ResumeErrorCode.transcriptMissingText(agentIdStr, agentIdStr));
         }
         AgentTranscript.AgentTranscriptResult transcript = transcriptOpt.get();
 
@@ -277,13 +468,25 @@ public class ResumeService {
         // 读取后、异步续跑前。
         restoreSessionCwd(sessionId);
 
-        // ── 3. 三层过滤（CC :70-74，复用 MessageFilters）──
-        List<AgentMessage> resumedMessages = MessageFilters.filterWhitespaceOnlyAssistantMessages(
+        // ── 3. 恢复起点：末尾不完整轮截断 + 丢失工具补 is_error（CC oKt / ure）──
+        //   CC 恢复起点不是「只取最后一条」，而是<b>整段历史重放</b>，但先切掉末尾未收尾的一轮：
+        //   {@code oKt(msgs)} 从尾部回退到最后一个完整边界（assistant 的 stop_reason 为
+        //   null|"tool_use" 且非 apiError；user/tool 行本身就是边界）；被切断的 tool_use
+        //   补成 {@code tool_result{is_error:true, toolDenialKind:"interrupted"}}，因为
+        //   「已执行的工具不重放」（CC 偏移 353419208 区 + 333977 区）。
+        List<AgentMessage> truncated = truncateIncompleteTail(transcript.messages());
+        // 三层过滤（CC :70-74，复用 MessageFilters）——顺序保持 CC：先过滤再补丢失工具。
+        //   全量 unresolved 的 assistant 会被 filterUnresolvedToolUses 丢掉（CC 同判据 ALL 才丢）；
+        //   部分未解析的保留下来，再由 fillInterruptedToolResults 补 is_error（CC ure()）。
+        List<AgentMessage> filtered = MessageFilters.filterWhitespaceOnlyAssistantMessages(
             MessageFilters.filterOrphanedThinkingOnlyMessages(
-                MessageFilters.filterUnresolvedToolUses(transcript.messages())));
+                MessageFilters.filterUnresolvedToolUses(truncated)));
+        List<AgentMessage> resumedMessages = fillInterruptedToolResults(filtered);
         if (log.isDebugEnabled()) {
-            log.debug("[ResumeService] 三层过滤: transcript.messages.size={} → resumedMessages.size={} "
-                    + "(CC resumeAgent.ts:70-74)", transcript.messages().size(), resumedMessages.size());
+            log.debug("[ResumeService] 恢复起点: transcript.messages.size={} → 截断后={} "
+                    + "→ 三层过滤后={} → 补丢失工具后={} (CC oKt + resumeAgent.ts:70-74 + ure)",
+                transcript.messages().size(), truncated.size(), filtered.size(),
+                resumedMessages.size());
         }
 
         // ── 4. reconstructForSubagentResume（CC :75-79）──
@@ -306,10 +509,13 @@ public class ResumeService {
         //   记录里的目录已不可进入 → 拒绝恢复，而不是悄悄换到别的目录继续跑。
         verifyMetadataCwd(meta);
 
-        // ── 4.6 stoppedByUser 门（对齐 CC uo(): (s?.stoppedByUser || 伴生标记) && !J）──
+        // ── 4.6 stoppedByUser 门（对齐 CC 偏移 333967189：(meta.stoppedByUser ‖ 伴生 found)
+        //        && !userInitiated && !lineage；lineage 时连探测都跳过）──
         //   用户显式停止过的 agent，只有用户本人可以恢复；模型自动 resume 一律拒绝。
         //   observer-activity 在 CC 是例外，本仓 observer 走 executeResumeAsync 不经此方法 ⇒ 天然例外。
-        verifyNotStoppedByUser(sessionDir, sessionIdStr, agentIdHex, agentIdStr, userInitiated);
+        boolean memoryStopped = stopMarkers != null && stopMarkers.isStopped(agentIdStr);
+        verifyNotStoppedByUser(sessionDir, sessionIdStr, agentIdHex, agentIdStr,
+            userInitiated, lineage, memoryStopped);
 
         // ── 5. worktree stat 校验 + 父 cwd 兜底 + utimes（CC :82-97）──
         String resumedWorktreePath = resolveWorktreePath(meta);
@@ -352,6 +558,23 @@ public class ResumeService {
         //   （runAgent.ts:508-518）→ 无 executeResumeAsync append 通道（原 7.5 段已删）。
         // [hooks-plugin-display 修复] 9 参重载透传创建会话 sessionId（resumeAgentBackground :153 参数）：
         //   async resume 子代理任务需会话归属（sessionId=null → GET /api/v1/tasks?sessionId= 过滤排除）。
+        // ── 8.5 门 B 复核（对齐 CC 偏移 333998223：准入后若期间又被停过 ⇒ 丢这条投递）──
+        //   快照取自进入 resumeAgentBackground 时；此处与当前值比对。userInitiated / lineage 放行。
+        if (!userInitiated && !lineage && stopMarkers != null
+                && stopMarkers.isStopped(agentIdStr)
+                && stopMarkers.stopCount(agentIdStr) != stopSnapshot) {
+            throw new ResumeErrorCode.ResumeException(
+                ResumeErrorCode.AGENT_STOPPED_BY_USER,
+                ResumeErrorCode.stoppedMeanwhileText(agentIdStr));
+        }
+        // [restart-rebuild] 复活标记：写 revivedAt 并清 finished（合并保留其它键）。
+        //   WHY 清 finished：复活后的这一轮正在跑，若仍留 finished:true，退役表重建会把
+        //   「进行中」说成「已完成」；本轮结束时由 SubagentExecutor Step 22 重新落盘 finished:true。
+        //   写入放在起跑前，避免 worker 结束写 finished 与本次清 finished 竞争（顺序颠倒会丢终态）。
+        AgentTranscript.markRevived(sessionDir, sessionIdStr, agentIdHex);
+        if (!agentIdHex.equals(agentIdStr)) {
+            AgentTranscript.markRevived(sessionDir, sessionIdStr, agentIdStr);
+        }
         subagentTool.executeResumeAsync(agentId, prompt, selectedAgent, uiDescription,
             forkParentSystemPrompt, resumedMessages, resumedWorktreePath, resumedReplacementState,
             sessionId);
@@ -360,12 +583,14 @@ public class ResumeService {
         // 否则该 agent 之后的任何自动 resume 都会被同一个标记拦住）。
         AgentTranscript.clearStoppedByUser(sessionDir, sessionIdStr, agentIdHex);
         AgentTranscript.clearStoppedByUser(sessionDir, sessionIdStr, agentIdStr);
+        if (stopMarkers != null) {
+            stopMarkers.clear(agentIdStr);
+        }
 
         // ── 9. 返回（CC :260-264）──
         // [R-A45 B-4 D18/B2] agentId 返回 a+16hex（前端入参同形制）：CC resumeAgent.ts:261
         //   {@code agentId} 即原 a+16hex string。前端以返回的 a+16hex 再入二次 resume →
-        //   CommandController.toResumeAgentId → packAgentId → unpackAgentId 还原同键 → transcript
-        //   命中（回环成立且形制一致）。outputFile 仍为实际输出文件
+        //   原样作为 transcript 键 → 命中（回环成立且形制一致）。outputFile 仍为实际输出文件
         //   （BackgroundTaskRunner.taskOutputPath(sessionId, agentId) 唯一根，写入侧同源）。
         // [批 3b-D7] 输出根所属会话 = 本方法的主会话参数（显式；⛔ 不再由下游读 MDC）
         String outputFile = com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
@@ -380,31 +605,191 @@ public class ResumeService {
     // ────────────────────────────────────────────────────────────────────────
 
     /**
-     * stoppedByUser 门 · 对齐 CC {@code uo()} 的
-     * {@code (s?.stoppedByUser || 伴生标记) && y?.kind !== "observer-activity"} → {@code !J} 抛错。
+     * stoppedByUser 门 · 对齐 CC 偏移 333967189：
+     * {@code (meta.stoppedByUser || 伴生文件 found) && !userInitiated && !lineage} → 抛错
+     * （{@code origin.kind !== "observer-activity"} 的例外在本仓由 observer 走另一条 resume 路径天然满足）。
      *
-     * <p>用户显式发起（{@code userInitiated=true}）一律放行；自动 resume 命中标记 → 拒绝，
-     * 文案逐字取 CC {@code jgr()}（{@code AgentStoppedByUserError}）。
+     * <p>用户显式发起（{@code userInitiated=true}）一律放行；{@code lineage=true}（同一血统续跑）
+     * 时 CC 连伴生探测都跳过（{@code he=...{found:false}}）⇒ 本方法直接返回，不读盘。
      */
     static void verifyNotStoppedByUser(Path sessionDir, String sessionId,
                                        String agentIdHex, String agentIdStr, boolean userInitiated) {
-        if (userInitiated) {
+        verifyNotStoppedByUser(sessionDir, sessionId, agentIdHex, agentIdStr,
+            userInitiated, false, false);
+    }
+
+    /**
+     * 6 参门（含 lineage 与内存标记）。
+     *
+     * @param memoryStopped 内存 {@code stoppedByUser}（{@link StopMarkers}）；lineage=true 时不使用
+     */
+    static void verifyNotStoppedByUser(Path sessionDir, String sessionId,
+                                       String agentIdHex, String agentIdStr,
+                                       boolean userInitiated, boolean lineage,
+                                       boolean memoryStopped) {
+        if (userInitiated || lineage) {
             return;
         }
-        if (!isStoppedByUser(sessionDir, sessionId, agentIdHex, agentIdStr)) {
+        if (!memoryStopped && !isStoppedByUser(sessionDir, sessionId, agentIdHex, agentIdStr)) {
             return;
         }
         throw new ResumeErrorCode.ResumeException(
             ResumeErrorCode.AGENT_STOPPED_BY_USER,
-            "Agent " + agentIdStr + " was stopped and won't be resumed. "
-                + "Treat its work as cancelled; only launch a new agent if the user explicitly asks.");
+            ResumeErrorCode.stoppedByUserText(agentIdStr));
     }
 
-    /** stopped-by-user 标记双键查找（a+16hex 新格式优先，UUID 旧格式兜底）。 */
+    /** stopped-by-user 标记双键查找（a+16hex 新格式优先，UUID 旧格式兜底；含 meta.stoppedByUser）。 */
     static boolean isStoppedByUser(Path sessionDir, String sessionId,
                                    String agentIdHex, String agentIdStr) {
-        return AgentTranscript.isStoppedByUser(sessionDir, sessionId, agentIdHex)
-            || AgentTranscript.isStoppedByUser(sessionDir, sessionId, agentIdStr);
+        return AgentTranscript.isStoppedByUserOrMeta(sessionDir, sessionId, agentIdHex)
+            || AgentTranscript.isStoppedByUserOrMeta(sessionDir, sessionId, agentIdStr);
+    }
+
+    /**
+     * teammate 重拉的历史重放 · 对齐 CC {@code resumeInProcessTeammate}
+     * （claude.exe 2.1.328 偏移 356099332：{@code rwe} 读 transcript → 同一变形链）。
+     *
+     * <p>与 subagent resume 的差异只在「谁来跑」：teammate 走同会话 in-process 重拉，
+     * 但<b>恢复起点完全相同</b> —— 末尾不完整轮截断（{@code oKt}）+ 三层过滤 + 未闭合
+     * tool_use 补 {@code is_error}（{@code ure}），⛔ 不是「只拿最后一条」。
+     *
+     * @param sessionDir 会话目录根
+     * @param sessionId  会话 ID
+     * @param agentId    teammate agentId（{@code name@team}，即 transcript 键）
+     * @return 可直接作为 {@code resumeMessages} 重放的消息列表；无 transcript → 空列表
+     *         （调用方文案走 {@code (no prior transcript)} 变体）
+     */
+    public static List<AgentMessage> loadTeammateResumeMessages(Path sessionDir, String sessionId,
+                                                                String agentId) {
+        if (sessionDir == null || sessionId == null || agentId == null || agentId.isBlank()) {
+            return List.of();
+        }
+        Optional<AgentTranscript.AgentTranscriptResult> transcriptOpt =
+            AgentTranscript.getAgentTranscript(sessionDir, sessionId, agentId);
+        if (transcriptOpt.isEmpty()) {
+            return List.of();
+        }
+        List<AgentMessage> truncated = truncateIncompleteTail(transcriptOpt.get().messages());
+        List<AgentMessage> filtered = MessageFilters.filterWhitespaceOnlyAssistantMessages(
+            MessageFilters.filterOrphanedThinkingOnlyMessages(
+                MessageFilters.filterUnresolvedToolUses(truncated)));
+        List<AgentMessage> resumed = fillInterruptedToolResults(filtered);
+        log.info("[ResumeService] teammate 重放历史已装配: agentId={} transcript={} → 重放 {} 条 "
+                + "(CC resumeInProcessTeammate: 整段重放，非最后一条)",
+            agentId, transcriptOpt.get().messages().size(), resumed.size());
+        return resumed;
+    }
+
+    // ────────────────────────────────────────────────────────────────────────
+    // 恢复起点 · 对齐 CC oKt（末尾不完整轮截断）+ ure（未闭合 tool_use 补 is_error）
+    // ────────────────────────────────────────────────────────────────────────
+
+    /**
+     * 切掉 transcript 末尾「不完整的一轮」· 对齐 CC {@code oKt(msgs)}（偏移 333977 区）。
+     *
+     * <p>CC 判据（从尾部回退到最后一个完整边界）：
+     * <ul>
+     *   <li>{@code user}/{@code tool}（CC 的 user 行含 tool_result 块）本身就是边界；</li>
+     *   <li>{@code assistant} 必须 {@code stop_reason === null || "tool_use"} 且非 apiError；
+     *       本仓无 stop_reason 字段 ⇒ 等价判据 = 非 apiError 且（有正文 或 其 tool_use 全部有结果）；</li>
+     *   <li>纯空白 / 孤立 thinking 的 assistant 不是边界（后面会被三层过滤丢弃）。</li>
+     * </ul>
+     * 只保留边界及其之前的历史；被切掉的尾部（如只发出 tool_use 就被中断的 assistant）
+     * 不参与重放。CC 把非会话行搬回尾部，本仓 transcript 结构下直接截断即可。
+     */
+    static List<AgentMessage> truncateIncompleteTail(List<AgentMessage> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return messages == null ? List.of() : messages;
+        }
+        Set<String> resultIds = new HashSet<>();
+        for (AgentMessage m : messages) {
+            if ("tool".equals(m.role()) && m.toolCallId() != null) {
+                resultIds.add(m.toolCallId());
+            }
+        }
+        int keep = 0;
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            if (isCompleteBoundary(messages.get(i), resultIds)) {
+                keep = i + 1;
+                break;
+            }
+        }
+        if (keep == messages.size()) {
+            return messages;
+        }
+        log.info("[ResumeService] transcript 末尾不完整轮已截断: {} → {} 条 (CC oKt)", messages.size(), keep);
+        return new ArrayList<>(messages.subList(0, keep));
+    }
+
+    private static boolean isCompleteBoundary(AgentMessage m, Set<String> resultIds) {
+        String role = m.role();
+        if ("user".equals(role) || "tool".equals(role)) {
+            return true;
+        }
+        if (!"assistant".equals(role)) {
+            return false;
+        }
+        if (m.isApiError()) {
+            return false;
+        }
+        boolean hasBody = m.content() != null && !m.content().isBlank();
+        List<AgentMessage.ToolCallInfo> calls = m.toolCalls();
+        boolean callsResolved = true;
+        if (calls != null) {
+            for (AgentMessage.ToolCallInfo call : calls) {
+                if (call.id() != null && !resultIds.contains(call.id())) {
+                    callsResolved = false;
+                    break;
+                }
+            }
+        }
+        if (hasBody) {
+            return true;
+        }
+        return calls != null && !calls.isEmpty() && callsResolved;
+    }
+
+    /**
+     * 为「重放时已丢失」的 tool_use 补 {@code tool_result{is_error:true}} · 对齐 CC
+     * {@code ure()}：内容 {@code A call of <name> that a restart lost was refused. Do not make it again.}
+     * （CC toolDenialKind="interrupted"；本仓 AgentMessage.isApiError=true 承载 is_error）。
+     *
+     * <p>WHY：已执行的工具<b>不重跑</b>；没有结果的 tool_use 若原样重放，会被 API 判为
+     * 「assistant 声明了工具但缺结果」而直接失败 —— 补一条拒绝结果既是合法消息，也把
+     * 「这次调用丢了」如实告诉模型。
+     */
+    static List<AgentMessage> fillInterruptedToolResults(List<AgentMessage> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return messages == null ? List.of() : messages;
+        }
+        Set<String> resolved = new HashSet<>();
+        for (AgentMessage m : messages) {
+            if ("tool".equals(m.role()) && m.toolCallId() != null) {
+                resolved.add(m.toolCallId());
+            }
+        }
+        List<AgentMessage> out = new ArrayList<>(messages);
+        int filled = 0;
+        for (AgentMessage m : messages) {
+            if (m.toolCalls() == null) {
+                continue;
+            }
+            for (AgentMessage.ToolCallInfo call : m.toolCalls()) {
+                if (call.id() == null || !resolved.add(call.id())) {
+                    continue;
+                }
+                String text = "A call of " + (call.name() == null ? "tool" : call.name())
+                    + " that a restart lost was refused. Do not make it again.";
+                out.add(new AgentMessage("tool", text, true, m.agentId(), true,
+                    java.util.UUID.randomUUID().toString(), m.uuid(),
+                    List.of(), call.id(), m.timestamp(), null));
+                filled++;
+            }
+        }
+        if (filled > 0) {
+            log.info("[ResumeService] 为 {} 个丢失的 tool_use 补 is_error 结果 (CC ure/interrupted)", filled);
+        }
+        return out;
     }
 
     /**
@@ -755,28 +1140,19 @@ public class ResumeService {
      *                  项目 / <b>无法判定</b>（回源器未接线、抛错、违约返回 null）⇒ <b>fail-loud 抛</b>
      *                  （⛔ 不是「回落 user.dir 兜底层」）
      */
-    /**
-     * 解析 agentId 字符串为 resume 入参 UUID · 对齐 CC {@code asAgentId}（ids.ts:31-33）。
-     *
-     * <p>支持两种形态：{@code a+16hex}（现代 spawn 键）与 legacy UUID 字符串。
-     * 无法解析 → null（调用方按「不可 resume」处理，fail loud）。
-     */
-    public static java.util.UUID parseAgentIdString(String agentId) {
-        if (agentId == null || agentId.isBlank()) {
-            return null;
-        }
-        try {
-            return AgentContext.packAgentId(agentId.trim());
-        } catch (Exception ignored) {
-        }
-        try {
-            return java.util.UUID.fromString(agentId.trim());
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
     public static Path resolveSessionDir(String sessionId) {
         return com.nexusai.application.agent.tool.SessionStorage.sessionProjectDir(sessionId);
+    }
+
+    /**
+     * 解析 agentId 字符串为 resume 入参键 · 对齐 CC {@code asAgentId}（ids.ts:31-33）。
+     *
+     * <p>a+16hex 原样；其它非空串原样（诚实降级，查不到 transcript 即抛 transcriptMissing）；
+     * null/空白 → null（调用方按「不可 resume」处理，fail loud）。
+     *
+     * <p><b>Breaking</b>：旧 UUID 键不再还原成 a+16hex（按 CC 单一形态；旧数据不可恢复）。
+     */
+    public static String parseAgentIdString(String agentId) {
+        return AgentContext.canonicalAgentId(agentId);
     }
 }

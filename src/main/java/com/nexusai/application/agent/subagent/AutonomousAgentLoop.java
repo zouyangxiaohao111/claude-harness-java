@@ -30,9 +30,6 @@ import java.util.Optional;
 import java.util.Set;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
-import java.util.concurrent.Executors;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.TimeUnit;
 
 /**
  * s17-P1-1/2/4/5 最小可行实现 · 对齐 CC services/team/inProcessRunner.ts:689-868.
@@ -74,7 +71,9 @@ public class AutonomousAgentLoop {
     /** s17-P1-2: CC idle_poll 最大持续时间 (60s 后强制 sleep) */
     public static final long IDLE_POLL_MAX_MS = 60_000;
 
-    /** W8-01: kill 后延迟 evict 终端任务 (对齐 CC STOPPED_DISPLAY_MS framework.ts:25=3_000) */
+    /** W8-01: kill 后延迟 evict 展示窗口（CC framework.ts:25 STOPPED_DISPLAY_MS=3_000）。
+     *  <p>[B1 逐出对齐] 生产路径已改为「终态 → {@link #terminalSink} → registry 30s 管线」
+     *  （CC evictAfter=now+30000）；本常量仅保留给未接线终态回调的直构场景（单测/教学）参考。 */
     public static final long STOPPED_DISPLAY_MS = 3_000;
 
     @Autowired private AgentMessageBus messageBus;
@@ -179,6 +178,13 @@ public class AutonomousAgentLoop {
      *  可选注入, 未注入时 runOneTurn 仅记录 (测试/教学回退) */
     private volatile com.nexusai.application.agent.tool.impl.SubagentExecutor subagentExecutor;
 
+    /**
+     * [B3 重拉] 首轮重放历史 · 对齐 CC {@code resumeInProcessTeammate} 的 {@code resumeMessages}
+     * （claude.exe 2.1.328 偏移 356099332）。只在<b>第一轮</b>被 {@link #consumeResumeMessagesOnce()}
+     * 取走一次（之后置 null），⇒ 后续轮不会重复注入历史。
+     */
+    private volatile java.util.List<AgentMessage> resumeMessages;
+
     /** W8-02 REWORK: team 文件工具 · kill 时 removeMemberByAgentId（CC spawnInProcess.ts:302-304） */
     private volatile TeamHelpers teamHelpers;
 
@@ -195,13 +201,14 @@ public class AutonomousAgentLoop {
     /** shutdown 标志 (避免阻塞 poll) */
     private volatile boolean shutdownRequested = false;
 
-    /** W8-01: kill 后延迟 evict 调度器 */
-    private final ScheduledExecutorService evictScheduler =
-        Executors.newSingleThreadScheduledExecutor(r -> {
-            Thread t = new Thread(r, "teammate-evict");
-            t.setDaemon(true);
-            return t;
-        });
+    /**
+     * [B1 逐出] 终态回调 · 生产由 {@link com.nexusai.application.agent.team.SpawnInProcess}
+     * 接线到 {@link com.nexusai.application.agent.team.InProcessTeammateTaskRegistry#onTerminal}
+     * —— registry 负责固定的「task evict → registry remove → retire → release quota」顺序与
+     * CC 的 30s 展示窗口。未接线（直构单测）→ 保持旧行为（completed/failed eager evict、
+     * killed 不 evict）。
+     */
+    private volatile com.nexusai.application.agent.team.InProcessTeammateTaskRegistry.TerminalSink terminalSink;
 
     /**
      * W8-04: 出站消息 sink · 对齐 CC runner 终端转换后 task_status attachment 进入 transcript。
@@ -293,6 +300,19 @@ public class AutonomousAgentLoop {
         this.subagentExecutor = subagentExecutor;
     }
 
+    /** 测试/接线用 setter：[B3 重拉] 首轮重放的 transcript 历史（空/null = 首次 spawn）。 */
+    public void setResumeMessages(java.util.List<AgentMessage> resumeMessages) {
+        this.resumeMessages = (resumeMessages == null || resumeMessages.isEmpty())
+            ? null : new ArrayList<>(resumeMessages);
+    }
+
+    /** 取走首轮重放历史（只生效一次）· 线程安全：runner 线程启动后只调用一次。 */
+    private synchronized java.util.List<AgentMessage> consumeResumeMessagesOnce() {
+        java.util.List<AgentMessage> current = resumeMessages;
+        resumeMessages = null;
+        return current;
+    }
+
     /** W8-02 REWORK: 测试/接线用 setter (team 文件工具 · kill 成员移除). */
     public void setTeamHelpers(TeamHelpers teamHelpers) {
         this.teamHelpers = teamHelpers;
@@ -316,6 +336,12 @@ public class AutonomousAgentLoop {
     /** W8-01: 当前状态载体 (测试/诊断). */
     public com.nexusai.application.agent.team.InProcessTeammateTaskState taskState() {
         return taskState;
+    }
+
+    /** [B1 逐出] 测试/接线用 setter（终态回调 · registry 逐出管线）。 */
+    public void setTerminalSink(
+            com.nexusai.application.agent.team.InProcessTeammateTaskRegistry.TerminalSink terminalSink) {
+        this.terminalSink = terminalSink;
     }
 
     /** W8-02: 当前消息镜像 (测试/诊断). */
@@ -774,13 +800,13 @@ public class AutonomousAgentLoop {
      *
      * <p>守卫 (:239-247): task 存在 && type==='in_process_teammate' && status==='running'
      * 否则 no-op。abortController.abort() (:256) → 状态 killed + notified:true + endTime
-     * (:280-296) → evictTaskOutput + emitTaskTerminatedSdk('stopped') + 3s 后 evictTerminalTask
-     * (:306-319, STOPPED_DISPLAY_MS)。notified:true 预置抑制 XML 通知 (:308)。
+     * (:280-296) → evictTaskOutput + emitTaskTerminatedSdk('stopped') → 终态回调
+     * (terminalSink → registry 按 CC evictAfter=now+30000 统一逐出)。notified:true 预置抑制 XML 通知 (:308)。
      *
      * <p>W8-02 REWORK：
      * <ul>
-     *   <li><b>GAP-3 去双 evict</b>：kill 仅延迟 3s evict（CC :316-319）；transitionToTerminal
-     *       对 KILLED 不再 eager evict（对照 completed/failed 才 eager evict :1453/:1506）。</li>
+     *   <li><b>GAP-3 去双 evict</b>：[B1] 所有终态统一交 terminalSink（registry 30s 管线）；
+     *       未接线（直构单测）时才回落旧语义（KILLED 不 eager evict，completed/failed eager）。</li>
      *   <li><b>GAP-4 removeMemberByAgentId</b>：kill 后从 team 文件移除成员（CC :302-304），
      *       否则 Team 文件成员残留。</li>
      * </ul>
@@ -822,11 +848,9 @@ public class AutonomousAgentLoop {
                     log.warn("[AutonomousAgentLoop] kill 移除 team 成员失败 agent={}: {}", agentId, e.getMessage());
                 }
             }
-            // CC :318-319 3s 后 evictTerminalTask (STOPPED_DISPLAY_MS)
-            String evictTaskId = taskId;
-            evictScheduler.schedule(
-                () -> taskFrameworkService.evictTerminalTask(evictTaskId),
-                STOPPED_DISPLAY_MS, TimeUnit.MILLISECONDS);
+            // [B1 逐出] 原「3s 后 evictTerminalTask」已删：终态统一交给 terminalSink（生产 =
+            //   registry.onTerminal）按 CC evictAfter=now+30000 走固定顺序管线
+            //   task evict → registry remove → retire → release quota。
         }
         return advanced;
     }
@@ -838,7 +862,8 @@ public class AutonomousAgentLoop {
      * 不覆盖、不发 SDK (防 killed→completed 翻转 + 双发 bookend)。
      * 推进语义: notified:true + endTime + 清 runtime 字段 (abortController) →
      * {@link TaskFrameworkService#updateTaskState} → {@link SdkEventQueue#emitTaskTerminatedSdk}
-     * ('completed'/'failed'/'stopped') → {@link TaskFrameworkService#evictTerminalTask}。
+     * ('completed'/'failed'/'stopped') → terminalSink（生产 = registry 30s 逐出管线；
+     *    未接线 → completed/failed 直接 {@link TaskFrameworkService#evictTerminalTask}）。
      *
      * <p>W8-02 REWORK（对齐 CC 实际源码，grep 自验）：
      * <ul>
@@ -847,9 +872,8 @@ public class AutonomousAgentLoop {
      *       否则 leader 经 waitForIdle 注册回调后 teammate 被 kill/complete/fail 时永久阻塞。</li>
      *   <li><b>GAP-2 error 落盘</b>：failed 时 error 追加到 BackgroundTask 描述（持久层暴露
      *       失败现场，CC failed:1490 error: errorMessage）；taskState.error 落盘在 {@link #fail}。</li>
-     *   <li><b>GAP-3 evict 语义</b>：completed/failed eager evict（CC :1453/:1506）；<b>killed 仅
-     *       延迟 evict</b>（CC spawnInProcess.ts:316-319，STOPPED_DISPLAY_MS 展示窗口）——立即
-     *       evict 使窗口失效、延迟 evict 变 no-op。</li>
+     *   <li><b>GAP-3 evict 语义</b>：[B1] 生产由 terminalSink → registry 统一 30s 后逐出
+     *       （CC evictAfter=now+30000，含 retired/配额释放）；未接线时才回落旧 eager 语义。</li>
      * </ul>
      *
      * @param status      目标终态
@@ -921,8 +945,13 @@ public class AutonomousAgentLoop {
                 log.warn("[AutonomousAgentLoop] teammate task_status attachment 出站失败: {}", e.getMessage());
             }
         }
-        // GAP-3: killed 仅延迟 evict（kill() 已调度 3s）；completed/failed eager evict（CC :1453/:1506）
-        if (status != BackgroundTaskStatus.KILLED) {
+        // [B1 逐出] 终态不在这里直接 evict：交给 terminalSink 登记 CC 的 30s 延迟管线
+        //   （task evict → registry remove → retire → release quota）。
+        //   未接线（直构单测）→ 保持旧行为：completed/failed eager evict；killed 保留展示窗口。
+        if (terminalSink != null) {
+            terminalSink.onTerminal(taskId, status.getStatusString(),
+                status == BackgroundTaskStatus.KILLED ? "killed" : null);
+        } else if (status != BackgroundTaskStatus.KILLED) {
             taskFrameworkService.evictTerminalTask(taskId);
         }
         return true;
@@ -1232,11 +1261,19 @@ public class AutonomousAgentLoop {
         //   直带（SubagentExecutor:1489 forkParams != null ? contentReplacementState() : null →
         //   runSubagentQueryLoop → injectContentReplacementState 注入 query loop session state，跨 turn 复用同一实例）。
         //   null（feature off）→ forkParams=null（CC :1043-1045 undefined，loop 每轮 fresh create）。
+        // [B3 重拉] 首轮把 transcript 历史装进 resume 通道（CC resumeInProcessTeammate 的
+        //   resumeMessages → runAgent 的 initialMessages = [...resumedMessages, prompt]）。
+        //   只消费一次：后续轮 replayMessages=null ⇒ 不重复注入。
+        java.util.List<AgentMessage> replayMessages = consumeResumeMessagesOnce();
         com.nexusai.application.agent.tool.impl.SubagentExecutor.ForkPathParams forkParams =
-            contentReplacementState != null
+            (replayMessages != null || contentReplacementState != null)
                 ? new com.nexusai.application.agent.tool.impl.SubagentExecutor.ForkPathParams(
-                    null, null, "", null, null, null, null, contentReplacementState)
+                    null, null, "", null, replayMessages, null, null, contentReplacementState)
                 : null;
+        if (replayMessages != null) {
+            log.info("[AutonomousAgentLoop] [B3] 首轮重放 transcript 历史 agent={} 条数={} "
+                + "（CC resumeInProcessTeammate: resumedMessages + 本条 prompt）", agentId, replayMessages.size());
+        }
         // GAP-2: 不再吞异常 —— 执行失败向上传播，runTeammateLoop catch → fail()
         //        （对齐 CC runInProcessTeammate try/catch :1465-1533 failed 终端转换）
         // Fix A（根因）: subagentType 必须恒 null（teammate 名如 'alice' 不得当 subagentType）——

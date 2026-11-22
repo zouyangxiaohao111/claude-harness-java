@@ -46,7 +46,7 @@ class TucAgentContextCarrierTest {
     @DisplayName("[批 5b-1] TUC 派生链（withXxx/copyWith/with）恒透传 agentContext")
     void witherChain_preservesAgentContext() {
         AgentContext.SubagentContext sub = subCtx("req_wither", "spawn");
-        ToolUseContext base = ToolUseContext.of(UUID.randomUUID(), "sess-x").withAgentContext(sub);
+        ToolUseContext base = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x").withAgentContext(sub);
 
         // 生产派生链（per-turn TUC 由 toolExecContext 经这些 wither 派生）
         ToolUseContext derived = base
@@ -64,7 +64,7 @@ class TucAgentContextCarrierTest {
     @DisplayName("[批 5b-1] SubagentExecutor.withEffectiveCwd（Step 18 派生）恒透传 agentContext")
     void withEffectiveCwd_preservesAgentContext() {
         AgentContext.SubagentContext sub = subCtx("req_step18", "spawn");
-        ToolUseContext source = ToolUseContext.of(UUID.randomUUID(), "sess-x").withAgentContext(sub);
+        ToolUseContext source = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x").withAgentContext(sub);
 
         ToolUseContext derived = SubagentExecutor.withEffectiveCwd(source, Path.of(".").toAbsolutePath());
 
@@ -78,7 +78,7 @@ class TucAgentContextCarrierTest {
     @DisplayName("[批 5b-1] 真实 commonPool 线程可读 + sparse edge 恰好发射一次（同实例）")
     void agentContext_readableOnCommonPoolWorker_andConsumedOnce() throws Exception {
         AgentContext.SubagentContext sub = subCtx("req_worker", "spawn");
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-x").withAgentContext(sub);
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x").withAgentContext(sub);
         String testThread = Thread.currentThread().getName();
 
         // 真实无 executor 的 CompletableFuture ⇒ ForkJoinPool.commonPool worker

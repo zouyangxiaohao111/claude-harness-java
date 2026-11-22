@@ -81,7 +81,7 @@ class ReadFileStateReplayTest {
 
     /** 带 effectiveCwd 的最小 ToolUseContext（镜像 ReadFileToolTest.ctxWithCwd 的 12 参工厂）。 */
     private static ToolUseContext ctxWithCwd(Path workspace) throws Exception {
-        UUID agentId = UUID.nameUUIDFromBytes(("rfsr-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,

@@ -42,8 +42,11 @@ public final class ExternalAgentRunner {
 
     /** stderr 保留上限（诊断用，不塞进模型上下文）。 */
     private static final int STDERR_LIMIT = 8192;
-    /** 结论文本上限（对齐 DSH conductor head+tail 截断思路，留给模型的可读上限）。 */
-    private static final int RESULT_LIMIT = 20_000;
+    /**
+     * 结论文本上限（对齐 CC Agent 工具声明上限 {@code maxResultSizeChars:1e5}，头+尾截断）。
+     * <p>原值 20_000 只有 CC 的五分之一，长报告被截得看不懂；改为 100_000 与 CC 声明值一致。
+     */
+    private static final int RESULT_LIMIT = 100_000;
 
     private ExternalAgentRunner() {
     }

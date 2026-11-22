@@ -19,7 +19,6 @@ import org.mockito.Mockito;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -56,7 +55,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CanUseToolDispatchTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000000";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
 
     // ─────────────────────────────── 测试桩 ───────────────────────────────

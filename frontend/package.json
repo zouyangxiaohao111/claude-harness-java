@@ -1,6 +1,6 @@
 {
   "name": "nexusai-client",
-  "version": "0.1.83",
+  "version": "0.1.84",
   "description": "NexusAI Tauri Client",
   "type": "module",
   "scripts": {
@@ -17,6 +17,7 @@
     "@playwright/test": "^1.64.1",
     "@tauri-apps/cli": "^2.11.2",
     "@types/mdast": "^4.0.4",
+    "@types/qrcode": "^1.5.6",
     "@types/react": "^19.2.16",
     "@types/react-dom": "^19.2.3",
     "@types/sockjs-client": "^1.5.4",
@@ -66,6 +67,7 @@
     "micromark-util-types": "^2.0.2",
     "monaco-editor": "^0.56.0",
     "pdfjs-dist": "^6.3.289",
+    "qrcode": "^1.5.4",
     "react": "^19.2.7",
     "react-dom": "^19.2.7",
     "shiki": "^4.4.3",

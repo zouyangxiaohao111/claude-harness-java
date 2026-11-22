@@ -60,7 +60,7 @@ class ChangedFilesTailDeliveryTest {
     /** 生产同款 base TUC 最小形态（readFileState 走 compact ctor 兜底的新 FileStateCache）。 */
     private static ToolUseContext tuc(String sessionId) {
         return new ToolUseContext(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 

@@ -169,10 +169,8 @@ public class MainSessionBackgroundService {
         //   易失字段不入载体（W5-02a JavaDoc），服务侧 map 持有（R-1 abort 接线待办）
         taskAbortSignals.put(taskId, new AtomicBoolean(false));
 
-        // CC :132-141 agentId=taskId 合一（taskId 的 UUID 视图，隔离 sessionAgentStateRegistry）
-        // [session-id-short] taskId 合规 UUID → fromString；非 UUID（测试/兼容 taskId 串）→ 稳定 hash
-        // 兜底（对齐旧 parseSessionUuid 的 agentUuid 语义，agentId=taskId 归一与会话无关保持 UUID）。
-        UUID agentUuid = taskAgentId(taskId);
+        // [agentid-cc-align] CC agentId=taskId 合一，且都是同一 String（a+16hex），不再造 UUID 视图。
+        String agentUuid = taskId;
         BackgroundTask projection = new BackgroundTask(
             taskId,
             TaskType.LOCAL_AGENT,
@@ -292,7 +290,7 @@ public class MainSessionBackgroundService {
 
         // ② 真中断 (a)：registry 在飞 AgentState 硬断流 —— 与 ChatService.cancelSession 同一路径。
         //    agentUuid 与注册侧同源同参（见 javadoc「agentUuid 取法」）。
-        UUID agentUuid = taskAgentId(taskId);
+        String agentUuid = taskId;
         if (sessionAgentStateRegistry == null) {
             // required=false 注入不到（非 Spring 单测 / 裁剪环境）：只能置终态 —— 必须 ≥WARN，
             //   否则「卡片已停止、后台仍在烧 token」的假绿无人察觉。
@@ -478,6 +476,10 @@ public class MainSessionBackgroundService {
         //   与 ToolUseContext 其他字段同一通道，不再依赖任何 ThreadLocal。
         try {
             LlmAgentLoop loop = loopProvider.getObject();
+            // [non-interactive 2026-11-20] 主会话后台化派生查询 = 后台会话（无人在键盘前交互）
+            //   ⇒ 显式置非交互：结构化输出注入门（jsonSchema 且 非交互/后台）据此放行。
+            //   prototype bean ⇒ 标志不跨 run 泄漏。
+            loop.setNonInteractiveSession(true);
             // w5-01 隔离设计 1：任务级独立 topic /topic/tasks/{taskId}/stream
             // [IMP-A · F6] 透传真实 sessionId —— 后台 loop 经 streamSessionId 解析会话
             //   projectRoot（F1 冻结：resolveSessionProjectRoot 先查 SessionProjectRoot
@@ -485,7 +487,7 @@ public class MainSessionBackgroundService {
             loop.setTaskStreamContext(wsTemplate, taskId, sessionId);
             // [session-id-short] sessionId 已 short 直传；agentUuid 由 taskId（合规 UUID）解析
             String sessionUuid = sessionId;
-            UUID agentUuid = taskAgentId(taskId); // CC agentId=taskId（:132）
+            String agentUuid = taskId; // CC agentId=taskId（:132）
             ProviderConfig cfg = (config != null) ? config : ProviderConfig.empty();
             // [IMP2-10 · MISS-2 · OD-13] taskBudget 生产注入：本入口无请求参数通道
             //   （后台派生查询），来源链 = 配置 nexusai.agent.task-budget.total → 默认值；恒非 null。

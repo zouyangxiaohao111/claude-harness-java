@@ -705,11 +705,12 @@ class ExecAgentHookSemanticsTest {
     void enforcementHook_within5s_stillEnforces() {
         // WHY: CC registerStructuredOutputEnforcement 注册 Stop 函数 hook, callback 返回 false → blocking 重入
         // loop（注入 "You MUST call StructuredOutput"）。5s 内未满足条件必须继续强制。
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         com.nexusai.application.agent.AgentState state =
-            new com.nexusai.application.agent.AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), hookAgentId);
+            new com.nexusai.application.agent.AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+                hookAgentId);
         state.appendMessage(assistantWithToolCall("toolu-read", "Read"));  // 未调 StructuredOutput
-        HookEvent event = HookEvent.stop("sess", hookAgentId.toString(), false, null);
+        HookEvent event = HookEvent.stop("sess", hookAgentId, false, null);
 
         GenericHook.HookResult r = new StructuredOutputEnforcementHook(hookAgentId, state).onEvent(event);
 
@@ -726,11 +727,12 @@ class ExecAgentHookSemanticsTest {
         //   原 Java 独有 MAX_BLOCKING_ATTEMPTS=5 兜底已删除（DEL-PROBE 裁决: CC 无此能力）。loop 重入
         //   有界性由外层 ExecAgentHook.MAX_AGENT_TURNS=50 计数器 + 60s 整体超时承担（execAgentHook.ts:197-207），
         //   enforcement hook 自身不得早退放行 —— 超过旧上限后仍须强制，否则未成功就放行 = 对齐偏移。
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         com.nexusai.application.agent.AgentState state =
-            new com.nexusai.application.agent.AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), hookAgentId);
+            new com.nexusai.application.agent.AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+                hookAgentId);
         state.appendMessage(assistantWithToolCall("toolu-read", "Read"));  // 仍未调 StructuredOutput
-        HookEvent event = HookEvent.stop("sess", hookAgentId.toString(), false, null);
+        HookEvent event = HookEvent.stop("sess", hookAgentId, false, null);
 
         StructuredOutputEnforcementHook hook = new StructuredOutputEnforcementHook(hookAgentId, state);
         for (int i = 1; i <= 10; i++) {  // 远超旧上限 5: 第 6..10 次仍必须强制重入

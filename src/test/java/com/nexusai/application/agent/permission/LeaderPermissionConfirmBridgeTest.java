@@ -170,10 +170,11 @@ class LeaderPermissionConfirmBridgeTest {
             return next;
         });
 
-        boolean consumed = bridge.onResponse("tool-use-2", "allow", List.of(),
-                null, List.of(), null, null);
+        LeaderPermissionConfirmBridge.ResponseResult consumed = bridge.onResponse(LEAD_SESSION,
+                "tool-use-2", "allow", List.of(), null, List.of(), null, null);
 
-        assertThat(consumed).as("命中本桥 entry → 消费").isTrue();
+        assertThat(consumed).as("命中本桥 entry 且归属匹配 → 消费")
+                .isEqualTo(LeaderPermissionConfirmBridge.ResponseResult.CONSUMED);
         assertThat(allow.get()).as("allow → onAllow(updatedInput)").isEqualTo(input);
         assertThat(reject.get()).isNull();
         assertThat(abort.get()).isFalse();
@@ -195,10 +196,10 @@ class LeaderPermissionConfirmBridgeTest {
             return next;
         });
 
-        boolean consumed = bridge.onResponse("tool-use-3", "deny", null,
-                "dangerous", List.of(), null, null);
+        LeaderPermissionConfirmBridge.ResponseResult consumed = bridge.onResponse(LEAD_SESSION,
+                "tool-use-3", "deny", null, "dangerous", List.of(), null, null);
 
-        assertThat(consumed).isTrue();
+        assertThat(consumed).isEqualTo(LeaderPermissionConfirmBridge.ResponseResult.CONSUMED);
         assertThat(reject.get()).as("deny → onReject(feedback)").isEqualTo("dangerous");
         assertThat(allow.get()).isNull();
     }
@@ -209,8 +210,9 @@ class LeaderPermissionConfirmBridgeTest {
         newBridgeWithWs();
         bridge.registerSetter(LEAD_SESSION);
         // 不推任何 entry
-        boolean consumed = bridge.onResponse("main-loop-tool-block-id", "allow", List.of(),
-                null, List.of(), null, null);
-        assertThat(consumed).as("非本桥请求（主 loop ToolUseBlock.id）→ 不消费，交 prompter").isFalse();
+        LeaderPermissionConfirmBridge.ResponseResult consumed = bridge.onResponse(LEAD_SESSION,
+                "main-loop-tool-block-id", "allow", List.of(), null, List.of(), null, null);
+        assertThat(consumed).as("非本桥请求（主 loop ToolUseBlock.id）→ 不消费，交 prompter")
+                .isEqualTo(LeaderPermissionConfirmBridge.ResponseResult.NOT_FOUND);
     }
 }

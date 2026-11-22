@@ -188,7 +188,7 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
         registerStuckSkill();          // CC :34（ant 门控）
         registerUltracodeSkill();      // CC bundled/index.ts:39（ultracode.ts:219，无条件注册，无 isEnabled gate）
         registerImportCcSkill();       // NexusAI 扩展 · /import-cc 一键导入 CC 技能/插件（无条件注册，无 isEnabled gate）
-        registerInstallSkill();        // NexusAI 扩展 · /install-skill 从插件市场浏览并安装技能（无条件注册）
+        registerInstallPluginSkill();  // NexusAI 扩展 · /install-plugin 装能力总入口（插件/MCP/技能，别名 install-skill；无条件注册）
         registerCronListSkill();       // CC bundled/index.ts:40（cronManage.ts:8，isEnabled=isKairosCronEnabled）
         registerCronDeleteSkill();     // CC bundled/index.ts:41（cronManage.ts:27，isEnabled=isKairosCronEnabled）
         // CC :35-45 KAIROS|KAIROS_DREAM(dream) / :41-45 REVIEW_ARTIFACT(hunter) — DEC-15 空壳不注册
@@ -362,11 +362,12 @@ public class BundledSkillsBootstrapper implements ApplicationRunner {
         registerSkill("import-cc", () -> new ImportCcSkillRegistrar().register(this::register));
     }
 
-    private void registerInstallSkill() {
-        // /install-skill · NexusAI 扩展（非 CC bundled）：模型可浏览市场清单并安装技能；
+    private void registerInstallPluginSkill() {
+        // /install-plugin · NexusAI 扩展（非 CC bundled）：装能力总入口 —— 市场插件、MCP server、
+        //   散装技能包；别名 install-skill 保留兼容（历史会话里的 /install-skill 仍能调起）。
         //   提示词强制 AskUserQuestion 确认、不执行包内脚本、安装落点由注册期注入
         //   （{configHome}/skills 与 .{appName}/skills，均在 SkillChangeDetector 监听集合内）。
-        registerSkill("install-skill", () -> register(new InstallSkillRegistrar().register()));
+        registerSkill("install-plugin", () -> register(new InstallPluginRegistrar().register()));
     }
 
     private void registerCronListSkill() {

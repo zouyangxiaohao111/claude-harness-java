@@ -50,7 +50,7 @@ class BashToolForegroundTaskAgentIdTest {
     private static final String SESSION = "sess-fg-agentid";
 
     /** 子代理 ctx（agentId 非 null —— CC 只有子代理 context 才带 agentId，Tool.ts:245） */
-    private static ToolUseContext subagentCtx(UUID agentId) {
+    private static ToolUseContext subagentCtx(String agentId) {
         return new ToolUseContext(agentId, SESSION, PermissionMode.DEFAULT, Map.of(), List.of());
     }
 
@@ -59,7 +59,7 @@ class BashToolForegroundTaskAgentIdTest {
         return new ToolUseContext(null, SESSION, PermissionMode.DEFAULT, Map.of(), List.of());
     }
 
-    private static BackgroundTask build(UUID agentId) {
+    private static BackgroundTask build(String agentId) {
         String taskId = TaskIdGenerator.generate(TaskType.LOCAL_BASH);
         return BashTool.buildForegroundTask(
             taskId, "sleep 1", "tu-" + taskId,
@@ -69,7 +69,7 @@ class BashToolForegroundTaskAgentIdTest {
     @Test
     @DisplayName("调用方 ctx.agentId 非 null ⇒ 前台登记出的 BackgroundTask 携带该 agentId")
     void foregroundTask_carriesCallingAgentId() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         BackgroundTask fg = build(agentId);
 
@@ -110,7 +110,7 @@ class BashToolForegroundTaskAgentIdTest {
     @Test
     @DisplayName("归属透到终态通知：registerForeground → cancel(markKilled) 入队的 agentId = 调用方 agentId")
     void attribution_reachesEnqueuedTerminalNotification() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(
             queue, new TaskFrameworkService(null));
@@ -126,7 +126,7 @@ class BashToolForegroundTaskAgentIdTest {
         assertThat(enqueued).hasSize(1);
         assertThat(enqueued.get(0).agentId())
             .as("终止通知必须回归属代理，否则主线程规则把它截给主会话")
-            .isEqualTo(agentId.toString());
+            .isEqualTo(agentId);
         assertThat(enqueued.get(0).mode()).isEqualTo(NotificationQueue.MODE_TASK_NOTIFICATION);
     }
 
@@ -177,7 +177,7 @@ class BashToolForegroundTaskAgentIdTest {
         Assumptions.assumeTrue(shellAvailable(),
             "需要可用 bash/zsh（Windows 走 Git Bash；ShellResolver.resolveShell 找不到则跳过）");
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(
             queue, new TaskFrameworkService(null));
@@ -210,7 +210,7 @@ class BashToolForegroundTaskAgentIdTest {
         assertThat(enqueued).hasSize(1);
         assertThat(enqueued.get(0).agentId())
             .as("完成回执必须回归属代理，否则 drainForQuery 主线程规则截给主会话")
-            .isEqualTo(agentId.toString());
+            .isEqualTo(agentId);
         assertThat(enqueued.get(0).mode()).isEqualTo(NotificationQueue.MODE_TASK_NOTIFICATION);
         t.interrupt();
     }
@@ -218,7 +218,7 @@ class BashToolForegroundTaskAgentIdTest {
     @Test
     @DisplayName("生产点②：转后台失败入队（completeForegroundBackgroundedTask catch 分支）agentId 归属正确")
     void backgroundedFailureEnqueue_carriesTaskAgentId() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(
             queue, new TaskFrameworkService(null));
@@ -256,14 +256,14 @@ class BashToolForegroundTaskAgentIdTest {
         assertThat(enqueued).hasSize(1);
         assertThat(enqueued.get(0).agentId())
             .as("失败回执同样必须回归属代理")
-            .isEqualTo(agentId.toString());
+            .isEqualTo(agentId);
         assertThat(enqueued.get(0).mode()).isEqualTo(NotificationQueue.MODE_TASK_NOTIFICATION);
     }
 
     @Test
     @DisplayName("生产点③：前台转后台 stall 入队（newStallWatchdog 回调）agentId 归属正确")
     void stallEnqueue_carriesTaskAgentId() throws Exception {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(
             queue, new TaskFrameworkService(null));
@@ -293,7 +293,7 @@ class BashToolForegroundTaskAgentIdTest {
         assertThat(enqueued).hasSize(1);
         assertThat(enqueued.get(0).agentId())
             .as("stall advisory 必须让归属代理看到，否则子代理以为命令还活着")
-            .isEqualTo(agentId.toString());
+            .isEqualTo(agentId);
         assertThat(enqueued.get(0).priority())
             .as("stall 走 NEXT（CC LocalShellTask.tsx:89-94 priority:'next'）")
             .isEqualTo(NotificationQueue.Priority.NEXT);

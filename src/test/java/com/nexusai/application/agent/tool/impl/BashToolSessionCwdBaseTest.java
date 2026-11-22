@@ -80,7 +80,7 @@ class BashToolSessionCwdBaseTest {
     @DisplayName("② 会话绑定 ctx ⇒ 基准 = 该会话项目根（不是进程 user.dir）")
     void effectiveCwd_sessionBound_returnsSessionRoot(@TempDir Path project) throws Exception {
         SessionProjectRoot.setForSession(SESSION, project.toString());
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), SESSION);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION);
 
         Path cwd = effectiveCwd(ctx);
 
@@ -108,7 +108,7 @@ class BashToolSessionCwdBaseTest {
     @DisplayName("④ sed 相对路径解析：会话绑定 ctx ⇒ 落在该会话项目根下；绝对路径原样")
     void resolveSedEditPath_sessionBound_underSessionRoot(@TempDir Path project) throws Exception {
         SessionProjectRoot.setForSession(SESSION, project.toString());
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), SESSION);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION);
 
         Path expectedRoot = Path.of(CwdResolution.normalizeCwd(project.toString()));
         assertThat(resolveSedEditPath("sub/out.txt", ctx))

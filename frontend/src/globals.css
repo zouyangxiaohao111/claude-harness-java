@@ -1,0 +1,20 @@
+
+/* ── 输入框右侧：IM 渠道入口（我们特有 · CC 用 ChannelsNotice 显示渠道连接态）── */
+.im-chan-pill {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  height: 26px;
+  padding: 0 9px;
+  border: 1px solid var(--hairline-strong);
+  border-radius: var(--r-pill, 9999px);
+  background: var(--canvas);
+  color: var(--ink-subtle);
+  font-size: 12px;
+  cursor: pointer;
+  flex: none;
+  white-space: nowrap;
+  transition: border-color .14s, color .14s, background .14s;
+}
+.im-chan-pill:hover { border-color: var(--accent); color: var(--accent); }
+.im-chan-pill.on { border-color: var(--accent); color: var(--accent); background: var(--accent-soft); }

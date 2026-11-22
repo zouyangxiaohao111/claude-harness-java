@@ -108,7 +108,7 @@ class SubagentExecutorAdditionalAgentsTest {
             com.nexusai.application.agent.subagent.createSubagentContext.create(
                 null,
                 new com.nexusai.application.agent.tool.ToolUseContext.SubagentContextOverrides(
-                    java.util.UUID.randomUUID(), "sdk-flag-agent", null,
+                    com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sdk-flag-agent", null,
                     null, null, null, null, null, null, null, null, null, null, null));
 
         assertThat(ctx).as("create() 必须返回非 null ToolUseContext").isNotNull();

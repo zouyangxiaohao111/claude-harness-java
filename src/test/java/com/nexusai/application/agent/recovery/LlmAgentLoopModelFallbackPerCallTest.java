@@ -163,7 +163,7 @@ class LlmAgentLoopModelFallbackPerCallTest {
             ProviderConfig.empty(), OPUS_ELIGIBLE, null, null, PER_CALL_A, null);
         QueryParams queryParams = QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, OPUS_ELIGIBLE, null, null,
             req.fallbackModel(), // DEC-RV-02 接线点：RunRequest.fallbackModel → QueryParams.fallbackModel

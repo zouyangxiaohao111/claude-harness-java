@@ -121,7 +121,7 @@ class AutonomousAgentLoopKillReleasesParkedToolTest {
                 ? abortControllerOverride : AbortController.NOOP;
             // ⚠ 本替身刻意仍用 NO_SESSION 哨兵构造工具 TUC：本用例验的是「kill 释放 park 住的工具」，
             //   与 teammate 会话归属无关；真实归属链由 TeammateLeaderSessionInheritanceTest 守。
-            ToolUseContext toolTuc = ToolUseContext.of(UUID.randomUUID(), NO_SESSION_SENTINEL,
+            ToolUseContext toolTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), NO_SESSION_SENTINEL,
                 PermissionMode.DEFAULT, List.of(), null, bridge);
             parked.countDown();
             // ↓↓↓ 这一段就是生产里 park 住的那一段（prompt 内部 future.get() 无超时）

@@ -385,7 +385,7 @@ public class ExitPlanModeTool implements Tool {
             log.debug("[ExitPlanModeTool] checkPermissions 返回 Ask('Exit plan mode?')（CC ExitPlanModeV2Tool.ts:234-238）");
         }
         // [plan-approval] 审批卡「执行方式」的可选项（对齐 CC buildPlanApprovalOptions）：
-        //   保留上下文执行 → setMode(acceptEdits)；手动逐次批准 → setMode(default)。
+        //   保留上下文执行 → setMode(acceptEdits)；手动批准编辑（CC: Yes, manually approve edits）→ setMode(default)。
         //   两者都是 SESSION 级（本次会话），与 CC 的 destination='session' 一致。
         //   用户点选后前端原样回传 updatedPermissions → onResponse 先 apply 再 complete，
         //   ExitPlanMode.execute 读到 mode != PLAN 即不再覆盖（CC 同序）。
@@ -403,6 +403,13 @@ public class ExitPlanModeTool implements Tool {
         if (ctx == null) {
             return ToolResult.error(call.id(), "ToolUseContext is required");
         }
+        // ── [C批 · 跨会话安全门禁] peer 回合恒拒绝：这是 prePlanMode=bypass 恢复提权路径 ──
+        //   必须在任何 writePlanFile / setAppState / session_permission_rules 写入之前。
+        if (ctx.peerExecutionOrigin() != null) {
+            return ToolResult.error(call.id(),
+                "ExitPlanMode is unavailable for cross-session (peer) turns: a peer may not restore or change "
+                    + "this session's permission mode.");
+        }
         // CC :244 isAgent = !!context.agentId；Java agentId 恒 UUID 兜底（ToolUseContext:276-278）→
         // 用 agentType()!=null 判定子 agent（SubagentExecutor:945 设，派生链透传）
         boolean isAgent = ctx.agentType() != null;
@@ -412,7 +419,7 @@ public class ExitPlanModeTool implements Tool {
         //   inputPlan = 'plan' in input && typeof input.plan==='string' ? input.plan : undefined
         //   plan = inputPlan ?? getPlan(agentId)（input.plan 缺失走磁盘 fallback）
         //   inputPlan !== undefined && filePath → writeFile(filePath, inputPlan) 同步磁盘（CC :256-258）
-        UUID planAgentId = isAgent ? ctx.agentId() : null;
+        String planAgentId = isAgent ? ctx.agentId() : null;
         PlanProvider planProvider = new PlanProviderImpl(ctx.sessionId());
         String filePath = planProvider.getPlanFilePath(planAgentId);
         JsonNode input = call.input();
@@ -642,8 +649,12 @@ public class ExitPlanModeTool implements Tool {
         //   把「用户拒绝」的 tool_result 伪装成 "User has approved exiting plan mode" ——
         //   真机 e2e 实测：用户点拒绝并写意见，模型却收到「已批准」。
         if (isError) {
-            String errorContent = tr.data() instanceof String s && !s.isEmpty()
-                ? s : "ExitPlanMode failed";
+            // [错误通道 · CCJ-ERR-014] 失败载荷可能是 ToolError（toString=原文）⇒ 统一取文本，
+            //   避免把真实拒绝原因替换成占位句。
+            String errorContent = tr.data() == null ? "ExitPlanMode failed" : String.valueOf(tr.data());
+            if (errorContent.isEmpty()) {
+                errorContent = "ExitPlanMode failed";
+            }
             if (log.isDebugEnabled()) {
                 log.debug("[ExitPlanModeTool] mapToToolResultBlockParam: 错误/拒绝结果原样回传 isError=true length={}",
                     errorContent.length());

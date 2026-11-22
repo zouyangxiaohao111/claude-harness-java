@@ -107,7 +107,7 @@ class AgentMcpToolPermissionPipelineE3Test {
     }
 
     private static ToolUseContext ctx(ToolPermissionContext permCtx) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), permCtx.mode(),
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), permCtx.mode(),
             List.of(), "", AbortController.NOOP, List.of(), permCtx, permCtx.mode());
     }
 

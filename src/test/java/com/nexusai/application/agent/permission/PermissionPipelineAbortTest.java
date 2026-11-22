@@ -85,7 +85,7 @@ class PermissionPipelineAbortTest {
     /** 17 参 ToolUseContext（abortController null → NOOP；permCtx 可为 null）。 */
     private static ToolUseContext newCtx(AbortController abortController,
                                          ToolPermissionContext permCtx) {
-        return new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", abortController, List.of(),
             permCtx, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null);
     }

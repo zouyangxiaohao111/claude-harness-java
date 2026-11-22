@@ -130,7 +130,7 @@ class LlmAgentLoopC3MidTurnDrainSnapshotTest {
         };
         QueryParams params = QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), sid)
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sid)
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", 8, null, null, null, null,
             deps, ProviderConfig.empty());

@@ -94,7 +94,7 @@ class LlmAgentLoopBlockingLimitTest {
         // ── 4. 驱动 loop（[H7-arch Phase 5-2 B1] 收敛签名：queryLoop(loop.QueryParams, state, uuids)）──
         com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
@@ -154,7 +154,7 @@ class LlmAgentLoopBlockingLimitTest {
 
         com.nexusai.application.agent.loop.QueryParams callerParams1 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.COMPACT, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty())
                 // [E-1a fail-loud 契约] 后台 fork 来源必须注入受限 canUseTool（否则 queryLoop 入口

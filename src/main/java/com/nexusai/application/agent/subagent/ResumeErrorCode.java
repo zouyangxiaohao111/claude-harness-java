@@ -56,7 +56,27 @@ public enum ResumeErrorCode {
     /** 目录与记录不一致 / 不可进入。 */
     SUBAGENT_RESUME_CWD_REFUSED("subagent_resume_cwd_refused"),
     /** 记录里声明了 worktree，但无法在该 worktree 中恢复。 */
-    SUBAGENT_RESUME_WORKTREE_REFUSED("subagent_resume_worktree_refused");
+    SUBAGENT_RESUME_WORKTREE_REFUSED("subagent_resume_worktree_refused"),
+    /**
+     * 会话级并发槽已满 · 对齐 CC {@code roomForResume} 返回 undefined 时的
+     * {@code session_full}（claude.exe 2.1.328 偏移 356172104
+     * {@code S("resume",void 0,{degradedClass:"session_full"})}）。
+     *
+     * <p>CC 原文（{@code uSa}，偏移 326610900）：{@code Agent "<name>" was not resumed, and your
+     * message was not delivered: this session has no room for another agent now, or has started as
+     * many as it may between two messages from the user. Go on without it, or say in your final
+     * response what you needed from it.} <b>不排队</b>。
+     */
+    SESSION_FULL("session_full"),
+    /**
+     * 自动续跑次数已用尽 · 对齐 CC {@code resumes_spent}（偏移 353419208
+     * {@code if(Pt>=yYa)return"resumes_spent"}，{@code yYa=5}）。CC 只在计划阶段静默剔除候选、
+     * 无面向用户文案；本仓对模型自动 resume 显式拒绝并给出出口句（不伪造 CC 原文）。
+     */
+    SUBAGENT_RESUME_RESUMES_SPENT("subagent_resume_resumes_spent");
+
+    /** CC {@code yYa=5}（偏移 315610267）· 每 agent 自动续跑上限。 */
+    public static final int MAX_RESTART_RESUMES = 5;
 
     private final String code;
 
@@ -82,7 +102,156 @@ public enum ResumeErrorCode {
         }
     }
 
+    /**
+     * 无 transcript · 对齐 CC {@code ef{transcriptMissing:true}}（偏移 333965575）。
+     *
+     * <p>继承 {@link com.nexusai.infra.exception.NotFoundException} 以保持 REST 404 契约
+     * （CommandController 注释的既有语义），同时携带 {@link #AGENT_TRANSCRIPT_MISSING}
+     * 让 SendMessage 回执能保留 {@code no_transcript} 分档 —— 两者不再互斥。
+     */
+    public static final class ResumeTranscriptMissingException extends com.nexusai.infra.exception.NotFoundException {
+        public ResumeTranscriptMissingException(String message) {
+            super(message);
+        }
+
+        public ResumeErrorCode errorCode() {
+            return AGENT_TRANSCRIPT_MISSING;
+        }
+    }
+
     /** CC 的通用出口句（逐字）。 */
     public static final String START_NEW_AGENT_SUFFIX =
         " Start a new agent if the work is still needed.";
+
+    // ────────────────────────────────────────────────────────────────────
+    // 失败分档 · 五档 + 遥测映射 / 面向用户原文
+    //   对齐 CC claude.exe 2.1.328：
+    //   · Ks(err) 偏移 356128040：k9 → "not_reachable"、t2e → "still_stopping"、
+    //     ef → "no_transcript"、其他 → "resume_failed"；
+    //   · 配额满 → {}",degradedClass:"session_full"（偏移 356172104）。
+    //   v9（AgentResumeInProgressError）在 SendMessage 侧被单独捕获并<b>软化</b>为入队
+    //   （偏移 356173200 区），不进失败分档；其余档位见下。
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * 码 → 遥测档（CC {@code Ks}）。{@code v9} 在本仓对应
+     * {@link #SUBAGENT_RESUME_ALREADY_RUNNING}，仅在调用方未软化时落入这里。
+     */
+    public static String telemetryCode(ResumeErrorCode code) {
+        if (code == null) {
+            return "resume_failed";
+        }
+        switch (code) {
+            case AGENT_STOPPED_BY_USER:
+                return "not_reachable";
+            case SUBAGENT_RESUME_ALREADY_RUNNING:
+                return "in_progress";
+            case SUBAGENT_RESUME_STILL_STOPPING:
+                return "still_stopping";
+            case AGENT_TRANSCRIPT_MISSING:
+                return "no_transcript";
+            case SESSION_FULL:
+                return "session_full";
+            default:
+                return "resume_failed";
+        }
+    }
+
+    /** 同 {@link #telemetryCode}（SendMessage 回执字段名沿用 CC 的 {@code degradedClass}）。 */
+    public static String degradedClass(ResumeErrorCode code) {
+        return telemetryCode(code);
+    }
+
+    /**
+     * k9 原文（{@code wqn}，偏移 333965575）：
+     * {@code Agent <id> was stopped and won't be resumed. Treat its work as cancelled; only launch
+     * a new agent if the user explicitly asks.}
+     */
+    public static String stoppedByUserText(String agentId) {
+        return "Agent " + agentId + " was stopped and won't be resumed. "
+            + "Treat its work as cancelled; only launch a new agent if the user explicitly asks.";
+    }
+
+    /**
+     * SendMessage 侧 k9 原文（{@code Ns}，偏移 356171000）：
+     * {@code Agent "<name>" was stopped by the user and was not resumed. Treat its work as
+     * cancelled; only start a new agent for it if the user explicitly asks.}
+     */
+    public static String stoppedByUserSendText(String agentName) {
+        return "Agent \"" + agentName + "\" was stopped by the user and was not resumed. "
+            + "Treat its work as cancelled; only start a new agent for it if the user explicitly asks.";
+    }
+
+    /** k9 门 B（准入后复核）原文：{@code Agent <id> was stopped meanwhile, so this delivery was dropped.} */
+    public static String stoppedMeanwhileText(String agentId) {
+        return "Agent " + agentId + " was stopped meanwhile, so this delivery was dropped.";
+    }
+
+    /** t2e 原文（偏移 333965575）：{@code Re-run <stop command> on it or wait for it to exit before resuming.} */
+    public static String stillStoppingText(String agentId) {
+        return "Agent " + agentId + " is still stopping \u2014 its previous run was stopped "
+            + "but has not exited. Re-run TaskStop on it or wait for it to exit before resuming.";
+    }
+
+    /** 调用方自己被停（t2e 另一种）：原文见 findings 三-②。 */
+    public static String callerStoppedText() {
+        return "This agent has been stopped and its stop is still completing; "
+            + "it cannot resume other agents.";
+    }
+
+    /**
+     * 无 transcript（CC {@code ef.transcriptMissing}，偏移 333965575 + {@code zs} 偏移 356128040）：
+     * {@code Agent "X" could not be resumed: No transcript found for agent ID: <id>.
+     * Start a new agent if the work is still needed.}
+     */
+    public static String transcriptMissingText(String agentName, String agentId) {
+        return "Agent \"" + agentName + "\" could not be resumed: No transcript found for agent ID: "
+            + agentId + "." + START_NEW_AGENT_SUFFIX;
+    }
+
+    /**
+     * 配额满（CC {@code uSa}，偏移 326610900 逐字）。
+     */
+    public static String sessionFullText(String agentName) {
+        return "Agent \"" + agentName + "\" was not resumed, and your message was not delivered: "
+            + "this session has no room for another agent now, or has started as many as it may "
+            + "between two messages from the user. Go on without it, or say in your final response "
+            + "what you needed from it.";
+    }
+
+    /**
+     * v9 软化（CC 偏移 356173200 区逐字）：
+     * {@code <name> is already waking; message queued for its next tool round
+     * (not delivered if the agent turns out to have been stopped).}
+     */
+    public static String alreadyWakingText(String agentName) {
+        return agentName + " is already waking; message queued for its next tool round "
+            + "(not delivered if the agent turns out to have been stopped).";
+    }
+
+    /** v9 且连 task 记录都没了（CC 同段）：{@code ... Retry shortly.} */
+    public static String alreadyWakingNoRecordText(String agentName) {
+        return agentName + " is being resumed by another caller and its task record is gone; "
+            + "the message was not delivered. Retry shortly.";
+    }
+
+    /** 其余失败（resume_failed）· 与 CC「not resumed / message was not delivered」同构。 */
+    public static String notResumedText(String agentName, String detail) {
+        return "Agent \"" + agentName + "\" was not resumed, and your message was not delivered: "
+            + detail;
+    }
+
+    /** 逐出分支 meta 不存在（CC {@code dSa}，偏移 326609933 逐字）。 */
+    public static String metaMissingText(String agentId) {
+        return "Not sent. This session has no saved settings for agent " + agentId
+            + " that it can read: the agent never ran here, or its settings were lost."
+            + START_NEW_AGENT_SUFFIX;
+    }
+
+    /** 逐出分支 meta 读失败（CC {@code cSa}，偏移 326610135 逐字）。 */
+    public static String metaUnreadableText(String agentId) {
+        return "Not sent. The saved settings of agent " + agentId
+            + " could not be read just now. Send the message again; start a new agent only if "
+            + "that fails too.";
+    }
 }

@@ -59,6 +59,17 @@ class UserFacingErrorMessageTest {
     }
 
     @Test
+    @DisplayName("429 套餐额度耗尽（Token Plan 用量上限）→ 译成「额度不足」，不得说成「请求过于频繁」")
+    void quotaExhausted429() {
+        String msg = ApiErrors.userFacingErrorMessage(api(429,
+            "{\"message\":\"已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)\","
+                + "\"type\":\"rate_limit_error\",\"http_code\":\"429\"}"));
+
+        assertThat(msg).contains("额度不足");
+        assertThat(msg).doesNotContain("请求过于频繁");
+    }
+
+    @Test
     @DisplayName("429 → 限流；529 → 过载；401 → 鉴权；每种都是中文结论开头")
     void otherKnownClasses() {
         assertThat(ApiErrors.userFacingErrorMessage(api(429, "rate"))).contains("请求过于频繁");

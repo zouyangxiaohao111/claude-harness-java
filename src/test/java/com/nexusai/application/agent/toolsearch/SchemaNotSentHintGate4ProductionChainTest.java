@@ -71,7 +71,7 @@ class SchemaNotSentHintGate4ProductionChainTest {
                 .put("max_results", 5);
         ToolUseBlock call = new ToolUseBlock("toolu_search_1", "ToolSearch", input);
         ToolUseContext searchCtx = ToolUseContext.of(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 List.of(searchTool, webSearch))
                 // [R8 / 单点化] 生产路径 turn 恒带 provider+model（AgentLoopContext.toolExecContext 盖章）；
                 //   本测试显式给 anthropic + claude-*（与原 [openai-lazy 乙-1] 期一致，保留上下文完整性）。
@@ -100,7 +100,7 @@ class SchemaNotSentHintGate4ProductionChainTest {
 
         // ── 5) build 全链路: 4 道门过到 gate4, discovered 含目标工具 → 返回 null（消除误报）──
         ToolUseContext ctx = ToolUseContext.of(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 List.of(searchTool, webSearch), "", AbortController.NOOP, List.of(toolResultMsg));
         String hint = SchemaNotSentHint.build(webSearch, ctx, JSON.createObjectNode());
         assertThat(hint)
@@ -113,7 +113,7 @@ class SchemaNotSentHintGate4ProductionChainTest {
     void reverse_noToolReference_buildInjectsHint() {
         Tool webSearch = deferredTool("WebSearch");
         ToolUseContext ctx = ToolUseContext.of(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 List.of(searchTool, webSearch), "", AbortController.NOOP, List.of());
 
         String hint = SchemaNotSentHint.build(webSearch, ctx, JSON.createObjectNode());

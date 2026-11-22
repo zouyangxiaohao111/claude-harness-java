@@ -136,7 +136,7 @@ class CronDeleteToolCcContractTest {
 
         // [REWORK-7] ToolResult.isError() 已删 (IMP-C2) → isError 由 data 文案推导。
         assertThat(LlmAgentLoop.isToolErrorData(r.data())).isFalse();
-        String text = (String) r.data();
+        String text = String.valueOf(r.data());
         assertThat(text).isNotBlank();
         assertThat(text).doesNotContain("status");
         assertThat(text).doesNotContain("cancelled");
@@ -203,7 +203,7 @@ class CronDeleteToolCcContractTest {
      * 身份经 {@code withTeammateIdentity} 显式盖章 —— 与生产盖章入口同源。
      */
     private static ToolUseContext teammateTuc(TeammateIdentity identity) {
-        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-del",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-cron-del",
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
             .withTeammateIdentity(identity);
     }

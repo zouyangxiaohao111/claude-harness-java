@@ -95,7 +95,7 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
                 return com.nexusai.application.agent.tool.ToolResult.success(call.id(), "ok");
             }
         };
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(mcpTool));
         AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
         state.replaceMessages(List.of(message("m1", Role.user, "question")));
@@ -144,7 +144,7 @@ class LlmAgentLoopSkipGlobalCacheCcTest {
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
         // 无 MCP 工具（空工具集）
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of());
 
         AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);

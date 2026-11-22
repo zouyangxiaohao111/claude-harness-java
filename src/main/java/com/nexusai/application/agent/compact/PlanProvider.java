@@ -31,7 +31,7 @@ public interface PlanProvider {
      * @param agentId 当前 agent ID（null = 主会话；CC 默认参，plans.ts:119）
      * @return plan 文件绝对路径（不保证文件存在）
      */
-    String getPlanFilePath(UUID agentId);
+    String getPlanFilePath(String agentId);
 
     /**
      * 读指定 agent 的 plan 文件全文 · CC original: getPlan(agentId)（plans.ts:135-144）。
@@ -41,7 +41,7 @@ public interface PlanProvider {
      * @param agentId 当前 agent ID（null = 主会话）
      * @return plan 全文；无文件 / 读失败 → null
      */
-    String getPlan(UUID agentId);
+    String getPlan(String agentId);
 
     /**
      * 恢复 plan 文件（resume）· CC original: copyPlanForResume（plans.ts:164-231，简化本地形式）。
@@ -87,5 +87,5 @@ public interface PlanProvider {
      * @param agentId 当前 agent ID（null = 主会话）
      * @return PlanRef(planFilePath, planContent)；无 plan 文件 → null
      */
-    AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(UUID agentId);
+    AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(String agentId);
 }

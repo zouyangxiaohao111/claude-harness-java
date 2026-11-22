@@ -4,8 +4,6 @@ import com.nexusai.application.agent.AgentState;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -35,8 +33,8 @@ class SubagentExecutorInvokedSkillCleanupTest {
             new SubagentExecutor(null, null, null, null, null, "model", "system-prompt");
 
     private final AgentState state = new AgentState("test-system-prompt");
-    private final UUID agentX = UUID.randomUUID();
-    private final UUID agentY = UUID.randomUUID();
+    private final String agentX = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+    private final String agentY = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     @Test
     @DisplayName("cleanSubagentInvokedSkills(X) 清空 X 条目，主会话与 Y 条目保留")
@@ -65,7 +63,8 @@ class SubagentExecutorInvokedSkillCleanupTest {
     void cleanForAgent_nullOrEmpty_isSafeNoop() {
         state.addInvokedSkill("skill-main", "/s-main/SKILL.md", "main", null);
         // 从未注册的 agentId → 无条目可删，不抛异常
-        executor.cleanSubagentInvokedSkills(state, UUID.randomUUID());
+        executor.cleanSubagentInvokedSkills(state,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         assertThat(state.getInvokedSkillsForAgent(null)).hasSize(1);
         // null state / null agentId → 安全返回
         executor.cleanSubagentInvokedSkills(null, agentX);

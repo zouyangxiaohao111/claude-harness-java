@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
+import { ImChannelPickerModal } from './ImChannelPickerModal'
+import type { ImPlatform } from '@/api/im'
 import { CatArtBody } from '../startup/CatArt'
 import type { PoppedQueueInput, QueuedCommand } from '@/hooks/useCommandQueue'
 import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
@@ -27,6 +29,8 @@ import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from 
 import { resolveCtxInfo } from '@/utils/contextUsage'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 import { useShallow } from 'zustand/react/shallow'
+import { useComposerBlock } from '@/hooks/useComposerBlock'
+import { ComposerBlockHint } from './ComposerBlockHint'
 
 /** 稳定空数组（selector `?? []` 每次返回新引用会触发无限重渲染）。 */
 const EMPTY_MESSAGES: ChatMessageDto[] = []
@@ -44,6 +48,35 @@ const EMPTY_USAGE_PROBE = {
 
 /** Tauri：拖拽被 WebView 拦截，用 onDragDropEvent 拿真实路径 → fs 读文件 → base64/upload */
 const IS_TAURI = isTauri()
+
+/**
+ * 权限模式图标 · 六种模式各一枚 14×14 描边图标（与工具 chip 同一视觉语言）。
+ *
+ * <p>WHY 一态一枚而不是所有模式共用盾牌：权限模式是「当前会怎么拦截/放行」，
+ * 盾牌只表达"权限"这个大类；计划/接受编辑/绕过/不询问/自动 五者的行为差异很大，
+ * 用同一枚图标时用户只能靠文字区分，扫视效率低。
+ */
+function PermissionModeIcon({ mode, className }: { mode: PermissionMode; className?: string }) {
+  const glyph: Record<PermissionMode, ReactNode> = {
+    // 默认：盾牌（每个敏感操作询问）
+    default: <path d="M7 1.5L12 3.5V6.5C12 9.5 9.8 11.8 7 12.5C4.2 11.8 2 9.5 2 6.5V3.5L7 1.5Z" />,
+    // 计划：地图（只读探索、先出方案）
+    plan: <path d="M2 3.5L5.5 2L8.5 3.5L12 2V10.5L8.5 12L5.5 10.5L2 12V3.5ZM5.5 2V10.5M8.5 3.5V12" />,
+    // 接受编辑：铅笔（自动接受文件编辑）
+    acceptEdits: <path d="M9.5 2.2L11.8 4.5L4.9 11.4H2.6V9.1L9.5 2.2ZM8.2 3.5L10.5 5.8" />,
+    // 绕过权限：盾牌 + 斜线
+    bypassPermissions: <path d="M7 1.5L12 3.5V6.5C12 9.5 9.8 11.8 7 12.5C4.2 11.8 2 9.5 2 6.5V3.5L7 1.5ZM2.6 2.6L11.4 11.4" />,
+    // 不询问（未预批准的拒绝）：禁止符
+    dontAsk: <path d="M7 1.8A5.2 5.2 0 1 0 7 12.2A5.2 5.2 0 1 0 7 1.8ZM3.4 10.6L10.6 3.4" />,
+    // 自动：星芒（classifier 判定）
+    auto: <path d="M7 1.5L8.4 5.1L12 6.5L8.4 7.9L7 11.5L5.6 7.9L2 6.5L5.6 5.1L7 1.5Z" />,
+  }
+  return (
+    <svg className={className} viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+      {glyph[mode]}
+    </svg>
+  )
+}
 
 /** 待发附件（A1 契约）：≤5MB base64 直传；>5MB multipart upload 拿 contentId；local-read 模式 >5MB 传本地 path */
 interface PendingAttachment {
@@ -183,6 +216,62 @@ interface ComposerProps {
   onOpenEffort?: () => void
   /** 当前会话 id（会话工具面板拉取 · 会话切换时自动刷新） */
   sessionId?: string
+  /** 已接入的 IM 渠道（弹窗左栏）。platform 用来显示品牌色徽标，缺省回落灰色「渠」 */
+  imInstances?: Array<{ id: string; label: string; platform?: ImPlatform }>
+  /** 各渠道下的会话（弹窗第二级：群聊 / 私聊） */
+  imChats?: Array<{
+    id: string
+    name: string
+    kind: 'group' | 'p2p'
+    instanceId: string
+    /** 这个聊天现在接在哪个会话上（null = 空闲）；用来做「已被谁占用」的提示 */
+    boundSessionId?: string | null
+    /** 占用者的会话标题（人看的名字，不是 sess-xxx） */
+    boundSessionTitle?: string | null
+  }>
+  /** 已经接到当前会话的 chat id（打勾） */
+  imBoundChatIds?: string[]
+  /**
+   * [A 预热提示] 需要激活但还没激活的 chat id（目前只有微信：没收到过对方消息 ⇒ 没有 context_token）。
+   *
+   * <p>选择器里给那一项标「未激活」，⛔ 不禁用绑定 —— 只是让人知道手机上暂时收不到通知。
+   */
+  imInactiveChatIds?: string[]
+  /** 把某个会话改接到当前会话 */
+  onBindImChat?: (chatId: string) => void
+  /** [快速绑定] 把该渠道的机器人默认会话接到当前会话（后端挑默认会话） */
+  onQuickBindImInstance?: (instanceId: string) => void
+  /** 断开某个会话与当前会话的接线（⛔ 与绑定的区别：绑定=改接，解绑=置空） */
+  onUnbindImChat?: (chatId: string) => void
+  /** 鼠标进入渠道入口时重拉一次渠道/聊天 —— 否则新同步的聊天在这一轮里看不到 */
+  onRefreshImData?: () => void
+  /** 打开 IM 频道页（管理渠道 / 新建绑定） */
+  onOpenImChannels?: () => void
+  /**
+   * [V329] 本会话是否显式开启无人值守（会话级状态，渠道右侧常驻开关）。
+   *
+   * <p>开启 ⇒ 回答直达（Brief）开、IM 工具开、AskUserQuestion 从工具池移除；
+   * 退出 ⇒ Ask 恢复，Brief 保持。⛔ 与权限模式不是同一个概念。
+   */
+  unattended?: boolean
+  /** [V329] 本轮仍在运行、模式变更要下一轮才生效（只提示，⛔ 不伪装已生效） */
+  unattendedPending?: boolean
+  /** [V329] 切换无人值守（App 调 `sessionApi.setUnattended`；无渠道时由 App/后端提示） */
+  onToggleUnattended?: () => void
+  /** [Q8] 工具面板里「确认关闭回答直达并退出无人值守」后，通知 App 重拉会话模式 */
+  onReloadSessionMode?: () => void
+  /**
+   * 是否允许 AI 以**用户本人名义**在 IM 发消息（全局开关）。
+   *
+   * <p>与「IM 频道页 › 安全与权限 › 允许以我的名义发消息」是**同一份数据**
+   * （后端 im_config 单行）⇒ 两处看到的状态一致。
+   *
+   * <p>⛔ 别把它做成「有没有入口」式的显隐：这是个**授权**，用户随时可能想开/关，
+   * 入口常显、状态用开关本身表达。
+   */
+  imAllowUserIdentity?: boolean
+  /** 切换「以用户名义发消息」（App 负责写后端 + 失败回滚） */
+  onToggleImUserIdentity?: () => void
   /** 空态（无消息）：输入框居中 */
   empty?: boolean
   /** F1 · 点击底部 hint-usage（token/金额/当前上下文）→ 打开 UsageCostModal（App 处理） */
@@ -222,10 +311,10 @@ interface ComposerProps {
   /** 当前目标条件（已有目标时点「目标」→ 面板预填，避免看起来像目标没了） */
   goalCondition?: string | null
   /**
-   * 输入框上方右侧的提示节点（App 传 `<AskUserPendingHint />`）。
+   * 输入框上方右侧的提示节点（App 传 `<PendingPermissionHint />`）。
    *
    * <p>放在 `.composer-inner` 内而不是 App 的 fixed 浮层：随输入区宽度/位置走，
-   * 用户视线落在输入框时就能看到「其他会话有工具在等回答」，不用去右下角找。
+   * 用户视线落在输入框时就能看到「其他会话有工具在等决策」，不用去右下角找。
    */
   pendingHint?: ReactNode
   /**
@@ -240,6 +329,18 @@ interface ComposerProps {
    * 放在 `.composer-inner` 顶部：清单是状态区，不进入消息流；工具调用仍在对话里滚动。
    */
   taskListHint?: ReactNode
+  /**
+   * [peer-pending] 待处理投递常驻条（App 传 `<PeerPendingHint />`）。
+   *
+   * <p>放输入区上方独立一行（不用 `.composer-top-actions` 那一排：本条是整句提醒 +
+   * 两个动作，塞进右缘单行会挤掉「回到底部/停止所有」）。pendingCount=0 时 App 传 null。
+   */
+  peerHoldHint?: ReactNode
+  /**
+   * [composer-block] 「去处理」审批 → 定位到审批卡片（App 触发对话区滚底，露出
+   * PermissionBubble / 内联计划审批）。⛔ 不切会话、不改输入内容。
+   */
+  onRevealApproval?: () => void
 }
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
@@ -376,9 +477,17 @@ const SUG_CARD: React.CSSProperties = {
   overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
 }
 
-export function Composer({ composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, onEnterPlanMode, onExitPlanMode, planPending, coordinatorMode, onCoordinatorModeChange, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, taskListHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions}: ComposerProps) {
+export function Composer({composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, onEnterPlanMode, onExitPlanMode, planPending, coordinatorMode, onCoordinatorModeChange, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, taskListHint, peerHoldHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions, imInstances, imChats, imBoundChatIds, imInactiveChatIds, onBindImChat, onQuickBindImInstance, onUnbindImChat, onRefreshImData, onOpenImChannels, imAllowUserIdentity, onToggleImUserIdentity, onRevealApproval, unattended, unattendedPending, onToggleUnattended, onReloadSessionMode}: ComposerProps) {
   // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
   const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
+  // [composer-block] 统一发送封锁判据：当前会话待确认消息 > 0 或有未处理审批/Ask 提问。
+  //   ⛔ 只封锁发送；面板/滚动/审批卡/切会话照旧（不使用遮罩）。判据与会话严格绑定。
+  const blockState = useComposerBlock(sessionId ?? null)
+  const composerBlocked = blockState.blocked
+  // 待确认消息的原因已由 App 传入的 peerHoldHint（PeerPendingHint：含「去处理」+「全部拒绝」）
+  //   常驻条表达；这里只在没有该条时补一条等价提示（避免同一原因出现两条）。
+  const showBlockHint = blockState.pendingApprovals > 0
+    || (blockState.peerPending > 0 && !peerHoldHint)
   // 会话 token/金额汇总（底部 footer · 与 hint-shortcuts 对称）：complete 事件实时覆盖 + F5 从会话列表恢复
   const sessionUsage = useChatStore((s) => s.sessions.find((x) => x.id === sessionId))
   // F1/F5 · 当前上下文「已用 / 窗口（剩余%）」：**只认快照口径**（服务端真实 usage + 模型原始窗口 +
@@ -498,6 +607,25 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   const [modeOpen, setModeOpen] = useState(false)
   // 权限模式抽屉（对齐模型胶囊 model-effort-pill 交互）
   const [permOpen, setPermOpen] = useState(false)
+  /** 渠道弹窗是否打开（点击「渠道」按钮打开独立的居中弹窗，不再靠 hover） */
+  const [chanMenuOpen, setChanMenuOpen] = useState(false)
+  // [V329] 无人值守入口的「请先配置渠道」引导：点入口但还没有任何已接入渠道时置真，
+  //   同时打开既有渠道弹窗（⛔ 入口不做 disabled 死按钮，也不静默）。
+  //
+  // [2026-11-21 用户实测「这个字不会消失，弹出来就不消失了」] 引导只允许存在于
+  //   「本次点击 → 用户处理完这条引导」的时间窗内，不是一个常驻状态：
+  //   · 文案本身由既有 toast 统一呈现（6s，见 hooks.ts useToastDispatcher），不另设秒数；
+  //   · 弹窗里的说明条由本状态驱动，**随弹窗关闭 / 配置成功 / 切会话**立即清掉；
+  //   · 删掉常驻在开关旁的行内气泡（那正是不会消失的那一处）。
+  const [uoGuide, setUoGuide] = useState(false)
+  // 渠道接好之后自动清掉引导（不必重新点一次入口）
+  useEffect(() => {
+    if (uoGuide && (imInstances?.length ?? 0) > 0) setUoGuide(false)
+  }, [uoGuide, imInstances])
+  // 切会话 ⇒ 上一会话的引导不得跟过来（Composer 在切会话时不重挂载）
+  useEffect(() => {
+    setUoGuide(false)
+  }, [sessionId])
   // 对话进行中（有消息/流式）禁止切换模式，仅空会话（新会话）可切换（对齐「文件选择」绑定规则）
   const modeLocked = !empty
   // 输入 `/` → 命令即时提示（slash 补全）
@@ -1066,6 +1194,8 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   }
   /** 发送：组装附件 req → sendMessage（Enter 与发送按钮共用 · 修复 Enter 丢 attachments bug） */
   const doSend = () => {
+    // [composer-block] 兜底：任何路径（按钮/Enter/快捷）都不得越过封锁
+    if (composerBlocked) return
     if (attachments.some((a) => a.contentId === '__uploading__')) {
       showToast('附件上传中，请稍候', 'info')
       return
@@ -1138,7 +1268,7 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
   }, [composerText])
 
   return (
-    <div className={`composer${empty ? ' composer-empty' : ''}`} onDrop={onDrop} onDragOver={onDragOver}>
+    <div className={`composer${empty ? ' composer-empty' : ''}${composerBlocked ? ' composer-blocked' : ''}`} onDrop={onDrop} onDragOver={onDragOver} data-composer-blocked={composerBlocked ? 'true' : undefined}>
       {/* 空态 hero：logo 动画 + 标题 + quick-actions（对齐主界面原型） */}
       {empty && (
         <div className="welcome">
@@ -1152,7 +1282,7 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
               </div>
               <div style={SUG_GRID}>
                 {emptySuggestions.questions.map((q) => (
-                  <button key={q} type="button" style={SUG_CARD} title={q} onClick={() => emptySuggestions.onPick(q)}>{q}</button>
+                  <button key={q} type="button" style={SUG_CARD} title={q} onClick={() => { if (!composerBlocked) emptySuggestions.onPick(q) }}>{q}</button>
                 ))}
               </div>
             </div>
@@ -1166,6 +1296,18 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
         </div>
       )}
       <div className="composer-inner">
+        {/* [peer-pending] 待处理投递常驻条：pendingCount=0 时 App 不传（整条不渲染）。 */}
+        {peerHoldHint}
+        {/* [composer-block] 暂不能发送的明确提示（原因 + 去处理入口）；无待处理时整条不渲染。 */}
+        {showBlockHint && (
+          <ComposerBlockHint
+            peerCount={peerHoldHint ? 0 : blockState.peerPending}
+            approvalCount={blockState.pendingApprovals}
+            // 待处理入口统一由 App 的 PeerPendingHint 提供（跳会话+定位卡片）；
+            // ⛔ 这里不再自带 openPanel（列表不再是来信面板）。
+            onRevealApproval={onRevealApproval}
+          />
+        )}
         {/* F19/#3 排队命令条（输入框上方，后端 B5 未接恒空隐藏） */}
         {/* 「编辑」按钮与 Esc 走同一个入口（文本 + 附件一起拉回） */}
         {/* [goal V253 形态重做] 移进 .composer-inner —— 原先在它<b>外面</b>（兄弟节点）⇒ 通栏， */}
@@ -1176,7 +1318,11 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
           {!minimalChrome && (
           <div
             className={`project-binder${modeLocked ? ' locked' : ''}`}
-            title={modeLocked ? '对话进行中不可切换项目（仅新会话可切换）' : '选择项目'}
+            title={modeLocked
+              ? '对话进行中不可切换项目（仅新会话可切换）'
+              : boundProjectName
+                ? `选择项目 · ${boundProjectName}`
+                : '选择项目'}
             onClick={() => {
               // 项目绑定与 full 模式一致：对话进行中锁定（仅新会话可切换）
               if (modeLocked) {
@@ -1208,7 +1354,7 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
               setModeOpen((v) => !v)
             }}
           >
-            <span>{mode} 模式</span> ▾
+            <span>{mode} 模式</span>
             {!modeLocked && modeOpen && (
               <div className="mode-dropdown">
                 {(['simple', 'full'] as const).map((m) => (
@@ -1353,11 +1499,14 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
             </div>
             <textarea
               ref={textareaRef}
-              placeholder="向 nexus 提问，或输入 / 调出命令"
+              placeholder={composerBlocked ? (blockState.reason ?? '暂不能发送') : '向 nexus 提问，或输入 / 调出命令'}
               value={composerText}
               onChange={(e) => setComposerText(e.target.value)}
               onScroll={syncHighlight}
               onPaste={onPaste}
+              // [composer-block] 待确认消息/待审批期间**只锁发送、不锁输入**：
+              //   用户仍可打字（不必丢失正在写的内容）；发送入口在发送按钮与发送回调处拦截。
+              title={composerBlocked ? (blockState.reason ?? undefined) : undefined}
               onKeyDown={(e) => {
                 // [Phase3 @引用] 候选打开时优先：↑↓ 选择 · Tab/Enter 引用 · Esc 关闭（不发送）
                 if (atMatches) {
@@ -1417,6 +1566,9 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                   // Enter 发送；Shift+Enter / Alt+Enter 换行（textarea 默认行为，不拦截）
                   if (!e.shiftKey && !e.altKey && !e.metaKey && !e.ctrlKey) {
                     e.preventDefault()
+                    // [composer-block] 封锁态下 Enter 不得越过禁用（输入框已 disabled，
+                    //   这里再兜一层：程序化派发/焦点残留也不会发出消息）
+                    if (composerBlocked) return
                     doSend()
                   }
                 } else if (e.key === 'Escape') {
@@ -1915,18 +2067,98 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                     showToast={showToast}
                     onClose={() => setToolsOpen(false)}
                     onOpenChromePanel={onOpenChromePanel}
+                    unattended={unattended}
+                    onModeChanged={onReloadSessionMode}
                   />
                 )}
               </div>
+              )}
+              {/* IM 渠道入口：与「浏览器」同款 chip（图标 + 文字）。点击打开**独立的居中弹窗**，
+                  弹窗内左「渠道」右「聊天」并列展示 —— ⛔ 不再锚在按钮上方、也不再两级下钻。 */}
+              {onOpenImChannels && (
+                <button
+                  type="button"
+                  className="tool-chip chan-entry"
+                  title="IM 渠道：这个会话的话会发到哪"
+                  onClick={(e) => {
+                    e.stopPropagation()
+                    // 每次打开都重拉一次渠道/聊天 —— 新同步的聊天不用重启就能看到
+                    if (!chanMenuOpen) onRefreshImData?.()
+                    setChanMenuOpen((v) => !v)
+                  }}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M21 12a8 8 0 01-11.5 7.2L4 21l1.8-5.5A8 8 0 1121 12z" />
+                  </svg>
+                  <span>渠道</span>
+                  {imBoundChatIds && imBoundChatIds.length > 0 && (
+                    <span className="chan-entry-dot" title={`已接 ${imBoundChatIds.length} 个聊天`} />
+                  )}
+                </button>
+              )}
+              {/* [V329] 无人值守：常驻在「渠道」右侧。
+                  唯一硬前置 = 已配置渠道实例；未配置时入口**仍可点** → 提示「请先配置渠道」并打开既有渠道弹窗。
+                  ⛔ 不在渠道弹窗放第二个开关；⛔ 不新增「交互方式」入口。
+                  [2026-11-21 用户要求] 视觉对齐「计划 / 协调者」chip：同一个 `.tool-chip.plan-mode`，
+                  关闭灰点、开启蓝点呼吸；⛔ 不再用迷你拨杆。 */}
+              {onToggleUnattended && (
+                <div className="uo-wrap">
+                  <button
+                    type="button"
+                    className={`tool-chip plan-mode uo-entry${unattended ? ' active' : ''}`}
+                    role="switch"
+                    aria-checked={!!unattended}
+                    aria-label="无人值守"
+                    title="无人值守：开启后回答直达开、Ask 关闭；未配置渠道会先引导配置"
+                    onClick={(e) => {
+                      e.stopPropagation()
+                      if ((imInstances?.length ?? 0) === 0) {
+                        setUoGuide(true)
+                        // 用既有 toast 统一时长（info=6s）—— ⛔ 不引入第二种「自动消失」实现
+                        showToast('请先配置渠道', 'info')
+                        if (!chanMenuOpen) onRefreshImData?.()
+                        setChanMenuOpen(true)
+                        return
+                      }
+                      setUoGuide(false)
+                      onToggleUnattended()
+                    }}
+                  >
+                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M12 3a7 7 0 017 7c0 3-1.6 4.6-2.7 6H7.7C6.6 14.6 5 13 5 10a7 7 0 017-7z" />
+                      <path d="M9 19h6M10 22h4" />
+                    </svg>
+                    <span>无人</span>
+                    {/* 状态与计划/协调者同一套语言：关闭灰点 / 开启蓝点呼吸；
+                        role=switch + aria-checked 保留给读屏与测试。 */}
+                    <i className="plan-indicator" aria-hidden="true" />
+                    {unattendedPending && <span className="uo-pending" title="本轮仍在运行，下一轮生效">下一轮生效</span>}
+                  </button>
+                </div>
+              )}
+              {onOpenImChannels && chanMenuOpen && (
+                <ImChannelPickerModal
+                  instances={imInstances ?? []}
+                  chats={imChats ?? []}
+                  boundChatIds={imBoundChatIds ?? []}
+                  inactiveChatIds={imInactiveChatIds ?? []}
+                  allowUserIdentity={imAllowUserIdentity}
+                  onToggleUserIdentity={onToggleImUserIdentity}
+                  onBind={(id) => onBindImChat?.(id)}
+                  onUnbind={(id) => onUnbindImChat?.(id)}
+                  sessionId={sessionId}
+                  onQuickBind={onQuickBindImInstance ? (id) => onQuickBindImInstance(id) : undefined}
+                  onOpenChannels={onOpenImChannels}
+                  guide={uoGuide}
+                  onClose={() => { setChanMenuOpen(false); setUoGuide(false) }}
+                />
               )}
             </div>
             <div className="right-tools">
               {onPermissionModeChange && (
                 <div className="perm-mode-pill-wrap" ref={permRef}>
-                  <div className="perm-mode-pill" onClick={() => setPermOpen((v) => !v)} title="权限模式（会话覆盖全局）">
-                    <svg className="pm-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
-                      <path d="M7 1.5L12 3.5V6.5C12 9.5 9.8 11.8 7 12.5C4.2 11.8 2 9.5 2 6.5V3.5L7 1.5Z" />
-                    </svg>
+                  <div className="perm-mode-pill" onClick={() => setPermOpen((v) => !v)} title={`权限模式：${PERMISSION_MODE_LABELS[permissionMode]}（会话覆盖全局）`}>
+                    <PermissionModeIcon mode={permissionMode} className={`pm-icon${permissionMode === 'bypassPermissions' ? ' danger' : ''}`} />
                     <span className="pm-label">权限模式:</span>
                     <span className="pm-value">{PERMISSION_MODE_LABELS[permissionMode]}</span>
                     <svg className={`pm-chevron ${permOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 12, height: 12 }}>
@@ -1942,7 +2174,10 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                           title={PERMISSION_MODE_DESCRIPTIONS[m]}
                           onClick={() => { setPermOpen(false); onPermissionModeChange(m) }}
                         >
-                          <span className="pill-label">{PERMISSION_MODE_LABELS[m]}</span>
+                          <span className="pill-main">
+                            <PermissionModeIcon mode={m} className={`pill-ico${m === 'bypassPermissions' ? ' danger' : ''}`} />
+                            <span className="pill-label">{PERMISSION_MODE_LABELS[m]}</span>
+                          </span>
                           <span className="pill-desc">{PERMISSION_MODE_DESCRIPTIONS[m]}</span>
                         </div>
                       ))}
@@ -1953,6 +2188,10 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
               {(onOpenModelPicker || onOpenEffort) && (
                 <div className="model-effort-pill-wrap" ref={pillRef}>
                   <div className="model-effort-pill" onClick={() => setPillOpen((v) => !v)} title="模型与推理等级">
+                    <svg className="mep-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                      <path d="M7 1.5L12 4.3V9.7L7 12.5L2 9.7V4.3L7 1.5Z" />
+                      <path d="M2 4.3L7 7.1L12 4.3M7 7.1V12.5" />
+                    </svg>
                     <span className="mep-model">{shortModel || '选择模型'}</span>
                     <span className="mep-effort">{ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')}</span>
                     <svg className={`mep-chevron ${pillOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 13, height: 13 }}>
@@ -1963,13 +2202,26 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                     <div className="pill-drawer">
                       {onOpenModelPicker && (
                         <div className="pill-row" onClick={() => { setPillOpen(false); onOpenModelPicker() }}>
-                          <span className="pill-label">模型</span>
+                          <span className="pill-main">
+                            <svg className="pill-ico" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M7 1.5L12 4.3V9.7L7 12.5L2 9.7V4.3L7 1.5Z" />
+                              <path d="M2 4.3L7 7.1L12 4.3M7 7.1V12.5" />
+                            </svg>
+                            <span className="pill-label">模型</span>
+                          </span>
                           <span className="pill-value">{shortModel || '选择模型'} ›</span>
                         </div>
                       )}
                       {onOpenEffort && (
                         <div className="pill-row" onClick={() => { setPillOpen(false); onOpenEffort() }}>
-                          <span className="pill-label">推理等级</span>
+                          <span className="pill-main">
+                            <svg className="pill-ico" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
+                              <path d="M2.4 10.2A4.8 4.8 0 1 1 11.6 10.2" />
+                              <path d="M7 9.2L9.1 6.4" />
+                              <path d="M7 10.4A1.2 1.2 0 1 0 7 8A1.2 1.2 0 0 0 7 10.4Z" />
+                            </svg>
+                            <span className="pill-label">推理等级</span>
+                          </span>
                           <span className="pill-value">{ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')} ›</span>
                         </div>
                       )}
@@ -1989,7 +2241,9 @@ export function Composer({ composerText, setComposerText, sendMessage, attachmen
                 <button
                   className="send-btn"
                   onClick={() => doSend()}
-                  disabled={!composerText.trim() && attachments.length === 0}
+                  disabled={composerBlocked || (!composerText.trim() && attachments.length === 0)}
+                  title={composerBlocked ? (blockState.reason ?? undefined) : undefined}
+                  aria-disabled={composerBlocked || undefined}
                 >
                   <span>发送</span>
                   <svg viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="1.5">

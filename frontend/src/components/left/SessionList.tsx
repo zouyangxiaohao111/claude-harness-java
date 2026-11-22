@@ -1,6 +1,13 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useState, type CSSProperties } from 'react'
+import { createPortal } from 'react-dom'
+import { isTauri } from '@tauri-apps/api/core'
 import type { SessionDto } from '@/api/types'
+import type { ToastType } from '@/types'
 import { compareSessions, compareGroups, sortSessionsWithPinned } from '@/utils/sessionOrder'
+import { computeDerivedChildCounts, computeFamilyColors } from './sessionFamily'
+
+/** IM 会话块默认展示条数（超出折叠成「查看全部」）—— 该块数量会长，全展开会撑爆左栏。 */
+const IM_BLOCK_PREVIEW = 3
 
 /**
  * 左侧栏 · 按项目路径分组，每路径下挂该项目的会话列表。
@@ -49,16 +56,60 @@ interface SessionListProps {
   onOpenSettings?: () => void
   /** 删除会话（App 处理：后端删 + 本地清理 + 切换） */
   onDeleteSession?: (id: string) => void
+  /** 复制会话（App 处理：以最后一条消息为分叉点分叉出新会话） */
+  onDuplicateSession?: (id: string) => void
+  /** 提示（项目分组右键菜单在浏览器环境的兜底文案用；省略 = 静默） */
+  showToast?: (msg: string, type?: ToastType) => void
   /** 运行中会话 id 集合（有 stream = 运行中 · 蓝点 ongoing） */
   runningSessionIds?: Set<string>
   /** 等待权限/提问的会话 id 集合（permissionQueue 中 · 橙红闪烁，优先于运行点） */
   pendingSessionIds?: Set<string>
   /** 运行完成且未读的会话 id 集合（静止绿点 · 切到该会话即清除） */
   doneUnreadIds?: Set<string>
+  /**
+   * [peer-badge] 每会话待处理投递数（sessionId → pending）。
+   *
+   * <p>数据来自全局 `peerInboxStore.countsBySession`（聚合 topic 的 `pendingCount` +
+   * `GET /peer-inbox/counts` 对账）。省略 / 空对象 ⇒ 不渲染任何行内角标（旧宿主零改动）。
+   * <p>⚠️ 口径只含 pending：declined/expired/accepted 不计（由 store 保证，组件不重算）。
+   */
+  peerPendingCounts?: Record<string, number>
+  /**
+   * [peer-badge] 全局待处理总数 = 左栏顶部汇总（N = `peerInboxStore.totalPending`）。
+   * 0 / 省略 ⇒ 整块不渲染。
+   */
+  peerTotalPending?: number
+  /**
+   * [peer-badge] 点击全局汇总 → App 决策：0 不弹 / 1 直接跳会话 / ≥2 展开会话级列表。
+   * 汇总本身不再直接开面板（App 内部按计数决定）。
+   */
+  onOpenPeerInbox?: () => void
+  /**
+   * [peer-badge] 点击某会话行内角标 → 直接跳该会话并定位首条 pending 卡。
+   * 未提供时退回 `switchSession`（旧宿主/旧测试零改动）。
+   */
+  onOpenPeerPending?: (sessionId: string) => void
   /** 重命名会话（App 调 sessionApi.update + 本地同步） */
   onRenameSession?: (id: string, title: string) => void
   /** 置顶 / 取消置顶（App 调 sessionApi.update({ pinned }) + 本地同步） */
   onPinSession?: (id: string, pinned: boolean) => void
+  /**
+   * 点击左栏「IM 频道」入口 → 主区换到 IM 频道页（App 持有 workspacePage）。
+   *
+   * <p>位置与「定时任务」同层（都在「新建会话」之后）—— 两者都是能力入口，
+   * 不是会话，所以不参与会话排序/筛选。
+   */
+  onOpenIm?: () => void
+  /** IM 频道页是否当前激活（导航项高亮） */
+  imActive?: boolean
+  /**
+   * 有 IM 接线的会话 id 集合 —— 用于左栏「IM 会话」块。
+   *
+   * <p>数据来自 {@code /api/v1/channels/bindings}（V255）。为空/省略 ⇒ 不渲染该块。
+   * <p>⚠️ 与「置顶」的关系（2026-11-23 用户裁定）：**允许重叠** —— 已置顶的 IM 会话
+   * 同时在置顶块和 IM 块出现（行首金色实心星表示已置顶）；只有普通项目分组做去重。
+   */
+  imSessionIds?: Set<string>
   /** 折叠/展开左栏（App 持有状态 · 按钮在左栏头部三条横线） */
   onToggleCollapse?: () => void
   /** 已折叠：只渲染窄 rail（展开按钮 + 新建）· 对齐 deepseek-harness 收起留 rail、永不消失 */
@@ -121,7 +172,10 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
-export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, onPinSession, runningSessionIds, pendingSessionIds, doneUnreadIds, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules, schedulesActive, groupsDefaultCollapsed }: SessionListProps) {
+export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, onPinSession, runningSessionIds, pendingSessionIds, doneUnreadIds, peerPendingCounts, peerTotalPending, onOpenPeerInbox, onOpenPeerPending, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules,
+  onOpenIm,
+  imActive,
+  imSessionIds, schedulesActive, groupsDefaultCollapsed, onDuplicateSession, showToast }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 默认折叠口径：只记录**用户/自动展开过**的组（collapsedGroups 的反面）。
   // 两套 state 并存而不是合成一个 Map：默认展开与默认折叠是两种语义，用一个布尔直接翻转
@@ -131,6 +185,47 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const [menuId, setMenuId] = useState<string | null>(null)
   const [renameId, setRenameId] = useState<string | null>(null)
   const [renameDraft, setRenameDraft] = useState('')
+  /** 项目分组标题右键菜单（x/y 视口坐标 + 该组项目路径） */
+  const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; path: string } | null>(null)
+  // [session-family] 置顶 / 派生 / IM 三块的折叠态（默认展开；与项目分组一样只存组件本地，不持久化）
+  const [pinnedOpen, setPinnedOpen] = useState(true)
+  const [derivedOpen, setDerivedOpen] = useState(true)
+  const [imOpen, setImOpen] = useState(true)
+  /** 派生块内按「源」分组：已收起的源 id 集合（默认全部展开）。 */
+  const [collapsedFamilyRoots, setCollapsedFamilyRoots] = useState<Set<string>>(new Set())
+  /** 悬停的家族根 id：同族行一起高亮（跨块 —— 置顶里的创建者 ↔ 派生块里的子会话）。 */
+  const [hoverFamily, setHoverFamily] = useState<string | null>(null)
+
+  // 右键菜单：点击空白 / Esc 关闭（菜单自身 onMouseDown stopPropagation）
+  useEffect(() => {
+    if (!groupMenu) return
+    const close = () => setGroupMenu(null)
+    const onKey = (e: KeyboardEvent) => { if (e.key === 'Escape') close() }
+    document.addEventListener('mousedown', close)
+    document.addEventListener('keydown', onKey)
+    return () => {
+      document.removeEventListener('mousedown', close)
+      document.removeEventListener('keydown', onKey)
+    }
+  }, [groupMenu])
+
+  /** 「在文件资源管理器中显示」：桌面壳走 opener；浏览器/e2e 复制路径兜底（不静默无反应） */
+  const revealGroupPath = async () => {
+    const menu = groupMenu
+    if (!menu) return
+    setGroupMenu(null)
+    if (isTauri()) {
+      try {
+        const { revealItemInDir } = await import('@tauri-apps/plugin-opener')
+        await revealItemInDir(menu.path)
+      } catch (e) {
+        showToast?.(`打开文件资源管理器失败：${e instanceof Error ? e.message : String(e)}`, 'info')
+      }
+      return
+    }
+    try { await navigator.clipboard.writeText(menu.path) } catch { /* ignore */ }
+    showToast?.('浏览器环境无法打开资源管理器，已复制路径', 'info')
+  }
 
   // ⋯ 菜单点外部收起：命中菜单或菜单按钮本身不关（按钮自己负责 toggle），其余任意
   // mousedown 都关闭 —— 此前没有任何 document 级监听，菜单会一直挂在界面上。
@@ -169,13 +264,58 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     return null
   }
 
-  // [V283] 置顶会话从项目分组中取出，单独渲染在最前的「置顶」块（跨项目、恒定展开）。
-  //   非置顶会话仍走原项目分组逻辑，行为逐字节不变。
+  // [V283] 置顶会话从项目分组中取出，单独渲染在最前的「置顶」块（跨项目）。
+  //   [session-family] 标题可点击折叠（默认展开）；置顶独占，不再出现在派生 / IM / 项目分组。
+  //   非置顶会话走「派生 / IM / 项目分组」三块（见下方 projectSessions 的排除规则）。
+  // IM 会话块：有接线的会话。
+  //   [session-family 2026-11-23] 不再排除置顶 —— 视图块之间允许重叠（置顶的 IM 会话
+  //   在置顶块与 IM 块都出现，行首显示金色实心星表示已置顶）。
+  const [imExpanded, setImExpanded] = useState(false)
+  const imBlockSessions = useMemo(
+    () => (imSessionIds && imSessionIds.size > 0
+      ? sortSessionsWithPinned(sessions.filter((s) => imSessionIds.has(s.id)))
+      : []),
+    [sessions, imSessionIds],
+  )
+
   const pinnedSessions = sessions.filter((s) => s.pinned === true)
   const unpinnedSessions = sessions.filter((s) => s.pinned !== true)
+
+  // [session-family] 家族色与派生数（纯展示，不参与排序/权限）。
+  //   家族 = 沿 derivedFromSessionId 上溯到根；同族同色，两个根两种色。
+  const familyColors = useMemo(() => computeFamilyColors(sessions), [sessions])
+  const derivedChildCounts = useMemo(() => computeDerivedChildCounts(sessions), [sessions])
+  const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions])
+  // 「派生」块 = 全部家族成员（含置顶 / IM 的成员）。
+  //   ⚠️ 三个视图块之间**允许重叠**：置顶的成员同时出现在置顶块与派生块、IM 的成员同时出现在
+  //   IM 块与派生块 —— 块回答的是不同问题；只有下面的普通项目分组才做整体去重。
+  const derivedSessions = sessions
+    .filter((s) => familyColors.has(s.id))
+    .sort(compareSessions)
+  // 派生块内部按「源」分组：每个家族根一组，组内是它派生出的会话（根自己渲染成组标题）。
+  //   组序 = 组内最近更新时间倒序（与项目分组同一口径）；组可单独展开/收起。
+  const familyGroups = (() => {
+    const byRoot = new Map<string, { rootId: string; color: string; members: SessionDto[]; latest: number }>()
+    for (const s of derivedSessions) {
+      const fam = familyColors.get(s.id)
+      if (!fam) continue
+      const group = byRoot.get(fam.rootId) ?? { rootId: fam.rootId, color: fam.color, members: [], latest: 0 }
+      group.members.push(s)
+      const ts = Date.parse(s.updatedAt ?? s.createdAt ?? '')
+      group.latest = Math.max(group.latest, Number.isNaN(ts) ? 0 : ts)
+      byRoot.set(fam.rootId, group)
+    }
+    return [...byRoot.values()].sort((a, b) => b.latest - a.latest)
+  })()
+  // 项目分组只放「未置顶 + 非 IM + 非家族」——置顶 / IM / 家族已在上面的视图块里，不再重复。
+  //   ⚠️ flatHistory 是「平铺、无分组标题」的旧口径：不启用三块拆分，会话全部留在平铺列表里。
+  const projectSessions = flatHistory
+    ? unpinnedSessions
+    : sessions.filter((s) => s.pinned !== true && !(imSessionIds?.has(s.id)) && !familyColors.has(s.id))
+
   // 按 mainProjectId 分组；flatHistory 下全部归入单一隐式组 ⇒ 平铺、无分组标题。
   const groups = new Map<string, SessionDto[]>()
-  for (const s of unpinnedSessions) {
+  for (const s of projectSessions) {
     const key = flatHistory ? FLAT_GROUP_KEY : (s.mainProjectId ?? '__unbound__')
     const arr = groups.get(key) ?? []
     arr.push(s)
@@ -207,13 +347,33 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     })
   }
 
-  /** 会话行 · 置顶块与项目组共用同一渲染（避免两份菜单/状态点逻辑漂移）。 */
-  const renderSessionRow = (s: SessionDto) => (
+  /**
+   * 会话行 · 置顶 / 派生 / IM / 项目组共用同一渲染（避免多份菜单/状态点逻辑漂移）。
+   *
+   * <p>`collapse` 只给「派生块的源」用：在标题后插一个 chevron，点它折叠该源的子会话；
+   * 行本身仍是完整会话行（hover / 状态点 / 时间 / ⋯ 菜单与别处完全一致）。
+   */
+  const renderSessionRow = (
+    s: SessionDto,
+    collapse?: { open: boolean; onToggle: () => void },
+  ) => {
+    // [session-family] 家族色：同族（含创建者）同一色，跨块一致；普通会话无 --fam ⇒ 不渲染色条/不染色徽章。
+    const fam = familyColors.get(s.id)
+    const famFocus = !!fam && hoverFamily === fam.rootId
+    const kidCount = derivedChildCounts.get(s.id) ?? 0
+    const rootTitle = fam ? (sessionById.get(fam.rootId)?.title ?? fam.rootId) : ''
+    return (
     <div
       key={s.id}
-      className={`session-item ${activeSession === s.id ? 'active' : ''}`}
+      className={`session-item ${activeSession === s.id ? 'active' : ''}${fam ? ' has-family' : ''}${famFocus ? ' fam-focus' : ''}`}
+      data-fam={fam?.rootId}
+      style={fam ? ({ '--fam': fam.color } as CSSProperties) : undefined}
+      onMouseEnter={fam ? () => setHoverFamily(fam.rootId) : undefined}
+      onMouseLeave={fam ? () => setHoverFamily(null) : undefined}
       onClick={() => switchSession(s.id)}
     >
+      {/* [session-family] 家族色条：放在左侧留白（x≈15px），与选中行的 3px accent 边、状态点都不重叠 */}
+      {fam ? <span className="fam-bar" aria-hidden="true" /> : null}
       {/* [V283] 行首置顶五角星 · 未置顶 hover 才显示（灰色空心），已置顶常显（金色实心）；
           点击直接切换置顶，不触发会话切换（stopPropagation）。 */}
       <button
@@ -249,17 +409,68 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
       ) : (
         <span className="title">{s.title || '新会话'}</span>
       )}
+      {/* 派生块的「源」：标题后的 chevron 只折叠该源的子会话，点行本身仍是切会话 */}
+      {collapse && (
+        <button
+          type="button"
+          className="session-collapse-btn"
+          aria-expanded={collapse.open}
+          aria-label={collapse.open ? '收起该源的派生会话' : '展开该源的派生会话'}
+          title={collapse.open ? '收起该源的派生会话' : '展开该源的派生会话'}
+          onClick={(e) => { e.stopPropagation(); collapse.onToggle() }}
+        >
+          <ChevronIcon open={collapse.open} />
+        </button>
+      )}
+      {/* [V328] 派生会话标记：由另一个会话经 SessionCreate 创建；仅展示，不做跳转/权限依据。
+          [session-family] 徽章取家族色，悬停提示创建者标题（不再裸露会话 id）。 */}
+      {s.derivedFromSessionId ? (
+        <span className="derived-badge" title={`由「${rootTitle}」创建`}>派生</span>
+      ) : null}
+      {/* [session-family] 创建者标记：与派生会话同一颜色 + 派生数（悬停说明），让「配对」看得出来 */}
+      {fam && kidCount > 0 ? (
+        <span className="fam-chip" title={`派生了 ${kidCount} 个会话`}>
+          <svg className="fam-fork" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" aria-hidden="true">
+            <circle cx="4" cy="3" r="1.5" />
+            <circle cx="4" cy="13" r="1.5" />
+            <circle cx="12" cy="13" r="1.5" />
+            <path d="M4 4.5V11.5M5.5 13h5" />
+          </svg>
+          {kidCount}
+        </span>
+      ) : null}
+      {/* [peer-badge] 该会话待处理投递数：0 不渲染；点击切到该会话。
+          ⚠️ 放在 title 与 time 之间 —— 不遮挡行首状态点/置顶星标，hover 时 time 淡出也不受影响。
+          纯文本数字 + 小圆点、无动画（避免与「运行中闪烁」混淆）。 */}
+      {(() => {
+        const pending = peerPendingCounts?.[s.id] ?? 0
+        if (pending <= 0) return null
+        return (
+          <button
+            type="button"
+            className="session-peer-badge"
+            title={`待处理 ${pending} 条投递`}
+            aria-label={`待处理 ${pending} 条投递`}
+            onClick={(e) => { e.stopPropagation(); (onOpenPeerPending ?? switchSession)(s.id) }}
+          >
+            <span className="dot" aria-hidden="true" />
+            {pending}
+          </button>
+        )
+      })()}
       <span className="time">{formatRelativeTime(s.updatedAt ?? s.createdAt)}</span>
       <span className="session-menu-btn" title="会话操作" onClick={(e) => { e.stopPropagation(); setMenuId(menuId === s.id ? null : s.id) }}>⋯</span>
       {menuId === s.id && (
         <div className="session-menu">
           <div className="sm-item" onClick={(e) => { e.stopPropagation(); onPinSession?.(s.id, s.pinned !== true); setMenuId(null) }}>{s.pinned === true ? '取消置顶' : '置顶'}</div>
           <div className="sm-item" onClick={(e) => { e.stopPropagation(); setRenameId(s.id); setRenameDraft(s.title || ''); setMenuId(null) }}>重命名</div>
+          <div className="sm-item" onClick={(e) => { e.stopPropagation(); onDuplicateSession?.(s.id); setMenuId(null) }}>复制</div>
           <div className="sm-item danger" onClick={(e) => { e.stopPropagation(); onDeleteSession?.(s.id) }}>删除</div>
         </div>
       )}
     </div>
-  )
+    )
+  }
 
   // 左栏面板内折叠开关（顶格 · 无文字标签 · 对齐 deepseek-harness logoRow 样式）。
   // 改版场景（workspaceRedesign）把它渲染在滚动区**之外**的左栏顶部右侧：
@@ -306,6 +517,21 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
           <span className="ent-t">定时任务</span>
         </button>
       )}
+      {/* 左栏入口：IM 频道（一级项，与「定时任务」同层）。
+          位置在「新建会话」之后、「定时任务」之前 —— 按使用频率排，IM 比定时任务更常用。 */}
+      {workspaceRedesign && onOpenIm && (
+        <button
+          className={`left-entry ws-nav-im${imActive ? ' on' : ''}`}
+          onClick={() => onOpenIm()}
+          title="IM 频道"
+        >
+          <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round">
+            <path d="M20 11.5c0 3.9-3.6 7-8 7-1 0-2-.2-2.9-.5L4.5 19.5l1.2-3.3C4.6 15.1 4 13.4 4 11.5c0-3.9 3.6-7 8-7s8 3.1 8 7z" />
+          </svg>
+          <span className="ent-t">IM 频道</span>
+        </button>
+      )}
+
       <div className="left-entry" onClick={() => onOpenAgentMarket?.()} title="打开技能市场">
         <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}><circle cx="12" cy="10" r="3.4" /><path d="M4.5 20c.9-3 4-4.4 7.5-4.4s6.6 1.4 7.5 4.4" /></svg>
         <span className="ent-t">技能市场</span>
@@ -347,15 +573,40 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         </div>
       ) : null}
 
+      {/* [peer-total] 全局待处理汇总：N = totalPending（各会话 pending 之和），0 时整块不渲染。
+          点击只开「待收件」面板 —— 汇总跨多个会话，无法确定目标 ⇒ ⛔ 不切会话。 */}
+      {(peerTotalPending ?? 0) > 0 && (
+        <button
+          type="button"
+          className="left-peer-total"
+          title="查看待处理投递"
+          aria-label={`待处理 ${peerTotalPending} 条投递`}
+          onClick={() => onOpenPeerInbox?.()}
+        >
+          <span className="dot" aria-hidden="true" />
+          <span className="txt">待处理</span>
+          <span className="n">{peerTotalPending}</span>
+        </button>
+      )}
+
       {sessions.length === 0 && (
         <div className="sidebar-empty">暂无会话 · 点击 + 新建</div>
       )}
 
-      {/* [V283] 置顶块 · 跨项目置前、恒定展开（不响应 groupsDefaultCollapsed） */}
+      {/* [V283] 置顶块 · 跨项目置前。
+          [session-family 2026-11-23] 标题可点击折叠（默认展开）；置顶独占 —— 同一条不再出现在
+          派生 / IM / 项目分组里（「置顶不隐藏」指留在本块可见）。 */}
       {pinnedSessions.length > 0 && (
         <div className="left-section">
           {!flatHistory && (
-            <div className="label pinned-label">
+            <div
+              className={`label pinned-label${pinnedOpen ? '' : ' collapsed'}`}
+              onClick={() => setPinnedOpen((v) => !v)}
+              role="button"
+              aria-expanded={pinnedOpen}
+              title={pinnedOpen ? '收起置顶' : '展开置顶'}
+            >
+              <ChevronIcon open={pinnedOpen} />
               <svg className="pin-mark" viewBox="0 0 16 16" fill="currentColor" role="img" aria-label="已置顶">
                 <path d="M8 1.5l2.06 4.18 4.61.67-3.33 3.25.78 4.59L8 11.93l-4.12 2.26.78-4.59L1.33 6.35l4.61-.67L8 1.5z" />
               </svg>
@@ -363,7 +614,116 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
               <span className="count">{pinnedSessions.length}</span>
             </div>
           )}
-          {sortSessionsWithPinned(pinnedSessions).map(renderSessionRow)}
+          {(flatHistory || pinnedOpen) && sortSessionsWithPinned(pinnedSessions).map((s) => renderSessionRow(s))}
+        </div>
+      )}
+
+      {/* [session-family 2026-11-23] 派生块 · 置顶之后、IM 之前。
+          · 成员 = 全部家族成员（创建者 + 派生会话 + 孙会话），**不排除置顶/IM 的成员**：
+            三个视图块回答不同问题，允许重叠；置顶成员在行首显示金色实心星（其他颜色不变）。
+          · 内部按「源」（家族根）分组：源渲染成组标题（可单独展开/收起），组内是它派生的会话。
+          · 普通项目分组会排除这些会话（下面的列表只放「未置顶 + 非 IM + 非家族」）。 */}
+      {!flatHistory && derivedSessions.length > 0 && (
+        <div className="left-section family-block">
+          <div
+            className={`label family-label${derivedOpen ? '' : ' collapsed'}`}
+            onClick={() => setDerivedOpen((v) => !v)}
+            role="button"
+            aria-expanded={derivedOpen}
+            title={derivedOpen ? '收起派生' : '展开派生'}
+          >
+            <ChevronIcon open={derivedOpen} />
+            <svg viewBox="0 0 16 16" width="12" height="12" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" className="family-mark" role="img" aria-label="派生会话">
+              <circle cx="4" cy="3" r="1.5" />
+              <circle cx="4" cy="13" r="1.5" />
+              <circle cx="12" cy="13" r="1.5" />
+              <path d="M4 4.5V11.5M5.5 13h5" />
+            </svg>
+            <span className="group-path">派生</span>
+            <span className="count">{derivedSessions.length}</span>
+          </div>
+          {derivedOpen && familyGroups.map((group) => {
+            const rootSession = sessionById.get(group.rootId)
+            const open = !collapsedFamilyRoots.has(group.rootId)
+            const toggle = () => setCollapsedFamilyRoots((prev) => {
+              const next = new Set(prev)
+              if (next.has(group.rootId)) next.delete(group.rootId); else next.add(group.rootId)
+              return next
+            })
+            return (
+              <div className="family-group" key={group.rootId}>
+                {/* 「源」= 完整会话行（hover / 状态点 / 时间 / ⋯ 菜单与别处一致），
+                    标题后多一个 chevron 只折叠该源的子会话。创建者已删时退化为只用 id 的静态行。 */}
+                {rootSession ? (
+                  renderSessionRow(rootSession, { open, onToggle: toggle })
+                ) : (
+                  <div className="session-item has-family source-missing" style={{ '--fam': group.color } as CSSProperties}>
+                    <span className="fam-bar" aria-hidden="true" />
+                    <button
+                      type="button"
+                      className="session-collapse-btn"
+                      aria-expanded={open}
+                      aria-label={open ? '收起该源的派生会话' : '展开该源的派生会话'}
+                      onClick={(e) => { e.stopPropagation(); toggle() }}
+                    >
+                      <ChevronIcon open={open} />
+                    </button>
+                    <span className="title">{group.rootId}（源已删除）</span>
+                    <span className="time">{group.members.length}</span>
+                  </div>
+                )}
+                {open && group.members
+                  .filter((m) => m.id !== group.rootId)
+                  .map((m) => renderSessionRow(m))}
+              </div>
+            )
+          })}
+        </div>
+      )}
+
+      {/* IM 会话块（用户裁定：任务上方除置顶外再加一块）。
+          · 数据 = 有接线的会话（imSessionIds 来自 /channels/bindings），**含已置顶的**：
+            置顶成员在这里也可见，行首显示金色实心星（视图块允许重叠）。
+          · [session-family 2026-11-23] **不再出现在下面的项目分组里**（用户要求去重）；
+            与派生块可以重叠 —— 同一会话既在 IM 块又在派生块。
+          · 标题可点击折叠；默认最多 3 条 + 「查看全部」——IM 会话数量会长，全展开会把左栏撑爆 */}
+      {imBlockSessions.length > 0 && (
+        <div className="left-section im-block">
+          {!flatHistory && (
+            <div
+              className={`label im-label${imOpen ? '' : ' collapsed'}`}
+              onClick={() => setImOpen((v) => !v)}
+              role="button"
+              aria-expanded={imOpen}
+              title={imOpen ? '收起 IM 会话' : '展开 IM 会话'}
+            >
+              <ChevronIcon open={imOpen} />
+              <svg viewBox="0 0 24 24" width="12" height="12" fill="none" stroke="currentColor" strokeWidth={1.8} strokeLinecap="round">
+                <path d="M20 11.5c0 3.9-3.6 7-8 7-1 0-2-.2-2.9-.5L4.5 19.5l1.2-3.3C4.6 15.1 4 13.4 4 11.5c0-3.9 3.6-7 8-7s8 3.1 8 7z" />
+              </svg>
+              <span className="group-path">IM 会话</span>
+              <span className="count">{imBlockSessions.length}</span>
+              {imOpen && imBlockSessions.length > IM_BLOCK_PREVIEW && (
+                <button
+                  onClick={(e) => { e.stopPropagation(); setImExpanded((v) => !v) }}
+                  title={imExpanded ? '收起' : '展开全部'}
+                  style={{
+                    marginLeft: 'auto',
+                    border: 0,
+                    background: 'none',
+                    color: 'var(--accent)',
+                    fontSize: 11.5,
+                    cursor: 'pointer',
+                    padding: '0 2px',
+                  }}
+                >
+                  {imExpanded ? '收起' : '查看全部'}
+                </button>
+              )}
+            </div>
+          )}
+          {(flatHistory || imOpen) &&
+            (imExpanded ? imBlockSessions : imBlockSessions.slice(0, IM_BLOCK_PREVIEW)).map((s) => renderSessionRow(s))}
         </div>
       )}
 
@@ -389,7 +749,16 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
           <div key={key} className="left-section">
             {/* flatHistory：不渲染分组标题 —— 会话平铺，无项目/文件夹分组概念 */}
             {!flatHistory && (
-              <div className={`label ${collapsed ? 'collapsed' : ''}`} onClick={() => toggleGroup(key)}>
+              <div
+                className={`label ${collapsed ? 'collapsed' : ''}`}
+                onClick={() => toggleGroup(key)}
+                onContextMenu={(e) => {
+                  e.preventDefault()
+                  e.stopPropagation()
+                  if (!path) return
+                  setGroupMenu({ x: e.clientX, y: e.clientY, path })
+                }}
+              >
                 <ChevronIcon open={!collapsed} />
                 <FolderIcon />
                 <span className="group-path" title={path || groupTitle}>{groupTitle}</span>
@@ -401,7 +770,7 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                 )}
               </div>
             )}
-            {visible.map(renderSessionRow)}
+            {visible.map((s) => renderSessionRow(s))}
           </div>
         )
       })}
@@ -431,6 +800,17 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
             </svg>
           </button>
         </div>
+      )}
+      {groupMenu && createPortal(
+        <div
+          className="project-context-menu"
+          style={{ left: groupMenu.x, top: groupMenu.y }}
+          onMouseDown={(e) => e.stopPropagation()}
+          onContextMenu={(e) => e.preventDefault()}
+        >
+          <div className="ctx-menu-item" onClick={() => void revealGroupPath()}>在文件资源管理器中显示</div>
+        </div>,
+        document.body,
       )}
     </div>
   )

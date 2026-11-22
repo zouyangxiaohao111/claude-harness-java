@@ -1,6 +1,7 @@
 import { useMemo } from 'react'
 import type { ComputerUseApp } from '@/api/types'
 import type { PermissionRequestItem } from '@/stores/chatStore'
+import { deliveryFailureText } from './permissionDeliveryText'
 
 /**
  * [桌面控制审批面板] 后端一次算好推给前端的应用清单 + 授权范围文案。
@@ -105,6 +106,12 @@ export function ComputerUseApprovalPanel({ request, onDecision, onAbort }: Props
     <div className="permission-bubble">
       <div className="pb-title">需要你授权控制电脑上的应用</div>
       {request.warning && <div className="pb-warning">{request.warning}</div>}
+      {/* [D 未送达上抛] 渠道没送出去 ⇒ 明确告诉人（⛔ 不影响决策，未送达≠拒绝） */}
+      {request.deliveryFailures && request.deliveryFailures.length > 0 && (
+        <div className="pb-warning" data-testid="pb-delivery-failure">
+          通知未送达：{request.deliveryFailures.map(deliveryFailureText).join('；')}
+        </div>
+      )}
       {request.isLeaderInbox && (
         <div className="pb-swarm-badge" style={request.workerBadgeColor ? { background: request.workerBadgeColor } : undefined}>
           swarm · 队友请求

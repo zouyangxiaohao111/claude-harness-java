@@ -39,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Session M1.1 · ToolUseContext.with() 显式逐字段决策对齐 CC forkedAgent.ts:376-461")
 class ToolUseContextWithExplicitFieldDispatchTest {
 
-    private static final UUID PARENT_AGENT_ID = UUID.randomUUID();
+    private static final String PARENT_AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String PARENT_SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /**

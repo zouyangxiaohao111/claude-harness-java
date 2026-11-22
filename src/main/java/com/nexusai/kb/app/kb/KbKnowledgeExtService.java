@@ -87,6 +87,15 @@ public class KbKnowledgeExtService {
     private final KbImageService imageService;
     private final JdbcTemplate jdbc;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 这里原来只传条目级 {@code row.getEmbeddingModelId()}；两级默认都空时
+     * {@code reindexKnowledge} 会进「只重建关键词」分支，删掉过期向量且不重建。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     @Autowired
     public KbKnowledgeExtService(KbKnowledgeMapper knowledgeMapper,
                                  KbKnowledgeBaseMapper baseMapper,
@@ -381,7 +390,8 @@ public class KbKnowledgeExtService {
         if (enableStatus != null) {
             try {
                 indexWriter.reindexKnowledge(id, row.getKnowledgeBaseId(),
-                    row.getEmbeddingModelId());
+                    kbConfigService == null ? row.getEmbeddingModelId()
+                        : kbConfigService.resolveEmbeddingModelId(id, row.getKnowledgeBaseId()));
             } catch (RuntimeException e) {
                 log.error("[知识扩展] 文档 {} 状态已改但索引重建失败：{}", id, e.getMessage());
             }

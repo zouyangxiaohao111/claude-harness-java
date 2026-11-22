@@ -229,7 +229,7 @@ class ToolRegistrationConfigCompactIdleRebuildTest {
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
         com.nexusai.application.agent.AgentState live =
-            new com.nexusai.application.agent.AgentState("sys", SESSION, java.util.UUID.randomUUID());
+            new com.nexusai.application.agent.AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         live.replaceMessages(List.of(
             msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, live);

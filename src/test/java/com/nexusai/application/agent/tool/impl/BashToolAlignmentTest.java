@@ -158,7 +158,7 @@ class BashToolAlignmentTest {
         //      （DEL-A2-01）会误报失败；接线后应 success 且 message 折入 data 文本。
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "grep foo file.txt", 1, "", "");
         assertThat(r.isError()).isFalse();
-        assertThat(r.result().data()).contains("No matches found");
+        assertThat(String.valueOf(r.result().data())).contains("No matches found");
     }
 
     @Test
@@ -167,7 +167,7 @@ class BashToolAlignmentTest {
         // WHY: exit>=2 是 grep 真实错误；与 exit 1 区分，仍须 error
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "grep foo missing.txt", 2, "", "grep: No such file");
         assertThat(r.isError()).isTrue();
-        assertThat(r.result().data()).contains("Exit code 2");
+        assertThat(String.valueOf(r.result().data())).contains("Exit code 2");
     }
 
     @Test
@@ -181,8 +181,8 @@ class BashToolAlignmentTest {
         assertThat(r.isError()).isTrue();
         // 输出必须在 "Exit code 1" 之前（CC :687 先 append 输出，:699 后 append 退出码），
         // 且 "Exit code 1" 是文本尾部（CC 无后缀换行）
-        assertThat(r.result().data()).endsWith("Exit code 1");
-        assertThat(r.result().data().indexOf("some output line")).isLessThan(r.result().data().indexOf("Exit code 1"));
+        assertThat(String.valueOf(r.result().data())).endsWith("Exit code 1");
+        assertThat(String.valueOf(r.result().data()).indexOf("some output line")).isLessThan(String.valueOf(r.result().data()).indexOf("Exit code 1"));
     }
 
     @Test
@@ -191,7 +191,7 @@ class BashToolAlignmentTest {
         // WHY: diff 退出 1 = 文件有差异（正常业务结果），非错误
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "diff a b", 1, "< old\n---\n> new", "");
         assertThat(r.isError()).isFalse();
-        assertThat(r.result().data()).contains("Files differ");
+        assertThat(String.valueOf(r.result().data())).contains("Files differ");
     }
 
     @Test
@@ -201,7 +201,7 @@ class BashToolAlignmentTest {
         //      ★ A2.md §5.3 误写 find 1=error，以 CC 为准
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "find / -name foo", 1, "", "");
         assertThat(r.isError()).isFalse();
-        assertThat(r.result().data()).contains("Some directories were inaccessible");
+        assertThat(String.valueOf(r.result().data())).contains("Some directories were inaccessible");
     }
 
     @Test
@@ -210,7 +210,7 @@ class BashToolAlignmentTest {
         // WHY: 未识别命令只有 0=成功，1+ 都是错误（DEFAULT_SEMANTIC）
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "git status", 1, "", "fatal: not a git repository");
         assertThat(r.isError()).isTrue();
-        assertThat(r.result().data()).contains("Exit code 1");
+        assertThat(String.valueOf(r.result().data())).contains("Exit code 1");
     }
 
     @Test
@@ -218,7 +218,7 @@ class BashToolAlignmentTest {
     void interpretExitCodeResult_unknownCommandExit0_success() {
         var r = bashTool.interpretExitCodeResult("test-tooluse-1", "ls -la", 0, "total 0", "");
         assertThat(r.isError()).isFalse();
-        assertThat(r.result().data()).contains("total 0");
+        assertThat(String.valueOf(r.result().data())).contains("total 0");
     }
 
     // ════════════════════════════════════════════════════════════════
@@ -245,7 +245,7 @@ class BashToolAlignmentTest {
         assertThat(LlmAgentLoop.isToolErrorData(r.result().data()))
             .as("R2 修复后 isToolErrorData 应识别真实 Bash 失败载荷（\n Exit code 非零 末尾标记）")
             .isTrue();
-        assertThat(r.result().data()).endsWith("Exit code 1");
+        assertThat(String.valueOf(r.result().data())).endsWith("Exit code 1");
     }
 
     @Test
@@ -257,9 +257,11 @@ class BashToolAlignmentTest {
         assertThat(r.isError())
             .as("成功输出以 'Error:' 开头不得误判为错误（CC 语义由退出码判定）")
             .isFalse();
+        // [错误通道 · CCJ-ERR-014] 前缀启发式已退役（改用 ToolError 结构判定）：
+        //   成功结果 data 是普通 String，不再因文本以 "Error:" 开头被误检为错误。
         assertThat(LlmAgentLoop.isToolErrorData(r.result().data()))
-            .as("对照：前缀启发式对 'Error:' 开头成功文本误检（false-positive）")
-            .isTrue();
+            .as("对照：结构判定对 'Error:' 开头的成功文本不再误检（旧前缀启发式已删）")
+            .isFalse();
     }
 
     // ─────────────────────────────────────────────
@@ -387,7 +389,7 @@ class BashToolAlignmentTest {
 
     private static ToolUseContext toolUseContext(PermissionMode permissionMode) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of(),
             null, permissionMode);
     }
@@ -395,7 +397,7 @@ class BashToolAlignmentTest {
     private static ToolUseContext toolUseContextWithCwd(PermissionMode permissionMode, Path effectiveCwd) {
         // 13 字段便利工厂（ToolUseContext.java:719）含 effectiveCwd → 持久化 workspaceDir 可断言
         return ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, permissionMode,
             Map.of(), false, "", effectiveCwd);
     }

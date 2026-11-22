@@ -29,7 +29,7 @@ import static org.mockito.Mockito.when;
  *   <li><b>三处同步</b>：DTO 字段 / toDto 透出 / update merge 分支，缺一处 = 前端开关「点了等于没点」。</li>
  * </ol>
  */
-@DisplayName("[V254] settings.channels_enabled 实时读源与开关契约")
+@DisplayName("[V254/V334] settings.channels_enabled 实时读源与开关契约（V334 起默认开）")
 class SettingsChannelsEnabledTest {
 
     private static final int SINGLETON_ID = 1;
@@ -53,22 +53,21 @@ class SettingsChannelsEnabledTest {
     // ────────────────── 读源三态 ──────────────────
 
     @Test
-    @DisplayName("三态：列 NULL 与整行缺失都返回 null（=未配置，不等于 false）")
-    void nullColumnAndMissingRowMeanUnconfigured() {
-        // WHY：null 与 false 必须可区分。null = 「没配过」→ 回落 yml 兜底；
-        //   false = 「用户明确关了」→ 必须压住 yml。若这里返回 false，
-        //   yml 开着的通道在用户 UI 关掉后会被顶回来（重启即复现）。
+    @DisplayName("[V334] 未配置（列 NULL / 整行缺失）⇒ 默认开（不再回落 yml）")
+    void unconfiguredDefaultsToEnabled() {
+        // [V334 用户裁定] 两个开关默认打开，DB 是唯一权威 ⇒ 未配置不再返回 null 让调用方
+        // 回落 yml，而是直接按「开」处理。旧断言（null=未配置）随 V334 语义变更一起改。
         SettingsMapper nullColumnMapper = mock(SettingsMapper.class);
         when(nullColumnMapper.selectOneById(SINGLETON_ID)).thenReturn(new SettingsRecord());
         assertThat(newService(nullColumnMapper).readDbChannelsEnabled())
-            .as("列 NULL = 未配置 → 必须返回 null（调用方据此回落 yml），不能是 false")
-            .isNull();
+            .as("列 NULL = 未配置 → 默认开")
+            .isTrue();
 
         SettingsMapper missingRowMapper = mock(SettingsMapper.class);
         when(missingRowMapper.selectOneById(SINGLETON_ID)).thenReturn(null);
         assertThat(newService(missingRowMapper).readDbChannelsEnabled())
-            .as("行缺失 = 未配置 → 必须返回 null")
-            .isNull();
+            .as("行缺失 = 未配置 → 默认开")
+            .isTrue();
     }
 
     @Test

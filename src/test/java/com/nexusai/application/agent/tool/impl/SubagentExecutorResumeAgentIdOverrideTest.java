@@ -15,7 +15,6 @@ import org.slf4j.LoggerFactory;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
@@ -36,7 +35,10 @@ import static org.assertj.core.api.Assertions.assertThatThrownBy;
 class SubagentExecutorResumeAgentIdOverrideTest {
 
     /** 固定 resume 原 agentId —— resume 续跑必须续写此键（CC resumeAgent.ts:240 override.agentId）。 */
-    private static final UUID ORIGINAL_AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000a1");
+    private static final String ORIGINAL_AGENT_ID = "a00000000000000a1";
+
+    /** 对外/日志的 CC 单一形态（a+16hex）—— 与 ORIGINAL_AGENT_ID 可逆对应。 */
+    private static final String ORIGINAL_AGENT_HEX = "a00000000000000a1";
 
     // ────────────────────────────────────────────────────────────────────────
     // 1. resume 路径：agentIdOverride 生效（续写原键）
@@ -72,17 +74,17 @@ class SubagentExecutorResumeAgentIdOverrideTest {
             List<String> logs = appender.list.stream()
                 .map(ILoggingEvent::getFormattedMessage).toList();
             assertThat(logs)
-                .as("resume 续跑必须续写原键: Step 1-5 agentId = 原 agentId " + ORIGINAL_AGENT_ID)
-                .anyMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_ID));
+                .as("resume 续跑必须续写原键: Step 1-5 agentId = 原 agentId " + ORIGINAL_AGENT_HEX)
+                .anyMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_HEX));
             // 反向断言：不得出现"新键"（任何非原 agentId 的 UUID）
             assertThat(logs.stream().filter(m -> m.contains("Step 1-5: agentId="))
-                .noneMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_ID) == false))
+                .noneMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_HEX) == false))
                 .as("不得出现新键 agentId")
                 .isTrue();
             // [REQ-R2-3] Step 18 writeMetadata 写点也复用 override 后的 agentId（transcript/metadata 同键）
             assertThat(logs)
                 .as("Step 18 元数据写点必须复用原键 (CC resumeAgent.ts:240 override.agentId 续写原 transcript)")
-                .anyMatch(m -> m.contains("Step 18: 已写入 agent 元数据 agent=" + ORIGINAL_AGENT_ID));
+                .anyMatch(m -> m.contains("Step 18: 已写入 agent 元数据 agent=" + ORIGINAL_AGENT_HEX));
         } finally {
             logger.detachAppender(appender);
             appender.stop();
@@ -132,7 +134,7 @@ class SubagentExecutorResumeAgentIdOverrideTest {
     // ────────────────────────────────────────────────────────────────────────
 
     /** 父 TUC 会话固定 UUID —— 父 TUC 分支 hasParent=true 判别 + 子 ctx 继承父 sessionId。 */
-    private static final UUID PARENT_AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000b1");
+    private static final String PARENT_AGENT_ID = "a00000000000000b1";
     private static final String PARENT_SESSION_ID = "00000000-0000-0000-0000-0000000000b2";
 
     /** 最小父 ToolUseContext（4 参紧凑构造）—— 经 8 参 SubagentExecutor 构造器注入驱动父 TUC 分支。 */
@@ -186,8 +188,8 @@ class SubagentExecutorResumeAgentIdOverrideTest {
                 .anyMatch(m -> m.contains("hasParent=true"));
             // 续写原键: 父 TUC 分支下 override 仍优先 (CC runAgent.ts:347 override?.agentId 优先级独立于分支)
             assertThat(logs)
-                .as("父 TUC 分支 resume 续跑必须续写原键: Step 1-5 agentId = 原 agentId " + ORIGINAL_AGENT_ID)
-                .anyMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_ID));
+                .as("父 TUC 分支 resume 续跑必须续写原键: Step 1-5 agentId = 原 agentId " + ORIGINAL_AGENT_HEX)
+                .anyMatch(m -> m.contains("Step 1-5: agentId=" + ORIGINAL_AGENT_HEX));
         } finally {
             executorLogger.detachAppender(appender);
             createLogger.detachAppender(appender);

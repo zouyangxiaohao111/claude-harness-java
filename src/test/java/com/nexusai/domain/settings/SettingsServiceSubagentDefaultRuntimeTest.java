@@ -72,17 +72,15 @@ class SettingsServiceSubagentDefaultRuntimeTest {
      * 用它根本表达不了「设置默认运行时」这个被测行为（会假绿）。
      */
     private static SettingsDto req(String defaultRuntime) {
-        return new SettingsDto(
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, defaultRuntime,
-            null, null, null);
+        // 用 JSON 构造（canonical 构造器参数已随设置项增长到 77+，手写极易错位）
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode node =
+                com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+            node.put("subagentDefaultRuntime", defaultRuntime);
+            return new com.fasterxml.jackson.databind.ObjectMapper().treeToValue(node, SettingsDto.class);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     @Test

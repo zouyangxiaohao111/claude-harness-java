@@ -105,7 +105,15 @@ public class ChannelAllowlistService {
             name = pluginSource;
             marketplace = null;
         }
-        if (marketplace == null || marketplace.isEmpty()) return false;
+        // [P0] 两条命中规则：
+        //   ① name@marketplace → 精确 (marketplace, name) 比对（CC 原语义，保留兼容）；
+        //   ② 普通渠道名（无 '@'）→ 任一行 plugin 同名即命中。内部 IM 渠道适配器用的是
+        //      普通名（不允许 '@'），旧规则恒 false ⇒ 纯 IM 绑定永远过不了资格判定。
+        if (marketplace == null || marketplace.isEmpty()) {
+            return mapper.selectAll().stream()
+                .map(ChannelAllowlistRecord::toDomain)
+                .anyMatch(e -> name.equals(e.plugin()));
+        }
         return isAllowed(marketplace, name);
     }
 

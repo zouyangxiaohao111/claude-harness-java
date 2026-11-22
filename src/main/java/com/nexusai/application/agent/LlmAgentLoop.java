@@ -226,21 +226,119 @@ public class LlmAgentLoop implements AgentLoop {
      */
     private static final ConcurrentHashMap<String, AtomicInteger> RUNNING_SESSIONS = new ConcurrentHashMap<>();
 
-    /** 标记会话进入运行态（run() 入口调用）。 */
-    public static void markRunning(String sessionId) {
-        if (sessionId == null) return;
-        RUNNING_SESSIONS.computeIfAbsent(sessionId, k -> new AtomicInteger()).incrementAndGet();
+    /**
+     * [sendmessage-cross-session · B] per-session 互斥锁 · <b>claim 与 running 切换共用同一把锁</b>。
+     *
+     * <p>WHY 需要独立锁对象（不直接用 {@code RUNNING_SESSIONS.computeIfAbsent} 的并发语义）：
+     * claim 的判据是「running / dispatching / 已持有 claim」三态组合，必须与 markRunning/markIdle
+     * 的写入在<b>同一临界区</b>内完成，否则出现「判 idle → 另一线程 markRunning → 本线程 claim 成功」
+     * 的双跑窗口（TOCTOU，与 M2 已修的 dispatching 缺口同源）。
+     *
+     * <p>锁对象只增不删（按 sessionId 常驻；会话数量级 ~百，泄漏可忽略），避免「删锁时另一个线程
+     * 刚拿到旧锁」的经典锁回收竞态。
+     */
+    private static final ConcurrentHashMap<String, Object> CLAIM_LOCKS = new ConcurrentHashMap<>();
+
+    private static Object claimLock(String sessionId) {
+        return CLAIM_LOCKS.computeIfAbsent(sessionId, k -> new Object());
     }
 
-    /** 标记会话退出运行态（run() finally 调用）；计数归零移除条目。 */
+    /**
+     * [sendmessage-cross-session · B] 会话起轮串行凭证（CC {@code QueryGuard} claim 等价物）。
+     *
+     * @param sessionId  被保留的会话（short sess-xxx / GLOBAL 哨兵）
+     * @param generation 进程内单调代次 —— {@link #releaseClaim} 只删「同代次」实例，
+     *                   旧的 finally 不会误删后来者的 claim
+     */
+    public record SessionClaim(String sessionId, long generation) {}
+
+    /** claim 代次源（进程级单调；只在持锁区内自增）。 */
+    private static final java.util.concurrent.atomic.AtomicLong CLAIM_GENERATION =
+        new java.util.concurrent.atomic.AtomicLong();
+
+    /** 当前持有的 claim（sessionId → 唯一实例）。 */
+    private static final ConcurrentHashMap<String, SessionClaim> CLAIMS = new ConcurrentHashMap<>();
+
+    /**
+     * [sendmessage-cross-session · B] 尝试取得会话起轮权 · running / dispatching / 已有 claim 均拒绝。
+     *
+     * <p>语义对齐 CC {@code QueryGuard.reserve()}（「非 idle 一律 false」）但更严格：
+     * dispatching 集合是旧 M2 通道（reserve/cancelReservation 兼容壳仍映射到它），本方法把三态
+     * 一并视为「非 idle」，使「主轮入口 + 空闲消费者」不会再并行起两个 run。
+     *
+     * <p>调用方铁律（同 reserve）：返回非 null 的调用方<b>必须</b>在所有 return/异常出口调
+     * {@link #releaseClaim(SessionClaim)}；返回 null 的调用方<b>不得</b>释放。
+     *
+     * @param sessionId 会话 key（null → 返回 null，不保留）
+     * @return 已取得的凭证；null = 会话已活跃（调用方不得释放）
+     */
+    public static SessionClaim tryClaim(String sessionId) {
+        if (sessionId == null) {
+            return null;
+        }
+        synchronized (claimLock(sessionId)) {
+            if (isSessionRunning(sessionId) || isSessionDispatching(sessionId)
+                    || CLAIMS.containsKey(sessionId)) {
+                return null;
+            }
+            SessionClaim claim = new SessionClaim(sessionId, CLAIM_GENERATION.incrementAndGet());
+            CLAIMS.put(sessionId, claim);
+            return claim;
+        }
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 释放起轮权 · <b>只删同代次实例</b>
+     * （旧 finally 不会删掉后来者刚取得的 claim）。
+     *
+     * @param claim {@link #tryClaim} 的返回值；null → no-op
+     */
+    public static void releaseClaim(SessionClaim claim) {
+        if (claim == null || claim.sessionId() == null) {
+            return;
+        }
+        synchronized (claimLock(claim.sessionId())) {
+            CLAIMS.remove(claim.sessionId(), claim);
+        }
+        // 锁对象保留（见 CLAIM_LOCKS 注释：删锁会引入锁回收竞态）
+    }
+
+    /** 会话当前是否被某个 claim 保留（未进入 running 之前的 dispatching 等价态）。 */
+    public static boolean isSessionClaimed(String sessionId) {
+        return sessionId != null && CLAIMS.containsKey(sessionId);
+    }
+
+    /** 标记会话进入运行态（run() 入口调用）· 与 claim 同一 per-session 锁。 */
+    public static void markRunning(String sessionId) {
+        if (sessionId == null) return;
+        synchronized (claimLock(sessionId)) {
+            RUNNING_SESSIONS.computeIfAbsent(sessionId, k -> new AtomicInteger()).incrementAndGet();
+        }
+    }
+
+    /** 标记会话退出运行态（run() finally 调用）；计数归零移除条目 · 与 claim 同一 per-session 锁。 */
     public static void markIdle(String sessionId) {
         if (sessionId == null) return;
-        RUNNING_SESSIONS.computeIfPresent(sessionId, (k, v) -> v.decrementAndGet() <= 0 ? null : v);
+        synchronized (claimLock(sessionId)) {
+            RUNNING_SESSIONS.computeIfPresent(sessionId, (k, v) -> v.decrementAndGet() <= 0 ? null : v);
+        }
     }
 
     /** 目标 session 是否已有运行中 agent_loop（idle 判定 · 对齐 CC isQueryActive）。 */
     public static boolean isSessionRunning(String sessionId) {
         return sessionId != null && RUNNING_SESSIONS.containsKey(sessionId);
+    }
+
+    /**
+     * 当前运行中的会话快照 · ListAgents 的 Peer sessions / Desktop 分节数据源。
+     *
+     * <p>对齐 CC 的 live 定义（本机 socket + pid + 可连）的本仓等价物：<b>RUNNING_SESSIONS 计数 &gt; 0</b>
+     * ——即本机进程内正在跑 agent loop 的会话，DB 历史会话不算。
+     *
+     * @return 运行中会话 ID 快照（不可变）
+     */
+    public static java.util.Set<String> activeSessionIds() {
+        return java.util.Set.copyOf(RUNNING_SESSIONS.keySet());
     }
 
     /**
@@ -277,8 +375,11 @@ public class LlmAgentLoop implements AgentLoop {
      */
     public static boolean reserve(String sessionId) {
         if (sessionId == null) return false;
-        if (isSessionRunning(sessionId)) return false;   // CC: status !== 'idle' → false
-        return DISPATCHING_SESSIONS.add(sessionId);      // 已在 dispatching → add=false（独占拒绝）
+        synchronized (claimLock(sessionId)) {
+            if (isSessionRunning(sessionId)) return false;   // CC: status !== 'idle' → false
+            if (isSessionClaimed(sessionId)) return false;   // [B] 新 claim 已持有时不再给 dispatching
+            return DISPATCHING_SESSIONS.add(sessionId);      // 已在 dispatching → add=false（独占拒绝）
+        }
     }
 
     /**
@@ -287,7 +388,9 @@ public class LlmAgentLoop implements AgentLoop {
      */
     public static void cancelReservation(String sessionId) {
         if (sessionId == null) return;
-        DISPATCHING_SESSIONS.remove(sessionId);
+        synchronized (claimLock(sessionId)) {
+            DISPATCHING_SESSIONS.remove(sessionId);
+        }
     }
 
     /** 会话是否处于 dispatching（条目已出队、异步链尚未开跑）· CC {@code QueryGuard} dispatching 分量。 */
@@ -300,7 +403,10 @@ public class LlmAgentLoop implements AgentLoop {
      * （{@code return this._status !== 'idle'}）—— 队列处理器判「能不能取该会话的条目」用本方法。
      */
     public static boolean isSessionActive(String sessionId) {
-        return isSessionRunning(sessionId) || isSessionDispatching(sessionId);
+        // [sendmessage-cross-session · B] 新增 claim：条目已出队 → claim 已持有、run 尚未 markRunning
+        // 的这段缺口与旧 dispatching 同义（若不计入，同一会话会被空闲消费者再取一批 = TOCTOU）。
+        return isSessionRunning(sessionId) || isSessionDispatching(sessionId)
+            || isSessionClaimed(sessionId);
     }
 
     /**
@@ -1510,7 +1616,14 @@ public class LlmAgentLoop implements AgentLoop {
         // [gap29] 同一 SessionMapper 桥接到会话级禁用工具集合静态读取（llmToolsArray static 上下文，
         //   对齐 MemoryBareModeConfig.bridgeSessionMapper 静态桥接惯例）。null 注入保持空集（不剔除）。
         SessionToolDisableConfig.setSessionMapper(sessionMapper);
+        // [unattended/brief V329] 同一 SessionMapper 桥接到会话级显式无人值守/Brief 状态读取
+        //   （sessionVisibleTools 是 static；旧「绑定渠道即无人值守」的 ImChatService 隐式判定已删）。
+        com.nexusai.application.agent.config.SessionModeState.setSessionMapper(sessionMapper);
     }
+
+    // [unattended V329] 原「桥接 ImChatService → ImUnattendedConfig」的 setter 已删除：
+    //   无人值守改读显式会话列（SessionModeState），绑定渠道本身不再禁 Ask（R6）。
+    //   ⛔ 不要复活绑定判定——那正是本次要移除的产品偏离。
 
     /** [F-24 Step 3] 原 B′ 兜底链的 ProjectMapper 注入点已随该链删除（唯一 DB 查询实现 =
      *  {@code ToolRegistrationConfig#sessionProjectRootResolver}）—— ⛔ 不得复活本 setter。 */
@@ -1542,6 +1655,28 @@ public class LlmAgentLoop implements AgentLoop {
             log.debug("[LlmAgentLoop] [sendmsg-inbox] agentNameRegistry 注入={} (CC agentNameRegistry · "
                     + "static loop 每轮 drain SendMessage 待办)",
                 agentNameRegistry != null);
+        }
+    }
+
+    /**
+     * [sendmessage-cross-session · B2-fix] 静态桥 {@link com.nexusai.application.agent.messaging.PeerRuntimeAdapter} ·
+     * 运行中 drain（{@link #drainAndInjectQueued} 是 static）在消费 peer 项前必须做「消费前复核」
+     * （{@link com.nexusai.application.agent.messaging.PeerRuntimeAdapter#revalidateForConsumption}），
+     * 而 static loop 上下文拿不到 Spring Bean ⇒ setter 同步静态桥（SessionMapper / AgentNameRegistry 同一先例）。
+     *
+     * <p>空语义：null = 未接线（非 Spring 夹具 / 无 peer 能力部署）⇒ peer 项一律<b>不消费</b>
+     * （⛔ 绝不放行未经复核的 peer 正文），与 {@code CronIdleExecutor} 未接线语义一致。
+     */
+    private static volatile com.nexusai.application.agent.messaging.PeerRuntimeAdapter staticPeerRuntimeAdapter;
+
+    /** [sendmessage-cross-session · B2-fix] setter 注入 PeerRuntimeAdapter（@Autowired(required=false)，同步静态桥）。 */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    public void setPeerRuntimeAdapter(
+            com.nexusai.application.agent.messaging.PeerRuntimeAdapter peerRuntimeAdapter) {
+        LlmAgentLoop.staticPeerRuntimeAdapter = peerRuntimeAdapter;
+        if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] [sendmsg-peer] peerRuntimeAdapter 注入={}（static loop drain 消费前复核）",
+                peerRuntimeAdapter != null);
         }
     }
 
@@ -1599,8 +1734,53 @@ public class LlmAgentLoop implements AgentLoop {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageLedgerRegistry;
 
-    /** b14：StructuredOutput 仅在显式非交互会话中启用，默认交互模式。 */
+    /**
+     * 本 run 是否非交互会话（结构化输出注入门的判据之一）· 对齐 CC
+     * {@code getIsNonInteractiveSession() = !STATE.isInteractive}（bootstrap/state.ts:1057-1059）。
+     *
+     * <p><b>判据（两源，任一为真即非交互）</b>：
+     * <ol>
+     *   <li>本字段 —— 入口经 {@link #setNonInteractiveSession(boolean)} 显式置位：
+     *       headless / {@code -p} / 无交互入口（{@code CronIdleExecutor} 无 WS streamContext 的
+     *       定时/队列代跑、{@code MainSessionBackgroundService} 主会话后台化）置 true；
+     *       普通交互入口（{@code ChatService.processUserMessage}）不置位 ⇒ 默认 false；</li>
+     *   <li>会话列 {@code sessions.non_interactive_session}（V57）= 非 0 → 真（会话级显式 headless 形态，
+     *       经 API 带 jsonSchema 的调用方在此标记「我是无人在键盘前的会话」）。</li>
+     * </ol>
+     *
+     * <p>{@code LlmAgentLoop} 是 {@code @Scope("prototype")} ⇒ 每次 {@code getObject()} 新实例，
+     * 标志不跨 run 泄漏；⛔ 不用全局 sysprop / ThreadLocal（会话态显式传参铁律）。
+     */
     private volatile boolean nonInteractiveSession = false;
+
+    /**
+     * 设定本 run 是否非交互会话（见 {@link #nonInteractiveSession} 的两源判据）。
+     *
+     * @param nonInteractive true = headless / -p / 后台会话；false = 交互式前台用户回合
+     */
+    public void setNonInteractiveSession(boolean nonInteractive) {
+        this.nonInteractiveSession = nonInteractive;
+        if (log.isDebugEnabled()) {
+            log.debug("[non-interactive] setNonInteractiveSession: session='{}' nonInteractive={}"
+                + "（结构化输出注入门判据）", this.streamSessionId, nonInteractive);
+        }
+    }
+
+    /**
+     * 解析本 run 是否非交互会话 · {@link #nonInteractiveSession} 或会话列
+     * {@code sessions.non_interactive_session}（V57，null/0 → false）。
+     *
+     * @param sessionId 会话 ID（null → 只看入参标志）
+     * @return true = 非交互会话
+     */
+    boolean resolveNonInteractiveSession(String sessionId) {
+        if (nonInteractiveSession) {
+            return true;
+        }
+        com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
+        return row != null && row.getNonInteractiveSession() != null
+            && row.getNonInteractiveSession() != 0;
+    }
 
     /**
      * [H7-arch Phase 5-2 P3-③] AgentLoopContext 共享工厂 · run() 经 {@code forSession(...)} 构造主循环 ctx。
@@ -2693,7 +2873,7 @@ public class LlmAgentLoop implements AgentLoop {
             ? resolvedModel : params.modelName();
         QuerySource querySource = params.querySource();
         String sessionId = params.sessionId();
-        UUID agentId = params.agentId();
+        String agentId = params.agentId();
         String systemPrompt = params.systemPrompt();
         // [RES-SP31 · OPD-SP-31] 用户追加指令（CC main.tsx:1364-1382 + systemPrompt.ts:121）
         String appendSystemPrompt = params.appendSystemPrompt();
@@ -2934,7 +3114,7 @@ public class LlmAgentLoop implements AgentLoop {
             if (agentId == null) {
                 sessionAgentStateRegistry.register(sessionId, state);
             } else {
-                sessionAgentStateRegistry.register(agentId, state);
+                sessionAgentStateRegistry.registerAgent(agentId, state);
             }
             if (log.isDebugEnabled()) {
                 log.debug("[P1-6] 注册会话 AgentState: key={} agentId={} sessionId={}",
@@ -3068,13 +3248,15 @@ public class LlmAgentLoop implements AgentLoop {
         //   hasStructuredOutputTool = tools.some(t => toolMatchesName(t, SYNTHETIC_OUTPUT_TOOL_NAME))
         //   （tools = 传给 LLM 的 LLM-facing 工具数组；main.tsx:1886 在 jsonSchema 存在时把
         //   SyntheticOutputTool 加入 tools）。
-        // ⚠️ Java 侧为「单门控」params.jsonSchema() != null（本 if）：主循环 llmToolsArray →
-        //   ToolRegistry.toOpenAiToolsArray:444-448 对 SYNTHETIC_OUTPUT_TOOL_NAME 走 SPECIAL_TOOLS
-        //   过滤从 LLM-facing schema 剔除（仅 fork/HOOK_AGENT 的 effectiveRegistry 设
-        //   skipSpecialToolsFilter=true 才暴露）→ CC 语义的 hasStructuredOutputTool 当前主循环恒 false。
-        //   因此 enforcement 在工具未暴露前不可满足（R1），完整 enablement 需 per-tool exemption。
+        // ⚠️ [2026-11-20 对齐 CC 注入门] Java 侧门控 = params.jsonSchema() != null
+        //   && 非交互会话（本 if）。CC main.tsx:1885-1891 只在「jsonSchema 存在 且
+        //   （非交互 或 后台会话）」时把 SyntheticOutputTool 加进 tools；QueryEngine.ts:327-333
+        //   的 hasStructuredOutputTool 因此才可能为真 —— 交互式带 json-schema 是**静默忽略**
+        //   （工具不注入、模型看不到、也不注册 STOP 强制 hook，否则会无限 blocking 重入）。
+        //   注入本体见本方法后段 applyStructuredOutputEnablement（同一判据单点）。
         // jsonSchema 经 HTTP 请求体 SendMessageRequest.jsonSchema → RunRequest.jsonSchema → 本门控。
-        if (params.jsonSchema() != null && hookRegistry != null && sessionId != null) {
+        if (params.jsonSchema() != null && hookRegistry != null && sessionId != null
+                && resolveNonInteractiveSession(sessionId.toString())) {
             try {
                 hookRegistry.registerStructuredOutputEnforcement(sessionId.toString());
                 // [IMP-HR-08 R1/R2] 记录结构化输出 jsonSchema + 本 run 起始 StructuredOutput 调用基线
@@ -3510,7 +3692,8 @@ public class LlmAgentLoop implements AgentLoop {
                 GenericHook.HookResult promptResult = hookRegistry.executeEvent(
                     promptEvent, null,
                     ToolUseContext.of(
-                        agentId, sessionId, PermissionMode.DEFAULT, List.of(), "",
+                        agentId,
+                        sessionId, PermissionMode.DEFAULT, List.of(), "",
                         runAbortController != null
                             ? runAbortController
                             : com.nexusai.application.agent.tool.AbortController.NOOP),
@@ -3641,13 +3824,34 @@ public class LlmAgentLoop implements AgentLoop {
             params.agentContext(),
             // [批 rfs-replay-3b] 跨进程 readFileState 恢复的原料 = 本方法 :2662-2671 已读到的
             //   那一次 DB 原始转录（⛔ 不再新增第二次 DB I/O；null/空 ⇒ replay 软降级跳过）。
-            resumeRawTranscript);
+            resumeRawTranscript,
+            // [V306] 定时任务通知目标（RunRequest.notifyChats() → base TUC → per-turn TUC →
+            //   SendUserMessage 工具 execute 形参）。非定时任务 run 恒 null ⇒ 零行为变化。
+            params.notifyChats());
         // [request-extras 批 1] 请求级通用透传：RunRequest.requestExtras() → base TUC →
         //   per-turn TUC（AgentLoopContext.toolExecContext 的 with* 派生按引用透传）→ 工具 execute 形参。
         //   本批骨架空转：KB 入口尚未写入 ⇒ params.requestExtras() 恒 null ⇒ withRequestExtras
         //   短路返回同一实例（零新实例、零行为变化）。
         if (baseTuc != null) {
             baseTuc = baseTuc.withRequestExtras(params.requestExtras());
+        }
+        // ── [sendmessage-cross-session · B] peer 执行来源：RunRequest → base TUC + run 级 state ──
+        //   唯一来源 = 服务端投递侧构造的 PeerExecutionOrigin（CronIdleExecutor 空闲路径 / drain 轮内
+        //   注入）；普通用户轮为 null ⇒ 两个对象都不带来源（清污：新 run 不复用上一 run 的 origin）。
+        //   state 侧供 AgentLoopContext.toolExecContext 在**每一轮**派生 per-turn TUC 时盖章
+        //   （轮内收到 peer 后 drain 改写 state，后续工具轮立即带上 —— 见 drainAndInjectQueued）。
+        if (params.peerExecutionOrigin() != null) {
+            state.setPeerExecutionOrigin(params.peerExecutionOrigin());
+            if (baseTuc != null) {
+                baseTuc = baseTuc.withPeerExecutionOrigin(params.peerExecutionOrigin());
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[LlmAgentLoop] peer 回合开始: session={} from={} messageId={} hops={}"
+                        + "（来源由服务端投递侧构造；守卫读 per-turn TUC 同一字段）",
+                    params.sessionId(), params.peerExecutionOrigin().sourceSessionId(),
+                    params.peerExecutionOrigin().messageId(),
+                    params.peerExecutionOrigin().hopChain().size());
+            }
         }
         // ── [批 A2b] 会话 SESSION 档授权回读注入 · 对齐 CC appState.toolPermissionContext（会话内存态）──
         //   背景：CC 的 appState.toolPermissionContext 活在长驻进程里（文件类弹窗「Yes, during this
@@ -3795,7 +3999,7 @@ public class LlmAgentLoop implements AgentLoop {
         // [2026-08-12 △-03] SessionStart hook initialUserMessage 替换首轮用户消息 · 对齐 CC
         //   pendingInitialUserMessage (sessionStart.ts:150-151 + cli/print.ts:697: SessionStart
         //   hooks 可 emit initialUserMessage — 首个 user turn 用 hook 提供的消息替换原 prompt)。
-        java.util.UUID promptAgentId = deriveAgentIdForCommandFilter(state);
+        String promptAgentId = deriveAgentIdForCommandFilter(state);
         String effectiveUserPrompt = sessionStartInitialUserMessage != null
             ? sessionStartInitialUserMessage : userPrompt;
         // [F1 · attachment-multimodal] 生产链路接线 · 先于首个 user 消息构造（queue 入队 / 直
@@ -3900,7 +4104,11 @@ public class LlmAgentLoop implements AgentLoop {
                 // [slash-align remaining-1] slash 命令不入队（对齐 CC：空闲 slash 直接 processSlashCommand，
                 //   入队后 drainForQuery 跳过 slash（:504 query.ts:1573）+ poll 谓词 workload==null 不消费
                 //   → 永久残留泄漏）。P1 边界已拦截 slash 转技能内容；此处防御绕过边界的 slash 不残留。
-                && (effectiveUserPrompt == null || !effectiveUserPrompt.startsWith("/"))) {
+                // [sendmessage-cross-session · B] peer 回合例外：peer 正文不是用户键盘输入（可能是
+                //   "/xxx" 形式的文本），必须以 skipSlashCommands=true 入队走纯文本 drain，⛔ 不得被
+                //   slash 守卫拦到直拼分支（那会绕过 peer 投影与信封）。
+                && (params.peerExecutionOrigin() != null
+                    || effectiveUserPrompt == null || !effectiveUserPrompt.startsWith("/"))) {
             // [3b] 用户 prompt 入队补 sessionId（state.sessionId() 派生 UUID 串）· 顺序约束：必须先于 3a
             // 生效 —— 否则 3a 落地后本 prompt 因 sessionId=null 被 drainForQuery 的"全局命令不捞"
             // 规则误伤捞不回来（A-queue-ownership-probe §2.2 场景 B）。带归属后：本会话首轮 drain
@@ -3908,34 +4116,78 @@ public class LlmAgentLoop implements AgentLoop {
             // workload==null）也不碰它。10 参构造 sessionId=short 直键（[session-id-short] 消费侧
             // drainForQuery 裸 equals 必中，原 canonicalUuid 归一化比较失去前提）。
             String promptSessionId = state.sessionId();
+            // [sendmessage-cross-session · B] peer 回合的首条 prompt **也走队列**（同一 drain 分支）：
+            //   workload="peer-message" + origin.kind="peer" + peerEnvelope=origin.toEnvelope(...)，
+            //   ⇒ turn-0 drain 看到 peerEnvelope 非 null → 同一 RAW 投影 + 同一 formatter（只包一次）。
+            //   skipSlashCommands=true：peer 正文是纯文本（同 bridge/CCR 语义），不被 slash 分支吞掉。
+            //   isMeta=true：peer 行是「非用户键入」（UI 隐藏、模型可见）。
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin promptPeerOrigin =
+                params.peerExecutionOrigin();
+            boolean promptIsPeer = promptPeerOrigin != null;
+            com.nexusai.application.agent.messaging.PeerEnvelope promptPeerEnvelope = promptIsPeer
+                ? promptPeerOrigin.toEnvelope(null, false) : null;
+            com.nexusai.application.agent.tasks.NotificationQueue.MessageOrigin promptOrigin =
+                promptIsPeer
+                    ? new com.nexusai.application.agent.tasks.NotificationQueue.MessageOrigin("peer", null)
+                    : null;
             mainCtx.notificationQueue().enqueue(new com.nexusai.application.agent.tasks.NotificationQueue.QueueItem(
                 effectiveUserPrompt, com.nexusai.application.agent.tasks.NotificationQueue.MODE_PROMPT,
                 null /* priority=null → enqueue() 默认 next */, null /* 主线程 agentId */,
                 this.streamUserMessageId /* [2026-08-25 主 prompt uuid] controller 传入的 userMessageId（msg-xxx）→
                    主 prompt user 消息在 state.messages 的 id = msg-xxx，lastUserMessageId() 返回 msg-xxx →
                    实时 chunk userMessageId 与 DB 落库一致（原 null → 随机 UUID 归错组）。null（headless/
-                   cron 无 controller 上下文）保持随机 UUID 兜底 */, false /* isMeta（用户输入非系统生成）*/,
-                null /* workload（非 cron）*/, false /* skipSlashCommands */,
-                null /* origin（CC "undefined = human (keyboard)"）*/,
-                promptSessionId /* [3b] 归属创建会话（派生 UUID 串）*/));
+                   cron 无 controller 上下文）保持随机 UUID 兜底 */, promptIsPeer /* isMeta（peer=非用户键入）*/,
+                promptIsPeer ? "peer-message" : null /* workload */,
+                promptIsPeer /* skipSlashCommands（peer 正文按纯文本送模型）*/,
+                promptOrigin /* origin（peer / null=human keyboard）*/,
+                promptSessionId /* [3b] 归属创建会话（派生 UUID 串）*/,
+                null /* boundProject */, null /* scheduleId */, null /* attachments */,
+                null /* userAttachments */, null /* imagePasteIds */,
+                null /* [V306] notifyChats（peer 入队无通知目标）*/,
+                promptPeerEnvelope /* [B] 跨会话信封（非 peer 为 null）*/));
             if (log.isInfoEnabled()) {
                 log.info("LlmAgentLoop.run start: prompt 入队 (mode=prompt, priority=next, sessionId={}) chars={}"
-                    + " · CC enqueue(mode='prompt') [3b 归属创建会话]",
-                    promptSessionId, effectiveUserPrompt.length());
+                    + " · CC enqueue(mode='prompt') [3b 归属创建会话] peer={} envelope={}",
+                    promptSessionId, effectiveUserPrompt.length(), promptIsPeer,
+                    promptPeerEnvelope != null ? promptPeerEnvelope.messageId() : "null");
             }
         } else {
-            // [A4] 主 user 消息图片注入 + 多模态路由 · 对齐 CC attachments.ts:1062-1071
-            //   （prompt submit 时 buildImageContentBlocks 注入主 user 消息 content 数组）。
-            //   有图片附件 && 模型 supportsImage → contentBlocks=[text, ...image]；不支持 →
-            //   多模态提示（描述附件 + contentId）供模型调 VisionAnalyzeTool 代理视觉模型分析；
-            //   无附件 → 纯文本（现状不变）。
-            state.appendMessage(buildUserMessageWithImages(
-                imageAttachmentStore, pdfAttachmentProcessor, modelMapper, providerMapper,
-                effectiveUserPrompt, modelName,
-                imageSessionKey(sessionId), null, false,
-                resolveMultimodalModelName() /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/));
-            appendSyntheticFileReadMessages(state, params.attachments(), this.attachmentService);
-            appendPdfReferenceMessages(state, pdfAttachmentProcessor);
+            if (params.peerExecutionOrigin() != null) {
+                // [sendmessage-cross-session · B] 无队列兜底（headless / 测试 / 未注入队列）：
+                //   仍走**同一投影**（peerMessageDto + 同一 structuredOutput + 同一登记），只是不经 drain。
+                //   ⛔ 不得直拼用户原文 —— 那会把 peer 行落成普通用户消息（丢 author/subtype/isMeta）。
+                com.nexusai.application.agent.messaging.PeerExecutionOrigin fallbackOrigin =
+                    params.peerExecutionOrigin();
+                com.nexusai.application.agent.messaging.PeerEnvelope fallbackEnvelope =
+                    fallbackOrigin.toEnvelope(null, false);
+                java.util.Map<String, Object> fallbackSo =
+                    peerStructuredOutput(fallbackOrigin, fallbackEnvelope.summary());
+                ChatMessageDto fallbackMsg = peerMessageDto(
+                    this.streamUserMessageId != null ? this.streamUserMessageId
+                        : fallbackOrigin.messageId(),
+                    effectiveUserPrompt, fallbackOrigin.sourceSessionId(), fallbackSo);
+                state.addInjectedQueuedMessage(fallbackMsg.id(), effectiveUserPrompt, "peer", null, true,
+                    fallbackOrigin.sourceSessionId(), "agent_message", fallbackSo);
+                state.appendMessage(fallbackMsg);
+                if (log.isInfoEnabled()) {
+                    log.info("[LlmAgentLoop] peer 回合首条 prompt 直拼（无通知队列）: session={} from={} "
+                            + "messageId={}（同一投影 + 同一落库出口）",
+                        sessionId, fallbackOrigin.sourceSessionId(), fallbackOrigin.messageId());
+                }
+            } else {
+                // [A4] 主 user 消息图片注入 + 多模态路由 · 对齐 CC attachments.ts:1062-1071
+                //   （prompt submit 时 buildImageContentBlocks 注入主 user 消息 content 数组）。
+                //   有图片附件 && 模型 supportsImage → contentBlocks=[text, ...image]；不支持 →
+                //   多模态提示（描述附件 + contentId）供模型调 VisionAnalyzeTool 代理视觉模型分析；
+                //   无附件 → 纯文本（现状不变）。
+                state.appendMessage(buildUserMessageWithImages(
+                    imageAttachmentStore, pdfAttachmentProcessor, modelMapper, providerMapper,
+                    effectiveUserPrompt, modelName,
+                    imageSessionKey(sessionId), null, false,
+                    resolveMultimodalModelName() /* [U2 自主引导] 多模态档位模型名注入引导（settings.multimodalModelName）*/));
+                appendSyntheticFileReadMessages(state, params.attachments(), this.attachmentService);
+                appendPdfReferenceMessages(state, pdfAttachmentProcessor);
+            }
         }
         // ── [skill-listing-cc-align 2026-09-10] skill_listing 注入点已下移至 loop() turn-0 drain 之后 ──
         //   CC：skill_listing 是 attachment，由 processTextPrompt 以 messages:[userMessage, ...attachments]
@@ -4886,6 +5138,26 @@ public class LlmAgentLoop implements AgentLoop {
      */
     private static String turnSessionId(AgentLoopContext ctx, ToolUseContext perTurnTuc) {
         return perTurnTuc != null ? perTurnTuc.sessionId() : ctx.streamSessionId();
+    }
+
+    /**
+     * [V330] 派生本轮 TUC 后立即挂「本轮可见性快照」。
+     *
+     * <p>快照在 executor 与 schema 构造之前捕获，两者与 ToolSearch / 执行守卫读同一份；
+     * 运行中切换工具/模式只影响下一轮（空闲时下一轮立即生效）。
+     * 只在这里赋值一次，调用方局部变量仍是 effectively-final（可被后续 lambda 捕获）。
+     *
+     * @param tuc 派生的 per-turn TUC（可 null）
+     * @return 挂了快照的 TUC；入参 null 原样返回
+     */
+    private static ToolUseContext withTurnVisibility(ToolUseContext tuc) {
+        if (tuc == null) {
+            return null;
+        }
+        com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot snapshot =
+            com.nexusai.application.agent.tool.SessionToolVisibility.capture(tuc.sessionId());
+        return tuc.withRequestExtras(com.nexusai.application.agent.tool.SessionToolVisibility
+            .attach(tuc.requestExtras(), snapshot));
     }
 
     /**
@@ -7141,7 +7413,8 @@ public class LlmAgentLoop implements AgentLoop {
             //   与本处（per-tool-round 工具面）共用**同一实现**，不复制粘贴两份。
             //   差异仅在 queryTracking：本处传 turnQueryTracking（每轮递增的链 ID，工具面语义），
             //   do-while 外传 null（材料收集不消费 queryTracking）。
-            ToolUseContext perTurnTuc = deriveTurnTuc(ctx, params, state, turnQueryTracking);
+            // [V330] 派生时立即挂本轮可见性快照（只赋值一次 ⇒ 下方 lambda 仍可捕获）。
+            ToolUseContext perTurnTuc = withTurnVisibility(deriveTurnTuc(ctx, params, state, turnQueryTracking));
             StreamingToolExecutor[] streamingExecRef = new StreamingToolExecutor[1];
             streamingExecRef[0] = (perTurnTuc != null && !perTurnTuc.availableTools().isEmpty() && streamingEnabled)
                 ? AgentLoopContext.buildStreamingExecutor(ctx, perTurnTuc, state, turnAssistantId,
@@ -7400,6 +7673,16 @@ public class LlmAgentLoop implements AgentLoop {
             //    ⚠️ 本行**不得**搬出循环：CC query.ts:900 每个 tool 轮都贴一次
             //    （搬出 ⇒ meta user 消息只贴一次，后续轮丢失 CLAUDE.md 上下文 / 顺序错位）。
             messagesForLlm = AgentLoopContext.prependUserContext(messagesForLlm, params.userContext());
+            // coordinator_context 尾部动态附件 · 对齐 exe 2.1.328 Ra()（producer @336413600）：
+            //   worker 工具清单变化 → "The worker tools have changed; this replaces the earlier list."；
+            //   模式结束 → "Coordinator mode has ended; the earlier list of worker tools no longer applies."
+            //   只在主线程投递（USER / REPL_MAIN_THREAD / SDK，方法内判定）。
+            boolean coordContextActive = com.nexusai.application.agent.prompt.PromptAlignSettingsResolver
+                .coordinatorModeActiveForSession(state.sessionId(), promptAlignResolverFromCtx(ctx), coordinatorMode);
+            String coordWorkerTools = params.userContext() != null
+                ? params.userContext().get("workerToolsContext") : null;
+            AgentLoopContext.maybeEmitCoordinatorContext(
+                state, params.querySource(), coordContextActive, coordWorkerTools);
             if (log.isDebugEnabled()) {
                 log.debug("LlmAgentLoop s10: 每 tool 轮 system prompt 段完成（材料收集由调用方一次）: "
                         + "custom={}, promptSegments={}, userKeys={}, systemKeys={}",
@@ -7625,12 +7908,11 @@ public class LlmAgentLoop implements AgentLoop {
             // [IMP-HR-08 R1] jsonSchema 结构化输出 enablement · 把 schema 专用 SyntheticOutputTool
             //   暴露给主循环 LLM · 对齐 CC main.tsx:1885-1891（jsonSchema 存在时
             //   createSyntheticOutputTool(jsonSchema) 追加到 tools 数组尾部，位于 getTools() 过滤之后）。
-            //   WHY: ToolRegistry.toOpenAiToolsArray:444-448 对 SYNTHETIC_OUTPUT_TOOL_NAME 走
-            //   SPECIAL_TOOLS 过滤（仅 skipSpecialToolsFilter 才暴露）→ 不追加则 LLM 看不到该工具，
-            //   enforcement（hasSuccessfulToolCall）恒不可满足 → STOP 全 blocking 重入（R1 前置解除）。
-            if (state.structuredOutputJsonSchema() != null && toolsAssembly != null && toolsAssembly.tools() != null) {
-                appendStructuredOutputToolToSchema(toolsAssembly.tools(), state.structuredOutputJsonSchema());
-            }
+            //   [2026-11-20 注入门对齐 CC] 追加条件 = jsonSchema 非空 **且**（非交互 或 后台会话）；
+            //   交互式会话即使带 json-schema 也不追加（CC 静默忽略），判据单点 =
+            //   {@link #shouldInjectStructuredOutput}（同判据也门控 enforcement 注册与 STOP 安全阀）。
+            applyStructuredOutputEnablement(toolsAssembly != null ? toolsAssembly.tools() : null,
+                state.structuredOutputJsonSchema(), perTurnTuc);
             // [G16① OPD-H-06] deferred_tools_delta 附件（主循环 + subagent 共享 queryLoop 路径）·
             //   对齐 CC claude.ts:1328-1330（deferred 工具经 persisted attachment 宣布）+
             //   attachments.ts:836-848 getAttachments → getDeferredToolsDeltaAttachment +
@@ -9600,6 +9882,8 @@ public class LlmAgentLoop implements AgentLoop {
                     .withReasoningDurationMs(computeReasoningDurationMs(reasoningStartMs, reasoningEndMs))
                     // [B7-R9] 输出解码耗时 decodeMs 挂载（t/s 前端展示；同 reasoningDurationMs 写点）
                     .withDecodeMs(computeDecodeMs(firstTokenMs));
+            // [content-blocks] 内容块顺序挂载（须在其它 with* 之后；单独一行避开自引用初始化）
+            plainTextAssistantMsg = plainTextAssistantMsg.withBlocks(blocksOf(plainTextAssistantMsg, msg));
             state.appendMessage(plainTextAssistantMsg);
             // [D] 发射点 ③：纯文本 assistant 真实模型产出 → onMessage（对齐 CC forkedAgent.ts:578
             //   消费侧 onMessage?.(message)；CC query() yield 的 assistant 消息类型之一）。
@@ -10724,6 +11008,133 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [sendmessage-cross-session · B2-fix] 运行中 drain 的单条 peer 项消费（唯一 peer 投影点）。
+     *
+     * <p><b>顺序（不可提前产生副作用）</b>：先
+     * {@link com.nexusai.application.agent.messaging.PeerRuntimeAdapter#revalidateForConsumption}
+     * （当前设置 + 目标当前最终有效模式），<b>只有</b> ACCEPT 才登记 state / append（→ 唯一落库出口）。
+     *
+     * <ul>
+     *   <li>ACCEPT → 原投影逻辑（role=user / isMeta=true / subtype=agent_message /
+     *       author=来源 sessionId / queuedOrigin='peer' / content=原文 /
+     *       structuredOutput={peer_source, agent_summary}）；</li>
+     *   <li>HOLD → 写<b>注入的</b> HeldPeerStore（{@code DbHeldPeerStore}，经 adapter），
+     *       不登记、不落库、不唤醒；</li>
+     *   <li>REFUSE → 丢弃并记日志，同样不产生任何副作用；</li>
+     *   <li>已消费（held 行 accepted，= 空闲路径已落库）→ <b>不判策略</b>、不重打落地标记，
+     *       仍按同一投影 append 进本轮 state（同 id 落库幂等）—— 见方法体内 [idle-then-drain 去重]；</li>
+     *   <li>未接线（adapter=null，非 Spring 夹具）→ 不消费（⛔ 绝不放行未经复核的 peer 正文）。</li>
+     * </ul>
+     *
+     * <p>抽成包内静态方法是为了让「策略变为 hold ⇒ 不进 state / 不落库」可被窄测试直接驱动
+     * （纯对象，无需构造 {@code AgentLoopContext}）。行为与内联分支逐字一致。
+     *
+     * @param state                   目标 run 的 state（sessionId / turnCount 读取源）
+     * @param item                    peer 队列项（{@code peerEnvelope != null}）
+     * @param injectedQueuedMessages  本批注入项登记表（可为 null）
+     * @param adapter                 运行期适配器（null = 未接线）
+     * @return true = 已按 ACCEPT 消费；false = 未消费（无 state / 落库副作用）
+     */
+    static boolean injectPeerQueuedItem(
+            AgentState state,
+            com.nexusai.application.agent.tasks.NotificationQueue.QueueItem item,
+            java.util.List<AgentState.InjectedQueuedMessage> injectedQueuedMessages,
+            com.nexusai.application.agent.messaging.PeerRuntimeAdapter adapter) {
+        if (state == null || item == null || item.peerEnvelope() == null) {
+            return false;
+        }
+        com.nexusai.application.agent.messaging.PeerEnvelope envelope = item.peerEnvelope();
+        String receiverSessionId = state.sessionId();
+        if (adapter == null) {
+            // 未接线（非 Spring 夹具）：revalidate 无法执行 ⇒ 按「不消费」处理（与 CronIdleExecutor 同语义）。
+            log.error("[LlmAgentLoop] turn={} peer 项消费被拒（PeerRuntimeAdapter 未接线，无法 revalidate）"
+                    + " messageId={} session={} —— 不登记、不落库、不唤醒",
+                state.turnCount(), envelope.messageId(), receiverSessionId);
+            return false;
+        }
+        // [idle-then-drain 去重 · 2026-11-20 E2E 第三轮] 空闲路径（CronIdleExecutor.handlePeerQueuedItem）
+        //   消费一条已批准 peer 项时：落库 → markConsumed（held 行置 accepted）→ 带
+        //   RunRequest.peerExecutionOrigin 起轮。doRun 会把同一条消息重建为本回合首条 prompt 重新入队
+        //   （PeerExecutionOrigin 不携带一次性批准标记 ⇒ 重入队信封 preApproved=false）。
+        //   若此处再按策略复核：hold 设置下误判 HOLD → holdRevalidated 命中 accepted 终态行 → 误报
+        //   ERROR，且消息进不了本轮上下文（同一 messageId 被判了两次）。
+        //   ⇒ 以<b>权威落库状态</b>（accepted）识别「已消费」：不判策略、不重打落地标记，
+        //     仍按同一投影注入本轮（同 id → 落库 11 参重载按 id 幂等，不产生第二行）。
+        //   ⛔ 不是把 ERROR 降级：真正的策略误判（未消费项）仍按下方原样判 HOLD/REFUSE。
+        boolean alreadyConsumed = adapter.isMessageConsumed(envelope.messageId());
+        if (!alreadyConsumed) {
+            com.nexusai.application.agent.messaging.PeerInboundPolicy.Outcome outcome =
+                adapter.revalidateForConsumption(envelope, receiverSessionId);
+            if (outcome == null
+                    || outcome.decision()
+                        != com.nexusai.application.agent.messaging.PeerInboundPolicy.Decision.ACCEPT) {
+                if (outcome != null
+                        && outcome.decision()
+                            == com.nexusai.application.agent.messaging.PeerInboundPolicy.Decision.HOLD) {
+                    // HOLD：写注入的 HeldPeerStore（未审批不得入历史 / 入模型 / 唤醒）。
+                    adapter.holdRevalidated(receiverSessionId, envelope, item.value(), outcome);
+                    log.info("[LlmAgentLoop] turn={} drain peer 项消费前复核 HOLD → 回写 held"
+                            + "（不登记/不落库/不唤醒）session={} messageId={} reason={}",
+                        state.turnCount(), receiverSessionId, envelope.messageId(), outcome.reason());
+                } else {
+                    log.warn("[LlmAgentLoop] turn={} drain peer 项消费前复核 REFUSE → 丢弃"
+                            + "（不登记/不落库/不唤醒）session={} messageId={} detail={}",
+                        state.turnCount(), receiverSessionId, envelope.messageId(),
+                        outcome == null ? "null outcome" : outcome.detail());
+                }
+                return false;
+            }
+        } else if (log.isDebugEnabled()) {
+            log.debug("[LlmAgentLoop] turn={} drain peer 项已由空闲路径消费落库 → 跳过策略复核与落地标记"
+                    + "（仍投影进本轮，同 id 幂等）session={} messageId={}",
+                state.turnCount(), receiverSessionId, envelope.messageId());
+        }
+        com.nexusai.application.agent.messaging.PeerExecutionOrigin origin =
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin.fromEnvelope(
+                envelope, envelope.fromName(),
+                com.nexusai.application.agent.messaging.PeerExecutionOrigin.SOURCE_KIND_PEER);
+        // 轮内更新：后续每轮 per-turn TUC 立即带来源（守卫不漏防）。
+        state.setPeerExecutionOrigin(origin);
+        state.setUsageSource(com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND);
+        java.util.Map<String, Object> peerSo = peerStructuredOutput(origin, envelope.summary());
+        // 行 id：队列 uuid 优先（生产 peer 项恒 = messageId）；uuid 为空（headless doRun 重入队时
+        // streamUserMessageId 可能为 null）回落信封 messageId ⇒ 同一 messageId 恒同一行 id，
+        // 「一个 messageId 只投递一次」在无流上下文时也成立。
+        String peerRowId = item.uuid() != null ? item.uuid() : envelope.messageId();
+        ChatMessageDto peerMsg = peerMessageDto(peerRowId, item.value(),
+            origin.sourceSessionId(), peerSo);
+        String peerRegUuid = item.uuid() != null ? item.uuid() : peerMsg.id();
+        // 登记（8 参）必须在 appendMessage 之前 —— append 触发的落库监听器按 uuid 反查 registry
+        // 命中即走既有唯一落库出口（⛔ 不新增第二个出口）。
+        state.addInjectedQueuedMessage(peerRegUuid, item.value(), "peer", null, true,
+            origin.sourceSessionId(), "agent_message", peerSo);
+        if (injectedQueuedMessages != null) {
+            injectedQueuedMessages.add(new AgentState.InjectedQueuedMessage(
+                peerRegUuid, item.value(), "peer", null, true,
+                origin.sourceSessionId(), "agent_message", peerSo));
+        }
+        state.appendMessage(peerMsg);
+        // [缺陷1 · 状态机] 已批准消息真正进入本会话历史 ⇒ held 行 approved → accepted
+        //（带批准标记的信封才有 held 行；普通直投为 no-op）。
+        // [idle-then-drain 去重] 已消费（accepted）项不再重复调用：行已不在 approved，调用只会
+        // 打 WARN；语义上本次是「重放投影」而非一次新的消费落地。
+        if (!alreadyConsumed) {
+            adapter.markConsumed(envelope);
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[LlmAgentLoop] turn={} drain 注入 peer 消息: session={} from={} messageId={} "
+                    + "chars={} isMeta=true queuedOrigin=peer subtype=agent_message "
+                    + "（{} → 投影+登记先于 append；后续 per-turn TUC 来源已更新）",
+                state.turnCount(), state.sessionId(), origin.sourceSessionId(),
+                origin.messageId(), item.value() != null ? item.value().length() : 0,
+                alreadyConsumed
+                    ? "已消费（空闲路径已落库）→ 跳过策略复核与落地标记"
+                    : "复核 ACCEPT");
+        }
+        return true;
+    }
+
+    /**
      * [queue-full-align P2/P4] 统一队列 drain + 注入 · 对齐 CC query.ts:1547-1643。
      *
      * <p>由两处调用：循环顶（P2 needsFollowUp 守门后，每轮工具后续续调 LLM 前）与 maxTurns 边界
@@ -10754,8 +11165,7 @@ public class LlmAgentLoop implements AgentLoop {
         // 主线程只消费 agentId==undefined 的项 (cmd.agentId===undefined);
         // subagent 只消费 mode==='task-notification' && agentId==自己 的通知, 绝不消费 user prompt.
         // 复用 deriveAgentIdForCommandFilter 的主线程归一 (agentId==null||agentId==sessionId → null).
-        java.util.UUID notificationAgentUuid = deriveAgentIdForCommandFilter(state);
-        String notificationAgentId = notificationAgentUuid != null ? notificationAgentUuid.toString() : null;
+        String notificationAgentId = deriveAgentIdForCommandFilter(state);
         // [3a] drain 归属收敛：传本会话 short（state.sessionId()）→ 只捞本会话命令，捞不到别的会话的
         // cron / prompt；sessionId==null 全局命令一律不捞（交 CronIdleExecutor）。
         // [3e] [session-id-short] QueueItem.sessionId 与 state.sessionId() 同 short，裸 equals 必中。
@@ -10849,6 +11259,17 @@ public class LlmAgentLoop implements AgentLoop {
                         state.turnCount(), foldSize, state.sessionId(), foldSize);
                 }
                 i = foldEnd;
+                continue;
+            }
+            // ── [sendmessage-cross-session · B] peer 项专用分支（唯一投影点）──
+            //  判据 = QueueItem.peerEnvelope 非 null（服务端投递侧构造，⛔ 不看 workload / 正文自报）。
+            //  [B2-fix] 先做消费前复核（当前设置 + 目标最终有效模式），ACCEPT 才投影/登记/落库；
+            //  HOLD → 写注入的 HeldPeerStore、REFUSE → 丢弃，两者都不登记、不落库、不唤醒。
+            //  投影/登记/append 的实现在 injectPeerQueuedItem（同一处，供窄测试直接驱动）。
+            if (item.peerEnvelope() != null) {
+                if (injectPeerQueuedItem(state, item, injectedQueuedMessages, staticPeerRuntimeAdapter)) {
+                    promptCount++;
+                }
                 continue;
             }
             boolean prompt = com.nexusai.application.agent.tasks.NotificationQueue.MODE_PROMPT.equals(item.mode());
@@ -11265,6 +11686,128 @@ public class LlmAgentLoop implements AgentLoop {
         return out;
     }
 
+    /**
+     * [sendmessage-cross-session · B] peer 注入的 structuredOutput 投影（落库 / 事件 / 模型包壳同一份）。
+     *
+     * <p>形状（与 D 前端 readPeerSource 同源）：
+     * <pre>
+     * { peer_source: { sourceSessionId, sourceTitle, sourceKind, messageId,
+     *                  endpointGeneration, fromMode, from, hopChain },
+     *   agent_summary: 摘要（可 null） }
+     * </pre>
+     */
+    static java.util.Map<String, Object> peerStructuredOutput(
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin origin, String summary) {
+        java.util.LinkedHashMap<String, Object> peerSource = new java.util.LinkedHashMap<>();
+        peerSource.put("sourceSessionId", origin.sourceSessionId());
+        peerSource.put("sourceTitle", origin.sourceTitle());
+        peerSource.put("sourceKind", origin.sourceKind());
+        peerSource.put("messageId", origin.messageId());
+        peerSource.put("endpointGeneration", origin.sourceEndpointEpoch());
+        peerSource.put("fromMode", origin.fromMode());
+        peerSource.put("from", origin.fromAddress());
+        peerSource.put("hopChain", origin.hopChain());
+        // [peer-admission 2026-11-21] 准入方式必须与空闲消费路径同口径写入
+        //   （PeerRuntimeAdapter.structuredOutput:644-647）。此前实时轮 drain / 无队列直拼漏写这两个键
+        //   ⇒ 同一对会话交替显示「自动通过」与「准入未知」。⛔ 不在这里判策略，只做投影透传。
+        peerSource.put("admission", origin.admission());
+        peerSource.put("admissionReason", origin.admissionReason());
+        java.util.LinkedHashMap<String, Object> so = new java.util.LinkedHashMap<>();
+        so.put("peer_source", java.util.Collections.unmodifiableMap(peerSource));
+        so.put("agent_summary", summary);
+        return java.util.Collections.unmodifiableMap(so);
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 构造 peer 注入 user 消息 DTO（单一投影点）。
+     *
+     * <p>字段合同：{@code role=user, isMeta=true, subtype=agent_message, author=<来源 sessionId>,
+     * queuedOrigin='peer', content=原文（不预包壳）, structuredOutput=peer_source 投影}。
+     * 复用 {@link #toMessage} 的默认字段（contentBlocks/imagePasteIds 空列表、isError=false）
+     * 再整体拷贝 —— ⛔ 不另造一套消息默认值。
+     */
+    static ChatMessageDto peerMessageDto(String id, String content, String author,
+                                         java.util.Map<String, Object> structuredOutput) {
+        ChatMessageDto base = toMessage(Role.user, content, null, id, true);
+        return new ChatMessageDto(
+            base.id(), base.sessionId(), base.role(), author, base.content(), base.reasoning(),
+            base.toolCalls(), base.finishReason(), base.inputTokens(), base.outputTokens(),
+            base.time(), base.createdAt(), base.toolCallId(), base.assistantMessageId(),
+            base.acceptFeedback(), base.contentBlocks(), base.imagePasteIds(),
+            structuredOutput, base.isMeta(), base.isError(),
+            base.sourceToolUseID(), "agent_message",
+            base.isApiErrorMessage(), base.apiError(), base.error(), base.errorDetails(),
+            base.inputCacheReadTokens(), base.inputCacheCreationTokens(),
+            base.compactMetadata(), base.microcompactMetadata(), base.logicalParentUuid(),
+            base.isCompactSummary(), base.isVisibleInTranscriptOnly(), base.usage(), base.level(),
+            base.matchedRule(), base.snipMetadata(), base.cwd(), base.reasoningDurationMs(),
+            base.userMessageId(), base.decodeMs(), base.contextTokensUsed(), base.percentLeft(),
+            base.contextWindow(), base.userAttachments(), "peer", base.thinkingSignature());
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 从 {@code structuredOutput.peer_source} 还原信封
+     * （只用于<b>模型可见正文</b>的共享 formatter，⛔ 不用于判权限 / 不用于信任根）。
+     *
+     * <p>还原出的信封只承载展示与包壳所需属性（from / from-session / hop-chain / from-name /
+     * from-mode）；权限判定只读 {@code ctx.peerExecutionOrigin()} 这个服务端类型化载体。
+     */
+    static com.nexusai.application.agent.messaging.PeerEnvelope peerEnvelopeFromStructuredOutput(
+            java.util.Map<String, Object> structuredOutput) {
+        if (structuredOutput == null) {
+            return null;
+        }
+        Object srcObj = structuredOutput.get("peer_source");
+        if (!(srcObj instanceof java.util.Map<?, ?> src)) {
+            return null;
+        }
+        String messageId = peerSourceString(src.get("messageId"));
+        String fromSessionId = peerSourceString(src.get("sourceSessionId"));
+        if (messageId == null || messageId.isBlank() || fromSessionId == null || fromSessionId.isBlank()) {
+            return null;
+        }
+        String fromAddress = peerSourceString(src.get("from"));
+        String fromTitle = peerSourceString(src.get("sourceTitle"));
+        String fromMode = peerSourceString(src.get("fromMode"));
+        long epoch = 0L;
+        Object epochObj = src.get("endpointGeneration");
+        if (epochObj instanceof Number n) {
+            epoch = n.longValue();
+        }
+        java.util.List<String> hops = new java.util.ArrayList<>();
+        Object hopObj = src.get("hopChain");
+        if (hopObj instanceof java.util.List<?> list) {
+            for (Object h : list) {
+                if (h != null) {
+                    hops.add(String.valueOf(h));
+                }
+            }
+        } else if (hopObj instanceof String s && !s.isBlank()) {
+            for (String h : s.split(",")) {
+                if (!h.isBlank()) {
+                    hops.add(h.trim());
+                }
+            }
+        }
+        String summary = structuredOutput.get("agent_summary") == null
+            ? null : String.valueOf(structuredOutput.get("agent_summary"));
+        try {
+            return new com.nexusai.application.agent.messaging.PeerEnvelope(
+                messageId, fromAddress, fromSessionId,
+                fromTitle != null && !fromTitle.isBlank() ? fromTitle : fromAddress,
+                fromMode, hops, epoch, summary, false);
+        } catch (RuntimeException e) {
+            // 形状非法（改库/旧数据）→ 不包壳（fail loud 记日志，零行为变化）
+            log.warn("[LlmAgentLoop] peer_source 还原信封失败（不包壳）: messageId={} session={} err={}",
+                messageId, fromSessionId, e.getMessage());
+            return null;
+        }
+    }
+
+    private static String peerSourceString(Object v) {
+        return v == null ? null : String.valueOf(v);
+    }
+
     static List<ChatMessageDto> wrapQueuedMessagesForApi(List<ChatMessageDto> messagesForLlm) {
         if (messagesForLlm == null || messagesForLlm.isEmpty()) {
             return messagesForLlm;
@@ -11278,6 +11821,33 @@ public class LlmAgentLoop implements AgentLoop {
             String qo = m.queuedOrigin();
             if (qo == null || qo.isBlank()) {
                 continue;   // 普通消息 / 空闲 cron / turn-0 prompt：零包壳（红线 §六.1/4）
+            }
+            // ── [sendmessage-cross-session · B] peer：从 structuredOutput.peer_source 还原信封，
+            //   走 cc 同形 formatter（PeerEnvelope.renderModelPayload）——
+            //   live 注入与 resume 历史行<b>同一条</b>路径（DB 只存原文，壳每次请求现生成）。
+            //   只包一次：renderModelPayload 内 isAlreadyWrapped 做首行 + 结尾双判，
+            //   已带 <cross-session-message> 的正文原样返回（同引用 ⇒ 不产生新列表）。
+            if ("peer".equals(qo)) {
+                com.nexusai.application.agent.messaging.PeerEnvelope peerEnvelope =
+                    peerEnvelopeFromStructuredOutput(m.structuredOutput());
+                if (peerEnvelope == null) {
+                    log.warn("[LlmAgentLoop] 发送层 peer 包壳跳过（structuredOutput.peer_source 缺失/非法）"
+                        + " id={}（不包壳，正文原样）", m.id());
+                    continue;
+                }
+                String rawPeerContent = m.content();
+                // [SessionCreate launch · 2026-11-22] 首条任务的落库 id = 队列 uuid = 服务端生成的
+                //   "peer-launch-*"；只对这一行追加「中途可沟通 + 完成须汇报」的专用说明。
+                //   普通 SendMessage（peer-UUID）不带该前缀 ⇒ 说明段不出现。
+                boolean sessionCreateLaunch = m.id() != null && m.id().startsWith("peer-launch-");
+                String peerWrapped = peerEnvelope.renderModelPayload(rawPeerContent, sessionCreateLaunch);
+                if (!java.util.Objects.equals(peerWrapped, rawPeerContent)) {
+                    if (out == null) {
+                        out = new java.util.ArrayList<>(messagesForLlm);
+                    }
+                    out.set(i, m.withContent(peerWrapped));
+                }
+                continue;
             }
             // [OD-D5] contentBlocks 非空 → 壳进 contentBlocks[0].text：busy 带图消息产物（buildUserMessageWithImages
             //   有注入媒体块时 blocks=[text(原文), ...image]）contentBlocks 非空弃 content（AnthropicSdkProvider
@@ -11731,9 +12301,11 @@ public class LlmAgentLoop implements AgentLoop {
         // [S1-T2] 便捷重载：无 teammate 身份承载体 → 显式 null（非 teammate 上下文）。
         // [S1-T7] 无 agent 归因上下文承载体 → 显式 null（非 agent 上下文）。
         // [批 rfs-replay-3b] 无 DB 转录承载体 → 显式 null（跨进程 replay 整段软降级跳过）。
+        // [V306] 无通知目标承载体 → 显式 null（非定时任务 run）。
         return buildBaseToolUseContext(state,
             InitialPermissionModeResolver.Input.empty(),
             InitialPermissionModeResolver.Config.defaults(),
+            null,
             null,
             null,
             null,
@@ -11770,6 +12342,13 @@ public class LlmAgentLoop implements AgentLoop {
      *                         ⛔ 显式传参而非就地再查一次 DB —— 「不新增 DB I/O」是硬约束；也正因如此
      *                         它必须由调用方给，本方法<b>不</b>持 messageService。
      *                         null/空 = 该 run 无历史（或便捷重载）⇒ replay 整段软降级跳过。
+     * @param notifyChats     [V306] <b>定时任务通知目标</b>（聊天 id 数组的 JSON 字符串）：
+     *                         来源 = {@code RunRequest.notifyChats()}（→ QueueItem.notifyChats
+     *                         ← schedules.notify_chats）。base TUC 是该值沿 TUC 传递链
+     *                         （base → per-turn → 工具 execute 形参）到达 {@code SendUserMessage}
+     *                         消费点的唯一源头，本形参即该源头的显式载体。
+     *                         ⛔ 不回落任何 ThreadLocal / 进程级槽（用户铁律：会话态一律显式传参）。
+     *                         null/空白 = 本 run 无通知目标（非定时任务 / 未配置 ⇒ 行为与现状一致）。
      */
     private ToolUseContext buildBaseToolUseContext(AgentState state,
             InitialPermissionModeResolver.Input initialModeInput,
@@ -11777,7 +12356,8 @@ public class LlmAgentLoop implements AgentLoop {
             java.nio.file.Path runExplicitCwd,
             com.nexusai.application.agent.team.TeammateIdentity teammateIdentity,
             com.nexusai.application.agent.subagent.AgentContext agentContext,
-            List<ChatMessageDto> dbTranscript) {
+            List<ChatMessageDto> dbTranscript,
+            String notifyChats) {
         if (state.sessionId() == null) {
             return null;
         }
@@ -11917,12 +12497,14 @@ public class LlmAgentLoop implements AgentLoop {
                 sessionReadFileState != null ? sessionReadFileState.size() : 0);
         }
         return new ToolUseContext(
-            state.agentId(), state.sessionId(), mode,
+            // [agentid-cc-align] 兼容构造器首参仍是历史 UUID；canonical 已是 String。
+            state.agentId(),
+            state.sessionId(), mode,
             java.util.Map.of(), baseTools, "",
             runAbortController != null ? runAbortController : com.nexusai.application.agent.tool.AbortController.NOOP,
             state.rawMessages() != null ? state.rawMessages() : List.of(),
             permCtx, mode,
-            buildMcpClients(), nonInteractiveSession,
+            buildMcpClients(), resolveNonInteractiveSession(state.sessionId()),
             state.systemPrompt() != null ? state.systemPrompt() : "",
             // [批 1 · 方向 C] effectiveCwd 显式传参：run 携带项目锚（cron DURABLE fire）时
             //   用该锚作本回合 cwd 快照（跨线程可见的「值」）；无锚 → null → 构造器既有
@@ -11986,7 +12568,11 @@ public class LlmAgentLoop implements AgentLoop {
             //   而是随 base TUC 显式下传整条链（per-turn TUC / 工具 execute / stop hook）。
             //   同值短路（withTeammateIdentity 内 equals 判定）：null→null 时返回同一实例，
             //   主会话路径零新实例、零行为变化。
-            .withTeammateIdentity(teammateIdentity);
+            .withTeammateIdentity(teammateIdentity)
+            // [V306] 定时任务通知目标盖章（唯一生产盖章点）：RunRequest.notifyChats() → base TUC
+            //   → per-turn TUC → SendUserMessage 工具 execute 形参。null/空白时短路返回同一实例
+            //   （非定时任务 run 零新实例、零行为变化）。
+            .withNotifyChats(notifyChats);
     }
 
 
@@ -13608,7 +14194,7 @@ public class LlmAgentLoop implements AgentLoop {
         }
     }
 
-    private SessionStartMetrics resolveSessionStartMetrics(UUID agentId) {
+    private SessionStartMetrics resolveSessionStartMetrics(String agentId) {
         if (agentId == null && messageService != null
                 && streamSessionId != null && !streamSessionId.isBlank()) {
             try {
@@ -14083,12 +14669,82 @@ public class LlmAgentLoop implements AgentLoop {
      * 主循环 / subagent 的 availableTools 保持默认过滤（SPECIAL_TOOLS 不暴露给 LLM，行为不变）。
      *
      * @param tuc         per-turn TUC（null → null，与 toolRegistry null 等价）
-     * @param querySource 区分 HOOK_AGENT（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
+     * @param querySource 区分 HOOK_AGENT / 协调者顶层循环（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
      * @return OpenAI function-calling tools 数组；tuc null → null
      */
     // ════════════════════════════════════════════════════════════════════════
     // [IMP-HR-08 R1/R2] 结构化输出 enablement 辅助
     // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * [2026-11-20 注入门] 本 turn 是否把 StructuredOutput 工具注入 LLM tools 数组 ·
+     * 对齐 CC main.tsx:1885-1891（`if (jsonSchema)` 且非交互/后台会话才
+     * `createSyntheticOutputTool(jsonSchema)` 追加到 getTools() 之后）+ SyntheticOutputTool.ts:22-26。
+     *
+     * <p><b>判据三件（全部满足才注入）</b>：
+     * <ol>
+     *   <li>{@code jsonSchema != null}（--json-schema 等价；没有 schema 就没有结构化输出契约）；</li>
+     *   <li>{@code SyntheticOutputTool.isSyntheticOutputToolEnabled(tuc.isNonInteractiveSession())}
+     *       —— {@code tuc.isNonInteractiveSession()} 是会话级值（base TUC 构造时由
+     *       {@link #resolveNonInteractiveSession} 解析：入口显式 headless/后台标志 或
+     *       {@code sessions.non_interactive_session} 列）；</li>
+     *   <li>deny 规则未挡掉 StructuredOutput（deny 优先 —— 本注入点在 schema 过滤之后，
+     *       不显式复查就会让被 deny 的工具有「后门」重新出现）。</li>
+     * </ol>
+     *
+     * <p>交互式会话：即使调用方传了 jsonSchema，也**不注入**（CC：静默忽略；模型看不到工具，
+     * 因而也不可能产生「可见不可用」的调用期拒绝）。
+     *
+     * @param jsonSchema 本 run 的结构化输出 schema（null → 不注入）
+     * @param tuc        per-turn TUC（null → 不注入；isNonInteractiveSession 由 base TUC 继承）
+     * @return true = 注入
+     */
+    static boolean shouldInjectStructuredOutput(
+            com.fasterxml.jackson.databind.JsonNode jsonSchema, ToolUseContext tuc) {
+        if (jsonSchema == null || tuc == null) {
+            return false;
+        }
+        if (!com.nexusai.application.agent.tool.impl.SyntheticOutputTool
+                .isSyntheticOutputToolEnabled(tuc.isNonInteractiveSession())) {
+            return false;
+        }
+        // deny 优先：池里已有该工具时，走与 schema 阶段同一 filterToolsByDenyRules 判据；
+        // 池里没有 → 允许追加（CC 的 SyntheticOutputTool 是在 getTools() 之后无条件 join 的，
+        // 不依赖工具池成员资格）。
+        List<Tool> pool = tuc.availableTools();
+        if (pool != null && !pool.isEmpty()) {
+            List<Tool> candidates = pool.stream()
+                .filter(t -> t != null && com.nexusai.application.agent.tool.ToolNameConstants
+                    .SYNTHETIC_OUTPUT_TOOL_NAME.equals(t.name()))
+                .toList();
+            if (!candidates.isEmpty()
+                && new ToolRegistry().filterToolsByDenyRules(candidates, tuc.permissionContext()).isEmpty()) {
+                if (log.isDebugEnabled()) {
+                    log.debug("[LlmAgentLoop] StructuredOutput 被 deny 规则挡下 → 不注入（deny 优先于注入门）");
+                }
+                return false;
+            }
+        }
+        return true;
+    }
+
+    /**
+     * [2026-11-20 注入门] 把 StructuredOutput 注入 LLM tools 数组（条件见
+     * {@link #shouldInjectStructuredOutput}）。生产唯一调用点 = 主循环每轮组装之后。
+     *
+     * @param tools      本 turn 已过滤的 LLM tools 数组（null → 无操作）
+     * @param jsonSchema 结构化输出 schema（null → 无操作）
+     * @param tuc        per-turn TUC（注入门判据源）
+     */
+    static void applyStructuredOutputEnablement(
+            com.fasterxml.jackson.databind.node.ArrayNode tools,
+            com.fasterxml.jackson.databind.JsonNode jsonSchema,
+            ToolUseContext tuc) {
+        if (tools == null || !shouldInjectStructuredOutput(jsonSchema, tuc)) {
+            return;
+        }
+        appendStructuredOutputToolToSchema(tools, jsonSchema);
+    }
 
     /**
      * [IMP-HR-08 R1] 把 schema 专用 SyntheticOutputTool 追加到主循环 LLM tools schema · 对齐 CC
@@ -14240,7 +14896,7 @@ public class LlmAgentLoop implements AgentLoop {
      * {@code useToolSearch=false} 时按 claude.ts:1170-1172 排除 ToolSearch（模型不支持 tool_reference）。
      *
      * @param tuc         per-turn TUC（null → null）
-     * @param querySource 区分 HOOK_AGENT（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
+     * @param querySource 区分 HOOK_AGENT / 协调者顶层循环（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
      * @param messages    消息历史（discovered-set 扫描源；null → 走旧行为）
      * @param modelName   本次调用模型名（null → 走旧行为；haiku 等不支持 tool_reference 时关闭工具搜索）
      * @return 工具装配结果（schema + useToolSearch + deferredToolNames）
@@ -14260,7 +14916,7 @@ public class LlmAgentLoop implements AgentLoop {
      * 纯 char fallback）。调用方（主循环 queryLoop）传 {@code this.countTokensClient}（Spring 注入）。
      *
      * @param tuc         per-turn TUC（null → null）
-     * @param querySource 区分 HOOK_AGENT（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
+     * @param querySource 区分 HOOK_AGENT / 协调者顶层循环（暴露 SPECIAL_TOOLS）与主循环/subagent（过滤）
      * @param messages    消息历史（discovered-set 扫描源；null → 走旧行为）
      * @param modelName   本次调用模型名（null → 走旧行为；haiku 等不支持 tool_reference 时关闭工具搜索）
      * @param tokenClient count_tokens 客户端（null → 纯 char fallback；3 参注入 = IMP-C6 token 优先）
@@ -14279,8 +14935,15 @@ public class LlmAgentLoop implements AgentLoop {
         //   但 GET 刻意保留被禁工具（disabled=true，前端可恢复），LLM schema 口径见
         //   {@link #sessionVisibleTools}（R4 校正）。
         List<Tool> available = sessionVisibleTools(tuc, querySource);
+        // [structured-output 2026-11-20 · 回退上一批「协调者跳过 SPECIAL_TOOLS 过滤」]
+        //   CC 的 SPECIAL_TOOLS（含 StructuredOutput）是内部 dispatch 工具，**永不**经常规
+        //   getTools() 通道暴露给模型；结构化输出实例只在「jsonSchema 且非交互/后台会话」时
+        //   由 main.tsx:1885-1891 在 getTools() 之后**单独追加**（见 applyStructuredOutputEnablement）。
+        //   因此这里只保留 HOOK_AGENT 一个放行来源（execAgentHook.ts:93-105 手工构建 tools）；
+        //   协调者白名单仍保留 StructuredOutput 作为「候选」，但候选 ≠ 可见。
+        boolean exposeSpecialTools = querySource == QuerySource.HOOK_AGENT;
         ToolRegistry temp = ToolRegistry.from(available);
-        if (querySource == QuerySource.HOOK_AGENT) {
+        if (exposeSpecialTools) {
             temp.setSkipSpecialToolsFilter(true);
         }
 
@@ -14336,7 +14999,7 @@ public class LlmAgentLoop implements AgentLoop {
                 // willDefer = useToolSearch && deferredToolNames.contains(name)
                 //   （claude.ts:1208-1209；shouldDeferLspTool Java 无 LSP 类 → N/A）
                 return new ToolsAssembly(
-                        withSkipSpecial(filtered, querySource).toOpenAiToolsArray(deferredToolNames),
+                        withSkipSpecial(filtered, exposeSpecialTools).toOpenAiToolsArray(deferredToolNames),
                         true, deferredToolNames);
             }
             // [R8 · 回归 CC claude.ts:1170-1172] useToolSearch=false（非 anthropic / anthropic×haiku /
@@ -14350,7 +15013,7 @@ public class LlmAgentLoop implements AgentLoop {
                     + "对齐 CC claude.ts:1170-1172；deferred {} 不参与过滤）",
                         available.size(), filtered.size(), deferredToolNames.size());
             }
-            return new ToolsAssembly(withSkipSpecial(filtered, querySource).toOpenAiToolsArray(), false, deferredToolNames);
+            return new ToolsAssembly(withSkipSpecial(filtered, exposeSpecialTools).toOpenAiToolsArray(), false, deferredToolNames);
         }
         return new ToolsAssembly(temp.toOpenAiToolsArray(), false, Set.of());
     }
@@ -14414,7 +15077,7 @@ public class LlmAgentLoop implements AgentLoop {
             if (log.isInfoEnabled()) {
                 log.info("LlmAgentLoop.sessionVisibleTools: bare 模式（Web 精简模式）工具池 {}→{}（裁剪为 [Bash,Read,Edit]{}，对齐 CC tools.ts:287-296）",
                         before, available.size(),
-                        coordinatorActive ? " + [Agent,TaskStop,SendMessage]" : "");
+                        coordinatorActive ? " + [Agent,TaskStop,SendMessage,SessionCreate]" : "");
             }
         }
         if (available != null) {
@@ -14467,44 +15130,29 @@ public class LlmAgentLoop implements AgentLoop {
      */
     public static List<Tool> sessionVisibleTools(ToolUseContext tuc, QuerySource querySource) {
         List<Tool> available = sessionVisibleToolsBase(tuc, querySource);
+        // [V330] 单一解析器：会话禁用 + 人格豁免 + Brief/IM 增量 + 无人值守 Ask。
+        //   有本轮快照时读快照（本轮固定、下一轮生效）；无快照/会话不匹配 ⇒ 实时解析。
         if (available != null && tuc != null && tuc.sessionId() != null) {
-            Set<String> disabled = SessionToolDisableConfig.getDisabledTools(tuc.sessionId());
-            // [2026-11-18 用户拍板 · 人格优先] 默认禁用集与人格点名冲突时，**人格指定的工具生效**，
-            //   其余非冲突项照旧禁用。
-            //
-            //   WHY：会话 disabled_tools 为 null 时读侧回落到「电脑操作 + 知识库」默认禁用集，
-            //   而 KB 人格（builtin-smart-reasoning / builtin-data-analyst 等）点名的正是知识库工具
-            //   ⇒ 默认集把人格要用的工具全剔掉，模型只能看到 AskUserQuestion + Read
-            //   （真机 2026-11-18 sess-2f77e856：池内知识库工具 4 → 0，结果 6 → 2）。
-            //
-            //   ⛔ 只豁免**默认集**：用户显式写进 disabled_tools 的项仍禁用 —— 那是用户的明确意图，
-            //   不该被人格定义覆盖（对齐 CC：deny 规则先于 agent 名单生效，见 tools.ts:310 +
-            //   REPL.tsx:824；本处是「默认值」层面的产品裁定，不是改 CC 的顺序语义）。
-            Set<String> effectiveDisabled = disabled;
-            if (!disabled.isEmpty() && SessionToolDisableConfig.isDefaultDisabledSet(tuc.sessionId())) {
-                Set<String> named = agentNamedTools(tuc.sessionId());
-                if (!named.isEmpty()) {
-                    Set<String> merged = new java.util.LinkedHashSet<>(disabled);
-                    merged.removeAll(named);
-                    if (merged.size() != disabled.size()) {
-                        log.info("[LlmAgentLoop] 人格优先豁免默认禁用: session={} 豁免={} 剩余禁用={}",
-                                tuc.sessionId(),
-                                named.stream().filter(disabled::contains).toList(), merged.size());
-                    }
-                    effectiveDisabled = merged;
-                }
-            }
-            if (!effectiveDisabled.isEmpty()) {
+            com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot snapshot =
+                com.nexusai.application.agent.tool.SessionToolVisibility
+                    .resolve(tuc.sessionId(), tuc.requestExtras());
+            if (!snapshot.disabled().isEmpty()) {
                 int before = available.size();
-                final Set<String> skip = effectiveDisabled;
                 available = available.stream()
-                        .filter(t -> t != null && !skip.contains(t.name()))
+                        .filter(t -> t != null && !snapshot.blocks(t.name()))
                         .toList();
                 if (log.isDebugEnabled() && available.size() != before) {
-                    log.debug("sessionVisibleTools: 会话禁用工具剔除 {} 个（gap29 · V34 disabled_tools，"
+                    log.debug("sessionVisibleTools: 会话可见集剔除 {} 个（V330 单一解析器，"
                             + "复刻 CC blanket deny schema 阶段剔除，tools.ts:262-269）",
                             before - available.size());
                 }
+            }
+            if (snapshot.askExcluded()) {
+                available = available.stream()
+                        .filter(t -> t == null
+                            || !com.nexusai.application.agent.config.ImUnattendedConfig
+                                .ASK_USER_QUESTION_TOOL.equals(t.name()))
+                        .toList();
             }
         }
         // [agent-tool-scope] 主线程 agent 工具白名单（用户 2026-10-23 裁定）· 对齐 CC
@@ -14515,6 +15163,17 @@ public class LlmAgentLoop implements AgentLoop {
         if (available != null && tuc != null && tuc.sessionId() != null
                 && isTopLevelLoopSource(querySource)) {
             available = applySessionAgentToolPolicy(tuc.sessionId(), available, tuc.requestExtras());
+        }
+        // [V330 · cron 无头] 无会话的非交互执行没有可应答 UI ⇒ AskUserQuestion 不可用
+        //   （⛔ 不是按“cron 来源”摘除：绑定历史的 cron 有会话，Ask 仍按其无人值守状态判定）。
+        // [F5] 非交互执行 ⇒ 无论有没有 sessionId 都没有人能答选择题。
+        //   ⛔ 旧判据额外要求「无会话」⇒ 有会话的非交互路径仍把 Ask 暴露给模型，
+        //   调用时必然 Deny（先把一扇关着的门画在墙上）。
+        if (available != null && tuc != null && tuc.isNonInteractiveSession()) {
+            available = available.stream()
+                    .filter(t -> t == null || !com.nexusai.application.agent.config.ImUnattendedConfig
+                        .ASK_USER_QUESTION_TOOL.equals(t.name()))
+                    .toList();
         }
         return available;
     }
@@ -14762,7 +15421,8 @@ public class LlmAgentLoop implements AgentLoop {
     /**
      * [G24 bare 模式工具池裁剪] 对齐 CC getTools SIMPLE 分支（tools.ts:287-296）：
      * simpleTools = [Bash, Read, Edit]；coordinator 模式开启时追加 [Agent, TaskStop, SendMessage]
-     * （tools.ts:291-296，使顶层 applyCoordinatorToolFilter 能保留编排白名单）。
+     * （tools.ts:291-296，使顶层 applyCoordinatorToolFilter 能保留编排白名单）+ 本仓扩展
+     * SessionCreate（2026-11-20 用户裁定，协调者要能创建同级会话）。
      *
      * <p>WHY: bare 模式（Web 精简模式）只暴露三个实质执行工具给 LLM，对齐 CC CLAUDE_CODE_SIMPLE
      * 语义（tools.ts:272-298）。coordinator 叠加时按 CC 追加编排三工具，随后既有
@@ -14788,6 +15448,12 @@ public class LlmAgentLoop implements AgentLoop {
             keep.add(com.nexusai.application.agent.tool.AgentToolConstants.AGENT_TOOL_NAME);
             keep.add(com.nexusai.application.agent.tool.ToolNameConstants.TASK_STOP_TOOL_NAME);
             keep.add(com.nexusai.application.agent.tool.ToolNameConstants.SEND_MESSAGE_TOOL_NAME);
+            // [2026-11-20 用户裁定] 协调者的「创建同级会话」通道同属编排面，与编排三工具
+            //   一起豁免 bare 裁剪；否则 bare+coordinator 下 SessionCreate 会在进入
+            //   applyCoordinatorToolFilter 之前就被 simpleTools 裁掉。
+            keep.add(com.nexusai.application.agent.tool.ToolNameConstants.SESSION_CREATE_TOOL_NAME);
+            // 协调者要建 peer 并指定模型 ⇒ 模型清单与 SessionCreate 同批豁免 bare 裁剪。
+            keep.add(com.nexusai.application.agent.tool.ToolNameConstants.LIST_MODELS_TOOL_NAME);
         }
         List<Tool> result = new ArrayList<>(tools.size());
         for (Tool tool : tools) {
@@ -14799,13 +15465,23 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * 从过滤后工具列表构建 ToolRegistry · HOOK_AGENT 保留 skipSpecialToolsFilter
-     * （结构化输出工具暴露，对齐 CC execAgentHook.ts:93-105）。管道分支重建 registry
-     * 时丢失该标志曾导致 R33H7_ExecAgentHookTest 回归（StructuredOutput 被 SPECIAL_TOOLS 过滤）。
+     * 从过滤后工具列表构建 ToolRegistry · {@code exposeSpecialTools=true} 时保留
+     * skipSpecialToolsFilter（结构化输出工具暴露）。生产来源唯一 = HOOK_AGENT
+     * （对齐 CC execAgentHook.ts:93-105 手工构建 tools）。
+     *
+     * <p>⛔ 协调者顶层循环**不再**是来源（2026-11-20 回退）：SPECIAL_TOOLS 永不经常规
+     * getTools()/toOpenAiToolsArray 通道暴露；结构化输出实例只在结构化的非交互会话由
+     * {@link #applyStructuredOutputEnablement} 在过滤之后单独追加。
+     *
+     * <p>管道分支重建 registry 时丢失该标志曾导致 R33H7_ExecAgentHookTest 回归（StructuredOutput 被
+     * SPECIAL_TOOLS 过滤）。
+     *
+     * @param tools               过滤后的工具列表
+     * @param exposeSpecialTools  是否放行 SPECIAL_TOOLS（仅暴露池内已有的，不回补）
      */
-    private static ToolRegistry withSkipSpecial(List<Tool> tools, QuerySource querySource) {
+    private static ToolRegistry withSkipSpecial(List<Tool> tools, boolean exposeSpecialTools) {
         ToolRegistry registry = ToolRegistry.from(tools);
-        if (querySource == QuerySource.HOOK_AGENT) {
+        if (exposeSpecialTools) {
             registry.setSkipSpecialToolsFilter(true);
         }
         return registry;
@@ -16764,94 +17440,30 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
-     * [IMP-C2] ToolResult 4 字段契约下 isError 由执行器推导（组 2-1 拍板）。对<b>直接调用
-     * 工具 execute()</b> 的消费方（无 TrackedTool/mapper 参数通道），错误语义改按 data 文案判定：
-     * error 路径构造的 data 均为错误消息（ToolResult.error → data=message，fail-loud）。
+     * 结果是否为失败 · <b>结构判定</b>（不再解析错误文案）。
      *
-     * <p>判定规则（保守）：data 为 String 且以典型错误前缀开头 → 视为 error result。
-     * 覆盖 ReadFileTool 缺文件 / EditFileTool 失败 / 权限拒绝等路径。非 error 的正常内容
-     * （文件内容/命令输出）不命中，保持正常语义。
+     * <p>失败由 {@link com.nexusai.application.agent.tool.ToolError} 类型承载：{@code ToolResult.error}
+     * / {@code ToolResult.failure} 工厂产出的 data 即该记录，故 {@code instanceof} 即为判据。
      *
-     * <p><b>[IMP-C2 返工 R2] Bash/PowerShell 语义错误补充</b>: 真实 Bash 失败载荷形如
-     * {@code "cat: /nonexistent: No such file or directory\nExit code 2"}（BashTool.tsx:687+699
-     * stdout 先入、isError 时末尾 append "Exit code N"），<b>不以任何已登记前缀开头</b>
-     * （cat:/ls:/sed:/bash:/fatal: 等命令前缀无法穷举）。该载荷统一以 {@code "\nExit code <非零>"}
-     * 结尾 —— 该末尾标记仅由 BashTool/PowerShellTool 语义错误路径（CommandSemanticsInterpreter
-     * 判定 isError 时，BashTool.java:1095-1096 / PowerShellTool.java:513）附加，是比命令前缀
-     * 更可靠的「可识别标记」；executor 正常返回路径（StreamingToolExecutor:1763-1764）据此
-     * 推导 isError=true → sibling abort + failure analytics + tool_result is_error=true。
+     * <p><b>WHY 不再用前缀表</b>：旧实现维护 200+ 条文案前缀（{@code "Error:"}、{@code "File does not exist"}…）
+     * 反推错误态。任何未登记文案都会漏判 —— 实测 EditFileTool 的 {@code "path is empty"} 被判成功，
+     * 继而由 Edit/Write 的成功模板 mapper 渲染成 {@code "The file … has been updated successfully."}，
+     * 形成「回执成功、实际零改动」的假成功。文案前缀在语义上也不该定义错误态：对齐 CC，
+     * 错误是控制流属性（toolExecution.ts 错误分支直构 {@code is_error:true} 块，从不进 mapper）。
      *
-     * @param data ToolResult.data()
-     * @return true = data 为错误消息（error result 语义）
+     * @param data {@code ToolResult.data()}
+     * @return true = 该结果是失败载荷
      */
     public static boolean isToolErrorData(Object data) {
-        if (data == null) {
-            return false;
-        }
-        String s = data instanceof String str ? str : String.valueOf(data);
-        if (s.isEmpty()) {
-            return false;
-        }
-        return s.startsWith("File does not exist") || s.startsWith("file does not exist")
-            || s.startsWith("Edit error") || s.startsWith("Write error")
-            // [测试残留修复 · isToolErrorData 前缀缺口] EditFileTool/WriteFileTool 兜底门禁
-            //   （execute(call) 无 ctx → "…requires ToolUseContext"，execute(call, ctx) validateInput
-            //   失败 → "…validateInput failed: …"）此前不命中任何前缀 → 直接 execute 调用方
-            //   （MagicDocUpdater.java:400 / LlmAgentLoop 工具执行链 等）把门禁拒绝误判为成功
-            //   （silent success）。补 4 前缀使门禁错误结果被识别（CC 语义：错误必须显式失败）。
-            || s.startsWith("EditFileTool validateInput failed") || s.startsWith("WriteFileTool validateInput failed")
-            || s.startsWith("EditFileTool requires ToolUseContext") || s.startsWith("WriteFileTool requires ToolUseContext")
-            || s.startsWith("Error:") || s.startsWith("Input validation failed")
-            || s.startsWith("No such tool") || s.startsWith("No task found")
-            || s.startsWith("No-op:") || s.startsWith("Missing required parameter") || s.startsWith("Task system not available")
-            || s.startsWith("Task ") && (s.contains("is not running") || s.contains("is not found"))
-            || s.startsWith("Unsupported task type") || s.startsWith("Task is not running")
-            || s.startsWith("Task ID is required") || s.startsWith("TaskCreated hook feedback")
-            || s.startsWith("TaskUpdated hook feedback") || s.startsWith("TaskCompleted hook feedback")
-            || s.startsWith("Skill execution failed")
-            || s.startsWith("Invalid URL") || s.startsWith("unable to fetch")
-            // [isToolErrorData 补丁 · WebFetch 阻断消息前缀] CC utils.ts:23 DomainBlockedError 消息为
-            //   "NexusAI is unable to fetch from <domain>"（WebFetchSecurity.DomainBlockedException:649，
-            //   WebFetchTool.java:304-306 以 ToolResult.error(call.id(), e.getMessage()) 透传 data）。
-            //   此前仅登记 "unable to fetch"（只匹配以 unable 开头的串），阻断消息以 "NexusAI is " 开头
-            //   → 前缀不匹配 → 下游消费者（InboundMcpToolProvider/MagicDocsService 等）
-            //   把阻断误判为成功 tool_result（silent success）。补前缀使 WebFetch 阻断被识别为 error。
-            || s.startsWith("NexusAI is unable to fetch")
-            || s.startsWith("WorktreeCreate hook failed") || s.startsWith("WorktreeRemove hook failed")
-            || s.startsWith("Permission denied")
-            || s.startsWith("Interrupted by user") || s.startsWith("StructuredOutput is only")
-            || s.startsWith("Output does not match required schema")
-            || s.startsWith("<tool_use_error>") || s.startsWith("unknown error")
-            || s.startsWith("streaming_fallback") || s.startsWith("agent_cancelled")
-            || s.startsWith("BashTool error") || s.startsWith("PowerShell error")
-            || s.startsWith("MCP call failed") || s.startsWith("McpServer error")
-            // [isToolErrorData 补丁 · MCP resources 工具错误前缀] ListMcpResourcesTool/ReadMcpResourceTool
-            //   （ListMcpResourcesTool.java:181 "Server \"x\" not found"；ReadMcpResourceTool.java:186/189
-            //   "ReadMcpResourceTool: missing ..."、:211 "is not connected"、:220 "does not support resources"）
-            //   此前不命中前缀表 → isToolErrorData 返回 false → 6 基线红测（execute_targetServerNotFound /
-            //   execute_serverNotFound / execute_missingFields / execute_noResourceCapability /
-            //   execute_serverNotConnected 等）误判成功。补前缀使 MCP resources 错误被识别。
-            || s.startsWith("Server \"") || s.startsWith("ReadMcpResourceTool:")
-            || s.startsWith("Monitor 工具不可用")
-            || s.startsWith("Teammates cannot spawn") || s.startsWith("Teammates cannot send")
-            // [Baseline-fix · SubagentToolTeammateSpawnBranchTest 4F] spawn 门禁错误前缀
-            //   （SubagentTool.swarmsDisabled/failedSpawn/background-rejected 三串此前不命中
-            //   前缀表 → isToolErrorData 返回 false → 门禁拒绝被误判为成功 tool_result）。
-            || s.startsWith("Agent Teams is not yet available")
-            || s.startsWith("In-process teammates cannot spawn background agents")
-            || s.startsWith("Failed to spawn in-process teammate")
-            || s.startsWith("The user doesn't want to proceed")
-            // [IMP-C4 REQ-G3-2-3] PreToolUse stop 分支 content = CANCEL_MESSAGE（CC
-            //   toolExecution.ts:855 createToolResultStopMessage content=CANCEL_MESSAGE，
-            //   messages.ts:210-211）→ is_error=true 结果须被识别为错误。
-            || s.startsWith("The user doesn't want to take this action")
-            // [IMP-H 返工] 未实现桩的 fail-loud 契约：TungstenTool（工具名对齐 CC
-            //   AntConfigTool/TungstenTool）与 SuggestBackgroundPRTool 返回
-            //   ToolResult.error(call.id(), "feature_not_implemented")（align CC 桩
-            //   error 显式 error 类型）。该串不在历史前缀表 → isError 推导失效 = 桩错误
-            //   会被当成成功 tool_result（silent success）。补前缀使桩错误被识别。
-            || s.startsWith("feature_not_implemented")
-            || isBashExitCodeErrorMarker(s);
+        // [错误通道对齐 CCJ-ERR-014] 结构判定替代「错误文案前缀表」。
+        //   WHY：旧实现靠 200+ 条文案前缀反推错误态，未登记文案（如 EditFileTool 的
+        //   {@code "path is empty"}）被判成功 → 再被 Edit/Write 的成功模板 mapper 渲染成
+        //   "The file … has been updated successfully."（实测假成功）。现失败由
+        //   {@link com.nexusai.application.agent.tool.ToolError} 类型承载（{@code ToolResult.error}
+        //   工厂产出），判定与文案无关。
+        //   对齐 CC：错误态是控制流/结果类型的属性，不是内容的字符串属性
+        //   （toolExecution.ts 错误分支直构 tool_result 块，从不进 per-tool mapper）。
+        return com.nexusai.application.agent.tool.ToolResult.isErrorData(data);
     }
 
     /**
@@ -17029,7 +17641,32 @@ public class LlmAgentLoop implements AgentLoop {
         }
         // [G2] per-tool mapper 构造 tool_result 块（对齐 CC toolExecution.ts:1292）
         // [IMP-C2] toolUseId/isError 显式传入（ToolResult 不再携带，组 2-1 拍板）
-        ToolResultBlockParam block = (tool != null) ? tool.mapToToolResultBlockParam(result, toolUseId, isError) : null;
+        // ── [错误通道对齐 CCJ-ERR-014] 成功/失败两条显式路径 ──
+        //   CC 只在 tool.call() 正常返回后调用 mapper（toolExecution.ts:1288-1292）；所有错误路径
+        //   （unknown/schema/validateInput/权限拒绝/call 抛错/取消）在错误点**直构** tool_result 块
+        //   （is_error:true），从不经过 per-tool mapper。Java 旧实现无条件调 mapper，于是 Edit/Write
+        //   等「不看 isError」的 mapper 把任何失败渲染成 "The file … has been updated successfully."
+        //   （实测假成功）。此处改为：失败 → 直构；成功 → 原 mapper 路径。
+        boolean errorFlag = isError || result.data() instanceof com.nexusai.application.agent.tool.ToolError;
+        ToolResultBlockParam block;
+        if (errorFlag) {
+            com.nexusai.application.agent.tool.ToolError err =
+                result.data() instanceof com.nexusai.application.agent.tool.ToolError te
+                    ? te
+                    : new com.nexusai.application.agent.tool.ToolError(
+                        ToolResult.renderToolResultPayloadText(result),
+                        com.nexusai.application.agent.tool.ToolErrorKind.CALL_THREW);
+            String errContent = err.kind().wrapsWithToolUseErrorShell()
+                ? "<tool_use_error>" + err.message() + "</tool_use_error>"
+                : err.message();
+            block = new ToolResultBlockParam(toolUseId, "tool_result", errContent, true);
+            if (log.isDebugEnabled()) {
+                log.debug("toolResultMessage 失败路径直构块（不调 mapper）: toolUseId={} tool={} kind={} contentLen={}",
+                    toolUseId, tool != null ? tool.name() : "null", err.kind(), errContent.length());
+            }
+        } else {
+            block = (tool != null) ? tool.mapToToolResultBlockParam(result, toolUseId, false) : null;
+        }
         // [WF-9 producer-toolref] content 为非 String（List<ContentBlockParam> 块数组，典型为
         // ToolSearchTool 命中产出的 tool_reference 块数组）时，不再回退 renderToolResultPayloadText
         // 丢弃块语义，而是把块序列化为 List<JsonNode> 注入 contentBlocks，流经 provider 的
@@ -17086,7 +17723,7 @@ public class LlmAgentLoop implements AgentLoop {
             imagePasteIds,
             structuredOutput == null || structuredOutput.isEmpty() ? null : structuredOutput,
             false,               // isMeta (R32-c-1 tool result 消息非元消息)
-            isError              // isError (H13-GAP 对抗核验: mapper 参数透传)
+            errorFlag            // isError (H13-GAP 对抗核验: 执行层真值; 失败载荷 ToolError 亦为 true)
         );
     }
 
@@ -17241,6 +17878,26 @@ public class LlmAgentLoop implements AgentLoop {
         return maxId + 1;
     }
 
+    /**
+     * assistant 消息挂载内容块（对齐 CC「一块一行 + apiBlockIndex」）。
+     *
+     * <p><b>WHY</b>：provider 层流式 content_block_start 带真实 index，只有它知道
+     * 「文本与工具之间的交错顺序」。provider 已采集则直接采用（并重排为连续下标）；
+     * 未采集（OpenAI Chat / Responses 无块下标语义）则按规范顺序回退
+     * （thinking → text → tool_use，与 Anthropic 发送侧重建顺序一致）。
+     *
+     * @param chatMsg     已构造的 assistant DTO（用于规范回退）
+     * @param providerMsg provider 响应体（可 null；null 时走回退）
+     * @return 按到达顺序的块（apiBlockIndex 连续）；null = 不落块
+     */
+    public static java.util.List<com.nexusai.model.session.dto.ContentBlockDto> blocksOf(
+            ChatMessageDto chatMsg, AssistantMessage providerMsg) {
+        if (providerMsg != null && providerMsg.blocks() != null && !providerMsg.blocks().isEmpty()) {
+            return com.nexusai.model.session.dto.MessageContentBlocks.ordered(providerMsg.blocks());
+        }
+        return com.nexusai.model.session.dto.MessageContentBlocks.resolve(chatMsg);
+    }
+
     /** ToolUseBlock → ToolCallDto。 */
     public static ToolCallDto toolCallDto(ToolUseBlock call) {
         return new ToolCallDto(
@@ -17380,7 +18037,7 @@ public class LlmAgentLoop implements AgentLoop {
      * @param state 当前 AgentState
      * @return 命令过滤用的 agentId; 主线程返回 null
      */
-    private static java.util.UUID deriveAgentIdForCommandFilter(AgentState state) {
+    private static String deriveAgentIdForCommandFilter(AgentState state) {
         if (state == null) return null;
         // [session-id-short] 主线程判定简化: agentId==null = 主线程（对齐 CC !context.agentId，
         // query.ts:1570-1643 cmd.agentId===undefined 走主线程分支）；subagent 返回 agentId scoping。

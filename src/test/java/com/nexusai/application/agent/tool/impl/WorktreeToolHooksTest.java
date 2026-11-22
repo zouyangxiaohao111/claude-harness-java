@@ -63,7 +63,7 @@ class WorktreeToolHooksTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     @AfterEach
     void tearDown() {
@@ -106,7 +106,7 @@ class WorktreeToolHooksTest {
         AgentToolResult<?> result = tool.execute(enterCall("feature-x"), ctx());
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode out = JSON.readTree((String) result.data());
+        JsonNode out = JSON.readTree(String.valueOf(result.data()));
         assertThat(out.path("worktreePath").asText())
             .as("hook stdout trim 即 worktreePath（CC worktree.ts:724-727 hookResult.worktreePath）")
             .isEqualTo(Path.of("/tmp/worktrees/feature-x").toString()); // Windows 分隔符无关断言（断点 1ce82468 既有失败修复）
@@ -140,7 +140,7 @@ class WorktreeToolHooksTest {
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         verify(service).createWorktree(any(), eq("feature-x"));
-        JsonNode out = JSON.readTree((String) result.data());
+        JsonNode out = JSON.readTree(String.valueOf(result.data()));
         assertThat(out.path("worktreePath").asText()).isEqualTo(wt.toString());
         assertThat(out.path("worktreeBranch").asText())
             .as("git 路径输出分支名（CC worktreeSession.worktreeBranch）")

@@ -9,6 +9,7 @@ import com.nexusai.eventbus.ws.MessageToolResultEvent;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import com.nexusai.application.agent.LlmAgentLoop;
 import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.messaging.PeerActionGuard;
 import com.nexusai.application.agent.permission.InputSanitizer;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
@@ -204,6 +205,16 @@ public class StreamingToolExecutor {
      * 非 null 时以 {@code tool.execute(call, ctx)} 派发，工具可读 agentId/sessionId 做会话分桶。
      */
     private final ToolUseContext ctx;
+
+    /**
+     * [V329] 本轮开始时的会话可见集快照（显式 disabled_tools + 无人值守 Ask）。
+     *
+     * <p>为什么快照而不是每次读库：运行中的开关切换只应影响**下一轮**；
+     * 若在每次 {@code add()} 读实时状态，用户在本轮中途开启无人值守会把本轮已装配的
+     * Ask 工具「假装撤销」（与设计 T7 冲突）。执行器本身按 tool-round 构造，快照粒度 = 一轮。
+     */
+    private final java.util.Set<String> sessionDisabledAtStart;
+    private final boolean unattendedAtStart;
 
     /** [Session J 方案 A] SubagentTool 特化执行参数 · 与 ToolUseContext 顶层字段解耦. */
     private volatile AgentOptions subagentAgentOptions = AgentOptions.defaultOptions();
@@ -623,6 +634,14 @@ public class StreamingToolExecutor {
         this.registry = registry;
         this.executor = executor;
         this.ctx = ctx;
+        // [V330] 会话可见集快照（本轮固定；切换下一轮生效）· 与 schema/ToolSearch/面板同一解析器。
+        //   有 TUC 携带的本轮快照则读它；否则实时解析当前会话状态。
+        String sid = ctx != null ? ctx.sessionId() : null;
+        com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot visibility =
+                com.nexusai.application.agent.tool.SessionToolVisibility
+                        .resolve(sid, ctx != null ? ctx.requestExtras() : null);
+        this.sessionDisabledAtStart = visibility.disabled();
+        this.unattendedAtStart = visibility.askExcluded();
         this.extendedResultHandler = extendedResultHandler;
         this.permissionGate = gate;
         this.canUseTool = canUseTool;
@@ -726,7 +745,10 @@ public class StreamingToolExecutor {
         //   过滤 → 执行器在过滤后 pool findToolByName 查不到 → StreamingToolExecutor.ts:91）。
         //   Java 注册表保留全部已注册工具（LLM schema 已按 isEnabled 过滤），此处执行器
         //   主路径补守卫（ToolRegistry.dispatch 守卫仅覆盖 fork 路径）。
-        if (tool != null && tool.isEnabled()) {
+        // [V329 会话可见集守卫] isEnabled 只是全局门；会话级剔除（disabled_tools / 无人值守 Ask）
+        //   也必须在这里生效 —— 否则 ToolSearch 找回 / 历史 tool_call 仍会执行模型「看不见」的工具。
+        boolean blockedBySession = tool != null && isBlockedBySession(tool, ctx);
+        if (tool != null && tool.isEnabled() && !blockedBySession) {
             t.tool = tool;
             try {
                 t.isConcurrencySafe = tool.isConcurrencySafe(call.input());
@@ -758,15 +780,21 @@ public class StreamingToolExecutor {
             // [IMP-C4 R1 rework] isEnabled=false 与 unknown 同路径（CC tools.ts:325 可见集过滤
             //   → 执行器 findToolByName 查不到 → StreamingToolExecutor.ts:91）；disabled 补 warn 日志.
             if (tool != null) {
-                log.warn("TOOL add: 工具 '{}' (id={}) 已注册但 disabled → 拒绝执行 (No such tool available)",
-                    call.name(), abbreviate(call.id(), 24));
+                if (blockedBySession) {
+                    log.warn("TOOL add: 工具 '{}' (id={}) 不在本会话可见集 → 拒绝执行 (No such tool available)",
+                        call.name(), abbreviate(call.id(), 24));
+                } else {
+                    log.warn("TOOL add: 工具 '{}' (id={}) 已注册但 disabled → 拒绝执行 (No such tool available)",
+                        call.name(), abbreviate(call.id(), 24));
+                }
             }
             t.isConcurrencySafe = true;
             t.status = Status.COMPLETED;
             // [R32-b15 Stage 2 C5] 未知工具错误保留 lineage parent (CLAUDE.md 规则 12 · Fail loud)
             //   让 UI/transcript 仍能按 DTO assistantMessageId 字段回挂父 envelope.
-            t.result = ToolResult.error(call.id(),
-                "No such tool available: " + call.name());
+            t.result = ToolResult.failure(call.id(),
+                "Error: No such tool available: " + call.name(),
+                com.nexusai.application.agent.tool.ToolErrorKind.UNKNOWN_TOOL);
             t.isError = true;
             tools.put(call.id(), t);
             // [工具调用实时推] unknown/disabled 分支: result 已同步就绪 →
@@ -776,6 +804,44 @@ public class StreamingToolExecutor {
             // [R32-b8 #3] 同步: 错误工具立即 mark completed (不入 in-progress 等待 UI)
             processQueue();
         }
+    }
+
+    /**
+     * 会话级可见集守卫（对齐 schema 的会话剔除，V329）。
+     *
+     * <p>执行入口必须与 {@code LlmAgentLoop.sessionVisibleTools} 同源：
+     * <ul>
+     *   <li>{@code disabled_tools} 的<b>显式</b>值（不推断默认禁用：默认集可被人格点名豁免）；</li>
+     *   <li>无人值守会话的 {@code AskUserQuestion}（显式会话状态）。</li>
+     * </ul>
+     * 两者都取<b>本轮构造时</b>的快照（见 {@link #sessionDisabledAtStart} / {@link #unattendedAtStart}），
+     * 运行中切换只影响下一轮。豁免 {@code SPECIAL_TOOLS} 与 ToolSearch 自身。
+     *
+     * @param tool 已解析的注册工具（用 canonical name，兼容 alias 调用）
+     * @param ctx  per-call 上下文（可 null）
+     * @return true = 本会话不可执行
+     */
+    private boolean isBlockedBySession(Tool tool, ToolUseContext ctx) {
+        if (ctx == null) {
+            return false;
+        }
+        String name = tool.name();
+        if (ctx.sessionId() == null || ctx.sessionId().isBlank()
+                || com.nexusai.common.SessionKeys.isNoSession(ctx.sessionId())) {
+            // [V330 · cron 无头] 无会话（NO_SESSION 哨兵）的非交互执行没有可应答 UI ⇒ Ask 不可执行。
+            return ctx.isNonInteractiveSession()
+                && com.nexusai.application.agent.config.ImUnattendedConfig
+                    .ASK_USER_QUESTION_TOOL.equals(name);
+        }
+        if (name == null
+                || ToolNameConstants.SPECIAL_TOOLS.contains(name)
+                || ToolNameConstants.TOOL_SEARCH_TOOL_NAME.equals(name)) {
+            return false;
+        }
+        return sessionDisabledAtStart.contains(name)
+                || (unattendedAtStart
+                    && com.nexusai.application.agent.config.ImUnattendedConfig
+                        .ASK_USER_QUESTION_TOOL.equals(name));
     }
 
     /**
@@ -1428,8 +1494,9 @@ public class StreamingToolExecutor {
                         log.info("TOOL _raw 兜底拦截: callId={} tool={} rawLen={} → 引导拆小重试（非合法 JSON）",
                             abbreviate(t.call.id(), 24), toolName, rawLen);
                     }
-                    t.result = ToolResult.error(t.call.id(),
-                        ToolErrorFormatter.inputValidationErrorBlock(guidance), "validation");
+                    t.result = ToolResult.failure(t.call.id(),
+                        "InputValidationError: " + guidance,
+                        com.nexusai.application.agent.tool.ToolErrorKind.SCHEMA);
                     t.isError = true;
                     erroredCount.incrementAndGet();
                     t.status = Status.COMPLETED;
@@ -1472,8 +1539,9 @@ public class StreamingToolExecutor {
                         // [IT-4 OD-TDV1-6] CC toolExecution.ts:670 tool_result content 逐字:
                         //   `<tool_use_error>InputValidationError: ${errorContent}</tool_use_error>`
                         //   is_error:true（旧 errorBuilder 死代码 + joinIssuesForLlm 折叠已删）
-                        t.result = ToolResult.error(t.call.id(),
-                            ToolErrorFormatter.inputValidationErrorBlock(errorContent), "validation");
+                        t.result = ToolResult.failure(t.call.id(),
+                            "InputValidationError: " + errorContent,
+                            com.nexusai.application.agent.tool.ToolErrorKind.SCHEMA);
                         t.isError = true;
                         erroredCount.incrementAndGet();
                         t.status = Status.COMPLETED;
@@ -1497,10 +1565,9 @@ public class StreamingToolExecutor {
                         // [P-AL-05 D-2] semantic 路径重载: error=message + errorCode
                         //   (CC toolExecution.ts:691-698), 内部注入 ToolDecisionInfo("config","reject")
                         emitToolUseErrorTelemetry(t, semanticResult.errorCode(), semanticResult.message());
-                        String joined = ToolErrorFormatter.joinIssuesForLlm(
-                            ToolErrorFormatter.formatValidationError(semanticResult));
-                        t.result = ToolResult.error(t.call.id(),
-                            "Input validation failed: " + joined, "validation");
+                        t.result = ToolResult.failure(t.call.id(),
+                            semanticResult.message(),
+                            com.nexusai.application.agent.tool.ToolErrorKind.VALIDATE_INPUT);
                         t.isError = true;
                         erroredCount.incrementAndGet();
                         t.status = Status.COMPLETED;
@@ -1600,8 +1667,9 @@ public class StreamingToolExecutor {
                         //   HookRegistry 已 unwrap + re-throw (R31-D2.6), 此处接住后立即阻断工具.
                         log.warn("TOOL PreToolUse hook AbortException: name={} id={} reason={}",
                             t.call.name(), abbreviate(t.call.id(), 24), ae.getMessage());
-                        t.result = ToolResult.error(t.call.id(),
-                            "PreToolUse hook aborted: " + ae.getMessage(), "abort");
+                        t.result = ToolResult.failure(t.call.id(),
+                            "PreToolUse hook aborted: " + ae.getMessage(),
+                            com.nexusai.application.agent.tool.ToolErrorKind.CANCEL);
                         t.isError = true;
                         erroredCount.incrementAndGet();
                     } catch (Throwable th) {
@@ -1670,9 +1738,10 @@ public class StreamingToolExecutor {
                     //   utils/messages.ts:210-211）。旧实现 `Error: ${stopReason}` 在
                     //   stopReason null 时产出 "Error: undefined"（TR-A3 △-4 行为可观测差异）。
                     String stopReason = preOutcome.stopReason();
-                    t.result = ToolResult.error(t.call.id(),
+                    t.result = ToolResult.failure(t.call.id(),
                         com.nexusai.application.agent.permission.PermissionRejectMessages.withMemoryCorrectionHint(
-                            com.nexusai.application.agent.permission.PermissionRejectMessages.CANCEL_MESSAGE), "abort");
+                            com.nexusai.application.agent.permission.PermissionRejectMessages.CANCEL_MESSAGE),
+                        com.nexusai.application.agent.tool.ToolErrorKind.CANCEL);
                     t.isError = true;
                     // [IMP-HOOKS-S6 E7] stoppedByHookExecuted 标志: post 链 (:1712-1843)
                     //   对 abort-stop 结果跳过 failure analytics + executePostToolUseFailure
@@ -1804,8 +1873,9 @@ public class StreamingToolExecutor {
                             // gate 抛异常 → fail loud (CLAUDE.md 规则十二) 但不挂掉 tool batch
                             log.error("TOOL permission gate threw: name={} id={} err={}",
                                 t.call.name(), abbreviate(t.call.id(), 24), th.toString());
-                            t.result = ToolResult.error(t.call.id(),
-                                "permission gate failed: " + th.getMessage());
+                            t.result = ToolResult.failure(t.call.id(),
+                                "permission gate failed: " + th.getMessage(),
+                                com.nexusai.application.agent.tool.ToolErrorKind.CALL_THREW);
                             t.isError = true;
                         }
                     }
@@ -1875,7 +1945,8 @@ public class StreamingToolExecutor {
                                 log.debug("TOOL hook deny 阻断: callId={} tool={} message={}",
                                     abbreviate(t.call.id(), 24), t.call.name(), errorMessage);
                             }
-                            t.result = ToolResult.error(t.call.id(), errorMessage, "permission");
+                            t.result = ToolResult.failure(t.call.id(), errorMessage,
+                                com.nexusai.application.agent.tool.ToolErrorKind.PERMISSION_DENY);
                             t.isError = true;
                         } else {
                             // rule deny / gate deny → toToolResult 提取 denyResult.message()
@@ -1983,6 +2054,23 @@ public class StreamingToolExecutor {
                                     t.call.name(), abbreviate(t.call.id(), 24));
                             }
                         }
+                        // ── [C批 · 跨会话安全门禁] 最终 effectiveCall 全部重写之后、tool.execute 之前再核 ──
+                        //   hook updatedInput / 用户弹窗改写 / backfill 都可能改路径（如把普通文件改成
+                        //   CLAUDE.md/settings）。此处只 Deny（不 Ask）：用户已在权限弹窗真实批准的本次
+                        //   调用不能被二次打断；只拦硬策略违规（plan 工具 / 配置写 / 受保护写目标）。
+                        PeerActionGuard.Decision peerFinal = PeerActionGuard.checkFinal(
+                            ctx != null ? ctx.peerExecutionOrigin() : null,
+                            t.tool, effectiveCall.input(), ctx);
+                        if (peerFinal.isDeny()) {
+                            t.result = peerFinal.toToolResult(t.call.id());
+                            t.isError = true;
+                            t.errorCategory = "permission";
+                            erroredCount.incrementAndGet();
+                            if (log.isInfoEnabled()) {
+                                log.info("TOOL PEER GUARD final deny（tool.execute 前）: name={} id={} code={}",
+                                    t.call.name(), abbreviate(t.call.id(), 24), peerFinal.code());
+                            }
+                        } else {
                         long toolExecStartNs = System.nanoTime();
                         // [B GAP-EXEC-08 修正] 标记工具真实执行 (permission DENY 等未执行
                         //   路径保持 false, 不触发 success-path Bash sibling abort)
@@ -2044,6 +2132,7 @@ public class StreamingToolExecutor {
                         } finally {
                             t.toolDurationMs = java.util.concurrent.TimeUnit.NANOSECONDS.toMillis(
                                 System.nanoTime() - toolExecStartNs);
+                        }
                         }
                         // [IMP-C2 返工] 正常返回路径推导 isError：ToolResult 4 字段契约删除
                         // isError 后，执行器在知悉结果处（工具正常返回 ToolResult.error）经
@@ -2393,8 +2482,9 @@ public class StreamingToolExecutor {
                 //   (CC toolExecution.ts:150-171 细粒度类名), errorCategory 注入 ToolResult.errorCategory
                 //   供 telemetry 区分 (接线保留, 决策 P-25).
                 String errorCategory = ToolErrorFormatter.classifyToolError(th);
-                t.result = ToolResult.error(t.call.id(),
-                    ToolErrorFormatter.formatError(th), errorCategory);
+                t.result = ToolResult.failure(t.call.id(),
+                    ToolErrorFormatter.formatError(th),
+                    com.nexusai.application.agent.tool.ToolErrorKind.CALL_THREW);
                 // [IMP-C2] catch 路径同步 TrackedTool isError/errorCategory
                 //   （getResultErrorFlags 配对推导 + PostToolUseFailure hook 入参依赖）
                 t.isError = true;
@@ -2967,7 +3057,8 @@ public class StreamingToolExecutor {
                 drained.add(tr);
             } else {
                 // 未知类型 → 防御性 fallback (sealed 已收窄, 理论不可达)
-                drained.add(ToolResult.error(t.call.id(), "unknown result type"));
+                drained.add(ToolResult.failure(t.call.id(), "unknown result type",
+                    com.nexusai.application.agent.tool.ToolErrorKind.SYNTHETIC));
             }
             // [fix-toolcall-fault A/R3] id 台账与结果同序同量追加（配对侧按 id 绑定）
             drainedIds.add(t.call.id());
@@ -3010,14 +3101,16 @@ public class StreamingToolExecutor {
         for (TrackedTool t : tools.values()) {
             if (t.status == Status.COMPLETED && !drainedIds.contains(t.call.id())) {
                 if (t.result == null) {
-                    drained.add(ToolResult.error(t.call.id(),
-                        discarded ? "streaming_fallback" : "no result produced"));
+                    drained.add(ToolResult.failure(t.call.id(),
+                        discarded ? "streaming_fallback" : "no result produced",
+                        com.nexusai.application.agent.tool.ToolErrorKind.SYNTHETIC));
                 } else if (t.result instanceof ToolResult<?> tr) {
                     // A1: ToolResult 在 dispatch 时已被 extendedResultHandler 处理, 返回其本身 (无 base 解包)
                     drained.add(tr);
                 } else {
                     // 未知类型 → 防御性 fallback (sealed 已收窄, 理论不可达)
-                    drained.add(ToolResult.error(t.call.id(), "unknown result type"));
+                    drained.add(ToolResult.failure(t.call.id(), "unknown result type",
+                    com.nexusai.application.agent.tool.ToolErrorKind.SYNTHETIC));
                 }
                 // [fix-toolcall-fault A/R3] id 台账与结果同序同量追加（配对侧按 id 绑定）
                 drainedIds.add(t.call.id());
@@ -3729,7 +3822,8 @@ public class StreamingToolExecutor {
                 content = "[R32 synthetic unknown abort reason] " + reason;
                 break;
         }
-        return ToolResult.error(toolUseId, content);
+        return ToolResult.failure(toolUseId, content,
+            com.nexusai.application.agent.tool.ToolErrorKind.SYNTHETIC);
     }
 
     // ─────────────────── [A1 撤外层] 决策 telemetry helpers ───────────────────
@@ -3858,6 +3952,13 @@ public class StreamingToolExecutor {
             //   非本工具 / 非结构化 data → truncateResult（原行为，含 null ↔ ""）。
             String briefJson = com.nexusai.application.agent.tool.impl.BriefTool
                 .structuredUiPayload(t.call.name(), rawData);
+            // [AST tools 2026-11-18] AST 工具（AstGrep/AstEdit）的 UI 载荷与 brief 同一条出口：
+            //   只由 AstUiPayload.serialize 产生（kind=ast_grep/ast_edit），与落库重拉
+            //   （ChatService.toolResultUiPayload）同形；⛔ 两处不得各写一套序列化。
+            if (briefJson == null) {
+                briefJson = com.nexusai.application.agent.ast.AstUiPayload
+                    .serialize(t.call.name(), rawData);
+            }
             result = briefJson != null ? briefJson : truncateResult(rawData);
         }
         try {

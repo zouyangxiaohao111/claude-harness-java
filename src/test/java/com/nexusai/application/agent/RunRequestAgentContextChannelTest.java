@@ -60,23 +60,28 @@ class RunRequestAgentContextChannelTest {
     void component_exists_asLastComponent() {
         var components = RunRequest.class.getRecordComponents();
         assertThat(components)
-            .as("RunRequest 组件数（S1-T7 新增 agentContext 后为 20；批 A4e 末位追加 permissionModeSource 后为 21）")
-            .hasSize(21);
-        // [批 A4e] 末位现为 permissionModeSource（同样的「末位追加」约定，避免插入式改签名）
+            .as("RunRequest 组件数（S1-T7 新增 agentContext 后为 20；批 A4e 末位追加 permissionModeSource 后为 21；"
+                + "request-extras 批 1 末位追加 requestExtras 后为 22；[V306] 末位追加 notifyChats 后为 23）")
+            .hasSize(23);
+        // [V306] 末位现为 notifyChats（同样的「末位追加」约定，避免插入式改签名）
         var last = components[components.length - 1];
         assertThat(last.getName())
-            .as("[批 A4e] permissionModeSource 必须末位追加（同 agentContext 的约定）")
-            .isEqualTo("permissionModeSource");
-        assertThat(last.getType())
-            .isEqualTo(com.nexusai.application.agent.permission.PermissionModeSource.class);
-        // agentContext 仍在第 20 位、紧随 boundProject（本批未插入式改动既有实参位置）
-        assertThat(components[components.length - 2].getName())
-            .as("agentContext 必须仍紧随 boundProject（agentContext 未被插入式改动）")
-            .isEqualTo("agentContext");
+            .as("[V306] notifyChats 必须末位追加（同 agentContext / permissionModeSource / requestExtras 的约定）")
+            .isEqualTo("notifyChats");
+        // [批 A4e] permissionModeSource 仍是必传组件（位置随新组件末位追加而后移，但值位不变）
         assertThat(components[components.length - 3].getName())
+            .as("permissionModeSource 必须仍在 notifyChats / requestExtras 之前（末位追加不移动既有组件）")
+            .isEqualTo("permissionModeSource");
+        assertThat(components[components.length - 3].getType())
+            .isEqualTo(com.nexusai.application.agent.permission.PermissionModeSource.class);
+        // agentContext 仍在第 20 位、紧随 boundProject（历次追加未插入式改动既有实参位置）
+        assertThat(components[19].getName())
+            .as("agentContext 必须仍在第 20 位（紧随 boundProject，未被插入式改动）")
+            .isEqualTo("agentContext");
+        assertThat(components[18].getName())
             .as("boundProject 必须仍紧随 batchUserPrompts")
             .isEqualTo("boundProject");
-        assertThat(components[components.length - 2].getType()).isEqualTo(AgentContext.class);
+        assertThat(components[19].getType()).isEqualTo(AgentContext.class);
     }
 
     @Test
@@ -133,8 +138,11 @@ class RunRequestAgentContextChannelTest {
 
         assertThat(code)
             .as("接线点 1：doRun 构造 base TUC 时必须把 RunRequest.agentContext() 作为实参显式传入"
-                + "（原为 buildBaseToolUseContext 内部读 AgentContext.getAgentContext() ambient）")
-            .anyMatch(l -> l.replaceAll("\\s+", " ").contains("params.agentContext());"));
+                + "（原为 buildBaseToolUseContext 内部读 AgentContext.getAgentContext() ambient）"
+                + "⚠️ 判据只认「实参本身」：该实参早已不是调用实参表的最后一项（其后还有 dbTranscript /"
+                + " notifyChats 等），所以不能要求源码里出现 `params.agentContext());` 这种「收尾形态」——"
+                + " 那种写法在本仓早已不存在 ⇒ 断言恒红（假红）。")
+            .anyMatch(l -> l.replaceAll("\\s+", " ").contains("params.agentContext()"));
 
         assertThat(code)
             .as("接线点 2：loop() 内的模型请求必须从 base TUC 的显式字段取（单一来源）"
@@ -143,46 +151,114 @@ class RunRequestAgentContextChannelTest {
     }
 
     @Test
-    @DisplayName("○（源码扫描）canonical new RunRequest( 调用点 == 18（原 17 + A4e sessionFromSessionOverride 1）")
+    @DisplayName("○（源码扫描）canonical new RunRequest( 调用点 == 20（原 18 + request-extras 1 + V306 withNotifyChats 1）")
     void allCanonicalConstructors_passAgentContext() {
         Path f = backendRoot().resolve("src/main/java/com/nexusai/application/agent/RunRequest.java");
         String src = readText(f);
-        List<String> code = codeLines(f);
+        // ⛔ 扫描一律用**去注释**源码：javadoc 里出现的 `new RunRequest(...)`（讲历史计数的说明文字）
+        //    不是构造点，混进来会让 arity 列表多出一个假项（arity=1）并让计数失真。
+        String code = stripComments(src);
+        List<String> codeLines = codeLines(f);
 
         // ── 1. 构造点计数 ──
         int canonical = 0;
-        for (String l : code) {
+        for (String l : codeLines) {
             canonical += countOccurrences(l, "new RunRequest(");
         }
         assertThat(canonical)
             .as("canonical 构造点数 = S1-T7 后的 17 处 **+ 1 处**（批 A4e 新增的 "
-                + "sessionFromSessionOverride 工厂 = 会话 override 槽专用来源标注）= 18。"
+                + "sessionFromSessionOverride 工厂 = 会话 override 槽专用来源标注）**+ 1 处**"
+                + "（request-extras 批 1 新增 withRequestExtras 副本方法）**+ 1 处**"
+                + "（[V306] 新增 withNotifyChats 副本方法）= 20。"
                 + "⚠️ 少一处会编译不过；多/少一处都说明工厂集变了 —— 必须人工确认后同步本计数"
                 + "（本断言刻意对计数敏感：它是「构造点是否全补齐」的机械落点）")
-            .isEqualTo(18);
+            .isEqualTo(20);
 
-        // ── 2. 每个构造点都必须是 21 个顶层实参（= 组件数）──
-        List<Integer> arities = canonicalArities(src, "new RunRequest(");
+        // ── 2. 每个构造点的顶层实参数 ──
+        //    工厂走 21 参**兼容构造器**（缺 requestExtras / notifyChats ⇒ 构造器内补 null）；
+        //    副本方法走 canonical（23 = 组件数）。两类都必须「补齐到当时的最大组件数」，
+        //    漏一个 ⇒ 编译不过（本断言是第二道机械闩锁）。
+        List<Integer> arities = canonicalArities(code, "new RunRequest(");
         assertThat(arities)
-            .as("每个 canonical new RunRequest(...) 的顶层实参数（应恒为 21 = record 组件数）；"
+            .as("每个 new RunRequest(...) 的顶层实参数：工厂 = 21（兼容构造器）/ 副本方法 = 23（canonical = 组件数）；"
                 + "若某处少一个 ⇒ 说明新增组件时漏补该构造点")
-            .hasSize(18)
-            .allSatisfy(a -> assertThat(a).isEqualTo(21));
+            .hasSize(20)
+            .allSatisfy(a -> assertThat(a).isIn(21, 23));
+        assertThat(arities)
+            .as("canonical（23 参 = 组件数）调用点 = 4 个副本方法"
+                + "（withBoundProject / withRequestExtras / withAgentContext / withNotifyChats）")
+            .filteredOn(a -> a == 23)
+            .hasSize(4);
 
-        // ── 3. 两处副本方法必须**透传** agentContext（而不是补 null）──
-        //    [批 A4e] 组件 permissionModeSource 末位追加后，两处副本方法的实参表尾变成
-        //    `, agentContext, permissionModeSource);` —— 用「尾两参连写」作判据，
-        //    同时证明「agentContext 未漏」且「新组件未漏」（任一被补成 null ⇒ 计数 ≠ 2 ⇒ 红）。
-        assertThat(countOccurrences(src, ", agentContext, permissionModeSource);"))
-            .as("withBoundProject / withAgentContext 两处副本方法必须**同时**透传 agentContext 与"
-                + " permissionModeSource（本仓多次出现「新增副本方法漏透传字段」；批 A4e 新增组件同款风险）")
-            .isEqualTo(2);
+        // ── 3. 四处副本方法必须**透传** agentContext（而不是补 null）──
+        //    组件末位追加后，副本方法的实参表尾变成
+        //    `, agentContext, permissionModeSource, requestExtras, notifyChats);` —— 用「尾四参连写」作判据，
+        //    同时证明「既有组件未漏」且「新组件未漏」（任一被补成 null ⇒ 计数 ≠ 4 ⇒ 红）。
+        assertThat(countOccurrences(code, ", agentContext, permissionModeSource, requestExtras, notifyChats);"))
+            .as("四个副本方法（withBoundProject / withRequestExtras / withAgentContext / withNotifyChats）"
+                + "必须**同时**透传 agentContext / permissionModeSource / requestExtras / notifyChats"
+                + "（本仓多次出现「新增副本方法漏透传字段」；A4e / request-extras / V306 新增组件同款风险）")
+            .isEqualTo(4);
 
-        // ── 4. [批 A4e] 两处副本方法必须**透传** permissionModeSource（同款「漏透传新字段」风险）──
-        assertThat(countOccurrences(src, ", permissionModeSource);"))
-            .as("withBoundProject / withAgentContext 两处副本方法都必须透传 permissionModeSource"
-                + "（批 A4e 新增组件；漏透传 ⇒ 副本会把来源标注静默丢掉）")
-            .isEqualTo(2);
+        // ── 4. 副本方法必须**透传** permissionModeSource + requestExtras + notifyChats（同款风险）──
+        assertThat(countOccurrences(code, ", permissionModeSource, requestExtras, notifyChats);"))
+            .as("四个副本方法都必须透传 permissionModeSource / requestExtras / notifyChats"
+                + "（漏透传 ⇒ 副本会把来源标注 / 请求级透传 / 通知目标静默丢掉）")
+            .isEqualTo(4);
+    }
+
+    /**
+     * 去掉源码里的注释（保留换行与字符串字面量）—— 让「调用点扫描」只看到真实代码。
+     *
+     * <p><b>WHY 必须有它</b>：{@code RunRequest.java} 的 javadoc 里会出现
+     * {@code new RunRequest(...)} 这类**说明文字**（讲历史构造点计数）。不先去注释，
+     * arity 列表会多出一个假项（arity=1）、计数也会失真 ⇒ 机械闩锁变成假红。
+     *
+     * <p>实现：状态机逐字符扫（区分行注释 / 块注释 / 字符串字面量），注释内容替换为等量空格
+     * （块注释里的换行保留 ⇒ 行号不变），字符串字面量内容保留（其中的 {@code //} 不是注释）。
+     */
+    private static String stripComments(String src) {
+        StringBuilder sb = new StringBuilder(src.length());
+        boolean inBlock = false;
+        boolean inStr = false;
+        boolean inChar = false;
+        for (int i = 0; i < src.length(); i++) {
+            char c = src.charAt(i);
+            if (inBlock) {
+                if (c == '*' && i + 1 < src.length() && src.charAt(i + 1) == '/') {
+                    inBlock = false;
+                    sb.append("  ");
+                    i++;
+                } else {
+                    sb.append(c == '\n' ? '\n' : ' ');
+                }
+                continue;
+            }
+            if (!inStr && !inChar && c == '/' && i + 1 < src.length()) {
+                char n = src.charAt(i + 1);
+                if (n == '*') {
+                    inBlock = true;
+                    sb.append("  ");
+                    i++;
+                    continue;
+                }
+                if (n == '/') {
+                    while (i < src.length() && src.charAt(i) != '\n') {
+                        sb.append(' ');
+                        i++;
+                    }
+                    i--;   // 回退一格，交给 for 的 i++ 处理换行本身
+                    continue;
+                }
+            }
+            if (c == '"' && !inChar) {
+                inStr = !inStr;
+            } else if (c == '\'' && !inStr) {
+                inChar = !inChar;
+            }
+            sb.append(c);
+        }
+        return sb.toString();
     }
 
     /**

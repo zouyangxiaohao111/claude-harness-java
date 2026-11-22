@@ -19,6 +19,10 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class SessionSkillAllowlistRegistryTest {
 
+    /** 非主线程 agentId（CC 单一形态 a+16hex，String）。 */
+    private static final String AGENT =
+        com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+
     private static Command cmd(String name) {
         Command c = new Command();
         c.setName(name);
@@ -68,14 +72,14 @@ class SessionSkillAllowlistRegistryTest {
     @DisplayName("作用范围：主线程 / 后台主会话 / fork 子代理 套用；普通子代理不套用")
     void applicability() {
         assertThat(SessionSkillAllowlistRegistry.appliesToListing(null, null, false)).isTrue();
-        assertThat(SessionSkillAllowlistRegistry.appliesToListing(UUID.randomUUID(), "main-session", false)).isTrue();
-        assertThat(SessionSkillAllowlistRegistry.appliesToListing(UUID.randomUUID(), "fork", true)).isTrue();
-        assertThat(SessionSkillAllowlistRegistry.appliesToListing(UUID.randomUUID(), "fork", false)).isFalse();
-        assertThat(SessionSkillAllowlistRegistry.appliesToListing(UUID.randomUUID(), "researcher", true)).isFalse();
+        assertThat(SessionSkillAllowlistRegistry.appliesToListing(AGENT, "main-session", false)).isTrue();
+        assertThat(SessionSkillAllowlistRegistry.appliesToListing(AGENT, "fork", true)).isTrue();
+        assertThat(SessionSkillAllowlistRegistry.appliesToListing(AGENT, "fork", false)).isFalse();
+        assertThat(SessionSkillAllowlistRegistry.appliesToListing(AGENT, "researcher", true)).isFalse();
 
         // dynamic_skill：仅主线程（CC e.agentId===void 0），fork 也不过滤
         assertThat(SessionSkillAllowlistRegistry.appliesToDynamicSkill(null)).isTrue();
-        assertThat(SessionSkillAllowlistRegistry.appliesToDynamicSkill(UUID.randomUUID())).isFalse();
+        assertThat(SessionSkillAllowlistRegistry.appliesToDynamicSkill(AGENT)).isFalse();
     }
 
     @Test

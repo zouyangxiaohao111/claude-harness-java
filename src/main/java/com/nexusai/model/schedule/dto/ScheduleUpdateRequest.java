@@ -27,6 +27,15 @@ package com.nexusai.model.schedule.dto;
  *                        {@code ValidationException} ⇒ 400，见 {@code ScheduleService#update}）
  * @param sessionId       创建时绑定的会话（⚠️ [cwd3 · D6] <b>创建后不可变</b>：非 null ⇒ 400）
  * @param agentId         teammate agentId（可空 = 不改）
+ * @param sessionMode     [V306] 执行上下文形态（A/B/C/D；可空 = 不改）。⚠️ 与 {@code sessionId}
+ *                        不同，它**可以改**（设计稿 ⑥：「会话归属和调度类型可以改，但已造的会话不能改」）：
+ *                        改形态会解除旧的会话绑定（会话本身保留在左栏），由新形态在下次 fire 时决定用哪个会话
+ * @param notifyChats     [V306] 通知目标聊天 id 列表（可空 = 不改；空列表 = 清空 ⇒ 不通知）
+ * @param notifyChannelIds [V306] 冗余渠道 id（可空 = 不改；服务端不依赖它做投递）
+ * @param mainThreadAgent [V317] 任务指定的「专家」（主线程 agent）。<b>null = 不改</b>；
+ *                        <b>空串 = 清空</b>（回落默认专家）；非空 = 设置。
+ *                        仅 {@code NEW_EACH}/{@code NEW_ONCE} 形态可非空，
+ *                        {@code REUSE}/{@code NONE} 传非空 ⇒ 400（不静默忽略）。
  */
 public record ScheduleUpdateRequest(
     String name,
@@ -38,5 +47,29 @@ public record ScheduleUpdateRequest(
     String description,
     ScheduleScope scope,
     String sessionId,
-    String agentId
-) {}
+    String agentId,
+    SessionMode sessionMode,
+    java.util.List<String> notifyChats,
+    java.util.List<String> notifyChannelIds,
+    String mainThreadAgent
+) {
+    /**
+     * V306 兼容构造器：V306 之前的 10 参调用点（测试夹具）不用改。
+     * 三个新字段取 {@code null} = 不改，与 partial-update 语义一致。
+     */
+    public ScheduleUpdateRequest(
+        String name,
+        ScheduleKind kind,
+        String cron,
+        Integer intervalSeconds,
+        String runAt,
+        String command,
+        String description,
+        ScheduleScope scope,
+        String sessionId,
+        String agentId
+    ) {
+        this(name, kind, cron, intervalSeconds, runAt, command, description,
+            scope, sessionId, agentId, null, null, null, null);
+    }
+}

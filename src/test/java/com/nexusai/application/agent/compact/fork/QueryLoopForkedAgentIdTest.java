@@ -119,7 +119,7 @@ class QueryLoopForkedAgentIdTest {
                 + "且 0 写入下永不收敛（改回 null → 本断言 RED：drain 根本不会被调用）")
             .isNotBlank();
 
-        assertThat(AgentContext.unpackAgentId(UUID.fromString(forkAgentId)))
+        assertThat(forkAgentId)
             .as("身份必须来自本仓既有生成器 AgentContext.createAgentId（CC uuid.ts:24-27 的 a+16hex）"
                 + "—— 不是新造一套、也不是随便一个 UUID")
             .matches("a[0-9a-f]{16}");
@@ -213,7 +213,7 @@ class QueryLoopForkedAgentIdTest {
     /** 会话 ToolUseContext（effectiveModelName 已写 ⇒ fork 走会话模型直传分支 · 对齐生产）。 */
     private static ToolUseContext baseTuc() {
         return new ToolUseContext(
-            UUID.randomUUID(), SESSION, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of())
             .withEffectiveModelName(MODEL_NAME);
     }

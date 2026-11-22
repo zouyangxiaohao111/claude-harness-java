@@ -306,7 +306,7 @@ public class ExecAgentHook {
         // [H13] 旧实现直接用 UUID.randomUUID()（generateHookAgentId 死方法）; 现经 generateHookAgentId()
         // 生成 'hook-agent-<uuid>' 前缀, 派生 UUID 供类型化字段（ToolUseContext/AgentState/EnforcementHook）。
         String hookAgentId = generateHookAgentId();
-        UUID hookAgentUuid = UUID.fromString(hookAgentId.substring("hook-agent-".length()));
+        String hookAgentUuid = hookAgentId;
         // CC :51 effectiveToolUseID = toolUseID || `hook-${randomUUID()}`
         String effectiveToolUseID = "hook-" + UUID.randomUUID();
         long hookStartTime = System.currentTimeMillis();
@@ -360,7 +360,8 @@ public class ExecAgentHook {
             String systemPrompt = buildSystemPrompt(hookEvent, transcriptPath);
 
             // 5. AgentState + maxTurns=50 + user message · CC :119, :67-68
-            AgentState state = new AgentState(systemPrompt, sessionId, hookAgentUuid);
+            AgentState state = new AgentState(systemPrompt, sessionId,
+                hookAgentUuid);
             state.maxTurns(MAX_AGENT_TURNS);
             state.appendMessage(userMessage(processedPrompt));
 
@@ -562,7 +563,7 @@ public class ExecAgentHook {
             //   回收失败仅 warn，不影响 hook outcome）。
             try {
                 com.nexusai.application.agent.skill.SkillListingSentRegistry
-                    .removeAgentKey(sessionId, hookAgentUuid.toString());
+                    .removeAgentKey(sessionId, hookAgentUuid);
             } catch (Exception e) {
                 log.warn("ExecAgentHook: hook={} 回收 skill_listing 槽失败 agentId={}: {}",
                     hookName, hookAgentId, e.getMessage());
@@ -1036,10 +1037,10 @@ public class ExecAgentHook {
                     continue;
                 }
                 String providerType = p.type() != null ? p.type().name() : "openai_compatible";
-                // [provider-custom-headers 任务 6] 此处 p 是 **ProviderDto**（不是 Provider 实体），
-                //   ProviderDto.extraHeaders() 已经是 Map<String,String>（ProviderService.toProviderDto
-                //   内已过 deserializeHeaders），故**不再**调 deserializeHeaders（那会类型不符）。
-                ProviderConfig cfg = new ProviderConfig(p.baseUrl(), rawKey, p.extraHeaders());
+                // [保密 2026-11-22] ⛔ 不能用 ProviderDto.extraHeaders()：GET 面已脱敏（只回末四位），
+                //   拿它发请求会让 hook 子代理缺真实鉴权头。真值走服务端内部读链（DB 列）。
+                ProviderConfig cfg = new ProviderConfig(p.baseUrl(), rawKey,
+                    providerService.getPlainExtraHeaders(p.id()));
                 // 工厂 2-arg 路由校验（对齐 HookRegistry.resolvePromptProvider 的
                 //   factory.getProvider(config, providerType) 模式）+ provider type 日志
                 LlmProvider routed = llmProviderFactory.getProvider(cfg, providerType);

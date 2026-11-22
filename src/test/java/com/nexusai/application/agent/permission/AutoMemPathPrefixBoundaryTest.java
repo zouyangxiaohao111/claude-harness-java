@@ -95,7 +95,7 @@ class AutoMemPathPrefixBoundaryTest {
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
         ToolPermissionContext permCtx = ToolPermissionContext.of(
             PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of());
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }

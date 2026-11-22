@@ -18,7 +18,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CompletableFuture;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -81,7 +80,7 @@ class ClassifierModeRetryHookTest {
         pipeline.denialTracker = new DenialTracker(3, 20); // 默认阈值,初始 DISABLED 状态 OK
         pipeline.yoloClassifier = fakeClassifier; // 可控的 fake classifier
         // ToolUseContext: 最小字段足够跑通 check() (Pipeline 各层大多不需要 ctx 内部字段)
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         ctx = new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", null, List.of(),

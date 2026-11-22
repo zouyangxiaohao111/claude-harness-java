@@ -14,7 +14,7 @@
 
     <groupId>com.nexusai</groupId>
     <artifactId>nexusai-backend</artifactId>
-    <version>0.1.83</version>
+    <version>0.1.84</version>
     <name>nexusai-backend</name>
     <description>NexusAI Backend - Spring Boot 3.4 + SQLite + MyBatis-Flex</description>
 
@@ -176,6 +176,29 @@
             <groupId>com.anthropic</groupId>
             <artifactId>anthropic-java</artifactId>
             <version>${anthropic-java.version}</version>
+        </dependency>
+
+        <!-- 企微 WebSocket 长连接传输层 (PIT-WC-012).
+             ⚠️ 必须**显式**声明: anthropic-java-client-okhttp 把 okhttp 声明为 runtime scope,
+             传递依赖的 runtime scope **不进编译期 classpath** ⇒ src/main/java 里 import okhttp3.* 编译不过.
+             版本与 anthropic 传递进来的完全一致 (4.12.0) ⇒ classpath 上不会出现第二个 okhttp 版本.
+             企微长连接的两个硬约束 (PIT-WC-012): pingInterval(0) + readTimeout(0) ——
+             okhttp 自带 ping 会与企微「应用层 ping 帧」打架, 默认 10s 读超时会自己掐断长连接. -->
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+            <version>4.12.0</version>
+        </dependency>
+
+        <!-- 飞书官方 SDK —— ⚠️ 只为了「长连接收事件」这一个能力。
+             飞书的 WS 协议**未公开文档化**（官方文档明说「长连接是 SDK 内提供的能力」），
+             帧是 protobuf；手写等于逆向协议 ⇒ 用官方实现。
+             自带 okhttp/okio 副本包（com.lark.oapi.okhttp / okio），不与本仓 4.12.0 打架。
+             License: MIT。 -->
+        <dependency>
+            <groupId>com.larksuite.oapi</groupId>
+            <artifactId>oapi-sdk</artifactId>
+            <version>2.8.7</version>
         </dependency>
 
         <!-- [R32-b12 D-1] OpenTelemetry SDK · 路径 C (OTel API + Logging Exporter, 0 collector).
@@ -400,6 +423,19 @@
 
     <build>
         <finalName>nexusai-backend</finalName>
+        <!-- ⛔ 安全止血（2026-11-20）：任何 *.local.json 都是「本机私有凭据」，绝不进 jar。
+             出事的是 factory/factory-preset.local.json（曾随 0.1.63/0.1.64 安装包外流）。
+             这里显式声明 resources 并排除 .local.json —— 即使有人把文件放回
+             src/main/resources/factory/，mvn package 也不会拷贝它。
+             ⚠️ 声明 <resources> 会覆盖 Maven 默认的 src/main/resources 条目，故此处必须显式写出。 -->
+        <resources>
+            <resource>
+                <directory>src/main/resources</directory>
+                <excludes>
+                    <exclude>**/*.local.json</exclude>
+                </excludes>
+            </resource>
+        </resources>
         <plugins>
             <plugin>
                 <groupId>org.springframework.boot</groupId>

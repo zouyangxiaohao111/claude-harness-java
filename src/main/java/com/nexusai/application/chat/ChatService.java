@@ -26,6 +26,8 @@ import com.nexusai.application.agent.tool.impl.BriefTool;
 import com.nexusai.application.agent.tool.impl.PdfSupport;
 import com.nexusai.application.agent.agent.CwdResolution;
 import com.nexusai.application.agent.memory.AutoMemPaths;
+import com.nexusai.application.agent.messaging.PeerEndpointActivator;
+import com.nexusai.application.agent.messaging.PeerEndpointActivator.Result;
 import com.nexusai.application.agent.query.QueryConfig;
 import com.nexusai.application.agent.query.TokenBudgetChecker;
 import com.nexusai.application.agent.tool.AgentUsage;
@@ -107,6 +109,12 @@ import java.util.stream.Collectors;
  *   <li>出错用 ERROR/WARN，便于 AI 按 level 过滤</li>
  * </ul>
  */
+// ⛔ 不要在此类上实现任何接口：ChatService 是 @Async bean，Spring 的 AOP 代理选择规则是
+//   「有用户提供的接口 ⇒ JDK 动态代理」，一旦实现接口，bean 类型就退化成接口类型，
+//   所有按具体类型注入 ChatService 的地方（SessionService/ChatController/CronIdleExecutor/
+//   SessionCreateTool/KbChatGatewayController/QaAliasController/MainSessionBackgroundService/
+//   KbQaTurnService）会在启动期报「expected ChatService but was jdk.proxy」。2026-11-20 实测启动失败。
+//   需要对外暴露的能力（如 PeerEndpointActivator）改由独立适配器 {@link ChatPeerEndpointActivator} 提供。
 @Service
 public class ChatService {
 
@@ -209,6 +217,16 @@ public class ChatService {
     //   [GR-3] auto 自动压缩器经 LlmAgentLoop @Autowired autoCompactor 注入，此处无需手动接线。
     @Autowired(required = false) private com.nexusai.application.agent.memory.MemoryStorage memoryStorage;
     @Autowired(required = false) private com.nexusai.application.agent.memory.MemoryPrefetcher memoryPrefetcher;
+    /**
+     * 自动循环刹车（CC {@code aVn/lVn}）：真实用户输入 = 复位点。
+     *
+     * <p>CC 原文（偏移 336253847）：{@code dMs(t){let e=t.get(l);e.localSends=0,e.bridgeSends=0}}
+     * —— 收到真实用户输入（{@code isMeta!==true && foreignWord===undefined && E_e(message)}）时
+     * 清零 localSends/bridgeSends。本仓用户输入入口 = 本类 {@link #processUserMessage}。
+     * null = 未接线（非 Spring 单测）⇒ 不复位、不刹车。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerLoopBrake peerLoopBrake;
     @Autowired(required = false) private com.nexusai.application.agent.context.ClaudemdEngine claudemdEngine;
     @Autowired(required = false) private com.nexusai.application.agent.recovery.MaxTokensHandler maxTokensHandler;
     @Autowired(required = false) private com.nexusai.application.agent.recovery.TransientErrorHandler transientErrorHandler;
@@ -261,6 +279,44 @@ public class ChatService {
     // [artifact-extract] 产物/来源异步抽取（轮末触发，fire-and-forget）· required=false 容错直构单测
     //   （null → 跳过抽取，对话不受影响）。
     @Autowired(required = false) private SessionArtifactService sessionArtifactService;
+
+    // ──────── [sendmessage-cross-session · B] 跨会话 endpoint 生命周期 ────────
+    /** live endpoint 注册表（register / beginClosing / unregister）· required=false 容错直构单测。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerSessionRegistry peerSessionRegistry;
+    /** 一次性 idle 订阅（close 时取消本会话相关订阅）· required=false。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerIdleSubscriptions peerIdleSubscriptions;
+    /**
+     * [peer-hold-expiry] 待收件结算出口（close/delete 时把该会话全部 pending 转 expired）。
+     *
+     * <p><b>WHY ObjectProvider</b>：直接注入会形成
+     * {@code ChatService → PeerMessageRouter → SessionService → ChatService} 循环
+     * （与 goalServiceProvider 同因，见上方注释）。本字段只用于会话关闭路径，延迟解析即可。
+     */
+    @Autowired(required = false)
+    private org.springframework.beans.factory.ObjectProvider<
+        com.nexusai.application.agent.messaging.PeerMessageRouter> peerMessageRouterProvider;
+    /**
+     * sessionId → 本会话当前 endpoint 句柄（epoch 是 unregister 的唯一凭据）。
+     *
+     * <p>只在「主会话首次成功初始化/恢复」登记一次；close/delete 后移除 ⇒ 下次消息重新登记
+     * （新 epoch，旧 epoch 的 in-flight 投递自然失效）。⛔ 不从 DB 历史预热（create ≠ live）。
+     */
+    private final ConcurrentHashMap<String, com.nexusai.application.agent.messaging.PeerSessionRegistry.EndpointHandle>
+        peerEndpoints = new ConcurrentHashMap<>();
+    /** sessionId → 已登记的权限模式版本（updateMode 只在版本前进时生效）。 */
+    private final ConcurrentHashMap<String, Long> peerModeVersions = new ConcurrentHashMap<>();
+
+    /**
+     * 「最终有效权限模式」统一解析链（2026-11-20 真实 E2E 缺陷 1）· required=false 容错直构单测。
+     *
+     * <p>登记 endpoint 时用它取模式（per-call ?? 会话列 ?? settings ?? default），
+     * 与发送方 {@code LlmAgentLoop} 的初始模式解析同源 ⇒ 入站 auto 的模式类判定两侧一致。
+     * null（非 Spring 单测）⇒ 回落旧的 per-call ?? 会话列。
+     */
+    @Autowired(required = false)
+    private EffectivePermissionModeResolver effectivePermissionModeResolver;
 
     /** sessionId → 当前 in-progress 任务。 */
     private final ConcurrentHashMap<String, ChatTask> inProgress = new ConcurrentHashMap<>();
@@ -392,7 +448,8 @@ public class ChatService {
             content, NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
             null, userMessageId, false, "busy-queued", false, null, sessionId,
             null /* boundProject */, null /* scheduleId */, busyAttachments, busyUserAttachments,
-            busyImagePasteIds.isEmpty() ? null : busyImagePasteIds));
+            busyImagePasteIds.isEmpty() ? null : busyImagePasteIds,
+            null /* [V306] notifyChats：busy-queued 非定时任务 ⇒ 无通知目标 */));
         if (log.isInfoEnabled()) {
             log.info("QUEUE busy 携附件: session={} uuid={} attachments={} userAttachments={} imagePasteIds={}"
                     + "（入队不裁剪：已通过校验/解析的附件随队列携带，drain 消费点逐项注册；未过校验项已在入队处 "
@@ -758,7 +815,15 @@ public class ChatService {
                 // [C2 2026-09-19] isMeta 由硬编码 false 改为 inj.isMeta() —— mid-turn 通知
                 //   （task-notification 等）须落 is_meta=true（resume 后 UI 隐藏，与 live 语义一致、
                 //   对齐 CC queued_command）；busy-queued 恒 false ⇒ 既有行为零变化。
-                if (inj.userAttachments() != null && !inj.userAttachments().isEmpty()) {
+                // [sendmessage-cross-session · B] peer 行：author/subtype/structuredOutput 必须一起落
+                //   （否则实时落库漏落的 peer 行会被补成普通 user 行：来源/子类型丢失）。
+                boolean peerInjectedRow = inj.subtype() != null || inj.author() != null
+                    || inj.structuredOutput() != null;
+                if (peerInjectedRow) {
+                    messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
+                        ts, inj.isMeta(), inj.queuedOrigin(), null,
+                        inj.userAttachments(), inj.author(), inj.subtype(), inj.structuredOutput());
+                } else if (inj.userAttachments() != null && !inj.userAttachments().isEmpty()) {
                     messageService.createQueuedUserMessage(sessionId, inj.uuid(), inj.content(),
                         ts, inj.isMeta(), inj.queuedOrigin(),
                         null /* imagePasteIds：图片走 AM 回写（updateUserImagePasteIds）通道，本处不重复 */,
@@ -793,6 +858,64 @@ public class ChatService {
                                    String userMessageId,
                                    SendMessageRequest req,
                                    SimpMessagingTemplate wsTemplate) {
+        processUserMessage(sessionId, userMessageId, req, wsTemplate, null);
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 共享起轮权重载（唯一真正执行体）。
+     *
+     * <p><b>claim 语义</b>：
+     * <ul>
+     *   <li>{@code providedClaim != null}：调用方（{@link com.nexusai.apis.session.ChatController#send}）
+     *       已<b>原子</b>取得起轮权 ⇒ 本方法<b>不重复 claim</b>（否则必然自拒），只负责在所有出口
+     *       释放同代次 claim；</li>
+     *   <li>{@code providedClaim == null}：本方法自行 {@code tryClaim}；失败 = 会话已活跃 ⇒ 按既有
+     *       语义入队（busy），不并行起轮。</li>
+     * </ul>
+     *
+     * <p>⛔ 回合结束 / run finally <b>不</b> unregister endpoint（回合空闲仍可被投递）。
+     *
+     * @param providedClaim 外部已取得的 claim（controller 传入）；null = 未取得
+     */
+    @Async("chatExecutor")
+    public void processUserMessage(String sessionId,
+                                   String userMessageId,
+                                   SendMessageRequest req,
+                                   SimpMessagingTemplate wsTemplate,
+                                   LlmAgentLoop.SessionClaim providedClaim) {
+        // [peer auto-loop brake 复位] CC dMs（偏移 336253847）：真实用户输入清零
+        //   localSends/bridgeSends —— 刹车只在「用户不说话、会话间自己刷」时生效。
+        //   放在最前：busy 排队也是用户输入，同样必须复位。
+        com.nexusai.application.agent.messaging.PeerLoopBrake brake = this.peerLoopBrake;
+        if (brake != null && sessionId != null) {
+            brake.onUserPrompt(sessionId);
+        }
+        LlmAgentLoop.SessionClaim claim = providedClaim;
+        if (claim == null) {
+            claim = LlmAgentLoop.tryClaim(sessionId);
+            if (claim == null) {
+                // 会话已活跃（running / dispatching / 他人 claim）→ 既有 busy 语义：排队，不并行起轮。
+                if (isImmediateLocalJsxCommand(sessionId, req != null ? req.content() : null)) {
+                    dispatchImmediateLocalJsx(sessionId, userMessageId,
+                        req != null ? req.content() : null, true, wsTemplate);
+                    return;
+                }
+                enqueueBusyPrompt(sessionId, userMessageId, req);
+                return;
+            }
+        }
+        try {
+            doProcessUserMessage(sessionId, userMessageId, req, wsTemplate);
+        } finally {
+            LlmAgentLoop.releaseClaim(claim);
+        }
+    }
+
+    /** 主会话一轮的真正执行体（原 {@code processUserMessage} 方法体）。 */
+    private void doProcessUserMessage(String sessionId,
+                                      String userMessageId,
+                                      SendMessageRequest req,
+                                      SimpMessagingTemplate wsTemplate) {
         // [V-TOK 实施] 本轮耗时锚点（duration_ms 装配用 · Java 无 API 累计计时，用 turn 墙钟近似）
         long turnStartMs = System.currentTimeMillis();
         log.info("USER → content={}", abbreviate(req == null ? "" : req.content(), 120));
@@ -1009,6 +1132,10 @@ public class ChatService {
             //   非交互 run（CronIdleExecutor 空闲代跑 / MainSessionBackgroundService 后台任务）不置位
             //   ⇒ 不会抢先 markRead 吃掉队员消息（判据 = per-run 显式值，非 sysprop/ThreadLocal）。
             loop.setTeammateInboxConsumer(true);
+            // [non-interactive 2026-11-20] 本入口 = 普通交互（Web 会话 + WS 流），显式置 false：
+            //   结构化输出注入门（jsonSchema 且 非交互/后台）据此不注入 —— 交互式带 json-schema
+            //   属 CC 的「静默忽略」，模型看不到工具，也就不存在「可见不可调用」。
+            loop.setNonInteractiveSession(false);
             // STREAM-P1-FIX: 真实注入 token budget / query config
             //   不再是 setXxx 死代码 - 实际进 LlmAgentLoop.run() 的 loop() 内每轮 check
             if (tokenBudgetChecker != null) loop.setTokenBudgetChecker(tokenBudgetChecker);
@@ -1081,6 +1208,16 @@ public class ChatService {
                         + "（per-call 恒胜会话 override；null 回落全局 settings/permissions.defaultMode）",
                     perCallPermissionMode, session.getPermissionMode(), effectivePermissionMode);
             }
+            // [sendmessage-cross-session · B] 主会话首次成功初始化/恢复 → 登记 live endpoint。
+            //   create ≠ live：只在真正起轮（会话行已取到、权限模式已解析）时 register，不从 DB 历史预热；
+            //   重复调用只在「尚未登记」时生效（每会话一个 epoch），回合结束不注销（空闲仍可被投递）。
+            // [peer-mode-parity] 注册表里的模式必须是「最终有效模式」（含 settings 回退），
+            //   否则入站 auto 的模式类判定会与发送方 attest 不一致（E2E 缺陷 1）。
+            ensurePeerEndpointRegistered(sessionId, session,
+                resolvePeerPermissionMode(session, perCallPermissionMode));
+            // [peer-heartbeat] 本轮开始 → 刷新 endpoint 最近活动时间（ListAgents 排序/展示依据）。
+            //   带当前代次；未登记/代次不符 → no-op（不复活已注销端点），失败只记日志不阻断起轮。
+            heartbeatPeerEndpoint(sessionId);
             // [实时落库 2026-09-03] run 前武装实时落库 SPI：装配了落库能力（messageService != null）才
             //   武装（非 Spring 单测不武装 → loop mock 不消费 enabler，零行为变化）。doRun 历史注入完成、
             //   prePersistedMessageIds 已登记后回调 → armRealTimePersist setAppendListener，其后每条
@@ -1148,6 +1285,8 @@ public class ChatService {
                     SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
                     "status=idle (after error)");
                 inProgress.remove(sessionId, task);
+                // [peer-heartbeat] 失败轮同样算「本轮结束」→ 刷新活动时间（带当前代次，no-op 安全）。
+                heartbeatPeerEndpoint(sessionId);
             }
             return;
         }
@@ -1241,6 +1380,9 @@ public class ChatService {
                 SessionStatusEvent.of(sessionId, effectiveEventUserMessageId(state, userMessageId), "idle"),
                 idleWhy);
             inProgress.remove(sessionId, task);
+            // [peer-heartbeat] 本轮结束 → 刷新 endpoint 最近活动时间（本轮开始时已刷一次；
+            //   结束再刷一次让「最近活动」覆盖整轮耗时）。代次不符/已注销 → no-op，失败只记日志。
+            heartbeatPeerEndpoint(sessionId);
             // [产物轮内监看] 与 startTurnWatch 成对收口 —— 否则定时任务跨轮常驻，
             //   已结束的轮仍会继续自动展开产物面板。
             if (sessionArtifactService != null) {
@@ -1794,15 +1936,43 @@ public class ChatService {
                             //   （task-notification / coordinator / channel / cron）落 is_meta=true
                             //   （resume 后 UI 隐藏，与 live 一致、对齐 CC queued_command）；busy-queued
                             //   恒 false ⇒ 既有行为零变化（ChatServiceBusyImagePersistenceTest 断言 eq(false) 仍绿）。
-                            messageService.createQueuedUserMessage(sessionId, m.id(), inj.content(), ts,
-                                m.isMeta(), inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments());
+                            // [sendmessage-cross-session · B] peer 行（inj 携带 author/subtype/structuredOutput）
+                            //   → 同一唯一落库出口的 11 参重载：真实写 author(来源 sessionId)/subtype(agent_message)/
+                            //   structured_output(peer_source)；⛔ 不新增第二个 agent_message 落库出口。
+                            boolean peerRow = inj.subtype() != null || inj.author() != null
+                                || inj.structuredOutput() != null;
+                            boolean alreadyPersisted = messageService.existsById(m.id());
+                            if (peerRow) {
+                                messageService.createQueuedUserMessage(sessionId, m.id(), inj.content(), ts,
+                                    m.isMeta(), inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments(),
+                                    inj.author(), inj.subtype(), inj.structuredOutput());
+                            } else {
+                                messageService.createQueuedUserMessage(sessionId, m.id(), inj.content(), ts,
+                                    m.isMeta(), inj.queuedOrigin(), m.imagePasteIds(), m.userAttachments());
+                            }
                             ctx.lastUserMessageId.set(m.id());
+                            // [sendmessage-cross-session · B] peer 行：落库成功（事务返回 = 已提交）后
+                            //   推 message.insert 完整行 DTO（与 GET 同 id / 同来源 / 同 subtype / 同时间）。
+                            //   ⛔ 落库失败不会到达本行（异常走下方 catch，绝不推成功行）；已存在（空闲路径
+                            //   先落库 / 重试）不重复推（前端同 id 幂等，且避免重复事件）。
+                            if (peerRow && !alreadyPersisted && wsTemplate != null && streamTopic != null) {
+                                try {
+                                    ChatMessageDto peerRowDto = messageService.getById(m.id());
+                                    sendAndLog(wsTemplate, streamTopic,
+                                        new MessageInsertEvent(sessionId, List.of(peerRowDto)),
+                                        "message.insert peer=" + m.id());
+                                } catch (Exception pe) {
+                                    log.warn("ChatService: peer message.insert 推送失败（已落库，GET 兜底）: "
+                                        + "session={} id={} err={}", sessionId, m.id(), pe.toString());
+                                }
+                            }
                             if (log.isInfoEnabled()) {
                                 log.info("ChatService: mid-turn 注入排队 user 消息实时原位落库 session={} id={}"
-                                        + " images={} userAttachments={}",
+                                        + " images={} userAttachments={} peerRow={} author={} subtype={}",
                                     sessionId, m.id(),
                                     m.imagePasteIds() == null ? 0 : m.imagePasteIds().size(),
-                                    m.userAttachments() == null ? 0 : m.userAttachments().size());
+                                    m.userAttachments() == null ? 0 : m.userAttachments().size(),
+                                    peerRow, inj.author(), inj.subtype());
                             }
                         } catch (Exception e) {
                             log.warn("ChatService: mid-turn 注入排队 user 消息实时原位落库失败: session={} id={}: {}",
@@ -1952,6 +2122,8 @@ public class ChatService {
                     MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
                     rec.setContent(m.content() == null ? "" : m.content());
                     rec.setReasoning(m.reasoning());
+                    // [content-blocks] 内容块顺序落库（V331 content_blocks）· 对齐 CC 「一块一行 + apiBlockIndex」
+                    rec.setContentBlocks(contentBlocksJson(m));
                     // [thinking-passthrough] thinking 块签名落库（V282 列）—— 送侧下一轮据此
                     //   重建 thinking 块；缺失则不回传 → DeepSeek 端按 tool_use id 恢复失败即 400。
                     rec.setThinkingSignature(m.thinkingSignature());
@@ -2000,6 +2172,8 @@ public class ChatService {
                     MessageRecord rec = newAssistantMessage(sessionId, id, ctx.lastUserMessageId.get());
                     rec.setContent(m.content() == null ? "" : m.content());
                     rec.setReasoning(m.reasoning());
+                    // [content-blocks] 内容块顺序落库（V331 content_blocks）· 纯文本轮通常只有 1 块。
+                    rec.setContentBlocks(contentBlocksJson(m));
                     // [thinking-passthrough] 纯文本 assistant 同样留签名（V282 列）
                     rec.setThinkingSignature(m.thinkingSignature());
                     rec.setReasoningDurationMs(m.reasoningDurationMs());
@@ -2025,10 +2199,13 @@ public class ChatService {
 
             if (m.role() == Role.tool) {
                 String content = m.content() == null ? "" : m.content();
-                boolean isError = content.startsWith("Error")
-                    || content.toLowerCase().contains("dangerous")
-                    || content.toLowerCase().contains("not found")
-                    || content.toLowerCase().contains("no such tool");
+                // [错误通道 · CCJ-ERR-011] is_error 是执行层已算出的**真值**，落库直接采用，
+                //   ⛔ 不再按内容重猜。旧启发式（startsWith("Error") / contains "dangerous" /
+                //   "not found" / "no such tool"）双向都错：未登记文案（Edit 的 "path is empty"）
+                //   被判成功；而成功输出里出现 "not found"（grep 无匹配）被误判失败。
+                //   对齐 CC：is_error 是 tool_result 块属性（messages.ts:4754），由执行路径决定，
+                //   持久化时原样写入（sessionStorage.ts:1039-1065），读侧不得二次推断。
+                boolean isError = m.isError();
                 // [brief-payload] UI 面载荷：SendUserMessage 走结构化 payload JSON（见 toolResultUiPayload），
                 //   其余工具仍为该文本的 truncate 副本。模型面文本不受影响（rec.content = content 原样落库）。
                 ToolCallRecord tcUpdate = toolCallMapper.selectOneById(m.toolCallId());
@@ -2134,6 +2311,18 @@ public class ChatService {
             }
         }
         return null;
+    }
+
+    /**
+     * assistant 内容块 JSON（V331 content_blocks 列）· 对齐 CC「一块一行 + apiBlockIndex」。
+     *
+     * <p>优先用消息自带的 blocks（provider 按 content_block_start 下标采集的真实到达顺序）；
+     * 为空则按规范顺序（thinking → text → tool_use）回退。null = 不落块（列 NULL，前端走旧渲染）。
+     * ⛔ 本列不进入任何 provider 的请求体。
+     */
+    private static String contentBlocksJson(com.nexusai.model.session.dto.ChatMessageDto m) {
+        return com.nexusai.model.session.dto.MessageContentBlocks.toJson(
+            com.nexusai.model.session.dto.MessageContentBlocks.resolve(m));
     }
 
     /**
@@ -2374,11 +2563,24 @@ public class ChatService {
      */
     public void closeSession(String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
-            log.warn("closeSession: sessionId 为空, 跳过 ScheduleService 清理");
+            log.warn("closeSession: sessionId 为空, 跳过关闭清理");
             return;
         }
+        // [peer-hold-expiry] 接收方会话关闭/删除 ⇒ 全部待确认来信结转 expired 并逐条通知发送方
+        //   （CC 2.1.328 实测硬行为：关闭即结算，不保留待投递）。必须在 teardown 之前做：
+        //   beginClosing 只拒新件，不会处理已经 hold 住的 pending。
+        settleHeldPeerInboxOnClose(sessionId);
+        // [sendmessage-cross-session · B] 先拆跨会话 endpoint（顺序 = 契约 3.7）：
+        //   beginClosing 拒新件 → 清未消费 peer 项 → 取消 idle 订阅 → unregister(expectedEpoch)。
+        //   放在 Schedule 清理之前：本方法在 SessionService.delete 里于删 DB 前被调用，
+        //   而「先拒新件」必须早于任何耗时清理（否则清理窗口内仍可被投递）。
+        try {
+            teardownPeerEndpoint(sessionId);
+        } catch (Exception e) {
+            log.error("closeSession: 跨会话 endpoint 注销失败 session={}: {}", sessionId, e.toString(), e);
+        }
         if (scheduleService == null) {
-            log.warn("closeSession: ScheduleService 未注入, 跳过清理 session={}", sessionId);
+            log.warn("closeSession: ScheduleService 未注入, 跳过 Schedule 清理 session={}", sessionId);
             return;
         }
         try {
@@ -2389,6 +2591,351 @@ public class ChatService {
             log.error("closeSession: ScheduleService.cleanupBySession 失败 session={}: {}",
                 sessionId, e.toString());
         }
+    }
+
+    /**
+     * [peer-hold-expiry] 会话关闭/删除 ⇒ 把该会话全部未到终态的待收件结算为 expired。
+     *
+     * <p>走 {@link com.nexusai.application.agent.messaging.PeerMessageRouter#expireAllHeld}：
+     * store 侧逐行条件 UPDATE（与并发 approve/reject 只有一个能改到）并逐条通知发送方。
+     * best-effort：结算失败不阻塞会话删除主流程（残留行会在下次读列表时按到期规则再结算）。
+     */
+    private void settleHeldPeerInboxOnClose(String sessionId) {
+        com.nexusai.application.agent.messaging.PeerMessageRouter router =
+            peerMessageRouterProvider == null ? null : peerMessageRouterProvider.getIfAvailable();
+        if (router == null) {
+            log.debug("closeSession: PeerMessageRouter 未注入，跳过待收件结算 session={}", sessionId);
+            return;
+        }
+        try {
+            int expired = router.expireAllHeld(sessionId,
+                com.nexusai.application.agent.messaging.PeerFailureNotifier.REASON_RECEIVER_CLOSED);
+            log.info("CLOSE session={} 待收件结转 expired 条数={}", sessionId, expired);
+        } catch (RuntimeException e) {
+            log.warn("closeSession: 待收件结转 expired 失败 session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    /**
+     * [session-create] 会话创建后立即登记 live endpoint（空会话也要可被 SendMessage 找到）。
+     *
+     * <p>普通会话的登记发生在首次起轮（{@link #processUserMessage}）；{@code SessionCreate}
+     * 允许「只建会话、不给首条任务」，此时没有起轮 ⇒ 不登记就永远不在
+     * {@link com.nexusai.application.agent.messaging.PeerSessionRegistry} 里，
+     * SendMessage/ListAgents 都找不到它。本方法给创建路径一个显式登记入口。
+     *
+     * <p>幂等：已登记时只按 modeVersion 前进更新权限模式（复用 private 实现）。
+     * 会话行不存在 → WARN 且不登记（⛔ 不造幽灵会话）。
+     *
+     * @param sessionId 新建会话 id
+     */
+    public void ensurePeerEndpointLive(String sessionId) {
+        if (sessionId == null || sessionId.isBlank() || peerSessionRegistry == null) {
+            return;
+        }
+        SessionRecord session = sessionMapper.selectOneById(sessionId);
+        if (session == null) {
+            log.warn("ChatService: ensurePeerEndpointLive 拒绝登记（会话行不存在）session={}", sessionId);
+            return;
+        }
+        String effectivePermissionMode = resolveEffectivePermissionMode(session, null);
+        ensurePeerEndpointRegistered(sessionId, session,
+            resolvePeerPermissionMode(session, null));
+    }
+
+    /**
+     * [peer-mode-parity] 登记 endpoint 用的「最终有效权限模式」。
+     *
+     * <p>统一链（{@link EffectivePermissionModeResolver}）：per-call ?? 会话列 ?? settings
+     * （DB 全局 ?? 磁盘）?? default，与发送方 {@code LlmAgentLoop} 的初始模式解析同源。
+     * 解析器未注入（非 Spring 单测）⇒ 回落旧的 per-call ?? 会话列（保持既有测试语义）。
+     *
+     * @param session 会话记录（可 null）
+     * @param perCall 本次请求的 per-call 模式（可 null）
+     * @return 登记用权限模式（恒非 null）
+     */
+    private com.nexusai.application.agent.permission.PermissionMode resolvePeerPermissionMode(
+            SessionRecord session, String perCall) {
+        EffectivePermissionModeResolver resolver = effectivePermissionModeResolver;
+        if (resolver != null) {
+            return resolver.resolve(session, perCall);
+        }
+        return com.nexusai.application.agent.permission.PermissionMode.fromString(
+            resolveEffectivePermissionMode(session, perCall));
+    }
+
+    /**
+     * [session-create] 会话标题变化 → 同步 live endpoint 的标题快照。
+     *
+     * <p>注册表只在登记时存标题快照；自动标题生成 / 用户 /rename 之后若不同步，
+     * {@code ListAgents} 与 {@code SendMessage} 的「按标题寻址」会一直显示旧标题
+     * （父会话也就无法通过 ListAgents 感知新名字）。地址名由标题派生，同步后自动跟着变。
+     *
+     * <p>未登记（会话从未起轮 / 已关闭）→ 静默返回：标题仍由 DB 与前端 status topic 承载。
+     *
+     * @param sessionId 会话 id
+     * @param title     新标题
+     */
+    public void refreshPeerEndpointTitle(String sessionId, String title) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        com.nexusai.application.agent.messaging.PeerSessionRegistry.EndpointHandle handle =
+            peerEndpoints.get(sessionId);
+        com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+        if (handle == null || registry == null) {
+            return;
+        }
+        try {
+            boolean updated = registry.updateTitle(sessionId, handle.endpointEpoch(), title);
+            if (log.isInfoEnabled()) {
+                log.info("ChatService: 跨会话 endpoint 标题同步 session={} epoch={} title={} updated={}",
+                    sessionId, handle.endpointEpoch(), title, updated);
+            }
+        } catch (RuntimeException e) {
+            log.warn("ChatService: endpoint 标题同步失败 session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 主会话首次成功初始化/恢复 → 登记 live endpoint（幂等）。
+     *
+     * <p>只在「尚未登记」时 register（每会话一个 epoch，回合之间沿用）；已登记时只按
+     * modeVersion 前进更新权限模式（{@link com.nexusai.application.agent.messaging.PeerSessionRegistry#updateMode}），
+     * 供入站策略读接收方<b>当前</b>有效模式。⛔ 不从 DB 历史预热；{@code create} 不等于 live。
+     *
+     * @param sessionId               会话 short id
+     * @param session                 会话行（标题快照）
+     * @param effectivePermissionMode 本轮<b>最终有效</b>权限模式（已含 settings 回退；非 null）
+     */
+    private void ensurePeerEndpointRegistered(String sessionId, SessionRecord session,
+                                              com.nexusai.application.agent.permission.PermissionMode effectivePermissionMode) {
+        com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+        if (registry == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        com.nexusai.application.agent.permission.PermissionMode mode = effectivePermissionMode != null
+            ? effectivePermissionMode : com.nexusai.application.agent.permission.PermissionMode.DEFAULT;
+        com.nexusai.application.agent.messaging.PeerSessionRegistry.EndpointHandle handle =
+            peerEndpoints.get(sessionId);
+        if (handle == null) {
+            String projectRoot = null;
+            try {
+                projectRoot = CwdResolution.getCwd(sessionId);
+            } catch (RuntimeException e) {
+                log.debug("ChatService: peer endpoint 项目根解析失败（写 null）session={}: {}",
+                    sessionId, e.toString());
+            }
+            try {
+                handle = registry.register(new com.nexusai.application.agent.messaging.PeerSessionRegistry
+                    .Registration(sessionId, session != null ? session.getTitle() : null,
+                        projectRoot, mode, 0L));
+                peerEndpoints.put(sessionId, handle);
+                peerModeVersions.put(sessionId, 0L);
+                log.info("ChatService: 跨会话 endpoint 已登记 session={} epoch={} mode={} title={}"
+                        + "（create≠live；启动不预热，按需登记）",
+                    sessionId, handle.endpointEpoch(), mode, session != null ? session.getTitle() : null);
+            } catch (RuntimeException e) {
+                log.warn("ChatService: 跨会话 endpoint 登记失败 session={}: {}", sessionId, e.toString());
+            }
+            return;
+        }
+        try {
+            long version = peerModeVersions.merge(sessionId, 1L, Long::sum);
+            if (!registry.updateMode(sessionId, handle.endpointEpoch(), mode, version)) {
+                log.debug("ChatService: peer endpoint 模式更新未生效（代次不符/版本落后）session={} epoch={} "
+                        + "mode={} version={}", sessionId, handle.endpointEpoch(), mode, version);
+            }
+        } catch (RuntimeException e) {
+            log.debug("ChatService: peer endpoint 模式更新异常 session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    /**
+     * [peer-heartbeat] 刷新本会话 endpoint 的最近活动时间（{@code lastActivityAt}）。
+     *
+     * <p><b>WHY</b>：{@code PeerSessionRegistry.heartbeat} 此前无任何调用点 ⇒ 注册后该字段永不前进，
+     * ListAgents 无法按「最近活动」排序/展示。每轮开始/结束各刷一次，让列表反映真实活跃度。
+     *
+     * <p><b>安全</b>：只更新<b>已登记且代次匹配</b>的 endpoint（{@code heartbeat} 内部
+     * {@code computeIfPresent} + 代次比较）⇒ 已注销/旧代次 = no-op，不复活端点。异常只记日志，
+     * 不影响对话主流程（与标题同步等旁路一致）。
+     *
+     * @param sessionId 会话 short id
+     */
+    private void heartbeatPeerEndpoint(String sessionId) {
+        com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+        if (registry == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        com.nexusai.application.agent.messaging.PeerSessionRegistry.EndpointHandle handle =
+            peerEndpoints.get(sessionId);
+        if (handle == null) {
+            return;
+        }
+        try {
+            if (!registry.heartbeat(sessionId, handle.endpointEpoch())) {
+                log.debug("ChatService: peer heartbeat 未生效（未登记/代次不符/已注销）session={} epoch={}",
+                    sessionId, handle.endpointEpoch());
+            }
+        } catch (RuntimeException e) {
+            log.warn("ChatService: peer heartbeat 失败 session={}: {}", sessionId, e.toString());
+        }
+    }
+
+    // ═════════════ [2026-11-20 E2E 缺陷 2] 会话记录在 → 按需登记 endpoint ═════════════
+
+    /**
+     * 按 sessionId 补登记 endpoint（{@link com.nexusai.application.agent.messaging.PeerEndpointActivator}）。
+     *
+     * <p><b>产品口径</b>（用户裁定）：会话记录在即可投递并唤醒；只有不存在/已删除才拒。
+     * 重启后注册表为空时，收件人解析 miss 会调到这里 → 走<b>同一条</b>登记链
+     * （{@link #ensurePeerEndpointLive}：标题快照 + 统一权限模式 + 句柄记账），
+     * 因此后续 close/delete 仍能按代次注销，不会留幽灵 endpoint。
+     *
+     * <p><b>对外经 {@link ChatPeerEndpointActivator} 暴露</b>（本类不实现接口，见类注释）。
+     *
+     * @param sessionId 目标会话 id
+     * @return ACTIVATED / NOT_FOUND（无会话行）/ UNAVAILABLE（不可登记或登记后不可投递）
+     */
+    public Result activateSession(String sessionId) {
+        if (sessionId == null || sessionId.isBlank() || peerSessionRegistry == null) {
+            return Result.UNAVAILABLE;
+        }
+        SessionRecord session;
+        try {
+            session = sessionMapper.selectOneById(sessionId);
+        } catch (RuntimeException e) {
+            log.warn("ChatService.activateSession: 会话行读取失败 session={} err={}", sessionId, e.toString());
+            return Result.UNAVAILABLE;
+        }
+        if (session == null) {
+            // 会话表没有软删除列：行不存在 = 从未创建 或 已删除。
+            log.info("ChatService.activateSession: 会话记录不存在（已删除/从未创建）session={}", sessionId);
+            return Result.NOT_FOUND;
+        }
+        ensurePeerEndpointLive(sessionId);
+        com.nexusai.application.agent.messaging.PeerSessionRegistry.LiveSession live =
+            peerSessionRegistry.resolve(sessionId).orElse(null);
+        if (live != null && live.accepting() && !live.closing()) {
+            log.info("ChatService.activateSession: 已按 DB 记录补登记 endpoint session={} epoch={} mode={}",
+                sessionId, live.endpointEpoch(), live.permissionMode());
+            return Result.ACTIVATED;
+        }
+        log.warn("ChatService.activateSession: 会话记录在但无法登记为可投递 endpoint session={}", sessionId);
+        return Result.UNAVAILABLE;
+    }
+
+    /**
+     * 按展示名（会话标题）补登记 endpoint（重启后模型只知道标题时用）。
+     *
+     * <p>匹配口径与 ListAgents 地址名一致：{@link com.nexusai.application.agent.messaging.PeerAddressing#normalizeName}
+     * 后相等。命中多条时全部登记，由解析侧判 AMBIGUOUS（⛔ 不随机挑）。
+     *
+     * @param name 收件名（原始串）
+     * @return ACTIVATED = 至少一个同名会话已可投递；NOT_FOUND = 没有同名会话记录
+     */
+    public Result activateSessionsByName(String name) {
+        String normalized = com.nexusai.application.agent.messaging.PeerAddressing.normalizeName(name);
+        if (normalized.isEmpty() || peerSessionRegistry == null) {
+            return Result.UNAVAILABLE;
+        }
+        List<SessionRecord> rows;
+        try {
+            // 只取两列：标题匹配不需要整行（会话表可能很大）。
+            rows = sessionMapper.selectListByQuery(
+                QueryWrapper.create().select("id", "title"));
+        } catch (RuntimeException e) {
+            log.warn("ChatService.activateSessionsByName: 会话表读取失败 name={} err={}", name, e.toString());
+            return Result.UNAVAILABLE;
+        }
+        if (rows == null || rows.isEmpty()) {
+            return Result.NOT_FOUND;
+        }
+        int matched = 0;
+        int activated = 0;
+        for (SessionRecord row : rows) {
+            if (row == null || row.getId() == null
+                || !normalized.equals(com.nexusai.application.agent.messaging.PeerAddressing
+                    .normalizeName(row.getTitle()))) {
+                continue;
+            }
+            matched++;
+            if (activateSession(row.getId()) == Result.ACTIVATED) {
+                activated++;
+            }
+        }
+        if (matched == 0) {
+            return Result.NOT_FOUND;
+        }
+        if (activated == 0) {
+            return Result.UNAVAILABLE;
+        }
+        log.info("ChatService.activateSessionsByName: 同名会话已补登记 name={} matched={} activated={}",
+            name, matched, activated);
+        return Result.ACTIVATED;
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 注销本会话 endpoint（close / delete 共用同一顺序）。
+     *
+     * <ol>
+     *   <li>{@code beginClosing}：拒新件（发送方看到不可投递），仍可只读展示；</li>
+     *   <li>清未消费 peer 队列项（本会话为目标的 peer 项；hold 从不入队，不在此处理）；</li>
+     *   <li>取消 idle 订阅：目标退出 → {@code EXITED} 回送仍 live 的源；本会话作为源 → 静默清理；</li>
+     *   <li>{@code unregister(sessionId, expectedEpoch)}：代次不符 = no-op（旧轮不会误删新 endpoint）。</li>
+     * </ol>
+     *
+     * @param sessionId 会话 short id
+     */
+    private void teardownPeerEndpoint(String sessionId) {
+        com.nexusai.application.agent.messaging.PeerSessionRegistry.EndpointHandle handle =
+            peerEndpoints.remove(sessionId);
+        peerModeVersions.remove(sessionId);
+        com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+        if (registry == null) {
+            return;
+        }
+        long epoch;
+        if (handle != null) {
+            epoch = handle.endpointEpoch();
+        } else {
+            // [peer-restart] 句柄表 miss 但注册表里仍有本会话（按需登记/旧版本残留）⇒ 按当前代次注销，
+            //   否则删除会话后留下幽灵 endpoint（仍被判可投递）。
+            com.nexusai.application.agent.messaging.PeerSessionRegistry.LiveSession live =
+                registry.resolve(sessionId).orElse(null);
+            if (live == null) {
+                return;
+            }
+            epoch = live.endpointEpoch();
+            log.info("ChatService: endpoint 句柄缺失，按注册表当前代次注销 session={} epoch={}", sessionId, epoch);
+        }
+        registry.beginClosing(sessionId, epoch);
+        if (notificationQueue != null) {
+            try {
+                List<NotificationQueue.QueueItem> removed = notificationQueue.removeByFilter(c ->
+                    c != null && sessionId.equals(c.sessionId()) && c.peerEnvelope() != null);
+                if (removed != null && !removed.isEmpty()) {
+                    log.info("ChatService: close/delete 清除未消费 peer 项 session={} 条数={}（beginClosing 之后）",
+                        sessionId, removed.size());
+                }
+            } catch (RuntimeException e) {
+                log.warn("ChatService: 清除未消费 peer 项失败 session={}: {}", sessionId, e.toString());
+            }
+        }
+        com.nexusai.application.agent.messaging.PeerIdleSubscriptions subscriptions = peerIdleSubscriptions;
+        if (subscriptions != null) {
+            try {
+                subscriptions.onTargetExit(sessionId, epoch);
+                subscriptions.onSourceExit(sessionId, epoch);
+            } catch (RuntimeException e) {
+                log.warn("ChatService: 取消 idle 订阅失败 session={}: {}", sessionId, e.toString());
+            }
+        }
+        boolean removed = registry.unregister(sessionId, epoch);
+        log.info("ChatService: 跨会话 endpoint 已注销 session={} epoch={} removed={}"
+                + "（beginClosing → 清 peer 项 → 取消订阅 → unregister）",
+            sessionId, epoch, removed);
     }
 
     // ─────────────────────────── Provider 路由 (Phase A5) ───────────────────────────
@@ -3008,6 +3555,9 @@ public class ChatService {
         sendAndLog(wsTemplate, "/topic/sessions/" + session.getId() + "/status",
             com.nexusai.eventbus.ws.SessionTitleEvent.of(session.getId(), userMessageId, newTitle),
             "title=" + newTitle);
+        // [session-create] 同步 live endpoint 标题快照：否则 ListAgents / 按标题寻址仍停留在旧名
+        //   （父会话看不到新标题、按新标题发消息会 not-found）。
+        refreshPeerEndpointTitle(session.getId(), newTitle);
         return true;
     }
 
@@ -3237,11 +3787,19 @@ public class ChatService {
      * @return 落库/推送的 UI 面载荷
      */
     static String toolResultUiPayload(String toolName, ChatMessageDto m, String modelFacingText) {
-        if (toolName == null
-                || !(BriefTool.NAME.equals(toolName) || BriefTool.LEGACY_NAME.equals(toolName))) {
+        if (toolName == null) {
             return truncate(modelFacingText, 5000);
         }
         Map<String, Object> structured = m == null ? null : m.structuredOutput();
+        // [AST tools 2026-11-18] AST 工具的 UI 载荷只由 AstUiPayload.serialize 产生；与实时通道
+        //   （StreamingToolExecutor.pushToolResultRealtime）同源同形，F5 前后卡片一致。
+        String astJson = com.nexusai.application.agent.ast.AstUiPayload.serialize(toolName, structured);
+        if (astJson != null) {
+            return astJson;
+        }
+        if (!(BriefTool.NAME.equals(toolName) || BriefTool.LEGACY_NAME.equals(toolName))) {
+            return truncate(modelFacingText, 5000);
+        }
         // [F1 2026-09-20] 判定 + 序列化**单一源** = BriefTool.structuredUiPayload —— 实时通道
         //   （StreamingToolExecutor.pushToolResultRealtime）读同一方法。两条投放通道（executor 先手
         //   实时推 / 本处落库重拉）必须逐字同形：交互路径上先手通常是 executor（本方法所在分支被

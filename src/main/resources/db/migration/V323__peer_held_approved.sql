@@ -1,0 +1,21 @@
+-- ===================================================================
+-- V323: peer_held_message 增加 approved 中间态时间戳
+--
+-- 背景（2026-11-20 跨会话 E2E 第二轮缺陷 1）：
+--   hold 设置下「接受一次」返回成功，但消费前复核又按当前设置（hold）判 HOLD；
+--   回写 held 用 INSERT OR IGNORE，同一 messageId 行已存在 ⇒ 幂等 no-op
+--   ⇒ 消息既不入历史也不回 pending，用户视角永久丢件。
+--
+--   状态机改为三段（不落 CHECK，仓库惯例）：
+--     pending   --用户批准-->  approved  --消费落地-->  accepted
+--     pending   --拒绝----->  rejected
+--   approved 表示「用户已批准但消息尚未写入会话历史」：投递失败或消费失败时
+--   行保持 approved（列表仍可见、可再次批准），⛔ 不得出现「已 accepted 却未投递」。
+--
+-- 语义：
+--   approved_at 记录进入 approved 的时刻（ISO-8601 字符串，与 created_at 同款）；
+--   旧行（pending/accepted/rejected）该列为 NULL，读侧按 NULL 处理，无需回填。
+--
+-- 版本号说明：当前最高 V322；V323 为下一个空号。⛔ 不修改历史迁移。
+-- ===================================================================
+ALTER TABLE peer_held_message ADD COLUMN approved_at TEXT;

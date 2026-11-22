@@ -96,7 +96,7 @@ class HasHookForEventThreeSourceTest {
         PermissionDeniedHookExecutor executor = new PermissionDeniedHookExecutor(registry);
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        ToolUseContext ctx = new ToolUseContext(UUID.randomUUID(), sessionId,
+        ToolUseContext ctx = new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId,
             PermissionMode.DEFAULT,
             java.util.Map.of(), List.of(), "", null, List.of(),
             null, PermissionMode.DEFAULT,

@@ -31,8 +31,8 @@ import static org.mockito.Mockito.when;
 @DisplayName("[agent-resume-align] resume 门禁")
 class ResumeServiceGateTest {
 
-    private static final UUID AGENT =
-        UUID.fromString("aaaaaaaa-0000-0000-0000-000000000001");
+    private static final String AGENT =
+        "a000000000000001";
 
     private static ResumeService newService(BackgroundTaskRunner runner) {
         ResumeService svc = new ResumeService();

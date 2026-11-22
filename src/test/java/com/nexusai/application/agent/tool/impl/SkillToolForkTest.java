@@ -94,7 +94,7 @@ class SkillToolForkTest {
                         any(ToolUseContext.class), any());
         tool.setSubagentExecutor(executor);
 
-        tool.execute(forkBlock("user-args"), ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+        tool.execute(forkBlock("user-args"), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         // verify executeForkedSkill 第一参数 (prompt) = 技能内容 (含正文 marker + baseDir 前缀), 非 args
         org.mockito.ArgumentCaptor<String> promptCaptor = org.mockito.ArgumentCaptor.forClass(String.class);
@@ -126,14 +126,14 @@ class SkillToolForkTest {
         // 不注入 subagentExecutor (模拟 bean 缺失)
 
         assertThatThrownBy(() ->
-                tool.execute(forkBlock("user-args"), ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))))
+                tool.execute(forkBlock("user-args"), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))))
                 .isInstanceOf(IllegalStateException.class)
                 .hasMessageContaining("Fork mode 需要 SubagentExecutor bean");
     }
 
     /**
      * [批 6 伪造 sessionId] fork 分支缺 ToolUseContext ⇒ fail-loud，⛔ 不再现造
-     * {@code ToolUseContext.of(UUID.randomUUID(), "sess-"+random8)} 兜底。
+     * {@code ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-"+random8)} 兜底。
      *
      * <p><b>WHY（第一红线 · 不许静默失效）</b>：那个兜底会让 fork 子代理继承一个
      * 「看起来合法」的假会话键（下游 {@code resolveSessionDir} / file-history /
@@ -189,7 +189,7 @@ class SkillToolForkTest {
 
         List<Tool.ToolProgress> progress = new ArrayList<>();
         var result = tool.execute(forkBlock("user-args"),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 progress::add);
 
         assertThat(result)
@@ -251,7 +251,7 @@ class SkillToolForkTest {
 
         List<Tool.ToolProgress> progress = new ArrayList<>();
         tool.execute(forkBlock("user-args"),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 progress::add);
 
         assertThat(progress)
@@ -268,7 +268,7 @@ class SkillToolForkTest {
         //   invokedSkills Map，随主会话压缩被重注入，污染 LLM 输入。
         SkillToolImpl tool = new SkillToolImpl(newForkRegistry(tempDir));
 
-        UUID forkAgentId = UUID.randomUUID();
+        String forkAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         // 预置：fork 子 agent 条目（写侧落点）+ 主会话条目（必须保留，验证 clearForAgent 精确性）
         AgentState sessionState = new AgentState("test-system-prompt");
@@ -277,7 +277,7 @@ class SkillToolForkTest {
 
         SubagentExecutor executor = mock(SubagentExecutor.class);
         doAnswer(inv -> SubagentExecutor.SubagentResult.completed(
-                "fork 完成", 0, 0L, forkAgentId.toString()))
+                "fork 完成", 0, 0L, forkAgentId))
                 .when(executor).executeForkedSkill(
                         anyString(), any(Command.class), anyString(),
                         any(ToolUseContext.class), any());
@@ -286,7 +286,7 @@ class SkillToolForkTest {
         tool.setSessionStateResolver(sid -> sid.equals(sessionId) ? sessionState : null);
 
         // ToolUseContext.of(agentId, sessionId) — 第二参才是 doExecute 读取的 sessionId
-        tool.execute(forkBlock("user-args"), ToolUseContext.of(UUID.randomUUID(), sessionId));
+        tool.execute(forkBlock("user-args"), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         assertThat(sessionState.getInvokedSkillsForAgent(forkAgentId))
                 .as("fork 子 agent 结束后其 invokedSkills 必须被 finally 清理 (CC SkillTool.ts:287)")
@@ -317,7 +317,7 @@ class SkillToolForkTest {
         tool.setSessionStateResolver(sid -> sessionState);
 
         var result = tool.execute(forkBlock("user-args"),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
                 .as("fork 异常被外层 catch 转 ToolResult.error（fail loud 非静默降级）")

@@ -18,7 +18,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -54,7 +53,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PermissionBubbleServiceCallerTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000001";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
 
     /**
@@ -139,7 +138,7 @@ class PermissionBubbleServiceCallerTest {
     /**
      * 构造 ToolUseContext · permissionMode 由调用方决定.
      *
-     * <p>使用 9 字段 {@link ToolUseContext#of(UUID, String, PermissionMode, List, String,
+     * <p>使用 9 字段 {@link ToolUseContext#of(String, String, PermissionMode, List, String,
      * AbortController, List, ToolPermissionContext, PermissionMode)} 便利工厂, 后面 37 字段
      * (Stage 3.2 C2 4 + Stage 3.3 UI 11 + Stage 3.4 session 13 + readFileState) 由
      * compact ctor 兜底 null.

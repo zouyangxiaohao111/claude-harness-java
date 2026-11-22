@@ -260,7 +260,7 @@ class SubagentToolD12ModelWiringTest {
             .model("sonnet").build();
 
         // WHEN: 触发 resume（effectiveModel 在调度线程同步计算 + D12 日志）
-        tool.executeResumeAsync(UUID.randomUUID(), "continue", sel, "resume",
+        tool.executeResumeAsync(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "continue", sel, "resume",
             null, List.of(), null, null);
 
         // THEN: ① agentModel=sonnet 确实传入 resolve ② effectiveModel != 原始 "sonnet"
@@ -300,7 +300,7 @@ class SubagentToolD12ModelWiringTest {
             "resume-agent", "resume desc", "userSettings", "resume prompt body")
             .model("opus").build();
 
-        tool.executeResumeAsync(UUID.randomUUID(), "continue", sel, "resume",
+        tool.executeResumeAsync(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "continue", sel, "resume",
             null, List.of(), null, null);
 
         // THEN: ① agentModel=opus 确实传入 ② effectiveModel != 原始 "opus"（旧实现会原样透传 → RED）

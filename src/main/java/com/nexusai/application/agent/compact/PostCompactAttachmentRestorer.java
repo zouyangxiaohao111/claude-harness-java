@@ -15,6 +15,7 @@ import com.nexusai.application.agent.permission.PermissionRuleSource;
 import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.permission.check.RuleQuery;
 import com.nexusai.application.agent.telemetry.Telemetry;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.AgentDefinition;
 import com.nexusai.application.agent.subagent.loadAgentsDir;
 import com.nexusai.application.agent.tasks.BackgroundTask;
@@ -464,7 +465,7 @@ public final class PostCompactAttachmentRestorer {
      * <ol>
      *   <li><b>plan 文件排除</b>（:1680-1687）：{@code expandPath(filename) ===
      *       expandPath(getPlanFilePath(agentId))} 精确匹配。Java 已实现：{@link #resolvePlanFilePath}
-     *       经 {@link PlanProvider#getPlanFilePath(UUID)} 取当前会话 plan 文件路径
+     *       经 {@link PlanProvider#getPlanFilePath(String)} 取当前会话 plan 文件路径
      *       （{@link PlanProviderImpl} 落地 plansDir/{slug}.md / {slug}-agent-{agentId}.md），
      *       按 {@link MemoryFileDetection#toComparable} 归一化精确匹配排除。</li>
      *   <li><b>memory 文件排除</b>（:1689-1702）：{@code MEMORY_TYPE_VALUES.map(type =>
@@ -737,13 +738,13 @@ public final class PostCompactAttachmentRestorer {
      * {@code createSkillAttachmentIfNeeded(context.agentId)}（compact.ts:1494-1534）的
      * <b>读取路径</b> {@code getInvokedSkillsForAgent(agentId)}（state.ts:1530-1541）。
      *
-     * <p><b>数据流</b>：AgentState.getInvokedSkillsForAgent(UUID) 严格相等过滤
-     * （null 只匹配主会话 null-agent skill；agentId 为 UUID 字符串时只匹配对应 fork
+     * <p><b>数据流</b>：AgentState.getInvokedSkillsForAgent(String) 严格相等过滤
+     * （null 只匹配主会话 null-agent skill；agentId 为 a+16hex 时只匹配对应 fork
      * 子 agent）→ 映射为 {@link SkillInfo} → 委托 {@link #skillAttachment(List)}
      * （复用 per-skill 5K 截断 + 总预算 25K + most-recent-first，行 212-236）。
      *
      * @param state  会话主 AgentState（未注册/不存在 → null）
-     * @param agentId CC context.agentId（UUID 字符串；blank/null → null=主会话语义）
+     * @param agentId CC context.agentId（a+16hex，经 {@link AgentContext#canonicalAgentId} 归一；blank/null → null=主会话语义）
      * @return invoked_skills 附件消息（无 skill / 全部超预算 → null）
      */
     public static ChatMessageDto skillAttachmentForAgent(AgentState state, String agentId) {
@@ -753,8 +754,8 @@ public final class PostCompactAttachmentRestorer {
             }
             return null;
         }
-        UUID agentUuid = parseUuidOrNull(agentId);
-        List<SkillInfo> skills = state.getInvokedSkillsForAgent(agentUuid).values().stream()
+        String agentKey = AgentContext.canonicalAgentId(agentId);
+        List<SkillInfo> skills = state.getInvokedSkillsForAgent(agentKey).values().stream()
             .map(info -> new SkillInfo(info.skillName(), info.skillPath(), info.content(), info.invokedAt()))
             .toList();
         if (skills.isEmpty()) {
@@ -835,7 +836,7 @@ public final class PostCompactAttachmentRestorer {
      * {@code const planAttachment = createPlanAttachmentIfNeeded(context.agentId);
      * if (planAttachment) postCompactFileAttachments.push(planAttachment)}。
      *
-     * <p><b>数据源</b>: 经 {@link PlanProvider#createPlanAttachmentIfNeeded(UUID)} 读磁盘 plan
+     * <p><b>数据源</b>: 经 {@link PlanProvider#createPlanAttachmentIfNeeded(String)} 读磁盘 plan
      * 文件（plans.ts:119-145 getPlanFilePath / getPlan）。planProvider 未注入时按
      * {@code ctx.sessionId} 回落构造 {@link PlanProviderImpl}（默认 plans 目录），使 compact 重建
      * 链真正拿到磁盘真实路径。
@@ -876,8 +877,8 @@ public final class PostCompactAttachmentRestorer {
                 + " 无显式 planProvider 且 sessionId 非法 UUID，跳过（sessionId={}）", ctx.getSessionId());
             return;
         }
-        UUID agentUuid = parseUuidOrNull(ctx.getAgentId());
-        AttachmentMessageDto.PlanRef planRef = provider.createPlanAttachmentIfNeeded(agentUuid);
+        String agentKey = AgentContext.canonicalAgentId(ctx.getAgentId());
+        AttachmentMessageDto.PlanRef planRef = provider.createPlanAttachmentIfNeeded(agentKey);
         if (planRef == null) {
             log.info("[PostCompactAttachmentRestorer] populatePlanAttachment:"
                 + " 无 plan 文件，降级不注入（sessionId={} agentId={}）", ctx.getSessionId(), ctx.getAgentId());
@@ -898,7 +899,7 @@ public final class PostCompactAttachmentRestorer {
      *
      * <p><b>数据源</b>: plan 模式判定读 {@code appState.toolPermissionContext.mode === 'plan'}
      * （compact.ts:1545-1547，Java 经 {@link CompactConversationContext#isInPlanMode()}）；planFilePath /
-     * planExists 经 {@link PlanProvider#getPlanFilePath(UUID)} / {@link PlanProvider#getPlan(UUID)}。
+     * planExists 经 {@link PlanProvider#getPlanFilePath(String)} / {@link PlanProvider#getPlan(String)}。
      * 非 plan 模式 → 不注入；plan 模式但无 plan 文件 → 仍注入 plan_mode（planExists=false，
      * 让模型知道当前处于 plan 模式 + plan 文件应写到的路径）。
      *
@@ -930,10 +931,10 @@ public final class PostCompactAttachmentRestorer {
                 + " plan_mode 附件已存在，跳过双注入（sessionId={}）", ctx.getSessionId());
             return;
         }
-        UUID agentUuid = parseUuidOrNull(ctx.getAgentId());
-        String planFilePath = provider.getPlanFilePath(agentUuid);
-        boolean planExists = provider.getPlan(agentUuid) != null;
-        boolean isSubAgent = agentUuid != null;
+        String agentKey = AgentContext.canonicalAgentId(ctx.getAgentId());
+        String planFilePath = provider.getPlanFilePath(agentKey);
+        boolean planExists = provider.getPlan(agentKey) != null;
+        boolean isSubAgent = agentKey != null;
         ChatMessageDto attachment = planModeAttachment(true, planFilePath, planExists, isSubAgent);
         List<ChatMessageDto> combined = new ArrayList<>();
         if (existing != null) {
@@ -967,7 +968,7 @@ public final class PostCompactAttachmentRestorer {
      * {@code getPlanFilePath(agentId)}（compact.ts:1680-1687 try/catch 语义）。
      *
      * <p>经 {@link #resolvePlanProvider} 取 {@link PlanProvider}（显式注入优先，否则按 sessionId
-     * 回落构造 {@link PlanProviderImpl}），再 {@link PlanProvider#getPlanFilePath(UUID)} 取主会话
+     * 回落构造 {@link PlanProviderImpl}），再 {@link PlanProvider#getPlanFilePath(String)} 取主会话
      * （agentId null）/ 子代理（agentId 非 null）plan 文件路径。任一环节不可得（ctx/sessionId 缺失、
      * provider 不可解析、路径计算抛异常）→ 返回 null（跳过 plan 排除，继续 memory 排除），
      * 对齐 CC compact.ts:1682-1686 try/catch「拿不到 plan 路径则继续其它检查」。
@@ -984,7 +985,7 @@ public final class PostCompactAttachmentRestorer {
             if (provider == null) {
                 return null;
             }
-            return provider.getPlanFilePath(parseUuidOrNull(ctx.getAgentId()));
+            return provider.getPlanFilePath(AgentContext.canonicalAgentId(ctx.getAgentId()));
         } catch (RuntimeException e) {
             if (log.isDebugEnabled()) {
                 log.debug("[PostCompactAttachmentRestorer] 解析 plan 文件路径失败，跳过 plan 排除: {}",
@@ -1135,18 +1136,6 @@ public final class PostCompactAttachmentRestorer {
                 + " 检测到 skill_listing 附件 → suppressNextSkillListing 置真（一次性 latch，CC conversationRecovery.ts:399-401）");
         } else if (log.isDebugEnabled()) {
             log.debug("[PostCompactAttachmentRestorer] restoreSkillStateFromMessages: 未检测到 skill_listing 附件（CC conversationRecovery.ts:382-403）");
-        }
-    }
-
-    /** 解析 agentId 为 UUID · blank/null → null（主会话语义，CC agentId ?? null）；非法 UUID → null（安全降级）。 */
-    private static UUID parseUuidOrNull(String agentId) {
-        if (agentId == null || agentId.isBlank()) {
-            return null;
-        }
-        try {
-            return UUID.fromString(agentId);
-        } catch (IllegalArgumentException e) {
-            return null;
         }
     }
 
@@ -1483,7 +1472,7 @@ public final class PostCompactAttachmentRestorer {
         // ── 2. plan_file_reference（CC createPlanAttachmentIfNeeded compact.ts:1470-1486）──
         AttachmentMessageDto.PlanRef planRef =
             planProvider != null
-                ? planProvider.createPlanAttachmentIfNeeded(parseUuidOrNull(ctx.getAgentId()))
+                ? planProvider.createPlanAttachmentIfNeeded(AgentContext.canonicalAgentId(ctx.getAgentId()))
                 : null;
         if (planRef != null) {
             combined.add(planFileReferenceMessage(planRef));

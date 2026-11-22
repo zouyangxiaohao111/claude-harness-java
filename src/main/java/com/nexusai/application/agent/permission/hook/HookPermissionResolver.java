@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.permission.hook;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.nexusai.application.agent.messaging.PeerActionGuard;
 import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionDecisionReason;
 import com.nexusai.application.agent.permission.PermissionResult;
@@ -189,6 +190,38 @@ public class HookPermissionResolver {
             ToolUseContext ctx,
             String toolUseId,
             CanUseTool canUseTool) {
+        // ── [C批 · 跨会话安全门禁] 方法体首条：先于 hook allow / forceDecision 任何返回 ──
+        //   peer 来源只读类型化字段 ctx.peerExecutionOrigin()（B 冻结）；origin=null（正常用户）
+        //   → ALLOW，既有语义零变化。hook allow / bypass / auto 白名单均不得豁免本门禁。
+        PeerActionGuard.Decision peerGate = PeerActionGuard.check(
+            ctx != null ? ctx.peerExecutionOrigin() : null, tool, input, ctx);
+        if (peerGate.isDeny()) {
+            if (log.isInfoEnabled()) {
+                log.info("HOOK PEER GUARD deny（先于 hook allow/forceDecision）: tool={} code={}",
+                    tool != null ? tool.name() : "?", peerGate.code());
+            }
+            return new ResolvedPermission(peerGate.toPermissionResult(input), input);
+        }
+        if (peerGate.isAsk()) {
+            // 真实用户逐次确认：经 gate 的 forceDecision 通道直接进入弹窗，跳过 10 层管线
+            // （bypass / auto 白名单不得把 peer 副作用动作自动放行）。canUseTool 缺失 → fail-closed。
+            if (canUseTool == null) {
+                if (log.isWarnEnabled()) {
+                    log.warn("HOOK PEER GUARD 需要用户确认但 canUseTool 缺失 → fail-closed: tool={}",
+                        tool != null ? tool.name() : "?");
+                }
+                PermissionResult deny = new PermissionResult.Deny(
+                    "Cross-session (peer) request requires a real user confirmation, but no permission "
+                        + "prompter is available in this path; the action was refused.",
+                    new PermissionDecisionReason.Other("peer_no_prompt_channel"),
+                    toolUseId);
+                return new ResolvedPermission(deny, input);
+            }
+            return new ResolvedPermission(
+                gateDecisionToPermission(canUseTool.canUse(
+                    tool, input, ctx, toolUseId, peerGate.toPermissionResult(input)), input),
+                input);
+        }
         // ── CC toolHooks.ts:344-345 requiresInteraction / requireCanUseTool ──
         boolean requiresInteraction = tool != null && tool.requiresUserInteraction();
         boolean requireCanUseTool = ctx != null && ctx.requireCanUseTool();

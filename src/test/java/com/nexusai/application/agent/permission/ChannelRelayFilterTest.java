@@ -3,7 +3,6 @@ package com.nexusai.application.agent.permission;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.mcp.McpToolPool;
-import com.nexusai.application.agent.mcp.config.McpProperties;
 import com.nexusai.application.agent.security.ChannelPermission;
 import com.nexusai.application.agent.subagent.JsonRpcMcpClient;
 import com.nexusai.application.agent.tool.AgentToolResult;
@@ -22,7 +21,6 @@ import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,8 +44,25 @@ import static org.mockito.Mockito.when;
 class ChannelRelayFilterTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000000";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
+
+    /**
+     * 会话 cwd 解析依赖冻结表（ToolUseContext.of 构造时解析项目根）。
+     *
+     * <p>⛔ 以前靠别的用例留下的静态残留「碰巧通过」；隔离跑或顺序变化就抛
+     * {@code UnresolvedProjectRootException} ⇒ 显式声明，别依赖泄漏。
+     */
+    @org.junit.jupiter.api.BeforeEach
+    void bindSessionProjectRoot() {
+        com.nexusai.common.SessionProjectRoot.setForSession(SESSION_ID,
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().toString());
+    }
+
+    @org.junit.jupiter.api.AfterEach
+    void clearSessionProjectRoot() {
+        com.nexusai.common.SessionProjectRoot.clearSession(SESSION_ID);
+    }
 
     private static final class DescribedTool implements Tool {
         private final String name;
@@ -109,6 +124,32 @@ class ChannelRelayFilterTest {
             .containsExactly("svr-ok");
     }
 
+    /**
+     * [V334] 注入两道设置门 + 会话绑定判据（旧 setMcpProperties 已删：yml 键不再参与判定）。
+     *
+     * @param channelsGate 渠道能力门（channels_enabled）
+     * @param relayGate    权限中继门（channels_permission_relay_enabled）
+     * @param sessionBound 本会话是否已绑定渠道
+     */
+    private static void injectGates(WebSocketPermissionPrompter prompter, boolean channelsGate,
+                                    boolean relayGate, boolean sessionBound) throws Exception {
+        com.nexusai.domain.settings.SettingsService settings =
+            mock(com.nexusai.domain.settings.SettingsService.class);
+        when(settings.readDbChannelsEnabled()).thenReturn(channelsGate);
+        when(settings.readDbChannelsPermissionRelayEnabled()).thenReturn(relayGate);
+        java.lang.reflect.Field sf = WebSocketPermissionPrompter.class.getDeclaredField("settingsService");
+        sf.setAccessible(true);
+        sf.set(prompter, settings);
+
+        com.nexusai.domain.session.SessionModeService sessionMode =
+            mock(com.nexusai.domain.session.SessionModeService.class);
+        when(sessionMode.hasAnyChannel(org.mockito.ArgumentMatchers.nullable(String.class)))
+            .thenReturn(sessionBound);
+        java.lang.reflect.Field mf = WebSocketPermissionPrompter.class.getDeclaredField("sessionModeService");
+        mf.setAccessible(true);
+        mf.set(prompter, sessionMode);
+    }
+
     // ─────────────────── ① relay 门控 false → 跳过整个 channel relay ───────────────────
 
     @Test
@@ -118,8 +159,8 @@ class ChannelRelayFilterTest {
         SimpMessagingTemplate channelWs = mock(SimpMessagingTemplate.class);
         WebSocketPermissionPrompter prompter = new WebSocketPermissionPrompter(ws, 1_000);
         prompter.wireRacersForTesting(null, new com.nexusai.application.agent.permission.StompChannelPermissionCallbacks(channelWs));
-        // relay 门控 false（McpProperties.channelsPermissionRelayEnabled=false）
-        prompter.setMcpProperties(new McpProperties(false, true, false, null, null, null, null, null, null, null, null));
+        // [V334] relay 门控 false（settings.channels_permission_relay_enabled=0）
+        injectGates(prompter, true, false, true);
 
         Thread t = new Thread(() -> prompter.prompt(
             new DescribedTool("Bash"), JSON.createObjectNode().put("command", "git status"),
@@ -141,7 +182,7 @@ class ChannelRelayFilterTest {
         WebSocketPermissionPrompter prompter = new WebSocketPermissionPrompter(ws, 1_000);
         prompter.wireRacersForTesting(null, new StompChannelPermissionCallbacks(channelWs));
         // relay 门控开，但 server 只声明 claude/channel（缺 claude/channel/permission）→ 不合格
-        prompter.setMcpProperties(new McpProperties(false, true, true, null, null, null, null, null, null, null, null));
+        injectGates(prompter, true, true, true);
         prompter.setChannelRelayServerSource(mockPool(Set.of("plugin:slack:1"), Map.of(
             "plugin:slack:1", new JsonRpcMcpClient.Capabilities(true, true, false, false,
                 false, false, false, Map.of("claude/channel", Map.of())))));
@@ -164,7 +205,7 @@ class ChannelRelayFilterTest {
         SimpMessagingTemplate channelWs = mock(SimpMessagingTemplate.class);
         WebSocketPermissionPrompter prompter = new WebSocketPermissionPrompter(ws, 1_000);
         prompter.wireRacersForTesting(null, new StompChannelPermissionCallbacks(channelWs));
-        prompter.setMcpProperties(new McpProperties(false, true, true, null, null, null, null, null, null, null, null));
+        injectGates(prompter, true, true, true);
         prompter.setChannelRelayServerSource(mockPool(Set.of("plugin:slack:1"), Map.of("plugin:slack:1", dualCapabilities())));
         prompter.setChannelRelayAllowlistChecker(name -> false); // 不在白名单
 
@@ -187,7 +228,7 @@ class ChannelRelayFilterTest {
         SimpMessagingTemplate channelWs = mock(SimpMessagingTemplate.class);
         WebSocketPermissionPrompter prompter = new WebSocketPermissionPrompter(ws, 1_000);
         prompter.wireRacersForTesting(null, new StompChannelPermissionCallbacks(channelWs));
-        prompter.setMcpProperties(new McpProperties(false, true, true, null, null, null, null, null, null, null, null));
+        injectGates(prompter, true, true, true);
         prompter.setChannelRelayServerSource(mockPool(Set.of("plugin:slack:1"), Map.of("plugin:slack:1", dualCapabilities())));
         prompter.setChannelRelayAllowlistChecker(name -> true);
 

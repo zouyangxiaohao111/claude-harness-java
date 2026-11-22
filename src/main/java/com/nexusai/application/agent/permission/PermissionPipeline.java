@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.permission;
 
 import com.fasterxml.jackson.databind.JsonNode;
+import com.nexusai.application.agent.messaging.PeerActionGuard;
 import com.nexusai.application.agent.permission.check.CheckLayer;
 import com.nexusai.application.agent.permission.check.CheckLayer1a_DenyRule;
 import com.nexusai.application.agent.permission.check.CheckLayer1b_AskRule;
@@ -328,6 +329,25 @@ public class PermissionPipeline {
             ToolUseContext ctx,
             ToolPermissionContext permCtx
     ) {
+        // ── [C批 · 跨会话安全门禁] 入口第一条：覆盖 InboundMcpToolProvider / PromptShellExecutor
+        //    直调（不经 hook resolver 的两处）。peer 来源在 10 层规则（含 2a bypass / 2b allow /
+        //    auto 白名单）之前先判；origin=null 正常用户 → ALLOW，既有语义零变化。
+        PeerActionGuard.Decision peerGate = PeerActionGuard.check(
+            ctx != null ? ctx.peerExecutionOrigin() : null, tool, input, ctx);
+        if (peerGate.isDeny()) {
+            if (log.isInfoEnabled()) {
+                log.info("PermissionPipeline PEER GUARD deny（入口，先于 10 层）: tool={} code={}",
+                    tool.name(), peerGate.code());
+            }
+            return peerGate.toPermissionResult(input);
+        }
+        if (peerGate.isAsk()) {
+            // 需要真实用户逐次确认：Ask 由 gate 的 mapToDecision 进入交互弹窗（bypass/auto 不适用）。
+            if (log.isInfoEnabled()) {
+                log.info("PermissionPipeline PEER GUARD ask（入口，先于 10 层）: tool={}", tool.name());
+            }
+            return peerGate.toPermissionResult(input);
+        }
         if (log.isDebugEnabled()) {
             log.debug("PermissionPipeline.check start: tool={} callId={}",
                 tool.name(), call.id());

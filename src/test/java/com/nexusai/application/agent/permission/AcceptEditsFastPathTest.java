@@ -63,7 +63,7 @@ class AcceptEditsFastPathTest {
         denialTracker = new DenialTracker(3, 20);
         pipeline.denialTracker = denialTracker;
         pipeline.yoloClassifier = fakeClassifier;
-        ctx = new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        ctx = new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", null, List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null);
     }

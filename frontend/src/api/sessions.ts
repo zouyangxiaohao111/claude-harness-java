@@ -1,5 +1,24 @@
-import { api } from './rest'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse, PlanExitRequest, PlanExitResponse } from './types'
+import { api, ApiError } from './rest'
+import { isCommonResult } from './peerInboxOutcome'
+import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse, PlanExitRequest, PlanExitResponse, SessionModeDto, SessionModeToggleRequest } from './types'
+
+/**
+ * [V329] 拆统一返回体：成功 = `success === true && code === 0`。
+ *
+ * <p>与 `peerInbox.ts` 的 `unwrapData` 同一判据（用户裁定：前端只认 success&&code==0）。
+ * 业务失败仍是 HTTP 200 + `success:false` + 数字码 ⇒ 抛 ApiError（status 200），
+ * 调用方按普通错误展示 msg。
+ */
+function unwrapMode(raw: unknown): SessionModeDto {
+  if (!isCommonResult(raw)) return raw as SessionModeDto
+  const env = raw as { code?: unknown; msg?: unknown; data?: unknown; success?: unknown }
+  const code = typeof env.code === 'number' ? env.code : null
+  if (env.success !== true || (code !== null && code !== 0)) {
+    const msg = typeof env.msg === 'string' && env.msg.trim() ? env.msg : '操作失败，请重试'
+    throw new ApiError(msg, { status: 200, title: 'Business Error', detail: msg })
+  }
+  return env.data as SessionModeDto
+}
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
@@ -59,6 +78,35 @@ export const sessionApi = {
     api<{ sessionId: string; pendingPermissions: PermissionEventPayload[] | null }>(
       `/sessions/${encodeURIComponent(id)}/state`,
     ),
+
+  /** [V329] 会话「无人值守 / Brief」状态（GET /sessions/{id}/mode · CommonResult 拆包） */
+  getMode: async (id: string): Promise<SessionModeDto> =>
+    unwrapMode(await api<unknown>(`/sessions/${encodeURIComponent(id)}/mode`)),
+
+  /**
+   * [V329] 开/关无人值守（PUT /sessions/{id}/mode/unattended）。
+   *
+   * <p>开启硬前置 = 渠道实例 ≥ 1；无渠道 → 业务失败（ApiError，msg「请先配置渠道」），
+   * 前端必须提示并打开渠道弹窗，⛔ 不静默。
+   */
+  setUnattended: async (id: string, enabled: boolean): Promise<SessionModeDto> =>
+    unwrapMode(await api<unknown>(`/sessions/${encodeURIComponent(id)}/mode/unattended`, {
+      method: 'PUT',
+      body: { enabled } satisfies SessionModeToggleRequest,
+    })),
+
+  /**
+   * [V329][Q8] 开/关 Brief（PUT /sessions/{id}/mode/brief）。
+   *
+   * <p>与 SendUserMessage 工具开关、`/brief` 同一份会话状态。无人值守开启时关闭：
+   * 不带 `cascadeExitUnattended` ⇒ 后端以 `code:409` 拒绝（前端据此弹确认框，状态不变）；
+   * 带 `true` ⇒ 一次请求原子写入 brief=false + unattended=false。
+   */
+  setBrief: async (id: string, enabled: boolean, cascadeExitUnattended?: boolean): Promise<SessionModeDto> =>
+    unwrapMode(await api<unknown>(`/sessions/${encodeURIComponent(id)}/mode/brief`, {
+      method: 'PUT',
+      body: { enabled, cascadeExitUnattended } satisfies SessionModeToggleRequest,
+    })),
 }
 
 /**
@@ -92,4 +140,11 @@ export interface PermissionEventPayload {
    * 漏了它，弹窗会退回 fail-loud 错误面板（安全但体验差）或普通 allow/deny（授权范围消失）。
    */
   computerUse?: ComputerUseApproval | null
+  /**
+   * [V333 AFK] 本次提问卡片是否启用倒计时 + 总时长（毫秒）。
+   * null/缺省 ⇒ 不启用（默认：卡片持久显示、不计时）。
+   */
+  afkTimeoutMs?: number | null
+  /** [V333 AFK] 倒计时显示阈值（毫秒）：剩余时间 ≤ 该值才显示剩余秒数（对齐 CC showCountdown）。 */
+  afkCountdownMs?: number | null
 }

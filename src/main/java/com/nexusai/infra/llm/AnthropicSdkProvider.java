@@ -80,6 +80,7 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeMap;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.function.Consumer;
 
@@ -185,6 +186,17 @@ public class AnthropicSdkProvider implements LlmProvider {
      *  max_tokens DB 优先解析（static 方法无法读实例字段）；未接线 → null → 回落 CC 家族表。 */
     private static volatile ModelMapper staticModelMapper;
     private static volatile ProviderMapper staticProviderMapper;
+
+    /**
+     * [断流观测 2026-11-20] 当前进行中的流式调用数（同进程）。
+     *
+     * <p><b>WHY</b>：真实链路出现「思考阶段服务端零异常结束 SSE」（contentLen=0、无
+     * message_delta/message_stop），而参数矩阵实测（max_tokens 384k/128k/32k、display 有无、
+     * 3 并发、大上下文、tools、thinking 回传、cache_control/beta）全部正常 ⇒ 需要现场数据
+     * 才能判断是否与「同账号并发流式请求」相关。本计数器只读观测，不改变任何行为。
+     */
+    private static final java.util.concurrent.atomic.AtomicInteger ACTIVE_STREAMS =
+        new java.util.concurrent.atomic.AtomicInteger();
 
     /**
      * [G-18] Spring 装配后桥接实例注入的 DB mapper 到静态持有（AgentColorCommand @PostConstruct
@@ -456,6 +468,9 @@ public class AnthropicSdkProvider implements LlmProvider {
         // [usage-gateway] StreamState 提升到 try 之外：中断 / 失败出口要读「该次尝试已累积的 usage」
         //   （abort 时 message_start 事件已填 input/cache/output），声明在 try 内则 catch 不可达。
         StreamState state = new StreamState();
+        // [断流观测 2026-11-20] 本次调用进入时的并发流数（同进程）。断流日志带该值，
+        //   用于判断是否为「同账号并发流式请求」触发服务端掐流；不改变任何行为。
+        int activeStreamsAtStart = ACTIVE_STREAMS.incrementAndGet();
 
         // [流空闲看门狗 · 对齐 CC 2.1.296（规格 §2-§3）]
         //   · stalledByWatchdog：看门狗触发标记（abort 监听置位；实际解阻塞由读超时完成，
@@ -596,11 +611,18 @@ public class AnthropicSdkProvider implements LlmProvider {
             //   → 外层 catch → 既有「非流式回退 + 重试」链接管（不再静默；正常流/合法「想完不说」
             //   有 usage 佐证、不受影响）。判据与反例矩阵见 streamLooksTruncated + wire 测试。
             if (streamLooksTruncated(state)) {
+                // [断流观测 2026-11-20] 现场字段：inputTokens / requestId / 进入时并发流数 /
+                //   msgs / tools / 本次请求 max_tokens —— 用于区分「并发触发」与「请求规模触发」
+                //   与「服务端无关故障」。只加日志，不改判据。
                 log.warn("AnthropicSdkProvider 流完整性校验失败（疑似服务端提前结束流·断流）: "
                         + "finishReason={} contentLen={} reasoningLen={} toolCalls={} outputTokens={} "
+                        + "inputTokens={} requestId={} activeStreams={} msgs={} tools={} maxTokens={} "
                         + "→ 按失败处理：走非流式回退/重试链",
                     state.finishReason, state.content.length(), state.reasoning.length(),
-                    state.toolCalls.size(), state.outputTokens);
+                    state.toolCalls.size(), state.outputTokens,
+                    state.inputTokens, state.requestId, activeStreamsAtStart,
+                    history == null ? 0 : history.size(), tools == null ? 0 : tools.size(),
+                    params.maxTokens());
                 throw new java.io.IOException("AnthropicSdkProvider stream truncated: 流结束但缺有效终止信号"
                     + "（finishReason=" + state.finishReason + ", contentLen=" + state.content.length()
                     + ", reasoningLen=" + state.reasoning.length()
@@ -685,6 +707,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             }
             log.error("AnthropicSdkProvider.stream failed: {}", translated.toString());
             onError.accept(translated);
+        } finally {
+            ACTIVE_STREAMS.decrementAndGet();
         }
     }
 
@@ -830,6 +854,11 @@ public class AnthropicSdkProvider implements LlmProvider {
             return false;
         }
         if (aborted != null && aborted.get()) {
+            return false;
+        }
+        // [quota-429] 额度/套餐耗尽的 429 是终态：非流式回退只会再撞同一面墙，且回退循环
+        //   自带退避重试（Thread.sleep，无事件）⇒ 前端干等数分钟。直接上抛，让 loop 立即出错误卡。
+        if (ApiErrors.isQuotaExhausted(e)) {
             return false;
         }
         if (e instanceof java.util.concurrent.CancellationException) {
@@ -1081,21 +1110,31 @@ public class AnthropicSdkProvider implements LlmProvider {
         StringBuilder reasoning = new StringBuilder();
         StringBuilder thinkingSignature = new StringBuilder();
         List<ToolUseBlock> toolCalls = new ArrayList<>();
+        // [content-blocks] 非流式 content 数组本就是真实顺序 → 直接按下标采集。
+        List<com.nexusai.model.session.dto.ContentBlockDto> blocks = new ArrayList<>();
+        int blockIndex = 0;
         for (var block : message.content()) {
             if (block.isText()) {
-                block.text().ifPresent(t -> {
-                    String s = t.text();
-                    if (s != null) text.append(s);
-                });
+                String s = block.text().map(t -> t.text()).orElse(null);
+                if (s != null) text.append(s);
+                if (s != null && !s.isEmpty()) {
+                    blocks.add(com.nexusai.model.session.dto.ContentBlockDto.text(s, blockIndex));
+                }
+                blockIndex++;
             } else if (block.isThinking()) {
-                block.thinking().ifPresent(t -> {
-                    String s = t.thinking();
-                    if (s != null) reasoning.append(s);
+                String s = null;
+                String sig = null;
+                if (block.thinking().isPresent()) {
+                    var t = block.thinking().get();
+                    s = t.thinking();
                     // [thinking-passthrough] 非流式响应里 signature 与 thinking 同块返回，
                     //   必须留存以回传（否则下一轮 thinking 块无签名）。
-                    String sig = t.signature();
-                    if (sig != null && !sig.isEmpty()) thinkingSignature.append(sig);
-                });
+                    sig = t.signature();
+                }
+                if (s != null) reasoning.append(s);
+                if (sig != null && !sig.isEmpty()) thinkingSignature.append(sig);
+                blocks.add(com.nexusai.model.session.dto.ContentBlockDto.thinking(s, sig, blockIndex));
+                blockIndex++;
             } else if (block.isToolUse()) {
                 var tu = block.asToolUse();
                 JsonNode input;
@@ -1106,6 +1145,9 @@ public class AnthropicSdkProvider implements LlmProvider {
                     input = JSON.createObjectNode();
                 }
                 toolCalls.add(new ToolUseBlock(tu.id(), tu.name(), input));
+                blocks.add(com.nexusai.model.session.dto.ContentBlockDto.toolUse(
+                    tu.id(), tu.name(), input.toString(), blockIndex));
+                blockIndex++;
             }
         }
         String finishReason = message.stopReason().map(Object::toString).orElse(null);
@@ -1127,7 +1169,8 @@ public class AnthropicSdkProvider implements LlmProvider {
         }
         return new AssistantMessage(text.toString(), finishReason, toolCalls,
             reasoning.toString(), null, agentUsage, null,
-            thinkingSignature.length() == 0 ? null : thinkingSignature.toString());
+            thinkingSignature.length() == 0 ? null : thinkingSignature.toString(),
+            blocks);
     }
 
     /**
@@ -1287,14 +1330,20 @@ public class AnthropicSdkProvider implements LlmProvider {
                 acc.id = tu.id();
                 acc.name = tu.name();
                 state.toolCalls.put(acc.index, acc);
+                state.blockTypes.put(acc.index, "tool_use");
             } else if (block.isThinking()) {
                 state.thinkingBlockIdx = (int) cb.index();
+                state.blockTypes.put((int) cb.index(), "thinking");
+                state.thinkingByIndex.computeIfAbsent((int) cb.index(), k -> new StringBuilder());
                 // [thinking-passthrough] content_block_start 也可能直接带 signature
                 //   （非增量形态的上游）；空串不动，保留后续 signature_delta 累积结果。
                 String sig0 = block.asThinking().signature();
                 if (sig0 != null && !sig0.isEmpty()) {
                     state.signature.append(sig0);
                 }
+            } else if (block.isText()) {
+                state.blockTypes.put((int) cb.index(), "text");
+                state.textByIndex.computeIfAbsent((int) cb.index(), k -> new StringBuilder());
             }
         } else if (event.isContentBlockDelta()) {
             RawContentBlockDeltaEvent d = event.asContentBlockDelta();
@@ -1303,6 +1352,7 @@ public class AnthropicSdkProvider implements LlmProvider {
             if (delta.isText()) {
                 String s = delta.asText().text();
                 state.content.append(s);
+                state.textByIndex.computeIfAbsent(idx, k -> new StringBuilder()).append(s == null ? "" : s);
                 if (onChunk != null) onChunk.accept(s);
             } else if (delta.isInputJson()) {
                 ToolCallAccumulator acc = state.toolCalls.get(idx);
@@ -1316,6 +1366,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 String s = delta.asThinking().thinking();
                 if (s != null) {
                     state.reasoning.append(s);
+                    state.thinkingByIndex.computeIfAbsent(idx, k -> new StringBuilder()).append(s);
                     if (onReasoningChunk != null) onReasoningChunk.accept(s);
                 }
             } else if (delta.isSignature()) {
@@ -2148,13 +2199,13 @@ public class AnthropicSdkProvider implements LlmProvider {
                 ? maxOutputTokensOverride
                 // [G-18] 请求体默认与压缩链同源：DB 优先（models.max_tokens）→ CC 家族表回落
                 : resolveMaxOutputTokensForModel(modelName))
-            // [thinking-adaptive 2026-10-10] 统一发 thinking:{type:"adaptive",display:"omitted"}
-            //   ——对齐 CC 2.1.296 实发形态（用户真机 CC 对接 DeepSeek /anthropic 的本地抓包实证：
-            //   CC 对一切模型（含未知模型 deepseek-flash）均带此字段）。本仓此前「恒不发 → 用上游默认」：
-            //   第三方 ant 端点（DeepSeek）对 deepseek-flash 默认 thinking 开，长上下文下「想完不写正文」
-            //   → 空收尾（用户报「直接结束」）。直连实测该参数被 DeepSeek 端点接受、adaptive 令模型
-            //   「适可而止地想」。display=OMITTED 与 CC 同形（DeepSeek 实测仍回 thinking 内容，不影响
-            //   本仓思考展示；真 Claude 侧与 CC 行为一致）。
+            // [thinking-adaptive] 统一发 thinking:{type:"adaptive"}
+            //   ——对齐 CC 2.1.328 源码（services/api/claude.ts：adaptive 分支只发
+            //   `thinking = { type: 'adaptive' }`，不带 display）。本仓此前额外发
+            //   display:"omitted"，来源是一次抓包解读，但 CC 源码里不存在该字段 ⇒ 已删。
+            //   本仓此前「恒不发 → 用上游默认」：第三方 ant 端点（DeepSeek）对 deepseek-flash
+            //   默认 thinking 开，长上下文下「想完不写正文」→ 空收尾（用户报「直接结束」）。
+            //   直连实测 adaptive 被 DeepSeek 端点接受、令模型「适可而止地想」。
             .thinking(com.nexusai.infra.llm.EffortSupport.isThinkingOff(effortValue)
                 // 「关闭思考」档（sessions.effort_level='off'）⇒ 显式 disabled，对齐 CC
                 // max_thinking_tokens=0 → {type:"disabled"}。⚠️ 极少数模型拒绝 disabled
@@ -2163,9 +2214,7 @@ public class AnthropicSdkProvider implements LlmProvider {
                 ? ThinkingConfigParam.ofDisabled(
                     com.anthropic.models.messages.ThinkingConfigDisabled.builder().build())
                 : ThinkingConfigParam.ofAdaptive(
-                    ThinkingConfigAdaptive.builder()
-                        .display(ThinkingConfigAdaptive.Display.OMITTED)
-                        .build()));
+                    ThinkingConfigAdaptive.builder().build()));
 
         // [C-31] output_config: task_budget + effort + format 共享单节点（CC claude.ts:1559-1565）
         OutputConfig.Builder ocb = null;
@@ -3736,6 +3785,12 @@ public class AnthropicSdkProvider implements LlmProvider {
         AgentUsage.ServerToolUse serverToolUse = null;
         String serviceTier = null;
         AgentUsage.CacheCreation cacheCreation = null;
+        // [content-blocks] 按 content_block_start 的 index 记录块的到达顺序与类型
+        //   （TreeMap 保升序）：text / thinking / tool_use。
+        //   文本与思考按 index 分桶累积（多个 text 块不合并，顺序保留）。
+        final TreeMap<Integer, String> blockTypes = new TreeMap<>();
+        final Map<Integer, StringBuilder> textByIndex = new LinkedHashMap<>();
+        final Map<Integer, StringBuilder> thinkingByIndex = new LinkedHashMap<>();
     }
 
     static class ToolCallAccumulator {
@@ -3796,6 +3851,33 @@ public class AnthropicSdkProvider implements LlmProvider {
             log.debug("AnthropicSdkProvider 流式产出 message requestId={} · CC AssistantMessage.requestId=streamRequestId(claude.ts:2201)",
                 state.requestId);
         }
+        // [content-blocks] 按 content_block_start 的 index 升序还原真实般到达顺序
+        //   （工具应用与文本可交错；连续 text 合并交给渲染层，本处不合并）。
+        java.util.List<com.nexusai.model.session.dto.ContentBlockDto> contentBlocks = new java.util.ArrayList<>();
+        for (java.util.Map.Entry<Integer, String> e : state.blockTypes.entrySet()) {
+            int idx = e.getKey();
+            String kind = e.getValue();
+            if ("text".equals(kind)) {
+                StringBuilder sb = state.textByIndex.get(idx);
+                String t = sb == null ? null : sb.toString();
+                if (t != null && !t.isEmpty()) {
+                    contentBlocks.add(com.nexusai.model.session.dto.ContentBlockDto.text(t, contentBlocks.size()));
+                }
+            } else if ("thinking".equals(kind)) {
+                StringBuilder sb = state.thinkingByIndex.get(idx);
+                String th = sb == null ? null : sb.toString();
+                contentBlocks.add(com.nexusai.model.session.dto.ContentBlockDto.thinking(
+                    th, state.signature.length() == 0 ? null : state.signature.toString(),
+                    contentBlocks.size()));
+            } else if ("tool_use".equals(kind)) {
+                ToolCallAccumulator acc = state.toolCalls.get(idx);
+                if (acc != null && acc.isComplete()) {
+                    ToolUseBlock tb = acc.toBlock();
+                    contentBlocks.add(com.nexusai.model.session.dto.ContentBlockDto.toolUse(
+                        tb.id(), tb.name(), tb.input().toString(), contentBlocks.size()));
+                }
+            }
+        }
         return new AssistantMessage(
             state.content.toString(),
             finishReason,
@@ -3804,7 +3886,8 @@ public class AnthropicSdkProvider implements LlmProvider {
             apiError,
             usage,
             state.requestId,
-            state.signature.length() == 0 ? null : state.signature.toString()
+            state.signature.length() == 0 ? null : state.signature.toString(),
+            contentBlocks
         );
     }
 

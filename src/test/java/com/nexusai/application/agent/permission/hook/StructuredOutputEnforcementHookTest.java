@@ -110,7 +110,7 @@ class StructuredOutputEnforcementHookTest {
     @Test
     @DisplayName("onEvent: 非 STOP 事件 -> proceed（自过滤 1）")
     void onEvent_nonStop_returnsProceed() {
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = newStateWithMessages(List.of());
         HookEvent event = HookEvent.sessionStart("sess", hookAgentId.toString(), "startup", null, null);
 
@@ -123,8 +123,8 @@ class StructuredOutputEnforcementHookTest {
     @Test
     @DisplayName("onEvent: STOP 但 agentId 不匹配 -> proceed（自过滤 2，隔离父循环）")
     void onEvent_stopNonMatchingAgent_returnsProceed() {
-        UUID hookAgentId = UUID.randomUUID();
-        UUID otherAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String otherAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = newStateWithMessages(List.of()); // 未调 StructuredOutput
         HookEvent event = HookEvent.stop("sess", otherAgentId.toString(), false, null);
 
@@ -137,7 +137,7 @@ class StructuredOutputEnforcementHookTest {
     @Test
     @DisplayName("onEvent: STOP 匹配 agentId 且未调 StructuredOutput -> blockingError 重入（CC :157-160 强制）")
     void onEvent_stopMatchingNotCalled_returnsBlockingError() {
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // messages 只有 Read 调用，无 StructuredOutput
         AgentState state = newStateWithMessages(List.of(
             assistantWithToolCall("toolu-read-2", "Read"),
@@ -154,7 +154,7 @@ class StructuredOutputEnforcementHookTest {
     @Test
     @DisplayName("onEvent: STOP 匹配 agentId 且已成功调 StructuredOutput -> proceed（放行退出）")
     void onEvent_stopMatchingSuccess_returnsProceed() {
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String toolUseId = "toolu-so-ok";
         AgentState state = newStateWithMessages(List.of(
             assistantWithToolCall(toolUseId, SO),
@@ -251,7 +251,8 @@ class StructuredOutputEnforcementHookTest {
     // ════════════════════════════════════════════════════════════════════════
 
     private static AgentState newStateWithMessages(List<ChatMessageDto> msgs) {
-        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         for (ChatMessageDto m : msgs) state.appendMessage(m);
         return state;
     }

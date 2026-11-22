@@ -206,7 +206,7 @@ class SchemaNotSentHintRoleToolTest {
     }
 
     private static ToolUseContext ctxWith(List<Tool> availableTools, List<?> messages) {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT,
             Map.of(), availableTools, "", null, messages,

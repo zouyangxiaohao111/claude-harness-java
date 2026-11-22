@@ -57,13 +57,14 @@ class SubagentExecutorInheritedSessionHookKeyTest {
         hookRegistry.addSessionHook(LEADER_SESSION, HookEventType.PRE_TOOL_USE, "Bash",
             commandHook("echo leader"), null, null);
         ToolUseContext leaderParentTuc =
-            ToolUseContext.of(UUID.randomUUID(), LEADER_SESSION, PermissionMode.DEFAULT);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), LEADER_SESSION, PermissionMode.DEFAULT);
 
         String key = SubagentExecutor.sessionHookKeyToClear(LEADER_SESSION, leaderParentTuc);
         assertThat(key).as("继承来的会话键 ⇒ 返回 null（不清理）").isNull();
 
         // Step 21.2b 等价执行路径
-        executorWith(hookRegistry).cleanupSessionHooks(key, UUID.randomUUID());
+        executorWith(hookRegistry).cleanupSessionHooks(key,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         assertThat(hookRegistry.getSessionHooks(LEADER_SESSION, HookEventType.PRE_TOOL_USE))
             .as("⭐ Leader 的会话桶必须存活（改前：teammate 每轮收尾都会把它清空）")
@@ -81,7 +82,8 @@ class SubagentExecutorInheritedSessionHookKeyTest {
         hookRegistry.addSessionHook(LEADER_SESSION, HookEventType.PRE_TOOL_USE, "Bash",
             commandHook("echo leader"), null, null);
 
-        executorWith(hookRegistry).cleanupSessionHooks(LEADER_SESSION, UUID.randomUUID());
+        executorWith(hookRegistry).cleanupSessionHooks(LEADER_SESSION,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         assertThat(hookRegistry.getSessionHooks(LEADER_SESSION, HookEventType.PRE_TOOL_USE))
             .as("未收窄时确实会清空 ⇒ sessionHookKeyToClear 的判据是承重的（不是恒真恒假）")
@@ -102,13 +104,14 @@ class SubagentExecutorInheritedSessionHookKeyTest {
 
         String noSessionKey = SubagentExecutor.sessionHookKeyToClear(SessionKeys.NO_SESSION, null);
         assertThat(noSessionKey).as("无父 TUC ⇒ 不是继承来的键，照原语义清理").isEqualTo(SessionKeys.NO_SESSION);
-        executor.cleanupSessionHooks(noSessionKey, UUID.randomUUID());
+        executor.cleanupSessionHooks(noSessionKey,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         assertThat(hookRegistry.getSessionHooks(SessionKeys.NO_SESSION, HookEventType.PRE_TOOL_USE))
             .as("standalone 哨兵桶仍被清理（⛔ 哨兵未被删除，其降级路径行为不变）")
             .doesNotContainKey(HookEventType.PRE_TOOL_USE);
 
         ToolUseContext otherParent =
-            ToolUseContext.of(UUID.randomUUID(), "sess-leader-other", PermissionMode.DEFAULT);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-leader-other", PermissionMode.DEFAULT);
         assertThat(SubagentExecutor.sessionHookKeyToClear("sess-child-own", otherParent))
             .as("与父会话键不同 ⇒ 是本 agent 自有的桶，照清")
             .isEqualTo("sess-child-own");

@@ -12,8 +12,6 @@ import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
-import org.springframework.stereotype.Component;
 
 /**
  * ListPeers Tool 真实现 · 对齐 CC {@code Open-ClaudeCode/src/tools/ListPeersTool/ListPeersTool.ts}
@@ -31,11 +29,10 @@ import org.springframework.stereotype.Component;
  * <p><b>受控残留</b>: CC call 用 UDS socket 目录（{@code udsMessaging.getUdsMessagingSocketPath()}）
  * + Remote Control bridge peer 注册表发现对端；Java Web 后端<b>无 UDS 消息基础设施</b>（SendMessage
  * 走内部队列非跨进程 socket）→ {@code peers=[]}（无 socket 时的 CC 等价分支 ListPeersTool.ts:106-130
- * 遍历为空即返回空数组）。契约面（schema/prompt/description/mapper 格式）逐字对齐 CC。
+ * <p><b>注册路径已退出</b>：旧 {@code ListPeers} 名已由 {@code ListAgentsTool} 作为 alias 承接，
+ * 本类不再声明 {@code @Component}/{@code @ConditionalOnProperty}（否则会成为第二个可注册实现，
+ * 与 canonical ListAgents 冲突）。类保留供旧测试直接构造。
  */
-@Component
-@ConditionalOnProperty(prefix = "nexusai.feature", name = "uds-inbox",
-        havingValue = "true", matchIfMissing = false)
 public class ListPeersTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(ListPeersTool.class);

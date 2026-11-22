@@ -38,7 +38,7 @@ import { PERMISSION_MODE_LABELS, type PermissionUpdate, type PermissionUpdateRul
 /** 走「命令」语义的工具（规则内容 = 命令前缀 / 命令原文） */
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
 /** 走「文件路径」语义的工具（规则内容 = 路径 glob） */
-const FILE_TOOLS = new Set(['Edit', 'Write', 'Read', 'Glob', 'Grep', 'NotebookEdit'])
+const FILE_TOOLS = new Set(['Edit', 'Write', 'Read', 'Glob', 'Grep', 'NotebookEdit', 'AstGrep', 'AstEdit'])
 /** Skill 规则前缀形态（`/^(.+):\*$/`） */
 const RULE_PREFIX_RE = /^(.+):\*$/
 

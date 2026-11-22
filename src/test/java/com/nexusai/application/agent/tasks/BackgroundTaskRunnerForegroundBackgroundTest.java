@@ -3,8 +3,6 @@ package com.nexusai.application.agent.tasks;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
-
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
 
@@ -34,20 +32,20 @@ class BackgroundTaskRunnerForegroundBackgroundTest {
     @Test
     @DisplayName("registerAgentForeground 登记前台任务 isBackgrounded=false，taskId=agentId 合一")
     void registerAgentForeground_registersForeground() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAgentForeground(agentId, "研究项目结构", "prompt", "general-purpose", null);
 
-        assertThat(task.id()).isEqualTo(agentId.toString());
+        assertThat(task.id()).isEqualTo(agentId);
         assertThat(task.isBackgrounded()).isFalse();
         assertThat(task.type()).isEqualTo(TaskType.LOCAL_AGENT);
         // 落入统一 store（CC registerTask → state.tasks，framework.ts:77-117）
-        assertThat(framework.getTask(agentId.toString())).isPresent();
+        assertThat(framework.getTask(agentId)).isPresent();
     }
 
     @Test
     @DisplayName("backgroundAgentTask 前台 → 后台切换，幂等（已后台化再切 false）")
     void backgroundAgentTask_flipsAndIsIdempotent() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAgentForeground(agentId, "写测试", "prompt", "general-purpose", null);
 
         assertThat(runner.backgroundAgentTask(task.id())).isTrue();
@@ -58,9 +56,9 @@ class BackgroundTaskRunnerForegroundBackgroundTest {
     @Test
     @DisplayName("backgroundAll 后台化所有前台任务，已后台化/非 local_agent 不受影响")
     void backgroundAll_backgroundsOnlyForegroundAgents() {
-        UUID a1 = UUID.randomUUID();
-        UUID a2 = UUID.randomUUID();
-        UUID a3 = UUID.randomUUID();
+        String a1 = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String a2 = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String a3 = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask t1 = runner.registerAgentForeground(a1, "A", "p", "general-purpose", null);
         BackgroundTask t2 = runner.registerAgentForeground(a2, "B", "p", "general-purpose", null);
         runner.registerAgentForeground(a3, "C", "p", "general-purpose", null);
@@ -75,8 +73,8 @@ class BackgroundTaskRunnerForegroundBackgroundTest {
     @Test
     @DisplayName("unregisterAgentForeground 注销前台任务；后台化任务不注销")
     void unregisterAgentForeground_onlyRemovesForeground() {
-        UUID fg = UUID.randomUUID();
-        UUID bg = UUID.randomUUID();
+        String fg = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String bg = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask foreground = runner.registerAgentForeground(fg, "前台", "p", "general-purpose", null);
         BackgroundTask background = runner.registerAgentForeground(bg, "转后台", "p", "general-purpose", null);
         runner.backgroundAgentTask(background.id());

@@ -94,7 +94,7 @@ public class MonitorTaskRunner {
      * 启动命令监控 · 每行 stdout/stderr 是一个事件，命令退出即结束。
      */
     public String startCommand(String command, String description, long timeoutMs,
-                               String toolUseId, UUID agentId, String sessionId) {
+                               String toolUseId, String agentId, String sessionId) {
         if (command == null || command.isBlank()) {
             throw new IllegalArgumentException("command 不能为空");
         }
@@ -128,7 +128,7 @@ public class MonitorTaskRunner {
      * 启动 WebSocket 监控 · 每条消息是一个事件，连接关闭即结束。
      */
     public String startWebSocket(String url, List<String> allowedDomains, String description,
-                                 long timeoutMs, String toolUseId, UUID agentId, String sessionId) {
+                                 long timeoutMs, String toolUseId, String agentId, String sessionId) {
         URI uri;
         try {
             uri = URI.create(url);
@@ -266,7 +266,7 @@ public class MonitorTaskRunner {
         }
     }
 
-    private Handle register(String description, String toolUseId, UUID agentId, String sessionId) {
+    private Handle register(String description, String toolUseId, String agentId, String sessionId) {
         if (sessionId == null || sessionId.isBlank()) {
             throw new IllegalArgumentException("Monitor 需要显式 sessionId");
         }
@@ -287,7 +287,7 @@ public class MonitorTaskRunner {
         Handle h = new Handle(taskId,
             description == null ? "" : description,
             sessionId,
-            agentId == null ? null : agentId.toString(),
+            agentId,
             outputFile);
         handles.put(taskId, h);
         if (backgroundTaskRunner != null) {

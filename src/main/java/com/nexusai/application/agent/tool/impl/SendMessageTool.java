@@ -4,8 +4,12 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.messaging.MessageRecipientResolver;
+import com.nexusai.application.agent.messaging.PeerAddressing;
+import com.nexusai.application.agent.messaging.PeerMessageRouter;
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.ToolPermissionGate;
+import com.nexusai.application.agent.subagent.AgentTranscript;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.InProcessTeammateTaskRegistry;
@@ -52,10 +56,11 @@ import java.util.Optional;
  *       {@code getTeamName(appState.teamContext)}（:156），Java 等价
  *       {@link Teammate#getTeamName(TeammateIdentity, String)}（in-process &gt; dynamic &gt; teamContext）。</li>
  *   <li><b>输出契约（⊕-11）</b>：删除 {@code message_id/delivered_to/type/timestamp}；
- *       plain 消息输出 {@code {success, message, routing}}（:175-187），广播
- *       {@code {success, message, recipients[], routing}}（:252-265）。</li>
- *   <li><b>广播经 teamFile.members（⊕-12）</b>：收件人 = {@code teamFile.members} 的 name
- *       （排除 sender，大小写不敏感，:220-226）；旧 {@code member_*} 文件枚举删除（无写入方死代码）。</li>
+ *       plain 消息输出 {@code {success, message, routing}}（:175-187）。</li>
+ *   <li><b>广播删除（2026-11-20 用户裁定，对齐 CC 2.1.328）</b>：{@code to:"*"} 不再支持 ——
+ *       {@link #validateInput} 最前按精确相等硬拒（{@code broadcast (to: "*") is no longer
+ *       supported — send a message per recipient}），零 mailbox 写入；旧 {@code handleBroadcast}
+ *       与通配 STOMP 事件已删。多个收件人必须逐个 {@code SendMessage}。</li>
  * </ul>
  *
  * <p>信封 text 语义（对齐 CC 实际 TS 源码，不信注释）：
@@ -70,9 +75,9 @@ import java.util.Optional;
  *       requestId, from, reason, timestamp}}（teammateMailbox.ts:755-763）。</li>
  * </ul>
  *
- * <p>校验在 {@link #validateInput}（CC :604-718）：{@code to} 非空 / 无 {@code @} / string 消息
- * {@code summary} 必填 / 结构化禁广播 / {@code shutdown_response} 必须发 team-lead / 拒绝时
- * {@code reason} 必填（均 errorCode 9）。
+ * <p>校验在 {@link #validateInput}（CC :604-718）：{@code to} 非空 / 无 {@code @} / 不得是
+ * {@code "*"}（广播已删除）/ string 消息 {@code summary} 必填 / {@code shutdown_response} 必须发
+ * team-lead / 拒绝时 {@code reason} 必填（均 errorCode 9）。
  */
 @Component
 public class SendMessageTool implements Tool {
@@ -98,6 +103,21 @@ public class SendMessageTool implements Tool {
 
     /** 拒绝 shutdown_request 时 reason 必填（CC SendMessageTool.ts:706-715）。 */
     private static final String VALIDATE_ERR_CODE = "9";
+
+    /** 已删除的广播收件人 · 精确相等才拒（不把 {@code "*x"} 之类当成广播）。 */
+    private static final String BROADCAST_REMOVED_TARGET = "*";
+
+    /** 广播删除回执 · CC 2.1.328 原文（to:"*" 硬拒，不写任何 mailbox）。 */
+    private static final String BROADCAST_REMOVED =
+        "broadcast (to: \"*\") is no longer supported — send a message per recipient";
+
+    /**
+     * agent-live 回执尾句 · 对齐 CC exe（`Message queued for delivery to X at its next tool round.`
+     * 之后追加）：子代理若先结束会被 resume 并再次发完成通知，⛔ 不要据此重发。
+     */
+    private static final String RESUME_ON_FINISH_HINT =
+        " If it finishes first, it is resumed with the message and notifies again, "
+        + "so wait for that notification before resending.";
 
     private final TeamHelpers teamHelpers;
 
@@ -134,6 +154,70 @@ public class SendMessageTool implements Tool {
     /** 运行态判定（taskId === agentId）· CC auto-resume 只在 agent 已停止时触发。 */
     @Autowired(required = false)
     private com.nexusai.application.agent.tasks.BackgroundTaskRunner backgroundTaskRunner;
+
+    /** [stop-double-write] 内存停止标记（CC Fat）· 未注入 → 只探磁盘伴生/meta。 */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.subagent.StopMarkers stopMarkers;
+
+    /**
+     * [lineage] 会话用量账本注册表 · 子代理父子链的唯一真源（节点 {@code parentAgentId} 由
+     * spawn 点写入、跨 turn 由 {@code usage_tree_json} 恢复）。未注入 → lineage 恒 false。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.cost.SessionUsageAccountingRegistry usageAccountingRegistry;
+
+    /** [8 步判定 3] observer 探测（observer → 不可达）。未注入 → 跳过该步（旧行为）。 */
+    @Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private com.nexusai.application.agent.subagent.AgentObserverService agentObserverService;
+
+    /** [8 步判定 7] 逐出 teammate 的 in-process 重拉缝。未注入 → teammate 回落 subagent resume。 */
+    @Autowired(required = false)
+    @org.springframework.context.annotation.Lazy
+    private com.nexusai.application.agent.subagent.TeammateRelauncher teammateRelauncher;
+
+    /**
+     * [B3 配额] 会话级并发槽（与 spawn 共用）· resume 前先给确定回执，真正的占槽在
+     * {@code SpawnInProcess} 启动门（避免检查/占用竞态超发）。未注入 → 不做前置判定。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.subagent.ResumeQuota resumeQuota;
+
+    /**
+     * 会话目录解析缝（stop-by-person / evicted meta 探测用）· 生产 =
+     * {@code ResumeService.resolveSessionDir}，单测注入临时目录（⛔ 不写用户真实 config home）。
+     */
+    private volatile java.util.function.Function<String, java.nio.file.Path> sessionDirResolver =
+        com.nexusai.application.agent.subagent.ResumeService::resolveSessionDir;
+
+    /** 测试/接线用 setter（会话目录解析缝）。 */
+    public void setSessionDirResolver(
+            java.util.function.Function<String, java.nio.file.Path> resolver) {
+        this.sessionDirResolver = resolver != null
+            ? resolver : com.nexusai.application.agent.subagent.ResumeService::resolveSessionDir;
+    }
+
+    /** 测试/接线用 setter（停止标记）。 */
+    public void setStopMarkers(com.nexusai.application.agent.subagent.StopMarkers stopMarkers) {
+        this.stopMarkers = stopMarkers;
+    }
+
+    /** 测试/接线用 setter（observer 探测）。 */
+    public void setAgentObserverService(
+            com.nexusai.application.agent.subagent.AgentObserverService agentObserverService) {
+        this.agentObserverService = agentObserverService;
+    }
+
+    /** 测试/接线用 setter（teammate 重拉）。 */
+    public void setTeammateRelauncher(
+            com.nexusai.application.agent.subagent.TeammateRelauncher teammateRelauncher) {
+        this.teammateRelauncher = teammateRelauncher;
+    }
+
+    /** 测试/接线用 setter（会话级并发槽）。 */
+    public void setResumeQuota(com.nexusai.application.agent.subagent.ResumeQuota resumeQuota) {
+        this.resumeQuota = resumeQuota;
+    }
 
     /**
      * [team-frontend-channel B1] STOMP 出站模板 · writeToMailbox 后推送
@@ -173,6 +257,39 @@ public class SendMessageTool implements Tool {
     /** [IMP-G4 C7] 测试/接线用 setter（agentNameRegistry · 按名 in-process 子代理路由）· 对齐 setSpawnInProcess 模式。 */
     public void setAgentNameRegistry(com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry) {
         this.agentNameRegistry = agentNameRegistry;
+    }
+
+    /**
+     * [跨会话 A 批] 收件人解析器（session/main/agent/sess-/name 判类 + live 校验）。
+     * 未注入 → 只有旧 name/team 路径；结构类地址明确报错，绝不静默落 mailbox。
+     */
+    @Autowired(required = false)
+    private MessageRecipientResolver recipientResolver;
+
+    /** [跨会话 A 批] 跨会话路由（hold / loop / 投递确认）。未注入 = 跨会话不可用。 */
+    @Autowired(required = false)
+    private PeerMessageRouter peerMessageRouter;
+
+    /**
+     * [ref 门] 本会话「ListAgents 实际列过的行」pin 集合（CC {@code UMr}）。
+     * 未注入（测试直构且不设 setter）→ 无法证明列过 ⇒ pinned 形态一律按 pin 失败处理（fail-closed）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerRefPins refPins;
+
+    /** [ref 门] 测试/接线用 setter（与 ListAgentsTool 共用同一实例）。 */
+    public void setRefPins(com.nexusai.application.agent.messaging.PeerRefPins pins) {
+        this.refPins = pins;
+    }
+
+    /** [跨会话 A 批] 测试/接线用 setter。 */
+    public void setRecipientResolver(MessageRecipientResolver resolver) {
+        this.recipientResolver = resolver;
+    }
+
+    /** [跨会话 A 批] 测试/接线用 setter。 */
+    public void setPeerMessageRouter(PeerMessageRouter router) {
+        this.peerMessageRouter = router;
     }
 
     /** 测试/接线用 setter（resume 通道）。 */
@@ -222,7 +339,7 @@ public class SendMessageTool implements Tool {
     @Override
     public String description() {
         // 对齐 CC SendMessageTool.ts:720-722 DESCRIPTION（prompt.ts:3 'Send a message to another agent'）
-        return "Send a message to another agent";
+        return "Send a message to another agent. Peer messages need no receipt-style reply.";
     }
 
     /**
@@ -248,10 +365,19 @@ public class SendMessageTool implements Tool {
 
             | `to` | |
             |---|---|
-            | `"researcher"` | Teammate by name |
-            | `"*"` | Broadcast to all teammates — expensive (linear in team size), use only when everyone genuinely needs it |
+            | `"researcher"` | Teammate / subagent by name |
+            | `"alice [ab12cd]"` | Address from ListAgents (name + short ref) |
+            | `"main"` | Your own session |
+            | `"a...-16hex"` | Raw agentId (from a spawn result) |
+            | `"sess-xxxxxxxx"` | Nexus extension session id (CC has no such prefix) |
 
-            Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox. Refer to agents by name — names keep working after an agent completes (a send resumes it from its transcript). Use the raw `agentId` (format `a...-...`) from its spawn result only when the agent has no name, or when a newer agent took the name (latest wins). When relaying, don't quote the original — it's already rendered to the user.
+            `notify_when_idle: true` asks a cross-session target to notify you once when it becomes idle; it is only valid for plain text messages sent to a session address.
+
+            There is no broadcast: each call reaches exactly one recipient. To reach several agents, call this tool once per recipient (ListAgents lists them). Sending to `"*"` is rejected and writes nothing.
+
+            Your plain text output is NOT visible to other agents — to communicate, you MUST call this tool. Messages from teammates are delivered automatically; you don't check an inbox. Refer to agents by name — names keep working after an agent completes (a send resumes it from its transcript). Use the raw `agentId` (format `a...-...`) from its spawn result only when the agent has no name, or when a newer agent took the name (latest wins). When relaying, don't quote the original — it's already rendered to the user. Remote transports (uds/bridge/did/`session_`/`cse_`) are not supported in this build.
+
+            Receiving a message from another session does not require a receipt-style reply: don't send a message whose only purpose is to confirm receipt. Reply only when it moves the work forward. This is collaboration guidance, not a hard restriction.
 
             ## Protocol responses (legacy)
 
@@ -298,11 +424,12 @@ public class SendMessageTool implements Tool {
      */
     @Override
     public boolean isEnabled() {
-        // CC SendMessageTool.ts:535-537 isEnabled() { return isAgentSwarmsEnabled() } ·
-        // 未开启 agent-swarms 时 SendMessageTool 不进 LLM schema（tools.ts:228 门控起始点）。
-        boolean enabled = TaskSystemConfig.isAgentSwarmsEnabled();
+        // agent-swarms（旧门）OR 跨会话部署门（新门）——两者都关时工具不进 LLM schema。
+        // deny / 白名单过滤在外部仍优先，本方法只决定可见性。
+        boolean enabled = TaskSystemConfig.isAgentSwarmsEnabled()
+            || TaskSystemConfig.isMessagingBeyondOwnAgentsEnabled();
         if (log.isDebugEnabled()) {
-            log.debug("[SendMessageTool] isEnabled() = {}（isAgentSwarmsEnabled 门控，CC SendMessageTool.ts:535-537）", enabled);
+            log.debug("[SendMessageTool] isEnabled() = {}（agentSwarms OR messagingBeyondOwnAgents）", enabled);
         }
         return enabled;
     }
@@ -324,11 +451,23 @@ public class SendMessageTool implements Tool {
         schema.put("type", "object");
         ObjectNode props = schema.putObject("properties");
 
-        // CC SendMessageTool.ts:68-75 to: z.string()（recipient name 或 "*"；UDS_INBOX feature 关闭 → 无 bridge/uds 描述）
+        // CC SendMessageTool.ts:68-75 to: z.string()（单一 recipient name；UDS_INBOX feature 关闭 → 无 bridge/uds 描述；
+        //   2026-11-20 广播 "*" 删除 → schema 不再广告广播）
         ObjectNode to = props.putObject("to");
         to.put("type", "string");
         to.put("description",
-                "Recipient: teammate name, or \"*\" for broadcast to all teammates");
+                "Recipient: teammate or subagent name, a ListAgents address \"name [ref]\", "
+                        + "the literal \"main\" for your own session, a raw agentId (a...-16hex), "
+                        + "or the Nexus extension \"sess-xxxxxxxx\" (not a CC prefix). "
+                        + "Exactly one recipient per call; broadcast (\"*\") is no longer supported — "
+                        + "send one message per recipient.");
+
+        // [跨会话 A 批] notify_when_idle：一次性 idle 订阅（仅纯文本 + 跨会话会话地址）
+        ObjectNode notifyWhenIdle = props.putObject("notify_when_idle");
+        notifyWhenIdle.put("type", "boolean");
+        notifyWhenIdle.put("description",
+            "When true, ask the target session to notify you once when it goes idle/exits. "
+                + "Only valid for plain text messages sent to a cross-session address.");
 
         // CC SendMessageTool.ts:76-81 summary（string 消息必填的 UI 预览）
         ObjectNode summary = props.putObject("summary");
@@ -403,10 +542,11 @@ public class SendMessageTool implements Tool {
      *
      * <p>顺序（UDS_INBOX feature 关闭 → bridge/uds 分支 N/A，:612-622/:631-666 跳过）：
      * <ol>
+     *   <li>{@code to} 精确等于 {@code "*"} → 拒绝（CC 2.1.328 已删除广播，见常
+     *       {@link #BROADCAST_REMOVED}）；</li>
      *   <li>{@code to} 非空（:605-611）；</li>
      *   <li>{@code to} 含 {@code @} → 拒绝（:623-630）；</li>
      *   <li>string 消息 {@code summary} 必填（:667-676）；</li>
-     *   <li>结构化消息 {@code to:"*"} 禁广播（:678-684）；</li>
      *   <li>{@code shutdown_response} 必须发 {@code team-lead}（:694-703）；</li>
      *   <li>{@code shutdown_response} 拒绝时 {@code reason} 必填（:705-715）。</li>
      * </ol>
@@ -414,6 +554,10 @@ public class SendMessageTool implements Tool {
     @Override
     public ValidationResult validateInput(JsonNode input, ToolUseContext ctx) {
         String to = readString(input, "to");
+        if (BROADCAST_REMOVED_TARGET.equals(to)) {
+            // CC 2.1.328：广播能力已硬删 —— 只允许单一收件人，绝不落任何 mailbox。
+            return ValidationResult.fail(VALIDATE_ERR_CODE, BROADCAST_REMOVED);
+        }
         if (to == null || to.trim().isEmpty()) {
             // CC :605-611 to must not be empty
             return ValidationResult.fail(VALIDATE_ERR_CODE, "to must not be empty");
@@ -421,7 +565,16 @@ public class SendMessageTool implements Tool {
         if (to.contains("@")) {
             // CC :623-630 拒绝 name@team 地址 —— 每 session 仅一 team
             return ValidationResult.fail(VALIDATE_ERR_CODE,
-                    "to must be a bare teammate name or \"*\" — there is only one team per session");
+                    "to must be a bare teammate name — there is only one team per session");
+        }
+        // [跨会话 A 批] notify_when_idle 只允许纯文本
+        boolean notifyWhenIdle = input.path("notify_when_idle").asBoolean(false);
+        if (notifyWhenIdle) {
+            JsonNode notifyMessage = input.get("message");
+            if (notifyMessage != null && notifyMessage.isObject()) {
+                return ValidationResult.fail(VALIDATE_ERR_CODE,
+                        "notify_when_idle is only supported for plain text messages");
+            }
         }
         JsonNode message = input.get("message");
         if (message != null && message.isTextual()) {
@@ -434,11 +587,6 @@ public class SendMessageTool implements Tool {
             return ValidationResult.pass();
         }
         if (message != null && message.isObject()) {
-            if ("*".equals(to)) {
-                // CC :678-684 结构化消息禁广播
-                return ValidationResult.fail(VALIDATE_ERR_CODE,
-                        "structured messages cannot be broadcast (to: \"*\")");
-            }
             String type = message.path("type").asText();
             if (TYPE_SHUTDOWN_RESPONSE.equals(type) && !SwarmConstants.TEAM_LEAD_NAME.equals(to)) {
                 // CC :694-703 shutdown_response 必须发 team-lead
@@ -499,7 +647,7 @@ public class SendMessageTool implements Tool {
      * 观测字段补全 · 对齐 CC SendMessageTool.ts:543-569 backfillObservableInput。
      *
      * <p>为 hook / canUseTool / observer 填充 {@code type/recipient/content/request_id/approve}
-     * 观测字段（broadcast→'broadcast' / plain→'message' / 结构化→其 type）；<b>不影响</b>最终
+     * 观测字段（plain→'message' / 结构化→其 type）；<b>不影响</b>最终
      * {@code execute()} 入参（Java 契约：backfill 仅观测，返回拷贝）。
      */
     @Override
@@ -513,14 +661,8 @@ public class SendMessageTool implements Tool {
             return node;
         }
         JsonNode message = node.get("message");
-        if ("*".equals(to)) {
-            // CC :547-549 broadcast
-            node.put("type", "broadcast");
-            if (message != null && message.isTextual()) {
-                node.put("content", message.asText());
-            }
-        } else if (message != null && message.isTextual()) {
-            // CC :550-553 message
+        if (message != null && message.isTextual()) {
+            // CC :550-553 message（广播分支随 to:"*" 删除已移除）
             node.put("type", "message");
             node.put("recipient", to);
             node.put("content", message.asText());
@@ -556,13 +698,15 @@ public class SendMessageTool implements Tool {
      *
      * <p>路由（UDS_INBOX feature 关闭 → bridge/uds 分支 N/A，:742-798 跳过）：
      * <ol>
-     *   <li>string 消息：{@code to:"*"} → {@link #handleBroadcast}；否则 {@link #handleMessage}
-     *       （:876-881）；</li>
-     *   <li>结构化消息：{@code to:"*"} → 拒绝（:883-885）；按 {@code type} 分发（:887-912）：
-     *       shutdown_request → handleShutdownRequest；shutdown_response →
+     *   <li>string 消息：{@link #handleMessage} 或跨会话/子代理路由（:876-881）；</li>
+     *   <li>结构化消息：按 {@code type} 分发（:887-912）：shutdown_request →
+     *       handleShutdownRequest；shutdown_response →
      *       approve?handleShutdownApproval:handleShutdownRejection；plan_approval_response →
      *       approve?handlePlanApproval:handlePlanRejection。</li>
      * </ol>
+     *
+     * <p>广播（{@code to:"*"}）已删除：{@link #validateInput} 前置拒绝；此处再按精确相等兜底，
+     * 保证直接调用 {@code execute} 时也绝不写 mailbox。
      *
      * <p>in-process 子代理路由（CC :800-874，按名 queue/resume）归属 IMP-G4（agentNameRegistry
      * 接线任务），本期不在此实现。
@@ -574,6 +718,10 @@ public class SendMessageTool implements Tool {
         if (to == null) {
             return ToolResult.error(call.id(), "missing required input: to");
         }
+        if (BROADCAST_REMOVED_TARGET.equals(to)) {
+            // 广播能力已删除：一律单一收件人（validateInput 已拦，此处覆盖直接 execute 的调用方）。
+            return ToolResult.error(call.id(), BROADCAST_REMOVED);
+        }
 
         JsonNode message = input.get("message");
         if (message == null || message.isNull()) {
@@ -582,25 +730,15 @@ public class SendMessageTool implements Tool {
 
         if (message.isTextual()) {
             String content = message.asText();
-            if ("*".equals(to)) {
-                return handleBroadcast(call, content, readString(input, "summary"), ctx);
-            }
-            // [IMP-G4 C7] in-process 子代理按名路由 · 对齐 CC SendMessageTool.ts:800-813：
-            //   appState.agentNameRegistry.get(input.to) → 命中注册名 → queuePendingMessage
-            //   （子 agent 下一轮 SubagentExecutor runSubagentQueryLoop drain 消费）。非注册名 →
-            //   降级 handleMessage（mailbox）。agentNameRegistry 未注入 → 降级。
-            AgentToolResult routed = routeToRegisteredSubagent(
-                call, to, content, readString(input, "summary"), ctx);
-            if (routed != null) {
-                return routed;
-            }
-            return handleMessage(call, to, content, readString(input, "summary"), ctx);
+            return routeTextMessage(call, to, content, readString(input, "summary"),
+                input.path("notify_when_idle").asBoolean(false), ctx);
         }
 
         if (message.isObject()) {
-            // CC :883-885 结构化消息禁广播（validateInput 也拦，此处防御）
-            if ("*".equals(to)) {
-                return ToolResult.error(call.id(), "structured messages cannot be broadcast");
+            // [跨会话 A 批] 结构化消息禁止发往跨会话地址（shutdown/plan 不得被当成用户批复）
+            AgentToolResult crossSessionError = rejectStructuredCrossSession(call, to, ctx);
+            if (crossSessionError != null) {
+                return crossSessionError;
             }
             String type = message.path("type").asText();
             switch (type) {
@@ -671,19 +809,524 @@ public class SendMessageTool implements Tool {
         if (agentNameRegistry == null) {
             return null;
         }
-        String agentId = agentNameRegistry.resolve(to);
-        if (agentId == null) {
+        String owner = ctx != null ? ctx.sessionId() : null;
+        // 解析顺序（用户裁定）：活跃表 → 退役表 → not-found。
+        //   registry.resolveEntry 已按该顺序实现；退役条目仍然带回 agentId，
+        //   后续按「停/逐出」分支处理（不再像旧实现那样注销即 not-found）。
+        com.nexusai.application.agent.subagent.AgentNameRegistry.AgentNameEntry entry =
+            agentNameRegistry.resolveEntry(owner, to);
+        if (entry == null) {
             return null;
         }
-        // [agent-resume-align 2026-11-15] 对齐 CC SendMessageTool.ts:815-874：
-        //   名字在 agent 完成后仍可寻址 —— 发送会从 transcript 热启动它。
-        if (!isAgentRunning(agentId)) {
-            AgentToolResult resumed = resumeStoppedAgent(call, to, agentId, content, ctx);
+        return deliverToResolvedAgent(call, to, entry.agentId(), content, summary, ctx);
+    }
+
+    /**
+     * 文本消息路由（判类顺序 session → main → agent → Nexus sess- → name）。
+     *
+     * <p>远端 session 形一律 Error 且<b>绝不放本地 mailbox</b>；session/main 走
+     * {@link PeerMessageRouter}，失败即 Error；name 未命中只有 team 上下文才保留 mailbox。
+     */
+    private AgentToolResult routeTextMessage(ToolUseBlock call, String to, String content,
+                                             String summary, boolean notifyWhenIdle,
+                                             ToolUseContext ctx) {
+        PeerAddressing.Parsed parsed = PeerAddressing.classify(to);
+        if (parsed.kind() == PeerAddressing.Kind.SESSION) {
+            return ToolResult.error(call.id(),
+                "Error: remote cross-session messaging is not supported in this build");
+        }
+        String teamName = resolveTeamName(ctx);
+        boolean hasTeam = teamName != null && !teamName.isBlank();
+        List<String> teamMemberNames = teamMemberNames(teamName, ctx);
+
+        if (recipientResolver == null) {
+            // 未接线也要拦住「发给自己」：main / 本会话 sess- id 在没有 resolver 时无法解析投递，
+            // 但必须给 CC 原文而不是「not wired」。
+            if (isSelfAddressWithoutResolver(to, ctx)) {
+                return selfAddressError(call, to);
+            }
+            if (parsed.kind() != PeerAddressing.Kind.NAME) {
+                return ToolResult.error(call.id(),
+                    "Error: cross-session messaging is not wired in this build");
+            }
+            AgentToolResult legacy = routeToRegisteredSubagent(call, to, content, summary, ctx);
+            if (legacy != null) {
+                return legacy;
+            }
+            if (notifyWhenIdle) {
+                return ToolResult.error(call.id(),
+                    "Error: notify_when_idle requires a live cross-session target");
+            }
+            // [cc-notfound-align] 旧路径同样要求收件人真实存在且**只能是 team-lead**：
+            //   名册里的非 lead 成员是 teammate（CC roster-first），其投递必须走代理队列；
+            //   本降级路径没有 resolver/loop 接线 ⇒ 一律 not-found 报错，⛔ 不落 inbox。
+            if (!hasTeam || !memberHit(teamMemberNames, to)
+                || !SwarmConstants.TEAM_LEAD_NAME.equals(PeerAddressing.normalizeName(to))) {
+                return ToolResult.error(call.id(), "Error: " + noAgentNamed(to, teamMemberNames, ctx));
+            }
+            return handleMessage(call, to, content, summary, ctx);
+        }
+
+        String sourceSessionId = ctx != null ? ctx.sessionId() : null;
+        MessageRecipientResolver.Target target = recipientResolver.resolve(
+            new MessageRecipientResolver.Request(to, sourceSessionId, teamName, hasTeam,
+                teamMemberNames, senderAgentId(ctx)));
+
+        // [CC 对齐] 解析到本会话自身（主会话 → main / 自己的 sess- id / 自己的地址）⇒ 直接 Error。
+        //   判定在 resolver（Target.selfSent），此处零投递、零 mailbox、零入队。
+        //   子代理/teammate 的 sessionId 继承父会话，发回主会话时 selfSent=false（不算发给自己）。
+        if (target.selfSent()) {
+            return selfAddressError(call, to);
+        }
+
+        switch (target.kind()) {
+            case UNSUPPORTED_REMOTE:
+                return ToolResult.error(call.id(),
+                    "Error: remote cross-session messaging is not supported in this build");
+            case AMBIGUOUS:
+                return ToolResult.error(call.id(), "Error: " + target.errorMessage());
+            case AGENT:
+            case NAME_AGENT:
+                if (notifyWhenIdle) {
+                    return ToolResult.error(call.id(),
+                        "Error: notify_when_idle requires a cross-session session address, not a subagent");
+                }
+                return deliverToSubagent(call, to, target.agentId(), content, summary, ctx);
+            case SESSION:
+            case NAME_SESSION:
+            case MAIN:
+                return deliverCrossSession(call, target, content, summary, notifyWhenIdle, ctx);
+            case TEAM_MAILBOX:
+                return handleMessage(call, to, content, summary, ctx);
+            case UNRESOLVED:
+            default:
+                // [cc-notfound-align] 对齐 CC 的 not-found：一律 success:false + 候选，
+                //   ⛔ 不再「有 team 上下文就写 inbox」（那条降级正是名字写错时消息被吞掉的原因）。
+                return ToolResult.error(call.id(), "Error: " + target.errorMessage());
+        }
+    }
+
+    /**
+     * 发送方 agent 身份 · 决定「目标会话 == 来源会话」是否算发给自己。
+     *
+     * <p>主会话 {@code ctx.agentId() == null}（对齐 CC {@code !context.agentId}）；子代理 /
+     * teammate 都有 agentId，且 {@code sessionId} 继承父会话（{@code createSubagentContext}）——
+     * 它们发回主会话属于正常投递，不得判成 selfSent。
+     *
+     * @param ctx 工具上下文（可 null）
+     * @return agentId 串；null = 主会话本身
+     */
+    private static String senderAgentId(ToolUseContext ctx) {
+        return ctx == null || ctx.agentId() == null ? null : ctx.agentId().toString();
+    }
+
+    /**
+     * 未接线 resolver 时的自身地址判定（兜底，不放宽）：只有主会话才可能发给自己。
+     *
+     * <p>{@code main} 恒等于主会话自身；{@code sess-xxxxxxxx} 与本会话 id 逐字相等时同样是自身。
+     *
+     * @param to  写入的收件地址
+     * @param ctx 工具上下文
+     * @return true = 发给自己
+     */
+    private static boolean isSelfAddressWithoutResolver(String to, ToolUseContext ctx) {
+        if (ctx == null || ctx.agentId() != null || ctx.sessionId() == null
+            || ctx.sessionId().isBlank()) {
+            return false;
+        }
+        PeerAddressing.Parsed parsed = PeerAddressing.classify(to);
+        if (parsed.kind() == PeerAddressing.Kind.MAIN) {
+            return true;
+        }
+        return parsed.kind() == PeerAddressing.Kind.NEXUS_SESSION
+            && ctx.sessionId().equals(parsed.raw());
+    }
+
+    /**
+     * 自身地址错误回执 · 文案 = CC 2.1.328 原文，零投递。
+     *
+     * @param call 工具调用块
+     * @param to   写入的收件地址
+     * @return Error 结果
+     */
+    private static AgentToolResult selfAddressError(ToolUseBlock call, String to) {
+        return ToolResult.error(call.id(),
+            "Error: " + MessageRecipientResolver.selfAddressFailure(to));
+    }
+
+    private AgentToolResult deliverToSubagent(ToolUseBlock call, String to, String agentId,
+                                              String content, String summary, ToolUseContext ctx) {
+        if (agentNameRegistry == null || agentId == null) {
+            return ToolResult.error(call.id(), "Error: no live agent, teammate, or session named " + to);
+        }
+        return deliverToResolvedAgent(call, to, agentId, content, summary, ctx);
+    }
+
+    /**
+     * 已解析 agentId 的投递 · 八步判定顺序（用户照 CC 2.1.328 裁定）。
+     *
+     * <ol>
+     *   <li>not-found —— 在调用方（{@code noAgentNamed}），本方法不写 mailbox；</li>
+     *   <li>停止/逐出三类 + {@code stoppedByPerson} → 拒（{@code was stopped by the user}）；</li>
+     *   <li>observer → 不可达；</li>
+     *   <li>live：running → 入队下一轮；status≠running → resume 并声明「若先收尾则带消息 resume」；</li>
+     *   <li>agent-stopped-by-user → 拒；</li>
+     *   <li>agent-stopped → 配额 + 读 transcript 续跑；</li>
+     *   <li>agent-evicted → 读 meta：teammate 重拉 in-process；subagent 同 stopped；
+     *       meta 不存在/读失败两档分别拒（CC dSa/cSa）；</li>
+     *   <li>失败分档由 {@link #resumeStoppedAgent} 保留（v9 软化 / t2e / k9 / transcriptMissing / resume_failed）。</li>
+     * </ol>
+     *
+     * <p>CC 原文（offset 356171000 区）：{@code if((r.kind==="agent-stopped"||r.kind===
+     * "agent-stopped-by-user"||r.kind==="agent-evicted")&&pSa(r.agentId)) return Ns(...)}。
+     * 本仓「受限模式」= in-process 名册路径恒受限（无跨会话放宽分支），故该门恒生效。
+     */
+    private AgentToolResult deliverToResolvedAgent(ToolUseBlock call, String to, String agentId,
+                                                   String content, String summary,
+                                                   ToolUseContext ctx) {
+        com.nexusai.application.agent.tasks.BackgroundTask task = backgroundTaskRunner == null
+            ? null : backgroundTaskRunner.getTask(agentId).orElse(null);
+        boolean running = task != null
+            && task.status() == com.nexusai.application.agent.tasks.BackgroundTaskStatus.RUNNING;
+        com.nexusai.application.agent.subagent.RetiredAgentRegistry.RetiredAgent retired =
+            agentNameRegistry.retiredEntryById(agentId);
+        // CC Qt() roster-first：名册非 lead 名字 = teammate（不先读 taskKind）。
+        boolean teammate = isTeammateRecipient(to, agentId, ctx);
+
+        // ── 2. 停止/逐出/被用户停 三类统一先判 stoppedByPerson（CC 顺序：先于 observer）──
+        //   [lineage] 仅「后代发起、恢复其祖先」时旁路（成员→lead / 子代理→父代理），
+        //   交给下面的恢复入口（那里有同一条门的完整判据 + 配额 + 重拉）。
+        //   ⛔ 父恢复子（lead→member、主代理→子代理）不是 lineage，照样 k9。
+        //   ⛔ lineage 只由 ctx 身份 + 真实名册/账本现算。
+        boolean stoppedByPerson = stoppedByPerson(agentId, ctx);
+        boolean lineageBypass = false;
+        if (!running && stoppedByPerson) {
+            lineageBypass = teammate
+                ? lineageForTeammateResume(ctx, resolveTeamName(ctx), agentId, to)
+                : lineageForSubagentResume(ctx, agentId);
+        }
+        if (!running && stoppedByPerson && !lineageBypass) {
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .stoppedByUserSendText(to), "not_reachable");
+        }
+
+        // ── 3. observer → 不可达（CC isObserver(agentId) → not_reachable）──
+        if (agentObserverService != null && agentObserverService.isObserverAgentId(agentId)) {
+            return failure(call, "Agent \"" + to + "\" is an observer and cannot be messaged directly.",
+                "not_reachable");
+        }
+
+        // ── 4. agent-live ──
+        if (running) {
+            if (teammate) {
+                // teammate 消费点是自己的常驻 wait 循环（AutonomousAgentLoop.pendingUserMessages），
+                // ⛔ 不是 AgentNameRegistry 队列（那条只被 SubagentExecutor 子代理循环 drain）。
+                return queueToTeammateNextToolRound(call, to, agentId, content, summary, ctx);
+            }
+            return queueForNextToolRound(call, to, agentId, content, summary, ctx);
+        }
+        // ── 4b. teammate 的 stopped/evicted 一律 in-process 重拉（CC resumeInProcessTeammate），
+        //    ⛔ 不走 subagent transcript resume：teammate 的 agentId 是 name@team，不是 UUID。──
+        if (teammate) {
+            return resumeTeammate(call, to, agentId, content, ctx);
+        }
+        if (task != null) {
+            // 记录在、但不是 running（pending / 终态）：CC agent-live 分支走 resume，
+            // 并声明「若先收尾则带消息 resume」。配额/门/分档都在 ResumeService。
+            AgentToolResult resumed = resumeStoppedAgent(call, to, agentId, content, summary, ctx,
+                true);
             if (resumed != null) {
                 return resumed;
             }
         }
-        // 已注册且运行中 → 待办队列投递（CC queuePendingMessage 等价），子 agent 下一轮消费。
+
+        // ── 7. agent-evicted：task 记录已不在（退役表命中且 runner 无记录）──
+        boolean evicted = retired != null && task == null;
+        if (evicted) {
+            // 逐出的 teammate 与 stopped 走同一条 in-process 重拉（CC resumeInProcessTeammate），
+            // ⛔ 不走 subagent transcript resume。停止门 / 配额 / transcript 重放 / 成功双清
+            // 都收在 resumeTeammate 单点实现里。
+            if (teammate) {
+                return resumeTeammate(call, to, agentId, content, ctx);
+            }
+            String sessionId = ctx != null ? ctx.sessionId() : null;
+            String key = transcriptKey(agentId);
+            java.nio.file.Path dir = resolveSessionDirQuiet(sessionId);
+            if (dir != null) {
+                AgentTranscript.MetadataState state = AgentTranscript.metadataState(dir, sessionId, key);
+                if (state == AgentTranscript.MetadataState.MISSING) {
+                    return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                        .metaMissingText(agentId), "not_reachable");
+                }
+                if (state == AgentTranscript.MetadataState.UNREADABLE) {
+                    return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                        .metaUnreadableText(agentId), "not_reachable");
+                }
+                AgentTranscript.MetaExtras extras = AgentTranscript.readMetaExtras(dir, sessionId, key);
+                if (extras.teammate()) {
+                    // sidecar 说它是 teammate（roster 未命中时的兜底）：同样走 in-process 重拉。
+                    return resumeTeammate(call, to, agentId, content, ctx);
+                }
+            }
+            // taskKind === undefined → subagent → 与 agent-stopped 同一条路（CC Qt() 分流）。
+        }
+
+        // ── 5/6. agent-stopped-by-user（已被步骤 2 拦下）/ agent-stopped → resume ──
+        AgentToolResult resumed = resumeStoppedAgent(call, to, agentId, content, summary, ctx,
+            false);
+        if (resumed != null) {
+            return resumed;
+        }
+        // resume 通道未接线（plain 测试/裁剪构建）→ 保持旧的入队兜底（不静默丢消息）。
+        return queueForNextToolRound(call, to, agentId, content, summary, ctx);
+    }
+
+    /**
+     * teammate 投递 · 对齐 CC「Teammate "&lt;x&gt;" is already running; queued your message for its
+     * next turn.」/「Message queued for delivery to &lt;x&gt; at its next tool round.」
+     * （claude.exe 2.1.328 偏移 176785314 / 176801104）。
+     *
+     * <p><b>单一来源</b>：teammate 的唯一消费点是 {@link AutonomousAgentLoop#waitForNextPromptOrShutdown()}
+     * 的第 1 优先级队列 {@code pendingUserMessages}（公共入口 {@link AutonomousAgentLoop#injectUserMessage}）。
+     * ⛔ 不同时写 {@link com.nexusai.application.agent.subagent.AgentNameRegistry} 的待办队列
+     * （那条只被子代理 query loop drain，对 teammate 永远没有读者 = 静默滞留）。
+     *
+     * <p>正文按 {@link AutonomousAgentLoop#formatAsTeammateMessage} 包裹：pendingUserMessages 被
+     * 当作「user 消息纯文本」消费（不二次包裹），故发送侧必须自己带上同一份
+     * {@code <teammate-message>} 形态，使 teammate 看到的 prompt 与文件 mailbox 时代一致。
+     */
+    private AgentToolResult queueToTeammateNextToolRound(ToolUseBlock call, String to, String agentId,
+                                                         String content, String summary,
+                                                         ToolUseContext ctx) {
+        AutonomousAgentLoop loop = findTeammateLoop(agentId, null);
+        if (loop == null) {
+            // 任务记录还在 running 但 loop 不可达 = 本构建缺接线；⛔ 不静默写别处（会被当成功但永不消费）。
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode.notResumedText(
+                to, "the teammate is running but its in-process execution loop is not reachable."),
+                "resume_failed");
+        }
+        String sender = resolveSenderName(ctx);
+        String color = Teammate.getTeammateColor(identityOf(ctx));
+        loop.injectUserMessage(AutonomousAgentLoop.formatAsTeammateMessage(
+            sender, content, color, summary));
+        log.info("[SendMessageTool] teammate 按名入队（下一 tool 轮消费）: to='{}' agentId={} from={} "
+            + "消息长度={} (CC queue for next tool round)", to, agentId, sender,
+            content == null ? 0 : content.length());
+        ObjectNode out = JsonNodeFactory.instance.objectNode();
+        out.put("success", true);
+        out.put("agentId", agentId);
+        out.put("delivery", "queued");
+        out.put("message", "Message queued for delivery to " + to + " at its next tool round.");
+        return ToolResult.success(call.id(), out);
+    }
+
+    /**
+     * teammate 非运行态投递 · 对齐 CC {@code resumeInProcessTeammate}（偏移 356099332）：
+     * 读 transcript/sidecar → 同会话重新拉起 in-process teammate，并把本条消息作为它的下一轮 prompt。
+     *
+     * <p>与 subagent 的差异（CC {@code Qt()} 分流）：
+     * <ul>
+     *   <li>meta 缺失/不可读 ⛔ 不用 dSa/cSa 拒绝 —— teammate 允许
+     *       {@code (no prior transcript)} 重拉（偏移 356174861）；</li>
+     *   <li>不查 agentId 是否为 UUID（teammate 是 {@code name@team}）。</li>
+     * </ul>
+     * 重拉实现由 B3 的 {@link com.nexusai.application.agent.subagent.TeammateRelauncher} 提供
+     * （正文条数 N 的文案也在那一批）；未接线/失败 → resume_failed 分档，⛔ 不谎报成功。
+     */
+    private AgentToolResult resumeTeammate(ToolUseBlock call, String to, String agentId,
+                                           String content, ToolUseContext ctx) {
+        String sessionId = ctx != null ? ctx.sessionId() : null;
+        String name = to;
+        String teamName = resolveTeamName(ctx);
+        String agentType = null;
+        java.nio.file.Path dir = resolveSessionDirQuiet(sessionId);
+        if (dir != null && sessionId != null) {
+            AgentTranscript.MetaExtras extras =
+                AgentTranscript.readMetaExtras(dir, sessionId, transcriptKey(agentId));
+            if (extras != null) {
+                if (!blank(extras.name())) {
+                    name = extras.name();
+                }
+                if (!blank(extras.teamName())) {
+                    teamName = extras.teamName();
+                }
+                agentType = extras.agentType();
+            }
+        }
+        // ── [B3] 用户 Stop 门（k9）· 对齐 CC 偏移 333967189 / 356171000：
+        //   (meta.stoppedByUser ‖ 伴生文件 ‖ 内存 stoppedByUser) && !userInitiated && !lineage → 拒。
+        //   本入口 = 模型经 SendMessage 自动恢复 ⇒ userInitiated=false。
+        //   [lineage] 真实触发点 = team config 的 leadAgentId：lead 是成员的父 ⇒
+        //   只有「成员恢复 lead（后代发起祖先）」算血统；lead/主会话恢复成员（父恢复子）
+        //   与兄弟成员之间一律不算。⛔ 判定只读 ctx 身份 + team config，不读工具入参。
+        boolean lineage = lineageForTeammateResume(ctx, teamName, agentId, name);
+        String stopRefusal = com.nexusai.application.agent.subagent.TeammateResumeGate.refusalText(
+            dir, sessionId, agentId, name, false, lineage, stopMarkers);
+        if (stopRefusal != null) {
+            log.info("[SendMessageTool] teammate 恢复被用户停止标记拒绝: to='{}' agentId={} "
+                + "（CC AgentStoppedByUserError / k9）", to, agentId);
+            return failure(call, stopRefusal, "not_reachable");
+        }
+        if (teammateRelauncher == null) {
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .notResumedText(to, "in-process teammate relaunch is not available in this build."),
+                "resume_failed");
+        }
+        if (blank(teamName)) {
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .notResumedText(to, "the teammate has no team saved, so it cannot be started again."),
+                "resume_failed");
+        }
+        // ── [B3 配额] 会话满 → session_full（CC uSa 原文），⛔ 不排队、不发起重拉 ──
+        if (resumeQuota != null && !resumeQuota.hasRoom(sessionId)) {
+            log.info("[SendMessageTool] teammate 恢复被并发槽拒绝: to='{}' session={} occupied={}/{} "
+                + "（session_full，不排队）", to, sessionId, resumeQuota.inUse(sessionId),
+                resumeQuota.max());
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .sessionFullText(to), "session_full");
+        }
+        // ── [B3 重拉] 按 transcript 全量重建历史（CC rwe → 同一变形链）──
+        java.util.List<com.nexusai.application.agent.subagent.AgentMessage> resumeMessages =
+            com.nexusai.application.agent.subagent.ResumeService.loadTeammateResumeMessages(
+                dir, sessionId, transcriptKey(agentId));
+        com.nexusai.application.agent.subagent.TeammateRelauncher.TeammateRelaunchResult result =
+            teammateRelauncher.relaunch(name, teamName, sessionId, agentType, content, resumeMessages);
+        if (result != null && result.success()) {
+            // 恢复成功 → 双清（内存标记 + 磁盘伴生/meta；CC eKt）
+            com.nexusai.application.agent.subagent.TeammateResumeGate.clearAfterResume(
+                dir, sessionId, agentId, stopMarkers);
+            log.info("[SendMessageTool] teammate 已重拉 in-process: to='{}' name={} team={} "
+                + "newAgentId={} 重放历史={} 条", to, name, teamName, result.agentId(),
+                result.resumedMessageCount());
+            ObjectNode out = JsonNodeFactory.instance.objectNode();
+            out.put("success", true);
+            out.put("agentId", result.agentId());
+            out.put("message", teammateResumedMessage(name, result.resumedMessageCount()));
+            return ToolResult.success(call.id(), out);
+        }
+        String errorClass = result != null && result.errorClass() != null
+            ? result.errorClass() : "resume_failed";
+        String errorMessage = result != null && result.errorMessage() != null
+            ? result.errorMessage() : "the teammate could not be started again.";
+        if ("session_full".equals(errorClass)) {
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .sessionFullText(to), "session_full");
+        }
+        return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+            .notResumedText(to, errorMessage), "resume_failed");
+    }
+
+    /**
+     * teammate 恢复的 lineage 判定（只读真实名册，⛔ 不读工具入参）。
+     *
+     * <p>数据源：team config {@code leadAgentId}（{@link TeamHelpers#leadAgentId}）。
+     * lead 是每个成员的父 ⇒ 只有<b>成员恢复 lead（后代发起祖先）</b>为 lineage：
+     * <ul>
+     *   <li>发起方是<b>同队成员</b>、目标是 lead ⇒ true；</li>
+     *   <li>lead / 主会话恢复成员（父恢复子）、同队另一成员（兄弟）、不同 team / 子代理 ⇒ false。</li>
+     * </ul>
+     *
+     * @param ctx          工具上下文（身份唯一来源）
+     * @param teamName     目标 team
+     * @param targetAgentId 目标完整 agentId（name@team）
+     * @param targetName   目标名（agentId 缺失时的兜底拼装）
+     * @return true = 成员（后代）恢复 lead（祖先）
+     */
+    private boolean lineageForTeammateResume(ToolUseContext ctx, String teamName,
+                                             String targetAgentId, String targetName) {
+        if (teamHelpers == null || teamName == null || teamName.isBlank()) {
+            return false;
+        }
+        String lead = teamHelpers.leadAgentId(teamName);
+        if (lead == null || lead.isBlank()) {
+            return false;
+        }
+        String target = !blank(targetAgentId)
+            ? targetAgentId
+            : (targetName == null ? "" : targetName) + "@" + teamName;
+        TeammateIdentity self = identityOf(ctx);
+        if (self == null || blank(self.teamName())) {
+            // 主会话（即 lead 本人）/ 子代理发起：不是「成员恢复 lead」
+            return false;
+        }
+        if (!self.teamName().equals(teamName)) {
+            return false; // 跨 team 不是同一条血统
+        }
+        return com.nexusai.application.agent.subagent.AgentLineage.teammateLinked(
+            Teammate.getAgentId(self), target, lead);
+    }
+
+    /**
+     * 子代理恢复的 lineage 判定 · 父子链取会话用量账本（spawn 写入的 parentAgentId）。
+     *
+     * <p>发起方 = {@code ctx.agentId()}（orchestrator 盖章的身份）；主会话为 null
+     * （账本根节点）→ 恒不是后代。⛔ 判定完全不读工具入参。
+     *
+     * @return true = 发起方是目标的<b>后代</b>（目标在其祖先链上）；父恢复子 → false
+     */
+    private boolean lineageForSubagentResume(ToolUseContext ctx, String agentId) {
+        if (usageAccountingRegistry == null || ctx == null || agentId == null) {
+            return false;
+        }
+        com.nexusai.application.agent.cost.SessionUsageLedger ledger =
+            usageAccountingRegistry.peek(ctx.sessionId());
+        if (ledger == null) {
+            return false;
+        }
+        String initiator = ctx.agentId() != null ? ctx.agentId().toString() : null;
+        return com.nexusai.application.agent.subagent.ResumeService.computeLineage(
+            ledger, initiator, agentId, ctx.sessionId());
+    }
+
+    /**
+     * teammate 重拉成功文案 · 对齐 CC（claude.exe 2.1.328 偏移 356176932 逐字）：
+     * {@code Teammate "X" was not running; resumed it as an in-process teammate with N prior
+     * messages and your message as its next prompt.}
+     * / 无 transcript 变体 {@code ... (no prior transcript) with your message as its next prompt.}
+     *
+     * @param to 收件名（模型写的那个名字）
+     * @param n  实际重放的 transcript 条数（与传给 relauncher 的列表长度同源）
+     */
+    static String teammateResumedMessage(String to, int n) {
+        String middle = n > 0
+            ? "with " + n + " prior messages and your message as its next prompt."
+            : "(no prior transcript) with your message as its next prompt.";
+        return "Teammate \"" + to + "\" was not running; resumed it as an in-process teammate "
+            + middle;
+    }
+
+    /**
+     * 「这个收件名是 teammate 吗」· 对齐 CC {@code Qt()}（偏移 356127769 / 356099285）的
+     * roster-first 判类：
+     * <ol>
+     *   <li>团队名册里命中且不是 {@code team-lead} ⇒ teammate（不先读 sidecar taskKind）；</li>
+     *   <li>否则看活体：本会话 registry 有该 agentId 的 loop，或任务类型是
+     *       {@code IN_PROCESS_TEAMMATE}（覆盖 kill 已从名册移除、30s 展示窗口内的情形）。</li>
+     * </ol>
+     * 都没有 ⇒ 按 subagent（旧的 transcript resume 路径，零变化）。
+     */
+    private boolean isTeammateRecipient(String to, String agentId, ToolUseContext ctx) {
+        String candidate = MessageRecipientResolver.stripNoRefMarker(to);
+        if (!blank(candidate) && !"team-lead".equals(PeerAddressing.normalizeName(candidate))) {
+            String teamName = resolveTeamName(ctx);
+            if (memberHit(teamMemberNames(teamName, ctx), candidate)) {
+                return true;
+            }
+        }
+        if (agentId == null) {
+            return false;
+        }
+        if (findTeammateLoop(agentId, null) != null) {
+            return true;
+        }
+        return backgroundTaskRunner != null && backgroundTaskRunner.getTask(agentId)
+            .map(t -> t.type() == com.nexusai.application.agent.tasks.TaskType.IN_PROCESS_TEAMMATE)
+            .orElse(false);
+    }
+
+    private AgentToolResult queueForNextToolRound(ToolUseBlock call, String to, String agentId,
+                                                  String content, String summary,
+                                                  ToolUseContext ctx) {
         // [agent-notice] 入队即生成稳定 ID，并携带来源/摘要/会话：子 agent 消费时落成一条
         //   user 消息（author=from, subtype=agent_message, isMeta=true），前端据此显示通知条。
         String sender = resolveSenderName(ctx);
@@ -691,15 +1334,273 @@ public class SendMessageTool implements Tool {
         agentNameRegistry.queue(agentId,
             ctx != null ? ctx.sessionId() : null, sender, content, summary, origin);
         if (log.isDebugEnabled()) {
-            log.debug("[SendMessageTool] [IMP-G4 C7] in-process 子代理按名路由: to='{}' agentId={} "
-                    + "from={} origin={} 消息长度={} 已入待办队列 (CC SendMessageTool.ts:800-813 queuePendingMessage)",
-                to, agentId, sender, origin, content == null ? 0 : content.length());
+            log.debug("[SendMessageTool] in-process 子代理按名路由: to='{}' agentId={} from={} origin={} "
+                    + "消息长度={} 已入待办队列 (CC queuePendingMessage)", to, agentId, sender, origin,
+                content == null ? 0 : content.length());
         }
         ObjectNode out = JsonNodeFactory.instance.objectNode();
         out.put("success", true);
-        out.put("message", "Message queued for delivery to " + to
-                + " at its next tool round.");
+        out.put("message", "Message queued for delivery to " + to + " at its next tool round."
+            + RESUME_ON_FINISH_HINT);
         return ToolResult.success(call.id(), out);
+    }
+
+    /** 停止意图判定（内存标记 → 退役记录 → 磁盘伴生/meta）· 异常即「视为已停」（CC pSa ??!0）。 */
+    private boolean stoppedByPerson(String agentId, ToolUseContext ctx) {
+        try {
+            if (stopMarkers != null && stopMarkers.isStopped(agentId)) {
+                return true;
+            }
+            com.nexusai.application.agent.subagent.RetiredAgentRegistry.RetiredAgent r =
+                agentNameRegistry != null ? agentNameRegistry.retiredEntryById(agentId) : null;
+            if (r != null && r.stoppedByUser()) {
+                return true;
+            }
+            String sessionId = ctx != null ? ctx.sessionId() : null;
+            java.nio.file.Path dir = resolveSessionDirQuiet(sessionId);
+            if (dir == null) {
+                return false;
+            }
+            String key = transcriptKey(agentId);
+            return AgentTranscript.isStoppedByUserOrMeta(dir, sessionId, key)
+                || AgentTranscript.isStoppedByUserOrMeta(dir, sessionId, agentId);
+        } catch (Exception e) {
+            // CC pSa: catch → ??!0（缺省/异常 = 拒绝）
+            return true;
+        }
+    }
+
+    private java.nio.file.Path resolveSessionDirQuiet(String sessionId) {
+        if (sessionId == null || sessionId.isBlank()) {
+            return null;
+        }
+        try {
+            java.util.function.Function<String, java.nio.file.Path> resolver = sessionDirResolver;
+            return resolver != null ? resolver.apply(sessionId) : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** agentId 的 transcript 键（a+16hex 原样；其它形态原样，旧 UUID 键不再还原 —— Breaking）。 */
+    private static String transcriptKey(String agentId) {
+        String canonical = com.nexusai.application.agent.subagent.AgentContext.canonicalAgentId(agentId);
+        return canonical != null ? canonical : agentId;
+    }
+
+    /** 分档失败回执（degradedClass 保留 CC 的档名，⛔ 不压成一句 Could not resume）。 */
+    private AgentToolResult failure(ToolUseBlock call, String message, String degradedClass) {
+        ObjectNode out = JsonNodeFactory.instance.objectNode();
+        out.put("success", false);
+        if (degradedClass != null) {
+            out.put("degradedClass", degradedClass);
+        }
+        out.put("message", message);
+        return ToolResult.success(call.id(), out);
+    }
+
+    /** 跨会话投递（失败一律 Error，不假成功、不落 mailbox）。 */
+    private AgentToolResult deliverCrossSession(ToolUseBlock call,
+                                                MessageRecipientResolver.Target target,
+                                                String content, String summary,
+                                                boolean notifyWhenIdle, ToolUseContext ctx) {
+        // 可达性口径（⛔ 本方法不另做判定，避免第三套真源）：
+        //   ① MessageRecipientResolver 已按 DB 判存在（记录在且未删；删除即拒），
+        //      并在缺 endpoint 时按需登记；② 代次 / accepting 由 router 再核一次。
+        //   故这里拿到的 sessionId + endpointEpoch 已是可投递快照（DB-only 会话此时已被唤醒登记）。
+        if (peerMessageRouter == null) {
+            return ToolResult.error(call.id(),
+                "Error: cross-session messaging is not wired in this build");
+        }
+        String sourceSessionId = ctx != null ? ctx.sessionId() : null;
+        if (sourceSessionId == null || sourceSessionId.isBlank()) {
+            return ToolResult.error(call.id(), "Error: cannot determine source session for cross-session send");
+        }
+        // [ref 门] 判类/解析之后、任何投递副作用之前：pin → 冒充。失败 = Error 且零投递。
+        String gateFailure = preSendGateFailure(target, sourceSessionId);
+        if (gateFailure != null) {
+            return ToolResult.error(call.id(), "Error: " + gateFailure);
+        }
+        PermissionMode sourceMode = ctx.permissionMode() != null ? ctx.permissionMode() : ctx.mode();
+        String sourceName = resolveSenderName(ctx);
+        String sourceAddress = PeerAddressing.formatAddress(sourceName, sourceSessionId);
+        // [hop 链传播] 回复 peer 时必须把入站链带上（prior + 本段），否则 A→B→A 往返链永远只有一段、
+        //   自环/链长判定在生产不可达。来源唯一 = 服务端类型化载体 ctx.peerExecutionOrigin()
+        //   （⛔ 不读模型正文 / structuredOutput / 前端自报）。
+        List<String> inboundHopChain = inboundHopChain(ctx);
+        // 同会话记录投递（子代理 / teammate → 主会话）：target 与 source 是同一个会话记录，
+        // 但发送方不是主会话本身（selfSent 在 routeTextMessage 已拦）。路由层据此跳过刹车/限速/
+        // hop 自环与入站 hold（这不是「别人发来的消息」），信封 admission=auto/self-sent。
+        boolean sameSessionDelivery = sourceSessionId.equals(target.sessionId());
+        PeerMessageRouter.SendRequest request = new PeerMessageRouter.SendRequest(
+            target.sessionId(), target.endpointEpoch(), target.displayName(),
+            sourceSessionId, sourceName, sourceAddress, content, summary,
+            notifyWhenIdle, sameSessionDelivery, inboundHopChain);
+        PeerMessageRouter.Receipt receipt = peerMessageRouter.send(request, sourceMode);
+
+        switch (receipt.status()) {
+            case ACCEPTED: {
+                // [SendMessage 成功回执对齐 CC 2.1.328] 跨会话成功 = 一句话回执（与 CC 实测同形）：
+                //   首行 "sent to <address> — another Claude session on this machine"，
+                //   第二行 "message_id: <id>" 保留排查线索。
+                //   <address> 用 ListAgents 的可回信地址（name / name [ref]），模型可直接回填 to。
+                //   ⛔ 不声称「模型已处理」——只说明已发到本机另一个会话（目标在安全轮界自行排队执行）。
+                //   自投递（主会话 → 自己）已在 routeTextMessage 直接拒绝，这里没有「自投递回执」。
+                StringBuilder message = new StringBuilder()
+                    .append("sent to ").append(replyableAddress(target))
+                    .append(" \u2014 another Claude session on this machine")
+                    .append('\n').append("message_id: ").append(receipt.messageId());
+                if (receipt.idleSubscription() != null) {
+                    message.append('\n').append("idle_subscription: ")
+                        .append(receipt.idleSubscription());
+                }
+                return ToolResult.success(call.id(), message.toString());
+            }
+            case HELD:
+                return ToolResult.error(call.id(), "Error: message held for approval (message_id="
+                    + receipt.messageId() + "): " + receipt.detail());
+            case REFUSED:
+                return ToolResult.error(call.id(), "Error: message refused by the receiving session: "
+                    + receipt.detail());
+            case LOOP_REJECTED:
+                return ToolResult.error(call.id(), "Error: hop-loop — message rejected to avoid a "
+                    + "peer messaging loop: " + receipt.detail());
+            case HOP_RUNAWAY:
+                return ToolResult.error(call.id(), "Error: hop-runaway — message rejected because the "
+                    + "peer relay chain is too long: " + receipt.detail());
+            case NOT_WIRED:
+                return ToolResult.error(call.id(),
+                    "Error: cross-session delivery is not wired in this build");
+            default:
+                return ToolResult.error(call.id(), "Error: cross-session delivery failed ("
+                    + receipt.status() + "): " + receipt.detail());
+        }
+    }
+
+    /**
+     * 发送前两道 ref 门 · 对齐 CC 2.1.328（顺序 = pin 先、冒充后）。
+     *
+     * <ol>
+     *   <li><b>pin</b>（exe 356121546 {@code Lt} / 356149269）：写入地址的方括号 ref 是 pinned 形态
+     *       （{@code session_}/{@code cse_}/{@code local_}，CC {@code $Ut}）时，该 ref 必须是本会话
+     *       ListAgents <b>实际打印过</b>的行，且写入地址要逐字等于 {@code <打印的名字> [<ref>]}。
+     *       否则原文：{@link PeerAddressing#PIN_FAILURE}。短 hex ref（6..12）不走这条。
+     *       <p>CC 原文：{@code if(Lt(Is(v,o.toolUseId)?.writtenTo,e.to,o.session)) return {data:{success:!1,
+     *       message:`Not sent: ${Su} has not listed that session id in this session, or last listed it
+     *       under another name. Call ${Su} and copy the name and brackets as printed.`}}}（{@code Su="ListAgents"}）。</li>
+     *   <li><b>冒充</b>（exe 355937466 {@code CKn}/{@code RKn}）：写入 ref 命中本进程自身广告的
+     *       session 身份（{@code oxi(ref, ownMessagingSocket)}），但解析出的目标不是自己
+     *       （{@code !Apn(sock)}）⇒ 原文 {@link PeerAddressing#IMPERSONATION_FAILURE_TEMPLATE}。</li>
+     * </ol>
+     *
+     * @param target          已解析的收件目标（{@code raw()} = 模型写入的原始 to）
+     * @param sourceSessionId 发送方会话
+     * @return 失败原文；null = 放行
+     */
+    private String preSendGateFailure(MessageRecipientResolver.Target target, String sourceSessionId) {
+        if (target == null) {
+            return null;
+        }
+        String writtenTo = target.raw();
+        String pinnedRef = PeerAddressing.pinnedRef(writtenTo);
+        if (pinnedRef != null) {
+            // fail-closed：没有 pin 集合（未接线/新进程）时无法证明列过 ⇒ 拒。
+            String listedName = refPins == null ? null : refPins.listedName(sourceSessionId, pinnedRef);
+            String normalized = writtenTo == null ? "" : writtenTo.trim();
+            if (listedName == null || !normalized.equals(listedName + " [" + pinnedRef + "]")) {
+                return PeerAddressing.PIN_FAILURE;
+            }
+        }
+        if (PeerAddressing.advertisesSelf(writtenTo, sourceSessionId)) {
+            String resolvedSessionId = target.sessionId();
+            if (resolvedSessionId != null && !resolvedSessionId.equals(sourceSessionId)) {
+                return PeerAddressing.impersonationFailure(writtenTo);
+            }
+        }
+        return null;
+    }
+
+    /**
+     * 跨会话成功回执里的目标地址 · 与 ListAgents 的「可回信地址」同形
+     * （{@code name}，有 ref 时 {@code name [ref]}）——模型可原样回填 {@code to}。
+     *
+     * @param target 解析出的收件目标
+     * @return 可回信地址（永不返回 null）
+     */
+    private static String replyableAddress(MessageRecipientResolver.Target target) {
+        String name = target.displayName();
+        if (name == null || name.isBlank()) {
+            name = target.sessionId();
+        }
+        if (name == null || name.isBlank()) {
+            name = target.raw();
+        }
+        String ref = target.ref();
+        if (ref != null && !ref.isBlank()) {
+            return name + " [" + ref + "]";
+        }
+        return name == null ? "" : name;
+    }
+
+    /**
+     * 当前回合的入站 hop 链（无 peer 来源 → 空链）。
+     *
+     * @param ctx 工具上下文（可为 null）
+     * @return 不可变 prior 链
+     */
+    private static List<String> inboundHopChain(ToolUseContext ctx) {
+        if (ctx == null) {
+            return List.of();
+        }
+        com.nexusai.application.agent.messaging.PeerExecutionOrigin origin = ctx.peerExecutionOrigin();
+        if (origin == null || origin.hopChain() == null) {
+            return List.of();
+        }
+        return origin.hopChain();
+    }
+
+    /**
+     * 结构化消息发往跨会话地址 → 明确 Error（禁止把 shutdown/plan 当用户批复）。
+     *
+     * @return 错误结果；非跨会话地址 → null
+     */
+    private AgentToolResult rejectStructuredCrossSession(ToolUseBlock call, String to,
+                                                         ToolUseContext ctx) {
+        // 顺序：先判「发给自身」（主会话 → 自己的地址 ⇒ CC 原文，零投递/零 mailbox），
+        // 再判普通跨会话地址。子代理 / teammate 发回主会话不属于「自身」分支。
+        if (recipientResolver != null) {
+            String sourceSessionId = ctx != null ? ctx.sessionId() : null;
+            String teamName = resolveTeamName(ctx);
+            MessageRecipientResolver.Target target = recipientResolver.resolve(
+                new MessageRecipientResolver.Request(to, sourceSessionId, teamName,
+                    teamName != null && !teamName.isBlank(),
+                    teamMemberNames(teamName, ctx), senderAgentId(ctx)));
+            if (target.selfSent()) {
+                return selfAddressError(call, to);
+            }
+            if (target.kind() == MessageRecipientResolver.Kind.NAME_SESSION
+                || target.kind() == MessageRecipientResolver.Kind.SESSION
+                || target.kind() == MessageRecipientResolver.Kind.MAIN
+                || target.kind() == MessageRecipientResolver.Kind.UNSUPPORTED_REMOTE) {
+                return ToolResult.error(call.id(),
+                    "Error: structured messages cannot be sent to a cross-session address");
+            }
+            if (target.kind() == MessageRecipientResolver.Kind.AMBIGUOUS) {
+                return ToolResult.error(call.id(), "Error: " + target.errorMessage());
+            }
+            return null;
+        }
+        if (isSelfAddressWithoutResolver(to, ctx)) {
+            return selfAddressError(call, to);
+        }
+        PeerAddressing.Kind kind = PeerAddressing.classify(to).kind();
+        if (kind == PeerAddressing.Kind.SESSION
+            || kind == PeerAddressing.Kind.MAIN
+            || kind == PeerAddressing.Kind.NEXUS_SESSION) {
+            return ToolResult.error(call.id(),
+                "Error: structured messages cannot be sent to a cross-session address");
+        }
+        return null;
     }
 
     /** agent 是否仍在运行（taskId === agentId）。无法判定 → 视为运行中（保持旧的入队行为）。 */
@@ -713,9 +1614,24 @@ public class SendMessageTool implements Tool {
             .orElse(false);
     }
 
-    /** 已停止 agent 的 resume · 对齐 CC：「a send resumes it from its transcript」。 */
+    /**
+     * 已停止 agent 的 resume · 对齐 CC「a send resumes it from its transcript」。
+     *
+     * <p><b>失败分档（五档，⛔ 不压成一句 {@code Could not resume}）</b>：
+     * <ul>
+     *   <li>v9（already running / resuming）→ <b>软化</b>：不报错，把消息挂到对方下一轮
+     *       {@code "<name> is already waking; message queued for its next tool round
+     *       (not delivered if the agent turns out to have been stopped)."}</li>
+     *   <li>t2e → {@code still_stopping}（含「调用方自己被停」文案）；</li>
+     *   <li>k9 → {@code not_reachable}（k9 原文）；</li>
+     *   <li>transcriptMissing → {@code no_transcript}；</li>
+     *   <li>其他 → {@code resume_failed}。</li>
+     * </ul>
+     * 回执字段 {@code degradedClass} 与 CC 遥测档同名（{@code Ks}，偏移 356128040）。
+     */
     private AgentToolResult resumeStoppedAgent(ToolUseBlock call, String to, String agentId,
-                                               String content, ToolUseContext ctx) {
+                                               String content, String summary, ToolUseContext ctx,
+                                               boolean declareOnFinish) {
         if (resumeServiceProvider == null) {
             return null;
         }
@@ -724,32 +1640,99 @@ public class SendMessageTool implements Tool {
         if (resume == null) {
             return null;
         }
-        java.util.UUID uuid =
+        String resumeKey =
             com.nexusai.application.agent.subagent.ResumeService.parseAgentIdString(agentId);
         String sessionId = ctx != null ? ctx.sessionId() : null;
-        if (uuid == null || sessionId == null || sessionId.isBlank()) {
+        if (resumeKey == null || sessionId == null || sessionId.isBlank()) {
             return null;
+        }
+        // t2e 的另一半：调用方自己已请求停止且尚未退出 → 它不能再恢复别人（CC 原文逐字）。
+        String callerAgentId = ctx != null && ctx.agentId() != null ? ctx.agentId().toString() : null;
+        if (callerAgentId != null && backgroundTaskRunner != null
+                && backgroundTaskRunner.isStopPending(callerAgentId)) {
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .callerStoppedText(), "still_stopping");
         }
         try {
             // 模型发起的自动 resume（非用户显式）：用户 TaskStop 过的 agent 会被 stoppedByUser 门拒绝
             // （对齐 CC J=false → AgentStoppedByUserError）。
-            resume.resumeAgentBackground(uuid, content,
-                com.nexusai.application.agent.subagent.ResumeService.resolveSessionDir(sessionId),
-                sessionId, null, false);
+            java.nio.file.Path sessionDir = resolveSessionDirQuiet(sessionId);
+            if (sessionDir == null) {
+                sessionDir = com.nexusai.application.agent.subagent.ResumeService
+                    .resolveSessionDir(sessionId);
+            }
+            // [lineage] 血统由 ResumeService 按「发起方 agentId + 会话用量账本里的父子链」现算
+            //   （对齐 CC 偏移 333967189：lineage 存在 → 跳过 stoppedByUser 探测与 k9）。
+            //   ⛔ callerAgentId 来自 ToolUseContext（orchestrator 盖章），不由工具入参自报。
+            resume.resumeAgentBackgroundForLineage(agentId, content, sessionDir, sessionId, null, false,
+                callerAgentId);
             ObjectNode out = JsonNodeFactory.instance.objectNode();
             out.put("success", true);
-            out.put("message", "Resumed " + to + " from its transcript and delivered the message.");
+            out.put("resumedAgentId", agentId);
+            out.put("revivedAgentId", agentId);
+            // CC 成功文案逐字：`Resuming agent <name7>`（ws() 把名字截 7 位，偏移 356128040）。
+            out.put("message", "Resuming agent " + shortAgentName(to)
+                + (declareOnFinish ? RESUME_ON_FINISH_HINT : ""));
             log.info("[SendMessageTool] [agent-resume-align] 已停止子代理按名热启动: to={} agentId={}",
                 to, agentId);
             return ToolResult.success(call.id(), out);
+        } catch (com.nexusai.application.agent.subagent.ResumeErrorCode.ResumeTranscriptMissingException e) {
+            log.warn("[SendMessageTool] resume 无 transcript to={} agentId={}: {}", to, agentId, e.getMessage());
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .transcriptMissingText(to, agentId), "no_transcript");
+        } catch (com.nexusai.application.agent.subagent.ResumeErrorCode.ResumeException e) {
+            return failureForResumeError(call, to, agentId, content, summary, ctx, e);
         } catch (Exception e) {
-            log.warn("[SendMessageTool] resume 已结束子代理失败 to={} agentId={}: {}",
-                to, agentId, e.toString());
-            ObjectNode out = JsonNodeFactory.instance.objectNode();
-            out.put("success", false);
-            out.put("message", "Could not resume " + to + ": " + e.getMessage());
-            return ToolResult.success(call.id(), out);
+            log.warn("[SendMessageTool] resume 已结束子代理失败 to={} agentId={}: {}", to, agentId, e.toString());
+            return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                .notResumedText(to, e.getMessage()), "resume_failed");
         }
+    }
+
+    /** 按 {@link com.nexusai.application.agent.subagent.ResumeErrorCode} 分档（v9 走软化入队）。 */
+    private AgentToolResult failureForResumeError(ToolUseBlock call, String to, String agentId,
+                                                  String content, String summary, ToolUseContext ctx,
+                                                  com.nexusai.application.agent.subagent.ResumeErrorCode.ResumeException e) {
+        com.nexusai.application.agent.subagent.ResumeErrorCode code = e.errorCode();
+        log.warn("[SendMessageTool] resume 分档失败 to={} agentId={} code={} detail={}",
+            to, agentId, code, e.getMessage());
+        switch (code) {
+            case AGENT_STOPPED_BY_USER:
+                return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                    .stoppedByUserSendText(to), "not_reachable");
+            case SUBAGENT_RESUME_STILL_STOPPING:
+                return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                    .stillStoppingText(agentId), "still_stopping");
+            case SESSION_FULL:
+                return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                    .sessionFullText(to), "session_full");
+            case SUBAGENT_RESUME_ALREADY_RUNNING: {
+                // v9 软化：CC 捕获 v9 后不报错，改投 pendingMessages（下一轮工具轮消费），
+                //   并明确「若它其实已被停则不投递」。
+                String sender = resolveSenderName(ctx);
+                String origin = Teammate.isTeammate(identityOf(ctx)) ? "peer" : "coordinator";
+                agentNameRegistry.queue(agentId, ctx != null ? ctx.sessionId() : null,
+                    sender, content, summary, origin);
+                ObjectNode out = JsonNodeFactory.instance.objectNode();
+                out.put("success", true);
+                out.put("message", com.nexusai.application.agent.subagent.ResumeErrorCode
+                    .alreadyWakingText(to));
+                return ToolResult.success(call.id(), out);
+            }
+            case SUBAGENT_RESUME_RESUMES_SPENT:
+                return failure(call, e.getMessage(), "resume_failed");
+            default:
+                return failure(call, com.nexusai.application.agent.subagent.ResumeErrorCode
+                    .notResumedText(to, e.getMessage()), "resume_failed");
+        }
+    }
+
+    /** CC {@code ws()}：a+16hex 截 7 位，其余原样。 */
+    private static String shortAgentName(String name) {
+        if (name == null) {
+            return "";
+        }
+        return name.matches("a[0-9a-fA-F]{16}") ? name.substring(0, 7) : name;
     }
 
     /**
@@ -802,73 +1785,6 @@ public class SendMessageTool implements Tool {
     }
 
     /**
-     * 广播 · 对齐 CC handleBroadcast（SendMessageTool.ts:191-266）。
-     *
-     * <p><b>IMP-G2 ⊕-12</b>：收件人 = {@code teamFile.members} 的 name（排除 sender，大小写不敏感，
-     * :220-226），非旧 {@code member_*} 文件枚举。team context 必填（:199-203）且 team 文件存在
-     * （:205-208）；无成员 → {@code {success, message:'No teammates to broadcast to...', recipients:[]}}
-     * （:228-236）；输出 {@code {success, message, recipients[], routing}}（:252-265）。
-     */
-    private AgentToolResult handleBroadcast(ToolUseBlock call, String content, String summary,
-                                            ToolUseContext ctx) {
-        String teamName = resolveTeamName(ctx);
-        if (teamName == null || teamName.isBlank()) {
-            // CC :199-203 无 team context → 拒绝
-            return ToolResult.error(call.id(),
-                    "Not in a team context. Create a team with Teammate spawnTeam first, or set CLAUDE_CODE_TEAM_NAME.");
-        }
-        if (!teamHelpers.teamExists(teamName)) {
-            // CC :205-208 team 文件不存在 → 拒绝
-            return ToolResult.error(call.id(), "Team \"" + teamName + "\" does not exist");
-        }
-        String senderName = resolveSenderName(ctx);
-        String senderColor = Teammate.getTeammateColor(identityOf(ctx));
-
-        // CC :220-226 recipients = members.filter(m => m.name.toLowerCase() !== senderName.toLowerCase())
-        List<String> recipients = teamHelpers.listMemberNames(teamName).stream()
-                .filter(m -> !m.equalsIgnoreCase(senderName))
-                .toList();
-
-        if (recipients.isEmpty()) {
-            // CC :228-236 无成员可广播
-            return ToolResult.success(call.id(),
-                    "{\"success\":true,\"message\":\"No teammates to broadcast to (you are the only team member)\",\"recipients\":[]}");
-        }
-
-        for (String recipientName : recipients) {
-            try {
-                TeammateMailbox.writeToMailbox(recipientName,
-                        new TeammateMailbox.TeammateMessage(senderName, content,
-                                TeammateMailbox.isoNow(), false, senderColor, summary),
-                        teamName);
-            } catch (IllegalStateException | IllegalArgumentException e) {
-                log.warn("[SendMessageTool] broadcast 写 {} inbox 失败: {}", recipientName, e.getMessage());
-            }
-        }
-        log.info("[SendMessageTool] broadcast from={} to {} teammates in team={}", senderName, recipients.size(), teamName);
-        // [team-frontend-channel B1] 广播写 inbox 完成 → 出站 topic（to="*" 一条，团队广播语义）
-        publishTeammateMessage(teamName, senderName, "*", content, summary, senderColor);
-
-        ObjectNode out = JsonNodeFactory.instance.objectNode();
-        out.put("success", true);
-        out.put("message", "Message broadcast to " + recipients.size() + " teammate(s): "
-                + String.join(", ", recipients));
-        ArrayNode recips = out.putArray("recipients");
-        recipients.forEach(recips::add);
-        ObjectNode routing = out.putObject("routing");
-        routing.put("sender", senderName);
-        if (senderColor != null) {
-            routing.put("senderColor", senderColor);
-        }
-        routing.put("target", "@team");
-        if (summary != null) {
-            routing.put("summary", summary);
-        }
-        routing.put("content", content);
-        return ToolResult.success(call.id(), out.toString());
-    }
-
-    /**
      * [team-frontend-channel B1] teammate 消息出站 · writeToMailbox 后统一推送
      * {@code /topic/sessions/{leadSessionId}/team-messages}（leadSessionId 从 team config 反查，
      * 只推给创建者会话；design doc §2.2 方案 A outboundEvent）。
@@ -884,7 +1800,7 @@ public class SendMessageTool implements Tool {
      *
      * @param teamName 目标 team（teamContext.teamName）
      * @param from     发送方 agent 名
-     * @param to       收件名（单播 = 收件 agent 名；广播 = "*"）
+     * @param to       收件名（单播 = 收件 agent 名）
      * @param text     消息文本
      * @param summary  UI 预览摘要（可空）
      * @param color    发送方颜色（可空）
@@ -1294,6 +2210,90 @@ public class SendMessageTool implements Tool {
      */
     private static TeammateIdentity identityOf(ToolUseContext ctx) {
         return ctx != null ? ctx.teammateIdentity() : null;
+    }
+
+    /**
+     * 团队名册收件人集合 · 对齐 CC resolver 的 mailbox 前置校验（exe `me(...)`：名册命中才 mailbox）。
+     *
+     * <p>来源三处合并：{@code teamContext.teammates}（会话列 / 同轮 appState）、team config
+     * members（{@link TeamHelpers#listMemberNames}）、{@code team-lead}（CC 对 {@code n===nd}
+     * 直接走 mailbox）。无 team → 空列表（不存在可写的 inbox）。
+     *
+     * @param teamName team 名（null/空白 → 空）
+     * @param ctx      工具上下文
+     * @return 名册名（保持发现顺序，去重）
+     */
+    @SuppressWarnings("unchecked")
+    private List<String> teamMemberNames(String teamName, ToolUseContext ctx) {
+        if (teamName == null || teamName.isBlank()) {
+            return List.of();
+        }
+        List<String> names = new ArrayList<>();
+        names.add(SwarmConstants.TEAM_LEAD_NAME);
+        Map<String, Object> teamContext = readTeamContext(ctx);
+        if (teamContext != null) {
+            Object mates = teamContext.get("teammates");
+            if (mates instanceof Map<?, ?> map) {
+                for (Object value : map.values()) {
+                    if (value instanceof Map<?, ?> member) {
+                        Object name = member.get("name");
+                        if (name instanceof String s && !s.isBlank() && !names.contains(s)) {
+                            names.add(s);
+                        }
+                    }
+                }
+            }
+        }
+        try {
+            for (String member : teamHelpers.listMemberNames(teamName)) {
+                if (member != null && !member.isBlank() && !names.contains(member)) {
+                    names.add(member);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[SendMessageTool] 读团队名册失败 team={}（按已收集项继续校验）: {}",
+                teamName, e.getMessage());
+        }
+        return names;
+    }
+
+    /** 收件名是否命中团队名册（归一化比较，与 {@code Request#hasTeamMember} 同规则）。 */
+    private static boolean memberHit(List<String> memberNames, String to) {
+        if (memberNames == null || memberNames.isEmpty() || to == null || to.isBlank()) {
+            return false;
+        }
+        String normalized = PeerAddressing.normalizeName(to);
+        for (String member : memberNames) {
+            if (member != null && PeerAddressing.normalizeName(member).equals(normalized)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * 未命中收件人回执 · 对齐 CC exe not-found 分支：
+     * {@code No agent named 'X' is reachable. Did you mean: a, b?}；无候选时给拼写/后台 agent id 指引。
+     * 候选池 = 团队名册 + 本会话已注册子代理名（共用 {@link MessageRecipientResolver#closestNames}）。
+     */
+    private String noAgentNamed(String to, List<String> teamMemberNames, ToolUseContext ctx) {
+        List<String> pool = new ArrayList<>();
+        if (teamMemberNames != null) {
+            pool.addAll(teamMemberNames);
+        }
+        if (agentNameRegistry != null) {
+            String owner = ctx != null ? ctx.sessionId() : null;
+            for (var entry : agentNameRegistry.entriesForOwner(owner)) {
+                pool.add(entry.name());
+            }
+        }
+        List<String> candidates = MessageRecipientResolver.closestNames(to, pool, 5);
+        if (candidates.isEmpty()) {
+            return "No agent named '" + to + "' is reachable. "
+                + "Check the spelling, or use the agent ID from a background agent's spawn result.";
+        }
+        return "No agent named '" + to + "' is reachable. Did you mean: "
+            + String.join(", ", candidates) + "?";
     }
 
     /**

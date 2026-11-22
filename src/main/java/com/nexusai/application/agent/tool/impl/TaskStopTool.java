@@ -32,6 +32,27 @@ public class TaskStopTool extends AbstractTaskTool {
     @Autowired(required = false)
     private BackgroundTaskRunner backgroundTaskRunner;
 
+    /**
+     * [stop-double-write] 内存停止标记（CC {@code Fat}）+ 退役表反查会话（写磁盘伴生文件用）。
+     * 见 {@link #recordStopIntentForMissingAgent(String)}。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.subagent.StopMarkers stopMarkers;
+
+    @Autowired(required = false)
+    private com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry;
+
+    /** 测试/接线用 setter。 */
+    public void setStopMarkers(com.nexusai.application.agent.subagent.StopMarkers stopMarkers) {
+        this.stopMarkers = stopMarkers;
+    }
+
+    /** 测试/接线用 setter。 */
+    public void setAgentNameRegistry(
+            com.nexusai.application.agent.subagent.AgentNameRegistry agentNameRegistry) {
+        this.agentNameRegistry = agentNameRegistry;
+    }
+
     @Override
     public String name() {
         return NAME;
@@ -194,8 +215,11 @@ public class TaskStopTool extends AbstractTaskTool {
             return ValidationResult.fail("1", "Missing required parameter: task_id");
         }
         if (backgroundTaskRunner != null) {
+            // [B3] 统一读口 = 本地 tasks ∪ 统一 store（TaskFrameworkService）。改前只查本地地图
+            //   ⇒ teammate / monitor / 主会话后台化任务在 validateInput 阶段被误报
+            //   「No task found」（CC appState.tasks 同一张表，无此分叉）。
             java.util.Optional<com.nexusai.application.agent.tasks.BackgroundTask> task =
-                    backgroundTaskRunner.getTask(taskId);
+                    backgroundTaskRunner.findTask(taskId);
             if (task.isEmpty()) {
                 // CC :74-80 No task found with ID: ${id}（errorCode 1）
                 return ValidationResult.fail("1", "No task found with ID: " + taskId);
@@ -257,6 +281,10 @@ public class TaskStopTool extends AbstractTaskTool {
         BackgroundTaskRunner.StopTaskResult result = backgroundTaskRunner.stopTask(taskId);
         if (!result.ok()) {
             if (result.errorCode() == BackgroundTaskRunner.StopTaskErrorCode.NOT_FOUND) {
+                // [stop-double-write] 对齐 CC {@code z8e()}（偏移 334309920）：任务记录已没了，
+                //   但 task_id 形如 agentId 时仍要记下「用户想停它」——否则它可能从 transcript
+                //   被自动复活。CC 写完标记后<b>正常返回</b>（不回滚成别的错误）。
+                recordStopIntentForMissingAgent(taskId);
                 // CC TaskStopTool.ts:74-79 validateInput errorCode 1
                 return ToolResult.error(call.id(), "No task found with ID: " + taskId);
             }
@@ -277,5 +305,63 @@ public class TaskStopTool extends AbstractTaskTool {
         out.put("command", command);
         log.info("TaskStopTool: stopped task {} type={}", taskId, result.taskType());
         return ToolResult.success(call.id(), out.toString());
+    }
+
+    /**
+     * TaskStop 命中 not-found 时补写「用户停止」意图 · 对齐 CC {@code z8e()}（偏移 334309920）：
+     * {@code catch(code==="not_found" && km(id)!==null) → Z3t(...,"stoppedByUser", ...)}。
+     *
+     * <p>双写：内存 {@link com.nexusai.application.agent.subagent.StopMarkers#markStopped}
+     * （幂等，不重复自增）+ 磁盘 {@code <agentId>.stopped-by-user}（由退役表反查所属会话；
+     * 查不到会话时只记内存，不凭空在用户目录外建文件）。
+     */
+    private void recordStopIntentForMissingAgent(String taskId) {
+        if (!looksLikeAgentId(taskId)) {
+            return;
+        }
+        try {
+            if (stopMarkers != null) {
+                stopMarkers.markStopped(taskId);
+            }
+            String owner = null;
+            if (agentNameRegistry != null) {
+                com.nexusai.application.agent.subagent.RetiredAgentRegistry.RetiredAgent r =
+                    agentNameRegistry.retiredEntryById(taskId);
+                if (r != null) {
+                    owner = r.ownerSessionId();
+                }
+            }
+            if (owner == null || owner.isBlank()) {
+                log.info("[TaskStopTool] not-found 停止意图已记内存（无会话可定位磁盘标记）: {}", taskId);
+                return;
+            }
+            // a+16hex 原样作为 transcript 键（旧 UUID 键不再还原 —— Breaking，按 CC 单一形态）。
+            String hex = taskId;
+            java.nio.file.Path sessionDir =
+                com.nexusai.application.agent.subagent.ResumeService.resolveSessionDir(owner);
+            com.nexusai.application.agent.subagent.AgentTranscript
+                .markStoppedByUser(sessionDir, owner, hex);
+            log.info("[TaskStopTool] not-found 停止意图已双写: agentId={} owner={}", taskId, owner);
+        } catch (Exception e) {
+            log.warn("[TaskStopTool] not-found 停止意图写入失败 {}: {}", taskId, e.toString());
+        }
+    }
+
+    /**
+     * task_id 形如 agentId：a+16hex（{@link com.nexusai.application.agent.subagent.AgentContext#createAgentId}）、
+     * UUID，或 teammate 的 {@code name@team}（CC {@code formatAgentId}，spawnInProcess.ts:112）。
+     */
+    static boolean looksLikeAgentId(String taskId) {
+        if (taskId == null || taskId.isBlank()) {
+            return false;
+        }
+        if (taskId.matches("a[0-9a-fA-F]{16}")) {
+            return true;
+        }
+        if (taskId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) {
+            return true;
+        }
+        // teammate agentId = name@team（两侧非空、不含空白；team 名可含连字符）
+        return taskId.matches("[^@\\s]+@[^@\\s]+");
     }
 }

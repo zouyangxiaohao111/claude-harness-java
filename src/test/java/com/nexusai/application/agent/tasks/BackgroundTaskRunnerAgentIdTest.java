@@ -98,13 +98,14 @@ class BackgroundTaskRunnerAgentIdTest {
      * 构造带归属 subagent 的后台 bash 任务（20 参 canonical 构造器，与
      * {@code registerAsyncAgent} 同形；sessionId 留 null → 由 spawn 回填，走真实路径）。
      */
-    private BackgroundTask newBashTaskOwnedBy(UUID agentId, String taskId, String command) {
+    private BackgroundTask newBashTaskOwnedBy(String agentId, String taskId, String command) {
         return new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             command, "tu-" + taskId,
             System.currentTimeMillis(), null, null,
             tempDir.resolve(taskId + ".out").toString(), 0L, false,
-            agentId,   // ← 归属 agent（子代理 spawn → 非 null；主会话 spawn → null）
+            agentId,
+            // ↑ 归属 agent（子代理 spawn → 非 null；主会话 spawn → null）· BackgroundTask.agentId 已是 String
             true,      // isBackgrounded
             null,      // sessionId（spawn 回填 createSessionId）
             null, null, null, null, null, null);
@@ -117,7 +118,7 @@ class BackgroundTaskRunnerAgentIdTest {
         NotificationQueue nq = new NotificationQueue();
         BackgroundTaskRunner runner = newRunner(nq);
 
-        UUID owner = UUID.fromString("11111111-2222-3333-4444-555555555555");
+        String owner = "a1111111122223333";
         String command = "echo agentid-owner; exit 0";
         runner.spawn(newBashTaskOwnedBy(owner, "agentid-owned-" + UUID.randomUUID(), command),
             command, SESSION);
@@ -130,7 +131,7 @@ class BackgroundTaskRunnerAgentIdTest {
         assertThat(item.agentId())
             .as("子代理任务的通知必须带归属 agentId —— 否则按 drainForQuery 规则必然被主线程捞走，"
                 + "子代理永远收不到（这正是上报的现象）")
-            .isEqualTo(owner.toString());
+            .isEqualTo(owner);
 
         // 后果断言 1：主线程（currentAgentId == null）不得捞到子代理的通知
         List<QueueItem> mainDrained = nq.drainForQuery(false, null, SESSION);
@@ -139,11 +140,12 @@ class BackgroundTaskRunnerAgentIdTest {
             .isEmpty();
 
         // 后果断言 2：归属子代理自己 drain 得到 —— 通知真正可达
-        List<QueueItem> ownerDrained = nq.drainForQuery(false, owner.toString(), SESSION);
+        List<QueueItem> ownerDrained = nq.drainForQuery(false, owner, SESSION);
         assertThat(ownerDrained)
             .as("归属子代理 drain 必须捞到自己的通知 —— 这是本修复要恢复的能力")
             .hasSize(1);
-        assertThat(ownerDrained.get(0).agentId()).isEqualTo(owner.toString());
+        assertThat(ownerDrained.get(0).agentId())
+            .isEqualTo(owner);
     }
 
     @Test
@@ -191,11 +193,11 @@ class BackgroundTaskRunnerAgentIdTest {
     // ══════════════════════════════════════════════════════════════════════
 
     /** 造一条归属指定 agent 的 task-notification 入队项（值的具体内容与判据无关）。 */
-    private static QueueItem notificationAddressedTo(UUID owner) {
+    private static QueueItem notificationAddressedTo(String owner) {
         return new NotificationQueue.QueueItem(
             "<task_notification>probe</task_notification>", NotificationQueue.MODE_TASK_NOTIFICATION,
             NotificationQueue.Priority.NEXT,
-            owner == null ? null : owner.toString());
+            owner);
     }
 
     @Test
@@ -206,8 +208,8 @@ class BackgroundTaskRunnerAgentIdTest {
         NotificationQueue nq = new NotificationQueue();
         BackgroundTaskRunner runner = newRunner(nq);
 
-        UUID exiting = UUID.fromString("cccccccc-1111-2222-3333-444444444444");
-        UUID other = UUID.fromString("dddddddd-1111-2222-3333-444444444444");
+        String exiting = "acccccccc11112222";
+        String other = "adddddddd11112222";
         nq.enqueuePendingNotification(notificationAddressedTo(exiting));
         nq.enqueuePendingNotification(notificationAddressedTo(other));
         nq.enqueuePendingNotification(notificationAddressedTo(null)); // 主线程通知
@@ -215,11 +217,11 @@ class BackgroundTaskRunnerAgentIdTest {
         int killed = runner.killShellTasksForAgent(exiting);
 
         assertThat(killed).as("无 running 任务 ⇒ 杀 0 个（但清队列仍必须执行）").isZero();
-        assertThat(nq.peek(q -> exiting.toString().equals(q.agentId())))
+        assertThat(nq.peek(q -> exiting.equals(q.agentId())))
             .as("归属退出 agent 的通知必须被清掉 —— 其实例 query loop 已退出，再无消费者；"
                 + "留着就是没人捞的孤儿通知（CC killShellTasks.ts:75 dequeueAllMatching）")
             .isEmpty();
-        assertThat(nq.peek(q -> other.toString().equals(q.agentId())))
+        assertThat(nq.peek(q -> other.equals(q.agentId())))
             .as("别人的通知必须留下 —— 谓词只能按 agentId 精确匹配，不得退化成 dequeueAll")
             .isPresent();
         assertThat(nq.peek(q -> q.agentId() == null))
@@ -234,7 +236,7 @@ class BackgroundTaskRunnerAgentIdTest {
         NotificationQueue nq = new NotificationQueue();
         BackgroundTaskRunner runner = newRunner(nq);
 
-        UUID owner = UUID.fromString("eeeeeeee-1111-2222-3333-444444444444");
+        String owner = "aeeeeeeee11112222";
         String taskId = "agentid-kill-" + UUID.randomUUID();
         // 长命令：保证调用 kill 时任务仍是 RUNNING（短命令会先完成 → 杀不到，断言失去意义）。
         String command = "echo agentid-kill-start; sleep 30";
@@ -256,7 +258,7 @@ class BackgroundTaskRunnerAgentIdTest {
             .isEqualTo(1);
         assertThat(runner.getTask(taskId).orElseThrow().status())
             .as("被杀任务必须落到 KILLED 终态").isEqualTo(BackgroundTaskStatus.KILLED);
-        assertThat(nq.peek(q -> owner.toString().equals(q.agentId())))
+        assertThat(nq.peek(q -> owner.equals(q.agentId())))
             .as("被杀任务 markKilled 会入队一条归属该 agent 的终止通知，且此前已有一条孤儿通知 —— "
                 + "两条都必须被同一句 dequeueAllMatching 收回，否则队列里全是没人捞的孤儿"
                 + "（CC killShellTasks.ts:71-75）")

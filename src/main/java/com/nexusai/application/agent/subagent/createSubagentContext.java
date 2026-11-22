@@ -214,9 +214,9 @@ public class createSubagentContext {
         //   ToolUseContext.agentId（Java record UUID 基础设施承载，S-12 可逆编码桥，见 AgentContext）。
         // resume 路径 overrides.agentId() = 原 spawn 的 packed UUID → 直接继承（CC :448 override 胜出），
         //   经 SubagentExecutor unpackAgentId 还原同一 a+16hex 续写 transcript。
-        UUID agentId = (overrides != null && overrides.agentId() != null)
+        String agentId = (overrides != null && overrides.agentId() != null)
             ? overrides.agentId()
-            : AgentContext.packAgentId(AgentContext.createAgentId());
+            : AgentContext.createAgentId();
         // sessionId: 父继承，或（真无父）显式「确无会话」哨兵
         // [批 6 2026-09-14 · 用户裁定 #2] 原 standalone 分支现造 `"sess-" + UUID.randomUUID()...` 已删：
         //   ① 该分支是 **Java 自造**，CC 无对应物 —— CC `createSubagentContext(parentContext, overrides)`
@@ -356,7 +356,7 @@ public class createSubagentContext {
                     + "isNonInteractive={}, renderedPrompt.length={}, effectiveCwd={}, "
                     + "messages.size={}, ownAbort={}({})",
                 agentId,
-                AgentContext.unpackAgentId(agentId),
+                agentId,
                 agentCtx.agentType(),
                 hasParent,
                 agentCtx.permissionContext() != null ? "已透传" : "null(无父)",

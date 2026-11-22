@@ -56,6 +56,15 @@ public class KbWikiChunkSync {
     private final KbKnowledgeBaseMapper knowledgeBaseMapper;
     private final KbIndexWriter indexWriter;
 
+    /**
+     * 模型解析统一入口（库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 原来 {@code embeddingModelOf} 只查库级，库级为空就返回 null ⇒
+     * {@code reindexKnowledge} 进「只重建关键词」分支，wiki 页只有关键词索引。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     public KbWikiChunkSync(
         KbChunkMapper chunkMapper,
         KbWikiPageMapper pageMapper,
@@ -289,6 +298,10 @@ public class KbWikiChunkSync {
     private String embeddingModelOf(String kbId) {
         try {
             KbKnowledgeBaseRecord kb = knowledgeBaseMapper.selectOneById(kbId);
+            if (kbConfigService != null) {
+                // 库级优先，库级为空 ⇒ 全局（自动选用第一个启用的 embedding 模型）
+                return kbConfigService.resolveEmbeddingModelId(null, kb);
+            }
             if (kb == null || kb.getEmbeddingModelId() == null) {
                 return null;
             }

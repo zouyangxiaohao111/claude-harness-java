@@ -99,7 +99,7 @@ class StreamingToolExecutorHookInjectionTest {
 
     private ToolUseContext baseCtx() {
         return ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT
         );
@@ -373,7 +373,7 @@ class StreamingToolExecutorHookInjectionTest {
             // [REWORK-7] ToolResult.toolUseId() 已删 (IMP-C2, 由 mapper 推导) → 用 result.data()
             //   作为本工具执行唯一标记（"raw_output"），顺序断言仍锁 post_hook 在 execute 之后。
             eventOrder.add("post_hook:" + result.data());
-            seenResultContent.set((String) result.data());
+            seenResultContent.set(String.valueOf(result.data()));
             return GenericHook.HookResult.proceed();
         };
         hooks.registerPostToolUse("order_post", postHook);
@@ -763,7 +763,7 @@ class StreamingToolExecutorHookInjectionTest {
             PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of(),
             false, false, Map.of(), false, false, null);
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT);
 
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, ctx, null, gate, null);
@@ -1529,7 +1529,8 @@ class StreamingToolExecutorHookInjectionTest {
         assertThat(exec.getResultErrorFlags().get("toolu_deny_1"))
             .as("deny 决策必须让结果标记为错误（getResultErrorFlags 生产 API）")
             .isTrue();
-        assertThat(((String) results.get(0).data()))
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（错误态由类型承载）；文本仍是原文。
+        assertThat(((ToolError) results.get(0).data()).message())
             .as("deny 消息原文直出 (无 'PreToolUse hook denied' 前缀, 对齐 CC toolExecution.ts:1033)")
             .isEqualTo("Tool explicitly denied")
             .doesNotContain("PreToolUse hook denied");
@@ -1973,7 +1974,7 @@ class StreamingToolExecutorHookInjectionTest {
             PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of(),
             false, false, Map.of(), false, false, null);
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT);
 
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, ctx, null, gate, null);
@@ -1990,7 +1991,8 @@ class StreamingToolExecutorHookInjectionTest {
             .isFalse();
         // 结果以错误 ToolResult 收束（外层 catch isAbort 语义，ToolErrorFormatter.formatError 承载）
         assertThat(results).hasSize(1);
-        assertThat(results.get(0).data()).isInstanceOf(String.class);
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（不再靠文案前缀反推错误态）
+        assertThat(results.get(0).data()).isInstanceOf(ToolError.class);
         assertThat(exec.getResultErrorFlags().get("toolu_gate_abort_1"))
             .as("AbortException 路径结果必须标 isError=true（getResultErrorFlags 推导）")
             .isTrue();

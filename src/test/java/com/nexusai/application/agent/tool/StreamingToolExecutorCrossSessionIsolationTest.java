@@ -156,7 +156,7 @@ class StreamingToolExecutorCrossSessionIsolationTest {
 
     private static ToolUseContext ctxFor(String sessionId) {
         return ToolUseContext.of(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", new AbortController(), List.of(),
             null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "",

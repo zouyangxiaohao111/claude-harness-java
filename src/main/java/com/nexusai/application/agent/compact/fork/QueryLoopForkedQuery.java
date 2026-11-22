@@ -249,7 +249,7 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         //   [systemPrompt=null] fork 的模型面提示由 params.systemPrompt() 承载（CC query({
         //     systemPrompt }) 同源）；state.systemPrompt() 是 CC customSystemPrompt 语义，fork 不设。
         String forkSessionId = forkCtx != null ? forkCtx.sessionId() : null;
-        java.util.UUID forkIdentity = forkAgentId(forkCtx);
+        String forkIdentity = forkAgentId(forkCtx);
         AgentState state = new AgentState(null, forkSessionId, forkIdentity);
         // ── [usage-gateway] fork 记账归属 + 会话账本绑定 ──
         // 用户裁定：用量统计前置到请求网关，归属/账本显式挂在 state 上（组装 ModelRequest 时由
@@ -263,8 +263,7 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
         if (usageLedgerRegistry != null) {
             com.nexusai.application.agent.cost.SessionUsageLedger forkLedger =
                 usageLedgerRegistry.forSession(forkSessionId);
-            String forkUsageAgentId = com.nexusai.application.agent.subagent.AgentContext
-                .unpackAgentId(forkIdentity);
+            String forkUsageAgentId = forkIdentity;
             com.nexusai.infra.llm.UsageAttribution parentAttribution =
                 forkLedger.attributionOf(forkSessionId);
             if (parentAttribution == null) {
@@ -403,24 +402,22 @@ public class QueryLoopForkedQuery implements RunForkedAgent.ForkedQuery {
      * <ol>
      *   <li>{@code forkCtx.agentId()}（fork 的隔离 TUC 已带同一身份 ——
      *       {@code RunForkedAgent.createIsolatedContext} → {@code ToolUseContext.with} 缺省生成
-     *       {@code packAgentId(createAgentId())}），复用 ⇒ 一个 fork 一个身份（与
+     *       {@code createAgentId()}），复用 ⇒ 一个 fork 一个身份（与
      *       {@code SubagentExecutor} 的 state.agentId == TUC.agentId 约定一致，避免 hook 载荷里的
      *       agent_id 与 TUC 身份分裂成两个）；</li>
      *   <li>缺失（测试直构 TUC / 无 agentId 的 ctx）→ 现造
-     *       {@link com.nexusai.application.agent.subagent.AgentContext#createAgentId()} 经
-     *       {@code packAgentId} 桥成 UUID —— <b>复用本仓既有生成器</b>（对齐 CC
-     *       {@code utils/uuid.ts:24-27}，a+16hex），⛔ 不另造一套。</li>
+     *       {@link com.nexusai.application.agent.subagent.AgentContext#createAgentId()} ——
+     *       <b>复用本仓既有生成器</b>（对齐 CC {@code utils/uuid.ts:24-27}，a+16hex），⛔ 不另造一套。</li>
      * </ol>
      *
      * @param forkCtx fork 的隔离 ToolUseContext（可为 null = standalone）
-     * @return 恒非 null 的 fork 身份 UUID（可经 {@code AgentContext.unpackAgentId} 还原 a+16hex）
+     * @return 恒非 null 的 fork 身份字符串（a+16hex，CC 单一形态）
      */
-    static java.util.UUID forkAgentId(ToolUseContext forkCtx) {
-        java.util.UUID existing = forkCtx != null ? forkCtx.agentId() : null;
-        if (existing != null) {
+    static String forkAgentId(ToolUseContext forkCtx) {
+        String existing = forkCtx != null ? forkCtx.agentId() : null;
+        if (existing != null && !existing.isBlank()) {
             return existing;
         }
-        return com.nexusai.application.agent.subagent.AgentContext
-            .packAgentId(com.nexusai.application.agent.subagent.AgentContext.createAgentId());
+        return com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     }
 }

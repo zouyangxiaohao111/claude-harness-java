@@ -38,7 +38,7 @@ import org.junit.jupiter.api.Test;
 class BashToolSandboxTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f60719";
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /** 沙箱 auto-allow 放行的归因原因（BashTool.java:1469 唯一沙箱 allow reason）。 */

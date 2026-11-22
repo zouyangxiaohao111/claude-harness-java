@@ -54,7 +54,7 @@ import static org.junit.jupiter.api.Assertions.assertTrue;
  */
 class SnipToolTest {
 
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f6071d";
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

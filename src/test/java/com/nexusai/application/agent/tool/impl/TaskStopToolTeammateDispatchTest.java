@@ -46,20 +46,28 @@ class TaskStopToolTeammateDispatchTest {
     private TaskFrameworkService taskFrameworkService;
     private SpawnInProcess spawner;
     private TaskStopTool stopTool;
+    private BackgroundTaskRunner runner;
+    private com.nexusai.application.agent.subagent.StopMarkers stopMarkers;
     private final List<String> spawnedTaskIds = new ArrayList<>();
 
     @BeforeEach
-    void setUp() {
+    void setUp() throws Exception {
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
+        java.nio.file.Files.createDirectories(tempDir.resolve("session-1"));
         taskFrameworkService = new TaskFrameworkService(new SdkEventQueue());
         spawner = new SpawnInProcess(taskFrameworkService);
+        spawner.setSessionDirResolver(id -> tempDir);
         // 真实 BackgroundTaskRunner：teammate 任务注册在统一 store（frameworkService），
         // stopTask 经 stopInProcessTeammateTask 回退分发到 registry.kill（对齐 CC stopTask 统一路径）。
-        BackgroundTaskRunner runner = new BackgroundTaskRunner(
+        runner = new BackgroundTaskRunner(
             new NotificationQueue(), taskFrameworkService, new SdkEventQueue());
         runner.setSpawnInProcess(spawner);
+        stopMarkers = new com.nexusai.application.agent.subagent.StopMarkers();
+        runner.setStopMarkers(stopMarkers);
+        runner.setSessionDirResolver(id -> tempDir);
         stopTool = new TaskStopTool();
         ReflectionTestUtils.setField(stopTool, "backgroundTaskRunner", runner);
+        ReflectionTestUtils.setField(stopTool, "stopMarkers", stopMarkers);
     }
 
     @AfterEach
@@ -132,5 +140,47 @@ class TaskStopToolTeammateDispatchTest {
                 .put("task_id", "nonexistent-task")));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("非 teammate 任务 → not_found 错误").isTrue();
         assertThat(String.valueOf(result.data())).contains("No task found with ID");
+    }
+
+    @Test
+    @DisplayName("b-1 · validateInput 能看见统一 store 里的 teammate 任务（不再误报 No task found）")
+    void validateInput_findsStoreTask() {
+        SpawnInProcess.InProcessSpawnOutput out = spawn("worker3", "t", "work");
+
+        com.nexusai.application.agent.tool.Tool.ValidationResult validation =
+            stopTool.validateInput(JsonNodeFactory.instance.objectNode().put("task_id", out.taskId()),
+                null);
+
+        assertThat(validation.ok()).as("running teammate 必须通过 validateInput（CC appState.tasks 同一张表）")
+            .isTrue();
+        assertThat(validation.errorCode()).isNull();
+        assertThat(runner.findTask(out.taskId())).as("统一读口必须命中 store 任务").isPresent();
+    }
+
+    @Test
+    @DisplayName("b-2 · TaskStop 对 teammate 双写停止标记且幂等（内存 count=1、伴生文件存在、二次停不自增）")
+    void stop_teammate_writesDualStopMarker_idempotent() {
+        SpawnInProcess.InProcessSpawnOutput out = spawn("worker4", "t", "work");
+        String agentId = "worker4@t";
+
+        ToolResult<?> first = stopTool.execute(new ToolUseBlock(
+            "call-4", "TaskStop",
+            JsonNodeFactory.instance.objectNode().put("task_id", out.taskId())));
+        assertThat(LlmAgentLoop.isToolErrorData(first.data())).as("首次停止必须成功").isFalse();
+
+        assertThat(stopMarkers.isStopped(agentId))
+            .as("内存 stoppedByUser（CC Fat，偏移 334311557）必须写").isTrue();
+        assertThat(stopMarkers.stopCount(agentId)).as("首次停止 userStopCount=1").isEqualTo(1);
+        Path sidecar = tempDir.resolve("session-1").resolve("subagents")
+            .resolve("agent-" + agentId + ".stopped-by-user");
+        assertThat(sidecar).as("磁盘伴生文件 <agentId>.stopped-by-user 必须存在（偏移 325012255）")
+            .isRegularFile();
+
+        ToolResult<?> second = stopTool.execute(new ToolUseBlock(
+            "call-5", "TaskStop",
+            JsonNodeFactory.instance.objectNode().put("task_id", out.taskId())));
+        assertThat(LlmAgentLoop.isToolErrorData(second.data())).as("二次停返回 not running").isTrue();
+        assertThat(stopMarkers.stopCount(agentId))
+            .as("已停不自增（CC Fat: if(stopped) return）").isEqualTo(1);
     }
 }

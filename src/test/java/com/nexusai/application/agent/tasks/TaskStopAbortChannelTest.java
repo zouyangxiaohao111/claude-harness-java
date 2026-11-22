@@ -4,8 +4,6 @@ import com.nexusai.application.agent.tool.AbortController;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -49,11 +47,11 @@ class TaskStopAbortChannelTest {
         //   killAsyncAgent 靠它打断 worker。Java 若无此注册表 → kill 无通道 → 用户 kill 后 worker
         //   无法即时中断（OPD-TP-21 核心缺口）。
         Ctx ctx = newCtx();
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", TYPE, null, null);
 
-        AbortController controller = ctx.runner.taskAbortController(agentId.toString());
+        AbortController controller = ctx.runner.taskAbortController(agentId);
         assertThat(controller).as("registerAsyncAgent 必须创建并保存 task-scoped AbortController").isNotNull();
         assertThat(controller.isCancelled()).as("新注册任务 controller 未取消").isFalse();
     }
@@ -66,14 +64,14 @@ class TaskStopAbortChannelTest {
         //   "aborted" 结果走 finalizeKilled 链。若 killAsyncAgent 只标状态不 abort，worker 无法被
         //   主动打断，TaskStop 对运行中子 agent 失效。
         Ctx ctx = newCtx();
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", TYPE, null, null);
         // kill 前捕获引用（CC :295 标 KILLED 后 abortController: undefined，但 abort() 已先行触发
         //   —— worker 持有该引用，观察点在 kill 前捕获的对象上）
-        AbortController controller = ctx.runner.taskAbortController(agentId.toString());
+        AbortController controller = ctx.runner.taskAbortController(agentId);
         assertThat(controller).as("registerAsyncAgent 必须已创建 controller").isNotNull();
 
-        boolean killed = ctx.runner.killAsyncAgent(agentId.toString());
+        boolean killed = ctx.runner.killAsyncAgent(agentId);
 
         assertThat(killed).isTrue();
         assertThat(controller.isCancelled()).as("killAsyncAgent 必须 abort 该 controller 以直接中断 worker").isTrue();
@@ -85,13 +83,13 @@ class TaskStopAbortChannelTest {
         // WHY: 幂等是 CC killAsyncAgent 的原子 CAS 语义（LocalAgentTask.tsx:282-283 only-if-running）——
         //   重复 kill 不重复 abort/不重复通知。worker 完成回调与 kill 并发时也不会二次触发。
         Ctx ctx = newCtx();
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", TYPE, null, null);
-        AbortController controller = ctx.runner.taskAbortController(agentId.toString());
+        AbortController controller = ctx.runner.taskAbortController(agentId);
         assertThat(controller).isNotNull();
 
-        assertThat(ctx.runner.killAsyncAgent(agentId.toString())).isTrue();
-        assertThat(ctx.runner.killAsyncAgent(agentId.toString())).isFalse();
+        assertThat(ctx.runner.killAsyncAgent(agentId)).isTrue();
+        assertThat(ctx.runner.killAsyncAgent(agentId)).isFalse();
 
         // abort() 幂等（AtomicBoolean CAS）：二次 kill 不触发二次 abort，但仍保持已取消
         assertThat(controller.isCancelled()).isTrue();
@@ -105,11 +103,11 @@ class TaskStopAbortChannelTest {
         //   立即 abort，保证父退出时不遗留子 worker。
         Ctx ctx = newCtx();
         AbortController parent = new AbortController();
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", TYPE, parent, null);
 
-        AbortController controller = ctx.runner.taskAbortController(agentId.toString());
+        AbortController controller = ctx.runner.taskAbortController(agentId);
         assertThat(controller).isNotNull();
         assertThat(controller.isCancelled()).isFalse();
         // 父 abort → child 级联 abort（CC createChildAbortController 单向级联）

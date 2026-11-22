@@ -443,8 +443,8 @@ public final class ClaudeCodeBackendAdapter implements AgentAdapter {
      */
     private static String readParentAgentId(HostHandle host) {
         ToolUseContext tuc = readToolUseContext(host);
-        UUID agentId = tuc != null ? tuc.agentId() : null;
-        return agentId != null ? agentId.toString() : null;
+        String agentId = tuc != null ? tuc.agentId() : null;
+        return agentId;
     }
 
     /**

@@ -1211,6 +1211,12 @@ public class OpenAiSdkProvider implements LlmProvider {
         //   放在 ProviderHeaderInjector 之前 ⇒ 用户在 extraHeaders 里配的同名头仍可覆盖。
         if (sessionId != null && !sessionId.isBlank() && isCodexEndpoint(config.baseUrl())) {
             builder.putHeader("session_id", sessionId);
+            // [codex-send-parity 2026-11-20] 对齐 codex / pi 的其余请求头：
+            //   · x-client-request-id：上游按它做请求级关联/去重（pi 与 codex 都发，值 = session）
+            //   · OpenAI-Beta: responses=experimental：codex SSE 通道的 beta 标记
+            //   仅 codex 端点注入；普通 openai_response / 国内兼容端点 wire 不变。
+            builder.putHeader("x-client-request-id", sessionId);
+            builder.putHeader("OpenAI-Beta", "responses=experimental");
         }
         ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
         return builder.build();

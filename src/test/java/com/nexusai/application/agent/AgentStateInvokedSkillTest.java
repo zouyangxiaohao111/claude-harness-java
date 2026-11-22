@@ -37,14 +37,14 @@ import static org.assertj.core.api.Assertions.assertThat;
 class AgentStateInvokedSkillTest {
 
     private AgentState state;
-    private UUID agentX;
-    private UUID agentY;
+    private String agentX;
+    private String agentY;
 
     @BeforeEach
     void setUp() {
         state = new AgentState("test-system-prompt");
-        agentX = UUID.randomUUID();
-        agentY = UUID.randomUUID();
+        agentX = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        agentY = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     }
 
     @Test

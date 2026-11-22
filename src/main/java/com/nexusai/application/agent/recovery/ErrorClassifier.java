@@ -503,7 +503,11 @@ public final class ErrorClassifier {
         // CC:763-764 409 → true
         if (status == 409) return true;
         // CC:767-769 429 → !isClaudeAISubscriber() || isEnterpriseSubscriber()（N/A → 非订阅 → true）
-        if (status == 429) return true;
+        // [quota-429] 但「账户/套餐额度耗尽」型 429 是终态：CC 订阅态不重试（同上判据），
+        //   本仓无订阅层 ⇒ 改由报文识别（判据与错误卡文案同源：ApiErrors.isQuotaExhausted）。
+        //   否则「Token Plan 用量上限」会被当成普通限流：流式→非流式回退再各自退避 10 次，
+        //   前端数分钟没有任何事件（实测 19:38 MiniMax 429）。
+        if (status == 429) return !ApiErrors.isQuotaExhausted(apiErr);
         // 401 → clearApiKeyHelperCache + false（non-retryable）· BUG1-401
         // CC withRetry.ts:773-776 原为 true（清 key 缓存后以新 key 有限重试）；
         // 用户决策 BUG1-401：Java 无 key helper 缓存（N/A）亦无 OAuth token 刷新通道，

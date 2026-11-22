@@ -91,7 +91,7 @@ class ComputerUseApprovalPayloadTest {
         ComputerUseRequestAccessTool tool = newTool();
 
         // 走真实的权限检查（Phase 1a 在此就地注入 resolvedApps）
-        PermissionResult result = tool.checkPermissions(toolInput, ToolUseContext.of((UUID) null, SESSION));
+        PermissionResult result = tool.checkPermissions(toolInput, ToolUseContext.of((String) null, SESSION));
         assertThat(result).isInstanceOf(PermissionResult.Passthrough.class);
 
         ComputerUseApprovalPayload payload =
@@ -118,7 +118,7 @@ class ComputerUseApprovalPayloadTest {
     void browserTierLabelIsPlainChinese() {
         ObjectNode toolInput = input("看看网页", false, false, false, "Chrome");
         ComputerUseRequestAccessTool tool = newTool();
-        tool.checkPermissions(toolInput, ToolUseContext.of((UUID) null, SESSION));
+        tool.checkPermissions(toolInput, ToolUseContext.of((String) null, SESSION));
 
         ComputerUseApprovalPayload payload =
                 ComputerUseApprovalPayload.fromToolInput(tool.name(), toolInput);
@@ -132,7 +132,7 @@ class ComputerUseApprovalPayloadTest {
     void requestedFlagsContainOnlyRequestedBits() {
         ObjectNode toolInput = input("要读剪贴板", true, false, false, "Notepad");
         ComputerUseRequestAccessTool tool = newTool();
-        tool.checkPermissions(toolInput, ToolUseContext.of((UUID) null, SESSION));
+        tool.checkPermissions(toolInput, ToolUseContext.of((String) null, SESSION));
 
         ComputerUseApprovalPayload payload =
                 ComputerUseApprovalPayload.fromToolInput(tool.name(), toolInput);
@@ -147,7 +147,7 @@ class ComputerUseApprovalPayloadTest {
     void noFlagsRequestedMeansEmptyLists() {
         ObjectNode toolInput = input("只是看看", false, false, false, "Notepad");
         ComputerUseRequestAccessTool tool = newTool();
-        tool.checkPermissions(toolInput, ToolUseContext.of((UUID) null, SESSION));
+        tool.checkPermissions(toolInput, ToolUseContext.of((String) null, SESSION));
 
         ComputerUseApprovalPayload payload =
                 ComputerUseApprovalPayload.fromToolInput(tool.name(), toolInput);

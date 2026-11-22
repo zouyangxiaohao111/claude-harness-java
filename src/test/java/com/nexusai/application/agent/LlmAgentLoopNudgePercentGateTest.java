@@ -141,12 +141,10 @@ class LlmAgentLoopNudgePercentGateTest {
     @Test
     @DisplayName("子代理路径（agentId != null）按同一判据评估: 剩余 20% → 注入")
     void subagentContext_evaluatedWithSameJudge() {
-        // ⚠️ 与任务书的唯一偏差：AgentState 第 3 参实际类型是 UUID（AgentState.java:399
-        //    `AgentState(String systemPrompt, String sessionId, UUID agentId)`），不是 String。
-        //    任务书写的是 "agent-" + UUID.randomUUID()（String）→ 编译不过，故按实际签名传 UUID。
+        // 第 3 参 agentId 现为 String（CC 形态 a+16hex），非 null = 子代理形态。
         AgentState state = new AgentState("sys",
             "sess-" + UUID.randomUUID().toString().substring(0, 8),
-            UUID.randomUUID());                               // 第 3 参非 null = 子代理形态
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         // ⚠️ 条数必须 < 30：否则旧判据（消息条数 ≥ 30）也会注入 → 本用例在切换前后都绿，无鉴别力。
         for (ChatMessageDto m : largeMessages(10)) {
             state.appendMessage(m);
@@ -268,7 +266,7 @@ class LlmAgentLoopNudgePercentGateTest {
         };
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }

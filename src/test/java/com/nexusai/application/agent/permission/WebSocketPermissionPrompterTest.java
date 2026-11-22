@@ -17,7 +17,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.util.List;
-import java.util.UUID;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -46,7 +45,7 @@ import static org.mockito.Mockito.when;
 class WebSocketPermissionPrompterTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000001";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
 
     /** 可配置 input 感知描述的工具桩（对齐 CC Tool.ts:386-393 description(input, options)）。 */

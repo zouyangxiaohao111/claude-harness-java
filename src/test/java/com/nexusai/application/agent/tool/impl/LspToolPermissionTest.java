@@ -122,7 +122,7 @@ class LspToolPermissionTest {
             // 白名单锚（getOriginalCwdLayer 首读槽）= 本用例的工作目录 ws；与 effectiveCwd 同值但语义不同
             SessionCwdHolder.setOriginalCwd(sessionId, effectiveCwd.toString());
         }
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }

@@ -1,0 +1,16 @@
+-- 扫描规则增加「执行上下文形态」（对齐定时任务 V306 的四形态语义）。
+--
+-- 为什么必须补这一列：
+--   旧实现只有 exec_mode = new|existing，其中 new 实际是 **headless**（不产生会话）
+--   ⇒ 扫描跑完用户看不到任何结果。而「定时看一眼群里有什么」这个场景，
+--   产物必须落在一个能点开的会话里。
+--
+-- 三态（不给 NONE：扫描看不到结果就没意义）：
+--   REUSE     写进规则指定的会话（共享历史；会话被删则降级为每次新建）
+--   NEW_EACH  每次触发新建一个会话（默认）—— 每次干净、互不污染
+--   NEW_ONCE  首次建一个专属会话后一直用它（结果攒在一起，方便连续追问）
+--
+-- exec_session_id 语义复用：REUSE 用它的目标会话，NEW_ONCE 回填首次建的那个。
+--
+-- 默认 NEW_EACH：存量行的 new（headless）本来就看不到结果，改成可见更符合预期。
+ALTER TABLE im_scan_rule ADD COLUMN session_mode TEXT NOT NULL DEFAULT 'NEW_EACH';

@@ -95,7 +95,7 @@ class QueryParamsOnMessageEmissionTest {
         };
         QueryParams params = QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-onmsg").withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-onmsg").withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
         return params.withOnMessage(onMessage);

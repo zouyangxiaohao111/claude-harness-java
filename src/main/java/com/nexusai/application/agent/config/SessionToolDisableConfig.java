@@ -3,6 +3,8 @@ package com.nexusai.application.agent.config;
 import com.alibaba.fastjson2.JSON;
 import com.nexusai.application.agent.tool.SessionToolCategory;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.application.agent.tool.ToolNameConstants;
+import com.nexusai.application.session.SessionTakeoverResolver;
 import com.nexusai.common.SessionKeys;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.SessionMapper;
@@ -43,6 +45,15 @@ public class SessionToolDisableConfig {
 
     /** 会话级禁用工具集合 DB 读取桥接（sessions.disabled_tools，V34 列）；null = 未注入（POJO 单测/无 Spring）→ 空集 */
     private static volatile SessionMapper sessionMapper;
+
+    /**
+     * 「是否已被真实用户接管」判定组件（可选注入）· 持久化读取职责归
+     * {@link com.nexusai.application.session.SessionTakeoverResolver}，本类只消费判定结果。
+     *
+     * <p>null = 未注入（POJO 单测 / 无 Spring）→ 判定为「不是用户发过」→ 派生会话保持默认禁用 Ask
+     * （宁可保守：判定不出来就按未接管处理）。
+     */
+    private static volatile SessionTakeoverResolver takeoverResolver;
 
     /**
      * Spring 注入 SessionMapper 桥接（setter 注入 → 静态字段，对齐 {@code MemoryBareModeConfig}
@@ -101,6 +112,34 @@ public class SessionToolDisableConfig {
      * @return 禁用工具名集合（不可变；显式全开 → 空集）
      */
     /**
+     * Spring 注入「真人接管」判定组件（可选；setter 注入 → 静态字段，同 {@link #bridgeSessionMapper} 惯例）。
+     *
+     * @param resolver 判定组件（可为 null → 一律按「未接管」处理）
+     */
+    @Autowired(required = false)
+    public void bridgeTakeoverResolver(SessionTakeoverResolver resolver) {
+        setTakeoverResolver(resolver);
+    }
+
+    /**
+     * 判定组件静态桥接 setter · 测试 + Spring 桥接共用。
+     */
+    public static void setTakeoverResolver(SessionTakeoverResolver resolver) {
+        takeoverResolver = resolver;
+    }
+
+    /**
+     * 会话是否已被真实用户接管（委托 {@link SessionTakeoverResolver}）。
+     *
+     * @param sessionId 已归一化的会话键
+     * @return true = 有过真实用户消息；组件未注入 → false（保守）
+     */
+    static boolean hasRealUserMessage(String sessionId) {
+        SessionTakeoverResolver resolver = takeoverResolver;
+        return resolver != null && resolver.hasRealUserMessage(sessionId);
+    }
+
+    /**
      * 按会话禁用集过滤工具池（元素级，保序）· 供「需要与 LLM schema 同源」的旁路池使用。
      *
      * <p><b>WHY 抽出这个方法</b>：会话禁用的剔除原先只写在
@@ -137,6 +176,56 @@ public class SessionToolDisableConfig {
                 sessionId, tools.size(), out.size(), tools.size() - out.size());
         }
         return out;
+    }
+
+    /**
+     * 该工具是否被<b>本会话显式禁用</b>（只读 {@code sessions.disabled_tools} 的实际值）。
+     *
+     * <p>⛔ 不用「默认禁用推断」：默认禁用的 CU/KB 可被人格点名豁免（2026-11-18 用户拍板），
+     * 执行入口若按默认集拦，会把 schema 已经放行的人格工具又挡回去。
+     *
+     * <p>本批（V329）消费它的两个场景都是<b>显式写入</b>：
+     * Brief 关时写 SendUserMessage、用户手动禁用的工具；因此只看显式列值即可，
+     * 且不会误伤默认集/人格豁免。
+     *
+     * @param toolName  工具名（null → false）
+     * @param sessionId 会话 id（null → false）
+     * @return true = 本会话显式禁用
+     */
+    public static boolean isDisabledForSession(String toolName, String sessionId) {
+        return toolName != null && getExplicitDisabledTools(sessionId).contains(toolName);
+    }
+
+    /**
+     * 读 {@code sessions.disabled_tools} 的<b>显式</b>值（不做默认禁用推断）。
+     *
+     * <p>供执行器在「本轮开始」时快照一次（StreamingToolExecutor），使运行中切换工具/模式
+     * 只影响下一轮，不撤销本轮已装配的工具池。
+     *
+     * @param sessionId 会话 id
+     * @return 显式禁用集合；列 null/blank、无 mapper、读失败 → 空集
+     */
+    public static Set<String> getExplicitDisabledTools(String sessionId) {
+        String key = normalizeSessionKey(sessionId);
+        SessionMapper mapper = sessionMapper;
+        if (key == null || mapper == null) {
+            return Set.of();
+        }
+        try {
+            SessionRecord s = mapper.selectOneById(key);
+            if (s == null) {
+                return Set.of();
+            }
+            String raw = s.getDisabledTools();
+            if (raw == null || raw.isBlank()) {
+                return Set.of();
+            }
+            List<String> list = JSON.parseArray(raw, String.class);
+            return list == null || list.isEmpty() ? Set.of() : Set.copyOf(list);
+        } catch (RuntimeException e) {
+            log.warn("会话级禁用工具显式读取失败（按未禁用处理）: 会话 '{}' 原因={}", key, e.toString());
+            return Set.of();
+        }
     }
 
     /**
@@ -180,6 +269,28 @@ public class SessionToolDisableConfig {
                     if (raw == null || raw.isBlank()) {
                         // 从未设置 → 默认禁用（电脑操作 + 知识库）
                         Set<String> defaults = SessionToolCategory.defaultDisabledNamesStatic();
+                        // [session-create-derived · 2026-11-22 用户拍板]
+                        //   派生/平级会话（SessionCreate 创建，derived_depth 非空）默认禁用 AskUserQuestion：
+                        //   需要信息时先走 SendMessage 问发起会话，别反复打断用户。
+                        //   ⚠️ 这是本仓有意偏离 CC：CC 2.1.328 只对 agent 子代理禁用该工具
+                        //   （I8t/filterToolsForAgent），平级 peer 会话并不禁用 —— 文档/注释不得写成对齐。
+                        //
+                        //   ⭐接管放开：真实用户在该会话发过消息（{@link #hasRealUserMessage}）后
+                        //   不再追加 Ask。当前轮工具列表已构造完不可变 ⇒ 实际是**下一轮**才生效，
+                        //   ⛔ 不为当轮重造工具列表。
+                        //   ⭐IM 渠道入站**不算**接管：IM 入站行 role=user 但 is_meta=true
+                        //   （ImInboundRouter:252-257 → CronIdleExecutor:1197-1218 以 isCron 落库），
+                        //   由 SessionTakeoverResolver 的严格白名单排除。
+                        //   ⭐无人值守优先级更高：unattended_mode 的 Ask 剔除在
+                        //   SessionToolVisibility.capture 的 askExcluded 层，与本处无关。
+                        //
+                        //   只在 raw 为空时追加：用户显式调整过工具列表 ⇒ 以用户列表为准。
+                        //   派生会话默认禁用 AskUserQuestion（见上）。
+                        if (s.getDerivedDepth() != null && !hasRealUserMessage(key)) {
+                            Set<String> withAsk = new java.util.LinkedHashSet<>(defaults);
+                            withAsk.add(ToolNameConstants.ASK_USER_QUESTION_TOOL_NAME);
+                            defaults = java.util.Collections.unmodifiableSet(withAsk);
+                        }
                         // [诊断 · 2026-11-18] 「池 110 → 2」只剩这一条能解释的路径：默认禁用集过大。
                         //   升级为 INFO 并打样例，重启后一次复现即可判定（诊断完可降回 DEBUG）。
                         if (log.isInfoEnabled()) {
@@ -234,5 +345,6 @@ public class SessionToolDisableConfig {
      */
     public static void reset() {
         sessionMapper = null;
+        takeoverResolver = null;
     }
 }

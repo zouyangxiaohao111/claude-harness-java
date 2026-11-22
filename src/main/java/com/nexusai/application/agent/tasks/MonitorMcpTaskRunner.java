@@ -101,7 +101,7 @@ public class MonitorMcpTaskRunner {
      *                    生产调用方 MonitorTool 恒传 {@code ctx.sessionId()}）
      * @return 新任务 id（'m' 前缀）
      */
-    public String registerTask(String description, String toolUseId, @Nullable UUID agentId,
+    public String registerTask(String description, String toolUseId, @Nullable String agentId,
                                String sessionId) {
         String taskId = TaskIdGenerator.generate(TaskType.MONITOR_MCP);
         long now = System.currentTimeMillis();
@@ -296,7 +296,7 @@ public class MonitorMcpTaskRunner {
             notificationQueue.enqueuePendingNotification(
                 new NotificationQueue.QueueItem(xml, NotificationQueue.MODE_TASK_NOTIFICATION,
                     NotificationQueue.Priority.NEXT,
-                    task.agentId() != null ? task.agentId().toString() : null,
+                    task.agentId(),
                     null, false, null, false, null, task.sessionId()));
         }
         log.info("[MonitorMcpTaskRunner] 终态流转: taskId={}, status={}, summary='{}'",

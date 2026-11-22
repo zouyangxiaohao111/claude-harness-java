@@ -21,7 +21,6 @@ import java.awt.image.BufferedImage;
 import java.lang.reflect.Field;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -114,7 +113,7 @@ class ComputerUseGroundingFallbackModeTest {
     }
 
     private static ToolUseContext ctxWithModel(String modelName) {
-        return ToolUseContext.of((UUID) null, SESSION)
+        return ToolUseContext.of((String) null, SESSION)
                 .withEffectiveModelName(modelName)
                 .withEffectiveProviderType("openai_compatible");
     }

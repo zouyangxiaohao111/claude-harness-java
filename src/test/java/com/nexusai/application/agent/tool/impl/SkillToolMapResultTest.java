@@ -73,7 +73,7 @@ class SkillToolMapResultTest {
     @DisplayName("T4 isError=true → Map.of()（CC mapper 仅成功路径被调 toolExecution.ts:1292-1295）")
     void errorResult_returnsEmptyMap() {
         SkillToolImpl tool = new SkillToolImpl(null);
-        ToolResult<String> error = ToolResult.error("toolu_4", "Unknown skill: xyz");
+        ToolResult<?> error = ToolResult.error("toolu_4", "Unknown skill: xyz");
 
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(error, "toolu_4", true);
 

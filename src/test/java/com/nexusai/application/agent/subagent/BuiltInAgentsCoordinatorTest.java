@@ -185,26 +185,24 @@ class BuiltInAgentsCoordinatorTest {
     // ────────────────── 3. DB 覆盖层（唯一用户可达的激活路径）必须与提示注入门同源 ──────────────────
 
     @Test
-    @DisplayName("DB coordinator_mode_enabled=true + feature/env 关 → 仍返回 [worker]（前端勾选即生效）")
-    void dbTrue_featureFalse_coordinatorBranchActive() {
-        // GIVEN: 前端「设置 → 环境配置 → 协调者模式」勾选 → settings.coordinatorModeEnabled=true；
-        //   application.yml 的 nexusai.feature.coordinator-mode 恒 false 且无 UI 可改。
+    @DisplayName("DB coordinator_mode_enabled=true + env 关 → 全局 DB 层已移除，仍返回 legacy 列表")
+    void dbTrue_featureEnvOff_dbIgnored() {
+        // [2026-11-19] 全局 settings 层已从判定链移除（按会话激活）；DB=true 不再能激活 coordinator。
         BuiltInAgents.GateConfig g = gate();
         g.setPromptAlignSettingsResolver(resolverWith(true));
-        g.setCoordinatorMode(null);   // env+feature 层判 false —— 旧 env-only 门会在此返回 legacy 列表
+        g.setCoordinatorMode(null);   // env 未设
 
-        // WHEN / THEN: coordinator 系统提示此刻<b>已经</b>注入（LlmAgentLoop:4618/4660 同一条 DB 链），
-        //   若本分支只读 env+feature → 提示让用 worker 而列表没有 = 派活必失败（本任务要修的故障原样保留）
         assertThat(BuiltInAgents.getBuiltInAgents().stream().map(AgentDefinition::agentType))
-            .as("DB 开关是唯一用户可达路径；此处理应整表替换为 [worker]（改回 env-only 则此处变红）")
-            .containsExactly("worker");
-        assertThat(BuiltInAgents.get("worker")).isNotNull();
+            .as("DB 全局开关已移除 → 不再凭空激活 coordinator")
+            .contains("general-purpose", "statusline-setup")
+            .doesNotContain("worker");
+        assertThat(BuiltInAgents.get("worker")).isNull();
     }
 
     @Test
-    @DisplayName("DB coordinator_mode_enabled=false + feature/env 真 → 回落层被 DB 覆盖为关（legacy 列表）")
-    void dbFalse_featureTrue_dbOverrideWins() {
-        // GIVEN: DB 显式关（DB 有值 → 覆盖 env+feature 层）
+    @DisplayName("DB coordinator_mode_enabled=false + env 真 → DB 被忽略，env 生效（[worker]）")
+    void dbFalse_featureTrue_dbIgnored() {
+        // [2026-11-19 对齐 exe 2.1.328] 门只看 env；DB=false 不再压过 env。
         BuiltInAgents.GateConfig g = gate();
         g.setPromptAlignSettingsResolver(resolverWith(false));
         g.setCoordinatorMode(coordinatorOn());
@@ -212,11 +210,9 @@ class BuiltInAgentsCoordinatorTest {
         g.setVerificationEnabled(false);
         g.setEntrypoint("");
 
-        // WHEN / THEN: DB 覆盖必须生效（对齐 LlmAgentLoop 的 `gate != null ? gate : ...` 语义）
         assertThat(BuiltInAgents.getBuiltInAgents().stream().map(AgentDefinition::agentType))
-            .as("DB 显式 false 覆盖 env 层的 true（若忽略 DB 层则此处只剩 worker → 红）")
-            .contains("general-purpose", "statusline-setup")
-            .doesNotContain("worker");
+            .as("DB 层已移除：env=true → 整表替换为 [worker]（若仍被 DB=false 压住 → 红）")
+            .containsExactly("worker");
     }
 
     @Test
@@ -286,8 +282,9 @@ class BuiltInAgentsCoordinatorTest {
             ctx.refresh();
 
             assertThat(BuiltInAgents.isCoordinatorModeActive())
-                .as("DB 层 setter 未被调用 → 生产里 DB 勾选开关永不生效（而 WorkerAgentDefinitionTest 等全绿）")
-                .isTrue();
+                .as("全局 DB 层已移除：注入 resolver(true) 后判定仍为 false（env 未设）；"
+                    + "本段保留只为覆盖 setter 路径。env 层生效由第二段证明")
+                .isFalse();
         }
 
         // ── 第二段：只提供 CoordinatorMode（env+feature 层），验证 setCoordinatorMode 被调 ──

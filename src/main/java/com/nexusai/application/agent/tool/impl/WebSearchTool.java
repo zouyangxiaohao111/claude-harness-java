@@ -14,6 +14,7 @@ import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolResultBlockParam;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.tool.ToolCallSummary;
 import com.nexusai.application.agent.tool.impl.web.AnySearchEngine;
 import com.nexusai.application.agent.tool.impl.web.DeepSeekSearchEngine;
 import com.nexusai.application.agent.tool.impl.web.DuckDuckGoEngine;
@@ -383,6 +384,16 @@ public class WebSearchTool implements Tool {
                 + "(anysearch / duckduckgo).";
     }
 
+    /**
+     * [B2] 本次调用的标题句 · CC 口径 {@code "Claude wants to search the web for: <query>"}。
+     */
+    @Override
+    public String description(JsonNode input) {
+        String query = ToolCallSummary.firstText(input, "query");
+        return query == null ? "Claude wants to search the web"
+                : "Claude wants to search the web for: " + query;
+    }
+
     /** 搜索提示 · 对齐 CC WebSearchTool.ts:154 searchHint（逐字）。 */
     @Override
     public String searchHint() {
@@ -627,6 +638,12 @@ public class WebSearchTool implements Tool {
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {
         if (result == null) {
+            return null;
+        }
+        // [错误通道 CCJ-ERR-014] 失败不渲染成功模板（第二道防线）：
+        //   正常路径由执行层直构错误块（LlmAgentLoop.toolResultMessage），此处只兜底
+        //   绕过执行器直接调 mapper 的调用方。返回 null → 调用方回退默认渲染器。
+        if (isError || ToolResult.isErrorData(result.data())) {
             return null;
         }
         try {
@@ -1073,7 +1090,8 @@ public class WebSearchTool implements Tool {
         if (log.isDebugEnabled()) {
             log.debug("[WebSearchTool] 引擎=anysearch: baseUrl={} apiKeyConfigured={} proxy={}",
                     baseUrl, !DEFAULT_ANYSEARCH_API_KEY.equals(apiKey),
-                    proxy == null ? "直连" : proxy);
+                    // [保密 2026-11-22] 日志不得出现代理口令
+                    proxy == null ? "直连" : com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(proxy));
         }
         return new AnySearchEngine(baseUrl, apiKey, proxy, anysearchHttpClient);
     }

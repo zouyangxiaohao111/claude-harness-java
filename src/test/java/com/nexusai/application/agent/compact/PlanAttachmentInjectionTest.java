@@ -53,7 +53,7 @@ class PlanAttachmentInjectionTest {
             appState.putAll(next);
         };
         return ToolUseContext.of(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", Path.of("."),
             null, null, null, get, set, m -> {}, s -> {});

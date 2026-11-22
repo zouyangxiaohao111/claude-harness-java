@@ -18,7 +18,6 @@ import org.mockito.Mockito;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -52,7 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class HeadlessPermissionChainTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000a4");
+    private static final String AGENT_ID = "a0000000000000a4";
     private static final String SESSION_ID = "00000000-0000-0000-0000-0000000000b4";
 
     // ─────────────────────────────── 测试桩 ───────────────────────────────

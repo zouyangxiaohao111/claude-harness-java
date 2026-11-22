@@ -89,7 +89,7 @@ class LlmAgentLoopSessionAgentStateRegistryTest {
         LlmAgentLoop loop = loopWithRegistry(registry);
 
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);   // 主会话 sessionId（MainSessionBackgroundService:338）
-        UUID agentUuid = UUID.randomUUID();     // 后台任务 agentId（MainSessionBackgroundService:339 agentUuid）
+        String agentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();     // 后台任务 agentId（MainSessionBackgroundService:339 agentUuid）
 
         // MainSessionBackgroundService:341 同款 run 契约：sessionId + agentId=agentUuid 非 null
         AgentState state = loop.run(RunRequest.session("background query", sessionUuid, agentUuid,

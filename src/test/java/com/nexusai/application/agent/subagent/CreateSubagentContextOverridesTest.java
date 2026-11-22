@@ -48,9 +48,9 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Session B B 方案 · createSubagentContext parent + overrides 架构对齐 CC")
 class CreateSubagentContextOverridesTest {
 
-    private static final UUID PARENT_AGENT_ID = UUID.randomUUID();
+    private static final String PARENT_AGENT_ID = AgentContext.createAgentId();
     private static final String PARENT_SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-    private static final UUID CHILD_AGENT_ID = UUID.randomUUID();
+    private static final String CHILD_AGENT_ID = AgentContext.createAgentId();
     private static final String CHILD_AGENT_TYPE = "fork";
     private static final String PARENT_PROMPT = "父 Agent 已渲染的 system prompt";
     private static final Path PARENT_CWD = Paths.get("/tmp/parent-workdir");
@@ -112,7 +112,7 @@ class CreateSubagentContextOverridesTest {
         ));
 
         assertThat(child.agentId())
-            .as("child.agentId 必须等于 overrides.agentId（覆写父 PARENT_AGENT_ID）")
+            .as("child.agentId 必须等于 overrides.agentId（覆写父 PARENT_AGENT_ID；agentId 现为 a+16hex String）")
             .isEqualTo(CHILD_AGENT_ID)
             .isNotEqualTo(parent.agentId());
     }
@@ -198,7 +198,7 @@ class CreateSubagentContextOverridesTest {
     @DisplayName("with() 不可变语义：返回新 record，原 parent 不被修改（immutable semantics · CLAUDE.md 规则二）")
     void test_with_returnsNewRecord_doesNotMutateParent() {
         ToolUseContext parent = buildParentContext();
-        UUID parentAgentIdBefore = parent.agentId();
+        String parentAgentIdBefore = parent.agentId();
         List<?> parentMessagesBefore = parent.messages();
 
         ToolUseContext child = parent.with(new ToolUseContext.SubagentContextOverrides(

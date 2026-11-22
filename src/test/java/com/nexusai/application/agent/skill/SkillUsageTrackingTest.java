@@ -501,7 +501,7 @@ class SkillUsageTrackingTest {
         ObjectNode input = MAPPER.createObjectNode();
         input.put("skill", "wired-skill");
         tool.execute(new ToolUseBlock("tool-use-1", "Skill", input),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(usageCountOf(storage, "wired-skill"))
                 .as("doExecute 经 SkillToolImpl 接线后必须记录技能使用 (CC SkillTool.ts:619)")
@@ -526,7 +526,7 @@ class SkillUsageTrackingTest {
         ObjectNode input = MAPPER.createObjectNode();
         input.put("skill", "no-such-skill");
         tool.execute(new ToolUseBlock("tool-use-unknown", "Skill", input),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(usageCountOf(storage, "no-such-skill"))
                 .as("未命中技能名也必须记录 usage（CC SkillTool.ts:619 recordSkillUsage 未命中也 record）")
@@ -582,7 +582,7 @@ class SkillUsageTrackingTest {
         ObjectNode input = MAPPER.createObjectNode();
         input.put("skill", "mem-wired");
         tool.execute(new ToolUseBlock("tool-use-2", "Skill", input),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
         assertThat(tracking.getSkillUsageScore("mem-wired"))
                 .as("doExecute 写侧同样 no-op（无 ConfigStorage 不落盘），读侧返回 0")
                 .isZero();

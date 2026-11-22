@@ -460,7 +460,7 @@ public final class RunForkedAgent {
         //   buildProductionCacheSafeParams 共用，防「同一能力两套判据」）。
         String forkSessionId = resolveForkSessionId(sessionId, "createMinimalCacheSafeParams");
         ToolUseContext standalone = new ToolUseContext(
-            UUID.randomUUID(), forkSessionId,
+            null, forkSessionId,
             PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
         // CacheSafeParams 紧凑构造对 null 兜底（systemPrompt/userContext/systemContext/

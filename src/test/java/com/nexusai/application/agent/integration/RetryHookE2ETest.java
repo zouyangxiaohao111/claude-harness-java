@@ -372,7 +372,7 @@ class RetryHookE2ETest {
         ToolRegistry registry = new ToolRegistry().register(bash);
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(bash), "", new AbortController(), List.of(),
             // [S12 R1] auto 模式入口门：非 auto/plan+active 的 Ask 不进分类器
             ToolPermissionContext.strict(PermissionMode.AUTO), PermissionMode.DEFAULT

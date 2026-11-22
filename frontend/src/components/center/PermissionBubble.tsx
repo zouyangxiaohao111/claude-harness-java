@@ -1,15 +1,16 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { JsonBlock } from '@/markdown/JsonBlock'
 import type { PermissionRequestItem } from '@/stores/chatStore'
 import type { AskUserAnswers, AskUserAnnotations, AskUserQuestion, PermissionUpdate } from '@/api/types'
 import { buildSuggestionOptions } from './permissionSuggestionLabels'
+import { deliveryFailureText } from './permissionDeliveryText'
 import { ComputerUseApprovalError, ComputerUseApprovalPanel, isComputerUseTool } from './ComputerUseApprovalPanel'
 
 interface Props {
   request: PermissionRequestItem
-  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations, permissionUpdates?: PermissionUpdate[], acceptFeedback?: string, updatedInput?: unknown) => void
+  onDecision: (requestId: string, decision: 'allow' | 'deny', answers?: AskUserAnswers, annotations?: AskUserAnnotations, permissionUpdates?: PermissionUpdate[], acceptFeedback?: string, updatedInput?: unknown, afk?: { afkTimeoutMs: number; isByCountdown: boolean }) => void
   /** [plan-approval] 清空上下文后执行（对齐 CC clear-context 批准）：由 App 负责新建会话并发送执行指令 */
   onPlanClearContext?: (plan: string) => void
   /** 中止权限请求（用户放弃决策 → App 发 deny + dequeue · 对齐 CC Ctrl+C onReject，解除 worker 等待） */
@@ -37,6 +38,12 @@ interface Props {
    * 会切走计划模式，档位文案必须写明。
    */
   permissionMode?: string | null
+  /**
+   * [B3] 本批次序号（1-based）与总数。一次只展示一张（排队），这里告诉用户「第几张 / 共几张」。
+   * 总数 < 2 不显示（对齐 CC：N<2 不显示）。
+   */
+  queueIndex?: number
+  queueSize?: number
 }
 
 /** 每问勾选态：question 文本 → 单选 label / 多选 label[] */
@@ -79,9 +86,19 @@ function WorkerBadge({ color }: { color?: string | null }) {
   )
 }
 
+/**
+ * [B3] 排队序号徽标「1 of 3」。
+ *
+ * <p>WHY：多条权限请求**一次只展示一张**（答完揭示下一张）；用户需要知道还剩几张，
+ * 否则会以为只收到了一条。N<2 时不显示（对齐 CC）。
+ */
+function QueueBadge({ index, total }: { index?: number; total?: number }) {
+  if (!index || !total || total < 2) return null
+  return <span className="pb-queue-index" data-testid="pb-queue-index">{index} of {total}</span>
+}
+
 /** 工具参数展示（普通权限弹窗 · toolInput 对齐 CC per-tool PermissionComponent 展示 input） */
-function ToolInput({ toolInput }: { toolInput: unknown }) {
-  // JsonBlock 无 null 守卫 → 由调用方先挡（无参数时不渲染参数区）
+function ToolInput({ toolInput }: { toolInput: unknown }) {  // JsonBlock 无 null 守卫 → 由调用方先挡（无参数时不渲染参数区）
   if (toolInput == null) return null
   // toolInput 可能是 JSON 字符串节点（后端 JsonNode 序列化而来）：先尝试 parse，
   // 解析失败再按裸字符串交给 JsonBlock（它会 stringify，故裸串会带引号显示 —— 但那比丢内容好）。
@@ -89,7 +106,7 @@ function ToolInput({ toolInput }: { toolInput: unknown }) {
   return <JsonBlock label="工具参数" payload={typeof toolInput === 'string' ? tryParse(toolInput) ?? toolInput : toolInput} defaultOpen />
 }
 
-export function PermissionBubble({ request, onDecision, onPlanClearContext, onAbort, projectLabel, selfDirName, permissionMode }: Props) {
+export function PermissionBubble({ request, onDecision, onPlanClearContext, onAbort, projectLabel, selfDirName, permissionMode, queueIndex, queueSize }: Props) {
   const questions = extractQuestions(request)
   const elapsed = useElapsed(request.timestampMs)
   // 一键授权档位（后端 suggestions → 文案）· useMemo：useElapsed 每秒触发重渲染，
@@ -154,6 +171,7 @@ export function PermissionBubble({ request, onDecision, onPlanClearContext, onAb
             || (request.isLeaderInbox
               ? `队友请求使用工具：${request.permissionDisplay?.displayName || request.toolName}`
               : `需要权限：${request.permissionDisplay?.displayName || request.toolName}`)}
+          <QueueBadge index={queueIndex} total={queueSize} />
         </div>
         {request.isLeaderInbox && <WorkerBadge color={request.workerBadgeColor} />}
         {planModeSwitchWarning && (
@@ -169,6 +187,13 @@ export function PermissionBubble({ request, onDecision, onPlanClearContext, onAb
           <div className="pb-worker">{request.workerName ? `来自 ${request.workerName}` : '来自队友（名称待后端补字段）'}</div>
         )}
         {request.reason && <div className="pb-reason">{request.reason.reason ?? request.reason.detail}</div>}
+        {/* [D 未送达上抛] 渠道没送出去 ⇒ 明确告诉人，但⛔ 不影响决策（卡片照常等允许/拒绝）。
+            只列失败的渠道（成功的不标）。 */}
+        {request.deliveryFailures && request.deliveryFailures.length > 0 && (
+          <div className="pb-warning" data-testid="pb-delivery-failure">
+            通知未送达：{request.deliveryFailures.map(deliveryFailureText).join('；')}
+          </div>
+        )}
         <ToolInput toolInput={(request as PermissionRequestItem & { toolInput?: unknown }).toolInput} />
         {request.timestampMs && <div className="pb-waiting">已等待 {elapsed}s</div>}
         {/* 一键授权档位：suggestions 为空则不渲染（后端没给建议就没有第三档）。
@@ -199,19 +224,97 @@ export function PermissionBubble({ request, onDecision, onPlanClearContext, onAb
   if (suggestionOptions.length > 0) {
     console.warn('[perm] AskUser 弹窗收到 suggestions，本路径不支持一键授权档位，已忽略', request.requestId)
   }
-  return <AskUserForm request={request} questions={questions} onDecision={onDecision} onAbort={onAbort} />
+  return <AskUserForm request={request} questions={questions} onDecision={onDecision} onAbort={onAbort}
+    queueIndex={queueIndex} queueSize={queueSize} />
 }
 
-function AskUserForm({ request, questions, onDecision, onAbort }: {
+function AskUserForm({ request, questions, onDecision, onAbort, queueIndex, queueSize }: {
   request: PermissionRequestItem
   questions: AskUserQuestion[]
   onDecision: Props['onDecision']
   onAbort?: () => void
+  queueIndex?: number
+  queueSize?: number
 }) {
   const [selected, setSelected] = useState<Selection>({})
   // 每题自定义答案（手动填写 · 对齐 CC AskUserQuestion 输入框）：非空时优先于选项选择
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({})
   const elapsed = useElapsed(request.timestampMs)
+
+  // ── [V333 AFK] 倒计时（默认关闭：request.afkTimeoutMs 缺省 ⇒ 不渲染、不计时）──
+  //   语义对齐 CC：计时只发生在「卡片可见」期间；到点以 allow 提交**已作答项**
+  //   （未答不填默认值）。卡片隐藏 / 切会话 / 卸载一律停表，绝不在后台补发一次 allow。
+  const afkTimeoutMs = typeof request.afkTimeoutMs === 'number' && request.afkTimeoutMs > 0
+    ? request.afkTimeoutMs : null
+  const afkCountdownMs = typeof request.afkCountdownMs === 'number' && request.afkCountdownMs > 0
+    ? request.afkCountdownMs : null
+  const [afkRemainingMs, setAfkRemainingMs] = useState<number | null>(null)
+  // 提交态与答案快照都用 ref：定时器回调拿到的必须是最新一次渲染的值
+  const afkSubmittedRef = useRef(false)
+  const answersRef = useRef<{ selected: Selection; customInputs: Record<string, string> }>({ selected: {}, customInputs: {} })
+  answersRef.current = { selected, customInputs }
+
+  /** 汇总当前答案（手动填写优先；多选逗号拼接）· 超时与手动确认共用同一口径。 */
+  function collectAnswers(
+    sel: Selection, customs: Record<string, string>,
+  ): AskUserAnswers {
+    const answers: AskUserAnswers = {}
+    for (const q of questions) {
+      const custom = (customs[q.question] ?? '').trim()
+      if (custom) { answers[q.question] = custom; continue }
+      const val = sel[q.question]
+      if (val === undefined || (Array.isArray(val) && val.length === 0)) continue
+      answers[q.question] = Array.isArray(val) ? val.join(', ') : val
+    }
+    return answers
+  }
+
+  useEffect(() => {
+    if (afkTimeoutMs == null) {
+      setAfkRemainingMs(null)
+      return
+    }
+    // 计时基准 = 卡片挂载（requestId 变化 ⇒ 新卡片重新计时）
+    const deadline = Date.now() + afkTimeoutMs
+    let stopped = false
+    let timer: number | undefined
+    const stop = () => {
+      stopped = true
+      if (timer !== undefined) window.clearInterval(timer)
+    }
+    const tick = () => {
+      if (stopped) return
+      const left = deadline - Date.now()
+      setAfkRemainingMs(Math.max(0, left))
+      if (left > 0) return
+      stop()
+      if (afkSubmittedRef.current) return
+      afkSubmittedRef.current = true
+      // 只提交已答；未答不补默认值（对齐 CC answersToSubmit / skipped 遥测）
+      const snap = answersRef.current
+      onDecision(
+        request.requestId, 'allow',
+        collectAnswers(snap.selected, snap.customInputs), {},
+        undefined, undefined, undefined,
+        { afkTimeoutMs, isByCountdown: true },
+      )
+    }
+    timer = window.setInterval(tick, 1000)
+    // 页面隐藏 ⇒ 立刻停表且不再恢复（回到前台也不重启：宁可让用户手动答，也不后台误放行）
+    const onVisibility = () => {
+      if (document.visibilityState === 'hidden') {
+        stop()
+        setAfkRemainingMs(null)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    tick()
+    return () => {
+      stop()
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [afkTimeoutMs, request.requestId])
 
   function clearCustom(q: AskUserQuestion) {
     setCustomInputs((c) => (c[q.question] ? { ...c, [q.question]: '' } : c))
@@ -240,16 +343,10 @@ function AskUserForm({ request, questions, onDecision, onAbort }: {
   }
 
   function confirm() {
-    const answers: AskUserAnswers = {}
-    for (const q of questions) {
-      // 自定义输入优先（trim 后非空用自定义，否则回退选项选择）
-      const custom = (customInputs[q.question] ?? '').trim()
-      if (custom) { answers[q.question] = custom; continue }
-      const val = selected[q.question]
-      if (val === undefined || (Array.isArray(val) && val.length === 0)) continue
-      // multi-select 逗号拼接（对齐后端 AskUserQuestionTool outputSchema）
-      answers[q.question] = Array.isArray(val) ? val.join(', ') : val
-    }
+    if (afkSubmittedRef.current) return
+    afkSubmittedRef.current = true
+    // 多选逗号拼接（对齐后端 AskUserQuestionTool outputSchema）
+    const answers = collectAnswers(selected, customInputs)
     // 无 preview/notes 收集 UI → annotations 恒空对象（后端仅非空才并入 Allow.updatedInput）
     const annotations: AskUserAnnotations = {}
     onDecision(request.requestId, 'allow', answers, annotations)
@@ -259,6 +356,7 @@ function AskUserForm({ request, questions, onDecision, onAbort }: {
     <div className="permission-bubble">
       <div className="pb-title">
         {request.isLeaderInbox ? `队友请求使用工具：${request.toolName}` : `需要权限：${request.toolName}`}
+        <QueueBadge index={queueIndex} total={queueSize} />
       </div>
       {request.isLeaderInbox && <WorkerBadge color={request.workerBadgeColor} />}
       {request.warning && <div className="pb-warning">{request.warning}</div>}
@@ -299,6 +397,12 @@ function AskUserForm({ request, questions, onDecision, onAbort }: {
         </div>
       ))}
       {request.timestampMs && <div className="pb-waiting">已等待 {elapsed}s</div>}
+      {/* [V333 AFK] 只在剩余时间进入阈值内才显示剩余秒数（对齐 CC showCountdown） */}
+      {afkRemainingMs != null && afkCountdownMs != null && afkRemainingMs <= afkCountdownMs && (
+        <div className="pb-waiting" data-testid="afk-countdown">
+          剩余 {Math.ceil(afkRemainingMs / 1000)} 秒：无人回答将按已选内容继续
+        </div>
+      )}
       <div className="pb-actions">
         {onAbort && <button className="pb-abort" onClick={onAbort}>中止</button>}
         <button className="fm-btn" onClick={() => onDecision(request.requestId, 'deny')}>拒绝</button>
@@ -518,11 +622,14 @@ export function PlanApprovalCard({
       <div className="pb-actions">
         {onAbort && <button className="pb-abort" onClick={onAbort}>中止</button>}
         <button className="fm-btn" onClick={() => setFeedbackOpen((v) => !v)}>不，继续规划</button>
-        <button className="fm-btn" onClick={() => approve('default')}>手动逐次批准</button>
+        <button className="fm-btn" onClick={() => approve('default')}>手动批准编辑</button>
         {onPlanClearContext && (
           <button className="fm-btn" onClick={() => setConfirmClear(true)}>批准并清空上下文执行</button>
         )}
         <button className="fm-btn primary" onClick={() => approve('acceptEdits')}>批准并执行</button>
+      </div>
+      <div className="pb-hint">
+        手动批准编辑 = 切到默认权限模式：读文件照常，之后每次编辑或运行命令都要你单独确认。
       </div>
       {confirmClear && onPlanClearContext && (
         <div className="pb-warning" style={{ padding: '0 0 10px' }}>

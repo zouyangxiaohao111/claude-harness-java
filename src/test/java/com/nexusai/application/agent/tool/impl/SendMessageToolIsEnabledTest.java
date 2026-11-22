@@ -36,6 +36,9 @@ class SendMessageToolIsEnabledTest {
     void setUp() {
         // configHome 指向临时目录：TeammateMailbox 文件委托需要可写 configHome
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
+        // [2026-11-20] 本类只验证旧的 agent-swarms 门；跨会话能力门默认已改为 true（对齐 CC），
+        //   两门互相独立（isEnabled = swarms OR messaging），故在此显式关闭新门以隔离维度。
+        System.setProperty("nexusai.feature.messaging-beyond-own-agents", "false");
     }
 
     @AfterEach

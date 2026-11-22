@@ -64,9 +64,30 @@ public class LeaderPermissionConfirmBridge {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /**
+     * 响应分流结论（[C批 · 会话归属]）。
+     */
+    public enum ResponseResult {
+        /** 命中本桥且归属匹配 → entry 已消费（回调已触发）。 */
+        CONSUMED,
+        /** 命中本桥但响应会话与发起时的 leader 会话不一致（或归属未知）→ 拒绝，entry 保留。 */
+        REJECTED_WRONG_SESSION,
+        /** 非本桥请求（不在 map 中）→ 交 prompter 既有容错路径。 */
+        NOT_FOUND
+    }
+
     /** toolUseId → entry 回调 · 对齐 CC setToolUseConfirmQueue 队列的 dedup 语义（按 toolUseId）。 */
     private final ConcurrentHashMap<String, LeaderPermissionBridge.ToolUseConfirmEntry> confirmEntries =
         new ConcurrentHashMap<>();
+
+    /**
+     * [C批 · 会话归属] toolUseId → 发起时的 leader 会话（写入时机 = entry 入 map 时）。
+     *
+     * <p>为什么必须有：{@code confirmEntries} 只有 toolUseId 维度，任何会话都可以发一个
+     * 携带该 toolUseId 的 STOMP 响应来消费别人的待审批项（跨会话串台）。本 map 在
+     * {@link #onResponse} 的 remove 之前比对 sessionId；不匹配则不 remove、拒绝。
+     */
+    private final ConcurrentHashMap<String, String> leaderSessionOf = new ConcurrentHashMap<>();
 
     /** STOMP 推送模板 · required=false 容错（无 WebSocket 场景 → 不注册 setter，保留 null 语义）。 */
     @Autowired(required = false)
@@ -135,6 +156,10 @@ public class LeaderPermissionConfirmBridge {
             for (LeaderPermissionBridge.ToolUseConfirmEntry entry : next) {
                 if (entry != null && !confirmEntries.containsKey(entry.toolUseId())) {
                     confirmEntries.put(entry.toolUseId(), entry);
+                    // [C批 · 会话归属] 发起时登记归属；onResponse 在 remove 前比对。
+                    if (leaderSessionId != null && !leaderSessionId.isBlank()) {
+                        leaderSessionOf.put(entry.toolUseId(), leaderSessionId);
+                    }
                     pushToStomp(leaderSessionId, entry);
                 }
             }
@@ -160,6 +185,7 @@ public class LeaderPermissionConfirmBridge {
     private void pushToStomp(String leaderSessionId, LeaderPermissionBridge.ToolUseConfirmEntry entry) {
         if (leaderSessionId == null || leaderSessionId.isBlank()) {
             confirmEntries.remove(entry.toolUseId());
+            leaderSessionOf.remove(entry.toolUseId());
             log.warn("[LeaderPermissionConfirmBridge] leader 会话为空，丢弃权限请求 tool={} toolUseId={}",
                 entry.toolName(), entry.toolUseId());
             return;
@@ -188,14 +214,16 @@ public class LeaderPermissionConfirmBridge {
                 leaderSessionId, entry.toolName(), entry.workerBadgeName(), entry.workerBadgeColor());
         } catch (Exception e) {
             confirmEntries.remove(entry.toolUseId());
+            leaderSessionOf.remove(entry.toolUseId());
             log.warn("[LeaderPermissionConfirmBridge] STOMP 推送失败，移除 entry tool={}: {}",
                 entry.toolName(), e.toString());
         }
     }
 
     /**
-     * 前端权限响应分流 · 命中本桥 entry → 消费并触发回调；未命中 → 返回 false
-     * （交 {@link WebSocketPermissionPrompter}）。由
+     * 前端权限响应分流 · 命中本桥 entry 且会话归属匹配 → 消费并触发回调；未命中 →
+     * {@link ResponseResult#NOT_FOUND}（交 {@link WebSocketPermissionPrompter} 既有容错路径）。
+     * 命中但归属不符 → {@link ResponseResult#REJECTED_WRONG_SESSION}（entry 保留、不触发回调）。由
      * {@link com.nexusai.apis.permission.PermissionController#handlePermissionResponse}
      * 在 prompter.onResponse 之前调用。
      *
@@ -203,14 +231,30 @@ public class LeaderPermissionConfirmBridge {
      * permissionUpdates)；deny → onReject(feedback)；abort/cancel → onAbort()。
      * updatedInput = entry.input()（leader inbox 流程前端无 input 编辑，透传原始 input）。
      *
-     * @return true 本桥已消费（不落 prompter 的 pending map）；false 非本桥请求
+     * @param responseSessionId 响应来源会话（STOMP 路径变量，服务端解析，非 body 自报）
+     * @return CONSUMED / REJECTED_WRONG_SESSION / NOT_FOUND（见 {@link ResponseResult}）
      */
-    public boolean onResponse(String requestId, String decision, List<JsonNode> updatedPermissions,
-                              String acceptFeedback, List<JsonNode> contentBlocks,
-                              JsonNode answers, JsonNode annotations) {
+    public ResponseResult onResponse(String responseSessionId, String requestId, String decision,
+                                     List<JsonNode> updatedPermissions,
+                                     String acceptFeedback, List<JsonNode> contentBlocks,
+                                     JsonNode answers, JsonNode annotations) {
+        if (requestId == null || !confirmEntries.containsKey(requestId)) {
+            return ResponseResult.NOT_FOUND;
+        }
+        // [C批 · 会话归属] 必须在 remove 之前比对；不匹配 / 归属未知 → 不 remove、拒绝。
+        //   ⚠️ 用「先查后删」而非 remove 后判断，否则错会话的响应会把合法 entry 消费掉。
+        String ownerSession = leaderSessionOf.get(requestId);
+        if (ownerSession == null || responseSessionId == null
+                || !ownerSession.equals(responseSessionId)) {
+            log.warn("[LeaderPermissionConfirmBridge] 响应会话归属不匹配 → 拒绝且保留 entry "
+                    + "toolUseId={} ownerSession={} responseSession={}",
+                requestId, ownerSession, responseSessionId);
+            return ResponseResult.REJECTED_WRONG_SESSION;
+        }
         LeaderPermissionBridge.ToolUseConfirmEntry entry = confirmEntries.remove(requestId);
+        leaderSessionOf.remove(requestId);
         if (entry == null) {
-            return false;
+            return ResponseResult.NOT_FOUND;
         }
         boolean isAllow = "allow".equalsIgnoreCase(decision);
         boolean isAbort = "abort".equalsIgnoreCase(decision)
@@ -233,7 +277,7 @@ public class LeaderPermissionConfirmBridge {
             log.warn("[LeaderPermissionConfirmBridge] 权限响应回调执行失败 toolUseId={}: {}",
                 requestId, e.toString());
         }
-        return true;
+        return ResponseResult.CONSUMED;
     }
 
     /**

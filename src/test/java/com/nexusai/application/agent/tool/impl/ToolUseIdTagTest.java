@@ -73,7 +73,7 @@ class ToolUseIdTagTest {
 
         ToolResult<?> result = (ToolResult<?>) tool.execute(
                 skillBlock("inline-skill"),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("inline skill 正常成功返回").isFalse();
         assertThat(result.newMessages())

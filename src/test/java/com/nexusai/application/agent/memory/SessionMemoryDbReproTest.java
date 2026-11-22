@@ -85,7 +85,7 @@ class SessionMemoryDbReproTest {
         Tool editTool = fakeTool("Edit");
         Tool readTool = fakeTool("Read");
         ToolUseContext supplierTuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-supplier", PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-supplier", PermissionMode.DEFAULT,
             Map.of(), List.of(editTool, readTool), "", AbortController.NOOP, List.of());
         svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierTuc, List.of()));
@@ -169,7 +169,7 @@ class SessionMemoryDbReproTest {
 
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, Map.of(), List.of(), "", AbortController.NOOP, List.of());
     }
 

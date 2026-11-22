@@ -69,6 +69,15 @@ public class KbChunkService {
      */
     private final com.nexusai.kb.app.ingest.KbQuestionGenerationService questionGenerationService;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 这里原来硬编码 {@code null} ⇒ 编辑分块后只会重建关键词索引，并把该块
+     * content_hash 已变的向量当「过期」删掉且不重建（永久丢语义检索）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     @Autowired
     public KbChunkService(KbChunkMapper chunkMapper,
                           KbChunkRevisionMapper revisionMapper,
@@ -296,7 +305,8 @@ public class KbChunkService {
         }
         try {
             indexWriter.reindexKnowledge(chunk.getKnowledgeId(), chunk.getKnowledgeBaseId(),
-                null);
+                kbConfigService == null ? null : kbConfigService.resolveEmbeddingModelId(
+                    chunk.getKnowledgeId(), chunk.getKnowledgeBaseId()));
             log.info("[分块] 已重建索引 knowledge={}（因分块编辑）", chunk.getKnowledgeId());
         } catch (RuntimeException e) {
             // ⚠️ 不吞：索引没重建 = 搜索是旧的，必须让调用方知道。

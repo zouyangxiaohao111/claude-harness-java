@@ -261,12 +261,152 @@ public class KbIndexWriter {
             embeddingMapper.insert(row);
         }
 
+        // 3.5) 问句条目（⭐ 对齐源站 GeneratedQuestionSourceID）
+        //   正文条目已不含问句 ⇒ 问句必须自己成条，否则「用问句搜能命中」的能力会丢。
+        int questionEntries = writeQuestionEntries(chunks, knowledgeBaseId, knowledgeId, modelId, now);
+
         // 4) 写 FTS（JDBC 原生：FTS5 是虚拟表，Flex 无法映射）
         writeFts(chunks);
 
-        log.info("[索引] 文档索引完成 knowledge={} 块数={} 模型={} 维度={}",
-            knowledgeId, chunks.size(), modelId, vectors.isEmpty() ? 0 : vectors.get(0).length);
+        log.info("[索引] 文档索引完成 knowledge={} 块数={} 问句条目={} 模型={} 维度={}",
+            knowledgeId, chunks.size(), questionEntries, modelId,
+            vectors.isEmpty() ? 0 : vectors.get(0).length);
         return chunks.size();
+    }
+
+    // ── 问句条目（B 对齐源站 GeneratedQuestionSourceID）─────────────────
+
+    /** 问句条目的 source_id 前缀：{@code q:{chunkId}:{qid}}（源站同名函数同形态）。 */
+    static final String QUESTION_SOURCE_PREFIX = "q:";
+
+    /** 拼问句条目的 source_id。 */
+    static String questionSourceId(String chunkId, String questionId) {
+        return QUESTION_SOURCE_PREFIX + chunkId + ":" + questionId;
+    }
+
+    /**
+     * 从索引条目的 {@code source_id} 还原所属块 id。
+     *
+     * <p>正文条目 source_id 就是块 id；问句条目是 {@code q:{chunkId}:{qid}}。
+     * 检索侧（{@code KbHybridSearcher}）用它把两类命中归并到同一个块。
+     *
+     * @param sourceId 索引条目 source_id
+     * @return 块 id；问句条目格式不合法 ⇒ null（调用方按无效命中丢弃）
+     */
+    public static String chunkIdOfSource(String sourceId) {
+        if (sourceId == null || sourceId.isBlank()) {
+            return null;
+        }
+        if (!sourceId.startsWith(QUESTION_SOURCE_PREFIX)) {
+            return sourceId;
+        }
+        int body = QUESTION_SOURCE_PREFIX.length();
+        int sep = sourceId.indexOf(':', body);
+        return sep <= body ? null : sourceId.substring(body, sep);
+    }
+
+    /** 某块问句条目的 source_id 前缀（按块精确删旧问句条目用）。 */
+    static String questionPrefixOf(String chunkId) {
+        return QUESTION_SOURCE_PREFIX + chunkId + ":";
+    }
+
+    /**
+     * 写这批块的问句向量条目；返回写入条数。
+     *
+     * <p>id 缺失（老数据）时用「块 id + 序号」当稳定兜底，保证同一份 metadata 反复重建
+     * 得到同一 source_id（否则旧条目永远删不干净）。
+     */
+    private int writeQuestionEntries(List<KbChunkRecord> chunks, String knowledgeBaseId,
+                                     String knowledgeId, String modelId, String now) {
+        List<String> sourceIds = new ArrayList<>();
+        List<String> texts = new ArrayList<>();
+        for (KbChunkRecord c : chunks) {
+            int seq = 0;
+            for (com.nexusai.kb.app.ingest.KbGeneratedQuestions.Entry q
+                    : com.nexusai.kb.app.ingest.KbGeneratedQuestions.readEntries(c.getMetadata())) {
+                String qid = (q.id() == null || q.id().isBlank()) ? ("s" + seq) : q.id();
+                sourceIds.add(questionSourceId(c.getId(), qid));
+                texts.add(q.question());
+                seq++;
+            }
+        }
+        if (texts.isEmpty()) {
+            return 0;
+        }
+        List<float[]> vecs = new ArrayList<>(texts.size());
+        for (int start = 0; start < texts.size(); start += EMBED_BATCH) {
+            int end = Math.min(start + EMBED_BATCH, texts.size());
+            List<String> batch = texts.subList(start, end);
+            List<float[]> got = embeddingBatchExecutor != null
+                ? embeddingBatchExecutor.embedInSubBatches(batch, sub -> callEmbed(modelId, sub))
+                : callEmbed(modelId, batch);
+            if (got == null || got.size() != batch.size()) {
+                throw new IllegalStateException(
+                    "问句嵌入返回条数与请求不一致：请求 " + batch.size()
+                        + "，返回 " + (got == null ? 0 : got.size()));
+            }
+            vecs.addAll(got);
+        }
+        for (int i = 0; i < sourceIds.size(); i++) {
+            KbEmbeddingRecord row = new KbEmbeddingRecord();
+            row.setId(UUID.randomUUID().toString());
+            row.setKnowledgeBaseId(knowledgeBaseId);
+            row.setKnowledgeId(knowledgeId);
+            row.setSourceId(sourceIds.get(i));
+            row.setSourceType("question");
+            row.setModelId(modelId);
+            row.setDimensions(vecs.get(i).length);
+            row.setVector(KbVectorCodec.encode(vecs.get(i)));
+            row.setContentHash(sha256(texts.get(i)));
+            row.setCreator("");
+            row.setUpdater("");
+            row.setDeleted(0);
+            row.setTenantId(0L);
+            row.setCreateTime(KbTimeFormat.parse(now));
+            row.setUpdateTime(KbTimeFormat.parse(now));
+            embeddingMapper.insert(row);
+        }
+        return sourceIds.size();
+    }
+
+    /**
+     * 只索引「指定块」的问句（后处理生成问句后调用）· ⛔ 不动正文向量。
+     *
+     * <p><b>为什么需要它</b>：问句条目化之后，加问句只需嵌这几条问句。
+     * 原来走 {@link #reindexKnowledge} = 整篇 clearIndex + 重嵌全部正文，
+     * 659 块的文档每批后处理要重嵌 659 条（真机实测 9 批后把向量删到只剩 1 条之前，
+     * 成本也是这个量级）。
+     *
+     * @param knowledgeId     文档 ID
+     * @param knowledgeBaseId 知识库 ID
+     * @param modelId         嵌入模型（null/空 ⇒ 什么都不做，不报错）
+     * @param chunkIds        本批生成/重生成问句的块
+     * @return 写入的问句条目数
+     */
+    public int indexQuestionsOnly(String knowledgeId, String knowledgeBaseId,
+                                  String modelId, List<String> chunkIds) {
+        if (modelId == null || modelId.isBlank()
+                || chunkIds == null || chunkIds.isEmpty() || chunkMapper == null) {
+            return 0;
+        }
+        List<KbChunkRecord> chunks = chunkMapper.selectListByQuery(
+            QueryWrapper.create()
+                .where("knowledge_id = ?", knowledgeId)
+                .in("id", chunkIds));
+        if (chunks == null || chunks.isEmpty()) {
+            return 0;
+        }
+        // 先删这批块的旧问句条目（问句可能被重新生成/删减）
+        for (KbChunkRecord c : chunks) {
+            embeddingMapper.deleteByQuery(QueryWrapper.create()
+                .and("source_type = ?", "question")
+                .and("source_id LIKE ?", questionPrefixOf(c.getId()) + "%"));
+        }
+        int written = writeQuestionEntries(chunks, knowledgeBaseId, knowledgeId,
+            modelId, KbTimeFormat.now());
+        log.info("[索引] 问句条目已更新 knowledge={} 块数={} 条目={} 模型={}",
+            knowledgeId, chunks.size(), written, modelId);
+        return written;
     }
 
     /**
@@ -418,9 +558,12 @@ public class KbIndexWriter {
         String imageText = imageSubChunksEnabled
             ? ""
             : com.nexusai.kb.app.image.KbImageEnrichService.imageTextForIndex(c.getImageInfo());
-        String raw = embeddingInputOf(c)
-            + imageText
-            + com.nexusai.kb.app.ingest.KbGeneratedQuestions.indexText(c.getMetadata());
+        // ⭐ [B 对齐源站 · 2026-11-20] 问句**不再**拼进正文条目：
+        //   每条问句是独立索引条目（source_id = q:{chunkId}:{qid}，源站 GeneratedQuestionSourceID），
+        //   正文条目只含正文 + 图内文字 ⇒ 后处理生成问句时只需嵌那几条问句，
+        //   不必重嵌正文（原实现：问句进块文本 ⇒ hash 变 ⇒ 整篇 clearIndex + 全量重嵌）。
+        //   FTS 侧仍拼问句（见 writeFts），关键词召回行为不变。
+        String raw = embeddingInputOf(c) + imageText;
         return clipIndexText(raw, c.getId());
     }
 

@@ -22,6 +22,12 @@ import java.util.Map;
  *
  * <p>该工具只在非交互会话使用，按动态 JSON Schema 校验输入，并把原始对象作为
  * 独立 structured_output 返回；文本 tool_result 仅用于确认调用成功。
+ *
+ * <p><b>可用性只由注入门决定（2026-11-20 对齐 CC）</b>：CC SyntheticOutputTool.ts 的
+ * {@code isEnabled()} 恒 true，execute 内<b>没有</b>任何「交互会话拒绝调用」分支 ——
+ * 交互式带 json-schema 是「不注入 = 模型看不到」，而不是「看得见但一调就失败」。
+ * 本类因此不再做调用期判定；注入门在 {@code LlmAgentLoop#shouldInjectStructuredOutput}
+ * （jsonSchema 非空 且 非交互会话）。
  */
 @Component
 public class SyntheticOutputTool implements Tool {
@@ -84,7 +90,7 @@ public class SyntheticOutputTool implements Tool {
     }
 
     /**
-     * 当前会话是否允许 SyntheticOutput 工具调用 · 对齐 CC
+     * 当前会话是否「结构化输出可用」· 对齐 CC
      * {@code isSyntheticOutputToolEnabled(opts: { isNonInteractiveSession }): boolean}
      * （SyntheticOutputTool.ts:22-26，函数体 {@code return opts.isNonInteractiveSession;}
      * 直透传入参数）。
@@ -93,8 +99,12 @@ public class SyntheticOutputTool implements Tool {
      * （M4.3 Pattern #12 命名反直觉修正），CC 真源仅 {@code isSyntheticOutputToolEnabled}
      * 单名字面 —— 归并回 CC 命名，删除 deprecated 包装。
      *
+     * <p><b>唯一消费点 = 注入门</b>（{@code LlmAgentLoop#shouldInjectStructuredOutput}）：
+     * CC 在 main.tsx:1885-1891 用它决定是否把工具加进 tools 数组；execute 内不再复检
+     * （CC 无调用期拒绝，见类注释）。
+     *
      * @param isNonInteractiveSession 当前 session 是否非交互（CC 调用处 ctx.isNonInteractiveSession()）
-     * @return true ⇔ 当前会话非交互（允许 SyntheticOutput tool 调用）；false ⇔ 交互会话（拒绝）
+     * @return true ⇔ 当前会话非交互（结构化输出可用）；false ⇔ 交互会话（不注入）
      */
     public static boolean isSyntheticOutputToolEnabled(boolean isNonInteractiveSession) {
         return isNonInteractiveSession;
@@ -171,12 +181,9 @@ public class SyntheticOutputTool implements Tool {
 
     @Override
     public AgentToolResult execute(ToolUseBlock call, ToolUseContext ctx) {
-        if (ctx != null && !isSyntheticOutputToolEnabled(ctx.isNonInteractiveSession())) {
-            log.warn("StructuredOutput 在交互会话被拒绝: toolUseId={}", call.id());
-            return ToolResult.error(call.id(),
-                "StructuredOutput is only available in non-interactive sessions");
-        }
-
+        // ⛔ 无调用期会话判定（2026-11-20 对齐 CC）：可见性完全由注入门决定
+        //   （LlmAgentLoop#shouldInjectStructuredOutput）。交互会话模型根本看不到本工具，
+        //   因此这里只做 schema 校验。
         Tool.ValidationResult validation = new ToolInputValidator().validateSchema(this, call.input());
         if (!validation.ok()) {
             log.warn("StructuredOutput schema 校验失败: toolUseId={} error={}",

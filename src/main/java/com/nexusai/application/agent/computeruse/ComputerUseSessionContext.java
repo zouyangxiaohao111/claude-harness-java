@@ -57,10 +57,10 @@ public record ComputerUseSessionContext(String sessionId, ToolUseContext toolUse
         if (callContext == null || callContext.sessionId() == null || callContext.sessionId().isBlank()) {
             throw new IllegalArgumentException("MCP 调用信封缺 sessionId");
         }
-        UUID agentId = null;
+        String agentId = null;
         if (callContext.agentId() != null && !callContext.agentId().isBlank()) {
             try {
-                agentId = UUID.fromString(callContext.agentId());
+                agentId = callContext.agentId();
             } catch (IllegalArgumentException e) {
                 throw new IllegalArgumentException("MCP 调用信封 agentId 非法: " + callContext.agentId(), e);
             }

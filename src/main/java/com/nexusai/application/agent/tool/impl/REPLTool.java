@@ -179,6 +179,12 @@ public class REPLTool implements Tool {
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(
             AgentToolResult<?> result, String toolUseId, boolean isError) {
+        // [错误通道 CCJ-ERR-014] 失败不渲染成功模板（第二道防线）：旧实现虽会把 ToolError
+        //   落到 renderToolResultPayloadText（文本正确），但 is_error 仍取调用方参数，
+        //   绕过执行器直调时可能渲染成"内容像错误、标志成功"。返回 null 统一交给调用方兜底。
+        if (isError || ToolResult.isErrorData(result == null ? null : result.data())) {
+            return null;
+        }
         String content;
         if (result instanceof ToolResult<?> tr && tr.data() instanceof String s) {
             try {

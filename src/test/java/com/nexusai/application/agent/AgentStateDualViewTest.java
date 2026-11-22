@@ -161,7 +161,7 @@ class AgentStateDualViewTest {
             userMessage("pre1", "pre-boundary"),
             compactBoundary(),
             userMessage("post1", "post-boundary")));
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-dual-view");
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-dual-view");
 
         AgentLoopContext ctx = TestContexts.agentLoopContext(null,
             Mockito.mock(LlmProviderFactory.class), null, null, null);
@@ -272,7 +272,7 @@ class AgentStateDualViewTest {
         };
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }

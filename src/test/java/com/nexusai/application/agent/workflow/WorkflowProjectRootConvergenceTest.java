@@ -161,7 +161,7 @@ class WorkflowProjectRootConvergenceTest {
     }
 
     private ToolUseContext toolUseContext() {
-        return new ToolUseContext(UUID.randomUUID(), SESSION_ID, PermissionMode.DEFAULT, Map.of());
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID, PermissionMode.DEFAULT, Map.of());
     }
 
     private LaunchInput probeInput() {

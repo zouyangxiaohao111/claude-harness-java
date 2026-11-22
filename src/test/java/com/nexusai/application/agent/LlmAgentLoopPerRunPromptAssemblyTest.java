@@ -377,7 +377,7 @@ class LlmAgentLoopPerRunPromptAssemblyTest {
 
     /** hook agent 走 toolExecContext 的 DONT_ASK 专属分支 → 必须带 DONT_ASK permCtx。 */
     private static ToolUseContext tuc(String sessionId, PermissionMode mode) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, mode,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, mode,
                 List.of(TestContexts.dummyTool("Bash")))
             .withPermissionContext(ToolPermissionContext.strict(mode), mode);
     }

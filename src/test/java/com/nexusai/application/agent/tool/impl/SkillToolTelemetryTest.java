@@ -110,7 +110,7 @@ class SkillToolTelemetryTest {
     }
 
     private static ToolUseContext ctx() {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
     }
 
     private static ToolUseBlock skillBlock(String skillName) {

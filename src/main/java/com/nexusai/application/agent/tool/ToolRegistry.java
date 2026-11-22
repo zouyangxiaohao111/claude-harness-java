@@ -185,7 +185,7 @@ public class ToolRegistry {
         ToolNameConstants.ENTER_WORKTREE_TOOL_NAME,                                  // EnterWorktreeTool :225
         ToolNameConstants.EXIT_WORKTREE_TOOL_NAME,                                   // ExitWorktreeTool :225
         ToolNameConstants.SEND_MESSAGE_TOOL_NAME,                                    // SendMessageTool :226
-        ToolNameConstants.LIST_PEERS_TOOL_NAME,                                      // ListPeersTool :227
+        ToolNameConstants.LIST_AGENTS_TOOL_NAME,                                     // ListAgentsTool :227（旧名 ListPeers 为 alias）
         ToolNameConstants.TEAM_CREATE_TOOL_NAME,                                     // TeamCreateTool :229 (swarms)
         ToolNameConstants.TEAM_DELETE_TOOL_NAME,                                     // TeamDeleteTool :229 (swarms)
         ToolNameConstants.VERIFY_PLAN_EXECUTION_TOOL_NAME,                           // VerifyPlanExecutionTool :231
@@ -206,7 +206,14 @@ public class ToolRegistry {
         ToolNameConstants.TESTING_PERMISSION_TOOL_NAME,                              // TestingPermissionTool :244
         ToolNameConstants.LIST_MCP_RESOURCES_TOOL_NAME,                              // ListMcpResourcesTool :245
         ToolNameConstants.READ_MCP_RESOURCE_TOOL_NAME,                               // ReadMcpResourceTool :246
-        ToolNameConstants.TOOL_SEARCH_TOOL_NAME                                      // ToolSearchTool :249
+        ToolNameConstants.TOOL_SEARCH_TOOL_NAME,                                     // ToolSearchTool :249
+        // ── 安装类（Java-only · 排在 CC 已知工具之后，与 sortByCcOrder 的「未知工具置后」一致）──
+        ToolNameConstants.MANAGE_PLUGIN_TOOL_NAME,                                   // ManagePluginTool
+        ToolNameConstants.MANAGE_MCP_SERVER_TOOL_NAME,                               // ManageMcpServerTool
+        // ── IM 类（Java-only · 排在 CC 已知工具之后）──
+        ToolNameConstants.LIST_IM_CHATS_TOOL_NAME,                                   // ListImChatsTool
+        ToolNameConstants.SEND_IM_AS_USER_TOOL_NAME,                                 // SendImAsUserTool
+        ToolNameConstants.ARTIFACT_TOOL_NAME                                         // ArtifactTool（本仓本地发布版）
     );
 
     /**
@@ -900,6 +907,13 @@ public class ToolRegistry {
             log.warn("ToolRegistry: tool '{}' (id={}) disabled → No such tool available", call.name(), call.id());
             return ToolResult.error(call.id(), "No such tool available: " + call.name());
         }
+        // [V329 会话可见集守卫] 与 StreamingToolExecutor.add 同源：会话禁用 / 无人值守 Ask
+        //   一律 No such tool available（fork / compact 直调路径也覆盖）。
+        if (isBlockedBySession(tool, ctx)) {
+            log.warn("ToolRegistry: tool '{}' (id={}) 不在本会话可见集 → No such tool available",
+                call.name(), call.id());
+            return ToolResult.error(call.id(), "No such tool available: " + call.name());
+        }
         try {
             log.info("ToolRegistry: dispatching '{}' (id={})", call.name(), call.id());
             AgentToolResult<?> rawResult = tool.execute(call, ctx);
@@ -912,5 +926,37 @@ public class ToolRegistry {
                 call.name(), call.id(), e);
             return ToolResult.error(call.id(), "Internal tool error: " + e.getMessage());
         }
+    }
+
+    /**
+     * 会话级可见集守卫（V329）· 与 {@code StreamingToolExecutor.isBlockedBySession} 同义。
+     *
+     * <p>豁免 SPECIAL_TOOLS 与 ToolSearch 自身；无 ctx/sessionId ⇒ 不拦。
+     */
+    private static boolean isBlockedBySession(Tool tool, ToolUseContext ctx) {
+        if (ctx == null) {
+            return false;
+        }
+        String name = tool.name();
+        if (ctx.sessionId() == null || ctx.sessionId().isBlank()
+                || com.nexusai.common.SessionKeys.isNoSession(ctx.sessionId())) {
+            // [V330 · cron 无头] 无会话（NO_SESSION 哨兵）的非交互执行没有可应答 UI ⇒ Ask 不可执行。
+            return ctx.isNonInteractiveSession()
+                && com.nexusai.application.agent.config.ImUnattendedConfig
+                    .ASK_USER_QUESTION_TOOL.equals(name);
+        }
+        if (name == null
+                || ToolNameConstants.SPECIAL_TOOLS.contains(name)
+                || ToolNameConstants.TOOL_SEARCH_TOOL_NAME.equals(name)) {
+            return false;
+        }
+        // [V330] 与 schema/ToolSearch/执行器同一解析器（实时值：本路径不在生产主执行链，
+        //   作为 fork/直调的防线；主路径本轮快照见 StreamingToolExecutor）。
+        com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot visibility =
+                SessionToolVisibility.resolve(ctx.sessionId(), ctx.requestExtras());
+        return visibility.blocks(name)
+                || (visibility.askExcluded()
+                    && com.nexusai.application.agent.config.ImUnattendedConfig
+                        .ASK_USER_QUESTION_TOOL.equals(name));
     }
 }

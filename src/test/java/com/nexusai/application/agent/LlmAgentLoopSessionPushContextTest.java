@@ -88,7 +88,7 @@ class LlmAgentLoopSessionPushContextTest {
     void derivedPushContext_fromPoolThread_reachesTokenWarningTopic() throws Exception {
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
         String sessionId = "sess-c0ffee01";
-        AgentState state = new AgentState("sys", sessionId, (java.util.UUID) null);
+        AgentState state = new AgentState("sys", sessionId, (String) null);
         AgentLoopContext ctx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
         runOnPoolThread(newSubagentLoopPool(), () -> {
@@ -121,7 +121,7 @@ class LlmAgentLoopSessionPushContextTest {
     @Test
     @DisplayName("wsTemplate==null（非 STOMP 路径）→ 无 push 上下文：跳过推送且不抛（不阻断压缩）")
     void nullWs_yieldsNullPushContext_andPublishDoesNotThrow() throws Exception {
-        AgentState state = new AgentState("sys", "sess-c0ffee02", (java.util.UUID) null);
+        AgentState state = new AgentState("sys", "sess-c0ffee02", (String) null);
         AgentLoopContext ctx = TestContexts.agentLoopContext(null, null, null, null, null);
         assertThat(ctx.wsTemplate()).as("前置：该 ctx 无 wsTemplate").isNull();
 
@@ -142,7 +142,7 @@ class LlmAgentLoopSessionPushContextTest {
     @DisplayName("sessionId==null → 无 push 上下文（差分对照）")
     void nullSessionId_yieldsNullPushContext() throws Exception {
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
-        AgentState stateNoSid = new AgentState("sys", null, (java.util.UUID) null);
+        AgentState stateNoSid = new AgentState("sys", null, (String) null);
         AgentLoopContext ctx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
         runOnPoolThread(newSubagentLoopPool(), () -> {
@@ -164,7 +164,7 @@ class LlmAgentLoopSessionPushContextTest {
         // registerSessionPushContext 用的那个值 ⇒ 推导出的 topic 逐字不变（改造前后一致）。
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
         String parentSessionId = "sess-parent01";
-        AgentState subagentState = new AgentState("subagent-sys", parentSessionId, java.util.UUID.randomUUID());
+        AgentState subagentState = new AgentState("subagent-sys", parentSessionId, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         AgentLoopContext subagentCtx = TestContexts.agentLoopContextWithWs(null, null, null, ws);
 
         CompactWarningState.SessionPushContext pushCtx =

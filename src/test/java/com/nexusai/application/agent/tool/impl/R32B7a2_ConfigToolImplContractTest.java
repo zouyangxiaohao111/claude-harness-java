@@ -170,7 +170,7 @@ class R32B7a2_ConfigToolImplContractTest {
     void checkPermissionsGetAllows() {
         // WHY: CC ConfigTool.ts:411 GET 自动允许; 用户不会因查看配置被弹窗打扰
         JsonNode getInput = JsonNodeFactory.instance.objectNode().put("setting", "theme");
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT);
 
         PermissionResult result = tool.checkPermissions(getInput, ctx);
@@ -188,7 +188,7 @@ class R32B7a2_ConfigToolImplContractTest {
         JsonNode setInput = JsonNodeFactory.instance.objectNode()
             .put("setting", "permissions.defaultMode")
             .put("value", "plan");
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT);
 
         PermissionResult result = tool.checkPermissions(setInput, ctx);
@@ -322,7 +322,7 @@ class R32B7a2_ConfigToolImplContractTest {
         // WHY: checkPermissions 返回的 reason 在审计日志里展示 — 必须归类到
         // PermissionDecisionReason 的合法子类, 不能 null
         JsonNode getInput = JsonNodeFactory.instance.objectNode().put("setting", "theme");
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT);
 
         PermissionResult result = tool.checkPermissions(getInput, ctx);

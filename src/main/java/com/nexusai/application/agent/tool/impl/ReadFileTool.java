@@ -487,6 +487,16 @@ public class ReadFileTool implements Tool {
                "let callers read a precise portion of the file instead of the whole content.";
     }
 
+    /**
+     * [B2] 本次调用的一句话摘要（权限推送/弹窗标题），对齐 CC {@code tool.description(input)}。
+     * ⛔ 不复用上面的注册期长描述 —— 那是给模型的说明书，不是这一条请求的标题。
+     */
+    @Override
+    public String description(JsonNode input) {
+        // [B2] CC 口径：固定标题句，不含路径（路径细节留给 input_preview）。
+        return "Read a file from the local filesystem.";
+    }
+
     @Override
     public JsonNode inputSchema() {
         ObjectNode root = JSON.createObjectNode();

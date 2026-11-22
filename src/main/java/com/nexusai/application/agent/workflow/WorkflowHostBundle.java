@@ -21,7 +21,7 @@ import java.util.UUID;
  * @param agentId        CC original: {@code agentId?} (hostHandle.ts:16) — 工具调用上下文 agentId
  */
 public record WorkflowHostBundle(ToolUseContext toolUseContext, Object canUseTool,
-                                 Object parentMessage, UUID agentId) {
+                                 Object parentMessage, String agentId) {
 
     /**
      * 从 toolUseContext/canUseTool 构建 bundle · CC original: {@code buildHostBundle}
@@ -37,7 +37,7 @@ public record WorkflowHostBundle(ToolUseContext toolUseContext, Object canUseToo
      */
     public static WorkflowHostBundle build(ToolUseContext toolUseContext, Object canUseTool,
                                            Object parentMessage) {
-        UUID agentId = toolUseContext != null ? toolUseContext.agentId() : null;
+        String agentId = toolUseContext != null ? toolUseContext.agentId() : null;
         return new WorkflowHostBundle(toolUseContext, canUseTool, parentMessage, agentId);
     }
 }

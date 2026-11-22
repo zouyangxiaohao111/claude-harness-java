@@ -86,14 +86,14 @@ public class StructuredOutputEnforcementHook implements GenericHook {
      */
     static final long CALL_TIMEOUT_MS = 5000L;
 
-    private final UUID hookAgentId;
+    private final String hookAgentId;
     private final AgentState state;
 
     /**
      * @param hookAgentId 本 hook agent 的唯一 ID（CC asAgentId('hook-agent-${UUID}')），用于 STOP 事件自过滤
      * @param state       hook agent 的 AgentState，onEvent 时读 messages 做成功判定
      */
-    public StructuredOutputEnforcementHook(UUID hookAgentId, AgentState state) {
+    public StructuredOutputEnforcementHook(String hookAgentId, AgentState state) {
         this.hookAgentId = hookAgentId;
         this.state = state;
     }
@@ -105,7 +105,7 @@ public class StructuredOutputEnforcementHook implements GenericHook {
             return HookResult.proceed();
         }
         // 自过滤 2: 仅处理本 hook agent 的 STOP（隔离父循环与其他并发 hook agent）
-        if (event.agentId() == null || !event.agentId().equals(hookAgentId.toString())) {
+        if (event.agentId() == null || !event.agentId().equals(hookAgentId)) {
             return HookResult.proceed();
         }
         // [IMPL-10] DEL-TH-04: per-call 超时测量（CC hookHelpers.ts:81 timeout:5000 对单次

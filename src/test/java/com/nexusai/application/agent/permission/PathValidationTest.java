@@ -398,7 +398,7 @@ class PathValidationTest {
         // 再与**介质自己**的派生（SessionStorage.sessionProjectDir）逐字对照 —— 二者若不同源，
         // 媒体写 → 权限读 回环即断裂（session memory 提取会静默拿到空内容），本断言即红。
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, "", Path.of("C:/proj"));
         PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc);
@@ -435,7 +435,7 @@ class PathValidationTest {
                 .as("夹具前提自检：该态下 getProjectRoot 确实抛（⇒ PathValidationEnv 的 catch 承重）")
                 .isInstanceOf(IllegalStateException.class);
 
-            ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), sid, PermissionMode.DEFAULT,
+            ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sid, PermissionMode.DEFAULT,
                 List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
                 Map.of(), false, "", Path.of("C:/wt"));
             PathValidationEnv env = PathValidationEnv.fromToolUseContext(tuc);
@@ -849,7 +849,7 @@ class PathValidationTest {
 
     /** 13 参最小 ToolUseContext 工厂（sessionId 固定，便于绑定 SessionProjectRoot）。 */
     private static ToolUseContext ctxWithSession(String sessionId, Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of()),
             PermissionMode.DEFAULT, Map.of(), false, "", effectiveCwd);

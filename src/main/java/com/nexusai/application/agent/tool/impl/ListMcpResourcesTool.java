@@ -163,7 +163,7 @@ public class ListMcpResourcesTool implements Tool {
     }
 
     @Override
-    public ToolResult<String> execute(ToolUseBlock call) {
+    public ToolResult<?> execute(ToolUseBlock call) {
         JsonNode input = call.input();
         String targetServer = input.has("server") && !input.get("server").asText().isEmpty()
             ? input.get("server").asText() : null;

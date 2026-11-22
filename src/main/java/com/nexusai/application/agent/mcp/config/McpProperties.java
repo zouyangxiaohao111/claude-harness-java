@@ -30,9 +30,9 @@ public record McpProperties(
     //   (channelAllowlist.ts:51-53, GrowthBook 'tengu_harbor' 默认 false)。默认 false →
     //   --channels 是 no-op、无 handler 注册。
     boolean channelsEnabled,
-    // [impl-I-3 T6] channel permission relay 开关 · CC original: isChannelPermissionRelayEnabled()
-    //   (channelPermissions.ts:36-38, GrowthBook 'tengu_harbor_permissions' 默认 false)。
-    //   独立于 channelsEnabled（CC「no bake time if it goes out tomorrow」）。
+    // [V334 起不再参与判定] 旧 yml 键 nexusai.mcp.channels-permission-relay-enabled。
+    //   用户 2026-11-22 裁定：两道门改为 settings 两列（DB 唯一权威，默认开）。
+    //   字段保留只为兼容旧配置文件（删掉会让旧 yml 出现未知键）；⛔ 不要再用它做门控。
     boolean channelsPermissionRelayEnabled,
     Pool pool,
     List<Server> servers,

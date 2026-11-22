@@ -107,7 +107,7 @@ class SkillToolInvokedSkillWriteTest {
         // 故意传随机 agentId 的 ctx —— registry 命中闸必 miss（resolver 只匹配 sessionId，
         // apply(随机agentId)=null）→ 写侧归因 null，随机 UUID 不污染写侧 key
         //（对齐 CC getAgentContext()?.agentId ?? null 主会话语义）。
-        tool.execute(skillBlock("inline-skill", null), ToolUseContext.of(UUID.randomUUID(), sessionId));
+        tool.execute(skillBlock("inline-skill", null), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         var mainSkills = sessionState.getInvokedSkillsForAgent(null);
         assertThat(mainSkills)
@@ -142,14 +142,14 @@ class SkillToolInvokedSkillWriteTest {
 
         SubagentExecutor executor = mock(SubagentExecutor.class);
         doAnswer(inv -> SubagentExecutor.SubagentResult.completed(
-                "fork 完成", 0, 0L, UUID.randomUUID().toString()))
+                "fork 完成", 0, 0L, com.nexusai.application.agent.subagent.AgentContext.createAgentId()))
                 .when(executor).executeForkedSkill(
                         anyString(), any(Command.class), anyString(),
                         any(ToolUseContext.class), any());
         tool.setSubagentExecutor(executor);
         tool.setSessionStateResolver(sid -> sid.equals(sessionId) ? sessionState : null);
 
-        tool.execute(skillBlock("fork-skill", null), ToolUseContext.of(UUID.randomUUID(), sessionId));
+        tool.execute(skillBlock("fork-skill", null), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         assertThat(sessionState.getInvokedSkillsForAgent(null))
                 .as("fork 分支不得写入主会话 invokedSkills (CC SkillTool.ts:622-632 + :761-764)")
@@ -168,7 +168,7 @@ class SkillToolInvokedSkillWriteTest {
         // 不注入 sessionStateResolver
 
         var result = tool.execute(skillBlock("inline-skill", null),
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
                 .as("resolver 未注入不影响 inline skill 正常执行返回")
@@ -189,9 +189,10 @@ class SkillToolInvokedSkillWriteTest {
         SkillToolImpl tool = new SkillToolImpl(newInlineRegistry(tempDir));
 
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);   // 主会话 sessionId（MainSessionBackgroundService:338）
-        UUID agentUuid = UUID.randomUUID();     // 后台任务 agentId（MainSessionBackgroundService:341 agentUuid）
+        String agentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();     // 后台任务 agentId（MainSessionBackgroundService:341 agentUuid）
         AgentState sharedState = new AgentState("test-system-prompt");                    // 共享会话 AgentState（≈CC 全局 STATE）
-        AgentState bgState = new AgentState("test-system-prompt", sessionUuid, agentUuid); // 后台 loop AgentState
+        AgentState bgState = new AgentState("test-system-prompt", sessionUuid,
+                agentUuid); // 后台 loop AgentState
 
         // 生产接线还原：LlmAgentLoop:1656-1659 双分支注册（主会话按 sessionId / 后台按 agentId）
         //   + ToolRegistrationConfig:349 resolver=sessionAgentStateRegistry::get
@@ -204,25 +205,30 @@ class SkillToolInvokedSkillWriteTest {
         tool.execute(skillBlock("inline-skill", null), ToolUseContext.of(agentUuid, sessionUuid));
 
         // 断言 1：正向分支 —— 条目落共享会话 AgentState，key=agentUuid:skill，agentId=agentUuid（CC state.ts:1516）
-        var bgSkills = sharedState.getInvokedSkillsForAgent(agentUuid);
+        var bgSkills = sharedState.getInvokedSkillsForAgent(
+                agentUuid);
         assertThat(bgSkills)
                 .as("后台 skill 必须按 agentUuid 归因（CC processSlashCommand.tsx:885 + LocalMainSessionTask.ts:368），否则 /clear 误清")
                 .hasSize(1);
         bgSkills.forEach((key, info) -> {
-            assertThat(key).as("复合键 = `${agentId}:${skillName}`（CC state.ts:1516）").isEqualTo(agentUuid + ":inline-skill");
-            assertThat(info.agentId()).as("条目 agentId=agentUuid（CC state.ts:1504）").isEqualTo(agentUuid);
+            assertThat(key).as("复合键 = `${agentId}:${skillName}`（CC state.ts:1516）")
+                    .isEqualTo(agentUuid + ":inline-skill");
+            assertThat(info.agentId()).as("条目 agentId=agentUuid（CC state.ts:1504）")
+                    .isEqualTo(agentUuid);
             assertThat(info.skillName()).as("skillName = 技能名（CC state.ts:1503）").isEqualTo("inline-skill");
         });
 
         // 主会话对照：随机 agentId ctx → registry miss → 仍 null 归因；同 skillName 双条目并存不覆盖（复合键语义）
-        tool.execute(skillBlock("inline-skill", null), ToolUseContext.of(UUID.randomUUID(), sessionUuid));
+        tool.execute(skillBlock("inline-skill", null), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionUuid));
         assertThat(sharedState.getInvokedSkillsForAgent(null))
                 .as("ctx.agentId() registry miss → null 归因（既有行为不变）")
                 .hasSize(1);
 
         // 断言 2：/clear preserved={agentUuid}（对齐 CommandController:370-373 + CC conversation.ts:93-106 + state.ts:1543-1555）
-        sharedState.clearInvokedSkills(java.util.Set.of(agentUuid));
-        assertThat(sharedState.getInvokedSkillsForAgent(agentUuid))
+        sharedState.clearInvokedSkills(java.util.Set.of(
+                agentUuid));
+        assertThat(sharedState.getInvokedSkillsForAgent(
+                agentUuid))
                 .as("后台 agentId∈preserved → 跨 /clear 存活（state.ts:1551 保留语义）")
                 .hasSize(1);
         assertThat(sharedState.getInvokedSkillsForAgent(null))

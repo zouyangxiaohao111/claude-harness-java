@@ -156,7 +156,7 @@ class ImageValidatorTest {
         int max = 5 * 1024 * 1024;
         state.appendMessage(userMessageWithImage("大图", List.of(base64ImageBlock("A".repeat(max + 1)))));
 
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
 
         AtomicInteger callModelInvoked = new AtomicInteger(0);
         var deps = new LoopDepsForTest(ctx, callModelInvoked);

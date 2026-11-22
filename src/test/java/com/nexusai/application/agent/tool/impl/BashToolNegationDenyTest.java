@@ -37,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class BashToolNegationDenyTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     private static PermissionRule rule(PermissionBehavior behavior, String content) {
         return new PermissionRule(PermissionRuleSource.USER_SETTINGS, behavior,

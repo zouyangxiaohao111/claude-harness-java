@@ -45,7 +45,7 @@ import static org.mockito.Mockito.when;
 class TaskToolsExpandedViewTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
+    private static final String AGENT_ID = "a1111111111111111";
     private static final String SESSION_ID = "22222222-2222-2222-2222-222222222222";
 
     // ════════════════════════════════════════════════════════════════════

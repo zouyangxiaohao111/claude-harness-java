@@ -93,7 +93,7 @@ class EditImpliesReadTest {
      * 那是<b>按会话</b>解析（会 fail-loud），只在单测 sessionless 环境下才恒等于进程 {@code user.dir}。
      */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }

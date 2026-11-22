@@ -327,7 +327,7 @@ class SessionMemoryTelemetryTest {
             }
         };
         return new com.nexusai.application.agent.tool.ToolUseContext(
-            java.util.UUID.randomUUID(), "no-session",
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "no-session",
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(echo), "",
             com.nexusai.application.agent.tool.AbortController.NOOP, List.of());

@@ -226,7 +226,7 @@ class ToolUseSummaryGeneratorTest {
                 "a0123456789abcdef", "sess-parent", "Explore", true, "req_loop_1", "spawn");
         com.nexusai.application.agent.tool.ToolUseContext stampedTuc =
             com.nexusai.application.agent.tool.ToolUseContext.of(
-                    java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                    com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                 .withAvailableTools(java.util.List.of(
                     com.nexusai.application.agent.TestContexts.dummyTool("Bash")))
                 .withAgentContext(subCtx);
@@ -468,7 +468,7 @@ class ToolUseSummaryGeneratorTest {
                 state.rawMessages(), null,
                 callerTuc != null ? callerTuc
                     : com.nexusai.application.agent.tool.ToolUseContext.of(
-                        java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+                        com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
                         .withAvailableTools(java.util.List.of(
                             com.nexusai.application.agent.TestContexts.dummyTool("Bash"))),
                 QuerySource.USER, "test-model", null, null, null, null, null,

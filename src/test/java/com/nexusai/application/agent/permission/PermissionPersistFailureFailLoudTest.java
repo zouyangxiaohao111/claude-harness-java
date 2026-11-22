@@ -23,7 +23,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -77,7 +76,7 @@ import static org.mockito.Mockito.mock;
 class PermissionPersistFailureFailLoudTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000a4c");
+    private static final String AGENT_ID = "a000000000000a4c";
     private static final String SESSION_ID = "sess-a4c0001";
     /** LOCAL_SETTINGS 目的地 —— 可持久化，persist 段会真的被执行（SESSION/CLI_ARG 会被拦住）。 */
     private static final String ADD_LOCAL_RULE =

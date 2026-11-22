@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
-import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode } from '@/api/types'
-import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
+import { PERMISSION_MODE_LABELS, PERMISSION_MODE_DESCRIPTIONS, type PermissionMode, type AskUserAfkTimeoutSetting } from '@/api/types'
+import type { AppSettings, CrossSessionInbound, UpdateSettingsRequest } from '@/api/types'
 import { getMemoryConfig, updateMemoryConfig } from '@/api/memory'
 import type { MemoryConfig } from '@/api/memory'
 import { ApiError } from '@/api/rest'
@@ -17,6 +17,44 @@ interface EnvConfigPanelProps {
   /** 当前活动会话 id：/memory/config 的 dreamStatus 是 per-project 数据，后端 sessionId 必填
    *  （缺值 400）。null = 无活动会话 → 记忆区块呈现显式错误态。 */
   sessionId?: string | null
+}
+
+/**
+ * [V321 peer-settings] 跨会话入站策略展示名。
+ *
+ * <p>`auto` 既是「未配置」的展示态，也是 PUT 的清除哨兵（后端收到 'auto' 把列写回 NULL）。
+ * ⚠️ 这里只做展示映射：不把运行时按权限模式推导出的 accept 回写配置。
+ */
+const CROSS_SESSION_INBOUND_LABELS: Record<CrossSessionInbound, string> = {
+  auto: '自动（按权限模式）',
+  accept: '接受',
+  hold: '待确认',
+  refuse: '拒绝',
+}
+const CROSS_SESSION_INBOUND_DESCRIPTIONS: Record<CrossSessionInbound, string> = {
+  auto: '按双方权限模式判定：匹配则直接接收，不匹配转待确认。',
+  accept: '其他会话发来的消息直接接收。',
+  hold: '先挂起，等你确认后再处理。',
+  refuse: '拒绝其他会话发来的消息。',
+}
+
+/**
+ * [V333 AFK] AskUserQuestion 超时档位展示名/说明。
+ *
+ * <p>值域来自 CC settings.askUserQuestionTimeout（never / 60s / 5m / 10m）；
+ * 「从不」= 默认（卡片持久显示、不自动继续），只有明确选其它档位才出现倒计时。
+ */
+const ASK_AFK_LABELS: Record<AskUserAfkTimeoutSetting, string> = {
+  never: '从不',
+  '60s': '1 分钟',
+  '5m': '5 分钟',
+  '10m': '10 分钟',
+}
+const ASK_AFK_DESCRIPTIONS: Record<AskUserAfkTimeoutSetting, string> = {
+  never: '卡片一直等你回答，不自动继续（默认）。',
+  '60s': '1 分钟无操作后按已选内容继续；没作答的问题留空，不替你选。',
+  '5m': '5 分钟无操作后按已选内容继续；没作答的问题留空，不替你选。',
+  '10m': '10 分钟无操作后按已选内容继续；没作答的问题留空，不替你选。',
 }
 
 /** WebSearch 引擎 id → 展示名（后端 websearchEngine 的取值：anysearch / duckduckgo / deepseek）。 */
@@ -94,6 +132,30 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     return () => document.removeEventListener('mousedown', onDoc)
   }, [permOpen])
 
+  // [V333 AFK] 提问超时档位抽屉（同权限模式抽屉语义：点击外部收起）
+  const [afkOpen, setAfkOpen] = useState(false)
+  const afkRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!afkOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (afkRef.current && !afkRef.current.contains(e.target as Node)) setAfkOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [afkOpen])
+
+  // [V321 peer-settings] 跨会话入站策略抽屉（同权限模式抽屉语义：点击外部收起）
+  const [inboundOpen, setInboundOpen] = useState(false)
+  const inboundRef = useRef<HTMLDivElement>(null)
+  useEffect(() => {
+    if (!inboundOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (inboundRef.current && !inboundRef.current.contains(e.target as Node)) setInboundOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [inboundOpen])
+
   const [compactDraft, setCompactDraft] = useState<string>(
     settings?.autoCompactWindow != null ? String(settings.autoCompactWindow) : '',
   )
@@ -108,7 +170,10 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const [wsEngine, setWsEngine] = useState<string>(settings?.websearchEngine ?? 'anysearch')
   const [wsUseSmallModel, setWsUseSmallModel] = useState<boolean>(settings?.websearchUseSmallModel ?? false)
   const [wsProxy, setWsProxy] = useState<string>(settings?.proxy ?? '')
-  const [wsApiKey, setWsApiKey] = useState<string>(settings?.apiKey ?? '')
+  // [保密 · 用户 2026-11-22「明文 apiKey 不能」] GET/PUT 只回掩码（****abcd，仅末四位）。
+  //   草稿**不从 settings 回填**（回填掩码会让用户以为那是真 key，且失焦回写会把掩码发给后端）；
+  //   已配置状态只看 settings.apiKey 是否非空，掩码仅作为 placeholder 展示。
+  const [wsApiKey, setWsApiKey] = useState<string>('')
   const [wsBaseUrl, setWsBaseUrl] = useState<string>(settings?.websearchBaseUrl ?? '')
   const [wsDomainCheckUrl, setWsDomainCheckUrl] = useState<string>(settings?.websearchDomainCheckUrl ?? '')
   const [wsFetchEngine, setWsFetchEngine] = useState<string>(settings?.webfetchEngine ?? 'builtin')
@@ -133,11 +198,11 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
     setWsEngine(settings?.websearchEngine ?? 'anysearch')
     setWsUseSmallModel(settings?.websearchUseSmallModel ?? false)
     setWsProxy(settings?.proxy ?? '')
-    setWsApiKey(settings?.apiKey ?? '')
+    // ⛔ 不回填 apiKey（见 wsApiKey 声明处）；草稿只由用户输入，保存成功后清空。
     setWsBaseUrl(settings?.websearchBaseUrl ?? '')
     setWsDomainCheckUrl(settings?.websearchDomainCheckUrl ?? '')
     setWsFetchEngine(settings?.webfetchEngine ?? 'builtin')
-  }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.apiKey, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl, settings?.webfetchEngine])
+  }, [settings?.websearchEngine, settings?.websearchUseSmallModel, settings?.proxy, settings?.websearchBaseUrl, settings?.websearchDomainCheckUrl, settings?.webfetchEngine])
 
   // 挂载时读 /memory/config 开关；失败 fail loud（内联错误文案，不阻塞其他区块）
   // 无活动会话 → 不发请求（后端 sessionId 必填会 400），直接内联错误态。
@@ -313,6 +378,33 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
   const commitWeb = (key: keyof UpdateSettingsRequest, value: string, stored: string | null | undefined) => {
     if (value === (stored ?? '')) return
     void onSaveSettings({ [key]: value }).catch(() => {})
+  }
+
+  /** 库里是否有 key —— GET/PUT 的 apiKey 已是掩码（sk-****abcd），非空即已配置。 */
+  const apiKeyConfigured = (settings?.apiKey ?? '').trim() !== ''
+  /** 掩码只用于 placeholder 展示，⛔ 绝不作为提交值。 */
+  const apiKeyMaskPlaceholder = settings?.apiKey ?? ''
+
+  /**
+   * 提交新 key（失焦/回车）。
+   *
+   * <p>空草稿 = 没改 —— 清空必须走「清空」按钮（显式语义），避免误清已存 key。
+   * 保存成功后清空草稿，输入框回到「已配置 · 掩码 placeholder」状态。
+   */
+  const commitApiKey = () => {
+    const value = wsApiKey.trim()
+    if (value === '') return
+    void onSaveSettings({ apiKey: value })
+      .then((ok) => { if (ok) setWsApiKey('') })
+      .catch(() => {})
+  }
+
+  /** 显式清空已存 key（而不是靠留空提交）。 */
+  const clearApiKey = () => {
+    if (!apiKeyConfigured) return
+    void onSaveSettings({ apiKey: '' })
+      .then((ok) => { if (ok) setWsApiKey('') })
+      .catch(() => {})
   }
 
   /**
@@ -885,16 +977,25 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
               </button>
             </div>
             <div className="envc-eng-cfg">
-              <ProviderField label="API key" note="留空用内置默认" shared={credentialHint}>
-                <input
-                  className="settings-input"
-                  type="password"
-                  value={wsApiKey}
-                  placeholder="留空使用内置默认 key"
-                  onChange={(e) => setWsApiKey(e.target.value)}
-                  onBlur={() => commitWeb('apiKey', wsApiKey, settings?.apiKey)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-                />
+              <ProviderField
+                label="API key"
+                note={apiKeyConfigured ? `已配置 ${apiKeyMaskPlaceholder} · 输入新值即替换` : '留空用内置默认'}
+                shared={credentialHint}
+              >
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', minWidth: 0 }}>
+                  <input
+                    className="settings-input"
+                    type="password"
+                    value={wsApiKey}
+                    placeholder={apiKeyConfigured ? `${apiKeyMaskPlaceholder}（已配置 · 留空不改）` : '留空使用内置默认 key'}
+                    onChange={(e) => setWsApiKey(e.target.value)}
+                    onBlur={commitApiKey}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                  />
+                  {apiKeyConfigured && (
+                    <button type="button" className="envc-usebtn" onClick={clearApiKey}>清空</button>
+                  )}
+                </div>
               </ProviderField>
               <ProviderField label="Base URL" note="留空 = 官方地址">
                 <input
@@ -990,16 +1091,25 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
               </button>
             </div>
             <div className="envc-eng-cfg">
-              <ProviderField label="API key" note="必填 · 不回落内置 key" shared={credentialHint}>
-                <input
-                  className="settings-input"
-                  type="password"
-                  value={wsApiKey}
-                  placeholder="粘贴 DeepSeek API key"
-                  onChange={(e) => setWsApiKey(e.target.value)}
-                  onBlur={() => commitWeb('apiKey', wsApiKey, settings?.apiKey)}
-                  onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
-                />
+              <ProviderField
+                label="API key"
+                note={apiKeyConfigured ? `已配置 ${apiKeyMaskPlaceholder} · 输入新值即替换` : '必填 · 不回落内置 key'}
+                shared={credentialHint}
+              >
+                <div style={{ display: 'flex', gap: 8, alignItems: 'center', minWidth: 0 }}>
+                  <input
+                    className="settings-input"
+                    type="password"
+                    value={wsApiKey}
+                    placeholder={apiKeyConfigured ? `${apiKeyMaskPlaceholder}（已配置 · 留空不改）` : '粘贴 DeepSeek API key'}
+                    onChange={(e) => setWsApiKey(e.target.value)}
+                    onBlur={commitApiKey}
+                    onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
+                  />
+                  {apiKeyConfigured && (
+                    <button type="button" className="envc-usebtn" onClick={clearApiKey}>清空</button>
+                  )}
+                </div>
               </ProviderField>
               <ProviderField label="Base URL" note="留空 = 官方地址">
                 <input
@@ -1023,7 +1133,7 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                   onKeyDown={(e) => { if (e.key === 'Enter') (e.target as HTMLInputElement).blur() }}
                 />
               </ProviderField>
-              {(dsSearch || dsFetch) && wsApiKey.trim() === '' && (
+              {(dsSearch || dsFetch) && !apiKeyConfigured && wsApiKey.trim() === '' && (
                 <div className="envc-note warn">
                   <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" aria-hidden="true">
                     <path d="M8 2.2L14.2 13H1.8L8 2.2Z" /><path d="M8 6.4v3.2M8 11.4v.1" />
@@ -1126,7 +1236,7 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
             </div>
             <div className="envc-control">
               <div className="perm-mode-pill-wrap" ref={permRef}>
-                <div className="perm-mode-pill" onClick={() => setPermOpen((v) => !v)} title="默认权限模式（全局）">
+                <div className="perm-mode-pill" onClick={() => { setPermOpen((v) => !v); setInboundOpen(false) }} title="默认权限模式（全局）">
                   <svg className="pm-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
                     <path d="M7 1.5L12 3.5V6.5C12 9.5 9.8 11.8 7 12.5C4.2 11.8 2 9.5 2 6.5V3.5L7 1.5Z" />
                   </svg>
@@ -1152,6 +1262,163 @@ export function EnvConfigPanel({ settings, onSaveSettings, onOpenMemoryEditor, s
                   </div>
                 )}
               </div>
+            </div>
+          </div>
+
+          {/* [V321 peer-settings] 跨会话入站策略：默认权限模式与 Team 协作之间 */}
+          <div className="envc-row">
+            <div className="envc-label-group">
+              <span className="envc-name">跨会话入站</span>
+              <span className="envc-desc">其他会话通过 SendMessage 发来的消息如何接收。默认自动（按双方权限模式判定）。</span>
+            </div>
+            <div className="envc-control">
+              <div className="perm-mode-pill-wrap" ref={inboundRef}>
+                <div
+                  className="perm-mode-pill"
+                  data-testid="cross-session-inbound-pill"
+                  onClick={() => { setInboundOpen((v) => !v); setPermOpen(false) }}
+                  title="跨会话入站策略（全局）"
+                >
+                  <svg className="pm-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <path d="M2 2.5H12V9.5H6.5L3.5 12V9.5H2V2.5Z" strokeLinejoin="round" />
+                  </svg>
+                  <span className="pm-label">入站:</span>
+                  <span className="pm-value">{CROSS_SESSION_INBOUND_LABELS[settings?.crossSessionInbound ?? 'auto']}</span>
+                  <svg className={`pm-chevron ${inboundOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 12, height: 12 }}>
+                    <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                {inboundOpen && (
+                  <div className="pill-drawer perm-mode-drawer">
+                    {(Object.keys(CROSS_SESSION_INBOUND_LABELS) as CrossSessionInbound[]).map((v) => (
+                      <div
+                        key={v}
+                        data-testid={`cross-session-inbound-option-${v}`}
+                        className={`pill-row pill-option ${(settings?.crossSessionInbound ?? 'auto') === v ? 'active' : ''}`}
+                        title={CROSS_SESSION_INBOUND_DESCRIPTIONS[v]}
+                        onClick={() => {
+                          setInboundOpen(false)
+                          // auto 是显式清除哨兵：后端收到后把列写回 NULL（GET 读回 null → 仍显示自动）
+                          void onSaveSettings({ crossSessionInbound: v }).catch(() => {})
+                        }}
+                      >
+                        <span className="pill-label">{CROSS_SESSION_INBOUND_LABELS[v]}</span>
+                        <span className="pill-desc">{CROSS_SESSION_INBOUND_DESCRIPTIONS[v]}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* [V333 AFK] 提问卡片超时：默认「从不」= 现状（不自动继续） */}
+          <div className="envc-row">
+            <div className="envc-label-group">
+              <span className="envc-name">提问卡片超时</span>
+              <span className="envc-desc">你离开时，提问卡片等多久后按已选内容自动继续。默认从不自动继续。</span>
+            </div>
+            <div className="envc-control">
+              <div className="perm-mode-pill-wrap" ref={afkRef}>
+                <div
+                  className="perm-mode-pill"
+                  data-testid="ask-afk-pill"
+                  onClick={() => { setAfkOpen((v) => !v); setPermOpen(false); setInboundOpen(false) }}
+                  title="提问卡片超时（全局）"
+                >
+                  <svg className="pm-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5">
+                    <circle cx="7" cy="7" r="5.2" />
+                    <path d="M7 4.2V7l2 1.2" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                  <span className="pm-label">超时:</span>
+                  <span className="pm-value">{ASK_AFK_LABELS[settings?.askUserAfkTimeout ?? 'never']}</span>
+                  <svg className={`pm-chevron ${afkOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 12, height: 12 }}>
+                    <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
+                  </svg>
+                </div>
+                {afkOpen && (
+                  <div className="pill-drawer perm-mode-drawer">
+                    {(Object.keys(ASK_AFK_LABELS) as AskUserAfkTimeoutSetting[]).map((v) => (
+                      <div
+                        key={v}
+                        data-testid={`ask-afk-option-${v}`}
+                        className={`pill-row pill-option ${(settings?.askUserAfkTimeout ?? 'never') === v ? 'active' : ''}`}
+                        title={ASK_AFK_DESCRIPTIONS[v]}
+                        onClick={() => {
+                          setAfkOpen(false)
+                          void onSaveSettings({ askUserAfkTimeout: v }).catch(() => {})
+                        }}
+                      >
+                        <span className="pill-label">{ASK_AFK_LABELS[v]}</span>
+                        <span className="pill-desc">{ASK_AFK_DESCRIPTIONS[v]}</span>
+                      </div>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+          </div>
+
+          {/* [V302] 计划审批卡「清空上下文」选项：从「通用」挪到权限相关区域 */}
+          <div className="envc-row">
+            <div className="envc-label-group">
+              <span className="envc-name">计划审批显示「清空上下文」</span>
+              <span className="envc-desc">开启后，批准计划时可选择清空当前上下文、在新会话执行计划。</span>
+            </div>
+            <div className="envc-control">
+              <label className="settings-switch">
+                <input
+                  type="checkbox"
+                  data-testid="show-clear-context-on-plan-accept-switch"
+                  checked={settings?.showClearContextOnPlanAccept === true}
+                  onChange={(e) => {
+                    void onSaveSettings({ showClearContextOnPlanAccept: e.target.checked }).catch(() => {})
+                  }}
+                />
+                <span></span>
+              </label>
+            </div>
+          </div>
+
+          {/* [V334] 权限中继两道门：都开只是「允许」，还要本会话已绑渠道才会推送 */}
+          <div className="envc-row">
+            <div className="envc-label-group">
+              <span className="envc-name">渠道能力 <span className="envc-tag mono">channels</span></span>
+              <span className="envc-desc">允许外部渠道接入（入站通知）。默认开；关掉后渠道消息不进来。</span>
+            </div>
+            <div className="envc-control">
+              <label className="settings-switch">
+                <input
+                  type="checkbox"
+                  data-testid="channels-enabled-switch"
+                  checked={settings?.channelsEnabled ?? true}
+                  onChange={(e) => { void onSaveSettings({ channelsEnabled: e.target.checked }).catch(() => {}) }}
+                />
+                <span></span>
+              </label>
+            </div>
+          </div>
+
+          <div className="envc-row">
+            <div className="envc-label-group">
+              <span className="envc-name">权限中继</span>
+              <span className="envc-desc">
+                把工具权限确认镜像到渠道（可在聊天里回「yes 短编号」）。默认开；
+                两个开关都开也只是允许——还要**本会话已接入渠道**才会真的推送，与无人值守无关。
+              </span>
+            </div>
+            <div className="envc-control">
+              <label className="settings-switch">
+                <input
+                  type="checkbox"
+                  data-testid="channel-permission-relay-switch"
+                  checked={settings?.channelsPermissionRelayEnabled ?? true}
+                  onChange={(e) => {
+                    void onSaveSettings({ channelsPermissionRelayEnabled: e.target.checked }).catch(() => {})
+                  }}
+                />
+                <span></span>
+              </label>
             </div>
           </div>
 

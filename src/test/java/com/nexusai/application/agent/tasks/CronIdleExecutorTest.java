@@ -179,7 +179,7 @@ class CronIdleExecutorTest {
         // （queueProcessor.ts:52-87 / useQueueProcessor.ts:48-67）零 cron 引用，isKilled 只 gate 调度
         // tick（cronScheduler.ts:231）。收窄后 = mainThreadConsumable 谓词逐条跳过 WORKLOAD_CRON 项：
         // 队列只有 cron → peek 无可消费 → poll 返回 false，cron 项留队列（存量项等门开 / producer gate
-        // 已停 fire）。生产方停止语义仍由 TestJob.fire producer gate（OPD-Cron-07-h）保证。
+        // 已停 fire）。生产方停止语义仍由 AgentJob.fire producer gate（OPD-Cron-07-h）保证。
         queue.enqueue(new QueueItem("提示词A", "prompt", Priority.LATER, null, true, NotificationQueue.WORKLOAD_CRON));
         CronEnabledGates gates = new CronEnabledGates(false, true);   // agentTriggerCron=false → isKairosCronEnabled=false
         ReflectionTestUtils.setField(executor, "cronGates", gates);
@@ -490,7 +490,7 @@ class CronIdleExecutorTest {
             return null;
         }).when(loop).run(any(RunRequest.class));
 
-        // DURABLE: sessionId=null + boundProject 锚（TestJob fire 经 QueueItem 透传）
+        // DURABLE: sessionId=null + boundProject 锚（AgentJob fire 经 QueueItem 透传）
         QueueItem cmd = new QueueItem("持久化项目任务", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, null, boundProject);
 
@@ -634,7 +634,7 @@ class CronIdleExecutorTest {
         when(provider.getObject()).thenReturn(loop);
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
 
-        // DURABLE: sessionId=null + boundProject 锚（TestJob fire 经 QueueItem 透传）
+        // DURABLE: sessionId=null + boundProject 锚（AgentJob fire 经 QueueItem 透传）
         QueueItem cmd = new QueueItem("持久化项目任务", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, null, boundProject);
 
@@ -768,7 +768,7 @@ class CronIdleExecutorTest {
         ReflectionTestUtils.setField(executor, "loopProvider", provider);
         // sessionMapper 未注入 → fail-open 视为存活（非 Spring 单测语义，生产恒注入）
 
-        // DURABLE: sessionId=创建会话 + boundProject 锚 + scheduleId（TestJob fire 经 QueueItem 透传）
+        // DURABLE: sessionId=创建会话 + boundProject 锚 + scheduleId（AgentJob fire 经 QueueItem 透传）
         QueueItem cmd = new QueueItem("持久化项目任务", "prompt", Priority.LATER, null,
             null, true, NotificationQueue.WORKLOAD_CRON, false, null, creatingSession, boundProject,
             "sch-alive-001");

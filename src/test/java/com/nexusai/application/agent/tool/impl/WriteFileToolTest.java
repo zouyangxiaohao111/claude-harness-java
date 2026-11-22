@@ -52,7 +52,7 @@ class WriteFileToolTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private static ToolUseContext ctxFor(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("d2-write-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("d2-write-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }

@@ -41,7 +41,6 @@ import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.function.Consumer;
 import java.util.function.Function;
 import java.util.stream.Collectors;
@@ -100,7 +99,7 @@ class SessionPermissionCrossSendSurvivalTest {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final SettingsJsonParser PARSER =
         new SettingsJsonParser(JSON, new PermissionRuleValueParser());
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000a2b");
+    private static final String AGENT_ID = "a000000000000a2b";
     private static final String SESSION_A = "sess-a2ba2b01";
     private static final String SESSION_B = "sess-a2ba2b02";
     /** ⑤-b 专用（非 SESSION 目的地写盘对照，不参与跨 send 断言）。 */

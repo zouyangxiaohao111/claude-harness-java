@@ -242,6 +242,39 @@ public class MessageRecord {
      * 故以本 JavaDoc 为准 —— 后来者请勿据 V70 那句反推模型面行为。
      */
     private Boolean isVisibleInTranscriptOnly;
+    /**
+     * 待确认来信状态 · <b>净新增字段（语义对齐 CC：hold 来信进会话记录，未批准不进模型上下文）</b>。
+     *
+     * <p>WHY（用户实测 CC 后裁定）：CC 的待确认来信进入 transcript，下次打开仍渲染成待确认卡片，
+     * 且未获批准前不作为上下文交给模型。本仓此前只在 {@code peer_held_message} 存 hold 行，
+     * 会话记录里没有它 ⇒ 重启后只能从待收件接口渲染，语义不一致。
+     *
+     * <p>V326 落库为 {@code held_state} 列（MyBatis-Flex camelCase→snake_case 自动映射，
+     * 同 V51 is_meta / V67 queued_origin 范式）。应用层枚举（不落 CHECK）：
+     * <ul>
+     *   <li>{@code pending} —— hold 判定通过、尚未批准：GET /messages 可见（待确认卡片），
+     *       ⛔ 模型上下文读侧（listForResume* / listForModel）过滤掉；</li>
+     *   <li>{@code delivered} —— 已批准且已按既有唯一落库出口写入历史：普通来信渲染 + 进上下文；</li>
+     *   <li>{@code declined} —— 已拒绝：渲染「已拒绝」卡片，⛔ 不进上下文；</li>
+     *   <li>{@code null} —— 普通消息（绝大多数行），行为与迁移前逐字一致。</li>
+     * </ul>
+     *
+     * <p>与 {@code peer_held_message} 的分工：本列描述「会话记录这一行」的可见/可入上下文状态；
+     * {@code peer_held_message} 存审批附属信息（hop 链 / 信封 / 已读 / 准入方式 / 审批时间）。
+     * 两者用同一主键对齐（messageId = PeerEnvelope.messageId）；批准只原地更新本列，⛔ 不插第二行。
+     */
+    private String heldState;
+    /**
+     * assistant 内容块顺序（JSON 数组）· 对齐 CC transcript 「一块一行 + apiBlockIndex」。
+     *
+     * <p>V331 落库为 {@code content_blocks} 列（MyBatis-Flex camelCase → snake_case 自动映射）。
+     * 元素形状见 {@code com.nexusai.model.session.dto.ContentBlockDto}：
+     * type / text / thinking / signature / id / name / input / apiBlockIndex。
+     * 写侧 = ChatService 实时落库 + MessageService.appendMessage（块列表原样透传）；
+     * 读侧 = MessageService.toDto。null = 历史行 / 非 assistant 行 / 未采集到顺序。
+     * ⛔ 本列不进入任何 provider 的请求体。
+     */
+    private String contentBlocks;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -310,4 +343,8 @@ public class MessageRecord {
     public void setIsCompactSummary(Boolean isCompactSummary) { this.isCompactSummary = isCompactSummary; }
     public Boolean getIsVisibleInTranscriptOnly() { return isVisibleInTranscriptOnly; }
     public void setIsVisibleInTranscriptOnly(Boolean isVisibleInTranscriptOnly) { this.isVisibleInTranscriptOnly = isVisibleInTranscriptOnly; }
+    public String getHeldState() { return heldState; }
+    public void setHeldState(String heldState) { this.heldState = heldState; }
+    public String getContentBlocks() { return contentBlocks; }
+    public void setContentBlocks(String contentBlocks) { this.contentBlocks = contentBlocks; }
 }

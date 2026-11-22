@@ -114,7 +114,7 @@ export function ModelFormModal({ initial, providerTag, mode = 'edit', onSave, on
           visibleWhen: isChatLike,
           rows: [
             [
-              { type: 'number', name: 'maxTokens', label: 'max tokens', nullable: true, placeholder: '384000', hint: '单次最大输出 token 数 · 留空=384000' },
+              { type: 'number', name: 'maxTokens', label: 'max tokens', nullable: true, placeholder: '128000', hint: '单次最大输出 token 数 · 留空=128000' },
               { type: 'number', name: 'maxContextTokens', label: '上下文窗口', nullable: true, placeholder: '1048576', hint: '模型上下文窗口 · 1M=1048576 · 留空=1M' },
             ],
             [

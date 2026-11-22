@@ -140,7 +140,7 @@ class LlmAgentLoopStopHookBlockingIsMetaTest {
     /** 32 参构造器构建 TUC（of() 工厂不含 UI 回调）。 */
     private static ToolUseContext tucWithNotification(Consumer<com.nexusai.application.agent.tool.Notification> addNotification) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), null, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, null, null, null, Map.of(), p -> {},
             null, null, null, null,

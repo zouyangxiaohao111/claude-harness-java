@@ -346,7 +346,7 @@ class CompactConversationTest {
         java.util.Set<String> discovered = java.util.concurrent.ConcurrentHashMap.newKeySet();
 
         com.nexusai.application.agent.tool.ToolUseContext tuc = new com.nexusai.application.agent.tool.ToolUseContext(
-            java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "",
             null, List.of(), null, com.nexusai.application.agent.permission.PermissionMode.DEFAULT, Map.of(), false, "",
@@ -512,7 +512,7 @@ class CompactConversationTest {
     /** 最小 ToolUseContext（供 CacheSafeParams 构造）。 */
     private static com.nexusai.application.agent.tool.ToolUseContext baseToolUseContext() {
         return new com.nexusai.application.agent.tool.ToolUseContext(
-            java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new com.nexusai.application.agent.tool.AbortController(), List.of());
     }

@@ -92,7 +92,7 @@ class ChatControllerPopForEditTest {
             false, "busy-queued", false, null, sessionId, null, null, atts);
     }
 
-    /** 不可编辑系统项：mode=prompt 但 isMeta=true（cron 命令 TestJob:373 / cron missed 通知 CronIdleExecutor:235 / channel ChannelNotification:154）。 */
+    /** 不可编辑系统项：mode=prompt 但 isMeta=true（cron 命令 AgentJob:373 / cron missed 通知 CronIdleExecutor:235 / channel ChannelNotification:154）。 */
     private static QueueItem systemPrompt(String value, String sessionId) {
         return new QueueItem(value, NotificationQueue.MODE_PROMPT, Priority.NEXT, null, null,
             true, NotificationQueue.WORKLOAD_CRON, false, null, sessionId);

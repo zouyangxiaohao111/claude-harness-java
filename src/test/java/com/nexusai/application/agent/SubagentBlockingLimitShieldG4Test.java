@@ -138,7 +138,7 @@ class SubagentBlockingLimitShieldG4Test {
     /** 走**生产子代理所走的** 4 参 boolean 重载（形参 autoCompactor 恒 null ⇒ 只能靠 ctx 分量翻包）。 */
     private static Drive driveSubagent(AgentLoopContext ctx) {
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        AgentState state = new AgentState("sys", sessionId, UUID.randomUUID());   // 子代理：agentId ≠ sessionId
+        AgentState state = new AgentState("sys", sessionId, com.nexusai.application.agent.subagent.AgentContext.createAgentId());   // 子代理：agentId ≠ sessionId
         state.appendMessage(userMessage("m1", "q"));
 
         QueryParams params = forLoopParams(ctx, QuerySource.SUBAGENT, state);
@@ -193,7 +193,7 @@ class SubagentBlockingLimitShieldG4Test {
         };
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }

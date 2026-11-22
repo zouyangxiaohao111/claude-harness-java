@@ -254,7 +254,7 @@ class SessionMemoryTuningConsumptionTest {
 
             // custom systemPrompt（非 null）+ override env → memoryMechanicsPrompt 门控开（CC :316-317）
             AgentState state = loop.run(RunRequest.session("configure the system now",
-                "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID(), ProviderConfig.empty(), "test-model",
+                "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId(), ProviderConfig.empty(), "test-model",
                 "CUSTOM SYSTEM PROMPT", null));
 
             assertThat(histories).as("必须 2 轮 LLM 调用（多迭代是频率断言的前提；旧实现 2 次发射）").hasSize(2);

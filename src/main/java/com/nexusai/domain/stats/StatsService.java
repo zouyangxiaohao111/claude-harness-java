@@ -334,9 +334,9 @@ public class StatsService {
     /**
      * byAgent：SQL 分两组（<b>数值维度</b>按 agent_id 聚合 + <b>身份维度</b>按
      * agent_id×category×label×depth×parent 聚合），JVM 只做
-     * <b>身份归一</b>（{@code a+16hex} ⇄ UUID 合并为同一节点）与<b>身份取舍</b>（优先级见
-     * {@link #NODE_CATEGORY_PRIORITY}）—— 这两件事 SQL 做不了（归一依赖
-     * {@link com.nexusai.application.agent.subagent.AgentContext#canonicalAgentId} 的位运算）。
+     * <b>身份归一</b>（{@link com.nexusai.application.agent.subagent.AgentContext#canonicalAgentId}
+     * 纯字符串：a+16hex 原样、空值归 null）与<b>身份取舍</b>（优先级见
+     * {@link #NODE_CATEGORY_PRIORITY}）—— 这两件事 SQL 做不了。
      */
     private List<AgentStat> aggregateByAgent(String fromIso, String toIso) {
         QueryWrapper numW = base(fromIso, toIso)
@@ -520,12 +520,11 @@ public class StatsService {
     /**
      * 会话内单个 agent 节点的用量（前端「子代理（本会话）」行直接消费）。
      *
-     * <p><b>{@code taskId} 的由来</b>：明细表 {@code agent_id} 列存的是 agent 身份渲染
-     * （子代理 = {@code a}+16hex，退化时 UUID 串；主 agent = 会话短 id）。而任务注册表 / task 事件
-     * （{@code task_id}）用的是 {@code agentId.toString()}（CC 语义 taskId === agentId）——两者
-     * 由 {@link com.nexusai.application.agent.subagent.AgentContext#packAgentId(String)} 确定性互转。
-     * 本字段即换算后的 {@code task_id}，供前端按 {@code task_id} 精确关联（⛔ 前端不得自行解析
-     * {@code agentId} 格式），无法换算（主 agent / 无会话哨兵 / 未知格式）→ {@code null}。
+     * <p><b>{@code taskId} 的由来</b>：明细表 {@code agent_id} 列存的是 agent 身份
+     * （子代理 = {@code a}+16hex；主 agent = 会话短 id）。任务注册表 / task 事件的 {@code task_id}
+     * 与 agentId 同形（CC 语义 taskId === agentId）——两者直接相等，不再做任何 UUID 换算。
+     * 本字段即 {@code task_id}，供前端按 {@code task_id} 精确关联（⛔ 前端不得自行解析
+     * {@code agentId} 格式），无对应任务（主 agent / 无会话哨兵 / 未知格式）→ {@code null}。
      *
      * <p>[cache-savings] 末尾 8 字段与 {@link SessionUsageTotals} 同口径（按<b>本节点</b>的行聚合）。
      */
@@ -635,22 +634,16 @@ public class StatsService {
     /**
      * 明细表 agentId → 任务注册表的 {@code task_id}（前端关联键）。
      *
-     * <p>换算规则：{@code a}+16hex（{@code AgentContext.createAgentId} 产物）→
-     * {@code packAgentId(hex).toString()}（UUID 串 = {@code registerAgentForeground} 的 taskId）；
-     * 已是 UUID 串 → 原样；其余（主 agent 会话短 id / 无会话哨兵 / 未知格式）→ {@code null}
-     * （无对应任务，前端不据此关联）。
+     * <p>换算规则：{@code task_id} 与 agentId 同形（{@code registerAgentForeground} 以 agentId
+     * 构建 taskId，CC 语义 taskId === agentId）⇒ a+16hex 原样返回；其余（主 agent 会话短 id /
+     * 无会话哨兵 / 未知格式）→ {@code null}（无对应任务，前端不据此关联）。
+     * 旧 UUID 键不再换算（Breaking，按 CC 单一形态）。
      */
     static String taskIdOf(String agentId) {
         if (agentId == null || agentId.isBlank()) {
             return null;
         }
-        if (agentId.matches("a[0-9a-f]{16}")) {
-            java.util.UUID uuid = com.nexusai.application.agent.subagent.AgentContext.packAgentId(agentId);
-            return uuid != null ? uuid.toString() : null;
-        }
-        return agentId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
-            ? agentId
-            : null;
+        return agentId.matches("a[0-9a-f]{16}") ? agentId : null;
     }
 
     /**

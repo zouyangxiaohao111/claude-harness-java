@@ -37,7 +37,6 @@ import java.util.ArrayList;
 import java.util.Collections;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -109,7 +108,7 @@ class LlmAgentLoopStopHookTranscriptAnchorWiringTest {
     @TempDir
     Path tempDir;
 
-    private final UUID agentId = UUID.randomUUID();
+    private final String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     @BeforeEach
     void declareNoDatabase() {
@@ -194,14 +193,14 @@ class LlmAgentLoopStopHookTranscriptAnchorWiringTest {
         final List<HookEvent> captured = Collections.synchronizedList(new ArrayList<>());
     }
 
-    /** 稳定会话锚（getAgentTranscriptPathForSession）应有的落点（agentId 同生产：UUID 字符串）。 */
+    /** 稳定会话锚（getAgentTranscriptPathForSession）应有的落点（agentId 同生产：a+16hex）。 */
     private String expectedStablePath() {
-        return SessionStorage.getAgentTranscriptPathForSession(SESSION, agentId.toString()).toString();
+        return SessionStorage.getAgentTranscriptPathForSession(SESSION, agentId).toString();
     }
 
     /** 上下文槽（ctx.sessionState().workspaceDir()）派生出来的「另一个槽」落点。 */
     private String contextSlotPath(Path worktree) {
-        return SessionStorage.getAgentTranscriptPath(worktree, SESSION, agentId.toString()).toString();
+        return SessionStorage.getAgentTranscriptPath(worktree, SESSION, agentId).toString();
     }
 
     /** 绝对锚（结构性断言 · 零 IO）：路径必须落在<b>绑定项目根</b>的 slug 下。 */
@@ -301,7 +300,7 @@ class LlmAgentLoopStopHookTranscriptAnchorWiringTest {
     /** 32 参构造器构建 TUC（of() 工厂不含 UI 回调）· 对齐同域既有测试。 */
     private static ToolUseContext tucWithNotification() {
         return new ToolUseContext(
-            UUID.randomUUID(), SESSION, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION, PermissionMode.DEFAULT,
             Map.of(), List.of(), null, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, null, null, null, Map.of(), p -> {},
             null, null, null, null,

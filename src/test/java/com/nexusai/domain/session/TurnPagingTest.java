@@ -100,6 +100,26 @@ class TurnPagingTest {
     // ════════════════════════════════════════════════════════════════════
 
     @Test
+    @DisplayName("SessionCreate 派单行（id=peer-launch-*）是轮锚点；同 subtype 的协作来信不是")
+    void peerLaunchRowIsTurnAnchor() {
+        // 派单：SessionCreateTool 落库，role=user / is_meta=1 / subtype=agent_message / id=peer-launch-<uuid>
+        // 来信：SendMessage 落库，同 subtype / is_meta=1，但 id 是普通 msg-* ⇒ 仍按后台通知处理
+        List<MessageRecord> rows = new ArrayList<>(List.of(
+            row("peer-launch-7af547eb", 10L, "user", "sess-parent", "agent_message", true, null),
+            row("msg-a1", 11L, "assistant"),
+            row("msg-mail", 12L, "user", "sess-other", "agent_message", true, null),
+            row("msg-a2", 13L, "assistant")));
+
+        List<TurnAnchor> anchors = TurnPaging.anchorsOf(rows);
+
+        assertThat(anchors).extracting(TurnAnchor::id).containsExactly("peer-launch-7af547eb");
+        // 派单之后的内容（含来信行本身）都归这一轮
+        TurnWindow win = TurnPaging.resolveWindow(anchors, null, 3);
+        assertThat(idsInWindow(rows, win))
+            .containsExactly("peer-launch-7af547eb", "msg-a1", "msg-mail", "msg-a2");
+    }
+
+    @Test
     @DisplayName("最近 2 轮：窗口=[u2,u3]，含起点用户消息、不含更早的 u1 轮（含其后的 tool/cron 行）")
     void latestTwoTurns_boundsAreUserMessages() {
         List<MessageRecord> rows = session3Turns();

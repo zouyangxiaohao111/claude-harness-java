@@ -86,7 +86,7 @@ class ArtifactCollectionHooksTest {
         String sid = sessionId == null
                 ? com.nexusai.common.SessionKeys.NO_SESSION
                 : sessionId;
-        return ToolUseContext.of(java.util.UUID.randomUUID(), sid,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sid,
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                 java.util.List.of(), "", null, java.util.List.of(), null,
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT);

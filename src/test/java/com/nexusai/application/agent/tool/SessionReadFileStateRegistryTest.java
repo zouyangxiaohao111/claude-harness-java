@@ -65,7 +65,7 @@ class SessionReadFileStateRegistryTest {
      *  {@code LlmAgentLoop.buildBaseToolUseContext} 的注入形态）。 */
     private static ToolUseContext runCtx(String sessionId) {
         ToolUseContext base = ToolUseContext.of(
-            UUID.nameUUIDFromBytes(("run-" + sessionId).getBytes()), sessionId, PermissionMode.DEFAULT);
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT);
         return base.with(new ToolUseContext.SubagentContextOverrides(
             null, null, null, null, null,
             SessionReadFileStateRegistry.forSession(sessionId),

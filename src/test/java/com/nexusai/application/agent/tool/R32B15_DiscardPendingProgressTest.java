@@ -138,7 +138,7 @@ class R32B15_DiscardPendingProgressTest {
         assertThat(results).isNotEmpty();
         // discard 后应得到 synthetic (含 "Streaming fallback"), 而非真实 "should not reach"
         boolean synthetic = results.stream()
-            .anyMatch(r -> ((String) r.data()).contains("Streaming fallback"));
+            .anyMatch(r -> (String.valueOf(r.data())).contains("Streaming fallback"));
         assertThat(synthetic).isTrue();
         assertThat(exec.getResultErrorFlags().get("t-block"))
             .as("discard 时 EXECUTING 工具 synthetic 结果必须标记 error")
@@ -235,7 +235,7 @@ class R32B15_DiscardPendingProgressTest {
     @Test
     @DisplayName("C11: interruptible state 单 cancel 工具 → true")
     void interruptibleStateAllCancel() {
-        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, pool);
         exec.setAgentState(state);
 
@@ -248,7 +248,7 @@ class R32B15_DiscardPendingProgressTest {
     @Test
     @DisplayName("C11: interruptible state 含 block 工具 → false")
     void interruptibleStateHasBlock() throws InterruptedException {
-        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, pool);
         exec.setAgentState(state);
 
@@ -283,7 +283,7 @@ class R32B15_DiscardPendingProgressTest {
         };
         registry.register(slowCancel);
 
-        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("test", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         StreamingToolExecutor exec = new StreamingToolExecutor(registry, pool);
         exec.setAgentState(state);
 

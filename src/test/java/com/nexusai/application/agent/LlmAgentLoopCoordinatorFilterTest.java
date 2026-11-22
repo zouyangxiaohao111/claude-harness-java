@@ -3,7 +3,12 @@ package com.nexusai.application.agent;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.nexusai.application.agent.config.MemoryBareModeConfig;
 import com.nexusai.application.agent.coordinator.CoordinatorMode;
+import com.nexusai.application.agent.permission.PermissionBehavior;
 import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.permission.PermissionRule;
+import com.nexusai.application.agent.permission.PermissionRuleSource;
+import com.nexusai.application.agent.permission.PermissionRuleValue;
+import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentToolUtils;
 import com.nexusai.application.agent.tool.Tool;
@@ -17,6 +22,7 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -29,7 +35,7 @@ import static org.mockito.Mockito.when;
  * getTools(permCtx) 之后 applyCoordinatorToolFilter）+ toolPool.ts:35-41。
  *
  * <p>WHY: coordinator 模式开启时主循环只应暴露编排白名单
- * （{@link AgentToolUtils#COORDINATOR_MODE_ALLOWED_TOOLS} = Agent/TaskStop/SendMessage/
+ * （{@link AgentToolUtils#COORDINATOR_MODE_ALLOWED_TOOLS} = Agent/TaskStop/SendMessage/SessionCreate/Skill/Workflow/ListAgents/
  * StructuredOutput）∪ PR 活动订阅工具（后缀命中 subscribe_pr_activity/unsubscribe_pr_activity，
  * CC toolPool.ts:11-14）——coordinator 负责编排 worker，不应看到 Bash/Read/Edit 等实质执行工具。
  * 过滤点 = {@link LlmAgentLoop#llmToolsArray} deny 过滤后（CC getTools tools.ts:310 之后），
@@ -38,12 +44,12 @@ import static org.mockito.Mockito.when;
  * <p>变异点：去掉 llmToolsArray 中的 coordinator 过滤（或门控失效）→ Bash/Read/Edit/普通 MCP
  * 工具重新出现在 schema → 测试变红。
  *
- * <p><b>StructuredOutput 特注</b>：StructuredOutput（SYNTHETIC_OUTPUT_TOOL_NAME）在
- * {@code COORDINATOR_MODE_ALLOWED_TOOLS} 内、coordinator 过滤<b>保留</b>它（{@link #poolRetainsStructuredOutput}），
- * 但 USER 主循环 schema 阶段经既有 SPECIAL_TOOLS 过滤（toOpenAiToolsArray）剔除 —— 生产主循环
- * 在结构化输出启用时经 llmToolsArray 之后 post-hoc 追加（LlmAgentLoop appendStructuredOutputToolToSchema，
- * 对齐 CC main.tsx:1885-1891）。故 schema 断言按 USER 实际可见集（{Agent,TaskStop,SendMessage} ∪ PR 工具）验，
- * 池级断言按 coordinator 白名单全集验。
+ * <p><b>StructuredOutput 特注（2026-11-20 按 CC 重新收口）</b>：StructuredOutput
+ * （SYNTHETIC_OUTPUT_TOOL_NAME）虽在 {@code COORDINATOR_MODE_ALLOWED_TOOLS} 内（白名单只决定
+ * <b>候选</b>），但它是内部 dispatch 工具：模型 tools 数组经 {@code ToolRegistry} 的
+ * SPECIAL_TOOLS 过滤恒不含它。结构化输出实例只在「jsonSchema 且 非交互/后台会话」时由主循环
+ * post-hoc 追加（CC main.tsx:1885-1891 / {@code LlmAgentLoop#applyStructuredOutputEnablement}）。
+ * ⇒ 交互式协调者：模型没有它、REST /tools 也没有它（口径一致）；不再有「可见不可调用」。
  */
 class LlmAgentLoopCoordinatorFilterTest {
 
@@ -58,7 +64,7 @@ class LlmAgentLoopCoordinatorFilterTest {
     /** 10 参构造器 per-turn TUC：availableTools + 空权限上下文（对齐 LlmAgentLoopToolsArrayDenyTest 形态）。 */
     private static ToolUseContext tuc(List<Tool> availableTools) {
         return new ToolUseContext(
-                UUID.randomUUID(),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                 "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT,
                 Map.of(),
@@ -70,12 +76,18 @@ class LlmAgentLoopCoordinatorFilterTest {
                 PermissionMode.DEFAULT);
     }
 
-    /** 模拟"全量 all()"工具池：coordinator 白名单 4 项 + 实质执行工具 + PR 订阅 MCP + 普通 MCP。 */
+    /**
+     * 模拟"全量 all()"工具池：coordinator 白名单成员 + 实质执行工具 + PR 订阅 MCP + 普通 MCP。
+     *
+     * <p>2026-11-20 用户裁定：协调者必须能创建同级会话 ⇒ SessionCreate 进白名单（本仓扩展，
+     * CC 无创建会话工具，属有意偏离）。
+     */
     private static List<Tool> fullAllPool() {
         return List.of(
                 tool("Agent"),
                 tool("TaskStop"),
                 tool("SendMessage"),
+                tool("SessionCreate"),
                 tool("StructuredOutput"),
                 tool("Bash"),
                 tool("Read"),
@@ -94,6 +106,9 @@ class LlmAgentLoopCoordinatorFilterTest {
 
     @BeforeEach
     void enableCoordinatorMode() {
+        // 纯 JUnit 夹具不接 DB 回源：显式声明「本环境确无会话」，避免 cwd 域 fail-loud
+        // （同 LlmAgentLoopToolsArrayDenyTest 的夹具姿态）。
+        com.nexusai.test.support.SessionProjectRootTestSupport.declareNoDatabase();
         // CoordinatorMode 2 参构造器（featureFlagSupplier, envSupplier）→ isCoordinatorMode()=true
         LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> true, () -> "1"));
     }
@@ -104,6 +119,7 @@ class LlmAgentLoopCoordinatorFilterTest {
         LlmAgentLoop.setCoordinatorMode(null);
         // [G24] bare 判定静态桥复位（MemoryBareModeConfig 是 static 桥接，防跨测试污染）
         MemoryBareModeConfig.reset();
+        com.nexusai.test.support.SessionProjectRootTestSupport.clearNoDatabase();
     }
 
     @Test
@@ -111,7 +127,10 @@ class LlmAgentLoopCoordinatorFilterTest {
     void llmToolsArray_coordinatorMode_schemaOnlyCoordinatorAllowed() {
         // WHY: coordinator 编排 worker，不应在 LLM schema 暴露 Bash/Read/Edit/普通 MCP 等实质执行工具
         //   （CC main.tsx:1872-1877 headless 路径 getTools 之后 applyCoordinatorToolFilter）。
-        //   变异点：删除 llmToolsArray 的 coordinator 过滤 → Bash/Read/Edit/WebSearch/mcp__ 重现 → 红。
+        //   StructuredOutput 属 SPECIAL_TOOLS：白名单保留其「候选资格」，但模型不可见（CC 只在
+        //   jsonSchema && 非交互/后台时 post-hoc 追加）。
+        //   变异点：删除 llmToolsArray 的 coordinator 过滤 → Bash/Read/Edit/WebSearch/mcp__ 重现 → 红；
+        //   重新放行 SPECIAL_TOOLS（旧放宽）→ StructuredOutput 出现在交互式 schema → 红。
         List<Tool> available = fullAllPool();
 
         ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(available), QuerySource.USER);
@@ -119,10 +138,10 @@ class LlmAgentLoopCoordinatorFilterTest {
         assertThat(schemaNames(schema))
                 .as("coordinator 模式主循环 schema = 白名单 USER 可见集 ∪ PR 订阅工具（CC main.tsx:1872-1877）")
                 .containsExactlyInAnyOrder(
-                        "Agent", "TaskStop", "SendMessage",
+                        "Agent", "TaskStop", "SendMessage", "SessionCreate",
                         "github.com.mycorp.subscribe_pr_activity",
                         "pr_events.unsubscribe_pr_activity")
-                .doesNotContain("Bash", "Read", "Edit", "WebSearch", "mcp__random.server.tool");
+                .doesNotContain("StructuredOutput", "Bash", "Read", "Edit", "WebSearch", "mcp__random.server.tool");
     }
 
     @Test
@@ -211,8 +230,8 @@ class LlmAgentLoopCoordinatorFilterTest {
         ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(fullAllPool()), QuerySource.USER);
 
         assertThat(schemaNames(schema))
-                .as("bare+coordinator 顶层 schema = coordinator 白名单（Agent/TaskStop/SendMessage）")
-                .containsExactlyInAnyOrder("Agent", "TaskStop", "SendMessage")
+                .as("bare+coordinator 顶层 schema = coordinator 白名单（Agent/TaskStop/SendMessage/SessionCreate）")
+                .containsExactlyInAnyOrder("Agent", "TaskStop", "SendMessage", "SessionCreate")
                 .doesNotContain("Bash", "Read", "Edit", "WebSearch", "mcp__random.server.tool");
     }
 
@@ -316,8 +335,173 @@ class LlmAgentLoopCoordinatorFilterTest {
         assertThat(filtered.stream().map(Tool::name))
                 .as("coordinator 过滤池级保留白名单全集 ∪ PR 订阅工具")
                 .containsExactlyInAnyOrder(
-                        "Agent", "TaskStop", "SendMessage", "StructuredOutput",
+                        "Agent", "TaskStop", "SendMessage", "SessionCreate", "StructuredOutput",
                         "github.com.mycorp.subscribe_pr_activity",
                         "pr_events.unsubscribe_pr_activity");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [2026-11-20 用户裁定] 协调者必须暴露 SendMessage + SessionCreate
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 构造 blanket deny 单个工具的 per-turn 权限上下文（同 LlmAgentLoopToolsArrayDenyTest 形态）。 */
+    private static ToolPermissionContext denyToolContext(String toolName) {
+        PermissionRule deny = new PermissionRule(
+                PermissionRuleSource.USER_SETTINGS,
+                PermissionBehavior.DENY,
+                PermissionRuleValue.wholeTool(toolName));
+        return ToolPermissionContext.of(
+                PermissionMode.DEFAULT,
+                Map.of(),
+                Map.of(PermissionRuleSource.USER_SETTINGS, Set.of(deny)),
+                Map.of(),
+                Map.of());
+    }
+
+    @Test
+    @DisplayName("协调者工具列表含 SendMessage 与 SessionCreate（SessionCreate 为本仓扩展，有意偏离 CC）")
+    void coordinatorMode_exposesSendMessageAndSessionCreate() {
+        // WHY: 用户 2026-11-20 裁定 —— 协调者要能把活派给「用户可接手继续聊」的同级会话，
+        //   故 SendMessage（继续对话）+ SessionCreate（创建同级会话）必须在协调者工具面里。
+        //   变异点：从 COORDINATOR_MODE_ALLOWED_TOOLS 移除 SessionCreate → SessionCreate 从
+        //   schema 消失 → 红。
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(fullAllPool()), QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("协调者 schema 必须同时含 SendMessage 与 SessionCreate")
+                .contains("SendMessage", "SessionCreate");
+    }
+
+    @Test
+    @DisplayName("协调者白名单不回补：池里没有 SessionCreate 时不会凭空出现")
+    void coordinatorMode_doesNotBackfillMissingSessionCreate() {
+        // WHY: 白名单只做减法（tool.filter），绝不从全局 registry 回补 —— 否则会绕过 deny /
+        //   会话禁用 / bare 裁剪全部权限门。
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(
+                tuc(List.of(tool("SendMessage"), tool("Bash"))), QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("池里无 SessionCreate → 协调者 schema 也不得凭空空降")
+                .contains("SendMessage")
+                .doesNotContain("SessionCreate", "Bash");
+    }
+
+    @Test
+    @DisplayName("普通会话不因协调者白名单多出 SessionCreate（协调者关闭 → 池原样）")
+    void normalSession_doesNotGainSessionCreateFromCoordinatorWhitelist() {
+        // WHY: 白名单只作用于协调者顶层循环；普通会话工具池必须原样透传 —— 池里有就保留，
+        //   池里没有就不能因白名单新增。变异点：coordinator 过滤误对非协调者生效 → 池被改写 → 红。
+        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> null));
+
+        ArrayNode withTool = LlmAgentLoop.llmToolsArray(
+                tuc(List.of(tool("Bash"), tool("SessionCreate"))), QuerySource.USER);
+        assertThat(schemaNames(withTool))
+                .as("普通会话池里有 SessionCreate → 保留；Bash 也在")
+                .contains("SessionCreate", "Bash");
+
+        ArrayNode withoutTool = LlmAgentLoop.llmToolsArray(
+                tuc(List.of(tool("Bash"))), QuerySource.USER);
+        assertThat(schemaNames(withoutTool))
+                .as("普通会话池里没有 SessionCreate → 不会因白名单出现")
+                .contains("Bash")
+                .doesNotContain("SessionCreate");
+    }
+
+    @Test
+    @DisplayName("deny 仍优先：协调者开启 + deny SessionCreate → schema 不含 SessionCreate")
+    void coordinatorMode_denyStillWins() {
+        // WHY: 协调者白名单只做收窄，不得把 deny 规则挡掉的工具捞回来。
+        //   变异点：协调者过滤置于 deny 之前/或回补 registry → 被 deny 的工具重现 → 红。
+        ToolUseContext ctx = new ToolUseContext(
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+                "sess-" + UUID.randomUUID().toString().substring(0, 8),
+                PermissionMode.DEFAULT,
+                Map.of(),
+                List.of(tool("SendMessage"), tool("SessionCreate"), tool("Bash")),
+                null,
+                AbortController.NOOP,
+                List.of(),
+                denyToolContext("SessionCreate"),
+                PermissionMode.DEFAULT);
+
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(ctx, QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("deny 优先于协调者白名单：被 deny 的 SessionCreate 不得出现")
+                .contains("SendMessage")
+                .doesNotContain("SessionCreate", "Bash");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [2026-11-20 · 按 CC 收口] StructuredOutput：SPECIAL_TOOLS 不经常规通道可见
+    // ════════════════════════════════════════════════════════════════════
+
+    @Test
+    @DisplayName("交互式协调者：模型 tools 不含 StructuredOutput，SPECIAL_TOOLS 未被放宽")
+    void coordinatorModelSchema_interactive_excludesStructuredOutput() {
+        // WHY: CC 的 StructuredOutput 是内部 dispatch 工具，只在 jsonSchema && 非交互/后台时由
+        //   main.tsx:1885-1891 在 getTools() 之后单独追加。白名单保留它只代表「候选」，
+        //   交互式会话模型不可见（旧实现为让它可见而放宽 SPECIAL_TOOLS，属偏离，已回退）。
+        //   变异点：重新放行协调者顶层 SPECIAL_TOOLS → StructuredOutput 出现 → 红。
+        List<Tool> available = fullAllPool();
+
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(available), QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("交互式协调者模型 tools 必须不含 StructuredOutput")
+                .doesNotContain("StructuredOutput")
+                .contains("Agent", "TaskStop", "SendMessage", "SessionCreate");
+    }
+
+    @Test
+    @DisplayName("协调者白名单仍保留 StructuredOutput 作为候选（白名单只决定候选，不等于可见）")
+    void coordinatorWhitelist_stillListsStructuredOutputAsCandidate() {
+        // WHY: CC constants/tools.ts:107-112 白名单含它；可见性由注入门决定而非白名单。
+        //   变异点：把 StructuredOutput 从白名单删掉 → 非交互注入时的候选语义丢失 → 红。
+        assertThat(AgentToolUtils.COORDINATOR_MODE_ALLOWED_TOOLS)
+                .contains(com.nexusai.application.agent.tool.ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("普通会话（协调者关闭）不多出 StructuredOutput：池里有也仍被 SPECIAL_TOOLS 过滤")
+    void normalSession_doesNotGainStructuredOutput() {
+        // WHY: 放行 SPECIAL_TOOLS 必须只对协调者顶层循环生效；普通会话的模型 schema 口径不许变
+        //   （SPECIAL_TOOLS 是内部 dispatch 工具，不暴露给 LLM）。
+        //   变异点：门控恒开 → 普通会话 schema 多出 StructuredOutput → 红。
+        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> null));
+
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(fullAllPool()), QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("普通会话 schema 不得因协调者修复而多出 StructuredOutput")
+                .contains("Bash", "Read", "Edit")
+                .doesNotContain("StructuredOutput");
+    }
+
+    @Test
+    @DisplayName("deny 仍优先：协调者开启 + deny StructuredOutput → schema 不含 StructuredOutput")
+    void coordinatorMode_denyStructuredOutputStillWins() {
+        // WHY: 放行 SPECIAL_TOOLS 只影响「schema 序列化阶段是否剔除」这一层，⛔ 不得让被 deny 的
+        //   StructuredOutput 复活（deny 在 sessionVisibleToolsBase 已把它从池里摘掉，registry 只序列化
+        //   池内已有工具）。
+        //   变异点：改成按名从全局 registry 回补 → deny 失效 → 红。
+        ToolUseContext ctx = new ToolUseContext(
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+                "sess-" + UUID.randomUUID().toString().substring(0, 8),
+                PermissionMode.DEFAULT,
+                Map.of(),
+                List.of(tool("SendMessage"), tool("StructuredOutput"), tool("Bash")),
+                null,
+                AbortController.NOOP,
+                List.of(),
+                denyToolContext("StructuredOutput"),
+                PermissionMode.DEFAULT);
+
+        ArrayNode schema = LlmAgentLoop.llmToolsArray(ctx, QuerySource.USER);
+
+        assertThat(schemaNames(schema))
+                .as("deny 优先于协调者放行：被 deny 的 StructuredOutput 不得出现")
+                .contains("SendMessage")
+                .doesNotContain("StructuredOutput", "Bash");
     }
 }

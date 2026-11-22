@@ -168,7 +168,7 @@ class StreamCompactSummaryTest {
 
         // 13 参构造：fork 槽位含工具源但 forkContextMessages 为空 → 跳过 fork → 落流式 fallback
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
         CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc, List.of());
         StreamCompactSummary scs = new StreamCompactSummary(
@@ -264,7 +264,7 @@ class StreamCompactSummaryTest {
                 List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 200, 300), "anthropic");
             RunForkedAgent.ForkedQuery query = params -> result;
             ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));
@@ -314,7 +314,7 @@ class StreamCompactSummaryTest {
                 List.of(assistant), new ForkedAgentResult.ForkUsage(1000, 500, 900, 100), "openai_sdk");
             RunForkedAgent.ForkedQuery query = params -> result;
             ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));
@@ -349,7 +349,7 @@ class StreamCompactSummaryTest {
             ForkedAgentResult result = new ForkedAgentResult(List.of(), ForkedAgentResult.ForkUsage.empty());
             RunForkedAgent.ForkedQuery query = params -> result;
             ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));
@@ -404,7 +404,7 @@ class StreamCompactSummaryTest {
                 throw new RuntimeException("fork boom");
             };
             ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 Map.of(), List.of(fakeTool("Read", false)), "", new AbortController(), List.of());
             CacheSafeParams params = new CacheSafeParams(List.of("sys"), Map.of(), Map.of(), tuc,
                 List.of(userMessage("forkctx1", "fork ctx")));

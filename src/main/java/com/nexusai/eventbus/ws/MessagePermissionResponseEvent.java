@@ -88,6 +88,20 @@ public class MessagePermissionResponseEvent {
     //   CC onAllow 第 1 参 updatedInput（interactiveHandler.ts:154-167，full replace）。
     //   旧前端不传 → null（保持原 input）。
     private final JsonNode updatedInput;
+    /**
+     * [V333 AFK] 倒计时超时提交时携带的总时长（毫秒）· 对齐 CC
+     * {@code AskUserQuestionPermissionRequest} 的 {@code onAllow(updatedInput)}：
+     * {@code updatedInput = {...input, answers, afkTimeoutMs}}。
+     *
+     * <p>null = 人类作答（默认路径），不写进 updatedInput。
+     */
+    private final Integer afkTimeoutMs;
+    /**
+     * [V333 AFK] 本次 allow 是否由倒计时触发 · 对齐 CC 权限结果顶层的 {@code isByCountdown}。
+     *
+     * <p>⛔ 只用于服务端日志/归因，<b>不进 tool_result、模型看不到</b>（CC 同样不给模型）。
+     */
+    private final Boolean isByCountdown;
 
     /**
      * 兼容旧调用:仅 requestId + decision(后端按 null 处理新字段)。
@@ -136,6 +150,25 @@ public class MessagePermissionResponseEvent {
      * <p>WHY 不依赖 default constructor: 本类是 final-field 不可变 DTO,加 default ctor 会破坏
      * 不变性;{@code @JsonCreator} 是惯用解决方案。
      */
+    public MessagePermissionResponseEvent(
+            String requestId,
+            String decision,
+            String acceptFeedback,
+            List<JsonNode> contentBlocks,
+            List<JsonNode> updatedPermissions,
+            JsonNode answers,
+            JsonNode annotations,
+            JsonNode updatedInput) {
+        this(requestId, decision, acceptFeedback, contentBlocks, updatedPermissions,
+            answers, annotations, updatedInput, null, null);
+    }
+
+    /**
+     * [V333 AFK] 主构造器 · Jackson 反序列化入口。
+     *
+     * <p>前端倒计时超时提交时带 {@code afkTimeoutMs} + {@code isByCountdown}；
+     * 人类作答路径两者均为 null（{@code @JsonInclude(NON_NULL)} 省略字段）。
+     */
     @JsonCreator
     public MessagePermissionResponseEvent(
             @JsonProperty("requestId") String requestId,
@@ -145,7 +178,9 @@ public class MessagePermissionResponseEvent {
             @JsonProperty("updatedPermissions") List<JsonNode> updatedPermissions,
             @JsonProperty("answers") JsonNode answers,
             @JsonProperty("annotations") JsonNode annotations,
-            @JsonProperty("updatedInput") JsonNode updatedInput) {
+            @JsonProperty("updatedInput") JsonNode updatedInput,
+            @JsonProperty("afkTimeoutMs") Integer afkTimeoutMs,
+            @JsonProperty("isByCountdown") Boolean isByCountdown) {
         this.requestId = requestId;
         this.decision = decision;
         this.acceptFeedback = acceptFeedback;
@@ -154,6 +189,8 @@ public class MessagePermissionResponseEvent {
         this.answers = answers;
         this.annotations = annotations;
         this.updatedInput = updatedInput;
+        this.afkTimeoutMs = afkTimeoutMs;
+        this.isByCountdown = isByCountdown;
     }
 
     /** 7 参兼容构造器 · 无 updatedInput（旧测试/旧调用语义）。 */
@@ -184,6 +221,10 @@ public class MessagePermissionResponseEvent {
      * 对齐 CC {@code onAllow(updatedInput, ...)} 的 full-replace 语义；null = 用原 input。
      */
     public JsonNode getUpdatedInput() { return updatedInput; }
+    /** [V333 AFK] 倒计时超时提交的总时长（毫秒）；null = 人类作答。 */
+    public Integer getAfkTimeoutMs() { return afkTimeoutMs; }
+    /** [V333 AFK] 是否由倒计时触发（只用于日志/归因；不进 tool_result）。 */
+    public Boolean getIsByCountdown() { return isByCountdown; }
     /**
      * [FIX-E askuser-answers] 每问注解（preview/notes；可为 null）。
      *

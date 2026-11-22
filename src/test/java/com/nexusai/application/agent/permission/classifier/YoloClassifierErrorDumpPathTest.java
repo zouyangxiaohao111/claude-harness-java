@@ -147,7 +147,7 @@ class YoloClassifierErrorDumpPathTest {
 
     /** 10 参 ToolUseContext + 显式 sessionId（dump 文件名校验用；注意 record 首字段为 agentId）。 */
     private static ToolUseContext newCtx(AbortController abortController, String sessionId) {
-        return new ToolUseContext(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", abortController, List.of(),
             null, PermissionMode.DEFAULT);
     }

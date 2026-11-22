@@ -22,7 +22,7 @@ import {
   brandTagFromName,
 } from '@/data'
 import type { Project, Session, SettingsTab, ModelTag, DiffFile, RightTab } from '@/types'
-import type { AppSettings, AskUserAnnotations, AskUserAnswers, AttachmentRequest, ModelTierRole, PermissionUpdate, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto } from '@/api/types'
+import type { AppSettings, AskUserAnnotations, AskUserAnswers, AttachmentRequest, ModelTierRole, PermissionUpdate, SessionDto, ChatMessageDto, UpdateSettingsRequest, PermissionMode, PivotCandidateDto, SessionModeDto } from '@/api/types'
 import { sessionApi } from '@/api/sessions'
 import { sessionFilesApi } from '@/api/sessionFiles'
 import { projectApi, type ProjectDto } from '@/api/projects'
@@ -30,6 +30,7 @@ import { selectProjectFolder } from '@/utils/projectFolder'
 import { isAbsolutePath, normalizePath } from '@/utils/path'
 import { compareSessions } from '@/utils/sessionOrder'
 import { resolveNewSessionProjectId } from '@/utils/newSessionProject'
+import { duplicateSession } from '@/utils/duplicateSession'
 import { chatApi } from '@/api/chat'
 import { artifactsApi, type SessionArtifacts, type SessionArtifactDto } from '@/api/artifacts'
 import { buildTurnContext, dedupeByFile } from '@/utils/artifactGrouping'
@@ -46,7 +47,7 @@ import { rememberAppName } from '@/utils/appNameCache'
 import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
 import { computeTurnRunning } from '@/utils/turnRunning'
 import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
-import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile } from '@/hooks/useServerRunning'
+import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile, useServerRunningSelfHeal } from '@/hooks/useServerRunning'
 import { useRunningSubagentSessionIds, useSubagentRunningReconcile } from '@/hooks/useSubagentRunning'
 import { sendSystemNotification, ensureNotificationPermissionOnGesture } from '@/utils/systemNotify'
 import { onSystemNotificationClick } from '@/utils/systemNotify'
@@ -72,8 +73,9 @@ import { MenuBar } from '@/components/layout/MenuBar'
 import { SessionList } from '@/components/left/SessionList'
 import { MessageList } from '@/components/center/MessageList'
 import { PermissionBubble } from '@/components/center/PermissionBubble'
+import { runQuickBind } from '@/components/center/imQuickBind'
+import { PendingPermissionHint } from '@/components/center/PendingPermissionHint'
 import { TaskListDock } from '@/components/center/TaskListDock'
-import { AskUserPendingHint } from '@/components/center/AskUserPendingHint'
 import { SubagentRunningHint } from '@/components/center/SubagentRunningHint'
 import { MonitorRunningHint } from '@/components/center/MonitorRunningHint'
 import { DialogOpsModal } from '@/components/center/DialogOpsModal'
@@ -83,7 +85,18 @@ import { CompactProgressBar } from '@/components/center/CompactProgressBar'
 import { NotificationBanner } from '@/components/center/NotificationBanner'
 import { Composer, SUMMON_TRAILING_SPACES } from '@/components/center/Composer'
 import { WorkspaceHeader } from '@/components/center/WorkspaceHeader'
+import type { PeerInboxPanelState } from '@/components/center/PeerInboxPanel'
+import { PeerPendingHint } from '@/components/center/PeerPendingHint'
+import { usePeerInboxFeed } from '@/hooks/usePeerInbox'
+import {
+  isPendingHeldItem,
+  peerHeldTitle,
+  peerInboxPendingCount,
+  usePeerInboxStore,
+} from '@/stores/peerInboxStore'
 import { SchedulesPage } from '@/components/center/SchedulesPage'
+import { ImChannelPage } from '@/components/center/ImChannelPage'
+import { imApi, type ImBinding, type ImChat, type ImConfig, type ImPlatform } from '@/api/im'
 import { KnowledgeBasePage, KbSceneNav } from '@/components/knowledge/KnowledgeBasePage'
 import { KbNewChatPane } from '@/components/knowledge/KbNewChatPane'
 import { kbPermissionOwnership, onKbAnswered, onKbOwnershipChanged } from '@/utils/kbPermissionOwnership'
@@ -435,8 +448,10 @@ function App() {
   const [historyLoading, setHistoryLoading] = useState(false)
   const [historyError, setHistoryError] = useState<string | null>(null)
   const historyReqSeq = useRef(0)
+  // [peer-inbox] 跨会话待收件 popover 开合由 peerInboxStore 统一持有（自动打开与手动开关同一事实来源；
+  //   切会话清空/自动打开边沿都在 store 内判定，组件不再各自判断）。
   // 主区页面：对话 / 定时任务 / 知识库（主区换页，不弹设置弹窗）
-  const [workspacePage, setWorkspacePage] = useState<'chat' | 'schedules' | 'knowledge'>('chat')
+  const [workspacePage, setWorkspacePage] = useState<'chat' | 'schedules' | 'knowledge' | 'im'>('chat')
   // 右栏抽屉开合（改版后右栏默认收起，由头部面板按钮 / 消息底部入口打开）
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false)
   // 基础设置（左下角用户行 → 轻量四项弹窗）
@@ -447,6 +462,21 @@ function App() {
   const [showAgentsPanel, setShowAgentsPanel] = useState(false)
   // FNT-BROWSER-01：/chrome 命令 → 打开 NexusAI in Chrome 扩展连接面板（静态引导 + sessionId 透出）
   const [showChromePanel, setShowChromePanel] = useState(false)
+  /**
+   * [快速绑定] 抢占确认：用**应用内弹窗**而不是 window.confirm。
+   *
+   * <p>why：Tauri WebView 里 `window.confirm` 不会真的弹（会被静默放行），
+   * 用户看到的就是「点了快速绑定立马被改绑」——没有确认这一步。
+   */
+  const [quickBindAsk, setQuickBindAsk] = useState<{ message: string; resolve: (ok: boolean) => void } | null>(null)
+  const askQuickBindConfirm = useCallback((message: string) =>
+    new Promise<boolean>((resolve) => setQuickBindAsk({ message, resolve })), [])
+  const answerQuickBind = useCallback((ok: boolean) => {
+    setQuickBindAsk((cur) => {
+      cur?.resolve(ok)
+      return null
+    })
+  }, [])
   // [附件双模式 local-read] 后端 nexusai.attachments.local-read（true=本地桌面：>5MB 拖拽附件传 path 由后端读盘）
   const [attachmentLocalRead, setAttachmentLocalRead] = useState(false)
   // 项目文件树点击查看（真实文件内容）
@@ -463,6 +493,8 @@ function App() {
    * 抽屉保持原样（浏览全部会话资源），本面板只在产物落地时打开（跟进刚生成的那一个）。
    */
   const [dockArtifact, setDockArtifact] = useState<SessionArtifactDto | null>(null)
+  /** 进右栏时直接进编辑态（产物卡「编辑」按钮 · md 等文本类）。 */
+  const [dockInitialEdit, setDockInitialEdit] = useState(false)
   const [dockWidth, setDockWidth] = useState<number>(() => {
     const saved = typeof localStorage !== 'undefined' ? Number(localStorage.getItem('nexusai-artifact-dock-w')) : 0
     return Number.isFinite(saved) && saved >= 320 ? saved : 460
@@ -642,6 +674,9 @@ function App() {
 
   // ---- current session & its context ----
   const activeSessionId = sessionR.activeSession
+  // ---- [V329] 会话模式（无人值守 / Brief）：权威值 + 写入口 ----
+  const [sessionMode, setSessionMode] = useState<SessionModeDto | null>(null)
+  const [modePending, setModePending] = useState(false)
   // 每会话独立输入草稿（切换会话不串扰）：保存上一个会话的输入，载入目标会话草稿
   const composerDraftsRef = useRef<Record<string, string>>({})
   const lastComposerSessionRef = useRef<string | null>(null)
@@ -662,6 +697,10 @@ function App() {
   const activePermissionMode: PermissionMode = activeSession?.permissionMode ?? appSettings?.permissionMode ?? 'default'
   // 当前会话主线程 agent（V58 main_thread_agent · null/空串 = 默认模式，Composer 顶部胶囊显示）
   const currentAgent = activeSession?.mainThreadAgent ?? null
+  // 会话模型显示：会话未设 override（modelName 为空，如 SessionCreate 建的会话）时，实际生效的是
+  // 全局主模型 —— 对齐后端 ChatService.resolveModelNameForSession 四层链
+  // （请求体 → sessions.model_name → settings.mainModelName → DEFAULT_MODEL）。这里只做显示回落。
+  const effectiveSessionModelName = activeSession.modelName || appSettings?.mainModelName || ''
 
   // 本地专家/市场数据由 SkillMarketModal 打开时自行拉取（agentApi.listAgents + marketApi.*），App 不再常驻清单。
 
@@ -781,6 +820,100 @@ function App() {
    */
   const turnRunningRef = useRef(turnRunning)
   turnRunningRef.current = turnRunning
+  // ---- [V329] 会话模式（无人值守 / Brief）：权威值 + 写入口 ----
+  const reloadSessionMode = useCallback(async (sid: string | null) => {
+    if (!sid) {
+      setSessionMode(null)
+      return
+    }
+    try {
+      setSessionMode(await sessionApi.getMode(sid))
+    } catch {
+      // 后端未升级 / 网络失败：保持 null（入口显示「关」，点击会被后端拒绝并提示）
+      setSessionMode(null)
+    }
+  }, [])
+  // 切会话 → 重拉（⛔ 不把上一个会话的状态带过来）
+  useEffect(() => {
+    setModePending(false)
+    void reloadSessionMode(activeSessionId)
+  }, [activeSessionId, reloadSessionMode])
+  // 本轮落定 → 若之前标记了「下一轮生效」，清标记并重拉权威状态
+  useEffect(() => {
+    if (!turnRunning && modePending) {
+      setModePending(false)
+      void reloadSessionMode(activeSessionId)
+    }
+  }, [turnRunning, modePending, activeSessionId, reloadSessionMode])
+  /**
+   * [A 预热提示] 单个聊天接入后：若该渠道需要激活但还没激活 ⇒ 提示一次。
+   *
+   * <p>⛔ 只提示，**不阻止绑定** —— 绑定仍然生效，只是让人知道「手机上暂时收不到通知」。
+   * 查询失败一律静默（提示是锦上添花，不能把绑定流程变成失败）。
+   */
+  const warnChatActivation = useCallback(async (chatId: string) => {
+    try {
+      const acts = await imApi.listChatActivations()
+      const a = acts.find((x) => x.chatId === chatId)
+      if (a?.activationRequired && !a.activated) {
+        showToast(a.hint ?? '微信渠道需先发一条消息激活，否则通知发不出去', 'info')
+      }
+    } catch { /* 查不到就不提示 */ }
+  }, [showToast])
+  /**
+   * [A 预热提示] 开启无人值守后：本会话绑定的渠道里有未激活的 ⇒ 提示一次。
+   *
+   * <p>为什么在「开启」时讲：无人值守意味着「不盯桌面、只靠手机回」，
+   * 而这个渠道恰恰收不到 —— 不提前说，用户会以为开了就万事大吉。
+   */
+  const warnSessionInactiveChannels = useCallback(async (sid: string) => {
+    try {
+      const [chats, acts] = await Promise.all([
+        imApi.listChatsBySession(sid),
+        imApi.listChatActivations(),
+      ])
+      const byId = new Map(acts.map((a) => [a.chatId, a]))
+      const bad = chats.filter((c) => {
+        const a = byId.get(c.id)
+        return !!a && a.activationRequired && !a.activated
+      })
+      if (bad.length > 0) {
+        showToast(`${bad.length} 个微信渠道未激活：需先给对方发一条消息，否则权限通知发不出去`, 'info')
+      }
+    } catch { /* 查不到就不提示 */ }
+  }, [showToast])
+  const toggleUnattended = useCallback(async () => {
+    const sid = activeSessionId
+    if (!sid) return
+    const target = !(sessionMode?.unattended ?? false)
+    try {
+      const next = await sessionApi.setUnattended(sid, target)
+      setSessionMode(next)
+      // 运行中切换：本轮工具池已装配 ⇒ 只提示「下一轮生效」，⛔ 不伪装已生效
+      if (turnRunningRef.current) setModePending(true)
+      showToast(target ? '已开启无人值守：回答直达开、Ask 关闭' : '已退出无人值守：Ask 恢复，回答直达保持', 'success')
+      // [A] 开启后补一句「哪个渠道收不到」（只提示，不改变结果）
+      if (target) void warnSessionInactiveChannels(sid)
+    } catch (e) {
+      const msg = e instanceof ApiError ? e.userMessage() : e instanceof Error ? e.message : String(e)
+      showToast(msg, 'info')
+    }
+  }, [activeSessionId, sessionMode, showToast, warnSessionInactiveChannels])
+  /** 左栏是否收起（同 turnRunningRef：异步推送回调里读「此刻」的布局，不读闭包旧值）。 */
+  const leftCollapsedRef = useRef(leftCollapsed)
+  leftCollapsedRef.current = leftCollapsed
+  /**
+   * 把产物面板宽度收回「中栏至少留 440px」的上限。
+   *
+   * <p>[2026-11-20 用户实测「默认打开会把对话内容盖住」] 面板是 grid 列，但历史存档 /
+   * 旧版本的宽度值可能比当前窗口还大 ⇒ 中栏被压到 0、内容被裁 ⇒ 看起来像被面板覆盖。
+   * 打开面板前先做一次视口拟合（只缩不放）。
+   */
+  const fitDockWidthToViewport = useCallback(() => {
+    const leftW = leftCollapsedRef.current ? 0 : 280
+    const maxW = Math.max(360, Math.min(1600, window.innerWidth - leftW - 440))
+    setDockWidth((w) => Math.min(w, maxW))
+  }, [])
   // 压缩进行中（compact-progress 事件 · 不经 LlmAgentLoop → turnRunning 假，需并入发送键⇄停止）
   // [多会话隔离 2026-09-11] 只看【当前活动会话】的进度：原实现读全局单对象 → A 压缩中切到 B，
   //   B 的发送键变停止（且点击取消的是 B）。此处与 CompactProgressBar 用同一键 → 键出现即横幅出现、
@@ -963,6 +1096,135 @@ function App() {
   // 主区停在定时任务页（对话面仍挂载，由 CSS 按 .workspace-surface[data-page="schedules"] 隐藏
   //   —— 输入草稿与附件不因换页丢失）。
   const showSchedulesPage = workspacePage === 'schedules'
+  /** IM 频道页（左侧边栏一级入口）：与定时任务同样走「主区换页」，不弹设置。 */
+  const showImPage = workspacePage === 'im'
+
+  /**
+   * 渠道 ↔ 会话 接线（V255）—— 左栏「IM 会话」块的数据源。
+   *
+   * <p>为什么放 App 而不是 SessionList：SessionList 是纯展示组件（既有约定），
+   * 取值/刷新由 App 负责；这里只在切页时刷一次（接线变化必伴随一次 IM 页操作）。
+   */
+  const [imChats, setImChats] = useState<ImChat[]>([])
+  /**
+   * [A 预热提示] 需要激活但还没激活的聊天 id（目前只有微信：缺 context_token）。
+   *
+   * <p>用途 = 渠道选择器里给那一项标「未激活」。⛔ 不常驻弹窗：只在**绑定**或
+   * **开启无人值守**这两个动作发生时提示一次。
+   */
+  const [imInactiveChatIds, setImInactiveChatIds] = useState<string[]>([])
+  /** 已接入的 IM 渠道（输入框渠道弹窗第一级） */
+  const [imInstances, setImInstances] = useState<Array<{ id: string; displayName: string; platform: ImPlatform }>>([])
+  /** 切绑 IM 聊天后重拉（effect 只在换页时跑，切绑后需要立刻反映） */
+  const reloadImChats = useCallback(async () => {
+    try {
+      setImChats(await imApi.listChats())
+    } catch {
+      // 未启用 / 后端未升级：保持原值，不打扰
+    }
+    // [A 预热提示] 微信渠道没收到过对方消息 ⇒ 没有 context_token ⇒ 权限通知发不出去。
+    //   查不到（后端未升级/网络失败）⇒ 清空标记（宁可不错标，也不误标）。
+    try {
+      const acts = await imApi.listChatActivations()
+      setImInactiveChatIds(
+        acts.filter((a) => a.activationRequired && !a.activated).map((a) => a.chatId),
+      )
+    } catch {
+      setImInactiveChatIds([])
+    }
+  }, [])
+  const [imBindings, setImBindings] = useState<ImBinding[]>([])
+  /**
+   * IM 安全与权限配置（单行 · 后端 im_config）。
+   *
+   * <p>为什么放在 App 而不是各自拉：对话框的开关与「IM 频道页 › 安全与权限」是
+   * **同一份数据**，两个入口必须看到一致的状态 ⇒ 单一持有者 + 单一写入口。
+   * （对话框开关与 IM 页开关各自维护 local state 会出现"这边开了那边没开"。）
+   */
+  const [imConfig, setImConfig] = useState<ImConfig | null>(null)
+  /**
+   * 切换「允许以我的名义发消息」。
+   *
+   * <p>乐观更新 + 失败回滚（与 IM 页现有开关同一范式）：网络往返期间手感不能卡，
+   * 但失败必须回滚 —— 否则界面显示"已开启"而库里没开，AI 拿不到工具、用户却以为开了。
+   */
+  const toggleImUserIdentity = useCallback(async () => {
+    if (!imConfig) {
+      // 配置还没读到（或后端未升级）⇒ 明确告知，不要静默无反应
+      showToast('IM 配置还没加载出来，稍后再试', 'info')
+      return
+    }
+    const prev = imConfig
+    const next = { ...imConfig, allowUserIdentity: !imConfig.allowUserIdentity }
+    setImConfig(next)
+    try {
+      setImConfig(await imApi.updateConfig(next))
+    } catch (e) {
+      setImConfig(prev)
+      showToast(e instanceof Error ? e.message : '保存失败', 'info')
+    }
+  }, [imConfig, showToast])
+  useEffect(() => {
+    let alive = true
+    // 左栏「IM 会话」块的数据源 = **聊天级**接线（V305），不是渠道级绑定（V255）：
+    // 渠道级只知道 "wechat"，拿不到"是哪个聊天接到了哪个任务"。
+    void imApi
+      .listChats()
+      .then((v) => {
+        if (alive) setImChats(v)
+      })
+      .catch(() => {
+        if (alive) setImChats([])
+      })
+    // [A] 渠道选择器里的「未激活」标记（微信缺 context_token）；查不到 ⇒ 不标
+    void imApi
+      .listChatActivations()
+      .then((v) => {
+        if (alive) {
+          setImInactiveChatIds(v.filter((a) => a.activationRequired && !a.activated).map((a) => a.chatId))
+        }
+      })
+      .catch(() => {
+        if (alive) setImInactiveChatIds([])
+      })
+    void imApi
+      .listInstances()
+      .then((v) => {
+        if (alive) setImInstances(v.map((i) => ({ id: i.id, displayName: i.displayName, platform: i.platform })))
+      })
+      .catch(() => {
+        if (alive) setImInstances([])
+      })
+    void imApi
+      .listBindings()
+      .then((v) => {
+        if (alive) setImBindings(v)
+      })
+      .catch(() => {
+        // 渠道子系统未启用 / 后端未升级 ⇒ 不打扰用户
+        if (alive) setImBindings([])
+      })
+    // IM 安全配置（对话框开关与 IM 页开关共享同一份）⇒ 切页时一起重拉，
+    // 这样「在 IM 页改了开关 → 切回对话框」看到的是新值。
+    void imApi
+      .getConfig()
+      .then((v) => {
+        if (alive) setImConfig(v)
+      })
+      .catch(() => {
+        if (alive) setImConfig(null)
+      })
+    return () => {
+      alive = false
+    }
+  }, [workspacePage])
+  const imSessionIds = useMemo(() => {
+    const ids = new Set<string>()
+    for (const c of imChats) if (c.boundSessionId) ids.add(c.boundSessionId)
+    // 兼容：MCP 通道侧的老绑定也算（两套并行期，宁可多显示也不要漏）
+    for (const b of imBindings) if (b.sessionId) ids.add(b.sessionId)
+    return ids
+  }, [imChats, imBindings])
   // 运行中会话集合（供左侧栏 `.status-dot.running` 闪烁点）。
   // [流式性能] 从 streamOrder 读键集：content 推进不换引用 → 不会每 chunk 重渲；块增删才更新。
   // 用 useMemo 稳定引用避免 selector 每次返回新 Set 触发无限重渲染。
@@ -1023,6 +1285,11 @@ function App() {
       || (useChatStore.getState().streams[activeSessionId] ?? []).some(
         (b) => (b.toolCalls ?? []).some((t) => t.id === pendingPlanApproval.toolUseId)))
     ? pendingPlanApproval : null
+  // [B3] 排队序号按「剩余队列」算（对齐 CC：答掉一张 ⇒ 下一张 1 of 2）。
+  //   卡片一次只渲染 currentPermission（恒为队列第一张）⇒ 序号恒为 1；N<2 时徽标不显示。
+  const permissionQueueSize = permissionQueue.filter((r) =>
+    r.sessionId === activeSessionId && !isPermissionOwnedElsewhere(r.sessionId)).length
+  const permissionQueueIndex = currentPermission ? 1 : 0
   // 稳定回调（useCallback）：否则每次渲染都换引用 ⇒ MessageList(memo) 失效 ⇒ 打字整表重渲
   const planClearHandler = useCallback(async (plan: string) => {
     const req = currentPermission
@@ -1054,6 +1321,8 @@ function App() {
     id: string, d: 'allow' | 'deny',
     answers?: AskUserAnswers, annotations?: AskUserAnnotations,
     permissionUpdates?: PermissionUpdate[], acceptFeedback?: string, updatedInput?: unknown,
+    /** [V333 AFK] 倒计时超时提交（人类作答不传） */
+    afk?: { afkTimeoutMs: number; isByCountdown: boolean },
   ) => {
     const req = currentPermission
     if (!req) return
@@ -1061,6 +1330,7 @@ function App() {
     if (clientRef.current) {
       sendPermissionResponse(clientRef.current, targetSession, req.kind, id, d, {
         answers, annotations, permissionUpdates, acceptFeedback, updatedInput,
+        afkTimeoutMs: afk?.afkTimeoutMs, isByCountdown: afk?.isByCountdown,
       })
     }
     useChatStore.getState().markToolAnswered(targetSession, req.toolUseId ?? id)
@@ -1114,17 +1384,50 @@ function App() {
   const setMessages = useChatStore((s) => s.setMessages)
   // [turn-paging] 分页单位 = **轮**（一轮 = 一条真正的用户提问行 + 其后的全部助手/工具内容，整轮不切断）。
   //   条数分页（150 条/页）在「一轮几百条 tool 消息」的数据形态下会把整页填成同一轮 ⇒ 首屏连一轮都显示不全。
-  /** [turn-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/turns 最近 3 轮，不再全量拉。
-   *  消息总数（轨迹徽标）由 /messages/count 的 5s 轮询单独维护，本端点不返回 total。 */
-  const loadTailWindow = useCallback(async (sid: string) => {
+  /** 会话窗口「整表安装」的调用序号（按 sid）：响应回来时若序号已变（期间又发了一次）→ 丢弃旧响应，
+   *  否则「先发的慢请求后返回」会把新结果覆盖成旧窗口。
+   *  loadTailWindow 与 reconcileTail 共用同一序号 ⇒ 两条安装路径对同一会话互斥（最新一次生效）。 */
+  const reconcileSeqRef = useRef<Record<string, number>>({})
+  /**
+   * [turn-paging] 尾页载入（查看主通道）：打开/刷新/断连补偿走 GET /messages/turns 最近 3 轮，不再全量拉。
+   * 消息总数（轨迹徽标）由 /messages/count 的 5s 轮询单独维护，本端点不返回 total。
+   *
+   * <p><b>[空窗口守卫] 为什么默认「空响应不覆盖本地」</b>：轮分页以「合法用户提问行」为锚点，
+   * 会话暂无锚点时后端返回 {@code messages=[]}（实证：新建会话首轮、提问行尚未落库时 rows=0；
+   * 随后落库即恢复）。整表安装空数组会把屏幕上的历史清空 ⇒ 用户看到「历史闪没、片刻后又出现」。
+   * 只有「裁剪到空 / 编辑重发 / 显式 F5」这类用户主动要求变成空的操作才传 {@code allowEmpty}。
+   */
+  const loadTailWindow = useCallback(async (sid: string, opts?: { allowEmpty?: boolean }) => {
+    const token = (reconcileSeqRef.current[sid] ?? 0) + 1
+    reconcileSeqRef.current[sid] = token
     // [折叠 = 真删 · 2026-11-02] 首屏/切会话/F5 只拉 FOLD_DEFAULT_TURNS 轮（与内存裁剪同源）
-    const { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
+    let { messages, hasMore } = await chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
+    if (reconcileSeqRef.current[sid] !== token) return
+    if (messages.length === 0) {
+      // [无轮锚点兜底] 轮分页以「合法用户提问行」为锚点。派生会话（SessionCreate 派单 / 子代理）
+      //   与纯系统+工具会话没有锚点 ⇒ 结构上只能返回 []，而会话实际有大量内容
+      //   （实证 sess-24230aad：415 条，user 行全是 is_meta / attachment）。
+      //   此时降级按条数取尾页，避免「后端有、前端全新」。
+      try {
+        const page = await chatApi.listMessagesPage(sid, { limit: 50 })
+        if (reconcileSeqRef.current[sid] !== token) return
+        if (page.messages.length > 0) {
+          messages = page.messages
+          hasMore = page.hasMore
+        }
+      } catch {
+        // 降级失败：沿用原空结果（下方空窗口守卫仍保护本地已显示内容）
+      }
+    }
+    if (!opts?.allowEmpty && messages.length === 0
+        && (useChatStore.getState().messages[sid]?.length ?? 0) > 0) {
+      // 静默跳过必须留一行原因（否则下次排查只能猜「为什么没刷新」）
+      console.debug('[load-tail] 服务端空窗口且本地非空 → 保留本地窗口', sid)
+      return
+    }
     setMessages(sid, messages)
     useChatStore.getState().setHasMore(sid, hasMore)
   }, [setMessages])
-  /** 尾部对账的调用序号（按 sid）：响应回来时若序号已变（期间又发了一次）→ 丢弃旧响应，
-   *  否则「先发的慢请求后返回」会把新结果覆盖成旧窗口。 */
-  const reconcileSeqRef = useRef<Record<string, number>>({})
   /**
    * [尾部对账] 切会话 / 断连重连 / idle 兜底 三处共用：拉一次尾窗并**整表安装**（对齐 dsh
    * `installWindow` / `repairGap` 语义）。
@@ -1458,7 +1761,7 @@ function App() {
     try {
       const resp = await chatApi.trimAfter(activeSessionId, messageId)
       if (resp.conversationId) setConversationId(activeSessionId, resp.conversationId)
-      await loadTailWindow(activeSessionId)
+      await loadTailWindow(activeSessionId, { allowEmpty: true })
       setShowDialogOps(false)
       showToast('已裁剪，此消息及其之后的对话已删除', 'success')
     } catch (e) {
@@ -1531,19 +1834,17 @@ function App() {
       return
     }
     // [turn-paging] 无缓存 → 最近 3 轮（有界窗口，不再全量；hasMore 供顶部「加载更多」）
+    // 走 loadTailWindow：与其它入口共用「无轮锚点降级 / 空窗口守卫 / 响应序号」，避免首屏
+    //   在「会话只有派生消息、没有用户提问锚点」时被空数组写成全新会话。
     let cancelled = false
-    chatApi.listTurns(sid, { turns: FOLD_DEFAULT_TURNS })
-      .then(({ messages, hasMore }) => {
-        if (cancelled) return
-        setMessages(sid, messages)
-        useChatStore.getState().setHasMore(sid, hasMore)
-      })
-      .catch((e) => { if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info') })
+    void loadTailWindow(sid).catch((e) => {
+      if (!cancelled) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    })
     return () => { cancelled = true }
     // sessionLive 必须在依赖里：切回时还在跑 → 本次不发请求；收口后（true→false）要自动补一次对账。
     // ⛔ 不加 messages/streams —— 内容推进不应重发 listTurns。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [activeSessionId, isRealActive, sessionLive, setMessages, showToast, reconcileTail, clearStream])
+  }, [activeSessionId, isRealActive, sessionLive, setMessages, showToast, reconcileTail, clearStream, loadTailWindow])
 
   // [Phase2] 切到真实会话 → GET /files 对账（补订阅前/断连期间的改动文件 · 与 files.changed 事件同源整表替换）
   const realChangedSession = storeSessions.some((s) => s.id === activeSessionId) ? activeSessionId : null
@@ -1561,6 +1862,8 @@ function App() {
   //   实现（GET + 失败静默 + 非轮询）与 WHY 见 hooks/useServerRunning.ts（抽出去是为了可被渲染级用例
   //   钉住 —— 内联在 App 里时「把 GET 整条改死」任何单测都照绿）。
   useServerRunningRebuild(activeSessionId, isRealActive)
+  // [状态自愈] 服务端说「在跑」的会话 5s 对账一次：complete/idle 帧丢失时也能翻回空闲 ⇒ 绿点能露出来。
+  useServerRunningSelfHeal()
 
   // [C6 · 遗留2] 服务端权威「收口」（true→false）→ 对账本地 turn 簿记（对账单点见 hooks/useServerRunning.ts：
   //   store 侧定稿残留流式块 + 回调回收本处 activeStreams 登记）。complete/cancel/error 三处事件回调
@@ -1614,7 +1917,7 @@ function App() {
   //   （ChatService :2682）。故本行是给「改回 per-turn topic」这类将来重设计留的兜底，**不是**当前回归的
   //   守护；真要区分「终止信号属于哪一轮」，需服务端在事件里带轮次 id（当前不带，见上方轮次判据的覆盖边界）。
   //   ⛔ 删/留属行为决策（未动）。
-  // ---- 「完成未读」绿点（需求：运行结束且非当前会话 → 静止绿点；切到即清除）----
+  // ---- 「完成」绿点（需求：运行结束即静止绿点；当前会话也显示；切到即清除）----
   const activeSessionIdRef = useRef(activeSessionId)
   activeSessionIdRef.current = activeSessionId
   const [doneUnreadIds, setDoneUnreadIds] = useState<Set<string>>(new Set())
@@ -1625,10 +1928,10 @@ function App() {
   }, [activeSessionId])
 
   const handleSessionDone = useCallback((sid: string, topic?: string, kind?: TurnEndKind) => {
-    // [未读] complete/cancel 运行结束且非当前会话 → 标「完成未读」（running/pending 优先级更高会覆盖显示）
-    if (sid !== activeSessionIdRef.current) {
-      setDoneUnreadIds((p) => (p.has(sid) ? p : new Set(p).add(sid)))
-    }
+    // [完成绿点] 本轮结束 ⇒ 标记完成（**当前会话也标记**：用户裁定「完成后变绿是对的」）。
+    // 仍有子代理在跑时不会显示绿点 —— 侧栏优先级 running > done，绿点被黄点盖住；
+    // 子代理全部结束、running 集合清空后自然露出来。
+    setDoneUnreadIds((p) => (p.has(sid) ? p : new Set(p).add(sid)))
     /**
      * [2026-11-04 新增] **系统级通知**（Windows 右下角 / macOS 通知中心）。
      *
@@ -1833,7 +2136,22 @@ function App() {
       //   判据取**推送载荷的 kind**（这次推的到底是什么）⇒ 不依赖 DB 行恰好在哪个桶里。
       if (payload.kind && payload.kind !== 'deliverable') return
       if (target.kind !== 'deliverable') return
+      // [2026-11-19/20 用户裁定] 自动打开统一进**右栏**（md/html 都是 · 右栏是 grid 列，
+      //   压缩中栏而不遮挡对话；全屏才走单独弹窗）。
+      //   「自动打开大一点」：旧默认 460px 太小 ⇒ 按视口比例拉起（html 62%、其它 50%）。
+      //   ⛔ 但必须给中栏留出可读宽度（用户 2026-11-20 实测「默认打开会盖住/挤没对话内容」）：
+      //     中栏内容列停靠时降到 320px 下限（见 CSS `.artifact-dock-open { --content-min }`）⇒
+      //     面板宽 = min(视口比例, 视口 - 左栏 - 中栏保留 440px)，绝不把对话压到溢出被裁。
+      const isHtmlOpen = artifactOpenActionOf(target).kind === 'view-html'
+      const leftW = leftCollapsedRef.current ? 0 : 280
+      const centerReserve = 440
+      const maxByCenter = Math.max(360, Math.min(1400, window.innerWidth - leftW - centerReserve))
+      const ratioWant = Math.round(window.innerWidth * (isHtmlOpen ? 0.62 : 0.5))
+      const want = Math.max(360, Math.min(ratioWant, maxByCenter))
+      // 只涨不跌，但**不得突破中栏保留位**：本地存过更宽的拖动值时，自动打开把它收回可读范围。
+      setDockWidth((w) => Math.min(Math.max(w, want), maxByCenter))
       dockAutoOpenRef.current = true
+      setDockInitialEdit(false)
       setDockArtifact(target)
     })()
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1962,6 +2280,13 @@ function App() {
       void showMainWindow()
       const sid = typeof extra?.sessionId === 'string' ? extra.sessionId.trim() : ''
       if (!sid) return
+      // [peer-pending] 待处理通知：聚焦窗口 + 跳该会话并定位首条 pending 卡。
+      //   走 store.requestJump 与 Web 通道同一条消费路径（App 的 jumpRequest effect）。
+      if (extra?.kind === 'peer-hold') {
+        const messageId = typeof extra?.messageId === 'string' ? extra.messageId : null
+        usePeerInboxStore.getState().requestJump(sid, messageId)
+        return
+      }
       // 会话可能已删除 / 不在当前列表 ⇒ 忽略（界面上本来就找不到它）
       if (!useChatStore.getState().sessions.some((x) => x.id === sid)) return
       sessionDispatch({ type: 'SWITCH', sessionId: sid })
@@ -2126,6 +2451,35 @@ function App() {
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
       throw e
+    }
+  }, [sessionDispatch, setSessions, storeSessions, showToast])
+
+  /**
+   * 左栏会话 ⋯ →「复制」：以**最后一条消息**为分叉点，复制出一个新会话。
+   *
+   * <p>与主区「从这条回答继续分叉」是**同一个后端能力**（POST /sessions/{id}/fork），
+   * 区别只在分叉点 —— 这里固定取会话最后一条 = 复制整个会话。
+   *
+   * <p>分叉点取法：{@code GET /messages/page?limit=1}（尾页 = 最新一条；轻量，不拉全量消息）。
+   * 后端 fork 强制要求 pivot 存在且属于本源会话（{@code @NotBlank throughMessageId}），
+   * 空会话没有 pivot ⇒ 这里先提示，不让请求白跑一趟。
+   */
+  const handleDuplicateSession = useCallback(async (sourceSessionId: string) => {
+    try {
+      const result = await duplicateSession(sourceSessionId)
+      if (!result.ok) {
+        showToast('该会话还没有消息，暂无可复制的内容', 'info')
+        return
+      }
+      const res = result.response
+      sessionListSeqRef.current++  // 丢弃在途列表响应，避免新会话闪一下又消失
+      setSessions([res.session, ...storeSessions].sort(compareSessions))
+      setWorkspacePage('chat')
+      sessionDispatch({ type: 'SWITCH', sessionId: res.session.id })
+      sessionDispatch({ type: 'ADD_TAB', tabId: res.session.id })
+      showToast(`已复制：${res.session.title}（复制 ${res.copiedMessages} 条消息）`, 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     }
   }, [sessionDispatch, setSessions, storeSessions, showToast])
 
@@ -2541,6 +2895,157 @@ function App() {
   const toggleRightCollapsed = useCallback(() => setRightCollapsed((v) => !v), [])
 
   // ---- 主区头部的通用动作（WorkspaceHeader）----
+  // [peer-inbox] 待收件：列表归属本会话；切会话时 store 会清空并按新会话重拉。
+  //   这里额外做一层「展示过滤」：凡是响应还挂着上一个会话的 id，一律不渲染（⛔ 不串会话）。
+  const peerInboxSessionId = usePeerInboxStore((s) => s.sessionId)
+  const peerInboxItems = usePeerInboxStore((s) => s.items)
+  const peerInboxRowErrors = usePeerInboxStore((s) => s.rowErrors)
+  const peerInboxActing = usePeerInboxStore((s) => s.acting)
+  const peerInboxActingAll = usePeerInboxStore((s) => s.actingAll)
+  // [peer-badge] 左栏全局角标：每会话 pending 计数 + 全局总数（store 维护，口径只含 pending）。
+  //   数据由聚合 topic 的 pendingCount 与 counts 对账刷新（重连/前台恢复补拉，⛔ 不新增轮询）。
+  const peerInboxCountsBySession = usePeerInboxStore((s) => s.countsBySession)
+  const peerInboxTotalPending = usePeerInboxStore((s) => s.totalPending)
+  const peerInboxInboxItems = usePeerInboxStore((s) => s.inboxItems)
+  const peerInboxInboxLoading = usePeerInboxStore((s) => s.inboxLoading)
+  const peerInboxInboxError = usePeerInboxStore((s) => s.inboxError)
+  const peerInboxInboxNotice = usePeerInboxStore((s) => s.inboxNotice)
+  const peerInboxInboxRowErrors = usePeerInboxStore((s) => s.inboxRowErrors)
+  const peerInboxInboxActing = usePeerInboxStore((s) => s.inboxActing)
+  const acceptInbox = usePeerInboxStore((s) => s.acceptInbox)
+  const rejectInbox = usePeerInboxStore((s) => s.rejectInbox)
+  const loadInbox = usePeerInboxStore((s) => s.loadInbox)
+  const peerInboxOpen = usePeerInboxStore((s) => s.open)
+  const peerInboxJumpRequest = usePeerInboxStore((s) => s.jumpRequest)
+  /** 最近一次「待处理提醒」信号：系统通知不可用时必须用页内 toast 兜底（⛔ 不静默）。 */
+  const peerInboxAlert = usePeerInboxStore((s) => s.alert)
+  const acceptPeerHeld = usePeerInboxStore((s) => s.accept)
+  const rejectPeerHeld = usePeerInboxStore((s) => s.reject)
+  const rejectAllPeerHeld = usePeerInboxStore((s) => s.rejectAll)
+  usePeerInboxFeed(activeSessionId, clientRef)
+  const closePeerInbox = useCallback(() => usePeerInboxStore.getState().closePanel(), [])
+  /**
+   * [peer] 标题**显式点击** → 跳到来源会话（唯一跳转入口）。
+   *
+   * <p>⛔ 自动行为（渲染 / 事件到达 / 启动提示 / 自动展开）一律不走这里。
+   * 来源会话已删除 / 不在会话列表（含已归档）⇒ 只提示、不跳转 —— 跳到不存在的会话
+   * 会让用户看到空白主区，比不跳更糟。
+   */
+  const openPeerSession = useCallback((sourceSessionId: string) => {
+    const sid = (sourceSessionId ?? '').trim()
+    if (!sid) return
+    if (!useChatStore.getState().sessions.some((s) => s.id === sid)) {
+      showToast('来源会话不存在或已删除，无法跳转', 'info')
+      return
+    }
+    switchSession(sid)
+  }, [switchSession, showToast])
+  const peerInboxOwned = peerInboxSessionId === activeSessionId
+  // 来源标题：后端 HeldView 只给 fromName（team-lead/agent 名，不是会话标题）；
+  //   用会话列表补「来源会话标题」快照（缺该会话时回落到 fromName → id，见 peerHeldTitle）。
+  const peerInboxRows = peerInboxOwned
+    ? peerInboxItems.map((i) => {
+        // 后端 HeldView 的实际字段名是 sourceTitle；旧投影 fromSessionTitle 也认。
+        if (i.fromSessionTitle || i.sourceTitle) return i
+        const title = i.fromSessionId
+          ? storeSessions.find((s) => s.id === i.fromSessionId)?.title
+          : null
+        return title ? { ...i, sourceTitle: title } : i
+      })
+    : []
+  /** 待处理项的来源标题（去重、最多 3 个）：输入框常驻条必须显示《标题》。 */
+  const peerInboxPendingTitles = peerInboxOwned
+    ? Array.from(new Set(
+        peerInboxRows.filter((i) => isPendingHeldItem(i)).map((i) => peerHeldTitle(i)),
+      )).slice(0, 3)
+    : []
+  // [peer-inbox-seen] 内联待确认卡**渲染到视野**才算已读：卡片固定在流尾 ⇒ 判据 = 流贴底。
+  //   ⛔ 不再依赖面板 open（列表不渲染正文，也不是「看过消息」）。依赖用未见过的 id 串，
+  //   轮询只更新字段时不会重复上报；新到达/刷新出的未读 id 变化时才再触发。
+  const peerInboxUnseenKey = peerInboxOwned && chatAtBottom
+    ? peerInboxRows.filter((i) => !i.seenAt).map((i) => i.messageId).join(',')
+    : ''
+  useEffect(() => {
+    if (!peerInboxOwned || !chatAtBottom || !peerInboxUnseenKey) return
+    void usePeerInboxStore.getState().markSeenForVisible()
+  }, [chatAtBottom, peerInboxOwned, peerInboxUnseenKey])
+  // [peer-pending] 系统通知不可用（插件缺失 / 权限被拒 / 浏览器未授权）时用页内 toast 兜底；
+  //   同一信号只弹一次（按 seq 去重）。输入框常驻条此时也仍然可见 ⇒ 不会静默。
+  const peerAlertToastedSeq = useRef(0)
+  useEffect(() => {
+    if (!peerInboxAlert || peerInboxAlert.notified) return
+    if (peerAlertToastedSeq.current === peerInboxAlert.seq) return
+    peerAlertToastedSeq.current = peerInboxAlert.seq
+    showToast(`待收件：还有 ${peerInboxAlert.count} 条未确认投递需处理`, 'info')
+  }, [peerInboxAlert, showToast])
+  /** 待处理数（角标 / 常驻条 / 启动提示的唯一口径；⛔ 不用未读数）。 */
+  const peerInboxPending = peerInboxOwned ? peerInboxPendingCount(peerInboxRows) : 0
+  /** 目标会话标题（收件箱行必须显示；缺失回落 id）。 */
+  const peerInboxSessionTitles = useMemo(
+    () => Object.fromEntries(storeSessions.map((s) => [s.id, s.title ?? s.id])),
+    [storeSessions],
+  )
+  /** 跳转后聚焦的 pending 卡（MessageList 消费：滚到卡 + 高亮 1.5s）。 */
+  const peerFocusSeq = useRef(0)
+  const [peerFocus, setPeerFocus] = useState<{ sessionId: string; messageId: string | null; nonce: number } | null>(null)
+  /**
+   * 唯一跳转实现：校验会话存在 → 关列表 → 切会话 → 请求聚焦首条 pending 卡。
+   *
+   * <p>⛔ 永不 openPanel；目标会话不在列表（已删除/不可用）时只提示 + 纠正计数，
+   * 不尝试 accept/reject（那会打到一个不存在的会话）。
+   */
+  const jumpToPending = useCallback((targetSessionId: string, messageId?: string | null) => {
+    const sid = (targetSessionId ?? '').trim()
+    if (!sid) return
+    if (!useChatStore.getState().sessions.some((s) => s.id === sid)) {
+      showToast('该待处理所属会话已删除或不可用', 'info')
+      void usePeerInboxStore.getState().reconcileCounts()
+      return
+    }
+    usePeerInboxStore.getState().closePanel()
+    switchSession(sid)
+    setPeerFocus({ sessionId: sid, messageId: messageId ?? null, nonce: ++peerFocusSeq.current })
+  }, [switchSession, showToast])
+  /** 打开收件箱（左栏待处理 / 输入框去处理）；0 条只提示，不开空面板。 */
+  const openInbox = useCallback(() => {
+    const st = usePeerInboxStore.getState()
+    if (st.totalPending <= 0 && st.pendingCount <= 0) {
+      showToast('收件箱暂无待处理来信', 'info')
+      return
+    }
+    st.openPanel()
+  }, [showToast])
+  /** 右上角收件箱入口：开着则收起，否则打开（入口按钮的常见语义）。 */
+  const toggleInbox = useCallback(() => {
+    const st = usePeerInboxStore.getState()
+    if (st.open) {
+      st.closePanel()
+      return
+    }
+    openInbox()
+  }, [openInbox])
+  // Web 系统通知点击 → store 发跳转请求；App 在这里统一消费（Tauri 通道直接调 jumpToPending）。
+  const consumedPeerJumpSeq = useRef(0)
+  useEffect(() => {
+    if (!peerInboxJumpRequest || peerInboxJumpRequest.seq === consumedPeerJumpSeq.current) return
+    consumedPeerJumpSeq.current = peerInboxJumpRequest.seq
+    jumpToPending(peerInboxJumpRequest.sessionId, peerInboxJumpRequest.messageId)
+  }, [peerInboxJumpRequest, jumpToPending])
+  const peerInboxState: PeerInboxPanelState = {
+    open: peerInboxOpen,
+    items: peerInboxInboxItems,
+    sessionTitles: peerInboxSessionTitles,
+    loading: peerInboxInboxLoading,
+    error: peerInboxInboxError,
+    notice: peerInboxInboxNotice,
+    rowErrors: peerInboxInboxRowErrors,
+    acting: peerInboxInboxActing,
+    onClose: closePeerInbox,
+    onRetry: () => { void loadInbox() },
+    onAccept: (id) => { void acceptInbox(id) },
+    onReject: (id) => { void rejectInbox(id) },
+    onOpenSession: (target, messageId) => jumpToPending(target, messageId),
+  }
   // 历史提问：打开时拉候选（全部 user 消息）；「压缩 / 裁剪」仍走既有 DialogOpsModal
   //   （不另造第二条执行路径，确认/后果提示等既有能力原样保留）。
   const toggleHistoryPanel = useCallback(() => {
@@ -2592,6 +3097,8 @@ function App() {
   }, [ui.showSearchPalette, uiDispatch])
   const handleWorkspaceShare = useCallback(() => showToast('分享功能建设中', 'info'), [showToast])
   // 切会话 / 新建 → 历史提问面板回到关闭态（候选属于上一个会话），跳转目标一并作废
+  // 切会话只关历史提问；待收件面板由 store 的 load(新会话) 关闭并重设基线（⛔ 不在这里清 sessionId，
+  //   否则会与 usePeerInboxFeed 的加载竞态，把在途响应作废）。
   useEffect(() => { setShowHistoryPanel(false); setHistoryJump(null) }, [activeSessionId])
 
   /**
@@ -2721,11 +3228,11 @@ function App() {
   // [产物/来源] 产物卡点击 → **按类型分发**的统一打开函数（右栏「产物」tab 与正文下方共用同一个）。
   //   ⛔ 不能走 openRefFile/openProjectFile：产物的 localPath 是**归档副本**的绝对路径
   //      （{configHome}/artifacts/<sessionId>/…），不在任何项目根内 ⇒ 必报「文件路径非法」。
-  //   分发口径（用户 2026-10-31 裁定）：
+  //   分发口径（用户 2026-10-31 裁定 + 2026-11-19 修订）：
   //     目录           → 桌面端打开所在目录（资源管理器）/ 浏览器端复制路径 + 说明
-  //     html          → ArtifactViewModal（Monaco 查看/编辑/保存 + 运行 + 在浏览器中打开）
+  //     html / md / 其它文本 → **右栏 ArtifactDock**（grid 列：压缩中栏、⛔ 不覆盖对话）；
+  //                      右栏的「全屏」才走单独弹窗（html → ArtifactViewModal，文本 → ArtifactPreviewModal）
   //     docx/xlsx/pdf/img → 现有渲染（独立预览窗：DocxPreview / ExcelPreview / PdfPreview / 图片）
-  //     md/其它文本    → ArtifactPreviewModal（Markdown 渲染 + 编辑保存）
   //     其它二进制      → 提示「该类型暂不支持预览」+ 复制路径（Tauri 下交给系统默认程序）
   const openArtifact = useCallback(async (a: SessionArtifactDto) => {
     if (!activeSessionId) {
@@ -2751,7 +3258,12 @@ function App() {
       return
     }
     if (action.kind === 'view-html') {
-      setViewArtifact({ sessionId: activeSessionId, artifact: a })
+      // [2026-11-19 用户裁定] html 点击也和 md 一样 → **右栏渲染**（不再是单独弹窗）；
+      //   弹窗只由右栏「全屏」触发（expandArtifact → ArtifactViewModal）。
+      setRightDrawerOpen(false)
+      fitDockWidthToViewport()
+      setDockInitialEdit(false)
+      setDockArtifact(a)
       return
     }
     if (action.kind === 'standalone') {
@@ -2763,7 +3275,13 @@ function App() {
       return
     }
     if (action.kind === 'preview-text') {
-      setPreviewArtifact({ sessionId: activeSessionId, artifact: a })
+      // [2026-11-19 用户裁定] 文本产物点击 → **右栏展示**（grid 列，压缩中栏而不遮挡对话）；
+      //   弹窗只留给右栏的「全屏」（见 expandArtifact）。
+      //   ⚠️ 抽屉（z-index 24）和右栏产物面板（22）占同一列，抽屉开着会盖住面板 ⇒ 先收抽屉。
+      setRightDrawerOpen(false)
+      fitDockWidthToViewport()
+      setDockInitialEdit(false)
+      setDockArtifact(a)
       return
     }
     // 其它二进制（pptx / zip / …）：浏览器里没有对应渲染器 ⇒ 复制路径 + 提示；
@@ -2781,7 +3299,7 @@ function App() {
       try { await navigator.clipboard.writeText(path) } catch { /* 剪贴板被拒不影响提示 */ }
     }
     showToast('该类型暂不支持预览，产物路径已复制', 'info')
-  }, [activeSessionId, showToast])
+  }, [activeSessionId, showToast, fitDockWidthToViewport])
 
   // [产物卡 · 在浏览器中打开] **只有 html 有**这个入口 → raw 端点（后端未上线时降级复制路径）
   const openArtifactInBrowser = useCallback(async (a: SessionArtifactDto) => {
@@ -2795,18 +3313,47 @@ function App() {
     showToast('产物原始地址暂不可用，路径已复制', 'info')
   }, [activeSessionId, showToast])
 
-  // [产物卡 · 编辑] 仅文本类产物有该入口 → html 走 Monaco 视图（直接进编辑态），其余走 Markdown/原文预览视图
+  // [产物卡 · 编辑] 文本类产物（含 html）统一进**右栏编辑态**（与点开同一处展示，
+  //   ⛔ 不弹遮罩层盖住对话）；全屏（ArtifactViewModal）里仍可用 Monaco 编辑。
   const editArtifact = useCallback((a: SessionArtifactDto) => {
     if (!activeSessionId) {
       showToast('无法编辑产物：未选中会话', 'info')
       return
     }
-    if (artifactOpenActionOf(a).kind === 'view-html') {
-      setViewArtifact({ sessionId: activeSessionId, artifact: a, initialEdit: true })
+    // 同 openArtifact：抽屉会盖住右栏产物面板 ⇒ 先收抽屉
+    setRightDrawerOpen(false)
+    fitDockWidthToViewport()
+    setDockInitialEdit(true)
+    setDockArtifact(a)
+  }, [activeSessionId, showToast, fitDockWidthToViewport])
+
+  /**
+   * 右栏「全屏」→ **单独弹窗**（用户 2026-11-19：「用右栏展示，全屏就是单独弹窗」）。
+   *
+   * <p>⛔ 不能复用 {@link openArtifact}：那里文本类已经改成进右栏，全屏必须显式走弹窗，
+   * 否则点「全屏」只是把同一个产物再塞回右栏（空操作）。
+   */
+  const expandArtifact = useCallback((a: SessionArtifactDto) => {
+    if (!activeSessionId) return
+    const action = artifactOpenActionOf(a)
+    if (action.kind === 'view-html') {
+      setViewArtifact({ sessionId: activeSessionId, artifact: a })
       return
     }
-    setPreviewArtifact({ sessionId: activeSessionId, artifact: a, initialEdit: true })
-  }, [activeSessionId, showToast])
+    if (action.kind === 'preview-text') {
+      setPreviewArtifact({ sessionId: activeSessionId, artifact: a })
+      return
+    }
+    if (action.kind === 'standalone') {
+      openStandalone({
+        type: action.previewType,
+        title: a.title,
+        artifact: { sessionId: activeSessionId, artifactId: a.id },
+      })
+      return
+    }
+    void openArtifact(a)
+  }, [activeSessionId, openArtifact])
 
   // [Phase3 @引用] 项目树右键「引用到对话」/ 未来其它入口 → 把 @path 插进输入框（与输入框 @ 补全同效）
   const insertReference = useCallback((path: string) => {
@@ -3221,7 +3768,8 @@ function App() {
       // F10：裁剪后后端返回新 conversationId（row key 刷新），落 store
       if (resp.conversationId) setConversationId(activeSessionId, resp.conversationId)
       // 重拉窗口（裁剪后剩余内容 = 按轮分页的最近 3 轮；不再依赖响应里的全量 messages）
-      await loadTailWindow(activeSessionId)
+      // 编辑重发可能把会话裁到只剩待重发之前的 0 条：用户显式操作，允许空窗口
+      await loadTailWindow(activeSessionId, { allowEmpty: true })
       // 裁剪完成 ⇒ 立刻退出编辑态（编辑态只覆盖裁剪这一小段）
       onTrimmed?.()
       // [2026-11-01] 原消息的附件随重发一起带上：否则「编辑后重发」会静默丢图
@@ -3272,6 +3820,7 @@ function App() {
   useEscapeKey(ui.showSettings, () => uiDispatch({ type: 'CLOSE_SETTINGS' }))
   useEscapeKey(showBasicSettings, () => setShowBasicSettings(false))
   useEscapeKey(showHistoryPanel, () => setShowHistoryPanel(false))
+  useEscapeKey(peerInboxOpen, closePeerInbox)
   useEscapeKey(!!ui.diffFile, () => { uiDispatch({ type: 'SET_DIFF', file: null }); setLiveDiff(null) })
   useEscapeKey(showModelPicker, () => setShowModelPicker(false))
   useEscapeKey(showAgentsPanel, () => setShowAgentsPanel(false))
@@ -3311,7 +3860,7 @@ function App() {
   return (
     <div
       className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}${rightDrawerOpen ? ' right-drawer-open' : ''}${dockArtifact ? ' artifact-dock-open' : ''} workspace-surface`}
-      data-page={showSchedulesPage ? 'schedules' : 'chat'}
+      data-page={showImPage ? 'im' : showSchedulesPage ? 'schedules' : 'chat'}
       style={{
         // [产物侧栏 2026-11-02] 面板宽度写到根节点上：CSS 的 `.artifact-dock-open` 读这个变量
         //   决定第三列列宽（真正压缩中栏，不是覆盖）。
@@ -3418,6 +3967,9 @@ function App() {
         // 左栏「定时任务」→ 主区换页（走现有 useSchedules，不弹设置）
         onOpenSchedules={() => setWorkspacePage('schedules')}
         schedulesActive={showSchedulesPage}
+        onOpenIm={() => setWorkspacePage('im')}
+        imActive={showImPage}
+        imSessionIds={imSessionIds}
         onOpenAgentMarket={() => openMarket('expert')}
         onOpenKnowledgeBase={() => {
           // ⭐ 用户 2026-11-09 裁定：「点开默认就是独立窗口」。
@@ -3441,16 +3993,48 @@ function App() {
         onDeleteSession={handleDeleteSession}
         onRenameSession={renameSession}
         onPinSession={pinSession}
+        // 左栏会话 ⋯ →「复制」= 以最后一条消息为分叉点分叉出新会话（同主区分叉能力）
+        onDuplicateSession={handleDuplicateSession}
         runningSessionIds={runningSessionIds}
         pendingSessionIds={pendingSessionIds}
+        // [peer-badge] 全局跨会话待处理角标：行内（会话维）+ 顶部汇总（全局）。
+        //   汇总点击只开面板、不切会话（无法确定目标会话）。
+        peerPendingCounts={peerInboxCountsBySession}
+        peerTotalPending={peerInboxTotalPending}
+        // 全局汇总：0 不弹 / 1 直接跳 / ≥2 展开会话级列表；行内角标直接跳。
+        onOpenPeerInbox={openInbox}
+        onOpenPeerPending={(sid) => jumpToPending(sid)}
         onToggleCollapse={() => setLeftCollapsed((v) => !v)}
         collapsed={leftCollapsed}
+        // 左栏项目分组右键菜单 → 「在文件资源管理器中显示」的失败/兜底提示
+        showToast={showToast}
       />
       <div className="center">
         {/* 定时任务页：主区换页而不是弹设置。对话面仍挂载、由 CSS 隐藏，
             避免换页丢掉 Composer 的草稿/附件状态。 */}
         {showSchedulesPage && (
-          <SchedulesPage schedulesApi={schedulesApi} showToast={showToast} />
+          <SchedulesPage
+            schedulesApi={schedulesApi}
+            showToast={showToast}
+            // 稿子 ⑨ 8.2「去会话」：先回对话页再切会话（与 onCreateSession 同序，否则切完还停在这一页）
+            onOpenSession={(sid) => { setWorkspacePage('chat'); sessionDispatch({ type: 'SWITCH', sessionId: sid }) }}
+          />
+        )}
+
+        {/* IM 频道页：同样「主区换页」而非弹窗 —— 对话面保持挂载（由 CSS 隐藏），
+            避免换页丢掉 Composer 草稿。
+            ⚠️ 对话本身不在这里实现（用户裁定「对话肯定是现在的」）：
+               「打开任务」直接切回既有对话页并选中该会话。 */}
+        {showImPage && (
+          <ImChannelPage
+            showToast={showToast}
+            onOpenSession={(sessionId) => {
+              sessionDispatch({ type: 'SWITCH', sessionId })
+              sessionDispatch({ type: 'ADD_TAB', tabId: sessionId })
+              setWorkspacePage('chat')
+            }}
+            sessions={sessions.map((x) => ({ id: x.id, title: x.title ?? x.id }))}
+          />
         )}
 
         {/* 无会话：不插空态页 —— 保留原首页（Composer welcome hero + 左栏「新建会话」），右栏各 tab 显示 0/空态 */}
@@ -3476,6 +4060,9 @@ function App() {
             onCompact: () => openHistoryOps('compact'),
             onTrim: () => openHistoryOps('trim'),
           }}
+          peerInbox={peerInboxState}
+          inboxCount={peerInboxTotalPending}
+          onOpenInbox={toggleInbox}
           showPanelToggle
           rightCollapsed={!rightDrawerOpen}
           onTogglePanel={() => setRightDrawerOpen((v) => !v)}
@@ -3487,12 +4074,22 @@ function App() {
             <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} turnRunning={turnLive} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }}
               pendingPlanApproval={inlinePlanApproval}
               onPlanClearContext={appSettings?.showClearContextOnPlanAccept === true ? planClearHandler : undefined}
-              onPlanDecision={permissionDecisionHandler} />
+              onPlanDecision={permissionDecisionHandler}
+              // [peer-hold] 待确认/已拒绝来信内联卡：数据来自待收件列表接口（⛔ 非消息表 heldState）
+              peerHeldItems={peerInboxRows}
+              focusPeer={peerFocus}
+              peerHeldActing={peerInboxOwned ? peerInboxActing : null}
+              peerHeldRowErrors={peerInboxOwned ? peerInboxRowErrors : undefined}
+              onPeerAccept={acceptPeerHeld}
+              onPeerReject={rejectPeerHeld}
+              onOpenPeerSession={openPeerSession} />
           )}
         </div>
         {currentPermission && !inlinePlanApproval && (
           <PermissionBubble
             request={currentPermission}
+            queueIndex={permissionQueueIndex}
+            queueSize={permissionQueueSize}
             // [批 A4c P3] 项目级档位文案的「项目标识」。currentPermission 已按
             //   sessionId === activeSessionId 过滤（见上方 currentPermission 定义）⇒ 用
             //   activeSession 的绑定项目即可，与 Composer 的 boundProjectName 同一来源。
@@ -3531,6 +4128,85 @@ function App() {
             未设置 = 关；用户一点就写本会话的 true/false。 */}
         {centerView === 'chat' && (
           <Composer
+            imInstances={imInstances.map((i) => ({ id: i.id, label: i.displayName, platform: i.platform }))}
+            imChats={imChats.map((c) => ({
+              id: c.id,
+              name: c.nickName?.trim() || c.peerName || c.peerId,
+              kind: c.chatKind,
+              instanceId: c.instanceId,
+              // 名字只是平台 id ⇒ 选择器标「对方未命名」，别让人盯一串 oc_… 猜
+              unnamed: !(c.nickName?.trim() || c.peerName),
+              boundSessionId: c.boundSessionId,
+              // 占用者用会话标题（人话），不是 sess-xxx
+              boundSessionTitle: c.boundSessionId
+                ? (sessions.find((s) => s.id === c.boundSessionId)?.title?.trim() || null)
+                : null,
+            }))}
+            imBoundChatIds={imChats
+              .filter((c) => c.boundSessionId === activeSessionId)
+              .map((c) => c.id)}
+            imInactiveChatIds={imInactiveChatIds}
+            onBindImChat={async (chatId) => {
+              if (!activeSessionId) return
+              try {
+                await imApi.bindChat(chatId, activeSessionId, 'manual')
+                await reloadImChats()
+                // [V329] 配置渠道 ⇒ 后端把 Brief + IM 工具打开；重拉本会话状态让入口即时一致
+                void reloadSessionMode(activeSessionId)
+                showToast('已把这个聊天接到当前会话')
+                // [A] 微信未激活 ⇒ 提示一次（绑定照常生效，只告知手机上暂时收不到通知）
+                void warnChatActivation(chatId)
+              } catch (e) {
+                showToast(e instanceof Error ? e.message : '改接失败', 'info')
+              }
+            }}
+            onUnbindImChat={async (chatId) => {
+              try {
+                await imApi.unbindChat(chatId)
+                await reloadImChats()
+                // [V329] 解绑最后一个渠道时后端会同步关掉无人值守 + Brief；重拉本会话状态
+                void reloadSessionMode(activeSessionId)
+                // 左栏「IM 会话」块的数据源就是 imChats，reloadImChats 已覆盖
+                showToast('已断开这个聊天与当前会话的接线')
+              } catch (e) {
+                showToast(e instanceof Error ? e.message : '断开失败', 'info')
+              }
+            }}
+            // [快速绑定] 渠道选择器左栏：把该渠道的机器人默认会话接到当前会话
+            //   （后端挑：私聊优先 → 最近活跃 → 企微 whoami 授权人；没有会话时回可执行提示）
+            onQuickBindImInstance={async (instanceId) => {
+              if (!activeSessionId) return
+              // 预览 → 必要时确认 → 绑定；任何一步不满足都不写库（规则集中在 runQuickBind）
+              const r = await runQuickBind(instanceId, activeSessionId, {
+                preview: (id) => imApi.previewDefaultChat(id),
+                bind: (id, sid) => imApi.bindDefaultChat(id, sid),
+                confirm: (msg) => askQuickBindConfirm(msg),
+              })
+              if (r.ok) {
+                await reloadImChats()
+                void reloadSessionMode(activeSessionId)
+              }
+              if (r.message) showToast(r.message, r.type)
+            }}
+            onRefreshImData={() => {
+              // 悬停渠道入口时重拉：新同步的聊天不用重启 App 就能看到
+              void reloadImChats()
+              void imApi.listInstances()
+                .then((v) => setImInstances(v.map((i) => ({ id: i.id, displayName: i.displayName, platform: i.platform }))))
+                .catch(() => { /* 未启用时保持原值 */ })
+            }}
+            // ⛔ 入口**不按绑定状态隐藏**：新建会话时用户也要能从这里挑渠道绑定。
+            //    「有没有绑」用图标配色表达（绿色=已绑），不是用有无入口表达。
+            onOpenImChannels={() => setWorkspacePage('im')}
+            // [V329] 无人值守：渠道右侧常驻开关（会话级显式状态）
+            unattended={sessionMode?.unattended ?? false}
+            unattendedPending={modePending}
+            onToggleUnattended={() => void toggleUnattended()}
+            // [Q8] 工具面板里确认「关 Brief 并退出无人值守」后，重拉会话模式让 chip 即时一致
+            onReloadSessionMode={() => { if (activeSessionId) void reloadSessionMode(activeSessionId) }}
+            // 「允许以我的名义发消息」：与 IM 频道页 › 安全与权限 是同一份数据
+            imAllowUserIdentity={imConfig?.allowUserIdentity ?? false}
+            onToggleImUserIdentity={toggleImUserIdentity}
             composerText={composerText}
             setComposerText={setComposerText}
             sendMessage={sendMessage}
@@ -3558,7 +4234,7 @@ function App() {
             boundProjectName={activeSession.mainProjectId ? (realProjects.find((p) => p.id === activeSession.mainProjectId)?.name ?? null) : null}
             boundProjectId={activeSession.mainProjectId}
             onSelectProject={() => void handleSelectProjectFolder()}
-            currentModel={activeSession.modelName ?? ''}
+            currentModel={effectiveSessionModelName}
             effortLevel={activeSession.effortLevel ?? 'high'}
             ultracodeEnabled={activeSession.ultracodeEnabled}
             bareMode={activeSession.bareMode}
@@ -3578,7 +4254,21 @@ function App() {
             }}
             hasGoal={!!currentGoal}
             goalCondition={currentGoal?.condition ?? null}
-            pendingHint={<AskUserPendingHint activeSessionId={activeSessionId} onOpenSession={switchSession} />}
+            pendingHint={<PendingPermissionHint activeSessionId={activeSessionId} onOpenSession={switchSession} />}
+            peerHoldHint={peerInboxPending > 0
+              ? <PeerPendingHint
+                  count={peerInboxPending}
+                  // 用户裁定：常驻条必须显示《来源标题》（去重，最多 3 个）。
+                  titles={peerInboxPendingTitles}
+                  // 只开面板：⛔ 不切会话、不拉历史（列表就是已加载的待收件）。
+                  // 常驻条 = 当前会话的待办 ⇒ 直接跳本会话并定位首条卡（不弹列表）。
+                  onOpen={openInbox}
+                  onRejectAll={() => { void rejectAllPeerHeld() }}
+                  acting={peerInboxActingAll}
+                />
+              : null}
+            // [composer-block] 「等待审批结果」提示条的「去处理」：滚底露出审批卡（不切会话、不改输入）
+            onRevealApproval={() => setPermScrollSignal((n) => n + 1)}
             taskListHint={activeSessionId
               ? <TaskListDock
                   sessionId={activeSessionId}
@@ -3637,20 +4327,23 @@ function App() {
         //   RightPanel 会按 DRAWER_TAB_LABEL 过滤掉，保留以对齐图标轨的 tab 口径。
         visibleTabs={['files', 'tasks', 'projects', 'artifacts', 'sources', 'team', 'run', 'terminal']}
       />
-      {/* [产物独立侧栏 2026-11-02] 只服务「产物自动打开」。与上面的 RightPanel 抽屉**并存**：
-          抽屉浏览全部会话资源，本面板跟进刚生成的那一个产物。「全屏」回落到原来的模态框。 */}
+      {/* [产物独立侧栏 2026-11-02] 产物（自动打开与卡片点击）都在这里展示。
+          与上面的 RightPanel 抽屉**并存**：抽屉浏览全部会话资源，本面板跟进单个产物。
+          「全屏」→ 单独弹窗（expandArtifact），⛔ 不是再塞回右栏。 */}
       {dockArtifact && activeSessionId && (
         <ArtifactDock
           sessionId={activeSessionId}
           artifact={dockArtifact}
           items={sessionArtifacts.deliverables}
-          onSelect={(a) => setDockArtifact(a)}
+          initialEdit={dockInitialEdit}
+          onSelect={(a) => { setDockInitialEdit(false); setDockArtifact(a) }}
           onClose={() => {
             // 用户手动收起 → 记住这个意图，新产物不再自动弹回来
             dockUserClosedRef.current = true
+            setDockInitialEdit(false)
             setDockArtifact(null)
           }}
-          onExpand={(a) => void openArtifact(a)}
+          onExpand={(a) => expandArtifact(a)}
           width={dockWidth}
           onWidthChange={setDockWidth}
         />
@@ -3727,7 +4420,7 @@ function App() {
       {showModelPicker && (
         <ModelPickerModal
           providers={providersApi.list}
-          activeSessionModelName={activeSession.modelName ?? ''}
+          activeSessionModelName={effectiveSessionModelName}
           pickCurrent={pickModel}
           close={() => setShowModelPicker(false)}
         />
@@ -3765,6 +4458,33 @@ function App() {
       )}
       {showAgentsPanel && <AgentsPanel onClose={() => setShowAgentsPanel(false)} sessionId={activeSessionId} />}
       {showChromePanel && <ChromePanel sessionId={activeSessionId} onClose={() => setShowChromePanel(false)} />}
+      {/* [快速绑定] 抢占确认：应用内弹窗（window.confirm 在 Tauri WebView 里不弹）。
+          ⚠️ 必须把 .fm-modal 放进 .fm-backdrop 里：backdrop 是 flex 容器，
+          modal 靠 margin:auto 居中；若写成兄弟节点，modal 会落在文档流里（看起来空的）。
+          确认/取消都只 resolve 本次 Promise，不关闭底下的渠道选择弹窗。 */}
+      {quickBindAsk && (
+        <div className="fm-backdrop" style={{ zIndex: 200 }} onClick={() => answerQuickBind(false)}>
+          <div
+            className="fm-modal"
+            role="dialog"
+            aria-modal="true"
+            style={{ width: 460 }}
+            onClick={(e) => e.stopPropagation()}
+          >
+            <div className="fm-header">
+              <div className="fm-title">切换绑定？</div>
+            </div>
+            <div style={{ padding: '12px 24px 16px', fontSize: 13, lineHeight: 1.65 }}>
+              {quickBindAsk.message}
+            </div>
+            <div className="fm-footer">
+              <span className="spacer" />
+              <button className="fm-btn" onClick={() => answerQuickBind(false)}>取消</button>
+              <button className="fm-btn danger" onClick={() => answerQuickBind(true)}>确定切换</button>
+            </div>
+          </div>
+        </div>
+      )}
       {/* 技能市场（V58 主线程 agent 胶囊 → SkillMarketModal · 骨架版） */}
       {/* ⭐ 知识库浮层（独立场景 · 用户 2026-11-06 裁定；2026-11-09 改为非模态可拖动）
           面板承载知识库的**全部**内容（列表 → 详情 → 文档/Wiki/图谱/问答 → 设置）。

@@ -197,7 +197,7 @@ class ManualCompactSessionCostWiringTest {
     private static AgentState liveState() {
         AgentState live = new AgentState("sys", SESSION, null);
         live.setCurrentModel(COMPACT_MODEL);
-        live.setCurrentToolUseContext(ToolUseContext.of(UUID.randomUUID(), SESSION));
+        live.setCurrentToolUseContext(ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION));
         live.appendMessage(msg("u1", Role.user, "first question"));
         live.appendMessage(msg("a1", Role.assistant, "first answer"));
         return live;

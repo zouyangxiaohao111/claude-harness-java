@@ -69,7 +69,7 @@ class CronDeleteToolOwnershipFailLoudTest {
 
     /** 带「残缺 teammate 身份」（agentId == null）的 TUC。 */
     private static ToolUseContext incompleteIdentityTuc() {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-s1-t14")
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-s1-t14")
             .withTeammateIdentity(
                 new TeammateIdentity(null, "researcher", "team-a", null, false, "leader-sess"));
     }
@@ -154,7 +154,7 @@ class CronDeleteToolOwnershipFailLoudTest {
         CronDeleteTool tool = toolWith(dto("job-4", "agent-B"));
 
         Tool.ValidationResult r = tool.validateInput(
-            call("job-4").input(), ToolUseContext.of(UUID.randomUUID(), "sess-s1-t14"));
+            call("job-4").input(), ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-s1-t14"));
 
         assertThat(r.ok())
             .as("CC CronDeleteTool.ts:72 `if (ctx && ...)` ⇒ 非 teammate 不受所有权限制")
@@ -165,7 +165,7 @@ class CronDeleteToolOwnershipFailLoudTest {
     @DisplayName("对照: teammate 身份完整 + 任务属自己 ⇒ 放行（正方向，证明守卫不是恒拒）")
     void completeIdentity_ownTask_passes() {
         CronDeleteTool tool = toolWith(dto("job-5", "agent-A"));
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-s1-t14")
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-s1-t14")
             .withTeammateIdentity(
                 new TeammateIdentity("agent-A", "peer", "team-a", null, false, "leader-sess"));
 

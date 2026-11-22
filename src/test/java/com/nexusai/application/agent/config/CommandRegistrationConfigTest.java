@@ -97,14 +97,14 @@ class CommandRegistrationConfigTest {
         assertThat(cmds.get("heapdump").getType()).isEqualTo("local");
         assertThat(cmds.get("keybindings").getType()).isEqualTo("local");
         assertThat(cmds.get("rename").getType()).isEqualTo("local-jsx");
-        assertThat(cmds.get("brief").getType()).isEqualTo("local-jsx");
+        assertThat(cmds.get("brief").getType()).isEqualTo("local");
         assertThat(cmds.get("ultrareview").getType()).isEqualTo("local-jsx");
 
         // heapdump isHidden=true（CC heapdump/index.ts:6）
         assertThat(cmds.get("heapdump").getIsHidden()).isTrue();
 
-        // brief 门控默认 false（KAIROS feature + enable_slash_command 默认 false，CC brief.ts:29-31/51-56）
-        assertThat(cmds.get("brief").isCommandEnabled()).isFalse();
+        // 用户批准本地 /brief 默认可用；不复制远端默认关闭门。
+        assertThat(cmds.get("brief").isCommandEnabled()).isTrue();
 
         // 无 gate 命令恒启用（CC types/command.ts:214-215 isEnabled?.() ?? true）
         assertThat(cmds.get("advisor").isCommandEnabled()).isTrue();
@@ -129,8 +129,8 @@ class CommandRegistrationConfigTest {
         // getAllCommands（web GET /api/command 数据源）含 local 命令（无 gate 的）
         List<String> all = registry.getAllCommands(null).stream().map(Command::getName).toList();
         assertThat(all).contains("commit", "advisor", "cost", "rename");
-        // brief 门控关 → 从 getAllCommands 过滤（对齐 CC commands.ts:484 isCommandEnabled）
-        assertThat(all).doesNotContain("brief");
+        // /brief 本地可发现，但仍非模型可调用的 prompt 命令。
+        assertThat(all).contains("brief");
     }
 
     @Test

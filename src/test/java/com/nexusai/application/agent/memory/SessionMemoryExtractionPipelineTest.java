@@ -284,7 +284,7 @@ class SessionMemoryExtractionPipelineTest {
         // 生产 supplier：buildProductionCacheSafeParams 等价（systemPrompt/userContext/systemContext 空
         // 占位，toolUseContext 携带真实工具集，5 参便捷构造 gate=false）
         ToolUseContext supplierCtx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
         svc.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
@@ -343,7 +343,7 @@ class SessionMemoryExtractionPipelineTest {
             sidSeenBySupplier.set(sessionId);
             cwdSeenBySupplier.set(cwd);
             return new CacheSafeParams(List.of(), Map.of(), Map.of(),
-                new ToolUseContext(UUID.randomUUID(),
+                new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                     RunForkedAgent.resolveForkSessionId(sessionId, "pipeline-test-supplier"),
                     com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                     Map.of(), List.of(), "", AbortController.NOOP, List.of()),
@@ -392,7 +392,7 @@ class SessionMemoryExtractionPipelineTest {
         svc.setCacheSafeParamsSupplier((sessionId, cwd) -> {
             sidSeenBySupplier.set(sessionId);
             return new CacheSafeParams(List.of(), Map.of(), Map.of(),
-                new ToolUseContext(UUID.randomUUID(),
+                new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                     RunForkedAgent.resolveForkSessionId(sessionId, "pipeline-test-supplier"),
                     com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                     Map.of(), List.of(), "", AbortController.NOOP, List.of()),
@@ -426,7 +426,7 @@ class SessionMemoryExtractionPipelineTest {
         svc.setSessionMemoryFeatureEnabled(true);
                 svc.setReadFileTool(readFileTool());
         ToolUseContext supplierCtx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
         // supplier 已携带真实 systemPrompt + systemContext（组装链注入 · 未来状态）；
@@ -739,7 +739,7 @@ class SessionMemoryExtractionPipelineTest {
     /** 最小 ToolUseContext（sessionId = 第二个 UUID）。 */
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
     }

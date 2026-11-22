@@ -212,7 +212,7 @@ class LlmAgentLoopRunRequestContractTest {
     @DisplayName("RunRequest.session 工厂透传 appendSystemPrompt（HTTP DTO → RunRequest 链）")
     void sessionFactory_carriesAppendSystemPrompt() {
         String sid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RunRequest req = RunRequest.session("p", sid, UUID.randomUUID(),
+        RunRequest req = RunRequest.session("p", sid, com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             ProviderConfig.empty(), "test-model", "CUSTOM", "APPEND-指令", null);
 
         assertThat(req.appendSystemPrompt()).as("session 工厂必须透传 appendSystemPrompt").isEqualTo("APPEND-指令");
@@ -239,7 +239,7 @@ class LlmAgentLoopRunRequestContractTest {
             .put("type", "object")
             .set("properties", om.createObjectNode()
                 .set("answer", om.createObjectNode().put("type", "string")));
-        RunRequest req = RunRequest.session("p", sid, UUID.randomUUID(),
+        RunRequest req = RunRequest.session("p", sid, com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             ProviderConfig.empty(), "test-model", "CUSTOM", null, null,
             null, false, null, schema);
 
@@ -259,7 +259,7 @@ class LlmAgentLoopRunRequestContractTest {
     @DisplayName("默认 session 工厂 jsonSchema 恒 null（未启用结构化输出零回归，GC-03）")
     void sessionFactory_defaultJsonSchemaIsNull() {
         String sid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        RunRequest req = RunRequest.session("p", sid, UUID.randomUUID(),
+        RunRequest req = RunRequest.session("p", sid, com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             ProviderConfig.empty(), "test-model", "CUSTOM", null, null, null);
         assertThat(req.jsonSchema()).as("默认工厂不得注入 jsonSchema（零回归门控）").isNull();
     }
@@ -305,7 +305,7 @@ class LlmAgentLoopRunRequestContractTest {
             //   本仓该字段为 vestigial（0 生产读点）→ 测试侧一律 List.of()（= 三条生产调用方同值），
             //   行为与旧传 "sys" 逐位相同（旧值从不被读；且空列表 ⇒ loop 走 per-run 材料收集 = 旧行为）。
             state.rawMessages(), java.util.List.of(),
-            com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+            com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             QuerySource.USER, "test-model", null, null, null, null, null,
             new LlmAgentLoop.MainLoopDeps(ctx, loop::getModelForCall), ProviderConfig.empty());
         // 编译断言：唯一入口签名必须接受 (loop.QueryParams, AgentState, List<String>)
@@ -331,7 +331,7 @@ class LlmAgentLoopRunRequestContractTest {
                 // [5b] canUseTool 为第 5 字段（CC query.ts:243 必填；Java 侧 null = 回落内层 gate）；
                 // 本测试锁定 compact ctor 的 querySource 非空校验，canUseTool 传 null 不影响校验。
                 null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 // [IMP2-05] querySourceValue 为第 8 字段（精确值通道，null = 回退 category.canonical()）；
                 // 本测试锁定 compact ctor 的 querySource 非空校验，querySourceValue 传 null 不影响校验。
                 null, null, null, null, null, null, null, null, ProviderConfig.empty(), "test-model",

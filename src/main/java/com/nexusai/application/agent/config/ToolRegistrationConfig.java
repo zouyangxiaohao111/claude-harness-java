@@ -2276,7 +2276,7 @@ public class ToolRegistrationConfig {
         //   之类后置 wither（批 6 已论证：after-the-fact 改写会留过期 cwd）。
         com.nexusai.application.agent.tool.ToolUseContext forkBaseCtx =
             new com.nexusai.application.agent.tool.ToolUseContext(
-                UUID.randomUUID(),
+                null,
                 com.nexusai.application.agent.compact.fork.RunForkedAgent
                     .resolveForkSessionId(sessionId, "buildProductionCacheSafeParams"),
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
@@ -2781,7 +2781,7 @@ public class ToolRegistrationConfig {
         }
         List<com.nexusai.model.session.dto.ChatMessageDto> history =
             messageService.listForResumeExcluding(raw, excludeId);
-        AgentState rebuilt = new AgentState(null, rawSessionId, (java.util.UUID) null);
+        AgentState rebuilt = new AgentState(null, rawSessionId, null);
         // [P3-a-2] 重建 state 补「会话有效模型」——见 {@link #resolveSessionModelName} 的 WHY。
         //   不补 → currentModel()=null → resolveManualCompactModel 返 null → resolveAnthropic 回落
         //   非 Anthropic → **anthropic 会话少计**（该 4 项和却只算 input+output；deepseek 会话

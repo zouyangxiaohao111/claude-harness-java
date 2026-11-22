@@ -161,7 +161,7 @@ class WorktreeHooksTest {
     @DisplayName("子代理 TUC（agentId 非 null）→ 载荷 session_id=主会话、agent_id=agentId")
     void subagentToolEvent_payloadSessionIdIsMainSession_agentIdFieldIsAgentId() {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         HookRegistry registry = new HookRegistry();
         AtomicReference<HookEvent> captured = new AtomicReference<>();
         registry.register("capture", event -> {
@@ -191,7 +191,7 @@ class WorktreeHooksTest {
     @DisplayName("子代理工具事件 → 按 agentId 注册的 session hooks 命中（匹配 key=agentId）")
     void subagentToolEvent_sessionHooksMatchByAgentId() {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         HookRegistry registry = new HookRegistry();
         registry.addSessionHook(agentId.toString(), HookEventType.PRE_TOOL_USE, "Bash",
             new CommandHook("echo session-hook", null, null, null, null, null, null, null),
@@ -230,7 +230,7 @@ class WorktreeHooksTest {
             return GenericHook.HookResult.proceed();
         });
         // Java 主线程惯例: agentId == sessionId（LlmAgentLoop.deriveQuerySource 同款判定）。
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT);
 
         registry.executePreToolUse("Bash", JSON.createObjectNode().put("k", "v"), ctx,

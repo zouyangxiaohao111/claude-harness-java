@@ -16,7 +16,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -132,9 +131,10 @@ class ComputerUseVisionCapabilityTest {
                 ctxWithModel("deepseek/deepseek-chat"));
 
         assertThat(result).isInstanceOf(ToolResult.class);
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（文本仍是错误文案）
         assertThat(((ToolResult<?>) result).data())
-                .as("不支持视觉 ⇒ fail loud（错误结果：data 是错误文案，不是截图载荷）")
-                .isInstanceOf(String.class);
+                .as("不支持视觉 ⇒ fail loud（错误结果：data 是失败载荷，不是截图载荷）")
+                .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
         assertThat(((ToolResult<?>) result).data().toString())
                 .contains("不支持图片输入");
         assertThat(capturer.captureCount)
@@ -200,9 +200,10 @@ class ComputerUseVisionCapabilityTest {
                 .putArray("coordinate").add(10).add(20));
         var result = tool.execute(call, ctxWithModel("deepseek/deepseek-chat"));
 
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（文本仍是错误文案）
         assertThat(((ToolResult<?>) result).data())
                 .as("看不到图 ⇒ 明确报错（不做盲点击）")
-                .isInstanceOf(String.class);
+                .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
         assertThat(((ToolResult<?>) result).data().toString()).contains("不支持图片输入");
     }
 
@@ -227,7 +228,7 @@ class ComputerUseVisionCapabilityTest {
 
     /** 带模型名 + provider 类型的工具上下文。 */
     private static ToolUseContext ctxWithModel(String modelName) {
-        return ToolUseContext.of((UUID) null, SESSION)
+        return ToolUseContext.of((String) null, SESSION)
                 .withEffectiveModelName(modelName)
                 .withEffectiveProviderType("openai_compatible");
     }

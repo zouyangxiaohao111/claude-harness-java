@@ -35,7 +35,7 @@ import org.springframework.boot.context.properties.bind.DefaultValue;
  * <p><b>null 契约（决策#11 CRON-F2）</b>：本 bean 自身无 null 态（{@link #DEFAULTS} 与默认构造均
  * (true,true) 非 null）。消费方（CronCreateTool/CronDeleteTool/CronListTool 等）遇注入为 null 时
  * 统一 <b>fail-open</b> 处理（null→门开），对齐 CC 无 null 态布尔链（isKairosCronEnabled 恒返回
- * boolean 默认 true）+ TestJob.java:99 / CronIdleExecutor.java:131 既有 fail-open。
+ * boolean 默认 true）+ AgentJob.java:99 / CronIdleExecutor.java:131 既有 fail-open。
  *
  * <p><b>运行时刷新缺口（CRON-F2 登记，本 session 只登记不改）</b>：{@link #isKairosCronEnabled()}
  * 为<b>会话静态值</b>——{@code agentTriggerCron} 由 Spring {@code @ConfigurationProperties} 启动绑定，

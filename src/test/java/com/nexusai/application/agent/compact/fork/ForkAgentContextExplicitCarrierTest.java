@@ -75,7 +75,7 @@ class ForkAgentContextExplicitCarrierTest {
 
     private static ToolUseContext tuc(AgentContext agentContext) {
         ToolUseContext base = new ToolUseContext(
-            UUID.randomUUID(), "sess-parent", PermissionMode.DEFAULT,
+            AgentContext.createAgentId(), "sess-parent", PermissionMode.DEFAULT,
             Map.of(), List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of());
         return base.withAgentContext(agentContext);
     }

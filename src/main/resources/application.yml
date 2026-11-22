@@ -7,6 +7,15 @@
 # =====================================================================
 
 spring:
+  # [2026-11-18] Make the documented default real.
+  # application-dev.yml and several long-standing comments ("default no profile = dev",
+  # "prod is overridden by application-prod.yml") all assume this, but the property
+  # itself was never set: with no explicit profile Spring used the empty "default"
+  # group, so application-dev.yml never loaded and @Profile("dev") beans (the IM
+  # probe controllers) were silently not registered.
+  # Scoped to the default only: an explicit prod/scene profile still wins.
+  profiles:
+    default: dev
   main.allow-circular-references: true
   threads:
     virtual:
@@ -392,7 +401,15 @@ nexusai:
   feature:
     # [2026-09-01] WORKFLOW_SCRIPTS feature 开启 → WorkflowTool.isEnabled()=true（暴露给模型，
     #   多代理编排 / ultracode 依赖）；默认 false 时 Workflow 工具不暴露（ToolSearch 搜不到）。
+    #   coordinator 系统提示的 Workflow 段按「默认 true」注入（对齐 exe 2.1.328 的 yg() 门）。
     workflow-scripts: true
+    # [SendMessage 跨会话 A 批] 部署门（默认 true，对齐 CC 本机跨会话默认可用）：跨会话发现/发送能力。
+    #   只决定是否暴露 ListAgents 跨会话分节与 SendMessage 跨会话寻址；与入站策略
+    #   crossSessionInbound（accept/auto/hold/refuse）是独立维度，不得混用。
+    #   值由 PeerSessionRegistry @PostConstruct 安装为 TaskSystemConfig 动态 source；
+    #   未配置（删除本键）时回落 sysprop nexusai.feature.messaging-beyond-own-agents 与
+    #   env NEXUSAI_FEATURE_MESSAGING_BEYOND_OWN_AGENTS。
+    messaging-beyond-own-agents: true
     # [2026-09-02] nexusai-in-chrome 浏览器工具总开关 · 开发中默认关（不暴露 mcp__nexusai-in-chrome__*
     #   18 工具给模型，避免开发期误调）；需启用 → true + 装 Chrome 扩展。BrowserMcpToolConfig 读此
     #   flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig nexusai-in-chrome skill 门控叠加
@@ -429,12 +446,10 @@ nexusai:
     # [OD-01 S1] tengu_sm_compact GB flag · 对齐 CC sessionMemoryCompact.ts:416-419
     # 默认开 = SM 压缩优先（与 sm-session-memory 作 AND）。
     sm-compact: true
-    # [coordinator 缺件补齐] coordinator 协调者模式 · 对齐 CC 编译期 feature('COORDINATOR_MODE')
-    #   （coordinatorMode.ts:36-41 feature('COORDINATOR_MODE') ? isEnvTruthy(CLAUDE_CODE_COORDINATOR_MODE) : false）。
-    #   开启需同时满足：本项 true AND env CLAUDE_CODE_COORDINATOR_MODE 为真值({1,true,yes,on})。
-    #   另有 DB settings.coordinator_mode_enabled 可覆盖（当前仅覆盖部分消费点）。
-    #   消费点 CoordinatorMode(Environment)（CoordinatorMode.java:85）读取本键；缺失 = getProperty 返回
-    #   null → isTruthy(null)=false → isCoordinatorMode() 恒早返 false（静默，无异常无日志），故本键必须存在。
+    # [coordinator · exe 2.1.328 对齐] 本键已<b>不参与判定</b>：exe 的 qa() 删除了 feature 门，
+    #   coordinator 回落层只看 env CLAUDE_CODE_COORDINATOR_MODE（真值 1/true/yes/on）。
+    #   真正的激活源是会话列 sessions.coordinator_mode（输入框「协调者」chip）。
+    #   键保留仅为历史兼容（旧部署仍在读），CoordinatorMode(Environment) 不再读它。
     coordinator-mode: false
 
   # ---------------------------------------------------------------

@@ -4,6 +4,8 @@ import ch.qos.logback.classic.Level;
 import ch.qos.logback.classic.Logger;
 import ch.qos.logback.classic.spi.ILoggingEvent;
 import ch.qos.logback.core.AppenderBase;
+import com.nexusai.application.agent.subagent.AgentNameRegistry;
+import com.nexusai.application.agent.subagent.AgentTranscript;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
 import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
@@ -11,6 +13,7 @@ import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.tasks.TaskType;
+import com.nexusai.test.support.SessionProjectRootTestSupport;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Disabled;
@@ -19,6 +22,7 @@ import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
 import org.slf4j.LoggerFactory;
 
+import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.Duration;
 import java.time.Instant;
@@ -73,6 +77,10 @@ class InProcessTeammateSpawnTest {
     @BeforeEach
     void setUp() {
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
+        // [B1] 本用例直构（无 Spring）⇒ 显式声明「本环境确无会话」，否则 spawn 的
+        //   taskOutputPath / cwd 解析会撞 CwdResolution 的 fail-loud。
+        SessionProjectRootTestSupport.declareNoDatabase();
+        TaskSystemConfig.clearForTest();
         taskFrameworkService = new RecordingFramework(new SdkEventQueue());
         spawner = new SpawnInProcess(taskFrameworkService);
     }
@@ -83,6 +91,7 @@ class InProcessTeammateSpawnTest {
         for (String taskId : spawnedTaskIds) {
             spawner.registry().kill(taskId);
         }
+        SessionProjectRootTestSupport.clearNoDatabase();
         System.clearProperty("nexusai.task.config-dir");
         TaskSystemConfig.clearForTest();
     }
@@ -375,5 +384,36 @@ class InProcessTeammateSpawnTest {
             spawnLogger.detachAppender(appender);
             spawnLogger.setLevel(prevLevel);
         }
+    }
+
+    @Test
+    @DisplayName("[B1] spawn 后注册进 AgentNameRegistry（owner=Lead 会话）并写 meta sidecar（taskKind）")
+    void spawn_registersIdentityAndWritesMeta() throws Exception {
+        // WHY: 改前 SpawnInProcess 从不 register、writeMetaExtras 全仓 0 调用 ⇒ teammate 名不可寻址、
+        //   taskKind 永不落盘 ⇒ 终态后退伍/重拉分支对 teammate 恒不可达。本用例是这两个写入点
+        //   的端到端断言（不是 mock 断言）。
+        Files.createDirectories(tempDir.resolve("session-1"));
+        AgentNameRegistry names = new AgentNameRegistry();
+        names.setSessionDirResolver(s -> tempDir);
+        spawner.setAgentNameRegistry(names);
+        spawner.setSessionDirResolver(s -> tempDir);
+
+        SpawnInProcess.InProcessSpawnOutput out = spawner.spawnInProcessTeammate(
+            new SpawnInProcess.InProcessSpawnConfig("researcher", "research-team", "do research",
+                null, false, null, "general-purpose", tempDir.toString()),
+            new SpawnInProcess.SpawnContext("session-1", "tool-use-1"));
+        spawnedTaskIds.add(out.taskId());
+
+        assertThat(out.success()).as("spawn 必须成功").isTrue();
+        assertThat(names.resolveEntry("session-1", "researcher"))
+            .as("spawn 必须按 Lead 会话注册名字").isNotNull();
+        assertThat(names.resolveEntry("session-1", "researcher").agentId())
+            .isEqualTo("researcher@research-team");
+        AgentTranscript.MetaExtras extras = AgentTranscript.readMetaExtras(
+            tempDir, "session-1", "researcher@research-team");
+        assertThat(extras.taskKind()).as("meta 必须写 taskKind=in_process_teammate")
+            .isEqualTo("in_process_teammate");
+        assertThat(extras.name()).isEqualTo("researcher");
+        assertThat(extras.teamName()).isEqualTo("research-team");
     }
 }

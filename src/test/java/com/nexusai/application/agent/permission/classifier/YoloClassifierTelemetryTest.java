@@ -547,7 +547,7 @@ class YoloClassifierTelemetryTest {
         AbortController abortController = new AbortController();
         abortController.abort("permission_denied");
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", abortController, List.of(),
             null, PermissionMode.DEFAULT
         );
@@ -641,7 +641,7 @@ class YoloClassifierTelemetryTest {
         com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
             new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
                 "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_1", "spawn");
-        ToolUseContext stampedTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x")
+        ToolUseContext stampedTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x")
             .withAgentContext(subCtx);
         // ── 读取端：真实 classify 内部经 commonPool worker 读显式载体 ──
         String testThread = Thread.currentThread().getName();
@@ -675,7 +675,7 @@ class YoloClassifierTelemetryTest {
                 new AgentUsage(1L, 1L, 0L, 0L, null, null, null), "id_1", null, null, null, 0L);
         });
         YoloClassifierImpl classifier = newClassifierOneStage(sideCallClient);
-        ToolUseContext plainTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x");   // 未盖章
+        ToolUseContext plainTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x");   // 未盖章
 
         // [S1-T7-2] 改锚：原用「提交线程 ambient 有值」构造负向对照，但 ambient 载体已整体删除
         //   ⇒ 该场景不可构造（无 API 可设）。保留仍然可证伪的核心断言：TUC 未盖章 ⇒ provider 收到 null。
@@ -712,7 +712,7 @@ class YoloClassifierTelemetryTest {
         com.nexusai.application.agent.subagent.AgentContext.SubagentContext subCtx =
             new com.nexusai.application.agent.subagent.AgentContext.SubagentContext(
                 "a0123456789abcdef", "sess-parent", "Explore", true, "req_spawn_2", "resume");
-        ToolUseContext stampedTuc = ToolUseContext.of(UUID.randomUUID(), "sess-x")
+        ToolUseContext stampedTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x")
             .withAgentContext(subCtx);
 
         String testThread = Thread.currentThread().getName();

@@ -93,7 +93,7 @@ class PermissionPipelineTelemetryTest {
 
     private static ToolUseContext newCtx(String sessionId, com.nexusai.application.agent.tool.AbortController abortController,
                                          ToolPermissionContext permCtx) {
-        return new ToolUseContext(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", abortController, List.of(),
             permCtx, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null);
     }

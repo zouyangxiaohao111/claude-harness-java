@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.api;
 
 import com.nexusai.infra.llm.LlmApiException;
+import java.util.Locale;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
@@ -430,6 +431,12 @@ public final class ApiErrors {
         String raw = error.getMessage() != null && !error.getMessage().isBlank()
             ? error.getMessage()
             : error.getClass().getSimpleName();
+        // [quota-429] 套餐/账户额度耗尽的 429 是终态（不重试，见 ErrorClassifier.shouldRetry），
+        //   文案必须说「额度」而不是「请求过于频繁」——否则用户会以为等一会儿就好。
+        //   判据与重试门同源（isQuotaExhausted），避免两处口径漂移。
+        if (isQuotaExhausted(error)) {
+            return QUOTA_HINT + "（" + abbreviate(raw, 200) + "）";
+        }
         String type = classifyApiError(error);
         String hint = switch (type) {
             case "credit_balance_low" -> QUOTA_HINT;
@@ -469,6 +476,54 @@ public final class ApiErrors {
     /** 额度不足的统一话术（CC credit_balance_low / 402 / insufficient_quota 共用，避免多处文案漂移）。 */
     private static final String QUOTA_HINT =
         "账户额度不足（余额已用完或需要付费），充值或更换可用的模型服务后再试";
+
+    /**
+     * 429 报文里「账户/套餐额度耗尽」的判定标记（统一小写比较）。
+     *
+     * <p>覆盖：OpenAI 兼容网关标准码 {@code insufficient_quota}、CC 原文
+     * {@code Credit balance is too low}、Claude 订阅 {@code out of credits}、
+     * 国内厂商（MiniMax 等）的「用量上限 / 额度不足 / 余额不足 / 购买积分」。
+     */
+    private static final String[] QUOTA_EXHAUSTED_MARKERS = {
+        "insufficient_quota",
+        "insufficient_user_quota",
+        "exceeded your current quota",
+        "credit balance is too low",
+        "out of credits",
+        "purchase credits",
+        "用量上限",
+        "额度不足",
+        "额度已用尽",
+        "额度用完",
+        "余额不足",
+        "购买积分",
+    };
+
+    /**
+     * 429 是否为「账户/套餐额度耗尽」终态（而不是瞬时限流）。
+     *
+     * <p><b>WHY</b>：CC 的 429 重试门是
+     * {@code 429 → !isClaudeAISubscriber() || isEnterpriseSubscriber()}（withRetry.ts:765-769）——
+     * 订阅/套餐额度型 429 立即失败、不重试。本仓无订阅层
+     * （{@link com.nexusai.application.agent.recovery.ErrorClassifier#isClaudeAISubscriber()} 恒 false），
+     * 只能从报文识别「额度耗尽」语义；否则会把「Token Plan 用量上限」当成普通限流，
+     * 走「流式→非流式回退 + 两层各 10 次退避」，前端数分钟无任何反馈。
+     *
+     * <p>仅对 status=429 生效；402 / {@code insufficient_quota} 的另一条路径由
+     * {@code ErrorClassifier.shouldRetry} 的默认分支处理（非 429/5xx/连接错误 → 不可重试）。
+     */
+    public static boolean isQuotaExhausted(Throwable error) {
+        if (!(error instanceof LlmApiException lae) || lae.status() != 429) {
+            return false;
+        }
+        String raw = lae.getMessage() == null ? "" : lae.getMessage().toLowerCase(Locale.ROOT);
+        for (String marker : QUOTA_EXHAUSTED_MARKERS) {
+            if (raw.contains(marker)) {
+                return true;
+            }
+        }
+        return false;
+    }
 
     /** 截断长错误串（保留可排查信息，不让错误卡被整段 body 撑爆）。 */
     private static String abbreviate(String s, int max) {

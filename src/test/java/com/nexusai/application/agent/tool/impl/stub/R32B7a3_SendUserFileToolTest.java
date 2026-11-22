@@ -57,8 +57,8 @@ class R32B7a3_SendUserFileToolTest {
     /** 生产格式派生会话 UUID（"sess-12345678" → 8 位填充进 00000000-...-0000）· 对齐 ChatService.parseSessionUuid。 */
     private static final String SESSION_ID =
             "sess-12345678";
-    private static final UUID AGENT_ID =
-            UUID.fromString("00000000-0000-0000-0000-0000000000aa");
+    private static final String AGENT_ID =
+            "a00000000000000aa";
 
     @Test
     @DisplayName("name() 返回 'SendUserFile' (对齐 CC SEND_USER_FILE_TOOL_NAME)")

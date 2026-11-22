@@ -959,6 +959,21 @@ public interface Tool {
         if (result == null) {
             return null;
         }
+        // [错误通道] 失败载荷（ToolError）· 第二道防线：按类别套壳/原文，且强制 is_error=true。
+        //   正常路径下执行器（LlmAgentLoop.toolResultMessage）已在调用 mapper 之前直构错误块，
+        //   此处只兜底「绕过执行器直接调 mapper」的调用方（如子代理/间接调用），
+        //   保证错误永远不会退化成任何 per-tool 成功文案。
+        if (result.data() instanceof ToolError err) {
+            String errContent = err.kind().wrapsWithToolUseErrorShell()
+                ? "<tool_use_error>" + err.message() + "</tool_use_error>"
+                : err.message();
+            if (LoggerFactory.getLogger(Tool.class).isDebugEnabled()) {
+                LoggerFactory.getLogger(Tool.class).debug(
+                    "Tool.mapToToolResultBlockParam 失败载荷兜底: toolUseId={} kind={}",
+                    toolUseId, err.kind());
+            }
+            return new ToolResultBlockParam(toolUseId, "tool_result", errContent, true);
+        }
         // 默认兜底: 复用 renderToolResultPayloadText 渲染通用文本 content（未 override 工具合法回退）
         String content = ToolResult.renderToolResultPayloadText((ToolResult<?>) result);
         if (LoggerFactory.getLogger(Tool.class).isDebugEnabled()) {

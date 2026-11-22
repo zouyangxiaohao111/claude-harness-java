@@ -10,6 +10,7 @@ import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.domain.session.SessionService;
+import com.nexusai.infra.exception.ConflictException;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.session.dto.SessionToolCategoryToggleRequest;
@@ -63,6 +64,8 @@ public class SessionToolsController {
 
     @Autowired private SessionService sessionService;
     @Autowired private ToolRegistry toolRegistry;
+    /** [V329] IM 组「全部启用」时把 Brief 一起打开（SendUserMessage 与 /brief 同一份状态）。 */
+    @Autowired(required = false) private com.nexusai.domain.session.SessionModeService sessionModeService;
 
     /**
      * 会话级工具列表 · GET /api/v1/sessions/{sessionId}/tools。
@@ -83,7 +86,8 @@ public class SessionToolsController {
     @GetMapping
     public List<SessionToolDto> list(@PathVariable String sessionId) {
         // session 校验（getDisabledTools 抛 NotFoundException → 404）
-        return buildList(sessionId, effectiveDisabledNames(sessionId));
+        sessionService.getDisabledTools(sessionId);
+        return buildList(sessionId);
     }
 
     /**
@@ -142,6 +146,27 @@ public class SessionToolsController {
                 skippedCore++;
             }
         }
+        // [V330] IM 组：其余工具走增量覆盖（默认关）；SendUserMessage 只由 Brief 状态控制。
+        if (SessionToolCategory.IM.equals(category)) {
+            Map<String, Boolean> patch = new java.util.LinkedHashMap<>();
+            for (String n : categoryNames) {
+                if (!ToolNameConstants.BRIEF_TOOL_NAME.equals(n) && !CORE_ORCHESTRATION_TOOLS.contains(n)) {
+                    patch.put(n, req.enabled());
+                }
+            }
+            if (!patch.isEmpty()) {
+                sessionService.patchImToolOverrides(sessionId, patch);
+            }
+            if (req.enabled() && sessionModeService != null
+                    && categoryNames.contains(ToolNameConstants.BRIEF_TOOL_NAME)) {
+                sessionModeService.setBrief(sessionId, true);
+            }
+            if (log.isInfoEnabled()) {
+                log.info("SessionToolsController.setCategoryEnabled: session={} IM enabled={} tools={}（V330 增量）",
+                        sessionId, req.enabled(), patch.keySet());
+            }
+            return buildList(sessionId);
+        }
         if (req.enabled()) {
             disabled.removeAll(categoryNames);
         } else {
@@ -157,7 +182,7 @@ public class SessionToolsController {
                     + "affected={} skippedCore={}（[tool-categories] 批量开关）",
                 sessionId, category, mcpServer, req.enabled(), categoryNames.size(), skippedCore);
         }
-        return buildList(sessionId, effectiveDisabledNames(sessionId));
+        return buildList(sessionId);
     }
 
     /**
@@ -194,19 +219,37 @@ public class SessionToolsController {
             throw new ValidationException("Tool " + toolName
                 + " is a core orchestration tool and cannot be disabled for this session");
         }
-        // 起点：DB 实际值（含默认禁用推断），否则「打开一个默认禁用的工具」会被默认集盖回
-        Set<String> disabled = new LinkedHashSet<>(effectiveDisabledNames(sessionId));
-        if (req.enabled()) {
-            disabled.remove(toolName);
+        // [V330] SendUserMessage 只由 Brief 状态控制；IM 组其余工具走增量覆盖（不写 disabled_tools）。
+        if (ToolNameConstants.BRIEF_TOOL_NAME.equals(toolName)) {
+            if (sessionModeService == null) {
+                throw new ValidationException("Brief 状态服务未接线，无法切换 " + toolName);
+            }
+            // [Q8] 关 Brief 且无人值守开启：未带确认 ⇒ 409 + 可读文案（前端据此弹确认框）；
+            //   带确认 ⇒ 域服务一次原子写入两个状态。
+            try {
+                sessionModeService.setBrief(sessionId, req.enabled(),
+                    Boolean.TRUE.equals(req.cascadeExitUnattended()));
+            } catch (IllegalStateException e) {
+                throw new ConflictException(e.getMessage());
+            }
+        } else if (SessionToolCategory.IM_TOOL_NAMES.contains(toolName)) {
+            sessionService.patchImToolOverrides(sessionId, Map.of(toolName, req.enabled()));
         } else {
-            disabled.add(toolName);
+            // 起点：DB 实际值（含默认禁用推断），否则「打开一个默认禁用的工具」会被默认集盖回
+            Set<String> disabled = new LinkedHashSet<>(effectiveDisabledNames(sessionId));
+            if (req.enabled()) {
+                disabled.remove(toolName);
+            } else {
+                disabled.add(toolName);
+            }
+            sessionService.setDisabledTools(sessionId, disabled);
         }
-        sessionService.setDisabledTools(sessionId, disabled);
         // [真值回读 · 2026-11-15] 必须按**写入后的实际生效集合**回报，⛔ 不能 `!req.enabled()` 硬算：
         //   硬算会让前端显示与真实状态分叉（真机：点「启用」后仍显示「已禁用」，
         //   而日志里只能看到前端算出来的值，无法区分是写入失败还是显示错误）。
-        //   口径与列表接口、LLM schema 剔除完全同一份（effectiveDisabledNames）。
-        boolean nowDisabled = effectiveDisabledNames(sessionId).contains(toolName);
+        //   口径与列表接口、LLM schema 剔除完全同一份（SessionToolVisibility.capture）。
+        boolean nowDisabled = com.nexusai.application.agent.tool.SessionToolVisibility
+            .capture(sessionId).blocks(toolName);
         if (log.isInfoEnabled()) {
             log.info("SessionToolsController.toggle: session={} tool={} disabled={}（V34 列，"
                     + "LLM schema 剔除语义对齐 CC blanket deny tools.ts:262-269）",
@@ -263,11 +306,14 @@ public class SessionToolsController {
      * @param disabled  生效禁用集合
      * @return 按工具名排序的完整列表
      */
-    private List<SessionToolDto> buildList(String sessionId, Set<String> disabled) {
+    private List<SessionToolDto> buildList(String sessionId) {
+        // [V330] 面板与模型同源：会话禁用 + 人格豁免 + Brief/IM 增量 + 无人值守 Ask，全部取自同一解析器。
+        com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot snapshot =
+            com.nexusai.application.agent.tool.SessionToolVisibility.capture(sessionId);
         List<Tool> all = toolRegistry.all();
         // [session-id-short] sessionId 已 short，直传（不再 canonicalUuid 派生 UUID）
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(),
+            null,
             sessionId,
             PermissionMode.DEFAULT,
             Map.of(),
@@ -283,14 +329,30 @@ public class SessionToolsController {
             if (t == null) {
                 continue;
             }
+            // [structured-output 2026-11-20 · 面板与模型同源] StructuredOutput 是内部 dispatch 工具：
+            //   模型 tools 数组经 ToolRegistry 的 SPECIAL_TOOLS 过滤恒不含它（唯一例外是非交互会话由
+            //   主循环 post-hoc 追加 schema 专用实例，属实现细节、非会话可配置工具）；面板若照旧列出，
+            //   就会出现「面板有、模型拿不到」的幽灵条目（交互式协调者尤其明显 —— 白名单候选里保留了它）。
+            //   ⛔ 只滤 StructuredOutput：ListMcpResourcesTool/ReadMcpResourceTool 同属 SPECIAL_TOOLS，
+            //   但它们对 LLM 实际可见（S04 过滤收窄），滤掉会造成反向不一致。
+            if (ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME.equals(t.name())) {
+                continue;
+            }
+            // [V329] 面板与模型同一可见集：会话禁用（disabled_tools）之外，无人值守会话的
+            //   AskUserQuestion 也必须显示为「不可用」（模型 schema 已剔除，原因 = unattended）。
+            //   被剔除的工具仍保留在列表（disabled=true），前端才能看到原因并恢复。
+            boolean disabledFlag = snapshot.blocks(t.name())
+                    || (snapshot.askExcluded()
+                        && com.nexusai.application.agent.config.ImUnattendedConfig
+                            .ASK_USER_QUESTION_TOOL.equals(t.name()));
             result.add(new SessionToolDto(t.name(), t.userFacingName(),
-                SessionToolCategory.of(t), t.description(), disabled.contains(t.name()),
+                SessionToolCategory.of(t), t.description(), disabledFlag,
                 SessionToolCategory.mcpServerOf(t.name())));
         }
         result.sort(Comparator.comparing(SessionToolDto::name));
         if (log.isDebugEnabled()) {
             log.debug("SessionToolsController.buildList: session={} tools={} disabled={}",
-                sessionId, result.size(), disabled);
+                sessionId, result.size(), snapshot.disabled());
         }
         return result;
     }

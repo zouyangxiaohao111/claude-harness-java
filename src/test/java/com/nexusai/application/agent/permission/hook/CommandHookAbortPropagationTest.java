@@ -103,7 +103,7 @@ class CommandHookAbortPropagationTest {
     private static ToolUseContext parentTucWith(AbortController abort) {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         // 主线程惯例: agentId == sessionId（与 R7 判定无关，此处仅作父上下文载体）
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", abort, List.of(), null, PermissionMode.DEFAULT);
     }
 

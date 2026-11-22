@@ -286,7 +286,7 @@ class LlmUsageCallStorageTest {
         SessionUsageLedger ledger = new SessionUsageLedger(SESSION, fixedPriceCalculator(), mapper);
         UsageAttribution main = UsageAttribution.top(SESSION, MAIN_AGENT, UsageCategory.MAIN, null);
         String hexAgentId = "a0123456789abcdef";
-        String uuidForm = "01234567-89ab-cdef-0000-000000000000";   // packAgentId(hex).toString()
+        String uuidForm = "01234567-89ab-cdef-0000-000000000000";   // 历史 UUID 渲染（canonicalAgentId 归一到 hex）
         // 本体调用（hex 形式）+ 其旁路调用（归一前写入的历史形态：UUID 形式）
         ledger.record(streamCall(LlmCallRecord.newCallId(),
             main.child(hexAgentId, UsageCategory.SUBAGENT, "general-purpose"), "m",
@@ -308,8 +308,8 @@ class LlmUsageCallStorageTest {
             .filter(a -> hexAgentId.equals(a.agentId())).findFirst().orElseThrow();
         assertThat(child.calls()).as("本体 1 次 + 旁路 1 次 = 2 次（同一节点）").isEqualTo(2);
         assertThat(child.inputTokens()).isEqualTo(400);
-        assertThat(child.taskId()).as("归一后仍可换算 taskId（前端关联键）")
-            .isEqualTo(uuidForm);
+        assertThat(child.taskId()).as("taskId === agentId（CC 单一形态，前端关联键）")
+            .isEqualTo(hexAgentId);
 
         // 全量视图同口径（同样只有 1 个节点）
         StatsService.StatsResult all = stats.aggregate();
@@ -359,8 +359,8 @@ class LlmUsageCallStorageTest {
 
         StatsService.SessionAgentUsage childNode = usage.agents().get(1);
         assertThat(childNode.taskId())
-            .as("a+16hex → packAgentId().toString() = 任务注册表 taskId（前端关联键）")
-            .isEqualTo("01234567-89ab-cdef-0000-000000000000");
+            .as("taskId === agentId（CC 单一形态 a+16hex，前端关联键）")
+            .isEqualTo("a0123456789abcdef");
         assertThat(childNode.parentTaskId()).isNull();
         assertThat(childNode.parentAgentId()).isEqualTo(MAIN_AGENT);
         assertThat(childNode.depth()).isEqualTo(1);

@@ -38,12 +38,12 @@ class LlmSideCallClientAttributionTest {
     private static final String HEX = "a48afc67b6604cf17";
     private static final String UUID_FORM = "48afc67b-6604-cf17-0000-000000000000";
 
-    /** 该 UUID 形式与 hex 形式确实是同一 agent（packAgentId 往返）——用例前提自证。 */
+    /** 该 UUID 形式与 hex 形式确实是同一 agent（canonicalAgentId 归一）——用例前提自证。 */
     @Test
-    @DisplayName("前提：UUID 形式与 a+16hex 是同一 agent 的两种渲染（packAgentId 往返）")
+    @DisplayName("前提：UUID 形式经 canonicalAgentId 归一到 a+16hex（同一 agent）")
     void uuidAndHexAreSameAgent() {
-        assertThat(AgentContext.packAgentId(HEX).toString()).isEqualTo(UUID_FORM);
-        assertThat(AgentContext.unpackAgentId(java.util.UUID.fromString(UUID_FORM))).isEqualTo(HEX);
+        assertThat(AgentContext.canonicalAgentId(UUID_FORM)).isEqualTo(HEX);
+        assertThat(AgentContext.canonicalAgentId(HEX)).isEqualTo(HEX);
     }
 
     @Test
@@ -105,11 +105,11 @@ class LlmSideCallClientAttributionTest {
         assertThat(who.label()).as("用途名必须留下（前端据此显示「未归类 · 图片分析」）").isEqualTo("vision-analyze");
     }
 
-    /** 防御：AgentState 的 agentId 是 UUID（调用点形态来源）——归一后必须等于其 hex 渲染。 */
+    /** 防御：AgentState 的 agentId 现为 a+16hex 单一形态——归一后必须等于其 hex 渲染。 */
     @Test
     @DisplayName("调用点形态（AgentState.agentId().toString()）归一后 == 该 agent 的 hex 渲染")
     void agentStateFormMatchesHex() {
-        AgentState state = new AgentState("sys", SESSION, AgentContext.packAgentId(HEX));
+        AgentState state = new AgentState("sys", SESSION, HEX);
 
         UsageAttribution who = LlmSideCallClient.SideCallUsage.inSession(
             state.sessionId(), state.agentId().toString(), UsageCategory.SIDE_CALL, "tool-use-summary")

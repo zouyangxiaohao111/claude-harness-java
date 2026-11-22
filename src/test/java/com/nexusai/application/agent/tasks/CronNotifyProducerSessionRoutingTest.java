@@ -76,7 +76,7 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAsyncAgent(agentId, "异步任务", "prompt", "general-purpose", null, createSession);
         // 完成通知（transitionToTerminal 内部 enqueue）
         runner.completeAsyncAgent(task.id(), AsyncAgentResult.success("summary", 1, 10L, task.id(), 5L, com.nexusai.application.agent.tool.AgentUsage.EMPTY));
@@ -103,7 +103,7 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAsyncAgent(agentId, "异步任务", "prompt", "general-purpose", null, createSession);
         runner.completeAsyncAgent(task.id(), AsyncAgentResult.success("summary", 1, 10L, task.id(), 5L, com.nexusai.application.agent.tool.AgentUsage.EMPTY));
 
@@ -128,7 +128,7 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAsyncAgent(agentId, "异步任务", "prompt", "general-purpose", null, createSession);
         runner.completeAsyncAgent(task.id(), AsyncAgentResult.success("summary", 1, 10L, task.id(), 5L, com.nexusai.application.agent.tool.AgentUsage.EMPTY));
 
@@ -213,7 +213,7 @@ class CronNotifyProducerSessionRoutingTest {
             @Override public AgentToolResult execute(ToolUseBlock call, ToolUseContext ctx) {
                 threadName.set(Thread.currentThread().getName());
                 String sid = ctx != null && ctx.sessionId() != null ? ctx.sessionId().toString() : null;
-                UUID agentId = UUID.randomUUID();
+                String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
                 BackgroundTask task = runner.registerAsyncAgent(agentId, "探针任务", "prompt", "general-purpose", null, sid);
                 taskSessionSeen.set(task.sessionId());
                 taskIdSeen.set(task.id());
@@ -273,7 +273,7 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAsyncAgent(
             agentId, "异步任务", "prompt", "general-purpose", null, createSession);
         assertThat(task.agentId()).as("前置条件：async agent 任务的 agentId 即任务自身（taskId===agentId）")
@@ -292,7 +292,7 @@ class CronNotifyProducerSessionRoutingTest {
             .isEqualTo(SessionKeys.canonicalUuid(createSession));
 
         // 后果断言 1：该 agent 自己（worker agentId）不再是收件人 —— 防「换一个死 id 填上」
-        assertThat(queue.drainForQuery(true, agentId.toString(), createSession))
+        assertThat(queue.drainForQuery(true, agentId, createSession))
             .as("按 worker 自己的 agentId drain 必须捞不到 —— 它已退出，正是原缺陷的收件人")
             .isEmpty();
 
@@ -320,7 +320,7 @@ class CronNotifyProducerSessionRoutingTest {
         NotificationQueue queue = new NotificationQueue();
         BackgroundTaskRunner runner = new BackgroundTaskRunner(queue, new TaskFrameworkService(null));
 
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAsyncAgent(
             agentId, "异步任务", "prompt", "general-purpose", null, createSession);
         assertThat(runner.killAsyncAgent(task.id()))
@@ -332,7 +332,7 @@ class CronNotifyProducerSessionRoutingTest {
             .as("LOCAL_AGENT 被杀通知不得携带 agentId —— 与完成路径同一根因（收件人已死）")
             .isNull();
 
-        assertThat(queue.drainForQuery(true, agentId.toString(), createSession))
+        assertThat(queue.drainForQuery(true, agentId, createSession))
             .as("按 worker 自己的 agentId drain 必须捞不到")
             .isEmpty();
         assertThat(drainTaskNotification(queue, createSession))
@@ -356,7 +356,7 @@ class CronNotifyProducerSessionRoutingTest {
     /** 固定创建会话 sessionId 的 ToolUseContext（对齐 ProjectRootPropagationTest 构造形态）。 */
     private static ToolUseContext context(String sessionId) {
         return ToolUseContext.of(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", new AbortController(), List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",

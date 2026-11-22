@@ -50,7 +50,7 @@ class ToolUseContextLocalOnlyBoundaryTest {
 
     /** 同时盖上两个 local-only 载体的 TUC（用生产唯一盖章入口，不绕过 wither）。 */
     private static ToolUseContext stampedTuc() {
-        return new ToolUseContext(UUID.randomUUID(), "sess-local-only",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-local-only",
                 PermissionMode.DEFAULT, Map.of())
             .withAgentContext(agentContext())
             .withTeammateIdentity(identity());
@@ -204,7 +204,7 @@ class ToolUseContextLocalOnlyBoundaryTest {
     @Test
     @DisplayName("B6 · 兼容构造器（46 参链）产出 TUC 的两个载体均为 null（新上下文默认非 teammate）")
     void compactCompatibleConstructorLeavesCarriersNull() {
-        ToolUseContext tuc = new ToolUseContext(UUID.randomUUID(), "sess-ctor",
+        ToolUseContext tuc = new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-ctor",
             PermissionMode.DEFAULT, Map.of());
         assertThat(tuc.agentContext()).as("兼容 ctor → agentContext null").isNull();
         assertThat(tuc.teammateIdentity()).as("兼容 ctor → teammateIdentity null").isNull();

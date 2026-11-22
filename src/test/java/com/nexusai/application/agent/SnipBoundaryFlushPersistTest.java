@@ -208,7 +208,7 @@ class SnipBoundaryFlushPersistTest {
             .as("u0 非历史注入（prePersisted 未登记）→ 若为 boundary 不会被监听器跳过").isTrue();
 
         // ── 4. per-turn TUC：availableTools=snipTool + messages=state.rawMessages()（工具读 ctx.messages）──
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), SESSION)
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION)
             .withAvailableTools(List.of(snipTool))
             .withMessages(state.rawMessages());
         String turnAssistantId = UUID.randomUUID().toString();
@@ -274,7 +274,7 @@ class SnipBoundaryFlushPersistTest {
         state.appendMessage(msg("u2", Role.user, "later turn 2"));
 
         // 真 SnipTool 产出 boundary（同一实现链路），随后模拟「暂存了但本 turn 无对应 tool_result 配对」──
-        ToolUseContext snipTuc = ToolUseContext.of(UUID.randomUUID(), session)
+        ToolUseContext snipTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), session)
             .withAvailableTools(List.of(snipTool))
             .withMessages(state.rawMessages());
         ToolResult<String> snipResult = asToolResult(snipTool.execute(snipCall("u0"), snipTuc));
@@ -286,7 +286,7 @@ class SnipBoundaryFlushPersistTest {
         assertThat(state.hasPendingNewMessages()).as("暂存未消费 → 触发末尾 drain").isTrue();
 
         // 本 turn 只有 Grep 调用（不消费 orphan 暂存）→ 主循环后走 drainLeftoverNewMessages ──
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), session)
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), session)
             .withAvailableTools(List.of(dummy));
         String turnAssistantId = UUID.randomUUID().toString();
         ToolUseBlock grepCall = new ToolUseBlock("call_grep_1", "Grep", JSON.createObjectNode().put("pattern", "TODO"));
@@ -332,7 +332,7 @@ class SnipBoundaryFlushPersistTest {
         SimpMessagingTemplate wsTemplate = mock(SimpMessagingTemplate.class);
         MessageMapper messageMapper = armPersist(state, session, topic, wsTemplate);
 
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), session)
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), session)
             .withAvailableTools(List.of(pdfTool))
             .withMessages(state.rawMessages());
         String turnAssistantId = UUID.randomUUID().toString();

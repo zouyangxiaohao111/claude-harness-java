@@ -289,28 +289,6 @@ class AgentContextExplicitApiTest {
     }
 
     @Test
-    @DisplayName("packAgentId/unpackAgentId 可逆编码桥往返（R3-WF-F IMP-SUB-12，CC forkedAgent.ts:448）")
-    void packUnpackAgentId_roundTrips_aPlus16Hex() {
-        // WHY: Java ToolUseContext.agentId 为 UUID 基础设施（S-12 桥），a+16hex 经 pack 桥确定可逆编码；
-        //   生产生成点 createSubagentContext.create() 以 packAgentId(createAgentId()) 产出，
-        //   transcript/resume 键经 unpackAgentId 还原。往返必须逐位一致，否则 resume 键错位。
-        String hexId = AgentContext.createAgentId();
-        UUID packed = AgentContext.packAgentId(hexId);
-        assertThat(AgentContext.unpackAgentId(packed))
-            .as("pack→unpack 往返必须还原原 a+16hex（CC uuid.ts:24-27 格式）")
-            .isEqualTo(hexId);
-        assertThat(AgentContext.packAgentId(hexId))
-            .as("同 a+16hex 必须映射同 UUID（确定性：resume 双键查找依赖）")
-            .isEqualTo(packed);
-        assertThat(AgentContext.unpackAgentId(UUID.randomUUID()))
-            .as("任意 UUID 均还原为合法 a+16hex 格式（^a[0-9a-f]{16}$，resume fallback 通道）")
-            .matches("^a[0-9a-f]{16}$");
-        assertThat(AgentContext.unpackAgentId(null))
-            .as("null 输入必须返回 null（不抛异常）")
-            .isNull();
-    }
-
-    @Test
     @DisplayName("createSubagentContext.create 生产生成点产出 a+16hex 可还原 agentId（CC forkedAgent.ts:448）")
     void createSubagentContext_create_generatesPackableAplus16HexAgentId() {
         // WHY: R3-WF-F 生产接线验收 —— 原实现 UUID.randomUUID() 零生产调用 createAgentId；对齐 CC
@@ -322,8 +300,8 @@ class AgentContextExplicitApiTest {
         assertThat(ctx.agentId())
             .as("spawn 生成点必须产出非 null agentId")
             .isNotNull();
-        assertThat(AgentContext.unpackAgentId(ctx.agentId()))
-            .as("unpack 还原必须匹配 CC AgentId 正则 ^a[0-9a-f]{16}$（a+16hex 生产接线）")
+        assertThat(ctx.agentId())
+            .as("agentId 必须是 a+16hex（CC 单一形态；ToolUseContext.agentId 现为 String）")
             .matches("^a[0-9a-f]{16}$");
     }
 
@@ -390,76 +368,4 @@ class AgentContextExplicitApiTest {
             .doesNotContainKey("invokingRequestId");
     }
 
-    @Test
-    @DisplayName("cleanup/kill 四键必须回传 packed UUID 字符串而非 a+16hex（REWORK-1 写入侧对齐）")
-    void cleanupKeys_mustBePackedUuidString_notAPlus16Hex() {
-        // WHY: REWORK-1 回归 —— 生产把 cleanupAgentTracking/cleanupAgentTodos/killShellTasksForAgent/
-        //   killMonitorMcpTasksForAgent 的键改成 a+16hex（agentIdHex），而写入/解析侧仍 UUID：
-        //   TodoWriteTool:832 todoKey = ctx.agentId().toString()（packed UUID 字符串）；
-        //   BackgroundTaskRunner.killShellTasksForAgent(UUID) 以 UUID 匹配 task.agentId()；
-        //   PromptCacheBreakDetection.getTrackingKey 用 agentId 原值。a+16hex 传入 → containsKey
-        //   恒 false / safeParseUuid 抛 IllegalArgumentException → 静默 no-op/泄漏。
-        //   本测试锁定：packed UUID 字符串与 a+16hex 是不同键，cleanup 必须用前者。
-        ToolUseContext ctx = createSubagentContext.create(null, null);
-        String packedUuidStr = ctx.agentId().toString();
-        String aPlus16Hex = AgentContext.unpackAgentId(ctx.agentId());
-
-        assertThat(packedUuidStr)
-            .as("写入侧键 = ctx.agentId().toString()（TodoWriteTool:832 同源）必须是合法 UUID 字符串")
-            .matches("^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$");
-        assertThat(aPlus16Hex)
-            .as("a+16hex 是 transcript/resume 可观察格式（SC-068），但非 UUID 桶键")
-            .matches("^a[0-9a-f]{16}$");
-        assertThat(packedUuidStr)
-            .as("packed UUID 字符串 ≠ a+16hex —— cleanup 传 a+16hex 必 miss 写入侧桶（REWORK-1 回归根因）")
-            .isNotEqualTo(aPlus16Hex);
-        assertThat(AgentContext.packAgentId(aPlus16Hex).toString())
-            .as("packAgentId(a+16hex).toString() 必须还原为写入侧 packed UUID 字符串（双向确定）")
-            .isEqualTo(packedUuidStr);
-        // safeParseUuid 语义（killShellTasksForAgent/killMonitorMcpTasksForAgent 委托路径）：
-        //   packed UUID 字符串可被 UUID.fromString 解析（命中 task.agentId()=packed UUID），
-        //   a+16hex 抛 IllegalArgumentException → SubagentExecutor.safeParseUuid 返 null → no-op。
-        assertThat(UUID.fromString(packedUuidStr))
-            .as("killShell/killMonitor safeParseUuid(packed UUID 字符串) 必须解析成功（CC runAgent.ts:851-861 命中）")
-            .isEqualTo(ctx.agentId());
-        org.assertj.core.api.Assertions.assertThatThrownBy(() -> UUID.fromString(aPlus16Hex))
-            .as("safeParseUuid(a+16hex) 必须抛 IllegalArgumentException（原返工回归根因）")
-            .isInstanceOf(IllegalArgumentException.class);
-    }
-
-    @Test
-    @DisplayName("cleanupAgentTracking 四键之一：packed UUID 字符串命中实际 tracking 桶，a+16hex 恒 miss（REWORK-1）")
-    void cleanupAgentTracking_packedUuidHitsBucket_aPlus16HexMisses() {
-        // WHY: REWORK-1 回归 —— PromptCacheBreakDetection.getTrackingKey(:152) 在 tracked source 下
-        //   用 agentId 原值作 PREVIOUS 桶键；生产写入侧（ToolUseContext.agentId=packed UUID）记录的
-        //   桶键是 packed UUID 字符串。cleanupAgentTracking 若传 a+16hex（原返工实现）→
-        //   PREVIOUS.remove(a+16hex) 恒 miss → tracking 泄漏；必须传 packed UUID 字符串才能命中实际桶。
-        //   feature 门控默认关（PROMPT_CACHE_BREAK_DETECTION），但键格式契约与本测试锁定的是
-        //   开启后的命中语义（对齐 SubagentExecutorCacheBreakCleanupTest 同款 record→cleanup 断言）。
-        //   PREVIOUS 为类级静态 Map（CC previousStateBySource 模块级），跨测试共享 → 每测前清空。
-        new PromptCacheBreakDetection(r -> {}).resetPromptCacheBreakDetection();
-        PromptCacheBreakDetection detector = new PromptCacheBreakDetection(events -> {}); // enabled=true
-        ToolUseContext ctx = createSubagentContext.create(null, null);
-        String packedUuidStr = ctx.agentId().toString();
-        String aPlus16Hex = AgentContext.unpackAgentId(ctx.agentId());
-        // record: 与生产写入侧同键（querySource tracked + agentId=packed UUID 字符串）
-        detector.recordPromptState(new PromptCacheBreakDetection.PromptStateSnapshot(
-            List.of(Map.of("type", "text", "text", "sys")),
-            List.of(Map.of("name", "toolA")),
-            "agent:default", "claude-sonnet-4-6", packedUuidStr,
-            false, "", List.of(), false, false, false, null, null));
-        assertThat(detector.getTrackedSourceCount()).as("record 后 PREVIOUS 有 1 条").isEqualTo(1);
-
-        // 错误格式 a+16hex → miss（原返工回归）
-        detector.cleanupAgentTracking(aPlus16Hex);
-        assertThat(detector.getTrackedSourceCount())
-            .as("cleanup(a+16hex) 必须 miss（键 ≠ 写入侧 packed UUID 字符串）→ 仍 1 条")
-            .isEqualTo(1);
-
-        // 正确格式 packed UUID 字符串 → hit
-        detector.cleanupAgentTracking(packedUuidStr);
-        assertThat(detector.getTrackedSourceCount())
-            .as("cleanup(packed UUID 字符串) 必须命中实际桶 → 0 条（CC promptCacheBreakDetection.ts:700-702 delete）")
-            .isZero();
-    }
 }

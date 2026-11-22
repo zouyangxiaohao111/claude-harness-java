@@ -56,6 +56,42 @@ export function useServerRunningRebuild(sessionId: string | null, enabled: boole
 }
 
 /**
+ * [状态自愈 · 2026-11-20 用户裁定] 服务端权威「在跑」的会话周期对账。
+ *
+ * <p><b>WHY</b>：侧栏「完成绿点」的优先级是 {@code pending > running > done}。`serverRunning`
+ * 为 true 时点会一直黄闪；而清零只靠两条**事件/边沿**通道（complete 帧 / idle 帧 / 一次 GET）。
+ * 任一帧静默丢失且没有 true→false 边沿，绿点就永远不会露出来 —— 用户实测「明明完成了左侧没变绿」。
+ *
+ * <p><b>只查什么</b>：store 里 `serverRunning===true` 的会话（通常 1~2 个，最多 {@link PROBE_LIMIT} 个）。
+ * 查回 false ⇒ 写回 false，复用既有收口边沿（{@link useServerRunningReconcile}：finalizeBlocks + 回收登记）。
+ * 查回 true / 查询失败 ⇒ **一律不改**（失败静默：不猜「空闲」）。
+ *
+ * <p><b>节奏</b>：5s；页面隐藏跳过。与「载入/切会话/重连各查一次」不冲突 —— 那几条负责首值，本钩子只做自愈。
+ */
+const SELF_HEAL_INTERVAL_MS = 5_000
+const PROBE_LIMIT = 6
+
+export function useServerRunningSelfHeal(): void {
+  useEffect(() => {
+    if (typeof chatApi.sessionRunning !== 'function') return   // 测试桩缺该 API ⇒ 不挂定时器
+    let stopped = false
+    const timer = window.setInterval(() => {
+      if (stopped || document.visibilityState === 'hidden') return
+      const ids = Object.entries(useChatStore.getState().serverRunning)
+        .filter(([, on]) => on === true)
+        .map(([sid]) => sid)
+        .slice(0, PROBE_LIMIT)
+      for (const sid of ids) {
+        void fetchServerRunning(sid).then((running) => {
+          if (running === false) useChatStore.getState().setServerRunning(sid, false)
+        })
+      }
+    }, SELF_HEAL_INTERVAL_MS)
+    return () => { stopped = true; window.clearInterval(timer) }
+  }, [])
+}
+
+/**
  * [C6 · 遗留2] 从「上一次服务端运行态快照」到「当前快照」的**收口边沿** → 返回需回收本地登记的会话 id。
  *
  * <p><b>只认 true → false</b>。键缺省 = 从未查到过（{@code chatStore.serverRunning} 注释：键缺失一律 false），

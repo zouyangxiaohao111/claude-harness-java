@@ -171,7 +171,7 @@ class PartialCompactSessionCostWiringTest {
     private static AgentState liveState() {
         AgentState live = new AgentState("sys", SESSION, null);
         live.setCurrentModel(P_MODEL);
-        live.setCurrentToolUseContext(ToolUseContext.of(UUID.randomUUID(), SESSION));
+        live.setCurrentToolUseContext(ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION));
         return live;
     }
 

@@ -266,7 +266,7 @@ class TaskHookAggregationTest {
         ToolUseBlock call = new ToolUseBlock("call-4", "TaskCreate",
             json.createObjectNode().put("subject", "Session capture"));
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionUuid);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionUuid);
 
         ToolResult<?> result = tool.execute(call, ctx);
 
@@ -300,7 +300,7 @@ class TaskHookAggregationTest {
         ToolUseBlock call = new ToolUseBlock("call-3", "TaskUpdate",
             json.createObjectNode().put("taskId", "t-13").put("status", "completed"));
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionUuid);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionUuid);
 
         ToolResult<String> result = tool.execute(call, ctx);
 
@@ -342,7 +342,7 @@ class TaskHookAggregationTest {
         AbortController abort = new AbortController();
         abort.abort("user_cancelled"); // 已取消 + reason（旧实现会把 cancelled=true/reason 写入 data map）
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "tl-1", abort);
 
         ToolResult<?> result = tool.execute(call, ctx);

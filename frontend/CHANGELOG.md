@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.84] - 2026-11-23
+
+### Added
+
+- 新增渠道权限中继（审批请求可经 IM 渠道下发并回执）、IM 渠道与微信日志增强、AskUserQuestion AFK 超时档位、插件卸载清理链；AST 工具（AstGrep/AstEdit）并入；修复密钥掩码回传覆盖库中真值
+
 ## [0.1.83] - 2026-11-19
 
 ### Added

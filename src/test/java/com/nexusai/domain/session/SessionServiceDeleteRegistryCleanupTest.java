@@ -4,6 +4,7 @@ import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.SessionStartSeenRegistry;
 import com.nexusai.application.agent.skill.SkillListingSentRegistry;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.team.LeaderPermissionBridge;
 import com.nexusai.repository.session.entity.SessionRecord;
 import com.nexusai.repository.session.mapper.MessageMapper;
@@ -32,7 +33,7 @@ import static org.mockito.Mockito.when;
  * <ol>
  *   <li>skill_listing 槽位回收走<b>纯清理</b>入口（{@code removeSessionEntries}）—— 不残留 CLEARED
  *       （残留会让被删会话 key 复现时误整份重发，且长跑 JVM 无界增长）；</li>
- *   <li>AgentState 清理覆盖<b>双桶</b> —— sessions（String）+ 后台化 agents（UUID）；上一版只清
+ *   <li>AgentState 清理覆盖<b>双桶</b> —— sessions（String）+ 后台化 agents（String agentId）；上一版只清
  *       sessions 桶 → 被后台化过的会话完整历史仍泄漏。</li>
  * </ol>
  * 删掉 SessionService.delete 里的任一处调用 → 对应断言 RED。
@@ -113,11 +114,11 @@ class SessionServiceDeleteRegistryCleanupTest {
         ReflectionTestUtils.setField(service, "sessionAgentStateRegistry", registry);
 
         AgentState mainState = new AgentState("sys", id, null);
-        UUID bgAgentId = UUID.randomUUID();
-        // 后台化主会话：MainSessionBackgroundService 以 agentId=agentUuid 注册（agents 桶），sessionId 相同。
+        String bgAgentId = AgentContext.createAgentId();
+        // 后台化主会话：MainSessionBackgroundService 以 agentId（a+16hex）注册（agents 桶），sessionId 相同。
         AgentState bgState = new AgentState("sys", id, bgAgentId);
         registry.register(id, mainState);
-        registry.register(bgAgentId, bgState);
+        registry.registerAgent(bgAgentId, bgState);
         assertThat(registry.size()).isEqualTo(2);
 
         service.delete(id);

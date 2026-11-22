@@ -92,7 +92,7 @@ class CompactLiveReadFileStateClearTest {
      */
     private static ToolUseContext liveTuc(String sessionId) {
         ToolUseContext base = ToolUseContext.of(
-            UUID.nameUUIDFromBytes(("rfs-run-" + sessionId).getBytes()), sessionId, PermissionMode.DEFAULT);
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT);
         return base.with(new ToolUseContext.SubagentContextOverrides(
             null, null, null, null, null,
             SessionReadFileStateRegistry.forSession(sessionId),

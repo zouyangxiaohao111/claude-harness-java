@@ -9,7 +9,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -84,7 +83,7 @@ class SubagentExecutorContentReplacementInjectionTest {
         SubagentExecutor.ForkPathParams resumeParams = new SubagentExecutor.ForkPathParams(
             null, null, "parent-prompt", null,
             List.of(AgentMessage.of("user", "pre-resume")),
-            null, UUID.fromString("00000000-0000-0000-0000-0000000000a1"), rebuilt);
+            null, "a00000000000000a1", rebuilt);
 
         assertThat(resumeParams.contentReplacementState()).isSameAs(rebuilt);
     }
@@ -110,7 +109,7 @@ class SubagentExecutorContentReplacementInjectionTest {
         SubagentExecutor.ForkPathParams resumeParams = new SubagentExecutor.ForkPathParams(
             null, null, "", null,
             List.of(AgentMessage.of("user", "pre-resume")),
-            null, UUID.fromString("00000000-0000-0000-0000-0000000000a2"),
+            null, "a00000000000000a2",
             ContentReplacementState.create());
         // 构造器兼容：8 字段 record 不破坏 SubagentExecutor 既有构造路径
         new SubagentExecutor(

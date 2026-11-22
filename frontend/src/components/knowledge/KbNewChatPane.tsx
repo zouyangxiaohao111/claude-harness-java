@@ -163,9 +163,12 @@ function SelfSocketBridge({ sessionId, activeStreams }: {
       // 知识库独立窗口没有「项目」概念，也没有 appSettings 上下文 ⇒ 两个可选文案来源都传 null
       projectLabel={null}
       selfDirName={null}
-      onDecision={(id, d, answers, annotations, permissionUpdates) => {
+      onDecision={(id, d, answers, annotations, permissionUpdates, _acceptFeedback, _updatedInput, afk) => {
         if (clientRef.current) {
-          sendPermissionResponse(clientRef.current, sid, perm.kind, id, d, { answers, annotations, permissionUpdates })
+          sendPermissionResponse(clientRef.current, sid, perm.kind, id, d, {
+            answers, annotations, permissionUpdates,
+            afkTimeoutMs: afk?.afkTimeoutMs, isByCountdown: afk?.isByCountdown,
+          })
         }
         useChatStore.getState().markToolAnswered(sid, perm.toolUseId ?? id)
         dequeuePermission(id)

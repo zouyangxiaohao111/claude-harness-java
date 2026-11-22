@@ -10,19 +10,23 @@ import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.domain.session.SessionModeService;
+import com.nexusai.domain.settings.SettingsService;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
+import org.springframework.test.util.ReflectionTestUtils;
 
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.mockito.ArgumentMatchers.anyString;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.when;
 
 /**
  * [刷新重放 · 三通道] 会话状态重放覆盖 <b>message / bridge / channel</b> 三条权限通道。
@@ -52,7 +56,7 @@ import static org.mockito.Mockito.mock;
 class PendingPermissionSnapshotReplayTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000001";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
 
     // ─────────────────────────── 工具桩 ───────────────────────────
@@ -77,6 +81,22 @@ class PendingPermissionSnapshotReplayTest {
 
     private static PermissionPromptDetails details() {
         return new PermissionPromptDetails("desc", List.of(), null, null, false);
+    }
+
+    /**
+     * [P1] 资格门缝：settings 两门开 + 本会话已绑渠道。
+     *
+     * <p>本测试只关心「快照重放形状」，不测资格判定；channel 竞速在资格不合格时会提前
+     * return（不登记快照）⇒ 必须把这两道门显式置为通过。
+     */
+    private static void wireEligibilityGates(WebSocketPermissionPrompter prompter) {
+        SettingsService settings = mock(SettingsService.class);
+        when(settings.readDbChannelsEnabled()).thenReturn(true);
+        when(settings.readDbChannelsPermissionRelayEnabled()).thenReturn(true);
+        ReflectionTestUtils.setField(prompter, "settingsService", settings);
+        SessionModeService sessionMode = mock(SessionModeService.class);
+        when(sessionMode.hasAnyChannel(anyString())).thenReturn(true);
+        ReflectionTestUtils.setField(prompter, "sessionModeService", sessionMode);
     }
 
     /** CU 工具入参（含 Phase 1a 就地注入的 resolvedApps ⇒ CU 面板数据可算）。 */
@@ -245,6 +265,7 @@ class PendingPermissionSnapshotReplayTest {
         WebSocketPermissionPrompter prompter =
             new WebSocketPermissionPrompter(mock(SimpMessagingTemplate.class), 5_000);
         prompter.wireRacersForTesting(null, channel);
+        wireEligibilityGates(prompter);
 
         AtomicReference<PermissionResult> holder = new AtomicReference<>();
         Thread t = new Thread(() -> holder.set(prompter.prompt(
@@ -345,6 +366,7 @@ class PendingPermissionSnapshotReplayTest {
         WebSocketPermissionPrompter prompter =
             new WebSocketPermissionPrompter(mock(SimpMessagingTemplate.class), 5_000);
         prompter.wireRacersForTesting(bridge, channel);
+        wireEligibilityGates(prompter);
 
         AtomicReference<PermissionResult> holder = new AtomicReference<>();
         Thread t = new Thread(() -> holder.set(prompter.prompt(
@@ -420,6 +442,7 @@ class PendingPermissionSnapshotReplayTest {
         WebSocketPermissionPrompter prompter =
             new WebSocketPermissionPrompter(mock(SimpMessagingTemplate.class), 5_000);
         prompter.wireRacersForTesting(bridge, channel);
+        wireEligibilityGates(prompter);
 
         AtomicReference<PermissionResult> holder = new AtomicReference<>();
         Thread t = new Thread(() -> holder.set(prompter.prompt(

@@ -58,7 +58,7 @@ class HandleToolCallsTurnPairingTest {
         state.incrementTurn(); // LlmAgentLoop.queryLoop:2870 每轮进入前 incrementTurn（turnCount>=1 必需）
         // [F4] 两个调用用**不同工具**（Bash / Grep）⇒ 结果内容可判别「谁拿到谁的结果」
         //   （原两条都用 Bash → 换位/串内容不可判别，用例判别力不足）。
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), "sess-fixb")
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-fixb")
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash"), TestContexts.dummyTool("Grep")));
         String turnAssistantId = UUID.randomUUID().toString();
 

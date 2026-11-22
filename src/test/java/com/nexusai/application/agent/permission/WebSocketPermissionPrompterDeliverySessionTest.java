@@ -15,7 +15,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
@@ -57,7 +56,7 @@ import static org.mockito.Mockito.mock;
 class WebSocketPermissionPrompterDeliverySessionTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000001";
     /** teammate 的 TUC sessionId 实机值 = 「确无会话」哨兵。 */
     private static final String NO_SESSION_SENTINEL = "no-session";
     /** Leader（= 有 UI 的会话）的 sessionId。 */

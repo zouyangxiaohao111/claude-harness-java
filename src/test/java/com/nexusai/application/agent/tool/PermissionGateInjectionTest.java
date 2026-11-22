@@ -364,14 +364,15 @@ class PermissionGateInjectionTest {
             registry, factoryMock, null, null, null, beans, hookMock);
 
         // 2. per-turn TUC：非空 availableTools（dummy "Bash"）→ 守卫通过
-        java.util.UUID agentId = java.util.UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         com.nexusai.application.agent.tool.ToolUseContext perTurnTuc =
             com.nexusai.application.agent.tool.ToolUseContext.of(agentId, sessionId)
                 .withAvailableTools(java.util.List.of(TestContexts.dummyTool("Bash")));
 
         // 3. 静态调 AgentLoopContext.buildStreamingExecutor
-        AgentState state = new AgentState("test prompt", sessionId, agentId);
+        AgentState state = new AgentState("test prompt", sessionId,
+            agentId);
         Object agentOptions = Class.forName(
             "com.nexusai.application.agent.subagent.createSubagentContext$AgentOptions")
             .getMethod("defaultOptions")

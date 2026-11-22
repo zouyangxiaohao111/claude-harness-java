@@ -4,7 +4,7 @@ import com.mybatisflex.core.MybatisFlexBootstrap;
 import com.nexusai.application.agent.tasks.NotificationQueue;
 import com.nexusai.application.schedule.QuartzScheduleService;
 import com.nexusai.infra.exception.NotFoundException;
-import com.nexusai.infra.schedule.TestJob;
+import com.nexusai.infra.schedule.AgentJob;
 import com.nexusai.model.schedule.dto.RunNowResponse;
 import com.nexusai.model.schedule.dto.ScheduleCreateRequest;
 import com.nexusai.model.schedule.dto.ScheduleKind;
@@ -47,7 +47,7 @@ import static org.mockito.Mockito.when;
  * </ul>
  *
  * <p>用 MybatisFlexBootstrap（无 Spring）直连临时 SQLite + Flyway V1..V9 + mock Quartz + real
- * TestJob（mock NotificationQueue），不启动完整应用上下文。ScheduleService 注入 real TestJob
+ * AgentJob（mock NotificationQueue），不启动完整应用上下文。ScheduleService 注入 real AgentJob
  * 验证 once 同步 fire 内联（gate→getById→enqueueLead→deleteAfterFire 全链路真实执行）。
  *
  * <p>[fix3] 与其它 Flex 测试类<b>可混跑</b>：DB 走共享稳定路径
@@ -93,8 +93,8 @@ class ScheduleServiceRunNowOnceTest {
         service = new ScheduleService();
         ReflectionTestUtils.setField(service, "scheduleMapper", mapper);
         ReflectionTestUtils.setField(service, "quartzScheduleService", quartz);
-        // 注入 real TestJob（mock NotificationQueue）→ once 同步 fire 全链路真实执行
-        TestJob job = new TestJob();
+        // 注入 real AgentJob（mock NotificationQueue）→ once 同步 fire 全链路真实执行
+        AgentJob job = new AgentJob();
         ReflectionTestUtils.setField(job, "scheduleService", service);
         ReflectionTestUtils.setField(job, "notificationQueue", mock(NotificationQueue.class));
         ReflectionTestUtils.setField(service, "testJob", job);

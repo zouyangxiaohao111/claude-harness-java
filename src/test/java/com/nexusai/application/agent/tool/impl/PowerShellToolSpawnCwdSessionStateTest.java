@@ -76,7 +76,7 @@ class PowerShellToolSpawnCwdSessionStateTest {
     @DisplayName("② 会话绑定 ctx ⇒ pb.directory = 会话项目根（子进程在会话目录里跑）")
     void execute_sessionBound_spawnsInSessionRoot(@TempDir Path project) {
         SessionProjectRoot.setForSession(SESSION, project.toString());
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), SESSION);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION);
         PowerShellTool tool = new PowerShellTool();
 
         ToolResult<?> probe = (ToolResult<?>) tool.execute(

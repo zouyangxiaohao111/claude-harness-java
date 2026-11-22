@@ -20,8 +20,7 @@ public record McpServerDto(
     // ── gap31 前端缺口 · server DTO 补 userFacingName / channelPermissions（纯派生，无新 DB 列）──
     // CC original: userFacingName()（client.ts:1972-1976，server 级 = client.name = server 名）
     String userFacingName,
-    // CC original: isChannelPermissionRelayEnabled()（channelPermissions.ts:36-38，
-    //   GrowthBook 'tengu_harbor_permissions' 默认 false）；Java = ChannelPermissionFeature.isEnabled()
+    // CC original: isChannelPermissionRelayEnabled()；Java = settings.channels_permission_relay_enabled（V334，默认开）
     boolean channelPermissions,
     String url,             // 远程反解：type≠stdio 取 command 列
     Map<String, String> headers,   // 远程反解：env 列（剥保留键）

@@ -309,7 +309,7 @@ public class SubagentExecutor {
             @JsonIgnore Object parentThinkingConfig,
             @JsonIgnore List<AgentMessage> resumedMessages,
             @JsonIgnore String resumedWorktreePath,
-            @JsonIgnore UUID agentIdOverride,
+            @JsonIgnore String agentIdOverride,
             @JsonIgnore ContentReplacementState contentReplacementState
     ) {
         public ForkPathParams {
@@ -575,7 +575,15 @@ public class SubagentExecutor {
             // [request-extras 批 1] requestExtras 透传 — 同上：本方法是 TUC 的 record-copy wither
             //   （派生视图），非来源；漏传会让子代理侧丢掉请求级透传（当前生产恒空 map ⇒ 行为不变）。
             //   ⛔ record 加组件后**所有全参构造调用都必须跟上**，否则编译报「找不到匹配的构造器」。
-            source.requestExtras()
+            source.requestExtras(),
+            // [V306] notifyChats 透传 — 同 requestExtras：本方法是 TUC 的 record-copy wither
+            //   （派生视图），非来源；本字段是「本轮/本任务」范围（定时任务配的通知目标），
+            //   不是「本 agent 身份」⇒ 子代理理应看到同一范围（父 null → 子 null，行为不变）。
+            source.notifyChats(),
+            // [sendmessage-cross-session · B] peer 来源**继承父**（本方法是派生视图，不是来源）：
+            //   peer 回合里派生的子代理执行的是同一件事，置 null 会让守卫被「嵌套一层子代理」绕过。
+            //   与 ToolUseContext.with(...) 的继承口径一致。
+            source.peerExecutionOrigin()
         );
     }
 
@@ -1038,7 +1046,7 @@ public class SubagentExecutor {
      * 保证 resume 原键（forkParams.agentIdOverride）胜出。null = 非统一路径（标准 sync/fork/测试）
      * 保持 create() 内部 generate 新 UUID 语义不变。
      */
-    private volatile UUID agentIdOverride = null;
+    private volatile String agentIdOverride = null;
 
     /** [IMP-G4 组11-1] 子 agent assistant 消息计数（完成遥测 assistant_message_count）· 在
      * runSubagentQueryLoop appendListener 逐 assistant 消息累加（对齐 CC finalizeAgentTool
@@ -1141,6 +1149,20 @@ public class SubagentExecutor {
     public void setUsageLedgerRegistry(
             com.nexusai.application.agent.cost.SessionUsageAccountingRegistry registry) {
         this.usageLedgerRegistry = registry;
+    }
+
+    /**
+     * [agent-summary-providerType] 注入共享模型解析器 · 由装配方（{@code SubagentTool} 4 构造站点 /
+     * {@code ToolRegistrationConfig.subagentExecutor @Bean}）注入；测试可手动调用。
+     *
+     * <p><b>WHY</b>：子代理周期摘要是真实出站 LLM 调用。{@link ProviderConfig} 只含 baseUrl+key，
+     * 不含 provider 类型；不注入本解析器时摘要按工厂默认 {@code openai_sdk} 路由，遇到
+     * {@code anthropic} 类型 provider（如 DeepSeek {@code /anthropic}）必然
+     * {@code {InternalServerException: 550: Unknown}}。同时它负责 SDK 模型名剥前缀。
+     * 未注入（测试直构）→ null ⇒ 摘要掉回改造前默认（不 NPE）。
+     */
+    public void setModelConfigResolver(com.nexusai.infra.llm.ModelConfigResolver resolver) {
+        this.modelConfigResolver = resolver;
     }
 
     /**
@@ -1290,7 +1312,7 @@ public class SubagentExecutor {
      * forkParams.agentIdOverride（resumeForkParams 第 7 参）在 Step 5 三元中仍胜出。
      * null = 非统一路径保持 create() 内部 generate 新 UUID 语义。
      */
-    public void setAgentIdOverride(UUID agentIdOverride) {
+    public void setAgentIdOverride(String agentIdOverride) {
         this.agentIdOverride = agentIdOverride;
     }
 
@@ -2070,7 +2092,7 @@ public class SubagentExecutor {
         //   override.agentId : createAgentId() + resumeAgent.ts:240 override.agentId=原 agentId。
         //   仅 resume 路径 (forkParams.agentIdOverride 非 null) 使用原键续写 transcript/metadata;
         //   null = 非 resume (标准 fork/普通执行) 保持 create() 内部 generate 新 UUID 语义。
-        UUID resumeAgentIdOverride = forkParams != null ? forkParams.agentIdOverride() : null;
+        String resumeAgentIdOverride = forkParams != null ? forkParams.agentIdOverride() : null;
         if (effectiveParentTuc != null) {
             // [P1-18] fork 工具授权: 把 skill allowedTools 包装进子代理 getAppState ·
             //   对齐 CC forkedAgent.ts:206-209 modifiedGetAppState = createGetAppStateWithAllowedTools(
@@ -2163,11 +2185,12 @@ public class SubagentExecutor {
         }
 
         ToolUseContext agentTuc = subagentCtx;
-        UUID agentId = agentTuc.agentId();
+        // [agentid-cc-align] ToolUseContext.agentId 已是 CC 单一 String 形态（a+16hex）。
+        String agentId = agentTuc.agentId();
         // [R3-WF-F IMP-SUB-12 返工] a+16hex 生产接线：ToolUseContext.agentId 为 packAgentId 可逆编码
         //   （S-12 桥），此处还原 CC 语义的 a+16hex（AgentTool.tsx:580 earlyAgentId / forkedAgent.ts:448
         //   createAgentId）。transcript/metadata/resume/analytics 键一律用 agentIdHex 输出。
-        String agentIdHex = agentId != null ? AgentContext.unpackAgentId(agentId) : null;
+        String agentIdHex = agentId;
         // [session-id-short] agentTuc.sessionId() 已 String（short）
         String sessionId = agentTuc.sessionId();
 
@@ -2665,6 +2688,9 @@ public class SubagentExecutor {
             summaryService, coordinatorMode, sdkAgentProgressSummariesEnabled,
             agentIdHex, sessionDir, sessionId.toString(),
             llmProviderFactory, effectiveProviderConfig(effectiveModel), effectiveModel,
+            // [agent-summary-providerType] 摘要旁路与主链同协议（生产 bean 由 @Autowired 注入；
+            //   测试直构未注入 → null，回落到改造前默认路由）。
+            this.modelConfigResolver,
             progressTracker, sdkEventQueue,
             // [S1-T7] 本子代理的归因上下文（Step 19.8 之前已构造 · 见上方上提块）。
             agentContext,
@@ -3019,6 +3045,13 @@ public class SubagentExecutor {
                 eviction);
         }
 
+        // [restart-rebuild] 终态落盘：写 meta 的 finished:true（合并保留其它键）。
+        //   WHY：重建退役表时若只靠 transcript 末行推断，末条是 tool/user 行会被误判 incomplete；
+        //   这里在子代理真正结束（completed/failed/aborted 三态都算「这一轮结束」）时留下显式终态，
+        //   重建侧优先读它，读不到才回落推断。复活（resume）时由 ResumeService 清 finished + 写 revivedAt。
+        if (sessionDir != null && agentIdHex != null && sessionId != null) {
+            AgentTranscript.markFinished(sessionDir, sessionId.toString(), agentIdHex);
+        }
         // [R-3] 原子代理边界 terminal API 事件已删除（对齐 CC：logging.ts 仅 3 个 per-LLM-call 事件
         //   query/error/success，:196/:304/:463，无子代理边界事件）；此处仅保留 Step 22 结果组装。
         return wasAborted
@@ -3116,7 +3149,7 @@ public class SubagentExecutor {
      * @param sessionId sub-agent 会话 ID (HookRegistry.clearSessionHooks 的 key)
      * @param agentId   sub-agent agent ID (frontmatter hooks 的 key)
      */
-    void cleanupSessionHooks(String sessionId, UUID agentId) {
+    void cleanupSessionHooks(String sessionId, String agentId) {
         if (hookRegistry == null) {
             return;
         }
@@ -3133,12 +3166,11 @@ public class SubagentExecutor {
         }
         if (agentId != null) {
             try {
-                // [R3-WF-F IMP-SUB-12 返工] frontmatter hooks 以 a+16hex 键注册（Step 13 agentIdHex），
-                //   cleanup 同键清理（S-12 桥还原）。
-                hookRegistry.clearSessionHooks(AgentContext.unpackAgentId(agentId));
+                // [agentid-cc-align] frontmatter hooks 与 a+16hex 键同源（Step 13 agentIdHex）。
+                hookRegistry.clearSessionHooks(agentId);
                 if (log.isDebugEnabled()) {
-                    log.debug("[SubagentExecutor] Step 21.2b: 已清理 frontmatter session hooks agent={} (a+16hex={})",
-                        agentId, AgentContext.unpackAgentId(agentId));
+                    log.debug("[SubagentExecutor] Step 21.2b: 已清理 frontmatter session hooks agent={}",
+                        agentId);
                 }
             } catch (Exception e) {
                 log.warn("[SubagentExecutor] Step 21.2b: clearSessionHooks(agentId) 失败: {}", e.getMessage());
@@ -3168,7 +3200,7 @@ public class SubagentExecutor {
      * @param state   子 agent 隔离 AgentState（{@code runSubagentQueryLoop} 内构造）
      * @param agentId 子 agent UUID
      */
-    void cleanSubagentInvokedSkills(AgentState state, UUID agentId) {
+    void cleanSubagentInvokedSkills(AgentState state, String agentId) {
         if (state == null || agentId == null) {
             return;
         }
@@ -3730,6 +3762,11 @@ public class SubagentExecutor {
             map.put("role", role);
             String content = m.content() != null ? m.content() : "";
             map.put("content", content);
+            // [transcript-timestamp] 保留原行的时间戳（resume 透传的是**历史**事件）——
+            //   丢了就只能由写入漏斗按「现在」补，会把旧消息排到本次新消息之后，破坏同批单调。
+            if (m.timestamp() != null && !m.timestamp().isBlank()) {
+                map.put("timestamp", m.timestamp());
+            }
             if ("assistant".equals(role) && m.toolCalls() != null && !m.toolCalls().isEmpty()) {
                 List<Map<String, Object>> toolCalls = new ArrayList<>();
                 for (AgentMessage.ToolCallInfo tc : m.toolCalls()) {
@@ -3916,10 +3953,10 @@ public class SubagentExecutor {
     }
 
     static AgentContext.SubagentContext buildSubagentAgentContext(
-            UUID agentId, String subagentName, boolean isBuiltIn, String invokingRequestId, String invocationKind) {
+            String agentId, String subagentName, boolean isBuiltIn, String invokingRequestId, String invocationKind) {
         // [R3-WF-F IMP-SUB-12 返工] SubagentContext.agentId 输出 a+16hex（对齐 CC agentContext.ts:34
         //   SubagentContext.agentId = createAgentId() 产物；Java 经 S-12 pack/unpack 桥还原）。
-        String agentIdHex = agentId != null ? AgentContext.unpackAgentId(agentId) : agentId != null ? agentId.toString() : null;
+        String agentIdHex = agentId;
         AgentContext.SubagentContext ctx = new AgentContext.SubagentContext(
             agentIdHex,           // agentId: CC :34 (a+16hex)
             null,                 // parentSessionId: main REPL subagent → undefined (CC :720)
@@ -4558,7 +4595,7 @@ public class SubagentExecutor {
      *                         {@code agentTuc.sessionId()}（父继承会话）透传；tool-exec 池线程无 MDC）
      * @return 已登记的前台 BackgroundTask；spawnPath 非 SYNC 或 runner 未注入 → null
      */
-    BackgroundTask registerSyncForeground(UUID agentId, String description, String prompt, String agentType,
+    BackgroundTask registerSyncForeground(String agentId, String description, String prompt, String agentType,
                                           String createSessionId) {
         if (summarySpawnPath != SummarySpawnPath.SYNC || backgroundTaskRunner == null) {
             return null;
@@ -4610,6 +4647,10 @@ public class SubagentExecutor {
             LlmProviderFactory llmProviderFactory,
             ProviderConfig providerConfig,
             String modelName,
+            // [agent-summary-providerType] 摘要旁路的协议/模型名解析来源（见
+            // SummarySummarizerImpl#setModelConfigResolver 的 WHY）。null = 测试直构，
+            // 摘要回落到改造前默认路由（不 NPE）。
+            com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver,
             AgentProgressTracker progressTracker,
             SdkEventQueue sdkEventQueue,
             com.nexusai.application.agent.subagent.AgentContext agentContext,
@@ -4652,6 +4693,9 @@ public class SubagentExecutor {
         //   使其内部经请求网关记账（未装配 → 不记账，行为等价改造前）。
         if (summarizer instanceof SummarySummarizerImpl impl) {
             impl.setUsageLedgerRegistry(usageLedgerRegistry);
+            // [agent-summary-providerType] 与主链同协议：类型 + SDK 模型名由共享解析器给出。
+            //   缺失时（测试直构）→ null，网关回落默认（行为等价改造前）。
+            impl.setModelConfigResolver(modelConfigResolver);
         }
         // [RF-2 ①] updateCallback 由 no-op → AgentProgress 通道 · 对齐 CC updateAgentSummary
         //   （LocalAgentTask.tsx:359-407）：写入 progress.summary + 按 sdk 门发射 task_progress。
@@ -4900,8 +4944,7 @@ public class SubagentExecutor {
             String sessionId) {
         com.nexusai.infra.llm.UsageAttribution parentAttribution = null;
         if (spawningTuc != null && spawningTuc.agentId() != null) {
-            parentAttribution = ledger.attributionOf(
-                AgentContext.unpackAgentId(spawningTuc.agentId()));
+            parentAttribution = ledger.attributionOf(spawningTuc.agentId());
         }
         if (parentAttribution == null && childAgentId != null) {
             parentAttribution = ledger.attributionOf(childAgentId);
@@ -4971,10 +5014,11 @@ public class SubagentExecutor {
             AgentProgressTracker progressTracker,
             boolean skillListingResume) {
 
-        UUID agentId = subagentCtx.agentId();
+        // [agentid-cc-align] 已是 CC 单一 String 形态（a+16hex）。
+        String agentId = subagentCtx.agentId();
         // [R3-WF-F IMP-SUB-12 返工] transcript/SubagentResult 键还原 a+16hex（S-12 桥），
         //   对齐 CC AgentTool.tsx:580 earlyAgentId = createAgentId() 格式。
-        String agentIdHex = agentId != null ? AgentContext.unpackAgentId(agentId) : null;
+        String agentIdHex = agentId;
         // [session-id-short] subagentCtx.sessionId() 已 String（short）
         String sessionId = subagentCtx.sessionId();
 
@@ -5542,22 +5586,23 @@ public class SubagentExecutor {
                 //   （agentToolUtils.ts:297-300 throw → catch :671），只有它落 failed。
                 //   有部分产出时保持既有语义（completed + 部分结果 + sync 错误恢复分类，CC :1223-1252）。
                 boolean zeroOutput = lastAssistantTextOrNull(state.rawMessages()) == null;
-                if (subagentCtx.abortController().isCancelled()) {
-                    return SubagentResult.aborted(fallbackText, fallbackToolUseCount, 0L,
-                        agentIdHex, fallbackTokens, fallbackUsage);
-                }
+                String errText = e.getMessage() != null && !e.getMessage().isBlank()
+                    ? e.getMessage() : e.toString();
                 if (zeroOutput) {
-                    String errText = e.getMessage() != null && !e.getMessage().isBlank()
-                        ? e.getMessage() : e.toString();
                     log.warn("[SubagentExecutor] [fix-toolcall-fault B] queryLoop 异常 ∧ 零 assistant 文本 "
                             + "→ status=failed 结论=异常原文: agentId={} err={} "
                             + "(CC :297-300 throw → :671 failAsyncAgent 等价位)",
                         agentId, errText);
-                    return SubagentResult.failed(errText, fallbackToolUseCount, 0L,
-                        agentIdHex, fallbackTokens, fallbackUsage);
+                } else if (isAsync && !subagentCtx.abortController().isCancelled()) {
+                    // [对齐 CC async] 异常穿出 + 有部分产出：CC async 生命周期 catch 非 AbortError
+                    //   → failAsyncAgent(status:'failed') + error:msg（agentToolUtils.ts:670-681）；
+                    //   sync 同场景才保留 completed + 部分结果（AgentTool.tsx:1223-1252）。
+                    log.warn("[SubagentExecutor] [CC async 对齐] queryLoop 异常 ∧ 部分产出 ∧ async "
+                            + "→ status=failed 结论=异常原文: agentId={} err={}", agentId, errText);
                 }
-                return SubagentResult.completed(fallbackText, fallbackToolUseCount, 0L,
-                    agentIdHex, fallbackTokens, fallbackUsage);
+                return classifyThrownAfterPartial(fallbackText, errText, fallbackToolUseCount,
+                    agentIdHex, fallbackTokens, fallbackUsage,
+                    subagentCtx.abortController().isCancelled(), zeroOutput, isAsync);
             }
     
             // [S4-1 流式化] 后置批量 transcript 录制 + 逐消息 emit 循环已删除 —
@@ -5895,6 +5940,28 @@ public class SubagentExecutor {
      *   <li>其余（非错误退出且无文本）→ status=completed + {@link #SUBAGENT_NO_FINAL_ANSWER_PLACEHOLDER}。</li>
      * </ol>
      */
+    /**
+     * queryLoop 异常穿出后的终态判定 · 对齐 CC 的 sync/async 分叉。
+     *
+     * <ul>
+     *   <li>cancelled → {@code aborted}（CC AbortError → killAsyncAgent / sync aborted）</li>
+     *   <li>零 assistant 文本 → {@code failed}（CC throw syncAgentError → 工具错误；async 同理）</li>
+     *   <li>有部分产出 + async → {@code failed}（CC async catch → failAsyncAgent，agentToolUtils.ts:670-681）</li>
+     *   <li>有部分产出 + sync → {@code completed}（CC AgentTool.tsx:1223-1252 保留部分进展）</li>
+     * </ul>
+     */
+    static SubagentResult classifyThrownAfterPartial(String fallbackText, String errText,
+            int toolUseCount, String agentIdHex, long tokens, AgentUsage usage,
+            boolean cancelled, boolean zeroOutput, boolean isAsync) {
+        if (cancelled) {
+            return SubagentResult.aborted(fallbackText, toolUseCount, 0L, agentIdHex, tokens, usage);
+        }
+        if (zeroOutput || isAsync) {
+            return SubagentResult.failed(errText, toolUseCount, 0L, agentIdHex, tokens, usage);
+        }
+        return SubagentResult.completed(fallbackText, toolUseCount, 0L, agentIdHex, tokens, usage);
+    }
+
     static FinalConclusion resolveFinalConclusion(boolean aborted,
                                                   List<ChatMessageDto> summarySource,
                                                   AgentState finalState) {
@@ -6536,6 +6603,10 @@ public class SubagentExecutor {
 
     /**
      * 记录单条 tool result transcript（per-message 录制）
+     *
+     * <p>[transcript-timestamp] 时间戳取**本方法执行时刻**（工具结果产生/落盘时刻），与其它行同格式
+     * （{@code OffsetDateTime.toString()}）。WHY：本方法直接构造 raw map，不经
+     * {@code chatMessageToMap} 的 createdAt 通道；此前不写 timestamp ⇒ tool 行成为无时序叶子。
      */
     private void recordToolResultTranscript(Path sessionDir, String sessionId, String agentId,
                                             ToolResult tr, String toolUseId, boolean isError) {
@@ -6544,6 +6615,7 @@ public class SubagentExecutor {
         trMap.put("toolCallId", toolUseId);
         trMap.put("content", tr.data() instanceof String s ? s : String.valueOf(tr.data()));
         trMap.put("isError", isError);
+        trMap.put("timestamp", OffsetDateTime.now().toString());
         try {
             AgentTranscript.recordSidechainTranscript(sessionDir, sessionId, agentId, List.of(trMap));
         } catch (Exception e) {
@@ -6677,8 +6749,8 @@ public class SubagentExecutor {
             return;
         }
         try {
-            UUID agentUuid = safeParseUuid(agentId);
-            int killed = backgroundTaskRunner.killShellTasksForAgent(agentUuid);
+            // [agentid-cc-align] 双方都是 CC 单一 String 形态，无需再转 UUID。
+            int killed = backgroundTaskRunner.killShellTasksForAgent(agentId);
             log.info("[SubagentExecutor] killShellTasksForAgent: agent {} 终止 {} 个后台 shell 任务",
                 agentId, killed);
         } catch (Exception e) {
@@ -6704,8 +6776,7 @@ public class SubagentExecutor {
             return;
         }
         try {
-            UUID agentUuid = safeParseUuid(agentId);
-            int killed = backgroundTaskRunner.killMonitorMcpTasksForAgent(agentUuid);
+            int killed = backgroundTaskRunner.killMonitorMcpTasksForAgent(agentId);
             log.info("[SubagentExecutor] killMonitorMcpTasksForAgent: agent {} 终止 {} 个 monitor 任务",
                 agentId, killed);
         } catch (Exception e) {
@@ -7248,6 +7319,18 @@ public class SubagentExecutor {
      * tool 为 null / mapper 返回 null / 块 content 非字符串时回退默认渲染器
      * （与 {@link LlmAgentLoop#toolResultMessage} 同一回退契约）。
      *
+     * <p><b>[C6 错误通道 · CCJ-ERR-016]</b> 与主循环 {@code LlmAgentLoop.toolResultMessage} 收敛为
+     * <b>同一双路径契约</b>：成功 → per-tool mapper；失败（{@code isError} 或 data 为
+     * {@link com.nexusai.application.agent.tool.ToolError}）→ 直构错误块且<b>不调 mapper</b>。
+     * WHY：CC 的错误块只在错误点直构（toolExecution.ts:469-489/:616-680/:717-732/:1033），
+     * mapper 仅在 call() 成功返回后调用（:1288-1292）；子代理若仍无条件走 mapper，Edit/Write 等
+     * 不看 isError 的 mapper 会把失败渲染成成功文案（同主循环的假成功）。
+     *
+     * <p>3 参重载同样按<b>载荷结构</b>推导 isError（{@link ToolResult#isErrorData}），不再硬编码 false。
+     *
+     * <p><b>调用方</b>：本类方法无生产调用方（主/子路径均经 {@code LlmAgentLoop.toolResultMessage}）；
+     * 保留供同包测试与后续接入，故与主循环保持逐条同构。
+     *
      * @param sessionId 会话 ID
      * @param result    工具执行结果（data 为 raw content + structuredOutput 呈现元数据）
      * @param tool      产生该结果的 Tool 实例（CC original: toolExecution.ts:1292 的 tool；
@@ -7255,23 +7338,57 @@ public class SubagentExecutor {
      */
     ChatMessageDto toolResultMessage(String sessionId, ToolResult result, Tool tool) {
         // [IMP-C2] ToolResult 4 字段契约：toolUseId/isError 由 mapper 参数推导（组 2-1 拍板）。
-        //   本方法无生产调用方（仅定义），toolUseId/isError 传 null/false（调用方接入时透传）。
-        return toolResultMessage(sessionId, result, tool, null, false);
+        //   本方法无生产调用方（仅定义），toolUseId 传 null（调用方接入时透传）；
+        //   [C6 错误通道] isError 改由**载荷结构**推导 —— 3 参重载不再硬编码 false，
+        //   否则 ToolError 载荷会被当成成功（与主循环同款的假成功）。
+        return toolResultMessage(sessionId, result, tool, null,
+            result != null && ToolResult.isErrorData(result.data()));
     }
 
     ChatMessageDto toolResultMessage(String sessionId, ToolResult result, Tool tool,
                                      String toolUseId, boolean isError) {
-        // [WF2-R4] per-tool mapper 构造 tool_result 块（对齐 CC toolExecution.ts:1292）
-        ToolResultBlockParam block = (tool != null)
-            ? tool.mapToToolResultBlockParam(result, toolUseId, isError) : null;
-        String payload = (block != null && block.content() instanceof String s)
-            ? s
-            : ToolResult.renderToolResultPayloadText(result);
+        // [WF2-R4] 成功路径走 per-tool mapper（对齐 CC toolExecution.ts:1292）；
+        //   [C6 错误通道 · CCJ-ERR-014/016] 失败路径**不调 mapper**、直构错误块 ——
+        //   与主循环 LlmAgentLoop.toolResultMessage 同一双路径契约。WHY：CC 只在 tool.call()
+        //   正常返回后调 mapper（toolExecution.ts:1288-1292），错误块在错误点直构；
+        //   本仓若把失败交给 mapper，Edit/Write 等不看 isError 的 mapper 会渲染成
+        //   "The file … has been updated successfully."（实测假成功）。
+        boolean errorFlag = isError
+            || (result != null && ToolResult.isErrorData(result.data()));
+        ToolResultBlockParam block;
+        String errorText = null;
+        if (errorFlag) {
+            com.nexusai.application.agent.tool.ToolError err =
+                result != null && result.data() instanceof com.nexusai.application.agent.tool.ToolError te
+                    ? te
+                    : new com.nexusai.application.agent.tool.ToolError(
+                        result == null ? "unknown error" : ToolResult.renderToolResultPayloadText(result),
+                        com.nexusai.application.agent.tool.ToolErrorKind.CALL_THREW);
+            errorText = err.kind().wrapsWithToolUseErrorShell()
+                ? "<tool_use_error>" + err.message() + "</tool_use_error>"
+                : err.message();
+            // toolUseId 可为 null（3 参重载：本类方法无生产调用方，调用方接入时透传）——
+            //   ToolResultBlockParam 契约要求非空 id，此时仅用 errorText 作为载荷，不构造块。
+            block = (toolUseId != null && !toolUseId.isBlank())
+                ? new ToolResultBlockParam(toolUseId, "tool_result", errorText, true)
+                : null;
+        } else {
+            // [WF2-R4] per-tool mapper 构造 tool_result 块（对齐 CC toolExecution.ts:1292）
+            block = (tool != null)
+                ? tool.mapToToolResultBlockParam(result, toolUseId, false) : null;
+        }
+        String payload = errorText != null
+            ? errorText
+            : (block != null && block.content() instanceof String s)
+                ? s
+                : ToolResult.renderToolResultPayloadText(result);
         if (log.isDebugEnabled()) {
-            log.debug("[SubagentExecutor] toolResultMessage 载荷来源: toolUseId={} tool={} mapper={} payloadLen={}（CC toolExecution.ts:1292 主/子共享 mapper）",
+            log.debug("[SubagentExecutor] toolResultMessage 载荷来源: toolUseId={} tool={} 路径={} isError={} payloadLen={}"
+                    + "（CC toolExecution.ts:1288-1292 成功走 mapper / 错误直构）",
                 toolUseId,
                 tool != null ? tool.name() : "null",
-                block != null ? "命中" : "回退默认渲染器",
+                errorFlag ? "错误直构" : (block != null ? "mapper命中" : "回退默认渲染器"),
+                errorFlag,
                 payload.length());
         }
         return new ChatMessageDto(
@@ -7291,7 +7408,7 @@ public class SubagentExecutor {
                 java.util.List.of(),           // R32-b9 imagePasteIds
                 null,                          // structuredOutput
                 false,                         // isMeta
-                isError                        // isError · CC tool_result.is_error (messages.ts:4754)
+                errorFlag                      // isError · 执行层真值（含 ToolError 载荷结构判定）
         );
     }
 
@@ -7355,6 +7472,14 @@ public class SubagentExecutor {
         if (msg.createdAt() != null) {
             // ISO-8601 带偏移（OffsetDateTime.toString）→ 读侧 OffsetDateTime/Instant 均可解析。
             map.put("timestamp", msg.createdAt().toString());
+        } else {
+            // [transcript-timestamp] 缺 createdAt 也必须落时间戳（CC 每行都有 timestamp）。
+            //   WHY：LlmAgentLoop.toolResultMessage 构造的 tool 消息 createdAt=null（工具结果行），
+            //   旧实现「createdAt != null 才落键」⇒ 工具行无 timestamp ⇒ 真实会话里出现
+            //   多个 timestamp=null 的叶子，findLatestLeaf 只能靠文件序兜底（见 AgentTranscript）。
+            //   这里取**落盘时刻** = 该行事件的发生时刻，与既有行同格式（OffsetDateTime.toString）；
+            //   有 createdAt 的消息一律原样使用，⛔ 不统一成同一时间。
+            map.put("timestamp", OffsetDateTime.now().toString());
         }
         if (msg.compactMetadata() != null) {
             map.put("compactMetadata", msg.compactMetadata());
@@ -7386,6 +7511,19 @@ public class SubagentExecutor {
             if (agentSummary instanceof String s && !s.isBlank()) {
                 map.put("summary", s);
             }
+        }
+        // [content-blocks] assistant 内容块顺序 · 对齐 CC「一块一行 + apiBlockIndex」。
+        //   与主库 messages.content_blocks（V331）同构（同一 ContentBlockDto）；
+        //   provider 已按 content_block_start 下标采集则用真实到达顺序，否则规范回退。
+        //   null = 非 assistant / 无块 → 不落键（读侧缺省 = 旧格式，非双轨）。
+        java.util.List<com.nexusai.model.session.dto.ContentBlockDto> blocks =
+            com.nexusai.model.session.dto.MessageContentBlocks.resolve(msg);
+        if (blocks != null && !blocks.isEmpty()) {
+            java.util.List<Map<String, Object>> blockMaps = new ArrayList<>(blocks.size());
+            for (com.nexusai.model.session.dto.ContentBlockDto b : blocks) {
+                blockMaps.add(com.nexusai.model.session.dto.MessageContentBlocks.toMap(b));
+            }
+            map.put("blocks", blockMaps);
         }
         return map;
     }

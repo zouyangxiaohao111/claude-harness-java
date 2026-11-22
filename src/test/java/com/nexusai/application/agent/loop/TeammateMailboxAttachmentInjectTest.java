@@ -18,7 +18,6 @@ import java.util.ArrayList;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -60,7 +59,7 @@ class TeammateMailboxAttachmentInjectTest {
     /** 带 appState 桥的 ToolUseContext · 对齐 CC ToolUseContext.getAppState/setAppState。 */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), "",
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "",
                 PermissionMode.DEFAULT,
                 List.of(), "", AbortController.NOOP,
                 List.of(), null, PermissionMode.DEFAULT, Map.of(),

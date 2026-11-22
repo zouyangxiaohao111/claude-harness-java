@@ -209,7 +209,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         LlmAgentLoop loop = buildLoop(messageService, stopProvider("subagent response"));
 
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentUuid = UUID.randomUUID();
+        String agentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // WHEN: agentId 非 null（真子代理路径，无后台任务标志）
         AgentState state = loop.run(RunRequest.session("subagent query", sessionUuid, agentUuid,
             ProviderConfig.empty(), "test-model", null, null));
@@ -244,7 +244,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         loop.setTaskStreamContext(null, "task-1", SESSION_KEY);
 
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentUuid = UUID.randomUUID();
+        String agentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // WHEN: agentId 非 null（后台化主会话任务，MainSessionBackgroundService:359 run 路径）
         AgentState state = loop.run(RunRequest.session("bg query", sessionUuid, agentUuid,
             ProviderConfig.empty(), "test-model", null, null));
@@ -287,7 +287,7 @@ class LlmAgentLoopDbHistoryInjectionTest {
         com.nexusai.application.agent.loop.QueryParams params =
             com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
 

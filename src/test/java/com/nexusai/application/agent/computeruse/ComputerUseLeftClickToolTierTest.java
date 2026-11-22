@@ -177,7 +177,7 @@ class ComputerUseLeftClickToolTierTest {
                 ComputerUseGrantFlags.DEFAULT).toJson());
 
         var result = tool("chrome").execute(new ToolUseBlock("c1", "mcp__computer-use__left_click", input(10, 10)),
-                ToolUseContext.of(UUID.randomUUID(), SESSION));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION));
 
         assertThat(((ToolResult<?>) result).data().toString()).contains("tier");
         assertThat(mouse.clicks).isEmpty();

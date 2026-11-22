@@ -172,7 +172,7 @@ class SubagentToolTeammateSpawnBranchTest {
     /** [S1-T6] 构造带 teammate 身份的 ToolUseContext（原 ThreadLocal 注入手法已随载体删除）·
      *  身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。 */
     private static ToolUseContext inProcessTeammate() {
-        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-subagent-tool",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-subagent-tool",
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
             .withTeammateIdentity(new TeammateIdentity(
                 "researcher", "peer", "research-team", null, false, null));

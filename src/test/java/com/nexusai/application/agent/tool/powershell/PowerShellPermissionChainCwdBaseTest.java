@@ -96,7 +96,7 @@ class PowerShellPermissionChainCwdBaseTest {
 
     /** ctx 显式带会话态 cwd（正常路径）。 */
     private static ToolUseContext ctxWithCwd(Path cwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", cwd);
     }

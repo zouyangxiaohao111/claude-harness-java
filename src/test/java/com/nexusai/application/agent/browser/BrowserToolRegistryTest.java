@@ -159,7 +159,7 @@ class BrowserToolRegistryTest {
 
     /** 显式会话载体（sessionId 必填）· 对齐 StreamingToolExecutor 经 execute(call, ctx) 的派发形态。 */
     private static ToolUseContext toolUseContext(String sessionId) {
-        return new ToolUseContext(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 

@@ -18,7 +18,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -129,7 +128,7 @@ class LlmAgentLoopCoordinatorPromptScopeTest {
         //   QueryEngine → buildEffectiveSystemPrompt（CC 的 coordinator 门只看 feature/env +
         //   mainThreadAgentDefinition，**不含** agentId）⇒ 后台化主会话照常注入 coordinator 提示。
         //   变异点：判据改用 ToolUseContext.agentId()（非 null 即当子代理）→ 本用例红。
-        UUID taskAgentId = UUID.randomUUID();
+        String taskAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = new AgentState("BG-MAIN-CUSTOM-PROMPT", "sess-bg-main", taskAgentId);
         ToolUseContext bgTuc = ToolUseContext.of(taskAgentId, "sess-bg-main", PermissionMode.DEFAULT, List.of());
 
@@ -147,7 +146,7 @@ class LlmAgentLoopCoordinatorPromptScopeTest {
     @Test
     @DisplayName("子代理（agentId 非 null，SubagentExecutor 路径）→ 不得拿到 coordinator 提示，自己的 agent 提示必须保留")
     void subagent_doesNotGetCoordinatorPrompt() {
-        UUID subAgentId = UUID.randomUUID();
+        String subAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = new AgentState("WORKER-AGENT-PROMPT", "sess-sub", subAgentId);
         ToolUseContext subTuc = ToolUseContext.of(subAgentId, "sess-sub", PermissionMode.DEFAULT, List.of());
 
@@ -164,7 +163,7 @@ class LlmAgentLoopCoordinatorPromptScopeTest {
     @Test
     @DisplayName("fork 子代理（QuerySource.FORK，agentId 非 null）→ 同子代理语义，不得拿到 coordinator 提示")
     void forkSubagent_doesNotGetCoordinatorPrompt() {
-        UUID forkAgentId = UUID.randomUUID();
+        String forkAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = new AgentState("FORK-AGENT-PROMPT", "sess-fork", forkAgentId);
         ToolUseContext forkTuc = ToolUseContext.of(forkAgentId, "sess-fork", PermissionMode.DEFAULT, List.of());
 
@@ -179,7 +178,7 @@ class LlmAgentLoopCoordinatorPromptScopeTest {
     @Test
     @DisplayName("hook agent（ExecAgentHook 路径，agentId 非 null）→ 不得拿到 coordinator 提示（CC 用硬编码校验提示）")
     void hookAgent_doesNotGetCoordinatorPrompt() {
-        UUID hookAgentId = UUID.randomUUID();
+        String hookAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = new AgentState("HOOK-AGENT-PROMPT", "sess-hook", hookAgentId);
         ToolUseContext hookTuc = ToolUseContext.of(hookAgentId, "sess-hook", PermissionMode.DEFAULT, List.of());
 

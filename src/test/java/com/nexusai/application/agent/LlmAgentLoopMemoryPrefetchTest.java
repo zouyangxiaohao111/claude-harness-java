@@ -174,7 +174,8 @@ class LlmAgentLoopMemoryPrefetchTest {
             ? new RunRequest("configure the system now", ProviderConfig.empty(), "test-model",
                 QuerySource.SUBAGENT, null, null, null, null, null, null, null, null, null, null, false, null, null, null, null, null,
                 com.nexusai.application.agent.permission.PermissionModeSource.NOT_APPLICABLE)
-            : RunRequest.session("configure the system now", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID(),
+            : RunRequest.session("configure the system now", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                 ProviderConfig.empty(), "test-model", null, null);
         final boolean[] firstRound = {true};
         doAnswer(inv -> {

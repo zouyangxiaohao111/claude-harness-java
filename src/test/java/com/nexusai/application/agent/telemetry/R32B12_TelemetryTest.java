@@ -592,7 +592,7 @@ class R32B12_TelemetryTest {
     @DisplayName("P1-6: ToolUseContext 保留 15 参数构造器且 toolDecisions 默认空")
     void toolUseContextFifteenArgConstructorCompatible() {
         var ctx = new com.nexusai.application.agent.tool.ToolUseContext(
-            java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(), "", null, List.of(), null,
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,

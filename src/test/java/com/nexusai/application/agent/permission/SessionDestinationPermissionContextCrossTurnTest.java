@@ -14,7 +14,6 @@ import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import java.util.function.Function;
@@ -64,7 +63,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("[批 A2] destination=SESSION 授权跨轮存活")
 class SessionDestinationPermissionContextCrossTurnTest {
 
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000a2");
+    private static final String AGENT_ID = "a0000000000000a2";
     private static final String SESSION_A = "sess-aaaaaaa2";
     private static final String SESSION_B = "sess-bbbbbbb2";
 

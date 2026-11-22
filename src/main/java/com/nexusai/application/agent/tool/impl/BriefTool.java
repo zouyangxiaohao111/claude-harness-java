@@ -14,6 +14,8 @@ import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolResultBlockParam;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.domain.im_channel.ImSendService;
+import com.nexusai.domain.im_channel.send.ImSendResult;
 import com.nexusai.repository.provider.entity.ProviderRecord;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
 import org.slf4j.Logger;
@@ -165,6 +167,129 @@ public class BriefTool implements Tool {
      */
     @Autowired(required = false)
     private AnalyticsTracker analyticsTracker;
+
+    /**
+     * [NXS-UC-CHN-020] IM 投递服务。
+     *
+     * <p>{@code required=false}：单测与孤立运行没有 Spring 上下文，此时投递直接跳过
+     * （只打日志），不影响 SendUserMessage 本身的行为。
+     */
+    @Autowired(required = false)
+    private ImSendService sendService;
+
+    /**
+     * 会话目录（只用来把 chatId 显示成人名）。
+     *
+     * <p>{@code required=false}：本类被大量单测直接 new 出来 ⇒ 强制依赖会把它们全拖下水。
+     * 缺它时投递照常，只是回执里显示 chatId 而不是名字。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.domain.im_channel.ImChatService imChatService;
+
+    /** [测试注入] 会话目录。 */
+    public void setImChatService(com.nexusai.domain.im_channel.ImChatService s) {
+        this.imChatService = s;
+    }
+
+    /** [测试注入] IM 投递服务。 */
+    public void setImSendService(ImSendService sendService) {
+        this.sendService = sendService;
+    }
+
+    /**
+     * 工具入参的附件路径 → IM 投递用的附件对象。
+     *
+     * <p>为什么在这里转而不是在 Service：路径的「相对 cwd」语义只有工具层知道
+     * （模型给的是 cwd 相对路径）。Service 只接收**绝对路径**，保持与 cwd 无关。
+     *
+     * <p>不在这里校验存在性：{@code validateInput} 已校验过；且 TOCTOU 下文件可能在
+     * 校验后被删 —— 那种情况由上传器给出明确错误，比在这里再 stat 一次更准。
+     */
+    private static List<com.nexusai.domain.im_channel.send.ImSendAttachment> toImAttachments(
+            List<String> rawPaths, ToolUseContext ctx) {
+        if (rawPaths == null || rawPaths.isEmpty()) {
+            return List.of();
+        }
+        Path base;
+        try {
+            base = Path.of(cwd(ctx));
+        } catch (RuntimeException e) {
+            base = Path.of(System.getProperty("user.dir", "."));
+        }
+        List<com.nexusai.domain.im_channel.send.ImSendAttachment> out = new ArrayList<>(rawPaths.size());
+        for (String raw : rawPaths) {
+            if (raw == null || raw.isBlank()) {
+                continue;
+            }
+            try {
+                Path p = Path.of(raw.trim());
+                Path abs = p.isAbsolute() ? p : base.resolve(p).normalize();
+                out.add(com.nexusai.domain.im_channel.send.ImSendAttachment.of(abs));
+            } catch (RuntimeException e) {
+                // 非法路径（如 Windows 下带冒号）—— 让上传阶段报错，而不是吞掉整条附件列表
+                log.warn("[SendUserMessage] 附件路径无法解析，跳过: raw={} err={}", raw, e.toString());
+            }
+        }
+        return out;
+    }
+
+    /**
+     * 投递结果 → 给前端用的扁平载荷（不含任何凭证）。
+     *
+     * <p>为什么不把 {@code ImSendResult} 直接序列化：它是 domain 记录，
+     * 将来加字段会无意泄漏到 API 契约；这里显式挑字段，是最小暴露面。
+     */
+    private List<Map<String, Object>> deliveryPayload(List<ImSendResult> results, List<String> chatIds) {
+        if (results == null || results.isEmpty()) {
+            return List.of();
+        }
+        List<Map<String, Object>> out = new ArrayList<>(results.size());
+        for (int i = 0; i < results.size(); i++) {
+            ImSendResult r = results.get(i);
+            if (r == null) {
+                continue;
+            }
+            Map<String, Object> m = new LinkedHashMap<>();
+            // 「投递给谁」必须带上：前端要在对话里显示「✓ 已发送到 飞书 · 张三」，
+            // 只给 status 的话用户看到「已发送」却不知道去了哪 —— 等于没说。
+            // results 与 chatIds 同序（ImSendService 按输入顺序逐个目标返回）。
+            if (chatIds != null && i < chatIds.size()) {
+                String chatId = chatIds.get(i);
+                m.put("chatId", chatId);
+                m.put("chatName", chatDisplayName(chatId));
+            }
+            m.put("status", r.status().name());
+            // 实际身份：请求 USER 但实例无票会降级 BOT，前端要能标出来
+            if (r.identity() != null) m.put("identity", r.identity().name());
+            if (r.messageId() != null) m.put("messageId", r.messageId());
+            if (r.errorCode() != null) m.put("errorCode", r.errorCode());
+            if (r.reason() != null) m.put("reason", r.reason());
+            if (r.attachmentErrors() != null && !r.attachmentErrors().isEmpty()) {
+                m.put("attachmentErrors", r.attachmentErrors());
+            }
+            out.add(m);
+        }
+        return out;
+    }
+
+    /**
+     * 会话显示名（找不到就回落 id）。
+     *
+     * <p>为什么不在这里抛：投递已经成功了，名字只是展示细节 ——
+     * 因为查库失败把「已发送」变成「发送异常」是更糟的错误。
+     */
+    private String chatDisplayName(String chatId) {
+        if (imChatService == null || chatId == null) {
+            return chatId;
+        }
+        try {
+            return imChatService.findById(chatId)
+                    .map(c -> c.peerName() != null && !c.peerName().isBlank() ? c.peerName() : c.peerId())
+                    .orElse(chatId);
+        } catch (RuntimeException e) {
+            return chatId;
+        }
+    }
 
     /** [IMP-T G15] 遥测通道注入（非 Spring 场景 / 测试）。 */
     public void setAnalyticsTracker(AnalyticsTracker analyticsTracker) {
@@ -393,6 +518,65 @@ public class BriefTool implements Tool {
         if (log.isInfoEnabled()) {
             log.info("[SendUserMessage] 消息投递完成: messageLen={} attachments={} status={} proactive={} sentAt={}",
                 message.length(), rawPaths == null ? 0 : rawPaths.size(), status, proactive, sentAt);
+        }
+        // [V306] 定时任务通知：agent 主动发起（proactive）且本轮有通知目标 → 投递给这些聊天。
+        // [NXS-UC-CHN-020] 已接真实投递：notifyChats → ImSendService（策略+模板+工厂分发到各平台）。
+        //
+        // 🔴 投递失败**绝不**让本工具变 isError：
+        //    SendUserMessage 的语义是「消息给用户看」，UI 那份永远成功；IM 只是**附加通道**。
+        //    若投递失败就报错，模型会认为整条消息没发出而重发 ⇒ 用户收到重复消息。
+        //    失败原因写进 data.delivery 与日志，由前端按需展示。
+        // [V330] 投递目标：本轮显式 notifyChats（IM 入站 / 定时任务）优先；
+        //   否则若本会话处于无人值守，用本会话已绑定的聊天兜底 —— 否则无人值守会话的回
+        //   永远只写 UI，「验证消息真正送达渠道」无法成立。
+        //   ⛔ 交互式普通会话（未开无人值守）不改变行为。
+        boolean unattendedSession = ctx != null
+                && com.nexusai.application.agent.config.ImUnattendedConfig.isUnattended(ctx.sessionId());
+        List<String> chatIds = List.of();
+        if (ctx != null && ctx.notifyChats() != null && !ctx.notifyChats().isBlank()) {
+            chatIds = ImSendService.parseChatIds(ctx.notifyChats());
+            if (chatIds.isEmpty()) {
+                log.warn("[SendUserMessage] [V306] notifyChats 解析为空，跳过投递: raw={}",
+                        ctx.notifyChats());
+            }
+        } else if (unattendedSession && imChatService != null) {
+            chatIds = imChatService.listBySession(ctx.sessionId()).stream()
+                    .map(com.nexusai.model.im_channel.ImChatEntry::id)
+                    .toList();
+            if (log.isDebugEnabled()) {
+                log.debug("[SendUserMessage] [V330] 无人值守投递兜底: session={} 绑定聊天={}",
+                        ctx.sessionId(), chatIds);
+            }
+        }
+        if (!chatIds.isEmpty()) {
+            if (sendService == null) {
+                // 未注入（测试 / 孤立运行）—— 只记录，不影响主链
+                log.info("[SendUserMessage] [V306] ImSendService 未注入，跳过投递: chats={}",
+                        chatIds);
+            } else {
+                // 附件同时走 IM 通道：同一份 rawPaths，UI 侧按 {path,size,isImage} 给本机客户端，
+                // IM 侧按「上传到各平台」处理（平台各自的 key 不通用 ⇒ Service 会对每个目标分别上传）。
+                List<com.nexusai.domain.im_channel.send.ImSendAttachment> imAttachments =
+                        toImAttachments(rawPaths, ctx);
+                List<ImSendResult> results = sendService.send(chatIds, message, imAttachments);
+                data.put("delivery", deliveryPayload(results, chatIds));
+                long sent = results.stream().filter(ImSendResult::ok).count();
+                long mediaFailed = results.stream()
+                        .filter(r -> r.attachmentErrors() != null && !r.attachmentErrors().isEmpty())
+                        .count();
+                if (log.isInfoEnabled()) {
+                    log.info("[SendUserMessage] [V306] 投递完成: 目标={} 成功={} 跳过={} 失败={} 附件失败目标数={}",
+                            results.size(), sent,
+                            results.stream().filter(r -> r.status() == ImSendResult.Status.SKIPPED).count(),
+                            results.stream().filter(r -> r.status() == ImSendResult.Status.FAILED).count(),
+                            mediaFailed);
+                }
+            }
+        } else if (unattendedSession) {
+            // 无人值守却没有可用目标：不静默成功，把原因写进回执（前端/验收可见）。
+            data.put("delivery", Map.of("status", "NO_TARGET", "reason", "no bound chat"));
+            log.warn("[SendUserMessage] [V330] 无人值守会话无可用投递目标: session={}",
+                    ctx == null ? null : ctx.sessionId());
         }
         return ToolResult.success(call.id(), data);
     }

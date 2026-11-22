@@ -125,7 +125,7 @@ class MainSessionTaskStopTest {
      */
     private String registerMainSessionViaFramework(Ctx ctx) {
         String taskId = MainSessionTaskState.generateMainSessionId();
-        UUID agentUuid = UUID.randomUUID();
+        String agentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         long now = System.currentTimeMillis();
         String outputFile = "unused.output";
         BackgroundTask projection = new BackgroundTask(
@@ -201,9 +201,9 @@ class MainSessionTaskStopTest {
         Ctx ctx = realCtx(true);
 
         // ① 普通 local_agent（spawn 路径：进 runner 本地 tasks + 统一 store，但**不在** mainSessionStore）
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         ctx.runner().registerAsyncAgent(agentId, "普通子代理", "prompt", "general-purpose", null, "sess-trk");
-        String normalTaskId = agentId.toString();
+        String normalTaskId = agentId;
 
         // ② 主会话后台化任务（只在统一 store + mainSessionStore）
         String mainTaskId = registerMainSession(ctx);
@@ -248,14 +248,14 @@ class MainSessionTaskStopTest {
         //   与 MainSessionBackgroundService 内部 taskAgentId(taskId) **同源**，测试不重算私有哈希。
         Ctx ctx = realCtx(true);
         String taskId = registerMainSession(ctx);
-        UUID agentUuid = ctx.framework().getTask(taskId).orElseThrow().agentId();
+        String agentUuid = ctx.framework().getTask(taskId).orElseThrow().agentId();
         assertThat(agentUuid).as("注册必须把 agentUuid 写进投影 agentId（真中断靠它查 registry）").isNotNull();
 
         // 真 AbortController + 真 registry：模拟后台查询已 attach 在飞状态
         AgentState inFlight = new AgentState("sys", "sess-x", agentUuid);
         AbortController abortController = new AbortController();
         inFlight.attachAbortController(abortController);
-        ctx.registry().register(agentUuid, inFlight);
+        ctx.registry().registerAgent(agentUuid, inFlight);
         assertThat(abortController.isCancelled()).as("前置：kill 前未取消").isFalse();
 
         boolean killed = ctx.service().killMainSessionTask(taskId);

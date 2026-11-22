@@ -73,6 +73,94 @@ function pruneToTurns(msgs: ChatMessageDto[], keepTurns: number): { kept: ChatMe
   return { kept, droppedTurns: questions.size }
 }
 
+/** structuredOutput 的「空」判据：仅 null/undefined/空串算缺；对象/数组/数字/布尔均算有值。 */
+function isBlankSoValue(v: unknown): boolean {
+  return v === undefined || v === null || v === ''
+}
+
+/** 普通对象判据（排除 null / 数组），用于 peer_source 的一层合并。 */
+function isPlainSoObject(v: unknown): v is Record<string, unknown> {
+  return v != null && typeof v === 'object' && !Array.isArray(v)
+}
+
+/**
+ * [peer-message] 同 id 服务端行到达时的**元数据补全**（`message.insert` 的幂等收敛）。
+ *
+ * <p><b>WHY 不能继续「同 id 直接跳过」</b>：跨会话通知行的第一份数据可能是**占位行**
+ * （排队投影/本地乐观构造：author='user'、subtype=null、没有 structuredOutput），
+ * 真正的完整行随后同样以 `message.insert` 到达。旧逻辑看到 id 已存在就整条丢弃 ⇒
+ * 通知行永远缺来源与摘要、渲染成用户气泡或主代理通知（用户看到错误归属）。
+ *
+ * <p><b>补全的铁律</b>（方案 §5 D 行）：
+ * <ol>
+ *   <li>只补**旧行缺失/为空**的字段；非空值一律保留 —— 绝不用旧数据/空数据覆盖完整行；</li>
+ *   <li>不换位置、不换会话桶、不改变行数（= 幂等，重复推送不产生第二条）；</li>
+ *   <li>structuredOutput 按 key 浅合并（旧值优先），只新增缺失键。</li>
+ * </ol>
+ *
+ * @returns 有新信息时返回**新对象**（调用方才替换数组元素）；无变化返回原引用（零重渲）
+ */
+function mergeServerRowMetadata(prev: ChatMessageDto, incoming: ChatMessageDto): ChatMessageDto {
+  const patch: Partial<ChatMessageDto> = {}
+  // 身份类元数据：旧值为空才补（空串与 null 同义）。
+  // ⚠️ 本地乐观/排队投影会把 author 写死成 'user'（appendMetaUser）—— 那是**占位身份**，
+  //   不是真实来源；peers 完整行带真实 session id 时必须能把它换掉，否则通知永远是「用户/主代理」。
+  //   反向永远不做：真实来源不能被随后的 'user'/空值覆盖。
+  const prevAuthorMissing = prev.author == null || prev.author === '' || prev.author === 'user'
+  if (prevAuthorMissing && incoming.author != null && incoming.author !== '' && incoming.author !== 'user') {
+    patch.author = incoming.author
+  }
+  if (prev.subtype == null && incoming.subtype != null) patch.subtype = incoming.subtype
+  if (prev.queuedOrigin == null && incoming.queuedOrigin != null) patch.queuedOrigin = incoming.queuedOrigin
+  if ((prev.summary == null || prev.summary === '') && incoming.summary != null && incoming.summary !== '') {
+    patch.summary = incoming.summary
+  }
+  // isMeta 只有「旧行不是 meta、新行是 meta」才可提升；反向（完整行被空行降级）永远不做
+  if (prev.isMeta !== true && incoming.isMeta === true) patch.isMeta = true
+  // 正文同理：占位行的空正文可由完整行补；已有正文绝不覆盖
+  if ((prev.content == null || prev.content === '') && incoming.content != null && incoming.content !== '') {
+    patch.content = incoming.content
+  }
+  // 结构化输出：旧无 → 整体取新；旧有 → 顶层旧值优先，但 peer_source / agent_summary 做
+  //   「非空优先」补齐（null/空串可被真实值填充，已有非空值不被覆盖）；peer_source 只做一层对象合并。
+  const prevSo = prev.structuredOutput
+  const incomingSo = incoming.structuredOutput
+  if (isPlainSoObject(incomingSo)) {
+    if (!isPlainSoObject(prevSo) || Object.keys(prevSo).length === 0) {
+      patch.structuredOutput = incomingSo
+    } else {
+      const incSo = incomingSo
+      const mergedSo: Record<string, unknown> = { ...incSo, ...prevSo }
+      let soChanged = false
+      // ① 顶层两键：旧为空（null/undefined/''）才用新值填
+      for (const key of ['peer_source', 'agent_summary'] as const) {
+        if (isBlankSoValue(prevSo[key]) && !isBlankSoValue(incSo[key])) {
+          mergedSo[key] = incSo[key]
+          soChanged = true
+        }
+      }
+      // ② peer_source 一层嵌套：旧对象缺的键（含 null/空串）用新对象填；旧非空值保留。
+      //    ⛔ 只此一层，不扩成通用深合并。
+      const prevPeer = prevSo.peer_source
+      const incPeer = incSo.peer_source
+      if (isPlainSoObject(prevPeer) && isPlainSoObject(incPeer)) {
+        const nestedSo: Record<string, unknown> = { ...incPeer, ...prevPeer }
+        for (const nk of Object.keys(incPeer)) {
+          if (isBlankSoValue(prevPeer[nk]) && !isBlankSoValue(incPeer[nk])) {
+            nestedSo[nk] = incPeer[nk]
+            soChanged = true
+          }
+        }
+        mergedSo.peer_source = nestedSo
+      }
+      if (soChanged || Object.keys(mergedSo).length !== Object.keys(prevSo).length) {
+        patch.structuredOutput = mergedSo
+      }
+    }
+  }
+  return Object.keys(patch).length > 0 ? { ...prev, ...patch } : prev
+}
+
 // [图片缓存有界] 每会话图片缓存条数上限。base64 图（缩略图/粘贴图）单条可达数百 KB～数 MB，
 //   原实现只合并 {...old, ...new} 从不删、无上限 → 删了会话图片仍驻留。按会话封顶，超出按
 //   插入序淘汰最旧（近似 LRU：重拉 miss 会重新写入并排到末尾；不追踪读取时间以避免侵入渲染层）。
@@ -189,9 +277,26 @@ export interface RetryUiState {
   at?: number
 }
 
+/**
+ * [D 未送达上抛] 某个渠道的权限通知没送出去（后端 `ImSendResult` 非 SENT）。
+ *
+ * <p>典型：微信缺 {@code context_token} ⇒ 后端 SKIPPED（{@code IM_REPLY_TOKEN_MISSING}）。
+ * <p>⛔ 语义上**不等于拒绝**：桌面这张卡照常等你点允许/拒绝，这里只是把
+ * 「手机上收不到这条确认」告诉你。
+ */
+export interface PermissionDeliveryFailure {
+  /** 平台（wechat / feishu / wecom / dingtalk） */
+  channel?: string | null
+  /** 对方展示名（哪个人/哪个群没收到） */
+  peerName?: string | null
+  /** 原因码（IM_REPLY_TOKEN_MISSING = 微信未激活） */
+  reasonCode?: string | null
+  /** 后端给的人类可读原因 */
+  reason?: string | null
+}
+
 /** 权限请求（3 种 kind 归一化：message/bridge/channel）。 */
-export interface PermissionRequestItem {
-  kind: 'message' | 'bridge' | 'channel'
+export interface PermissionRequestItem {  kind: 'message' | 'bridge' | 'channel'
   /** 来源会话 id（STOMP topic 归属 · 决策 sendPermissionResponse 路由目标） */
   sessionId: string
   requestId: string
@@ -231,6 +336,16 @@ export interface PermissionRequestItem {
    * front/src/api/__tests__/computerUseApproval.test.ts 与 useChatSocket.pendingReplay.test.tsx）。
    */
   computerUse?: ComputerUseApproval | null
+  /** [V333 AFK] 启用倒计时时的总时长（毫秒）；缺省 = 不计时（默认）。 */
+  afkTimeoutMs?: number | null
+  /** [V333 AFK] 倒计时显示阈值（毫秒，剩余 ≤ 该值才显示剩余秒数）。 */
+  afkCountdownMs?: number | null
+  /**
+   * [D 未送达上抛] 哪些渠道没把这条权限确认送出去（null/空 = 全部送达或没有渠道）。
+   *
+   * <p>只列**失败**的渠道（多渠道绑定时成功的不标）；未送达 ≠ 拒绝，卡片仍等你决策。
+   */
+  deliveryFailures?: PermissionDeliveryFailure[] | null
 }
 
 export interface ChatState {
@@ -309,9 +424,10 @@ export interface ChatState {
    *  与 setMessages 的区别：setMessages = 服务端整表替换（App 首屏 / 重拉）；
    *  appendMessages = 本地追加（只增，折叠由渲染层负责 —— 见 MessageList 的折叠行）。 */
   appendMessages: (sessionId: string, msgs: ChatMessageDto[]) => void
-  /** [sm-boundary-reload] 服务端插入行（STOMP message.insert 事件 · 压缩 boundary 行落库即推）：
-   *  **id 幂等**（同 id 已存在 → 跳过）+ 插列表尾。与收尾重拉（setMessages 整表替换）
-   *  天然收敛 —— 同 id 覆盖/跳过，不产生重复行（对齐 addStopHookSummary 的幂等插入语义）。 */
+  /** [sm-boundary-reload] 服务端插入行（STOMP message.insert 事件 · 压缩 boundary / 跨会话通知行落库即推）：
+   *  **id 幂等**（同 id 已存在 → 只补缺失元数据，不重复插）+ 新 id 插列表尾。与收尾重拉
+   *  （setMessages 整表替换）天然收敛 —— 不产生重复行（对齐 addStopHookSummary 的幂等插入语义）。
+   *  [peer-message] 同 id 补全只填空值/缺键，绝不覆盖完整行（见 mergeServerRowMetadata）。 */
   insertServerMessages: (sessionId: string, rows: ChatMessageDto[]) => void
   /** [snip-persist] 合并被裁剪消息 id（STOMP message.boundary 实时 → 会话 snippedIds） */
   markSnipped: (sessionId: string, ids: string[]) => void
@@ -377,6 +493,27 @@ export interface ChatState {
   }) => void
   enqueuePermission: (req: PermissionRequestItem) => void
   dequeuePermission: (requestId: string) => void
+  /**
+   * [P0] 按**关联键**（{@code toolUseId ?? requestId}）清掉该会话的全部权限副本。
+   *
+   * <p>一次权限请求会下发 message / bridge / channel 三条事件，三者的 requestId 各不相同
+   * （channel 短 ID、bridge UUID）⇒ 只按 requestId 结算会留下副本（卡片不消失、输入框锁死）。
+   * 传 toolUseId 时清全部同 toolUseId 的副本；缺失时退回按 requestId 清（老事件）。
+   */
+  resolvePermission: (sessionId: string, toolUseId: string | null | undefined, requestId: string) => void
+  /**
+   * [D 未送达上抛] 给某个待审批卡片补上「哪些渠道没送出去」。
+   *
+   * <p>按 `toolUseId ?? requestId` 关联（后端 permission-delivery 事件携带）。
+   * 找不到对应卡片 ⇒ 静默忽略（请求还没到 / 已结算）—— **绝不为它新建一条**
+   * （那会凭空多出一张没有工具上下文的卡）。
+   */
+  setPermissionDeliveryFailures: (
+    sessionId: string,
+    toolUseId: string | null | undefined,
+    requestId: string,
+    failures: PermissionDeliveryFailure[],
+  ) => void
   /** 按工具调用清掉该会话里同一 tool_useId 的全部权限项（message + bridge 双推的兜底清理） */
   clearPermissionByToolUse: (sessionId: string, toolUseId: string | null | undefined) => void
   expirePermission: (sessionId: string, requestId: string) => void
@@ -562,15 +699,45 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
       hasMore: droppedTurns > 0 ? { ...st.hasMore, [sessionId]: true } : st.hasMore,
     }
   }),
-  // [sm-boundary-reload] 服务端插入行（message.insert 事件 = 压缩 boundary 行落库即推）：id 幂等 +
-  //   插列表尾（只增不裁）。⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）。
-  //   与重拉（setMessages 整表替换）天然收敛：同 id 跳过，不产生重复行。
+  // [sm-boundary-reload] 服务端插入行（message.insert 事件 = 压缩 boundary / 跨会话通知行落库即推）：
+  //   id 幂等 + 插列表尾。⛔ 不走 appendMessages —— 那条路无 id 去重（重拉/重放双通道会出重复行）。
+  //   与重拉（setMessages 整表替换）天然收敛：同 id 只补元数据、不产生重复行。
+  //   [peer-message] 通知行可能先到占位行再到完整行 ⇒ 同 id 不再是「直接跳过」（见 mergeServerRowMetadata）。
   insertServerMessages: (sessionId, rows) => set((st) => {
-    const msgs = st.messages[sessionId] ?? []
-    // 幂等：同 id 已在列表（重拉已含该行 / 重复推送）→ 跳过不重复插
-    const fresh = rows.filter((r) => r.id && !msgs.some((m) => m.id === r.id))
-    if (!fresh.length) return st
-    // 插列表尾（当前点）：boundary 行落库即最新时序，非 flow 锚定（无 userMessageId 归属）
+    if (!rows?.length) return st
+    let msgs = st.messages[sessionId] ?? []
+    let copy: ChatMessageDto[] | null = null
+    const fresh: ChatMessageDto[] = []
+    const freshIndexById = new Map<string, number>()
+    for (const r of rows) {
+      if (!r.id) continue
+      const idx = msgs.findIndex((m) => m.id === r.id)
+      if (idx >= 0) {
+        // [peer-message] 同 id 已在列表（重拉已含 / 重复推送 / 占位行）：不再一律跳过，
+        //   只做元数据补全（见 mergeServerRowMetadata）—— 重复推送时它返回原引用 = 真正幂等。
+        const merged = mergeServerRowMetadata(msgs[idx]!, r)
+        if (merged !== msgs[idx]) {
+          if (copy == null) copy = [...msgs]
+          copy[idx] = merged
+          msgs = copy
+        }
+        continue
+      }
+      // 同一批 rows 内重复同 id：合并到**首个位置**（取更完整者），避免尾部插入两行。
+      //   旧实现「先到先得」⇒ 先到的空占位会让后到的完整行被丢弃（UI 永远空通知）。
+      const freshIdx = freshIndexById.get(r.id)
+      if (freshIdx != null) {
+        fresh[freshIdx] = mergeServerRowMetadata(fresh[freshIdx]!, r)
+        continue
+      }
+      freshIndexById.set(r.id, fresh.length)
+      fresh.push(r)
+    }
+    // 只有元数据补全、没有新行：不插尾、不裁剪（补元数据不该导致任何轮被移出内存）
+    if (!fresh.length) {
+      return copy == null ? st : { messages: { ...st.messages, [sessionId]: copy } }
+    }
+    // 插列表尾（当前点）：boundary/peer 行落库即最新时序，非 flow 锚定（无 userMessageId 归属）
     // [排队行序] 落库即推的行同样按「到达时刻」定位（本轮流式中到达 → 排在已输出内容之后）
     const stamped = stampLiveRows(st, sessionId, fresh)
     // [折叠 = 真删] 与 appendMessages 同一收口（2026-11-02 推翻「只增不裁」）
@@ -912,24 +1079,47 @@ const createChatStoreCreator = () => create<ChatState>()((set) => ({
   setConversationId: (sessionId, conversationId) => set((st) => ({
     conversationIds: { ...st.conversationIds, [sessionId]: conversationId },
   })),
-  // [同一 tool_use 只保留一条 · 2026-11-15] 后端对同一个工具调用会推 **两条** 权限事件
-  //   （message = AskUser/权限面板，bridge = racer）；两条 requestId 不同，回答时按 requestId
-  //   只能删掉被回答的那条 ⇒ 另一条永久留在队列 ⇒ `pendingSessionIds` 常亮，左栏黄点一直闪
-  //   （真机症状：右下角已提示本轮完成，左栏仍闪黄点）。
-  //   规则：同 sessionId + 同 toolUseId 时——
-  //     · 新来的是 message ⇒ 顶掉全部旧项（message 是最完整的那个）；
-  //     · 新来的是 bridge/channel ⇒ 只顶掉旧的非 message 项，已有的 message 保留。
-  //   toolUseId 缺失（老事件）⇒ 不去重，退回原行为。
+  // [同一 tool_use 只保留一条 · 2026-11-15] 后端对同一个工具调用会推 **多条** 权限事件
+  //   （message = AskUser/权限面板，bridge = racer，channel = 渠道中继）；三条 requestId 各不相同，
+  //   回答时按 requestId 只能删掉被回答的那条 ⇒ 其余副本永久留在队列 ⇒ `pendingSessionIds` 常亮，
+  //   卡片不消失、输入框锁死（真机症状：连点两次「允许」才消失）。
+  //   规则：关联键 = `toolUseId ?? requestId`（toolUseId 是三条通道共用的同一个工具调用 id，
+  //   老事件缺该字段 ⇒ 退回 requestId）—— 同 sessionId + 同关联键在队列里**恒为 1 条**：
+  //     · 已有 message 时，后到的 bridge/channel 副本直接丢弃（message 最完整）；
+  //     · 无 message 时，后到的副本替换前一条（最后一个可用）。
   enqueuePermission: (req) => set((st) => {
+    const corr = (r: PermissionRequestItem) => r.toolUseId ?? r.requestId
+    const reqKey = corr(req)
     const sameCall = (r: PermissionRequestItem) =>
-      !!req.toolUseId && r.sessionId === req.sessionId && r.toolUseId === req.toolUseId
-    const kept = st.permissionQueue.filter(r => {
-      if (!sameCall(r)) return true
-      return req.kind !== 'message' && r.kind === 'message'
-    })
-    return { permissionQueue: [...kept, req] }
+      r.sessionId === req.sessionId && corr(r) === reqKey
+    const existing = st.permissionQueue.filter(sameCall)
+    // 已有 message（最完整）且新来的是 bridge/channel ⇒ 丢弃新副本，队列里恒为 1 条。
+    if (req.kind !== 'message' && existing.some(r => r.kind === 'message')) return st
+    // 其余：用本条替换同名全部副本（message 来则顶掉全部；无 message 时非 message 单条替换）。
+    return { permissionQueue: [...st.permissionQueue.filter(r => !sameCall(r)), req] }
   }),
   dequeuePermission: (requestId) => set((st) => ({ permissionQueue: st.permissionQueue.filter(r => r.requestId !== requestId) })),
+  // [P0] 结算：按关联键清掉该会话的**全部副本**（桌面/渠道/Stop 三路径共用）。
+  //   切会话不误伤：只动 sessionId 命中的项（topic 已按会话隔离，这里再兜一层）。
+  resolvePermission: (sessionId, toolUseId, requestId) => set((st) => {
+    const key = toolUseId ?? requestId
+    if (!sessionId || !key) return st
+    return {
+      permissionQueue: st.permissionQueue.filter(r =>
+        !(r.sessionId === sessionId && (r.toolUseId ?? r.requestId) === key)),
+    }
+  }),
+  // [D 未送达上抛] 只更新已存在的卡片（找不到就忽略，⛔ 不新建）。
+  setPermissionDeliveryFailures: (sessionId, toolUseId, requestId, failures) => set((st) => {
+    const key = toolUseId ?? requestId
+    if (!sessionId || !key || !failures || failures.length === 0) return st
+    const idx = st.permissionQueue.findIndex(r =>
+      r.sessionId === sessionId && (r.toolUseId ?? r.requestId) === key)
+    if (idx < 0) return st
+    const next = st.permissionQueue.slice()
+    next[idx] = { ...next[idx], deliveryFailures: failures }
+    return { permissionQueue: next }
+  }),
   // 兜底：回答某条请求后，把**同一工具调用**的其余权限项一并清掉（message 与 bridge 的
   //   requestId 不同，只按 requestId 删会留下另一条 ⇒ 左栏黄点常亮）。
   //   toolUseId 缺失 ⇒ 不动队列（⛔ 不能按 sessionId 清，会把别的等待中请求一起抹掉）。

@@ -557,7 +557,7 @@ class ManualCacheClearCcIntegrationTest {
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
         ReflectionTestUtils.setField(controller, "sessionAgentStateRegistry", registry);
         com.nexusai.application.agent.tasks.TaskFrameworkService tasks = mock(com.nexusai.application.agent.tasks.TaskFrameworkService.class);
-        java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
+        String bgAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionUuid = "00000000-0000-0000-0000-00000000000c";
         AgentState state = new AgentState("test-system-prompt");
         registry.register(sessionUuid, state);

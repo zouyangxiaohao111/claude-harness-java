@@ -78,7 +78,7 @@ class BlockingMeasurementSourceCcTest {
 
         com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
@@ -117,7 +117,7 @@ class BlockingMeasurementSourceCcTest {
 
         com.nexusai.application.agent.loop.QueryParams callerParams1 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null,
-                com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "test-model", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams1.deps().context(), callerParams1, state),

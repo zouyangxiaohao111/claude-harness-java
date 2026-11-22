@@ -5,12 +5,14 @@ import com.nexusai.domain.session.SessionService;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.domain.oauth_account.AccountOAuthTokenService;
 import com.nexusai.infra.exception.GlobalExceptionHandler;
+import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.security.BearerTokenAuthFilter;
 import com.nexusai.model.oauth_account.AccountOAuthToken;
 import com.nexusai.model.session.dto.SessionCreateRequest;
 import com.nexusai.model.session.dto.SessionDto;
 import com.nexusai.model.session.dto.SessionGroup;
 import com.nexusai.model.session.dto.SessionUpdateRequest;
+import com.nexusai.repository.session.mapper.SessionMapper;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
@@ -31,6 +33,7 @@ import static org.mockito.Mockito.eq;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
+import static org.mockito.Mockito.verifyNoInteractions;
 import static org.mockito.Mockito.when;
 import static org.springframework.http.MediaType.APPLICATION_JSON;
 import static org.springframework.test.web.servlet.request.MockMvcRequestBuilders.delete;
@@ -340,5 +343,51 @@ class SessionControllerTest {
             .andExpect(status().isNoContent());
 
         verify(sessionService).delete("sess-1");
+    }
+
+    // ───────────────── [缺陷 2] plan/exit 会话存在性 ─────────────────
+
+    /**
+     * 缺陷 2（2026-11-20 E2E 第二轮）：plan/exit 对不存在的会话返回 200 {@code code=0 success=true}，
+     * 静默成功且可能给幽灵 session 写权限规则。
+     *
+     * <p>现在的契约：会话不存在 → HTTP 404 + {@code CommonResult{success:false, code:404}}，
+     * 且在<b>写任何权限规则之前</b>失败。
+     */
+    @Test
+    @DisplayName("[缺陷2] plan/exit 会话不存在 → 404 + success=false，且不写任何权限规则")
+    void exitPlan_unknownSession_404_andNoPermissionWrite() throws Exception {
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ReflectionTestUtils.setField(controller, "sessionMapper", sessionMapper);
+        when(sessionService.getById("sess-nope"))
+            .thenThrow(new NotFoundException("Session sess-nope not found"));
+
+        mockMvc.perform(post("/api/v1/sessions/sess-nope/plan/exit")
+                .contentType(APPLICATION_JSON)
+                .content("{\"mode\":\"acceptEdits\"}"))
+            .andExpect(status().isNotFound())
+            .andExpect(jsonPath("$.code").value(404))
+            .andExpect(jsonPath("$.success").value(false));
+
+        verifyNoInteractions(sessionMapper);
+        verify(sessionService).getById("sess-nope");
+        verify(sessionService, never()).create(any());
+    }
+
+    @Test
+    @DisplayName("[缺陷2] plan/exit 正常会话 → 行为不变（200 + code=0 + {sessionId, cleared}）")
+    void exitPlan_existingSession_keepsBehavior() throws Exception {
+        SessionMapper sessionMapper = mock(SessionMapper.class);
+        ReflectionTestUtils.setField(controller, "sessionMapper", sessionMapper);
+        when(sessionService.getById("sess-1")).thenReturn(session("sess-1", "需求分析", 3));
+
+        mockMvc.perform(post("/api/v1/sessions/sess-1/plan/exit")
+                .contentType(APPLICATION_JSON)
+                .content("{\"mode\":\"acceptEdits\"}"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.code").value(0))
+            .andExpect(jsonPath("$.success").value(true))
+            .andExpect(jsonPath("$.data.sessionId").value("sess-1"))
+            .andExpect(jsonPath("$.data.cleared").value(false));
     }
 }

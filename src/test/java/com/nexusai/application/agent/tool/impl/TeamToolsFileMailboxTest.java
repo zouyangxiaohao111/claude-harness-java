@@ -92,7 +92,7 @@ class TeamToolsFileMailboxTest {
     }
 
     private ToolUseContext ctx() {
-        return ToolUseContext.of(UUID.randomUUID(), "");
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "");
     }
 
     /**
@@ -101,7 +101,7 @@ class TeamToolsFileMailboxTest {
      */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), "",
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "",
                 PermissionMode.DEFAULT,
                 java.util.List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
                 java.util.List.of(), null, PermissionMode.DEFAULT, Map.of(),
@@ -129,7 +129,12 @@ class TeamToolsFileMailboxTest {
         Map<String, Object> teamContext = new LinkedHashMap<>();
         teamContext.put("teamName", TEAM);
         teamContext.put("leadAgentId", "team-lead@" + TEAM);
-        teamContext.put("teammates", new LinkedHashMap<>());
+        // [cc-notfound-align] mailbox 要求收件人命中团队名册（CC exe resolver）——"mate" 必须是真实成员。
+        Map<String, Object> mate = new LinkedHashMap<>();
+        mate.put("name", "mate");
+        Map<String, Object> mates = new LinkedHashMap<>();
+        mates.put("mate@" + TEAM, mate);
+        teamContext.put("teammates", mates);
         return teamContext;
     }
 
@@ -147,15 +152,16 @@ class TeamToolsFileMailboxTest {
         // IMP-G2（⊕-08/⊕-09）：to 为裸 teammate 名（name@team 已拒），team 名取 teamContext；
         //      string 消息走 handleMessage（SendMessageTool.ts:876-881），信封含 summary。
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        // [B2] roster 非 lead 成员不再走文件邮箱（改代理队列）⇒ 信封形状用例改用 team-lead。
+        input.put("to", "team-lead");
         input.put("message", "hello mate");
         input.put("summary", "hello mate");
         SendMessageTool tool = newSendMessageTool();
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx());
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        assertThat(inboxPath("mate")).exists();
-        JsonNode messages = json.readTree(Files.readString(inboxPath("mate")));
+        assertThat(inboxPath("team-lead")).exists();
+        JsonNode messages = json.readTree(Files.readString(inboxPath("team-lead")));
         assertThat(messages).hasSize(1);
         JsonNode envelope = messages.get(0);
         assertThat(envelope.get("text").asText()).isEqualTo("hello mate");

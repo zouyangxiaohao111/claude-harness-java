@@ -97,7 +97,7 @@ class LlmAgentLoopCloseTest {
             @Override public AgentLoopContext context() { return ctx; }
             @Override public boolean isMainLoop() { return true; }
         };
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), sessionId)
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId)
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
 
         QueryParams callerParams0 = QueryParams.forLoop(

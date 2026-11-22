@@ -516,7 +516,7 @@ class TaskUpdateToolStructuredOutputTest {
             ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
                 json.createObjectNode().put("taskId", "t-1").put("status", "completed"));
             // 子代理 ctx：agentId≠sessionId（对齐 createSubagentContext 随机新 UUID，ToolUseContext.java:283-290）
-            ToolUseContext subCtx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+            ToolUseContext subCtx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
 
             ToolResult<String> result = tool.execute(call, subCtx);
 
@@ -645,7 +645,7 @@ class TaskUpdateToolStructuredOutputTest {
             ToolUseBlock call = new ToolUseBlock("call-1", "TaskUpdate",
                 json.createObjectNode().put("taskId", "t-1").put("status", "in_progress"));
             // 生产可达前提（同文件 :415-417 已消费同一字段）：ctx 携带显式 teammate 身份。
-            ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-b5")
+            ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-b5")
                 .withTeammateIdentity(new TeammateIdentity(
                     "x@t", "x", "t", null, false, "sess-b5"));
 

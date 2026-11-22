@@ -43,7 +43,7 @@ class McpAuthDegradationTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /** execute 抛 McpAuthError 的 stub tool. */

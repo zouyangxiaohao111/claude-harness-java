@@ -91,7 +91,7 @@ class TeamDeleteToolTest {
     /** 带 appState 桥的 ToolUseContext · 对齐 CC ToolUseContext.getAppState/setAppState。 */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), APPSTATE_CTX_SESSION_ID,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), APPSTATE_CTX_SESSION_ID,
                 PermissionMode.DEFAULT,
                 List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
                 List.of(), null, PermissionMode.DEFAULT, Map.of(),
@@ -158,7 +158,7 @@ class TeamDeleteToolTest {
                 appStateCtx(new LinkedHashMap<>()));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).isTrue();
         assertThat(output.get("message").asText()).isEqualTo("No team name found, nothing to clean up");
         // 输出无 Java-only existed（⊕-06）
@@ -193,7 +193,7 @@ class TeamDeleteToolTest {
                 appStateCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).as("活跃成员存在必须 success=false").isFalse();
         assertThat(output.get("message").asText()).contains("active member(s): mate");
         assertThat(output.get("team_name").asText()).isEqualTo(team);
@@ -244,7 +244,7 @@ class TeamDeleteToolTest {
         AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
                 appStateCtx(appState));
 
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).as("活跃成员存在 → 拒删").isFalse();
         assertThat(teamConfigPath(team)).exists();
         assertThat(store.get("teamContext")).as("拒删时会话列 teamContext 必须保留（CC 早退语义）").isNotNull();
@@ -253,7 +253,7 @@ class TeamDeleteToolTest {
         // 第二次调用：仍应被守卫拒删，而不是退化成 "No team name found"（假成功、零清理）
         AgentToolResult<?> second = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
                 appStateCtx(appState));
-        JsonNode secondOutput = new ObjectMapper().readTree((String) second.data());
+        JsonNode secondOutput = new ObjectMapper().readTree(String.valueOf(second.data()));
         assertThat(secondOutput.get("message").asText())
                 .as("第二次仍应按守卫拒删，而非退化成 No team name found（假成功）")
                 .contains("active member(s): mate")
@@ -287,7 +287,7 @@ class TeamDeleteToolTest {
                 appStateCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).as("inactive 成员不拦截删除").isTrue();
         assertThat(teamConfigPath(team)).as("无活跃成员时必须删除 team 目录").doesNotExist();
         // CC :118-124 清 teamContext
@@ -312,7 +312,7 @@ class TeamDeleteToolTest {
                 appStateCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).isTrue();
         assertThat(output.get("message").asText()).contains("Cleaned up directories and worktrees for team");
         assertThat(output.get("team_name").asText()).isEqualTo(team);
@@ -374,7 +374,7 @@ class TeamDeleteToolTest {
         AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
                 appStateCtx(new LinkedHashMap<>()));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).as("store team 名须被清理").isTrue();
         assertThat(teamConfigPath("store-del-team")).as("store team 名须被删除").doesNotExist();
     }
@@ -420,7 +420,7 @@ class TeamDeleteToolTest {
         AgentToolResult<?> result = newTool().execute(block("TeamDelete", input), appStateCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean())
                 .as("越界 wait_ms → 0，无 spawnInProcess → 无法终止 → success=false（不抛）").isFalse();
         assertThat(output.get("message").asText()).contains("Cannot cleanup team");
@@ -455,7 +455,7 @@ class TeamDeleteToolTest {
         long elapsed = System.currentTimeMillis() - start;
 
         assertThat(elapsed).as("requested 空 → 不得空等 wait_ms").isLessThan(500);
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).isFalse();
         assertThat(output.get("message").asText()).contains("Cannot cleanup team");
     }
@@ -502,7 +502,7 @@ class TeamDeleteToolTest {
                 appStateCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).isFalse();
         assertThat(output.get("message").asText()).contains("Shutdown requested for active teammate(s): mate");
         assertThat(output.get("message").asText()).contains("Cleanup is blocked until they exit");
@@ -573,7 +573,7 @@ class TeamDeleteToolTest {
         AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
             appStateCtx(appState));
 
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("success").asBoolean()).isFalse();
         assertThat(output.get("message").asText())
             .as("⭐ 全形落空必须走裸名兜底 ⇒ 文案仍是「Shutdown requested…」而非「Cannot cleanup…」")
@@ -609,7 +609,7 @@ class TeamDeleteToolTest {
         AgentToolResult<?> result = tool.execute(block("TeamDelete", new ObjectMapper().createObjectNode()),
             appStateCtx(appState));
 
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("message").asText())
             .as("已请求过 → 仍视为「已请求」（守卫 return true），文案不降级")
             .contains("Shutdown requested for active teammate(s): mate");

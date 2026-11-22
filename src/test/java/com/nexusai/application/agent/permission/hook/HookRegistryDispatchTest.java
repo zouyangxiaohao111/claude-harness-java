@@ -481,7 +481,7 @@ class HookRegistryDispatchTest {
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT);
         com.nexusai.application.agent.tool.ToolUseContext parentTuc =
             com.nexusai.application.agent.tool.ToolUseContext.of(
-                java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
                 java.util.List.of(), "", AbortController.NOOP, java.util.List.of(),
                 parentPermCtx, com.nexusai.application.agent.permission.PermissionMode.DEFAULT);

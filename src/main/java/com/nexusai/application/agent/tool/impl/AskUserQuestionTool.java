@@ -419,6 +419,14 @@ public class AskUserQuestionTool implements Tool {
         ObjectNode annotations = props.putObject("annotations");
         annotations.put("type", "object");
         annotations.put("description", "Optional per-question annotations from the user (e.g., notes on preview selections).");
+        // [V333 AFK] 对齐 CC outputSchema afkTimeoutMs（exe 偏移 334211575）：
+        //   人类作答路径不带该字段；只有倒计时超时才有。
+        //   ⛔ 只在输出 schema —— CC 的输入 schema 没有超时字段，模型无法设置/关闭超时。
+        ObjectNode afkTimeoutMs = props.putObject("afkTimeoutMs");
+        afkTimeoutMs.put("type", "integer");
+        afkTimeoutMs.put("description",
+            "Set when the dialog auto-resolved after this many milliseconds of idle (user away from keyboard). "
+                + "Absent on every human-resolved path.");
         return schema;
     }
 
@@ -477,6 +485,11 @@ public class AskUserQuestionTool implements Tool {
             }
         }
         JsonNode annotations = input.get("annotations");
+        // [V333 AFK] 倒计时超时路径：权限层把 afkTimeoutMs 合并进 updatedInput（对齐 CC
+        //   AskUserQuestionPermissionRequest {...input, answers, afkTimeoutMs}）。
+        //   人类作答路径不带该字段 ⇒ 文案与改造前逐字一致。
+        JsonNode afkNode = input.get("afkTimeoutMs");
+        Integer afkTimeoutMs = afkNode != null && afkNode.canConvertToInt() ? afkNode.asInt() : null;
 
         // CC call :214-221 — 输出 {questions, answers, ...(annotations && {annotations})}
         Map<String, Object> structuredOutput = new LinkedHashMap<>();
@@ -485,8 +498,15 @@ public class AskUserQuestionTool implements Tool {
         if (annotations != null && annotations.isObject()) {
             structuredOutput.put("annotations", annotations);
         }
+        if (afkTimeoutMs != null) {
+            structuredOutput.put("afkTimeoutMs", afkTimeoutMs);
+            // CC 只发「跳过题数」遥测（qi(dr,"afk_timeout")），不发默认答案。
+            int skipped = countUnanswered(questions, answers);
+            log.info("[AskUserQuestionTool] AFK 倒计时超时提交: afkTimeoutMs={} 已答={} 未答={}（只提交已答，"
+                    + "未答不计默认值 · 对齐 CC skipped 遥测）", afkTimeoutMs, answers.size(), skipped);
+        }
 
-        String summary = buildAnswersContent(answers, annotations);
+        String summary = buildAnswersContent(answers, annotations, afkTimeoutMs);
         log.info("[AskUserQuestionTool] 返回 {} 个问题的用户答案（CC AskUserQuestionTool.tsx:209-223 回传 questions + answers）",
             answers.size());
         return ToolResult.successWithStructuredOutput(call.id(), summary, structuredOutput);
@@ -509,7 +529,8 @@ public class AskUserQuestionTool implements Tool {
         Map<String, Object> so = ToolResult.presentationMeta(tr);
         JsonNode answers = so.get("answers") instanceof JsonNode n ? n : null;
         JsonNode annotations = so.get("annotations") instanceof JsonNode n ? n : null;
-        String content = buildAnswersContent(answers, annotations);
+        Integer afkTimeoutMs = so.get("afkTimeoutMs") instanceof Integer i ? i : null;
+        String content = buildAnswersContent(answers, annotations, afkTimeoutMs);
 
         if (log.isDebugEnabled()) {
             log.debug("[AskUserQuestionTool] mapToToolResultBlockParam 生成 tool_result content长度={}（CC AskUserQuestionTool.tsx:224-244）",
@@ -526,6 +547,30 @@ public class AskUserQuestionTool implements Tool {
      * 多条以 {@code ", "} 连接，最终包裹 {@code "User has answered your questions: ..."}。
      */
     static String buildAnswersContent(JsonNode answers, JsonNode annotations) {
+        return buildAnswersContent(answers, annotations, null);
+    }
+
+    /**
+     * [V333 AFK] 结果文案 · 人类作答与倒计时超时两种形态。
+     *
+     * <p>倒计时超时（{@code afkTimeoutMs != null}）对齐 CC
+     * {@code mapToolResultToToolResultBlockParam} 首分支：
+     * {@code "No response after ${round(ms/1000)}s — the user may be away from keyboard. Proceed using
+     * your best judgment based on the context so far; you can re-ask this question later if it's still
+     * relevant."}；若期间已选过部分答案，再追加
+     * {@code "\n\nBefore going idle the user had selected: <q1>="<a1>", ...".}。
+     * ⛔ 未作答的题不填默认值、不出现在答案列表里（对齐 CC answersToSubmit 只含已答）。
+     *
+     * @param afkTimeoutMs 超时毫秒数；null = 人类作答（沿用原文案，逐字不变）
+     */
+    static String buildAnswersContent(JsonNode answers, JsonNode annotations, Integer afkTimeoutMs) {
+        if (afkTimeoutMs != null) {
+            String head = "No response after " + Math.round(afkTimeoutMs / 1000.0) + "s — the user may be "
+                + "away from keyboard. Proceed using your best judgment based on the context so far; "
+                + "you can re-ask this question later if it's still relevant.";
+            String selected = buildSelectedPairs(answers, annotations);
+            return selected.isEmpty() ? head : head + "\n\nBefore going idle the user had selected: " + selected + ".";
+        }
         StringBuilder answersText = new StringBuilder();
         if (answers != null && answers.isObject()) {
             boolean first = true;
@@ -559,5 +604,63 @@ public class AskUserQuestionTool implements Tool {
         }
         return "User has answered your questions: " + answersText
             + ". You can now continue with the user's answers in mind.";
+    }
+
+    /**
+     * [V333 AFK] 已选答案的 {@code "q"="a"} 列表（含 preview/notes），用 {@code ", "} 连接。
+     *
+     * <p>对齐 CC {@code mapToolResultToToolResultBlockParam} 里 {@code d} 的拼装：未作答的题
+     * 直接跳过（返回空串表示「一题都没答」）。
+     */
+    static String buildSelectedPairs(JsonNode answers, JsonNode annotations) {
+        StringBuilder sb = new StringBuilder();
+        if (answers != null && answers.isObject()) {
+            var fields = answers.fields();
+            while (fields.hasNext()) {
+                Map.Entry<String, JsonNode> e = fields.next();
+                String questionText = e.getKey();
+                String answer = e.getValue().isTextual() ? e.getValue().asText() : e.getValue().toString();
+                if (sb.length() > 0) {
+                    sb.append(", ");
+                }
+                sb.append('"').append(questionText).append("\"=\"").append(answer).append('"');
+                JsonNode annotation = annotations != null && annotations.isObject()
+                    ? annotations.get(questionText) : null;
+                if (annotation != null && annotation.isObject()) {
+                    JsonNode preview = annotation.get("preview");
+                    if (preview != null && preview.isTextual() && !preview.asText().isBlank()) {
+                        sb.append(" selected preview:\n").append(preview.asText());
+                    }
+                    JsonNode notes = annotation.get("notes");
+                    if (notes != null && notes.isTextual() && !notes.asText().isBlank()) {
+                        sb.append(" notes: ").append(notes.asText());
+                    }
+                }
+            }
+        }
+        return sb.toString();
+    }
+
+    /**
+     * [V333 AFK] 未作答题数（只用于日志/遥测，对齐 CC {@code skippedCount}）。
+     *
+     * <p>⛔ 只统计，不补默认答案 —— 未答就是未答，模型从文案里读「没人答」。
+     */
+    static int countUnanswered(JsonNode questions, JsonNode answers) {
+        if (questions == null || !questions.isArray()) {
+            return 0;
+        }
+        int unanswered = 0;
+        for (JsonNode q : questions) {
+            String text = q != null ? q.path("question").asText("") : "";
+            if (text.isEmpty()) {
+                continue;
+            }
+            JsonNode a = answers != null && answers.isObject() ? answers.get(text) : null;
+            if (a == null || a.isNull() || (a.isTextual() && a.asText().isBlank())) {
+                unanswered++;
+            }
+        }
+        return unanswered;
     }
 }

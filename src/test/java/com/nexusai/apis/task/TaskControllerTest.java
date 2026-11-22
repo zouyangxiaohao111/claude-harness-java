@@ -73,7 +73,8 @@ class TaskControllerTest {
 
     /** 注册一个 running 的 local_agent 后台任务（sess 会话）· taskId = agentId.toString()（CC 合一）。 */
     private BackgroundTask registerAgent(String sessionId) {
-        return runner.registerAsyncAgent(UUID.randomUUID(), "测试子代理 " + sessionId,
+        return runner.registerAsyncAgent(
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "测试子代理 " + sessionId,
             "prompt " + sessionId, "general-purpose", null, sessionId);
     }
 
@@ -206,10 +207,10 @@ class TaskControllerTest {
         // WHY: 前端 BackgroundTaskDto 按 CC 值域消费（local_agent/running…）；agentId 串化；
         // AsyncTasksPanel.tsx:59 按 isBackgrounded !== false 过滤——DTO 必须透出该字段
         //（registerAsyncAgent 后台=true / registerAgentForeground 前台=false）
-        UUID bgAgentId = UUID.randomUUID();
+        String bgAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask bg = runner.registerAsyncAgent(bgAgentId, "后台契约子代理", "prompt",
             "general-purpose", null, "sess-1");
-        UUID fgAgentId = UUID.randomUUID();
+        String fgAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask fg = runner.registerAgentForeground(fgAgentId, "前台契约子代理", "prompt",
             "general-purpose", "sess-1");
 
@@ -217,7 +218,7 @@ class TaskControllerTest {
             .andExpect(status().isOk())
             .andExpect(jsonPath("$[?(@.id=='" + bg.id() + "')].type").value(hasItem("local_agent")))
             .andExpect(jsonPath("$[?(@.id=='" + bg.id() + "')].status").value(hasItem("running")))
-            .andExpect(jsonPath("$[?(@.id=='" + bg.id() + "')].agentId").value(hasItem(bgAgentId.toString())))
+            .andExpect(jsonPath("$[?(@.id=='" + bg.id() + "')].agentId").value(hasItem(bgAgentId)))
             .andExpect(jsonPath("$[?(@.id=='" + bg.id() + "')].isBackgrounded").value(hasItem(true)))
             .andExpect(jsonPath("$[?(@.id=='" + fg.id() + "')].isBackgrounded").value(hasItem(false)));
     }
@@ -228,7 +229,7 @@ class TaskControllerTest {
         // WHY: 对齐 CC Ctrl+B task:background——前台子代理就地转后台（backgroundAgentTask 翻转
         // isBackgrounded）；翻转后该任务才满足前端 AsyncTasksPanel 的 isBackgrounded !== false
         // 过滤，出现在异步面板。断言后端真实翻转（非只回包）+ GET 清单透出。
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask task = runner.registerAgentForeground(agentId, "前台子代理", "prompt",
             "general-purpose", "sess-1");
         assertThat(task.isBackgrounded()).as("前置：registerAgentForeground 是前台任务").isFalse();
@@ -348,7 +349,7 @@ class TaskControllerTest {
         // WHY: 对齐 CC Ctrl+B backgroundAll（LocalShellTask.tsx:390-410）——只后台化前台任务；
         //   已后台化（registerAsyncAgent isBackgrounded=true）与不支持类型（monitor）跳过。
         //   backgrounded 计数只算真正翻转的。
-        UUID fgAgentId = UUID.randomUUID();
+        String fgAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask fg = runner.registerAgentForeground(fgAgentId, "前台子代理", "prompt",
             "general-purpose", "sess-1");
         BackgroundTask bg = registerAgent("sess-1");   // registerAsyncAgent → isBackgrounded=true
@@ -370,17 +371,17 @@ class TaskControllerTest {
     void backgroundAll_sessionFiltered() throws Exception {
         // WHY: 会话级批量（前端 Ctrl+B 只后台化当前会话前台任务，对齐 stop-all 会话过滤语义）；
         //   他会话前台任务不动。
-        UUID a1 = UUID.randomUUID();
+        String a1 = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         runner.registerAgentForeground(a1, "sess1前台", "prompt", "general-purpose", "sess-1");
-        UUID a2 = UUID.randomUUID();
+        String a2 = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         runner.registerAgentForeground(a2, "sess2前台", "prompt", "general-purpose", "sess-2");
 
         mockMvc.perform(post("/api/v1/tasks/background-all").param("sessionId", "sess-1"))
             .andExpect(status().isOk())
             .andExpect(jsonPath("$.backgrounded").value(1));
 
-        assertThat(runner.getTask(a1.toString()).orElseThrow().isBackgrounded()).isTrue();
-        assertThat(runner.getTask(a2.toString()).orElseThrow().isBackgrounded())
+        assertThat(runner.getTask(a1).orElseThrow().isBackgrounded()).isTrue();
+        assertThat(runner.getTask(a2).orElseThrow().isBackgrounded())
             .as("他会话前台任务不受影响").isFalse();
     }
 
@@ -402,7 +403,7 @@ class TaskControllerTest {
         System.setProperty("nexusai.experimental.agent-teams", "true");
         try {
             com.nexusai.application.agent.tool.ToolUseContext leadCtx =
-                com.nexusai.application.agent.tool.ToolUseContext.of(UUID.randomUUID(), leadSession);
+                com.nexusai.application.agent.tool.ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), leadSession);
             com.fasterxml.jackson.databind.ObjectMapper json =
                 new com.fasterxml.jackson.databind.ObjectMapper();
 

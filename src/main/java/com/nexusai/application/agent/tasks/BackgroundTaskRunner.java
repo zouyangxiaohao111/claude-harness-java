@@ -70,6 +70,32 @@ public class BackgroundTaskRunner {
      * <p><b>生命周期</b>：kill 时加入；worker 线程 finally 经 {@link #clearStopPending} 移除。
      */
     private final java.util.Set<String> stopPendingAgentIds = java.util.concurrent.ConcurrentHashMap.newKeySet();
+    /**
+     * [stop-double-write] 内存停止标记 · 对齐 CC {@code Fat()}（claude.exe 2.1.328 偏移 334311557：
+     * {@code {stoppedByUser:true, userStopCount:(t.userStopCount??0)+1}}）。磁盘侧见
+     * {@link #markAsyncAgentStoppedByUser}。未注入（测试直构）→ 只写磁盘，行为与改造前一致。
+     */
+    @org.springframework.beans.factory.annotation.Autowired(required = false)
+    private com.nexusai.application.agent.subagent.StopMarkers stopMarkers;
+
+    /**
+     * [B3] 会话目录解析缝 · 写 teammate 的 {@code <agentId>.stopped-by-user} 用。
+     * 生产 = {@link com.nexusai.application.agent.tool.SessionStorage#sessionProjectDir}；
+     * 单测注入临时目录（⛔ 不写用户真实 config home）。
+     */
+    private volatile java.util.function.Function<String, Path> sessionDirResolver =
+        com.nexusai.application.agent.tool.SessionStorage::sessionProjectDir;
+
+    /** 测试/接线用 setter（会话目录解析缝）。 */
+    public void setSessionDirResolver(java.util.function.Function<String, Path> resolver) {
+        this.sessionDirResolver = resolver != null
+            ? resolver : com.nexusai.application.agent.tool.SessionStorage::sessionProjectDir;
+    }
+
+    /** 测试/接线用 setter。 */
+    public void setStopMarkers(com.nexusai.application.agent.subagent.StopMarkers stopMarkers) {
+        this.stopMarkers = stopMarkers;
+    }
     private final NotificationQueue notificationQueue;
     private final TaskFrameworkService frameworkService;
     /** SDK 事件队列（可为 null —— 测试直构无 bean 时不发 SDK 事件）· OPD-TS-22 task_notification 通道 */
@@ -567,6 +593,25 @@ public class BackgroundTaskRunner {
         return Optional.ofNullable(tasks.get(taskId));
     }
 
+    /**
+     * [B3] 查任务：本地 tasks ∪ 统一 store（framework）。
+     *
+     * <p><b>WHY</b>：{@code TaskStopTool.validateInput} 旧实现只查本地 {@link #getTask}，而
+     * teammate / monitor / 主会话后台化等任务只注册在 {@link TaskFrameworkService} ⇒ 对它们
+     * 「No task found with ID」误报（CC 的 appState.tasks 是同一张表，不存在这个分叉）。
+     * 本方法是 validateInput 的统一读口；{@link #stopTask} 的分发顺序保持不动。
+     */
+    public Optional<BackgroundTask> findTask(String taskId) {
+        if (taskId == null) {
+            return Optional.empty();
+        }
+        BackgroundTask local = tasks.get(taskId);
+        if (local != null) {
+            return Optional.of(local);
+        }
+        return frameworkService != null ? frameworkService.getTask(taskId) : Optional.empty();
+    }
+
     /** 获取所有已注册任务 */
     public List<BackgroundTask> listTasks() {
         return new ArrayList<>(tasks.values());
@@ -743,14 +788,14 @@ public class BackgroundTaskRunner {
      * @return 已注册的 BackgroundTask
      */
     public BackgroundTask registerAsyncAgent(
-            UUID agentId, String description, String prompt,
+            String agentId, String description, String prompt,
             String selectedAgentType, @Nullable AbortController parentAbortController,
             String createSessionId) {
         if (agentId == null) {
             throw new IllegalArgumentException("agentId 不能为 null");
         }
         // CC 语义: taskId === agentId (LocalAgentTask.tsx:197-262)
-        String taskId = agentId.toString();
+        String taskId = agentId;
         // 方案B: outputFile 对齐 CC 五层 {tmpRoot}/{appName}[-{uid}]/{sanitizePath(originalCwd)}/{sessionId}/tasks/{taskId}.output
         //   （CC LocalAgentTask.tsx:488 createTaskStateBase → Task.ts:121 getTaskOutputPath）
         String outputFile = taskOutputPath(createSessionId, taskId);
@@ -871,13 +916,13 @@ public class BackgroundTaskRunner {
      * @return 已注册的前台 BackgroundTask（isBackgrounded=false）
      */
     public BackgroundTask registerAgentForeground(
-            UUID agentId, String description, String prompt, String selectedAgentType,
+            String agentId, String description, String prompt, String selectedAgentType,
             String createSessionId) {
         if (agentId == null) {
             throw new IllegalArgumentException("agentId 不能为 null");
         }
         // CC 语义: taskId === agentId（LocalAgentTask.tsx:132/406）
-        String taskId = agentId.toString();
+        String taskId = agentId;
         // A-7: outputFile 对齐 CC 分层格式（CC LocalAgentTask.tsx:553 createTaskStateBase
         //   → Task.ts:121 outputFile: getTaskOutputPath(id)）
         String outputFile = taskOutputPath(createSessionId, taskId);
@@ -1919,14 +1964,72 @@ public class BackgroundTaskRunner {
             return new StopTaskResult(taskId, TaskType.IN_PROCESS_TEAMMATE.getTypeString(), command,
                 StopTaskErrorCode.NOT_RUNNING);
         }
+        // kill 前先取 agentId：kill 会推进终态并（按 evictAfter）从 registry 移除 loop，
+        //   事后取可能拿不到（30s 窗口在测试里可被缩短为 0）。停止标记的归属必须准确。
+        String teammateAgentId = resolveTeammateAgentId(task);
         boolean killed = spawnInProcess.registry().kill(taskId);
         if (!killed) {
             return new StopTaskResult(taskId, TaskType.IN_PROCESS_TEAMMATE.getTypeString(), command,
                 StopTaskErrorCode.NOT_RUNNING);
         }
+        // [B3 停止标记] TaskStop 命中 teammate ⇒ 双写（内存 stoppedByUser/userStopCount + 磁盘
+        //   <agentId>.stopped-by-user）。teammate 的 taskId ≠ agentId（taskId='t'+8，agentId=name@team），
+        //   且 BackgroundTask.agentId 为 null ⇒ agentId 从 registry 的 taskState.identity() 取。
+        markInProcessTeammateStoppedByUser(task, teammateAgentId);
         log.info("BackgroundTaskRunner.stopTask: in_process_teammate task {} killed (killInProcessTeammate taskId={})",
             taskId, taskId);
         return new StopTaskResult(taskId, TaskType.IN_PROCESS_TEAMMATE.getTypeString(), command, null);
+    }
+
+    /** teammate 的 agentId（{@code name@team}）· taskId ≠ agentId，只能从 taskState.identity 取。 */
+    private String resolveTeammateAgentId(BackgroundTask task) {
+        if (task == null || spawnInProcess == null) {
+            return null;
+        }
+        return spawnInProcess.registry().get(task.id())
+            .map(loop -> loop.taskState())
+            .map(state -> state.identity())
+            .map(identity -> identity.agentId())
+            .orElse(null);
+    }
+
+    /**
+     * teammate 的「被用户停止」双写 · 对齐 CC {@code Fat()}（内存，偏移 334311557）+
+     * {@code <agentId>.stopped-by-user}（磁盘，偏移 325012255）。
+     *
+     * <p>只在 TaskStop 路径调用（系统侧 kill / 会话清理不写），否则模型之后的自动 resume 会被误拦。
+     * 内存写幂等（已停不自增）；磁盘写幂等（CREATE_NEW / AlreadyExists 视为成功）。
+     */
+    private void markInProcessTeammateStoppedByUser(BackgroundTask task, String agentId) {
+        if (task == null) {
+            return;
+        }
+        if (agentId == null || agentId.isBlank()) {
+            log.warn("BackgroundTaskRunner: teammate 停止标记无法定位 agentId（task={}），跳过双写", task.id());
+            return;
+        }
+        try {
+            if (stopMarkers != null) {
+                int count = stopMarkers.markStopped(agentId);
+                log.info("BackgroundTaskRunner: teammate 停止标记已写内存 agent={} userStopCount={}",
+                    agentId, count);
+            }
+        } catch (Exception e) {
+            log.warn("BackgroundTaskRunner: 写 teammate 内存停止标记失败 task={}: {}", task.id(), e.toString());
+        }
+        if (task.sessionId() == null) {
+            return;
+        }
+        try {
+            java.nio.file.Path sessionDir = sessionDirResolver.apply(task.sessionId());
+            com.nexusai.application.agent.subagent.AgentTranscript
+                .markStoppedByUser(sessionDir, task.sessionId(), agentId);
+            log.info("BackgroundTaskRunner: teammate 停止标记已写磁盘 agent={} session={}",
+                agentId, task.sessionId());
+        } catch (Exception e) {
+            log.warn("BackgroundTaskRunner: 写 teammate stopped-by-user 伴生文件失败 task={}: {}",
+                task.id(), e.toString());
+        }
     }
 
     /**
@@ -2060,14 +2163,26 @@ public class BackgroundTaskRunner {
      * {@code ResumeService} 的 stoppedByUser 门。
      */
     private void markAsyncAgentStoppedByUser(BackgroundTask task) {
-        if (task == null || task.sessionId() == null || task.agentId() == null) {
+        if (task == null || task.agentId() == null) {
+            return;
+        }
+        String agentId = task.agentId().toString();
+        // [stop-double-write] 内存侧 · 对齐 CC Fat()：stoppedByUser=true + userStopCount+1（已停不重复加）。
+        //   磁盘侧仍是 <agentId>.stopped-by-user；两侧都写才算「用户停止」被完整记录。
+        try {
+            if (stopMarkers != null) {
+                stopMarkers.markStopped(agentId);
+            }
+        } catch (Exception e) {
+            log.warn("BackgroundTaskRunner: 写内存 stoppedByUser 标记失败 task={}: {}", task.id(), e.toString());
+        }
+        if (task.sessionId() == null) {
             return;
         }
         try {
             java.nio.file.Path sessionDir = com.nexusai.application.agent.tool.SessionStorage
                 .sessionProjectDir(task.sessionId());
-            String agentIdHex = com.nexusai.application.agent.subagent.AgentContext
-                .unpackAgentId(task.agentId());
+            String agentIdHex = task.agentId();
             com.nexusai.application.agent.subagent.AgentTranscript
                 .markStoppedByUser(sessionDir, task.sessionId(), agentIdHex);
         } catch (Exception e) {
@@ -2096,7 +2211,7 @@ public class BackgroundTaskRunner {
      * @param agentId 拥有待终止 task 的 sub-agent UUID
      * @return 实际终止的 task 数（不含被收回的通知条数）
      */
-    public int killShellTasksForAgent(UUID agentId) {
+    public int killShellTasksForAgent(String agentId) {
         if (agentId == null) {
             log.debug("BackgroundTaskRunner.killShellTasksForAgent: agentId=null, 跳过");
             return 0;
@@ -2155,7 +2270,7 @@ public class BackgroundTaskRunner {
      * @param agentId 拥有待终止 monitor 任务的 sub-agent UUID
      * @return 实际终止的 monitor task 数
      */
-    public int killMonitorMcpTasksForAgent(UUID agentId) {
+    public int killMonitorMcpTasksForAgent(String agentId) {
         if (agentId == null || monitorMcpTaskRunner == null || frameworkService == null) {
             if (log.isDebugEnabled()) {
                 log.debug("BackgroundTaskRunner.killMonitorMcpTasksForAgent: agentId={} 或 runner={} 缺失, 跳过",
@@ -2254,7 +2369,7 @@ public class BackgroundTaskRunner {
      *   <li>无匹配返回 null（CC :107 undefined 等价）</li>
      * </ul>
      *
-     * <p>WHY（意图）：TestJob fire 按 {@code dto.agentId()} 路由到 teammate 时，
+     * <p>WHY（意图）：AgentJob fire 按 {@code dto.agentId()} 路由到 teammate 时，
      * 若存在多个同 agentId 的任务（旧 killed 任务未 evict + 新 running 任务并存），
      * running 优先避免把 prompt 注入死任务（CC :96-99 注释 "Prefer running tasks in case
      * old killed tasks still exist"）。

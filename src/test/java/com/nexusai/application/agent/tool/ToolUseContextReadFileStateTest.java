@@ -45,7 +45,7 @@ class ToolUseContextReadFileStateTest {
         SessionProjectRootTestSupport.clearNoDatabase();
     }
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     @Test
@@ -80,7 +80,7 @@ class ToolUseContextReadFileStateTest {
 
         // 步骤 3: 子 ctx 持有 clone 后的 Cache (用 18 参 ctor 模拟)
         ToolUseContext child = new ToolUseContext(
-            UUID.randomUUID(), SESSION_ID, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID, PermissionMode.DEFAULT,
             java.util.Map.of(), java.util.List.of(), "",
             AbortController.NOOP, java.util.List.of(),
             null, PermissionMode.DEFAULT,
@@ -122,7 +122,7 @@ class ToolUseContextReadFileStateTest {
         FileStateCache childCache =
             ToolUseContext.cloneFileStateCache(parent.readFileState());
         ToolUseContext child = new ToolUseContext(
-            UUID.randomUUID(), SESSION_ID, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID, PermissionMode.DEFAULT,
             java.util.Map.of(), java.util.List.of(), "",
             AbortController.NOOP, java.util.List.of(),
             null, PermissionMode.DEFAULT,

@@ -929,7 +929,7 @@ public class PowerShellTool implements Tool {
      * @param result  ToolResult（isError → ToolResult.error(data=错误消息)）
      * @param isError 显式错误标志（CC interpretCommandResult.isError 推导）
      */
-    record PowerShellExitCodeResult(ToolResult<String> result, boolean isError) {}
+    record PowerShellExitCodeResult(ToolResult<?> result, boolean isError) {}
 
     /**
      * [IMP-T G15] PowerShell 命令执行遥测 · 对齐 CC PowerShellTool.tsx:504 trackGitOperations +
@@ -1094,7 +1094,7 @@ public class PowerShellTool implements Tool {
         //   后台 PS 任务通知必被主代理截走（NotificationQueue 主线程规则只捞 agentId==null）。
         //   ctx==null（1 参 dispatch 兼容路径）→ 无归属可传，保持 null（⛔ 不编造、不回落全局）。
         //   isBackgrounded=true 与 11 参构造器的硬编码值一致。
-        java.util.UUID taskAgentId = ctx != null ? ctx.agentId() : null;
+        String taskAgentId = ctx != null ? ctx.agentId() : null;
         BackgroundTask task = new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             abbreviate(command, 100), toolUseId,

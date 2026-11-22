@@ -124,7 +124,7 @@ class CheckLayer1bAlwaysAllowSuggestionsTest {
     }
 
     private static ToolUseContext ctx(ToolPermissionContext permCtx) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-a4d", permCtx.mode(),
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-a4d", permCtx.mode(),
             List.of(), "", AbortController.NOOP, List.of(), permCtx, permCtx.mode());
     }
 

@@ -231,7 +231,7 @@ class E1aForkShieldGateTest {
     private static ToolUseContext tuc(String sessionId) {
         Tool skillTool = mock(Tool.class);
         when(skillTool.name()).thenReturn("Skill");
-        return new ToolUseContext(UUID.randomUUID(), sessionId,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId,
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             java.util.Map.of(), List.of(skillTool));
     }

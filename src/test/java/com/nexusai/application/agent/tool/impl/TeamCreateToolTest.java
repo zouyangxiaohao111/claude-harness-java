@@ -100,7 +100,7 @@ class TeamCreateToolTest {
     /** 带 appState 桥的 ToolUseContext · 对齐 CC ToolUseContext.getAppState/setAppState。 */
     private ToolUseContext appStateCtx(Map<String, Object> appState) {
         return ToolUseContext.of(
-                UUID.randomUUID(), APPSTATE_CTX_SESSION_ID,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), APPSTATE_CTX_SESSION_ID,
                 PermissionMode.DEFAULT,
                 List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
                 List.of(), null, PermissionMode.DEFAULT, Map.of(),
@@ -162,7 +162,7 @@ class TeamCreateToolTest {
         AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "my-project")), null);
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("创建 team 不应失败").isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("lead_agent_id").asText()).isEqualTo("team-lead@my-project");
         // config.json leadAgentId 同源
         JsonNode config = new ObjectMapper().readTree(
@@ -179,12 +179,12 @@ class TeamCreateToolTest {
         TeamCreateTool tool = newTool();
         AgentToolResult<?> first = tool.execute(block("TeamCreate", input("team_name", "dup")), null);
         assertThat(LlmAgentLoop.isToolErrorData(first.data())).as("首次创建不应失败").isFalse();
-        String firstTeam = new ObjectMapper().readTree((String) first.data()).get("team_name").asText();
+        String firstTeam = new ObjectMapper().readTree(String.valueOf(first.data())).get("team_name").asText();
         assertThat(firstTeam).isEqualTo("dup");
 
         AgentToolResult<?> second = tool.execute(block("TeamCreate", input("team_name", "dup")), null);
         assertThat(LlmAgentLoop.isToolErrorData(second.data())).as("重名创建不应失败（CC 自动换名）").isFalse();
-        String secondTeam = new ObjectMapper().readTree((String) second.data()).get("team_name").asText();
+        String secondTeam = new ObjectMapper().readTree(String.valueOf(second.data())).get("team_name").asText();
         assertThat(secondTeam).as("重名必须自动换名，不得沿用同名").isNotEqualTo("dup");
         assertThat(secondTeam).matches("[a-z]+-[a-z]+-[a-z]+");
     }
@@ -197,7 +197,7 @@ class TeamCreateToolTest {
         TeamCreateTool tool = newTool();
         AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "my.team!")), null);
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("含特殊字符的 team_name 不应被字符集校验拒绝").isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.get("team_name").asText()).isEqualTo("my.team!");
     }
 
@@ -209,7 +209,7 @@ class TeamCreateToolTest {
         TeamCreateTool tool = newTool();
         AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "out-check")), null);
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode output = new ObjectMapper().readTree((String) result.data());
+        JsonNode output = new ObjectMapper().readTree(String.valueOf(result.data()));
         assertThat(output.has("team_name")).as("必须含 team_name").isTrue();
         assertThat(output.has("team_file_path")).as("必须含 team_file_path").isTrue();
         assertThat(output.has("lead_agent_id")).as("必须含 lead_agent_id").isTrue();
@@ -230,7 +230,7 @@ class TeamCreateToolTest {
         appState.put("teamContext", Map.of("teamName", "existing-team"));
         TeamCreateTool tool = newTool();
         AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "new-team")), appStateCtx(appState));
-        assertThat(((String) result.data())).as("已领导 team 时必须返回拒绝消息").contains("Already leading team \"existing-team\"");
+        assertThat((String.valueOf(result.data()))).as("已领导 team 时必须返回拒绝消息").contains("Already leading team \"existing-team\"");
         assertThat(Files.exists(tempDir.resolve("teams/new-team"))).as("守卫拒绝后不得创建 team 目录").isFalse();
     }
 
@@ -269,7 +269,7 @@ class TeamCreateToolTest {
         // appState 空（模拟 per-request no-op appState），store 有 team → 仍拒绝
         AgentToolResult<?> result = tool.execute(block("TeamCreate", input("team_name", "new-team")),
                 appStateCtx(new LinkedHashMap<>()));
-        assertThat((String) result.data()).as("store 有 team 时创建必须返回拒绝消息")
+        assertThat(String.valueOf(result.data())).as("store 有 team 时创建必须返回拒绝消息")
                 .contains("Already leading team \"existing-team\"");
         // 守卫拒绝 → 不得创建 team 目录（变异点：守卫失效则目录被创建 → 红）
         assertThat(Files.exists(tempDir.resolve("teams/new-team")))

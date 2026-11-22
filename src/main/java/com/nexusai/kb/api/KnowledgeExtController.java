@@ -91,6 +91,15 @@ public class KnowledgeExtController {
     private KbIndexWriter indexWriter;
 
     /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 这里原来只传 {@code row.getEmbeddingModelId()}（条目级），两级默认都为空
+     * ⇒ {@code reindexKnowledge} 进「只重建关键词」分支，删掉过期向量且不重建。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
+    /**
      * 摘要生成 · 手动重新生成用（对齐源侧 {@code POST /knowledge/{id}/regenerate-summary}）。
      *
      * <p>⚠️ 用 {@code required = false}：摘要服务晚于本控制器装配时不能让整个 Bean 起不来
@@ -302,7 +311,8 @@ public class KnowledgeExtController {
         // ⚠️ 正文重切块后必须重建索引（否则搜索还是旧文本，且不报错）
         try {
             indexWriter.reindexKnowledge(row.getId(), row.getKnowledgeBaseId(),
-                row.getEmbeddingModelId());
+                kbConfigService == null ? row.getEmbeddingModelId()
+                    : kbConfigService.resolveEmbeddingModelId(row.getId(), row.getKnowledgeBaseId()));
         } catch (RuntimeException e) {
             log.error("[知识API] 手工知识已更新但索引重建失败 id={} —— 搜索仍是旧文本", id, e);
         }

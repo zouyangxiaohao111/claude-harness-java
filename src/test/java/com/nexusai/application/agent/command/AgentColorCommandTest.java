@@ -602,7 +602,7 @@ class AgentColorCommandTest {
     @Test
     @DisplayName("AgentState.color set/get 往返（/color 命令 setAppStateColor 写侧）")
     void agentStateColor_setGetRoundTrip() {
-        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("sys", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         assertThat(state.color()).as("初始 color 为 null（= 未设置，默认色）").isNull();
         state.setColor("blue");
         assertThat(state.color()).isEqualTo("blue");

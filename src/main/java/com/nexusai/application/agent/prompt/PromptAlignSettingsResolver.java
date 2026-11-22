@@ -432,6 +432,20 @@ public class PromptAlignSettingsResolver {
     }
 
     /**
+     * 静态槽位读 scratchpad 门 · 无 ctx 的调用方（coordinator userContext 的 scratchpad 段）使用。
+     *
+     * <p>CC 2.1.328 的 coordinator scratchpad 段由 {@code isScratchpadEnabled()} 门控
+     * （exe chunk-cg459d1s 的 {@code W()}），不再借用 coordinator feature —— 旧实现
+     * {@code CoordinatorMode.isScratchpadGateEnabled()} 返回 featureFlagSupplier 是接错源。
+     *
+     * @return true = settings.scratchpad_enabled 显式为 true；resolver 未接线 / null → false
+     */
+    public static boolean staticScratchpadEnabled() {
+        PromptAlignSettingsResolver r = staticResolver;
+        return r != null && Boolean.TRUE.equals(r.scratchpadEnabled());
+    }
+
+    /**
      * 静态槽位 + 会话感知重载 · 会话层来源 = {@link #staticResolver} 持有的 mapper 按 sessionId 直查
      * {@code sessions.coordinator_mode}（静态门拿不到 ctx 的 resolver 实例，但 staticResolver 槽
      * 就是同一个 Spring bean，见 {@link #setStaticResolver}）。

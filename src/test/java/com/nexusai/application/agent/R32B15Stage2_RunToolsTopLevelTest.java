@@ -117,7 +117,7 @@ class R32B15Stage2_RunToolsTopLevelTest {
     @Test
     @DisplayName("C4 · parent-aware add 并发 safe 工具, lineage 一致 (StreamingToolExecutor 与 CC runTools 等价)")
     void safeParallelWithParentLineage() throws Exception {
-        AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         String aid = state.prepareAssistantMessageId();
         ToolParent parent = ToolParent.of(aid);
 
@@ -173,7 +173,7 @@ class R32B15Stage2_RunToolsTopLevelTest {
 
         // [P0-2] applyDeferredContextModifiers 真实 apply (对齐 CC toolOrchestration.ts:53-61):
         //   对 per-turn TUC 按 add 顺序调 modifier, mod 触发 → appliedCount == 1.
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
         exec.applyDeferredContextModifiers(perTurnTuc);
         assertThat(appliedCount.get())
             .as("P0-2 后 applyDeferredContextModifiers 真实 apply, modifier 对 per-turn TUC 触发一次")
@@ -202,7 +202,7 @@ class R32B15Stage2_RunToolsTopLevelTest {
 
         // [P0-2] applyDeferredContextModifiers 真实按 add 顺序 apply (对齐 CC toolOrchestration.ts:53-61):
         //   add 顺序 A/B/C, 完成时序 B/C/A → applyOrder 必须 [A, B, C] (LinkedHashMap 保序).
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
         exec.applyDeferredContextModifiers(perTurnTuc);
         assertThat(applyOrder)
             .as("P0-2 后 modifier 按 add 顺序真实 apply: [A, B, C] (非线程完成时序)")
@@ -237,7 +237,7 @@ class R32B15Stage2_RunToolsTopLevelTest {
     @Test
     @DisplayName("C4 · parent 不破坏并发守门 (StreamingToolExecutor 与 add(call, parent) 重载回归)")
     void parentDoesNotBreakConcurrencyGate() throws Exception {
-        AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         String aid = state.prepareAssistantMessageId();
 
         CountDownLatch release = new CountDownLatch(1);

@@ -56,7 +56,7 @@ class LlmAgentLoopDisabledToolsFilterTest {
     /** 10 参构造器 per-turn TUC：availableTools + 空权限上下文（对齐 LlmAgentLoopToolsArrayDenyTest 形态）。 */
     private static ToolUseContext tuc(List<Tool> availableTools) {
         return new ToolUseContext(
-                UUID.randomUUID(),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                 "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT,
                 Map.of(),

@@ -88,7 +88,7 @@ class UltrareviewPostCommitHookTest {
     }
 
     private static ToolUseContext subagentCtx() {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-review-hook", PermissionMode.DEFAULT, List.of());
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-review-hook", PermissionMode.DEFAULT, List.of());
     }
 
     @Test

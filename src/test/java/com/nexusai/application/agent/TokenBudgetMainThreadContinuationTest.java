@@ -86,7 +86,7 @@ class TokenBudgetMainThreadContinuationTest {
         // -> checkTokenBudget(agentId=null, budget=null) -> StopDecision(null) no-op（不 break）
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         AgentState state = loop.run(RunRequest.session(
-            "hello", sessionUuid, UUID.randomUUID(), ProviderConfig.empty(), "test-model", null, null));
+            "hello", sessionUuid, com.nexusai.application.agent.subagent.AgentContext.createAgentId(), ProviderConfig.empty(), "test-model", null, null));
 
         // ── 4. 断言 ──
         assertThat(state).as("run() 必须返回非 null AgentState").isNotNull();

@@ -70,7 +70,7 @@ class StreamingToolExecutorUserCancelTest {
         AgentState state = new AgentState("sys");
         StreamingToolExecutor exec = new StreamingToolExecutor(
                 new ToolRegistry().register(tool),
-                ToolUseContext.of(UUID.randomUUID(), "sess-cancel-probe"));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-cancel-probe"));
         exec.setAgentState(state);
         exec.add(new ToolUseBlock("hang-1", "HangProbe", JSON.createObjectNode()), null, null);
 

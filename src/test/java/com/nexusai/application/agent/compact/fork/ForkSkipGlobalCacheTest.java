@@ -61,7 +61,7 @@ class ForkSkipGlobalCacheTest {
             }
         };
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(mcpTool), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of());
 
         ForkQueryParams params = new ForkQueryParams(
@@ -89,7 +89,7 @@ class ForkSkipGlobalCacheTest {
         LlmProvider provider = fakeProvider(capturedBlocks);
 
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of());
 
         ForkQueryParams params = new ForkQueryParams(

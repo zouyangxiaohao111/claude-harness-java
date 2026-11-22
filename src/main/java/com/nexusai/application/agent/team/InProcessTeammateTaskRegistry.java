@@ -1,6 +1,8 @@
 package com.nexusai.application.agent.team;
 
+import com.nexusai.application.agent.subagent.AgentNameRegistry;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
+import com.nexusai.application.agent.subagent.ResumeQuota;
 import com.nexusai.application.agent.tasks.BackgroundTask;
 import com.nexusai.application.agent.tasks.BackgroundTaskStatus;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
@@ -9,9 +11,15 @@ import com.nexusai.common.SessionKeys;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
+import java.util.List;
+import java.util.Map;
 import java.util.Optional;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 
 /**
  * In-process teammate 任务注册表 · 对齐 CC utils/task/framework.ts:77-117 registerTask +
@@ -35,12 +43,98 @@ public class InProcessTeammateTaskRegistry {
 
     private static final Logger log = LoggerFactory.getLogger(InProcessTeammateTaskRegistry.class);
 
+    /**
+     * 终态 → 逐出的展示窗口 · <b>对齐 CC {@code ML=30000}</b>（claude.exe 2.1.328 偏移 322959003 /
+     * {@code evictAfter = Date.now()+ML} 偏移 322968319）。
+     *
+     * <p>CC 的 {@code fr(id,setState)} 要求「终态 + notified + 无 retain 或 evictAfter<=now +
+     * keepaliveReasons 为空」才删内存记录；本仓 BackgroundTask 无 retain/keepalive 字段
+     * （{@code TaskFrameworkService.isRetained} 恒 false）⇒ 唯一条件就是这 30s 窗口。
+     */
+    public static final long EVICT_AFTER_MS = 30_000L;
+
+    /** 共享逐出调度器（daemon）· 每个 registry 一个线程会在长跑进程里堆线程，故进程级共享。 */
+    private static final ScheduledExecutorService EVICT_SCHEDULER =
+        Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread t = new Thread(r, "teammate-registry-evict");
+            t.setDaemon(true);
+            return t;
+        });
+
     private final ConcurrentHashMap<String, AutonomousAgentLoop> loops = new ConcurrentHashMap<>();
 
     private final TaskFrameworkService taskFrameworkService;
 
+    /** 终态退役落点（teammate 也走「活跃表 → 退役表」同一条解析链）。可选注入。 */
+    private volatile AgentNameRegistry agentNameRegistry;
+
+    /**
+     * 已排入逐出的 taskId（幂等闸）· 同一任务只会走一次
+     * {@code task evict → registry remove → retire → release quota}。
+     */
+    private final Set<String> evictionScheduled = ConcurrentHashMap.newKeySet();
+
+    /** 终态逐出延迟（默认 {@link #EVICT_AFTER_MS}；测试可缩短，生产 ⛔ 不改成其它值）。 */
+    private volatile long evictAfterMs = EVICT_AFTER_MS;
+
+    /**
+     * 并发槽释放句柄 · spawn 侧（B3 配额门）预留槽后登记，逐出管线第四步释放。
+     * 用句柄而不是「按会话减一」：释放必须幂等且只归还本任务占的那个槽。
+     */
+    private final Map<String, ResumeQuota.Release> quotaReleases = new ConcurrentHashMap<>();
+
+    /** 生命周期阶段观察者（测试锁顺序 / 生产可接指标）。 */
+    private volatile LifecycleObserver lifecycleObserver;
+
+    /** 生命周期阶段（顺序即 CC 要求的固定顺序）。 */
+    public enum LifecycleStage {
+        TASK_EVICTED, REGISTRY_REMOVED, RETIRED, QUOTA_RELEASED
+    }
+
+    /** 阶段观察者。 */
+    @FunctionalInterface
+    public interface LifecycleObserver {
+        void onStage(LifecycleStage stage, String taskId, String agentId);
+    }
+
+    /**
+     * 终态回调缝 · {@link AutonomousAgentLoop} 在 terminal 转换完成后调用
+     * （对齐 CC terminal 后 {@code evictAfter=now+ML} 的登记点）。
+     */
+    @FunctionalInterface
+    public interface TerminalSink {
+        void onTerminal(String taskId, String terminalStatus, String stopReason);
+    }
+
     public InProcessTeammateTaskRegistry(TaskFrameworkService taskFrameworkService) {
         this.taskFrameworkService = taskFrameworkService;
+    }
+
+    /** 测试/接线：终态退役落点。 */
+    public void setAgentNameRegistry(AgentNameRegistry agentNameRegistry) {
+        this.agentNameRegistry = agentNameRegistry;
+    }
+
+    /** 测试：缩短逐出窗口（生产保持 {@link #EVICT_AFTER_MS}）。 */
+    public void setEvictAfterMs(long evictAfterMs) {
+        this.evictAfterMs = Math.max(0L, evictAfterMs);
+    }
+
+    /** 测试/可观测性：生命周期阶段观察者。 */
+    public void setLifecycleObserver(LifecycleObserver lifecycleObserver) {
+        this.lifecycleObserver = lifecycleObserver;
+    }
+
+    /** spawn 侧预留并发槽后登记释放句柄（逐出管线第四步调用）。 */
+    public void registerQuotaRelease(String taskId, ResumeQuota.Release release) {
+        if (taskId != null && release != null) {
+            quotaReleases.put(taskId, release);
+        }
+    }
+
+    /** 当前持有 loop 条目的任务数（测试/观测：逐出后必须回落，防只增不减）。 */
+    public int size() {
+        return loops.size();
     }
 
     /**
@@ -173,6 +267,10 @@ public class InProcessTeammateTaskRegistry {
             try {
                 unregister.run();
                 aborted++;
+                // [loop-leak] 会话删除只 abort（CC 语义），但 runner 线程若已死/未走到 terminal，
+                //   loops 条目会永久残留（旧实现即「只增不减」）。这里同时登记逐出（走同一条
+                //   固定顺序管线）；正常线程随后 complete() 的登记会被幂等闸合并，不会双执行。
+                onTerminal(st.taskId(), null, null);
             } catch (Exception e) {
                 log.warn("cleanupSession: abort teammate {} 失败 session={}: {}",
                     st.identity().agentId(), sessionId, e.getMessage());
@@ -219,12 +317,144 @@ public class InProcessTeammateTaskRegistry {
 
     /**
      * 终端任务 evict 桥接 · 对齐 CC framework.ts:124-147 evictTerminalTask。
+     *
+     * <p><b>立即逐出</b>（跳过 30s 窗口；仅供 {@link #cleanupSession} / 显式清理使用）。
+     * 正常终态走 {@link #onTerminal} 的延迟管线，两者最终都汇到 {@link #runEviction}。
      */
     public void evictTerminalTask(String taskId) {
-        if (taskFrameworkService != null) {
-            taskFrameworkService.evictTerminalTask(taskId);
+        runEviction(taskId, null, null);
+    }
+
+    /**
+     * 终态登记点 · 由 {@link AutonomousAgentLoop} 在 terminal 转换完成后调用
+     * （对齐 CC「终态 + notified → {@code evictAfter = now + ML}」）。
+     *
+     * <p>不立即删：CC 的 30s 展示窗口内 SendMessage 仍应看到「agent-stopped（带 status）」，
+     * 窗口过后记录消失才转成「agent-evicted」，否则会在「task 还在但已退役」的窗口里误走
+     * subagent resume 分支。
+     *
+     * @param taskId         任务 ID（teammate taskId，≠ agentId）
+     * @param terminalStatus completed/failed/killed（可空 = 执行时按任务记录现读）
+     * @param stopReason     killed → {@code "killed"}；completed/failed → null
+     */
+    public void onTerminal(String taskId, String terminalStatus, String stopReason) {
+        if (taskId == null) {
+            return;
         }
-        loops.remove(taskId);
+        if (!evictionScheduled.add(taskId)) {
+            log.debug("[InProcessTeammateTaskRegistry] onTerminal: task {} 已排入逐出，忽略重复登记", taskId);
+            return;
+        }
+        long delay = evictAfterMs;
+        log.info("[InProcessTeammateTaskRegistry] 终态逐出已登记: task={} status={} stopReason={} "
+            + "delayMs={}（对齐 CC evictAfter=now+30000）", taskId, terminalStatus, stopReason, delay);
+        EVICT_SCHEDULER.schedule(() -> runEviction(taskId, terminalStatus, stopReason),
+            delay, TimeUnit.MILLISECONDS);
+    }
+
+    /**
+     * 逐出执行体 · <b>固定顺序</b>（顺序错了会误走 subagent resume 或泄漏配额）：
+     * <ol>
+     *   <li><b>task evict</b> —— 删 BackgroundTask 记录（SendMessage 的 evicted 判据 = task==null）</li>
+     *   <li><b>registry remove</b> —— 删 loop 条目（修「loops 只增不减」内存泄漏）</li>
+     *   <li><b>retire</b> —— 名字/agentId/终态/transcript/停止原因进退役表，活跃表不再命中</li>
+     *   <li><b>release quota</b> —— 归还 spawn/resume 预留的会话并发槽</li>
+     * </ol>
+     * 幂等：同一 taskId 重复调用只会执行一次（{@link #evictionScheduled} 闸）。
+     */
+    private void runEviction(String taskId, String terminalStatus, String stopReason) {
+        if (taskId == null) {
+            return;
+        }
+        AutonomousAgentLoop loop = loops.get(taskId);
+        com.nexusai.application.agent.team.TeammateIdentity identity =
+            loop != null && loop.taskState() != null ? loop.taskState().identity() : null;
+        String agentId = identity != null ? identity.agentId() : null;
+        String status = terminalStatus;
+        if (status == null && taskFrameworkService != null) {
+            status = taskFrameworkService.getTask(taskId)
+                .map(t -> t.status().getStatusString()).orElse(null);
+        }
+        String reason = stopReason;
+        if (reason == null && status != null && "killed".equalsIgnoreCase(status)) {
+            reason = "killed";
+        }
+        try {
+            // 1. task evict
+            if (taskFrameworkService != null) {
+                taskFrameworkService.evictTerminalTask(taskId);
+            }
+            notifyStage(LifecycleStage.TASK_EVICTED, taskId, agentId);
+            // 2. registry remove（loop 表释放 —— 修只增不减）
+            loops.remove(taskId);
+            notifyStage(LifecycleStage.REGISTRY_REMOVED, taskId, agentId);
+            // 3. retire（task 记录已消失 ⇒ 解析走「活跃 → 退役」而非 agent-stopped）
+            if (identity != null && agentNameRegistry != null) {
+                try {
+                    agentNameRegistry.retireAgent(identity.parentSessionId(), identity.agentName(),
+                        identity.agentId(), status, reason);
+                } catch (Exception e) {
+                    log.warn("[InProcessTeammateTaskRegistry] 退役 teammates 失败 task={} agent={}: {}",
+                        taskId, agentId, e.toString());
+                }
+            }
+            notifyStage(LifecycleStage.RETIRED, taskId, agentId);
+            // 4. release quota（释放句柄幂等）
+            releaseQuota(taskId);
+            notifyStage(LifecycleStage.QUOTA_RELEASED, taskId, agentId);
+            log.info("[InProcessTeammateTaskRegistry] 逐出完成: task={} agent={} status={} "
+                + "（task evict → registry remove → retire → release quota）", taskId, agentId, status);
+        } catch (Exception e) {
+            log.warn("[InProcessTeammateTaskRegistry] 逐出 pipeline 异常 task={}: {}", taskId, e.toString());
+        } finally {
+            evictionScheduled.remove(taskId);
+        }
+    }
+
+    /**
+     * 显式归还某个任务的并发槽（spawn 在「已登记句柄但启动失败」的异常路径用）。
+     *
+     * <p>与 {@link #runEviction} 内的释放共用同一份句柄表：先释放者 remove，后到者是 no-op
+     * ⇒ 不会重复归还。⚠️ 只用于「确定不再进入逐出管线」的失败路径；正常终态一律走 30s 管线。
+     */
+    public void releaseQuotaForTask(String taskId) {
+        releaseQuota(taskId);
+    }
+
+    /**
+     * 释放 spawn 预留的会话并发槽 · 逐出管线的<b>唯一</b>释放点。
+     *
+     * <p>为什么只在逐出释放：所有终态路由（completed / failed / killed / cleanupSession abort）
+     * 都经 {@link #onTerminal} 汇入同一条 30s 管线 ⇒ 在这里释放一次即覆盖全部终态；
+     * 句柄 {@code remove} 后再次逐出是 no-op，{@link ResumeQuota.Release#release()} 本身也幂等
+     * ⇒ 重复调用不会把计数减成负数。
+     *
+     * <p>⛔ 不要在 {@link #onTerminal} 提前释放：B1 固定的生命周期顺序是
+     * {@code task evict → registry remove → retire → release quota}，提前释放会让
+     * 「task 记录已消失 / 已退役」的观测点失真。
+     */
+    private void releaseQuota(String taskId) {
+        ResumeQuota.Release release = quotaReleases.remove(taskId);
+        if (release == null) {
+            return;
+        }
+        try {
+            release.release();
+        } catch (Exception e) {
+            log.warn("[InProcessTeammateTaskRegistry] 释放并发槽失败 task={}: {}", taskId, e.toString());
+        }
+    }
+
+    private void notifyStage(LifecycleStage stage, String taskId, String agentId) {
+        LifecycleObserver observer = lifecycleObserver;
+        if (observer == null) {
+            return;
+        }
+        try {
+            observer.onStage(stage, taskId, agentId);
+        } catch (Exception e) {
+            log.debug("[InProcessTeammateTaskRegistry] lifecycle observer 异常: {}", e.toString());
+        }
     }
 
     /**

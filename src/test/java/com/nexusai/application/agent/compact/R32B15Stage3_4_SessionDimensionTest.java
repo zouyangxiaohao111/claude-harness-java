@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class R32B15Stage3_4_SessionDimensionTest {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = "a0123456789abcdef";
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /**

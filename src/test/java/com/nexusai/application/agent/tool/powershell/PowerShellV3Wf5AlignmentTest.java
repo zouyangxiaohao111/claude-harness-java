@@ -133,7 +133,7 @@ class PowerShellV3Wf5AlignmentTest {
     }
 
     private static ToolUseContext ctxWith(ToolPermissionContext permCtx) {
-        return new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             java.util.Map.of(), List.of(), null, null, List.of(), permCtx, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", null, null, java.util.Map.of(),
             null, null, null, null, null);
@@ -145,7 +145,7 @@ class PowerShellV3Wf5AlignmentTest {
             false, false, java.util.Map.of(), false, false, null);
         // effectiveCwd 显式指定 C:/work/project —— 规避测试 worktree 位于 .claude/ 下导致
         // pathSafetyForAutoEdit 命中危险目录 .claude 的假阳性（生产 cwd 由会话注入）。
-        return new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.ACCEPT_EDITS,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.ACCEPT_EDITS,
             java.util.Map.of(), List.of(), null, null, List.of(), permCtx, PermissionMode.ACCEPT_EDITS,
             java.util.Map.of(), false, "", Path.of("C:/work/project"), null, java.util.Map.of(),
             null, null, null, null, null);

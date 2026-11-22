@@ -84,6 +84,26 @@ public class SummarySummarizerImpl implements SummarySummarizer {
         this.usageLedgerRegistry = registry;
     }
 
+    /**
+     * [agent-summary-providerType] 共享模型解析器（可选）· 由构造点 {@code SubagentExecutor} 注入。
+     *
+     * <p><b>WHY 必须有</b>：摘要是一次<b>真实出站 LLM 调用</b>，必须与主链同协议。构造器只拿到
+     * {@link ProviderConfig}（baseUrl + key，<b>不含 provider 类型</b>），旧实现用单参
+     * {@code getProvider(config)} ⇒ 工厂按默认 {@code openai_sdk} 路由。当会话 provider 是
+     * {@code anthropic}（如 {@code https://api.deepseek.com/anthropic}）时，OpenAI 格式请求打到
+     * Anthropic 端点 ⇒ 每次摘要必报 {@code 550: Unknown}（2026-11-20 实测：该 agent 573 次失败、
+     * 0 次成功）。同一 resolver 还负责 SDK 模型名剥前缀（{@code deepseek/deepseek-flash} →
+     * {@code deepseek-flash}），缺它则 Anthropic 端点会 400。
+     *
+     * <p>未注入（测试直构）→ null ⇒ 网关回落既有默认（行为等价改造前，不 NPE）。
+     */
+    private com.nexusai.infra.llm.ModelConfigResolver modelConfigResolver;
+
+    /** [agent-summary-providerType] setter 注入口（同 {@link #setUsageLedgerRegistry} 范式）。 */
+    public void setModelConfigResolver(com.nexusai.infra.llm.ModelConfigResolver resolver) {
+        this.modelConfigResolver = resolver;
+    }
+
     @Override
     public List<AgentMessage> readTranscript(String agentId) {
         // CC agentSummary.ts:68 getAgentTranscript(agentId)
@@ -139,13 +159,14 @@ public class SummarySummarizerImpl implements SummarySummarizer {
                             com.nexusai.application.agent.subagent.AgentContext agentContext) {
         // CC agentSummary.ts:109-119 runForkedAgent — 简化为 chatWithOptions 非工具调用
         try {
-            LlmProvider provider = llmProviderFactory != null
-                ? llmProviderFactory.getProvider(providerConfig)
-                : null;
-            if (provider == null) {
+            if (llmProviderFactory == null) {
                 log.warn("[SummarySummarizerImpl] llmProviderFactory 未注入, 跳过 summary (agent={})", agentId);
                 return null;
             }
+            // [agent-summary-providerType] provider 不再在这里预解析：provider 类型 + SDK 模型名
+            //   （剥 provider 前缀）统一交给请求网关按 modelName 解析 —— 与主链/其它旁路同一来源。
+            //   旧实现单参 getProvider(config) 恒默认 openai_sdk，anthropic 类型 provider 的摘要
+            //   全部 550（2026-11-20 实测 573 失败 / 0 成功）。
             List<ChatMessageDto> history = toChatHistory(context);
             // CC querySource: 'agent_summary' (agentSummary.ts:115) — 侧信道来源标记
             LlmProvider.ChatRequestOptions options = new LlmProvider.ChatRequestOptions(
@@ -170,7 +191,7 @@ public class SummarySummarizerImpl implements SummarySummarizer {
             com.nexusai.application.agent.cost.SessionUsageLedger ledger = usageLedgerRegistry != null
                 ? usageLedgerRegistry.forSession(sessionId) : null;
             String summary = com.nexusai.infra.llm.LlmInvocationGateway.invoke(
-                llmProviderFactory, null,
+                llmProviderFactory, modelConfigResolver,
                 com.nexusai.infra.llm.LlmInvocationRequest.of(providerConfig, modelName, null, prompt,
                     options, "agent_summary", who, ledger)).content();
             if (log.isDebugEnabled()) {

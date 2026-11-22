@@ -51,7 +51,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Session B P0-2 · createSubagentContext 父→子 9 字段透传契约")
 class SubagentContextFieldPropagationTest {
 
-    private static final UUID PARENT_AGENT_ID = UUID.randomUUID();
+    private static final String PARENT_AGENT_ID = AgentContext.createAgentId();
     private static final String PARENT_SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
     private static final String PARENT_PROMPT = "父 Agent 已渲染的 system prompt 字节（与父 prompt cache 绑定）";
     private static final Path PARENT_CWD = Paths.get("/tmp/parent-workdir");

@@ -318,7 +318,17 @@ public class SlashCommandInterceptor {
     /** best-effort 读取会话消息（promptFn 会话通道）· 失败 → 空列表不阻断。 */
     private List<ChatMessageDto> safeListBySession(String sessionId) {
         try {
-            return messageService.listRawForTranscript(sessionId);
+            List<ChatMessageDto> raw = messageService.listRawForTranscript(sessionId);
+            // [held-state V326] 本通道产物进入技能正文 → 属于「当前请求组装」的模型上下文：
+            //   pending / declined 的待确认来信不得混进技能 prompt（未批准不可作为上下文）。
+            //   展示通道（GET /messages）不受影响（它直接用 listRawForTranscript 全量）。
+            List<ChatMessageDto> visible = new java.util.ArrayList<>(raw.size());
+            for (ChatMessageDto m : raw) {
+                if (!com.nexusai.domain.session.MessageService.isHeldOutOfModel(m)) {
+                    visible.add(m);
+                }
+            }
+            return visible;
         } catch (Exception e) {
             log.warn("[slash] 读取会话消息失败（best-effort → 空列表）: session={} err={}", sessionId,
                 e.getMessage());

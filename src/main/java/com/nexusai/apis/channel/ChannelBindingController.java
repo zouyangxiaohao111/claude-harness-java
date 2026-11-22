@@ -1,5 +1,7 @@
 package com.nexusai.apis.channel;
 
+import com.nexusai.application.agent.mcp.ChannelAllowlist;
+import com.nexusai.application.agent.mcp.ChannelSessionAllowlist;
 import com.nexusai.domain.mcp_channel_binding.ChannelBindingService;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.model.mcp_channel_binding.ChannelBindingEntry;
@@ -39,6 +41,15 @@ import java.util.Map;
 public class ChannelBindingController {
 
     @Autowired private ChannelBindingService channelBindingService;
+    @Autowired(required = false) private com.nexusai.domain.session.SessionModeService sessionModeService;
+
+    /**
+     * [P3] 会话级 --channels 白名单 · 生产写入缝。
+     *
+     * <p>此前 {@code setForSession} 零生产调用点 ⇒ 会话白名单恒空。渠道绑定的真实写入点就是
+     * 这里（绑定时写、解绑/抢占时重算），判定按 {@code sessionId} 隔离。
+     */
+    @Autowired(required = false) private ChannelSessionAllowlist channelSessionAllowlist;
 
     /**
      * 全部绑定条目（渠道面板用）。
@@ -82,6 +93,9 @@ public class ChannelBindingController {
             throw new ValidationException("sessionId 不能为空");
         }
 
+        // [P3] 抢占前记住旧归属会话：绑定成功后要重算它的会话白名单（可能因此清空）。
+        String previousOwner = channelBindingService.findByChannelId(channelId)
+            .map(ChannelBindingEntry::sessionId).orElse(null);
         ChannelBindingService.BindResult result = channelBindingService.bind(channelId, serverName, sessionId, force);
         if (result.conflicted()) {
             Map<String, Object> conflict = new LinkedHashMap<>();
@@ -91,6 +105,11 @@ public class ChannelBindingController {
                 "sessionId", result.conflict().sessionId(),
                 "serverName", result.conflict().serverName()));
             return ResponseEntity.status(HttpStatus.CONFLICT).body(conflict);
+        }
+        // [P3] 绑定成功 ⇒ 会话级白名单真实写入（含 force 抢占后旧会话的重算，见 previousOwner）。
+        syncSessionAllowlist(sessionId);
+        if (previousOwner != null && !previousOwner.isBlank() && !previousOwner.equals(sessionId)) {
+            syncSessionAllowlist(previousOwner);
         }
         Map<String, Object> ok = new LinkedHashMap<>();
         ok.put("binding", result.entry());
@@ -106,7 +125,21 @@ public class ChannelBindingController {
     public ResponseEntity<Map<String, Object>> unbind(@PathVariable String channelId,
                                                       @RequestBody(required = false) Map<String, String> body) {
         String sessionId = body == null ? null : body.get("sessionId");
+        // [V330] 解绑前记住归属会话：解绑后要判断该会话是否还有别的渠道（R14 收敛）。
+        String ownerSessionId = channelBindingService.findByChannelId(channelId)
+            .map(ChannelBindingEntry::sessionId).orElse(null);
         boolean removed = channelBindingService.unbind(channelId, sessionId);
+        if (removed && ownerSessionId != null && sessionModeService != null) {
+            sessionModeService.onChannelClosed(ownerSessionId);
+        }
+        // [P3] 解绑后重算该会话白名单（最后一个渠道 ⇒ 清空；否则只剩其余渠道）
+        if (removed) {
+            syncSessionAllowlist(ownerSessionId);
+        }
+        // [P3] 解绑 ⇒ 重算该会话白名单（最后一个渠道移除 ⇒ clearSession）
+        if (removed && ownerSessionId != null) {
+            syncSessionAllowlist(ownerSessionId);
+        }
         Map<String, Object> body0 = new LinkedHashMap<>();
         body0.put("removed", removed);
         return ResponseEntity.ok(body0);
@@ -116,5 +149,37 @@ public class ChannelBindingController {
         if (body == null) return null;
         Object v = body.get(key);
         return v == null ? null : String.valueOf(v);
+    }
+
+    /**
+     * [P3] 会话级白名单重算：把该会话**当前真实的渠道绑定**写进 {@link ChannelSessionAllowlist}。
+     *
+     * <p>语义：绑定表是「这个渠道此刻归哪个会话」，本方法把它镜像成该会话的
+     * {@code --channels} 条目（server-kind + dev=true —— 绑定动作本身就是用户显式授权）。
+     * 绑定为空 ⇒ {@code clearSession}（fail-closed）。
+     *
+     * <p>⛔ 只写 {@code sessionId} 这一个键：A/B 两会话互不影响（白名单按会话隔离）。
+     * 写失败只记日志，不能把已经成功的绑定动作变成 500（副作用失败不改主结果）。
+     */
+    private void syncSessionAllowlist(String sessionId) {
+        if (channelSessionAllowlist == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            List<ChannelBindingEntry> bindings = channelBindingService.listBySession(sessionId);
+            if (bindings.isEmpty()) {
+                channelSessionAllowlist.clearSession(sessionId);
+                return;
+            }
+            List<ChannelAllowlist.ChannelEntry> entries = bindings.stream()
+                .map(b -> new ChannelAllowlist.ChannelEntry("server", b.serverName(), null, true))
+                .distinct()
+                .toList();
+            channelSessionAllowlist.setForSession(sessionId, entries);
+        } catch (RuntimeException e) {
+            org.slf4j.LoggerFactory.getLogger(ChannelBindingController.class).warn(
+                "[ChannelBindingController] 同步会话白名单失败（不影响绑定结果）session={} err={}",
+                sessionId, e.toString());
+        }
     }
 }

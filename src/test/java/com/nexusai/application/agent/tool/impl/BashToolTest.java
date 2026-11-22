@@ -223,7 +223,7 @@ class BashToolTest {
      * → {@code Shell.ts:395} 回读被跳过）。
      */
     private static ToolUseContext subagentCtx(String parentSessionId) {
-        return new ToolUseContext(UUID.randomUUID(), parentSessionId, PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), parentSessionId, PermissionMode.DEFAULT,
             java.util.Map.of());
     }
 

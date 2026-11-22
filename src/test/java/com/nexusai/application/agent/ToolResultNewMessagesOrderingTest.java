@@ -85,7 +85,7 @@ class ToolResultNewMessagesOrderingTest {
         AgentLoopContext ctx = TestContexts.agentLoopContext(registry, null, null, null, null);
         AgentState state = new AgentState("sys", "sess-ord-" + UUID.randomUUID().toString().substring(0, 8), null);
         state.incrementTurn();
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), "sess-ord")
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-ord")
             .withAvailableTools(List.of(pdfTool));
         String turnAssistantId = UUID.randomUUID().toString();
 
@@ -154,7 +154,7 @@ class ToolResultNewMessagesOrderingTest {
         AgentLoopContext ctx = TestContexts.agentLoopContext(registry, null, null, null, null);
         AgentState state = new AgentState("sys", "sess-ord2", null);
         state.incrementTurn();
-        ToolUseContext perTurnTuc = ToolUseContext.of(UUID.randomUUID(), "sess-ord2")
+        ToolUseContext perTurnTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-ord2")
             .withAvailableTools(List.of(plainTool));
         String turnAssistantId = UUID.randomUUID().toString();
 

@@ -60,7 +60,7 @@ class R32B8_SetInProgressToolUseIDsTest {
 
     private static ToolUseContext baseCtx() {
         return ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT
         );
@@ -103,7 +103,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -154,7 +154,7 @@ class R32B8_SetInProgressToolUseIDsTest {
 
         Path effectiveCwd = java.nio.file.Paths.get("/tmp");
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -180,7 +180,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         // WHY: 旧 4 参构造器 (s12 方案 C 之前) 必须继续兼容, 不能因 #3 改动破坏.
         // compact ctor 兜底 noop Function 保证旧 30+ caller 无需修改.
         ToolUseContext ctx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of()
         );
         assertThat(ctx.inProgressToolUseIDs())
@@ -197,7 +197,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         // WHY: Phase A 任务 2 的 14 参便利构造 (effectiveCwd=null) 继续兼容.
         // 测试验证 inProgressToolUseIDs 兜底 noop.
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, ""
@@ -223,7 +223,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -269,7 +269,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -305,7 +305,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -430,7 +430,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -486,7 +486,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         };
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -550,7 +550,7 @@ class R32B8_SetInProgressToolUseIDsTest {
         parentAbort.abort("interrupt");
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", parentAbort, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",

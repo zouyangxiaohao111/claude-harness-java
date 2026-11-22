@@ -239,7 +239,7 @@ class PdfDeliveryAlignmentTest {
         assertThat(result.newMessages())
             .as("文本模型下绝不把 document/image block 发给主模型（deepseek 400 根因防线）")
             .isNullOrEmpty();
-        assertThat((String) result.data())
+        assertThat(String.valueOf(result.data()))
             .contains("当前模型不支持 image/PDF 视觉")
             .contains("完整 PDF")
             .contains("doc.pdf");
@@ -250,7 +250,7 @@ class PdfDeliveryAlignmentTest {
 
     /** [pdf-vision-align] 文本模型上下文：appState mainLoopModel=claude-3-haiku（mappers 未注入 → 1 参回落 false → 文本模型分支）。 */
     private static ToolUseContext textModelCtx(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("pal01-haiku-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return ToolUseContext.of(
             agentId, sessionId, PermissionMode.DEFAULT,
@@ -377,7 +377,7 @@ class PdfDeliveryAlignmentTest {
     }
 
     private static ToolUseContext ctxWithSession(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("pal01-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("pal01-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }

@@ -176,7 +176,7 @@ class SubagentExecutorProviderResolutionTest {
         //   ⚠️ AgentModelResolver 解析链里 env 腿（步骤 3）排在 'inherit'（步骤 4）之前（CC agent.ts:43-45
         //   同序），故本用例对环境做**显式分支断言**而不是假设环境干净（避免「假绿」）。
         SubagentExecutor executor = beanLikeExecutor();
-        ToolUseContext parentTuc = ToolUseContext.of(UUID.randomUUID(), "sess-lead")
+        ToolUseContext parentTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-lead")
             .withEffectiveModelName("lead-session-model");
 
         String model = executor.resolveEffectiveModel(

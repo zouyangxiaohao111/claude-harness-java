@@ -318,8 +318,8 @@ class CommandControllerBuiltInCommandsTest {
         //   后台化 agentId 未保留，/clear 会把后台会话已加载的 skill 内容清掉，后续继续查询时模型失忆。
         AgentState state = new AgentState("test-system-prompt");
         when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(state);
-        java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
-        java.util.UUID fgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000bb");
+        String bgAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String fgAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // 后台化主会话任务（isBackgrounded=true，agentId=taskId UUID 视图）
         BackgroundTask bgTask = new BackgroundTask("s12345678", TaskType.LOCAL_AGENT,
             BackgroundTaskStatus.RUNNING, "bg", null, System.currentTimeMillis(), null, null,
@@ -362,10 +362,10 @@ class CommandControllerBuiltInCommandsTest {
         //
         // 走反射直调私有方法：/clear 端点已停用（409，见上方 CLEAR_DISABLED_REASON），
         // 清理链本身按决策保留不删，故只能从方法入口取证。
-        java.util.UUID agentTaskAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a1");
-        java.util.UUID teammateAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a2");
-        java.util.UUID bashTaskAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a3");
-        java.util.UUID remoteAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000a4");
+        String agentTaskAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String teammateAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String bashTaskAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String remoteAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         long now = System.currentTimeMillis();
         String out = "/tmp/nexusai-sessions/sess-x/tasks/";
         when(taskFrameworkService.listAll()).thenReturn(java.util.List.of(
@@ -441,7 +441,7 @@ class CommandControllerBuiltInCommandsTest {
         //       续跑时首次 record 无 prev 参照 → 缓存 break 误报）。
         AgentState state = new AgentState("test-system-prompt");
         when(sessionAgentStateRegistry.get(org.mockito.ArgumentMatchers.any())).thenReturn(state);
-        java.util.UUID bgAgent = java.util.UUID.fromString("00000000-0000-0000-0000-0000000000aa");
+        String bgAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask bgTask = new BackgroundTask("s12345678", TaskType.LOCAL_AGENT,
             BackgroundTaskStatus.RUNNING, "bg", null, System.currentTimeMillis(), null, null,
             "/tmp/nexusai-sessions/sess-x/tasks/s12345678.output", 0L, false, bgAgent, true);

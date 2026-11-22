@@ -237,7 +237,7 @@ class WorkflowToolTest {
 
             ToolUseBlock call = new ToolUseBlock("toolu-p10a", WorkflowTool.NAME,
                     JsonNodeFactory.instance.objectNode().put("script", "return 42"));
-            ToolUseContext ctx = new ToolUseContext(UUID.randomUUID(), sessionId,
+            ToolUseContext ctx = new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId,
                     PermissionMode.DEFAULT, Map.of());
 
             new WorkflowTool().execute(call, ctx);

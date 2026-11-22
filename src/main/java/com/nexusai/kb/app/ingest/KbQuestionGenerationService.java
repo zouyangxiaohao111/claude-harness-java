@@ -89,6 +89,16 @@ public class KbQuestionGenerationService {
     @Autowired(required = false)
     private ModelConfigResolver modelConfigResolver;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 本类原来自己抄了一份**只有两级**的实现（漏了全局回落）⇒ 传 null 进
+     * {@code reindexKnowledge} 会走「只重建关键词」分支，把刚建好的向量按 content_hash
+     * 当作过期清掉且不重建（2026-11-18 真机：659 个块的向量被 9 批后处理删到只剩 1 条）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     public KbQuestionGenerationService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -259,8 +269,12 @@ public class KbQuestionGenerationService {
 
         // ── 重建索引（问句要能被检索到）──────────────────────────────
         try {
-            indexWriter.reindexKnowledge(knowledgeId, kbId,
-                resolveEmbeddingModelId(knowledge, kb));
+            // [B 对齐源站 · 2026-11-20] 问句是**独立索引条目**（source_id = q:{chunkId}:{qid}）
+            //   ⇒ 只嵌本批生成的问句，⛔ 不重嵌正文。
+            //   原实现走 reindexKnowledge = clearIndex + 整篇重嵌（659 块的文档每批重嵌 659 条）。
+            indexWriter.indexQuestionsOnly(knowledgeId, kbId,
+                kbConfigService == null ? null : kbConfigService.resolveEmbeddingModelId(knowledge, kb),
+                chunkIds);
         } catch (RuntimeException e) {
             // 问句已写进 metadata，索引失败重试会重复调模型 ⇒ 记日志但不判失败
             log.warn("[问句] 重建索引失败（问句已落库）knowledge={} 原因={}",
@@ -382,18 +396,9 @@ public class KbQuestionGenerationService {
         return found.isEmpty() ? null : found.get(0).getContent();
     }
 
-    private static String resolveEmbeddingModelId(
-        KbKnowledgeRecord knowledge, KbKnowledgeBaseRecord kb
-    ) {
-        String own = knowledge.getEmbeddingModelId();
-        if (own != null && !own.isBlank()) {
-            return own;
-        }
-        if (kb != null && kb.getEmbeddingModelId() != null && !kb.getEmbeddingModelId().isBlank()) {
-            return kb.getEmbeddingModelId();
-        }
-        return null;
-    }
+    // [2026-11-18] 原私有 resolveEmbeddingModelId（只有「条目级 → 库级」两级）已删除：
+    //   漏了全局回落 ⇒ reindexKnowledge 收到 null ⇒ 只重建关键词并删掉过期向量（不重建）。
+    //   统一改用 KbConfigService.resolveEmbeddingModelId（单一来源）。
 
     /**
      * 解析「模型 ID / 名」→ 真实配置 + 真实模型名。

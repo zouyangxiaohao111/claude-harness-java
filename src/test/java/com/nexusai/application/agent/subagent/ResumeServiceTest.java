@@ -71,12 +71,8 @@ class ResumeServiceTest {
     private SessionAgentStateRegistry registry;
 
     private static final ObjectMapper MAPPER = new ObjectMapper();
-    /** 固定 agent UUID（transcript 文件名 agent-{uuid}.jsonl 与 resumeAgentBackground 入参须一致）。 */
-    private static final UUID AGENT_UUID = UUID.fromString("00000000-0000-0000-0000-00000000000a");
-    private static final String AGENT = AGENT_UUID.toString();
-    /** agentId a+16hex（生产返回形制：AgentContext.unpackAgentId(AGENT_UUID) 还原 —— 对齐 CC
-     *  uuid.ts:24-27 createAgentId 'a'+16hex · D18/B2 拍板；mostSigBits=0 → "a0000000000000000"）。 */
-    private static final String AGENT_ID_A16HEX = "a0000000000000000";
+    /** 固定 agentId（transcript 文件名 agent-{id}.jsonl 与 resumeAgentBackground 入参须一致；CC a+16hex）。 */
+    private static final String AGENT = "a0000000000000000";
     /** 固定 session UUID（transcript 子目录 {sessionId}/subagents 与 resumeAgentBackground 入参须一致）。 */
     private static final String SESSION_UUID = "00000000-0000-0000-0000-00000000000b";
 
@@ -164,7 +160,7 @@ class ResumeServiceTest {
     @Test
     @DisplayName("无 transcript → 抛 NotFoundException（CC :67-69 throw new Error; REST 语义 404）")
     void resume_noTranscript_throwsNotFound() {
-        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null))
+        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null))
             .isInstanceOf(NotFoundException.class)
             .hasMessageContaining("No transcript found for agent ID");
     }
@@ -185,14 +181,14 @@ class ResumeServiceTest {
             entry("user", "second", AGENT, "u4", "u3"),
             entry("assistant", "final", AGENT, "u5", "u4")));
 
-        ResumeAgentResult result = service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        ResumeAgentResult result = service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
-        // [REWORK-5 R-1] 生产返回 a+16hex（unpackAgentId 还原，CC resumeAgent.ts:261 agentId 即原 string）——
-        //   锁定 a+16hex 形制而非旧 UUID（前端入参同形制，二次 resume 回环成立，B-4）
-        assertThat(result.agentId()).isEqualTo(AGENT_ID_A16HEX);
+        // [REWORK-5 R-1] 生产返回原 agentId 字符串（CC resumeAgent.ts:261 agentId 即原 string）——
+        //   锁定 a+16hex 形制（前端入参同形制，二次 resume 回环成立，B-4）
+        assertThat(result.agentId()).isEqualTo(AGENT);
         ArgumentCaptor<List<AgentMessage>> resumedCaptor = ArgumentCaptor.forClass(List.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -215,16 +211,16 @@ class ResumeServiceTest {
         // WHY (REQ-R2-1): CC resumeAgent.ts:198-205 registerAsyncAgent 复用原 agentId + :240
         //   override.agentId —— 若 ResumeService 不把原键透传给 SubagentTool, 二次 resume 会写新键,
         //   读到 pre-resume transcript (新键空 transcript), 被 kill 的异步 agent 上下文丢失。
-        // RED 依据: 本断言锁定 executeResumeAsync 首参 == 原 AGENT_UUID, 而非 any(UUID)。
+        // RED 依据: 本断言锁定 executeResumeAsync 首参 == 原 AGENT, 而非 any(UUID)。
         writeTranscript(AGENT, List.of(
             entry("user", "go", AGENT, "u1", null),
             entry("assistant", "work", AGENT, "u2", "u1")));
         writeMetadata(AGENT, "general-purpose", null, "gp");
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.eq(AGENT_UUID),
+            org.mockito.ArgumentMatchers.eq(AGENT),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -251,13 +247,13 @@ class ResumeServiceTest {
 
         registry.register(SESSION_UUID, new AgentState("PARENT_RENDERED_PROMPT", SESSION_UUID, null));
 
-        ResumeAgentResult result = service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        ResumeAgentResult result = service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         assertThat(result.description()).isEqualTo("fork agent");
         ArgumentCaptor<AgentDefinition> agentCaptor = ArgumentCaptor.forClass(AgentDefinition.class);
         ArgumentCaptor<String> promptCaptor = ArgumentCaptor.forClass(String.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             agentCaptor.capture(),
             org.mockito.ArgumentMatchers.eq("fork agent"),
@@ -295,11 +291,11 @@ class ResumeServiceTest {
         toolRegistry.register(new StubTool("Echo", "echo test tool"));
         service.setToolRegistry(toolRegistry);
 
-        ResumeAgentResult result = service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        ResumeAgentResult result = service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<String> promptCaptor = ArgumentCaptor.forClass(String.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.eq("fork agent"),
@@ -340,7 +336,7 @@ class ResumeServiceTest {
         toolRegistry.register(new StubTool("Echo", "echo test tool"));
         service.setToolRegistry(toolRegistry);
 
-        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null))
+        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessage("Cannot resume fork agent: unable to reconstruct parent system prompt");
     }
@@ -357,7 +353,7 @@ class ResumeServiceTest {
         registry.register(SESSION_UUID, new AgentState(null, SESSION_UUID, null));
         // 不注入 ToolRegistry → rebuildForkParentSystemPrompt 返 null → 调用方抛错
 
-        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null))
+        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessage("Cannot resume fork agent: unable to reconstruct parent system prompt");
     }
@@ -376,11 +372,11 @@ class ResumeServiceTest {
         Files.createDirectories(worktreeDir);
         writeMetadata(AGENT, "general-purpose", worktreeDir.toString(), "gp");
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<String> worktreeCaptor = ArgumentCaptor.forClass(String.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -400,10 +396,10 @@ class ResumeServiceTest {
             entry("assistant", "work", AGENT, "u2", "u1")));
         writeMetadata(AGENT, "general-purpose", tmpDir.resolve("gone").toString(), "gp");
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -422,12 +418,12 @@ class ResumeServiceTest {
             entry("assistant", "work", AGENT, "u2", "u1")));
         writeMetadata(AGENT, "general-purpose", null, "My Agent");
 
-        ResumeAgentResult result = service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        ResumeAgentResult result = service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
-        // [REWORK-5 R-1] 生产返回 a+16hex（unpackAgentId 还原，CC resumeAgent.ts:261 agentId 即原 string）——
-        //   锁定 a+16hex 形制而非旧 UUID；outputFile 走唯一根 taskOutputPath（对齐 CC getTaskOutputPath，
+        // [REWORK-5 R-1] 生产返回原 agentId 字符串（CC resumeAgent.ts:261 agentId 即原 string）——
+        //   锁定 a+16hex 形制；outputFile 走唯一根 taskOutputPath（对齐 CC getTaskOutputPath，
         //   旧平铺 /tmp/agent-{id}.out 已删）
-        assertThat(result.agentId()).isEqualTo(AGENT_ID_A16HEX);
+        assertThat(result.agentId()).isEqualTo(AGENT);
         assertThat(result.description()).isEqualTo("My Agent");
         assertThat(result.outputFile())
             .as("输出根所属会话 = resumeAgentBackground 的会话参数（[批 3b-D7] 显式）")
@@ -465,7 +461,7 @@ class ResumeServiceTest {
         // 先清 SessionCwdHolder 槽（隔离跨测试污染）
         com.nexusai.application.agent.agent.SessionCwdHolder.clear(SESSION_UUID.toString());
         try {
-            service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+            service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
             // THEN: SessionCwdHolder 会话 cwd 槽被恢复为首条消息 cwd（realpath+NFC 归一化）
             assertThat(com.nexusai.application.agent.agent.SessionCwdHolder.get(SESSION_UUID.toString()))
@@ -498,10 +494,10 @@ class ResumeServiceTest {
         com.nexusai.application.agent.agent.SessionCwdHolder.clear(SESSION_UUID.toString());
         try {
             ResumeAgentResult result = service.resumeAgentBackground(
-                AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+                AGENT, "continue", tmpDir, SESSION_UUID, null);
 
             // THEN: 主流程不受阻（resume 正常返回），SessionCwdHolder 槽未被污染（保持 null）
-            assertThat(result.agentId()).isEqualTo(AGENT_ID_A16HEX);
+            assertThat(result.agentId()).isEqualTo(AGENT);
             assertThat(com.nexusai.application.agent.agent.SessionCwdHolder.get(SESSION_UUID.toString()))
                 .as("首条消息无 cwd → 目录恢复软跳过，SessionCwdHolder 保持未设置")
                 .isNull();
@@ -530,11 +526,11 @@ class ResumeServiceTest {
         registry.register(SESSION_UUID, new AgentState("PARENT_RENDERED_PROMPT", SESSION_UUID, null,
             "APPEND_USER_INSTRUCTIONS"));
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<String> promptCaptor = ArgumentCaptor.forClass(String.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.eq("fork agent"),
@@ -570,13 +566,13 @@ class ResumeServiceTest {
         ContentReplacementState parentState = ContentReplacementState.create();
         parentState.recordReplacement("tc1", "[parent-preview]");
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, parentState);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, parentState);
 
         // THEN: executeResumeAsync 第 8 参收到重建后的 CRS（含 candidate tc1 seen + 替换）
         ArgumentCaptor<ContentReplacementState> crsCaptor =
             ArgumentCaptor.forClass(ContentReplacementState.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -602,12 +598,12 @@ class ResumeServiceTest {
         writeMetadata(AGENT, "general-purpose", null, "gp");
         // 显式传第 5 参 null（web 端点无父 ToolUseContext）→ reconstructForSubagentResume 返 null（CC toolResultStorage.ts:1006 if (!parentState) return undefined）
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<ContentReplacementState> crsCaptor =
             ArgumentCaptor.forClass(ContentReplacementState.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.anyString(),
@@ -641,11 +637,11 @@ class ResumeServiceTest {
         when(subagentTool.agentRegistry(SESSION_UUID)).thenReturn(new AgentDefinitionRegistry(
             java.util.Map.of(), List.of(customDef)));
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<AgentDefinition> agentCaptor = ArgumentCaptor.forClass(AgentDefinition.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             agentCaptor.capture(),
             org.mockito.ArgumentMatchers.anyString(),
@@ -670,11 +666,11 @@ class ResumeServiceTest {
         when(subagentTool.agentRegistry(SESSION_UUID)).thenReturn(new AgentDefinitionRegistry(
             java.util.Map.of(), List.of()));
 
-        service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<AgentDefinition> agentCaptor = ArgumentCaptor.forClass(AgentDefinition.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             agentCaptor.capture(),
             org.mockito.ArgumentMatchers.anyString(),
@@ -710,11 +706,11 @@ class ResumeServiceTest {
         toolRegistry.register(new StubTool("Echo", "echo test tool"));
         service.setToolRegistry(toolRegistry);
 
-        ResumeAgentResult result = service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null);
+        ResumeAgentResult result = service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null);
 
         ArgumentCaptor<String> promptCaptor = ArgumentCaptor.forClass(String.class);
         verify(subagentTool).executeResumeAsync(
-            org.mockito.ArgumentMatchers.any(UUID.class),
+            org.mockito.ArgumentMatchers.any(String.class),
             org.mockito.ArgumentMatchers.eq("continue"),
             org.mockito.ArgumentMatchers.any(AgentDefinition.class),
             org.mockito.ArgumentMatchers.eq("fork agent"),
@@ -750,7 +746,7 @@ class ResumeServiceTest {
         toolRegistry.register(new StubTool("Echo", "echo test tool"));
         service.setToolRegistry(toolRegistry);
 
-        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT_UUID, "continue", tmpDir, SESSION_UUID, null))
+        assertThatThrownBy(() -> service.resumeAgentBackground(AGENT, "continue", tmpDir, SESSION_UUID, null))
             .isInstanceOf(IllegalArgumentException.class)
             .hasMessage("Cannot resume fork agent: unable to reconstruct parent system prompt");
     }

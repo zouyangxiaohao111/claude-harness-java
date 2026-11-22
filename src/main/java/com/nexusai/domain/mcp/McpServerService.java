@@ -23,9 +23,11 @@ import com.nexusai.application.agent.mcp.config.McpJsonConfigParser;
 import com.nexusai.application.agent.mcp.config.McpProperties;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.infra.exception.ConflictException;
+import com.nexusai.infra.util.ApiKeyHasher;
 import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.mcp.mapper.McpServerMapper;
+import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.repository.mcp.entity.McpServerRecord;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.CommandLoadedFrom;
@@ -230,14 +232,11 @@ public class McpServerService {
     private com.nexusai.application.agent.skill.SkillDiscoveryPrefetch skillDiscoveryPrefetch;
 
     /**
-     * [gap31] channelPermissions 全局开关 · CC original: isChannelPermissionRelayEnabled()
-     * （channelPermissions.ts:36-38，GrowthBook 'tengu_harbor_permissions' 默认 false）。
-     * {@code toDto} 填 {@code channelPermissions}（全局 feature 值透出，非 per-server 声明）。
-     * required=false 容错：测试直构未装配 → null → 默认 false（对齐 ChannelPermissionFeature 无
-     * Spring 缺省 false，channelPermissions.ts:36-38）。
+     * [V334] 权限中继总闸读源（settings.channels_permission_relay_enabled，DB 唯一权威）。
+     * 只用于 DTO 展示；真正的推送门判定在 {@code WebSocketPermissionPrompter}。
      */
     @Autowired(required = false)
-    private com.nexusai.application.agent.permission.ChannelPermissionFeature channelPermissionFeature;
+    private com.nexusai.domain.settings.SettingsService settingsService;
 
     /**
      * s19-P1-6: 当前活跃的 MCP 工具池 · 对齐 CC tools.ts:345 assembleToolPool.
@@ -450,7 +449,11 @@ public class McpServerService {
         if (req.name() != null) s.setName(req.name());
         if (req.command() != null) s.setCommand(req.command());
         if (req.args() != null) s.setArgs(serializeArgs(req.args()));
-        if (req.env() != null) s.setEnv(serializeEnv(req.env()));
+        if (req.env() != null) {
+            // [保密 2026-11-22] 同 update：掩码回传保留库中真值
+            s.setEnv(serializeEnv(
+                ApiKeyHasher.mergeMaskedMap(req.env(), deserializeEnv(s.getEnv()))));
+        }
         if (req.enabled() != null) s.setEnabled(req.enabled());
         // [V295] 同 update()：自启显式值优先，enabled=false 强制关
         if (req.autoStart() != null) {
@@ -820,8 +823,10 @@ public class McpServerService {
             }
             config.put("type", type);
             config.put("url", req.url());
-            if (req.headers() != null && !req.headers().isEmpty()) {
-                config.put("headers", req.headers());
+            // [保密 2026-11-22] 新建没有旧值可还原 ⇒ 掩码值直接丢弃（⛔ 不把 **** 存进库）
+            Map<String, String> newHeaders = ApiKeyHasher.mergeMaskedMap(req.headers(), null);
+            if (newHeaders != null && !newHeaders.isEmpty()) {
+                config.put("headers", newHeaders);
             }
             Map<String, Object> oauth = buildOAuth(req.oauth());
             if (oauth != null) {
@@ -836,8 +841,10 @@ public class McpServerService {
             config.put("type", "stdio");
             config.put("command", req.command());
             config.put("args", req.args() != null ? req.args() : List.of());
-            if (req.env() != null && !req.env().isEmpty()) {
-                config.put("env", req.env());
+            // 同 headers：新建时掩码值直接丢弃
+            Map<String, String> newEnv = ApiKeyHasher.mergeMaskedMap(req.env(), null);
+            if (newEnv != null && !newEnv.isEmpty()) {
+                config.put("env", newEnv);
             }
             // OAuth flag 误用警告（CC addCommand.ts:240-249）
             if (hasOAuthFlags(req)) {
@@ -869,7 +876,8 @@ public class McpServerService {
                 config.put("args", deserializeArgs(s.getArgs()));
             }
             if (req.env() != null) {
-                config.put("env", req.env());
+                // [保密 2026-11-22] 掩码哨兵：回传的 ****末四位保留库中真值（否则 token 被覆盖）
+                config.put("env", ApiKeyHasher.mergeMaskedMap(req.env(), deserializeEnv(s.getEnv())));
             } else if (s.getEnv() != null) {
                 config.put("env", deserializeEnv(s.getEnv()));
             }
@@ -877,7 +885,9 @@ public class McpServerService {
             config.put("url", req.url() != null ? req.url() : s.getCommand());
             Map<String, String> headers;
             if (req.headers() != null) {
-                headers = req.headers();
+                // 同 env：敏感头掩码回传 → 保留库中真值
+                headers = ApiKeyHasher.mergeMaskedMap(
+                    req.headers(), headersFromEnv(deserializeEnv(s.getEnv())));
             } else {
                 headers = headersFromEnv(deserializeEnv(s.getEnv()));
             }
@@ -1071,7 +1081,9 @@ public class McpServerService {
         String type = String.valueOf(config.getOrDefault("type", "stdio"));
         boolean remote = !"stdio".equals(type);
         String url = remote && config.get("url") != null ? String.valueOf(config.get("url")) : null;
-        Map<String, String> headers = remote ? headersFromConfig(config) : null;
+        // [保密 2026-11-22] create/update 响应里的 headers 来自请求 config（明文）⇒ 出站前套同一掩码
+        Map<String, String> headers = remote
+            ? ApiKeyHasher.maskSensitiveMap(headersFromConfig(config)) : null;
         Map<String, Object> oauth = config.get("oauth") instanceof Map<?, ?> om
             ? toStringObjectMap(om) : null;
         // [批 3c 会话态显式化] create/update 无会话入参（REST 域方法签名不含 sessionId），且 filePath
@@ -1222,6 +1234,59 @@ public class McpServerService {
         if (log.isDebugEnabled()) {
             log.debug("[McpServerService] 插件 MCP servers 落库 {} 个（Q-09=C DB 唯一运行时源）", upserted);
         }
+    }
+
+    /**
+     * [S08 F3 · 插件卸载清理链] 删除某插件贡献的全部 MCP server 行（否则成孤儿）。
+     *
+     * <p>插件 MCP 落 {@code mcp_servers} 表：名字 {@code plugin:<name>:<server>}、scope=dynamic
+     * （见 {@code PluginMcpIntegration#addPluginScopeToServers}）。插件卸载后这些行若留着，
+     * 工具池里还挂着已删插件的 server（孤儿）。
+     *
+     * <p>删行前先 {@link #stop(String)}：否则运行中的 server 进程与已注册工具残留。
+     * 停止/删除失败仅记录（best-effort）—— 插件目录已删才是主结果，不因清理失败而让整个卸载失败。
+     *
+     * @param pluginName 插件名（裸名）
+     * @return 被删除的 server 行数
+     */
+    public int deletePluginMcpServers(String pluginName) {
+        if (pluginName == null || pluginName.isBlank()) {
+            return 0;
+        }
+        String prefix = "plugin:" + pluginName + ":";
+        List<McpServerRecord> rows;
+        try {
+            // 前缀匹配（LIKE 'plugin:<name>:%'）· 结果再用 startsWith 精确收窄（只删本插件的）
+            rows = mcpServerMapper.selectListByQuery(
+                QueryWrapper.create().where("name like ?", prefix + "%"));
+        } catch (Exception e) {
+            log.warn("[McpServerService] 按前缀查插件 MCP server 失败 plugin={}，回退全表扫描: {}",
+                pluginName, e.getMessage());
+            rows = mcpServerMapper.selectListByQuery(QueryWrapper.create());
+        }
+        int deleted = 0;
+        for (McpServerRecord r : rows) {
+            if (r == null || r.getName() == null || !r.getName().startsWith(prefix)) {
+                continue;
+            }
+            try {
+                stop(r.getId());
+            } catch (Exception e) {
+                log.warn("[McpServerService] 停止插件 MCP server 失败 server={}（继续删行）: {}",
+                    r.getName(), e.getMessage());
+            }
+            try {
+                delete(r.getId());
+                deleted++;
+            } catch (Exception e) {
+                log.warn("[McpServerService] 删除插件 MCP server 行失败 server={}: {}",
+                    r.getName(), e.getMessage());
+            }
+        }
+        if (deleted > 0) {
+            log.info("[McpServerService] 已删除插件 {} 贡献的 MCP server 行 {} 条", pluginName, deleted);
+        }
+        return deleted;
     }
 
     // ============== start / stop / test ==============
@@ -1958,6 +2023,11 @@ public class McpServerService {
         } else {
             dtoEnv = deserializeEnv(s.getEnv());
         }
+        // [保密 2026-11-22] 敏感键（*KEY/*TOKEN/*SECRET/*PASSWORD/Authorization）只回末四位掩码；
+        //   非敏感键（LOG_LEVEL 之类）原样返回 —— 整份掩码会让 MCP 配置无法编辑。
+        //   DB 里仍是明文，运行时连接/工具调用读的是记录本身（toTransportConfig / applyServerConfig），不经 DTO。
+        dtoEnv = ApiKeyHasher.maskSensitiveMap(dtoEnv);
+        headers = ApiKeyHasher.maskSensitiveMap(headers);
         // [V295] status 不再是 DB 列：由运行时连接态映射三态（前端既有枚举不变），
         //   runtimeStatus 给更细的真值。⛔ 不读旧列（已删）。
         boolean enabled = Boolean.TRUE.equals(s.getEnabled());
@@ -1981,9 +2051,9 @@ public class McpServerService {
             s.getApprovalStatus(),
             // [gap31] userFacingName = server 名（CC client.ts:1972-1976 的 client.name 等价）
             s.getName(),
-            // [gap31] channelPermissions = 全局 feature 值（CC channelPermissions.ts:36-38，
-            //   GrowthBook 'tengu_harbor_permissions' 默认 false）；未装配 → 默认 false
-            channelPermissionFeature != null && channelPermissionFeature.isEnabled(),
+            // [gap31/V334] channelPermissions = 权限中继总闸（settings 列，默认开）；
+            //   未装配（测试直构）→ 按未配置（开）解释，与读侧默认一致
+            settingsService == null || settingsService.readDbChannelsPermissionRelayEnabled(),
             url,
             headers,
             oauth,

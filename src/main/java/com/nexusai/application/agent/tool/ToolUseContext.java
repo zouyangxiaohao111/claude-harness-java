@@ -66,7 +66,9 @@ import java.util.function.Function;
  */
 public record ToolUseContext(
         // ═══════════════════ 1-17 既有字段 ═══════════════════
-        UUID agentId,
+        // [agentid-cc-align] CC 单一形态：agentId 是 String（a+16hex），不再是 UUID。
+        //   Java 内部历史 UUID 由兼容构造器走 AgentContext.unpackAgentId 还原成同一 String。
+        String agentId,
         String sessionId,
         PermissionMode mode,
         Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
@@ -271,7 +273,33 @@ public record ToolUseContext(
         // null 入参 → compact ctor 兜底 Map.of()；非 null 入参 → Map.copyOf 不可变快照。
         // @JsonIgnore: 请求级运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
         //   （同 teammateIdentity / agentContext / readFileState local-only 约束）。
-        @JsonIgnore Map<String, Object> requestExtras
+        @JsonIgnore Map<String, Object> requestExtras,
+        // ═══════ [V306] 定时任务通知目标（第 55 组件 · local-only）═══════
+        // 聊天 id 数组的 JSON 字符串（如 ["imch-d1","imch-d2"]）· 消费方 = SendUserMessage 工具
+        //   （BriefTool）：agent 主动发起（status='proactive'）且本轮有通知目标 ⇒ 该推给这些聊天。
+        // 载体链：schedules.notify_chats（V306 列）→ QueueItem.notifyChats → RunRequest.notifyChats
+        //   → base TUC（本字段）→ per-turn TUC（各 wither 透传）→ 工具 execute 形参。
+        // ⚠️ 不能靠「按 sessionId 反查任务」拿：B 形态（每次新建会话）不回填 session_id ⇒ 反查恒空
+        //   ⇒ B 形态永远通知不到 ⇒ 必须显式下传。
+        // null / 空白 = 本轮无通知目标（非定时任务 / 未配置 ⇒ 行为与现状一致）。
+        // @JsonIgnore: 会话运行信息，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 requestExtras / teammateIdentity local-only 约束）。
+        @JsonIgnore String notifyChats,
+        // ═══════ [sendmessage-cross-session · B] peer 执行来源（第 56 组件 · local-only）═══════
+        // CC 真源：跨会话消息在目标会话里由目标会话自己跑，但来源身份（from-session / from-name /
+        //   hop-chain / from-mode）必须随执行上下文下传，权限守卫据此判定「这是 peer 触发的调用」。
+        // 载体链：RunRequest.peerExecutionOrigin → buildBaseToolUseContext 的 base TUC →
+        //   AgentLoopContext.toolExecContext 派生的 per-turn TUC（copyWith / withXxx 原样透传）
+        //   → StreamingToolExecutor / HookPermissionResolver / PermissionPipeline 读同一字段
+        //   （C 批 PeerActionGuard 的唯一判据）。
+        // 语义边界：
+        //   · null = 用户自己的回合（绝不清污复用 — 用户下一轮 RunRequest 为 null ⇒ 新 run 也是 null）；
+        //   · 非 null = 本回合由服务端投递的 peer 信封触发（唯一构造入口 PeerExecutionOrigin.fromEnvelope）；
+        //   · 派生 agent（with(SubagentContextOverrides) / withSubagentIdentity）<b>继承</b>父值：
+        //     子代理做的是 peer 这件事的延续，重新判「不是 peer」会让守卫被一层嵌套绕过。
+        // @JsonIgnore: 运行期来源载体，不进 AgentState / EventPublisher / STOMP / LLM payload
+        //   （同 requestExtras / teammateIdentity local-only 约束）。
+        @JsonIgnore com.nexusai.application.agent.messaging.PeerExecutionOrigin peerExecutionOrigin
         // [Session J 方案 A] 撤回 E session 加的 querySource + assistantMessage 顶层字段:
         //   - CC 真源 (主 agent grep 实证 Pattern #9):
         //     · querySource: toolUseContext.options.querySource (Tool.ts:176), Java 端对齐
@@ -610,7 +638,7 @@ public record ToolUseContext(
      * 零改动迁移（canonical 已扩为 46 参；prompt 回调通道 已删, S9 DEL-02c）。
      * 新字段缺省 → compact ctor 兜底 {@code List.of()}。
      */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                           Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                           List<Tool> availableTools, String taskListId, AbortController abortController,
                           List<?> messages, ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -646,6 +674,7 @@ public record ToolUseContext(
                           String toolUseId,
                           String criticalSystemReminder_EXPERIMENTAL,
                           FileStateCache readFileState) {
+        // [agentid-cc-align] 最长兼容构造器的唯一职责：把历史 UUID 首参还原成 canonical 的 String。
         this(agentId, sessionId, mode, additionalWorkingDirectories, availableTools, taskListId,
              abortController, messages, permissionContext, permissionMode, mcpClients,
              isNonInteractiveSession, renderedSystemPrompt, effectiveCwd, inProgressToolUseIDs,
@@ -659,7 +688,17 @@ public record ToolUseContext(
              preserveToolUseResults, localDenialTracking, contentReplacementState,
              queryTracking, toolUseId, criticalSystemReminder_EXPERIMENTAL,
              readFileState,
-             null);   // [MCP-I-9 Q-30] mcpServerConnections 缺省 → compact ctor 兜底 List.of()
+             null,    // [MCP-I-9 Q-30] mcpServerConnections 缺省 → compact ctor 兜底 List.of()
+             null,    // [OPD-D1-01] fileReadingLimits 缺省 → null
+             null,    // [openai-lazy] effectiveModelName 缺省 → null
+             null,    // [openai-lazy] effectiveProviderType 缺省 → null
+             null,    // [tuc-subagent-identity] subagentName 缺省 → null
+             false,   // [tuc-subagent-identity] isBuiltIn 缺省 → false
+             null,    // [批 5b-1] agentContext 缺省 → null
+             null,    // [S1-T1] teammateIdentity 缺省 → null
+             null,    // [request-extras 批 1] requestExtras 缺省 → null
+             null,    // [V306] notifyChats 缺省 → null（无通知目标；唯一盖章入口 withNotifyChats）
+             null);   // [sendmessage-cross-session · B] peerExecutionOrigin 缺省 → null（非 peer 回合）
     }
 
     /**
@@ -667,7 +706,7 @@ public record ToolUseContext(
      * （canonical 已扩为 47 参）。
      * 新字段缺省 → compact ctor 兜底 {@code null}（CC Tool.ts:251 fileReadingLimits? optional = undefined）。
      */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                           Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                           List<Tool> availableTools, String taskListId, AbortController abortController,
                           List<?> messages, ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -725,11 +764,83 @@ public record ToolUseContext(
              false,    // [tuc-subagent-identity] isBuiltIn 缺省 → false
              null,    // [批 5b-1] agentContext 缺省 → null（非 agent 上下文；唯一盖章入口 withAgentContext）
              null,    // [S1-T1] teammateIdentity 缺省 → null（非 teammate 上下文；唯一盖章入口 withTeammateIdentity）
-             null);   // [request-extras 批 1] requestExtras 缺省 → null（compact ctor 兜底 Map.of()）
+             null,    // [request-extras 批 1] requestExtras 缺省 → null（compact ctor 兜底 Map.of()）
+             null,    // [V306] notifyChats 缺省 → null（无通知目标；唯一盖章入口 withNotifyChats）
+             null);   // [sendmessage-cross-session · B] peerExecutionOrigin 缺省 → null（非 peer 回合）
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 54 参兼容构造器（缺 peerExecutionOrigin）· 供既有 full-arg
+     * 调用方零改动编译（canonical 已扩为 55 参）。
+     *
+     * <p>peerExecutionOrigin 缺省 → {@code null}（非 peer 回合）。⚠️ 语义提示：本构造器覆盖不了
+     * 「父 TUC 派生」场景的来源继承 —— 派生点应改用 wither（{@link #withPeerExecutionOrigin}）或
+     * 显式传父值，否则 peer 回合里的子代理会被判成「非 peer」。
+     */
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
+                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
+                          List<Tool> availableTools, String taskListId, AbortController abortController,
+                          List<?> messages, ToolPermissionContext permissionContext, PermissionMode permissionMode,
+                          Map<String, McpClientRuntime> mcpClients, boolean isNonInteractiveSession,
+                          String renderedSystemPrompt, Path effectiveCwd,
+                          Function<Set<String>, Set<String>> inProgressToolUseIDs,
+                          Map<String, ToolDecisionInfo> toolDecisions,
+                          Consumer<CompactProgressEvent> onCompactProgress,
+                          Function<Map<String, Object>, Map<String, Object>> getAppState,
+                          Consumer<Function<Map<String, Object>, Map<String, Object>>> setAppState,
+                          Consumer<SpinnerMode> setStreamMode, Consumer<SDKStatus> setSDKStatus,
+                          Consumer<Notification> addNotification,
+                          Consumer<SystemMessage> appendSystemMessage,
+                          Consumer<OSNotification> sendOSNotification,
+                          Consumer<String> setResponseLength,
+                          Consumer<Boolean> setHasInterruptibleToolInProgress,
+                          Consumer<FileHistoryState> updateFileHistoryState,
+                          Consumer<UiAttribution> updateAttributionState,
+                          Consumer<String> setConversationId,
+                          Consumer<Object> setToolJSX,
+                          Consumer<MessageSelector> openMessageSelector,
+                          boolean userModified,
+                          Set<String> nestedMemoryAttachmentTriggers,
+                          Set<String> loadedNestedMemoryPaths,
+                          Set<String> dynamicSkillDirTriggers,
+                          Set<String> discoveredSkillNames,
+                          String agentType,
+                          boolean requireCanUseTool,
+                          boolean preserveToolUseResults,
+                          Map<String, Object> localDenialTracking,
+                          Map<String, Object> contentReplacementState,
+                          Map<String, Object> queryTracking,
+                          String toolUseId,
+                          String criticalSystemReminder_EXPERIMENTAL,
+                          FileStateCache readFileState,
+                          java.util.List<com.nexusai.application.agent.subagent.AgentMcpServers.McpServerConnection> mcpServerConnections,
+                          FileReadingLimits.Override fileReadingLimits,
+                          String effectiveModelName,
+                          String effectiveProviderType,
+                          String subagentName,
+                          boolean isBuiltIn,
+                          com.nexusai.application.agent.subagent.AgentContext agentContext,
+                          com.nexusai.application.agent.team.TeammateIdentity teammateIdentity,
+                          Map<String, Object> requestExtras) {
+        this(agentId, sessionId, mode, additionalWorkingDirectories, availableTools, taskListId,
+             abortController, messages, permissionContext, permissionMode, mcpClients,
+             isNonInteractiveSession, renderedSystemPrompt, effectiveCwd, inProgressToolUseIDs,
+             toolDecisions, onCompactProgress, getAppState, setAppState, setStreamMode, setSDKStatus,
+             addNotification, appendSystemMessage, sendOSNotification, setResponseLength,
+             setHasInterruptibleToolInProgress, updateFileHistoryState, updateAttributionState,
+             setConversationId, setToolJSX, openMessageSelector, userModified,
+             nestedMemoryAttachmentTriggers, loadedNestedMemoryPaths, dynamicSkillDirTriggers,
+             discoveredSkillNames, agentType, requireCanUseTool, preserveToolUseResults,
+             localDenialTracking, contentReplacementState, queryTracking, toolUseId,
+             criticalSystemReminder_EXPERIMENTAL, readFileState, mcpServerConnections,
+             fileReadingLimits, effectiveModelName, effectiveProviderType, subagentName, isBuiltIn,
+             agentContext, teammateIdentity, requestExtras,
+             null,    // [V306] notifyChats 缺省 → null（无通知目标；唯一盖章入口 withNotifyChats）
+             null);   // [sendmessage-cross-session · B] peerExecutionOrigin 缺省 → null
     }
 
     /** Stage 3.1 4 参兼容构造器. */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories) {
         this(agentId, sessionId, mode, additionalWorkingDirectories, List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null,
              null, null, null, null,
@@ -738,7 +849,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 5 参兼容构造器 (s12 方案 C availableTools). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools) {
         this(agentId, sessionId, mode, additionalWorkingDirectories, availableTools, "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null,
@@ -748,7 +859,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 6 参兼容构造器 (s12-2.3 taskListId). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId) {
         this(agentId, sessionId, mode, additionalWorkingDirectories, availableTools, taskListId, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, null, null,
@@ -758,7 +869,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 8 参兼容构造器 (Phase 2 PR 1 messages + abortController). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages) {
@@ -770,7 +881,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 10 参兼容构造器 (Phase 2 PR 1 permissionContext + permissionMode). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -783,7 +894,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 11 参兼容构造器 (P1.3 mcpClients). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -797,7 +908,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 12 参兼容构造器 (P1.3 isNonInteractiveSession). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -812,7 +923,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 13 参兼容构造器 (P1.3 renderedSystemPrompt). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -829,7 +940,7 @@ public record ToolUseContext(
     }
 
     /** Stage 3.1 15 参兼容构造器 (Phase A + R32-b8 #3 effectiveCwd + inProgressToolUseIDs). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -850,7 +961,7 @@ public record ToolUseContext(
 
     /** Stage 3.1 17 参兼容构造器 (R32-b12 D-4 + Stage 3.1 C13 toolDecisions + onCompactProgress).
      *  Stage 3.2 C2 4 字段 + Stage 3.3 UI 11 字段 + Stage 3.4 session 13 字段 传 null → compact ctor 兜底 noop / identity. */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -873,7 +984,7 @@ public record ToolUseContext(
     /** [Session L+ R1] 18 参兼容构造器 (含 readFileState 透传).
      *  Stage 3.2 C2 4 字段 + Stage 3.3 UI 11 字段 + Stage 3.4 session 13 字段 传 null → compact ctor 兜底.
      *  [P-CC-02] readFileState 类型为 FileStateCache (双限真 LRU, 对齐 CC fileStateCache.ts:30-93). */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId,
                          AbortController abortController, List<?> messages,
@@ -898,7 +1009,7 @@ public record ToolUseContext(
 
     /** Stage 3.2 21 参兼容构造器 (含 4 C2 字段).
      *  Stage 3.3 UI 11 字段 + Stage 3.4 session 13 字段 传 null → compact ctor 兜底. */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId, AbortController abortController,
                          List<?> messages, ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -921,7 +1032,7 @@ public record ToolUseContext(
 
     /** Stage 3.3 32 参兼容构造器 (含 C2 4 + UI 11 字段).
      *  Stage 3.4 session 13 字段 传 null → compact ctor 兜底. */
-    public ToolUseContext(UUID agentId, String sessionId, PermissionMode mode,
+    public ToolUseContext(String agentId, String sessionId, PermissionMode mode,
                          Map<String, AdditionalWorkingDirectory> additionalWorkingDirectories,
                          List<Tool> availableTools, String taskListId, AbortController abortController,
                          List<?> messages, ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -959,43 +1070,43 @@ public record ToolUseContext(
     // ════════════════════════════════════════════════════════════════════
 
     /** 2 字段便利工厂: 默认 mode=DEFAULT, 全部 43 余字段 null/默认. */
-    public static ToolUseContext of(UUID agentId, String sessionId) {
+    public static ToolUseContext of(String agentId, String sessionId) {
         return new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT, Map.of(), List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, null);
     }
 
     /** 3 字段便利工厂: 含 mode. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode) {
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode) {
         return new ToolUseContext(agentId, sessionId, mode, Map.of(), List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, null);
     }
 
     /** 4 字段便利工厂: 含 mode + availableTools (s12 方案 C). */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools) {
         return new ToolUseContext(agentId, sessionId, mode, Map.of(), availableTools, "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, null);
     }
 
     /** 5 字段便利工厂: s12-2.3 含 taskListId. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId) {
         return new ToolUseContext(agentId, sessionId, mode, Map.of(), availableTools, taskListId, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, null);
     }
 
     /** 6 字段便利工厂: 含 abortController (R28). */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController) {
         return new ToolUseContext(agentId, sessionId, mode, Map.of(), availableTools, taskListId, abortController, List.of(), null, PermissionMode.DEFAULT, null);
     }
 
     /** 7 字段便利工厂: 含 messages (R28.3). */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages) {
         return new ToolUseContext(agentId, sessionId, mode, Map.of(), availableTools, taskListId, abortController, messages, null, PermissionMode.DEFAULT, null);
     }
 
     /** 9 字段便利工厂: 含 permissionContext + permissionMode (Phase 2 PR 1). */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode) {
@@ -1005,7 +1116,7 @@ public record ToolUseContext(
     }
 
     /** 12 字段便利工厂: P1.3 含 MCP + 非交互 + 渲染提示词. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1019,7 +1130,7 @@ public record ToolUseContext(
     }
 
     /** 13 字段便利工厂: Phase A 含 effectiveCwd. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1034,7 +1145,7 @@ public record ToolUseContext(
     }
 
     /** 14 字段便利工厂: R32-b8 #3 含 inProgressToolUseIDs. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1051,7 +1162,7 @@ public record ToolUseContext(
     }
 
     /** 15 字段便利工厂: R32-b12 D-4 含 toolDecisions. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1069,7 +1180,7 @@ public record ToolUseContext(
     }
 
     /** 16 字段便利工厂: R32-b15 Stage 3.1 C13 含 onCompactProgress. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1089,7 +1200,7 @@ public record ToolUseContext(
 
     /** 20 字段便利工厂: R32-b15 Stage 3.2 C2 含 4 C2 桥接字段.
      *  Stage 3.3 UI 11 字段 + Stage 3.4 session 13 字段 传 null → compact ctor 兜底. */
-    public static ToolUseContext of(UUID agentId, String sessionId, PermissionMode mode,
+    public static ToolUseContext of(String agentId, String sessionId, PermissionMode mode,
                                    List<Tool> availableTools, String taskListId,
                                    AbortController abortController, List<?> messages,
                                    ToolPermissionContext permissionContext, PermissionMode permissionMode,
@@ -1359,7 +1470,8 @@ public record ToolUseContext(
      * @see createSubagentContext#create(ToolUseContext, SubagentContextOverrides)
      */
     public record SubagentContextOverrides(
-            @JsonIgnore UUID agentId,
+            // [agentid-cc-align B4] CC 单一形态：String（a+16hex），不再是 UUID。
+            @JsonIgnore String agentId,
             @JsonIgnore String agentType,
             @JsonIgnore List<?> messages,
             @JsonIgnore AbortController abortController,
@@ -1514,7 +1626,8 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留 · peer 来源透传 (null 保留)
     }
 
     /** 覆写 messages 快照。null 参数 → 保留现有。 */
@@ -1552,7 +1665,8 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留 · peer 来源透传 (null 保留)
     }
 
     /**
@@ -1588,7 +1702,8 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留 · peer 来源透传 (null 保留)
     }
 
     /**
@@ -1621,7 +1736,8 @@ public record ToolUseContext(
             modelName,
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留 · peer 来源透传 (null 保留)
     }
 
     /**
@@ -1670,7 +1786,8 @@ public record ToolUseContext(
             effectiveModelName(),
             providerType, subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留 · peer 来源透传 (null 保留)
     }
 
     /**
@@ -1721,7 +1838,8 @@ public record ToolUseContext(
             //   {@link #withAgentContext} 单点盖章（两者盖章时机同在 SubagentExecutor TUC 定稿步，
             //   但语义不同 —— 一个是「本 agent 是谁」，一个是「本 invocation 的归因边载荷」）。
             agentContext(),
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传：withSubagentIdentity 只覆写子代理身份名，teammate 身份原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),  // [S1-T1] 身份透传：withSubagentIdentity 只覆写子代理身份名，teammate 身份原样保留
+            peerExecutionOrigin());  // [sendmessage-cross-session · B] peer 来源透传 (null 保留)
     }
 
     /**
@@ -1771,7 +1889,8 @@ public record ToolUseContext(
             isBuiltIn(),
             agentContext,
             // [S1-T1] 身份透传：本 wither 只覆写 agentContext，teammate 身份原样保留。
-            this.teammateIdentity(), requestExtras());
+            this.teammateIdentity(), requestExtras(), notifyChats(),
+            peerExecutionOrigin());   // [sendmessage-cross-session · B] peer 来源透传 (null 保留)
     }
 
     /**
@@ -1819,7 +1938,9 @@ public record ToolUseContext(
             isBuiltIn(),
             agentContext(),
             teammateIdentity,
-            requestExtras());
+            requestExtras(),
+            notifyChats(),
+            peerExecutionOrigin());
     }
 
     /**
@@ -1862,7 +1983,75 @@ public record ToolUseContext(
             isBuiltIn(),
             agentContext(),
             teammateIdentity(),
-            extras);
+            extras,
+            notifyChats(),
+            peerExecutionOrigin());
+    }
+
+    /**
+     * [V306] 覆盖定时任务通知目标（{@code null} 参数 → 保留现有）。
+     *
+     * <p><b>唯一生产盖章点</b> = {@code LlmAgentLoop.buildBaseToolUseContext}
+     * （{@code RunRequest.notifyChats()} → base TUC）；per-turn TUC 由 base 经
+     * {@code withQueryTracking / withMessages / withPermissionContext …} 派生时按引用透传
+     * （各 wither 已带本字段），故工具 {@code execute} 形参恒可读到本轮通知目标。
+     *
+     * <p>消费方 = {@code SendUserMessage}（{@code BriefTool}）：agent 主动发起
+     * （{@code status='proactive'}）且本轮有通知目标 ⇒ 该推给这些聊天。⛔ 推不推由 agent 决定
+     * （扫描类任务扫到东西才通知，没扫到就安静结束）。
+     *
+     * @param notifyChats 通知目标（聊天 id 数组的 JSON 字符串）；null / 空白 / 同值 → 返回 {@code this}
+     * @return 带该通知目标的新 TUC（其余字段原样透传）
+     */
+    public ToolUseContext withNotifyChats(String notifyChats) {
+        if (notifyChats == null || notifyChats.isBlank() || notifyChats.equals(this.notifyChats)) {
+            return this;
+        }
+        return new ToolUseContext(
+            agentId(), sessionId(), mode(), additionalWorkingDirectories(),
+            availableTools(), taskListId(), abortController(),
+            messages(), permissionContext(), permissionMode(),
+            mcpClients(),
+            isNonInteractiveSession(), renderedSystemPrompt(), effectiveCwd(),
+            inProgressToolUseIDs(), toolDecisions(), onCompactProgress(),
+            getAppState(), setAppState(), setStreamMode(), setSDKStatus(),
+            addNotification(), appendSystemMessage(), sendOSNotification(),
+            setResponseLength(), setHasInterruptibleToolInProgress(), updateFileHistoryState(),
+            updateAttributionState(), setConversationId(), setToolJSX(), openMessageSelector(),
+            userModified(), nestedMemoryAttachmentTriggers(), loadedNestedMemoryPaths(),
+            dynamicSkillDirTriggers(), discoveredSkillNames(), agentType(), requireCanUseTool(),
+            preserveToolUseResults(), localDenialTracking(), contentReplacementState(),
+            queryTracking(), toolUseId(), criticalSystemReminder_EXPERIMENTAL(),
+            readFileState(),
+            mcpServerConnections(),
+            fileReadingLimits(),
+            effectiveModelName(),
+            effectiveProviderType(),
+            subagentName(),
+            isBuiltIn(),
+            agentContext(),
+            teammateIdentity(),
+            requestExtras(),
+            notifyChats,
+            peerExecutionOrigin());   // [sendmessage-cross-session · B] peer 来源透传 (null 保留)
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 覆写 peer 执行来源（唯一生产盖章点 = LlmAgentLoop.doRun
+     * 从 {@link com.nexusai.application.agent.RunRequest#peerExecutionOrigin()} 盖章）。
+     *
+     * <p>同值短路（{@code equals}）⇒ 非 peer 回合零新实例。派生的 per-turn TUC / 子代理 TUC
+     * 由 copyWith / with(...) 原样透传本字段（见各构造点），守卫链读同一 {@code ctx.peerExecutionOrigin()}。
+     *
+     * @param origin 服务端投递侧构造的来源；null = 非 peer 回合（普通用户轮）
+     * @return 带该来源的新 TUC（其余字段原样透传）
+     */
+    public ToolUseContext withPeerExecutionOrigin(
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin origin) {
+        if (java.util.Objects.equals(origin, this.peerExecutionOrigin())) {
+            return this;
+        }
+        return copyWith(null, null, null, null, null, null, origin);
     }
 
     /** 覆写 permissionContext + permissionMode（每轮经 ctx.permissionContextBuilder() 重建）。 */
@@ -1882,6 +2071,19 @@ public record ToolUseContext(
     private ToolUseContext copyWith(Map<String, Object> qt, List<?> msgs, List<Tool> tools,
                                     Boolean nonInteractive, ToolPermissionContext permCtx,
                                     PermissionMode permMode) {
+        return copyWith(qt, msgs, tools, nonInteractive, permCtx, permMode, this.peerExecutionOrigin());
+    }
+
+    /**
+     * 通用 record copy（带 peer 来源覆写）· 仅替换非 null override 字段，其余 54 字段原样透传。
+     *
+     * <p>[sendmessage-cross-session · B] peer 来源是唯一一个「null 也是显式值」的维度
+     * （清污 = 显式置 null），故单独走本重载而非复用 null 语义。
+     */
+    private ToolUseContext copyWith(Map<String, Object> qt, List<?> msgs, List<Tool> tools,
+                                    Boolean nonInteractive, ToolPermissionContext permCtx,
+                                    PermissionMode permMode,
+                                    com.nexusai.application.agent.messaging.PeerExecutionOrigin origin) {
         return new ToolUseContext(
             agentId(), sessionId(), mode(), additionalWorkingDirectories(),
             tools != null ? tools : availableTools(),
@@ -1906,7 +2108,8 @@ public record ToolUseContext(
             effectiveModelName(),   // [openai-lazy] 透传 (null 保留)
             effectiveProviderType(), subagentName(), isBuiltIn(),
             agentContext(),   // [批 5b-1] 透传 (null 保留)
-            teammateIdentity(), requestExtras());  // [S1-T1] 身份透传 (null 保留) · [request-extras] 请求级透传原样保留
+            teammateIdentity(), requestExtras(), notifyChats(),
+            origin);  // [sendmessage-cross-session · B] 覆盖值（null 也是显式值=清污）；原实现误传 this.peerExecutionOrigin() ⇒ withPeerExecutionOrigin 恒空操作
     }
 
     public ToolUseContext with(SubagentContextOverrides overrides) {
@@ -2021,9 +2224,9 @@ public record ToolUseContext(
         // [R-A45 A-4 D18/B2] override 缺省 → packAgentId(createAgentId())（CC createAgentId 产物
         //   经 S-12 可逆桥存入 UUID 字段），不再独立 UUID.randomUUID() —— 对齐 CC forkedAgent.ts:448
         //   {@code overrides?.agentId ?? createAgentId()} 语义（子 agent 每次 spawn 新 ID，不继承父）。
-        UUID newAgentId = overrides.agentId() != null
+        String newAgentId = overrides.agentId() != null
             ? overrides.agentId()
-            : AgentContext.packAgentId(AgentContext.createAgentId());
+            : AgentContext.createAgentId();
 
         // [CC :449] agentType: 仅 override (不取 parent, override null = 子 ctx.agentType = null)
         String newAgentType = overrides.agentType();
@@ -2079,6 +2282,7 @@ public record ToolUseContext(
         }
 
         return new ToolUseContext(
+            // [agentid-cc-align] canonical 首参是 String（a+16hex）；overrides 仍是历史 UUID 形
             newAgentId, this.sessionId(), this.mode(),
             this.additionalWorkingDirectories(), newAvailableTools, this.taskListId(),
             newAbortController, newMessages,
@@ -2121,7 +2325,15 @@ public record ToolUseContext(
             // [request-extras 批 1] 透传父值（与 subagentName/isBuiltIn/agentContext 不同）：
             //   本字段是「请求级」范围（用户 @ 的库/文件），不是「本 agent 身份」⇒ 同一请求内派生出的
             //   子代理理应看到同一范围，故原样保留（父空 map → 子空 map，行为不变）。
-            requestExtras());
+            requestExtras(),
+            // [V306] 通知目标透传父值（同 requestExtras 的理由）：本字段是「本轮/本任务」范围
+            //   （定时任务配的通知目标），不是「本 agent 身份」⇒ 子代理理应看到同一范围。
+            //   （父 null → 子 null，行为不变。）
+            this.notifyChats(),
+            // [sendmessage-cross-session · B] peer 来源**继承**父值（与 requestExtras 同口径，与
+            //   teammateIdentity/agentContext 相反）：子代理执行的是同一个 peer 触发的任务，若在此
+            //   置 null，守卫会被「嵌套一层子代理」绕过；失败方向必须取「仍是 peer」而不是「洗白」。
+            this.peerExecutionOrigin());
     }
 
     /**

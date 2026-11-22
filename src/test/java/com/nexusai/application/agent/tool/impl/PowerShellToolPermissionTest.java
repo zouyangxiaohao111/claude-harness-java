@@ -414,7 +414,7 @@ class PowerShellToolPermissionTest {
             cmd("Set-Content", "cmdlet", "..\\project\\HEAD", "x"),
             cmd("git", "unknown", "status")));
         PowerShellTool tool = new PowerShellTool(new PowerShellPermissionChain(ast));
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", cwd);
         PermissionResult result = tool.checkPermissions(input("Set-Content ..\\project\\HEAD x ; git status"), ctx);
@@ -445,7 +445,7 @@ class PowerShellToolPermissionTest {
             cmd("Set-Content", "cmdlet", "hooks\\pre-commit", "evil"),
             cmd("git", "unknown", "status")));
         PowerShellTool tool = new PowerShellTool(new PowerShellPermissionChain(ast));
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", cwd);
         PermissionResult result = tool.checkPermissions(input("Set-Content hooks\\pre-commit evil ; git status"), ctx);
@@ -495,7 +495,7 @@ class PowerShellToolPermissionTest {
     private static ToolUseContext ctxWithCwd(Path cwd) {
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
         SessionCwdHolder.setOriginalCwd(sessionId, cwd.toString());
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId,
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId,
             PermissionMode.DEFAULT, List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", cwd);
         pinnedOriginalCwdSessions.add(sessionId);
@@ -514,7 +514,7 @@ class PowerShellToolPermissionTest {
     }
 
     private static ToolUseContext ctxWith(ToolPermissionContext permCtx) {
-        return new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             java.util.Map.of(), List.of(), null, null, List.of(), permCtx, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", null, null, java.util.Map.of(),
             null, null, null, null, null);

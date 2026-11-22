@@ -12,7 +12,6 @@ import java.nio.file.Path;
 import java.time.Duration;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.function.BooleanSupplier;
 import java.util.stream.Collectors;
 
@@ -171,8 +170,8 @@ class TaskStopDispatchTest {
         // WHY: LOCAL_AGENT 必须仍走 killAsyncAgent（only-if-running 原子守卫），不能误入 cancel。
         //   回归 OPD-TS-23：TaskStop 路径 killAsyncAgent 行为不变。
         Ctx ctx = newCtx();
-        UUID agentId = UUID.randomUUID();
-        String taskId = agentId.toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String taskId = agentId;
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null,
             "sess-stop-3b-fixture");
 
@@ -235,8 +234,8 @@ class TaskStopDispatchTest {
     @DisplayName("非 running 任务 → NOT_RUNNING（CC StopTaskError not_running :50-55）")
     void stopTask_notRunning_returnsNotRunning() {
         Ctx ctx = newCtx();
-        UUID agentId = UUID.randomUUID();
-        String taskId = agentId.toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String taskId = agentId;
         ctx.runner.registerAsyncAgent(agentId, "调研任务", "prompt", "general-purpose", null,
             "sess-stop-3b-fixture");
         ctx.runner.completeAsyncAgent(taskId, AsyncAgentResult.success("结论", 1, 10L, "agent-x"));

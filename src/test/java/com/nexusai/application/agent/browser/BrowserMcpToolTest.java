@@ -151,7 +151,8 @@ class BrowserMcpToolTest {
         BrowserMcpTool tool = toolFor("computer", null);
         var result = tool.execute(new ToolUseBlock("call-1", tool.name(), JSON.createObjectNode()));
 
-        assertThat(((ToolResult<?>) result).data())
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（文本仍是原消息）
+        assertThat(String.valueOf(((ToolResult<?>) result).data()))
                 .isEqualTo(BrowserMcpTool.EXTENSION_NOT_CONNECTED_MESSAGE);
     }
 

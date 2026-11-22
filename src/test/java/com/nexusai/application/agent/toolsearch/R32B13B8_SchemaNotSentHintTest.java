@@ -46,7 +46,7 @@ class R32B13B8_SchemaNotSentHintTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private ToolUseContext createCtx(List<Tool> availableTools) {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT,
             Map.of(), availableTools, "", null, List.of(),

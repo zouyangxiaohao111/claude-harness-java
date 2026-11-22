@@ -149,6 +149,54 @@ export function checkAnydocNative(jarPath, jarTool) {
   return false
 }
 
+/**
+ * 出包检查：ast-grep 二进制是否随 jar 内置（AstGrep/AstEdit 的数据来源）。
+ *
+ * <p>只警告不 fail（与 {@link checkAnydocNative} 同取舍）：资源缺失时后端
+ * `AstGrepBinary.available()` 为 false ⇒ 两个工具 `isEnabled()=false`（模型看不到它们），
+ * 应用其余功能完全正常。资源由 `backend/scripts/fetch-ast-grep.mjs` 生成
+ * （`resources/ast-grep/<arch>-<os>/ast-grep[.exe].gz`，gzip 后 ≈8.5MB/平台）。
+ *
+ * @param jarPath jar 绝对路径（判据来源）
+ * @param jarTool JDK 的 jar 可执行文件（列条目用）
+ */
+export function checkAstGrepNative(jarPath, jarTool) {
+  if (!jarPath || !jarTool || !existsSync(jarPath)) {
+    console.warn('[prepare-backend] ⚠️ 无 jar 路径，跳过 ast-grep 内置检查')
+    return false
+  }
+  let bundled = []
+  try {
+    const listing = execSync(`"${jarTool}" --list --file "${jarPath}"`, { encoding: 'utf8' })
+    bundled = listing
+      .split(/\r?\n/)
+      .map((l) => l.trim())
+      .filter((e) => e.startsWith('BOOT-INF/classes/ast-grep/') && !e.endsWith('/'))
+  } catch (e) {
+    console.warn(`[prepare-backend] 读取 jar 条目失败（跳过 ast-grep 内置检查）: ${e.message}`)
+    return false
+  }
+  if (bundled.length === 0) {
+    console.warn('')
+    console.warn('[prepare-backend] ⚠️ jar 内没有 ast-grep 资源（BOOT-INF/classes/ast-grep/）：')
+    console.warn('  影响：AstGrep/AstEdit 工具 isEnabled()=false（模型看不到），其余功能正常。')
+    console.warn('  处置：cd backend && node scripts/fetch-ast-grep.mjs --all 后重新 mvn package。')
+    console.warn('')
+    return false
+  }
+  const platforms = [...new Set(bundled.map((e) => e.split('/')[3]))].sort()
+  console.log(
+    `[prepare-backend] ast-grep 二进制：已随 jar 内置（平台 ${platforms.join(', ')}，` +
+      `${bundled.length} 个文件）—— 运行时由 AstGrepBinary 解压到 tmp`
+  )
+  const expected = ['arm64-darwin', 'arm64-linux', 'arm64-win32', 'x64-darwin', 'x64-linux', 'x64-win32']
+  const missing = expected.filter((p) => !platforms.includes(p))
+  if (missing.length > 0) {
+    console.warn(`[prepare-backend] ⚠️ 缺少平台 ${missing.join(', ')} —— 这些平台 AstGrep/AstEdit 不可用`)
+  }
+  return true
+}
+
 /** jar 内迁移目录（spring-boot repackage 把 target/classes 放到 BOOT-INF/classes 下） */
 const MIGRATION_DIR_IN_JAR = 'BOOT-INF/classes/db/migration/'
 
@@ -266,8 +314,11 @@ function main() {
 
   // 3.5) anydoc 原生库检查（只警告不 fail —— 见 checkAnydocNative 的 WHY）
   //      ⭐ 判据已改为「jar 里有没有」：库随 jar 内置（resources/anydoc/<arch>-<os>/）
-  console.log(`[prepare-backend] [4/6] 检查 anydoc 原生库（jar 内置 → 外部兜底）`)
+  console.log(`[prepare-backend] [4/6] 检查 anydoc / ast-grep 原生二进制（jar 内置）`)
   checkAnydocNative(jarPath, tools.jar)
+  // ast-grep 只警告不 fail：缺资源时后端 AstGrep/AstEdit 的 isEnabled()=false（工具不暴露），
+  // 应用其余功能不受影响 ⇒ 与 anydoc 同取舍。资源生成见 backend/scripts/fetch-ast-grep.mjs。
+  checkAstGrepNative(jarPath, tools.jar)
 
   // 4) jdeps 求基线模块，与补丁集并集去重排序 → --add-modules 串
   console.log(`[prepare-backend] [5/6] jdeps 分析模块依赖: ${jarPath}`)

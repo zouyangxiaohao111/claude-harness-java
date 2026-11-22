@@ -1,4 +1,4 @@
-import type { ChatMessageDto } from '../api/types'
+import type { ChatMessageDto, PeerSourceInfo } from '../api/types'
 
 /**
  * [轮判据] 轮属性判据的【唯一真源】。
@@ -97,6 +97,267 @@ export function isAgentNotificationRow(m: ChatMessageDto): boolean {
 }
 
 /**
+ * [peer-message] 读取跨会话来源元数据（后端 `structuredOutput.peer_source`）。
+ *
+ * <p><b>WHY 必须有这一层规范化</b>：主会话 DTO 没有顶层 summary，来源标题/回信地址/hop-chain
+ * 只能从 `structuredOutput` 里取；后端 Map 透传，键名可能按 camelCase 或 snake_case 出站
+ * （方案 §3.4 的字段名与 Java Map 写入点由 A/B 批确定）。渲染层若直接 `so.peer_source.sourceTitle`
+ * 取值，键名一变就静默退化成「主代理」，用户看到错误来源 —— 比不显示更糟。
+ *
+ * <p>只做**读取与规整**，不推断来源：`peer_source` 缺失 → null（调用方回落既有 agent 通知视觉）。
+ * `sourceTitle` 是他人数据，调用方必须按纯文本渲染。
+ */
+export function readPeerSource(m: ChatMessageDto): PeerSourceInfo | null {
+  const structured = m.structuredOutput
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return null
+  const raw = pickStructuredField(structured, ['peer_source', 'peerSource'])
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const r = raw as Record<string, unknown>
+  const genRaw = pickStructuredField(r, ['endpointGeneration', 'endpoint_generation', 'generation'])
+  return {
+    sourceSessionId: asPeerText(pickStructuredField(r, ['sourceSessionId', 'source_session_id'])),
+    sourceTitle: asPeerText(pickStructuredField(r, ['sourceTitle', 'source_title'])),
+    // 发送方名称（CC envelope `from-name`）：后端多数版本把它折进 sourceTitle，
+    // 这里单独读是为了内联卡片的「发送方」显示不被标题缺失连带丢空。
+    fromName: asPeerText(pickStructuredField(r, ['fromName', 'from_name'])),
+    sourceKind: asPeerText(pickStructuredField(r, ['sourceKind', 'source_kind', 'kind'])),
+    messageId: asPeerText(pickStructuredField(r, ['messageId', 'message_id'])),
+    endpointGeneration: typeof genRaw === 'string' || typeof genRaw === 'number' ? genRaw : null,
+    fromMode: asPeerText(pickStructuredField(r, ['fromMode', 'from_mode'])),
+    // `from` = 可回信地址（CC envelope 属性），不是发件人昵称；缺省不伪造。
+    from: asPeerText(pickStructuredField(r, ['from'])),
+    hopChain: asPeerHopChain(pickStructuredField(r, ['hopChain', 'hop_chain'])),
+    // 入站准入（服务端信封透传）：auto / approved；缺失 = 未知 ⇒ UI 显示中性文案，⛔ 不猜。
+    admission: asPeerText(pickStructuredField(r, ['admission'])),
+    admissionReason: asPeerText(pickStructuredField(r, ['admissionReason', 'admission_reason'])),
+  }
+}
+
+/**
+ * [peer-message] 是否是**跨会话** agent 通知行（= agent_message 且带 peer_source）。
+ *
+ * <p>判定依据只有 `peer_source` 存在性，不看 `queuedOrigin`/`author` 猜：
+ * 同会话子代理通知（既有契约）没有 peer_source，必须继续走原「收到 X 通知」视觉；
+ * 跨会话行的 author 是来源 session id，若沿用原来的空 author → 「主代理」回落会把
+ * 他人会话冒充成本会话主代理（用户看到错误归属）。
+ */
+export function isPeerAgentNotification(m: ChatMessageDto): boolean {
+  return isAgentNotificationRow(m) && readPeerSource(m) != null
+}
+
+/**
+ * [peer-failure] 读取「投递失败通知」载荷（后端 `structuredOutput.peer_failure`）。
+ *
+ * <p>后端 `PeerFailureNotifier` 在**发送方会话**写一条 meta 行（role=user / subtype=agent_message /
+ * isMeta=true），structured_output 带 {@code peer_failure{messageId, reason, receiverSessionId,
+ * receiverTitle}}。它与「跨会话来信」共用 subtype，但语义相反：这是**我方发出去没送到**的回执，
+ * 既不是来信（没有 peer_source ⇒ 不能走来信卡片），也不是普通代理通知（文案完全不同）。
+ *
+ * <p>键名兼容 camelCase / snake_case；缺失 → null（调用方回落既有通知视觉）。
+ */
+export interface PeerFailureInfo {
+  /** 未投递成功的消息 id（后端用它派生通知行 id：`peer-failure-<messageId>`） */
+  messageId: string | null
+  /** 线上原始原因串（expired / user-declined / receiver-closed / queue-full / …）；展示层做中文映射 */
+  reason: string | null
+  /** 接收方会话 id（= 消息的目标） */
+  receiverSessionId: string | null
+  /** 接收方会话标题快照（他人数据：只按纯文本渲染） */
+  receiverTitle: string | null
+}
+
+export function readPeerFailure(m: ChatMessageDto): PeerFailureInfo | null {
+  const structured = m.structuredOutput
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return null
+  const raw = pickStructuredField(structured, ['peer_failure', 'peerFailure'])
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null
+  const r = raw as Record<string, unknown>
+  return {
+    messageId: asPeerText(pickStructuredField(r, ['messageId', 'message_id'])),
+    reason: asPeerText(pickStructuredField(r, ['reason'])),
+    receiverSessionId: asPeerText(pickStructuredField(
+      r, ['receiverSessionId', 'receiver_session_id', 'targetSessionId', 'target_session_id'])),
+    receiverTitle: asPeerText(pickStructuredField(
+      r, ['receiverTitle', 'receiver_title', 'targetTitle', 'target_title'])),
+  }
+}
+
+/** 失败原因归一档（线上原值 → 前端文案档）；未知值一律 unknown，不猜。 */
+export type PeerFailureReasonKey =
+  | 'expired'
+  | 'rejected'
+  | 'refused'
+  | 'no_live_session'
+  | 'rate_limited'
+  | 'duplicate'
+  | 'queue_full'
+  | 'relay_budget'
+  | 'hop_loop'
+  | 'hop_runaway'
+  | 'unknown'
+
+/**
+ * 原因串归一：线上实际出站用连字符（`user-declined` / `receiver-closed` / `queue-full` /
+ * `rate-limited` / `relay-budget` / `hop-loop` / `hop-runaway`，见后端 PeerFailureNotifier/PeerRateLimits），需求文档用下划线
+ * 写法 ⇒ 两种拼写都认：小写 + `_`→`-` 后比对。
+ */
+export function normalizePeerFailureReason(raw: string | null | undefined): PeerFailureReasonKey {
+  const key = (raw ?? '').trim().toLowerCase().replace(/_/g, '-')
+  switch (key) {
+    case 'expired': return 'expired'
+    case 'rejected':
+    case 'user-declined':
+    case 'declined': return 'rejected'
+    case 'refused': return 'refused'
+    case 'no-live-session':
+    case 'receiver-closed':
+    case 'no-live': return 'no_live_session'
+    case 'rate-limited': return 'rate_limited'
+    case 'duplicate': return 'duplicate'
+    case 'queue-full': return 'queue_full'
+    case 'relay-budget': return 'relay_budget'
+    case 'hop-loop': return 'hop_loop'
+    case 'hop-runaway': return 'hop_runaway'
+    default: return 'unknown'
+  }
+}
+
+/** 接收方展示名：标题缺失显示「未命名会话」（⛔ 不拿 id 冒充名称）。 */
+export function peerFailureReceiverTitle(f: PeerFailureInfo): string {
+  const title = (f.receiverTitle ?? '').trim()
+  return title === '' ? '未命名会话' : title
+}
+
+/**
+ * 失败通知文案（纯文本；标题/会话 id 都是他人数据 ⇒ 调用方必须以文本节点渲染，不执行 HTML）。
+ *
+ * <p>每条都带「来源会话《标题》+ 来源 id」：标题缺失 → 未命名会话；id 缺失 → 省略括号。
+ */
+export function peerFailureSentence(f: PeerFailureInfo): string {
+  const id = (f.receiverSessionId ?? '').trim()
+  const who = `《${peerFailureReceiverTitle(f)}》${id ? `（${id}）` : ''}`
+  switch (normalizePeerFailureReason(f.reason)) {
+    case 'expired': return `你发给${who}的消息已过期，未获批准，未投递给对方。`
+    case 'rejected': return `你发给${who}的消息被对方拒绝。`
+    case 'refused': return `你发给${who}的消息被对方入站策略拒绝。`
+    case 'no_live_session': return `你发给${who}的消息未送达：目标会话不在线。`
+    case 'rate_limited': return `你发给${who}的消息被限流丢弃：发送过于频繁。`
+    case 'duplicate': return `你发给${who}的消息被去重丢弃：短时间内重复内容。`
+    case 'queue_full': return `你发给${who}的消息被拒绝：对方待收件已满。`
+    case 'relay_budget': return `你发给${who}的消息未送达：转发预算耗尽。`
+    case 'hop_loop': return `你发给${who}的消息在会话之间反复往返，已被判定为循环并拦截。`
+    case 'hop_runaway': return `你发给${who}的消息转发链过长，已被判定为失控转发并拦截。`
+    default: return `投递到${who}失败（未知原因）。`
+  }
+}
+
+/**
+ * [peer-failure] 实时事件（`peer.message.failed` / `peer.message.rejected`）→ 一条**合成消息行**。
+ *
+ * <p><b>WHY 合成普通行而不是另建渲染通道</b>：失败通知的权威来源是后端落库行（同 id =
+ * `peer-failure-<messageId>`）。实时事件只做「立即出现」的提示，刷新后由 GET /messages 的持久行
+ * 接管 —— 两者必须同 id，否则同一条失败会出现两行（或刷新后消失）。因此这里按**落库行同形**构造：
+ * subtype=agent_message、isMeta=true、structured_output.peer_failure。
+ *
+ * <p>⛔ messageId 缺失 → 无法去重/对齐持久行 ⇒ 返回 null（不插行）。
+ */
+export function peerFailureRowFromEvent(
+  evt: Record<string, unknown>,
+  sessionId: string | null | undefined,
+): ChatMessageDto | null {
+  const sid = (sessionId ?? '').trim()
+  if (sid === '') return null
+  const messageId = asPeerText(pickStructuredField(evt, ['messageId', 'message_id']))
+  if (messageId == null) return null
+  const reason = asPeerText(pickStructuredField(evt, ['reason']))
+  const receiverSessionId = asPeerText(pickStructuredField(
+    evt, ['targetSessionId', 'target_session_id', 'receiverSessionId', 'receiver_session_id']))
+  const receiverTitle = asPeerText(pickStructuredField(
+    evt, ['targetTitle', 'target_title', 'receiverTitle', 'receiver_title']))
+  return {
+    id: `peer-failure-${messageId}`,
+    sessionId: sid,
+    role: 'user',
+    // author = 接收方会话（与落库行一致：后端把 targetSessionId 写进 author 位）
+    author: receiverSessionId,
+    content: asPeerText(pickStructuredField(evt, ['text'])),
+    reasoning: null,
+    toolCalls: null,
+    finishReason: null,
+    inputTokens: null,
+    outputTokens: null,
+    reasoningDurationMs: null,
+    time: asPeerText(pickStructuredField(evt, ['occurredAt', 'occurred_at', 'rejectedAt', 'rejected_at'])),
+    toolCallId: null,
+    assistantMessageId: null,
+    subtype: 'agent_message',
+    structuredOutput: {
+      peer_failure: {
+        messageId,
+        reason,
+        receiverSessionId,
+        receiverTitle,
+      },
+    },
+    isMeta: true,
+    isApiErrorMessage: false,
+    apiError: null,
+    error: null,
+    errorDetails: null,
+    matchedRule: null,
+    userMessageId: null,
+  }
+}
+
+/**
+ * [peer-message] 跨会话通知的**真实摘要**（`structuredOutput.agent_summary`）。
+ *
+ * <p>⛔ 不读顶层 `msg.summary` —— 那个字段是子代理转录契约（后端 AgentMessage.summary），
+ * 主会话 peer 行上不存在（方案 §3.6 复核：主会话 DTO 无顶层 summary 投影）。
+ * 拿它当 peer 摘要会在后端补投影前显示空/错值。读取失败返回空串，由调用方回落正文首行。
+ */
+export function readPeerNoticeSummary(m: ChatMessageDto): string {
+  const structured = m.structuredOutput
+  if (!structured || typeof structured !== 'object' || Array.isArray(structured)) return ''
+  return asPeerText(pickStructuredField(structured, ['agent_summary', 'agentSummary'])) ?? ''
+}
+
+/** 按候选键取第一个「有值」的字段（camelCase / snake_case 兼容；空串视为缺省）。 */
+function pickStructuredField(obj: Record<string, unknown>, keys: readonly string[]): unknown {
+  for (const k of keys) {
+    const v = obj[k]
+    if (v !== undefined && v !== null && v !== '') return v
+  }
+  return undefined
+}
+
+/** 规整为可展示文本：字符串 trim 后非空 / 有限数字转串；其余（对象/数组/布尔）→ null。 */
+function asPeerText(v: unknown): string | null {
+  if (typeof v === 'string') {
+    const t = v.trim()
+    return t === '' ? null : t
+  }
+  if (typeof v === 'number' && Number.isFinite(v)) return String(v)
+  return null
+}
+
+/**
+ * 规整 hop-chain：数组原样取段；单串按 `>` 拆分（后端可能序列化成 `a>b>c`）。
+ *
+ * <p>只做展示用分段，不解释地址含义、不据此做路由；空/非法 → null（不渲染「转发链：」空行）。
+ */
+function asPeerHopChain(v: unknown): string[] | null {
+  if (Array.isArray(v)) {
+    const parts = v.map(asPeerText).filter((p): p is string => p != null)
+    return parts.length > 0 ? parts : null
+  }
+  const text = asPeerText(v)
+  if (text == null) return null
+  const parts = text.split('>').map((p) => p.trim()).filter(Boolean)
+  return parts.length > 0 ? parts : null
+}
+
+/**
  * 后台通知 / 子代理回执的正文特征（**前端兜底防御**）。
  *
  * <p><b>WHY 需要按内容判（2026-11-02 用户实测「nexus 回复被切成多段」）</b>：
@@ -133,8 +394,28 @@ export function isNotificationInjectedUserRow(m: ChatMessageDto): boolean {
  *
  *  <p>渲染分组（MessageList）与窗口裁剪（{@link capTailTurns}）**共用**此判据：用户裁定
  *  「只按用户消息算轮次」，后台通知 / cron / 队列 / 离开摘要 / 子代理回执都不开新轮。 */
+/** SessionCreate 派单消息 id 前缀（后端 `SessionCreateTool` 落库：`"peer-launch-" + UUID`）。 */
+export const PEER_LAUNCH_ID_PREFIX = 'peer-launch-'
+
+/**
+ * [peer-launch] 是否是 SessionCreate 派单行（= 派生会话的首条任务）。
+ *
+ * <p><b>与协作来信严格区分</b>：SendMessage 来信同样是 `role=user / isMeta=true /
+ * subtype=agent_message`，但它由普通消息 id 承载；只有派单消息用
+ * {@link PEER_LAUNCH_ID_PREFIX} 前缀。派生会话没有别的用户提问行 ⇒ 不把它当轮起点，
+ * 该会话的轮次窗口恒为空。
+ *
+ * <p>与后端 `TurnPaging.isPeerLaunchTurnRow`、`TurnPaging.PEER_LAUNCH_ID_PREFIX` 同口径。
+ */
+export function isPeerLaunchRow(m: ChatMessageDto): boolean {
+  return m.role === 'user' && m.id.startsWith(PEER_LAUNCH_ID_PREFIX)
+}
+
 export function isUserTurnRow(m: ChatMessageDto): boolean {
   if (m.role !== 'user') return false
+  // [peer-launch] 派单行 = 该会话的轮起点（用户 2026-11-22 裁定）。同一判据见 isPeerLaunchRow，
+  //   ⚠️ SendMessage 来信不满足该前缀 ⇒ 仍按后台通知处理（不开新轮）。
+  if (isPeerLaunchRow(m)) return true
   if (m.isMeta) return false
   if (m.author === 'system' || m.author === 'attachment') return false
   if (m.isCompactSummary === true) return false

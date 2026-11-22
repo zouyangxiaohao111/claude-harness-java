@@ -14,7 +14,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  * <p><b>WHY（规则九 · 测试验证意图）</b>：底部「缓存利用率 / 当前上下文」被同会话后台任务污染
  * （实测 63% 的 message.usage 事件出自 {@code cron-idle-*} 线程，取「最后一条带 usage 的条目」时被
  * 后台任务那轮顶掉）。修复要求事件带来源标记、前端只统计「用户自己的请求」——于是判据必须成立：
- * <b>cron 调度（TestJob fire：mode=prompt + workload=cron）与任务通知（mode=task-notification）都不是
+ * <b>cron 调度（AgentJob fire：mode=prompt + workload=cron）与任务通知（mode=task-notification）都不是
  * 用户自己的请求 → background；busy-queued 是用户自己排的队 → user</b>。
  *
  * <p>为什么这条判据只能在这里成立：run 进 LlmAgentLoop 之后，{@code querySource} 恒
@@ -42,7 +42,7 @@ class CronIdleExecutorUsageSourceTest {
     }
 
     @Test
-    @DisplayName("cron 调度 fire（TestJob 入队：mode=prompt + workload=cron）→ background")
+    @DisplayName("cron 调度 fire（AgentJob 入队：mode=prompt + workload=cron）→ background")
     void cronWorkloadIsBackground() {
         assertThat(CronIdleExecutor.usageSourceOf(item(NotificationQueue.MODE_PROMPT, NotificationQueue.WORKLOAD_CRON)))
             .isEqualTo(MessageUsageEvent.SOURCE_BACKGROUND);

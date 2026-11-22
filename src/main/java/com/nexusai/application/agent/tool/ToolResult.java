@@ -154,17 +154,55 @@ public record ToolResult<T>(
         return new ToolResult<>(data, null, null, null);
     }
 
-    /** 失败结果 (data 承载错误消息; is_error 由执行器推导). */
-    public static ToolResult<String> error(String toolUseId, String message) {
-        return new ToolResult<>(message == null ? "unknown error" : message, null, null, null);
+    /**
+     * 失败结果 · data 承载 {@link ToolError}（错误态由<b>类型</b>承载，不再靠文案前缀反推）。
+     *
+     * <p><b>WHY 改载荷</b>：旧实现把错误文案当普通 String 放进 data，下游只能靠前缀表
+     * {@code isToolErrorData} 反推；未入表文案（如 Edit 的 {@code "path is empty"}）被判成功，
+     * 再被成功模板 mapper 覆盖成 {@code "The file  has been updated successfully."}（实测假成功）。
+     * 现错误态由 {@code data instanceof ToolError} 结构判定，执行层据此直构错误块且不调 mapper
+     * （对齐 CC：错误路径从不进 {@code mapToolResultToToolResultBlockParam}）。
+     *
+     * @param toolUseId 工具调用 ID（mapper 推导，工厂内丢弃）
+     * @param message   错误文本（空/空白 → {@code "unknown error"}）
+     * @return data 为 {@link ToolError}（默认类别 {@link ToolErrorKind#CALL_THREW}）
+     */
+    public static ToolResult<ToolError> error(String toolUseId, String message) {
+        return new ToolResult<>(ToolError.of(message), null, null, null);
     }
 
     /**
-     * [R32-b15 C15 遗留] 失败结果 (带错误分类) — errorCategory 已改走 OTel 通道,
-     * 参数保留仅供 60+ 调用点编译通过, 内部丢弃.
+     * 失败结果（带历史 category 字符串）· category 映射为 {@link ToolErrorKind}
+     * （{@code "validation"} → VALIDATE_INPUT、{@code "permission"} → PERMISSION_DENY，
+     * 其余 → CALL_THREW）。
+     *
+     * <p>保留该签名供既有 60+ 调用点编译通过；错误类别改由枚举承载，不再只进 OTel。
      */
-    public static ToolResult<String> error(String toolUseId, String message, String errorCategory) {
-        return new ToolResult<>(message == null ? "unknown error" : message, null, null, null);
+    public static ToolResult<ToolError> error(String toolUseId, String message, String errorCategory) {
+        return new ToolResult<>(new ToolError(message, ToolError.kindOfCategory(errorCategory)),
+            null, null, null);
+    }
+
+    /**
+     * 失败结果（显式类别）· 供执行器按失败点精确标注（schema / validateInput / 权限 / 取消 / 合成）。
+     *
+     * @param toolUseId 工具调用 ID（mapper 推导，工厂内丢弃）
+     * @param message   错误文本
+     * @param kind      失败类别（决定是否套 {@code <tool_use_error>} 外壳）
+     * @return data 为 {@link ToolError}
+     */
+    public static ToolResult<ToolError> failure(String toolUseId, String message, ToolErrorKind kind) {
+        return new ToolResult<>(new ToolError(message, kind), null, null, null);
+    }
+
+    /**
+     * 结构判定 · data 是否为失败载荷（替代字符串前缀表 {@code isToolErrorData} 的实现）。
+     *
+     * @param data 工具结果 data
+     * @return true = 本次结果是失败
+     */
+    public static boolean isErrorData(Object data) {
+        return data instanceof ToolError;
     }
 
     /**
@@ -262,9 +300,9 @@ public record ToolResult<T>(
      * @param message     错误信息 (data, LLM 可见)
      * @param newMessages 注入对话历史的额外消息 (如 isMeta 重试指令)
      */
-    public static ToolResult<String> errorWithNewMessages(
+    public static ToolResult<ToolError> errorWithNewMessages(
             String message, List<ChatMessageDto> newMessages) {
-        return new ToolResult<>(message == null ? "unknown error" : message, newMessages, null, null);
+        return new ToolResult<>(ToolError.of(message), newMessages, null, null);
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -436,6 +474,10 @@ public record ToolResult<T>(
             return "";
         }
         Object data = result.data();
+        // 失败载荷 → 模型可见文本即错误原文（类别/外壳由执行层渲染，渲染器只给裸消息）
+        if (data instanceof ToolError err) {
+            return err.message();
+        }
         if (data instanceof String s) {
             return s;
         }

@@ -164,3 +164,97 @@ describe('EnvConfigPanel v2 形态', () => {
     expect(text).toContain('只有一个地址槽位')
   })
 })
+
+/**
+ * [保密 2026-11-22] 凭据输入框的脱敏契约（用户「明文 apiKey 不能」）。
+ *
+ * 后端 GET/PUT 只回掩码（****abcd）。前端必须做到三件，少一件就会把真 key 冲成掩码：
+ *  ① 输入框**不回填**任何值（掩码只进 placeholder），从根上杜绝「失焦回写掩码」；
+ *  ② 已配置时有可见标记 + 「清空」按钮（清空是显式动作，不靠留空）；
+ *  ③ 输入新 key 才提交，且提交的是用户输入的明文。
+ */
+describe('EnvConfigPanel 凭据脱敏（2026-11-22）', () => {
+  let container: HTMLDivElement
+  let root: Root
+
+  beforeEach(() => {
+    container = document.createElement('div')
+    document.body.appendChild(container)
+    root = createRoot(container)
+  })
+
+  afterEach(() => {
+    act(() => root.unmount())
+    container.remove()
+    vi.restoreAllMocks()
+  })
+
+  async function render(settings: AppSettings | null, onSave: (req: UpdateSettingsRequest) => Promise<boolean>) {
+    await act(async () => {
+      root.render(<EnvConfigPanel settings={settings} onOpenMemoryEditor={() => {}} onSaveSettings={onSave} />)
+      await Promise.resolve()
+    })
+  }
+
+  function deepSeekCard(): HTMLElement {
+    const card = Array.from(container.querySelectorAll('.envc-eng'))
+      .find((e) => e.querySelector('.envc-eng-name')?.textContent?.includes('DeepSeek'))
+    if (!card) throw new Error('未找到 DeepSeek 卡')
+    return card as HTMLElement
+  }
+
+  /** 受控 input：用原生 setter 改值并派发 input，React 才认。 */
+  async function typeInto(input: HTMLInputElement, value: string) {
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+    await act(async () => {
+      setter.call(input, value)
+      input.dispatchEvent(new Event('input', { bubbles: true }))
+      await Promise.resolve()
+    })
+  }
+
+  it('已配置：输入框不回填明文/掩码，掩码只出现在 placeholder', async () => {
+    await render(baseSettings({ apiKey: '****1234' }), async () => true)
+    const input = deepSeekCard().querySelector('input[type="password"]') as HTMLInputElement
+    expect(input.value).toBe('')
+    expect(input.placeholder).toContain('****1234')
+    expect(input.placeholder).toContain('已配置')
+  })
+
+  it('未配置：不显示「清空」按钮', async () => {
+    await render(baseSettings({ apiKey: null }), async () => true)
+    const clear = Array.from(deepSeekCard().querySelectorAll('button'))
+      .find((b) => b.textContent === '清空')
+    expect(clear).toBeUndefined()
+  })
+
+  it('已配置：「清空」是显式动作，提交空串', async () => {
+    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
+    await render(baseSettings({ apiKey: '****1234' }), onSave)
+    const clear = Array.from(deepSeekCard().querySelectorAll('button'))
+      .find((b) => b.textContent === '清空') as HTMLButtonElement
+    expect(clear).toBeTruthy()
+    await act(async () => { clear.click(); await Promise.resolve() })
+    expect(onSave).toHaveBeenCalledTimes(1)
+    expect(onSave.mock.calls[0][0]).toEqual({ apiKey: '' })
+  })
+
+  it('已配置：不动输入框直接失焦 → 不发请求（不会把掩码写回）', async () => {
+    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
+    await render(baseSettings({ apiKey: '****1234' }), onSave)
+    const input = deepSeekCard().querySelector('input[type="password"]') as HTMLInputElement
+    await act(async () => { input.focus(); input.blur(); await Promise.resolve() })
+    expect(onSave).not.toHaveBeenCalled()
+  })
+
+  it('输入新 key 后失焦 → 提交用户输入的明文', async () => {
+    const onSave = vi.fn(async (_req: UpdateSettingsRequest) => true)
+    await render(baseSettings({ apiKey: '****1234' }), onSave)
+    const input = deepSeekCard().querySelector('input[type="password"]') as HTMLInputElement
+    input.focus()
+    await typeInto(input, 'sk-rotated-9999')
+    await act(async () => { input.blur(); await Promise.resolve() })
+    expect(onSave).toHaveBeenCalledTimes(1)
+    expect(onSave.mock.calls[0][0]).toEqual({ apiKey: 'sk-rotated-9999' })
+  })
+})

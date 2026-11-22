@@ -125,7 +125,7 @@ class GateAllowSkipTest {
     /** 13 参工厂：显式 permissionContext + effectiveCwd（同 {@code EditImpliesReadTest} 夹具形态）。 */
     private static ToolUseContext ctx(Path effectiveCwd, ToolPermissionContext pc) {
         return ToolUseContext.of(
-            UUID.nameUUIDFromBytes(("gas-agent-" + effectiveCwd).getBytes()),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             UUID.nameUUIDFromBytes(("gas-sess-" + effectiveCwd + pc.mode()).getBytes()).toString(),
             PermissionMode.DEFAULT, List.of(), "", AbortController.NOOP, List.of(),
             pc, pc.mode(), Map.of(), false, "", effectiveCwd);
@@ -641,7 +641,7 @@ class GateAllowSkipTest {
             WriteFileTool write = writeToolWithRealChecker(new PathGuard(tmp));
             // 3 参工厂：permissionContext = null
             ToolUseContext noPerm = ToolUseContext.of(
-                UUID.randomUUID(), "gas-noperm",
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "gas-noperm",
                 PermissionMode.DEFAULT);
 
             assertThatCode(() -> {

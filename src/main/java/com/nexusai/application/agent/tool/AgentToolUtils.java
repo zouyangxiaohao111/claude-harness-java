@@ -60,6 +60,7 @@ public final class AgentToolUtils {
         ToolNameConstants.WEB_SEARCH_TOOL_NAME,         // WebSearch
         ToolNameConstants.TODO_WRITE_TOOL_NAME,         // TodoWrite
         ToolNameConstants.GREP_TOOL_NAME,               // Grep
+        ToolNameConstants.AST_GREP_TOOL_NAME,           // AstGrep（只读结构化搜索；AstEdit 可写，不加）
         ToolNameConstants.WEB_FETCH_TOOL_NAME,          // WebFetch
         ToolNameConstants.GLOB_TOOL_NAME,               // Glob
         ToolNameConstants.BASH_TOOL_NAME,               // Bash (SHELL_TOOL_NAMES)
@@ -72,7 +73,9 @@ public final class AgentToolUtils {
         ToolNameConstants.TOOL_SEARCH_TOOL_NAME,        // ToolSearch
         ToolNameConstants.ENTER_WORKTREE_TOOL_NAME,     // EnterWorktree
         ToolNameConstants.EXIT_WORKTREE_TOOL_NAME,      // ExitWorktree
-        ToolNameConstants.VISION_ANALYZE_TOOL_NAME      // vision_analyze（代理视觉模型读图/PDF 页）
+        ToolNameConstants.VISION_ANALYZE_TOOL_NAME,     // vision_analyze（代理视觉模型读图/PDF 页）
+        // Artifact：worker 需要「写 HTML 页面并发布」；CC 协调者正是把发布委派给 worker。
+        ToolNameConstants.ARTIFACT_TOOL_NAME            // Artifact（本仓本地发布版）
     );
 
     /**
@@ -111,17 +114,41 @@ public final class AgentToolUtils {
     }
 
     /**
-     * CC constants/tools.ts:107-112 · coordinator 模式专用白名单 —
-     * 仅输出 + agent 管理工具给 coordinator (worker 侧由 filterToolsForAgent 过滤).
+     * coordinator 模式专用白名单 · 对齐 claude.exe 2.1.328 {@code vfn}（@334245957）。
      *
-     * <p>[D session] 补全 constants/tools.ts 第 5 集 (C session 已建前 4 集).
-     * Java 端 coordinator mode 未启用 (feature flag 关闭), 集合保留为 CC 结构对齐.
+     * <p>exe 的协调者工具过滤：
+     * <pre>
+     * function vfn(o,t=()=>!1){
+     *   ...
+     *   return o.filter((r)=&gt;E8r.has(r.name)||...||dFa(r.name)||f(r)||nXt(r)||...||Zk(r,e)||...)
+     * }
+     * </pre>
+     * {@code E8r = new Set([Agent, TaskStop, SendMessage, al, Skill, uw, ListAgents, XA, Workflow])}
+     * —— 9 项中有 3 项（al/uw/XA）静态未确名。本仓按<b>已确名且存在的工具</b>取并集：
+     * Agent / TaskStop / SendMessage / Skill / Workflow / ListAgents。
+     *
+     * <p>保留 {@code StructuredOutput}：旧版白名单含它，exe 2.1.328 未确证移除
+     * （它可能是 9 项中未确名之一），删掉会改变本仓既有内部工具面。
+     *
+     * <p><b>本仓有意偏离（2026-11-20 用户裁定）</b>：追加
+     * {@link ToolNameConstants#SESSION_CREATE_TOOL_NAME}。CC 没有「创建同级会话」工具，
+     * 但本仓协调者需要先把活派给「用户能在左栏接手继续聊」的同级会话，再用 SendMessage 继续对话；
+     * 缺了它协调者只能退化成一次性子代理编排。白名单本身只做收窄（减法），
+     * deny / 会话禁用 / bare 裁剪仍在它之前生效，不会因此放宽其它工具。
+     *
+     * <p>未移植的放行通道（列残留）：cliOwned MCP（{@code f(r)}）、comms MCP（{@code nXt(r)}）、
+     * {@code CLAUDE_CODE_COORDINATOR_EXTRA_TOOLS}（{@code Zk}）。
      */
     public static final Set<String> COORDINATOR_MODE_ALLOWED_TOOLS = Set.of(
         AgentToolConstants.AGENT_TOOL_NAME,               // Agent
         ToolNameConstants.TASK_STOP_TOOL_NAME,            // TaskStop
         ToolNameConstants.SEND_MESSAGE_TOOL_NAME,         // SendMessage
-        ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME      // StructuredOutput
+        ToolNameConstants.SESSION_CREATE_TOOL_NAME,       // SessionCreate（本仓扩展 · 见上）
+        ToolNameConstants.LIST_MODELS_TOOL_NAME,          // ListModels（SessionCreate.model 的取值来源）
+        ToolNameConstants.SKILL_TOOL_NAME,                // Skill
+        ToolNameConstants.WORKFLOW_TOOL_NAME,             // Workflow
+        ToolNameConstants.LIST_AGENTS_TOOL_NAME,          // ListAgents（ListAgentsTool @Component，ListPeers 为别名）
+        ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME      // StructuredOutput（旧版保留）
     );
 
     /**

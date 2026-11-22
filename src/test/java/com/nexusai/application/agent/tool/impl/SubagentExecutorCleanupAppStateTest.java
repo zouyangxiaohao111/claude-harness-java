@@ -31,8 +31,8 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class SubagentExecutorCleanupAppStateTest {
 
-    private static final UUID AGENT_A = UUID.fromString("11111111-1111-1111-1111-111111111111");
-    private static final UUID AGENT_B = UUID.fromString("22222222-2222-2222-2222-222222222222");
+    private static final String AGENT_A = "a1111111111111111";
+    private static final String AGENT_B = "a2222222222222222";
     private static final String SESSION_ID = "33333333-3333-3333-3333-333333333333";
 
     /** 模拟父会话 appState（对齐 LlmAgentLoop.appStateRef + setAppState 语义）。 */
@@ -43,7 +43,7 @@ class SubagentExecutorCleanupAppStateTest {
             this.state = new AtomicReference<>(initial == null ? Map.of() : Map.copyOf(initial));
         }
 
-        ToolUseContext parentTuc(UUID agentId) {
+        ToolUseContext parentTuc(String agentId) {
             return ToolUseContext.of(
                 agentId, SESSION_ID, PermissionMode.DEFAULT,
                 List.of(), "", AbortController.NOOP, List.of(),
@@ -81,17 +81,17 @@ class SubagentExecutorCleanupAppStateTest {
     void removesTargetBucketOnly() {
         AppStateHolder holder = new AppStateHolder(Map.of(
             "todos", Map.of(
-                AGENT_A.toString(), List.of(new TodoWriteTool.TodoItem("A", TodoWriteTool.TodoStatus.PENDING, "Doing A")),
-                AGENT_B.toString(), List.of(new TodoWriteTool.TodoItem("B", TodoWriteTool.TodoStatus.PENDING, "Doing B")))));
+                AGENT_A, List.of(new TodoWriteTool.TodoItem("A", TodoWriteTool.TodoStatus.PENDING, "Doing A")),
+                AGENT_B, List.of(new TodoWriteTool.TodoItem("B", TodoWriteTool.TodoStatus.PENDING, "Doing B")))));
         ToolUseContext parentTuc = holder.parentTuc(AGENT_A);
 
-        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A.toString());
+        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A);
 
         Map<String, Object> snapshot = holder.snapshot();
         assertThat(todosMap(snapshot))
             .as("目标 agentId 桶必须被移除（CC: const { [agentId]: _, ...todos }）")
-            .doesNotContainKey(AGENT_A.toString());
-        assertThat(bucket(snapshot, AGENT_B.toString()))
+            .doesNotContainKey(AGENT_A);
+        assertThat(bucket(snapshot, AGENT_B))
             .as("其他 agentId 桶必须保留")
             .hasSize(1);
     }
@@ -101,11 +101,11 @@ class SubagentExecutorCleanupAppStateTest {
     void noOpWhenBucketMissing() {
         AppStateHolder holder = new AppStateHolder(Map.of(
             "todos", Map.of(
-                AGENT_B.toString(), List.of(new TodoWriteTool.TodoItem("B", TodoWriteTool.TodoStatus.PENDING, "Doing B")))));
+                AGENT_B, List.of(new TodoWriteTool.TodoItem("B", TodoWriteTool.TodoStatus.PENDING, "Doing B")))));
         ToolUseContext parentTuc = holder.parentTuc(AGENT_A);
         Map<String, Object> before = holder.snapshot();
 
-        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A.toString());
+        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A);
 
         assertThat(holder.snapshot()).isEqualTo(before);
     }
@@ -116,7 +116,7 @@ class SubagentExecutorCleanupAppStateTest {
         AppStateHolder holder = new AppStateHolder(Map.of("expandedView", "tasks"));
         ToolUseContext parentTuc = holder.parentTuc(AGENT_A);
 
-        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A.toString());
+        SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, AGENT_A);
 
         assertThat(holder.snapshot()).isEqualTo(Map.of("expandedView", "tasks"));
     }
@@ -125,11 +125,11 @@ class SubagentExecutorCleanupAppStateTest {
     @DisplayName("清理链：parentTuc/agentId null → 不抛异常（standalone 兼容）")
     void noOpOnNullArguments() {
         AppStateHolder holder = new AppStateHolder(Map.of("todos", Map.of(
-            AGENT_A.toString(), List.of(new TodoWriteTool.TodoItem("A", TodoWriteTool.TodoStatus.PENDING, "Doing A")))));
+            AGENT_A, List.of(new TodoWriteTool.TodoItem("A", TodoWriteTool.TodoStatus.PENDING, "Doing A")))));
         ToolUseContext parentTuc = holder.parentTuc(AGENT_A);
 
         // null agentId / null parentTuc 均不抛异常
-        SubagentExecutor.cleanupAgentTodosFromAppState(null, AGENT_A.toString());
+        SubagentExecutor.cleanupAgentTodosFromAppState(null, AGENT_A);
         SubagentExecutor.cleanupAgentTodosFromAppState(parentTuc, null);
         SubagentExecutor.cleanupAgentTodosFromAppState(null, null);
     }

@@ -39,7 +39,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class DangerousStripRestoreTest {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /** 测试可控: loader 返回的规则集 (每次 build 重新读取). */

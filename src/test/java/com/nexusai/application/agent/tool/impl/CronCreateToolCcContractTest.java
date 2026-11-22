@@ -135,7 +135,7 @@ class CronCreateToolCcContractTest {
         when(svc.create(any(ScheduleCreateRequest.class))).thenReturn(created("job-bp", ScheduleScope.DURABLE));
         CronCreateTool tool = new CronCreateTool(svc, CronEnabledGates.DEFAULTS);
         // durable=true（DURABLE 分支）+ ctx.sessionId=派生 UUID（工具路径落库形态）
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), derivedUuid);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), derivedUuid);
 
         ToolResult<?> r = (ToolResult<?>) tool.execute(
             call("c1", input("0 9 * * *", "run smoke test", true, true)), ctx);
@@ -164,7 +164,7 @@ class CronCreateToolCcContractTest {
         stubNoNameCollision(svc);
         when(svc.create(any(ScheduleCreateRequest.class))).thenReturn(created("job-null-bp", ScheduleScope.DURABLE));
         CronCreateTool tool = new CronCreateTool(svc, CronEnabledGates.DEFAULTS);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), derivedUuid);
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), derivedUuid);
 
         ToolResult<?> r = (ToolResult<?>) tool.execute(
             call("c1", input("0 9 * * *", "run smoke test", true, true)), ctx);
@@ -600,7 +600,7 @@ class CronCreateToolCcContractTest {
         when(svc.create(any(ScheduleCreateRequest.class))).thenReturn(created("job-3", ScheduleScope.SESSION));
         // 门 cron-durable=false（agent-trigger-cron=true 保持工具可用）
         CronCreateTool tool = new CronCreateTool(svc, new CronEnabledGates(true, false));
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
 
         ToolResult<?> r = (ToolResult<?>) tool.execute(
             call("c1", input("*/5 * * * *", "run smoke test", true, true)), ctx);
@@ -642,7 +642,7 @@ class CronCreateToolCcContractTest {
 
         assertThat(tool.isEnabled())
             .as("决策#11: 门 null→开。对齐 CC 无 null 态布尔链（isKairosCronEnabled 恒返回 boolean 且默认 true，"
-                + "CronCreateTool.ts:67-69）+ TestJob.java:99 / CronIdleExecutor.java:131 已 fail-open（null→放行），"
+                + "CronCreateTool.ts:67-69）+ AgentJob.java:99 / CronIdleExecutor.java:131 已 fail-open（null→放行），"
                 + "CronCreateTool 同化统一。fail-closed 下 null→false 会让工具静默禁用（生产 @ConfigurationProperties "
                 + "恒注入非 null，此分支仅防护直接 new 构造/测试路径）")
             .isTrue();
@@ -741,7 +741,7 @@ class CronCreateToolCcContractTest {
      * 身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。
      */
     private static ToolUseContext teammateTuc(TeammateIdentity identity) {
-        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-create",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-cron-create",
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
             .withTeammateIdentity(identity);
     }

@@ -92,7 +92,7 @@ class SnipBoundaryPersistTest {
     }
 
     private static ToolUseContext ctxWithMessages(List<?> messages) {
-        return ToolUseContext.of(UUID.randomUUID(), SESSION, PermissionMode.DEFAULT, List.of(), "",
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION, PermissionMode.DEFAULT, List.of(), "",
             AbortController.NOOP, messages);
     }
 

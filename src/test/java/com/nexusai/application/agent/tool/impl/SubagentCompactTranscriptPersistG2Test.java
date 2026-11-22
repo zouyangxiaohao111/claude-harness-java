@@ -226,7 +226,7 @@ class SubagentCompactTranscriptPersistG2Test {
     @DisplayName("[R4] armCompactTranscriptPersist 武装后 state.isCompactPersistArmed() 为真；经 AgentState.persistCompactedMessages 收到 postCompact 时产物落子代理自己的转录")
     void armingSeam_armsListenerOnState_andProductsLandInOwnTranscript() {
         // GIVEN: 子代理 state（真类）+ 未武装
-        AgentState state = new AgentState("sys", SESSION_ID, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION_ID, AGENT_ID);
         assertThat(state.isCompactPersistArmed())
             .as("前置：未武装时判据必须为假（否则本用例无鉴别力）").isFalse();
 

@@ -114,5 +114,28 @@ public record SessionDto(
      * 左栏置顶标记（V283 列 pinned）· 1/0 → Boolean，null 保持 null（未设置，读侧按未置顶处理）。
      * 前端「任务」列表据此把置顶会话排到最前的独立置顶区；后端列表 ORDER BY 不感知本列。
      */
-    Boolean pinned
-) {}
+    Boolean pinned,
+    /**
+     * [session-create V328] 派生来源会话 id（{@code derived_from_session_id}）·
+     * null = 用户自己建的普通会话；非空 = 由该会话经 SessionCreate 创建。
+     * 前端左栏据此显示「派生」标记。⛔ 只用于展示，不作路由/权限判据。
+     */
+    String derivedFromSessionId
+) {
+
+    /**
+     * 24 参兼容构造器 · 保留 V328 加列前的既有调用形态（derivedFromSessionId 缺省 null）。
+     */
+    public SessionDto(String id, String model, String modelName, String title, String time,
+                      SessionGroup group, String tabId, String mainProjectId, Integer messageCount,
+                      OffsetDateTime createdAt, OffsetDateTime updatedAt, String effortLevel,
+                      Boolean ultracodeEnabled, Boolean bareMode, Map<String, Object> teamContext,
+                      Map<String, Object> todos, String permissionMode, Double totalCostYuan,
+                      Long totalTokens, String mainThreadAgent, Boolean coordinatorMode,
+                      Double cacheHitRate, Boolean kbToolsEnabled, Boolean pinned) {
+        this(id, model, modelName, title, time, group, tabId, mainProjectId, messageCount,
+            createdAt, updatedAt, effortLevel, ultracodeEnabled, bareMode, teamContext, todos,
+            permissionMode, totalCostYuan, totalTokens, mainThreadAgent, coordinatorMode,
+            cacheHitRate, kbToolsEnabled, pinned, null);
+    }
+}

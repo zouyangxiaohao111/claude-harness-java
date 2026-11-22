@@ -67,7 +67,7 @@ class PermissionDecisionAttachmentTest {
         hooks.registerPreToolUse("permreq", prHook);
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT);
         StreamingToolExecutor exec = new StreamingToolExecutor(registryWith(stub), ctx, null, null, hooks);
         exec.setTelemetry(new Telemetry());
@@ -113,7 +113,7 @@ class PermissionDecisionAttachmentTest {
             null, null, null, null, null, null, null, null, null));
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT);
         StreamingToolExecutor exec = new StreamingToolExecutor(registryWith(stub), ctx, null, null, hooks);
         exec.setTelemetry(new Telemetry());
@@ -138,7 +138,7 @@ class PermissionDecisionAttachmentTest {
             PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of(),
             false, false, Map.of(), false, true, null); // awaitAutomatedChecksBeforeDialog=true
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT);
 
         Tool stub = new Tool() {

@@ -100,7 +100,7 @@ export type PermissionKind = 'message' | 'bridge' | 'channel'
  *  `permissionUpdates` = 用户点「一键授权」时后端推来的 suggestions **原样**回传
  *  （wire 键 `updatedPermissions`，CC 判别联合形状）→ 后端 apply 到 ctx + 落盘。
  *  ⛔ 前端不做任何结构转换；仅点击第三档时携带（普通允许/拒绝不传 → 不产生规则）。 */
-export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations; permissionUpdates?: PermissionUpdate[]; acceptFeedback?: string; updatedInput?: unknown }) {
+export function sendPermissionResponse(client: Client, sessionId: string, kind: PermissionKind, requestId: string, decision: 'allow' | 'deny', extra?: { answers?: AskUserAnswers; annotations?: AskUserAnnotations; permissionUpdates?: PermissionUpdate[]; acceptFeedback?: string; updatedInput?: unknown; afkTimeoutMs?: number; isByCountdown?: boolean }) {
   const dest = {
     message: `/app/sessions/${sessionId}/permission-response`,
     bridge: `/app/sessions/${sessionId}/permission-bridge-response`,
@@ -120,6 +120,14 @@ export function sendPermissionResponse(client: Client, sessionId: string, kind: 
   // [plan-approval] 用户编辑后的工具输入（如审批卡里改过的计划）· CC updatedInput full replace
   if (extra?.updatedInput !== undefined) {
     payload.updatedInput = extra.updatedInput
+  }
+  // [V333 AFK] 倒计时超时提交：时长由后端并入 Allow.updatedInput（工具侧据此出「No response after Ns」），
+  //   isByCountdown 只做归因（不进 tool_result）。人类作答路径两字段都不发。
+  if (extra?.afkTimeoutMs !== undefined) {
+    payload.afkTimeoutMs = extra.afkTimeoutMs
+  }
+  if (extra?.isByCountdown !== undefined) {
+    payload.isByCountdown = extra.isByCountdown
   }
   client.publish({ destination: dest, body: JSON.stringify(payload) })
 }

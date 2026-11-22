@@ -247,6 +247,24 @@ class ErrorClassifierTest {
     }
 
     @Test
+    @DisplayName("shouldRetry: 429 套餐/账户额度耗尽 → false（终态；对齐 CC 订阅态 429 不重试 withRetry.ts:765-769）")
+    void shouldRetry429QuotaExhaustedIsFalse() {
+        LlmApiException quota = new LlmApiException(429, Map.of(),
+            "{\"message\":\"已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)\","
+                + "\"type\":\"rate_limit_error\",\"http_code\":\"429\"}");
+        assertThat(ErrorClassifier.shouldRetry(quota)).isFalse();
+        assertThat(ErrorClassifier.isRetryable(quota)).isFalse();
+    }
+
+    @Test
+    @DisplayName("shouldRetry: 429 insufficient_quota（OpenAI 兼容网关）→ false")
+    void shouldRetry429InsufficientQuotaIsFalse() {
+        assertThat(ErrorClassifier.shouldRetry(new LlmApiException(429, Map.of(),
+            "{\"error\":{\"message\":\"You exceeded your current quota\",\"type\":\"insufficient_quota\"}}")))
+            .isFalse();
+    }
+
+    @Test
     @DisplayName("shouldRetry: OAuth revoked 403 → true（CC:779-781）")
     void shouldRetryRevoked403IsTrue() {
         assertThat(ErrorClassifier.shouldRetry(new LlmApiException(403, Map.of(),

@@ -2,6 +2,7 @@ package com.nexusai.application.chat;
 
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.compact.SqliteBusyRetry;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -12,7 +13,6 @@ import org.springframework.test.util.ReflectionTestUtils;
 
 import java.time.OffsetDateTime;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -99,7 +99,7 @@ class ChatServiceCompactPersistRetryTest {
             }
             return inv.getArgument(1);
         });
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, AgentContext.createAgentId());
         armChatService(messageService, state);
 
         assertThat(state.isCompactPersistArmed()).as("前置：compact 落库通道已武装").isTrue();
@@ -121,7 +121,7 @@ class ChatServiceCompactPersistRetryTest {
             calls.incrementAndGet();
             throw busySnapshot();
         });
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, AgentContext.createAgentId());
         armChatService(messageService, state);
 
         assertThatThrownBy(() -> state.persistCompactedMessages(postCompact()))
@@ -143,7 +143,7 @@ class ChatServiceCompactPersistRetryTest {
             calls.incrementAndGet();
             throw new IllegalStateException("NOT NULL constraint failed: messages.id");
         });
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, AgentContext.createAgentId());
         armChatService(messageService, state);
 
         assertThatThrownBy(() -> state.persistCompactedMessages(postCompact()))

@@ -50,7 +50,7 @@ class NotebookEditToolCcContractTest {
     }
 
     private static ToolUseContext ctx(Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of()),
             PermissionMode.DEFAULT, Map.of(), false, "", effectiveCwd);

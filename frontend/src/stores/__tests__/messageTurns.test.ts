@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest'
-import { capTailTurns, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isLiveDisplayRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../messageTurns'
+import { capTailTurns, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isLiveDisplayRow, isNotificationInjectedUserRow, isPeerAgentNotification, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, readPeerNoticeSummary, readPeerSource, turnKeyByRowId, turnKeyOf } from '../messageTurns'
 import type { ChatMessageDto } from '../../api/types'
 
 /** 测试用最小 ChatMessageDto。 */
@@ -96,6 +96,30 @@ describe('[agent-notice] SendMessage 协作通知行：可见、不开新轮、�
 
   it('turnKeyOf：通知行沿用上一提问的轮键', () => {
     expect(turnKeyOf(notice(), 'u1')).toBe('u1')
+  })
+})
+
+describe('[peer-launch] SessionCreate 派单行是轮起点；协作来信不是', () => {
+  /**
+   * 后端 SessionCreateTool 落库的派单消息：`id=peer-launch-<uuid>`、`isMeta=true`、
+   * `subtype=agent_message`、`author=创建者会话 id`。
+   * 用户裁定：派单算一轮；SendMessage 来信（同 subtype，id 不是该前缀）仍按通知处理。
+   */
+  const launch = (patch: Partial<ChatMessageDto> = {}): ChatMessageDto =>
+    msg('peer-launch-7af547eb-e7da-4cee-9370-c86cc8ee1b37', {
+      author: 'sess-parent',
+      subtype: 'agent_message',
+      isMeta: true,
+      content: '你接手一个已规划好的小批次',
+      ...patch,
+    })
+
+  it('isUserTurnRow：只认 id 以 peer-launch- 开头的派单行', () => {
+    expect(isUserTurnRow(launch())).toBe(true)
+    // 对照组：同 subtype / isMeta，但 id 不是派单前缀（SendMessage 来信）⇒ 仍不算轮起点
+    expect(isUserTurnRow(msg('msg-mail', { author: 'sess-other', subtype: 'agent_message', isMeta: true }))).toBe(false)
+    // 对照组：assistant 角色即使 id 撞前缀也不算
+    expect(isUserTurnRow(launch({ role: 'assistant' }))).toBe(false)
   })
 })
 
@@ -203,6 +227,122 @@ describe('messageTurns 判据（与 MessageList 渲染分组同源）', () => {
     expect(turnKeyOf(msg('b1', { role: 'system', subtype: 'compact_boundary' }), null)).toBe('b1')
   })
 })
+
+describe('[peer-message] 跨会话通知行的判据与来源读取', () => {
+  /** 数据合同（方案 §3.4）：role=user、isMeta、subtype=agent_message、author=来源 session id、
+   *  queuedOrigin=peer；structuredOutput 带 peer_source + agent_summary。 */
+  const peer = (patch: Partial<ChatMessageDto> = {}): ChatMessageDto =>
+    msg('peer-1', {
+      author: 'sess-c7767a8d',
+      subtype: 'agent_message',
+      isMeta: true,
+      queuedOrigin: 'peer',
+      content: '原文：请复核 §3.6',
+      structuredOutput: {
+        peer_source: {
+          sourceSessionId: 'sess-c7767a8d',
+          sourceTitle: '审计报告',
+          sourceKind: 'session',
+          messageId: 'src-msg-9',
+          endpointGeneration: 3,
+          fromMode: 'default',
+          from: 'sess-c7767a8d',
+          hopChain: ['sess-ce9234ed', 'sess-c7767a8d'],
+        },
+        agent_summary: '请复核前端呈现方案',
+      },
+      ...patch,
+    })
+
+  it('readPeerSource：读取来源元数据（camelCase 合同字段逐项可用）', () => {
+    const src = readPeerSource(peer())
+    expect(src).not.toBeNull()
+    expect(src!.sourceSessionId).toBe('sess-c7767a8d')
+    expect(src!.sourceTitle).toBe('审计报告')
+    expect(src!.sourceKind).toBe('session')
+    expect(src!.messageId).toBe('src-msg-9')
+    expect(src!.endpointGeneration).toBe(3)
+    expect(src!.fromMode).toBe('default')
+    expect(src!.from).toBe('sess-c7767a8d')
+    expect(src!.hopChain).toEqual(['sess-ce9234ed', 'sess-c7767a8d'])
+  })
+
+  it('readPeerSource：兼容后端 Map 的 snake_case 键与单串 hop-chain（键名漂移不得静默丢来源）', () => {
+    const src = readPeerSource(peer({
+      structuredOutput: {
+        peer_source: {
+          source_session_id: 'sess-other',
+          source_title: '同名会话',
+          source_kind: 'agent',
+          message_id: 'm2',
+          endpoint_generation: '7',
+          from_mode: 'plan',
+          from: 'agent:researcher',
+          hop_chain: 'sess-a > sess-b',
+        },
+      },
+    }))
+    expect(src).not.toBeNull()
+    expect(src!.sourceSessionId).toBe('sess-other')
+    expect(src!.sourceTitle).toBe('同名会话')
+    expect(src!.sourceKind).toBe('agent')
+    expect(src!.messageId).toBe('m2')
+    expect(src!.endpointGeneration).toBe('7')
+    expect(src!.fromMode).toBe('plan')
+    expect(src!.from).toBe('agent:researcher')
+    expect(src!.hopChain).toEqual(['sess-a', 'sess-b'])
+  })
+
+  it('readPeerSource：缺 peer_source / 非法结构 → null（不臆造来源）', () => {
+    expect(readPeerSource(peer({ structuredOutput: null }))).toBeNull()
+    expect(readPeerSource(peer({ structuredOutput: { agent_summary: '只有摘要' } }))).toBeNull()
+    expect(readPeerSource(peer({ structuredOutput: { peer_source: 'not-an-object' } }))).toBeNull()
+    // 对照组：同会话子代理通知（无 structuredOutput）也不得被判成 peer
+    expect(readPeerSource(noticeLegacy())).toBeNull()
+  })
+
+  it('isPeerAgentNotification：只有「agent_message + peer_source」才是跨会话通知', () => {
+    expect(isPeerAgentNotification(peer())).toBe(true)
+    // 对照组：既有子代理通知没有 peer_source → 必须继续走原视觉（author=team-lead → 主代理）
+    expect(isAgentNotificationRow(noticeLegacy())).toBe(true)
+    expect(isPeerAgentNotification(noticeLegacy())).toBe(false)
+    // 非 agent_message / assistant 行永不成立
+    expect(isPeerAgentNotification(peer({ subtype: 'task_notification' }))).toBe(false)
+    expect(isPeerAgentNotification(peer({ role: 'assistant' }))).toBe(false)
+  })
+
+  it('readPeerNoticeSummary：真实摘要只读 structuredOutput.agent_summary（⛔ 不拿顶层 summary 冒充）', () => {
+    expect(readPeerNoticeSummary(peer())).toBe('请复核前端呈现方案')
+    // 顶层 summary 是子代理转录契约字段：peer 行只有它时不得被当成摘要（主会话 DTO 无该投影）
+    expect(readPeerNoticeSummary(peer({ summary: '子代理转录摘要' }))).toBe('请复核前端呈现方案')
+    expect(readPeerNoticeSummary(peer({
+      summary: '子代理转录摘要',
+      structuredOutput: { peer_source: { sourceSessionId: 's' } },
+    }))).toBe('')
+    expect(readPeerNoticeSummary(peer({ structuredOutput: { agent_summary: 'snake 摘要' } }))).toBe('snake 摘要')
+  })
+
+  it('轮次判据：peer 通知行进对话流、不开新轮、不进「已完成」折叠区', () => {
+    const row = peer()
+    expect(isDialogueRow(row)).toBe(true)
+    expect(isUserTurnRow(row)).toBe(false)
+    expect(isSystemInjectedRow(row)).toBe(false)
+    // 前向扫描：peer 行沿用上一提问的轮键，后面的 assistant 段仍归 u1（不出现第二个 nexus 头）
+    expect(turnKeyOf(row, 'u1')).toBe('u1')
+    const rows = [
+      msg('u1', { userMessageId: 'u1' }),
+      row,
+      msg('a1', { role: 'assistant', userMessageId: 'u1' }),
+    ]
+    expect(orderedTurnKeys(rows)).toEqual(['u1'])
+    expect(turnKeyByRowId(rows).get('peer-1')).toBe('u1')
+  })
+})
+
+/** 既有同会话子代理通知（无 structuredOutput）：对照基线，不得被 peer 判据吞掉。 */
+function noticeLegacy(): ChatMessageDto {
+  return msg('n-legacy', { author: 'team-lead', subtype: 'agent_message', isMeta: true, content: '继续' })
+}
 
 describe('messageTurns capTailTurns（窗口 = 最近 N 轮，整轮保留）', () => {
   it('未超上限 → 返回同一引用（WHY：引用稳定才不触发无谓重渲/重排）', () => {

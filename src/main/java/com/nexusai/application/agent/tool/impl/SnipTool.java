@@ -380,6 +380,11 @@ public class SnipTool implements Tool {
         if (result == null) {
             return null;
         }
+        // [错误通道 CCJ-ERR-014] 失败不渲染成功模板（第二道防线）：错误内容若走到这里，
+        //   "Snipped 0 messages. Summary: " 会把失败伪装成成功；返回 null 让调用方回退默认渲染器。
+        if (isError || ToolResult.isErrorData(result.data())) {
+            return null;
+        }
         int count = 0;
         String summary = "";
         if (result instanceof ToolResult<?> tr && tr.data() instanceof String s) {

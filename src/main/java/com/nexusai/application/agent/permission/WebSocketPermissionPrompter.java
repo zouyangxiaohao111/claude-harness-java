@@ -3,6 +3,8 @@ package com.nexusai.application.agent.permission;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.common.SessionKeys;
+import com.nexusai.application.agent.messaging.PeerExecutionOrigin;
+import com.nexusai.application.agent.messaging.PeerUiApprovalAuthority;
 import com.nexusai.application.agent.hook.PermissionBehavior;
 import com.nexusai.application.agent.permission.hook.AbortException;
 import com.nexusai.application.agent.permission.hook.GenericHook;
@@ -143,16 +145,6 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     private ChannelPermissionCallbacks channelCallbacks;
 
     /**
-     * [impl-I-3 T6] channel relay 门控数据源 · CC original: {@code isChannelPermissionRelayEnabled()}
-     * （channelPermissions.ts:36-38，GrowthBook 'tengu_harbor_permissions' 默认 false）。
-     * Java 配置 {@code nexusai.mcp.channels-permission-relay-enabled}（默认 false）→ 跳过整个
-     * channel relay 竞速（CC「One gate, full disable」useManageMCPConnections.ts:188）。null
-     * （测试直构 / 未注入）→ 视为开启（保留既有 STOMP channel 竞速测试语义）。
-     */
-    @Autowired(required = false)
-    private com.nexusai.application.agent.mcp.config.McpProperties mcpProperties;
-
-    /**
      * [impl-I-3 T6] 合格 channel server 数据源 · CC original: {@code getAppState().mcp.clients}
      * （interactiveHandler.ts:323）。Java 数据源 = {@link McpToolPool}（activeServers +
      * getServerCapabilities）。null（未接线 / 测试）→ 跳过 filter（向后兼容）。
@@ -177,20 +169,144 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * 默认 false，非硬编码 {@code () -> true}）。镜像 CC {@code isChannelPermissionRelayEnabled()}
      * （channelPermissions.ts:36-37，GrowthBook 'tengu_harbor_permissions' 缺省 false）。
      */
+    /**
+     * [V334] 会话渠道绑定判据（本会话是否已接入渠道）。
+     *
+     * <p>用户 2026-11-22 裁定：权限中继跟着 CC 走、**不跟着无人值守走** ——
+     * 两道设置门都开只是「允许」，真正推送还要求该会话已绑定渠道。
+     * null（测试直构 / 未注入）→ 视为已绑定（测试 seam；生产恒有 bean）。
+     */
     @Autowired(required = false)
-    private ChannelPermissionFeature channelPermissionFeature;
-
-    /** [impl-I-3 T6] filterPermissionRelayClients 执行器（CC channelPermissions.ts:177-194 4 判定）。 */
-    private final com.nexusai.application.agent.security.ChannelPermission channelPermission =
-        new com.nexusai.application.agent.security.ChannelPermission(this::channelPermissionRelayEnabled);
+    private com.nexusai.domain.session.SessionModeService sessionModeService;
 
     /**
-     * [OPD-WF8-02-07] ChannelPermission.isEnabled 门控读取 · 配置 {@code nexusai.feature.channel-permission}
-     * （默认 false，对齐 CC channelPermissions.ts:36-38 默认 false）。feature 未注入（测试直构）→
-     * 默认关闭（对齐 CC 默认 false，不再保留 {@code () -> true} 语义）。
+     * [P1 端到端] 原生 IM 出站（把权限确认发到本会话绑定的聊天）。
+     * null（测试直构 / 未注入）→ 只走 STOMP 适配器那条路。
      */
-    private boolean channelPermissionRelayEnabled() {
-        return channelPermissionFeature != null && channelPermissionFeature.isEnabled();
+    @Autowired(required = false)
+    private ChannelPermissionImNotifier imNotifier;
+
+    /**
+     * [V333 AFK] AskUserQuestion 超时档位读取源 · {@code settings.ask_user_afk_timeout}。
+     *
+     * <p>只在「本次请求是提问卡片」（{@code toolInput.has("questions")}，与前端
+     * {@code askUserNotice.isAskUserQuestion} 同口径）时读一次，解析出生效时长后随请求下发；
+     * <b>不设 deadline</b>。null（测试直构 / 未注入）→ 不启用（默认行为不变）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.domain.settings.SettingsService settingsService;
+
+    /**
+     * filterPermissionRelayClients 执行器（CC channelPermissions.ts:177-194 4 判定）。
+     *
+     * <p>只用到 {@code filterPermissionRelayClients}（纯过滤）；{@code isEnabled()} 本仓无调用方
+     * ⇒ 给恒 true，避免它掺进「是否推送」的判定（那道门已改为 settings 两列，见 V334）。
+     */
+    private final com.nexusai.application.agent.security.ChannelPermission channelPermission =
+        new com.nexusai.application.agent.security.ChannelPermission(() -> true);
+
+    /**
+     * [V334] 两道设置门是否都允许中继（DB 唯一权威，默认开）。
+     *
+     * <p>⛔ 旧的假门闸 {@code nexusai.feature.channel-permission} 已删除：它只喂过 DTO 展示，
+     * 不拦任何东西，留着只会让人调错键。现在只认 settings 两列。
+     */
+    private boolean channelRelayAllowedBySettings() {
+        if (settingsService == null) {
+            return false;
+        }
+        return settingsService.readDbChannelsPermissionRelayEnabled()
+            && Boolean.TRUE.equals(settingsService.readDbChannelsEnabled());
+    }
+
+    /** [V334] 该请求所属会话是否已绑定渠道（与无人值守解耦；null bean = 测试 seam 视为已绑定）。 */
+    private boolean sessionHasChannelBinding(ToolUseContext ctx) {
+        if (sessionModeService == null) {
+            return true;
+        }
+        String sid = owningSessionId(ctx);
+        return sessionModeService.hasAnyChannel(sid);
+    }
+
+    /**
+     * [P1] 渠道权限中继的<b>唯一资格入口</b>。
+     *
+     * <p>把「settings 两道门 → 会话绑定 → 来源资格」收敛为一次求值，返回统一结构
+     * {@link ChannelRelayEligibility}（来源类型 + 能力声明 + 合格/不合格原因码）。
+     *
+     * <p>两条来源<b>各自独立</b>求值，任一合格即合格：
+     * <ul>
+     *   <li><b>IM</b>：本会话绑定了聊天（{@code imNotifier.boundChats}）—— <b>不</b>查 MCP 白名单；</li>
+     *   <li><b>MCP</b>：存在合格 channel server（connected + allowlist + 双 capability）。</li>
+     * </ul>
+     *
+     * <p>⛔ 不要把两条来源写回复用同一个 {@code if} 的并列短路：那会让 IM 也依赖 MCP 资格
+     * （真实条件下只绑 IM 就永远推不出去）。
+     */
+    public ChannelRelayEligibility evaluateChannelRelayEligibility(ToolUseContext ctx) {
+        // 闸 1: settings 两道门（DB 唯一权威，默认开）
+        if (!channelRelayAllowedBySettings()) {
+            return ChannelRelayEligibility.rejected(
+                ChannelRelayEligibility.Reason.NOT_SETTINGS_GATE, "settings 两道门未同时开启");
+        }
+        // 闸 2: 本会话必须已绑定渠道（与无人值守解耦）
+        if (!sessionHasChannelBinding(ctx)) {
+            return ChannelRelayEligibility.rejected(
+                ChannelRelayEligibility.Reason.NOT_SESSION_UNBOUND,
+                "session=" + owningSessionId(ctx));
+        }
+        String sid = owningSessionId(ctx);
+        // 来源 A: 本会话绑定的 IM 聊天（按会话绑定求值，⛔ 不走 MCP 白名单）
+        if (imNotifier != null) {
+            java.util.List<com.nexusai.model.im_channel.ImChatEntry> bound = imNotifier.boundChats(sid);
+            if (bound != null && !bound.isEmpty()) {
+                return ChannelRelayEligibility.qualified(
+                    ChannelRelayEligibility.Source.IM,
+                    ChannelRelayEligibility.Capabilities.RELAY,
+                    ChannelRelayEligibility.Reason.QUALIFIED_IM_BOUND,
+                    "chats=" + bound.size());
+            }
+        }
+        // 来源 B: 合格 MCP channel server（白名单 + 双 capability）
+        if (channelRelayServerSource == null) {
+            // MCP 池未装配（测试 seam / 无 MCP 场景）⇒ 不做来源阻断（保持原有向后兼容行为）。
+            return ChannelRelayEligibility.qualified(
+                ChannelRelayEligibility.Source.MCP,
+                ChannelRelayEligibility.Capabilities.NONE,
+                ChannelRelayEligibility.Reason.QUALIFIED_SOURCE_NOT_CHECKED,
+                "channelRelayServerSource=null");
+        }
+        if (hasQualifiedChannelRelayServer()) {
+            return ChannelRelayEligibility.qualified(
+                ChannelRelayEligibility.Source.MCP,
+                ChannelRelayEligibility.Capabilities.RELAY,
+                ChannelRelayEligibility.Reason.QUALIFIED_MCP_SERVER,
+                null);
+        }
+        return ChannelRelayEligibility.rejected(
+            ChannelRelayEligibility.Reason.NOT_NO_SOURCE,
+            "IM 未绑定且无合格 channel server");
+    }
+
+    /**
+     * [V333 AFK] 解析本次提问卡片的生效超时时长（毫秒）；{@code null} = 不启用。
+     *
+     * <p>设置 {@code never}/未配置/脏值 ⇒ 不启用（环境变量不能把「从不」变成开启，见
+     * {@link AskUserAfkTimeout} 类注释）；读库失败同样按不启用处理 —— 权限弹窗不能因为
+     * 设置读取失败而崩，且默认行为（不计时）是安全的。
+     */
+    private Long resolveAskAfkTimeoutMs() {
+        String raw = null;
+        try {
+            if (settingsService != null) {
+                raw = settingsService.get().askUserAfkTimeout();
+            }
+        } catch (Exception e) {
+            log.warn("PERMISSION AFK: 读取 settings.ask_user_afk_timeout 失败，按不启用处理: {}",
+                e.toString());
+            return null;
+        }
+        return AskUserAfkTimeout.resolveTimeoutMs(raw, System::getenv);
     }
 
     /**
@@ -271,6 +387,32 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * 本地 onAbort/onAllow/onReject 的 sendResponse + cancelRequest）。
      */
     private final Map<String, String> bridgeRequestIds = new ConcurrentHashMap<>();
+
+    /** [C批] owner requestId → channel 短 requestId（removePendingSnapshot 反向清理用）。 */
+    private final Map<String, String> channelRequestIds = new ConcurrentHashMap<>();
+
+    /**
+     * [F4] owner requestId → channel 待回执的退订句柄。
+     *
+     * <p>为什么需要：桌面先答 / abort 之后，channel 侧的 pending resolver 若不摘除，稍后一条
+     * IM「yes <短id>」仍会命中并 resolve=true（用户以为批了，实际请求早已结束）。
+     * ⇒ 桌面落地时主动退订，让迟到回执明确返回 false（过期），而不是静默成功。
+     */
+    private final Map<String, Runnable> channelUnsubscribes = new ConcurrentHashMap<>();
+
+    /**
+     * [C批 · 跨会话安全门禁] bridge/channel 响应归属表：
+     * 外部 requestId（bridge 随机 UUID / channel 短 id）→ owner requestId + 投递会话。
+     *
+     * <p>用途：{@code PermissionController} 在调用 bridge/channel resolve（会 remove pending）
+     * <b>之前</b>校验「本响应声称的会话 == 该请求实际投递会话」；peer 来源还要求真实 UI 认证。
+     * 无此表时 bridgeRequestId 只能由 prompter→callback 单向映射（{@link #bridgeRequestIds} 是
+     * owner→bridge，反向不可得）。
+     */
+    private final Map<String, String> bridgeOwnerOf = new ConcurrentHashMap<>();
+    private final Map<String, String> bridgeSessionOf = new ConcurrentHashMap<>();
+    private final Map<String, String> channelOwnerOf = new ConcurrentHashMap<>();
+    private final Map<String, String> channelSessionOf = new ConcurrentHashMap<>();
 
     /**
      * [Session S16] 权限更新 Applier（CC {@code applyPermissionUpdates}，
@@ -593,14 +735,6 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     }
 
     /**
-     * [impl-I-3 T6] 注入 channel relay 门控数据源（McpProperties → channelsPermissionRelayEnabled）。
-     * null → 视为开启（保留既有 STOMP channel 竞速测试语义）。
-     */
-    public void setMcpProperties(com.nexusai.application.agent.mcp.config.McpProperties mcpProperties) {
-        this.mcpProperties = mcpProperties;
-    }
-
-    /**
      * [impl-I-3 T6] 注入合格 channel server 数据源（McpToolPool）· null → 跳过 filter（向后兼容）。
      */
     public void setChannelRelayServerSource(com.nexusai.application.agent.mcp.McpToolPool pool) {
@@ -709,9 +843,11 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             ctx.abortController().onCancel(ac -> {
                 // 幂等: future.complete 二次调用被忽略; pending.remove 重复执行无害
                 pending.remove(requestId);
-                removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
                 raceClaims.remove(requestId);
                 if (claimed.compareAndSet(false, true)) {
+                    // [P1] Stop/abort 也必须推 resolved：否则前端卡片挂在一个已结束的请求上，
+                    //   输入框一直被锁。notifyResolved 顺带清快照（所有终态统一出口）。
+                    notifyResolved(requestId, resolveToolUseId(ctx, requestId), "abort");
                     future.complete(new PermissionResult.Deny(
                         PermissionRejectMessages.buildRejectMessage(
                             ctx.agentType() != null, null),
@@ -767,6 +903,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 computerUse,
                 isClassifierFeatureEnabled()
             );
+            // [V333 AFK] 提问卡片才下发倒计时参数（默认 null = 不启用，前端行为与改造前一致）
+            if (input != null && input.has("questions")) {
+                Long afkTimeoutMs = resolveAskAfkTimeoutMs();
+                if (afkTimeoutMs != null) {
+                    event.setAfkTimeoutMs((int) Math.min(Integer.MAX_VALUE, afkTimeoutMs.longValue()));
+                    event.setAfkCountdownMs((int) Math.min(Integer.MAX_VALUE,
+                        AskUserAfkTimeout.resolveCountdownMs(afkTimeoutMs, System::getenv)));
+                }
+            }
             // [Hook v2.1.325] PreToolUse.permissionDisplay → 前端 ask 卡片文案
             if (details != null && details.permissionDisplay() != null) {
                 event.setPermissionDisplay(details.permissionDisplay());
@@ -805,10 +950,9 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         //       pendingClassifierCheck 生产恒 null，无载体）
         //    [IMP-10 OPD-WF8-CB-01] 竞速 racer 参与/失败追踪 —— 全部 racer 异常 + 超时兜底
         //    必须 deny（对齐 CC structuredIO.ts:639-649 异常→deny），不静默放行。
-        RacerTracker racers = new RacerTracker();
-        startHookRace(tool, input, ctx, requestId, future, claimed, details, racers);
-        startBridgeRace(tool, input, ctx, requestId, future, claimed, details, racers);
-        startChannelRace(tool, input, ctx, requestId, future, claimed, details, racers);
+        startHookRace(tool, input, ctx, requestId, future, claimed, details);
+        startBridgeRace(tool, input, ctx, requestId, future, claimed, details);
+        startChannelRace(tool, input, ctx, requestId, future, claimed, details);
 
         // 4) 阻塞等待首个 racer claim 的决策 · 无限等待对齐 CC（CC 权限请求无超时——PermissionContext
         //    Promise 挂起直至用户 allow/deny 或 abort；racer 失败/onResponse/abort 均 complete future，
@@ -842,6 +986,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             promptInputs.remove(requestId);
             promptContexts.remove(requestId);
             bridgeRequestIds.remove(requestId);
+            channelRequestIds.remove(requestId);
             // [OPD-WF8-01-T5 / WF-11] 会话态 running 通知补接 · 对齐 CC structuredIO.ts:650-657：
             //   finally 中「无其他 pending 权限请求」时 notifySessionStateChanged('running')。
             //   Java 经 SdkEventQueue.enqueueSdkEvent 发射 SessionStateChangedEvent('running')，
@@ -914,17 +1059,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      */
     private void startHookRace(Tool tool, JsonNode input, ToolUseContext ctx,
                                String requestId, CompletableFuture<PermissionResult> future,
-                               AtomicBoolean claimed, PermissionPromptDetails details,
-                               RacerTracker racers) {
+                               AtomicBoolean claimed, PermissionPromptDetails details) {
         // runHookRace gate 在 start 内收敛（原 prompt() 调用点条件迁移至此）——runHookRace=false
-        //   （非 hooks 场景）时 hook racer 不启动、不计入 RacerTracker。对齐 CC
+        //   （非 hooks 场景）时 hook racer 不启动。对齐 CC
         //   interactiveHandler.ts:411-431（仅 !awaitAutomatedChecksBeforeDialog 才后台 runHooks）。
         if (hookRegistry == null || details == null || !details.runHookRace()) {
             return;
         }
         List<Map<String, Object>> suggestions = toPermissionSuggestionMaps(
             details != null ? details.suggestions() : List.of());
-        racers.recordStarted();
         RACERS.execute(() -> {
             try {
                 HookEvent requestEvent = HookEvent.permissionRequest(
@@ -939,6 +1082,8 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 HookRaceOutcome outcome = toHookRaceDecision(result, input, requestId);
                 PermissionResult decision = outcome != null ? outcome.decision() : null;
                 if (decision != null && claimed.compareAndSet(false, true)) {
+                    // hook 抢先给了决策 ⇒ 本地弹窗要关掉（否则用户看到失效对话框）
+                    notifyResolved(requestId, resolveToolUseId(ctx, requestId), "hook");
                     // [Session S16] 对齐 CC PermissionContext.ts:233-239 handleHookAllow:
                     //   hook allow 携带 updatedPermissions → persistPermissions（apply + persist）
                     //   后再放行（CC :324-335）。空列表 = hook 未批准规则变更。
@@ -963,15 +1108,11 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 //   future 永不完成 → 30s 超时兜底 deny(reason=timeout)）。
                 completeRacerAbort(requestId, future, claimed, ctx, ae);
             } catch (Throwable th) {
-                // [OPD-WF8-CB-01] 单个 racer 异常 → 保留 drop（不因单崩溃误拒），登记失败；
-                //   [2026-08-24 对齐 CC 无超时] 原超时兜底已移除 → 全部 racer 失败立即 complete deny
-                //   （否则 future 永不 complete → 无限挂起）。对齐 CC structuredIO.ts:639-649 异常→deny。
-                log.warn("HOOK PermissionRequest race failed: requestId={} err={}",
-                    requestId, th.toString());
-                racers.recordFailure();
-                if (racers.allStartedFailed()) {
-                    completeRacerAllFailed(requestId, future, claimed, ctx);
-                }
+                // [S3] 竞速按 CC：失败 = 这一路没给出决策，**不**收敛请求。
+                //   CC interactiveHandler.ts:18483-18505 的 hook racer 是裸 await（无 catch→deny），
+                //   异常只会让那一路悄悄退出，桌面弹窗继续等；收敛只来自用户/abort。
+                log.warn("HOOK PermissionRequest race failed（该路不参与收敛，桌面继续等）: "
+                    + "requestId={} err={}", requestId, th.toString());
             }
         });
     }
@@ -1134,6 +1275,18 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     private void applyAndPersistUpdates(List<PermissionUpdate> updates, ToolUseContext ctx, String requestId) {
         if (updates == null || updates.isEmpty()) {
             return;
+        }
+        // [C批 · 跨会话安全] peer 回合不得新增会话级规则/模式（真实用户一次同意 ≠ 会话永久授权）。
+        if (ctx != null && ctx.peerExecutionOrigin() != null) {
+            int before = updates.size();
+            updates = SessionPermissionOverlay.withoutSessionScoped(updates);
+            if (before != updates.size()) {
+                log.warn("PERMISSION peer 回合过滤 destination=SESSION 更新: requestId={} dropped={} kept={}",
+                    requestId, before - updates.size(), updates.size());
+            }
+            if (updates.isEmpty()) {
+                return;
+            }
         }
         // [P11d] 会话 id 上提（apply 与 persist 共用同一值）：project/local source 的写盘落点
         //   按会话解析（读侧 PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。
@@ -1540,21 +1693,28 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      */
     private void startBridgeRace(Tool tool, JsonNode input, ToolUseContext ctx,
                                  String requestId, CompletableFuture<PermissionResult> future,
-                                 AtomicBoolean claimed, PermissionPromptDetails details,
-                                 RacerTracker racers) {
+                                 AtomicBoolean claimed, PermissionPromptDetails details) {
         if (bridgeCallbacks == null) {
             return;
         }
         String bridgeRequestId = UUID.randomUUID().toString();
         bridgeRequestIds.put(requestId, bridgeRequestId);
-        racers.recordStarted();
+        // [C批 · 跨会话安全] 登记反向归属（bridgeRequestId → owner + 投递会话），供 Controller
+        //   在 resolve（remove pending）之前校验 sessionId+requestId 归属。
+        String bridgeDeliverySessionId = owningSessionId(ctx);
+        bridgeOwnerOf.put(bridgeRequestId, requestId);
+        if (bridgeDeliverySessionId != null) {
+            bridgeSessionOf.put(bridgeRequestId, bridgeDeliverySessionId);
+        }
         try {
             // [canUseTool v4] 传 sessionId — CC 回调是 session 级闭包，Java @Component 单例需显式
             //   路由出站请求到正确 session 的 STOMP topic（对齐 CC bridgePermissionCallbacks.ts
             //   sendRequest 参数 + interactiveHandler.ts:245-253）。
+            // [P0] toolUseId 与 message / channel 两条事件同值（resolveToolUseId 单点）——
+            //   前端以 `toolUseId ?? requestId` 作唯一键，两侧取值不同就会各留一张卡。
             bridgeCallbacks.sendRequest(
                 ctx.sessionId(),
-                bridgeRequestId, tool.name(), input, requestId,
+                bridgeRequestId, tool.name(), input, resolveToolUseId(ctx, requestId),
                 details != null ? details.description() : null,
                 details != null ? details.suggestions() : List.of(),
                 details != null ? details.blockedPath() : null);
@@ -1563,21 +1723,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             completeRacerAbort(requestId, future, claimed, ctx, ae);
             return;
         } catch (Throwable th) {
-            // [OPD-WF8-CB-01] 单个 racer 异常 → 保留 drop（不因单崩溃误拒），登记失败；
-            //   [2026-08-24 对齐 CC 无超时] 全部 racer 失败立即 complete deny（原超时兜底已移除）。
-            log.warn("PERMISSION bridge sendRequest failed (graceful degradation): requestId={} err={}",
-                requestId, th.toString());
-            racers.recordFailure();
-            if (racers.allStartedFailed()) {
-                completeRacerAllFailed(requestId, future, claimed, ctx);
-            }
+            // [S3] 同上：出站失败只代表这一路没参战，不收敛请求（CC 同样只 log）。
+            log.warn("PERMISSION bridge sendRequest failed（该路不参与收敛，桌面继续等）: "
+                + "requestId={} err={}", requestId, th.toString());
             return;
         }
         // [刷新重放 · 三通道] 登记 bridge 通道的待审批快照 —— 此前只重放 message 通道 ⇒
         //   bridge 通道的请求在用户刷新页面后消失（看不到、也没法批准/拒绝）。
         //   快照的 requestId = owner requestId（tool_use id）⇒ 前端补拉后按 message 通道归一化，
         //   用户的允许/拒绝能命中 prompter 的 pending future（用 bridge UUID 会查不到 → 工具挂起）。
-        String bridgeDeliverySessionId = owningSessionId(ctx);
         registerChannelSnapshot(bridgeDeliverySessionId, requestId, PendingPermissionSnapshot.fromBridge(
             bridgeDeliverySessionId, requestId, bridgeRequestId,
             resolveToolUseId(ctx, requestId), tool.name(), input,
@@ -1594,6 +1748,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 if ("allow".equals(response.behavior())) {
                     if (log.isInfoEnabled()) {
                         log.info("PERMISSION bridge race ALLOW: requestId={}", requestId);
+                        notifyResolved(requestId, resolveToolUseId(ctx, requestId), "bridge");
                     }
                     // [Session S16] 对齐 CC interactiveHandler.ts:266-269 —
                     //   response.updatedPermissions?.length → ctx.persistPermissions（apply + persist）
@@ -1640,56 +1795,103 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      */
     private void startChannelRace(Tool tool, JsonNode input, ToolUseContext ctx,
                                   String requestId, CompletableFuture<PermissionResult> future,
-                                  AtomicBoolean claimed, PermissionPromptDetails details,
-                                  RacerTracker racers) {
+                                  AtomicBoolean claimed, PermissionPromptDetails details) {
         if (channelCallbacks == null) {
             return;
         }
-        // [impl-I-3 T6] 闸 1: isChannelPermissionRelayEnabled（默认 false → 跳过整个 relay 竞速）
-        boolean relayEnabled = mcpProperties == null || mcpProperties.channelsPermissionRelayEnabled();
-        if (!relayEnabled) {
+        // [F2] 需要用户交互的工具（AskUserQuestion 类）不进 channel 中继：
+        //   渠道回执只有「yes/no + 短 id」一种形态，选择题推过去等于让人对一道看不到的题回 yes。
+        //   CC 在同样位置用 requiresUserInteraction 明确排除。
+        if (tool != null && tool.requiresUserInteraction()) {
             if (log.isInfoEnabled()) {
-                log.info("CHANNEL 竞速跳过: isChannelPermissionRelayEnabled=false requestId={}", requestId);
+                log.info("CHANNEL 竞速跳过: 工具要求用户交互（Ask 类，不能走 yes/no 回执）requestId={} tool={}",
+                    requestId, tool.name());
             }
             return;
         }
-        // [impl-I-3 T6] 闸 2: 无合格 channel server → 不参与竞速（本地/前端兜底）
-        if (channelRelayServerSource != null && !hasQualifiedChannelRelayServer()) {
+        // [P1] 资格判定收敛到一个入口：settings 两门 → 会话绑定 → 来源（IM 绑定 / 合格 MCP server）。
+        //   ⛔ 不要再把「IM 绑定」与「合格 MCP server」写成同一个 if 的并列短路 —— 那会让
+        //   只绑 IM 的会话在真实条件下永远推不出去（IM 不应走 MCP 白名单）。
+        ChannelRelayEligibility eligibility = evaluateChannelRelayEligibility(ctx);
+        if (!eligibility.qualified()) {
             if (log.isInfoEnabled()) {
-                log.info("CHANNEL 竞速跳过: 无合格 channel server（filterPermissionRelayClients 为空）requestId={}",
-                    requestId);
+                log.info("CHANNEL 竞速跳过: reason={} detail={} requestId={}",
+                    eligibility.reason(), eligibility.detail(), requestId);
             }
             return;
         }
-        String channelRequestId = channelCallbacks.shortRequestId(requestId);
-        racers.recordStarted();
+        if (log.isInfoEnabled()) {
+            log.info("CHANNEL 竞速资格: source={} capability.permissionRelay={} reason={} requestId={}",
+                eligibility.source(), eligibility.capabilities().permissionRelay(),
+                eligibility.reason(), requestId);
+        }
+        // [P2] 会话内唯一短 ID（随机 5 位 + 撞号重试 + 哈希回退）；作用域 = 投递会话。
+        String channelDeliverySessionId = owningSessionId(ctx);
+        String channelRequestId = channelCallbacks.shortRequestId(channelDeliverySessionId, requestId);
+        // [C批 · 跨会话安全] 登记反向归属（channelRequestId → owner + 投递会话）。
+        //   channel 短 id 在 StompChannelPermissionCallbacks 内部小写化 → 本表同样用小写键。
+        channelRequestIds.put(requestId, channelRequestId);
+        channelOwnerOf.put(channelRequestId.toLowerCase(java.util.Locale.ROOT), requestId);
+        if (channelDeliverySessionId != null) {
+            channelSessionOf.put(channelRequestId.toLowerCase(java.util.Locale.ROOT), channelDeliverySessionId);
+        }
+        // [P1] 先发原生 IM（本会话绑定的聊天）—— 用户手机上真正能收到的那条。
+        //   失败只 warn（对齐 CC），不判拒绝、不收敛 future。
+        if (imNotifier != null) {
+            // [P0.1] 先登记「允许回执的来源连接」= 本会话绑定的 (instanceId, peerId)，
+            //   之后 IM 入站的回执必须落在这个集合里才算可信（不能凭消息里的字段自证）。
+            java.util.List<com.nexusai.model.im_channel.ImChatEntry> bound =
+                imNotifier.boundChats(channelDeliverySessionId);
+            if (!bound.isEmpty()) {
+                java.util.Set<String> origins = new java.util.HashSet<>();
+                for (var c : bound) {
+                    if (c != null) {
+                        origins.add(c.instanceId() + "|" + c.peerId());
+                    }
+                }
+                channelCallbacks.registerOrigin(channelRequestId, origins);
+            }
+            ChannelPermissionImNotifier.NotifyResult imResult =
+                imNotifier.notifyBoundChats(channelDeliverySessionId, channelRequestId, tool.name(),
+                    details != null ? details.description() : null, input);
+            // [D] 未送达上抛：仅让桌面卡片显示「该渠道未激活，通知未送达」。
+            //   ⛔ 不得改变权限结果语义 —— 未送达 ≠ 拒绝，future 继续等桌面（不加兜底）。
+            if (imResult != null && imResult.hasFailures()) {
+                notifyDeliveryFailures(channelDeliverySessionId, requestId,
+                    resolveToolUseId(ctx, requestId), imResult.failures());
+            }
+        }
         try {
             // [canUseTool v4] 传 sessionId — 对齐 CC interactiveHandler.ts:334-354
             //   ChannelPermissionRequestParams（request_id/tool_name/description/input_preview）。
+            // [P0] 追加 toolUseId —— 与同一次请求的 message / bridge 事件同值（resolveToolUseId 单点）。
             channelCallbacks.sendRequest(
                 ctx.sessionId(),
                 channelRequestId, tool.name(),
-                details != null ? details.description() : null, input);
+                details != null ? details.description() : null, input,
+                resolveToolUseId(ctx, requestId));
         } catch (AbortException ae) {
             // [IMP-10 核心修复] AbortException 不吞 → 立即中止 deny（对齐 CC AbortError）
             completeRacerAbort(requestId, future, claimed, ctx, ae);
             return;
         } catch (Throwable th) {
-            // [OPD-WF8-CB-01] 单个 racer 异常 → 保留 drop（不因单崩溃误拒），登记失败；
-            //   [2026-08-24 对齐 CC 无超时] 全部 racer 失败立即 complete deny（原超时兜底已移除）。
-            log.warn("PERMISSION channel sendRequest failed (graceful degradation): requestId={} err={}",
-                requestId, th.toString());
-            racers.recordFailure();
-            if (racers.allStartedFailed()) {
-                completeRacerAllFailed(requestId, future, claimed, ctx);
-            }
-            return;
+            // [F3] 出站失败 = 这一路**没参与竞速**（等同未启用），不能因此把请求判 Deny ——
+            //   桌面弹窗还开着，人可能正要批准。旧实现这里 recordFailure() + allStartedFailed()
+            //   ⇒ 直接 deny 一个用户根本没拒绝的操作。
+            //   ⛔ 不登记 started/failed：该路从未参赛，不该影响其它 racer 的失败计数。
+            log.warn("PERMISSION channel sendRequest failed → 该路不参与竞速，桌面继续等待: "
+                + "requestId={} err={}", requestId, th.toString());
+            // 清掉反向归属，避免迟到/伪造的短 id 命中一个从未发出的请求
+            channelRequestIds.remove(requestId);
+            channelOwnerOf.remove(channelRequestId.toLowerCase(java.util.Locale.ROOT));
+            channelSessionOf.remove(channelRequestId.toLowerCase(java.util.Locale.ROOT));
+            // ⛔ 不 return：IM 那条路可能已经发出去了，回执仍需由下面的 onResponse 命中。
         }
+        // 只有真正推送成功才算「参与竞速」
         // [刷新重放 · 三通道] 登记 channel 通道的待审批快照（此前只重放 message 通道 ⇒
         //   channel 通道的请求在用户刷新页面后消失）。
         //   toolInput = 完整入参（channel 通道只推 200 字符截断预览；快照带全量 ⇒ 弹窗可渲染），
         //   inputPreview = 截断预览（channel 通道字段名 · 与出站事件同形）。
-        String channelDeliverySessionId = owningSessionId(ctx);
         registerChannelSnapshot(channelDeliverySessionId, requestId, PendingPermissionSnapshot.fromChannel(
             channelDeliverySessionId, requestId, channelRequestId,
             resolveToolUseId(ctx, requestId), tool.name(), input,
@@ -1702,12 +1904,26 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 tool.name(), input),
             System.currentTimeMillis()));
 
+        // [P0.2] 工具自身 MCP server 的 allow 必须丢弃（CC 2.1.330 exe：`de.behavior==="allow" &&
+        //   de.fromServer===<tool 的 mcpSkill.server.name>` → return）。否则一个能执行该工具的服务端
+        //   可以「批准自己」，绕过人工审批。
+        String selfServerName = resolveSelfServerName(ctx, tool);
         Runnable unsubscribe = channelCallbacks.onResponse(channelRequestId, response -> {
+            if ("allow".equals(response.behavior()) && selfServerName != null
+                    && selfServerName.equals(response.fromServer())) {
+                log.warn("PERMISSION channel self-approval dropped（工具自身 server 不能批准自己）: "
+                    + "requestId={} server={}", requestId, selfServerName);
+                return;
+            }
             if (claimed.compareAndSet(false, true)) {
+                channelUnsubscribes.remove(requestId);
                 if ("allow".equals(response.behavior())) {
                     if (log.isInfoEnabled()) {
                         log.info("PERMISSION channel race ALLOW: requestId={}", requestId);
                     }
+                    // ⛔ notifyResolved 必须在日志门之外：它推的是「关弹窗」事件，不是日志。
+                    //   放进 if (log.isInfoEnabled()) 会让 INFO 关掉时 allow 永不关卡（deny 分支在外）。
+                    notifyResolved(requestId, resolveToolUseId(ctx, requestId), "channel");
                     future.complete(new PermissionResult.Allow(input,
                         new PermissionDecisionReason.Other("channel_allowed"),
                         requestId, false, null, List.of()));
@@ -1715,6 +1931,8 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                     if (log.isInfoEnabled()) {
                         log.info("PERMISSION channel race DENY: requestId={}", requestId);
                     }
+                    // [F4] deny 与 allow 一样要通知前端关闭弹窗：否则桌面卡片挂在一个已结束的请求上
+                    notifyResolved(requestId, resolveToolUseId(ctx, requestId), "channel");
                     future.complete(new PermissionResult.Deny(
                         "Denied via channel " + response.fromServer(),
                         new PermissionDecisionReason.Other("channel_denied"),
@@ -1722,9 +1940,28 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 }
             }
         });
+        channelUnsubscribes.put(requestId, unsubscribe);
         if (ctx.abortController() != null && ctx.abortController() != AbortController.NOOP) {
-            ctx.abortController().onCancel(ac -> unsubscribe.run());
+            ctx.abortController().onCancel(ac -> {
+                channelUnsubscribes.remove(requestId);
+                unsubscribe.run();
+            });
         }
+    }
+
+    /**
+     * [P0.2] 解析「本工具所属的 MCP server 名」；非 MCP 工具 ⇒ null。
+     *
+     * <p>与 CC 同源：{@code metadata.mcpSkill.server.name}。本仓取 {@code Tool#mcpInfo().serverName()}。
+     */
+    private static String resolveSelfServerName(ToolUseContext ctx, Tool tool) {
+        if (ctx == null || tool == null) {
+            return null;
+        }
+        java.util.Map<String, Object> meta =
+            com.nexusai.application.agent.permission.hook.HookRegistry.mcpServerNameOf(ctx, tool.name());
+        Object name = meta == null ? null : meta.get("name");
+        return name instanceof String s && !s.isBlank() ? s : null;
     }
 
     /**
@@ -1764,42 +2001,6 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
     // [IMP-10 OPD-WF8-CB-01] 竞速 racer 参与/失败追踪 · 对齐 CC structuredIO.ts:639-649
     // ════════════════════════════════════════════════════════════════════════
 
-    /**
-     * 竞速 racer 参与/失败追踪 · [IMP-10 OPD-WF8-CB-01 拍板组合方案]。
-     *
-     * <p>语义（CC original：structuredIO.ts:639-649 竞速异常 catch → deny 决策）：
-     * <ul>
-     *   <li><b>单 racer 异常 → 保留 Java drop</b>（不因单崩溃误拒）：{@link #recordFailure()}
-     *       只登记失败，不立即拒绝；</li>
-     *   <li><b>全部 racer 异常 + 超时兜底 → deny</b>（不静默放行）：prompt 超时兜底时
-     *       {@link #allStartedFailed()} 判定 {@code started>0 && failed>=started} → 返回
-     *       {@code deny(reason=permission_request_failed)}，对齐 CC 异常→deny。</li>
-     * </ul>
-     *
-     * <p>{@code started} 由 prompt 线程同步登记（各 racer 通过 gate 实际启动时），
-     * {@code failed} 由 racer 线程异步登记 —— 超时兜底时刻 {@code started} 已完整（所有
-     * start 调用在 {@code future.get} 之前完成），无登记顺序竞态。
-     */
-    private static final class RacerTracker {
-        private final AtomicInteger started = new AtomicInteger();
-        private final AtomicInteger failed = new AtomicInteger();
-
-        /** 竞速 racer 实际启动（通过 gate）登记 · prompt 线程同步调用。 */
-        void recordStarted() {
-            started.incrementAndGet();
-        }
-
-        /** 竞速 racer 异常失败登记 · racer 线程异步调用。 */
-        void recordFailure() {
-            failed.incrementAndGet();
-        }
-
-        /** 全部已启动 racer 均已异常失败（started>0 时）· 供超时兜底 deny 判据。 */
-        boolean allStartedFailed() {
-            int s = started.get();
-            return s > 0 && failed.get() >= s;
-        }
-    }
 
     /**
      * 竞速 racer 抛 {@link AbortException} → 立即完成 future 为中止 deny · [IMP-10 核心修复]。
@@ -1849,23 +2050,6 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * @param claimed   原子 claim 守卫
      * @param ctx       工具调用上下文（拒绝消息模板）
      */
-    private static void completeRacerAllFailed(String requestId,
-                                               CompletableFuture<PermissionResult> future,
-                                               AtomicBoolean claimed, ToolUseContext ctx) {
-        if (!claimed.compareAndSet(false, true)) {
-            // 竞速已由其他 racer / 用户 / abort 胜出 → 忽略（幂等）
-            return;
-        }
-        if (log.isWarnEnabled()) {
-            log.warn("PERMISSION 全部竞速 racer 异常失败 → 立即 deny（对齐 CC structuredIO.ts:639-649 "
-                + "异常→deny，原超时兜底已移除）: requestId={}", requestId);
-        }
-        future.complete(new PermissionResult.Deny(
-            "Tool permission request failed: all permission checks failed",
-            new PermissionDecisionReason.Other("permission_request_failed"),
-            requestId));
-    }
-
     // ════════════════════════════════════════════════════════════════════════
     // STOMP 响应回调（由 PermissionController 调）
     // ════════════════════════════════════════════════════════════════════════
@@ -1892,10 +2076,193 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         onResponse(requestId, decision, null, null, null);
     }
 
+    // ════════════════════════════════════════════════════════════════════════
+    // [C批 · 跨会话安全] 审批响应归属 / 可信 UI 准入（必须在任何 pending.remove 之前调用）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 响应准入结论。 */
+    public enum ResponseAdmission {
+        /** 归属正确（peer 来源还要求可信 UI 已通过）。 */
+        ACCEPT,
+        /** 未知请求（已超时/重复/已被竞速解决）—— 交由既有容错路径处理。 */
+        UNKNOWN_REQUEST,
+        /** 会话不匹配 —— 拒绝且 <b>不</b> remove pending（错归属不消耗请求）。 */
+        WRONG_SESSION,
+        /** peer 来源但响应通道不能证明来自真实 UI —— 拒绝（调用方应 fail-closed 结束请求）。 */
+        UNTRUSTED_PEER_ORIGIN
+    }
+
+    /**
+     * 普通 permission-response 准入：先校验 {@code sessionId + requestId} 归属，再对 peer 来源
+     * 要求真实 UI 认证。调用方必须在 {@link #onResponse} 之前调用；未 ACCEPT 不得 remove。
+     */
+    public ResponseAdmission admitMessageResponse(String sessionId, String requestId) {
+        if (requestId == null || requestId.isBlank() || !pending.containsKey(requestId)) {
+            return ResponseAdmission.UNKNOWN_REQUEST;
+        }
+        String owner = pendingSessionOf.get(requestId);
+        if (owner == null || !owner.equals(sessionId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION admission: 会话归属不匹配 → 拒绝且保留 pending claimedSession={} "
+                    + "eventSession={} requestId={}", owner, sessionId, requestId);
+            }
+            return ResponseAdmission.WRONG_SESSION;
+        }
+        if (isPeerOriginPending(requestId)
+                && !PeerUiApprovalAuthority.isTrustedUi(
+                    PeerUiApprovalAuthority.Source.STOMP_MESSAGE, sessionId, requestId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION admission: peer 来源响应无法证明来自真实 UI → fail-closed "
+                    + "session={} requestId={}", sessionId, requestId);
+            }
+            return ResponseAdmission.UNTRUSTED_PEER_ORIGIN;
+        }
+        return ResponseAdmission.ACCEPT;
+    }
+
+    /** bridge 响应准入（bridgeRequestId → owner/session 由 startBridgeRace 登记）。 */
+    public ResponseAdmission admitBridgeResponse(String sessionId, String bridgeRequestId) {
+        if (bridgeRequestId == null || bridgeRequestId.isBlank()) {
+            return ResponseAdmission.UNKNOWN_REQUEST;
+        }
+        String owner = bridgeOwnerOf.get(bridgeRequestId);
+        String ownerSession = bridgeSessionOf.get(bridgeRequestId);
+        if (owner == null || !pending.containsKey(owner)) {
+            return ResponseAdmission.UNKNOWN_REQUEST;
+        }
+        if (ownerSession == null || !ownerSession.equals(sessionId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION bridge admission: 会话归属不匹配 → 拒绝 bridgeRequestId={} "
+                    + "claimedSession={} eventSession={}", bridgeRequestId, ownerSession, sessionId);
+            }
+            return ResponseAdmission.WRONG_SESSION;
+        }
+        if (isPeerOriginPending(owner)
+                && !PeerUiApprovalAuthority.isTrustedUi(
+                    PeerUiApprovalAuthority.Source.STOMP_BRIDGE, sessionId, bridgeRequestId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION bridge admission: peer 来源 → 要求真实 UI 认证, 当前未满足 "
+                    + "bridgeRequestId={} session={}", bridgeRequestId, sessionId);
+            }
+            return ResponseAdmission.UNTRUSTED_PEER_ORIGIN;
+        }
+        return ResponseAdmission.ACCEPT;
+    }
+
+    /** channel 响应准入（channelRequestId 小写键，与 StompChannelPermissionCallbacks 一致）。 */
+    public ResponseAdmission admitChannelResponse(String sessionId, String channelRequestId) {
+        if (channelRequestId == null || channelRequestId.isBlank()) {
+            return ResponseAdmission.UNKNOWN_REQUEST;
+        }
+        String key = channelRequestId.toLowerCase(java.util.Locale.ROOT);
+        String owner = channelOwnerOf.get(key);
+        String ownerSession = channelSessionOf.get(key);
+        if (owner == null || !pending.containsKey(owner)) {
+            return ResponseAdmission.UNKNOWN_REQUEST;
+        }
+        if (ownerSession == null || !ownerSession.equals(sessionId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION channel admission: 会话归属不匹配 → 拒绝 channelRequestId={} "
+                    + "claimedSession={} eventSession={}", channelRequestId, ownerSession, sessionId);
+            }
+            return ResponseAdmission.WRONG_SESSION;
+        }
+        if (isPeerOriginPending(owner)
+                && !PeerUiApprovalAuthority.isTrustedUi(
+                    PeerUiApprovalAuthority.Source.STOMP_CHANNEL, sessionId, channelRequestId)) {
+            if (log.isWarnEnabled()) {
+                log.warn("PERMISSION channel admission: peer 来源 → 要求真实 UI 认证, 当前未满足 "
+                    + "channelRequestId={} session={}", channelRequestId, sessionId);
+            }
+            return ResponseAdmission.UNTRUSTED_PEER_ORIGIN;
+        }
+        return ResponseAdmission.ACCEPT;
+    }
+
+    /** owner requestId 对应的 prompt 是否来自 peer 回合（只读类型化来源字段）。 */
+    public boolean isPeerOriginPending(String ownerRequestId) {
+        ToolUseContext promptCtx = promptContexts.get(ownerRequestId);
+        if (promptCtx == null) {
+            return false;
+        }
+        PeerExecutionOrigin origin = promptCtx.peerExecutionOrigin();
+        return origin != null;
+    }
+
+    /**
+     * 未通过可信 UI 准入的 peer 来源响应：fail-closed 结束挂起请求（Deny），避免模型永久挂起。
+     * 只允许 deny 方向，绝不把未经认证的 allow 传下去。
+     */
+    public void denyPending(String requestId, String reason) {
+        if (requestId == null || requestId.isBlank()) {
+            return;
+        }
+        CompletableFuture<PermissionResult> future = pending.remove(requestId);
+        removePendingSnapshot(requestId);
+        AtomicBoolean claimed = raceClaims.remove(requestId);
+        promptInputs.remove(requestId);
+        promptContexts.remove(requestId);
+        bridgeRequestIds.remove(requestId);
+        channelRequestIds.remove(requestId);
+        if (future == null) {
+            return;
+        }
+        if (claimed != null && !claimed.compareAndSet(false, true)) {
+            log.info("PERMISSION denyPending: 请求已被竞速解决，忽略 requestId={}", requestId);
+            return;
+        }
+        future.complete(new PermissionResult.Deny(
+            reason != null && !reason.isBlank() ? reason
+                : "Permission response rejected: the request came from a cross-session peer and could not be "
+                    + "proven to come from the real user interface.",
+            new PermissionDecisionReason.Other("peer_untrusted_ui"),
+            requestId));
+        log.warn("PERMISSION denyPending: 已 fail-closed 结束请求 requestId={} reason={}",
+            requestId, reason);
+    }
+
+    /**
+     * [F4] 摘掉某请求在 channel 侧的待回执（幂等）。
+     *
+     * <p>桌面先答 / abort / 推送失败 / channel 自身裁决都会走到这里；之后迟到的 IM 回执
+     * 由 {@code ChannelPermissionCallbacks#resolve} 返回 false（= 已过期），不再静默报成功。
+     */
+    private void releaseChannelPending(String requestId) {
+        if (requestId == null) {
+            return;
+        }
+        Runnable unsub = channelUnsubscribes.remove(requestId);
+        if (unsub == null) {
+            return;
+        }
+        try {
+            unsub.run();
+        } catch (RuntimeException e) {
+            log.warn("PERMISSION channel unsubscribe failed (ignored): requestId={} err={}",
+                requestId, e.toString());
+        }
+    }
+
     /**
      * 清掉某请求的会话状态快照 · pending future 已终结 / 被覆盖 / 推送失败时同步调用。
      */
     private void removePendingSnapshot(String requestId) {
+        // [F4] 请求终结 ⇒ 同步摘掉 channel 待回执（幂等；abort / 推送失败 / 桌面裁决都走这里）
+        releaseChannelPending(requestId);
+        // [C批 · 跨会话安全] bridge/channel 反向归属随 owner 请求同生命周期清理（防泄漏/误匹配）。
+        //   ⚠️ 用 get 不用 remove：onResponse 在 removePendingSnapshot 之后仍要读 bridgeRequestIds
+        //   向远程表面回 dismiss；owner→channel 映射在 prompt finally 清理。
+        String bridgeId = bridgeRequestIds.get(requestId);
+        if (bridgeId != null) {
+            bridgeOwnerOf.remove(bridgeId);
+            bridgeSessionOf.remove(bridgeId);
+        }
+        String channelId = channelRequestIds.get(requestId);
+        if (channelId != null) {
+            String key = channelId.toLowerCase(java.util.Locale.ROOT);
+            channelOwnerOf.remove(key);
+            channelSessionOf.remove(key);
+        }
         String sid = pendingSessionOf.remove(requestId);
         if (sid == null) return;
         Map<String, MessagePermissionRequestEvent> m = pendingBySession.get(sid);
@@ -1909,6 +2276,101 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         if (cm != null) {
             cm.remove(requestId);
             if (cm.isEmpty()) pendingChannelBySession.remove(sid);
+        }
+    }
+
+    /**
+     * 竞速非本地分支胜出 ⇒ 清快照 **并通知前端关掉本地弹窗**。
+     *
+     * <h2>WHY 必须单独一个方法</h2>
+     * {@link #removePendingSnapshot} 只清内存；用户自己点按钮时前端本来就会关，不需要通知。
+     * 但当 **hook / bridge / channel** 抢先给出决策时，本地那个弹窗是**活的** ——
+     * 不通知它，用户会看到一个已经失效的对话框，点下去毫无反应（后端已 claim，直接丢弃）。
+     *
+     * <h2>对齐 CC</h2>
+     * CC {@code interactiveHandler.ts:78-82} 在 local/hook/classifier 胜出时清掉 channel 待处理项；
+     * 我们多做一步：把「已解决」推给本地前端，让它立即关闭弹窗。
+     * ⚠️ 已发到 IM 的那条消息**无法撤回**（CC 注释：{@code the text sits in your phone}）——
+     * 只能保证本地 UI 与真实状态一致。
+     *
+     * @param requestId 工具调用 id（与前端弹窗同键）
+     * @param toolUseId [P0] 三条通道共用的工具调用 id（与 message/bridge/channel 事件同值，可 null）
+     * @param source    谁赢的（hook / bridge / channel）
+     */
+    private void notifyResolved(String requestId, String toolUseId, String source) {
+        if (requestId == null) return;
+        // 先取 sid（removePendingSnapshot 会把它删掉）
+        String sid = pendingSessionOf.get(requestId);
+        removePendingSnapshot(requestId);
+        if (sid == null) return;
+        try {
+            // [P0] 同时下发 toolUseId：前端按 `toolUseId ?? requestId` 清**全部**副本
+            //   （message/bridge/channel 三份 requestId 各不相同，只按 requestId 会留下残卡）。
+            java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+            payload.put("requestId", requestId);
+            if (toolUseId != null && !toolUseId.isBlank()) {
+                payload.put("toolUseId", toolUseId);
+            }
+            payload.put("source", source == null ? "unknown" : source);
+            ws.convertAndSend("/topic/sessions/" + sid + "/permission-resolved", payload);
+            if (log.isDebugEnabled()) {
+                log.debug("[perm] 通知前端关闭弹窗 requestId={} toolUseId={} source={} session={}",
+                        requestId, toolUseId, source, sid);
+            }
+        } catch (RuntimeException e) {
+            // 推送失败不影响决策本身 —— 前端还有「切会话/重连补拉」兜底（listPendingForSession）
+            log.warn("[perm] 推送 permission-resolved 失败 requestId={} err={}", requestId, e.toString());
+        }
+    }
+
+    /**
+     * [D 未送达上抛] 把「哪些渠道没送出去」推给桌面，让权限卡显示提示。
+     *
+     * <h2>⛔ 这不是决策通道</h2>
+     * 未送达 ≠ 拒绝。本方法只做**展示**：future 仍然挂着等桌面点允许/拒绝，
+     * 任何失败（推送异常）都只 warn —— 丢一条提示绝不能让审批流程变形。
+     *
+     * <p>载荷按 {@code toolUseId ?? requestId} 关联到该工具调用的权限卡；
+     * 只列**失败的**渠道（成功的不标），避免「多渠道一起标红」。
+     *
+     * @param sessionId 投递会话（与权限卡同会话）
+     * @param requestId owner 请求 id（与 message 通道事件同值）
+     * @param toolUseId 三通道共用关联键
+     * @param failures  未送达明细（非空才调用）
+     */
+    private void notifyDeliveryFailures(String sessionId, String requestId, String toolUseId,
+                                        java.util.List<ChannelPermissionImNotifier.DeliveryFailure> failures) {
+        if (sessionId == null || sessionId.isBlank() || failures == null || failures.isEmpty()) {
+            return;
+        }
+        try {
+            java.util.List<java.util.Map<String, Object>> items = new java.util.ArrayList<>(failures.size());
+            for (ChannelPermissionImNotifier.DeliveryFailure f : failures) {
+                if (f == null) {
+                    continue;
+                }
+                // ⛔ 只放可展示字段（无 token / 无凭证）
+                java.util.Map<String, Object> item = new java.util.LinkedHashMap<>();
+                item.put("channel", f.platform());
+                item.put("peerName", f.peerName());
+                item.put("reasonCode", f.reasonCode());
+                item.put("reason", f.reason());
+                items.add(item);
+            }
+            java.util.Map<String, Object> payload = new java.util.LinkedHashMap<>();
+            payload.put("requestId", requestId);
+            if (toolUseId != null && !toolUseId.isBlank()) {
+                payload.put("toolUseId", toolUseId);
+            }
+            payload.put("failures", items);
+            ws.convertAndSend("/topic/sessions/" + sessionId + "/permission-delivery", payload);
+            if (log.isInfoEnabled()) {
+                log.info("PERMISSION delivery 未送达提示 → STOMP session={} requestId={} failures={}",
+                    sessionId, requestId, items.size());
+            }
+        } catch (RuntimeException e) {
+            // 提示丢了不影响审批本身（桌面卡片照常显示，future 照常等）
+            log.warn("[perm] 推送 permission-delivery 失败 requestId={} err={}", requestId, e.toString());
         }
     }
 
@@ -2073,12 +2535,34 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                            String acceptFeedback, List<JsonNode> contentBlocks,
                            JsonNode answers, JsonNode annotations,
                            JsonNode responseUpdatedInput) {
+        // [V333 AFK] 旧调用方：无倒计时信息（人类作答路径）
+        onResponse(requestId, decision, updatedPermissions, acceptFeedback, contentBlocks,
+            answers, annotations, responseUpdatedInput, null, null);
+    }
+
+    /**
+     * [V333 AFK] 10 参主实现 · 追加倒计时超时的两个标记。
+     *
+     * <p>{@code afkTimeoutMs} 非空时写入 {@code Allow.updatedInput}（对齐 CC
+     * {@code AskUserQuestionPermissionRequest} 的 {@code {...input, answers, afkTimeoutMs}}），
+     * 工具侧据此产出「No response after Ns…」文案；{@code isByCountdown} 只做日志/归因，
+     * <b>不进 tool_result</b>（CC 同样不给模型看）。
+     *
+     * @param afkTimeoutMs  倒计时超时提交的总时长（毫秒）；null = 人类作答
+     * @param isByCountdown 是否由倒计时触发；null = 人类作答
+     */
+    public void onResponse(String requestId, String decision,
+                           List<JsonNode> updatedPermissions,
+                           String acceptFeedback, List<JsonNode> contentBlocks,
+                           JsonNode answers, JsonNode annotations,
+                           JsonNode responseUpdatedInput,
+                           Integer afkTimeoutMs, Boolean isByCountdown) {
         if (requestId == null || requestId.isBlank()) {
             log.warn("PERMISSION onResponse: requestId is blank, ignoring");
             return;
         }
         CompletableFuture<PermissionResult> future = pending.remove(requestId);
-        removePendingSnapshot(requestId); // [会话状态同步] 同步清快照
+        // [P1] 快照不在这里清：下面 claim 成功后由 notifyResolved 统一清 + 推 resolved 事件。
         AtomicBoolean claimed = raceClaims.remove(requestId);
         // [FIX-E askuser-answers] 用 remove 返回值捕获 originalInput —— 修复已存在 bug：
         //   原实现 promptInputs.remove(requestId) 先于 promptInputs.get(requestId) 读取
@@ -2098,8 +2582,15 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         if (claimed != null && !claimed.compareAndSet(false, true)) {
             log.info("PERMISSION onResponse: race already resolved for requestId={}, ignored",
                 requestId);
+            // 竞速已由别的路胜出 → 那条路自己推过 resolved；这里只需清掉本请求的残留快照
+            removePendingSnapshot(requestId);
             return;
         }
+        // [P1] 桌面裁决 = 终态：推统一 resolved（前端单一出口 dequeue + 解锁输入框）。
+        //   幂等：重复到达时 pending 里已无该请求，notifyResolved 只做一次推送。
+        notifyResolved(requestId, resolveToolUseId(promptCtx, requestId), "user");
+        // [F4] 桌面（或其它 racer）已裁决 ⇒ 摘掉 channel 侧待回执，后续 IM 回执按「已过期」处理。
+        releaseChannelPending(requestId);
         boolean isAllow = "allow".equalsIgnoreCase(decision);
         // [RV-07] 本地用户 racer 胜出 → 通知 bridge 远程表面 dismiss（对齐 CC interactiveHandler.ts:162-168
         //   onAllow / :186-192 onReject 的 sendResponse + cancelRequest）
@@ -2128,7 +2619,7 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             //   originalInput 为 null 时以空对象兜底（Allow.updatedInput 恒非 null）。
             // 用户改写后的输入优先（计划审批的编辑计划走这里）；否则用原输入 + answers/annotations。
             JsonNode baseInput = responseUpdatedInput != null ? responseUpdatedInput : originalInput;
-            JsonNode updatedInput = buildUpdatedInput(baseInput, answers, annotations);
+            JsonNode updatedInput = buildUpdatedInput(baseInput, answers, annotations, afkTimeoutMs);
             // [R32-b9] 透传 STOMP feedback/blocks 到 Allow 决策(CC addToolResult allow 路径)
             String fb = (acceptFeedback != null && !acceptFeedback.isBlank()) ? acceptFeedback : null;
             List<JsonNode> blocks = (contentBlocks != null && !contentBlocks.isEmpty())
@@ -2139,10 +2630,12 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 null, false,
                 fb,           // R32-b9 · acceptFeedback(原硬编码 null → 现透传)
                 blocks);      // R32-b9 · contentBlocks(原硬编码 null → 现透传)
-            if (log.isDebugEnabled() && (fb != null || !blocks.isEmpty() || answers != null || annotations != null)) {
-                log.debug("PERMISSION onResponse: allow feedback={} blocks={} hasAnswers={} hasAnnotations={} inputFields={} requestId={}",
+            if (log.isDebugEnabled() && (fb != null || !blocks.isEmpty() || answers != null
+                    || annotations != null || afkTimeoutMs != null)) {
+                log.debug("PERMISSION onResponse: allow feedback={} blocks={} hasAnswers={} hasAnnotations={}"
+                        + " afkTimeoutMs={} isByCountdown={} inputFields={} requestId={}",
                     fb != null, blocks.size(), answers != null, annotations != null,
-                    updatedInput.size(), requestId);
+                    afkTimeoutMs, isByCountdown, updatedInput.size(), requestId);
             }
         } else {
             // decision 是 null / 未知 / "deny" 都视为 deny
@@ -2195,7 +2688,14 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
      * @param annotations   每问注解（preview/notes；可为 null）
      * @return 合并后的 ObjectNode（originalInput 浅拷贝 + answers/annotations）
      */
-    private JsonNode buildUpdatedInput(JsonNode originalInput, JsonNode answers, JsonNode annotations) {
+    /**
+     * [V333 AFK] 合并 answers/annotations/afkTimeoutMs 进 originalInput 构建 Allow.updatedInput。
+     *
+     * <p>{@code afkTimeoutMs} 仅在倒计时超时路径出现（人类作答恒 null）⇒ 工具侧据此区分
+     * 「没人答」与「答了但空」。其余语义与三参版本逐字一致。
+     */
+    private JsonNode buildUpdatedInput(JsonNode originalInput, JsonNode answers, JsonNode annotations,
+                                       Integer afkTimeoutMs) {
         ObjectNode merged = (originalInput != null && originalInput.isObject())
             ? ((ObjectNode) originalInput).deepCopy()
             : JSON_FACTORY.createObjectNode();
@@ -2204,6 +2704,9 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
         }
         if (annotations != null && annotations.isObject() && !annotations.isEmpty()) {
             merged.set("annotations", annotations);
+        }
+        if (afkTimeoutMs != null) {
+            merged.put("afkTimeoutMs", afkTimeoutMs.intValue());
         }
         return merged;
     }

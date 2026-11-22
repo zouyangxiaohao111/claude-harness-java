@@ -88,6 +88,29 @@ class SessionToolCategoryTest {
     }
 
     @Test
+    @DisplayName("IM 工具名（SendImAsUser / ListImChats / ReadImMessages / SearchImContacts / SendUserMessage / 微信记录）→ IM")
+    void imTools_areIm() {
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("SendImAsUser")));
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("ListImChats")));
+        // WHY：IM 能力后来扩了「读历史消息 / 搜联系人」，名字带 Im 但没登记就会落到
+        // 系统工具组（用户 2026-11-22 报障：「名称带 IM 的工具应都在 IM 组」）。
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("ReadImMessages")));
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("SearchImContacts")));
+        // WHY：SendUserMessage（BriefTool）就是「给用户发消息」，不归 IM 会让 IM 组
+        // 只剩渠道工具，用户在组里统一开关时找不到它。
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("SendUserMessage")));
+        // WHY：本机微信记录检索/会话列表同属通讯类，且实现类在 wechatlog 包，
+        // 既不是 kb 包也没有统一前缀 ⇒ 必须显式登记，否则会掉进 SYS。
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("wechat_search_messages")));
+        assertEquals(SessionToolCategory.IM, SessionToolCategory.of(tool("wechat_list_conversations")));
+        // ⚠️ 只按登记的工具名判定，形近名不得误归 IM
+        assertEquals(SessionToolCategory.SYS, SessionToolCategory.of(tool("SendImAsUserV2")));
+        assertEquals(SessionToolCategory.SYS, SessionToolCategory.of(tool("wechat_read_conversation")));
+        // ⛔ SendMessage 是核心编排工具（不可禁用），不得放进可整组关闭的 IM
+        assertEquals(SessionToolCategory.SYS, SessionToolCategory.of(tool("SendMessage")));
+    }
+
+    @Test
     @DisplayName("其余工具 → SYS（系统工具），含裸名")
     void others_areSys() {
         assertEquals(SessionToolCategory.SYS, SessionToolCategory.of(tool("Bash")));

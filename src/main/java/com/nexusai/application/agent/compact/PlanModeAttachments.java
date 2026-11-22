@@ -137,7 +137,7 @@ public final class PlanModeAttachments {
             List<ChatMessageDto> messages,
             List<AttachmentMessageDto> attachments,
             PermissionMode mode,
-            UUID agentId,
+            String agentId,
             PlanProvider provider,
             PlanModeFlags flags,
             int turnCount) {
@@ -205,7 +205,7 @@ public final class PlanModeAttachments {
      */
     public static List<AttachmentMessageDto> getPlanModeExitAttachment(
             PermissionMode mode,
-            UUID agentId,
+            String agentId,
             PlanProvider provider,
             PlanModeFlags flags) {
         if (!flags.needsPlanModeExitAttachment()) {

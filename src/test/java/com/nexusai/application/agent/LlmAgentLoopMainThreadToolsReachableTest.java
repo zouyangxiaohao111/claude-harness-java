@@ -184,7 +184,7 @@ class LlmAgentLoopMainThreadToolsReachableTest {
         LlmAgentLoop loop = newLoop(provider, registry, toolsRef, tucRef);
 
         String sessionUuid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID subAgentUuid = UUID.randomUUID();
+        String subAgentUuid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = loop.run(RunRequest.session(
             "hello", sessionUuid, subAgentUuid,
             ProviderConfig.empty(), "test-model", null, null));

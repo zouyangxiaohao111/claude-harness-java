@@ -93,7 +93,7 @@ class ReadMcpResourceToolTest {
         ReadMcpResourceTool tool = tool();
         ToolResult<?> result = (ToolResult<?>) tool.execute(call("t1", "{\"server\":\"ghost\",\"uri\":\"u\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-        assertThat((String) result.data()).startsWith("Server \"ghost\" not found.");
+        assertThat(String.valueOf(result.data())).startsWith("Server \"ghost\" not found.");
     }
 
     @Test
@@ -105,10 +105,10 @@ class ReadMcpResourceToolTest {
         ReadMcpResourceTool tool = tool();
         ToolResult<?> noServer = (ToolResult<?>) tool.execute(call("t1", "{\"uri\":\"u\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(noServer.data())).isTrue();
-        assertThat((String) noServer.data()).startsWith("ReadMcpResourceTool: missing 'server'");
+        assertThat(String.valueOf(noServer.data())).startsWith("ReadMcpResourceTool: missing 'server'");
         ToolResult<?> noUri = (ToolResult<?>) tool.execute(call("t1", "{\"server\":\"s\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(noUri.data())).isTrue();
-        assertThat((String) noUri.data()).startsWith("ReadMcpResourceTool: missing 'uri'");
+        assertThat(String.valueOf(noUri.data())).startsWith("ReadMcpResourceTool: missing 'uri'");
     }
 
     @Test
@@ -117,7 +117,7 @@ class ReadMcpResourceToolTest {
         ReadMcpResourceTool tool = toolWith(new NoResourceCapabilityTransport());
         ToolResult<?> result = (ToolResult<?>) tool.execute(call("t1", "{\"server\":\"gate\",\"uri\":\"u\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-        assertThat((String) result.data()).isEqualTo("Server \"gate\" does not support resources");
+        assertThat(String.valueOf(result.data())).isEqualTo("Server \"gate\" does not support resources");
     }
 
     @Test
@@ -128,7 +128,7 @@ class ReadMcpResourceToolTest {
         // 前置门控 3/3：装配成功（activeServers 含 gate，过 server-not-found）→
         // isServerConnected(gate)=false（transport.getState()==NOT_CONNECTED）→ not-connected 错误
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-        assertThat((String) result.data()).isEqualTo("Server \"gate\" is not connected");
+        assertThat(String.valueOf(result.data())).isEqualTo("Server \"gate\" is not connected");
     }
 
     @Test
@@ -139,7 +139,7 @@ class ReadMcpResourceToolTest {
         // 对比 fetchResources（client.ts:2021-2027 catch → [] fail-soft）：resources/read 无 fail-soft，
         // 协议失败抛错 → Java 端 Tool.execute catch → ToolResult.error（行为等价）
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-        assertThat((String) result.data()).startsWith("ReadMcpResourceTool:")
+        assertThat(String.valueOf(result.data())).startsWith("ReadMcpResourceTool:")
             .contains("read failed");
     }
 
@@ -149,7 +149,7 @@ class ReadMcpResourceToolTest {
         ReadMcpResourceTool tool = toolWith(new TextResourceTransport());
         ToolResult<?> result = (ToolResult<?>) tool.execute(call("t1", "{\"server\":\"gate\",\"uri\":\"mock://docs/readme\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode out = MAPPER.readTree((String) result.data());
+        JsonNode out = MAPPER.readTree(String.valueOf(result.data()));
         JsonNode first = out.path("contents").get(0);
         assertThat(first.path("uri").asText()).isEqualTo("mock://docs/readme");
         assertThat(first.path("mimeType").asText()).isEqualTo("text/plain");
@@ -167,13 +167,13 @@ class ReadMcpResourceToolTest {
         // 返回 null → 'missing persistence context' 不落盘。生产 StreamingToolExecutor 恒传 ctx
         // （effectiveCwd+sessionId）→ 测试对齐生产轨传递含落盘上下文的 ToolUseContext（指向临时目录）。
         ToolUseContext ctx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), java.util.List.of(), "", new AbortController(), java.util.List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", tempDir, null, null, null);
         ToolResult<?> result = (ToolResult<?>) tool.execute(
             call("t1", "{\"server\":\"gate\",\"uri\":\"mock://img/1\"}"), ctx);
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode out = MAPPER.readTree((String) result.data());
+        JsonNode out = MAPPER.readTree(String.valueOf(result.data()));
         JsonNode first = out.path("contents").get(0);
         String savedTo = first.path("blobSavedTo").asText();
         assertThat(savedTo).isNotBlank();

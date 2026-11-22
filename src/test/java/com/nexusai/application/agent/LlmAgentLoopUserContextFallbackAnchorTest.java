@@ -190,7 +190,7 @@ class LlmAgentLoopUserContextFallbackAnchorTest {
     }
 
     private static ToolUseContext minimalTuc() {
-        return ToolUseContext.of(UUID.randomUUID(), SESSION,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION,
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, List.of());
     }
 

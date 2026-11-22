@@ -110,7 +110,7 @@ class HookExecutorProjectRootPropagationTest {
     /** 主线程 ctx：agentType=null、effectiveCwd=null（LlmAgentLoop base TUC 等价）。 */
     private static ToolUseContext mainThreadCtx() {
         return ToolUseContext.of(
-            UUID.fromString("aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             "", PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, "", null);

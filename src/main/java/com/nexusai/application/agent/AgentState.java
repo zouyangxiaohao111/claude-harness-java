@@ -146,7 +146,7 @@ public class AgentState {
      *
      * <p>Phase 1 与 sessionId 共用；Phase 2 起会按 subagent / parallel agent 区分。
      */
-    private final UUID agentId;
+    private final String agentId;
     /**
      * 最大轮数 · CC original: {@code maxTurns} (query.ts:190).
      * <p><b>OD-11 对齐 CC 无默认</b>：null = 无限轮（CC 不设默认值，调用方不传则无上限）。
@@ -282,6 +282,37 @@ public class AgentState {
     private String usageSource = com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER;
 
     /**
+     * [sendmessage-cross-session · B] 本 run 的 <b>peer 执行来源</b>（run 级可变态）。
+     *
+     * <p><b>语义</b>：非 null = 本回合由服务端投递的跨会话信封触发；null = 用户自己的回合。
+     * 值只能来自 {@code RunRequest.peerExecutionOrigin()}（服务端投递侧构造的
+     * {@link com.nexusai.application.agent.messaging.PeerExecutionOrigin}），
+     * ⛔ HTTP requestExtras / 模型正文 / structuredOutput 自报都不是信任根。
+     *
+     * <p><b>轮内更新</b>：{@code LlmAgentLoop.drainAndInjectQueued} 消费到 peer 项时立即改写本字段
+     * （sticky：后续 per-turn TUC 由 {@code AgentLoopContext.toolExecContext} 派生时读它盖章），
+     * 使「工具边界收到 peer 消息 → 之后每一轮工具调用都处于 peer 来源」成立。
+     *
+     * <p><b>清污</b>：新 run 新建 AgentState ⇒ 默认 null；只有 doRun 入口按 RunRequest 显式写入。
+     * {@code @JsonIgnore} local-only（同 usageSource / injectedQueuedMessages 红线）：
+     * 不进 outbound DTO / STOMP / LLM payload。
+     */
+    @JsonIgnore
+    private com.nexusai.application.agent.messaging.PeerExecutionOrigin peerExecutionOrigin;
+
+    /** [sendmessage-cross-session · B] 读本 run 的 peer 执行来源（null = 非 peer 回合）。 */
+    @JsonIgnore
+    public com.nexusai.application.agent.messaging.PeerExecutionOrigin peerExecutionOrigin() {
+        return this.peerExecutionOrigin;
+    }
+
+    /** [sendmessage-cross-session · B] 写本 run 的 peer 执行来源（doRun 入口 / drain 轮内更新）。 */
+    public void setPeerExecutionOrigin(
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin peerExecutionOrigin) {
+        this.peerExecutionOrigin = peerExecutionOrigin;
+    }
+
+    /**
      * [mid-turn-align] 单条 mid-turn 注入的排队 user 消息（uuid = 队列命令 id，content = 原始文本，可空串）。
      *
      * <p>[P0-1 OD-1/OD-3] 3 参扩展 + queuedOrigin（排队来源标记）：queuedOrigin 供 ChatService 落库
@@ -309,7 +340,28 @@ public class AgentState {
     public record InjectedQueuedMessage(String uuid, String content, String queuedOrigin,
                                         java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo>
                                             userAttachments,
-                                        boolean isMeta) {
+                                        boolean isMeta,
+                                        /**
+                                         * [sendmessage-cross-session · B] 落库 author 列（peer 行 =
+                                         * 来源 sessionId；其余来源 null → 沿用既有 author 逻辑）。
+                                         * 服务端从 {@code PeerEnvelope.fromSessionId()} 取，⛔ 非模型自报。
+                                         */
+                                        String author,
+                                        /** [sendmessage-cross-session · B] 落库 subtype 列（peer = 'agent_message'）。 */
+                                        String subtype,
+                                        /**
+                                         * [sendmessage-cross-session · B] 落库 structured_output 列（V6 JSON）：
+                                         * peer = {@code { peer_source: {...}, agent_summary: ... }}；其余来源 null。
+                                         */
+                                        java.util.Map<String, Object> structuredOutput) {
+        /** 5 参兼容构造（author/subtype/structuredOutput = null）· 既有全部调用方零改动。 */
+        public InjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+                                     java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo>
+                                         userAttachments,
+                                     boolean isMeta) {
+            this(uuid, content, queuedOrigin, userAttachments, isMeta, null, null, null);
+        }
+
         public InjectedQueuedMessage(String uuid, String content) {
             this(uuid, content, null, null, false);
         }
@@ -516,7 +568,7 @@ public class AgentState {
      * @param sessionId    会话 ID（short 形态 sess-xxx；{@code null} → 权限系统不可用）
      * @param agentId      agent 实例 ID（{@code null} → 权限系统不可用）
      */
-    public AgentState(String systemPrompt, String sessionId, UUID agentId) {
+    public AgentState(String systemPrompt, String sessionId, String agentId) {
         this(systemPrompt, sessionId, agentId, null);
     }
 
@@ -528,7 +580,7 @@ public class AgentState {
      * @param agentId           agent 实例 ID（{@code null} → 权限系统不可用）
      * @param appendSystemPrompt 用户追加指令（CC main.tsx:1364-1382 + systemPrompt.ts:121；null = 无）
      */
-    public AgentState(String systemPrompt, String sessionId, UUID agentId, String appendSystemPrompt) {
+    public AgentState(String systemPrompt, String sessionId, String agentId, String appendSystemPrompt) {
         this.systemPrompt = systemPrompt;
         this.appendSystemPrompt = appendSystemPrompt;
         this.sessionId = sessionId;
@@ -777,6 +829,31 @@ public class AgentState {
     }
 
     /**
+     * [sendmessage-cross-session · B] 8 参重载：+ author / subtype / structuredOutput（落库同源元数据）。
+     *
+     * <p>调用面 = {@code LlmAgentLoop.drainAndInjectQueued} 的 peer 分支（{@code queuedOrigin='peer'}）：
+     * 在 {@code state.appendMessage} <b>之前</b>登记，实时落库出口（ChatService.persistAppendedMessage
+     * → MessageService.createQueuedUserMessage 扩展重载）与轮末补落读取<b>同一份</b>元数据。
+     * ⛔ 不新增第二个落库出口 —— 本方法只登记，不写 DB。
+     *
+     * @param uuid             队列项 uuid（= 落库主键 = PeerEnvelope.messageId）
+     * @param content          原文 RAW（不预包壳）
+     * @param queuedOrigin     'peer'
+     * @param userAttachments  非图片附件快照（peer 恒 null）
+     * @param isMeta           恒 true（UI 隐藏、模型可见）
+     * @param author           来源 sessionId（服务端解析，非模型自报）
+     * @param subtype          'agent_message'
+     * @param structuredOutput {@code { peer_source: {...}, agent_summary: ... }}
+     */
+    public void addInjectedQueuedMessage(String uuid, String content, String queuedOrigin,
+            java.util.List<com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo> userAttachments,
+            boolean isMeta, String author, String subtype,
+            java.util.Map<String, Object> structuredOutput) {
+        this.injectedQueuedMessages.add(new InjectedQueuedMessage(
+            uuid, content, queuedOrigin, userAttachments, isMeta, author, subtype, structuredOutput));
+    }
+
+    /**
      * [mid-turn-align] 取出 mid-turn 注入的排队 user 消息只读视图 · ChatService 轮结束补落库消费。
      * <p><b>local-only 约束</b>: {@code @JsonIgnore} 双重保险 —— 与字段注解共同保证不序列化到外部通道。
      */
@@ -823,7 +900,7 @@ public class AgentState {
     /**
      * PR 4 新增：agent 实例 ID（{@code null} → state 未接入权限系统）。
      */
-    public UUID agentId() { return agentId; }
+    public String agentId() { return agentId; }
 
     /**
      * [R32-b15 C11] 是否有可中断工具在执行中 · 对齐 CC
@@ -1963,7 +2040,7 @@ public class AgentState {
      *                  null=主会话；UUID 非 null=forked 子 agent 实例 ID
      */
     public record InvokedSkillInfo(String skillName, String skillPath, String content,
-                                   long invokedAt, UUID agentId) {
+                                   long invokedAt, String agentId) {
     }
 
     /**
@@ -1976,8 +2053,8 @@ public class AgentState {
      *
      * @param agentId CC original: agentId（默认参 null）—— null 表示主会话作用域
      */
-    public void addInvokedSkill(String skillName, String skillPath, String content, UUID agentId) {
-        String key = (agentId == null ? "" : agentId.toString()) + ":" + skillName;
+    public void addInvokedSkill(String skillName, String skillPath, String content, String agentId) {
+        String key = (agentId == null ? "" : agentId) + ":" + skillName;
         // 单调递增保证: 同毫秒批量调用时 currentTimeMillis 碰撞 → max(prev+1, now) 严格递增
         // (见 lastInvokedAt javadoc), 排序/预算丢弃决策确定性化
         long invokedAt = lastInvokedAt.updateAndGet(prev -> Math.max(prev + 1, System.currentTimeMillis()));
@@ -2024,7 +2101,7 @@ public class AgentState {
      * null-agent（主会话）skill。返回<b>新 Map</b>，不共享内部引用（对齐 CC
      * 新建 filtered Map）。
      */
-    public java.util.Map<String, InvokedSkillInfo> getInvokedSkillsForAgent(UUID agentId) {
+    public java.util.Map<String, InvokedSkillInfo> getInvokedSkillsForAgent(String agentId) {
         java.util.Map<String, InvokedSkillInfo> filtered = new java.util.HashMap<>();
         for (java.util.Map.Entry<String, InvokedSkillInfo> e : invokedSkills.entrySet()) {
             if (java.util.Objects.equals(e.getValue().agentId(), agentId)) {
@@ -2046,7 +2123,7 @@ public class AgentState {
      * {@code agentId ∈ preserved} 的条目。无参 / 空集 → 全清
      * （对齐 CC {@code !preservedAgentIds || size === 0}）。
      */
-    public void clearInvokedSkills(java.util.Set<UUID> preservedAgentIds) {
+    public void clearInvokedSkills(java.util.Set<String> preservedAgentIds) {
         int before = invokedSkills.size();
         if (preservedAgentIds == null || preservedAgentIds.isEmpty()) {
             invokedSkills.clear();
@@ -2069,7 +2146,7 @@ public class AgentState {
      *
      * <p>仅删除 {@code skill.agentId === agentId} 全部条目，其余保留。
      */
-    public void clearInvokedSkillsForAgent(UUID agentId) {
+    public void clearInvokedSkillsForAgent(String agentId) {
         int before = invokedSkills.size();
         invokedSkills.entrySet().removeIf(e -> java.util.Objects.equals(e.getValue().agentId(), agentId));
         if (log.isDebugEnabled()) {

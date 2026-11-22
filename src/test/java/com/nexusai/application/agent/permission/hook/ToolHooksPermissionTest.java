@@ -137,7 +137,7 @@ class ToolHooksPermissionTest {
     /** 9 参便利 ctx (permissionContext 带规则; requireCanUseTool=false 默认). */
     private ToolUseContext ctxWith(ToolPermissionContext permCtx) {
         return ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             permCtx, PermissionMode.DEFAULT);
     }
@@ -150,7 +150,7 @@ class ToolHooksPermissionTest {
      */
     private ToolUseContext ctxWithRequireCanUseTool(boolean requireCanUseTool) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of(),
             permCtxNoRules(), PermissionMode.DEFAULT,
             Map.of(), false, "", null, null, Map.of(), null,

@@ -57,7 +57,7 @@ class EditFileToolTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     private static ToolUseContext ctxFor(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("d2-edit-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("d2-edit-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }
@@ -88,7 +88,7 @@ class EditFileToolTest {
 
     /** 带 effectiveCwd=workspace 的 ToolUseContext: 技能发现上界必须显式等于 workspace（同 ReadFileToolTest.ctxWithCwd）。 */
     private static ToolUseContext ctxWithCwd(Path workspace) throws Exception {
-        UUID agentId = UUID.nameUUIDFromBytes(("d2-edit-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("d2-edit-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,

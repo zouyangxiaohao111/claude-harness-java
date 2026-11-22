@@ -37,7 +37,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class TodoWriteReminderInjectionTest {
 
     private static final String SESSION_ID = "22222222-2222-2222-2222-222222222222";
-    private static final UUID AGENT_ID = UUID.fromString("11111111-1111-1111-1111-111111111111");
+    private static final String AGENT_ID = "11111111-1111-1111-1111-111111111111";
 
     @BeforeAll
     static void enableTodoWriteV1() {

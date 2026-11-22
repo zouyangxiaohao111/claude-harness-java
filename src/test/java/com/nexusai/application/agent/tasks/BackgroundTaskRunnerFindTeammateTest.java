@@ -4,7 +4,6 @@ import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.util.UUID;
 import java.util.concurrent.ConcurrentMap;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -47,13 +46,13 @@ class BackgroundTaskRunnerFindTeammateTest {
             id, TaskType.IN_PROCESS_TEAMMATE, status, "teammate-" + id,
             null, System.currentTimeMillis(), null, null,
             "/tmp/teammate-" + id + ".out", 0L, false,
-            UUID.fromString(agentId), true);
+            agentId, true);
     }
 
     @Test
     @DisplayName("running 优先：同 agentId 存在已终态 + running 时返回 running（CC :98-99）")
     void runningTaskPreferredOverTerminal() {
-        String agentId = UUID.randomUUID().toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         putTask(teammate("t-old", agentId, BackgroundTaskStatus.COMPLETED));
         putTask(teammate("t-new", agentId, BackgroundTaskStatus.RUNNING));
 
@@ -68,7 +67,7 @@ class BackgroundTaskRunnerFindTeammateTest {
     @Test
     @DisplayName("terminal 兜底：仅终态匹配时返回该任务（CC :102-104，terminal 过滤在调用方）")
     void terminalTaskReturnedAsFallback() {
-        String agentId = UUID.randomUUID().toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         putTask(teammate("t-killed", agentId, BackgroundTaskStatus.KILLED));
 
         BackgroundTask found = runner.findTeammateByAgentId(agentId);
@@ -82,9 +81,11 @@ class BackgroundTaskRunnerFindTeammateTest {
     @Test
     @DisplayName("无匹配返回 null（CC :107 undefined 等价）")
     void noMatchReturnsNull() {
-        putTask(teammate("t-a", UUID.randomUUID().toString(), BackgroundTaskStatus.RUNNING));
+        putTask(teammate("t-a", com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+            BackgroundTaskStatus.RUNNING));
 
-        BackgroundTask found = runner.findTeammateByAgentId(UUID.randomUUID().toString());
+        BackgroundTask found = runner.findTeammateByAgentId(
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         assertThat(found).as("无 agentId 匹配必须返回 null").isNull();
     }
@@ -92,12 +93,12 @@ class BackgroundTaskRunnerFindTeammateTest {
     @Test
     @DisplayName("类型过滤：agentId 匹配但非 IN_PROCESS_TEAMMATE 忽略（CC :95 isInProcessTeammateTask）")
     void nonTeammateTypeIgnored() {
-        String agentId = UUID.randomUUID().toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // LOCAL_BASH 任务带同 agentId —— 不是 teammate，必须忽略
         BackgroundTask bash = new BackgroundTask(
             "t-bash", TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING, "bash",
             null, System.currentTimeMillis(), null, null,
-            "/tmp/bash.out", 0L, false, UUID.fromString(agentId), true);
+            "/tmp/bash.out", 0L, false, agentId, true);
         putTask(bash);
 
         BackgroundTask found = runner.findTeammateByAgentId(agentId);

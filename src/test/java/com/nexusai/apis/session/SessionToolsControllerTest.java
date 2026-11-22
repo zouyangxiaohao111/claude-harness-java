@@ -12,6 +12,7 @@ import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import com.alibaba.fastjson2.JSON;
 import org.mockito.ArgumentCaptor;
 import org.springframework.test.util.ReflectionTestUtils;
 import org.springframework.test.web.servlet.MockMvc;
@@ -24,6 +25,7 @@ import static org.hamcrest.Matchers.nullValue;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
+import static org.mockito.Mockito.doAnswer;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
 import static org.mockito.Mockito.verify;
@@ -54,6 +56,8 @@ class SessionToolsControllerTest {
     private SessionService sessionService;
     private ToolRegistry toolRegistry;
     private MockMvc mockMvc;
+    /** 会话行（disabled_tools / brief_mode / unattended_mode 的真实读取源）。 */
+    private com.nexusai.repository.session.entity.SessionRecord sessionRow;
 
     @BeforeEach
     void setUp() {
@@ -62,6 +66,17 @@ class SessionToolsControllerTest {
         toolRegistry = mock(ToolRegistry.class);
         ReflectionTestUtils.setField(controller, "sessionService", sessionService);
         ReflectionTestUtils.setField(controller, "toolRegistry", toolRegistry);
+        // [V330] 面板与模型同源读取走静态桥 —— 测试必须注入同一份会话行，否则禁用集恒为空。
+        sessionRow = new com.nexusai.repository.session.entity.SessionRecord();
+        sessionRow.setId("sess-1");
+        com.nexusai.repository.session.mapper.SessionMapper sessionMapper =
+            mock(com.nexusai.repository.session.mapper.SessionMapper.class);
+        when(sessionMapper.selectOneById(any())).thenReturn(sessionRow);
+        when(sessionMapper.selectImToolOverrides(any())).thenReturn(null);
+        doAnswer(inv -> {
+            sessionRow.setDisabledTools(JSON.toJSONString(inv.getArgument(1)));
+            return null;
+        }).when(sessionService).setDisabledTools(any(), any());
         mockMvc = MockMvcBuilders.standaloneSetup(controller)
             .setControllerAdvice(new GlobalExceptionHandler())
             .build();
@@ -69,6 +84,12 @@ class SessionToolsControllerTest {
         LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> null));
         MemoryBareModeConfig.reset();
         SessionToolDisableConfig.reset();
+        // reset 之后再注入（顺序反了会把 mapper 清掉，禁用集恒为空）。
+        SessionToolDisableConfig.setSessionMapper(sessionMapper);
+        com.nexusai.application.agent.config.SessionModeState.setSessionMapper(sessionMapper);
+        // 工具池装配会解析工作目录；standalone 测试无 DB 解析源，给测试会话一个真实目录。
+        com.nexusai.common.SessionProjectRoot.setForSession("sess-1",
+            java.nio.file.Path.of(System.getProperty("java.io.tmpdir")).toAbsolutePath().toString());
     }
 
     @AfterEach
@@ -76,6 +97,13 @@ class SessionToolsControllerTest {
         LlmAgentLoop.setCoordinatorMode(null);
         MemoryBareModeConfig.reset();
         SessionToolDisableConfig.reset();
+        com.nexusai.application.agent.config.SessionModeState.reset();
+        com.nexusai.common.SessionProjectRoot.clearSession("sess-1");
+    }
+
+    /** 设定会话生效禁用集（走 SessionToolDisableConfig 的列语义：非空数组 = 显式集合）。 */
+    private void givenDisabled(String... names) {
+        sessionRow.setDisabledTools(names.length == 0 ? null : JSON.toJSONString(List.of(names)));
     }
 
     private static Tool tool(String name) {
@@ -96,7 +124,7 @@ class SessionToolsControllerTest {
         // WHY: 被禁工具必须仍在列表（disabled=true）——否则前端无法恢复（PATCH enabled:true 无入口）。
         //   与 LLM schema 口径同源（sessionVisibleToolsBase），列表与模型实际可见一致。
         givenAllTools(tool("Bash"), tool("Read"), tool("Edit"), tool("WebSearch"));
-        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of("Bash"));
+        givenDisabled("Bash");
 
         mockMvc.perform(get("/api/v1/sessions/sess-1/tools"))
             .andExpect(status().isOk())
@@ -127,11 +155,28 @@ class SessionToolsControllerTest {
     }
 
     @Test
+    @DisplayName("[structured-output 2026-11-20] GET 不含 StructuredOutput（内部 dispatch 工具，模型也不可见）")
+    void list_excludesStructuredOutput() throws Exception {
+        // WHY: 面板与模型同源。StructuredOutput 属 SPECIAL_TOOLS，模型 tools 数组经 ToolRegistry
+        //   过滤恒不含它（交互式协调者的白名单只保留「候选」，不决定可见）；面板若照旧列出，
+        //   就会出现「面板有、模型拿不到」的幽灵条目（真机缺陷）。
+        //   变异点：去掉 buildList 的该过滤 → 列表多出 StructuredOutput → 红。
+        givenAllTools(tool("Bash"), tool(com.nexusai.application.agent.tool.ToolNameConstants
+            .SYNTHETIC_OUTPUT_TOOL_NAME));
+        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+
+        mockMvc.perform(get("/api/v1/sessions/sess-1/tools"))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.length()").value(1))
+            .andExpect(jsonPath("$[0].name").value("Bash"));
+    }
+
+    @Test
     @DisplayName("PATCH .../tools/Bash {enabled:false} → 200 + 持久化禁用（V34 列）")
     void patch_disablePersists() throws Exception {
         // WHY: 禁用会话内生效必须持久化（V34 列 disabled_tools，跨 turn/重开生效）。
         givenAllTools(tool("Bash"), tool("Read"));
-        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+        givenDisabled();
 
         mockMvc.perform(patch("/api/v1/sessions/sess-1/tools/Bash")
                 .contentType(APPLICATION_JSON)
@@ -149,7 +194,7 @@ class SessionToolsControllerTest {
     void patch_enableRestores() throws Exception {
         // WHY: 恢复 = 工具回到 LLM schema（从禁用集合移除）。变异点：恢复未移除 → 仍被剔除 → 红。
         givenAllTools(tool("Bash"), tool("Read"));
-        when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of("Bash"));
+        givenDisabled("Bash");
 
         mockMvc.perform(patch("/api/v1/sessions/sess-1/tools/Bash")
                 .contentType(APPLICATION_JSON)
@@ -250,5 +295,33 @@ class SessionToolsControllerTest {
                 .content("{\"category\":\"SYS\",\"mcpServer\":\"rea\",\"enabled\":false}"))
             .andExpect(status().isBadRequest());
         verify(sessionService, never()).setDisabledTools(eq("sess-1"), any(Set.class));
+    }
+
+    @Test
+    @DisplayName("[V329] 面板与模型同源：无人值守会话的 AskUserQuestion 显示 disabled=true（原因=unattended）")
+    void list_unattended_SessionMarksAskDisabled() throws Exception {
+        // WHY：模型 schema 已把 Ask 摘除；面板若仍显示「可用」，用户会以为能弹卡。
+        //   面板保留该行（可看到原因），但 disabled=true。
+        com.nexusai.repository.session.entity.SessionRecord rec =
+                new com.nexusai.repository.session.entity.SessionRecord();
+        rec.setId("sess-1");
+        rec.setUnattendedMode(1);
+        com.nexusai.repository.session.mapper.SessionMapper mapper =
+                mock(com.nexusai.repository.session.mapper.SessionMapper.class);
+        when(mapper.selectOneById(any())).thenReturn(rec);
+        com.nexusai.application.agent.config.SessionModeState.setSessionMapper(mapper);
+        try {
+            givenAllTools(tool("AskUserQuestion"), tool("Bash"));
+            when(sessionService.getDisabledTools("sess-1")).thenReturn(Set.of());
+
+            mockMvc.perform(get("/api/v1/sessions/sess-1/tools"))
+                .andExpect(status().isOk())
+                .andExpect(jsonPath("$[0].name").value("AskUserQuestion"))
+                .andExpect(jsonPath("$[0].disabled").value(true))
+                .andExpect(jsonPath("$[1].name").value("Bash"))
+                .andExpect(jsonPath("$[1].disabled").value(false));
+        } finally {
+            com.nexusai.application.agent.config.SessionModeState.reset();
+        }
     }
 }

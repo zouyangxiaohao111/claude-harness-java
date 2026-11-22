@@ -76,7 +76,7 @@ class EditWriteStructuredOutputTest {
     }
 
     private static ToolUseContext ctxFor(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("esos-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("esos-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }

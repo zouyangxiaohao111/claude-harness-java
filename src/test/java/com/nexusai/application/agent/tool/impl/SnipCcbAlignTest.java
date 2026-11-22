@@ -48,7 +48,7 @@ import static org.mockito.Mockito.when;
  */
 class SnipCcbAlignTest {
 
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f6071c";
     private static final String SESSION = "sess-snipalign";
     private static final ObjectMapper MAPPER = new ObjectMapper();
 

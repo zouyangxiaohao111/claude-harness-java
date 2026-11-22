@@ -56,7 +56,7 @@ class SessionMemoryForkSendsEditToolTest {
         Tool read = fakeTool("Read");
         Tool bash = fakeTool("Bash");
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-test", PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-test", PermissionMode.DEFAULT,
             Map.of(), List.of(edit, read, bash), "", com.nexusai.application.agent.tool.AbortController.NOOP, List.of());
 
         // ── SM 请求形态：forkContextMessages=真实会话 + promptMessages=改 notes 指令 ──

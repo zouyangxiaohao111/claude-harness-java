@@ -200,7 +200,7 @@ class CommandFieldTransmissionTest {
         ToolUseBlock block = new ToolUseBlock("tool-use-1", "Skill", input);
 
         ToolResult<?> result = (ToolResult<?>) tool.execute(
-            block, ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+            block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         // R1 关闭：bundled skill 不再因内容源全 null 报 has-no-content error
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
@@ -240,7 +240,7 @@ class CommandFieldTransmissionTest {
         ToolUseBlock block = new ToolUseBlock("tool-use-1", "Skill", input);
 
         ToolResult<?> result = (ToolResult<?>) tool.execute(
-            block, ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+            block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("image 通道不应破坏技能执行").isFalse();
         assertThat(result.newMessages()).isNotEmpty();

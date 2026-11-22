@@ -71,7 +71,7 @@ class ExitWorktreeToolOriginalCwdTest {
     }
 
     private static ToolUseContext ctx() {
-        return ToolUseContext.of(UUID.randomUUID(), SESSION_ID);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID);
     }
 
     private static Map<String, Object> structuredOutput(AgentToolResult<?> result) {

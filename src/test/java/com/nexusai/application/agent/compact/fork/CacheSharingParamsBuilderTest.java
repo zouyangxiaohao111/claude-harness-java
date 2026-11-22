@@ -346,7 +346,7 @@ class CacheSharingParamsBuilderTest {
     /** 最小 ToolUseContext（8 参兼容构造器 · 对齐 RunForkedAgentTest.baseContext）。 */
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 

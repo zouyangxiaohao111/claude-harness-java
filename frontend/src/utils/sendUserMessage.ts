@@ -44,10 +44,31 @@ export interface BriefAttachment {
   isImage: boolean | null
 }
 
-/** SendUserMessage 的可见载荷（message 正文 + 附件列表）。 */
+/** 单个目标的投递结果（后端 `BriefTool.deliveryPayload` 产出）。 */
+export interface BriefDelivery {
+  chatId?: string
+  /** 会话显示名（后端查 im_chat.peer_name；查不到时后端回落成 chatId） */
+  chatName?: string
+  /** SENT | SKIPPED | FAILED */
+  status: string
+  /** 实际身份（USER/BOT）—— 请求 USER 但实例没授权会降级，这里能看出来 */
+  identity?: string
+  messageId?: string
+  errorCode?: string
+  reason?: string
+}
+
+/** SendUserMessage 的可见载荷（message 正文 + 附件列表 + 投递结果）。 */
 export interface BriefPayload {
   message: string
   attachments: BriefAttachment[]
+  /**
+   * 投递到 IM 的结果（没有配通知目标时为空数组）。
+   *
+   * <p>为什么要渲染它：模型说「已发送」，但用户不知道发到哪、成功没有。
+   * 对话区原本一行都没有 ⇒ 「投递成功」和「根本没投」在界面上长得一模一样。
+   */
+  delivery: BriefDelivery[]
 }
 
 function parseJsonObject(raw: string | null | undefined): Record<string, unknown> | null {
@@ -65,6 +86,22 @@ function fromStructured(result: string | null | undefined): BriefPayload | null 
   const o = parseJsonObject(result)
   if (!o) return null
   const message = typeof o.message === 'string' ? o.message : ''
+  const delivery: BriefDelivery[] = []
+  if (Array.isArray(o.delivery)) {
+    for (const raw of o.delivery) {
+      if (raw == null || typeof raw !== 'object') continue
+      const d = raw as Record<string, unknown>
+      if (typeof d.status !== 'string') continue
+      const one: BriefDelivery = { status: d.status }
+      if (typeof d.chatId === 'string') one.chatId = d.chatId
+      if (typeof d.chatName === 'string') one.chatName = d.chatName
+      if (typeof d.identity === 'string') one.identity = d.identity
+      if (typeof d.messageId === 'string') one.messageId = d.messageId
+      if (typeof d.errorCode === 'string') one.errorCode = d.errorCode
+      if (typeof d.reason === 'string') one.reason = d.reason
+      delivery.push(one)
+    }
+  }
   const attachments: BriefAttachment[] = []
   if (Array.isArray(o.attachments)) {
     for (const item of o.attachments) {
@@ -79,7 +116,7 @@ function fromStructured(result: string | null | undefined): BriefPayload | null 
     }
   }
   if (message === '' && attachments.length === 0) return null
-  return { message, attachments }
+  return { message, attachments, delivery }
 }
 
 /** 回落：工具入参的 message + 原始附件路径（无 size/isImage —— 入参只有路径字符串）。 */
@@ -93,7 +130,8 @@ function fromArguments(raw: string | null | undefined): BriefPayload | null {
         .map((path) => ({ path, size: null, isImage: null }))
     : []
   if (message === '' && attachments.length === 0) return null
-  return { message, attachments }
+  // arguments 是「调用入参」，投递结果要执行后才产生 ⇒ 这里恒为空
+  return { message, attachments, delivery: [] }
 }
 
 /**

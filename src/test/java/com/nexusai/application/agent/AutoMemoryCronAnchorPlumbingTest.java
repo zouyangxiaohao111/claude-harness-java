@@ -128,7 +128,7 @@ class AutoMemoryCronAnchorPlumbingTest {
      * 生产 headless 路径同样带兜底会话键。故此处传入一个与断言无关的占位键。
      */
     private static ToolUseContext minimalTuc() {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-headless-placeholder",
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-headless-placeholder",
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, List.of());
     }
 

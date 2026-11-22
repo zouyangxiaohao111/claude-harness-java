@@ -10,8 +10,11 @@ import java.util.Map;
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
- * [coordinator 缺件补齐] nexusai.feature.coordinator-mode 配置键存在性 + 默认值 = false ·
- * 对齐 CC coordinator/coordinatorMode.ts:36-41 的 {@code feature('COORDINATOR_MODE')}。
+ * [coordinator 缺件补齐 → exe 2.1.328 对齐] nexusai.feature.coordinator-mode 配置键存在性 + 默认值 = false。
+ *
+ * <p><b>口径变更（2026-11-19）</b>：exe 2.1.328 的 {@code qa()} 已删除 feature 门，coordinator
+ * 判据 = {@code CLAUDE_CODE_COORDINATOR_MODE} env only。本键保留仅为历史兼容，<b>不再参与判定</b>
+ * （{@link CoordinatorMode#isCoordinatorMode()} 不读 feature）。
  *
  * <p><b>WHY (意图验证，不是行为验证)</b>：生产构造器
  * {@link CoordinatorMode#CoordinatorMode(org.springframework.core.env.Environment)}
@@ -90,16 +93,40 @@ class CoordinatorModeConfigKeyTest {
     }
 
     @Test
-    @DisplayName("默认 false 时 isCoordinatorMode() 恒 false（env 即使为真值也短路）")
-    void defaultFalseShortCircuitsEvenWithTruthyEnv() {
-        // 与 yml 默认值同构的运行时夹具：feature=false + env=true
+    @DisplayName("exe 2.1.328: feature 不参与判定 —— feature=false + env 真值 → 激活")
+    void featureFlagNoLongerGates() {
+        // exe 2.1.328 qa() 已删 feature 门：只看 env。
         CoordinatorMode mode = new CoordinatorMode(
             () -> false,
             () -> "1");
 
         assertThat(mode.isCoordinatorMode())
-            .as("feature 关 → 早返 false，env 通道被短路（对齐 CC coordinatorMode.ts:36-41 feature off 早返）")
-            .isFalse();
+            .as("feature=false 不再短路；env 真值即激活（对齐 exe qa()）")
+            .isTrue();
+    }
+
+    @Test
+    @DisplayName("exe qa() 排除：交互式本地会话 → false；remote 工作区 / CLAUDE_CODE_REMOTE → true")
+    void surfaceExclusionMatchesExeQa() {
+        CoordinatorMode mode = new CoordinatorMode(() -> false, () -> "1");
+        try {
+            CoordinatorMode.setExclusionSlotsForTest(() -> true, () -> false, () -> false);
+            assertThat(mode.isCoordinatorMode())
+                .as("Td() && !xn() && !CLAUDE_CODE_REMOTE ⇒ false")
+                .isFalse();
+
+            CoordinatorMode.setExclusionSlotsForTest(() -> true, () -> true, () -> false);
+            assertThat(mode.isCoordinatorMode())
+                .as("remote 工作区（xn()=true）⇒ 不排除")
+                .isTrue();
+
+            CoordinatorMode.setExclusionSlotsForTest(() -> true, () -> false, () -> true);
+            assertThat(mode.isCoordinatorMode())
+                .as("CLAUDE_CODE_REMOTE 真 ⇒ 不排除")
+                .isTrue();
+        } finally {
+            CoordinatorMode.setExclusionSlotsForTest(null, null, null);
+        }
     }
 
     @Test

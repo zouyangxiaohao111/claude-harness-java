@@ -1341,7 +1341,7 @@ class ClaudemdEngineTest {
         engine.setHookRegistry(registry);
 
         // ① 生产 base TUC（buildBaseToolUseContext 等价：compact ctor 持会话级 KeySetView）
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
             List.of(), null, com.nexusai.application.agent.permission.PermissionMode.DEFAULT);

@@ -28,6 +28,11 @@ import java.util.Set;
  *       ⚠️ 必须在 CU / BR 之后判，二者是专属前缀</li>
  *   <li>实现类在 {@code com.nexusai.kb.} 包下 → {@link #KB} —— 知识库专属工具
  *       （{@code kb/agent/tool/} 下 15 个，均标 {@code @ExclusiveTool}）</li>
+ *   <li>IM 工具名（{@code SendImAsUser} / {@code ListImChats} / {@code ReadImMessages} /
+ *       {@code SearchImContacts} / {@code SendUserMessage} / {@code wechat_search_messages} /
+ *       {@code wechat_list_conversations}）→ {@link #IM} ——
+ *       通讯类能力（实现类分散在 {@code tool.impl} 与 {@code wechatlog.tool} 两个包，
+ *       故按<b>工具名</b>判定，见 {@link #IM_TOOL_NAMES}）</li>
  *   <li>其余 → {@link #SYS}</li>
  * </ol>
  *
@@ -42,7 +47,9 @@ import java.util.Set;
  * <h2>默认禁用（[tool-categories] 用户 2026-11-12 裁定）</h2>
  * <p>只有 {@link #CU} 与 {@link #KB} 两类默认禁用；{@link #BR} <b>不</b>默认禁用
  * （未装扩展时该组天然 0 项，装上后立即生效，无需用户再手动开）；
- * {@link #MCP} 也<b>不</b>默认禁用（第三方能力由用户在会话内按需关闭）。
+ * {@link #MCP} 也<b>不</b>默认禁用（第三方能力由用户在会话内按需关闭）；
+ * {@link #IM} 不进 CU+KB 默认禁用集（会话级 IM 默认关闭走 {@code SessionToolVisibility}
+ * 的 {@code im_tool_overrides} 规则；本机微信记录类除外，见 {@link #IM_NO_BINDING_TOOL_NAMES}）。
  *
  * <p><b>静态桥接</b>：{@link #defaultDisabledNamesStatic()} 为静态 —— 消费方
  * {@code SessionToolDisableConfig.getDisabledTools} 在 {@code LlmAgentLoop} 的 static
@@ -70,10 +77,53 @@ public class SessionToolCategory {
     public static final String KB = "KB";
     public static final String BR = "BR";
     public static final String MCP = "MCP";
+    public static final String IM = "IM";
     public static final String SYS = "SYS";
 
+    /**
+     * IM 类工具名集合（唯一判定来源）。
+     *
+     * <p><b>为什么按工具名而不是包名</b>：{@code ListImChatsTool} / {@code SendImAsUserTool}
+     * 与系统工具同在 {@code com.nexusai.application.agent.tool.impl} 包，按包名无法与 SYS 区分；
+     * 微信那几个在 {@code com.nexusai.wechatlog.tool} 包，又不在 kb 包，
+     * 两处都没有可复用的包级判据 ⇒ 只能用工具名。
+     *
+     * <p><b>为什么 {@code SendUserMessage} 也在里面</b>：它的实现是 {@code BriefTool}
+     * （{@link ToolNameConstants#BRIEF_TOOL_NAME}，CC 里叫 SendUserMessage），
+     * 语义就是「给用户发消息」——和 IM 同属通讯类。
+     *
+     * <p>⛔ <b>不要把 {@code SendMessage} 加进来</b>：它属于
+     * {@code SessionToolsController.CORE_ORCHESTRATION_TOOLS}（不可禁用），
+     * 放进可整组关闭的 IM 会产生「点了整组关闭，SendMessage 被跳过」的错位。
+     *
+     * <p>微信两个名字来自 {@code WeChatSearchMessagesTool#name()} /
+     * {@code WeChatListConversationsTool#name()}（下划线命名，与本仓新增能力风格一致）。
+     */
+    private static final String WECHAT_SEARCH_MESSAGES_TOOL_NAME = "wechat_search_messages";
+    private static final String WECHAT_LIST_CONVERSATIONS_TOOL_NAME = "wechat_list_conversations";
+
+    public static final Set<String> IM_TOOL_NAMES = Set.of(
+            ToolNameConstants.SEND_IM_AS_USER_TOOL_NAME,     // SendImAsUser
+            ToolNameConstants.LIST_IM_CHATS_TOOL_NAME,       // ListImChats
+            ToolNameConstants.READ_IM_MESSAGES_TOOL_NAME,    // ReadImMessages
+            ToolNameConstants.SEARCH_IM_CONTACTS_TOOL_NAME,  // SearchImContacts
+            ToolNameConstants.BRIEF_TOOL_NAME,               // SendUserMessage
+            WECHAT_SEARCH_MESSAGES_TOOL_NAME,                // 本机微信记录检索
+            WECHAT_LIST_CONVERSATIONS_TOOL_NAME);            // 本机微信会话列表
+
+    /**
+     * IM 组中<b>不依赖「渠道绑定到当前会话」</b>的工具（本机微信记录）。
+     *
+     * <p>它们读的是本机已同步的 wechat 索引，不需要任何 IM 实例接到本会话 ⇒ 新建会话即可用：
+     * 不参与 {@code SessionToolVisibility} 的「无覆盖 ⇒ 默认不启用」，但仍归 {@link #IM} 分类、
+     * 仍显示在面板的 IM（渠道）组里。用户显式写过 {@code im_tool_overrides=false} 时照常关闭。
+     */
+    public static final Set<String> IM_NO_BINDING_TOOL_NAMES = Set.of(
+            WECHAT_SEARCH_MESSAGES_TOOL_NAME,
+            WECHAT_LIST_CONVERSATIONS_TOOL_NAME);
+
     /** 合法分类集合（请求体校验用）。 */
-    public static final Set<String> ALL = Set.of(CU, KB, BR, MCP, SYS);
+    public static final Set<String> ALL = Set.of(CU, KB, BR, MCP, IM, SYS);
 
     /** 工具注册表静态桥接（null = 未注入，POJO 单测/无 Spring）。 */
     private static volatile ToolRegistry toolRegistry;
@@ -101,7 +151,7 @@ public class SessionToolCategory {
      * 判定单个工具的分类。
      *
      * @param tool 工具（null → {@link #SYS}，防御性）
-     * @return {@link #CU} / {@link #KB} / {@link #BR} / {@link #MCP} / {@link #SYS}
+     * @return {@link #CU} / {@link #KB} / {@link #BR} / {@link #MCP} / {@link #IM} / {@link #SYS}
      */
     public static String of(Tool tool) {
         if (tool == null) {
@@ -123,6 +173,9 @@ public class SessionToolCategory {
         }
         if (tool.getClass().getName().startsWith(KB_PACKAGE_PREFIX)) {
             return KB;
+        }
+        if (name != null && IM_TOOL_NAMES.contains(name)) {
+            return IM;
         }
         return SYS;
     }

@@ -77,7 +77,8 @@ class SettingsServiceTest {
         SettingsDto dto = service.get();
 
         assertThat(dto.websearchEngine()).isEqualTo("anysearch");
-        assertThat(dto.apiKey()).isEqualTo("db-key-123");
+        // [保密 2026-11-22] 出站只给掩码，明文永不出后端（用户「明文 apiKey 不能」）
+        assertThat(dto.apiKey()).isEqualTo(com.nexusai.infra.util.ApiKeyHasher.maskTail("db-key-123"));
         assertThat(dto.proxy()).isEqualTo("proxy.db.example:8080");
         assertThat(dto.websearchUseSmallModel()).isTrue();
         assertThat(dto.websearchBaseUrl()).as("V38 列 websearch_base_url 必须透出（R-B）").isEqualTo("https://base.example.com");
@@ -190,7 +191,8 @@ class SettingsServiceTest {
         SettingsDto dto = service.update(req);
 
         assertThat(dto.websearchEngine()).isEqualTo("duckduckgo");
-        assertThat(dto.apiKey()).isEqualTo("db-key-123");   // null → 保留旧值
+        // null → 保留旧值；出站仍是掩码（[保密 2026-11-22] 明文不出后端）
+        assertThat(dto.apiKey()).isEqualTo(com.nexusai.infra.util.ApiKeyHasher.maskTail("db-key-123"));
         assertThat(dto.proxy()).isEqualTo("proxy.db.example:8080");
         assertThat(dto.websearchUseSmallModel()).isFalse(); // false 非 null → 覆盖
         assertThat(dto.websearchBaseUrl()).as("websearchBaseUrl null → 保留旧值透出").isEqualTo("https://base.example.com");

@@ -86,7 +86,7 @@ class BashToolReadOnlySessionExplicitTest {
     }
 
     private static ToolUseContext ctxWithoutEffectiveCwd(String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             ToolPermissionContext.of(PermissionMode.DEFAULT, Map.of(), Map.of(), Map.of(), Map.of()),
             PermissionMode.DEFAULT);

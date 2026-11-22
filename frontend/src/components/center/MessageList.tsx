@@ -1,8 +1,10 @@
 import { Fragment, createContext, memo, useCallback, useContext, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from 'react'
-import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isNotificationInjectedUserRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
+import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isAgentNotificationRow, isDialogueRow, isNotificationInjectedUserRow, isPeerAgentNotification, isPeerLaunchRow, isSystemInjectedRow, isUserTurnRow, orderedTurnKeys, peerFailureSentence, readPeerFailure, readPeerSource, turnKeyByRowId, turnKeyOf } from '../../stores/messageTurns'
+import { peerAdmissionBadge, peerModeText } from '@/stores/peerInboxStore'
+import { PeerHoldCards } from './PeerHoldCards'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
 import { projectPreview } from '@/markdown/plainPreview'
-import type { AttachmentRequest, ChatMessageDto, ToolCallDto } from '@/api/types'
+import type { AttachmentRequest, ChatMessageDto, ContentBlockDto, PeerHeldItemDto, ToolCallDto } from '@/api/types'
 import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
 import type { TurnUsageDto } from '@/api/usageTurns'
 import type { SessionFile } from '@/types'
@@ -15,9 +17,12 @@ import { uploadAttachment } from '@/api/chat'
 import { briefErrorMessage, briefPayload, dropTextInBriefTurns, isBriefBlock, isSendUserMessage } from '@/utils/sendUserMessage'
 import { extractAtRefs } from '@/utils/atRefs'
 import { headTailCap } from '@/utils/headTailCap'
+// [错误通道 · CCJ-ERR-013] 工具卡状态判定的唯一入口（取消/拒绝/中断前缀先于 is_error，对齐 CC）
+import { classifyToolStatus, toolStatusIcon, toolStatusLabel } from '@/utils/toolStatus'
 // [OBS2] 渲染错误边界（防御性兜底）：见下方「消息区整层」与「逐行」两处包裹
 import { ErrorBoundary } from '@/components/common/ErrorBoundary'
 import { ArtifactCards } from '@/components/right/ArtifactCards'
+import { AstToolBody, parseAstPayload } from './AstToolBody'
 import { PlanApprovalCard } from './PermissionBubble'
 import type { PermissionRequestItem } from '@/stores/chatStore'
 
@@ -127,6 +132,22 @@ function formatMsgTimeAbsolute(msg: ChatMessageDto): string {
     }
   }
   return ''
+}
+
+/**
+ * [peer-message] 来信正文是否需要「展开全文 / 收起」。
+ *
+ * <p><b>WHY 两档判据</b>：内联卡片正文按 `pre-wrap` 全宽渲染，折叠态是 `max-height: 12 行`。
+ * 只数 `\n` 会漏掉「几千字但没有换行」的来信 —— 那种正文会被 max-height 裁掉却没有展开入口
+ * （用户看到半截、也点不开）。故同时按字数估算换行后的行数（12 行 × 约 60 字/行）。
+ */
+const PEER_BODY_CLAMP_LINES = 12
+const PEER_BODY_CLAMP_CHARS = PEER_BODY_CLAMP_LINES * 60
+function peerBodyIsLong(text: string): boolean {
+  if (text === '') return false
+  let lines = 1
+  for (let i = 0; i < text.length; i++) if (text.charCodeAt(i) === 10) lines++
+  return lines > PEER_BODY_CLAMP_LINES || text.length > PEER_BODY_CLAMP_CHARS
 }
 
 /**
@@ -453,7 +474,7 @@ function collectUserTurnIds(messages: ChatMessageDto[]): { ids: Set<string>; lat
  *  <p>WHY 组合匹配：工具名有大量变体（`Bash` / `BashTool` / `mcp__x__run_command` / `execute_command` /
  *  `ReadFile` / `WebFetch` …），只按几个固定子串会把「跑命令」的行走成通用扳手。
  *  判定顺序 = 终端 → 网页 → 搜索 → 目录 → 读 → 编辑 → 写，前者优先（`web_search` 不能被 `search` 抢走）。 */
-function toolIconKind(name: string): 'bash' | 'web' | 'grep' | 'glob' | 'read' | 'edit' | 'write' | 'other' {
+function toolIconKind(name: string): 'bash' | 'web' | 'grep' | 'ast' | 'glob' | 'read' | 'edit' | 'write' | 'other' {
   const n = (name ?? '').toLowerCase()
   const tokens = n.split(/[^a-z0-9]+/).filter(Boolean)
   const has = (keys: string[]): boolean => keys.some((k) => n.includes(k) || tokens.includes(k))
@@ -462,6 +483,8 @@ function toolIconKind(name: string): 'bash' | 'web' | 'grep' | 'glob' | 'read' |
     || has(['bash', 'shell', 'powershell', 'pwsh', 'terminal', 'exec', 'execute', 'command', 'cmd', 'cmdline'])) return 'bash'
   // 网页类：WebSearch / web_search / WebFetch / web_fetch / browser / fetch
   if (has(['websearch', 'web_search', 'webfetch', 'web_fetch', 'browse', 'browser', 'fetch'])) return 'web'
+  // AST 结构化：AstGrep / ast_grep / AstEdit / ast-edit（必须先于 grep —— 名字里含 "grep"）
+  if (has(['ast_grep', 'astgrep', 'ast_edit', 'astedit'])) return 'ast'
   // 搜索类：Grep / ripgrep / search_files / file_search / search
   if (has(['grep', 'ripgrep', 'search'])) return 'grep'
   // 目录/文件列举：Glob / list_dir / list_files / find_files
@@ -497,6 +520,9 @@ function ToolTypeIcon({ name }: { name: string }) {
       )}
       {kind === 'grep' && (
         <svg {...svgProps}><circle cx="7" cy="7" r="4.4" /><path d="M10.3 10.3L14 14" /></svg>
+      )}
+      {kind === 'ast' && (
+        <svg {...svgProps}><path d="M8 1.8v4.2" /><circle cx="8" cy="7.4" r="1.4" /><path d="M8 8.8v2.1M8 10.9L4 13.2M8 10.9l4 2.3" /><circle cx="4" cy="13.9" r="1.2" /><circle cx="12" cy="13.9" r="1.2" /></svg>
       )}
       {kind === 'glob' && (
         <svg {...svgProps}><path d="M1.7 4.6a1.4 1.4 0 011.4-1.4h2.6l1.3 1.5h4.9a1.4 1.4 0 011.4 1.4v5.5a1.4 1.4 0 01-1.4 1.4H3.1a1.4 1.4 0 01-1.4-1.4z" /><circle cx="9.4" cy="8.7" r="2" /><path d="M10.9 10.2l1.4 1.4" /></svg>
@@ -624,6 +650,35 @@ interface MessageListProps {
   /** [正文排版] 助手正文追加 `markdown-prose`（预览那套 · 14px 字号）。
    *  子代理 transcript 传 true；主会话不传 ⇒ 行为零变化。 */
   prose?: boolean
+  /**
+   * [peer-hold] 待确认 / 已拒绝来信（**数据来自待收件列表接口** `peer_held_message`）。
+   *
+   * <p>⛔ 不从消息行读 `heldState`：hold 消息不进 messages 表，读它会在刷新后丢卡片。
+   * 不传/空数组 ⇒ 不渲染（旧宿主零改动）。
+   */
+  peerHeldItems?: PeerHeldItemDto[]
+  /** 正在处理（接受/拒绝）的 messageId：期间两按钮都禁用。 */
+  peerHeldActing?: string | null
+  /** 行内失败原因（业务未达成/请求失败；行保留）。 */
+  peerHeldRowErrors?: Record<string, string>
+  onPeerAccept?: (messageId: string) => void
+  onPeerReject?: (messageId: string) => void
+  /** [peer] 来源会话标题**显式点击** → App 校验后跳转；⛔ 渲染/自动行为一律不跳。 */
+  onOpenPeerSession?: (sessionId: string) => void
+  /**
+   * [peer-jump] 待处理点击后的聚焦请求：切到该会话后滚到首条 pending 卡 + 高亮 1.5s。
+   *
+   * <p>只处理 `sessionId === 当前会话` 的请求；items 异步加载，effect 内做 bounded 重试。
+   */
+  focusPeer?: { sessionId: string; messageId: string | null; nonce: number } | null
+}
+
+/** [session-create] 从 SessionCreate 工具结果的固定协议里取新会话 id
+ *  （`created session: sess-xxxxxxxx`）；格式不匹配 → null（不渲染跳转入口）。 */
+function sessionCreateTarget(result: string | null | undefined): string | null {
+  if (!result) return null
+  const m = /created session:\s*([A-Za-z0-9_-]+)/.exec(result)
+  return m ? m[1]! : null
 }
 
 /** [紧凑过程行] 工具行标题参数摘要：从 arguments JSON 取「动作对象」字段（command/cmd/path/pattern/query…），
@@ -632,9 +687,20 @@ function toolArgSummary(raw: string | null | undefined): string {
   const text = raw?.trim() ?? ''
   if (!text) return ''
   const fromObject = (o: Record<string, unknown>): string => {
-    for (const key of ['command', 'cmd', 'file_path', 'filePath', 'path', 'pattern', 'query', 'url', 'prompt', 'description']) {
+    for (const key of ['command', 'cmd', 'file_path', 'filePath', 'pat', 'path', 'pattern', 'query', 'url', 'prompt', 'description']) {
       const v = o[key]
       if (typeof v === 'string' && v.trim() !== '') return v.trim()
+    }
+    // AstEdit：ops 数组压成 "pat → out, pat → out"（没有单串可摘要时的首选展示）
+    if (Array.isArray(o.ops)) {
+      const parts: string[] = []
+      for (const item of o.ops) {
+        if (item == null || typeof item !== 'object') continue
+        const pat = 'pat' in item && typeof item.pat === 'string' ? item.pat : ''
+        const out = 'out' in item && typeof item.out === 'string' ? item.out : ''
+        if (pat) parts.push(`${pat} → ${out}`)
+      }
+      if (parts.length > 0) return parts.join(', ')
     }
     for (const v of Object.values(o)) {
       if (typeof v === 'string' && v.trim() !== '') return v.trim()
@@ -671,7 +737,7 @@ function shortToolArgSummary(raw: string | null | undefined): string {
  *
  *  <p>[紧凑过程行] 默认收起为<b>单行灰字</b>：类型图标 + 状态图标（✓/⊙/✗/⊘）+ 工具名 + 关键参数摘要 + 右侧 chevron，
  *  无卡片边框/背景/阴影；点击整行展开原有 IN/OUT（终端输出保留深底块）。展开/收起能力与状态判据不变。 */
-export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string }) {
+export function ToolCard({ tool, matchedRule, live = false, sessionId, onOpenSession }: { tool: NonNullable<ChatMessageDto['toolCalls']>[number]; matchedRule: string | null; live?: boolean; sessionId: string; /** [session-create] 新会话跳转（仅显式点击）· 缺省不渲染入口 */ onOpenSession?: (sessionId: string) => void }) {
   // 工具卡片默认折叠（用户手动点击展开 IN/OUT）· 对齐 Harness ToolRow；组件本地展开态
   const [expanded, setExpanded] = useState(false)
   // [plan-approval inline] 本卡就是待审批的 ExitPlanMode → 卡后插入内联审批卡
@@ -686,6 +752,8 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
   //   query=搜索词；results 中对象块（content:[{title,url}]）= hits 列表；string 项 = 弱模型总结。
   //   勿读已删除的 summary 键；result 缺失/解析失败 → 「搜索中…/总结中…」（按 tool.isError 显示失败）。
   const isWs = /web[\s_-]?search/i.test(name)
+  // AST 工具（AstGrep/AstEdit）：result 是 AstUiPayload 产出的结构化 JSON；解析失败 → null（回落 IN/OUT）
+  const astPayload = parseAstPayload(name, tool.result)
   const wsData = isWs ? (() => {
     try {
       const r: { query?: unknown; results?: unknown } = tool.result ? JSON.parse(tool.result) : null
@@ -725,7 +793,6 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
   //   WHY：空输出成功 Bash（cmd start 开浏览器等零 stdout）后端实时推 result=""，旧实现拿
   //   result.trim()!=='' 判完成 → 空结果被当未完成 → 永久「执行中」假卡
   //   （BashTool 空输出假卡事故 2026-09-05 · 修复 B）。OUT 区显隐用内联 result.trim()!==''（下方 body）。
-  const hasResult = tool.result != null
   // [Fix3 2026-09-09 · 对齐 CC resolvedToolUseIDs] "执行中"只在 live(活跃流式块=turn 仍在飞)成立；
   //   settled 历史里 result==null 且非 error = 孤儿(工具被取消/中断/结果缺失) → 显示"已中断"，不永久转圈。
   //   runningFront(转后台按钮) 仅 live 卡有效 —— settled 孤儿不再触发 tasksApi.list 轮询/不再有陈旧"转后台"
@@ -733,12 +800,12 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
   // [2026-10-22 问答收敛] 已回答、等待结果：AskUserQuestion 类工具回答后、tool_result 到达前，
   //   卡片显示「已回答 · 等待结果」而不是「执行中」（事件缺失时也不再判为「已中断」）。
   const answered = useChatStore((s) => (tool.id ? s.answeredToolCalls[tool.id] != null : false))
-  const interrupted = !hasResult && !tool.isError && !live && !answered
-  const runningFront = live && !hasResult && !tool.isError
-  // [紧凑过程行] 状态图标/文案与既有判据同源：失败 ✗ / 完成 ✓ / 中断 ⊘ / 运行中（含已回答等待结果）⊙
-  const statusKind = tool.isError ? 'error' : hasResult ? 'done' : interrupted ? 'interrupted' : 'running'
-  const statusLabel = tool.isError ? '失败' : hasResult ? '已完成' : answered ? '已回答 · 等待结果' : interrupted ? '已中断' : '执行中'
-  const statusIcon = tool.isError ? '✗' : hasResult ? '✓' : interrupted ? '⊘' : '⊙'
+  // [错误通道 · CCJ-ERR-013] 状态判定收敛到 classifyToolStatus（唯一入口，实时/重拉共用）：
+  //   取消 → 拒绝 → 中断（内容前缀，对齐 CC UserToolResultMessage.tsx:40-104）→ is_error → 成功/进行中。
+  const statusKind = classifyToolStatus({ result: tool.result, isError: tool.isError, live, answered })
+  const runningFront = live && statusKind === 'running'
+  const statusLabel = toolStatusLabel(statusKind, { answered })
+  const statusIcon = toolStatusIcon(statusKind)
   const [bgTaskId, setBgTaskId] = useState<string | null>(null)
   useEffect(() => {
     if (!runningFront) { setBgTaskId(null); return }
@@ -786,11 +853,30 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
             转后台
           </span>
         )}
+        {/* [session-create] SessionCreate 工具卡 → 显式点击打开它创建的会话（⛔ 不自动跳） */}
+        {(() => {
+          const target = name === 'SessionCreate' ? sessionCreateTarget(tool.result) : null
+          if (!target || !onOpenSession) return null
+          return (
+            <span
+              role="button"
+              className="tc-open-session"
+              onClick={(e) => { e.stopPropagation(); e.preventDefault(); onOpenSession(target) }}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.stopPropagation(); e.preventDefault(); onOpenSession(target) } }}
+              tabIndex={0}
+              title="打开新建的会话"
+            >
+              打开会话
+            </span>
+          )
+        })()}
         <svg className="tc-chevron" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} aria-hidden="true">
           <path d="M6 4l4 4-4 4" />
         </svg>
       </button>
-      {expanded && (isWs ? (
+      {expanded && (astPayload ? (
+        <AstToolBody payload={astPayload} />
+      ) : isWs ? (
         wsData ? (
           <div className="ws-body">
             {wsData.query && <div className="ws-query">{wsData.query}</div>}
@@ -853,13 +939,15 @@ export function ToolCard({ tool, matchedRule, live = false, sessionId }: { tool:
  *  摘要优先用同轮 `tool_use_summary` 文本（由 MessageList 关联后经 `title` 传入），否则「首个工具名: 参数摘要」，
  *  再否则「并行 N 个工具」；单行不换行，完整值在 title tooltip + 子项 IN/OUT 里看。
  *  子项复用紧凑 {@link ToolCard} —— 每项的状态图标、类型图标、IN/OUT、自动批准徽标、错误/中断全部保留。 */
-export function ToolGroup({ tools, matchedRule, sessionId, title, live = false }: {
+export function ToolGroup({ tools, matchedRule, sessionId, title, live = false, onOpenSession }: {
   tools: ToolCallDto[]
   matchedRule: string | null
   sessionId: string
   /** 同轮 tool_use_summary 文本（父行标题优先来源；缺省回落首个工具名+参数） */
   title?: string
   live?: boolean
+  /** [session-create] 子项 ToolCard 的新会话跳转（透传） */
+  onOpenSession?: (sessionId: string) => void
 }) {
   const [open, setOpen] = useState(true)
   const first = tools[0]!
@@ -880,14 +968,21 @@ export function ToolGroup({ tools, matchedRule, sessionId, title, live = false }
   const label = title?.trim() || `${firstName} · ${fallback}`
   const tip = title?.trim() || (argFull ? `${firstName}: ${argFull}` : firstName) || fallback
   // 聚合状态：任一失败 → ✗；有未完成（live=执行中 / 已结束=中断）→ ⊙/⊘；否则 ✓
-  const anyError = tools.some((t) => t.isError)
-  const anyPending = tools.some((t) => t.result == null && !t.isError)
-  const anyDone = tools.some((t) => t.result != null)
-  const statusKind: 'error' | 'running' | 'interrupted' | 'done' = anyError
-    ? 'error'
-    : anyPending ? (live ? 'running' : anyDone ? 'done' : 'interrupted') : 'done'
-  const statusIcon = statusKind === 'error' ? '✗' : statusKind === 'done' ? '✓' : statusKind === 'interrupted' ? '⊘' : '⊙'
-  const statusLabel = statusKind === 'error' ? '有工具失败' : statusKind === 'done' ? '已完成' : statusKind === 'interrupted' ? '已中断' : '执行中'
+  // 聚合状态：优先失败 → 拒绝/取消（内容前缀，同 ToolCard 判定入口）→ 进行中 → 中断 → 完成
+  const kinds = tools.map((t) => classifyToolStatus({ result: t.result, isError: t.isError, live }))
+  const statusKind: 'error' | 'rejected' | 'cancelled' | 'running' | 'interrupted' | 'done' =
+    kinds.includes('error') ? 'error'
+      : kinds.includes('rejected') ? 'rejected'
+        : kinds.includes('cancelled') ? 'cancelled'
+          : kinds.includes('running') ? 'running'
+            : kinds.includes('interrupted') ? 'interrupted'
+              : 'done'
+  const statusIcon = toolStatusIcon(statusKind)
+  const statusLabel = statusKind === 'error' ? '有工具失败'
+    : statusKind === 'rejected' ? '有工具被拒绝'
+      : statusKind === 'cancelled' ? '有工具被取消'
+        : statusKind === 'done' ? '已完成'
+          : statusKind === 'interrupted' ? '已中断' : '执行中'
   return (
     <div className={`tool-group${open ? ' open' : ''}`}>
       <button
@@ -907,7 +1002,7 @@ export function ToolGroup({ tools, matchedRule, sessionId, title, live = false }
       {open && (
         <div className="tg-body">
           {tools.map((t, i) => (
-            <ToolCard key={t.id ?? i} tool={t} matchedRule={matchedRule} live={live} sessionId={sessionId} />
+            <ToolCard key={t.id ?? i} tool={t} matchedRule={matchedRule} live={live} sessionId={sessionId} onOpenSession={onOpenSession} />
           ))}
         </div>
       )}
@@ -938,6 +1033,26 @@ function SendUserMessageBody({ tool, prose = false }: { tool: NonNullable<ChatMe
   return (
     <div className="sum-body">
       {payload.message !== '' && <MarkdownTextV2 text={payload.message} className={`content md${prose ? ' markdown-prose' : ''}`} />}
+      {/* 投递回执：复用定时任务运行记录那套 .run-notify（同一个视觉语义：
+          ✓ 已投递到 X / ✗ 投递失败：原因）。
+          ⚠️ 没有配通知目标时 delivery 为空 ⇒ 整块不渲染 ——
+             不要在对话里写「未发送到任何渠道」，那会让用户以为出错了。 */}
+      {payload.delivery.length > 0 && (
+        <div className="sum-delivery">
+          {payload.delivery.map((d, i) => (
+            <span
+              key={d.chatId ?? `d-${i}`}
+              className={d.status === 'SENT' ? 'run-notify ok' : d.status === 'SKIPPED' ? 'run-notify' : 'run-notify err'}
+            >
+              {d.status === 'SENT'
+                ? `✓ 已发送到 ${d.chatName ?? d.chatId ?? '目标'}${d.identity === 'USER' ? '（以你本人名义）' : ''}`
+                : d.status === 'SKIPPED'
+                  ? `— 跳过 ${d.chatName ?? d.chatId ?? '目标'}${d.reason ? `：${d.reason}` : ''}`
+                  : `✗ 发送失败 ${d.chatName ?? d.chatId ?? '目标'}${d.reason ? `：${d.reason}` : ''}`}
+            </span>
+          ))}
+        </div>
+      )}
       {payload.attachments.length > 0 && (
         <div className="sum-attachments">
           {payload.attachments.map((a) => (
@@ -958,7 +1073,7 @@ function SendUserMessageBody({ tool, prose = false }: { tool: NonNullable<ChatMe
  *  `groupTitle`（同轮 tool_use_summary 文本）只交给本条消息里的第一个组，避免标题重复。 */
 function renderToolCalls(
   calls: ToolCallDto[],
-  opts: { matchedRule: string | null; sessionId: string; live?: boolean; groupTitle?: string; prose?: boolean },
+  opts: { matchedRule: string | null; sessionId: string; live?: boolean; groupTitle?: string; prose?: boolean; onOpenSession?: (sessionId: string) => void },
 ): ReactNode[] {
   const out: ReactNode[] = []
   let run: ToolCallDto[] = []
@@ -967,7 +1082,7 @@ function renderToolCalls(
     if (run.length === 0) return
     if (run.length === 1) {
       const t = run[0]!
-      out.push(<ToolCard key={t.id ?? `tc-${out.length}`} tool={t} matchedRule={opts.matchedRule} live={opts.live} sessionId={opts.sessionId} />)
+      out.push(<ToolCard key={t.id ?? `tc-${out.length}`} tool={t} matchedRule={opts.matchedRule} live={opts.live} sessionId={opts.sessionId} onOpenSession={opts.onOpenSession} />)
     } else {
       out.push(
         <ToolGroup
@@ -977,6 +1092,7 @@ function renderToolCalls(
           sessionId={opts.sessionId}
           live={opts.live}
           title={titleAssigned ? undefined : opts.groupTitle}
+          onOpenSession={opts.onOpenSession}
         />,
       )
       titleAssigned = true
@@ -1006,13 +1122,14 @@ function renderToolCalls(
  * <p>⚠️ props 必须全稳定：`toolCalls` 数组引用 / `sessionId` / `prose`。
  */
 const StreamToolList = memo(function StreamToolList({
-  toolCalls, sessionId, prose = false,
+  toolCalls, sessionId, prose = false, onOpenSession,
 }: {
   toolCalls: NonNullable<ChatMessageDto['toolCalls']>
   sessionId: string
   prose?: boolean
+  onOpenSession?: (sessionId: string) => void
 }) {
-  return <>{renderToolCalls(toolCalls, { matchedRule: null, sessionId, live: true, prose })}</>
+  return <>{renderToolCalls(toolCalls, { matchedRule: null, sessionId, live: true, prose, onOpenSession })}</>
 })
 
 /** [P2-13] compact 摘要专用渲染 · 对齐 CC {@code components/CompactSummary.tsx:74-104}（auto-compact 默认分支）
@@ -1063,19 +1180,20 @@ function CompactSummaryCard({ msg, highlighted }: { msg: ChatMessageDto; highlig
  *  且非 label 摘要 → 不渲染（Stop/SubagentStop 生产形态 hookLabel 恒 null →
  *  即「只有出错或被阻止时才可见」）。 */
 /**
- * 系统注入行（2026-11-02 用户裁定）：技能清单 / 外部改文件 / hook 回执 等 meta 消息。
+ * 系统注入行（2026-11-02 用户裁定；2026-11-20 改位置）：技能清单 / 外部改文件 / hook 回执 等 meta 消息。
  *
  * <p><b>形态</b>：一行弱化的「⏺ 摘要」，点开看原始内容 —— 复用后台通知行（`.msg.task-notice`）的视觉，
  * 因为它们同属「系统说的话，不是用户说的，也不是助手说的」。
  *
- * <p><b>位置</b>：⛔ 不单独占据对话流（否则收起态仍会显示、且夹在工具卡之间打断阅读），
- * 只在该轮「已完成」折叠区里渲染（由 {@code Message} 的 turn-process-body 承载）。
+ * <p><b>位置</b>（2026-11-20 用户裁定「消息末尾」）：按自身在消息序列中的位置**独立渲染**。
+ * 后端把这类行 append 在当轮尾部（seq 单调）⇒ 它们天然落在消息末尾，不再被收进该轮折叠区。
+ * ⛔ 不进用户气泡、不新开轮次。
  */
 function SystemInjectedRow({ msg }: { msg: ChatMessageDto }) {
   const [open, setOpen] = useState(false)
   const raw = (msg.content ?? '').trim()
   return (
-    <div className="msg task-notice" data-msg-id={msg.id}>
+    <div className="msg task-notice sys-injected" data-msg-id={msg.id}>
       <button
         type="button"
         className="tn-head"
@@ -1118,7 +1236,7 @@ function systemRowLabel(m: ChatMessageDto): string {
   if (sub === 'mcp_instructions_delta') return 'MCP 指令更新'
   // [goal V253] 目标（/goal）终态溯源行 · 后端 GoalService.buildTerminalTraceMessage 产出
   //   （role=user + isMeta + author='attachment' + subtype='goal_status'）
-  //   ⇒ isSystemInjectedRow 的 isMeta 分支天然覆盖 ⇒ 落该轮「已完成」折叠区，不开新轮、不当用户气泡。
+  //   ⇒ isSystemInjectedRow 的 isMeta 分支天然覆盖 ⇒ 在对话流中按自身位置独立渲染，不开新轮、不当用户气泡。
   //   正文由后端写死「◎ 目标已达成 · N 轮」/「◎ 目标无法达成 · N 轮」⇒ 直接当摘要用。
   if (sub === 'goal_status') return text || '目标已结束'
   const inner = text.replace(/^<system-reminder>/, '').replace(/<\/system-reminder>$/, '').trim()
@@ -1229,6 +1347,151 @@ function ContentGuard({ text, className, onRunHtml, streaming, citeLink, citeMsg
   )
 }
 
+/**
+ * [content-blocks] 单个 thinking 块 · **复用现有思考块折叠样式**
+ * （`.thinking-wrap` / `.thinking-toggle` / `.thinking-icon` / `.thinking-caret` / `.thinking-body`，
+ * 与 `msg.reasoning` 的思考块同一套视觉）。
+ *
+ * <p>展开态按块各自持有：历史默认收起、点击展开（与现有思考块一致）；多个 thinking 块互不影响。
+ * `aria-expanded` 是新增的无障碍标注（不影响任何既有选择器/样式）。
+ */
+function BlockThinking({ text }: { text: string }) {
+  const [open, setOpen] = useState(false)
+  const bodyRef = useRef<HTMLDivElement>(null)
+  // 思考窗口：展开时滚到底（只露最新内容），与 Message 里的 reasoningBlock 同行为
+  useEffect(() => {
+    const el = bodyRef.current
+    if (el && open) el.scrollTop = el.scrollHeight
+  }, [open, text])
+  const tokens = Math.ceil(text.length / 4)
+  return (
+    <div className={`thinking-wrap${open ? ' open' : ''}`}>
+      <button type="button" className="thinking-toggle" onClick={() => setOpen((v) => !v)} aria-expanded={open}>
+        <svg className="thinking-icon" viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.2">
+          <path d="M8 2.2v2.6M8 11.2v2.6M2.2 8h2.6M11.2 8h2.6M4.1 4.1l1.8 1.8M10.1 10.1l1.8 1.8M11.9 4.1l-1.8 1.8M5.9 10.1l-1.8 1.8" strokeLinecap="round" />
+        </svg>
+        <span>思考过程{tokens > 0 ? ` · ${compactNumber(tokens)} tokens` : ''}</span>
+        <svg className="thinking-caret" viewBox="0 0 24 24"><path d="M9 18l6-6-6-6" /></svg>
+      </button>
+      {open && <div className="thinking-body" ref={bodyRef}>{text}</div>}
+    </div>
+  )
+}
+
+/** [content-blocks] 一个渲染段（segment）：thinking / 合并后的 text / 相邻 tool_use 组。 */
+interface ContentBlockSegment {
+  key: string
+  kind: 'text' | 'thinking' | 'tools'
+  /** 仅 kind='text' 携带合并后的正文（判定「最终答复」时要用） */
+  text?: string
+  node: ReactNode
+}
+
+/**
+ * [content-blocks] 有序 content blocks → 按数组顺序的渲染段。
+ *
+ * <p><b>规则（对齐 CC 逐块 switch）</b>：
+ * ① thinking 一块一段（沿用现有折叠样式）；
+ * ② **连续 text 合并**成一段（`\n\n` 连接，一次 Markdown 渲染）；
+ * ③ **相邻 tool_use 合成一段**：复用 {@link renderToolCalls}（1 个 → 单卡、>1 → 并行组；
+ *    SendUserMessage 仍按正文语义就地渲染）；
+ * ④ 中间夹了 thinking/text 即断组；文本**不搬家、不重排** —— DOM 顺序恒等于数组顺序。
+ *
+ * <p>tool_use 块按 `id` 关联本消息真实的 `toolCalls`（拿 result/isError 显示状态与结果）；
+ * 关联不上就用块自身字段构造（`result=null` = 尚无结果，⛔ 不伪造成功）。
+ */
+function buildContentBlockSegments(
+  blocks: ContentBlockDto[],
+  opts: {
+    toolCalls: ToolCallDto[]
+    matchedRule: string | null
+    sessionId: string
+    groupTitle?: string
+    prose?: boolean
+    live?: boolean
+    onRunHtml?: (code: string) => void
+    onOpenSession?: (sessionId: string) => void
+    citeMsgId?: string
+  },
+): ContentBlockSegment[] {
+  const byId = new Map<string, ToolCallDto>()
+  for (const t of opts.toolCalls) if (t.id) byId.set(t.id, t)
+  const out: ContentBlockSegment[] = []
+  let textRun: string[] = []
+  let toolRun: ToolCallDto[] = []
+  /** 同轮 `tool_use_summary` 标题只交给**第一个**并行组（与旧路径 titleAssigned 同语义） */
+  let titleUsed = false
+  let seq = 0
+  const flushText = () => {
+    if (textRun.length === 0) return
+    const merged = textRun.join('\n\n')
+    textRun = []
+    if (merged.trim() === '') return
+    out.push({
+      key: `blk-text-${seq++}`,
+      kind: 'text',
+      text: merged,
+      node: (
+        <ContentGuard
+          text={merged}
+          className={`content md${opts.prose ? ' markdown-prose' : ''}`}
+          onRunHtml={opts.onRunHtml}
+          citeMsgId={opts.citeMsgId}
+        />
+      ),
+    })
+  }
+  const flushTools = () => {
+    if (toolRun.length === 0) return
+    const run = toolRun
+    toolRun = []
+    const useTitle = !titleUsed && run.filter((t) => !isSendUserMessage(t)).length > 1
+    if (useTitle) titleUsed = true
+    out.push({
+      key: `blk-tools-${run[0]!.id ?? seq++}`,
+      kind: 'tools',
+      node: (
+        <>
+          {renderToolCalls(run, {
+            matchedRule: opts.matchedRule,
+            sessionId: opts.sessionId,
+            groupTitle: useTitle ? opts.groupTitle : undefined,
+            prose: opts.prose,
+            live: opts.live,
+            onOpenSession: opts.onOpenSession,
+          })}
+        </>
+      ),
+    })
+  }
+  for (const b of blocks) {
+    if (b.type === 'text') {
+      flushTools()
+      textRun.push(b.text ?? '')
+    } else if (b.type === 'tool_use') {
+      flushText()
+      const id = b.id ?? null
+      const hit = id ? byId.get(id) : undefined
+      toolRun.push(hit ?? {
+        id: id ?? `blk-tool-${seq++}`,
+        name: b.name ?? null,
+        arguments: b.input == null ? null : (typeof b.input === 'string' ? b.input : JSON.stringify(b.input)),
+        result: null,
+        isError: null,
+      })
+    } else if (b.type === 'thinking') {
+      flushText()
+      flushTools()
+      const text = cleanReasoning(b.thinking)
+      if (text === '') continue
+      out.push({ key: `blk-think-${seq++}`, kind: 'thinking', node: <BlockThinking text={text} /> })
+    }
+  }
+  flushText()
+  flushTools()
+  return out
+}
+
 /** [本轮消耗] TurnFooter 一行展示的数据（见 formatTurnUsageLabel）。 */
 interface TurnUsageSummary {
   /** 本轮金额（元）· 会话累计花费差分；无可靠差分 → null（回落 tokens） */
@@ -1335,15 +1598,23 @@ function TurnFooter({ artifactCount, changeCount, onOpen, usageLabel }: {
 /** 编辑态附件 chip：投递通道给的字段 + 上传回填的 contentId（`AcceptedAttachment` 本身不含它）。 */
 type EditAttachmentChip = AcceptedAttachment & { contentId?: string }
 
-export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, onEditResend, onForkTurn, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, systemRows, prose = false }: {
+export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, onEditResend, onForkTurn, onEditingChange, footer, highlighted, processExpanded, collapsedTailKeep, hiddenSegCount, turnHasIntermediate, isFinalOfTurn, isRunningTurn, liveTurnMs, showProcessHeader, turnDurationMs, turnKey, onToggleProcess, showHeader, groupTitle, summaryToolName, prose = false, onOpenPeerSession, systemInjected }: {
   msg: ChatMessageDto
   onDelete: (id: string) => void
+  /** [peer-message] 来源会话标题显式点击 → 打开该会话（仅点击；⛔ 渲染/事件不跳转） */
+  onOpenPeerSession?: (sessionId: string) => void
   onRunHtml?: (code: string) => void
   onOpenRefFile?: (path: string) => void
   /** 知识库文档 chip 点击：传了就在页面内右侧抽屉打开（见 {@link MessageListProps.onOpenKbDoc}） */
   onOpenKbDoc?: (knowledgeId: string, title?: string | null) => void
   /** [用户消息编辑重发] 见 MessageListProps */
   onEditResend?: (messageId: string, newText: string, onTrimmed?: () => void, attachments?: AttachmentRequest[]) => Promise<void>
+  /**
+   * [编辑保护] 编辑态开关上报（id = 正在编辑的消息；null = 退出）。
+   * <p><b>WHY 必须上报给列表层</b>：编辑态是本行局部 state，而渲染层的「按轮折叠」会把整轮
+   * （连同本行）卸载 —— 一轮被折掉 = 编辑框与草稿一起丢。列表层据此保证「编辑中的轮不折叠」。
+   */
+  onEditingChange?: (messageId: string | null) => void
   /** [分叉] 从该行所在轮分叉；缺省（子代理 transcript 等非会话宿主）⇒ 不渲染操作条 */
   onForkTurn?: (sessionId: string, throughMessageId: string) => Promise<void>
   footer?: ReactNode
@@ -1383,12 +1654,12 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
   groupTitle?: string
   /** [摘要行图标] 同轮首个工具名（tool_use_summary 行按它选类型图标；缺省留 ⚒） */
   summaryToolName?: string
-  /** [2026-11-02 系统注入行] 该轮的 meta 注入行（技能清单 / 外部改文件 / hook 回执…）。
-   *  只由**状态行所在的那一条** assistant 接收（一轮一处，见 processHeaderIdByTurn）⇒ 折叠区里渲染一次。
-   *  缺省 undefined = 该轮没有注入行（零渲染开销）。 */
-  systemRows?: ChatMessageDto[]
   /** [正文排版] 见 {@link MessageListProps.prose} */
   prose?: boolean
+  /** [2026-11-20 用户裁定] 本轮的「系统注入行」（技能清单 / 日期告知 / deferred_tools_delta…）。
+   *  渲染在该轮「已完成 / 正在执行」**状态行下方**（不再按自身 seq 跑到轮头），
+   *  且跟随轮展开态 —— 收起时与折叠区一起隐藏。由父级把该轮注入行挂到状态行落点行。 */
+  systemInjected?: ChatMessageDto[]
 }) {
   const isUser = msg.role === 'user'
   // [轮次消息头合并] 同轮后续段不渲染头像/作者/时间/徽标；仍留同宽头像占位，保证正文/工具行与首段左对齐。
@@ -1421,8 +1692,18 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
   // [agent-notice] SendMessage 协作通知行（后端在子代理实际消费时落的一条 isMeta user 消息）。
   //   与上一条同视觉、不同语义：来源是 agent 名 / 「主代理」，摘要优先用 SendMessage.summary。
   const isAgentNotice = isAgentNotificationRow(msg)
+  // [peer-message] 跨会话通知 = agent_message + `structuredOutput.peer_source`。
+  //   ⛔ 不能沿用下面的空 author/team-lead →「主代理」回落：peer 行的 author 是来源 session id，
+  //   回落会把**别的会话**冒充成本会话主代理。来源标题是他人数据，只按纯文本渲染。
+  const peerSource = isAgentNotice ? readPeerSource(msg) : null
+  const isPeerNotice = peerSource != null
+  // [peer-failure] 投递失败通知 = agent_message + `structuredOutput.peer_failure`。
+  //   语义与来信相反（我方发出未送达的回执），⛔ 不走来信卡片（没有 peer_source），
+  //   也⛔ 不走下面「收到 X 通知」的普通代理通知文案 —— 独立通知条 + reason 中文映射。
+  const peerFailure = isAgentNotice && peerSource == null ? readPeerFailure(msg) : null
+  const isPeerFailure = peerFailure != null
   const agentNoticeLabel = (() => {
-    if (!isAgentNotice) return ''
+    if (!isAgentNotice || isPeerNotice || isPeerFailure) return ''
     const from = (msg.author ?? '').trim()
     const who = from === '' || from === 'team-lead' ? '主代理' : from
     const head = `收到${who}通知`
@@ -1555,9 +1836,11 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     setEditRemoved(new Set())
     editAddedKeysRef.current.clear()
     setEditing(true)
+    onEditingChange?.(msg.id)
   }
   const cancelEdit = () => {
     setEditing(false)
+    onEditingChange?.(null)
     setEditError(null)
     setEditSlow(false)
   }
@@ -1701,8 +1984,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
         setEditSlow(false)
         setEditSending(false)
         setEditing(false)
+        onEditingChange?.(null)
       }, attachments.length > 0 ? attachments : undefined)
       setEditing(false)
+      onEditingChange?.(null)
     } catch {
       // 失败保持编辑态（草稿不丢），由调用方另行 toast 具体原因
       setEditError('发送失败，请重试')
@@ -1732,11 +2017,41 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
   const intermediateReasoning = cleanReasoning(msg.reasoning)
   const briefToolCalls = (msg.toolCalls ?? []).filter(isSendUserMessage)
   const intermediateToolCalls = (msg.toolCalls ?? []).filter((t) => !isSendUserMessage(t))
-  // [2026-11-02 系统注入行] 该轮只有「纯正文 assistant + 注入行」时也要有折叠入口，
-  //   否则注入行永远看不到（它只在该轮的展开态折叠区里渲染）。
-  const hasSystemRows = (systemRows?.length ?? 0) > 0
+  /**
+   * [content-blocks] 后端有序内容块（新契约）。**非空 ⇒ 按数组顺序渲染**，下面所有
+   * 「思考→旁白→工具→正文」的固定模板都不参与；老消息缺省/null ⇒ 原 JSX 分支逐字不变
+   * （⛔ 不为历史数据伪造块顺序）。
+   */
+  const contentBlocks = msg.blocks && msg.blocks.length > 0 ? msg.blocks : null
+  const blockSegments = contentBlocks
+    ? buildContentBlockSegments(contentBlocks, {
+        toolCalls: msg.toolCalls ?? [],
+        matchedRule: msg.matchedRule,
+        sessionId: msg.sessionId,
+        groupTitle,
+        prose,
+        onRunHtml,
+        onOpenSession: onOpenPeerSession,
+        citeMsgId: msg.id,
+      })
+    : null
+  /**
+   * 最终答复 = **末尾那段 text**（仅按最终段渲染时）。它在块序里本来就是最后一个，
+   * 因此移到正文区（折叠区之后）不改变顺序；其余块一律留在折叠区。
+   * 末尾不是 text（纯工具轮等）⇒ null，正文区无内容（与旧行为一致）。
+   */
+  const trailingBlockText = blockSegments && isFinalOfTurn !== false
+    && blockSegments.length > 0 && blockSegments[blockSegments.length - 1]!.kind === 'text'
+    ? blockSegments[blockSegments.length - 1]!.text ?? ''
+    : null
+  /** 折叠区里的块段（去掉上面那段最终答复文本）。 */
+  const foldBlockSegments = blockSegments
+    ? (trailingBlockText !== null ? blockSegments.slice(0, -1) : blockSegments)
+    : null
   const hasIntermediate = !isUser && !isFallback && !isScheduledFire && !msg.isApiErrorMessage
-    && (intermediateReasoning !== '' || intermediateToolCalls.length > 0 || hasSystemRows)
+    && (intermediateReasoning !== '' || intermediateToolCalls.length > 0
+      // [content-blocks] 折叠区里还有思考/工具段 ⇒ 同样要有「已完成/正在执行」开关
+      || (foldBlockSegments ?? []).some((s) => s.kind !== 'text'))
   const turnDuration = formatTurnDuration(turnDurationMs)
   // [2026-11-01 方案 3] 进行中的实时时长：由父级每秒推进 `liveTurnMs`（见 MessageListInner 的 tick），
   //   这里只做格式化。缺省回落 turnDurationMs（旧数据 / 非轮次宿主）。
@@ -1755,6 +2070,12 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
   const toggleProcess = () => onToggleProcess?.(turnKey ?? '', processExpanded === true)
   /** [2026-11-02] 通知行展开态（「收到子代理通知」点开看原始 XML）。 */
   const [noticeOpen, setNoticeOpen] = useState(false)
+  /** [peer-message] 内联来信卡片：正文长文「展开全文/收起」（默认收起尾部、正文默认可见）。 */
+  const [peerBodyOpen, setPeerBodyOpen] = useState(false)
+  /** [peer-message] 内联来信卡片：底部「来源信息」（转发链 / 回信地址）折叠态。 */
+  const [peerSrcOpen, setPeerSrcOpen] = useState(false)
+  /** [peer-failure] 投递失败通知：展开看原始原因 + messageId。 */
+  const [failureOpen, setFailureOpen] = useState(false)
   // 图片附件放大预览（user-attach-img 点击 → lightbox）
   const [zoomImg, setZoomImg] = useState<string | null>(null)
   /**
@@ -1808,6 +2129,151 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
           {summaryToolName ? <ToolTypeIcon name={summaryToolName} /> : '⚒'}
         </span>
         <span className="tus-text" title={msg.content ?? ''}>{msg.content}</span>
+      </div>
+    )
+  }
+  // [peer-failure] 跨会话投递失败 → 专门的通知条（**不是用户气泡、不是来信卡片、不是普通代理通知**）。
+  //   数据：后端在发送方会话落库的 meta 行（structured_output.peer_failure）+ 同形实时事件。
+  //   约束：纯文本渲染；标题不可点击（失败通知不需要跳转）；不提供「重发」；不生成用户轮、不切会话、不拉历史。
+  if (isAgentNotice && peerFailure) {
+    const rawReason = (peerFailure.reason ?? '').trim()
+    return (
+      <div className="msg task-notice peer-failure-notice" data-msg-id={msg.id}>
+        <button
+          type="button"
+          className="tn-head"
+          onClick={() => setFailureOpen((v) => !v)}
+          aria-expanded={failureOpen}
+          title={failureOpen ? '收起投递详情' : '展开投递详情'}
+        >
+          <span className="tn-icon" aria-hidden="true">
+            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5} strokeLinecap="round" strokeLinejoin="round">
+              <path d="M8 2.6 14.2 13.4H1.8L8 2.6Z" />
+              <path d="M8 6.4v3.1" />
+              <path d="M8 11.7h.01" />
+            </svg>
+          </span>
+          <span className="tn-text">{peerFailureSentence(peerFailure)}</span>
+          <svg className={`tn-caret${failureOpen ? ' open' : ''}`} viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.5}>
+            <path d="M5 6.5L8 9.5L11 6.5" />
+          </svg>
+        </button>
+        {failureOpen && (
+          <div className="tn-body pfn-body">
+            <div>原始原因：{rawReason === '' ? '未知' : rawReason}</div>
+            <div>消息 ID：{peerFailure.messageId ?? '未知'}</div>
+          </div>
+        )}
+      </div>
+    )
+  }
+  // [peer-message] 跨会话来信 → **对话流内联来信卡片**（对齐 CC：来信直接出现在对话流里、正文可见）。
+  //   ⛔ 普通来信不是用户气泡、不开新轮（isUserTurnRow 已排除）、不自动切到来源会话、不自动授权、不拉历史。
+  //   ✅ 例外（用户 2026-11-22 裁定）：SessionCreate **派单行**（isPeerLaunchRow）既是轮起点，
+  //      卡片也放进用户气泡位置（外包 .msg.user，只借用右对齐容器；无编辑/重发/附件等用户动作）。
+  //   发送方/正文/属性全部按纯文本渲染（React 转义 ⇒ 不执行 HTML）；同名标题必须用来源会话 id 区分。
+  //   卡片结构：头部（发送方名 + 来源 id + 来源模式 + 时间）→ 正文（默认可见，>12 行可展开）→
+  //   底部（复制正文 + 折叠的转发链/回信地址）。
+  //   旧的「通知条」视觉（task-notice/agent-notice）仍用于同会话子代理通知与空闲通知等非来信场景。
+  if (isAgentNotice && peerSource) {
+    const hopChain = peerSource.hopChain ?? []
+    const content = msg.content ?? ''
+    const bodyLong = peerBodyIsLong(content)
+    // 来源会话标题：头部固定显示「收到消息 · 来自会话 《标题》」（用户 2026-11-21 终稿）。
+    //   ⚠️ 标题是他人数据，只按文本节点渲染；缺失显示「未命名会话」并保留 id（⛔ 不用 id 冒充标题）。
+    //   不再把 fromName 当标题展示：两处 peer_source 投影都没写该字段，@ 后面恒等于会话标题。
+    const sourceTitle = (peerSource.sourceTitle ?? '').trim()
+    const srcId = (peerSource.sourceSessionId ?? '').trim()
+    // 模式只显示**声明值**：未声明就写「未声明」——⛔ 不回落成 default 冒充对方声明。
+    const modeText = peerModeText(peerSource.fromMode)
+    const modeDeclared = (peerSource.fromMode ?? '').trim() !== ''
+    // 准入徽标（自动通过 / 手动批准；缺失 = 中性「准入未知」，不瞎猜）。
+    const admission = peerAdmissionBadge(peerSource.admission, peerSource.admissionReason)
+    const timeText = formatMsgTimeAbsolute(msg)
+    const hasSourceDetail = hopChain.length > 0 || !!peerSource.from || !!srcId
+      || !!peerSource.sourceKind || !!peerSource.messageId
+    const card = (
+        <div className="pm-card">
+          <div className="pm-head">
+            {/* 方向 + 来源固定文案：收到消息 · 来自会话《标题》。
+                标题有来源 id 时**显式点击**才跳转（键盘可达）；
+                ⛔ 渲染、自动展开、事件到达一律不跳；App 侧还会校验会话是否已删除。 */}
+            <span className="pm-dir">收到消息</span>
+            <span className="pm-from-label">来自会话</span>
+            {onOpenPeerSession && srcId ? (
+              <button
+                type="button"
+                className="pm-title pm-jump"
+                title={`打开来源会话 ${srcId}`}
+                onClick={() => onOpenPeerSession(srcId)}
+              >
+                《{sourceTitle || '未命名会话'}》
+              </button>
+            ) : (
+              <span className={`pm-title${sourceTitle ? '' : ' is-missing'}`}>
+                《{sourceTitle || '未命名会话'}》
+              </span>
+            )}
+            {srcId ? <span className="pm-src" title={`来源会话 ${srcId}`}>{srcId}</span> : null}
+            <span
+              className={`pm-mode${modeDeclared ? '' : ' undeclared'}`}
+              title="来源会话的权限模式（只显示发送方声明值，不继承为本会话模式）"
+            >
+              {modeText}
+            </span>
+            <span className={`pm-admission ${admission.kind}`} title="入站准入方式（服务端判定）">
+              {admission.label}
+            </span>
+            {timeText ? <span className="pm-time">{timeText}</span> : null}
+          </div>
+          <div className={`pm-body${bodyLong && !peerBodyOpen ? ' clamped' : ''}`}>{content}</div>
+          {bodyLong ? (
+            <button
+              type="button"
+              className="pm-more"
+              onClick={() => setPeerBodyOpen((v) => !v)}
+              aria-expanded={peerBodyOpen}
+            >
+              {peerBodyOpen ? '收起' : '展开全文'}
+            </button>
+          ) : null}
+          <div className="pm-foot">
+            <button type="button" className="pm-copy" onClick={copyContent}>{copied ? '已复制' : '复制正文'}</button>
+            {hasSourceDetail ? (
+              <button
+                type="button"
+                className="pm-src-toggle"
+                onClick={() => setPeerSrcOpen((v) => !v)}
+                aria-expanded={peerSrcOpen}
+              >
+                {peerSrcOpen ? '收起来源信息' : '来源信息'}
+              </button>
+            ) : null}
+          </div>
+          {peerSrcOpen && hasSourceDetail ? (
+            <div className="pm-meta">
+              {srcId ? <div>来源会话：{srcId}</div> : null}
+              {peerSource.from ? <div>回信地址：{peerSource.from}</div> : null}
+              {hopChain.length > 0 ? <div>转发链：{hopChain.join(' → ')}</div> : null}
+              {peerSource.sourceKind ? <div>来源类型：{peerSource.sourceKind}</div> : null}
+              {peerSource.messageId ? <div>来源消息：{peerSource.messageId}</div> : null}
+            </div>
+          ) : null}
+        </div>
+    )
+    // [peer-launch] 派单 = 来信卡片放在用户气泡位置（用户 2026-11-22 裁定 · 视觉 A）：
+    //   气泡只作右对齐容器（透明 / 无边框 / 无阴影，样式见 .peer-launch-bubble），
+    //   卡片自身保留底色与来源头。⛔ 不进普通 user 分支：没有编辑 / 重发 / 附件等用户动作。
+    if (isPeerLaunchRow(msg)) {
+      return (
+        <div className="msg user peer-launch" data-msg-id={msg.id}>
+          <div className="user-bubble peer-launch-bubble">{card}</div>
+        </div>
+      )
+    }
+    return (
+      <div className="msg peer-message" data-msg-id={msg.id}>
+        {card}
       </div>
     )
   }
@@ -1913,26 +2379,31 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
    */
   const foldSegments: { key: string; node: ReactNode }[] = []
   if (!isUser && !isFallback && !isScheduledFire && !msg.isApiErrorMessage) {
-    if (intermediateReasoning !== '') foldSegments.push({ key: 'reasoning', node: reasoningBlock })
-    // [中间旁白正文] 非最终段的 content 是过程性碎句（「设计确认…」「现在实现后端…」）
-    // → 与思考/工具卡同处折叠区；展开时按原顺序显示在思考之后、工具之前。
-    // ⛔ 判据用 isFinalOfTurn（undefined = 非轮次宿主 → 一律算最终，保持旧行为）。
-    const narration = isFinalOfTurn === false ? (msg.content ?? '').trim() : ''
-    if (narration !== '') {
-      foldSegments.push({
-        key: 'narration',
-        node: <ContentGuard text={msg.content ?? ''} className={`content md turn-process-text${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />,
-      })
+    if (blockSegments) {
+      // [content-blocks] 数组顺序即渲染顺序：思考/文本/工具按真实发生次序排，
+      // ⛔ 不搬文本、不重排旁白（交替的「工具→文本→工具」在这里保持原样）。
+      // 末尾那段 text 已上提到正文区（trailingBlockText）⇒ 顺序仍等价于数组顺序。
+      for (const seg of foldBlockSegments!) foldSegments.push({ key: seg.key, node: seg.node })
+    } else {
+      if (intermediateReasoning !== '') foldSegments.push({ key: 'reasoning', node: reasoningBlock })
+      // [中间旁白正文] 非最终段的 content 是过程性碎句（「设计确认…」「现在实现后端…」）
+      // → 与思考/工具卡同处折叠区；展开时按原顺序显示在思考之后、工具之前。
+      // ⛔ 判据用 isFinalOfTurn（undefined = 非轮次宿主 → 一律算最终，保持旧行为）。
+      const narration = isFinalOfTurn === false ? (msg.content ?? '').trim() : ''
+      if (narration !== '') {
+        foldSegments.push({
+          key: 'narration',
+          node: <ContentGuard text={msg.content ?? ''} className={`content md turn-process-text${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />,
+        })
+      }
+      // [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard
+      if (intermediateToolCalls.length > 0) {
+        foldSegments.push({
+          key: 'tools',
+          node: renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose }),
+        })
+      }
     }
-    // [并行工具组] 多工具 → 一个父行 + 缩进子项；单个保持单行 ToolCard
-    if (intermediateToolCalls.length > 0) {
-      foldSegments.push({
-        key: 'tools',
-        node: renderToolCalls(intermediateToolCalls, { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose }),
-      })
-    }
-    // [2026-11-02 系统注入行] 放折叠区末尾：它们不是「助手说了什么」，而是系统在本轮塞给模型的提示。
-    for (const m of systemRows ?? []) foldSegments.push({ key: `sys-${m.id}`, node: <SystemInjectedRow msg={m} /> })
   }
   /** 收起态要保留的尾部段数（展开态 = 0，不参与切片）。 */
   const collapsedKeep = processExpanded === true ? 0 : (collapsedTailKeep ?? 0)
@@ -2296,6 +2767,14 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                     assistant 都成立，用它画就会每段各出一条（用户实测「扫光条有好几个」）。
                     一轮只能有一条 —— 它属于「本轮状态」，不属于任何单个 assistant 段。 */}
                 {showProcessHeader && isRunningTurn && <div className="exec-scan-line" aria-hidden="true" />}
+                {/* [2026-11-20 用户裁定] 系统注入行（技能清单 / 日期 / 工具清单变化）→ 放在
+                    「已完成 / 正在执行」**下方**、折叠内容之上；跟随轮展开态（收起时与折叠区一起隐藏）。
+                    父级已把这些行从按 seq 的位置摘掉，只挂在本轮的承载行（状态行落点）。 */}
+                {showProcessHeader && processExpanded === true && (systemInjected?.length ?? 0) > 0 && (
+                  <>
+                    {systemInjected!.map((im) => <SystemInjectedRow key={im.id} msg={im} />)}
+                  </>
+                )}
                 {foldSegments.length > 0 && (processExpanded === true || collapsedKeep > 0) && (
                   <div className="turn-process-body">
                     {(processExpanded === true
@@ -2305,18 +2784,31 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                   </div>
                 )}
               </>
-            ) : reasoningBlock}
+            ) : (blockSegments ? null : reasoningBlock)}
             {msg.isApiErrorMessage ? (
               <div className="content error">
                 <p>{msg.apiError ?? msg.error ?? 'API 错误'}</p>
                 {msg.errorDetails && <p className="error-details">{msg.errorDetails}</p>}
               </div>
+            ) : blockSegments ? (
+              /* [content-blocks] 无轮折叠宿主（子代理 transcript 等）：没有折叠区可放，
+                 整串块按数组顺序铺在正文位（思考块仍可各自折叠）。 */
+              !collapsible && (
+                <>
+                  {blockSegments.map((seg) => <Fragment key={seg.key}>{seg.node}</Fragment>)}
+                </>
+              )
             ) : (
               /* [中间旁白正文] 非最终段的正文已在折叠区渲染过 → 正文区不再重复。
                  非轮次宿主（isFinalOfTurn === undefined）与最终段照常渲染。 */
               isFinalOfTurn !== false && (
                 <ContentGuard text={msg.content ?? ''} className={`content md${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />
               )
+            )}
+            {/* [content-blocks] 有块时的正文 = 末尾那段 text（已在数组末尾，顺序不变）。
+                空文本不渲染空 Markdown 容器。 */}
+            {blockSegments && collapsible && trailingBlockText !== null && trailingBlockText.trim() !== '' && (
+              <ContentGuard text={trailingBlockText} className={`content md${prose ? ' markdown-prose' : ''}`} onRunHtml={onRunHtml} citeMsgId={msg.id} />
             )}
             {/* [分叉/复制] 只有该轮最终段、非运行中：操作条紧贴**正文下方**（工具卡/产物之前）。
                 `isFinalOfTurn === undefined`（子代理 transcript）不渲染，保持旧行为。
@@ -2333,10 +2825,11 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                 现改为每轮只在 TurnFooter 汇总一行（见 TurnFooter / usageLabelByTurn）。 */}
             {/* SendUserMessage（CC BriefTool）是模型交付正文（无工具边框）→ 始终显示在正文区；
                 普通工具卡（技能加载 / 运行校验等）已收进轮次「已完成」折叠区。
-                非轮次折叠宿主（子代理 transcript）保持旧的按序渲染。 */}
-            {collapsible
+                非轮次折叠宿主（子代理 transcript）保持旧的按序渲染。
+                [content-blocks] 有块时工具已在块序里渲染过 ⇒ 这里不再重复。 */}
+            {blockSegments ? null : collapsible
               ? briefToolCalls.map((t, i) => <SendUserMessageBody key={t.id ?? i} tool={t} />)
-              : renderToolCalls(msg.toolCalls ?? [], { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose })}
+              : renderToolCalls(msg.toolCalls ?? [], { matchedRule: msg.matchedRule, sessionId: msg.sessionId, groupTitle, prose, onOpenSession: onOpenPeerSession })}
             {/* [任务结束入口] 仅最后一条 assistant 消息、且本轮不在运行/流式中时传入（见 MessageListInner） */}
             {footer}
           </div>
@@ -2369,9 +2862,11 @@ const MemoMessage = memo(Message)
 //   订阅自己的块对象 —— append 只换该块对象引用 → 仅本行重渲，历史行/其余流式块行/父级全部被 bail。
 //   渲染行为与旧内联块一致：reasoning 默认展开可收起（本地态，随行卸载丢弃）、MarkdownText streaming、
 //   toolCalls 卡片。class 未动。
-const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null, turnKey, processExpanded, onToggleProcess, collapsedTailKeep = 0, hiddenSegCount = 0, prose = false }: {
+const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStreamingTail, turnRunning, onRunHtml, showHeader = true, showProcessHeader = false, liveTurnMs = null, turnKey, processExpanded, onToggleProcess, collapsedTailKeep = 0, hiddenSegCount = 0, prose = false, onOpenSession }: {
   sessionId: string
   blockId: string
+  /** [session-create] 流式期间 SessionCreate 卡的新会话跳转（透传；缺省不渲染入口） */
+  onOpenSession?: (sessionId: string) => void
   isStreamingTail: boolean
   /**
    * **该轮是否仍在跑**（父级传服务端运行态 `thinking`）。
@@ -2519,7 +3014,7 @@ const StreamBlockRow = memo(function StreamBlockRow({ sessionId, blockId, isStre
   // [并行工具组] 流式块同样成组（live=true ⇒ 未返回结果的子项显示「执行中」）
   // [流式性能 2026-11-18] 抽成 memo 组件：纯文本帧 `toolCalls` 引用不变 ⇒ 不重建任何工具卡。
   if (b.toolCalls.length > 0) {
-    segNodes.push({ key: 'tools', node: <StreamToolList toolCalls={b.toolCalls} sessionId={sessionId} prose={prose} /> })
+    segNodes.push({ key: 'tools', node: <StreamToolList toolCalls={b.toolCalls} sessionId={sessionId} prose={prose} onOpenSession={onOpenSession} /> })
   }
   // [段到达顺序 2026-11-13] 上面按「思考→正文→工具」建段；但模型可能先跑工具再思考/出正文
   //   （RAG 的 query_understand 排在首个 chunk 之前），固定顺序会把晚到的思考/正文倒挂到工具上方。
@@ -2628,7 +3123,7 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, turnRunning: turnRunningProp, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false, pendingPlanApproval, onPlanDecision, onPlanClearContext }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, turnRunning: turnRunningProp, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false, pendingPlanApproval, onPlanDecision, onPlanClearContext, peerHeldItems, peerHeldActing, peerHeldRowErrors, onPeerAccept, onPeerReject, onOpenPeerSession, focusPeer }: MessageListProps) {
   // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
   citationChipEnabled = !!onCitationClick
   citationTitlesByMessage = citationTitleMapByMsg ?? {}
@@ -2649,6 +3144,23 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   // F10 · 消息 row key 并入 conversationId（partial 压缩/裁剪后旋转）→ 触发整列表 remount
   //   useCallback 稳定引用（flatRows useMemo 依赖它 —— 每 render 新函数会让 flatRows 每 chunk 全量重建）
   const rowKey = useCallback((id: string) => (conversationId ? `${conversationId}:${id}` : id), [conversationId])
+  /**
+   * [编辑保护] 正在编辑的消息 id —— 折叠计算据此保证「编辑中的轮永不折叠」。
+   *
+   * <p><b>WHY</b>：编辑态（editing / 草稿）是 {@link Message} 的行内局部 state，而渲染层的
+   * 「按轮折叠 / 执行中只留最后 1 轮」是**整轮过滤**（`visibleRows` 过滤掉 foldedSet）——
+   * 一旦正在编辑的那一轮被折掉，该行直接卸载 ⇒ 编辑框与用户已经打的内容一起消失（实测必现）。
+   * 触发点不止一种：运行态抖动（turnEnded false ⇒ 窗口 1 轮）、会话里插入新的轮起点
+   * （IM 入站 / 派单行 / 队列消息）后「最新轮」换人、块轮兜底折叠。
+   *
+   * <p><b>取舍</b>：编辑是用户的显式操作，优先级高于「执行中只显示当前轮」这条显示约定 ——
+   * 用户在编辑，就不能把他正在编辑的那轮藏起来。退出编辑后折叠语义立即恢复。
+   */
+  const [editingMsgId, setEditingMsgId] = useState<string | null>(null)
+  const handleEditingChange = useCallback((messageId: string | null) => setEditingMsgId(messageId), [])
+  // 切会话 → 丢弃上一个会话的编辑标记（否则残留 id 会在无关会话里给折叠窗口「开天窗」）。
+  // 行内编辑态本身随会话切换一并卸载，这里只是清列表层的保护键。
+  useEffect(() => { setEditingMsgId(null) }, [sessionId])
   // [流式性能] 稳定行序订阅：引用只在块增/删/finalize/clear 变化；content 追加不触碰 → 父级不被打字机逐帧重渲
   const streamIds = useChatStore(selectStreamIds(sessionId))
   // [2026-11-12 尾部 3 段] 流式块的「段数」只在内容**首现**时变化（思考首片 / 正文首片 / 首个工具）。
@@ -3359,6 +3871,61 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       clearTimers()
     }
   }, [jumpToMessage, sessionId, onLoadOlder])
+
+  // [peer-jump] 待处理点击 → 滚到首条 pending 卡并高亮 1.5s。
+  //   items 是异步 load 的 ⇒ 用 rAF bounded 重试（最多约 3s/180 帧）；nonce 只在真正命中后记为已消费，
+  //   这样 items 后到时同一请求仍能继续（不会因 effect 重跑而丢失）。
+  const [focusedPeerId, setFocusedPeerId] = useState<string | null>(null)
+  const focusedPeerNonceRef = useRef(0)
+  useEffect(() => {
+    if (!focusPeer || focusPeer.sessionId !== sessionId) return
+    if (focusPeer.nonce === focusedPeerNonceRef.current) return
+    let cancelled = false
+    let raf = 0
+    let tries = 0
+    let clearTimer = 0
+    const pickTarget = (): PeerHeldItemDto | null => {
+      const pending = (peerHeldItems ?? []).filter((item) => {
+        const status = (item.status ?? '').trim().toLowerCase()
+        return status === '' || status === 'pending'
+      })
+      if (pending.length === 0) return null
+      if (focusPeer.messageId) {
+        const exact = pending.find((item) => item.messageId === focusPeer.messageId)
+        if (exact) return exact
+      }
+      return pending[0] ?? null
+    }
+    const tick = () => {
+      if (cancelled) return
+      const target = pickTarget()
+      const box = scrollElRef.current
+      const el = target && box
+        ? Array.from(box.querySelectorAll<HTMLElement>('[data-peer-message-id]'))
+            .find((node) => node.getAttribute('data-peer-message-id') === target.messageId) ?? null
+        : null
+      if (target && el) {
+        focusedPeerNonceRef.current = focusPeer.nonce
+        nearBottomRef.current = true
+        onNearBottomChangeRef.current?.(true)
+        if (typeof el.scrollIntoView === 'function') el.scrollIntoView({ block: 'center' })
+        else if (box) box.scrollTop = Math.max(0, el.offsetTop - Math.max(0, (box.clientHeight - el.offsetHeight) / 2))
+        setFocusedPeerId(target.messageId)
+        clearTimer = window.setTimeout(() => {
+          if (!cancelled) setFocusedPeerId((cur) => (cur === target.messageId ? null : cur))
+        }, 1500)
+        return
+      }
+      // 约 3s（180 帧）：等待收件列表接口返回后卡片才进 DOM；仍不命中则放弃高亮。
+      if (++tries < 180) raf = window.requestAnimationFrame(tick)
+    }
+    raf = window.requestAnimationFrame(tick)
+    return () => {
+      cancelled = true
+      if (raf) cancelAnimationFrame(raf)
+      if (clearTimer) window.clearTimeout(clearTimer)
+    }
+  }, [focusPeer, peerHeldItems, sessionId])
   /** [轮次消息头合并] 每轮**第一条 assistant 行**（落库消息或流式块）→ 唯一渲染消息头。
    *  按 flatRows 最终行序（anchorSeq）判定，与用户看到的「第一条」同源；同轮其余工具/正文段不再重复
    *  头像 / 名字 / 时间 / 徽标。不同轮次各有一条 ⇒ 轮次之间仍各有消息头。 */
@@ -3505,6 +4072,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   //   revealedFoldKeys = 点过「展开」的轮 + 「加载更多」新拉到的轮（直接展开，不折回去）。
   const foldedTurnKeys = useMemo(() => {
     const keys = orderedTurnKeys(messages)
+    /**
+     * [编辑保护] 正在编辑的消息所属轮键（WHY 见 {@link editingMsgId}）。
+     * 两条折叠路径都必须跳过它：①窗口起点不越过；②「窗口外块轮」兜底折叠也不折它。
+     * 消息已不在窗口 / 已提交（找不到）→ null，行为与改动前一致。
+     */
+    const editingTurnKey = editingMsgId ? (turnKeyByRowId(messages).get(editingMsgId) ?? null) : null
     // [2026-11-02 用户最终裁定] **执行中只显示当前轮，历史全部隐藏；完成后自动恢复。**
     //   原话：「用户发送消息后 应该只显示该用户消息和当前轮次 其他的轮次隐藏了 直到完成后重新可以看到」。
     //
@@ -3532,6 +4105,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       //   早先版本按「最后一个用户提问」锚定，但新提问行的乐观插入与流式块状态更新是
       //   两条独立异步路径，某一帧可能还没收到新 user 行 ⇒ 锚点指向旧轮 ⇒ 多露一轮。
       windowStart = Math.max(windowStart, keys.length - RUNNING_FOLD_TURNS)
+    }
+    // [编辑保护] 窗口起点不得越过「正在编辑的那一轮」：编辑态是行内 state，
+    //   轮被折 = 行卸载 = 编辑框与草稿丢失。与上面的窗口收窄取更早的那个起点。
+    if (editingTurnKey) {
+      const editingIdx = keys.indexOf(editingTurnKey)
+      if (editingIdx >= 0) windowStart = Math.min(windowStart, editingIdx)
     }
     const folded: string[] = []
     for (let i = 0; i < windowStart; i++) {
@@ -3587,13 +4166,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           if (!b?.userMessageId) continue
           if (b.userMessageId === latestUserTurnId) continue
           if (b.userMessageId === runningTurnKey) continue
+          // [编辑保护] 编辑中的轮不折（折 = 行卸载 = 编辑框与草稿丢失）
+          if (b.userMessageId === editingTurnKey) continue
           if (inWindow.has(b.userMessageId)) continue
           if (!folded.includes(b.userMessageId)) folded.push(b.userMessageId)
         }
       }
     }
     return folded
-  }, [messages, revealedFoldKeys, activeTurnKeys, turnEnded, streamIds, sessionId])
+  }, [messages, revealedFoldKeys, activeTurnKeys, turnEnded, streamIds, sessionId, editingMsgId])
   const foldedSet = useMemo(() => new Set(foldedTurnKeys), [foldedTurnKeys])
   /** 折叠区内的轮**不渲染 DOM**（既留数据又不占渲染）；点击折叠行后它们才出现。 */
   const visibleRows = useMemo(
@@ -3691,58 +4272,59 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
   }, [])
   useEffect(() => { setProcessOpenByTurn({}) }, [sessionId])
   /**
-   * 每轮**状态行（「正在执行 / 已完成」+ 扫光条）的唯一落点**。
+   * [2026-11-20] 该轮是否含系统注入行（技能清单 / 外部改文件 / hook 回执…）。
    *
-   * <p><b>WHY 需要两个候选（2026-11-02 用户实测「扫描蓝条被顶掉」）</b>：
-   * 原实现只认 {@link firstIntermediateByTurn} —— 那个 map 只在「有思考或非 SendUserMessage 工具」
-   * 时登记。于是一轮若**第一段只有正文**（模型直接开口就写），整轮没有任何一条消息拿到
-   * `showProcessHeader` ⇒ 状态行和扫光条整轮都不渲染，用户看到「正在跑但下面一条动静都没有」。
-   *
-   * <p>但**不能**简单地改成「只看该轮第一条 assistant 行」：那条若恰好是纯正文（无可折叠内容），
-   * `hasIntermediate` 为 false ⇒ 状态行同样消失（实测会让「纯文本开场 + 后续工具」的轮次丢掉
-   * 「已完成」开关）。
-   *
-   * <p>故取**两级优先**：
-   * <ol>
-   *   <li>该轮第一条**有中间过程**的 assistant 行（旧行为，保证「已完成」开关落在有内容的那行）；</li>
-   *   <li>没有中间过程 → 回落该轮**第一条 assistant 行**（保证「正在执行」+ 扫光条在执行中仍可见）。</li>
-   * </ol>
+   * <p>只用于两处：① 折叠入口存在性 —— 否则「只有注入行、没有思考/工具」的轮没有开关，
+   * 而注入行收起态不渲染 ⇒ 永远看不到（死锁）；② 不参与段计数（不算「最新 3 段」）。
    */
-  /**
-   * [2026-11-02 系统注入行] 每轮的系统注入行（技能清单 / 外部改文件 / hook 回执…）· 按轮键归组。
-   *
-   * <p>WHY 按轮聚合：用户裁定「融合在已完成中」⇒ 它们不单独占对话流，只在**该轮的折叠区**里出现
-   * （收起时随轮一起藏起，展开时才看得到，且一轮只渲染一次）。
-   * 取 flatRows（已按 isDialogueRow 过滤）而非 messages，保证与渲染行同源。
-   */
-  const systemRowsByTurn = useMemo(() => {
-    const out = new Map<string, ChatMessageDto[]>()
+  const hasSystemRowsByTurn = useMemo(() => {
+    const set = new Set<string>()
     for (const row of flatRows) {
       if (row.kind !== 'msg' || !isSystemInjectedRow(row.m)) continue
-      const list = out.get(row.turnKey)
-      if (list) list.push(row.m)
-      else out.set(row.turnKey, [row.m])
+      set.add(row.turnKey)
     }
-    return out
+    return set
   }, [flatRows])
-  const processHeaderIdByTurn = useMemo(() => {
-    const firstAssistant = new Map<string, string>()
-    const firstIntermediate = new Map<string, string>()
+  /**
+   * [peer-message 2026-11-22 用户裁定] 该轮是否含跨会话来信卡（`.msg.peer-message`）。
+   *
+   * <p>来信卡收起态不渲染（跟随轮折叠态，见渲染循环），与系统注入行同理：该轮若只有来信卡、
+   * 没有思考/工具，它自己必须算作「有中间过程」，否则整轮没有折叠入口 ⇒ 来信永久不可见（死锁）。
+   */
+  const hasPeerMessageRowsByTurn = useMemo(() => {
+    const set = new Set<string>()
     for (const row of flatRows) {
+      // 派单行是轮起点（用户气泡位置），不算「中间过程」—— 它自己不该给该轮制造折叠入口。
+      if (row.kind !== 'msg' || !isPeerAgentNotification(row.m) || isPeerLaunchRow(row.m)) continue
+      set.add(row.turnKey)
+    }
+    return set
+  }, [flatRows])
+  /** [2026-11-20 用户裁定] 系统注入行改挂到该轮「状态行落点行」内部（已完成/正在执行下方）。
+   *  carrier = 每轮第一条 assistant 落库行（与 {@link firstAssistantRowKeys} 同源）；只有它有状态行。
+   *  有 carrier 的轮：注入行不再按自身 seq 渲染（见渲染循环的 return null），改由 carrier 传给
+   *  {@link Message} 的 `systemInjected`。没有 assistant 行的轮保持原位（不能凭空消失）。 */
+  const injectedCarrierByTurn = useMemo(() => {
+    const map = new Map<string, string>()
+    for (const row of visibleRows) {
       if (row.kind !== 'msg' || row.m.role !== 'assistant') continue
-      if (!firstAssistant.has(row.turnKey)) firstAssistant.set(row.turnKey, row.m.id)
-      if (firstIntermediate.has(row.turnKey)) continue
-      const hasInter = cleanReasoning(row.m.reasoning) !== ''
-        || (row.m.toolCalls ?? []).some((t) => !isSendUserMessage(t))
-        || systemRowsByTurn.has(row.turnKey)   // [2026-11-02] 注入行也要有折叠入口
-      if (hasInter) firstIntermediate.set(row.turnKey, row.m.id)
+      if (!firstAssistantRowKeys.has(row.key)) continue
+      map.set(row.turnKey, row.key)
     }
-    const out = new Map<string, string>()
-    for (const [turnKey, firstId] of firstAssistant) {
-      out.set(turnKey, firstIntermediate.get(turnKey) ?? firstId)
+    return map
+  }, [visibleRows, firstAssistantRowKeys])
+  /** 每轮要移进折叠区的系统注入行（保持时间序）。只收有 carrier 的轮。 */
+  const systemInjectedByTurn = useMemo(() => {
+    const map = new Map<string, ChatMessageDto[]>()
+    for (const row of visibleRows) {
+      if (row.kind !== 'msg' || !isSystemInjectedRow(row.m)) continue
+      if (!injectedCarrierByTurn.has(row.turnKey)) continue
+      const arr = map.get(row.turnKey)
+      if (arr) arr.push(row.m)
+      else map.set(row.turnKey, [row.m])
     }
-    return out
-  }, [flatRows, systemRowsByTurn])
+    return map
+  }, [visibleRows, injectedCarrierByTurn])
   /**
    * [2026-11-12 用户裁定「另外我希望默认收起中间轮」] 轮级展开态 —— 落库段与流式块**共用同一份**。
    *
@@ -3753,7 +4335,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     (turnKey: string) => processOpenByTurn[turnKey] ?? false,
     [processOpenByTurn],
   )
-  /** 每轮第一条「含中间过程」的 assistant 消息 → 该轮唯一的「已完成」开关落点。 */
+  /** 每轮第一条「含中间过程」的 assistant 消息 → 该轮唯一的「已完成」开关落点。
+   *  ⚠️ 注入行也必须算「有中间过程」：它们收起态不渲染（见渲染循环），
+   *  若该轮只有注入行而无思考/工具，没有折叠入口 ⇒ 永远展开不了 ⇒ 注入行死锁不可见。 */
   const firstIntermediateByTurn = useMemo(() => {
     const map = new Map<string, string>()
     for (const row of flatRows) {
@@ -3761,11 +4345,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       if (map.has(row.turnKey)) continue
       const hasInter = cleanReasoning(row.m.reasoning) !== ''
         || (row.m.toolCalls ?? []).some((t) => !isSendUserMessage(t))
-        || systemRowsByTurn.has(row.turnKey)   // [2026-11-02] 注入行也要有折叠入口
+        || hasSystemRowsByTurn.has(row.turnKey)
+        || hasPeerMessageRowsByTurn.has(row.turnKey)
       if (hasInter) map.set(row.turnKey, row.m.id)
     }
     return map
-  }, [flatRows, systemRowsByTurn])
+  }, [flatRows, hasSystemRowsByTurn, hasPeerMessageRowsByTurn])
   /**
    * 每轮**最后一条 assistant 行**的 id —— 「最终答复」判据。
    *
@@ -3841,7 +4426,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
    * <p>流式块：思考块 / 正文 / 工具（整块 1 段）—— 用户裁定「收起中间轮后也要展示最新三条输出，
    * 包括思考组件和工具」，而执行中的最新内容几乎都在流式块里，不纳入就会「收起来后一片空白」。
    */
-  const intermediateSegCount = useCallback((row: { kind: 'msg'; key: string; turnKey: string; m: ChatMessageDto } | { kind: 'blk'; key: string; sid: string; blockId: string }, sysRows?: ChatMessageDto[]) => {
+  const intermediateSegCount = useCallback((row: { kind: 'msg'; key: string; turnKey: string; m: ChatMessageDto } | { kind: 'blk'; key: string; sid: string; blockId: string }) => {
     if (row.kind === 'blk') {
       const b = (useChatStore.getState().streams[row.sid] ?? []).find((x) => x.assistantMessageId === row.blockId)
       if (!b) return 0
@@ -3853,12 +4438,16 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     }
     if (row.kind !== 'msg') return 0
     const m = row.m
+    // [peer-message 2026-11-22 用户裁定] 跨会话来信卡是**独立行**（不参与 assistant 的折叠区），
+    //   但它同样算「中间过程」1 段：否则收起态它永远露在外面，用户会误以为两条来信是连续发送的
+    //   （中间的思考/工具已被折叠）。与工具整行同口径 —— 占「最新 3 段」的一个名额。
+    //   ⚠️ 只算「收到消息」卡（isPeerAgentNotification）；hold 卡不在消息流、审批阻塞常显，另算。
+    if (isPeerAgentNotification(m)) return 1
     if (m.role !== 'assistant' || m.isApiErrorMessage) return 0
     let n = 0
     if (cleanReasoning(m.reasoning) !== '') n += 1
     if (!isFinalOfTurnFor({ turnKey: row.turnKey, m }) && (m.content ?? '').trim() !== '') n += 1
     if ((m.toolCalls ?? []).some((t) => !isSendUserMessage(t))) n += 1
-    n += sysRows?.length ?? 0
     return n
   }, [isFinalOfTurnFor])
   /**
@@ -3895,18 +4484,15 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     const rows = visibleRows.filter((r): r is
       | { kind: 'msg'; key: string; turnKey: string; m: ChatMessageDto; seq: number }
       | { kind: 'blk'; key: string; sid: string; blockId: string; turnKey: string; seq: number } =>
-      (r.kind === 'msg' && r.m.role === 'assistant') || r.kind === 'blk')
+      // [peer-message 2026-11-22] 来信卡也参与尾部窗口：它是独立行，但同样占「最新 3 段」的名额
+      (r.kind === 'msg' && (r.m.role === 'assistant' || isPeerAgentNotification(r.m))) || r.kind === 'blk')
     for (const turnKey of runningTurnKeys) {
       const turnRows = rows.filter((r) => r.turnKey === turnKey)
-      const sysRows = systemRowsByTurn.get(turnKey)
-      const headerId = processHeaderIdByTurn.get(turnKey)
       let need = COLLAPSED_TAIL_SEGMENTS
       let total = 0
       for (let i = turnRows.length - 1; i >= 0 && need > 0; i--) {
         const row = turnRows[i]!
-        // 与 Message 的 systemRows 投放条件一致：只有状态行所在那条能拿到注入行
-        const rowSys = row.kind === 'msg' && headerId === row.m.id ? sysRows : undefined
-        const n = intermediateSegCount(row, rowSys)
+        const n = intermediateSegCount(row)
         if (n === 0) continue
         total += n
         const take = Math.min(n, need)
@@ -3917,13 +4503,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       for (let i = 0; i < turnRows.length; i++) {
         const row = turnRows[i]!
         if (keep.has(row.key)) continue
-        const rowSys = row.kind === 'msg' && headerId === row.m.id ? sysRows : undefined
-        total += intermediateSegCount(row, rowSys)
+        total += intermediateSegCount(row)
       }
       if (total > COLLAPSED_TAIL_SEGMENTS) hidden.set(turnKey, total - COLLAPSED_TAIL_SEGMENTS)
     }
     return { tailKeepByRowKey: keep, hiddenSegCountByTurn: hidden }
-  }, [visibleRows, activeTurnKeys, streamIds, systemRowsByTurn, processHeaderIdByTurn, intermediateSegCount, streamShape, streamToolCount])
+  }, [visibleRows, activeTurnKeys, streamIds, intermediateSegCount, streamShape, streamToolCount])
   /** [并行工具组] 同轮 `tool_use_summary` → 该轮**首个**多工具消息的工具组父行标题。
    *  同时记下被「消费」的那条摘要行 id：该轮展开时不再单独渲染它（摘要不显示两遍）；
    *  轮次收起时摘要行照常显示（组在折叠区里不可见，摘要是唯一线索）。 */
@@ -4034,7 +4619,9 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     return out
   }, [messages])
   // 空态（置于所有 hooks 之后 · React 19 hooks 规则：hooks 前不得条件 return）
-  if (messages.length === 0 && streamIds.length === 0) {
+  //   ⚠️ 有待确认来信时必须渲染：新会话可能一条历史都没有，但 hold 卡要在流里可见
+  //   （否则「有件但看不到」= 用户认为消息丢了）。
+  if (messages.length === 0 && streamIds.length === 0 && (peerHeldItems?.length ?? 0) === 0) {
     return null
   }
   // 流式尾块 id（给行打「streaming」尾态 class · 只在块增删时变化）
@@ -4229,6 +4816,14 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           transition: background 120ms var(--ease, ease);
         }
         .msg.task-notice .tn-head:hover { background: var(--surface-3, #e9edf4); }
+        /* [2026-11-20 用户裁定] 系统注入行与工具行一致：**顶格左对齐** + 宽度跟文字走（fit-content），
+           ⛔ 不居中、⛔ 不固定最大宽度、⛔ 不吃满 .stream-inner（= 输入框同宽）。
+           max-width:100% 只作展开态长正文的溢出兜底。agent-notice 等复用 task-notice 的行不受影响。 */
+        .msg.task-notice.sys-injected {
+          width: fit-content;
+          max-width: 100%;
+          margin: 2px 0 4px;
+        }
         .msg.task-notice .tn-icon { flex-shrink: 0; display: inline-flex; color: var(--accent, #0f5fd4); }
         .msg.task-notice .tn-icon svg { width: 13px; height: 13px; }
         .msg.task-notice .tn-text {
@@ -4256,6 +4851,303 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
           word-break: break-word;
           max-height: 240px;
           overflow-y: auto;
+        }
+        /* [peer-failure] 跨会话投递失败通知条：复用 task-notice 结构，左侧 error 强调边 + 图标着色。
+           颜色全走主题变量（surface/ink/error），深浅色自动适配；文案必须整行可读 ⇒ 不省略号截断。 */
+        .msg.task-notice.peer-failure-notice .tn-head {
+          border-left: 3px solid var(--error, #C64545);
+          color: var(--ink, #14181f);
+        }
+        .msg.task-notice.peer-failure-notice .tn-icon { color: var(--error, #C64545); }
+        /* 深色主题：--error 未在 data-theme=dark 覆盖，原色在深底上对比不足 ⇒ 用同色系提亮值 */
+        .app[data-theme="dark"] .msg.task-notice.peer-failure-notice .tn-head { border-left-color: #e07a7a; }
+        .app[data-theme="dark"] .msg.task-notice.peer-failure-notice .tn-icon { color: #e07a7a; }
+        .msg.task-notice.peer-failure-notice .tn-text {
+          white-space: normal;
+          overflow: visible;
+          text-overflow: clip;
+        }
+        .msg.task-notice.peer-failure-notice .tn-body { font-family: inherit; }
+        /* [peer-message] 跨会话通知展开后的来源元信息（from / from-session / hop-chain）。
+           与正文同底色、独立一块；标题/属性都是他人数据，纯文本显示。 */
+        .msg.task-notice .tn-meta {
+          margin: 6px 0 0;
+          padding: 6px 10px;
+          background: var(--surface-2, #eff2f8);
+          border-radius: 8px;
+          font-size: 11.5px;
+          line-height: 1.6;
+          color: var(--ink-subtle, #5f6875);
+          word-break: break-word;
+        }
+        /* [peer-message] 跨会话来信 · 对话流内联卡片（对齐 CC：来信直接进流、正文默认可见）。
+           视觉复用既有变量与圆角：surface-2 底 + hairline 描边 + 左侧 accent 强调边（深浅色随变量切换）。
+           ⛔ 不使用独立配色系统；旧的 task-notice 通知条样式保留给同会话子代理通知 / 空闲通知等场景。 */
+        .msg.peer-message {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 0;
+          margin: 4px 0 18px;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-card {
+          box-sizing: border-box;
+          width: 100%;
+          padding: 10px 14px;
+          background: var(--surface-2, #eff2f8);
+          border: 1px solid var(--hairline);
+          border-left: 3px solid var(--accent);
+          border-radius: 10px;
+        }
+        /* [peer-launch] 派单 = 来信卡片放进「用户气泡位置」：气泡只当右对齐容器
+           （透明 / 无边框 / 无阴影），卡片保留自己的底色、左强调边与来源头
+           （用户 2026-11-22 裁定 · 视觉 A）。 */
+        .msg.user.peer-launch { justify-content: flex-end; }
+        .msg.user .peer-launch-bubble {
+          background: transparent;
+          border: none;
+          box-shadow: none;
+          padding: 0;
+          max-width: 78%;
+        }
+        .msg.user .peer-launch-bubble .pm-card { width: auto; }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-head {
+          display: flex;
+          align-items: baseline;
+          flex-wrap: wrap;
+          gap: 8px;
+          margin-bottom: 6px;
+        }
+        /* [peer-head] 方向 + 来源固定文案：收到消息 · 来自会话《标题》
+           （用户 2026-11-21 终稿；⛔ 不再用 @发送方名，@ 后面恒等于会话标题，容易被读成人名） */
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-dir {
+          flex-shrink: 0;
+          padding: 0 7px;
+          border-radius: 999px;
+          font-size: 10.5px;
+          line-height: 17px;
+          font-weight: 600;
+          background: var(--accent-soft);
+          color: var(--accent);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-from-label {
+          flex-shrink: 0;
+          font-size: 12.5px;
+          color: var(--ink-subtle);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-src {
+          font-family: var(--font-mono, ui-monospace, monospace);
+          font-size: 11px;
+          color: var(--ink-tertiary);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-mode {
+          padding: 0 7px;
+          border-radius: 999px;
+          background: var(--accent-soft);
+          color: var(--accent);
+          font-size: 11px;
+          line-height: 17px;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-time {
+          margin-left: auto;
+          font-size: 11.5px;
+          color: var(--ink-subtle);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-body {
+          font-size: 13.5px;
+          line-height: 1.6;
+          color: var(--ink-muted);
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
+        /* 长文折叠 = 12 行（1.6 行高 × 12）；展开/收起按钮由 peerBodyIsLong 决定是否存在 */
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-body.clamped {
+          max-height: 19.2em;
+          overflow: hidden;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-more,
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-copy,
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-src-toggle {
+          margin-top: 6px;
+          padding: 1px 8px;
+          font-family: inherit;
+          font-size: 11.5px;
+          line-height: 1.6;
+          color: var(--ink-subtle);
+          background: transparent;
+          border: 1px solid var(--hairline-strong);
+          border-radius: 999px;
+          cursor: pointer;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-more:hover,
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-copy:hover,
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-src-toggle:hover { color: var(--ink); background: var(--surface-3); }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-foot {
+          display: flex;
+          align-items: center;
+          gap: 8px;
+          margin-top: 6px;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-foot .pm-copy,
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-foot .pm-src-toggle { margin-top: 0; }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-meta {
+          margin-top: 8px;
+          padding-top: 8px;
+          border-top: 1px dashed var(--hairline-strong);
+          font-size: 11.5px;
+          line-height: 1.6;
+          color: var(--ink-subtle);
+          word-break: break-word;
+        }
+        /* [peer] 标题跳转 = 显式点击（button 重置成文本观感；键盘 focus 可见）。
+           ⛔ 只是展示入口：不自动跳、不因渲染/事件切会话。 */
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-title.pm-jump,
+        .msg.peer-hold .ph-title.ph-jump {
+          padding: 0;
+          border: 0;
+          background: transparent;
+          font-family: inherit;
+          text-align: left;
+          cursor: pointer;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-title.pm-jump:hover,
+        .msg.peer-hold .ph-title.ph-jump:hover { color: var(--accent); text-decoration: underline; }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-title.pm-jump:focus-visible,
+        .msg.peer-hold .ph-title.ph-jump:focus-visible {
+          outline: 2px solid var(--accent);
+          outline-offset: 2px;
+          border-radius: 4px;
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-title {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--ink);
+          word-break: break-word;
+        }
+        /* 标题缺失只说「未命名会话」，不冒充具体名字 */
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-title.is-missing { color: var(--ink-subtle); }
+        /* 未声明 ≠ default：虚线灰底，不冒充任何具体模式 */
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-mode.undeclared {
+          background: transparent;
+          border: 1px dashed var(--hairline-strong);
+          color: var(--ink-subtle);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-admission {
+          padding: 0 7px;
+          border-radius: 999px;
+          font-size: 11px;
+          line-height: 17px;
+          background: var(--surface-3);
+          color: var(--ink-subtle);
+        }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-admission.auto { background: #eefaf3; color: #0e8a4a; }
+        :is(.msg.peer-message, .msg.user .peer-launch-bubble) .pm-admission.approved { background: var(--accent-soft); color: var(--accent); }
+        /* [peer-hold] 待确认来信：警示虚线边（与已投递卡片的实线 + accent 左边区分）。
+           正文/标题同样是他人数据 → 纯文本。 */
+        .msg.peer-hold {
+          flex-direction: column;
+          align-items: stretch;
+          gap: 0;
+          margin: 4px 0 18px;
+        }
+        .msg.peer-hold .ph-card {
+          box-sizing: border-box;
+          width: 100%;
+          padding: 10px 14px;
+          background: #fff7e6;
+          border: 1px dashed #e3b06f;
+          border-left: 3px dashed #d97706;
+          border-radius: 10px;
+        }
+        .msg.peer-hold.declined .ph-card {
+          background: var(--surface-2);
+          border: 1px solid var(--hairline);
+          border-left: 3px solid var(--hairline-strong);
+        }
+        .msg.peer-hold .ph-head {
+          display: flex;
+          align-items: baseline;
+          flex-wrap: wrap;
+          gap: 6px;
+        }
+        .msg.peer-hold .ph-lead { font-size: 12.5px; color: var(--ink-subtle); }
+        .msg.peer-hold .ph-title {
+          font-size: 13px;
+          font-weight: 600;
+          color: var(--ink);
+          word-break: break-word;
+        }
+        .msg.peer-hold .ph-src {
+          font-family: var(--font-mono, ui-monospace, monospace);
+          font-size: 11px;
+          color: var(--ink-tertiary);
+        }
+        .msg.peer-hold .ph-flag { font-size: 12px; font-weight: 600; color: #8a4b00; }
+        .msg.peer-hold.declined .ph-flag { font-weight: 500; color: var(--ink-subtle); }
+        .msg.peer-hold .ph-reason { font-size: 11.5px; color: #8a4b00; }
+        .msg.peer-hold .ph-badges {
+          display: flex;
+          align-items: center;
+          flex-wrap: wrap;
+          gap: 6px;
+          margin: 4px 0 6px;
+          font-size: 11px;
+          color: var(--ink-subtle);
+        }
+        .msg.peer-hold .ph-mode,
+        .msg.peer-hold .ph-admission {
+          padding: 0 7px;
+          border-radius: 999px;
+          line-height: 17px;
+          background: var(--surface-3);
+        }
+        .msg.peer-hold .ph-admission.auto { background: #eefaf3; color: #0e8a4a; }
+        .msg.peer-hold .ph-admission.approved { background: var(--accent-soft); color: var(--accent); }
+        .msg.peer-hold .ph-time { margin-left: auto; font-size: 11.5px; }
+        .msg.peer-hold .ph-body {
+          font-size: 13.5px;
+          line-height: 1.6;
+          color: var(--ink-muted);
+          white-space: pre-wrap;
+          word-break: break-word;
+        }
+        .msg.peer-hold .ph-body.clamped { max-height: 19.2em; overflow: hidden; }
+        .msg.peer-hold .ph-body.ph-empty { color: var(--ink-subtle); font-style: italic; }
+        .msg.peer-hold .ph-more {
+          margin-top: 6px;
+          padding: 1px 8px;
+          font-family: inherit;
+          font-size: 11.5px;
+          line-height: 1.6;
+          color: var(--ink-subtle);
+          background: transparent;
+          border: 1px solid var(--hairline-strong);
+          border-radius: 999px;
+          cursor: pointer;
+        }
+        .msg.peer-hold .ph-more:hover { color: var(--ink); background: var(--surface-3); }
+        .msg.peer-hold .ph-actions { display: flex; gap: 8px; margin-top: 8px; }
+        .msg.peer-hold .ph-reject,
+        .msg.peer-hold .ph-accept {
+          padding: 2px 10px;
+          font-family: inherit;
+          font-size: 12px;
+          line-height: 1.6;
+          border-radius: 7px;
+          cursor: pointer;
+        }
+        .msg.peer-hold .ph-reject { background: #fff; border: 1px solid #e3b06f; color: #8a4b00; }
+        .msg.peer-hold .ph-reject:hover { border-color: #d97706; }
+        .msg.peer-hold .ph-accept { background: #d97706; border: 1px solid #d97706; color: #fff; }
+        .msg.peer-hold .ph-accept:hover { background: #b45309; border-color: #b45309; }
+        .msg.peer-hold .ph-reject:disabled,
+        .msg.peer-hold .ph-accept:disabled { opacity: .6; cursor: default; }
+        .msg.peer-hold .ph-error {
+          margin-top: 6px;
+          padding: 5px 9px;
+          border-radius: 8px;
+          background: rgba(0, 0, 0, 0.04);
+          color: var(--ink-muted);
+          font-size: 11.5px;
         }
         /* [P2-13] compact 摘要卡片：CC CompactSummary 专用渲染（⏺ 标题行 + 折叠正文），
            不是用户气泡 —— 摘要正文默认收起（= CC prompt 模式），展开 = CC transcript 模式 */
@@ -4765,14 +5657,41 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
         //   即「一条消息毒」会带走整个消息列表。逐行隔开后，坏的那条只挂自己那一行。
         //   ⛔ 只加这一层壳，不动行内渲染逻辑。
         if (row.kind === 'msg') {
-          // [2026-11-02 系统注入行] 不单独占对话流 —— 由该轮折叠区统一渲染（见 systemRowsByTurn）。
-          //   若这里放行，收起态仍会显示、且夹在工具卡之间打断阅读（用户要的是「融合在已完成中」）。
-          if (isSystemInjectedRow(row.m)) return null
+          // [2026-11-20 用户裁定「消息末尾 + 收起时不露」] 系统注入行按自身位置渲染（在对话流里），
+          //   但**跟随所属轮的收起态**：收起时不显示、展开后按真实位置显示。
+          //   它们由后端在当轮尾部 append（seq 单调）⇒ 展开时就在「消息末尾」，
+          //   不再是「挂在某轮折叠区里、看起来像被插到前面」。⛔ 仍不进用户气泡。
+          if (isSystemInjectedRow(row.m)) {
+            // [2026-11-20 用户裁定] 该轮有状态行承载行 → 由它渲染在「已完成 / 正在执行」下方；
+            //   此处不再按自身 seq 渲染（否则轮头会出现一份、折叠区再出现一份）。
+            if (injectedCarrierByTurn.has(row.turnKey)) return null
+            if (!turnOpenFor(row.turnKey)) return null
+            return (
+              <ErrorBoundary key={row.key} tag="MessageList.row.sys" compact
+                title="这条系统提示显示失败" hint="其余内容不受影响。">
+                <SystemInjectedRow msg={row.m} />
+              </ErrorBoundary>
+            )
+          }
           // [2026-11-12 用户裁定「默认不展开 就是收起状态」] 进行中的轮**默认收起**：
           //   收起态会露出「最新 3 段」（见 tailKeepByRowKey），所以不再需要靠展开撑场面。
           //   ⛔ 收起后状态行 + 扫光条仍在（见 Message 的 isRunningTurn 分支），不会变成「看不出还活着」。
           const isRunningTurn = activeTurnKeys.has(row.turnKey)
           const turnOpen = turnOpenFor(row.turnKey)
+          // [peer-message 2026-11-22 用户裁定] 跨会话来信卡跟随轮收起态：
+          //   · 收起 = 不显示（与折叠区同进退 —— 否则中间思考/工具被折叠，两条来信看起来像连续发送）；
+          //   · 展开 = 按真实位置正常显示；
+          //   · 执行中的轮：若它落在「最新 3 段」窗口内（keep > 0）照常露出。
+          //   ⚠️ hold（审批）卡不在此列：它不在消息流里（PeerHoldCards 常显），且会阻塞整个运转。
+          //   ⚠️ 兜底：该轮没有任何折叠入口（如整轮只有一条来信、没有 assistant 行）时必须常显 ——
+          //      否则来信被隐藏且无从展开 = 消息静默消失。
+          if (isPeerAgentNotification(row.m)
+            // [peer-launch] 派单行是轮起点（用户气泡位置），必须常显：
+            //   它跟轮收起态隐藏的话，派生会话的首轮在收起时整条消失（用户 2026-11-22 裁定）。
+            && !isPeerLaunchRow(row.m)
+            && firstIntermediateByTurn.has(row.turnKey)
+            && !turnOpen
+            && !(isRunningTurn && (tailKeepByRowKey.get(row.key) ?? 0) > 0)) return null
           // [并行工具组] 该轮展开时其 tool_use_summary 已并入工具组父行标题 → 独立摘要行不再重复显示
           // [2026-11-12] 收起态**不**吸附：收起后折叠区仍会露尾部段（含工具组父行），
           //   若同时隐藏摘要行又给组头 title ⇒ 摘要行成了唯一线索却看不见；若都显示 ⇒ 同一段摘要出现两次。
@@ -4826,6 +5745,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
               title="这条消息显示失败" hint="其余内容不受影响。">
               <MemoMessage msg={row.m} onDelete={onDelete} onRunHtml={openHtmlPreview} onOpenRefFile={onOpenRefFile} onOpenKbDoc={onOpenKbDoc}
                 onEditResend={onEditResend}
+                onEditingChange={handleEditingChange}
                 onForkTurn={onForkTurn}
                 footer={footerByRowKey.get(row.key)}
                 highlighted={row.m.id === highlightedMsgId}
@@ -4847,14 +5767,18 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 //   该轮第一条**有中间过程**的 assistant 行 → 没有则回落该轮**第一条** assistant 行。
                 //   只认前者会让「首段纯正文」的轮次整轮没有状态行与扫光条。
                 showProcessHeader={firstAssistantRowKeys.has(row.key)}
+                // [2026-11-20] 本轮的「系统注入行」只挂到状态行落点行（carrier），由它在
+                //   「已完成/正在执行」下方渲染；其余行不传，避免同一轮重复渲染。
+                systemInjected={injectedCarrierByTurn.get(row.turnKey) === row.key
+                  ? systemInjectedByTurn.get(row.turnKey)
+                  : undefined}
                 turnDurationMs={turnDurationByKey.get(row.turnKey) ?? null}
                 turnKey={row.turnKey}
                 showHeader={firstAssistantRowKeys.has(row.key)}
                 groupTitle={turnOpen ? toolGroupMeta.titleByMsgId.get(row.m.id) : undefined}
                 summaryToolName={toolGroupMeta.toolNameByTurn.get(row.turnKey)}
-                systemRows={processHeaderIdByTurn.get(row.turnKey) === row.m.id
-                  ? systemRowsByTurn.get(row.turnKey) : undefined}
                 prose={prose}
+                onOpenPeerSession={onOpenPeerSession}
                 onToggleProcess={toggleTurnProcess} />
             </ErrorBoundary>
           )
@@ -4909,10 +5833,25 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
                 hiddenSegCount={hiddenSegCountByTurn.get(row.turnKey) ?? 0}
               prose={prose}
               onToggleProcess={toggleTurnProcess}
+              onOpenSession={onOpenPeerSession}
             />
           </ErrorBoundary>
         )
       })}
+      {/* [peer-hold] 待确认 / 已拒绝来信 → 对话流内联卡片（数据来自待收件列表接口，非消息表 heldState）。
+          「卡住直到选择」：pending 行会一直留在这里，接受后由 store 移除、拒绝后消失；
+          行内失败原因随行保留（⛔ 不弹假成功）。*/}
+      {peerHeldItems && peerHeldItems.length > 0 && onPeerAccept && onPeerReject ? (
+        <PeerHoldCards
+          items={peerHeldItems}
+          acting={peerHeldActing}
+          rowErrors={peerHeldRowErrors}
+          onAccept={onPeerAccept}
+          onReject={onPeerReject}
+          onJump={onOpenPeerSession}
+          focusedId={focusedPeerId}
+        />
+      ) : null}
       {/* 无 flow 锚定的错误（userMessageId/assistantMessageId 均缺失）→ 兜底渲染在末尾 */}
       {(() => { const err = apiErrorMap.get('global'); return err ? <ApiErrorCard key="err-global" err={err} /> : null })()}
       {/* 回到最底部（离底时显示 · 对齐 deepseek-harness ChatView toBottom） */}

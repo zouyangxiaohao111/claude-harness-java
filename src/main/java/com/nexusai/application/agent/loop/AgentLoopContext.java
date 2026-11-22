@@ -1246,14 +1246,14 @@ public record AgentLoopContext(
      * null（单测/standalone 构造路径）→ 无 todo 历史，返回空列表。
      */
     private static java.util.List<com.nexusai.application.agent.tool.impl.TodoWriteTool.TodoItem> readTodosFromAppState(
-            AgentLoopContext ctx, UUID agentId, String sessionId) {
+            AgentLoopContext ctx, String agentId, String sessionId) {
         java.util.function.Function<java.util.Map<String, Object>, java.util.Map<String, Object>> reader =
             ctx.sessionState().appStateReader();
         if (reader == null) {
             return java.util.List.of();
         }
         // [session-id-short] 主线程回退键 = sessionId（short，与写侧 TodoWriteTool resolveTodoKey 收敛）
-        String todoKey = agentId != null ? agentId.toString() : sessionId;
+        String todoKey = agentId != null ? agentId : sessionId;
         if (todoKey == null) {
             return java.util.List.of();
         }
@@ -1570,7 +1570,9 @@ public record AgentLoopContext(
             //   必须是投影面，否则被 snip 删除 / pre-boundary 内容经工具通道回流。
             com.nexusai.application.agent.tool.ToolUseContext hookTuc = baseTuc
                 .withQueryTracking(queryTracking)
-                .withMessages(state.modelView());
+                .withMessages(state.modelView())
+                // [sendmessage-cross-session · B] peer 来源随 per-turn TUC 透传（与主分支同口径）。
+                .withPeerExecutionOrigin(effectivePeerOrigin(baseTuc, state));
             state.setCurrentToolUseContext(hookTuc);
             return hookTuc;
         }
@@ -1645,7 +1647,12 @@ public record AgentLoopContext(
             //   state.currentModel() = LlmAgentLoop doRun 入口 + 每轮 effectiveModel 覆盖写。
             .withEffectiveModelName(state.currentModel())
             // [openai-lazy 乙-1] 注入当前 turn 目标 provider 类型（消费方见上方解析处注释）。
-            .withEffectiveProviderType(resolvedProviderType);
+            .withEffectiveProviderType(resolvedProviderType)
+            // [sendmessage-cross-session · B] peer 来源：base TUC 的初始值 + **轮内更新**
+            //   （drain 收到 peer 项时写 state.peerExecutionOrigin，本行使<b>后续每一轮</b>的
+            //   per-turn TUC 立即带上该来源；C 批守卫在工具 execute 前读同一字段）。
+            //   同值短路：非 peer 回合零新实例。
+            .withPeerExecutionOrigin(effectivePeerOrigin(baseTuc, state));
         state.setCurrentToolUseContext(perTurnTuc);
         if (log.isDebugEnabled()) {
             log.debug("AgentLoopContext toolExecContext stamp: sessionId={} queryTracking={} effectiveModel={} effectiveProviderType={}",
@@ -1655,6 +1662,27 @@ public record AgentLoopContext(
                 perTurnTuc.effectiveProviderType() != null ? perTurnTuc.effectiveProviderType() : "(null)");
         }
         return perTurnTuc;
+    }
+
+    /**
+     * [sendmessage-cross-session · B] per-turn TUC 的 peer 来源取值：
+     * <b>state 优先（drain 轮内更新），base 兜底</b>。
+     *
+     * <p>为什么两源：base TUC 是 run 入口按 {@code RunRequest.peerExecutionOrigin} 盖的值（本 run 起始
+     * 来源）；mid-turn 若在同一 run 里收到 peer 消息，{@code LlmAgentLoop.drainAndInjectQueued} 会把
+     * 新来源写到 {@code state.peerExecutionOrigin}（sticky），后续工具轮必须以它为准 —— 否则「用户轮里
+     * 收到 peer」时守卫仍按用户轮判（漏防）。二源同值时不产生新实例（withPeerExecutionOrigin 短路）。
+     *
+     * @param baseTuc run 入口的 base TUC（可 null）
+     * @param state   本 run 状态（可 null）
+     * @return 本轮生效的 peer 来源；两者皆无 → null（非 peer 回合）
+     */
+    private static com.nexusai.application.agent.messaging.PeerExecutionOrigin effectivePeerOrigin(
+            com.nexusai.application.agent.tool.ToolUseContext baseTuc, AgentState state) {
+        if (state != null && state.peerExecutionOrigin() != null) {
+            return state.peerExecutionOrigin();
+        }
+        return baseTuc != null ? baseTuc.peerExecutionOrigin() : null;
     }
 
     /**
@@ -2249,6 +2277,9 @@ public record AgentLoopContext(
                 .withReasoningDurationMs(reasoningDurationMs)
                 // [B7-R9] 输出解码耗时 decodeMs 挂载（工具轮 assistant 消息；外层 run() 算好传入，null = 无计时）
                 .withDecodeMs(decodeMs);
+        // [content-blocks] 内容块顺序挂载（须在其它 with* 之后）· 对齐 CC「一块一行 + apiBlockIndex」
+        assistantToolCallsMsg = assistantToolCallsMsg.withBlocks(
+            LlmAgentLoop.blocksOf(assistantToolCallsMsg, msg));
         state.appendMessage(assistantToolCallsMsg);
         // [D] 发射点 ①：assistant(tool_calls) 真实模型产出 → onMessage（对齐 CC forkedAgent.ts:578
         //   消费侧 onMessage?.(message)；CC query() yield 的 assistant 消息类型之一）。
@@ -2483,10 +2514,16 @@ public record AgentLoopContext(
                 if (com.nexusai.application.agent.tool.ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME
                         .equals(call.name()) && r != null) {
                     Object d = r.data();
-                    String ds = d instanceof String s ? s : String.valueOf(d);
-                    // schema 失败 / 中断 → 判定为 structured failure（fail-loud 语义）
-                    if (ds.startsWith("Output does not match") || ds.startsWith("StructuredOutput")
-                        || ds.startsWith("unknown error") || ds.startsWith("Interrupted")) {
+                    // [错误通道] 结构判定优先：失败载荷 ToolError 即失败（不再靠文案前缀）；
+                    //   前缀分支仅保留给历史 String 载荷，行为不变。
+                    boolean failure = com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(d);
+                    if (!failure) {
+                        String ds = d instanceof String s ? s : String.valueOf(d);
+                        // schema 失败 / 中断 → 判定为 structured failure（fail-loud 语义）
+                        failure = ds.startsWith("Output does not match") || ds.startsWith("StructuredOutput")
+                            || ds.startsWith("unknown error") || ds.startsWith("Interrupted");
+                    }
+                    if (failure) {
                         structuredFailure = true;
                         break;
                     }
@@ -2780,10 +2817,25 @@ public record AgentLoopContext(
     private static com.nexusai.application.agent.tool.ToolResult<?> applyToolResultBudget(AgentLoopContext ctx,
             AgentState state, com.nexusai.application.agent.tool.ToolResult<?> r, String toolName,
             String toolUseId, boolean isError, QuerySource querySource) {
-        // [A1·退役 content()/metadata()] 只对 String data 做 budget 持久化
-        // (CC toolResultStorage persist 的 content 是 stringified data; 结构化 data<T> 非 String 时跳过 budget)
-        // [merge] data() 泛型化下按 CC toolResultStorage 语义收窄：CC enforceToolResultBudget (Open-ClaudeCode/src/utils/toolResultStorage.ts:924) 作用于 string content；结构化 data<T> 非 String 跳过 budget。Java 侧 instanceof 收窄，逻辑等价 CC 字符串工具结果处理。
-        if (r == null || !(r.data() instanceof String dc0)) {
+        // [Agent-budget-fix 2026-11-20] CC 的落盘判据作用在**渲染后的 tool_result 文本**上
+        // （{@code mapToolResultToToolResultBlockParam} 产物），不是原始 data 类型。
+        // Agent 子代理结果 data = ObjectNode，但模型侧看到的是它的 JSON 文本
+        // （Tool 默认 mapper → {@link com.nexusai.application.agent.tool.ToolResult#renderToolResultPayloadText}
+        // → {@code node.toString()}）⇒ 必须用同一文本参与预算，否则子代理报告永不落盘：
+        // 超 50K 也原样进父上下文（实测缺陷：sync Agent 结果绕过 budget）。
+        // 其他结构化 data（image/块数组等）仍按原语义跳过 —— 压平会破坏结构化 content。
+        // [A1·退役 content()/metadata()] String data 路径逐位等价原实现。
+        if (r == null) {
+            return r;
+        }
+        String dc0;
+        if (r.data() instanceof String s) {
+            dc0 = s;
+        } else if (r.data() instanceof com.fasterxml.jackson.databind.JsonNode node
+                && (com.nexusai.application.agent.tool.AgentToolConstants.AGENT_TOOL_NAME.equals(toolName)
+                    || com.nexusai.application.agent.tool.AgentToolConstants.LEGACY_AGENT_TOOL_NAME.equals(toolName))) {
+            dc0 = node.toString();
+        } else {
             return r;
         }
         if (dc0.trim().isEmpty()) {
@@ -4931,6 +4983,144 @@ public record AgentLoopContext(
         log.info("[date] 尾部投递日期附件（独立消息 · 无免责声明包裹）: sessionId={} date={}"
             + " changed={} assumedUtc={} querySource={} · 对齐 CC 2.1.322 Ci offset 308666094",
             sessionId, currentDate, changed, assumedUtc, querySource);
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // coordinator_context 动态附件 · 对齐 exe 2.1.328（producer @336413600 的 Ra()，
+    // 渲染 @330697225；schema content/changed @325127619）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 首次 worker 工具清单消息的 subtype。 */
+    public static final String COORDINATOR_CONTEXT_SUBTYPE = "coordinator_context";
+    /** 清单变化 / 模式结束的 subtype（changed=true 的一对）。 */
+    public static final String COORDINATOR_CONTEXT_CHANGE_SUBTYPE = "coordinator_context_change";
+    /** 模式结束的 subtype。 */
+    public static final String COORDINATOR_CONTEXT_END_SUBTYPE = "coordinator_context_end";
+
+    /** exe 渲染文案（@330697225）。 */
+    private static final String COORDINATOR_CONTEXT_CHANGED_PREFIX =
+        "The worker tools have changed; this replaces the earlier list.\n\n";
+    private static final String COORDINATOR_CONTEXT_ENDED_TEXT =
+        "Coordinator mode has ended; the earlier list of worker tools no longer applies.";
+
+    /**
+     * coordinator_context 附件投递 · 对齐 exe 2.1.328 {@code Ra()} 的 coordinator 段：
+     * <pre>
+     * let z = jy(e);                     // 历史最后一条 coordinator_context.content
+     * let K = o.workerTools;             // 本轮 workerToolsContext
+     * let X = qa();                      // isCoordinatorMode
+     * if(X &amp;&amp; K!==void 0 &amp;&amp; (k ? z===void 0 : z!==K))
+     *    push({type:"coordinator_context", content:K, ...(z!==void 0 &amp;&amp; {changed:!0})});
+     * </pre>
+     *
+     * <p>本仓落点与 date 附件同款：<b>尾部真实消息</b>（{@code state.appendMessage}，subtype 区分
+     * 首次 / 变化 / 结束），历史判据读本 agent 自己的消息数组。
+     *
+     * <p>只对<b>主线程</b>注入（{@code USER / REPL_MAIN_THREAD / SDK}）：协调者提示本身只作用于
+     * 主线程，worker 收到协调者的工具清单会误导。
+     *
+     * @param state              AgentState（消息历史 + appendMessage 通道）
+     * @param querySource        本次 query 来源
+     * @param coordinatorActive  本轮 coordinator 门（会话列 / env 产物）
+     * @param workerToolsContent 本轮 {@code workerToolsContext}（gate 真时非 null）
+     */
+    public static void maybeEmitCoordinatorContext(AgentState state,
+            com.nexusai.application.agent.QuerySource querySource,
+            boolean coordinatorActive, String workerToolsContent) {
+        if (state == null) {
+            return;
+        }
+        if (querySource != com.nexusai.application.agent.QuerySource.USER
+                && querySource != com.nexusai.application.agent.QuerySource.REPL_MAIN_THREAD
+                && querySource != com.nexusai.application.agent.QuerySource.SDK) {
+            return;
+        }
+        String last = lastCoordinatorContextFromHistory(state.rawMessages());
+        if (coordinatorActive) {
+            if (workerToolsContent == null || workerToolsContent.isBlank()) {
+                return;
+            }
+            boolean auxiliary = isAuxiliaryQuerySource(querySource);
+            boolean shouldEmit = auxiliary ? last == null : !workerToolsContent.equals(last);
+            if (!shouldEmit) {
+                return;
+            }
+            boolean changed = last != null;
+            String rendered = changed
+                ? COORDINATOR_CONTEXT_CHANGED_PREFIX + workerToolsContent
+                : workerToolsContent;
+            emitCoordinatorContext(state,
+                changed ? COORDINATOR_CONTEXT_CHANGE_SUBTYPE : COORDINATOR_CONTEXT_SUBTYPE,
+                rendered, changed, querySource);
+        } else if (last != null) {
+            emitCoordinatorContext(state, COORDINATOR_CONTEXT_END_SUBTYPE,
+                COORDINATOR_CONTEXT_ENDED_TEXT, true, querySource);
+        }
+    }
+
+    private static void emitCoordinatorContext(AgentState state, String subtype,
+            String rendered, boolean changed, com.nexusai.application.agent.QuerySource querySource) {
+        String sessionId = state.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            if (log.isDebugEnabled()) {
+                log.debug("[coordinator-context] 命中投递但无会话标识 ⇒ 只记录不投递 subtype={}", subtype);
+            }
+            return;
+        }
+        ChatMessageDto msg = coordinatorContextMessage(sessionId, rendered, subtype);
+        if (msg == null) {
+            return;
+        }
+        state.appendMessage(msg);
+        log.info("[coordinator-context] 尾部投递 subtype={} changed={} querySource={}"
+                + " · 对齐 exe 2.1.328 Ra() coordinator 段",
+            subtype, changed, querySource);
+    }
+
+    /** coordinator_context meta 消息构造（isMeta=true user 消息，subtype 编码形态）。 */
+    public static ChatMessageDto coordinatorContextMessage(String sessionId, String content, String subtype) {
+        if (content == null || content.isBlank()) {
+            return null;
+        }
+        return new ChatMessageDto(
+            UUID.randomUUID().toString(), sessionId, Role.user, "attachment",
+            content, null, java.util.List.of(), null, null, null,
+            "刚刚", java.time.OffsetDateTime.now(), null, null,
+            null, java.util.List.of(), java.util.List.of(), null, true)
+            .withSubtype(subtype);
+    }
+
+    /**
+     * 历史里最后一条「有效」coordinator_context 内容（已剥掉 changed 前缀）。
+     *
+     * <p>遇到 {@code coordinator_context_end} 返回 null —— 模式结束后历史清单作废，
+     * 再次进入时按「首次」处理。
+     */
+    static String lastCoordinatorContextFromHistory(java.util.List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return null;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto m = messages.get(i);
+            if (m == null) {
+                continue;
+            }
+            String sub = m.subtype();
+            if (COORDINATOR_CONTEXT_END_SUBTYPE.equals(sub)) {
+                return null;
+            }
+            if (COORDINATOR_CONTEXT_SUBTYPE.equals(sub)
+                    || COORDINATOR_CONTEXT_CHANGE_SUBTYPE.equals(sub)) {
+                String content = m.content();
+                if (content == null) {
+                    continue;
+                }
+                return content.startsWith(COORDINATOR_CONTEXT_CHANGED_PREFIX)
+                    ? content.substring(COORDINATOR_CONTEXT_CHANGED_PREFIX.length())
+                    : content;
+            }
+        }
+        return null;
     }
 
     /**

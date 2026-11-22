@@ -139,6 +139,12 @@ public class TaskSystemConfig {
     private static final String AGENT_COLOR_PROPERTY = "nexusai.agent.color";
     private static final String VERIFICATION_AGENT_PROPERTY = "nexusai.feature.verification_agent";
     private static final String TENGU_HIVE_EVIDENCE_PROPERTY = "nexusai.feature.tengu_hive_evidence";
+    /** 跨会话 SendMessage 部署门 sysprop · 与入站策略 crossSessionInbound 不得混用。 */
+    private static final String MESSAGING_BEYOND_OWN_AGENTS_PROPERTY =
+        "nexusai.feature.messaging-beyond-own-agents";
+    /** 跨会话 SendMessage 部署门 env（与 sysprop 同义）。 */
+    private static final String MESSAGING_BEYOND_OWN_AGENTS_ENV =
+        "NEXUSAI_FEATURE_MESSAGING_BEYOND_OWN_AGENTS";
 
     /**
      * 任务配置根目录覆盖 · nexusai.* 约定
@@ -383,6 +389,59 @@ public class TaskSystemConfig {
     }
 
     // ════════════════════════════════════════════════════════════════════════
+    // 跨会话 SendMessage 能力门 · 单一门（不是入站策略）
+    // ════════════════════════════════════════════════════════════════════════
+
+    /**
+     * 动态部署门来源（PeerSessionRegistry @PostConstruct 安装 application.yml 值）。
+     *
+     * <p>返回 null = 未配置 ⇒ 继续走 sysprop → env → false 回落链。
+     */
+    private static volatile Supplier<Boolean> messagingBeyondOwnAgentsSource;
+
+    /**
+     * 是否启用「向自身会话之外的 agent 发送消息」。
+     *
+     * <p><b>优先级</b>：动态 source（部署装配）&gt; sysprop
+     * {@code nexusai.feature.messaging-beyond-own-agents} &gt; env
+     * {@code NEXUSAI_FEATURE_MESSAGING_BEYOND_OWN_AGENTS} &gt; {@code true}。
+     *
+     * <p><b>不得混淆</b>：本门只决定「是否暴露跨会话发现/发送能力」，与入站策略
+     * {@code crossSessionInbound}（accept/auto/hold/refuse）是两个独立维度。
+     *
+     * @return true = 能力启用；默认 true（对齐 CC：本机跨会话默认可用）
+     */
+    public static boolean isMessagingBeyondOwnAgentsEnabled() {
+        Supplier<Boolean> source = messagingBeyondOwnAgentsSource;
+        if (source != null) {
+            Boolean configured = source.get();
+            if (configured != null) {
+                return configured;
+            }
+        }
+        String sysprop = System.getProperty(MESSAGING_BEYOND_OWN_AGENTS_PROPERTY);
+        if (sysprop != null) {
+            return isEnvTruthy(sysprop);
+        }
+        String env = System.getenv(MESSAGING_BEYOND_OWN_AGENTS_ENV);
+        if (env != null) {
+            return isEnvTruthy(env);
+        }
+        return true;
+    }
+
+    /**
+     * 安装动态部署门 source。
+     *
+     * @param source 每次调用返回 Boolean（null = 未配置，继续回落）；null 参数不覆盖
+     */
+    public static void installMessagingBeyondOwnAgentsSource(Supplier<Boolean> source) {
+        if (source != null) {
+            messagingBeyondOwnAgentsSource = source;
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
     // Agent/Team 名称 · 对齐 CC utils/teammate.ts
     // ════════════════════════════════════════════════════════════════════════
 
@@ -584,6 +643,9 @@ public class TaskSystemConfig {
         System.clearProperty(TENGU_HIVE_EVIDENCE_PROPERTY);
         System.clearProperty(TASKS_CONFIG_DIR_PROPERTY);
         System.clearProperty(AGENT_COLOR_PROPERTY);
+        System.clearProperty(MESSAGING_BEYOND_OWN_AGENTS_PROPERTY);
+        // 跨会话能力门动态 source 必须清：否则测试间安装的 source 串状态
+        messagingBeyondOwnAgentsSource = null;
         // [agent-swarms-global] 清实时 DB 读源：否则测试间安装的 source 串状态（下一测试误读上一测试 DB 值）
         agentSwarmsSettingsSource = null;
         // [agent-swarms-setting V42] 清 settings 静态覆盖标志：否则既有 swarms 门控测试（SendMessageTool 等）串状态

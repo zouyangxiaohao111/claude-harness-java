@@ -45,6 +45,9 @@ public final class TurnPaging {
         "compact_boundary", "microcompact_boundary", "snip_boundary", "snip_marker",
         "subagent_result", "subagent_receipt", "subagent_start", "subagent_stop");
 
+    /** SessionCreate 派单消息 id 前缀（{@code SessionCreateTool} 落库：{@code "peer-launch-" + UUID}）。 */
+    public static final String PEER_LAUNCH_ID_PREFIX = "peer-launch-";
+
     private TurnPaging() {
     }
 
@@ -104,6 +107,21 @@ public final class TurnPaging {
      * @param isMeta           DB {@code is_meta} 列（可为 null = 旧行）
      * @param isCompactSummary DB {@code is_compact_summary} 列（可为 null = 旧行）
      */
+    /**
+     * SessionCreate <b>派单行</b>是否作为轮起点（用户 2026-11-22 裁定：派单算一轮）。
+     *
+     * <p><b>与协作来信严格区分</b>：SendMessage 来信同样是
+     * {@code role=user / is_meta=1 / subtype=agent_message}，但它由普通消息 id 承载；
+     * 只有 {@code SessionCreateTool} 落库的派单消息用 {@code peer-launch-<uuid>} 前缀。
+     * 派生会话（子代理）没有别的用户提问行 ⇒ 不放行它，轮锚点恒为 0，轮分页永远返回空。
+     *
+     * @param id   DB 消息 id（派单行的稳定判据）
+     * @param role DB role 列
+     */
+    public static boolean isPeerLaunchTurnRow(String id, String role) {
+        return "user".equals(role) && id != null && id.startsWith(PEER_LAUNCH_ID_PREFIX);
+    }
+
     public static boolean isUserTurnRow(String role, String author, String subtype,
                                         Boolean isMeta, Boolean isCompactSummary) {
         if (!"user".equals(role)) {
@@ -137,8 +155,11 @@ public final class TurnPaging {
             if (r == null || r.getId() == null) {
                 continue;
             }
-            if (!isUserTurnRow(r.getRole(), r.getAuthor(), r.getSubtype(),
-                    r.getIsMeta(), r.getIsCompactSummary())) {
+            boolean userTurn = isUserTurnRow(r.getRole(), r.getAuthor(), r.getSubtype(),
+                    r.getIsMeta(), r.getIsCompactSummary());
+            // 派单行（peer-launch-*）虽然是 is_meta=1 的 agent_message，但它是派生会话的
+            // 唯一轮起点 —— 单独放行；同 subtype 的协作来信不满足前缀，仍在这里被排除。
+            if (!userTurn && !isPeerLaunchTurnRow(r.getId(), r.getRole())) {
                 continue;
             }
             if (r.getSeq() == null) {

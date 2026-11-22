@@ -43,7 +43,8 @@ import static org.mockito.Mockito.when;
 /**
  * coordinator 激活来源收敛 · <b>全局 DB 层已移除，每一处门都必须吃会话门 / feature+env</b>
  * （[2026-11-19 用户裁定] {@code settings.coordinator_mode_enabled} 不再参与判定；
- * 会话列 → feature && env 两层，见 {@link PromptAlignSettingsResolver#coordinatorModeActive}）。
+ * 会话列 → env 两层，见 {@link PromptAlignSettingsResolver#coordinatorModeActive}；
+ * exe 2.1.328 已删除 feature 门，回落层只看 {@code CLAUDE_CODE_COORDINATOR_MODE}）。
  *
  * <h2>WHY 存在（CLAUDE.md 规则 9：测试验证意图，不是验证行为）</h2>
  * <p>coordinator 模式的用户激活路径是输入框「协调者」chip（写 {@code sessions.coordinator_mode}）；
@@ -132,7 +133,7 @@ class CoordinatorModeUnifiedGateTest {
 
     private static ToolUseContext tuc(List<Tool> availableTools) {
         return new ToolUseContext(
-            UUID.randomUUID(),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             "sess-" + UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT,
             Map.of(),
@@ -229,13 +230,15 @@ class CoordinatorModeUnifiedGateTest {
         ArrayNode schema = LlmAgentLoop.llmToolsArray(tuc(fullAllPool()), QuerySource.USER);
 
         // THEN: coordinator 白名单（USER 可见集 ∪ PR 订阅工具）；Bash/Read/Edit/普通 MCP 必须消失
+        //   [2026-11-20 按 CC 收口] StructuredOutput 虽在白名单（候选），但属 SPECIAL_TOOLS，
+        //   交互式会话模型不可见（只在 jsonSchema && 非交互/后台时 post-hoc 追加）。
         assertThat(schemaNames(schema))
             .as("协调者激活时顶层工具池必须裁剪（否则系统提示让模型编排、模型却仍见执行工具 = 半激活）")
             .containsExactlyInAnyOrder(
                 "Agent", "TaskStop", "SendMessage",
                 "github.com.mycorp.subscribe_pr_activity",
                 "pr_events.unsubscribe_pr_activity")
-            .doesNotContain("Bash", "Read", "Edit", "WebSearch", "mcp__random.server.tool");
+            .doesNotContain("StructuredOutput", "Bash", "Read", "Edit", "WebSearch", "mcp__random.server.tool");
     }
 
     @Test
@@ -366,7 +369,7 @@ class CoordinatorModeUnifiedGateTest {
         return SubagentExecutor.maybeStartSummary(
             path, null, svc, coordinator, false, "unified-gate-agent", tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null, null,
+            null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
     }
 

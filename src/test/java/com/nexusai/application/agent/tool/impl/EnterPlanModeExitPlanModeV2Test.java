@@ -62,7 +62,7 @@ class EnterPlanModeExitPlanModeV2Test {
             appState.putAll(next);
         };
         ToolUseContext base = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             tpc, PermissionMode.DEFAULT, Map.of(), false, "", Path.of("."),
             null, null, null, get, set, m -> {}, s -> {});
@@ -131,7 +131,9 @@ class EnterPlanModeExitPlanModeV2Test {
         // [IMP-F 2026-08-22] 修正：isToolErrorData 只识别登记前缀（Error:/No-op: 等），
         // "EnterPlanMode tool cannot be used in agent contexts" 不命中 → 该断言恒 false（旧缺陷）。
         // 拒绝语义由下方 contains 断言锁定（CC EnterPlanModeTool.ts:79 'cannot be used in agent contexts'）。
-        assertThat((String) ((ToolResult<?>) r).data())
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError；结构判定后该拒绝才真正被识别为失败。
+        assertThat(LlmAgentLoop.isToolErrorData(((ToolResult<?>) r).data())).isTrue();
+        assertThat(String.valueOf(((ToolResult<?>) r).data()))
             .as("子 agent 上下文必须拒绝（CC EnterPlanModeTool.ts:78-80）")
             .contains("EnterPlanMode tool cannot be used in agent contexts");
     }

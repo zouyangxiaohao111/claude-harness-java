@@ -123,7 +123,7 @@ public class CronIdleExecutor {
      *
      * <p><b>[OD-D7] 消费侧收窄后三个使用点</b>：① {@link #poll} mainThreadConsumable 谓词逐条跳过
      * cron workload 项（门关不再冻结整段 poll）；② {@link #surfaceMissedAtStartup} missed 表面 gate
-     * （保留）；③ TestJob.fire producer gate（OPD-Cron-07-h「关闭后已注册任务立即停止」，保留，
+     * （保留）；③ AgentJob.fire producer gate（OPD-Cron-07-h「关闭后已注册任务立即停止」，保留，
      * 属另一文件）。CC 队列消费（queueProcessor.ts:52-87 / useQueueProcessor.ts:48-67）零 cron 引用。
      */
     @Autowired(required = false) private CronEnabledGates cronGates;
@@ -152,6 +152,22 @@ public class CronIdleExecutor {
      * 调度业务门面 — 启动 missed 表面编排（CRON-F5）。null（未注入）→ 跳过启动表面并 warn。
      */
     @Autowired(required = false) private ScheduleService scheduleService;
+
+    /** [V306] 运行记录收口（schedule_runs）· null → 不记录（非 Spring 夹具）。 */
+    @Autowired(required = false)
+    private com.nexusai.application.schedule.ScheduleRunsService runsService;
+    /**
+     * [sendmessage-cross-session · B] 运行期适配器：peer 项消费前复核（revalidate）/ 非 ACCEPT 回写 held /
+     * peer structuredOutput 投影。null（非 Spring 单测）→ peer 项按「未接线」一律不消费（留在队列）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerRuntimeAdapter peerRuntimeAdapter;
+    /**
+     * [sendmessage-cross-session · B] live endpoint 注册表：空闲路径 peer 项的「目标存活」判据
+     * （⛔ 不拿 DB 历史当 live；DB 可见 ≠ 可投递）。null → 回落 DB 行存在性（仅单测）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.messaging.PeerSessionRegistry peerSessionRegistry;
     /**
      * [P3 事件驱动] 队列变更 → 立即消费的合并闸 · 防止 onQueueChanged 自触发风暴（poll 内
      *   dequeueAllMatching 再 fire → processing=true 吞掉）与突发并发。cronExecutor core=1 串行
@@ -763,7 +779,7 @@ public class CronIdleExecutor {
         // isKilled (cronScheduler.ts:231) 只 gate 调度 tick（cron 项是否 fire 入队）。原实现把门放在
         // poll() 顶部 → 门关冻结整段 poll（busy-queued/task-notification 空闲消费也被停）属自创过宽。
         // OD-D7 收窄：cron skip 下沉到 mainThreadConsumable 谓词（下方逐条跳过 WORKLOAD_CRON 项），
-        // 非 cron 命令照常消费（门关不空转）。TestJob.fire producer gate（OPD-Cron-07-h「关闭后已注册
+        // 非 cron 命令照常消费（门关不空转）。AgentJob.fire producer gate（OPD-Cron-07-h「关闭后已注册
         // 任务立即停止」）保留 —— 本处只管消费侧语义。
         // 三闸 2: 队列非空（对齐 useQueueProcessor.ts:51 queueSnapshot.length === 0）
         if (!notificationQueue.hasCommandsInQueue()) {
@@ -787,7 +803,7 @@ public class CronIdleExecutor {
         //   （headless，CronIdleExecutor 代跑）；SESSION 命令必须会话存活（会话已关 → 不消费）。
         //   理由选 boundProject 判别而非新增 durable 标记：boundProject 已区分两 scope 语义
         //   （DURABLE 项目锚 / SESSION 走 sessionId 恢复路径），新增字段会扩大 QueueItem 构造面
-        //   （8 个兼容构造 + normalizePriority + TestJob 入队），收益仅覆盖「会话无绑定项目」的
+        //   （8 个兼容构造 + normalizePriority + AgentJob 入队），收益仅覆盖「会话无绑定项目」的
         //   罕见边角（DURABLE 在未绑定项目会话中创建 → boundProject=null 被误判 SESSION，
         //   SessionKeys.originalKey 仍可反解，运行路径不受影响，登记 concern）。
         Predicate<NotificationQueue.QueueItem> mainThreadConsumable = cmd -> {
@@ -795,7 +811,7 @@ public class CronIdleExecutor {
             // [OD-D7] cron 开关收窄 · 门关仅跳过 cron workload 项，busy-queued/task-notification 照常
             //   空闲消费（对齐 CC：queueProcessor.ts:52-87 / useQueueProcessor.ts:48-67 队列消费零 cron
             //   引用；isKilled 只 gate 调度 tick cronScheduler.ts:231）。判别样式 = mode=prompt +
-            //   workload='cron'（TestJob fire 入队唯一样式，探查已证）。cron 项被 skip 后留队列
+            //   workload='cron'（AgentJob fire 入队唯一样式，探查已证）。cron 项被 skip 后留队列
             //   （producer gate 已停 fire，存量项等门开或由 missed surface 兜底）。null 未注入 →
             //   fail-open 视为开（不 skip）。log.debug 记录每次 skip（原整段 warn 改为逐条 debug）。
             if (cronGates != null && !cronGates.isKairosCronEnabled()
@@ -816,6 +832,19 @@ public class CronIdleExecutor {
             //   M1 改虚拟线程后提交不再全序 ⇒ 同会话可在缺口内被连续出队两批（TOCTOU）。
             //   逐条跳过语义不变（修饿死：跳过运行中会话的命令，空闲会话照常处理）。
             if (LlmAgentLoop.isSessionActive(target)) return false;   // 目标会话活跃（dispatching/running）→ 逐条跳过
+            // [sendmessage-cross-session · B] peer 项（peerEnvelope 非 null）专属空闲判定：
+            //   目标必须<b>仍 live</b>（registry 真源）且不处于 closing —— DB 行存在 ≠ 可投递
+            //   （已关闭/代次失效的会话不得被唤醒）。目标运行中已由上一行 isSessionActive 跳过。
+            //   registry 未接线（非 Spring 单测）→ 回落 DB 行存在性（保持既有 SESSION 语义）。
+            if (cmd.peerEnvelope() != null) {
+                com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+                if (registry != null) {
+                    return registry.resolve(cmd.sessionId())
+                        .map(s -> s.accepting() && !s.closing())
+                        .orElse(false);
+                }
+                return isSessionAlive(cmd.sessionId());
+            }
             if (cmd.sessionId() == null) return true;                 // 全局空闲 → 本执行器消费
             if (cmd.boundProject() != null && !cmd.boundProject().isBlank()) {
                 return true;                                          // DURABLE（项目锚）：空闲/已关照常消费（3c）
@@ -895,7 +924,7 @@ public class CronIdleExecutor {
      * <p><b>值域</b>（与 {@code MessageUsageEvent.SOURCE_*} 同）：
      * <ul>
      *   <li>{@code MODE_TASK_NOTIFICATION}（后台任务完成通知）→ {@code background}；</li>
-     *   <li>{@code workload == WORKLOAD_CRON}（TestJob 定时 fire，mode=prompt）→ {@code background}；</li>
+     *   <li>{@code workload == WORKLOAD_CRON}（AgentJob 定时 fire，mode=prompt）→ {@code background}；</li>
      *   <li>其余（busy-queued 用户排队消息 = mode=prompt + workload=busy-queued）→ {@code user}。</li>
      * </ul>
      *
@@ -908,11 +937,51 @@ public class CronIdleExecutor {
      * @return {@code background} / {@code user}（缺省用户来源，不隐藏既有数据）
      */
     static String usageSourceOf(NotificationQueue.QueueItem cmd) {
+        // [sendmessage-cross-session · B] peer 项（其他会话投递 → 目标会话空闲代跑）= 后台来源
+        //   （不是本会话用户自己的请求）：判据 = workload="peer-message"（投递侧唯一 workload 标记）。
         boolean background = NotificationQueue.MODE_TASK_NOTIFICATION.equals(cmd.mode())
-            || NotificationQueue.WORKLOAD_CRON.equals(cmd.workload());
+            || NotificationQueue.WORKLOAD_CRON.equals(cmd.workload())
+            || "peer-message".equals(cmd.workload());
         return background
             ? com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_BACKGROUND
             : com.nexusai.eventbus.ws.MessageUsageEvent.SOURCE_USER;
+    }
+
+    /**
+     * [V306] cron 回合注入的执行提示 —— 告诉模型「有值得说的才汇报」。
+     *
+     * <h2>为什么必须注入</h2>
+     * cron run 的 {@code RunRequest.systemPrompt} 原本是 {@code null}，模型拿到用户填的
+     * prompt 就干活，<b>干完可能直接结束，根本不知道有 {@code SendUserMessage} 这个出口</b>
+     * ⇒「任务跑完 → IM 通知」在第一步就断了（没有消息可投递）。
+     *
+     * <h2>为什么措辞必须带「没有就安静结束」</h2>
+     * 用户裁定（2026-11-16）：<b>推不推由 AI 判断</b>，不是「跑完必推」——
+     * 「有些定时任务是扫描到什么就通知用户」。所以这里是<b>授权</b>而不是<b>要求</b>：
+     * <ul>
+     *   <li>扫描类任务：扫到命中项才说，没扫到就结束（不打扰）</li>
+     *   <li>汇报类任务：整理完给一条摘要</li>
+     *   <li>失败：带错误原因汇报</li>
+     * </ul>
+     * 若写成「完成后必须汇报」，模型会退化成机械地每次都推。
+     *
+     * <p><b>为什么只对 cron 注入</b>：{@code task-notification}（子代理/后台任务完成通知）
+     * 本身已经是消息，再注入会让模型重复转述；{@code busy-queued} 是用户排队的原话，
+     * 用户就在场。只有 cron 是「无人值守发起」的场景。
+     *
+     * @param cmd 队列命令
+     * @return 注入的 systemPrompt；非 cron 回合 → {@code null}（保持原行为）
+     */
+    static String cronSystemPromptOf(NotificationQueue.QueueItem cmd) {
+        if (!NotificationQueue.WORKLOAD_CRON.equals(cmd.workload())) {
+            return null;
+        }
+        return "这是一次定时任务的执行。\n"
+            + "\n"
+            + "如果这次执行有值得用户知道的内容（扫描到命中项、发现了问题、完成了有价值的处理），"
+            + "用 SendUserMessage(status='proactive') 简明汇报：一两句话讲清做了什么、结果如何。\n"
+            + "\n"
+            + "如果没有任何值得说的内容，直接结束，不要为了汇报而汇报。";
     }
 
     /**
@@ -988,11 +1057,11 @@ public class CronIdleExecutor {
         //   取值顺序 = uuidsOf 先（纯映射，最不可能抛）。
         List<String> batchUuids;
         String reserveKey;
-        java.util.concurrent.atomic.AtomicBoolean reservedFlag;
+        java.util.concurrent.atomic.AtomicReference<LlmAgentLoop.SessionClaim> claimRef;
         try {
             batchUuids = uuidsOf(commands);
             reserveKey = resolveSessionUuid(commands.isEmpty() ? null : commands.get(0).sessionId());
-            reservedFlag = new java.util.concurrent.atomic.AtomicBoolean(false);
+            claimRef = new java.util.concurrent.atomic.AtomicReference<>();
         } catch (RuntimeException | Error e) {
             // 回队失败自身也回队不了（队列写失败）时由 requeueAfterDispatchFailure 内如实 ERROR 留痕。
             requeueAfterDispatchFailure(commands, List.of(),
@@ -1010,16 +1079,21 @@ public class CronIdleExecutor {
                     "出队后复核 canDispatch()==false: " + dispatchBlockReason(), null);
                 return;
             }
-            boolean reserved = LlmAgentLoop.reserve(reserveKey);
-            reservedFlag.set(reserved);
-            if (!reserved && log.isWarnEnabled()) {
-                // 保留失败（该会话已 running 或已被前一批 dispatching 占住）= TOCTOU 窗口被撞上。
-                // 策略：**照常执行**（绝不丢件 —— 丢件是本事故的原症状），只记录「本批未占位」
-                // （并发窗口与改动前相同，不新增退化）。
-                log.warn("CronIdleExecutor: [M2] 会话保留占位失败（已 running / 已 dispatching）"
-                        + " reserveKey={} 条数={} uuids={} —— 本批照常执行但不占位（防丢件）",
-                    reserveKey, commands.size(), uuidsOf(commands));
+            // [sendmessage-cross-session · B] 共享起轮权（LlmAgentLoop.tryClaim）：
+            //   判据 = running / dispatching / 已持有 claim 三态（与主轮入口同一真源）。
+            //   ⛔ 取得失败必须<b>整批回队</b>并 return —— 绝不「reserve 失败仍执行」
+            //   （那会导致同会话并发起两个 run：主轮与空闲消费各一份）。
+            //   旧 reserve/cancelReservation 兼容壳仍在（内部同一 per-session 锁），本方法改走 claim。
+            LlmAgentLoop.SessionClaim claim = LlmAgentLoop.tryClaim(reserveKey);
+            if (claim == null) {
+                requeueAfterDispatchFailure(commands, batchUuids,
+                    "会话起轮权已被占用（running/dispatching/claim）reserveKey=" + reserveKey, null);
+                log.warn("CronIdleExecutor: tryClaim 失败（会话非空闲）→ 整批回队不执行 "
+                        + "reserveKey={} 条数={} uuids={}",
+                    reserveKey, commands.size(), batchUuids);
+                return;
             }
+            claimRef.set(claim);
             long submittedAtMs = System.currentTimeMillis();
             String submittedBy = Thread.currentThread().getName();
             java.util.concurrent.atomic.AtomicBoolean started =
@@ -1088,6 +1162,14 @@ public class CronIdleExecutor {
                 //   剩余条目才回队（见任务体 catch (Throwable)）。
                 consumedCursor.set(ci + 1);
                 try {
+                    // [sendmessage-cross-session · B] peer 项（peerEnvelope 非 null）专属消费：
+                    //   revalidate → 落库 → 幂等推完整行 → 带 origin 起轮。
+                    //   ⛔ HOLD/REFUSE 不落库、不入历史、不起轮；且与 cron/busy 落库/推送分支互斥
+                    //   （peer 正文绝不能被当作用户原文塞进模型）。
+                    if (cmd.peerEnvelope() != null) {
+                        handlePeerQueuedItem(cmd);
+                        continue;
+                    }
                     // [queue-first B3 改] 先推 queue.drained 再 runOneAgentLoop —— [streamTopic-session-level]
                     //   前端已订阅会话级 /topic/sessions/{sid}/stream（单一订阅），drained[].streamTopic
                     //   恒为会话 topic（emitDrained 恒派生，无新订阅地址）；runOneAgentLoop 阻塞到整轮
@@ -1275,11 +1357,13 @@ public class CronIdleExecutor {
                 //   :617 userInvocable 拒绝、:673 slash 终态）/ 正常走完 / 任何 RuntimeException。
                 //   ⛔ 漏一条 = 该会话永久 dispatching ⇒ **新的静默卡死**（本批最需要防的退化）。
                 //   ⛔ 仅当本次 reserve 成功才释放（reserve 失败的批次不得误清他人保留）。
-                //   [B2] 用 reservedFlag holder（裸局部变量非 effectively-final，lambda 不可捕获）+
-                //   getAndSet(false) 保证**恰好释放一次**（提交侧 catch 与任务体 finally 双路径，
-                //   后者先跑时前者不得再清一次 —— 否则会误清本批之后他人的保留）。
-                if (reservedFlag.getAndSet(false)) {
-                    LlmAgentLoop.cancelReservation(reserveKey);
+                //   [B2] 用 claimRef holder（裸局部变量非 effectively-final，lambda 不可捕获）+
+                //   getAndSet(null) 保证**恰好释放一次**（提交侧 catch 与任务体 finally 双路径，
+                //   后者先跑时前者不得再清一次 —— 否则会误清本批之后他人的 claim）。
+                //   releaseClaim 只删**同代次实例**（旧 finally 不会删掉后来者刚取得的 claim）。
+                LlmAgentLoop.SessionClaim finishedClaim = claimRef.getAndSet(null);
+                if (finishedClaim != null) {
+                    LlmAgentLoop.releaseClaim(finishedClaim);
                 }
             }
             });
@@ -1304,8 +1388,9 @@ public class CronIdleExecutor {
             //   ⛔ 仅当**未成功提交**才释放（已提交 = 任务体在跑，由其 finally 释放；此处误清会
             //   提前放开保留 ⇒ 同会话并发）。
             if (!submitted) {
-                if (reservedFlag.getAndSet(false)) {
-                    LlmAgentLoop.cancelReservation(reserveKey);
+                LlmAgentLoop.SessionClaim unreleased = claimRef.getAndSet(null);
+                if (unreleased != null) {
+                    LlmAgentLoop.releaseClaim(unreleased);
                 }
                 // [P1 · 2026-09-18 返工] 提交失败 ⇒ 整批**回队**（条目不消失）+ 开事件驱动抑制窗口。
                 //   ⛔ 原实现只有 log.error + rethrow ⇒ 条目「已出队、永不会再跑」= 静默丢件
@@ -1319,6 +1404,127 @@ public class CronIdleExecutor {
             log.error("CronIdleExecutor: 提交执行器失败（未成功提交则已就地释放保留态并**回队**）"
                     + "reserveKey={} uuids={}: {}", reserveKey, batchUuids, e.toString(), e);
             throw e;
+        }
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 空闲路径消费一条 peer 项（{@code peerEnvelope != null}）。
+     *
+     * <h2>顺序（不可提前产生副作用）</h2>
+     * <ol>
+     *   <li><b>消费前复核</b>：{@code PeerRuntimeAdapter.revalidateForConsumption}（同一判据：当前设置 +
+     *       接收方当前有效模式）。{@code HOLD} → 回写 held 存储（{@code DbHeldPeerStore} 注入，未审批
+     *       不得入历史/入模型）；{@code REFUSE} → 丢弃并记日志。<b>两者都不落库、不入历史、不起轮。</b></li>
+     *   <li><b>落库</b>：{@code MessageService.createQueuedUserMessage} 11 参重载（author=来源
+     *       sessionId、subtype=agent_message、structuredOutput=peer_source 投影、queued_origin=peer、
+     *       is_meta=true、content=原文不预包壳）。同 id 幂等（空闲先落库、turn-0 drain 再 append 同一 id）。
+     *       落库失败 → 记 ERROR 并<b>不起轮、不推送成功行</b>。</li>
+     *   <li><b>推送</b>：提交后 {@code message.insert} 完整行 DTO（与 GET 同 id / 同来源 / 同 subtype）；
+     *       另保留既有 {@code message.user} 锚点（同 id，前端幂等）。</li>
+     *   <li><b>起轮</b>：{@code RunRequest.withPeerExecutionOrigin(origin)}；usage 记 background
+     *       （{@link #usageSourceOf} 已含 peer-message）。</li>
+     * </ol>
+     *
+     * @param cmd peer 队列项（peerEnvelope 非 null）
+     */
+    private void handlePeerQueuedItem(NotificationQueue.QueueItem cmd) {
+        com.nexusai.application.agent.messaging.PeerEnvelope envelope = cmd.peerEnvelope();
+        String targetSession = cmd.sessionId();
+        com.nexusai.application.agent.messaging.PeerRuntimeAdapter adapter = peerRuntimeAdapter;
+        if (adapter == null) {
+            // 未接线（非 Spring 夹具）：revalidate 无法执行 ⇒ 按 HOLD 语义不消费（⛔ 绝不放行裸 peer 文本）。
+            log.error("CronIdleExecutor: peer 项消费被拒（PeerRuntimeAdapter 未接线，无法 revalidate）"
+                    + " messageId={} target={} —— 不落库、不入历史、不起轮",
+                envelope.messageId(), targetSession);
+            return;
+        }
+        com.nexusai.application.agent.messaging.PeerInboundPolicy.Outcome outcome =
+            adapter.revalidateForConsumption(envelope, targetSession);
+        if (outcome.decision() != com.nexusai.application.agent.messaging.PeerInboundPolicy.Decision.ACCEPT) {
+            if (outcome.decision() == com.nexusai.application.agent.messaging.PeerInboundPolicy.Decision.HOLD) {
+                adapter.holdRevalidated(targetSession, envelope, cmd.value(), outcome);
+                log.info("CronIdleExecutor: peer 项消费前复核 HOLD → 回写 held（不落库/不入历史/不起轮）"
+                        + " target={} messageId={} reason={}",
+                    targetSession, envelope.messageId(), outcome.reason());
+            } else {
+                log.warn("CronIdleExecutor: peer 项消费前复核 REFUSE → 丢弃（不落库/不入历史/不起轮）"
+                        + " target={} messageId={} detail={}",
+                    targetSession, envelope.messageId(), outcome.detail());
+            }
+            return;
+        }
+        com.nexusai.application.agent.messaging.PeerExecutionOrigin origin =
+            com.nexusai.application.agent.messaging.PeerRuntimeAdapter.originOf(envelope);
+        String userMessageId = cmd.uuid();
+        String streamTopicForSession = targetSession != null
+            ? "/topic/sessions/" + targetSession + "/stream" : null;
+        if (messageService != null && targetSession != null && !targetSession.isBlank()) {
+            MessageCreatedResponse created;
+            boolean existed;
+            try {
+                existed = userMessageId != null && messageService.existsById(userMessageId);
+                created = messageService.createQueuedUserMessage(
+                    targetSession, userMessageId, cmd.value(), OffsetDateTime.now(),
+                    true /* isMeta：peer 行 UI 隐藏、模型可见 */,
+                    "peer" /* queued_origin */,
+                    null /* imagePasteIds */, null /* userAttachments */,
+                    origin.sourceSessionId(), "agent_message",
+                    com.nexusai.application.agent.messaging.PeerRuntimeAdapter.structuredOutput(
+                        origin, envelope.summary()));
+                if (created != null && created.userMessageId() != null) {
+                    userMessageId = created.userMessageId();
+                }
+            } catch (Exception e) {
+                // ⛔ 落库失败不得吞成成功，也不得随后推送成功行 → 不起轮（显式 ERROR 留痕）。
+                log.error("CronIdleExecutor: peer 行落库失败 → 不推送成功行、不起轮"
+                        + " target={} messageId={} err={}",
+                    targetSession, userMessageId, e.toString(), e);
+                return;
+            }
+            // [缺陷1 · 状态机] 已批准消息真正写入历史 ⇒ held 行 approved → accepted。
+            // 落库失败/未接线时不调用 ⇒ 行保持 approved（列表可见、可再次批准），不丢件。
+            adapter.markConsumed(envelope);
+            // 提交后：message.insert 完整行（与 GET 同 id / 同来源 / 同 subtype / 同时间）。
+            if (!existed) {
+                try {
+                    com.nexusai.model.session.dto.ChatMessageDto row = messageService.getById(userMessageId);
+                    sendAndLog(wsTemplate, streamTopicForSession,
+                        new com.nexusai.eventbus.ws.MessageInsertEvent(targetSession, List.of(row)),
+                        "message.insert peer=" + userMessageId);
+                    if (log.isInfoEnabled()) {
+                        log.info("CronIdleExecutor: peer 行已落库并推送 message.insert 完整行 target={} id={} "
+                                + "author={} subtype=agent_message queuedOrigin=peer isMeta=true",
+                            targetSession, userMessageId, origin.sourceSessionId());
+                    }
+                } catch (Exception e) {
+                    // 已落库（DB 已提交）；推送失败只记 WARN（对账层 GET 兜底），不得反向改判落库失败。
+                    log.warn("CronIdleExecutor: peer message.insert 推送失败（已落库，GET 兜底）target={} id={}: {}",
+                        targetSession, userMessageId, e.toString());
+                }
+            }
+            // 既有 message.user 锚点（该轮 assistant 流式块归属；同 id 前端幂等）。
+            if (chatService != null) {
+                try {
+                    chatService.publishUserMessageEvent(targetSession, userMessageId, cmd.value(), true,
+                        streamTopicForSession, wsTemplate);
+                } catch (Exception e) {
+                    log.warn("CronIdleExecutor: peer message.user 锚点推送失败 target={} id={}: {}",
+                        targetSession, userMessageId, e.toString());
+                }
+            }
+        }
+        runOneAgentLoop(cmd, origin);
+    }
+
+    /** 推 STOMP（null 模板 → 仅日志；与 ChatService.sendAndLog 同语义的最小等价物）。 */
+    private static void sendAndLog(org.springframework.messaging.simp.SimpMessagingTemplate ws,
+                                   String topic, Object payload, String what) {
+        if (ws == null || topic == null) {
+            return;
+        }
+        ws.convertAndSend(topic, payload);
+        if (log.isInfoEnabled()) {
+            log.info("CronIdleExecutor: 推送 {} topic={}", what, topic);
         }
     }
 
@@ -1338,7 +1544,7 @@ public class CronIdleExecutor {
      *
      * <p><b>[批次X Q2 + 批 1 · 方向 C]</b>（DURABLE 项目锚 · 对齐 CC durable 文件位置锚项目）：
      * SESSION 任务走 {@code cmd.sessionId()} 恢复（会话仍存活才可命中 boundProject）；DURABLE 任务锚从
-     * {@code cmd.boundProject()}（V23 bound_project 列，TestJob fire 经 QueueItem 透传）取 ——
+     * {@code cmd.boundProject()}（V23 bound_project 列，AgentJob fire 经 QueueItem 透传）取 ——
      * <b>[批 1]</b> 非空时经 {@link RunRequest#withBoundProject(String)} 挂到本 run 的
      * {@link RunRequest} 上（<b>显式值传参</b>：对齐 CC 把 cwd 作为值带在队列命令上
      * useScheduledTasks.ts:52/:110 {@code currentDir: getCwd()}；CC 的
@@ -1370,7 +1576,19 @@ public class CronIdleExecutor {
      * cronTranscriptSessionKeyOverride 已删，SessionStorage ThreadLocal override 已删）。
      */
     private void runOneAgentLoop(NotificationQueue.QueueItem cmd) {
-        runAgentLoop(cmd, null, null);
+        runAgentLoop(cmd, null, null, null);
+    }
+
+    /**
+     * [sendmessage-cross-session · B] peer 回合重载：来源随 RunRequest 显式下传
+     * （{@code RunRequest.withPeerExecutionOrigin} → base TUC → per-turn TUC 守卫可读）。
+     *
+     * @param cmd    队列项
+     * @param origin 服务端类型化来源（peerEnvelope 派生，非模型自报）；null = 非 peer 回合
+     */
+    private void runOneAgentLoop(NotificationQueue.QueueItem cmd,
+                                 com.nexusai.application.agent.messaging.PeerExecutionOrigin origin) {
+        runAgentLoop(cmd, null, null, origin);
     }
 
     /**
@@ -1380,7 +1598,12 @@ public class CronIdleExecutor {
      *                       null → 主模型
      */
     private void runOneAgentLoop(NotificationQueue.QueueItem cmd, String modelOverride) {
-        runAgentLoop(cmd, modelOverride, null);
+        runAgentLoop(cmd, modelOverride, null, null);
+    }
+
+    /** 3 参兼容壳（非 peer）：origin = null。 */
+    private void runAgentLoop(NotificationQueue.QueueItem cmd, String modelOverride, List<String> extraPrompts) {
+        runAgentLoop(cmd, modelOverride, extraPrompts, null);
     }
 
     /**
@@ -1413,9 +1636,15 @@ public class CronIdleExecutor {
      * @param cmd           首条命令（批量 = 首条；单条 = 该条）
      * @param modelOverride 技能级 model 覆盖（CC processSlashCommand.tsx:917）；null → 主模型
      * @param extraPrompts  批量模式下后续 N-1 条原文；null/空 = 单条模式
+     * @param peerOrigin    [sendmessage-cross-session · B] peer 回合来源；null = 非 peer
      */
-    private void runAgentLoop(NotificationQueue.QueueItem cmd, String modelOverride, List<String> extraPrompts) {
+    private void runAgentLoop(NotificationQueue.QueueItem cmd, String modelOverride, List<String> extraPrompts,
+                              com.nexusai.application.agent.messaging.PeerExecutionOrigin peerOrigin) {
         LlmAgentLoop loop = loopProvider.getObject();
+        // [non-interactive 2026-11-20] 本入口 = headless（无 WS streamContext 的 cron 空闲代跑 /
+        //   队列 drain，等价 CC -p / 后台会话）⇒ 显式置非交互：结构化输出注入门（jsonSchema 且
+        //   非交互/后台）据此放行，且不会给交互式会话打开同一通道。prototype bean ⇒ 不跨 run 泄漏。
+        loop.setNonInteractiveSession(true);
         if (tokenBudgetChecker != null) loop.setTokenBudgetChecker(tokenBudgetChecker);
         if (queryConfig != null) loop.setQueryConfig(queryConfig);
         if (memoryStorage != null) loop.setMemoryStorage(memoryStorage);
@@ -1564,11 +1793,22 @@ public class CronIdleExecutor {
             //   ⛔ 不得退回任何硬编码 null permissionModeCli 的便捷重载 —— 那会声明
             //   NOT_APPLICABLE 却携带真实会话 ⇒ LlmAgentLoop 守护 WARN（批 A4b 型缺陷）。
             req = RunRequest.sessionFromSessionOverride(
-                promptValue, sessionUuid, null, config, modelName, null,
+                promptValue, sessionUuid, null, config, modelName,
+                cronSystemPromptOf(cmd),
                 effectivePermissionMode, false, null, cmd.attachments());
             log.info("CronIdleExecutor: 启动 agent_loop, mode={}, prompt长度={}, model={}, sessionId={}, attachments={}, permissionMode={}",
                 cmd.mode(), promptValue.length(), modelName, sessionUuid,
                 cmd.attachments() == null ? 0 : cmd.attachments().size(), effectivePermissionMode);
+        }
+        // [sendmessage-cross-session · B] peer 回合：来源随 RunRequest 显式下传（服务端类型化载体）。
+        //   doRun 把它写进 state + base TUC → per-turn TUC（守卫判据）；首条 prompt 由
+        //   LlmAgentLoop 以同一信封入队走 turn-0 drain（同一投影 + 同一 formatter），⛔ 绝不裸文本起轮。
+        if (peerOrigin != null) {
+            req = req.withPeerExecutionOrigin(peerOrigin);
+            log.info("CronIdleExecutor: peer 回合来源已挂载 RunRequest from={} messageId={} hopChain={}"
+                    + "（守卫读 per-turn TUC，不读队列文本）session={}",
+                peerOrigin.sourceSessionId(), peerOrigin.messageId(), peerOrigin.hopChain().size(),
+                sessionUuid);
         }
         // [批 1 · 方向 C] DURABLE 项目锚显式传参（QueueItem.boundProject → RunRequest.boundProject）：
         //   本 run 的 cwd / memory 项目身份由【值】承载、跨线程可见，替代原两条 ThreadLocal 通道
@@ -1592,6 +1832,17 @@ public class CronIdleExecutor {
         } else {
             log.info("CronIdleExecutor: 本 run 无显式项目锚（QueueItem.boundProject 空）→ 项目根由 sessionId 解析"
                     + "（session={} mode={}，值未缺失，非跳过）", sessionId, cmd.mode());
+        }
+        // [V306] 定时任务通知目标显式传参（QueueItem.notifyChats → RunRequest.notifyChats）：
+        //   本 run 的 agent 若调 SendUserMessage(status='proactive')，消息就该推给这些聊天。
+        //   ⚠️ 不能靠「按 sessionId 反查任务」拿：B 形态（每次新建会话）**不回填** session_id
+        //      ⇒ 反查恒空 ⇒ B 形态永远通知不到 ⇒ 必须显式随队列项下传（值随调用直传，非 ThreadLocal）。
+        //   缺值语义：null / 空白 = 未配置通知目标（合法跳过，不告警 —— 普通 cron 恒如此）。
+        if (cmd.notifyChats() != null && !cmd.notifyChats().isBlank()) {
+            req = req.withNotifyChats(cmd.notifyChats());
+            log.info("CronIdleExecutor: 通知目标已挂载 RunRequest notifyChats={} mode={} sessionId={}"
+                    + "（V306：仅 agent 主动发起 SendUserMessage(status='proactive') 时才推）",
+                cmd.notifyChats(), cmd.mode(), sessionId);
         }
         // [queue-first B3] 真实会话命令 → 注入 streamContext（镜像 ChatService.processUserMessage
         //   setStreamContext：wsTemplate + sessionId + userMessageId），否则助手回复不推 STOMP 前端收不到。
@@ -1687,9 +1938,31 @@ public class CronIdleExecutor {
         //   ⇒ 无从终止。thinking/idle 成对推且 idle 放 finally（且恒为【最后】一条，见下方 A2 注释）
         //   ⇒ run 抛异常也不会把前端永久留在「运行中」。
         pushSessionStatus(wsTemplate, sessionUuid, cmd.uuid(), "thinking", "drain run 起轮");
+        // [peer-heartbeat] 空闲消费路径本轮开始 → 刷新 endpoint 最近活动时间（带当前代次；
+        //   未登记/代次不符 = no-op，不复活已注销端点）。失败只记日志，不阻断 run。
+        heartbeatPeerEndpoint(cmd.sessionId());
         AgentState runState;
         try {
             runState = loop.run(req);
+
+            // [V306] 运行记录收口：run 真正结束时才定 status（替换原来的假信号 ——
+            //   lastRunStatus 是在 enqueue 那一刻就写 ok 的，跑崩了也显示成功）。
+            //   三条分支与设计稿 4.5 一致：cancelled（用户点停止）/ error / ok。
+            if (runsService != null && cmd.scheduleId() != null && !cmd.scheduleId().isBlank()) {
+                try {
+                    String runStatus = runState == null ? "error"
+                        : runState.cancelled() ? "cancelled"
+                        : (runState.lastError() != null && !runState.lastError().isBlank()) ? "error"
+                        : "ok";
+                    String summary = runState == null ? null : runState.lastAssistant();
+                    String err = runState == null ? "run 返回 null（未产生 AgentState）" : runState.lastError();
+                    runsService.finishLatestRunning(
+                        cmd.scheduleId(), runStatus, summary, err, sessionUuid);
+                } catch (Exception e) {
+                    log.error("CronIdleExecutor: V306 运行记录收口失败 schedule={}: {}",
+                        cmd.scheduleId(), e.toString(), e);
+                }
+            }
 
             // [C6 · A2 · 事件顺序] 收口（解除落库监听 + complete + title）必须先于 idle 推送 ——
             //   与主路径 ChatService.runAgentLoop 同序（complete :1120 → idle :1131 finally）。
@@ -1752,6 +2025,37 @@ public class CronIdleExecutor {
             // idle 恒在此推（run 抛异常也不把前端永久留在「运行中」），但必须【最后】推 ——
             //   顺序契约见上方注释（与主路径一致）。
             pushSessionStatus(wsTemplate, sessionUuid, cmd.uuid(), "idle", "drain run 收口");
+            // [peer-heartbeat] 本轮结束 → 再刷一次活动时间（本轮耗时也计入「最近活动」）。
+            heartbeatPeerEndpoint(cmd.sessionId());
+        }
+    }
+
+    /**
+     * [peer-heartbeat] 空闲消费路径（排队命令 / cron / task-notification）的本轮活动心跳。
+     *
+     * <p>空闲路径不持有 ChatService 的 endpoint 句柄表 ⇒ 按注册表<b>当前代次</b>取 epoch 再心跳；
+     * 会话未登记（非跨会话会话 / headless）直接跳过。代次在此刻被替换 ⇒ 心跳自然 no-op
+     * （不会复活已注销端点）。异常只记日志，不阻断 run。
+     *
+     * @param sessionId 目标会话 short id（可为 null = 全局 headless，跳过）
+     */
+    private void heartbeatPeerEndpoint(String sessionId) {
+        com.nexusai.application.agent.messaging.PeerSessionRegistry registry = peerSessionRegistry;
+        if (registry == null || sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        try {
+            com.nexusai.application.agent.messaging.PeerSessionRegistry.LiveSession live =
+                registry.resolve(sessionId).orElse(null);
+            if (live == null) {
+                return;
+            }
+            if (!registry.heartbeat(sessionId, live.endpointEpoch())) {
+                log.debug("CronIdleExecutor: peer heartbeat 未生效（代次已变/已注销）session={} epoch={}",
+                    sessionId, live.endpointEpoch());
+            }
+        } catch (RuntimeException e) {
+            log.warn("CronIdleExecutor: peer heartbeat 失败 session={}: {}", sessionId, e.toString());
         }
     }
 

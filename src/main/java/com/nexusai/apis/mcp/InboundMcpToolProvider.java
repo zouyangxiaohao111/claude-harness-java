@@ -334,7 +334,7 @@ public class InboundMcpToolProvider implements ToolCallback {
                 + "（本告警仅打印一次）", com.nexusai.common.SessionKeys.NO_SESSION);
         }
         return new ToolUseContext(
-            UUID.randomUUID(),            // agentId（非会话身份：CC TUC 无 agentId，仅本仓必填槽位）
+            null,                         // agentId（CC TUC 无 agentId；无会话场景即 undefined）
             com.nexusai.common.SessionKeys.NO_SESSION,  // sessionId（显式「确无会话」哨兵，见方法 javadoc）
             PermissionMode.DEFAULT,
             Map.of(),                     // additionalWorkingDirectories

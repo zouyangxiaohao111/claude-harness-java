@@ -3,6 +3,9 @@ package com.nexusai.application.agent.plugin;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.plugin.PluginSchemas.KnownMarketplace;
 import com.nexusai.application.agent.plugin.PluginSchemas.MarketplaceSource;
+import com.nexusai.application.agent.settings.storage.ConfigStorage;
+import com.nexusai.domain.mcp.McpServerService;
+import com.nexusai.domain.settings.SettingsService;
 import com.nexusai.model.market.dto.PluginInstallRequest;
 import com.nexusai.model.market.dto.PluginInstallResult;
 import org.slf4j.Logger;
@@ -16,6 +19,8 @@ import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.nio.file.StandardCopyOption;
 import java.util.List;
+import java.util.Iterator;
+import java.util.LinkedHashMap;
 import java.util.Map;
 
 /**
@@ -44,6 +49,27 @@ public class PluginInstallService {
 
     @Autowired
     private InstalledPluginsManager installedPluginsManager;
+
+    /**
+     * [V61 · 插件卸载清理链] enabledPlugins 条目清理（DB settings 列 + {@code ~/.nexusai.json}）。
+     * required=false：未装配（测试直构）→ 跳过，不阻断卸载主流程。
+     */
+    @Autowired(required = false)
+    private SettingsService settingsService;
+
+    /**
+     * [S08 F3 · 插件卸载清理链] 删该插件贡献的 MCP server 行（{@code plugin:<name>:<server>}）。
+     * required=false：未装配（测试直构）→ 跳过，不阻断卸载主流程。
+     */
+    @Autowired(required = false)
+    private McpServerService mcpServerService;
+
+    /**
+     * [V61 · 插件卸载清理链] {@code ~/.nexusai.json} 的 enabledPlugins 键（读链的另一环）。
+     * required=false：未装配（测试直构）→ 跳过，不阻断卸载主流程。
+     */
+    @Autowired(required = false)
+    private ConfigStorage configStorage;
 
     /** 插件加载器（装完刷新 feed 缓存用）· required=false（未装配时跳过刷新，重启后生效）。 */
     @Autowired(required = false)
@@ -202,15 +228,17 @@ public class PluginInstallService {
         if (name == null || name.isBlank()) {
             return new PluginInstallResult(false, "插件名不能为空", null, name, null);
         }
-        InstalledPluginsManager.InstalledRecord rec = installedPluginsManager.list().stream()
-            .filter(r -> r != null && name.equals(r.name()))
-            .findFirst().orElse(null);
+        InstalledPluginsManager.InstalledRecord rec = findInstalledRecord(name);
         if (rec == null) {
             if (log.isInfoEnabled()) {
                 log.info("[PluginInstall] 卸载跳过：未找到已安装记录 name={}", name);
             }
             return new PluginInstallResult(false, "未找到已安装的插件：" + name, null, name, null);
         }
+        // ⚠️ 记录键可能是 name@marketplace（migrateFromEnabledPlugins 写）⇒ 卸载用**记录键**，
+        //    不是用户传的裸名（否则内存/文件里的 scoped 记录删不掉）。
+        String recordKey = rec.name();
+        String bareName = barePluginName(name);
         String path = rec.installPath();
         if (path != null && !path.isBlank()) {
             try {
@@ -231,14 +259,109 @@ public class PluginInstallService {
             }
         }
         try {
-            // 既有的数据面卸载（移除内存记录 + installed_plugins.json 条目）
-            installedPluginsManager.uninstall(name);
+            // 既有的数据面卸载（移除内存记录 + installed_plugins.json 条目）· 用记录键
+            installedPluginsManager.uninstall(recordKey);
         } catch (Exception e) {
             log.warn("[PluginInstall] 移除安装记录失败 name={}: {}", name, e.getMessage());
         }
+        // 清理链：清 enabledPlugins（DB + ~/.nexusai.json）+ 删该插件贡献的 MCP server 行
+        // ⛔ 不清 ⇒ 重启后 migrateFromEnabledPlugins 把插件重新登记成已安装 ⇒ **插件复活**
+        clearEnabledPluginEntries(bareName);
+        deletePluginMcpServers(bareName);
         // 卸载后同样要刷新（否则技能/命令仍留在内存注册表里）
         refreshPlugins();
         return new PluginInstallResult(true, "已卸载 " + name, null, name, null);
+    }
+
+    /**
+     * 找已安装记录 · <b>键空间不统一</b>：{@code addInstalledPlugin} 写裸名、
+     * {@code migrateFromEnabledPlugins} 写 {@code name@marketplace} ⇒ 裸名也要能命中 scoped 记录。
+     */
+    private InstalledPluginsManager.InstalledRecord findInstalledRecord(String name) {
+        List<InstalledPluginsManager.InstalledRecord> all = installedPluginsManager.list();
+        if (all == null) {
+            return null;
+        }
+        for (InstalledPluginsManager.InstalledRecord r : all) {
+            if (r != null && name.equals(r.name())) {
+                return r;
+            }
+        }
+        String bare = barePluginName(name);
+        if (bare.isEmpty()) {
+            return null;
+        }
+        for (InstalledPluginsManager.InstalledRecord r : all) {
+            if (r != null && bare.equals(barePluginName(r.name()))) {
+                return r;
+            }
+        }
+        return null;
+    }
+
+    /** 插件标识的「名字部分」（首个 @ 之前）· 裸名与 {@code name@marketplace} 归一。 */
+    private static String barePluginName(String pluginId) {
+        if (pluginId == null) {
+            return "";
+        }
+        int at = pluginId.indexOf('@');
+        return at > 0 ? pluginId.substring(0, at) : pluginId;
+    }
+
+    /**
+     * 清理链 ①：清 enabledPlugins（DB settings 列 + {@code ~/.nexusai.json}）。
+     *
+     * <p>不清 ⇒ 重启时 {@code migrateFromEnabledPlugins} 从 enabledPlugins 读回该插件并重新登记成已安装
+     * （installPath 指向已删目录）⇒ <b>插件复活</b>。
+     */
+    private void clearEnabledPluginEntries(String bareName) {
+        SettingsService settings = this.settingsService;
+        if (settings != null) {
+            try {
+                settings.removeEnabledPlugin(bareName);
+            } catch (Exception e) {
+                log.warn("[PluginInstall] 清除 DB enabledPlugins 失败 plugin={}: {}", bareName, e.getMessage());
+            }
+        }
+        ConfigStorage storage = this.configStorage;
+        if (storage == null) {
+            return;
+        }
+        try {
+            Object raw = storage.readSettings(List.of("enabledPlugins"));
+            if (!(raw instanceof Map)) {
+                return; // 未配置（absent）或不是 map → 无可清项
+            }
+            @SuppressWarnings("unchecked")
+            Map<String, Boolean> onDisk = new LinkedHashMap<>((Map<String, Boolean>) raw);
+            boolean changed = false;
+            for (Iterator<String> it = onDisk.keySet().iterator(); it.hasNext();) {
+                String key = it.next();
+                if (key != null && bareName.equals(barePluginName(key))) {
+                    it.remove();
+                    changed = true;
+                }
+            }
+            if (changed) {
+                storage.writeSettings(List.of("enabledPlugins"), onDisk);
+            }
+        } catch (Exception e) {
+            log.warn("[PluginInstall] 清除 ~/.nexusai.json enabledPlugins 失败 plugin={}: {}",
+                bareName, e.getMessage());
+        }
+    }
+
+    /** 清理链 ②：删该插件贡献的 MCP server 行（否则成孤儿）。 */
+    private void deletePluginMcpServers(String bareName) {
+        McpServerService mcp = this.mcpServerService;
+        if (mcp == null) {
+            return;
+        }
+        try {
+            mcp.deletePluginMcpServers(bareName);
+        } catch (Exception e) {
+            log.warn("[PluginInstall] 删除插件 MCP server 行失败 plugin={}: {}", bareName, e.getMessage());
+        }
     }
 
     /** 装完触发插件刷新：PluginLoader feed 缓存失效 + <b>重新扫描插件 agents 并入 registry</b>

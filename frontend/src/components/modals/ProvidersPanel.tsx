@@ -48,7 +48,7 @@ const EMPTY_MODEL: Model = {
   tag: 'DS',
   desc: '',
   type: 'chat',
-  maxTokens: 384000,
+  maxTokens: 128000,
   temperature: 1.0,
   topP: null,
   think: '',
@@ -471,10 +471,34 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
     setProxyDetectHandled(true)
   }
 
+  /**
+   * [保密 2026-11-22 B6] 「清空」：显式清除代理配置（不是靠留空）。
+   * 三态里 null = 未配置（回落环境变量/直连）；与「留空 + 记住」等价，但有明确按钮与提示。
+   */
+  const onClearProxy = async () => {
+    if (!proxySaved) return
+    setProxyError(null)
+    setProxySaving(true)
+    setProxyTestNote(null)
+    try {
+      const r = await putHttpProxy(null)
+      setHttpProxy(r.proxy ?? '')
+      setProxySaved(r.proxy ?? '')
+      showToast('已清除代理配置（回落环境变量/直连）', 'info')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    } finally {
+      setProxySaving(false)
+    }
+  }
+
   /** 「记住」：先实测再落库；**实测失败也照存**（用户明确要求），只把原因提示出来 */
   const onSaveProxy = async () => {
     const v = httpProxy.trim()
-    if (v !== '' && !PROXY_PATTERN.test(v)) {
+    // [保密 2026-11-22 B6] 后端 GET 只回 `user:****@host`（口令段掩码），该形态过不了
+    // PROXY_PATTERN（本来也不允许 userinfo）。未改动（=== 已保存值）时跳过格式校验，
+    // 原样回传 → 后端用哨兵换回真口令。只有用户真改了才校验。
+    if (v !== '' && v !== proxySaved.trim() && !PROXY_PATTERN.test(v)) {
       setProxyError(PROXY_FORMAT_HINT)
       return
     }
@@ -1345,6 +1369,14 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
               disabled={proxyProbing}
               onClick={() => { void onProbeProxy() }}
             >{proxyProbing ? '检测中…' : '自动检测'}</button>
+            {proxySaved ? (
+              <button
+                type="button"
+                className="pv-btn pv-btn-tint pv-btn-sm"
+                disabled={proxySaving}
+                onClick={() => { void onClearProxy() }}
+              >清空</button>
+            ) : null}
             <button
               type="button"
               className="pv-btn pv-btn-primary pv-btn-sm"

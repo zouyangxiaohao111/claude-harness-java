@@ -175,6 +175,13 @@ class AnthropicSdkProviderStreamingNonStreamingFallbackTest {
             new LlmApiException(529, Map.of(), "overloaded"), notAborted, false))
             .as("流式 529 → 回退（预置计数 1）")
             .isTrue();
+        // [quota-429] 套餐/账户额度耗尽型 429 是终态 → 不回退（回退只会再撞一次并静默退避重试）
+        assertThat(AnthropicSdkProvider.shouldUseNonStreamingFallback(
+            new LlmApiException(429, Map.of(),
+                "{\"message\":\"已达到 Token Plan 用量上限：请升级 Token Plan 套餐或购买积分补充用量。 (2056)\"}"),
+            notAborted, false))
+            .as("流式 429 额度耗尽 → 不回退（终态）")
+            .isFalse();
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -72,7 +72,7 @@ class StreamingToolExecutorDefaultExecutorLeakTest {
             // 生产同款入口：只给 registry + ctx ⇒ 走 defaultExecutor()
             StreamingToolExecutor exec = new StreamingToolExecutor(
                 new ToolRegistry().register(probe),
-                ToolUseContext.of(UUID.randomUUID(), "sess-leak-" + i));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-leak-" + i));
             exec.add(new ToolUseBlock("probe-" + i, PROBE_TOOL_NAME, JSON.createObjectNode()), null, null);
             assertThat(exec.getRemainingResults())
                 .as("第 %d 次实例化必须真的执行完探针工具", i).hasSize(1);

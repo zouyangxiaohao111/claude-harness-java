@@ -116,7 +116,7 @@ class HookSessionExplicitDerivedThreadTest {
     }
 
     private static ToolUseContext ctxOf(String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId);
     }
 
     // ════════════════════════════════════════════════════════════════════

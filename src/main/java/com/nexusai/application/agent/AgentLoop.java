@@ -86,7 +86,7 @@ public interface AgentLoop {
      */
     default java.util.stream.Stream<AgentEvent> runStream(String userPrompt,
                                                           String sessionId,
-                                                          UUID agentId,
+                                                          String agentId,
                                                           ProviderConfig config,
                                                           String modelName,
                                                           String systemPrompt) {

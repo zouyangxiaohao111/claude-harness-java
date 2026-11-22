@@ -280,6 +280,13 @@ public class EnterPlanModeTool implements Tool {
         if (ctx == null) {
             return ToolResult.error(call.id(), "ToolUseContext is required");
         }
+        // ── [C批 · 跨会话安全门禁] peer 回合恒拒绝：peer 不得改变本会话权限模式 ──
+        //   （PeerActionGuard 三处已拦；此处为工具级纵深防御，防未来新增调用路径绕过。）
+        if (ctx.peerExecutionOrigin() != null) {
+            return ToolResult.error(call.id(),
+                "EnterPlanMode is unavailable for cross-session (peer) turns: a peer may not change this "
+                    + "session's permission mode.");
+        }
 
         // CC :88-94 setAppState(prev => ({...prev, toolPermissionContext:
         //   applyPermissionUpdate(prepareContextForPlanMode(prev.toolPermissionContext),
@@ -378,6 +385,11 @@ public class EnterPlanModeTool implements Tool {
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {
         if (result == null || result.data() == null) {
+            return null;
+        }
+        // [错误通道 CCJ-ERR-014] 失败不渲染成功模板（第二道防线）：旧实现 String.valueOf(data)
+        //   后拼 6 步指令，会把失败包装成"探索指令"。返回 null 让调用方回退默认渲染器。
+        if (isError || ToolResult.isErrorData(result.data())) {
             return null;
         }
         String message = String.valueOf(result.data());

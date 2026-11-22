@@ -18,7 +18,6 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
 import java.util.concurrent.atomic.AtomicReference;
@@ -52,7 +51,7 @@ import static org.mockito.Mockito.when;
 class InteractiveRaceModelTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000001");
+    private static final String AGENT_ID = "a000000000000001";
     private static final String SESSION_ID = "00000000-0000-0000-0000-000000000002";
 
     /** 可配置 input 感知描述的工具桩（对齐 CC Tool.ts:386-393 description(input, options)）。 */

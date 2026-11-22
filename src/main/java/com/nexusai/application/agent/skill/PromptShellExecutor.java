@@ -227,7 +227,7 @@ public class PromptShellExecutor {
                                     + match.fullMatch() + "\": Permission denied");
                 }
                 // (b) 执行 · 对齐 CC :115 shellTool.call({command}, context)
-                ToolResult<String> toolResult = runner.run(command);
+                ToolResult<?> toolResult = runner.run(command);
                 if (toolResult == null) {
                     throw new IllegalStateException("ShellCommandRunner returned null for command: " + command);
                 }
@@ -237,13 +237,14 @@ public class PromptShellExecutor {
                 //   shell 路径的真实形状（`"interrupted"`（BashTool:1621）/ `…\nExit code N`
                 //   （BashTool:1930/2649 · IMP-C2 R2 约定））**恒 false** ⇒ 本分支不可达（H3 已证）。
                 if (isShellFailureResult(toolResult.data())) {
-                    String data = toolResult.data() == null ? "" : toolResult.data();
+                    String data = com.nexusai.application.agent.tool.ToolResult.renderToolResultPayloadText(toolResult);
                     throw new ShellCommandFailedException("", data, "interrupted".equals(data.trim()));
                 }
                 // (d) 替换 · 对齐 CC :126-131 —— String.replace 会解释 $$ $& $` $' 替换串；
                 //     function replacer（Java 等价 Matcher.quoteReplacement）让任意输出（尤其
                 //     PowerShell $env:PATH / $$）按字面插入（CC :127-131 注释）。
-                String output = formatBashOutput(toolResult.data(), "", false);
+                String output = formatBashOutput(
+                        com.nexusai.application.agent.tool.ToolResult.renderToolResultPayloadText(toolResult), "", false);
                 result = replaceOnce(result, match.fullMatch(), output);
             } catch (ShellError e) {
                 // [I1 修红 · CC 主分派] CC formatBashError 以 `e instanceof ShellError` 分派
@@ -295,7 +296,7 @@ public class PromptShellExecutor {
      * {@code ToolResult.error}（非抛异常），由 {@link #executeShellCommandsInPrompt} (c) 转
      * {@link ShellCommandFailedException}。
      */
-    private ToolResult<String> runShellCommand(String shellToolName, String command, ToolUseContext ctx) {
+    private ToolResult<?> runShellCommand(String shellToolName, String command, ToolUseContext ctx) {
         Tool tool = resolveTool(shellToolName);
         if (tool == null) {
             throw new IllegalStateException("Shell tool not configured: " + shellToolName);
@@ -310,9 +311,7 @@ public class PromptShellExecutor {
         if (!(ar instanceof ToolResult<?> tr)) {
             return ToolResult.error(block.id(), "shell tool returned non-ToolResult result");
         }
-        @SuppressWarnings("unchecked")
-        ToolResult<String> ts = (ToolResult<String>) tr;
-        return ts;
+        return tr;
     }
 
     /** 解析 shell 工具实例 · "PowerShell" → powerShellTool，否则 bashTool。 */
@@ -477,8 +476,13 @@ public class PromptShellExecutor {
      * @param data runner 返回结果的 data（可 null）
      * @return true = 视为执行失败 → 走 CC {@code formatBashError} ShellError 分支
      */
-    private static boolean isShellFailureResult(String data) {
-        if (data == null || data.isEmpty()) {
+    private static boolean isShellFailureResult(Object rawData) {
+        if (rawData == null) {
+            return false;
+        }
+        // 失败载荷 ToolError 的 toString() 即错误原文 ⇒ 文本形状判定对 String/ToolError 一致
+        String data = rawData instanceof String s ? s : String.valueOf(rawData);
+        if (data.isEmpty()) {
             return false;
         }
         if ("interrupted".equals(data.trim())) {
@@ -487,7 +491,7 @@ public class PromptShellExecutor {
         if (SHELL_EXIT_CODE_MARKER.matcher(data).find()) {
             return true;
         }
-        return com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(data);
+        return com.nexusai.application.agent.LlmAgentLoop.isToolErrorData(rawData);
     }
 
     /**
@@ -573,12 +577,12 @@ public class PromptShellExecutor {
     /**
      * 执行器 · CC original: PromptShellTool（promptShellExecution.ts:20-25）。
      *
-     * <p>函数式接口，command → {@code ToolResult<String>}。默认实现委托注入的
+     * <p>函数式接口，command → {@code ToolResult<?>}。默认实现委托注入的
      * BashTool/PowerShellTool.execute（合成 {@code ToolUseBlock}）；测试注入 fake 不跑真实进程。
      */
     @FunctionalInterface
     public interface ShellCommandRunner {
-        ToolResult<String> run(String command);
+        ToolResult<?> run(String command);
     }
 
     /**

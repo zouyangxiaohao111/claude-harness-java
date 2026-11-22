@@ -80,32 +80,60 @@ class AgentToolUtilsAgentSetsTest {
     // ── 集合内容复验（D-26 ASYNC 16 项含 ToolSearch；OPD-03 COORDINATOR 4 项）──
 
     @Test
-    @DisplayName("ASYNC_AGENT_ALLOWED_TOOLS 共 17 项含 ToolSearch + vision_analyze（PDF 分页子代理读页图）")
-    void asyncAllowedHas16IncludingToolSearch() {
-        // WHY: CC constants/tools.ts:55-71 字面量 16 项 + [PDF 分页子代理修复] vision_analyze 补进
-        //   第 17 项（Java 文本模型 deepseek 看 PDF 页图/附件图靠 vision_analyze 代理视觉模型——
-        //   fork 异步子代理 >10 页 PDF NEEDS_SUBAGENT 分页依赖；isReadOnly+isConcurrencySafe 异步安全）。
-        //   含 ToolSearch 是 hook agent 反递归/补全工具的必要白名单。
+    @DisplayName("ASYNC_AGENT_ALLOWED_TOOLS 共 19 项含 ToolSearch + vision_analyze + Artifact + AstGrep")
+    void asyncAllowedIncludesToolSearch() {
+        // WHY: CC constants/tools.ts:55-71 字面量 16 项 + vision_analyze（PDF 分页读页图）
+        //   + Artifact（worker 发布 HTML 产物的通道，CC 协调者把发布委派给 worker）。
+        //   + [AST 工具] AstGrep 第 19 项（只读结构化搜索；CC 无 AstGrep，属本仓增强；
+        //   AstEdit 可写，⛔ 不进白名单）。
         Assertions.assertThat(AgentToolUtils.ASYNC_AGENT_ALLOWED_TOOLS)
-            .as("ASYNC 白名单必须为 17 项（含 vision_analyze 供 PDF 分页子代理读页图）")
-            .hasSize(17)
+            .as("ASYNC 白名单必须为 19 项（含 vision_analyze + Artifact + AstGrep）")
+            .hasSize(19)
             .contains(ToolNameConstants.TOOL_SEARCH_TOOL_NAME)
             .contains(ToolNameConstants.ENTER_WORKTREE_TOOL_NAME)
             .contains(ToolNameConstants.EXIT_WORKTREE_TOOL_NAME)
-            .contains(ToolNameConstants.VISION_ANALYZE_TOOL_NAME);
+            .contains(ToolNameConstants.VISION_ANALYZE_TOOL_NAME)
+            .contains(ToolNameConstants.ARTIFACT_TOOL_NAME)
+            .contains(ToolNameConstants.AST_GREP_TOOL_NAME);
     }
 
     @Test
-    @DisplayName("COORDINATOR_MODE_ALLOWED_TOOLS 共 4 项（Agent/TaskStop/SendMessage/StructuredOutput）")
-    void coordinatorModeHas4() {
-        // WHY: CC constants/tools.ts:107-112 — coordinator 模式仅 4 工具（agent 管理 + 输出）。
+    @DisplayName("COORDINATOR_MODE_ALLOWED_TOOLS 共 9 项（exe 2.1.328 vfn/E8r + Skill/Workflow/ListAgents + 本仓 SessionCreate）")
+    void coordinatorModeMatchesExeWhitelist() {
+        // WHY: exe 2.1.328 的协调者过滤 vfn 允许 E8r（9 项，3 项静态未确名）+ PR 订阅等。
+        //   本仓取已确名且存在的工具并集，保留旧版 StructuredOutput；
+        //   2026-11-20 用户裁定追加 SessionCreate（本仓扩展，CC 无创建会话工具）。
         Assertions.assertThat(AgentToolUtils.COORDINATOR_MODE_ALLOWED_TOOLS)
-            .as("COORDINATOR 白名单必须为 4 项")
-            .hasSize(4)
+            .as("COORDINATOR 白名单 = Agent/TaskStop/SendMessage/SessionCreate/Skill/Workflow/ListAgents/StructuredOutput")
+            .hasSize(9)
             .contains(AgentToolConstants.AGENT_TOOL_NAME)
             .contains(ToolNameConstants.TASK_STOP_TOOL_NAME)
             .contains(ToolNameConstants.SEND_MESSAGE_TOOL_NAME)
+            .contains(ToolNameConstants.SESSION_CREATE_TOOL_NAME)
+            .contains(ToolNameConstants.SKILL_TOOL_NAME)
+            .contains(ToolNameConstants.WORKFLOW_TOOL_NAME)
+            .contains(ToolNameConstants.LIST_AGENTS_TOOL_NAME)
+            .contains(ToolNameConstants.LIST_MODELS_TOOL_NAME)
             .contains(ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("SessionCreate 已在注册表（@Component + COMMON），协调者白名单按名可见")
+    void sessionCreateRegisteredAndCoordinatorVisible() {
+        // WHY: 需求 3 的判据 —— SessionCreate 若「没有 @Component / 未进注册表」才需要补注册。
+        //   本仓它是 @Component（ToolRegistry 的 @Autowired List<Tool> 自动收集）；且未标
+        //   @ExclusiveTool ⇒ ToolScope.COMMON，进默认池/通配池。此断言把「已注册」这一事实钉住，
+        //   避免后续有人误判成「工具不存在」而重复实现。
+        Assertions.assertThat(com.nexusai.application.agent.tool.impl.SessionCreateTool.class
+                .isAnnotationPresent(org.springframework.stereotype.Component.class))
+            .as("SessionCreateTool 必须带 @Component（Spring 扫描进 ToolRegistry）")
+            .isTrue();
+        Assertions.assertThat(ToolScope.of(new com.nexusai.application.agent.tool.impl.SessionCreateTool()))
+            .as("SessionCreate 非专属工具 ⇒ 默认池可见")
+            .isEqualTo(ToolScope.COMMON);
+        Assertions.assertThat(AgentToolUtils.COORDINATOR_MODE_ALLOWED_TOOLS)
+            .as("协调者白名单含 SessionCreate（本仓扩展）")
+            .contains(ToolNameConstants.SESSION_CREATE_TOOL_NAME);
     }
 
     // ── 单一权威不变量（DEL-WFB-03）──

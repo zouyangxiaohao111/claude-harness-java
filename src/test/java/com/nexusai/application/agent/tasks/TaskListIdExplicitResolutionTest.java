@@ -88,7 +88,7 @@ class TaskListIdExplicitResolutionTest {
 
     /** 只带 sessionId 的 TUC（TUC 的 compact ctor 强校验 sessionId 非 null）。 */
     private static ToolUseContext tuc(String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId);
     }
 
     // ════════════════════════════════════════════════════════════════════════

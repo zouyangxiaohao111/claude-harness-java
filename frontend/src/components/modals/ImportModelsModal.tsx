@@ -27,7 +27,7 @@ import { brandTagFromName, tagToClass } from '@/data'
 
 /** 与后端 ModelService.create 的缺省一致（模型表单的 placeholder 也是这两个值）。 */
 const DEFAULT_MAX_CONTEXT_TOKENS = 1_048_576   // 1M
-const DEFAULT_MAX_TOKENS = 384_000
+const DEFAULT_MAX_TOKENS = 128_000
 
 /**
  * 类型推断：模型名里带 embed / rerank 线索 ⇒ 对应类型，否则按「对话」。

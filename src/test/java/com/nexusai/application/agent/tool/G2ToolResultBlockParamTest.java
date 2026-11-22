@@ -85,10 +85,12 @@ class G2ToolResultBlockParamTest {
         ToolResult ok = ToolResult.successWithStructuredOutput("toolu_e2", "summary", so);
         ToolResultBlockParam block = tool.mapToToolResultBlockParam(ok, "toolu_e2", false);
         // CC FileEditTool.ts:579-581 modifiedNote + :594 `has been updated successfully${modifiedNote}.`
-        // —— 注意 trailing '.' 在 modifiedNote 之后（CC 原文如此，含 "them. ." 双句点）
+        // —— trailing '.' 在 modifiedNote 之后（CC 原文如此，含双句点）
+        // [exe 2.1.328 文案] exe off 166563721：`The user modified your proposed content before accepting it.`
+        // （源码快照为 "proposed changes before accepting them"，已按 exe 对齐）
         assertThat(block.content())
             .isEqualTo("The file /tmp/b.java has been updated successfully"
-                + ".  The user modified your proposed changes before accepting them. "
+                + ".  The user modified your proposed content before accepting it. "
                 + ".");
     }
 

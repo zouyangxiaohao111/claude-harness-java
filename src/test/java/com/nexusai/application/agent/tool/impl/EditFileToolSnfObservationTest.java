@@ -96,7 +96,7 @@ class EditFileToolSnfObservationTest {
     }
 
     private static ToolUseContext ctxFor(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("obs-agent-" + workspace).getBytes(StandardCharsets.UTF_8));
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("obs-sess-" + workspace).getBytes(StandardCharsets.UTF_8)).toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }

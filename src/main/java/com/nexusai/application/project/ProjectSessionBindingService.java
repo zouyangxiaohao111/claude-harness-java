@@ -181,7 +181,9 @@ public class ProjectSessionBindingService {
             // [V278] 会话级「引入知识库」开关（0/1 → Boolean，null = 未设置）
             s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null,
             // [V283] 左栏置顶标记（0/1 → Boolean，null = 未设置）
-            s.getPinned() != null ? s.getPinned() != 0 : null
+            s.getPinned() != null ? s.getPinned() != 0 : null,
+            // [session-create V328] 派生来源会话 id（null = 用户自建；前端左栏「派生」标记）
+            s.getDerivedFromSessionId()
         );
     }
 

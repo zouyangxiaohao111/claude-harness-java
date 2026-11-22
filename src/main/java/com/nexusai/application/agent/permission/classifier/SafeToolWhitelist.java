@@ -75,6 +75,9 @@ public class SafeToolWhitelist {
             "Read",                 // CC 'Read'（FILE_READ_TOOL_NAME，classifierDecision.ts:58）
             "Grep",                 // CC 'Grep'（:60）
             "Glob",                 // CC 'Glob'（:61）
+            // AstGrep = 只读结构化搜索（ast-grep），CC 无对应工具；与本清单 'Grep' 同档
+            //   （只读、无副作用、不写盘）。AstEdit 可写，⛔ 不进白名单。
+            "AstGrep",
             "LSP",                  // CC 'LSP'（:62）
             "ToolSearch",           // CC 'ToolSearch'（:63）
             "ListMcpResourcesTool", // CC 'ListMcpResources'（:64）

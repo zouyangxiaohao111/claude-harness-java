@@ -82,7 +82,7 @@ class StreamingToolExecutorAbortTelemetryTest {
         parentAbort.abort("permission_denied");
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", parentAbort, List.of(),
             null, PermissionMode.DEFAULT,
             Map.of(), false, "",
@@ -151,7 +151,7 @@ class StreamingToolExecutorAbortTelemetryTest {
         abort.abort("agent_cancelled");
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", abort, List.of(),
             null, PermissionMode.DEFAULT
         ).withQueryTracking(Map.of("chainId", "chain-agent-2", "depth", 5));

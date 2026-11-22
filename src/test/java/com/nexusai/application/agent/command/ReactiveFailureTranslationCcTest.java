@@ -234,7 +234,7 @@ class ReactiveFailureTranslationCcTest {
             new com.nexusai.application.agent.config.ToolRegistrationConfig();
         AbortController live = new AbortController();
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", live, List.of());
         // 本测试仅验 abort 接线，不依赖 telemetry（no-arg 构造可用，Telemetry.java:124）
         com.nexusai.application.agent.telemetry.Telemetry telemetry =

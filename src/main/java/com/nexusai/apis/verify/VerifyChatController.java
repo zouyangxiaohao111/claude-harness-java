@@ -93,6 +93,8 @@ public class VerifyChatController {
         //   Spring 自动注入 fileConfigStorage / runtimeModelOverride / startupModelFlag 等 @Autowired 依赖.
         LlmAgentLoop loop = loopProvider.getObject();
         loop.setStreamContext(null, null, null);  // VerifyChatController 无 STOMP 流上下文
+        // [non-interactive 2026-11-20] 无 STOMP 流 = 无交互入口 ⇒ 非交互会话（同 cron headless 判据）。
+        loop.setNonInteractiveSession(true);
         loop.setEventPublisher(publisher);
 
         long start = System.nanoTime();
@@ -121,31 +123,7 @@ public class VerifyChatController {
             }
         }
 
-        List<ToolCallRecord> toolCalls = new ArrayList<>();
-        for (ChatMessageDto m : state.rawMessages()) {
-            if (m.role() == Role.assistant && m.toolCalls() != null) {
-                for (ToolCallDto tc : m.toolCalls()) {
-                    toolCalls.add(new ToolCallRecord(
-                        tc.id(), tc.name(), tc.arguments(), null, null, null));
-                }
-            }
-            if (m.role() == Role.tool) {
-                String callId = m.toolCallId();
-                String content = m.content() == null ? "" : m.content();
-                boolean isError = content.startsWith("Error")
-                    || content.toLowerCase().contains("dangerous")
-                    || content.toLowerCase().contains("not found")
-                    || content.toLowerCase().contains("no such tool");
-                for (int i = 0; i < toolCalls.size(); i++) {
-                    ToolCallRecord tcr = toolCalls.get(i);
-                    if (callId != null && callId.equals(tcr.id())) {
-                        toolCalls.set(i, new ToolCallRecord(
-                            tcr.id(), tcr.name(), tcr.args(),
-                            content, isError, (long) content.length()));
-                    }
-                }
-            }
-        }
+        List<ToolCallRecord> toolCalls = collectToolCalls(state.rawMessages());
 
         return new VerifyChatResponse(
             userText,
@@ -158,6 +136,50 @@ public class VerifyChatController {
             toolCalls,
             recorder.events
         );
+    }
+
+    /**
+     * 收集本轮 tool_call 记录 · assistant 的 tool_use 先入表，tool 结果按 {@code toolCallId} 回填。
+     *
+     * <p><b>[错误通道 C8 · CCJ-ERR-011/014]</b> 结果侧 {@code isError} 取<b>执行层真值</b>
+     * {@link ChatMessageDto#isError()}（由 {@code LlmAgentLoop.toolResultMessage} 的 errorFlag 写入，
+     * 即 ToolError 结构判定），⛔ 不再按 content 文案推断。
+     *
+     * <p>WHY 删旧启发式：{@code startsWith("Error") || contains("dangerous"|"not found"|"no such tool")}
+     * 双向都错 —— 未登记文案（如 Edit 的 {@code "path is empty"}）判不出错误，
+     * 而成功结果里出现 "not found" 等字样时又被误判为失败。
+     *
+     * @param messages 本轮消息（{@code AgentState.rawMessages()}）
+     * @return 与 assistant tool_use 同序的工具调用记录
+     */
+    static List<ToolCallRecord> collectToolCalls(List<ChatMessageDto> messages) {
+        List<ToolCallRecord> toolCalls = new ArrayList<>();
+        if (messages == null) {
+            return toolCalls;
+        }
+        for (ChatMessageDto m : messages) {
+            if (m.role() == Role.assistant && m.toolCalls() != null) {
+                for (ToolCallDto tc : m.toolCalls()) {
+                    toolCalls.add(new ToolCallRecord(
+                        tc.id(), tc.name(), tc.arguments(), null, null, null));
+                }
+            }
+            if (m.role() == Role.tool) {
+                String callId = m.toolCallId();
+                String content = m.content() == null ? "" : m.content();
+                // 执行层真值（ToolError 结构判定结果）—— 不解析文案
+                boolean isError = m.isError();
+                for (int i = 0; i < toolCalls.size(); i++) {
+                    ToolCallRecord tcr = toolCalls.get(i);
+                    if (callId != null && callId.equals(tcr.id())) {
+                        toolCalls.set(i, new ToolCallRecord(
+                            tcr.id(), tcr.name(), tcr.args(),
+                            content, isError, (long) content.length()));
+                    }
+                }
+            }
+        }
+        return toolCalls;
     }
 
     /**

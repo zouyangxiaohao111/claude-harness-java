@@ -358,7 +358,7 @@ class PartialCompactConversationTest {
         //   验证 PTL retry 的 re-save 逐字段保留 projectRoot（会话态载具；漏转发 = 重试轮 fork
         //   落 config home 冒充项目根，静默错目录）。清理由下方 @AfterEach 兜底。
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), W1B_SESSION, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), W1B_SESSION, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
         SessionProjectRoot.setForSession(W1B_SESSION, W1B_PROJECT_ROOT);
         Supplier<SystemPrompt> defaultAssemble = () -> {
@@ -775,7 +775,7 @@ class PartialCompactConversationTest {
     /** 最小 ToolUseContext（8 参兼容构造器）· 对齐 StreamCompactSummaryForkUserContextTest.baseContext。 */
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 

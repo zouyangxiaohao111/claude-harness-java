@@ -97,7 +97,7 @@ class ListMcpResourcesToolAlignmentTest {
         ListMcpResourcesTool tool = toolWith(new EmptyResourcesTransport());
         ToolResult<?> result = (ToolResult<?>) tool.execute(call("t1", "{}"));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        assertThat((String) result.data()).isEqualTo(
+        assertThat(String.valueOf(result.data())).isEqualTo(
             "No resources found. MCP servers may still provide tools even if they have no resources.");
     }
 
@@ -109,7 +109,7 @@ class ListMcpResourcesToolAlignmentTest {
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         // [IMP-E1 组 2-7 △-3] CC mapToolResultToToolResultBlockParam content = jsonStringify(content)
         //   → 模型看到裸数组 [{uri:...}]；旧实现 {"data":[...]} 与声明 array outputSchema 矛盾。
-        JsonNode out = MAPPER.readTree((String) result.data());
+        JsonNode out = MAPPER.readTree(String.valueOf(result.data()));
         JsonNode arr = out; // 顶层即裸数组（无 data 包装）
         assertThat(arr.isArray()).isTrue();
         assertThat(arr.get(0).path("uri").asText()).isEqualTo("mock://docs/readme");
@@ -122,7 +122,7 @@ class ListMcpResourcesToolAlignmentTest {
         ListMcpResourcesTool tool = toolWith(new EmptyResourcesTransport());
         ToolResult<?> result = (ToolResult<?>) tool.execute(call("t1", "{\"server\":\"nope\"}"));
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-        assertThat((String) result.data()).contains("Server \"nope\" not found.");
+        assertThat(String.valueOf(result.data())).contains("Server \"nope\" not found.");
     }
 
     // ── helpers ──

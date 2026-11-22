@@ -36,6 +36,35 @@ public class SettingsRecord {
     private Boolean showClearContextOnPlanAccept;
 
     /**
+     * [V321 peer-settings] 跨会话入站策略 · 列 {@code cross_session_inbound}（TEXT，可空）。
+     *
+     * <p>值域：{@code accept} / {@code hold} / {@code refuse}；{@code NULL} = 未显式配置 →
+     * 运行时按「自动（按双方权限模式判定）」处理，不默认 accept。
+     * 前端「设置 · 权限与协作」写；消费侧按当前读取解析，不缓存/不 Bean 构造冻结。
+     *
+     * <p>命名：MyBatis-Flex camelCase→snake 精确映射（crossSessionInbound → cross_session_inbound）。
+     */
+    private String crossSessionInbound;
+
+    /**
+     * [V333] AskUserQuestion 的 AFK 超时档位 · 列 {@code ask_user_afk_timeout}（TEXT，可空）。
+     *
+     * <p>值域对齐 CC settings {@code askUserQuestionTimeout}：{@code never} / {@code 60s} /
+     * {@code 5m} / {@code 10m}；NULL / 空 / 其它值一律按 {@code never}（默认关闭，不自动继续）处理。
+     * 只影响前端权限卡的倒计时，后端不设 deadline（详见 V333 迁移头注释）。
+     */
+    private String askUserAfkTimeout;
+
+    /**
+     * [V334] 权限中继总闸 · 列 {@code channels_permission_relay_enabled}（INTEGER，可空）。
+     *
+     * <p>对齐 CC {@code isChannelPermissionRelayEnabled()}（tengu_harbor_permissions）。
+     * null = 未配置 → 默认<b>开</b>（用户 2026-11-22 裁定）；0 = 显式关。
+     * ⚠️ 与 {@code channelsEnabled} 一起只是「允许」，真正推送还要求本会话已绑定渠道。
+     */
+    private Boolean channelsPermissionRelayEnabled;
+
+    /**
      * 入库流水线六池并发配置 · V293 列 {@code ingest_concurrency_config}（TEXT）。
      *
      * <p>存 JSON 文本：{@code {"parse":8,"postprocess":2,"enrichment":12,"wiki":8,
@@ -531,6 +560,9 @@ public class SettingsRecord {
     public void setShowClearContextOnPlanAccept(Boolean showClearContextOnPlanAccept) {
         this.showClearContextOnPlanAccept = showClearContextOnPlanAccept;
     }
+    // [V321 peer-settings] cross_session_inbound ↔ crossSessionInbound（null = 未配置 → 运行时 auto）
+    public String getCrossSessionInbound() { return crossSessionInbound; }
+    public void setCrossSessionInbound(String crossSessionInbound) { this.crossSessionInbound = crossSessionInbound; }
     // [V293] ingest_concurrency_config ↔ ingestConcurrencyConfig（JSON 文本；null/空 = 回落 yml）
     public String getIngestConcurrencyConfig() { return ingestConcurrencyConfig; }
     public void setIngestConcurrencyConfig(String ingestConcurrencyConfig) { this.ingestConcurrencyConfig = ingestConcurrencyConfig; }
@@ -544,4 +576,10 @@ public class SettingsRecord {
     public void setSubagentDefaultRuntime(String v) { this.subagentDefaultRuntime = v; }
     public Boolean getSubagentExternalEnabled() { return subagentExternalEnabled; }
     public void setSubagentExternalEnabled(Boolean v) { this.subagentExternalEnabled = v; }
+    // [V333] ask_user_afk_timeout ↔ askUserAfkTimeout（never/60s/5m/10m；null/空/非法 = never）
+    public String getAskUserAfkTimeout() { return askUserAfkTimeout; }
+    public void setAskUserAfkTimeout(String v) { this.askUserAfkTimeout = v; }
+    // [V334] channels_permission_relay_enabled ↔ channelsPermissionRelayEnabled（null = 未配置 → 默认开）
+    public Boolean getChannelsPermissionRelayEnabled() { return channelsPermissionRelayEnabled; }
+    public void setChannelsPermissionRelayEnabled(Boolean v) { this.channelsPermissionRelayEnabled = v; }
 }

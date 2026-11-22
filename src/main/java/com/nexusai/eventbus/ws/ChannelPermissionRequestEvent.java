@@ -26,6 +26,19 @@ public class ChannelPermissionRequestEvent {
 
     private final String sessionId;
     private final String requestId;
+
+    /**
+     * [P0] 工具调用 ID · 与同一次权限请求的 message / bridge 两条事件<b>同值</b>。
+     *
+     * <p><b>WHY</b>：一次权限请求会向三条 topic 各推一份事件（message / bridge / channel），
+     * 三份的 {@code requestId} 各不相同（channel 是短 ID、bridge 是 UUID）。前端若只按
+     * {@code requestId} 去重/结算就会留下副本 ⇒ 卡片不消失、输入框锁死。{@code toolUseId}
+     * 是三次推送<a>共用的关联键</a>：前端以 {@code toolUseId ?? requestId} 作为唯一键。
+     *
+     * <p>可 null（老调用点/测试）⇒ 前端退回按 {@code requestId} 处理。
+     */
+    private final String toolUseId;
+
     private final String toolName;
     private final String description;
     private final String inputPreview;
@@ -64,11 +77,14 @@ public class ChannelPermissionRequestEvent {
                                          String description,
                                          String inputPreview,
                                          long timestampMs) {
-        this(sessionId, requestId, toolName, description, inputPreview, null, timestampMs);
+        this(sessionId, requestId, null, toolName, description, inputPreview, null, timestampMs);
     }
 
     /**
      * [Phase 1d] 完整构造器 · 含 computerUse。
+     *
+     * <p>[P0] 兼容形态：不带 {@code toolUseId}（旧调用点/测试）⇒ null，前端退回
+     * {@code requestId} 作为唯一键。
      *
      * @param computerUse computer-use 审批面板数据（可 null ⇒ 非 CU 请求 ⇒ 省略字段）
      */
@@ -79,8 +95,26 @@ public class ChannelPermissionRequestEvent {
                                          String inputPreview,
                                          com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse,
                                          long timestampMs) {
+        this(sessionId, requestId, null, toolName, description, inputPreview, computerUse, timestampMs);
+    }
+
+    /**
+     * [P0] 完整构造器 · 含 {@code toolUseId} + computerUse。
+     *
+     * @param toolUseId 与 message / bridge 事件<span>同值</span>的工具调用 ID（可 null）
+     * @param computerUse computer-use 审批面板数据（可 null ⇒ 非 CU 请求 ⇒ 省略字段）
+     */
+    public ChannelPermissionRequestEvent(String sessionId,
+                                         String requestId,
+                                         String toolUseId,
+                                         String toolName,
+                                         String description,
+                                         String inputPreview,
+                                         com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse,
+                                         long timestampMs) {
         this.sessionId = sessionId;
         this.requestId = requestId;
+        this.toolUseId = toolUseId;
         this.toolName = toolName;
         this.description = description;
         this.inputPreview = inputPreview;
@@ -115,8 +149,27 @@ public class ChannelPermissionRequestEvent {
             Instant.now().toEpochMilli());
     }
 
+    /**
+     * [P0] 当前时间戳便捷工厂 · 含 {@code toolUseId} + computerUse。
+     *
+     * @param toolUseId 与 message / bridge 事件同值的工具调用 ID（可 null）
+     */
+    public static ChannelPermissionRequestEvent of(String sessionId,
+                                                   String requestId,
+                                                   String toolUseId,
+                                                   String toolName,
+                                                   String description,
+                                                   String inputPreview,
+                                                   com.nexusai.application.agent.computeruse.ComputerUseApprovalPayload computerUse) {
+        return new ChannelPermissionRequestEvent(
+            sessionId, requestId, toolUseId, toolName, description, inputPreview, computerUse,
+            Instant.now().toEpochMilli());
+    }
+
     public String getSessionId() { return sessionId; }
     public String getRequestId() { return requestId; }
+    /** [P0] 与 message / bridge 事件同值的工具调用 ID（可 null ⇒ 前端退回 requestId）。 */
+    public String getToolUseId() { return toolUseId; }
     public String getToolName() { return toolName; }
     public String getDescription() { return description; }
     public String getInputPreview() { return inputPreview; }

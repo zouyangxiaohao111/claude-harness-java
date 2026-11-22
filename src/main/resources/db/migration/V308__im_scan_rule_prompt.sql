@@ -1,0 +1,11 @@
+-- 扫描规则增加 prompt（用户填写的作业指令）。
+--
+-- 为什么必须由用户填：
+--   扫描**只负责筛**（按用户指定的群 / 关键词 / 时间窗捞出聊天记录），
+--   「这些消息说明了什么、要不要建审批、要不要通知谁」是判断，不能写死在代码里。
+--   prompt 就是交给 agent 的作业说明书，随记录一起入队。
+--
+-- 为什么默认空串而不是 NOT NULL 无默认：
+--   SQLite 的 ALTER TABLE ADD COLUMN 加 NOT NULL 列必须带常量默认值；
+--   这里给 '' 保证老规则行可读，是否必填由应用层校验（新规则必须填）。
+ALTER TABLE im_scan_rule ADD COLUMN prompt TEXT NOT NULL DEFAULT '';

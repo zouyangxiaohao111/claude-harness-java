@@ -70,7 +70,7 @@ class McpAuthToolTest {
     }
 
     private static String message(AgentToolResult<?> r) {
-        return (String) r.data();
+        return String.valueOf(r.data());
     }
 
     // ───────────── name / mcpInfo / isMcp（McpAuthTool.ts:63-65 + mcpStringUtils.ts:50-52）─────────────

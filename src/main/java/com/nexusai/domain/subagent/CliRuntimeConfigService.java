@@ -152,7 +152,7 @@ public class CliRuntimeConfigService {
                 if (parsed != null) {
                     for (Map.Entry<String, String> e : parsed.entrySet()) {
                         if (e.getKey() == null || e.getValue() == null) continue;
-                        masked.put(e.getKey(), ApiKeyHasher.mask(e.getValue()));
+                        masked.put(e.getKey(), ApiKeyHasher.maskSecret(e.getValue()));
                     }
                 }
             } catch (Exception e) {

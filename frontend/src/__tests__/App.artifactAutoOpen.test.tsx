@@ -53,7 +53,10 @@ vi.mock('@/api/sessionFiles', () => ({ sessionFilesApi: { list: vi.fn(async () =
 vi.mock('@/api/projects', () => ({ projectApi: { list: vi.fn(async () => []), create: vi.fn(), bind: vi.fn() } }))
 vi.mock('@/api/market', () => ({ marketApi: {} }))
 vi.mock('@/api/command', () => ({ commandApi: { list: vi.fn(async () => []), executeBuiltin: vi.fn() } }))
-vi.mock('@/api/tasks', () => ({ tasksApi: { list: vi.fn(async () => []), stopAllTasks: vi.fn(), backgroundAll: vi.fn() } }))
+vi.mock('@/api/tasks', () => ({
+  // TaskListDock 挂载即拉 listSnapshot（漏掉它会让整个 App 挂载失败、本文件的产物断言全部跑不到）
+  tasksApi: { list: vi.fn(async () => []), listSnapshot: vi.fn(async () => null), stopAllTasks: vi.fn(), backgroundAll: vi.fn() },
+}))
 vi.mock('@/api/settings', () => ({ settingsApi: { get: vi.fn(async () => ({ theme: 'dark', fontSize: 14, animationsEnabled: true })), update: vi.fn() } }))
 vi.mock('@/api/attachment', () => ({ attachmentApi: { config: vi.fn(async () => ({ localRead: false })) } }))
 vi.mock('@/api/claudeMd', () => ({
@@ -76,6 +79,12 @@ vi.mock('@/components/modals/ArtifactViewModal', () => ({ ArtifactViewModal: () 
 vi.mock('@/components/right/ArtifactDock', () => ({
   ArtifactDock: ({ artifact }: { artifact: { id: string; title: string } | null }) =>
     artifact ? <div data-testid="artifact-dock" data-artifact-id={artifact.id}>{artifact.title}</div> : null,
+}))
+
+/** md/文本产物弹窗（ArtifactPreviewModal）：同样把「打开的是哪一条」写进 DOM。 */
+vi.mock('@/components/modals/ArtifactPreviewModal', () => ({
+  ArtifactPreviewModal: ({ artifact }: { artifact: { id: string } }) =>
+    <div data-testid="artifact-preview-modal" data-artifact-id={artifact.id} />,
 }))
 
 /** 产物列表接口：测试里控制「后端重拉回来的列表内容与顺序」。 */
@@ -231,6 +240,41 @@ describe('[2026-11-04] 产物推送载荷 ⇒ 侧栏只打开「本次推送的�
     await pushArtifact({ artifactId: null, kind: 'deliverable', created: true })
 
     expect(dockEl(c)).toBeFalsy()
+  })
+
+  it('[2026-11-20] html 自动打开 ⇒ 面板宽度给中栏留 440px（不再把对话压没/看起来被覆盖）', async () => {
+    artifactsList.mockResolvedValue({
+      deliverables: [deliverable('art-html', '报告.html', '2026-11-20T09:00:00+08:00')],
+      sources: [],
+    })
+    const c = await mountApp()
+    act(() => { useChatStore.getState().setServerRunning(SID, true) })
+
+    await pushArtifact({ artifactId: 'art-html', kind: 'deliverable', created: true })
+
+    expect(dockEl(c)).toBeTruthy()
+    const appEl = c.querySelector('.app') as HTMLElement
+    const w = parseFloat(appEl.style.getPropertyValue('--artifact-dock-w'))
+    const cap = Math.max(360, window.innerWidth - 280 - 440)
+    expect(w).toBeGreaterThanOrEqual(360)
+    expect(w).toBeLessThanOrEqual(cap)
+  })
+
+  it('[2026-11-19] md 产物 ⇒ 在**右栏**展示（压缩中栏、不遮挡对话；全屏才走弹窗）', async () => {
+    artifactsList.mockResolvedValue({
+      deliverables: [deliverable('art-md', '方案.md', '2026-11-19T10:00:00+08:00')],
+      sources: [],
+    })
+    const c = await mountApp()
+    act(() => { useChatStore.getState().setServerRunning(SID, true) })
+
+    await pushArtifact({ artifactId: 'art-md', kind: 'deliverable', created: true })
+
+    const dock = dockEl(c)
+    expect(dock).toBeTruthy()
+    expect(dock!.getAttribute('data-artifact-id')).toBe('art-md')
+    // 不默认弹遮罩层（弹窗只由右栏「全屏」触发）
+    expect(c.querySelector('[data-testid="artifact-preview-modal"]')).toBeFalsy()
   })
 
   it('来源（source）推送 ⇒ 不自动展开（来源是一批链接，不是刚生成的交付物）', async () => {

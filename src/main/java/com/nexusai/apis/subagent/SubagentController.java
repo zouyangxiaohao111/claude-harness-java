@@ -10,7 +10,6 @@ import com.nexusai.infra.exception.NotFoundException;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -27,12 +26,10 @@ import org.springframework.web.bind.annotation.RestController;
  * 对齐 CC getAgentTranscript，sessionStorage.ts:4190-4236）。sessionDir 解析复用
  * {@link ResumeService#resolveSessionDir}（config-home 项目 slug 目录，与 SubagentExecutor 写入同源）。
  *
- * <p>agentId 三键查找（Bug B 修复）：transcript 文件名键为 a+16hex（SubagentExecutor 写入用
- * agentIdHex）；前端 SubagentIdentity.taskId 为后台任务 id → 先试原样（a+16hex / 旧 UUID 键），
- * UUID 形再经 {@link AgentContext#unpackAgentId} 转 a+16hex 兜底，最后按 taskId 查
- * {@link BackgroundTaskRunner#resolveOutputTask} 取 {@code task.agentId()}（子代理 UUID）还原
- * a+16hex 兜底（对齐 ResumeService.resumeAgentBackground 双键查找模式 + Bug B 补 taskId→agentId
- * 桥）。
+ * <p>agentId 两键查找（Bug B 修复）：transcript 文件名键为 a+16hex（SubagentExecutor 写入用
+ * agentIdHex）；前端 SubagentIdentity.taskId 为后台任务 id → 先试原样（a+16hex），最后按 taskId 查
+ * {@link BackgroundTaskRunner#resolveOutputTask} 取 {@code task.agentId()}（同为 a+16hex）兜底
+ * （对齐 CC 单一身份形态 + Bug B 补 taskId→agentId 桥）。旧 UUID 键不再还原（Breaking）。
  */
 @RestController
 @RequestMapping("/api/v1/sessions/{sessionId}/subagents")
@@ -45,7 +42,7 @@ public class SubagentController {
      *
      * <p>供 getTranscript 的 taskId 兜底：前端 SubagentIdentity.taskId = BackgroundTask.id，
      * 经 {@link BackgroundTaskRunner#resolveOutputTask} 查 task → {@code task.agentId()}
-     * （子代理 UUID）→ {@link AgentContext#unpackAgentId} 还原 a+16hex → 查 transcript。
+     * （a+16hex）→ 查 transcript。
      */
     @Autowired(required = false)
     private BackgroundTaskRunner backgroundTaskRunner;
@@ -107,25 +104,15 @@ public class SubagentController {
         Path sessionDir = ResumeService.resolveSessionDir(sessionId);
         Optional<AgentTranscript.AgentTranscriptResult> opt =
             AgentTranscript.getAgentTranscript(sessionDir, sessionId, agentId);
-        if (opt.isEmpty()) {
-            try {
-                // UUID 形（前端 taskId）→ a+16hex 键兜底
-                UUID uuid = UUID.fromString(agentId);
-                String agentIdHex = AgentContext.unpackAgentId(uuid);
-                opt = AgentTranscript.getAgentTranscript(sessionDir, sessionId, agentIdHex);
-            } catch (Exception ignored) {
-                // 非 UUID 形 → 原样键已试
-            }
-        }
+        // 旧 UUID 形态 taskId 不再还原为 a+16hex（Breaking，按 CC 单一形态；旧数据不可恢复）。
         if (opt.isEmpty() && backgroundTaskRunner != null) {
-            // Bug B 兜底: agentId 作为后台任务 taskId（BackgroundTask.id）→ task.agentId（子代理 UUID）
-            // → unpackAgentId 还原 a+16hex → 查 transcript。注册链路 registerAsyncAgent/
-            // registerAgentForeground 以 agentId 构建 taskId===agentId（BackgroundTaskRunner.java:618/683），
-            // transcript 文件名经 unpackAgentId 得 a+16hex（SubagentExecutor.java:1436）；前端传的
-            // taskId 非 packAgentId(agentIdHex) 结果时前两键 miss，此处经 task.agentId 桥接还原。
+            // Bug B 兜底: agentId 作为后台任务 taskId（BackgroundTask.id）→ task.agentId（子代理 a+16hex）
+            // → 查 transcript。注册链路 registerAsyncAgent/registerAgentForeground 以 agentId 构建
+            // taskId===agentId（BackgroundTaskRunner.java:618/683），transcript 文件名同为 a+16hex
+            // （SubagentExecutor.java:1436）；前端传的 taskId 与原样键 miss 时，此处经 task.agentId 桥接。
             BackgroundTask task = backgroundTaskRunner.resolveOutputTask(agentId);
             if (task != null && task.agentId() != null) {
-                String agentIdHex = AgentContext.unpackAgentId(task.agentId());
+                String agentIdHex = task.agentId();
                 opt = AgentTranscript.getAgentTranscript(sessionDir, sessionId, agentIdHex);
                 if (log.isDebugEnabled()) {
                     log.debug("子代理 transcript taskId 兜底: taskId={} 子代理UUID={} agentIdHex={} 命中={}",

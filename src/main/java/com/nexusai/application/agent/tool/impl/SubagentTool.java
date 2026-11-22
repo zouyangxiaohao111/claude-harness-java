@@ -21,6 +21,7 @@ import com.nexusai.application.agent.subagent.AgentDefinitionRegistry;
 import com.nexusai.application.agent.subagent.AgentSummaryService;
 import com.nexusai.application.agent.subagent.AgentMcpServers;
 import com.nexusai.application.agent.subagent.AgentMessage;
+import com.nexusai.application.agent.subagent.AgentNameRegistry;
 import com.nexusai.application.agent.subagent.BuiltInAgents;
 import com.nexusai.application.agent.subagent.ForkChildBoilerplate;
 import com.nexusai.application.agent.subagent.ForkSubagent;
@@ -55,6 +56,7 @@ import com.nexusai.application.agent.subagent.createSubagentContext.AgentOptions
 import com.nexusai.application.agent.worktree.WorktreeCwdTracker;
 import com.nexusai.application.agent.tool.ContentReplacementState;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.application.agent.tool.ToolErrorKind;
 import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.application.agent.tool.ToolRegistry;
 import com.nexusai.application.agent.tool.ToolResult;
@@ -1892,7 +1894,13 @@ public class SubagentTool implements Tool {
             "Set to true to run this agent in the background");
 
         // CC fullInputSchema 额外字段（对齐 CC AgentTool.tsx:91-101）
+        // name 的形态约束 · 对齐 CC Hrl=/^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/（@316706232）：
+        // schema 层同步暴露 pattern/maxLength（模型可见），运行时另由 validateAgentName 兜底
+        // （广告与运行时分离，同本类 unknownKeysPolicy 的既有做法）。
         addProperty(properties, "name", "string", "Name for the spawned agent");
+        ObjectNode nameProp = (ObjectNode) properties.get("name");
+        nameProp.put("pattern", AgentNameRegistry.AGENT_NAME_PATTERN.pattern());
+        nameProp.put("maxLength", 64);
         addProperty(properties, "team_name", "string", "Team name for spawning");
         // CC AgentTool.tsx:96 mode: permissionModeSchema().optional() —
         //   PERMISSION_MODES = ['acceptEdits','bypassPermissions','default','dontAsk','plan']
@@ -2110,8 +2118,25 @@ public class SubagentTool implements Tool {
         // [Phase A 任务 4] 移除原 isolation/cwd "当前未生效" warn 分支, 改为下面 step 5 之后的真正解析.
         // 这里只读取字段, 不再 warn.
 
-        if (description.isBlank()) return ToolResult.error(call.id(), "description cannot be empty");
-        if (prompt.isBlank()) return ToolResult.error(call.id(), "prompt cannot be empty");
+        // [C6 错误通道 · CCJ-ERR-016] 三个入参校验与 CC 的 zod schema 失败同档（VALIDATE_INPUT
+        //   ⇒ 执行层套 <tool_use_error> 外壳、is_error=true）。此前以裸 String 返回，靠旧前缀表
+        //   反推错误态，未入表时将父模型看到的参数拒绝当成功。
+        //   ⛔ 其余 `throw`-语义错误（teammate 禁止/递归 fork/agent 不存在/MCP 缺失/spawn 失败）
+        //   对齐 CC 的 call() 抛错：原文直出、不套壳，故保持默认 CALL_THREW。
+        if (description.isBlank()) {
+            return ToolResult.failure(call.id(), "description cannot be empty", ToolErrorKind.VALIDATE_INPUT);
+        }
+        if (prompt.isBlank()) {
+            return ToolResult.failure(call.id(), "prompt cannot be empty", ToolErrorKind.VALIDATE_INPUT);
+        }
+        // 名字校验 · 对齐 CC Agent 工具的入参 schema（格式 Hrl + 保留名/id 形 refine）。
+        // CC 在 parse 期拒绝 ⇒ 这里也在做任何 spawn 之前拒绝，绝不把非法名带进注册表/团队名册。
+        String nameError = validateAgentName(name);
+        if (nameError != null) {
+            log.warn("[SubagentTool] name 校验失败: name='{}' reason={}", name, nameError);
+            // 名字规则对齐 CC schema 的 refine（名字格式/保留名/ID 形）⇒ 同属入参校验档。
+            return ToolResult.failure(call.id(), nameError, ToolErrorKind.VALIDATE_INPUT);
+        }
 
         // ═══════════════════════════════════════════════════════════════════
         // [W8-GAP-01] teammate spawn 生产分支 · 对齐 CC AgentTool.tsx:263-320
@@ -3023,7 +3048,11 @@ public class SubagentTool implements Tool {
         data.put("agent_id", out.agentId());
         if (subagentType != null) data.put("agent_type", subagentType);
         if (resolvedModel != null) data.put("model", resolvedModel);
-        data.put("name", name);
+        // 撞名自动改名（CC allocateName）后 agentId = 真名@team ⇒ 回执里必须是**真名**，
+        // 否则模型后续按请求名发消息会解析不到（注册表里只有 name-2）。
+        String spawnedName = out.agentId() != null && out.agentId().contains("@")
+            ? out.agentId().substring(0, out.agentId().lastIndexOf('@')) : name;
+        data.put("name", spawnedName);
         if (color != null && !color.isBlank()) data.put("color", color);
         data.put("tmux_session_name", "in-process");
         data.put("tmux_window_name", "in-process");
@@ -3096,6 +3125,10 @@ public class SubagentTool implements Tool {
         // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全（未注入 →
         //   SubagentExecutor 不装配归属，请求网关跳过记账，等价改造前）
         executor.setUsageLedgerRegistry(usageLedgerRegistry);
+        // [agent-summary-providerType] 摘要旁路协议解析来源（同主链 ModelConfigResolver）·
+        //   本类是 new 出来的执行器，@Autowired 字段不生效 ⇒ 必须显式注入，否则摘要按
+        //   openai_sdk 默认路由，anthropic 类型 provider 的摘要恒 550。
+        executor.setModelConfigResolver(modelConfigResolver);
         // [FIX-AM REQ-M-19] 生产接线：注入自定义 agent 解析器 + agent-memory 目录 →
         //   resolveAgentDefinition 命中自定义 memory agent（CC AgentTool.tsx:286 activeAgents.find）
         //   + buildAgentSystemPrompt(:1854) 生成期真实注入 agentMemoryPrompt（CC loadAgentsDir.ts:481-488）。
@@ -3191,6 +3224,13 @@ public class SubagentTool implements Tool {
             SubagentExecutor.SubagentResult result = streamingSink != null
                 ? executor.executeStreaming(prompt, selectedAgent.agentType(), model, forkParams, streamingSink)
                 : executor.execute(prompt, selectedAgent.agentType(), model, forkParams);
+            // [对齐 CC sync] 零产出/失败终态：CC 重抛 syncAgentError ⇒ 工具框架产 is_error 块
+            //   （AgentTool.tsx:1226-1228）；本仓此前返回 success + status="failed"，父模型收到内容
+            //   而非工具错误。失败态一律改走错误通道（原文直出）。
+            ToolResult<?> failedSync = syncErrorResult(toolUseId, result);
+            if (failedSync != null) {
+                return failedSync;
+            }
             // s06 P1-2: 把结构化 metrics 暴露给父 Agent (对齐 CC AgentTool.tsx:1253-1260)
             // [A1·退役 metadata] 旧 success(id, summary, Map metadata) 旁路退役, 结构化 metrics
             // 改走 ToolResult.structuredOutput (summary 仍为 LLM 可见 data).
@@ -3230,6 +3270,30 @@ public class SubagentTool implements Tool {
             // [批 4b-1] 原 AutoMemPaths.restoreCurrentProjectRoot(prevSyncProjectRoot) 已删
             //   （ThreadLocal 载体删除，见 executeSync 入口注释）。
         }
+    }
+
+    /**
+     * sync 子代理失败/取消态 → 工具错误结果 · 对齐 CC AgentTool.tsx:1226-1228
+     * （syncAgentError 重抛 → 工具框架产 is_error；sync 取消抛 AbortError →
+     * toolExecution 的 AbortError 分支产 INTERRUPT_MESSAGE_FOR_TOOL_USE）。
+     *
+     * @return 失败/取消结果；completed 返回 null 走原成功路径
+     */
+    static ToolResult<?> syncErrorResult(String toolUseId, SubagentExecutor.SubagentResult result) {
+        if (result == null) {
+            return null;
+        }
+        if ("failed".equals(result.status())) {
+            return ToolResult.failure(toolUseId, result.summaryText(), ToolErrorKind.CALL_THREW);
+        }
+        if ("aborted".equals(result.status())) {
+            // CC sync 取消 = throw AbortError（无 message）→ 工具框架用 INTERRUPT_MESSAGE_FOR_TOOL_USE；
+            // 部分产出摘要与 CC 一样不进入 tool_result（取消不是成功交付）。
+            return ToolResult.failure(toolUseId,
+                com.nexusai.application.agent.LlmAgentLoop.INTERRUPT_MESSAGE_FOR_TOOL_USE,
+                ToolErrorKind.INTERRUPT);
+        }
+        return null;
     }
 
     /**
@@ -3309,12 +3373,13 @@ public class SubagentTool implements Tool {
         //   存入 UUID 字段，不再独立 UUID.randomUUID()。taskId===agentId（agentId.toString()）
         //   保持（BackgroundTaskRunner 键匹配 / kill / abort / outputFile 语义不变，
         //   CC LocalAgentTask.tsx:197-262）。
-        UUID agentId = AgentContext.packAgentId(AgentContext.createAgentId());
-        String taskId = agentId.toString();
+        String agentId = AgentContext.createAgentId();
+        // [agentid-cc-align] 对外一律 CC 单一 String 形态 a+16hex（taskId === agentId）。
+        String taskId = agentId;
         if (log.isDebugEnabled()) {
             log.debug("[SubagentTool] executeAsync a+16hex 生成点: taskId={}, a+16hex={} "
                     + "(R-A45 A-5 对齐 CC createAgentId)",
-                taskId, AgentContext.unpackAgentId(agentId));
+                taskId, agentId);
         }
 
         // Phase 3: 优先走 BackgroundTaskRunner.registerAsyncAgent (CC AgentTool.tsx:686-764)
@@ -3354,12 +3419,8 @@ public class SubagentTool implements Tool {
                 //   仅 async spawn 注册（CC :703 位置在 runAsyncAgentLifecycle 前）。
                 final String registeredName = name;
                 if (registeredName != null && agentNameRegistry != null) {
-                    agentNameRegistry.register(registeredName, agentId.toString());
-                    if (log.isDebugEnabled()) {
-                        log.debug("[SubagentTool] [IMP-G4 C7] name→agentId 注册: name='{}' agentId={} "
-                                + "(CC AgentTool.tsx:703-712)",
-                            registeredName, agentId);
-                    }
+                    registerAsyncAgentName(agentNameRegistry, parentSessionId, registeredName,
+                        agentId);
                 }
                 // OPD-TP-21: 取 task-scoped AbortController（runner registerAsyncAgent 创建并保存）·
                 //   killAsyncAgent → abort() 经本实例直达 worker（对齐 CC AgentTool.tsx:735 + runAgent.ts:524-525）
@@ -3371,7 +3432,7 @@ public class SubagentTool implements Tool {
                         : (mainLoop != null ? mainLoop.getCurrentToolUseContext() : null);
                 final String effectiveModel = model != null ? model : defaultModel;
                 final AgentDefinition sel = selectedAgent;
-                final UUID ag = agentId;
+                final String ag = agentId;
                 // [Phase A 任务 6] 构造 AsyncAgentFinalizer (注入 runner, 集中收敛终态化逻辑)
                 AsyncAgentFinalizer finalizer = new AsyncAgentFinalizer(runnerRef);
                 // [批 4b-1] 原 [IMP-D F4/M-05]「调度线程捕获父会话 projectRoot → asyncWorker 注入 →
@@ -3401,6 +3462,10 @@ public class SubagentTool implements Tool {
                         // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全
                         //   （未注入 → SubagentExecutor 不装配归属，等价改造前）
                         exec.setUsageLedgerRegistry(usageLedgerRegistry);
+                        // [agent-summary-providerType] 摘要旁路协议解析来源（new 实例不触发
+                        //   @Autowired 字段注入 ⇒ 必须显式注入，否则 anthropic 类型 provider 的
+                        //   子代理摘要恒 550: Unknown）。
+                        exec.setModelConfigResolver(modelConfigResolver);
                         // OPD-TP-21: 注入 task-scoped AbortController → SubagentExecutor 决策层
                         //   override 优先（对齐 CC runAgent.ts:524-525）；killAsyncAgent abort 直达 worker
                         exec.setTaskAbortController(taskAbort);
@@ -3503,7 +3568,7 @@ public class SubagentTool implements Tool {
                         // [IMP-G4 C7] 终态注销 name→agentId（避免映射残留指向已终止 agentId ·
                         //   CC React 状态随会话结束 GC，Java 显式注销等价位）
                         if (registeredName != null && agentNameRegistry != null) {
-                            agentNameRegistry.unregister(registeredName);
+                            agentNameRegistry.unregister(parentSessionId, registeredName, ag.toString());
                             if (log.isDebugEnabled()) {
                                 log.debug("[SubagentTool] [IMP-G4 C7] 终态注销 name→agentId: name='{}' "
                                         + "agentId={} (CC agentNameRegistry 会话结束清理)",
@@ -3556,6 +3621,8 @@ public class SubagentTool implements Tool {
         executor.setFeatureFlags(featureFlags);
         // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全（同 async 路径）
         executor.setUsageLedgerRegistry(usageLedgerRegistry);
+        // [agent-summary-providerType] 摘要旁路协议解析来源（同 async 路径 · new 实例必须显式注入）
+        executor.setModelConfigResolver(modelConfigResolver);
         // [FIX-AM REQ-M-19] 生产接线：自定义 agent 解析器 + agent-memory 目录注入（降级 sync 路径）
         //   [C-方案3][DEC-C-02] 复用 executeAsync 调用线程捕获的 per-session registry（会话项目表）
         executor.setAgentDefinitionResolver(sessionRegistry::findAgent);
@@ -3843,7 +3910,7 @@ public class SubagentTool implements Tool {
      *                             null = 父 live state 不可得（web 端点）→ loop 保持默认 create
      *                             （CC :1006 feature off）
      */
-    public void executeResumeAsync(UUID agentId, String prompt, AgentDefinition selectedAgent,
+    public void executeResumeAsync(String agentId, String prompt, AgentDefinition selectedAgent,
                                    String description, String forkParentSystemPrompt,
                                    List<AgentMessage> resumedMessages, String resumedWorktreePath,
                                    ContentReplacementState contentReplacementState) {
@@ -3864,7 +3931,7 @@ public class SubagentTool implements Tool {
      *
      * @param createSessionId 创建此 resume 任务的会话 sessionId（null = 无会话归属 → V1 列表会话过滤排除）
      */
-    public void executeResumeAsync(UUID agentId, String prompt, AgentDefinition selectedAgent,
+    public void executeResumeAsync(String agentId, String prompt, AgentDefinition selectedAgent,
                                    String description, String forkParentSystemPrompt,
                                    List<AgentMessage> resumedMessages, String resumedWorktreePath,
                                    ContentReplacementState contentReplacementState,
@@ -3897,7 +3964,7 @@ public class SubagentTool implements Tool {
         }
         final ToolUseContext parentTUC = mainLoop != null ? mainLoop.getCurrentToolUseContext() : null;
         final AgentDefinition sel = selectedAgent;
-        final UUID ag = agentId;
+        final String ag = agentId;
         final String fp = forkParentSystemPrompt;
         final String rw = resumedWorktreePath;
         final List<AgentMessage> rm = resumedMessages;
@@ -3949,6 +4016,8 @@ public class SubagentTool implements Tool {
                 // [usage-gateway] 子代理用量并入父会话账目（子节点归属 + 账本绑定）· null 安全
                 //   （resume 续跑复用原 agentId → 归属解析优先复用账本已有节点，层级不漂移）
                 exec.setUsageLedgerRegistry(usageLedgerRegistry);
+                // [agent-summary-providerType] 摘要旁路协议解析来源（resume 路径 · new 实例必须显式注入）
+                exec.setModelConfigResolver(modelConfigResolver);
                 // OPD-TP-21: 注入 task-scoped AbortController（resume 续跑同样可被 kill 中断）
                 exec.setTaskAbortController(taskAbort);
                 // [MCP-I-9 返工 R1+R2] MCP 装配：McpTransportFactory + supplier + name resolver（resume 路径）
@@ -4365,6 +4434,56 @@ public class SubagentTool implements Tool {
 
     private String getStringOrNull(JsonNode input, String field) {
         return input.has(field) ? input.get(field).asText() : null;
+    }
+
+    /**
+     * 名字校验 · 对齐 CC Agent 工具入参 schema（claude.exe 2.1.328）：
+     * <ol>
+     *   <li>格式 {@code ^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$}（{@code Hrl} @316706232）；</li>
+     *   <li>保留名 {@code main}/{@code team-lead}/{@code user}/{@code system}（任意拼写）、
+     *       agent id 形、session id 形（{@code v1} @317883761 + refine @334056321）。</li>
+     * </ol>
+     *
+     * <p>CC 的校验发生在 zod parse 期（字段 regex 先于 superRefine），故顺序 = 先格式后保留名。
+     *
+     * @param name 入参 name（null = 未传，合法）
+     * @return null = 合法；非 null = 直接返回给模型的错误文案
+     */
+    static String validateAgentName(String name) {
+        if (name == null) {
+            return null;
+        }
+        if (!AgentNameRegistry.isValidAgentName(name)) {
+            return AgentNameRegistry.NAME_FORMAT_HINT;
+        }
+        return AgentNameRegistry.registrationRejectionReason(name);
+    }
+
+    /**
+     * async 子代理的 name→agentId 注册 · 对齐 CC AgentTool 写点
+     * {@code if(He!==void 0 && registry.get(He)===void 0) registerName(...)}（@333963676）。
+     *
+     * <p><b>撞名语义</b>：先注册者保号，后者<b>不注册</b>（spawn 照常成功）——改前本仓用
+     * {@code register()} 覆盖，等于第二个 agent 抢走名字（缺陷）。
+     *
+     * @return true = 本次写入生效；false = 名字已被别的 agent 占用（本次未注册）
+     */
+    static boolean registerAsyncAgentName(AgentNameRegistry registry, String parentSessionId,
+                                          String name, String agentId) {
+        AgentNameRegistry.RegistrationOutcome outcome =
+            registry.registerIfAbsent(parentSessionId, name, agentId);
+        if (!outcome.registered()) {
+            log.info("[SubagentTool] [IMP-G4 C7] name '{}' 已被占用，第二个 agent {} 不注册"
+                    + "（先注册者保号；CC @333963676）: {}",
+                name, agentId, outcome.reservedReason());
+            return false;
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[SubagentTool] [IMP-G4 C7] name→agentId 注册: name='{}' agentId={} "
+                    + "(CC AgentTool.tsx:703-712)",
+                name, agentId);
+        }
+        return true;
     }
 
     @Override

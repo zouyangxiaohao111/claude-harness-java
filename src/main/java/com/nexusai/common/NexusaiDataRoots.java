@@ -133,6 +133,61 @@ public final class NexusaiDataRoots {
         return dir;
     }
 
+    /** IM 频道子目录名（{@code <数据根>/im}）· 扫描产物与「确认后新建的任务」都落这里。 */
+    public static final String IM_DIR_NAME = "im";
+
+    /**
+     * IM 频道工作区目录（{@code <数据根>/im}）。
+     *
+     * <p><b>为什么固定一个目录</b>：扫描确认后新建的任务必须绑一条已注册的项目
+     * （{@code SessionService.create} 的 {@code mainProjectId} 是硬校验），
+     * 而"该落到哪个项目"不能猜 —— 猜错会让任务出现在用户自己的仓库里，
+     * cwd / 记忆 / 产物全跟着跑偏。给 IM 一个固定归属即可与用户项目隔离。
+     *
+     * <p>形态与 {@link #chatRoot()} 同构（知识库新对话的先例）：
+     * {@code <安装目录>/data/workspace/<NEXUSAI_USER 或 default>/im}。
+     *
+     * @return 已创建成功的绝对路径
+     * @throws IllegalStateException 目录创建失败（不静默降级到别的目录）
+     */
+    public static Path imRoot() {
+        Path dir = sub(IM_DIR_NAME);
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException | SecurityException e) {
+            throw new IllegalStateException("IM 工作目录创建失败: " + dir, e);
+        }
+        return dir;
+    }
+
+    /** 定时任务子目录名（{@code <数据根>/cron}）· B/C 形态新建会话的项目锚。 */
+    public static final String CRON_DIR_NAME = "cron";
+
+    /**
+     * 定时任务工作区目录（{@code <数据根>/cron}）。
+     *
+     * <p><b>为什么需要</b>：{@code session_mode} 里的 B（每次新建）与 C（建后绑定）形态由
+     * 任务自己造会话，而 {@code SessionService.create} 的 {@code mainProjectId} 是硬校验
+     * ⇒ 必须给一个已注册的项目。让这些自动会话落到用户正在用的仓库里会让 cwd / 记忆 /
+     * 产物全部跑偏（知识库弹窗 {code projectApi.list()[0]} 踩过同款）。
+     *
+     * <p>形态与 {@link #imRoot()} / {@link #chatRoot()} 同构，只是子目录名不同：
+     * {@code <安装目录>/data/workspace/<NEXUSAI_USER 或 default>/cron}，
+     * 拿不到安装目录时回落 configHome（= {@code ~/.nexusai/cron}）。
+     *
+     * @return 已创建成功的绝对路径
+     * @throws IllegalStateException 目录创建失败（不静默降级到别的目录 —— 那会让任务跑在错误项目下）
+     */
+    public static Path cronRoot() {
+        Path dir = sub(CRON_DIR_NAME);
+        try {
+            Files.createDirectories(dir);
+        } catch (IOException | SecurityException e) {
+            throw new IllegalStateException("定时任务工作目录创建失败: " + dir, e);
+        }
+        return dir;
+    }
+
     /**
      * 可注入版本（单测用）。
      *

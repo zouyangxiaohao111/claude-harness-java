@@ -17,7 +17,6 @@ import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.test.support.SessionProjectRootTestSupport;
-import java.util.UUID;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
 import java.nio.file.Path;
@@ -787,7 +786,7 @@ class CommandHookExecutorTest {
         // 9 参工厂显式传 permissionMode=PLAN（6 参便捷工厂会把 permissionMode 字段硬编码 DEFAULT，
         //   enrichBaseFields 读 parentTuc.permissionMode() 注入，故须用显式 permissionMode 工厂验证映射）。
         ToolUseContext parentTuc = ToolUseContext.of(
-            UUID.fromString("00000000-0000-0000-0000-000000000001"),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             "",
             PermissionMode.PLAN, List.of(), "", AbortController.NOOP,
             List.of(), null, PermissionMode.PLAN);

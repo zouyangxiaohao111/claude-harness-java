@@ -1079,8 +1079,8 @@ public class SkillToolImpl implements Tool {
         if (ctx == null || ctx.agentId() == null) {
             return null;
         }
-        // unpackAgentId: TUC 承载 packAgentId(a+16hex) 可逆编码 → 还原 CC 语义的 a+16hex 形制
-        return AgentContext.unpackAgentId(ctx.agentId());
+        // [agentid-cc-align] TUC.agentId 已是 CC 单一 String 形态（a+16hex）。
+        return ctx.agentId();
     }
 
     // ════════════════════════════════════════════════════════════════════════
@@ -1737,7 +1737,7 @@ public class SkillToolImpl implements Tool {
                     //   CommandController:370-373）能匹配保留（state.ts:1543-1555）——EVD-B 归因链修复。
                     //   [session-id-short] 主会话 ctx.agentId()=null（agentId 兜底已删）→ agentId 分支不命中
                     //   → skillAgentId=null（既有行为不变）；fork 子 agent 不注册 → null。
-                    UUID skillAgentId = null;
+                    String skillAgentId = null;
                     if (ctx.agentId() != null && sessionStateResolver.apply(ctx.agentId()) != null) {
                         skillAgentId = ctx.agentId();
                     }
@@ -1985,9 +1985,13 @@ public class SkillToolImpl implements Tool {
         if (result == null || sessionId == null) {
             return;
         }
-        UUID forkAgentId;
+        String forkAgentId;
         try {
-            forkAgentId = UUID.fromString(result.agentId());
+            String rawForkAgentId = result.agentId();
+            if (rawForkAgentId == null || rawForkAgentId.isBlank()) {
+                throw new IllegalArgumentException("empty agentId");
+            }
+            forkAgentId = rawForkAgentId;
         } catch (IllegalArgumentException e) {
             if (log.isDebugEnabled()) {
                 log.debug("[P1-6-CLEANUP-1] fork 子 agent id 非 UUID，跳过 invokedSkills 清理: {}",

@@ -33,7 +33,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  */
 class R32B15Stage3_2_AppStateSDKStatusTest {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = "a0123456789abcdef";
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     // ═══════════════════ AppState 测试 ═══════════════════

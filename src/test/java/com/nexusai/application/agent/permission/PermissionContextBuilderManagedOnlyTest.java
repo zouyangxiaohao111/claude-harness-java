@@ -71,7 +71,7 @@ class PermissionContextBuilderManagedOnlyTest {
     }
 
     private static AgentState state() {
-        return new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        return new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
     }
 
     @Test

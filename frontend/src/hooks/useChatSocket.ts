@@ -4,6 +4,7 @@ import { parseGoalPayload } from '@/utils/goalState'
 import { useChatStore, type PermissionRequestItem } from '../stores/chatStore'
 import { sessionApi, type PermissionEventPayload } from '../api/sessions'
 import { createSocketClient, subscribeStream, notifySocketConnect, isChunk, isPushedUser, isComplete, isCitations, isMessageUsage, isToolCall, isToolResult, isBoundary, isMessageInsert, isRetry, isError, isCancelled, isStatus, isTokenWarning } from '../api/socket'
+import { peerFailureRowFromEvent } from '../stores/messageTurns'
 import { useSubagentStore } from '../stores/subagentStore'
 import { useSkillSurveyStore } from '../components/center/SkillSurvey'
 import { TASKS_TOPIC } from '../api/types'
@@ -239,7 +240,10 @@ function subscribeTeamTopics(client: Client, leadSessionId: string) {
 
 /** bridge dismiss 订阅登记：sid -> sub（本地 message 竞速胜出 → 后端推 dismiss → dequeue 残留 bridge 请求）。
  *  模块级（非 hook ref）：subscribePermTopics 是模块级函数；生命周期随 perm 订阅（hook 内增删清理）。 */
+const permissionResolvedSubs = new Map<string, StompSubscription>()
 const bridgeDismissSubs = new Map<string, StompSubscription>()
+/** [D] permission-delivery（未送达提示）订阅登记：sid -> sub */
+const permissionDeliverySubs = new Map<string, StompSubscription>()
 
 /**
  * 归一化产物的**收紧类型**：与 {@link PermissionRequestItem} 同形，但 `computerUse` **必填**。
@@ -294,6 +298,11 @@ function toPermissionItem(
     //   useChatSocket.pendingReplay.test.tsx 补拉路径 +
     //   useChatSocket.computerUseChannels.test.tsx **三通道** message/bridge/channel）。
     computerUse: raw.computerUse ?? null,
+    // [V333 AFK] 计时参数随请求下发（缺省 = 不启用，行为与改造前一致）。
+    //   ⚠️ 同 computerUse：本清单是手抄的，漏抄 ⇒ 只有「实时」路径能倒计时、补拉丢失。
+    //   补拉丢失是**可接受**的：计时只发生在当前可见卡片上，刷新/切会话不回放计时。
+    afkTimeoutMs: raw.afkTimeoutMs ?? null,
+    afkCountdownMs: raw.afkCountdownMs ?? null,
   }
 }
 
@@ -391,6 +400,32 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
   })
   // 本地 message 竞速胜出 → 后端 WebSocketPermissionPrompter.onResponse → bridgeCallbacks.sendResponse
   //   推 dismiss → 移除对应 bridge 请求（防同一 tool_use 的 bridge 事件残留 → 第二弹窗）
+  // 竞速非本地分支胜出（hook / bridge / channel）⇒ 后端推 permission-resolved
+  //   ⇒ 关掉本地那个已经失效的弹窗（否则用户点下去毫无反应：后端已 claim，直接丢弃）
+  //
+  // ⚠️ 与 permission-bridge-dismiss 的分工：
+  //   · bridge-dismiss = 本地答了 → 关 bridge 的弹窗
+  //   · resolved       = 别处答了 → 关本地的弹窗（本订阅）
+  //   最终都走 dequeuePermission —— 队列按 requestId 唯一，重复删是幂等的。
+  if (!permissionResolvedSubs.has(sid)) {
+    const resolved = client.subscribe(`/topic/sessions/${sid}/permission-resolved`, (msg) => {
+      try {
+        // [P0] 后端同时下发 toolUseId（三条通道共用的关联键）。只按 requestId 删会漏掉
+        //   bridge/channel 副本 ⇒ 卡片不消失、输入框锁死；这里按 `toolUseId ?? requestId`
+        //   清掉该会话的**全部**副本（topic 已按会话隔离，不会误伤其它会话）。
+        const payload = JSON.parse(msg.body) as { requestId?: string; toolUseId?: string; source?: string }
+        if (payload.requestId) {
+          if (import.meta.env.DEV) {
+            console.debug('[perm] resolved elsewhere → dismiss local', payload.requestId,
+              payload.toolUseId, payload.source)
+          }
+          useChatStore.getState().resolvePermission(
+            sid, payload.toolUseId ?? null, payload.requestId)
+        }
+      } catch { /* 非法载荷忽略 */ }
+    })
+    permissionResolvedSubs.set(sid, resolved)
+  }
   if (!bridgeDismissSubs.has(sid)) {
     const dismiss = client.subscribe(`/topic/sessions/${sid}/permission-bridge-dismiss`, (msg) => {
       try {
@@ -399,6 +434,24 @@ export function subscribePermTopics(client: Client, sid: string): { message: Sto
       } catch { /* 非法载荷忽略 */ }
     })
     bridgeDismissSubs.set(sid, dismiss)
+  }
+  // [D 未送达上抛] 后端把「哪些渠道没送出去」单独推来（⛔ 不是决策事件）。
+  //   只补到已存在的卡片上；请求卡片由 message 通道先到（后端顺序保证），
+  //   没找到就忽略 —— 绝不因此新建一张卡。
+  if (!permissionDeliverySubs.has(sid)) {
+    const delivery = client.subscribe(`/topic/sessions/${sid}/permission-delivery`, (msg) => {
+      try {
+        const payload = JSON.parse(msg.body) as {
+          requestId?: string
+          toolUseId?: string
+          failures?: Array<{ channel?: string; peerName?: string; reasonCode?: string; reason?: string }>
+        }
+        if (!payload?.requestId || !Array.isArray(payload.failures) || payload.failures.length === 0) return
+        useChatStore.getState().setPermissionDeliveryFailures(
+          sid, payload.toolUseId ?? null, payload.requestId, payload.failures)
+      } catch { /* 非法载荷忽略 */ }
+    })
+    permissionDeliverySubs.set(sid, delivery)
   }
   return subs
 }
@@ -780,7 +833,9 @@ export function useChatSocket(
       streamSubsRef.current.clear()
       watchSubsRef.current.clear() // [会话状态同步] 断线后订阅随连接失效，map 须清空以便重订
       permSubsRef.current.clear()
+      permissionResolvedSubs.clear()
       bridgeDismissSubs.clear()
+      permissionDeliverySubs.clear()
       teamSubsRef.current = null
       teamLeadSubsRef.current = null
       statusSubsRef.current.clear()
@@ -859,8 +914,12 @@ export function useChatSocket(
       sessionLevelSubsRef.current.clear()
       streamSubsRef.current.clear()
       permSubsRef.current.clear()
+      for (const sub of permissionResolvedSubs.values()) sub.unsubscribe()
+      permissionResolvedSubs.clear()
       for (const sub of bridgeDismissSubs.values()) sub.unsubscribe()
       bridgeDismissSubs.clear()
+      for (const sub of permissionDeliverySubs.values()) sub.unsubscribe()
+      permissionDeliverySubs.clear()
       teamSubsRef.current = null
       teamLeadSubsRef.current = null
       for (const sub of statusSubsRef.current.values()) sub.unsubscribe()
@@ -1291,6 +1350,14 @@ export function useChatSocket(
     // 多会话分发：归属会话 = **投递 topic**（其 sid 是权威）→ 载荷 sessionId → 当前会话兜底。
     //   [2026-10-23] 原顺序（载荷优先、缺失回落当前会话）会把缺 sessionId 的帧写进当前会话。
     const sid = resolveEventSid(evt, topic, sessionId)
+    // [peer-failure] 跨会话投递失败/被拒的**即时提示**（旁路事件，不带 seq ⇒ 上面的闸门已直接派发到这里）。
+    //   权威来源是后端落库的 meta 行（同 id = peer-failure-<messageId>）⇒ 这里合成同形行插列表尾，
+    //   刷新后 GET /messages 用同 id 收敛，不会出现第二行。⛔ 不生成用户轮 / 不切会话 / 不拉历史。
+    if (evt.type === 'peer.message.failed' || evt.type === 'peer.message.rejected') {
+      const row = peerFailureRowFromEvent(evt as unknown as Record<string, unknown>, sid)
+      if (row) st.insertServerMessages(sid, [row])
+      return
+    }
     if (isPushedUser(evt)) {
       // P0 排队消息气泡：message.user 按事件携带的 isMeta 分流（不再一刀切硬编码占位）——
       //   isMeta=false（普通用户消息，含 busy-queued 排队插队注入）→ 渲染正式 user 气泡（进消息列表，id 判重）；

@@ -127,6 +127,9 @@
     <logger name="com.nexusai.application.agent.LlmAgentLoop" level="INFO"/>
     <logger name="com.nexusai.infra.llm.OpenAiSdkProvider" level="INFO"/>
     <logger name="com.nexusai.application.chat.ChatService" level="INFO"/>
+    <!-- [临时诊断] 飞书长连接收帧可观测：SDK 每收到一帧会打 "receive message, message_type: … payload: …"。
+         用于判定「平台没推到本连接」还是「到了但没派发」。定位完删除。 -->
+    <logger name="com.lark.oapi.ws" level="DEBUG"/>
     <logger name="org.springframework" level="WARN"/>
     <logger name="org.quartz" level="WARN"/>
     <logger name="org.flywaydb" level="WARN"/>

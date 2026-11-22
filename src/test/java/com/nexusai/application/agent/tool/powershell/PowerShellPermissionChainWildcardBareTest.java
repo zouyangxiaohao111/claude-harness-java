@@ -114,7 +114,7 @@ class PowerShellPermissionChainWildcardBareTest {
     }
 
     private static ToolUseContext ctxWith(ToolPermissionContext permCtx) {
-        return new ToolUseContext(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             java.util.Map.of(), List.of(), null, null, List.of(), permCtx, PermissionMode.DEFAULT,
             java.util.Map.of(), false, "", null, null, java.util.Map.of(),
             null, null, null, null, null);

@@ -63,7 +63,7 @@ class ExitWorktreeToolStructuredOutputTest {
     }
 
     private static ToolUseContext ctx() {
-        return ToolUseContext.of(UUID.randomUUID(), SESSION_ID);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID);
     }
 
     /**
@@ -175,7 +175,7 @@ class ExitWorktreeToolStructuredOutputTest {
         AgentToolResult<?> result = tool.execute(call("noop-call", "remove"), ctx());
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).as("无会话必须被守卫拦截").isTrue();
-        assertThat((String) result.data())
+        assertThat(String.valueOf(result.data()))
             .as("no-op 文案对齐 CC ExitWorktreeTool.ts:185-187")
             .contains("no active EnterWorktree session");
         // 守卫不得触达 WorktreeService（防误删）——直调下 consumeHookBasedWorktree 未被消费

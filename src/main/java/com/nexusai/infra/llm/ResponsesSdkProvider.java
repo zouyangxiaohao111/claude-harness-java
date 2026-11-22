@@ -3,6 +3,7 @@ package com.nexusai.infra.llm;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
+import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.prompt.SystemPromptBlock;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentUsage;
@@ -12,6 +13,7 @@ import com.nexusai.model.session.dto.ToolCallDto;
 import com.nexusai.repository.provider.mapper.ModelMapper;
 import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.openai.client.OpenAIClient;
+import com.openai.client.okhttp.OpenAIOkHttpClient;
 import com.openai.core.JsonValue;
 import com.openai.core.RequestOptions;
 import com.openai.core.http.StreamResponse;
@@ -23,6 +25,7 @@ import com.openai.models.responses.Response;
 import com.openai.models.responses.ResponseCreateParams;
 import com.openai.models.responses.ResponseFunctionCallOutputItem;
 import com.openai.models.responses.ResponseFunctionToolCall;
+import com.openai.models.responses.ResponseIncludable;
 import com.openai.models.responses.ResponseInputContent;
 import com.openai.models.responses.ResponseInputImage;
 import com.openai.models.responses.ResponseInputImageContent;
@@ -31,8 +34,14 @@ import com.openai.models.responses.ResponseInputText;
 import com.openai.models.responses.ResponseInputTextContent;
 import com.openai.models.responses.ResponseOutputItem;
 import com.openai.models.responses.ResponseOutputMessage;
+import com.openai.models.responses.ResponseOutputRefusal;
+import com.openai.models.responses.ResponseOutputText;
+import com.openai.models.responses.ResponseReasoningItem;
 import com.openai.models.responses.ResponseStreamEvent;
+import com.openai.models.responses.ResponsesClientEvent;
+import com.openai.models.responses.ResponsesServerEvent;
 import com.openai.models.responses.Tool;
+import com.openai.models.responses.ToolChoiceOptions;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
@@ -45,6 +54,10 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.CancellationException;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.ExecutionException;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.TimeoutException;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -95,6 +108,41 @@ public class ResponsesSdkProvider implements LlmProvider {
     @org.springframework.beans.factory.annotation.Autowired(required = false)
     private com.nexusai.domain.provider.ProviderService providerService;
 
+    /** Responses over WebSocket 会话池（codex 端点专用）。 */
+    private final ResponsesWsManager wsManager = new ResponsesWsManager();
+
+    /** codex `DEFAULT_STREAM_MAX_RETRIES`（model-provider-info/src/lib.rs:74）。 */
+    private static final int WS_STREAM_MAX_RETRIES = readWsMaxRetries();
+
+    /**
+     * [codex 对齐] 续接失效/连接上限的快速重试上限。
+     *
+     * <p>codex 对 {@code previous_response_not_found} 与 {@code websocket_connection_limit_reached}
+     * 的处置是「作废续接 + 立即重发全量」（responses_websocket.rs:432-434），不占 stream 重试预算。
+     * 这里用独立小预算防死循环（全量请求仍报同错 = 真故障，交由后续通用重试/降级）。
+     */
+    private static final int WS_CONTINUATION_MAX_RETRIES = 2;
+
+    @jakarta.annotation.PreDestroy
+    public void shutdownWs() {
+        wsManager.closeAll();
+    }
+
+    private static int readWsMaxRetries() {
+        String raw = System.getenv("NEXUSAI_RESPONSES_WS_MAX_RETRIES");
+        if (raw != null && !raw.isBlank()) {
+            try {
+                int v = Integer.parseInt(raw.trim());
+                if (v >= 0) {
+                    return Math.min(v, 100);   // codex MAX_STREAM_MAX_RETRIES
+                }
+            } catch (NumberFormatException ignore) {
+                // 非法值 → 默认
+            }
+        }
+        return 5;
+    }
+
     @Override
     public String type() {
         return PROVIDER_TYPE;
@@ -142,7 +190,7 @@ public class ResponsesSdkProvider implements LlmProvider {
         }
         doStream(config, modelName, systemPromptBlocks, history, tools, maxOutputTokensOverride,
             effortValue, onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
-            aborted, onError, onComplete, scope, streamIdleControl,
+            aborted, onError, onComplete, scope, streamIdleControl, abortController,
             new AtomicBoolean(false));
     }
 
@@ -163,6 +211,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                           Runnable onComplete,
                           LlmCallScope scope,
                           StreamIdleControl streamIdleControl,
+                          AbortController abortController,
                           AtomicBoolean authRetried) {
         if (config == null || !config.isUsable()) {
             LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
@@ -184,6 +233,23 @@ public class ResponsesSdkProvider implements LlmProvider {
         List<Tool> sdkTools = buildTools(tools);
         String resolvedEffort = EffortSupport.resolveAppliedEffort(modelName, effortValue);
 
+        // [responses-ws] codex 端点优先走 Responses over WebSocket（对齐 codex 0.162.1：
+        //   同一会话一条连接 + previous_response_id 增量 + include reasoning.encrypted_content）。
+        //   返回 true = 本次尝试已完整处理（含成功/失败回调）；false = 该会话已 sticky 切 HTTP。
+        boolean forceNonStreaming = streamIdleControl != null && streamIdleControl.forceNonStreaming();
+        if (!forceNonStreaming && isCodexEndpoint(config.baseUrl())) {
+            String wsKey = wsKey(config, sessionId);
+            if (!wsManager.isDisabled(wsKey)) {
+                boolean handled = doStreamWs(config, modelName, wsKey, sessionId, instructions,
+                    input, sdkTools, maxOutputTokensOverride, resolvedEffort,
+                    onChunk, onAssistantMessage, onToolCallComplete, onReasoningChunk,
+                    aborted, onError, onComplete, scope, streamIdleControl, abortController, authRetried);
+                if (handled) {
+                    return;
+                }
+            }
+        }
+
         // 本次尝试的累积状态（失败/中断出口也要能看到部分 usage）
         StringBuilder content = new StringBuilder();
         StringBuilder reasoning = new StringBuilder();
@@ -191,6 +257,7 @@ public class ResponsesSdkProvider implements LlmProvider {
         Map<String, PendingCall> pendingCalls = new LinkedHashMap<>();
         List<ToolUseBlock> toolCalls = new ArrayList<>();
         Set<String> emittedCallKeys = new HashSet<>();
+        Set<String> textDeltaItems = new HashSet<>();
         AtomicReference<Response> finalResponse = new AtomicReference<>();
 
         try {
@@ -198,7 +265,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                 ? streamIdleControl.idleTimeoutMs() : null;
             OpenAIClient client = OpenAiSdkProvider.buildClient(config, sessionId, idleTimeoutMs);
             ResponseCreateParams params = buildParams(modelName, instructions, input, sdkTools,
-                maxOutputTokensOverride, sessionId, resolvedEffort);
+                maxOutputTokensOverride, sessionId, resolvedEffort, isCodexEndpoint(config.baseUrl()));
             if (log.isDebugEnabled()) {
                 log.debug("ResponsesSdkProvider stream -> model={} inputItems={} tools={} effort={} session={}",
                     modelName, input.size(), sdkTools.size(), resolvedEffort, sessionId);
@@ -224,7 +291,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                     }
                     ResponseStreamEvent ev = it.next();
                     streamFailure = handleEvent(ev, content, reasoning, argBuffers, pendingCalls,
-                        toolCalls, emittedCallKeys, finalResponse, onChunk, onReasoningChunk,
+                        toolCalls, emittedCallKeys, textDeltaItems, finalResponse, onChunk, onReasoningChunk,
                         onToolCallComplete);
                     if (streamFailure != null) {
                         break;
@@ -260,7 +327,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                     doStream(retried, modelName, systemPromptBlocks, history, tools,
                         maxOutputTokensOverride, effortValue, onChunk, onAssistantMessage,
                         onToolCallComplete, onReasoningChunk, aborted, onError, onComplete,
-                        scope, streamIdleControl, authRetried);
+                        scope, streamIdleControl, abortController, authRetried);
                     return;
                 }
                 // 拿不到新 token（或已经重试过）⇒ 可读错误，不再二次刷新。
@@ -273,16 +340,767 @@ public class ResponsesSdkProvider implements LlmProvider {
         }
     }
 
+    // ===================== WebSocket（codex 端点） =====================
+
+    /** 是否 ChatGPT Codex 订阅端点（与 {@link OpenAiSdkProvider} 同判据）。 */
+    private static boolean isCodexEndpoint(String baseUrl) {
+        return baseUrl != null
+            && baseUrl.toLowerCase(java.util.Locale.ROOT).contains("/backend-api/codex");
+    }
+
+    /** WS 会话键：端点 + 会话（OAuth 刷新换 token 不应换连接，故 apiKey 不参与）。 */
+    private static String wsKey(ProviderConfig config, String sessionId) {
+        String base = config == null || config.baseUrl() == null ? "" : config.baseUrl();
+        return base + "|" + (sessionId == null ? "" : sessionId);
+    }
+
     /**
-     * 单事件映射。返回非 null = 该事件是终止性失败（调用方停止消费并走 onError）。
+     * Responses over WebSocket 主路径（对齐 codex 0.162.1）。
+     *
+     * <p>返回 true = 本次尝试已完整处理（成功终止或已回 onError）；false = 该会话应改用 HTTP SSE
+     * （sticky 降级 / 握手不支持 / 传输重试耗尽）。
+     */
+    private boolean doStreamWs(ProviderConfig config,
+                               String modelName,
+                               String wsKey,
+                               String sessionId,
+                               String instructions,
+                               List<ResponseInputItem> input,
+                               List<Tool> sdkTools,
+                               Integer maxOutputTokens,
+                               String resolvedEffort,
+                               Consumer<String> onChunk,
+                               Consumer<AssistantMessage> onAssistantMessage,
+                               Consumer<ToolUseBlock> onToolCallComplete,
+                               Consumer<String> onReasoningChunk,
+                               AtomicBoolean aborted,
+                               Consumer<Throwable> onError,
+                               Runnable onComplete,
+                               LlmCallScope scope,
+                               StreamIdleControl streamIdleControl,
+                               AbortController abortController,
+                               AtomicBoolean authRetried) {
+        ResponsesWsManager.SessionState st = wsManager.state(wsKey);
+        long idleMs = streamIdleControl != null ? streamIdleControl.idleTimeoutMs() : 0L;
+        String fingerprint = requestFingerprint(modelName, instructions, sdkTools,
+            maxOutputTokens, sessionId, resolvedEffort);
+        List<String> fullDigests = digestInput(input);
+
+        synchronized (st.lock) {
+            // ── 增量判定（对齐 pi requestBodiesMatchExceptInput：除 input/previous_response_id 外全等） ──
+            String previousResponseId = null;
+            List<ResponseInputItem> toSend = input;
+            if (st.session != null && !st.session.isClosed()
+                && st.lastResponseId != null
+                && !st.conversationDigests.isEmpty()
+                && fingerprint.equals(st.fingerprint)
+                && fullDigests.size() > st.conversationDigests.size()
+                && fullDigests.subList(0, st.conversationDigests.size()).equals(st.conversationDigests)) {
+                previousResponseId = st.lastResponseId;
+                toSend = new ArrayList<>(input.subList(st.conversationDigests.size(), input.size()));
+            }
+
+            int transportRetries = 0;
+            // [codex 对齐] 续接失效/连接上限的快速重试次数（不占传输重试预算）
+            int continuationRetries = 0;
+            while (true) {
+                if (aborted.get()) {
+                    return true;   // onError 已由 abort listener 交付
+                }
+                boolean emittedContent = false;
+                try {
+                    ResponsesWsSession session = st.session;
+                    if (session == null || session.isClosed()) {
+                        // 连接不可用 ⇒ 续接状态作废（previous_response_id 依附会话状态）
+                        st.invalidateContinuation();
+                        previousResponseId = null;
+                        toSend = input;
+                        session = ResponsesWsSession.connect(buildWsClient(config, sessionId),
+                            ResponsesWsSession.CONNECT_TIMEOUT_MS);
+                        st.session = session;
+                        if (abortController != null) {
+                            abortController.onCancel(ac -> st.closeSession());
+                        }
+                    }
+
+                    ResponsesClientEvent.ResponseCreate request = buildWsRequest(modelName, instructions,
+                        toSend, sdkTools, maxOutputTokens, sessionId, resolvedEffort, previousResponseId);
+                    if (log.isDebugEnabled()) {
+                        log.debug("[responses-ws] session={} model={} input={} send={} prev={} retry={}",
+                            sessionId, modelName, input.size(), toSend.size(), previousResponseId, transportRetries);
+                    }
+                    session.send(request);
+
+                    StringBuilder content = new StringBuilder();
+                    StringBuilder reasoning = new StringBuilder();
+                    Map<String, StringBuilder> argBuffers = new LinkedHashMap<>();
+                    Map<String, PendingCall> pendingCalls = new LinkedHashMap<>();
+                    List<ToolUseBlock> toolCalls = new ArrayList<>();
+                    Set<String> emittedCallKeys = new HashSet<>();
+                    Set<String> textDeltaItems = new HashSet<>();
+                    AtomicReference<Response> finalResponse = new AtomicReference<>();
+
+                    boolean sawEvent = false;
+                    boolean sawOutput = false;
+                    boolean sawReasoning = false;
+                    boolean sawToolCall = false;
+
+                    while (true) {
+                        if (aborted.get()) {
+                            return true;
+                        }
+                        ResponsesServerEvent ev;
+                        try {
+                            ev = session.next(idleMs);
+                        } catch (TimeoutException te) {
+                            st.closeSession();
+                            throw new StreamIdleTimeoutError(
+                                progressOf(sawEvent, sawOutput, sawToolCall, sawReasoning), false,
+                                "responses websocket idle timeout " + idleMs + "ms");
+                        }
+                        if (ev == null) {
+                            throw new IllegalStateException("responses websocket closed");
+                        }
+                        ResponsesWireSignal sig = ResponsesWireSignal.of(ev);
+                        if (sig.kind == ResponsesWireSignal.Kind.IGNORED) {
+                            continue;   // codex.rate_limits / codex.response.metadata / websocket_timing…
+                        }
+                        sawEvent = true;
+                        if (sig.kind == ResponsesWireSignal.Kind.TEXT_DELTA
+                            || sig.kind == ResponsesWireSignal.Kind.TEXT_DONE
+                            || sig.kind == ResponsesWireSignal.Kind.REFUSAL_DELTA) {
+                            sawOutput = true;
+                        }
+                        if (sig.kind == ResponsesWireSignal.Kind.REASONING_SUMMARY_DELTA
+                            || sig.kind == ResponsesWireSignal.Kind.REASONING_TEXT_DELTA) {
+                            sawReasoning = true;
+                        }
+                        if (sig.kind == ResponsesWireSignal.Kind.ARGS_DONE
+                            || sig.kind == ResponsesWireSignal.Kind.ITEM_DONE) {
+                            sawToolCall = true;
+                        }
+                        emittedContent = sawOutput || sawToolCall;
+                        String failure = handleWsEvent(ev, content, reasoning, argBuffers, pendingCalls,
+                            toolCalls, emittedCallKeys, textDeltaItems, finalResponse,
+                            onChunk, onReasoningChunk, onToolCallComplete);
+                        if (failure != null) {
+                            // [codex 对齐] 续接失效/连接上限是**可恢复**的：codex 明确为它们
+                            //   作废 previous_response_id 后重发（responses_websocket.rs:432-434
+                            //   PREVIOUS_RESPONSE_NOT_FOUND_CODE / WEBSOCKET_CONNECTION_LIMIT_REACHED_CODE），
+                            //   不能按终态失败处理。抛可重试异常交给下方 catch。
+                            if (isRecoverableWsReconnect(failure)) {
+                                throw new IllegalStateException("responses ws recoverable: " + failure);
+                            }
+                            // 其余服务端终态失败（response.failed / error 事件）：codex 归为 Never
+                            //   （不重试、不切传输）——重放同一请求只会得到同样结果并重复计费。
+                            throw new WsTerminalException(failure);
+                        }
+                        Response done = finalResponse.get();
+                        if (done != null) {
+                            // 成功终止：更新增量状态（会话内容摘要 = 本次全量 input ++ 本轮 output）
+                            st.lastResponseId = done.id();
+                            st.fingerprint = fingerprint;
+                            st.conversationDigests = concat(fullDigests, digestSignatureItems(outputSignature(done)));
+                            terminate(done, toolCalls, content, reasoning, scope,
+                                onAssistantMessage, onComplete);
+                            return true;
+                        }
+                    }
+                } catch (StreamIdleTimeoutError ite) {
+                    LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
+                    onError.accept(ite);
+                    return true;
+                } catch (WsTerminalException terminal) {
+                    LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
+                    onError.accept(new IllegalStateException(terminal.getMessage()));
+                    return true;
+                } catch (Throwable e) {
+                    if (aborted.get()) {
+                        return true;
+                    }
+                    // 已见到输出 ⇒ 不重试、不降级（重放会重复计费/重复正文，对齐 codex websocket_fallback_close）
+                    if (emittedContent) {
+                        LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
+                        onError.accept(OpenAiSdkProvider.translateSdkError(e));
+                        return true;
+                    }
+                    // [codex 对齐] 续接失效（previous_response_not_found）/ 连接上限
+                    //   （websocket_connection_limit_reached）：codex 的处置是作废续接、立即重发全量
+                    //   （responses_websocket.rs:432-434）。不走背退避、不占传输重试预算。
+                    if (isRecoverableWsReconnect(messagesOf(e))
+                        && continuationRetries < WS_CONTINUATION_MAX_RETRIES) {
+                        continuationRetries++;
+                        log.info("[responses-ws] session={} 续接失效/连接上限，立即全量重连 {}/{}: {}",
+                            sessionId, continuationRetries, WS_CONTINUATION_MAX_RETRIES, e.toString());
+                        st.closeSession();
+                        previousResponseId = null;
+                        toSend = input;
+                        continue;
+                    }
+                    // 426 Upgrade Required / 消息超限 ⇒ 立即 sticky 切 HTTP（codex client.rs:2435-2439 / ws:1267）
+                    if (isUpgradeRequired(e) || isMessageTooLarge(e)) {                        log.info("[responses-ws] session={} 端点要求 HTTP 或请求超限，永久切 HTTP: {}",
+                            sessionId, e.toString());
+                        wsManager.disable(wsKey);
+                        return false;
+                    }
+                    // 显式访问拒绝：终态，不重试、不切传输（codex RetryPolicy::Never）
+                    if (isExplicitAccessDenial(e)) {
+                        LlmCallScope.record(scope, AgentUsage.EMPTY, UsageTokenSource.UNKNOWN, LlmUsagePhase.FAILED);
+                        onError.accept(OpenAiSdkProvider.translateSdkError(e));
+                        return true;
+                    }
+                    // 401 自愈：刷新后同传输重试一次（codex handle_unauthorized）
+                    if (isAuthError(e) && authRetried.compareAndSet(false, true)) {
+                        String refreshed = forceRefreshAccess(config.apiKey());
+                        if (refreshed != null) {
+                            log.info("[responses-ws] access token 失效，刷新后重建连接重试 model={}", modelName);
+                            ProviderConfig retried = new ProviderConfig(config.baseUrl(), refreshed,
+                                config.extraHeaders(), config.extraBody());
+                            st.closeSession();
+                            return doStreamWs(retried, modelName, wsKey, sessionId, instructions, input,
+                                sdkTools, maxOutputTokens, resolvedEffort, onChunk, onAssistantMessage,
+                                onToolCallComplete, onReasoningChunk, aborted, onError, onComplete,
+                                scope, streamIdleControl, abortController, authRetried);
+                        }
+                    }
+                    // 其余传输/流错误：WS 内重试（codex stream_max_retries 默认 5），耗尽 ⇒ sticky HTTP
+                    if (transportRetries < WS_STREAM_MAX_RETRIES) {
+                        transportRetries++;
+                        long delay = backoffMs(transportRetries);
+                        log.warn("[responses-ws] 流失败，重连重试 {}/{}（{}ms）: {}",
+                            transportRetries, WS_STREAM_MAX_RETRIES, delay, e.toString());
+                        st.closeSession();
+                        sleepQuietly(delay);
+                        previousResponseId = null;
+                        toSend = input;
+                        continue;
+                    }
+                    log.warn("[responses-ws] 重试耗尽，永久切 HTTP: {}", e.toString());
+                    wsManager.disable(wsKey);
+                    return false;
+                }
+            }
+        }
+    }
+
+    private static StreamIdleTimeoutError.Progress progressOf(boolean sawEvent, boolean sawOutput,
+                                                              boolean sawToolCall, boolean sawReasoning) {
+        if (!sawEvent) {
+            return StreamIdleTimeoutError.Progress.NOTHING;
+        }
+        if (sawOutput) {
+            return StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT;
+        }
+        if (sawToolCall) {
+            return StreamIdleTimeoutError.Progress.PARTIAL_OUTPUT;
+        }
+        if (sawReasoning) {
+            return StreamIdleTimeoutError.Progress.THINKING_ONLY;
+        }
+        return StreamIdleTimeoutError.Progress.STARTED;
+    }
+
+    /** codex 握手/连接超时 15s；读空闲由 {@code StreamIdleControl} 独立负责（不设 okhttp readTimeout）。 */
+    private static OpenAIClient buildWsClient(ProviderConfig config, String sessionId) {
+        OpenAIOkHttpClient.Builder builder = OpenAIOkHttpClient.builder()
+            .apiKey(config.apiKey())
+            .maxRetries(0);
+        if (config.baseUrl() != null && !config.baseUrl().isBlank()) {
+            builder.baseUrl(config.baseUrl());
+        }
+        java.net.Proxy outbound = OutboundProxy.httpProxyFor(config.baseUrl());
+        if (outbound != null) {
+            builder.proxy(outbound);
+        }
+        if (sessionId != null && !sessionId.isBlank()) {
+            builder.putHeader("session_id", sessionId);
+            builder.putHeader("x-client-request-id", sessionId);   // 对齐 pi/codex 的请求级关联头
+        }
+        // codex 官方 WS beta 头（二进制/源码同值）
+        builder.putHeader("OpenAI-Beta", "responses_websockets=2026-02-06");
+        ProviderHeaderInjector.apply(builder::putHeader, config.extraHeaders(), sessionId);
+        return builder.build();
+    }
+
+    /** WS 版请求体（字段与 {@link #buildParams} 对齐；包内可见供回归测试断言 wire 形态）。 */
+    static ResponsesClientEvent.ResponseCreate buildWsRequest(String modelName,
+                                                                      String instructions,
+                                                                      List<ResponseInputItem> input,
+                                                                      List<Tool> sdkTools,
+                                                                      Integer maxOutputTokens,
+                                                                      String promptCacheKey,
+                                                                      String reasoningEffort,
+                                                                      String previousResponseId) {
+        ResponsesClientEvent.ResponseCreate.Builder b = ResponsesClientEvent.ResponseCreate.builder()
+            .model(modelName)
+            .inputOfResponse(input == null ? List.of() : input)
+            .store(false)
+            .stream(true)
+            .parallelToolCalls(true)
+            .toolChoice(ToolChoiceOptions.AUTO)
+            .addInclude(ResponseIncludable.REASONING_ENCRYPTED_CONTENT);
+        if (instructions != null && !instructions.isBlank()) {
+            b.instructions(instructions);
+        }
+        if (sdkTools != null && !sdkTools.isEmpty()) {
+            b.tools(sdkTools);
+        }
+        if (maxOutputTokens != null && maxOutputTokens > 0) {
+            b.maxOutputTokens(maxOutputTokens.longValue());
+        }
+        if (promptCacheKey != null && !promptCacheKey.isBlank()) {
+            b.promptCacheKey(promptCacheKey);
+        }
+        // [codex 对齐] client_metadata.session_id —— codex 的 ResponsesApiRequest 每次都带
+        //   （codex-rs/codex-api/src/common.rs:432；值来自 responses_metadata.client_metadata）。
+        //   服务端用于会话路由/遥测；可选字段，缺失不影响协议正确性。
+        if (promptCacheKey != null && !promptCacheKey.isBlank()) {
+            ObjectNode meta = JSON.createObjectNode();
+            meta.put("session_id", promptCacheKey);
+            b.putAdditionalProperty("client_metadata", JsonValue.fromJsonNode(meta));
+        }
+        Reasoning reasoning = reasoningOf(modelName, reasoningEffort);
+        if (reasoning != null) {
+            b.reasoning(reasoning);
+        }
+        if (previousResponseId != null && !previousResponseId.isBlank()) {
+            b.previousResponseId(previousResponseId);
+        }
+        return b.build();
+    }
+
+    /** 除 input / previous_response_id 外的字段指纹（任一变化则不增量）。 */
+    private static String requestFingerprint(String modelName, String instructions, List<Tool> tools,
+                                             Integer maxOutputTokens, String promptCacheKey,
+                                             String reasoningEffort) {
+        return modelName + "\u0001"
+            + (instructions == null ? "" : instructions) + "\u0001"
+            + (tools == null ? "" : tools.toString()) + "\u0001"
+            + (maxOutputTokens == null ? "" : maxOutputTokens) + "\u0001"
+            + (promptCacheKey == null ? "" : promptCacheKey) + "\u0001"
+            + (reasoningEffort == null ? "" : reasoningEffort);
+    }
+
+    /** codex 退避：首 5s 起、翻倍、封顶 60s（responses_retry.rs:23-24）。 */
+    private static long backoffMs(int attempt) {
+        long delay = 5_000L;
+        for (int i = 1; i < attempt && delay < 60_000L; i++) {
+            delay *= 2;
+        }
+        return Math.min(delay, 60_000L);
+    }
+
+    /**
+     * [codex 对齐] 续接失效/连接上限判据（字符串含错误码或文案）。
+     *
+     * <p>codex 常量逐字：
+     * {@code previous_response_not_found}（responses_websocket.rs:432）与
+     * {@code websocket_connection_limit_reached}（:433），两者都要求作废
+     * {@code previous_response_id} 后重发全量。
+     */
+    static boolean isRecoverableWsReconnect(String message) {
+        if (message == null || message.isEmpty()) {
+            return false;
+        }
+        String m = message.toLowerCase(java.util.Locale.ROOT);
+        return m.contains("previous_response_not_found")
+            || m.contains("previous response was not found")
+            || m.contains("websocket_connection_limit_reached")
+            || m.contains("responses websocket connection limit reached");
+    }
+
+    /** 拼接异常 cause 链消息（上限 4KB），供错误码判据使用。 */
+    static String messagesOf(Throwable e) {
+        StringBuilder sb = new StringBuilder();
+        for (Throwable t = e; t != null && sb.length() < 4096; t = t.getCause()) {
+            if (t.getMessage() != null) {
+                sb.append(t.getMessage()).append(' ');
+            }
+        }
+        return sb.toString();
+    }
+
+    private static void sleepQuietly(long ms) {
+        try {
+            Thread.sleep(ms);
+        } catch (InterruptedException ie) {
+            Thread.currentThread().interrupt();
+        }
+    }
+
+    /** 握手 426 Upgrade Required（codex client.rs:2435-2439）。 */
+    private static boolean isUpgradeRequired(Throwable t) {
+        Throwable cur = t;
+        for (int depth = 0; cur != null && depth < 16; depth++) {
+            if (cur instanceof com.openai.errors.OpenAIServiceException se && se.statusCode() == 426) {
+                return true;
+            }
+            if (cur instanceof LlmApiException api && api.status() == 426) {
+                return true;
+            }
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("426") && lower.contains("upgrade")) {
+                    return true;
+                }
+            }
+            Throwable next = cur.getCause();
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        return false;
+    }
+
+    /** WebSocket 消息超限（codex WebsocketMessageTooLarge）。 */
+    private static boolean isMessageTooLarge(Throwable t) {
+        Throwable cur = t;
+        for (int depth = 0; cur != null && depth < 16; depth++) {
+            String msg = cur.getMessage();
+            if (msg != null) {
+                String lower = msg.toLowerCase(java.util.Locale.ROOT);
+                if (lower.contains("message size") || lower.contains("too large")
+                    || lower.contains("websocketmessagetoolarge") || lower.contains("closecode.size")) {
+                    return true;
+                }
+            }
+            Throwable next = cur.getCause();
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        return false;
+    }
+
+    /**
+     * 显式访问拒绝（codex `RetryPolicy::Never`）：403 + 明确的 workspace/access-program 码。
+     *
+     * <p>这些不是瞬时故障，重试或换传输都会得到同样结果；codex 明确不重试、不切传输
+     * （core/tests/suite/websocket_fallback.rs 的 forbidden_responses_retry_only_without_an_explicit_access_denial）。
+     */
+    private static boolean isExplicitAccessDenial(Throwable t) {
+        Throwable cur = t;
+        for (int depth = 0; cur != null && depth < 16; depth++) {
+            String text = null;
+            if (cur instanceof LlmApiException api) {
+                if (api.status() != 403) {
+                    return false;
+                }
+                text = api.body();
+            } else if (cur instanceof com.openai.errors.OpenAIServiceException se) {
+                if (se.statusCode() != 403) {
+                    return false;
+                }
+                text = serviceBodyText(se);
+            } else if (cur instanceof com.openai.core.http.ResponseWebSocketException rwe) {
+                text = String.valueOf(rwe.event());
+            }
+            if (text != null) {
+                return text.contains("invalid_workspace_selected")
+                    || text.contains("codex_workspace_access_denied")
+                    || text.contains("access_program_not_enabled");
+            }
+            Throwable next = cur.getCause();
+            if (next == cur) {
+                break;
+            }
+            cur = next;
+        }
+        return false;
+    }
+
+    private static List<String> concat(List<String> a, List<String> b) {
+        List<String> out = new ArrayList<>(a.size() + b.size());
+        out.addAll(a);
+        out.addAll(b);
+        return out;
+    }
+
+    /**
+     * 逐项摘要（本仓自造的稳定指纹，用于判断「新 input 的前缀是否与上一轮完全一致」）。
+     *
+     * <p>不用 SDK 对象序列化：Kotlin 模型没有稳定的 public bean 形状；这里只取参与前缀判定
+     * 的语义字段，且 {@link #replayFromSignature} 产出的 item 与 {@link #digestSignatureItems}
+     * 用同一套字段，保证自洽。
+     */
+    static List<String> digestInput(List<ResponseInputItem> items) {
+        List<String> out = new ArrayList<>(items == null ? 0 : items.size());
+        if (items == null) {
+            return out;
+        }
+        for (ResponseInputItem it : items) {
+            out.add(digestItem(it));
+        }
+        return out;
+    }
+
+    private static String digestItem(ResponseInputItem it) {
+        if (it == null) {
+            return "null";
+        }
+        if (it.isReasoning()) {
+            ResponseReasoningItem r = it.asReasoning();
+            return "rs|" + r.id() + "|" + r.encryptedContent().orElse("") + "|" + summaryText(r.summary());
+        }
+        if (it.isResponseOutputMessage()) {
+            ResponseOutputMessage m = it.asResponseOutputMessage();
+            StringBuilder t = new StringBuilder();
+            for (ResponseOutputMessage.Content c : m.content()) {
+                if (c.isOutputText()) {
+                    t.append(c.asOutputText().text());
+                } else if (c.isRefusal()) {
+                    t.append(c.asRefusal().refusal());
+                }
+            }
+            return "om|" + m.id() + "|" + t;
+        }
+        if (it.isFunctionCall()) {
+            ResponseFunctionToolCall fc = it.asFunctionCall();
+            return "fc|" + fc.id().orElse("") + "|" + fc.callId() + "|" + fc.name() + "|" + fc.arguments();
+        }
+        if (it.isEasyInputMessage()) {
+            EasyInputMessage m = it.asEasyInputMessage();
+            return "msg|" + m.role() + "|" + m.content();
+        }
+        if (it.isMessage()) {
+            ResponseInputItem.Message m = it.asMessage();
+            StringBuilder t = new StringBuilder();
+            for (ResponseInputContent c : m.content()) {
+                if (c.isInputText()) {
+                    t.append(c.asInputText().text());
+                } else if (c.isInputImage()) {
+                    t.append(c.asInputImage().imageUrl());
+                }
+            }
+            return "msg|" + m.role() + "|" + t;
+        }
+        if (it.isFunctionCallOutput()) {
+            ResponseInputItem.FunctionCallOutput o = it.asFunctionCallOutput();
+            return "fco|" + o.callId() + "|" + o.output();
+        }
+        return "other|" + it;
+    }
+
+    private static String summaryText(List<ResponseReasoningItem.Summary> summary) {
+        if (summary == null || summary.isEmpty()) {
+            return "";
+        }
+        StringBuilder sb = new StringBuilder();
+        for (ResponseReasoningItem.Summary s : summary) {
+            if (s != null && s.text() != null) {
+                sb.append(s.text());
+            }
+        }
+        return sb.toString();
+    }
+
+    /** 上一轮 output → 可回放签名（thinkingSignature 列承载；kind 区分 Anthropic 的 thinking 块）。 */
+    static String outputSignature(Response response) {
+        if (response == null || response.output() == null || response.output().isEmpty()) {
+            return null;
+        }
+        ObjectNode root = JSON.createObjectNode();
+        root.put("kind", "responses_output");
+        ArrayNode items = root.putArray("items");
+        for (ResponseOutputItem item : response.output()) {
+            if (item == null) {
+                continue;
+            }
+            if (item.isReasoning()) {
+                var r = item.asReasoning();
+                ObjectNode n = items.addObject();
+                n.put("type", "reasoning");
+                if (r.id() != null) {
+                    n.put("id", r.id());
+                }
+                r.encryptedContent().ifPresent(v -> n.put("encrypted_content", v));
+                ArrayNode sum = n.putArray("summary");
+                for (var s : r.summary()) {
+                    if (s != null && s.text() != null) {
+                        sum.add(s.text());
+                    }
+                }
+            } else if (item.isMessage()) {
+                var m = item.asMessage();
+                StringBuilder t = new StringBuilder();
+                for (var c : m.content()) {
+                    if (c.isOutputText()) {
+                        t.append(c.asOutputText().text());
+                    } else if (c.isRefusal()) {
+                        t.append(c.asRefusal().refusal());
+                    }
+                }
+                if (t.length() == 0) {
+                    continue;
+                }
+                ObjectNode n = items.addObject();
+                n.put("type", "message");
+                if (m.id() != null) {
+                    n.put("id", m.id());
+                }
+                n.put("text", t.toString());
+            } else if (item.isFunctionCall()) {
+                var fc = item.asFunctionCall();
+                if (fc.callId() == null || fc.name() == null) {
+                    continue;
+                }
+                ObjectNode n = items.addObject();
+                n.put("type", "function_call");
+                fc.id().ifPresent(v -> n.put("id", v));
+                n.put("call_id", fc.callId());
+                n.put("name", fc.name());
+                n.put("arguments", fc.arguments() == null ? "{}" : fc.arguments());
+            }
+        }
+        return items.isEmpty() ? null : root.toString();
+    }
+
+    /** 签名 → input items（不可解析 / 非 responses 形状 → null，走旧 EasyInputMessage 逻辑）。 */
+    static List<ResponseInputItem> replayFromSignature(String signature) {
+        if (signature == null || signature.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode root = JSON.readTree(signature);
+            if (root == null || !"responses_output".equals(root.path("kind").asText())) {
+                return null;
+            }
+            List<ResponseInputItem> out = new ArrayList<>();
+            for (JsonNode n : root.path("items")) {
+                String type = n.path("type").asText("");
+                switch (type) {
+                    case "reasoning" -> {
+                        ResponseReasoningItem.Builder b = ResponseReasoningItem.builder();
+                        if (n.hasNonNull("id")) {
+                            b.id(n.get("id").asText());
+                        }
+                        if (n.hasNonNull("encrypted_content")) {
+                            b.encryptedContent(n.get("encrypted_content").asText());
+                        }
+                        List<ResponseReasoningItem.Summary> summary = new ArrayList<>();
+                        for (JsonNode s : n.path("summary")) {
+                            summary.add(ResponseReasoningItem.Summary.builder().text(s.asText()).build());
+                        }
+                        b.summary(summary);
+                        // ⛔ 不设 status：codex 端点拒绝 input item 上的 status 字段
+                        //   （实测 `Invalid response.create payload: Unknown parameter: 'input[127].status'`）。
+                        //   input 语义里 status 无意义；SDK 该字段可选。
+                        out.add(ResponseInputItem.ofReasoning(b.build()));
+                    }
+                    case "message" -> {
+                        // 对齐 pi openai-responses-shared.js: text block →
+                        //   {type:"message", role:"assistant", content:[{type:"output_text",...}],
+                        //    status:"completed", id:"msg_..."}
+                        // codex 接受 message 上的 status（拒绝的是 reasoning/function_call 上的）。
+                        String text = n.path("text").asText("");
+                        if (text.isEmpty()) {
+                            break;
+                        }
+                        if (!n.hasNonNull("id")) {
+                            // 无 id 时 SDK 的 ResponseOutputMessage 无法构造（id/status 均必填）
+                            //   ⇒ 退化成无 id 的 easy message（digest 侧同判据，保持自洽）。
+                            out.add(ResponseInputItem.ofEasyInputMessage(
+                                EasyInputMessage.builder()
+                                    .role(EasyInputMessage.Role.ASSISTANT)
+                                    .content(text)
+                                    .build()));
+                            break;
+                        }
+                        ResponseOutputMessage.Builder b = ResponseOutputMessage.builder()
+                            .id(n.get("id").asText())
+                            .role(JsonValue.from("assistant"))
+                            .status(ResponseOutputMessage.Status.COMPLETED)
+                            .type(JsonValue.from("message"))
+                            .content(List.of(ResponseOutputMessage.Content.ofOutputText(
+                                ResponseOutputText.builder()
+                                    .annotations(List.of())
+                                    .text(text)
+                                    .build())));
+                        out.add(ResponseInputItem.ofResponseOutputMessage(b.build()));
+                    }
+                    case "function_call" -> {
+                        ResponseFunctionToolCall.Builder b = ResponseFunctionToolCall.builder()
+                            .callId(n.path("call_id").asText())
+                            .name(n.path("name").asText())
+                            .arguments(n.path("arguments").asText("{}"));
+                        // ⛔ 不设 status（codex 端点拒绝 input[].status；SDK 该字段可选）
+                        if (n.hasNonNull("id")) {
+                            b.id(n.get("id").asText());
+                        }
+                        out.add(ResponseInputItem.ofFunctionCall(b.build()));
+                    }
+                    default -> {
+                        // 未知条目忽略（向前兼容）
+                    }
+                }
+            }
+            return out.isEmpty() ? null : out;
+        } catch (Exception e) {
+            log.debug("ResponsesSdkProvider: thinkingSignature 非 responses 形状，忽略: {}", e.toString());
+            return null;
+        }
+    }
+
+    /** 签名条目的摘要（必须与 {@link #digestItem} 对同类条目的输出逐字一致）。 */
+    static List<String> digestSignatureItems(String signature) {
+        List<String> out = new ArrayList<>();
+        if (signature == null || signature.isBlank()) {
+            return out;
+        }
+        try {
+            JsonNode root = JSON.readTree(signature);
+            if (root == null) {
+                return out;
+            }
+            for (JsonNode n : root.path("items")) {
+                String type = n.path("type").asText("");
+                switch (type) {
+                    case "reasoning" -> {
+                        StringBuilder sum = new StringBuilder();
+                        for (JsonNode s : n.path("summary")) {
+                            sum.append(s.asText());
+                        }
+                        out.add("rs|" + n.path("id").asText("") + "|"
+                            + n.path("encrypted_content").asText("") + "|" + sum);
+                    }
+                    // message：有 id ⇒ "om|id|text"（ResponseOutputMessage 回放）；
+                    //   无 id ⇒ "msg|assistant|text"（replayFromSignature 的同判据退化分支）。
+                    case "message" -> out.add(
+                        n.hasNonNull("id") && !n.path("text").asText("").isEmpty()
+                            ? "om|" + n.get("id").asText() + "|" + n.path("text").asText("")
+                            : "msg|assistant|" + n.path("text").asText(""));
+                    case "function_call" -> out.add("fc|" + n.path("id").asText("") + "|"
+                        + n.path("call_id").asText("") + "|" + n.path("name").asText("")
+                        + "|" + n.path("arguments").asText("{}"));
+                    default -> {
+                        // 忽略
+                    }
+                }
+            }
+        } catch (Exception ignore) {
+            // 摘要失败 → 空 ⇒ 下一轮回全量（安全）
+        }
+        return out;
+    }
+
+    /**
+     * SSE 单事件映射 → 统一 {@link ResponsesWireSignal} 消费（与 WS 共用 {@link #handleSignal}）。
+     *
+     * <p>返回非 null = 该事件是终止性失败（调用方停止消费并走 onError）。
      *
      * <pre>
      * response.output_text.delta                -> onChunk
      * response.reasoning_summary_text.delta     -> onReasoningChunk
+     * response.reasoning_text.delta             -> onReasoningChunk
+     * response.refusal.delta                    -> onChunk（拒答也是可见正文）
      * response.output_item.added                -> 记 function_call 的 name / call_id
      * response.function_call_arguments.delta    -> 累积参数
      * response.function_call_arguments.done     -> ToolUseBlock -> onToolCallComplete
-     * response.output_item.done                 -> 兜底收尾（arguments.done 缺失时补发工具块）
+     * response.output_item.done                 -> 兜底收尾（arguments.done 缺失 / 不发 delta 的端点）
+     * response.output_text.done                 -> 兜底补发（按 itemId 去重）
      * response.completed / response.incomplete  -> 记最终响应（usage 来源）
      * response.failed / error                   -> 返回失败描述
      * 其余                                      -> debug 忽略
@@ -295,78 +1113,162 @@ public class ResponsesSdkProvider implements LlmProvider {
                                Map<String, PendingCall> pendingCalls,
                                List<ToolUseBlock> toolCalls,
                                Set<String> emittedCallKeys,
+                               Set<String> textDeltaItems,
                                AtomicReference<Response> finalResponse,
                                Consumer<String> onChunk,
                                Consumer<String> onReasoningChunk,
                                Consumer<ToolUseBlock> onToolCallComplete) {
-        if (ev.isOutputTextDelta()) {
-            String delta = ev.asOutputTextDelta().delta();
-            content.append(delta);
-            onChunk.accept(delta);
-            return null;
-        }
-        if (ev.isReasoningSummaryTextDelta()) {
-            String delta = ev.asReasoningSummaryTextDelta().delta();
-            reasoning.append(delta);
-            onReasoningChunk.accept(delta);
-            return null;
-        }
-        if (ev.isOutputItemAdded()) {
-            ResponseOutputItem item = ev.asOutputItemAdded().item();
-            if (item.isFunctionCall()) {
-                ResponseFunctionToolCall fc = item.asFunctionCall();
-                pendingCalls.put(callKey(fc), new PendingCall(fc.callId(), fc.name()));
+        return handleSignal(ResponsesWireSignal.of(ev), content, reasoning, argBuffers, pendingCalls,
+            toolCalls, emittedCallKeys, textDeltaItems, finalResponse, onChunk, onReasoningChunk,
+            onToolCallComplete);
+    }
+
+    /** WebSocket 单事件映射 → 同一 {@link #handleSignal}。 */
+    private String handleWsEvent(ResponsesServerEvent ev,
+                                 StringBuilder content,
+                                 StringBuilder reasoning,
+                                 Map<String, StringBuilder> argBuffers,
+                                 Map<String, PendingCall> pendingCalls,
+                                 List<ToolUseBlock> toolCalls,
+                                 Set<String> emittedCallKeys,
+                                 Set<String> textDeltaItems,
+                                 AtomicReference<Response> finalResponse,
+                                 Consumer<String> onChunk,
+                                 Consumer<String> onReasoningChunk,
+                                 Consumer<ToolUseBlock> onToolCallComplete) {
+        return handleSignal(ResponsesWireSignal.of(ev), content, reasoning, argBuffers, pendingCalls,
+            toolCalls, emittedCallKeys, textDeltaItems, finalResponse, onChunk, onReasoningChunk,
+            onToolCallComplete);
+    }
+
+    /**
+     * 统一事件消费（SSE / WS 单源）。
+     *
+     * <p>`textDeltaItems`：已经收到正文增量的 itemId 集合。`output_text.done` 与
+     * `output_item.done` 的兜底补发都靠它去重 —— 端点正常发 delta 时不会重复吐正文；
+     * 兼容端点只发 done 时也能整段交付（否则表现为「流式没输出」）。
+     */
+    private String handleSignal(ResponsesWireSignal sig,
+                                StringBuilder content,
+                                StringBuilder reasoning,
+                                Map<String, StringBuilder> argBuffers,
+                                Map<String, PendingCall> pendingCalls,
+                                List<ToolUseBlock> toolCalls,
+                                Set<String> emittedCallKeys,
+                                Set<String> textDeltaItems,
+                                AtomicReference<Response> finalResponse,
+                                Consumer<String> onChunk,
+                                Consumer<String> onReasoningChunk,
+                                Consumer<ToolUseBlock> onToolCallComplete) {
+        switch (sig.kind) {
+            case TEXT_DELTA -> {
+                if (sig.delta == null) {
+                    return null;
+                }
+                content.append(sig.delta);
+                onChunk.accept(sig.delta);
+                if (sig.itemId != null) {
+                    textDeltaItems.add(sig.itemId);
+                }
+                return null;
             }
-            return null;
-        }
-        if (ev.isFunctionCallArgumentsDelta()) {
-            var e = ev.asFunctionCallArgumentsDelta();
-            argBuffers.computeIfAbsent(e.itemId(), k -> new StringBuilder()).append(e.delta());
-            return null;
-        }
-        if (ev.isFunctionCallArgumentsDone()) {
-            var e = ev.asFunctionCallArgumentsDone();
-            emitToolCall(e.itemId(), e.arguments(), pendingCalls, argBuffers, toolCalls,
-                emittedCallKeys, onToolCallComplete);
-            return null;
-        }
-        if (ev.isOutputItemDone()) {
-            ResponseOutputItem item = ev.asOutputItemDone().item();
-            if (item.isFunctionCall()) {
-                ResponseFunctionToolCall fc = item.asFunctionCall();
-                pendingCalls.putIfAbsent(callKey(fc), new PendingCall(fc.callId(), fc.name()));
-                // 兜底：部分兼容端点不发 function_call_arguments.done，只在 output_item.done 给全量参数
-                emitToolCall(callKey(fc), fc.arguments(), pendingCalls, argBuffers, toolCalls,
+            case REASONING_SUMMARY_DELTA, REASONING_TEXT_DELTA -> {
+                if (sig.delta != null) {
+                    reasoning.append(sig.delta);
+                    onReasoningChunk.accept(sig.delta);
+                }
+                return null;
+            }
+            case REFUSAL_DELTA -> {
+                // 模型拒答：text 在 output_text 之外走 refusal 通道 ⇒ 必须当可见正文
+                if (sig.delta != null) {
+                    content.append(sig.delta);
+                    onChunk.accept(sig.delta);
+                }
+                return null;
+            }
+            case ITEM_ADDED -> {
+                ResponseOutputItem item = sig.item;
+                if (item != null && item.isFunctionCall()) {
+                    ResponseFunctionToolCall fc = item.asFunctionCall();
+                    pendingCalls.put(callKey(fc), new PendingCall(fc.callId(), fc.name()));
+                }
+                return null;
+            }
+            case ARGS_DELTA -> {
+                if (sig.itemId != null && sig.delta != null) {
+                    argBuffers.computeIfAbsent(sig.itemId, k -> new StringBuilder()).append(sig.delta);
+                }
+                return null;
+            }
+            case ARGS_DONE -> {
+                emitToolCall(sig.itemId, sig.arguments, pendingCalls, argBuffers, toolCalls,
                     emittedCallKeys, onToolCallComplete);
+                return null;
             }
-            return null;
-        }
-        if (ev.isCompleted()) {
-            finalResponse.set(ev.asCompleted().response());
-            return null;
-        }
-        if (ev.isIncomplete()) {
-            finalResponse.set(ev.asIncomplete().response());
-            return null;
-        }
-        if (ev.isFailed()) {
-            return "Responses API response.failed: " + describeError(ev.asFailed().response());
-        }
-        if (ev.isError()) {
-            return "Responses API error event: " + ev.asError().message();
-        }
-        if (ev.isCreated()) {
-            // 只留痕：终态与 usage 一律从 completed / incomplete 取（created 里的 status 仍是 in_progress）
-            if (log.isDebugEnabled()) {
-                log.debug("ResponsesSdkProvider response.created id={}",
-                    ev.asCreated().response().id());
+            case ITEM_DONE -> {
+                ResponseOutputItem item = sig.item;
+                if (item != null && item.isFunctionCall()) {
+                    ResponseFunctionToolCall fc = item.asFunctionCall();
+                    pendingCalls.putIfAbsent(callKey(fc), new PendingCall(fc.callId(), fc.name()));
+                    // 兜底：部分兼容端点不发 function_call_arguments.done，只在 output_item.done 给全量参数
+                    emitToolCall(callKey(fc), fc.arguments(), pendingCalls, argBuffers, toolCalls,
+                        emittedCallKeys, onToolCallComplete);
+                } else if (item != null && item.isMessage()) {
+                    emitWholeMessageIfNoDelta(item.asMessage(), content, textDeltaItems, onChunk);
+                }
+                return null;
             }
-            return null;
+            case TEXT_DONE -> {
+                // 兜底：本 item 一个 delta 都没收到 → 整段补发一次
+                if (sig.itemId != null && sig.text != null && !sig.text.isEmpty()
+                    && textDeltaItems.add(sig.itemId)) {
+                    content.append(sig.text);
+                    onChunk.accept(sig.text);
+                }
+                return null;
+            }
+            case COMPLETED, INCOMPLETE -> {
+                finalResponse.set(sig.response);
+                return null;
+            }
+            case FAILED -> {
+                return "Responses API response.failed: " + describeError(sig.response);
+            }
+            case ERROR -> {
+                return "Responses API error event: " + sig.message;
+            }
+            default -> {
+                if (log.isDebugEnabled()) {
+                    log.debug("ResponsesSdkProvider 忽略未映射流事件: {}", sig.kind);
+                }
+                return null;
+            }
         }
-        if (log.isDebugEnabled()) {
-            log.debug("ResponsesSdkProvider 忽略未映射流事件: {}", ev);
+    }
+
+    /** 兜底：message item 没发过 delta 时把它的正文整段补发一次（按 item id 去重）。 */
+    private static void emitWholeMessageIfNoDelta(ResponseOutputMessage msg,
+                                                  StringBuilder content,
+                                                  Set<String> textDeltaItems,
+                                                  Consumer<String> onChunk) {
+        if (msg == null || msg.id() == null || textDeltaItems.contains(msg.id())) {
+            return;
         }
-        return null;
+        StringBuilder text = new StringBuilder();
+        for (ResponseOutputMessage.Content c : msg.content()) {
+            if (c.isOutputText()) {
+                text.append(c.asOutputText().text());
+            } else if (c.isRefusal()) {
+                text.append(c.asRefusal().refusal());
+            }
+        }
+        if (text.length() == 0) {
+            return;
+        }
+        textDeltaItems.add(msg.id());
+        content.append(text);
+        onChunk.accept(text.toString());
     }
 
     /** 收尾（成功路径）：usage 记账 -> onAssistantMessage -> onComplete。 */
@@ -403,7 +1305,7 @@ public class ResponsesSdkProvider implements LlmProvider {
             apiError,
             usage,
             response != null ? response.id() : null,
-            null);
+            outputSignature(response));
         onAssistantMessage.accept(msg);
         onComplete.run();
     }
@@ -601,6 +1503,18 @@ public class ResponsesSdkProvider implements LlmProvider {
                                              Integer maxOutputTokens,
                                              String promptCacheKey,
                                              String reasoningEffort) {
+        return buildParams(modelName, instructions, input, toolsList, maxOutputTokens,
+            promptCacheKey, reasoningEffort, false);
+    }
+
+    private ResponseCreateParams buildParams(String modelName,
+                                             String instructions,
+                                             List<ResponseInputItem> input,
+                                             List<Tool> toolsList,
+                                             Integer maxOutputTokens,
+                                             String promptCacheKey,
+                                             String reasoningEffort,
+                                             boolean codexEndpoint) {
         ResponseCreateParams.Builder b = ResponseCreateParams.builder()
             .model(modelName)
             .inputOfResponse(input == null ? List.of() : input)
@@ -629,6 +1543,13 @@ public class ResponsesSdkProvider implements LlmProvider {
                     reasoning.effort().map(Object::toString).orElse("?"), modelName);
             }
         }
+        // [responses-ws] 对齐 codex / pi：拿回 encrypted reasoning 供下一轮原样回放。
+        //   ⚠️ 仅 codex 端点发送（非 codex 的兼容端点未验证该 include 值，保持原 wire 不变）。
+        if (codexEndpoint) {
+            b.addInclude(ResponseIncludable.REASONING_ENCRYPTED_CONTENT)
+                .parallelToolCalls(true)
+                .toolChoice(ToolChoiceOptions.AUTO);
+        }
         return b.build();
     }
 
@@ -647,7 +1568,12 @@ public class ResponsesSdkProvider implements LlmProvider {
         if (openAiEffort == null || !EffortSupport.modelSupportsEffort(modelName)) {
             return null;
         }
-        return Reasoning.builder().effort(ReasoningEffort.of(openAiEffort)).build();
+        // [responses-ws] 对齐 pi（openai-codex-responses.js:257-259）：effort 存在时同时请求 summary=auto；
+        //   否则上游不会发 reasoning_summary_text.delta（思考面板无流式内容）。
+        return Reasoning.builder()
+            .effort(ReasoningEffort.of(openAiEffort))
+            .summary(Reasoning.Summary.AUTO)
+            .build();
     }
 
     /** systemPromptBlocks → 顶层 instructions（多块按空行 join；cacheScope 无对应物 → 忽略）。 */
@@ -708,6 +1634,14 @@ public class ResponsesSdkProvider implements LlmProvider {
                 case user -> items.add(buildUserItem(
                     m.contentBlocks(), m.content(), imageDetail, supportsImage));
                 case assistant -> {
+                    // [responses-ws] 有上一轮原样输出签名 ⇒ 逐项回放（reasoning item + message + function_call），
+                    //   这是 previous_response_id 增量前缀比对的成立前提（否则我们从历史重建的 item 与
+                    //   服务端 output 不等价，增量永远退化为全量）。
+                    List<ResponseInputItem> replay = replayFromSignature(m.thinkingSignature());
+                    if (replay != null) {
+                        items.addAll(replay);
+                        continue;
+                    }
                     String text = m.content() == null ? "" : m.content();
                     if (!text.isEmpty()) {
                         items.add(ResponseInputItem.ofEasyInputMessage(
@@ -996,7 +1930,7 @@ public class ResponsesSdkProvider implements LlmProvider {
         }
     }
 
-    /** 非流式响应中的全部 output_text。 */
+    /** 非流式响应中的全部 output_text（含 refusal —— 拒答也是可见正文）。 */
     static String extractText(Response response) {
         StringBuilder sb = new StringBuilder();
         if (response == null || response.output() == null) {
@@ -1010,6 +1944,8 @@ public class ResponsesSdkProvider implements LlmProvider {
             for (ResponseOutputMessage.Content c : msg.content()) {
                 if (c.isOutputText()) {
                     sb.append(c.asOutputText().text());
+                } else if (c.isRefusal()) {
+                    sb.append(c.asRefusal().refusal());
                 }
             }
         }
@@ -1051,7 +1987,11 @@ public class ResponsesSdkProvider implements LlmProvider {
         }
         Long cacheRead = u.inputTokensDetails() != null && u.inputTokensDetails().cachedTokens() > 0
             ? u.inputTokensDetails().cachedTokens() : null;
-        return new AgentUsage(u.inputTokens(), u.outputTokens(), null, cacheRead, null, null, null);
+        // [responses-ws] 对齐 SDK 字段：inputTokensDetails 同时有 cachedTokens / cacheWriteTokens；
+        //   后者映射到内部 cacheCreationInputTokens（此前恒漏读 ⇒ 统计少一列）。
+        Long cacheWrite = u.inputTokensDetails() != null && u.inputTokensDetails().cacheWriteTokens() > 0
+            ? u.inputTokensDetails().cacheWriteTokens() : null;
+        return new AgentUsage(u.inputTokens(), u.outputTokens(), cacheWrite, cacheRead, null, null, null);
     }
 
     /** response.failed 的人类可读描述。 */
@@ -1060,6 +2000,13 @@ public class ResponsesSdkProvider implements LlmProvider {
             return "no response";
         }
         return response.error().map(e -> e.message()).orElse("unknown error");
+    }
+
+    /** WS 服务端终态失败（对齐 codex RetryPolicy::Never：不重试、不切传输）。 */
+    private static final class WsTerminalException extends RuntimeException {
+        WsTerminalException(String message) {
+            super(message);
+        }
     }
 
     /** 流内待发工具调用（output_item.added 给出 name / call_id，参数由后续事件拼出）。 */

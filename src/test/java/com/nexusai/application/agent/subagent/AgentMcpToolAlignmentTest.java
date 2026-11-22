@@ -199,7 +199,8 @@ class AgentMcpToolAlignmentTest {
         //   该文本仅 McpAuthError 分支产出（成功路径返 content JSON、通用 catch 前缀 "MCP call failed:"），
         //   isEqualTo(authMsg) 即等价于「isError=true 且 401 未被吞」。isToolErrorData 前缀表不含
         //   "MCP server"，不可用于本认证错误文本（与 McpServerToolCallTimeAuthTest 同为 baseline 口径）。
-        assertThat(result.data()).isInstanceOf(String.class);
+        // [错误通道 · CCJ-ERR-014] 失败载荷 data 为 ToolError（错误态由类型承载，文本仍是原文）
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
         assertThat(String.valueOf(result.data())).isEqualTo(authMsg);
     }
 
@@ -240,7 +241,7 @@ class AgentMcpToolAlignmentTest {
         state.set(new LinkedHashMap<>(Map.of("mcp", mcp)));
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, Map.of(), null,
             prev -> Map.copyOf(state.get()),
@@ -296,7 +297,7 @@ class AgentMcpToolAlignmentTest {
         state.set(new LinkedHashMap<>(Map.of("mcp", mcp)));
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, Map.of(), null,
             prev -> Map.copyOf(state.get()),
@@ -349,7 +350,7 @@ class AgentMcpToolAlignmentTest {
         state.set(new LinkedHashMap<>(Map.of("mcp", mcp)));
 
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT, Map.of(), false, "", null, null, Map.of(), null,
             prev -> Map.copyOf(state.get()),

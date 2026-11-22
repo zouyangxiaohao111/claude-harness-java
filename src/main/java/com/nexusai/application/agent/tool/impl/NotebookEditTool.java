@@ -471,7 +471,9 @@ public class NotebookEditTool implements Tool {
      */
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {
-        if (isError) {
+        // [错误通道 · C2 第二道防线] isError / 失败载荷 → 交默认渲染器，不产成功模板。
+        if (isError || (result instanceof ToolResult<?> tr0
+                && tr0.data() instanceof com.nexusai.application.agent.tool.ToolError)) {
             return Tool.super.mapToToolResultBlockParam(result, toolUseId, isError);
         }
         if (!(result instanceof ToolResult<?> tr)) {

@@ -51,7 +51,7 @@ public final class PlanPaths {
     }
 
     /** 主会话 → {slug}.md；子代理 → {slug}-agent-{agentId}.md。 */
-    public static String planFilePath(String plansDirectory, String sessionId, UUID agentId) {
+    public static String planFilePath(String plansDirectory, String sessionId, String agentId) {
         String slug = slugFor(plansDirectory, sessionId);
         return agentId == null
             ? Path.of(plansDirectory, slug + ".md").toString()

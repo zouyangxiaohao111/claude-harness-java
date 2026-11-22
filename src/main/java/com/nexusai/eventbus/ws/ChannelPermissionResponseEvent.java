@@ -31,19 +31,39 @@ public class ChannelPermissionResponseEvent {
     private final String fromServer;
 
     /**
+     * [P0.1] 渠道适配器身份口令 · 必须与后端配置 {@code nexusai.mcp.channel-adapter-token} 一致。
+     *
+     * <p>为什么不复用 fromServer：那是消息体里可随便填的字符串，无法证明「你确实是一条活着的
+     * 渠道连接」。口令由运维在适配器侧配置，未配置时后端一律拒绝 STOMP 渠道回执（fail-closed）。
+     */
+    private final String adapterToken;
+
+    /**
+     * @JsonCreator + @JsonProperty 让 Jackson 反序列化 STOMP inbound 消息。
+     */
+    /** 旧 3 参（无口令）· 兼容旧调用/旧适配器（会被身份校验拒绝，fail-closed）。 */
+    public ChannelPermissionResponseEvent(String requestId, String behavior, String fromServer) {
+        this(requestId, behavior, fromServer, null);
+    }
+
+    /**
      * @JsonCreator + @JsonProperty 让 Jackson 反序列化 STOMP inbound 消息。
      */
     @JsonCreator
     public ChannelPermissionResponseEvent(
             @JsonProperty("requestId") String requestId,
             @JsonProperty("behavior") String behavior,
-            @JsonProperty("fromServer") String fromServer) {
+            @JsonProperty("fromServer") String fromServer,
+            @JsonProperty("adapterToken") String adapterToken) {
         this.requestId = requestId;
         this.behavior = behavior;
         this.fromServer = fromServer;
+        this.adapterToken = adapterToken;
     }
 
     public String getRequestId() { return requestId; }
     public String getBehavior() { return behavior; }
     public String getFromServer() { return fromServer; }
+    /** [P0.1] 适配器身份口令（null = 旧适配器/伪造；后端按未通过校验处理）。 */
+    public String getAdapterToken() { return adapterToken; }
 }

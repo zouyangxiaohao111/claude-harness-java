@@ -2,6 +2,7 @@ package com.nexusai.infra.llm;
 
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
+import com.nexusai.model.session.dto.ContentBlockDto;
 
 import java.util.List;
 import java.util.Objects;
@@ -61,7 +62,14 @@ public record AssistantMessage(
     String apiError,
     AgentUsage usage,
     String requestId,
-    String thinkingSignature
+    String thinkingSignature,
+    /**
+     * 内容块到达顺序（协议中立）· 对齐 CC transcript 「一块一行 + apiBlockIndex」。
+     * 由 AnthropicSdkProvider 按 content_block_start 的 index 采集（text / thinking / tool_use）；
+     * OpenAI 两条路（Chat / Responses）无块下标语义 → 留空，由 MessageContentBlocks 回退规范顺序。
+     * null/空 = 未采集（非 Anthropic 路径）。⛔ 不进入任何 provider 请求体。
+     */
+    List<ContentBlockDto> blocks
 ) {
 
     public AssistantMessage {
@@ -78,13 +86,21 @@ public record AssistantMessage(
      *  AnthropicSdkProvider / OpenAiSdkProvider / MockLlmProvider 等流式/非流式构建点）。 */
     public AssistantMessage(String content, String finishReason, List<ToolUseBlock> toolCalls,
                             String reasoning, String apiError, AgentUsage usage) {
-        this(content, finishReason, toolCalls, reasoning, apiError, usage, null, null);
+        this(content, finishReason, toolCalls, reasoning, apiError, usage, null, null, null);
     }
 
     /** 7-arg 兼容构造器（thinkingSignature=null · 保留既有 (…usage, requestId) 形状的调用方）。 */
     public AssistantMessage(String content, String finishReason, List<ToolUseBlock> toolCalls,
                             String reasoning, String apiError, AgentUsage usage, String requestId) {
-        this(content, finishReason, toolCalls, reasoning, apiError, usage, requestId, null);
+        this(content, finishReason, toolCalls, reasoning, apiError, usage, requestId, null, null);
+    }
+
+    /** 8-arg 兼容构造器（blocks=null · 保留 blocks 字段加入前的 canonical 形状）。 */
+    public AssistantMessage(String content, String finishReason, List<ToolUseBlock> toolCalls,
+                            String reasoning, String apiError, AgentUsage usage, String requestId,
+                            String thinkingSignature) {
+        this(content, finishReason, toolCalls, reasoning, apiError, usage, requestId,
+            thinkingSignature, null);
     }
 
     /**

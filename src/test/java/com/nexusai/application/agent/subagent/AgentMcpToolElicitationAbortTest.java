@@ -177,7 +177,7 @@ class AgentMcpToolElicitationAbortTest {
     @Timeout(value = 15, unit = TimeUnit.SECONDS)
     void abort_cancelsInFlightFuture_returnsError() throws Exception {
         AbortController abortController = new AbortController();
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(), "", abortController);
         AgentMcpTool t = new AgentMcpTool("fs", "read", "mcp__fs__read",
             MAPPER.createObjectNode(), null, null, "Read",

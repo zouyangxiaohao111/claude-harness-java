@@ -195,7 +195,7 @@ class PartialCompactModelWiringTest {
         when(sessionService.getById(anyString())).thenReturn(sessionDto(DEEPSEEK));
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        AgentState live = new AgentState("sys", SESSION, java.util.UUID.randomUUID());
+        AgentState live = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         live.setCurrentModel(ANTHROPIC);
         registry.register(SESSION, live);
 

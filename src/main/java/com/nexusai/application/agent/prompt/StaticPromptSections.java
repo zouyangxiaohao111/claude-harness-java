@@ -219,14 +219,20 @@ public final class StaticPromptSections {
             }
         }
         String bash = ToolNameConstants.BASH_TOOL_NAME;
-        List<Object> providedToolSubitems = List.of(
+        List<Object> providedToolSubitems = new ArrayList<>(List.of(
             "To read files use " + ToolNameConstants.FILE_READ_TOOL_NAME + " instead of cat, head, tail, or sed",
             "To edit files use " + ToolNameConstants.FILE_EDIT_TOOL_NAME + " instead of sed or awk",
             "To create files use " + ToolNameConstants.FILE_WRITE_TOOL_NAME + " instead of cat with heredoc or echo redirection",
             "To search for files use " + ToolNameConstants.GLOB_TOOL_NAME + " instead of find or ls",
             "To search the content of files, use " + ToolNameConstants.GREP_TOOL_NAME + " instead of grep or rg",
             "Reserve using the " + bash + " exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the " + bash + " tool for these if it is absolutely necessary."
-        );
+        ));
+        // [AST tools] 只有组装出这两个工具时才提（enabledTools == null 时保持既有语义：不追加）。
+        if (enabledTools != null && enabledTools.contains(ToolNameConstants.AST_GREP_TOOL_NAME)) {
+            providedToolSubitems.add("To search code by syntax shape (calls, declarations, language constructs) use "
+                + ToolNameConstants.AST_GREP_TOOL_NAME + " instead of regex guesses; use "
+                + ToolNameConstants.AST_EDIT_TOOL_NAME + " for repeated structural rewrites (preview first, then apply).");
+        }
         List<Object> items = new ArrayList<>();
         items.add("Do NOT use the " + bash + " to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:");
         items.add(providedToolSubitems);

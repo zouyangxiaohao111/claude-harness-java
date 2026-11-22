@@ -275,7 +275,7 @@ class LlmAgentLoopReactiveCompactAbortTest {
                                       AbortController abortController) {
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), state.sessionId(), PermissionMode.DEFAULT,
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), state.sessionId(), PermissionMode.DEFAULT,
                 List.of(), "", abortController),
             QuerySource.USER, COMPACT_MODEL, 8,
             null, null, null, null,

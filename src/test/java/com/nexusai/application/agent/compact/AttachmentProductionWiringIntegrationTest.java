@@ -66,21 +66,21 @@ class AttachmentProductionWiringIntegrationTest {
     @DisplayName("plan+async-agent 场景: 压缩后附件含 plan_file_reference/plan_mode/task_status 且总预算合规")
     void planAndAsyncAgentScenarioAttachmentsPresentAndBudgetCompliant() {
         // ── 数据源：async-agent 任务（LOCAL_AGENT，running，CC appState.tasks local_agent）──
-        UUID asyncAgentId = UUID.randomUUID();
+        String asyncAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         TaskFrameworkService taskFrameworkService = new TaskFrameworkService(null);
         taskFrameworkService.registerTask(new BackgroundTask(
-            asyncAgentId.toString(), TaskType.LOCAL_AGENT, BackgroundTaskStatus.RUNNING,
+            asyncAgentId, TaskType.LOCAL_AGENT, BackgroundTaskStatus.RUNNING,
             "正在整理调研报告", null, System.currentTimeMillis(), null, null,
             com.nexusai.application.agent.tasks.BackgroundTaskRunner.taskOutputPath(
-                "sess-3b-attach-fixture", asyncAgentId.toString()), 0L, false,
+                "sess-3b-attach-fixture", asyncAgentId), 0L, false,
             asyncAgentId, true));
         // ── 数据源：plan 文件（fake PlanProvider，CC getPlan/getPlanFilePath）· 非函数式接口，匿名类 ──
         PlanProvider planProvider = new PlanProvider() {
-            @Override public String getPlanFilePath(UUID agentId) { return "plans/main.md"; }
-            @Override public String getPlan(UUID agentId) { return "# 当前计划\n1. 完成附件接线"; }
+            @Override public String getPlanFilePath(String agentId) { return "plans/main.md"; }
+            @Override public String getPlan(String agentId) { return "# 当前计划\n1. 完成附件接线"; }
             @Override public boolean copyPlanForResume(String targetSessionId, String sourceSlug) { return false; }
             @Override public boolean copyPlanForFork(String targetSessionId, String sourceSlug) { return false; }
-            @Override public AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(UUID agentId) {
+            @Override public AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(String agentId) {
                 return new AttachmentMessageDto.PlanRef("plans/main.md", "# 当前计划\n1. 完成附件接线");
             }
         };

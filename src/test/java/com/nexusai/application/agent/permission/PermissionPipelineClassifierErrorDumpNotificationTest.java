@@ -64,7 +64,7 @@ class PermissionPipelineClassifierErrorDumpNotificationTest {
     /** 32 参 ToolUseContext 携带真实 addNotification 回调（LlmAgentLoopStopHookFailureCatchTest 同款）。 */
     private static ToolUseContext tucWithNotification(Consumer<Notification> addNotification) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), null, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, null, null, null, Map.of(), p -> {},
             null, null, null, null,

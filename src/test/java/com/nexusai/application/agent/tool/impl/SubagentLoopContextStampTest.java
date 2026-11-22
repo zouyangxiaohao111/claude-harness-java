@@ -42,7 +42,7 @@ class SubagentLoopContextStampTest {
     @DisplayName("盖章：TUC 定稿步一次盖齐身份（subagentName/isBuiltIn）+ agent 归因上下文（同实例）")
     void stamp_carriesBothCarriers() {
         AgentContext.SubagentContext sub = subCtx("req_stamp_1");
-        ToolUseContext subagentCtx = ToolUseContext.of(UUID.randomUUID(), "sess-child");
+        ToolUseContext subagentCtx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child");
 
         ToolUseContext stamped =
             SubagentExecutor.stampSubagentLoopContext(subagentCtx, sub, "worker", false, null);
@@ -65,7 +65,7 @@ class SubagentLoopContextStampTest {
         // WHY（规则九）：本条是上一条的**正向对照**。没有它，一个「什么都不做、直接返回入参」的实现
         //   也能让上一条过吗？不能（断言值不匹配）—— 但「of() 恰好已带默认值」这类夹具陷阱必须有
         //   显式反证，否则无法区分「盖章生效」与「夹具本来就带值」。
-        ToolUseContext bare = ToolUseContext.of(UUID.randomUUID(), "sess-child");
+        ToolUseContext bare = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child");
 
         assertThat(bare.subagentName()).isNull();
         assertThat(bare.agentContext()).isNull();
@@ -79,7 +79,7 @@ class SubagentLoopContextStampTest {
         //   只断言「字段有值」不覆盖该目的；本用例在真实派生线程上消费一次，闭合「盖章 → 跨线程可用」。
         AgentContext.SubagentContext sub = subCtx("req_stamp_worker");
         ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
-            ToolUseContext.of(UUID.randomUUID(), "sess-child"), sub, "Explore", true, null);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child"), sub, "Explore", true, null);
         String testThread = Thread.currentThread().getName();
 
         String[] seen = CompletableFuture.supplyAsync(() -> {
@@ -111,7 +111,7 @@ class SubagentLoopContextStampTest {
                 "alice@team-x", "alice", "team-x", null, false, "sess-parent");
 
         ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
-            ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "general-purpose", true, identity);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child"), null, "general-purpose", true, identity);
 
         assertThat(stamped.teammateIdentity())
             .as("teammate 身份必须被盖章（同一实例，不入 copy 语义）").isSameAs(identity);
@@ -119,7 +119,7 @@ class SubagentLoopContextStampTest {
             .as("身份盖章不影响 subagentName 同点盖章").isEqualTo("general-purpose");
         // 反向对照：不传身份时不得凭空造一个
         assertThat(SubagentExecutor.stampSubagentLoopContext(
-                ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "general-purpose", true, null)
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child"), null, "general-purpose", true, null)
                 .teammateIdentity())
             .as("非 teammate 路径不得伪造 teammate 身份").isNull();
     }
@@ -130,7 +130,7 @@ class SubagentLoopContextStampTest {
         // WHY（缺值策略 (b) 类边界）：SubagentExecutor 的调用点恒传非 null（buildSubagentAgentContext
         //   返回值），但缝本身必须定义 null 语义且**不得伪造**一个空对象（那会让下游以为有归因上下文）。
         ToolUseContext stamped = SubagentExecutor.stampSubagentLoopContext(
-            ToolUseContext.of(UUID.randomUUID(), "sess-child"), null, "Explore", true, null);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-child"), null, "Explore", true, null);
 
         assertThat(stamped.subagentName()).isEqualTo("Explore");
         assertThat(stamped.agentContext()).isNull();

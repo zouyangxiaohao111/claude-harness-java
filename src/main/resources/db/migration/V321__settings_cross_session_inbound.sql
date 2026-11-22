@@ -1,0 +1,18 @@
+-- ===================================================================
+-- V321: settings 表新增 cross_session_inbound 列（跨会话入站策略）
+--
+-- 背景（SendMessage 跨会话对齐 · P1 设置持久化）：
+--   跨会话消息（peer）默认按「自动（按双方权限模式判定）」接收；用户可在
+--   「设置 · 权限与协作」显式改为 接受 / 待确认 / 拒绝。
+-- 语义：TEXT，可空。null = 未显式配置 → 运行时按 auto 处理（不默认 accept）；
+--   'accept' / 'hold' / 'refuse' = 用户显式策略。
+--   ⛔ 不把运行时推导出的 accept 写回本列（GET 返回原始选择，未设置为 null）。
+-- 写侧三态（SettingsService.update）：省略字段 = 保持旧值；显式 'auto' = 清列回 NULL；
+--   其它值 → 400。因 update 是 null=不覆盖的 merge 语义，清列必须走
+--   update(entity, false) 显式写 NULL（同 subagent_default_runtime 先例）。
+-- 映射：Java 字段 crossSessionInbound ↔ 列 cross_session_inbound
+--   （MyBatis-Flex camelCase→snake 自动映射）。
+--
+-- 版本号说明：当前最高 V302，V303 未被占用（V301 归 DSH 副本自有迁移）。不修改历史迁移。
+-- ===================================================================
+ALTER TABLE settings ADD COLUMN cross_session_inbound TEXT;

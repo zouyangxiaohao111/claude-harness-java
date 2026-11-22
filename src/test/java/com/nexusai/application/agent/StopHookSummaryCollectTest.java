@@ -303,7 +303,7 @@ class StopHookSummaryCollectTest {
     void notifyStopHookError_noopConsumer_doesNotThrow() {
         // WHY: CC addNotification?.() 可选链 —— TUC 未接线 UI 回调（子代理 compact ctor 置 null）
         //   时必须 no-op 不抛（CC "subagents can't control parent UI"）。
-        ToolUseContext bareTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext bareTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, List.of(), null, AbortController.NOOP);
         assertThatCode(() -> LlmAgentLoop.notifyStopHookError(bareTuc, List.of("boom")))
             .doesNotThrowAnyException();
@@ -357,7 +357,7 @@ class StopHookSummaryCollectTest {
     /** 32 参构造器构建携带真实 addNotification 回调的 TUC（of() 工厂不含 UI 回调）。 */
     private static ToolUseContext tucWithNotification(Consumer<Notification> addNotification) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), null, AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, null, null, null, Map.of(), p -> {},
             null, null, null, null,

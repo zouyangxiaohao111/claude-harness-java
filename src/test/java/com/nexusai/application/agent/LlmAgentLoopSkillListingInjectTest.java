@@ -300,7 +300,8 @@ class LlmAgentLoopSkillListingInjectTest {
             null, null, null, null, null, null, null);
 
         String sessionUuid = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        // agentId：同一 String 同时喂 ToolUseContext 与 AgentState（单一形态）
         AgentState state = new AgentState("subagent sys", sessionUuid, agentId);
 
         ToolUseContext tuc = new ToolUseContext(agentId, sessionUuid, PermissionMode.DEFAULT,
@@ -315,8 +316,8 @@ class LlmAgentLoopSkillListingInjectTest {
             .as("子代理（isMainLoop=false）必须拿到自己的 turn-0 skill_listing（CC attachments.ts:2672-2676）")
             .isNotNull()
             .contains("commit");
-        assertThat(SkillListingSentRegistry.isInitialized(sessionUuid, agentId.toString()))
-            .as("子代理按自身 agentKey 独立建槽（非主线程槽）").isTrue();
+        assertThat(SkillListingSentRegistry.isInitialized(sessionUuid, agentId))
+            .as("子代理按自身 agentId 独立建槽（非主线程槽）").isTrue();
     }
 
     /**

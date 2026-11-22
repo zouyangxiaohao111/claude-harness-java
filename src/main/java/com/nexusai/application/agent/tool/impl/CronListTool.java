@@ -16,6 +16,7 @@ import com.nexusai.application.agent.tool.cron.CronToHuman;
 import com.nexusai.domain.schedule.ScheduleService;
 import com.nexusai.infra.util.StringWidth;
 import com.nexusai.model.schedule.dto.ScheduleDto;
+import com.nexusai.model.schedule.dto.SessionMode;
 import com.nexusai.model.schedule.dto.ScheduleKind;
 import com.nexusai.model.schedule.dto.ScheduleScope;
 import org.slf4j.Logger;
@@ -300,13 +301,17 @@ public class CronListTool implements Tool {
             // CC :75-76 条件键 → 文本标记: recurring 派生 kind!=once, durable===false 派生 scope==SESSION
             String recurringMark = d.kind() != ScheduleKind.once ? " (recurring)" : " (one-shot)";
             String durableMark = d.scope() == ScheduleScope.SESSION ? " [session-only]" : "";
+            // 本仓增量（CC 无 sessionMode）：让 agent 知道这个任务跑在哪个会话。
+            // REUSE 是默认值 ⇒ 不标（避免每行都挂一个噪音标记）。
+            String modeMark = d.sessionMode() == null || d.sessionMode() == SessionMode.REUSE
+                ? "" : " [session:" + d.sessionMode().name() + "]";
             // CC :89 truncate(j.prompt, 80, true) · Java prompt = ScheduleDto.command
             String prompt = truncate(d.command(), 80, true);
             if (sb.length() > 0) {
                 sb.append('\n');
             }
             sb.append(d.id()).append(" — ").append(humanSchedule)
-                .append(recurringMark).append(durableMark)
+                .append(recurringMark).append(durableMark).append(modeMark)
                 .append(": ").append(prompt);
         }
         return sb.toString();

@@ -260,7 +260,7 @@ class LlmAgentLoopStreamIdleWatchdogTest {
         };
 
         ToolUseContext baseTuc = ToolUseContext.of(
-                UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8))
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8))
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
 
         com.nexusai.application.agent.loop.QueryParams callerParams = com.nexusai.application.agent.loop.QueryParams.forLoop(

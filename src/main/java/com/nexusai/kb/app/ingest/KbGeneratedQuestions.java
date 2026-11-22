@@ -39,6 +39,50 @@ public final class KbGeneratedQuestions {
     }
 
     /**
+     * 一条生成问句（id 用于索引条目的 source_id，与源站 {@code GeneratedQuestion.ID} 同义）。
+     *
+     * @param id       问句 id（metadata 里的 {@code id}；缺失/空 ⇒ 调用方回落到「块 id + 序号」）
+     * @param question 问句文本
+     */
+    public record Entry(String id, String question) {
+    }
+
+    /**
+     * 读出带 id 的问句（供「问句独立索引条目」使用）。
+     *
+     * <p>id 缺失时返回空串，由调用方用稳定兜底（块 id + 序号）—— ⛔ 不能在这里生成随机 id，
+     * 否则同一份 metadata 每次读出来 id 不同 ⇒ 索引条目每次都是「新条目」，旧的永远删不干净。
+     *
+     * @param metadataJson chunk.metadata 原文（可 null / 坏 JSON）
+     * @return 问句条目（永不 null；坏数据 ⇒ 空列表）
+     */
+    public static List<Entry> readEntries(String metadataJson) {
+        if (metadataJson == null || metadataJson.isBlank()) {
+            return List.of();
+        }
+        try {
+            JsonNode root = JSON.readTree(metadataJson);
+            JsonNode arr = root == null ? null : root.get(KEY);
+            if (arr == null || !arr.isArray()) {
+                return List.of();
+            }
+            List<Entry> out = new ArrayList<>(arr.size());
+            for (JsonNode n : arr) {
+                String q = n.isTextual() ? n.asText() : n.path("question").asText("");
+                if (q == null || q.isBlank()) {
+                    continue;
+                }
+                String id = n.isTextual() ? "" : n.path("id").asText("");
+                out.add(new Entry(id, q.trim()));
+            }
+            return List.copyOf(out);
+        } catch (Exception e) {
+            log.warn("[问句] metadata 解析失败（条目版），按无问句处理 原因={}", e.getMessage());
+            return List.of();
+        }
+    }
+
+    /**
      * 读出问句文本列表。
      *
      * @param metadataJson chunk.metadata 原文（可 null / 坏 JSON）

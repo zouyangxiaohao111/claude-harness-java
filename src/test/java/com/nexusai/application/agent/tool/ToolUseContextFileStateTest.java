@@ -257,7 +257,7 @@ class ToolUseContextFileStateTest {
     @Test
     @DisplayName("cloneFileStateCache: 复制初始 entries + 子父独立 + 子沿用父容量约束")
     void cloneFileStateCacheCopiesEntriesAndIndependence() {
-        ToolUseContext parent = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext parent = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT);
         // 父 cache 插入 3 条
         parent.readFileState().set("a.txt",

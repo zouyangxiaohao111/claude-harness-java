@@ -126,7 +126,7 @@ class ReadPermissionCheckerCwdWiringTest {
      * 不查 DB、不依赖 JUnit 扩展的 resolver 装配状态，工作目录判定完全确定。
      */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), SessionKeys.NO_SESSION, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SessionKeys.NO_SESSION, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }

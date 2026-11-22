@@ -4,6 +4,7 @@ import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 
 import java.time.OffsetDateTime;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 
@@ -56,5 +57,56 @@ public final class AgentNotificationMessages {
             null, null, null, null, null, false, false,
             null, null, null, null, null, null, null,
             null, null, null, null, null, null, null);
+    }
+
+    /**
+     * 通知行 → 子代理 transcript 落盘 Map（**入队即落库**的唯一写入形态）。
+     *
+     * <p><b>WHY 需要第二条写入通道</b>：{@link #toChatMessage} 只在**消费点**（子代理下一轮
+     * drain / 启动段 drain）被 append，若子代理没有活消费点（已结束 / 空闲），待办永远留在
+     * {@code AgentNameRegistry.pendingMessages} 内存里 ⇒ transcript 没有行 ⇒ 子代理会话视图
+     * 永远看不到通知。本方法让入队侧可以立刻写出一条可读的行；消费侧再 append 时由
+     * {@link AgentTranscript#recordSidechainTranscript} 按 uuid 去重（同一 uuid 只落一次）。
+     *
+     * <p>与 {@link #toChatMessage} 的字段逐项对齐：{@code role=user, isMeta=true,
+     * subtype=agent_message, author=发送方, content=正文}；{@code summary} 是惰性键（空则省略）。
+     * ⛔ 不写 {@code structuredOutput} / {@code peer_source} —— 子代理通知不是跨会话来信，
+     * 前端必须走 agent 通知条而不是 peer 卡片（见 MessageList 的 isAgentNotice 分支）。
+     *
+     * @param pm 入队记录（非 null）
+     * @return 可直接交 {@link AgentTranscript#recordSidechainTranscript} 的 JSONL 行
+     */
+    public static Map<String, Object> toTranscriptMap(AgentNameRegistry.PendingAgentMessage pm) {
+        return toTranscriptMap(pm, pm != null ? pm.id() : null);
+    }
+
+    /**
+     * 通知行 → transcript 落盘 Map（允许覆盖 uuid · 终态补写的孤儿修复路径用）。
+     *
+     * @param pm           入队记录（非 null）
+     * @param uuidOverride 落盘 uuid；null → 用 {@code pm.id()}
+     * @return JSONL 行
+     */
+    public static Map<String, Object> toTranscriptMap(AgentNameRegistry.PendingAgentMessage pm,
+                                                      String uuidOverride) {
+        Map<String, Object> map = new LinkedHashMap<>();
+        String uuid = uuidOverride != null && !uuidOverride.isBlank()
+            ? uuidOverride : (pm != null ? pm.id() : null);
+        if (uuid != null) {
+            map.put("uuid", uuid);
+        }
+        map.put("role", "user");
+        map.put("content", pm != null ? pm.text() : null);
+        if (pm != null && pm.from() != null && !pm.from().isBlank()) {
+            map.put("author", pm.from());
+        }
+        map.put("subtype", "agent_message");
+        map.put("isMeta", true);
+        if (pm != null && pm.summary() != null && !pm.summary().isBlank()) {
+            map.put("summary", pm.summary());
+        }
+        map.put("timestamp", pm != null && pm.queuedAt() != null
+            ? pm.queuedAt() : OffsetDateTime.now().toString());
+        return map;
     }
 }

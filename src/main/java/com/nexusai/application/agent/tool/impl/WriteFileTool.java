@@ -384,6 +384,16 @@ public class WriteFileTool implements Tool {
                "paths escaping the workspace are rejected. Parent directories are auto-created.";
     }
 
+    /**
+     * [B2] 本次调用的一句话摘要（权限推送/弹窗标题），对齐 CC {@code tool.description(input)}。
+     * ⛔ 不复用注册期长描述（说明书）。
+     */
+    @Override
+    public String description(JsonNode input) {
+        // [B2] CC 口径：固定标题句，不含路径（细节留给 input_preview）。
+        return "Write a file to the local filesystem.";
+    }
+
     @Override
     public JsonNode inputSchema() {
         ObjectNode root = JSON.createObjectNode();
@@ -642,7 +652,13 @@ public class WriteFileTool implements Tool {
         }
         String relPath = input.path("file_path").asText("");
         if (relPath.isBlank()) {
-            return Tool.ValidationResult.pass();
+            // [错误通道 · C2] 空 file_path 前置拒绝（旧实现 pass() 后由 executeInternal 回
+            //   "path is empty" 普通 String ⇒ 前缀表漏判 ⇒ is_error=false ⇒ 被成功模板覆盖）。
+            if (log.isWarnEnabled()) {
+                log.warn("WriteFileTool: validateInput 空 file_path 拒绝（错误通道 C2）");
+            }
+            return Tool.ValidationResult.fail("EMPTY_FILE_PATH",
+                "The file_path parameter is empty. Provide the absolute path of the file to write.");
         }
 
         Path file;
@@ -920,8 +936,9 @@ public class WriteFileTool implements Tool {
         // [L+ round 4] ctx 为 null → validateInput 内部已拒绝, 此处不再 null 兜底.
         ValidationResult vr = validateInput(call.input(), ctx);
         if (!vr.ok()) {
-            return ToolResult.error(call.id(),
-                "WriteFileTool validateInput failed: " + vr.message());
+            // [错误通道 · C2] 语义校验失败归 VALIDATE_INPUT（对齐 CC toolExecution.ts:717-732）。
+            return ToolResult.failure(call.id(), vr.message(),
+                com.nexusai.application.agent.tool.ToolErrorKind.VALIDATE_INPUT);
         }
         ToolResult result = executeInternal(call, ctx);
         // 仅写成功后 invalidate cache; 错误结果不动 cache (避免污染)
@@ -959,7 +976,10 @@ public class WriteFileTool implements Tool {
         String content = call.input().path("content").asText("");
 
         if (relPath.isBlank()) {
-            return ToolResult.error(call.id(), "path is empty");
+            // [错误通道 · C2] 绕过 validateInput 的兜底：显式 VALIDATE_INPUT 类别。
+            return ToolResult.failure(call.id(),
+                "The file_path parameter is empty. Provide the absolute path of the file to write.",
+                com.nexusai.application.agent.tool.ToolErrorKind.VALIDATE_INPUT);
         }
 
         Path file;
@@ -1128,6 +1148,16 @@ public class WriteFileTool implements Tool {
     @Override
     public ToolResultBlockParam mapToToolResultBlockParam(AgentToolResult<?> result, String toolUseId, boolean isError) {
         if (!(result instanceof ToolResult<?> tr)) {
+            return null;
+        }
+        // [错误通道 · C2 第二道防线] 失败返回 null → 调用方走默认渲染器/执行器错误路径，
+        //   永不由本方法输出成功模板。对齐 CC：FileWriteTool.ts:418-433 的 mapper 只在
+        //   tool.call() 成功后调用（toolExecution.ts:1288-1292）。
+        if (isError || tr.data() instanceof com.nexusai.application.agent.tool.ToolError) {
+            if (log.isDebugEnabled()) {
+                log.debug("WriteFileTool.mapToToolResultBlockParam: 失败结果不产成功模板 → null (isError={})",
+                    isError);
+            }
             return null;
         }
         Map<String, Object> so = ToolResult.presentationMeta(tr);

@@ -5,6 +5,7 @@ import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.SessionToolCategory;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolRegistry;
+import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.kb.agent.tool.FakeKbToolForCategoryTest;
 import com.nexusai.repository.session.entity.SessionRecord;
@@ -138,5 +139,38 @@ class SessionToolDisableDefaultsTest {
         record.setDisabledTools(null);
 
         assertThat(SessionToolDisableConfig.getDisabledTools("sess-1")).isEmpty();
+    }
+
+    @Test
+    @DisplayName("派生会话 + 列未设置 → 默认禁用 AskUserQuestion（本仓有意偏离 CC）")
+    void derivedSession_defaultDisablesAskUserQuestion() {
+        record.setDerivedDepth(1);
+        record.setDisabledTools(null);
+
+        Set<String> disabled = SessionToolDisableConfig.getDisabledTools("sess-1");
+
+        assertThat(disabled).contains(ToolNameConstants.ASK_USER_QUESTION_TOOL_NAME);
+        assertThat(disabled).as("默认 CU/KB 仍生效，不被覆盖")
+            .contains("mcp__computer-use__screenshot", "search_knowledge");
+    }
+
+    @Test
+    @DisplayName("普通会话（非派生）→ 不禁用 AskUserQuestion")
+    void plainSession_keepsAskUserQuestion() {
+        record.setDerivedDepth(null);
+        record.setDisabledTools(null);
+
+        assertThat(SessionToolDisableConfig.getDisabledTools("sess-1"))
+            .doesNotContain(ToolNameConstants.ASK_USER_QUESTION_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("派生会话但列显式设置 → 以用户列表为准，不追加 AskUserQuestion")
+    void derivedSession_explicitColumnNotAppended() {
+        record.setDerivedDepth(1);
+        record.setDisabledTools("[\"Bash\"]");
+
+        assertThat(SessionToolDisableConfig.getDisabledTools("sess-1"))
+            .containsExactly("Bash");
     }
 }

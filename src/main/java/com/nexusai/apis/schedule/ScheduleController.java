@@ -10,6 +10,8 @@ import com.nexusai.model.schedule.dto.ScheduleDto;
 import com.nexusai.model.schedule.dto.ScheduleScope;
 import com.nexusai.model.schedule.dto.ScheduleUpdateRequest;
 import com.nexusai.domain.schedule.ScheduleService;
+import com.nexusai.application.schedule.ScheduleRunsService;
+import com.nexusai.repository.schedule.entity.ScheduleRunRecord;
 import jakarta.validation.Valid;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
@@ -45,7 +47,7 @@ import java.util.List;
  * （agent-trigger-cron）无关——鉴权恒生效，不构成功能门控。
  *
  * <p><b>④ 唯一受功能门控的 REST 子路径</b>：POST {@code /{id}/run} → runNow →
- * {@code TestJob.fire} 内部 gate（TestJob.java:128，对齐 CC cronScheduler.ts:231 isKilled
+ * {@code AgentJob.fire} 内部 gate（AgentJob.java:128，对齐 CC cronScheduler.ts:231 isKilled
  * 每 tick），门关返回 false 不执行。另注：create 超 MAX_JOBS 返回 409 + errorCode3
  * （决策#13，ScheduleService.java:132-144），与工具路径 validateInput errorCode3
  * （CronCreateTool.ts:97-104）语义一致。
@@ -58,6 +60,9 @@ public class ScheduleController {
         org.slf4j.LoggerFactory.getLogger(ScheduleController.class);
 
     @Autowired private ScheduleService scheduleService;
+
+    /** [V306] 运行记录（schedule_runs）· 列表与详情都读它。 */
+    @Autowired private ScheduleRunsService runsService;
 
     /**
      * 定时任务列表 · 可选 {@code ?sessionId=} 按会话过滤（含全局 durable 任务）。
@@ -74,6 +79,31 @@ public class ScheduleController {
     @GetMapping("/{id}")
     public ScheduleDto get(@PathVariable String id) {
         return scheduleService.getById(id);
+    }
+
+    /**
+     * [V306] 某任务的运行记录（时间倒序，默认最近 50 条）。
+     *
+     * <p>对应前端「运行记录」tab 点开某任务时的历史。{@code status} 只可能是
+     * {@code running} / {@code ok} / {@code error} / {@code cancelled} —— 其中
+     * {@code running} 表示「还在跑或崩在收口前」，供排查用。
+     */
+    @GetMapping("/{id}/runs")
+    public List<ScheduleRunRecord> runs(
+            @PathVariable String id,
+            @RequestParam(name = "limit", defaultValue = "50") int limit) {
+        return runsService.listBySchedule(id, limit);
+    }
+
+    /**
+     * [V306] 全部任务的运行记录（时间倒序，默认最近 100 条）。
+     *
+     * <p>「运行记录」tab 的首屏数据源（不指定任务时看全量）。
+     */
+    @GetMapping("/runs/all")
+    public List<ScheduleRunRecord> allRuns(
+            @RequestParam(name = "limit", defaultValue = "100") int limit) {
+        return runsService.listRecent(limit);
     }
 
     /**
@@ -147,9 +177,13 @@ public class ScheduleController {
                     + "）—— 请确认该会话存在且已绑定项目（sessions.main_project_id → projects.path）");
         }
         // 用解析值重建请求（只换 boundProject）⇒ 客户端伪造的 boundProject 被覆盖
+        // ⚠️ 重建必须**逐字段透传**其余字段：形态 / 通知目标 / 专家都靠它们表达，
+        //    漏一个就在这条分支上被静默丢弃（用户会以为设置生效了）。
         ScheduleCreateRequest normalized = new ScheduleCreateRequest(
             req.name(), req.kind(), req.cron(), req.intervalSeconds(), req.runAt(), req.command(),
-            req.description(), scope, sessionId, req.agentId(), lk.projectRoot(), req.id());
+            req.description(), scope, sessionId, req.agentId(), lk.projectRoot(),
+            req.sessionMode(), req.notifyChats(), req.notifyChannelIds(), req.mainThreadAgent(),
+            req.id());
         if (log.isInfoEnabled()) {
             log.info("[ScheduleController] POST /schedules DURABLE 会话锚已由 sessionId 解析并覆盖请求体: "
                 + "sessionId={} boundProject={}（客户端传入的 boundProject={} 被丢弃）",

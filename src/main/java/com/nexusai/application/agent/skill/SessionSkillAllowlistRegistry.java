@@ -107,7 +107,7 @@ public final class SessionSkillAllowlistRegistry {
      * @param subagentName 子代理身份名（CC {@code subagentName}）
      * @param isBuiltIn    是否内置子代理（fork 判定需要）
      */
-    public static boolean appliesToListing(UUID agentId, String subagentName, boolean isBuiltIn) {
+    public static boolean appliesToListing(String agentId, String subagentName, boolean isBuiltIn) {
         if (agentId == null) {
             return true;
         }
@@ -123,7 +123,7 @@ public final class SessionSkillAllowlistRegistry {
     }
 
     /** dynamic_skill 附件是否套用白名单 · 对齐 CC {@code e.agentId===void 0}（仅主线程）。 */
-    public static boolean appliesToDynamicSkill(UUID agentId) {
+    public static boolean appliesToDynamicSkill(String agentId) {
         return agentId == null;
     }
 

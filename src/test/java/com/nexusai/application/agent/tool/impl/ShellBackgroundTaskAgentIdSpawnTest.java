@@ -100,7 +100,7 @@ class ShellBackgroundTaskAgentIdSpawnTest {
         BashTool tool = new BashTool();
         tool.setBackgroundTaskRunner(stub);
 
-        UUID subAgent = UUID.fromString("aaaaaaaa-1111-2222-3333-444444444444");
+        String subAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         tool.execute(bgCall("Bash", "bg-agentid-1"), ToolUseContext.of(subAgent, SESSION));
 
         assertThat(stub.spawned)
@@ -163,7 +163,7 @@ class ShellBackgroundTaskAgentIdSpawnTest {
         PowerShellTool tool = new PowerShellTool();
         ReflectionTestUtils.setField(tool, "backgroundTaskRunner", stub);
 
-        UUID subAgent = UUID.fromString("bbbbbbbb-1111-2222-3333-444444444444");
+        String subAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         tool.execute(bgCall("PowerShell", "bg-agentid-4"), ToolUseContext.of(subAgent, SESSION));
 
         assertThat(stub.spawned)

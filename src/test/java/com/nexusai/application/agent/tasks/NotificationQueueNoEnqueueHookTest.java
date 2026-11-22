@@ -14,7 +14,7 @@ import static org.junit.jupiter.api.Assertions.assertThrows;
  * 入队 (enqueue / enqueuePendingNotification) 是纯队列操作，不触发任何 hook。
  * Notification hook 仅由系统通知路径触发 (LlmAgentLoop:5303 A11 / ElicitationHandler /
  * AgentLoopContext:1094)。旧实现 enqueue() 内联 emitNotificationHook 会在每次入队
- * (TestJob / 用户 prompt 等) 重复触发 NOTIFICATION hook —— 与 CC 背离，会造成重复通知。
+ * (AgentJob / 用户 prompt 等) 重复触发 NOTIFICATION hook —— 与 CC 背离，会造成重复通知。
  *
  * <p>守护契约 (RED→GREEN)：队列类不得暴露任何 hook 接线入口 (setHookRegistry / hookRegistry
  * 字段)。若未来有人重新把 hook 塞回队列入队路径，本测试失败即报警 (回归护栏)。

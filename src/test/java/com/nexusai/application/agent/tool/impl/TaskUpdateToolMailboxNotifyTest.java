@@ -109,7 +109,7 @@ class TaskUpdateToolMailboxNotifyTest {
 
     /** 只带会话 + teammate 身份的 TUC（TUC 的 compact ctor 强校验 sessionId 非 null）。 */
     private static ToolUseContext tuc(TeammateIdentity identity) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-lead").withTeammateIdentity(identity);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-lead").withTeammateIdentity(identity);
     }
 
     private ToolResult<String> runUpdate(String owner) {

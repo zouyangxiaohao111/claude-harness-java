@@ -50,6 +50,26 @@ public final class ChannelPermission {
 
     private final Supplier<Boolean> featureFlagSupplier;
 
+    /** [P2] 随机短 ID 的熵源（会话内唯一性守卫见 {@link #shortRequestIdForSession}）。 */
+    private static final java.security.SecureRandom RANDOM = new java.security.SecureRandom();
+
+    /**
+     * [P2] 某会话**当前已占用**的短 ID（key=sessionId）。
+     *
+     * <p>WHY：短 ID 从确定性哈希改成随机后，同一会话在极低概率下可能连撞同一个号 ⇒
+     * {@code pending} 表（按短 ID 键控）会被后来的请求覆盖，用户回执命中错的请求。
+     * 这里按会话登记已发出的号，重试到不撞为止。
+     */
+    private final java.util.Map<String, java.util.Set<String>> issuedIdsBySession =
+        new java.util.concurrent.ConcurrentHashMap<>();
+
+    /**
+     * [P2] 测试 seam：null ⇒ {@link #randomCandidate()}；非 null ⇒ 逐次取该 Supplier 的候选。
+     *
+     * <p>只用于把「随机撞号 → 重试 → 哈希回退」这条分支变成可确定性验证的用例。
+     */
+    private java.util.function.Supplier<String> randomCandidateSupplier;
+
     public ChannelPermission(Supplier<Boolean> featureFlagSupplier) {
         this.featureFlagSupplier = Objects.requireNonNull(featureFlagSupplier);
     }
@@ -66,13 +86,95 @@ public final class ChannelPermission {
         for (int salt = 0; salt < 10; salt++) {
             String input = salt == 0 ? toolUseId : (toolUseId + ":" + salt);
             String candidate = hashToId(input);
-            boolean dirty = false;
-            for (String bad : ID_AVOID_SUBSTRINGS) {
-                if (candidate.contains(bad)) { dirty = true; break; }
-            }
-            if (!dirty) return candidate;
+            if (!isDirtyId(candidate)) return candidate;
         }
         return hashToId(toolUseId);
+    }
+
+    /** 脏词子串命中（对齐 CC blocklist 重 hash 判据）。 */
+    private boolean isDirtyId(String candidate) {
+        for (String bad : ID_AVOID_SUBSTRINGS) {
+            if (candidate.contains(bad)) return true;
+        }
+        return false;
+    }
+
+    /**
+     * [P2] 随机 5 位短 ID（同一字符集 a-z 去 {@code l}）；脏词命中重试，最多 10 次。
+     *
+     * @return 合法候选；连续 10 次都不合法（实际不可能）⇒ null，由调用方回落哈希路径
+     */
+    public String randomShortId() {
+        for (int i = 0; i < 10; i++) {
+            String candidate = randomCandidateSupplier != null
+                ? randomCandidateSupplier.get() : randomCandidate();
+            if (candidate == null) return null;
+            if (candidate.length() != 5) continue;
+            if (!isAllAlphabet(candidate)) continue;
+            if (isDirtyId(candidate)) continue;
+            return candidate;
+        }
+        return null;
+    }
+
+    private String randomCandidate() {
+        StringBuilder sb = new StringBuilder(5);
+        for (int i = 0; i < 5; i++) {
+            sb.append(ID_ALPHABET.charAt(RANDOM.nextInt(ID_ALPHABET.length())));
+        }
+        return sb.toString();
+    }
+
+    private static boolean isAllAlphabet(String s) {
+        for (int i = 0; i < s.length(); i++) {
+            if (ID_ALPHABET.indexOf(s.charAt(i)) < 0) return false;
+        }
+        return true;
+    }
+
+    /**
+     * [P2] 生成**会话内唯一**的短 ID：优先随机，撞号（含脏词）重试；随机失败回落确定性哈希
+     * （带盐重 hash）—— <b>哈希回退路径保留</b>。
+     *
+     * @param sessionId 会话 id（会话内唯一性作用域）
+     * @param toolUseId 工具调用 id（哈希回退路径的种子）
+     */
+    public String shortRequestIdForSession(String sessionId, String toolUseId) {
+        String sid = sessionId == null ? "" : sessionId;
+        for (int i = 0; i < 20; i++) {
+            String candidate = randomShortId();
+            if (candidate == null) break;
+            if (claim(sid, candidate)) return candidate;
+        }
+        String fallback = shortRequestId(toolUseId);
+        if (claim(sid, fallback)) return fallback;
+        for (int salt = 1; salt <= 50; salt++) {
+            String candidate = shortRequestId(toolUseId + ":fallback:" + salt);
+            if (claim(sid, candidate)) return candidate;
+        }
+        // 极端情况（整个小字母空间被占满）⇒ 仍返回一个可用号，不阻断权限流程
+        return fallback;
+    }
+
+    /** [P2] 结算/取消时释放会话内的短 ID（允许以后复用）。 */
+    public void releaseShortId(String sessionId, String shortId) {
+        if (sessionId == null || shortId == null) return;
+        java.util.Set<String> set = issuedIdsBySession.get(sessionId);
+        if (set != null) {
+            set.remove(shortId);
+            if (set.isEmpty()) issuedIdsBySession.remove(sessionId, set);
+        }
+    }
+
+    /** [P2] 测试 seam：注入可复算的随机候选（null 恢复真实随机）。 */
+    void setRandomCandidateSupplier(java.util.function.Supplier<String> supplier) {
+        this.randomCandidateSupplier = supplier;
+    }
+
+    private boolean claim(String sid, String id) {
+        java.util.Set<String> set = issuedIdsBySession.computeIfAbsent(
+            sid, k -> java.util.concurrent.ConcurrentHashMap.newKeySet());
+        return set.add(id);
     }
 
     /** CC hashToId — FNV-1a 32-bit hash → base-25 encode 5 chars. */

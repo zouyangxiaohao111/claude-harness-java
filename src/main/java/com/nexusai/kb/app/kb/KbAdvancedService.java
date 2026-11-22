@@ -49,6 +49,15 @@ public class KbAdvancedService {
     private final KbImageService imageService;
     private final JdbcTemplate jdbc;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 这里原来只传条目级 {@code d.getEmbeddingModelId()}；两级默认都空时
+     * {@code reindexKnowledge} 会进「只重建关键词」分支，删掉过期向量且不重建。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     @Autowired
     public KbAdvancedService(KbKnowledgeBaseMapper baseMapper,
                              KbKnowledgeMapper knowledgeMapper,
@@ -131,8 +140,10 @@ public class KbAdvancedService {
             }
             try {
                 indexWriter.reindexKnowledge(d.getId(), kbId,
-                    d.getEmbeddingModelId() == null || d.getEmbeddingModelId().isBlank()
-                        ? kb.getEmbeddingModelId() : d.getEmbeddingModelId());
+                    kbConfigService == null
+                        ? (d.getEmbeddingModelId() == null || d.getEmbeddingModelId().isBlank()
+                            ? kb.getEmbeddingModelId() : d.getEmbeddingModelId())
+                        : kbConfigService.resolveEmbeddingModelId(d, kb));
                 ok++;
             } catch (RuntimeException e) {
                 failed++;

@@ -42,8 +42,8 @@ import java.util.stream.Stream;
  * <ul>
  *   <li>{@link #readConfig} 文件缺失返回 {@code null}（对齐 CC readTeamFile :73-80 ENOENT → null）；</li>
  *   <li>{@link #deleteTeam} 递归删除 team 目录（对齐 CC cleanupTeamDirectories，含 config.json + inboxes/）；</li>
- *   <li>成员枚举经 {@code config.json members} 数组（{@link #listMemberNames}，对齐 CC handleBroadcast
- *       teamFile.members）；旧 {@code member_*} 文件枚举已随 IMP-G2 TR-G3-⊕-12 删除（无写入方死代码）。</li>
+ *   <li>成员枚举经 {@code config.json members} 数组（{@link #listMemberNames}）· 供 SendMessage 名册校验 /
+ *       ListAgents 使用；CC 广播（handleBroadcast）已于 2026-11-20 删除（to:"*" 硬拒）。</li>
  * </ul>
  *
  * <p>静态工具类风格同 {@link TeammateMailbox}（CC teamHelpers.ts 为模块级函数、无实例状态）；
@@ -307,13 +307,12 @@ public class TeamHelpers {
     }
 
     /**
-     * 列出 team 成员名 · 对齐 CC {@code handleBroadcast}（SendMessageTool.ts:220-226）经
-     * {@code teamFile.members} 枚举：读 config.json {@code members} 数组 → 返回 {@code member.name}
+     * 列出 team 成员名 · 对齐 CC {@code teamFile.members} 枚举（原 SendMessageTool.ts:220-226
+     * handleBroadcast 用法，广播已删除）：读 config.json {@code members} 数组 → 返回 {@code member.name}
      * 列表；team 不存在 / 无 members / 解析失败 → 空（对齐 CC readTeamFile ENOENT → null 容错）。
      *
-     * <p><b>IMP-G2（组 6-2，TR-G3-⊕-12）</b>：替代旧 {@code member_*} 文件枚举（全仓无写入方，
-     * 广播恒空死代码）。CC 广播收件人 = teamFile.members 中 name（大小写不敏感排除 sender），
-     * 非 {@code member_*} 文件。旧实现已删除，不保留双轨。
+     * <p><b>用途</b>：SendMessage 的团队名册校验（单播收件人必须名册命中）与 ListAgents 的成员枚举。
+     * CC 广播（handleBroadcast）已删除（2026-11-20，{@code to:"*"} 硬拒），本方法不再是广播收件人来源。
      *
      * @param teamName 目标 team
      * @return 成员 name 列表（含 team-lead），team 不存在返回空
@@ -620,7 +619,7 @@ public class TeamHelpers {
      * planModeRequired, joinedAt, tmuxPaneId, cwd, subscriptions, backendType})}。
      *
      * <p>teammate spawn 成功后由 {@link SpawnInProcess} 调用，使 teammate 对 TeamDiscovery
-     * （读 members）/ 广播（SendMessageTool listMemberNames）/ TeamDelete（活跃成员守卫）可见。
+     * （读 members）/ SendMessage 名册校验（listMemberNames）/ TeamDelete（活跃成员守卫）可见。
      * CC 写失败抛错（team 消失，spawnMultiAgent.ts:490-493）；Java 放宽为 log.warn 返回 false
      * （append 失败不阻断 spawn，Batch2 S1 设计决策记录差异）。
      *

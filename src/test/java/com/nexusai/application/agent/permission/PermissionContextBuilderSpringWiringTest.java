@@ -43,7 +43,8 @@ import static org.assertj.core.api.Assertions.assertThat;
 class PermissionContextBuilderSpringWiringTest {
 
     private static final String SESSION_ID = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID =
+        com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     /** 两条 stub loader 规则（USER_SOURCE allow + PROJECT_SOURCE deny）。 */
     private static final PermissionRule USER_ALLOW = new PermissionRule(

@@ -9,8 +9,6 @@ import org.junit.jupiter.api.Test;
 import org.springframework.messaging.simp.SimpMessagingTemplate;
 import org.springframework.test.util.ReflectionTestUtils;
 
-import java.util.UUID;
-
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.ArgumentMatchers.eq;
@@ -51,9 +49,10 @@ class ChatServiceCancelSessionAbortTest {
         // 在飞主 AgentState（agentId=null 主会话，LlmAgentLoop.run() 入口按 sessionId=short 注册）
         AgentState inFlight = new AgentState(null, rawSession, null);
         registry.register(rawSession, inFlight);
-        // 另一会话的 AgentState（不应被误 cancel）
-        AgentState otherSession = new AgentState(null, "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), null);
-        registry.register(UUID.randomUUID(), otherSession);
+        // 另一会话的 AgentState（不应被误 cancel）· 以不同 sessionId 注册在 sessions 桶
+        String otherRawSession = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
+        AgentState otherSession = new AgentState(null, otherRawSession, null);
+        registry.register(otherRawSession, otherSession);
 
         // delete 路径即便无 in-progress ChatTask 也须 abort 在飞 AgentState（S4 核心目标）
         boolean result = service.cancelSession(rawSession, wsTemplate);

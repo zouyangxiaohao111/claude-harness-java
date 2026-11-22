@@ -4,9 +4,17 @@ import com.nexusai.application.agent.LlmAgentLoop;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.application.agent.agent.SessionCwdHolder;
+import com.nexusai.application.agent.messaging.MessageRecipientResolver;
+import com.nexusai.application.agent.messaging.PeerIdleSubscriptions;
+import com.nexusai.application.agent.messaging.PeerInboundPolicy;
+import com.nexusai.application.agent.messaging.PeerMessageRouter;
+import com.nexusai.application.agent.messaging.PeerSessionRegistry;
 import com.nexusai.application.agent.permission.PermissionMode;
+import com.nexusai.application.agent.subagent.AgentNameRegistry;
 import com.nexusai.application.agent.tasks.TaskSystemConfig;
 import com.nexusai.application.agent.team.TeamHelpers;
+import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -27,6 +35,7 @@ import java.nio.file.Path;
 import java.util.LinkedHashMap;
 import java.util.Map;
 import java.util.UUID;
+import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -61,6 +70,9 @@ class SendMessageToolTest {
 
     private static final String TEAM = "research-team";
 
+    /** 来源会话 id · 供子代理注册表 / peer 会话注册表按 owner 匹配。 */
+    private static final String SELF = "sess-aaaaaaa1";
+
     private final ObjectMapper json = new ObjectMapper();
 
     @TempDir
@@ -70,10 +82,14 @@ class SendMessageToolTest {
     void setUp() {
         // configHome 指向临时目录: {configHome}/teams/{team}/inboxes/{agent}.json
         System.setProperty("nexusai.task.config-dir", tempDir.toString());
+        // 带 sessionId 的 ToolUseContext 会经 CwdResolution 解析 cwd；测试会话未入库 ⇒ 显式登记，
+        // 避免构造器 fail-loud（与 TeamControllerTest 同款夹具）。
+        SessionCwdHolder.set(SELF, tempDir.toAbsolutePath().normalize().toString());
     }
 
     @AfterEach
     void tearDown() {
+        SessionCwdHolder.clear(SELF);
         TaskSystemConfig.clearForTest();
     }
 
@@ -90,15 +106,20 @@ class SendMessageToolTest {
     }
 
     private ToolUseContext plainCtx() {
-        return ToolUseContext.of(UUID.randomUUID(), "");
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "");
     }
 
     /** 带 appState 桥的 ToolUseContext · SendMessage 经 getTeamName(appState.teamContext) 取 team 名。 */
     private ToolUseContext teamCtx(Map<String, Object> appState) {
+        return teamCtx(appState, "");
+    }
+
+    /** 同上，但带真实来源会话 id（结构类负例要按 owner 匹配子代理 / peer 会话）。 */
+    private ToolUseContext teamCtx(Map<String, Object> appState, String sessionId) {
         return ToolUseContext.of(
-                UUID.randomUUID(), "",
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId,
                 PermissionMode.DEFAULT,
-                java.util.List.of(), "", com.nexusai.application.agent.tool.AbortController.NOOP,
+                java.util.List.of(), "", AbortController.NOOP,
                 java.util.List.of(), null, PermissionMode.DEFAULT, Map.of(),
                 false, "", null, null, null, null,
                 prev -> appState,
@@ -115,7 +136,13 @@ class SendMessageToolTest {
         Map<String, Object> tc = new LinkedHashMap<>();
         tc.put("teamName", TEAM);
         tc.put("leadAgentId", "team-lead@" + TEAM);
-        tc.put("teammates", new LinkedHashMap<>());
+        // [cc-notfound-align] mailbox 现在要求收件人命中团队名册（CC exe resolver）——
+        //   单播测试的 "mate" 必须是真实成员，否则分支会按 not-found 拒绝。
+        Map<String, Object> mate = new LinkedHashMap<>();
+        mate.put("name", "mate");
+        Map<String, Object> mates = new LinkedHashMap<>();
+        mates.put("mate@" + TEAM, mate);
+        tc.put("teammates", mates);
         appState.put("teamContext", tc);
         return appState;
     }
@@ -190,9 +217,32 @@ class SendMessageToolTest {
     }
 
     @Test
-    @DisplayName("validateInput: 结构化消息 to=\"*\" 禁广播 → 拒绝（CC :678-684）")
-    void validateInput_rejectsStructuredBroadcast() {
-        // WHY: CC :678-684 结构化消息（shutdown/plan 决策）不可广播，必须单播到指定 teammate。
+    @DisplayName("validateInput: to=\"*\" 被硬拒（CC 2.1.328 原文），任何消息都不写 mailbox")
+    void validateInput_rejectsBroadcast_withCcText() {
+        // WHY: 2026-11-20 用户裁定「彻底删除 to:\"*\"」——对齐 CC 2.1.328 硬拒，只允许单一收件人。
+        SendMessageTool tool = newTool();
+        ObjectNode input = json.createObjectNode();
+        input.put("to", "*");
+        input.put("message", "all hands");
+        input.put("summary", "all hands");
+        Tool.ValidationResult result = tool.validateInput(input, plainCtx());
+        assertThat(result.ok()).isFalse();
+        assertThat(result.errorCode()).isEqualTo("9");
+        assertThat(result.message()).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+
+        // 直接 execute 同样拒绝，且不产生任何 inbox（无 team 上下文也不猜收件人）。
+        AgentToolResult<?> executed = tool.execute(block("SendMessage", input), plainCtx());
+        assertThat(String.valueOf(executed.data())).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+        assertThat(inboxPath("team-lead")).doesNotExist();
+        assertThat(inboxPath("mate")).doesNotExist();
+    }
+
+    @Test
+    @DisplayName("validateInput: 结构化消息 + to=\"*\" 同样被拒（只能指定单一收件人）")
+    void validateInput_rejectsBroadcastForStructuredMessage() {
+        // WHY: shutdown/plan 决策必须单播 —— 广播删除后不因消息类型而放行。
         SendMessageTool tool = newTool();
         ObjectNode input = json.createObjectNode();
         input.put("to", "*");
@@ -202,7 +252,14 @@ class SendMessageToolTest {
         Tool.ValidationResult result = tool.validateInput(input, plainCtx());
         assertThat(result.ok()).isFalse();
         assertThat(result.errorCode()).isEqualTo("9");
-        assertThat(result.message()).contains("structured messages cannot be broadcast");
+        assertThat(result.message()).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+
+        // 直接 execute（结构性消息）也不得落任何 mailbox。
+        AgentToolResult<?> executed = tool.execute(block("SendMessage", input), plainCtx());
+        assertThat(String.valueOf(executed.data())).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+        assertThat(inboxPath("team-lead")).doesNotExist();
     }
 
     @Test
@@ -225,69 +282,57 @@ class SendMessageToolTest {
     }
 
     @Test
-    @DisplayName("broadcast: 经 teamFile.members 枚举收件人（排除 sender），旧 member_* 恒空死代码删除（⊕-12）")
-    void broadcast_usesTeamFileMembers() throws Exception {
-        // WHY: CC handleBroadcast :220-226 recipients = teamFile.members 排除 sender（大小写不敏感）。
-        //      旧 Java listMembers 枚举 member_* 文件（全仓无写入方 → 广播恒空，功能不可用）；
-        //      IMP-G2 改按 config.json members 数组 → 广播真正按团队配置投递。
+    @DisplayName("execute: to=\"*\" 即使有 team/peer/子代理也只返回拒绝、零投递（广播已删除）")
+    void execute_broadcast_neverDeliversToAnyTarget() throws Exception {
+        // WHY（2026-11-20 用户裁定）：广播能力彻底删除 ⇒ team 名册成员、跨会话 peer、子代理
+        //   三类目标一个都不许因 "*" 被投递，且不落任何 mailbox / 不排队子代理消息。
         Map<String, Object> appState = teamContext();
-        writeTeamConfig("team-lead", "mate"); // 广播收件人 = members 排除 sender(team-lead) → [mate]
+        writeTeamConfig("team-lead", "mate", "peer-one", "worker-one");
+
+        // 跨会话 peer（本机另一个会话）· 名字出现在 team 名册里也不得被广播命中
+        PeerSessionRegistry sessions = new PeerSessionRegistry();
+        sessions.register(new PeerSessionRegistry.Registration(
+            "sess-ccccccc3", "peer-one", "/p", PermissionMode.DEFAULT, 1L));
+        // 子代理（本会话注册）· 同样不得被广播命中
+        AgentNameRegistry agents = new AgentNameRegistry();
+        agents.register(SELF, "worker-one", "a1111111111111111");
+
+        MessageRecipientResolver resolver = new MessageRecipientResolver();
+        resolver.setPeerSessionRegistry(sessions);
+        resolver.setAgentNameRegistry(agents);
+
+        PeerInboundPolicy policy = new PeerInboundPolicy();
+        policy.setSettingsSource(id -> "accept");
+        PeerMessageRouter router = new PeerMessageRouter();
+        router.setPeerSessionRegistry(sessions);
+        router.setPeerInboundPolicy(policy);
+        router.setIdleSubscriptions(new PeerIdleSubscriptions());
+        AtomicInteger peerDeliveries = new AtomicInteger();
+        router.setDeliveryPort((targetSessionId, epoch, envelope, body) -> {
+            peerDeliveries.incrementAndGet();
+            return new PeerMessageRouter.Receipt(PeerMessageRouter.Status.ACCEPTED,
+                envelope.messageId(), "stub", null);
+        });
 
         SendMessageTool tool = newTool();
+        tool.setRecipientResolver(resolver);
+        tool.setPeerMessageRouter(router);
+        tool.setAgentNameRegistry(agents);
+
         ObjectNode input = json.createObjectNode();
         input.put("to", "*");
         input.put("message", "all hands");
         input.put("summary", "all hands");
-        AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
+        AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState, SELF));
 
-        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode out = json.readTree(String.valueOf(result.data()));
-        assertThat(out.get("success").asBoolean()).isTrue();
-        assertThat(out.get("recipients").toString()).contains("mate");
-
-        // mate 收到广播，sender(team-lead) 被排除（CC :222-224）
-        assertThat(inboxPath("mate")).exists();
-        JsonNode mateMessages = json.readTree(Files.readString(inboxPath("mate")));
-        assertThat(mateMessages).hasSize(1);
-        assertThat(mateMessages.get(0).get("text").asText()).isEqualTo("all hands");
-        assertThat(inboxPath("team-lead")).doesNotExist();
-    }
-
-    @Test
-    @DisplayName("broadcast: 无成员可广播 → recipients:[]（CC :228-236），不写任何 inbox")
-    void broadcast_noRecipients_returnsEmpty() throws Exception {
-        Map<String, Object> appState = teamContext();
-        writeTeamConfig("team-lead"); // 仅 sender 自己
-
-        SendMessageTool tool = newTool();
-        ObjectNode input = json.createObjectNode();
-        input.put("to", "*");
-        input.put("message", "anyone?");
-        input.put("summary", "anyone?");
-        AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
-
-        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        JsonNode out = json.readTree(String.valueOf(result.data()));
-        assertThat(out.get("success").asBoolean()).isTrue();
-        assertThat(out.get("message").asText()).contains("No teammates to broadcast to");
-        assertThat(out.get("recipients").isEmpty()).isTrue();
-        assertThat(inboxPath("team-lead")).doesNotExist();
-    }
-
-    @Test
-    @DisplayName("broadcast: 无 team context → 拒绝（CC :199-203）")
-    void broadcast_withoutTeamContext_rejected() {
-        // WHY: CC :199-203 广播必须处于 team context（teamName 必填）——否则不知投递哪个 team。
-        // 注：isToolErrorData 前缀表（LlmAgentLoop.java:9515-9560）不含 "Not in a team context"——
-        //   拒绝经「消息内容 + 不写任何 inbox」双断言验证（意图：无 team 时广播被拦截）。
-        SendMessageTool tool = newTool();
-        ObjectNode input = json.createObjectNode();
-        input.put("to", "*");
-        input.put("message", "anyone?");
-        input.put("summary", "anyone?");
-        AgentToolResult<?> result = tool.execute(block("SendMessage", input), plainCtx());
-        assertThat(result.data()).asString().contains("Not in a team context");
-        assertThat(inboxPath("team-lead")).as("无 team 时广播不得写任何 inbox").doesNotExist();
+        assertThat(String.valueOf(result.data())).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+        for (String name : java.util.List.of("mate", "team-lead", "peer-one", "worker-one")) {
+            assertThat(inboxPath(name)).as("to=* 不得给 %s 写 mailbox", name).doesNotExist();
+        }
+        assertThat(peerDeliveries).as("to=* 不得投递给跨会话 peer").hasValue(0);
+        assertThat(agents.hasPending("a1111111111111111"))
+            .as("to=* 不得给子代理排队消息").isFalse();
     }
 
     @Test
@@ -298,7 +343,9 @@ class SendMessageToolTest {
         Map<String, Object> appState = teamContext();
         SendMessageTool tool = newTool();
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        // [B2] 非 lead 名册成员改走代理队列（⛔ 不再写 inbox）——本用例只验证 handleMessage
+        // 输出形状，收件人改用唯一仍走 mailbox 的 team-lead。
+        input.put("to", "team-lead");
         input.put("message", "status update");
         input.put("summary", "status");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
@@ -306,14 +353,35 @@ class SendMessageToolTest {
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         JsonNode out = json.readTree(String.valueOf(result.data()));
         assertThat(out.get("success").asBoolean()).isTrue();
-        assertThat(out.get("message").asText()).isEqualTo("Message sent to mate's inbox");
+        assertThat(out.get("message").asText()).isEqualTo("Message sent to team-lead's inbox");
         assertThat(out.has("message_id")).as("旧 message_id 字段应删除").isFalse();
         assertThat(out.has("delivered_to")).as("旧 delivered_to 字段应删除").isFalse();
         assertThat(out.has("type")).as("旧 type 字段应删除").isFalse();
         assertThat(out.has("timestamp")).as("旧 timestamp 字段应删除").isFalse();
         JsonNode routing = out.get("routing");
         assertThat(routing.get("sender").asText()).isEqualTo("team-lead");
-        assertThat(routing.get("target").asText()).isEqualTo("@mate");
+        assertThat(routing.get("target").asText()).isEqualTo("@team-lead");
+    }
+
+    @Test
+    @DisplayName("[cc-notfound-align] 收件名不在名册 → Error + Did you mean，且不写任何 inbox（CC not-found）")
+    void plainMessage_unknownRecipient_failsLoud_withCandidate() {
+        // WHY: CC exe 的 not-found 分支返回 success:false + `No agent named 'X' is reachable.
+        //   Did you mean: …?`，⛔ 不落 inbox。旧实现「有 team 上下文就写 inbox」会把消息吞掉
+        //   （实测：spawn 名 peer-inline-card / 发送名 inline-card → inbox 永久 read:false）。
+        Map<String, Object> appState = teamContext();
+        SendMessageTool tool = newTool();
+        ObjectNode input = json.createObjectNode();
+        input.put("to", "mat");
+        input.put("message", "hi");
+        input.put("summary", "hi");
+        AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
+
+        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
+        assertThat(String.valueOf(result.data()))
+            .contains("No agent named 'mat'")
+            .contains("mate");
+        assertThat(inboxPath("mat")).as("名册外的收件人不得写 inbox").doesNotExist();
     }
 
     @Test
@@ -329,9 +397,9 @@ class SendMessageToolTest {
         tc.put("leadAgentId", "team-lead@" + TEAM);
         Map<String, Object> mates = new LinkedHashMap<>();
         Map<String, Object> mate = new LinkedHashMap<>();
-        mate.put("name", "mate");
+        mate.put("name", "team-lead");
         mate.put("color", "#ff0000");
-        mates.put("mate@" + TEAM, mate);
+        mates.put("team-lead@" + TEAM, mate);
         tc.put("teammates", mates);
         when(sessionService.getTeamContext(anyString())).thenReturn(tc);
 
@@ -339,8 +407,9 @@ class SendMessageToolTest {
         ReflectionTestUtils.setField(tool, "sessionService", sessionService);
         writeTeamConfig("team-lead", "mate");
 
+        // [B2] 非 lead 名册成员不再写 inbox ⇒ 用 team-lead 验证 store 团队名/颜色路由。
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        input.put("to", "team-lead");
         input.put("message", "from store");
         input.put("summary", "from store");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(new LinkedHashMap<>()));
@@ -348,9 +417,9 @@ class SendMessageToolTest {
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         JsonNode out = json.readTree(String.valueOf(result.data()));
         assertThat(out.get("success").asBoolean()).isTrue();
-        // mate 收到消息且路由到 TEAM 的 inbox（store teamName 生效）
-        assertThat(inboxPath("mate")).exists();
-        JsonNode mateMessages = json.readTree(Files.readString(inboxPath("mate")));
+        // team-lead 收到消息且路由到 TEAM 的 inbox（store teamName 生效）
+        assertThat(inboxPath("team-lead")).exists();
+        JsonNode mateMessages = json.readTree(Files.readString(inboxPath("team-lead")));
         assertThat(mateMessages).hasSize(1);
         assertThat(mateMessages.get(0).get("text").asText()).isEqualTo("from store");
         // color 从 store teamContext.teammates 读取（findTeammateColor store-first）
@@ -373,7 +442,7 @@ class SendMessageToolTest {
         tool.setWs(ws);
 
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        input.put("to", "team-lead");
         input.put("message", "status update");
         input.put("summary", "status");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
@@ -385,16 +454,16 @@ class SendMessageToolTest {
         assertThat(evt.type()).as("出站事件 type 必须为 teammate.message").isEqualTo("teammate.message");
         assertThat(evt.teamName()).isEqualTo(TEAM);
         assertThat(evt.from()).as("sender = resolveSenderName()（无 teammate context → team-lead）").isEqualTo("team-lead");
-        assertThat(evt.to()).isEqualTo("mate");
+        assertThat(evt.to()).isEqualTo("team-lead");
         assertThat(evt.text()).isEqualTo("status update");
         assertThat(evt.summary()).isEqualTo("status");
     }
 
     @Test
-    @DisplayName("[B1] handleBroadcast 写 inbox 后推一条 to=\"*\" 广播事件（按 lead 会话 topic）")
-    void broadcast_publishesSingleWildcardEvent() throws Exception {
-        // WHY: 广播为团队级事件（to=\"*\"）——前端团队消息流渲染一条广播而非每收件人一条。
-        //   [stomp-lead-session 方案 3] topic 按 lead 会话：/topic/sessions/{leadSessionId}/team-messages。
+    @DisplayName("execute: to=\"*\" 不推任何 STOMP 事件（通配广播事件随广播能力一并删除）")
+    void execute_broadcast_publishesNoWildcardEvent() throws Exception {
+        // WHY: 原 handleBroadcast 会推一条 to="*" 的团队广播事件；广播删除后不得再出现任何
+        //   "broadcast" 形态的出站事件（否则前端仍显示「已广播」而实际没人收到）。
         Map<String, Object> appState = teamContext();
         writeTeamConfig("team-lead", "mate");
         SimpMessagingTemplate ws = mock(SimpMessagingTemplate.class);
@@ -407,13 +476,10 @@ class SendMessageToolTest {
         input.put("summary", "all hands");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
 
-        assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
-        ArgumentCaptor<TeammateMessageEvent> captor = ArgumentCaptor.forClass(TeammateMessageEvent.class);
-        verify(ws).convertAndSend(eq("/topic/sessions/sess-1/team-messages"), captor.capture());
-        assertThat(captor.getValue().type()).isEqualTo("teammate.message");
-        assertThat(captor.getValue().to()).as("广播 to 必须为 *（团队广播语义）").isEqualTo("*");
-        assertThat(captor.getValue().text()).isEqualTo("all hands");
-        assertThat(captor.getValue().summary()).isEqualTo("all hands");
+        assertThat(String.valueOf(result.data())).isEqualTo(
+                "broadcast (to: \"*\") is no longer supported — send a message per recipient");
+        verify(ws, never()).convertAndSend(anyString(), any(TeammateMessageEvent.class));
+        assertThat(inboxPath("mate")).doesNotExist();
     }
 
     @Test
@@ -425,14 +491,14 @@ class SendMessageToolTest {
         SendMessageTool tool = newTool(); // 不注入 ws
 
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        input.put("to", "team-lead");
         input.put("message", "no ws");
         input.put("summary", "no ws");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         // inbox 仍写入（B1 不改变既有落库语义）
-        assertThat(inboxPath("mate")).exists();
+        assertThat(inboxPath("team-lead")).exists();
     }
 
     @Test
@@ -462,7 +528,7 @@ class SendMessageToolTest {
         tool.setWs(ws);
 
         ObjectNode input = json.createObjectNode();
-        input.put("to", "mate");
+        input.put("to", "team-lead");
         input.put("message", "no lead");
         input.put("summary", "no lead");
         AgentToolResult<?> result = tool.execute(block("SendMessage", input), teamCtx(appState));
@@ -472,6 +538,6 @@ class SendMessageToolTest {
         //   用 any(TeammateMessageEvent.class) 消解 Spring convertAndSend(String,Object) 双重载歧义
         verify(ws, never()).convertAndSend(anyString(), any(TeammateMessageEvent.class));
         // inbox 仍写入（跳过推送不影响既有 mailbox 投递语义）
-        assertThat(inboxPath("mate")).exists();
+        assertThat(inboxPath("team-lead")).exists();
     }
 }

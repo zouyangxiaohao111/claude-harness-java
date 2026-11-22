@@ -21,7 +21,6 @@ import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
-import java.util.UUID;
 import java.util.function.Function;
 import java.util.stream.Collectors;
 
@@ -72,7 +71,7 @@ import static org.mockito.Mockito.when;
 @DisplayName("[T1-A2] teammate 路径读 Leader 会话列授权（会话列 → 子代理 per-turn permCtx）")
 class TeammateLeaderSessionColumnReadTest {
 
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000a3");
+    private static final String AGENT_ID = "a00000000000000a3";
     private static final String LEADER_SESSION = "sess-leader-t1a2";
     private static final String LEADER_CWD = "D:/tmp/t1a2-leader-cwd";
     /** 文件类弹窗「Yes, during this session」的目录（CC permissionOptions.tsx:127-131 → session 档）。 */

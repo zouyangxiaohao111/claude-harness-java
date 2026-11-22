@@ -52,7 +52,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  */
 class R32B15Stage3_3_UIRecordExtensionTest {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = "a0123456789abcdef";
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     // ═══════════════════ 7 payload record accessor ═══════════════════
@@ -250,45 +250,45 @@ class R32B15Stage3_3_UIRecordExtensionTest {
         //   javap 实测签名 = (UUID, String, PermissionMode, Map)）。此处按**实测签名**校正。
         // 4 参 (Stage 3.1 早期)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class)).isNotNull();
+            String.class, String.class, PermissionMode.class, Map.class)).isNotNull();
         // 5 参 (s12 方案 C availableTools)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class)).isNotNull();
+            String.class, String.class, PermissionMode.class, Map.class, List.class)).isNotNull();
         // 6 参 (s12-2.3 taskListId)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class)).isNotNull();
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class)).isNotNull();
         // 8 参 (Phase 2 PR 1 messages + abortController)
         Class<?> abortControllerCls = Class.forName("com.nexusai.application.agent.tool.AbortController");
         Class<?> permissionCtxCls = Class.forName("com.nexusai.application.agent.permission.ToolPermissionContext");
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class)).isNotNull();
         // 10 参 (Phase 2 PR 1 permissionContext + permissionMode)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class)).isNotNull();
         // 11 参 (Stage 3.1 P1.3 mcpClients)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class)).isNotNull();
         // 12 参 (P1.3 isNonInteractiveSession)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class)).isNotNull();
         // 13 参 (P1.3 renderedSystemPrompt)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class)).isNotNull();
         // 15 参 (Phase A + R32-b8 #3 effectiveCwd + inProgressToolUseIDs)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class,
@@ -296,7 +296,7 @@ class R32B15Stage3_3_UIRecordExtensionTest {
             Class.forName("java.util.function.Function"))).isNotNull();
         // 17 参 (Stage 3.1 C13 toolDecisions + onCompactProgress)
         assertThat(ToolUseContext.class.getConstructor(
-            UUID.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
+            String.class, String.class, PermissionMode.class, Map.class, List.class, String.class,
             abortControllerCls, List.class,
             permissionCtxCls, PermissionMode.class,
             Map.class, boolean.class, String.class,

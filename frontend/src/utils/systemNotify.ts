@@ -47,6 +47,14 @@ export interface SystemNotifyPayload {
    * 无此能力）⇒ Web 通道点击只能聚焦窗口，不切会话。
    */
   extra?: Record<string, unknown>
+  /**
+   * Web 通道的**点击回调**（可选）。
+   *
+   * <p>浏览器规范不允许点击时回读自定义载荷（Tauri 才有 `extra`）⇒ 需要「点通知做事」的
+   * 调用方在 Web 通道里靠本回调实现。Tauri 通道忽略本字段（点击事件由
+   * {@link onSystemNotificationClick} 按 extra 派发）。
+   */
+  onClick?: () => void
 }
 
 /** 「本轮完成/出错」通知的默认分组（同一会话连续结束不堆一屏）。 */
@@ -127,7 +135,7 @@ export async function sendSystemNotification(payload: SystemNotifyPayload): Prom
   try {
     const { isTauri } = await import('@tauri-apps/api/core')
     if (isTauri()) return await sendViaTauri(title, payload.body, payload.extra)
-    return await sendViaWeb(title, payload.body, tag)
+    return await sendViaWeb(title, payload.body, tag, payload.onClick)
   } catch {
     // 插件缺失 / 非 Tauri 构建 / 浏览器不支持 —— 一律静默
     return false
@@ -190,7 +198,12 @@ export async function ensureNotificationPermissionOnGesture(): Promise<void> {
 }
 
 /** Web 通道：浏览器 Notification API。 */
-async function sendViaWeb(title: string, body?: string, tag: string = DEFAULT_TAG): Promise<boolean> {
+async function sendViaWeb(
+  title: string,
+  body?: string,
+  tag: string = DEFAULT_TAG,
+  onClick?: () => void,
+): Promise<boolean> {
   if (typeof Notification === 'undefined') return false
   // ⛔ 不在异步事件里主动 requestPermission：浏览器要求手势，调了也只会被静默拒。
   //   只消费「用户此前已经放行」的结果。
@@ -202,12 +215,16 @@ async function sendViaWeb(title: string, body?: string, tag: string = DEFAULT_TA
     silent: false,
   })
   // 点击通知 → 把窗口拉回前台（Web 端没有可靠的跨平台「聚焦窗口」API，
-  //   这里只做「响应用户点击」的语义：关掉通知本身，由浏览器决定是否切标签页）
+  //   这里只做「响应用户点击」的语义：关掉通知本身，由浏览器决定是否切标签页）。
+  //   需要「点通知后做点什么」的调用方传 onClick（Tauri 通道走 extra，不走这里）。
   n.onclick = () => {
     try {
       window.focus()
       n.close()
     } catch { /* 某些浏览器禁止程序化关闭，忽略 */ }
+    try {
+      onClick?.()
+    } catch { /* 回调失败不得影响通知本身 */ }
   }
   return true
 }

@@ -611,7 +611,7 @@ class StopHooksPipelineTest {
 
         AbortController abort = new AbortController();
         ToolUseContext ctx = ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "tl-1", abort)
             // permissionMode 是 TUC 位置 10 字段（mode 是位置 3）——对齐生产 baseTuc.permissionMode()
             .withPermissionContext(null, PermissionMode.BYPASS_PERMISSIONS);

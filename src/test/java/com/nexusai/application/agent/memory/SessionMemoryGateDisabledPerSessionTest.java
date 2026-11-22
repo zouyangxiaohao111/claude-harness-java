@@ -14,7 +14,6 @@ import java.nio.file.Path;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -97,7 +96,7 @@ class SessionMemoryGateDisabledPerSessionTest {
     /** 显式 sessionId 的 TUC（8 参便捷 ctor；本用例只关心 sessionId 维度）。 */
     private static ToolUseContext tuc(String sessionId) {
         return new ToolUseContext(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", AbortController.NOOP, List.of());
     }
 

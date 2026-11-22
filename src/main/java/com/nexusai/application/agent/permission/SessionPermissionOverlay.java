@@ -146,6 +146,42 @@ public final class SessionPermissionOverlay {
     }
 
     /**
+     * [C批 · 跨会话安全] 过滤掉 destination=SESSION 的更新 —— peer 来源不得新增会话级规则/模式。
+     *
+     * <p>peer 回合的权限批准只允许「本次调用」生效（accept-once），不得把
+     * 「always allow during this session」写成 {@code sessions.session_permission_rules}。
+     * 调用方（{@code WebSocketPermissionPrompter.applyAndPersistUpdates}）在
+     * {@code ctx.peerExecutionOrigin() != null} 时先经本方法过滤。
+     *
+     * @param updates 用户批准的权限更新（可 null/空）
+     * @return 仅保留非 SESSION destination 的新列表（原列表不变）
+     */
+    public static List<PermissionUpdate> withoutSessionScoped(List<PermissionUpdate> updates) {
+        if (updates == null || updates.isEmpty()) {
+            return List.of();
+        }
+        List<PermissionUpdate> filtered = new ArrayList<>(updates.size());
+        for (PermissionUpdate update : updates) {
+            if (update != null && !isSessionScoped(update)) {
+                filtered.add(update);
+            }
+        }
+        return filtered;
+    }
+
+    /** {@link PermissionUpdate} 的 destination（sealed interface 未声明公共 accessor → 穷举六型）。 */
+    private static boolean isSessionScoped(PermissionUpdate update) {
+        return switch (update) {
+            case PermissionUpdate.AddRules u -> u.destination() == PermissionUpdate.Destination.SESSION;
+            case PermissionUpdate.RemoveRules u -> u.destination() == PermissionUpdate.Destination.SESSION;
+            case PermissionUpdate.ReplaceRules u -> u.destination() == PermissionUpdate.Destination.SESSION;
+            case PermissionUpdate.SetMode u -> u.destination() == PermissionUpdate.Destination.SESSION;
+            case PermissionUpdate.AddDirectories u -> u.destination() == PermissionUpdate.Destination.SESSION;
+            case PermissionUpdate.RemoveDirectories u -> u.destination() == PermissionUpdate.Destination.SESSION;
+        };
+    }
+
+    /**
      * [权限胶囊切换] 把会话列里<b>已有</b>的 SESSION setMode 同步成用户显式选择的模式。
      *
      * <p><b>WHY</b>：V75 {@code session_permission_rules} 的 SESSION setMode 在 per-turn 合并中

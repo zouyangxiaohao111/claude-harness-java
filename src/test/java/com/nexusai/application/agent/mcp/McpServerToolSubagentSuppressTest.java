@@ -94,7 +94,7 @@ class McpServerToolSubagentSuppressTest {
 
     /** 构造一个带 agentType 的 TUC · 复用 ToolUseContext.of 便捷工厂（最小字段）. */
     private static ToolUseContext ctxWithAgentType(String agentType) {
-        ToolUseContext base = ToolUseContext.of(java.util.UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext base = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
         // of() 便捷工厂无 agentType 参数 — 用 SubagentContextOverrides 经 with() 注入
         return base.with(new ToolUseContext.SubagentContextOverrides(
             null, agentType, null, null, null, null, null, null, null, null, null, null, null, null));

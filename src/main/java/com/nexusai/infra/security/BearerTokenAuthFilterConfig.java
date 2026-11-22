@@ -87,7 +87,13 @@ public class BearerTokenAuthFilterConfig {
             "/api/v1/session-memory/export", "/api/v1/session-memory/export/*",
             "/api/v1/attachments/content", "/api/v1/attachments/content/*",
             "/api/v1/attachments/upload",
-            "/api/v1/attachments/image/*");
+            "/api/v1/attachments/image/*",
+            // IM 频道（V302~V304）：实例 / 扫描规则 / 审批。
+            // 双 pattern 是 Servlet 规范要求（/prefix/* 不匹配裸路径本身）。
+            "/api/v1/im", "/api/v1/im/*",
+            // 既有缺口补齐：V255 的渠道绑定端点此前根本没进鉴权列表
+            // （/api/v1/channels 不在任何 pattern 里 ⇒ 未鉴权即可读写绑定关系）。
+            "/api/v1/channels", "/api/v1/channels/*");
         registration.setOrder(Ordered.HIGHEST_PRECEDENCE);
         registration.setName("bearerTokenAuthFilter");
         return registration;

@@ -737,7 +737,7 @@ class WebSearchToolTest {
         AgentToolResult<?> result = tool.execute(
                 new ToolUseBlock("ws-w3", "WebSearch",
                         MAPPER.createObjectNode().put("query", "claude code")),
-                ToolUseContext.of(UUID.randomUUID(), SID));
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SID));
 
         JsonNode out = MAPPER.readTree(((ToolResult<?>) result).data().toString());
         assertThat(out.path("results").get(1).asText())
@@ -833,7 +833,7 @@ class WebSearchToolTest {
         // 未注入 mapper → 通道3 no-op，通道2 独立验证（隔离良好）
         ToolUseBlock call = new ToolUseBlock("ws-ev-1", "WebSearch",
                 MAPPER.createObjectNode().put("query", "claude code"));
-        AgentToolResult<?> result = tool.execute(call, ToolUseContext.of(UUID.randomUUID(), SID));
+        AgentToolResult<?> result = tool.execute(call, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SID));
 
         // 通道2 已停用（2026-08-23）：STOMP 事件不再发布到 /topic/sessions/{sessionId}/websearch-results
         verify(wsTemplate, never()).convertAndSend(anyString(), any(Object.class));
@@ -855,7 +855,7 @@ class WebSearchToolTest {
         ReflectionTestUtils.setField(tool, "webSearchResultMapper", mapper);
         ToolUseBlock call = new ToolUseBlock("ws-st-1", "WebSearch",
                 MAPPER.createObjectNode().put("query", "claude code"));
-        AgentToolResult<?> result = tool.execute(call, ToolUseContext.of(UUID.randomUUID(), SID));
+        AgentToolResult<?> result = tool.execute(call, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SID));
 
         // 通道3 已停用（2026-08-23）：websearch_results 表不再落库
         verify(mapper, never()).insert(any(WebSearchResultRecord.class));
@@ -947,9 +947,12 @@ class WebSearchToolTest {
                         + "null,"
                         + "\"Note text\"],\"durationSeconds\":1.0}");
 
-        ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "ws-2", true);
+        // [错误通道 CCJ-ERR-014] mapper 只在成功路径被调用（CC toolExecution.ts:1288-1292）；
+        //   失败由执行层直构块。此用例只验证成功渲染分支 → isError=false。
+        //   失败守卫见 ErrorMapperGuardTest#webSearchMapperSkipsFailurePayload。
+        ToolResultBlockParam block = tool.mapToToolResultBlockParam(result, "ws-2", false);
 
-        assertThat(block.isError()).isTrue(); // isError 透传
+        assertThat(block.isError()).isFalse();
         String content = (String) block.content();
         assertThat(content).contains("No links found.");
         assertThat(content).contains("Note text");

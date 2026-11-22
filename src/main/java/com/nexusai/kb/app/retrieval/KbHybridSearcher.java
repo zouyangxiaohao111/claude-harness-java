@@ -281,13 +281,16 @@ public class KbHybridSearcher {
         // ⭐ 块级可见性闸（缺陷：is_enabled=0 的分块仍被召回）
         //   kb_embedding 只是索引产物，块被禁用后向量行可能还在（禁用不走重建索引）
         //   ⇒ 用子查询把「未删 + 启用」的块限定出来，一次查询完成（不是逐条查、也不是 N+1）。
+        // [B 对齐源站 · 2026-11-20] 索引条目有两类：
+        //   · 正文条目 source_type='chunk'，source_id = 块 id；
+        //   · 问句条目 source_type='question'，source_id = q:{chunkId}:{qid}（源站 GeneratedQuestionSourceID）。
+        //   两类都要参与召回，并把命中归并到**所属块**（同块多条取最高分）。
+        java.util.Set<String> visibleChunkIds = visibleChunkIds(kbId);
         List<KbEmbeddingRecord> rows = embeddingMapper.selectListByQuery(
             QueryWrapper.create()
                 .where("knowledge_base_id = ?", kbId)
                 .and("model_id = ?", modelId)
-                .and("source_type = ?", "chunk")
-                .and("source_id IN (SELECT id FROM kb_chunk WHERE knowledge_base_id = ?"
-                    + " AND deleted = 0 AND is_enabled = 1)", kbId));
+                .and("source_type in ('chunk','question')"));
 
         List<Scored> scored = new ArrayList<>(rows.size());
         for (KbEmbeddingRecord row : rows) {
@@ -302,8 +305,13 @@ public class KbHybridSearcher {
                 // 维度不一致 = 模型换了但旧向量没清，跳过（不参与排序）
                 continue;
             }
+            // 问句条目归并到所属块；正文条目 source_id 本身就是块 id
+            String chunkId = KbIndexWriter.chunkIdOfSource(row.getSourceId());
+            if (chunkId == null || !visibleChunkIds.contains(chunkId)) {
+                continue;
+            }
             double sim = KbVectorCodec.cosine(queryVec, vec);
-            scored.add(new Scored(row.getSourceId(), sim));
+            scored.add(new Scored(chunkId, sim));
         }
 
         scored.sort(Comparator
@@ -311,6 +319,7 @@ public class KbHybridSearcher {
             .thenComparing(Scored::chunkId));  // 同分按 id，保证可复现
 
         List<String> out = new ArrayList<>(Math.min(scored.size(), CANDIDATES_PER_ROUTE));
+        java.util.Set<String> seen = new java.util.HashSet<>();
         int dropped = 0;
         for (int i = 0; i < scored.size() && out.size() < CANDIDATES_PER_ROUTE; i++) {
             Scored s = scored.get(i);
@@ -319,12 +328,41 @@ public class KbHybridSearcher {
                 dropped = scored.size() - i;
                 break;
             }
+            // 同一块可能同时命中「正文条目」与「问句条目」⇒ 只保留分数最高的那次命中
+            if (!seen.add(s.chunkId())) {
+                continue;
+            }
             out.add(s.chunkId());
         }
         if (dropped > 0 && log.isDebugEnabled()) {
             log.debug("[检索] 向量路阈值过滤 kb={} 阈值={} 丢弃={}", kbId, threshold, dropped);
         }
         return out;
+    }
+
+    /**
+     * 该知识库里「未删 + 启用」的块 id 集合。
+     *
+     * <p>正文条目与问句条目共用的可见性闸：{@code kb_embedding} 只是索引产物，
+     * 块被禁用/删除后索引行可能还在，必须以 {@code kb_chunk} 为准。
+     */
+    private java.util.Set<String> visibleChunkIds(String kbId) {
+        java.util.Set<String> ids = new java.util.HashSet<>();
+        String sql = "SELECT id FROM kb_chunk WHERE knowledge_base_id = ?"
+            + " AND deleted = 0 AND is_enabled = 1";
+        try (var conn = dataSource.getConnection();
+             var ps = conn.prepareStatement(sql)) {
+            ps.setString(1, kbId);
+            try (var rs = ps.executeQuery()) {
+                while (rs.next()) {
+                    ids.add(rs.getString(1));
+                }
+            }
+        } catch (Exception e) {
+            // 读不出来 ⇒ 空集 ⇒ 向量路返回空（降级到只走关键词），⛔ 不放行未校验的块
+            log.warn("[检索] 读可见块集合失败，向量路按空集处理 kb={} 原因={}", kbId, e.getMessage());
+        }
+        return ids;
     }
 
     // ── 关键词召回 ──────────────────────────────────────────────────

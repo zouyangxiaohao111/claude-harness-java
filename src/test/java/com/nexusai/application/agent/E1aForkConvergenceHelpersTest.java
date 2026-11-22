@@ -137,7 +137,7 @@ class E1aForkConvergenceHelpersTest {
             state.appendMessage(userMessage("u1", "q"));
             QueryParams params = QueryParams.forLoop(
                 state.rawMessages(), null,
-                ToolUseContext.of(UUID.randomUUID(), sessionId()),
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId()),
                 forkSource, "test-model", null, null, null, null, null,
                 minimalDeps(), null);
 

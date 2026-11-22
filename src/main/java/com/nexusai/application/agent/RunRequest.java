@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.nexusai.application.agent.permission.PermissionModeSource;
 import com.nexusai.infra.llm.ProviderConfig;
 import com.nexusai.model.session.dto.AttachmentRequest;
+import jakarta.annotation.Nullable;
 
 import java.util.List;
 import java.util.Map;
@@ -70,7 +71,8 @@ public record RunRequest(
     String modelName,
     QuerySource querySource,
     String sessionId,
-    UUID agentId,
+    // [agentid-cc-align] CC 单一形态：agentId 是 String（a+16hex）；null = 主线程。
+    String agentId,
     String systemPrompt,
     Integer maxTurns,
     TaskBudget taskBudget,
@@ -173,7 +175,44 @@ public record RunRequest(
      *
      * <p>null = 本请求无附加透传参数（主会话 / cron / 验证入口，行为与现状一致）。
      */
-    Map<String, Object> requestExtras
+    Map<String, Object> requestExtras,
+    /**
+     * [V306] <b>定时任务通知目标</b>（聊天 id 数组的 JSON 字符串，如 {@code ["imch-d1","imch-d2"]}）。
+     *
+     * <p><b>来源链</b>：{@code schedules.notify_chats}（V306 列）→
+     * {@link com.nexusai.application.agent.tasks.NotificationQueue.QueueItem#notifyChats()}
+     * → {@link CronIdleExecutor} 经 {@link #withNotifyChats(String)} 挂到本字段 →
+     * {@code LlmAgentLoop.buildBaseToolUseContext} → base {@code ToolUseContext.notifyChats()}
+     * → per-turn TUC → 工具 {@code execute} 形参。
+     *
+     * <p><b>WHY 必须显式下传</b>：不能靠「按 sessionId 反查任务」拿通知目标 —— B 形态
+     * （每次新建会话）<b>不回填</b> {@code session_id} ⇒ 反查恒空 ⇒ B 形态永远通知不到。
+     *
+     * <p><b>判据</b>：推不推由 <b>agent</b> 决定 —— 只有 agent 调
+     * {@code SendUserMessage(status='proactive')}（主动发起）才推；扫描类任务扫到东西才通知，
+     * 没扫到就安静结束（⛔ 不是「跑完必推」）。
+     *
+     * <p>null / 空白 = 本轮无通知目标（非定时任务 / 未配置通知 ⇒ 行为与现状一致）。
+     */
+    @Nullable String notifyChats,
+    /**
+     * [sendmessage-cross-session · B] <b>本回合的 peer 执行来源</b>（末位追加 · 只由服务端投递侧构造）。
+     *
+     * <p><b>来源链</b>：{@code NotificationQueue.QueueItem.peerEnvelope}（服务端生成的
+     * {@link com.nexusai.application.agent.messaging.PeerEnvelope}）→ 运行中 drain / 空闲
+     * {@code CronIdleExecutor} → {@code PeerExecutionOrigin.fromEnvelope(...)} → 本字段 →
+     * {@code LlmAgentLoop.buildBaseToolUseContext} 的 base {@code ToolUseContext} →
+     * per-turn TUC → 工具 {@code execute} 形参（C 批守卫读 {@code ctx.peerExecutionOrigin()}）。
+     *
+     * <p>⛔ <b>信任根</b>：HTTP {@code requestExtras} / 模型正文 / {@code structuredOutput} 自报
+     * 都<b>不是</b>来源 —— 本字段只接受 {@code PeerRuntimeAdapter} 从服务端信封构造的值。
+     *
+     * <p><b>清污</b>：用户正常下一轮的 RunRequest 为 {@code null} ⇒ 新 run 的 base / per-turn TUC
+     * 也为 null；本字段绝不跨用户轮复用（不是 loop 实例字段，不驻留）。
+     *
+     * <p>null = 非 peer 回合（普通用户输入 / 纯 cron / 通知 run）。
+     */
+    com.nexusai.application.agent.messaging.PeerExecutionOrigin peerExecutionOrigin
 ) {
     /**
      * 紧凑构造器：校验 userPrompt / querySource / permissionModeSource 必传（对齐 CC 运行时检查）。
@@ -201,9 +240,10 @@ public record RunRequest(
     /**
      * [request-extras 批 1] <b>旧全参转发构造器</b>（{@code requestExtras} 缺省 = null）·
      * 供既有 18 处 {@code new RunRequest(...)} 零改动编译（canonical 已扩为 22 组件）。
+     * [V306] {@code notifyChats} 同样缺省 = null（无通知目标）—— canonical 已扩为 23 组件。
      */
     public RunRequest(String userPrompt, ProviderConfig config, String modelName, QuerySource querySource,
-                      String sessionId, UUID agentId, String systemPrompt, Integer maxTurns,
+                      String sessionId, String agentId, String systemPrompt, Integer maxTurns,
                       TaskBudget taskBudget, String fallbackModel, Boolean skipCacheWrite,
                       Integer maxOutputTokensOverride, String appendSystemPrompt, String permissionModeCli,
                       boolean dangerouslySkipPermissions, JsonNode jsonSchema,
@@ -213,7 +253,8 @@ public record RunRequest(
         this(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt, maxTurns,
             taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource, null);
+            boundProject, agentContext, permissionModeSource, null, null,
+            null);   // [sendmessage-cross-session · B] peerExecutionOrigin 缺省 → null（非 peer 回合）
     }
 
     /**
@@ -233,7 +274,7 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource, requestExtras);
+            boundProject, agentContext, permissionModeSource, requestExtras, notifyChats, peerExecutionOrigin);
     }
 
     /**
@@ -252,7 +293,7 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource, requestExtras);
+            boundProject, agentContext, permissionModeSource, requestExtras, notifyChats, peerExecutionOrigin);
     }
 
     /**
@@ -274,7 +315,50 @@ public record RunRequest(
         return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
             maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
             permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
-            boundProject, agentContext, permissionModeSource, requestExtras);
+            boundProject, agentContext, permissionModeSource, requestExtras, notifyChats, peerExecutionOrigin);
+    }
+
+    /**
+     * [V306] 返回携带定时任务通知目标的副本（其余字段不变）。
+     *
+     * <p><b>唯一生产调用方</b> = {@code CronIdleExecutor.runAgentLoop}（定时任务 fire：把
+     * {@link com.nexusai.application.agent.tasks.NotificationQueue.QueueItem#notifyChats()}
+     * 挂到本 run 上 → base TUC → per-turn TUC → {@code SendUserMessage} 工具 execute 形参）。
+     *
+     * <p>用副本方法而非再加一组工厂重载：本 record 已有 10+ 工厂重载，每加一个字段就翻倍增长
+     * （与 {@link #withBoundProject(String)} / {@link #withAgentContext} 同款写法：null / 同值短路
+     * 返回 {@code this}，避免无谓新实例）。
+     *
+     * @param notifyChats 通知目标（聊天 id 数组的 JSON 字符串；null / 空白 = 无 → 返回 {@code this}）
+     */
+    public RunRequest withNotifyChats(String notifyChats) {
+        if (notifyChats == null || notifyChats.isBlank() || notifyChats.equals(this.notifyChats)) {
+            return this;
+        }
+        return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
+            maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
+            permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
+            boundProject, agentContext, permissionModeSource, requestExtras, notifyChats, peerExecutionOrigin);
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 返回携带 peer 执行来源的副本（其余字段不变）。
+     *
+     * <p><b>唯一生产调用面</b>：{@code CronIdleExecutor.executeQueuedInput}（空闲消费 peer 项）与
+     * {@code PeerRuntimeAdapter} 的唤醒路径 —— 来源只能由服务端投递侧构造。
+     * 用法同 {@link #withBoundProject(String)}：同值 / null 短路返回 {@code this}。
+     *
+     * @param origin 服务端投递侧构造的来源；null = 非 peer 回合（返回 {@code this}）
+     */
+    public RunRequest withPeerExecutionOrigin(
+            com.nexusai.application.agent.messaging.PeerExecutionOrigin origin) {
+        if (origin == null || origin.equals(this.peerExecutionOrigin)) {
+            return this;
+        }
+        return new RunRequest(userPrompt, config, modelName, querySource, sessionId, agentId, systemPrompt,
+            maxTurns, taskBudget, fallbackModel, skipCacheWrite, maxOutputTokensOverride, appendSystemPrompt,
+            permissionModeCli, dangerouslySkipPermissions, jsonSchema, attachments, batchUserPrompts,
+            boundProject, agentContext, permissionModeSource, requestExtras, notifyChats, origin);
     }
 
     // ── [IMP2-10 · MISS-2 · OD-13] taskBudget 生产来源解析 ──
@@ -422,7 +506,7 @@ public record RunRequest(
      * {@link #session(String, String, UUID, ProviderConfig, String, String, String, String, String, boolean, TaskBudget, JsonNode, List)}
      * 或 {@link #sessionFromSessionOverride(String, String, UUID, ProviderConfig, String, String, String, boolean, TaskBudget, List)}。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
@@ -431,7 +515,7 @@ public record RunRequest(
     }
 
     /** [RES-SP31] session 工厂重载：额外携带 appendSystemPrompt（ChatService 主会话 HTTP 入口）。 */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
@@ -447,7 +531,7 @@ public record RunRequest(
      * → 本字段 → QueryParams → RetryOptions → TransientErrorHandler（按调用传入优先，
      * 空则回落 settings.fallbackModelId 默认值，决策 10 不变（F4 env→settings 迁移）。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel, TaskBudget taskBudget) {
         return new RunRequest(userPrompt, config, modelName, QuerySource.REPL_MAIN_THREAD,
@@ -469,7 +553,7 @@ public record RunRequest(
      * （值来自 CLI/请求体槽：web = per-call HTTP 请求体 ?? 会话 override 的解析结果；
      * 为 {@code null} 表示该槽确实为空 ⇒ 合法回落 + {@code auto} opt-in 判断依据）。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel,
                                      String permissionModeCli, boolean dangerouslySkipPermissions,
@@ -499,7 +583,7 @@ public record RunRequest(
      * @param permissionModeCli 会话选定模式（可为 null = 会话未设 override 或取不到；取不到须调用方已留痕）
      * @param attachments      附件列表（可 null/空 = 无附件）
      */
-    public static RunRequest sessionFromSessionOverride(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest sessionFromSessionOverride(String userPrompt, String sessionId, String agentId,
                                                         ProviderConfig config, String modelName, String systemPrompt,
                                                         String permissionModeCli, boolean dangerouslySkipPermissions,
                                                         TaskBudget taskBudget, List<AttachmentRequest> attachments) {
@@ -517,7 +601,7 @@ public record RunRequest(
      * LlmAgentLoop.doRun 注册主会话 structured output enforcement（STOP 门控）。
      * null = 未指定结构化输出 → 主循环不注册 enforcement（行为与现状一致）。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel,
                                      String permissionModeCli, boolean dangerouslySkipPermissions,
@@ -554,7 +638,7 @@ public record RunRequest(
      * （ChatService.processUserMessage 已按 contentId 经 ImageAttachmentStore 补全
      * base64 + mediaType）。null/空 = 无附件。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel,
                                      String permissionModeCli, boolean dangerouslySkipPermissions,
@@ -591,7 +675,7 @@ public record RunRequest(
      * <p>[批 A4e] 来源标注 = {@link PermissionModeSource#NOT_APPLICABLE}
      * ⇒ 若调用方携带真实会话，消费点守护会 <b>≥WARN</b>（结构性矛盾，不许静默）。
      */
-    public static RunRequest session(String userPrompt, String sessionId, UUID agentId,
+    public static RunRequest session(String userPrompt, String sessionId, String agentId,
                                      ProviderConfig config, String modelName, String systemPrompt,
                                      String appendSystemPrompt, String fallbackModel,
                                      TaskBudget taskBudget, List<AttachmentRequest> attachments) {
@@ -633,7 +717,7 @@ public record RunRequest(
      * @param dangerouslySkipPermissions 危险跳过开关（drain 侧无 per-call 来源 ⇒ 恒 false）
      * @param taskBudget   任务预算（可 null）
      */
-    public static RunRequest sessionBatch(List<String> prompts, String sessionId, UUID agentId,
+    public static RunRequest sessionBatch(List<String> prompts, String sessionId, String agentId,
                                           ProviderConfig config, String modelName, String systemPrompt,
                                           String permissionModeCli, boolean dangerouslySkipPermissions,
                                           TaskBudget taskBudget) {

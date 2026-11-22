@@ -127,18 +127,18 @@ class FixTs04BuildJsonInputAlignTest {
     /** subagent 工具 ctx：agentType 非 null（createSubagentContext 等价）+ effectiveCwd + DEFAULT 权限模式。 */
     private static ToolUseContext subagentCtx(String agentType, String agentId, String sessionId, Path effectiveCwd) {
         ToolUseContext base = ToolUseContext.of(
-            UUID.fromString(agentId), sessionId, PermissionMode.DEFAULT,
+            agentId, sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
         return base.with(new ToolUseContext.SubagentContextOverrides(
-            UUID.fromString(agentId), agentType, null, null, null,
+            agentId, agentType, null, null, null,
             null, null, null, null, null, null, null, null, null));
     }
 
     /** 主线程 ctx：agentType=null、effectiveCwd=null（LlmAgentLoop base TUC 等价）。 */
     private static ToolUseContext mainThreadCtx(String agentId, String sessionId) {
         return ToolUseContext.of(
-            UUID.fromString(agentId), sessionId, PermissionMode.DEFAULT,
+            agentId, sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             Map.of(), false, "", null);
     }
@@ -157,7 +157,7 @@ class FixTs04BuildJsonInputAlignTest {
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
-        String agentId = UUID.randomUUID().toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.randomUUID().toString();
         ToolUseContext ctx = subagentCtx("explore-agent", agentId, sessionId, Path.of("C:/wt"));
 
@@ -200,7 +200,7 @@ class FixTs04BuildJsonInputAlignTest {
         com.nexusai.common.SessionProjectRoot.clearSession(sessionId);
         com.nexusai.common.SessionProjectRoot.setForSession(sessionId, "C:/proj");
         try {
-            ToolUseContext ctx = mainThreadCtx(UUID.randomUUID().toString(), sessionId);
+            ToolUseContext ctx = mainThreadCtx(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId);
             registry.executePreToolUse("Bash", JSON.createObjectNode(), ctx, "tu-1");
 
             JsonNode node = readJson(stub.capturedJsonInput.get());
@@ -223,7 +223,7 @@ class FixTs04BuildJsonInputAlignTest {
         StubCommandExecutor stub = new StubCommandExecutor(FixTs04BuildJsonInputAlignTest::exit0EmptyJson);
         HookRegistry registry = registryWithConfiguredHook(stub, HookEventType.PRE_TOOL_USE);
 
-        String agentId = UUID.randomUUID().toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // toolPre 5 参 sessionId=null（对齐 ElicitationHandler 等无会话调用点）
         HookEvent event = HookEvent.toolPre("Bash", JSON.createObjectNode(), null, agentId, "tu-1");
         String tucSessionId = "00000000-0000-0000-0000-000000000001";

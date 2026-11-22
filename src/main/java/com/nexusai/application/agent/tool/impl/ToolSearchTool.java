@@ -216,7 +216,22 @@ public class ToolSearchTool implements Tool {
         //   把它们 select 出来；返回的 tool_reference 一旦进入历史，下一轮请求就 400
         //   （Anthropic: tool reference 'X' not found in available tools）。
         //   ⇒ 候选池必须与 LLM schema 同源：先剔掉会话禁用集合。
-        allTools = excludeSessionDisabled(allTools, ctx != null ? ctx.sessionId() : null);
+        // [V330] 候选池 = 与 LLM schema 同一「本会话生效可见集」解析器：
+        //   会话禁用 + 人格豁免 + Brief/IM 增量 + 无人值守 Ask。否则禁用工具仍能被 select 出来，
+        //   返回的 tool_reference 进入历史后下一轮请求 400。
+        com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot visibility =
+            com.nexusai.application.agent.tool.SessionToolVisibility.resolve(
+                ctx != null ? ctx.sessionId() : null,
+                ctx != null ? ctx.requestExtras() : null,
+                ctx != null && ctx.isNonInteractiveSession());
+        if (!visibility.disabled().isEmpty() || visibility.askExcluded()) {
+            allTools = allTools.stream()
+                    .filter(t -> t != null && !visibility.blocks(t.name()))
+                    .filter(t -> !visibility.askExcluded()
+                            || !com.nexusai.application.agent.config.ImUnattendedConfig
+                                .ASK_USER_QUESTION_TOOL.equals(t.name()))
+                    .toList();
+        }
         if (allTools.isEmpty() && log.isDebugEnabled()) {
             log.debug("[ToolSearchTool] ctx 无可用工具（单参 execute 路径）→ select/fast-path 降级（CC 依赖 options.tools 全集）");
         }

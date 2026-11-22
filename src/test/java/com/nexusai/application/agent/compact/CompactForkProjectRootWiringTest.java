@@ -240,7 +240,7 @@ class CompactForkProjectRootWiringTest {
     /** 会话 ToolUseContext（sessionId = 会话键，即 SessionProjectRoot 的登记键）。 */
     private static ToolUseContext ctx(String sessionId) {
         return new ToolUseContext(
-            UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 

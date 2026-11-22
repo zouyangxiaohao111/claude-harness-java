@@ -63,8 +63,8 @@ import static org.mockito.Mockito.when;
 class SkillListingSubagentResumeWiringTest {
 
     private static final String SESSION_KEY = "sess-subresume";
-    /** 子代理 agentId（keys 为 sessionId + '\0' + agentId.toString()）。 */
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000b7");
+    /** 子代理 agentId（keys 为 sessionId + '\0' + agentId）。 */
+    private static final String AGENT_ID = "a0000000000000b7";
 
     @AfterEach
     void tearDown() {
@@ -84,7 +84,7 @@ class SkillListingSubagentResumeWiringTest {
         AgentState state = h.subagentState();
         // 前置：该 agentKey 未初始化（P2-12 removeAgentKey 在上一 run 结束点回收了槽位）——
         //   这正是「续跑」的真实形态：进程内已发过一次，但槽位已被回收。
-        SkillListingSentRegistry.removeAgentKey(SESSION_KEY, AGENT_ID.toString());
+        SkillListingSentRegistry.removeAgentKey(SESSION_KEY, AGENT_ID);
 
         QueryParams callerParams0 = h.params(state);
         LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state), state, new ArrayList<>(), /*skillListingResume=*/true);

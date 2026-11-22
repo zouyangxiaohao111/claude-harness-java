@@ -25,6 +25,7 @@ import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.skill.PromptBlock;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.infra.util.UndercoverCheck;
+import com.nexusai.domain.session.SessionModeService;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.PromptFnContext;
 import org.slf4j.Logger;
@@ -68,7 +69,7 @@ import java.util.function.Supplier;
  * </ul>
  *
  * <p><b>isEnabled 门控</b>（对齐 CC types/command.ts:214-215 isEnabled?.() ?? true）：
- * brief（KAIROS gate 默认 false）/ files（USER_TYPE==='ant'）/ keybindings（GB gate 默认 false）/
+ * brief（用户批准本地启用）/ files（USER_TYPE==='ant'）/ keybindings（GB gate 默认 false）/
  * ultrareview（GB gate 默认 false）经 BooleanSupplier 惰性求值；其余无 gate 默认 true。
  *
  * <p><b>受控差异（fail loud 登记）</b>：
@@ -90,6 +91,9 @@ import java.util.function.Supplier;
 public class CommandRegistrationConfig {
 
     private static final Logger log = LoggerFactory.getLogger(CommandRegistrationConfig.class);
+
+    @Autowired
+    private SessionModeService sessionModeService;
 
     /**
      * [coordinator-session V75] coordinator feature+env 回落层 · 供 transcript {@code mode} 行取值
@@ -237,13 +241,9 @@ public class CommandRegistrationConfig {
         registerLocalMetadata("advisor", "local", "Configure the advisor model", "[<model>|off]", () -> true, false);
     }
 
-    /**
-     * /brief 元数据 · CC commands/brief.ts:47-128（type='local-jsx'，isEnabled=KAIROS feature &&
-     * enable_slash_command 默认 false，brief.ts:51-56 + DEFAULT_BRIEF_CONFIG.enable_slash_command=false :29-31）。
-     * Java 无 KAIROS feature → 默认 false（对齐 CC 生产默认不注册门控语义）。
-     */
+    /** 用户已批准本地 /brief 可用；Web 用 local 文本派发，不走不可渲染的 JSX 分支。 */
     private void registerBriefMetadata() {
-        registerLocalMetadata(BriefCommand.NAME, "local-jsx", BriefCommand.DESCRIPTION, null, () -> false, false);
+        registerLocalMetadata(BriefCommand.NAME, "local", BriefCommand.DESCRIPTION, null, () -> true, false);
     }
 
     /** /cost 元数据 · CC commands/cost/index.ts:8-21（type='local'，无 isEnabled gate）。 */
@@ -378,19 +378,22 @@ public class CommandRegistrationConfig {
         log.info("[CommandRegistrationConfig] /advisor 已注册为生产 slash command result handler（对齐 CC commands/advisor.ts call，text 结果回传 <local-command-stdout>）");
     }
 
-    /**
-     * /brief handler · CC commands/brief.ts:59-126 call（local-jsx，immediate）。
-     *
-     * <p>默认门控关闭（KAIROS feature + enable_slash_command=false，brief.ts:51-56）→ handler 仅披露。
-     * isBriefOnly / userMsgOptIn 会话状态未接线（BriefTool 注释「后端 getUserMsgOptIn() 无进程内状态」），
-     * 故开启后也无法真实切换 brief 模式 —— 受控差异（fail loud）。
-     */
+    /** /brief 与面板/API 共用会话模式服务；只回显文本，不额外启动模型轮次。 */
     private void registerBriefHandler(UserInputDispatcher dispatcher) {
-        dispatcher.registerSlashCommand(BriefCommand.NAME, (args, sessionId, inFlightUserMessageId) -> {
-            log.warn("[CommandRegistrationConfig] /brief 被门控关闭（KAIROS feature + enable_slash_command 默认 false，"
-                + "对齐 CC brief.ts:51-56）；isBriefOnly/userMsgOptIn 会话状态未接线（受控差异）");
+        dispatcher.registerSlashCommandResult(BriefCommand.NAME, (args, sessionId, inFlightUserMessageId) -> {
+            boolean next = !sessionModeService.getState(sessionId).brief();
+            try {
+                sessionModeService.setBrief(sessionId, next);
+            } catch (IllegalStateException e) {
+                log.info("[CommandRegistrationConfig] /brief 状态冲突: session={} target={} reason={}",
+                        sessionId, next, e.getMessage());
+                // [Q8] 命令无弹窗能力 ⇒ 拒绝并给可执行指引（不改任何状态）
+                return UserInputDispatcher.LocalCommandResult.text(
+                        com.nexusai.domain.session.SessionModeService.BRIEF_COMMAND_CONFLICT_MESSAGE);
+            }
+            log.info("[CommandRegistrationConfig] /brief 已切换: session={} brief={}", sessionId, next);
+            return UserInputDispatcher.LocalCommandResult.text(BriefCommand.toggleResultMessage(next));
         });
-        log.info("[CommandRegistrationConfig] /brief 已注册为生产 slash command（门控默认关，对齐 CC brief.ts DEFAULT_BRIEF_CONFIG）");
     }
 
     /**

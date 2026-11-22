@@ -5,6 +5,7 @@
 import { api } from './rest'
 import type {
   Schedule,
+  ScheduleRun,
   CreateScheduleRequest,
   UpdateScheduleRequest,
   RunNowResponse,
@@ -23,4 +24,15 @@ export const scheduleApi = {
     api<void>(`/schedules/${encodeURIComponent(id)}`, { method: 'DELETE' }),
   runNow: (id: string) =>
     api<RunNowResponse>(`/schedules/${encodeURIComponent(id)}/run`, { method: 'POST' }),
+  /**
+   * 某任务的运行记录（时间倒序 · 默认最近 50 条）。
+   *
+   * <p>与 `schedules.lastRunStatus` 不同：后者在**入队那一刻**就写了（假信号），
+   * 本端点记录的是 run **真正结束**后的结果（ok / error / cancelled / running）。
+   */
+  runs: (id: string, limit = 50) =>
+    api<ScheduleRun[]>(`/schedules/${encodeURIComponent(id)}/runs?limit=${limit}`),
+  /** 全部任务的运行记录（「运行记录」tab 首屏 · 时间倒序 · 默认最近 100 条） */
+  allRuns: (limit = 100) =>
+    api<ScheduleRun[]>(`/schedules/runs/all?limit=${limit}`),
 }

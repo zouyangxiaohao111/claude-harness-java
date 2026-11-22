@@ -180,7 +180,7 @@ class RunForkedAgentTest {
      * [批 6 伪造 sessionId] 无父上下文 ⇒ fail-loud，⛔ 不再伪造 {@code "sess-"+UUID}。
      *
      * <p><b>WHY（第一红线 · 不许静默失效）</b>：原实现 {@code parent == null} 时现造
-     * {@code ToolUseContext.of(UUID.randomUUID(), "sess-"+random8)}。该分支**不可达**
+     * {@code ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-"+random8)}。该分支**不可达**
      * （{@code CacheSafeParams} 紧凑构造器 :101-104 对 {@code toolUseContext==null} 直接抛
      * ⇒ 唯一调用点 :229-230 传 {@code cs.toolUseContext()} 恒非 null；CC 真源
      * {@code forkedAgent.ts:342-345 createSubagentContext(parentContext, overrides)} 亦**无**
@@ -528,7 +528,7 @@ class RunForkedAgentTest {
     /** 最小 ToolUseContext（8 参兼容构造器）。 */
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
     }
 
@@ -783,7 +783,7 @@ class RunForkedAgentTest {
     /** fork 隔离上下文（availableTools 携带工具 → buildToolsArray 产真实工具数组）。 */
     private static ToolUseContext forkCtxWith(Tool... tools) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(tools), "", new AbortController(), List.of());
     }
 

@@ -43,7 +43,7 @@ class PromptShellExecutorTest {
 
     /** 默认 ctx（permissionContext=null → 默认 checker 按 strict 空规则集 + allowedTools 合并）。 */
     private static ToolUseContext ctx() {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT, List.of());
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT, List.of());
     }
 
     /** fake 执行器 · 返回固定 output（不跑真实进程）。 */

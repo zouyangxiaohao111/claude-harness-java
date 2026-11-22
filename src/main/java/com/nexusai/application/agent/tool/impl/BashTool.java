@@ -1561,7 +1561,11 @@ public class BashTool implements Tool {
                 // G5-9: 中断结果文本输出（对齐 CC BashTool.tsx:601-605 errorMessage + is_error: interrupted；
                 //   :780 hints 剥离亦作用于中断路径 → 用已剥离 out）
                 String combinedOut = out + (err.isEmpty() ? "" : "\n" + err);
-                return ToolResult.error(call.id(), BashOutputUtils.stripEmptyLines(combinedOut));
+                // [错误通道] 中断按 INTERRUPT 归类（原文直出、is_error=true），
+                //   对齐 CC AbortError 分支；CALL_THREW 仅是类别偏差，此处收口。
+                return ToolResult.failure(call.id(),
+                    BashOutputUtils.stripEmptyLines(combinedOut),
+                    com.nexusai.application.agent.tool.ToolErrorKind.INTERRUPT);
             }
 
             // ── G5-8: noOutputExpected · 对齐 CC BashTool.tsx:809 + :178-217 isSilentBashCommand ──
@@ -2631,7 +2635,7 @@ public class BashTool implements Tool {
      * @param result  ToolResult（isError 错误 → ToolResult.error(data=错误消息)）
      * @param isError 显式错误标志（CC interpretCommandResult.isError 推导，非前缀启发式）
      */
-    record BashExitCodeResult(ToolResult<String> result, boolean isError) {}
+    record BashExitCodeResult(ToolResult<?> result, boolean isError) {}
 
     /**
      * 解释命令退出码并按语义分派 ToolResult · 对齐 CC BashTool.tsx:690 消费
@@ -2793,7 +2797,7 @@ public class BashTool implements Tool {
         //   主线程 = ctx.agentId()==null（CC :642 isMainThread = !toolUseContext.agentId）；
         //   ctx==null（1 参 dispatch 兼容路径）→ 无归属可传，保持 null（⛔ 不编造、不回落全局）。
         //   isBackgrounded=true 与 11 参构造器的硬编码值一致 —— 本改动不动该语义。
-        UUID taskAgentId = ctx != null ? ctx.agentId() : null;
+        String taskAgentId = ctx != null ? ctx.agentId() : null;
         BackgroundTask task = new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             abbreviate(command, 100), toolUseId,
@@ -2848,7 +2852,7 @@ public class BashTool implements Tool {
                                               String outputFile, String sessionId,
                                               ToolUseContext ctx) {
         // 归属语义 / CC 行号 / ctx==null 与 isBackgrounded 的不变量：见本方法 javadoc（[coordinator-align]）
-        UUID taskAgentId = ctx != null ? ctx.agentId() : null;
+        String taskAgentId = ctx != null ? ctx.agentId() : null;
         return new BackgroundTask(
             taskId, TaskType.LOCAL_BASH, BackgroundTaskStatus.RUNNING,
             abbreviate(command, 100), toolUseId,

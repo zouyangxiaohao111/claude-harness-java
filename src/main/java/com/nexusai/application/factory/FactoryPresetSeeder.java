@@ -5,8 +5,6 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.skill.BootstrapSkillsSeeder;
-import com.nexusai.infra.util.ApiKeyHasher;
-import com.nexusai.infra.util.CryptoUtil;
 import com.nexusai.repository.provider.entity.ModelRecord;
 import com.nexusai.repository.provider.entity.ProviderRecord;
 import com.nexusai.repository.provider.mapper.ModelMapper;
@@ -15,6 +13,9 @@ import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
 import java.io.IOException;
 import java.io.InputStream;
+import java.nio.file.Files;
+import java.nio.file.InvalidPathException;
+import java.nio.file.Path;
 import java.time.OffsetDateTime;
 import java.time.format.DateTimeFormatter;
 import java.util.Iterator;
@@ -40,19 +41,25 @@ import org.springframework.transaction.support.TransactionTemplate;
  * 老库（已有任何 provider）绝不写入、不覆盖。
  *
  * <p><b>WHY（用户拍板 2026-10-26）</b>：新用户首次启动空库时，开箱即得「MiniMax 主模型 + DeepSeek 备用」
- * 的可用配置：provider 只含 minimax（内网版带秘钥）与 deepseek（无秘钥），9 个模型档位全部指向
- * minimax，用户不需要先建 provider 才能开始对话。
+ * 的可用配置：provider 只含 minimax 与 deepseek（<b>两者均无秘钥</b>），9 个模型档位全部指向
+ * minimax，用户不需要先建 provider 才能开始对话。⛔ 2026-11-20 起本功能<b>默认关闭</b>，
+ * 且绝不从任何文件注入 apiKey。
  *
  * <p><b>触发</b>：仅当 {@code providers} 表 count==0（全新库）。任何已存在的 provider 行都判定为
  * 「老用户 / 已使用」，跳过（不覆盖任何已有数据）。见 {@link #seedIfFresh()}。
  *
- * <p><b>数据源与秘钥边界</b>：
+ * <p><b>数据源与秘钥边界（2026-11-20 安全止血后）</b>：
  * <ul>
+ *   <li><b>默认关闭</b>：{@code @ConditionalOnProperty(matchIfMissing = false)} —— 只有显式
+ *       {@code nexusai.factory.preset.enabled=true} 才执行；生产/开发/测试缺省一律不种入。</li>
  *   <li>classpath {@code factory/factory-preset.json}（随 jar 分发）——<b>绝不包含任何秘钥</b>；
  *       providers 为 minimax + deepseek，models 为 minimax 模型 + 3 条 deepseek 模型。</li>
- *   <li>可选 classpath {@code factory/factory-preset.local.json}（<b>被 .gitignore 忽略</b>，仅内网
- *       打包机存在）——按 provider name 叠加 {@code apiKey}。内网安装包带默认秘钥；GitHub 版本
- *       没有这个文件 ⇒ 全新安装仍是「无 key，填了即用」。发布脚本另设硬门禁（见 release-publish.mjs）。</li>
+ *   <li>可选<b>非秘钥</b>本地叠加：优先读 configHome（{@code {user.home}/.{appName}/factory/
+ *       factory-preset.local.json}），其次读环境变量 {@code NEXUSAI_PROVIDER_PRESET}（文件路径或
+ *       JSON 文本）；都缺失 → 正常跳过、不报错。叠加<b>只允许</b>覆盖 baseUrl/type/enabled 等公开字段，
+ *       <b>任何 {@code apiKey} 一律忽略</b>（⛔ 绝不从本地文件注入秘钥）。</li>
+ *   <li><b>种入的 provider 永远无 key</b>：api_key_hash/api_key_masked 为空串、api_key_encrypted 为 null，
+ *       由用户在设置页自行填写。</li>
  *   <li>settings：仅 merge JSON 里出现的键到 id=1 单例行。白名单 {@link #SETTING_APPLIERS} 现包含
  *       9 个模型档位（全部指向 minimax）与 {@code classifier_model}；<b>任何含 key 的列仍严禁收录</b>。
  *       {@code permission_mode} 强制 {@code default}（不照搬用户的 bypassPermissions）。</li>
@@ -68,10 +75,11 @@ import org.springframework.transaction.support.TransactionTemplate;
  * {@code @Transactional} 职责，避免 AOP 自调用失效）。
  */
 @Component
-// e2e / 特殊环境可用 nexusai.factory.preset.enabled=false 关掉出厂预设：
-// 独立库若被塞入 minimax provider，测试会打到真实模型（消耗真实额度），必须能显式关闭。
+// ⛔ 默认关闭：只有显式 nexusai.factory.preset.enabled=true 才种入。
+// WHY（2026-11-20）：此前 matchIfMissing=true ⇒ 空库启动即种入带真 key 的 minimax，
+// E2E/开发实例会烧真实额度；且该链路与 profile 无关，生产包同样触发。
 @ConditionalOnProperty(prefix = "nexusai.factory.preset", name = "enabled",
-    havingValue = "true", matchIfMissing = true)
+    havingValue = "true", matchIfMissing = false)
 public class FactoryPresetSeeder implements ApplicationRunner {
 
     private static final Logger log = LoggerFactory.getLogger(FactoryPresetSeeder.class);
@@ -79,11 +87,11 @@ public class FactoryPresetSeeder implements ApplicationRunner {
     /** classpath 出厂预设资源路径 · 随 jar 分发（非外部目录）。 */
     static final String RESOURCE_PATH = "factory/factory-preset.json";
 
-    /**
-     * 可选本地叠加资源（内网秘钥）· <b>被 .gitignore 忽略</b>，仅内网打包机存在。
-     * 测试通过构造参数传一个不存在的资源名，避免读到开发者本机的真实秘钥。
-     */
-    static final String LOCAL_OVERLAY_RESOURCE_PATH = "factory/factory-preset.local.json";
+    /** configHome 下的可选本地叠加（相对路径，<b>非秘钥</b>；带 key 的文件即使存在也不采纳 key）。 */
+    static final String CONFIG_HOME_OVERLAY_RELATIVE = "factory/factory-preset.local.json";
+
+    /** 环境变量：本地叠加的文件路径，或直接是 JSON 文本。 */
+    static final String ENV_PRESET = "NEXUSAI_PROVIDER_PRESET";
 
     /** settings 恒单例行（V1__init_schema.sql INSERT INTO settings (id) VALUES (1)）。 */
     private static final int SETTINGS_SINGLETON_ID = 1;
@@ -92,23 +100,32 @@ public class FactoryPresetSeeder implements ApplicationRunner {
     private final ModelMapper modelMapper;
     private final SettingsMapper settingsMapper;
     private final ObjectMapper objectMapper;
-    private final CryptoUtil cryptoUtil;
-    private final String localOverlayResourcePath;
+    /** 用户配置根：{@code {user.home}/.{appName}}（与 application-prod.yml 的数据根一致）。 */
+    private final Path configHome;
+    /** 环境变量值（construct 时取 System.getenv；测试可注入）。 */
+    private final String envPresetValue;
 
     /** 可选事务管理器：Spring 环境注入 → run() 内用 TransactionTemplate 包裹，失败回滚；测试/无 bean → null 直跑。 */
     @Autowired(required = false)
     private PlatformTransactionManager txManager;
 
     public FactoryPresetSeeder(ProviderMapper providerMapper, ModelMapper modelMapper,
-            SettingsMapper settingsMapper, ObjectMapper objectMapper, CryptoUtil cryptoUtil,
-            @Value("${nexusai.factory.preset.local:" + LOCAL_OVERLAY_RESOURCE_PATH + "}")
-            String localOverlayResourcePath) {
+            SettingsMapper settingsMapper, ObjectMapper objectMapper,
+            @Value("${spring.application.name:nexusai}") String appName) {
+        this(providerMapper, modelMapper, settingsMapper, objectMapper,
+            Path.of(System.getProperty("user.home"), "." + appName), System.getenv(ENV_PRESET));
+    }
+
+    /** 测试/显式装配用：直接给定 configHome 与环境变量值（不读真实 env）。 */
+    FactoryPresetSeeder(ProviderMapper providerMapper, ModelMapper modelMapper,
+            SettingsMapper settingsMapper, ObjectMapper objectMapper,
+            Path configHome, String envPresetValue) {
         this.providerMapper = providerMapper;
         this.modelMapper = modelMapper;
         this.settingsMapper = settingsMapper;
         this.objectMapper = objectMapper;
-        this.cryptoUtil = cryptoUtil;
-        this.localOverlayResourcePath = localOverlayResourcePath;
+        this.configHome = configHome;
+        this.envPresetValue = envPresetValue;
     }
 
     @Override
@@ -148,7 +165,7 @@ public class FactoryPresetSeeder implements ApplicationRunner {
         }
 
         JsonNode root = readPreset();
-        // 内网版本才有的本地叠加（秘钥）；GitHub 版本没有该资源 ⇒ 叠加结果为原样（无 key）
+        // 可选本地叠加（只覆盖 baseUrl/type/enabled，⛔ 不采纳 apiKey）；缺失即按原样种入（无 key）
         JsonNode providersNode = applyLocalOverlay(root.path("providers"), readLocalOverlay());
         Map<String, String> providerIdByName = insertProviders(providersNode);
         int insertedModels = insertModels(root.path("models"), providerIdByName);
@@ -226,12 +243,12 @@ public class FactoryPresetSeeder implements ApplicationRunner {
     /**
      * 插入 JSON providers 数组。返回 name→id。
      *
-     * <p>无 {@code apiKey} 时：api_key_hash / api_key_masked 用空串占位（NOT NULL 约束），
+     * <p><b>永远无 key</b>：api_key_hash / api_key_masked 用空串占位（NOT NULL 约束），
      * api_key_encrypted 不写；hasKey 判定链为 {@code masked != null && !masked.isBlank()}
      * （BillingController:126），空串 → false，语义正确「无 key」。
      *
-     * <p>有 {@code apiKey}（只可能来自本地叠加的内网版本）：与 {@code ProviderService.create}
-     * 同一套写侧语义 —— SHA-256 hash + 脱敏 + AES/GCM 密文。<b>秘钥值绝不写日志</b>。
+     * <p>⛔ 即使入参 JSON 带 {@code apiKey} 也<b>不读取、不落库</b>（安全止血 2026-11-20）——
+     * 秘钥只能由用户在设置页填写。值绝不写日志。
      */
     private Map<String, String> insertProviders(JsonNode node) {
         Map<String, String> idByName = new LinkedHashMap<>();
@@ -254,19 +271,15 @@ public class FactoryPresetSeeder implements ApplicationRunner {
             rec.setName(name);
             rec.setType(p.path("type").asText("openai_compatible"));
             rec.setBaseUrl(p.path("baseUrl").asText(""));
-            String apiKey = p.path("apiKey").asText(null);
-            boolean hasKey = apiKey != null && !apiKey.isBlank();
-            if (hasKey) {
-                // 内网版本：与 ProviderService.create 同源写侧语义（hash + 脱敏 + AES/GCM）
-                rec.setApiKeyHash(ApiKeyHasher.hash(apiKey));
-                rec.setApiKeyMasked(ApiKeyHasher.mask(apiKey));
-                rec.setApiKeyEncrypted(cryptoUtil.encrypt(apiKey));
-            } else {
-                // 空 key 占位：hash/masked 空串满足 NOT NULL；encrypted 不写。hasKey 判定 masked 非空 → false。
-                rec.setApiKeyHash("");
-                rec.setApiKeyMasked("");
-                rec.setApiKeyEncrypted(null);
+            // ⛔ 出厂种入永不写 key（2026-11-20 安全止血）：即使 JSON 里带 apiKey 也一律忽略。
+            // 空 key 占位：hash/masked 空串满足 NOT NULL；encrypted 不写。hasKey 判定 masked 非空 → false。
+            if (p.hasNonNull("apiKey")) {
+                log.warn("[FactoryPresetSeeder] provider '{}' 的预设含 apiKey，已忽略（出厂预设绝不注入秘钥）", name);
             }
+            rec.setApiKeyHash("");
+            rec.setApiKeyMasked("");
+            rec.setApiKeyEncrypted(null);
+            boolean hasKey = false;
             rec.setEnabled(p.path("enabled").asBoolean(true));
             rec.setCreatedAt(now);
             rec.setUpdatedAt(now);
@@ -478,10 +491,11 @@ public class FactoryPresetSeeder implements ApplicationRunner {
     // ============== helpers ==============
 
     /**
-     * 本地叠加合并：只允许按 provider {@code name} 给<b>已存在的</b>出厂 provider 补 {@code apiKey}，
-     * 不允许本地新增 provider（防止秘钥配到未知厂商）。返回新数组，不修改入参。
+     * 本地叠加合并（<b>非秘钥</b>）：只允许按 provider {@code name} 给<b>已存在的</b>出厂 provider
+     * 覆盖 {@code baseUrl}/{@code type}/{@code enabled} 等公开字段；不允许新增 provider。
      *
-     * <p>秘钥值绝不写日志（只记 provider 名与计数）。
+     * <p>⛔ <b>任何 {@code apiKey} 一律忽略</b>（安全止血 2026-11-20）：即使本地文件写着 key，
+     * 也不会进入落库链路。返回新数组，不修改入参。
      */
     static JsonNode applyLocalOverlay(JsonNode providers, JsonNode overlay) {
         if (providers == null || !providers.isArray()) {
@@ -510,39 +524,75 @@ public class FactoryPresetSeeder implements ApplicationRunner {
                 log.warn("[FactoryPresetSeeder] 本地叠加 provider='{}' 不在出厂预设内，跳过（不允许本地新增 provider）", name);
                 continue;
             }
-            String apiKey = local.path("apiKey").asText(null);
-            if (apiKey == null || apiKey.isBlank()) {
-                log.warn("[FactoryPresetSeeder] 本地叠加 provider='{}' 缺少 apiKey，跳过", name);
-                continue;
+            boolean changed = false;
+            for (String field : new String[] {"baseUrl", "type", "enabled"}) {
+                if (local.has(field)) {
+                    target.set(field, local.get(field));
+                    changed = true;
+                }
             }
-            target.put("apiKey", apiKey);
-            applied++;
-            // ⛔ 只记 provider 名，绝不打印秘钥
-            log.info("[FactoryPresetSeeder] 本地叠加已为 provider='{}' 注入秘钥（值不落日志）", name);
+            if (local.hasNonNull("apiKey")) {
+                // ⛔ 只记 provider 名，绝不打印秘钥；key 直接丢弃
+                log.warn("[FactoryPresetSeeder] 本地叠加 provider='{}' 含 apiKey，已忽略（出厂预设绝不注入秘钥）", name);
+            }
+            if (changed) {
+                applied++;
+            }
         }
-        log.info("[FactoryPresetSeeder] 本地叠加完成：{} 个 provider 注入秘钥（内网版本）", applied);
+        log.info("[FactoryPresetSeeder] 本地叠加完成：{} 个 provider 覆盖了非秘钥字段", applied);
         return merged;
     }
 
     /**
-     * 读取可选本地叠加资源（内网秘钥）。资源不存在 → null（GitHub/通用版本的预期状态）。
+     * 读取可选本地叠加（<b>非秘钥</b>）：
+     * <ol>
+     *   <li>configHome 下同名文件 {@code {user.home}/.{appName}/factory/factory-preset.local.json}；</li>
+     *   <li>环境变量 {@code NEXUSAI_PROVIDER_PRESET}（文件路径，或直接是 JSON 文本）；</li>
+     *   <li>都不存在 → 返回 null，正常继续、不报错。</li>
+     * </ol>
+     * 读取/解析失败只 warn，不阻断启动（本地叠加是可选增强）。
      */
     private JsonNode readLocalOverlay() {
-        if (localOverlayResourcePath == null || localOverlayResourcePath.isBlank()) {
+        Path configFile = configHome == null ? null : configHome.resolve(CONFIG_HOME_OVERLAY_RELATIVE);
+        JsonNode fromConfigHome = tryReadOverlayFile(configFile, "configHome");
+        if (fromConfigHome != null) {
+            return fromConfigHome;
+        }
+        if (envPresetValue != null && !envPresetValue.isBlank()) {
+            String value = envPresetValue.trim();
+            if (value.startsWith("{")) {
+                try {
+                    return objectMapper.readTree(value);
+                } catch (IOException e) {
+                    log.warn("[FactoryPresetSeeder] 环境变量 {} 的 JSON 文本解析失败（忽略）: {}", ENV_PRESET, e.toString());
+                }
+            } else {
+                try {
+                    JsonNode fromEnv = tryReadOverlayFile(Path.of(value), "env " + ENV_PRESET);
+                    if (fromEnv != null) {
+                        return fromEnv;
+                    }
+                } catch (InvalidPathException e) {
+                    log.warn("[FactoryPresetSeeder] 环境变量 {} 不是合法路径（忽略）: {}", ENV_PRESET, value);
+                }
+            }
+        }
+        log.info("[FactoryPresetSeeder] 未发现本地叠加（configHome={} / env {} 均缺失），按无叠加继续",
+            configFile, ENV_PRESET);
+        return null;
+    }
+
+    /** 读取叠加文件；不存在/不可读/解析失败 → null（只 warn，不抛）。 */
+    private JsonNode tryReadOverlayFile(Path file, String source) {
+        if (file == null || !Files.isRegularFile(file)) {
             return null;
         }
-        try (InputStream in = FactoryPresetSeeder.class.getClassLoader()
-                .getResourceAsStream(localOverlayResourcePath)) {
-            if (in == null) {
-                log.info("[FactoryPresetSeeder] 未发现本地叠加资源 {}（GitHub/通用版本预期如此：无默认秘钥）",
-                    localOverlayResourcePath);
-                return null;
-            }
-            log.info("[FactoryPresetSeeder] 发现本地叠加资源 {}，将合并内网秘钥（值不落日志）",
-                localOverlayResourcePath);
+        try (InputStream in = Files.newInputStream(file)) {
+            log.info("[FactoryPresetSeeder] 读取本地叠加来源 {}: {}", source, file);
             return objectMapper.readTree(in);
         } catch (IOException e) {
-            throw new IllegalStateException("读取/解析本地叠加资源失败: " + localOverlayResourcePath, e);
+            log.warn("[FactoryPresetSeeder] 读取本地叠加来源 {} 失败（忽略）: {}", source, e.toString());
+            return null;
         }
     }
 

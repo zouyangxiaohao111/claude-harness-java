@@ -186,18 +186,24 @@ class ToolRegistryAlignmentTest {
         //   的成员资格已由上方 SPECIAL_TOOLS 断言覆盖（CC specialTools 即 LLM-facing 过滤源）。
     }
 
-    // ── 6. COORDINATOR_MODE_ALLOWED_TOOLS (CC constants/tools.ts:107-112) ──
+    // ── 6. COORDINATOR_MODE_ALLOWED_TOOLS (exe 2.1.328 vfn/E8r) ──
 
     @Test
-    @DisplayName("COORDINATOR_MODE_ALLOWED_TOOLS = {Agent, TaskStop, SendMessage, StructuredOutput} (CC constants/tools.ts:107-112)")
+    @DisplayName("COORDINATOR_MODE_ALLOWED_TOOLS = {Agent, TaskStop, SendMessage, SessionCreate, Skill, Workflow, ListAgents, StructuredOutput}")
     void coordinatorModeAllowedTools_matchesCC() {
-        // WHY: constants/tools.ts 第 5 集 — coordinator 模式仅输出 + agent 管理工具.
+        // WHY: exe 2.1.328 vfn 的 E8r 9 项（3 项静态未确名）+ 本仓存在工具取并集；
+        //   StructuredOutput 为旧版保留；SessionCreate 为 2026-11-20 用户裁定的本仓扩展
+        //   （CC 无创建会话工具，协调者需创建同级会话后用 SendMessage 继续）。
         //   变异点: 少/多一个成员 → 红.
         assertThat(AgentToolUtils.COORDINATOR_MODE_ALLOWED_TOOLS)
             .containsExactlyInAnyOrder(
                 AgentToolConstants.AGENT_TOOL_NAME,
                 ToolNameConstants.TASK_STOP_TOOL_NAME,
                 ToolNameConstants.SEND_MESSAGE_TOOL_NAME,
+                ToolNameConstants.SESSION_CREATE_TOOL_NAME,
+                ToolNameConstants.SKILL_TOOL_NAME,
+                ToolNameConstants.WORKFLOW_TOOL_NAME,
+                ToolNameConstants.LIST_AGENTS_TOOL_NAME,
                 ToolNameConstants.SYNTHETIC_OUTPUT_TOOL_NAME);
     }
 

@@ -33,7 +33,6 @@ import java.time.OffsetDateTime;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicReference;
 import java.util.function.Consumer;
@@ -299,7 +298,7 @@ class SessionMemoryForkSessionModelTest {
     /** 会话/供应器 ToolUseContext（sessionId 固定便于清理；modelName=null → effectiveModelName 缺省）。 */
     private static ToolUseContext ctx(List<Tool> tools, String modelName) {
         ToolUseContext tuc = new ToolUseContext(
-            UUID.randomUUID(), SESSION_ID, PermissionMode.DEFAULT, Map.of(),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION_ID, PermissionMode.DEFAULT, Map.of(),
             tools, "", AbortController.NOOP, List.of());
         return modelName != null ? tuc.withEffectiveModelName(modelName) : tuc;
     }

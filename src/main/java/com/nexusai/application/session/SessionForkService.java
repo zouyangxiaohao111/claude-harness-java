@@ -163,6 +163,11 @@ public class SessionForkService {
 
         SessionRecord session = buildForkSession(src, newSessionId, now, srcMessages.size());
         sessionMapper.insert(session);
+        // [V330] IM 工具增量列不映射实体（防止旧全行 update 覆盖），fork 必须用专用 SQL 按源快照复制。
+        String srcImOverrides = sessionMapper.selectImToolOverrides(src.getId());
+        if (srcImOverrides != null && !srcImOverrides.isBlank()) {
+            sessionMapper.copyImToolOverrides(src.getId(), newSessionId);
+        }
 
         for (MessageRecord m : srcMessages) {
             MessageRecord copy = new MessageRecord();

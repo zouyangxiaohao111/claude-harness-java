@@ -274,7 +274,7 @@ public class MonitorTool implements Tool {
             }
         }
         String sessionId = ctx != null ? ctx.sessionId() : null;
-        var agentId = ctx != null ? ctx.agentId() : null;
+        String agentId = ctx != null ? ctx.agentId() : null;
         try {
             String taskId = hasCommand
                 ? monitorTaskRunner.startCommand(command, description, timeoutMs, call.id(), agentId, sessionId)

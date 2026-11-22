@@ -156,11 +156,13 @@ public class ProviderService {
         p.setType(req.type() != null ? req.type().name() : "openai_compatible");
         p.setBaseUrl(req.baseUrl());
         p.setApiKeyHash(ApiKeyHasher.hash(req.apiKey()));
-        p.setApiKeyMasked(ApiKeyHasher.mask(req.apiKey()));
+        p.setApiKeyMasked(ApiKeyHasher.maskSecret(req.apiKey()));
         p.setApiKeyEncrypted(cryptoUtil.encrypt(req.apiKey()));
         // 写侧校验必须在序列化之前：敏感头 / 非法名 / 换行值 / 占位符拼写错误 → 400（规范 §6.4）
         validateExtraHeaders(req.extraHeaders());
-        p.setExtraHeaders(serializeHeaders(req.extraHeaders()));
+        // [保密 2026-11-22] 新建时库里没有旧值可还原 ⇒ 掩码值直接丢弃（⛔ 不把 **** 当配置存进库）
+        p.setExtraHeaders(serializeHeaders(
+            ApiKeyHasher.mergeMaskedMap(req.extraHeaders(), null)));
         p.setEnabled(req.enabled() == null ? Boolean.TRUE : req.enabled());
         // [V296] auth_mode 是 NOT NULL 列：insert(entity) 不忽略 null ⇒ 必须显式给默认值，
         //   否则 NOT NULL 约束会挡住「新建 provider」（DB 的 DEFAULT 只对「不写该列」生效）。
@@ -238,7 +240,7 @@ public class ProviderService {
         p.setBaseUrl(CODEX_OAUTH_BASE_URL);
         // 空串凭据：登录前不用它发请求；hash/mask/encrypt 对空串都是正常值（mask → "****"）
         p.setApiKeyHash(ApiKeyHasher.hash(""));
-        p.setApiKeyMasked(ApiKeyHasher.mask(""));
+        p.setApiKeyMasked(ApiKeyHasher.maskSecret(""));
         p.setApiKeyEncrypted(cryptoUtil.encrypt(""));
         p.setEnabled(Boolean.TRUE);
         p.setAuthMode(AUTH_MODE_API_KEY);
@@ -387,7 +389,7 @@ public class ProviderService {
         p.setBaseUrl(CLAUDE_API_BASE_URL);
         // 空串凭据：登录前不用它发请求；hash/mask/encrypt 对空串都是正常值（mask → "****"）
         p.setApiKeyHash(ApiKeyHasher.hash(""));
-        p.setApiKeyMasked(ApiKeyHasher.mask(""));
+        p.setApiKeyMasked(ApiKeyHasher.maskSecret(""));
         p.setApiKeyEncrypted(cryptoUtil.encrypt(""));
         p.setEnabled(Boolean.TRUE);
         p.setAuthMode(AUTH_MODE_API_KEY);
@@ -606,9 +608,14 @@ public class ProviderService {
         if (req.name() != null) p.setName(req.name());
         if (req.type() != null) p.setType(req.type().name());
         if (req.baseUrl() != null) p.setBaseUrl(req.baseUrl());
-        if (req.apiKey() != null) {
+        // [保密 2026-11-22 B4] 掩码哨兵：GET 只回 apiKeyMasked ⇒ 客户端把掩码当 apiKey 回传时
+        //   必须视为「未修改」。⛔ 不能只判 !=null：否则库里真 key 的密文会被 "****1234" 顶掉。
+        //   基准 = 当前密文的解密明文（拿不到时回落 storedMasked）；空/空白同样视为不改
+        //   （旧实现会把 "" 加密成一个「空凭据」，同样属于静默破坏）。
+        if (req.apiKey() != null && !req.apiKey().isBlank()
+                && !isMaskedApiKeyEcho(req.apiKey(), p)) {
             p.setApiKeyHash(ApiKeyHasher.hash(req.apiKey()));
-            p.setApiKeyMasked(ApiKeyHasher.mask(req.apiKey()));
+            p.setApiKeyMasked(ApiKeyHasher.maskSecret(req.apiKey()));
             p.setApiKeyEncrypted(cryptoUtil.encrypt(req.apiKey()));
         }
         // 写侧校验必须在序列化之前（同 create）：命中敏感头 / 非法名 / 换行值 / 占位符拼写错误 → 400
@@ -625,9 +632,16 @@ public class ProviderService {
         //   NULL，不会误伤其他列。
         // 范式照抄本仓既有（不新造）：ProjectSessionBindingService.unbind / EffortCommand、
         //   TodoWriteTool 均用 update(entity, false) 显式写 NULL。
-        boolean clearHeaders = req.extraHeaders() != null && req.extraHeaders().isEmpty();
+        // [保密 2026-11-22] 掩码哨兵：敏感头回传的 ****末四位 ⇒ 保留库里原值（否则真 token
+        //   被掩码覆盖，下一次请求就 401）。其余头按入参写；非敏感键从不受影响。
+        Map<String, String> mergedHeaders = null;
         if (req.extraHeaders() != null) {
-            p.setExtraHeaders(clearHeaders ? null : serializeHeaders(req.extraHeaders()));
+            mergedHeaders = ApiKeyHasher.mergeMaskedMap(
+                req.extraHeaders(), deserializeHeaders(p.getExtraHeaders()));
+        }
+        boolean clearHeaders = mergedHeaders != null && mergedHeaders.isEmpty();
+        if (mergedHeaders != null) {
+            p.setExtraHeaders(clearHeaders ? null : serializeHeaders(mergedHeaders));
         }
         if (req.enabled() != null) p.setEnabled(req.enabled());
         // [V299] 品牌归属三态：缺字段 = 不改；空串 = 移出品牌（改回自定义）；非空 = 写入
@@ -933,6 +947,18 @@ public class ProviderService {
      */
     public String getDecryptedApiKey(String providerId) {
         return resolveCredential(providerId);
+    }
+
+    /**
+     * [保密 2026-11-22] 服务端内部读链：provider 自定义头的<b>明文</b>（供 hook 子代理发真实请求）。
+     *
+     * <p>⛔ 不要用 {@code ProviderDto.extraHeaders()} 去发请求：那是只回末四位的掩码。
+     * 本方法直读 DB 列（与 {@code ProviderHeaderInjector.apply} 在测试连接里读的是同一份）。
+     */
+    public Map<String, String> getPlainExtraHeaders(String providerId) {
+        if (providerId == null) return null;
+        ProviderRecord r = providerMapper.selectOneById(providerId);
+        return r == null ? null : deserializeHeaders(r.getExtraHeaders());
     }
 
     /**
@@ -1261,6 +1287,47 @@ public class ProviderService {
      * @param headers 请求体里的 extraHeaders（可 null / 空 → 放行）
      * @throws ValidationException 命中任一条；消息指明具体是哪个 header、为什么
      */
+    /**
+     * [保密 2026-11-22 B4] provider.apiKey 写侧哨兵（包级可见，便于单测）。
+     *
+     * <p>两个显式判据：
+     * <ol>
+     *   <li>入参含 {@link ApiKeyHasher#MASK_TOKEN}（掩码必然含，真 key 不含），或逐字等于
+     *       库里 {@code api_key_masked}；</li>
+     *   <li>{@link ApiKeyHasher#isMaskedSentinel} 对「当前密文的解密明文」再判一次
+     *       （精确形态，防掩码格式变化后漏判）。</li>
+     * </ol>
+     *
+     * <p>⛔ 解密失败 / OAuth 模式 / 无密文时只看第 1 条 —— 不让一次解密失败阻断保存。
+     */
+    boolean isMaskedApiKeyEcho(String incoming, Provider p) {
+        if (incoming == null || p == null) return false;
+        String storedMasked = p.getApiKeyMasked();
+        if (storedMasked != null && !storedMasked.isBlank() && incoming.equals(storedMasked)) {
+            return true;
+        }
+        return ApiKeyHasher.isMaskedSentinel(incoming, decryptApiKeyPlain(p));
+    }
+
+    /** 解密「当前」apiKey 明文（仅用于哨兵比对；失败/OAuth/无密文 → null，不抛不写日志内容）。 */
+    private String decryptApiKeyPlain(Provider p) {
+        if (cryptoUtil == null || p.getApiKeyEncrypted() == null || p.getApiKeyEncrypted().isBlank()) {
+            return null;
+        }
+        String mode = p.getAuthMode();
+        if (AUTH_MODE_CODEX_OAUTH.equals(mode) || AUTH_MODE_CLAUDE_OAUTH.equals(mode)) {
+            return null;
+        }
+        try {
+            return cryptoUtil.decrypt(p.getApiKeyEncrypted());
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[ProviderService] 当前 apiKey 解密失败，掩码哨兵回落 storedMasked: {}", e.toString());
+            }
+            return null;
+        }
+    }
+
     static void validateExtraHeaders(Map<String, String> headers) {
         if (headers == null || headers.isEmpty()) {
             return;
@@ -1292,7 +1359,9 @@ public class ProviderService {
         return new ProviderDto(p.getId(), p.getName(),
             p.getType() != null ? ProviderType.valueOf(p.getType()) : null,
             p.getBaseUrl(), p.getApiKeyMasked(),
-            deserializeHeaders(p.getExtraHeaders()),
+            // [保密 2026-11-22] 敏感头（*KEY/*TOKEN/*SECRET/*PASSWORD/Authorization）只回末四位掩码；
+            //   明文仍留在 DB 供 ProviderHeaderInjector 注入真实请求（它读 Provider.extraHeaders，不经 DTO）。
+            ApiKeyHasher.maskSensitiveMap(deserializeHeaders(p.getExtraHeaders())),
             Boolean.TRUE.equals(p.getEnabled()), models,
             parseDateTime(p.getCreatedAt()), parseDateTime(p.getUpdatedAt()),
             // [V296] 只暴露「凭据形态」这类非敏感元数据；access/refresh/state 绝不出 DTO

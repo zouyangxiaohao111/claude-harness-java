@@ -211,7 +211,7 @@ class AutoDreamConsolidatorTest {
         AtomicReference<String> sidSeen = new AtomicReference<>("<供应器未被调用>");
         AtomicReference<Path> cwdSeen = new AtomicReference<>();
         ToolUseContext supplierCtx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, Map.of(), List.of(), "", new AbortController(), List.of());
         consolidator.setCacheSafeParamsSupplier((sid, cwd) -> {
             sidSeen.set(sid);
@@ -241,7 +241,7 @@ class AutoDreamConsolidatorTest {
         AtomicReference<String> sidSeen = new AtomicReference<>("<供应器未被调用>");
         AtomicReference<Path> cwdSeen = new AtomicReference<>();
         ToolUseContext supplierCtx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, Map.of(), List.of(), "", new AbortController(), List.of());
         consolidator.setCacheSafeParamsSupplier((sid, cwd) -> {
             sidSeen.set(sid);
@@ -267,7 +267,7 @@ class AutoDreamConsolidatorTest {
         consolidator.setAutoDreamEnabled(() -> true);
         // 生产 supplier 形态：三段恒空，仅 toolUseContext 载荷（buildProductionCacheSafeParams）
         ToolUseContext supplierCtx = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             Map.of(), List.of(), "", new AbortController(), List.of());
         consolidator.setCacheSafeParamsSupplier((sid, cwd) -> new CacheSafeParams(
             List.of(), Map.of(), Map.of(), supplierCtx, List.of(), false));

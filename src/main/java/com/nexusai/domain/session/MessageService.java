@@ -6,6 +6,7 @@ import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.ChatMessageDto.UserAttachmentInfo;
 import com.nexusai.model.session.dto.FinishReason;
+import com.nexusai.model.session.dto.MessageContentBlocks;
 import com.nexusai.model.session.dto.PivotCandidateDto;
 import com.nexusai.model.session.dto.Role;
 import com.nexusai.model.session.dto.ToolCallDto;
@@ -296,6 +297,62 @@ public class MessageService {
      * 且都<b>永不废掉</b> {@code idx_messages_session_seq}（无 TEMP B-TREE）。
      */
     public static final String SEQ_DESC_NULLS_LAST_ORDER = "seq DESC NULLS LAST";
+
+    // ════════════════════════════════════════════════════════════════════
+    // [held-state V326] 待确认来信状态（messages.held_state）
+    // ════════════════════════════════════════════════════════════════════
+
+    /** 待确认（hold 判定通过、未批准）：GET 可见，⛔ 不进模型上下文。 */
+    public static final String HELD_STATE_PENDING = "pending";
+
+    /** 已批准且已写入会话历史：普通来信渲染 + 进模型上下文。 */
+    public static final String HELD_STATE_DELIVERED = "delivered";
+
+    /** 已拒绝：渲染「已拒绝」卡片，⛔ 不进模型上下文。 */
+    public static final String HELD_STATE_DECLINED = "declined";
+
+    /**
+     * 是否「不得进入模型上下文」的 held 行（pending / declined）。
+     *
+     * <p><b>WHY</b>：未获批准的来信绝不能作为上下文交给模型（用户实测 CC 的语义）；
+     * 已拒绝的同样不得进入。只有 {@code delivered}（或普通消息的 null）才可进入。
+     * 前端展示通道（{@link #listRawForTranscript} / GET messages）<b>不</b>过滤 ——
+     * 待确认卡片 / 已拒绝卡片必须能从会话记录渲染出来。
+     */
+    public static boolean isHeldOutOfModel(ChatMessageDto m) {
+        if (m == null || m.heldState() == null) {
+            return false;
+        }
+        return HELD_STATE_PENDING.equals(m.heldState()) || HELD_STATE_DECLINED.equals(m.heldState());
+    }
+
+    /** 模型面过滤：剔除 pending / declined 的 held 行（null/空 → 原样返回同一实例）。 */
+    private static List<ChatMessageDto> excludeHeldFromModel(List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return messages;
+        }
+        boolean any = false;
+        for (ChatMessageDto m : messages) {
+            if (isHeldOutOfModel(m)) {
+                any = true;
+                break;
+            }
+        }
+        if (!any) {
+            return messages;
+        }
+        List<ChatMessageDto> out = new ArrayList<>(messages.size());
+        for (ChatMessageDto m : messages) {
+            if (!isHeldOutOfModel(m)) {
+                out.add(m);
+            }
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[MessageService] 模型面过滤：剔除 {} 条 pending/declined held 行（{} → {}）",
+                messages.size() - out.size(), messages.size(), out.size());
+        }
+        return out;
+    }
 
     /**
      * 取一个「雪花候选号」（{@code IdUtil.getSnowflakeNextId()}）· {@link #nextSeq} /
@@ -606,8 +663,10 @@ public class MessageService {
                 .orderByUnSafely(SEQ_ASC_NULLS_LAST_ORDER));
         warnNullSeqIfAny(sessionId, "listRawForTranscript", all);
         List<ChatMessageDto> result = new ArrayList<>(all.size());
+        // [错误通道] tool_calls.is_error 整批预取（角色 tool 行回填用，避免 N+1）
+        Map<String, Boolean> toolCallErrors = loadToolCallErrors(all);
         for (MessageRecord m : all) {
-            result.add(toDto(m));
+            result.add(toDto(m, toolCallErrors));
         }
         // [token-compact-fix ⑤方案B] 重拉上下文快照补算：对末条 assistant 消息挂
         //   contextTokensUsed/percentLeft/contextWindow（实时 complete 事件推这三字段，重拉丢失；
@@ -641,8 +700,11 @@ public class MessageService {
      */
     public List<ChatMessageDto> listForModel(String sessionId) {
         List<ChatMessageDto> raw = listRawForTranscript(sessionId);
+        // [held-state V326] 模型面过滤：pending / declined 的待确认来信不得进入上下文
+        //   （KV/README：未批准不入模型；已拒绝同样不得作为历史回放）。
         List<ChatMessageDto> modelView = new ArrayList<>(
-            com.nexusai.application.agent.compact.BoundaryReader.getMessagesAfterCompactBoundary(raw));
+            com.nexusai.application.agent.compact.BoundaryReader.getMessagesAfterCompactBoundary(
+                excludeHeldFromModel(raw)));
         if (log.isDebugEnabled()) {
             log.debug("[MessageService] listForModel: session={} 全量 {} 条 → 模型视图 {} 条"
                     + "（compact boundary 切片 + snip 投影 + preservedSegment 重挂，CC query.ts:523 等价）",
@@ -821,8 +883,10 @@ public class MessageService {
         List<MessageRecord> asc = new ArrayList<>(page);
         java.util.Collections.reverse(asc);
         List<ChatMessageDto> result = new ArrayList<>(asc.size());
+        // [错误通道] tool_calls.is_error 整批预取（本页 tool 行回填用，避免 N+1）
+        Map<String, Boolean> toolCallErrors = loadToolCallErrors(asc);
         for (MessageRecord m : asc) {
-            result.add(toDto(m));
+            result.add(toDto(m, toolCallErrors));
         }
         if (beforeMessageId == null || beforeMessageId.isBlank()) {
             // 尾页才补上下文快照（前页更早消息的 usage 已随 DB 存储，无需重算）
@@ -942,8 +1006,10 @@ public class MessageService {
         List<MessageRecord> rows = messageMapper.selectListByQuery(qw);
         warnNullSeqIfAny(sessionId, "listMessagesByTurns.rows", rows);
         List<ChatMessageDto> result = new ArrayList<>(rows.size());
+        // [错误通道] tool_calls.is_error 整批预取（本窗口 tool 行回填用，避免 N+1）
+        Map<String, Boolean> toolCallErrors = loadToolCallErrors(rows);
         for (MessageRecord m : rows) {
-            result.add(toDto(m));
+            result.add(toDto(m, toolCallErrors));
         }
         // 尾页（窗口覆盖到最后一轮）才补上下文快照 —— 与 listPageBySession 尾页口径一致
         if (win.endIndex() == anchors.size()) {
@@ -1435,10 +1501,12 @@ public class MessageService {
      */
     public List<ChatMessageDto> listForResume(String sessionId) {
         List<ChatMessageDto> raw = listRawForTranscript(sessionId);
+        // [held-state V326] 恢复/续聊 = 模型上下文通道：剔除 pending / declined 的待确认来信
+        //   （未批准 / 已拒绝都不得作为上下文交给模型；delivered 与普通行照常保留）。
         // ⚠️ 顺序：先剔 ragpipe-（展示用调用，无独立 tool_result），再跑反序列化。
         //   反过来会让「未配对 tool_use 剥离」把整条 RAG 轮 assistant 删掉（回答丢失）。
         return SessionResumeDeserializer.deserializeWithInterruptDetection(
-            stripPipelineToolCalls(raw)).messages();
+            stripPipelineToolCalls(excludeHeldFromModel(raw))).messages();
     }
 
     /**
@@ -1484,12 +1552,16 @@ public class MessageService {
         if (raw == null || raw.isEmpty()) {
             return List.of();
         }
+        // [held-state V326] 模型面过滤先做（无论是否传 excludeMessageId）：
+        //   pending / declined 的待确认来信不得进入 run 起始上下文（LlmAgentLoop 注入块 /
+        //   ToolRegistrationConfig.rebuildIdleStateFromDb 都消费本重载）。
+        List<ChatMessageDto> visible = excludeHeldFromModel(raw);
         if (excludeMessageId == null || excludeMessageId.isBlank()) {
             return SessionResumeDeserializer.deserializeWithInterruptDetection(
-                stripPipelineToolCalls(raw)).messages();
+                stripPipelineToolCalls(visible)).messages();
         }
-        List<ChatMessageDto> filtered = new ArrayList<>(raw.size());
-        for (ChatMessageDto m : raw) {
+        List<ChatMessageDto> filtered = new ArrayList<>(visible.size());
+        for (ChatMessageDto m : visible) {
             if (m != null && excludeMessageId.equals(m.id())) {
                 continue;
             }
@@ -1702,10 +1774,74 @@ public class MessageService {
                                                           OffsetDateTime createdAt, boolean isMeta, String queuedOrigin,
                                                           List<String> imagePasteIds,
                                                           List<ChatMessageDto.UserAttachmentInfo> userAttachments) {
+        return insertQueuedUserMessage(sessionId, userMessageId, content, createdAt, isMeta, queuedOrigin,
+            imagePasteIds, userAttachments, null, null, null, false);
+    }
+
+    /**
+     * [sendmessage-cross-session · B] 11 参重载：排队 user 行 + <b>真实</b> author / subtype /
+     * structuredOutput（peer 行：{@code author=来源 sessionId}、{@code subtype=agent_message}、
+     * {@code structuredOutput.peer_source}）。其余列沿用 8 参重载语义。
+     *
+     * <p><b>幂等</b>：同 id 已存在 → 直接返回同 id 响应（<b>不</b>再次取号、不改 messageCount、
+     * 不覆盖既有行）。空闲路径先落库、运行中 turn-0 drain 再 append 同一 id 时靠本语义收敛
+     * （一次投递 = 一行）。⛔ 真实落库异常向上抛（调用方不得把失败当成功推送）。
+     *
+     * @param author           user 行作者（peer = 来源 sessionId；null = 普通排队消息）
+     * @param subtype          行 subtype（peer = agent_message；null = 普通消息）
+     * @param structuredOutput 结构化载荷（V6 列；peer_source 投影；null = 无）
+     */
+    public MessageCreatedResponse createQueuedUserMessage(String sessionId, String userMessageId, String content,
+                                                          OffsetDateTime createdAt, boolean isMeta, String queuedOrigin,
+                                                          List<String> imagePasteIds,
+                                                          List<ChatMessageDto.UserAttachmentInfo> userAttachments,
+                                                          String author, String subtype,
+                                                          Map<String, Object> structuredOutput) {
+        return insertQueuedUserMessage(sessionId, userMessageId, content, createdAt, isMeta, queuedOrigin,
+            imagePasteIds, userAttachments, author, subtype, structuredOutput, true);
+    }
+
+    /**
+     * 排队 user 行唯一写实现（8 参 / 11 参共用）。
+     *
+     * @param idempotent true = 同 id 已存在时按幂等返回（不重复 insert / 不重复取号）；
+     *                   false = 既有语义（主键冲突照旧抛出，由调用方 best-effort 兜底）
+     */
+    private MessageCreatedResponse insertQueuedUserMessage(String sessionId, String userMessageId, String content,
+                                                          OffsetDateTime createdAt, boolean isMeta, String queuedOrigin,
+                                                          List<String> imagePasteIds,
+                                                          List<ChatMessageDto.UserAttachmentInfo> userAttachments,
+                                                          String author, String subtype,
+                                                          Map<String, Object> structuredOutput,
+                                                          boolean idempotent) {
         SessionRecord session = sessionMapper.selectOneById(sessionId);
         if (session == null) throw new NotFoundException("Session " + sessionId + " not found");
         if (userMessageId == null || userMessageId.isBlank()) {
             userMessageId = generateId("msg");
+        }
+        if (idempotent && messageMapper.selectOneById(userMessageId) != null) {
+            // 一次投递 = 一行：空闲路径先落库后，运行中 turn-0 drain 再 append 同 id → no-op
+            // [held-state V326] 例外：hold 时已写入的 pending 行 —— 投递成功即原地升级为 delivered
+            //   （⛔ 不插第二行；用投递侧权威投影覆盖 author/subtype/structured_output/queued_origin），
+            //   并按普通路径补一次 messageCount（hold 插入时不计，declined 行永不计）。
+            MessageRecord existing = messageMapper.selectOneById(userMessageId);
+            if (existing != null && HELD_STATE_PENDING.equals(existing.getHeldState())) {
+                int upgraded = messageMapper.deliverHeldRow(userMessageId, sessionId, author, subtype,
+                    serializeStructuredOutput(structuredOutput), queuedOrigin);
+                if (upgraded == 1) {
+                    session.setMessageCount((session.getMessageCount() == null ? 0 : session.getMessageCount()) + 1);
+                    session.setUpdatedAt(OffsetDateTime.now().toString());
+                    sessionMapper.update(session);
+                    log.info("[MessageService] held 行投递落地：held_state pending → delivered（同 id 原地，无第二行）"
+                            + " session={} id={} author={} subtype={}",
+                        sessionId, userMessageId, author, subtype);
+                } else {
+                    log.warn("[MessageService] held 行投递落地未命中 pending（可能已处理）session={} id={}",
+                        sessionId, userMessageId);
+                }
+            }
+            return new MessageCreatedResponse(userMessageId, "msg-stub-pending",
+                "/topic/sessions/" + sessionId + "/stream", false);
         }
         MessageRecord m = new MessageRecord();
         m.setId(userMessageId);
@@ -1713,7 +1849,7 @@ public class MessageService {
         m.setUserMessageId(userMessageId);
         m.setSessionId(sessionId);
         m.setRole(Role.user.name());
-        m.setAuthor(null);
+        m.setAuthor(author);
         m.setContent(content != null ? content : "");
         m.setReasoning(null);
         m.setReasoningDurationMs(null);
@@ -1738,6 +1874,11 @@ public class MessageService {
         //   queued_origin 列；仅 busy-queued 传 'busy-queued'（resume 重放 toDto 读回 → 发送层重包壳）；
         //   空闲 cron/busy / slash meta/result/reject 恒 null（红线：空闲路径零标记，原文发）
         m.setQueuedOrigin(queuedOrigin);
+        // [sendmessage-cross-session · B] 真实写 author / subtype / structured_output（V6 列）：
+        //   peer 行 = author(来源 sessionId) + subtype(agent_message) + peer_source 投影；
+        //   旧调用方传 null → 列 NULL，行为零变化。
+        m.setSubtype(subtype);
+        m.setStructuredOutput(serializeStructuredOutput(structuredOutput));
         // [D8=C 2026-09-12] V70 两标记列真实接线：排队用户消息是普通消息 → 两标志显式 false（不是 NULL）·
         //   CC original: isCompactSummary/isVisibleInTranscriptOnly（messages.ts:464-465/479-480）。
         //   语义等价（读侧 Boolean.TRUE.equals 本就把 NULL 当 false），只为消除
@@ -1754,6 +1895,117 @@ public class MessageService {
         //   返回值仅由后端消费（原位落库忽略返回值），语义一致。
         String streamTopic = "/topic/sessions/" + sessionId + "/stream";
         return new MessageCreatedResponse(userMessageId, "msg-stub-pending", streamTopic, false);
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [held-state V326] 待确认来信进会话记录（唯一受控写入路径）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * hold 判定通过：把待确认来信写入 {@code messages}（{@code held_state='pending'}）。
+     *
+     * <p><b>WHY</b>（用户实测 CC 后裁定）：CC 的待确认来信进入会话记录，刷新/重启后仍能按原样
+     * 渲染成待确认卡片；未获批准前不得作为上下文交给模型。本方法把这条语义落进消息表，
+     * 而不是只在 {@code peer_held_message} 里存一份审批行。
+     *
+     * <p><b>与投递行同形</b>：role=user / author=来源 sessionId / subtype=agent_message /
+     * queued_origin=peer / is_meta=true / content=原文（壳不落库）—— 批准后由
+     * {@link #insertQueuedUserMessage} 的幂等分支<b>原地</b>升级为 {@code delivered}
+     * （同 id，⛔ 不插第二行），因此这里必须一次写全投递行所需字段。
+     *
+     * <p><b>幂等</b>：同 id 已存在 → 不覆盖、不插入，返回 {@code false}（并发/重试安全）。
+     * <b>不 bump</b> messageCount：行可能被拒绝，计数留给真正投递落地那一刻。
+     *
+     * @param sessionId       目标会话 id
+     * @param messageId       消息 id（= PeerEnvelope.messageId；两者必须一致才能原地升级）
+     * @param content         原文（{@code PeerEnvelope} 正文；null → 空串）
+     * @param sourceSessionId 来源会话 id（落 author，⛔ 不落敏感 token）
+     * @param structuredOutput 来源投影（{@code {peer_source, agent_summary}}；null = 无）
+     * @param heldAt          hold 时刻（null → {@link #nextCreatedAt} 取号）
+     * @return true = 本次写入成功；false = 参数非法 / id 已存在（未改动任何行）
+     */
+    public boolean insertHeldPeerMessage(String sessionId, String messageId, String content,
+                                         String sourceSessionId, Map<String, Object> structuredOutput,
+                                         OffsetDateTime heldAt) {
+        if (sessionId == null || sessionId.isBlank() || messageId == null || messageId.isBlank()) {
+            log.warn("[MessageService] insertHeldPeerMessage 参数非法（session/messageId 为空），不落库");
+            return false;
+        }
+        if (sessionMapper.selectOneById(sessionId) == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        if (messageMapper.selectOneById(messageId) != null) {
+            // 同 id 已存在：不回退、不覆盖（hold 重放 / 并发 hold / 已投递）。
+            log.debug("[MessageService] insertHeldPeerMessage：同 id 行已存在，保持原状态 session={} id={}",
+                sessionId, messageId);
+            return false;
+        }
+        MessageRecord m = new MessageRecord();
+        m.setId(messageId);
+        m.setSessionId(sessionId);
+        m.setRole(Role.user.name());
+        m.setAuthor(sourceSessionId);
+        m.setContent(content != null ? content : "");
+        // 与投递行同一形状（见 ChatService.persistAppendedMessage peer 分支 / CronIdleExecutor.handlePeerQueuedItem）
+        m.setSubtype("agent_message");
+        m.setStructuredOutput(serializeStructuredOutput(structuredOutput));
+        m.setQueuedOrigin("peer");
+        m.setIsMeta(true);
+        m.setUserMessageId(messageId);
+        m.setIsCompactSummary(false);
+        m.setIsVisibleInTranscriptOnly(false);
+        m.setHeldState(HELD_STATE_PENDING);
+        m.setCreatedAt((heldAt != null ? heldAt : nextCreatedAt(sessionId)).toString());
+        m.setCwd(CwdResolution.getCwd(sessionId));
+        m.setSeq(nextSeq(sessionId));
+        messageMapper.insert(m);
+        log.info("[MessageService] 待确认来信已进会话记录（held_state=pending）：session={} id={} from={} chars={}",
+            sessionId, messageId, sourceSessionId, m.getContent().length());
+        return true;
+    }
+
+    /**
+     * 批准后「已投递」：{@code pending → delivered}（单条条件 UPDATE，同 id 幂等，⛔ 不插第二行）。
+     *
+     * <p>正常投递链不直接调用本方法 —— 它经 {@link #insertQueuedUserMessage} 的幂等分支完成
+     * （同一唯一落库出口）。本方法供「只更新状态、不重复投递」的场景/测试使用。
+     *
+     * @param sessionId 目标会话
+     * @param messageId 消息 id（= PeerEnvelope.messageId）
+     * @return true = 本次迁移成功；false = 行不存在 / 不是 pending（已处理）
+     */
+    public boolean markHeldDelivered(String sessionId, String messageId) {
+        if (sessionId == null || messageId == null) {
+            return false;
+        }
+        int rows = messageMapper.transitionHeldState(messageId, sessionId, HELD_STATE_DELIVERED);
+        if (rows == 1) {
+            log.info("[MessageService] held_state pending → delivered session={} id={}", sessionId, messageId);
+            return true;
+        }
+        return false;
+    }
+
+    /**
+     * 拒绝后「已拒绝」：{@code pending → declined}（单条条件 UPDATE，同 id 幂等）。
+     *
+     * <p>拒绝行<b>保留</b>在会话记录里（可渲染「已拒绝」卡片、刷新/重启可见），
+     * 但读侧模型通道（{@link #listForResume} / {@link #listForModel}）一律过滤。
+     *
+     * @param sessionId 目标会话
+     * @param messageId 消息 id（= PeerEnvelope.messageId）
+     * @return true = 本次迁移成功；false = 行不存在 / 不是 pending（已处理）
+     */
+    public boolean markHeldDeclined(String sessionId, String messageId) {
+        if (sessionId == null || messageId == null) {
+            return false;
+        }
+        int rows = messageMapper.transitionHeldState(messageId, sessionId, HELD_STATE_DECLINED);
+        if (rows == 1) {
+            log.info("[MessageService] held_state pending → declined session={} id={}", sessionId, messageId);
+            return true;
+        }
+        return false;
     }
 
     public MessageCreatedResponse createUserMessage(String sessionId, SendMessageRequest req) {
@@ -2184,6 +2436,9 @@ public class MessageService {
             rec.setAgentSteps(serializeToolCalls(dto.toolCalls()));
         }
         rec.setReasoning(dto.reasoning());
+        // [content-blocks] assistant 内容块顺序落库 · V331 content_blocks 列。
+        //   原样透传 dto.blocks()（真实到达顺序由写入侧定）；null = 不落块。
+        rec.setContentBlocks(MessageContentBlocks.toJson(MessageContentBlocks.resolve(dto)));
         // [thinking-passthrough] thinking 块签名落库 · V282 列（与 reasoning 文本配对，
         //   与 CC transcript 同构：只存 thinking 文本 + signature，不存块结构）。
         rec.setThinkingSignature(dto.thinkingSignature());
@@ -2246,7 +2501,8 @@ public class MessageService {
             .withReasoningDurationMs(dto.reasoningDurationMs()) // [reasoningDurationMs] 写后回传保留字段
             .withUserMessageId(dto.userMessageId()) // [userMessageId] 写后回传保留字段（与 rec 落库同源）
             .withIsCompactSummary(dto.isCompactSummary())           // [V70] 写后回传保真（TraceView 消费）
-            .withIsVisibleInTranscriptOnly(dto.isVisibleInTranscriptOnly()); // [V70] 写后回传保真
+            .withIsVisibleInTranscriptOnly(dto.isVisibleInTranscriptOnly()) // [V70] 写后回传保真
+            .withBlocks(dto.blocks()); // [content-blocks V331] 写后回传保真
     }
 
     /**
@@ -2314,6 +2570,9 @@ public class MessageService {
             rec.setAuthor(dto.author());
             rec.setContent(dto.content() == null ? "" : dto.content());
             rec.setReasoning(dto.reasoning());
+            // [content-blocks] 部分压缩写回路径同样持久化块顺序（V331）。
+            //   否则 kept 消息经 replaceSessionMessages 重插后块顺序丢失（round-trip 破缺）。
+            rec.setContentBlocks(MessageContentBlocks.toJson(MessageContentBlocks.resolve(dto)));
             // [thinking-passthrough] thinking 块签名落库 · V282 列（partial 压缩写回路径同样
             //   持久化，否则 round-trip 破缺——kept 消息重插后 thinking 块丢签名 ⇒ 下一轮 400）。
             rec.setThinkingSignature(dto.thinkingSignature());
@@ -2391,7 +2650,8 @@ public class MessageService {
                 .withReasoningDurationMs(dto.reasoningDurationMs()) // [reasoningDurationMs] 写后回传保留字段
                 .withUserMessageId(dto.userMessageId()) // [userMessageId] 写后回传保留字段（与 rec 落库同源）
                 .withIsCompactSummary(dto.isCompactSummary())       // [V70] 写后回传保真
-                .withIsVisibleInTranscriptOnly(dto.isVisibleInTranscriptOnly())); // [V70] 写后回传保真
+                .withIsVisibleInTranscriptOnly(dto.isVisibleInTranscriptOnly()) // [V70] 写后回传保真
+                .withBlocks(dto.blocks())); // [content-blocks V331] 写后回传保真
         }
         // [2026-11-01] 全量替换本质是「删全表 + 重插」⇒ 被丢弃的行可能正是某个 boundary 的
         //   preservedSegment 接线图引用（partial 压缩写回路径与 trim 同源缺陷，见
@@ -2618,6 +2878,54 @@ public class MessageService {
      * 内存消息流内生效（ER-IMP-11 接线），transcript 重放侧无该语义（P-28 接受，JavaDoc 标注）。
      */
     private ChatMessageDto toDto(MessageRecord m) {
+        return toDto(m, loadToolCallErrors(List.of(m)));
+    }
+
+    /**
+     * [错误通道 · CCJ-ERR-012] 批量预取 {@code tool_calls.is_error}（{@code tool_call_id → isError}）。
+     *
+     * <p><b>WHY</b>：{@code messages} 表没有 is_error 列（V1 DDL 里只有 {@code tool_calls.is_error}），
+     * 而 CC 的 tool_result {@code is_error} 是**持久化真值**（sessionStorage.ts:1039-1065），
+     * 重启/续接后必须原样回到 wire（否则模型把历史失败当成功）。本仓唯一已落库的错误真值就是
+     * {@code tool_calls.is_error}（写侧 = 执行层算出的 {@code ChatMessageDto.isError()}），
+     * 故读侧按 {@code messages.tool_call_id} 回填，⛔ 不按内容推断。
+     *
+     * <p>一次 {@code IN} 查询覆盖整页，避免逐条 N+1（分页/全量/轮窗口三个通道共用）。
+     *
+     * @param rows 本批消息行（可空）
+     * @return id → isError（无 tool 消息 / 查询不到 → 空 Map）
+     */
+    private Map<String, Boolean> loadToolCallErrors(List<MessageRecord> rows) {
+        if (rows == null || rows.isEmpty()) {
+            return Map.of();
+        }
+        List<String> ids = new ArrayList<>();
+        for (MessageRecord m : rows) {
+            String tcId = m.getToolCallId();
+            if (tcId != null && !tcId.isBlank()) {
+                ids.add(tcId);
+            }
+        }
+        if (ids.isEmpty()) {
+            return Map.of();
+        }
+        List<ToolCallRecord> tcs = toolCallMapper.selectListByQuery(QueryWrapper.create()
+            .select("id", "is_error")
+            .in("id", ids));
+        Map<String, Boolean> out = new HashMap<>(Math.max(4, tcs.size() * 2));
+        for (ToolCallRecord tc : tcs) {
+            out.put(tc.getId(), Boolean.TRUE.equals(tc.getIsError()));
+        }
+        return out;
+    }
+
+    /**
+     * MessageRecord → 出站 DTO · 带本批已预取的 tool_calls 错误真值。
+     *
+     * @param m                消息行
+     * @param toolCallErrors   {@link #loadToolCallErrors(List)} 的产物（{@code tool_call_id → isError}）
+     */
+    private ChatMessageDto toDto(MessageRecord m, Map<String, Boolean> toolCallErrors) {
         // 查 tool_calls（若无，返回空 list）
         List<ToolCallRecord> toolEntities = toolCallMapper.selectListByQuery(
             QueryWrapper.create().eq("message_id", m.getId()));
@@ -2631,6 +2939,10 @@ public class MessageService {
                 tc.getIsError()
             ));
         }
+        // [错误通道 · CCJ-ERR-012] Role.tool 的消息级 is_error 从持久化真值回填（旧实现恒 false，
+        //   导致重启后续接的模型 wire 丢失历史失败）。⛔ 不按 content 前缀推断。
+        boolean messageIsError = m.getToolCallId() != null
+            && Boolean.TRUE.equals(toolCallErrors.get(m.getToolCallId()));
 
         ChatMessageDto dto = new ChatMessageDto(
             m.getId(),
@@ -2652,7 +2964,7 @@ public class MessageService {
             parseStringList(m.getImagePasteIds()), // V46 imagePasteIds（V46 列 JSON 数组读回；null 列 → 空列表）
             parseStructuredOutput(m.getStructuredOutput()), // OD-14: V6 读回
             Boolean.TRUE.equals(m.getIsMeta()), // R32-c-1 isMeta（V51 is_meta 列读回；null→false 容错）
-            false,               // H13-GAP isError（DB schema 未持久化）
+            messageIsError,      // [错误通道 CCJ-ERR-012] isError（tool_calls.is_error 回填；非 tool 行恒 false）
             null,                // P2-22 sourceToolUseID（DB schema 未持久化）
             m.getSubtype(),      // IMP-05/OD-14: V6 读回 subtype（读侧 BoundaryReader 判别）
             false,               // ER-IMP-11 isApiErrorMessage（DB schema 未持久化）
@@ -2668,7 +2980,14 @@ public class MessageService {
             .withUserMessageId(m.getUserMessageId()) // [userMessageId] 读侧回填（V47 列；GET /messages 出站唯一点；旧行 NULL = 无归属容错）
             .withQueuedOrigin(m.getQueuedOrigin()) // [P0-1 OD-1/OD-3] 读侧回填（V67 queued_origin 列；resume 发送层按标记重新包壳；旧行 NULL = 非排队不包壳，与现状一致可接受）
             .withThinkingSignature(m.getThinkingSignature()) // [thinking-passthrough] 读侧回填（V282 列；resume/重放时送侧据此重建 thinking 块；旧行 NULL = 无签名，按空签名回传）
-            .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId()));
+            .withUserAttachments(resolveAttachmentUrls(parseUserAttachments(m.getUserAttachments()), m.getSessionId()))
+            // [held-state V326] 读侧回填待确认状态（GET /messages 出站唯一点：pending → 待确认卡片、
+            //   declined → 已拒绝卡片、delivered/null → 普通来信/普通消息）。⛔ 不含敏感信息。
+            //   ⚠️ 必须在其它 with* 之后调用（兼容构造器把 heldState 默认 null）。
+            .withHeldState(m.getHeldState())
+            // [content-blocks V331] 读侧回填内容块顺序（GET /messages 出站唯一点）。
+            //   null = 历史行 / 非 assistant 行 → 前端走旧渲染。须在其它 with* 之后。
+            .withBlocks(MessageContentBlocks.fromJson(m.getContentBlocks()));
         // [userAttachments] 读侧回填（V62 列；GET /messages 出站唯一点；contentId 非空 → url 动态拼
         //   /api/v1/attachments/content/{sessionId}/{contentId}；null 列 → 空列表，恒非 null）
         //

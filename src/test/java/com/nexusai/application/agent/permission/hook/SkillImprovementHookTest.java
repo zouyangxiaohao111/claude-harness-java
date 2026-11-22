@@ -99,7 +99,7 @@ class SkillImprovementHookTest {
     /** 构造含 effectiveCwd 的 ToolUseContext (compact ctor 其余字段默认). */
     private static ToolUseContext tucWithCwd(String sessionId, Path effectiveCwd) {
         return new ToolUseContext(
-                UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
                 Map.of(), List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
                 Map.of(), false, "", effectiveCwd, null, Map.of(), null,
                 prev -> new LinkedHashMap<>(prev),
@@ -411,7 +411,7 @@ class SkillImprovementHookTest {
     void logResult_writesSuggestionViaToolUseContext() {
         AtomicReference<Map<String, Object>> captured = new AtomicReference<>();
         ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
                 Map.of(), List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
                 Map.of(), false, "", null, null, Map.of(), null,
                 prev -> new LinkedHashMap<>(prev),
@@ -693,7 +693,7 @@ class SkillImprovementHookTest {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         SkillImprovementSuggestionStore store = new SkillImprovementSuggestionStore();
         ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
                 Map.of(), List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
                 Map.of(), false, "", null, null, Map.of(), null,
                 prev -> new LinkedHashMap<>(prev),
@@ -810,7 +810,7 @@ class SkillImprovementHookTest {
         // [session-id-short] ctx.sessionId() 已 short 直键（不再派生 UUID 反解）
         String sessionId = "sess-abc12345";
         ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
                 Map.of(), List.of(), "", null, List.of(), null, PermissionMode.DEFAULT,
                 Map.of(), false, "", null, null, Map.of(), null,
                 prev -> new LinkedHashMap<>(prev),

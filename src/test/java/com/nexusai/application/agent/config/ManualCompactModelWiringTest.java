@@ -25,7 +25,6 @@ import java.lang.reflect.Method;
 import java.time.OffsetDateTime;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -137,7 +136,7 @@ class ManualCompactModelWiringTest {
         // 回落链：currentModel 缺失 → per-turn TUC.effectiveModelName（AgentLoopContext 由 currentModel 写入）
         state.setCurrentModel(null);
         state.setCurrentToolUseContext(new ToolUseContext(
-            UUID.randomUUID(), SESSION, PermissionMode.DEFAULT, Map.of(), List.of(), "",
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION, PermissionMode.DEFAULT, Map.of(), List.of(), "",
             new AbortController(), List.of()).withEffectiveModelName("anthropic/claude-sonnet-4-6"));
         assertThat(ToolRegistrationConfig.resolveManualCompactModel(state))
             .as("currentModel 缺失 → 回落 TUC.effectiveModelName（不返 null）")

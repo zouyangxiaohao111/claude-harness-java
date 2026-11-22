@@ -30,6 +30,12 @@ describe('cronToHuman · 6 字段 Quartz + || 变体', () => {
     expect(cronToHuman('0 0 9 * * ?')).toBe('每天 09:00')
   })
 
+  it('日字段写 ?（Quartz「本字段无特定值」）⇒ 仍是每天 HH:mm（设计稿 ② 的默认值 0 57 8 ? * *）', () => {
+    // WHY：设计稿 ② 的默认 cron 是 6 段 Quartz `0 57 8 ? * *`；日字段是 '?' 而非 '*'。
+    // 若不把 '?' 当通配，人话预览会退化成「未识别调度」⇒ 用户以为自己写错了 cron。
+    expect(cronToHuman('0 57 8 ? * *')).toBe('每天 08:57')
+  })
+
   it('回归：每月 N 日 HH:mm', () => {
     expect(cronToHuman('0 0 9 1 * ?')).toBe('每月 1 日 09:00')
   })

@@ -2,7 +2,12 @@ package com.nexusai.application.agent.team;
 
 import com.nexusai.application.agent.permission.PermissionMode;
 import com.nexusai.application.agent.permission.SessionPermissionOverlay;
+import com.nexusai.application.agent.subagent.AgentMessage;
+import com.nexusai.application.agent.subagent.AgentNameRegistry;
+import com.nexusai.application.agent.subagent.AgentTranscript;
 import com.nexusai.application.agent.subagent.AutonomousAgentLoop;
+import com.nexusai.application.agent.subagent.ResumeQuota;
+import com.nexusai.application.agent.subagent.ResumeService;
 import com.nexusai.application.agent.tasks.SdkEventQueue;
 import com.nexusai.application.agent.tasks.TaskFrameworkService;
 import com.nexusai.application.agent.tasks.TaskService;
@@ -17,6 +22,7 @@ import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
+import java.nio.file.Path;
 import java.nio.file.Paths;
 import java.security.SecureRandom;
 import java.util.ArrayList;
@@ -24,6 +30,7 @@ import java.util.HashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.function.Function;
+import java.util.regex.Pattern;
 
 /**
  * Spawn In Process · 对齐 CC utils/swarm/spawnInProcess.ts（W8-01 生产化，DEL-29）。
@@ -84,6 +91,25 @@ public class SpawnInProcess {
      * （⛔ 不静默 —— 静默的后果正是「批准了却还弹」这个用户可见缺陷）。
      */
     @Autowired(required = false) private SessionMapper sessionMapper;
+    /**
+     * [B1 身份] teammate 名字注册表 · spawn 成功后以 <b>Lead 会话</b>为 owner 注册
+     * （teammate 的 TUC 继承 Lead session，SendMessage 的 owner 匹配也用 Lead）。
+     * 可选注入：未注入（单测直构）→ 不注册（并 WARN，不静默）。
+     */
+    @Autowired(required = false) private AgentNameRegistry agentNameRegistry;
+
+    /**
+     * [B3 配额] 会话级并发槽 · 对齐 CC {@code roomForResume}/{@code $xt}/{@code Tr}。
+     * spawn 与 resume 共用同一实例（CC 的 {@code taskRegistry.getConcurrentSubagents()}）。
+     * 可选注入：未注入（单测直构）→ 不设并发上限（行为与 B1 之前一致）。
+     */
+    @Autowired(required = false) private ResumeQuota resumeQuota;
+
+    /**
+     * [B1 meta] 会话目录解析缝 · 生产 = {@link ResumeService#resolveSessionDir}，
+     * 单测可注入临时目录（⛔ 不写用户真实 config home）。
+     */
+    private volatile Function<String, Path> sessionDirResolver = ResumeService::resolveSessionDir;
 
     /**
      * 测试/接线用构造器：注入 TaskFrameworkService（BackgroundTask 状态层）。
@@ -151,6 +177,22 @@ public class SpawnInProcess {
         this.sessionMapper = sessionMapper;
     }
 
+    /** 测试/接线用 setter（agentNameRegistry · teammate 注册/退役）. */
+    public void setAgentNameRegistry(AgentNameRegistry agentNameRegistry) {
+        this.agentNameRegistry = agentNameRegistry;
+    }
+
+    /** 测试/接线用 setter（resumeQuota · 会话级并发槽，spawn/resume 共用）。 */
+    public void setResumeQuota(ResumeQuota resumeQuota) {
+        this.resumeQuota = resumeQuota;
+    }
+
+    /** 测试/接线用 setter（会话目录解析缝 · meta sidecar 落盘位置）. */
+    public void setSessionDirResolver(Function<String, Path> sessionDirResolver) {
+        this.sessionDirResolver = sessionDirResolver != null
+            ? sessionDirResolver : ResumeService::resolveSessionDir;
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // 数据契约 · 对齐 CC spawnInProcess.ts InProcessSpawnConfig/InProcessSpawnOutput
     // ════════════════════════════════════════════════════════════════════
@@ -169,8 +211,23 @@ public class SpawnInProcess {
         boolean planModeRequired,
         String model,
         String agentType,
-        String cwd
+        String cwd,
+        /**
+         * [B3 重拉] 从 transcript 读出的历史（teammate 重拉时非空）· 对齐 CC
+         * {@code spawnInProcessTeammate({resumableAgentId, resumeMessages})}。
+         * null / 空 = 首次 spawn（或 {@code (no prior transcript)} 重拉）。
+         */
+        java.util.List<AgentMessage> resumeMessages
     ) {
+        /**
+         * 8 参便捷构造器 · 原有调用点（首次 spawn）不带历史（最小改动，非兼容壳）。
+         */
+        public InProcessSpawnConfig(String name, String teamName, String prompt, String color,
+                                    boolean planModeRequired, String model, String agentType,
+                                    String cwd) {
+            this(name, teamName, prompt, color, planModeRequired, model, agentType, cwd, null);
+        }
+
         /**
          * 6 参便捷构造器 · 既有测试/调用点缺省 agentType/cwd=null（最小改动，非兼容壳）。
          */
@@ -212,6 +269,69 @@ public class SpawnInProcess {
     }
 
     /**
+     * 自动名基础形 · 对齐 CC {@code u(i)}（claude.exe @342172293）：
+     * {@code i.replace(/[^A-Za-z0-9_-]+/g,"-").replace(/^-+/,"").slice(0,64)}，空 → {@code "agent"}。
+     */
+    static String autoNameBase(String name) {
+        if (name == null) {
+            return "agent";
+        }
+        String base = INVALID_NAME_CHARS.matcher(name).replaceAll("-").replaceAll("^-+", "");
+        if (base.length() > 64) {
+            base = base.substring(0, 64);
+        }
+        return base.isEmpty() ? "agent" : base;
+    }
+
+    /** CC {@code u(i)} 的清洗正则（连续非法段 → 单个 '-'）。 */
+    private static final Pattern INVALID_NAME_CHARS = Pattern.compile("[^A-Za-z0-9_-]+");
+
+    /** 名字分配结果（{@code rejectedReason} 非 null ⇒ 不可注册，spawn 失败）。 */
+    record TeammateNameAllocation(String name, String rejectedReason) {}
+
+    /**
+     * 分配 teammate 的名字 · 对齐 CC {@code allocateName}(@342171283)：
+     * 依次尝试 {@code base} / {@code base-2} / {@code base-3}…，<b>跳过保留名与已注册活名</b>
+     * （CC 还跳过名册名 / 活任务；本仓名册成员同样在注册表里，故等价）。
+     *
+     * <p>纯查询：只读注册表，不写任何映射（写点在 {@link #registerTeammateIdentity}，
+     * 保证 spawn 中途失败不残留注册）。
+     *
+     * <p>保留名 / agent id 形 / session id 形 ⇒ 直接拒绝（⛔ 不改名绕过），对齐 CC 的双重拒绝。
+     */
+    private TeammateNameAllocation allocateTeammateName(String ownerSessionId, String requestedName) {
+        String rejection = AgentNameRegistry.registrationRejectionReason(requestedName);
+        if (rejection != null) {
+            return new TeammateNameAllocation(requestedName, rejection);
+        }
+        if (agentNameRegistry == null) {
+            // 无注册表（单测直构）⇒ 无撞名可言，保持原名。
+            return new TeammateNameAllocation(requestedName, null);
+        }
+        String base = autoNameBase(requestedName);
+        if (base.isEmpty()) {
+            base = "agent";
+        }
+        for (int suffix = 1; suffix <= 1000; suffix++) {
+            String candidate = suffix == 1 ? base : base + "-" + suffix;
+            if (AgentNameRegistry.registrationRejectionReason(candidate) != null) {
+                continue;
+            }
+            if (agentNameRegistry.resolveActiveEntry(ownerSessionId, candidate) == null) {
+                return new TeammateNameAllocation(candidate, null);
+            }
+        }
+        return new TeammateNameAllocation(requestedName, "no available name after 1000 suffixes");
+    }
+
+    /** 换名副本（record 不可变）· 自动改名后让下游 identity / meta / members 用真名。 */
+    static InProcessSpawnConfig copyWithName(InProcessSpawnConfig config, String name) {
+        return new InProcessSpawnConfig(name, config.teamName(), config.prompt(), config.color(),
+            config.planModeRequired(), config.model(), config.agentType(), config.cwd(),
+            config.resumeMessages());
+    }
+
+    /**
      * 生成 taskId · 对齐 CC Task.ts:98-105 generateTaskId：前缀 + 8 位随机（36 字母表）。
      */
     public static String generateTaskId() {
@@ -241,10 +361,6 @@ public class SpawnInProcess {
      * @return SpawnOutput（success/agentId/taskId/abortController/teammateContext）
      */
     public InProcessSpawnOutput spawnInProcessTeammate(InProcessSpawnConfig config, SpawnContext context) {
-        String agentId = formatAgentId(config.name(), config.teamName());
-        String taskId = generateTaskId();
-        log.info("[spawnInProcessTeammate] Spawning {} (taskId: {})", agentId, taskId);
-
         // parentSessionId = Leader's session（CC :125 getSessionId）
         // ── [fail-loud · 2026-09-22 用户裁定] 取不到 Leader 真实会话键 ⇒ 直接抛，⛔ 不回落 ──
         // WHY（改前缺陷 · 已读码复核）: 改前本行是
@@ -266,6 +382,47 @@ public class SpawnInProcess {
         // 边界：只拦 teammate 这一条链；「确无会话」的合法降级路径（入站 MCP / 无会话 plan provider /
         //   workflow worker / standalone fork 子代理）仍走 SessionKeys.NO_SESSION + CwdResolution 命名出口。
         String parentSessionId = requireLeaderSessionId(context, config);
+
+        // ── [CC allocateName] 撞名不失败，改自动名 ──
+        // CC 原文（claude.exe @357747471）：`[spawnInProcessTeammate] name "X" already routes to live
+        // ...; registry entry uses "X" instead` ⇒ 名字已被活代理占用时，注册表改用「第一个可用后缀」
+        // （name / name-2 / name-3…，@342171283 `allocateName`），spawn 照常成功。
+        // 保留名 / agent id 形 / session id 形 ⇒ 直接拒绝（CC 在 schema refine + registerName 双重拒绝，
+        // 不会靠改名绕过）。
+        TeammateNameAllocation allocation = allocateTeammateName(parentSessionId, config.name());
+        if (allocation.rejectedReason() != null) {
+            String failedAgentId = formatAgentId(config.name(), config.teamName());
+            log.warn("[spawnInProcessTeammate] 名字不可注册，拒绝 spawn {}: {}",
+                failedAgentId, allocation.rejectedReason());
+            return new InProcessSpawnOutput(false, failedAgentId, null, null,
+                "Teammate name \"" + config.name() + "\" cannot be registered: "
+                    + allocation.rejectedReason());
+        }
+        if (!allocation.name().equals(config.name())) {
+            log.info("[spawnInProcessTeammate] name \"{}\" already routes to live agent; "
+                    + "registry entry uses \"{}\" instead（CC allocateName 自动改名）",
+                config.name(), allocation.name());
+            config = copyWithName(config, allocation.name());
+        }
+        String agentId = formatAgentId(config.name(), config.teamName());
+        String taskId = generateTaskId();
+        log.info("[spawnInProcessTeammate] Spawning {} (taskId: {})", agentId, taskId);
+
+        // ── [B3 配额门] 会话级并发槽 · 对齐 CC 启动门 {@code Ar}（偏移 334098803）——
+        //   {@code if (getConcurrentSubagents() >= Tr()) return "Concurrent subagent limit reached..."}。
+        //   满 → 直接拒（⛔ 不排队）；槽句柄在成功后交 registry，由终态逐出管线释放（只释放一次）。
+        ResumeQuota.Release quotaSlot = null;
+        if (resumeQuota != null) {
+            quotaSlot = resumeQuota.tryAcquire(parentSessionId);
+            if (quotaSlot == null) {
+                String limitText = ResumeQuota.concurrentLimitText(resumeQuota.max());
+                log.warn("[spawnInProcessTeammate] 并发槽已满，拒绝 spawn {} (taskId={}) session={} "
+                    + "occupied={}/{}（CC subagent_concurrency_cap，不排队）", agentId, taskId,
+                    parentSessionId, resumeQuota.inUse(parentSessionId), resumeQuota.max());
+                return new InProcessSpawnOutput(false, agentId, taskId, null, limitText);
+            }
+        }
+        boolean quotaHandedOff = false;
 
         try {
             // 独立 AbortController（不受 leader 中断，CC :122）
@@ -407,10 +564,41 @@ public class SpawnInProcess {
             // registerTask 桥接 + loop 注册（CC :191 → framework.ts:77-117）；
             // toolUseId 透传（CC spawnInProcess.ts:162 context.toolUseId）
             String toolUseId = context != null ? context.toolUseId() : null;
+
+            // ── [B1 身份] teammate 注册（owner = Lead 会话，对齐 CC roster/taskRegistry）──
+            //   必须在起线程之前完成：否则「已跑起来但没有名字」的 teammate 会既不可达、
+            //   又会在崩溃后无法退役。冲突/保留名 ⇒ 直接失败，且此时任务未注册、线程未启动，
+            //   没有需要清理的资源。
+            String identityError = registerTeammateIdentity(parentSessionId, config, agentId);
+            if (identityError != null) {
+                log.warn("[spawnInProcessTeammate] 身份注册失败，拒绝 spawn {} (taskId={}): {}",
+                    agentId, taskId, identityError);
+                return new InProcessSpawnOutput(false, agentId, taskId, null, identityError);
+            }
+            // 终态管线（CC evictAfter=now+30000）：task evict → registry remove → retire → release quota
+            if (agentNameRegistry != null) {
+                registry().setAgentNameRegistry(agentNameRegistry);
+            }
+            loop.setTerminalSink(registry()::onTerminal);
+
             // Fix 0（NPE）: Spring 路径走无参构造（:74-76），registry 字段为 null —— 直接字段访问
             //   registry.register 必 NPE（主工作区 20:33 前实证）。改用 registry() 惰性创建（:82-94）：
             //   Spring 字段注入完成后 taskFrameworkService 已就绪，首次调用才建 InProcessTeammateTaskRegistry。
             registry().register(taskState, loop, toolUseId);
+            // ── [B3 配额] 槽句柄交给逐出管线（task evict → registry remove → retire → release quota）──
+            //   交出去之后本方法的 finally 不再释放；由 registry 在终态逐出时释放且只释放一次。
+            if (quotaSlot != null) {
+                registry().registerQuotaRelease(taskId, quotaSlot);
+                quotaHandedOff = true;
+                log.info("[spawnInProcessTeammate] [B3] 并发槽已登记释放句柄: taskId={} session={} "
+                    + "occupied={}/{}", taskId, parentSessionId, resumeQuota.inUse(parentSessionId),
+                    resumeQuota.max());
+            }
+            // ── [B3 重拉] 历史重放列表交给运行循环（仅第一轮消费一次；空 = 首次 spawn）──
+            loop.setResumeMessages(config.resumeMessages());
+            // ── [B1 meta] sidecar：taskKind=in_process_teammate + name + teamName + agentType ──
+            //   CC 仅认 taskKind 判定 teammate（偏移 356099285）；无 meta 的旧数据按「不存在」分档。
+            writeTeammateMeta(parentSessionId, config, agentId);
             log.info("[spawnInProcessTeammate] Registered {} in task store (taskId={})", agentId, taskId);
 
             // [Batch2 S1] appendTeamMember 写 config.json members（Java 保留该持久化供
@@ -467,7 +655,26 @@ public class SpawnInProcess {
         } catch (Exception e) {
             String errorMessage = e.getMessage() != null ? e.getMessage() : "Unknown error during spawn";
             log.warn("[spawnInProcessTeammate] Failed to spawn {}: {}", agentId, errorMessage);
+            // 已登记进逐出管线但启动阶段抛错：本方法不会再等终端回调 ⇒ 显式归还槽
+            // （与逐出释放共用句柄表，先到者生效、后到者 no-op）。
+            if (quotaHandedOff) {
+                try {
+                    registry().releaseQuotaForTask(taskId);
+                } catch (Exception cleanupError) {
+                    log.warn("[spawnInProcessTeammate] 启动失败后归还并发槽失败 task={}: {}",
+                        taskId, cleanupError.toString());
+                }
+            }
             return new InProcessSpawnOutput(false, agentId, taskId, null, errorMessage);
+        } finally {
+            // 槽在「注册进逐出管线」之前就失败（身份冲突 / 写 meta 抛错 / 其他早退）⇒ 本方法自己归还；
+            // 已交给 registry 的槽由逐出管线释放（Release 幂等，但 ⛔ 不重复持有）。
+            if (!quotaHandedOff && quotaSlot != null) {
+                quotaSlot.release();
+                log.info("[spawnInProcessTeammate] [B3] spawn 失败/早退，已归还并发槽 session={} "
+                    + "occupied={}/{}", parentSessionId, resumeQuota.inUse(parentSessionId),
+                    resumeQuota.max());
+            }
         }
     }
 
@@ -553,6 +760,93 @@ public class SpawnInProcess {
         }
         String cwd = com.nexusai.application.agent.agent.CwdResolution.getCwd(sessionId);
         return cwd != null && !cwd.isBlank() ? cwd : System.getProperty("user.dir", ".");
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [B1] 身份注册 + meta sidecar
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 把 teammate 注册进 {@link AgentNameRegistry}（owner = Lead 会话）。
+     *
+     * <p><b>为什么 owner 是 Lead 会话</b>：teammate 的 TUC 继承 Lead 的 sessionId（见
+     * {@link #buildLeaderParentTuc}），SendMessage 的 owner 匹配也用 Lead 会话 ⇒ 注册表的
+     * owner 维度必须与之一致，否则解析恒不命中。这与子代理的 register 规则同一张表
+     * （{@code SubagentTool} 用 {@code parentSessionId}）——名字空间合并是 CC 的语义。
+     *
+     * <p><b>冲突规则</b>（对齐 CC：「名字已路由到活代理」⇒ 调用方已用
+     * {@link #allocateTeammateName} 换成自动名，本方法只会遇到「保留名 / id 形」与
+     * 并发写的极端赛跑）：
+     * <ul>
+     *   <li>保留名 {@code main}/{@code team-lead}/{@code user}/{@code system}、agent id 形、
+     *       session id 形 ⇒ register 拒绝 ⇒ spawn 失败（CC 同样拒绝）。</li>
+     *   <li>同名已被别的 agent 抢注（并发赛跑）⇒ 不覆盖，spawn 失败（先注册者保号）。</li>
+     * </ul>
+     *
+     * @return null = 已注册；非 null = 失败原因（调用方按 spawn 失败返回）
+     */
+    private String registerTeammateIdentity(String ownerSessionId, InProcessSpawnConfig config,
+                                            String agentId) {
+        if (agentNameRegistry == null) {
+            log.warn("[spawnInProcessTeammate] agentNameRegistry 未注入 ⇒ teammate {} 未注册（不可按名到达）",
+                agentId);
+            return null;
+        }
+        AgentNameRegistry.RegistrationOutcome outcome =
+            agentNameRegistry.registerIfAbsent(ownerSessionId, config.name(), agentId);
+        if (!outcome.registered()) {
+            return "Teammate name \"" + config.name() + "\" cannot be registered: "
+                + outcome.reservedReason();
+        }
+        log.info("[spawnInProcessTeammate] [B1] teammate 已注册: owner(lead)={} name='{}' agentId={}",
+            ownerSessionId, config.name(), agentId);
+        return null;
+    }
+
+    /**
+     * 写 teammate 的 meta sidecar（{@code <sessionDir>/<sessionId>/subagents/agent-<agentId>.meta.json}）。
+     *
+     * <p>写三键 + agentType：{@code taskKind="in_process_teammate"} / {@code name} / {@code teamName}
+     * （CC 仅有 taskKind 才判 teammate，偏移 356099285），agentType 供重拉还原 agent 定义。
+     *
+     * <p>失败策略：会话目录不可解析或写失败 → WARN 但<b>不阻断 spawn</b>（对齐 CC 的 sidecar 是
+     * 附带证据；缺失时 SendMessage 按「meta 不存在」分档，而不是 spawn 失败）。
+     */
+    private void writeTeammateMeta(String ownerSessionId, InProcessSpawnConfig config, String agentId) {
+        Path sessionDir = resolveSessionDirSafe(ownerSessionId);
+        if (sessionDir == null) {
+            log.warn("[spawnInProcessTeammate] [B1] 会话目录不可解析 ⇒ 未写 meta sidecar agent={} "
+                + "session={}（重拉将按「无 transcript」分档）", agentId, ownerSessionId);
+            return;
+        }
+        // 真实会话目录（{slug}/{sessionId}）不存在 ⇒ 不是本机已知会话，别在用户目录外乱建文件
+        // （对齐 AgentNameRegistry.persistNotice 的同款安全阀；单测直构/未知会话走这条）。
+        if (!java.nio.file.Files.isDirectory(sessionDir.resolve(ownerSessionId))) {
+            log.warn("[spawnInProcessTeammate] [B1] 会话目录不存在 ⇒ 未写 meta sidecar agent={} "
+                + "session={}（不凭空建目录）", agentId, ownerSessionId);
+            return;
+        }
+        try {
+            AgentTranscript.writeMetaExtras(sessionDir, ownerSessionId, agentId,
+                new AgentTranscript.MetaExtras(config.agentType(), "in_process_teammate",
+                    config.name(), config.teamName()));
+            log.info("[spawnInProcessTeammate] [B1] 已写 meta sidecar: agentId={} taskKind=in_process_teammate "
+                + "name={} team={}", agentId, config.name(), config.teamName());
+        } catch (Exception e) {
+            log.warn("[spawnInProcessTeammate] [B1] 写 meta sidecar 失败 agent={}: {}",
+                agentId, e.toString());
+        }
+    }
+
+    /** 会话目录解析 · 解析器抛错 → null（不阻断 spawn）。 */
+    private Path resolveSessionDirSafe(String sessionId) {
+        try {
+            Function<String, Path> resolver = sessionDirResolver;
+            return resolver != null ? resolver.apply(sessionId) : null;
+        } catch (Exception e) {
+            log.debug("[spawnInProcessTeammate] 解析会话目录失败 session={}: {}", sessionId, e.toString());
+            return null;
+        }
     }
 
     // ════════════════════════════════════════════════════════════════════

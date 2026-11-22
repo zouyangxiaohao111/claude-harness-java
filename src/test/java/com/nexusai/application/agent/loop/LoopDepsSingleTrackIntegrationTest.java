@@ -118,7 +118,7 @@ class LoopDepsSingleTrackIntegrationTest {
         state.appendMessage(userMessage("question"));
 
         // 无工具 → buildStreamingExecutor 返回 null，纯文本路径
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8));
 
         AtomicInteger callModelInvoked = new AtomicInteger(0);
         AtomicInteger uuidInvoked = new AtomicInteger(0);

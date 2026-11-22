@@ -297,7 +297,7 @@ class LlmAgentLoopAutoCompactAbortTest {
         return QueryParams.forLoop(
             state.rawMessages(), null,
             // 会话 id 与 state.sessionId() 同源（生产 buildBaseToolUseContext 即取 state.sessionId()）
-            ToolUseContext.of(UUID.randomUUID(), state.sessionId(), PermissionMode.DEFAULT,
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), state.sessionId(), PermissionMode.DEFAULT,
                 List.of(), "", abortController),
             QuerySource.USER, COMPACT_MODEL, null,
             null, null, null, null,

@@ -79,7 +79,7 @@ class ReadPermissionCheckerInternalPathTest {
     }
 
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }
@@ -108,7 +108,7 @@ class ReadPermissionCheckerInternalPathTest {
     @Test
     @DisplayName("[E2] session-memory 文件读 → 静默 Allow（真实介质形状，CC filesystem.ts:1620-1629）")
     void sessionMemory_read_allow() {
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), emptyRulesCtx(), PermissionMode.DEFAULT,
             Map.of(), false, "", cwdDir());
         // [批 E2] 夹具改为**真实介质形状**（SessionMemoryService.resolvePath:2272-2283）：
@@ -138,7 +138,7 @@ class ReadPermissionCheckerInternalPathTest {
         // 本类经 setConfigHomeDirOverride 隔离到 CONFIG_DIR）；读分支 auto-allow。
         Path configHomeDir = Paths.get(CONFIG_DIR).toAbsolutePath();
         // 用任意 sessionId 构造 plan 路径；checker 的 env 用 ctx.sessionId()，故此处须用同一 sessionId。
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), emptyRulesCtx(), PermissionMode.DEFAULT,
             Map.of(), false, "", cwdDir());
         // [对齐 CC plans.ts] 词对 slug：路径由与生产同一工具派生，而不是 {sessionId}.md
@@ -163,7 +163,7 @@ class ReadPermissionCheckerInternalPathTest {
     @DisplayName("tool-results 文件读 → 静默 Allow（CC filesystem.ts:1656-1674）")
     void toolResults_read_allow() {
         Path cwd = cwdDir();
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), emptyRulesCtx(), PermissionMode.DEFAULT,
             Map.of(), false, "", cwd);
         // Java 真实介质 = {nexusaiConfigHomeDir}/projects/{sanitizePath(effectiveCwd)}/{sessionId}/tool-results

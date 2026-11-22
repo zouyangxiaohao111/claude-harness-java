@@ -70,7 +70,7 @@ class StreamingToolExecutorNoThreadLocalIdentityTest {
     }
 
     private static ToolUseContext tucWithIdentity(TeammateIdentity identity) {
-        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-stream-id",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-stream-id",
                 com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
             .withTeammateIdentity(identity);
     }

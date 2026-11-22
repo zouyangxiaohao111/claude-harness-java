@@ -159,7 +159,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
         loop.setContextFactory(ctxFactory);
 
         String sid = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID subAgentId = UUID.randomUUID();   // agentId != sessionId → 真 subagent
+        String subAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();   // agentId != sessionId → 真 subagent
         AgentState state = loop.run(RunRequest.session("sub-prompt", sid, subAgentId,
             com.nexusai.infra.llm.ProviderConfig.empty(), "test-model", null, null));
 
@@ -350,7 +350,7 @@ class LlmAgentLoopUnifiedQueuePromptTest {
             NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,
             null, null, true, null, true,
             new NotificationQueue.MessageOrigin("channel", "slack")));
-        // cron 触发 prompt（TestJob.enqueueLead :292-294 同型 6-arg + WORKLOAD_CRON；priority 用 NEXT
+        // cron 触发 prompt（AgentJob.enqueueLead :292-294 同型 6-arg + WORKLOAD_CRON；priority 用 NEXT
         // 保证单 turn 即 drain —— 优先级仲裁已由 drainForQuery 覆盖，本测试只断言前缀隔离）
         queue.enqueue(new NotificationQueue.QueueItem(
             "cron-triggered-prompt", NotificationQueue.MODE_PROMPT, NotificationQueue.Priority.NEXT,

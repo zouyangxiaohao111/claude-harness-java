@@ -17,6 +17,22 @@ import org.slf4j.LoggerFactory;
  *            best-effort: 任何失败 (no token / bridge off / 网络 / 4xx) → debug log + return undefined.
  *            本地渲染仍可用 {path, size, isImage}.
  *
+ * <p><b>[NEXUSAI 2026-11-18] 这条通道的来历与去留（用户裁定）</b>：
+ * <ul>
+ *   <li><b>它上传到的是「模型服务商」</b>（{@code DB provider.baseUrl} + {@code /api/oauth/file_upload}，
+ *       默认即 Anthropic），目的只有一个：让 <b>claude.ai 网页端</b>能预览附件。
+ *       这是 CC 的场景 —— CLI 跑在本地，用户在网页看会话。</li>
+ *   <li><b>我们当前用不上</b>：客户端是本地 App（Tauri / 浏览器），与文件**同机**，
+ *       直接读 {@code path} 就能渲染；且 {@code nexusai.brief.bridge-mode} 默认 false，
+ *       连 {@code file_uuid} 都不会生成。</li>
+ *   <li><b>后期计划（用户 2026-11-18 明确）</b>：把它换成**我们自己的文件服务器**，
+ *       让**手机端**（跨设备）也能看到附件 —— 届时只需把 {@code baseUrl} 指向自有端点，
+ *       {@code file_uuid} 的语义保留不变。</li>
+ *   <li>⛔ 在换成自有文件服务器之前<b>不要删除</b>：它仍是「远程预览附件」的唯一实现。</li>
+ * </ul>
+ * <p>真正的「发到 IM 平台」是另一条链（{@code ImMediaUploader} → 平台 media upload），
+ * 与本类无关，不要混用。
+ *
  * <p>L2 契约 (5 Release Gate):
  * <ul>
  *   <li><b>A1</b>: uploadBriefAttachment(path, size, ctx) → Optional&lt;String&gt;;

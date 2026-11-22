@@ -29,7 +29,7 @@ import java.util.function.Predicate;
  *
  * <p>实现对齐 CC {@code commandQueue: QueuedCommand[]}（Array + splice）：同优先级内先进先出
  * （FIFO），非 {@link java.util.concurrent.PriorityBlockingQueue} 堆序。Java 多生产者
- * （TestJob / BackgroundTaskRunner / CommandHookExecutor）+ 多消费者（LlmAgentLoop drain /
+ * （AgentJob / BackgroundTaskRunner / CommandHookExecutor）+ 多消费者（LlmAgentLoop drain /
  * CronIdleExecutor poll）→ 全部操作 synchronized 保证 FIFO 与分区语义（CC 模块级单线程）。
  *
  * <p>优先级 (CC messageQueueManager.ts:151-155 PRIORITY_ORDER)：now(0) &gt; next(1) &gt; later(2)。
@@ -74,7 +74,7 @@ public class NotificationQueue {
      * <p><b>本仓 mode 取值域</b>：全部 {@code QueueItem} 构造点（8 处生产调用）只传
      * {@link #MODE_PROMPT} / {@link #MODE_TASK_NOTIFICATION} 两个字面量（{@code MODE_PROMPT}：
      * LlmAgentLoop:3539 用户 prompt / ChatService:320 busy-queued /
-     * ChannelNotification:154 channel / CronIdleExecutor:235 missed 通知 / TestJob:373 cron 命令；
+     * ChannelNotification:154 channel / CronIdleExecutor:235 missed 通知 / AgentJob:373 cron 命令；
      * {@code MODE_TASK_NOTIFICATION}：BackgroundTaskRunner / RemoteAgentTaskService /
      * MainSessionBackgroundService / MonitorMcpTaskRunner / WorkflowNotifications / CommandHookExecutor）。
      * 故本判据在当前取值域下等价于 {@code mode == MODE_PROMPT}，但按 CC 写成「非 task-notification」
@@ -93,7 +93,7 @@ public class NotificationQueue {
      * （utils/messageQueueManager.ts:359-361）。
      *
      * <p><b>WHY 必须与 {@code mode} 判据同时判 {@code isMeta}</b>：本仓 {@code mode='prompt'} 而
-     * {@code isMeta=true} 的项有三处 —— cron 命令（{@code TestJob:373}，{@code workload='cron'}）、
+     * {@code isMeta=true} 的项有三处 —— cron 命令（{@code AgentJob:373}，{@code workload='cron'}）、
      * cron missed 启动通知（{@code CronIdleExecutor:235}）、外部 channel 入站消息
      * （{@code ChannelNotification:154}，正文是 {@code <channel>} 原始 XML）。这些是<b>系统生成</b>的
      * 内容，不是用户在输入框里敲的字 —— 一旦把它们拼进用户输入框，用户就会「拉回」一段自己从未写过的
@@ -159,7 +159,7 @@ public class NotificationQueue {
      *                          DURABLE（创建会话已关也照常 fire），null = SESSION（必须会话存活）。
      *                          null = 无项目锚（SESSION 走 sessionId 恢复路径 / DURABLE 无会话直建），
      *                          回落 user.dir。
-     * @param scheduleId        保留透传调度 id（TestJob.execute JobDataMap:99 取到 → enqueueLead 参数透传，
+     * @param scheduleId        保留透传调度 id（AgentJob.execute JobDataMap:99 取到 → enqueueLead 参数透传，
      *                          SESSION scope 亦可携带但不使用）。原 cron-transcript 方案 a 用其派生
      *                          per-task 虚拟会话键，该机制已随 [cron-durable-session-fire] 删除（DURABLE
      *                          fire 归创建会话），本字段仅供日志归组/诊断。null = 无调度上下文
@@ -227,11 +227,75 @@ public class NotificationQueue {
          * 按序去重（同 buildUserMessageWithImages 收集规则）。仅 busy-queued 携；其余 workload 恒 null
          * = 无图片（前端「缺键 = 无图」，不伪造空数组）。
          */
-        @Nullable List<String> imagePasteIds
+        @Nullable List<String> imagePasteIds,
+        /**
+         * [V306] <b>定时任务通知目标</b>（聊天 id 数组的 <b>JSON 字符串</b>，如
+         * {@code ["imch-d1","imch-d2"]}）。
+         *
+         * <p><b>WHY 必须随队列项存活</b>：定时任务可以配通知目标（{@code schedules.notify_chats}，
+         * 存 {@code im_chat.id} 数组）。任务跑完后 agent 调 {@code SendUserMessage(status='proactive')}
+         * 就把消息推给这些聊天 ⇒ 消费线程（{@code CronIdleExecutor.runAgentLoop}）必须知道「本轮
+         * 该推给谁」。而通知目标<b>不能靠「按 sessionId 反查任务」拿到</b> —— B 形态（每次新建会话）
+         * <b>不回填</b> {@code session_id} ⇒ 反查恒空 ⇒ B 形态永远通知不到 ⇒ 只能显式下传。
+         *
+         * <p><b>形态</b>：JSON 数组字符串（不是 List）—— 队列项跨线程边界，字符串是不可变值，
+         * 与 {@code sessionId} / {@code boundProject} 同款；序列化在写入侧（{@code AgentJob.fire}）
+         * 做一次，消费侧只读不解析（⛔ 不在消费侧发明解析/投递实现）。
+         *
+         * <p>null / 空白 = 无通知目标（普通 prompt / busy-queued / task-notification 恒 null）。
+         */
+        @Nullable String notifyChats,
+        /**
+         * [sendmessage-cross-session · B] <b>跨会话投递信封</b>（第 16 组件 · 唯一 peer 项的判据）。
+         *
+         * <p>非 null 只可能来自服务端投递侧（{@code PeerRuntimeAdapter} 从 A 批 router 生成的信封），
+         * ⛔ 绝不从 HTTP 请求体 / 模型正文 / structuredOutput 自报恢复。
+         *
+         * <p><b>两项不变量</b>：
+         * <ul>
+         *   <li>peer 项 = {@code mode=prompt + workload="peer-message" + agentId=null + sessionId=目标}
+         *       ⇒ 既有 {@code drainForQuery} 归属过滤<b>不改</b>即可命中（本会话 turn 才捞得走）；</li>
+         *   <li>hold（待审批）绝不入本队列 —— 未 ACCEPT 的项不得占用候选位。</li>
+         * </ul>
+         *
+         * <p>消费点：运行中 {@code LlmAgentLoop.drainAndInjectQueued}（peer 分支投影
+         * queuedOrigin='peer' + isMeta + author/subtype/structuredOutput），空闲由
+         * {@code CronIdleExecutor} 按同一信封构造 {@code RunRequest.peerExecutionOrigin}。
+         * null = 非 peer 项（全部既有 workload）。
+         */
+        @Nullable com.nexusai.application.agent.messaging.PeerEnvelope peerEnvelope
     ) {
         /**
-         * 14-arg 兼容构造（imagePasteIds=null）— [busy 气泡附件胶囊] 既有 14 参 canonical 调用方零改动
-         * （仅 busy-queued 携图片 id；其余构造点留空 = 无图片）。
+         * 15-arg 兼容构造（peerEnvelope=null · notifyChats=null）— [sendmessage-cross-session · B] 既有 15 参
+         * canonical 调用方零改动（peer 项只由 {@code PeerRuntimeAdapter} 构造并显式携带信封）。
+         */
+        public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
+                         @Nullable String uuid, boolean isMeta, @Nullable String workload,
+                         boolean skipSlashCommands, @Nullable MessageOrigin origin,
+                         @Nullable String sessionId, @Nullable String boundProject,
+                         @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments,
+                         @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments,
+                         @Nullable List<String> imagePasteIds) {
+            this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
+                sessionId, boundProject, scheduleId, attachments, userAttachments, imagePasteIds, null, null);
+        }
+        /**
+         * 16-arg 兼容构造（peerEnvelope=null）— [V306] 既有 16 参 canonical 调用方零改动
+         * （notifyChats 为末位；peer 项只由 {@code PeerRuntimeAdapter} 走 17 参 canonical 显式携带信封）。
+         */
+        public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
+                         @Nullable String uuid, boolean isMeta, @Nullable String workload,
+                         boolean skipSlashCommands, @Nullable MessageOrigin origin,
+                         @Nullable String sessionId, @Nullable String boundProject,
+                         @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments,
+                         @Nullable List<ChatMessageDto.UserAttachmentInfo> userAttachments,
+                         @Nullable List<String> imagePasteIds, @Nullable String notifyChats) {
+            this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
+                sessionId, boundProject, scheduleId, attachments, userAttachments, imagePasteIds, notifyChats, null);
+        }
+        /**
+         * 14-arg 兼容构造（imagePasteIds=null · notifyChats=null · peerEnvelope=null）— [busy 气泡附件胶囊]
+         * 既有 14 参 canonical 调用方零改动（仅 busy-queued 携图片 id；其余构造点留空 = 无图片）。
          */
         public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
                          @Nullable String uuid, boolean isMeta, @Nullable String workload,
@@ -245,6 +309,7 @@ public class NotificationQueue {
         /**
          * 13-arg 兼容构造（userAttachments=null）— [busy 附件快照] 既有 13 参 canonical 调用方零改动
          * （仅 busy-queued 携快照；其余构造点留空 = 无附件快照）。
+         * [V306] imagePasteIds / notifyChats 缺省 = null。
          */
         public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
                          @Nullable String uuid, boolean isMeta, @Nullable String workload,
@@ -252,7 +317,7 @@ public class NotificationQueue {
                          @Nullable String sessionId, @Nullable String boundProject,
                          @Nullable String scheduleId, @Nullable List<AttachmentRequest> attachments) {
             this(value, mode, priority, agentId, uuid, isMeta, workload, skipSlashCommands, origin,
-                sessionId, boundProject, scheduleId, attachments, null, null);
+                sessionId, boundProject, scheduleId, attachments, null);
         }
         /**
          * 12-arg 兼容构造（attachments=null）— [OD-D5] 既有 canonical 调用方零改动
@@ -268,7 +333,7 @@ public class NotificationQueue {
         }
         /**
          * 11-arg 兼容构造（origin + sessionId + boundProject，scheduleId=null）— cron-transcript
-         * 保留旧 canonical 签名（scheduleId 后置 null），使既有 11 参调用（TestJob fire 路径 / 测试）
+         * 保留旧 canonical 签名（scheduleId 后置 null），使既有 11 参调用（AgentJob fire 路径 / 测试）
          * 零改动。
          */
         public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
@@ -281,7 +346,7 @@ public class NotificationQueue {
 
         /**
          * 10-arg 兼容构造（origin 携带方 + sessionId 后置）— CRON-D5 保留旧 canonical 签名
-         * （boundProject=null 后置），使既有 10 参调用零改动（不属批次X 写集；仅 TestJob fire
+         * （boundProject=null 后置），使既有 10 参调用零改动（不属批次X 写集；仅 AgentJob fire
          * 路径显式传 boundProject）。
          */
         public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
@@ -324,7 +389,7 @@ public class NotificationQueue {
             this(value, mode, priority, agentId, null, false, null, false, null, null, null, null);
         }
 
-        /** 6-arg 兼容构造（TestJob fire 入队 / CronIdleExecutorTest）— uuid 默认 null, skipSlashCommands=false */
+        /** 6-arg 兼容构造（AgentJob fire 入队 / CronIdleExecutorTest）— uuid 默认 null, skipSlashCommands=false */
         public QueueItem(String value, String mode, @Nullable Priority priority, @Nullable String agentId,
                          boolean isMeta, @Nullable String workload) {
             this(value, mode, priority, agentId, null, isMeta, workload, false, null, null, null, null);
@@ -405,6 +470,59 @@ public class NotificationQueue {
     }
 
     /**
+     * 该会话当前排队的 <b>peer 项</b>数（{@code peerEnvelope != null}）。
+     *
+     * <p>对齐 CC 2.1.328 收件队列上限口径（{@code claude.exe} 偏移 325455000）：
+     * <pre>
+     * qs=!ya&amp;&amp;!ol&amp;&amp;ds()&gt;=ede().maxQueuedPeerMessages;   // ds() = 已排队 peer 项计数
+     * </pre>
+     * 判据 = 「接收会话当前排队 peer 项数 ≥ 50 ⇒ 拒新、不淘汰旧」。
+     *
+     * @param sessionId 目标会话（null = 只统计 sessionId 为 null 的项）
+     * @return 计数（无 peer 项 → 0）
+     */
+    public synchronized int countPeerQueued(@Nullable String sessionId) {
+        int count = 0;
+        for (QueueItem item : queue) {
+            if (item.peerEnvelope() == null) {
+                continue;
+            }
+            if (sessionId == null ? item.sessionId() == null : sessionId.equals(item.sessionId())) {
+                count++;
+            }
+        }
+        return count;
+    }
+
+    /**
+     * 入队 peer 项（带收件队列上限，原子判定）· 对齐 CC {@code Es()} 的 queue-full 分支。
+     *
+     * <p><b>拒新、不淘汰旧</b>（CC 原文：溢出时新消息不入队，队列里既有项保持原样）。
+     * 检查与 {@link #queue} 追加在同一把锁内完成 ⇒ 并发入队不会越过上限。
+     *
+     * @param item              队列项（必须携带 peerEnvelope；否则拒绝）
+     * @param maxPeerPerSession 该会话最大排队 peer 项数（CC {@code maxQueuedPeerMessages:50}）
+     * @return true = 已入队；false = 已达上限被拒（调用方负责回执告知发送方 dropped）
+     */
+    public synchronized boolean enqueuePeer(QueueItem item, int maxPeerPerSession) {
+        if (item == null || item.peerEnvelope() == null) {
+            return false;
+        }
+        if (countPeerQueued(item.sessionId()) >= maxPeerPerSession) {
+            return false;
+        }
+        QueueItem normalized = normalizePriority(item, Priority.NEXT);
+        queue.add(normalized);
+        if (log.isDebugEnabled()) {
+            log.debug("NotificationQueue.enqueuePeer: sessionId={}, uuid={}, reason=peer",
+                normalized.sessionId(), normalized.uuid());
+        }
+        submitAudit(auditRecord("enqueue", normalized));
+        fireOnChange();
+        return true;
+    }
+
+    /**
      * 入队（后台通知，默认 LATER）— 对齐 CC enqueuePendingNotification (messageQueueManager.ts:142-149)。
      * 用户输入永不因系统消息饿死。
      */
@@ -437,10 +555,15 @@ public class NotificationQueue {
         //   否则忙时排队带图消息经 normalizePriority（priority 缺省补 NEXT）丢图（reflector MAJOR-2）。
         // [busy 附件快照/气泡图片] userAttachments + imagePasteIds 同样逐字段透传：重建丢弃它们 ⇒
         //   drain 落库 V63 快照与 queue.drained 气泡图片 id 双双丢失（与本方法上方 attachments 同一红线）。
+        // [V306] notifyChats 逐字段透传：重建丢弃它 ⇒ 定时任务的通知目标静默消失（priority==null 路径
+        //   必走本方法重建 ⇒ 漏传 = 定时任务通知永远拿不到目标，且无任何报错）。
+        // [sendmessage-cross-session · B] peerEnvelope 透传（与 attachments 同一红线）：peer 项入队时
+        //   priority 通常为 null（调用方不指定）⇒ 若重建丢弃信封，drain 看到的是普通 prompt：
+        //   既不会投影 queuedOrigin='peer'，也不会唤醒目标会话 —— 信封是 peer 语义的<b>唯一</b>载体。
         return new QueueItem(item.value(), item.mode(), fallback, item.agentId(),
             item.uuid(), item.isMeta(), item.workload(), item.skipSlashCommands(), item.origin(),
             item.sessionId(), item.boundProject(), item.scheduleId(), item.attachments(),
-            item.userAttachments(), item.imagePasteIds());
+            item.userAttachments(), item.imagePasteIds(), item.notifyChats(), item.peerEnvelope());
     }
 
     /** debug 日志用 origin 描述（channel → "channel:server"，null → "null"）。 */

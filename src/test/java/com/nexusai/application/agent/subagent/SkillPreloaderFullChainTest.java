@@ -64,7 +64,7 @@ class SkillPreloaderFullChainTest {
 
         SkillRegistry registry = new SkillRegistry(skillsRoot.toString());
         SkillPreloader preloader = new SkillPreloader(registry);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-abc");
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-abc");
 
         SkillPreloader.PreloadResult result = preloader.preload(List.of("my-skill"), "sess-abc", ctx);
 
@@ -93,7 +93,7 @@ class SkillPreloaderFullChainTest {
 
         SkillRegistry registry = new SkillRegistry(skillsRoot.toString());
         SkillPreloader preloader = new SkillPreloader(registry);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-x");
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x");
 
         SkillPreloader.PreloadResult result = preloader.preload(List.of("no-dir-skill"), "sess-x", ctx);
 
@@ -121,7 +121,7 @@ class SkillPreloaderFullChainTest {
         preloader.setPromptShellExecutor(shellExecutor);
         when(shellExecutor.executeShellCommandsInPrompt(anyString(), any(), anyString(), any(), anyList()))
             .thenReturn("INJECTED-OUTPUT");
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-abc");
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-abc");
 
         SkillPreloader.PreloadResult result = preloader.preload(List.of("sh-skill"), "sess-abc", ctx);
 
@@ -190,7 +190,7 @@ class SkillPreloaderFullChainTest {
 
         try {
             SkillPreloader preloader = new SkillPreloader(new SkillRegistry(skillsRoot.toString()));
-            ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-abc");
+            ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-abc");
 
             SkillPreloader.PreloadResult result = preloader.preload(List.of("bundle-skill"), "sess-abc", ctx);
 
@@ -217,7 +217,7 @@ class SkillPreloaderFullChainTest {
 
         try {
             SkillPreloader preloader = new SkillPreloader(new SkillRegistry(skillsRoot.toString()));
-            ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), "sess-x");
+            ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-x");
 
             SkillPreloader.PreloadResult result = preloader.preload(List.of("bundle-plain"), "sess-x", ctx);
 

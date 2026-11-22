@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool.impl;
 
 import com.nexusai.application.agent.coordinator.CoordinatorMode;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.AgentSummaryHandle;
 import com.nexusai.application.agent.subagent.AgentSummaryService;
 import com.nexusai.application.agent.subagent.ForkSubagent;
@@ -18,7 +19,6 @@ import org.junit.jupiter.api.io.TempDir;
 import java.lang.reflect.Field;
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
 
@@ -98,7 +98,7 @@ class SubagentSyncForegroundRegistrationTest {
             .isSameAs(runner);
 
         // ── Link B: registerSyncForeground 调 registerAgentForeground + 写回 summaryTaskId ──
-        UUID agentId = UUID.randomUUID();
+        String agentId = AgentContext.createAgentId();
         // [H1 修红] 第 5 参 createSessionId 必须显式非空：批 3b-D7 删除了 MDC/sysprop/"unknown"
         //   三源兜底 ⇒ BackgroundTaskRunner.taskOutputDir(null) **有意** fail-loud
         //   （「任务产物必须归属某个会话目录，不编造兜底值」，BackgroundTaskRunner:588-592）。
@@ -108,13 +108,13 @@ class SubagentSyncForegroundRegistrationTest {
             agentId, "研究项目结构", "prompt", "general-purpose", "session-1");
 
         assertThat(registered).isNotNull();
-        assertThat(registered.id()).isEqualTo(agentId.toString());
-        assertThat(framework.getTask(agentId.toString()))
+        assertThat(registered.id()).isEqualTo(agentId);
+        assertThat(framework.getTask(agentId))
             .as("前台任务必须落入统一 store（CC registerTask → state.tasks）")
             .isPresent();
         assertThat(reflectSummaryTaskId(executor))
             .as("registerSyncForeground 必须把 registered.id() 写回 summaryTaskId（CC AgentTool.tsx:843）")
-            .isEqualTo(agentId.toString());
+            .isEqualTo(agentId);
 
         // ── Link C: 非 null summaryTaskId + sdk=true → maybeStartSummary SYNC 门命中 ──
         ScheduledExecutorService scheduler = newScheduler();
@@ -123,9 +123,9 @@ class SubagentSyncForegroundRegistrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.SYNC, reflectSummaryTaskId(executor),
             svc, coordinator, true,
-            agentId.toString(), tmpDir, "session-1",
+            agentId, tmpDir, "session-1",
             new LlmProviderFactory(), ProviderConfig.empty(), "test-model",
-            null, null, null,
+            null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle)
@@ -152,7 +152,7 @@ class SubagentSyncForegroundRegistrationTest {
         tool.applySummaryWiring(executor, SubagentExecutor.SummarySpawnPath.SYNC);
 
         BackgroundTask registered = executor.registerSyncForeground(
-            UUID.randomUUID(), "desc", "prompt", "general-purpose", null);
+            AgentContext.createAgentId(), "desc", "prompt", "general-purpose", null);
 
         assertThat(registered).isNull();
         assertThat(reflectSummaryTaskId(executor)).isNull();
@@ -175,7 +175,7 @@ class SubagentSyncForegroundRegistrationTest {
         tool.applySummaryWiring(executor, SubagentExecutor.SummarySpawnPath.ASYNC);
 
         BackgroundTask registered = executor.registerSyncForeground(
-            UUID.randomUUID(), "desc", "prompt", "general-purpose", null);
+            AgentContext.createAgentId(), "desc", "prompt", "general-purpose", null);
 
         assertThat(registered).isNull();
         assertThat(reflectSummaryTaskId(executor)).isNull();

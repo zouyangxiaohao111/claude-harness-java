@@ -63,6 +63,9 @@ const FIXTURE: SessionToolDto[] = [
   t('mcp__rea__inspect_plist', 'MCP', false, '读取 plist', 'rea'),
   t('mcp__rea__list_names', 'MCP', true, '列出符号', 'rea'),
   t('mcp__other__do_thing', 'MCP', false, '其它工具', 'other'),
+  // IM：自建通讯工具（1 开 1 关 → 半开），独立成组不落进系统工具
+  t('SendImAsUser', 'IM', false, '以我本人名义发消息'),
+  t('ListImChats', 'IM', true, '列出 IM 会话'),
   // SYS：部分禁用（半开）
   t('Bash', 'SYS', false, 'Bash（终端）'),
   t('Read', 'SYS', true, '读取文件'),
@@ -100,17 +103,18 @@ afterEach(() => {
 })
 
 describe('SessionToolsPanel · 分类分组', () => {
-  it('5 类按 CU→KB→BR→MCP→SYS 顺序渲染，并显示 N 个 · M 个已启用', async () => {
+  it('6 类按 CU→KB→BR→MCP→IM→SYS 顺序渲染，并显示 N 个 · M 个已启用', async () => {
     await mount()
     const names = Array.from(container.querySelectorAll('.l1-name')).map((n) => n.textContent)
-    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', 'MCP 工具', '系统工具'])
+    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', 'MCP 工具', 'IM 工具', '系统工具'])
 
     const subs = Array.from(container.querySelectorAll('.l1-sub')).map((n) => n.textContent)
     expect(subs[0]).toBe('2 个 · 0 个已启用')   // CU 全部禁用
     expect(subs[1]).toBe('1 个 · 0 个已启用')   // KB 全部禁用
     expect(subs[2]).toBe('需安装 Chrome 扩展')  // BR 空组
     expect(subs[3]).toBe('3 个 · 2 个已启用')   // MCP 半开（third-party 工具不再混进系统工具）
-    expect(subs[4]).toBe('3 个 · 2 个已启用')   // SYS 半开
+    expect(subs[4]).toBe('2 个 · 1 个已启用')   // IM 半开（自建通讯工具独立成组）
+    expect(subs[5]).toBe('3 个 · 2 个已启用')   // SYS 半开
   })
 })
 
@@ -144,7 +148,7 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     await act(async () => { closeBtn.click() })
     expect(container.querySelector('.tools-panel')).toBeNull()
     // 一级目录仍在
-    expect(container.querySelectorAll('.l1-item').length).toBe(5)
+    expect(container.querySelectorAll('.l1-item').length).toBe(6)
   })
 
   it('切换到另一类后二级内容随之变化', async () => {
@@ -152,7 +156,7 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     const items = container.querySelectorAll('.l1-item')
     await act(async () => { (items[0] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('电脑操作')
-    await act(async () => { (items[4] as HTMLElement).click() })
+    await act(async () => { (items[5] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('系统工具')
   })
 })
@@ -173,7 +177,7 @@ describe('SessionToolsPanel · 分类开关', () => {
   it('半开组点开关 → 全部启用', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    const sw = items[4].querySelector('.tc-sw') as HTMLElement
+    const sw = items[5].querySelector('.tc-sw') as HTMLElement
     await act(async () => { sw.click() })
     await act(async () => { await Promise.resolve() })
     expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'SYS', true])
@@ -263,7 +267,7 @@ describe('SessionToolsPanel · 单工具开关（目标状态语义）', () => {
   it('⭐ 点「禁用」发 enabled=false、点「启用」发 enabled=true', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    await act(async () => { (items[4] as HTMLElement).click() })
+    await act(async () => { (items[5] as HTMLElement).click() })
 
     const rowOf = (name: string) =>
       Array.from(container.querySelectorAll('.tool-row'))
@@ -287,7 +291,7 @@ describe('SessionToolsPanel · 核心工具保护', () => {
   it('Agent 的禁用按钮是 disabled（后端会 400）', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    await act(async () => { (items[4] as HTMLElement).click() })
+    await act(async () => { (items[5] as HTMLElement).click() })
     const rows = Array.from(container.querySelectorAll('.tool-row'))
     const agentRow = rows.find((r) => r.querySelector('.tool-key')?.textContent === 'Agent')
     expect(agentRow, '应能找到 Agent 行').toBeTruthy()

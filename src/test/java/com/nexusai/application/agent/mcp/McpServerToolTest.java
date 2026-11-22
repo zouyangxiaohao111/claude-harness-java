@@ -222,7 +222,7 @@ class McpServerToolTest {
     void mapToToolResultBlockParam_isError_returnsNull() {
         // WHY: CC mapper 仅在成功路径被调（toolExecution.ts:1292-1295 位于 endToolExecutionSpan(success) 之后），
         // isError 时返回 null（调用方回退默认渲染器），不渲染失败数据为成功块
-        ToolResult<String> err = ToolResult.error("use-1", "MCP call failed");
+        ToolResult<?> err = ToolResult.error("use-1", "MCP call failed");
         assertTrue(LlmAgentLoop.isToolErrorData(err.data()), "前置: 该结果必须是 isError（IMP-C2 后 isError 由执行路径推导）");
         assertNull(tool(null, null, null).mapToToolResultBlockParam(err, "use-1", true));
     }

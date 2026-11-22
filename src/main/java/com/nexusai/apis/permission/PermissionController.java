@@ -1,6 +1,7 @@
 package com.nexusai.apis.permission;
 
 import com.nexusai.application.agent.mcp.ElicitationHandler;
+import com.nexusai.application.agent.messaging.PeerUiApprovalAuthority;
 import com.nexusai.application.agent.permission.BridgePermissionCallbacks;
 import com.nexusai.application.agent.permission.ChannelPermissionCallbacks;
 import com.nexusai.application.agent.permission.LeaderPermissionConfirmBridge;
@@ -86,6 +87,12 @@ public class PermissionController {
     private ChannelPermissionCallbacks channelCallbacks;
 
     /**
+     * [P0.1] 渠道适配器身份校验 · 未配置口令 ⇒ 所有 STOMP 渠道回执一律拒绝（fail-closed）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.agent.permission.ChannelAdapterAuth channelAdapterAuth;
+
+    /**
      * [IMP-SS-01] Elicitation form 弹窗响应处理器 · 对齐 CC elicitationHandler.ts:138-146
      * {@code respond(result)} 回调。注入 {@link ElicitationHandler} 完成 form 挂起 future；
      * required=false 容错（MCP 未装配/测试无 WebSocket bean 时不阻塞实例化）。
@@ -142,20 +149,59 @@ public class PermissionController {
         // [S16] 透传 updatedPermissions（用户批准的建议；原始 JSON 数组 → prompter 内解析）
         // [FIX-E askuser-answers] 透传 answers + annotations（AskUserQuestion 答案收集通道，
         //   对齐 CC AskUserQuestionPermissionRequest.tsx:398-407 submitAnswers → onAllow(updatedInput, ...)）
-        // [Batch2 C1] 先分流 leader inbox 权限请求（LeaderPermissionConfirmBridge 桥，requestId 空间 =
-        //   worker toolUseId）——命中则消费 entry 回调，不落 prompter 的 pending map（requestId 空间与
-        //   主 loop 的 ToolUseBlock.id 不同，无碰撞）
-        if (leaderConfirmBridge != null && leaderConfirmBridge.onResponse(
-                event.getRequestId(), event.getDecision(), event.getUpdatedPermissions(),
-                event.getAcceptFeedback(), event.getContentBlocks(),
-                event.getAnswers(), event.getAnnotations())) {
+        // ── [C批 · 跨会话安全] 任何 pending.remove 之前先校验归属 / 来源归因 ──
+        //   审批主体 = 默认本地用户（userId 缺省 "default"）→ 正常 UI 响应可信；
+        //   ⛔ 但「可归因为 peer」的请求一律不消耗、不解除 pending：peer 消息不能充当用户批准。
+        //   错归属同样保留 pending（拒绝这一个响应，不替攻击者完成取消动作）。
+        if (PeerUiApprovalAuthority.isPeerAttributed(
+                PeerUiApprovalAuthority.Source.STOMP_MESSAGE, sessionId, event.getRequestId())) {
+            log.warn("PERMISSION response: 请求可归因为 peer 来源 → 丢弃该响应且保留 pending "
+                + "sessionId={} requestId={} decision={}", sessionId, event.getRequestId(),
+                event.getDecision());
             return;
+        }
+        WebSocketPermissionPrompter.ResponseAdmission admission =
+            prompter.admitMessageResponse(sessionId, event.getRequestId());
+        if (admission == WebSocketPermissionPrompter.ResponseAdmission.WRONG_SESSION) {
+            log.warn("PERMISSION response: 会话归属不匹配，拒绝且保留 pending sessionId={} requestId={}",
+                sessionId, event.getRequestId());
+            return;
+        }
+        if (admission != WebSocketPermissionPrompter.ResponseAdmission.ACCEPT
+                && admission != WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST) {
+            // 默认 local-user 验证器下不会出现 UNTRUSTED_PEER_ORIGIN；若未来安装更严的验证器
+            // 使得该响应不可信，仍只丢弃「这一个响应」，⛔ 不 denyPending（不替攻击者取消合法待审批项）。
+            log.warn("PERMISSION response: 响应未通过可信 UI 准入 → 丢弃且保留 pending "
+                + "sessionId={} requestId={} admission={}", sessionId, event.getRequestId(), admission);
+            return;
+        }
+        log.info("PERMISSION response accepted: sessionId={} requestId={} user={} admission={}",
+            sessionId, event.getRequestId(), PeerUiApprovalAuthority.getUserId(), admission);
+        // 归属正确（ACCEPT）→ 直接交 prompter；未知 requestId（UNKNOWN）→ 先尝试 leader inbox 分流
+        //（leader 权限的 requestId 空间 = worker toolUseId，不落 prompter pending map）。
+        if (admission == WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST) {
+            if (leaderConfirmBridge != null) {
+                // [C批 · 修正] leader 分支自带 session 归属校验；UNKNOWN 只是「不在 prompter
+                //   pending map」的正常情况，**不得**因此回落成无归属校验的放行。
+                //   归属不符 → REJECTED_WRONG_SESSION（entry 保留），本 handler 直接返回，
+                //   不再继续下发到 prompter.onResponse。
+                LeaderPermissionConfirmBridge.ResponseResult leaderOutcome =
+                    leaderConfirmBridge.onResponse(sessionId, event.getRequestId(),
+                        event.getDecision(), event.getUpdatedPermissions(),
+                        event.getAcceptFeedback(), event.getContentBlocks(),
+                        event.getAnswers(), event.getAnnotations());
+                if (leaderOutcome != LeaderPermissionConfirmBridge.ResponseResult.NOT_FOUND) {
+                    return;
+                }
+            }
         }
         prompter.onResponse(event.getRequestId(), event.getDecision(),
             event.getUpdatedPermissions(),
             event.getAcceptFeedback(), event.getContentBlocks(),
             event.getAnswers(), event.getAnnotations(),
-            event.getUpdatedInput());
+            event.getUpdatedInput(),
+            // [V333 AFK] 倒计时超时提交：时长进 updatedInput，isByCountdown 只做归因日志
+            event.getAfkTimeoutMs(), event.getIsByCountdown());
     }
 
     /**
@@ -275,6 +321,28 @@ public class PermissionController {
                 + "ignoring event sessionId={} requestId={}", sessionId, event.getRequestId());
             return;
         }
+        // ── [C批 · 跨会话安全] resolve（remove pending）之前校验归属 / 来源归因 ──
+        if (PeerUiApprovalAuthority.isPeerAttributed(
+                PeerUiApprovalAuthority.Source.STOMP_BRIDGE, sessionId, event.getRequestId())) {
+            log.warn("BRIDGE response: 请求可归因为 peer 来源 → 丢弃该响应且保留 pending "
+                + "bridgeRequestId={} sessionId={}", event.getRequestId(), sessionId);
+            return;
+        }
+        WebSocketPermissionPrompter.ResponseAdmission admission =
+            prompter != null
+                ? prompter.admitBridgeResponse(sessionId, event.getRequestId())
+                : WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST;
+        if (admission == WebSocketPermissionPrompter.ResponseAdmission.WRONG_SESSION) {
+            log.warn("BRIDGE response: 会话归属不匹配，拒绝 bridgeRequestId={} sessionId={}",
+                event.getRequestId(), sessionId);
+            return;
+        }
+        if (admission != WebSocketPermissionPrompter.ResponseAdmission.ACCEPT
+                && admission != WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST) {
+            log.warn("BRIDGE response: 响应未通过可信 UI 准入 → 丢弃且保留 pending "
+                + "bridgeRequestId={} sessionId={} admission={}", event.getRequestId(), sessionId, admission);
+            return;
+        }
         // [S16] 远程表面批准的 updatedPermissions（原始 JSON 数组）→ prompter 转换器解析
         java.util.List<com.nexusai.application.agent.permission.PermissionUpdate> parsedUpdates =
             com.nexusai.application.agent.permission.WebSocketPermissionPrompter
@@ -310,6 +378,37 @@ public class PermissionController {
         if (channelCallbacks == null) {
             log.error("CHANNEL response: channelCallbacks is null (Spring DI failed), "
                 + "ignoring event sessionId={} requestId={}", sessionId, event.getRequestId());
+            return;
+        }
+        // ── [C批 · 跨会话安全] resolve（remove pending）之前校验归属 / 来源归因 ──
+        if (PeerUiApprovalAuthority.isPeerAttributed(
+                PeerUiApprovalAuthority.Source.STOMP_CHANNEL, sessionId, event.getRequestId())) {
+            log.warn("CHANNEL response: 请求可归因为 peer 来源 → 丢弃该响应且保留 pending "
+                + "channelRequestId={} sessionId={}", event.getRequestId(), sessionId);
+            return;
+        }
+        WebSocketPermissionPrompter.ResponseAdmission admission =
+            prompter != null
+                ? prompter.admitChannelResponse(sessionId, event.getRequestId())
+                : WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST;
+        if (admission == WebSocketPermissionPrompter.ResponseAdmission.WRONG_SESSION) {
+            log.warn("CHANNEL response: 会话归属不匹配，拒绝 channelRequestId={} sessionId={}",
+                event.getRequestId(), sessionId);
+            return;
+        }
+        if (admission != WebSocketPermissionPrompter.ResponseAdmission.ACCEPT
+                && admission != WebSocketPermissionPrompter.ResponseAdmission.UNKNOWN_REQUEST) {
+            log.warn("CHANNEL response: 响应未通过可信 UI 准入 → 丢弃且保留 pending "
+                + "channelRequestId={} sessionId={} admission={}", event.getRequestId(), sessionId, admission);
+            return;
+        }
+        // ── [P0.1] 身份校验：fromServer 是消息体里可伪造的字符串，不能当身份用 ──
+        //   回执必须带适配器共享口令（nexusai.mcp.channel-adapter-token）；未配置口令 ⇒ 全拒。
+        if (channelAdapterAuth == null || !channelAdapterAuth.verify(event.getAdapterToken())) {
+            log.warn("CHANNEL response rejected (untrusted adapter identity): terminal=rejected_untrusted_adapter "
+                    + "sessionId={} requestId={} behavior={} fromServer={} hasToken={}",
+                sessionId, event.getRequestId(), event.getBehavior(), event.getFromServer(),
+                event.getAdapterToken() != null);
             return;
         }
         boolean resolved = channelCallbacks.resolve(

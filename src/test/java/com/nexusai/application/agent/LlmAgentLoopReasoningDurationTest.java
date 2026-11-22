@@ -161,7 +161,7 @@ class LlmAgentLoopReasoningDurationTest {
             @Override public AgentLoopContext context() { return ctx; }
             @Override public boolean isMainLoop() { return true; }
         };
-        ToolUseContext baseTuc = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
+        ToolUseContext baseTuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8))
             .withAvailableTools(List.of(TestContexts.dummyTool("Bash")));
         com.nexusai.application.agent.loop.QueryParams callerParams0 = com.nexusai.application.agent.loop.QueryParams.forLoop(
                 state.rawMessages(), null, baseTuc,

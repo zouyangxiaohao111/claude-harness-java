@@ -1,0 +1,30 @@
+-- ===================================================================
+-- V331: messages.content_blocks（assistant 内容块顺序真源）
+--
+-- 背景（对齐 Claude Code transcript 结构）：
+--   CC 的 assistant 行是「一块一行 + 索引」——同一 message.id 跨 N 行落盘，
+--   每行只带 message.content 的**一个**块，另带 apiBlockIndex（= 该块在 API
+--   content 数组里的下标）；同 message.id 下的块按 apiBlockIndex 拼回完整顺序。
+--   块类型：text{text} / thinking{thinking,signature} / tool_use{id,name,input}。
+--   本仓此前只有 content 字符串 + tool_calls 子表 + reasoning，**顺序信息全丢**：
+--   「工具1 → 文本 → 工具2」这种中间夹文本的轮次，渲染只能按「先文本后工具」猜。
+--
+-- 本列语义（渲染与顺序的真源，⛔ 不是协议载荷）：
+--   · content_blocks = JSON 数组，元素形如
+--       {"type":"thinking","thinking":"...","signature":"...","apiBlockIndex":0}
+--       {"type":"text","text":"...","apiBlockIndex":1}
+--       {"type":"tool_use","id":"call_1","name":"Bash","input":"{...}","apiBlockIndex":2}
+--     元素按 apiBlockIndex 升序（写入侧按「到达顺序」追加，索引由写入侧连续分配）。
+--   · ⛔ 本列**不会**被塞进任何 provider 的请求体：Anthropic / OpenAI Chat /
+--     OpenAI Responses 的出站请求仍由各 provider 现有组装器从
+--     content / reasoning / toolCalls / toolCallId 生成（块顺序只服务渲染与顺序还原）。
+--   · content_blocks IS NULL = 历史行 / 非 assistant 行 / 未采集到块顺序 → 前端走旧渲染
+--     （与迁移前逐字一致，无回填、无双写）。
+--
+-- 为什么用可空 TEXT 而不是 NOT NULL：绝大多数行（user/tool/system）不写块；
+--   历史 assistant 行也无法回填出真实顺序（回填只能编造），故一律 NULL 保真。
+--
+-- 版本号说明：落盘时目录最大号 V330（真库已应用到 V329）。V331 为下一个空号。
+--   ⛔ 不修改任何历史迁移。
+-- ===================================================================
+ALTER TABLE messages ADD COLUMN content_blocks TEXT;

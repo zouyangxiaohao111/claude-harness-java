@@ -73,17 +73,15 @@ class SubagentDefaultRuntimeRealDbTest {
 
     /** 只带 subagentDefaultRuntime 的请求体（其余 72 个组件全 null）。 */
     private static SettingsDto dtoWithDefaultRuntime(String defaultRuntime) {
-        return new SettingsDto(
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, null,
-            null, null, null, null, null, null, null, defaultRuntime,
-            null, null, null);
+        // 用 JSON 构造（canonical 构造器参数已随设置项增长，手写极易错位）
+        try {
+            com.fasterxml.jackson.databind.node.ObjectNode node =
+                com.fasterxml.jackson.databind.node.JsonNodeFactory.instance.objectNode();
+            node.put("subagentDefaultRuntime", defaultRuntime);
+            return new com.fasterxml.jackson.databind.ObjectMapper().treeToValue(node, SettingsDto.class);
+        } catch (Exception e) {
+            throw new IllegalStateException(e);
+        }
     }
 
     @Test

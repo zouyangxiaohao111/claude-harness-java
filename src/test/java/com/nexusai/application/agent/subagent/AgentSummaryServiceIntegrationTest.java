@@ -94,6 +94,8 @@ class AgentSummaryServiceIntegrationTest {
      */
     private static final class CapturingProvider implements LlmProvider {
         volatile List<ChatMessageDto> lastHistory;
+        /** [agent-summary-providerType] 网关实际发给 provider 的 SDK 模型名（应已剥 provider 前缀）。 */
+        volatile String lastModelName;
         @Override public String type() { return "mock-capture"; }
         @Override public String chat(ProviderConfig config, String modelName,
                                      String systemPrompt, String userMessage) {
@@ -123,6 +125,7 @@ class AgentSummaryServiceIntegrationTest {
         @Override public String chatWithOptions(ProviderConfig config, String modelName,
                                                 String systemPrompt, String userMessage,
                                                 LlmProvider.ChatRequestOptions options) {
+            lastModelName = modelName;
             lastHistory = options != null ? options.history() : List.of();
             return "Reading runAgent.ts";
         }
@@ -213,6 +216,45 @@ class AgentSummaryServiceIntegrationTest {
         }
     }
 
+    /**
+     * [agent-summary-providerType] 记录网关按 providerType 选中的类型。
+     * 2026-11-20 根因：摘要旁路曾用单参 getProvider(config) + 网关 resolver=null ⇒ 恒 openai_sdk，
+     * anthropic 类型 provider 的摘要 100% 报 {@code InternalServerException: 550}。
+     */
+    private static final class TypeRecordingFactory extends LlmProviderFactory {
+        private final LlmProvider provider;
+        volatile String lastProviderType;
+        TypeRecordingFactory(LlmProvider provider) { this.provider = provider; }
+        @Override
+        public LlmProvider getProvider(ProviderConfig config) {
+            return provider;
+        }
+        @Override
+        public LlmProvider getProvider(ProviderConfig config, String providerType) {
+            lastProviderType = providerType;
+            return provider;
+        }
+    }
+
+    /** [agent-summary-providerType] 只读 stub：不复用 DB 链接，返回固定 (providerType, SDK 名)。 */
+    private static final class StubResolver extends com.nexusai.infra.llm.ModelConfigResolver {
+        private final String providerType;
+        private final String sdkModelName;
+        StubResolver(String providerType, String sdkModelName) {
+            this.providerType = providerType;
+            this.sdkModelName = sdkModelName;
+        }
+        @Override
+        public com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel resolve(String modelName) {
+            return new com.nexusai.infra.llm.ModelConfigResolver.ResolvedModel(
+                ProviderConfig.empty(), providerType, sdkModelName);
+        }
+        @Override
+        public String resolveSdkModelName(String modelName) {
+            return sdkModelName;
+        }
+    }
+
     @AfterEach
     void restoreDefaultForkGate() {
         // R31-03: maybeStartSummary 门读 ForkSubagent 静态门槽；测试污染门槽后还原默认 {true,false,false}
@@ -237,7 +279,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-1", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null,
+            ProviderConfig.empty(), "test-model", null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
@@ -263,7 +305,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-2", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null,
+            ProviderConfig.empty(), "test-model", null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNull();
@@ -289,7 +331,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.BACKGROUNDED, null,
             svc, coordinator, true, "agent-sdk", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null,
+            ProviderConfig.empty(), "test-model", null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
@@ -316,7 +358,7 @@ class AgentSummaryServiceIntegrationTest {
         AgentSummaryHandle handle = SubagentExecutor.maybeStartSummary(
             SubagentExecutor.SummarySpawnPath.ASYNC, null,
             svc, coordinator, false, "agent-fork", tmpDir, "session-1", factory(),
-            ProviderConfig.empty(), "test-model", null, null, null,
+            ProviderConfig.empty(), "test-model", null, null, null, null,
             null);   // [usage-gateway] 末参 = 账本注册表（测试不记账）
         try {
             assertThat(handle).isNotNull();
@@ -396,6 +438,32 @@ class AgentSummaryServiceIntegrationTest {
         assertThat(summary).isEqualTo("Reading runAgent.ts");
         assertThat(provider.lastHistory).extracting(ChatMessageDto::role)
             .containsExactly(Role.user, Role.assistant, Role.system);
+    }
+
+    @Test
+    void summarize_routesViaSharedResolver_providerTypeAndStrippedSdkModelName() {
+        // WHY（2026-11-20 550 事故）: 摘要旁路旧实现 = 单参 getProvider(config) + 网关 resolver=null
+        //   ⇒ 工厂按默认 openai_sdk 路由。会话 provider 为 anthropic（DeepSeek /anthropic）时，
+        //   OpenAI 格式请求打到 Anthropic 端点 ⇒ 每次摘要 InternalServerException: 550。
+        // 断言两件事：①网关按共享解析器给出的 providerType 选 provider（不再落默认）；
+        //            ②发给 SDK 的模型名已剥 provider 前缀（deepseek/deepseek-flash → deepseek-flash）。
+        CapturingProvider provider = new CapturingProvider();
+        TypeRecordingFactory factory = new TypeRecordingFactory(provider);
+        SummarySummarizerImpl summarizer = new SummarySummarizerImpl(
+            tmpDir, "session-1", factory, ProviderConfig.empty(), "deepseek/deepseek-flash");
+        summarizer.setModelConfigResolver(new StubResolver("anthropic", "deepseek-flash"));
+        List<AgentMessage> clean = List.of(
+            AgentMessage.of("user", "first prompt"),
+            AgentMessage.of("assistant", "working on runAgent.ts"),
+            AgentMessage.of("system", "system instruction"));
+        String summary = summarizer.summarize("agent-x", "prompt", clean, null, null);
+        assertThat(summary).isEqualTo("Reading runAgent.ts");
+        assertThat(factory.lastProviderType)
+            .as("摘要旁路必须按模型解析出的 providerType 路由（否则 anthropic provider 恒 550）")
+            .isEqualTo("anthropic");
+        assertThat(provider.lastModelName)
+            .as("发给 SDK 的模型名必须已剥 provider 前缀")
+            .isEqualTo("deepseek-flash");
     }
 
     @Test

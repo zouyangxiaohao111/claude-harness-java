@@ -71,7 +71,7 @@ class LlmAgentLoopToolsArrayDenyTest {
     /** 10 参构造器 per-turn TUC：availableTools + permissionContext（对齐生产 perTurnTuc 形态）。 */
     private ToolUseContext tuc(List<Tool> availableTools, ToolPermissionContext permCtx) {
         return new ToolUseContext(
-                UUID.randomUUID(),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
                 "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT,
                 Map.of(),

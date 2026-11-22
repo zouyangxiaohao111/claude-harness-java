@@ -13,7 +13,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -36,7 +35,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("[B-2] SubagentExecutor shouldAvoidPermissionPrompts 落地")
 class SubagentExecutorShouldAvoidPromptsTest {
 
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000b1");
+    private static final String AGENT_ID = "a00000000000000b1";
     private static final String SESSION_ID = "00000000-0000-0000-0000-0000000000b2";
 
     // ─────────────────────── 公式 (CC runAgent.ts:440-451 降级) ───────────────────────
@@ -83,7 +82,8 @@ class SubagentExecutorShouldAvoidPromptsTest {
         // WHY: 旧便捷重载（已删除）硬编码 false — 即使 SubagentExecutor 把 flag 写入 base TUC,
         //   每轮重建也会覆盖回 false. 5 参重载是 per-turn 保真的唯一来源.
         PermissionContextBuilder builder = new PermissionContextBuilder();
-        AgentState state = new AgentState("sys", SESSION_ID, AGENT_ID);
+        AgentState state = new AgentState("sys", SESSION_ID,
+            AGENT_ID);
 
         ToolPermissionContext withFlag = builder.buildPermissionContext(state, false, PermissionMode.DEFAULT, true, true);
         assertThat(withFlag.shouldAvoidPermissionPrompts())
@@ -115,7 +115,8 @@ class SubagentExecutorShouldAvoidPromptsTest {
 
         AgentLoopContext ctx = ctxWithPermissionContextBuilder(new PermissionContextBuilder());
         ToolUseContext perTurn = AgentLoopContext.toolExecContext(
-            ctx, baseTuc, new AgentState("sys", SESSION_ID, AGENT_ID), Map.of());
+            ctx, baseTuc, new AgentState("sys", SESSION_ID,
+            AGENT_ID), Map.of());
 
         assertThat(perTurn.permissionContext()).isNotNull();
         assertThat(perTurn.permissionContext().shouldAvoidPermissionPrompts())
@@ -137,7 +138,8 @@ class SubagentExecutorShouldAvoidPromptsTest {
 
         AgentLoopContext ctx = ctxWithPermissionContextBuilder(new PermissionContextBuilder());
         ToolUseContext perTurn = AgentLoopContext.toolExecContext(
-            ctx, baseTuc, new AgentState("sys", SESSION_ID, AGENT_ID), Map.of());
+            ctx, baseTuc, new AgentState("sys", SESSION_ID,
+            AGENT_ID), Map.of());
 
         assertThat(perTurn.permissionContext()).isNotNull();
         assertThat(perTurn.permissionContext().shouldAvoidPermissionPrompts())

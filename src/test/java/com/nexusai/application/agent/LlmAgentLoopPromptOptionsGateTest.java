@@ -18,7 +18,6 @@ import java.lang.reflect.Method;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -126,7 +125,7 @@ class LlmAgentLoopPromptOptionsGateTest {
 
     private static ToolUseContext tucWithMcp(Map<String, McpClientRuntime> mcp) {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-f", PermissionMode.DEFAULT, Map.of(), List.of(), null,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-f", PermissionMode.DEFAULT, Map.of(), List.of(), null,
             AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT, mcp);
     }
 
@@ -240,10 +239,10 @@ class LlmAgentLoopPromptOptionsGateTest {
     }
 
     @Test
-    @DisplayName("合并: DB coordinator=1 已被忽略 + feature/env 关 → 返回原引用（不做 worker 包裹）")
-    void mergeCoordinator_dbGateIgnored_featureEnvOff_returnsOriginal() throws Exception {
-        // [2026-11-19] 全局 coordinator DB 层已移除：门只看 feature/env（此处双假）⇒ 不合并。
-        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> "1")); // isCoordinatorMode()=false
+    @DisplayName("合并: DB coordinator=1 已被忽略 + env 未设 → 返回原引用（不做 worker 包裹）")
+    void mergeCoordinator_dbGateIgnored_envOff_returnsOriginal() throws Exception {
+        // [2026-11-19 对齐 exe 2.1.328] 门只看 env；此处 env 未设 ⇒ 不合并（DB=1 仍被忽略）。
+        LlmAgentLoop.setCoordinatorMode(new CoordinatorMode(() -> false, () -> null)); // env 未设 → 不激活
         AgentLoopContext ctx = ctxWithResolver(resolverWith(null, null, true, false)); // DB=1（应被忽略）
         Map<String, String> base = new LinkedHashMap<>();
         base.put("claudeMd", "md-content");

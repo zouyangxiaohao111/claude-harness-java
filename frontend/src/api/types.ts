@@ -411,6 +411,21 @@ export type ScheduleKind = 'cron' | 'once' | 'interval'
  * ⚠️ 缺省值只管**新建**；存量行读侧以落库的 scope 列为权威，不因缺省值改动而变化。
  */
 export type ScheduleScope = 'DURABLE' | 'SESSION'
+
+/**
+ * 会话形态（A/B/C/D）· 缺省 `REUSE`（对齐后端 `SessionMode.parseOrDflt`）。
+ *
+ * <p>与 {@link ScheduleScope} **正交**：scope 讲「生命周期」，本枚举讲「执行时用哪个会话」。
+ * ⚠️ 不挂在 scope 上 —— 后端 `lookupScope` 遇未知值静默回落 DURABLE，`sweepSessionTasksAtStartup`
+ * 会删 SESSION 值的新形态任务。
+ *
+ * - `REUSE`（A）绑定已有会话：写进该会话，能读到它全部历史；会话被删 ⇒ 降级为 `NEW_EACH`
+ * - `NEW_EACH`（B）每次触发都新建：全新上下文，零历史，30 天后清理
+ * - `NEW_ONCE`（C）新建后绑定住：专属会话，长期累积，**任务删了才删**
+ * - `NONE`（D）不绑定会话：后台静默执行，不产生任何会话，仅留运行记录
+ */
+export type SessionMode = 'REUSE' | 'NEW_EACH' | 'NEW_ONCE' | 'NONE'
+
 export interface Schedule {
   id: string
   name: string
@@ -433,6 +448,59 @@ export interface Schedule {
   agentId?: string | null
   /** 任务的项目锚 · 仅 DURABLE 非 null（由后端按 sessionId 解析并覆盖请求体，客户端不可伪造）；SESSION 恒 null */
   boundProject?: string | null
+  /**
+   * 会话形态（A/B/C/D）· 缺省 `REUSE`（对齐后端 `SessionMode.parseOrDflt`：脏值回落 REUSE）。
+   * ⛔ 存量行（V306 之前创建的）恒为 REUSE ⇒ 列表上的归属胶囊按 A 显示。
+   */
+  sessionMode?: SessionMode | null
+  /** 通知目标 = **聊天 id**（`im_chat.id`）· 空 = 不通知（结果只在运行记录里看） */
+  notifyChats?: string[] | null
+  /** 冗余渠道 id（列表展示省一次 join）· 后端不依赖它做逻辑 */
+  notifyChannelIds?: string[] | null
+  /**
+   * V317 · 任务指定的「专家」（主线程 agent）· null/空 = 不指定。
+   *
+   * <p>⛔ 不是 `agentId`（那是 teammate 队友）。落点是**新建会话时**写进
+   * `sessions.main_thread_agent`（`LlmAgentLoop.buildEffectivePromptOptions` 据此替换系统提示词）。
+   *
+   * <p>⚠️ 只有 `NEW_EACH` / `NEW_ONCE` 形态能有值；`REUSE` / `NONE` 传非空会被后端 400 拒绝。
+   */
+  mainThreadAgent?: string | null
+}
+
+/** 运行记录状态 · `running` = 还在跑（或崩在收口前，供排查） */
+export type ScheduleRunStatus = 'running' | 'ok' | 'error' | 'cancelled'
+
+/**
+ * 定时任务的一次执行记录（V306 `schedule_runs` 表 · GET /api/v1/schedules/{id}/runs）。
+ *
+ * <p>与 `schedules.last_run_status` 不同：后者在**入队那一刻**就写了（假信号），
+ * 本表记录的是 run **真正结束**后的结果。
+ */
+export interface ScheduleRun {
+  id: string
+  scheduleId: string
+  /** 冗余存任务名 —— 任务删了也能看懂这条记录是什么 */
+  scheduleName: string
+  /** 本轮**实际**用的形态（降级后的值，不是创建时配置） */
+  sessionMode?: SessionMode | null
+  /** 触发来源：`quartz`（定时）| `manual`（REST runNow） */
+  triggerSource?: string | null
+  status: ScheduleRunStatus | string
+  startedAt: string | null
+  finishedAt: string | null
+  durationMs: number | null
+  /** 本轮实际用的会话 id · `NONE` 形态为空 */
+  sessionId: string | null
+  /** 本轮执行的 prompt */
+  prompt: string | null
+  /** 结果摘要（`AgentState.lastAssistant()` 截断） */
+  outputSummary: string | null
+  /** 失败原因 */
+  error: string | null
+  /** 每个通知目标的投递结果 · JSON 数组字符串（`[{chatId,chatName,platform,ok,error}]`）· null = 没配通知目标 */
+  notifyResultJson: string | null
+  createdAt?: string | null
 }
 export interface CreateScheduleRequest {
   name: string
@@ -456,6 +524,24 @@ export interface CreateScheduleRequest {
    * ⚠️ [cwd3 D6] **创建后不可变** —— update 请求带 scope/sessionId 会被后端 400 拒绝。
    */
   scope?: ScheduleScope
+  /**
+   * 会话形态（A/B/C/D）· 缺省 REUSE。
+   *
+   * <p>⚠️ **B/C/D 形态不需要 sessionId**（后端 `ScheduleService.create` 只对 REUSE 形态要求会话）
+   * ⇒ 无活动会话时也能建任务（设计稿 ⑩「不再置灰添加按钮」）。
+   */
+  sessionMode?: SessionMode
+  /** 通知目标聊天 id（`im_chat.id`）· 空 = 不通知 */
+  notifyChats?: string[]
+  /** 冗余渠道 id · 可空 */
+  notifyChannelIds?: string[]
+  /**
+   * V317 · 任务指定的「专家」（主线程 agent）· 可空 = 不指定。
+   *
+   * <p>⚠️ 只有 `NEW_EACH` / `NEW_ONCE` 能带非空值；`REUSE` / `NONE` 带非空 ⇒ 后端 400
+   * 「只有『每次触发都新建』/『新建后绑定住』的任务才能指定专家」。
+   */
+  mainThreadAgent?: string
 }
 export interface UpdateScheduleRequest extends Partial<CreateScheduleRequest> {}
 
@@ -508,7 +594,30 @@ export const PERMISSION_MODE_DESCRIPTIONS: Record<PermissionMode, string> = {
 }
 
 // ---- AppSettings（对齐后端 SettingsDto · GET/PUT /api/v1/settings）----
+/**
+ * [peer-message] 跨会话入站策略（后端 settings.cross_session_inbound 列，V321）。
+ *
+ * <ul>
+ *   <li>`auto` —— 按 mode-parity 自动判定（CC 默认；GET 返回该值表示列 NULL）；</li>
+ *   <li>`accept` —— 一律接收；</li>
+ *   <li>`hold` —— 挂起待用户批准（未批准不进入模型历史）；</li>
+ *   <li>`refuse` —— 一律拒绝。</li>
+ * </ul>
+ *
+ * ⚠️ 三态契约（方案 §7.1 P-C01/P-C02）：GET 的 null/`auto` 都显示为「自动」；PUT `auto` = 清列
+ * （落 NULL）；PUT **省略字段** = 保持现值。本类型只定义值域，写入语义归 E 批设置页/后端。
+ */
+export type CrossSessionInbound = 'auto' | 'accept' | 'hold' | 'refuse'
+
 /** 后端 SettingsDto · 用户全局设置（singleton，未配置字段为 null） */
+/**
+ * [V333 AFK] AskUserQuestion 超时档位 · 对齐 CC settings.askUserQuestionTimeout 的值域。
+ *
+ * <p>`never`（默认，等价用户说的"关"）= 卡片持久显示、不自动继续；`60s`/`5m`/`10m` =
+ * 卡片倒计时，到点只提交已作答项（未答不填默认值）。
+ */
+export type AskUserAfkTimeoutSetting = 'never' | '60s' | '5m' | '10m'
+
 export interface AppSettings {
   theme: 'light' | 'dark' | 'auto' | null        // 后端 Theme 枚举
   fontSize: 'small' | 'medium' | 'large' | null  // 后端 FontSize 枚举
@@ -549,7 +658,12 @@ export interface AppSettings {
   // 0.4.4 契约：WebSearch 工具配置（对齐后端 SettingsDto 字段名）
   /** WebSearch 搜索引擎（默认 anysearch） */
   websearchEngine?: string | null
-  /** WebSearch API key（空 → 内置默认兜底） */
+  /**
+   * WebSearch API key（空 → 内置默认兜底）。
+   *
+   * <p>⚠️ 读接口（GET/PUT /settings）只回**掩码**（如 `****abcd`，仅末四位），明文永不出后端。
+   * 非空即「已配置」；提交时传掩码会被后端当作「未修改」（掩码哨兵），清空须显式传空串。
+   */
   apiKey?: string | null
   /** WebSearch 代理（空 → 直连） */
   proxy?: string | null
@@ -563,9 +677,9 @@ export interface AppSettings {
   webfetchEngine?: string | null
   /** 市场管理员模式（默认关）· true 才在设置页显示「市场管理」；上架能力不受影响 */
   marketAdminEnabled?: boolean | null
-  /** 外部渠道（channel）总开关（settings.channels_enabled · 默认关）· true 才允许 MCP channel server
-   *  注册入站通知 handler（后端 ChannelNotificationGate 门序[2] 实时读）。
-   *  null/undefined = 未配置 → 回落后端 yml nexusai.mcp.channels-enabled（默认 false）。 */
+  /** 外部渠道（channel）能力门（settings.channels_enabled · V334 起默认开）· true 才允许 MCP channel
+   *  server 注册入站通知 handler（后端 ChannelNotificationGate 门序[2] 实时读）。
+   *  null/undefined = 未配置 → 默认开（DB 唯一权威；yml nexusai.mcp.channels-enabled 不再参与判定）。 */
   channelsEnabled?: boolean | null
   /** [V258] 目标 check-in 间隔（分钟）· 对齐 CC `CLAUDE_CODE_GOAL_CHECKIN_MINUTES`（默认 30）。
    *  /goal 目标因后台任务未归位而延迟评估时，每 N 分钟注入一次 check-in 提示（指数退避 ×2、最多 3 次）。
@@ -590,6 +704,23 @@ export interface AppSettings {
   subagentExternalEnabled?: boolean | null
   /** Agent Swarms 功能开关（设置页「环境配置」模块写 · 后端 TaskSystemConfig.isAgentSwarmsEnabled 读） */
   agentSwarmsEnabled?: boolean | null
+  /**
+   * [peer-message] 跨会话入站策略（V321 cross_session_inbound 列 · 设置页「权限与协作」段）。
+   *
+   * <p>三态语义：`null`/`undefined` = 未配置（GET 显示「自动」，后端 NULL 等价 auto）；
+   * PUT 省略字段 = 保持现值；PUT `'auto'` = 显式清除为 NULL。仅 D 批写 `types.ts`，E 批补 UI/后端。
+   */
+  crossSessionInbound?: CrossSessionInbound | null
+  /**
+   * [V333 AFK] AskUserQuestion 超时档位（V333 ask_user_afk_timeout 列 · 设置页「权限与协作」段）。
+   * `never`/null = 不自动继续（默认）；`60s`/`5m`/`10m` = 卡片倒计时，到点以「只提交已答」放行。
+   */
+  askUserAfkTimeout?: AskUserAfkTimeoutSetting | null
+  /**
+   * [V334] 权限中继门（settings.channels_permission_relay_enabled）。默认开。
+   * 两个门都开 ≠ 会推送；推送 = 两门开 + 本会话已绑定渠道 + 工具不要求用户交互（Ask 不走中继）。
+   */
+  channelsPermissionRelayEnabled?: boolean | null
   /** 协调者模式开关（设置页「环境配置」模块写 · 后端 PromptAlignSettingsResolver.coordinatorModeEnabled 读；未配置/null → 关闭） */
   coordinatorModeEnabled?: boolean | null
   /** 权限分类器模型全名（V45 列 classifier_model；留空 → 主循环模型，对齐 CC getClassifierModel 兜底 getMainLoopModel） */
@@ -854,6 +985,9 @@ export interface SessionDto {
   cacheHitRate?: number | null
   /** [V283] 左栏置顶标记 · true = 置顶（排在最前独立置顶区）；false/null = 未置顶 */
   pinned?: boolean | null
+  /** [V328 session-create] 派生来源会话 id · null = 用户自己建的普通会话；非空 = 由该会话经
+   *  SessionCreate 创建。仅用于左栏「派生」标记，⛔ 不作路由/权限判据。 */
+  derivedFromSessionId?: string | null
 }
 export type SessionGroup = 'current' | 'today' | 'yesterday' | 'week'
 
@@ -1406,14 +1540,14 @@ export interface TodoUpdateEvent {
 
 // ---- 会话工具（GET/PATCH /sessions/{id}/tools · 会话级临时禁用）----
 /** 工具分类（后端 SessionToolCategory.of 判定 · 前端只消费不推导） */
-export type SessionToolCategory = 'CU' | 'KB' | 'BR' | 'MCP' | 'SYS'
+export type SessionToolCategory = 'CU' | 'KB' | 'BR' | 'MCP' | 'IM' | 'SYS'
 /** 单个会话工具状态（对齐后端 SessionToolDto · 被禁工具仍在列表，disabled=true 供恢复） */
 export interface SessionToolDto {
   /** 工具名（如 Bash/Read/Agent · PATCH 路径段） */
   name: string
   /** 展示名（如「Bash（终端）」） */
   userFacingName: string
-  /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / MCP=第三方 MCP / SYS=系统工具 */
+  /** 分类：CU=电脑操作 / KB=知识库 / BR=浏览器控制 / MCP=第三方 MCP / IM=IM 工具 / SYS=系统工具 */
   category: SessionToolCategory
   /** 工具描述原文（后端不截断 · 前端按行数截断展示） */
   description: string
@@ -1445,6 +1579,34 @@ export interface ToolCallDto {
   isError: boolean | null
   /** 工具调用耗时（毫秒）· 后端 message.tool_result 事件携带 */
   durationMs?: number | null
+}
+/**
+ * [content-blocks] 一条 assistant 消息的**有序**内容块（对齐 CC transcript 的
+ * `message.content[]`：text / thinking / tool_use）。
+ *
+ * <p><b>WHY 需要它</b>：一轮里「文本 A → 工具 1/2 → 文本 B → 工具 3/4」的真实时序，
+ * 旧 DTO（`content` + `toolCalls` 两个平铺字段）结构上存不下 ⇒ 前端只能按固定模板
+ * 「思考→旁白→工具→正文」渲染，顺序丢失。
+ *
+ * <p>`tool_result` 不在这里：它在下一轮 user 行（CC 同款），前端靠 `tool_use.id` ↔
+ * `ChatMessageDto.toolCalls[].id` 关联已落库的结果。
+ *
+ * <p>老消息该字段缺省/null ⇒ 前端走旧 JSX 分支（⛔ 不为历史数据伪造块）。
+ */
+export interface ContentBlockDto {
+  type: 'text' | 'thinking' | 'tool_use'
+  /** type='text' */
+  text?: string | null
+  /** type='thinking'（原文；signature 是 Anthropic 多轮回传签名，前端不渲染） */
+  thinking?: string | null
+  signature?: string | null
+  /** type='tool_use' */
+  id?: string | null
+  name?: string | null
+  /** type='tool_use' 的入参（对象；已序列化时也可能是字符串） */
+  input?: unknown
+  /** 该块在模型 API content 数组里的下标（CC apiBlockIndex · 排序兜底/对账用） */
+  apiBlockIndex?: number | null
 }
 /** 压缩边界元数据（compact_boundary / microcompact_boundary 消息携带 · 后端透传）
  *
@@ -1491,6 +1653,197 @@ export interface CitationItem {
   chunk_index?: number | null
 }
 
+/**
+ * [peer-message] 跨会话通知来源（后端结构化输出 `structuredOutput.peer_source` 投影）。
+ *
+ * <p>来源：跨会话 SendMessage 在目标会话落库时写入的元数据（方案 §3.4）。字段是**他人数据**：
+ * 标题只按纯文本展示，不作路由/授权主键；同名标题必须用 `sourceSessionId` 区分。
+ *
+ * <p>全部可选：旧后端 / 非 peer 行不带该对象；读取侧必须容忍缺字段（规范化读法见
+ * `stores/messageTurns.ts` 的 `readPeerSource`，同时兼容 snake_case）。
+ */
+export interface PeerSourceInfo {
+  /** 服务端来源会话 id（稳定地址；展示同名区分用） */
+  sourceSessionId?: string | null
+  /** 来源会话标题快照（⚠️ 不可信数据：只按文本渲染） */
+  sourceTitle?: string | null
+  /** 发送方名称（CC envelope 的 from-name；后端当前多用 sourceTitle 承载，
+   *  读取侧仅在 sourceTitle 缺失时回落展示它） */
+  fromName?: string | null
+  /** 来源类型（后端 sourceKind：session / agent / subagent …；前端只做展示分组，不映射权限） */
+  sourceKind?: string | null
+  /** 源消息 id（跨会话发送的消息本体 id） */
+  messageId?: string | null
+  /** 来源 endpoint 代次（同一 session 重连后旧代次消息必须可辨） */
+  endpointGeneration?: string | number | null
+  /** 发送方 attest 的权限模式类（mode-parity 展示用，不继承为接收方模式） */
+  fromMode?: string | null
+  /** 可回信地址（CC envelope 的 from 属性） */
+  from?: string | null
+  /** 防循环链（每段一个地址；后端原始 Map 可能是数组或 "a>b>c" 字符串，
+   *  读取侧 `readPeerSource` 统一规整为数组后再交给 UI） */
+  hopChain?: string[] | null
+  /** 入站准入方式（服务端信封：`auto` / `approved`；null/缺失 = 未知，⛔ 不猜） */
+  admission?: string | null
+  /** 准入理由（`mode-match` / `self-sent` / `user-approved` / `explicit-accept`；可 null） */
+  admissionReason?: string | null
+  [key: string]: unknown
+}
+
+/**
+ * 后端统一返回体（CommonResult）· 2026-11-20 起所有给前端的 JSON 都包这一层。
+ *
+ * <p>成功 = `code === 0 && success === true`；业务失败仍是 HTTP 200，`success === false` +
+ * 数字码（423/404/403/500/900…），业务原因在 `data.status`。`msg` 是给用户看的中文文案。
+ * 读取侧判据见 `api/peerInboxOutcome.isCommonResult`（旧扁平体的 `code` 是字符串 ⇒ 不误判）。
+ */
+export interface CommonResultDto<T = unknown> {
+  code?: number | null
+  msg?: string | null
+  data?: T | null
+  success?: boolean | null
+}
+
+/**
+ * [peer-inbox] 待收件（held）项 · 与后端 `PeerInboxController.HeldView` 同形。
+ *
+ * <p>来源消息在入站策略为 HOLD 时只写入内存 HeldPeerStore（不入队、不唤醒、不进历史），
+ * 本端点让用户可见、可「接受一次」或「拒绝」。全部字段是**他人数据**：标题/摘要/正文
+ * 只能按纯文本节点渲染，⛔ 不执行 HTML、不作路由主键。
+ */
+export interface PeerHeldItemDto {
+  messageId: string
+  /** 目标会话（= 列表接口路径里的 id；服务端归属真源） */
+  targetSessionId?: string | null
+  /** 来源会话 id（同名标题靠它区分；展示时与标题同屏） */
+  fromSessionId?: string | null
+  /** 来源展示名（后端信封的 from-name；可作标题回落） */
+  fromName?: string | null
+  /** 来源会话标题快照（旧投影字段；缺失时前端回落到 fromName） */
+  fromSessionTitle?: string | null
+  /**
+   * 来源会话标题（**后端 `HeldView.sourceTitle` 的实际字段名**）。
+   *
+   * <p>⚠️ 后端 record 第十个分量就叫 `sourceTitle`（见 `PeerInboxController.toView`），
+   * 不是 `fromSessionTitle`。两个都认，否则标题恒为空 → 退回 fromName 冒充标题。
+   */
+  sourceTitle?: string | null
+  /** 可回信地址（CC envelope 的 from 属性） */
+  fromAddress?: string | null
+  /** 发送方 attest 的权限模式串（展示用，不继承） */
+  fromMode?: string | null
+  /** UI 摘要（可空；缺失时取正文首行） */
+  summary?: string | null
+  /** hold 原因（`PeerInboundPolicy.Reason` 名称：EXPLICIT_HOLD / MODE_MISMATCH / …） */
+  reason?: string | null
+  /** 进入 held 的时间（ISO-8601） */
+  heldAt?: string | null
+  /** 原文（纯文本；缺失/空 = 无正文可展示） */
+  body?: string | null
+  /**
+   * [peer-inbox-seen] 已读时刻（ISO-8601；null/缺失 = 未读）。
+   *
+   * <p>未读的唯一判据就是本字段为空：`pending && seenAt == null` 才计入角标、才提示音/自动打开。
+   * 已读项仍在列表里（还没处理），只是不再提醒。
+   */
+  seenAt?: string | null
+  /** 后端行状态（`pending` / `approved`；若后端透出终态 `rejected`/`declined` 则渲染已拒绝卡） */
+  status?: string | null
+  /** 来源类别（本批恒 'peer'；事件契约 `sourceKind` 透传，仅展示分组用，不作权限判据） */
+  sourceKind?: string | null
+  /** 入站准入方式（`auto` / `approved`；pending 行恒 null —— null 显示中性「准入未知」） */
+  admission?: string | null
+  /** 准入理由（`mode-match` / `self-sent` / `user-approved` / `explicit-accept`；可 null） */
+  admissionReason?: string | null
+  /** 正文总行数（后端 `HeldView.bodyLines`；缺失 = 不显示规模） */
+  bodyLines?: number | null
+  /** 正文总字数（后端 `HeldView.bodyChars`；缺失 = 不显示规模） */
+  bodyChars?: number | null
+}
+
+/**
+ * 已读上报 · `POST /sessions/{id}/peer-inbox/seen`。
+ *
+ * <p>新契约：`CommonResult<PeerInboxSeenResultDto>`（成功 `code:0`）；旧实现直接回 `{updated:n}`。
+ * 读取侧两种都认（`api/peerInbox.unwrapData`）。
+ */
+export interface PeerInboxSeenResultDto {
+  updated?: number | null
+}
+
+/**
+ * 批量拒绝回执载荷 · `POST /sessions/{id}/peer-inbox/reject-all`。
+ *
+ * <p>新契约：`CommonResult<PeerInboxRejectAllResultDto>`，成功 `code:0`、`data.status='REJECTED'`、
+ * `data.rejected=N`；业务失败 `success:false` + 数字码。旧实现是本结构直接当 body、`code` 为字符串。
+ */
+export interface PeerInboxRejectAllResultDto {
+  /** 业务码（**旧实现**字符串码）：成功恒 `REJECTED`；新契约看 `status`/数字码 */
+  code?: string | null
+  /** 行状态（新契约 `data.status`；批量拒绝成功 = `REJECTED`） */
+  status?: string | null
+  /** 服务端文案（可选） */
+  message?: string | null
+  rejected?: number | null
+}
+
+/**
+ * [peer-inbox-realtime] `peer.inbox.hold` 事件载荷（STOMP `/topic/sessions/{sid}/peer-inbox`）。
+ *
+ * <p>⚠️ <b>载荷是扁平的</b>（后端直接序列化 `PeerInboxHoldEvent`）：`messageId/targetSessionId/
+ * sourceSessionId/sourceTitle/createdAt…` 全在顶层，**没有 `item` 包装**。`item` 只是旧形态回落。
+ * 字段名有两套（设计稿 `fromSessionId/fromName/heldAt`，实施契约
+ * `sourceSessionId/sourceTitle/sourceKind/receivedAt/createdAt`）⇒ 读取侧必须两种都认，
+ * 归一化在 `stores/peerInboxStore.normalizeHoldEventItem`，⛔ 不要在任何调用方各写一套。
+ * 计数（pendingCount/unreadCount）只是参考，前端以合并后本地列表重算为准。
+ */
+export interface PeerInboxHoldEvent extends StreamEventBase {
+  type: 'peer.inbox.hold'
+  /** 目标会话（= topic 里的 sid；与 store.sessionId 不一致一律丢弃） */
+  sessionId?: string | null
+  /** 后端契约（扁平载荷）：held 行的 messageId */
+  messageId?: string | null
+  targetSessionId?: string | null
+  sourceSessionId?: string | null
+  sourceTitle?: string | null
+  sourceKind?: string | null
+  fromMode?: string | null
+  summary?: string | null
+  body?: string | null
+  reason?: string | null
+  status?: string | null
+  /** 进入 held 的时间（后端事件用 `createdAt`，列表接口用 `heldAt`） */
+  createdAt?: string | null
+  seenAt?: string | null
+  /** 旧形态回落：服务端曾把上述字段包一层 item（现网不是这种形状） */
+  item?: Record<string, unknown> | null
+  pendingCount?: number | null
+  unreadCount?: number | null
+}
+
+/** 接受/拒绝回执载荷 · 与后端 `PeerInboxController.HeldActionResult` 同形（新契约放在 `data` 里）。
+ *
+ *  <p>新契约：`CommonResult<PeerHeldActionResultDto>`，成功 `code:0 && success:true`
+ *  （拒绝成功 `data.status='REJECTED'`，接受成功 `data.status='ACCEPTED'`）；业务失败仍是 HTTP 200：
+ *  `success:false` + 数字码 423/404/403/500/900，真实原因在 `data.status`
+ *  （`HELD` / `NO_LIVE_SESSION` / `NOT_FOUND` / `REFUSED` / `NOT_DELIVERED` / `APPROVAL_REJECTED`）。
+ *
+ *  <p>灰度兼容：后端未更新时仍是扁平体，`code` 为**字符串**（`ACCEPTED/REJECTED/…`），
+ *  缺失时回落同义 `status`（见 `api/peerInboxOutcome.normalizeActionOutcome`）。 */
+export interface PeerHeldActionResultDto {
+  /** 新契约的失败回执载荷不含 messageId（只有 code + message）⇒ 可缺 */
+  messageId?: string | null
+  /** 行状态：新契约 `data.status` 是业务原因的**唯一**区分来源（404/403 各承载两种） */
+  status?: string | null
+  /** 业务结果码（**旧实现**字符串码；新契约是数字码，走 `success`/`code` 判读） */
+  code?: string | null
+  /** 服务端文案（旧实现的业务未达成原因；新契约文案在 `msg`） */
+  message?: string | null
+  detail?: string | null
+  /** 批量拒绝载荷里的结算条数（新契约 `data.rejected`） */
+  rejected?: number | null
+}
+
 export interface ChatMessageDto {
   id: string
   sessionId: string
@@ -1499,6 +1852,9 @@ export interface ChatMessageDto {
   content: string | null
   reasoning: string | null
   toolCalls: ToolCallDto[] | null
+  /** [content-blocks] 有序内容块（见 {@link ContentBlockDto}）。新轮由后端按发生顺序落库；
+   *  老消息缺省/null ⇒ 前端走旧渲染模板（不造假块）。 */
+  blocks?: ContentBlockDto[] | null
   finishReason: FinishReason | null
   inputTokens: number | null
   outputTokens: number | null
@@ -1510,8 +1866,20 @@ export interface ChatMessageDto {
   assistantMessageId: string | null
   subtype: string | null
   /** [agent-notice] SendMessage 协作通知行的 UI 摘要（后端 AgentMessage.summary；
-   *  仅 subtype='agent_message' 的行携带，其余缺省）。 */
+   *  仅 subtype='agent_message' 的行携带，其余缺省）。
+   *  ⚠️ 这是**子代理转录**契约字段；跨会话 peer 行的真实摘要在 `structuredOutput.agent_summary`
+   *  （主会话 DTO 没有后端顶层 summary 投影，⛔ 不要拿本字段冒充 peer 摘要）。 */
   summary?: string | null
+  /**
+   * [peer-message] 结构化输出载荷（后端 `ChatMessageDto.structuredOutput` Map 透传）。
+   *
+   * <p>跨会话行用它承载 `peer_source`（来源元数据）与 `agent_summary`（真实摘要）。
+   * 后端 DTO 已出站该字段（非 @JsonIgnore）；旧后端省略 → 读取侧按缺省处理。
+   */
+  structuredOutput?: Record<string, unknown> | null
+  /** [peer-message] 排队来源标记（后端 queued_origin 列读回）：`peer` = 跨会话入站消息。
+   *  与 subtype/peer_source 同源，但**不单独作为判定依据**（判定见 messageTurns.readPeerSource）。 */
+  queuedOrigin?: string | null
   isMeta: boolean
   /** IMP2-14 · compact 摘要 user 消息标记（CC original: isCompactSummary, messages.ts:465/480）：
    *  true = 该 user 消息是 compact 摘要正文（后端 CompactConversation.buildCompactSummaryMessage 产出，
@@ -2438,4 +2806,84 @@ export interface PromptSuggestion {
   suggestion: string
   promptId?: string | null
   generationRequestId?: string | null
+}
+
+// ---- [V329] 会话「无人值守 / Brief」状态（GET /sessions/{id}/mode）----
+export interface SessionModeDto {
+  sessionId: string
+  /** 本会话显式开启无人值守（sessions.unattended_mode） */
+  unattended: boolean
+  /** 本会话 Brief 开启（sessions.brief_mode；SendUserMessage 可用） */
+  brief: boolean
+  /** 已接入的 IM 渠道实例数（无人值守唯一硬前置） */
+  channels: number
+  canEnableUnattended: boolean
+}
+
+/** [V329] 模式开关请求体（PUT /sessions/{id}/mode/{unattended|brief}） */
+export interface SessionModeToggleRequest {
+  enabled: boolean
+  /** [Q8] 关 Brief 且无人值守开启时：true = 用户已确认同时退出无人值守（一次请求原子生效） */
+  cascadeExitUnattended?: boolean
+}
+
+// ---- AST 结构化工具（AstGrep/AstEdit）· 工具 UI 载荷 ----
+/** AstGrep 单条匹配（行列 1 基；text 超过 200 字符被后端截断加 `…`）。 */
+export interface AstGrepMatchDto {
+  line: number
+  column: number
+  endLine: number
+  endColumn: number
+  text: string
+  meta: Record<string, string>
+}
+
+export interface AstGrepFileDto {
+  path: string
+  language: string
+  matches: AstGrepMatchDto[]
+}
+
+/** AstGrep 工具结果的结构化载荷（kind 固定 'ast_grep'）。 */
+export interface AstGrepPayload {
+  kind: 'ast_grep'
+  pattern: string
+  lang: string | null
+  scope: string
+  filesSearched: number
+  skip: number
+  limitReached: boolean
+  truncated: boolean
+  totalMatches: number
+  more: number
+  files: AstGrepFileDto[]
+}
+
+/** AstEdit 单条变更（before/after 均可能被后端截断）。 */
+export interface AstEditChangeDto {
+  line: number
+  column: number
+  endLine: number
+  endColumn: number
+  before: string
+  after: string
+}
+
+export interface AstEditFileDto {
+  path: string
+  changes: AstEditChangeDto[]
+}
+
+/** AstEdit 工具结果的结构化载荷（kind 固定 'ast_edit'）。 */
+export interface AstEditPayload {
+  kind: 'ast_edit'
+  applied: boolean
+  ops: Array<{ pat: string; out: string }>
+  paths: string[]
+  totalReplacements: number
+  filesTouched: number
+  limitReached: boolean
+  truncated: boolean
+  more: number
+  files: AstEditFileDto[]
 }

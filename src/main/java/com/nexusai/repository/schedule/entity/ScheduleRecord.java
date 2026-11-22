@@ -53,7 +53,7 @@ public class ScheduleRecord {
      * agentId 条件透传 cronTasks.ts:212 ({ ...task, ...(agentId ? { agentId } : {}) })；
      * CronCreateTool.ts:126 getTeammateContext()?.agentId 作实参）。
      *
-     * <p>语义：teammate 创建的 SESSION（durable=false）任务设此值，TestJob.fire 按
+     * <p>语义：teammate 创建的 SESSION（durable=false）任务设此值，AgentJob.fire 按
      * dto.agentId() 分发到该 teammate 队列（useScheduledTasks.ts:92 if(task.agentId)）。
      * 主线程创建 / DURABLE 任务为 null。Java 侧用户拍板（OPD-D4-GAP-5 方案 A）落库
      * V9 agent_id 列（CC 虽 runtime-only 不写盘，Java SESSION 本就落库 OPD-Cron-02）。
@@ -79,6 +79,47 @@ public class ScheduleRecord {
      * 创建项目而非 user.dir。
      */
     private String boundProject;
+
+    /**
+     * 执行上下文形态（V306）· {@link com.nexusai.model.schedule.dto.SessionMode} 的 name()。
+     *
+     * <p>独立于 {@link #scope}：scope 表达生命周期（SESSION 随会话死 / DURABLE 持久），
+     * 本列表达「每次触发用哪个会话」。缺省 {@code REUSE} ⇒ 存量行语义零变化。
+     * 为什么不能给 scope 加枚举值见 {@link com.nexusai.model.schedule.dto.SessionMode} 类注释。
+     */
+    private String sessionMode;
+
+    /**
+     * 通知目标（V306）· JSON 数组存 {@code im_chat.id}：{@code ["imch-d1","imch-d2"]}。
+     *
+     * <p>存**聊天 id** 而不是平台名（wechat）：只选渠道不知道发给张三还是刘工 ——
+     * 这正是旧表 {@code mcp_channel_binding} 只到渠道级的老问题（该表已废弃）。
+     * null/空 = 不通知（结果只在「运行记录」里看）。
+     */
+    private String notifyChats;
+
+    /** 冗余存渠道 id（{@code ["imc-demo1"]}），供列表展示省一次 join（V306）。 */
+    private String notifyChannelIds;
+
+    /**
+     * 任务指定的「专家」（主线程 agent）· V317 {@code schedules.main_thread_agent}。
+     *
+     * <p>⛔ <b>不是</b> {@link #agentId} —— 那是 teammate（swarm 队友），
+     * 语义完全不同。用户说的「专家」= 会话级主线程 agent（{@code sessions.main_thread_agent}）。
+     *
+     * <p>为什么任务上要存一份：fire 时若不记，下次触发就不知道该用哪个专家。
+     * 落地方式是**建会话时写进新会话行**（{@code ScheduleSessionResolver.createAutoSession}），
+     * ⛔ 不做「轮次覆盖」（{@code RunRequest.withMainThreadAgent} 已被用户否掉）——
+     * 新会话没有可污染的既有设置，直接写列即可。
+     *
+     * <p>⚠️ V317 迁移文件头注释描述的是**被否掉的轮次覆盖方案**（已应用 ⇒ 不可改其内容，
+     * 否则 checksum mismatch）；实际语义以本注释与用户裁定为准。
+     *
+     * <p>取值约束：仅 {@code NEW_EACH} / {@code NEW_ONCE} 形态可非空；
+     * {@code REUSE} / {@code NONE} 传非空一律 {@code ValidationException} 拒绝
+     * （静默忽略会让用户以为设置生效了）。
+     */
+    private String mainThreadAgent;
 
     public String getId() { return id; }
     public void setId(String id) { this.id = id; }
@@ -112,4 +153,12 @@ public class ScheduleRecord {
     public void setAgentId(String agentId) { this.agentId = agentId; }
     public String getBoundProject() { return boundProject; }
     public void setBoundProject(String boundProject) { this.boundProject = boundProject; }
+    public String getSessionMode() { return sessionMode; }
+    public void setSessionMode(String sessionMode) { this.sessionMode = sessionMode; }
+    public String getNotifyChats() { return notifyChats; }
+    public void setNotifyChats(String notifyChats) { this.notifyChats = notifyChats; }
+    public String getNotifyChannelIds() { return notifyChannelIds; }
+    public void setNotifyChannelIds(String notifyChannelIds) { this.notifyChannelIds = notifyChannelIds; }
+    public String getMainThreadAgent() { return mainThreadAgent; }
+    public void setMainThreadAgent(String mainThreadAgent) { this.mainThreadAgent = mainThreadAgent; }
 }

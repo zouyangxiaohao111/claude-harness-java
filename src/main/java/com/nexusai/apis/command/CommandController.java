@@ -39,7 +39,6 @@ import org.springframework.web.bind.annotation.*;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 /**
  * Command REST 端点 · 对齐 CC commands.ts getCommands() / findCommand()
@@ -904,8 +903,8 @@ public class CommandController {
      * {@link ValidationException}（400）；sessionId 缺失 → IllegalStateException（无会话上下文）。
      *
      * <p><b>[R-A] agentId 不拒收语义</b>（对齐 CC asAgentId，ids.ts:31-33 纯 cast）：agentId 即 string，
-     * 非 UUID 不拒收 —— a+16hex（{@link AgentContext#createAgentId} 产物）经 S-12 pack 桥接受，任意
-     * 其他字符串同样不拒收，最终由 ResumeService 双键查 transcript miss → {@link NotFoundException}（404，
+     * 非 UUID 也不拒收 —— a+16hex（{@link AgentContext#createAgentId} 产物）原样作为 transcript 键，
+     * 任意其他字符串同样不拒收，最终由 ResumeService 查 transcript miss → {@link NotFoundException}（404，
      * 等价 CC resumeAgent.ts:67-69 getAgentTranscript miss → throw）。
      *
      * <p><b>⛔⛔ [步骤 4 · 映射陷阱 · 不得在此清任何 prompt 缓存集合]</b>：
@@ -932,10 +931,9 @@ public class CommandController {
             throw new ValidationException("resume 请求体需携带 agentId");
         }
         // [R-A] 对齐 CC asAgentId（ids.ts:31-33 纯 cast，不校验格式）：agentId 即 string，去掉
-        //   UUID.fromString 拒收。a+16hex（AgentContext.createAgentId 产物，D18/B2 拍板，'a'+16 hex）
-        //   经 S-12 pack 桥 → UUID(msb,0)，ResumeService.unpackAgentId 还原 a+16hex 新格式键查找
-        //   （ResumeService.java:136-144 双键：a+16hex 优先，UUID-string 兜底）。
-        UUID agentId = toResumeAgentId(request.agentId());
+        //   UUID.fromString 拒收，也不再经任何 UUID 桥 —— a+16hex 原样作为 transcript 键。
+        //   旧 UUID 键不再还原（Breaking，按 CC 单一形态）；查不到 → NotFoundException（404）。
+        String agentId = request.agentId();
         // [批 3a] 会话标识由 REST 入口显式传入（调用方 executeBuiltin 已做缺值 400 校验）；不再读 MDC。
         String sessionIdStr = sessionIdParam;
         if (sessionIdStr == null) {
@@ -982,37 +980,6 @@ public class CommandController {
                 result.agentId(), result.outputFile());
         }
         return result;
-    }
-
-    /**
-     * resume 请求 agentId → ResumeService 入参 UUID · 对齐 CC {@code asAgentId}（ids.ts:31-33 纯 cast）。
-     *
-     * <p><b>不拒收语义</b>（CC agentId 即 string，非 UUID 也不拒绝）：
-     * <ul>
-     *   <li>合法 UUID（legacy 格式）→ 直接透传（ResumeService 的 UUID-string fallback 兼容 pre-migration
-     *       transcript，ResumeService.java:141/:144）</li>
-     *   <li>a+16hex（{@link AgentContext#createAgentId} 产物，'a'+16 hex）→ {@link AgentContext#packAgentId}
-     *       打包进 mostSigBits（S-12 桥），ResumeService {@link AgentContext#unpackAgentId} 还原 a+16hex 键
-     *       （新格式 transcript 主键，ResumeService.java:136-140）</li>
-     *   <li>任意其他字符串 → 不拒收：映射 {@code UUID(0L,0L)}，ResumeService 双键查 transcript 均 miss →
-     *       {@link NotFoundException}（404），等价 CC getAgentTranscript miss → throw（resumeAgent.ts:67-69）</li>
-     * </ul>
-     *
-     * @param agentId resume 请求 agentId（非 null / 非 blank，调用方已校验）
-     * @return ResumeService 入参 UUID
-     */
-    private static UUID toResumeAgentId(String agentId) {
-        try {
-            return UUID.fromString(agentId);
-        } catch (IllegalArgumentException uuidRejected) {
-            // 非 UUID → 按 CC asAgentId 不拒收：优先 a+16hex pack（'a'+16 hex → mostSigBits）
-            try {
-                return AgentContext.packAgentId(agentId);
-            } catch (NumberFormatException hexRejected) {
-                // 任意非 hex 字符串（如 teammate 名）→ 不拒收，映射零 UUID → 下游 transcript miss → 404
-                return new UUID(0L, 0L);
-            }
-        }
     }
 
     /**
@@ -1071,7 +1038,7 @@ public class CommandController {
         //   ctx.agentId() 传进 shell task，本循环若只判 task.agentId()!=null，就会把「派过 bash 的子代理」
         //   也收进 preserved → /clear 后其 invokedSkills 跨清存活，方向与 CC 相反（新引入的偏差，
         //   静默无报错）。故门 = 类型白名单，而不是「有没有 agentId」。
-        java.util.Set<UUID> preserved = new java.util.HashSet<>();
+        java.util.Set<String> preserved = new java.util.HashSet<>();
         for (com.nexusai.application.agent.tasks.BackgroundTask task : taskFrameworkService.listAll()) {
             if (!task.isBackgrounded()) {
                 continue; // CC shouldKillTask（:94-98）

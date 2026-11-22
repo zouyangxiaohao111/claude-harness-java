@@ -5,7 +5,7 @@ import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.application.agent.tool.config.CronJitterProperties;
 import com.nexusai.application.agent.tool.cron.CronExpressionConverter;
 import com.nexusai.application.agent.tool.cron.CronJitter;
-import com.nexusai.infra.schedule.TestJob;
+import com.nexusai.infra.schedule.AgentJob;
 import org.quartz.CronExpression;
 import org.quartz.CronScheduleBuilder;
 import org.quartz.CronTrigger;
@@ -103,7 +103,7 @@ public class QuartzScheduleService {
                 scheduler.scheduleJob(scheduler.getJobDetail(jobKey), new LinkedHashSet<>(triggers), true);
                 log.info("[Quartz] Rescheduled job={} triggers={} kind={}", id, triggers.size(), s.getKind());
             } else {
-                JobDetail jobDetail = JobBuilder.newJob(TestJob.class)
+                JobDetail jobDetail = JobBuilder.newJob(AgentJob.class)
                     .withIdentity(jobKey)
                     .usingJobData(data)
                     .storeDurably()

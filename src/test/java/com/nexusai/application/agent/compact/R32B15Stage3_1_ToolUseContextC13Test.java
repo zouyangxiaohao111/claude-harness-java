@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThatCode;
  */
 class R32B15Stage3_1_ToolUseContextC13Test {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     @Test

@@ -11,7 +11,6 @@ import java.security.SecureRandom;
 import java.util.HexFormat;
 import java.util.LinkedHashMap;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
@@ -321,66 +320,14 @@ public sealed interface AgentContext {
     }
 
     /**
-     * a+16hex → UUID 可逆编码桥 · 生产生成点接线（R3-WF-F IMP-SUB-12 返工 · D18/B2 拍板）。
+     * agentId <b>归一</b>（纯字符串）：已是 a+16hex → 原样；其它非空串 → 原样（诚实降级，
+     * 查不到即按未归属/404 处理）；null/空白 → null。
      *
-     * <p><b>[S-12] Java record 类型基础设施</b>: Java 侧 {@code ToolUseContext.agentId} 字段类型为
-     * {@link UUID}（既有基础设施，超出本返工写集），而 CC {@code ToolUseContext.agentId} 为 string
-     * a+16hex（forkedAgent.ts:448 {@code agentId: overrides?.agentId ?? createAgentId()}）。
-     * 本方法把 a+16hex 的 16-hex 后缀（64 bit）打包进 {@code UUID} 的 {@code mostSigBits}
-     * （leastSigBits 恒 0），使 a+16hex ↔ UUID 双向确定可逆：
-     * <ul>
-     *   <li>{@code packAgentId("acd5812100ae224fe")} → {@code UUID(cd5812100ae224fe, 0)}</li>
-     *   <li>{@code unpackAgentId(uuid)} → {@code "a"+16hex}（{@link #unpackAgentId} 逆运算）</li>
-     * </ul>
-     * 生产生成点（R-A45 全量接线 · a+16hex 为单一身份源）均以
-     * {@code packAgentId(createAgentId())} 产出 ToolUseContext.agentId：
-     * <ul>
-     *   <li>{@code createSubagentContext.create()}（CC forkedAgent.ts:448 等价，spawn 主路径）</li>
-     *   <li>{@code ToolUseContext} compact ctor 兜底 + {@code with()} override 缺省（A-4）</li>
-     *   <li>{@code SubagentTool.executeAsync} async 生成点（A-5，不再独立 UUID.randomUUID()）</li>
-     * </ul>
-     * transcript/metadata/resume/analytics 表面点经 {@link #unpackAgentId} 还原 a+16hex 输出；
-     * resume 返回形制统一 a+16hex（B-4）。CC ToolUseContext.agentId 即 a+16hex string，
-     * Java 以可逆编码桥（UUID 字段承载）对齐语义。
+     * <p><b>Breaking</b>：旧 UUID 键不再还原成 a+16hex（按 CC 单一形态；旧数据不可恢复）。
      *
-     * @param agentIdHex a+16hex（{@link #createAgentId} 产物，17 字符：'a'+16 hex；容忍无 'a' 前缀）
-     * @return 确定性 UUID（16-hex 后缀入 mostSigBits）；null → null
-     */
-    static UUID packAgentId(String agentIdHex) {
-        if (agentIdHex == null) {
-            return null;
-        }
-        String hex = agentIdHex.startsWith("a") ? agentIdHex.substring(1) : agentIdHex;
-        long msb = Long.parseUnsignedLong(hex, 16);
-        return new UUID(msb, 0L);
-    }
-
-    /**
-     * UUID → a+16hex 逆运算 · {@link #packAgentId} 的逆映射。
-     *
-     * <p>对任意 UUID 均确定性还原 16 hex（mostSigBits 两补码格式化），故 legacy/随机 UUID 也能
-     * 映射到合法 a+16hex（resume 双键查找的 fallback 通道，见 ResumeService.resumeAgentBackground）。
-     *
-     * @param agentIdUuid ToolUseContext.agentId（{@link #packAgentId} 产物或任意 UUID）
-     * @return a+16hex（'a'+16 hex）；null → null
-     */
-    static String unpackAgentId(UUID agentIdUuid) {
-        if (agentIdUuid == null) {
-            return null;
-        }
-        String hex = String.format("%016x", agentIdUuid.getMostSignificantBits());
-        return "a" + hex;
-    }
-
-    /**
-     * agentId <b>归一</b>：UUID 串（{@code agentId.toString()}）→ a+16hex（单一身份源）；
-     * 已是 a+16hex / 会话短 id / 其他形态 → 原样；null/空白 → null。
-     *
-     * <p><b>WHY（要修的缺陷）</b>：同一 agent 的不同调用路径会传不同渲染 —— 主循环与子代理归属用
-     * a+16hex，而旁路调用点普遍传 {@code state.agentId().toString()}（UUID 形式）⇒ 账本/统计按
-     * agentId 分组时同一 agent 裂成两个节点（实测：子代理本体一行 + 它的旁路一行，费用被拆开、
-     * 前端「按代理层级」同名两行）。写入侧（{@code LlmSideCallClient}）与读取侧（{@code StatsService}
-     * 的按 agent 聚合，兼容归一前写入的历史行）共用本方法，保证「一个 agent = 一个节点」。
+     * <p><b>WHY（要修的缺陷）</b>：同一 agent 的不同调用路径曾传不同渲染 —— 主循环与子代理归属用
+     * a+16hex，而历史旁路调用点传旧 UUID 形态 ⇒ 账本/统计按 agentId 分组时同一 agent 裂成两个节点。
+     * 现在身份只有 a+16hex 一种写法，本方法只做空值守卫；历史 UUID 行按原键保留（不迁移）。
      */
     static String canonicalAgentId(String agentId) {
         if (agentId == null || agentId.isBlank()) {
@@ -389,9 +336,14 @@ public sealed interface AgentContext {
         if (agentId.matches("a[0-9a-f]{16}")) {
             return agentId;
         }
-        if (agentId.matches("[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")) {
-            String hex = unpackAgentId(UUID.fromString(agentId));
-            return hex != null ? hex : agentId;
+        // 历史 UUID 渲染 → a+16hex（对齐 CC 单一形态；用 JDK UUID 直接归一，不依赖已删除的 pack/unpack 桥）。
+        if (agentId.matches("[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")) {
+            try {
+                java.util.UUID uuid = java.util.UUID.fromString(agentId);
+                return "a" + String.format("%016x", uuid.getMostSignificantBits());
+            } catch (IllegalArgumentException ignore) {
+                return agentId;
+            }
         }
         return agentId;
     }

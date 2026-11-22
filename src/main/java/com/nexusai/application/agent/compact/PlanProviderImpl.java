@@ -136,7 +136,7 @@ public class PlanProviderImpl implements PlanProvider {
     }
 
     @Override
-    public String getPlanFilePath(UUID agentId) {
+    public String getPlanFilePath(String agentId) {
         // [批 6] 无会话 ⇒ 无 slug 可派生（旧实现给随机 slug，使读/写回路必然错配）⇒ null。
         //   消费方已全部 null 安全（PostCompactAttachmentRestorer:482 的 planFilePath != null；
         //   planModeAttachment:684 的 null → ""；ExitPlanModeTool 的 filePath != null 守卫）。
@@ -151,7 +151,7 @@ public class PlanProviderImpl implements PlanProvider {
     }
 
     @Override
-    public String getPlan(UUID agentId) {
+    public String getPlan(String agentId) {
         String path = getPlanFilePath(agentId);
         if (path == null) {
             // [批 6] 无会话：不读盘（也避免 Path.of(null) NPE）⇒ 与 ENOENT 同语义「无 plan」
@@ -177,7 +177,7 @@ public class PlanProviderImpl implements PlanProvider {
     }
 
     @Override
-    public AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(UUID agentId) {
+    public AttachmentMessageDto.PlanRef createPlanAttachmentIfNeeded(String agentId) {
         String planContent = getPlan(agentId);
         if (planContent == null) {
             if (log.isDebugEnabled()) {

@@ -192,7 +192,7 @@ class MidTurnNotificationPersistDbTest {
         };
         QueryParams params = QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), session)
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), session)
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", 8, null, null, null, null,
             deps, ProviderConfig.empty());
@@ -315,7 +315,7 @@ class MidTurnNotificationPersistDbTest {
         };
         QueryParams params = QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), session)
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), session)
                 .withAvailableTools(List.of(TestContexts.dummyTool("Bash"))),
             QuerySource.USER, "test-model", 8, null, null, null, null,
             deps, ProviderConfig.empty());

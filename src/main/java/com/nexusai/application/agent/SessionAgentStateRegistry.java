@@ -4,7 +4,6 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.stereotype.Component;
 
-import java.util.UUID;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
@@ -23,13 +22,12 @@ import java.util.concurrent.ConcurrentHashMap;
  *       （LlmAgentLoop 主线程 agentId==null 注册，ChatService/ToolRegistrationConfig/
  *       PartialCompactService/PostCompactionState/CommandController/WebSocketPermissionPrompter
  *       全部经此直键查询）。</li>
- *   <li>{@link #agents} —— {@code UUID}（agentId=agentUuid）→ 后台化主会话 AgentState
+ *   <li>{@link #agents} —— {@code String}（agentId，CC 单一形态 a+16hex）→ 后台化主会话 AgentState
  *       （MainSessionBackgroundService 后台任务 LlmAgentLoop.run 唯一非 null agentId 调用方按
- *       agentId 注册；SkillTool 写侧经 {@code ctx.agentId()}（工具线程上恒为该后台 loop 的
- *       agentUuid）解析命中 —— agentId 通道与会话无关保持 UUID）。</li>
+ *       agentId 注册；SkillTool 写侧经 {@code ctx.agentId()} 解析命中 —— agentId 通道与会话无关）。</li>
  * </ul>
  *
- * <p>主/后台不同 key（sessionId short vs agentUuid UUID），互不覆盖，registry 查询不冲突。
+ * <p>主/后台不同 key（sessionId short vs agentId a+16hex），互不覆盖，registry 查询不冲突。
  *
  * <p><b>local-only 红线（CLAUDE.md BudgetTracker 架构）</b>：纯内存进程内注册表，
  * 绝不序列化 / 绝不经 STOMP / WebSocket / EventPublisher / outbound DTO 外发。
@@ -67,8 +65,8 @@ public class SessionAgentStateRegistry {
 
     /** 主会话映射 · key = short sessionId（sess-xxx）。 */
     private final ConcurrentHashMap<String, AgentState> sessions = new ConcurrentHashMap<>();
-    /** 后台化主会话映射 · key = agentId（agentUuid，与会话无关保持 UUID）。 */
-    private final ConcurrentHashMap<UUID, AgentState> agents = new ConcurrentHashMap<>();
+    /** 后台化主会话映射 · key = agentId（a+16hex，与会话无关）。 */
+    private final ConcurrentHashMap<String, AgentState> agents = new ConcurrentHashMap<>();
 
     /**
      * 注册（或覆盖）short sessionId → 主 AgentState 映射（主线程 agentId==null 入口）。
@@ -105,7 +103,7 @@ public class SessionAgentStateRegistry {
      * @param agentId agent 实例 ID（agentUuid；非 null）
      * @param state   后台化主会话当前 AgentState（非 null）
      */
-    public void register(UUID agentId, AgentState state) {
+    public void registerAgent(String agentId, AgentState state) {
         if (agentId == null || state == null) {
             return;
         }
@@ -117,18 +115,18 @@ public class SessionAgentStateRegistry {
     }
 
     /**
-     * 按键取 AgentState · 按参类型路由（String short sessionId → sessions map；
-     * UUID agentId → agents map）。未命中返回 null（写入侧 null-safe 降级 skip）。
+     * 按键取 AgentState · String short sessionId → sessions map；
+     * String agentId（a+16hex）→ agents map。未命中返回 null（写入侧 null-safe 降级 skip）。
+     *
+     * <p><b>Breaking</b>：旧 UUID 入参不再归一（按 CC 单一形态；调用方一律传 String）。
      */
     public AgentState get(Object key) {
         if (key == null) {
             return null;
         }
-        if (key instanceof UUID agentId) {
-            return agents.get(agentId);
-        }
-        if (key instanceof String sessionId) {
-            return sessions.get(sessionId);
+        if (key instanceof String k) {
+            AgentState byAgent = agents.get(k);
+            return byAgent != null ? byAgent : sessions.get(k);
         }
         return null;
     }
@@ -142,7 +140,7 @@ public class SessionAgentStateRegistry {
     }
 
     /** 按 agentId 取后台化主会话 AgentState（agents map）。 */
-    public AgentState getByAgentId(UUID agentId) {
+    public AgentState getByAgentId(String agentId) {
         if (agentId == null) {
             return null;
         }
@@ -165,11 +163,11 @@ public class SessionAgentStateRegistry {
      *
      * <p><b>为什么需要它（2026-09-10 收尾轮修复）</b>：会话删除路径原只调 {@link #remove(String)}
      * （sessions 桶），但后台化主会话（{@code MainSessionBackgroundService} 是唯一 agentId!=null 的
-     * {@code LlmAgentLoop.run} 调用方）走 {@link #register(UUID, AgentState)} 注册进 <b>agents 桶</b>
-     * （键=agentUuid）。于是「被后台化过的会话」删除后其 AgentState（含完整消息历史 + invokedSkills
+     * {@code LlmAgentLoop.run} 调用方）走 {@link #registerAgent(String, AgentState)} 注册进 <b>agents 桶</b>
+     * （键=agentId a+16hex）。于是「被后台化过的会话」删除后其 AgentState（含完整消息历史 + invokedSkills
      * 全文 + budgetTracker）永驻 JVM —— 恰是本类 javadoc 声称已修的「泄漏量最大的一个」，实际只修了一半
-     * （{@link #remove(UUID)} 全仓 0 调用点）。本方法按 {@code AgentState.sessionId()} 反查 agents 桶
-     * 一并移除，闭环。
+     * （旧 {@code remove(UUID)} 重载全仓 0 调用点，已删）。本方法按 {@code AgentState.sessionId()} 反查
+     * agents 桶一并移除，闭环。
      *
      * <p>安全性：会话删除是进程级终结（CC 一进程一会话，会话结束即进程退出、内存随进程释放，故 CC 无
      * 对应动作）；并发读侧 {@link #get} 对未命中返回 null（null-safe 降级），移除在飞 run 的 state 不会
@@ -200,7 +198,7 @@ public class SessionAgentStateRegistry {
     }
 
     /** 移除 agentId 后台化主会话映射。 */
-    public void remove(UUID agentId) {
+    public void removeAgent(String agentId) {
         if (agentId == null) {
             return;
         }

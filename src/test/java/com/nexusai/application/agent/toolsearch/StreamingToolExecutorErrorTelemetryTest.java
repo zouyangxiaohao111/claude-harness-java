@@ -131,7 +131,7 @@ class StreamingToolExecutorErrorTelemetryTest {
     }
 
     private ToolUseContext ctxWith(List<Tool> availableTools) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, availableTools);
     }
 

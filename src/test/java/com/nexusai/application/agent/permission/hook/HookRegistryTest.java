@@ -348,7 +348,7 @@ class HookRegistryTest {
 
     private static ToolUseContext ctx() {
         return ToolUseContext.of(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(),
             null, PermissionMode.DEFAULT
         );
@@ -824,7 +824,7 @@ class HookRegistryTest {
     @DisplayName("6c. CC 无 appState 事件（SessionStart/Setup/SubagentStart）会话运行中排除 session function hook；SESSION_END 为 appState 发射点 → 会话运行中参与并阻断（对齐 CC executeSessionEndHooks → executeHooksOutsideREPL getAppState）")
     void dynamicGate_ccNoAppStateEvents_excluded_sessionEndParticipates() {
         String sessionUuid = "00000000-0000-0000-0000-0000000000a3";
-        UUID agentUuid = UUID.fromString("00000000-0000-0000-0000-0000000000b1");
+        String agentUuid = "a000000000000000b1";
         HookRegistry registry = new HookRegistry();
         registry.setHookMatcherEngine(new HookMatcherEngine(null, null));
         registry.setCommandHookExecutor(new StubCommandExecutor(j -> exit0Json("{}")));
@@ -1197,7 +1197,7 @@ class HookRegistryTest {
         GenericHook.HookResult outcome = registry.executePostToolUse(
             ToolNameConstants.FILE_EDIT_TOOL_NAME, input,
             ToolResult.success("tu-1", "ok"),
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(outcome.preventContinuation())
             .as("attribution hook 是 internal 旁路（CC return {}，hooks.ts:2038）→ 不阻断工具链")
@@ -1229,7 +1229,7 @@ class HookRegistryTest {
         registry.executePostToolUse(
             ToolNameConstants.FILE_EDIT_TOOL_NAME, input,
             ToolResult.success("tu-1", "ok"),
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)));
 
         assertThat(tracker.snapshotFileStates())
             .as("门控关 → attribution hooks 未注册 → 零追踪")

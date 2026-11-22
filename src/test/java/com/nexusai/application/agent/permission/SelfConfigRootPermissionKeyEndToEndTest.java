@@ -102,7 +102,7 @@ import static org.mockito.Mockito.when;
 class SelfConfigRootPermissionKeyEndToEndTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000e2");
+    private static final String AGENT_ID = "a0000000000000e2";
     private static final String SESSION = "sess-selfroot-e2e";
 
     @org.junit.jupiter.api.BeforeEach

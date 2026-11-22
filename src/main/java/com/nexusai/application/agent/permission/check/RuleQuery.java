@@ -872,7 +872,12 @@ public final class RuleQuery {
         boolean isPathTool = toolName != null
             && (toolName.equals("Edit")
                 || toolName.equals("Write")
-                || toolName.equals("Read"));
+                || toolName.equals("Read")
+                // AstGrep/AstEdit（AST 工具）：内容规则同样按路径语义匹配。
+                // checker 侧传的是合成输入 {"path": p}（每路径一次），故这里读 path 即可；
+                // 不加则路径级 deny/ask 规则对这两个工具永远不命中（用户 deny 被绕过）。
+                || toolName.equals("AstGrep")
+                || toolName.equals("AstEdit"));
         // 1. PathTool (file_path 类工具): root-relative 匹配（[P19] 对齐 CC matchingRuleForInput）
         if (isPathTool) {
             // cwd 缺失（无会话）在此单点解析，与 getEditRuleByContentsForPath 同一入口/同一告警位
@@ -925,6 +930,12 @@ public final class RuleQuery {
             // 先经 toolNameMatches 严格 === 门控（tool.name()=CC 名），这些分支在生产不可达，
             // 移除对齐 CC（OPD-WF3-DC-v4-05 等价组删 + R7 清理）
             case "Edit", "Write", "Read" -> getTextOrNull(input, "file_path");
+            // AstGrep/AstEdit：checker 传合成输入 {"path": p}（工具自身 checkPermissions 逐路径检查），
+            // 真实输入里 AstGrep 是 path、AstEdit 是 paths[]；两者都读，单测/直调都覆盖。
+            case "AstGrep", "AstEdit" -> {
+                String single = getTextOrNull(input, "path");
+                yield single != null ? single : firstTextOfArray(input, "paths");
+            }
             // 未知工具类型：无特定字段，不匹配
             default -> null;
         };
@@ -949,6 +960,20 @@ public final class RuleQuery {
             return null;
         }
         return field.asText();
+    }
+
+    /** 取数组字段的第一个非空文本（AstEdit 的 {@code paths[]} 用；缺失/非数组 → null）。 */
+    private static String firstTextOfArray(JsonNode node, String fieldName) {
+        JsonNode field = node.get(fieldName);
+        if (field == null || !field.isArray()) {
+            return null;
+        }
+        for (JsonNode item : field) {
+            if (item.isTextual() && !item.asText().isBlank()) {
+                return item.asText();
+            }
+        }
+        return null;
     }
 
     // ──────────────────────────────────────────────────────────────────────

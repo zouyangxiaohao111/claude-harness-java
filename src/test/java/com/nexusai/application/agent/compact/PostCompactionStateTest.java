@@ -48,8 +48,8 @@ class PostCompactionStateTest {
     @BeforeEach
     void setUp() {
         registry = new SessionAgentStateRegistry();
-        stateA = new AgentState("system", SESSION_A, UUID.randomUUID());
-        stateB = new AgentState("system", SESSION_B, UUID.randomUUID());
+        stateA = new AgentState("system", SESSION_A, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
+        stateB = new AgentState("system", SESSION_B, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         registry.register(SESSION_A, stateA);
         registry.register(SESSION_B, stateB);
         PostCompactionState.setSessionAgentStateRegistry(registry);
@@ -127,7 +127,7 @@ class PostCompactionStateTest {
         // [session-id-short] 生产 raw = "sess-" + UUID 前 8 位（SessionService.generateId 格式）
         // mark 侧与 consume 侧 sessionId 已统一 short 直键（不再 parseSessionUuid 归一化）
         String rawSessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        AgentState prodState = new AgentState("system", rawSessionId, UUID.randomUUID());
+        AgentState prodState = new AgentState("system", rawSessionId, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         registry.register(rawSessionId, prodState);
 
         // mark 侧生产真实值：short 直键（mark 站点 CompactCommand:224 / AutoCompactor:573 等）

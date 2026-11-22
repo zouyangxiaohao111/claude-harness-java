@@ -41,7 +41,7 @@ class BashToolPendingClassifierCheckTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
     @AfterEach
     void tearDown() {

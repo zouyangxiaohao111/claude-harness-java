@@ -111,7 +111,7 @@ class SessionMemoryForkStartObservationTest {
 
     private static ToolUseContext baseContext() {
         return new ToolUseContext(
-            UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT, Map.of(), List.of(), "", AbortController.NOOP, List.of());
     }
 

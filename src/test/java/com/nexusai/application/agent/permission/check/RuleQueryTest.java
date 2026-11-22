@@ -12,6 +12,8 @@ import com.nexusai.application.agent.permission.ToolPermissionContext;
 import com.nexusai.application.agent.skill.NexusaiPaths;
 import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.application.agent.tool.impl.AstEditTool;
+import com.nexusai.application.agent.tool.impl.AstGrepTool;
 import com.nexusai.application.agent.tool.impl.BashTool;
 import com.nexusai.application.agent.tool.impl.EditFileTool;
 import com.nexusai.application.agent.tool.impl.PowerShellTool;
@@ -602,6 +604,28 @@ class RuleQueryTest {
             assertThat(RuleQuery.getDenyRuleByContentsForTool(
                 permCtx, new BashTool(), input, projectDir.toString()))
                 .as("cwd!=null 结论必须相同（Bash 分支不消费 cwd）").isNotNull();
+        }
+
+        // ── 4. AST 工具（AstGrep/AstEdit）同样按路径语义匹配 ──────────────
+
+        @Test
+        @DisplayName("[AST] AstGrep/AstEdit 纳入 PathTool：路径级 deny 规则命中（否则用户 deny 被绕过）")
+        void astTools_pathRulesHit(@TempDir Path workspace) {
+            ObjectNode input = JSON.createObjectNode()
+                .put("path", workspace.resolve("sub/bar.txt").toString());
+
+            ToolPermissionContext editCtx = denyCtx(rule("AstEdit", "/sub/**"));
+            assertThat(RuleQuery.getDenyRuleByContentsForTool(
+                editCtx, new AstEditTool(new PathGuard(workspace)), input, workspace.toString()))
+                .as("AstEdit(/sub/**) 应命中 cwd/sub/bar.txt").isNotNull();
+            assertThat(RuleQuery.getDenyRuleByContentsForTool(
+                editCtx, new AstGrepTool(new PathGuard(workspace)), input, workspace.toString()))
+                .as("工具名不同的规则不得命中 AstGrep").isNull();
+
+            ToolPermissionContext grepCtx = denyCtx(rule("AstGrep", "/sub/**"));
+            assertThat(RuleQuery.getDenyRuleByContentsForTool(
+                grepCtx, new AstGrepTool(new PathGuard(workspace)), input, workspace.toString()))
+                .as("AstGrep(/sub/**) 应命中 cwd/sub/bar.txt").isNotNull();
         }
     }
 

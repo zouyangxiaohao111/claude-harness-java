@@ -13,6 +13,10 @@ interface Props {
   onCountChange?: (count: number) => void
   /** 浏览器扩展安装/检查引导（BR 组空态按钮）*/
   onOpenChromePanel?: () => void
+  /** [Q8] 本会话无人值守是否开启（关 SendUserMessage 时要判断是否会连带退出无人值守） */
+  unattended?: boolean
+  /** [Q8] 级联改了无人值守状态后，通知上层重拉会话模式（App 的 unattended chip 即时一致） */
+  onModeChanged?: () => void
 }
 
 /**
@@ -24,6 +28,9 @@ const isCoreTool = (name: string) => CORE_ORCHESTRATION_TOOLS.has(name)
 
 /** 常用工具 → 图标路径（未命中回落通用齿轮） */
 const TOOL_ICON_PATHS: Record<string, string> = {
+  // AST 结构化工具必须先于 grep/edit 判定（ToolIcon 取第一个命中的键，而 "astgrep" 含 "grep"）
+  astgrep: 'M12 3v6M12 9a2 2 0 100 4 2 2 0 000-4zM12 13v4M12 17l-6 4M12 17l6 4',
+  astedit: 'M12 3v6M12 9a2 2 0 100 4 2 2 0 000-4zM12 13v4M12 17l-6 4M12 17l6 4',
   bash: 'M4 5l8 7-8 7M12 19h8',
   read: 'M4 5a2 2 0 012-2h4v18H6a2 2 0 01-2-2V5zM14 3h4a2 2 0 012 2v14a2 2 0 01-2 2h-4V3z',
   edit: 'M17 3l4 4L8 20l-5 1 1-5L17 3z',
@@ -62,9 +69,12 @@ interface CategoryMeta {
   iconPath: string
 }
 /**
- * 顺序：CU → KB → BR → MCP → SYS。
+ * 顺序：CU → KB → BR → MCP → IM → SYS。
  * MCP 排在「系统工具」之前 —— 它是**可关闭的第三方能力**（一个 server 可能带几百个工具），
  * SYS 是内置工具，二者视觉上必须分开（用户 2026-11-16：「mcp 出现系统工具中 导致无法动态关闭指定的 mcp」）。
+ * IM 是通讯类能力（SendImAsUser / ListImChats / ReadImMessages / SearchImContacts /
+ * SendUserMessage / 本机微信记录工具），
+ * 同样独立成组、排在 SYS 之前。
  */
 const CATEGORIES: CategoryMeta[] = [
   {
@@ -89,18 +99,40 @@ const CATEGORIES: CategoryMeta[] = [
     iconPath: 'M9 3v6M15 3v6M7 9h10v4a5 5 0 01-10 0V9zM12 18v3',
   },
   {
+    key: 'IM',
+    label: 'IM 工具',
+    // 聊天气泡：气泡体 + 左下小尾巴（不引外部资源，沿用本文件 iconPath 风格）
+    iconPath: 'M4 5a2 2 0 012-2h12a2 2 0 012 2v9a2 2 0 01-2 2H8l-4 4V5z',
+  },
+  {
     key: 'SYS',
     label: '系统工具',
     iconPath: 'M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01L12 2z',
   },
 ]
 
-/** 分类兜底：老后端无 category 字段时按工具名前缀推断（CU/BR 专属前缀优先，其余 mcp__ → MCP） */
+/**
+ * IM 工具名 · 与后端 {@code SessionToolCategory.IM_TOOL_NAMES} 同口径。
+ *
+ * <p>⛔ 不含 SendMessage：它是核心编排工具（不可禁用），归 SYS。
+ */
+const IM_TOOL_NAMES = new Set([
+  'SendImAsUser',
+  'ListImChats',
+  'ReadImMessages',
+  'SearchImContacts',
+  'SendUserMessage',
+  'wechat_search_messages',
+  'wechat_list_conversations',
+])
+
+/** 分类兜底：老后端无 category 字段时按工具名前缀推断（CU/BR 专属前缀优先，其余 mcp__ → MCP，IM 工具名 → IM） */
 function resolveCategory(t: SessionToolDto): SessionToolCategory {
   if (t.category) return t.category
   if (t.name.startsWith('mcp__computer-use__')) return 'CU'
   if (t.name.startsWith('mcp__nexusai-in-chrome__')) return 'BR'
   if (t.name.startsWith('mcp__')) return 'MCP'
+  if (IM_TOOL_NAMES.has(t.name)) return 'IM'
   return 'SYS'
 }
 
@@ -133,10 +165,12 @@ interface CategoryGroup {
   servers: McpServerGroup[]
 }
 
-export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange, onOpenChromePanel }: Props) {
+export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange, onOpenChromePanel, unattended, onModeChanged }: Props) {
   const [tools, setTools] = useState<SessionToolDto[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string | null>(null)
+  /** [Q8] 关 SendUserMessage 且无人值守开启 ⇒ 先确认（取消 = 什么都不变） */
+  const [confirmBriefOff, setConfirmBriefOff] = useState(false)
   /** 当前展开二级明细的类（null = 未展开） */
   const [activeCat, setActiveCat] = useState<SessionToolCategory | null>(null)
   /**
@@ -301,11 +335,41 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
       // 当前可用 → 目标是禁用 false。⛔ 不能写 !t.disabled（会把「禁用」发成「启用」，
       // 后端 remove 为空操作 → 面板无变化 = 用户看到「点单个禁用没反应」）。
       const wantEnabled = t.disabled
+      // [V329] SendUserMessage（BriefTool）的开关 = 会话 Brief 状态，与 /brief 同一份数据。
+      //   ⛔ 不能走普通 disabled_tools PATCH：那样只改可见性、不改 Brief 状态，两处会漂移。
+      if (t.name === 'SendUserMessage') {
+        // [Q8] 无人值守开启时关 Brief：先确认（取消 = 什么都不变，也不发请求）
+        if (!wantEnabled && unattended) {
+          setConfirmBriefOff(true)
+          return
+        }
+        await sessionApi.setBrief(sessionId, wantEnabled)
+        await load()
+        showToast(wantEnabled ? '已开启回答直达（与 /brief 同一状态）' : '已关闭回答直达（与 /brief 同一状态）', 'success')
+        return
+      }
       const updated = await sessionApi.setToolEnabled(sessionId, t.name, wantEnabled)
       const next = (tools ?? []).map((x) => (x.name === updated.name ? updated : x))
       setTools(next)
       onCountChange?.(next.filter((x) => x.disabled).length)
       showToast(updated.disabled ? `已禁用工具 ${updated.userFacingName}` : `已恢复工具 ${updated.userFacingName}`, 'success')
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    } finally {
+      setPending(null)
+    }
+  }
+
+  /** [Q8] 用户确认「关回答直达并退出无人值守」⇒ 一次请求原子生效（⛔ 不拆两个请求）。 */
+  const confirmBriefOffNow = async () => {
+    if (!sessionId || pending) return
+    setConfirmBriefOff(false)
+    setPending('SendUserMessage')
+    try {
+      await sessionApi.setBrief(sessionId, false, true)
+      await load()
+      onModeChanged?.()
+      showToast('已关闭回答直达，并已退出无人值守', 'success')
     } catch (e) {
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     } finally {
@@ -584,6 +648,53 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
               </div>
             </>
           )}
+        </div>
+      )}
+      {confirmBriefOff && (
+        <div
+          data-testid="brief-off-confirm"
+          style={{
+            position: 'fixed', inset: 0, zIndex: 1200,
+            background: 'rgba(0,0,0,0.32)',
+            display: 'flex', alignItems: 'center', justifyContent: 'center',
+          }}
+        >
+          <div
+            role="dialog"
+            aria-modal="true"
+            style={{
+              width: 340, maxWidth: 'calc(100vw - 32px)',
+              background: '#fff', color: '#1f2329', borderRadius: 10,
+              padding: '18px 20px 14px', boxShadow: '0 12px 32px rgba(0,0,0,0.22)',
+            }}
+          >
+            <div style={{ fontSize: 15, fontWeight: 600, marginBottom: 8 }}>关闭回答直达？</div>
+            <div style={{ fontSize: 13, lineHeight: 1.65, color: '#4e5969', marginBottom: 16 }}>
+              无人值守正在开启，关闭回答直达会同时退出无人值守。
+            </div>
+            <div style={{ display: 'flex', justifyContent: 'flex-end', gap: 8 }}>
+              <button
+                type="button"
+                onClick={() => setConfirmBriefOff(false)}
+                style={{
+                  padding: '6px 14px', borderRadius: 6, border: '1px solid #d9dde3',
+                  background: '#fff', color: '#1f2329', cursor: 'pointer',
+                }}
+              >
+                取消
+              </button>
+              <button
+                type="button"
+                onClick={() => void confirmBriefOffNow()}
+                style={{
+                  padding: '6px 14px', borderRadius: 6, border: 'none',
+                  background: '#f54a45', color: '#fff', cursor: 'pointer',
+                }}
+              >
+                确认关闭
+              </button>
+            </div>
+          </div>
         </div>
       )}
     </div>

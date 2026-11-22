@@ -132,7 +132,8 @@ class LlmAgentLoopNestedMemoryInjectionTest {
         LlmProvider mainProvider = mock(LlmProvider.class);
         List<List<ChatMessageDto>> histories = new ArrayList<>();
         RunRequest request = RunRequest.session("configure the system now",
-            "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID(),
+            "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             com.nexusai.infra.llm.ProviderConfig.empty(), "test-model", null, null);
         final boolean[] firstRound = {true};
         doAnswer(inv -> {

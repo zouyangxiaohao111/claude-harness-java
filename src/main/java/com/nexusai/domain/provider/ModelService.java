@@ -87,7 +87,7 @@ public class ModelService {
         m.setTag(ModelTags.normalize(req.tag()));   // [D5] 写路径校验（1-8 位大写字母/数字，非法 400）
         m.setDescription(req.desc() != null ? req.desc() : "");
         m.setType(req.type().name());
-        m.setMaxTokens(req.maxTokens() != null ? req.maxTokens() : 384000); // 默认 384K 输出上限（用户拍板）
+        m.setMaxTokens(req.maxTokens() != null ? req.maxTokens() : 128000); // 默认 128K 输出上限（2026-11-20 由 384K 下调；384K 对 ant 端点过大且无收益）
         m.setTemperature(req.temperature() != null ? req.temperature().doubleValue() : 1.0); // 默认 1.0
         m.setTopP(req.topP() != null ? req.topP().doubleValue() : null);
         // W2-1: 模型级上下文窗口入库（models.max_context_tokens · 此前死列零接线）。

@@ -214,7 +214,7 @@ class WritePermissionCheckerUserApprovedPenetrationTest {
     /** 13 参工厂：显式 effectiveCwd（工作目录与目标路径刻意互不包含）。 */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd) {
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, permCtx.mode(),
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, permCtx.mode(),
             List.of(), "", AbortController.NOOP, List.of(), permCtx, permCtx.mode(),
             Map.of(), false, "", effectiveCwd);
     }

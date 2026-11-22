@@ -188,6 +188,100 @@ public class SessionService {
     }
 
     /**
+     * 读会话实体（{@code SessionCreateTool} 护栏判定用）· 不存在 → null，不抛。
+     *
+     * <p>与 {@link #getById} 的差别：护栏路径只想知道「父会话还在不在 / 深度多少」，
+     * 不该因 404 语义差异在工具里产生异常分支。
+     */
+    public SessionRecord getRecord(String id) {
+        return (id == null || id.isBlank()) ? null : sessionMapper.selectOneById(id);
+    }
+
+    /**
+     * ListAgents 的 Peer sessions 目录一次最多读取的 DB 会话行数。
+     *
+     * <p>按 {@code updated_at} 倒序取<b>最近</b>的这一批（见 {@link #listPeerSessionSummaries()}）。
+     * 调用方用「返回行数 == 本上限」判定可能还有更旧的行未被读到。
+     */
+    public static final int PEER_SESSION_SUMMARY_LIMIT = 200;
+
+    /**
+     * ListAgents 的 Peer sessions 目录来源：<b>DB 里最近的至多
+     * {@value #PEER_SESSION_SUMMARY_LIMIT} 个会话</b>（只取 id / title / updated_at，不加载消息）。
+     *
+     * <p><b>WHY 用 DB 而不是运行期注册表</b>：本仓的产品口径是「会话记录在即可投递并唤醒」
+     * （重启后收件人解析会按 DB 记录补登记 endpoint，见 {@code PeerEndpointActivator}）。
+     * 若列表只读内存注册表，重启后注册表为空 ⇒ 明明能发的会话在列表里看不到。
+     * 运行态（running / idle）仍由 {@code PeerSessionRegistry} 判定，本方法只回答「存在」。
+     *
+     * <p><b>为什么只取三列</b>：会话表可能很大，且 messages 在另一张表；列表只需要 id（身份键）、
+     * title（展示名）与 updated_at（定序）。返回的 {@link SessionRecord} 其余字段为 null ——
+     * 调用方不得当作完整会话使用。
+     *
+     * <p><b>定序与上限</b>：{@code updated_at DESC, id ASC}（与 {@link #list} 同一口径，保证输出稳定），
+     * 同一查询附加 {@code LIMIT} {@value #PEER_SESSION_SUMMARY_LIMIT} —— 只取最近的一批，
+     * 避免会话表变大后把整表拉进内存。
+     *
+     * <p><b>已删除</b>：本仓删除 = 删行（{@link #delete} → {@code deleteById}），没有软删列
+     * ⇒ 不出现在本查询结果里即为「已删除」。
+     *
+     * @return 会话摘要行（永不为 null，行数 ≤ {@value #PEER_SESSION_SUMMARY_LIMIT}；
+     *         表读失败向上抛，由调用方降级）
+     */
+    public List<SessionRecord> listPeerSessionSummaries() {
+        return sessionMapper.selectListByQuery(
+            QueryWrapper.create()
+                .select("id", "title", "updated_at")
+                .orderBy("updated_at", false)
+                .orderBy("id", true)
+                .limit(PEER_SESSION_SUMMARY_LIMIT));
+    }
+
+    /**
+     * 统计某会话派生的同级会话数（V328 列 {@code derived_from_session_id}）。
+     *
+     * <p>用于 SessionCreate 的单父派生上限（防「会话爆炸」）。按行计数，不判状态 ——
+     * 派生后又被删除的会话不减计数（同一父会话的累计派生次数即配额消耗）。
+     */
+    public long countDerivedFrom(String parentSessionId) {
+        if (parentSessionId == null || parentSessionId.isBlank()) {
+            return 0L;
+        }
+        return sessionMapper.selectCountByQuery(
+            QueryWrapper.create().eq("derived_from_session_id", parentSessionId));
+    }
+
+    /**
+     * 现存派生会话总数（V328 非空行）—— SessionCreate 的全局活跃派生上限用。
+     *
+     * <p>删除会话即释放配额（本仓删除 = 删行）。
+     */
+    public long countAllDerived() {
+        return sessionMapper.selectCountByQuery(
+            QueryWrapper.create().where("derived_from_session_id IS NOT NULL"));
+    }
+
+    /**
+     * 写入派生来源与深度（{@code SessionCreateTool} 创建成功后唯一写入口）。
+     *
+     * <p>走「整行读 → 改两列 → 整行写」：不依赖 MyBatis-Flex 的 null 字段更新策略
+     * （策略若是 ignored，只设两列的 patch 会把其它列写成 null）。调用点紧跟
+     * {@link #create}，与 {@link #update} 同款 read-modify-write 语义。
+     *
+     * @param sessionId       新建会话 id
+     * @param parentSessionId 创建者会话 id
+     * @param depth           派生深度（父=0 派生的 = 1，再派生 = 2）
+     */
+    public void markDerived(String sessionId, String parentSessionId, int depth) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) throw new NotFoundException("Session " + sessionId + " not found");
+        s.setDerivedFromSessionId(parentSessionId);
+        s.setDerivedDepth(depth);
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+    }
+
+    /**
      * 是否分叉会话（V297 列 {@code forked_from} 非空）· SessionStart hook
      * {@code source='fork'} 的判据。读不到会话 → false（不抛，hook 侧按 startup 兜底）。
      */
@@ -362,6 +456,15 @@ public class SessionService {
         }
 
         sessionMapper.update(s);
+        // [session-create V328] 显式 /rename → 同步跨会话 endpoint 的标题快照
+        //   （否则 ListAgents / 按标题寻址一直显示旧名；地址名由标题派生，同步后自动跟着变）。
+        if (req.title() != null && chatService != null) {
+            try {
+                chatService.refreshPeerEndpointTitle(id, s.getTitle());
+            } catch (RuntimeException e) {
+                log.warn("[SessionService] update: endpoint 标题同步失败 session={}: {}", id, e.toString());
+            }
+        }
         // [批 4a · 用户裁定 #12] PATCH 改绑项目（mainProjectId）后必须让旧冻结值失效：
         //   SessionProjectRoot.setForSession 是 putIfAbsent 首写胜 ⇒ 不清缓存则改绑后
         //   CwdResolution/memory/transcript 仍解析到<b>旧项目根</b>（本条曾漏 clearSession，
@@ -380,7 +483,15 @@ public class SessionService {
     public void delete(String id) {
         SessionRecord s = sessionMapper.selectOneById(id);
         if (s == null) throw new NotFoundException("Session " + id + " not found");
-        // [S4] 先 cancel 在飞 turn 再清理调度（对齐 CC onCancel REPL.tsx:2147；cancel-first 幂等）
+        // [sendmessage-cross-session · B] 跨会话 endpoint 注销必须**最早**发生，且顺序与
+        //   {@link ChatService#closeSession} 同一实现（beginClosing 拒新件 → 清未消费 peer 项 →
+        //   取消 idle 订阅 → unregister(expectedEpoch)）。先关闭再 cancel：beginClosing 是
+        //   「不再接受新的跨会话投递」的唯一闸门，晚于任何耗时清理都会留下可投递窗口。
+        //   ⛔ 不在 run 结束/回合空闲时注销（由 ChatService 保证）；本类只负责会话真正的结束。
+        if (chatService != null) {
+            chatService.closeSession(id);
+        }
+        // [S4] 再 cancel 在飞 turn（对齐 CC onCancel REPL.tsx:2147；cancel-first 幂等）
         //   否则已删会话 in-flight turn 继续跑并向已删 topic 推 STOMP（探查 S4）。
         //   best-effort：wsTemplate/chatService 缺失或推送异常不阻塞会话删除主流程。
         if (chatService != null && wsTemplate != null) {
@@ -402,11 +513,6 @@ public class SessionService {
             } catch (Exception e) {
                 log.warn("[SessionService] delete: cleanupSession 失败 session={}: {}", id, e.toString());
             }
-        }
-        // Phase 4: 关闭前先调 ChatService.closeSession 清理 SESSION-scope 调度任务
-        //   (best-effort — 内部 try/catch 吞异常, 不阻塞 session 删除主流程)
-        if (chatService != null) {
-            chatService.closeSession(id);
         }
         // [MG-6 · A2-4 补充登记 6] removeSessionState 接线 · 会话删除 → 释放 SESSION_STATES 桶
         //   （决策登记 6 A2-4：CC 进程随会话结束退出无泄漏；Java 常驻 JVM，会话删除时由外层移除
@@ -707,6 +813,112 @@ public class SessionService {
         }
     }
 
+    /**
+     * 增量写入 IM 工具覆盖（V330 列 im_tool_overrides）。
+     *
+     * <p>只走 Mapper 的原子 json_patch（该列不映射到 {@link SessionRecord}），
+     * 因此并发的模式写/禁用写不会覆盖它；不同键并发合并不丢项。
+     * 存量 JSON 损坏时 SQL 的 WHERE 不命中（返回 0）⇒ 显式失败，不静默当作成功。
+     *
+     * @param sessionId 会话 id
+     * @param patch     IM 工具名 → 是否启用（调用方已校验白名单）
+     * @throws NotFoundException     会话不存在
+     * @throws IllegalStateException 存量 JSON 非法、无法安全合并
+     */
+    public void patchImToolOverrides(String sessionId, Map<String, Boolean> patch) {
+        if (patch == null || patch.isEmpty()) {
+            return;
+        }
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        int updated = sessionMapper.patchImToolOverrides(sessionId, patch);
+        if (updated <= 0) {
+            throw new IllegalStateException(
+                "Session " + sessionId + " 的 IM 工具覆盖已损坏（非 JSON 对象），拒绝覆盖写入");
+        }
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] patchImToolOverrides: session={} patch={}（V330 列，原子合并）",
+                    sessionId, patch);
+        }
+    }
+
+    // ════════════════════════════════════════════════════════════════════
+    // [unattended/brief V329] 会话级显式无人值守 + Brief 状态（V329 列）
+    // ════════════════════════════════════════════════════════════════════
+
+    /**
+     * 写入会话级显式无人值守（V329 列 unattended_mode，1/0）。
+     *
+     * <p>只写本列；级联（Brief、IM 工具、Ask 工具池）由
+     * {@code SessionModeService} 统一编排，⛔ 不要在其他调用点各写一遍。
+     *
+     * @param sessionId 会话 id
+     * @param enabled   true = 无人值守；false = 退出
+     * @throws NotFoundException session 不存在
+     */
+    public void setUnattendedMode(String sessionId, boolean enabled) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        s.setUnattendedMode(enabled ? 1 : 0);
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] setUnattendedMode: session={} enabled={}（V329 列 unattended_mode）",
+                    sessionId, enabled);
+        }
+    }
+
+    /**
+     * 写入会话级 Brief 状态（V329 列 brief_mode，1/0）。
+     *
+     * <p>只写本列；SendUserMessage 的 disabled_tools 同步由
+     * {@code SessionModeService} 统一编排。
+     *
+     * @param sessionId 会话 id
+     * @param enabled   true = Brief 开；false = 关
+     * @throws NotFoundException session 不存在
+     */
+    public void setBriefMode(String sessionId, boolean enabled) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        s.setBriefMode(enabled ? 1 : 0);
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] setBriefMode: session={} enabled={}（V329 列 brief_mode）",
+                    sessionId, enabled);
+        }
+    }
+
+    /**
+     * [Q8] 一次写入 Brief + 无人值守两列（原子级联）。
+     *
+     * <p>WHY 必须单次 update：无人值守开启时关 Brief，用户确认的是「两件事一起关」。
+     * 拆成两次写时第二次失败会留下「Brief 已关、无人值守还开着」的半状态。这里用同一条
+     * {@code sessionMapper.update} 落两列，要么都变、要么都不变。
+     */
+    public void setBriefAndUnattendedMode(String sessionId, boolean brief, boolean unattended) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) {
+            throw new NotFoundException("Session " + sessionId + " not found");
+        }
+        s.setBriefMode(brief ? 1 : 0);
+        s.setUnattendedMode(unattended ? 1 : 0);
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] setBriefAndUnattendedMode: session={} brief={} unattended={}"
+                    + "（V329 两列 · 单次 update 保证原子）",
+                    sessionId, brief, unattended);
+        }
+    }
+
     // ════════════════════════════════════════════════════════════════════
     // [goal V253] 会话级目标状态（V253 列 goal）· 对齐 CC appState.activeGoal
     // ════════════════════════════════════════════════════════════════════
@@ -984,7 +1196,9 @@ public class SessionService {
             //   未设置；主对话工具策略只认 Integer.valueOf(1) ⇒ null 与 0 同义，但透传原始三态）
             s.getKbToolsEnabled() != null ? s.getKbToolsEnabled() != 0 : null,
             // [V283] 左栏置顶标记透出（0/1 → Boolean，null 保持 null = 未设置）
-            s.getPinned() != null ? s.getPinned() != 0 : null
+            s.getPinned() != null ? s.getPinned() != 0 : null,
+            // [session-create V328] 派生来源会话 id 透出（null = 用户自建；前端左栏「派生」标记）
+            s.getDerivedFromSessionId()
         );
     }
 

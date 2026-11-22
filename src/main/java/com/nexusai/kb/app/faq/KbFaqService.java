@@ -82,6 +82,15 @@ public class KbFaqService {
     private final JdbcTemplate jdbc;
     private final KbHybridSearcher searcher;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 这里原来只传库级 {@code kb.getEmbeddingModelId()}；库级为空时
+     * {@code reindexKnowledge} 会进「只重建关键词」分支，删掉过期向量且不重建。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     @Autowired
     public KbFaqService(KbKnowledgeMapper knowledgeMapper,
                         KbKnowledgeBaseMapper baseMapper,
@@ -905,8 +914,10 @@ public class KbFaqService {
         }
         try {
             indexWriter.reindexKnowledge(container.getId(), kb.getId(),
-                kb.getEmbeddingModelId() == null || kb.getEmbeddingModelId().isBlank()
-                    ? null : kb.getEmbeddingModelId());
+                kbConfigService == null
+                    ? (kb.getEmbeddingModelId() == null || kb.getEmbeddingModelId().isBlank()
+                        ? null : kb.getEmbeddingModelId())
+                    : kbConfigService.resolveEmbeddingModelId(null, kb));
         } catch (RuntimeException e) {
             log.error("[FAQ] 索引重建失败 kb={} —— 搜索仍是旧数据（可手动重建）原因={}",
                 kb.getId(), e.getMessage());

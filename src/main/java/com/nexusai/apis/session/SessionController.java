@@ -1,7 +1,10 @@
 package com.nexusai.apis.session;
 
+import com.nexusai.application.agent.messaging.PeerUiApprovalAuthority;
 import com.nexusai.application.agent.permission.PermissionConfigProvider;
 import com.nexusai.application.session.SessionForkService;
+import com.nexusai.infra.exception.ForbiddenException;
+import com.nexusai.infra.exception.NotFoundException;
 import com.nexusai.model.session.dto.ForkSessionRequest;
 import com.nexusai.model.session.dto.ForkSessionResponse;
 import com.nexusai.model.session.dto.PlanExitRequest;
@@ -16,9 +19,13 @@ import com.nexusai.infra.exception.ValidationException;
 import com.nexusai.repository.session.mapper.SessionMapper;
 import com.nexusai.domain.session.SessionService;
 import com.nexusai.domain.stats.StatsService;
+import com.zjky.pro.framework.common.pojo.CommonResult;
 import jakarta.validation.Valid;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
+import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
@@ -27,6 +34,8 @@ import java.util.List;
 @RestController
 @RequestMapping("/api/v1/sessions")
 public class SessionController {
+
+    private static final Logger log = LoggerFactory.getLogger(SessionController.class);
 
     @Autowired private SessionService sessionService;
     @Autowired private SessionForkService sessionForkService;
@@ -149,11 +158,29 @@ public class SessionController {
      *
      * @param id  正在退出 plan 的会话
      * @param req 计划正文 + 执行方式 + 是否清空上下文
-     * @return 继续执行的目标会话
+     * @return 继续执行的目标会话（外层统一 CommonResult；成功 code=0/success=true，data=原响应）
      */
     @PostMapping("/{id}/plan/exit")
-    public PlanExitResponse exitPlan(@PathVariable String id,
-                                     @RequestBody PlanExitRequest req) {
+    public ResponseEntity<CommonResult<PlanExitResponse>> exitPlan(@PathVariable String id,
+                                                                   @RequestBody PlanExitRequest req) {
+        // 统一返回体：成功 200 + {code:0,success:true,data:{sessionId,cleared}}；参数错误 400、
+        // 提权被拒 403、会话不存在 404 时 HTTP 状态保持语义，body 同样是 CommonResult
+        // （⛔ 只有本方法包；本控制器其它方法的成功体与错误体不动）。
+        try {
+            return ResponseEntity.ok(CommonResult.ok(exitPlanChecked(id, req)));
+        } catch (ValidationException ex) {
+            return ResponseEntity.badRequest().body(CommonResult.error(400, ex.getMessage()));
+        } catch (ForbiddenException ex) {
+            return ResponseEntity.status(HttpStatus.FORBIDDEN)
+                .body(CommonResult.error(403, ex.getMessage()));
+        } catch (NotFoundException ex) {
+            return ResponseEntity.status(HttpStatus.NOT_FOUND)
+                .body(CommonResult.error(404, ex.getMessage()));
+        }
+    }
+
+    /** {@link #exitPlan} 的业务主体（校验 + 写 SESSION setMode + 可选建新会话）。 */
+    private PlanExitResponse exitPlanChecked(String id, PlanExitRequest req) {
         if (req == null || req.mode() == null || req.mode().isBlank()) {
             throw new ValidationException("mode is required");
         }
@@ -162,6 +189,33 @@ public class SessionController {
                 .contains(req.mode())) {
             throw new ValidationException("mode must be one of: acceptEdits, default, bypassPermissions, dontAsk, auto");
         }
+        // [缺陷2 · 2026-11-20 E2E 第二轮] 会话必须存在：不存在的会话 → NotFoundException → HTTP 404 +
+        // CommonResult{success:false, code:404}，且必须在写任何权限规则之前失败（⛔ 不得对幽灵会话
+        // 静默成功、也不得给不存在的 session_id 落 SESSION setMode 行）。
+        SessionDto src = sessionService.getById(id);
+        // ── [C批 · 跨会话安全] 本端点可直写 SESSION setMode（含 bypassPermissions/dontAsk/auto）──
+        //   它没有模型参与，但本地任意进程（包括 peer 回合里的 Bash/curl）都能发同样的 HTTP 请求。
+        //   ⚠️ [语义重排] 默认门不是「未配置可信 UI ⇒ 全部 403」——默认已安装 local-user
+        //   验证器（userId 缺省 "default"），正常用户（origin=null）零变化。只有两类请求被拒：
+        //     ① 服务端可归因为 peer / 非可信主体（PeerUiApprovalAuthority.Attributor 判定）；
+        //     ② 未来安装更严验证器后，提权模式必须携带可验证的 UI 凭据（未通过 → 拒）。
+        //   ⛔ 这里不把「本地 HTTP 请求」本身当成 peer 自证，也不伪造 token 校验。
+        boolean privilegedMode = java.util.Set.of("bypassPermissions", "dontAsk", "auto")
+                .contains(req.mode());
+        boolean peerAttributed = PeerUiApprovalAuthority.isPeerAttributed(
+            PeerUiApprovalAuthority.Source.HTTP_PLAN_EXIT, id, null);
+        boolean requiresVerifiedUi = PeerUiApprovalAuthority.isConfigured()
+            && !PeerUiApprovalAuthority.isTrustedUi(
+                PeerUiApprovalAuthority.Source.HTTP_PLAN_EXIT, id, null);
+        if (privilegedMode && (peerAttributed || requiresVerifiedUi)) {
+            log.warn("[SessionController] plan/exit 拒绝提权模式写入：{} session={} user={} "
+                    + "peerAttributed={} trustedUiMissing={}", req.mode(), id,
+                PeerUiApprovalAuthority.getUserId(), peerAttributed, requiresVerifiedUi);
+            throw new ForbiddenException(
+                "Switching a session to '" + req.mode() + "' from this endpoint is not allowed for this "
+                    + "request: peer-attributed escalation requests are refused, and a stricter UI "
+                    + "verification (if installed) must pass. Use the desktop UI instead.");
+        }
         PermissionMode mode = PermissionMode.fromString(req.mode());
         // 源会话：恢复执行模式（V75 SESSION setMode）
         persistPlanExitMode(id, mode);
@@ -169,7 +223,6 @@ public class SessionController {
         if (!Boolean.TRUE.equals(req.clearContext())) {
             return new PlanExitResponse(id, false);
         }
-        SessionDto src = sessionService.getById(id);
         if (src == null || src.mainProjectId() == null || src.mainProjectId().isBlank()) {
             throw new ValidationException("session has no bound project");
         }

@@ -49,7 +49,7 @@ class TodoWriteToolSessionLifecycleTest {
     private static final class SessionAppState {
         final AtomicReference<Map<String, Object>> state = new AtomicReference<>(Map.of());
 
-        ToolUseContext ctx(UUID agentId) {
+        ToolUseContext ctx(String agentId) {
             return ToolUseContext.of(
                 agentId, SESSION_ID, PermissionMode.DEFAULT,
                 List.of(), "", AbortController.NOOP, List.of(),
@@ -99,7 +99,7 @@ class TodoWriteToolSessionLifecycleTest {
     void sameSessionSharesTodosAcrossExecutes() throws Exception {
         TodoWriteTool tool = new TodoWriteTool();
         SessionAppState session = new SessionAppState();
-        ToolUseContext ctx = session.ctx(UUID.randomUUID());
+        ToolUseContext ctx = session.ctx(com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         tool.execute(call("c1", inputWithTodos(new String[][]{
             {"A", "pending", "Doing A"},
@@ -128,8 +128,8 @@ class TodoWriteToolSessionLifecycleTest {
     void differentTodoKeysDoNotInterfere() throws Exception {
         TodoWriteTool tool = new TodoWriteTool();
         SessionAppState session = new SessionAppState();
-        UUID mainAgent = UUID.randomUUID();
-        UUID subAgent = UUID.randomUUID();
+        String mainAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String subAgent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         tool.execute(call("c1", inputWithTodos(new String[][]{
             {"A", "pending", "Doing A"},
@@ -163,7 +163,7 @@ class TodoWriteToolSessionLifecycleTest {
     void allDoneClearsStoredBucket() throws Exception {
         TodoWriteTool tool = new TodoWriteTool();
         SessionAppState session = new SessionAppState();
-        UUID agent = UUID.randomUUID();
+        String agent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         ToolResult<?> r1 = tool.execute(call("c1", inputWithTodos(new String[][]{
             {"A", "completed", "Doing A"},
@@ -190,7 +190,7 @@ class TodoWriteToolSessionLifecycleTest {
     @DisplayName("会话重启（新 appState）→ oldTodos 缺省空列表，不残留旧会话数据（CC 会话级生命周期）")
     void newSessionStartsWithEmptyTodos() throws Exception {
         TodoWriteTool tool = new TodoWriteTool(); // 同一单例 Bean 实例
-        UUID agent = UUID.randomUUID();
+        String agent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         // 会话 1：写入 todo 桶
         SessionAppState session1 = new SessionAppState();

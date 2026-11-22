@@ -28,7 +28,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 @DisplayName("Session S7 · SubagentContextOverrides 三字段补齐对齐 CC forkedAgent.ts:262/274/299")
 class SubagentContextOverridesFieldTest {
 
-    private static final UUID PARENT_AGENT_ID = UUID.randomUUID();
+    private static final String PARENT_AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String PARENT_SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     /** 构造父 ctx (全字段非默认, 18 参兼容 ctor) — 与 ToolUseContextWithExplicitFieldDispatchTest 同构. */

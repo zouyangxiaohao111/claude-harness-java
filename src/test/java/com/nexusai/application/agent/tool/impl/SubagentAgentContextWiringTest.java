@@ -4,8 +4,6 @@ import com.nexusai.application.agent.subagent.AgentContext;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
 
-import java.util.UUID;
-
 import static org.assertj.core.api.Assertions.assertThat;
 
 /**
@@ -51,16 +49,15 @@ class SubagentAgentContextWiringTest {
         //   CC 真源：uuid.ts:24-27 createAgentId() → `a{label-}{16 hex}`；agentContext.ts:34 agentId: string；
         //   AgentTool.tsx:580 earlyAgentId = createAgentId() + :716 asyncAgentContext.agentId = asyncAgentId。
         //   注意 agentContext.ts:33 注释旧称 "UUID" 为过时注释（规则九：不信 CC 注释，看实际源码）。
-        //   Java 侧 ToolUseContext.agentId 为 UUID（S-12 Java record 基础设施），buildSubagentAgentContext
-        //   收 UUID 经 AgentContext.unpackAgentId（a+16hex 可逆编码桥）还原输出。
-        UUID agentId = UUID.randomUUID();
+        //   Java 侧 buildSubagentAgentContext 直接收 a+16hex agentId（String）。
+        String agentId = AgentContext.createAgentId();
 
         AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
             agentId, "Explore", true, null, "spawn");
 
         assertThat(ctx.agentId())
             .as("agentId 必须 = 子 agent a+16hex（CC uuid.ts:24-27 createAgentId() 产物；agentContext.ts:34）")
-            .isEqualTo(AgentContext.unpackAgentId(agentId));
+            .isEqualTo(agentId);
         assertThat(ctx.agentId())
             .as("agentId 必须匹配 CC 校验正则 /^a(?:.+-)?[0-9a-f]{16}$/（types/ids.ts:35 AGENT_ID_PATTERN，"
                 + "toAgentId :42；非 UUID 8-4-4-4-12）")
@@ -98,7 +95,7 @@ class SubagentAgentContextWiringTest {
         String parentRequestId = "req-abc-123";
 
         AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
-            UUID.randomUUID(), "Explore", true, parentRequestId, "spawn");
+            AgentContext.createAgentId(), "Explore", true, parentRequestId, "spawn");
 
         assertThat(ctx.invokingRequestId())
             .as("invokingRequestId 必须透传父 assistantMessage.requestId（CC AgentTool.tsx:723/:778）")
@@ -111,7 +108,7 @@ class SubagentAgentContextWiringTest {
         // WHY: CC resumeAgent.ts:230 void runWithAgentContext(asyncAgentContext, ...) 的 asyncAgentContext
         //   invocationKind: 'resume'（resumeAgent.ts:218-224）—— 续跑子 agent 必须与初始 spawn 区分，
         //   否则 analytics sparse-edge 归因把 resume 当成新 spawn。
-        UUID agentId = UUID.randomUUID();
+        String agentId = AgentContext.createAgentId();
 
         AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
             agentId, "Explore", true, null, "resume");
@@ -129,7 +126,7 @@ class SubagentAgentContextWiringTest {
         //   该映射本身现由 {@code SessionFileAccessHooks.subagentProps} 承载、由
         //   {@code SubagentNameExplicitCarrierTest} 守；本用例只钉「映射的输入字段被正确派生」。
         AgentContext.SubagentContext ctx = SubagentExecutor.buildSubagentAgentContext(
-            UUID.randomUUID(), "my-custom-agent", false, null, "spawn");
+            AgentContext.createAgentId(), "my-custom-agent", false, null, "spawn");
 
         assertThat(ctx.isBuiltIn())
             .as("自定义 agent isBuiltIn 必须 false（CC :723）")

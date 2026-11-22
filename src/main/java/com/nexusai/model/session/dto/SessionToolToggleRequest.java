@@ -7,5 +7,7 @@ package com.nexusai.model.session.dto;
  */
 public record SessionToolToggleRequest(
     /** false=禁用该工具；true=恢复该工具 */
-    boolean enabled
+    boolean enabled,
+    /** [Q8] 关 SendUserMessage 且无人值守开启时，true = 用户已确认同时退出无人值守 */
+    Boolean cascadeExitUnattended
 ) {}

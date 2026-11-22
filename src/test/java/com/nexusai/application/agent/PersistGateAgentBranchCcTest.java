@@ -58,7 +58,7 @@ class PersistGateAgentBranchCcTest {
             false, false, false, false, false, false, false, false, false, false, false, false, false, false);
 
     private static final String SESSION = "00000000-0000-0000-0000-0000000000a1";
-    private static final UUID SUBAGENT_ID = UUID.fromString("00000000-0000-0000-0000-0000000000b1");
+    private static final String SUBAGENT_ID = "a000000000000000b1";
     private static final String SESSION_STR = SESSION.toString();
 
     // ────────────────────────────────────────────────────────────────────────
@@ -90,7 +90,7 @@ class PersistGateAgentBranchCcTest {
     }
 
     /** 同组 150K+80K > 200K 聚合预算 → 最大 fresh（call_t1）被持久化为 preview（CC selectFreshToReplace）。 */
-    private AgentState overBudgetState(UUID agentId) {
+    private AgentState overBudgetState(String agentId) {
         ChatMessageDto asst = asst("asst-1", "A", List.of(
             new ToolCallDto("call_t1", "Bash", null, null, false),
             new ToolCallDto("call_t2", "Bash", null, null, false)));

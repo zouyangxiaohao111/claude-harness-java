@@ -504,7 +504,7 @@ public class MagicDocUpdater {
         //   见 MagicDocsService.updateTrackedDocs）。子代理/工具身份（agentId）仍为本地一次性值：
         //   它只用于 EditFileTool 的 read-before-write 门禁键派生，不参与任何会话/项目身份解析。
         //   ⛔ sessionId 的 null 由 writeViaEditTool 入口守卫拦截（不会到达此处）。
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
 
         // [会话 cwd 同源] 用「EditFileTool 即将用的同一对 (guard, sessionId)」解析目标路径：
         //   EditFileTool.execute 内部走 guard.resolve(ctx.sessionId() == 本方法生成的 sessionId, relPath)

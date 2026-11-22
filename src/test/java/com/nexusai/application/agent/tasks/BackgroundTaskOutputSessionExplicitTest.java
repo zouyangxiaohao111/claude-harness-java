@@ -10,7 +10,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Files;
 import java.nio.file.Path;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicReference;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -122,11 +121,12 @@ class BackgroundTaskOutputSessionExplicitTest {
         SessionCwdHolder.set(STALE, Files.createDirectories(tmp.resolve("stale2")).toString());
         SessionCwdHolder.set(EXPLICIT, Files.createDirectories(tmp.resolve("explicit2")).toString());
         // [批 3c] 语义消失：原此处写「别的会话」的裸 MDC 当反向对照 —— 该槽已整类删除，装置删除。
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         BackgroundTask async = runner.registerAsyncAgent(
             agentId, "d7 异步", "prompt", "general-purpose", null, EXPLICIT);
         BackgroundTask fg = runner.registerAgentForeground(
-            UUID.randomUUID(), "d7 前台", "prompt", "general-purpose", EXPLICIT);
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+            "d7 前台", "prompt", "general-purpose", EXPLICIT);
 
         assertThat(sessionDirOf(async.outputFile()))
             .as("async agent 输出根 = 显式会话（按 ambient 会话解析会落 stale 会话目录）")
@@ -161,11 +161,13 @@ class BackgroundTaskOutputSessionExplicitTest {
             .isInstanceOf(IllegalArgumentException.class);
 
         assertThatThrownBy(() -> runner.registerAsyncAgent(
-                UUID.randomUUID(), "缺会话", "prompt", "general-purpose", null, null))
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+                "缺会话", "prompt", "general-purpose", null, null))
             .as("registerAsyncAgent(null) → 输出根缺值 fail-loud")
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> runner.registerAgentForeground(
-                UUID.randomUUID(), "缺会话", "prompt", "general-purpose", null))
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
+                "缺会话", "prompt", "general-purpose", null))
             .isInstanceOf(IllegalArgumentException.class);
         assertThatThrownBy(() -> runner.registerWorkflowTask("w-null-3b", "spec", "spec", null, null, null))
             .isInstanceOf(IllegalArgumentException.class);

@@ -3,6 +3,7 @@ package com.nexusai.infra.llm;
 import com.nexusai.application.agent.AgentState;
 import com.nexusai.application.agent.SessionAgentStateRegistry;
 import com.nexusai.application.agent.compact.PostCompactionState;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
 import org.junit.jupiter.api.AfterEach;
@@ -59,8 +60,8 @@ class PostCompactionSessionExplicitDerivedThreadTest {
     @BeforeEach
     void setUp() {
         registry = new SessionAgentStateRegistry();
-        registry.register(SESSION_HISTORY, new AgentState("system", SESSION_HISTORY, UUID.randomUUID()));
-        registry.register(SESSION_STALE, new AgentState("system", SESSION_STALE, UUID.randomUUID()));
+        registry.register(SESSION_HISTORY, new AgentState("system", SESSION_HISTORY, AgentContext.createAgentId()));
+        registry.register(SESSION_STALE, new AgentState("system", SESSION_STALE, AgentContext.createAgentId()));
         PostCompactionState.setSessionAgentStateRegistry(registry);
         PostCompactionState.reset();
     }

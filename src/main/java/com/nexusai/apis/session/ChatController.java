@@ -169,8 +169,12 @@ public class ChatController {
         //   user 消息在 controller 同步落库而前一轮 assistant 消息轮结束才落库 → 插入到未落库
         //   assistant 前的 DB 顺序错位（前端 GET /messages 显示错乱）。对齐 CC enqueue 内存队列 →
         //   消费时 createUserMessage 落库。
-        boolean busy = LlmAgentLoop.isSessionRunning(sessionId);
-        if (busy) {
+        // [sendmessage-cross-session · B] 共享起轮权（LlmAgentLoop.tryClaim）：与空闲消费者 /
+        //   其他入口同一真源（running / dispatching / 已 claim 三态都拒绝）。失败 = 会话已活跃 ⇒
+        //   既有 busy 语义（排队，不并行起轮）。成功 ⇒ claim 交给 processUserMessage 在 run 结束释放
+        //   （⛔ 本方法不释放、也不在 processUserMessage 内重复 claim —— 那会必然自拒）。
+        LlmAgentLoop.SessionClaim claim = LlmAgentLoop.tryClaim(sessionId);
+        if (claim == null) {
             // [P5-②] immediate local-jsx 命令 busy 优先 · 对齐 CC handlePromptSubmit.ts:239-252
             //   （queryGuard.isActive 优先语义）：命中且已注册命名 handler → 不 enqueueBusyPrompt，
             //   直接 dispatch 立即执行 + 推 message.user（web 无 TUI，显式推送；CC setToolJSX 展示）。
@@ -201,16 +205,26 @@ public class ChatController {
         }
 
         // 1. 持久化 user 消息（同步，仅空闲路径）
-        MessageCreatedResponse resp = messageService.createUserMessage(sessionId, req);
+        // [sendmessage-cross-session · B] claim 交接：落库/提交任一步失败 ⇒ 就地释放（否则该会话
+        //   永久被 claim 占住 = 新的静默卡死）；成功交交给 processUserMessage 在 run 结束释放。
+        boolean claimHandedOff = false;
+        try {
+            MessageCreatedResponse resp = messageService.createUserMessage(sessionId, req);
 
-        // 2. 异步触发 LLM 流（fire-and-forget — @Async 立刻返回）
-        chatService.processUserMessage(sessionId, resp.userMessageId(), req, wsTemplate);
+            // 2. 异步触发 LLM 流（fire-and-forget — @Async 立刻返回）
+            chatService.processUserMessage(sessionId, resp.userMessageId(), req, wsTemplate, claim);
+            claimHandedOff = true;
 
-        // 3. HTTP 立刻返 202 · 客户端拿 assistantMessageId（这里 v1 仍为 "msg-stub-pending"，
-        //    因为 ChatService 内部才生成真 ID；Phase 6 让 MessageService 也返回真实 ID 或
-        //    ChatService 同步预算 assistantId 再回写 resp）。queued=false（空闲直接跑）。
-        return new MessageCreatedResponse(resp.userMessageId(), resp.assistantMessageId(),
-            resp.streamTopic(), false);
+            // 3. HTTP 立刻返 202 · 客户端拿 assistantMessageId（这里 v1 仍为 "msg-stub-pending"，
+            //    因为 ChatService 内部才生成真 ID；Phase 6 让 MessageService 也返回真实 ID 或
+            //    ChatService 同步预算 assistantId 再回写 resp）。queued=false（空闲直接跑）。
+            return new MessageCreatedResponse(resp.userMessageId(), resp.assistantMessageId(),
+                resp.streamTopic(), false);
+        } finally {
+            if (!claimHandedOff) {
+                LlmAgentLoop.releaseClaim(claim);
+            }
+        }
     }
 
     /**
@@ -221,7 +235,7 @@ public class ChatController {
      * <ol>
      *   <li><b>谓词 = 可编辑</b>：只取 {@link NotificationQueue#isQueuedCommandEditable} 命中的项
      *       （CC :359-361 {@code isPromptInputModeEditable(mode) && !cmd.isMeta}）。本仓
-     *       {@code mode=prompt && isMeta=true} 的系统项有三处 —— cron 命令（{@code TestJob:373}）、
+     *       {@code mode=prompt && isMeta=true} 的系统项有三处 —— cron 命令（{@code AgentJob:373}）、
      *       cron missed 启动通知（{@code CronIdleExecutor:235}）、channel 入站消息
      *       （{@code ChannelNotification:154}，正文是原始 XML）—— <b>不再被弹出</b>
      *       （旧谓词只判 {@code mode=prompt}，会把这三类系统文本拼进用户输入框）。</li>

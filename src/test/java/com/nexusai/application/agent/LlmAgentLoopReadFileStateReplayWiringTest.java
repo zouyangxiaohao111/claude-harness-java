@@ -134,7 +134,7 @@ class LlmAgentLoopReadFileStateReplayWiringTest {
     private static String realRenderedReadBody(Path workspace, Path file) throws Exception {
         ReadFileTool tool = new ReadFileTool(new PathGuard(workspace));
         String sessionId = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        ToolUseContext ctx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, PermissionMode.DEFAULT,
             null, false, "", workspace.toRealPath());
         ObjectNode input = JSON.createObjectNode();

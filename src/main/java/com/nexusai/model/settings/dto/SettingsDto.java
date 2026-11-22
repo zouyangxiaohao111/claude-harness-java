@@ -236,7 +236,38 @@ public record SettingsDto(
      * null/0 = 关闭（审批卡只显示保留上下文）；1 = 显示清空上下文选项并二次确认。
      * ⚠️ 三处必须同步：① 本字段 ② SettingsService.toDto ③ update 的 merge 分支。
      */
-    Boolean showClearContextOnPlanAccept
+    Boolean showClearContextOnPlanAccept,
+    /**
+     * [V321 peer-settings] 跨会话入站策略（settings.cross_session_inbound，可空 TEXT）。
+     *
+     * <p>GET 返回原始选择：{@code accept}/{@code hold}/{@code refuse} 或 {@code null}（= 未设置，
+     * 运行时按「自动（按权限模式）」处理，不默认 accept，也不把运行时推导结果写回）。
+     *
+     * <p>PUT 三态：省略字段 = 保持旧值；显式 {@code "auto"} = 清列回 NULL；其余三值 = 设值；
+     * 其它值 → 400（{@link com.nexusai.infra.exception.ValidationException}），不静默接受。
+     *
+     * <p>放在末尾以保持既有构造点参数顺序不变（仅需尾参补 null）。
+     */
+    String crossSessionInbound,
+    /**
+     * [V333 AFK] AskUserQuestion 的 AFK 超时档位（settings.ask_user_afk_timeout）。
+     *
+     * <p>值域对齐 CC {@code askUserQuestionTimeout}：{@code never} / {@code 60s} / {@code 5m} /
+     * {@code 10m}。GET 返回原值（NULL = 未配置 → 前端显示 never）；PUT 三态同
+     * {@code crossSessionInbound}：省略 = 保持旧值、{@code never} = 设 never（不删列）、其它非法值 400。
+     *
+     * <p>⛔ 这里只透出设置值，真正生效的时长由
+     * {@code AskUserQuestionAfkTimeoutResolver} 在「生成本次权限请求」时解析（env 可覆盖时长，
+     * 但设置 never 时一律关闭）。
+     */
+    String askUserAfkTimeout,
+    /**
+     * [V334] 权限中继总闸（settings.channels_permission_relay_enabled）。
+     *
+     * <p>默认<b>开</b>（null/未配置 = 开）。⛔ 它只是「允许中继」：真正推送还要
+     * {@code channelsEnabled} 也开、且该会话已绑定渠道。
+     */
+    Boolean channelsPermissionRelayEnabled
 ) {
 
     /**
@@ -335,6 +366,6 @@ public record SettingsDto(
             skillSearchIntentEnabled, scratchpadEnabled, frcEnabled, agentMainThreadEnabled,
             verifyPlanReminderEnabled, language, outputStyle, enabledPlugins, pluginClaudeFallback,
             allowDynamicHeaderValues, streamIdleTimeoutMs, webfetchEngine, marketAdminEnabled,
-            channelsEnabled, null, null, null, null, null);
+            channelsEnabled, null, null, null, null, null, null, null, null);
     }
 }

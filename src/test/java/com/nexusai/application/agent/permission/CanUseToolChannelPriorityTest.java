@@ -22,7 +22,6 @@ import org.junit.jupiter.api.Test;
 
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
 
 import static org.assertj.core.api.Assertions.assertThat;
@@ -66,7 +65,7 @@ import static org.assertj.core.api.Assertions.assertThat;
 class CanUseToolChannelPriorityTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-00000005b001");
+    private static final String AGENT_ID = "a000000000005b001";
     private static final String SESSION_ID = "00000000-0000-0000-0000-00000005b002";
 
     // ════════════════════════════════════════════════════════════════════

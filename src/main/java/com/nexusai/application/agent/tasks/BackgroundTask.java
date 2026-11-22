@@ -88,7 +88,7 @@ public record BackgroundTask(
      *       ⛔ 本字段的此语义仅用于「任务自身标识」，不是通知收件人。</li>
      * </ul>
      */
-    @Nullable UUID agentId,
+    @Nullable String agentId,
     /**
      * Phase 3: 前台 → 后台 切换标记 (CC LocalAgentTask.tsx:197-262) ·
      * 默认 true（async spawn 一律为后台）；sync 后切后台的 task 由 caller 显式 set false → true。
@@ -181,7 +181,7 @@ public record BackgroundTask(
             String description, @Nullable String toolUseId,
             long startTime, @Nullable Long endTime, @Nullable Long totalPausedMs,
             String outputFile, long outputOffset, boolean notified,
-            @Nullable UUID agentId, boolean isBackgrounded) {
+            @Nullable String agentId, boolean isBackgrounded) {
         this(id, type, status, description, toolUseId,
              startTime, endTime, totalPausedMs,
              outputFile, outputOffset, notified,
@@ -232,7 +232,7 @@ public record BackgroundTask(
     /**
      * Phase 3: 创建一个带 agentId 的副本 (killShellTasksForAgent owner-scoped 归属)
      */
-    public BackgroundTask withAgentId(@Nullable UUID newAgentId) {
+    public BackgroundTask withAgentId(@Nullable String newAgentId) {
         return new BackgroundTask(id, type, status, description, toolUseId,
             startTime, endTime, totalPausedMs, outputFile, outputOffset, notified,
             newAgentId, isBackgrounded, sessionId,

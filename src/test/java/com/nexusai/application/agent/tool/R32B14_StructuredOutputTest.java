@@ -77,7 +77,7 @@ class R32B14_StructuredOutputTest {
     void applierStoresStructuredOutputByToolUseId() {
         // WHY: ToolResultApplier (替代 ExtendedToolResultApplier) 把 structuredOutput 暂存到
         // AgentState.recordStructuredOutput (b14 本地暂存通道, 后续 provider 序列化).
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         ToolResult<Map<String, Object>> result = ToolResult.successWithStructuredOutput("toolu-5", "ack", Map.of("value", "kept"));
         ToolResult<?> applied = ToolResultApplier.apply(result, state.rawMessages(), state, "toolu-5");
         assertEquals("ack", applied.data() instanceof Map<?, ?> m ? m.get("summary") : applied.data());
@@ -91,7 +91,7 @@ class R32B14_StructuredOutputTest {
         // createAttachmentMessage({type:'structured_output', data}) 独立附件消息进 transcript;
         // 该附件不进 LLM (CC normalizeAttachmentForAPI structured_output→[], messages.ts:4258-4261)。
         // 双通道并存: attachment 记录 + AgentState 载体暂存 (takeStructuredOutput 仍可取回)。
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         Map<String, Object> output = Map.of("answer", "yes", "score", 3);
         ToolResult<Map<String, Object>> result = ToolResult.successWithStructuredOutput("toolu-8", "ack", output);
         ToolResultApplier.apply(result, state.rawMessages(), state, "toolu-8");
@@ -151,17 +151,22 @@ class R32B14_StructuredOutputTest {
     }
 
     @Test
-    void structuredOutputToolIsGatedForInteractiveContext() {
+    void structuredOutputToolHasNoCallTimeSessionRejection() {
+        // [2026-11-20 对齐 CC] CC SyntheticOutputTool 的 isEnabled 恒 true、execute 内无
+        //   「交互会话拒绝调用」分支 —— 交互式带 json-schema 是「不注入（模型看不到）」，
+        //   而不是「看得见但一调就失败」。可用性只由注入门决定。
+        //   变异点：恢复调用期拒绝 → 本用例变红（返回 error 而非成功载荷）。
         SyntheticOutputTool tool = new SyntheticOutputTool();
-        ObjectNode input = JsonNodeFactory.instance.objectNode();
+        ObjectNode input = JsonNodeFactory.instance.objectNode().put("answer", "yes");
         ToolUseContext context = new ToolUseContext(
-            UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT,
             Map.of(), List.of(tool), "", AbortController.NOOP, List.of(), null,
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, Map.of(), false);
-        ToolResult<String> result = (ToolResult<String>) tool.execute(new ToolUseBlock("toolu-8", tool.name(), input), context);
-        assertTrue(LlmAgentLoop.isToolErrorData(result.data()));
-        assertTrue(result.data().contains("non-interactive"));
+        ToolResult<String> result = (ToolResult<String>) tool.execute(
+            new ToolUseBlock("toolu-9", tool.name(), input), context);
+        assertFalse(LlmAgentLoop.isToolErrorData(result.data()));
+        assertEquals("yes", ToolResult.presentationMeta(result).get("answer"));
     }
 
     @Test

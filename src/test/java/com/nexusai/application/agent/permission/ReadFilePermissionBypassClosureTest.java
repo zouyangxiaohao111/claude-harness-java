@@ -78,7 +78,7 @@ class ReadFilePermissionBypassClosureTest {
         // ToolUseContext.of(UUID, UUID, PermissionMode) 的 11 参构造第 9 位传 null →
         // permissionContext()==null（compact ctor 不兜底该字段）
         ToolUseContext ctx =
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT);
 
         assertThatThrownBy(() -> checker.check(tool, input(), ctx))
             .as("permCtx 缺失 = 权限管线未装配 → fail-loud IAE（对齐 PermissionContextBuilder:177）")
@@ -92,7 +92,7 @@ class ReadFilePermissionBypassClosureTest {
         // 1 参便捷构造器（测试用）: permissionChecker 未注入 → 调用期 fail-loud
         ReadFileTool tool = new ReadFileTool(new PathGuard(workspace));
         ToolUseContext ctx =
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT);
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT);
 
         assertThatThrownBy(() -> tool.checkPermissions(input(), ctx))
             .as("依赖缺失静默 Allow = Pattern #11 bypass; 对齐 ReadFileTool fail-loud ISE 模式")

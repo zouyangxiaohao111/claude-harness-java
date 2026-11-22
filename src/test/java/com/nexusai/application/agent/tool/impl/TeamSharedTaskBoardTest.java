@@ -77,11 +77,11 @@ class TeamSharedTaskBoardTest {
     }
 
     private ToolUseContext leadCtx() {
-        return ToolUseContext.of(UUID.randomUUID(), LEAD_SESSION);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), LEAD_SESSION);
     }
 
     private ToolUseContext teammateCtx() {
-        return ToolUseContext.of(UUID.randomUUID(), TEAMMATE_SESSION)
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), TEAMMATE_SESSION)
             .withTeammateIdentity(new TeammateIdentity(
                 "mate@" + TEAM, "mate", TEAM, null, false, LEAD_SESSION));
     }

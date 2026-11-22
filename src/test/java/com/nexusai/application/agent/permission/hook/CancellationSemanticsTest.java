@@ -219,7 +219,7 @@ class CancellationSemanticsTest {
 
     /** 带父 abort 的 parentTuc · 对齐 CC toolUseContext.abortController 语义. */
     private static ToolUseContext parentTucWithAbort(AbortController abort) {
-        return ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT,
             List.of(), "", abort, List.of(), null, PermissionMode.DEFAULT);
     }
 

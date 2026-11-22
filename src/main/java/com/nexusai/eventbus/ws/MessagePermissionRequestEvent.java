@@ -117,6 +117,41 @@ public class MessagePermissionRequestEvent extends StreamEvent {
     }
 
     /**
+     * [V333 AFK] 本次 AskUserQuestion 权限卡是否启用倒计时 + 总时长（毫秒）。
+     *
+     * <p>由 {@code WebSocketPermissionPrompter} 在推送前按
+     * {@code settings.ask_user_afk_timeout}（+ 环境变量覆盖）解析后 set：
+     * {@code null} = 不启用（默认；前端卡片保持持久显示、不计时）。
+     *
+     * <p>⚠️ 后端只下发时长，<b>不设任何 deadline</b>：计时与超时提交都发生在前端卡片里。
+     */
+    private Integer afkTimeoutMs;
+
+    /**
+     * [V333 AFK] 倒计时显示阈值（毫秒）· 对齐 CC {@code showCountdown = 剩余*1000 <= 阈值}。
+     *
+     * <p>随 {@link #afkTimeoutMs} 一起下发（默认 20000，可用 {@code CLAUDE_AFK_COUNTDOWN_MS}
+     * 覆盖）。{@code null} = 不启用。
+     */
+    private Integer afkCountdownMs;
+
+    public Integer getAfkTimeoutMs() {
+        return afkTimeoutMs;
+    }
+
+    public void setAfkTimeoutMs(Integer afkTimeoutMs) {
+        this.afkTimeoutMs = afkTimeoutMs;
+    }
+
+    public Integer getAfkCountdownMs() {
+        return afkCountdownMs;
+    }
+
+    public void setAfkCountdownMs(Integer afkCountdownMs) {
+        this.afkCountdownMs = afkCountdownMs;
+    }
+
+    /**
      * [perm-timeout #132] worker 徽标色 · CC original: {@code WorkerBadgeProps.color}
      * （WorkerBadge.tsx:8）+ useInboxPoller.ts:292（{@code entry.workerBadge.color}）。
      *

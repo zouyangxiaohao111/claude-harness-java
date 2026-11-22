@@ -515,7 +515,7 @@ class ForkQueryLoopProviderBoundaryEquivalenceTest {
 
         private ToolUseContext baseTuc() {
             ToolUseContext tuc = new ToolUseContext(
-                UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT, Map.of(), List.of(), "", AbortController.NOOP, List.of());
             return tuc.withAvailableTools(List.of(writeTool())).withEffectiveModelName(sessionModelName);
         }

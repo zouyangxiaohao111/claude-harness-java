@@ -130,7 +130,7 @@ class EnterWorktreeToolTranscriptOriginalCwdTest {
     }
 
     private static ToolUseContext ctx(String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT);
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT);
     }
 
     /** 读取本轮 Enter 落盘的 transcript worktreeSession 节点（无 entry ⇒ null）。 */

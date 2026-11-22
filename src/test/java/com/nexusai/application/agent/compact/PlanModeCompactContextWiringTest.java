@@ -28,10 +28,10 @@ class PlanModeCompactContextWiringTest {
 
     /** 构造 PLAN 模式 TUC：getAppState 返回含 toolPermissionContext.mode=PLAN 的 appState（对齐 EnterPlanModeTool 写侧）。 */
     private static ToolUseContext planModeTuc(PermissionMode mode) {
-        UUID sid = UUID.randomUUID();
+        String sid = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         Map<String, Object> appState = Map.of(
             "toolPermissionContext", ToolPermissionContext.strict(mode));
-        // [session-id-short] of(agentId, sessionId)：agentId=UUID sid，sessionId=short
+        // [session-id-short] of(agentId, sessionId)：agentId=String sid，sessionId=short
         return ToolUseContext.of(
             sid, "sess-" + sid.toString().substring(0, 8), mode,
             List.of(), "", AbortController.NOOP, List.of(),

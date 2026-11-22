@@ -31,7 +31,7 @@ import static org.assertj.core.api.Assertions.assertThat;
  */
 class R32B15Stage3_2P1_FixesTest {
 
-    private static final UUID AGENT_ID = UUID.randomUUID();
+    private static final String AGENT_ID = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
     private static final String SESSION_ID = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     // ═══════════════════ P1-1: 17 参数 canonical 构造器保留 ═══════════════════
@@ -41,7 +41,7 @@ class R32B15Stage3_2P1_FixesTest {
     void test17ParamCanonicalConstructorPreserved() throws Exception {
         // reflection: 必须存在 17 参数 canonical 构造器 (兼容旧调用)
         Constructor<?> ctor = ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class,
+            String.class, String.class, PermissionMode.class,
             Map.class, List.class, String.class,
             Class.forName("com.nexusai.application.agent.tool.AbortController"),
             List.class,
@@ -98,7 +98,7 @@ class R32B15Stage3_2P1_FixesTest {
     @DisplayName("P1-2: 4 参数构造器保留 · delegation 到 17/45 参")
     void testOld4ParamConstructorStillDelegates() throws Exception {
         Constructor<?> ctor = ToolUseContext.class.getConstructor(
-            UUID.class, UUID.class, PermissionMode.class, Map.class
+            String.class, String.class, PermissionMode.class, Map.class
         );
         assertThat(ctor).as("4-param legacy constructor must still exist").isNotNull();
 

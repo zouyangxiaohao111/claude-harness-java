@@ -101,7 +101,10 @@ public class SettingsController {
      */
     @GetMapping("/http-proxy")
     public HttpProxyResponse getHttpProxy() {
-        return new HttpProxyResponse(settingsService.readDbHttpProxy());
+        // [保密 2026-11-22 B6] 只回 user:****@host:port；三态语义不变：
+        //   null = 未配置、"" = 显式直连、非空 = 该代理（口令段被掩码）。
+        return new HttpProxyResponse(
+            com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(settingsService.readDbHttpProxy()));
     }
 
     /**
@@ -117,8 +120,13 @@ public class SettingsController {
      */
     @PutMapping("/http-proxy")
     public HttpProxyResponse updateHttpProxy(@RequestBody(required = false) HttpProxyRequest body) {
-        settingsService.writeDbHttpProxy(body == null ? null : body.proxy());
-        return new HttpProxyResponse(settingsService.readDbHttpProxy());
+        // [保密 2026-11-22 B6] 掩码哨兵：前端回传 `user:****@host` 时把口令段换回库中真值
+        //   （允许只改主机/端口），⛔ 绝不把 **** 写进库。null/"" 三态原样透传给 writeDbHttpProxy。
+        String incoming = body == null ? null : body.proxy();
+        settingsService.writeDbHttpProxy(com.nexusai.infra.util.ApiKeyHasher
+            .unmaskProxyPassword(incoming, settingsService.readDbHttpProxy()));
+        return new HttpProxyResponse(
+            com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(settingsService.readDbHttpProxy()));
     }
 
     /**
@@ -156,7 +164,11 @@ public class SettingsController {
      */
     @PostMapping("/http-proxy/test")
     public ProxyTestResponse testHttpProxy(@RequestBody(required = false) HttpProxyRequest body) {
-        String proxy = body == null ? null : body.proxy();
+        // [保密 2026-11-22 B6] 「试一下」必须用**服务端真值**：前端拿到的是 user:****@host，
+        //   直接拿去连会把掩码当口令（必失败）。掩码段在这里换回库中真口令；用户新输入的真口令原样使用。
+        String proxy = com.nexusai.infra.util.ApiKeyHasher
+            .unmaskProxyPassword(body == null ? null : body.proxy(),
+                settingsService.readDbHttpProxy());
         com.nexusai.infra.llm.ProxyProbe.TestResult r =
             com.nexusai.infra.llm.ProxyProbe.test(proxy);
         return new ProxyTestResponse(r.ok(), r.latencyMs(), r.error());

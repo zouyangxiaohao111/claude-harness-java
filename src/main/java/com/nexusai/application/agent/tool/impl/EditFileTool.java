@@ -20,6 +20,8 @@ import com.nexusai.application.agent.tool.StructuredPatchGenerator;
 import com.nexusai.application.agent.tool.StructuredPatchHunk;
 import com.nexusai.application.agent.tool.AgentToolResult;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.application.agent.tool.ToolError;
+import com.nexusai.application.agent.tool.ToolErrorKind;
 import com.nexusai.application.agent.tool.ToolResultBlockParam;
 import com.nexusai.application.agent.tool.ToolUseContext;
 import com.nexusai.application.agent.tool.ToolUseContext.ReadState;
@@ -300,6 +302,16 @@ public class EditFileTool implements Tool {
                "file_path is resolved relative to the workspace root.";
     }
 
+    /**
+     * [B2] 本次调用的一句话摘要（权限推送/弹窗标题），对齐 CC {@code tool.description(input)}。
+     * ⛔ 不复用注册期长描述（说明书）。
+     */
+    @Override
+    public String description(JsonNode input) {
+        // [B2] CC 口径：固定标题句，不含路径（细节留给 input_preview）。
+        return "A tool for editing files";
+    }
+
     @Override
     public JsonNode inputSchema() {
         ObjectNode root = JSON.createObjectNode();
@@ -330,6 +342,9 @@ public class EditFileTool implements Tool {
         ObjectNode replaceAll = JSON.createObjectNode();
         replaceAll.put("type", "boolean");
         replaceAll.put("default", false);
+        // [对齐 CC semanticBoolean] 广告仍是 boolean（模型看到的 shape 不变），但运行时容忍
+        //   字符串 "true"/"false"（CC utils/semanticBoolean.ts:24-29 的 z.preprocess）。
+        replaceAll.put("x-semantic-boolean", true);
         replaceAll.put("description", "Replace all occurrences of old_string (default false)");
         properties.set("replace_all", replaceAll);
 
@@ -582,22 +597,33 @@ public class EditFileTool implements Tool {
         }
         String relPath = input.path("file_path").asText("");
         if (relPath.isBlank()) {
-            return Tool.ValidationResult.pass();  // execute() 内部会拒空 path
+            // [错误通道 · C2] 空 file_path 前置拒绝，不再 pass() 到 executeInternal。
+            //   WHY: 此前 pass() 后由 executeInternal 回 "path is empty"（旧实现是普通 String data），
+            //   未命中错误前缀表 ⇒ is_error=false，再被成功模板 mapper 渲染成
+            //   "The file  has been updated successfully."（实测假成功）。
+            //   CC 侧无显式空路径检查（expandPath("") 落到目录后读失败抛错），效果同为错误通道；
+            //   此处给出模型可行动的显式提示，errorCode 取描述性值（该码只进 telemetry）。
+            if (log.isWarnEnabled()) {
+                log.warn("EditFileTool: validateInput 空 file_path 拒绝（错误通道 C2）");
+            }
+            return Tool.ValidationResult.fail("EMPTY_FILE_PATH",
+                "The file_path parameter is empty. Provide the absolute path of the file to edit.");
         }
 
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），越狱 defer 逻辑删除
         // [会话 cwd] 会话感知解析（基准 = 本会话当前 cwd；ctx 此处已非 null，见上方 ctx==null 拒绝）
         Path file = guard.resolve(ctx.sessionId(), relPath);
-        // UNC 路径提前 pass (CC :179-181 防 NTLM 凭据泄露).
+        // [顺序对齐 CC] UNC 短路移到 deny 规则之后（CC :158-174 deny 先于 :176-181 UNC），
+        //   插入点见下方 errorCode 2 块末尾。先取字符串形态供后续判定。
         String fullFilePathStr = file.toString();
-        if (fullFilePathStr.startsWith("\\\\") || fullFilePathStr.startsWith("//")) {
-            return Tool.ValidationResult.pass();
-        }
 
         // P1-4: team memory secret 检查 · 对齐 CC FileEditTool.ts:144 — 编辑 team memory 文件
         // 写入 new_string 含 secret → 拒绝 (errorCode 0)，防止 secret 同步给仓库协作者。
         String oldString = input.path("old_string").asText("");
         String newString = input.path("new_string").asText("");
+        // [对齐 CC semanticBoolean] replace_all 广告为 boolean，但 schema 带 x-semantic-boolean
+        //   运行时容忍字符串 "true"/"false"（CC types.ts:13-21 / utils/semanticBoolean.ts）。
+        //   Jackson 的 TextNode.asBoolean(default) 会把 "true"/"false" 解析为布尔，故读取不变。
         boolean replaceAll = input.path("replace_all").asBoolean(false);
         if (teamMemSecretGuard != null) {
             String secretError = teamMemSecretGuard.checkTeamMemSecrets(fullFilePathStr, newString);
@@ -636,6 +662,12 @@ public class EditFileTool implements Tool {
                 return Tool.ValidationResult.fail("2",
                     "File is in a directory that is denied by your permission settings.");
             }
+        }
+
+        // UNC 路径提前 pass · 对齐 CC FileEditTool.ts:176-181（deny 之后、任何文件系统操作之前）。
+        //   WHY: Windows 上 stat/read 对 UNC 路径会触发 SMB 认证，泄露 NTLM 凭据。
+        if (fullFilePathStr.startsWith("\\\\") || fullFilePathStr.startsWith("//")) {
+            return Tool.ValidationResult.pass();
         }
 
         // errorCode 10: 1 GiB 大小上限 · 对齐 CC FileEditTool.ts:184-197（stat bytes 前置于读取，
@@ -855,6 +887,76 @@ public class EditFileTool implements Tool {
      * 统计子串出现次数 (非重叠, 等价 CC {@code file.split(sub).length - 1}) ·
      * errorCode 9 多匹配判断用。
      */
+    /** call 级 pre-read guard 判定（对齐 CC 2.1.278 {@code A2o}）。 */
+    enum CallGuardVerdict {
+        /** 放行（mtime 未增 / 全量内容一致 / 免门命中）。 */
+        OK,
+        /** mtime 变新且内容已变，但 old_string 仍可干净施加 ⇒ 放行并标记 staleRecovered。 */
+        RECOVERED,
+        /** 无读记录且未获免门 ⇒ 抛 eAn（File has not been read yet）。 */
+        THROW_NOT_READ,
+        /** mtime 变新且内容已变、old_string 也不适用 ⇒ 抛 sQe（File content has changed）。 */
+        THROW_STALE
+    }
+
+    /**
+     * call 级 pre-read guard · 对齐 CC {@code A2o}（exe 2.1.328 行为；旧快照无此符号）。
+     *
+     * <p>顺序与 CC 一致：无 entry（按免门）→ mtime 未增 → full-read 内容一致 →
+     * old_string 仍适用（staleRecovered）→ 否则 sQe。
+     *
+     * <p>已确定的偏离：不做模型分叉（用户 2026-09-22 裁定）、无 readBaseline 通道（N/A）。
+     *
+     * @param lastWriteTime 当前文件 mtime（毫秒；stat 失败传 -1）
+     * @param lastRead      读记录（null = 从未读过）
+     * @param skipAllowed   无 entry 时是否免门（read 层 allow）
+     * @return 判定结果
+     */
+    static CallGuardVerdict evaluateCallLevelGuard(
+            long lastWriteTime, ReadState lastRead, boolean skipAllowed,
+            String relPath, String content, String oldString, String newString, boolean replaceAll) {
+        if (lastRead == null) {
+            return skipAllowed ? CallGuardVerdict.OK : CallGuardVerdict.THROW_NOT_READ;
+        }
+        if (lastWriteTime <= lastRead.mtimeMillis()) {
+            return CallGuardVerdict.OK;
+        }
+        boolean isFullRead = lastRead.offset() == null && lastRead.limit() == null;
+        // [G13④] BOM 归一比对：ReadState 无 BOM、FileEncodingReader 保留 BOM，双侧剥 U+FEFF。
+        boolean contentUnchanged = isFullRead
+            && stripLeadingBom(content).equals(stripLeadingBom(lastRead.content()));
+        if (contentUnchanged) {
+            return CallGuardVerdict.OK;
+        }
+        return staleEditApplies(relPath, content, oldString, newString, replaceAll)
+            ? CallGuardVerdict.RECOVERED
+            : CallGuardVerdict.THROW_STALE;
+    }
+
+    /**
+     * 编辑能否干净施加于给定内容 · 对齐 CC {@code BEe(...)==="applies"}。
+     *
+     * <p>复用与执行链相同的归一化/匹配（semantic desanitize + 弯引号），
+     * 要求：命中且（replace_all=true 时 ≥1 处；否则恰好 1 处）。
+     *
+     * @return true = 该编辑可安全施加
+     */
+    static boolean staleEditApplies(String relPath, String content,
+            String oldString, String newString, boolean replaceAll) {
+        try {
+            EditMatchEngine.NormalizedEdit normalized =
+                EditMatchEngine.normalizeEdit(relPath, content, oldString, newString);
+            String actualOld = EditMatchEngine.findActualString(content, normalized.oldString());
+            if (actualOld == null) {
+                return false;
+            }
+            int matches = countOccurrences(content, actualOld);
+            return replaceAll ? matches >= 1 : matches == 1;
+        } catch (RuntimeException e) {
+            return false;  // 归一化/匹配异常 → 视为不适用（保守拒绝）
+        }
+    }
+
     private static int countOccurrences(String s, String sub) {
         if (sub.isEmpty()) {
             return 0;
@@ -1235,8 +1337,10 @@ public class EditFileTool implements Tool {
         // [L+ round 4] ctx 为 null → validateInput 内部已拒绝, 此处不再 null 兜底.
         ValidationResult vr = validateInput(call.input(), ctx);
         if (!vr.ok()) {
-            return ToolResult.error(call.id(),
-                "EditFileTool validateInput failed: " + vr.message());
+            // [错误通道 · C2] 语义校验失败归 VALIDATE_INPUT（套 <tool_use_error> 外壳，对齐 CC
+            //   toolExecution.ts:717-732）；旧实现用 ToolResult.error 默认类别，且文案带工具名前缀。
+            return ToolResult.failure(call.id(), vr.message(),
+                ToolErrorKind.VALIDATE_INPUT);
         }
         ToolResult result = executeInternal(call, ctx);
         // 仅写回成功后 invalidate cache; 错误结果不动 cache (避免污染)
@@ -1269,13 +1373,23 @@ public class EditFileTool implements Tool {
         return result;
     }
 
-    private ToolResult executeInternal(ToolUseBlock call, ToolUseContext ctx) {
+    /**
+     * 执行编辑（不含 validateInput）· package-private 供测试直接覆盖 call 级守卫
+     * （validateInput 已由 {@link #execute} 前置执行；测试需绕过它构造 TOCTOU 场景）。
+     */
+    ToolResult executeInternal(ToolUseBlock call, ToolUseContext ctx) {
         String relPath = call.input().path("file_path").asText("");
         String oldString = call.input().path("old_string").asText("");
         String newString = call.input().path("new_string").asText("");
         boolean replaceAll = call.input().path("replace_all").asBoolean(false);
 
-        if (relPath.isBlank()) return ToolResult.error(call.id(), "path is empty");
+        if (relPath.isBlank()) {
+            // [错误通道 · C2] 绕过 validateInput 直达 executeInternal 时的兜底：
+            //   显式 VALIDATE_INPUT 类别，避免旧实现「普通 String data ⇒ 前缀表漏判 ⇒ is_error=false」。
+            return ToolResult.failure(call.id(),
+                "The file_path parameter is empty. Provide the absolute path of the file to edit.",
+                ToolErrorKind.VALIDATE_INPUT);
+        }
 
         // [CC 对齐 2026-09-03] PathGuard 逃逸拦截已删（resolve 纯展开不抛），逃逸拒绝删除
         // [会话 cwd] 会话感知解析：相对路径基准 = 本会话当前 cwd（对齐 CC expandPath(baseDir=getCwd())）；
@@ -1310,6 +1424,9 @@ public class EditFileTool implements Tool {
             if (file.getParent() != null) {
                 Files.createDirectories(file.getParent());
             }
+
+            // [对齐 CC staleRecovered] mtime 变新但 old_string 仍可干净施加时放行，并在结果里标记。
+            boolean staleRecovered = false;
 
             // [G33①/OPD-D2-07] call 级 pre-read guard · 对齐 CC 2.1.278 {@code A2o}
             //   （exe byte offset 206612007；旧注释锚 FileEditTool.ts:451-468 是 2.1.88 行号）：
@@ -1355,7 +1472,10 @@ public class EditFileTool implements Tool {
                 //   仍能干净唯一匹配 ⇒ 放行并打 staleRecovered 标记）本仓<b>未抄</b> —— 抄了会把本仓
                 //   由「拒」改成「放行」，属放宽，本批不做，在此如实登记。
                 if (lastRead == null) {
-                    if (!readLayerAllowsSkip(file, ctx)) {
+                    CallGuardVerdict verdict = evaluateCallLevelGuard(
+                        lastWriteTime, null, readLayerAllowsSkip(file, ctx),
+                        relPath, content, oldString, newString, replaceAll);
+                    if (verdict == CallGuardVerdict.THROW_NOT_READ) {
                         if (log.isWarnEnabled()) {
                             log.warn("EditFileTool: call 级 pre-read guard 拒绝（CC A2o !lastRead 且未获免门"
                                 + " ⇒ throw RX(eAn)）: path={}", relPath);
@@ -1366,22 +1486,27 @@ public class EditFileTool implements Tool {
                         log.info("EditFileTool: call 级 pre-read guard 免门放行（CC A2o: !lastRead + "
                             + "免门判据真 + readBaseline 缺失 ⇒ return !1）: path={}", relPath);
                     }
-                } else if (lastWriteTime > lastRead.mtimeMillis()) {
-                    boolean isFullRead = lastRead.offset() == null && lastRead.limit() == null;
-                    // [G13④] BOM 归一比对（同 validateInput errorCode-7）：ReadState 无 BOM、
-                    //   FileEncodingReader 保留 BOM，双侧剥前导 U+FEFF 后等价。
-                    boolean contentUnchanged = isFullRead
-                        && stripLeadingBom(content).equals(stripLeadingBom(lastRead.content()));
-                    if (!contentUnchanged) {
+                } else {
+                    CallGuardVerdict verdict = evaluateCallLevelGuard(
+                        lastWriteTime, lastRead, false,
+                        relPath, content, oldString, newString, replaceAll);
+                    if (verdict == CallGuardVerdict.THROW_STALE) {
                         if (log.isWarnEnabled()) {
                             log.warn("EditFileTool: call 级 stale 复检拒绝（CC A2o 尾 throw RX(sQe)）: path={} "
-                                + "lastWriteTime={} readMtime={} isFullRead={}",
-                                relPath, lastWriteTime, lastRead.mtimeMillis(), isFullRead);
+                                + "lastWriteTime={} readMtime={}",
+                                relPath, lastWriteTime, lastRead.mtimeMillis());
                         }
                         // CC A2o 尾 `throw new RX(sQe)`：Java 由 executeInternal 外层 catch 转
-                        // "Edit error: <msg>"（isToolErrorData 前缀 "Edit error" 识别 → is_error=true，
-                        // StreamingToolExecutor:1861）。message 保持 CC 2.1.278 sQe 逐字。
+                        // "Edit error: <msg>"（isError 由 ToolError 结构判定）。message 与 CC 逐字一致。
                         throw new IllegalStateException(FILE_CONTENT_CHANGED_ERROR);
+                    }
+                    if (verdict == CallGuardVerdict.RECOVERED) {
+                        staleRecovered = true;
+                        if (log.isInfoEnabled()) {
+                            log.info("EditFileTool: staleRecovered —— mtime 变新但 old_string 仍可干净施加，"
+                                + "放行编辑（对齐 CC A2o `BEe(...)==\"applies\"`）: path={} replaceAll={}",
+                                relPath, replaceAll);
+                        }
                     }
                 }
             }
@@ -1453,6 +1578,11 @@ public class EditFileTool implements Tool {
             structuredOutput.put("replaceAll", replaceAll);        // CC data.replaceAll（FileEditTool.ts:568）
             if (gitDiff != null) {
                 structuredOutput.put("gitDiff", gitDiff);          // CC data.gitDiff（FileEditTool.ts:569）
+            }
+            if (staleRecovered) {
+                // [对齐 CC] mtime 变新但编辑仍可干净施加 → 结果携带 staleRecovered 标记
+                //   （exe 2.1.328 @167336640 存在该串；CC snapshot 无此符号，字段落位按 exe 语义）。
+                structuredOutput.put("staleRecovered", true);
             }
             String summary = replaceAll
                 ? "The file " + filePath + " has been updated. All occurrences were successfully replaced."
@@ -1689,7 +1819,7 @@ public class EditFileTool implements Tool {
      *   <li>默认      → {@code The file ${filePath} has been updated successfully${modifiedNote}.}</li>
      * </ul>
      * modifiedNote（CC :579-581）: userModified 时追加
-     * {@code ".  The user modified your proposed changes before accepting them. "}。
+     * {@code ".  The user modified your proposed content before accepting it. "}。
      *
      * @param result 工具执行结果（structuredOutput 含 filePath/userModified/replaceAll）
      * @return tool_result 块（tool_use_id/type/content/is_error）
@@ -1699,12 +1829,22 @@ public class EditFileTool implements Tool {
         if (!(result instanceof ToolResult<?> tr)) {
             return null;
         }
+        // [错误通道 · C2 第二道防线] 失败时返回 null → 调用方走默认渲染器/执行器错误路径，
+        //   永不由本方法输出成功模板。对齐 CC：FileEditTool.ts:575-594 的 mapper 只在
+        //   tool.call() 成功返回后被调用（toolExecution.ts:1288-1292），错误路径从不经过它。
+        if (isError || tr.data() instanceof ToolError) {
+            if (log.isDebugEnabled()) {
+                log.debug("EditFileTool.mapToToolResultBlockParam: 失败结果不产成功模板 → null (isError={} toolError={})",
+                    isError, tr.data() instanceof ToolError);
+            }
+            return null;
+        }
         Map<String, Object> so = ToolResult.presentationMeta(tr);
         String filePath = so.get("filePath") instanceof String s ? s : "";
         boolean userModified = Boolean.TRUE.equals(so.get("userModified"));
         boolean replaceAll = Boolean.TRUE.equals(so.get("replaceAll"));
         String modifiedNote = userModified
-                ? ".  The user modified your proposed changes before accepting them. "
+                ? ".  The user modified your proposed content before accepting it. "
                 : "";
         String content;
         if (replaceAll) {

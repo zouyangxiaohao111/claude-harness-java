@@ -54,6 +54,17 @@ public class KbConfigService {
     @Autowired private DataSource dataSource;
 
     /**
+     * 文档 / 知识库行读取器 · 只服务 {@link #resolveEmbeddingModelId(String, String)} 的 id 版。
+     *
+     * <p>⚠️ {@code required = false}：单测只验配置读写时不装配这两张表；为 null 时
+     * 那两个级别视为「拿不到」，仍会走全局回落（不是错误）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.repo.mapper.KbKnowledgeMapper knowledgeMapper;
+    @Autowired(required = false)
+    private com.nexusai.kb.repo.mapper.KbKnowledgeBaseMapper knowledgeBaseMapper;
+
+    /**
      * 模型目录（用于「未显式配置时自动选用」）。
      *
      * <p>⚠️ {@code required = false}：单测只验配置读写时不装配模型层；
@@ -139,6 +150,72 @@ public class KbConfigService {
      */
     public String readEmbeddingModelId() {
         return readModelId(KbConfigRecord::getEmbeddingModelId, ModelType.embedding);
+    }
+
+    /**
+     * 解析「某文档该用哪个 embedding 模型」· 知识库内<b>唯一</b>口径。
+     *
+     * <p>优先级：文档级 → 知识库级 → {@link #readEmbeddingModelId()}（全局配置 + 自动选用）。
+     *
+     * <p><b>⭐ 为什么必须集中在这里</b>：2026-11-18 发现后处理（问题生成 / 摘要）各自抄了一份
+     * 「文档级 → 库级 → null」的两级实现，漏了第三级 ⇒ {@code reindexKnowledge(..., null)}
+     * 进「只重建关键词」分支，而该分支按 {@code content_hash} 清掉「过期」向量、<b>且不重建</b>
+     * ⇒ 每跑一批后处理就删一批向量。真机证据（合同库测试 / 租金支付0831（测试）.xls）：
+     * 索引完成时 659 个块都有向量，9 批后处理之后只剩 1 条。
+     *
+     * @param knowledge 知识条目行（可 null）
+     * @param kb        知识库行（可 null）
+     * @return 模型 ID；三级都拿不到 ⇒ null（调用方按「只走关键词」处理，不是错误）
+     */
+    public String resolveEmbeddingModelId(
+            com.nexusai.kb.repo.entity.KbKnowledgeRecord knowledge,
+            com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord kb) {
+        if (knowledge != null) {
+            String own = knowledge.getEmbeddingModelId();
+            if (own != null && !own.isBlank()) {
+                return own;
+            }
+        }
+        if (kb != null) {
+            String kbModel = kb.getEmbeddingModelId();
+            if (kbModel != null && !kbModel.isBlank()) {
+                return kbModel;
+            }
+        }
+        // 第三级：全局配置（未显式配置时自动选用第一个启用的 embedding 模型）
+        return readEmbeddingModelId();
+    }
+
+    /**
+     * 同 {@link #resolveEmbeddingModelId(Object, Object)}，但只给 id 时现查两行。
+     *
+     * <p>用于手上只有 {@code knowledgeId / knowledgeBaseId} 的调用点（分块编辑、状态切换等）。
+     * mapper 未装配（单测 / 非 Spring）时按「拿不到行」处理，仍会走第三级全局回落。
+     *
+     * @param knowledgeId     知识条目 ID（可 null）
+     * @param knowledgeBaseId 知识库 ID（可 null）
+     * @return 模型 ID；三级都拿不到 ⇒ null
+     */
+    public String resolveEmbeddingModelId(String knowledgeId, String knowledgeBaseId) {
+        com.nexusai.kb.repo.entity.KbKnowledgeRecord knowledge = null;
+        if (knowledgeId != null && !knowledgeId.isBlank() && knowledgeMapper != null) {
+            try {
+                knowledge = knowledgeMapper.selectOneById(knowledgeId);
+            } catch (RuntimeException e) {
+                log.warn("[kb_config] 解析 embedding 模型时读文档失败（按库级/全局处理）id={} 原因={}",
+                        knowledgeId, e.toString());
+            }
+        }
+        com.nexusai.kb.repo.entity.KbKnowledgeBaseRecord kb = null;
+        if (knowledgeBaseId != null && !knowledgeBaseId.isBlank() && knowledgeBaseMapper != null) {
+            try {
+                kb = knowledgeBaseMapper.selectOneById(knowledgeBaseId);
+            } catch (RuntimeException e) {
+                log.warn("[kb_config] 解析 embedding 模型时读知识库失败（按全局处理）kb={} 原因={}",
+                        knowledgeBaseId, e.toString());
+            }
+        }
+        return resolveEmbeddingModelId(knowledge, kb);
     }
 
     /**

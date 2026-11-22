@@ -225,6 +225,25 @@ public class SessionRecord {
     private String goal;
 
     /**
+     * 会话级显式无人值守（V329 列 unattended_mode，INTEGER 0/1 可空）。
+     *
+     * <p>对齐 CC Ask 可用性门 {@code tfi()} 的 {@code Se()}（非交互）语义：只有<b>显式开启</b>
+     * 的会话才剔除 AskUserQuestion；⛔ 不再用 {@code im_chat.bound_session_id} 隐式判定
+     * （绑定渠道本身不禁 Ask，见 R6/R16）。
+     * <p>可空：null/0 = 否；1 = 本会话无人值守。按 sessionId 读写，跨会话互不影响。
+     */
+    private Integer unattendedMode;
+
+    /**
+     * 会话级 Brief 状态（V329 列 brief_mode，INTEGER 0/1 可空）。
+     *
+     * <p>与无人值守、IM 工具开关同属「渠道/Brief 联动」状态：SendUserMessage（{@code BriefTool}）
+     * 是否在模型 schema 内以本列为准（写侧同时同步 {@code disabled_tools} 的 SendUserMessage 项）。
+     * <p>可空：null/0 = 关；1 = 开。Brief 单独开启<b>不</b>影响 Ask（R12）。
+     */
+    private Integer briefMode;
+
+    /**
      * 分叉来源会话 id（V297 列 forked_from，可空）。
      *
      * <p>SessionStart hook 的 {@code source='fork'} 判据；由
@@ -232,6 +251,17 @@ public class SessionRecord {
      * 历史分叉行保持 NULL（无法回溯，⛔ 不靠标题后缀判断）。
      */
     private String forkedFrom;
+
+    /**
+     * 派生来源会话 id（V328 列 derived_from_session_id，可空）。
+     *
+     * <p>{@code SessionCreateTool} 创建同级会话时写入；null = 用户自己建的普通会话。
+     * 用途：单父派生数上限统计 + 左栏「派生自 X」标记。⛔ 不靠标题/文本推断。
+     */
+    private String derivedFromSessionId;
+
+    /** 派生深度（V328 列 derived_depth，可空）：父=0 派生出的会话=1，再派生=2；null = 非派生会话。 */
+    private Integer derivedDepth;
 
     /**
      * 主对话「引入知识库」开关（V278，2026-11-06）。
@@ -327,7 +357,19 @@ public class SessionRecord {
     public String getGoal() { return goal; }
     public void setGoal(String goal) { this.goal = goal; }
 
+    // [unattended/brief V329] 会话级显式无人值守 + Brief 状态（V329 会话列，MyBatis-Flex snake↔camel 映射）
+    public Integer getUnattendedMode() { return unattendedMode; }
+    public void setUnattendedMode(Integer unattendedMode) { this.unattendedMode = unattendedMode; }
+    public Integer getBriefMode() { return briefMode; }
+    public void setBriefMode(Integer briefMode) { this.briefMode = briefMode; }
+
     // [hook-v2.1.325 V297] 分叉来源会话 id（会话列 forked_from，可空；SessionStart source=fork 判据）
     public String getForkedFrom() { return forkedFrom; }
     public void setForkedFrom(String forkedFrom) { this.forkedFrom = forkedFrom; }
+
+    // [session-create V328] 派生来源/深度 getter/setter（V328 会话列，MyBatis-Flex snake↔camel 映射）
+    public String getDerivedFromSessionId() { return derivedFromSessionId; }
+    public void setDerivedFromSessionId(String derivedFromSessionId) { this.derivedFromSessionId = derivedFromSessionId; }
+    public Integer getDerivedDepth() { return derivedDepth; }
+    public void setDerivedDepth(Integer derivedDepth) { this.derivedDepth = derivedDepth; }
 }

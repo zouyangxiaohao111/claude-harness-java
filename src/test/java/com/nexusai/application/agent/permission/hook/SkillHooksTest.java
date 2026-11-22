@@ -261,7 +261,7 @@ class SkillHooksTest {
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        tool.execute(block, ToolUseContext.of(UUID.randomUUID(), sessionId));
+        tool.execute(block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         Map<HookEventType, List<SessionHookStore.SessionDerivedHookMatcher>> hooks =
                 registry2.getSessionHooks(sessionId.toString(), HookEventType.USER_PROMPT_SUBMIT);
@@ -302,7 +302,7 @@ class SkillHooksTest {
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        var result = tool.execute(block, ToolUseContext.of(UUID.randomUUID(), sessionId));
+        var result = tool.execute(block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         // 门控只拦 hooks 注册, 技能本身仍正常执行
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
@@ -343,7 +343,7 @@ class SkillHooksTest {
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        var result = tool.execute(block, ToolUseContext.of(UUID.randomUUID(), sessionId));
+        var result = tool.execute(block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data()))
             .as("bundled 来源技能执行 data 非错误消息（IMP-C2 后 isError 由执行路径推导）")
@@ -387,7 +387,7 @@ class SkillHooksTest {
         ObjectMapper mapper = new ObjectMapper();
         ToolUseBlock block = new ToolUseBlock("tb-1", "Skill", mapper.readTree("{\"skill\":\"skill-a\"}"));
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        var result = tool.execute(block, ToolUseContext.of(UUID.randomUUID(), sessionId));
+        var result = tool.execute(block, ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId));
 
         assertThat(LlmAgentLoop.isToolErrorData(result.data())).isFalse();
         Map<HookEventType, List<SessionHookStore.SessionDerivedHookMatcher>> hooks =

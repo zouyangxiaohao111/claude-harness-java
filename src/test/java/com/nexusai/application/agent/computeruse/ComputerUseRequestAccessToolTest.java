@@ -19,7 +19,6 @@ import org.sqlite.SQLiteDataSource;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -83,7 +82,7 @@ class ComputerUseRequestAccessToolTest {
         return node;
     }
 
-    private ToolUseContext ctx(UUID agentId) {
+    private ToolUseContext ctx(String agentId) {
         return ToolUseContext.of(agentId, SESSION);
     }
 
@@ -204,7 +203,7 @@ class ComputerUseRequestAccessToolTest {
     void subagentDoesNotAcquireLock() {
         ComputerUseRequestAccessTool tool = newTool();
         var result = tool.execute(new ToolUseBlock("call-1", tool.name(), input("Notepad")),
-                ctx(UUID.randomUUID()));
+                ctx(com.nexusai.application.agent.subagent.AgentContext.createAgentId()));
 
         JsonNode data = (JsonNode) ((ToolResult<?>) result).data();
         assertThat(data.path("granted_count").asInt()).isEqualTo(1);

@@ -229,7 +229,7 @@ public class PermissionContextBuilder {
         if (state == null) {
             throw new IllegalArgumentException("state is null");
         }
-        UUID agentId = state.agentId();
+        String agentId = state.agentId();
         String sessionId = state.sessionId();
         if (sessionId == null) {
             throw new IllegalArgumentException("AgentState.sessionId is null");
@@ -237,7 +237,9 @@ public class PermissionContextBuilder {
         if (agentId == null) {
             throw new IllegalArgumentException("AgentState.agentId is null");
         }
-        return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
+        return ToolUseContext.of(
+            agentId,
+            sessionId, PermissionMode.DEFAULT);
     }
 
     /**
@@ -252,7 +254,9 @@ public class PermissionContextBuilder {
             List<?> messages) {
         ToolUseContext base = buildToolUseContext(state);
         if (abortController == null && (messages == null || messages.isEmpty())) return base;
-        return ToolUseContext.of(base.agentId(), base.sessionId(), base.mode(),
+        return ToolUseContext.of(
+            base.agentId(),
+            base.sessionId(), base.mode(),
             base.availableTools(), base.taskListId(), abortController, messages);
     }
 

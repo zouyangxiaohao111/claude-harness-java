@@ -33,7 +33,6 @@ import org.springframework.messaging.simp.SimpMessagingTemplate;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.ExecutorService;
@@ -90,7 +89,7 @@ import static org.mockito.Mockito.when;
 class PermissionWriteKeyEqualsDeliveryKeyTest {
 
     private static final JsonNodeFactory JSON = JsonNodeFactory.instance;
-    private static final UUID AGENT_ID = UUID.fromString("00000000-0000-0000-0000-000000000002");
+    private static final String AGENT_ID = "a000000000000002";
     /** teammate 的 TUC sessionId 实机值 = 「确无会话」哨兵（T1 前/降级路径才会出现）。 */
     private static final String NO_SESSION_SENTINEL = "no-session";
     /** Leader（= 有 UI 的会话）的 sessionId。 */

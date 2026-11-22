@@ -228,7 +228,7 @@ public class TeamController {
         }
         ToolUseBlock block = new ToolUseBlock(UUID.randomUUID().toString(), TeamCreateTool.NAME, input);
         // [session-id-short] sessionId 已 short，直传（不再 canonicalUuid 派生 UUID）
-        ToolUseContext ctx = ToolUseContext.of(UUID.randomUUID(), sessionId);
+        ToolUseContext ctx = ToolUseContext.of(null, sessionId);
         AgentToolResult<?> result = teamCreateTool.execute(block, ctx);
         String raw = String.valueOf(result.data());
         JsonNode dataNode = parseToolResult(result.data());

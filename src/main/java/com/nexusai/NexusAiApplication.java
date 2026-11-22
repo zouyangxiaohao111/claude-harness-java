@@ -1,6 +1,8 @@
 package com.nexusai;
 
 import com.nexusai.application.agent.telemetry.ToolTelemetryProperties;
+import com.nexusai.wechatlog.key.elevation.ElevatedKeyExtractProtocol;
+import com.nexusai.wechatlog.key.elevation.WeChatKeyExtractMain;
 import org.mybatis.spring.annotation.MapperScan;
 import org.springframework.boot.builder.SpringApplicationBuilder;
 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -31,6 +33,11 @@ import java.nio.file.Paths;
 })
 public class NexusAiApplication {
     public static void main(String[] args) {
+        // 提权子进程分支：同一份 fat jar 以 runas 启动时带哨兵参数，此时只取微信密钥，
+        // 绝不启动 Spring（否则会占用端口/迁移数据库/弹一堆无关初始化）。
+        if (ElevatedKeyExtractProtocol.isInvocation(args)) {
+            System.exit(WeChatKeyExtractMain.run(ElevatedKeyExtractProtocol.payload(args)));
+        }
         new SpringApplicationBuilder(NexusAiApplication.class)
             .initializers(NexusAiApplication::ensureHomeDir)
             .run(args);

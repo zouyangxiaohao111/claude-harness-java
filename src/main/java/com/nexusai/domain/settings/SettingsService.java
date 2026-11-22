@@ -197,6 +197,41 @@ public class SettingsService {
         if (req.showClearContextOnPlanAccept() != null) {
             s.setShowClearContextOnPlanAccept(req.showClearContextOnPlanAccept());
         }
+        // [V321 peer-settings] 跨会话入站策略三态（省略 = 保持旧值；auto = 清列回 NULL；
+        //   accept/hold/refuse = 设值；其它 → 400）。不能靠 PUT null 清列：本方法整体是
+        //   「null = 不覆盖」的 merge 语义，必须显式哨兵 + update(entity, false) 显式写 NULL。
+        boolean clearCrossSessionInbound = false;
+        if (req.crossSessionInbound() != null) {
+            String inbound = req.crossSessionInbound().trim();
+            if ("auto".equals(inbound)) {
+                s.setCrossSessionInbound(null);
+                clearCrossSessionInbound = true;
+            } else if ("accept".equals(inbound) || "hold".equals(inbound) || "refuse".equals(inbound)) {
+                s.setCrossSessionInbound(inbound);
+            } else {
+                throw new ValidationException(
+                    "crossSessionInbound 非法（允许 auto/accept/hold/refuse；auto = 清除配置，不落库）");
+            }
+        }
+
+        // [V333 AFK] AskUserQuestion 超时档位（null = 不覆盖；值域对齐 CC askUserQuestionTimeout）。
+        //   写侧 fail-loud：非法值 400，不静默折叠成 never（读侧才容错，见 AskUserAfkTimeout.parse）。
+        if (req.askUserAfkTimeout() != null) {
+            String afk = req.askUserAfkTimeout().trim();
+            String canonical = null;
+            for (com.nexusai.application.agent.permission.AskUserAfkTimeout t
+                    : com.nexusai.application.agent.permission.AskUserAfkTimeout.values()) {
+                if (t.wireValue().equalsIgnoreCase(afk)) {
+                    canonical = t.wireValue();
+                    break;
+                }
+            }
+            if (canonical == null) {
+                throw new ValidationException(
+                    "askUserAfkTimeout 非法（允许 never/60s/5m/10m；never = 不自动继续）");
+            }
+            s.setAskUserAfkTimeout(canonical);
+        }
 
         // [C-05 · OPD-CM5-C-05] autoMemoryDirectory 存 DB 列（V34 列 auto_memory_directory，
         // 前端"模型配置页-环境配置"可配置，对齐 CC 给默认值；null = 不覆盖）。
@@ -216,8 +251,20 @@ public class SettingsService {
 
         // [websearch-ccalign V37] WebSearch 4 列 merge（null = 不覆盖；DB + 前端可配置）
         if (req.websearchEngine() != null) s.setWebsearchEngine(req.websearchEngine());
-        if (req.apiKey() != null) s.setApiKey(req.apiKey());
-        if (req.proxy() != null) s.setProxy(req.proxy());
+        // [保密 · 用户 2026-11-22「明文 apiKey 不能」] 读接口只回掩码 ⇒ 前端/旧客户端可能把
+        //   `****abcd` 原样回传。掩码进来必须视为「不改」，否则真 key 被掩码覆盖（最典型的坑）。
+        //   判据是显式哨兵（含 **** 或等于当前值的 mask），⛔ 不是「长度像不像」。
+        //   空串仍按显式清空处理（前端「清空」按钮发的就是空串）。
+        if (req.apiKey() != null && !isMaskedApiKeyForWrite(req.apiKey(), s.getApiKey())) {
+            s.setApiKey(req.apiKey());
+        }
+        // [保密 2026-11-22] proxy 口令段同款哨兵：GET 回的是 user:****@host，掩码回传时替换回
+        //   库中真口令（允许只改主机/端口），⛔ 绝不把 **** 存进库。明文仍只有服务端读链
+        //   （WebSearchTool / WebFetchTool 直读 SettingsRecord）可见。
+        if (req.proxy() != null) {
+            s.setProxy(com.nexusai.infra.util.ApiKeyHasher
+                .unmaskProxyPassword(req.proxy(), s.getProxy()));
+        }
         if (req.websearchUseSmallModel() != null) s.setWebsearchUseSmallModel(req.websearchUseSmallModel());
         // [websearch-resid R-B] WebSearch 第 5 列 websearchBaseUrl merge（V38；null = 不覆盖，对齐既有 merge）
         if (req.websearchBaseUrl() != null) s.setWebsearchBaseUrl(req.websearchBaseUrl());
@@ -229,6 +276,10 @@ public class SettingsService {
         if (req.marketAdminEnabled() != null) s.setMarketAdminEnabled(req.marketAdminEnabled());
         // [V254 外部渠道] channel 总开关 merge（null = 不覆盖，对齐既有 merge；默认关 → 通道消息不进）
         if (req.channelsEnabled() != null) s.setChannelsEnabled(req.channelsEnabled());
+        // [V334] 权限中继总闸 merge（null = 不覆盖；DB 唯一权威，改完下一次权限判定即生效）
+        if (req.channelsPermissionRelayEnabled() != null) {
+            s.setChannelsPermissionRelayEnabled(req.channelsPermissionRelayEnabled());
+        }
         // [V258 goal-checkin] 目标 check-in 间隔 merge（null = 不覆盖；0 合法 = 显式关闭）。
         //   负数是非法输入 —— fail-loud 拒绝，而不是静默当成「未配置」让用户以为改了。
         if (req.goalCheckinMinutes() != null) {
@@ -368,7 +419,8 @@ public class SettingsService {
         //   ⇒ 用户点「改回内置」没反应，DB 留着旧 runtime ⇒ 派发永远回落到它。
         //   ⛔ 不能用「稀疏 patch + updateByQuery(patch,false,qw)」：false 会把 patch 所有 null 字段
         //   写 NULL，settings 里 NOT NULL 列（theme/font_size/accent/…）会炸 ⇒ 用完整实体 s。
-        if (clearSubagentDefaultRuntime) {
+        //   [V321] crossSessionInbound 的显式 auto（清列回 NULL）走同一条 ignoreNulls=false 路径。
+        if (clearSubagentDefaultRuntime || clearCrossSessionInbound) {
             settingsMapper.update(s, false);
         } else {
             settingsMapper.update(s);
@@ -586,35 +638,61 @@ public class SettingsService {
     }
 
     /**
-     * [V254 外部渠道] {@code channels_enabled} 实时读源（三态：true / false / <b>null=未配置</b>）。
+     * [V334] 渠道能力门 {@code channels_enabled} 实时读源（DB 唯一权威，默认<b>开</b>）。
      *
-     * <p>被 {@code ChannelNotificationGate} 的门序[2] runtime 消费。语义：
+     * <p>被 {@code ChannelNotificationGate} 的门序[2] runtime 消费。语义（用户 2026-11-22 裁定）：
      * <ul>
-     *   <li>DB 列有值（0/1）→ 该值即权威（用户可在「设置→高级」显式开/关）；</li>
-     *   <li>DB 行缺失 / 列 NULL → 返回 <b>null</b>（=未配置）→ 调用方回落 yml
-     *       {@code nexusai.mcp.channels-enabled} 兜底；</li>
-     *   <li>读取抛异常 → 返回 <b>null</b> + warn（同样回落 yml，不让一次 DB 抖动反转用户设置）。</li>
+     *   <li>DB 列有值（0/1）→ 该值即权威（前端「环境配置 → 权限与协作」显式开/关）；</li>
+     *   <li>DB 行缺失 / 列 NULL → <b>开</b>（默认开）；</li>
+     *   <li>读取抛异常 → <b>开</b>（默认值；不因一次 DB 抖动反转「默认开」）。</li>
      * </ul>
      *
-     * <p><b>为什么是三态而不是布尔</b>：必须区分「用户显式关闭（false）」与「没有这个配置（null）」——
-     * 前者要尊重（UI 关掉后不能被 yml 顶回来），后者才回落兜底。
+     * <p>⛔ 不再回落到 yml {@code nexusai.mcp.channels-enabled}：V334 起 DB 是唯一权威
+     * （用户：「后期远程可以直接改数据库」）。yml 键保留只为兼容旧配置文件，不参与判定。
      *
-     * <p><b>不缓存</b>：前端 PUT 后下一条通道消息即生效（同 {@link #readDbAllowDynamicHeaderValues} 形状）。
+     * <p><b>不缓存</b>：前端 PUT 后下一次判定即生效。
      */
     public Boolean readDbChannelsEnabled() {
         try {
             SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
-            // 行缺失 / 列 NULL → 未配置（null → 回落 yml）。注意顺序：先判 null 再拆箱，避免 NPE。
             if (s == null || s.getChannelsEnabled() == null) {
-                return null;
+                return Boolean.TRUE;
             }
             return s.getChannelsEnabled();
         } catch (Exception e) {
             if (log.isWarnEnabled()) {
-                log.warn("[SettingsService] 实时读 settings.channelsEnabled 失败，回落 yml "
-                    + "nexusai.mcp.channels-enabled 兜底（不因读失败而反转用户设置）: {}", e.toString());
+                log.warn("[SettingsService] 实时读 settings.channelsEnabled 失败，按默认开处理: {}",
+                    e.toString());
             }
-            return null;
+            return Boolean.TRUE;
+        }
+    }
+
+    /**
+     * [V334] 权限中继总闸 {@code channels_permission_relay_enabled} 实时读源（默认<b>开</b>）。
+     *
+     * <p>对齐 CC {@code isChannelPermissionRelayEnabled()}（tengu_harbor_permissions）。
+     * <ul>
+     *   <li>列 NULL / 行缺失 → <b>开</b>（默认开）；</li>
+     *   <li>列 0 → 关（用户显式关闭优先于默认）；</li>
+     *   <li>读取抛异常 → <b>关</b>（fail-closed：读不到配置时宁可不推送审批，也不越权镜像）。</li>
+     * </ul>
+     *
+     * <p>⛔ 它只是「允许」：真正推送还要求 {@link #readDbChannelsEnabled()} 也开、且该会话已绑定渠道。
+     */
+    public boolean readDbChannelsPermissionRelayEnabled() {
+        try {
+            SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+            if (s == null || s.getChannelsPermissionRelayEnabled() == null) {
+                return true;
+            }
+            return Boolean.TRUE.equals(s.getChannelsPermissionRelayEnabled());
+        } catch (Exception e) {
+            if (log.isWarnEnabled()) {
+                log.warn("[SettingsService] 实时读 settings.channelsPermissionRelayEnabled 失败，按关处理 "
+                    + "（fail-closed，不越权镜像审批）: {}", e.toString());
+            }
+            return false;
         }
     }
 
@@ -683,8 +761,11 @@ public class SettingsService {
         s.setHttpProxy(normalized);
         settingsMapper.update(s, false);
         if (log.isInfoEnabled()) {
+            // [保密 2026-11-22] 日志同样不得出现代理口令：只打掩码形态
             log.info("[SettingsService] LLM 出站代理已落库: {}",
-                normalized == null ? "NULL（未配置）" : (normalized.isEmpty() ? "空串（显式直连）" : normalized));
+                normalized == null ? "NULL（未配置）"
+                    : (normalized.isEmpty() ? "空串（显式直连）"
+                        : com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(normalized)));
         }
     }
 
@@ -836,8 +917,12 @@ public class SettingsService {
             s.getAutoDreamEnabled(),
             // [websearch-ccalign V37] WebSearch 4 列透出（可空；缺省/未配置 → WebSearchTool 读链兜底默认）
             s.getWebsearchEngine(),
-            s.getApiKey(),
-            s.getProxy(),
+            // [保密 · 用户 2026-11-22「明文 apiKey 不能」] 出站只给掩码（****abcd，仅末四位），未配置 → null。
+            //   明文只留在 DB 与服务端内部读链（WebSearchTool 直读 SettingsRecord），⛔ 不进任何响应体。
+            maskApiKeyForRead(s.getApiKey()),
+            // [保密 2026-11-22] 代理口令段只留 user:****@host（主机端口仍可读，便于编辑）；
+            //   服务端内部（WebSearch/WebFetch 直读记录）拿的仍是明文。
+            com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(s.getProxy()),
             s.getWebsearchUseSmallModel(),
             // [websearch-resid R-B] WebSearch 第 5 列 websearchBaseUrl 透出（V38；null → WebSearchTool 兜底默认）
             s.getWebsearchBaseUrl(),
@@ -925,8 +1010,77 @@ public class SettingsService {
             // [V292] 后台向量化并发全局默认透出（不补这行前端恒显示空）
             s.getModelMaxConcurrency(),
             // [V302] 计划审批卡「清空上下文」选项（null = 未配置 → 前端按关闭处理）
-            s.getShowClearContextOnPlanAccept()
+            s.getShowClearContextOnPlanAccept(),
+            // [V321 peer-settings] 跨会话入站策略原样透出（null = 未显式配置 → 前端显示「自动」，
+            //   运行时按权限模式判定；不在此把推导结果写成 accept）
+            s.getCrossSessionInbound(),
+            // [V333 AFK] AskUserQuestion 超时档位原样透出（null/非法 → 前端按 never 显示，
+            //   真正生效时长由 AskUserQuestionAfkTimeoutResolver 在生成本次权限请求时解析）
+            s.getAskUserAfkTimeout(),
+            // [V334] 权限中继总闸原样透出（null = 未配置；读侧按「默认开」解释）
+            s.getChannelsPermissionRelayEnabled()
         );
+    }
+
+    // ============== [保密 · 2026-11-22] API key 出站掩码 / 入站哨兵 ==============
+
+    /**
+     * 读侧：把库中明文 key 变成出站掩码（{@code ****abcd}，仅保留可辨识末四位）。
+     *
+     * <p>⛔ 用 {@code maskTail} 而不是 {@code mask}：后者保留前 3 位，{@code sk-} 开头的 key
+     * 会把 {@code sk-} 前缀回传出去 —— 验收线是「响应体里不得出现 {@code sk-}」。
+     *
+     * <p>未配置（null / 空白）→ {@code null}，⛔ 不要用 {@code "****"} 冒充 —— 前端据此区分
+     * 「已配置」与「未配置」（{@code maskTail(null)} 也返回 {@code "****"}）。
+     *
+     * <p>明文的使用者只有服务端内部读链（{@code WebSearchTool} 直读 {@code SettingsRecord}），
+     * 不经本 DTO ⇒ 脱敏不影响 WebSearch / WebFetch 的实际调用。
+     */
+    /**
+     * [保密 2026-11-22] 服务端内部读链：WebSearch key 的<b>明文</b>（供 WebFetch DeepSeek 抓取用）。
+     *
+     * <p>⛔ 不要拿 {@code get().apiKey()} 去发请求：那是给前端的掩码。本方法直读记录，
+     * 与 {@code WebSearchTool.readSettings()} 同源（DB 明文），不经脱敏 DTO。
+     */
+    public String readDbApiKeyPlain() {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        return s == null ? null : s.getApiKey();
+    }
+
+    /**
+     * [保密 2026-11-22] 服务端内部读链：WebSearch/WebFetch 代理的<b>真值</b>（含口令）。
+     *
+     * <p>语义与 {@code WebSearchTool.readProxy} 对齐：null / 空白 → null（直连）。
+     * ⛔ 不要用 {@code get().proxy()}（那是 {@code user:****@host} 掩码）。
+     */
+    public String readDbWebsearchProxy() {
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) return null;
+        String v = s.getProxy();
+        return v == null || v.isBlank() ? null : v;
+    }
+
+    private static String maskApiKeyForRead(String plainKey) {
+        if (plainKey == null || plainKey.isBlank()) {
+            return null;
+        }
+        return com.nexusai.infra.util.ApiKeyHasher.maskTail(plainKey);
+    }
+
+    /**
+     * 写侧：判断入参是不是「回传的掩码」⇒ 视为不修改。
+     *
+     * <p>两个显式判据（任一命中即掩码）：
+     * <ol>
+     *   <li>含 {@link com.nexusai.infra.util.ApiKeyHasher#MASK_TOKEN}（掩码必然含，真实 key 不含）；</li>
+     *   <li>与「当前库中值的掩码」逐字相等（前端原样回传的精确形态）。</li>
+     * </ol>
+     *
+     * <p>⛔ 不能用长度/字符集推断；空串不算掩码 —— 那是用户点「清空」的显式语义。
+     */
+    private static boolean isMaskedApiKeyForWrite(String incoming, String storedPlain) {
+        // 判据与 provider extraHeaders / MCP env 的 map 哨兵共用同一条（ApiKeyHasher.isMaskedSentinel）。
+        return com.nexusai.infra.util.ApiKeyHasher.isMaskedSentinel(incoming, storedPlain);
     }
 
     // ============== [V61] enabledPlugins JSON 编解码 ==============
@@ -956,5 +1110,62 @@ public class SettingsService {
         } catch (Exception e) {
             throw new IllegalArgumentException("enabledPlugins 序列化失败: " + e.getMessage(), e);
         }
+    }
+
+    /**
+     * [V61 · 插件卸载清理链] 从 {@code settings.enabled_plugins} 移除指定插件的启用条目。
+     *
+     * <p><b>为什么必须清</b>：启动时 {@code InstalledPluginsManager.migrateFromEnabledPlugins}
+     * 以 {@code enabled_plugins} 为「已安装」真相源，把仍在表里的插件重新登记成已安装
+     * （installPath 指向已删目录）⇒ <b>卸载后重启插件会复活</b>。
+     *
+     * <p><b>键空间不统一</b>：{@code addInstalledPlugin} 写裸名、{@code migrateFromEnabledPlugins}
+     * 写 {@code name@marketplace} ⇒ 本方法按「首个 @ 之前的名字部分」匹配，裸名与 scoped 名一起清。
+     *
+     * <p><b>幂等</b>：条目本来就不在（未配置 / 已清）⇒ 不写库（避免无谓 UPDATE 与 updated_at 抖动）。
+     *
+     * @param pluginName 插件名（裸名或 {@code name@marketplace} 皆可）
+     */
+    public void removeEnabledPlugin(String pluginName) {
+        if (pluginName == null || pluginName.isBlank()) {
+            return;
+        }
+        SettingsRecord s = settingsMapper.selectOneById(SINGLETON_ID);
+        if (s == null) {
+            log.warn("[SettingsService] 清除 enabledPlugins 跳过：settings 单例行不存在");
+            return;
+        }
+        Map<String, Boolean> enabled = parseEnabledPlugins(s.getEnabledPlugins());
+        if (enabled == null || enabled.isEmpty()) {
+            return;
+        }
+        String bare = barePluginName(pluginName);
+        boolean changed = false;
+        for (java.util.Iterator<String> it = enabled.keySet().iterator(); it.hasNext();) {
+            String key = it.next();
+            if (key == null) {
+                continue;
+            }
+            if (key.equals(pluginName) || bare.equals(barePluginName(key))) {
+                it.remove();
+                changed = true;
+            }
+        }
+        if (!changed) {
+            return;
+        }
+        s.setEnabledPlugins(toJson(enabled));
+        settingsMapper.update(s);
+        log.info("[SettingsService] 已清除 enabledPlugins 中的插件条目 plugin={}（剩余 {} 条）",
+            pluginName, enabled.size());
+    }
+
+    /** 插件标识的「名字部分」（首个 @ 之前）· 裸名与 {@code name@marketplace} 归一。 */
+    private static String barePluginName(String pluginId) {
+        if (pluginId == null) {
+            return "";
+        }
+        int at = pluginId.indexOf('@');
+        return at > 0 ? pluginId.substring(0, at) : pluginId;
     }
 }

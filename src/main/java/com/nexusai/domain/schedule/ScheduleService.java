@@ -8,6 +8,8 @@ import com.nexusai.model.schedule.dto.ScheduleDto;
 import com.nexusai.model.schedule.dto.ScheduleKind;
 import com.nexusai.model.schedule.dto.ScheduleScope;
 import com.nexusai.model.schedule.dto.ScheduleUpdateRequest;
+import com.nexusai.model.schedule.dto.SessionMode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.repository.schedule.entity.ScheduleRecord;
 import com.nexusai.infra.exception.MaxJobsExceededException;
 import com.nexusai.infra.exception.NotFoundException;
@@ -19,7 +21,7 @@ import com.nexusai.application.agent.tool.config.CronJitterProperties;
 import com.nexusai.application.agent.tool.cron.CronExpressionConverter;
 import com.nexusai.application.agent.tool.cron.CronJitter;
 import com.nexusai.application.schedule.QuartzScheduleService;
-import com.nexusai.infra.schedule.TestJob;
+import com.nexusai.infra.schedule.AgentJob;
 import com.mybatisflex.core.query.QueryWrapper;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -59,7 +61,7 @@ import java.util.stream.Collectors;
  * ScheduleController，故补 POST /{id} 端点需重开 partial-update 能力（对齐 remote-trigger 域）。</p>
  *
  * <p>{@code command} 字段：v1 默认 "test"，存进 DB 但不再被实际消费（所有 schedule 都
- * 路由到 {@code TestJob}）。v2 接入真实执行器后再按 command 派发。
+ * 路由到 {@code AgentJob}）。v2 接入真实执行器后再按 command 派发。
  */
 @Service
 public class ScheduleService {
@@ -68,6 +70,9 @@ public class ScheduleService {
 
     /** s14-P1-4: 强制 MAX_JOBS 上限 · 对齐 CC CronCreateTool.ts:25 MAX_JOBS=50 */
     public static final int MAX_JOBS = 50;
+
+    /** [V306] notify 列 JSON 编解码 · 无状态单例（不注入 Spring ObjectMapper，避免影响测试夹具）。 */
+    private static final ObjectMapper JSON = new ObjectMapper();
 
     /**
      * s14-P1-5: session-scoped 任务索引 · 对齐 CC cronScheduler.ts:246-247
@@ -98,16 +103,26 @@ public class ScheduleService {
      */
     @Autowired private CronJitterProperties jitterProps;
     /**
-     * CRON-B4-4（决策 #15 / OPD-EL-04）：once 任务同步 fire 入口 · 经 TestJob 共享 fire body
+     * CRON-B4-4（决策 #15 / OPD-EL-04）：once 任务同步 fire 入口 · 经 AgentJob 共享 fire body
      * （gate→getById→route/enqueue→applyFireLifecycle）内联执行，对齐工具路径 fire-then-delete
      * 语义（CronCreateTool.ts:152 "fire once then auto-delete"）。
      *
-     * <p>循环依赖：TestJob {@code @Autowired} ScheduleService，本字段用 {@code @Lazy} +
+     * <p>循环依赖：AgentJob {@code @Autowired} ScheduleService，本字段用 {@code @Lazy} +
      * {@code required=false} 破环（延迟到 runNow once 路径首次调用才实例化真实 bean）。
      * 非 Spring 单测不注入（null）→ once 路径 fail-loud log.error + executed=false。
      */
     @Lazy @Autowired(required = false)
-    private TestJob testJob;
+    private AgentJob testJob;
+
+    /**
+     * [V306] 运行记录（schedule_runs）· 列表/详情读它拿到**真实的** lastRunStatus。
+     *
+     * <p>为什么需要覆盖：{@code schedules.last_run_status} 是入队那一刻写的假信号
+     * （{@code markFired}），跑崩了仍显示 ok。本服务提供「该任务最近一条 run 的 status」，
+     * 读侧用它覆盖，列表的绿点/红点才是真的。null（非 Spring 夹具）→ 回落到旧列。
+     */
+    @Autowired(required = false)
+    private com.nexusai.application.schedule.ScheduleRunsService runsService;
 
     /**
      * IMPL-10 (NEW-12): P2 遥测 · 对齐 CC logEvent (cronScheduler.ts:205-212 missed /
@@ -131,7 +146,11 @@ public class ScheduleService {
             return listAll();
         }
         return listAll().stream()
-            .filter(d -> d.sessionId() == null || sessionId.equals(d.sessionId()))
+            // [V306] 撞坏点③修复：B/C 形态在**首次触发前** session_id 为空（会话要 fire 时才造），
+            //   若仍只按 sessionId 过滤，右栏就看不到「还没触发过」的任务。
+            //   ⇒ 非 REUSE 形态一律视为「与我相关」全局可见（它们不绑定某一个会话的语义）。
+            .filter(d -> (d.sessionMode() != null && d.sessionMode() != SessionMode.REUSE)
+                || d.sessionId() == null || sessionId.equals(d.sessionId()))
             .toList();
     }
 
@@ -143,7 +162,16 @@ public class ScheduleService {
         // 看不到 SESSION-scope 任务.
         // CRON-B2: 优先读 DB scope/session_id 列（重启后可辨识，R-1 僵尸修复），
         // sessionJobs 仅兜底 scope 列为 NULL 的存量旧行
-        return all.stream().map(r -> toDto(r, lookupScope(r), lookupSessionId(r)))
+        // [V306] 用运行记录里的**真实**状态覆盖 schedules.last_run_status（后者是入队时写的假信号）。
+        //   一次查询拿全部任务的最新状态（非 N+1），失败则回落旧列。
+        java.util.Map<String, String> realStatus = runsService == null
+            ? java.util.Map.of() : runsService.latestStatusBySchedule();
+        return all.stream().map(r -> {
+                ScheduleDto d = toDto(r, lookupScope(r), lookupSessionId(r));
+                if (d == null) return null;
+                String real = realStatus.get(r.getId());
+                return real == null ? d : withRunStatus(d, real);
+            })
             .filter(Objects::nonNull)
             .toList();
     }
@@ -196,6 +224,11 @@ public class ScheduleService {
         // IMPL-05（✗-C P2 读容错）: 非法 kind 脏行 → toDto 返回 null → 404（脏行 = 不可见资源，
         // 与 listAll 跳过语义一致；对齐 CC cronTasks.ts:108-137 坏条目不阻塞整文件）
         if (dto == null) throw new NotFoundException("Schedule " + id + " not found");
+        // [V306] 同上：真实状态覆盖假信号
+        if (runsService != null) {
+            String real = runsService.latestStatusBySchedule().get(id);
+            if (real != null) dto = withRunStatus(dto, real);
+        }
         return dto;
     }
 
@@ -263,6 +296,22 @@ public class ScheduleService {
         //   ⚠️ 存量行**不受影响**：scope 已随创建落库（V8+），读侧一律以 scope 列为权威
         //      （见 {@link #lookupScope}）⇒ 老的 DURABLE 任务不会因本改动变成 SESSION。
         ScheduleScope scope = req.scope() == null ? ScheduleScope.SESSION : req.scope();
+        // [V306] 新形态（B/C/D）强制 DURABLE scope —— 会话由任务自己造或压根不产生，
+        //   ⛔ 不能是 SESSION（那会被 cleanupBySession / sweepSessionTasksAtStartup 清掉）。
+        //   这里在**写入前**归一，而不是让调用方保证：前端漏传 scope 时缺省是 SESSION，
+        //   若在此静默接受，任务会在第一次重启后消失（且不报错）。
+        SessionMode sessionModeForScope = req.sessionMode() == null ? SessionMode.DEFAULT : req.sessionMode();
+        // [V317] 「专家」（主线程 agent）与形态的相容性：**先判后写** ——
+        //   静默忽略会让用户以为保存成功、跑起来却是默认人格。
+        String mainThreadAgent = trimToNull(req.mainThreadAgent());
+        validateMainThreadAgent(sessionModeForScope, mainThreadAgent);
+        // [V330 · cron 三类] 无头 / 新会话执行必须有渠道（否则执行时无送达目标，会静默白跑）。
+        validateChannelPrecondition(sessionModeForScope, req.notifyChats());
+        if (sessionModeForScope != SessionMode.REUSE && scope == ScheduleScope.SESSION) {
+            log.info("[Schedule] create() 形态 {} ⇒ scope 由 SESSION 归一为 DURABLE"
+                    + "（会话由任务自己造，不随会话消亡）", sessionModeForScope);
+            scope = ScheduleScope.DURABLE;
+        }
         String sessionId = req.sessionId();
         if (scope == ScheduleScope.SESSION && (sessionId == null || sessionId.isBlank())) {
             throw new ValidationException("scope=SESSION requires non-empty 'sessionId'");
@@ -337,7 +386,22 @@ public class ScheduleService {
         //   RED（RE-1a-3）：把 else 分支改回 req.boundProject() ⇒ 「DURABLE+null ⇒ bound_project
         //   恒 NULL」断言翻红（该断言是「无会话 ⇒ 无锚」不变量的守护，不是「不抛」）。
         if (scope == ScheduleScope.DURABLE) {
-            if (resolvedProjectRoot != null && !resolvedProjectRoot.isBlank()) {
+            if (sessionModeForScope.createsOwnSession()) {
+                // [V306] B（每次新建）/ C（建后绑定）：会话由任务自己造，项目锚 = cron 目录。
+                //   ⛔ 不从这个任务的 sessionId 解析 —— B 形态压根没有 sessionId，
+                //   C 形态的 sessionId 要到首次 fire 才回填；两者都不该依赖用户会话的项目。
+                //   目录不存在则现建（NexusaiDataRoots.cronRoot 内 createDirectories），
+                //   建不出来直接抛（不静默降级到别的目录 —— 那会让任务跑在错误项目下）。
+                String cronRoot = com.nexusai.common.NexusaiDataRoots.cronRoot().toString();
+                s.setBoundProject(cronRoot);
+                log.info("[Schedule] create() 形态 {} ⇒ 项目锚 = cron 目录 {}", sessionModeForScope, cronRoot);
+            } else if (sessionModeForScope == SessionMode.NONE) {
+                // [V306] D（不绑会话）：显式「无锚」—— 与 A 形态「解析不到锚就抛」不同，
+                //   D 的语义就是后台静默执行，项目锚回落进程 user.dir 是设计的一部分。
+                s.setBoundProject(null);
+                log.info("[Schedule] create() 形态 NONE（不绑会话）⇒ bound_project 为 null"
+                        + "（fire 时回落进程 user.dir）");
+            } else if (resolvedProjectRoot != null && !resolvedProjectRoot.isBlank()) {
                 s.setBoundProject(resolvedProjectRoot);
             } else if (sessionId != null && !sessionId.isBlank() && !SessionKeys.isNoSession(sessionId)) {
                 SessionProjectRoot.Lookup lk = SessionProjectRoot.lookup(sessionId);
@@ -362,6 +426,17 @@ public class ScheduleService {
         // 不暴露 CronCreate permanent 入口（不发明 CC 没有的能力），留待 assistant-mode
         // （catch-up/morning-checkin/dream）接入时再补写入口。
         s.setPermanent(Boolean.FALSE);
+        // [V306] 执行上下文形态 + 通知目标
+        //   sessionMode 缺省 REUSE ⇒ 存量行为零变化；DURABLE 且 sessionId 非空时语义等同
+        //   「绑定创建会话」（= 现在的行为）。四种形态的 fire 分流在 CronIdleExecutor。
+        s.setSessionMode(sessionModeForScope.name());
+        //   notifyChats 存 im_chat.id 数组（聊天级，不是平台名 —— 只选渠道不知道发给谁）。
+        //   null/空 = 不通知。JSON 序列化在这里做，消费方（AgentJob）直接透传字符串。
+        s.setNotifyChats(toJsonArray(req.notifyChats()));
+        s.setNotifyChannelIds(toJsonArray(req.notifyChannelIds()));
+        // [V317] 专家落库（null = 不指定 ⇒ 列留 NULL；fire 时由
+        //   ScheduleSessionResolver 建会话时写进 sessions.main_thread_agent）
+        s.setMainThreadAgent(mainThreadAgent);
         if (log.isDebugEnabled()) {
             log.debug("[Schedule] create() 构建 ScheduleRecord id={} scope={} sessionId={} agentId={} "
                     + "boundProject={} createdAt={} permanent={} (对齐 CC cronTasks.ts:208/:212)",
@@ -452,6 +527,57 @@ public class ScheduleService {
         if (req.command() != null) s.setCommand(req.command());
         if (req.description() != null) s.setDescription(req.description());
         if (req.agentId() != null) s.setAgentId(req.agentId());
+
+        // [V306] 执行形态可改（设计稿 ⑥「会话归属和调度类型可以改，但已造的会话不能改」）。
+        //   ⚠️ 改形态必须**解除旧会话绑定**（sessionId 置 null）：
+        //      · A→C 若不解除，resolver 会把 A 那个会话当成 C 的「专属会话」直接接管 ——
+        //        与「换一种执行方式」的直觉相反；
+        //      · 会话本身**不删**（用户左栏还能找到并继续聊），只是这个任务不再往里写。
+        //   ⚠️ 旧值可能是 null（V306 之前建的行的列值）⇒ 用 parseOrDflt 归一到 REUSE 再比，
+        //      否则「存量任务 + 前端回传 REUSE」会被误判成「变了」而清掉 sessionId。
+        if (req.sessionMode() != null) {
+            SessionMode wanted = req.sessionMode();
+            SessionMode oldMode = SessionMode.parseOrDflt(s.getSessionMode());
+            if (wanted != oldMode) {
+                log.info("[Schedule] update() 形态变更 id={} {} → {}（解除旧会话绑定 sessionId={}）",
+                    id, oldMode, wanted, s.getSessionId());
+                s.setSessionMode(wanted.name());
+                s.setSessionId(null);
+            }
+        }
+        // [V306] 通知目标可改；**空列表 = 清空 ⇒ 不通知**（与 null「不改」区分）
+        if (req.notifyChats() != null) s.setNotifyChats(toJsonArray(req.notifyChats()));
+        if (req.notifyChannelIds() != null) s.setNotifyChannelIds(toJsonArray(req.notifyChannelIds()));
+        // [V317] 「专家」更新：null = 不改；空串 = 清空；非空 = 设置。
+        //   形态相容性按**变更后**的形态判（req.sessionMode 优先，否则沿用行上形态）——
+        //   改形态与设专家是同一次请求里的两件事，必须按最终形态校验。
+        SessionMode effectiveMode = req.sessionMode() != null
+            ? req.sessionMode()
+            : SessionMode.parseOrDflt(s.getSessionMode());
+        // [V330] 改形态后同样要满足渠道前置（未传 notifyChats ⇒ 用行上现有值判）。
+        validateChannelPrecondition(effectiveMode, req.notifyChats() != null
+            ? req.notifyChats() : parseJsonArray(s.getNotifyChats()));
+        if (req.mainThreadAgent() != null) {
+            String agentType = req.mainThreadAgent().trim();
+            if (agentType.isEmpty()) {
+                // 清空：写空串（⛔ 不能写 null：MyBatis-Flex 的 update 默认 ignoreNulls=true，
+                //   置 null 是空操作 ⇒ 列永远清不掉）。读侧把空串归一成 null。
+                s.setMainThreadAgent("");
+                log.info("[Schedule] update() 清空专家 id={}", id);
+            } else {
+                validateMainThreadAgent(effectiveMode, agentType);
+                s.setMainThreadAgent(agentType);
+                log.info("[Schedule] update() 设置专家 id={} mainThreadAgent={} mode={}",
+                    id, agentType, effectiveMode);
+            }
+        } else if (effectiveMode == SessionMode.REUSE || effectiveMode == SessionMode.NONE) {
+            // 形态改成 REUSE/NONE ⇒ 旧专家失去载体（这两种形态不建自己的会话，
+            //   专家永远不会被应用）⇒ 必须清掉，否则任务行上挂着一个永不生效的专家。
+            if (s.getMainThreadAgent() != null) {
+                s.setMainThreadAgent("");
+                log.info("[Schedule] update() 形态 {} 不接受专家 ⇒ 清掉旧值 id={}", effectiveMode, id);
+            }
+        }
         // 批次X Q2: boundProject 为创建时项目锚（对齐 CC STATE.projectRoot 启动冻结语义，
         // B 探查 §7.3：锚来源=创建会话绑定项目，fire 恢复=写回执行线程项目上下文），
         // 不随 update 漂移 —— ScheduleUpdateRequest 无 boundProject 字段（partial update 仅
@@ -565,7 +691,7 @@ public class ScheduleService {
      * （对齐 CC removeSessionCronTasks 内存同步，cronScheduler.ts:329）。CC 无独立后台清理循环
      * （cleanupExpiredRecurring 后台扫描已废弃），aged 只在 fire 时刻判定。
      *
-     * <p>接线：已接线 CRON-F4（TestJob#applyFireLifecycle fire 路径，含 runNow 触发）在任务触发后调用本方法。
+     * <p>接线：已接线 CRON-F4（AgentJob#applyFireLifecycle fire 路径，含 runNow 触发）在任务触发后调用本方法。
      *
      * @param id 调度 id（不存在 → 记录 warn 并返回 false，无删除动作）
      * @return true = 已删除（one-shot fire 后 / aged recurring fire 后）；false = 保留（recurring 未 aged）
@@ -912,7 +1038,7 @@ public class ScheduleService {
      * CronCreateTool.ts:152 "fire once then auto-delete"）。
      *
      * <p><b>once</b>：同步 fire-then-delete —— {@link #runOnceSynchronously} 内联调
-     * {@code TestJob.fireSynchronously}（gate→getById→route/enqueue→applyFireLifecycle，
+     * {@code AgentJob.fireSynchronously}（gate→getById→route/enqueue→applyFireLifecycle，
      * deleteAfterFire 同步删行），返回 executed+deleted。不走 triggerNow（异步入队 + worker
      * 晚读已删行 = fire 丢失竞态），deleteRowAndUnregister 已 unregister Quartz job → 无双发。
      *
@@ -948,20 +1074,20 @@ public class ScheduleService {
     /**
      * 决策 #15 / OPD-EL-04：once 任务同步 fire-then-delete。
      *
-     * <p>同步调 {@link TestJob#fireSynchronously}（共享 fire body，deleteAfterFire 在返回前已同步
+     * <p>同步调 {@link AgentJob#fireSynchronously}（共享 fire body，deleteAfterFire 在返回前已同步
      * 删行），随后 {@code selectOneById(id)==null} 判定 deleted —— 「已观测删除完成」语义
      * （取已删除而非确定性将删，用户拍板 OPD-EL-04）。fire 后删行释放 MAX_JOBS 配额
      * （对齐 CronCreateTool.ts:152 "fire once then auto-delete"）。
      *
-     * <p>TestJob 未注入（非 Spring 单测）→ fail-loud log.error + executed=false，不静默吞错。
+     * <p>AgentJob 未注入（非 Spring 单测）→ fail-loud log.error + executed=false，不静默吞错。
      *
      * @param id once 任务 id
      * @return fire-then-delete 结果（executed/deleted/output）
      */
     private RunNowResponse runOnceSynchronously(String id) {
         if (testJob == null) {
-            log.error("[Schedule] runNow: once 任务 id={} 的 TestJob 未注入，无法同步 fire（fail-loud）", id);
-            return new RunNowResponse(false, false, "once job not fired: TestJob not injected");
+            log.error("[Schedule] runNow: once 任务 id={} 的 AgentJob 未注入，无法同步 fire（fail-loud）", id);
+            return new RunNowResponse(false, false, "once job not fired: AgentJob not injected");
         }
         boolean fired = testJob.fireSynchronously(id);
         boolean deleted = scheduleMapper.selectOneById(id) == null;
@@ -1010,7 +1136,7 @@ public class ScheduleService {
      *       + {@code lastRunStatus="ok"}</li>
      * </ul>
      *
-     * <p>接线：已接线 CRON-F4（TestJob#applyFireLifecycle fire 路径，deleteAfterFire=false 保留时调用）。
+     * <p>接线：已接线 CRON-F4（AgentJob#applyFireLifecycle fire 路径，deleteAfterFire=false 保留时调用）。
      *
      * @param ids     本次 fire 的任务 id 集合
      * @param firedAt fire 时刻（写 lastRunAt）
@@ -1107,6 +1233,16 @@ public class ScheduleService {
         int deleted = 0;
         for (ScheduleRecord r : all) {
             if (lookupScope(r) != ScheduleScope.SESSION) continue;
+            // [V306] 撞坏点②修复：B/C/D 形态的会话是**任务自己造的**（或压根没有），
+            //   生命周期跟任务走，⛔ 不能按「会话不活跃」清掉 —— 否则重启一次任务就没了。
+            //   正规路径下这些形态创建时就用 DURABLE scope；本判据是兜底，防手工数据/旧前端
+            //   把它们建成 SESSION。
+            if (SessionMode.parseOrDflt(r.getSessionMode()) != SessionMode.REUSE) {
+                log.info("[Schedule] sweepSessionTasksAtStartup 跳过非 REUSE 形态任务 id={} mode={}"
+                        + "（会话由任务自己造，不随会话消亡）",
+                    r.getId(), r.getSessionMode());
+                continue;
+            }
             if (active.contains(r.getSessionId())) continue;
             try {
                 quartzScheduleService.unregisterSchedule(r.getId());
@@ -1314,8 +1450,115 @@ public class ScheduleService {
             scope,
             sessionId,
             s.getAgentId(),          // CRON-D4: CC CronTask.agentId (cronTasks.ts:69)；由 create→toDto 填充
-            s.getBoundProject()      // 批次X Q2: V23 bound_project 列回填（create→toDto / DB 列回填）
+            s.getBoundProject(),     // 批次X Q2: V23 bound_project 列回填（create→toDto / DB 列回填）
+            SessionMode.parseOrDflt(s.getSessionMode()),   // V306: 脏值回落 REUSE（读侧不抛）
+            parseJsonArray(s.getNotifyChats()),            // V306
+            parseJsonArray(s.getNotifyChannelIds()),       // V306
+            trimToNull(s.getMainThreadAgent())             // V317: 空串归一成 null（= 不指定）
         );
+    }
+
+    /**
+     * [V306] 用运行记录的真实状态替换 DTO 里的 {@code lastRunStatus}（副本，不改原记录）。
+     *
+     * <p>映射：{@code running} → {@code "running"}（前端显示「运行中」）；{@code ok}/{@code error}
+     * / {@code cancelled} 原样透传。{@code lastRunAt} 保持 {@code schedules} 列的值
+     * （那是「上次触发时间」，与本表的 started_at 同源，无需替换）。
+     */
+    private static ScheduleDto withRunStatus(ScheduleDto d, String realStatus) {
+        return new ScheduleDto(
+            d.id(), d.name(), d.kind(), d.cron(), d.intervalSeconds(), d.runAt(),
+            d.command(), d.description(), d.lastRunAt(), realStatus,
+            d.scope(), d.sessionId(), d.agentId(), d.boundProject(),
+            d.sessionMode(), d.notifyChats(), d.notifyChannelIds(), d.mainThreadAgent());
+    }
+
+    // ============== V317 · 「专家」（主线程 agent） ==============
+
+    /**
+     * V317 · 「专家」与执行形态的相容性校验（create / update 共用同一判据）。
+     *
+     * <p><b>为什么必须抛错而不是静默忽略</b>：用户选了专家、看到「保存成功」，跑起来却是默认人格 ——
+     * 那比「明确拒绝」更坏（用户会以为设置生效了）。用户原话：「绑定现有的不行」。
+     *
+     * <p>只有 {@link SessionMode#NEW_EACH} / {@link SessionMode#NEW_ONCE} 能指定 ——
+     * 这两种形态的会话由任务自己造，**建会话时把专家写进会话行**即可；
+     * {@code REUSE} 写进用户自己的会话会污染用户的持久设置，
+     * {@code NONE} 压根不产生会话 ⇒ 无处安放。
+     *
+     * @param mode      生效的执行形态
+     * @param agentType 专家 agentType（null/空白 = 不指定，不校验）
+     */
+    private static void validateMainThreadAgent(SessionMode mode, String agentType) {
+        if (agentType == null || agentType.isBlank()) return;
+        if (mode == SessionMode.REUSE || mode == SessionMode.NONE) {
+            throw new ValidationException(
+                "只有「每次触发都新建」/「新建后绑定住」的任务才能指定专家；"
+                    + "绑定已有会话的任务请直接用该会话自己的专家"
+                    + "（不绑定会话的任务压根不产生会话，没有地方放专家）");
+        }
+    }
+
+    /** trim 后非空才返回值；否则 null（null = 不指定）。 */
+    private static String trimToNull(String v) {
+        if (v == null) return null;
+        String t = v.trim();
+        return t.isEmpty() ? null : t;
+    }
+
+    /**
+     * List → JSON 数组字符串（V306 通知目标落库）。
+     *
+     * <p>null / 空列表 → {@code null}（不写空数组，保持「未配置」与「配了空」同形）。
+     * 元素是聊天 id（{@code imch-d1}）这类 ASCII 串，无转义风险，但统一走 Jackson
+     * 以免将来带特殊字符时出问题。
+     */
+    /**
+     * [V330 · cron 三类] 无头（NONE）与新会话执行（NEW_EACH / NEW_ONCE）必须有渠道。
+     *
+     * <p>WHY：这两类执行时没有「人正开着会话」可应答，结果只能靠渠道送达；
+     * 无渠道时保存成功、执行时却无处投递 = 静默白跑。⛔ 不放行空列表。
+     *
+     * @param mode        执行形态
+     * @param notifyChats 通知目标（im_chat.id）
+     * @throws ValidationException 需要渠道但一个都没有
+     */
+    private static void validateChannelPrecondition(SessionMode mode, List<String> notifyChats) {
+        if (mode == null || mode == SessionMode.REUSE || mode == SessionMode.DEFAULT) {
+            return;
+        }
+        boolean hasChannel = notifyChats != null
+            && notifyChats.stream().anyMatch(c -> c != null && !c.isBlank());
+        if (!hasChannel) {
+            throw new ValidationException("需先配置渠道：无头 / 新会话执行任务至少要选择一个渠道");
+        }
+    }
+
+    private static String toJsonArray(List<String> values) {
+        if (values == null || values.isEmpty()) return null;
+        try {
+            return JSON.writeValueAsString(values);
+        } catch (Exception e) {
+            // 理论上不可达（List<String>）；fail-loud 而不是静默丢弃用户配的通知目标
+            throw new IllegalStateException("notify targets 序列化失败: " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * JSON 数组字符串 → List（V306 读侧）。
+     *
+     * <p>null / 空白 / 解析失败 → 空列表。解析失败**不抛**：一条脏行不该让整个列表 500
+     * （对齐 {@link #parseKind} 的「坏条目不阻塞整列表」口径）。
+     */
+    private static List<String> parseJsonArray(String raw) {
+        if (raw == null || raw.isBlank()) return List.of();
+        try {
+            List<String> parsed = JSON.readValue(raw, new com.fasterxml.jackson.core.type.TypeReference<List<String>>() {});
+            return parsed == null ? List.of() : parsed;
+        } catch (Exception e) {
+            log.warn("[Schedule] notify 列 JSON 解析失败，按空处理: raw={} err={}", raw, e.getMessage());
+            return List.of();
+        }
     }
 
     /**

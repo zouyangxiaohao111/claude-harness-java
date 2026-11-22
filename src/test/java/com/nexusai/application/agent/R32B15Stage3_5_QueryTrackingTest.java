@@ -103,7 +103,7 @@ class R32B15Stage3_5_QueryTrackingTest {
         when(factory.getProvider(any(), any())).thenReturn(provider);
 
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = loop.run(RunRequest.session(
             "question", sessionId, agentId, ProviderConfig.empty(), "test-model", null, null));
         assertThat(state).as("run() 必须返回非 null state").isNotNull();

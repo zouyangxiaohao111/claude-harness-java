@@ -82,17 +82,16 @@ class AnthropicSdkProviderTest {
     }
 
     @Test
-    @DisplayName("[thinking-adaptive 2026-10-10] buildMessageParams: 恒发 thinking:{type:\"adaptive\",display:\"omitted\"}（对齐 CC 2.1.296 实发形态）")
+    @DisplayName("[thinking-adaptive] buildMessageParams: 恒发 thinking:{type:\"adaptive\"}（对齐 CC 2.1.328 源码，不带 display）")
     void buildMessageParams_thinkingAdaptive() {
         MessageCreateParams params = AnthropicSdkProvider.buildMessageParams(
             "deepseek-flash", null, List.of(), null, null, null, null, null, null);
 
         assertThat(params.thinking()).isPresent();
         var t = params.thinking().get();
-        assertThat(t.isAdaptive()).as("恒发 adaptive（CC 捕获形态）").isTrue();
-        assertThat(t.asAdaptive().display()).isPresent();
-        assertThat(t.asAdaptive().display().get().asString())
-            .as("display=omitted（CC 同形）").isEqualTo("omitted");
+        assertThat(t.isAdaptive()).as("恒发 adaptive").isTrue();
+        assertThat(t.asAdaptive().display())
+            .as("不带 display（CC claude.ts adaptive 分支只有 {type:'adaptive'}）").isEmpty();
     }
 
     @Test

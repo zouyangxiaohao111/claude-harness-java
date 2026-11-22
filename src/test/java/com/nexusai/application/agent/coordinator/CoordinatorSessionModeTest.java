@@ -29,7 +29,6 @@ import java.nio.file.Files;
 import java.nio.file.Path;
 import java.util.List;
 import java.util.Map;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.Mockito.mock;
@@ -124,8 +123,8 @@ class CoordinatorSessionModeTest {
         return envFeatureLayer(false, null);
     }
 
-    /** feature 恒 false + env="1" 也不会开（CC isCoordinatorMode 要求两者皆真）—— 用于反向。 */
-    private static CoordinatorMode envFeatureEnvOnly() {
+    /** exe 2.1.328 末层：只看 env（feature=false + env="1" 也开）。 */
+    private static CoordinatorMode envOnly() {
         return envFeatureLayer(false, "1");
     }
 
@@ -154,7 +153,7 @@ class CoordinatorSessionModeTest {
 
     private static ToolUseContext tuc(String sessionId) {
         return new ToolUseContext(
-            UUID.randomUUID(),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             sessionId,
             PermissionMode.DEFAULT,
             Map.of(),
@@ -210,8 +209,8 @@ class CoordinatorSessionModeTest {
     }
 
     @Test
-    @DisplayName("三层优先级: 会话列 NULL + settings 未配置 → 回落 feature && env（末层）")
-    void threeLayers_nullSessionNullSettingsFallsBackToEnvFeature() {
+    @DisplayName("三层优先级: 会话列 NULL + settings 未配置 → 回落 env（末层，exe 2.1.328）")
+    void threeLayers_nullSessionNullSettingsFallsBackToEnv() {
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(
                 SESSION_A, withSession(resolver(null), SESSION_A, null), envFeatureOn()))
             .as("两层都未配置 → 回落 CC 原判定链 feature && env（双真 = true）")
@@ -223,9 +222,9 @@ class CoordinatorSessionModeTest {
             .isFalse();
 
         assertThat(PromptAlignSettingsResolver.coordinatorModeActiveForSession(
-                SESSION_A, withSession(resolver(null), SESSION_A, null), envFeatureEnvOnly()))
-            .as("末层是 AND（feature 假 + env 真 ≠ 开），与 CC isCoordinatorMode 同源")
-            .isFalse();
+                SESSION_A, withSession(resolver(null), SESSION_A, null), envOnly()))
+            .as("末层只读 env（exe qa() 已删 feature 门）：feature 假 + env 真 = 开")
+            .isTrue();
     }
 
     @Test

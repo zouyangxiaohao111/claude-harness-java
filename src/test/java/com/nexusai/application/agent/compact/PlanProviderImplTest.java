@@ -87,7 +87,7 @@ class PlanProviderImplTest {
     @DisplayName("getPlanFilePath: 主会话 → {slug}.md；子代理 → {slug}-agent-{agentId}.md（CC plans.ts:119-129）")
     void getPlanFilePathMainVsSubagent(@TempDir Path tmp) {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
 
         String main = provider.getPlanFilePath(null);
@@ -123,7 +123,7 @@ class PlanProviderImplTest {
     @DisplayName("getPlan: 子代理读 {slug}-agent-{agentId}.md（与主会话隔离）")
     void getPlanReadsSubagentFile(@TempDir Path tmp) throws IOException {
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         PlanProvider provider = new PlanProviderImpl(sessionId, tmp.toString());
         Files.writeString(Path.of(provider.getPlanFilePath(agentId)),
             "sub plan", StandardCharsets.UTF_8);

@@ -130,7 +130,7 @@ class PowerShellToolTest {
      * {@code Shell.ts:181-197 exec()}，回读门控（{@code :395}）是共享的 ⇒ 本仓也必须同款。
      */
     private static ToolUseContext psSubagentCtx(String parentSessionId) {
-        return new ToolUseContext(UUID.randomUUID(), parentSessionId, PermissionMode.DEFAULT,
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), parentSessionId, PermissionMode.DEFAULT,
             java.util.Map.of());
     }
 

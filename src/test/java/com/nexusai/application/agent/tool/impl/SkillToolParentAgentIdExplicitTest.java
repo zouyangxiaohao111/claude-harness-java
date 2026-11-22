@@ -165,7 +165,7 @@ class SkillToolParentAgentIdExplicitTest {
         tool.setTelemetry(telemetry);
 
         ToolUseContext tuc = ToolUseContext.of(
-            AgentContext.packAgentId(EXPLICIT_AGENT_HEX), newSessionId());
+            EXPLICIT_AGENT_HEX, newSessionId());
 
         runOnPoolThread(newToolExecPool(), () -> tool.execute(skillBlock("explicit-skill"), tuc));
 

@@ -90,6 +90,15 @@ public class KbSummaryService {
     @Autowired(required = false)
     private com.nexusai.kb.app.profile.KbProfileTrigger profileTrigger;
 
+    /**
+     * 模型解析统一入口（条目级 → 库级 → 全局自动选用）。
+     *
+     * <p>⚠️ 本类原来的私有实现只有两级，漏了全局回落 ⇒ 重索引传 null ⇒ 只重建关键词、
+     * 顺手把向量按 content_hash 当过期清掉且不重建（2026-11-18 真机：659 → 1 条）。
+     */
+    @Autowired(required = false)
+    private com.nexusai.kb.config.KbConfigService kbConfigService;
+
     public KbSummaryService(
         KbKnowledgeMapper knowledgeMapper,
         KbKnowledgeBaseMapper knowledgeBaseMapper,
@@ -254,7 +263,8 @@ public class KbSummaryService {
 
         // ── 重建索引（摘要块要可检索）────────────────────────────────
         try {
-            indexWriter.reindexKnowledge(knowledgeId, kbId, resolveEmbeddingModelId(knowledge, kb));
+            indexWriter.reindexKnowledge(knowledgeId, kbId,
+                kbConfigService == null ? null : kbConfigService.resolveEmbeddingModelId(knowledge, kb));
         } catch (RuntimeException e) {
             // 摘要本身已落库，索引失败不该让摘要任务判失败（重试会把整个 LLM 调用再来一遍）
             log.warn("[摘要] 重建索引失败（摘要已落库）knowledge={} 原因={}", knowledgeId, e.getMessage());
@@ -530,18 +540,9 @@ public class KbSummaryService {
     }
 
     /** 嵌入模型解析：条目级 → 库级 → null（与 {@code KnowledgeParseProcessor} 同口径）。 */
-    private static String resolveEmbeddingModelId(
-        KbKnowledgeRecord knowledge, KbKnowledgeBaseRecord kb
-    ) {
-        String own = knowledge.getEmbeddingModelId();
-        if (own != null && !own.isBlank()) {
-            return own;
-        }
-        if (kb != null && kb.getEmbeddingModelId() != null && !kb.getEmbeddingModelId().isBlank()) {
-            return kb.getEmbeddingModelId();
-        }
-        return null;
-    }
+    // [2026-11-18] 原私有 resolveEmbeddingModelId（只有「条目级 → 库级」两级）已删除：
+    //   漏了全局回落 ⇒ reindexKnowledge 收到 null ⇒ 只重建关键词并删掉过期向量（不重建）。
+    //   统一改用 KbConfigService.resolveEmbeddingModelId（单一来源）。
 
     private ProviderConfig resolveConfig(String modelName) {
         ModelConfigResolver.ResolvedModel r = resolveModel(modelName);

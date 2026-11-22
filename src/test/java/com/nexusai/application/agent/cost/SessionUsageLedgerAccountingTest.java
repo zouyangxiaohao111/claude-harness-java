@@ -108,7 +108,7 @@ class SessionUsageLedgerAccountingTest {
             UsageAttribution child = main.child("aChild", UsageCategory.SUBAGENT, "Explore");
             UsageAttribution grand = child.child("aGrand", UsageCategory.SUBAGENT, "nested");
 
-            ledger.attach(main, new AgentState("sys", SESSION, UUID.randomUUID()));
+            ledger.attach(main, new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId()));
             ledger.record(call(grand, 7, 7, MODEL, UsageTokenSource.UPSTREAM, LlmUsagePhase.SETTLED, true));
 
             UsageAttribution restored = ledger.attributionOf("aGrand");
@@ -131,7 +131,7 @@ class SessionUsageLedgerAccountingTest {
             ModelCostCalculator calc = calculator();
             AgentUsage usage = new AgentUsage(1200, 340, 12L, 800L, null, null, null);
             UsageAttribution main = UsageAttribution.top(SESSION, SESSION, UsageCategory.MAIN, null);
-            AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+            AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
             SessionUsageLedger ledger = new SessionUsageLedger(SESSION, calc, null);
             ledger.attach(main, state);
 

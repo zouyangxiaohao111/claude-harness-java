@@ -228,7 +228,7 @@ class ReadPermissionCheckerWorkingDirAnchorTest {
     }
 
     private static ToolUseContext ctx(Path effectiveCwd, PermissionMode mode) {
-        return ToolUseContext.of(UUID.randomUUID(), SESSION, mode,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), SESSION, mode,
             List.of(), "", AbortController.NOOP, List.of(),
             ToolPermissionContext.of(mode,
                 Map.<PermissionRuleSource, Set<PermissionRule>>of(),

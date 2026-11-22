@@ -154,7 +154,7 @@ class CompactCommandPersistWritebackTest {
         MessageService messageService = mock(MessageService.class);
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         List<ChatMessageDto> pre = List.of(
             msg("m1", Role.user, "hi"),
@@ -187,7 +187,7 @@ class CompactCommandPersistWritebackTest {
         MessageService messageService = mock(MessageService.class);
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenAnswer(inv -> inv.getArgument(1));
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         List<ChatMessageDto> pre = List.of(
             msg("m1", Role.user, "hi"),
@@ -218,7 +218,7 @@ class CompactCommandPersistWritebackTest {
     @Test
     @DisplayName("无落库通道: 返回 NO_PERSIST_CHANNEL 且内存仍替换为压缩后视图（不静默、不谎报）")
     void noPersistChannelFailsLoud() {
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         assertThat(state.isAppendPersistenceArmed())
             .as("前置：未武装（run 空闲态，ChatService 收口已 clearCompactPersistListener）")
             .isFalse();
@@ -241,7 +241,7 @@ class CompactCommandPersistWritebackTest {
     @Test
     @DisplayName("AgentState 已武装: 回落 state.persistCompactedMessages（与 auto/reactive 同一通道），messageService 可 null")
     void armedStateChannelIsUsedWhenNoDirectMessageService() {
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         List<ChatMessageDto> capturedByState = new ArrayList<>();
         state.setAppendListener(m -> { });
         state.setCompactPersistListener(msgs -> {
@@ -268,7 +268,7 @@ class CompactCommandPersistWritebackTest {
         MessageService messageService = mock(MessageService.class);
         when(messageService.appendPostCompactMessages(eq(SESSION), anyList()))
             .thenThrow(new RuntimeException("db down"));
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
 
         List<ChatMessageDto> pre = List.of(
             msg("m1", Role.user, "hi"),
@@ -303,7 +303,7 @@ class CompactCommandPersistWritebackTest {
             .thenAnswer(inv -> inv.getArgument(1));
 
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         state.replaceMessages(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, state);
 
@@ -338,7 +338,7 @@ class CompactCommandPersistWritebackTest {
     void handleCompactCommandFailsLoudWhenNoChannel(@TempDir Path baseDir) throws Exception {
         SessionMemoryService sm = newSmService(baseDir);
         SessionAgentStateRegistry registry = new SessionAgentStateRegistry();
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         state.replaceMessages(List.of(msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")));
         registry.register(SESSION, state);
 
@@ -430,7 +430,7 @@ class CompactCommandPersistWritebackTest {
             }
             return inv.getArgument(1);
         });
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         CompactionResult result = CompactCommand.call("  ", traditionalCtx(List.of(
             msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")))).compactionResult();
 
@@ -461,7 +461,7 @@ class CompactCommandPersistWritebackTest {
             calls.incrementAndGet();
             throw busySnapshot();
         });
-        AgentState state = new AgentState("sys", SESSION, UUID.randomUUID());
+        AgentState state = new AgentState("sys", SESSION, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         CompactionResult result = CompactCommand.call("  ", traditionalCtx(List.of(
             msg("m1", Role.user, "hi"), msg("m2", Role.assistant, "yo")))).compactionResult();
 

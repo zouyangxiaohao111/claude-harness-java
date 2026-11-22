@@ -42,7 +42,7 @@ import static org.mockito.Mockito.mock;
 class H14V3_ExitWorktreeNewCwdTest {
 
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f6071b";
 
     @AfterEach
     void tearDown() {

@@ -51,7 +51,7 @@ class EnterWorktreeToolNestingGuardTest {
 
     private static final String SESSION =
             "sess-12345678";
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f6071a";
 
     @AfterEach
     void tearDown() {

@@ -63,7 +63,7 @@ class SchemaNotSentHintRoleToolE2ETest {
         Tool mcpTool = mockMcp("mcp__gh__create");
 
         // 真实执行 ToolSearchTool：ctx.availableTools 含 deferred mcp 工具，select 精确命中
-        ToolUseContext execCtx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext execCtx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT, List.of(mcpTool));
         ToolUseBlock call = new ToolUseBlock("toolu_1", ToolNameConstants.TOOL_SEARCH_TOOL_NAME,
                 JSON.createObjectNode().put("query", "select:mcp__gh__create").put("max_results", 5));
@@ -103,7 +103,7 @@ class SchemaNotSentHintRoleToolE2ETest {
         Tool otherMcp = mockMcp("mcp__gh__delete");
         Tool targetMcp = mockMcp("mcp__gh__create");
 
-        ToolUseContext execCtx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext execCtx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT, List.of(otherMcp));
         ToolUseBlock call = new ToolUseBlock("toolu_1", ToolNameConstants.TOOL_SEARCH_TOOL_NAME,
                 JSON.createObjectNode().put("query", "select:mcp__gh__delete"));
@@ -132,7 +132,7 @@ class SchemaNotSentHintRoleToolE2ETest {
         // Role.tool 真实 producer 产物（扁平化 tool_reference）
         ToolSearchTool toolSearch = new ToolSearchTool();
         Tool flatMcp = mockMcp("mcp__flat__tool");
-        ToolUseContext execCtx = ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
+        ToolUseContext execCtx = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
                 PermissionMode.DEFAULT, List.of(flatMcp));
         ToolUseBlock call = new ToolUseBlock("toolu_1", ToolNameConstants.TOOL_SEARCH_TOOL_NAME,
                 JSON.createObjectNode().put("query", "select:mcp__flat__tool"));
@@ -200,7 +200,7 @@ class SchemaNotSentHintRoleToolE2ETest {
     }
 
     private static ToolUseContext ctxWith(List<Tool> availableTools, List<?> messages) {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT,
                 Map.of(), availableTools, "", null, messages,

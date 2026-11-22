@@ -6,7 +6,6 @@ import org.junit.jupiter.api.io.TempDir;
 
 import java.nio.file.Path;
 import java.util.List;
-import java.util.UUID;
 
 import static org.assertj.core.api.Assertions.assertThat;
 
@@ -79,10 +78,10 @@ class SdkEventQueueWiringTest {
         TaskFrameworkService service = new TaskFrameworkService(sdk);
         BackgroundTaskRunner runner = new BackgroundTaskRunner(nq, service, sdk);
 
-        String taskId = UUID.randomUUID().toString();
+        String taskId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         // createSessionId 为必填（批 3b-D7 签名收紧：taskOutputPath 缺值 fail-loud）；
         // C2 起同时是 task_started/task_notification 的归属键 ⇒ 必须与下方 drain 同键。
-        runner.registerAsyncAgent(UUID.fromString(taskId), "调研任务", "prompt", "general-purpose", null, SESSION);
+        runner.registerAsyncAgent(taskId, "调研任务", "prompt", "general-purpose", null, SESSION);
         // register 已发 task_started（先 drain 掉）
         assertThat(sdk.drainSdkEvents("sess")).hasSize(1);
 

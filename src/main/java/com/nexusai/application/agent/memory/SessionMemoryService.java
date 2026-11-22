@@ -37,6 +37,7 @@ import com.nexusai.application.agent.prompt.SystemPromptAssembler;
 import com.nexusai.application.agent.prompt.SystemPromptAssemblyInput;
 import com.nexusai.application.agent.prompt.SystemPromptSectionCache;
 import com.nexusai.application.agent.session.SessionMemoryPrompts;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.subagent.createSubagentContext;
 import com.nexusai.application.agent.tool.SessionStorage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -1879,7 +1880,7 @@ public class SessionMemoryService {
      * {@code const planAttachment = createPlanAttachmentIfNeeded(agentId);
      * const attachments = planAttachment ? [planAttachment] : []}。
      *
-     * <p>数据源经 {@link PlanProvider#createPlanAttachmentIfNeeded(UUID)} 读磁盘 plan 文件
+     * <p>数据源经 {@link PlanProvider#createPlanAttachmentIfNeeded(String)} 读磁盘 plan 文件
      * （plans.ts:119-145 getPlanFilePath / getPlan）；无 plan 文件 / provider 不可解析 →
      * 空列表（CC createPlanAttachmentIfNeeded 返回 null → attachments=[]）。
      *
@@ -1887,7 +1888,7 @@ public class SessionMemoryService {
      * 回落构造 {@link PlanProviderImpl}（默认 plans 目录），对齐
      * {@link PostCompactAttachmentRestorer#resolvePlanProvider}（传统路径同源语义）。
      *
-     * @param agentId   当前 agent ID（null = 主会话；非 UUID → 主会话语义）
+     * @param agentId   当前 agent ID（null = 主会话；非 a+16hex 原样透传）
      * @param sessionId 会话 ID（planProvider 未注入时回落构造 PlanProviderImpl 的 slug 源）
      * @return plan_file_reference 附件消息列表；无 plan → 空
      */
@@ -1897,8 +1898,8 @@ public class SessionMemoryService {
             // [session-id-short] sessionId 已 short，PlanProviderImpl 直收 String（不再 UUID.fromString）
             provider = new PlanProviderImpl(sessionId);
         }
-        UUID agentUuid = parseUuidOrNull(agentId);
-        AttachmentMessageDto.PlanRef planRef = provider.createPlanAttachmentIfNeeded(agentUuid);
+        String agentKey = AgentContext.canonicalAgentId(agentId);
+        AttachmentMessageDto.PlanRef planRef = provider.createPlanAttachmentIfNeeded(agentKey);
         if (planRef == null) {
             if (log.isDebugEnabled()) {
                 log.debug("[SessionMemory] SM plan 附件: 无 plan 文件，结果 attachments 为空（agentId={}）"
@@ -1912,21 +1913,6 @@ public class SessionMemoryService {
             agentId, planRef.planFilePath(),
             planRef.planContent() == null ? 0 : planRef.planContent().length());
         return List.of(planAttachment);
-    }
-
-    /**
-     * [IMP-CM-04] agentId → UUID（null / 空白 / 非法 → null = 主会话语义）· 对齐
-     * {@link PostCompactAttachmentRestorer#parseUuidOrNull}。
-     */
-    private static UUID parseUuidOrNull(String agentId) {
-        if (agentId == null || agentId.isBlank()) {
-            return null;
-        }
-        try {
-            return UUID.fromString(agentId);
-        } catch (IllegalArgumentException e) {
-            return null;
-        }
     }
 
     // ════════════════════════════════════════════════════════════════════

@@ -48,7 +48,7 @@ class BashToolPermissionTest {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
-    private static final UUID AGENT = UUID.randomUUID();
+    private static final String AGENT = "a1b2c3d4e5f60718";
     private static final String SESSION = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
 
     // ────────────────────────────────────────────────────────────────────

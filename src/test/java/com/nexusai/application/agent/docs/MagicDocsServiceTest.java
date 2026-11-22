@@ -145,7 +145,7 @@ class MagicDocsServiceTest {
     private static PostSamplingContext mainThreadContextWithSession(String sessionId) {
         ToolUseContext tuc = sessionId == null
             ? null
-            : ToolUseContext.of(java.util.UUID.randomUUID(), sessionId);
+            : ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId);
         return new PostSamplingContext(List.of(), List.of("systemPrompt"), Map.of(), Map.of(),
             tuc, QuerySource.REPL_MAIN_THREAD);
     }

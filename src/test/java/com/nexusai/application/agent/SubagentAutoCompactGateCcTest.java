@@ -117,7 +117,7 @@ class SubagentAutoCompactGateCcTest {
     @DisplayName("主线程（agentId==sessionId）超阈 → 压缩照常（既有行为不回归）【部件级：压缩器为形参注入 · ⛔ 非生产路径，见类 javadoc】")
     void mainThreadOverLimit_autoCompacts() {
         String id = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        AgentState state = new AgentState("sys", id, UUID.randomUUID());
+        AgentState state = new AgentState("sys", id, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
         appendLargeMessages(state, 50);
         LlmProviderFactory factory = completingProviderFactory();
         AutoCompactor auto = autoCompactor();
@@ -153,7 +153,7 @@ class SubagentAutoCompactGateCcTest {
     /** 子代理状态：agentId ≠ sessionId（触发 Java 旧 !isSubagent 判定的场景）。 */
     private static AgentState subagentState() {
         String session = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID agent = UUID.randomUUID();
+        String agent = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         return new AgentState("sys", session, agent);
     }
 
@@ -177,7 +177,7 @@ class SubagentAutoCompactGateCcTest {
         };
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }

@@ -11,6 +11,7 @@ import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolResultStorage;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
+import com.nexusai.application.agent.tool.ToolCallSummary;
 import com.nexusai.application.agent.tool.impl.web.DeepSeekFetchEngine;
 import com.nexusai.domain.settings.SettingsService;
 import com.nexusai.model.settings.dto.SettingsDto;
@@ -226,7 +227,9 @@ public class WebFetchTool implements Tool {
             securityDomainCheckSource = domainCheckUrl;
             if (log.isInfoEnabled()) {
                 log.info("[WebFetchTool] settings.proxy/websearchDomainCheckUrl 变更/懒构建，security 重建: proxy={} domainCheckUrl={}",
-                        proxy == null ? "直连" : proxy,
+                        // [保密 2026-11-22] 日志不得出现代理口令
+                        proxy == null ? "直连"
+                            : com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(proxy),
                         domainCheckUrl == null ? "跳过预检" : domainCheckUrl);
             }
             return security;
@@ -246,7 +249,9 @@ public class WebFetchTool implements Tool {
             return null;
         }
         try {
-            return settingsService.get().proxy();
+            // [保密 2026-11-22] 必须走内部真值：get().proxy() 现在是 user:****@host 掩码，
+            //   拿它去连代理会认证失败。
+            return settingsService.readDbWebsearchProxy();
         } catch (Exception e) {
             if (log.isWarnEnabled()) {
                 log.warn("[WebFetchTool] settings 读取失败，proxy 按直连处理（fail-loud）: err={}", e.getMessage());
@@ -289,10 +294,12 @@ public class WebFetchTool implements Tool {
         long start = System.currentTimeMillis();
         try {
             SettingsDto s = settingsService != null ? settingsService.get() : null;
-            String key = s != null && s.apiKey() != null ? s.apiKey() : "";
+            // [保密 2026-11-22] key/proxy 走内部真值：DTO 只回掩码，拿掩码发 DeepSeek 必 401。
+            String plainKey = settingsService != null ? settingsService.readDbApiKeyPlain() : null;
+            String key = plainKey != null ? plainKey : "";
             String base = s != null && s.websearchBaseUrl() != null && !s.websearchBaseUrl().isBlank()
                 ? s.websearchBaseUrl().trim() : DeepSeekFetchEngine.DEFAULT_BASE_URL;
-            String proxy = s != null ? s.proxy() : null;
+            String proxy = settingsService != null ? settingsService.readDbWebsearchProxy() : null;
             DeepSeekFetchEngine.Page page = new DeepSeekFetchEngine(base, key, proxy, null).fetch(url);
             String content = page.content() == null ? "" : page.content();
             WebFetchSecurity.FetchedContent fc = new WebFetchSecurity.FetchedContent(
@@ -340,10 +347,12 @@ public class WebFetchTool implements Tool {
         try {
             if ("deepseek".equals(currentFetchEngine())) {
                 SettingsDto s = settingsService != null ? settingsService.get() : null;
-                String key = s != null && s.apiKey() != null ? s.apiKey() : "";
+                // [保密 2026-11-22] 同 executeDeepSeekFetch：真值走内部读链
+                String plainKey = settingsService != null ? settingsService.readDbApiKeyPlain() : null;
+                String key = plainKey != null ? plainKey : "";
                 String base = s != null && s.websearchBaseUrl() != null && !s.websearchBaseUrl().isBlank()
                     ? s.websearchBaseUrl().trim() : DeepSeekFetchEngine.DEFAULT_BASE_URL;
-                String proxy = s != null ? s.proxy() : null;
+                String proxy = settingsService != null ? settingsService.readDbWebsearchProxy() : null;
                 DeepSeekFetchEngine.Page page = new DeepSeekFetchEngine(base, key, proxy, null).fetch(url);
                 return page == null ? null : page.content();
             }
@@ -395,6 +404,28 @@ public class WebFetchTool implements Tool {
                 + "This tool is read-only and does not modify any files. Includes a self-cleaning 15-minute cache. "
                 + "When a URL redirects to a different host, the tool will inform you and provide the redirect URL "
                 + "in a special format; you should then make a new WebFetch request with the redirect URL.";
+    }
+
+    /**
+     * [B2] 本次调用的标题句 · CC 口径 {@code "Claude wants to fetch content from <host>"}。
+     * 路径/查询参数等细节留给 input_preview。
+     */
+    @Override
+    public String description(JsonNode input) {
+        String url = ToolCallSummary.firstText(input, "url");
+        if (url == null) {
+            return "Claude wants to fetch content from a URL";
+        }
+        String host = url;
+        try {
+            String parsed = java.net.URI.create(url).getHost();
+            if (parsed != null && !parsed.isBlank()) {
+                host = parsed;
+            }
+        } catch (RuntimeException ignored) {
+            // 非法 URL ⇒ 原样展示（标题句不该因为解析失败而消失）
+        }
+        return "Claude wants to fetch content from " + host;
     }
 
     /** 搜索提示 · 对齐 CC WebFetchTool.ts:68 searchHint（逐字）。 */

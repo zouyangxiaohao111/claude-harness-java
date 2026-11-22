@@ -78,7 +78,7 @@ class BashToolSpawnCwdSessionPropagationTest {
 
     /** 与 {@code BashToolPersistenceTest} / {@code BashToolAlignmentTest} 同款真实执行夹具。 */
     private ToolUseContext ctx(Path workspaceDir, String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), null, null, Map.of(),
             false, "", workspaceDir);
     }

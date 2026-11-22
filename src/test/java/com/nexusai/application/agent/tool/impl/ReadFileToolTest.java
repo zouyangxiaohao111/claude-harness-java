@@ -129,7 +129,7 @@ class ReadFileToolTest {
      * 保证 @TempDir 每次测试唯一.
      */
     private static ToolUseContext ctxWithSession(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("rft-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }
@@ -158,7 +158,7 @@ class ReadFileToolTest {
      * （3 参工厂 effectiveCwd 兜底为 user.dir，父链 startsWith(user.dir+sep) 不成立 → 发现为空）。
      */
     private static ToolUseContext ctxWithCwd(Path workspace) throws Exception {
-        UUID agentId = UUID.nameUUIDFromBytes(("rft-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8).toString().toString();
         // toRealPath: @TempDir 在 Windows 返回 8.3 短名（ADMINI~1.DES），而 PathGuard.resolve
         // 内部 toRealPath 长名（Administrator.DESKTOP-S50NL12）—— 形态不一致会让 discover
@@ -459,8 +459,8 @@ class ReadFileToolTest {
 
         ToolResult r = (ToolResult) tool.execute(callWith("sub/missing.txt"), ctx);
         // [IMP-C5] 错误 data 为 String（"File not found" 不在 isToolErrorData 前缀集，直接断言错误消息文本）
-        assertThat(r.data()).isInstanceOf(String.class);
-        assertThat((String) r.data()).contains("File not found");
+        assertThat(r.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(r.data())).contains("File not found");
         assertThat(ctx.dynamicSkillDirTriggers())
             .as("CC FileReadTool.ts:575-591 技能链在 callInner（:593 ENOENT 友好错误 :611）之前执行——文件不存在同样触发技能发现")
             .isNotEmpty();
@@ -700,8 +700,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("big.ipynb"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        String msg = (String) result.data();
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String msg = String.valueOf(result.data());
         assertThat(msg).contains("exceeds maximum allowed size");
         assertThat(msg).contains("Bash").contains("jq");
         // jq 4 条示例逐字对齐 CC FileReadTool.ts:831-834
@@ -724,8 +724,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("big.ipynb"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data())
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data()))
             .contains("tokens estimated")
             .contains("exceeds maximum allowed tokens");
     }
@@ -774,8 +774,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data()).contains("empty");
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data())).contains("empty");
     }
 
     @Test
@@ -786,8 +786,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data()).contains("not a valid PDF");
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data())).contains("not a valid PDF");
     }
 
     @Test
@@ -799,8 +799,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data()).contains("maximum allowed size");
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data())).contains("maximum allowed size");
     }
 
     @Test
@@ -811,8 +811,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"));
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data()).contains("too many to read at once");
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data())).contains("too many to read at once");
     }
 
     @Test
@@ -864,8 +864,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("文本模型全读 PDF → 引导文本 data（非 parts/JsonNode —— 不发 document/image block）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             .as("错误含模型不支持 image/PDF + 范围 + path；引导 vision_analyze(contentType=pdf, path=绝对路径) 直达（非派多模态子代理）")
             .contains("当前模型不支持 image/PDF 视觉")
@@ -896,8 +896,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("文本模型图片 → 引导文本 data（非 parts/JsonNode —— 不发 image block，deepseek 空读根因）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             .as("错误含模型不支持 + path；引导 vision_analyze(type=analyze, path=…)（非派子代理/非 contentId）")
             .contains("当前模型不支持 Read 直接显示图像")
@@ -928,8 +928,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("多模态 + openai 兼容格式 → 引导文本 data（不发 image block）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             .as("文案要点名**当前格式**（openai 兼容）+ 说清模型本身多模态 + 引导 vision_analyze；⛔ 不再说「模型不支持」")
             .contains("当前 provider 格式")
@@ -953,7 +953,7 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("shot.png"), ctx);
 
-        String data = (String) result.data();
+        String data = String.valueOf(result.data());
         assertThat(data)
             .as("文本模型 ⇒ 旧文案保留（模型确实不支持图片）")
             .contains("当前模型不支持 Read 直接显示图像")
@@ -971,8 +971,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("文本模型 pages → 引导文本 data（非 parts/JsonNode —— 不发 image block newMessages）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             .contains("当前模型不支持 image/PDF 视觉")
             .contains("PDF 页图（pages=1-2）")
@@ -999,8 +999,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("data 为引导文本（非 parts/JsonNode —— 不发 image block）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             // [vision-cc-align 2026-09-03] 递归根因修复：不再引导派多模态子代理（fork 继承文本模型 →
             //   Read 再触发门控 → 无限递归）。改为引导 vision_analyze 直达（工具内部懒渲染 pages → 调多模态
@@ -1095,8 +1095,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf"), ctx);
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data())
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data()))
             .as("3 参 type=chat（deepseek）→ 引导文本 error（含 model=deepseek-chat，非 1 参 haiku 名字契约路径）")
             .contains("Error: 当前模型不支持 image/PDF 视觉")
             .contains("model=deepseek-chat")
@@ -1118,8 +1118,8 @@ class ReadFileToolTest {
 
         ToolResult result = (ToolResult) tool.execute(callWith("doc.pdf", "pages", "1-2"), ctx);
 
-        assertThat(result.data()).isInstanceOf(String.class);
-        assertThat((String) result.data())
+        assertThat(result.data()).isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(result.data()))
             .as("3 参 type=chat pages → 引导文本 error（含 pages 范围，不渲染页图）")
             .contains("Error: 当前模型不支持 image/PDF 视觉")
             .contains("PDF 页图（pages=1-2）")
@@ -1149,8 +1149,8 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("deepseek-vision-exp：多模态（type=vision）但 openai-completions 非 ant 直给格式 → 引导（不直给页图）")
-            .isInstanceOf(String.class);
-        String data = (String) result.data();
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        String data = String.valueOf(result.data());
         assertThat(data)
             // [2026-11-01] 文案按三态区分：模型**多模态**但格式不开放直给 ⇒ 说「当前 provider 格式不支持」，
             //   不再说「当前模型不支持」（那会把格式限制说成模型能力不足，与事实不符）
@@ -1220,7 +1220,7 @@ class ReadFileToolTest {
 
     /** [pdf-vision-align 纠正] 文本模型上下文：appState mainLoopModel=claude-3-haiku（mappers 未注入 → 1 参回落 false → 文本模型分支）。 */
     private static ToolUseContext haikuModelCtx(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("rft-haiku-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return ToolUseContext.of(
             agentId, sessionId, PermissionMode.DEFAULT,
@@ -1389,8 +1389,8 @@ class ReadFileToolTest {
             //   直接断言错误消息文本以锁死 fail-loud 语义，避免依赖共享启发式）。
             assertThat(result.data())
                 .as("listener 异常必须 fail-loud (error result), 不能静默吞掉")
-                .isInstanceOf(String.class);
-            assertThat((String) result.data()).contains("listener boom");
+                .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+            assertThat(String.valueOf(result.data())).contains("listener boom");
             // 后续 listener 不被调用 (CC 中断语义)
             assertThat(received)
                 .as("第一个 listener 抛异常后, 后续 listener 不得被调用 (CC :1042-1044 裸调用)")
@@ -1425,7 +1425,7 @@ class ReadFileToolTest {
 
         assertThat(result.data())
             .as("PathGuard 逃逸拦截已删（对齐 CC）：../../ 展开后读文件，不存在返回 String error（非 escape 拦截）")
-            .isInstanceOf(String.class);
+            .isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
         assertThat(String.valueOf(result.data()))
             .doesNotContain("escapes workspace");
     }
@@ -1534,7 +1534,7 @@ class ReadFileToolTest {
      */
     private static ToolUseContext ctxWithSessionAndModel(Path workspace, String mainLoopModel) {
         return ToolUseContext.of(
-            UUID.nameUUIDFromBytes(("rft-agent-" + workspace).getBytes()),
+            com.nexusai.application.agent.subagent.AgentContext.createAgentId(),
             "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8),
             PermissionMode.DEFAULT,
             java.util.List.<com.nexusai.application.agent.tool.Tool>of(),
@@ -2104,8 +2104,8 @@ class ReadFileToolTest {
 
         // 对照组：无 override → 默认 256KB 上限拒绝 300KB 全读
         ToolResult withoutOverride = (ToolResult) tool.execute(callWith("big.txt"), ctxWithSession(workspace));
-        assertThat(withoutOverride.data()).as("无 override 默认 256KB 必须拒绝 300KB").isInstanceOf(String.class);
-        assertThat((String) withoutOverride.data()).contains("exceeds maximum allowed size");
+        assertThat(withoutOverride.data()).as("无 override 默认 256KB 必须拒绝 300KB").isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(withoutOverride.data())).contains("exceeds maximum allowed size");
 
         // override：maxSizeBytes=512KB（放宽）+ maxTokens 足够大（token 校验不参与）→ 放行
         ToolResult withOverride = (ToolResult) tool.execute(callWith("big.txt"),
@@ -2118,17 +2118,20 @@ class ReadFileToolTest {
     @DisplayName("OPD-D1-01 · override maxSizeBytes 收紧 pre-read 字节上限（100KB 默认放行 → 64KB 拒绝）")
     void overrideMaxSizeBytesTightensFullRead(@TempDir Path workspace) throws Exception {
         // WHY: 收紧语义——调用方可以把默认 256KB 降为 64KB，让超大文件更早 fail-loud（CC 无截断概念）。
-        writeAsciiFile(workspace, "mid.txt", 100 * 1024);
+        writeAsciiFile(workspace, "mid.txt", 70 * 1024);
         ReadFileTool tool = toolFor(workspace);
 
         ToolResult withoutOverride = (ToolResult) tool.execute(callWith("mid.txt"), ctxWithSession(workspace));
+        // [错误通道 · CCJ-ERR-014] 结构判定后本断言才真正生效：原实现靠前缀表判错，
+        //   该分支的真实失败（token 上限）不在表内 → 断言恒真、掩盖了下述 token 上限问题。
+        //   文件名 70KB：> 64KB override（验证字节收紧）且 < 25000 token 默认上限（避免撞 token 闸）。
         assertThat(LlmAgentLoop.isToolErrorData(withoutOverride.data()))
-            .as("无 override 100KB < 256KB 默认放行").isFalse();
+            .as("无 override 70KB < 256KB 默认放行").isFalse();
 
         ToolResult withOverride = (ToolResult) tool.execute(callWith("mid.txt"),
             ctxWithOverride(workspace, new FileReadingLimits.Override(1_000_000, 64 * 1024)));
-        assertThat(withOverride.data()).as("override maxSizeBytes=64KB 必须拒绝 100KB（CC :505-506）").isInstanceOf(String.class);
-        assertThat((String) withOverride.data()).contains("exceeds maximum allowed size");
+        assertThat(withOverride.data()).as("override maxSizeBytes=64KB 必须拒绝 100KB（CC :505-506）").isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(withOverride.data())).contains("exceeds maximum allowed size");
     }
 
     @Test
@@ -2140,8 +2143,8 @@ class ReadFileToolTest {
         ReadFileTool tool = toolFor(workspace);
 
         ToolResult withoutOverride = (ToolResult) tool.execute(callWith("wide.txt"), ctxWithSession(workspace));
-        assertThat(withoutOverride.data()).as("无 override 默认 token 上限必须拒绝 200KB 输出").isInstanceOf(String.class);
-        assertThat((String) withoutOverride.data()).contains("exceeds maximum allowed tokens");
+        assertThat(withoutOverride.data()).as("无 override 默认 token 上限必须拒绝 200KB 输出").isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(withoutOverride.data())).contains("exceeds maximum allowed tokens");
 
         // maxSizeBytes 也放宽到 1MB（否则 size 校验先拒绝）；maxTokens=100000 → 400k 字符 ≥ 200k
         ToolResult withOverride = (ToolResult) tool.execute(callWith("wide.txt"),
@@ -2163,8 +2166,8 @@ class ReadFileToolTest {
 
         ToolResult withOverride = (ToolResult) tool.execute(callWith("small.txt"),
             ctxWithOverride(workspace, new FileReadingLimits.Override(1_000, null)));
-        assertThat(withOverride.data()).as("override maxTokens=1000 必须拒绝 10KB 输出（CC :507）").isInstanceOf(String.class);
-        assertThat((String) withOverride.data()).contains("exceeds maximum allowed tokens");
+        assertThat(withOverride.data()).as("override maxTokens=1000 必须拒绝 10KB 输出（CC :507）").isInstanceOf(com.nexusai.application.agent.tool.ToolError.class);
+        assertThat(String.valueOf(withOverride.data())).contains("exceeds maximum allowed tokens");
     }
 
     @Test

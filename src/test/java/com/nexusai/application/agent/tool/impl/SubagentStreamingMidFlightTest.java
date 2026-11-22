@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.tool.impl;
 
 import com.nexusai.application.agent.AgentState;
+import com.nexusai.application.agent.subagent.AgentContext;
 import com.nexusai.application.agent.tool.AgentUsage;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.FinishReason;
@@ -47,7 +48,7 @@ class SubagentStreamingMidFlightTest {
     void appendMessage_shouldFireListenerSynchronously() {
         // WHY: 流式语义的核心是 "逐消息实时" — 回调必须在 appendMessage 返回前触发
         //   (CC for-await 每轮循环 yield, 父 Agent 不等终态). 后置批量 emit 会破坏该时间序.
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         List<ChatMessageDto> observed = new ArrayList<>();
         Consumer<ChatMessageDto> listener = observed::add;
         state.setAppendListener(listener);
@@ -66,7 +67,7 @@ class SubagentStreamingMidFlightTest {
     void listenerCallback_shouldMapMessageTypesCorrectly() {
         // WHY: sink 消费端 (executeStreaming messageSink) 依赖 toSubagentMessage 类型映射 —
         //   assistant 消息含 usage (CC agentToolUtils.ts:355), 父 Agent 据此做 token budget 决策.
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         List<SubagentMessage> sink = new ArrayList<>();
         state.setAppendListener(msg -> sink.add(SubagentExecutor.toSubagentMessage(msg, "agent-1")));
 
@@ -87,7 +88,7 @@ class SubagentStreamingMidFlightTest {
     @DisplayName("逐消息 append → sink 顺序与产生顺序一致 (CC for-await yield 顺序)")
     void listener_shouldPreserveMessageOrder() {
         // WHY: 父 Agent 依赖消息顺序重建子 Agent 思维链 — 乱序 emit 会错乱 transcript/UI.
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         List<String> order = new ArrayList<>();
         state.setAppendListener(msg -> order.add(msg.content()));
 
@@ -103,7 +104,7 @@ class SubagentStreamingMidFlightTest {
     void clearAppendListener_shouldStopCallbacks() {
         // WHY: runSubagentQueryLoop finally 解除监听 — 不解除则跨 execute 复用残留回调引用
         //   (异常/早退路径). 泄漏 = 后续无关 append 触发陈旧 sink.
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         AtomicInteger fired = new AtomicInteger(0);
         state.setAppendListener(msg -> fired.incrementAndGet());
         state.appendMessage(dto(Role.user, "m1", null, null, null));
@@ -119,7 +120,7 @@ class SubagentStreamingMidFlightTest {
     void unarmed_shouldBeNoOp() {
         // WHY: AgentState 是主循环共享类 (高扇出) — listener 默认 null, 主循环不武装,
         //   零行为影响 (S4 风险项 1 的 RED 证据).
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         state.appendMessage(dto(Role.user, "m1", null, null, null));
         state.appendMessage(dto(Role.assistant, "m2", null, 1, 1));
         // 无异常 = 通过; 消息正常落库
@@ -131,7 +132,7 @@ class SubagentStreamingMidFlightTest {
     void replaceMessages_shouldNotFireListener() {
         // WHY: CC 压缩重建 messages 不产生 per-message yield (compact 独立通道); Java
         //   replaceMessages 清空重建若也触发 listener 会双发. 单点语义: 仅 appendMessage yield.
-        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), UUID.randomUUID());
+        AgentState state = new AgentState("system", "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), AgentContext.createAgentId());
         AtomicInteger fired = new AtomicInteger(0);
         state.setAppendListener(msg -> fired.incrementAndGet());
 

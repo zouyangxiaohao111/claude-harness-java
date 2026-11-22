@@ -276,8 +276,8 @@ class BackgroundTaskRunnerTest {
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
         // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-async";
-        UUID agentId = UUID.randomUUID();
-        String taskId = agentId.toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String taskId = agentId;
 
         BackgroundTask task = runner.registerAsyncAgent(
             agentId, "异步任务", "prompt", "general-purpose", null, sessionId);
@@ -296,8 +296,8 @@ class BackgroundTaskRunnerTest {
         //   taskId===agentId 合一。旧 Java 硬编码 /tmp/agent-{taskId}.out 已删除（A-7 拍板）。
         // [批 3c] 原此处 setSession 造 ambient 会话；API 已显式传 sessionId ⇒ 装置删除。
         String sessionId = "sess-fg";
-        UUID agentId = UUID.randomUUID();
-        String taskId = agentId.toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String taskId = agentId;
 
         BackgroundTask task = runner.registerAgentForeground(
             agentId, "前台任务", "prompt", "general-purpose", sessionId);
@@ -316,8 +316,8 @@ class BackgroundTaskRunnerTest {
         //   把 output 软链到该 agent 的 transcript，任务结束只把路径拼进通知文本。
         //   若这里仍 append summary，会把一段纯文本塞进 transcript 的 .jsonl，破坏记录格式。
         String sessionId = "sess-write-" + UUID.randomUUID().toString().substring(0, 8);
-        UUID agentId = UUID.randomUUID();
-        String taskId = agentId.toString();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
+        String taskId = agentId;
         BackgroundTask task = runner.registerAsyncAgent(
             agentId, "写输出", "prompt", "general-purpose", null, sessionId);
 

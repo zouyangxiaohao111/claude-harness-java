@@ -66,7 +66,7 @@ class LlmAgentLoopDeferLoadingPipelineTest {
     /** [R8] 显式 provider 盖章变体（非 anthropic / 未知场景）。 */
     private ToolUseContext tuc(List<Tool> availableTools, String providerType) {
         return new ToolUseContext(
-                UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT, Map.of(),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8), PermissionMode.DEFAULT, Map.of(),
                 availableTools, null, AbortController.NOOP, List.of(),
                 (ToolPermissionContext) null, PermissionMode.DEFAULT)
             .withEffectiveProviderType(providerType);
@@ -301,7 +301,7 @@ class LlmAgentLoopDeferLoadingPipelineTest {
         List<Tool> available = List.of(new BashTool(), new ToolSearchTool(), new NotebookEditTool());
 
         ToolUseContext refusedTuc = new ToolUseContext(
-                UUID.randomUUID(), sid, PermissionMode.DEFAULT, Map.of(),
+                com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sid, PermissionMode.DEFAULT, Map.of(),
                 available, null, AbortController.NOOP, List.of(),
                 (ToolPermissionContext) null, PermissionMode.DEFAULT)
             .withEffectiveProviderType("anthropic");

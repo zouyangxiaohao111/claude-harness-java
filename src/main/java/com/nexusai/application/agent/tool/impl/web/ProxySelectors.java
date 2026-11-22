@@ -50,7 +50,8 @@ public final class ProxySelectors {
         }
         int idx = p.lastIndexOf(':');
         if (idx <= 0 || idx == p.length() - 1) {
-            log.warn("[ProxySelectors] proxy 格式非法（应为 host:port），回退直连: proxy='{}'", proxy);
+            log.warn("[ProxySelectors] proxy 格式非法（应为 host:port），回退直连: proxy='{}'",
+                com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(proxy));
             return null;
         }
         try {
@@ -58,7 +59,8 @@ public final class ProxySelectors {
             int port = Integer.parseInt(p.substring(idx + 1));
             return ProxySelector.of(InetSocketAddress.createUnresolved(host, port));
         } catch (NumberFormatException e) {
-            log.warn("[ProxySelectors] proxy 端口非法，回退直连: proxy='{}' err={}", proxy, e.getMessage());
+            log.warn("[ProxySelectors] proxy 端口非法，回退直连: proxy='{}' err={}",
+                com.nexusai.infra.util.ApiKeyHasher.maskProxyPassword(proxy), e.getMessage());
             return null;
         }
     }

@@ -67,7 +67,7 @@ class R32B13B9_PermissionDeniedRetryTest {
     }
 
     private ToolUseContext createCtx() {
-        UUID agentId = UUID.randomUUID();
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
         return new ToolUseContext(agentId, sessionId, PermissionMode.DEFAULT,
             Map.of(), List.of(), "", null, List.of(),

@@ -387,7 +387,7 @@ class CompactSessionCostWiringTest {
                                       String sessionId) {
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), sessionId),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId),
             QuerySource.USER, TRAP_MODEL, null,
             null, null, null, null,
             deps(resolvedModel, ctx), ProviderConfig.empty());
@@ -398,7 +398,7 @@ class CompactSessionCostWiringTest {
                                               String sessionId) {
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), sessionId),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId),
             QuerySource.USER, "test-model", 8,
             null, null, null, null,
             deps(resolvedModel, ctx), ProviderConfig.empty());

@@ -286,7 +286,7 @@ public class CronCreateTool implements Tool {
      *
      * <p><b>决策#11（CRON-F2 null 语义）</b>: 门控 null 统一 <b>fail-open</b>（null→开/放行）。
      * CC 布尔链无 null 态（isKairosCronEnabled 恒返回 boolean，GB 默认 true）；Java 侧
-     * {@code cronGates == null} 视为门开——与 TestJob.java:99 / CronIdleExecutor.java:131
+     * {@code cronGates == null} 视为门开——与 AgentJob.java:99 / CronIdleExecutor.java:131
      * 已 fail-open 的消费方三层统一。生产 @ConfigurationProperties + @DefaultValue 恒注入
      * 非 null，此分支仅防护直接 new 构造/测试路径。
      */
@@ -422,6 +422,22 @@ public class CronCreateTool implements Tool {
             .put("type", "boolean")
             .put("description",
                 "true = 跨会话持久化。false（默认）= 仅当前会话有效。"));
+        // ── 本仓增量（CC 无这两项）：任务跑在哪个会话 / 用哪个专家 ──
+        ObjectNode modeNode = props.putObject("sessionMode");
+        modeNode.put("type", "string");
+        var modeEnum = modeNode.putArray("enum");
+        java.util.List.of("REUSE", "NEW_EACH", "NEW_ONCE", "NONE").forEach(modeEnum::add);
+        modeNode
+            .put("description",
+                "任务跑在哪个会话。REUSE（默认）= 绑当前会话，结果就落在那个会话里；"
+                + "NEW_ONCE = 首次触发时建一个专属会话并一直用它（等价于「一个真会话 + 定时唤醒」，"
+                + "可以在渠道里接着聊）；NEW_EACH = 每轮都新建（跑完就散，接不上上一轮）；"
+                + "NONE = 不留会话。");
+        props.set("mainThreadAgent", JSON.createObjectNode()
+            .put("type", "string")
+            .put("description",
+                "可选 · 用哪个专家（主线程 agent）驱动新建的会话。"
+                + "只能在 sessionMode=NEW_EACH / NEW_ONCE 时给；REUSE / NONE 给了会被服务端拒绝。"));
         List.of("cron", "prompt").forEach(r -> schema.putArray("required").add(r));
         return schema;
     }
@@ -492,7 +508,7 @@ public class CronCreateTool implements Tool {
         // CC :120 effectiveDurable = durable && isDurableCronEnabled() — kill-switch 强制 session-only
         //   (门 flips mid-session 时 schema 稳定, 输出 durable 变 false, 对齐 CC :118-120 注释)
         //   决策#11: cronGates null→开（fail-open），对齐 CC isDurableCronEnabled 默认 true
-        //   + CronEnabledGates.DEFAULTS=(true,true) + TestJob/CronIdleExecutor 已 fail-open。
+        //   + CronEnabledGates.DEFAULTS=(true,true) + AgentJob/CronIdleExecutor 已 fail-open。
         boolean effectiveDurable = durable
             && (cronGates == null || cronGates.isDurableCronEnabled());
         if (log.isDebugEnabled() && cronGates == null) {
@@ -622,6 +638,16 @@ public class CronCreateTool implements Tool {
         //    V20 已去 schedules.name UNIQUE 约束, name 退化为纯展示字段。展示碰撞 →
         //    scheduleService.nextAvailableName 追加 -N 递增后缀 (截断逻辑移入该方法,
         //    恒 ≤64 对齐 ScheduleCreateRequest @Size(max=64) 契约; 旧 name.substring(0,64) 已删))
+        // ── 本仓增量：会话形态 + 专家（CC 契约里没有，缺省 = 不指定形态 ⇒ 服务端回落 REUSE）──
+        String sessionModeRaw = input.path("sessionMode").asText("");
+        com.nexusai.model.schedule.dto.SessionMode sessionMode =
+            sessionModeRaw.isBlank() ? null
+                : com.nexusai.model.schedule.dto.SessionMode.valueOf(sessionModeRaw.trim().toUpperCase());
+        String mainThreadAgent = input.path("mainThreadAgent").asText("");
+        if (mainThreadAgent.isBlank()) {
+            mainThreadAgent = null;
+        }
+
         String baseName = (recurring ? "cron:" : "once:") + cron;
         String name = scheduleService.nextAvailableName(baseName);
         if (log.isDebugEnabled() && !name.equals(baseName)) {
@@ -642,6 +668,10 @@ public class CronCreateTool implements Tool {
             sessionId,
             agentId,
             boundProject,              // 批次X Q2: DURABLE 创建会话绑定项目（SESSION 恒 null）
+            sessionMode,               // 本仓增量：任务跑在哪个会话（null ⇒ 服务端回落 REUSE）
+            null,                      // notifyChats：AI 建任务时还不知道聊天 id ⇒ 不自动投递
+            null,                      // notifyChannelIds
+            mainThreadAgent,           // 本仓增量：仅 NEW_EACH / NEW_ONCE 有效（服务端校验）
             scheduleId                 // CRON-F1: one-shot 预生成 id（jitter taskId 依赖）；recurring=null
         );
 

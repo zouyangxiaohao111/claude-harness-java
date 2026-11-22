@@ -81,7 +81,7 @@ class CronListToolCcContractTest {
         ToolResult<?> r = (ToolResult<?>) tool.execute(call("c1"));
         // [REWORK-7] ToolResult.isError() 已删 (IMP-C2) → isError 由 data 文案推导。
         assertThat(LlmAgentLoop.isToolErrorData(r.data())).as("execute 不报错").isFalse();
-        return (String) r.data();
+        return String.valueOf(r.data());
     }
 
     @Test
@@ -177,7 +177,7 @@ class CronListToolCcContractTest {
 
         // [REWORK-7] ToolResult.isError() 已删 (IMP-C2) → isError 由 data 文案推导。
         assertThat(LlmAgentLoop.isToolErrorData(r.data())).isFalse();
-        String text = (String) r.data();
+        String text = String.valueOf(r.data());
         assertThat(text).contains("job-a");
         assertThat(text).as("agentId 不匹配任务被过滤").doesNotContain("job-b");
     }
@@ -293,8 +293,27 @@ class CronListToolCcContractTest {
      * 身份经 {@code withTeammateIdentity}（= 生产唯一盖章入口）显式盖章。
      */
     private static ToolUseContext teammateTuc(TeammateIdentity identity) {
-        return new ToolUseContext(java.util.UUID.randomUUID(), "sess-cron-list",
+        return new ToolUseContext(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-cron-list",
             com.nexusai.application.agent.permission.PermissionMode.DEFAULT, java.util.Map.of())
             .withTeammateIdentity(identity);
+    }
+
+    @Test
+    @DisplayName("本仓增量：非 REUSE 形态在行里标 [session:XXX]，REUSE 不标（避免噪音）")
+    void execute_sessionModeMark() {
+        ScheduleService svc = mock(ScheduleService.class);
+        ScheduleDto reuse = new ScheduleDto(
+            "job-r", "job r", ScheduleKind.cron, "0 0 * ? * *",
+            null, null, "p", "p", null, null, ScheduleScope.DURABLE, null, null, null,
+            com.nexusai.model.schedule.dto.SessionMode.REUSE, null, null, null);
+        ScheduleDto once = new ScheduleDto(
+            "job-o", "job o", ScheduleKind.cron, "0 0 * ? * *",
+            null, null, "p", "p", null, null, ScheduleScope.DURABLE, null, null, null,
+            com.nexusai.model.schedule.dto.SessionMode.NEW_ONCE, null, null, null);
+
+        String text = listText(svc, reuse, once);
+
+        assertThat(text).as("REUSE 是默认形态，不挂标记").doesNotContain("[session:REUSE]");
+        assertThat(text).as("非默认形态要能一眼看出跑在哪个会话").contains("[session:NEW_ONCE]");
     }
 }

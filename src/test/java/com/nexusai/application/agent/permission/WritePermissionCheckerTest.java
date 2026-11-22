@@ -81,7 +81,7 @@ class WritePermissionCheckerTest {
      * 锚 getOriginalCwd；effectiveCwd 不再作白名单锚，仅 expandPath 相对路径基准）。
      */
     private static ToolUseContext ctx(ToolPermissionContext permCtx, Path effectiveCwd, String sessionId) {
-        return ToolUseContext.of(UUID.randomUUID(), sessionId, PermissionMode.DEFAULT,
+        return ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId, PermissionMode.DEFAULT,
             List.of(), "", AbortController.NOOP, List.of(), permCtx, PermissionMode.DEFAULT,
             Map.of(), false, "", effectiveCwd);
     }

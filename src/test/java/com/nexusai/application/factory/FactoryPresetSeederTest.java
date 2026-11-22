@@ -2,7 +2,6 @@ package com.nexusai.application.factory;
 
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
-import com.nexusai.infra.util.CryptoUtil;
 import com.nexusai.repository.provider.entity.ModelRecord;
 import com.nexusai.repository.provider.entity.ProviderRecord;
 import com.nexusai.repository.provider.mapper.ModelMapper;
@@ -10,13 +9,19 @@ import com.nexusai.repository.provider.mapper.ProviderMapper;
 import com.nexusai.repository.settings.entity.SettingsRecord;
 import com.nexusai.repository.settings.mapper.SettingsMapper;
 import java.io.InputStream;
+import java.nio.charset.StandardCharsets;
+import java.nio.file.Files;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
 import org.junit.jupiter.api.DisplayName;
 import org.junit.jupiter.api.Test;
+import org.junit.jupiter.api.io.TempDir;
 import org.mockito.ArgumentCaptor;
+import org.springframework.boot.autoconfigure.condition.ConditionalOnProperty;
 
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatCode;
 import static org.mockito.ArgumentMatchers.any;
 import static org.mockito.Mockito.mock;
 import static org.mockito.Mockito.never;
@@ -27,38 +32,38 @@ import static org.mockito.Mockito.when;
 /**
  * {@link FactoryPresetSeeder} 聚焦单测（Mockito 轻量，不起 Spring 上下文）。
  *
- * <p><b>WHY（规则九 · 测试验证意图）</b>：出厂预设的安全/触发语义是本次任务核心，逐条锁定：
+ * <p><b>WHY（规则九 · 测试验证意图 + 2026-11-20 安全止血）</b>：
  * <ol>
- *   <li><b>全新库（providers 空）才写</b>：minimax + deepseek 两个 provider、minimax 模型 + 3 条
- *       deepseek 模型、settings merge；<b>没有本地叠加时两个 provider 都无 key</b>（GitHub 版本语义）。</li>
- *   <li><b>老库（providers 非空）跳过</b>：零写入、零覆盖。</li>
- *   <li><b>本地叠加</b>：仅内网版本存在 {@code factory-preset.local.json}，只按 name 给已存在的
- *       provider 补 apiKey（加密落库、可解密），不新增 provider；未知 name/空 key 跳过。</li>
- *   <li><b>classpath 基础资源内容</b>：providers = minimax + deepseek、models 4 条、9 个模型档位全部
- *       指向 minimax、settings 键 ⊆ 白名单且<b>不含任何密钥</b> —— 资源漂移即测试失败。</li>
+ *   <li><b>默认关闭</b>：{@code @ConditionalOnProperty(matchIfMissing=false)}，不显式开启就不种入。</li>
+ *   <li><b>全新库（providers 空）才写</b>：minimax + deepseek 两个 provider、4 条模型、settings merge；
+ *       <b>两个 provider 都没有 key</b>（即使本地叠加文件写了 apiKey 也不采纳）。</li>
+ *   <li><b>老库（providers 非空）跳过完整预设</b>：零覆盖。</li>
+ *   <li><b>本地叠加只含非秘钥字段</b>：优先 configHome、其次环境变量；apiKey 一律忽略。</li>
+ *   <li><b>预设文件缺失不抛异常</b>：按无叠加继续。</li>
+ *   <li><b>classpath 基础资源内容</b>：providers = minimax + deepseek、models 4 条、9 个档位指向
+ *       minimax、settings 键 ⊆ 白名单且<b>不含任何密钥</b> —— 资源漂移即测试失败。</li>
  * </ol>
  */
 class FactoryPresetSeederTest {
 
-    /** 与 application.yml 的 dev 默认一致；仅用于验证加密落库可解密。 */
-    private static final String TEST_ENCRYPTION_KEY = "HxBcdiB5ncUwttp/2Z/kImpmtdG8gz79qbekIeGmAGc=";
-
-    /** 测试叠加里的假秘钥（⛔ 非真实秘钥，只为验证叠加链路）。 */
+    /** 测试叠加里的假秘钥（⛔ 非真实秘钥；只用于断言「写了也必须被忽略」）。 */
     private static final String TEST_OVERLAY_KEY = "sk-test-only-1234567890";
+
+    @TempDir
+    Path tempDir;
 
     private final ProviderMapper providerMapper = mock(ProviderMapper.class);
     private final ModelMapper modelMapper = mock(ModelMapper.class);
     private final SettingsMapper settingsMapper = mock(SettingsMapper.class);
     private final ObjectMapper objectMapper = new ObjectMapper();
-    private final CryptoUtil cryptoUtil = new CryptoUtil(TEST_ENCRYPTION_KEY);
 
     private FactoryPresetSeeder newSeeder() {
-        return newSeeder("factory/__absent-local-overlay__.json");
+        return newSeeder(tempDir, null);
     }
 
-    private FactoryPresetSeeder newSeeder(String overlayResourcePath) {
+    private FactoryPresetSeeder newSeeder(Path configHome, String envPresetValue) {
         return new FactoryPresetSeeder(providerMapper, modelMapper, settingsMapper, objectMapper,
-            cryptoUtil, overlayResourcePath);
+            configHome, envPresetValue);
     }
 
     private static JsonNode readPreset(ObjectMapper om) throws Exception {
@@ -70,7 +75,21 @@ class FactoryPresetSeederTest {
     }
 
     @Test
-    @DisplayName("全新库（providers 空）→ minimax + deepseek 两 provider、4 models、9 档位指向 minimax")
+    @DisplayName("默认关闭：@ConditionalOnProperty matchIfMissing=false，必须显式 enabled=true")
+    void defaultDisabled_unlessExplicitlyEnabled() {
+        ConditionalOnProperty condition =
+            FactoryPresetSeeder.class.getAnnotation(ConditionalOnProperty.class);
+        assertThat(condition).as("必须保留条件装配注解").isNotNull();
+        assertThat(condition.prefix()).isEqualTo("nexusai.factory.preset");
+        assertThat(condition.name()).containsExactly("enabled");
+        assertThat(condition.havingValue()).isEqualTo("true");
+        assertThat(condition.matchIfMissing())
+            .as("⛔ 缺省必须关闭：空库启动不得自动种入可用 provider")
+            .isFalse();
+    }
+
+    @Test
+    @DisplayName("全新库（providers 空）→ minimax + deepseek、4 models、9 档位；provider 全部无 key")
     void freshDb_seedsProviderModelsAndSettings() throws Exception {
         when(providerMapper.selectAll()).thenReturn(List.of());
         when(settingsMapper.update(any())).thenReturn(1);
@@ -79,7 +98,7 @@ class FactoryPresetSeederTest {
 
         assertThat(seeded).as("providers 空库应执行预设写入").isTrue();
 
-        // —— providers：minimax + deepseek；无本地叠加 ⇒ 两者都无 key（GitHub 版本语义）——
+        // —— providers：minimax + deepseek；无叠加 ⇒ 两者都无 key ——
         ArgumentCaptor<ProviderRecord> providerCaptor = ArgumentCaptor.forClass(ProviderRecord.class);
         verify(providerMapper, times(2)).insertSelective(providerCaptor.capture());
         List<ProviderRecord> providers = providerCaptor.getAllValues();
@@ -94,9 +113,9 @@ class FactoryPresetSeederTest {
         assertThat(deepseek.getBaseUrl()).isEqualTo("https://api.deepseek.com");
         assertThat(deepseek.getEnabled()).isTrue();
         for (ProviderRecord p : providers) {
-            assertThat(p.getApiKeyHash()).as("%s 无叠加时 hash 空串占位", p.getName()).isEmpty();
-            assertThat(p.getApiKeyMasked()).as("%s 无叠加时 masked 空串 → hasKey=false", p.getName()).isEmpty();
-            assertThat(p.getApiKeyEncrypted()).as("%s 无叠加时绝不写密钥密文", p.getName()).isNull();
+            assertThat(p.getApiKeyHash()).as("%s hash 空串占位", p.getName()).isEmpty();
+            assertThat(p.getApiKeyMasked()).as("%s masked 空串 → hasKey=false", p.getName()).isEmpty();
+            assertThat(p.getApiKeyEncrypted()).as("%s 绝不写密钥密文", p.getName()).isNull();
         }
 
         // —— models：minimax 1 条 + deepseek 3 条 ——
@@ -113,7 +132,6 @@ class FactoryPresetSeederTest {
         assertThat(minimaxModel.getProviderId()).isEqualTo(minimax.getId());
         assertThat(minimaxModel.getType()).isEqualTo("multimodal");
         assertThat(minimaxModel.getTag()).isEqualTo("MM");
-        // 1M 窗口必须随出厂预设落库，否则上下文解析会按 200k 兜底
         assertThat(minimaxModel.getMaxTokens()).isEqualTo(262144);
         assertThat(minimaxModel.getMaxContextTokens()).isEqualTo(1048576);
         assertThat(models).allMatch(m -> Boolean.TRUE.equals(m.getEnabled()));
@@ -122,9 +140,8 @@ class FactoryPresetSeederTest {
         ArgumentCaptor<SettingsRecord> settingsCaptor = ArgumentCaptor.forClass(SettingsRecord.class);
         verify(settingsMapper).update(settingsCaptor.capture());
         SettingsRecord s = settingsCaptor.getValue();
-        assertThat(s.getPermissionMode()).as("permission_mode 强制 default（不照搬用户的 bypassPermissions）").isEqualTo("default");
+        assertThat(s.getPermissionMode()).isEqualTo("default");
         assertThat(s.getAutoCompactWindow()).isEqualTo(1000000);
-        // 2026-11-12：max_output_tokens 已废弃（V285 DROP 列），不再从预设导入
         assertThat(s.getWebsearchUseSmallModel()).isTrue();
         assertThat(s.getAgentSwarmsEnabled()).isTrue();
         assertThat(s.getAutoCompactEnabled()).isTrue();
@@ -150,46 +167,76 @@ class FactoryPresetSeederTest {
     }
 
     @Test
-    @DisplayName("本地叠加（内网版本）：只给 minimax 注入秘钥并加密落库，可解密；deepseek 仍无 key")
-    void localOverlay_injectsKeyOnlyIntoExistingProvider() throws Exception {
+    @DisplayName("configHome 叠加写了 apiKey：baseUrl 生效但 apiKey 必须被忽略（种入仍无 key）")
+    void configHomeOverlay_keyIgnoredBaseUrlApplied() throws Exception {
+        Path overlay = tempDir.resolve(FactoryPresetSeeder.CONFIG_HOME_OVERLAY_RELATIVE);
+        Files.createDirectories(overlay.getParent());
+        Files.writeString(overlay,
+            "{\"providers\":[{\"name\":\"minimax\",\"apiKey\":\"" + TEST_OVERLAY_KEY
+                + "\",\"baseUrl\":\"https://overlay.example/v1\"}]}",
+            StandardCharsets.UTF_8);
         when(providerMapper.selectAll()).thenReturn(List.of());
         when(settingsMapper.update(any())).thenReturn(1);
 
-        boolean seeded = newSeeder("factory/factory-preset.local-test.json").seedIfFresh();
-        assertThat(seeded).isTrue();
+        assertThat(newSeeder(tempDir, null).seedIfFresh()).isTrue();
 
         ArgumentCaptor<ProviderRecord> captor = ArgumentCaptor.forClass(ProviderRecord.class);
         verify(providerMapper, times(2)).insertSelective(captor.capture());
-        List<ProviderRecord> providers = captor.getAllValues();
-        ProviderRecord minimax = providers.stream()
+        ProviderRecord minimax = captor.getAllValues().stream()
             .filter(p -> "minimax".equals(p.getName())).findFirst().orElseThrow();
-        ProviderRecord deepseek = providers.stream()
-            .filter(p -> "deepseek".equals(p.getName())).findFirst().orElseThrow();
-
-        assertThat(minimax.getApiKeyHash()).isNotEmpty();
-        assertThat(minimax.getApiKeyMasked()).endsWith(TEST_OVERLAY_KEY.substring(TEST_OVERLAY_KEY.length() - 4));
-        assertThat(minimax.getApiKeyEncrypted()).isNotNull();
-        assertThat(cryptoUtil.decrypt(minimax.getApiKeyEncrypted()))
-            .as("叠加进来的秘钥必须能被同一 CryptoUtil 解密（否则内网安装后不可用）")
-            .isEqualTo(TEST_OVERLAY_KEY);
-        assertThat(deepseek.getApiKeyEncrypted()).as("未叠加的 provider 仍无 key").isNull();
+        assertThat(minimax.getBaseUrl()).as("非秘钥字段允许叠加").isEqualTo("https://overlay.example/v1");
+        assertThat(minimax.getApiKeyHash()).as("⛔ apiKey 绝不注入").isEmpty();
+        assertThat(minimax.getApiKeyMasked()).as("⛔ apiKey 绝不注入").isEmpty();
+        assertThat(minimax.getApiKeyEncrypted()).as("⛔ apiKey 绝不落库").isNull();
     }
 
     @Test
-    @DisplayName("本地叠加只按 name 补 apiKey：未知 provider 不新增、空 key 跳过、不改入参")
+    @DisplayName("环境变量 NEXUSAI_PROVIDER_PRESET 的 JSON：非秘钥字段生效，apiKey 忽略")
+    void envPresetJson_keyIgnored() {
+        when(providerMapper.selectAll()).thenReturn(List.of());
+        when(settingsMapper.update(any())).thenReturn(1);
+        String env = "{\"providers\":[{\"name\":\"deepseek\",\"apiKey\":\"" + TEST_OVERLAY_KEY
+            + "\",\"baseUrl\":\"https://env.example\"}]}";
+
+        assertThat(newSeeder(tempDir, env).seedIfFresh()).isTrue();
+
+        ArgumentCaptor<ProviderRecord> captor = ArgumentCaptor.forClass(ProviderRecord.class);
+        verify(providerMapper, times(2)).insertSelective(captor.capture());
+        ProviderRecord deepseek = captor.getAllValues().stream()
+            .filter(p -> "deepseek".equals(p.getName())).findFirst().orElseThrow();
+        assertThat(deepseek.getBaseUrl()).isEqualTo("https://env.example");
+        assertThat(deepseek.getApiKeyMasked()).isEmpty();
+        assertThat(deepseek.getApiKeyEncrypted()).isNull();
+    }
+
+    @Test
+    @DisplayName("本地叠加只按 name 覆盖非秘钥字段：未知 provider 不新增、apiKey 丢弃、不改入参")
     void localOverlay_onlyPatchesExistingProvider() throws Exception {
         JsonNode base = objectMapper.readTree(
             "[{\"name\":\"minimax\"},{\"name\":\"deepseek\"}]");
         JsonNode overlay = objectMapper.readTree(
-            "{\"providers\":[{\"name\":\"minimax\",\"apiKey\":\"k1\"},"
+            "{\"providers\":[{\"name\":\"minimax\",\"apiKey\":\"k1\",\"baseUrl\":\"https://x\"},"
                 + "{\"name\":\"unknown\",\"apiKey\":\"k2\"},{\"name\":\"deepseek\"}]}");
 
         JsonNode merged = FactoryPresetSeeder.applyLocalOverlay(base, overlay);
 
         assertThat(merged.size()).as("不允许本地新增 provider").isEqualTo(2);
-        assertThat(merged.get(0).path("apiKey").asText()).isEqualTo("k1");
+        assertThat(merged.get(0).path("baseUrl").asText()).isEqualTo("https://x");
+        assertThat(merged.get(0).has("apiKey")).as("⛔ apiKey 绝不被合并").isFalse();
         assertThat(merged.get(1).has("apiKey")).as("缺少 apiKey 的条目跳过").isFalse();
-        assertThat(base.get(0).has("apiKey")).as("不得修改入参（避免叠加污染基础预设）").isFalse();
+        assertThat(base.get(0).has("apiKey")).as("不得修改入参").isFalse();
+    }
+
+    @Test
+    @DisplayName("预设文件缺失（configHome 与 env 都没有）→ 正常工作、不抛异常")
+    void missingOverlay_doesNotThrow() {
+        when(providerMapper.selectAll()).thenReturn(List.of());
+        when(settingsMapper.update(any())).thenReturn(1);
+
+        assertThatCode(() -> {
+            boolean seeded = newSeeder(tempDir.resolve("no-such-home"), null).seedIfFresh();
+            assertThat(seeded).isTrue();
+        }).doesNotThrowAnyException();
     }
 
     @Test
@@ -256,7 +303,7 @@ class FactoryPresetSeederTest {
         List<String> providerNames = new ArrayList<>();
         providers.forEach(p -> {
             providerNames.add(p.path("name").asText());
-            // ⛔ 基础资源绝不包含秘钥（秘钥只能在 gitignored 的 local 叠加里）
+            // ⛔ 基础资源绝不包含秘钥
             assertThat(p.has("apiKey")).as("factory-preset.json 禁止包含 apiKey").isFalse();
             assertThat(p.path("type").asText()).isEqualTo("openai_compatible");
             assertThat(p.path("enabled").asBoolean()).isTrue();
@@ -293,21 +340,20 @@ class FactoryPresetSeederTest {
         }
         assertThat(minimaxModel).as("资源必须含 minimax 模型").isNotNull();
         assertThat(minimaxModel.path("provider").asText()).isEqualTo("minimax");
-        assertThat(minimaxModel.path("type").asText()).as("MiniMax 模型 type 照用户库实际（multimodal）").isEqualTo("multimodal");
+        assertThat(minimaxModel.path("type").asText()).isEqualTo("multimodal");
         assertThat(minimaxModel.path("maxContextTokens").asInt())
-            .as("1M 窗口必须随出厂预设下发（否则上下文解析按 200k 兜底）").isEqualTo(1048576);
+            .as("1M 窗口必须随出厂预设下发").isEqualTo(1048576);
         assertThat(vision).as("资源必须含 deepseek-v4-flash-vision-exp").isNotNull();
-        assertThat(vision.path("type").asText()).as("vision 模型 type 照用户库实际（multimodal）").isEqualTo("multimodal");
+        assertThat(vision.path("type").asText()).isEqualTo("multimodal");
 
         JsonNode settings = root.path("settings");
         assertThat(settings.isObject()).isTrue();
         List<String> keys = new ArrayList<>();
         settings.fieldNames().forEachRemaining(keys::add);
         assertThat(keys).as("不预设含 api_key 的密钥列").noneMatch(k -> k.contains("api_key"));
-        assertThat(keys).as("出厂资源 settings 键必须 ⊆ 白名单（防漂移被静默跳过）")
+        assertThat(keys).as("出厂资源 settings 键必须 ⊆ 白名单")
             .allMatch(FactoryPresetSeeder.supportedSettingsKeys()::contains);
         assertThat(settings.path("permission_mode").asText()).isEqualTo("default");
-        // 9 个模型档位全部指向 minimax（2026-10-26 用户裁定）
         for (String tier : List.of("main_model_name", "fast_model_name", "weak_model_name",
             "medium_model_name", "strong_model_name", "subagent_model_name",
             "fallback_model_name", "multimodal_model_name", "classifier_model")) {

@@ -1,5 +1,6 @@
 import { useEffect, useLayoutEffect, useRef, useState } from 'react'
 import type { PivotCandidateDto } from '@/api/types'
+import { PeerInboxPanel, type PeerInboxPanelState } from './PeerInboxPanel'
 
 /** 历史提问面板的数据与动作（App 持有候选与压缩/裁剪流程）。 */
 export interface WorkspaceHistoryPanelState {
@@ -29,6 +30,17 @@ interface WorkspaceHeaderProps {
   traceCount?: number | null
   onHistory: () => void
   history: WorkspaceHistoryPanelState
+  /**
+   * 跨会话收件箱（可选：不传 = 不渲染，旧测试/其它宿主零改动）。
+   *
+   * <p>2026-11-23 用户裁定：右上角收件箱入口恢复；点它 / 左栏「待处理」/ 输入框
+   * 「去处理」都打开同一个收件箱。头部只负责渲染入口与面板本体。
+   */
+  peerInbox?: PeerInboxPanelState
+  /** 收件箱待处理总数（>0 显示角标）。 */
+  inboxCount?: number
+  /** 点击右上角收件箱入口 → 打开收件箱。 */
+  onOpenInbox?: () => void
   /** 是否渲染右侧抽屉开合按钮（合同全屏表面等右栏不挂载的形态为 false）。 */
   showPanelToggle: boolean
   rightCollapsed: boolean
@@ -65,6 +77,9 @@ export function WorkspaceHeader({
   traceCount,
   onHistory,
   history,
+  peerInbox,
+  inboxCount,
+  onOpenInbox,
   showPanelToggle,
   rightCollapsed,
   onTogglePanel,
@@ -77,6 +92,7 @@ export function WorkspaceHeader({
   const cancelRef = useRef(false)
   const historyBtnRef = useRef<HTMLButtonElement>(null)
   const historyPanelRef = useRef<HTMLDivElement>(null)
+  const peerPanelRef = useRef<HTMLDivElement>(null)
 
   // 会话切换 / 外部重命名 → 非编辑态同步草稿
   useEffect(() => {
@@ -136,6 +152,22 @@ export function WorkspaceHeader({
     document.addEventListener('mousedown', onDown)
     return () => document.removeEventListener('mousedown', onDown)
   }, [history.open, history.onClose])
+
+  // 待收件面板：点面板外部关闭（与历史提问同一套交互）。
+  //   头部已无入口按钮（入口 = 输入框常驻条 / 系统通知）⇒ 只认面板本体。
+  useEffect(() => {
+    if (!peerInbox?.open) return
+    const onDown = (e: MouseEvent) => {
+      const target = e.target as Node | null
+      if (!target) return
+      if (peerPanelRef.current?.contains(target)) return
+      // 右上角入口自己负责 toggle：mousedown 先关会让「再点一次收起」变成「关了又开」。
+      if ((target as Element).closest?.('.inbox-entry')) return
+      peerInbox.onClose()
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [peerInbox?.open, peerInbox?.onClose])
 
   const displayTitle = title ? title : isWork ? '新任务' : '新会话'
   // 轨迹 = 全部消息流 ⇒ 角标显示条数（用户 2026-10-29 裁定：千级 k / 万级 w 缩写，具体值放 tooltip）
@@ -214,6 +246,22 @@ export function WorkspaceHeader({
           </svg>
           {traceBadge != null && <span className="ws-trace-badge">{traceBadge}</span>}
         </button>
+        {onOpenInbox && (
+          <button
+            className={`ws-icon-btn inbox-entry${peerInbox?.open ? ' on' : ''}`}
+            type="button"
+            title={inboxCount && inboxCount > 0 ? `收件箱 · ${inboxCount} 条待处理` : '收件箱'}
+            aria-label="收件箱"
+            onClick={onOpenInbox}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.6" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M4 13l2.2-6.2A2 2 0 0 1 8.1 5.5h7.8a2 2 0 0 1 1.9 1.3L20 13" />
+              <path d="M4 13v4.5A1.5 1.5 0 0 0 5.5 19h13a1.5 1.5 0 0 0 1.5-1.5V13" />
+              <path d="M9 13h6" />
+            </svg>
+            {inboxCount != null && inboxCount > 0 && <span className="inbox-badge">{inboxCount}</span>}
+          </button>
+        )}
         <button
           ref={historyBtnRef}
           className={`ws-icon-btn${history.open ? ' on' : ''}`}
@@ -227,6 +275,9 @@ export function WorkspaceHeader({
             <path d="M12 7v5l3 2" />
           </svg>
         </button>
+        {/* [2026-11-20 用户裁定] 右上角收件入口（按钮 + 角标）已移除：
+            可见入口 = 输入框上方常驻条（去处理 / 全部拒绝）+ 系统通知点击。
+            ⛔ 不要在此处恢复入口（「隐藏入口 = 死锁」的结论已被常驻条取代）。 */}
         {showPanelToggle && (
           <button
             className={`ws-icon-btn${rightCollapsed ? '' : ' on'}`}
@@ -277,6 +328,8 @@ export function WorkspaceHeader({
           )}
         </div>
       )}
+
+      {peerInbox?.open && <PeerInboxPanel {...peerInbox} panelRef={peerPanelRef} />}
     </div>
   )
 }

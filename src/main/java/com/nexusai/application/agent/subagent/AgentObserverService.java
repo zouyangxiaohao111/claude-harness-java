@@ -57,7 +57,30 @@ public class AgentObserverService {
         return agentType == null ? null : observedDefinitions.get(agentType);
     }
 
-    private record Pairing(String type, UUID agentId, AgentDefinition definition) {}
+    /**
+     * 该 agentId 是否是本服务拉起的 observer · 对齐 CC SendMessage 第 3 步
+     * {@code isObserver(agentId) → not_reachable}（findings 八步判定顺序 3）。
+     *
+     * @param agentId a+16hex 或 UUID 字符串（两种形态都比对）
+     */
+    public boolean isObserverAgentId(String agentId) {
+        if (agentId == null || agentId.isBlank()) {
+            return false;
+        }
+        for (List<Pairing> list : pairings.values()) {
+            for (Pairing p : list) {
+                if (p.agentId() == null) {
+                    continue;
+                }
+                if (agentId.equals(p.agentId())) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    private record Pairing(String type, String agentId, AgentDefinition definition) {}
 
     @Autowired(required = false)
     public AgentObserverService(ObjectProvider<SubagentTool> subagentToolProvider) {
@@ -163,7 +186,7 @@ public class AgentObserverService {
                 input.put("run_in_background", true);
                 ToolUseBlock call = new ToolUseBlock("observer-" + UUID.randomUUID(), "Agent", input);
                 AgentToolResult<?> result = tool.execute(call, parentTuc);
-                UUID agentId = parseAgentId(result);
+                String agentId = parseAgentId(result);
                 AgentDefinition def = definitionResolver != null ? definitionResolver.apply(type) : null;
                 if (def == null) {
                     def = observed;
@@ -185,7 +208,7 @@ public class AgentObserverService {
     }
 
     /** 从 spawn 结果解析 agentId（payload.agentId 为 a<hex> 形式）。 */
-    private static UUID parseAgentId(AgentToolResult<?> result) {
+    private static String parseAgentId(AgentToolResult<?> result) {
         if (result == null) {
             return null;
         }
@@ -196,7 +219,7 @@ public class AgentObserverService {
             if (hex.isBlank()) {
                 return null;
             }
-            return AgentContext.packAgentId(hex);
+            return hex;
         } catch (Exception e) {
             return null;
         }

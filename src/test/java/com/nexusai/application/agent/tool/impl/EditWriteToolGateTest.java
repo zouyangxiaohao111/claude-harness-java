@@ -98,7 +98,7 @@ class EditWriteToolGateTest {
     }
 
     private static ToolUseContext ctxFor(Path workspace) {
-        UUID agentId = UUID.nameUUIDFromBytes(("ewt-agent-" + workspace).getBytes());
+        String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         String sessionId = UUID.nameUUIDFromBytes(("ewt-sess-" + workspace).getBytes()).toString().toString();
         return ToolUseContext.of(agentId, sessionId, PermissionMode.DEFAULT);
     }
@@ -590,11 +590,11 @@ class EditWriteToolGateTest {
             EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
             ToolUseContext ctx = ctxFor(workspace);
 
-            ToolResult<String> result = (ToolResult<String>) editTool.execute(
+            ToolResult<?> result = (ToolResult<?>) editTool.execute(
                 editCallWith("a.txt", "hello", "CHANGED"), ctx);
 
             assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-            assertThat(result.data())
+            assertThat(ToolResult.renderToolResultPayloadText(result))
                 .as("兜底门禁: 绕过 validator 直接 execute 也必须拒")
                 .contains("File has not been read yet");
         }
@@ -622,13 +622,13 @@ class EditWriteToolGateTest {
             Files.writeString(workspace.resolve("a.txt"), "hello\n");
             EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
 
-            ToolResult<String> result = (ToolResult<String>) editTool.execute(
+            ToolResult<?> result = (ToolResult<?>) editTool.execute(
                 editCallWith("a.txt", "hello", "CHANGED"));
 
             assertThat(LlmAgentLoop.isToolErrorData(result.data()))
                 .as("execute(call) 无 ctx 必须被显式拒绝, 不再静默放行")
                 .isTrue();
-            assertThat(result.data())
+            assertThat(ToolResult.renderToolResultPayloadText(result))
                 .as("错误消息必须明确指向 ctx 必传 + 拒绝绕过的门禁")
                 .contains("requires ToolUseContext")
                 .contains("silently bypasses");
@@ -643,13 +643,13 @@ class EditWriteToolGateTest {
             // 对齐 CC FileWriteTool.ts:153 validateInput 签名必传 toolUseContext.
             WriteFileTool writeTool = new WriteFileTool(new PathGuard(workspace));
 
-            ToolResult<String> result = (ToolResult<String>) writeTool.execute(
+            ToolResult<?> result = (ToolResult<?>) writeTool.execute(
                 writeCallWith("new.txt", "CONTENT"));
 
             assertThat(LlmAgentLoop.isToolErrorData(result.data()))
                 .as("execute(call) 无 ctx 必须被显式拒绝, 不再静默放行")
                 .isTrue();
-            assertThat(result.data())
+            assertThat(ToolResult.renderToolResultPayloadText(result))
                 .contains("requires ToolUseContext")
                 .contains("silently bypasses");
             // 文件不能被误创建
@@ -729,12 +729,14 @@ class EditWriteToolGateTest {
             Files.writeString(workspace.resolve("a.txt"), "hello\n");
             EditFileTool editTool = new EditFileTool(new PathGuard(workspace));
 
-            ToolResult<String> result = (ToolResult<String>) editTool.execute(
+            ToolResult<?> result = (ToolResult<?>) editTool.execute(
                 editCallWith("a.txt", "hello", "CHANGED"), null);
 
             assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-            assertThat(result.data())
-                .contains("validateInput failed")
+            // [错误通道 · C2] 语义校验失败不再包 "validateInput failed: " 前缀（CC
+            //   toolExecution.ts:723 的 content 就是 message 原文外套 <tool_use_error>）。
+            assertThat(ToolResult.renderToolResultPayloadText(result))
+                .doesNotContain("validateInput failed")
                 .contains("requires ToolUseContext");
         }
 
@@ -743,12 +745,14 @@ class EditWriteToolGateTest {
         void writeExecuteNullCtxReturnsGateBypassError(@TempDir Path workspace) throws Exception {
             WriteFileTool writeTool = new WriteFileTool(new PathGuard(workspace));
 
-            ToolResult<String> result = (ToolResult<String>) writeTool.execute(
+            ToolResult<?> result = (ToolResult<?>) writeTool.execute(
                 writeCallWith("new.txt", "CONTENT"), null);
 
             assertThat(LlmAgentLoop.isToolErrorData(result.data())).isTrue();
-            assertThat(result.data())
-                .contains("validateInput failed")
+            // [错误通道 · C2] 语义校验失败不再包 "validateInput failed: " 前缀（CC
+            //   toolExecution.ts:723 的 content 就是 message 原文外套 <tool_use_error>）。
+            assertThat(ToolResult.renderToolResultPayloadText(result))
+                .doesNotContain("validateInput failed")
                 .contains("requires ToolUseContext");
         }
     }
@@ -999,7 +1003,7 @@ class EditWriteToolGateTest {
 
         /** 构造含 Edit deny 规则的 ctx（relative glob 命中工具层相对 path 展开结果）。 */
         private ToolUseContext denyCtxFor(Path workspace) {
-            UUID agentId = UUID.nameUUIDFromBytes(("rv04-agent-" + workspace).getBytes());
+            String agentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
             String sessionId = UUID.nameUUIDFromBytes(("rv04-sess-" + workspace).getBytes()).toString().toString();
             PermissionRule denyRule = new PermissionRule(
                 PermissionRuleSource.SESSION,

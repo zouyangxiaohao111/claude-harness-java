@@ -35,6 +35,8 @@ export interface ArtifactDockProps {
   items: SessionArtifactDto[]
   /** 切换查看的产物 */
   onSelect: (a: SessionArtifactDto) => void
+  /** 进来直接进编辑态（产物卡「编辑」按钮 · 仅文本类有意义） */
+  initialEdit?: boolean
   /** 收起面板（回到完全隐藏态） */
   onClose: () => void
   /** 打开原来的居中模态框（「全屏」） */
@@ -44,12 +46,18 @@ export interface ArtifactDockProps {
   onWidthChange: (w: number) => void
 }
 
-/** 面板宽度上下限（与抽屉同量级；下限保证 html 预览还有可用宽度）。 */
+/**
+ * 面板宽度上下限（下限保证 html 预览还有可用宽度）。
+ *
+ * <p>[2026-11-19 用户裁定] 原上限 860px 太窄：html 产物（仪表盘/长表格）在 860 下渲染不全，
+ * 用户「只能扩大右边侧栏」却发现拖不动 ⇒ 上限放开到 1600px。面板是 grid 列（压缩中栏、
+ * 不遮挡中栏），所以放宽只是让中栏更窄，不会盖住它。
+ */
 const MIN_W = 320
-const MAX_W = 860
+const MAX_W = 1600
 
 export function ArtifactDock({
-  sessionId, artifact, items, onSelect, onClose, onExpand, width, onWidthChange,
+  sessionId, artifact, items, initialEdit = false, onSelect, onClose, onExpand, width, onWidthChange,
 }: ArtifactDockProps) {
   const [data, setData] = useState<ArtifactContent | null>(null)
   const [error, setError] = useState<string | null>(null)
@@ -71,7 +79,8 @@ export function ArtifactDock({
     setLoading(true)
     setError(null)
     setData(null)
-    setMode('preview')
+    // 卡片「编辑」进入 → 直接编辑态；普通点开 → 预览
+    setMode(initialEdit ? 'edit' : 'preview')
     artifactsApi.content(sessionId, artifact.id)
       .then((d) => {
         if (!alive) return
@@ -85,7 +94,8 @@ export function ArtifactDock({
         setLoading(false)
       })
     return () => { alive = false }
-  }, [sessionId, artifact?.id])
+    // initialEdit 也在依赖里：右栏已开着同一产物时点「编辑」，也要切进编辑态
+  }, [sessionId, artifact?.id, initialEdit])
 
   // Monaco 只在源码/编辑态挂载（预览态用 iframe / Markdown，不需要编辑器实例）
   useEffect(() => {
@@ -183,7 +193,7 @@ export function ArtifactDock({
     <div className="artifact-dock" style={{ width }}>
       <div className="ad-resizer" onMouseDown={startResize} title="拖拽调整宽度" />
 
-      {/* 顶部：类型图标 + 文件名 + 全屏 / 浏览器 / 收起 */}
+      {/* 顶部：类型图标 + 文件名 + 全屏 / 浏览器 / 关闭(×) */}
       <div className="ad-head">
         <span className={`ad-ico k-${kind}`}><ArtifactKindIcon kind={kind} size={13} /></span>
         <span className="ad-name" title={artifact.localPath ?? artifact.title}>{artifact.title}</span>
@@ -203,9 +213,10 @@ export function ArtifactDock({
               </svg>
             </button>
           )}
-          <button type="button" className="ad-btn" onClick={onClose} title="收起侧栏" aria-label="收起侧栏">
+          <button type="button" className="ad-btn" onClick={onClose} title="关闭产物面板" aria-label="关闭产物面板">
+            {/* × 而不是 ‹：用户 2026-11-19「产物打开还得有个 x」—— 收起箭头不像关闭 */}
             <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth={1.6} strokeLinecap="round" strokeLinejoin="round">
-              <path d="M9.5 4.5L6 8l3.5 3.5" />
+              <path d="M4 4l8 8M12 4l-8 8" />
             </svg>
           </button>
         </div>

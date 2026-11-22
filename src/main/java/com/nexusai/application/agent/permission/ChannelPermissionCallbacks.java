@@ -33,6 +33,19 @@ public interface ChannelPermissionCallbacks {
     String shortRequestId(String toolUseId);
 
     /**
+     * [P2] 会话内唯一的短请求 ID。
+     *
+     * <p>默认委托 {@link #shortRequestId(String)}（旧实现/测试零改动）；生产实现
+     * {@link StompChannelPermissionCallbacks} 覆盖：随机 5 位 + 会话内撞号重试 + 哈希回退。
+     *
+     * @param sessionId 会话 id（唯一性作用域）
+     * @param toolUseId 工具调用 id（哈希回退种子）
+     */
+    default String shortRequestId(String sessionId, String toolUseId) {
+        return shortRequestId(toolUseId);
+    }
+
+    /**
      * 注册通道响应回调 · 返回退订 Runnable（对齐 CC channelCallbacks.onResponse）。
      *
      * @param requestId 短请求 ID
@@ -58,6 +71,21 @@ public interface ChannelPermissionCallbacks {
                      String description, JsonNode displayInput);
 
     /**
+     * [P0] 带 {@code toolUseId} 的出站请求 · 与同一次请求的 message / bridge 事件同值。
+     *
+     * <p><b>WHY 用 default 而不是改既有抽象方法</b>：旧实现（测试 stub / 其它回调）只实现
+     * 5 参签名；新增抽象方法会让它们全部编译失败。这里默认退化为 5 参调用
+     * （{@code toolUseId} 丢失 ⇒ 前端退回按 {@code requestId} 处理），生产实现
+     * {@link StompChannelPermissionCallbacks} 覆盖本方法来真正携带该值。
+     *
+     * @param toolUseId 工具调用 ID（与 message / bridge 事件同值；可 null）
+     */
+    default void sendRequest(String sessionId, String requestId, String toolName,
+                             String description, JsonNode displayInput, String toolUseId) {
+        sendRequest(sessionId, requestId, toolName, description, displayInput);
+    }
+
+    /**
      * [canUseTool v4] STOMP inbound 响应解析 · 对齐 CC channelPermissions.ts {@code resolve}
      * （structured event notifications/claude/channel/permission 的匹配通道）。
      *
@@ -72,6 +100,23 @@ public interface ChannelPermissionCallbacks {
      * @return true = 命中 pending resolver 并已调用；false = 未知/已 resolve
      */
     boolean resolve(String requestId, String behavior, String fromServer);
+
+    /**
+     * [P0.1] 登记本次请求「允许从哪些连接回执」· key = {@code instanceId|peerId}。
+     *
+     * <p>默认空实现（旧实现/测试无需关心）；生产实现据此拒绝「知道编号但不是该会话渠道」的回执。
+     */
+    default void registerOrigin(String requestId, java.util.Set<String> originKeys) { }
+
+    /**
+     * [P0.1] 带来源连接的回执解析（IM 入站走这条）。
+     *
+     * <p>默认委托 {#resolve}（旧实现兼容）；生产实现会先校验来源连接是否属于本请求登记的集合。
+     */
+    default boolean resolveFrom(String requestId, String behavior, String fromServer,
+                                String instanceId, String peerId) {
+        return resolve(requestId, behavior, fromServer);
+    }
 
     /**
      * 通道响应载荷 · 对齐 CC interactiveHandler.ts:363-397 response
@@ -92,8 +137,13 @@ public interface ChannelPermissionCallbacks {
      */
     static String truncateForPreview(JsonNode input) {
         try {
-            String s = input == null ? "" : input.toString();
-            return s.length() > 200 ? s.substring(0, 200) + "…" : s;
+            if (input == null) {
+                return "";
+            }
+            // [P0] 与 IM 文本共用同一个脱敏函数：STOMP 出站同样会落到外部渠道订阅者手里，
+            //   不能只脱 IM 那条路。先脱敏再截断（截断不能把密钥截成安全样、再露出后半段）。
+            String masked = ChannelPermissionPayload.maskSecrets(input.toString());
+            return masked.length() > 200 ? masked.substring(0, 200) + "…" : masked;
         } catch (Exception e) {
             return "(unserializable)";
         }

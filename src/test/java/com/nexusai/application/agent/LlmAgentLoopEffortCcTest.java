@@ -87,7 +87,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         QueryParams callerParams0 = QueryParams.forLoop(state.rawMessages(), null,
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams0.deps().context(), callerParams0, state),
@@ -124,7 +124,7 @@ class LlmAgentLoopEffortCcTest {
         // ── 镜像 SubagentExecutor.runSubagentQueryLoop :2104-2112（fork 隔离子 AgentState 注入）──
         //   agentDefinition.effort = skill frontmatter effort 合并（SkillTool.ts:208-212 withEffort）
         String forkSessionId = "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8);
-        UUID forkAgentId = UUID.randomUUID();
+        String forkAgentId = com.nexusai.application.agent.subagent.AgentContext.createAgentId();
         AgentState state = new AgentState("fork-agent-system", forkSessionId, forkAgentId);
         // [C-31] 注入：agentDefinition.effort().isPresent() → state.setEffortValue(effort)
         state.setEffortValue("max");
@@ -136,7 +136,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         QueryParams callerParams1 = QueryParams.forLoop(state.rawMessages(), null,
-                // [session-id-short] of(agentId, sessionId)：forkSessionId 是 short sessionId，forkAgentId 是 UUID agentId
+                // [session-id-short] of(agentId, sessionId)：forkSessionId 是 short sessionId，forkAgentId 是 String agentId
                 ToolUseContext.of(forkAgentId, forkSessionId),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
                 deps, ProviderConfig.empty());
@@ -181,7 +181,7 @@ class LlmAgentLoopEffortCcTest {
         };
 
         QueryParams callerParams2 = QueryParams.forLoop(state.rawMessages(), null,
-                ToolUseContext.of(UUID.randomUUID(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
+                ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + java.util.UUID.randomUUID().toString().substring(0, 8)),
                 QuerySource.USER, "claude-sonnet-4-6", null, null, null, null, null,
                 deps, ProviderConfig.empty());
         LoopResult result = LlmAgentLoop.queryLoop(LlmAgentLoop.collectRunMaterial(callerParams2.deps().context(), callerParams2, state),

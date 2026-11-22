@@ -60,7 +60,7 @@ class RenameColorTeammateGuardCrossSessionTest {
 
     private static AgentState stateFor(String sessionId, boolean teammate) {
         AgentState state = new AgentState("sys", sessionId, null);
-        ToolUseContext tuc = ToolUseContext.of(UUID.randomUUID(), sessionId);
+        ToolUseContext tuc = ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), sessionId);
         if (teammate) {
             tuc = tuc.withTeammateIdentity(new TeammateIdentity(
                 TEAMMATE_AGENT_ID_A, "researcher", "team-a", "#ff0000", false, "leader-sess"));

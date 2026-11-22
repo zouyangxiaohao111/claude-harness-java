@@ -41,7 +41,8 @@ class SendMessageToolResumeTest {
     @DisplayName("agent 已停止 ⇒ resume 同一 agent，不再只入队")
     void stoppedAgent_resumes() throws Exception {
         AgentNameRegistry registry = mock(AgentNameRegistry.class);
-        when(registry.resolve("researcher")).thenReturn("a1234567890abcdef");
+        when(registry.resolveEntry("sess-1", "researcher"))
+            .thenReturn(new AgentNameRegistry.AgentNameEntry("sess-1", "researcher", "a1234567890abcdef"));
         ResumeService resume = mock(ResumeService.class);
         BackgroundTaskRunner runner = mock(BackgroundTaskRunner.class);
         BackgroundTask completed = new BackgroundTask(
@@ -54,24 +55,28 @@ class SendMessageToolResumeTest {
         tool.setAgentNameRegistry(registry);
         tool.setResumeServiceProvider(provider(resume));
         tool.setBackgroundTaskRunner(runner);
+        tool.setSessionDirResolver(s -> java.nio.file.Paths.get("."));
         ToolUseContext ctx = mock(ToolUseContext.class);
         when(ctx.sessionId()).thenReturn("sess-1");
 
         ToolResult<?> r = (ToolResult<?>) tool.execute(new ToolUseBlock("c1", "SendMessage",
             JSON.readTree("{\"to\":\"researcher\",\"message\":\"keep going\"}")), ctx);
 
-        // 模型发起的自动 resume → userInitiated=false（stoppedByUser 门据此拦截用户停止过的 agent）
-        verify(resume).resumeAgentBackground(any(), eq("keep going"), any(), eq("sess-1"), any(),
-            eq(false));
+        // 模型发起的自动 resume → userInitiated=false（stoppedByUser 门据此拦截用户停止过的 agent）；
+        // [lineage] 发起方身份取 ToolUseContext（此处 mock 无 agentId → null，lineage 由 ResumeService 现算）
+        verify(resume).resumeAgentBackgroundForLineage(any(), eq("keep going"), any(), eq("sess-1"),
+            any(), eq(false), org.mockito.ArgumentMatchers.nullable(String.class));
         verify(registry, never()).queue(anyString(), anyString());
-        assertThat(String.valueOf(r.data())).contains("Resumed");
+        // CC 成功文案逐字：`Resuming agent <name>`（偏移 356128040 ws()）
+        assertThat(String.valueOf(r.data())).contains("Resuming agent researcher");
     }
 
     @Test
     @DisplayName("agent 仍在运行 ⇒ 只入队（不触发 resume）")
     void runningAgent_queues() throws Exception {
         AgentNameRegistry registry = mock(AgentNameRegistry.class);
-        when(registry.resolve("researcher")).thenReturn("a1234567890abcdef");
+        when(registry.resolveEntry("sess-1", "researcher"))
+            .thenReturn(new AgentNameRegistry.AgentNameEntry("sess-1", "researcher", "a1234567890abcdef"));
         ResumeService resume = mock(ResumeService.class);
         BackgroundTaskRunner runner = mock(BackgroundTaskRunner.class);
         BackgroundTask running = new BackgroundTask(
@@ -84,6 +89,7 @@ class SendMessageToolResumeTest {
         tool.setAgentNameRegistry(registry);
         tool.setResumeServiceProvider(provider(resume));
         tool.setBackgroundTaskRunner(runner);
+        tool.setSessionDirResolver(s -> java.nio.file.Paths.get("."));
         ToolUseContext ctx = mock(ToolUseContext.class);
         when(ctx.sessionId()).thenReturn("sess-1");
 
@@ -92,8 +98,9 @@ class SendMessageToolResumeTest {
 
         // [agent-notice] 入队携带来源/会话/origin（稳定 ID 由 registry 生成，此处只校验路由参数）
         verify(registry).queue("a1234567890abcdef", "sess-1", "team-lead", "status?", null, "coordinator");
-        verify(resume, never()).resumeAgentBackground(any(), anyString(), any(), anyString(), any(),
-            org.mockito.ArgumentMatchers.anyBoolean());
+        verify(resume, never()).resumeAgentBackgroundForLineage(any(), anyString(), any(), anyString(),
+            any(), org.mockito.ArgumentMatchers.anyBoolean(),
+            org.mockito.ArgumentMatchers.nullable(String.class));
     }
 
     private static <T> org.springframework.beans.factory.ObjectProvider<T> provider(T value) {

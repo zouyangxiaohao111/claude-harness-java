@@ -55,6 +55,12 @@ public final class ToolNameConstants {
     public static final String GLOB_TOOL_NAME = "Glob";
     public static final String GREP_TOOL_NAME = "Grep";
 
+    // ── AST tools (结构化搜索/改写 · ast-grep CLI 支撑，CC 无对应工具) ──
+    /** 按 AST 结构搜索（只读）。 */
+    public static final String AST_GREP_TOOL_NAME = "AstGrep";
+    /** 按 AST 结构批量改写（默认预览，{@code apply:true} 才写盘）。 */
+    public static final String AST_EDIT_TOOL_NAME = "AstEdit";
+
     // ── Web tools (对齐 CC WebFetchTool / WebSearchTool) ──
     public static final String WEB_FETCH_TOOL_NAME = "WebFetch";
     public static final String WEB_SEARCH_TOOL_NAME = "WebSearch";
@@ -107,6 +113,33 @@ public final class ToolNameConstants {
     public static final String WEB_BROWSER_TOOL_NAME = "WebBrowser";
     /** CC original: LIST_PEERS_TOOL_NAME（ListPeersTool.ts:6）= 'ListPeers' · feature('UDS_INBOX') tools.ts:126/227。 */
     public static final String LIST_PEERS_TOOL_NAME = "ListPeers";
+
+    /** CC ArtifactTool 工具名 = 'Artifact'（工具名清单 exe @313578509）。本仓为本地发布版。 */
+    public static final String ARTIFACT_TOOL_NAME = "Artifact";
+    /**
+     * CC ListAgentsTool 工具名 · exe 2.1.328 工具注册表有 {@code ListAgentsTool}。
+     *
+     * <p>本仓尚未实现该工具；常量与协调者白名单先对齐，工具落地后自动生效
+     * （白名单按字符串匹配，名字不存在时无副作用）。
+     */
+    public static final String LIST_AGENTS_TOOL_NAME = "ListAgents";
+
+    /**
+     * 本仓扩展工具（CC 无创建会话工具）：在一个全新同级会话里起任务，之后用 SendMessage 继续。
+     *
+     * <p>CC 是单进程 CLI，新会话必须用户再起一个进程；本仓后端能创建会话 + 服务端起 run，
+     * 所以这是 Java 独有能力，不参与「对齐 CC」的命名/白名单约束。
+     */
+    public static final String SESSION_CREATE_TOOL_NAME = "SessionCreate";
+
+    /**
+     * 列出可传给 {@code SessionCreate.model} 的会话模型（本仓扩展；CC 无对应工具）。
+     *
+     * <p>每条给出可直接复制的 {@code provider/modelName}、模型类型、上下文窗口与绑定档位；
+     * embedding / rerank 等非对话模型不在可用组。与 {@code SessionCreate} 同能力门
+     * （跨会话投递开关），并进入协调者白名单与 bare 模式 keep 集合。
+     */
+    public static final String LIST_MODELS_TOOL_NAME = "ListModels";
     /** CC original: SEND_USER_FILE_TOOL_NAME（SendUserFileTool/prompt.ts）= 'SendUserFile' ·
      *  CC 注册 feature('KAIROS') tools.ts:42-43/239 —— Java 侧用户拍板默认启用（不 KAIROS 门控，2026-08-23）。 */
     public static final String SEND_USER_FILE_TOOL_NAME = "SendUserFile";
@@ -365,6 +398,29 @@ public final class ToolNameConstants {
     public static final String TERMINAL_READ_TOOL_NAME = "terminal_read";
     public static final String TERMINAL_CREATE_TOOL_NAME = "terminal_create";
     public static final String TERMINAL_WRITE_TOOL_NAME = "terminal_write";
+
+    // ── 安装类 tools（自建 · 让模型自助装插件/MCP · CC 无对应工具面）──
+    public static final String MANAGE_PLUGIN_TOOL_NAME = "ManagePlugin";
+    public static final String MANAGE_MCP_SERVER_TOOL_NAME = "ManageMcpServer";
+
+    // ── IM 类 tools（自建 · CC 无对应工具面）──
+    /**
+     * 以**用户本人名义**在 IM 发消息（{@code SendImAsUserTool}）。
+     *
+     * <p>⛔ 与 {@link #BRIEF_TOOL_NAME}（SendUserMessage）语义不同：那个是「机器人通知用户」，
+     * 这个是「替用户本人对别人说话」⇒ 必须独立成工具，不能合成同一个工具的参数。
+     * 可见性受 {@code im_config.allow_user_identity} 开关控制（关闭 ⇒ 不进 schema）。
+     */
+    public static final String SEND_IM_AS_USER_TOOL_NAME = "SendImAsUser";
+
+    /** 列出可用 IM 会话（{@code ListImChatsTool}）；给 SendImAsUser 提供 chatId。 */
+    public static final String LIST_IM_CHATS_TOOL_NAME = "ListImChats";
+
+    /** 读取某个 IM 会话的历史消息（{@code ReadImMessagesTool}）。 */
+    public static final String READ_IM_MESSAGES_TOOL_NAME = "ReadImMessages";
+
+    /** 在 IM 通讯录里搜索联系人（{@code SearchImContactsTool}），结果可直接作为 SendImAsUser 的 chatId。 */
+    public static final String SEARCH_IM_CONTACTS_TOOL_NAME = "SearchImContacts";
 
     private ToolNameConstants() {
         // 常量容器

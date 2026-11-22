@@ -191,7 +191,7 @@ class SubagentAutoCompactWiringG1Test {
     /** 子代理状态：agentId ≠ sessionId（生产子代理语义）。 */
     private static AgentState subagentState() {
         String session = "sess-" + UUID.randomUUID().toString().substring(0, 8);
-        return new AgentState("sys", session, UUID.randomUUID());
+        return new AgentState("sys", session, com.nexusai.application.agent.subagent.AgentContext.createAgentId());
     }
 
     /** 超阈 autoCompactor：tokenCounter 恒 200_000；摘要走桩回调（不触 LLM）。 */
@@ -213,7 +213,7 @@ class SubagentAutoCompactWiringG1Test {
         };
         return QueryParams.forLoop(
             state.rawMessages(), null,
-            ToolUseContext.of(UUID.randomUUID(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
+            ToolUseContext.of(com.nexusai.application.agent.subagent.AgentContext.createAgentId(), "sess-" + UUID.randomUUID().toString().substring(0, 8)),
             source, "test-model", null, null, null, null, null,
             deps, ProviderConfig.empty());
     }
