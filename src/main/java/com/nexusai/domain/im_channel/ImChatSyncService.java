@@ -218,12 +218,16 @@ public class ImChatSyncService {
         int updated = 0;
         int skipped = 0;
         int total = 0;
+        int pagesOk = 0;
+        // [V335] bot 身份的 im/v1/chats = 机器人所在群（CLI: 仅成员可见）⇒ 本集合可回写可达性
+        java.util.Set<String> presentPeerIds = new java.util.HashSet<>();
         String pageToken = null;
         for (int page = 0; page < MAX_PAGES; page++) {
             var data = fetchFeishuChatPage(token, pageToken);
             if (data == null) {
                 break;
             }
+            pagesOk++;
             for (var item : data.path("items")) {
                 total++;
                 String chatId = item.path("chat_id").asText("");
@@ -231,6 +235,7 @@ public class ImChatSyncService {
                     skipped++;
                     continue;
                 }
+                presentPeerIds.add(chatId);
                 String name = item.path("name").asText("");
                 // chat_mode: "group" | "p2p" | "topic"；非 p2p 一律当群（topic 也是群的一种）
                 String kind = "p2p".equals(item.path("chat_mode").asText("")) ? "p2p" : "group";
@@ -254,6 +259,16 @@ public class ImChatSyncService {
             pageToken = data.path("page_token").asText("");
             if (pageToken.isBlank()) {
                 break;
+            }
+        }
+
+        // [V335] 同步成功过至少一页 ⇒ 用 bot 群集合回写「机器人是否在群」。
+        //   一页都没成功（pagesOk=0）⇒ 不动，防平台抖动把整渠道的会话隐藏。
+        if (pagesOk > 0) {
+            try {
+                chatService.markBotPresence(inst.id(), presentPeerIds);
+            } catch (RuntimeException e) {
+                log.warn("[ImChatSync] 回写机器人可达性失败 instance={} err={}", inst.id(), e.toString());
             }
         }
 

@@ -154,6 +154,36 @@ public class TaskController {
     }
 
     /**
+     * 活跃后台任务清单 · GET /api/v1/tasks/active
+     *
+     * <p><b>WHY 需要独立端点</b>：侧栏「正在运行」判定必须把「主 turn 已结束、但仍有后台工作
+     * （子代理 / 后台 bash / monitor 等）在跑」的会话也算作运行中。前端只靠 STOMP 事件建立
+     * 该集合时，F5 / 丢帧后会永久缺失；而全局 {@link #listTasks} 每次都会打 WARN（(b) 类
+     * 「缺 sessionId」留痕）⇒ 不适合 2s 轮询。本端点语义就是「跨会话找还活着的后台工作」，
+     * 缺 sessionId 属预期，不打 WARN。
+     *
+     * <p><b>口径</b>：只返回 ①有会话归属（否则无法归回会话）②未终态（pending/running）
+     * ③已后台化（{@code isBackgrounded=true}；前台同步任务由主 turn 自身覆盖，重复计无意义）。
+     * 未做去重：{@link BackgroundTaskRunner#listAllTasks()} 已合并本地/统一 store。
+     *
+     * @return 活跃后台任务（含 {@code sessionId} 归属字段，前端按会话聚合）
+     */
+    @GetMapping("/active")
+    public List<TaskDto> listActiveTasks() {
+        List<TaskDto> result = new ArrayList<>();
+        for (BackgroundTask task : backgroundTaskRunner.listAllTasks()) {
+            if (task.sessionId() == null || task.sessionId().isBlank()) continue;
+            if (task.status().isTerminal()) continue;
+            if (!task.isBackgrounded()) continue;
+            result.add(TaskDto.from(task));
+        }
+        if (log.isDebugEnabled()) {
+            log.debug("[TaskController] GET /api/v1/tasks/active → {} 个活跃后台任务（按会话聚合）", result.size());
+        }
+        return result;
+    }
+
+    /**
      * V2 任务清单 · GET /api/v1/tasks/list?sessionId=
      *
      * <p>用户拍板（2026-08-24）：TaskService.listTasks 共用——一个会话 V1（TodoWrite）/V2

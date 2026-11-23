@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { sessionApi } from '@/api/sessions'
 import type { SessionToolCategory, SessionToolDto } from '@/api/types'
-import { ApiError } from '@/api/rest'
+import { ApiError, api } from '@/api/rest'
 
 interface Props {
   /** 当前会话 id（空串不拉取 · 切换时组件自动重新拉取） */
@@ -76,6 +76,15 @@ interface CategoryMeta {
  * SendUserMessage / 本机微信记录工具），
  * 同样独立成组、排在 SYS 之前。
  */
+/**
+ * 归入「应用层」的分类（当前**只有 MCP**）。
+ *
+ * <p>2026-11-23 终稿：门 = 会话级 `enabled_apps`（启动才进工具 schema）；请求体的 `selectedApps`
+ * 只是**每轮强调**、不改 schema。浏览器（BR）/ 电脑操作（CU）不需要应用指定，在本面板各自开关
+ * ⇒ 本面板对 MCP 只读展示 + 历史禁用恢复，⛔ 不再维护第二套 MCP 开关。
+ */
+const APP_MANAGED_CATEGORIES = new Set<SessionToolCategory>(['MCP'])
+
 const CATEGORIES: CategoryMeta[] = [
   {
     key: 'CU',
@@ -124,6 +133,7 @@ const IM_TOOL_NAMES = new Set([
   'SendUserMessage',
   'wechat_search_messages',
   'wechat_list_conversations',
+  'wechat_read_conversation',
 ])
 
 /** 分类兜底：老后端无 category 字段时按工具名前缀推断（CU/BR 专属前缀优先，其余 mcp__ → MCP，IM 工具名 → IM） */
@@ -136,52 +146,23 @@ function resolveCategory(t: SessionToolDto): SessionToolCategory {
   return 'SYS'
 }
 
-/**
- * MCP 工具 → server 名。
- * 优先用后端给的 mcpServer；老后端没有该字段时按 `mcp__<server>__<tool>` 取前缀后第一段
- * （与后端 McpStringUtils 同口径：server 段不会含 `__`，tool 段可能含）。
- */
-function serverOfTool(t: SessionToolDto): string {
-  if (t.mcpServer) return t.mcpServer
-  const rest = t.name.startsWith('mcp__') ? t.name.slice('mcp__'.length) : t.name
-  const i = rest.indexOf('__')
-  return i > 0 ? rest.slice(0, i) : rest
-}
-
-/** MCP 二级分组（一个 server 一组） */
-interface McpServerGroup {
-  server: string
-  tools: SessionToolDto[]
-  total: number
-  enabled: number
-}
-
 interface CategoryGroup {
   meta: CategoryMeta
   tools: SessionToolDto[]
   total: number
   enabled: number
-  /** 仅 MCP 类填充：按 server 分好的二级分组（其它分类为空数组） */
-  servers: McpServerGroup[]
 }
 
 export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange, onOpenChromePanel, unattended, onModeChanged }: Props) {
   const [tools, setTools] = useState<SessionToolDto[] | null>(null)
   const [error, setError] = useState<string | null>(null)
   const [pending, setPending] = useState<string | null>(null)
+  /** 浏览器扩展连接真值（GET /api/v1/browser/status）· null = 未知/请求失败 */
+  const [browserConnected, setBrowserConnected] = useState<boolean | null>(null)
   /** [Q8] 关 SendUserMessage 且无人值守开启 ⇒ 先确认（取消 = 什么都不变） */
   const [confirmBriefOff, setConfirmBriefOff] = useState(false)
   /** 当前展开二级明细的类（null = 未展开） */
   const [activeCat, setActiveCat] = useState<SessionToolCategory | null>(null)
-  /**
-   * MCP 第三层：当前进入的 server（null = 停在 server 列表）。
-   *
-   * <p>三层面板：① 分类 → ② MCP server 列表 → ③ 该 server 的工具。
-   * ②③ 复用同一个 `.tools-panel` 容器，靠面包屑回退（⛔ 不叠加浮层）。
-   */
-  const [activeMcpServer, setActiveMcpServer] = useState<string | null>(null)
-  /** 第三层的工具名过滤（只影响显示，不改任何开关状态） */
-  const [toolQuery, setToolQuery] = useState('')
   const closeTimerRef = useRef<number | null>(null)
 
   const load = useCallback(async () => {
@@ -198,12 +179,24 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
     }
   }, [sessionId, onCountChange])
 
+  // 浏览器扩展连接状态（只读）· 面板打开时拉一次；用于区分「能力未开」与「扩展没连」
+  useEffect(() => {
+    let alive = true
+    void (async () => {
+      try {
+        const r = await api<{ connected: boolean }>('/browser/status')
+        if (alive) setBrowserConnected(!!r?.connected)
+      } catch {
+        if (alive) setBrowserConnected(null)
+      }
+    })()
+    return () => { alive = false }
+  }, [sessionId])
+
   // 会话切换 → 清空旧列表并重新拉取（监听 sessionId）
   useEffect(() => {
     setTools(null)
     setActiveCat(null)
-    setActiveMcpServer(null)
-    setToolQuery('')
     void load()
   }, [load])
 
@@ -235,31 +228,11 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
     })
     return CATEGORIES.map((meta) => {
       const list = (byCat.get(meta.key) ?? []).slice().sort((a, b) => a.name.localeCompare(b.name))
-      // MCP 多一级：按 server 分组（其它分类不建分组，保持原渲染）
-      let servers: McpServerGroup[] = []
-      if (meta.key === 'MCP') {
-        const byServer = new Map<string, SessionToolDto[]>()
-        list.forEach((t) => {
-          const server = serverOfTool(t)
-          const bucket = byServer.get(server)
-          if (bucket) bucket.push(t)
-          else byServer.set(server, [t])
-        })
-        servers = Array.from(byServer.entries())
-          .sort((a, b) => a[0].localeCompare(b[0]))
-          .map(([server, tools]) => ({
-            server,
-            tools,
-            total: tools.length,
-            enabled: tools.filter((t) => !t.disabled).length,
-          }))
-      }
       return {
         meta,
         tools: list,
         total: list.length,
         enabled: list.filter((t) => !t.disabled).length,
-        servers,
       }
     })
   }, [tools])
@@ -290,40 +263,32 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
   }
 
   /**
-   * MCP 二级开关：只切该 server 的工具（`{category:'MCP', mcpServer, enabled}`）。
-   * ⛔ 不循环 N 次单工具 PATCH；后端返回整表后一次替换。
+   * [应用层单一入口] 清除应用层分类（当前只有 MCP）的会话级禁用 —— **只做恢复**。
+   *
+   * <p>为什么需要：这三类已从工具面板移走，但老会话的 `disabled_tools` 里可能留着历史禁用行；
+   * 应用选择器只管「本轮用哪些」，不解开历史禁用 ⇒ 没有这个入口用户就没法恢复。
+   * 只对**确实有禁用行**的分类发一次整类启用请求（⛔ 不提供禁用路径）。
    */
-  const toggleMcpServer = async (sv: McpServerGroup, e: React.MouseEvent) => {
-    e.stopPropagation()
+  const clearAppManagedDisabled = async () => {
     if (!sessionId || pending) return
-    if (sv.total === 0) return
-    const wantEnabled = sv.enabled < sv.total
-    setPending(`srv:${sv.server}`)
+    setPending('app-managed')
     try {
-      const updated = await sessionApi.setCategoryEnabled(sessionId, 'MCP', wantEnabled, sv.server)
-      setTools(updated)
-      onCountChange?.(updated.filter((t) => t.disabled).length)
-      showToast(
-        wantEnabled ? `已启用 ${sv.server} 的全部工具` : `已禁用 ${sv.server} 的全部工具`,
-        'success',
-      )
+      let updated: SessionToolDto[] | null = null
+      for (const g of groups) {
+        if (!APP_MANAGED_CATEGORIES.has(g.meta.key)) continue
+        if (g.total <= g.enabled) continue
+        updated = await sessionApi.setCategoryEnabled(sessionId, g.meta.key, true)
+      }
+      if (updated) {
+        setTools(updated)
+        onCountChange?.(updated.filter((t) => t.disabled).length)
+        showToast('已恢复应用层全部工具（清除会话级禁用）', 'success')
+      }
     } catch (err) {
       showToast(err instanceof ApiError ? err.userMessage() : String(err), 'info')
     } finally {
       setPending(null)
     }
-  }
-
-  /** 进入某个 server 的工具列表（第三层）；切换/关闭面板时由调用方重置。 */
-  const enterMcpServer = (server: string) => {
-    setActiveMcpServer(server)
-    setToolQuery('')
-  }
-
-  /** 面包屑返回：回到 server 列表（第二层）。 */
-  const backToMcpServers = () => {
-    setActiveMcpServer(null)
-    setToolQuery('')
   }
 
   /** 单工具启用/禁用（保留细粒度） */
@@ -379,14 +344,11 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
 
   /** 点行：已展开则收起（用户报的「无法收起」缺陷），否则展开 */
   const selectCategory = (cat: SessionToolCategory) => {
-    // 换类时回到最外层：MCP 的第三层面板不跨类保留（否则下次点 MCP 会直接落在某个 server 的工具里）
-    setActiveMcpServer(null)
-    setToolQuery('')
     setActiveCat((cur) => (cur === cat ? null : cat))
   }
 
   /**
-   * 单工具行（CU/KB/BR/SYS 与 MCP 二级分组共用同一份渲染）。
+   * 单工具行（KB / IM / SYS 共用同一份渲染）。
    * ⚠️ 抽成函数只是去重：样式、核心工具置灰、目标状态语义均与原先内联版本一致。
    */
   const renderToolRow = (t: SessionToolDto) => {
@@ -406,6 +368,7 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
           <div className="tool-key">{t.name}</div>
           {t.description && <div className="tool-desc">{t.description}</div>}
         </div>
+        {/* 单工具开关（CU / KB / BR / IM / SYS 保留细粒度；MCP 已归应用层） */}
         <button
           className={`toggle-btn ${t.disabled ? 'restore' : 'disable'}`}
           disabled={coreLocked || busy}
@@ -418,14 +381,17 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
     )
   }
 
-  const activeGroup = groups.find((g) => g.meta.key === activeCat) ?? null
-  /** MCP 第三层当前 server（不在第三层 / 非 MCP → null）。 */
-  const mcpServerView = activeGroup && activeGroup.meta.key === 'MCP' && activeMcpServer
-    ? activeGroup.servers.find((s) => s.server === activeMcpServer) ?? null
-    : null
-  /** 状态行与「全部启用」的作用域：第三层 = 该 server；否则 = 整类。 */
-  const scopeEnabled = mcpServerView ? mcpServerView.enabled : (activeGroup?.enabled ?? 0)
-  const scopeTotal = mcpServerView ? mcpServerView.total : (activeGroup?.total ?? 0)
+  /** 工具面板只列非应用层分类：MCP 归应用层（门 = 会话 enabled_apps），浏览器/电脑操作 在面板内 */
+  const visibleGroups = groups.filter((g) => !APP_MANAGED_CATEGORIES.has(g.meta.key))
+  /** 应用层分类的历史禁用总数（>0 才显示「清除」恢复入口） */
+  const appManagedDisabledCount = groups
+    .filter((g) => APP_MANAGED_CATEGORIES.has(g.meta.key))
+    .reduce((n, g) => n + Math.max(0, g.total - g.enabled), 0)
+
+  const activeGroup = visibleGroups.find((g) => g.meta.key === activeCat) ?? null
+  /** 状态行与「全部启用」的作用域 = 整类 */
+  const scopeEnabled = activeGroup?.enabled ?? 0
+  const scopeTotal = activeGroup?.total ?? 0
 
   if (tools == null) {
     return (
@@ -454,9 +420,9 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
       <div className="tool-cat-menu">
         <div className="l1-head">
           <span>工具分类</span>
-          <span className="l1-head-count">{CATEGORIES.length} 类</span>
+          <span className="l1-head-count">{visibleGroups.length} 类</span>
         </div>
-        {groups.map((g) => {
+        {visibleGroups.map((g) => {
           const empty = g.total === 0
           const swClass = empty
             ? 'tc-sw empty'
@@ -465,9 +431,14 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
               : g.enabled >= g.total
                 ? 'tc-sw on'
                 : 'tc-sw mixed'
+          // 空组不用「需安装扩展」一句话糊过去：按真实连接状态区分「能力未开 / 未连接 / 未知」
           const sub = empty && g.meta.key === 'BR'
-            ? '需安装 Chrome 扩展'
-            : `${g.total} 个 · ${g.enabled} 个已启用`
+            ? (browserConnected === true
+              ? '扩展已连接 · 浏览器工具未开启'
+              : browserConnected === false ? '未连接浏览器扩展' : '浏览器扩展状态未知')
+            : empty && g.meta.key === 'CU'
+              ? '功能未开启'
+              : `${g.total} 个 · ${g.enabled} 个已启用`
           return (
             <div
               key={g.meta.key}
@@ -498,44 +469,47 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
             </div>
           )
         })}
+        {/* [应用层单一入口] MCP 已从本面板移走：启停在输入框「应用」里写会话 enabled_apps。
+            老会话可能带着这三类的历史禁用行 ⇒ 只给一个**恢复**入口，⛔ 不提供禁用。 */}
+        {appManagedDisabledCount > 0 && (
+          <button
+            type="button"
+            className="l1-item"
+            data-testid="app-managed-history"
+            disabled={pending != null}
+            title="只恢复，不提供禁用（启用已由「应用」选择器按轮决定）"
+            onClick={() => void clearAppManagedDisabled()}
+          >
+            <span className="l1-ico">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M12 4a8 8 0 018 8M12 20a8 8 0 01-8-8" />
+                <path d="M4 8l2-4 4 2M20 16l-2 4-4-2" />
+              </svg>
+            </span>
+            <div className="l1-body">
+              <div className="l1-name">应用层历史禁用</div>
+              <div className="l1-sub">{appManagedDisabledCount} 项 · 点击恢复</div>
+            </div>
+          </button>
+        )}
       </div>
 
       {/* ── 二级：该类明细（并排在右，可收起） ── */}
       {activeGroup && (
         <div className="tools-panel show">
           <div className="tools-panel-header">
-            {mcpServerView ? (
-              /* 第三层：面包屑（‹ MCP 工具 › rea），点任一级都回 server 列表 */
-              <div className="crumb">
-                <button
-                  type="button"
-                  className="crumb-back"
-                  onClick={backToMcpServers}
-                  title="返回 MCP 工具"
-                  aria-label="返回 MCP 工具"
-                >
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-                    <path d="M15 18l-6-6 6-6" />
-                  </svg>
-                </button>
-                <button type="button" className="crumb-root" onClick={backToMcpServers}>MCP 工具</button>
-                <span className="crumb-sep">›</span>
-                <span className="crumb-cur">{mcpServerView.server}</span>
-              </div>
-            ) : (
-              <span className="tools-panel-title">
-                <span className="l1-ico l1-ico-sm">
-                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                    <path d={activeGroup.meta.iconPath} />
-                  </svg>
-                </span>
-                {activeGroup.meta.label}
+            <span className="tools-panel-title">
+              <span className="l1-ico l1-ico-sm">
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                  <path d={activeGroup.meta.iconPath} />
+                </svg>
               </span>
-            )}
+              {activeGroup.meta.label}
+            </span>
             <span className="tools-panel-count">{scopeTotal} 个工具</span>
             <button
               className="tools-panel-close"
-              onClick={() => { setActiveCat(null); setActiveMcpServer(null); setToolQuery('') }}
+              onClick={() => setActiveCat(null)}
               title="收起明细"
               aria-label="收起明细"
             >×</button>
@@ -543,11 +517,19 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
 
           {activeGroup.total === 0 && activeGroup.meta.key === 'BR' ? (
             <div className="tools-panel-state">
-              <span>浏览器扩展未启用，模型看不到这组工具。</span>
+              <span>
+                {browserConnected === true
+                  ? '浏览器扩展已连接，但浏览器工具未开启（browser-mcp 能力关）。'
+                  : browserConnected === false
+                    ? '未连接浏览器扩展，模型看不到这组工具。'
+                    : '浏览器扩展连接状态未知；可打开面板检查。'}
+              </span>
               {onOpenChromePanel && (
                 <button className="tools-panel-retry" onClick={onOpenChromePanel}>检查 / 安装扩展</button>
               )}
             </div>
+          ) : activeGroup.total === 0 && activeGroup.meta.key === 'CU' ? (
+            <div className="tools-panel-state">功能未开启：computer-use 能力默认关闭，工具未注册。</div>
           ) : activeGroup.total === 0 ? (
             <div className="tools-panel-state">当前会话暂无该类工具</div>
           ) : (
@@ -555,25 +537,10 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
               {activeGroup.meta.key === 'KB' && (
                 <div className="tp-hint">仅绑定「知识库智能体」的会话生效。普通会话的模型本来没挂这组，开关无效果。</div>
               )}
-              {activeGroup.meta.key === 'MCP' && !mcpServerView && (
-                <div className="tp-hint">
-                  一个 MCP server 可能带很多工具。先关整类，或点某个 server 只改它那一组。
-                </div>
-              )}
-              {mcpServerView && (
-                <div className="tp-search">
-                  <input
-                    value={toolQuery}
-                    onChange={(e) => setToolQuery(e.target.value)}
-                    placeholder="搜索工具名…"
-                    spellCheck={false}
-                  />
-                </div>
-              )}
               <div className="tp-status">
                 <span className="tp-status-text">
                   {scopeEnabled === 0
-                    ? <>{mcpServerView ? `${mcpServerView.server} 当前` : '本组工具当前'}<b>全部禁用</b>，模型本轮看不到它们</>
+                    ? <>{'本组工具当前'}<b>全部禁用</b>，模型本轮看不到它们</>
                     : <>已启用 <b>{scopeEnabled}</b> / {scopeTotal}
                       {activeGroup.meta.key === 'SYS' && <span>　·　3 个编排工具始终可用</span>}
                     </>}
@@ -581,70 +548,11 @@ export function SessionToolsPanel({ sessionId, showToast, onClose, onCountChange
                 <button
                   className="tp-bulk"
                   disabled={pending != null}
-                  onClick={(e) => mcpServerView
-                    ? void toggleMcpServer(mcpServerView, e)
-                    : void toggleCategory(activeGroup, e)}
+                  onClick={(e) => void toggleCategory(activeGroup, e)}
                 >{scopeEnabled >= scopeTotal ? '全部禁用' : '全部启用'}</button>
               </div>
               <div className="tools-panel-list">
-                {activeGroup.meta.key !== 'MCP' ? (
-                  activeGroup.tools.map(renderToolRow)
-                ) : mcpServerView ? (
-                  /* 第三层：该 server 的工具（可搜索；搜索只影响显示） */
-                  (() => {
-                    const q = toolQuery.trim().toLowerCase()
-                    const matched = q
-                      ? mcpServerView.tools.filter((t) =>
-                        t.name.toLowerCase().includes(q)
-                        || (t.userFacingName ?? '').toLowerCase().includes(q))
-                      : mcpServerView.tools
-                    if (matched.length === 0) {
-                      return <div className="tools-panel-state">没有匹配「{toolQuery.trim()}」的工具</div>
-                    }
-                    return matched.map(renderToolRow)
-                  })()
-                ) : (
-                  /* 第二层：server 列表（点行进第三层；右侧开关只切该 server） */
-                  activeGroup.servers.map((sv) => {
-                    const svSw = sv.enabled === 0
-                      ? 'tc-sw'
-                      : sv.enabled >= sv.total
-                        ? 'tc-sw on'
-                        : 'tc-sw mixed'
-                    const svBusy = pending === `srv:${sv.server}`
-                    return (
-                      <div
-                        key={sv.server}
-                        className="tool-row"
-                        style={{ cursor: 'pointer' }}
-                        onClick={() => enterMcpServer(sv.server)}
-                        role="button"
-                        title={`查看 ${sv.server} 的工具`}
-                      >
-                        <span className="tool-icon">
-                          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
-                            <path d="M9 3v6M15 3v6M6 9h12v4a6 6 0 01-6 6 6 6 0 01-6-6V9z" />
-                          </svg>
-                        </span>
-                        <div className="tool-info">
-                          <div className="tool-name">{sv.server}</div>
-                          <div className="tool-key">{sv.enabled} / {sv.total} 已启用</div>
-                        </div>
-                        <span
-                          className={svSw}
-                          role="switch"
-                          aria-checked={sv.enabled >= sv.total}
-                          title={sv.enabled >= sv.total ? '关闭此 server 全部工具' : '启用此 server 全部工具'}
-                          style={svBusy ? { opacity: 0.5, cursor: 'wait' } : undefined}
-                          onClick={(e) => void toggleMcpServer(sv, e)}
-                        />
-                        <svg width="12" height="12" viewBox="0 0 12 12" fill="none" stroke="#C6CBD3" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" style={{ flex: 'none' }}>
-                          <path d="M4 2l4 4-4 4" />
-                        </svg>
-                      </div>
-                    )
-                  })
-                )}
+                {activeGroup.tools.map((t) => renderToolRow(t))}
               </div>
             </>
           )}

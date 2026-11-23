@@ -1,0 +1,17 @@
+-- ===================================================================
+-- V337: sessions 表加 enabled_apps（会话级「已启动应用」= schema 门）
+--
+-- 背景（2026-11-23 终稿）：
+--   启动应用 = 进 schema 的门（会话级、持久）；每轮 selectedApps 只是「强调层」，
+--   不改 schema、不参与 allowlist。安装/授权不等于启动。
+--
+-- enabled_apps TEXT（JSON 数组；MyBatis-Flex snake_case↔camelCase）：
+--   NULL      = 未设置 → 按应用目录的 defaultOpen 种子
+--               （应用层只含 MCP：connector 安装的=false，其余 MCP=true）
+--   "[]"      = 显式全不启动 → 所有 MCP 应用工具不进 schema/候选池
+--   ["A","B"] = 显式启动集 → allowlist（MCP server 名；浏览器/CU 是内置工具，不在应用层）
+--   解析在读侧（SessionEnabledAppsConfig），照 disabled_tools（V35）先例。
+--
+-- 影响：只加可空列；旧值 NULL 即按 defaultOpen 种子，无需数据迁移。
+-- ===================================================================
+ALTER TABLE sessions ADD COLUMN enabled_apps TEXT;

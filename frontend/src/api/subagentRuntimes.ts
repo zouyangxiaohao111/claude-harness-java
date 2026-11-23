@@ -159,6 +159,15 @@ export interface CliRuntimeTestResult {
   elapsedMs: number
   sample: string | null
   error: string | null
+  /**
+   * 探测深度（后端判定，前端只按它出文案；缺省/老后端 = 按 `ok` 回落）。
+   *
+   * <p>ACP 这种「进程起来了 ≠ 协议握手成功」的运行时必须有这一位：
+   * `acp_initialize` = initialize 握手成功；`process_only` = 进程已起但握手未完成；
+   * `failed` = 起不来/握手失败（原因在 `error`）。
+   * ⛔ 不要用「进程退出码 0」冒充握手成功。
+   */
+  probeLevel?: 'acp_initialize' | 'process_only' | 'failed' | null
 }
 
 /**

@@ -1,0 +1,539 @@
+/*
+ * 连接器市场（技能市场「连接器」tab）· 卡片 + 授权抽屉。
+ *
+ * 样式取值来源：
+ * - 卡片体量与交互按 Octop 连接器/应用卡（`D:/tmp/octop-impact/app-picker-ui.md`）：
+ *   2px 边框、hover `translateY(-2px)` + 品牌色 4% 底、11px 胶囊徽章、状态胶囊 + 圆点；
+ *   面板阴影 `0 8px 24px rgba(0,0,0,0.08)`、入场 `translateY(4px)→0 / 0.15s ease`（原值照抄）。
+ * - 抽屉视觉语言照 `components/center/imChannel.css` 的 `.imc-drawer/.imc-dh/.imc-db/.imc-df`。
+ * ⛔ 类名统一 `mc-` 前缀，不复用/不改 `.sm-*`（`.sm-card/.sm-mini-card` 是三个 tab 共用）。
+ */
+
+/* ---------- 网格（Octop 原值：minmax(240) / 行 16 / 列 12） ---------- */
+.mc-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(240px, 1fr));
+  row-gap: 16px;
+  column-gap: 12px;
+  padding: 4px 0;
+  align-items: stretch;
+}
+
+.mc-card {
+  --connector-accent: var(--accent, #0f5fd4);
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 152px;
+  padding: 20px;
+  background: #ffffff;
+  border: 2px solid #e5e7eb;
+  border-radius: 12px;
+  cursor: pointer;
+  overflow: hidden;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s, box-shadow 0.2s;
+}
+.mc-card:hover,
+.mc-card:focus-visible {
+  border-color: var(--connector-accent);
+  background: color-mix(in srgb, var(--connector-accent) 4%, #ffffff);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+}
+.mc-card:active { transform: translateY(0); transition-duration: 0.05s; }
+.mc-card:focus-visible { outline: 2px solid var(--connector-accent); outline-offset: 2px; }
+.mc-card.on { border-color: var(--connector-accent); }
+/* unavailable：置灰、hover 不动 —— ⛔ 没有任何可点动作 */
+.mc-card.is-disabled { opacity: 0.62; cursor: not-allowed; }
+.mc-card.is-disabled:hover,
+.mc-card.is-disabled:focus-visible {
+  transform: none;
+  box-shadow: none;
+  background: #ffffff;
+  border-color: #e5e7eb;
+}
+
+.mc-card-top { display: flex; align-items: center; gap: 12px; min-height: 44px; min-width: 0; }
+/* 图标容器 44×44 + 图 40×40 / radius 10（Octop 原值） */
+.mc-ico-lg {
+  flex: none;
+  width: 44px;
+  height: 44px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.mc-logo { width: 40px; height: 40px; border-radius: 10px; object-fit: contain; }
+.mc-ico-fallback {
+  width: 40px;
+  height: 40px;
+  border-radius: 10px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: #fff;
+  font-size: 16px;
+  font-weight: 700;
+}
+.mc-titles { display: flex; flex-direction: column; gap: 4px; min-width: 0; flex: 1; overflow: hidden; }
+.mc-title {
+  max-width: 100%;
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+  line-height: 1.3;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 分类 chip 10px / line-height 18 / padding 0 7 / radius 9 / 品牌色 + 10% 底 */
+.mc-chip-row { display: flex; align-items: center; gap: 4px; min-width: 0; overflow: hidden; }
+.mc-badge-hidden { height: 16px; padding: 0 6px; font-size: 10px; color: #6b7280; background: #f2f3f5; }
+.mc-badge-official { height: 16px; padding: 0 6px; font-size: 10px; color: #0f5fd4; background: rgba(15, 95, 212, 0.1); }
+.mc-chip {
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  align-self: flex-start;
+  display: inline-flex;
+  align-items: center;
+  padding: 0 7px;
+  border-radius: 9px;
+  font-size: 10px;
+  font-weight: 500;
+  line-height: 18px;
+  color: var(--connector-accent);
+  background: color-mix(in srgb, var(--connector-accent) 10%, #ffffff);
+  white-space: nowrap;
+}
+.mc-configured { flex: none; align-self: flex-start; font-size: 11px; font-weight: 500; color: #52c41a; }
+.mc-tier-note {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 11.5px;
+  color: var(--ink-tertiary, #8a93a2);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* 自定义 tab：非内置目录的 MCP server 列表（只读；管理入口在设置→MCP） */
+.mc-custom-list { display: flex; flex-direction: column; gap: 6px; margin-top: 4px; }
+.mc-custom-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline, #eee);
+  border-radius: 10px;
+  background: #fff;
+}
+.mc-custom-name {
+  flex: 1;
+  min-width: 0;
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink, #14181f);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-desc {
+  margin-top: 12px;
+  font-size: 13px;
+  line-height: 1.45;
+  color: #9ca3af;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  min-height: 38px;
+  max-height: 38px;
+}
+.mc-foot {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: nowrap;
+  margin-top: 12px;
+  min-height: 24px;
+  min-width: 0;
+}
+.mc-foot .mc-status { flex: none; }
+.mc-foot .mc-btn { flex: none; }
+
+/* 11px 胶囊徽章（Octop 原值） */
+.mc-badge {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  height: 18px;
+  padding: 0 7px;
+  border-radius: var(--r-pill, 9999px);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 550;
+  color: var(--ink-subtle, #5f6875);
+  background: var(--surface-2, #eff2f8);
+  white-space: nowrap;
+}
+.mc-badge.auth { color: var(--accent, #0f5fd4); background: var(--accent-soft, rgba(15, 95, 212, 0.1)); }
+
+/* 状态胶囊 + 圆点 */
+.mc-status {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 18px;
+  padding: 0 8px;
+  border-radius: var(--r-pill, 9999px);
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 550;
+  background: var(--surface-2, #eff2f8);
+  color: var(--ink-subtle, #5f6875);
+  white-space: nowrap;
+}
+.mc-status .mc-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--ink-faint, #9aa3b2);
+}
+.mc-status.connected { color: var(--success-dark, #2d6e3d); background: var(--success-soft, rgba(93, 184, 114, 0.12)); }
+.mc-status.connected .mc-dot { background: var(--success, #5db872); }
+.mc-status.pending { color: var(--warning, #c99417); background: rgba(201, 148, 23, 0.1); }
+.mc-status.pending .mc-dot { background: var(--warning, #c99417); }
+.mc-status.error { color: var(--error-dark, #8b2d2d); background: var(--error-soft, rgba(198, 69, 69, 0.1)); }
+.mc-status.error .mc-dot { background: var(--error, #c64545); }
+/* 凭据还在但已失效：需要重新授权（warning 语义，与 failed 区分） */
+.mc-status.reauth { color: var(--warning, #c99417); background: rgba(201, 148, 23, 0.1); }
+.mc-status.reauth .mc-dot { background: var(--warning, #c99417); }
+
+/* ---------- 探测结果面板（Octop probeResult 原值） ---------- */
+.mc-probe {
+  margin-top: 20px;
+  border: 1px solid color-mix(in srgb, var(--success, #5db872) 28%, #e5e7eb);
+  border-radius: 8px;
+  overflow: hidden;
+}
+.mc-probe.fail { border-color: color-mix(in srgb, var(--error, #c64545) 28%, #e5e7eb); }
+.mc-probe-hd {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 12px 14px;
+  background: color-mix(in srgb, var(--success, #5db872) 9%, #fff);
+  border-bottom: 1px solid color-mix(in srgb, var(--success, #5db872) 16%, #fff);
+}
+.mc-probe.fail .mc-probe-hd {
+  background: color-mix(in srgb, var(--error, #c64545) 8%, #fff);
+  border-bottom-color: color-mix(in srgb, var(--error, #c64545) 16%, #fff);
+}
+.mc-probe-ico {
+  flex: none;
+  width: 18px;
+  height: 18px;
+  border-radius: 50%;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 12px;
+  font-weight: 700;
+  color: #fff;
+  background: var(--success, #5db872);
+  margin-top: 1px;
+}
+.mc-probe.fail .mc-probe-ico { background: var(--error, #c64545); }
+.mc-probe-title { font-size: 14px; font-weight: 600; color: var(--ink, #14181f); line-height: 1.35; }
+.mc-probe-sub { margin-top: 3px; font-size: 12px; line-height: 1.5; color: var(--ink-subtle, #5f6875); }
+.mc-probe-meta {
+  padding: 6px 14px;
+  font-size: 11.5px;
+  color: var(--ink-tertiary, #8a93a2);
+  border-bottom: 1px solid var(--hairline, #eee);
+}
+.mc-probe-list {
+  list-style: none;
+  margin: 0;
+  padding: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  max-height: 300px;
+  overflow-y: auto;
+}
+.mc-probe-item {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  padding: 10px 12px;
+  background: var(--surface-2, #f7f8fa);
+  border: 1px solid var(--hairline, #eee);
+  border-radius: 5px;
+}
+.mc-probe-idx {
+  flex: none;
+  width: 22px;
+  height: 22px;
+  border-radius: 6px;
+  background: #fff;
+  border: 1px solid var(--hairline-strong, #e2e2e2);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 20px;
+  text-align: center;
+  color: var(--ink-subtle, #5f6875);
+}
+.mc-probe-body { min-width: 0; }
+.mc-probe-name {
+  font-family: var(--font-mono);
+  font-size: 13px;
+  font-weight: 500;
+  color: var(--ink, #14181f);
+  word-break: break-word;
+}
+.mc-probe-desc { margin-top: 4px; font-size: 12px; line-height: 1.5; color: var(--ink-tertiary, #8a93a2); }
+
+/* 卡片动作按钮（贴右下） */
+.mc-acts { margin-left: auto; display: inline-flex; gap: 6px; }
+.mc-btn {
+  height: 26px;
+  padding: 0 12px;
+  border: 1px solid var(--hairline-strong, #e2e2e2);
+  border-radius: var(--r-sm, 6px);
+  background: var(--surface-1, #fff);
+  color: var(--ink, #14181f);
+  font-size: 12px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+}
+.mc-btn:hover { background: var(--surface-2, #eff2f8); }
+.mc-btn.primary {
+  border-color: transparent;
+  background: var(--accent, #0f5fd4);
+  color: #fff;
+}
+.mc-btn.primary:hover { background: var(--accent-hover, #0a49a8); }
+.mc-btn:disabled { opacity: 0.5; cursor: default; }
+.mc-btn.danger { border-color: rgba(198, 69, 69, 0.45); color: var(--error, #c64545); background: transparent; }
+.mc-btn.danger:hover { background: var(--error-soft, rgba(198, 69, 69, 0.1)); }
+
+/* ---------- 分类 pill（Octop 原值：5px 12px / 13px / 999；底 #f2f3f5，选中品牌色白字） ---------- */
+.mc-cat-row { display: flex; align-items: center; gap: 8px; margin-top: 12px; margin-bottom: 16px; }
+.mc-cat-scroll { display: flex; align-items: center; gap: 8px; overflow-x: auto; scrollbar-width: none; flex: 1; min-width: 0; }
+.mc-cat-scroll::-webkit-scrollbar { display: none; }
+.mc-cat {
+  flex: none;
+  padding: 5px 12px;
+  border-radius: 999px;
+  border: 1px solid transparent;
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 20px;
+  background: #f2f3f5;
+  color: #4b5563;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.mc-cat:hover { background: #f0f1f3; color: #111827; }
+/* 选中色对齐 Octop（#e85d75 白字）· 仅连接器 tab 内使用，不影响全局 --accent */
+.mc-cat.active { background: #e85d75; color: #fff; }
+
+/* ---------- 授权抽屉（照 imc-drawer 视觉语言） ---------- */
+.mc-scrim {
+  position: fixed;
+  inset: 0;
+  background: rgba(20, 24, 31, 0.28);
+  z-index: 130;
+}
+.mc-drawer {
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 480px;
+  max-width: 92vw;
+  background: var(--canvas, #fff);
+  border-left: 1px solid var(--hairline-strong, #e2e2e2);
+  box-shadow: -12px 0 40px rgba(0, 0, 0, 0.1);
+  z-index: 131;
+  display: flex;
+  flex-direction: column;
+  /* 0.2s 滑入（Octop Drawer 观感）；减少动效偏好下关闭 */
+  animation: mc-slide-in 0.2s ease-out;
+}
+.mc-drawer:focus { outline: none; }
+@keyframes mc-slide-in {
+  from { transform: translateX(12px); opacity: 0.6; }
+  to { transform: translateX(0); opacity: 1; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .mc-drawer { animation: none; }
+}
+.mc-dh {
+  flex: none;
+  height: 52px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 0 18px;
+  border-bottom: 1px solid var(--hairline, #eee);
+}
+.mc-dh-ico { flex: none; width: 26px; height: 26px; display: inline-flex; align-items: center; justify-content: center; }
+.mc-dh-ico .mc-logo { width: 24px; height: 24px; border-radius: 6px; }
+.mc-dh-ico .mc-ico-fallback { width: 24px; height: 24px; border-radius: 6px; font-size: 12px; }
+.mc-dh-titles { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.mc-dh h4 { margin: 0; font-size: 14.5px; font-weight: 620; color: var(--ink-strong, #252523); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mc-dh-titles .mc-status { height: 16px; padding: 0 6px; font-size: 10.5px; align-self: flex-start; }
+.mc-dh .mc-x {
+  margin-left: auto;
+  width: 28px;
+  height: 28px;
+  border: none;
+  background: none;
+  border-radius: var(--r-sm, 6px);
+  cursor: pointer;
+  color: var(--ink-tertiary, #8a93a2);
+  font-size: 17px;
+  line-height: 1;
+}
+.mc-dh .mc-x:hover { background: var(--surface-2, #eff2f8); color: var(--ink, #14181f); }
+.mc-db { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
+.mc-df {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  justify-content: flex-end;
+  padding: 12px 18px;
+  border-top: 1px solid var(--hairline, #eee);
+  background: var(--canvas, #fff);
+}
+.mc-df-left { margin-right: auto; display: inline-flex; align-items: center; gap: 8px; }
+
+.mc-frow { padding: 0 0 16px; }
+.mc-flab { font-size: 13px; color: var(--ink-subtle, #5f6875); margin-bottom: 6px; font-weight: 500; }
+.mc-inp {
+  width: 100%;
+  height: 36px;
+  padding: 0 10px;
+  border: 1px solid var(--hairline-strong, #e2e2e2);
+  border-radius: var(--r-sm, 6px);
+  background: var(--surface-1, #fff);
+  color: var(--ink, #14181f);
+  font-size: 13px;
+  outline: none;
+}
+.mc-inp:focus { border-color: var(--accent, #0f5fd4); box-shadow: 0 0 0 3px var(--accent-soft, rgba(15, 95, 212, 0.1)); }
+.mc-hint { font-size: 12px; line-height: 1.6; color: var(--ink-tertiary, #8a93a2); }
+.mc-note {
+  font-size: 12.5px;
+  line-height: 1.6;
+  color: var(--ink-subtle, #5f6875);
+  background: var(--surface-2, #eff2f8);
+  border-radius: var(--r-md, 8px);
+  padding: 10px 12px;
+  margin-bottom: 14px;
+}
+.mc-scopes { display: flex; flex-wrap: wrap; gap: 5px; margin: 2px 0 12px; }
+.mc-scope {
+  font-size: 11px;
+  padding: 2px 7px;
+  border-radius: var(--r-pill, 9999px);
+  background: var(--surface-2, #eff2f8);
+  color: var(--ink-subtle, #5f6875);
+}
+
+/* 回调地址行：等宽 + 可复制 */
+.mc-cbrow { display: flex; align-items: center; gap: 8px; }
+.mc-cburl {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  color: var(--ink, #14181f);
+  background: var(--surface-2, #eff2f8);
+  border-radius: var(--r-sm, 6px);
+  padding: 8px 10px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.mc-err {
+  font-size: 12.5px;
+  color: var(--error-dark, #8b2d2d);
+  background: var(--error-soft, rgba(198, 69, 69, 0.1));
+  border-radius: var(--r-md, 8px);
+  padding: 9px 12px;
+  margin-bottom: 12px;
+}
+/* 授权提示/状态区块（Octop authHint 视觉：13px/1.5、padding 10 12、底 #eff2f8、radius 8） */
+.mc-authhint {
+  font-size: 13px;
+  line-height: 1.5;
+  color: var(--ink-subtle, #5f6875);
+  padding: 10px 12px;
+  background: var(--surface-2, #eff2f8);
+  border-radius: 8px;
+  margin-bottom: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+/* 描述/账号/到期合并的一行说明 */
+.mc-line-hint {
+  font-size: 12.5px;
+  color: var(--ink-subtle, #5f6875);
+  margin-bottom: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.mc-doclink {
+  align-self: flex-start;
+  border: none;
+  background: none;
+  padding: 0;
+  margin: -4px 0 12px;
+  font-size: 12.5px;
+  color: var(--accent, #0f5fd4);
+  cursor: pointer;
+  text-decoration: underline;
+  text-underline-offset: 2px;
+}
+.mc-doclink:hover { color: var(--accent-hover, #0a49a8); }
+/* 需重新授权 / 失效提示 */
+.mc-warn {
+  font-size: 12.5px;
+  line-height: 1.5;
+  color: var(--warning, #c99417);
+  background: rgba(201, 148, 23, 0.09);
+  border: 1px solid rgba(201, 148, 23, 0.22);
+  border-radius: 8px;
+  padding: 9px 12px;
+  margin-bottom: 12px;
+}
+/* 「已授权，可直接探测或保存」徽标（Octop configuredBadge 等价值） */
+.mc-configured-badge {
+  font-size: 13px;
+  color: var(--success-dark, #2d6e3d);
+  background: var(--success-soft, rgba(93, 184, 114, 0.12));
+  padding: 8px 10px;
+  border-radius: 5px;
+  margin-bottom: 12px;
+}
+
+.mc-sec { margin: 4px 0 12px; font-size: 13px; font-weight: 600; color: var(--ink-strong, #252523); }
+.mc-confirmbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--error-dark, #8b2d2d);
+}

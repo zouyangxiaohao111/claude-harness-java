@@ -47,13 +47,25 @@ public class ImChatRecord {
     /** 最后一条**出站**消息时间（区分"对方说了话"与"我说了话"）。 */
     private String lastOutboundAt;
 
+    /**
+     * V335 · 机器人是否在**该会话**里（群聊的入站可达性）。
+     *
+     * <p>{@code null} = 尚未判定过 ⇒ 读侧按「可达」处理（上线首日不误隐藏旧行）。
+     * <p>权威来源：bot 身份的 {@code GET /im/v1/chats}（= 机器人作为成员的群）。
+     * p2p 与微信恒为 true —— 单聊不进群列表，微信登录账号本身就是机器人。
+     */
+    private Boolean botPresent;
+
+    /** 最近一次判定的时刻（ISO-8601）；null = 从未判定。 */
+    private String botPresentAt;
+
     private String createdAt;
     private String updatedAt;
 
     public ImChatEntry toDomain() {
         return new ImChatEntry(id, instanceId, platform, peerId, peerName, chatKind,
             memberCount, lastMessagePreview, lastMessageAt, boundSessionId, bindMode, boundAt,
-            createdAt, updatedAt, nickName);
+            createdAt, updatedAt, nickName, botPresent);
     }
 
     public static ImChatRecord fromDomain(ImChatEntry e) {
@@ -71,6 +83,7 @@ public class ImChatRecord {
         r.setBoundSessionId(e.boundSessionId());
         r.setBindMode(e.bindMode());
         r.setBoundAt(e.boundAt());
+        r.setBotPresent(e.botPresent());
         r.setCreatedAt(e.createdAt());
         r.setUpdatedAt(e.updatedAt());
         return r;
@@ -118,4 +131,8 @@ public class ImChatRecord {
     public void setSource(String source) { this.source = source; }
     public String getLastOutboundAt() { return lastOutboundAt; }
     public void setLastOutboundAt(String lastOutboundAt) { this.lastOutboundAt = lastOutboundAt; }
+    public Boolean getBotPresent() { return botPresent; }
+    public void setBotPresent(Boolean botPresent) { this.botPresent = botPresent; }
+    public String getBotPresentAt() { return botPresentAt; }
+    public void setBotPresentAt(String botPresentAt) { this.botPresentAt = botPresentAt; }
 }

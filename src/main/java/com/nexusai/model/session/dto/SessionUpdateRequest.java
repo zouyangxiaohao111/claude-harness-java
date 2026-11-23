@@ -31,7 +31,18 @@ public record SessionUpdateRequest(
      * 可选 · 左栏置顶标记（V283 列 pinned）· true = 置顶，false = 取消置顶（显式写 0），
      * null = <b>不改动</b>该列（与 bareMode / coordinatorMode 同款 PATCH 语义）。
      */
-    Boolean pinned
+    Boolean pinned,
+    /**
+     * 可选 · 会话级「已启动应用」（V337 列 enabled_apps，JSON 数组，= schema 门）· <b>四态</b>：
+     * <ul>
+     *   <li>字段缺省（Java 引用 null）= <b>不改动</b>；</li>
+     *   <li>显式 JSON {@code null}（NullNode）= <b>清除</b>（回到 defaultOpen 种子）；</li>
+     *   <li>{@code []} = 显式全不启动；</li>
+     *   <li>字符串数组 = 显式启动集（MCP server 名 / 内置 key）。</li>
+     * </ul>
+     * 其它形态 → 400。启动即持久化；schema 与执行侧 allowlist 都读本列。
+     */
+    com.fasterxml.jackson.databind.JsonNode enabledApps
 ) {
     /**
      * 七参兼容构造器 · 保留 V75 加列前的既有调用形态（{@code new SessionUpdateRequest(title, model,
@@ -41,7 +52,7 @@ public record SessionUpdateRequest(
     public SessionUpdateRequest(String title, String model, String modelName, String mainProjectId,
                                 Boolean bareMode, String permissionMode, String mainThreadAgent) {
         this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
-            null, null, null);
+            null, null, null, null);
     }
 
     /**
@@ -51,7 +62,7 @@ public record SessionUpdateRequest(
                                 Boolean bareMode, String permissionMode, String mainThreadAgent,
                                 Boolean coordinatorMode) {
         this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
-            coordinatorMode, null, null);
+            coordinatorMode, null, null, null);
     }
 
     /**
@@ -62,6 +73,17 @@ public record SessionUpdateRequest(
                                 Boolean bareMode, String permissionMode, String mainThreadAgent,
                                 Boolean coordinatorMode, Boolean kbToolsEnabled) {
         this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
-            coordinatorMode, kbToolsEnabled, null);
+            coordinatorMode, kbToolsEnabled, null, null);
+    }
+
+    /**
+     * 十参兼容构造器 · 保留加 V337 前的既有调用形态（{@code SessionCreateTool} 两处 10 参）。
+     * {@code enabledApps} 不传 = 不改动该列。
+     */
+    public SessionUpdateRequest(String title, String model, String modelName, String mainProjectId,
+                                Boolean bareMode, String permissionMode, String mainThreadAgent,
+                                Boolean coordinatorMode, Boolean kbToolsEnabled, Boolean pinned) {
+        this(title, model, modelName, mainProjectId, bareMode, permissionMode, mainThreadAgent,
+            coordinatorMode, kbToolsEnabled, pinned, null);
     }
 }

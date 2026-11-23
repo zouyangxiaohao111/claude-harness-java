@@ -4,6 +4,7 @@ import {
   cliRuntimeConfigApi,
   type CliRuntimeConfig,
   type CliRuntimeModels,
+  type CliRuntimeTestResult,
   type SubagentExternalAgent,
 } from '@/api/subagentRuntimes'
 import type { AppSettings, UpdateSettingsRequest } from '@/api/types'
@@ -385,7 +386,7 @@ export function SubagentRuntimePanel({ settings, onSaveSettings, showToast, sess
  * 必须给它一个深色承托。其余三家的图标自带配色，浅底即可。
  */
 function CliIcon({ runtime, small }: { runtime: string; small?: boolean }) {
-  const known = ['claude', 'codex', 'opencode', 'pi'].includes(runtime)
+  const known = ['claude', 'codex', 'opencode', 'pi', 'acp'].includes(runtime)
   const size = small ? 18 : 32
   if (known) {
     return (
@@ -605,12 +606,10 @@ function RuntimeConfigPanel({
     setTestMsg(null)
     try {
       const r = await cliRuntimeConfigApi.test(config.runtime)
-      setTestMsg({
-        ok: r.ok,
-        text: r.ok ? `${r.elapsedMs} 毫秒响应 ·「${r.sample ?? ''}」` : (r.error ?? '测试失败'),
-      })
+      setTestMsg(testResultMessage(r))
     } catch (e) {
-      setTestMsg({ ok: false, text: e instanceof Error ? e.message : String(e) })
+      // 请求本身失败（含「后端尚未放行该运行时」的 400）也是「失败：原因」，⛔ 不吞成空/假成功
+      setTestMsg({ ok: false, text: `失败：${e instanceof Error ? e.message : String(e)}` })
     } finally {
       setTesting(false)
     }
@@ -634,7 +633,9 @@ function RuntimeConfigPanel({
           className="cli-test-btn"
           onClick={() => void runTest()}
           disabled={testing}
-          title="发送极小的测试提示词以验证连接（会消耗一次模型调用）"
+          title={config.runtime === 'acp'
+            ? 'ACP 握手探测：启动适配器并完成 initialize（进程起来 ≠ 握手成功）'
+            : '发送极小的测试提示词以验证连接（会消耗一次模型调用）'}
         >
           {testing ? '测试中' : '测试'}
         </button>
@@ -647,6 +648,10 @@ function RuntimeConfigPanel({
       )}
 
       <div className="cli-config-body">
+        {/* 模型选择：ACP 没有通用「模型枚举」语义（后端 supportsModelList/supportsReasoning 均 false），
+            ⛔ 不显示一个点了没用的控件。判据必须是 runtime —— claude 的 supportsModelList 也是
+            false（它没有枚举子命令），但模型别名对它仍有意义，按能力位判会误伤。 */}
+        {config.runtime !== 'acp' && (
         <label className="cli-field">
           <span className="cli-field-label">
             模型
@@ -699,6 +704,7 @@ function RuntimeConfigPanel({
             />
           )}
         </label>
+        )}
 
         {/* 推理强度：只在 CLI 支持时渲染（claude 没有这个开关） */}
         {config.supportsReasoning && reasoningChoices.length > 0 && (
@@ -868,6 +874,29 @@ function RuntimeConfigPanel({
       </details>
     </div>
   )
+}
+
+/**
+ * 测试结果 → 展示文案（先看后端 probeLevel，缺省回落旧的 ok/耗时文案）。
+ *
+ * <p><b>为什么必须看 probeLevel</b>：ACP 的「进程起来了」≠「协议握手成功」。
+ * 只看 ok/退出码会把 `process_only` 说成成功 —— 用户以为配好了，实际派发必然失败。
+ */
+export function testResultMessage(r: CliRuntimeTestResult): { ok: boolean; text: string } {
+  switch (r.probeLevel) {
+    case 'acp_initialize':
+      return { ok: true, text: `ACP 握手成功 · ${r.elapsedMs} 毫秒` }
+    case 'process_only':
+      // 有进展但没结果 ⇒ 按「未成功」展示（文案把进展说清楚，⛔ 不冒充成功）
+      return { ok: false, text: '进程已起，未完成握手' }
+    case 'failed':
+      return { ok: false, text: `失败：${r.error ?? '原因未知'}` }
+    default:
+      return {
+        ok: r.ok,
+        text: r.ok ? `${r.elapsedMs} 毫秒响应 ·「${r.sample ?? ''}」` : (r.error ?? '测试失败'),
+      }
+  }
 }
 
 function reasoningHint(style: string): string {

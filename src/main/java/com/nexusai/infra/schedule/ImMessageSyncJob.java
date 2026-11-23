@@ -51,8 +51,9 @@ public class ImMessageSyncJob implements Job {
         }
         try {
             SyncSummary summary = syncService.runOnce();
-            log.info("[Quartz] ImMessageSyncJob 完成: 实例 {} / 会话 {} / 新增 {} / 失败实例 {}",
-                summary.instances(), summary.chats(), summary.newMessages(), summary.failedInstances());
+            log.info("[Quartz] ImMessageSyncJob 完成: 实例 {} / 会话 {} / 新增 {} / 跳过 {} / 失败实例 {}",
+                summary.instances(), summary.chats(), summary.newMessages(),
+                summary.skippedChats(), summary.failedInstances());
         } catch (Exception e) {
             // ⛔ 不往外抛：失败原因已经写进 im_scan_channel.last_error（用户能在界面上看到），
             //    再抛给 Quartz 只会变成一行看不懂的 Quartz 堆栈。

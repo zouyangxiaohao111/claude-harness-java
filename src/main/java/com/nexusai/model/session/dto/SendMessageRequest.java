@@ -28,16 +28,30 @@ public record SendMessageRequest(
     JsonNode jsonSchema,             // [IMP-HR-08 · OPD-WF6-01-06-?-3] 可选 · 本次调用主循环结构化输出 JSON Schema
                                      // CC original: --json-schema（main.tsx:1880-1883 + QueryEngine.ts:327-333）
                                      // null = 未指定 → 主循环不注册 structured output enforcement
-    Map<String, Object> requestExtras // 可选 · 请求级通用透传参数（本批仅骨架空转 · 不落库 · 不参与任何行为）
+    Map<String, Object> requestExtras, // 可选 · 请求级通用透传参数（本批仅骨架空转 · 不落库 · 不参与任何行为）
                                      // 供工具执行期读取本轮「用户 @ 的库/文件」等请求级范围；null = 无
                                      // （批 2 才由 kb/api/KbChatGatewayController.viaReact 写入）
+    List<String> selectedApps        // [app-selection] 本轮选中的应用 key（MCP server 名 / 内置应用 key）
+                                     // 唯一真相源：null = 未指定（不裁剪，与历史行为一致）；
+                                     // 空数组 = 显式什么都不选；非空 = allowlist（只保留这些应用的
+                                     // mcp__<key>__* 工具）。服务端按本轮计算工具可见集，不落会话列。
 ) {
-    /** 旧 9 参转发构造器（requestExtras 缺省 = null · 既有调用点零改动）。 */
+    /** 旧 10 参转发构造器（selectedApps 缺省 = null · 既有调用点零改动）。 */
+    public SendMessageRequest(String content, String modelName, Boolean useFastModel,
+                              List<AttachmentRequest> attachments, String appendSystemPrompt,
+                              String fallbackModel, String permissionMode,
+                              Boolean dangerouslySkipPermissions, JsonNode jsonSchema,
+                              Map<String, Object> requestExtras) {
+        this(content, modelName, useFastModel, attachments, appendSystemPrompt, fallbackModel,
+            permissionMode, dangerouslySkipPermissions, jsonSchema, requestExtras, null);
+    }
+
+    /** 旧 9 参转发构造器（requestExtras / selectedApps 缺省 = null · 既有调用点零改动）。 */
     public SendMessageRequest(String content, String modelName, Boolean useFastModel,
                               List<AttachmentRequest> attachments, String appendSystemPrompt,
                               String fallbackModel, String permissionMode,
                               Boolean dangerouslySkipPermissions, JsonNode jsonSchema) {
         this(content, modelName, useFastModel, attachments, appendSystemPrompt, fallbackModel,
-            permissionMode, dangerouslySkipPermissions, jsonSchema, null);
+            permissionMode, dangerouslySkipPermissions, jsonSchema, null, null);
     }
 }

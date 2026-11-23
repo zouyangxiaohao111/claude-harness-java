@@ -295,6 +295,86 @@ public class WeChatMessageIndexer {
         }
     }
 
+    /**
+     * 统计某会话在时间窗内的消息数（与 {@link #listMessages} 同口径）。
+     *
+     * @param accountWxid    账号；null/空 = 不限
+     * @param conversationId 会话（必填）
+     * @param sinceUnix      起始（含）；0 = 不限
+     * @param untilUnix      结束（含）；0 = 不限
+     */
+    public long countMessages(String accountWxid, String conversationId,
+                              long sinceUnix, long untilUnix) {
+        StringBuilder sql = new StringBuilder(
+                "SELECT COUNT(*) FROM wechat_message WHERE deleted = 0 AND conversation_id = ?");
+        List<Object> args = new ArrayList<>();
+        args.add(conversationId);
+        if (accountWxid != null && !accountWxid.isBlank()) {
+            sql.append(" AND account_wxid = ?");
+            args.add(accountWxid);
+        }
+        if (sinceUnix > 0) {
+            sql.append(" AND msg_time >= ?");
+            args.add(sinceUnix);
+        }
+        if (untilUnix > 0) {
+            sql.append(" AND msg_time <= ?");
+            args.add(untilUnix);
+        }
+        try {
+            Long n = jdbc.queryForObject(sql.toString(), Long.class, args.toArray());
+            return n == null ? 0L : n;
+        } catch (Exception e) {
+            log.warn("统计会话消息失败", e);
+            return 0L;
+        }
+    }
+
+    /**
+     * 按会话 + 时间窗列出消息（不按关键词过滤）。
+     *
+     * <p>文本列同时返回 {@code search_text} 与 {@code content_preview}：
+     * 工具层优先用 search_text（≤500，覆盖绝大多数聊天消息），preview 仅兜底。</p>
+     *
+     * @param ascending true=时间升序（按对话顺序读）；false=时间倒序
+     */
+    public List<Map<String, Object>> listMessages(String accountWxid, String conversationId,
+                                                  long sinceUnix, long untilUnix,
+                                                  int offset, int limit, boolean ascending) {
+        StringBuilder sql = new StringBuilder("""
+                SELECT account_wxid, conversation_id, sender, msg_type, msg_time,
+                       content_preview, search_text, is_self, sort_seq, server_id
+                FROM wechat_message
+                WHERE deleted = 0 AND conversation_id = ?
+                """);
+        List<Object> args = new ArrayList<>();
+        args.add(conversationId);
+        if (accountWxid != null && !accountWxid.isBlank()) {
+            sql.append(" AND account_wxid = ?");
+            args.add(accountWxid);
+        }
+        if (sinceUnix > 0) {
+            sql.append(" AND msg_time >= ?");
+            args.add(sinceUnix);
+        }
+        if (untilUnix > 0) {
+            sql.append(" AND msg_time <= ?");
+            args.add(untilUnix);
+        }
+        sql.append(ascending
+                ? " ORDER BY msg_time ASC, sort_seq ASC"
+                : " ORDER BY msg_time DESC, sort_seq DESC");
+        sql.append(" LIMIT ? OFFSET ?");
+        args.add(Math.max(1, Math.min(limit, 300)));
+        args.add(Math.max(0, offset));
+        try {
+            return jdbc.queryForList(sql.toString(), args.toArray());
+        } catch (Exception e) {
+            log.warn("列出会话消息失败", e);
+            return List.of();
+        }
+    }
+
     // ==================================================================
 
     static String preview(String content) {

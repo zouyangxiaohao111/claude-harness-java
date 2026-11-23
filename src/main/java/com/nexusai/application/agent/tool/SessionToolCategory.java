@@ -30,7 +30,7 @@ import java.util.Set;
  *       （{@code kb/agent/tool/} 下 15 个，均标 {@code @ExclusiveTool}）</li>
  *   <li>IM 工具名（{@code SendImAsUser} / {@code ListImChats} / {@code ReadImMessages} /
  *       {@code SearchImContacts} / {@code SendUserMessage} / {@code wechat_search_messages} /
- *       {@code wechat_list_conversations}）→ {@link #IM} ——
+ *       {@code wechat_list_conversations} / {@code wechat_read_conversation}）→ {@link #IM} ——
  *       通讯类能力（实现类分散在 {@code tool.impl} 与 {@code wechatlog.tool} 两个包，
  *       故按<b>工具名</b>判定，见 {@link #IM_TOOL_NAMES}）</li>
  *   <li>其余 → {@link #SYS}</li>
@@ -96,11 +96,13 @@ public class SessionToolCategory {
      * {@code SessionToolsController.CORE_ORCHESTRATION_TOOLS}（不可禁用），
      * 放进可整组关闭的 IM 会产生「点了整组关闭，SendMessage 被跳过」的错位。
      *
-     * <p>微信两个名字来自 {@code WeChatSearchMessagesTool#name()} /
-     * {@code WeChatListConversationsTool#name()}（下划线命名，与本仓新增能力风格一致）。
+     * <p>微信三个名字来自 {@code WeChatSearchMessagesTool#name()} /
+     * {@code WeChatListConversationsTool#name()} / {@code WeChatReadConversationTool#name()}
+     * （下划线命名，与本仓新增能力风格一致）。
      */
     private static final String WECHAT_SEARCH_MESSAGES_TOOL_NAME = "wechat_search_messages";
     private static final String WECHAT_LIST_CONVERSATIONS_TOOL_NAME = "wechat_list_conversations";
+    private static final String WECHAT_READ_CONVERSATION_TOOL_NAME = "wechat_read_conversation";
 
     public static final Set<String> IM_TOOL_NAMES = Set.of(
             ToolNameConstants.SEND_IM_AS_USER_TOOL_NAME,     // SendImAsUser
@@ -109,7 +111,8 @@ public class SessionToolCategory {
             ToolNameConstants.SEARCH_IM_CONTACTS_TOOL_NAME,  // SearchImContacts
             ToolNameConstants.BRIEF_TOOL_NAME,               // SendUserMessage
             WECHAT_SEARCH_MESSAGES_TOOL_NAME,                // 本机微信记录检索
-            WECHAT_LIST_CONVERSATIONS_TOOL_NAME);            // 本机微信会话列表
+            WECHAT_LIST_CONVERSATIONS_TOOL_NAME,             // 本机微信会话列表
+            WECHAT_READ_CONVERSATION_TOOL_NAME);             // 本机微信按时间段列消息
 
     /**
      * IM 组中<b>不依赖「渠道绑定到当前会话」</b>的工具（本机微信记录）。
@@ -120,7 +123,8 @@ public class SessionToolCategory {
      */
     public static final Set<String> IM_NO_BINDING_TOOL_NAMES = Set.of(
             WECHAT_SEARCH_MESSAGES_TOOL_NAME,
-            WECHAT_LIST_CONVERSATIONS_TOOL_NAME);
+            WECHAT_LIST_CONVERSATIONS_TOOL_NAME,
+            WECHAT_READ_CONVERSATION_TOOL_NAME);
 
     /** 合法分类集合（请求体校验用）。 */
     public static final Set<String> ALL = Set.of(CU, KB, BR, MCP, IM, SYS);

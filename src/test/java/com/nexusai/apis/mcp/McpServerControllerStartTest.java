@@ -9,7 +9,6 @@ import org.mockito.Mock;
 import org.mockito.junit.jupiter.MockitoExtension;
 import org.springframework.http.ResponseEntity;
 
-import java.lang.reflect.Field;
 
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.mockito.ArgumentMatchers.any;
@@ -36,10 +35,8 @@ class McpServerControllerStartTest {
 
     @BeforeEach
     void setUp() throws Exception {
-        controller = new McpServerController();
-        Field f = McpServerController.class.getDeclaredField("mcpServerService");
-        f.setAccessible(true);
-        f.set(controller, mcpServerService);
+        // [2026-11-23] 控制器改为构造注入（新增 JSON 导入/导出服务）；start 路径不用 transferService
+        controller = new McpServerController(mcpServerService, null);
         when(mcpServerService.start(any(), any())).thenReturn(null);
     }
 

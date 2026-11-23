@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.application.agent.plugin.MarketplaceHttpDownloader;
 import com.nexusai.infra.exception.BadGatewayException;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.model.connector.ConnectorConnectionInfo;
 import com.nexusai.model.market.dto.ExternalMarketDto;
 import com.nexusai.model.market.dto.ExternalPluginDto;
 import org.slf4j.Logger;
@@ -85,7 +86,12 @@ public class ExternalMarketService {
                     authorName,
                     authorVerified,
                     authorAvatarUrl,
-                    authorEmail));
+                    authorEmail,
+                    // [2026-11-23 连接器市场] connection 块：与 PluginMarketplace.Entry 同形，
+                    //   显式取键（缺失 → null），否则市场里写了界面也看不到。
+                    // [2026-11-23 市场图标] 图标 URL：显式取键（缺失 → null，前端回落首字母色块）。
+                    connectionInfo(n.get("connection")),
+                    text(n.get("icon"))));
             }
 
             // [2026-11-01 v4 · 用户拍板方案 B] 统计数字来自市场侧的 stats.json（安装/召唤时 +1）。
@@ -147,6 +153,29 @@ public class ExternalMarketService {
             return text(owner.get("name"));
         }
         return text(owner);
+    }
+
+    /** [2026-11-23] 连接器授权元数据块：显式取键；非对象/全空 → null。 */
+    private static ConnectorConnectionInfo connectionInfo(JsonNode node) {
+        if (node == null || !node.isObject()) {
+            return null;
+        }
+        ConnectorConnectionInfo info = new ConnectorConnectionInfo(
+            text(node.get("authType")),
+            strList(node.get("scopes")),
+            text(node.get("discoveryUrl")),
+            text(node.get("authorizationEndpoint")),
+            text(node.get("tokenEndpoint")),
+            text(node.get("resource")),
+            booleanOrNull(node.get("requiresManualClient")),
+            text(node.get("callbackPath")));
+        return info.authType() == null && info.discoveryUrl() == null
+            && info.authorizationEndpoint() == null && info.tokenEndpoint() == null
+            ? null : info;
+    }
+
+    private static Boolean booleanOrNull(JsonNode node) {
+        return node != null && node.isBoolean() ? node.asBoolean() : null;
     }
 
     // ────────────────────────────────────────────────────────────────────────
@@ -292,7 +321,8 @@ public class ExternalMarketService {
             out.add(new ExternalPluginDto(
                 p.name(), p.displayName(), p.description(), p.version(), p.fingerprint(), p.category(),
                 p.tags(), p.createdAt(), p.publishedAt(), use, download,
-                p.authorName(), p.authorVerified(), p.authorAvatarUrl(), p.authorEmail()));
+                p.authorName(), p.authorVerified(), p.authorAvatarUrl(), p.authorEmail(),
+                p.connection(), p.icon()));
         }
         if (log.isDebugEnabled()) {
             log.debug("[ExternalMarket] 统计合并完成：{} 个插件（其中 {} 个有使用量）",

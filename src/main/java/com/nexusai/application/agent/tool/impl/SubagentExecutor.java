@@ -2008,6 +2008,22 @@ public class SubagentExecutor {
                 externalCwd = effectiveParentTuc.effectiveCwd();
             }
 
+            // ── [ACP 运行时 2026-11-23] ACP 分叉必须在 tryResolve 之前 ──
+            // WHY：tryResolve 只认 ExternalRuntimeCatalog 的 4 个预设；runtime=acp 会命中
+            //   「未知的外部运行时」不可用分支 → 下面 :2016-2026 静默回落内置 general-purpose，
+            //   用户看到的是内置子代理在答。ACP 是 JSON-RPC 长连接，argv 模板 / streamFormat
+            //   都不适用，故独立 runner + 独立规格（AcpRuntimeSpec）。
+            if ("acp".equalsIgnoreCase(externalDef.runtime())) {
+                String acpAgentId = com.nexusai.application.agent.subagent.external.ExternalAgentRunner.newAgentId();
+                log.info("[SubagentExecutor] 走 ACP 运行时: type={} cwd={} agentId={}",
+                        effectiveType, externalCwd, acpAgentId);
+                return com.nexusai.application.agent.acp.AcpAgentRunner.run(
+                        externalDef, prompt, modelOverride, externalCwd,
+                        parentSessionId, acpAgentId,
+                        descriptionForExternal(prompt, effectiveType),
+                        effectiveParentTuc, permissionGate);
+            }
+
             // [简化口径 2026-11-04 用户] 「没有运行时会说明并采用默认的配置」：
             //   先探一次可用性；不可用就**回落内置 general-purpose**，并把原因写进日志。
             //   ⛔ 不在这里直接失败 —— 用户选了默认运行时但本机没装，不该让整个任务挂掉。

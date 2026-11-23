@@ -224,7 +224,11 @@ public class ToolSearchTool implements Tool {
                 ctx != null ? ctx.sessionId() : null,
                 ctx != null ? ctx.requestExtras() : null,
                 ctx != null && ctx.isNonInteractiveSession());
-        if (!visibility.disabled().isEmpty() || visibility.askExcluded()) {
+        // [app-layer] hasMcpAllowlist 时即使 disabled 为空也必须过滤：否则「只设了应用选择、
+        //   没有任何 disabled」的轮次里，候选池仍是全量 —— 模型可 select 出未选应用的工具，
+        //   tool_reference 进历史后下一轮 400（与该文件上方注释同一失效模式）。
+        if (!visibility.disabled().isEmpty() || visibility.askExcluded()
+                || visibility.hasMcpAllowlist()) {
             allTools = allTools.stream()
                     .filter(t -> t != null && !visibility.blocks(t.name()))
                     .filter(t -> !visibility.askExcluded()
@@ -235,8 +239,16 @@ public class ToolSearchTool implements Tool {
         if (allTools.isEmpty() && log.isDebugEnabled()) {
             log.debug("[ToolSearchTool] ctx 无可用工具（单参 execute 路径）→ select/fast-path 降级（CC 依赖 options.tools 全集）");
         }
+        // [app-selection] 本轮选中的应用工具视为 alwaysLoad（豁免 MCP 恒 defer）——
+        //   与 schema 侧（LlmAgentLoop.llmToolsArray）同一覆盖集，避免「schema 直发、这里仍当 defer」分叉。
+        java.util.Set<String> alwaysLoadNames = visibility.hasMcpAllowlist()
+                ? allTools.stream()
+                    .filter(t -> t != null && t.isMcp())
+                    .map(Tool::name)
+                    .collect(java.util.stream.Collectors.toSet())
+                : java.util.Set.of();
         List<Tool> deferredTools = allTools.stream()
-                .filter(ToolSearchTool::isDeferredTool)
+                .filter(t -> ToolSearchService.isDeferredTool(t, null, alwaysLoadNames))
                 .collect(Collectors.toList());
         maybeInvalidateCache(deferredTools);
 
@@ -631,15 +643,6 @@ public class ToolSearchTool implements Tool {
     // ═══════════════════════════════════════════════════════════════════════
     // 私有辅助（deferred / pending MCP / analytics / getPrompt）
     // ═══════════════════════════════════════════════════════════════════════
-
-    /**
-     * 是否 deferred 工具 · 委托共享服务 {@link ToolSearchService#isDeferredTool(Tool, JsonNode)}
-     * （对齐 CC isDeferredTool prompt.ts:62-108 全 7 规则，FORK/KAIROS 分支 N/A 登记）。
-     * <p>检索场景无调用输入 → input 传 null（Java shouldDefer(null) 语义与既有实现一致）。
-     */
-    private static boolean isDeferredTool(Tool tool) {
-        return ToolSearchService.isDeferredTool(tool, null);
-    }
 
     /**
      * pending MCP 服务器名 · 对齐 CC getPendingServerNames（ToolSearchTool.ts:335-339，

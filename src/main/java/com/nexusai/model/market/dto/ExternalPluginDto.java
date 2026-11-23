@@ -1,5 +1,7 @@
 package com.nexusai.model.market.dto;
 
+import com.nexusai.model.connector.ConnectorConnectionInfo;
+
 import java.util.List;
 
 /**
@@ -33,6 +35,13 @@ import java.util.List;
  * @param authorVerified 是否认证发布者（缺省 false）
  * @param authorAvatarUrl 开发者头像 URL（可选 · null → 前端用首字母色块）
  * @param authorEmail    开发者邮箱（可选 · 详情页「关于开发者」展示）
+ * @param connection     连接器授权元数据（仅 category=connector 的条目有 · 缺省 null）。
+ *                       [2026-11-23 Octop 连接器市场] 与 {@code PluginMarketplace.Entry.connection}
+ *                       同形；三处逐键解析（Entry / 本服务的 read / MarketPublishService 的 write）
+ *                       必须同步，否则「市场里写了、界面永远看不到」。
+ * @param icon           技能/专家图标 URL（可选 · null → 前端回落名字首字母色块）。
+ *                       [2026-11-23 市场图标] 与 {@code PluginMarketplace.Entry.icon} /
+ *                       {@code MarketPublishService.PublishRequest.icon} 三处同键。
  */
 public record ExternalPluginDto(
         String name,
@@ -49,7 +58,10 @@ public record ExternalPluginDto(
         String authorName,
         Boolean authorVerified,
         String authorAvatarUrl,
-        String authorEmail
+        String authorEmail,
+        ConnectorConnectionInfo connection,
+        /** 图标 URL（可选 · null → 前端首字母色块回落）。 */
+        String icon
 ) {
 
     /**

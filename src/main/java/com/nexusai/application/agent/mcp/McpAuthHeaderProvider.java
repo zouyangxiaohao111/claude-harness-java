@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.mcp;
 
 import com.nexusai.application.agent.api.OAuth401Refresher;
+import com.nexusai.domain.connector.ConnectorTokenProvider;
 import com.nexusai.domain.mcp_oauth.McpOAuthTokenService;
 import com.nexusai.model.mcp_oauth.McpOAuthToken;
 import java.util.Arrays;
@@ -12,6 +13,7 @@ import java.util.concurrent.ConcurrentHashMap;
 import java.util.function.Consumer;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.stereotype.Component;
 
 /**
@@ -60,11 +62,26 @@ public class McpAuthHeaderProvider {
 
     private final McpOAuthTokenService tokenStore;
     private final McpAuth mcpAuth;
+    /**
+     * [2026-11-23 连接器市场] 加密凭据源（connector_credentials）。
+     *
+     * <p>优先级：连接器记录存在且接管 → 用它（即使无 token 也不回退，直接 401 语义）；
+     * 否则回退既有 {@code mcp_oauth_tokens}。null = 未装配（测试/旧装配）→ 纯旧路径。
+     */
+    private final ConnectorTokenProvider connectorTokenProvider;
     /** per-server OAuth401Refresher（key=serverKey）：TokenStore/TokenRefresher 绑定该 server。 */
     private final Map<String, OAuth401Refresher> refreshers = new ConcurrentHashMap<>();
 
+    /** 旧 1 参构造（测试/旧装配）：无连接器凭据源，行为与改造前一致。 */
     public McpAuthHeaderProvider(McpOAuthTokenService tokenStore) {
+        this(tokenStore, null);
+    }
+
+    @Autowired
+    public McpAuthHeaderProvider(McpOAuthTokenService tokenStore,
+                                 ConnectorTokenProvider connectorTokenProvider) {
         this.tokenStore = Objects.requireNonNull(tokenStore, "tokenStore is required");
+        this.connectorTokenProvider = connectorTokenProvider;
         // McpAuth 自建：DB tokenStore + 真实 OAuthHttpClient（refresh/performMCPOAuthFlow 共用）
         // + LoopbackCallbackHandler（[S5] transport 按需触发 OAuth 流时 loopback 回调完成授权码）。
         this.mcpAuth = new McpAuth(null, new DefaultOAuthHttpClient(),
@@ -178,6 +195,19 @@ public class McpAuthHeaderProvider {
         if (config == null || config.serverName() == null) {
             return null;
         }
+        // [2026-11-23 连接器市场] 连接器凭据优先：命中即接管，不复用 mcp_oauth_tokens 的旧 token。
+        // 接管但无可用 token（过期且刷新失败）→ 返回 null，传输层不发 Authorization → 401 → reauth 提示。
+        if (connectorTokenProvider != null) {
+            ConnectorTokenProvider.Result cr = connectorTokenProvider.resolve(config.serverName());
+            if (cr != null && cr.connectorManaged()) {
+                if (cr.usable()) {
+                    return cr.accessToken();
+                }
+                log.info("[McpAuthHeaderProvider] 连接器凭据不可用（{}），不回退旧源 server={}",
+                    cr.status(), config.serverName());
+                return null;
+            }
+        }
         String serverKey = serverKey(config);
         McpOAuthToken token = tokenStore.read(serverKey);
         if (token == null || token.getAccessToken() == null || token.getAccessToken().isBlank()) {
@@ -236,6 +266,17 @@ public class McpAuthHeaderProvider {
         if (config == null || config.serverName() == null || failedAccessToken == null) {
             return null;
         }
+        // [2026-11-23 连接器市场] 401 时连接器优先：先 resolve（可能顺带因过期刷新），
+        // 若 token 仍是刚被拒的那个 → 强制刷新一次；失败标记 reauth_required 并返回 null。
+        if (connectorTokenProvider != null) {
+            ConnectorTokenProvider.Result cr = connectorTokenProvider.resolve(config.serverName());
+            if (cr != null && cr.connectorManaged()) {
+                if (cr.usable() && !failedAccessToken.equals(cr.accessToken())) {
+                    return cr.accessToken();
+                }
+                return connectorTokenProvider.forceRefresh(config.serverName());
+            }
+        }
         String serverKey = serverKey(config);
         // [OAuth-R1] step-up pending 时跳过刷新 —— RFC 6749 §6 禁止 refresh 提升 scope，刷新
         // 只会返回同 scope token 仍被拒（CC authInternal 因 tokens() 省略 refresh_token 而直接
@@ -285,11 +326,10 @@ public class McpAuthHeaderProvider {
             return new McpAuth.AuthResult(false, null,
                 "config missing for OAuth flow", McpAuth.MCPOAuthFlowErrorReason.UNKNOWN);
         }
-        McpAuth.OAuthServerConfig oauthCfg = new McpAuth.OAuthServerConfig(
-            config.type(), config.command(),
-            // env 可能含 __mcp_oauth__ 镜像保留键 → 按 headers 语义剥除（否则保留键被当 HTTP 头发送）
-            McpOAuth.headersOnly(config.env()),
-            null, null, null);
+        // [2026-11-23] 从 env 镜像读回 OAuth 配置（clientId/callbackPort/metadataUrl/scopes/端点），
+        // 不再传 null —— 否则面板上填的 OAuth 配置对真实授权流不生效（对比报告 ③-1）。
+        McpAuth.OAuthServerConfig oauthCfg = McpOAuth.oauthServerConfig(
+            config.type(), config.command(), config.env());
         if (log.isDebugEnabled()) {
             log.debug("[McpAuthHeaderProvider] 触发 OAuth 流 serverName={} type={}",
                 config.serverName(), config.type());

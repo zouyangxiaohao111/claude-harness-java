@@ -65,6 +65,122 @@ public class ImChatService {
         return mapper.selectListByInstanceId(instanceId).stream().map(ImChatRecord::toDomain).toList();
     }
 
+    /**
+     * 列表默认视图（V335）：只显示「现在能发」的会话。
+     *
+     * <p>规则（已接线的一律保留 —— 否则用户没法解绑）：
+     * <ul>
+     *   <li>飞书群：机器人不在群（{@code bot_present == false}）⇒ 隐藏；</li>
+     *   <li>微信群聊：iLink 没有群发通道 ⇒ 隐藏；</li>
+     *   <li>微信单聊：还没有可用 {@code context_token}（未激活）⇒ 隐藏；</li>
+     *   <li>其余（飞书 p2p / 企微等）⇒ 显示。</li>
+     * </ul>
+     */
+    public List<ImChatEntry> listVisible() {
+        java.util.Set<String> activated = activatedChatIds();
+        return list().stream().filter(c -> visible(c, activated)).toList();
+    }
+
+    /** 某实例下「现在能发」的会话（快速绑定挑默认会话用）。 */
+    public List<ImChatEntry> listByInstanceVisible(String instanceId) {
+        java.util.Set<String> activated = activatedChatIds();
+        return listByInstance(instanceId).stream().filter(c -> visible(c, activated)).toList();
+    }
+
+    /** 默认可见判据（见 {@link #listVisible()} 的规则）。 */
+    private boolean visible(ImChatEntry c, java.util.Set<String> activatedIds) {
+        if (c == null) {
+            return false;
+        }
+        if (c.bound()) {
+            return true;   // 已接线：保留解绑入口，不可达/不可发的事实由 UI 标出
+        }
+        if (c.botPresent() != null && !c.botPresent()) {
+            return false;
+        }
+        if ("wechat".equalsIgnoreCase(c.platform())) {
+            if ("group".equalsIgnoreCase(c.chatKind())) {
+                return false;   // 微信 iLink 无群发通道（平台限制，不是配置问题）
+            }
+            return activatedIds.contains(c.id());
+        }
+        return true;
+    }
+
+    /** 当前已具备主动发条件的聊天 id（微信 = 有未过期的 context_token）。 */
+    private java.util.Set<String> activatedChatIds() {
+        java.util.Set<String> activated = new java.util.HashSet<>();
+        try {
+            List<ImChatRecord> rows = mapper.selectListWithReplyToken();
+            if (rows == null) {
+                return activated;
+            }
+            for (ImChatRecord r : rows) {
+                if (r == null || r.getId() == null || r.getId().isBlank()) {
+                    continue;
+                }
+                String exp = r.getReplyTokenExpiresAt();
+                // 与 replyTokenOf 同口径：过期 ⇒ 视为没有
+                if (exp == null || exp.isBlank() || !expired(exp)) {
+                    activated.add(r.getId());
+                }
+            }
+        } catch (RuntimeException e) {
+            log.warn("[ImChatService] 批量查回复令牌失败（本次不给激活提示）: {}", e.toString());
+            return java.util.Set.of();
+        }
+        return activated;
+    }
+
+    /**
+     * V335 · 回写「机器人是否在群」（由扫描刷新目录时调用）。
+     *
+     * <p>为什么放在扫描层：{@code ImMessageSyncService.refreshChatDirectory} 每轮已经
+     * 按实例拉了平台目录（飞书 = bot 的 {@code im/v1/chats}，企微 = aibot sessions + groups），
+     * 拿到的 peer 集合就是「机器人可见的会话」的权威事实 —— 不必再多打一轮接口。
+     *
+     * <p>规则：
+     * <ul>
+     *   <li>{@code p2p} / 微信 ⇒ 恒 true（单聊不进 bot 群列表；微信登录账号即机器人）；</li>
+     *   <li>其余群聊 ⇒ {@code peerId ∈ presentPeerIds}；</li>
+     *   <li>平台本轮失败 / 空集合 ⇒ 调用方<b>不该</b>调用本方法（保持原值，防网络抖动误隐藏）。</li>
+     * </ul>
+     *
+     * @return 实际发生变化的行数（未变化的行不写，避免每 5 分钟刷一轮 updated_at）
+     */
+    public int markBotPresence(String instanceId, java.util.Set<String> presentPeerIds) {
+        if (instanceId == null || instanceId.isBlank()) {
+            return 0;
+        }
+        java.util.Set<String> present = presentPeerIds == null ? java.util.Set.of() : presentPeerIds;
+        List<ImChatRecord> rows = mapper.selectListByInstanceId(instanceId);
+        if (rows == null || rows.isEmpty()) {
+            return 0;
+        }
+        String at = now();
+        int changed = 0;
+        for (ImChatRecord r : rows) {
+            boolean reachable = "p2p".equalsIgnoreCase(r.getChatKind())
+                || "wechat".equalsIgnoreCase(r.getPlatform())
+                || (r.getPeerId() != null && present.contains(r.getPeerId()));
+            Boolean old = r.getBotPresent();
+            if (old != null && old == reachable) {
+                continue;
+            }
+            UpdateChain.of(ImChatRecord.class)
+                .set(ImChatRecord::getBotPresent, reachable)
+                .set(ImChatRecord::getBotPresentAt, at)
+                .where(ImChatRecord::getId).eq(r.getId())
+                .update();
+            changed++;
+        }
+        if (changed > 0 && log.isInfoEnabled()) {
+            log.info("[ImChatService] 机器人可达性回写: instance={} 变化 {} 行 / 共 {} 行",
+                instanceId, changed, rows.size());
+        }
+        return changed;
+    }
+
     public Optional<ImChatEntry> findById(String id) {
         if (id == null || id.isBlank()) return Optional.empty();
         ImChatRecord r = mapper.selectOneById(id);
@@ -153,6 +269,12 @@ public class ImChatService {
             if (existing.getSource() == null || existing.getSource().isBlank()) {
                 existing.setSource(source == null ? SOURCE_INBOUND : source);
             }
+            // [V335] 入站消息 = 机器人确实在这个会话里 ⇒ 推翻此前「不在群」的判定
+            //   （典型：机器人后来被拉回群，第一条消息就该让它重新可见）
+            if (SOURCE_INBOUND.equals(source)) {
+                existing.setBotPresent(true);
+                existing.setBotPresentAt(now());
+            }
             existing.setUpdatedAt(now());
             mapper.update(existing);
             return existing.toDomain();
@@ -171,6 +293,11 @@ public class ImChatService {
         r.setLastMessagePreview(lastPreview);
         r.setLastMessageAt(lastAt != null ? lastAt : now());
         r.setSource(source == null || source.isBlank() ? SOURCE_INBOUND : source);
+        // [V335] 入站新建 = 机器人已在会话里（扫描/列表来源则留给 markBotPresence 判定）
+        if (SOURCE_INBOUND.equals(r.getSource())) {
+            r.setBotPresent(true);
+            r.setBotPresentAt(now());
+        }
         r.setCreatedAt(now());
         r.setUpdatedAt(now());
         mapper.insert(r);
@@ -271,24 +398,17 @@ public class ImChatService {
      * @return 与 {@link #list()} 同序的状态列表
      */
     public List<ImChatActivation> listActivations() {
-        java.util.Set<String> activated = new java.util.HashSet<>();
+        java.util.Set<String> activated = activatedChatIds();
+        List<ImChatEntry> all;
         try {
-            for (ImChatRecord r : mapper.selectListWithReplyToken()) {
-                if (r == null || r.getId() == null || r.getId().isBlank()) {
-                    continue;
-                }
-                String exp = r.getReplyTokenExpiresAt();
-                // 与 replyTokenOf 同口径：过期 ⇒ 视为没有
-                if (exp == null || exp.isBlank() || !expired(exp)) {
-                    activated.add(r.getId());
-                }
-            }
+            all = list();
         } catch (RuntimeException e) {
-            log.warn("[ImChatService] 批量查回复令牌失败（本次不给激活提示）: {}", e.toString());
+            // 查询异常 ⇒ 空列表（宁可不提示，也不误标全员未激活）——保持原契约
+            log.warn("[ImChatService] 读聊天目录失败（本次不给激活提示）: {}", e.toString());
             return List.of();
         }
         List<ImChatActivation> out = new java.util.ArrayList<>();
-        for (ImChatEntry c : list()) {
+        for (ImChatEntry c : all) {
             boolean required = "wechat".equals(c.platform());
             boolean ok = activated.contains(c.id());
             out.add(new ImChatActivation(c.id(), c.platform(), c.instanceId(),

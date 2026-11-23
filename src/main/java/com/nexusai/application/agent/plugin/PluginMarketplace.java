@@ -4,6 +4,7 @@ import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
 import com.fasterxml.jackson.annotation.JsonInclude;
 import com.fasterxml.jackson.annotation.JsonProperty;
 import com.fasterxml.jackson.databind.JsonNode;
+import com.nexusai.model.connector.ConnectorConnectionInfo;
 
 import java.util.List;
 
@@ -37,12 +38,32 @@ public final class PluginMarketplace {
         @JsonProperty("tags") List<String> tags,
         @JsonProperty("strict") Boolean strict,
         @JsonProperty("version") String version,
-        @JsonProperty("dependencies") List<String> dependencies) {
+        @JsonProperty("dependencies") List<String> dependencies,
+        // [2026-11-23 连接器市场] 连接器授权元数据（仅 category=connector 条目有）。
+        //   声明在 record 上才不会因 ignoreUnknown 静默丢弃；与 ExternalMarketService /
+        //   MarketPublishService 的 connection 块同形。
+        @JsonProperty("connection") ConnectorConnectionInfo connection,
+        // [2026-11-23 市场图标] 技能/专家图标 URL（仅 category=skill/expert 条目有）。
+        //   与 ExternalMarketService 的读取 / MarketPublishService 的写入同键。
+        @JsonProperty("icon") String icon) {
 
         public Entry {
             if (name == null || name.isBlank()) {
                 throw new IllegalArgumentException("PluginMarketplaceEntry.name 不能为空");
             }
+        }
+
+        /** 既有 8 参构造（无 icon）· 供既有调用方/测试保持源码兼容。 */
+        public Entry(String name, JsonNode source, String category, List<String> tags,
+                     Boolean strict, String version, List<String> dependencies,
+                     ConnectorConnectionInfo connection) {
+            this(name, source, category, tags, strict, version, dependencies, connection, null);
+        }
+
+        /** 既有 7 参构造（无 connection/icon）· 供既有调用方/测试保持源码兼容。 */
+        public Entry(String name, JsonNode source, String category, List<String> tags,
+                     Boolean strict, String version, List<String> dependencies) {
+            this(name, source, category, tags, strict, version, dependencies, null, null);
         }
     }
 

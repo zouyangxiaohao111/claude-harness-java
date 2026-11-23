@@ -101,6 +101,12 @@ public class HttpMcpTransport implements McpTransport {
      */
     private final McpAuthHeaderProvider authHeaderProvider;
 
+    /**
+     * [2026-11-23] 连接器/管理页配置的自定义请求头（env 承载；如 X-Lark-MCP-UAT /
+     * X-Tencent-Meeting-Token / x-api-key）。Bearer 头仍由 authHeaderProvider 管。
+     */
+    private volatile Map<String, String> customHeaders = Map.of();
+
     public HttpMcpTransport() {
         this(null);
     }
@@ -123,6 +129,7 @@ public class HttpMcpTransport implements McpTransport {
         this.serverName = config == null ? null : config.serverName();
         // [S2] 保存完整 config 供 McpAuthHeaderProvider 计算 serverKey（Bearer 注入）
         this.config = config;
+        this.customHeaders = config == null ? Map.of() : McpOAuth.headersOnly(config.env());
         // Streamable HTTP transport 用 command 字段作 URL
         String url = config == null || config.command() == null ? null : config.command();
         if (url == null || (!url.startsWith("http://") && !url.startsWith("https://"))) {
@@ -185,6 +192,7 @@ public class HttpMcpTransport implements McpTransport {
             if (bearerToken != null) {
                 builder.header("Authorization", "Bearer " + bearerToken);
             }
+            applyCustomHeaders(builder);
             HttpRequest req = builder
                 .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(rpc), StandardCharsets.UTF_8))
                 .build();
@@ -355,6 +363,25 @@ public class HttpMcpTransport implements McpTransport {
         }
     }
 
+    /** 注入自定义请求头（跳过传输层自管的 Authorization/Content-Type/Accept/Mcp-Session-Id）。 */
+    private void applyCustomHeaders(HttpRequest.Builder builder) {
+        Map<String, String> headers = customHeaders;
+        if (headers == null || headers.isEmpty()) {
+            return;
+        }
+        headers.forEach((k, v) -> {
+            if (k == null || k.isBlank() || v == null) {
+                return;
+            }
+            String lower = k.toLowerCase(java.util.Locale.ROOT);
+            if (lower.equals("authorization") || lower.equals("content-type")
+                    || lower.equals("accept") || lower.equals("mcp-session-id")) {
+                return;
+            }
+            builder.setHeader(k, v);
+        });
+    }
+
     /** [S2] 当前 Bearer token 解析（无 provider / 无 config → null）。 */
     private String resolveBearer() {
         if (authHeaderProvider == null || config == null) {
@@ -453,6 +480,7 @@ public class HttpMcpTransport implements McpTransport {
         if (bearerToken != null) {
             builder.header("Authorization", "Bearer " + bearerToken);
         }
+        applyCustomHeaders(builder);
         HttpRequest req = builder
             .POST(HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(rpc), StandardCharsets.UTF_8))
             .build();

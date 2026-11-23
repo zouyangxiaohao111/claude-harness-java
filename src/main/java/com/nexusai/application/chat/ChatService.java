@@ -1237,8 +1237,10 @@ public class ChatService {
                 req != null ? req.jsonSchema() : null,           // [IMP-HR-08 · OPD-WF6-01-06-?-3] 主循环 structured output jsonSchema 透传（HTTP 请求体 → RunRequest.jsonSchema → LlmAgentLoop 注册 enforcement）
                 attachments)                                     // [A1 · attachment-multimodal] 附件列表透传（image content block / 多模态工具路由）
                 // [request-extras 批 1] 请求级通用透传（HTTP 请求体 → RunRequest.requestExtras → base TUC → per-turn TUC → 工具）。
-                //   本批骨架空转：KbChatGatewayController 尚未写入 ⇒ 主会话恒 null ⇒ withRequestExtras 短路返回同一实例。
-                .withRequestExtras(req != null ? req.requestExtras() : null));
+                //   [app-selection] 本轮 selectedApps 并入同一 map（工具层 allowlist + 尾部通知同源读取）。
+                .withRequestExtras(withSelectedApps(
+                    req != null ? req.requestExtras() : null,
+                    req != null ? req.selectedApps() : null)));
         } catch (Throwable e) {
             // [catch-throwable] 原 catch (Exception)：任务体抛 Error（OOM/StackOverflow/NoClassDefFound…）
             //   会整条漏出去 —— 既不推 message.error 也不推 status=idle ⇒ 前端停止键永驻、
@@ -3116,6 +3118,36 @@ public class ChatService {
             throw new ValidationException(
                 "Fallback model cannot be the same as the main model. Please specify a different model for --fallback-model.");
         }
+    }
+
+    /**
+     * [app-selection] 把本轮 {@code selectedApps} 并入 requestExtras（base TUC → per-turn TUC → 工具层）。
+     *
+     * <p>语义：null ⇒ 未指定（原样返回，零行为变化）；非 null（含空列表）⇒ 写入
+     * {@link com.nexusai.application.agent.tool.SessionToolVisibility#SELECTED_APPS_KEY}。
+     * 空列表是有效值（显式什么都不选），不能被当成 null 丢掉。
+     *
+     * @param extras       原 requestExtras（可 null）
+     * @param selectedApps 本轮选中应用（MCP server 名 / 内置 key；可 null）
+     * @return 合并后的不可变 map（无变化时返回原引用）
+     */
+    static java.util.Map<String, Object> withSelectedApps(java.util.Map<String, Object> extras,
+                                                         java.util.List<String> selectedApps) {
+        if (selectedApps == null) {
+            return extras;
+        }
+        java.util.Map<String, Object> out = new java.util.LinkedHashMap<>();
+        if (extras != null) {
+            out.putAll(extras);
+        }
+        java.util.List<String> normalized = selectedApps.stream()
+            .filter(java.util.Objects::nonNull)
+            .map(String::trim)
+            .filter(s -> !s.isEmpty())
+            .toList();
+        out.put(com.nexusai.application.agent.tool.SessionToolVisibility.SELECTED_APPS_KEY,
+            java.util.List.copyOf(normalized));
+        return java.util.Map.copyOf(out);
     }
 
     /**

@@ -262,10 +262,24 @@ public final class McpAuth {
         /** CC serverConfig.oauth?.clientId — 预配置客户端 ID */
         String clientId,
         /** CC serverConfig.oauth?.authServerMetadataUrl — 直接 RFC 8414 metadata 文档 URL */
-        String authServerMetadataUrl) {
+        String authServerMetadataUrl,
+        /** [2026-11-23] 显式 scope（空格分隔；优先于 step-up/metadata） */
+        String scopes,
+        /** [2026-11-23] 显式授权端点（与 tokenEndpoint 同时给出时跳过 discovery） */
+        String authorizationEndpoint,
+        /** [2026-11-23] 显式 token 端点 */
+        String tokenEndpoint) {
 
         public OAuthServerConfig {
             headers = headers == null ? Map.of() : headers;
+        }
+
+        /** 旧 6 参构造（既有调用方/测试）：新增 3 字段缺省 null。 */
+        public OAuthServerConfig(String type, String url, Map<String, String> headers,
+                                 String configuredCallbackPort, String clientId,
+                                 String authServerMetadataUrl) {
+            this(type, url, headers, configuredCallbackPort, clientId, authServerMetadataUrl,
+                    null, null, null);
         }
 
         public static OAuthServerConfig of(String type, String url) {
@@ -1102,8 +1116,11 @@ public final class McpAuth {
             log.debug("[McpAuth] 复用 step-up scope serverKey={} stepUpScope={}", serverKey, cachedStepUpScope);
         }
 
-        // CC: clearServerTokensFromLocalStorage 清除旧凭据保证全新注册（auth.ts:916）
-        clearServerTokens(serverKey);
+        // [2026-11-23] 只清 token 字段（不删整行/client）：预注册的 clientId/clientSecret
+        // 必须跨授权流程保留，否则「面板填了 clientId 仍永远走 DCR」（对比报告 ③-2）。
+        // CC 的 clearServerTokensFromLocalStorage 是整条清，但 CC 的预配置 clientId 在
+        // serverConfig.oauth 里另有来源；本仓 clientId 只落 mcp_oauth_tokens ⇒ 不能整行删。
+        invalidateCredentials(serverKey, "tokens");
 
         try {
             // ③端口分配：配置回调端口优先，否则 findAvailablePort（CC auth.ts:959-962）
@@ -1113,8 +1130,9 @@ public final class McpAuth {
                 log.debug("[McpAuth] 回调端口 port={} redirectUri={}", port, redirectUri);
             }
 
-            // 发现 AS metadata（authorization_endpoint/token_endpoint）
-            AuthServerMetadata metadata = discoverAuthServer(config.url(), config.authServerMetadataUrl());
+            // 发现 AS metadata（authorization_endpoint/token_endpoint）；
+            // 显式端点优先，跳过 discovery（[2026-11-23] Octop 表单的 authz/token endpoint）
+            AuthServerMetadata metadata = resolveFlowMetadata(config);
             if (metadata == null) {
                 // [OAuth-R4] 对齐 CC：顶层 fetchAuthServerMetadata 发现失败是 best-effort
                 // （auth.ts:978-999 try/catch 后继续）；Java 侧无 SDK 二次发现，等价降级 =
@@ -1163,9 +1181,11 @@ public final class McpAuth {
             //   经 SDK clientMetadata 落入授权 URL）。首次授权无 step-up 缓存 → 回退
             //   metadata.scope()（getScopeFromMetadata 产物：scope/default_scope/scopes_supported。
             //   scope 为空时 buildAuthorizationUrl 自动省略该参数）。
-            String authUrlScope = (cachedStepUpScope != null && !cachedStepUpScope.isBlank())
-                ? cachedStepUpScope
-                : metadata.scope();
+            // [2026-11-23] 优先级：oauth.scopes（显式配置）→ step-up（更高权限重授权）→ metadata。
+            String authUrlScope = (config.scopes() != null && !config.scopes().isBlank())
+                ? config.scopes()
+                : ((cachedStepUpScope != null && !cachedStepUpScope.isBlank())
+                    ? cachedStepUpScope : metadata.scope());
             if (log.isDebugEnabled()) {
                 log.debug("[McpAuth] 授权 URL scope 解析 authUrlScope={} stepUpScope={} metadataScope={}",
                     authUrlScope, cachedStepUpScope, metadata.scope());
@@ -1238,6 +1258,20 @@ public final class McpAuth {
         } catch (IllegalArgumentException e) {
             return true;
         }
+    }
+
+    /**
+     * 授权的 AS metadata 来源（[2026-11-23]）：显式授权+令牌端点优先（不发发现请求），
+     * 否则走 RFC 9728→8414 发现。包可见以便测试直接断言「显式端点不触发 discovery」。
+     */
+    AuthServerMetadata resolveFlowMetadata(OAuthServerConfig config) {
+        if (config.authorizationEndpoint() != null && !config.authorizationEndpoint().isBlank()
+                && config.tokenEndpoint() != null && !config.tokenEndpoint().isBlank()) {
+            String scope = config.scopes() == null || config.scopes().isBlank() ? null : config.scopes();
+            return new AuthServerMetadata(
+                config.authorizationEndpoint(), config.tokenEndpoint(), null, null, scope);
+        }
+        return discoverAuthServer(config.url(), config.authServerMetadataUrl());
     }
 
     /** 配置回调端口解析：CC serverConfig.oauth?.callbackPort（空/非法 → findAvailablePort）。 */

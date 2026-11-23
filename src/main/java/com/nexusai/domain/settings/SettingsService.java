@@ -306,12 +306,16 @@ public class SettingsService {
             if (rt.isEmpty()) {
                 s.setSubagentDefaultRuntime(null);   // 显式清空 = 回到「全内置」
                 clearSubagentDefaultRuntime = true;
-            } else if (com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.find(rt) == null) {
+            } else if (com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.find(rt) == null
+                    && !com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME.equalsIgnoreCase(rt)) {
+                // ACP 是独立运行时（不进 ExternalRuntimeCatalog.PRESETS）⇒ 单点放行；
+                // 其余未知 runtime 仍 400。
                 throw new ValidationException("未知的外部运行时 '" + rt + "'，可选："
                         + com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.presets()
                                 .stream()
                                 .map(com.nexusai.application.agent.subagent.external.ExternalRuntimeCatalog.RuntimePreset::runtime)
-                                .collect(java.util.stream.Collectors.joining(", ")));
+                                .collect(java.util.stream.Collectors.joining(", "))
+                        + "、" + com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME);
             } else {
                 s.setSubagentDefaultRuntime(rt);
             }

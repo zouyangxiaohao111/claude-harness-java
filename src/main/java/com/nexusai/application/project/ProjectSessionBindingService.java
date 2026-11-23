@@ -183,7 +183,9 @@ public class ProjectSessionBindingService {
             // [V283] 左栏置顶标记（0/1 → Boolean，null = 未设置）
             s.getPinned() != null ? s.getPinned() != 0 : null,
             // [session-create V328] 派生来源会话 id（null = 用户自建；前端左栏「派生」标记）
-            s.getDerivedFromSessionId()
+            s.getDerivedFromSessionId(),
+            // [app-layer V337] 已启动应用（三态；复用 SessionService 单点解析）
+            SessionService.parseEnabledApps(s.getEnabledApps())
         );
     }
 

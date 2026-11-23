@@ -65,7 +65,7 @@ class ImChatQuickBindTest {
         ImInstanceIdentityService identityService = mock(ImInstanceIdentityService.class);
         ImChatEntry oc = chat("c-oc", "oc_6ac6", "p2p", "2026-11-22 10:00:00");
         ImChatEntry ou = chat("c-ou", "ou_9be7", "p2p", "2026-11-22 12:00:00");
-        when(chatService.listByInstance("imc-1")).thenReturn(List.of(ou, oc));
+        when(chatService.listByInstanceVisible("imc-1")).thenReturn(List.of(ou, oc));
         when(chatService.bind(eq("c-oc"), eq("sess-1"), eq("manual")))
                 .thenReturn(new ImChatEntry("c-oc", "imc-1", "feishu", "oc_6ac6", null, "p2p",
                         null, null, null, "sess-1", "manual", "t", "t", "t"));
@@ -84,7 +84,7 @@ class ImChatQuickBindTest {
         ImChatService chatService = mock(ImChatService.class);
         ImChannelService channelService = mock(ImChannelService.class);
         ImInstanceIdentityService identityService = mock(ImInstanceIdentityService.class);
-        when(chatService.listByInstance("imc-1")).thenReturn(List.of());
+        when(chatService.listByInstanceVisible("imc-1")).thenReturn(List.of());
         when(channelService.findById("imc-1")).thenReturn(Optional.of(inst("wecom")));
         when(identityService.resolve("imc-1")).thenReturn(new ImInstanceIdentityService.Identity(
                 true, "wecom", null, "bot-1", "zhangsan", null, "ok"));
@@ -110,7 +110,7 @@ class ImChatQuickBindTest {
         ImChatService chatService = mock(ImChatService.class);
         ImChannelService channelService = mock(ImChannelService.class);
         ImInstanceIdentityService identityService = mock(ImInstanceIdentityService.class);
-        when(chatService.listByInstance("imc-1")).thenReturn(List.of());
+        when(chatService.listByInstanceVisible("imc-1")).thenReturn(List.of());
         when(channelService.findById("imc-1")).thenReturn(Optional.of(inst("feishu")));
 
         ImChatController c = controller(chatService, channelService, identityService,
@@ -131,7 +131,7 @@ class ImChatQuickBindTest {
                 mock(com.nexusai.domain.session.SessionService.class);
         ImChatEntry row = new ImChatEntry("c-oc", "imc-1", "feishu", "oc_1", null, "p2p",
                 null, null, null, "sess-old", "manual", "t", "t", "t");
-        when(chatService.listByInstance("imc-1")).thenReturn(List.of(row));
+        when(chatService.listByInstanceVisible("imc-1")).thenReturn(List.of(row));
         when(sessionService.getById("sess-old")).thenReturn(
                 new com.nexusai.model.session.dto.SessionDto("sess-old", null, null, "旧任务",
                         null, null, null, null, null, null, null, null, null, null, null, null,
@@ -152,7 +152,7 @@ class ImChatQuickBindTest {
         ImChatService chatService = mock(ImChatService.class);
         ImChannelService channelService = mock(ImChannelService.class);
         ImInstanceIdentityService identityService = mock(ImInstanceIdentityService.class);
-        when(chatService.listByInstance("imc-1")).thenReturn(List.of());
+        when(chatService.listByInstanceVisible("imc-1")).thenReturn(List.of());
 
         Map<String, Object> out = controller(chatService, channelService, identityService,
                 mock(com.nexusai.domain.session.SessionService.class))

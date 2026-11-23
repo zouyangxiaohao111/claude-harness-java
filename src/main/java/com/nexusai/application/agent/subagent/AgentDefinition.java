@@ -861,7 +861,10 @@ public sealed interface AgentDefinition permits AgentDefinition.BuiltInAgentDefi
      * 类型守卫 · 对齐 CC isBuiltInAgent/isCustomAgent/isPluginAgent
      */
     static boolean isBuiltIn(AgentDefinition agent) {
-        return agent instanceof BuiltInAgentDefinition;
+        // 除 instanceof 外，source="built-in" 也算内置（ACP 等用 ExternalAgentDefinition
+        // 承载运行时但语义上仍是内置 agent；6 组折叠靠本判据归组，判错会被静默丢弃）。
+        return agent instanceof BuiltInAgentDefinition
+                || (agent != null && "built-in".equals(agent.source()));
     }
 
     static boolean isCustom(AgentDefinition agent) {

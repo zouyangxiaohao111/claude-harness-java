@@ -1234,6 +1234,12 @@ function systemRowLabel(m: ChatMessageDto): string {
   if (sub === 'date_change') return '日期变更提醒'
   if (sub === 'changed_files') return '已改动文件清单'
   if (sub === 'mcp_instructions_delta') return 'MCP 指令更新'
+  // [应用选择] 尾部 meta 通知三态（后端 AgentLoopContext.maybeEmitAppSelectionNotice 产出：
+  //  app_selection 首次 / app_selection_change 选择变化 / app_selection_end 清空）。
+  //  不加这三行也不会丢内容，但会落到默认分支显示英文长句，不符合既有中文化口径。
+  if (sub === 'app_selection') return '已选择应用'
+  if (sub === 'app_selection_change') return '可用应用已更新'
+  if (sub === 'app_selection_end') return '已清空应用选择'
   // [goal V253] 目标（/goal）终态溯源行 · 后端 GoalService.buildTerminalTraceMessage 产出
   //   （role=user + isMeta + author='attachment' + subtype='goal_status'）
   //   ⇒ isSystemInjectedRow 的 isMeta 分支天然覆盖 ⇒ 在对话流中按自身位置独立渲染，不开新轮、不当用户气泡。

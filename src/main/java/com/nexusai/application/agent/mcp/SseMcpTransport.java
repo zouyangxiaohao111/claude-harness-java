@@ -149,10 +149,14 @@ public class SseMcpTransport implements McpTransport {
      */
     private final Map<String, List<McpNotificationHandler>> notificationHandlers = new ConcurrentHashMap<>();
 
+    /** [2026-11-23] 自定义请求头（env 承载；Bearer 仍由 authHeaderProvider 管）。 */
+    private volatile Map<String, String> customHeaders = Map.of();
+
     @Override
     public void start(McpTransport.TransportConfig config) {
         // [S2] 保存完整 config 供 McpAuthHeaderProvider 计算 serverKey（Bearer 注入）
         this.config = config;
+        this.customHeaders = config == null ? Map.of() : McpOAuth.headersOnly(config.env());
         // SSE transport 用 endpoint 字段 (URL string) 替代 command
         String url = config == null || config.command() == null ? null : config.command();
         if (url == null || url.isBlank()) {
@@ -297,12 +301,32 @@ public class SseMcpTransport implements McpTransport {
      * （client.ts:648-671）：Accept text/event-stream + Bearer（null 不带）。2xx → 返回
      * 连接供 reader 持久读取（读阶段免超时）；401/其它非 2xx → 断开并返回状态码。
      */
+    /** 注入自定义请求头（跳过传输层自管的 Authorization/Content-Type/Accept）。 */
+    private void applyCustomHeaders(HttpURLConnection conn) {
+        Map<String, String> headers = customHeaders;
+        if (headers == null || headers.isEmpty()) {
+            return;
+        }
+        headers.forEach((k, v) -> {
+            if (k == null || k.isBlank() || v == null) {
+                return;
+            }
+            String lower = k.toLowerCase(java.util.Locale.ROOT);
+            if (lower.equals("authorization") || lower.equals("content-type")
+                    || lower.equals("accept")) {
+                return;
+            }
+            conn.setRequestProperty(k, v);
+        });
+    }
+
     private StreamHandle openStreamHandle(String bearerToken) throws IOException {
         HttpURLConnection conn = (HttpURLConnection) endpoint.toURL().openConnection();
         conn.setConnectTimeout(GET_CONNECT_READ_TIMEOUT_MS);
         conn.setReadTimeout(GET_CONNECT_READ_TIMEOUT_MS);
         conn.setRequestMethod("GET");
         conn.setRequestProperty("Accept", "text/event-stream");
+        applyCustomHeaders(conn);
         if (bearerToken != null) {
             conn.setRequestProperty("Authorization", "Bearer " + bearerToken);
         }
@@ -513,6 +537,7 @@ public class SseMcpTransport implements McpTransport {
         conn.setDoOutput(true);
         conn.setRequestProperty("Content-Type", "application/json");
         conn.setRequestProperty("Accept", "application/json, text/event-stream");
+        applyCustomHeaders(conn);
         if (bearerToken != null) {
             conn.setRequestProperty("Authorization", "Bearer " + bearerToken);
         }

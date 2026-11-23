@@ -227,11 +227,21 @@ public final class StaticPromptSections {
             "To search the content of files, use " + ToolNameConstants.GREP_TOOL_NAME + " instead of grep or rg",
             "Reserve using the " + bash + " exclusively for system commands and terminal operations that require shell execution. If you are unsure and there is a relevant dedicated tool, default to using the dedicated tool and only fallback on using the " + bash + " tool for these if it is absolutely necessary."
         ));
-        // [AST tools] 只有组装出这两个工具时才提（enabledTools == null 时保持既有语义：不追加）。
+        // [AST tools] 名称按各自可见性拼接；enabledTools == null 时保持既有语义：不追加。
+        List<String> astClauses = new ArrayList<>();
         if (enabledTools != null && enabledTools.contains(ToolNameConstants.AST_GREP_TOOL_NAME)) {
-            providedToolSubitems.add("To search code by syntax shape (calls, declarations, language constructs) use "
-                + ToolNameConstants.AST_GREP_TOOL_NAME + " instead of regex guesses; use "
-                + ToolNameConstants.AST_EDIT_TOOL_NAME + " for repeated structural rewrites (preview first, then apply).");
+            astClauses.add("Prefer " + ToolNameConstants.AST_GREP_TOOL_NAME + " for code searches; use "
+                + ToolNameConstants.GREP_TOOL_NAME
+                + " for non-programming content or when the language is unsupported");
+        }
+        if (enabledTools != null && enabledTools.contains(ToolNameConstants.AST_EDIT_TOOL_NAME)) {
+            astClauses.add("Prefer " + ToolNameConstants.AST_EDIT_TOOL_NAME
+                + " for code changes, including a single location; use " + ToolNameConstants.FILE_EDIT_TOOL_NAME
+                + " for non-programming content or when AST cannot express the change"
+                + "; it previews a diff first and only writes when re-run with apply: true");
+        }
+        if (!astClauses.isEmpty()) {
+            providedToolSubitems.add(String.join(". ", astClauses) + ".");
         }
         List<Object> items = new ArrayList<>();
         items.add("Do NOT use the " + bash + " to run commands when a relevant dedicated tool is provided. Using dedicated tools allows the user to better understand and review your work. This is CRITICAL to assisting the user:");

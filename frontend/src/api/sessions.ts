@@ -1,6 +1,6 @@
 import { api, ApiError } from './rest'
 import { isCommonResult } from './peerInboxOutcome'
-import type { SessionDto, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse, PlanExitRequest, PlanExitResponse, SessionModeDto, SessionModeToggleRequest } from './types'
+import type { SessionDto, SessionSearchPage, SessionCreateRequest, SessionUpdateRequest, SessionToolDto, SessionToolPatchRequest, SessionToolCategory, SessionToolCategoryToggleRequest, SessionUsageResponse, ComputerUseApproval, ForkSessionRequest, ForkSessionResponse, PlanExitRequest, PlanExitResponse, SessionModeDto, SessionModeToggleRequest } from './types'
 
 /**
  * [V329] 拆统一返回体：成功 = `success === true && code === 0`。
@@ -22,6 +22,16 @@ function unwrapMode(raw: unknown): SessionModeDto {
 
 export const sessionApi = {
   list: () => api<SessionDto[]>('/sessions'),
+  /**
+   * 会话模糊搜索（标题 / id 子串匹配 · 分页）· `GET /sessions/search?q=&page=&size=`。
+   *
+   * <p>q 空白 = 最近会话（按 updated_at 倒序）；供搜索面板「会话」区使用，
+   * ⛔ 不再用前端本地过滤（旧实现只过滤已加载数组 ⇒ 旧会话搜不到）。
+   */
+  search: (q: string, page = 1, size = 10) =>
+    api<SessionSearchPage>(
+      `/sessions/search?q=${encodeURIComponent(q)}&page=${page}&size=${size}`,
+    ),
   get: (id: string) => api<SessionDto>(`/sessions/${encodeURIComponent(id)}`),
   create: (req: SessionCreateRequest) => api<SessionDto>('/sessions', { method: 'POST', body: req }),
   /** 分叉：从某轮末消息截断复制出一个新会话（标题追加「 分叉」，产物/附件按新会话 id 复制） */

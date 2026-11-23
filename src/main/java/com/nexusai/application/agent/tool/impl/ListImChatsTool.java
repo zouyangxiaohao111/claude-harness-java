@@ -211,7 +211,8 @@ public class ListImChatsTool implements Tool {
         // ── 2. 读本地目录 ──
         List<ImChatEntry> chats;
         try {
-            chats = chatService.list();
+            // [V335] 只给「可见」会话：机器人不在的群绑了也收不到事件（已接线的仍可见）
+            chats = chatService.listVisible();
         } catch (RuntimeException e) {
             return ToolResult.error(call.id(),
                 "Error: 读取聊天目录失败: " + (e.getMessage() == null ? e.toString() : e.getMessage()));

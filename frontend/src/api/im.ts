@@ -64,6 +64,12 @@ export interface ImChat {
   boundSessionId: string | null
   bindMode: 'auto' | 'manual' | null
   boundAt: string | null
+  /**
+   * V335 · 机器人是否在该会话里。
+   * null/undefined = 尚未判定（按可达处理）；false = 确认机器人不在该群
+   * （飞书「本人所在群」同步进来的会话：@ 它不会推事件、拉历史也会被拒）。
+   */
+  botPresent?: boolean | null
   createdAt: string
   updatedAt: string
 }

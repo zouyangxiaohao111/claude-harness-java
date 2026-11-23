@@ -552,6 +552,39 @@ html {
   color: var(--ink-faint);
   font-weight: 400;
 }
+/* [run-badge] 分组标题右侧的「N 运行中 / N 待处理」角标（方案 A）：
+   组收起时看不到组内会话行，靠它一眼找到有任务在跑 / 在等权限的分组。
+   静止不闪烁（与行内 status-dot 的闪烁区分）；0 不渲染；收起 / 展开都显示。 */
+.left-section .label .label-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+}
+.left-section .label .run-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  height: 17px;
+  padding: 0 6px;
+  border-radius: 9px;
+  background: rgba(232, 185, 60, .16);
+  color: var(--ink-muted);
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 1;
+  white-space: nowrap;
+}
+.left-section .label .run-badge.pending { background: rgba(232, 87, 58, .12); }
+.left-section .label .run-badge .dot {
+  width: 5px;
+  height: 5px;
+  border-radius: 50%;
+  background: #E8B93C;
+}
+.left-section .label .run-badge.pending .dot { background: #E8573A; }
 .left-section .label .group-path {
   flex: 1;
   overflow: hidden;
@@ -1348,6 +1381,10 @@ html {
   flex: 1;
   overflow-y: auto;
   padding: 20px 0;
+  /* [宽度稳定 2026-11-23] 滚动条直接占 6px 内容宽（::-webkit-scrollbar width=6px）⇒
+     消息/附件变多的一瞬间出现滚动条，对话列会突然窄 6px；stable 让槽位常驻，
+     内容列宽度不随滚动条出现/消失抖动（用户报「内容变多就变窄」）。 */
+  scrollbar-gutter: stable;
 }
 /* 空态：MessageList 返回 null 后 .stream 无内容 → 高度塌陷，释放给 Composer 居中 */
 .stream:empty {
@@ -3448,8 +3485,9 @@ html {
    ⚠️ 阈值必须按**两侧自然宽度之和**定，不能凭感觉：实测
      left-tools 完整形态 194px + right-tools 399px ≈ 593px（+ gap）⇒
      只要输入框窄于 ~600px，这一排就排不下、左半边必然被顶上去。
-     初版写成 420px 是错的（开右侧栏时 inner 实测 434px，仍 > 420 ⇒ 根本没触发，
-     用户实测「没有变成图标」）。现取 700px —— 左组新增计划/协调者/渠道后变宽，旧 620px 会先换行。
+     初版写成 420px 是错的（开右侧栏时 inner 实测 434px，仍 > 420 ⇒ 根本没触发）。
+   ⚠️ [2026-11-23 用户裁定] 只在 **≤700px** 收文字（默认必须显示文字）；701–962px 的「两排」
+     不靠收字解决 —— 改由 `.toolbar`/`.left-tools` 不换行 + 左组横向滚动（隐藏滚动条）保单排。
    ══════════════════════════════════════════════════════════════════ */
 @container composer-inner (max-width: 700px) {
   .composer .toolbar .left-tools .tool-chip > span:not(.tools-badge) { display: none; }
@@ -3486,12 +3524,9 @@ html {
   /* 计划/协调者：窄栏收成 28×28 纯图标，7px 状态点塞不下 ⇒ 隐藏（状态由 active 底色表达） */
   .composer .toolbar .left-tools .tool-chip.plan-mode .plan-indicator { display: none; }
 
-  /* 右侧控件同步收成纯图标（<700px 时与左侧 chip 同一口径）：
-     权限模式只留盾牌、模型只留立方体、发送只留箭头 —— 文字全收，title/hover 保留可读性。 */
+  /* 右侧只收权限模式文字、发送箭头；⛔ 模型胶囊保持「DS + 图标 + max」（用户裁定 max 常显） */
   .composer .right-tools .perm-mode-pill .pm-label,
-  .composer .right-tools .perm-mode-pill .pm-value,
-  .composer .right-tools .model-effort-pill .mep-model,
-  .composer .right-tools .model-effort-pill .mep-effort { display: none; }
+  .composer .right-tools .perm-mode-pill .pm-value { display: none; }
   .composer .right-tools .perm-mode-pill,
   .composer .right-tools .model-effort-pill { padding: 0 8px; gap: 2px; }
   .composer .right-tools .send-btn > span { display: none; }
@@ -4658,6 +4693,61 @@ html {
   text-align: center;
   color: var(--ink-faint);
   font-size: 12px;
+}
+
+/* 结果分区标题（会话 / 其它）+ 命中数 */
+.search-section-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 12px 4px;
+  font-size: 10.5px;
+  font-weight: 600;
+  letter-spacing: 0.4px;
+  color: var(--ink-faint);
+}
+
+.search-section-count {
+  font-size: 9px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: var(--r-xs);
+  background: var(--surface-2);
+  color: var(--ink-subtle);
+}
+
+/* 会话区翻页条 */
+.search-pager {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 12px 8px;
+}
+
+.search-pager-info {
+  font-size: 10.5px;
+  color: var(--ink-faint);
+}
+
+.search-pager-btn {
+  padding: 3px 10px;
+  border: 1px solid var(--hairline);
+  border-radius: var(--r-sm);
+  background: var(--surface-1);
+  color: var(--ink);
+  font-size: 11px;
+  cursor: pointer;
+  transition: background 100ms var(--ease);
+}
+
+.search-pager-btn:hover:not(:disabled) {
+  background: var(--surface-2);
+}
+
+.search-pager-btn:disabled {
+  opacity: 0.45;
+  cursor: default;
 }
 
 .search-item {
@@ -9168,7 +9258,8 @@ html {
   font-size: 12px;
   font-weight: 600;
   color: var(--ink);
-  max-width: 140px;
+  /* [2026-11-23] 与 app-picker.css 的收窄值统一为 112px（两处同名规则曾分叉 140/112） */
+  max-width: 112px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -9355,6 +9446,28 @@ html {
 .session-item .session-pin-btn.pinned { display: inline-flex; color: #E3A008; }
 /* 置顶块标题里的五角星（纯装饰） */
 .left-section .label.pinned-label .pin-mark { color: #E3A008; width: 13px; height: 13px; }
+/* [run-block 2026-11-23] 左栏「正在运行」块：标题脉冲点 + 行内运行时长。
+   点色与改版行内 running 状态点一致（#ff9500）；时长占时间位，hover 不被 ⋯ 顶掉。 */
+@keyframes runPulse {
+  0% { box-shadow: 0 0 0 0 rgba(255, 149, 0, .45); }
+  70% { box-shadow: 0 0 0 7px rgba(255, 149, 0, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(255, 149, 0, 0); }
+}
+.left-section .label.running-label .run-pulse {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #ff9500;
+  flex: 0 0 auto;
+  animation: runPulse 1.6s ease-out infinite;
+}
+.running-block .session-item .run-elapsed {
+  margin-left: auto;
+  font-size: 11px;
+  color: var(--ink-faint);
+  font-variant-numeric: tabular-nums;
+  flex-shrink: 0;
+}
 /* 会话操作下拉（置顶 / 重命名 / 删除） */
 .session-menu {
   position: absolute; right: 8px; top: calc(100% + 2px); z-index: 30;
@@ -12508,8 +12621,14 @@ html {
 .cl-report-hint{font-size:11px;color:#9aa3b2}
 .cl-report-error{font-size:11px;color:#c2410c;word-break:break-word}
 
-/* 主界面淡入（放大完成后切换 App 的入场） */
-.cl-enter{animation:cl-enter .4s var(--ease) both}
+/* 主界面淡入（放大完成后切换 App 的入场）
+   ⚠️ 不能写 fill-mode（both / forwards）：关键帧带 transform，动画结束后 fill 状态会把
+   computed transform 冻结成 identity matrix（实测 matrix(1,0,0,1,0,0)，且把 to 帧的
+   transform 删掉也一样）。这会让整个 App 长期处于「transform 造成的层叠上下文 + fixed
+   包含块」中 —— App 内 position:fixed 的弹窗全部被困在该上下文里，压不过 body 层
+   createPortal 的弹窗（实测：快速绑定确认弹窗 z-index 200 仍被渠道弹窗 110 盖住，
+   必须关掉渠道弹窗才看得到）。默认 fill:none，动画结束即恢复自身 transform:none。 */
+.cl-enter{animation:cl-enter .4s var(--ease)}
 @keyframes cl-enter{from{opacity:0;transform:scale(.985)}to{opacity:1;transform:none}}
 
 @media (prefers-reduced-motion:reduce){
@@ -14908,6 +15027,12 @@ html {
   font-weight: 400;
   color: var(--ink-faint);
 }
+
+/* [run-badge] 改版左栏：点色与行内状态点一致（运行 #ff9500 / 等权限 #ff3b30）。 */
+.app.workspace-surface .left-section .label .run-badge { background: rgba(255, 149, 0, .14); }
+.app.workspace-surface .left-section .label .run-badge.pending { background: rgba(255, 59, 48, .12); }
+.app.workspace-surface .left-section .label .run-badge .dot { background: #ff9500; }
+.app.workspace-surface .left-section .label .run-badge.pending .dot { background: #ff3b30; }
 
 .app.workspace-surface .left-section .label .add {
   width: 20px;
@@ -20153,6 +20278,13 @@ html {
 .chanm-inactive {
   color: var(--warning-dark, #8a6414);
   background: var(--warning-soft, rgba(201, 148, 23, .12));
+  padding: 0 5px; border-radius: 4px; font-size: 10px;
+}
+/* [V335] 「机器人不在该群」= 绑定仍然有效，但平台不会推事件、历史也拉不到。
+   用错误色（不是警告色）：这不是"等对方说话"，而是"这个接线收不到任何东西"。 */
+.chanm-unreachable {
+  color: var(--error-dark, #b42318);
+  background: var(--error-soft, rgba(217, 45, 32, .10));
   padding: 0 5px; border-radius: 4px; font-size: 10px;
 }
 .chanm-on-badge {

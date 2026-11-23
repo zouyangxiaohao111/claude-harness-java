@@ -9,7 +9,7 @@ import { settingsApi, getHttpProxy, putHttpProxy, probeHttpProxy, testHttpProxy,
 import { APPLY_ALL_ROLES, APPLY_ALL_TIER_FIELDS } from '@/components/settings/ModelSettingsPanel'
 import type { UseProviders } from '@/hooks/useProviders'
 import { ApiError } from '@/api/rest'
-import { providerApi, type BuiltinConnection, type BuiltinProviderStatus } from '@/api/providers'
+import { providerApi, type BuiltinBrandModel, type BuiltinConnection, type BuiltinProviderStatus } from '@/api/providers'
 import type { CreateModelRequest, CreateProviderRequest, ModelType, UpdateModelRequest, UpdateProviderRequest, UpdateSettingsRequest } from '@/api/types'
 
 interface ProvidersPanelProps {
@@ -115,6 +115,8 @@ const BRAND_ICON_KEYS = new Set([
   'openai', 'claude', 'deepseek', 'minimax', 'opencode', 'qwen', 'kimi', 'wenxin',
   'doubao', 'gemini', 'mistral', 'ollama', 'openrouter', 'vllm', 'lmstudio', 'mimo',
   'hunyuan', 'zhipu', 'xai', 'groq', 'stepfun', 'siliconflow',
+  // [2026-11-23 Octop provider 导入] 新品牌（图标见 public/provider-icons/）
+  'modelscope', 'iflytek', 'tencent',
 ])
 
 /** 品牌图标路径；未知 key → 兜底机器人图标。 */
@@ -303,6 +305,8 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
   const [addingModelFor, setAddingModelFor] = useState<{ providerId: string; prefillName: string } | null>(null)
   /** 拉取远端模型并导入（保存提供商后自动打开 · 见 onAddProvider） */
   const [importingModelsFor, setImportingModelsFor] = useState<Provider | null>(null)
+  /** 内置卡新建时带过来的模板模型建议（[2026-11-23] 只在「导入模型」里作建议，用户可改） */
+  const [importSuggestions, setImportSuggestions] = useState<BuiltinBrandModel[]>([])
   const [pending, setPending] = useState(false)
   /** ChatGPT 订阅：已展开粘贴区的 providerId → 粘贴内容（键存在 = 展开，空串也算已展开） */
   const [oauthPaste, setOauthPaste] = useState<Record<string, string>>({})
@@ -984,6 +988,8 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
   }
 
   const onAddProvider = (p: Provider) => {
+    // 模板模型建议只在本次从内置卡进来时有效；手动「+ 添加提供商」为空
+    const suggestions = builtinPrefill?.models ?? []
     // 协议类型：显式 anthropic 用 anthropic；否则按 baseUrl 智能推断（含 api.anthropic.com → anthropic）
     const inferred = (p.baseUrl ?? '').toLowerCase().includes('api.anthropic.com') ? 'anthropic' : 'openai_compatible'
     const req: CreateProviderRequest = {
@@ -1018,6 +1024,8 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
       await refreshBuiltin()
       setAddingProvider(false)
       setBuiltinPrefill(null)
+      // 建议清单交给「导入模型」弹窗（仅本次；关弹窗即清空）
+      setImportSuggestions(suggestions)
       // L4b-2 首启引导信号：带 created 详情（内含 models），引导据此判断是否需补插「添加模型」步
       window.dispatchEvent(new CustomEvent('nexusai:provider-saved', { detail: created }))
       // [2026-11-03 用户裁定] **保存后不自动拉模型** —— 保存就保存，导入是另一个明确动作
@@ -2181,8 +2189,9 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
       {importingModelsFor && (
         <ImportModelsModal
           provider={importingModelsFor}
+          suggestedModels={importSuggestions}
           createModel={createModel}
-          onClose={() => setImportingModelsFor(null)}
+          onClose={() => { setImportingModelsFor(null); setImportSuggestions([]) }}
           showToast={showToast}
         />
       )}

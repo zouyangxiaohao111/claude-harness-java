@@ -20,7 +20,7 @@
  * —— 那会过期，且与提供商实际部署不一致。
  */
 import { useEffect, useMemo, useState } from 'react'
-import { providerApi } from '@/api/providers'
+import { providerApi, type BuiltinBrandModel } from '@/api/providers'
 import { ApiError } from '@/api/rest'
 import type { CreateModelRequest, ModelType, Provider, RemoteModel } from '@/api/types'
 import { brandTagFromName, tagToClass } from '@/data'
@@ -63,10 +63,32 @@ interface DraftModel {
   existing: boolean
   /** 用户是否勾选导入 */
   selected: boolean
+  /** [2026-11-23] 来自内置品牌模板的建议（不是远端接口返回；用户可改/可取消） */
+  suggested?: boolean
+}
+
+/** 内置建议 → 待导入行（建议值可改；库里已有同名则置灰跳过） */
+function toSuggestedDraft(s: BuiltinBrandModel, existingNames: Set<string>): DraftModel {
+  const inferred = inferModelType(s.id)
+  return {
+    id: s.id,
+    alias: s.name || s.id,
+    type: inferred.type,
+    typeInferred: !inferred.confident,
+    maxTokens: DEFAULT_MAX_TOKENS,
+    maxContextTokens: s.maxInputTokens ?? DEFAULT_MAX_CONTEXT_TOKENS,
+    ctxFromApi: s.maxInputTokens != null,
+    maxFromApi: false,
+    existing: existingNames.has(s.id),
+    selected: !existingNames.has(s.id),
+    suggested: true,
+  }
 }
 
 interface ImportModelsModalProps {
   provider: Provider
+  /** [2026-11-23] 内置品牌模板的模型建议：远端没有的补进列表，只作建议、用户可改 */
+  suggestedModels?: BuiltinBrandModel[]
   /** 逐个创建模型（复用父级的 createModel，错误处理与 toast 由父级统一管） */
   createModel: (providerId: string, req: CreateModelRequest) => Promise<void>
   onClose: () => void
@@ -78,7 +100,7 @@ type FetchState =
   | { phase: 'ready'; message: string }
   | { phase: 'failed'; message: string }
 
-export function ImportModelsModal({ provider, createModel, onClose, showToast }: ImportModelsModalProps) {
+export function ImportModelsModal({ provider, suggestedModels, createModel, onClose, showToast }: ImportModelsModalProps) {
   const [state, setState] = useState<FetchState>({ phase: 'loading' })
   const [drafts, setDrafts] = useState<DraftModel[]>([])
   const [expanded, setExpanded] = useState<Set<string>>(new Set())
@@ -97,11 +119,19 @@ export function ImportModelsModal({ provider, createModel, onClose, showToast }:
   //   且第一遍的响应会被 alive 守卫丢弃。
   useEffect(() => {
     let alive = true
+    const sug = suggestedModels ?? []
     providerApi
       .remoteModels(provider.id)
       .then((res) => {
         if (!alive) return
         if (!res.ok) {
+          if (sug.length > 0) {
+            const existingNames = new Set(provider.models.map((m) => m.name))
+            const list = sug.map((s) => toSuggestedDraft(s, existingNames))
+            setDrafts(list)
+            setState({ phase: 'ready', message: `远端清单不可用（${res.message || '读取失败'}）· 已载入 ${list.length} 个内置建议，可改` })
+            return
+          }
           setState({ phase: 'failed', message: res.message || '读取失败' })
           return
         }
@@ -122,12 +152,29 @@ export function ImportModelsModal({ provider, createModel, onClose, showToast }:
             selected: !exists,
           }
         })
+        // [2026-11-23] 内置建议：远端没有的同名 id 才补进列表（只是建议，用户可改/取消）
+        const seen = new Set(list.map((d) => d.id))
+        let suggestedAdded = 0
+        for (const s of sug) {
+          if (seen.has(s.id)) continue
+          seen.add(s.id)
+          list.push(toSuggestedDraft(s, existingNames))
+          suggestedAdded++
+        }
         setDrafts(list)
-        setState({ phase: 'ready', message: res.message || `读取到 ${list.length} 个模型` })
+        setState({ phase: 'ready', message: (res.message || `读取到 ${list.length} 个模型`)
+          + (suggestedAdded > 0 ? ` · 另含 ${suggestedAdded} 个内置建议` : '') })
       })
       .catch((e) => {
         if (!alive) return
         const msg = e instanceof ApiError ? e.userMessage() : String(e)
+        if (sug.length > 0) {
+          const existingNames = new Set(provider.models.map((m) => m.name))
+          const list = sug.map((s) => toSuggestedDraft(s, existingNames))
+          setDrafts(list)
+          setState({ phase: 'ready', message: `远端清单不可用（${msg}）· 已载入 ${list.length} 个内置建议，可改` })
+          return
+        }
         setState({ phase: 'failed', message: msg })
       })
     return () => { alive = false }
@@ -135,7 +182,7 @@ export function ImportModelsModal({ provider, createModel, onClose, showToast }:
     //   （刷新「已存在」标记）。但它每次都是**新数组**（store 每次 setList 都造新的）
     //   ⇒ 依赖它会导致弹窗开着时反复重拉。故只用 provider.id 触发拉取，
     //   「已存在」标记在**打开弹窗那一刻**快照即可（导入过程中不会变）。
-  }, [provider.id])
+  }, [provider.id, suggestedModels])
 
   const providerTag = brandTagFromName(provider.name) ?? 'other'
 
@@ -272,7 +319,14 @@ export function ImportModelsModal({ provider, createModel, onClose, showToast }:
                           <span className="im-type">{d.typeInferred ? '类型待确认' : d.type}</span>
                           {d.existing
                             ? <span className="im-badge">已存在，跳过</span>
-                            : <span className="im-badge src">上下文 {d.ctxFromApi ? '接口' : '默认'} · 输出 {d.maxFromApi ? '接口' : '默认'}</span>}
+                            : (
+                              <>
+                                {d.suggested && <span className="im-badge src">内置建议</span>}
+                                <span className="im-badge src">
+                                  上下文 {d.suggested ? '建议' : (d.ctxFromApi ? '接口' : '默认')} · 输出 {d.maxFromApi ? '接口' : '默认'}
+                                </span>
+                              </>
+                            )}
                           <button
                             type="button"
                             className="im-expand"

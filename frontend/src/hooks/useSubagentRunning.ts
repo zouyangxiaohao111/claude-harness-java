@@ -1,4 +1,4 @@
-import { useEffect, useSyncExternalStore } from 'react'
+import { useEffect, useState, useSyncExternalStore } from 'react'
 import {
   useSubagentStore,
   runningSubagentSessionIds,
@@ -163,6 +163,54 @@ async function reconcileRunningSubagents(): Promise<void> {
  * App 里挂一次：2s 常驻对账定时器。cleanup 真正 `clearInterval`（StrictMode 双挂载不跑两套、
  * 测试能停）；模块级 {@link started} 防同一时刻两个定时器。
  */
+/** 活跃后台任务轮询间隔（内存态清单，代价低；与子代理对账同节奏）。 */
+const BACKGROUND_ACTIVE_POLL_MS = 2000
+
+/**
+ * [侧栏运行点 · 后台任务那一路]
+ *
+ * <b>WHY</b>：主 turn 结束（idle）后，会话里<b>仍可能有后台工作</b>在跑 —— local_bash
+ * （run_in_background）、monitor_mcp、local_workflow 等。这些任务不进 subagentStore
+ * （`task_started` 只登记 local_agent / in_process_teammate / remote_agent），也不产生
+ * stream 块 ⇒ 上述三路判据全空，侧栏会在「明明还有东西在跑」时熄灭。
+ *
+ * <p>数据源用 REST {@code GET /tasks/active}（跨会话、只含未终态 + 已后台化）而不是事件：
+ * 事件（task_started/task_notification）在 F5 / 丢帧后无法重建集合；2s 轮询与
+ * {@link useSubagentRunningReconcile} 同节奏，代价可接受。
+ *
+ * <p><b>⛔ 边界</b>：只服务侧栏状态点，不进 turnRunning / 停止键。
+ *
+ * @returns 仍有活跃后台任务的会话 id 集合（内容不变时返回同一引用，避免无谓重渲）
+ */
+export function useBackgroundRunningSessionIds(): Set<string> {
+  const [ids, setIds] = useState<Set<string>>(() => new Set())
+  useEffect(() => {
+    let alive = true
+    let timer: number | undefined
+    const tick = async () => {
+      if (document.visibilityState === 'visible' && typeof tasksApi.active === 'function') {
+        try {
+          const list = (await tasksApi.active()) ?? []
+          if (alive) {
+            const next = new Set<string>()
+            for (const t of list) {
+              if (t.sessionId && (t.status === 'running' || t.status === 'pending')) next.add(t.sessionId)
+            }
+            setIds((prev) => (sameMembers(prev, next) ? prev : next))
+          }
+        } catch { /* 网络抖动：保留上一轮结果，下一轮再对账 */ }
+      }
+      if (alive) timer = window.setTimeout(() => { void tick() }, BACKGROUND_ACTIVE_POLL_MS)
+    }
+    void tick()
+    return () => {
+      alive = false
+      if (timer !== undefined) window.clearTimeout(timer)
+    }
+  }, [])
+  return ids
+}
+
 export function useSubagentRunningReconcile(): void {
   useEffect(() => {
     if (started) return

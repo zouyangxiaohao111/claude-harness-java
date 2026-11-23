@@ -15,6 +15,7 @@ import com.nexusai.repository.im_channel.mapper.ImChannelInstanceMapper;
 import com.nexusai.repository.im_channel.mapper.ImChatMapper;
 import com.nexusai.repository.im_message.mapper.ImMessageMapper;
 import com.nexusai.repository.im_message.mapper.ImScanChannelMapper;
+import com.nexusai.repository.im_message.mapper.ImScanTaskMapper;
 import com.nexusai.test.support.MybatisFlexDbTestSupport;
 import org.flywaydb.core.Flyway;
 import org.junit.jupiter.api.BeforeAll;
@@ -63,6 +64,7 @@ class ImMessageSyncServiceTest {
 
     private static ImMessageService messageService;
     private static ImScanChannelService scanService;
+    private static ImScanTaskService scanTaskService;
     private static ImChatService chatService;
     private static ImChannelService channelService;
 
@@ -81,7 +83,7 @@ class ImMessageSyncServiceTest {
             .migrate();
 
         MybatisFlexDbTestSupport.resetAndStart(ds, ImMessageMapper.class, ImScanChannelMapper.class,
-            ImChatMapper.class, ImChannelInstanceMapper.class);
+            ImScanTaskMapper.class, ImChatMapper.class, ImChannelInstanceMapper.class);
 
         messageMapper = MybatisFlexBootstrap.getInstance().getMapper(ImMessageMapper.class);
         scanMapper = MybatisFlexBootstrap.getInstance().getMapper(ImScanChannelMapper.class);
@@ -93,6 +95,11 @@ class ImMessageSyncServiceTest {
 
         scanService = new ImScanChannelService();
         ReflectionTestUtils.setField(scanService, "mapper", scanMapper);
+
+        // V318 任务级暂停开关：runOnce() 会读它（缺了会 NPE ⇒ 整类误红）
+        scanTaskService = new ImScanTaskService();
+        ReflectionTestUtils.setField(scanTaskService, "mapper",
+            MybatisFlexBootstrap.getInstance().getMapper(ImScanTaskMapper.class));
 
         chatService = new ImChatService();
         ReflectionTestUtils.setField(chatService, "mapper", chatMapper);
@@ -143,9 +150,16 @@ class ImMessageSyncServiceTest {
             null, null, null, ImChatService.SOURCE_LISTED);
     }
 
+    /** 建一个群聊目录行（kind=group）。 */
+    private void newGroupChat(String instanceId, String platform, String peerId) {
+        chatService.upsert(instanceId, platform, peerId, peerId, "group",
+            null, null, null, ImChatService.SOURCE_LISTED);
+    }
+
     private ImMessageSyncService newService(ImMessageFetcher... fetchers) {
         ImMessageSyncService svc = new ImMessageSyncService();
         ReflectionTestUtils.setField(svc, "scanChannelService", scanService);
+        ReflectionTestUtils.setField(svc, "scanTaskService", scanTaskService);
         ReflectionTestUtils.setField(svc, "chatService", chatService);
         ReflectionTestUtils.setField(svc, "channelService", channelService);
         ReflectionTestUtils.setField(svc, "messageService", messageService);
@@ -374,6 +388,97 @@ class ImMessageSyncServiceTest {
         assertThat(fetcher.lastSince).isEqualTo("2026-11-18T23:00:00.000+08:00");
     }
 
+    // ═══════════════════ 机器人不在的飞书群（P0-2） ═══════════════════
+
+    @Test
+    @DisplayName("飞书群 + 机器人不在（bot_present=false）⇒ 跳过、不计失败、skippedChats=1、游标照常推进")
+    void feishuGroupWithoutBot_isSkippedNotFailed() {
+        String instanceId = newInstance("feishu");
+        scanService.enable(instanceId);
+        newChat(instanceId, "feishu", "oc_p2p");
+        newGroupChat(instanceId, "feishu", "oc_group");
+        // 机器人当前不在任何群：p2p 按规则恒 true，群 ⇒ false（与 ImChatService.visible() 同判据）
+        chatService.markBotPresence(instanceId, java.util.Set.of());
+
+        FakeFetcher fetcher = new FakeFetcher("feishu");
+        fetcher.ok("oc_p2p", List.of(
+            entry(instanceId, "feishu", "oc_p2p", "om_1", "2026-11-18T10:00:00.000+08:00", "单聊")));
+
+        ImMessageSyncService.SyncSummary summary = newService(fetcher).runOnce();
+
+        assertThat(fetcher.calls).as("只拉 p2p，不碰机器人不在的群（否则每轮都被 400）").isEqualTo(1);
+        assertThat(fetcher.calledChats).containsExactly("oc_p2p");
+        assertThat(summary.skippedChats()).isEqualTo(1);
+        assertThat(summary.chats()).isEqualTo(1);
+        assertThat(summary.failedInstances()).isZero();
+        assertThat(summary.partialFailedInstances()).as("跳过不是失败").isZero();
+
+        ImScanChannelEntry row = scanRow(instanceId);
+        assertThat(row.lastError()).as("预期跳过不能写成故障").isNull();
+        assertThat(row.failed()).isFalse();
+        assertThat(row.lastScanAt()).as("无失败 ⇒ 游标照常推进").isNotNull();
+    }
+
+    @Test
+    @DisplayName("全部会话都是「机器人不在的飞书群」⇒ 全跳过、0 次拉取、last_error 仍为 null")
+    void allFeishuGroupsWithoutBot_skippedWithoutError() {
+        String instanceId = newInstance("feishu");
+        scanService.enable(instanceId);
+        newGroupChat(instanceId, "feishu", "oc_g1");
+        newGroupChat(instanceId, "feishu", "oc_g2");
+        chatService.markBotPresence(instanceId, java.util.Set.of());
+
+        FakeFetcher fetcher = new FakeFetcher("feishu");
+        ImMessageSyncService.SyncSummary summary = newService(fetcher).runOnce();
+
+        assertThat(fetcher.calls).isZero();
+        assertThat(summary.skippedChats()).isEqualTo(2);
+        assertThat(summary.chats()).isZero();
+        assertThat(summary.failedInstances()).isZero();
+        assertThat(summary.partialFailedInstances()).isZero();
+
+        ImScanChannelEntry row = scanRow(instanceId);
+        assertThat(row.lastError()).as("全部跳过 = 预期行为，不是故障 ⇒ 不写错误").isNull();
+        assertThat(row.failed()).isFalse();
+        assertThat(row.lastScanAt()).as("全部跳过也按成功推进游标（否则每轮从头重来）").isNotNull();
+    }
+
+    @Test
+    @DisplayName("飞书群 bot_present 尚未判定（null）⇒ 仍照常尝试（避免首日误跳过）")
+    void feishuGroupWithUnknownBotPresence_stillFetched() {
+        String instanceId = newInstance("feishu");
+        scanService.enable(instanceId);
+        newGroupChat(instanceId, "feishu", "oc_unknown");   // bot_present 保持 null
+
+        FakeFetcher fetcher = new FakeFetcher("feishu");
+        fetcher.ok("oc_unknown", List.of());
+
+        ImMessageSyncService.SyncSummary summary = newService(fetcher).runOnce();
+
+        assertThat(fetcher.calls).isEqualTo(1);
+        assertThat(fetcher.calledChats).containsExactly("oc_unknown");
+        assertThat(summary.skippedChats()).isZero();
+        assertThat(summary.chats()).isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("失败原因走共享码表：230002 ⇒ last_error 是「机器人不在该会话」而不是 HTTP 400")
+    void reasonOfMapsFeishuCodeToReadableText() {
+        String instanceId = newInstance("feishu");
+        scanService.enable(instanceId);
+        newChat(instanceId, "feishu", "oc_group_like");
+
+        FakeFetcher fetcher = new FakeFetcher("feishu");
+        fetcher.failWith("oc_group_like", new ImMessageFetchException(
+            "IM_FETCH_PLATFORM_ERROR", "飞书拉取消息 HTTP 400 code=230002", "230002", true));
+
+        newService(fetcher).runOnce();
+
+        assertThat(scanRow(instanceId).lastError())
+            .contains("机器人不在该会话（230002）")
+            .doesNotContain("HTTP 400");
+    }
+
     // ═══════════════════════ 替身 ═══════════════════════
 
     /**
@@ -389,6 +494,7 @@ class ImMessageSyncServiceTest {
         private final Map<String, ImMessageFetchException> failWith = new HashMap<>();
         private int calls;
         private String lastSince;
+        private final List<String> calledChats = new ArrayList<>();
 
         FakeFetcher(String platform) {
             this.platform = platform;
@@ -418,6 +524,7 @@ class ImMessageSyncServiceTest {
                 throws com.nexusai.domain.im_message.fetch.ImMessageFetchException {
             calls++;
             lastSince = sinceIso;
+            calledChats.add(chatId);
             ImMessageFetchException typed = failWith.get(chatId);
             if (typed != null) {
                 throw typed;

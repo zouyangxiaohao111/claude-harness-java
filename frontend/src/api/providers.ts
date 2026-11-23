@@ -31,6 +31,13 @@ export interface BuiltinConnection {
   authMode?: string
 }
 
+export interface BuiltinBrandModel {
+  id: string
+  name?: string | null
+  /** 上下文窗口（可空 · 前端回落自己的默认值） */
+  maxInputTokens?: number | null
+}
+
 export interface BuiltinProviderStatus {
   key: string
   /** 左栏分组：国际 / 国内 / 本地（后端 BuiltinProviderCatalog.group） */
@@ -47,6 +54,8 @@ export interface BuiltinProviderStatus {
   modelCount: number
   /** [V299] 该品牌下的全部连接（一个品牌可以有多条） */
   connections?: BuiltinConnection[]
+  /** 模板模型建议（[2026-11-23 Octop provider 导入] 可空 · 「导入模型」里作建议，用户可改） */
+  models?: BuiltinBrandModel[] | null
 }
 
 export const providerApi = {

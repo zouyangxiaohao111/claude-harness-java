@@ -93,6 +93,10 @@ public class BrowserWsChannel implements BrowserChannel {
     /** 全局连接引用 · 一个扩展连接服务所有会话（新连接覆盖旧连接）。 */
     private final AtomicReference<WebSocketSession> connection = new AtomicReference<>();
 
+    /** 最近一次扩展活动时间（epoch millis；0 = 从未连接）。连接建立/收到响应时刷新。 */
+    private final java.util.concurrent.atomic.AtomicLong lastSeenMillis =
+        new java.util.concurrent.atomic.AtomicLong(0);
+
     /**
      * 待响应映射 · {@code callId → CompletableFuture<JsonNode>}。
      *
@@ -252,6 +256,7 @@ public class BrowserWsChannel implements BrowserChannel {
             return;
         }
         WebSocketSession old = connection.getAndSet(session);
+        lastSeenMillis.set(System.currentTimeMillis());
         if (old != null && old != session && old.isOpen()) {
             // 连接被替换：旧连接上在途的 tool_call 不会再收到回复 → 立即 fail，避免 send 干等 30s
             failAllPending("扩展连接被新连接替换（旧 wsSessionId=" + old.getId() + "），在途调用失效");
@@ -321,6 +326,7 @@ public class BrowserWsChannel implements BrowserChannel {
      * @param response 扩展回包全量消息（{@code {"type":"tool_result"/"tool_error", ...}}）
      */
     public void resolve(String callId, JsonNode response) {
+        lastSeenMillis.set(System.currentTimeMillis());
         if (callId == null || callId.isBlank()) {
             log.warn("BrowserWsChannel.resolve: callId 为空，忽略");
             return;
@@ -370,6 +376,18 @@ public class BrowserWsChannel implements BrowserChannel {
     public boolean isSessionConnected(String sessionId) {
         WebSocketSession ws = connection.get();
         return ws != null && ws.isOpen();
+    }
+
+    /**
+     * 最近一次扩展活动时间（epoch millis；0 = 从未连接）。
+     *
+     * <p>供 {@code /api/v1/browser/status} 与工具能力目录显示真实连接活性（不再让前端按
+     * 工具数 0 猜「需安装扩展」）。连接建立 / 收到扩展回包时刷新。
+     *
+     * @return epoch millis（0 = 从未）
+     */
+    public long lastSeenMillis() {
+        return lastSeenMillis.get();
     }
 
     /** 全局已连接扩展连接数（测试断言用）· 0 或 1（单连接模型）。 */

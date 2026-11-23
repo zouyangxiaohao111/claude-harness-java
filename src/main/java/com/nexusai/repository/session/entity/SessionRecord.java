@@ -55,6 +55,13 @@ public class SessionRecord {
      */
     private String disabledTools;
     /**
+     * 会话级「已启动应用」（V337 列 enabled_apps，TEXT JSON 数组，可空）· schema 门。
+     *
+     * <p>三态：null = 未设置（按应用目录 defaultOpen 种子）；{@code "[]"} = 显式全不启动；
+     * {@code ["A","B"]} = 显式启动集。String 存 JSON、解析在读侧（{@code SessionEnabledAppsConfig}）。
+     */
+    private String enabledApps;
+    /**
      * 会话级 swarm teamContext（V39 列 team_context，TEXT JSON 对象，可空）· CC original:
      * appState.teamContext（TeamCreateTool.ts:201-216 setAppState(teamContext)，session-global 稳定态）。
      * Web 多会话 → 会话列承载（multi-session-vs-cc-single-session 铁律，effort_level V31 / bare_mode
@@ -318,6 +325,9 @@ public class SessionRecord {
     public void setBareMode(Integer bareMode) { this.bareMode = bareMode; }
     public String getDisabledTools() { return disabledTools; }
     public void setDisabledTools(String disabledTools) { this.disabledTools = disabledTools; }
+    // [app-layer V337] 会话级已启动应用 getter/setter（enabled_apps 列，MyBatis-Flex snake↔camel 映射）
+    public String getEnabledApps() { return enabledApps; }
+    public void setEnabledApps(String enabledApps) { this.enabledApps = enabledApps; }
     public String getTeamContext() { return teamContext; }
     public void setTeamContext(String teamContext) { this.teamContext = teamContext; }
     public String getTodos() { return todos; }

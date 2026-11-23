@@ -242,8 +242,8 @@ public class WeChatIncrementalSync {
      * <ol>
      *   <li>{@code ~/.nexusai/wechat-log/README.md} —— 人/AI 读一眼就知道有什么；
      *   <li>{@code ~/.nexusai/wechat-log/INDEX.json} —— 机器可解析（账号、会话、条数、时间）；
-     *   <li>AI 工具 {@code wechat_search_messages} / {@code wechat_list_conversations}
-     *       直接查索引表，无需读文件。
+     *   <li>AI 工具 {@code wechat_search_messages} / {@code wechat_list_conversations} /
+     *       {@code wechat_read_conversation} 直接查索引表，无需读文件。
      * </ol>
      *
      * @param account  账号
@@ -319,7 +319,7 @@ public class WeChatIncrementalSync {
             md.append("```\n\n");
 
             md.append("## 怎么查\n\n");
-            md.append("- **AI 工具**（推荐）：`wechat_search_messages` / `wechat_list_conversations`\n");
+            md.append("- **AI 工具**（推荐）：`wechat_search_messages` / `wechat_list_conversations` / `wechat_read_conversation`\n");
             md.append("- **命令行**：`sqlite3 <上面的 .db> \"SELECT ... FROM Msg_<md5>\"`\n\n");
 
             md.append("## 当前数据\n\n");

@@ -117,7 +117,12 @@ public class AstGrepTool implements Tool {
             + "ruby, php, swift, scala, lua (toml/sql/xml/vue/svelte are not built in). "
             + "Start narrow with path; use skip/limit to page. A parse warning is not proof of absence - refine "
             + "the pattern before concluding there are no matches. Results are grouped per file with line:column "
-            + "and metavariable bindings.";
+            + "and metavariable bindings. "
+            + "Prefer AstGrep for code searches: calls, declarations and language constructs that a regex would "
+            + "have to guess. Use Grep for non-programming content (logs, prose, and configs in formats not "
+            + "listed above), for literal text targeting, or when the language is unsupported: "
+            + "AstGrep only scans extensions that map to a parsed language, while node kinds such as string "
+            + "literals or comments are matchable only where the parser exposes them.";
     }
 
     @Override

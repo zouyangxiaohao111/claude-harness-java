@@ -1619,6 +1619,9 @@ public class LlmAgentLoop implements AgentLoop {
         // [unattended/brief V329] 同一 SessionMapper 桥接到会话级显式无人值守/Brief 状态读取
         //   （sessionVisibleTools 是 static；旧「绑定渠道即无人值守」的 ImChatService 隐式判定已删）。
         com.nexusai.application.agent.config.SessionModeState.setSessionMapper(sessionMapper);
+        // [app-layer V337] 同一 SessionMapper 桥接到会话级 enabled_apps 静态读取
+        //   （SessionToolVisibility 是 static；缺此桥会静默回落 defaultOpen 种子 ⇒ 启停不生效）。
+        com.nexusai.application.agent.config.SessionEnabledAppsConfig.setSessionMapper(sessionMapper);
     }
 
     // [unattended V329] 原「桥接 ImChatService → ImUnattendedConfig」的 setter 已删除：
@@ -4141,7 +4144,13 @@ public class LlmAgentLoop implements AgentLoop {
                 promptIsPeer /* skipSlashCommands（peer 正文按纯文本送模型）*/,
                 promptOrigin /* origin（peer / null=human keyboard）*/,
                 promptSessionId /* [3b] 归属创建会话（派生 UUID 串）*/,
-                null /* boundProject */, null /* scheduleId */, null /* attachments */,
+                null /* boundProject */, null /* scheduleId */,
+                // [file-附件 drain 修复 2026-11-23] turn-0 用户附件必须随队列携带：drain 处
+                //   appendSyntheticFileReadMessages(item.attachments()) 是 type=file 附件（.md/.txt/Office）
+                //   进入模型上下文的唯一消费点（doRun 的 buildMediaAttachmentNotes 对 file 直接 skip）。
+                //   原先恒 null ⇒ 主路径（web 用户消息一律入队）的 file 附件「前端 chip 在、模型收不到」。
+                //   drain 的 injectAttachments 仅 busyQueued 生效（图片/PDF 已在 doRun 入口预注册）⇒ 不重复注入。
+                params.attachments(),
                 null /* userAttachments */, null /* imagePasteIds */,
                 null /* [V306] notifyChats（peer 入队无通知目标）*/,
                 promptPeerEnvelope /* [B] 跨会话信封（非 peer 为 null）*/));
@@ -5154,8 +5163,11 @@ public class LlmAgentLoop implements AgentLoop {
         if (tuc == null) {
             return null;
         }
+        // [app-layer V337] schema 门 = 会话级已启动应用（enabled_apps / defaultOpen 种子）；
+        //   进快照后 schema（sessionVisibleTools）与执行守卫（ToolRegistry/StreamingToolExecutor
+        //   的 blocks）读同一份 allowlist。每轮 selectedApps 只是强调层，不参与这里。
         com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot snapshot =
-            com.nexusai.application.agent.tool.SessionToolVisibility.capture(tuc.sessionId());
+            com.nexusai.application.agent.tool.SessionToolVisibility.capture(tuc.sessionId(), false);
         return tuc.withRequestExtras(com.nexusai.application.agent.tool.SessionToolVisibility
             .attach(tuc.requestExtras(), snapshot));
     }
@@ -5232,6 +5244,21 @@ public class LlmAgentLoop implements AgentLoop {
             }
             List<Tool> scoped = applySessionAgentToolPolicy(
                     ref[0].sessionId(), pool, ref[0].requestExtras());
+            // [app-layer V337] 执行侧 allowlist = 会话当前有效启动集（enabled_apps / defaultOpen 种子）。
+            //   与 schema 侧（sessionVisibleTools → Snapshot.blocks）共用同一纯判据
+            //   SessionToolVisibility.isMcpServerAllowed。⛔ 只改 schema 不改这里 ⇒ 历史 tool_call /
+            //   模型幻觉仍能执行未启动应用；两处必须同时收窄。
+            java.util.Set<String> allowedApps = com.nexusai.application.agent.tool
+                .SessionToolVisibility.effectiveAllowedApps(ref[0].sessionId());
+            if (allowedApps != null) {
+                int beforeAllowlist = scoped.size();
+                scoped = com.nexusai.application.agent.tool.SessionToolVisibility
+                    .filterByMcpAllowlist(scoped, allowedApps);
+                if (log.isDebugEnabled() && scoped.size() != beforeAllowlist) {
+                    log.debug("[app-layer] deriveTurnTuc 执行侧池裁剪 {}→{}（已启动应用={}）",
+                        beforeAllowlist, scoped.size(), allowedApps);
+                }
+            }
             ref[0] = ref[0].withAvailableTools(scoped);
         }
         return ref[0];
@@ -7683,6 +7710,24 @@ public class LlmAgentLoop implements AgentLoop {
                 ? params.userContext().get("workerToolsContext") : null;
             AgentLoopContext.maybeEmitCoordinatorContext(
                 state, params.querySource(), coordContextActive, coordWorkerTools);
+            // unattended_mode 尾部动态附件（同款投递形态）：用户开了无人值守 ⇒ 提示模型用
+            //   SendUserMessage 与用户沟通（Ask 已被摘掉）；关掉 ⇒ 投递「已结束」，否则历史里的
+            //   开启提示会一直生效、用户回来后模型仍按无人值守行事。状态不变时零追加。
+            AgentLoopContext.maybeEmitUnattendedModeNotice(state, params.querySource());
+            // [app-layer V337] 两种应用通知（都在变化时一条、无上限、原始 schema 工具名）：
+            //   ① app_enabled_change：会话级启动状态（schema 门）变化；
+            //   ② app_emphasis_change：本轮重点应用（per-turn selectedApps，仅强调，不改 schema）。
+            //   工具清单来源 = 本轮已按启动集裁剪的 perTurnTuc 池（原始名；浏览器/CU 天然覆盖）。
+            java.util.Map<String, java.util.List<String>> appTools = AgentLoopContext.mcpToolsByServer(
+                perTurnTuc != null ? perTurnTuc.availableTools() : null);
+            AgentLoopContext.maybeEmitAppEnabledChange(state, params.querySource(),
+                com.nexusai.application.agent.tool.SessionToolVisibility
+                    .effectiveEnabledAppKeys(state.sessionId()),
+                appTools);
+            AgentLoopContext.maybeEmitAppEmphasisChange(state, params.querySource(),
+                com.nexusai.application.agent.tool.SessionToolVisibility.selectedAppsFromExtras(
+                    params.toolUseContext() != null
+                        ? params.toolUseContext().requestExtras() : null));
             if (log.isDebugEnabled()) {
                 log.debug("LlmAgentLoop s10: 每 tool 轮 system prompt 段完成（材料收集由调用方一次）: "
                         + "custom={}, promptSegments={}, userKeys={}, systemKeys={}",
@@ -14345,6 +14390,19 @@ public class LlmAgentLoop implements AgentLoop {
     }
 
     /**
+     * [coordinator-unattended] 读取当前 CoordinatorMode 静态门（Spring 注入实例）。
+     *
+     * <p>供 {@link com.nexusai.application.agent.tool.SessionToolVisibility} 判定
+     * 「无人值守 + 协调者」时作为 feature+env 回落层 —— 与 {@link #sessionVisibleToolsBase}
+     * 的 coordinator 门同源（都走 {@code staticCoordinatorModeActiveForSession}）。
+     *
+     * @return 当前门（未注入时 = 默认实例，feature/env 恒关）
+     */
+    public static CoordinatorMode coordinatorModeBean() {
+        return coordinatorMode;
+    }
+
+    /**
      * [A1 coordinator 工具池过滤] Spring prototype 注入 CoordinatorMode bean ·
      * 对齐 ToolRegistry.setCoordinatorMode / SubagentTool.setCoordinatorModeBean 模式
      * （{@code @Autowired(required=false)} 容错无 bean 场景）。委托静态 setter（llmToolsArray
@@ -14964,7 +15022,21 @@ public class LlmAgentLoop implements AgentLoop {
                     // [tool-search-refused] 端点曾以「不认 defer_loading」400/422 拒绝过 ⇒ 本会话永走
                     //   全量内联（对齐 CC：拒绝后会话内不再发 deferred，ENABLE_TOOL_SEARCH=false 语义）。
                     && !ToolSearchService.isToolSearchRefused(tuc.sessionId());
-            Set<String> deferredToolNames = ToolSearchService.computeDeferredToolNames(available);
+            // [app-layer V337] 已启动应用（enabled_apps 门）的 MCP 工具 = alwaysLoad（豁免
+            //   「MCP 恒 defer」）⇒ 直接进 schema；allowlist 已在池层剔除未启动应用的工具。
+            Set<String> alwaysLoadNames = new java.util.HashSet<>();
+            com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot selectionSnapshot =
+                com.nexusai.application.agent.tool.SessionToolVisibility.resolve(
+                    tuc.sessionId(), tuc.requestExtras());
+            if (selectionSnapshot.hasMcpAllowlist()) {
+                for (Tool tool : available) {
+                    if (tool != null && tool.isMcp()) {
+                        alwaysLoadNames.add(tool.name());
+                    }
+                }
+            }
+            Set<String> deferredToolNames =
+                ToolSearchService.computeDeferredToolNames(available, alwaysLoadNames);
             // [vision-defer-model 2026-09-03 / R12 2026-09-12 判据单点化] vision_analyze 懒加载豁免
             //   （装配层按主模型能力判定）：仅「能用 tool_reference」AND 多模态（supportsImage）才保留懒 ——
             //   该模型能走 Read 直给通道，vision_analyze 仅 PDF 超预算/分段补充，可 defer 省 token；
@@ -15102,10 +15174,15 @@ public class LlmAgentLoop implements AgentLoop {
         //   排除 SUBAGENT/FORK/HOOK_AGENT/COMPACT 等（否则 coordinator 模式会错误把 worker
         //   工具池裁剪为编排白名单 → worker 拿不到 Bash/Read/Edit）。
         if (topLevelLoop && coordinatorActive) {
-            available = AgentToolUtils.applyCoordinatorToolFilter(available);
+            // [coordinator-unattended] 无人值守协调者：IM 组并入白名单（本仓扩展，CC 无此项）。
+            //   判定与 SessionToolVisibility.capture 的 IM 默认值同源。
+            boolean imToolsAllowed = com.nexusai.application.agent.tool.SessionToolVisibility
+                .isUnattendedCoordinator(tuc.sessionId());
+            available = AgentToolUtils.applyCoordinatorToolFilter(available, imToolsAllowed);
             if (log.isInfoEnabled()) {
                 log.info("LlmAgentLoop.sessionVisibleTools: coordinator 模式开启，顶层循环工具池经"
-                        + " applyCoordinatorToolFilter 裁剪（对齐 CC main.tsx:1872-1877）");
+                        + " applyCoordinatorToolFilter 裁剪（对齐 CC main.tsx:1872-1877）"
+                        + (imToolsAllowed ? " + IM 组（无人值守）" : ""));
             }
         }
         return available;
@@ -15136,13 +15213,15 @@ public class LlmAgentLoop implements AgentLoop {
             com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot snapshot =
                 com.nexusai.application.agent.tool.SessionToolVisibility
                     .resolve(tuc.sessionId(), tuc.requestExtras());
-            if (!snapshot.disabled().isEmpty()) {
+            // [app-layer V337] enabled_apps 门：即使 disabled 为空也必须走过滤，
+            //   否则未启动应用的 MCP 工具仍留在 schema（对未来新增 server 同样泄漏）。
+            if (!snapshot.disabled().isEmpty() || snapshot.hasMcpAllowlist()) {
                 int before = available.size();
                 available = available.stream()
                         .filter(t -> t != null && !snapshot.blocks(t.name()))
                         .toList();
                 if (log.isDebugEnabled() && available.size() != before) {
-                    log.debug("sessionVisibleTools: 会话可见集剔除 {} 个（V330 单一解析器，"
+                    log.debug("sessionVisibleTools: 会话可见集剔除 {} 个（V330 单一解析器 + V337 enabled_apps 门，"
                             + "复刻 CC blanket deny schema 阶段剔除，tools.ts:262-269）",
                             before - available.size());
                 }

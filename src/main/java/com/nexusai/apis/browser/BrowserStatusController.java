@@ -46,9 +46,17 @@ public class BrowserStatusController {
     @GetMapping("/status")
     public Map<String, Object> status() {
         boolean connected = browserWsChannel != null && browserWsChannel.hasSessionConnection();
+        long lastSeen = browserWsChannel != null ? browserWsChannel.lastSeenMillis() : 0L;
         if (log.isDebugEnabled()) {
-            log.debug("[BrowserStatusController] GET /api/v1/browser/status → connected={}", connected);
+            log.debug("[BrowserStatusController] GET /api/v1/browser/status → connected={} lastSeen={}",
+                connected, lastSeen);
         }
-        return Map.of("connected", connected);
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("connected", connected);
+        out.put("lastSeen", lastSeen > 0
+            ? java.time.OffsetDateTime.ofInstant(
+                java.time.Instant.ofEpochMilli(lastSeen), java.time.ZoneId.systemDefault()).toString()
+            : null);
+        return out;
     }
 }

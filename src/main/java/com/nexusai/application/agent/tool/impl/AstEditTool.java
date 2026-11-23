@@ -174,7 +174,13 @@ public class AstEditTool implements Tool {
             + "with the identical ops/paths and apply: true to write. If a previewed file changes before apply, "
             + "the edit is rejected as stale - re-preview. Overlapping replacements are rejected (refine the "
             + "pattern). Language is inferred per file; pass lang only to disambiguate (e.g. cpp for .h) and note "
-            + "it then restricts the scan to that language.";
+            + "it then restricts the scan to that language. "
+            + "Prefer AstEdit for program-code changes, including a single location; use Edit for "
+            + "non-programming content, or when AST cannot express the change or the language is unsupported. "
+            + "Matching is syntactic, not symbol-aware: it does not resolve symbols or "
+            + "types, so it is not a semantic rename and does not guarantee a type-safe signature migration; "
+            + "string literals are ordinary AST nodes and can be matched. Preview the diff and check the "
+            + "surrounding code before applying - the preview shows matched regions, not whole-file context.";
     }
 
     @Override

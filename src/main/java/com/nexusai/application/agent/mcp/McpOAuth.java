@@ -1,6 +1,7 @@
 package com.nexusai.application.agent.mcp;
 
 import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import java.nio.charset.StandardCharsets;
 import java.security.MessageDigest;
@@ -51,6 +52,67 @@ public final class McpOAuth {
     public static final String ENV_OAUTH_MIRROR_KEY = "__mcp_oauth__";
 
     private McpOAuth() {}
+
+    /** env 镜像 {@code __mcp_oauth__} 解码结果（[2026-11-23] 运行时接线唯一读取口）。 */
+    public record OAuthEnvInfo(
+            String clientId,
+            String configuredCallbackPort,
+            String authServerMetadataUrl,
+            boolean xaa,
+            String scopes,
+            String authorizationEndpoint,
+            String tokenEndpoint) {
+
+        public static final OAuthEnvInfo EMPTY =
+                new OAuthEnvInfo(null, null, null, false, null, null, null);
+    }
+
+    /**
+     * 反解 env 里的 oauth 镜像（base64(JSON)）→ {@link OAuthEnvInfo}。
+     *
+     * <p>这是「面板上填的 OAuth 配置喂给运行时」的唯一解析点：三处 {@code OAuthServerConfig}
+     * 构造统一走 {@link #oauthServerConfig}，避免任一处漏传导致配置是摆设。
+     */
+    public static OAuthEnvInfo oauthEnv(Map<String, String> env) {
+        if (env == null) {
+            return OAuthEnvInfo.EMPTY;
+        }
+        String raw = env.get(ENV_OAUTH_MIRROR_KEY);
+        if (raw == null || raw.isBlank()) {
+            return OAuthEnvInfo.EMPTY;
+        }
+        try {
+            JsonNode node = JSON.readTree(new String(java.util.Base64.getDecoder().decode(raw),
+                    StandardCharsets.UTF_8));
+            if (node == null || !node.isObject()) {
+                return OAuthEnvInfo.EMPTY;
+            }
+            return new OAuthEnvInfo(
+                    text(node, "clientId"),
+                    text(node, "callbackPort"),
+                    text(node, "authServerMetadataUrl"),
+                    node.path("xaa").asBoolean(false),
+                    text(node, "scopes"),
+                    text(node, "authorizationEndpoint"),
+                    text(node, "tokenEndpoint"));
+        } catch (Exception e) {
+            return OAuthEnvInfo.EMPTY;
+        }
+    }
+
+    /** 从 env 构建 {@code McpAuth.OAuthServerConfig}（保留 __mcp_oauth__ 剥除后的 headers）。 */
+    public static McpAuth.OAuthServerConfig oauthServerConfig(
+            String type, String url, Map<String, String> env) {
+        OAuthEnvInfo o = oauthEnv(env);
+        return new McpAuth.OAuthServerConfig(type, url, headersOnly(env),
+                o.configuredCallbackPort(), o.clientId(), o.authServerMetadataUrl(),
+                o.scopes(), o.authorizationEndpoint(), o.tokenEndpoint());
+    }
+
+    private static String text(JsonNode node, String field) {
+        JsonNode v = node.get(field);
+        return v == null || !v.isValueNode() ? null : v.asText(null);
+    }
 
     /**
      * 把 env（远程 server 的 headers 载体）按「headers 语义」剥除保留键的只读视图。

@@ -5067,7 +5067,7 @@ public record AgentLoopContext(
             }
             return;
         }
-        ChatMessageDto msg = coordinatorContextMessage(sessionId, rendered, subtype);
+        ChatMessageDto msg = attachmentMetaMessage(sessionId, rendered, subtype);
         if (msg == null) {
             return;
         }
@@ -5077,8 +5077,13 @@ public record AgentLoopContext(
             subtype, changed, querySource);
     }
 
-    /** coordinator_context meta 消息构造（isMeta=true user 消息，subtype 编码形态）。 */
-    public static ChatMessageDto coordinatorContextMessage(String sessionId, String content, String subtype) {
+    /**
+     * 尾部 meta 附件消息构造（isMeta=true user 消息，subtype 编码形态）。
+     *
+     * <p>coordinator_context / unattended_mode 共用：两者都只是「一次性告知模型一条状态变更」，
+     * 走同一条 {@code state.appendMessage} 通道（落库 + STOMP），不占 system prompt（保前缀缓存）。
+     */
+    public static ChatMessageDto attachmentMetaMessage(String sessionId, String content, String subtype) {
         if (content == null || content.isBlank()) {
             return null;
         }
@@ -5121,6 +5126,433 @@ public record AgentLoopContext(
             }
         }
         return null;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // unattended_mode 动态附件 · 无人值守开关的尾部提示
+    //
+    // 为什么需要它：无人值守会话把 AskUserQuestion 从工具池里摘掉了（ImUnattendedConfig），
+    // 同时 SendUserMessage 被打开（SessionModeService.setUnattended ⇒ brief=on）。模型只知道
+    // 「哪些工具在」，不知道「用户不在电脑前」——于是会把结论只留在正文里（用户看不到
+    // 会话窗口），或反复尝试向用户提问。这里补一条状态提示。
+    //
+    // 为什么是尾部 meta 消息而不是 system prompt：system prompt 参与前缀缓存，
+    // 按会话状态改写它会让缓存按会话/按开关分裂；尾部消息只在状态切换时投递一次。
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 无人值守「已开启」提示的 subtype。 */
+    public static final String UNATTENDED_MODE_SUBTYPE = "unattended_mode";
+    /** 无人值守「已结束」提示的 subtype。 */
+    public static final String UNATTENDED_MODE_END_SUBTYPE = "unattended_mode_end";
+
+    /** 开启文案（模型侧英文，与 coordinator_context 同一风格）。 */
+    static final String UNATTENDED_MODE_TEXT =
+        "The user has enabled unattended mode and is not at the computer. Communicate with the "
+            + "user through the SendUserMessage tool, and send a short message with it before you "
+            + "end your final reply.";
+
+    /** 结束文案：避免用户回来后模型仍按「无人值守」行事（历史里的开启提示不会自己消失）。 */
+    static final String UNATTENDED_MODE_ENDED_TEXT =
+        "Unattended mode has ended; the user is back at the computer and reads your reply in the session.";
+
+    /**
+     * 无人值守开关的尾部提示 · 开/关各投递一次。
+     *
+     * <p>判据读两处：会话状态（{@code sessions.unattended_mode}，与工具池同一读源）与
+     * 本 agent 自己历史里的上一条 unattended 提示。两者不一致才投递 —— 一致即无事可做，
+     * 因此每个 tool 轮调用都是幂等的（第二次起零追加）。
+     *
+     * <p>只对主线程投递（{@code USER / REPL_MAIN_THREAD / SDK}）：子代理/后台 fork 不直接面向
+     * 用户，提示它们用 SendUserMessage 只会误导。
+     *
+     * @param state       AgentState（消息历史 + appendMessage 通道）
+     * @param querySource 本次 query 来源
+     */
+    public static void maybeEmitUnattendedModeNotice(AgentState state, QuerySource querySource) {
+        if (state == null) {
+            return;
+        }
+        if (querySource != QuerySource.USER
+                && querySource != QuerySource.REPL_MAIN_THREAD
+                && querySource != QuerySource.SDK) {
+            return;
+        }
+        boolean unattended = com.nexusai.application.agent.config.ImUnattendedConfig
+            .isUnattended(state.sessionId());
+        boolean announced = lastUnattendedNoticeActive(state.rawMessages());
+        if (unattended == announced) {
+            // 状态与历史一致：已投递过开启提示，或本就未开启且未提示过 ⇒ 零追加
+            return;
+        }
+        String sessionId = state.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        String subtype = unattended ? UNATTENDED_MODE_SUBTYPE : UNATTENDED_MODE_END_SUBTYPE;
+        ChatMessageDto msg = attachmentMetaMessage(sessionId,
+            unattended ? UNATTENDED_MODE_TEXT : UNATTENDED_MODE_ENDED_TEXT, subtype);
+        if (msg == null) {
+            return;
+        }
+        state.appendMessage(msg);
+        log.info("[unattended] 尾部投递 subtype={} session={} querySource={}",
+            subtype, sessionId, querySource);
+    }
+
+    /**
+     * 历史里最后一条 unattended 提示是否仍是「已开启」。
+     *
+     * <p>倒序扫描：先遇到 {@code unattended_mode} ⇒ true；先遇到
+     * {@code unattended_mode_end} ⇒ false；都没有 ⇒ false（从未提示过）。
+     *
+     * @param messages 消息历史（可 null）
+     * @return true = 历史里最后一条提示是「已开启」
+     */
+    static boolean lastUnattendedNoticeActive(java.util.List<ChatMessageDto> messages) {
+        if (messages == null || messages.isEmpty()) {
+            return false;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto m = messages.get(i);
+            if (m == null) {
+                continue;
+            }
+            String sub = m.subtype();
+            if (UNATTENDED_MODE_END_SUBTYPE.equals(sub)) {
+                return false;
+            }
+            if (UNATTENDED_MODE_SUBTYPE.equals(sub)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    // ════════════════════════════════════════════════════════════════════════
+    // app_selection 动态附件 · 本轮选中应用（连接器 / MCP server）的尾部提示
+    //
+    // 为什么需要它：本轮工具池已按 selectedApps 收窄（只留 mcp__<server>__*），
+    // 但模型只会看到「工具少了」——不知道原因是用户换了应用选择。这里在状态切换时
+    // 补一条告知，并明确「以最新一条为准」，避免按旧清单行事。
+    //
+    // 形态与 coordinator_context / unattended_mode 同款（append-only 尾部 meta 消息，
+    // ⛔ 不写 messages[0]、不进 system prompt，避免前缀缓存按选择值分裂）。
+    // ════════════════════════════════════════════════════════════════════════
+
+    /** 启动状态变化提示的 subtype（schema 门）。 */
+    public static final String APP_ENABLED_CHANGE_SUBTYPE = "app_enabled_change";
+    /** 本轮重点应用变化提示的 subtype（仅强调，不改 schema）。 */
+    public static final String APP_EMPHASIS_CHANGE_SUBTYPE = "app_emphasis_change";
+
+    /** 正文后缀。 */
+    static final String APP_TEXT_SUFFIX = "。";
+    /** 启动状态变化：引导语 / +启动 / -停止 / 当前已启动。 */
+    static final String APP_ENABLED_LEAD = "应用启动状态已更新：";
+    static final String APP_ENABLED_ADDED_PREFIX = "+启动 ";
+    static final String APP_ENABLED_REMOVED_PREFIX = "-停止 ";
+    static final String APP_CURRENT_ENABLED_PREFIX = "当前已启动：";
+    /** 重点应用变化：引导语 / +新增 / -移除 / 当前重点。 */
+    static final String APP_EMPHASIS_LEAD = "本轮重点应用已更新：";
+    static final String APP_EMPHASIS_ADDED_PREFIX = "+新增 ";
+    static final String APP_EMPHASIS_REMOVED_PREFIX = "-移除 ";
+    static final String APP_CURRENT_EMPHASIS_PREFIX = "当前重点：";
+    /** 空列表文案。 */
+    static final String APP_NONE_TEXT = "无";
+
+    /**
+     * 启动状态变化提示（{@code app_enabled_change}，schema 门）· 变化时一条、无上限、原始工具名。
+     *
+     * <p>正文：{@code 应用启动状态已更新：+启动 X（工具：mcp__…）；-停止 Y；当前已启动：X、Z。}
+     * 比较键 = 排序后的 enabled key 列表（工具集变化不算变化）。每 tool 轮幂等。
+     *
+     * @param state       AgentState
+     * @param querySource 本次 query 来源（仅主线程）
+     * @param enabledApps 会话当前有效启动集（raw key；{@code null} = 无来源 → 不投递）
+     * @param appTools    应用 key（规范化）→ 原始 schema 工具名（{@link #mcpToolsByServer}）
+     */
+    public static void maybeEmitAppEnabledChange(AgentState state, QuerySource querySource,
+                                                 java.util.List<String> enabledApps,
+                                                 java.util.Map<String, java.util.List<String>> appTools) {
+        if (state == null || !isMainThreadSource(querySource) || enabledApps == null) {
+            return;
+        }
+        java.util.TreeSet<String> current = sortedAppKeys(enabledApps);
+        java.util.TreeSet<String> previous = lastAppKeys(state.rawMessages(),
+            APP_ENABLED_CHANGE_SUBTYPE, APP_CURRENT_ENABLED_PREFIX);
+        if (previous == null && current.isEmpty()) {
+            return; // 从未启动过任何应用 ⇒ 无事可报
+        }
+        if (previous != null && current.equals(previous)) {
+            return; // 同状态 ⇒ 零追加
+        }
+        java.util.TreeSet<String> base = previous == null ? new java.util.TreeSet<>() : previous;
+        String content = renderEnabledChange(current, base, appTools) + APP_TEXT_SUFFIX;
+        appendAppNotice(state, querySource, APP_ENABLED_CHANGE_SUBTYPE, content, current);
+    }
+
+    /**
+     * 本轮重点应用变化提示（{@code app_emphasis_change}，仅强调，⛔ 不改 schema）。
+     *
+     * <p>正文：{@code 本轮重点应用已更新：+新增 X、Y；-移除 Z；当前重点：X、Y。}
+     * 比较键 = 排序后的 emphasis key 列表。每 tool 轮幂等。
+     *
+     * @param state       AgentState
+     * @param querySource 本次 query 来源（仅主线程）
+     * @param emphasisApps 本轮 selectedApps（{@code null}/空 = 无重点）
+     */
+    public static void maybeEmitAppEmphasisChange(AgentState state, QuerySource querySource,
+                                                  java.util.List<String> emphasisApps) {
+        if (state == null || !isMainThreadSource(querySource)) {
+            return;
+        }
+        java.util.TreeSet<String> current = sortedAppKeys(emphasisApps);
+        java.util.TreeSet<String> previous = lastAppKeys(state.rawMessages(),
+            APP_EMPHASIS_CHANGE_SUBTYPE, APP_CURRENT_EMPHASIS_PREFIX);
+        if (previous == null && current.isEmpty()) {
+            return;
+        }
+        if (previous != null && current.equals(previous)) {
+            return;
+        }
+        java.util.TreeSet<String> base = previous == null ? new java.util.TreeSet<>() : previous;
+        String content = renderEmphasisChange(current, base) + APP_TEXT_SUFFIX;
+        appendAppNotice(state, querySource, APP_EMPHASIS_CHANGE_SUBTYPE, content, current);
+    }
+
+    private static boolean isMainThreadSource(QuerySource qs) {
+        return qs == QuerySource.USER || qs == QuerySource.REPL_MAIN_THREAD || qs == QuerySource.SDK;
+    }
+
+    private static void appendAppNotice(AgentState state, QuerySource querySource, String subtype,
+                                        String content, java.util.TreeSet<String> current) {
+        String sessionId = state.sessionId();
+        if (sessionId == null || sessionId.isBlank()) {
+            return;
+        }
+        ChatMessageDto msg = attachmentMetaMessage(sessionId, content, subtype);
+        if (msg == null) {
+            return;
+        }
+        state.appendMessage(msg);
+        log.info("[app-layer] 尾部投递 subtype={} apps={} session={} querySource={}",
+            subtype, current, sessionId, querySource);
+    }
+
+    /**
+     * 单应用片段：{@code <展示名>（工具：mcp__… / mcp__…）}（无工具 → 「工具：暂无」）。
+     *
+     * <p><b>不设上限</b>：全量列出原始 schema 工具名（不剥前缀）；内置应用显示展示名。
+     */
+    static String renderAppSegment(String app,
+                                   java.util.Map<String, java.util.List<String>> appTools) {
+        String normalized = com.nexusai.application.agent.mcp.McpStringUtils
+            .normalizeNameForMCP(app);
+        java.util.List<String> tools = appTools == null ? null : appTools.get(normalized);
+        StringBuilder sb = new StringBuilder();
+        sb.append(app).append("（工具：");
+        if (tools == null || tools.isEmpty()) {
+            sb.append("暂无");
+        } else {
+            for (int i = 0; i < tools.size(); i++) {
+                if (i > 0) {
+                    sb.append(" / ");
+                }
+                sb.append(tools.get(i));
+            }
+        }
+        sb.append('）');
+        return sb.toString();
+    }
+
+    /**
+     * 启动状态变化正文：{@code +启动 X（工具：…）/ -停止 Y / 当前已启动：X、Z}。
+     *
+     * @param current  本轮启动集（排序）
+     * @param previous 历史启动集（非 null；空集 = 首次）
+     * @param appTools 应用 → 原始 schema 工具名
+     * @return 正文（不含句号）
+     */
+    static String renderEnabledChange(java.util.TreeSet<String> current,
+                                      java.util.TreeSet<String> previous,
+                                      java.util.Map<String, java.util.List<String>> appTools) {
+        java.util.TreeSet<String> added = new java.util.TreeSet<>(current);
+        added.removeAll(previous);
+        java.util.TreeSet<String> removed = new java.util.TreeSet<>(previous);
+        removed.removeAll(current);
+
+        StringBuilder sb = new StringBuilder(APP_ENABLED_LEAD);
+        boolean any = false;
+        if (!added.isEmpty()) {
+            sb.append(APP_ENABLED_ADDED_PREFIX)
+                .append(String.join("、", added.stream()
+                    .map(app -> renderAppSegment(app, appTools))
+                    .toList()));
+            any = true;
+        }
+        if (!removed.isEmpty()) {
+            if (any) {
+                sb.append("；");
+            }
+            sb.append(APP_ENABLED_REMOVED_PREFIX)
+                .append(joinLabels(removed));
+            any = true;
+        }
+        if (any) {
+            sb.append("；");
+        }
+        sb.append(APP_CURRENT_ENABLED_PREFIX)
+            .append(current.isEmpty() ? APP_NONE_TEXT : joinLabels(current));
+        return sb.toString();
+    }
+
+    /**
+     * 重点应用变化正文：{@code +新增 X、Y / -移除 Z / 当前重点：X、Y}（不带工具名）。
+     *
+     * @param current  本轮重点（排序）
+     * @param previous 历史重点（非 null；空集 = 首次）
+     * @return 正文（不含句号）
+     */
+    static String renderEmphasisChange(java.util.TreeSet<String> current,
+                                       java.util.TreeSet<String> previous) {
+        java.util.TreeSet<String> added = new java.util.TreeSet<>(current);
+        added.removeAll(previous);
+        java.util.TreeSet<String> removed = new java.util.TreeSet<>(previous);
+        removed.removeAll(current);
+
+        StringBuilder sb = new StringBuilder(APP_EMPHASIS_LEAD);
+        boolean any = false;
+        if (!added.isEmpty()) {
+            sb.append(APP_EMPHASIS_ADDED_PREFIX).append(joinLabels(added));
+            any = true;
+        }
+        if (!removed.isEmpty()) {
+            if (any) {
+                sb.append("；");
+            }
+            sb.append(APP_EMPHASIS_REMOVED_PREFIX).append(joinLabels(removed));
+            any = true;
+        }
+        if (any) {
+            sb.append("；");
+        }
+        sb.append(APP_CURRENT_EMPHASIS_PREFIX)
+            .append(current.isEmpty() ? APP_NONE_TEXT : joinLabels(current));
+        return sb.toString();
+    }
+
+    /** key 列表 → {@code 、} 连接（应用层只含 MCP，key 即展示名）。 */
+    private static String joinLabels(java.util.Collection<String> keys) {
+        return String.join("、", keys);
+    }
+
+    /**
+     * 工具池 → 应用 key（规范化 server 段）→ <b>原始 schema 工具名</b>。
+     *
+     * <p>判据与 allowlist 同源：{@code mcp__<server>__<tool>} 解析 server 段；工具名保持
+     * 原始全名（如 {@code mcp__codegraph__explore}，协调者裁定不剥前缀）。非 MCP 形态工具
+     * （Bash/Read/KB/IM）不参与。浏览器（{@code mcp__nexusai-in-chrome__*}）与 computer-use
+     * （{@code mcp__computer-use__*}）同样是 mcp 形态 ⇒ 天然覆盖，无需第二套映射。
+     *
+     * @param tools 工具池（可 null）
+     * @return 规范化 server 名 → 排序去重后的原始工具名（无 MCP 工具 → 空 map）
+     */
+    public static java.util.Map<String, java.util.List<String>> mcpToolsByServer(
+            java.util.List<com.nexusai.application.agent.tool.Tool> tools) {
+        if (tools == null || tools.isEmpty()) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, java.util.TreeSet<String>> grouped = new java.util.HashMap<>();
+        for (com.nexusai.application.agent.tool.Tool t : tools) {
+            String name = t == null ? null : t.name();
+            if (name == null) {
+                continue;
+            }
+            com.nexusai.application.agent.mcp.McpStringUtils.McpInfo info =
+                com.nexusai.application.agent.mcp.McpStringUtils.mcpInfoFromString(name);
+            if (info == null) {
+                continue;
+            }
+            grouped.computeIfAbsent(info.serverName(), k -> new java.util.TreeSet<>()).add(name);
+        }
+        if (grouped.isEmpty()) {
+            return java.util.Map.of();
+        }
+        java.util.Map<String, java.util.List<String>> out = new java.util.HashMap<>();
+        grouped.forEach((server, names) -> out.put(server, java.util.List.copyOf(names)));
+        return java.util.Map.copyOf(out);
+    }
+
+    /** 去空/去重/排序后的应用 key（空串名单 → 空集）。 */
+    static java.util.TreeSet<String> sortedAppKeys(java.util.List<String> selectedApps) {
+        java.util.TreeSet<String> sorted = new java.util.TreeSet<>();
+        if (selectedApps == null) {
+            return sorted;
+        }
+        for (String app : selectedApps) {
+            if (app == null || app.isBlank()) {
+                continue;
+            }
+            sorted.add(app.trim());
+        }
+        return sorted;
+    }
+
+    /**
+     * 历史里最后一条指定 subtype 通知的应用 key 集合（比较键）。
+     *
+     * <p>从正文的 {@code <currentPrefix><labels>。} 尾段解析（标签 → key 反解）；
+     * 形态不符 ⇒ null（视为无历史，宁可再报一次）。
+     *
+     * @param messages      消息历史（可 null）
+     * @param subtype       目标 subtype（{@code app_enabled_change} / {@code app_emphasis_change}）
+     * @param currentPrefix 当前列表前缀（{@code 当前已启动：} / {@code 当前重点：}）
+     * @return 应用 key 集合；没有该 subtype 的历史 ⇒ null
+     */
+    static java.util.TreeSet<String> lastAppKeys(java.util.List<ChatMessageDto> messages,
+                                                 String subtype, String currentPrefix) {
+        if (messages == null || messages.isEmpty()) {
+            return null;
+        }
+        for (int i = messages.size() - 1; i >= 0; i--) {
+            ChatMessageDto m = messages.get(i);
+            if (m == null || !subtype.equals(m.subtype())) {
+                continue;
+            }
+            String content = m.content();
+            if (content == null) {
+                continue;
+            }
+            int idx = content.indexOf(currentPrefix);
+            if (idx < 0) {
+                return null;
+            }
+            String tail = content.substring(idx + currentPrefix.length());
+            if (tail.endsWith(APP_TEXT_SUFFIX)) {
+                tail = tail.substring(0, tail.length() - APP_TEXT_SUFFIX.length());
+            }
+            if (APP_NONE_TEXT.equals(tail.trim())) {
+                return new java.util.TreeSet<>();
+            }
+            return keysFromLabels(tail.split("、"));
+        }
+        return null;
+    }
+
+    private static java.util.TreeSet<String> keysFromLabels(String[] labels) {
+        java.util.TreeSet<String> keys = new java.util.TreeSet<>();
+        for (String label : labels) {
+            if (label != null && !label.isBlank()) {
+                addKey(keys, label.trim());
+            }
+        }
+        return keys;
+    }
+
+    /** 通知正文里的标签 → 应用 key（应用层只含 MCP ⇒ 恒等）。 */
+    private static void addKey(java.util.TreeSet<String> keys, String label) {
+        if (label != null && !label.isBlank()) {
+            keys.add(label.trim());
+        }
     }
 
     /**

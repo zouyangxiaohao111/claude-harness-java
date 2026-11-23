@@ -50,10 +50,19 @@ public class ImChatController {
     /** [V329] 渠道接线 ⇄ 会话 Brief/无人值守联动（配置渠道 ⇒ Brief+IM 工具开；移除最后一个 ⇒ 两者关）。 */
     @Autowired private com.nexusai.domain.session.SessionModeService sessionModeService;
 
-    /** 全部聊天（按最后消息时间倒序）。 */
+    /**
+     * 全部聊天（按最后消息时间倒序）。
+     *
+     * <p>[V335] 默认隐藏「机器人不在该群且未接线」的会话（飞书「本人所在群」同步进来的那些：
+     * 群里 @ 机器人不会推事件、拉历史也会被拒）。已接线的仍返回 —— 否则用户没法解绑。
+     * 后期要「开放显示」时传 {@code includeUnreachable=true}，不用改数据层。
+     */
     @GetMapping
-    public List<ImChatEntry> list() {
-        return chatService.list();
+    public List<ImChatEntry> list(
+            @org.springframework.web.bind.annotation.RequestParam(
+                    name = "includeUnreachable", defaultValue = "false")
+            boolean includeUnreachable) {
+        return includeUnreachable ? chatService.list() : chatService.listVisible();
     }
 
     /** 某任务接的聊天（左栏「IM 会话」块可复用）。 */
@@ -124,7 +133,7 @@ public class ImChatController {
         if (instanceId == null || instanceId.isBlank() || sessionId == null || sessionId.isBlank()) {
             throw new ValidationException("instanceId / sessionId 不能为空");
         }
-        ImChatEntry target = chooseDefaultChat(chatService.listByInstance(instanceId));
+        ImChatEntry target = chooseDefaultChat(chatService.listByInstanceVisible(instanceId));
         if (target == null) {
             String platform = channelService.findById(instanceId)
                     .map(com.nexusai.model.im_channel.ImInstanceEntry::platform).orElse(null);
@@ -167,7 +176,7 @@ public class ImChatController {
         if (instanceId == null || instanceId.isBlank()) {
             throw new ValidationException("instanceId 不能为空");
         }
-        ImChatEntry target = chooseDefaultChat(chatService.listByInstance(instanceId));
+        ImChatEntry target = chooseDefaultChat(chatService.listByInstanceVisible(instanceId));
         Map<String, Object> out = new LinkedHashMap<>();
         if (target == null) {
             out.put("found", false);
@@ -199,6 +208,8 @@ public class ImChatController {
     /** 默认会话：私聊优先（飞书 oc_ 行优先），否则最近活跃的任一会话。 */
     private static ImChatEntry chooseDefaultChat(List<ImChatEntry> chats) {
         if (chats == null || chats.isEmpty()) {
+            // [V335] 调用方传进来的已经是「现在能发」的集合（listByInstanceVisible）：
+            //   飞书不在群的群、微信群聊、微信未激活单聊都已排除。
             return null;
         }
         java.util.Comparator<ImChatEntry> byRecent = java.util.Comparator.comparing(

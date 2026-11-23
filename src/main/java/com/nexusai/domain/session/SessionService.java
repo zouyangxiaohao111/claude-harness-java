@@ -181,6 +181,54 @@ public class SessionService {
         return result;
     }
 
+    /** {@link #search} 的每页条数上限（防止前端传超大 size 把整表拉回）。 */
+    public static final int SEARCH_MAX_PAGE_SIZE = 50;
+
+    /**
+     * 会话模糊搜索（标题 / id 子串匹配 · 分页）· {@code GET /api/v1/sessions/search}。
+     *
+     * <p><b>WHY 放到 DB 而不是前端过滤</b>：左栏 / 搜索面板此前只过滤「已加载的那一份会话数组」，
+     * 会话多了之后旧会话根本搜不到（用户实测：搜索是假的）。这里按 {@code LIKE %kw%} 直接查库，
+     * 定序与 {@link #list} 同口径（{@code updated_at DESC, id ASC}）⇒ 翻页不会重复/漏行。
+     *
+     * <p>口径：空白关键词 = 全部会话（按最近活跃分页，供面板空查询时显示「最近会话」）；
+     * {@code %}/{@code _}/{@code \} 按字面量匹配（用户输入的通配符不放大结果集）。
+     *
+     * @param query    关键词（可为 null/空白）
+     * @param page     页号（1 起，越界自动收敛）
+     * @param pageSize 每页条数（1..{@value #SEARCH_MAX_PAGE_SIZE}）
+     */
+    public com.nexusai.model.session.dto.SessionSearchPage search(String query, int page, int pageSize) {
+        int p = Math.max(1, page);
+        int ps = Math.min(SEARCH_MAX_PAGE_SIZE, Math.max(1, pageSize));
+        String kw = query == null ? "" : query.trim();
+        QueryWrapper countQw = QueryWrapper.create();
+        QueryWrapper listQw = QueryWrapper.create();
+        if (!kw.isEmpty()) {
+            String pattern = likePattern(kw);
+            // ESCAPE '\'：让用户输入里的 % / _ 按字面量匹配
+            String cond = "(title LIKE ? ESCAPE '\\' OR id LIKE ? ESCAPE '\\')";
+            countQw.where(cond, pattern, pattern);
+            listQw.where(cond, pattern, pattern);
+        }
+        long total = sessionMapper.selectCountByQuery(countQw);
+        List<SessionRecord> rows = total == 0 ? List.of()
+            : sessionMapper.selectListByQuery(listQw
+                .orderBy("updated_at", false)
+                .orderBy("id", true)
+                .limit((p - 1) * ps, ps));
+        List<SessionDto> items = new ArrayList<>(rows.size());
+        for (SessionRecord s : rows) {
+            items.add(toDto(s));
+        }
+        return new com.nexusai.model.session.dto.SessionSearchPage(items, total, p, ps);
+    }
+
+    /** LIKE 模式串：转义 {@code \ % _} 后包成 {@code %kw%}（与上面 {@code ESCAPE '\'} 配套）。 */
+    private static String likePattern(String kw) {
+        return "%" + kw.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "%";
+    }
+
     public SessionDto getById(String id) {
         SessionRecord s = sessionMapper.selectOneById(id);
         if (s == null) throw new NotFoundException("Session " + id + " not found");
@@ -455,7 +503,40 @@ public class SessionService {
             }
         }
 
-        sessionMapper.update(s);
+        // [app-layer V337] 会话级「已启动应用」（enabled_apps 列 = schema 门，启动即持久化）。
+        //   四态见 SessionUpdateRequest#enabledApps：缺省=不改动；显式 null=清除（回 defaultOpen 种子）；
+        //   [] / 数组 = 写 JSON。清除必须 update(s,false) 写 NULL（Flex 默认 ignoreNulls，同 goal 先例）。
+        boolean clearEnabledApps = false;
+        if (req.enabledApps() != null) {
+            if (req.enabledApps().isNull()) {
+                s.setEnabledApps(null);
+                clearEnabledApps = true;
+            } else if (req.enabledApps().isArray()) {
+                java.util.List<String> apps = new java.util.ArrayList<>();
+                for (com.fasterxml.jackson.databind.JsonNode n : req.enabledApps()) {
+                    if (n == null || !n.isTextual()) {
+                        throw new ValidationException("enabledApps must be an array of strings");
+                    }
+                    String v = n.asText().trim();
+                    if (!v.isEmpty()) {
+                        apps.add(v);
+                    }
+                }
+                s.setEnabledApps(JSON.toJSONString(apps));
+            } else {
+                throw new ValidationException("enabledApps must be an array of strings or null");
+            }
+            if (log.isInfoEnabled()) {
+                log.info("[SessionService] update: session={} enabledApps={}（V337 列 enabled_apps；"
+                    + "null=defaultOpen 种子 / [] =全不启动 / 数组=显式启动集）", id, s.getEnabledApps());
+            }
+        }
+
+        if (clearEnabledApps) {
+            sessionMapper.update(s, false);
+        } else {
+            sessionMapper.update(s);
+        }
         // [session-create V328] 显式 /rename → 同步跨会话 endpoint 的标题快照
         //   （否则 ListAgents / 按标题寻址一直显示旧名；地址名由标题派生，同步后自动跟着变）。
         if (req.title() != null && chatService != null) {
@@ -814,6 +895,35 @@ public class SessionService {
     }
 
     /**
+     * 写入会话级「已启动应用」（V337 列 enabled_apps，JSON 数组；= schema 门）。
+     *
+     * <p>供应用 start/stop 端点使用：传空列表 ⇒ 存 {@code "[]"}（显式全不启动），⛔ 不写 null。
+     *
+     * @param sessionId 会话 ID（DB 键）
+     * @param apps      应用 key 列表（null 视为空集 → {@code "[]"}）
+     * @throws NotFoundException session 不存在
+     */
+    public void setEnabledApps(String sessionId, List<String> apps) {
+        SessionRecord s = sessionMapper.selectOneById(sessionId);
+        if (s == null) throw new NotFoundException("Session " + sessionId + " not found");
+        java.util.TreeSet<String> norm = new java.util.TreeSet<>();
+        if (apps != null) {
+            for (String a : apps) {
+                if (a != null && !a.isBlank()) {
+                    norm.add(a.trim());
+                }
+            }
+        }
+        s.setEnabledApps(JSON.toJSONString(new ArrayList<>(norm)));
+        s.setUpdatedAt(OffsetDateTime.now().toString());
+        sessionMapper.update(s);
+        if (log.isInfoEnabled()) {
+            log.info("[SessionService] setEnabledApps: session={} enabled={}（V337 列 enabled_apps）",
+                sessionId, norm);
+        }
+    }
+
+    /**
      * 增量写入 IM 工具覆盖（V330 列 im_tool_overrides）。
      *
      * <p>只走 Mapper 的原子 json_patch（该列不映射到 {@link SessionRecord}），
@@ -1066,6 +1176,37 @@ public class SessionService {
      *
      * <p>供 {@link #toDto} 复用（对齐 parseTeamContext :310-326 模式）。
      */
+    /**
+     * 解析 V337 列 {@code enabled_apps}（JSON 字符串数组 → 列表）。
+     *
+     * <p>三态：null/空白/解析失败 → null（= 未设置，前端按 defaultOpen 种子）；
+     * {@code "[]"} → 空列表（显式全不启动）；数组 → 列表。
+     *
+     * @param json 列原始值
+     * @return 解析态；供 {@link #toDto} / ProjectSessionBindingService 复用
+     */
+    public static List<String> parseEnabledApps(String json) {
+        if (json == null || json.isBlank()) {
+            return null;
+        }
+        try {
+            List<String> list = JSON.parseArray(json, String.class);
+            if (list == null) {
+                return null;
+            }
+            List<String> out = new java.util.ArrayList<>(list.size());
+            for (String v : list) {
+                if (v != null && !v.isBlank()) {
+                    out.add(v.trim());
+                }
+            }
+            return List.copyOf(out);
+        } catch (Exception e) {
+            log.warn("[SessionService] enabled_apps 解析失败（按未设置处理）: {}", e.toString());
+            return null;
+        }
+    }
+
     public static Map<String, Object> parseTodos(String json) {
         if (json == null || json.isBlank()) {
             return null;
@@ -1198,7 +1339,9 @@ public class SessionService {
             // [V283] 左栏置顶标记透出（0/1 → Boolean，null 保持 null = 未设置）
             s.getPinned() != null ? s.getPinned() != 0 : null,
             // [session-create V328] 派生来源会话 id 透出（null = 用户自建；前端左栏「派生」标记）
-            s.getDerivedFromSessionId()
+            s.getDerivedFromSessionId(),
+            // [app-layer V337] 已启动应用（三态：null=未设置(按 defaultOpen 种子)/[]=全不启动/数组）
+            parseEnabledApps(s.getEnabledApps())
         );
     }
 

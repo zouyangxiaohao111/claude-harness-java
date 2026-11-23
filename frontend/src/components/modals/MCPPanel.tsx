@@ -5,9 +5,11 @@ import { ApiError } from '@/api/rest'
 import { doctorApi } from '@/api/doctor'
 import type { RuntimeEnvResponse } from '@/api/doctor'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
-import type { CreateMcpRequest, McpOAuthRequest, McpRuntimeStatus, McpServer } from '@/api/types'
+import type { CreateMcpRequest, McpOAuthRequest, McpServer } from '@/api/types'
 import type { UseMcp } from '@/hooks/useMcp'
 import { parseMcpCommandLine } from '@/utils/mcpCliParse'
+import { McpOauthRow } from './McpOauthRow'
+import { CONN_STATE, RUNTIME_LABEL } from './mcpStatus'
 
 interface MCPPanelProps {
   /** 真实后端 CRUD API */
@@ -49,6 +51,9 @@ interface McpFormState {
   oauthClientId: string
   oauthCallbackPort: string
   oauthMetadataUrl: string
+  oauthScopes: string
+  oauthAuthEndpoint: string
+  oauthTokenEndpoint: string
   oauthXaa: boolean
   clientSecret: string
 }
@@ -57,9 +62,14 @@ const EMPTY_FORM: McpFormState = {
   name: '', type: 'stdio', scope: 'project',
   command: '', argsStr: '', envStr: '',
   url: '', headersJson: '',
-  oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '', oauthXaa: false,
+  oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '',
+  oauthScopes: '', oauthAuthEndpoint: '', oauthTokenEndpoint: '',
+  oauthXaa: false,
   clientSecret: '',
 }
+
+/** 默认回调端口：与后端 `OauthPort` 的 fallback 3118 保持一致（未填 Callback Port 时展示它） */
+const DEFAULT_CALLBACK_PORT = '3118'
 
 const isTransport = (t: string | undefined): t is Transport =>
   t === 'stdio' || t === 'sse' || t === 'http'
@@ -73,26 +83,6 @@ const APPROVAL_LABEL: Record<string, { cls: string; label: string }> = {
   pending: { cls: 'pending', label: '待审批' },
 }
 
-/**
- * [V295] 运行时状态徽标（对齐后端 McpRuntimeStatus，优先于 status 使用）。
- * 只复用既有三种 CSS 类（connected/needs-auth/failed），不新增样式。
- */
-const RUNTIME_LABEL: Record<McpRuntimeStatus, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
-  connected: { cls: 'connected', label: '已连接' },
-  pending: { cls: 'needs-auth', label: '待审批' },
-  failed: { cls: 'failed', label: '连接失败' },
-  needsAuth: { cls: 'needs-auth', label: '待授权' },
-  disabled: { cls: 'needs-auth', label: '已停用' },
-  stopped: { cls: 'needs-auth', label: '未连接' },
-}
-
-/** 老后端无 runtimeStatus 时按 status 回落 */
-const CONN_STATE: Record<string, { cls: 'connected' | 'needs-auth' | 'failed'; label: string }> = {
-  running: { cls: 'connected', label: '已连接' },
-  stopped: { cls: 'needs-auth', label: '未连接' },
-  error: { cls: 'failed', label: '连接失败' },
-  pending: { cls: 'needs-auth', label: '待审批' },
-}
 
 const parseArgs = (raw: string): string[] => raw.split(/\s+/).filter(Boolean)
 
@@ -145,6 +135,8 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   const [formOpen, setFormOpen] = useState(false)
   /** Node / Python 探测结果：缺失时提示，不阻塞任何操作 */
   const [runtimeEnv, setRuntimeEnv] = useState<RuntimeEnvResponse | null>(null)
+  /** 最近一次「测试」结果（按 server id）· tools[] 是后端 tools/list 的真实工具名 */
+  const [lastTest, setLastTest] = useState<Record<string, { ok: boolean; message: string; latencyMs: number | null; tools: string[] }>>({})
 
   useEffect(() => {
     let alive = true
@@ -196,7 +188,9 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     }
     setForm({
       ...parsed.form,
-      oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '', oauthXaa: false,
+      oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '',
+      oauthScopes: '', oauthAuthEndpoint: '', oauthTokenEndpoint: '',
+      oauthXaa: false,
       clientSecret: '',
     })
     setEditing(null)
@@ -206,13 +200,21 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
 
   const buildOAuth = (): McpOAuthRequest | undefined => {
     const clientId = form.oauthClientId.trim()
-    if (!clientId && !form.oauthCallbackPort.trim() && !form.oauthMetadataUrl.trim() && !form.oauthXaa) {
+    const scopes = form.oauthScopes.trim()
+    const authz = form.oauthAuthEndpoint.trim()
+    const token = form.oauthTokenEndpoint.trim()
+    // falsy 门：所有 OAuth 字段都空 ⇒ 不下发 oauth（老行为完全不变）
+    if (!clientId && !form.oauthCallbackPort.trim() && !form.oauthMetadataUrl.trim()
+      && !scopes && !authz && !token && !form.oauthXaa) {
       return undefined
     }
     return {
       clientId: clientId || undefined,
       callbackPort: form.oauthCallbackPort.trim() || undefined,
       authServerMetadataUrl: form.oauthMetadataUrl.trim() || undefined,
+      scopes: scopes || undefined,
+      authorizationEndpoint: authz || undefined,
+      tokenEndpoint: token || undefined,
       xaa: form.oauthXaa || undefined,
     }
   }
@@ -301,6 +303,9 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       oauthClientId: oauth?.clientId ?? '',
       oauthCallbackPort: oauth?.callbackPort != null ? String(oauth.callbackPort) : '',
       oauthMetadataUrl: oauth?.authServerMetadataUrl ?? '',
+      oauthScopes: oauth?.scopes ?? '',
+      oauthAuthEndpoint: oauth?.authorizationEndpoint ?? '',
+      oauthTokenEndpoint: oauth?.tokenEndpoint ?? '',
       oauthXaa: !!oauth?.xaa,
       clientSecret: '',
     })
@@ -352,12 +357,16 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     }, `已停止: ${m.userFacingName ?? m.name}`)
   }
 
-  /** 测试连接：toast 展示 ok/latencyMs 或错误 message */
+  /** 测试连接：toast 展示 ok/latencyMs 或错误 message，并在行详情里保留本次结果与工具清单 */
   const onTest = (m: McpServer) => {
     void (async () => {
       setPending(true)
       try {
         const res = await mcpRestApi.test(m.id)
+        setLastTest((prev) => ({
+          ...prev,
+          [m.id]: { ok: res.ok, message: res.message, latencyMs: res.latencyMs, tools: res.tools ?? [] },
+        }))
         if (res.ok) showToast(`测试通过 · 延迟 ${res.latencyMs}ms`, 'success')
         else showToast(`测试失败: ${res.message}`, 'info')
       } catch (e) {
@@ -445,6 +454,17 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   }
 
   const enabledCount = list.filter((m) => m.enabled).length
+
+  /** 回调地址（未填端口时展示后端 `OauthPort` 的默认 fallback 3118） */
+  const callbackUri = `http://localhost:${form.oauthCallbackPort.trim() || DEFAULT_CALLBACK_PORT}/callback`
+  const copyCallback = async () => {
+    try {
+      await navigator.clipboard?.writeText(callbackUri)
+      showToast('已复制回调地址', 'success')
+    } catch {
+      showToast('复制失败，请手动选中复制', 'info')
+    }
+  }
 
   /** 添加 / 编辑共用的表单主体（在卡片内展开，不常驻页面顶部） */
   const renderForm = () => (
@@ -577,6 +597,19 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                 disabled={pending}
               />
             </div>
+            {/* 回调地址：给用户去平台后台登记（默认端口与后端 fallback 一致） */}
+            <div className="mcp-add-row">
+              <label>回调地址</label>
+              <code
+                data-testid="mcp-callback-uri"
+                style={{ flex: 1, minWidth: 0, fontSize: 12, wordBreak: 'break-all' }}
+              >
+                {callbackUri}
+              </code>
+              <button className="mcp-cli-btn" type="button" onClick={() => void copyCallback()} disabled={pending}>
+                复制
+              </button>
+            </div>
             <div className="mcp-add-row">
               <label>Metadata URL</label>
               <input
@@ -584,6 +617,36 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                 value={form.oauthMetadataUrl}
                 onChange={(e) => set({ oauthMetadataUrl: e.target.value })}
                 placeholder="https://auth.example.com/.well-known/openid-configuration"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>Scope</label>
+              <input
+                className="settings-input"
+                value={form.oauthScopes}
+                onChange={(e) => set({ oauthScopes: e.target.value })}
+                placeholder="空格分隔，如 openid profile tasks:read"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>授权端点</label>
+              <input
+                className="settings-input"
+                value={form.oauthAuthEndpoint}
+                onChange={(e) => set({ oauthAuthEndpoint: e.target.value })}
+                placeholder="可选，覆盖自动发现：https://.../authorize"
+                disabled={pending}
+              />
+            </div>
+            <div className="mcp-add-row">
+              <label>令牌端点</label>
+              <input
+                className="settings-input"
+                value={form.oauthTokenEndpoint}
+                onChange={(e) => set({ oauthTokenEndpoint: e.target.value })}
+                placeholder="可选，覆盖自动发现：https://.../token"
                 disabled={pending}
               />
             </div>
@@ -865,6 +928,40 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                         <div className="mcp-detail">
                           {m.lastError && <div className="mcp-detail-error">✗ {m.lastError}</div>}
                           <div className="mcp-detail-cmd">{desc}</div>
+                          {/* 最近一次测试结果 + 真实工具清单（后端 /test 的 tools: string[]） */}
+                          {lastTest[m.id] && (
+                            <div className="mcp-detail-row" data-testid="mcp-test-result">
+                              <div style={{ flex: 1, minWidth: 0 }}>
+                                <div className="mcp-detail-label">最近一次测试</div>
+                                <div className="mcp-detail-desc">
+                                  {lastTest[m.id].ok
+                                    ? `通过${lastTest[m.id].latencyMs != null ? ` · ${lastTest[m.id].latencyMs}ms` : ''}：${lastTest[m.id].message}`
+                                    : `失败：${lastTest[m.id].message}`}
+                                </div>
+                                {lastTest[m.id].tools.length > 0 && (
+                                  <ul
+                                    data-testid="mcp-test-tools"
+                                    style={{ listStyle: 'none', margin: '4px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 3 }}
+                                  >
+                                    {lastTest[m.id].tools.map((t) => (
+                                      <li key={t} style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-subtle)' }}>
+                                        {t}
+                                      </li>
+                                    ))}
+                                  </ul>
+                                )}
+                              </div>
+                            </div>
+                          )}
+                          {/* 远程 server 的 OAuth 授权/断开（start→浏览器→轮询；行内二次确认） */}
+                          {remote && (
+                            <McpOauthRow
+                              server={m}
+                              statusLabel={conn.label}
+                              showToast={showToast}
+                              onChanged={refresh}
+                            />
+                          )}
                           <div className="mcp-detail-row">
                             <div>
                               <div className="mcp-detail-label">启动时自动连接</div>

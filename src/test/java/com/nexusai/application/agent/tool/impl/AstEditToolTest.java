@@ -12,6 +12,7 @@ import com.nexusai.application.agent.permission.WritePermissionChecker;
 import com.nexusai.application.agent.tool.AbortController;
 import com.nexusai.application.agent.tool.PathGuard;
 import com.nexusai.application.agent.tool.Tool;
+import com.nexusai.application.agent.tool.ToolNameConstants;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
 import com.nexusai.application.agent.tool.ToolUseContext;
@@ -291,5 +292,40 @@ class AstEditToolTest {
         tool.setWriteChecker(writeDeny);
         assertThat(tool.checkPermissions(read(apply("a.js")), ctx))
             .isInstanceOf(PermissionResult.Deny.class);
+    }
+
+    // ── description 选择边界 / schema 契约 ──
+
+    @Test
+    @DisplayName("description：代码修改优先 AstEdit（含单点）/ 非程序内容与不可表达回退 Edit / 语法级边界 / preview-apply 语义")
+    void descriptionGuidesToolChoice() {
+        String desc = tool().description();
+
+        assertThat(desc).as("程序代码修改优先 AstEdit（含单点，不设批量门槛）")
+            .contains("Prefer AstEdit").contains("program-code changes").contains("including a single location");
+        assertThat(desc).as("非程序内容 / AST 表达不了 / 语言不支持 → 回退 Edit")
+            .contains("use Edit for non-programming content")
+            .contains("AST cannot express")
+            .contains("unsupported");
+        assertThat(desc).as("能力边界：语法级而非符号级").contains("syntactic, not symbol-aware");
+        assertThat(desc).as("两阶段契约仍在文案里").contains("PREVIEW").contains("apply: true");
+        assertThat(desc).as("不写 Read-free 式盲改鼓励")
+            .doesNotContain("Read-free").doesNotContain("without reading");
+        assertThat(desc).as("旧取向（仅多处/多文件才用 AstEdit）已清除")
+            .doesNotContain("many matched sites");
+    }
+
+    @Test
+    @DisplayName("schema：description 改动不动契约（required=[ops,paths]，ops item required=[pat,out]）")
+    void schemaContractUnchanged() {
+        JsonNode schema = tool().inputSchema();
+
+        assertThat(schema.path("required")).extracting(JsonNode::asText).containsExactly("ops", "paths");
+        assertThat(schema.path("properties").fieldNames()).toIterable()
+            .containsExactlyInAnyOrder("ops", "paths", "lang", "apply");
+        JsonNode opsItems = schema.path("properties").path("ops").path("items");
+        assertThat(opsItems.path("required")).extracting(JsonNode::asText).containsExactly("pat", "out");
+        assertThat(opsItems.path("properties").fieldNames()).toIterable()
+            .containsExactlyInAnyOrder("pat", "out");
     }
 }

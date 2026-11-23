@@ -1,0 +1,115 @@
+/*
+ * 内置专家库（技能市场 → 专家 → 内置专家）。
+ * 只新增 .xl-* 类，不改 globals.css 里既有的 .sm-* 规则。
+ */
+
+.xl-wrap { display: flex; flex-direction: column; gap: 10px; }
+
+.xl-panel { display: flex; flex-direction: column; gap: 10px; }
+
+.xl-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+
+.xl-count {
+  font-size: 12px;
+  color: var(--text-secondary, #5b6068);
+}
+
+.xl-list {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 10px;
+}
+
+@media (max-width: 900px) {
+  .xl-list { grid-template-columns: minmax(0, 1fr); }
+}
+
+.xl-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px 12px;
+  border: 1px solid var(--hairline, #E7E9EE);
+  border-radius: 10px;
+  background: #FFFFFF;
+}
+
+.xl-item-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.xl-avatar {
+  width: 26px;
+  height: 26px;
+  flex: 0 0 26px;
+  border-radius: 8px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 14px;
+  color: #FFFFFF;
+  overflow: hidden;
+}
+
+.xl-name {
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink, #14181f);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+}
+
+.xl-division {
+  flex: 0 0 auto;
+  padding: 1px 7px;
+  border-radius: 9999px;
+  background: var(--surface-2, #eff2f8);
+  color: var(--ink-subtle, #5f6875);
+  font-size: 10.5px;
+  line-height: 1.6;
+}
+
+.xl-desc {
+  font-size: 12px;
+  line-height: 1.5;
+  color: var(--text-secondary, #5b6068);
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.xl-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+}
+
+.xl-installed {
+  font-size: 12px;
+  color: var(--success-dark, #2D6E3D);
+}
+
+.xl-more {
+  align-self: center;
+  padding: 6px 14px;
+  border: 1px solid var(--hairline, #E7E9EE);
+  border-radius: 8px;
+  background: #FFFFFF;
+  color: var(--ink-subtle, #5f6875);
+  font-size: 12px;
+  cursor: pointer;
+}
+
+.xl-more:hover { color: var(--ink, #14181f); }

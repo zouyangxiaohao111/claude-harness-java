@@ -32,6 +32,8 @@ import { compareSessions } from '@/utils/sessionOrder'
 import { resolveNewSessionProjectId } from '@/utils/newSessionProject'
 import { duplicateSession } from '@/utils/duplicateSession'
 import { chatApi } from '@/api/chat'
+// [应用选择] localStorage 只作 UI 初始记忆（真相源 = 本轮内存态，随消息发送）
+import { forgetRememberedApps, loadRememberedApps, saveRememberedApps } from '@/api/apps'
 import { artifactsApi, type SessionArtifacts, type SessionArtifactDto } from '@/api/artifacts'
 import { buildTurnContext, dedupeByFile } from '@/utils/artifactGrouping'
 import { goalApi, splitGoalKickoff } from '@/api/goal'
@@ -48,7 +50,7 @@ import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedU
 import { computeTurnRunning } from '@/utils/turnRunning'
 import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile, useServerRunningSelfHeal } from '@/hooks/useServerRunning'
-import { useRunningSubagentSessionIds, useSubagentRunningReconcile } from '@/hooks/useSubagentRunning'
+import { useBackgroundRunningSessionIds, useRunningSubagentSessionIds, useSubagentRunningReconcile } from '@/hooks/useSubagentRunning'
 import { sendSystemNotification, ensureNotificationPermissionOnGesture } from '@/utils/systemNotify'
 import { onSystemNotificationClick } from '@/utils/systemNotify'
 import { showMainWindow } from '@/utils/tauri-bridge'
@@ -155,6 +157,9 @@ const EMPTY_SESSION_DTO: SessionDto = {
 
 /** 空项目（无绑定项目时右栏「项目」tab 兜底 → 显示「未绑定项目」而非演示名）。 */
 const EMPTY_PROJECT: Project = { id: '', name: '', branch: '', dirty: 0, agents: 0, path: '' }
+
+/** 搜索面板「会话」区每页条数（后端上限 50；10 条 ≈ 一屏不滚动太多）。 */
+const SEARCH_SESSION_PAGE_SIZE = 10
 
 /** 后端 SessionDto → UI 旧 Session 形状（null 兜底，任务 9 起组件原生消费 DTO 后移除）。 */
 /** 稳定空数组（避免 selector `?? []` 每次返回新引用触发 useSyncExternalStore 无限重渲染）。 */
@@ -367,6 +372,14 @@ function App() {
   // 中心区视图：'chat' 对话 / 'trace' 轨迹（dsh 式记录列表）
   const [centerView, setCenterView] = useState<'chat' | 'trace'>('chat')
   const [composerText, setComposerText] = useState('')
+  /**
+   * [应用选择] 本轮**强调**集合（per-turn，随消息带 `selectedApps`）。
+   * 按会话隔离：切换会话时从该会话的 UI 记忆恢复（见下方 effect）；⛔ 不落会话列、不改 schema。
+   */
+  const [selectedApps, setSelectedApps] = useState<string[] | null>(null)
+  /** sendMessage 内读取最新强调集合（⛔ 不把它加进 useCallback 依赖：每敲一键已换一次引用） */
+  const selectedAppsRef = useRef<string[] | null>(selectedApps)
+  selectedAppsRef.current = selectedApps
   // F19/#3 排队命令状态机（后端 B4/B5 未接时恒空，优雅降级）
   // [2026-10-23] 传当前会话：排队快照按会话分桶（多会话并行时 B 的 queue.changed 不得覆盖 A 的排队框）。
   //   此处与 :385 的 activeSessionId 同源（sessionR.activeSession），沿用 :133 的写法避免提升 const。
@@ -1241,6 +1254,9 @@ function App() {
   // [2026-11-12] 子代理仍在跑 ⇒ 侧栏保持运行点（主代理完成后不得翻绿）。
   //   ⛔ 只并进侧栏这一路；serverRunning / turnRunning（停止键 / Esc）不碰。
   const subagentRunningIds = useRunningSubagentSessionIds()
+  // [后台任务] 主 turn / 子代理都结束后，会话仍可能有后台 bash / monitor 在跑（不进 subagentStore）
+  //   ⇒ 用 /tasks/active 的会话归属补这一路。⛔ 只并进侧栏判据，不碰 serverRunning / 停止键。
+  const backgroundRunningIds = useBackgroundRunningSessionIds()
   useSubagentRunningReconcile()
   const runningSessionIds = useMemo(() => {
     const out = new Set<string>(Object.keys(streamOrderMap))
@@ -1251,8 +1267,11 @@ function App() {
     for (const [sid, on] of Object.entries(serverRunningMap)) if (on) out.add(sid)
     // 子代理运行态（独立于主 turn）：主代理 complete 后子代理可能仍在跑。
     for (const sid of subagentRunningIds) out.add(sid)
+    // 后台任务运行态（local_bash / monitor / workflow 等）：主 turn 与子代理都结束后仍可能有
+    //   后台工作在跑；这些任务不进 subagentStore ⇒ 单独一路补上。
+    for (const sid of backgroundRunningIds) out.add(sid)
     return out
-  }, [streamOrderMap, serverRunningMap, activeStreams, subagentRunningIds])
+  }, [streamOrderMap, serverRunningMap, activeStreams, subagentRunningIds, backgroundRunningIds])
 
   // ---- 权限冒泡：持久队列头部 + 决策出队 ----
   const permissionQueue = useChatStore((s) => s.permissionQueue)
@@ -2842,6 +2861,38 @@ function App() {
     }
   }, [activeSessionId, setSessions, showToast, storeSessions])
 
+  /**
+   * [应用选择] 会话级**启动集**（启动才进工具 schema）· 与 coordinatorMode 同构：PATCH 即存。
+   *
+   * <p>三态：`null` = 回落 `defaultOpen` 集合；`[]` = 全部停止；数组 = 显式启动集。
+   * ⛔ 与「本轮强调」（发送体 `selectedApps`）分开：强调不改 schema。
+   */
+  const handleEnabledAppsChange = useCallback(async (keys: string[] | null) => {
+    if (!activeSessionId) return
+    try {
+      const updated = await sessionApi.update(activeSessionId, { enabledApps: keys })
+      setSessions(storeSessions.map((s) => s.id === activeSessionId ? updated : s))
+    } catch (e) {
+      showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    }
+  }, [activeSessionId, setSessions, showToast, storeSessions])
+
+  /**
+   * [应用选择] 本轮**强调**集合（per-turn，随消息带 `selectedApps`）· 按会话隔离。
+   *
+   * <p>初值/刷新恢复来自该会话的 localStorage（**仅 UI**，⛔ 不是真相源）；发送时用当前内存态。
+   * 强调**下一轮继承**（同一会话内保持），只有变化才会触发后端的强调通知。
+   */
+  useEffect(() => {
+    setSelectedApps(loadRememberedApps(activeSessionId))
+  }, [activeSessionId])
+
+  const handleAppsChange = useCallback((keys: string[] | null) => {
+    if (keys) saveRememberedApps(activeSessionId, keys)
+    else forgetRememberedApps(activeSessionId)
+    setSelectedApps(keys)
+  }, [activeSessionId])
+
   // 会话级主线程 agent（V58 main_thread_agent · Composer 顶部胶囊）：PATCH 后端 + 本地同步
   //   agentType=null/空串 均表示清除 → 后端传空串（PATCH 语义：null=不改动，空串=清除）
   const handleAgentChange = useCallback(async (agentType: string | null) => {
@@ -3084,6 +3135,16 @@ function App() {
   const handleWorkspaceRename = useCallback((title: string) => {
     if (activeSessionId) void renameSession(activeSessionId, title)
   }, [activeSessionId, renameSession])
+  /** 主区标题旁「复制会话 ID」：写剪贴板 + toast 回执（失败如实提示，不假装成功）。 */
+  const handleCopySessionId = useCallback(async () => {
+    if (!activeSessionId) return
+    try {
+      await navigator.clipboard.writeText(activeSessionId)
+      showToast('会话 ID 已复制', 'success')
+    } catch {
+      showToast('复制失败，剪贴板不可用', 'info')
+    }
+  }, [activeSessionId, showToast])
   /** 轨迹入口：进入 trace；已在 trace 时再点 = 返回对话（tab 行已移除，必须留回路）。
    *
    *  <p>⚠️ 旧实现第二分支只重试 {@code loadTraceFull} 然后 return，<b>全仓没有任何
@@ -3666,7 +3727,13 @@ function App() {
         prev[sid] ? prev : { ...prev, [sid]: `/topic/sessions/${sid}/stream` }
       ))
       // F20：attachments（PDF 绝对路径字符串数组）透传给后端，服务端 PDFBox 解析
-      const resp = await chatApi.send(sid, { content: text, attachments })
+      // [应用选择] per-turn：null = 未设置 ⇒ 不带该字段（后端不裁剪）；数组（含 []）= 本轮名单
+      const appsSel = selectedAppsRef.current
+      const resp = await chatApi.send(sid, {
+        content: text,
+        attachments,
+        ...(appsSel ? { selectedApps: appsSel } : {}),
+      })
       const st = useChatStore.getState()
       // 排队分支（B1/B5 · 对齐 CC）：turn 运行中再发消息 → 后端入队返回 queued=true。
       //   【不】乐观插入气泡（交给排队框展示暗色条）、【不】覆盖 activeStreams（保持原 topic 收流），
@@ -3794,16 +3861,64 @@ function App() {
     }
   }, [activeSessionId, removeMessage, showToast])
 
+  // ---- 全局搜索面板：[会话] 区走后端模糊搜索 + 分页（旧实现只过滤静态演示数据 = 假搜索）----
+  const [searchSessionHits, setSearchSessionHits] = useState<SessionDto[]>([])
+  const [searchSessionTotal, setSearchSessionTotal] = useState(0)
+  const [searchSessionPage, setSearchSessionPage] = useState(1)
+  const [searchSessionLoading, setSearchSessionLoading] = useState(false)
+  const [searchSessionError, setSearchSessionError] = useState<string | null>(null)
+  // 查询词变化 → 回到第 1 页（翻页保留当前查询词）
+  const searchQuerySeenRef = useRef(ui.searchQuery)
+  useEffect(() => {
+    if (searchQuerySeenRef.current !== ui.searchQuery) {
+      searchQuerySeenRef.current = ui.searchQuery
+      setSearchSessionPage(1)
+    }
+  }, [ui.searchQuery])
+  // 面板关闭 → 页号归 1（下次打开从最近会话第一页开始）
+  useEffect(() => {
+    if (!ui.showSearchPalette) setSearchSessionPage(1)
+  }, [ui.showSearchPalette])
+  // 面板打开 + 查询词/页号变化 → 拉一页（200ms 防抖；序号守卫丢弃过期响应）
+  const searchReqSeqRef = useRef(0)
+  useEffect(() => {
+    if (!ui.showSearchPalette) return
+    const seq = ++searchReqSeqRef.current
+    setSearchSessionLoading(true)
+    setSearchSessionError(null)
+    const timer = window.setTimeout(() => {
+      void sessionApi
+        .search(ui.searchQuery.trim(), searchSessionPage, SEARCH_SESSION_PAGE_SIZE)
+        .then((res) => {
+          if (seq !== searchReqSeqRef.current) return
+          setSearchSessionHits(res.items)
+          setSearchSessionTotal(res.total)
+        })
+        .catch((e) => {
+          if (seq !== searchReqSeqRef.current) return
+          setSearchSessionHits([])
+          setSearchSessionTotal(0)
+          setSearchSessionError(e instanceof ApiError ? e.userMessage() : String(e))
+        })
+        .finally(() => {
+          if (seq === searchReqSeqRef.current) setSearchSessionLoading(false)
+        })
+    }, 200)
+    return () => window.clearTimeout(timer)
+  }, [ui.showSearchPalette, ui.searchQuery, searchSessionPage])
+
   // ---- derived ----
+  // 会话已由后端搜索结果承担 ⇒ 这里的静态项只保留**真实可执行**的命令（项目/文件在 demo 数据里是假的）
+  const nonSessionSearchItems = searchItems.filter((i) => i.type !== 'session')
   const filteredSearchItems = ui.searchQuery
-    ? searchItems
+    ? nonSessionSearchItems
         .filter(
           (item) =>
             item.title.toLowerCase().includes(ui.searchQuery.toLowerCase()) ||
             item.sub.toLowerCase().includes(ui.searchQuery.toLowerCase()),
         )
         .slice(0, 8)
-    : searchItems.slice(0, 6)
+    : nonSessionSearchItems.filter((i) => i.type === 'command')
   const currentDiff = ui.diffFile ? getDiffFor(ui.diffFile) : null
 
   // ---- click outside / escape ----
@@ -4043,6 +4158,8 @@ function App() {
           title={workspaceTitle}
           isWork={false}
           onRename={handleWorkspaceRename}
+          sessionId={activeSessionId}
+          onCopySessionId={handleCopySessionId}
           onSearch={handleWorkspaceSearch}
           onShare={handleWorkspaceShare}
           onTrace={handleWorkspaceTrace}
@@ -4141,6 +4258,8 @@ function App() {
               boundSessionTitle: c.boundSessionId
                 ? (sessions.find((s) => s.id === c.boundSessionId)?.title?.trim() || null)
                 : null,
+              // V335 · 机器人已被移出群：仍然显示（否则解绑不了），但打标记
+              botPresent: c.botPresent,
             }))}
             imBoundChatIds={imChats
               .filter((c) => c.boundSessionId === activeSessionId)
@@ -4218,6 +4337,13 @@ function App() {
             planPending={pendingPlanEnter.has(activeSessionId)}
             coordinatorMode={activeSession?.coordinatorMode ?? false}
             onCoordinatorModeChange={handleCoordinatorModeChange}
+            // [应用选择] 两个动作：行开关=会话级启动集（PATCH）；星标=本轮强调（随消息发送）
+            enabledApps={activeSession?.enabledApps ?? null}
+            onEnabledAppsChange={handleEnabledAppsChange}
+            selectedApps={selectedApps}
+            onAppsChange={handleAppsChange}
+            // 右栏抽屉展开 ⇒ 输入框只留图标（文字收进 title/tooltip），chip 照常显示
+            compact={rightDrawerOpen}
             streaming={turnRunning || compactActive}
             onStop={stopStreaming}
             queuedCommands={commandQueue.queuedCommands}
@@ -4429,6 +4555,13 @@ function App() {
         <SearchPalette
           searchQuery={ui.searchQuery}
           setSearchQuery={(v) => uiDispatch({ type: 'SET_SEARCH_QUERY', value: v })}
+          sessionHits={searchSessionHits}
+          sessionTotal={searchSessionTotal}
+          sessionPage={searchSessionPage}
+          sessionPageSize={SEARCH_SESSION_PAGE_SIZE}
+          sessionLoading={searchSessionLoading}
+          sessionError={searchSessionError}
+          onSessionPage={setSearchSessionPage}
           filteredItems={filteredSearchItems}
           close={() => uiDispatch({ type: 'CLOSE_SEARCH' })}
           onSessionPick={switchSession}

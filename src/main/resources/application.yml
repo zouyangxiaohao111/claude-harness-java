@@ -410,17 +410,13 @@ nexusai:
     #   未配置（删除本键）时回落 sysprop nexusai.feature.messaging-beyond-own-agents 与
     #   env NEXUSAI_FEATURE_MESSAGING_BEYOND_OWN_AGENTS。
     messaging-beyond-own-agents: true
-    # [2026-09-02] nexusai-in-chrome 浏览器工具总开关 · 开发中默认关（不暴露 mcp__nexusai-in-chrome__*
-    #   18 工具给模型，避免开发期误调）；需启用 → true + 装 Chrome 扩展。BrowserMcpToolConfig 读此
-    #   flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig nexusai-in-chrome skill 门控叠加
-    #   （false → skill 不注册，防「skill 提示用工具但工具不存在」空转）。后期转常态后改默认 true。
+    # [2026-11-23 用户裁定] nexusai-in-chrome 浏览器工具总开关 · **默认开启**（18 个
+    #   mcp__nexusai-in-chrome__* 工具注册给模型，实际调用需 Chrome 扩展已连接）。
+    #   BrowserMcpToolConfig 读此 flag（false → 工具不注册）+ BundledSkillFeatureFlagsConfig
+    #   nexusai-in-chrome skill 门控叠加（false → skill 不注册，防「skill 提示用工具但工具不存在」空转）。
     browser-mcp: true
-    # [CU-PoC → Phase 1c] computer-use 总开关 · Phase 0 的 2 个工具（mcp__computer-use__screenshot /
-    #   mcp__computer-use__left_click）+ Phase 1a 的 request_access + Phase 1c 的 4 个
-    #   （type / key / wait / list_granted_applications），默认 true ⇒ 工具注册（模型可见）。
-    #   [2026-10-31 用户裁定] 默认开启 —— 本仓是常驻应用，computer-use 作为常驻能力默认对模型可见。
-    #   出处：CC feature('CHICAGO_MCP') —— CCB 2.8.4 侧 DEFAULTS.enabled = true（默认构建里就是开的）；
-    #   本仓此前为 false（出包安全选择），现按裁定改为 true ⇒ 与该出处口径一致，差异消除。
+    # [CU-PoC → Phase 1c] computer-use 总开关 · **默认开启**（2026-11-23 用户裁定：恢复默认 true；
+    #   工具注册后仍受 SessionToolCategory 默认禁用集约束 ⇒ 工具面板里默认关、可手动打开）。
     #   ⚠️ 开启 ≠ 可控桌面：模型可见 mcp__computer-use__* 工具，但实际操作仍需 request_access 授权
     #   （会话级授权 + 应用白名单 + read/click/full 三档 tier + 三个默认全关的授权位
     #   clipboardRead / clipboardWrite / systemKeyCombos）；mcp__computer-use__* 走免弹窗模型
@@ -457,8 +453,8 @@ nexusai:
   #   对齐 CCB 2.8.4 src/utils/computerUse/gates.ts:11-20 的 DEFAULTS。
   #   ⛔ 不能放在 feature: 下 —— nexusai.feature.computer-use 已是**标量**（总开关），
   #      YAML 同键不能既是标量又是映射（重复键 ⇒ 解析失败/后者覆盖）。
-  #   总开关 = nexusai.feature.computer-use（默认 true：2026-10-31 用户裁定「常驻应用」；
-  #   与 CCB DEFAULTS.enabled = true 一致）。
+  #   总开关 = nexusai.feature.computer-use（默认 true：2026-11-23 用户裁定恢复默认开启；
+  #   注册后仍受 SessionToolCategory 默认禁用集约束，会话内默认关、可手动打开）。
   #   其中 7 个取值与 CCB 的 DEFAULTS 一致；Phase 1c 已逐个核实 CCB 在 Windows 的实际行为，
   #   生效范围见 ComputerUseGates 类 javadoc 的「Phase 1c 生效状态」表。
   computer-use:

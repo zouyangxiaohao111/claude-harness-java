@@ -97,4 +97,42 @@ class WeChatToolParsingTest {
         String ok = WeChatSearchMessagesTool.formatTime(1700000000);
         assertTrue(ok.matches("\\d{4}-\\d{2}-\\d{2} \\d{2}:\\d{2}:\\d{2}"), ok);
     }
+
+    // ---- 按会话读消息：时间窗解析 ----
+
+    @Test
+    @DisplayName("until 只给日期时补到当天 23:59:59")
+    void untilDateOnlyMeansEndOfDay() {
+        long t = WeChatReadConversationTool.parseUntil("2026-11-01");
+        var dt = java.time.Instant.ofEpochSecond(t)
+                .atZone(java.time.ZoneId.systemDefault());
+        assertEquals(23, dt.getHour());
+        assertEquals(59, dt.getMinute());
+        assertEquals(59, dt.getSecond());
+    }
+
+    @Test
+    @DisplayName("时间窗：默认今天 / 只给 since=自动 custom / month=近 30 个自然日")
+    void resolvesRanges() {
+        long now = 1_800_000_000L;
+        long todayStart = java.time.LocalDate.now()
+                .atStartOfDay(java.time.ZoneId.systemDefault()).toEpochSecond();
+
+        // 什么都不给 ⇒ today（今天的 00:00 ~ now）
+        var today = WeChatReadConversationTool.resolveWindow(null, null, null, now);
+        assertEquals(todayStart, today.since());
+        assertEquals(now, today.until());
+
+        // 只给 since、没给 range ⇒ 自动 custom
+        var custom = WeChatReadConversationTool.resolveWindow(null, "2026-10-14 17:30:00", null, now);
+        assertTrue(custom.since() > 0);
+        assertEquals(now, custom.until());
+
+        // range=month ⇒ todayStart - 29 天 ~ now
+        var month = WeChatReadConversationTool.resolveWindow("month", null, null, now);
+        assertEquals(todayStart - 29L * 86400, month.since());
+
+        // custom 但两边都没给 ⇒ null（调用方报错）
+        assertNull(WeChatReadConversationTool.resolveWindow("custom", null, null, now));
+    }
 }

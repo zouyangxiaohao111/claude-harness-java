@@ -1,0 +1,557 @@
+/**
+ * 输入框「应用多选」控件样式（P5）。
+ *
+ * 几何/阴影/动画数值逐条照搬 Octop（chatInputPickers.partial.less 680-719 + picker.module.less
+ * + chatContextChips.partial.less + chatInputCore.partial.less 243-339）；
+ * 颜色映射到本仓变量：Octop 写死的 #2563eb / rgba(37,99,235,*) 在深色主题下会发亮
+ * （影响面文档 R5 已登记）⇒ 统一用 --accent* / --surface-* / --hairline。
+ *
+ * 不改 globals.css：.composer .input-box / .composer .tool-chip 在那里有多段同名 last-wins。
+ */
+
+/* ---- 触发器：复用现有 .tool-chip 的尺寸/间距（28px 高），⛔ 不自定义高度/圆角/包裹层 ---- */
+/* 只叠「激活/禁用/图标」三种态；宽度/高度/padding/gap 全部交给 globals 的 .tool-chip 规则，
+   否则 32px 的按钮会把 .toolbar 挤成两排（用户 2026-11-23 截图）。 */
+.composer .toolbar .left-tools .tool-chip.app-trigger {
+  position: relative;
+  flex: none;
+}
+.composer .toolbar .left-tools .tool-chip.app-trigger.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-strong);
+}
+.composer .toolbar .left-tools .tool-chip.app-trigger.disabled {
+  opacity: 0.35;
+  cursor: not-allowed;
+}
+.composer .toolbar .left-tools .tool-chip.app-trigger .app-trigger-ico {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: none;
+}
+/* 已选数量角标（Octop .toolbarBadge） */
+.composer .app-trigger-count {
+  position: absolute;
+  top: -3px;
+  right: -3px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 15px;
+  text-align: center;
+  color: #fff;
+  background: var(--accent);
+  box-shadow: 0 0 0 1.5px var(--surface-1);
+  pointer-events: none;
+}
+
+/* ---- [2026-11-23 用户裁定] 指定入口与「+」同款：白底(=透明) + hairline 边框 + 同一 hover ----
+   只作用于列出的入口；协调者（.coordinator-chip）保持自己的激活语言，不在此列。
+   用 5 段特异性压过 globals 的 `.composer .tool-chip`（后者有多段 last-wins）。 */
+.composer .toolbar .left-tools .tool-chip.app-trigger:not(.active),
+.composer .toolbar .left-tools .tool-chip.plan-mode-chip:not(.active),
+.composer .toolbar .left-tools .tool-chip.tool-entry:not(.active),
+.composer .toolbar .left-tools .tool-chip.chan-entry:not(.active),
+.composer .toolbar .left-tools .tool-chip.uo-entry:not(.active) {
+  background: transparent;
+  border: 1px solid var(--hairline);
+  color: var(--ink-subtle);
+}
+.composer .toolbar .left-tools .tool-chip.app-trigger:not(.active):hover,
+.composer .toolbar .left-tools .tool-chip.plan-mode-chip:not(.active):hover,
+.composer .toolbar .left-tools .tool-chip.tool-entry:not(.active):hover,
+.composer .toolbar .left-tools .tool-chip.chan-entry:not(.active):hover,
+.composer .toolbar .left-tools .tool-chip.uo-entry:not(.active):hover {
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-strong);
+  color: var(--accent-hover);
+}
+
+/* ---- [2026-11-23 用户裁定] 工具栏单排：不换行 + **压缩间距/内边距**，
+   默认**不收文字**（只有 ≤700px 容器查询或右栏 compact 才收）。
+   ⛔ 不给 .left-tools 加 overflow：它是 plus-menu / 应用面板 / 工具面板的锚点容器，
+   overflow 会变成裁剪上下文，把弹层裁掉（真机 P0：点应用/工具/渠道 不弹或弹不完整）。 ---- */
+.composer .toolbar {
+  flex-wrap: nowrap;
+}
+.composer .toolbar .left-tools {
+  flex-wrap: nowrap;
+  overflow: visible;   /* 弹层必须能溢出；单排靠下面的容器查询压缩保证 */
+}
+.composer .toolbar .left-tools > * { flex: none; }
+/* 701–962px：先压 gap 与 chip 内边距（文字照常显示） */
+@container composer-inner (max-width: 960px) {
+  .composer .toolbar { gap: 2px; }
+  .composer .toolbar .left-tools { gap: 2px; }
+  .composer .toolbar .left-tools .tool-chip { padding: 0 7px; }
+}
+/* ≤860px：再压一档，右侧间距与模型胶囊同步收一点 */
+@container composer-inner (max-width: 860px) {
+  .composer .toolbar .left-tools .tool-chip { padding: 0 5px; }
+  .composer .toolbar .right-tools { gap: 4px; }
+  .composer .toolbar .right-tools .model-effort-pill { max-width: 104px; }
+}
+
+/* ---- 模型胶囊：两字母别名 + 品牌图标 + 档位标签（用户选型）· 上限 120px ---- */
+.composer .toolbar .right-tools .model-effort-pill {
+  max-width: 120px;
+  min-width: 0;
+  padding: 0 8px;
+  gap: 4px;
+}
+.composer .right-tools .mep-alias {
+  flex: none;
+  font-size: 12px;
+  font-weight: 700;
+  letter-spacing: 0.2px;
+  color: var(--ink);
+}
+.composer .right-tools .mep-brand {
+  flex: none;
+  width: 14px;
+  height: 14px;
+  object-fit: contain;
+  border-radius: 3px;
+}
+/* 自定义快速 tooltip（≤100ms）· 原生 title 仅兜底 */
+.composer .model-effort-tip {
+  position: absolute;
+  right: 0;
+  bottom: calc(100% + 6px);
+  padding: 6px 8px;
+  max-width: 280px;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 6px;
+  box-shadow: 0 6px 18px rgba(0, 0, 0, 0.12);
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--ink);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  z-index: 80;
+  pointer-events: none;
+  animation: appPickerFadeIn 0.12s ease;
+}
+
+/* ---- 弹层（Octop .ant-popover-inner 原值：padding 0 / 12px / hidden / 0 8px 24px） ---- */
+.composer .app-picker-wrap {
+  position: relative;
+  display: inline-flex;
+  flex: none;
+  align-items: center;
+}
+.composer .app-picker-panel {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 8px);
+  width: 280px;
+  max-width: min(280px, calc(100vw - 32px));
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1);
+  border: 1px solid var(--hairline);
+  border-radius: 12px;
+  overflow: hidden;
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.08);
+  z-index: 120;
+  /* Octop .shortcutPopover 的入场动画（AntD Popover motion 不可搬，用等价 keyframes） */
+  animation: appPickerFadeIn 0.15s ease;
+}
+@keyframes appPickerFadeIn {
+  from { opacity: 0; transform: translateY(4px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ---- 搜索行（padding 10px 12px / 下边框 / 13px） ---- */
+.composer .app-picker-search {
+  position: relative;
+  padding: 10px 12px;
+  border-bottom: 1px solid var(--hairline);
+  flex: none;
+}
+.composer .app-picker-search-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  background: transparent;
+  font-size: 13px;
+  color: var(--ink);
+  padding-right: 26px;
+}
+.composer .app-picker-search-input::placeholder {
+  color: var(--ink-tertiary);
+}
+.composer .app-picker-search-ico {
+  position: absolute;
+  right: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 14px;
+  height: 14px;
+  color: var(--ink-tertiary);
+  pointer-events: none;
+}
+
+/* ---- 列表（max-height 320px / padding 4px 0） ---- */
+.composer .app-picker-list {
+  max-height: 320px;
+  overflow-y: auto;
+  padding: 4px 0;
+}
+.composer .app-picker-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 6px;
+  padding: 24px 16px;
+  text-align: center;
+  font-size: 13px;
+  color: var(--ink-tertiary);
+}
+
+/* ---- 行（gap 10px / padding 8px 12px / background .15s ease） ---- */
+.composer .app-picker-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  box-sizing: border-box;
+  padding: 8px 12px;
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.composer .app-picker-row:hover {
+  background: rgba(0, 0, 0, 0.04);
+}
+.composer .app-picker-row.on {
+  background: var(--accent-soft);
+}
+.composer .app-picker-row.on:hover {
+  background: var(--accent-soft-strong);
+}
+.composer .app-picker-row.off {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.composer .app-picker-row:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: -2px;
+}
+.composer .app-picker-avatar {
+  flex-shrink: 0;
+  width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+  overflow: hidden;
+  background: var(--surface-2);
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--ink-tertiary);
+}
+.composer .app-picker-avatar-img {
+  width: 22px;
+  height: 22px;
+  object-fit: contain;
+  display: block;
+}
+.composer .app-picker-text {
+  min-width: 0;
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.composer .app-picker-title {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.composer .app-picker-name {
+  font-size: 13px;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--ink);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer .app-picker-row.on .app-picker-name {
+  color: var(--accent-hover);
+}
+/* 类别徽章（MCP / 浏览器 / 桌面）· 11px 小胶囊，不抢名字 */
+.composer .app-picker-badge {
+  flex: none;
+  padding: 1px 6px;
+  border-radius: 999px;
+  font-size: 10px;
+  font-weight: 600;
+  line-height: 16px;
+  color: var(--ink-tertiary);
+  background: var(--surface-2);
+  border: 1px solid var(--hairline);
+}
+.composer .app-picker-badge.kind-browser {
+  color: var(--accent-hover);
+  background: var(--accent-soft);
+  border-color: var(--accent-soft-strong);
+}
+.composer .app-picker-row .app-picker-tools {
+  flex: none;
+  font-size: 11px;
+  color: var(--ink-tertiary);
+}
+/* 展开工具清单（独立按钮，不可用行也能展开） */
+.composer .app-picker-expand {
+  flex: none;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--ink-tertiary);
+  cursor: pointer;
+}
+.composer .app-picker-expand:hover {
+  background: rgba(0, 0, 0, 0.06);
+  color: var(--ink);
+}
+.composer .app-picker-expand svg {
+  width: 12px;
+  height: 12px;
+  transition: transform 0.15s ease;
+}
+.composer .app-picker-expand.open svg {
+  transform: rotate(180deg);
+}
+.composer .app-picker-tool-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 2px 12px 8px 54px;
+  max-height: 180px;
+  overflow-y: auto;
+  background: rgba(0, 0, 0, 0.02);
+}
+.composer .app-picker-tool {
+  font-size: 11px;
+  line-height: 16px;
+  color: var(--ink-tertiary);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.composer .app-picker-desc {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--ink-tertiary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+/* ---- 独立开关按钮（22×12 拨杆）= 启动/停止（进 schema 的入口） ---- */
+.composer .app-picker-sw {
+  flex-shrink: 0;
+  margin-left: auto;
+  position: relative;
+  width: 22px;
+  height: 12px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: var(--hairline-strong);
+  cursor: pointer;
+  transition: background 0.15s ease;
+}
+.composer .app-picker-sw:disabled {
+  cursor: not-allowed;
+  opacity: 0.5;
+}
+.composer .app-picker-sw:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.composer .app-picker-sw i {
+  position: absolute;
+  top: 1px;
+  left: 1px;
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  background: #fff;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.15);
+  transition: transform 0.15s ease;
+}
+.composer .app-picker-sw.on {
+  background: var(--accent);
+}
+.composer .app-picker-sw.on i {
+  transform: translateX(10px);
+}
+
+/* ---- 页脚 「管理连接器」（Octop .footer） ---- */
+.composer .app-picker-footer {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  padding: 10px 12px;
+  border: none;
+  border-top: 1px solid var(--hairline);
+  background: transparent;
+  color: var(--ink-tertiary);
+  font-size: 13px;
+  cursor: pointer;
+  transition: background 0.15s ease, color 0.15s ease;
+}
+.composer .app-picker-footer:hover {
+  background: rgba(0, 0, 0, 0.04);
+  color: var(--ink);
+}
+.composer .app-picker-link {
+  border: none;
+  background: transparent;
+  color: var(--accent);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+}
+.composer .app-picker-link:hover {
+  color: var(--accent-hover);
+  text-decoration: underline;
+}
+
+/* ---- 已选 chip（Octop .contextChipConnector 原值） ---- */
+/* ---- chip 容器：topChips（知识库已选库）与应用 chip **同一行**（改前是两行：
+        `.app-chips` 自己带 `padding:0 0 8px`，把输入框几何整体抬高了一行）。
+        容器无内边距、gap 6px、chip 高 28px —— 与既有 chip 一致，窄宽度同样换行。 ---- */
+.composer .input-chips {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  /* ⛔ 不设 padding：高度完全由 chip 自身（28px）决定，恢复「topChips 原本不占额外行高」 */
+}
+/* 子项不压缩：topChips 自带 flex 容器时按内容宽参与本行 */
+.composer .input-chips > * {
+  flex: none;
+  max-width: 100%;
+}
+.composer .app-chip {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  flex-shrink: 0;
+  max-width: 200px;
+  height: 28px;
+  padding: 0 26px 0 8px;
+  border-radius: 6px;
+  border: 1px solid var(--accent-soft-strong);
+  background: var(--accent-soft);
+}
+.composer .app-chip-ico {
+  flex: none;
+  width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 4px;
+  overflow: hidden;
+  background: var(--surface-1);
+  font-size: 10px;
+  font-weight: 700;
+  color: var(--accent);
+}
+.composer .app-chip-label {
+  min-width: 0;
+  flex: 1;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.25;
+  color: var(--accent-hover);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.composer .app-chip-x {
+  position: absolute;
+  top: 50%;
+  right: 4px;
+  transform: translateY(-50%);
+  width: 18px;
+  height: 18px;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: transparent;
+  color: var(--accent-hover);
+  cursor: pointer;
+  line-height: 1;
+  font-size: 12px;
+  opacity: 0.55;
+  transition: opacity 0.15s, background 0.15s, color 0.15s;
+}
+.composer .app-chip-x:hover {
+  opacity: 1;
+  background: var(--accent-soft-strong);
+  color: var(--accent-hover);
+}
+
+/* ---- 右栏（抽屉）展开时的 compact：输入框工具区只留图标（文字收进 title/tooltip）。
+   由布局类驱动（`.composer.compact`，App 传 rightDrawerOpen），不依赖宽度 ——
+   窄栏那套是 `@container composer-inner (max-width:700px)`（globals.css:3491-3535），
+   本段与它**同口径**但不重复造机制：宽度触发和布局状态触发各管各的。 */
+.composer.compact .toolbar .left-tools .tool-chip > span:not(.tools-badge) { display: none; }
+.composer.compact .toolbar .left-tools .tool-chip {
+  box-sizing: border-box;
+  width: 28px;
+  height: 28px;
+  min-width: 28px;
+  padding: 0;
+  justify-content: center;
+  gap: 0;
+}
+.composer.compact .toolbar .left-tools .tool-chip > svg {
+  width: 13px;
+  height: 13px;
+  flex: none;
+}
+/* 「清空」这类纯文字按钮没有图标：收文字就空了，它是动作不是入口 ⇒ 保留文字（同窄栏规则） */
+.composer.compact .toolbar .left-tools .tool-chip.text-only {
+  width: auto;
+  min-width: auto;
+  padding: 0 8px;
+}
+.composer.compact .toolbar .left-tools .tool-chip.text-only > span { display: inline; }
+/* 专家胶囊：只留头像，名字收起（title 仍在 agent-pill 上） */
+.composer.compact .toolbar .left-tools .agent-pill .agent-pill-name { display: none; }
+.composer.compact .toolbar .left-tools .agent-pill { padding-right: 4px; }
+/* 计划/协调者：28×28 下状态点塞不下，状态由 active 底色表达（同窄栏规则） */
+.composer.compact .toolbar .left-tools .tool-chip.plan-mode .plan-indicator { display: none; }
+/* 右侧控件同步收成纯图标：权限模式只留盾牌、模型只留立方体、发送只留箭头 */
+.composer.compact .right-tools .perm-mode-pill .pm-label,
+.composer.compact .right-tools .perm-mode-pill .pm-value { display: none; }
+.composer.compact .right-tools .perm-mode-pill,
+.composer.compact .right-tools .model-effort-pill { padding: 0 8px; gap: 2px; }
+.composer.compact .right-tools .send-btn > span { display: none; }

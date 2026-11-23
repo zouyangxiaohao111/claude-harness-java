@@ -183,6 +183,7 @@ class ExternalMarketServiceStatsTest {
     private static ExternalPluginDto plugin(String name, Long use, Long download) {
         return new ExternalPluginDto(
             name, name, "desc", "1.0.0", "sha256:" + name, "skill", List.of(), null, null,
-            use, download, ExternalPluginDto.DEFAULT_AUTHOR_NAME, false, null, null);
+            use, download, ExternalPluginDto.DEFAULT_AUTHOR_NAME, false, null, null,
+            null, null);
     }
 }

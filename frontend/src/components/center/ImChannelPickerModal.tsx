@@ -19,6 +19,11 @@ export interface PickerChat {
   instanceId: string
   boundSessionId?: string | null
   boundSessionTitle?: string | null
+  /**
+   * V335 · 机器人是否在该会话里。
+   * false = 已被移出该群（仍显示，否则解绑不了）；null/undefined = 尚未判定。
+   */
+  botPresent?: boolean | null
   /** 名字只是平台 id（缺昵称/群名）—— 用于提示「对方未命名」而不是让人盯一串 oc_… */
   unnamed?: boolean
 }
@@ -276,11 +281,11 @@ export function ImChannelPickerModal({
                 <div className="chanm-empty">先在左边选一个渠道</div>
               ) : activeChats.length === 0 ? (
                 <div className="chanm-empty">
-                  这个渠道还没收到过消息
+                  这个渠道还没有能接到本会话的聊天
                   <br />
                   <span>
-                    先在「IM 频道」里对这个渠道点「启动连接」，再私聊机器人发一句话
-                    （群里则 @ 它一次）。聊天出现在这里之后，才能接到本会话。
+                    列表只显示<b>现在能发消息</b>的会话：微信群聊不支持群发、微信单聊需对方先发一句；
+                    飞书群需机器人已加入。先在「IM 频道」里启动连接，再私聊机器人发一句话。
                   </span>
                 </div>
               ) : (
@@ -309,6 +314,15 @@ export function ImChannelPickerModal({
                           {!on && c.boundSessionId && (
                             <span className="chanm-occupied" title={`现在接在「${c.boundSessionTitle ?? c.boundSessionId}」上`}>
                               已被「{c.boundSessionTitle ?? c.boundSessionId}」占用
+                            </span>
+                          )}
+                          {/* V335 · 机器人不在该群：已接线的仍显示（要能解绑），但必须让人知道收不到事件 */}
+                          {c.botPresent === false && (
+                            <span
+                              className="chanm-unreachable"
+                              title="机器人已被移出该群：群里 @ 它不会推送事件，历史消息也拉不到"
+                            >
+                              机器人不在该群
                             </span>
                           )}
                         </div>

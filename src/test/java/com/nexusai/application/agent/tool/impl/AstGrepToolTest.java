@@ -94,6 +94,31 @@ class AstGrepToolTest {
     }
 
     @Test
+    @DisplayName("description：代码搜索优先 AstGrep / 非程序内容与字面定位回退 Grep / 格式边界 / schema 契约不变")
+    void descriptionGuidesToolChoice() {
+        AstGrepTool tool = tool(new FakeCli());
+        String desc = tool.description();
+
+        assertThat(desc).as("程序代码搜索优先 AstGrep")
+            .contains("Prefer AstGrep").contains("code searches");
+        assertThat(desc).as("非程序内容 / 字面文本定位 / 语言不支持 → 回退 Grep")
+            .contains("Grep for non-programming content")
+            .contains("literal text")
+            .contains("unsupported");
+        // 边界：configs 不是整类不解析——JSON/YAML 在内建语言列表里，只有「未列出的格式」才退回 Grep。
+        assertThat(desc).as("边界：configs 按格式区分，不得与 logs/prose 并列为整类不解析")
+            .contains("configs in formats not listed above")
+            .doesNotContain("(logs, configs, prose)");
+        assertThat(desc).as("内建语言列表仍含 json/yaml，与上面 configs 的边界表述一致")
+            .contains("json, yaml");
+        assertThat(desc).as("旧的无回退表述不应残留").doesNotContain("AstGrep does not parse");
+        JsonNode schema = tool.inputSchema();
+        assertThat(schema.path("required")).extracting(JsonNode::asText).containsExactly("pat");
+        assertThat(schema.path("properties").fieldNames()).toIterable()
+            .containsExactlyInAnyOrder("pat", "path", "lang", "skip", "limit");
+    }
+
+    @Test
     @DisplayName("空 pat → Error: 前缀；skip 越界 → 错误")
     void validatesInput() {
         AstGrepTool tool = tool(new FakeCli());

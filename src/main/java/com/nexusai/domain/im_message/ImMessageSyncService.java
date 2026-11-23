@@ -5,6 +5,7 @@ import com.nexusai.domain.im_channel.ImChatService;
 import com.nexusai.domain.im_channel.catalog.ImChatCandidate;
 import com.nexusai.domain.im_channel.catalog.ImChatListStrategy;
 import com.nexusai.domain.im_channel.catalog.ImChatListStrategyFactory;
+import com.nexusai.domain.im_channel.send.FeishuErrorHints;
 import com.nexusai.model.im_channel.ImChatEntry;
 import com.nexusai.model.im_channel.ImInstanceEntry;
 import com.nexusai.model.im_message.ImMessageEntry;
@@ -111,9 +112,11 @@ public class ImMessageSyncService {
      * @param failedInstances 本轮<b>全部会话都失败</b>的实例数（⇒ 游标未推进）
      * @param partialFailedInstances 本轮<b>部分会话失败</b>的实例数（⇒ 游标照常推进，
      *                                失败摘要写在 {@code last_error} 里）
+     * @param skippedChats   本轮<b>按规则跳过</b>的会话数（如「机器人不在的飞书群」）。
+     *                       ⛔ 不计入失败：那是平台契约内的预期行为，不是故障。
      */
     public record SyncSummary(int instances, int chats, int newMessages, int failedInstances,
-                              int partialFailedInstances) {
+                              int partialFailedInstances, int skippedChats) {
     }
 
     /**
@@ -125,13 +128,13 @@ public class ImMessageSyncService {
         if (!running.compareAndSet(false, true)) {
             // 上一轮还没跑完（平台慢 / 会话很多）⇒ 本轮直接跳过，别叠第二轮
             log.info("[ImMessageSync] 上一轮尚未结束，本轮跳过");
-            return new SyncSummary(0, 0, 0, 0, 0);
+            return new SyncSummary(0, 0, 0, 0, 0, 0);
         }
         try {
             return doRun();
         } catch (RuntimeException e) {
             log.error("[ImMessageSync] 本轮扫描异常", e);
-            return new SyncSummary(0, 0, 0, 0, 0);
+            return new SyncSummary(0, 0, 0, 0, 0, 0);
         } finally {
             running.set(false);
         }
@@ -142,17 +145,18 @@ public class ImMessageSyncService {
         // （⛔ 不动 im_scan_channel ⇒ 恢复后用户原来的渠道勾选还在）
         if (scanTaskService.isPaused()) {
             log.info("[ImMessageSync] 系统任务已暂停，本轮跳过");
-            return new SyncSummary(0, 0, 0, 0, 0);
+            return new SyncSummary(0, 0, 0, 0, 0, 0);
         }
         List<ImScanChannelEntry> channels = scanChannelService.listEnabled();
         if (channels == null || channels.isEmpty()) {
             // 一行 info 就够：每 5 分钟一次，不要刷屏
             log.info("[ImMessageSync] 没有启用扫描的渠道，本轮跳过");
-            return new SyncSummary(0, 0, 0, 0, 0);
+            return new SyncSummary(0, 0, 0, 0, 0, 0);
         }
 
         int chatTotal = 0;
         int newTotal = 0;
+        int skippedTotal = 0;
         int failed = 0;
         int partialFailed = 0;
         for (ImScanChannelEntry channel : channels) {
@@ -162,6 +166,7 @@ public class ImMessageSyncService {
             InstanceScanResult r = scanInstance(channel);
             chatTotal += r.chats();
             newTotal += r.newMessages();
+            skippedTotal += r.skipped();
             if (r.error() == null) {
                 continue;
             }
@@ -172,9 +177,9 @@ public class ImMessageSyncService {
                 failed++;
             }
         }
-        log.info("[ImMessageSync] 本轮完成: 实例 {} 个 / 会话 {} 个 / 新增 {} 条 / 失败实例 {} 个 / 部分失败实例 {} 个",
-                channels.size(), chatTotal, newTotal, failed, partialFailed);
-        return new SyncSummary(channels.size(), chatTotal, newTotal, failed, partialFailed);
+        log.info("[ImMessageSync] 本轮完成: 实例 {} 个 / 会话 {} 个 / 新增 {} 条 / 跳过 {} 个 / 失败实例 {} 个 / 部分失败实例 {} 个",
+                channels.size(), chatTotal, newTotal, skippedTotal, failed, partialFailed);
+        return new SyncSummary(channels.size(), chatTotal, newTotal, failed, partialFailed, skippedTotal);
     }
 
     /**
@@ -190,7 +195,7 @@ public class ImMessageSyncService {
             // 实例被删了但扫描配置还在 ⇒ 记失败原因（游标不推进），让用户看得见
             String error = "渠道实例不存在: " + instanceId;
             markFailed(instanceId, error);
-            return new InstanceScanResult(0, 0, error, false);
+            return new InstanceScanResult(0, 0, error, false, 0);
         }
         ImInstanceEntry inst = instOpt.get();
 
@@ -208,6 +213,7 @@ public class ImMessageSyncService {
 
         int chatCount = 0;
         int newCount = 0;
+        int skipped = 0;
         int attempted = 0;
         List<ChatFailure> failures = new ArrayList<>();
 
@@ -218,6 +224,16 @@ public class ImMessageSyncService {
             String peerId = chat.peerId();
             String platform = (chat.platform() != null && !chat.platform().isBlank())
                 ? chat.platform() : inst.platform();
+            if (shouldSkipUnreachable(platform, chat)) {
+                // 机器人不在的飞书群：拿 tenant token 去读，飞书按契约回 400（230002）
+                // ⇒ 每 5 分钟重试一次、永远失败，还会把「预期不可读」写成 last_error 里的故障。
+                // 判据与 ImChatService.visible() 对齐（botPresent == false 才跳过；
+                // null = 尚未判定 ⇒ 仍尝试，避免首日误跳过）。
+                skipped++;
+                log.debug("[ImMessageSync] 跳过机器人不在的飞书群 instance={} peer={}",
+                    instanceId, peerId);
+                continue;
+            }
             attempted++;
             try {
                 ImMessageFetcher fetcher = fetcherFactory.of(platform);
@@ -242,22 +258,46 @@ public class ImMessageSyncService {
         }
 
         if (failures.isEmpty()) {
-            // 成功 ⇒ 游标推进到本轮窗口上界（与 until 同一个时刻 ⇒ 不漏 (T1, T2) 这一段）
+            // 成功（或本轮只有「按规则跳过」的会话）⇒ 游标推进到本轮窗口上界。
+            // ⛔ 跳过不是失败：last_error 必须为 null，否则 UI 会把预期行为标成「上次扫描失败」。
+            if (skipped > 0) {
+                log.info("[ImMessageSync] 已跳过 {} 个机器人不在的飞书群（不计失败）instance={}",
+                    skipped, instanceId);
+            }
             scanChannelService.markScanResult(instanceId, chatCount, newCount, null, scanUntil);
-            return new InstanceScanResult(chatCount, newCount, null, true);
+            return new InstanceScanResult(chatCount, newCount, null, true, skipped);
         }
 
-        String error = truncate(summarizeFailures(attempted, failures));
+        String error = truncate(summarizeFailures(attempted, failures)
+            + (skipped > 0 ? "（另跳过 " + skipped + " 个机器人不在的群）" : ""));
         if (chatCount > 0) {
             // 🔴 部分会话成功 ⇒ 游标**照常推进**（否则一个坏会话把好会话钉死在同一起点）。
             //    失败会话本地没数据 ⇒ 它下轮的起点 = max(新游标, 本地最大 sent_at) = 新游标
             //    ⇒ 只拉增量，不会重拉全量。
             scanChannelService.markScanResult(instanceId, chatCount, newCount, error, scanUntil, true);
-            return new InstanceScanResult(chatCount, newCount, error, true);
+            return new InstanceScanResult(chatCount, newCount, error, true, skipped);
         }
         // 全部会话都失败（会话数 > 0）⇒ 游标**不推进**：这才是「凭证坏了 / 平台整体拒绝」的信号
         scanChannelService.markScanResult(instanceId, chatCount, newCount, error, null, false);
-        return new InstanceScanResult(chatCount, newCount, error, false);
+        return new InstanceScanResult(chatCount, newCount, error, false, skipped);
+    }
+
+    /**
+     * 「机器人不在的飞书群」是否该跳过本轮拉取。
+     *
+     * <p>判据复用 {@code ImChatService.visible()} 的语义：{@code botPresent == false} ⇒ 隐藏。
+     * 只收窄到 <b>feishu + group</b>：
+     * <ul>
+     *   <li>p2p / 微信恒可达（{@code markBotPresence} 也把它们写成 true）——不在此列；</li>
+     *   <li>{@code botPresent == null}（尚未判定）仍尝试 —— 避免首日把合法群误跳过。</li>
+     * </ul>
+     */
+    static boolean shouldSkipUnreachable(String platform, ImChatEntry chat) {
+        if (chat == null || !"feishu".equalsIgnoreCase(platform)) {
+            return false;
+        }
+        return "group".equalsIgnoreCase(chat.chatKind())
+            && Boolean.FALSE.equals(chat.botPresent());
     }
 
     /**
@@ -296,6 +336,12 @@ public class ImMessageSyncService {
         if (e instanceof ImMessageFetchException fe) {
             if (ImMessageFetchException.CODE_INVALID_CHAT_ID.equals(fe.code())) {
                 return "非法 chat_id";
+            }
+            // 能认出的平台码 ⇒ 先给人话（如 230002「机器人不在该会话」），
+            // 而不是把「HTTP 400」直接塞进 last_error。
+            String brief = FeishuErrorHints.shortReason(fe.platformCode());
+            if (brief != null) {
+                return brief + "（" + fe.platformCode() + "）";
             }
             String msg = fe.getMessage();
             return shorten(msg == null || msg.isBlank() ? fe.code() : msg);
@@ -337,8 +383,21 @@ public class ImMessageSyncService {
                 inst.id(), e.toString());
             return;
         }
-        if (candidates == null || candidates.isEmpty()) {
+        if (candidates == null) {
+            // 拉取失败（策略已抛/记日志）⇒ 不改可达性：一次网络抖动不该把整个渠道的会话隐藏
             return;
+        }
+        // [V335] 只有飞书的会话列表是「机器人作为成员的完整群集合」（im/v1/chats，见 larksuite/cli
+        //   的 +chat-list 语义）⇒ 才能据此判「不在群」。
+        //   ⛔ 企微不能用：aibot/sessions/list 只覆盖机器人最近参与的 20 个会话，
+        //   chat/groups/list 只给 7 天内有消息的群 ⇒ 拿它判 false 会把「安静但合法」的群误隐藏。
+        java.util.Set<String> presentPeerIds = new java.util.HashSet<>();
+        if ("feishu".equals(inst.platform())) {
+            for (ImChatCandidate c : candidates) {
+                if (c != null && c.peerId() != null && !c.peerId().isBlank()) {
+                    presentPeerIds.add(c.peerId());
+                }
+            }
         }
         for (ImChatCandidate c : candidates) {
             if (c == null || c.peerId() == null || c.peerId().isBlank()) {
@@ -350,6 +409,16 @@ public class ImMessageSyncService {
             } catch (RuntimeException e) {
                 log.warn("[ImMessageSync] 会话目录 upsert 失败 instance={} peer={} err={}",
                     inst.id(), c.peerId(), e.toString());
+            }
+        }
+        // 在 upsert 之后判定：本轮新增的群也能立即拿到 true（未判定=NULL 虽然也按可达显示，
+        // 但列出的值要尽快变成事实，排查时不用猜）。
+        if ("feishu".equals(inst.platform())) {
+            try {
+                chatService.markBotPresence(inst.id(), presentPeerIds);
+            } catch (RuntimeException e) {
+                // 可达性回写失败不影响消息拉取（下轮会再对一次）
+                log.warn("[ImMessageSync] 回写机器人可达性失败 instance={} err={}", inst.id(), e.toString());
             }
         }
     }
@@ -411,8 +480,10 @@ public class ImMessageSyncService {
      * 单实例的扫描结果。
      *
      * @param cursorAdvanced 游标是否推进（false = 全失败 ⇒ 下一轮从旧游标重来）
+     * @param skipped        按规则跳过的会话数（不计失败）
      */
-    private record InstanceScanResult(int chats, int newMessages, String error, boolean cursorAdvanced) {
+    private record InstanceScanResult(int chats, int newMessages, String error,
+                                      boolean cursorAdvanced, int skipped) {
     }
 
     /** 单个会话的失败（peerId + 短原因）。 */

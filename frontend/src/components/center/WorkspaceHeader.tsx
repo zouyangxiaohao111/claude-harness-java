@@ -22,6 +22,10 @@ interface WorkspaceHeaderProps {
   /** WORK 场景：标题为空时回落「新任务」；CODING 回落「新会话」。 */
   isWork: boolean
   onRename: (title: string) => void
+  /** 当前会话 id（有值才显示「复制会话 ID」按钮）。 */
+  sessionId?: string | null
+  /** 复制当前会话 id（剪贴板写入与提示由 App 负责）。 */
+  onCopySessionId?: () => void
   onSearch: () => void
   onShare: () => void
   onTrace: () => void
@@ -70,6 +74,8 @@ export function WorkspaceHeader({
   title,
   isWork,
   onRename,
+  sessionId,
+  onCopySessionId,
   onSearch,
   onShare,
   onTrace,
@@ -211,6 +217,20 @@ export function WorkspaceHeader({
                   <path d="M12 6l6 6" />
                 </svg>
               </button>
+              {sessionId && onCopySessionId && (
+                <button
+                  className="ws-title-pencil ws-title-copy"
+                  type="button"
+                  title={`复制会话 ID：${sessionId}`}
+                  aria-label="复制会话 ID"
+                  onClick={onCopySessionId}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.7" strokeLinecap="round" strokeLinejoin="round">
+                    <rect x="9" y="9" width="11" height="11" rx="2.5" />
+                    <path d="M15 9V6.5A2.5 2.5 0 0 0 12.5 4H6.5A2.5 2.5 0 0 0 4 6.5v6A2.5 2.5 0 0 0 6.5 15H9" />
+                  </svg>
+                </button>
+              )}
             </>
           )}
         </div>

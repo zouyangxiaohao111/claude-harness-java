@@ -59,6 +59,26 @@ export const mcpApi = {
   test: (id: string) =>
     api<TestConnectionResponse>(`/mcp/${encodeURIComponent(id)}/test`, { method: 'POST' }),
 
+  // ---- OAuth（start/poll/logout · 与连接器同一套 loopback 授权范式）----
+
+  /**
+   * 发起授权 · POST /mcp/{id}/oauth/start
+   *
+   * <p>返回 authorizeUrl/state/redirectUri，由前端用**系统浏览器**打开，再按 interval 秒轮询 poll。
+   * ⛔ 不是 device code 流程。
+   */
+  oauthStart: (id: string) =>
+    api<{
+      authorizeUrl: string; state: string; redirectUri: string; interval: number; expiresIn: number
+    }>(`/mcp/${encodeURIComponent(id)}/oauth/start`, { method: 'POST' }),
+  /** 轮询授权结果 · GET /mcp/{id}/oauth/poll?state= */
+  oauthPoll: (id: string, state: string) =>
+    api<{ state: 'PENDING' | 'AUTHORIZED' | 'ERROR'; message?: string | null }>(
+      `/mcp/${encodeURIComponent(id)}/oauth/poll?state=${encodeURIComponent(state)}`),
+  /** 断开授权（吊销 token + 清凭据）· DELETE /mcp/{id}/oauth */
+  oauthLogout: (id: string) =>
+    api<{ revoked: boolean }>(`/mcp/${encodeURIComponent(id)}/oauth`, { method: 'DELETE' }),
+
   // ---- FM-17 通道白名单（独立命名空间 /mcp/channel-allowlist · Q-37 ledger DB 表） ----
   listAllowlist: () => api<ChannelAllowlistEntry[]>('/mcp/channel-allowlist'),
   addAllowlist: (req: AddChannelAllowlistRequest) =>

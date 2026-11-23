@@ -183,6 +183,8 @@ export interface TestConnectionResponse {
   latencyMs: number | null
   message: string
   details: Record<string, unknown> | null
+  /** MCP 测试连接的真实 tools/list 工具名（非 MCP/失败时为空数组）；Provider/DB 测试不返回该字段 */
+  tools?: string[] | null
 }
 
 /**
@@ -323,12 +325,13 @@ export interface McpServer {
   runtimeStatus?: McpRuntimeStatus
 }
 
-/** MCP 运行时状态（对齐后端 McpRuntimeStatus；CC 五态 + 本仓 stopped） */
+/** MCP 运行时状态（对齐后端 McpRuntimeStatus；CC 五态 + 本仓 stopped + reauth_required） */
 export type McpRuntimeStatus =
   | 'connected'
   | 'pending'
   | 'failed'
   | 'needsAuth'
+  | 'reauth_required'
   | 'disabled'
   | 'stopped'
 export interface CreateMcpRequest {
@@ -360,6 +363,12 @@ export interface McpOAuthRequest {
   callbackPort?: string
   authServerMetadataUrl?: string
   xaa?: boolean
+  /** 期望 scope（空格分隔；后端 buildAuthorizationUrl 直接使用） */
+  scopes?: string
+  /** 显式授权端点（可选：覆盖自动发现） */
+  authorizationEndpoint?: string
+  /** 显式令牌端点（可选：覆盖自动发现） */
+  tokenEndpoint?: string
 }
 export interface UpdateMcpRequest extends Partial<CreateMcpRequest> {}
 
@@ -980,6 +989,12 @@ export interface SessionDto {
    *  再回落 feature+env）；true = 本会话强制协调者；false = 本会话强制普通（压过全局开）。
    *  「A 会话是协调者、B 会话不是」的唯一载体（后端 PromptAlignSettingsResolver 逐次按 sessionId 读） */
   coordinatorMode?: boolean | null
+  /**
+   * [应用选择] 本会话**已启动**的应用（启动后才进 schema）· 三态：
+   * `null/undefined` = 未设置（回落后端 `defaultOpen` 集合）；`[]` = 全部停止；数组 = 显式启动集。
+   * ⛔ 与「本轮强调」（发送体 `selectedApps`）不是一回事：强调不改 schema、只影响通知文案。
+   */
+  enabledApps?: string[] | null
   /** [V101] 会话累计缓存命中率（**0-1 比率** · 后端由 `sessions.model_usage_json` 派生，与 usage 记账同源）·
    *  底部「X%（累计）」的**重拉回退源**（实时优先用 complete 事件透传值）；无数据 = null → 不渲染，⛔ 不臆造 0。 */
   cacheHitRate?: number | null
@@ -990,6 +1005,14 @@ export interface SessionDto {
   derivedFromSessionId?: string | null
 }
 export type SessionGroup = 'current' | 'today' | 'yesterday' | 'week'
+
+/** 会话模糊搜索的一页（GET /sessions/search · 标题/id 子串匹配，updated_at 倒序）。 */
+export interface SessionSearchPage {
+  items: SessionDto[]
+  total: number
+  page: number
+  pageSize: number
+}
 
 // ---- 用量统计（S3 · 对齐后端 GET /api/v1/stats StatsResponse）----
 // [V101 读侧重构] 数据源 = `llm_usage_calls` 明细表（唯一真源，聚合下推 SQL，无 rollup 表）；
@@ -1310,7 +1333,7 @@ export interface ForkSessionRequest { throughMessageId: string }
 /** 分叉响应 · 新会话 + 复制的消息条数（前端拿到 session 即可插入左栏并跳转） */
 export interface ForkSessionResponse { session: SessionDto; copiedMessages: number }
 /** 会话更新（PATCH /sessions/{id} · null=不改动，mainThreadAgent 空串=清除） */
-export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null; /** V283 左栏置顶 · true=置顶，false=取消，不传=不改动 */ pinned?: boolean | null }
+export interface SessionUpdateRequest { title?: string; model?: ModelTag; modelName?: string; mainProjectId?: string; bareMode?: boolean; permissionMode?: PermissionMode; /** V58 main_thread_agent · 会话级主线程 agent（专家）· null=不改动，空串=清除 */ mainThreadAgent?: string | null; /** V75 会话级协调者模式覆盖（coordinator_mode）· true/false=显式设置，不传=不改动 */ coordinatorMode?: boolean | null; /** V283 左栏置顶 · true=置顶，false=取消，不传=不改动 */ pinned?: boolean | null; /** [应用选择] 会话级启动集（进 schema 的开关）· null=回落 defaultOpen，[]=全部停止，不传=不改动 */ enabledApps?: string[] | null }
 /** GET /agents/list?sessionId={sid} 单条（后端 AgentListDto · agentType 专家列表） */
 export interface AgentListItem {
   agentType: string
@@ -1452,6 +1475,8 @@ export interface ExternalMarketPlugin {
   authorAvatarUrl?: string | null
   /** 开发者邮箱 */
   authorEmail?: string | null
+  /** 卡片图标 URL（[2026-11-23 市场图标] 可选 · null/加载失败 → 名字首字母色块） */
+  icon?: string | null
 }
 /** GET /api/market/external 响应（后端 ExternalMarketDto · 自建 MinIO 市场） */
 export interface ExternalMarket {
@@ -1979,6 +2004,12 @@ export interface SendMessageRequest {
   fallbackModel?: string
   /** [plan-approval] 本消息的初始权限模式（后端 SendMessageRequest.permissionMode → CLI 槽） */
   permissionMode?: PermissionMode
+  /**
+   * [应用选择] 本轮**强调**的应用 key（星标）· 只影响给模型的强调通知文案，
+   * ⛔ 不改工具 schema（真正进 schema 的是会话级 `enabledApps`）。
+   * 缺省 = 本轮无强调；`[]` = 显式无强调。⛔ 字段名冻结，不要改名。
+   */
+  selectedApps?: string[]
 }
 
 /** [批 A5] POST /sessions/{id}/queue/pop 响应 · 对齐 CC PopAllEditableResult

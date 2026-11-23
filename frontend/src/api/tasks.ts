@@ -21,6 +21,11 @@ export interface BackgroundTaskDto {
   ownerName?: string | null
   /** running teammate 的最近活动摘要（对齐 CC TaskListV2 进行中任务第二行） */
   activity?: string | null
+  /**
+   * 创建该后台任务的会话 id（后端 {@code TaskDto.sessionId}）· null = 无会话归属。
+   * 侧栏「正在运行」判定靠它把「仍有后台工作的会话」聚合回来。
+   */
+  sessionId?: string | null
 }
 
 export const tasksApi = {
@@ -32,6 +37,13 @@ export const tasksApi = {
    * AsyncTasksPanel 列当前会话任务），省值会让 A 会话看到 B 会话的任务 → 类型上要求必传。
    */
   list: (sessionId: string) => api<BackgroundTaskDto[]>(`/tasks?sessionId=${encodeURIComponent(sessionId)}`),
+  /**
+   * 活跃后台任务清单（跨会话）· GET /tasks/active。
+   *
+   * <p>只含「有会话归属 + 未终态 + 已后台化」的任务。侧栏判定「该会话仍在运行」时，
+   * 主 turn 完成但后台还在跑（子代理 / 后台 bash / monitor）也要算 ⇒ 用本端点聚合。
+   */
+  active: () => api<BackgroundTaskDto[]>('/tasks/active'),
   /** 任务清单合并端点（TaskCreate V2 + TodoWrite V1 · V1/V2 互斥，前端按非空方显示）· GET /tasks/list?sessionId */
   listSnapshot: (sessionId: string) => api<TaskListSnapshotDto>(`/tasks/list?sessionId=${encodeURIComponent(sessionId)}`),
   /** 重置 V2 任务清单（对齐 CC resetTaskList：提水位 + 删任务文件）。

@@ -180,9 +180,14 @@ public class CliRuntimeConfigService {
     public View save(String runtime, SaveRequest req) {
         String rt = normalize(runtime);
         ExternalRuntimeCatalog.RuntimePreset preset = ExternalRuntimeCatalog.find(rt);
-        if (preset == null) {
+        // ACP 是独立运行时，不进 ExternalRuntimeCatalog.PRESETS（该目录的「args 必须含
+        // {prompt}」断言与 ACP 的 session/prompt 语义冲突）⇒ 这里单点放行；
+        // ⛔ 其余未知 kind 仍按原行为拒绝（保存未知运行时 = 400）。
+        boolean acpRuntime = com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME.equalsIgnoreCase(rt);
+        if (preset == null && !acpRuntime) {
             throw new IllegalArgumentException(
-                    "未知的外部运行时 '" + runtime + "'，可选：" + ExternalRuntimeCatalog.knownRuntimes());
+                    "未知的外部运行时 '" + runtime + "'，可选：" + ExternalRuntimeCatalog.knownRuntimes()
+                            + "、" + com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME);
         }
         if (req == null) {
             throw new IllegalArgumentException("请求体为空");
@@ -193,7 +198,8 @@ public class CliRuntimeConfigService {
         if (req.reasoning() != null) {
             String r = req.reasoning().trim();
             if (!r.isEmpty() && !"default".equalsIgnoreCase(r)) {
-                if (!preset.supportsReasoning()) {
+                // ACP 没有推理强度语义（preset == null）⇒ 该项不做「支持性」校验
+                if (preset != null && !preset.supportsReasoning()) {
                     throw new IllegalArgumentException("运行时 '" + rt + "' 不支持推理强度");
                 }
                 // 全局表里有的档位直接放行；不在表里但形如合法标识符也放行（模型级档位）
@@ -218,6 +224,9 @@ public class CliRuntimeConfigService {
         if (req.model() != null) row.setModel(emptyToNull(req.model()));
         if (req.reasoning() != null) row.setReasoning(emptyToNull(req.reasoning()));
 
+        // 该运行时认得的 secret 变量名（ACP 无预设 ⇒ 用统一常量，避免与执行侧漂移）
+        java.util.List<String> allowedSecretEnvs = preset != null ? preset.apiKeyEnvs()
+                : java.util.List.of(com.nexusai.model.acp.AcpRuntimeConstants.DEFAULT_API_KEY_ENV);
         // secrets：null = 不改；空 map = 清空；非空 = 替换（**值为掩码的项保留原值**）
         if (req.secrets() != null) {
             // 已保存的明文，用于「提交的是掩码 ⇒ 保持原值」的判定
@@ -235,9 +244,9 @@ public class CliRuntimeConfigService {
                     continue;
                 }
                 // ⛔ 只接受该 CLI 认得的变量名：写错名字 = 静默不生效
-                if (!preset.apiKeyEnvs().contains(name)) {
+                if (!allowedSecretEnvs.contains(name)) {
                     throw new IllegalArgumentException("运行时 '" + rt + "' 不认环境变量 '" + name
-                            + "'，可选：" + String.join(", ", preset.apiKeyEnvs()));
+                            + "'，可选：" + String.join(", ", allowedSecretEnvs));
                 }
                 cleaned.put(name, value);
             }

@@ -120,7 +120,13 @@ public record SessionDto(
      * null = 用户自己建的普通会话；非空 = 由该会话经 SessionCreate 创建。
      * 前端左栏据此显示「派生」标记。⛔ 只用于展示，不作路由/权限判据。
      */
-    String derivedFromSessionId
+    String derivedFromSessionId,
+    /**
+     * 会话级「已启动应用」原始值（V337 列 {@code sessions.enabled_apps}，JSON 数组解析态）。
+     * 三态：{@code null} = 未设置（前端按 {@code GET /api/v1/apps} 的 {@code defaultOpen} 种子算有效集）；
+     * 空列表 = 显式全不启动；非空 = 显式启动集。⛔ 本字段是原始值，不是 seed 后的有效集。
+     */
+    java.util.List<String> enabledApps
 ) {
 
     /**
@@ -136,6 +142,6 @@ public record SessionDto(
         this(id, model, modelName, title, time, group, tabId, mainProjectId, messageCount,
             createdAt, updatedAt, effortLevel, ultracodeEnabled, bareMode, teamContext, todos,
             permissionMode, totalCostYuan, totalTokens, mainThreadAgent, coordinatorMode,
-            cacheHitRate, kbToolsEnabled, pinned, null);
+            cacheHitRate, kbToolsEnabled, pinned, null, null);
     }
 }

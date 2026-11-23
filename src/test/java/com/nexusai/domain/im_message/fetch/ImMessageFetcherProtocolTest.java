@@ -61,6 +61,12 @@ class ImMessageFetcherProtocolTest {
     /** 让企微消息列表返回指定错误码（0 = 正常）。 */
     private int wecomErrorCode;
 
+    /** 让飞书消息列表返回指定 HTTP 状态（200 = 正常）。 */
+    private int messagesHttpStatus = 200;
+
+    /** 飞书消息列表在非 200 时的响应体（模拟平台错误报文）。 */
+    private String messagesHttpBody;
+
     private String base() {
         return "http://127.0.0.1:" + server.getAddress().getPort();
     }
@@ -76,9 +82,17 @@ class ImMessageFetcherProtocolTest {
                 requests.add(new String[]{path, query, body});
             }
             authHeaders.add(String.valueOf(exchange.getRequestHeaders().getFirst("Authorization")));
-            byte[] out = route(path).getBytes(StandardCharsets.UTF_8);
+            String payload;
+            int status = 200;
+            if (path.contains("/open-apis/im/v1/messages") && messagesHttpStatus != 200) {
+                status = messagesHttpStatus;
+                payload = messagesHttpBody == null ? "" : messagesHttpBody;
+            } else {
+                payload = route(path);
+            }
+            byte[] out = payload.getBytes(StandardCharsets.UTF_8);
             exchange.getResponseHeaders().add("Content-Type", "application/json");
-            exchange.sendResponseHeaders(200, out.length);
+            exchange.sendResponseHeaders(status, out.length);
             try (OutputStream os = exchange.getResponseBody()) {
                 os.write(out);
             }
@@ -484,6 +498,57 @@ class ImMessageFetcherProtocolTest {
             ImMessageTime.canonical("2026-11-18T09:00:00+08:00"), null, 50))
             .isInstanceOf(ImMessageFetchException.class)
             .hasMessageContaining("99991672");
+    }
+
+    @Test
+    @DisplayName("飞书：HTTP 400 也要解析并透出 body 的 code/msg（不再只剩 statusCode）")
+    void feishuHttp400ExposesBodyCodeAndMsg() {
+        // 真机形态：机器人不在群 ⇒ HTTP 400 + {"code":230002,"msg":"Bot is not in the group"}
+        messagesHttpStatus = 400;
+        messagesHttpBody = "{\"code\":230002,\"msg\":\"Bot is not in the group\"}";
+        FeishuImMessageFetcher fetcher = new FeishuImMessageFetcher(base());
+        org.springframework.test.util.ReflectionTestUtils.setField(fetcher, "channelService",
+            channelService("{\"appId\":\"cli_x\",\"appSecret\":\"sec\"}"));
+        org.springframework.test.util.ReflectionTestUtils.setField(fetcher, "tokenService",
+            new FeishuTokenService(base()));
+
+        assertThatThrownBy(() -> fetcher.fetch("inst-f", "oc_group",
+            ImMessageTime.canonical("2026-11-18T09:00:00+08:00"), null, 50))
+            .isInstanceOf(ImMessageFetchException.class)
+            .satisfies(e -> {
+                ImMessageFetchException fe = (ImMessageFetchException) e;
+                assertThat(fe.platformCode())
+                    .as("platformCode 要取飞书 body 里的业务码（不是 HTTP 400）")
+                    .isEqualTo("230002");
+                assertThat(fe.getMessage())
+                    .as("异常消息要带上 body 的 code/msg")
+                    .contains("HTTP 400")
+                    .contains("230002")
+                    .contains("Bot is not in the group")
+                    .as("还要有人话原因（与发送路径共用同一份码表）")
+                    .contains("机器人不在该会话");
+            });
+    }
+
+    @Test
+    @DisplayName("飞书：HTTP 400 且 body 不是 JSON ⇒ 退回 body 片段，不吞成空消息")
+    void feishuHttp400NonJsonBodyFallsBackToSnippet() {
+        messagesHttpStatus = 400;
+        messagesHttpBody = "gateway error";
+        FeishuImMessageFetcher fetcher = new FeishuImMessageFetcher(base());
+        org.springframework.test.util.ReflectionTestUtils.setField(fetcher, "channelService",
+            channelService("{\"appId\":\"cli_x\",\"appSecret\":\"sec\"}"));
+        org.springframework.test.util.ReflectionTestUtils.setField(fetcher, "tokenService",
+            new FeishuTokenService(base()));
+
+        assertThatThrownBy(() -> fetcher.fetch("inst-f", "oc_group",
+            ImMessageTime.canonical("2026-11-18T09:00:00+08:00"), null, 50))
+            .isInstanceOf(ImMessageFetchException.class)
+            .satisfies(e -> {
+                ImMessageFetchException fe = (ImMessageFetchException) e;
+                assertThat(fe.platformCode()).as("解析不出业务码 ⇒ 用 HTTP 状态码").isEqualTo("400");
+                assertThat(fe.getMessage()).contains("HTTP 400").contains("gateway error");
+            });
     }
 
     @Test

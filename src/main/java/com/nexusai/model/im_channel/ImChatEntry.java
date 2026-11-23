@@ -37,15 +37,32 @@ public record ImChatEntry(
      * <p>可空：企微靠 contact search 补、飞书靠通讯录 scope、**微信 iLink 永远拿不到**。
      * <p>展示请走 {@link #displayName()}（昵称 → peerName → peerId 依次回退）。
      */
-    String nickName
+    String nickName,
+    /**
+     * V335 · 机器人是否在该会话里（入站可达性）。
+     *
+     * <p>{@code null} = 尚未判定 ⇒ 读侧按「可达」处理；
+     * {@code false} = 确认机器人不在该群（飞书「本人所在群」同步进来的那些）。
+     * <p>p2p 与微信恒为 {@code true}（单聊不进 bot 群列表；微信登录账号即机器人）。
+     */
+    Boolean botPresent
 ) {
+    /** 旧 15 参签名：botPresent 缺省为 null（未判定 ⇒ 按可达处理）。 */
+    public ImChatEntry(String id, String instanceId, String platform, String peerId, String peerName,
+                       String chatKind, Integer memberCount, String lastMessagePreview,
+                       String lastMessageAt, String boundSessionId, String bindMode, String boundAt,
+                       String createdAt, String updatedAt, String nickName) {
+        this(id, instanceId, platform, peerId, peerName, chatKind, memberCount, lastMessagePreview,
+            lastMessageAt, boundSessionId, bindMode, boundAt, createdAt, updatedAt, nickName, null);
+    }
+
     /** 旧 14 参签名：nickName 缺省为 null（读侧回退 peerName）。 */
     public ImChatEntry(String id, String instanceId, String platform, String peerId, String peerName,
                        String chatKind, Integer memberCount, String lastMessagePreview,
                        String lastMessageAt, String boundSessionId, String bindMode, String boundAt,
                        String createdAt, String updatedAt) {
         this(id, instanceId, platform, peerId, peerName, chatKind, memberCount, lastMessagePreview,
-            lastMessageAt, boundSessionId, bindMode, boundAt, createdAt, updatedAt, null);
+            lastMessageAt, boundSessionId, bindMode, boundAt, createdAt, updatedAt, null, null);
     }
 
     /**
@@ -63,5 +80,15 @@ public record ImChatEntry(
     /** 是否已接线到某个任务。 */
     public boolean bound() {
         return boundSessionId != null && !boundSessionId.isBlank();
+    }
+
+    /**
+     * 是否在列表里默认可见。
+     *
+     * <p>规则：可达（{@code botPresent == null} 视为可达）**或**已接线。
+     * 已接线但机器人被移出群的会话必须仍然可见 —— 否则用户看不到、也没法解绑。
+     */
+    public boolean visibleInList() {
+        return botPresent == null || botPresent || bound();
     }
 }

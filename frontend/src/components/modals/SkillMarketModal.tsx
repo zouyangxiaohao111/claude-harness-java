@@ -3,14 +3,22 @@ import { ApiError } from '@/api/rest'
 import { agentApi } from '@/api/agent'
 import { commandApi, type CommandDto } from '@/api/command'
 import { marketApi, type InstallProgress, type InstalledPluginDetail } from '@/api/market'
+import { connectorsApi, type ConnectorDto, type ConnectorStatusResponse } from '@/api/connectors'
+import { mcpApi as mcpRestApi } from '@/api/mcp'
+import { expertsApi, type BundledExpert } from '@/api/experts'
+import '@/styles/expert-library.css'
+import { ConnectorCard } from '@/components/market/ConnectorCard'
+import { ConnectorAuthDrawer } from '@/components/market/ConnectorAuthDrawer'
+import { categoryLabel } from '@/components/market/connectorMeta'
+import { statusBadgeOf } from './mcpStatus'
 import { selectProjectFolder } from '@/utils/projectFolder'
 import { formatCountW } from '@/utils/format'
 import type {
   AgentListItem,
   ExternalMarketPlugin,
-  MarketConnector,
   MarketExpert,
   MarketSkill,
+  McpServer,
 } from '@/api/types'
 
 /**
@@ -19,7 +27,8 @@ import type {
  * 两种来源（左上角下拉切换）：建科数字插件市场（自建 MinIO，/api/market/external 解析
  *   marketplace.json，按 category 分流）/ 本地（/agents/list + /api/command 本地技能 + 已装插件）。
  * - 专家「使用」：本地 agentType → App 走现有 PATCH mainThreadAgent；建科市场专家 → 安装插件。
- * - 技能/连接器「+」：建科市场走真实安装；本地来源只展示已装内容。
+ * - 技能「+」：建科市场走真实安装；本地来源只展示已装内容。
+ * - 连接器：走独立的连接器授权 API（`/api/market/connectors`），⛔ 不再复用插件安装。
  * ⛔ 腾讯 workbuddy 源已按用户 2026-10-26 裁定删除。
  */
 
@@ -71,6 +80,14 @@ const CATEGORY_LABELS: Record<string, string> = {
   design: '设计', architecture: '架构',
   ppt: '演示', pptx: '演示', presentation: '演示',
   svn: 'SVN', data: '数据', analyst: '分析', engineering: '工程',
+}
+/** 内置专家分类目录 → 中文徽章（后端 divisions.json 是 Octop 侧真源，这里只做展示映射） */
+const DIVISION_LABELS: Record<string, string> = {
+  academic: '学术', design: '设计', engineering: '工程', finance: '金融',
+  'game-development': '游戏开发', gis: '地理信息', marketing: '市场营销', 'paid-media': '付费媒体',
+  product: '产品', 'project-management': '项目管理', sales: '销售', security: '安全',
+  'spatial-computing': '空间计算', specialized: '专项', 'supply-chain': '供应链',
+  support: '技术支持', testing: '测试', hr: '人力资源', legal: '法务',
 }
 function colorOf(name: string): string {
   let h = 0
@@ -212,9 +229,46 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
   const [skills, setSkills] = useState<MarketSkill[]>([])
   /** 市场技能（对应技能 tab 的「市场」子 tab）· 与 skills 分开，两个子 tab 各自渲染 */
   const [marketSkills, setMarketSkills] = useState<MarketSkill[]>([])
-  const [connectors, setConnectors] = useState<MarketConnector[]>([])
+  /**
+   * 连接器目录（**惰性加载**）：只在切到「连接器」tab 时才请求。
+   *
+   * <p>⛔ 不能挂在弹窗挂载期 —— 三个既有 SkillMarketModal 测试把 `@/api/market` mock 成
+   * 封闭白名单，新增挂载期 market/connector 请求会让它们以 `is not a function` 直接红。
+   */
+  const [connectors, setConnectors] = useState<ConnectorDto[]>([])
+  const [connState, setConnState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle')
+  const [connError, setConnError] = useState<string | null>(null)
+  /** 正在查看 / 授权的连接器（null = 抽屉关闭） */
+  const [connDrawer, setConnDrawer] = useState<ConnectorDto | null>(null)
+  /** 连接器分类 pill（'全部' = 不筛）与状态筛选 */
+  const [connCat, setConnCat] = useState<string>('全部')
+  const [connFilter, setConnFilter] = useState<'all' | 'connected' | 'needs-auth'>('all')
+  /**
+   * 连接器子 tab：已启用（已连接的目录条目）/ 内置（全量目录）/ 自定义（非目录的 MCP server）。
+   * 默认「内置」= 对齐 Octop，也让既有用例（进连接器 tab 直接看到目录卡）不变。
+   */
+  const [connSrc, setConnSrc] = useState<'enabled' | 'builtin' | 'custom'>('builtin')
+  /** 自定义 tab 数据（惰性：只有切到自定义才拉 MCP 列表） */
+  const [customServers, setCustomServers] = useState<McpServer[]>([])
+  const [customState, setCustomState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle')
+  const [customError, setCustomError] = useState<string | null>(null)
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState<string | null>(null)
+
+  /**
+   * 专家 tab 的子来源：市场（默认）/ 内置专家。
+   * 内置目录**惰性加载**（只有切到内置专家才请求），避免给既有市场/技能用例引入挂载期请求。
+   */
+  const [expertSrc, setExpertSrc] = useState<'market' | 'builtin'>('market')
+  const [bundledExperts, setBundledExperts] = useState<BundledExpert[]>([])
+  const [bundledState, setBundledState] = useState<'idle' | 'loading' | 'loaded' | 'error'>('idle')
+  const [bundledError, setBundledError] = useState<string | null>(null)
+  /** 手动重试计数：失败后点「重试」→ 重新进入 idle 并触发 effect（不能把 bundledState 放进 deps，
+   *  否则 setState('loading') 会让 effect 自我取消，加载永远停在 loading）。 */
+  const [bundledRetry, setBundledRetry] = useState(0)
+  const [bundledBusy, setBundledBusy] = useState<Set<string>>(new Set())
+  /** 内置专家列表分页（一次渲 60 条，避免 272 条同时进 DOM） */
+  const [bundledLimit, setBundledLimit] = useState(60)
 
   // 建科市场插件（ExternalMarketPlugin）→ 现有 Market* 类型（按 category 分流到三 Tab）
   // [2026-11-01 v4] 补统计与开发者：后端已下发原始整数（useCount/downloadCount）与
@@ -230,6 +284,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     authorVerified: p.authorVerified ?? false,
     authorAvatarUrl: p.authorAvatarUrl ?? null,
     authorEmail: p.authorEmail ?? null,
+    icon: p.icon ?? null,
   })
   const toMarketSkill = (p: ExternalMarketPlugin): MarketSkill => ({
     marketId: p.name, name: p.name, displayName: p.displayName, description: p.description,
@@ -244,9 +299,7 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     authorVerified: p.authorVerified ?? false,
     authorAvatarUrl: p.authorAvatarUrl ?? null,
     authorEmail: p.authorEmail ?? null,
-  })
-  const toMarketConnector = (p: ExternalMarketPlugin): MarketConnector => ({
-    marketId: p.name, name: p.displayName || p.name, authType: p.tags?.[0], remote: true,
+    icon: p.icon ?? null,
   })
 
   // 本机已安装技能来源：用户级 / 项目级 / 插件级（排除内置/捆绑 —— 数量大且不是用户装的）。
@@ -317,16 +370,16 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
         failMsgs.push(`本机技能：${formatFail(cmdR.reason)}`)
       }
 
-      // ③ 市场条目（市场子 tab；专家/技能/连接器三个 Tab 共用同一份）
+      // ③ 市场条目（市场子 tab；专家/技能两个 Tab 共用同一份）
+      //    ⚠️ 连接器不从这里取：独立目录由 `/api/market/connectors` 提供（惰性加载，见下）
       if (mR.status === 'fulfilled') {
         const m = mR.value
         if (m?.name) setMarketName(m.name)
         const pl = m?.plugins ?? []
         setExperts(pl.filter((p) => p.category === 'expert').map(toMarketExpert))
         setMarketSkills(pl.filter((p) => p.category === 'skill').map(toMarketSkill))
-        setConnectors(pl.filter((p) => p.category === 'connector').map(toMarketConnector))
       } else {
-        setExperts([]); setMarketSkills([]); setConnectors([])
+        setExperts([]); setMarketSkills([])
         failMsgs.push(`建科市场：${formatFail(mR.reason)}`)
       }
 
@@ -336,6 +389,79 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     return () => { cancelled = true }
   }, [sessionId, reloadKey])
 
+  // ---- 连接器目录（惰性）：切到「连接器」tab 才拉一次 ----
+  const loadConnectors = async () => {
+    setConnState('loading')
+    setConnError(null)
+    try {
+      const r = await connectorsApi.list(true)
+      // 全量 30 条（含 hidden 的 qcc/tencent-ardot）：hidden 条目由卡片按 unavailable 置灰 + 「内部/企业」展示
+      setConnectors((r?.connectors ?? []).filter((c) => !!c.authType))
+      setConnState('loaded')
+    } catch (e) {
+      setConnState('error')
+      setConnError(e instanceof ApiError ? e.userMessage() : String(e))
+    }
+  }
+  useEffect(() => {
+    if (tab === 'connector' && connState === 'idle') void loadConnectors()
+    // idle → loading → loaded/error 只跑一次；失败不自动重试（抽屉下方给显式「重试」）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, connState])
+
+  /** 自定义 tab：非目录的 MCP server（惰性拉取，⛔ 不在挂载期请求） */
+  useEffect(() => {
+    if (tab !== 'connector' || connSrc !== 'custom' || customState !== 'idle') return
+    setCustomState('loading')
+    setCustomError(null)
+    void mcpRestApi.list()
+      .then((list) => { setCustomServers(list ?? []); setCustomState('loaded') })
+      .catch((e) => {
+        setCustomState('error')
+        setCustomError(e instanceof ApiError ? e.userMessage() : String(e))
+      })
+  }, [tab, connSrc, customState])
+
+  // ---- 内置专家目录（惰性）：切到「内置专家」子 tab 才拉一次 ----
+  useEffect(() => {
+    if (tab !== 'expert' || expertSrc !== 'builtin' || bundledState !== 'idle') return
+    let cancelled = false
+    setBundledState('loading')
+    setBundledError(null)
+    void expertsApi.listBundled()
+      .then((list) => {
+        if (cancelled) return
+        setBundledExperts(list ?? [])
+        setBundledState('loaded')
+      })
+      .catch((e) => {
+        if (cancelled) return
+        setBundledState('error')
+        setBundledError(e instanceof ApiError ? e.userMessage() : String(e))
+      })
+    return () => { cancelled = true }
+    // bundledState 故意不进 deps：它是本 effect 的产物，进 deps 会自我取消（见 bundledRetry 注释）
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [tab, expertSrc, bundledRetry])
+
+  // 搜索词变化 → 分页回到第一批（避免「搜出 2 条但停在 120 条之后」）
+  useEffect(() => { setBundledLimit(60) }, [q])
+
+  /**
+   * 抽屉回写权威状态 → 同步列表卡片与抽屉自身。
+   * ⛔ 不做本地乐观置位：`connected/status/account` 全部来自后端 status 响应。
+   */
+  const applyConnectorStatus = (id: string, st: ConnectorStatusResponse) => {
+    const patch = {
+      connected: st.connected,
+      status: st.connected ? ('connected' as const) : ('unconnected' as const),
+      account: st.account ?? null,
+      expiresAt: st.expiresAt ?? null,
+    }
+    setConnectors((prev) => prev.map((c) => (c.id === id ? { ...c, ...patch } : c)))
+    setConnDrawer((prev) => (prev && prev.id === id ? { ...prev, ...patch } : prev))
+  }
+
   /**
    * 市场拉取失败且用户没主动切到本机 ⇒ 内容区改为「只有失败说明 + 一个出口」。
    *
@@ -343,9 +469,9 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
    * 更稳的是「市场列表为空 **且** 加载错误非空」—— 市场为空但无错误 = 真的没有技能。
    */
   //    ⚠️ 只用**声明在上面**的 state 判定（expertCards 是 useMemo、在其后才声明，
-  //   在这里引用会 TDZ 报错）。改用原始数据源：市场三个列表全空 + 有错误。
+  //   在这里引用会 TDZ 报错）。改用原始数据源：市场两个列表全空 + 有错误。
   const isMarketFailed = skillSrc === 'market' && !installedOnly
-    && marketSkills.length === 0 && experts.length === 0 && connectors.length === 0
+    && marketSkills.length === 0 && experts.length === 0
     && !!loadError
 
   // ---- 已安装计数（顶栏）----
@@ -357,7 +483,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     ? localAgents.filter((a) => a.source !== 'plugin').length + experts.filter((e) => e.preinstalled).length
     : tab === 'skill'
       ? skills.length
-      : connectors.filter((c) => c.isConnected).length
+      // 连接器：只数真正可用的已连接（reauth_required 的凭据已失效，不算「已连接」）
+      : connectors.filter((c) => c.connected && c.status !== 'reauth_required').length
 
   // ---- 技能分类胶囊（每个技能只取一个分类 → 中文标签；按显示名去重）----
   const skillCategories = useMemo(() => {
@@ -405,6 +532,43 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
   const keyword = q.trim().toLowerCase()
   const matchAny = (...parts: Array<string | null | undefined>) =>
     keyword.length === 0 || parts.some((p) => (p ?? '').toLowerCase().includes(keyword))
+
+  // ---- 内置专家：搜索过滤（名称/描述/slug）----
+  const bundledFiltered = useMemo(
+    () => bundledExperts.filter((e) => matchAny(e.name, e.description, e.slug, DIVISION_LABELS[e.division])),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [bundledExperts, keyword],
+  )
+
+  /**
+   * 安装单个内置专家。
+   * ⛔ 不做本地乐观置位：只有后端返回成功才把该条置为「已安装」；
+   * 409（本地已有同名且内容不同）如实提示，不伪造成功。
+   */
+  const installBundled = async (e: BundledExpert) => {
+    if (bundledBusy.has(e.slug)) return
+    setBundledBusy((prev) => new Set(prev).add(e.slug))
+    try {
+      const r = await expertsApi.installBundled(e.slug)
+      setBundledExperts((prev) => prev.map((x) => (x.slug === e.slug ? { ...x, installed: true } : x)))
+      showToast(
+        r.status === 'UNCHANGED' ? `专家 ${e.name} 已是最新` : `已安装专家 ${e.name}`,
+        'success',
+      )
+    } catch (err) {
+      if (err instanceof ApiError && err.status === 409) {
+        showToast('该专家已存在且本地内容与内置版本不同；如确认覆盖，请先移走本地文件或带 overwrite 重新安装', 'info')
+      } else {
+        showToast(err instanceof ApiError ? err.userMessage() : String(err), 'info')
+      }
+    } finally {
+      setBundledBusy((prev) => {
+        const next = new Set(prev)
+        next.delete(e.slug)
+        return next
+      })
+    }
+  }
 
   // ---- 专家卡（本地 + 远端合并，混排双列大卡）----
   const expertCards = useMemo<ExpertCard[]>(() => {
@@ -639,18 +803,113 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
     return pluginDetails.filter((p) => matchAny(p.name, p.version))
   }, [pluginDetails, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ---- 连接器过滤（搜索）----
+  // ---- 连接器分类（只取有 connection 块且带 category 的条目；顺序按首次出现，稳定不乱跳）----
+  const connectorCategories = useMemo(() => {
+    const out: string[] = []
+    for (const c of connectors) {
+      if (c.authType && c.category && !out.includes(c.category)) out.push(c.category)
+    }
+    return out
+  }, [connectors])
+
+  // ---- 连接器三子 tab 的数据视图 ----
+  /** 已启用 = 凭据有效且已连接（reauth_required 不算可用） */
+  const enabledConnectors = useMemo(
+    () => connectors.filter((c) => c.connected && c.status !== 'reauth_required'),
+    [connectors],
+  )
+  /** 目录 key 集合：自定义 tab 要排除「由连接器授权创建的同名 MCP server」 */
+  const catalogKeys = useMemo(() => new Set(connectors.map((c) => c.key)), [connectors])
+  const customList = useMemo(
+    () => customServers.filter((s) => !catalogKeys.has(s.name) && !catalogKeys.has(s.id)),
+    [customServers, catalogKeys],
+  )
+
+  // ---- 连接器过滤（分类 + 状态 + 搜索）----
+  // 「需授权」= 未连接，或凭据还在但已失效（reauth_required）
   const filteredConnectors = useMemo(() => {
-    return connectors.filter((c) => matchAny(c.name, c.scope, c.status, c.authType))
-  }, [connectors, keyword]) // eslint-disable-line react-hooks/exhaustive-deps
+    return connectors.filter((c) => {
+      if (connCat !== '全部' && c.category !== connCat) return false
+      if (connFilter === 'connected'
+        && !(c.connected && c.status !== 'reauth_required')) return false
+      if (connFilter === 'needs-auth'
+        && !(!c.connected || c.status === 'reauth_required')) return false
+      return matchAny(c.name, c.key, c.description, c.authType, c.status, c.account, (c.scopes ?? []).join(' '))
+    })
+  }, [connectors, keyword, connCat, connFilter]) // eslint-disable-line react-hooks/exhaustive-deps
 
   // ---- 「+」安装 UI 高亮（骨架：仅本地 Set，不做真实安装）----
 
-  // ---- 头像（远端 icon URL → img；缺失/本地 → 色块）----
+  // ---- 头像（远端 icon URL → img；缺失/加载失败 → 色块首字母，⛔ 不许破图）----
   const renderAvatar = (c: { iconUrl: string | null; iconColor: string; iconText: string; name: string }) => (
-    c.iconUrl
-      ? <img className="sm-avatar sm-avatar-img" src={c.iconUrl} alt={c.name} loading="lazy" />
-      : <span className="sm-avatar" style={{ background: c.iconColor }}>{c.iconText}</span>
+    <span className="sm-avatar" style={{ background: c.iconColor, position: 'relative' }}>
+      {c.iconText}
+      {c.iconUrl && (
+        <img
+          className="sm-avatar-img"
+          src={c.iconUrl}
+          alt={c.name}
+          loading="lazy"
+          style={{ position: 'absolute', inset: 0, width: '100%', height: '100%' }}
+          onError={(e) => { e.currentTarget.style.display = 'none' }}
+        />
+      )}
+    </span>
+  )
+
+  // ---- 内置专家（子 tab 内容）：列表 + 搜索 + 安装态 ----
+  const builtinPanel = (
+    <div className="xl-panel">
+      {bundledState === 'loading' && <div className="sm-loading">内置专家加载中…</div>}
+      {bundledState === 'error' && (
+        <div className="sm-market-failed">
+          <div className="sm-market-failed-txt">内置专家目录加载失败：{bundledError}</div>
+          <button className="sm-market-failed-btn" onClick={() => { setBundledState('idle'); setBundledRetry((n) => n + 1) }}>重试</button>
+        </div>
+      )}
+      {bundledState === 'loaded' && (
+        <>
+          <div className="xl-toolbar">
+            <span className="xl-count">{bundledFiltered.length} 位内置专家 · 随安装包提供，按需安装</span>
+          </div>
+          {bundledFiltered.length === 0 ? (
+            <div className="sm-empty small">{keyword ? '没有匹配的内置专家' : '暂无内置专家'}</div>
+          ) : (
+            <div className="xl-list">
+              {bundledFiltered.slice(0, bundledLimit).map((e) => (
+                <div key={e.slug} className="xl-item">
+                  <div className="xl-item-head">
+                    <span className="xl-avatar" style={{ background: e.color || colorOf(e.name) }}>{e.emoji || e.name.charAt(0)}</span>
+                    <span className="xl-name" title={e.name}>{e.name}</span>
+                    <span className="xl-division">{DIVISION_LABELS[e.division] ?? e.division}</span>
+                  </div>
+                  <div className="xl-desc" title={e.description}>{e.description}</div>
+                  <div className="xl-actions">
+                    {e.installed ? (
+                      <span className="xl-installed">已安装</span>
+                    ) : (
+                      <button
+                        className={`sm-use-btn${bundledBusy.has(e.slug) ? ' installing' : ''}`}
+                        disabled={bundledBusy.has(e.slug)}
+                        onClick={() => void installBundled(e)}
+                        title={`安装内置专家 ${e.name}`}
+                      >
+                        {bundledBusy.has(e.slug) ? '安装中…' : '安装'}
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+          {bundledFiltered.length > bundledLimit && (
+            <button className="xl-more" onClick={() => setBundledLimit((n) => n + 80)}>
+              显示更多（还有 {bundledFiltered.length - bundledLimit} 个）
+            </button>
+          )}
+        </>
+      )}
+    </div>
   )
 
   return (
@@ -688,17 +947,29 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
                 placeholder={SEARCH_PLACEHOLDERS[tab]}
               />
             </div>
+            {/* 连接器 tab：该按钮变成「已连接(N)」筛选（原来点它无任何效果 = 空操作）；
+                技能/专家 tab 仍是「已安装(N)」本机筛选。 */}
             <button
-              className={`sm-installed-pill${installedOnly ? ' on' : ''}`}
-              onClick={() => setInstalledOnly((v) => !v)}
+              className={`sm-installed-pill${(tab === 'connector' ? connFilter === 'connected' : installedOnly) ? ' on' : ''}`}
+              onClick={() => {
+                if (tab === 'connector') {
+                  setConnFilter((v) => (v === 'connected' ? 'all' : 'connected'))
+                  return
+                }
+                setInstalledOnly((v) => !v)
+              }}
               title={
-                installedOnly
-                  ? `正在只看本机已安装（${installedCount} 项）· 点一下回到全部`
-                  : `只看本机已安装（${installedCount} 项）`
+                tab === 'connector'
+                  ? (connFilter === 'connected'
+                    ? `正在只看已连接（${installedCount} 项）· 点一下回到全部`
+                    : `只看已连接（${installedCount} 项）`)
+                  : (installedOnly
+                    ? `正在只看本机已安装（${installedCount} 项）· 点一下回到全部`
+                    : `只看本机已安装（${installedCount} 项）`)
               }
             >
               <svg viewBox="0 0 24 24"><rect x="3" y="5" width="18" height="14" rx="3" /><path d="M8 12l3 3 5-6" /></svg>
-              已安装 ({installedCount})
+              {tab === 'connector' ? '已连接' : '已安装'} ({installedCount})
             </button>
             <div className="sm-add">
               <button className="sm-add-primary" onClick={() => setAddOpen((v) => !v)} title="添加">
@@ -739,9 +1010,26 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
               {loadError && <div className="sm-banner">{loadError}</div>}
 
               {tab === 'expert' && (
-                /* [2026-11-01 修] 与技能 tab 保持**完全一致**的失败态（用户要求「专家 tab 也和技能一致」）：
-                   市场拉取失败时不再只给一句空文案，而是同一套「失败说明 + 查看本机已装」出口。 */
-                isMarketFailed ? (
+                <div className="xl-wrap">
+                  {/* 专家来源子 tab：市场（默认）/ 内置专家（惰性加载） */}
+                  <div className="sm-subtabs">
+                    <button
+                      className={`sm-subtab${expertSrc === 'market' ? ' active' : ''}`}
+                      onClick={() => { setExpertSrc('market'); setInstalledOnly(false) }}
+                    >
+                      市场 <span className="cnt">{experts.length}</span>
+                    </button>
+                    <button
+                      className={`sm-subtab${expertSrc === 'builtin' ? ' active' : ''}`}
+                      onClick={() => { setExpertSrc('builtin'); setInstalledOnly(false) }}
+                    >
+                      内置专家{bundledState === 'loaded' && <span className="cnt">{bundledExperts.length}</span>}
+                    </button>
+                  </div>
+
+                  {/* [2026-11-01 修] 与技能 tab 保持完全一致的失败态：
+                      市场拉取失败时给「失败说明 + 查看本机已装」出口。 */}
+                  {expertSrc === 'builtin' ? builtinPanel : isMarketFailed ? (
                   <div className="sm-market-failed">
                     <div className="sm-market-failed-txt">市场数据拉取失败，暂无可展示的专家。</div>
                     <button
@@ -830,7 +1118,8 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
                       </div>
                     ))}
                   </div>
-                )
+                  )}
+                </div>
               )}
 
               {tab === 'skill' && (
@@ -953,43 +1242,162 @@ export function SkillMarketModal({ sessionId, currentAgent, busy: _busy, initial
               )}
 
               {tab === 'connector' && (
-                filteredConnectors.length === 0 ? (
-                  <div className="sm-empty">{keyword ? '没有匹配的连接器' : '暂无可用连接器'}</div>
-                ) : (
-                  <div className="sm-connector-grid">
-                    {filteredConnectors.map((c) => {
-                      const desc = [c.authType, c.scope, c.status].filter(Boolean).join(' · ')
-                      return (
-                        <div key={`conn-${c.marketId}`} className={`sm-card sm-mini-card${c.isConnected ? ' installed' : ''}`}>
-                          <div className="sm-mini-head">
-                            <span className="sm-avatar sm-avatar-sm" style={{ background: colorOf(c.name ?? c.marketId) }}>{(c.name ?? 'C').charAt(0).toUpperCase()}</span>
-                            <span className="sm-mini-name" title={c.name ?? c.marketId}>{c.name ?? c.marketId}</span>
-                            {/* v4：connectors 只由市场源填充（本机无连接器概念）⇒ 恒走安装分支 */}
-                            {c.isConnected
-                              ? <span className="sm-installed-mark">已连接</span>
-                              : (
-                                  <button
-                                    className={`sm-plus-btn${installed.has(c.marketId) ? ' marked' : ''}${installing.has(c.marketId) ? ' installing' : ''}`}
-                                    disabled={installed.has(c.marketId) || installing.has(c.marketId)}
-                                    onClick={() => void installMarketPlugin(c.marketId)}
-                                    title={installed.has(c.marketId) ? '已安装' : installing.has(c.marketId) ? '正在安装…' : '安装'}
-                                  >
-                                    {installing.has(c.marketId)
-                                      ? <RingProgress percent={progress[c.marketId]?.percent ?? 0} />
-                                      : installed.has(c.marketId) ? '✓' : '+'}
-                                  </button>
-                                )}
-                          </div>
-                          {desc && <div className="sm-desc one">{desc}</div>}
-                        </div>
-                      )
-                    })}
+                /* 连接器 = 独立目录（惰性加载）+ 三子 tab：已启用 / 内置 / 自定义；点卡片开授权/凭证抽屉。 */
+                <>
+                  <div className="mc-cat-row" style={{ marginBottom: 4 }}>
+                    <div className="mc-cat-scroll">
+                      {([['enabled', '已启用'], ['builtin', '内置'], ['custom', '自定义']] as const).map(([v, l]) => (
+                        <button
+                          key={v}
+                          className={`mc-cat${connSrc === v ? ' active' : ''}`}
+                          onClick={() => setConnSrc(v)}
+                        >
+                          {l}
+                        </button>
+                      ))}
+                    </div>
+                    <span className="sm-result-count">
+                      {connSrc === 'enabled'
+                        ? `${enabledConnectors.length} 个`
+                        : connSrc === 'custom' ? `${customList.length} 个` : `${connectors.length} 个`}
+                    </span>
                   </div>
-                )
+                  {connSrc === 'builtin' && (
+                    connState === 'idle' || connState === 'loading' ? (
+                  <div className="sm-loading">连接器加载中…</div>
+                ) : connState === 'error' ? (
+                  <div className="sm-market-failed">
+                    <div className="sm-market-failed-txt">连接器服务不可用：{connError}</div>
+                    <button className="sm-market-failed-btn" onClick={() => void loadConnectors()}>重试</button>
+                  </div>
+                ) : (
+                  <>
+                    {/* 分类 pill（数据来自 ConnectorDto.category；只在有分类时出现） */}
+                    {connectorCategories.length > 0 && (
+                      <div className="mc-cat-row">
+                        <div className="mc-cat-scroll">
+                          {['全部', ...connectorCategories].map((c) => (
+                            <button
+                              key={c}
+                              className={`mc-cat${connCat === c ? ' active' : ''}`}
+                              onClick={() => setConnCat(c)}
+                            >
+                              {c === '全部' ? '全部' : (categoryLabel(c) ?? c)}
+                            </button>
+                          ))}
+                        </div>
+                        <span className="sm-result-count">{filteredConnectors.length} 个连接器</span>
+                      </div>
+                    )}
+                    {/* 状态筛选：全部 / 已连接 / 需授权（需授权 = 未连接或 reauth_required） */}
+                    <div className="mc-cat-row" style={{ marginTop: connectorCategories.length > 0 ? 0 : 12 }}>
+                      <div className="mc-cat-scroll">
+                        {([['all', '全部'], ['connected', '已连接'], ['needs-auth', '需授权']] as const).map(([v, l]) => (
+                          <button
+                            key={v}
+                            className={`mc-cat${connFilter === v ? ' active' : ''}`}
+                            onClick={() => setConnFilter(v)}
+                          >
+                            {l}
+                          </button>
+                        ))}
+                      </div>
+                      {connectorCategories.length === 0 && (
+                        <span className="sm-result-count">{filteredConnectors.length} 个连接器</span>
+                      )}
+                    </div>
+
+                    {filteredConnectors.length === 0 ? (
+                      <div className="sm-empty small">
+                        {keyword
+                          ? '没有匹配的连接器'
+                          : connFilter === 'needs-auth'
+                            ? '没有待授权的连接器'
+                            : connFilter === 'connected'
+                              ? '还没有已连接的连接器'
+                              : '暂无可用连接器'}
+                      </div>
+                    ) : (
+                      <div className="mc-grid">
+                        {filteredConnectors.map((c) => (
+                          <ConnectorCard
+                            key={c.id}
+                            connector={c}
+                            onOpen={() => setConnDrawer(c)}
+                          />
+                        ))}
+                      </div>
+                    )}
+                  </>
+                    )
+                  )}
+
+                  {/* 已启用：凭据有效且已连接的目录条目 */}
+                  {connSrc === 'enabled' && (
+                    enabledConnectors.length === 0 ? (
+                      <div className="sm-empty small">
+                        还没有已启用的连接器 · 去「内置」里完成授权
+                      </div>
+                    ) : (
+                      <div className="mc-grid">
+                        {enabledConnectors.map((c) => (
+                          <ConnectorCard key={c.id} connector={c} onOpen={() => setConnDrawer(c)} />
+                        ))}
+                      </div>
+                    )
+                  )}
+
+                  {/* 自定义：非内置目录的 MCP server（管理入口在 设置 → MCP） */}
+                  {connSrc === 'custom' && (
+                    customState === 'loading' ? (
+                      <div className="sm-loading">自定义连接器加载中…</div>
+                    ) : customState === 'error' ? (
+                      <div className="sm-market-failed">
+                        <div className="sm-market-failed-txt">MCP 列表加载失败：{customError}</div>
+                        <button className="sm-market-failed-btn" onClick={() => setCustomState('idle')}>重试</button>
+                      </div>
+                    ) : customList.length === 0 ? (
+                      <div className="sm-empty small">
+                        没有自定义连接器 · 在「设置 → MCP」添加 http/sse 或 stdio server
+                      </div>
+                    ) : (
+                      <div className="mc-custom-list">
+                        {customList.map((s) => {
+                          const badge = statusBadgeOf(s)
+                          return (
+                            <div key={s.id} className="mc-custom-row" data-testid="custom-mcp-row">
+                              <span className="mc-custom-name" title={s.userFacingName ?? s.name}>
+                                {s.userFacingName ?? s.name}
+                              </span>
+                              <span className="mc-badge">{s.type ?? 'stdio'}</span>
+                              <span className={`mc-status ${badge.cls === 'connected' ? 'connected' : badge.cls === 'failed' ? 'error' : 'pending'}`}>
+                                <span className="mc-dot" />
+                                {badge.label}
+                              </span>
+                            </div>
+                          )
+                        })}
+                        <div className="mc-hint" style={{ marginTop: 8 }}>
+                          自定义连接器的启动 / 授权在「设置 → MCP」管理。
+                        </div>
+                      </div>
+                    )
+                  )}
+                </>
               )}
             </>
           )}
         </div>
+
+        {/* 连接器授权抽屉 · 后端权威状态回写列表卡片 */}
+        {connDrawer && (
+          <ConnectorAuthDrawer
+            connector={connDrawer}
+            onClose={() => setConnDrawer(null)}
+            onStatusChange={applyConnectorStatus}
+            showToast={showToast}
+          />
+        )}
 
         {/* 上架弹窗（上传技能 / 上传专家）· 上架成功后重新拉市场列表 */}
         {publishCat && (
@@ -1216,6 +1624,8 @@ function SkillCard({
   const dlLabel = formatCountW(skill.downloadCount)
   const author = skill.authorName
   const publishedLabel = formatPublishedAt(skill.publishedAt)
+  /** 图标加载失败 → 回落首字母色块（外链/离线场景不许出现破图） */
+  const [iconFailed, setIconFailed] = useState(false)
 
   return (
     <div
@@ -1230,7 +1640,9 @@ function SkillCard({
           className="sk-ico"
           style={{ background: `linear-gradient(145deg, ${colorOf(nm)}, ${colorOf(nm + 'x')})` }}
         >
-          {nm.charAt(0).toUpperCase()}
+          {skill.icon && !iconFailed
+            ? <img src={skill.icon} alt="" loading="lazy" onError={() => setIconFailed(true)} />
+            : nm.charAt(0).toUpperCase()}
         </span>
         <div className="sk-titles">
           <div className="sk-name" title={nm}>{nm}</div>

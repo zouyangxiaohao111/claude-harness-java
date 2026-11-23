@@ -448,11 +448,30 @@ public final class ToolSearchService {
      * @return true = tool 是 deferred
      */
     public static boolean isDeferredTool(Tool tool, JsonNode input) {
+        return isDeferredTool(tool, input, null);
+    }
+
+    /**
+     * 是否 deferred 工具（带本轮「选中应用 alwaysLoad」豁免）。
+     *
+     * <p>[app-selection] 本轮被选中的应用，其工具视同 {@code tool.alwaysLoad()}（豁免
+     * 「MCP 恒 defer」）→ 直接进本轮 schema；未选应用的工具由 allowlist 在池层剔除，
+     * 根本到不了这里。
+     *
+     * @param alwaysLoadNames 本轮豁免 defer 的工具名（null/空 = 无豁免，与旧行为一致）
+     */
+    public static boolean isDeferredTool(Tool tool, JsonNode input,
+                                         java.util.Set<String> alwaysLoadNames) {
         if (tool == null) {
             return false;
         }
         // CC prompt.ts:65 — Explicit opt-out via alwaysLoad，最先检查
         if (tool.alwaysLoad()) {
+            return false;
+        }
+        // [app-selection] 本轮选中的应用 = alwaysLoad（豁免下面的 MCP 恒 defer）
+        if (alwaysLoadNames != null && tool.name() != null
+                && alwaysLoadNames.contains(tool.name())) {
             return false;
         }
         // CC prompt.ts:68 — MCP 工具永远 defer（workflow-specific）
@@ -692,12 +711,24 @@ public final class ToolSearchService {
      * @return deferred 工具名集合（可空）
      */
     public static Set<String> computeDeferredToolNames(List<Tool> tools) {
+        return computeDeferredToolNames(tools, null);
+    }
+
+    /**
+     * 预计算 deferred 工具名集合（带本轮「选中应用 alwaysLoad」豁免）。
+     *
+     * @param tools           可用工具列表
+     * @param alwaysLoadNames 本轮豁免 defer 的工具名（null/空 = 无豁免）
+     * @return deferred 工具名集合（可空）
+     */
+    public static Set<String> computeDeferredToolNames(List<Tool> tools,
+                                                      Set<String> alwaysLoadNames) {
         Set<String> names = new HashSet<>();
         if (tools == null) {
             return names;
         }
         for (Tool t : tools) {
-            if (isDeferredTool(t, null)) {
+            if (isDeferredTool(t, null, alwaysLoadNames)) {
                 names.add(t.name());
             }
         }

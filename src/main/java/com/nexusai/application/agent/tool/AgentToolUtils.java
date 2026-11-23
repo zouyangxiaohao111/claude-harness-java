@@ -187,6 +187,20 @@ public final class AgentToolUtils {
      * @return 仅含 {@link #COORDINATOR_MODE_ALLOWED_TOOLS} ∪ PR 活动订阅工具 的列表
      */
     public static List<Tool> applyCoordinatorToolFilter(List<Tool> tools) {
+        return applyCoordinatorToolFilter(tools, false);
+    }
+
+    /**
+     * 条件扩展版 · 无人值守协调者会话额外放行 IM 组（{@link com.nexusai.application.agent.tool.SessionToolCategory#IM_TOOL_NAMES}）。
+     *
+     * <p>判定来源 = {@link com.nexusai.application.agent.tool.SessionToolVisibility#isUnattendedCoordinator(String)}
+     * （调用方传入，本类不做会话判定）。{@code imToolsAllowed=false} 时与旧签名完全等价。
+     *
+     * @param tools          待过滤工具列表（null/空 → 空列表）
+     * @param imToolsAllowed 无人值守 + 协调者 ⇒ true
+     * @return 白名单 ∪ PR 订阅 ∪（条件）IM 组
+     */
+    public static List<Tool> applyCoordinatorToolFilter(List<Tool> tools, boolean imToolsAllowed) {
         if (tools == null || tools.isEmpty()) {
             return tools == null ? List.of() : new ArrayList<>();
         }
@@ -197,7 +211,9 @@ public final class AgentToolUtils {
             }
             String name = tool.name();
             if (COORDINATOR_MODE_ALLOWED_TOOLS.contains(name)
-                    || isPrActivitySubscriptionTool(name)) {
+                    || isPrActivitySubscriptionTool(name)
+                    || (imToolsAllowed && com.nexusai.application.agent.tool.SessionToolCategory
+                            .IM_TOOL_NAMES.contains(name))) {
                 result.add(tool);
             }
         }

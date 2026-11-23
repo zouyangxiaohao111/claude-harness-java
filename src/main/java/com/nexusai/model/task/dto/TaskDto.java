@@ -34,6 +34,10 @@ import jakarta.annotation.Nullable;
  * @param activity    进行中 teammate 的最近活动摘要（对齐 CC
  *                    {@code TaskListV2} 第二行 {@code progress.recentActivities} 合并结果）；
  *                    非 teammate / 无活动 / 非 running 为 null
+ * @param sessionId   创建该后台任务的会话 id（{@link BackgroundTask#sessionId()}）· null = 无会话归属
+ *                    （main-thread spawn 无 MDC / 测试直构）。<b>WHY 透出</b>：侧栏
+ *                    「正在运行」判定需要把「仍有后台工作的会话」与主 turn 的运行态取并集
+ *                    （GET /api/v1/tasks/active），前端只能靠该字段把任务归回会话。
  */
 public record TaskDto(
         String id,
@@ -46,7 +50,8 @@ public record TaskDto(
         @Nullable String agentId,
         @Nullable Boolean isBackgrounded,
         @Nullable String ownerName,
-        @Nullable String activity
+        @Nullable String activity,
+        @Nullable String sessionId
 ) {
 
     /**
@@ -81,7 +86,8 @@ public record TaskDto(
                 task.agentId() != null ? task.agentId().toString() : null,
                 task.isBackgrounded(),
                 ownerName,
-                activity
+                activity,
+                task.sessionId()
         );
     }
 }

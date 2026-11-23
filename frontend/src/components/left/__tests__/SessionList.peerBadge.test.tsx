@@ -201,9 +201,10 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
       )
     })
 
-    // 置顶块仍在最前、且置顶星标仍是实心态
-    const firstSection = container.querySelector('.left-section')
-    expect(firstSection?.querySelector('.label .group-path')?.textContent).toBe('置顶')
+    // [run-block 2026-11-23] 运行块在最前；置顶块紧随其后、置顶星标仍是实心态
+    const sectionTitles = Array.from(container.querySelectorAll('.left-section > .label .group-path'))
+      .map((el) => el.textContent)
+    expect(sectionTitles.slice(0, 2)).toEqual(['正在运行', '置顶'])
     expect(rowOf(A).querySelector('.session-pin-btn')?.getAttribute('aria-label')).toBe('取消置顶')
     // 运行中状态点仍在（角标不抢占状态点的位置）
     expect(rowOf(B).querySelector('.status-dot.running')).toBeTruthy()

@@ -76,6 +76,24 @@ public class SessionController {
         return sessionService.list();
     }
 
+    /**
+     * 会话模糊搜索（标题 / id 子串匹配）· 分页 · {@code GET /api/v1/sessions/search?q=&page=1&size=10}。
+     *
+     * <p>供左栏「任务」区搜索按钮打开的面板使用（此前面板只过滤静态演示数据 = 假搜索）。
+     * 路径是字面量 {@code /search}，Spring 优先于 {@code /{id}} 匹配，不会被当成会话 id。
+     *
+     * @param q    关键词（空白 = 最近会话）
+     * @param page 页号（1 起，越界自动收敛）
+     * @param size 每页条数（1..{@link SessionService#SEARCH_MAX_PAGE_SIZE}）
+     */
+    @GetMapping("/search")
+    public com.nexusai.model.session.dto.SessionSearchPage search(
+            @RequestParam(value = "q", required = false) String q,
+            @RequestParam(value = "page", required = false, defaultValue = "1") int page,
+            @RequestParam(value = "size", required = false, defaultValue = "10") int size) {
+        return sessionService.search(q, page, size);
+    }
+
     @GetMapping("/{id}")
     public SessionDto get(@PathVariable String id) {
         return sessionService.getById(id);

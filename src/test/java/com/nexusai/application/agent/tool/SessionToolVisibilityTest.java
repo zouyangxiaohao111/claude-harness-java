@@ -46,6 +46,11 @@ class SessionToolVisibilityTest {
         when(mapper.selectImToolOverrides(any())).thenReturn(null);
         SessionToolDisableConfig.setSessionMapper(mapper);
         SessionModeState.setSessionMapper(mapper);
+        // coordinator 会话列读源：resolver 实例共用同一个 mapper mock。
+        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver resolver =
+            new com.nexusai.application.agent.prompt.PromptAlignSettingsResolver();
+        resolver.setSessionMapper(mapper);
+        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver.setStaticResolver(resolver);
     }
 
     @AfterEach
@@ -54,6 +59,7 @@ class SessionToolVisibilityTest {
         SessionModeState.reset();
         SessionToolVisibility.resetGlobalFlags();
         LlmAgentLoop.setCoordinatorMode(null);
+        com.nexusai.application.agent.prompt.PromptAlignSettingsResolver.setStaticResolver(null);
         com.nexusai.common.SessionProjectRoot.clearSession(SID);
     }
 
@@ -73,7 +79,8 @@ class SessionToolVisibilityTest {
             List.of(tool("Bash"), tool("AskUserQuestion"), tool("SendUserMessage"),
                 tool("SendImAsUser"), tool("ListImChats"),
                 tool("ReadImMessages"), tool("SearchImContacts"),
-                tool("wechat_search_messages"), tool("wechat_list_conversations")),
+                tool("wechat_search_messages"), tool("wechat_list_conversations"),
+                tool("wechat_read_conversation")),
             "", AbortController.NOOP, List.of(), null, null, Map.of(), false, "");
         return LlmAgentLoop.sessionVisibleTools(tuc, QuerySource.USER).stream().map(Tool::name).toList();
     }
@@ -86,7 +93,8 @@ class SessionToolVisibilityTest {
             .doesNotContain("SendUserMessage", "SendImAsUser", "ListImChats",
                 "ReadImMessages", "SearchImContacts")
             .contains("Bash", "AskUserQuestion",
-                "wechat_search_messages", "wechat_list_conversations");
+                "wechat_search_messages", "wechat_list_conversations",
+                "wechat_read_conversation");
     }
 
     @Test
@@ -141,6 +149,53 @@ class SessionToolVisibilityTest {
         assertThat(LlmAgentLoop.sessionVisibleTools(tuc, QuerySource.USER).stream().map(Tool::name).toList())
             .doesNotContain("AskUserQuestion")
             .contains("Bash");
+    }
+
+    @Test
+    void unattendedCoordinatorRevealsAllImTools() {
+        // [coordinator-unattended] 无人值守 + 协调者 ⇒ IM 8 个默认全部放行
+        // （brief=0 也放 SendUserMessage：会话级 opt-in 视为已开）。
+        row.setUnattendedMode(1);
+        row.setCoordinatorMode(1);
+        assertThat(schemaNames())
+            .contains("SendUserMessage", "SendImAsUser", "ListImChats", "ReadImMessages",
+                "SearchImContacts", "wechat_search_messages", "wechat_list_conversations",
+                "wechat_read_conversation")
+            .doesNotContain("AskUserQuestion");
+    }
+
+    @Test
+    void unattendedWithoutCoordinatorStillHidesChannelImTools() {
+        row.setUnattendedMode(1);
+        assertThat(schemaNames())
+            .doesNotContain("SendUserMessage", "SendImAsUser", "ListImChats",
+                "ReadImMessages", "SearchImContacts")
+            .contains("wechat_search_messages");
+    }
+
+    @Test
+    void coordinatorWithoutUnattendedStillHidesChannelImTools() {
+        row.setCoordinatorMode(1);
+        assertThat(schemaNames())
+            .doesNotContain("SendUserMessage", "SendImAsUser", "ListImChats",
+                "ReadImMessages", "SearchImContacts", "wechat_search_messages");
+    }
+
+    @Test
+    void explicitImOverrideFalseWinsOverUnattendedCoordinator() {
+        // 条件默认只作用于「无覆盖」分支：显式关闭仍然生效。
+        row.setUnattendedMode(1);
+        row.setCoordinatorMode(1);
+        when(mapper.selectImToolOverrides(any())).thenReturn("{\"ListImChats\":false}");
+        assertThat(schemaNames()).doesNotContain("ListImChats").contains("SendImAsUser");
+    }
+
+    @Test
+    void globalKillSwitchStillWinsInUnattendedCoordinator() {
+        row.setUnattendedMode(1);
+        row.setCoordinatorMode(1);
+        SessionToolVisibility.setBriefGloballyEnabled(false);
+        assertThat(schemaNames()).doesNotContain("SendUserMessage").contains("SendImAsUser");
     }
 
     @Test

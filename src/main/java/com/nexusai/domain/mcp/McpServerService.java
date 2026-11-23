@@ -18,6 +18,7 @@ import com.nexusai.application.agent.mcp.config.McpConfigDedup;
 import com.nexusai.application.agent.mcp.config.McpConfigFileWriter;
 import com.nexusai.application.agent.mcp.McpOAuth;
 import com.nexusai.domain.mcp_oauth.McpOAuthTokenService;
+import com.nexusai.model.mcp_oauth.McpOAuthToken;
 import com.nexusai.application.agent.mcp.config.McpConfigPolicy;
 import com.nexusai.application.agent.mcp.config.McpJsonConfigParser;
 import com.nexusai.application.agent.mcp.config.McpProperties;
@@ -921,7 +922,12 @@ public class McpServerService {
             hasClientSecret, false);
     }
 
-    /** OAuth 组构（CC addCommand.ts:159-166/:205-212）：clientId/callbackPort/xaa 任一有值才产出。 */
+    /**
+     * OAuth 组构（CC addCommand.ts:159-166/:205-212）：clientId/callbackPort/xaa 任一有值才产出。
+     *
+     * <p>[2026-11-23] 新增 scopes / authorizationEndpoint / tokenEndpoint（Octop CustomMcpOAuthClient
+     * 同字段）：给了端点就跳过 discovery；给了 scopes 就不再只能吃 metadata 的 scope。
+     */
     private Map<String, Object> buildOAuth(McpOAuthRequest oauthReq) {
         if (oauthReq == null) {
             return null;
@@ -929,9 +935,13 @@ public class McpServerService {
         boolean hasClientId = oauthReq.clientId() != null && !oauthReq.clientId().isBlank();
         Integer port = parseCallbackPort(oauthReq.callbackPort());
         boolean xaa = Boolean.TRUE.equals(oauthReq.xaa());
+        boolean hasScopes = oauthReq.scopes() != null && !oauthReq.scopes().isBlank();
+        boolean hasAuthz = oauthReq.authorizationEndpoint() != null
+            && !oauthReq.authorizationEndpoint().isBlank();
+        boolean hasToken = oauthReq.tokenEndpoint() != null && !oauthReq.tokenEndpoint().isBlank();
         // CC addCommand.ts:159-166 oauth falsy 门：parseInt("0")=0 与 parseInt("-0")=-0 均为 falsy →
         // 外层门短路（无 clientId/xaa 时 oauth=undefined）且展开省略 callbackPort（有 clientId 时）。
-        if (!hasClientId && (port == null || port == 0) && !xaa) {
+        if (!hasClientId && (port == null || port == 0) && !xaa && !hasScopes && !hasAuthz && !hasToken) {
             return null;
         }
         Map<String, Object> oauth = new LinkedHashMap<>();
@@ -946,6 +956,15 @@ public class McpServerService {
         }
         if (xaa) {
             oauth.put("xaa", true);
+        }
+        if (hasScopes) {
+            oauth.put("scopes", oauthReq.scopes().trim());
+        }
+        if (hasAuthz) {
+            oauth.put("authorizationEndpoint", oauthReq.authorizationEndpoint().trim());
+        }
+        if (hasToken) {
+            oauth.put("tokenEndpoint", oauthReq.tokenEndpoint().trim());
         }
         return oauth;
     }
@@ -991,13 +1010,23 @@ public class McpServerService {
         return (int) (neg ? -value : value);
     }
 
-    /** clientSecret → keychain（McpOAuthTokenService，CC keychain 等价物）· 仅 sse/http + clientId 同时存在。 */
+    /**
+     * 预配置 OAuth client → 持久化（[2026-11-23] 对齐 Octop「预注册 Client 可用」）。
+     *
+     * <p>旧实现只把 clientSecret 写 {@code mcp_oauth_client_config}，clientId 只留在 env 镜像；
+     * 而授权流开头会清凭据 ⇒ 预注册 client 实际不可用、永远走 DCR。现在把
+     * <b>clientId + clientSecret 一起写进 {@code mcp_oauth_tokens}</b>（授权流只清 token 列、
+     * 保留 client，见 {@code McpAuth.performMCPOAuthFlow}），{@code resolveOrRegisterClient}
+     * 第一步就能读到。仅 sse/http 且 clientId 非空时落行。
+     */
     private void saveClientSecretIfNeeded(McpCreateRequest req, Map<String, Object> config) {
-        if (mcpOAuthTokenService == null || req.clientSecret() == null || req.clientSecret().isBlank()) {
+        if (mcpOAuthTokenService == null || req.oauth() == null) {
             return;
         }
-        if (req.oauth() == null || req.oauth().clientId() == null || req.oauth().clientId().isBlank()) {
-            if (log.isDebugEnabled()) {
+        String clientId = req.oauth().clientId();
+        String clientSecret = req.clientSecret();
+        if (clientId == null || clientId.isBlank()) {
+            if (clientSecret != null && !clientSecret.isBlank() && log.isDebugEnabled()) {
                 log.debug("[McpServerService] clientSecret 无 clientId → 忽略（CC addCommand.ts:168-171 语义）");
             }
             return;
@@ -1012,8 +1041,20 @@ public class McpServerService {
         String url = config.get("url") == null ? "" : String.valueOf(config.get("url"));
         Map<String, String> headers = headersFromConfig(config);
         String serverKey = McpOAuth.getServerKey(req.name(), type, url, headers);
-        mcpOAuthTokenService.saveClientSecret(serverKey, req.clientSecret());
-        log.info("[McpServerService] clientSecret 已落 keychain server={} serverKey={}（不落 config/文件）",
+
+        McpOAuthToken existing = mcpOAuthTokenService.read(serverKey);
+        McpOAuthToken token = existing != null ? existing : new McpOAuthToken();
+        token.setServerKey(serverKey);
+        token.setServerName(req.name());
+        token.setServerUrl(url);
+        token.setClientId(clientId);
+        if (clientSecret != null && !clientSecret.isBlank()) {
+            token.setClientSecret(clientSecret);
+            // 兼容二级回退（既有代码在 config.clientId 非空时读它）
+            mcpOAuthTokenService.saveClientSecret(serverKey, clientSecret);
+        }
+        mcpOAuthTokenService.save(token);
+        log.info("[McpServerService] 预配置 OAuth client 已落 keychain server={} serverKey={}（clientId 持久化）",
             req.name(), serverKey);
     }
 
@@ -1401,6 +1442,29 @@ public class McpServerService {
         }
     }
 
+    /**
+     * [app-layer] 应用「启动」：必要时把 server 置为 {@code enabled=true}（<b>不改</b> autoStart），
+     * 再走正常 {@link #start(String, String)}（pending 审批 / 连接失败仍按原语义抛错）。
+     *
+     * <p>⛔ 不修改自启语义：进程启动时的自动连接仍由 {@code enabled && autoStart} 决定。
+     *
+     * @param id        MCP server DB id
+     * @param sessionId 发起启动的会话（channel 白名单门用；可 null）
+     * @return 启动后的 DTO
+     */
+    public McpServerDto enableAndStart(String id, String sessionId) {
+        McpServerRecord r = mcpServerMapper.selectOneById(id);
+        if (r == null) throw new NotFoundException("MCP server " + id + " not found");
+        McpServer s = r.toDomain();
+        if (!Boolean.TRUE.equals(s.getEnabled())) {
+            s.setEnabled(true);
+            mcpServerMapper.update(McpServerRecord.fromDomain(s));
+            log.info("[McpServerService] enableAndStart: server={} enabled=false→true（应用启动；autoStart 保持原值）",
+                s.getName());
+        }
+        return start(id, sessionId);
+    }
+
     public McpServerDto stop(String id) {
         McpServerRecord r = mcpServerMapper.selectOneById(id);
         if (r == null) throw new NotFoundException("MCP server " + id + " not found");
@@ -1447,14 +1511,50 @@ public class McpServerService {
                 "capabilities", Map.of(),
                 "clientInfo", Map.of("name", "nexusai-mcp-client", "version", "1.0.0")
             )).join();
+            // [2026-11-23] initialize 成功后再拉一次 tools/list（best-effort）：
+            //   /test 要回真实工具名清单（前端 P2 按 tools: string[] 渲染），不是只回 "ok"。
+            List<String> tools = listToolNames(transport);
             long latencyMs = (System.nanoTime() - startedAt) / 1_000_000L;
-            log.info("[McpServerService] test succeeded server={} latencyMs={}", s.getName(), latencyMs);
-            return new TestConnectionResponse(true, latencyMs, "ok", null);
+            log.info("[McpServerService] test succeeded server={} latencyMs={} tools={}",
+                s.getName(), latencyMs, tools.size());
+            return new TestConnectionResponse(true, latencyMs, "ok", null, tools);
         } catch (Exception e) {
             log.error("[McpServerService] test failed server={}: {}", s.getName(), e.getMessage(), e);
             throw new RuntimeException("Failed to test MCP server " + s.getName(), e);
         } finally {
             transport.close();
+        }
+    }
+
+    /** tools/list → 工具名（best-effort：部分 server 要求先发 initialized；失败返回空，不影响 initialize 成功）。 */
+    private static List<String> listToolNames(McpTransport transport) {
+        try {
+            transport.sendNotification("notifications/initialized", Map.of());
+        } catch (Exception ignored) {
+            // 部分 server 不校验 initialized；失败继续 tools/list
+        }
+        try {
+            com.fasterxml.jackson.databind.JsonNode result =
+                    transport.sendRequest("tools/list", Map.of()).join();
+            if (result == null || !result.path("tools").isArray()) {
+                return List.of();
+            }
+            java.util.List<String> names = new java.util.ArrayList<>();
+            for (com.fasterxml.jackson.databind.JsonNode t : result.path("tools")) {
+                String name = t.path("name").asText("");
+                if (!name.isBlank()) {
+                    names.add(name);
+                }
+                if (names.size() >= 100) {
+                    break;
+                }
+            }
+            return List.copyOf(names);
+        } catch (Exception e) {
+            if (log.isDebugEnabled()) {
+                log.debug("[McpServerService] test tools/list 失败（按空工具清单返回）: {}", e.toString());
+            }
+            return List.of();
         }
     }
 

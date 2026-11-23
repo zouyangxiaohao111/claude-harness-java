@@ -1,19 +1,23 @@
 package com.nexusai.apis.mcp;
 
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.model.mcp.dto.McpCreateRequest;
-import com.nexusai.model.mcp.dto.McpImportRequest;
 import com.nexusai.model.mcp.dto.McpServerDto;
 import com.nexusai.model.provider.dto.TestConnectionResponse;
+import com.nexusai.domain.mcp.McpJsonTransferService;
 import com.nexusai.domain.mcp.McpServerService;
+import com.nexusai.infra.exception.ValidationException;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 
 import java.util.List;
+import java.util.Map;
 
 /**
  * MCP Server REST 端点 · 对齐 CC {@code claude mcp} 命令族。
@@ -31,8 +35,16 @@ import java.util.List;
 public class McpServerController {
 
     private static final Logger log = LoggerFactory.getLogger(McpServerController.class);
+    private static final ObjectMapper JSON = new ObjectMapper();
 
-    @Autowired private McpServerService mcpServerService;
+    private final McpServerService mcpServerService;
+    private final McpJsonTransferService transferService;
+
+    public McpServerController(McpServerService mcpServerService,
+                               McpJsonTransferService transferService) {
+        this.mcpServerService = mcpServerService;
+        this.transferService = transferService;
+    }
 
     /** G5-1 列表：返回扩展 DTO（远程 server 反解 url/headers/oauth，供前端回显）。 */
     @GetMapping
@@ -145,17 +157,43 @@ public class McpServerController {
      * files = scope → 文件路径（project/user/local/... 多 scope 合并，同名字 local 胜）。
      * 导入的 pending server 由前端经 /{id}/approve|reject 审批（FM-1）。
      */
+    /**
+     * JSON 导出（[2026-11-23] DB 为真源，⛔ 不写 ~/.nexusai/mcp.json）。
+     *
+     * <p>响应体 = {@code {"mcpServers": {...}}}（密钥/头值掩码）；可选保存路径只放在
+     * {@code X-Suggested-Save-Path} 响应头里，后端不落任何文件。
+     */
+    @GetMapping("/export")
+    public ResponseEntity<JsonNode> exportServers() {
+        return ResponseEntity.ok()
+                .header("X-Suggested-Save-Path", transferService.suggestedSavePath())
+                .body(transferService.exportMasked());
+    }
+
+    /**
+     * JSON 导入（DB 为真源）。请求体两种形态：
+     * <ul>
+     *   <li>{@code {"mcpServers": {...}, "deleteMissing": false}} — 新的 JSON 导入（严格校验/备份/diff）</li>
+     *   <li>{@code {"files": {"project": "C:/path/.mcp.json"}}} — 既有 .mcp.json 文件导入（兼容）</li>
+     * </ul>
+     */
     @PostMapping("/import")
-    @ResponseStatus(HttpStatus.OK)
-    public McpServerService.McpServerImportResult importServers(
-            @RequestBody McpImportRequest req) {
-        if (req == null || req.files() == null || req.files().isEmpty()) {
-            throw new com.nexusai.infra.exception.ValidationException("files (scope → .mcp.json path) required");
+    public ResponseEntity<?> importServers(@RequestBody JsonNode body) {
+        if (body != null && body.has("mcpServers")) {
+            return ResponseEntity.ok(transferService.importJson(body));
         }
-        McpServerService.McpServerImportResult result = mcpServerService.importFromMcpJson(req.files());
-        log.info("[McpServerController] 导入完成 imported={} blocked={} suppressed={}",
-            result.imported(), result.blocked(), result.suppressed());
-        return result;
+        if (body != null && body.has("files")) {
+            Map<String, String> files = JSON.convertValue(body.get("files"),
+                    new TypeReference<Map<String, String>>() { });
+            if (files == null || files.isEmpty()) {
+                throw new ValidationException("files (scope → .mcp.json path) required");
+            }
+            McpServerService.McpServerImportResult result = mcpServerService.importFromMcpJson(files);
+            log.info("[McpServerController] 文件导入完成 imported={} blocked={} suppressed={}",
+                result.imported(), result.blocked(), result.suppressed());
+            return ResponseEntity.ok(result);
+        }
+        throw new ValidationException("导入请求需包含 mcpServers（JSON）或 files（.mcp.json 路径）");
     }
 
     /** T7: 审批通过（pending → approved + enabled）· Q-25 状态机。 */

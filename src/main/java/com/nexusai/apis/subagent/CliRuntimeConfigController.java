@@ -119,7 +119,66 @@ public class CliRuntimeConfigController {
             row.put("resolvedPath", resolved);
             out.add(row);
         }
+        // ── ACP 运行时卡片（P2 · 独立规格，不加进 ExternalRuntimeCatalog.PRESETS）──
+        // WHY 独立一行：PRESETS 的「每个预设 args 必须含 {prompt}」断言
+        // （ExternalRuntimeCatalogTest:26-31）与 ACP 的 argv 语义冲突；ACP 走
+        // session/prompt 传任务，没有 argv 模板。故卡片单独拼，不进 presets。
+        out.add(acpRuntimeRow(saved));
         return out;
+    }
+
+    /** ACP 卡片行 · 形状与预设行一致（前端按同一套字段渲染，未知 runtime 走首字母图标回落）。 */
+    private Map<String, Object> acpRuntimeRow(List<CliRuntimeConfigService.View> saved) {
+        CliRuntimeConfigService.View v = null;
+        for (CliRuntimeConfigService.View s : saved) {
+            if ("acp".equals(s.runtime())) {
+                v = s;
+                break;
+            }
+        }
+        if (v == null) {
+            v = service.get("acp");
+        }
+        Map<String, Object> row = new LinkedHashMap<>();
+        row.put("runtime", "acp");
+        row.put("displayName", "ACP 外部代理");
+        row.put("tagline", "Agent Client Protocol · stdio（外部 agent 运行时）");
+        row.put("configurable", true);
+        row.put("configDirEnv", null);
+        row.put("baseUrlEnv", null);
+        // ACP 适配器默认认哪个 key 变量由适配器决定；dsh 用 DEEPSEEK_API_KEY
+        // （唯一来源：AcpRuntimeConstants，与执行侧/配置保存侧共用，避免三处漂移）。
+        row.put("apiKeyEnvs", List.of(com.nexusai.model.acp.AcpRuntimeConstants.DEFAULT_API_KEY_ENV));
+        row.put("binEnv", null);
+
+        row.put("configDir", v.configDir());
+        row.put("baseUrl", v.baseUrl());
+        row.put("secrets", v.secrets());
+        row.put("apiKeySet", v.apiKeySet());
+        row.put("bin", v.bin());
+        row.put("model", v.model());
+        row.put("reasoning", v.reasoning());
+        row.put("configured", v.configDir() != null || v.baseUrl() != null || v.apiKeySet()
+                || v.bin() != null || v.model() != null || v.reasoning() != null);
+        row.put("updatedAt", v.updatedAt());
+
+        // ACP 没有「推理强度 / 模型枚举」的通用语义 ⇒ 前端按不支持渲染（不显示假控件）
+        row.put("supportsReasoning", false);
+        row.put("reasoningOptions", List.of());
+        row.put("reasoningStyle", "NONE");
+        row.put("supportsModelList", false);
+        row.put("fallbackModels", List.of());
+
+        String resolved = null;
+        if (v.bin() != null && !v.bin().isBlank()) {
+            resolved = ExternalRuntimeSpec.resolveExecutable(v.bin().trim());
+        }
+        if (resolved == null) {
+            resolved = ExternalRuntimeSpec.resolveExecutable("dsh");
+        }
+        row.put("available", resolved != null);
+        row.put("resolvedPath", resolved);
+        return row;
     }
 
     /**
@@ -130,6 +189,9 @@ public class CliRuntimeConfigController {
      */
     @GetMapping("/{runtime}/version")
     public Map<String, Object> version(@PathVariable String runtime) {
+        if (isAcpRuntime(runtime)) {
+            return acpVersion();
+        }
         ExternalRuntimeCatalog.RuntimePreset preset = requirePreset(runtime);
         String bin = resolveBinFor(preset);
         Map<String, Object> resp = new LinkedHashMap<>();
@@ -148,6 +210,9 @@ public class CliRuntimeConfigController {
      */
     @GetMapping("/{runtime}/models")
     public Map<String, Object> models(@PathVariable String runtime) {
+        if (isAcpRuntime(runtime)) {
+            return acpModels();
+        }
         ExternalRuntimeCatalog.RuntimePreset preset = requirePreset(runtime);
         String bin = resolveBinFor(preset);
         Map<String, Object> resp = new LinkedHashMap<>();
@@ -200,6 +265,9 @@ public class CliRuntimeConfigController {
      */
     @PostMapping("/{runtime}/test")
     public Map<String, Object> test(@PathVariable String runtime) {
+        if (isAcpRuntime(runtime)) {
+            return acpTest();
+        }
         ExternalRuntimeCatalog.RuntimePreset preset = requirePreset(runtime);
         String bin = resolveBinFor(preset);
         ExternalRuntimeProbe.TestResult result = ExternalRuntimeProbe.test(preset, bin,
@@ -270,6 +338,67 @@ public class CliRuntimeConfigController {
             out.add(row);
         }
         return out;
+    }
+
+    private static boolean isAcpRuntime(String runtime) {
+        return com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME.equalsIgnoreCase(
+                runtime == null ? "" : runtime.trim());
+    }
+
+    /** ACP 版本信息 · 不伪造预设字段：真实找 bin、真实跑 --version、附上本客户端的协议版本。 */
+    private Map<String, Object> acpVersion() {
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("runtime", com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME);
+        com.nexusai.application.agent.acp.AcpRuntimeSpec.Resolution r =
+                com.nexusai.application.agent.acp.AcpRuntimeSpec.resolveForRuntime(null);
+        resp.put("available", r.isAvailable());
+        resp.put("resolvedPath", r.isAvailable() ? r.spec().bin() : null);
+        resp.put("version", r.isAvailable()
+                ? ExternalRuntimeProbe.probeVersion(r.spec().bin()) : null);
+        resp.put("acpProtocolVersion", com.nexusai.application.agent.acp.AcpClient.PROTOCOL_VERSION);
+        return resp;
+    }
+
+    /** ACP 没有可枚举的模型（模型由外部 agent 自身配置）· 返回不支持而不是 400。 */
+    private Map<String, Object> acpModels() {
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("runtime", com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME);
+        resp.put("supported", false);
+        resp.put("live", false);
+        resp.put("models", List.of());
+        resp.put("reason", "ACP 不支持枚举模型（模型由外部 agent 自身配置）");
+        return resp;
+    }
+
+    /** ACP 真探测：spawn → initialize → session/new → 收尾（与真实派发同一条链）。 */
+    private Map<String, Object> acpTest() {
+        com.nexusai.application.agent.acp.AcpRuntimeSpec.Resolution r =
+                com.nexusai.application.agent.acp.AcpRuntimeSpec.resolveForRuntime(null);
+        Map<String, Object> resp = new LinkedHashMap<>();
+        resp.put("runtime", com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME);
+        if (!r.isAvailable()) {
+            resp.put("ok", false);
+            resp.put("probeLevel", "failed");
+            resp.put("elapsedMs", 0L);
+            resp.put("sample", null);
+            resp.put("error", r.unavailableReason());
+            return resp;
+        }
+        com.nexusai.application.agent.acp.AcpRuntimeProbe.Result probe =
+                com.nexusai.application.agent.acp.AcpRuntimeProbe.probe(r.spec(), 20_000L);
+        try {
+            service.recordTestResult(com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME,
+                    probe.ok(), probe.ok() ? null : probe.message());
+        } catch (Exception e) {
+            log.warn("[CliRuntimeConfig] 记录 ACP 测试结果失败（不影响本次结果）: {}", e.toString());
+        }
+        resp.put("ok", probe.ok());
+        resp.put("probeLevel", probe.probeLevel());
+        resp.put("elapsedMs", probe.elapsedMs());
+        resp.put("sample", null);
+        resp.put("error", probe.ok() ? null : probe.message());
+        resp.put("message", probe.message());
+        return resp;
     }
 
     private ExternalRuntimeCatalog.RuntimePreset requirePreset(String runtime) {

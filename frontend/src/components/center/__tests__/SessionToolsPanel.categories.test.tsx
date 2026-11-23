@@ -30,11 +30,13 @@ vi.mock('@/api/sessions', () => ({
   },
 }))
 
-// ApiError 只需 instanceof 判断，用轻量替身
+// ApiError 只需 instanceof 判断，用轻量替身；api 供「浏览器扩展连接状态」查询
+const browserStatus = vi.fn()
 vi.mock('@/api/rest', () => ({
   ApiError: class ApiError extends Error {
     userMessage() { return this.message }
   },
+  api: (...a: unknown[]) => browserStatus(...a),
 }))
 
 import { SessionToolsPanel } from '@/components/center/SessionToolsPanel'
@@ -92,6 +94,7 @@ beforeEach(() => {
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
+  browserStatus.mockReset().mockResolvedValue({ connected: true })
   listTools.mockReset().mockResolvedValue(FIXTURE)
   setToolEnabled.mockReset()
   setCategoryEnabled.mockReset().mockResolvedValue(FIXTURE)
@@ -103,18 +106,24 @@ afterEach(() => {
 })
 
 describe('SessionToolsPanel · 分类分组', () => {
-  it('6 类按 CU→KB→BR→MCP→IM→SYS 顺序渲染，并显示 N 个 · M 个已启用', async () => {
+  it('列 CU→KB→BR→IM→SYS（只有 MCP 移出到应用层）', async () => {
     await mount()
-    const names = Array.from(container.querySelectorAll('.l1-name')).map((n) => n.textContent)
-    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', 'MCP 工具', 'IM 工具', '系统工具'])
+    const names = Array.from(container.querySelectorAll('.l1-name'))
+      .map((n) => n.textContent)
+      .filter((n) => n !== '应用层历史禁用')   // 历史恢复行不是分类
+    expect(names).toEqual(['电脑操作', '知识库', '浏览器控制', 'IM 工具', '系统工具'])
 
-    const subs = Array.from(container.querySelectorAll('.l1-sub')).map((n) => n.textContent)
+    const subs = Array.from(container.querySelectorAll('.l1-sub'))
+      .slice(0, 5)
+      .map((n) => n.textContent)
     expect(subs[0]).toBe('2 个 · 0 个已启用')   // CU 全部禁用
     expect(subs[1]).toBe('1 个 · 0 个已启用')   // KB 全部禁用
-    expect(subs[2]).toBe('需安装 Chrome 扩展')  // BR 空组
-    expect(subs[3]).toBe('3 个 · 2 个已启用')   // MCP 半开（third-party 工具不再混进系统工具）
-    expect(subs[4]).toBe('2 个 · 1 个已启用')   // IM 半开（自建通讯工具独立成组）
-    expect(subs[5]).toBe('3 个 · 2 个已启用')   // SYS 半开
+    // BR 空组：按 /browser/status 真值说「扩展已连接 · 工具未开启」（不再写死「需安装」）
+    expect(subs[2]).toBe('扩展已连接 · 浏览器工具未开启')
+    expect(subs[3]).toBe('2 个 · 1 个已启用')   // IM 半开（自建通讯工具独立成组）
+    expect(subs[4]).toBe('3 个 · 2 个已启用')   // SYS 半开
+    // ⛔ 只有 MCP 被移出
+    expect(names).not.toContain('MCP 工具')
   })
 })
 
@@ -148,7 +157,7 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     await act(async () => { closeBtn.click() })
     expect(container.querySelector('.tools-panel')).toBeNull()
     // 一级目录仍在
-    expect(container.querySelectorAll('.l1-item').length).toBe(6)
+    expect(container.querySelectorAll('.l1-item').length).toBe(6) // 5 类 + 历史禁用恢复行
   })
 
   it('切换到另一类后二级内容随之变化', async () => {
@@ -156,20 +165,70 @@ describe('SessionToolsPanel · 二级展开与收起', () => {
     const items = container.querySelectorAll('.l1-item')
     await act(async () => { (items[0] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('电脑操作')
-    await act(async () => { (items[5] as HTMLElement).click() })
+    await act(async () => { (items[4] as HTMLElement).click() })
     expect(container.querySelector('.tools-panel-title')?.textContent).toContain('系统工具')
   })
 })
 
+describe('SessionToolsPanel · 空组状态（按真实能力/连接状态，不写死）', () => {
+  const openCat = async (label: string) => {
+    const row = Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === label) as HTMLElement
+    await act(async () => { row.click() })
+  }
+
+  it('浏览器扩展未连接 ⇒ 「未连接浏览器扩展」', async () => {
+    browserStatus.mockResolvedValue({ connected: false })
+    await mount({ onOpenChromePanel: () => {} })
+    const br = Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === '浏览器控制') as HTMLElement
+    expect(br.querySelector('.l1-sub')?.textContent).toBe('未连接浏览器扩展')
+    await openCat('浏览器控制')
+    expect(container.textContent).toContain('未连接浏览器扩展，模型看不到这组工具')
+    // 仍然保留检查/安装入口
+    expect(container.querySelector('.tools-panel-retry')).not.toBeNull()
+  })
+
+  it('浏览器扩展已连接但工具未开启 ⇒ 说明是能力关，不是没装', async () => {
+    browserStatus.mockResolvedValue({ connected: true })
+    await mount()
+    await openCat('浏览器控制')
+    expect(container.textContent).toContain('浏览器扩展已连接，但浏览器工具未开启')
+  })
+
+  it('状态查不到 ⇒ 「状态未知」而不是断言没装', async () => {
+    browserStatus.mockRejectedValue(new Error('boom'))
+    await mount()
+    const br = Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === '浏览器控制') as HTMLElement
+    expect(br.querySelector('.l1-sub')?.textContent).toBe('浏览器扩展状态未知')
+  })
+
+  it('电脑操作 0 工具 ⇒ 「功能未开启」（不是 0 个）', async () => {
+    listTools.mockResolvedValue([t('Bash', 'SYS', false, 'Bash（终端）')])
+    await mount()
+    const cu = Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === '电脑操作') as HTMLElement
+    expect(cu.querySelector('.l1-sub')?.textContent).toBe('功能未开启')
+    await openCat('电脑操作')
+    expect(container.textContent).toContain('computer-use 能力默认关闭')
+  })
+})
+
 describe('SessionToolsPanel · 分类开关', () => {
+  /** 按一级标签找行（只有 MCP 移出应用层） */
+  const l1ByLabel = (label: string) =>
+    Array.from(container.querySelectorAll('.l1-item'))
+      .find((el) => el.querySelector('.l1-name')?.textContent === label) as HTMLElement
+
   it('点开关只调 setCategoryEnabled，不打开二级', async () => {
     await mount()
-    const sw = container.querySelector('.l1-item .tc-sw') as HTMLElement
+    const sw = l1ByLabel('系统工具').querySelector('.tc-sw') as HTMLElement
     await act(async () => { sw.click() })
     await act(async () => { await Promise.resolve() })
 
     expect(setCategoryEnabled).toHaveBeenCalledTimes(1)
-    expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'CU', true])
+    expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'SYS', true])
     // ⛔ 关键：开关不得展开二级
     expect(container.querySelector('.tools-panel'), '点开关不应展开明细').toBeNull()
   })
@@ -177,89 +236,56 @@ describe('SessionToolsPanel · 分类开关', () => {
   it('半开组点开关 → 全部启用', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    const sw = items[5].querySelector('.tc-sw') as HTMLElement
+    const sw = items[4].querySelector('.tc-sw') as HTMLElement
     await act(async () => { sw.click() })
     await act(async () => { await Promise.resolve() })
     expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'SYS', true])
   })
 
-  it('浏览器组 0 项时开关不可点（不发请求）', async () => {
+  it('CU / KB / BR / IM / SYS 的开关都在（只有 MCP 被移走）', async () => {
     await mount()
-    const items = container.querySelectorAll('.l1-item')
-    const sw = items[2].querySelector('.tc-sw') as HTMLElement
-    expect(sw.className).toContain('empty')
-    await act(async () => { sw.click() })
-    await act(async () => { await Promise.resolve() })
-    expect(setCategoryEnabled).not.toHaveBeenCalled()
+    for (const label of ['电脑操作', '知识库', '浏览器控制', 'IM 工具', '系统工具']) {
+      expect(l1ByLabel(label).querySelector('.tc-sw'), `${label} 开关丢了`).not.toBeNull()
+    }
   })
 })
 
-describe('SessionToolsPanel · MCP 三级开关（总类 → server → 单工具）', () => {
-  /** 按一级标签找行（⛔ 不写死下标：MCP 插入后下标会漂） */
-  const l1ByLabel = (label: string) =>
-    Array.from(container.querySelectorAll('.l1-item'))
-      .find((el) => el.querySelector('.l1-name')?.textContent === label) as HTMLElement
-  /** 二级分组头（`.tools-panel-list > div > .tool-row`） */
-  const serverHeaders = () =>
-    Array.from(container.querySelectorAll('.tools-panel-list > .tool-row')) as HTMLElement[]
-  const headerOf = (server: string) =>
-    serverHeaders().find((h) => h.querySelector('.tool-name')?.textContent === server)!
-  /** 当前列表面板里出现的工具名（第二层只有 server 行，第三层才是工具）。 */
-  const listKeyTexts = () =>
-    Array.from(container.querySelectorAll('.tools-panel-list .tool-key'))
-      .map((n) => n.textContent)
-
-  it('⭐ 展开 MCP → 只列 server（第二层），点 server 进第三层才看到工具', async () => {
+describe('SessionToolsPanel · 应用层分类已移出（历史禁用只恢复）', () => {
+  it('⭐ MCP 不出现在分类列表（在输入框「应用」里开关）；CU/BR 回来了', async () => {
     await mount()
-    await act(async () => { l1ByLabel('MCP 工具').click() })
-
-    const names = serverHeaders().map((h) => h.querySelector('.tool-name')?.textContent)
-    expect(names).toEqual(['other', 'rea'])
-    expect(headerOf('rea').querySelector('.tool-key')?.textContent).toBe('1 / 2 已启用')
-    // 第二层不铺工具行：一个 server 可能带 255 个工具，不能一口气全渲染
-    expect(listKeyTexts()).toEqual(['1 / 1 已启用', '1 / 2 已启用'])
-
-    await act(async () => { headerOf('rea').click() })
-    expect(listKeyTexts()).toContain('mcp__rea__inspect_plist')
-    expect(listKeyTexts()).not.toContain('mcp__other__do_thing')
-    expect(container.querySelector('.crumb-cur')?.textContent).toBe('rea')
+    const names = Array.from(container.querySelectorAll('.l1-name')).map((n) => n.textContent)
+    expect(names).not.toContain('MCP 工具')
+    for (const back of ['浏览器控制', '电脑操作']) {
+      expect(names, `${back} 应回到工具面板`).toContain(back)
+    }
+    // 没有二级面板自动展开（MCP 无处可进）
+    expect(container.querySelectorAll('.tools-panel').length).toBe(0)
   })
 
-  it('⭐ server 开关 → PATCH {category:MCP, mcpServer:rea}（只关这一个 server）', async () => {
+  it('⭐ 历史会话级禁用 ⇒ 出现「应用层历史禁用」一项，点击只做恢复', async () => {
     await mount()
-    await act(async () => { l1ByLabel('MCP 工具').click() })
+    // FIXTURE：只有 MCP 有 1 项会话级禁用（CU/BR 已回面板，不算「应用层历史」）
+    const row = container.querySelector('[data-testid="app-managed-history"]') as HTMLElement | null
+    expect(row, '缺少历史禁用恢复入口').toBeTruthy()
+    expect(row!.textContent).toContain('应用层历史禁用')
+    expect(row!.textContent).toContain('1 项')
 
-    const sw = headerOf('rea').querySelector('.tc-sw') as HTMLElement
-    expect(sw.className).toContain('mixed')
-    await act(async () => { sw.click() })
+    await act(async () => { row!.click() })
     await act(async () => { await Promise.resolve() })
 
-    expect(setCategoryEnabled).toHaveBeenCalledTimes(1)
-    expect(setCategoryEnabled.mock.calls[0]).toEqual(['sess-1', 'MCP', true, 'rea'])
-    // ⛔ server 开关不得进入第三层（只切开关，不改视图）
-    expect(container.querySelector('.crumb-cur')).toBeNull()
+    // 只对确实有禁用行的分类发「整类启用」；⛔ 不提供禁用路径
+    const calls = setCategoryEnabled.mock.calls.map((c) => c.slice(0, 3))
+    expect(calls).toEqual([['sess-1', 'MCP', true]])
   })
 
-  it('一级 MCP 开关 → PATCH {category:MCP}（不带 mcpServer = 整个 MCP 类）', async () => {
+  it('没有历史禁用 ⇒ 不显示恢复入口（不制造无用按钮）', async () => {
+    listTools.mockResolvedValue([
+      t('mcp__rea__inspect_plist', 'MCP', false, '读取 plist', 'rea'),
+      t('mcp__other__do_thing', 'MCP', false, '其它工具', 'other'),
+      t('Bash', 'SYS', false, 'Bash（终端）'),
+    ])
     await mount()
-    const sw = l1ByLabel('MCP 工具').querySelector('.tc-sw') as HTMLElement
-    await act(async () => { sw.click() })
-    await act(async () => { await Promise.resolve() })
-
-    expect(setCategoryEnabled).toHaveBeenCalledTimes(1)
-    expect(setCategoryEnabled.mock.calls[0].slice(0, 3)).toEqual(['sess-1', 'MCP', true])
-  })
-
-  it('第三层面包屑返回 server 列表（不再是折叠语义）', async () => {
-    await mount()
-    await act(async () => { l1ByLabel('MCP 工具').click() })
-    await act(async () => { headerOf('rea').click() })
-    expect(container.querySelector('.crumb-cur')?.textContent).toBe('rea')
-
-    await act(async () => { (container.querySelector('.crumb-root') as HTMLElement).click() })
-    expect(container.querySelector('.crumb-cur')).toBeNull()
-    expect(serverHeaders().map((h) => h.querySelector('.tool-name')?.textContent))
-      .toEqual(['other', 'rea'])
+    expect(container.querySelector('[data-testid="app-managed-history"]')).toBeNull()
   })
 })
 
@@ -267,7 +293,7 @@ describe('SessionToolsPanel · 单工具开关（目标状态语义）', () => {
   it('⭐ 点「禁用」发 enabled=false、点「启用」发 enabled=true', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    await act(async () => { (items[5] as HTMLElement).click() })
+    await act(async () => { (items[4] as HTMLElement).click() })
 
     const rowOf = (name: string) =>
       Array.from(container.querySelectorAll('.tool-row'))
@@ -291,7 +317,7 @@ describe('SessionToolsPanel · 核心工具保护', () => {
   it('Agent 的禁用按钮是 disabled（后端会 400）', async () => {
     await mount()
     const items = container.querySelectorAll('.l1-item')
-    await act(async () => { (items[5] as HTMLElement).click() })
+    await act(async () => { (items[4] as HTMLElement).click() })
     const rows = Array.from(container.querySelectorAll('.tool-row'))
     const agentRow = rows.find((r) => r.querySelector('.tool-key')?.textContent === 'Agent')
     expect(agentRow, '应能找到 Agent 行').toBeTruthy()

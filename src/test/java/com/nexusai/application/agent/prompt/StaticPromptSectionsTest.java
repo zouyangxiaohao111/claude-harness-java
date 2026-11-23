@@ -169,4 +169,63 @@ class StaticPromptSectionsTest {
         assertThat(eff).contains("IMPORTANT: Go straight to the point.");
         assertThat(eff).doesNotContain("# Communicating with the user");
     }
+
+    // ── AST 工具子弹：两名称各自独立门控（只提实际可见的那个）──
+
+    @Test
+    @DisplayName("usingYourToolsSection：AstGrep+AstEdit 都可见 → 两者都出现，且写清分工与 apply 两阶段")
+    void usingYourTools_astBothVisible() {
+        String section = StaticPromptSections.usingYourToolsSection(
+            Set.of(ToolNameConstants.AST_GREP_TOOL_NAME, ToolNameConstants.AST_EDIT_TOOL_NAME));
+
+        assertThat(section).contains(ToolNameConstants.AST_GREP_TOOL_NAME);
+        assertThat(section).contains(ToolNameConstants.AST_EDIT_TOOL_NAME);
+        assertThat(section).as("代码搜索优先 AstGrep / 代码修改优先 AstEdit（含单点）")
+            .contains("Prefer " + ToolNameConstants.AST_GREP_TOOL_NAME)
+            .contains("Prefer " + ToolNameConstants.AST_EDIT_TOOL_NAME)
+            .contains("code searches")
+            .contains("code changes")
+            .contains("including a single location");
+        assertThat(section).as("非程序内容回退 Grep/Edit、不可表达可回退")
+            .contains(ToolNameConstants.GREP_TOOL_NAME + " for non-programming content")
+            .contains(ToolNameConstants.FILE_EDIT_TOOL_NAME + " for non-programming content")
+            .contains("cannot express");
+        assertThat(section).as("旧取向（仅多处/多文件才用）已清除").doesNotContain("many matched sites");
+        assertThat(section).as("AstEdit 两阶段：先预览再 apply").contains("apply: true");
+        assertThat(section).as("CC 原有 Edit/Grep 子弹不因 AST 子弹被削")
+            .contains("To edit files use " + ToolNameConstants.FILE_EDIT_TOOL_NAME)
+            .contains("To search the content of files, use " + ToolNameConstants.GREP_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("usingYourToolsSection：仅 AstGrep 可见 → 只提 AstGrep，不提 AstEdit")
+    void usingYourTools_onlyAstGrep() {
+        String section = StaticPromptSections.usingYourToolsSection(
+            Set.of(ToolNameConstants.FILE_EDIT_TOOL_NAME, ToolNameConstants.AST_GREP_TOOL_NAME));
+
+        assertThat(section).contains(ToolNameConstants.AST_GREP_TOOL_NAME);
+        assertThat(section).as("正向：代码搜索优先 AstGrep").contains("Prefer " + ToolNameConstants.AST_GREP_TOOL_NAME);
+        assertThat(section).doesNotContain(ToolNameConstants.AST_EDIT_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("usingYourToolsSection：仅 AstEdit 可见 → 只提 AstEdit，不提 AstGrep")
+    void usingYourTools_onlyAstEdit() {
+        String section = StaticPromptSections.usingYourToolsSection(
+            Set.of(ToolNameConstants.FILE_EDIT_TOOL_NAME, ToolNameConstants.AST_EDIT_TOOL_NAME));
+
+        assertThat(section).contains(ToolNameConstants.AST_EDIT_TOOL_NAME);
+        assertThat(section).as("正向：代码修改优先 AstEdit").contains("Prefer " + ToolNameConstants.AST_EDIT_TOOL_NAME);
+        assertThat(section).doesNotContain(ToolNameConstants.AST_GREP_TOOL_NAME);
+    }
+
+    @Test
+    @DisplayName("usingYourToolsSection：两者都不可见 → 两个名称都不出现")
+    void usingYourTools_noAstTools() {
+        String section = StaticPromptSections.usingYourToolsSection(
+            Set.of(ToolNameConstants.FILE_EDIT_TOOL_NAME, ToolNameConstants.GREP_TOOL_NAME));
+
+        assertThat(section).doesNotContain(ToolNameConstants.AST_GREP_TOOL_NAME);
+        assertThat(section).doesNotContain(ToolNameConstants.AST_EDIT_TOOL_NAME);
+    }
 }

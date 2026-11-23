@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.model.connector.ConnectorConnectionInfo;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
@@ -101,7 +102,7 @@ public class MarketPublishService {
         }
         String category = (req.category() == null || req.category().isBlank()) ? "skill" : req.category().trim();
         String dirName = req.name() != null && !req.name().isBlank() ? req.name().trim() : dir.getFileName().toString();
-        String problem = validatePluginDir(dir);
+        String problem = validatePluginDir(dir, category);
         if (problem != null) {
             return PublishResult.fail(problem);
         }
@@ -169,13 +170,19 @@ public class MarketPublishService {
             ArrayNode tags = entry.putArray("tags");
             List<String> tagList = req.tags() != null && !req.tags().isEmpty()
                 ? req.tags()
-                : List.of(category);
+                // [2026-11-23] 连接器不再默认 tags=[category]：前端曾把 tags[0] 当 authType，
+                //   会拿到字面量 "connector"（假 authType）。技能/专家保持原默认。
+                : ("connector".equals(category) ? List.of() : List.of(category));
             tagList.forEach(tags::add);
             entry.put("source", source);
             entry.put("strict", false);
             entry.withArray("dependencies");
             entry.put("fingerprint", publishedFingerprint);
             entry.put("publishedAt", now);
+            // [2026-11-23 连接器市场] manifest 的 connection 块（req 未提供时保留既有块，不覆盖）
+            writeConnection(entry, req.connection());
+            // [2026-11-23 市场图标] 图标 URL：仅非空时写入（留空保留既有值，避免重发版把图标清掉）
+            writeIcon(entry, req.icon());
             ArrayNode versions = entry.withArray("versions");
             ObjectNode v = versions.addObject();
             v.put("version", version);
@@ -248,14 +255,59 @@ public class MarketPublishService {
 
     // ── 内部 ───────────────────────────────────────────────────────────────
 
-    /** 目录合法性：至少要有 SKILL.md / plugin.json / agents 之一，否则装上去也是空壳。 */
-    private static String validatePluginDir(Path dir) {
+    /**
+     * 目录合法性：技能/专家至少要有 SKILL.md / plugin.json / agents / skills 之一；
+     * <b>连接器分支单独校验</b>（[2026-11-23] 连接器包只有 {@code connector.json}，
+     * 用插件白名单会被误拒）。
+     */
+    private static String validatePluginDir(Path dir, String category) {
+        if ("connector".equals(category)) {
+            boolean connectorOk = Files.isRegularFile(dir.resolve("connector.json"))
+                || Files.isRegularFile(dir.resolve(".claude-plugin").resolve("plugin.json"))
+                || Files.isRegularFile(dir.resolve("plugin.json"));
+            return connectorOk ? null
+                : "连接器目录里既没有 connector.json，也没有 plugin.json，不是可上架的连接器目录";
+        }
         boolean ok = Files.isRegularFile(dir.resolve("SKILL.md"))
             || Files.isRegularFile(dir.resolve(".claude-plugin").resolve("plugin.json"))
             || Files.isRegularFile(dir.resolve("plugin.json"))
             || Files.isDirectory(dir.resolve("agents"))
             || Files.isDirectory(dir.resolve("skills"));
         return ok ? null : "目录里既没有 SKILL.md，也没有 plugin.json / agents/ / skills/，不是可上架的插件目录";
+    }
+
+    /** 写 manifest 的 connection 块（只写非空键；{@code info == null} 时不动既有块）。 */
+    private static void writeConnection(ObjectNode entry, ConnectorConnectionInfo info) {
+        if (info == null) {
+            return;
+        }
+        ObjectNode conn = entry.putObject("connection");
+        putText(conn, "authType", info.authType());
+        ArrayNode scopes = conn.putArray("scopes");
+        if (info.scopes() != null) {
+            info.scopes().forEach(scopes::add);
+        }
+        putText(conn, "discoveryUrl", info.discoveryUrl());
+        putText(conn, "authorizationEndpoint", info.authorizationEndpoint());
+        putText(conn, "tokenEndpoint", info.tokenEndpoint());
+        putText(conn, "resource", info.resource());
+        if (info.requiresManualClient() != null) {
+            conn.put("requiresManualClient", info.requiresManualClient());
+        }
+        putText(conn, "callbackPath", info.callbackPath());
+    }
+
+    private static void putText(ObjectNode node, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            node.put(key, value);
+        }
+    }
+
+    /** 写 manifest 的图标 URL（仅非空；{@code icon==null/空白} 时不动既有值）。 */
+    private static void writeIcon(ObjectNode entry, String icon) {
+        if (icon != null && !icon.isBlank()) {
+            entry.put("icon", icon.trim());
+        }
     }
 
     /** 分类 → 目录名（清单 source 前缀，与既有清单 `skills/...`、`experts/...` 对齐）。 */
@@ -510,10 +562,13 @@ public class MarketPublishService {
      * 上架请求。
      *
      * @param author 市场卡片「开发者」名（可选）：留空时新条目默认 {@code zjky}、已有条目保留原值
+     * @param connection 连接器授权元数据（仅 category=connector 需要；null = 不写/保留既有块）
+     * @param icon   市场卡片图标 URL（可选 · [2026-11-23 市场图标]）：非空才写入清单，
+     *               留空不覆盖既有值；前端加载失败时回落名字首字母色块
      */
     public record PublishRequest(String sourcePath, String name, String displayName,
                                  String description, String category, List<String> tags, String version,
-                                 String author) {
+                                 String author, ConnectorConnectionInfo connection, String icon) {
     }
 
     /**

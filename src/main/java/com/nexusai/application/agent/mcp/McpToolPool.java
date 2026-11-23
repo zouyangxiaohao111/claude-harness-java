@@ -1075,8 +1075,9 @@ public class McpToolPool {
             // 低频一次性编排（可阻塞等浏览器回调）→ 专用 cached pool，避免占公共线程
             authFlowExecutor().execute(() -> {
                 try {
-                    McpAuth.OAuthServerConfig oauthCfg = new McpAuth.OAuthServerConfig(
-                        c.type(), c.url(), Map.of(), null, null, null);
+                    // [2026-11-23] 从 server 的 env 镜像读回 OAuth 配置（与 transport 共用同一解析口）
+                    McpAuth.OAuthServerConfig oauthCfg = McpOAuth.oauthServerConfig(
+                        c.type(), c.url(), config.env());
                     McpAuth.AuthResult result = mcpAuthInstance.performMCPOAuthFlow(
                         s, oauthCfg, onUrl, opts.skipBrowserOpen());
                     if (result.success()) {
@@ -1217,11 +1218,9 @@ public class McpToolPool {
         wsAuthReconnectAt.put(serverName, now);
         authFlowExecutor().execute(() -> {
             try {
-                McpAuth.OAuthServerConfig oauthCfg = new McpAuth.OAuthServerConfig(
-                    config.type(), config.command(),
-                    // 剥除 __mcp_oauth__ 镜像保留键（headers 语义视图，防止保留键当 HTTP 头发送）
-                    McpOAuth.headersOnly(config.env()),
-                    null, null, null);
+                // [2026-11-23] 从 env 镜像读回 OAuth 配置（clientId/callbackPort/metadata/scopes/端点）
+                McpAuth.OAuthServerConfig oauthCfg = McpOAuth.oauthServerConfig(
+                    config.type(), config.command(), config.env());
                 McpAuth.AuthResult result = mcpAuth().performMCPOAuthFlow(serverName, oauthCfg,
                     authUrl -> log.info("[McpToolPool] WS OAuth 授权 URL server={} authUrl={}", serverName, authUrl),
                     true);

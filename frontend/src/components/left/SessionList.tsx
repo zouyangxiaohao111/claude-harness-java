@@ -172,6 +172,15 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
+/** 运行时长标签：m:ss（<1h）/ h:mm:ss。 */
+function formatRunElapsed(ms: number): string {
+  const total = Math.max(0, Math.floor(ms / 1000))
+  const m = Math.floor(total / 60)
+  const h = Math.floor(m / 60)
+  const ss = String(total % 60).padStart(2, '0')
+  return h > 0 ? `${h}:${String(m % 60).padStart(2, '0')}:${ss}` : `${m}:${ss}`
+}
+
 export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, onPinSession, runningSessionIds, pendingSessionIds, doneUnreadIds, peerPendingCounts, peerTotalPending, onOpenPeerInbox, onOpenPeerPending, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules,
   onOpenIm,
   imActive,
@@ -187,7 +196,8 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const [renameDraft, setRenameDraft] = useState('')
   /** 项目分组标题右键菜单（x/y 视口坐标 + 该组项目路径） */
   const [groupMenu, setGroupMenu] = useState<{ x: number; y: number; path: string } | null>(null)
-  // [session-family] 置顶 / 派生 / IM 三块的折叠态（默认展开；与项目分组一样只存组件本地，不持久化）
+  // [session-family] 运行 / 置顶 / 派生 / IM 各块的折叠态（默认展开；与项目分组一样只存组件本地，不持久化）
+  const [runningOpen, setRunningOpen] = useState(true)
   const [pinnedOpen, setPinnedOpen] = useState(true)
   const [derivedOpen, setDerivedOpen] = useState(true)
   const [imOpen, setImOpen] = useState(true)
@@ -195,6 +205,10 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const [collapsedFamilyRoots, setCollapsedFamilyRoots] = useState<Set<string>>(new Set())
   /** 悬停的家族根 id：同族行一起高亮（跨块 —— 置顶里的创建者 ↔ 派生块里的子会话）。 */
   const [hoverFamily, setHoverFamily] = useState<string | null>(null)
+  /** [run-block] 运行块内每会话的时长起点（进入集合时记，离开即清）。 */
+  const [runSince, setRunSince] = useState<Map<string, number>>(new Map())
+  /** [run-block] 每秒推进一次，让时长走动。 */
+  const [, setRunTick] = useState(0)
 
   // 右键菜单：点击空白 / Esc 关闭（菜单自身 onMouseDown stopPropagation）
   useEffect(() => {
@@ -247,6 +261,34 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     return flatHistory ? FLAT_GROUP_KEY : (s.mainProjectId ?? '__unbound__')
   }, [sessions, activeSession, flatHistory])
 
+  // [run-block 2026-11-23 用户认可设计稿] 「正在运行」块 = 运行中 ∪ 等待权限。
+  //   与下方各视图块允许重叠（不去重、不隐藏）；为空 ⇒ 整块不渲染。排序与分组内序同口径。
+  const runningSessions = useMemo(
+    () => sessions
+      .filter((s) => runningSessionIds?.has(s.id) === true || pendingSessionIds?.has(s.id) === true)
+      .sort(compareSessions),
+    [sessions, runningSessionIds, pendingSessionIds],
+  )
+  // 时长起点：仍在集合里沿用旧起点，离开即丢。内容不变时返回旧 Map（不触发重渲）。
+  useEffect(() => {
+    setRunSince((prev) => {
+      const now = Date.now()
+      const next = new Map<string, number>()
+      for (const s of runningSessions) next.set(s.id, prev.get(s.id) ?? now)
+      let changed = prev.size !== next.size
+      if (!changed) {
+        for (const [id, ts] of next) { if (prev.get(id) !== ts) { changed = true; break } }
+      }
+      return changed ? next : prev
+    })
+  }, [runningSessions])
+  // 有运行会话时才开 1s 定时器（空块不耗电）。
+  useEffect(() => {
+    if (runningSessions.length === 0) return
+    const timer = window.setInterval(() => setRunTick((v) => v + 1), 1000)
+    return () => window.clearInterval(timer)
+  }, [runningSessions.length])
+
   // 默认折叠：当前会话所在组自动展开。
   // 依赖 = activeSession（会话 id）+ activeGroupKey，刻意**不含 sessions 引用**：
   //   · 轮询/重排换 sessions 数组不会反复顶开用户手动折叠的组；
@@ -277,6 +319,40 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
       : []),
     [sessions, imSessionIds],
   )
+
+  // [run-badge 2026-11-23] 分组标题右侧的「N 运行中 / N 待处理」文字角标（方案 A）：
+  //   组收起时看不到组内会话行，角标让用户一眼找到哪个组里有在跑 / 在等权限的任务。
+  //   口径与行内 status-dot 一致：pending 优先于 running —— 同一会话等待权限时只算「待处理」，
+  //   避免被两个角标重复计数。0 不渲染；收起 / 展开都显示（标题行一直在）。
+  const countPending = (list: SessionDto[]) =>
+    pendingSessionIds && pendingSessionIds.size
+      ? list.reduce((n, s) => (pendingSessionIds.has(s.id) ? n + 1 : n), 0)
+      : 0
+  const countRunning = (list: SessionDto[]) =>
+    runningSessionIds && runningSessionIds.size
+      ? list.reduce((n, s) => (runningSessionIds.has(s.id) && !pendingSessionIds?.has(s.id) ? n + 1 : n), 0)
+      : 0
+  const renderRunBadges = (list: SessionDto[]) => {
+    const running = countRunning(list)
+    const pending = countPending(list)
+    if (running <= 0 && pending <= 0) return null
+    return (
+      <>
+        {running > 0 && (
+          <span className="run-badge" title={`${running} 个会话正在运行`}>
+            <span className="dot" aria-hidden="true" />
+            {running} 运行中
+          </span>
+        )}
+        {pending > 0 && (
+          <span className="run-badge pending" title={`${pending} 个会话等待权限/回答`}>
+            <span className="dot" aria-hidden="true" />
+            {pending} 待处理
+          </span>
+        )}
+      </>
+    )
+  }
 
   const pinnedSessions = sessions.filter((s) => s.pinned === true)
   const unpinnedSessions = sessions.filter((s) => s.pinned !== true)
@@ -356,6 +432,8 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const renderSessionRow = (
     s: SessionDto,
     collapse?: { open: boolean; onToggle: () => void },
+    /** [run-block] 有值 = 用运行时长替换相对时间（hover 不淡出）。 */
+    runTime?: string,
   ) => {
     // [session-family] 家族色：同族（含创建者）同一色，跨块一致；普通会话无 --fam ⇒ 不渲染色条/不染色徽章。
     const fam = familyColors.get(s.id)
@@ -458,7 +536,9 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
           </button>
         )
       })()}
-      <span className="time">{formatRelativeTime(s.updatedAt ?? s.createdAt)}</span>
+      {runTime
+        ? <span className="run-elapsed" title={`已运行 ${runTime}`}>{runTime}</span>
+        : <span className="time">{formatRelativeTime(s.updatedAt ?? s.createdAt)}</span>}
       <span className="session-menu-btn" title="会话操作" onClick={(e) => { e.stopPropagation(); setMenuId(menuId === s.id ? null : s.id) }}>⋯</span>
       {menuId === s.id && (
         <div className="session-menu">
@@ -593,6 +673,33 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         <div className="sidebar-empty">暂无会话 · 点击 + 新建</div>
       )}
 
+      {/* [run-block 2026-11-23] 正在运行块 · 置顶之上；与下方各块允许重叠（不隐藏不去重） */}
+      {!flatHistory && runningSessions.length > 0 && (
+        <div className="left-section running-block">
+          <div
+            className={`label running-label${runningOpen ? '' : ' collapsed'}`}
+            onClick={() => setRunningOpen((v) => !v)}
+            role="button"
+            aria-expanded={runningOpen}
+            title={runningOpen ? '收起正在运行' : '展开正在运行'}
+          >
+            <ChevronIcon open={runningOpen} />
+            <i className="run-pulse" aria-hidden="true" />
+            <span className="group-path">正在运行</span>
+            <span className="count">{runningSessions.length}</span>
+            <span className="label-right">{renderRunBadges(runningSessions)}</span>
+          </div>
+          {runningOpen && runningSessions.map((s) => {
+            const since = runSince.get(s.id)
+            return renderSessionRow(
+              s,
+              undefined,
+              since === undefined ? undefined : formatRunElapsed(Date.now() - since),
+            )
+          })}
+        </div>
+      )}
+
       {/* [V283] 置顶块 · 跨项目置前。
           [session-family 2026-11-23] 标题可点击折叠（默认展开）；置顶独占 —— 同一条不再出现在
           派生 / IM / 项目分组里（「置顶不隐藏」指留在本块可见）。 */}
@@ -612,6 +719,7 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
               </svg>
               <span className="group-path">置顶</span>
               <span className="count">{pinnedSessions.length}</span>
+              <span className="label-right">{renderRunBadges(pinnedSessions)}</span>
             </div>
           )}
           {(flatHistory || pinnedOpen) && sortSessionsWithPinned(pinnedSessions).map((s) => renderSessionRow(s))}
@@ -641,6 +749,7 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
             </svg>
             <span className="group-path">派生</span>
             <span className="count">{derivedSessions.length}</span>
+            <span className="label-right">{renderRunBadges(derivedSessions)}</span>
           </div>
           {derivedOpen && familyGroups.map((group) => {
             const rootSession = sessionById.get(group.rootId)
@@ -703,23 +812,25 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
               </svg>
               <span className="group-path">IM 会话</span>
               <span className="count">{imBlockSessions.length}</span>
-              {imOpen && imBlockSessions.length > IM_BLOCK_PREVIEW && (
-                <button
-                  onClick={(e) => { e.stopPropagation(); setImExpanded((v) => !v) }}
-                  title={imExpanded ? '收起' : '展开全部'}
-                  style={{
-                    marginLeft: 'auto',
-                    border: 0,
-                    background: 'none',
-                    color: 'var(--accent)',
-                    fontSize: 11.5,
-                    cursor: 'pointer',
-                    padding: '0 2px',
-                  }}
-                >
-                  {imExpanded ? '收起' : '查看全部'}
-                </button>
-              )}
+              <span className="label-right">
+                {renderRunBadges(imBlockSessions)}
+                {imOpen && imBlockSessions.length > IM_BLOCK_PREVIEW && (
+                  <button
+                    onClick={(e) => { e.stopPropagation(); setImExpanded((v) => !v) }}
+                    title={imExpanded ? '收起' : '展开全部'}
+                    style={{
+                      border: 0,
+                      background: 'none',
+                      color: 'var(--accent)',
+                      fontSize: 11.5,
+                      cursor: 'pointer',
+                      padding: '0 2px',
+                    }}
+                  >
+                    {imExpanded ? '收起' : '查看全部'}
+                  </button>
+                )}
+              </span>
             </div>
           )}
           {(flatHistory || imOpen) &&
@@ -763,11 +874,14 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                 <FolderIcon />
                 <span className="group-path" title={path || groupTitle}>{groupTitle}</span>
                 <span className="count">{groupSessions.length}</span>
-                {!isUnbound && (
-                  <div className="add" title="在该项目内新建会话" onClick={(e) => { e.stopPropagation(); onCreateInProject?.(key) }}>
-                    <PlusIcon size={10} />
-                  </div>
-                )}
+                <span className="label-right">
+                  {renderRunBadges(groupSessions)}
+                  {!isUnbound && (
+                    <div className="add" title="在该项目内新建会话" onClick={(e) => { e.stopPropagation(); onCreateInProject?.(key) }}>
+                      <PlusIcon size={10} />
+                    </div>
+                  )}
+                </span>
               </div>
             )}
             {visible.map((s) => renderSessionRow(s))}

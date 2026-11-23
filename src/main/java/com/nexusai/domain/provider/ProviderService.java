@@ -488,7 +488,9 @@ public class ProviderService {
      */
     public record BuiltinStatus(String key, String group, String name, String type, String baseUrl, String subtitle,
                                 boolean configured, String providerId, String providerName, int modelCount,
-                                List<BuiltinConnection> connections) {
+                                List<BuiltinConnection> connections,
+                                /** 模板模型建议（[2026-11-23 Octop provider 导入] 可空 · 前端「导入模型」里作建议，用户可改）。 */
+                                List<BuiltinProviderCatalog.BrandModel> models) {
     }
 
     /**
@@ -553,7 +555,8 @@ public class ProviderService {
                 first == null ? null : first.getId(),
                 first == null ? null : first.getName(),
                 first == null ? 0 : modelCounts.getOrDefault(first.getId(), 0),
-                connections));
+                connections,
+                brand.models()));
         }
         return out;
     }

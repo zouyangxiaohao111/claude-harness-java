@@ -183,9 +183,11 @@ public class NotificationQueue {
          * （handlePromptSubmit.ts:340 忙时 enqueue 携带 raw pastedContents；
          * attachments.ts:1060-1083 每条 queued_command 各自 pastedContents → buildImageContentBlocks）。
          *
-         * <p>仅 busy-queued 携附件（{@code ChatService.enqueueBusyPrompt} → 三道门与空闲路径同源：
-         * 数量 ≤50 / resolveAttachments 白名单+存在性+≤200MB+防穿越 / MediaLimitGuard 100 项+5MB，
-         * 见 {@code ChatService.busyQueuedResolvedAttachments}）；
+         * <p>busy-queued 与 turn-0 用户 prompt 携附件：busy 由 {@code ChatService.enqueueBusyPrompt}
+         * （三道门与空闲路径同源：数量 ≤50 / resolveAttachments 白名单+存在性+≤200MB+防穿越 /
+         * MediaLimitGuard 100 项+5MB，见 {@code ChatService.busyQueuedResolvedAttachments}）；
+         * turn-0 由 {@code LlmAgentLoop.doRun} 入队时携带（drain 的 appendSyntheticFileReadMessages
+         * 是 type=file 附件的唯一消费点，2026-11-23 修复「file 附件模型不可见」）；
          * task-notification/coordinator/channel/cron 不携。drain 消费点逐项注册
          * （registerRunPromptImages / registerRunPromptPdfs per-item），消费即清（CC per-command
          * 独立附件，attachments.ts:1060-1083 —— 绝不共享桶）。null = 无附件（纯文本）。

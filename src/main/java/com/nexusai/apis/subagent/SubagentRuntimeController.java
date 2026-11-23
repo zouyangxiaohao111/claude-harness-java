@@ -116,13 +116,30 @@ public class SubagentRuntimeController {
                 row.put("streamFormat", ext.streamFormat());
                 // 只写 runtime ⇒ 用内置预设；写了 args/bin 才算用户自定义
                 row.put("source", (!ext.args().isEmpty() || ext.bin().isPresent()) ? "custom" : "preset");
-                row.put("available", com.nexusai.application.agent.subagent.external
-                        .ExternalRuntimeSpec.tryResolveBin(ext).isPresent());
+                row.put("available", isExternalAgentAvailable(ext));
                 out.add(row);
             }
         } catch (Exception e) {
             log.warn("[SubagentRuntimeController] 枚举外部 agent 失败（runtimes 清单照常返回）: {}", e.toString());
         }
         return out;
+    }
+
+    /**
+     * 外部 agent 的「本机可用」判据。
+     *
+     * <p>ACP 走 {@code AcpRuntimeSpec}（配置 bin → dsh → acp，argv/env 与真实派发一致）；
+     * ⛔ 不能用 {@code ExternalRuntimeSpec.tryResolveBin} —— 它按 runtime 名找名为 {@code acp}
+     * 的二进制，永远找不到（ACP 的默认适配器是 dsh），会把可用的 ACP 显示成不可用。
+     */
+    static boolean isExternalAgentAvailable(AgentDefinition.ExternalAgentDefinition ext) {
+        if (ext == null) {
+            return false;
+        }
+        if (com.nexusai.model.acp.AcpRuntimeConstants.RUNTIME.equalsIgnoreCase(ext.runtime())) {
+            return com.nexusai.application.agent.acp.AcpRuntimeSpec.resolveForRuntime(null).isAvailable();
+        }
+        return com.nexusai.application.agent.subagent.external.ExternalRuntimeSpec
+                .tryResolveBin(ext).isPresent();
     }
 }

@@ -3,6 +3,8 @@ import { createPortal } from 'react-dom'
 import type { ClipboardEvent, CSSProperties, DragEvent, ReactNode } from 'react'
 import { QueuedCommandsBar } from './QueuedCommandsBar'
 import { SessionToolsPanel } from './SessionToolsPanel'
+import { AppPicker } from './AppPicker'
+import { type AppEntry, fetchAppEntries, startApp, toggleAppKey } from '@/api/apps'
 import { ImChannelPickerModal } from './ImChannelPickerModal'
 import type { ImPlatform } from '@/api/im'
 import { CatArtBody } from '../startup/CatArt'
@@ -27,6 +29,7 @@ import { u8ToBase64 } from '@/utils/base64'
 import '@/styles/kb-mention.css'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
 import { resolveCtxInfo } from '@/utils/contextUsage'
+import { effortTag, resolveModelBrand } from '@/utils/modelBrand'
 import { useChatStore, type StreamBlock } from '@/stores/chatStore'
 import { useShallow } from 'zustand/react/shallow'
 import { useComposerBlock } from '@/hooks/useComposerBlock'
@@ -228,6 +231,8 @@ interface ComposerProps {
     boundSessionId?: string | null
     /** 占用者的会话标题（人看的名字，不是 sess-xxx） */
     boundSessionTitle?: string | null
+    /** V335 · 机器人是否在该会话里（false = 已被移出该群；null/undefined = 未判定） */
+    botPresent?: boolean | null
   }>
   /** 已经接到当前会话的 chat id（打勾） */
   imBoundChatIds?: string[]
@@ -276,7 +281,7 @@ interface ComposerProps {
   empty?: boolean
   /** F1 · 点击底部 hint-usage（token/金额/当前上下文）→ 打开 UsageCostModal（App 处理） */
   onOpenUsageCost?: () => void
-  /** NexusAI in Chrome：输入框工具栏浏览器图标 → 打开 ChromePanel（检查/安装/连接引导，App 处理） */
+  /** NexusAI in Chrome：工具面板「浏览器控制」空态的检查/安装入口 → 打开 ChromePanel（App 处理） */
   onOpenChromePanel?: () => void
   /** 进入计划模式（claude.exe EnterPlanMode 等价：App 走 `/plan` 命令链路，写会话 permission rules） */
   onEnterPlanMode?: () => void
@@ -288,6 +293,28 @@ interface ComposerProps {
   coordinatorMode?: boolean
   /** 切换协调者模式（App 调 sessionApi.update({coordinatorMode}) · 写入会话级覆盖） */
   onCoordinatorModeChange?: (on: boolean) => void
+  /**
+   * [应用选择] 会话级**启动集**（启动才进工具 schema）· 三态：
+   * `null` = 回落 `defaultOpen` 集合；`[]` = 全部停止；数组 = 显式启动集。
+   * 由 App 持有（PATCH 会话），本组件只渲染 + 上抛。
+   */
+  enabledApps?: string[] | null
+  /** [应用选择] 启动/停止（完整新数组；null = 回落默认集合） */
+  onEnabledAppsChange?: (keys: string[] | null) => void
+  /**
+   * [应用选择] 本轮**强调**（星标）· 只进发送体 `selectedApps`，⛔ 不改 schema。
+   * `null/不传` = 本轮无强调；数组 = 强调集合。
+   */
+  selectedApps?: string[] | null
+  /** [应用选择] 星标变化（完整新数组；每轮，不持久化到会话） */
+  onAppsChange?: (keys: string[] | null) => void
+  /**
+   * [compact] 右侧面板（抽屉）展开 ⇒ 输入框只留图标：文字收进 title/tooltip，chip 仍显示。
+   *
+   * <p>由布局状态驱动（App 传 `rightDrawerOpen`），与窄栏 `@container (max-width:700px)`
+   * 同口径但互不替代 —— 宽屏开抽屉时容器未必小于 700px。
+   */
+  compact?: boolean
   /** 回到底部按钮（离底时显示 · 对齐 deepseek-harness ChatView toBottom · 由 MessageList onScroll 驱动） */
   showToBottom?: boolean
   /** 回到底部点击 → 滚动对话到底（App 触发 MessageList scrollSignal） */
@@ -345,6 +372,14 @@ interface ComposerProps {
 
 // F36：token target 关键词（+500k / +250k / +1m 等），对齐 CC PromptInput 的 findTokenBudgetPositions
 const TOKEN_BUDGET_RE = /\+\d+[kmb]?/gi
+
+/**
+ * 透明高亮层的降级阈值（沿用 `front/src/markdown/MarkdownText.tsx:126` 的 8000）。
+ *
+ * <p>超过这个长度就不再渲染 overlay：长串会被「textarea + overlay」整形两遍，
+ * 且每键重建整棵高亮子树 ⇒ 输入线性变卡（真机 2 万字实测）。⛔ 不影响发送内容。
+ */
+const OVERLAY_DEGRADE_CHARS = 8000
 
 // 高亮层与 textarea 共用同一套排版参数，保证逐字对齐（背景透明 textarea + 前置高亮层）
 
@@ -477,9 +512,8 @@ const SUG_CARD: React.CSSProperties = {
   overflow: 'hidden', whiteSpace: 'normal', minHeight: 48, wordBreak: 'break-word',
 }
 
-export function Composer({composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, onEnterPlanMode, onExitPlanMode, planPending, coordinatorMode, onCoordinatorModeChange, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, taskListHint, peerHoldHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions, imInstances, imChats, imBoundChatIds, imInactiveChatIds, onBindImChat, onQuickBindImInstance, onUnbindImChat, onRefreshImData, onOpenImChannels, imAllowUserIdentity, onToggleImUserIdentity, onRevealApproval, unattended, unattendedPending, onToggleUnattended, onReloadSessionMode}: ComposerProps) {
-  // 模型名显示末段（去掉 provider 前缀，如 ds-openai/deepseek-v4-flash → deepseek-v4-flash）
-  const shortModel = currentModel?.split('/').pop() ?? currentModel ?? ''
+export function Composer({composerText, setComposerText, sendMessage, attachmentUploader, showToast, streaming, onStop, queuedCommands, popEditable, boundProjectName, boundProjectId, onSelectProject, currentModel, permissionMode, onPermissionModeChange, effortLevel, ultracodeEnabled, bareMode, onModeChange, onOpenModelPicker, onOpenEffort, empty, sessionId, onOpenUsageCost, onOpenChromePanel, onEnterPlanMode, onExitPlanMode, planPending, coordinatorMode, onCoordinatorModeChange, enabledApps, onEnabledAppsChange, selectedApps, onAppsChange, compact, showToBottom, onScrollToBottom, onHardStop, localRead, currentAgent, onClearAgent, slashAlias, onOpenMarket, onSetGoal, hasGoal, goalCondition, pendingHint, subagentHint, monitorHint, taskListHint, peerHoldHint, agentModes, minimalChrome, atItems, onAtPickItem, minimalTools, topChips, emptySuggestions, imInstances, imChats, imBoundChatIds, imInactiveChatIds, onBindImChat, onQuickBindImInstance, onUnbindImChat, onRefreshImData, onOpenImChannels, imAllowUserIdentity, onToggleImUserIdentity, onRevealApproval, unattended, unattendedPending, onToggleUnattended, onReloadSessionMode}: ComposerProps) {
+  // 模型胶囊只显两字母别名（见 utils/modelBrand）；完整模型名放在下拉与 tooltip 里
   // [composer-block] 统一发送封锁判据：当前会话待确认消息 > 0 或有未处理审批/Ask 提问。
   //   ⛔ 只封锁发送；面板/滚动/审批卡/切会话照旧（不使用遮罩）。判据与会话严格绑定。
   const blockState = useComposerBlock(sessionId ?? null)
@@ -582,6 +616,24 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
   //   [D1 usage-source] 同源于 message.usage → 与缓存%/上下文条统一只统计 user 来源（底部数字口径一致）。
   const lastSpeedTs = usageProbe.lastSpeedTs
   const textareaRef = useRef<HTMLTextAreaElement>(null)
+  /**
+   * [IME 守卫] 输入法组合态按 Enter 只确认候选，⛔ 不能发送（Mac 中文输入法误发）。
+   *
+   * <p>Safari/WKWebView 的 `compositionend` 可能**早于** Enter 的 keydown ⇒ 单靠
+   * `isComposing` 会漏；再记一个结束时间戳，短时间内到达的 Enter 也吞掉。
+   */
+  const composingRef = useRef(false)
+  const compositionEndAtRef = useRef(0)
+  /** [长文本性能] 自动高度合并后的 rAF 句柄（每键最多一次 read scrollHeight） */
+  const heightRafRef = useRef<number | null>(null)
+  /** [模型胶囊] 自定义快速 tooltip（原生 title 约 500ms 才出，用户要求 ≤100ms） */
+  const [mepTipOpen, setMepTipOpen] = useState(false)
+  const mepTipTimer = useRef<number | null>(null)
+  useEffect(() => () => {
+    if (mepTipTimer.current != null) window.clearTimeout(mepTipTimer.current)
+  }, [])
+  const modelBrand = useMemo(() => resolveModelBrand(currentModel), [currentModel])
+  const modelEffortTag = effortTag(effortLevel as string | null | undefined, ultracodeEnabled)
   const highlightRef = useRef<HTMLDivElement>(null)
   const fileInputRef = useRef<HTMLInputElement>(null)
   const [attachments, setAttachments] = useState<PendingAttachment[]>([])
@@ -923,6 +975,141 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
   useEffect(() => () => {
     if (hoverCloseTimer.current != null) window.clearTimeout(hoverCloseTimer.current)
   }, [])
+
+  // ---- 应用选择（连接器多选 · 本轮随消息携带 `selectedApps`） ----
+  // 选中集**只由上层持有**（App：`useState` + localStorage 记忆 + 拼进请求体）。
+  // ⛔ 本组件不存第二份：没有上层接线时连入口都不渲染。
+  //
+  // [三态语义 · 2026-11-23 用户截图纠正] `selectedApps === null` **不是「什么都没选」**，
+  //   而是「不裁剪 = 所有可用应用默认开启」。旧实现把所有行按 OFF 渲染 ⇒ 界面骗人
+  //   （codegraph 明明可用却显示关着）。⇒ 行状态一律按**有效选中集**渲染。
+  //   chips / 角标仍只表达**显式选择**（null = 没偏离默认，不堆一屏 chip）。
+  const appSelKeys: string[] = selectedApps ?? []
+  const [appsOpen, setAppsOpen] = useState(false)
+  /** 目录：null = 未拉过（惰性，首次打开面板或有记忆选择时才拉） */
+  const [appOptions, setAppOptions] = useState<AppEntry[] | null>(null)
+  const [appsLoading, setAppsLoading] = useState(false)
+  const [appsError, setAppsError] = useState<string | null>(null)
+  /** 正在启动的不可用应用（后端 canStart）与失败原因（按 key） */
+  const [appsStarting, setAppsStarting] = useState<Set<string>>(new Set())
+  const [appsStartError, setAppsStartError] = useState<Record<string, string>>({})
+  const appsWrapRef = useRef<HTMLDivElement>(null)
+  /** 并发去重（StrictMode 双跑 / 连点重试）：同一时刻只跑一个目录请求 */
+  const appsLoadRef = useRef<Promise<void> | null>(null)
+  /** 会话未设置启动集（null）时 = 后端标了 defaultOpen 且可用的应用（当前只有 MCP 在应用层） */
+  const defaultAppKeys = useMemo(
+    () => (appOptions ?? []).filter((a) => a.usable && a.defaultOpen).map((a) => a.key),
+    [appOptions],
+  )
+  /** 有效**启动集**（行开关的真源）：`enabledApps === null` ⇒ 默认集合 */
+  const startedAppKeys = useMemo(
+    () => (enabledApps ?? defaultAppKeys),
+    [enabledApps, defaultAppKeys],
+  )
+  /** **本轮强调**（点行切换）：只进发送体，不改 schema */
+  const emphasizedKeys = useMemo(() => (selectedApps ?? []), [selectedApps])
+  /** 入口与 chip 只在「上层真的接收选择」时渲染（App 传了其一） */
+  const showAppSelection = !minimalTools
+    && (onAppsChange !== undefined || selectedApps !== undefined
+      || onEnabledAppsChange !== undefined || enabledApps !== undefined)
+  /**
+   * 提交**启动集**（三态规范化）：目标集合恰好等于默认集合 ⇒ null（回落后端 defaultOpen）；
+   * 否则显式数组（`[]` = 全部停止）。
+   *
+   * <p>⚠️ 基线用「默认集合」而非「全部可用集合」：把默认关闭的应用启动属于偏离默认，
+   * 必须落成显式名单（否则被当成 null 又回落成默认关）。
+   */
+  const commitStarted = (keys: string[]) => {
+    const nextSet = new Set(keys)
+    const equalsDefault = defaultAppKeys.length > 0
+      && defaultAppKeys.every((k) => nextSet.has(k))
+      && nextSet.size === defaultAppKeys.length
+    onEnabledAppsChange?.(equalsDefault ? null : keys)
+  }
+  /** 独立开关：启动/停止（写会话级启动集）；启动 ⇒ 自动加入强调，停止 ⇒ 从强调移除 */
+  const toggleStart = (key: string) => {
+    const base: string[] = enabledApps ?? defaultAppKeys
+    const wasStarted = base.includes(key)
+    commitStarted(wasStarted ? base.filter((k) => k !== key) : [...base, key])
+    const em = selectedApps ?? []
+    if (wasStarted) {
+      // 停止 ⇒ 从强调集合移除（停了的应用再"强调"没有意义）
+      if (em.includes(key)) onAppsChange?.(em.filter((k) => k !== key))
+    } else if (!em.includes(key)) {
+      // 启动 ⇒ 默认选中（自动加入强调集，chip 立即出现）
+      onAppsChange?.([...em, key])
+    }
+  }
+  /** 点行：选择/取消**本轮强调**（只写发送体 selectedApps，⛔ 不改 schema、不启停） */
+  const toggleEmphasis = (key: string) => {
+    onAppsChange?.(toggleAppKey(selectedApps ?? [], key))
+  }
+  /** 启动一个不可用应用（真调后端 MCP start）· 成功重拉目录；失败原样挂到该行，⛔ 不假成功 */
+  const startAppByKey = useCallback(async (key: string) => {
+    const app = (appOptions ?? []).find((a) => a.key === key)
+    if (!app?.serverId) return
+    setAppsStarting((prev) => new Set(prev).add(key))
+    setAppsStartError((prev) => {
+      if (!(key in prev)) return prev
+      const next = { ...prev }
+      delete next[key]
+      return next
+    })
+    try {
+      await startApp(app.serverId, sessionId ?? null)
+      setAppOptions(await fetchAppEntries())
+    } catch (e) {
+      setAppsStartError((prev) => ({ ...prev, [key]: e instanceof Error ? e.message : String(e) }))
+    } finally {
+      setAppsStarting((prev) => {
+        const next = new Set(prev)
+        next.delete(key)
+        return next
+      })
+    }
+  }, [appOptions, sessionId])
+
+  const loadApps = useCallback(async () => {
+    if (appsLoadRef.current) return appsLoadRef.current
+    const task = (async () => {
+      setAppsLoading(true)
+      setAppsError(null)
+      try {
+        setAppOptions(await fetchAppEntries())
+      } catch (e) {
+        // 真实原因上屏（面板里给「重试」），⛔ 不糊成「加载失败」
+        setAppsError(e instanceof Error ? e.message : String(e))
+      } finally {
+        setAppsLoading(false)
+        appsLoadRef.current = null
+      }
+    })()
+    appsLoadRef.current = task
+    return task
+  }, [])
+  // 有记忆选择时挂载即拉一次目录（只为 chip 显示名字；失败不影响选中集与发送）
+  useEffect(() => {
+    if (appSelKeys.length === 0 || appOptions !== null) return
+    void loadApps()
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- 只按「首次是否需要」判定，选中集后续变化不重复拉
+  }, [])
+  // 点击外部收起（与 plus-menu / tools-panel 同一套 mousedown 判据）
+  useEffect(() => {
+    if (!appsOpen) return
+    const onDoc = (e: MouseEvent) => {
+      if (appsWrapRef.current && !appsWrapRef.current.contains(e.target as Node)) setAppsOpen(false)
+    }
+    document.addEventListener('mousedown', onDoc)
+    return () => document.removeEventListener('mousedown', onDoc)
+  }, [appsOpen])
+  /** 目录已拉过且一条都没有 ⇒ 视为「没有连接器」：入口置灰，点了只给说明（⛔ 不开空面板装样子） */
+  const appCatalogEmpty = appOptions !== null && appOptions.length === 0
+  const appByKey = useMemo(() => {
+    const m = new Map<string, AppEntry>()
+    for (const a of appOptions ?? []) m.set(a.key, a)
+    return m
+  }, [appOptions])
+
   // 附件（A1 契约 · 批 ATT-DROP）：**投递决策全在 utils/attachmentDelivery（有单测）**，本函数只做副作用接线。
   //   ⛔ 红线：不允许「已显示 chip、模型收不到」的静默丢弃 —— 每个 File 必须落进
   //   「真的进入投递通道（base64 / upload）」或「同步拒绝（提示 + 不生成 chip）」。
@@ -1257,18 +1444,32 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
   }
 
   // 输入变化可能引入/移除滚动条（内容区宽度随之变化），需在绘制前重新对齐；
-  // 同时 textarea 随内容自动增高（min 22px → max 200px）
+  // 同时 textarea 随内容自动增高（min 22px → max 200px）。
+  // [长文本性能] 高度测量合并到**一个 rAF**：`height='auto'` + 读 `scrollHeight` 是强制回流，
+  //   原来每键同步跑一次（长串上可达几十 ms）；合并后每帧最多一次，且高度没变就不写回。
   useLayoutEffect(() => {
-    syncHighlight()
-    const ta = textareaRef.current
-    if (ta) {
+    if (heightRafRef.current != null) cancelAnimationFrame(heightRafRef.current)
+    heightRafRef.current = requestAnimationFrame(() => {
+      heightRafRef.current = null
+      const ta = textareaRef.current
+      if (!ta) return
+      syncHighlight()
+      const prev = ta.style.height
       ta.style.height = 'auto'
-      ta.style.height = `${Math.min(ta.scrollHeight, 200)}px`
+      const next = `${Math.min(Math.max(ta.scrollHeight, 22), 200)}px`
+      if (prev !== next) ta.style.height = next
+      else ta.style.height = prev
+    })
+    return () => {
+      if (heightRafRef.current != null) {
+        cancelAnimationFrame(heightRafRef.current)
+        heightRafRef.current = null
+      }
     }
   }, [composerText])
 
   return (
-    <div className={`composer${empty ? ' composer-empty' : ''}${composerBlocked ? ' composer-blocked' : ''}`} onDrop={onDrop} onDragOver={onDragOver} data-composer-blocked={composerBlocked ? 'true' : undefined}>
+    <div className={`composer${empty ? ' composer-empty' : ''}${composerBlocked ? ' composer-blocked' : ''}${compact ? ' compact' : ''}`} onDrop={onDrop} onDragOver={onDragOver} data-composer-blocked={composerBlocked ? 'true' : undefined}>
       {/* 空态 hero：logo 动画 + 标题 + quick-actions（对齐主界面原型） */}
       {empty && (
         <div className="welcome">
@@ -1422,7 +1623,35 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
           <GoalHead sessionId={sessionId ?? null} />
         )}
         <div className="input-box">
-          {topChips}
+          {/* [chip 行] topChips（知识库已选库）与应用 chip **同容器同行**：
+              同高 28px、同 gap 6px，容器自身不加内边距 —— ⛔ 不再让应用 chip 单独起一行，
+              否则输入框几何被整体抬高一截（用户 2026-11-23 报）。 */}
+          {(!!topChips || (showAppSelection && appSelKeys.length > 0)) ? (
+            <div className="input-chips" data-testid="input-chips">
+              {topChips}
+              {showAppSelection && appSelKeys.map((key) => {
+                const opt = appByKey.get(key)
+                const label = opt?.name ?? key
+                return (
+                  <span className="app-chip" key={key} data-app-key={key} title={`应用：${label}`}>
+                    <span className="app-chip-ico" aria-hidden="true">{(label.trim()[0] ?? '?').toUpperCase()}</span>
+                    <span className="app-chip-label">{label}</span>
+                    <button
+                      type="button"
+                      className="app-chip-x"
+                      aria-label={`移除本轮强调：${label}`}
+                      title={`移除本轮强调：${label}`}
+                      onClick={(e) => {
+                        e.stopPropagation()
+                        // chip = 本轮强调（星标）；移除 = 从强调名单去掉（⛔ 不停止应用）
+                        onAppsChange?.(appSelKeys.filter((k) => k !== key))
+                      }}
+                    >×</button>
+                  </span>
+                )
+              })}
+            </div>
+          ) : null}
           {attachments.length > 0 && (
             <div className="attach-preview">
               {attachments.map((a, i) => {
@@ -1478,8 +1707,11 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
             </div>
           )}
           <div style={{ position: 'relative' }}>
+            {/* 长文本降级：超过阈值不渲染高亮层（长串整形/正则/子树重建是卡顿主因） */}
+            {composerText.length <= OVERLAY_DEGRADE_CHARS && (
             <div
               ref={highlightRef}
+              data-testid="composer-highlight"
               aria-hidden="true"
               style={{
                 position: 'absolute',
@@ -1497,6 +1729,7 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
             >
               {renderHighlighted(composerText, removeAtChip, slashAlias)}
             </div>
+            )}
             <textarea
               ref={textareaRef}
               placeholder={composerBlocked ? (blockState.reason ?? '暂不能发送') : '向 nexus 提问，或输入 / 调出命令'}
@@ -1504,10 +1737,20 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
               onChange={(e) => setComposerText(e.target.value)}
               onScroll={syncHighlight}
               onPaste={onPaste}
+              onCompositionStart={() => { composingRef.current = true }}
+              onCompositionEnd={() => {
+                composingRef.current = false
+                compositionEndAtRef.current = Date.now()
+              }}
               // [composer-block] 待确认消息/待审批期间**只锁发送、不锁输入**：
               //   用户仍可打字（不必丢失正在写的内容）；发送入口在发送按钮与发送回调处拦截。
               title={composerBlocked ? (blockState.reason ?? undefined) : undefined}
               onKeyDown={(e) => {
+                // [IME] 组合态（拼音/日文候选）里按 Enter 只确认候选：
+                //   ① isComposing / keyCode 229 = 组合中的标准信号；
+                //   ② compositionend 早于 keydown 的浏览器（Safari/WKWebView）用短窗口兜底。
+                if (e.nativeEvent.isComposing || e.keyCode === 229 || composingRef.current) return
+                if (Date.now() - compositionEndAtRef.current < 60) return
                 // [Phase3 @引用] 候选打开时优先：↑↓ 选择 · Tab/Enter 引用 · Esc 关闭（不发送）
                 if (atMatches) {
                   if (e.key === 'ArrowDown') { e.preventDefault(); setAtIndex((i) => (i + 1) % atMatches.length); return }
@@ -1891,6 +2134,65 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
                   </div>
                 )}
               </div>
+              {/* 应用（连接器）多选：常驻入口，本轮随消息生效（⛔ 不写会话级禁用表）。
+                  无连接器（目录已拉且为空）⇒ 置灰 + 点击给说明，⛔ 不开空面板装样子。 */}
+              {showAppSelection && (
+                <div className="app-picker-wrap" ref={appsWrapRef}>
+                  <button
+                    type="button"
+                    className={`tool-chip app-trigger${appSelKeys.length ? ' active' : ''}${appCatalogEmpty ? ' disabled' : ''}`}
+                    data-testid="app-picker-trigger"
+                    title={appCatalogEmpty
+                      ? '还没有可用的应用：请先在「+ → 连接器」里接入一个连接器'
+                      : '选择应用（本轮生效，可多选）'}
+                    aria-label="选择应用"
+                    aria-expanded={appsOpen}
+                    aria-disabled={appCatalogEmpty ? true : undefined}
+                    onClick={() => {
+                      // 已开 → 关（入口永远能关自己的面板）；未开且无连接器 → 只给说明，⛔ 不开空面板
+                      if (appsOpen) { setAppsOpen(false); return }
+                      if (appCatalogEmpty) {
+                        showToast('还没有可用的应用：请先在「+ → 连接器」里接入一个连接器', 'info')
+                        return
+                      }
+                      setAppsOpen(true)
+                      if (appOptions === null) void loadApps()
+                    }}
+                  >
+                    {/* 图标必须放 <i>：窄栏（<700px）的 `tool-chip > span` 收文字规则会连图标一起藏掉 */}
+                    <i className="app-trigger-ico" aria-hidden="true">
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                        <rect x="3.5" y="3.5" width="7" height="7" rx="1.6" />
+                        <rect x="13.5" y="3.5" width="7" height="7" rx="1.6" />
+                        <rect x="3.5" y="13.5" width="7" height="7" rx="1.6" />
+                        <path d="M17 13.5v7M13.5 17h7" />
+                      </svg>
+                    </i>
+                    {/* 文字与其他 chip 同款：窄栏/compact 的 `tool-chip > span` 规则会自动收掉 */}
+                    <span>应用</span>
+                    {/* 角标用 <b>：`> span` 在窄栏会被收文字规则隐藏 */}
+                    {appSelKeys.length > 0 && <b className="app-trigger-count">{appSelKeys.length}</b>}
+                  </button>
+                  {appsOpen && (
+                    <AppPicker
+                      apps={appOptions ?? []}
+                      startedKeys={startedAppKeys}
+                      emphasizedKeys={emphasizedKeys}
+                      onToggleStart={toggleStart}
+                      onToggleEmphasis={toggleEmphasis}
+                      startingKeys={[...appsStarting]}
+                      startErrors={appsStartError}
+                      onStartApp={(key) => { void startAppByKey(key) }}
+                      loading={appsLoading}
+                      error={appsError}
+                      onRetry={() => { void loadApps() }}
+                      onOpenConnectors={onOpenMarket
+                        ? () => { setAppsOpen(false); onOpenMarket('connector') }
+                        : undefined}
+                    />
+                  )}
+                </div>
+              )}
               {/* 当前专家/模式胶囊（在 + 右侧）
                   · 主会话：纯展示，hover 出 × 清除（App → handleAgentChange(null)）
                   · 知识库（agentModes）：可点击，自己弹模式列表 —— + 菜单里不再放「模式」 */}
@@ -2187,17 +2489,36 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
               )}
               {(onOpenModelPicker || onOpenEffort) && (
                 <div className="model-effort-pill-wrap" ref={pillRef}>
-                  <div className="model-effort-pill" onClick={() => setPillOpen((v) => !v)} title="模型与推理等级">
-                    <svg className="mep-icon" viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round">
-                      <path d="M7 1.5L12 4.3V9.7L7 12.5L2 9.7V4.3L7 1.5Z" />
-                      <path d="M2 4.3L7 7.1L12 4.3M7 7.1V12.5" />
-                    </svg>
-                    <span className="mep-model">{shortModel || '选择模型'}</span>
-                    <span className="mep-effort">{ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')}</span>
+                  {/* 收窄后长名会被省略 ⇒ title 给完整模型名与推理等级（原为固定文案） */}
+                  <div
+                    className="model-effort-pill"
+                    onClick={() => setPillOpen((v) => !v)}
+                    // title 仅兜底（原生约 500ms）；真正的提示是下面 100ms 的自定义 tooltip
+                    title={`${currentModel || '选择模型'} · 推理 ${ultracodeEnabled ? 'ultracode' : effortLevel === 'off' ? '关闭' : (effortLevel ?? 'high')}`}
+                    onMouseEnter={() => {
+                      if (mepTipTimer.current != null) window.clearTimeout(mepTipTimer.current)
+                      mepTipTimer.current = window.setTimeout(() => setMepTipOpen(true), 100)
+                    }}
+                    onMouseLeave={() => {
+                      if (mepTipTimer.current != null) window.clearTimeout(mepTipTimer.current)
+                      mepTipTimer.current = null
+                      setMepTipOpen(false)
+                    }}
+                  >
+                    {/* 别名 + 品牌图标 + 档位标签（顺序按用户：DS → 图标 → max） */}
+                    <span className="mep-alias">{modelBrand.alias}</span>
+                    <img className="mep-brand" src={modelBrand.icon} alt="" draggable={false} />
+                    {modelEffortTag && <span className="mep-effort">{modelEffortTag}</span>}
                     <svg className={`mep-chevron ${pillOpen ? 'open' : ''}`} viewBox="0 0 12 12" fill="none" stroke="currentColor" strokeWidth="2.2" style={{ width: 13, height: 13 }}>
                       <path d="M2 4L6 8L10 4" strokeLinecap="round" strokeLinejoin="round" />
                     </svg>
                   </div>
+                  {mepTipOpen && (
+                    <div className="model-effort-tip" role="tooltip">
+                      {currentModel || '选择模型'} · {modelBrand.provider}
+                      {modelEffortTag ? ` · 推理 ${modelEffortTag}` : ''}
+                    </div>
+                  )}
                   {pillOpen && (
                     <div className="pill-drawer">
                       {onOpenModelPicker && (
@@ -2209,7 +2530,7 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
                             </svg>
                             <span className="pill-label">模型</span>
                           </span>
-                          <span className="pill-value">{shortModel || '选择模型'} ›</span>
+                          <span className="pill-value">{currentModel || '选择模型'} ›</span>
                         </div>
                       )}
                       {onOpenEffort && (

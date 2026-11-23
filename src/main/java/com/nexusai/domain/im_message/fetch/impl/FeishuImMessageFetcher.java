@@ -3,6 +3,7 @@ package com.nexusai.domain.im_message.fetch.impl;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.nexusai.domain.im_channel.ImChannelService;
+import com.nexusai.domain.im_channel.send.FeishuErrorHints;
 import com.nexusai.domain.im_channel.send.FeishuTokenService;
 import com.nexusai.domain.im_channel.send.ImSendException;
 import com.nexusai.domain.im_message.ImMessageTime;
@@ -95,6 +96,9 @@ public class FeishuImMessageFetcher implements ImMessageFetcher {
 
     /** 页数上限（默认 10 页）——⛔ 不无限翻：飞书限流 1000 次/分钟、50 次/秒。 */
     static final int MAX_PAGES = 10;
+
+    /** 非 2xx 时透出的平台字段（{@code msg} / body 片段）长度上限。 */
+    static final int MAX_PLATFORM_FIELD_LEN = 200;
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
@@ -253,8 +257,32 @@ public class FeishuImMessageFetcher implements ImMessageFetcher {
                 "飞书拉取消息失败：" + e.getClass().getSimpleName(), null, true);
         }
         if (resp.statusCode() / 100 != 2) {
-            throw new ImMessageFetchException("IM_FETCH_PLATFORM_ERROR",
-                "飞书拉取消息 HTTP " + resp.statusCode(), String.valueOf(resp.statusCode()), true);
+            // 🔴 非 2xx 也要读 body：飞书的真实原因（code/msg，如 230002 机器人不在群）
+            //    只在这里面。旧实现整段丢掉 ⇒ 日志里只剩「HTTP 400」，排查全靠猜。
+            //    ⛔ 只取 code / msg 两个字段（+ 解析失败时的 body 片段），不透出响应全文。
+            JsonNode err = parseErrorBody(resp.body());
+            String platformCode = String.valueOf(resp.statusCode());
+            StringBuilder msg = new StringBuilder("飞书拉取消息 HTTP ").append(resp.statusCode());
+            int code = -1;
+            if (err != null) {
+                code = err.path("code").asInt(-1);
+                String rawMsg = err.path("msg").asText("");
+                if (code >= 0) {
+                    platformCode = String.valueOf(code);
+                    msg.append(" code=").append(code);
+                }
+                if (!rawMsg.isBlank()) {
+                    msg.append(" msg=").append(snippet(rawMsg));
+                }
+                if (code >= 0) {
+                    msg.append(FeishuErrorHints.hint(code));
+                }
+            }
+            if (code < 0 && resp.body() != null && !resp.body().isBlank()) {
+                // body 不是 JSON（或没有 code）：给一小段原文，至少能看出是什么
+                msg.append(" body=").append(snippet(resp.body()));
+            }
+            throw new ImMessageFetchException("IM_FETCH_PLATFORM_ERROR", msg.toString(), platformCode, true);
         }
         JsonNode root;
         try {
@@ -266,8 +294,9 @@ public class FeishuImMessageFetcher implements ImMessageFetcher {
         // 飞书业务错误常配 HTTP 200 ⇒ 判成功看 code==0，不看 HTTP 状态码
         int code = root.path("code").asInt(-1);
         if (code != 0) {
+            String msg = root.path("msg").asText("");
             throw new ImMessageFetchException("IM_FETCH_PLATFORM_ERROR",
-                "飞书拒绝拉取消息：code=" + code + " msg=" + root.path("msg").asText(""),
+                "飞书拒绝拉取消息：code=" + code + " msg=" + snippet(msg) + FeishuErrorHints.hint(code),
                 String.valueOf(code), false);
         }
         JsonNode data = root.path("data");
@@ -508,6 +537,29 @@ public class FeishuImMessageFetcher implements ImMessageFetcher {
         }
         Instant at = ImMessageTime.toInstant(iso);
         return at == null ? null : at.getEpochSecond();
+    }
+
+    /** 解析错误响应体（不是 JSON 对象 ⇒ null）；⛔ 不抛，调用方回退到 body 片段。 */
+    private static JsonNode parseErrorBody(String body) {
+        if (body == null || body.isBlank()) {
+            return null;
+        }
+        try {
+            JsonNode n = JSON.readTree(body);
+            return (n != null && n.isObject()) ? n : null;
+        } catch (Exception e) {
+            return null;
+        }
+    }
+
+    /** 截断平台原文（异常 message 不接受整段响应体，防止把 token 等内容带进日志）。 */
+    private static String snippet(String s) {
+        if (s == null) {
+            return "";
+        }
+        String oneLine = s.replace('\n', ' ').replace('\r', ' ');
+        return oneLine.length() <= MAX_PLATFORM_FIELD_LEN
+            ? oneLine : oneLine.substring(0, MAX_PLATFORM_FIELD_LEN) + "…";
     }
 
     private static String text(JsonNode root, String... keys) {

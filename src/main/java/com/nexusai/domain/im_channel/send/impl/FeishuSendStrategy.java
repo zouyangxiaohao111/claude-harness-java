@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.domain.im_channel.send.AbstractImSendStrategy;
+import com.nexusai.domain.im_channel.send.FeishuErrorHints;
 import com.nexusai.domain.im_channel.send.FeishuTokenService;
 import com.nexusai.domain.im_channel.send.ImMediaRef;
 import com.nexusai.domain.im_channel.send.ImMediaUploader;
@@ -45,11 +46,15 @@ import java.util.Set;
  * {@code ou_xxx} → {@code open_id}（通讯录里搜到、还没跟机器人说过话的人）；
  * 含 {@code @} → {@code email}。见 {@link #receiveIdTypeOf}。
  *
- * <h3>身份：只有应用（机器人）身份</h3>
+ * <h3>身份：应用（机器人）+ 用户本人（两者都支持）</h3>
  * 飞书<b>协议层支持</b>用户身份发消息（{@code user_access_token} + 权限
- * {@code im:message} + {@code im:message.send_as_user}），但那需要走 OAuth 拿票；
- * 本仓飞书凭证只有 {@code appId/appSecret}（一键建应用产出），换出来的只能是
- * {@code tenant_access_token} ⇒ {@link #canSendAsUser()} 保持 false。
+ * {@code im:message} + {@code im:message.send_as_user}）；本仓已走 OAuth
+ * （渠道卡片「授权本人身份」）把 user token 存进 {@code im_channel_instance}。
+ * <p>⇒ {@link #canSendAsUser()} 返回 <b>true</b>；实例没授权时由
+ * {@link #effectiveIdentity} 降级为 BOT 并在 {@code identityNote} 里如实告知
+ * （不是静默降级）。
+ * <p>⚠️ 外部群仍受平台权限约束：{@code code=230027 no permission to operate external chats}
+ * —— 即使带 user token，也要应用具备外部会话操作权限。
  *
  * <h3>🔴 content 必须是「JSON 字符串」，不是对象</h3>
  * 请求体里的 {@code content} 是「JSON 序列化后再转义」的**字符串**：
@@ -602,20 +607,12 @@ public class FeishuSendStrategy extends AbstractImSendStrategy {
     /**
      * 常见拒绝码 → 一句「该怎么办」的中文提示（拼在原始 code/msg 之后）。
      *
+     * <p>映射已抽到 {@link FeishuErrorHints}（拉取路径共用同一份，⛔ 别再各写一份）。
      * <p>只做解释，不改判定：能否重试、要不要清缓存仍由 {@link #isTokenExpired} 等逻辑决定。
      * 未列出的码返回空串（原文保留，便于对飞书文档）。
      */
     private static String sendHint(int code) {
-        return switch (code) {
-            case 99991672 -> "（缺少所需权限 scope：请让管理员在开放平台为应用开通 "
-                    + "im:message.send_as_user 等权限；若用本人身份发送，开通后需重新点「授权本人身份」刷新授权范围）";
-            case 99991663, 99991661, 99991668 -> "（令牌无效或已过期：机器人身份会自动换票重试一次；"
-                    + "本人身份请重新授权）";
-            case 230001, 230013 -> "（接收方 id 无效：私聊/群请用 oc_ 开头的 chat_id，"
-                    + "通讯录里的人请用 ou_ 开头的 open_id）";
-            case 230002 -> "（机器人不在该会话里：请把机器人拉进群，或让对方先跟机器人发起会话）";
-            default -> "";
-        };
+        return FeishuErrorHints.hint(code);
     }
 
     /** 平台码是否是「token 失效」这一族（可换票重试）。 */

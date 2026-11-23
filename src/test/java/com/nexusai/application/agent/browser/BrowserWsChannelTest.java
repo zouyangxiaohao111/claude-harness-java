@@ -48,6 +48,20 @@ class BrowserWsChannelTest {
     private static final ObjectMapper JSON = new ObjectMapper();
 
     @Test
+    @DisplayName("lastSeenMillis：扩展连接建立后刷新（真实活性，供 /browser/status 与能力目录展示）")
+    void lastSeenUpdatesOnRegister() {
+        BrowserWsChannel channel = new BrowserWsChannel(1_000L);
+        assertThat(channel.lastSeenMillis()).isZero();
+
+        WebSocketSession ws = mock(WebSocketSession.class);
+        when(ws.isOpen()).thenReturn(true);
+        when(ws.getId()).thenReturn("ws-lastseen");
+        channel.register(ws);
+
+        assertThat(channel.lastSeenMillis()).isPositive();
+    }
+
+    @Test
     @DisplayName("send：转发 tool_call（type/id/sessionId/tool/args 正确）并返回 tool_result.result 文本")
     void sendForwardsToolCallAndReturnsResult() throws Exception {
         BrowserWsChannel channel = new BrowserWsChannel();

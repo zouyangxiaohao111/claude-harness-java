@@ -510,6 +510,32 @@ public class BuiltInAgents {
      * <p>CC tools=['*'] (generalPurposeAgent.ts:29); model 缺省 -> getDefaultSubagentModel()='inherit'
      * (agent.ts:25-26). Java 端 model 留 empty, 运行时 resolveAgentTools/resolveAgentModel 走 inherit 兜底.
      */
+    /**
+     * ACP 外部运行时 Agent · <b>内置定义</b>（不写用户家目录的 md，避免受保护路径与安装期 IO）。
+     *
+     * <p>之所以能当「内置」：{@code externalSource} 复用内置字面量 {@code "built-in"}
+     * （⛔ 不新增 source 字面量），并让 {@link AgentDefinition#isBuiltIn} /
+     * {@link #isBuiltIn(AgentDefinition)} 把 source="built-in" 也算内置 —— 否则
+     * {@code loadAgentsDir.getActiveAgentsFromList} 会把它归到「哪一组都不是」而静默丢弃。
+     *
+     * <p>覆盖优先级不变：用户若在 {@code ~/.nexusai/agents} 写了同 agentType 的 md，
+     * 按 6 组优先级（user &gt; built-in）覆盖本定义。
+     *
+     * <p>⚠️ coordinator 模式下 {@link #getBuiltInAgents()} 整表替换 ⇒ 本 agent 不出现
+     * （与 CC builtInAgents.ts:33-41 的语义一致，不是遗漏）。
+     */
+    public static final AgentDefinition ACP_EXTERNAL_AGENT = AgentDefinition.ExternalAgentDefinition.builder(
+            "acp-external",
+            "ACP 智能体：把任务交给本机 ACP（Agent Client Protocol）适配器执行（默认 dsh --profile acp）。"
+                + "外部 agent 自带模型与工具，任务描述必须自足；其工具调用会经本仓权限审批，"
+                + "rm -rf / / mkfs / dd if= / 越界路径会被硬阻断。",
+            "built-in",
+            "")
+        .runtime("acp")
+        .color("purple")
+        .filename("acp-external")
+        .build();
+
     public static final AgentDefinition GENERAL_PURPOSE_AGENT = AgentDefinition.BuiltInAgentDefinition.create(
         GENERAL_PURPOSE,
         "General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. " +
@@ -818,6 +844,8 @@ public class BuiltInAgents {
         List<AgentDefinition> agents = new java.util.ArrayList<>();
         agents.add(GENERAL_PURPOSE_AGENT);
         agents.add(STATUSLINE_SETUP_AGENT);
+        // ACP 外部运行时 Agent（内置定义，不写用户家目录的 md）
+        agents.add(ACP_EXTERNAL_AGENT);
         if (areExplorePlanAgentsEnabled()) {
             agents.add(EXPLORE_AGENT);
             agents.add(PLAN_AGENT);
@@ -879,6 +907,9 @@ public class BuiltInAgents {
      * 检查是否为内置 Agent（对齐 CC isBuiltInAgent）
      */
     public static boolean isBuiltIn(AgentDefinition def) {
-        return def instanceof AgentDefinition.BuiltInAgentDefinition;
+        // 除 instanceof 外，source="built-in" 也算内置：ACP 这类「用 ExternalAgentDefinition
+        // 承载运行时而仍属内置」的定义必须能被 6 组折叠归到 built-in 组，否则会被静默丢弃。
+        return def instanceof AgentDefinition.BuiltInAgentDefinition
+                || (def != null && "built-in".equals(def.source()));
     }
 }
