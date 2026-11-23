@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.85] - 2026-11-23
+
+### Added
+
+- 修复安装包安装过慢：随包 Git 由 4190 个小文件改为单文件，安装时探测系统 Git 按需解压
+
 ## [0.1.84] - 2026-11-23
 
 ### Added

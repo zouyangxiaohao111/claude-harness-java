@@ -55,6 +55,29 @@
   ;   · PATH **末尾追加**（不是前置）⇒ 系统 Git 仍优先命中；
   ;   · CLAUDE_CODE_GIT_BASH_PATH 只在系统没有 Git 时写，避免抢用户已有版本；
   ;   · 写入的段记在 HKCU\Software\NexusAI\BundledGit，供升级/卸载**精确**移除。
+  ;
+  ; ── [2026-11-23 安装提速] 随包 Git = 单个压缩包，**按需**解压 ──
+  ;
+  ; WHY：旧版把解压好的 214MB / **4190 个小文件**直接打进安装包 ⇒ 每次装 app
+  ; 都要逐个写盘（叠加杀软逐文件扫描）⇒ 用户反馈"安装卡很久"。
+  ; 现在安装包内只有一个 portable-git.7z.exe（57MB），先探测系统 Git：
+  ;   · 已有 Git for Windows（注册表有 InstallPath）⇒ **完全不解压**（多数机器）
+  ;   · 没有 ⇒ 现场解压到 backend\git（一次性约 8–10s，仅这些机器付一次）
+  ; 解压/跳过之后，继续走下面的 PATH 注入逻辑（它对 bash.exe 是否存在做判断）。
+  IfFileExists "$INSTDIR\backend\git\bin\bash.exe" nexusai_git_probe_done nexusai_git_probe_system
+
+  nexusai_git_probe_system:
+    ; 与下方 ③ 同一判据（Git for Windows 安装时写这两个注册表项）
+    ReadRegStr $R5 HKLM "SOFTWARE\GitForWindows" "InstallPath"
+    StrCmp $R5 "" 0 nexusai_git_probe_done
+    ReadRegStr $R5 HKCU "SOFTWARE\GitForWindows" "InstallPath"
+    StrCmp $R5 "" 0 nexusai_git_probe_done
+    ; 系统无 Git ⇒ 用随包压缩包解压（SFX 静默：-o<目录> -y）
+    IfFileExists "$INSTDIR\backend\portable-git.7z.exe" 0 nexusai_git_probe_done
+      DetailPrint "本机未检测到 Git —— 正在解压随包 Git（一次性，约 10 秒）..."
+      ExecWait '"$INSTDIR\backend\portable-git.7z.exe" -o"$INSTDIR\backend\git" -y'
+
+  nexusai_git_probe_done:
   IfFileExists "$INSTDIR\backend\git\bin\bash.exe" 0 nexusai_git_done
 
   StrCpy $R0 "$INSTDIR\backend\git\cmd;$INSTDIR\backend\git\bin;$INSTDIR\backend\git\usr\bin"

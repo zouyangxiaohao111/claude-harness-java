@@ -3,8 +3,19 @@
  * 准备随包运行时（Windows Git for Windows PortableGit），供 Tauri 安装包分发。
  *
  * 职责：
- *   取 PortableGit 自解压包 → 解压到 front/src-tauri/backend/git/ → 校验
- *   （bin/bash.exe + cmd/git.exe + 实际执行 git --version）→ 写 VERSION 标记。
+ *   取 PortableGit 自解压包 → 复制成 backend/portable-git.7z.exe（**单文件**）。
+ *
+ * [2026-11-23 安装提速] ⛔ 不再在构建期解压到 backend/git/：
+ *   旧做法会把 214MB / **4190 个小文件**打进安装包 ⇒ 每次装 app 都要逐个写盘
+ *   （叠加杀软逐文件扫描）⇒ 安装"卡很久"。这正是用户反馈的"安装过慢"根因。
+ *   新做法：安装包内只落 **1 个 57MB 压缩包**；安装器 POSTINSTALL 先探测系统 Git：
+ *     · 有系统 Git ⇒ **完全不解压**（绝大多数开发/办公机）
+ *     · 无系统 Git ⇒ 现场解压到 backend/git（一次性，约 8–10s）
+ *   ⚠️ 代价：无 Git 的机器上装完是**未裁剪**的 ~388MB（旧裁剪版为 258MB）——
+ *      换取的是所有人安装都快。裁剪逻辑保留在 `prune()` 供 NEXUSAI_GIT_VERIFY=1 自检用。
+ *
+ *   构建期校验改为**可选**（默认不做，省 ~8s）：
+ *     set NEXUSAI_GIT_VERIFY=1   → 解压到临时目录实跑 bash/git/POSIX 工具自检后删除
  *
  * ⚠️ 为什么不用 MinGit（实测结论，2026-11-15）：
  *   MinGit 2.45.2 与 2.56.1 两版解压后都**只有 usr/bin/sh.exe（dash）**，
@@ -29,7 +40,7 @@
  *   out = <front>/src-tauri/backend —— 对应 tauri.conf.json bundle.resources 的 "backend"
  */
 import { spawnSync } from 'node:child_process'
-import { cpSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from 'node:fs'
+import { cpSync, existsSync, mkdirSync, readdirSync, rmSync, statSync } from 'node:fs'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -37,14 +48,20 @@ const __dirname = dirname(fileURLToPath(import.meta.url))
 const out = resolve(__dirname, '../src-tauri/backend')
 const gitDir = join(out, 'git')
 const cacheDir = resolve(__dirname, '../.runtime-cache')
-const marker = join(gitDir, 'VERSION')
+
+/**
+ * 随包压缩包在 backend/ 下的**固定文件名**（安装器 installer-hooks.nsh 硬编码引用）。
+ * ⛔ 改名必须同步改 installer-hooks.nsh 的 NSIS_HOOK_POSTINSTALL。
+ */
+const BUNDLED_PKG_NAME = 'portable-git.7z.exe'
+const bundledPkg = join(out, BUNDLED_PKG_NAME)
 
 /** 目标平台：只随包 Windows（macOS / Linux 系统自带 bash/git）。 */
 const isWin = process.platform === 'win32'
 
 /**
- * 裁剪配方版本：清单变化时递增，强制已准备好的目录重新解压 + 裁剪。
- * 判定见 {@link alreadyPrepared}（marker 内容参与比对）。
+ * 裁剪配方版本：清单变化时递增（仅 {@link prune} 用；现只在 NEXUSAI_GIT_VERIFY=1
+ * 的构建期自检里跑，安装包内不再携带裁剪结果）。
  */
 const PRUNE_RECIPE = 'pruned-v1'
 
@@ -104,25 +121,6 @@ function resolvePackage() {
     }
   }
   return null
-}
-
-/**
- * 目标目录是否已是**同一个包**的完整解压结果（bash.exe + git.exe + VERSION 匹配）。
- *
- * ⚠️ 必须比对包名：只判文件存在会让升级 PortableGit 版本时静默沿用旧目录。
- */
-function alreadyPrepared(pkg) {
-  if (!existsSync(join(gitDir, 'bin', 'bash.exe'))
-    || !existsSync(join(gitDir, 'cmd', 'git.exe'))
-    || !existsSync(marker)) {
-    return false
-  }
-  return readFileSync(marker, 'utf8').trim() === markerOf(pkg)
-}
-
-/** VERSION 标记内容：包文件名 + 裁剪配方（同时用于诊断与幂等比对）。 */
-function markerOf(pkg) {
-  return `PortableGit from ${pkg.split(/[\\/]/).pop()} (${PRUNE_RECIPE})`
 }
 
 /** 递归统计目录/文件字节数（仅用于打印裁剪前后体积）。 */
@@ -186,14 +184,14 @@ function prune() {
  * ssh、file（magic 数据库保留）。任何一项失败都中止构建 —— 宁可不出包，
  * 也不能出一个「bash 起来但脚本全炸」的安装包。
  */
-function verifyRuntime() {
-  const bash = join(gitDir, 'bin', 'bash.exe')
+function verifyRuntime(dir = gitDir) {
+  const bash = join(dir, 'bin', 'bash.exe')
   const env = {
     ...process.env,
     PATH: [
-      join(gitDir, 'cmd'),
-      join(gitDir, 'bin'),
-      join(gitDir, 'usr', 'bin'),
+      join(dir, 'cmd'),
+      join(dir, 'bin'),
+      join(dir, 'usr', 'bin'),
       process.env.PATH || '',
     ].join(';'),
   }
@@ -267,9 +265,9 @@ function normalizeLayout(dest) {
 }
 
 /** 构建期门禁：可执行文件齐全且真的能跑。 */
-function verify() {
-  const bash = join(gitDir, 'bin', 'bash.exe')
-  const git = join(gitDir, 'cmd', 'git.exe')
+function verifyDir(dir = gitDir) {
+  const bash = join(dir, 'bin', 'bash.exe')
+  const git = join(dir, 'cmd', 'git.exe')
   if (!existsSync(bash)) {
     fail(`解压结果缺少 bin/bash.exe：${bash}`)
   }
@@ -295,13 +293,19 @@ function main() {
     return
   }
 
-  const pkg = resolvePackage()
-  if (pkg && alreadyPrepared(pkg)) {
-    console.log(`[prepare-runtime] 已就绪：${readFileSync(marker, 'utf8').trim()}`)
-    return
+  // 旧做法残留的「已解压目录」必须清掉：它一旦留在 backend/ 里就会被整个打进安装包，
+  // 安装慢的问题会原样回来（见文件头 [2026-11-23 安装提速]）。
+  if (existsSync(gitDir)) {
+    rmSync(gitDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 })
+    console.log('[prepare-runtime] 已清理旧版 backend/git（改为随包单文件压缩包）')
   }
+
+  const pkg = resolvePackage()
   if (!pkg) {
     if (process.env.NEXUSAI_SKIP_BUNDLED_GIT === '1') {
+      if (existsSync(bundledPkg)) {
+        rmSync(bundledPkg, { force: true })
+      }
       warn('未找到 PortableGit（已设置 NEXUSAI_SKIP_BUNDLED_GIT=1）⇒ 本次出包不含随包 Git')
       warn('新装机器将无法使用 Bash 工具；仅限本地临时构建，正式发布禁止跳过')
       return
@@ -315,19 +319,28 @@ function main() {
   临时跳过（正式发布禁止）：set NEXUSAI_SKIP_BUNDLED_GIT=1`)
   }
 
-  console.log(`[prepare-runtime] PortableGit: ${pkg}（${(statSync(pkg).size / 1024 / 1024).toFixed(1)} MB）`)
-  if (existsSync(gitDir)) {
-    // Windows 上大量小文件 + 杀软扫描会偶发 EPERM ⇒ 带重试
-    rmSync(gitDir, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 })
+  const sizeMb = (statSync(pkg).size / 1024 / 1024).toFixed(1)
+  console.log(`[prepare-runtime] PortableGit: ${pkg}（${sizeMb} MB）`)
+
+  // 只复制这**一个文件**进 backend/（安装包内不落 4190 个小文件）。
+  cpSync(pkg, bundledPkg)
+  console.log(`[prepare-runtime] 随包单文件 → ${bundledPkg}`)
+  console.log('[prepare-runtime] 安装时由安装器探测系统 Git：有则不解压，无则解压到 backend/git')
+
+  // 可选构建期自检（默认关，省 ~8s）：解压到临时目录实跑一遍再删。
+  if (process.env.NEXUSAI_GIT_VERIFY === '1') {
+    const tmp = join(cacheDir, '.verify-git')
+    rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 })
+    try {
+      extractPackage(pkg, tmp)
+      normalizeLayout(tmp)
+      verifyDir(tmp)
+      verifyRuntime(tmp)
+      console.log('[prepare-runtime] 构建期自检通过（未裁剪，临时目录已清理）')
+    } finally {
+      rmSync(tmp, { recursive: true, force: true, maxRetries: 10, retryDelay: 300 })
+    }
   }
-  extractPackage(pkg, gitDir)
-  normalizeLayout(gitDir)
-  verify()
-  prune()
-  // 裁剪后再跑一次完整功能自检：删错任何依赖都会在这里中止构建
-  verifyRuntime()
-  writeFileSync(marker, `${markerOf(pkg)}\n`, 'utf8')
-  console.log(`[prepare-runtime] 完成 → ${gitDir}`)
 }
 
 main()
