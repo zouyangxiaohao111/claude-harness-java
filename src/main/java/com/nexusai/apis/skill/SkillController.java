@@ -1,7 +1,9 @@
 package com.nexusai.apis.skill;
 
+import com.nexusai.application.agent.skill.SkillContentService;
 import com.nexusai.application.agent.skill.SkillRegistry;
 import com.nexusai.domain.command.CommandService;
+import com.nexusai.model.skill.dto.SkillContentDto;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.command.dto.CommandDto;
 import com.nexusai.model.command.dto.CreateCommandRequest;
@@ -34,6 +36,9 @@ public class SkillController {
 
     /** [联调三问题·skill 根因] 内存真实技能源（bundled 注册 + ~/.claude/skills）——合并进 REST 数据源。 */
     @Autowired private SkillRegistry skillRegistry;
+
+    /** [2026-11-23] 按名取 SKILL.md 正文（详情预览用，避免列表 1.1MB 常驻）。 */
+    @Autowired private SkillContentService skillContentService;
 
     /**
      * 列出所有技能（合并内存真实技能源 + DB/磁盘 ghost 补缺）· 前端 useSkills 实际消费端点。
@@ -84,6 +89,16 @@ public class SkillController {
                 registryCommands.size(), byName.size());
         }
         return commandService.toDtos(List.copyOf(byName.values()));
+    }
+
+    /**
+     * 按技能名取正文（[2026-11-23] 详情预览）· 限 512KB；name 不允许路径分隔符；
+     * contentPath 含 {@code ..} 或非 SKILL.md 一律拒绝。
+     */
+    @GetMapping("/{name}/content")
+    public SkillContentDto content(@PathVariable String name,
+                                   @RequestParam(value = "sessionId", required = false) String sessionId) {
+        return skillContentService.content(name, sessionId);
     }
 
     @GetMapping("/{id}")

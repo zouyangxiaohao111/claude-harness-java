@@ -10,6 +10,20 @@ export interface McpImportRequest {
   files: Record<string, string>
 }
 
+/** JSON 导入结果（对齐 McpJsonTransferService.ImportResult） */
+export interface McpImportDiff {
+  added: number
+  updated: number
+  removed: number
+  unchanged: number
+  addedNames?: string[]
+  updatedNames?: string[]
+  removedNames?: string[]
+  unchangedNames?: string[]
+  backupPath?: string | null
+  warnings?: string[]
+}
+
 /** 通道白名单条目（对齐后端 ChannelAllowlistEntry：marketplace/plugin/createdAt）。
  *  <p>后端 id 由 SQLite 生成，但 toDomain()/create() 未回传 → 前端置为可选；DELETE 依赖 id。 */
 export interface ChannelAllowlistEntry {
@@ -75,6 +89,13 @@ export const mcpApi = {
   oauthPoll: (id: string, state: string) =>
     api<{ state: 'PENDING' | 'AUTHORIZED' | 'ERROR'; message?: string | null }>(
       `/mcp/${encodeURIComponent(id)}/oauth/poll?state=${encodeURIComponent(state)}`),
+  /** 导出 JSON 视图（掩码）· GET /mcp/export */
+  exportServers: () =>
+    api<{ mcpServers: Record<string, Record<string, unknown>> }>('/mcp/export'),
+  /** 导入 JSON 视图（DB 唯一真源）· POST /mcp/import */
+  importJson: (body: { mcpServers: Record<string, Record<string, unknown>>; deleteMissing?: boolean }) =>
+    api<McpImportDiff>('/mcp/import', { method: 'POST', body }),
+
   /** 断开授权（吊销 token + 清凭据）· DELETE /mcp/{id}/oauth */
   oauthLogout: (id: string) =>
     api<{ revoked: boolean }>(`/mcp/${encodeURIComponent(id)}/oauth`, { method: 'DELETE' }),

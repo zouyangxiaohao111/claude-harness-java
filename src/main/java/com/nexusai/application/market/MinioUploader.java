@@ -64,6 +64,11 @@ public class MinioUploader {
         this.httpClient = HttpClient.newBuilder().connectTimeout(TIMEOUT).build();
     }
 
+    /** 对象的公开访问 URL（bucket 公开读的市场端点；与 {@link #upload} 用同一套 path 编码）。 */
+    public String publicUrl(String objectKey) {
+        return endpoint + "/" + bucket + "/" + encodePath(objectKey);
+    }
+
     /**
      * 上传对象（覆盖同名键）。
      *

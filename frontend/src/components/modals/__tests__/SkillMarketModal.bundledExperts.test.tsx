@@ -122,9 +122,22 @@ function clickButton(label: string) {
 async function openBuiltinTab() {
   renderModal()
   await flush()
+  // 2026-11-23 用户终稿：专家 tab 的子 tab 由「市场/内置专家」改为「专家/专家团」。
   const btn = Array.from(container!.querySelectorAll('button'))
-    .find((b) => (b.textContent ?? '').includes('内置专家'))
-  expect(btn, '内置专家子 tab 应可见').toBeTruthy()
+    .find((b) => (b.textContent ?? '').includes('专家团'))
+  expect(btn, '专家团子 tab 应可见').toBeTruthy()
+  act(() => btn!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
+  await flush()
+}
+
+/** 打开某个成员所属团队的「查看成员」弹窗（安装按钮在弹窗内）。 */
+async function openTeamOf(memberName: string) {
+  const card = Array.from(container!.querySelectorAll('[data-testid="expert-team-card"]'))
+    .find((el) => (el.textContent ?? '').includes(memberName)) as HTMLElement | undefined
+  expect(card, `未找到包含「${memberName}」的团队卡`).toBeTruthy()
+  const btn = Array.from(card!.querySelectorAll('button'))
+    .find((b) => (b.textContent ?? '').includes('查看成员')) as HTMLElement | undefined
+  expect(btn, '团队卡缺少「查看成员」按钮').toBeTruthy()
   act(() => btn!.dispatchEvent(new MouseEvent('click', { bubbles: true })))
   await flush()
 }
@@ -165,6 +178,7 @@ describe('[bundled-experts] 专家 tab 内置专家', () => {
   it('点击安装调用后端；成功后显示已安装', async () => {
     installBundledMock.mockResolvedValue({ status: 'INSTALLED', slug: 'engineering-backend-architect', path: 'x' })
     await openBuiltinTab()
+    await openTeamOf('后端架构师')
     clickButton('安装')
     await flush()
 
@@ -178,6 +192,7 @@ describe('[bundled-experts] 专家 tab 内置专家', () => {
   it('409 冲突如实提示，不伪造成功', async () => {
     installBundledMock.mockRejectedValue(new ApiError('conflict', { status: 409 }))
     await openBuiltinTab()
+    await openTeamOf('后端架构师')
 
     // 第一个未安装条目 = 后端架构师
     clickButton('安装')

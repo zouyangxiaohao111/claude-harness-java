@@ -51,6 +51,24 @@ export const marketApi = {
   /** 市场清单（含每个插件的全部历史版本）· GET /api/market/manage/list */
   manageList: () => api<MarketManifest>(`/market/manage/list`, {}, MARKET_BASE),
 
+  /**
+   * 市场技能正文预览 · GET /api/market/skills/{name}/preview?version=&source=&url=
+   *
+   * <p>返回 `{ name, version, slug, markdown, frontmatter, iconDataUrl, contentLength, cached }`；
+   * 服务端 10 分钟缓存。404/400 ⇒ 详情弹窗显示可读错误 + 重试，⛔ 不显示假正文。
+   */
+  skillPreview: (name: string, opts?: { version?: string | null; source?: string | null; url?: string | null }) =>
+    api<{
+      name?: string; version?: string | null; slug?: string | null
+      markdown?: string; frontmatter?: Record<string, unknown> | null
+      iconDataUrl?: string | null; contentLength?: number | null; cached?: boolean
+    }>(
+      `/market/skills/${encodeURIComponent(name)}/preview${buildQs({
+        version: opts?.version ?? undefined,
+        source: opts?.source ?? undefined,
+        url: opts?.url ?? undefined,
+      })}`, {}, MARKET_BASE),
+
   /** 上架本地目录 · POST /api/market/manage/publish（版本留空 = 自动 patch+1） */
   publishPlugin: (body: PublishPluginRequest) =>
     api<PublishPluginResult>(`/market/manage/publish`, { method: 'POST', body }, MARKET_BASE),

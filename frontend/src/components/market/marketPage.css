@@ -1,0 +1,498 @@
+/* ================================================================
+   市场整页（工作区换页 · 照 IM 频道页范式）+ 专家页场景/团队卡
+   ---------------------------------------------------------------
+   ⚠️ 整页只换外壳：`.sm-topbar/.sm-body` 等市场既有类名原样复用，
+      确保弹窗与整页的卡片/筛选 DOM 只有一份实现。
+   ================================================================ */
+
+.market-page {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1, #fff);
+  /* PublishDialog 是 position:absolute; inset:0 —— 包含块必须是本页，不能是视口 */
+  position: relative;
+}
+
+/* 顶栏高度对齐 IM 频道页（52px）；左栏收起时避开窗口红绿灯 */
+.market-page .sm-topbar.mk-topbar {
+  height: 52px;
+  flex: 0 0 52px;
+  padding: 0 20px;
+}
+.app.workspace-surface.left-collapsed .market-page .mk-topbar { padding-left: 124px; }
+.market-page .sm-body { padding: 18px 22px 26px; }
+
+/* ---- 专家页：精选场景 ---- */
+.mk-section { margin-bottom: 6px; }
+.mk-section-head {
+  display: flex;
+  align-items: flex-end;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 10px;
+}
+.mk-h2 { margin: 0; font-size: 15px; font-weight: 600; color: var(--ink, #14181f); letter-spacing: -0.01em; }
+.mk-sub { margin: 2px 0 0; font-size: 12px; color: var(--ink-tertiary, #9aa3b2); }
+.mk-link {
+  border: none;
+  background: none;
+  color: var(--accent, #0f5fd4);
+  font-size: 12.5px;
+  cursor: pointer;
+  padding: 2px 0;
+  font-family: inherit;
+}
+.mk-link:hover { text-decoration: underline; }
+
+.mk-scene-scroll {
+  display: flex;
+  gap: 10px;
+  overflow-x: auto;
+  padding-bottom: 4px;
+  scrollbar-width: thin;
+}
+.mk-scene {
+  flex: 0 0 216px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  text-align: left;
+  padding: 14px 14px 12px;
+  border: 1px solid var(--hairline, #ececec);
+  border-radius: 12px;
+  background: linear-gradient(160deg, rgba(15, 95, 212, 0.07), rgba(15, 95, 212, 0.01));
+  cursor: pointer;
+  font-family: inherit;
+  transition: border-color 120ms var(--ease, ease);
+}
+.mk-scene:nth-child(2n) { background: linear-gradient(160deg, rgba(93, 184, 114, 0.10), rgba(93, 184, 114, 0.01)); }
+.mk-scene:nth-child(3n) { background: linear-gradient(160deg, rgba(201, 148, 23, 0.10), rgba(201, 148, 23, 0.01)); }
+.mk-scene:nth-child(4n) { background: linear-gradient(160deg, rgba(123, 97, 255, 0.10), rgba(123, 97, 255, 0.01)); }
+.mk-scene:hover { border-color: var(--hairline-strong, #e2e2e2); }
+.mk-scene.active { border-color: var(--accent, #0f5fd4); box-shadow: 0 0 0 2px var(--accent-soft, rgba(15, 95, 212, 0.12)); }
+.mk-scene-title { font-size: 14px; font-weight: 600; color: var(--ink, #14181f); }
+.mk-scene-desc { font-size: 12px; line-height: 1.45; color: var(--ink-subtle, #5f6875); min-height: 34px; }
+.mk-scene-people { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 2px; }
+.mk-scene-person { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-subtle, #5f6875); }
+.mk-scene-person .sm-avatar { width: 22px; height: 22px; font-size: 10px; }
+.mk-scene-person-name { white-space: nowrap; }
+
+/* ---- 专家页：专家团（按 division 分组的团队卡）---- */
+.mk-team-wrap { display: flex; flex-direction: column; }
+.mk-team-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(320px, 1fr));
+  gap: 12px;
+  margin-top: 4px;
+}
+.mk-team-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 14px;
+  border: 1px solid var(--hairline, #ececec);
+  border-radius: 14px;
+  background: var(--surface-1, #fff);
+}
+.mk-team-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.mk-team-name { font-size: 14px; font-weight: 600; color: var(--ink, #14181f); }
+.mk-team-count { margin-left: auto; font-size: 12px; color: var(--ink-tertiary, #9aa3b2); }
+.mk-team-members { display: flex; flex-direction: column; gap: 8px; }
+.mk-team-member { display: flex; align-items: center; gap: 9px; min-width: 0; }
+.mk-team-member-main { display: flex; flex-direction: column; min-width: 0; flex: 1; }
+.mk-team-member-name { font-size: 13px; font-weight: 500; color: var(--ink, #14181f); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-team-member-desc { font-size: 11.5px; color: var(--ink-tertiary, #9aa3b2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-team-member .sm-use-btn { flex: none; }
+.mk-team-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  border-top: 1px solid var(--hairline, #ececec);
+  padding-top: 8px;
+}
+.mk-team-more { font-size: 12px; color: var(--ink-tertiary, #9aa3b2); }
+
+/* 专家卡：岗位/真人名小字（名称下方一行） */
+.mk-expert-role {
+  font-size: 12px;
+  color: var(--ink-subtle, #5f6875);
+  margin: 2px 0 4px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ---- 「我安装的」管理弹窗（技能 tab 右上入口）---- */
+.mk-installed-card {
+  width: 520px;
+  max-width: 92vw;
+  max-height: 76vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--surface-1, #fff);
+  border: 1px solid var(--hairline, #ececec);
+  border-radius: 16px;
+  box-shadow: 0 24px 70px rgba(28, 34, 44, 0.22);
+  overflow: hidden;
+}
+.mk-installed-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--hairline, #ececec);
+}
+.mk-installed-title { font-size: 14px; font-weight: 600; color: var(--ink, #14181f); }
+.mk-installed-title .cnt { color: var(--ink-tertiary, #9aa3b2); font-weight: 500; font-size: 12.5px; }
+.mk-installed-search { padding: 10px 16px 0; }
+.mk-installed-search .settings-input { width: 100%; }
+.mk-installed-list {
+  padding: 10px 16px 16px;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.mk-installed-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+  padding: 8px 10px;
+  border-radius: 10px;
+  background: var(--surface-2, #eff2f8);
+}
+.mk-installed-ico {
+  width: 32px;
+  height: 32px;
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: 8px;
+}
+.mk-installed-ico img { width: 22px; height: 22px; object-fit: contain; }
+.mk-installed-main { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.mk-installed-name { font-size: 13px; font-weight: 500; color: var(--ink, #14181f); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-installed-desc { font-size: 11.5px; color: var(--ink-tertiary, #9aa3b2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.mk-installed-row .mc-btn { flex: none; }
+
+/* ================================================================
+   2026-11-23 专家页对齐 HTML 设计稿：场景卡 / 专家三列 / 专家团 / 详情弹窗
+   ================================================================ */
+
+/* ---- 场景区右侧翻页 ---- */
+.mk-scene-nav { display: flex; gap: 7px; }
+.mk-scene-arrow {
+  width: 34px; height: 34px; border-radius: 50%;
+  border: 1px solid var(--hairline, #ececec);
+  background: #fff; color: var(--ink-subtle, #5f6875);
+  font-size: 18px; line-height: 1; cursor: pointer; font-family: inherit;
+  display: inline-flex; align-items: center; justify-content: center;
+}
+.mk-scene-arrow:hover { background: var(--surface-2, #f5f6f4); }
+
+/* ---- 场景卡：白底 + 浅色插画带（覆盖旧渐变） ---- */
+.mk-scene {
+  flex: 0 0 300px;
+  padding: 0;
+  gap: 0;
+  overflow: hidden;
+  border-radius: 18px;
+  background: #fff;
+  display: flex;
+  flex-direction: column;
+  text-align: left;
+  cursor: pointer;
+}
+.mk-scene:nth-child(n) { background: #fff; }
+.mk-scene:hover { border-color: var(--hairline-strong, #d7dbd5); }
+.mk-scene-art {
+  height: 86px; padding: 0 20px 14px;
+  display: flex; align-items: flex-end;
+  position: relative; overflow: hidden;
+  background: #eef3f3;
+}
+.mk-scene-art.art-invest { background: #eef1e9; }
+.mk-scene-art.art-legal { background: #f4eee7; }
+.mk-scene-art.art-sme { background: #edf0ec; }
+.mk-scene-art.art-ecom { background: #f2ece9; }
+.mk-scene-art.art-data { background: #eaf0f2; }
+.mk-scene-art-ico {
+  position: absolute; right: 14px; top: 12px;
+  width: 58px; height: 58px; color: #5c7264; opacity: .55;
+}
+.mk-scene-art-ico svg { width: 100%; height: 100%; }
+.mk-scene-title { font-size: 21px; font-weight: 650; letter-spacing: -.4px; color: var(--ink, #14181f); }
+.mk-scene-body { padding: 12px 18px 16px; display: flex; flex-direction: column; gap: 8px; }
+.mk-scene-desc { font-size: 12px; line-height: 1.6; color: var(--ink-subtle, #5f6875); min-height: 0; white-space: normal; }
+.mk-scene-people { flex-direction: column; align-items: flex-start; gap: 2px; margin-top: 2px; }
+.mk-scene-person {
+  border: 0; background: none; padding: 4px 0;
+  cursor: pointer; font-family: inherit; border-radius: 6px;
+}
+.mk-scene-person:hover { color: var(--ink, #14181f); }
+.mk-scene-person .sm-avatar { width: 26px; height: 26px; border-radius: 50%; font-size: 11px; }
+
+/* ---- 专家：三列卡片 + 圆形头像 ---- */
+.sm-expert-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.sm-expert-card { padding: 18px; border-radius: 16px; gap: 9px; }
+.sm-expert-card .sm-avatar { width: 46px; height: 46px; border-radius: 50%; font-size: 16px; }
+.sm-expert-card .sm-card-title { font-size: 16px; }
+.sm-expert-card .sk-author { font-size: 11px; }
+
+/* ---- 专家团：摘要卡（成员以标签展示，查看成员弹窗） ---- */
+.mk-team-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.mk-team-card { padding: 18px; border-radius: 16px; gap: 10px; }
+.mk-team-top { display: flex; align-items: center; gap: 12px; min-width: 0; }
+.mk-team-art { display: flex; flex: none; }
+.mk-team-art .sm-avatar { width: 30px; height: 30px; border-radius: 50%; border: 2px solid #fff; margin-left: -10px; font-size: 12px; }
+.mk-team-art .sm-avatar:first-child { margin-left: 0; }
+.mk-team-titles { display: flex; flex-direction: column; min-width: 0; gap: 2px; }
+.mk-team-name { font-size: 16px; font-weight: 600; color: var(--ink, #14181f); }
+.mk-team-count { font-size: 11px; color: var(--ink-tertiary, #9aa3b2); }
+.mk-team-desc { font-size: 13px; line-height: 1.8; color: var(--ink-subtle, #5f6875); min-height: 46px; }
+.mk-team-card .sm-tags { margin-top: 0; }
+
+/* ---- 专家详情弹窗 ---- */
+.ed-mask { background: rgba(20, 26, 21, .34); backdrop-filter: none; -webkit-backdrop-filter: none; }
+.ed-card { max-width: 880px; border-radius: 20px; padding: 30px 34px 34px; position: relative; }
+.ed-close {
+  position: absolute; right: 18px; top: 16px;
+  width: 30px; height: 30px; border-radius: 8px;
+  border: 1px solid var(--hairline, #ececec); background: #fff;
+  color: var(--ink-tertiary, #9aa3b2); cursor: pointer; font-family: inherit;
+}
+.ed-close:hover { background: var(--surface-2, #f5f6f4); }
+.ed-head { display: flex; align-items: center; gap: 20px; padding-right: 36px; }
+.ed-avatar {
+  width: 78px; height: 78px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-size: 28px; font-weight: 700; overflow: hidden;
+}
+.ed-avatar img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; }
+.ed-title h2 {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  font-size: 26px; font-weight: 650; letter-spacing: -.5px; color: var(--ink, #14181f);
+}
+.ed-bar { width: 1px; height: 24px; background: #d6dad5; display: inline-block; }
+.ed-role { font-size: 19px; font-weight: 500; color: #4e5851; }
+.ed-primary {
+  margin-top: 12px; border: 1px solid #20241f; background: #20241f; color: #fff;
+  border-radius: 999px; padding: 9px 22px; font-size: 15px; font-weight: 600;
+  cursor: pointer; font-family: inherit; min-height: 42px;
+}
+.ed-primary:hover:not(:disabled) { background: #3b443c; border-color: #3b443c; }
+.ed-primary:disabled { opacity: .6; cursor: default; }
+.ed-desc { font-size: 15px; line-height: 1.9; color: #4f5851; margin-top: 22px; }
+.ed-tags { margin-top: 16px; }
+.ed-sec { font-size: 16px; font-weight: 650; color: var(--ink, #14181f); margin-top: 28px; }
+.ed-prompts { display: flex; flex-direction: column; gap: 10px; margin-top: 12px; }
+.ed-prompt {
+  display: flex; align-items: center; justify-content: space-between; gap: 14px;
+  background: #f6f7f4; border: 1px solid #f0f1ed; border-radius: 10px;
+  padding: 14px 18px; font-size: 14px; color: #3e4740; cursor: pointer;
+  text-align: left; font-family: inherit; line-height: 1.6;
+}
+.ed-prompt:hover { background: #eff2eb; border-color: #dfe5d9; }
+.ed-copy { font-size: 11px; color: var(--ink-tertiary, #9aa3b2); flex: none; }
+.ed-note { font-size: 13px; line-height: 1.9; color: var(--ink-tertiary, #9aa3b2); margin-top: 9px; }
+.ed-author { margin-top: 12px; }
+
+/* ---- 专家团成员弹窗 ---- */
+.td-card { max-width: 640px; }
+.td-title { font-size: 22px; font-weight: 650; color: var(--ink, #14181f); }
+.td-sub { font-size: 12px; color: var(--ink-tertiary, #9aa3b2); margin-top: 4px; }
+.td-list { margin-top: 16px; display: flex; flex-direction: column; }
+.td-row { display: flex; align-items: center; gap: 11px; padding: 12px 0; border-bottom: 1px solid var(--hairline, #ececec); }
+.td-main { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.td-main b { font-size: 13px; font-weight: 600; color: var(--ink, #14181f); }
+.td-main span { font-size: 11.5px; color: var(--ink-tertiary, #9aa3b2); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+@media (max-width: 1100px) {
+  .sm-expert-grid, .mk-team-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+@media (max-width: 700px) {
+  .sm-expert-grid, .mk-team-grid { grid-template-columns: 1fr; }
+  .mk-scene { flex-basis: 260px; }
+  .ed-card { padding: 22px 18px 26px; border-radius: 16px; }
+  .ed-head { gap: 13px; align-items: flex-start; }
+  .ed-avatar { width: 58px; height: 58px; font-size: 22px; }
+  .ed-title h2 { font-size: 19px; gap: 8px; }
+  .ed-role { font-size: 15px; }
+  .ed-primary { font-size: 13px; min-height: 38px; }
+}
+
+/* ---- 技能目录：去掉子标签后的标题行 + 三列卡片（对齐专家页） ---- */
+.sm-skill-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 2px 0 14px; }
+.sk-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+@media (max-width: 1100px) { .sk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
+@media (max-width: 700px) { .sk-grid { grid-template-columns: 1fr; } }
+
+/* ---- 连接器卡片：贴合技能/专家页（1px 边线、16 圆角、中性 hover，去掉品牌色描边与上浮） ---- */
+.mc-card {
+  border-width: 1px;
+  border-radius: 16px;
+  padding: 20px;
+  min-height: 0;
+}
+.mc-card:hover,
+.mc-card:focus-visible {
+  border-color: #bcc5bd;
+  background: #fcfdfb;
+  transform: none;
+  box-shadow: none;
+}
+.mc-card.is-disabled:hover,
+.mc-card.is-disabled:focus-visible { background: #ffffff; border-color: #e5e7eb; }
+.mc-card.on { border-color: #bcc5bd; }
+/* 分类/授权 chip 改为中性灰，与技能标签一致 */
+.mc-chip { color: #5b645c; background: #f3f4f1; border-radius: 5px; font-size: 11px; padding: 2px 8px; line-height: 18px; }
+/* 状态胶囊：红色收敛为低饱和棕红，避免整页刺眼 */
+.mc-status.error { color: #8a4b45; background: #f7efed; }
+.mc-status.error .mc-dot { background: #a76a62; }
+.mc-status.reauth { color: #8a6b3a; background: #f7f2e8; }
+.mc-status.reauth .mc-dot { background: #b08a4e; }
+
+/* 专家页横向滚动条隐藏（场景条 / 分类条）：内容仍可滚，视觉上不出现滚动条 */
+.mk-scene-scroll,
+.sm-cat-scroll { scrollbar-width: none; -ms-overflow-style: none; }
+.mk-scene-scroll::-webkit-scrollbar,
+.sm-cat-scroll::-webkit-scrollbar { display: none; height: 0; }
+
+/* 专家卡 hover 也走中性样式（覆盖 globals 里 .sm-card 的品牌色上浮） */
+.sm-expert-grid .sm-expert-card:hover,
+.sm-expert-grid .sm-expert-card:focus-within {
+  transform: none;
+  box-shadow: none;
+  border-color: #bcc5bd;
+  background: #fcfdfb;
+}
+
+/* ---- 连接器详情弹窗（双 Logo） ---- */
+.cd-card { max-width: 720px; border-radius: 20px; padding: 30px 34px 30px; position: relative; text-align: center; }
+.cd-hero { display: flex; align-items: center; justify-content: center; gap: 16px; margin: 6px 0 20px; }
+.cd-logo {
+  width: 86px; height: 86px; border-radius: 50%; flex: none;
+  display: inline-flex; align-items: center; justify-content: center;
+  background: #fff; border: 1px solid #edf0ea; overflow: hidden;
+}
+.cd-logo img { width: 58px; height: 58px; object-fit: contain; }
+.cd-logo.nexus { background: #20241f; border-color: #20241f; color: #fff; }
+.cd-logo.nexus svg { width: 40px; height: 40px; }
+.cd-logo-fallback { color: #fff; background: #5b6b5e; width: 100%; height: 100%; display: flex; align-items: center; justify-content: center; font-size: 28px; font-weight: 700; }
+.cd-link { display: flex; align-items: center; gap: 5px; color: #c6cdc4; }
+.cd-link i { width: 4px; height: 4px; border-radius: 50%; background: currentColor; }
+.cd-link b { width: 30px; height: 1px; background: repeating-linear-gradient(90deg, #c6cdc4 0 5px, transparent 5px 9px); }
+.cd-title { font-size: 27px; font-weight: 650; letter-spacing: -.4px; color: var(--ink, #14181f); }
+.cd-desc { max-width: 560px; margin: 14px auto 0; font-size: 15px; line-height: 1.95; color: #505951; }
+.cd-hint { max-width: 560px; margin: 12px auto 0; font-size: 12.5px; line-height: 1.9; color: var(--ink-tertiary, #9aa3b2); }
+.cd-action { display: flex; justify-content: center; margin-top: 22px; }
+.cd-primary {
+  min-height: 46px; padding: 0 30px; border-radius: 999px;
+  border: 1px solid #20241f; background: #20241f; color: #fff;
+  font-size: 15px; font-weight: 600; cursor: pointer; font-family: inherit;
+}
+.cd-primary:hover:not(:disabled) { background: #3b443c; border-color: #3b443c; }
+.cd-primary:disabled { background: #eef0ec; color: #8b938b; border-color: #e3e7df; cursor: default; }
+.cd-note { margin-top: 16px; font-size: 12px; line-height: 1.8; color: var(--ink-tertiary, #9aa3b2); }
+@media (max-width: 700px) {
+  .cd-card { padding: 22px 18px 24px; border-radius: 16px; }
+  .cd-logo { width: 64px; height: 64px; }
+  .cd-logo img { width: 44px; height: 44px; }
+  .cd-link b { width: 16px; }
+  .cd-title { font-size: 21px; }
+  .cd-desc { font-size: 13.5px; }
+}
+
+/* 专家 / 专家团 子标签：对齐设计稿（纯文字，选中加深，计数小灰字，不用胶囊） */
+.sm-subtabs {
+  display: flex;
+  align-items: center;
+  gap: 27px;
+  padding: 0;
+  width: auto;
+  background: none;
+  border: 0;
+  border-radius: 0;
+  margin: 2px 0 18px;
+}
+.sm-subtab {
+  padding: 0;
+  font-size: 21px;
+  font-weight: 500;
+  line-height: 1.5;
+  color: #737975;
+  border-radius: 0;
+  background: none;
+}
+.sm-subtab:hover { background: none; color: #202722; }
+.sm-subtab.active { background: none; color: #202722; font-weight: 650; box-shadow: none; }
+.sm-subtab .cnt,
+.sm-subtab.active .cnt {
+  min-width: 0;
+  padding: 0;
+  border-radius: 0;
+  background: none;
+  color: #9aa3b2;
+  font-size: 12px;
+  font-weight: 400;
+}
+@media (max-width: 700px) {
+  .sm-subtabs { gap: 23px; margin-bottom: 14px; }
+  .sm-subtab { font-size: 19px; }
+}
+
+/* 技能缺失图标：按分类生成的线性图标（统一浅底 + 墨色，不再紫色渐变） */
+.sk-ico.sk-ico-gen {
+  background: #f1f4ef;
+  color: #4c6253;
+  border: 1px solid #e4e9e2;
+}
+.sk-ico.sk-ico-gen svg { width: 24px; height: 24px; }
+.dt-ico.sk-ico-gen { background: #f1f4ef; color: #41574a; border-color: #e4e9e2; }
+.dt-ico.sk-ico-gen svg { width: 30px; height: 30px; }
+.mk-installed-ico.sk-ico-gen svg { width: 20px; height: 20px; }
+
+/* 连接器里的红色残留：危险按钮 / 失败探测面板 / 焦点环，统一收敛到低饱和中性色 */
+.mc-card:focus-visible { outline-color: #bcc5bd; }
+.mc-btn.danger { border-color: #ddc9c2; color: #8a4b45; background: transparent; }
+.mc-btn.danger:hover { background: #f7efed; border-color: #cdb2a9; }
+.mc-probe.fail { border-color: #e6d5cf; }
+.mc-probe.fail .mc-probe-hd { background: #faf4f2; border-bottom-color: #efe1db; }
+.mc-probe.fail .mc-probe-ico { background: #a76a62; color: #fff; }
+.dt-preview-error { color: #8a4b45; }
+
+/* 技能目录标题：与「专家 / 专家团」子标签同一套黑体加粗（21px / 650 / 深墨） */
+.sm-skill-head .mk-h2 {
+  font-size: 21px;
+  font-weight: 650;
+  color: #202722;
+  letter-spacing: -.3px;
+  line-height: 1.5;
+}
+@media (max-width: 700px) {
+  .sm-skill-head .mk-h2 { font-size: 19px; }
+}
+
+/* 「专家 / 专家团」再压一档字重：黑体加粗观感（未选中 600、选中 700） */
+.sm-subtab { font-weight: 600; color: #4f5852; }
+.sm-subtab:hover { color: #161b17; }
+.sm-subtab.active { font-weight: 700; color: #161b17; }
+.sm-skill-head .mk-h2 { font-weight: 700; color: #161b17; }
+
+/* 连接器 / 分类胶囊：去掉红色选中态，改成浅灰底 + 深墨加粗（对齐专家/专家团） */
+.mc-cat { font-weight: 500; }
+.mc-cat.active {
+  background: #eef0ec;
+  color: #202722;
+  font-weight: 650;
+}
+.sm-cat.active {
+  background: #eef0ec;
+  border-color: #eef0ec;
+  color: #202722;
+  font-weight: 650;
+}

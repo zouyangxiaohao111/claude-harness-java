@@ -1,6 +1,6 @@
 {
   "name": "nexusai-client",
-  "version": "0.1.85",
+  "version": "0.1.86",
   "description": "NexusAI Tauri Client",
   "type": "module",
   "scripts": {

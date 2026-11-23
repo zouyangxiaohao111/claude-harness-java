@@ -26,6 +26,19 @@ export const skillApi = {
     api<Skill>(`/skills/${encodeURIComponent(id)}`, { method: 'PATCH', body: req }),
   remove: (id: string) =>
     api<void>(`/skills/${encodeURIComponent(id)}`, { method: 'DELETE' }),
+  /**
+   * 技能正文（本机已装）· GET /api/v1/skills/{name}/content
+   *
+   * <p>按**名字**查（磁盘/插件技能的 id 为 null，不能走 DB id）。404/500 ⇒ 详情弹窗显示
+   * 可读错误 + 重试，⛔ 不显示假正文。
+   */
+  content: (name: string, sessionId?: string) =>
+    api<{
+      name?: string; displayName?: string; description?: string | null; version?: string | null
+      content?: string; markdown?: string; contentPath?: string | null; baseDir?: string | null
+      whenToUse?: string | null; allowedTools?: string[] | null
+    }>(
+      `/skills/${encodeURIComponent(name)}/content${sessionId ? `?sessionId=${encodeURIComponent(sessionId)}` : ''}`),
 }
 
 /**

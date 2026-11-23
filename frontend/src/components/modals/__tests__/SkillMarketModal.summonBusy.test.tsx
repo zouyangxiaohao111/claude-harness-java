@@ -86,12 +86,13 @@ describe('SkillMarketModal · 召唤不因对话进行中被互斥', () => {
     act(() => { skillTab!.click() })
     await flush()
 
-    // 切到「本机已装」子 tab（本机技能自带「召唤」按钮）
-    const localSubtab = Array.from(container!.querySelectorAll('.sm-subtab'))
-      .find((el) => (el.textContent ?? '').includes('本机已装')) as HTMLElement | undefined
-    expect(localSubtab, '未找到「本机已装」子 tab').toBeTruthy()
-    act(() => { localSubtab!.click() })
+    // 2026-11-23：技能默认只展示市场；看本机要点右上「已安装」筛选。
+    const installedPill = Array.from(container!.querySelectorAll('.sm-installed-pill'))
+      .find((el) => (el.textContent ?? '').includes('已安装')) as HTMLElement | undefined
+    expect(installedPill, '未找到「已安装」筛选').toBeTruthy()
+    act(() => { installedPill!.click() })
     await flush()
+    expect(container!.textContent).toContain('summon-skill')
 
     // [2026-11-01 v4] 卡片改 Apple 风格：类名 sm-summon-btn → sk-summon，
     //   且操作区默认 opacity:0（hover 才浮现）。按钮**仍在 DOM 里**（用 opacity 而非

@@ -1,5 +1,5 @@
 -- ===================================================================
--- V320: settings 表新增 show_clear_context_on_plan_accept 列
+-- V302: settings 表新增 show_clear_context_on_plan_accept 列
 --
 -- 背景：plan 审批卡的「批准并清空上下文执行」对齐 CC
 --   （`showClearContextOnPlanAccept`）。此前本仓只有 SettingsSchemaGenerator 的 schema 声明，

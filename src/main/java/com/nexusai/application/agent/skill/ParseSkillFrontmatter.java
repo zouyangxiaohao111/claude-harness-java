@@ -748,7 +748,9 @@ public class ParseSkillFrontmatter {
                 // :262 effort
                 effort,
                 // :263 shell —— parseShellFrontmatter(frontmatter.shell, resolvedName)
-                parseShellFrontmatter(frontmatter.get("shell"), resolvedName)
+                parseShellFrontmatter(frontmatter.get("shell"), resolvedName),
+                // [2026-11-23 技能图标] icon —— 可选 URL；缺失 → null（前端用统一兜底图标）
+                frontmatter.get("icon") != null ? String.valueOf(frontmatter.get("icon")) : null
         );
     }
 

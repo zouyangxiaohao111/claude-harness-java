@@ -7,7 +7,9 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.mybatisflex.core.query.QueryWrapper;
 import com.nexusai.application.agent.mcp.McpOAuth;
 import com.nexusai.application.agent.skill.NexusaiPaths;
+import com.nexusai.domain.mcp_oauth.McpOAuthTokenService;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.model.mcp_oauth.McpOAuthToken;
 import com.nexusai.model.mcp.McpServer;
 import com.nexusai.repository.mcp.entity.McpServerRecord;
 import com.nexusai.repository.mcp.mapper.McpServerMapper;
@@ -19,6 +21,7 @@ import org.springframework.transaction.annotation.Transactional;
 import java.net.URLDecoder;
 import java.net.URLEncoder;
 import java.nio.charset.StandardCharsets;
+import java.util.Base64;
 import java.nio.file.Files;
 import java.nio.file.Path;
 import java.time.OffsetDateTime;
@@ -49,7 +52,11 @@ public class McpJsonTransferService {
     private static final ObjectMapper JSON = new ObjectMapper();
     private static final DateTimeFormatter TS = DateTimeFormatter.ofPattern("yyyyMMdd-HHmmss");
     private static final Set<String> SERVER_FIELDS = Set.of(
-            "type", "command", "url", "args", "env", "headers", "enabled", "autoStart", "scope");
+            "type", "command", "url", "args", "env", "headers", "enabled", "autoStart", "scope",
+            "oauth");
+    private static final Set<String> OAUTH_FIELDS = Set.of(
+            "clientId", "scopes", "authorizationEndpoint", "tokenEndpoint", "callbackPort",
+            "clientSecret", "xaa", "authServerMetadataUrl");
     private static final Set<String> ROOT_FIELDS = Set.of("mcpServers", "deleteMissing");
     private static final Set<String> SCOPES = Set.of(
             "project", "user", "local", "dynamic", "enterprise", "claudeai", "managed");
@@ -58,10 +65,13 @@ public class McpJsonTransferService {
             "key", "ak", "apikey", "api_key", "access_token", "token", "code", "secret");
 
     private final McpServerMapper mcpServerMapper;
+    private final McpOAuthTokenService tokenService;
     private Path backupDir;
 
-    public McpJsonTransferService(McpServerMapper mcpServerMapper) {
+    public McpJsonTransferService(McpServerMapper mcpServerMapper,
+                                  McpOAuthTokenService tokenService) {
         this.mcpServerMapper = mcpServerMapper;
+        this.tokenService = tokenService;
     }
 
     /** 测试注入：备份目录（默认 app data/backups）。 */
@@ -102,6 +112,7 @@ public class McpJsonTransferService {
                 if (!headers.isEmpty()) {
                     n.set("headers", maskedObject(headers));
                 }
+                appendOAuth(n, s, env);
             }
             n.put("enabled", Boolean.TRUE.equals(s.getEnabled()));
             n.put("autoStart", Boolean.TRUE.equals(s.getAutoStart()));
@@ -114,6 +125,106 @@ public class McpJsonTransferService {
     public String suggestedSavePath() {
         return NexusaiPaths.getAppConfigHomePath()
                 .resolve("exports").resolve("mcp-servers-" + ts() + ".json").toString();
+    }
+
+    /** 导出 OAuth 元数据（env 镜像 + keychain clientSecret 掩码）。 */
+    private void appendOAuth(ObjectNode node, McpServer s, Map<String, String> env) {
+        McpOAuth.OAuthEnvInfo oi = McpOAuth.oauthEnv(env);
+        String secret = storedClientSecret(s, env);
+        boolean any = oi.clientId() != null || oi.scopes() != null
+                || oi.authorizationEndpoint() != null || oi.tokenEndpoint() != null
+                || oi.configuredCallbackPort() != null || secret != null;
+        if (!any) {
+            return;
+        }
+        ObjectNode o = node.putObject("oauth");
+        if (oi.clientId() != null) {
+            o.put("clientId", oi.clientId());
+        }
+        if (oi.scopes() != null) {
+            o.put("scopes", oi.scopes());
+        }
+        if (oi.authorizationEndpoint() != null) {
+            o.put("authorizationEndpoint", oi.authorizationEndpoint());
+        }
+        if (oi.tokenEndpoint() != null) {
+            o.put("tokenEndpoint", oi.tokenEndpoint());
+        }
+        if (oi.configuredCallbackPort() != null) {
+            o.put("callbackPort", oi.configuredCallbackPort());
+        }
+        if (oi.authServerMetadataUrl() != null) {
+            o.put("authServerMetadataUrl", oi.authServerMetadataUrl());
+        }
+        if (oi.xaa()) {
+            o.put("xaa", true);
+        }
+        if (secret != null) {
+            o.put("clientSecret", mask(secret));
+        }
+    }
+
+    private String storedClientSecret(McpServer s, Map<String, String> env) {
+        if (tokenService == null) {
+            return null;
+        }
+        String key = McpOAuth.getServerKey(s.getName(), s.getType(), s.getCommand(),
+                McpOAuth.headersOnly(env));
+        McpOAuthToken token = tokenService.read(key);
+        String secret = token == null ? null : token.getClientSecret();
+        if (secret == null || secret.isBlank()) {
+            secret = tokenService.getClientSecret(key);
+        }
+        return secret == null || secret.isBlank() ? null : secret;
+    }
+
+    /** 读取 env 里的 __mcp_oauth__ 镜像 → 可合并的 Map（值可为 Boolean）。 */
+    private static Map<String, Object> oauthMirror(Map<String, String> env) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        String raw = env.get(McpOAuth.ENV_OAUTH_MIRROR_KEY);
+        if (raw == null || raw.isBlank()) {
+            return out;
+        }
+        try {
+            JsonNode node = JSON.readTree(new String(Base64.getDecoder().decode(raw),
+                    StandardCharsets.UTF_8));
+            if (node != null && node.isObject()) {
+                node.fields().forEachRemaining(e -> {
+                    if (e.getValue().isBoolean()) {
+                        out.put(e.getKey(), e.getValue().asBoolean());
+                    } else if (e.getValue().isValueNode()) {
+                        out.put(e.getKey(), e.getValue().asText());
+                    }
+                });
+            }
+        } catch (Exception ignored) {
+            // 坏镜像从空开始
+        }
+        return out;
+    }
+
+    private static void putIfText(Map<String, Object> map, String key, String value) {
+        if (value != null && !value.isBlank()) {
+            map.put(key, value);
+        }
+    }
+
+    private String storedSecretOf(McpServerRecord old) {
+        if (old == null || tokenService == null) {
+            return null;
+        }
+        String key = serverKey(old);
+        McpOAuthToken token = tokenService.read(key);
+        String secret = token == null ? null : token.getClientSecret();
+        if (secret == null || secret.isBlank()) {
+            secret = tokenService.getClientSecret(key);
+        }
+        return secret == null || secret.isBlank() ? null : secret;
+    }
+
+    private static String serverKey(McpServerRecord r) {
+        return McpOAuth.getServerKey(r.getName(), r.getType(), r.getCommand(),
+                McpOAuth.headersOnly(parseEnv(r.getEnv())));
     }
 
     private static ObjectNode maskedObject(Map<String, String> map) {
@@ -139,11 +250,12 @@ public class McpJsonTransferService {
         List<String> removed = new ArrayList<>();
         List<String> warnings = new ArrayList<>();
         Map<String, McpServerRecord> toWrite = new LinkedHashMap<>();
+        Map<String, String> secretsToSave = new LinkedHashMap<>();
 
         for (ImportServer server : parsed.servers()) {
             McpServerRecord old = existing.get(server.name());
             McpServerRecord target = old != null ? old : newRecord(server.name());
-            boolean changed = applyToRecord(target, server, old, warnings);
+            boolean changed = applyToRecord(target, server, old, warnings, secretsToSave);
             if (old == null) {
                 toWrite.put(server.name(), target);
                 added.add(server.name());
@@ -186,6 +298,13 @@ public class McpJsonTransferService {
                             QueryWrapper.create().eq("id", record.getId()));
                 } else {
                     mcpServerMapper.insert(record);
+                }
+            }
+            // clientSecret 明文只在导入里出现一次 → 按最终 serverKey 落 keychain（掩码不落）
+            for (Map.Entry<String, String> e : secretsToSave.entrySet()) {
+                McpServerRecord rec = toWrite.get(e.getKey());
+                if (rec != null && tokenService != null) {
+                    tokenService.saveClientSecret(serverKey(rec), e.getValue());
                 }
             }
             mutated = true;
@@ -274,6 +393,10 @@ public class McpJsonTransferService {
         List<String> args = stringList(node.get("args"), name + ".args");
         Map<String, String> env = stringMap(node.get("env"), name + ".env");
         Map<String, String> headers = stringMap(node.get("headers"), name + ".headers");
+        ImportOAuth oauth = parseOAuth(name, node.get("oauth"));
+        if ("stdio".equals(type) && oauth != null) {
+            throw new ValidationException(name + "：stdio 不允许 oauth");
+        }
         if ("stdio".equals(type) && !headers.isEmpty()) {
             throw new ValidationException(name + "：stdio 不允许 headers");
         }
@@ -292,13 +415,45 @@ public class McpJsonTransferService {
             throw new ValidationException(name + "：scope 非法（" + scope + "）");
         }
         return new ImportServer(name, type, command, url, args, env, headers,
-                enabled, autoStart, scope);
+                enabled, autoStart, scope, oauth);
+    }
+
+    private ImportOAuth parseOAuth(String name, JsonNode node) {
+        if (node == null || node.isNull()) {
+            return null;
+        }
+        if (!node.isObject()) {
+            throw new ValidationException(name + "：oauth 必须是对象");
+        }
+        List<String> unknown = fieldNames(node).stream()
+                .filter(k -> !OAUTH_FIELDS.contains(k)).toList();
+        if (!unknown.isEmpty()) {
+            throw new ValidationException(name + "：oauth 未知字段 " + String.join(", ", unknown));
+        }
+        String scopes = null;
+        JsonNode scopesNode = node.get("scopes");
+        if (scopesNode != null && !scopesNode.isNull()) {
+            if (scopesNode.isTextual()) {
+                scopes = scopesNode.asText();
+            } else if (scopesNode.isArray()) {
+                List<String> list = stringList(scopesNode, name + ".oauth.scopes");
+                scopes = String.join(" ", list);
+            } else {
+                throw new ValidationException(name + "：oauth.scopes 必须是字符串或数组");
+            }
+        }
+        return new ImportOAuth(
+                text(node, "clientId"), scopes,
+                text(node, "authorizationEndpoint"), text(node, "tokenEndpoint"),
+                text(node, "callbackPort"), text(node, "clientSecret"),
+                node.path("xaa").asBoolean(false), text(node, "authServerMetadataUrl"));
     }
 
     // ── 应用/合并 ──
 
     private boolean applyToRecord(McpServerRecord target, ImportServer server,
-                                  McpServerRecord old, List<String> warnings) {
+                                  McpServerRecord old, List<String> warnings,
+                                  Map<String, String> secretsToSave) {
         String oldType = old == null ? null : old.getType();
         String oldCommand = old == null ? null : old.getCommand();
         String oldArgs = old == null ? null : old.getArgs();
@@ -325,6 +480,44 @@ public class McpJsonTransferService {
                 baseEnv.put(k, v);
             }
         });
+        // [2026-11-23] OAuth 元数据往返：env 镜像键 __mcp_oauth__（clientSecret 只进 keychain）
+        Map<String, Object> mirror = oauthMirror(baseEnv);
+        ImportOAuth oauth = server.oauth();
+        if (oauth != null) {
+            if (old == null && oauth.clientSecret() != null) {
+                throw new ValidationException(server.name()
+                        + "：新增 OAuth 请用表单（JSON 不允许 clientSecret）");
+            }
+            putIfText(mirror, "clientId", oauth.clientId());
+            putIfText(mirror, "scopes", oauth.scopes());
+            putIfText(mirror, "authorizationEndpoint", oauth.authorizationEndpoint());
+            putIfText(mirror, "tokenEndpoint", oauth.tokenEndpoint());
+            putIfText(mirror, "callbackPort", oauth.callbackPort());
+            putIfText(mirror, "authServerMetadataUrl", oauth.authServerMetadataUrl());
+            if (oauth.xaa()) {
+                mirror.put("xaa", Boolean.TRUE);
+            }
+            if (oauth.clientSecret() != null) {
+                if (isMasked(oauth.clientSecret())) {
+                    // 掩码 = 保持原值：必须确有原值，否则无法恢复
+                    if (storedSecretOf(old) == null) {
+                        throw new ValidationException(server.name()
+                                + "：clientSecret 是掩码值，但当前没有可保留的原值");
+                    }
+                } else {
+                    secretsToSave.put(server.name(), oauth.clientSecret());
+                }
+            }
+        }
+        if (!mirror.isEmpty()) {
+            try {
+                baseEnv.put(McpOAuth.ENV_OAUTH_MIRROR_KEY,
+                        Base64.getEncoder().encodeToString(JSON.writeValueAsString(mirror)
+                                .getBytes(StandardCharsets.UTF_8)));
+            } catch (Exception e) {
+                throw new IllegalStateException("序列化 oauth 镜像失败", e);
+            }
+        }
         String argsJson = server.args().isEmpty() ? null : serializeArgs(server.args());
         String envJson = baseEnv.isEmpty() ? null : serializeMap(baseEnv);
 
@@ -648,7 +841,13 @@ public class McpJsonTransferService {
     record ImportServer(String name, String type, String command, String url,
                         List<String> args, Map<String, String> env,
                         Map<String, String> headers, boolean enabled,
-                        boolean autoStart, String scope) {
+                        boolean autoStart, String scope, ImportOAuth oauth) {
+    }
+
+    /** JSON 里的 oauth 子对象（clientSecret 可为掩码）。 */
+    record ImportOAuth(String clientId, String scopes, String authorizationEndpoint,
+                       String tokenEndpoint, String callbackPort, String clientSecret,
+                       boolean xaa, String authServerMetadataUrl) {
     }
 
     /**

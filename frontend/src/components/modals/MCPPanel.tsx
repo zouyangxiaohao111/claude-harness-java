@@ -5,11 +5,19 @@ import { ApiError } from '@/api/rest'
 import { doctorApi } from '@/api/doctor'
 import type { RuntimeEnvResponse } from '@/api/doctor'
 import { mcpApi as mcpRestApi } from '@/api/mcp'
-import type { CreateMcpRequest, McpOAuthRequest, McpServer } from '@/api/types'
+import type { CreateMcpRequest, McpServer } from '@/api/types'
 import type { UseMcp } from '@/hooks/useMcp'
-import { parseMcpCommandLine } from '@/utils/mcpCliParse'
 import { McpOauthRow } from './McpOauthRow'
 import { CONN_STATE, RUNTIME_LABEL } from './mcpStatus'
+import { McpServerForm } from '@/components/mcp/McpServerForm'
+import { McpServerRow } from '@/components/mcp/McpServerRow'
+
+/** 审批态徽标（对齐 McpServerDto.approvalStatus） */
+const APPROVAL_LABEL: Record<string, { cls: string; label: string }> = {
+  approved: { cls: 'approved', label: '已通过' },
+  rejected: { cls: 'rejected', label: '已拒绝' },
+  pending: { cls: 'pending', label: '待审批' },
+}
 
 interface MCPPanelProps {
   /** 真实后端 CRUD API */
@@ -23,93 +31,6 @@ interface MCPPanelProps {
   sessionId?: string | null
 }
 
-type Transport = 'stdio' | 'sse' | 'http'
-type Scope = 'local' | 'user' | 'project'
-
-const TRANSPORT_TYPES: { value: Transport; label: string }[] = [
-  { value: 'stdio', label: 'stdio' },
-  { value: 'sse', label: 'sse' },
-  { value: 'http', label: 'http' },
-]
-
-const SCOPE_OPTIONS: { value: Scope; label: string }[] = [
-  { value: 'local', label: 'local' },
-  { value: 'user', label: 'user' },
-  { value: 'project', label: 'project' },
-]
-
-/** 添加/编辑表单本地 state（传输类型切换联动 Command / URL + Headers/OAuth 行） */
-interface McpFormState {
-  name: string
-  type: Transport
-  scope: Scope
-  command: string
-  argsStr: string
-  envStr: string
-  url: string
-  headersJson: string
-  oauthClientId: string
-  oauthCallbackPort: string
-  oauthMetadataUrl: string
-  oauthScopes: string
-  oauthAuthEndpoint: string
-  oauthTokenEndpoint: string
-  oauthXaa: boolean
-  clientSecret: string
-}
-
-const EMPTY_FORM: McpFormState = {
-  name: '', type: 'stdio', scope: 'project',
-  command: '', argsStr: '', envStr: '',
-  url: '', headersJson: '',
-  oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '',
-  oauthScopes: '', oauthAuthEndpoint: '', oauthTokenEndpoint: '',
-  oauthXaa: false,
-  clientSecret: '',
-}
-
-/** 默认回调端口：与后端 `OauthPort` 的 fallback 3118 保持一致（未填 Callback Port 时展示它） */
-const DEFAULT_CALLBACK_PORT = '3118'
-
-const isTransport = (t: string | undefined): t is Transport =>
-  t === 'stdio' || t === 'sse' || t === 'http'
-const isScope = (s: string | null | undefined): s is Scope =>
-  s === 'local' || s === 'user' || s === 'project'
-
-/** 审批态徽标（对齐 McpServerDto.approvalStatus） */
-const APPROVAL_LABEL: Record<string, { cls: string; label: string }> = {
-  approved: { cls: 'approved', label: '已通过' },
-  rejected: { cls: 'rejected', label: '已拒绝' },
-  pending: { cls: 'pending', label: '待审批' },
-}
-
-
-const parseArgs = (raw: string): string[] => raw.split(/\s+/).filter(Boolean)
-
-/** 把 "K=V\nK=V" 解析为对象；非法行（无 =）返回 null 触发 toast */
-const parseKvLines = (raw: string): Record<string, string> | null => {
-  const out: Record<string, string> = {}
-  for (const line of raw.split(/\r?\n/)) {
-    const trimmed = line.trim()
-    if (!trimmed) continue
-    const eq = trimmed.indexOf('=')
-    if (eq <= 0) return null
-    out[trimmed.slice(0, eq).trim()] = trimmed.slice(eq + 1)
-  }
-  return out
-}
-
-/** 解析 JSON 对象文本；空串返回 undefined（不发送），非法 JSON / 非对象返回 null 触发 toast */
-const parseJsonObject = (raw: string): Record<string, string> | undefined | null => {
-  if (!raw.trim()) return undefined
-  try {
-    const parsed = JSON.parse(raw)
-    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null
-    return parsed
-  } catch {
-    return null
-  }
-}
 
 /**
  * MCPPanel · 版式对齐「CLI 设置」页：
@@ -117,13 +38,14 @@ const parseJsonObject = (raw: string): Record<string, string> | undefined | null
  * 避免一进页面就被一张常驻表单抢注意力。
  *
  * <p>「启动时自动连接」是每个服务器自己的开关（新增默认开启），跟着列表行走，没有全局总闸。
+ *
+ * <p>列表行与添加/编辑表单分别抽到 `components/mcp/McpServerRow|McpServerForm`：
+ * 市场「自定义连接器」弹窗复用同一份实现（用户要求两处不许各写一套）。
  */
 export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps) {
   const { list, loading, error, refresh, createMcp, updateMcp, deleteMcp, toggleMcp } = mcpApi
 
-  const [form, setForm] = useState<McpFormState>(EMPTY_FORM)
   const [editing, setEditing] = useState<McpServer | null>(null)
-  const [cliLine, setCliLine] = useState('')
   const [pending, setPending] = useState(false)
   const [importing, setImporting] = useState(false)
   const [importDetail, setImportDetail] = useState<{ blocked: string[]; suppressed: string[] } | null>(null)
@@ -152,8 +74,6 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
       .catch(() => { /* 探测失败静默：不把 MCP 面板拖进错误态 */ })
   }
 
-  const set = (patch: Partial<McpFormState>) => setForm((p) => ({ ...p, ...patch }))
-
   const wrap = async (fn: () => Promise<unknown>, successMsg: string) => {
     setPending(true)
     try {
@@ -169,7 +89,6 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
   }
 
   const resetForm = () => {
-    setForm(EMPTY_FORM)
     setEditing(null)
   }
 
@@ -179,91 +98,15 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     setFormOpen(false)
   }
 
-  /** 命令行快速添加：解析 `claude mcp add ...` / 纯命令 → 填入表单（失败 toast；成功清掉 OAuth 残留回到新建态） */
-  const onCliParse = () => {
-    const parsed = parseMcpCommandLine(cliLine)
-    if (!parsed.ok) {
-      showToast(parsed.error, 'info')
+  /** 表单校验通过 → 父层落库（编辑 = PATCH / 新增 = POST）。 */
+  const onFormSubmit = (req: CreateMcpRequest) => {
+    if (editing) {
+      void wrap(async () => {
+        await updateMcp(editing.id, req)
+        resetForm()
+      }, `已更新: ${req.name}`)
       return
     }
-    setForm({
-      ...parsed.form,
-      oauthClientId: '', oauthCallbackPort: '', oauthMetadataUrl: '',
-      oauthScopes: '', oauthAuthEndpoint: '', oauthTokenEndpoint: '',
-      oauthXaa: false,
-      clientSecret: '',
-    })
-    setEditing(null)
-    setCliLine('')
-    showToast('已填入表单，确认后点添加服务器', 'success')
-  }
-
-  const buildOAuth = (): McpOAuthRequest | undefined => {
-    const clientId = form.oauthClientId.trim()
-    const scopes = form.oauthScopes.trim()
-    const authz = form.oauthAuthEndpoint.trim()
-    const token = form.oauthTokenEndpoint.trim()
-    // falsy 门：所有 OAuth 字段都空 ⇒ 不下发 oauth（老行为完全不变）
-    if (!clientId && !form.oauthCallbackPort.trim() && !form.oauthMetadataUrl.trim()
-      && !scopes && !authz && !token && !form.oauthXaa) {
-      return undefined
-    }
-    return {
-      clientId: clientId || undefined,
-      callbackPort: form.oauthCallbackPort.trim() || undefined,
-      authServerMetadataUrl: form.oauthMetadataUrl.trim() || undefined,
-      scopes: scopes || undefined,
-      authorizationEndpoint: authz || undefined,
-      tokenEndpoint: token || undefined,
-      xaa: form.oauthXaa || undefined,
-    }
-  }
-
-  /** 表单 → 请求体：stdio 提交 command/args/env；sse/http 提交 url/headers/oauth/clientSecret。校验失败返回 null。 */
-  const buildRequest = (): CreateMcpRequest | null => {
-    const name = form.name.trim()
-    if (!name) {
-      showToast('请填写服务器名称', 'info')
-      return null
-    }
-    const base: CreateMcpRequest = {
-      name,
-      type: form.type,
-      scope: form.scope,
-      enabled: editing ? editing.enabled : true,
-      // 新增默认「启动时自动连接」（编辑时沿用原值，不回写覆盖；undefined 会被后端视为不改）
-      autoStart: editing ? editing.autoStart : true,
-    }
-    if (form.type === 'stdio') {
-      if (!form.command.trim()) {
-        showToast('请填写 Command', 'info')
-        return null
-      }
-      const env = parseKvLines(form.envStr)
-      if (env === null) {
-        showToast('环境变量格式错误：每行应为 KEY=VALUE', 'info')
-        return null
-      }
-      return { ...base, command: form.command.trim(), args: parseArgs(form.argsStr), env }
-    }
-    if (!form.url.trim()) {
-      showToast('请填写 URL', 'info')
-      return null
-    }
-    const headers = parseJsonObject(form.headersJson)
-    if (headers === null) {
-      showToast('Headers 需为 JSON 对象，如 {"Authorization":"Bearer xxx"}', 'info')
-      return null
-    }
-    const oauth = buildOAuth()
-    const req: CreateMcpRequest = { ...base, url: form.url.trim(), headers, oauth }
-    if (oauth?.clientId && form.clientSecret.trim()) req.clientSecret = form.clientSecret.trim()
-    return req
-  }
-
-  const onAdd = () => {
-    const req = buildRequest()
-    if (!req) return
     void wrap(async () => {
       await createMcp(req)
       resetForm()
@@ -271,44 +114,13 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
     }, `已添加: ${req.name}`)
   }
 
-  const onSaveEdit = () => {
-    const req = buildRequest()
-    if (!req || !editing) return
-    void wrap(async () => {
-      await updateMcp(editing.id, req)
-      resetForm()
-    }, `已更新: ${req.name}`)
-  }
-
   const startAdd = () => {
     resetForm()
-    setCliLine('')
     setFormOpen(true)
     setOpenId(null)
   }
 
   const startEdit = (m: McpServer) => {
-    const type: Transport = isTransport(m.type) ? m.type : 'stdio'
-    const scope: Scope = isScope(m.scope) ? m.scope : 'project'
-    const oauth = (m.oauth ?? null) as McpOAuthRequest | null
-    setForm({
-      name: m.userFacingName ?? m.name,
-      type,
-      scope,
-      command: type === 'stdio' ? m.command : '',
-      argsStr: m.args ? m.args.join(' ') : '',
-      envStr: m.env ? Object.entries(m.env).map(([k, v]) => `${k}=${v}`).join('\n') : '',
-      url: type === 'stdio' ? '' : (m.url ?? ''),
-      headersJson: m.headers ? JSON.stringify(m.headers, null, 2) : '',
-      oauthClientId: oauth?.clientId ?? '',
-      oauthCallbackPort: oauth?.callbackPort != null ? String(oauth.callbackPort) : '',
-      oauthMetadataUrl: oauth?.authServerMetadataUrl ?? '',
-      oauthScopes: oauth?.scopes ?? '',
-      oauthAuthEndpoint: oauth?.authorizationEndpoint ?? '',
-      oauthTokenEndpoint: oauth?.tokenEndpoint ?? '',
-      oauthXaa: !!oauth?.xaa,
-      clientSecret: '',
-    })
     setEditing(m)
     setFormOpen(false)
     setOpenId(m.id)
@@ -455,237 +267,6 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
 
   const enabledCount = list.filter((m) => m.enabled).length
 
-  /** 回调地址（未填端口时展示后端 `OauthPort` 的默认 fallback 3118） */
-  const callbackUri = `http://localhost:${form.oauthCallbackPort.trim() || DEFAULT_CALLBACK_PORT}/callback`
-  const copyCallback = async () => {
-    try {
-      await navigator.clipboard?.writeText(callbackUri)
-      showToast('已复制回调地址', 'success')
-    } catch {
-      showToast('复制失败，请手动选中复制', 'info')
-    }
-  }
-
-  /** 添加 / 编辑共用的表单主体（在卡片内展开，不常驻页面顶部） */
-  const renderForm = () => (
-    <>
-      {!editing && (
-        <div className="mcp-cli-row">
-          <input
-            className="settings-input mcp-cli-input"
-            value={cliLine}
-            onChange={(e) => setCliLine(e.target.value)}
-            placeholder="claude mcp add <name> -- npx -y @modelcontextprotocol/server-filesystem /tmp"
-            onKeyDown={(e) => { if (e.key === 'Enter') onCliParse() }}
-            disabled={pending}
-          />
-          <button className="mcp-cli-btn" onClick={onCliParse} disabled={pending}>
-            解析填入
-          </button>
-        </div>
-      )}
-      <div className="mcp-add-form">
-        <div className="mcp-add-row">
-          <label>服务器名称</label>
-          <input
-            className="settings-input"
-            value={form.name}
-            onChange={(e) => set({ name: e.target.value })}
-            placeholder="e.g. filesystem"
-            disabled={pending}
-          />
-        </div>
-        <div className="mcp-add-row">
-          <label>传输类型</label>
-          <select
-            className="settings-input"
-            value={form.type}
-            onChange={(e) => set({ type: e.target.value as Transport, url: '', headersJson: '' })}
-            disabled={pending}
-          >
-            {TRANSPORT_TYPES.map((t) => (
-              <option key={t.value} value={t.value}>{t.label}</option>
-            ))}
-          </select>
-          <label className="mcp-add-inline-label">作用域</label>
-          <select
-            className="settings-input"
-            value={form.scope}
-            onChange={(e) => set({ scope: e.target.value as Scope })}
-            disabled={pending}
-          >
-            {SCOPE_OPTIONS.map((s) => (
-              <option key={s.value} value={s.value}>{s.label}</option>
-            ))}
-          </select>
-        </div>
-        {form.type === 'stdio' ? (
-          <>
-            <div className="mcp-add-row">
-              <label>Command</label>
-              <input
-                className="settings-input"
-                value={form.command}
-                onChange={(e) => set({ command: e.target.value })}
-                placeholder="npx -y @modelcontextprotocol/server-filesystem /tmp"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>Args</label>
-              <input
-                className="settings-input"
-                value={form.argsStr}
-                onChange={(e) => set({ argsStr: e.target.value })}
-                placeholder="-y @modelcontextprotocol/server-fs /tmp"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>Env</label>
-              <textarea
-                className="settings-input mcp-add-textarea"
-                value={form.envStr}
-                onChange={(e) => set({ envStr: e.target.value })}
-                placeholder={'API_KEY=xxx\nLOG_LEVEL=info'}
-                rows={2}
-                disabled={pending}
-              />
-            </div>
-          </>
-        ) : (
-          <>
-            <div className="mcp-add-row">
-              <label>URL</label>
-              <input
-                className="settings-input"
-                value={form.url}
-                onChange={(e) => set({ url: e.target.value })}
-                placeholder="https://mcp.example.com/sse"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>Headers JSON</label>
-              <textarea
-                className="settings-input mcp-add-textarea"
-                value={form.headersJson}
-                onChange={(e) => set({ headersJson: e.target.value })}
-                placeholder='{ "Authorization": "Bearer xxxxx" }'
-                rows={2}
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-subtitle">OAuth（可选）</div>
-            <div className="mcp-add-row">
-              <label>Client ID</label>
-              <input
-                className="settings-input"
-                value={form.oauthClientId}
-                onChange={(e) => set({ oauthClientId: e.target.value })}
-                placeholder="e.g. my-app-client"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>Callback Port</label>
-              <input
-                className="settings-input"
-                value={form.oauthCallbackPort}
-                onChange={(e) => set({ oauthCallbackPort: e.target.value })}
-                placeholder="8080"
-                disabled={pending}
-              />
-            </div>
-            {/* 回调地址：给用户去平台后台登记（默认端口与后端 fallback 一致） */}
-            <div className="mcp-add-row">
-              <label>回调地址</label>
-              <code
-                data-testid="mcp-callback-uri"
-                style={{ flex: 1, minWidth: 0, fontSize: 12, wordBreak: 'break-all' }}
-              >
-                {callbackUri}
-              </code>
-              <button className="mcp-cli-btn" type="button" onClick={() => void copyCallback()} disabled={pending}>
-                复制
-              </button>
-            </div>
-            <div className="mcp-add-row">
-              <label>Metadata URL</label>
-              <input
-                className="settings-input"
-                value={form.oauthMetadataUrl}
-                onChange={(e) => set({ oauthMetadataUrl: e.target.value })}
-                placeholder="https://auth.example.com/.well-known/openid-configuration"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>Scope</label>
-              <input
-                className="settings-input"
-                value={form.oauthScopes}
-                onChange={(e) => set({ oauthScopes: e.target.value })}
-                placeholder="空格分隔，如 openid profile tasks:read"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>授权端点</label>
-              <input
-                className="settings-input"
-                value={form.oauthAuthEndpoint}
-                onChange={(e) => set({ oauthAuthEndpoint: e.target.value })}
-                placeholder="可选，覆盖自动发现：https://.../authorize"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>令牌端点</label>
-              <input
-                className="settings-input"
-                value={form.oauthTokenEndpoint}
-                onChange={(e) => set({ oauthTokenEndpoint: e.target.value })}
-                placeholder="可选，覆盖自动发现：https://.../token"
-                disabled={pending}
-              />
-            </div>
-            <div className="mcp-add-row">
-              <label>XAA</label>
-              <label className="settings-switch" style={{ marginTop: 3 }}>
-                <input
-                  type="checkbox"
-                  checked={form.oauthXaa}
-                  onChange={(e) => set({ oauthXaa: e.target.checked })}
-                  disabled={pending}
-                />
-                <span></span>
-              </label>
-            </div>
-            <div className="mcp-add-row">
-              <label>Client Secret</label>
-              <input
-                className="settings-input"
-                value={form.clientSecret}
-                onChange={(e) => set({ clientSecret: e.target.value })}
-                placeholder="仅当填写 OAuth Client ID 时生效"
-                disabled={pending}
-              />
-            </div>
-          </>
-        )}
-      </div>
-      <div className="mcp-add-actions">
-        <button className="mcp-add-btn ghost" onClick={closeForm} disabled={pending}>
-          取消
-        </button>
-        <button className="mcp-add-btn primary" onClick={editing ? onSaveEdit : onAdd} disabled={pending}>
-          {editing ? '保存修改' : '添加服务器'}
-        </button>
-      </div>
-    </>
-  )
-
   return (
     <div className="mcp-list cli-panel">
       <section className="cli-section">
@@ -790,214 +371,163 @@ export function MCPPanel({ mcpApi, showToast, sessionId = null }: MCPPanelProps)
                 <div className="cli-config-head">
                   <span className="cli-config-name">添加新服务器</span>
                 </div>
-                <div className="mcp-form-wrap">{renderForm()}</div>
+                <div className="mcp-form-wrap">
+                  <McpServerForm
+                    key="new"
+                    pending={pending}
+                    onSubmit={onFormSubmit}
+                    onCancel={closeForm}
+                    showToast={showToast}
+                  />
+                </div>
               </div>
             </div>
           )}
 
           {list.map((m) => {
-            const type = m.type ?? 'stdio'
-            const remote = type !== 'stdio'
+            const isOpen = openId === m.id
+            const editingThis = editing?.id === m.id
+            const remote = (m.type ?? 'stdio') !== 'stdio'
             const approval = APPROVAL_LABEL[m.approvalStatus ?? 'approved'] ?? APPROVAL_LABEL.approved
             // [V295] 运行时状态优先（后端现算，不落库）；老后端无 runtimeStatus → 回落三态映射
             const conn = m.runtimeStatus ? RUNTIME_LABEL[m.runtimeStatus] : (CONN_STATE[m.status] ?? CONN_STATE.stopped)
-            const isConnected = m.runtimeStatus
-              ? m.runtimeStatus === 'connected'
-              : m.status === 'running'
+            const isConnected = m.runtimeStatus ? m.runtimeStatus === 'connected' : m.status === 'running'
             const desc = remote
               ? `URL: ${m.url ?? m.command}`
               : `Command: ${m.command}${m.args && m.args.length > 0 ? ' ' + m.args.join(' ') : ''}`
-            const display = m.userFacingName ?? m.name
-            const scopeText = m.scope ?? (remote ? 'remote' : 'local')
-            const isOpen = openId === m.id
-            const editingThis = editing?.id === m.id
-            const approvalNote = m.approvalStatus === 'pending'
-              ? '待审批 · '
-              : m.approvalStatus === 'rejected' ? '已拒绝 · ' : ''
             return (
-              <div
+              <McpServerRow
                 key={m.id}
-                className={`cli-card mcp-card${isOpen ? ' is-open' : ''}${m.enabled ? '' : ' is-off'}`}
+                server={m}
+                open={isOpen}
+                pending={pending}
+                onToggleOpen={() => setOpenId(isOpen ? null : m.id)}
+                onToggleEnabled={() => onToggle(m)}
               >
-                <div
-                  role="button"
-                  tabIndex={0}
-                  className="cli-card-hit"
-                  aria-expanded={isOpen}
-                  onClick={() => setOpenId(isOpen ? null : m.id)}
-                  onKeyDown={(e) => {
-                    if (e.key === 'Enter' || e.key === ' ') {
-                      e.preventDefault()
-                      setOpenId(isOpen ? null : m.id)
-                    }
-                  }}
-                >
-                  <span className="mcp-card-icon" aria-hidden="true">
-                    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8"
-                         strokeLinecap="round" strokeLinejoin="round">
-                      <rect x="3.5" y="4.5" width="17" height="6" rx="2" />
-                      <rect x="3.5" y="13.5" width="17" height="6" rx="2" />
-                      <path d="M7 7.5h.01M7 16.5h.01" />
-                    </svg>
-                  </span>
-                  <span className="cli-card-body">
-                    <span className="cli-card-name">
-                      <span className="cli-card-title">{display}</span>
-                      <span className="cli-card-divider" aria-hidden="true">·</span>
-                      <span className="cli-card-tagline">{type} · {scopeText}</span>
-                      {isConnected && <span className="cli-dot" title="已连接" aria-hidden="true" />}
-                    </span>
-                    <span className="cli-card-meta">
-                      {approvalNote}{m.enabled && m.autoStart ? '自启 · ' : ''}{conn.label} · {desc}
-                    </span>
-                  </span>
-                  <svg
-                    className="cli-card-chevron"
-                    viewBox="0 0 12 12"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="1.6"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden="true"
-                  >
-                    <path d="M3 4.5L6 7.5L9 4.5" />
-                  </svg>
-                </div>
-
-                {/* 启用开关放在点击区外：它是独立动作，嵌在整行点击区里容易误触 */}
-                <div className="mcp-card-tail">
-                  <span className="mcp-switch-label">启用</span>
-                  <label className="settings-switch" title={m.enabled ? '停用' : '启用'}>
-                    <input
-                      type="checkbox"
-                      checked={m.enabled}
-                      onChange={() => onToggle(m)}
-                      disabled={pending}
-                    />
-                    <span></span>
-                  </label>
-                </div>
-
-                {isOpen && (
-                  <div className="cli-config">
-                    {editingThis ? (
-                      <>
-                        <div className="cli-config-head">
-                          <span className="cli-config-name">编辑服务器</span>
-                        </div>
-                        <div className="mcp-form-wrap">{renderForm()}</div>
-                      </>
-                    ) : (
-                      <>
-                        <div className="cli-config-head">
-                          <span className="mcp-detail-badges">
-                            {m.approvalStatus && m.approvalStatus !== 'approved' && (
-                              <span className={`mcp-badge approval ${approval.cls}`}>{approval.label}</span>
-                            )}
-                            <span
-                              className={`mcp-badge conn ${conn.cls}`}
-                              title={m.runtimeStatus
-                                ? '运行时连接状态（后端现算，不落库）'
-                                : '连接状态（后端未返回 runtimeStatus，按三态映射）'}
-                            >
-                              <span className="mcp-badge-dot" />
-                              {conn.label}
-                            </span>
-                          </span>
-                          <div className="mcp-card-actions">
-                            {isConnected ? (
-                              <button className="cli-card-action" onClick={() => onStop(m)} disabled={pending}>
-                                停止
-                              </button>
-                            ) : (
-                              <button
-                                className="cli-card-action"
-                                onClick={() => onStart(m)}
-                                disabled={pending || m.status === 'pending'}
-                                title={m.status === 'pending' ? '待审批，需先通过后才能启动' : '启动'}
+                {editingThis ? (
+                  <>
+                    <div className="cli-config-head">
+                      <span className="cli-config-name">编辑服务器</span>
+                    </div>
+                    <div className="mcp-form-wrap">
+                      <McpServerForm
+                        key={editing?.id ?? 'new'}
+                        pending={pending}
+                        editing={editing}
+                        onSubmit={onFormSubmit}
+                        onCancel={closeForm}
+                        showToast={showToast}
+                      />
+                    </div>
+                  </>
+                ) : (
+                  <>
+                    <div className="cli-config-head">
+                      <span className="mcp-detail-badges">
+                        {m.approvalStatus && m.approvalStatus !== 'approved' && (
+                          <span className={`mcp-badge approval ${approval.cls}`}>{approval.label}</span>
+                        )}
+                        <span
+                          className={`mcp-badge conn ${conn.cls}`}
+                          title={m.runtimeStatus
+                            ? '运行时连接状态（后端现算，不落库）'
+                            : '连接状态（后端未返回 runtimeStatus，按三态映射）'}
+                        >
+                          <span className="mcp-badge-dot" />
+                          {conn.label}
+                        </span>
+                      </span>
+                      <div className="mcp-card-actions">
+                        {isConnected ? (
+                          <button className="cli-card-action" onClick={() => onStop(m)} disabled={pending}>
+                            停止
+                          </button>
+                        ) : (
+                          <button
+                            className="cli-card-action"
+                            onClick={() => onStart(m)}
+                            disabled={pending || m.status === 'pending'}
+                            title={m.status === 'pending' ? '待审批，需先通过后才能启动' : '启动'}
+                          >
+                            启动
+                          </button>
+                        )}
+                        <button className="cli-card-action" onClick={() => onTest(m)} disabled={pending}>
+                          测试
+                        </button>
+                      </div>
+                    </div>
+                    <div className="mcp-detail">
+                      {m.lastError && <div className="mcp-detail-error">✗ {m.lastError}</div>}
+                      <div className="mcp-detail-cmd" title={desc}>{desc}</div>
+                      {/* 最近一次测试结果 + 真实工具清单（后端 /test 的 tools: string[]） */}
+                      {lastTest[m.id] && (
+                        <div className="mcp-detail-row" data-testid="mcp-test-result">
+                          <div style={{ flex: 1, minWidth: 0 }}>
+                            <div className="mcp-detail-label">最近一次测试</div>
+                            <div className="mcp-detail-desc">
+                              {lastTest[m.id].ok
+                                ? `通过${lastTest[m.id].latencyMs != null ? ` · ${lastTest[m.id].latencyMs}ms` : ''}：${lastTest[m.id].message}`
+                                : `失败：${lastTest[m.id].message}`}
+                            </div>
+                            {lastTest[m.id].tools.length > 0 && (
+                              <ul
+                                data-testid="mcp-test-tools"
+                                style={{ listStyle: 'none', margin: '4px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 3 }}
                               >
-                                启动
-                              </button>
+                                {lastTest[m.id].tools.map((t) => (
+                                  <li key={t} style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-subtle)' }}>
+                                    {t}
+                                  </li>
+                                ))}
+                              </ul>
                             )}
-                            <button className="cli-card-action" onClick={() => onTest(m)} disabled={pending}>
-                              测试
-                            </button>
                           </div>
                         </div>
-                        <div className="mcp-detail">
-                          {m.lastError && <div className="mcp-detail-error">✗ {m.lastError}</div>}
-                          <div className="mcp-detail-cmd">{desc}</div>
-                          {/* 最近一次测试结果 + 真实工具清单（后端 /test 的 tools: string[]） */}
-                          {lastTest[m.id] && (
-                            <div className="mcp-detail-row" data-testid="mcp-test-result">
-                              <div style={{ flex: 1, minWidth: 0 }}>
-                                <div className="mcp-detail-label">最近一次测试</div>
-                                <div className="mcp-detail-desc">
-                                  {lastTest[m.id].ok
-                                    ? `通过${lastTest[m.id].latencyMs != null ? ` · ${lastTest[m.id].latencyMs}ms` : ''}：${lastTest[m.id].message}`
-                                    : `失败：${lastTest[m.id].message}`}
-                                </div>
-                                {lastTest[m.id].tools.length > 0 && (
-                                  <ul
-                                    data-testid="mcp-test-tools"
-                                    style={{ listStyle: 'none', margin: '4px 0 0', padding: 0, display: 'flex', flexDirection: 'column', gap: 3 }}
-                                  >
-                                    {lastTest[m.id].tools.map((t) => (
-                                      <li key={t} style={{ fontFamily: 'var(--font-mono)', fontSize: 11.5, color: 'var(--ink-subtle)' }}>
-                                        {t}
-                                      </li>
-                                    ))}
-                                  </ul>
-                                )}
-                              </div>
-                            </div>
-                          )}
-                          {/* 远程 server 的 OAuth 授权/断开（start→浏览器→轮询；行内二次确认） */}
-                          {remote && (
-                            <McpOauthRow
-                              server={m}
-                              statusLabel={conn.label}
-                              showToast={showToast}
-                              onChanged={refresh}
-                            />
-                          )}
-                          <div className="mcp-detail-row">
-                            <div>
-                              <div className="mcp-detail-label">启动时自动连接</div>
-                              <div className="mcp-detail-desc">
-                                开启后，应用启动时会自动连上这个服务；关闭则每次手动启动。
-                                {!m.enabled && '（先启用该服务器）'}
-                              </div>
-                            </div>
-                            <label
-                              className="settings-switch"
-                              title={m.enabled ? '启动时自动连接此服务（全局总闸关闭时仍不会连）' : '先启用该服务器才能设置启动自启'}
-                            >
-                              <input
-                                type="checkbox"
-                                checked={!!m.autoStart && m.enabled}
-                                onChange={() => onToggleAutoStart(m)}
-                                disabled={pending || !m.enabled}
-                              />
-                              <span></span>
-                            </label>
-                          </div>
-                          <div className="mcp-detail-foot">
-                            <button className="cli-card-action" onClick={() => startEdit(m)} disabled={pending}>
-                              编辑
-                            </button>
-                            <span className="spacer" />
-                            <button className="mcp-text-btn danger" onClick={() => onRemove(m)} disabled={pending}>
-                              删除
-                            </button>
+                      )}
+                      {/* 远程 server 的 OAuth 授权/断开（start→浏览器→轮询；行内二次确认） */}
+                      {remote && (
+                        <McpOauthRow
+                          server={m}
+                          statusLabel={conn.label}
+                          showToast={showToast}
+                          onChanged={refresh}
+                        />
+                      )}
+                      <div className="mcp-detail-row">
+                        <div>
+                          <div className="mcp-detail-label">启动时自动连接</div>
+                          <div className="mcp-detail-desc">
+                            开启后，应用启动时会自动连上这个服务；关闭则每次手动启动。
+                            {!m.enabled && '（先启用该服务器）'}
                           </div>
                         </div>
-                      </>
-                    )}
-                  </div>
+                        <label
+                          className="settings-switch"
+                          title={m.enabled ? '启动时自动连接此服务（全局总闸关闭时仍不会连）' : '先启用该服务器才能设置启动自启'}
+                        >
+                          <input
+                            type="checkbox"
+                            checked={!!m.autoStart && m.enabled}
+                            onChange={() => onToggleAutoStart(m)}
+                            disabled={pending || !m.enabled}
+                          />
+                          <span></span>
+                        </label>
+                      </div>
+                      <div className="mcp-detail-foot">
+                        <button className="cli-card-action" onClick={() => startEdit(m)} disabled={pending}>
+                          编辑
+                        </button>
+                        <span className="spacer" />
+                        <button className="mcp-text-btn danger" onClick={() => onRemove(m)} disabled={pending}>
+                          删除
+                        </button>
+                      </div>
+                    </div>
+                  </>
                 )}
-              </div>
+              </McpServerRow>
             )
           })}
         </div>

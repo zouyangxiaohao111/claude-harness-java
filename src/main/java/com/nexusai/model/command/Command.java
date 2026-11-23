@@ -97,6 +97,8 @@ public class Command {
 
     private String description;
     private String version;
+    /** [2026-11-23 技能图标] 可选图标 URL（frontmatter {@code icon}；null = 前端统一兜底图标）。 */
+    private String icon;
 
     // ════════════════════════════════════════════════════════════════════════
     // 来源分类（CC CommandBase.loadedFrom + PromptCommand.source）
@@ -318,6 +320,8 @@ public class Command {
     public void setDescription(String description) { this.description = description; }
     public String getVersion() { return version; }
     public void setVersion(String version) { this.version = version; }
+    public String getIcon() { return icon; }
+    public void setIcon(String icon) { this.icon = icon; }
 
     public String getType() { return type; }
     public void setType(String type) { this.type = type; }

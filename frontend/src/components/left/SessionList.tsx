@@ -47,7 +47,7 @@ interface SessionListProps {
   projectCreatedAtFor?: (projectId: string | null) => string | undefined
   onCreateInProject?: (projectId: string | null) => void
   onCreateSession?: () => void
-  /** 点击左栏「技能市场」入口 → 打开技能市场弹窗（App 持有 showMarket state） */
+  /** 点击左栏「专家 · 技能 · 连接器」入口 → 主区换页到市场整页（App 的 workspacePage='market'） */
   onOpenAgentMarket?: () => void
   /** 点击左栏「知识库」入口 → 打开知识库/记忆（App 处理，暂占位） */
   onOpenKnowledgeBase?: () => void
@@ -102,6 +102,8 @@ interface SessionListProps {
   onOpenIm?: () => void
   /** IM 频道页是否当前激活（导航项高亮） */
   imActive?: boolean
+  /** 市场整页（专家/技能/连接器）是否当前激活（导航项高亮） */
+  marketActive?: boolean
   /**
    * 有 IM 接线的会话 id 集合 —— 用于左栏「IM 会话」块。
    *
@@ -184,6 +186,7 @@ function formatRunElapsed(ms: number): string {
 export function SessionList({ sessions, activeSession, switchSession, projectPathFor, projectNameFor, projectCreatedAtFor, onCreateInProject, onCreateSession, onAddWorkspace, onDeleteSession, onRenameSession, onPinSession, runningSessionIds, pendingSessionIds, doneUnreadIds, peerPendingCounts, peerTotalPending, onOpenPeerInbox, onOpenPeerPending, onOpenAgentMarket, onOpenKnowledgeBase, onToggleCollapse, collapsed, flatHistory, workspaceRedesign, onOpenSettings, onOpenSearch, onOpenSchedules,
   onOpenIm,
   imActive,
+  marketActive,
   imSessionIds, schedulesActive, groupsDefaultCollapsed, onDuplicateSession, showToast }: SessionListProps) {
   const [collapsedGroups, setCollapsedGroups] = useState<Set<string>>(new Set())
   // 默认折叠口径：只记录**用户/自动展开过**的组（collapsedGroups 的反面）。
@@ -612,10 +615,13 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         </button>
       )}
 
-      <div className="left-entry" onClick={() => onOpenAgentMarket?.()} title="打开技能市场">
+      <div
+        className={`left-entry ws-nav-market${marketActive ? ' on' : ''}`}
+        onClick={() => onOpenAgentMarket?.()}
+        title="打开市场（专家 / 技能 / 连接器）"
+      >
         <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}><circle cx="12" cy="10" r="3.4" /><path d="M4.5 20c.9-3 4-4.4 7.5-4.4s6.6 1.4 7.5 4.4" /></svg>
-        <span className="ent-t">技能市场</span>
-        <span className="ent-arr">›</span>
+        <span className="ent-t">专家 · 技能 · 连接器</span>
       </div>
       <div className="left-entry" onClick={() => onOpenKnowledgeBase?.()} title="打开知识库">
         <svg className="ent-ic" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={1.6}><ellipse cx="12" cy="5.5" rx="7" ry="3" /><path d="M5 5.5v13c0 1.7 3.1 3 7 3s7-1.3 7-3v-13" /><path d="M5 12c0 1.7 3.1 3 7 3s7-1.3 7-3" /></svg>

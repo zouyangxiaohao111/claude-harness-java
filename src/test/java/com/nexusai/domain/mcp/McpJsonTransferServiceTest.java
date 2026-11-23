@@ -3,7 +3,9 @@ package com.nexusai.domain.mcp;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ObjectNode;
+import com.nexusai.domain.mcp_oauth.McpOAuthTokenService;
 import com.nexusai.infra.exception.ValidationException;
+import com.nexusai.model.mcp_oauth.McpOAuthToken;
 import com.nexusai.repository.mcp.entity.McpServerRecord;
 import com.nexusai.repository.mcp.mapper.McpServerMapper;
 import org.junit.jupiter.api.BeforeEach;
@@ -36,23 +38,41 @@ class McpJsonTransferServiceTest {
     Path temp;
 
     private McpServerMapper mapper;
+    private McpOAuthTokenService tokenService;
     private McpJsonTransferService service;
 
     @BeforeEach
     void setUp() {
         mapper = mock(McpServerMapper.class);
-        service = new McpJsonTransferService(mapper);
+        tokenService = mock(McpOAuthTokenService.class);
+        service = new McpJsonTransferService(mapper, tokenService);
         service.setBackupDirForTests(temp.resolve("backups"));
+    }
+
+    private static String mirror(String json) {
+        return java.util.Base64.getEncoder().encodeToString(
+                json.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+    }
+
+    private static McpOAuthToken secretToken(String secret) {
+        McpOAuthToken t = new McpOAuthToken();
+        t.setClientSecret(secret);
+        return t;
     }
 
     @Test
     @DisplayName("导出：env/header 值掩码（****末4），URL 敏感 query 参数掩码，剥 __mcp_oauth__，仅 stdio/http/sse")
     void exportMasks() {
+        when(tokenService.read(anyString())).thenReturn(secretToken("supersecret9876"));
         when(mapper.selectAll()).thenReturn(List.of(
                 row("s1", "stdio", "/bin/x", "[\"--t=1\"]",
                         "{\"API_KEY\":\"abcd1234\",\"DEBUG\":\"1\"}", true, true, "user"),
                 row("s2", "http", "https://mcp.example/mcp?key=SECRET1234&x=1",
-                        null, "{\"X-Lark-MCP-UAT\":\"uat-abcd\",\"__mcp_oauth__\":\"b64\"}",
+                        null, "{\"X-Lark-MCP-UAT\":\"uat-abcd\",\"__mcp_oauth__\":\""
+                                + mirror("{\"clientId\":\"cid-1\",\"scopes\":\"read write\","
+                                + "\"authorizationEndpoint\":\"https://as/a\","
+                                + "\"tokenEndpoint\":\"https://as/t\",\"callbackPort\":\"38001\"}")
+                                + "\"}",
                         true, false, "user"),
                 row("s3", "ws", "wss://x", null, null, true, true, "user")));
 
@@ -68,6 +88,53 @@ class McpJsonTransferServiceTest {
         assertThat(servers.path("s2").path("headers").path("X-Lark-MCP-UAT").asText())
                 .isEqualTo("****abcd");
         assertThat(servers.path("s1").path("scope").asText()).isEqualTo("user");
+        // OAuth 元数据往返：镜像字段 + keychain secret 只掩码
+        JsonNode oauth = servers.path("s2").path("oauth");
+        assertThat(oauth.path("clientId").asText()).isEqualTo("cid-1");
+        assertThat(oauth.path("scopes").asText()).isEqualTo("read write");
+        assertThat(oauth.path("authorizationEndpoint").asText()).isEqualTo("https://as/a");
+        assertThat(oauth.path("tokenEndpoint").asText()).isEqualTo("https://as/t");
+        assertThat(oauth.path("callbackPort").asText()).isEqualTo("38001");
+        assertThat(oauth.path("clientSecret").asText()).isEqualTo("****9876");
+    }
+
+    @Test
+    @DisplayName("OAuth 掩码 clientSecret：更新时保留原值，不落库、不覆盖")
+    void oauthMaskedSecretKept() {
+        McpServerRecord existing = row("o1", "http", "https://o/mcp", null,
+                "{\"__mcp_oauth__\":\"" + mirror("{\"clientId\":\"cid-9\"}") + "\"}",
+                true, true, "user");
+        when(mapper.selectAll()).thenReturn(List.of(existing));
+        when(tokenService.read(anyString())).thenReturn(secretToken("real-secret-9876"));
+
+        JsonNode body = json("""
+                {"mcpServers":{"o1":{"type":"http","url":"https://o/mcp","enabled":false,
+                  "oauth":{"clientId":"cid-9","clientSecret":"****9876","scopes":"read"}}}}
+                """);
+        service.importJson(body);
+
+        ArgumentCaptor<McpServerRecord> captor = ArgumentCaptor.forClass(McpServerRecord.class);
+        verify(mapper).updateByQuery(captor.capture(),
+                org.mockito.ArgumentMatchers.eq(false),
+                any(com.mybatisflex.core.query.QueryWrapper.class));
+        String env = captor.getValue().getEnv();
+        assertThat(env).doesNotContain("real-secret-9876").doesNotContain("****9876");
+        assertThat(env).contains("__mcp_oauth__");
+        verify(tokenService, never()).saveClientSecret(anyString(), anyString());
+    }
+
+    @Test
+    @DisplayName("新增 OAuth 带掩码 clientSecret → 400（只能走表单）")
+    void newOauthMaskedSecretRejected() {
+        when(mapper.selectAll()).thenReturn(List.of());
+        JsonNode body = json("""
+                {"mcpServers":{"n1":{"type":"http","url":"https://n/mcp",
+                  "oauth":{"clientId":"cid","clientSecret":"****1234"}}}}
+                """);
+        assertThatThrownBy(() -> service.importJson(body))
+                .isInstanceOf(ValidationException.class)
+                .hasMessageContaining("新增 OAuth 请用表单");
+        verify(mapper, never()).insert(any(McpServerRecord.class));
     }
 
     @Test

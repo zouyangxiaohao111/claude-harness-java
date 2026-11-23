@@ -329,7 +329,7 @@ interface ComposerProps {
   onClearAgent?: () => void
   /** 斜杠前缀 chip 的显示别名（召唤技能时带中文显示名；仅当前缀名匹配时生效） */
   slashAlias?: { name: string; display: string } | null
-  /** 左下角 + 菜单「专家/技能/连接器」→ 打开技能市场弹窗并切到对应 tab（App 持有 showMarket state） */
+  /** 左下角 + 菜单「专家/技能/连接器」→ 主区换页到市场整页并切到对应 tab */
   onOpenMarket?: (tab?: 'expert' | 'skill' | 'connector') => void
   /** 设定目标（+ 菜单「目标」→ 面板提交）：App 走 runBuiltin('goal', condition) */
   onSetGoal?: (condition: string) => Promise<void>

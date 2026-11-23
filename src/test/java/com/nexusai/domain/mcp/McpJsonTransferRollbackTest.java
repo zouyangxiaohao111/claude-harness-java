@@ -103,7 +103,8 @@ class McpJsonTransferRollbackTest {
                     }
                 });
 
-        McpJsonTransferService service = new McpJsonTransferService(failing);
+        McpJsonTransferService service = new McpJsonTransferService(failing,
+                org.mockito.Mockito.mock(com.nexusai.domain.mcp_oauth.McpOAuthTokenService.class));
         service.setBackupDirForTests(temp.resolve("backups"));
         String payload = """
                 {"mcpServers":{

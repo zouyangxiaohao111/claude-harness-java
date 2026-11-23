@@ -57,20 +57,22 @@ describe('SkillMarketModal icon', () => {
     expect(img.src).toContain('http://m/i.svg')
   })
 
-  it('falls back to initial when no icon', async () => {
+  it('缺少 icon 时按分类生成线性图标（不再用统一紫色兜底图，也不是首字母）', async () => {
     await openSkillTab()
     const ico = card('NoIcon').querySelector('.sk-ico')!
+    expect(ico.classList.contains('sk-ico-gen')).toBe(true)
+    expect(ico.querySelector('svg')).toBeTruthy()
     expect(ico.querySelector('img')).toBeNull()
-    expect(ico.textContent).toBe('N')
   })
 
-  it('falls back after image load error', async () => {
+  it('icon 加载失败后同样回落到分类生成的线性图标', async () => {
     await openSkillTab()
     const img = card('WithIcon').querySelector('.sk-ico img')!
     act(() => { img.dispatchEvent(new Event('error', { bubbles: false })) })
     await flush()
-    const ico = card('WithIcon').querySelector('.sk-ico')!
-    expect(ico.querySelector('img')).toBeNull()
-    expect(ico.textContent).toBe('W')
+    const after = card('WithIcon').querySelector('.sk-ico')!
+    expect(after.classList.contains('sk-ico-gen')).toBe(true)
+    expect(after.querySelector('svg')).toBeTruthy()
+    expect(after.querySelector('img')).toBeNull()
   })
 })

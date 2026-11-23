@@ -1,0 +1,13 @@
+# 有意改名/删除的已提交迁移（check-migrations.sh 第 2 项的审计例外）
+#
+# 格式：<原文件名>  # <理由>
+# ⛔ 只有在「回滚一次错误的改号」时才允许加行；正常开发一律用 scripts/next-migration.sh 取新号。
+#
+# ── 2026-11-23 回滚「已发布迁移被改号」事故 ─────────────────────────────
+# 0.1.83 已把 add_settings 编成 V302 发布；之后 master 把它改号成 V320、并把 V302 让给
+# create_im_channel ⇒ 任何从 0.1.83 升级的机器启动即 Flyway checksum mismatch。
+# 修复：恢复 V302=add_settings（逐字节取 tag v0.1.83），把抢号的两个迁移挪到 V338/V339，
+# 删除重复的 V320。以下三条是本轮回滚的**唯一**例外。
+V301__create_wechat_log_index.sql  # 改为 V338__create_wechat_log_index.sql（0.1.83 未包含此迁移，挪号不影响老库）
+V302__create_im_channel_instance.sql  # 改为 V339__create_im_channel_instance.sql（释放 V302 归还 add_settings）
+V320__add_settings_show_clear_context_on_plan_accept.sql  # 删除（与恢复后的 V302 是同一条 SQL，重复）

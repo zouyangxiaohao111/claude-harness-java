@@ -26,7 +26,7 @@ const {
   listAgentsMock, listInstalledMock, listInstalledDetailsMock, listCommandsMock, listExternalMock,
   installMock, getProgressMock,
   connListMock, connStartMock, connPollMock, connStatusMock, connCredMock, connTestMock, connDisconnectMock,
-  openExternalMock, mcpListMock,
+  openExternalMock, mcpListMock, mcpCreateMock, mcpRemoveMock, mcpExportMock, mcpImportMock,
 } = vi.hoisted(() => ({
   listAgentsMock: vi.fn(),
   listInstalledMock: vi.fn(),
@@ -44,9 +44,16 @@ const {
   connDisconnectMock: vi.fn(),
   openExternalMock: vi.fn(),
   mcpListMock: vi.fn(),
+  mcpCreateMock: vi.fn(),
+  mcpRemoveMock: vi.fn(),
+  mcpExportMock: vi.fn(),
+  mcpImportMock: vi.fn(),
 }))
 
-vi.mock('@/api/mcp', () => ({ mcpApi: { list: mcpListMock } }))
+vi.mock('@/api/mcp', () => ({ mcpApi: {
+  list: mcpListMock, create: mcpCreateMock, remove: mcpRemoveMock,
+  exportServers: mcpExportMock, importJson: mcpImportMock,
+} }))
 
 vi.mock('@/api/agent', () => ({ agentApi: { listAgents: listAgentsMock } }))
 vi.mock('@/api/market', () => ({
@@ -142,6 +149,10 @@ beforeEach(() => {
   connDisconnectMock.mockReset()
   openExternalMock.mockReset(); openExternalMock.mockResolvedValue(true)
   mcpListMock.mockReset(); mcpListMock.mockResolvedValue([])
+  mcpCreateMock.mockReset()
+  mcpRemoveMock.mockReset()
+  mcpExportMock.mockReset(); mcpExportMock.mockResolvedValue({ mcpServers: { s1: { type: 'stdio', command: 'npx x' } } })
+  mcpImportMock.mockReset()
 })
 
 afterEach(() => {
@@ -195,6 +206,22 @@ function unmountFrom(m: { el: HTMLDivElement; root: Root }) {
 function btnWithText(root: ParentNode, text: string): HTMLButtonElement | undefined {
   return Array.from(root.querySelectorAll('button'))
     .find((b) => (b.textContent ?? '').includes(text)) as HTMLButtonElement | undefined
+}
+
+/**
+ * 2026-11-23 设计稿：点卡片先打开居中详情弹窗，再点「连接 / 管理连接」进入授权抽屉。
+ * 这个 helper 把两步串起来，保持既有抽屉用例的语义。
+ */
+async function openDrawerOf(card: HTMLElement): Promise<HTMLElement> {
+  act(() => card.click())
+  await flush()
+  const go = container!.querySelector('.cd-primary') as HTMLButtonElement | null
+  expect(go, '连接器详情弹窗缺少连接按钮').toBeTruthy()
+  act(() => go!.click())
+  await flush()
+  const drawer = container!.querySelector('[data-testid="connector-drawer"]') as HTMLElement | null
+  expect(drawer, '未打开授权抽屉').toBeTruthy()
+  return drawer!
 }
 
 function cardOf(authType: string): HTMLElement {
@@ -317,12 +344,9 @@ describe('SkillMarketModal · 连接器市场', () => {
     await flush()
     await openConnectorTab()
 
-    act(() => { cardOf('oauth2').click() })
-    await flush()
-    const drawer = container!.querySelector('[data-testid="connector-drawer"]')
-    expect(drawer, '未打开授权抽屉').toBeTruthy()
+    const drawer = await openDrawerOf(cardOf('oauth2'))
 
-    const startBtn = Array.from(drawer!.querySelectorAll('button'))
+    const startBtn = Array.from(drawer.querySelectorAll('button'))
       .find((b) => (b.textContent ?? '').includes('开始授权')) as HTMLButtonElement
     expect(startBtn).toBeTruthy()
     act(() => { startBtn.click() })
@@ -357,9 +381,7 @@ describe('SkillMarketModal · 连接器市场', () => {
     renderModal()
     await flush()
     await openConnectorTab()
-    act(() => { cardOf('oauth2').click() })
-    await flush()
-    const drawer = container!.querySelector('[data-testid="connector-drawer"]')!
+    const drawer = await openDrawerOf(cardOf('oauth2'))
     const startBtn = Array.from(drawer.querySelectorAll('button'))
       .find((b) => (b.textContent ?? '').includes('开始授权')) as HTMLButtonElement
     act(() => { startBtn.click() })
@@ -390,9 +412,8 @@ describe('SkillMarketModal · 连接器市场', () => {
     await flush()
     await openConnectorTab()
 
-    act(() => { cardOf('oauth2').click() })
-    await flush()
-    const testBtn = Array.from(container!.querySelectorAll('[data-testid="connector-drawer"] button'))
+    const drawer = await openDrawerOf(cardOf('oauth2'))
+    const testBtn = Array.from(drawer.querySelectorAll('button'))
       .find((b) => (b.textContent ?? '').includes('测试连接')) as HTMLButtonElement
     expect(testBtn).toBeTruthy()
     act(() => { testBtn.click() })
@@ -617,7 +638,7 @@ describe('SkillMarketModal · 连接器市场', () => {
     expect(card.querySelector('.mc-desc')).toBeTruthy()
   })
 
-  it('三子 tab：已启用只显示已连接；自定义列出非目录 MCP server', async () => {
+  it('两子 tab + 唯一「自定义连接器」入口：已启用只显示已连接，点击打开弹窗', async () => {
     connListMock.mockResolvedValue({
       connectors: [{ ...NOTION, connected: true, status: 'connected' }, OFFICE_CONN],
     })
@@ -638,10 +659,16 @@ describe('SkillMarketModal · 连接器市场', () => {
     expect(cards()).toHaveLength(1)
     expect(cards()[0].dataset.connectorKey).toBe('notion')
 
-    act(() => { tabOf('自定义').click() })
+    // ⛔ 只保留一个「自定义连接器」入口（旧的「+ 添加连接器」不再出现在连接器页）
+    const customButtons = Array.from(container!.querySelectorAll('button'))
+      .filter((b) => (b.textContent ?? '').includes('自定义连接器'))
+    expect(customButtons, '连接器页「自定义连接器」按钮必须恰好 1 个').toHaveLength(1)
+
+    act(() => { customButtons[0].click() })
     await flush()
+    expect(container!.querySelector('[data-testid="custom-connector-dialog"]')).toBeTruthy()
     expect(mcpListMock).toHaveBeenCalledTimes(1)
-    const rows = Array.from(container!.querySelectorAll('[data-testid="custom-mcp-row"]'))
+    const rows = Array.from(container!.querySelectorAll('[data-testid="custom-connector-row"]'))
     // notion 是目录里的 key（由连接器授权产生）⇒ 自定义里排除
     expect(rows).toHaveLength(1)
     expect(rows[0].textContent).toContain('my-server')
@@ -680,15 +707,13 @@ describe('SkillMarketModal · 连接器市场', () => {
     await flush()
     await openConnectorTab()
 
-    act(() => { (container!.querySelector('[data-connector-key="notion"]') as HTMLElement).click() })
-    await flush()
-    expect(container!.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('未连接')
-    act(() => { (container!.querySelector('.mc-x') as HTMLElement).click() })
+    const drawer1 = await openDrawerOf(container!.querySelector('[data-connector-key="notion"]') as HTMLElement)
+    expect(drawer1.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('未连接')
+    act(() => { (drawer1.querySelector('.mc-x') as HTMLElement).click() })
     await flush()
 
-    act(() => { (container!.querySelector('[data-connector-key="off2"]') as HTMLElement).click() })
-    await flush()
-    expect(container!.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('已授权')
+    const drawer2 = await openDrawerOf(container!.querySelector('[data-connector-key="off2"]') as HTMLElement)
+    expect(drawer2.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('已授权')
   })
 
   it('ESC 关闭抽屉', async () => {
@@ -696,9 +721,7 @@ describe('SkillMarketModal · 连接器市场', () => {
     renderModal()
     await flush()
     await openConnectorTab()
-    act(() => { cardOf('oauth2').click() })
-    await flush()
-    expect(container!.querySelector('[data-testid="connector-drawer"]')).toBeTruthy()
+    await openDrawerOf(cardOf('oauth2'))
 
     act(() => { window.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape' })) })
     await flush()
@@ -712,10 +735,9 @@ describe('SkillMarketModal · 连接器市场', () => {
     renderModal()
     await flush()
     await openConnectorTab()
-    act(() => { cardOf('oauth2').click() })
-    await flush()
+    const drawer = await openDrawerOf(cardOf('oauth2'))
 
-    expect(container!.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('需重新授权')
+    expect(drawer.querySelector('[data-testid="drawer-status"]')!.textContent).toContain('需重新授权')
     expect(container!.querySelector('[data-testid="connector-reauth"]')!.textContent).toContain('授权已失效')
     expect(btnWithText(container!.querySelector('[data-testid="connector-drawer"]')!, '重新授权')).toBeTruthy()
   })
@@ -832,9 +854,8 @@ describe('SkillMarketModal · 连接器市场', () => {
     await openConnectorTab()
     expect(cards()[0].textContent).toContain('官方 MCP')
 
-    act(() => { cardOf('oauth2').click() })
-    await flush()
-    expect(container!.querySelector('[data-testid="connector-drawer"]')!.textContent).toContain('官方 MCP')
+    const drawer = await openDrawerOf(cardOf('oauth2'))
+    expect(drawer.textContent).toContain('官方 MCP')
   })
 
   it('authMode=bearer：单个 Token 输入 + Bearer 说明', async () => {
@@ -912,5 +933,108 @@ describe('SkillMarketModal · 连接器市场', () => {
     } finally {
       unmountFrom(m)
     }
+  })
+
+  it('自定义连接器 JSON 模式：非法 JSON 禁存；合法才可导入', async () => {
+    mcpImportMock.mockResolvedValue({ added: 1, updated: 0, removed: 0, unchanged: 0 })
+    connListMock.mockResolvedValue({ connectors: [] })
+    renderModal()
+    await flush()
+    await openConnectorTab()
+    const openBtn = Array.from(container!.querySelectorAll('button'))
+      .find((b) => (b.textContent ?? '').includes('自定义连接器'))!
+    act(() => { openBtn.click() })
+    await flush()
+
+    const jsonTab = Array.from(container!.querySelectorAll('.mc-dlg-tabs button'))
+      .find((b) => (b.textContent ?? '').includes('JSON')) as HTMLButtonElement
+    act(() => { jsonTab.click() })
+    await flush()
+    // 导出结果进编辑框
+    expect(mcpExportMock).toHaveBeenCalledTimes(1)
+    const area = container!.querySelector('[data-testid="custom-connector-json"]') as HTMLTextAreaElement
+    expect(area.value).toContain('mcpServers')
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLTextAreaElement.prototype, 'value')!.set!
+    const saveBtn = () => container!.querySelector('[data-testid="custom-connector-json-save"]') as HTMLButtonElement
+
+    act(() => { setter.call(area, '{ bad json'); area.dispatchEvent(new Event('input', { bubbles: true })) })
+    await flush()
+    expect(saveBtn().disabled).toBe(true)
+    expect(container!.querySelector('[data-testid="custom-connector-json-err"]')).toBeTruthy()
+
+    act(() => {
+      setter.call(area, JSON.stringify({ mcpServers: { probe: { type: 'http', url: 'https://x' } } }))
+      area.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await flush()
+    expect(saveBtn().disabled).toBe(false)
+
+    act(() => { saveBtn().click() })
+    await flush()
+    expect(mcpImportMock).toHaveBeenCalledTimes(1)
+    expect(mcpImportMock.mock.calls[0][0]).toMatchObject({
+      mcpServers: { probe: { type: 'http', url: 'https://x' } },
+      deleteMissing: false,
+    })
+  })
+
+  it('自定义连接器表单模式：stdio 必填 Command，提交走 mcpApi.create', async () => {
+    connListMock.mockResolvedValue({ connectors: [] })
+    mcpCreateMock.mockResolvedValue({ id: 'n1', name: 'probe' })
+    renderModal()
+    await flush()
+    await openConnectorTab()
+    act(() => {
+      ;(Array.from(container!.querySelectorAll('button'))
+        .find((b) => (b.textContent ?? '').includes('自定义连接器')) as HTMLButtonElement).click()
+    })
+    await flush()
+
+    const formTab = Array.from(container!.querySelectorAll('.mc-dlg-tabs button'))
+      .find((b) => (b.textContent ?? '').includes('表单')) as HTMLButtonElement
+    act(() => { formTab.click() })
+    await flush()
+
+    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')!.set!
+    const nameInput = container!.querySelector('input[data-field="name"]') as HTMLInputElement
+    const cmdInput = Array.from(container!.querySelectorAll('.mc-dlg input')) as HTMLInputElement[]
+    const command = cmdInput.find((i) => (i.placeholder ?? '').includes('server-filesystem'))!
+    act(() => {
+      setter.call(nameInput, 'probe'); nameInput.dispatchEvent(new Event('input', { bubbles: true }))
+      setter.call(command, 'npx -y some-server'); command.dispatchEvent(new Event('input', { bubbles: true }))
+    })
+    await flush()
+
+    const addBtn = Array.from(container!.querySelectorAll('.mc-dlg .mc-df button'))
+      .find((b) => (b.textContent ?? '').trim() === '添加') as HTMLButtonElement
+    act(() => { addBtn.click() })
+    await flush()
+    expect(mcpCreateMock).toHaveBeenCalledTimes(1)
+    expect(mcpCreateMock.mock.calls[0][0]).toMatchObject({ name: 'probe', type: 'stdio', command: 'npx -y some-server' })
+  })
+
+  it('三类卡片共用 market-card-base（与连接器卡同一套样式/字体）', async () => {
+    listExternalMock.mockResolvedValue({
+      name: 'zjky-market',
+      plugins: [
+        { name: 'exp1', displayName: '专家一', description: 'x', category: 'expert', tags: [] },
+        { name: 'sk1', displayName: '技能一', description: 'x', category: 'skill', tags: [] },
+      ],
+    })
+    connListMock.mockResolvedValue({ connectors: [NOTION] })
+    renderModal()
+    await flush()
+    // 专家（默认 tab）
+    expect(container!.querySelector('.sm-expert-card.market-card-base')).toBeTruthy()
+    // 技能
+    const skillTab = Array.from(container!.querySelectorAll('.sm-tab-flat'))
+      .find((b) => (b.textContent ?? '').includes('技能')) as HTMLElement
+    act(() => { skillTab.click() })
+    await flush()
+    expect(container!.querySelector('.sk-card.market-card-base')).toBeTruthy()
+    // 连接器
+    await openConnectorTab()
+    expect(container!.querySelector('.mc-card')).toBeTruthy()
   })
 })

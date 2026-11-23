@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.86] - 2026-11-23
+
+### Added
+
+- 修复 0.1.83 用户升级后因迁移编号变更导致无法启动；新增技能市场页与技能内容预览、自定义连接器
+
 ## [0.1.85] - 2026-11-23
 
 ### Added

@@ -37,6 +37,14 @@ class SkillsLoaderFrontmatterTest {
     }
 
     @Test
+    @DisplayName("icon：frontmatter icon 可选透出；缺失 → null（前端统一兜底图标，⛔ 不回落首字母）")
+    void icon_optional(@TempDir Path skillsRoot) throws Exception {
+        assertThat(load(skillsRoot, "with-icon", "icon: https://m/icons/a.svg\n").getIcon())
+            .isEqualTo("https://m/icons/a.svg");
+        assertThat(load(skillsRoot, "no-icon", "").getIcon()).isNull();
+    }
+
+    @Test
     @DisplayName("name 恒=目录名，displayName=frontmatter.name（CC :452 + :238-239）")
     void nameIsDirName_displayNameIsFrontmatterName(@TempDir Path skillsRoot) throws Exception {
         // frontmatter.name 与目录名不同 → name 仍取目录名，displayName 取 frontmatter.name

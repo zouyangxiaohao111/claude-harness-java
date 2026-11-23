@@ -341,8 +341,8 @@
   transition: background 0.15s, color 0.15s;
 }
 .mc-cat:hover { background: #f0f1f3; color: #111827; }
-/* 选中色对齐 Octop（#e85d75 白字）· 仅连接器 tab 内使用，不影响全局 --accent */
-.mc-cat.active { background: #e85d75; color: #fff; }
+/* 2026-11-23 用户终稿：去掉红色选中态，改为浅灰底 + 深墨加粗（对齐「专家 / 专家团」） */
+.mc-cat.active { background: #eef0ec; color: #202722; font-weight: 650; }
 
 /* ---------- 授权抽屉（照 imc-drawer 视觉语言） ---------- */
 .mc-scrim {
@@ -537,3 +537,68 @@
   font-size: 12px;
   color: var(--error-dark, #8b2d2d);
 }
+
+/* ---------- 共享卡片外壳（专家 / 技能 / 连接器三类统一）----------
+   白底、2px #e5e7eb、radius 12、padding 20、min-height 152、hover 上浮+轻阴影；
+   字体用本仓 font stack（⛔ 不用第三方字体）。连接器卡另有 --connector-accent 品牌色。 */
+.market-card-base,
+.mc-card {
+  font-family: var(--font-sans);
+}
+.market-card-base {
+  background: #ffffff;
+  border: 2px solid #e5e7eb;
+  border-radius: 12px;
+  padding: 20px;
+  min-height: 152px;
+  transition: border-color 0.2s, background 0.2s, transform 0.2s, box-shadow 0.2s;
+}
+.market-card-base:hover,
+.market-card-base:focus-visible {
+  border-color: var(--accent, #0f5fd4);
+  background: color-mix(in srgb, var(--accent, #0f5fd4) 4%, #ffffff);
+  transform: translateY(-2px);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.1);
+}
+.market-card-base .sk-name,
+.market-card-base .sm-card-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: #111827;
+}
+.market-card-base .sk-desc,
+.market-card-base .sm-desc {
+  font-size: 13px;
+  line-height: 1.45;
+  color: #9ca3af;
+}
+
+/* 自定义连接器弹窗 */
+.mc-dlg {
+  position: fixed;
+  left: 50%;
+  top: 50%;
+  transform: translate(-50%, -50%);
+  width: 720px;
+  max-width: 94vw;
+  max-height: 86vh;
+  display: flex;
+  flex-direction: column;
+  background: var(--canvas, #fff);
+  border: 1px solid var(--hairline-strong, #e2e2e2);
+  border-radius: 14px;
+  box-shadow: 0 24px 60px rgba(0, 0, 0, 0.18);
+  z-index: 132;
+  overflow: hidden;
+  font-family: var(--font-sans);
+}
+.mc-dlg-tabs { display: flex; gap: 8px; padding: 12px 18px 0; }
+.mc-dlg .mc-db { flex: 1; min-height: 0; overflow: auto; padding: 16px 18px; }
+.mc-json { font-family: var(--font-mono); font-size: 12px; height: auto; padding: 8px 10px; resize: vertical; }
+
+/* 技能详情：标签 + SKILL.md 预览 */
+.dt-tags-row { display: flex; gap: 6px; flex-wrap: wrap; margin: 8px 0 0; }
+.dt-tag { font-size: 11px; padding: 2px 8px; border-radius: 999px; background: var(--surface-2, #eff2f8); color: var(--ink-subtle, #5f6875); }
+.dt-preview { max-height: 420px; overflow: auto; padding: 12px 14px; background: var(--surface-2, #eff2f8); border-radius: 8px; }
+.dt-preview-state { font-size: 12.5px; color: var(--ink-tertiary, #8a93a2); }
+.dt-preview-error { display: flex; flex-direction: column; gap: 8px; font-size: 12.5px; color: var(--error-dark, #8b2d2d); }

@@ -80,7 +80,7 @@ class CommandControllerListMergeTest {
             c.getEffort(), c.getPaths(), c.getHooks(), c.getContent(), c.getContentPath(),
             c.getBaseDir(), c.getProgressMessage(),
             Boolean.TRUE.equals(c.getEnabled()), Boolean.TRUE.equals(c.getBuiltin()),
-            c.getType(), null); // pluginName：无插件信息时 null（对齐 CommandService.toDto:554-556）
+            c.getType(), null, c.getIcon()); // pluginName：无插件信息时 null（对齐 CommandService.toDto:554-556）
     }
 
     @Test

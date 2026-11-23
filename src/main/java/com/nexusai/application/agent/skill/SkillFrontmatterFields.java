@@ -134,5 +134,11 @@ public record SkillFrontmatterFields(
          * {@code parseShellFrontmatter(frontmatter.shell, resolvedName)}）。
          * 仅 bash/powershell 白名单值；非法 → null（回退 bash）。
          */
-        String shell
+        String shell,
+
+        /**
+         * [2026-11-23 技能图标] 可选图标 URL（frontmatter {@code icon}；不强制）。
+         * null = 前端用统一兜底图标（⛔ 不再回落名字首字母）。
+         */
+        String icon
 ) {}

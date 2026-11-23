@@ -22,6 +22,8 @@ export interface CommandDto {
   isHidden?: boolean
   whenToUse?: string | null
   userInvocable?: boolean
+  /** [2026-11-23 技能图标] 可选图标 URL（SKILL.md frontmatter icon；null = 统一兜底图标） */
+  icon?: string | null
 }
 /** 对齐后端 BuiltInCommandDto 7 字段：type 区分渲染/触发（local=本地命令 / local-jsx=面板 / prompt=提示注入） */
 export interface BuiltInCommandDto {

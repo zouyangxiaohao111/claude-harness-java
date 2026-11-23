@@ -5844,6 +5844,20 @@ html {
   align-self: stretch;
   padding: 0 12px 0 8px;
 }
+/* [2026-11-23 13 寸窄宽必现] 启用开关被长命令挤到下一行。
+   头部（点击区 + 开关）必须是 nowrap 的一整行：左侧 flex:1 min-width:0 允许收缩省略，
+   开关 flex:none + margin-left:auto 固定在最右。展开区 .cli-config 仍是 .cli-card
+   的 flex-basis:100% 子项 —— 换行只允许发生在展开区那一段。 */
+.mcp-card-main {
+  display: flex;
+  align-items: center;
+  flex-wrap: nowrap;
+  width: 100%;
+  min-width: 0;
+}
+.mcp-card-main .cli-card-hit { flex: 1 1 0; min-width: 0; }
+.mcp-card-main .mcp-card-tail { flex: 0 0 auto; margin-left: auto; align-self: center; white-space: nowrap; }
+.mcp-card-main .cli-card-meta { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .mcp-card-actions { display: flex; align-items: center; gap: 8px; }
 .mcp-detail-badges { display: inline-flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 
@@ -11969,7 +11983,8 @@ html {
   transition: all 140ms var(--ease);
 }
 .sm-cat:hover { border-color: var(--accent, #0f5fd4); color: var(--accent, #0f5fd4); }
-.sm-cat.active { background: var(--accent, #0f5fd4); border-color: var(--accent, #0f5fd4); color: #FFFFFF; font-weight: 600; }
+/* 2026-11-23：分类胶囊选中态不再用品牌蓝/红，改浅灰底 + 深墨加粗（对齐专家/专家团子标签） */
+.sm-cat.active { background: #eef0ec; border-color: #eef0ec; color: #202722; font-weight: 650; }
 
 .sm-section-head { display: flex; align-items: center; gap: 8px; margin-top: 6px; }
 .sm-section-title {
@@ -12419,81 +12434,68 @@ html {
 .dt-body { font-size: 13px; line-height: 1.75; color: var(--ink-muted); }
 
 /* ================================================================
-   开发者信息弹窗（.dev-*）· 点详情页「开发者」格打开
+   开发者信息弹窗（.dev-*）· 点卡片作者行 / 详情页「开发者」格打开
+   760 宽 · max-height 80vh · radius 12 · 头部 20 padding · 两列作品网格
    ================================================================ */
 .dev-modal {
-  position: relative; width: 100%; max-width: 520px; max-height: 100%; overflow-y: auto;
-  background: #fff; border-radius: 22px;
-  box-shadow: 0 30px 80px rgba(0,0,0,.26); padding: 26px 26px 22px;
+  position: relative; width: 100%; max-width: 760px; max-height: 80vh;
+  display: flex; flex-direction: column;
+  background: #fff; border-radius: 12px; overflow: hidden;
+  box-shadow: 0 30px 80px rgba(0,0,0,.26);
+  font-family: var(--font-sans);
 }
 .dev-close {
-  position: absolute; top: 18px; right: 18px;
+  position: absolute; top: 16px; right: 16px;
   width: 30px; height: 30px; border: none; background: none;
   color: var(--ink-tertiary); font-size: 17px; cursor: pointer;
   border-radius: 50%; display: inline-flex; align-items: center;
   justify-content: center; font-family: inherit;
 }
 .dev-close:hover { background: var(--surface-2); color: var(--ink); }
-.dev-head { display: flex; flex-direction: column; align-items: center; gap: 11px; padding-bottom: 22px; }
+.dev-head { display: flex; align-items: flex-start; gap: 14px; padding: 20px; }
 .dev-avatar {
-  width: 92px; height: 92px; border-radius: 24px; overflow: hidden;
+  width: 56px; height: 56px; border-radius: 14px; overflow: hidden; flex-shrink: 0;
   display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-size: 36px; font-weight: 700;
-  box-shadow: 0 6px 18px rgba(0,0,0,.16);
+  color: #fff; font-size: 24px; font-weight: 700;
 }
 .dev-avatar img { width: 100%; height: 100%; object-fit: cover; }
-.dev-name { display: flex; align-items: center; gap: 7px; font-size: 21px; font-weight: 700; letter-spacing: -0.02em; }
+.dev-head-main { flex: 1; min-width: 0; padding-right: 34px; }
+.dev-name { display: flex; align-items: center; gap: 7px; font-size: 18px; font-weight: 600; letter-spacing: -0.02em; color: var(--ink); }
 /* 认证图标：橙色（参考图如此；且不跟主色蓝抢注意力） */
 .dev-verify { color: var(--warning); display: inline-flex; }
 .dev-verify svg {
   width: 19px; height: 19px; fill: none; stroke: currentColor;
   stroke-width: 1.9; stroke-linecap: round; stroke-linejoin: round;
 }
-.dev-about { background: var(--surface-2); border-radius: 14px; padding: 17px 19px; }
-.dev-about-h { font-size: 15px; font-weight: 650; color: var(--ink); margin-bottom: 9px; letter-spacing: -0.01em; }
-.dev-about-txt { font-size: 13px; line-height: 1.7; color: var(--ink-muted); }
-.dev-about-mail {
-  display: inline-flex; align-items: center; gap: 6px; margin-top: 12px;
-  font-size: 12.5px; color: var(--ink-subtle); cursor: pointer; word-break: break-all;
+.dev-meta { display: flex; flex-wrap: wrap; align-items: center; gap: 12px; margin-top: 5px; min-width: 0; }
+.dev-copy {
+  display: inline-flex; align-items: center; gap: 5px; max-width: 100%;
+  border: none; background: none; padding: 0; cursor: pointer;
+  font-family: inherit; font-size: 11.5px; color: var(--ink-subtle);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
-.dev-about-mail:hover { color: var(--accent); }
-.dev-about-mail svg {
-  width: 14px; height: 14px; fill: none; stroke: currentColor;
+.dev-copy:hover { color: var(--accent); }
+.dev-copy svg {
+  width: 12px; height: 12px; fill: none; stroke: currentColor;
   stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0;
 }
-.dev-tabs { display: flex; align-items: center; gap: 22px; margin: 22px 0 14px; }
+.dev-bio {
+  margin-top: 8px; font-size: 13px; line-height: 1.5; color: var(--ink-muted);
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+}
+.dev-stats { margin-top: 8px; display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-tertiary); }
+.dev-tabs { display: flex; align-items: center; gap: 22px; padding: 0 20px; border-bottom: .5px solid var(--hairline); }
 .dev-tab {
-  border: none; background: none; padding: 0;
-  font-size: 16px; font-weight: 700; color: var(--ink-faint);
+  border: none; background: none; padding: 10px 0; margin-bottom: -1px;
+  border-bottom: 2px solid transparent;
+  font-size: 14px; font-weight: 600; color: var(--ink-faint);
   cursor: pointer; font-family: inherit; letter-spacing: -0.01em;
 }
-.dev-tab.active { color: var(--ink); }
-.dev-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; }
-.dev-card {
-  display: flex; flex-direction: column; gap: 9px;
-  padding: 13px 14px; border: 1px solid var(--hairline);
-  border-radius: 14px; background: #fff; cursor: pointer;
-  transition: border-color 140ms var(--ease), box-shadow 140ms var(--ease);
-}
-.dev-card:hover { border-color: var(--hairline-strong); box-shadow: 0 1px 2px rgba(0,0,0,.04), 0 4px 14px rgba(0,0,0,.045); }
-.dev-card-head { display: flex; align-items: center; gap: 10px; min-width: 0; }
-.dev-card-ico {
-  width: 42px; height: 42px; border-radius: 11px; flex-shrink: 0; overflow: hidden;
-  display: inline-flex; align-items: center; justify-content: center;
-  color: #fff; font-size: 16px; font-weight: 600;
-}
-.dev-card-ico img { width: 100%; height: 100%; object-fit: cover; }
-.dev-card-titles { flex: 1; min-width: 0; }
-.dev-card-name {
-  font-size: 13.5px; font-weight: 650; color: var(--ink);
-  white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.01em;
-}
-.dev-card-desc {
-  font-size: 11.5px; line-height: 1.45; color: var(--ink-subtle); margin-top: 2px;
-  display: -webkit-box; -webkit-line-clamp: 1; -webkit-box-orient: vertical; overflow: hidden;
-}
-.dev-card-tags { display: flex; flex-wrap: wrap; gap: 5px; }
-.dev-card-tag { font-size: 10.5px; color: var(--ink-subtle); background: var(--surface-2); padding: 2px 9px; border-radius: 6px; }
+.dev-tab.active { color: var(--ink); border-bottom-color: var(--accent); }
+.dev-tab .n { font-weight: 500; color: var(--ink-tertiary); }
+.dev-body { flex: 1; min-height: 0; overflow-y: auto; padding: 16px 20px 20px; }
+.dev-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 12px; align-items: start; }
+.dev-empty { grid-column: 1 / -1; padding: 40px 0; text-align: center; font-size: 13px; color: var(--ink-faint); }
 
 /* Apple 风格小开关（卡片/详情页启用态） */
 .sk-switch {
@@ -16213,6 +16215,9 @@ html {
    ⚠️ 漏这条会出现「IM 页与对话页叠在一起」（2026-11-16 实测踩到）。
    ⛔ 不要改成条件卸载：卸载会丢 Composer 草稿。 */
 .app.workspace-surface[data-page="im"] .center > :not(.im-channel-page) { display: none; }
+/* 市场整页：与 IM 同范式 —— 对话面保持挂载（不丢 Composer 草稿/附件），仅由 CSS 隐藏。
+   ⚠️ 漏这条会出现「市场页与对话页叠在一起」。⛔ 不要改成条件卸载。 */
+.app.workspace-surface[data-page="market"] .center > :not(.market-page) { display: none; }
 
 .app.workspace-surface .schedules-page {
   flex: 1;

@@ -823,6 +823,8 @@ public class SkillsLoader {
         c.setUserInvocable(parsed.userInvocable());
         c.setDisableModelInvocation(parsed.disableModelInvocation());
         c.setShell(parsed.shell());
+        // [2026-11-23 技能图标] frontmatter icon 可选透出（null = 前端统一兜底图标）
+        if (parsed.icon() != null) c.setIcon(parsed.icon());
         // P1-2: 磁盘技能 isHidden/progressMessage 补齐（CC createSkillCommand loadSkillsDir.ts:335-336
         //   isHidden: !userInvocable + progressMessage: 'running'）——此前磁盘主路径漏设两字段，
         //   user-invocable:false 磁盘技能 UI 不隐藏、progressMessage 恒 null（EV-WF1-LD-010 闭合）。

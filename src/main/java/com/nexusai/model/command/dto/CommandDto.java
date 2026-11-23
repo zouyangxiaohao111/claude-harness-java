@@ -42,5 +42,7 @@ public record CommandDto(
      *  local / local-jsx 全集属 M23 范围）。默认 'prompt'，供前端区分 prompt/local/local-jsx 触发路径。 */
     String type,
     /** 所属插件名（source='plugin'/'bundled' 时来自 pluginInfo.pluginManifest.name · 前端 /插件名 提示其技能） */
-    String pluginName
+    String pluginName,
+    /** [2026-11-23 技能图标] 可选图标 URL（frontmatter icon；null = 前端统一兜底图标，⛔ 不用首字母） */
+    String icon
 ) {}

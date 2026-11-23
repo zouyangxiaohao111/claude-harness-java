@@ -121,7 +121,7 @@ import { EffortModal } from '@/components/modals/EffortModal'
 import { ContextAnalyzeModal } from '@/components/modals/ContextAnalyzeModal'
 import { UsageCostModal } from '@/components/modals/UsageCostModal'
 import { MemoryEditorModal } from '@/components/modals/MemoryEditorModal'
-import { SkillMarketModal, type MarketTab } from '@/components/modals/SkillMarketModal'
+import { MarketPage, type MarketTab } from '@/components/market/MarketPage'
 import { IncludeApprovalModal } from '@/components/modals/IncludeApprovalModal'
 import { describeIncludeStatusProbeFailure, getIncludeStatus } from '@/api/claudeMd'
 import { Toast } from '@/components/common/Toast'
@@ -260,13 +260,12 @@ function App() {
     return () => { cancelled = true }
   }, [])
 
-  // ---- 技能市场弹窗（Composer 顶部 agent 胶囊点击触发 · App 持有开关 + 渲染 SkillMarketModal）----
-  const [showMarket, setShowMarket] = useState(false)
+  // ---- 专家/技能/连接器市场（主区换页 · 用户 2026-11-23 终稿「平铺中间栏，不要弹窗」）----
   /** 打开市场时停在哪个 tab（+ 菜单「专家/技能/连接器」指定；其它入口默认专家） */
   const [marketTab, setMarketTab] = useState<MarketTab>('expert')
   const openMarket = (tab: MarketTab = 'expert') => {
     setMarketTab(tab)
-    setShowMarket(true)
+    setWorkspacePage('market')
   }
   /**
    * 知识库浮层（2026-11-06 用户裁定：知识库是**独立场景**，用弹窗承载，
@@ -464,7 +463,7 @@ function App() {
   // [peer-inbox] 跨会话待收件 popover 开合由 peerInboxStore 统一持有（自动打开与手动开关同一事实来源；
   //   切会话清空/自动打开边沿都在 store 内判定，组件不再各自判断）。
   // 主区页面：对话 / 定时任务 / 知识库（主区换页，不弹设置弹窗）
-  const [workspacePage, setWorkspacePage] = useState<'chat' | 'schedules' | 'knowledge' | 'im'>('chat')
+  const [workspacePage, setWorkspacePage] = useState<'chat' | 'schedules' | 'knowledge' | 'im' | 'market'>('chat')
   // 右栏抽屉开合（改版后右栏默认收起，由头部面板按钮 / 消息底部入口打开）
   const [rightDrawerOpen, setRightDrawerOpen] = useState(false)
   // 基础设置（左下角用户行 → 轻量四项弹窗）
@@ -1111,6 +1110,8 @@ function App() {
   const showSchedulesPage = workspacePage === 'schedules'
   /** IM 频道页（左侧边栏一级入口）：与定时任务同样走「主区换页」，不弹设置。 */
   const showImPage = workspacePage === 'im'
+  /** 市场整页（专家/技能/连接器）：与 IM 同范式，对话面由 CSS 隐藏而非卸载。 */
+  const showMarketPage = workspacePage === 'market'
 
   /**
    * 渠道 ↔ 会话 接线（V255）—— 左栏「IM 会话」块的数据源。
@@ -1808,8 +1809,9 @@ function App() {
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
       if (e.key !== 'F5') return
-      // 设置页打开时 F5 刷新当前菜单 tab；其他弹窗打开时不刷新
-      if (showDialogOps || showCommandPalette || ui.showSearchPalette || showModelPicker || showAgentsPanel || showChromePanel || showContextAnalyze || showMemoryEditor || showIncludeApproval || showMarket || ui.showAddPanel || !!ui.diffFile) return
+      // 设置页打开时 F5 刷新当前菜单 tab；其他弹窗打开时不刷新。
+      // 主区停在非对话页（定时任务 / IM / 市场）时也不刷新对话 —— 用户看不到刷新结果。
+      if (showDialogOps || showCommandPalette || ui.showSearchPalette || showModelPicker || showAgentsPanel || showChromePanel || showContextAnalyze || showMemoryEditor || showIncludeApproval || workspacePage !== 'chat' || ui.showAddPanel || !!ui.diffFile) return
       e.preventDefault()
       if (ui.showSettings) {
         // F5 刷新当前设置菜单页（对应 hook refresh；无 hook 的 tab 回落刷新会话历史）
@@ -1827,7 +1829,7 @@ function App() {
     }
     window.addEventListener('keydown', onKey)
     return () => window.removeEventListener('keydown', onKey)
-  }, [ui, settings.settingsTab, providersApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, showMarket])
+  }, [ui, settings.settingsTab, providersApi, mcpApi, databasesApi, schedulesApi, refreshConversation, showToast, showDialogOps, showCommandPalette, showModelPicker, showAgentsPanel, showChromePanel, showContextAnalyze, showMemoryEditor, showIncludeApproval, workspacePage])
 
   // ---- 历史回放：会话切换 —— 未在跑就与后端整表对账（对齐 dsh repairGap 语义）----
   // [chat-switch-stream-align] 对齐 deepseek「Session 数据常驻」：messages/streams 已常驻
@@ -2906,11 +2908,11 @@ function App() {
     }
   }, [activeSessionId, setSessions, storeSessions, showToast])
 
-  // ---- 技能市场：使用专家（SkillMarketModal 回调）----
-  // 本地专家 → 复用 handleAgentChange（现有 PATCH mainThreadAgent 链路）+ 关弹窗。
-  // 建科市场专家 → 在弹窗内直接走插件安装（installMarketPlugin），不再经过 App。
+  // ---- 市场：使用专家（MarketPage 回调）----
+  // 本地专家 → 复用 handleAgentChange（现有 PATCH mainThreadAgent 链路）+ 回对话页。
+  // 建科市场专家 → 在市场内直接走插件安装（installMarketPlugin），不再经过 App。
   const handleMarketUseLocal = useCallback((agentType: string) => {
-    setShowMarket(false)
+    setWorkspacePage('chat')
     void handleAgentChange(agentType)
   }, [handleAgentChange])
 
@@ -3944,7 +3946,7 @@ function App() {
   useEscapeKey(showUsageCost, () => setShowUsageCost(false))
   useEscapeKey(showMemoryEditor, () => setShowMemoryEditor(false))
   useEscapeKey(showIncludeApproval, () => setShowIncludeApproval(false))
-  useEscapeKey(showMarket, () => setShowMarket(false))
+  // 市场整页不再有独立 Esc（由上方 workspacePage !== 'chat' 的通用守卫回对话页）
   // ⛔ 知识库浮层**刻意不挂 Esc**（用户 2026-11-09 裁定：「只留 ✕，Esc 也不响应」）。
   //   原因有三，缺一条都会误关：
   //   ① 场景内的输入框（问答 tab 的提问框、文档搜索、FAQ 编辑器、重命名）里按 Esc 是
@@ -3975,7 +3977,7 @@ function App() {
   return (
     <div
       className={`app${leftCollapsed ? ' left-collapsed' : ''}${rightCollapsed ? ' right-collapsed' : ''}${rightDrawerOpen ? ' right-drawer-open' : ''}${dockArtifact ? ' artifact-dock-open' : ''} workspace-surface`}
-      data-page={showImPage ? 'im' : showSchedulesPage ? 'schedules' : 'chat'}
+      data-page={showMarketPage ? 'market' : showImPage ? 'im' : showSchedulesPage ? 'schedules' : 'chat'}
       style={{
         // [产物侧栏 2026-11-02] 面板宽度写到根节点上：CSS 的 `.artifact-dock-open` 读这个变量
         //   决定第三列列宽（真正压缩中栏，不是覆盖）。
@@ -4085,7 +4087,8 @@ function App() {
         onOpenIm={() => setWorkspacePage('im')}
         imActive={showImPage}
         imSessionIds={imSessionIds}
-        onOpenAgentMarket={() => openMarket('expert')}
+        onOpenAgentMarket={() => setWorkspacePage('market')}
+        marketActive={showMarketPage}
         onOpenKnowledgeBase={() => {
           // ⭐ 用户 2026-11-09 裁定：「点开默认就是独立窗口」。
           //   知识库不再先弹浮层 —— 直接开**新的 Tauri 窗口**（系统级窗口，可拖到另一块屏）。
@@ -4149,6 +4152,33 @@ function App() {
               setWorkspacePage('chat')
             }}
             sessions={sessions.map((x) => ({ id: x.id, title: x.title ?? x.id }))}
+          />
+        )}
+
+        {/* 市场整页（专家/技能/连接器）：与 IM 同范式 —— 对话面保持挂载、由 CSS 隐藏。
+            关闭 = ← / Esc / 点会话 / 新建会话，全部把 workspacePage 切回 chat。 */}
+        {showMarketPage && (
+          <MarketPage
+            sessionId={activeSessionId ?? ''}
+            currentAgent={currentAgent}
+            busy={turnRunning}
+            initialTab={marketTab}
+            onExit={() => setWorkspacePage('chat')}
+            onUseLocalAgent={handleMarketUseLocal}
+            onSummonSkill={(cmd, display) => {
+              setWorkspacePage('chat')
+              // 有中文显示名 → 输入框用显示名本身（发送时还原为 /命令名）；否则维持 /命令名
+              if (display) {
+                setComposerText(`${display}${SUMMON_TRAILING_SPACES}`)
+                setSlashAlias({ name: cmd, display })
+              } else {
+                setComposerText(`/${cmd} `)
+                setSlashAlias(null)
+              }
+              // 召唤后聚焦输入框（页面切回 chat 并渲染出 Composer 之后再聚焦）
+              setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 60)
+            }}
+            showToast={showToast}
           />
         )}
 
@@ -4698,7 +4728,7 @@ function App() {
               onOpenArtifacts={() => { setShowKnowledge(false); openRightTab('artifacts') }}
               onOpenAgents={() => { setShowKnowledge(false); setShowAgentsPanel(true) }}
               onOpenSchedules={() => { setShowKnowledge(false); setWorkspacePage('schedules') }}
-              onOpenToolbox={() => { setShowKnowledge(false); openMarket('expert') }}
+              onOpenToolbox={() => { setShowKnowledge(false); setMarketTab('expert'); setWorkspacePage('market') }}
               // ⭐ 共享空间 = 场景内的独立一页（不关弹窗、不重开）
               onOpenSharedSpace={() => setKbScene('shared')}
               onBackToList={() => { setKbView('knowledge'); setKbScene('knowledge') }}
@@ -4718,30 +4748,8 @@ function App() {
           </div>
         </div>
       )}
-      {showMarket && (
-        <SkillMarketModal
-          sessionId={activeSessionId ?? ''}
-          currentAgent={currentAgent}
-          busy={turnRunning}
-          initialTab={marketTab}
-          onClose={() => setShowMarket(false)}
-          onUseLocalAgent={handleMarketUseLocal}
-          onSummonSkill={(cmd, display) => {
-            setShowMarket(false)
-            // 有中文显示名 → 输入框用显示名本身（发送时还原为 /命令名）；否则维持 /命令名
-            if (display) {
-              setComposerText(`${display}${SUMMON_TRAILING_SPACES}`)
-              setSlashAlias({ name: cmd, display })
-            } else {
-              setComposerText(`/${cmd} `)
-              setSlashAlias(null)
-            }
-            // 召唤后聚焦输入框，用户可以接着输入（等弹窗关闭后再聚焦）
-            setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 60)
-          }}
-          showToast={showToast}
-        />
-      )}
+      {/* 市场已改为主区整页（见 .center 内的 <MarketPage>）；主窗口不再渲染弹窗。
+          KB 独立窗仍用 SkillMarketModal（KbNewChatPane 自己渲染）。 */}
       <SkillSurvey />
       {/* 基础设置（左下角用户行）：轻量四项 + 「高级设置」→ 现有完整设置 */}
       {showBasicSettings && (

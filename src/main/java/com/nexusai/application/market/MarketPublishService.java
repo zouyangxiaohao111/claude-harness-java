@@ -181,8 +181,8 @@ public class MarketPublishService {
             entry.put("publishedAt", now);
             // [2026-11-23 连接器市场] manifest 的 connection 块（req 未提供时保留既有块，不覆盖）
             writeConnection(entry, req.connection());
-            // [2026-11-23 市场图标] 图标 URL：仅非空时写入（留空保留既有值，避免重发版把图标清掉）
-            writeIcon(entry, req.icon());
+            // [2026-11-23 市场图标] 自动带图标：显式 > 包根 icon.svg（上传后引用）> 统一兜底图标
+            writeIcon(entry, resolveIconUrl(req.icon(), dir, source, category));
             ArrayNode versions = entry.withArray("versions");
             ObjectNode v = versions.addObject();
             v.put("version", version);
@@ -308,6 +308,30 @@ public class MarketPublishService {
         if (icon != null && !icon.isBlank()) {
             entry.put("icon", icon.trim());
         }
+    }
+
+    /** 统一兜底图标对象（2026-11-23 已上传；缺图标的上架条目统一引用它）。 */
+    static final String FALLBACK_ICON_KEY = KEY_PREFIX + "/assets/skill-fallback.svg";
+
+    /** 上架图标：显式 > 包根 icon.svg（上传后引用）> 统一兜底（非 skill 类别不自动写）。 */
+    private String resolveIconUrl(String explicit, Path dir, String source, String category) {
+        if (explicit != null && !explicit.isBlank()) {
+            return explicit.trim();
+        }
+        if (!"skill".equals(category)) {
+            return null;
+        }
+        Path local = dir.resolve("icon.svg");
+        if (Files.isRegularFile(local)) {
+            String key = KEY_PREFIX + "/" + source + "/icon.svg";
+            try {
+                uploader.upload(key, Files.readAllBytes(local), "image/svg+xml");
+                return uploader.publicUrl(key);
+            } catch (IOException e) {
+                log.warn("[MarketPublish] icon 上传失败，回落兜底 plugin={}: {}", dir.getFileName(), e.getMessage());
+            }
+        }
+        return uploader.publicUrl(FALLBACK_ICON_KEY);
     }
 
     /** 分类 → 目录名（清单 source 前缀，与既有清单 `skills/...`、`experts/...` 对齐）。 */
