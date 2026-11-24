@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.88] - 2026-11-24
+
+### Added
+
+- 修复纯附件消息空气泡与 txt 附件预览、飞书创建后凭证自检、命令与插件命令合并、市场页完善
+
 ## [0.1.87] - 2026-11-24
 
 ### Added

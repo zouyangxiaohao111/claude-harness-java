@@ -64,4 +64,30 @@ describe('用户消息附件在气泡上方', () => {
     ).toBeTruthy()
     expect(files!.querySelector('.attach-file-card'), '文件卡在附件行内').toBeTruthy()
   })
+
+  it('纯附件消息（content 为空）→ 只有附件卡片，不渲染空气泡', () => {
+    const msg = base()
+    msg.content = ''
+    msg.userAttachments = [
+      { type: 'file', filename: 'at org.springframework....txt', mediaType: 'text/plain', contentId: '42', url: '/attachments/content/x/42', base64: null, path: null },
+    ]
+    act(() => {
+      root.render(
+        <MessageList
+          sessionId={SID}
+          messages={[msg]}
+          onDelete={noop}
+          conversationId={null}
+          onNearBottomChange={noop}
+          onLoadOlder={noop}
+          onOpenRightTab={noop}
+        />,
+      )
+    })
+    expect(container.querySelector('.msg.user .user-files'), '附件卡片照常显示').toBeTruthy()
+    expect(
+      container.querySelector('.msg.user .user-bubble'),
+      '正文为空时 .user-bubble 会画出一个空气泡（背景+padding）⇒ 必须不渲染',
+    ).toBeNull()
+  })
 })

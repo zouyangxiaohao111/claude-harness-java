@@ -84,6 +84,8 @@ export function StandalonePreviewView() {
         ? <MarkdownTextV2 text={code} className="content md markdown-prose" />
         : <div className="rp-hint">加载中…</div>}
     </div>
+  ) : type === 'text' ? (
+    <pre className="stand-text">{code ?? ''}</pre>
   ) : loading && !url && !bytes ? (
     <div className="rp-hint">加载中…</div>
   ) : type === 'pdf' && url ? (

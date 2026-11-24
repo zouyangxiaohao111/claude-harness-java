@@ -592,7 +592,8 @@ public class CommandService {
             c.getPluginInfo() != null && c.getPluginInfo().pluginManifest() != null
                 ? c.getPluginInfo().pluginManifest().name()
                 : null,
-            c.getIcon()
+            c.getIcon(),
+            c.getDisplayName()
         );
     }
 

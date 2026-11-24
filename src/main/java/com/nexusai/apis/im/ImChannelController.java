@@ -188,6 +188,62 @@ public class ImChannelController {
         return null;
     }
 
+    /**
+     * [飞书平台策略自检] 用**已保存实例**的凭证真换一次 tenant_access_token。
+     *
+     * <p><b>WHY</b>：一键创建成功只代表「应用建出来了」，不代表飞书肯给这个应用换票。
+     * 豆包账号创建的自建应用会被平台策略拒绝（{@code code=21001}），此时创建后立刻提示，
+     * 用户就不会再点「同步」「授权」绕一圈（授权页还会显示「无需授权任何权限」，容易误判已授权）。
+     *
+     * <p>⛔ 响应只含 ok/code/message（+ 成功的机器人名/群数），不回显凭证与 token。
+     */
+    @PostMapping("/{id}/probe")
+    public Map<String, Object> probeSaved(@PathVariable String id) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        var instOpt = channelService.findById(id);
+        if (instOpt.isEmpty()) {
+            out.put("ok", false);
+            out.put("code", "NOT_FOUND");
+            out.put("message", "实例不存在");
+            return out;
+        }
+        ImInstanceEntry inst = instOpt.get();
+        if (!"feishu".equals(inst.platform())) {
+            out.put("ok", false);
+            out.put("code", "UNSUPPORTED");
+            out.put("message", "只有飞书支持凭证换票自检");
+            return out;
+        }
+        var credOpt = channelService.credentialOf(id);
+        if (credOpt.isEmpty()) {
+            out.put("ok", false);
+            out.put("code", "INVALID_CREDENTIAL");
+            out.put("message", "该实例没有可用凭证");
+            return out;
+        }
+        com.fasterxml.jackson.databind.JsonNode cred;
+        try {
+            cred = new com.fasterxml.jackson.databind.ObjectMapper().readTree(credOpt.get());
+        } catch (Exception e) {
+            out.put("ok", false);
+            out.put("code", "INVALID_CREDENTIAL");
+            out.put("message", "凭证不是合法 JSON");
+            return out;
+        }
+        var r = probeService.probeFeishu(
+                textOr(cred, "appId", "app_id"), textOr(cred, "appSecret", "app_secret"));
+        out.put("ok", r.ok());
+        out.put("code", r.code());
+        out.put("message", r.message());
+        if (r.botName() != null) {
+            out.put("botName", r.botName());
+        }
+        if (r.chatVisible() != null) {
+            out.put("chatVisible", r.chatVisible());
+        }
+        return out;
+    }
+
     /** 改显示名 / 平台开关（不轮换凭证）。 */
     @PutMapping("/{id}")
     public ImInstanceEntry update(@PathVariable String id, @RequestBody Map<String, Object> body) {

@@ -34,9 +34,9 @@ export function AttachPreviewModal({ att, sessionId, onClose }: {
   const [url, setUrl] = useState<string | null>(null)
   const [error, setError] = useState<string | null>(null)
   const kind = previewKindOfAttachment(att)
-  /** markdown：字节 → 文本（与主对话同一渲染器） */
-  const mdText = useMemo(
-    () => (kind === 'markdown' && bytes ? new TextDecoder('utf-8').decode(bytes) : null),
+  /** markdown / 纯文本：字节 → 文本（markdown 用主对话渲染器，text 用 <pre> 原样显示） */
+  const textText = useMemo(
+    () => ((kind === 'markdown' || kind === 'text') && bytes ? new TextDecoder('utf-8').decode(bytes) : null),
     [kind, bytes],
   )
 
@@ -111,10 +111,13 @@ export function AttachPreviewModal({ att, sessionId, onClose }: {
             : kind === 'xlsx' ? <ExcelPreview bytes={bytes} error={error} />
             : kind === 'markdown' ? (
               <div className="attach-preview-md">
-                {mdText != null
-                  ? <MarkdownTextV2 text={mdText} className="content md markdown-prose" />
+                {textText != null
+                  ? <MarkdownTextV2 text={textText} className="content md markdown-prose" />
                   : <div className="rp-hint">加载中…</div>}
               </div>
+            )
+            : kind === 'text' ? (
+              <pre className="attach-preview-text">{textText ?? ''}</pre>
             )
             : kind === 'image' && url ? <img className="attach-preview-img" src={url} alt={att.filename} />
             : kind === 'video' && url ? <video className="attach-preview-media" controls src={url} />

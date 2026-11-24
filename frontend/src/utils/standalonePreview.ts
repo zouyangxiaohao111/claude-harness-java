@@ -13,7 +13,7 @@
  */
 
 /** 独立预览载荷类型。 */
-export type PreviewType = 'html' | 'pdf' | 'docx' | 'xlsx' | 'image' | 'video' | 'audio' | 'markdown' | 'file'
+export type PreviewType = 'html' | 'pdf' | 'docx' | 'xlsx' | 'image' | 'video' | 'audio' | 'markdown' | 'text' | 'file'
 
 /** 对话附件内容源（结构兼容 ChatMessageDto.userAttachments 元素，缺省可空）。 */
 export interface StandaloneAttachment {
@@ -93,10 +93,12 @@ export function trimItemForTransfer(item: StandaloneAttachment): StandaloneAttac
   return { ...rest }
 }
 
-/** 附件 → 预览类型（docx/xlsx 按扩展名；pdf/video/audio 按 type 或扩展名；其余 file）。 */
+/** 附件 → 预览类型（docx/xlsx 按扩展名；pdf/video/audio 按 type 或扩展名；txt/log 纯文本；其余 file）。 */
 export function previewKindOfAttachment(a: StandaloneAttachment): PreviewType {
   const name = a.filename ?? ''
   if (/\.(md|mdx|markdown)$/i.test(name)) return 'markdown'
+  // [PASTE-TXT] 大段粘贴转出的 .txt / .log 按**纯文本**预览（<pre> 原样显示，不做 markdown 投影）
+  if (/\.(txt|log)$/i.test(name)) return 'text'
   if (/\.docx$/i.test(name)) return 'docx'
   if (/\.xlsx$/i.test(name)) return 'xlsx'
   if (a.type === 'pdf' || /\.pdf$/i.test(name)) return 'pdf'

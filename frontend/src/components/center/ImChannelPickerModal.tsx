@@ -287,6 +287,15 @@ export function ImChannelPickerModal({
                     列表只显示<b>现在能发消息</b>的会话：微信群聊不支持群发、微信单聊需对方先发一句；
                     飞书群需机器人已加入。先在「IM 频道」里启动连接，再私聊机器人发一句话。
                   </span>
+                  {activeInst.platform === 'feishu' && (
+                    <>
+                      <br />
+                      <span>
+                        刚点过「同步会话」却没结果时，看「IM 频道」页的提示：
+                        平台错误 <b>21001</b> 表示飞书拒绝了该应用的换票（豆包账号常见），需要换飞书个人/企业账号。
+                      </span>
+                    </>
+                  )}
                 </div>
               ) : (
                 activeChats.map((c) => {

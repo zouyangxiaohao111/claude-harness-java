@@ -4178,6 +4178,14 @@ function App() {
               // 召唤后聚焦输入框（页面切回 chat 并渲染出 Composer 之后再聚焦）
               setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 60)
             }}
+            onCreateExpert={() => {
+              // [我的专家空态 2026-11-24] 创建专家 = 回到对话 + 预填创建提示（用户补全后发送）。
+              //   不加 slashAlias：这是给 agent 的自然语言指令，不是已注册命令。
+              setWorkspacePage('chat')
+              setComposerText('/expert-manager 帮我创建一个 XXX 专家，擅长 XXXXX。我的经验是：[请补充你的行业背景、相关经验]')
+              setSlashAlias(null)
+              setTimeout(() => document.querySelector<HTMLTextAreaElement>('.composer textarea')?.focus(), 60)
+            }}
             showToast={showToast}
           />
         )}

@@ -238,6 +238,22 @@
 
 /* ---- 专家：三列卡片 + 圆形头像 ---- */
 .sm-expert-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+
+/* ---- 「我的专家」空态（用户 2026-11-24 截图）：居中帽子 + 标题 + 说明 + 描边按钮 ---- */
+.mk-empty-expert {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  text-align: center; padding: 76px 20px 96px;
+}
+.mk-empty-expert-ico { width: 44px; height: 44px; color: var(--ink, #14181f); margin-bottom: 18px; }
+.mk-empty-expert-title { font-size: 15px; font-weight: 600; color: var(--ink, #14181f); }
+.mk-empty-expert-sub { margin-top: 6px; font-size: 12.5px; color: var(--ink-subtle, #5f6875); }
+.mk-empty-expert-btn {
+  margin-top: 18px; display: inline-flex; align-items: center; gap: 6px;
+  height: 34px; padding: 0 16px; border: 1px solid var(--hairline-strong, #e2e2e2);
+  border-radius: 8px; background: var(--surface-1, #fff); color: var(--ink, #14181f);
+  font-size: 13px; cursor: pointer;
+}
+.mk-empty-expert-btn:hover { border-color: var(--ink-tertiary, #8a93a2); }
 .sm-expert-card { padding: 18px; border-radius: 16px; gap: 9px; }
 .sm-expert-card .sm-avatar { width: 46px; height: 46px; border-radius: 50%; font-size: 16px; }
 .sm-expert-card .sm-card-title { font-size: 16px; }
@@ -325,11 +341,10 @@
   .ed-primary { font-size: 13px; min-height: 38px; }
 }
 
-/* ---- 技能目录：去掉子标签后的标题行 + 三列卡片（对齐专家页） ---- */
+/* ---- 技能目录：去掉子标签后的标题行 + 卡片网格（对齐连接器 .mc-grid：auto-fill 240px，一行 4~5 个） ---- */
 .sm-skill-head { display: flex; align-items: center; justify-content: space-between; gap: 12px; margin: 2px 0 14px; }
-.sk-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
-@media (max-width: 1100px) { .sk-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }
-@media (max-width: 700px) { .sk-grid { grid-template-columns: 1fr; } }
+/* [2026-11-24 用户定] 一行固定 5 个（扩大缩小都固定，宽度按 1fr 自适应） */
+.sk-grid { grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; }
 
 /* ---- 连接器卡片：贴合技能/专家页（1px 边线、16 圆角、中性 hover，去掉品牌色描边与上浮） ---- */
 .mc-card {

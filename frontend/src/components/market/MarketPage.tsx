@@ -13,7 +13,7 @@ export type { MarketTab } from './MarketBrowser'
  * 关闭（← / Esc / 点会话 / 新建会话）由 App 把 `workspacePage` 切回 `chat`。
  */
 export function MarketPage({
-  sessionId, currentAgent, busy, initialTab, onExit, onUseLocalAgent, onSummonSkill, showToast,
+  sessionId, currentAgent, busy, initialTab, onExit, onUseLocalAgent, onSummonSkill, onCreateExpert, showToast,
 }: {
   sessionId: string
   currentAgent?: string | null
@@ -23,6 +23,8 @@ export function MarketPage({
   onExit: () => void
   onUseLocalAgent?: (agentType: string) => void
   onSummonSkill?: (commandName: string, displayName?: string) => void
+  /** 「我的专家」空态 → 创建专家（App 把创建提示写进输入框） */
+  onCreateExpert?: () => void
   showToast: (msg: string, type?: 'success' | 'info') => void
 }) {
   return (
@@ -36,6 +38,7 @@ export function MarketPage({
         onClose={onExit}
         onUseLocalAgent={onUseLocalAgent}
         onSummonSkill={onSummonSkill}
+        onCreateExpert={onCreateExpert}
         showToast={showToast}
       />
     </div>

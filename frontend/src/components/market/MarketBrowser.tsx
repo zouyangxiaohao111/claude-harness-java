@@ -253,7 +253,17 @@ interface ExpertCard {
   inUse: boolean
 }
 
-export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab, mode = 'modal', onClose, onUseLocalAgent, onSummonSkill, showToast }: {
+/**
+ * [我的专家 2026-11-24] 「我的专家」只算**用户自己创建的** agent：
+ * source ∈ userSettings / projectSettings / localSettings；排除 built-in / plugin / policy / CLI。
+ * 否则内置专家永远在列表里，「我的专家」空态永远出不来。
+ */
+function isMyExpert(a: AgentListItem): boolean {
+  const s = (a.source ?? '').toLowerCase()
+  return s === 'usersettings' || s === 'projectsettings' || s === 'localsettings'
+}
+
+export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab, mode = 'modal', onClose, onUseLocalAgent, onSummonSkill, onCreateExpert, showToast }: {
   /** 当前会话 id（/agents/list + /market/* + POST use 需要） */
   sessionId: string
   /** 打开时停在哪个 tab（输入框 + 菜单「专家/技能/连接器」指定）· 缺省专家 */
@@ -273,6 +283,12 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
   onUseLocalAgent?: (agentType: string) => void
   /** 召唤已安装技能（技能命令名 + 中文显示名）→ App 关弹窗 + 把「/命令名 」写入输入框（2026-10-19 用户需求） */
   onSummonSkill?: (commandName: string, displayName?: string) => void
+  /**
+   * [我的专家空态 2026-11-24] 点「创建专家」→ App 关市场页 + 把创建提示写进输入框
+   * （`/expert-manager 帮我创建一个 XXX 专家…`，由用户补全后发送）。
+   * 未接线（弹窗形态）时按钮回落到 showToast 说明。
+   */
+  onCreateExpert?: () => void
   /** 轻提示 */
   showToast: (msg: string, type?: 'success' | 'info') => void
   /**
@@ -305,6 +321,20 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
   const [installedOnly, setInstalledOnly] = useState(false)
   /** 当前展开 ⋯ 菜单的技能（marketId）· null = 无展开 */
   const [openMenuId, setOpenMenuId] = useState<string | null>(null)
+  /**
+   * [2026-11-24] 技能卡 ⋯ 菜单：点击菜单/触发按钮**之外**任意位置即收起。
+   * 菜单项自己的 onClick 负责关闭；这里只处理「点外面」。
+   */
+  useEffect(() => {
+    if (openMenuId == null) return
+    const onDown = (e: MouseEvent) => {
+      const t = e.target as Element | null
+      if (t?.closest('.sk-menu') || t?.closest('.sk-more')) return
+      setOpenMenuId(null)
+    }
+    document.addEventListener('mousedown', onDown)
+    return () => document.removeEventListener('mousedown', onDown)
+  }, [openMenuId])
   /** 详情页正在查看的技能 · null = 不显示详情 */
   const [detailSkill, setDetailSkill] = useState<MarketSkill | null>(null)
   /** 开发者信息弹窗（null = 不显示）· 按 author.name 聚合该开发者的全部条目 */
@@ -600,7 +630,10 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
   //   会把「市场里装了但本机命令列表没扫到」的条目也算进来，数字与实际可见条目对不上。
   //   现在严格 = 当前来源里「已安装」的条目数，与点开「已安装」后看到的一一对应。
   const installedCount = tab === 'expert'
-    ? localAgents.filter((a) => a.source !== 'plugin').length + experts.filter((e) => e.preinstalled).length
+    ? (mode === 'page'
+      // 「我的专家」= 用户自建（内置/插件不算）
+      ? localAgents.filter(isMyExpert).length
+      : localAgents.filter((a) => a.source !== 'plugin').length + experts.filter((e) => e.preinstalled).length)
     : tab === 'skill'
       ? skills.length
       // 连接器：只数真正可用的已连接（reauth_required 的凭据已失效，不算「已连接」）
@@ -691,7 +724,10 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
     // [2026-11-01 修] 本机专家**只在「已安装」筛选打开时**才并入（用户要求：
     //   「专家还是失败后默认展示本机的 这是不对的」）。此前无条件并入 ⇒ 市场 502 时
     //   专家 tab 静静地列出一堆本机 agent，看起来像市场拉到了东西。
-    for (const a of installedOnly ? localAgents : []) {
+    for (const a of (installedOnly
+      // page 形态的「我的专家」= 用户自建；modal 形态的「已安装」保留全量本机 agent
+      ? (mode === 'page' ? localAgents.filter(isMyExpert) : localAgents)
+      : [])) {
       // 插件专家（source='plugin'）归「远程」展示，本机卡恒来自 localAgents
       if (a.source === 'plugin') continue
       const nm = a.agentType
@@ -707,7 +743,9 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
         inUse: !!currentAgent && currentAgent === nm,
       })
     }
-    for (const e of experts) {
+    // [我的专家 2026-11-24] page 形态点「我的专家」= 只看用户自建 ⇒ 不再并入市场专家；
+    //   否则 277 个市场专家永远在列表里，空态出不来。弹窗形态（已安装筛选）保持原混合语义。
+    for (const e of (mode === 'page' && installedOnly ? [] : experts)) {
       const nm = e.displayName || e.agentName || e.marketId
       cards.push({
         key: `remote:${e.marketId}`, kind: 'remote', name: nm, marketId: e.marketId,
@@ -1151,7 +1189,7 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
               {tab === 'expert' && (
                 <div className="mk-expert">
                   {/* ===== 精选场景：点场景打开代表专家的详情弹窗（⛔ 不筛选列表）===== */}
-                  {!keyword && (
+                  {!keyword && !installedOnly && (
                     <div className="mk-section" data-testid="expert-scenes">
                       <div className="mk-section-head">
                         <div>
@@ -1210,6 +1248,8 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
                   )}
 
                   {/* ===== 子 tab：专家 / 专家团（替换原来的上下两块）===== */}
+                  {/* [我的专家 2026-11-24] 「我的专家」是独立视图：不显示专家团子 tab */}
+                  {!installedOnly && (
                   <div className="sm-subtabs">
                     <button
                       className={`sm-subtab${expertView === 'solo' ? ' active' : ''}`}
@@ -1224,15 +1264,19 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
                       专家团
                     </button>
                   </div>
+                  )}
 
                   {expertView === 'solo' ? (
                     <>
+                      {/* [我的专家 2026-11-24] 独立视图：不显示分类胶囊行（截图只有空态/列表） */}
+                      {!installedOnly && (
                       <div className="sm-cat-row">
                         <div className="sm-cat-scroll">
                           <button className="sm-cat active" aria-pressed="true">全部</button>
                         </div>
                         <span className="sm-result-count">{visibleExperts.length} 位</span>
                       </div>
+                      )}
                       {isMarketFailed ? (
                         <div className="sm-market-failed">
                           <div className="sm-market-failed-txt">市场数据拉取失败，暂无可展示的专家。</div>
@@ -1244,9 +1288,35 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
                           </button>
                         </div>
                       ) : visibleExperts.length === 0 ? (
-                        <div className="sm-empty">
-                          {keyword ? '没有匹配的专家' : '暂无可用专家'}
-                        </div>
+                        installedOnly && !keyword ? (
+                          /* [我的专家空态 2026-11-24] 用户点「我的专家」且本地没有自建专家：
+                             显示创建引导（不是一句「暂无」），按钮把创建提示写进输入框。 */
+                          <div className="mk-empty-expert">
+                            <svg className="mk-empty-expert-ico" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5" aria-hidden="true">
+                              <path d="M2.5 8.6L12 4.2l9.5 4.4L12 13 2.5 8.6z" strokeLinejoin="round" />
+                              <path d="M6.2 10.8v4.1c0 1.1 2.6 2.9 5.8 2.9s5.8-1.8 5.8-2.9v-4.1" strokeLinecap="round" />
+                            </svg>
+                            <div className="mk-empty-expert-title">还没有创建任何专家</div>
+                            <div className="mk-empty-expert-sub">创建属于你的专家，分享专业知识</div>
+                            <button
+                              type="button"
+                              className="mk-empty-expert-btn"
+                              onClick={() => {
+                                if (onCreateExpert) onCreateExpert()
+                                else showToast('在对话输入框输入 /expert-manager 帮我创建一个专家…', 'info')
+                              }}
+                            >
+                              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" aria-hidden="true" style={{ width: 14, height: 14 }}>
+                                <path d="M12 5v14M5 12h14" strokeLinecap="round" />
+                              </svg>
+                              创建专家
+                            </button>
+                          </div>
+                        ) : (
+                          <div className="sm-empty">
+                            {keyword ? '没有匹配的专家' : '暂无可用专家'}
+                          </div>
+                        )
                       ) : (
                         <div className="sm-expert-grid">
                           {visibleExperts.map((c) => (
@@ -1943,8 +2013,7 @@ function SkillCard({
             )}
             {publishedLabel && (
               <span className="sk-stat" title={skill.publishedAt ?? undefined}>
-                <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8" /><path d="M12 7.5V12l3 2" /></svg>
-                上架时间：{publishedLabel}
+                上架 {publishedLabel}
               </span>
             )}
             {hasUpdate && installed ? (
@@ -1957,8 +2026,9 @@ function SkillCard({
           </div>
         </>
       )}
-      footerRight={(
-        <span className="sk-acts">
+      overlay={(
+        <>
+          <span className="sk-acts">
           <button className="sk-more" title="更多" onClick={(e) => { e.stopPropagation(); onToggleMenu() }} aria-expanded={menuOpen}>
             <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
           </button>
@@ -1975,9 +2045,8 @@ function SkillCard({
               {installing ? `${Math.round(installPercent)}%` : '＋ 安装'}
             </button>
           )}
-        </span>
-      )}
-      overlay={menuOpen ? (
+          </span>
+          {menuOpen && (
         <div className="sk-menu" onClick={(e) => e.stopPropagation()}>
           {installed ? (
             <>
@@ -2004,7 +2073,9 @@ function SkillCard({
             </>
           )}
         </div>
-      ) : null}
+          )}
+        </>
+      )}
     />
   )
 }

@@ -560,6 +560,81 @@ class LoadPluginCommandsTest {
             .isEqualTo("deploy");
     }
 
+    @Test
+    @DisplayName("frontmatter displayName/icon → Command.displayName/icon（市场技能展示名与图标，命令名不受影响）")
+    void skill_frontmatter_explicit_display_name_and_icon() throws Exception {
+        // WHY: 市场技能的中文展示名与图标走独立 displayName/icon frontmatter；命令名仍是目录名
+        //   （中文会被规范化成 '-'，不能当 name）。若插件链不读这两个字段，install 后 /api/command
+        //   返回的 displayName/icon 为空，前端只能回落统一兜底图标。
+        Path skillsDir = tempDir.resolve("meta-plugin").resolve("skills");
+        Files.createDirectories(skillsDir.resolve("doc-writer"));
+        Files.writeString(skillsDir.resolve("doc-writer/SKILL.md"),
+            "---\n"
+                + "name: doc-writer\n"
+                + "displayName: 文档写作\n"
+                + "icon: http://192.168.20.125:9000/nexusai/marketplace/skills/doc-writer/0.1.0/icon.svg\n"
+                + "description: write docs\n"
+                + "---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            plugin("meta-plugin", skillsDir.getParent())), false);
+
+        assertThat(skills).hasSize(1);
+        Command c = skills.get(0);
+        assertThat(c.getName())
+            .as("命令名仍取目录名（frontmatter name/displayName 不改命令名）")
+            .isEqualTo("meta-plugin:doc-writer");
+        assertThat(c.getDisplayName())
+            .as("显式 displayName 覆盖 CC 语义的 displayName=frontmatter.name")
+            .isEqualTo("文档写作");
+        assertThat(c.getIcon())
+            .as("frontmatter icon 落到 Command.icon")
+            .isEqualTo("http://192.168.20.125:9000/nexusai/marketplace/skills/doc-writer/0.1.0/icon.svg");
+    }
+
+    @Test
+    @DisplayName("frontmatter 无 displayName/icon → Command 两字段 null")
+    void skill_frontmatter_absent_display_name_and_icon_are_null() throws Exception {
+        // WHY: 未声明的技能不应被塞入空串或回落名；前端据此走统一兜底图标。
+        Path skillsDir = tempDir.resolve("plain-plugin").resolve("skills");
+        Files.createDirectories(skillsDir.resolve("plain"));
+        Files.writeString(skillsDir.resolve("plain/SKILL.md"),
+            "---\ndescription: plain skill\n---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            plugin("plain-plugin", skillsDir.getParent())), false);
+
+        assertThat(skills).hasSize(1);
+        assertThat(skills.get(0).getDisplayName())
+            .as("无 name/displayName → displayName null")
+            .isNull();
+        assertThat(skills.get(0).getIcon())
+            .as("无 icon → icon null")
+            .isNull();
+    }
+
+    @Test
+    @DisplayName("空白 displayName/icon → 视为未声明（displayName 保留既有 name 回落，icon=null）")
+    void skill_frontmatter_blank_display_name_and_icon_treated_as_absent() throws Exception {
+        // WHY: trim 空视为未声明；displayName 仍走 CC 的 name 回落，避免中文/空串把展示名抹成空。
+        Path skillsDir = tempDir.resolve("blank-plugin").resolve("skills");
+        Files.createDirectories(skillsDir.resolve("blank"));
+        Files.writeString(skillsDir.resolve("blank/SKILL.md"),
+            "---\nname: blank-skill\ndisplayName: \"   \"\nicon: \"\"\ndescription: x\n---\n\nbody");
+
+        List<Command> skills = LoadPluginCommands.loadSkills(List.of(
+            plugin("blank-plugin", skillsDir.getParent())), false);
+
+        assertThat(skills).hasSize(1);
+        Command c = skills.get(0);
+        assertThat(c.getDisplayName())
+            .as("空白 displayName 不覆盖，保留 CC 的 displayName=frontmatter.name")
+            .isEqualTo("blank-skill");
+        assertThat(c.getIcon())
+            .as("空白 icon → null")
+            .isNull();
+    }
+
     /** 构造含默认组件目录的 LoadedPlugin（commandsPath/skillsPath = localPath 下常规子目录）。 */
     private static PluginLoader.LoadedPlugin plugin(String name, Path localPath) {
         return new PluginLoader.LoadedPlugin(name, PluginLoader.InstallSource.PATH,

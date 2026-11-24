@@ -544,6 +544,17 @@ public final class LoadPluginCommands {
             if (parsed.displayName() != null) {
                 c.setDisplayName(parsed.displayName());
             }
+            // [2026-11-24 市场技能展示名/图标] 显式 frontmatter displayName/icon 优先于 CC 语义的
+            //   displayName=frontmatter.name（parsed.displayName 取的是 name，中文名无法当命令名，
+            //   由独立 displayName 字段承载）。trim 后为空视为未声明，保留上方既有值。
+            String explicitDisplayName = trimToNull(fm2.get("displayName"));
+            if (explicitDisplayName != null) {
+                c.setDisplayName(explicitDisplayName);
+            }
+            String iconUrl = trimToNull(fm2.get("icon"));
+            if (iconUrl != null) {
+                c.setIcon(iconUrl);
+            }
             c.setAllowedTools(parsed.allowedTools());
             c.setModel(parsed.model());
             c.setContext(parsed.executionContext() != null ? parsed.executionContext() : "inline");
@@ -723,6 +734,15 @@ public final class LoadPluginCommands {
     private static String fileNameWithoutMd(Path file) {
         String name = file.getFileName() != null ? file.getFileName().toString() : "";
         return name.toLowerCase().endsWith(".md") ? name.substring(0, name.length() - 3) : name;
+    }
+
+    /** frontmatter 字符串字段 → trim 后非空值；null / 非字符串 / 全空白 → null。 */
+    private static String trimToNull(Object value) {
+        if (value == null) {
+            return null;
+        }
+        String s = String.valueOf(value).trim();
+        return s.isEmpty() ? null : s;
     }
 
     /**

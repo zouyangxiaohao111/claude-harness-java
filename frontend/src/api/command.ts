@@ -24,6 +24,8 @@ export interface CommandDto {
   userInvocable?: boolean
   /** [2026-11-23 技能图标] 可选图标 URL（SKILL.md frontmatter icon；null = 统一兜底图标） */
   icon?: string | null
+  /** [2026-11-24 技能气泡] 可读展示名（frontmatter name；空 → 气泡回落 DSH 式内联 `/name`） */
+  displayName?: string | null
 }
 /** 对齐后端 BuiltInCommandDto 7 字段：type 区分渲染/触发（local=本地命令 / local-jsx=面板 / prompt=提示注入） */
 export interface BuiltInCommandDto {

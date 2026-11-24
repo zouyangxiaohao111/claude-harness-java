@@ -63,6 +63,8 @@ const syncFeishuChats = vi.fn(async (instanceId: string) => ({
 }))
 const oauthStatus = vi.fn(async () => ({ authorized: true, missingScopes: [] as string[] }))
 const contactsPermission = vi.fn(async () => ({ granted: true }))
+/** [21001] 创建后凭证自检：默认换票成功（失败分支由 feishuHealthHint 单测覆盖文案） */
+const probeSaved = vi.fn(async (_id: string) => ({ ok: true as const, code: '0', message: '' }))
 const oauthStart = vi.fn(async (_id: string) => ({
   deviceCode: 'd1',
   userCode: 'U1',
@@ -93,6 +95,7 @@ vi.mock('@/api/im', () => ({
     startQr: (p: string) => startQr(p),
     pollQr: (p: string, s: string) => pollQr(p, s),
     testConnection: (req: { platform: string; credential: string }) => testConnection(req),
+    probeSaved: (id: string) => probeSaved(id),
     syncFeishuChats: (id: string) => syncFeishuChats(id),
     oauthStatus: () => oauthStatus(),
     oauthStart: (id: string) => oauthStart(id),

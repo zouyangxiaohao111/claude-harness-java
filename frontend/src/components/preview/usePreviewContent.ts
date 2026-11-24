@@ -110,7 +110,7 @@ export function usePreviewContent(payload: StandalonePayload | null): PreviewCon
     setLoading(true)
     ;(async () => {
       try {
-        if (payload.type === 'markdown') {
+        if (payload.type === 'markdown' || payload.type === 'text') {
           setCode(await readText())
           return
         }

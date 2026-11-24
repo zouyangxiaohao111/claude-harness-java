@@ -207,6 +207,18 @@ export const imApi = {
       { method: 'POST', body: req },
     ),
 
+  /**
+   * 已保存实例的凭证自检（飞书换票）。
+   *
+   * <p>一键创建后立刻调用：创建成功 ≠ 飞书肯换票（豆包账号会回 {@code 21001}）。
+   * ⛔ 响应只含 ok/code/message（+ 成功的机器人名/群数），不含凭证与 token。
+   */
+  probeSaved: (instanceId: string) =>
+    api<{ ok: boolean; code?: string | null; message?: string | null; botName?: string | null; chatVisible?: string | null }>(
+      `/im/instances/${encodeURIComponent(instanceId)}/probe`,
+      { method: 'POST' },
+    ),
+
   /** 拉飞书「机器人所在的群」进聊天目录（私聊不会出现在列表里，仍需先发一条消息）。 */
   syncFeishuChats: (instanceId: string) =>
     api<{

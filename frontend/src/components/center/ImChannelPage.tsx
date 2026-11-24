@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react'
 import QRCode from 'qrcode'
 import { openExternalUrl } from '@/utils/openExternal'
+import { feishuPolicySuffix, feishuProbeFailureHint } from '@/utils/feishuHealthHint'
 import { ApiError } from '@/api/rest'
 import {
   imApi,
@@ -390,7 +391,9 @@ export function ImChannelPage({ showToast, sessions }: ImChannelPageProps) {
         ? ''
         : '；当前只同步了机器人所在的群——授权本人身份后会改为同步你所在的所有群'
       const p2p = r.total === 0 ? '；飞书没有「列出我的单聊」接口，私聊要等对方先发一条消息' : ''
-      showToast(`${base}${scope}${p2p}`, r.total > 0 ? 'success' : 'info')
+      // [21001] 换票被平台策略拒绝时直接指向「换账号」，别让用户回头去配权限
+      const policy = feishuPolicySuffix(r.message)
+      showToast(`${base}${scope}${p2p}${policy}`, r.total > 0 ? 'success' : 'info')
       await refresh()
     } catch (e) {
       showToast(`同步会话失败：${errMsg(e)}`, 'info')
@@ -480,12 +483,18 @@ export function ImChannelPage({ showToast, sessions }: ImChannelPageProps) {
               )}
               {drawer.kind === 'addChannel' && <AddChannelList instances={instances} onPick={openCredDrawer} />}
               {drawer.kind === 'qr' && drawer.platform && <QrPanel platform={drawer.platform} onConnected={async (newInstanceId) => {
-                showToast('已连接', 'success')
                 setDrawer(null)
                 await refresh()
-                // 飞书：机器人建好后立即检查「能不能以你本人名义发」——
-                // 没有 user token 就直接把授权抽屉推给用户（用户定：建/绑成功后触发）
+                // 飞书：创建成功 ≠ 飞书肯换票（豆包账号会回 21001）。先自检：
+                //   失败 → 直接说明「换账号」，且**不**把人送进授权页（那里只会显示「无需授权任何权限」，
+                //   用户会误判已经授权）；成功 → 再检查本人授权，缺 token 才推授权抽屉。
                 if (drawer.platform === 'feishu' && newInstanceId) {
+                  const health = await imApi.probeSaved(newInstanceId).catch(() => null)
+                  if (health && !health.ok) {
+                    showToast(feishuProbeFailureHint(health), 'info')
+                    return
+                  }
+                  showToast('已连接', 'success')
                   try {
                     const st = await imApi.oauthStatus(newInstanceId)
                     if (!st.authorized) {
@@ -494,7 +503,9 @@ export function ImChannelPage({ showToast, sessions }: ImChannelPageProps) {
                   } catch {
                     // 查不到就静默跳过：授权引导不该把「建渠道成功」这一步变成失败
                   }
+                  return
                 }
+                showToast('已连接', 'success')
               }} />}
               {drawer.kind === 'security' && <SecurityPanel />}
               {drawer.kind === 'oauth' && drawer.instanceId && (

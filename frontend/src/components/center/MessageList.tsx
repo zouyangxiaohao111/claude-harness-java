@@ -16,6 +16,8 @@ import { u8ToBase64 } from '@/utils/base64'
 import { uploadAttachment } from '@/api/chat'
 import { briefErrorMessage, briefPayload, dropTextInBriefTurns, isBriefBlock, isSendUserMessage } from '@/utils/sendUserMessage'
 import { extractAtRefs } from '@/utils/atRefs'
+import { loadSkillCatalog, matchLeadingSkill } from '@/utils/skillBubble'
+import type { CommandDto } from '@/api/command'
 import { headTailCap } from '@/utils/headTailCap'
 // [错误通道 · CCJ-ERR-013] 工具卡状态判定的唯一入口（取消/拒绝/中断前缀先于 is_error，对齐 CC）
 import { classifyToolStatus, toolStatusIcon, toolStatusLabel } from '@/utils/toolStatus'
@@ -2110,8 +2112,18 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
       .map((id) => imageCache[msg.sessionId]?.[id])
       .filter((v): v is { mediaType: string; base64: string } => !!v)
   }, [msg.imageData, msg.imagePasteIds, msg.sessionId, imageCache])
-  /** 文件附件（非图片、非知识库引用）· 与图片同一条 attachment 行（chat-demo 结构） */
-  const userFileAtts = (msg.userAttachments ?? []).filter((a) => a.type !== 'image' && a.type !== 'kb' && a.filename)
+  /** 文件附件（非图片、非知识库引用、非技能标识）· 与图片同一条 attachment 行（chat-demo 结构） */
+  const userFileAtts = (msg.userAttachments ?? []).filter((a) => a.type !== 'image' && a.type !== 'kb' && a.type !== 'skill' && a.filename)
+  /**
+   * [技能气泡] 命令目录（按会话拉一次；同会话多条消息共享 `loadSkillCatalog` 的模块级缓存）。
+   * 渲染时按 content 首个 `/name` 反查：有 displayName → 顶部 chip；没有 → 正文内联 chip。
+   */
+  const [skillCatalog, setSkillCatalog] = useState<CommandDto[] | null>(null)
+  useEffect(() => {
+    let alive = true
+    void loadSkillCatalog(msg.sessionId).then((list) => { if (alive) setSkillCatalog(list) })
+    return () => { alive = false }
+  }, [msg.sessionId])
   // 对齐 Harness ChatView：展开思考/工具块是内容变化而非流尖推进，不触发滚动跟随。
   //   用户上滚查历史时点开思考下拉，滚动位置保持不动（治「点开思考回到底部」）。
   // snip_marker：snip 内部标记消息，前端不渲染（仅占位记录，避免气泡噪音）
@@ -2652,21 +2664,51 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                   ))}
                 </div>
               ) : null}
-              <div className="user-bubble">
-                {/* [Phase3 @引用] 正文里的 @token 直接渲染为内联可点 chip（单份 · 不再额外加引用卡片行）。
-                    无 @引用时仍走原有 ContentGuard markdown 渲染。 */}
-                {(() => {
-                  // 知识库轮次的 content 前缀是给模型的 runtime_context 块 ⇒ 展示前剥掉
-                  const shown = stripRuntimeContextForDisplay(msg.content ?? '')
-                  return extractAtRefs(shown).length > 0 ? (
-                    <div className="user-text user-ref-text">
-                      {renderUserRefText(shown, onOpenRefFile)}
-                    </div>
-                  ) : (
-                    <ContentGuard text={shown} className="user-text md markdown-prose" onRunHtml={onRunHtml} />
-                  )
-                })()}
-              </div>
+              {(() => {
+                // 知识库轮次的 content 前缀是给模型的 runtime_context 块 ⇒ 展示前剥掉
+                const shown = stripRuntimeContextForDisplay(msg.content ?? '')
+                // [纯附件消息] 无正文（只发了图片/文件）⇒ 不渲染气泡壳：
+                //   否则空 div 会按 .user-bubble 的背景+padding 画出一个空气泡（对齐 DSH：只有附件卡片）。
+                if (!shown.trim()) return null
+                // [技能气泡 2026-11-24 用户定] 按命令目录反查消息开头的 /name：
+                //   有 displayName → 气泡内顶部 chip 行（Octop 式，正文不变）；
+                //   没有 → 正文首个 /name 渲染成内联 chip（DSH 式）；目录未命中 → 原样。
+                const skill = matchLeadingSkill(shown, skillCatalog ?? [])
+                return (
+                  <div className="user-bubble">
+                    {skill?.named && (
+                      <div className="bubble-tags">
+                        <span
+                          className="skill-chip"
+                          title={`/${skill.name}${skill.entry.description ? ` · ${skill.entry.description}` : ''}`}
+                        >
+                          {skill.entry.icon
+                            ? <img className="skill-chip-img" src={skill.entry.icon} alt="" loading="lazy" />
+                            : <span className="skill-chip-fallback" aria-hidden="true">✦</span>}
+                          <span className="skill-chip-label">{(skill.entry.displayName ?? '').trim()}</span>
+                        </span>
+                      </div>
+                    )}
+                    {skill ? (
+                      // [DSH 同款 2026-11-24] 命中的技能命令在正文里也着色（等宽 token）；
+                      //   named 时上方另有中文 chip 行，正文仍保留 /name 原文（可复制、可复现）。
+                      <span className="user-text user-skill-inline">
+                        <span
+                          className="inline-skill"
+                          title={skill.entry.description ?? `/${skill.name}`}
+                        >{skill.token}</span>
+                        {skill.rest ? <> {skill.rest}</> : null}
+                      </span>
+                    ) : extractAtRefs(shown).length > 0 ? (
+                      <div className="user-text user-ref-text">
+                        {renderUserRefText(shown, onOpenRefFile)}
+                      </div>
+                    ) : (
+                      <ContentGuard text={shown} className="user-text md markdown-prose" onRunHtml={onRunHtml} />
+                    )}
+                  </div>
+                )
+              })()}
               {/* [用户消息编辑重发] 气泡下方 meta 行：默认隐藏 · hover 淡入（时间 + 编辑 + 复制） */}
               <div className={`user-msg-meta${hovered ? ' show' : ''}`}>
                 <span className="um-time">{userStamp}</span>

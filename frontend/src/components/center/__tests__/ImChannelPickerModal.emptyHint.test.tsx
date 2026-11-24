@@ -45,8 +45,12 @@ describe('[im-picker] 空渠道的引导', () => {
 
     // 弹窗走 portal，内容在 document.body 里
     const text = document.body.textContent ?? ''
-    expect(text).toContain('还没收到过消息')
+    // 断言跟随现有文案（旧断言「还没收到过消息」在 HEAD 版就与代码不一致，属测试漂移）
+    expect(text).toContain('这个渠道还没有能接到本会话的聊天')
     expect(text).toContain('启动连接')
     expect(text).toContain('私聊机器人发一句话')
+    // [21001] 飞书渠道空态必须指向平台策略/换账号，避免用户以为只是"没同步"
+    expect(text).toContain('21001')
+    expect(text).toContain('豆包账号')
   })
 })
