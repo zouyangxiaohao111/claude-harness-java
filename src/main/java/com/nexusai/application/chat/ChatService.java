@@ -1152,7 +1152,13 @@ public class ChatService {
                 maxTokensHandler != null, transientErrorHandler != null);
             String userPrompt = req != null ? req.content() : null;
             if (userPrompt == null || userPrompt.isBlank()) {
-                userPrompt = lastUserContent(loadRecentHistory(sessionId, HISTORY_LIMIT));
+                // [纯附件消息] 有附件时**不得**回落到上一轮用户文本：RunRequest 紧凑构造器拒绝空白
+                //   userPrompt，而回落历史会让模型把上一轮的话当成这一轮的 prompt（重复回答）。
+                //   给一个最小占位满足构造器；附件内容由 image/pdf block 与 file 类合成 Read 消息注入。
+                boolean hasAttachments = req != null && req.attachments() != null && !req.attachments().isEmpty();
+                userPrompt = hasAttachments
+                    ? "[附件]"
+                    : lastUserContent(loadRecentHistory(sessionId, HISTORY_LIMIT));
             }
             // [Phase3 @引用文件] 从 content 里的 @token（@path / @"path with space" · 用户 @ 提及字面）解析
             //   绑定项目内相对路径 → 读全文拼进本轮 user 文本（对齐 CC @file 上下文注入；

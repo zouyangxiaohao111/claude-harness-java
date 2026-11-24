@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.87] - 2026-11-24
+
+### Added
+
+- 修复 macOS 上后端因日志路径为相对目录而无法启动；修复 0.1.83 用户升级后迁移校验失败；长文本粘贴自动转附件
+
 ## [0.1.86] - 2026-11-23
 
 ### Added

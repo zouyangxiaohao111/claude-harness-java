@@ -91,9 +91,8 @@ export function classifyAttachmentFile(
  * - `video`/`audio`：**一律 upload** —— 这两类的 base64 后端零消费方（静默丢弃），
  *   而 upload 白名单（`AttachmentController.isAllowedType`）接受 `video/*`、`audio/*`
  * - `file`（docx/xlsx/zip/txt… Office MIME 不命中 media 前缀者）：**一律 upload（与大小无关）**
- *   - 原实现 ≤5MB ⇒ `reject`，唯一理由是「当时 upload 白名单（`AttachmentController.isAllowedType`）
- *     **不含 doc/docx/xls/xlsx** ⇒ 走 upload 必然 400」，而 base64 腿后端零消费方（静默丢弃）
- *     ⇒ 同步拒绝是当时唯一的「响亮失败」。
+ *   - upload 白名单（`AttachmentController.isAllowedType`）已含 doc/docx/xls/xlsx 与 text/*、.txt
+ *     （后者服务于「大段粘贴 → txt 附件」，见 `utils/pasteTextAttachment`）
  *   - **前提已变**：用户裁定 upload 白名单放开到 doc/docx/xls/xlsx（后端批 ATT-UPLOAD-DOC）
  *     ⇒ 继续同步拒绝会**砍掉一条现在能送达的腿**（模型拿不到用户发的 Word/Excel）⇒ 改走 upload。
  *     改后 file 类**只有一条腿**，不再有「同一个 .docx 时好时坏」的双形态。
@@ -107,6 +106,7 @@ export function classifyAttachmentFile(
  * Office MIME 亦不命中 `image/|video/|audio/` 前缀 ⇒ 一个大 `.docx` 走 upload **今天就是 400**
  * （`AttachmentController:172-175` → 「附件上传失败：不支持的文件类型」）；`verifyMagic` 的兜底腿
  * （`:528`）只认「无 mediaType ⇒ 试图片魔数」，也不认 OOXML。⇒ **交给 ATT-UPLOAD-DOC 放开。**
+ * （2026-11-24 [PASTE-TXT] 已同步放开 `text/*` 与 `.txt`，`looksLikeText` 拦住二进制冒充。）
  *
  * <b>`'reject'` 通道现状（如实登记）</b>：本函数**当前已无任何输入会返回 `'reject'`**
  * （image/pdf → base64|upload，video/audio/file → upload）。该通道与

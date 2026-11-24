@@ -174,7 +174,7 @@ public class AttachmentController {
         if (!isAllowedType(filename, mediaType)) {
             log.warn("附件上传拒绝：非白名单类型（mediaType={} filename={}）session={}", mediaType, filename, sessionId);
             throw new ValidationException(
-                    "附件上传失败：不支持的文件类型（支持 image/video/audio/pdf/doc/docx/xls/xlsx）");
+                    "附件上传失败：不支持的文件类型（支持 image/video/audio/pdf/doc/docx/xls/xlsx/txt）");
         }
         // 魔数校验（防 HTML/文本改名伪装媒体或 PDF；[ATT-DOC] 文档类按容器魔数：docx/xlsx=ZIP、doc/xls=OLE2）
         byte[] head = readHead(file, sessionId);
@@ -410,13 +410,17 @@ public class AttachmentController {
     // ════════════════════════════════════════════════════════════════════
 
     /**
-     * 类型白名单 · mediaType 主类型 image/video/audio 或 PDF；或文件名扩展名白名单兜底
-     * （媒体类 + [ATT-DOC] 文档类 doc/docx/xls/xlsx）。
+     * 类型白名单 · mediaType 主类型 image/video/audio/text 或 PDF；或文件名扩展名白名单兜底
+     * （媒体类 + [ATT-DOC] 文档类 doc/docx/xls/xlsx + [PASTE-TXT] 文本类 txt）。
      *
      * <p>[ATT-DOC · 用户裁定 2026-09-18] 放开到<b>文档类</b>：此前的表只有媒体扩展名，
      * 而 {@code >5MB 的 Word/Excel} 在前端只能走 upload 腿（{@code attachmentDelivery.ts}
      * 对 {@code type=file} 的 {@code >5MB} 决策）⇒ 必然命中本门 400「不支持的文件类型」。
      * 放开后仍由 {@link #verifyMagic} 按容器魔数兜底（docx/xlsx=ZIP、doc/xls=OLE2）。
+     *
+     * <p>[PASTE-TXT · 对齐 DSH] 放开<b>文本类</b>（{@code text/*} 与 {@code .txt}）：
+     * 输入框把 &gt;10000 字的粘贴转成 .txt 附件后只能走 upload 腿（浏览器里 File 没有本地路径），
+     * 本门不收会让「大段粘贴转附件」永远 400。魔数门由 {@link #looksLikeText} 兜底。
      */
     private boolean isAllowedType(String filename, String mediaType) {
         if (isPdfFile(filename, mediaType)) {
@@ -424,7 +428,8 @@ public class AttachmentController {
         }
         if (mediaType != null) {
             String primary = mediaType.toLowerCase();
-            if (primary.startsWith("image/") || primary.startsWith("video/") || primary.startsWith("audio/")) {
+            if (primary.startsWith("image/") || primary.startsWith("video/") || primary.startsWith("audio/")
+                    || primary.startsWith("text/")) {
                 return true;
             }
         }
@@ -437,7 +442,9 @@ public class AttachmentController {
                     || lower.endsWith(".flac")
                     // [ATT-DOC] 文档类（docx/xlsx=OOXML/ZIP；doc/xls=旧版 OLE2）
                     || lower.endsWith(".doc") || lower.endsWith(".docx")
-                    || lower.endsWith(".xls") || lower.endsWith(".xlsx");
+                    || lower.endsWith(".xls") || lower.endsWith(".xlsx")
+                    // [PASTE-TXT] 文本类
+                    || lower.endsWith(".txt");
         }
         return false;
     }
@@ -559,6 +566,12 @@ public class AttachmentController {
         if (isLegacyOfficeDocFile(filename)) {
             return isOle2(h);
         }
+        // [PASTE-TXT] 文本类：纯文本没有魔数 ⇒ 只判「像不像文本（无二进制控制字符）」。
+        //   位置约束同文档类：必须落在显式媒体类型/容器判定之后 —— .docx 声明 text/plain 时
+        //   先被上面的 OOXML 门接住，不能靠 text 分支放行。
+        if (mt.startsWith("text/") || isTxtFile(filename)) {
+            return looksLikeText(h);
+        }
         if (mt.startsWith("image/")) {
             return isPng(h) || isJpeg(h) || isGif(h) || isWebp(h) || isBmp(h);
         }
@@ -575,6 +588,31 @@ public class AttachmentController {
 
     private boolean isPng(byte[] h) {
         return (h[0] & 0xFF) == 0x89 && h[1] == 0x50 && h[2] == 0x4E && h[3] == 0x47;
+    }
+
+    /** `.txt` 扩展名判定（{@link #verifyMagic} 的文本分支用）。 */
+    private static boolean isTxtFile(String filename) {
+        return filename != null && filename.toLowerCase().endsWith(".txt");
+    }
+
+    /**
+     * 文本载荷判定：头部不得出现二进制控制字符（{@code \t \n \r} 除外）。
+     *
+     * <p>纯文本没有魔数；若直接「text/* ⇒ true」，PNG / ZIP / PDF 改名 .txt 就能穿过魔数门。
+     * 这里只做「不是二进制」的最低判定：任意 NUL 或 <0x20 的控制字符即拒绝 —— PNG 的 0x1A、
+     * ZIP 的 0x03/0x04、JPEG 的 NUL 都会命中。UTF-8 多字节字符的高位字节（≥0x80）不受影响。
+     */
+    private boolean looksLikeText(byte[] h) {
+        for (byte b : h) {
+            int v = b & 0xFF;
+            if (v == 0x09 || v == 0x0A || v == 0x0D) {
+                continue;
+            }
+            if (v < 0x20 || v == 0x7F) {
+                return false;
+            }
+        }
+        return true;
     }
 
     private boolean isJpeg(byte[] h) {

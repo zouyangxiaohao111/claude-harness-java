@@ -4,13 +4,18 @@
 # 也可显式选择：--spring.profiles.active=dev / SPRING_PROFILES_ACTIVE=dev；
 #   Tauri 壳自启后端时可用 NEXUSAI_BACKEND_PROFILE=dev 覆盖壳侧默认的 prod/scene。
 #
-# 日志：相对路径 logs —— 由进程工作目录决定：
-#   IDE 启动（cwd=backend/）        ⇒ <repo>/backend/logs
-#   Tauri 壳自启（cwd={data_dir}）  ⇒ {data_dir}/logs（场景版即 ~/.nexusai-scene/logs）
+# 日志：⚠️ 必须用**绝对可写路径**，⛔ 不能用相对 `logs`。
+#
+# [2026-11-24 macOS 启动即崩] 相对路径由**进程工作目录**决定，而 macOS 上从 Finder/Dock
+#   启动（或从只读目录执行 `java -jar`）时 cwd 可能是 `/` ⇒ logback 打开 `logs/info.log`
+#   直接 `FileNotFoundException: logs/info.log (Permission denied)` ⇒
+#   `Logback configuration error detected` ⇒ Spring 环境准备阶段就抛异常 ⇒ 后端起不来。
+#   ⇒ 与 prod 同源：{user.home}/.{spring.application.name}/logs（主仓 = ~/.nexusai/logs）。
+#   ⚠️ 代价：IDE 本地开发的日志不再落在 <repo>/backend/logs，统一到 ~/.nexusai/logs。
 # =====================================================================
 logging:
   file:
-    path: logs
+    path: ${user.home}/.${spring.application.name}/logs
 
 # ---------------------------------------------------------------------
 # ⛔ 本文件不设 spring.datasource.url：

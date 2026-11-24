@@ -52,7 +52,8 @@ import static org.springframework.test.web.servlet.result.MockMvcResultMatchers.
  * <p><b>负例与正例同批（规则九）</b>：只测「放行」会让 {@code verifyMagic} 被顺带删空、
  * 或让「ZIP 魔数」变成任意 ZIP 的通行证而测试仍全绿 —— 故本类同时锁死：
  * 内容与扩展名不符（HTML/PNG 冒充 .docx、ZIP 冒充 .doc）必须 400；
- * 未放开的类型（.txt / .zip）必须仍 400；{@code >100MB} 上限不得放宽。
+ * 未放开的类型（.zip）必须仍 400；.txt 已按 [PASTE-TXT] 放开（大段粘贴转 txt 附件的落点），
+ * 但「二进制改名 .txt」必须仍 400；{@code >100MB} 上限不得放宽。
  *
  * <p><b>与 {@link AttachmentControllerUploadTest} 的关系</b>：那个类只注入了 {@code pdfAttachmentStore}
  * （且其两条 200 用例因 {@code attachmentService} 未注入而 NPE → 500，属<b>既存红</b>）。
@@ -275,10 +276,27 @@ class AttachmentControllerUploadDocTest {
     }
 
     @Test
-    @DisplayName("⑩ .txt 不在白名单 → 400（本次只放开文档类，未顺带放开文本类）")
-    void txtExtensionStillRejected() throws Exception {
+    @DisplayName("⑩ .txt + text/plain → 200（[PASTE-TXT] 对齐 DSH：粘贴超 10000 字转 txt 附件必须能上传）")
+    void txtUpload_ok() throws Exception {
         MockMultipartFile file = new MockMultipartFile(
-            "file", "notes.txt", MediaType.TEXT_PLAIN_VALUE, "hello".getBytes(StandardCharsets.US_ASCII));
+            "file", "notes.txt", MediaType.TEXT_PLAIN_VALUE,
+            "java.io.FileNotFoundException: logs/info.log (Permission denied)\n".getBytes(StandardCharsets.UTF_8));
+
+        // ⚠️ 不在此断言 media-cache 落盘路径：本类 docx/doc/xls 三条同款落盘断言在本机环境已既存红
+        //   （MediaAttachmentStore 落盘根与 NexusaiPaths 断言根不一致，与校验门无关）。本用例只锁
+        //   「白名单 + 文本魔数门放行」这一新行为；落盘由 MediaAttachmentStore 自身测试覆盖。
+        mvc.perform(multipart("/api/v1/attachments/upload").file(file).param("sessionId", SESSION))
+            .andExpect(status().isOk())
+            .andExpect(jsonPath("$.contentId").value("1"))
+            .andExpect(jsonPath("$.filename").value("notes.txt"))
+            .andExpect(jsonPath("$.mediaType").value("text/plain"));
+    }
+
+    @Test
+    @DisplayName("⑩b PNG 字节改名 .txt → 400（文本魔数门：NUL/控制字符即拒，不能靠扩展名混过）")
+    void txtWithPngContent_badRequest() throws Exception {
+        MockMultipartFile file = new MockMultipartFile(
+            "file", "伪装.txt", MediaType.TEXT_PLAIN_VALUE, pngBytes());
 
         mvc.perform(multipart("/api/v1/attachments/upload").file(file).param("sessionId", SESSION))
             .andExpect(status().isBadRequest());

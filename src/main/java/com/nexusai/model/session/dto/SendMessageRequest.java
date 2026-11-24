@@ -1,13 +1,14 @@
 package com.nexusai.model.session.dto;
 
 import com.fasterxml.jackson.databind.JsonNode;
-import jakarta.validation.constraints.NotBlank;
 import java.util.List;
 import java.util.Map;
 
 /** POST /api/v1/sessions/{sessionId}/messages 请求 */
 public record SendMessageRequest(
-    @NotBlank String content,
+    // 组合校验在 ChatController.send：**无附件**时才必填（纯附件消息允许空串，对齐 DSH）。
+    // 不能标 @NotBlank —— 前端「只上传文件」时 content 就是空串。
+    String content,
     String modelName,                // 可选 · 覆盖 session 默认 model
     Boolean useFastModel,            // 可选 · true=用 fastModel，false=用 mainModel
     List<AttachmentRequest> attachments, // 附件列表 · 对齐 CC pastedContents（utils/config.ts:54-62，

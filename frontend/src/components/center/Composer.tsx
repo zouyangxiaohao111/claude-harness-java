@@ -25,6 +25,7 @@ import { compactNumber, formatFileSize } from '@/utils/format'
 import { AttachFileIcon } from './AttachFileIcon'
 import { AttachPreviewModal } from './AttachPreviewModal'
 import { contentDedupKey, deliverAttachmentFiles, fileDedupKey } from '@/utils/attachmentDelivery'
+import { PASTE_TEXT_ATTACHMENT_LIMIT, pasteTextFileName, shouldConvertPastedText } from '@/utils/pasteTextAttachment'
 import { u8ToBase64 } from '@/utils/base64'
 import '@/styles/kb-mention.css'
 import { classifyAttachmentPath, pathDedupKey, planPathAttachmentChannel } from '@/utils/pathAttachment'
@@ -1169,7 +1170,7 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
       const noSession = summary.rejected.filter((r) => r.reason === 'no-session').map((r) => r.filename)
       const parts: string[] = []
       if (summary.accepted > 0) parts.push(`已添加 ${summary.accepted} 个附件`)
-      if (unsupported.length) parts.push(`不支持的文件类型：${unsupported.join('、')}（本通道仅支持 图片 / PDF / 视频 / 音频）`)
+      if (unsupported.length) parts.push(`不支持的文件类型：${unsupported.join('、')}（本通道支持 图片 / PDF / 视频 / 音频 / Word / Excel / 文本）`)
       if (noSession.length) parts.push(`需先打开一个会话再添加附件：${noSession.join('、')}`)
       if (summary.failed.length) parts.push(`读取失败：${summary.failed.map((f) => f.filename).join('、')}`)
       if (parts.length) {
@@ -1354,6 +1355,15 @@ export function Composer({composerText, setComposerText, sendMessage, attachment
       e.preventDefault()
       addFiles(images)
       console.debug('[paste] 图片走 items/files 路径', images.map((f) => `${f.name}:${f.type}:${f.size}`))
+      return
+    }
+    // 大段文本粘贴 → txt 附件（对齐 DSH paste-as-text-attachment：>10000 字符、按 UTF-16 码元计）
+    const pastedText = e.clipboardData?.getData('text/plain') ?? ''
+    if (shouldConvertPastedText(pastedText, e.clipboardData?.files?.length ?? 0)) {
+      e.preventDefault()
+      const filename = pasteTextFileName(pastedText)
+      console.warn(`[paste] 文本 ${pastedText.length} 字 > ${PASTE_TEXT_ATTACHMENT_LIMIT} → 转 txt 附件 filename=${filename}`)
+      addFiles([new File([pastedText], filename, { type: 'text/plain' })])
       return
     }
     // 兜底：WebView2 某些场景 items/files 不含图片 → navigator.clipboard.read() 异步读剪贴板图片

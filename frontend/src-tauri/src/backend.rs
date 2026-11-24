@@ -111,9 +111,32 @@ pub fn data_dir() -> PathBuf {
 
 /// 确保 `{data_dir}` 与 `{data_dir}/logs` 存在（后端日志落盘与相对数据文件的前提）。
 pub fn ensure_data_dirs() -> std::io::Result<()> {
+    // ⚠️ 必须显式拦「HOME/USERPROFILE 缺失」：data_dir() 会回落 `.`（= 进程 cwd），
+    //    而 macOS 从 Finder/Dock 启动时 cwd 常是 `/`（只读）⇒ create_dir_all 失败，
+    //    报错却看不出根因（用户实测：日志一片 Permission denied 才定位到）。
+    let home_var = if cfg!(windows) { "USERPROFILE" } else { "HOME" };
+    if std::env::var_os(home_var).is_none() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "环境变量 {home_var} 未设置，无法确定数据目录（应为 {home_var}/.nexusai）。\
+                 请从正常登录会话启动应用，或显式设置 {home_var} 后再启动。"
+            ),
+        ));
+    }
     let root = data_dir();
-    std::fs::create_dir_all(&root)?;
-    std::fs::create_dir_all(root.join("logs"))?;
+    std::fs::create_dir_all(&root).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("创建数据目录失败：{}（{}）", root.display(), e),
+        )
+    })?;
+    std::fs::create_dir_all(root.join("logs")).map_err(|e| {
+        std::io::Error::new(
+            e.kind(),
+            format!("创建日志目录失败：{}（{}）", root.join("logs").display(), e),
+        )
+    })?;
     Ok(())
 }
 

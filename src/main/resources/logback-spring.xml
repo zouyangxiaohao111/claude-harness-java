@@ -4,7 +4,11 @@
     <include resource="org/springframework/boot/logging/logback/defaults.xml" />
 
     <!-- 外部可配项（application.yml logging.* 注入；未配置回落默认） -->
-    <springProperty scope="context" name="log-file-path" source="logging.file.path" defaultValue="logs"/>
+    <!-- ⚠️ 兜底必须是**绝对可写路径**：相对 `logs` 会随 cwd 走，macOS 从 Finder/只读目录启动时
+         cwd 可能是 `/` ⇒ openFile 报 Permission denied ⇒ Spring 环境准备阶段直接抛异常。
+         （dev/prod 都显式配了 logging.file.path；此默认只在「都没配」时生效。） -->
+    <springProperty scope="context" name="log-file-path" source="logging.file.path"
+                    defaultValue="${user.home}/.nexusai/logs"/>
     <springProperty scope="context" name="log-rolling-max-file-size" source="logging.logback.rollingpolicy.max-file-size" defaultValue="32MB"/>
     <springProperty scope="context" name="log-rolling-total-size-cap" source="logging.logback.rollingpolicy.total-size-cap" defaultValue="512MB"/>
     <springProperty scope="context" name="log-rolling-max-history" source="logging.logback.rollingpolicy.max-history" defaultValue="14"/>

@@ -20,6 +20,7 @@ import com.nexusai.application.agent.tasks.QueueEventPublisher;
 import com.nexusai.application.agent.compact.SqliteBusyRetry;
 import com.nexusai.domain.session.MessageService;
 import com.nexusai.domain.session.SessionService;
+import com.nexusai.infra.exception.ValidationException;
 import jakarta.validation.Valid;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -160,6 +161,12 @@ public class ChatController {
     @ResponseStatus(HttpStatus.ACCEPTED)
     public MessageCreatedResponse send(@PathVariable String sessionId,
                                        @Valid @RequestBody SendMessageRequest req) {
+        // [纯附件消息] content 改为「无附件时才必填」：前端「只上传文件」发的就是空串
+        //   （原先 @NotBlank 直接 400，用户感知「不许只发文件」）。判据与前端发送按钮同源：
+        //   文本空白 **且** 附件列表为空 ⇒ 拒绝；任一非空 ⇒ 放行。
+        if (isEmptyContentWithoutAttachments(req)) {
+            throw new ValidationException("消息内容不能为空（无附件时必填）");
+        }
         // [P-26] fallback==main 校验落 HTTP 请求体层（同步 400）· CC main.tsx:1336-1340
         //   stderr + exit(1) 等价；ValidationException → GlobalExceptionHandler 400
         //   （createUserMessage 前校验，避免非法请求落库）
@@ -225,6 +232,17 @@ public class ChatController {
                 LlmAgentLoop.releaseClaim(claim);
             }
         }
+    }
+
+    /**
+     * [纯附件消息] content 组合判据：文本空白 **且** 无附件 ⇒ 非法。
+     *
+     * <p>包可见 + static：发送路径与单测共用同一份判据，避免单测复制条件后与生产漂移。
+     */
+    static boolean isEmptyContentWithoutAttachments(SendMessageRequest req) {
+        boolean noText = req == null || req.content() == null || req.content().isBlank();
+        boolean noAttachments = req == null || req.attachments() == null || req.attachments().isEmpty();
+        return noText && noAttachments;
     }
 
     /**
