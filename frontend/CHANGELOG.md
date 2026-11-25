@@ -7,6 +7,7 @@ All notable changes to NexusAI will be documented in this file.
 ### Fixed
 
 - 修复技能市场预览与知识库文件选择的问题（修改人：zcw）
+- 修复通用设置「关于 → 更新」按钮点击无反应：按钮发出 `nexusai:check-update` 事件但 `UpdateCenter` 未监听（事件发给了空气），并移除重复的右下角悬浮入口，更新弹窗改为压在设置弹窗之上（z-index 420）。（修改人：zcw）
 
 ## [0.1.89] - 2026-11-25
 

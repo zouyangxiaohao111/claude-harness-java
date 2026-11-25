@@ -15,7 +15,8 @@ import {
 type Stage = 'idle' | 'checking' | 'found' | 'notes' | 'dl' | 'ready' | 'fail' | 'latest' | 'installing'
 
 /**
- * 自动更新中心（自包含）：右下角悬浮「更新」入口 + 发现新版自动弹窗。
+ * 自动更新中心（自包含）：手动入口只有「基础设置 → 关于 → 更新」一处（发 nexusai:check-update 事件），
+ * 另有启动 3s 自动检查 + 发现新版自动弹窗。
  * 状态机对应 docs/.../autoupdate.html（latest 化：对外只说“有新版本”，真实版本在说明/关于）。
  * dev(浏览器) 无 Tauri → 不渲染。
  */
@@ -62,6 +63,13 @@ export function UpdateCenter({ appName }: { appName?: string | null }) {
     }
   }, [current, appName])
 
+  // 基础设置「关于 → 更新」按钮通过自定义事件触发手动检查（不把 check 暴露到 App）
+  useEffect(() => {
+    const onCheck = () => { if (stage === 'idle') void check(true) }
+    window.addEventListener('nexusai:check-update', onCheck)
+    return () => window.removeEventListener('nexusai:check-update', onCheck)
+  }, [check, stage])
+
   useEffect(() => {
     // appName 未就绪时不排程：等设置到达后本 effect 重跑，再决定用哪套更新源
     if (!tauri || !appName) return
@@ -106,19 +114,8 @@ export function UpdateCenter({ appName }: { appName?: string | null }) {
 
   return (
     <>
-      {/* 悬浮入口 */}
-      <button
-        className="ud-fab"
-        title="检查更新"
-        onClick={() => { if (stage === 'idle') void check(true) }}
-      >
-        <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-          <path d="M12 3v11m0 0 4-4m-4 4-4-4M4 17v1a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-1" />
-        </svg>
-      </button>
-
       {open && (
-        <div className="overlay-backdrop" onClick={stage === 'found' || stage === 'notes' || stage === 'latest' ? close : undefined}>
+        <div className="overlay-backdrop ud-backdrop" onClick={stage === 'found' || stage === 'notes' || stage === 'latest' ? close : undefined}>
           <div className="ud-dlg" onClick={(e) => e.stopPropagation()}>
             <div className="ud-head">
               <div className={`ud-ic ${stage === 'fail' ? 'warn' : stage === 'ready' || stage === 'latest' ? 'ok' : 'brand'}`}>
