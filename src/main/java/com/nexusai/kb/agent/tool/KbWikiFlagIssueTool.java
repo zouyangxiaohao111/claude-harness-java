@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -45,7 +44,6 @@ import java.util.Locale;
  * 所以这里直接走 mapper 单条插入。
  */
 @Component
-@ExclusiveTool
 public class KbWikiFlagIssueTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiFlagIssueTool.class);

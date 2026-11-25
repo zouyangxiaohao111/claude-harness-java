@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -46,7 +45,6 @@ import java.util.regex.PatternSyntaxException;
  * ⛔ 不能只信模型传进来的 id（那等于把权限判断交给模型）。
  */
 @Component
-@ExclusiveTool
 public class KbReadDocumentTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbReadDocumentTool.class);

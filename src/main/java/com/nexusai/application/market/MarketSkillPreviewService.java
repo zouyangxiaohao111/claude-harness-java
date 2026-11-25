@@ -81,10 +81,11 @@ public class MarketSkillPreviewService {
             zipUrl = assertAllowedUrl(url);
         } else if (source != null && !source.isBlank()) {
             zipUrl = base + "/" + stripSlashes(source) + "/plugin.zip";
-        } else if (version != null && !version.isBlank()) {
-            zipUrl = base + "/skills/" + name + "/" + version + "/plugin.zip";
         } else {
-            ManifestHit hit = resolveFromManifest(name);
+            // ⛔ 不得用 name+version 硬拼路径：清单 entry.source 才是唯一权威。目录名可能与 name 不同
+            //   （name=zjky-doc-writer → source=skills/doc-writer/0.1.0），分类前缀也可能是 experts/connectors。
+            //   version 只用于在 versions[] 里挑对应那条。
+            ManifestHit hit = resolveFromManifest(name, version);
             zipUrl = hit.url();
             resolvedVersion = hit.version();
         }
@@ -188,7 +189,14 @@ public class MarketSkillPreviewService {
         return null;
     }
 
-    private ManifestHit resolveFromManifest(String name) {
+    /**
+     * 按清单解析 plugin.zip URL。
+     *
+     * <p>{@code wantedVersion} 非空且不等于当前版本时，到 {@code versions[]} 找该版本的 {@code source}
+     * ——回滚后 entry.source 指向当前版本，不代表历史版本目录。现代清单（有 versions[]）里找不到该版本
+     * 一律 404；旧清单没有 versions[] 时无法校验，按 entry.source 尽力而为。
+     */
+    private ManifestHit resolveFromManifest(String name, String wantedVersion) {
         Path tmp = null;
         try {
             tmp = Files.createTempDirectory("nexusai-market-manifest-");
@@ -203,6 +211,27 @@ public class MarketSkillPreviewService {
                     }
                     String version = n.path("version").asText(null);
                     String source = n.path("source").asText(null);
+                    if (wantedVersion != null && !wantedVersion.isBlank()
+                            && !wantedVersion.equals(version)) {
+                        JsonNode versions = n.path("versions");
+                        String hitSource = null;
+                        if (versions.isArray()) {
+                            for (JsonNode v : versions) {
+                                if (wantedVersion.equals(v.path("version").asText(null))) {
+                                    hitSource = v.path("source").asText(null);
+                                    break;
+                                }
+                            }
+                        }
+                        if (hitSource != null && !hitSource.isBlank()) {
+                            source = hitSource;
+                            version = wantedVersion;
+                        } else if (versions.isArray() && !versions.isEmpty()) {
+                            throw new NotFoundException(
+                                    "市场清单中没有该版本：" + name + "@" + wantedVersion);
+                        }
+                        // 旧清单无 versions[] → 无法校验历史版本，按 entry.source 尽力而为
+                    }
                     if (source == null || source.isBlank()) {
                         String category = n.path("category").asText("skill");
                         String dirName = switch (category) {

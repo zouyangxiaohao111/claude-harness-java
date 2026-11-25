@@ -3,6 +3,7 @@ import { createPortal } from 'react-dom'
 import { ApiError } from '@/api/rest'
 import { knowledgeApi, PARSE_STATUS_LABEL, PARSE_STATUS_TONE } from '@/api/knowledge'
 import type { KbFolderNode, KbTag, Knowledge, SearchHit } from '@/api/knowledge'
+import { FolderPicker } from './FolderPicker'
 import { KbUploadSource } from './KbUploadSource'
 import { KbDocDrawer } from './KbDocDrawer'
 import { KbProcessingTimeline } from './KbProcessingTimeline'
@@ -328,17 +329,20 @@ export function KnowledgeDocPanel({
     }
   }
 
-  const handleMove = async (row: Knowledge) => {
-    const to = window.prompt('移动到文件夹（留空 = 移出文件夹）', row.folder_path ?? '')
-    if (to === null) return
-    try {
-      await knowledgeApi.moveToFolder([row.id], to.trim())
-      showToast('已移动', 'success')
-      void loadItems()
-      void loadFolders()
-    } catch (e) {
-      showToast(toMessage(e), 'info')
-    }
+  /**
+   * 目标文件夹选择器（对齐源站 `FolderPickerMenu.vue`）：单行与批量共用。
+   *
+   * <p>⛔ 不再用 `window.prompt` 手打路径 —— 那样既看不到目录树，也没法在选的同时新建
+   * （源站的「新建文件夹」正是在这个选择器里做的：选一个新路径 = 把文档移进去 = 目录出现）。
+   */
+  const [folderPickState, setFolderPickState] = useState<{ ids: string[]; title: string } | null>(null)
+
+
+  const handleMove = (row: Knowledge) => {
+    setFolderPickState({
+      ids: [row.id],
+      title: `移动「${row.title || row.file_name || row.id}」到文件夹`,
+    })
   }
 
   /**
@@ -960,6 +964,19 @@ export function KnowledgeDocPanel({
                     ))}
                   </select>
                 )}
+                {/* 批量移动（对齐源站 DocumentBatchBar 的「移动到…」）：
+                    与单行移动共用同一个文件夹选择器（可在选择器里新建文件夹）。 */}
+                <button
+                  type="button"
+                  className="t-button t-button--variant-outline t-button--theme-default t-size-s"
+                  disabled={selectedIds.size === 0}
+                  onClick={() => setFolderPickState({
+                    ids: [...selectedIds],
+                    title: `移动 ${selectedIds.size} 个文档到文件夹`,
+                  })}
+                >
+                  <span className="t-button__text">移动到…</span>
+                </button>
                 <button
                   type="button"
                   className="t-button t-button--variant-outline t-button--theme-default t-size-s"
@@ -1465,6 +1482,28 @@ export function KnowledgeDocPanel({
           </div>
         </div>,
         document.body,
+      )}
+
+      {/* 目标文件夹选择器（单行 / 批量移动共用 · 可在其中新建文件夹） */}
+      {folderPickState && (
+        <FolderPicker
+          baseId={baseId}
+          title={folderPickState.title}
+          onPick={async (path) => {
+            const ids = folderPickState.ids
+            setFolderPickState(null)
+            try {
+              await knowledgeApi.moveToFolder(ids, path)
+              showToast(ids.length > 1 ? `已移动 ${ids.length} 个文档` : '已移动', 'success')
+              setSelectedIds(new Set())
+              void loadItems()
+              void loadFolders()
+            } catch (e) {
+              showToast(toMessage(e), 'info')
+            }
+          }}
+          onClose={() => setFolderPickState(null)}
+        />
       )}
 
       {/* 2. 移动到…（跨知识库） */}

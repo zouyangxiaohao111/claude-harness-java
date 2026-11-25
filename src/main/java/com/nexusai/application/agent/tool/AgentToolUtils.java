@@ -301,4 +301,93 @@ public final class AgentToolUtils {
         }
         return result;
     }
+
+    /**
+     * [agent-named-default-disabled 2026-11-24] 子代理按名点名的工具若属于「默认禁用集」（CU/KB），
+     * 即使被 async 白名单或专属工具过滤剔除，也补回结果。
+     *
+     * <p>语义对齐主线程的「人格优先豁免」：专家在 {@code tools} 里点名 = 显式要求。
+     * 只补默认禁用集内的工具 ⇒ Bash/Write 等不在其中，async 安全边界不变；
+     * 专家 {@code disallowedTools} 仍然优先剔除。
+     *
+     * @param source     补全来源（全量工具池）
+     * @param filtered   已过 4-SET / async 白名单的结果
+     * @param declared   专家点名的工具名（空 Optional = 通配）
+     * @param disallowed 专家显式禁用的工具名
+     * @return 补齐后的列表（无变更时原样返回）
+     */
+    public static List<Tool> augmentAgentNamedDefaultDisabled(List<Tool> source, List<Tool> filtered,
+                                                              Optional<List<String>> declared,
+                                                              Optional<List<String>> disallowed) {
+        if (source == null || source.isEmpty() || filtered == null) {
+            return filtered;
+        }
+        List<String> names = declared == null ? null : declared.orElse(null);
+        if (names == null || names.isEmpty()) {
+            return filtered;
+        }
+        if (names.size() == 1 && names.get(0) != null && "*".equals(names.get(0).trim())) {
+            return filtered;
+        }
+        Set<String> defaultDisabled = SessionToolCategory.defaultDisabledNamesStatic();
+        if (defaultDisabled == null || defaultDisabled.isEmpty()) {
+            return filtered;
+        }
+        Set<String> banned = new LinkedHashSet<>();
+        if (disallowed != null && disallowed.isPresent() && disallowed.get() != null) {
+            for (String d : disallowed.get()) {
+                if (d != null && !d.isBlank()) {
+                    banned.add(d.trim());
+                }
+            }
+        }
+        Set<String> present = new LinkedHashSet<>();
+        for (Tool t : filtered) {
+            if (t != null && t.name() != null) {
+                present.add(t.name());
+            }
+        }
+        Set<String> wanted = new LinkedHashSet<>();
+        for (String n : names) {
+            if (n == null) {
+                continue;
+            }
+            String name = n.trim();
+            if (name.isEmpty() || "*".equals(name) || banned.contains(name)) {
+                continue;
+            }
+            if (defaultDisabled.contains(name) && !present.contains(name)) {
+                wanted.add(name);
+            }
+        }
+        if (wanted.isEmpty()) {
+            return filtered;
+        }
+        // 取数来源：优先全量注册表（source 可能是父会话已过滤过的池，未必含这些工具）
+        List<Tool> full = source;
+        ToolRegistry reg = SessionToolCategory.registryStatic();
+        if (reg != null) {
+            List<Tool> all = reg.all();
+            if (all != null && !all.isEmpty()) {
+                full = all;
+            }
+        }
+        List<Tool> out = new ArrayList<>(filtered);
+        for (Tool t : full) {
+            if (t == null || t.name() == null) {
+                continue;
+            }
+            // [scope 守卫] 仍带 @ExclusiveTool 的工具不由此补丁放开：
+            //   注解语义 = 只能由"去掉注解"来显式开放，不能靠专家点名绕过。
+            if (ToolScope.of(t) != ToolScope.COMMON) {
+                continue;
+            }
+            if (wanted.contains(t.name()) && present.add(t.name())) {
+                out.add(t);
+            }
+        }
+        log.info("[AgentToolUtils] 专家点名补回默认禁用工具 {} → {}（补 {} 个：{}）",
+                filtered.size(), out.size(), out.size() - filtered.size(), wanted);
+        return out;
+    }
 }

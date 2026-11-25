@@ -918,7 +918,10 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
    * <p><b>⚠️ 不可恢复</b>：后端真实删除安装目录。必须二次确认，且确认框要说清
    * 「卸插件会连带它带来的全部技能/专家」—— 用户点之前得知道后果。
    */
-  const handleUninstall = async (skill: MarketSkill, fromLocal: boolean) => {
+  const handleUninstall = async (
+    skill: { marketId: string; displayName?: string | null; name?: string | null },
+    fromLocal: boolean,
+  ) => {
     const nm = skill.displayName || skill.name || skill.marketId
     const what = fromLocal ? `技能「${nm}」` : `插件「${nm}」`
     const extra = fromLocal
@@ -1318,11 +1321,15 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
                           </div>
                         )
                       ) : (
-                        <div className="sm-expert-grid">
-                          {visibleExperts.map((c) => (
+                        /* [2026-11-24 用户定] 专家卡与技能卡同款：sk-grid 固定 5 列 + sk-card 紧凑样式 */
+                        <div className="sk-grid">
+                          {visibleExperts.map((c) => {
+                            const menuOpen = openMenuId === c.key
+                            const closeMenu = () => setOpenMenuId(null)
+                            return (
                             <MarketCard
                               key={c.key}
-                              extraClass={`sm-card sm-expert-card${c.kind === 'remote' ? ' remote' : ''}${c.inUse ? ' in-use' : ''}`}
+                              extraClass={`sk-card${c.kind === 'remote' ? ' remote' : ''}${c.inUse ? ' in-use' : ''}`}
                               accent={c.iconColor}
                               onClick={() => setSceneExpert({ card: c, sceneKey: null })}
                               icon={renderAvatar(c)}
@@ -1362,44 +1369,100 @@ export function MarketBrowser({ sessionId, currentAgent, busy: _busy, initialTab
                                   )}
                                 </>
                               )}
-                              footerRight={<span style={{ display: 'contents' }} onClick={(e) => e.stopPropagation()}>{c.kind === 'remote' ? (
-                                installed.has(c.marketId) ? (
-                                  <span style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                    {hasUpdate(c.marketId, c.fingerprint, c.version) ? (
-                                      <button
-                                        className={`sm-use-btn${installing.has(c.marketId) ? ' installing' : ''}`}
-                                        disabled={installing.has(c.marketId)}
-                                        onClick={() => void installMarketPlugin(c.marketId)}
-                                      >
-                                        {installing.has(c.marketId) ? `${progress[c.marketId]?.percent ?? 0}%` : '更新'}
-                                      </button>
+                              overlay={(
+                                <>
+                                  <span className="sk-acts" onClick={(e) => e.stopPropagation()}>
+                                    <button
+                                      className="sk-more"
+                                      title="更多"
+                                      aria-label="更多"
+                                      aria-expanded={menuOpen}
+                                      onClick={() => (menuOpen ? closeMenu() : setOpenMenuId(c.key))}
+                                    >
+                                      <svg viewBox="0 0 24 24"><circle cx="5" cy="12" r="1.8" /><circle cx="12" cy="12" r="1.8" /><circle cx="19" cy="12" r="1.8" /></svg>
+                                    </button>
+                                    {c.kind === 'remote' ? (
+                                      installed.has(c.marketId) ? (
+                                        hasUpdate(c.marketId, c.fingerprint, c.version) ? (
+                                          <button
+                                            className={`sk-summon accent${installing.has(c.marketId) ? ' installing' : ''}`}
+                                            disabled={installing.has(c.marketId)}
+                                            onClick={() => void installMarketPlugin(c.marketId)}
+                                          >
+                                            {installing.has(c.marketId) ? `${progress[c.marketId]?.percent ?? 0}%` : '更新'}
+                                          </button>
+                                        ) : (
+                                          <button className="sk-summon" onClick={() => useInstalledPlugin(c.marketId)}>使用</button>
+                                        )
+                                      ) : (
+                                        <button
+                                          className={`sk-summon accent${installing.has(c.marketId) ? ' installing' : ''}`}
+                                          disabled={installing.has(c.marketId)}
+                                          onClick={() => void installMarketPlugin(c.marketId)}
+                                        >
+                                          {installing.has(c.marketId) ? `${progress[c.marketId]?.percent ?? 0}%` : '安装'}
+                                        </button>
+                                      )
                                     ) : (
-                                      <>
-                                        <span className="sm-installed-mark">已安装</span>
-                                        <button className="sm-use-btn" onClick={() => useInstalledPlugin(c.marketId)}>使用</button>
-                                      </>
+                                      <button
+                                        className={`sk-summon${c.inUse ? ' used' : ''}`}
+                                        disabled={c.inUse}
+                                        onClick={() => handleUse(c)}
+                                      >
+                                        {c.inUse ? '使用中' : '使用'}
+                                      </button>
                                     )}
                                   </span>
-                                ) : (
-                                  <button
-                                    className={`sm-use-btn${installing.has(c.marketId) ? ' installing' : ''}`}
-                                    disabled={installing.has(c.marketId)}
-                                    onClick={() => void installMarketPlugin(c.marketId)}
-                                  >
-                                    {installing.has(c.marketId) ? `${progress[c.marketId]?.percent ?? 0}%` : '安装'}
-                                  </button>
-                                )
-                              ) : (
-                                <button
-                                  className={`sm-use-btn${c.inUse ? ' used' : ''}`}
-                                  disabled={c.inUse}
-                                  onClick={() => handleUse(c)}
-                                >
-                                  {c.inUse ? '使用中' : '使用'}
-                                </button>
-                              )}</span>}
+                                  {menuOpen && (
+                                    <div className="sk-menu" onClick={(e) => e.stopPropagation()}>
+                                      {(c.kind === 'local' || installed.has(c.marketId)) && (
+                                        <div
+                                          className="sk-menu-item"
+                                          onClick={() => {
+                                            closeMenu()
+                                            if (c.kind === 'local') handleUse(c)
+                                            else useInstalledPlugin(c.marketId)
+                                          }}
+                                        >
+                                          <svg viewBox="0 0 24 24"><path d="M13 3L4 14h6l-1 7 9-11h-6l1-7z" /></svg>召唤到对话
+                                        </div>
+                                      )}
+                                      <div
+                                        className="sk-menu-item"
+                                        onClick={() => { closeMenu(); setSceneExpert({ card: c, sceneKey: null }) }}
+                                      >
+                                        <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3" /><path d="M12 3v3M12 18v3M3 12h3M18 12h3" /></svg>查看详情
+                                      </div>
+                                      {c.kind === 'remote' && !installed.has(c.marketId) && (
+                                        <>
+                                          <div className="sk-menu-sep" />
+                                          <div
+                                            className="sk-menu-item"
+                                            onClick={() => { closeMenu(); void installMarketPlugin(c.marketId) }}
+                                          >
+                                            <svg viewBox="0 0 24 24"><path d="M12 5v14M5 12h14" /></svg>安装
+                                          </div>
+                                        </>
+                                      )}
+                                      {/* [2026-11-24 用户定] 与技能卡对齐：已安装的专家可卸载（插件级，连带其技能/专家） */}
+                                      {c.kind === 'remote' && installed.has(c.marketId) && (
+                                        <>
+                                          <div className="sk-menu-sep" />
+                                          <div
+                                            className="sk-menu-item danger"
+                                            onClick={() => { closeMenu(); void handleUninstall(c, false) }}
+                                          >
+                                            <svg viewBox="0 0 24 24"><path d="M4 7h16" /><path d="M9 7V5h6v2" /><path d="M6 7l1 13h10l1-13" /></svg>卸载
+                                          </div>
+                                        </>
+                                      )}
+                                    </div>
+                                  )}
+                                </>
+                              )}
                             />
-                          ))}
+                            )
+                          })}
                         </div>
                       )}
                     </>

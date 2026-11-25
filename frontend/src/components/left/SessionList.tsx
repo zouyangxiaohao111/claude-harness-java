@@ -302,13 +302,6 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     setExpandedGroups((prev) => (prev.has(activeGroupKey) ? prev : new Set(prev).add(activeGroupKey)))
   }, [groupsDefaultCollapsed, flatHistory, activeGroupKey, activeSession])
 
-  // [2026-11-01 用户二次裁定] 收起 = **完全隐藏**（不是窄 rail）。
-  //   展开入口已移到顶栏红绿灯右侧（TitleBar 的 .topbar-side-toggle）⇒ 这里不再渲染任何东西：
-  //   此前保留的 `+` / 定时任务 / 技能市场 / 知识库 四个按钮在 0 宽列里仍会露出一半（用户实测「左边还有 + 等残留」）。
-  if (collapsed) {
-    return null
-  }
-
   // [V283] 置顶会话从项目分组中取出，单独渲染在最前的「置顶」块（跨项目）。
   //   [session-family] 标题可点击折叠（默认展开）；置顶独占，不再出现在派生 / IM / 项目分组。
   //   非置顶会话走「派生 / IM / 项目分组」三块（见下方 projectSessions 的排除规则）。
@@ -365,6 +358,15 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const familyColors = useMemo(() => computeFamilyColors(sessions), [sessions])
   const derivedChildCounts = useMemo(() => computeDerivedChildCounts(sessions), [sessions])
   const sessionById = useMemo(() => new Map(sessions.map((s) => [s.id, s])), [sessions])
+  // [HOOKS-BEFORE-EARLY-RETURN 2026-11-24] 收起时必须**所有 hook 都跑过**再 return：
+  //   原实现把 `if (collapsed) return null` 放在这里之前，收起瞬间少调用 6 个 hook
+  //   （imExpanded / imBlockSessions / familyColors / derivedChildCounts / sessionById 等）
+  //   → React error #300「Rendered fewer hooks than expected」→ 整页白屏（用户实测，点重试才恢复）。
+  //   收起 = 完全隐藏，展开入口在顶栏红绿灯右侧（TitleBar .topbar-side-toggle）。
+  if (collapsed) {
+    return null
+  }
+
   // 「派生」块 = 全部家族成员（含置顶 / IM 的成员）。
   //   ⚠️ 三个视图块之间**允许重叠**：置顶的成员同时出现在置顶块与派生块、IM 的成员同时出现在
   //   IM 块与派生块 —— 块回答的是不同问题；只有下面的普通项目分组才做整体去重。

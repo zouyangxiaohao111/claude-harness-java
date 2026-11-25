@@ -4,7 +4,6 @@ import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -35,7 +34,6 @@ import java.util.Map;
  * 实体/关系/权重都在）。本工具只做「工具契约 → 现有服务」的翻译，⛔ 不复制算法。
  */
 @Component
-@ExclusiveTool
 public class KbQueryGraphTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbQueryGraphTool.class);

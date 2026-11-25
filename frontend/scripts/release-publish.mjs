@@ -207,7 +207,11 @@ if (errorReportSecret && internal && !fileContains(appExe, errorReportSecret)) {
 const env = { ...process.env }
 // --skip-minio 时不能把 MINIO_API 传给 release-update.mjs：它内部会自行 `mc cp`，
 // 否则会把本次（可能是 keyless）产物覆盖到 MinIO 的内网 updater。
-if (!skipMinio && endpoint) { env.MINIO_API = endpoint; env.MINIO_BUCKET = bucket; env.MINIO_PREFIX = prefix }
+// ⚠️ MINIO_PREFIX **必须无条件传**（不能挂在 endpoint 上）：
+//    release-update.mjs 在没拿到 MINIO_PREFIX 时会回落 `updater`（公开前缀）。
+//    2026-11-24 实测事故：endpoint 缺失 ⇒ 场景包的 latest.json 被写成公开 updater 的 URL。
+if (!skipMinio) { env.MINIO_PREFIX = prefix }
+if (!skipMinio && endpoint) { env.MINIO_API = endpoint; env.MINIO_BUCKET = bucket }
 // 仅上 GitHub 时，让 latest.json 指向 GitHub Release 资产（与本次 keyless 包同源）。
 if (skipMinio && !skipGh) {
   env.UPDATE_URL_OVERRIDE = `https://github.com/${GH_REPO}/releases/download/v${version}/${fileName}`

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from 'react'
 import { ApiError } from '@/api/rest'
+import { FolderPicker } from './FolderPicker'
 import {
   UPLOAD_CONCURRENCY,
   buildUploadFileName,
@@ -55,6 +56,15 @@ interface TrackedUpload {
  */
 export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props) {
   const [open, setOpen] = useState(false)
+  /**
+   * 本批上传的**目标文件夹**（对齐源站 `UploadConfirmDialog` + `FolderPickerMenu`）：
+   * 初值 = 当前浏览的文件夹，可在这里改（含「新建文件夹」）。
+   * ⚠️ 不用 props.folderPath 直传：那只是「当前浏览位置」，用户可以在上传时就改目标，
+   *   上传完仍留在原地浏览。
+   */
+  const [targetFolder, setTargetFolder] = useState(folderPath)
+  const [folderPickerOpen, setFolderPickerOpen] = useState(false)
+  useEffect(() => { setTargetFolder(folderPath) }, [folderPath])
   const [urlOpen, setUrlOpen] = useState(false)
   const [url, setUrl] = useState('')
   const [manualOpen, setManualOpen] = useState(false)
@@ -294,7 +304,7 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
       await runUpload(
         Array.from(list).map((f) => ({
           file: f,
-          fileName: buildUploadFileName(f as File & { webkitRelativePath?: string }, folderPath),
+          fileName: buildUploadFileName(f as File & { webkitRelativePath?: string }, targetFolder),
         })),
         null
       )
@@ -499,6 +509,29 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
         <>
           <div className="kb-upload-mask" onClick={() => setOpen(false)} />
           <div className="kb-upload-menu" role="menu">
+            {/* 目标文件夹：上传前可改（含新建）· 对齐源站 UploadConfirmDialog 的 FolderPickerMenu */}
+            <div
+              role="presentation"
+              style={{
+                display: 'flex', alignItems: 'center', gap: 8, padding: '8px 12px',
+                borderBottom: '1px solid var(--td-component-stroke, #e3e6ea)',
+                fontSize: 12, color: '#646a73',
+              }}
+            >
+              <span
+                style={{ flex: 1, minWidth: 0, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}
+                title={targetFolder || '（根目录）'}
+              >
+                目标：{targetFolder || '（根目录）'}
+              </span>
+              <button
+                type="button"
+                className="doc-filter-toggle"
+                onClick={() => { setOpen(false); setFolderPickerOpen(true) }}
+              >
+                更改
+              </button>
+            </div>
             <button
               type="button"
               role="menuitem"
@@ -610,6 +643,16 @@ export function KbUploadSource({ baseId, folderPath, showToast, onDone }: Props)
             </button>
           </div>
         </div>
+      )}
+
+      {/* 目标文件夹选择器（上传前改目标 · 可在其中新建文件夹） */}
+      {folderPickerOpen && (
+        <FolderPicker
+          baseId={baseId}
+          title="选择上传目标文件夹"
+          onPick={(path) => { setTargetFolder(path); setFolderPickerOpen(false) }}
+          onClose={() => setFolderPickerOpen(false)}
+        />
       )}
     </div>
   )

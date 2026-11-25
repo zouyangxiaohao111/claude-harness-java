@@ -14485,7 +14485,14 @@ html {
 /* [2026-11-13 用户裁定·最终] 右栏展开**占网格列**：中栏让出抽屉宽度（压缩中栏，避免覆盖内容）。
    ⚠️ 曾短暂改成 absolute 覆盖（不压缩），用户实测「会覆盖」⇒ 恢复占列。
    内容列宽度按 `--content-w` 随中栏可用宽度收缩，仍保持左右居中。 */
-.app.workspace-surface.right-drawer-open { --right-col: var(--right-drawer-w, 384px); }
+.app.workspace-surface.right-drawer-open {
+  --right-col: var(--right-drawer-w, 384px);
+  /* [2026-11-24 用户实测「右栏偶尔挡住输入框」] 与 .artifact-dock-open 同一类根因：
+     抽屉占列后中栏被压窄，但正文/输入框的 clamp 只按下限 --content-min(575px) 撑宽
+     ⇒ 内容比列还宽 → 被 .center 的 overflow:hidden 裁掉，看起来就像「侧栏盖住了输入框」。
+     窗口越窄越容易出现，所以是「偶尔」。停靠抽屉时把下限降到 320px，让内容随列宽重排。 */
+  --content-min: 320px;
+}
 .app.workspace-surface.right-drawer-open.left-collapsed { grid-template-columns: 0 1fr var(--right-col); }
 
 /* ══════════════════════════════════════════════════════════════════

@@ -236,8 +236,9 @@
 .mk-scene-person:hover { color: var(--ink, #14181f); }
 .mk-scene-person .sm-avatar { width: 26px; height: 26px; border-radius: 50%; font-size: 11px; }
 
-/* ---- 专家：三列卡片 + 圆形头像 ---- */
+/* ---- 专家：与技能卡同款（sk-grid 5 列 + sk-card 紧凑）· 头像对齐技能图标 44 ---- */
 .sm-expert-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 14px; }
+.sk-card .sm-avatar { width: 44px; height: 44px; font-size: 15px; }
 
 /* ---- 「我的专家」空态（用户 2026-11-24 截图）：居中帽子 + 标题 + 说明 + 描边按钮 ---- */
 .mk-empty-expert {

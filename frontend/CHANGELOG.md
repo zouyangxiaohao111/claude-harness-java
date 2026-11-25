@@ -2,6 +2,18 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.90] - 2026-11-25
+
+### Fixed
+
+- 修复技能市场预览与知识库文件选择的问题（修改人：zcw）
+
+## [0.1.89] - 2026-11-25
+
+### Added
+
+- 修复 macOS 点 Dock 无法唤回隐藏的主窗口；市场页专家卡与技能卡样式统一并支持卸载
+
 ## [0.1.88] - 2026-11-24
 
 ### Added

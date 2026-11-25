@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -38,7 +37,6 @@ import java.sql.Connection;
  * 它会猜列名，然后每次执行都失败——这是源站把 schema 查询独立成工具的原因。
  */
 @Component
-@ExclusiveTool
 public class KbDataSchemaTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbDataSchemaTool.class);

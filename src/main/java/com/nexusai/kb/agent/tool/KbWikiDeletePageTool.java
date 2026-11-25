@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -36,7 +35,6 @@ import org.springframework.stereotype.Component;
  * </ul>
  */
 @Component
-@ExclusiveTool
 public class KbWikiDeletePageTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiDeletePageTool.class);

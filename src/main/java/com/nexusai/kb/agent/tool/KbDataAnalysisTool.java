@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -42,7 +41,6 @@ import java.sql.Connection;
  * 校验器不拦（它只拦写操作与危险函数）。
  */
 @Component
-@ExclusiveTool
 public class KbDataAnalysisTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbDataAnalysisTool.class);

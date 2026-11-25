@@ -640,7 +640,27 @@ public class StreamingToolExecutor {
         com.nexusai.application.agent.tool.SessionToolVisibility.Snapshot visibility =
                 com.nexusai.application.agent.tool.SessionToolVisibility
                         .resolve(sid, ctx != null ? ctx.requestExtras() : null);
-        this.sessionDisabledAtStart = visibility.disabled();
+        // [exec-agent-exempt 2026-11-25] 子代理线程：TUC.agentType() 点名的「默认禁用集」工具
+        //   在 schema 侧已被补回，执行期这里也必须放行，否则模型看得到却调用报
+        //   No such tool available。范围仍限定在默认禁用集内，且用户显式 disabled_tools 不受影响。
+        java.util.Set<String> disabledAtStart = visibility.disabled();
+        if (ctx != null && ctx.sessionId() != null && ctx.agentType() != null
+                && !ctx.agentType().isBlank()) {
+            java.util.Set<String> named =
+                com.nexusai.application.agent.LlmAgentLoop.agentNamedToolsOf(ctx.sessionId(), ctx.agentType());
+            if (!named.isEmpty()) {
+                java.util.Set<String> defaultDisabled =
+                    com.nexusai.application.agent.tool.SessionToolCategory.defaultDisabledNamesStatic();
+                java.util.LinkedHashSet<String> kept = new java.util.LinkedHashSet<>(disabledAtStart);
+                for (String n : named) {
+                    if (defaultDisabled.contains(n)) {
+                        kept.remove(n);
+                    }
+                }
+                disabledAtStart = kept;
+            }
+        }
+        this.sessionDisabledAtStart = disabledAtStart;
         this.unattendedAtStart = visibility.askExcluded();
         this.extendedResultHandler = extendedResultHandler;
         this.permissionGate = gate;

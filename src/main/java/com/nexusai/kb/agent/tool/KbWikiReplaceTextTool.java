@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -39,7 +38,6 @@ import java.util.List;
  * 强行替换会改错位置 ⇒ 本实现按「出现次数 ≠ 1 就拒绝」处理。
  */
 @Component
-@ExclusiveTool
 public class KbWikiReplaceTextTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiReplaceTextTool.class);

@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -38,7 +37,6 @@ import java.util.Set;
  * 这能显著降低上下文消耗。本仓简化实现：逐页返回完整内容，靠 {@code content} 预算截断。
  */
 @Component
-@ExclusiveTool
 public class KbWikiReadPageTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiReadPageTool.class);

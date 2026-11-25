@@ -4159,6 +4159,9 @@ public class SubagentTool implements Tool {
                 isAsync,
                 resolvePermissionMode(selectedAgent), // CC original: permissionMode (agentToolUtils.ts:146) — plan 放行 ExitPlanMode
                 selectedAgent.disallowedTools());
+            filtered = com.nexusai.application.agent.tool.AgentToolUtils
+                .augmentAgentNamedDefaultDisabled(availableTools, filtered,
+                    selectedAgent.tools(), selectedAgent.disallowedTools());
             for (Tool tool : filtered) {
                 registry.register(tool);
             }

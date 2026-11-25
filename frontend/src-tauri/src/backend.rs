@@ -550,8 +550,15 @@ pub fn spawn_backend(app: &tauri::AppHandle) -> std::io::Result<u32> {
         // stderr 仍落 backend.log（JVM/原生层致命信息不经 logback，丢了就查不到启动失败原因）。
         .stdin(Stdio::null())
         .stdout(Stdio::null())
-        .stderr(Stdio::from(stderr_file))
-        .spawn()?;
+        .stderr(Stdio::from(stderr_file));
+    // [2026-11-25] 让后端自成进程组（pgid = 自身 pid）：退出时用 kill(-pgid) 整组回收。
+    //   Windows 走 taskkill /T，无需此步。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        cmd.process_group(0);
+    }
+    let child = cmd.spawn()?;
 
     let pid = child.id();
     // 6) 关键：mem::forget 让子进程脱离 Child 句柄托管（父进程退出时不会被 drop 收割/牵连），
@@ -598,9 +605,24 @@ pub fn kill_process_tree(pid: u32) {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // TODO：非 Windows 平台整树杀后端（进程组 / pgrep 树）本轮未实现，退出时可能残留 java 进程
-        let _ = pid;
-        eprintln!("[backend] 非 Windows 平台整树杀后端进程未实现（pid={}），请手动终止 java 进程。", pid);
+        // [2026-11-25 用户实测「右键退出后 java 还在」] 旧实现是空 TODO ⇒ 退出钩子跑了也不杀。
+        // 后端以独立进程组启动（见 spawn_backend 的 process_group(0)）⇒ 负 pid 即整组：
+        //   先 SIGTERM（让 Spring 走优雅关闭，释放端口/落盘），800ms 后仍在则 SIGKILL 兜底。
+        // 用 /bin/kill 而不是 libc，避免为一次 kill 引入新依赖。
+        let group = format!("-{}", pid);
+        let single = pid.to_string();
+        for sig in ["-TERM", "-KILL"] {
+            let _ = std::process::Command::new("kill")
+                .args([sig, group.as_str()])
+                .status();
+            let _ = std::process::Command::new("kill")
+                .args([sig, single.as_str()])
+                .status();
+            if sig == "-TERM" {
+                std::thread::sleep(std::time::Duration::from_millis(800));
+            }
+        }
+        log_launcher(&format!("已回收后端进程 pid={}（进程组 -{}）", pid, pid));
     }
     // 本次 kill 的目标即本会话自启后端（pid 文件只写过自启 pid）→ 顺带清 pid 记录
     clear_backend_pid();

@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -42,7 +41,6 @@ import java.util.regex.PatternSyntaxException;
  * （单库 Wiki 页数量级是几十到几百，不值得为它加 FTS）。
  */
 @Component
-@ExclusiveTool
 public class KbWikiSearchTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiSearchTool.class);

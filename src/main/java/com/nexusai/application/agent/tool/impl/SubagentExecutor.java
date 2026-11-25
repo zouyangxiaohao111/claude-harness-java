@@ -4068,6 +4068,10 @@ public class SubagentExecutor {
         List<Tool> filtered = AgentToolUtils.filterToolsForAgent(
             subagentToolRegistry.all(), isBuiltIn, isAsync, permissionMode,
             agentDefinition.disallowedTools());
+        // 专家点名的「默认禁用集」工具（CU/KB）不受 async 白名单裁剪
+        filtered = AgentToolUtils.augmentAgentNamedDefaultDisabled(
+            subagentToolRegistry.all(), filtered,
+            agentDefinition.tools(), agentDefinition.disallowedTools());
 
         // CC :162-173 hasWildcard → return allowedAvailableTools (全量放行)
         // [S4-1 C-9] wildcard 仅 undefined / ['*'] (agentToolUtils.ts:163-165):

@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -44,7 +43,6 @@ import java.util.Set;
  * 但知识库这组是**新增能力**、不是 CC 对齐项，用源侧名字更便于对照。
  */
 @Component
-@ExclusiveTool
 public class KbSearchKnowledgeTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbSearchKnowledgeTool.class);

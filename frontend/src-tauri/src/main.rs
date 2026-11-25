@@ -226,6 +226,11 @@ fn install_tray(app: &tauri::App) -> Result<(), Box<dyn std::error::Error>> {
         .menu(&menu)
         // 左键单击 = 唤回窗口（与 Windows 托盘惯例一致）；右键才弹菜单
         .show_menu_on_left_click(false)
+        // [2026-11-25 Windows 实测] 托盘级**也**注册菜单处理：应用级 `Builder::on_menu_event`
+        //   在 Windows 上对「运行期 set_menu 换过的新菜单」可能收不到事件（用户实测右键退出
+        //   后既没退出、`tauri-launcher.log` 里也没有「收到退出菜单事件」）。
+        //   TrayIconBuilder::on_menu_event 与菜单实例绑定更紧，两边都挂 ⇒ 任一路由到即可。
+        .on_menu_event(|app, event| handle_menu_event(app, event))
         .on_tray_icon_event(|tray, event| {
             // 左键单击唤回（右键由 menu 自己处理，这里只管 Left + Up 的同一次点击）
             if let tauri::tray::TrayIconEvent::Click {
@@ -292,6 +297,16 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
     match id.as_str() {
         TRAY_MENU_SHOW => show_main_window(app),
         TRAY_MENU_QUIT => {
+            // 应用级与托盘级**都**注册了处理器 ⇒ 同一次点击可能进来两次；
+            // 只让第一次走（后续直接返回），避免重复 kill / 重复 spawn 看门狗。
+            static QUIT_STARTED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if QUIT_STARTED.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            // [2026-11-25 Windows 实测] 先落一行日志：若日志里没有这行，说明**菜单事件根本没到**，
+            //   问题在托盘注册而不是退出逻辑 —— 别再盲改 app.exit 一侧。
+            backend::log_launcher("[托盘退出] 收到退出菜单事件");
             let plan = quit_plan(app.state::<BackendState>().0.lock().unwrap().take());
             // 先放行关闭钩子，再关窗 —— 顺序不能反（反了钩子会把这次关闭也当成「隐藏」）
             if plan.release_close_hook {
@@ -301,6 +316,8 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
             }
             if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
                 let _ = window.close();
+                // close() 在个别环境下会被 WebView 侧（beforeunload 等）拦下 ⇒ 再强制销毁一次
+                let _ = window.destroy();
             }
             // 兜底回收后端：窗口已隐藏时 close 不触发钩子 ⇒ 这里补杀（take 幂等）
             if let Some(p) = plan.backend_pid {
@@ -310,6 +327,19 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
             // ⛔ 必须结束进程：托盘常驻 ⇒ 关掉所有窗口不会结束进程（详见 quit_plan 的文档）
             if plan.exit_process {
                 app.exit(0);
+                // [2026-11-25 Windows 实测「右键退出后进程还在」] 兜底看门狗：
+                //   Tauri 的 exit 在个别 Windows 环境会被托盘/单实例插件挂住，事件循环不结束。
+                //   1.2s 后仍在 ⇒ 再 exit 一次；再等 800ms 还在 ⇒ 直接结束本进程。
+                //   后端进程树已在上面 kill 完，所以这里强杀不会留孤儿。
+                let h = app.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(std::time::Duration::from_millis(1200));
+                    backend::log_launcher("[托盘退出] app.exit 后 1.2s 仍在运行 → 再次 exit");
+                    h.exit(0);
+                    std::thread::sleep(std::time::Duration::from_millis(800));
+                    backend::log_launcher("[托盘退出] 仍未退出 → 强制结束本进程");
+                    std::process::exit(0);
+                });
             }
         }
         other => {
@@ -546,9 +576,9 @@ fn main() {
         // 单实例：第二实例启动即退出并把已运行实例的主窗口置前聚焦，
         // 防止两个壳实例各自拉起后端、争抢 3458 端口（窗口 label 默认 "main"）
         .plugin(tauri_plugin_single_instance::init(|app, _args, _cwd| {
-            if let Some(window) = app.get_webview_window(MAIN_WINDOW_LABEL) {
-                let _ = window.set_focus();
-            }
+            // ⛔ 不能只 set_focus：主窗口「点 X」是 hide()（见 on_window_event），
+            //   对已隐藏的窗口 set_focus 不会把它显示出来 ⇒ 二次启动看似「没反应」。
+            show_main_window(app);
         }))
         .manage(BackendState(std::sync::Mutex::new(None)))
         .manage(HideOnClose(std::sync::atomic::AtomicBool::new(true)))
@@ -747,9 +777,23 @@ fn main() {
         .expect("error while building tauri application");
 
     app.run(|app_handle, event| {
+        // [2026-11-24 用户实测] macOS：点 Dock 图标 / Finder 再次打开已运行实例走的是
+        //   applicationShouldHandleReopen（不会起新进程，单实例插件也收不到）⇒ 必须在这里
+        //   唤回窗口；否则「点 X 隐藏」后用户没有任何入口（托盘图标可能被菜单栏挤掉）。
+        #[cfg(target_os = "macos")]
+        if let tauri::RunEvent::Reopen { has_visible_windows, .. } = &event {
+            backend::log_launcher(&format!(
+                "[window] Reopen(has_visible_windows={}) → 唤回主窗口",
+                has_visible_windows
+            ));
+            show_main_window(app_handle);
+        }
+
         // 兜底：非“关窗”路径的退出（RunEvent::ExitRequested）再回收一次；
         // take() 幂等——若已在关窗时 kill 过则此处为 None，直接跳过
-        if let tauri::RunEvent::ExitRequested { .. } = event {
+        // [2026-11-24] macOS Dock 右键「退出」只走 RunEvent::Exit，不经过 ExitRequested
+        //   ⇒ 只监听 ExitRequested 会漏杀后端（前端退了、java 还在）。两个都收。
+        if matches!(&event, tauri::RunEvent::ExitRequested { .. } | tauri::RunEvent::Exit) {
             let pid = app_handle
                 .state::<BackendState>()
                 .0
@@ -757,7 +801,7 @@ fn main() {
                 .unwrap()
                 .take();
             if let Some(p) = pid {
-                eprintln!("[backend] 应用退出，回收后端进程树 pid={}", p);
+                backend::log_launcher(&format!("应用退出，回收后端进程树 pid={}", p));
                 backend::kill_process_tree(p);
             }
         }
@@ -892,9 +936,12 @@ mod tests {
         );
         // 菜单「退出」必须先放行钩子，再 close —— 顺序反了钩子会把退出也当成隐藏
         let quit_pos = prod.find("TRAY_MENU_QUIT =>").expect("托盘退出菜单项必须存在");
-        // ⚠️ 不能直接 `&prod[quit_pos..quit_pos + 600]`：源码里全是中文，按**字节**切会
-        //   落在多字节字符中间 ⇒ panic（实测 `not a char boundary`）。按字符数取窗口。
-        let quit_seg: String = prod[quit_pos..].chars().take(600).collect();
+        // ⚠️ 不要用固定长度窗口（曾是 600 字符）：在退出分支里加注释/日志就会把
+        //   `store(false` 挤出窗口 ⇒ 假红。这里取到**下一个 match 分支**为止。
+        //   `find` 返回的字节索引落在 ASCII needle 上 ⇒ 切片天然在字符边界。
+        let after = &prod[quit_pos..];
+        let quit_end = after.find("\n        other =>").unwrap_or(after.len());
+        let quit_seg = &after[..quit_end];
         let store_pos = quit_seg.find("store(false").expect("退出项必须先把 HideOnClose 置 false");
         let close_pos = quit_seg.find("window.close()").expect("退出项必须真的关闭窗口");
         assert!(

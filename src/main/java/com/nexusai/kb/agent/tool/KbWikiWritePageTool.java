@@ -5,7 +5,6 @@ import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.JsonNodeFactory;
 import com.fasterxml.jackson.databind.node.ObjectNode;
 import com.nexusai.application.agent.tool.AgentToolResult;
-import com.nexusai.application.agent.tool.ExclusiveTool;
 import com.nexusai.application.agent.tool.Tool;
 import com.nexusai.application.agent.tool.ToolResult;
 import com.nexusai.application.agent.tool.ToolUseBlock;
@@ -39,7 +38,6 @@ import java.util.List;
  * 正文里 {@code [[...]]} 重新扫描 out_links。自己写 UPDATE 会漏掉这些，且不报错。
  */
 @Component
-@ExclusiveTool
 public class KbWikiWritePageTool implements Tool {
 
     private static final Logger log = LoggerFactory.getLogger(KbWikiWritePageTool.class);

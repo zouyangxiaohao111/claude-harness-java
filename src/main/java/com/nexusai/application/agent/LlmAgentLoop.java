@@ -15254,6 +15254,33 @@ public class LlmAgentLoop implements AgentLoop {
                         .ASK_USER_QUESTION_TOOL.equals(t.name()))
                     .toList();
         }
+        // [subagent-agent-exempt 2026-11-25] 子代理线程：其 agentType 若在 tools 里点名，
+        //   默认禁用集（CU+KB）不应再挡。主线程靠「人格优先豁免」放行，子代理线程此前没有
+        //   对应逻辑 ⇒ SubagentExecutor 已按专家解析出 wiki 工具，仍被会话默认禁用集再度剔除
+        //   （实测日志：Step 15-16 解析出 10 个，紧接着「默认禁用 39 个」→ 模型只见 Read）。
+        //   语义与主线程一致：范围 = 默认禁用集 ∩ 专家点名，仍受 disallowedTools 约束。
+        if (available != null && tuc != null && tuc.sessionId() != null) {
+            String subAgentType = tuc.agentType();
+            if (subAgentType != null && !subAgentType.isBlank()) {
+                com.nexusai.application.agent.tool.impl.SubagentTool st = findSubagentTool();
+                if (st != null) {
+                    final String atKey = subAgentType.trim();
+                    com.nexusai.application.agent.subagent.AgentDefinition def =
+                        com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry.resolve(
+                            tuc.sessionId(), atKey,
+                            () -> st.agentRegistry(tuc.sessionId()).findAgent(atKey));
+                    if (def != null && def.tools().isPresent() && !def.usesAllTools()) {
+                        com.nexusai.application.agent.tool.ToolRegistry full =
+                            com.nexusai.application.agent.tool.SessionToolCategory.registryStatic();
+                        if (full != null) {
+                            available = com.nexusai.application.agent.tool.AgentToolUtils
+                                .augmentAgentNamedDefaultDisabled(
+                                    full.all(), available, def.tools(), def.disallowedTools());
+                        }
+                    }
+                }
+            }
+        }
         return available;
     }
 
@@ -15275,6 +15302,43 @@ public class LlmAgentLoop implements AgentLoop {
      * @param sessionId 会话 id（非 null 非空白由调用方保证）
      * @return 人格点名的工具名集合（不含通配符、不含空串）
      */
+    /**
+     * 指定 {@code agentType} 的点名工具集合（子代理线程豁免默认禁用集用）。
+     *
+     * <p>与 {@link #agentNamedTools(String)} 同源定义解析，区别只是 agentType 来自
+     * 子代理线程的 {@code ToolUseContext.agentType()}，而不是会话的 main_thread_agent。
+     *
+     * @return 点名工具名集合；通配 / 解析失败 → 空集
+     */
+    public static Set<String> agentNamedToolsOf(String sessionId, String agentType) {
+        if (sessionId == null || sessionId.isBlank() || agentType == null || agentType.isBlank()) {
+            return Set.of();
+        }
+        com.nexusai.application.agent.tool.impl.SubagentTool subagentTool = findSubagentTool();
+        if (subagentTool == null) {
+            return Set.of();
+        }
+        final String key = agentType.trim();
+        com.nexusai.application.agent.subagent.AgentDefinition def =
+                com.nexusai.application.agent.subagent.SessionMainThreadAgentRegistry.resolve(
+                        sessionId, key,
+                        () -> subagentTool.agentRegistry(sessionId).findAgent(key));
+        if (def == null || def.tools() == null || def.tools().isEmpty()) {
+            return Set.of();
+        }
+        java.util.List<String> declared = def.tools().get();
+        if (declared.size() == 1 && "*".equals(declared.get(0))) {
+            return Set.of();
+        }
+        Set<String> out = new java.util.LinkedHashSet<>();
+        for (String n : declared) {
+            if (n != null && !n.isBlank() && !"*".equals(n.trim())) {
+                out.add(n.trim());
+            }
+        }
+        return out;
+    }
+
     public static Set<String> agentNamedTools(String sessionId) {
         com.nexusai.repository.session.entity.SessionRecord row = sessionRowOrNull(sessionId);
         String agentType = row == null ? null : row.getMainThreadAgent();

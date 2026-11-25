@@ -212,6 +212,15 @@ public class SessionToolCategory {
      *
      * @return 工具名集合（不可变；无注册表 → 空集）
      */
+    /**
+     * 全量工具注册表（静态桥接）· 供子代理按专家点名补齐工具用。
+     *
+     * @return 注册表；Spring 未注入（单测/POJO）时为 null
+     */
+    public static ToolRegistry registryStatic() {
+        return toolRegistry;
+    }
+
     public static Set<String> defaultDisabledNamesStatic() {
         ToolRegistry registry = toolRegistry;
         if (registry == null) {
