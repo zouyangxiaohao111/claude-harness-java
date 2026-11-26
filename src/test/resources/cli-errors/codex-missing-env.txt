@@ -1,0 +1,2 @@
+{"type":"error","message":"Missing environment variable: OPENAI_API_KEY."}
+{"type":"turn.failed","error":{"message":"Missing environment variable: OPENAI_API_KEY."}}

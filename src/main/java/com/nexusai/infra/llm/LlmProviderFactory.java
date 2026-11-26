@@ -17,6 +17,8 @@ import org.springframework.stereotype.Component;
  *   <li>{@code providerType == "openai_sdk"} → {@link OpenAiSdkProvider}（官方 openai-java SDK）</li>
  *   <li>{@code providerType == "anthropic"} → {@link AnthropicSdkProvider}（官方 anthropic-java SDK，
  *       [DEC-RV-07] 替代手写 HTTP {@code AnthropicProvider}（旧类已删除））</li>
+ *   <li>{@code providerType == "gemini_code_assist"} → {@code GoogleGeminiProvider}（真实协议实现；
+ *       bean 缺失或凭据不可用 → fail-loud，⛔ 不退 OpenAI/mock）</li>
  *   <li>未知 type → 默认走 {@link OpenAiSdkProvider}（OpenAI 协议是事实标准，官方 SDK 优先）</li>
  * </ul>
  *
@@ -35,17 +37,31 @@ public class LlmProviderFactory {
 
     @Autowired private LlmProvider mockLlmProvider;
     @Autowired private LlmProvider openAiSdkProvider;
+    /** 真实协议实现由协议 peer 提供（bean 名 = googleGeminiProvider，type=gemini_code_assist）。 */
+    @Autowired(required = false) private LlmProvider googleGeminiProvider;
     @Autowired private AnthropicSdkProvider anthropicProvider;
     @Autowired private ResponsesSdkProvider responsesSdkProvider;
 
     /**
      * 按 provider type + config 路由。
      *
-     * @param config       解密后的配置；null 或 apiKey 空 → mock
-     * @param providerType "openai_compatible" / "openai_sdk" / "anthropic" / null
-     * @return 永不返回 null（至少返回 mock）
+     * @param config       解密后的配置；null 或 apiKey 空 → mock（Google 订阅例外：fail-loud）
+     * @param providerType "openai_compatible" / "openai_sdk" / "anthropic" / "gemini_code_assist" / null
+     * @return 非 null；Google 订阅 bean 缺失时抛错，⛔ 不退 OpenAI/mock
      */
     public LlmProvider getProvider(ProviderConfig config, String providerType) {
+        // Google 订阅必须精确路由到真实实现：凭据/bean 缺失一律 fail-loud，
+        // ⛔ 不回落 MockLlmProvider/OpenAiSdkProvider（否则会把「订阅不能用」伪装成成功）。
+        if (providerType != null && "gemini_code_assist".equalsIgnoreCase(providerType)) {
+            if (googleGeminiProvider == null) {
+                throw new IllegalStateException(
+                    "Google 订阅 provider 未装配（GoogleGeminiProvider bean 缺失），无法发送请求");
+            }
+            if (config == null || !config.isUsable()) {
+                throw new IllegalStateException("Google 订阅未登录或凭据不可用，请先完成登录");
+            }
+            return googleGeminiProvider;
+        }
         if (config == null || !config.isUsable()) {
             return mockLlmProvider;
         }

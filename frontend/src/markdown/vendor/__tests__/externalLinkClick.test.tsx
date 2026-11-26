@@ -4,6 +4,14 @@ import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
 import { MarkdownTextV2 } from '../renderer'
 import { isExternalLinkHref } from '@/utils/externalLink'
+import { localFilePathOf } from '@/utils/localFileLink'
+
+/** openLocalFile 是异步动态 import 的桌面壳通道；单测只验证「被正确调用」。 */
+const openLocalFileMock = vi.hoisted(() => vi.fn(async () => true))
+vi.mock('@/utils/localFileLink', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('@/utils/localFileLink')>()
+  return { ...actual, openLocalFile: openLocalFileMock }
+})
 
 /**
  * 对话正文外链的打开口径（用户 2026-11-18 真机缺陷回归）。
@@ -27,6 +35,7 @@ let container: HTMLDivElement
 let root: Root
 
 beforeEach(() => {
+  openLocalFileMock.mockClear()
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -136,5 +145,45 @@ describe('MarkdownTextV2 外链交互', () => {
 
     expect(click.defaultPrevented).toBe(false)
     expect(openSpy).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * 用户 2026-11-26 真机缺陷：模型把产物写成 `file:///D:/...`，
+ * DOMPurify 剥掉 href ⇒ 链接仍是蓝色、点下去什么也不发生。
+ */
+describe('MarkdownTextV2 本地文件链接', () => {
+  it('localFilePathOf：file:// 与盘符路径解出本地路径，外链/相对路径返回 null', () => {
+    expect(localFilePathOf('file:///D:/apps/a/x.html')).toBe('D:/apps/a/x.html')
+    expect(localFilePathOf('file:///D:/a%20b/x.html')).toBe('D:/a b/x.html')
+    expect(localFilePathOf('D:/apps/x.html')).toBe('D:/apps/x.html')
+    expect(localFilePathOf('D:\\apps\\x.html')).toBe('D:\\apps\\x.html')
+    expect(localFilePathOf('https://example.com/x')).toBeNull()
+    expect(localFilePathOf('/docs/a.md')).toBeNull()
+    expect(localFilePathOf('#kb-cite-1')).toBeNull()
+  })
+
+  it('⭐ file:// 链接：href 不再保留但路径进 data-local-file，点击交系统默认程序', async () => {
+    await mount('[打开入口页](file:///D:/apps/NexusAI/data/x.html)')
+    const anchor = container.querySelector('a')!
+    // href 被净化器剥掉（这正是「看着可点、点不动」的根因）；真实路径改挂 data-*
+    expect(anchor.getAttribute('href')).toBeNull()
+    expect(anchor.getAttribute('data-local-file')).toBe('D:/apps/NexusAI/data/x.html')
+
+    const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+    await act(async () => {
+      anchor.dispatchEvent(click)
+      await Promise.resolve()
+    })
+
+    expect(click.defaultPrevented).toBe(true)
+    expect(openLocalFileMock).toHaveBeenCalledWith('D:/apps/NexusAI/data/x.html')
+  })
+
+  it('无协议盘符路径同样识别为本地文件', async () => {
+    await mount('[主业务链图](D:/apps/NexusAI/data/x-main.html)')
+    const anchor = container.querySelector('a')!
+    expect(anchor.getAttribute('data-local-file')).toBe('D:/apps/NexusAI/data/x-main.html')
+    expect(openLocalFileMock).not.toHaveBeenCalled()
   })
 })

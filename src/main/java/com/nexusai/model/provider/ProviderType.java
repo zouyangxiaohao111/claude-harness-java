@@ -17,5 +17,13 @@ public enum ProviderType {
      */
     openai_response,
     anthropic,
+    /**
+     * Google 订阅（Gemini Code Assist / Cloud Code OAuth）· 独立于 API-key 的
+     * {@code openai_compatible} Gemini。
+     *
+     * <p>由 {@code GoogleGeminiProvider} 实现；请求发往 {@code https://cloudcode-pa.googleapis.com}
+     * 且必须携带 {@code providers.oauth_project}（V338）。
+     */
+    gemini_code_assist,
     mock
 }

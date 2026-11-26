@@ -133,6 +133,16 @@ export function KbAssistantPanel({ baseId, docTitle, knowledgeId, onClose, showT
       title: `文档助手 · ${docTitle}`,
       mainProjectId: workspace.id,
     })
+    // ⭐ 文档助手 = 智能推理（ReAct），⛔ 不是 quick-answer 的 RAG 流水线。
+    //   源站阅读页的助手是「把 source 塞进 prompt 交给通用助手」（doc-content.vue readingAssistantActions），
+    //   智能体自己调 search_knowledge / read_document 读这一篇；RAG 链会把
+    //   query_understand / knowledge_search 这类内部阶段当「工具卡」推到正文下方（用户 2026-11-26 报）。
+    //   ⚠️ 绑定失败不阻断：未绑定 agent 时后端同样分流到 ReAct（agentId=null ⇒ REACT）。
+    try {
+      await sessionApi.update(created.id, { mainThreadAgent: 'builtin-smart-reasoning' })
+    } catch {
+      /* 绑定只是显式化，失败仍走 ReAct */
+    }
     sessionRef.current = created.id
 
     const client = createSocketClient()
@@ -163,14 +173,20 @@ export function KbAssistantPanel({ baseId, docTitle, knowledgeId, onClose, showT
 
     try {
       const sid = await ensureSession()
-      await knowledgeApi.askQa(sid, { content, knowledgeBaseIds: [baseId] })
+      // ⭐ 统一入口：会话已绑 smart-reasoning ⇒ 后端分流到 ReAct（有真实工具调用），
+      //   同时把范围收到**当前这篇文档**（只传库是整库检索，实测会引用到同库别的文件）。
+      await knowledgeApi.kbChat(sid, {
+        content,
+        knowledgeBaseIds: [baseId],
+        knowledgeIds: [knowledgeId],
+      })
     } catch (e) {
       const msg = e instanceof ApiError ? e.userMessage() : String(e)
       patchTurn(id, { phase: 'error', error: msg })
       activeTurnRef.current = null
       showToast(msg, 'info')
     }
-  }, [baseId, ensureSession, patchTurn, question, showToast])
+  }, [baseId, knowledgeId, ensureSession, patchTurn, question, showToast])
 
   /**
    * 一次性消费 `initialQuestion`（宿主点「诊断」等按钮时带进来的问题）。

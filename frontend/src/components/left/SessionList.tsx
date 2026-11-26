@@ -5,6 +5,7 @@ import type { SessionDto } from '@/api/types'
 import type { ToastType } from '@/types'
 import { compareSessions, compareGroups, sortSessionsWithPinned } from '@/utils/sessionOrder'
 import { computeDerivedChildCounts, computeFamilyColors } from './sessionFamily'
+import { FileTypeIcon } from '@/components/right/FileTypeIcon'
 
 /** IM 会话块默认展示条数（超出折叠成「查看全部」）—— 该块数量会长，全展开会撑爆左栏。 */
 const IM_BLOCK_PREVIEW = 3
@@ -24,11 +25,19 @@ const ChevronIcon = ({ open }: { open: boolean }) => (
     <path d="M4 2L8 6L4 10" />
   </svg>
 )
-const FolderIcon = () => (
-  <svg viewBox="0 0 14 14" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 15, height: 15, flexShrink: 0 }}>
-    <path d="M2 4.5C2 3.5 2.5 3 3.5 3H5L6 4.5H10.5C11.5 4.5 12 5 12 6V10C12 11 11.5 11.5 10.5 11.5H3.5C2.5 11.5 2 11 2 10V4.5Z" />
-  </svg>
+/** [folder-group 2026-11-26] 项目分组标题 chevron —— 照右栏文件树 `.file-tree-node .chev` 形态
+ *  （向下小箭头，展开时旋转 90°），与文件夹 open/closed 图标配套。仅项目分组用，其余块仍用 ChevronIcon。 */
+const GroupChev = ({ open }: { open: boolean }) => (
+  <span className={`chev${open ? ' open' : ''}`}>
+    <svg viewBox="0 0 10 10" fill="none" stroke="currentColor" strokeWidth="1.5" style={{ width: 8, height: 8 }}>
+      <path d="M3 4L5 6.5L7 4" />
+    </svg>
+  </span>
 )
+/** 文件夹色：照右栏「项目」tab 文件树文件夹色（utils/fileType.ts FILE_KIND_COLORS.folder）。 */
+const FOLDER_COLOR = '#F59E0B'
+/** 「更早」归档阈值：updatedAt 距今 > 3 天（即「4天前」及更早）收进子组，默认收起。 */
+const OLDER_THAN_DAYS = 3
 
 interface SessionListProps {
   sessions: SessionDto[]
@@ -174,6 +183,19 @@ function formatRelativeTime(iso?: string): string {
   return `${d.getMonth() + 1}/${d.getDate()}`
 }
 
+/** [folder-group] 是否归入「更早」：updatedAt 距今 > OLDER_THAN_DAYS 天。
+ *  天数口径与 formatRelativeTime 完全一致（按本地自然日取整），保证「3天前」可见、「4天前」收起。 */
+function isOlderSession(iso?: string): boolean {
+  if (!iso) return false
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return false
+  const now = new Date()
+  const startToday = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime()
+  const target = new Date(d.getFullYear(), d.getMonth(), d.getDate()).getTime()
+  const days = Math.round((startToday - target) / 86_400_000)
+  return days > OLDER_THAN_DAYS
+}
+
 /** 运行时长标签：m:ss（<1h）/ h:mm:ss。 */
 function formatRunElapsed(ms: number): string {
   const total = Math.max(0, Math.floor(ms / 1000))
@@ -206,6 +228,9 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
   const [imOpen, setImOpen] = useState(true)
   /** 派生块内按「源」分组：已收起的源 id 集合（默认全部展开）。 */
   const [collapsedFamilyRoots, setCollapsedFamilyRoots] = useState<Set<string>>(new Set())
+  /** [folder-group] 项目分组内「更早」子组：用户手动展开过的组键集合（默认全部收起）。
+   *  当前会话落在「更早」里时由渲染派生强制展开（见 olderOpen），不写进本集合。 */
+  const [expandedOlder, setExpandedOlder] = useState<Set<string>>(new Set())
   /** 悬停的家族根 id：同族行一起高亮（跨块 —— 置顶里的创建者 ↔ 派生块里的子会话）。 */
   const [hoverFamily, setHoverFamily] = useState<string | null>(null)
   /** [run-block] 运行块内每会话的时长起点（进入集合时记，离开即清）。 */
@@ -291,6 +316,23 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
     const timer = window.setInterval(() => setRunTick((v) => v + 1), 1000)
     return () => window.clearInterval(timer)
   }, [runningSessions.length])
+
+  // [run-block 2026-11-26] 「进行中」块再纳入「已完成未读」（doneUnreadIds）：跑完没看的会话
+  //   也 surfaced 在这里，点进去查看即由 App 清除 doneUnreadIds（App.tsx 切会话 effect）⇒ 立马移出。
+  //   运行中/待处理优先：同一会话既在跑又曾完成 ⇒ 算运行段，不重复进完成段。
+  const doneUnreadSessions = useMemo(
+    () => sessions
+      .filter((s) => doneUnreadIds?.has(s.id) === true
+        && runningSessionIds?.has(s.id) !== true
+        && pendingSessionIds?.has(s.id) !== true)
+      .sort(compareSessions),
+    [sessions, doneUnreadIds, runningSessionIds, pendingSessionIds],
+  )
+  // 块列表 = 运行中/待处理（带运行时长）在前，已完成未读（绿点 + 相对时间）在后。
+  const blockSessions = useMemo(
+    () => [...runningSessions, ...doneUnreadSessions],
+    [runningSessions, doneUnreadSessions],
+  )
 
   // 默认折叠：当前会话所在组自动展开。
   // 依赖 = activeSession（会话 id）+ activeGroupKey，刻意**不含 sessions 引用**：
@@ -681,23 +723,32 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         <div className="sidebar-empty">暂无会话 · 点击 + 新建</div>
       )}
 
-      {/* [run-block 2026-11-23] 正在运行块 · 置顶之上；与下方各块允许重叠（不隐藏不去重） */}
-      {!flatHistory && runningSessions.length > 0 && (
+      {/* [run-block 2026-11-23 / 2026-11-26] 「进行中」块 = 运行中 ∪ 待处理 ∪ 已完成未读 · 置顶之上；
+          与下方各块允许重叠（不隐藏不去重）。已完成未读查看即移出（App 清 doneUnreadIds）。 */}
+      {!flatHistory && blockSessions.length > 0 && (
         <div className="left-section running-block">
           <div
             className={`label running-label${runningOpen ? '' : ' collapsed'}`}
             onClick={() => setRunningOpen((v) => !v)}
             role="button"
             aria-expanded={runningOpen}
-            title={runningOpen ? '收起正在运行' : '展开正在运行'}
+            title={runningOpen ? '收起进行中' : '展开进行中'}
           >
             <ChevronIcon open={runningOpen} />
-            <i className="run-pulse" aria-hidden="true" />
-            <span className="group-path">正在运行</span>
-            <span className="count">{runningSessions.length}</span>
-            <span className="label-right">{renderRunBadges(runningSessions)}</span>
+            {runningSessions.length > 0 && <i className="run-pulse" aria-hidden="true" />}
+            <span className="group-path">进行中</span>
+            <span className="count">{blockSessions.length}</span>
+            <span className="label-right">
+              {renderRunBadges(runningSessions)}
+              {doneUnreadSessions.length > 0 && (
+                <span className="run-badge done" title={`${doneUnreadSessions.length} 个会话已完成未查看`}>
+                  <span className="dot" aria-hidden="true" />
+                  {doneUnreadSessions.length} 已完成
+                </span>
+              )}
+            </span>
           </div>
-          {runningOpen && runningSessions.map((s) => {
+          {runningOpen && blockSessions.map((s) => {
             const since = runSince.get(s.id)
             return renderSessionRow(
               s,
@@ -859,11 +910,26 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
         const collapsed = flatHistory
           ? false
           : groupsDefaultCollapsed ? !expandedGroups.has(key) : collapsedGroups.has(key)
-        // 折叠 → 组内会话全部收起（0 个）；展开 → 全部显示
+        // 折叠 → 组内会话全部收起（0 个）；展开 → 显示「最近」+「更早」子组。
         // 组内序走 compareSessions（updatedAt 降序 + id 兜底），与后端 ORDER BY 同一口径；
         // 用 slice 而非原地 sort —— groups 里的数组是本渲染新建的，但原地排序会让「组内序」
         // 隐式依赖遍历顺序，显式复制更清楚。
-        const visible = collapsed ? [] : [...groupSessions].sort(compareSessions)
+        const sorted = collapsed ? [] : [...groupSessions].sort(compareSessions)
+        // [folder-group] 超过 3 天的会话收进「更早」子组（默认收起）；flatHistory 平铺不拆。
+        // ⚠️ 运行中 / 待处理会话豁免（即使 updatedAt 旧也不收）——保住 2026-11-23 run-block
+        //   「运行中会话仍留在项目分组、不隐藏」的不变量（updatedAt 只跟用户消息走，长任务可能旧）。
+        const isOlder = (s: SessionDto) => isOlderSession(s.updatedAt ?? s.createdAt)
+          && runningSessionIds?.has(s.id) !== true
+          && pendingSessionIds?.has(s.id) !== true
+        const recent = flatHistory ? sorted : sorted.filter((s) => !isOlder(s))
+        const older = flatHistory ? [] : sorted.filter((s) => isOlder(s))
+        // 当前会话落在「更早」里 ⇒ 强制展开（保证可见，与 groupsDefaultCollapsed 自动展开当前组同语义）。
+        const olderOpen = expandedOlder.has(key) || older.some((s) => s.id === activeSession)
+        const toggleOlder = () => setExpandedOlder((prev) => {
+          const next = new Set(prev)
+          if (next.has(key)) next.delete(key); else next.add(key)
+          return next
+        })
         return (
           <div key={key} className="left-section">
             {/* flatHistory：不渲染分组标题 —— 会话平铺，无项目/文件夹分组概念 */}
@@ -878,8 +944,10 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                   setGroupMenu({ x: e.clientX, y: e.clientY, path })
                 }}
               >
-                <ChevronIcon open={!collapsed} />
-                <FolderIcon />
+                <GroupChev open={!collapsed} />
+                <span className="folder-ic" style={{ color: FOLDER_COLOR }}>
+                  <FileTypeIcon kind="folder" size={15} open={!collapsed} />
+                </span>
                 <span className="group-path" title={path || groupTitle}>{groupTitle}</span>
                 <span className="count">{groupSessions.length}</span>
                 <span className="label-right">
@@ -892,7 +960,28 @@ export function SessionList({ sessions, activeSession, switchSession, projectPat
                 </span>
               </div>
             )}
-            {visible.map((s) => renderSessionRow(s))}
+            {recent.map((s) => renderSessionRow(s))}
+            {/* [folder-group] 「更早」子组：时钟图标 + 计数徽章 + 上间距软分隔（不画线），默认收起。 */}
+            {older.length > 0 && (
+              <>
+                <div
+                  className="older-head"
+                  onClick={toggleOlder}
+                  role="button"
+                  aria-expanded={olderOpen}
+                  title="超过 3 天未更新的会话"
+                >
+                  <GroupChev open={olderOpen} />
+                  <svg className="older-clock" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round">
+                    <circle cx="12" cy="12" r="9" />
+                    <path d="M12 7v5l3 2" />
+                  </svg>
+                  <span className="older-label">更早</span>
+                  <span className="older-badge">{older.length}</span>
+                </div>
+                {olderOpen && older.map((s) => renderSessionRow(s))}
+              </>
+            )}
           </div>
         )
       })}

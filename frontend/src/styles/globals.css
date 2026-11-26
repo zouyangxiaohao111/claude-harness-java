@@ -585,6 +585,9 @@ html {
   background: #E8B93C;
 }
 .left-section .label .run-badge.pending .dot { background: #E8573A; }
+/* [run-block 2026-11-26] 「已完成未读」角标：绿点绿底，与行内 done 状态点同色族 */
+.left-section .label .run-badge.done { background: rgba(36, 138, 61, .14); }
+.left-section .label .run-badge.done .dot { background: #248a3d; }
 .left-section .label .group-path {
   flex: 1;
   overflow: hidden;
@@ -2854,8 +2857,9 @@ html {
   display: inline-flex; align-items: center; gap: 6px;
   padding: 2px 9px; border-radius: 999px;
   background: var(--surface-2); color: var(--ink);
-  font-size: 12px; line-height: 18px; cursor: default;
+  font-size: 12px; line-height: 18px; cursor: pointer;
 }
+.msg.user .user-bubble .skill-chip:hover { background: var(--surface-3); }
 .msg.user .user-bubble .skill-chip-img { width: 14px; height: 14px; border-radius: 3px; object-fit: cover; }
 .msg.user .user-bubble .skill-chip-fallback { font-size: 12px; color: var(--accent); }
 .msg.user .user-bubble .skill-chip-label { max-width: 220px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
@@ -2865,7 +2869,37 @@ html {
   /* DSH skill token 同色：--dsw-alias-state-business-primary = deepseek-500 = rgb(65,118,230) */
   background: rgba(65, 118, 230, 0.12);
   color: rgb(65, 118, 230);
+  cursor: pointer;
 }
+.msg.user .user-bubble .inline-skill:hover { text-decoration: underline dotted; text-underline-offset: 3px; }
+/* [技能预览 2026-11-26] 气泡技能 chip / 内联命令的「技能说明」浮层
+   （设计稿 sess-0abfe0a1 deliverables/技能召唤消息气泡设计.html） */
+.skill-pop {
+  position: fixed; z-index: 70;
+  display: flex; flex-direction: column;
+  border: 1px solid var(--hairline-strong); border-radius: 12px;
+  background: var(--surface-1);
+  box-shadow: 0 12px 40px rgba(20,24,31,.18);
+  padding: 12px 14px;
+  animation: bubbleIn 140ms var(--spring);
+}
+.skill-pop-head { display: flex; align-items: center; gap: 8px; }
+.skill-pop-icon { width: 18px; height: 18px; border-radius: 4px; object-fit: cover; flex: 0 0 auto; }
+.skill-pop-icon-fallback { color: var(--accent); font-size: 14px; flex: 0 0 auto; }
+.skill-pop-title { display: flex; align-items: baseline; gap: 6px; min-width: 0; flex: 1; }
+.skill-pop-title b { font-size: 13px; font-weight: 600; color: var(--ink); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-pop-name { font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace); font-size: 11px; color: var(--ink-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.skill-pop-close { flex: 0 0 auto; border: 0; background: transparent; color: var(--ink-tertiary); cursor: pointer; font-size: 12px; line-height: 18px; padding: 2px 5px; border-radius: 5px; }
+.skill-pop-close:hover { background: var(--surface-2); color: var(--ink); }
+.skill-pop-path { margin-top: 6px; font-family: var(--font-mono, ui-monospace, Menlo, Consolas, monospace); font-size: 11px; color: var(--ink-tertiary); word-break: break-all; }
+.skill-pop-desc { margin-top: 8px; font-size: 12px; line-height: 1.55; color: var(--ink-subtle); }
+.skill-pop-body { margin-top: 10px; flex: 1 1 auto; min-height: 0; overflow: auto; }
+.skill-pop-hint { font-size: 12px; color: var(--ink-tertiary); }
+.skill-pop-hint.error { color: var(--error, #c64545); }
+.skill-pop-md { font-size: 12.5px; line-height: 1.6; }
+.skill-pop-md h1, .skill-pop-md h2, .skill-pop-md h3, .skill-pop-md h4 { margin: 8px 0 4px; font-size: 13px; }
+.skill-pop-md p, .skill-pop-md ul, .skill-pop-md ol { margin: 4px 0; }
+.skill-pop-md pre { max-width: 100%; overflow-x: auto; }
 @keyframes bubbleIn {
   from { opacity: 0; transform: translateY(6px) scale(0.98); }
   to { opacity: 1; transform: translateY(0) scale(1); }
@@ -21022,3 +21056,52 @@ html {
 .session-item .session-collapse-btn svg { width: 10px; height: 10px; }
 /* 创建者已删除时退化的静态「源」行（仍带家族色条，仅不可点） */
 .session-item.source-missing { cursor: default; opacity: .85; }
+
+/* ===== [folder-group 2026-11-26] 左栏文件夹分组：照右栏文件树折叠形态 + 「更早」归档子组 =====
+   设计权威：deliverables/左栏文件夹分组-设计稿.html（用户确认：文件夹琥珀/open-closed、
+   更早子分组行 A 图标徽章无线、阈值 >3天）。chevron 与文件夹图标取自右栏 .file-tree-node / FileTypeIcon。 */
+/* 分组标题 chevron：照右栏 .file-tree-node .chev（向下小箭头，展开旋转 90°）。仅项目分组用。 */
+.left-section .label .chev { display: flex; align-items: center; color: var(--ink-faint); transition: transform 150ms var(--ease); width: 8px; flex-shrink: 0; }
+.left-section .label .chev.open { transform: rotate(90deg); }
+/* 文件夹图标着色：.folder-ic 上 inline color（琥珀），svg 继承它。
+   ⚠️ 必须显式覆盖 .label svg{color:var(--ink-faint)}（含 workspace-surface 的 (0,4,1) 规则），
+   否则文件夹仍灰 —— 用更高特异性把 svg 颜色抢回 inherit。 */
+.left-section .label .folder-ic { display: flex; flex-shrink: 0; }
+.left-section .label .folder-ic svg { color: inherit; }
+.app.workspace-surface .left-section .label .folder-ic svg { color: inherit; }
+/* 「更早」子组行（A 图标徽章）：时钟 + 计数徽章 + 6px 上间距软分隔，不画线、不上底色。
+   左栏现有语言靠间距/缩进分区、组内不画横线，故不用分隔线。 */
+.older-head { display: flex; align-items: center; gap: 7px; height: 28px; padding: 0 8px 0 31px; margin: 6px 0 2px; border-radius: 9px; cursor: pointer; color: var(--ink-subtle); font-size: 12px; font-weight: 500; transition: background .14s var(--ease); }
+.older-head:hover { background: var(--surface-2); }
+.older-head .chev { display: flex; align-items: center; color: var(--ink-faint); transition: transform 150ms var(--ease); width: 8px; flex-shrink: 0; }
+.older-head .chev.open { transform: rotate(90deg); }
+.older-head .older-clock { width: 13px; height: 13px; flex-shrink: 0; color: var(--ink-faint); }
+.older-head .older-label { flex: 0 1 auto; color: var(--ink-subtle); }
+.older-head .older-badge { font-size: 10.5px; font-weight: 600; color: var(--ink-subtle); background: var(--surface-3); padding: 1px 7px; border-radius: 999px; line-height: 1.5; flex-shrink: 0; }
+
+/* ── Trace 详情面板的滚动条要「看得见」──────────────────────────────
+   全局 thumb 是 rgba(20,24,31,.12) 的 6px 细条，在深色 JSON 区里几乎不可见 ⇒
+   用户以为面板不能滚（2026-11-26 报「整个页面没法滚动条」）。
+   这里只对详情面板加粗到 10px、加深到 .28，并常驻槽位（scrollbar-gutter）避免内容跳动。 */
+.kp-detail-body {
+  scrollbar-width: thin;
+  scrollbar-color: rgba(20, 24, 31, 0.28) transparent;
+  scrollbar-gutter: stable;
+}
+.kp-detail-body::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+.kp-detail-body::-webkit-scrollbar-track {
+  background: transparent;
+}
+.kp-detail-body::-webkit-scrollbar-thumb {
+  background: rgba(20, 24, 31, 0.28);
+  border-radius: 5px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+.kp-detail-body::-webkit-scrollbar-thumb:hover {
+  background: rgba(20, 24, 31, 0.45);
+  background-clip: padding-box;
+}

@@ -17,6 +17,7 @@ import { uploadAttachment } from '@/api/chat'
 import { briefErrorMessage, briefPayload, dropTextInBriefTurns, isBriefBlock, isSendUserMessage } from '@/utils/sendUserMessage'
 import { extractAtRefs } from '@/utils/atRefs'
 import { loadSkillCatalog, matchLeadingSkill } from '@/utils/skillBubble'
+import { SkillPreviewPopover } from './SkillPreviewPopover'
 import type { CommandDto } from '@/api/command'
 import { headTailCap } from '@/utils/headTailCap'
 // [错误通道 · CCJ-ERR-013] 工具卡状态判定的唯一入口（取消/拒绝/中断前缀先于 is_error，对齐 CC）
@@ -1073,10 +1074,25 @@ function SendUserMessageBody({ tool, prose = false }: { tool: NonNullable<ChatMe
 /** [并行工具组] toolCalls → 渲染段：SendUserMessage 就地渲染（正文语义）；连续的非 brief 工具调用成组
  *  —— 多于 1 个收进一个 {@link ToolGroup} 父行，单个保持原有单行 {@link ToolCard}。
  *  `groupTitle`（同轮 tool_use_summary 文本）只交给本条消息里的第一个组，避免标题重复。 */
+/**
+ * RAG 链的**内部阶段**被包装成工具事件推过来（`KbQaProgress.TOOL_QUERY_UNDERSTAND` /
+ * `TOOL_KNOWLEDGE_SEARCH`，源站同款进度协议）。
+ *
+ * <p>它们不是模型调用过的工具，画成工具卡会让用户以为智能体在调工具；
+ * 而且 `query_understand` 的 ok 取决于「意图改写是否降级」，模型没配时永远是 ✗
+ * （2026-11-26 用户报「快速问答正文下方出现工具调用」）。
+ *
+ * <p>⚠️ ReAct 的真实检索工具叫 `search_knowledge`，与这里的 `knowledge_search` 不同名，
+ * 所以按名字剔除不会误伤智能体真的调用。
+ */
+const RAG_INTERNAL_TOOL_NAMES = new Set(['query_understand', 'knowledge_search'])
+
 function renderToolCalls(
   calls: ToolCallDto[],
   opts: { matchedRule: string | null; sessionId: string; live?: boolean; groupTitle?: string; prose?: boolean; onOpenSession?: (sessionId: string) => void },
 ): ReactNode[] {
+  // 正文下方只保留模型真调过的工具
+  calls = calls.filter((c) => !RAG_INTERNAL_TOOL_NAMES.has((c.name ?? '').trim()))
   const out: ReactNode[] = []
   let run: ToolCallDto[] = []
   let titleAssigned = false
@@ -2124,6 +2140,11 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
     void loadSkillCatalog(msg.sessionId).then((list) => { if (alive) setSkillCatalog(list) })
     return () => { alive = false }
   }, [msg.sessionId])
+  /** [技能预览 2026-11-26] 点气泡里的技能 chip / 内联 `/name` → 浮层看 SKILL.md（设计稿「技能说明」）。 */
+  const [skillPreview, setSkillPreview] = useState<{ name: string; entry: CommandDto; rect: DOMRect } | null>(null)
+  const openSkillPreview = (el: HTMLElement, name: string, entry: CommandDto) => {
+    setSkillPreview({ name, entry, rect: el.getBoundingClientRect() })
+  }
   // 对齐 Harness ChatView：展开思考/工具块是内容变化而非流尖推进，不触发滚动跟随。
   //   用户上滚查历史时点开思考下拉，滚动位置保持不动（治「点开思考回到底部」）。
   // snip_marker：snip 内部标记消息，前端不渲染（仅占位记录，避免气泡噪音）
@@ -2462,8 +2483,10 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
             <div className="user-snipped"><span className="snipped-badge" title="该消息已被 Snip 裁剪，不再发送给模型">已裁剪</span></div>
           )}
           {/* 附件行（chat-demo `UserMessage.files`）：图片与文件同一个 wrap 容器、右对齐、gap 10；
-              有文件时图片缩到 64（--message-file-image-size 同款机制） */}
-          {(userImages.length > 0 || userFileAtts.length > 0) && (
+              有文件时图片缩到 64（--message-file-image-size 同款机制）。
+              [编辑态去重 2026-11-26] 编辑框内已有 `.user-edit-attach`（带删除按钮，且尊重 editRemoved）
+              ⇒ 这里不再重复渲染，否则删掉的图仍在上方原样显示，同一张图出现两次。 */}
+          {!editing && (userImages.length > 0 || userFileAtts.length > 0) && (
             <div className={`user-files${userFileAtts.length > 0 ? ' with-docs' : ''}`}>
               {userImages.map((img, i) => (
                 <button
@@ -2680,7 +2703,16 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                       <div className="bubble-tags">
                         <span
                           className="skill-chip"
-                          title={`/${skill.name}${skill.entry.description ? ` · ${skill.entry.description}` : ''}`}
+                          role="button"
+                          tabIndex={0}
+                          title={`/${skill.name}${skill.entry.description ? ` · ${skill.entry.description}` : ''} · 点击查看技能说明`}
+                          onClick={(e) => openSkillPreview(e.currentTarget, skill.name, skill.entry)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault()
+                              openSkillPreview(e.currentTarget, skill.name, skill.entry)
+                            }
+                          }}
                         >
                           {skill.entry.icon
                             ? <img className="skill-chip-img" src={skill.entry.icon} alt="" loading="lazy" />
@@ -2695,7 +2727,16 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                       <span className="user-text user-skill-inline">
                         <span
                           className="inline-skill"
-                          title={skill.entry.description ?? `/${skill.name}`}
+                          role="button"
+                          tabIndex={0}
+                          title={`${skill.entry.description ?? `/${skill.name}`} · 点击查看技能说明`}
+                          onClick={(e) => openSkillPreview(e.currentTarget, skill.name, skill.entry)}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' || e.key === ' ') {
+                              e.preventDefault()
+                              openSkillPreview(e.currentTarget, skill.name, skill.entry)
+                            }
+                          }}
                         >{skill.token}</span>
                         {skill.rest ? <> {skill.rest}</> : null}
                       </span>
@@ -2709,6 +2750,17 @@ export function Message({ msg, onDelete, onRunHtml, onOpenRefFile, onOpenKbDoc, 
                   </div>
                 )
               })()}
+              {skillPreview && (
+                <SkillPreviewPopover
+                  name={skillPreview.name}
+                  displayName={skillPreview.entry.displayName}
+                  icon={skillPreview.entry.icon}
+                  description={skillPreview.entry.description}
+                  rect={skillPreview.rect}
+                  sessionId={msg.sessionId}
+                  onClose={() => setSkillPreview(null)}
+                />
+              )}
               {/* [用户消息编辑重发] 气泡下方 meta 行：默认隐藏 · hover 淡入（时间 + 编辑 + 复制） */}
               <div className={`user-msg-meta${hovered ? ' show' : ''}`}>
                 <span className="um-time">{userStamp}</span>

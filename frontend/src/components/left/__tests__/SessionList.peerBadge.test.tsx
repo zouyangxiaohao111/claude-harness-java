@@ -8,6 +8,12 @@ import { SessionList } from '../SessionList'
 import type { SessionDto } from '@/api/types'
 import { sumPeerCounts, usePeerInboxStore } from '@/stores/peerInboxStore'
 
+// [folder-group 2026-11-26] 日期用「相对今天」造：本文件测角标，与日期无关；
+// 固定旧日期会被「超过3天收进更早」默认收起导致行不可见。近期日期保证行可见，相对顺序保留。
+const recentIso = (daysAgo = 0): string => {
+  const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - daysAgo); return d.toISOString()
+}
+
 /**
  * [peer-badge] 全局跨会话待处理角标（用户已选 B 方案）。
  *
@@ -111,7 +117,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
   it('a) 有 pending 的会话显示数字，0 的会话不显示', () => {
     const counts = { [A]: 2, [B]: 0 }
     usePeerInboxStore.setState({ countsBySession: counts, totalPending: sumPeerCounts(counts) })
-    render([mkSession(A, '2026-11-01T00:00:00Z'), mkSession(B, '2026-10-01T00:00:00Z')])
+    render([mkSession(A, recentIso(0)), mkSession(B, recentIso(1))])
 
     const badge = badgeOf(A)
     expect(badge, 'A 有 2 条待处理 ⇒ 必须有角标').toBeTruthy()
@@ -123,7 +129,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
     const counts = { [A]: 2, [B]: 3 }
     const total = sumPeerCounts(counts)
     usePeerInboxStore.setState({ countsBySession: counts, totalPending: total })
-    render([mkSession(A, '2026-11-01T00:00:00Z'), mkSession(B, '2026-10-01T00:00:00Z')])
+    render([mkSession(A, recentIso(0)), mkSession(B, recentIso(1))])
 
     const summary = container.querySelector('.left-peer-total')
     expect(summary, '有 pending ⇒ 顶部汇总必须渲染').toBeTruthy()
@@ -136,7 +142,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
   it('c) 点击行内角标切到对应会话，且不触发整行 onClick 的二次切换', () => {
     const counts = { [A]: 1, [B]: 4 }
     usePeerInboxStore.setState({ countsBySession: counts, totalPending: sumPeerCounts(counts) })
-    render([mkSession(A, '2026-11-01T00:00:00Z'), mkSession(B, '2026-10-01T00:00:00Z')], A)
+    render([mkSession(A, recentIso(0)), mkSession(B, recentIso(1))], A)
 
     click(badgeOf(B)!)
     expect(switchSession).toHaveBeenCalledTimes(1)
@@ -147,7 +153,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
     const counts = { [A]: 1, [B]: 4 }
     usePeerInboxStore.setState({ countsBySession: counts, totalPending: sumPeerCounts(counts) })
     onOpenPeerPending = vi.fn<(id: string) => void>()
-    render([mkSession(A, '2026-11-01T00:00:00Z'), mkSession(B, '2026-10-01T00:00:00Z')], A)
+    render([mkSession(A, recentIso(0)), mkSession(B, recentIso(1))], A)
 
     click(badgeOf(B)!)
     expect(onOpenPeerPending).toHaveBeenCalledWith(B)
@@ -155,13 +161,13 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
   })
 
   it('d) 汇总为 0 时不渲染整块；全 0 计数也不渲染', () => {
-    render([mkSession(A, '2026-11-01T00:00:00Z')])
+    render([mkSession(A, recentIso(0))])
     expect(container.querySelector('.left-peer-total')).toBeNull()
     expect(container.querySelector('.session-peer-badge')).toBeNull()
 
     usePeerInboxStore.setState({ countsBySession: { [A]: 0, [B]: 0 }, totalPending: 0 })
     // 重渲染触发选择器读取
-    render([mkSession(A, '2026-11-01T00:00:00Z')])
+    render([mkSession(A, recentIso(0))])
     expect(container.querySelector('.left-peer-total')).toBeNull()
     expect(container.querySelector('.session-peer-badge')).toBeNull()
   })
@@ -189,7 +195,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
     act(() => {
       root.render(
         <SessionList
-          sessions={[mkSession(A, '2026-09-01T00:00:00Z', true), mkSession(B, '2026-11-01T00:00:00Z')]}
+          sessions={[mkSession(A, recentIso(2), true), mkSession(B, recentIso(0))]}
           activeSession={B}
           switchSession={switchSession}
           projectNameFor={() => '项目一'}
@@ -204,7 +210,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
     // [run-block 2026-11-23] 运行块在最前；置顶块紧随其后、置顶星标仍是实心态
     const sectionTitles = Array.from(container.querySelectorAll('.left-section > .label .group-path'))
       .map((el) => el.textContent)
-    expect(sectionTitles.slice(0, 2)).toEqual(['正在运行', '置顶'])
+    expect(sectionTitles.slice(0, 2)).toEqual(['进行中', '置顶'])
     expect(rowOf(A).querySelector('.session-pin-btn')?.getAttribute('aria-label')).toBe('取消置顶')
     // 运行中状态点仍在（角标不抢占状态点的位置）
     expect(rowOf(B).querySelector('.status-dot.running')).toBeTruthy()
@@ -214,7 +220,7 @@ describe('SessionList · [peer-badge] 会话行角标', () => {
   })
 
   it('g) 聚合事件到达后角标与汇总即时变化（无需切会话/轮询）', () => {
-    render([mkSession(A, '2026-11-01T00:00:00Z'), mkSession(B, '2026-10-01T00:00:00Z')])
+    render([mkSession(A, recentIso(0)), mkSession(B, recentIso(1))])
     expect(container.querySelector('.session-peer-badge')).toBeNull()
     expect(container.querySelector('.left-peer-total')).toBeNull()
 

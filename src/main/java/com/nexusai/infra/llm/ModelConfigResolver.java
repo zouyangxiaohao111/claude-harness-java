@@ -181,8 +181,16 @@ public class ModelConfigResolver {
         //   此前该列没有任何 provider 读取（只存不读），前端填了不生效。解析失败/非对象 → 空 map
         //   （fail-soft：不阻断请求，只记 warn）。
         Map<String, Object> extraBody = parseExtraBody(model.getExtraBody(), modelName);
-        return new ResolvedModel(new ProviderConfig(provider.getBaseUrl(), rawKey,
-            ProviderService.deserializeHeaders(provider.getExtraHeaders()), extraBody), providerType,
+        Map<String, String> headers = ProviderService.deserializeHeaders(provider.getExtraHeaders());
+        ProviderConfig config;
+        if (ProviderConfigAssembler.isGoogleOAuth(provider.getAuthMode())) {
+            // Google 订阅：固定 Cloud Code host + project 透传（与 ChatService/ExecAgentHook 同一装配器）
+            config = ProviderConfigAssembler.forGoogleOAuth(rawKey, provider.getOauthProject(),
+                headers, extraBody);
+        } else {
+            config = new ProviderConfig(provider.getBaseUrl(), rawKey, headers, extraBody);
+        }
+        return new ResolvedModel(config, providerType,
             // ⚠️ 用 models.name（真实模型名），不是入参 modelName —— 入参可能是 ID
             model.getName());
     }

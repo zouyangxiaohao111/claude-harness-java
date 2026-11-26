@@ -10,7 +10,7 @@
  * <p>`openai_response`（OpenAI Responses API · `/v1/responses`）已由后端
  * `ResponsesSdkProvider` 实现，可正常提交并调用。
  */
-export type ProviderType = 'openai_compatible' | 'openai_response' | 'anthropic'
+export type ProviderType = 'openai_compatible' | 'openai_response' | 'anthropic' | 'gemini_code_assist'
 
 /** 协议类型下拉/分段控件的**展示项** · 与 ProviderType 同集合（保留该别名避免大范围改调用方）。 */
 export type ProviderProtocolOption = ProviderType
@@ -29,9 +29,10 @@ export interface Provider {
   updatedAt?: string
   /**
    * 鉴权模式（后端 `providers.auth_mode`）：
-   * `api_key` = 走下方 API Key；`codex_oauth` = ChatGPT 订阅登录；`claude_oauth` = Claude 订阅登录
+   * `api_key` = 走下方 API Key；`codex_oauth` = ChatGPT 订阅登录；`claude_oauth` = Claude 订阅登录；
+   * `google_oauth` = Google 订阅（Gemini Code Assist）登录
    */
-  authMode?: 'api_key' | 'codex_oauth' | 'claude_oauth'
+  authMode?: 'api_key' | 'codex_oauth' | 'claude_oauth' | 'google_oauth'
   /**
    * 订阅账号标识（后端 `providers.oauth_account_id`）。
    * 仅 `codex_oauth` 有值 —— Claude 的 token 响应不带账号标识，恒为 null。
@@ -217,6 +218,26 @@ export interface OAuthAuthorizeResponse {
 export interface OAuthCompleteResponse {
   ok: boolean
   message?: string
+}
+
+// ---- OAuth（Google 订阅 · Gemini Code Assist）----
+/** `POST /providers/{id}/oauth/google/authorize`：授权地址 + 在途授权过期时刻（epoch ms） */
+export interface GoogleOAuthAuthorizeResponse {
+  url: string
+  expiresAt: number
+}
+
+/**
+ * `GET /providers/{id}/oauth/google/status`（纯只读，无刷新/认证副作用）。
+ *
+ * <p>`expiresAt`：pending = 在途授权 TTL；ready = token 实际过期时刻。
+ * project 不在 ProviderDto 上，资格诊断以本接口的 `oauthProject` 为准。
+ */
+export interface GoogleOAuthStatus {
+  status: 'logged_out' | 'pending' | 'onboarding' | 'ready' | 'error'
+  oauthProject: string | null
+  expiresAt: number | null
+  message: string | null
 }
 
 // ---- Skill ----

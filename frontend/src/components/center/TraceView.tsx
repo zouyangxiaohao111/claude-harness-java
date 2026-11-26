@@ -242,6 +242,10 @@ const CONTENT_CELL_STYLE: CSSProperties = {
 const DETAIL_BODY_STYLE: CSSProperties = {
   flex: '1 1 auto',
   minHeight: 0,
+  // ⭐ 卡片本身限高（`.trace-detail{max-height:82vh}`），内容（原始 JSON 动辄上万字符）
+  //   必须在这里滚 —— 少了这行内容直接溢出被卡片裁掉，用户看到「后半段看不到、也没滚动条」
+  //   （2026-11-26 用户报）。
+  overflowY: 'auto',
 }
 
 /** [snip-persist] 已裁剪正文的删除线（旧 `.trace-record.snipped .content{text-decoration:line-through}` 等价物）。 */

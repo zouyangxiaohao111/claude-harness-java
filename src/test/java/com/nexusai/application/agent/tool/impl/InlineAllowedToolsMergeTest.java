@@ -66,7 +66,7 @@ class InlineAllowedToolsMergeTest {
         //   schedule 技能声明的两个工具在会话权限层零授权，模型调用 RemoteTrigger/AskUserQuestion
         //   会被权限层阻断。断言 COMMAND 桶含两个 whole-tool ALLOW rule 即锁死运行时授权。
         Map<String, Object> merged = SkillToolImpl.mergeAllowedToolsIntoAppState(
-                null, List.of("RemoteTrigger", "AskUserQuestion"));
+                null, List.of("RemoteTrigger", "AskUserQuestion"), PermissionMode.DEFAULT);
 
         ToolPermissionContext tpc = (ToolPermissionContext) merged.get("toolPermissionContext");
         assertThat(tpc).as("appState 无既有 toolPermissionContext → 构建最小 ToolPermissionContext").isNotNull();
@@ -82,7 +82,7 @@ class InlineAllowedToolsMergeTest {
         //   update-config 只允许 Read（禁止 Edit/Write/Bash 由模型直接调用，用户必须手动确认），
         //   若 allowedTools 丢失，Read 也需权限询问，破坏"先读再写"引导流程。
         Map<String, Object> merged = SkillToolImpl.mergeAllowedToolsIntoAppState(
-                null, List.of("Read"));
+                null, List.of("Read"), PermissionMode.DEFAULT);
 
         ToolPermissionContext tpc = (ToolPermissionContext) merged.get("toolPermissionContext");
         assertThat(tpc.alwaysAllowRules().get(PermissionRuleSource.COMMAND))
@@ -103,7 +103,7 @@ class InlineAllowedToolsMergeTest {
                 Map.of(), false, false, Map.of(), false, false, null);
 
         Map<String, Object> merged = SkillToolImpl.mergeAllowedToolsIntoAppState(
-                snapshotWith(base), List.of("Read", "RemoteTrigger"));
+                snapshotWith(base), List.of("Read", "RemoteTrigger"), PermissionMode.DEFAULT);
 
         ToolPermissionContext tpc = (ToolPermissionContext) merged.get("toolPermissionContext");
         Set<PermissionRule> commandRules = tpc.alwaysAllowRules().get(PermissionRuleSource.COMMAND);
@@ -113,5 +113,36 @@ class InlineAllowedToolsMergeTest {
         assertThat(commandRules.stream().filter(r -> r.ruleValue().toolName().equals("Read")).count())
                 .as("[P2-5] 去重：Read whole-tool ALLOW rule 必须唯一（CC SkillTool.ts:795-799 new Set）")
                 .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("[coordinator-bypass-inherit] appState 无 tpc + currentMode=BYPASS → 占位 mode 继承 BYPASS（⛔ 不得 DEFAULT 压掉会话 bypass）")
+    void mergeIntoAppState_noExistingTpc_placeholderModeInheritsCurrentMode() {
+        // WHY（2026-11-26 sess-908ea539 实证）: 旧实现 existing=null 时硬编码 PermissionMode.DEFAULT
+        //   占位，而 AgentLoopContext.mergeAppStatePermissionRules:1776「appState 侧 mode 胜出」会采纳它
+        //   ⇒ 技能 allowedTools 注入后 per-turn 模式被压成 DEFAULT，协调者子代理继承 DEFAULT
+        //   → 目录外 Edit 弹 WorkingDir 窗 → 用户点「本次会话允许编辑」setMode(acceptEdits) 污染主会话。
+        //   CC 真源 appState.toolPermissionContext 恒存在（无占位分支）；本仓 prototype loop appStateRef
+        //   恒空 ⇒ 占位 mode 必须继承当前 TUC 有效模式。变异自检：else 分支改回硬编码 DEFAULT → 本用例红。
+        Map<String, Object> merged = SkillToolImpl.mergeAllowedToolsIntoAppState(
+                null, List.of("Read"), PermissionMode.BYPASS_PERMISSIONS);
+
+        ToolPermissionContext tpc = (ToolPermissionContext) merged.get("toolPermissionContext");
+        assertThat(tpc.mode())
+                .as("[coordinator-bypass-inherit] 占位 ctx mode 必须继承 currentMode=BYPASS，不得硬编码 DEFAULT")
+                .isEqualTo(PermissionMode.BYPASS_PERMISSIONS);
+        assertThat(tpc.alwaysAllowRules().get(PermissionRuleSource.COMMAND))
+                .as("COMMAND 桶授权语义不变")
+                .containsExactly(wholeToolRule("Read"));
+    }
+
+    @Test
+    @DisplayName("[coordinator-bypass-inherit] currentMode=null → DEFAULT 兜底（无上下文可继承时保持旧行为）")
+    void mergeIntoAppState_noExistingTpc_nullCurrentModeFallsBackToDefault() {
+        Map<String, Object> merged = SkillToolImpl.mergeAllowedToolsIntoAppState(
+                null, List.of("Read"), null);
+
+        ToolPermissionContext tpc = (ToolPermissionContext) merged.get("toolPermissionContext");
+        assertThat(tpc.mode()).isEqualTo(PermissionMode.DEFAULT);
     }
 }

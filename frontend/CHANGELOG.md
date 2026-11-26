@@ -2,12 +2,18 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.91] - 2026-11-26
+
+### Added
+
+- 修复 Win10 右键退出杀不掉 Java；新增 Google 订阅（Gemini Code Assist）OAuth、KB 摄取进度与引用、Provider 配置组装
+
 ## [0.1.90] - 2026-11-25
 
-### Fixed
+### Added
 
-- 修复技能市场预览与知识库文件选择的问题（修改人：zcw）
-- 修复通用设置「关于 → 更新」按钮点击无反应：按钮发出 `nexusai:check-update` 事件但 `UpdateCenter` 未监听（事件发给了空气），并移除重复的右下角悬浮入口，更新弹窗改为压在设置弹窗之上（z-index 420）。（修改人：zcw）
+- 修复技能市场预览与知识库文件选择的问题
+- 新增独立「Google 订阅」（Gemini Code Assist）入口与详情视图：显式 OAuth 登录（动态回调 + 手动粘贴兜底）、五态有界轮询（初始 expiresAt 绝对硬截止 + 独立到期 timer，悬挂请求也收口）、授权 URL 安全兜底（打开/复制/手动选择，Tauri 打开失败明确警告不假成功、Web noopener null 不误判失败）、常驻条款风险提示、就绪后按后端下发管理模型；与 Gemini API Key 为两条独立连接。本地 mock + 真实 Controller 契约对接验证通过；真实账号/Tauri 壳/Mac 未验。
 
 ## [0.1.89] - 2026-11-25
 

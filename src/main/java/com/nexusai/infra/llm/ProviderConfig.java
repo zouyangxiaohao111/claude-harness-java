@@ -23,7 +23,7 @@ import java.util.Map;
  *                     {@link ProviderHeaderInjector} 单点处理（防御存量脏数据）。
  */
 public record ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders,
-                             Map<String, Object> extraBody) {
+                             Map<String, Object> extraBody, String oauthProject) {
 
     /**
      * 模型级额外请求体（{@code extraBody}）· 2026-10-22。
@@ -37,9 +37,20 @@ public record ProviderConfig(String baseUrl, String apiKey, Map<String, String> 
         extraBody = extraBody == null ? Map.of() : Map.copyOf(extraBody);
     }
 
-    /** 兼容构造：无额外请求体（既有 3 参调用点零改动）。 */
+    /**
+     * 兼容构造：无 OAuth project（既有 4 参调用点零改动）。
+     *
+     * <p>{@code oauthProject} 只对 {@code google_oauth}（Gemini Code Assist / Cloud Code）有意义；
+     * 普通 provider 恒为 null。⛔ 不要在普通路径「凭空」补 project，只有装配 Google 订阅时才显式传。
+     */
+    public ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders,
+                          Map<String, Object> extraBody) {
+        this(baseUrl, apiKey, extraHeaders, extraBody, null);
+    }
+
+    /** 兼容构造：无额外请求体、无 OAuth project（既有 3 参调用点零改动）。 */
     public ProviderConfig(String baseUrl, String apiKey, Map<String, String> extraHeaders) {
-        this(baseUrl, apiKey, extraHeaders, Map.of());
+        this(baseUrl, apiKey, extraHeaders, Map.of(), null);
     }
 
     /**

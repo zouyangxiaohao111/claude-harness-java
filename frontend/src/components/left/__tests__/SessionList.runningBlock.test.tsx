@@ -6,7 +6,7 @@ import { SessionList } from '../SessionList'
 import type { SessionDto } from '@/api/types'
 
 /**
- * 「正在运行」块（用户 2026-11-23 认可的设计稿）。
+ * 「进行中」块（原「正在运行」，2026-11-26 纳入已完成未读后改名；用户 2026-11-23 认可的设计稿）。
  * 意图：运行的会话浮在最上面一眼可见，但不能从原分组搬走（「下方文件组不隐藏」）；空则整块消失。
  */
 
@@ -45,6 +45,7 @@ async function mount(props: {
   sessions: SessionDto[]
   runningSessionIds?: Set<string>
   pendingSessionIds?: Set<string>
+  doneUnreadIds?: Set<string>
 }) {
   act(() => {
     root.render(
@@ -56,6 +57,7 @@ async function mount(props: {
         sessions={props.sessions}
         runningSessionIds={props.runningSessionIds}
         pendingSessionIds={props.pendingSessionIds}
+        doneUnreadIds={props.doneUnreadIds}
       />,
     )
   })
@@ -68,14 +70,14 @@ function titlesIn(el: Element | null): string[] {
   return Array.from(el?.querySelectorAll('.session-item .title') ?? []).map((n) => n.textContent ?? '')
 }
 
-describe('SessionList · 正在运行块', () => {
+describe('SessionList · 进行中块（运行/待处理）', () => {
   it('运行中会话进块，同时仍留在项目分组里（不隐藏）', async () => {
     await mount({
       sessions: [mkSession('s-run', '2026-11-02T00:00:00Z'), mkSession('s-idle', '2026-11-01T00:00:00Z')],
       runningSessionIds: new Set(['s-run']),
     })
     expect(runBlock()).toBeTruthy()
-    expect(runBlock()?.querySelector('.group-path')?.textContent).toBe('正在运行')
+    expect(runBlock()?.querySelector('.group-path')?.textContent).toBe('进行中')
     expect(titlesIn(runBlock())).toEqual(['会话 s-run'])
     expect(runBlock()?.querySelector('.session-item .status-dot.running')).toBeTruthy()
     expect(runBlock()?.querySelector('.run-elapsed')?.textContent).toMatch(/^\d+:\d{2}$/)
@@ -108,5 +110,39 @@ describe('SessionList · 正在运行块', () => {
     act(() => { label.click() })
     expect(titlesIn(runBlock())).toEqual([])
     expect(runBlock()?.querySelector('.label-right .run-badge')?.textContent).toContain('运行中')
+  })
+})
+
+describe('SessionList · 进行中块纳入「已完成未读」（2026-11-26）', () => {
+  it('已完成未读进块：绿点 + 相对时间（无运行时长）+「已完成」角标', async () => {
+    await mount({ sessions: [mkSession('s-done', '2026-11-01T00:00:00Z')], doneUnreadIds: new Set(['s-done']) })
+    expect(titlesIn(runBlock())).toEqual(['会话 s-done'])
+    expect(runBlock()?.querySelector('.session-item .status-dot.done')).toBeTruthy()
+    expect(runBlock()?.querySelector('.session-item .run-elapsed')).toBeNull()
+    expect(runBlock()?.querySelector('.session-item .time')).toBeTruthy()
+    expect(runBlock()?.querySelector('.label-right .run-badge.done')?.textContent).toContain('已完成')
+  })
+
+  it('只有已完成未读（无运行/待处理）⇒ 块仍渲染、无运行脉冲', async () => {
+    await mount({ sessions: [mkSession('s-done', '2026-11-01T00:00:00Z')], doneUnreadIds: new Set(['s-done']) })
+    expect(runBlock()).toBeTruthy()
+    expect(runBlock()?.querySelector('.group-path')?.textContent).toBe('进行中')
+    expect(runBlock()?.querySelector('.run-pulse')).toBeNull()
+  })
+
+  it('查看即移出：doneUnreadIds 清除后该会话离开块（WHY：用户要「查看完成就立马移出」）', async () => {
+    const s = mkSession('s-done', '2026-11-01T00:00:00Z')
+    await mount({ sessions: [s], doneUnreadIds: new Set(['s-done']) })
+    expect(titlesIn(runBlock())).toEqual(['会话 s-done'])
+    // 模拟 App 切到该会话 ⇒ 清除 doneUnreadIds（App.tsx:1946 effect）
+    await mount({ sessions: [s], doneUnreadIds: new Set() })
+    expect(runBlock()).toBeNull()
+  })
+
+  it('运行中优先：既 running 又 doneUnread ⇒ 只算运行段，不重复、无已完成角标', async () => {
+    await mount({ sessions: [mkSession('s-x', '2026-11-01T00:00:00Z')], runningSessionIds: new Set(['s-x']), doneUnreadIds: new Set(['s-x']) })
+    expect(titlesIn(runBlock())).toEqual(['会话 s-x'])
+    expect(runBlock()?.querySelector('.run-badge.done')).toBeNull()
+    expect(runBlock()?.querySelector('.run-badge')?.textContent).toContain('运行中')
   })
 })

@@ -907,6 +907,8 @@ function reasoningHint(style: string): string {
       return '--thinking'
     case 'OPENCODE_VARIANT':
       return '--variant'
+    case 'AGY_EFFORT':
+      return '--effort'
     default:
       return ''
   }

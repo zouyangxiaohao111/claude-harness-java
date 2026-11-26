@@ -1671,7 +1671,11 @@
 }
 
 .kb-scope .kp-json-large {
-  max-height: 480px;
+  /* 「原始 JSON」不单独限高：内容经常上万字符，这里再套一层滚动条会和
+     .kp-detail-body 的滚动打架，滚动条看不见、尾部以为被截断（2026-11-26 用户报）。
+     统一交给 .kp-detail-body 一个滚动容器。 */
+  max-height: none;
+  overflow: visible;
 }
 
 /* ============== COMPACT MODE (untouched) ============== */

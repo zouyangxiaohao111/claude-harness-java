@@ -34,7 +34,9 @@ public final class ExternalRuntimeCatalog {
         /** pi：{@code --thinking <id>} */
         PI_THINKING,
         /** opencode：{@code --variant <id>}（仅当模型声明了该 variant） */
-        OPENCODE_VARIANT
+        OPENCODE_VARIANT,
+        /** agy（Antigravity CLI）：{@code --effort <id>}（2026-11-26 由 {@code agy --help} 核实） */
+        AGY_EFFORT
     }
 
     /**
@@ -179,7 +181,40 @@ public final class ExternalRuntimeCatalog {
                 ReasoningStyle.PI_THINKING,
                 List.of("--list-models"),
                 "极简编码代理",
-                "pi coding agent；凭据跟 provider 走，请在 pi 内 /login")
+                "pi coding agent；凭据跟 provider 走，请在 pi 内 /login"),
+        // agy（Google Antigravity 官方 CLI）· 2026-11-26 真机实测：
+        //   `agy --version` = 1.5.18；`agy models` 每行 modelId<TAB>Display Name（27 条）；
+        //   `agy --effort low|medium|high|xhigh|max`、`--model <id>` 均由 `agy --help` 核实。
+        // ⚠️ 成功分支的 stream-json 事件形状**未实测**（当前账号被 Eligibility check 拒绝），
+        //   故 streamFormat 用容错的 "jsonl"，且解析不到正文时如实报「没有答案」——
+        //   ⛔ 不要照猜补成功事件映射；拿到真实成功输出后再补。
+        // ⚠️ agy 需要访问 Google：本机直连不通，子进程必须带代理（见 ExternalRuntimeSpec
+        //   的 outboundProxyEnv，值来自应用设置，不硬编码端口）。
+        new RuntimePreset("agy", "Antigravity CLI", "agy", List.of("agy"),
+                "AGY_BIN",
+                List.of("-p", "{prompt}", "--output-format", "stream-json"),
+                "jsonl",
+                null, null,
+                // CLI 侧认 GEMINI_API_KEY（与 ACP authMethods 的 gemini-api-key 同源）
+                List.of("GEMINI_API_KEY"),
+                // 2026-11-26 `agy models` 实测（按输出顺序）。未登录时该命令非 0 退出 ⇒
+                // controller 回落这份内置列表。
+                List.of("gemini-4-neon-high", "gemini-4-neon-xhigh", "gemini-4-neon-medium",
+                        "gemini-4-neon-low", "gemini-4-carbon-medium", "gemini-4-carbon-high",
+                        "gemini-4-carbon-low", "gemini-4-argon-medium", "gemini-4-argon-high",
+                        "gemini-4-argon-low", "gemini-4-hydrogen-high", "gemini-4-hydrogen-xhigh",
+                        "gemini-4-hydrogen-medium", "gemini-4-hydrogen-low",
+                        "gemini-pro-orchestrator-neon", "gemini-pro-orchestrator",
+                        "gemini-pro-orchestrator-argon", "gemini-3.8-flash-high",
+                        "gemini-3.8-flash-medium", "gemini-3.8-flash-low",
+                        "claude-opus-5-5-low", "claude-opus-5-5-medium", "claude-opus-5-5-high",
+                        "claude-sonnet-5-5-low", "claude-sonnet-5-5-medium", "claude-sonnet-5-5-high",
+                        "gpt-oss-120b-medium"),
+                List.of("low", "medium", "high", "xhigh", "max"),
+                ReasoningStyle.AGY_EFFORT,
+                List.of("models"),
+                "Google Antigravity 官方 CLI",
+                "未配置时用 agy 自身的登录态；需要能访问 Google（走应用设置里的出站代理）")
     );
 
     public static List<RuntimePreset> presets() {
@@ -275,6 +310,61 @@ public final class ExternalRuntimeCatalog {
                 .build();
     }
 
+    // ─────────────────── 推理强度 → argv 的策略表 ───────────────────
+    // 为什么策略化（用户 2026-11-26）：每家 CLI 的拼法互不兼容，之前是 switch；改成
+    // 「一个 style 一个策略实现 + 静态注册表」后，dispatcher 只查表、不再感知任何一家。
+    // ⛔ 不进 Spring / 不做 SPI 扫描：注册表就是本类的静态 Map，新增一家 = 加一个实现类 + 一行注册。
+    // ⛔ key 必须是枚举名（对外 JSON 的 reasoningStyle 字面量不变，前端零改动）。
+
+    /** 一种推理强度拼法的策略。 */
+    interface ReasoningArgStrategy {
+        /** @param effort 已校验过的档位 id（非空、形如标识符） */
+        List<String> args(String effort);
+    }
+
+    /** claude：不支持推理强度 ⇒ 任何档位都不追加（⛔ 不能塞一个它静默忽略的值）。 */
+    private static final class NoneStrategy implements ReasoningArgStrategy {
+        @Override public List<String> args(String effort) {
+            return List.of();
+        }
+    }
+
+    /** codex：{@code -c model_reasoning_effort="x"} —— ⛔ 引号是参数的一部分，必须逐字保留。 */
+    private static final class CodexConfigStrategy implements ReasoningArgStrategy {
+        @Override public List<String> args(String effort) {
+            return List.of("-c", "model_reasoning_effort=\"" + effort + "\"");
+        }
+    }
+
+    /** pi：{@code --thinking <id>}。 */
+    private static final class PiThinkingStrategy implements ReasoningArgStrategy {
+        @Override public List<String> args(String effort) {
+            return List.of("--thinking", effort);
+        }
+    }
+
+    /** opencode：{@code --variant <id>}（按模型的 variant）。 */
+    private static final class OpencodeVariantStrategy implements ReasoningArgStrategy {
+        @Override public List<String> args(String effort) {
+            return List.of("--variant", effort);
+        }
+    }
+
+    /** agy：{@code --effort <id>}。 */
+    private static final class AgyEffortStrategy implements ReasoningArgStrategy {
+        @Override public List<String> args(String effort) {
+            return List.of("--effort", effort);
+        }
+    }
+
+    /** 注册表 · key = {@link ReasoningStyle#name()}（= 对外 JSON 字面量）。 */
+    private static final Map<String, ReasoningArgStrategy> REASONING_ARG_STRATEGIES = Map.of(
+            ReasoningStyle.NONE.name(), new NoneStrategy(),
+            ReasoningStyle.CODEX_CONFIG.name(), new CodexConfigStrategy(),
+            ReasoningStyle.PI_THINKING.name(), new PiThinkingStrategy(),
+            ReasoningStyle.OPENCODE_VARIANT.name(), new OpencodeVariantStrategy(),
+            ReasoningStyle.AGY_EFFORT.name(), new AgyEffortStrategy());
+
     /**
      * 把用户选的推理强度拼进 argv（照 OpenDesign 各 agent def 的真实形态）。
      *
@@ -294,12 +384,9 @@ public final class ExternalRuntimeCatalog {
         //    （gpt-6-luna 到 max、gpt-6.1-sol 到 ultra），全局表只是兜底展示。
         //    在这里拦会让用户选中的 max/ultra 静默不生效。
         if (!r.matches("^[A-Za-z][A-Za-z0-9_-]{0,31}$")) return List.of();
-        return switch (preset.reasoningStyle()) {
-            case NONE -> List.of();
-            case CODEX_CONFIG -> List.of("-c", "model_reasoning_effort=\"" + r + "\"");
-            case PI_THINKING -> List.of("--thinking", r);
-            case OPENCODE_VARIANT -> List.of("--variant", r);
-        };
+        // dispatcher 只查表：不认识 style（理论上不可能，枚举封闭）⇒ 不追加，保持旧 switch 的保底语义
+        ReasoningArgStrategy strategy = REASONING_ARG_STRATEGIES.get(preset.reasoningStyle().name());
+        return strategy == null ? List.of() : strategy.args(r);
     }
 
     /**

@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 import { SessionList } from '../SessionList'
 import type { SessionDto } from '@/api/types'
 
+// [folder-group 2026-11-26] 普通会话（plain）日期用「相对今天」造：它落在项目分组，
+// 固定旧日期会被「超过3天收进更早」默认收起导致行不可见。派生/置顶/IM 成员不受归档影响。
+const recentIso = (daysAgo = 0): string => {
+  const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - daysAgo); return d.toISOString()
+}
+
 /**
  * [session-family] 左栏「派生」块 + 家族色 + 三块折叠。
  *
@@ -78,7 +84,7 @@ describe('SessionList · [session-family] 派生块', () => {
     render([
       mkSession('root', '2026-11-03T00:00:00Z'),
       mkSession('child', '2026-11-02T00:00:00Z', { parent: 'root' }),
-      mkSession('plain', '2026-11-01T00:00:00Z'),
+      mkSession('plain', recentIso(0)),
     ])
     // 源是完整会话行：有家族色条 + 折叠按钮（与普通行同样的 hover/状态/时间）
     const rootRow = rowByTitle('root')
@@ -129,7 +135,7 @@ describe('SessionList · [session-family] 派生块', () => {
   })
 
   it('普通会话没有家族色（不渲染色条）', () => {
-    render([mkSession('plain', '2026-11-01T00:00:00Z')])
+    render([mkSession('plain', recentIso(0))])
     expect(famColor('plain')).toBe('')
     expect(rowByTitle('plain')?.querySelector('.fam-bar')).toBeNull()
   })
@@ -184,7 +190,7 @@ describe('SessionList · [session-family] 派生块', () => {
 
 describe('SessionList · [session-family] 三块可折叠', () => {
   it('置顶块点标题收起/展开', () => {
-    render([mkSession('pinned', '2026-11-01T00:00:00Z', { pinned: true })])
+    render([mkSession('pinned', recentIso(0), { pinned: true })])
     const label = container.querySelector('.pinned-label')!
     expect(countTitle('pinned')).toBe(1)
     click(label)

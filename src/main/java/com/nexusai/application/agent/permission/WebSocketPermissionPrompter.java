@@ -1288,6 +1288,26 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
                 return;
             }
         }
+        // [coordinator-preserveMode 2026-11-26] worker（子代理/teammate，agentId 非空）弹窗授权
+        //   写回 leader：过滤 SetMode（CC inProcessRunner.ts:283-288 无条件 preserveMode: true）。
+        //   worker 弹窗里点「本次会话允许编辑」的 setMode 不得改 leader 模式（会话列/apply/persist
+        //   全链不接纳），规则/目录类更新照常。主会话自身弹窗（agentId=null，用户在协调者终端
+        //   操作）不过滤——setMode 是用户主动切模式，对齐 CC「User-initiated mode changes must
+        //   NOT be overridden」。⛔ 与 ToolPermissionGate.applyAndPersistPermissionUpdates 是
+        //   两个等价单点，两处同步挂钩。
+        boolean workerPath = ctx != null && ctx.agentId() != null;
+        if (workerPath) {
+            int before = updates.size();
+            updates = SessionPermissionOverlay.withoutSetMode(updates);
+            if (before != updates.size()) {
+                log.info("PERMISSION worker 写回 preserveMode: 过滤 SetMode requestId={} dropped={} kept={}"
+                    + "（CC inProcessRunner.ts:286 leader mode 不被 worker 弹窗改变）",
+                    requestId, before - updates.size(), updates.size());
+            }
+            if (updates.isEmpty()) {
+                return;
+            }
+        }
         // [P11d] 会话 id 上提（apply 与 persist 共用同一值）：project/local source 的写盘落点
         //   按会话解析（读侧 PermissionContextBuilder:355 传同一值 ⇒ 读写同址）。
         //   [session-id-short] ctx.sessionId() 已 String（short）
@@ -1360,16 +1380,22 @@ public class WebSocketPermissionPrompter implements PermissionPrompter {
             }
         }
         // 3) appState 同步 —— CC setToolPermissionContext（PermissionContext.ts:143-145）
+        //    [coordinator-preserveMode] worker 路径 mode 保留 leader 当前值（CC REPL.tsx:2858
+        //    preserveMode ? prev.toolPermissionContext.mode : context.mode）——applied 携带的
+        //    worker mode 不得经 mergeAppStatePermissionRules「appState mode 胜出」压掉 leader。
         if (ctx != null && ctx.setAppState() != null) {
             final ToolPermissionContext finalCtx = applied;
+            final boolean preserveMode = workerPath;
             ctx.setAppState().accept(prev -> {
                 Map<String, Object> next = new java.util.LinkedHashMap<>(prev);
-                next.put("toolPermissionContext", finalCtx);
+                next.put("toolPermissionContext", preserveMode
+                    ? SessionPermissionOverlay.withPreservedMode(finalCtx, prev)
+                    : finalCtx);
                 return next;
             });
             if (log.isDebugEnabled()) {
-                log.debug("PERMISSION updatedPermissions: appState.toolPermissionContext 已同步 requestId={}",
-                    requestId);
+                log.debug("PERMISSION updatedPermissions: appState.toolPermissionContext 已同步 requestId={} preserveMode={}",
+                    requestId, preserveMode);
             }
         }
     }

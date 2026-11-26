@@ -859,6 +859,18 @@ export const knowledgeApi = {
     api<{ task_id: number }>(`/knowledge/${encodeURIComponent(id)}/reparse`, { method: 'POST' }),
 
   /**
+   * 重试单个后处理子任务（`POST /knowledge/{id}/ingest-tasks/{taskType}/retry`）。
+   *
+   * <p>只对 `kb_ingest_task` 有行的类型有效：`summary / question / wiki / auto_tag / graph`。
+   * ⛔ 主阶段（docreader/chunking/embedding/multimodal）没有独立任务行 ⇒ 只能调 `reparse`。
+   */
+  retrySubtask: (id: string, taskType: string) =>
+    api<{ task_id: number; task_type: string }>(
+      `/knowledge/${encodeURIComponent(id)}/ingest-tasks/${encodeURIComponent(taskType)}/retry`,
+      { method: 'POST' },
+    ),
+
+  /**
    * 某一次尝试的 span 树（后端 `GET /api/v1/knowledge/{id}/spans`）。
    *
    * <p>⚠️ 响应**带 `{success, data}` 包装**（与 `/system/parser-engines` 同一种「元数据」形状，
@@ -1219,6 +1231,26 @@ export const knowledgeApi = {
       method: 'POST',
       body: { knowledge_ids: knowledgeIds, folder_path: folderPath },
     }),
+
+  /**
+   * 库级入库进度（`GET /knowledge-bases/{id}/ingest-progress`）。
+   *
+   * <p>一次聚合查询出全部计数；`ready` 已经叠了 `pending_subtasks_count=0`
+   * （后处理没跑完的文档不算就绪）。
+   *
+   * <p>⚠️ 后端未重启时该接口会 404 ⇒ 调用方必须容忍失败（拿不到就隐藏进度条）。
+   */
+  getIngestProgress: (baseId: string) =>
+    api<{
+      total: number
+      queued: number
+      processing: number
+      ready: number
+      waitingPost: number
+      failed: number
+      cancelled: number
+      pendingSubtasks: number
+    }>(`/knowledge-bases/${encodeURIComponent(baseId)}/ingest-progress`),
 
   /**
    * 跨知识库移动：可选的**目标知识库**列表（`GET /knowledge-bases/{id}/move-targets`）。
@@ -1837,6 +1869,13 @@ export interface KbQaAskBody {
   content: string
   /** 检索范围；null/空 ⇒ 智能体范围 > 全部可检索库 */
   knowledgeBaseIds?: string[] | null
+  /**
+   * 限定在**这几篇文档**内检索（库内下钻 · 文档详情「问助手」用）。
+   *
+   * <p>后端 `KnowledgeChatController` 的 Request 已有该字段，透传到
+   * `KbQaPipeline.filterByKnowledgeIds`；⛔ 只传库不传文档 = 全库检索。
+   */
+  knowledgeIds?: string[] | null
   modelName?: string | null
   webSearchEnabled?: boolean
 }

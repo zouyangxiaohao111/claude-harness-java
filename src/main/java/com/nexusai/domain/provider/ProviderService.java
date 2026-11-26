@@ -69,6 +69,14 @@ public class ProviderService {
     public static final String AUTH_MODE_CODEX_OAUTH = "codex_oauth";
     /** 凭据形态：Anthropic Claude 订阅（Claude Code OAuth）会话。 */
     public static final String AUTH_MODE_CLAUDE_OAUTH = "claude_oauth";
+    /**
+     * 凭据形态：Google 订阅（Gemini Code Assist / Cloud Code OAuth）会话。
+     *
+     * <p>与 {@code api_key} 的 Gemini API（{@code openai_compatible}）严格区分：订阅凭据只对
+     * {@code cloudcode-pa.googleapis.com} 有效，且额外需要 {@code providers.oauth_project}
+     * （V338）；⛔ 不允许把它回落成 API key 形态。
+     */
+    public static final String AUTH_MODE_GOOGLE_OAUTH = "google_oauth";
 
     /**
      * access token 提前刷新窗口（5 分钟）。
@@ -474,6 +482,161 @@ public class ProviderService {
             providerId, DEFAULT_CLAUDE_MODEL_NAME);
     }
 
+    // ───────────── [Google 订阅] 内置「Google」订阅 provider ─────────────
+    //
+    // ⚠️ 与内置品牌目录里的「Google Gemini（API Key）」（brandKey=gemini / type=openai_compatible）
+    //    是两条独立链路：本段只认 auth_mode=google_oauth 或 name+type 约定，⛔ 不做 brand host 匹配
+    //    （否则会把用户已有的 API-key Gemini provider 误认成订阅 provider）。
+
+    /** 内置 Google 订阅 provider 的固定名（识别约定之一：name + type）。 */
+    private static final String GOOGLE_PROVIDER_NAME = "Google";
+
+    /** 「Google」已被别的类型占用时的备用名（同样计入 name+type 识别约定）。 */
+    private static final String GOOGLE_PROVIDER_FALLBACK_NAME = "Google-订阅";
+
+    /** 内置 Google 订阅 provider 的协议类型（固定；实现由 GoogleGeminiProvider 提供）。 */
+    private static final String GOOGLE_PROVIDER_TYPE = ProviderType.gemini_code_assist.name();
+
+    /** Google 订阅的固定 baseUrl（cloudcode-pa；单一常量源在 infra 装配器）。 */
+    private static final String GOOGLE_CLOUD_CODE_BASE_URL =
+        com.nexusai.infra.llm.ProviderConfigAssembler.GOOGLE_CLOUD_CODE_BASE_URL;
+
+    /**
+     * 内置默认模型名（仅 canonical ID，来源官方源码）。
+     *
+     * <p>取证：{@code gemini-cli@08e9a20} {@code packages/core/src/config/models.ts:66}
+     * （{@code DEFAULT_GEMINI_MODEL='gemini-2.5-pro'}）与 :69
+     * （{@code BASE_GEMINI_FLASH_MODEL='gemini-3.5-flash'}）。
+     * ⛔ 模板 ≠ 资格检查 ≠ 远端模型清单：静态种子只是 UI 初始项，**不是**账号有资格用这些模型的证明。
+     *
+     * <p><b>模型映射口径（已核定，不做 flags 动态分档）</b>：本仓无
+     * {@code hasLatestFlashGAAccess} 等 entitlement flag 的来源，故协议侧固定按官方
+     * **无 flag 分支**执行默认映射 {@code gemini-3.5-flash → gemini-3-flash}
+     * （models.ts:144-157）；流式与非流式同一映射，thoughtSignature 绑定**最终 wire model**。
+     * ⛔ 不新增 flags 字段、不推测未核定模型名（如 3.8）。
+     */
+    static final List<String> DEFAULT_GOOGLE_MODEL_NAMES =
+        List.of("gemini-2.5-pro", "gemini-3.5-flash");
+
+    /** 查官方 Google 订阅 provider（不存在 → null）。 */
+    public ProviderDto getOfficialGoogleProvider() {
+        return findOfficialGoogleProvider(selectAllProviderRecords());
+    }
+
+    /** Google ensure 的单 JVM 串行锁（不影响其它品牌）。 */
+    private final Object googleEnsureMonitor = new Object();
+
+    /**
+     * 幂等创建 / 返回内置 Google 订阅 provider。
+     *
+     * <p>新建：name={@code Google}（被别的类型占用则 {@code Google-订阅}）、type={@code gemini_code_assist}、
+     * baseUrl={@code https://cloudcode-pa.googleapis.com}、空 API key、auth_mode 保持 {@code api_key}
+     * （登录成功后由 {@link #saveGoogleOAuthCredential} 翻成 {@code google_oauth}）、enabled=1；
+     * models 为 0 时补两条内置 canonical 模型。
+     *
+     * <p><b>并发</b>：Google 专用单 JVM 锁串行化「查-建-补种」，并发请求解析到同一 id 只插一次
+     * （跨进程/多实例不在本锁范围，属已知边界）。
+     */
+    public ProviderDto ensureOfficialGoogleProvider() {
+        synchronized (googleEnsureMonitor) {
+            return ensureOfficialGoogleProviderLocked();
+        }
+    }
+
+    private ProviderDto ensureOfficialGoogleProviderLocked() {
+        List<ProviderRecord> records = selectAllProviderRecords();
+        ProviderDto existing = findOfficialGoogleProvider(records);
+        if (existing != null) {
+            ensureDefaultGoogleModels(existing.id());
+            return existing;
+        }
+
+        String name = GOOGLE_PROVIDER_NAME;
+        for (ProviderRecord r : records) {
+            if (GOOGLE_PROVIDER_NAME.equals(r.getName())) {
+                name = GOOGLE_PROVIDER_FALLBACK_NAME;
+                break;
+            }
+        }
+
+        Provider p = new Provider();
+        p.setId(generateId("prov"));
+        p.setName(name);
+        p.setType(GOOGLE_PROVIDER_TYPE);
+        p.setBaseUrl(GOOGLE_CLOUD_CODE_BASE_URL);
+        p.setApiKeyHash(ApiKeyHasher.hash(""));
+        p.setApiKeyMasked(ApiKeyHasher.maskSecret(""));
+        p.setApiKeyEncrypted(cryptoUtil.encrypt(""));
+        p.setEnabled(Boolean.TRUE);
+        p.setAuthMode(AUTH_MODE_API_KEY);
+        String now = OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME);
+        p.setCreatedAt(now);
+        p.setUpdatedAt(now);
+        providerMapper.insert(ProviderRecord.fromDomain(p));
+        log.info("已创建内置 Google 订阅 provider: id={} name={} type={}", p.getId(), name, p.getType());
+        ensureDefaultGoogleModels(p.getId());
+        return toProviderDto(p, List.of());
+    }
+
+    /** 官方 Google 订阅识别（get / ensure 共用；⛔ 不做 brand host 匹配，见段首注释）。 */
+    private ProviderDto findOfficialGoogleProvider(List<ProviderRecord> records) {
+        ProviderRecord firstOauth = null;
+        for (ProviderRecord r : records) {
+            if (!AUTH_MODE_GOOGLE_OAUTH.equals(r.getAuthMode())) continue;
+            if (firstOauth == null) {
+                firstOauth = r;
+            } else {
+                log.warn("发现多条 google_oauth provider（{} / {}），官方识别取第一条 id={}",
+                    firstOauth.getId(), r.getId(), firstOauth.getId());
+                break;
+            }
+        }
+        if (firstOauth != null) return toProviderDto(firstOauth.toDomain(), List.of());
+        for (ProviderRecord r : records) {
+            boolean nameMatches = GOOGLE_PROVIDER_NAME.equals(r.getName())
+                || GOOGLE_PROVIDER_FALLBACK_NAME.equals(r.getName());
+            if (nameMatches && GOOGLE_PROVIDER_TYPE.equals(r.getType())) {
+                return toProviderDto(r.toDomain(), List.of());
+            }
+        }
+        return null;
+    }
+
+    /**
+     * Google provider 模型数为 0 → 插入内置 canonical 模型（幂等；已有任意模型一律 no-op）。
+     *
+     * <p>maxTokens 取 models 表默认 65536；maxContextTokens 留 null（官方源码未提供可取证的上限，
+     * ⛔ 不凭记忆填数字）。用户可自行编辑。
+     */
+    private void ensureDefaultGoogleModels(String providerId) {
+        if (providerId == null || providerId.isBlank()) return;
+        List<ModelRecord> models = modelMapper.selectListByQuery(
+            QueryWrapper.create().eq("provider_id", providerId));
+        if (models != null && !models.isEmpty()) return;
+
+        for (String name : DEFAULT_GOOGLE_MODEL_NAMES) {
+            Model m = new Model();
+            m.setId(generateId("model"));
+            m.setProviderId(providerId);
+            m.setName(name);
+            m.setAlias(null);
+            m.setTag("GEM");
+            m.setDescription("内置默认模型（Google 订阅模板，不代表账号资格）");
+            m.setType(ModelType.chat.name());
+            m.setMaxTokens(65536);
+            m.setTemperature(null);
+            m.setTopP(null);
+            m.setMaxContextTokens(null);
+            m.setThink("");
+            m.setExtraBody("");
+            m.setEnabled(Boolean.TRUE);
+            m.setCreatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+            modelMapper.insert(ModelRecord.fromDomain(m));
+        }
+        log.info("已为内置 Google 订阅 provider 补默认模型: providerId={} names={}",
+            providerId, DEFAULT_GOOGLE_MODEL_NAMES);
+    }
+
     // ───────────── [内置品牌目录] 5 张常驻内置卡（只读） ─────────────
 
     /** 一个品牌下的一条连接（只读快照 · 不含任何凭据）。 */
@@ -728,6 +891,10 @@ public class ProviderService {
         ProviderRecord r = providerMapper.selectOneById(id);
         if (r == null) throw new NotFoundException("Provider " + id + " not found");
         Provider p = r.toDomain();
+        // Google 订阅走本地校验：cloudcode-pa 没有 /models 端点，⛔ 不能照发 GET /models 再把 404 当失败。
+        if (AUTH_MODE_GOOGLE_OAUTH.equals(r.getAuthMode())) {
+            return testGoogleSubscription(r);
+        }
         // [C2c] 凭据与 baseUrl 统一走 resolveCredential / resolveRemoteBaseUrl：
         //   codex_oauth 模式下 apiKeyEncrypted 恒为空，直接解密必然失败；baseUrl 也必须强制到
         //   /backend-api/codex（用户填的值不参与）。
@@ -765,6 +932,26 @@ public class ProviderService {
         }
     }
 
+    /**
+     * Google 订阅本地校验（不联网）：token + project 齐备才算成功。
+     *
+     * <p>⛔ 不请求 {@code /models}；也不把「有 token 但无 project」标绿 —— 那种状态发请求必失败。
+     */
+    private TestConnectionResponse testGoogleSubscription(ProviderRecord r) {
+        boolean hasToken = r.getOauthAccessEncrypted() != null
+            && !r.getOauthAccessEncrypted().isBlank();
+        if (!hasToken) {
+            return new TestConnectionResponse(false, null, "未登录 Google 订阅", null);
+        }
+        String project = r.getOauthProject();
+        if (project == null || project.isBlank()) {
+            return new TestConnectionResponse(false, null,
+                "已登录但 Cloud Code 项目未就绪（账号可能无订阅资格或需要绑定 GCP project），请重新登录",
+                null);
+        }
+        return new TestConnectionResponse(true, null, "已登录 Google 订阅（项目已就绪）", null);
+    }
+
     // ───────────────────────── 拉取远端模型清单 ─────────────────────────
 
     /**
@@ -783,6 +970,11 @@ public class ProviderService {
         ProviderRecord r = providerMapper.selectOneById(id);
         if (r == null) throw new NotFoundException("Provider " + id + " not found");
         Provider p = r.toDomain();
+        // Google 订阅没有 /models 端点：明确告知「用内置模板」，⛔ 不发假请求、不把 404 当可重试。
+        if (AUTH_MODE_GOOGLE_OAUTH.equals(r.getAuthMode())) {
+            return new RemoteModelsResponse(false, List.of(),
+                "Google 订阅模式不支持远端模型探测，已使用内置模型模板");
+        }
         // [C2c] 同 test()：凭据走 resolveCredential，baseUrl 走 resolveRemoteBaseUrl。
         String apiKey = resolveCredential(id);
         if (apiKey == null || apiKey.isBlank()) {
@@ -829,6 +1021,11 @@ public class ProviderService {
     private String resolveRemoteBaseUrl(ProviderRecord r, Provider p) {
         if (AUTH_MODE_CODEX_OAUTH.equals(r.getAuthMode())) {
             return CODEX_OAUTH_BASE_URL;
+        }
+        if (AUTH_MODE_GOOGLE_OAUTH.equals(r.getAuthMode())) {
+            // 订阅凭据只对 Cloud Code 有效（用户填的 baseUrl 不参与）；本分支仅防御，
+            // test()/fetchRemoteModels() 已提前本地短路，不会发 /models。
+            return GOOGLE_CLOUD_CODE_BASE_URL;
         }
         String url = (p.getBaseUrl() == null ? "" : p.getBaseUrl()).trim();
         return url.endsWith("/") ? url.substring(0, url.length() - 1) : url;
@@ -988,9 +1185,11 @@ public class ProviderService {
         return decryptOrNull(providerId, "api key", r.getApiKeyEncrypted());
     }
 
-    /** 该 auth_mode 是否为订阅 OAuth 形态（codex_oauth / claude_oauth）。 */
+    /** 该 auth_mode 是否为订阅 OAuth 形态（codex_oauth / claude_oauth / google_oauth）。 */
     private static boolean isOAuthAuthMode(String authMode) {
-        return AUTH_MODE_CODEX_OAUTH.equals(authMode) || AUTH_MODE_CLAUDE_OAUTH.equals(authMode);
+        return AUTH_MODE_CODEX_OAUTH.equals(authMode)
+            || AUTH_MODE_CLAUDE_OAUTH.equals(authMode)
+            || AUTH_MODE_GOOGLE_OAUTH.equals(authMode);
     }
 
     /**
@@ -1200,9 +1399,80 @@ public class ProviderService {
     }
 
     /**
+     * Google 订阅专用：token 与 Cloud Code project <b>同一次行更新</b>写入，避免半成功。
+     *
+     * <p>为什么必须专用：{@link #saveOAuthCredential} 只有凭据列，project 是 V338 独立列；
+     * 分两次 update 会在「token 写成功、project 写失败」时留下半成品登录态（status 会显示
+     * onboarding 且发请求必失败）。这里一次 {@code update(entity,false)} 同时落 token/auth_mode/project。
+     *
+     * @param access  明文 access token（本方法加密后落库，⛔ 不打印）
+     * @param refresh refresh token（可 null；Google 首次授权通常返回）
+     * @param expiresAt token 实际到期（epoch ms；调用方已按上游 expires_in 换算，⛔ 不再二次扣 5min）
+     * @param project  Cloud Code project（调用方必须已解析成功；null → 抛错，不落半成功）
+     */
+    public void saveGoogleOAuthCredential(String providerId, String access, String refresh,
+                                          Long expiresAt, String project) {
+        ProviderRecord r = providerMapper.selectOneById(providerId);
+        if (r == null) throw new NotFoundException("Provider " + providerId + " not found");
+        if (project == null || project.isBlank()) {
+            throw new ValidationException("Google 订阅缺少 Cloud Code project，登录未完成");
+        }
+        if (access == null || access.isBlank()) {
+            throw new ValidationException("Google 订阅 access token 为空，登录未完成");
+        }
+        r.setAuthMode(AUTH_MODE_GOOGLE_OAUTH);
+        r.setOauthAccessEncrypted(cryptoUtil.encrypt(access));
+        // 首次授权缺 refresh_token 由调用方 fail-loud；这里只在拿到新值时覆盖，
+        // null/空白 → 保留既有 refresh（重登/刷新响应通常不带新 refresh_token）。
+        if (refresh != null && !refresh.isBlank()) {
+            r.setOauthRefreshEncrypted(cryptoUtil.encrypt(refresh));
+        }
+        r.setOauthExpiresAt(expiresAt);
+        r.setOauthProject(project.trim());
+        r.setUpdatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
+        // ignoreNulls=false：access/expires/project 必须真落（refresh 分支已单独判断，不在此被清空）
+        providerMapper.update(r, false);
+        log.info("Provider {} 的 Google 订阅凭据已写入（project={}，expiresAt={}）",
+            providerId, r.getOauthProject(), expiresAt);
+    }
+
+    /** 读 Cloud Code project（非机密；null/空 → null）。 */
+    public String getOAuthProject(String providerId) {
+        if (providerId == null) return null;
+        ProviderRecord r = providerMapper.selectOneById(providerId);
+        if (r == null) return null;
+        String p = r.getOauthProject();
+        return p == null || p.isBlank() ? null : p;
+    }
+
+    /**
+     * OAuth 状态快照（给 Google status 端点用；只读，不触发 refresh / 网络）。
+     *
+     * <p>只暴露非敏感元数据：auth_mode / 过期时刻 / project / 是否已有 access 密文；
+     * ⛔ 不解密、不返回 token/state。
+     */
+    public record OAuthSnapshot(String id, String type, String authMode, Long expiresAt,
+                                String project, boolean hasAccessToken, boolean hasRefreshToken) {}
+
+    /** 读 OAuth 状态快照；provider 不存在 → null。 */
+    public OAuthSnapshot getOAuthSnapshot(String providerId) {
+        if (providerId == null) return null;
+        ProviderRecord r = providerMapper.selectOneById(providerId);
+        if (r == null) return null;
+        boolean hasAccess = r.getOauthAccessEncrypted() != null
+            && !r.getOauthAccessEncrypted().isBlank();
+        boolean hasRefresh = r.getOauthRefreshEncrypted() != null
+            && !r.getOauthRefreshEncrypted().isBlank();
+        String project = r.getOauthProject() == null || r.getOauthProject().isBlank()
+            ? null : r.getOauthProject();
+        return new OAuthSnapshot(r.getId(), r.getType(), r.getAuthMode(),
+            r.getOauthExpiresAt(), project, hasAccess, hasRefresh);
+    }
+
+    /**
      * 清除 OAuth 凭据并回落到 api_key 模式（退出登录）。
      *
-     * <p>清 4 列（access / refresh / expiresAt / accountId）+ auth_mode='api_key'；
+     * <p>清 5 列（access / refresh / expiresAt / accountId / <b>oauthProject</b>）+ auth_mode='api_key'；
      * oauth_state 不在这里动 —— 它属于登录在途状态，由登录流程自行清。
      */
     public void clearOAuth(String providerId) {
@@ -1213,8 +1483,9 @@ public class ProviderService {
         r.setOauthRefreshEncrypted(null);
         r.setOauthExpiresAt(null);
         r.setOauthAccountId(null);
+        r.setOauthProject(null);
         r.setUpdatedAt(OffsetDateTime.now().format(DateTimeFormatter.ISO_OFFSET_DATE_TIME));
-        // 必须 ignoreNulls=false 才能把上面 4 列真写成 NULL
+        // 必须 ignoreNulls=false 才能把上面 5 列真写成 NULL
         providerMapper.update(r, false);
         log.info("Provider {} 的 OAuth 凭据已清除，回落到 api_key 模式", providerId);
     }

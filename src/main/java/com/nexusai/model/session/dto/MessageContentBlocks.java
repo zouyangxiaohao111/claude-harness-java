@@ -28,6 +28,10 @@ import java.util.Map;
  * <p><b>⛔ 边界</b>：本类只服务落库/渲染/顺序还原。任何 provider 的出站请求组装器
  * （Anthropic content 数组 / OpenAI Chat tool_calls / OpenAI Responses output items）
  * 都不读本类产物 —— 见 {@link ContentBlockDto} 类注释。
+ *
+ * <p><b>唯一例外（方案 A，主会话 2026-11-25 裁决）</b>：{@code GoogleGeminiProvider} 经
+ * {@link ChatMessageDto#blocks()}（本类 {@link #fromJson} 读回产物）取 Gemini thoughtSignature
+ * 元数据与 part 边界，须先与 canonical 内容核对等价；仍⛔不整份序列化 blocks 进请求体。
  */
 public final class MessageContentBlocks {
 

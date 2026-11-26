@@ -2073,7 +2073,7 @@ public class SkillToolImpl implements Tool {
             }
             // (a) allowedTools 非空 → 去重合入 appState.toolPermissionContext.alwaysAllowRules.command
             if (!allowedTools.isEmpty()) {
-                tuc.setAppState().accept(prev -> mergeAllowedToolsIntoAppState(prev, allowedTools));
+                tuc.setAppState().accept(prev -> mergeAllowedToolsIntoAppState(prev, allowedTools, tuc.permissionMode()));
                 if (log.isDebugEnabled()) {
                     log.debug("[SkillTool] contextModifier 注入 allowedTools={} (CC SkillTool.ts:779-806)",
                             allowedTools);
@@ -2139,15 +2139,24 @@ public class SkillToolImpl implements Tool {
      * whole-tool ALLOW rule（对齐 CC command 桶是工具名 string[]）。
      *
      * <p><b>既有 appState 存在 toolPermissionContext</b>: 保留全部既有字段，仅替换 command 桶
-     * （去重合并）; <b>不存在</b>: 构建仅含 command 桶的最小 ToolPermissionContext（mode=DEFAULT，
-     * 该 mode 不被消费 —— 消费方仅读 command 规则）。
+     * （去重合并）; <b>不存在</b>: 构建仅含 command 桶的最小 ToolPermissionContext，
+     * mode 继承 {@code currentMode}（当前 TUC 有效模式）。
+     *
+     * <p><b>[coordinator-bypass-inherit 2026-11-26]</b> 旧实现占位 mode 硬编码 DEFAULT 且注释自称
+     * 「该 mode 不被消费」——错误：{@code AgentLoopContext.mergeAppStatePermissionRules}（:1776）
+     * 「appState 侧 mode 胜出」会采纳它，把会话 bypass 压成 DEFAULT（实证 sess-908ea539：
+     * 子代理继承 DEFAULT → 目录外 Edit 弹 WorkingDir 窗 → 用户点「本次会话允许编辑」
+     * setMode(acceptEdits) 污染主会话）。CC 真源 appState.toolPermissionContext 恒存在
+     * （进程启动初始化），无占位分支；本仓 prototype loop appStateRef 恒空 ⇒ existing=null
+     * 生产可达，占位 mode 必须继承当前上下文，不得凭空造一个更严格的模式。
      *
      * @param prev        setAppState 传入的 prev appState snapshot（可为 null）
      * @param allowedTools 技能声明的 allowed tools（非空）
+     * @param currentMode 当前 TUC 有效权限模式（占位 ctx 的 mode 来源；null → DEFAULT 兜底）
      * @return 合并后的 appState（含更新后的 toolPermissionContext）
      */
     static Map<String, Object> mergeAllowedToolsIntoAppState(
-            Map<String, Object> prev, List<String> allowedTools) {
+            Map<String, Object> prev, List<String> allowedTools, PermissionMode currentMode) {
         Map<String, Object> next = new LinkedHashMap<>(prev != null ? prev : Map.of());
         Object existing = prev != null ? prev.get(KEY_TOOL_PERMISSION_CONTEXT) : null;
         ToolPermissionContext tpc;
@@ -2178,7 +2187,8 @@ public class SkillToolImpl implements Tool {
             Map<PermissionRuleSource, Set<PermissionRule>> allow =
                     new EnumMap<>(PermissionRuleSource.class);
             allow.put(PermissionRuleSource.COMMAND, commandRules);
-            tpc = new ToolPermissionContext(PermissionMode.DEFAULT, allow, Map.of(), Map.of(),
+            tpc = new ToolPermissionContext(currentMode != null ? currentMode : PermissionMode.DEFAULT,
+                    allow, Map.of(), Map.of(),
                     Map.of(), false, false, Map.of(), false, false, null);
         }
         next.put(KEY_TOOL_PERMISSION_CONTEXT, tpc);

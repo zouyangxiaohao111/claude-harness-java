@@ -36,6 +36,7 @@ import com.nexusai.infra.llm.AssistantMessage;
 import com.nexusai.infra.llm.LlmProvider;
 import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.ProviderConfigAssembler;
 import com.nexusai.model.provider.dto.ProviderDto;
 import com.nexusai.model.session.dto.ChatMessageDto;
 import com.nexusai.model.session.dto.Role;
@@ -1039,8 +1040,17 @@ public class ExecAgentHook {
                 String providerType = p.type() != null ? p.type().name() : "openai_compatible";
                 // [保密 2026-11-22] ⛔ 不能用 ProviderDto.extraHeaders()：GET 面已脱敏（只回末四位），
                 //   拿它发请求会让 hook 子代理缺真实鉴权头。真值走服务端内部读链（DB 列）。
-                ProviderConfig cfg = new ProviderConfig(p.baseUrl(), rawKey,
-                    providerService.getPlainExtraHeaders(p.id()));
+                ProviderConfig cfg;
+                if (ProviderConfigAssembler.isGoogleOAuth(p.authMode())) {
+                    // 第三装配点：ProviderDto 不带 project（冻结契约），走服务端内部读 oauth_project，
+                    // 与 ChatService/ModelConfigResolver 共用同一装配器（固定 host + project）。
+                    cfg = ProviderConfigAssembler.forGoogleOAuth(rawKey,
+                        providerService.getOAuthProject(p.id()),
+                        providerService.getPlainExtraHeaders(p.id()), java.util.Map.of());
+                } else {
+                    cfg = new ProviderConfig(p.baseUrl(), rawKey,
+                        providerService.getPlainExtraHeaders(p.id()));
+                }
                 // 工厂 2-arg 路由校验（对齐 HookRegistry.resolvePromptProvider 的
                 //   factory.getProvider(config, providerType) 模式）+ provider type 日志
                 LlmProvider routed = llmProviderFactory.getProvider(cfg, providerType);

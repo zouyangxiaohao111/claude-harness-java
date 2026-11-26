@@ -21,6 +21,13 @@ vi.mock('@/api/command', () => ({
   commandApi: { list: vi.fn(async () => CATALOG) },
 }))
 
+/** 技能说明浮层读的是本机 SKILL.md 正文（GET /skills/{name}/content）。 */
+const skillContentMock = vi.hoisted(() => vi.fn(async () => ({
+  contentPath: 'skills/deep-research/SKILL.md',
+  content: '# 深度研究\n\n多源交叉验证并标注来源。',
+})))
+vi.mock('@/api/skills', () => ({ skillApi: { content: skillContentMock } }))
+
 const SID = 'sess-skill-bubble'
 const noop = () => {}
 
@@ -61,6 +68,7 @@ async function renderMessage(content: string) {
 beforeEach(() => {
   ;(globalThis as unknown as { IS_REACT_ACT_ENVIRONMENT: boolean }).IS_REACT_ACT_ENVIRONMENT = true
   resetSkillCatalogCache()
+  skillContentMock.mockClear()
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -99,5 +107,36 @@ describe('[技能气泡] 用户消息', () => {
     expect(container.querySelector('.bubble-tags')).toBeNull()
     expect(container.querySelector('.inline-skill')).toBeNull()
     expect(container.querySelector('.msg.user .user-bubble')!.textContent).toContain('/init')
+  })
+
+  it('⭐ 点技能 chip → 打开「技能说明」浮层并读到 SKILL.md', async () => {
+    await renderMessage('/deep-research 帮我核对这份材料')
+    const chip = container.querySelector('.msg.user .user-bubble .bubble-tags .skill-chip') as HTMLElement
+    expect(chip, '缺少技能 chip').toBeTruthy()
+
+    await act(async () => {
+      chip.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    })
+    await flush()
+
+    const pop = document.querySelector('.skill-pop')
+    expect(pop, 'chip 点击后应出现技能说明浮层').toBeTruthy()
+    expect(pop!.textContent).toContain('深度研究')
+    expect(pop!.textContent).toContain('/deep-research')
+    expect(pop!.textContent).toContain('多源交叉验证')
+    expect(skillContentMock).toHaveBeenCalledWith('deep-research', SID)
+  })
+
+  it('无 displayName 时正文内联 /name 也可点开说明', async () => {
+    await renderMessage('/archify 画个架构图')
+    const inline = container.querySelector('.msg.user .user-bubble .inline-skill') as HTMLElement
+
+    await act(async () => {
+      inline.dispatchEvent(new MouseEvent('click', { bubbles: true, cancelable: true }))
+    })
+    await flush()
+
+    expect(document.querySelector('.skill-pop'), '内联 chip 也要能点').toBeTruthy()
+    expect(skillContentMock).toHaveBeenCalledWith('archify', SID)
   })
 })

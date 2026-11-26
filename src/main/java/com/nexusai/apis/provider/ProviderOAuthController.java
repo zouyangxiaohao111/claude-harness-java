@@ -2,6 +2,7 @@ package com.nexusai.apis.provider;
 
 import com.nexusai.application.agent.oauth.ClaudeOAuthService;
 import com.nexusai.application.agent.oauth.CodexOAuthService;
+import com.nexusai.application.agent.oauth.GoogleOAuthService;
 import com.nexusai.application.agent.oauth.OAuthTokenExchangeError;
 import com.nexusai.domain.provider.ProviderService;
 import com.nexusai.model.provider.dto.ProviderDto;
@@ -40,6 +41,7 @@ public class ProviderOAuthController {
 
     @Autowired private CodexOAuthService codexOAuthService;
     @Autowired private ClaudeOAuthService claudeOAuthService;
+    @Autowired private GoogleOAuthService googleOAuthService;
     @Autowired private ProviderService providerService;
 
     /** complete 请求体：用户粘贴的整条回调 URL 或裸授权码。 */
@@ -145,6 +147,94 @@ public class ProviderOAuthController {
     public ResponseEntity<Void> claudeLogout(@PathVariable String id) {
         claudeOAuthService.logout(id);
         return ResponseEntity.noContent().build();
+    }
+
+    // ───────────── Google（Gemini Code Assist / Cloud Code）订阅登录 ─────────────
+    //
+    // 与 Codex/Claude 的差异：无 PKCE；回调绑 127.0.0.1:<临时端口>/oauth2callback；登录成功还要求
+    // 额外拿到 Cloud Code project（providers.oauth_project）才算 ready。project 只在 status 返回，
+    // ⛔ 不扩 ProviderDto、不回明文 token。
+    // 错误一律 400 + 脱敏 message；provider 不存在仍是 404（交给 GlobalExceptionHandler）。
+
+    /** 官方内置 Google 订阅 provider（不存在 → 204）。 */
+    @GetMapping("/official/google")
+    public ResponseEntity<ProviderDto> officialGoogle() {
+        ProviderDto dto = providerService.getOfficialGoogleProvider();
+        return dto == null ? ResponseEntity.noContent().build() : ResponseEntity.ok(dto);
+    }
+
+    /** 幂等创建 / 返回官方 Google 订阅 provider。 */
+    @PostMapping("/official/google/ensure")
+    public ProviderDto ensureOfficialGoogle() {
+        return providerService.ensureOfficialGoogleProvider();
+    }
+
+    /** 生成授权链接 + 登录 TTL（epoch ms）；后端同时起临时端口回调监听，不自动打开浏览器。 */
+    @PostMapping("/{id}/oauth/google/authorize")
+    public ResponseEntity<Object> googleAuthorize(@PathVariable String id) {
+        try {
+            GoogleOAuthService.AuthorizeResult result = googleOAuthService.buildAuthorizeUrl(id);
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("url", result.url());
+            body.put("expiresAt", result.expiresAt());
+            return ResponseEntity.ok(body);
+        } catch (IllegalArgumentException e) {
+            log.warn("Google 订阅授权失败 provider={}: {}", id, e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(Map.of("ok", false, "message", readable(e.getMessage())));
+        }
+    }
+
+    /** 用整条回调 URL / 裸 code 完成登录（回调端口不可用时的回退通道）。 */
+    @PostMapping("/{id}/oauth/google/complete")
+    public ResponseEntity<Map<String, Object>> googleComplete(@PathVariable String id,
+            @RequestBody(required = false) CompleteRequest req) {
+        String input = req == null ? null : req.input();
+        try {
+            googleOAuthService.complete(id, input);
+            return ResponseEntity.ok(Map.of("ok", true));
+        } catch (IllegalArgumentException e) {
+            log.warn("Google 订阅登录失败 provider={}: {}", id, e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(Map.of("ok", false, "message", readable(e.getMessage())));
+        } catch (OAuthTokenExchangeError e) {
+            // ⛔ 不打印 code / token；错误码已由 OAuthTokenClient 脱敏
+            log.warn("Google 订阅换 token 失败 provider={}: error={}", id, e.errorCode());
+            String reason = e.errorCode() != null && !e.errorCode().isBlank()
+                ? "provider 返回 " + e.errorCode()
+                : "token 端点拒绝了本次请求";
+            return ResponseEntity.badRequest().body(Map.of("ok", false,
+                "message", "授权码兑换失败（" + reason + "），请重新点击登录获取新的授权链接"));
+        }
+    }
+
+    /** 只读状态（不 refresh、不发网络请求）。 */
+    @GetMapping("/{id}/oauth/google/status")
+    public ResponseEntity<Object> googleStatus(@PathVariable String id) {
+        try {
+            return ResponseEntity.ok(googleOAuthService.status(id));
+        } catch (IllegalArgumentException e) {
+            log.warn("Google 订阅状态查询失败 provider={}: {}", id, e.getMessage());
+            Map<String, Object> body = new java.util.LinkedHashMap<>();
+            body.put("status", "error");
+            body.put("oauthProject", null);
+            body.put("expiresAt", null);
+            body.put("message", readable(e.getMessage()));
+            return ResponseEntity.badRequest().body(body);
+        }
+    }
+
+    /** 退出登录：取消在途回调 / onboarding，清 token + project + state。 */
+    @DeleteMapping("/{id}/oauth/google")
+    public ResponseEntity<Object> googleLogout(@PathVariable String id) {
+        try {
+            googleOAuthService.logout(id);
+            return ResponseEntity.noContent().build();
+        } catch (IllegalArgumentException e) {
+            log.warn("Google 订阅退出失败 provider={}: {}", id, e.getMessage());
+            return ResponseEntity.badRequest()
+                .body(Map.of("ok", false, "message", readable(e.getMessage())));
+        }
     }
 
     private static String readable(String message) {

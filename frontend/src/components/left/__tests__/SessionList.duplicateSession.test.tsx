@@ -5,6 +5,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { SessionList } from '../SessionList'
 import type { SessionDto } from '@/api/types'
 
+// [folder-group 2026-11-26] 日期用「相对今天」造：本文件测 ⋯ 菜单，与日期无关；
+// 固定旧日期会被「超过3天收进更早」默认收起，导致行不可见。用近期日期保证行可见。
+const recentIso = (daysAgo = 0): string => {
+  const d = new Date(); d.setHours(12, 0, 0, 0); d.setDate(d.getDate() - daysAgo); return d.toISOString()
+}
+
 /**
  * 左栏会话行 ⋯ 菜单里的「复制」项（2026-11-18 用户要求：复制 = 以最后一条为分叉点分叉）。
  *
@@ -54,7 +60,7 @@ describe('SessionList · 会话 ⋯ 菜单「复制」', () => {
     act(() => {
       root.render(
         <SessionList
-          sessions={[mkSession('s1', '2026-11-01T00:00:00Z')]}
+          sessions={[mkSession('s1', recentIso(0))]}
           activeSession=""
           switchSession={() => {}}
         />,
@@ -69,7 +75,7 @@ describe('SessionList · 会话 ⋯ 菜单「复制」', () => {
     act(() => {
       root.render(
         <SessionList
-          sessions={[mkSession('s-42', '2026-11-01T00:00:00Z')]}
+          sessions={[mkSession('s-42', recentIso(0))]}
           activeSession=""
           switchSession={() => {}}
           onDuplicateSession={onDuplicateSession}

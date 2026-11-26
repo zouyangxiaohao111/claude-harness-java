@@ -2119,7 +2119,8 @@ public class SubagentExecutor {
             //   .apply(null) 快照的 alwaysAllowRules[COMMAND] 并入 permCtx → 技能工具不被权限层阻断.
             Function<Map<String, Object>, Map<String, Object>> forkWrappedGetAppState =
                 (forkAllowedTools != null && !forkAllowedTools.isEmpty())
-                    ? createForkGetAppStateWithAllowedTools(effectiveParentTuc.getAppState(), forkAllowedTools)
+                    ? createForkGetAppStateWithAllowedTools(effectiveParentTuc.getAppState(), forkAllowedTools,
+                        effectiveParentTuc.permissionMode())
                     : null;
             if (log.isDebugEnabled() && forkWrappedGetAppState != null) {
                 log.debug("[SubagentExecutor] [P1-18] fork 工具授权包装 getAppState: allowedTools={} "
@@ -3303,11 +3304,13 @@ public class SubagentExecutor {
      * @param baseGetAppState 基础 getAppState (父 TUC.getAppState 桥接会话 appStateRef)
      * @param allowedTools    skill frontmatter allowedTools (CC original: parseToolListFromCLI 输出,
      *                        forkedAgent.ts:203); null/空 → no-op 原样返回 base
+     * @param currentMode     父 TUC 有效权限模式（base 快照无 toolPermissionContext 时占位 ctx 的 mode
+     *                        来源; [coordinator-bypass-inherit 2026-11-26] 防 DEFAULT 占位压掉会话 bypass）
      * @return 包装后 getAppState; allowedTools 空时返回原函数 (no-op 守卫, 对齐 :151)
      */
     static Function<Map<String, Object>, Map<String, Object>> createForkGetAppStateWithAllowedTools(
             Function<Map<String, Object>, Map<String, Object>> baseGetAppState,
-            List<String> allowedTools) {
+            List<String> allowedTools, PermissionMode currentMode) {
         if (allowedTools == null || allowedTools.isEmpty()) {
             // CC forkedAgent.ts:151 no-op 守卫: allowedTools 空 → 原样返回 baseGetAppState
             return baseGetAppState;
@@ -3315,7 +3318,7 @@ public class SubagentExecutor {
         return prev -> {
             Map<String, Object> baseSnapshot = baseGetAppState != null ? baseGetAppState.apply(prev) : null;
             // 复用 SkillToolImpl.mergeAllowedToolsIntoAppState 单源合并语义 (CC :160-166 command 桶去重)
-            return SkillToolImpl.mergeAllowedToolsIntoAppState(baseSnapshot, allowedTools);
+            return SkillToolImpl.mergeAllowedToolsIntoAppState(baseSnapshot, allowedTools, currentMode);
         };
     }
 

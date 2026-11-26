@@ -1,0 +1,1 @@
+[claude-code:unrecognized_model] {"model":"qwen4-max[1m]","query_source":"sdk"}

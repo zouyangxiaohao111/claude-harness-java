@@ -30,6 +30,8 @@ public class Provider {
     private String oauthAccountId;
     /** 登录流程在途的一次性 state（CSRF）。 */
     private String oauthState;
+    /** [V338] Google 订阅的 Cloud Code project（null = 未取得）。 */
+    private String oauthProject;
     /** [V299] 归属品牌 key（BuiltinProviderCatalog.BRANDS[].key；null = 自定义连接）。 */
     private String brandKey;
 
@@ -67,6 +69,8 @@ public class Provider {
     public void setOauthAccountId(String oauthAccountId) { this.oauthAccountId = oauthAccountId; }
     public String getOauthState() { return oauthState; }
     public void setOauthState(String oauthState) { this.oauthState = oauthState; }
+    public String getOauthProject() { return oauthProject; }
+    public void setOauthProject(String oauthProject) { this.oauthProject = oauthProject; }
     public String getBrandKey() { return brandKey; }
     public void setBrandKey(String brandKey) { this.brandKey = brandKey; }
 }

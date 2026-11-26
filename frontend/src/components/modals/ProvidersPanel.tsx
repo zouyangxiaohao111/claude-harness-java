@@ -10,7 +10,7 @@ import { APPLY_ALL_ROLES, APPLY_ALL_TIER_FIELDS } from '@/components/settings/Mo
 import type { UseProviders } from '@/hooks/useProviders'
 import { ApiError } from '@/api/rest'
 import { providerApi, type BuiltinBrandModel, type BuiltinConnection, type BuiltinProviderStatus } from '@/api/providers'
-import type { CreateModelRequest, CreateProviderRequest, ModelType, UpdateModelRequest, UpdateProviderRequest, UpdateSettingsRequest } from '@/api/types'
+import type { CreateModelRequest, CreateProviderRequest, GoogleOAuthStatus, ModelType, UpdateModelRequest, UpdateProviderRequest, UpdateSettingsRequest } from '@/api/types'
 
 interface ProvidersPanelProps {
   /** 后端拉取的 providers 列表（已嵌套 models） */
@@ -141,6 +141,34 @@ const openExternal = async (url: string): Promise<void> => {
     /* 桌面壳不可用 → 回落浏览器 */
   }
   window.open(url, '_blank', 'noopener')
+}
+
+/**
+ * Google 专用授权打开路径（⛔ 不改上方共享 openExternal，GPT/Claude 行为不变）。
+ *
+ * <p>Tauri openUrl 明确异常 → 返回警告文案（调用方展示 + 保持 pending + URL 兜底），
+ * ⛔ 不静默回落 window.open（壳内会开 WebView / 被拦）。
+ * Web window.open 带 noopener/noreferrer 成功也返回 null ⇒ null 不作为失败证据。
+ */
+const openGoogleAuthUrl = async (url: string): Promise<string | null> => {
+  let tauri = false
+  try {
+    const { isTauri } = await import('@tauri-apps/api/core')
+    tauri = isTauri()
+  } catch {
+    tauri = false
+  }
+  if (tauri) {
+    try {
+      const { openUrl } = await import('@tauri-apps/plugin-opener')
+      await openUrl(url)
+      return null
+    } catch (e) {
+      return `无法打开系统浏览器：${e instanceof Error ? e.message : String(e)}。请复制下方授权链接手动打开。`
+    }
+  }
+  window.open(url, '_blank', 'noopener,noreferrer')
+  return null
 }
 
 /**
@@ -322,6 +350,28 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
   const [claudePending, setClaudePending] = useState(false)
   /** 等待浏览器回调的 providerId（状态灯「等待」态；oauthPendingId 只覆盖发起请求那一瞬） */
   const [oauthWaitingId, setOauthWaitingId] = useState<string | null>(null)
+  /** Google 订阅条目（挂载时 GET /official/google；204 → null）。 */
+  const [googleProvider, setGoogleProvider] = useState<Provider | null>(null)
+  /** Google 登录状态（GET .../oauth/google/status 是唯一权威；null = 还没读到）。 */
+  const [googleStatus, setGoogleStatus] = useState<GoogleOAuthStatus | null>(null)
+  /** Google 登录动作（ensure+authorize）进行中 —— 首次点击时条目可能还不存在。 */
+  const [googlePending, setGooglePending] = useState(false)
+  /** Google 手动完成 / 退出进行中（Google 专用，⛔ 不与 ChatGPT/Claude 共享 oauthPendingId 防串票）。 */
+  const [googleBusy, setGoogleBusy] = useState(false)
+  /** Google 手动粘贴区（null = 收起；id 绑定展开时的 Google 条目，⛔ 不复用无类型的 oauthPaste）。 */
+  const [googlePaste, setGooglePaste] = useState<{ id: string; value: string } | null>(null)
+  /** Google 状态轮询定时器（独立于 ChatGPT/Claude 的 oauthPollRef）。 */
+  const googlePollRef = useRef<ReturnType<typeof setInterval> | null>(null)
+  /** Google 轮询截止时刻（epoch ms · 以服务端 authorize/status 的 expiresAt 为准，前端不自行缩短）。 */
+  const googleDeadlineRef = useRef<number>(0)
+  /** Google 异步世代：退出 / 切走 / 卸载 / 新登录时 +1；晚到回包世代不符直接丢弃（不 setState、不起 timer）。 */
+  const googleGenRef = useRef(0)
+  /** 本次 authorize 的授权 URL（绑定 provider id；logout/ready/超时/重新 authorize/切卡清，⛔ 不跨 attempt 串用）。 */
+  const [googleAuthUrl, setGoogleAuthUrl] = useState<{ id: string; url: string } | null>(null)
+  /** Google 打开浏览器失败警告（Tauri openUrl 明确异常；与 OAuth 状态分离，不强行置 error）。 */
+  const [googleOpenWarn, setGoogleOpenWarn] = useState<string | null>(null)
+  /** Google 独立到期 timer（单次 status 请求悬挂也能按绝对截止收口）。 */
+  const googleExpiryRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   /** 左栏当前选中的条目：'official' 或 provider.id */
   const [selectedKey, setSelectedKey] = useState<string>('official')
   /** 展开中的模型溢出菜单（model.id） */
@@ -388,6 +438,31 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
     void providerApi.listBuiltin()
       .then((s) => { if (!cancelled) setBuiltinStatuses(s ?? []) })
       .catch((e) => { console.warn('[ProvidersPanel] 读取内置品牌状态失败，左栏仅显示已配置项', e) })
+    return () => { cancelled = true }
+  }, [])
+
+  /**
+   * Google 订阅：挂载只读已有条目 + 状态（⛔ 不 ensure、不 authorize、不取票）。
+   * 状态读取失败落 error 终态，不留「读取中」悬挂；条目读取失败保持「未登录」（登录按钮会 ensure）。
+   */
+  useEffect(() => {
+    let cancelled = false
+    void (async () => {
+      try {
+        const p = await providerApi.officialGoogle()
+        if (cancelled) return
+        setGoogleProvider(p)
+        if (!p) return
+        try {
+          const st = await providerApi.oauthGoogleStatus(p.id)
+          if (!cancelled) setGoogleStatus(st)
+        } catch {
+          if (!cancelled) setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: '读取登录状态失败，请重新登录或稍后重试' })
+        }
+      } catch {
+        // 条目读取失败不阻断面板：卡片显示「未登录」，用户点登录会重试
+      }
+    })()
     return () => { cancelled = true }
   }, [])
 
@@ -540,8 +615,11 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
   const officialFromList = list.find((p) => isOfficialProvider(p)) ?? null
   /** 官方条目：优先取列表里那条（最新），其次 state（ensure 后 / 挂载时拉到的） */
   const officialEntry = officialFromList ?? officialProvider
-  /** 普通列表：滤掉官方条目，避免与顶部固定卡片重复显示 */
-  const regularProviders = list.filter((p) => !isOfficialProvider(p))
+  /** Google 订阅条目：优先列表里最新那条（已知 id 或 google_oauth 兜底），其次挂载 / ensure 后拉到的 state。 */
+  const googleFromList = list.find((p) => p.id === googleProvider?.id || p.authMode === 'google_oauth') ?? null
+  const googleEntry = googleFromList ?? googleProvider
+  /** 普通列表：滤掉官方条目与 Google 订阅条目，避免与左栏固定卡片重复显示 */
+  const regularProviders = list.filter((p) => !isOfficialProvider(p) && p.id !== googleEntry?.id)
 
   /** 内置组里除 openai 外的 4 张常驻卡（openai 仍走既有官方条目行为）。 */
   const builtinCards = builtinStatuses.filter((b) => b.key !== 'openai')
@@ -557,6 +635,23 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
   const claudeWaiting = !!claudeEntry && oauthWaitingId === claudeEntry.id
   /** 左栏 Claude 卡的三态文案（未登录 / 等待授权 / 已登录） */
   const claudeStateText = claudeLoggedIn ? '已登录' : claudeWaiting ? '等待授权' : '未登录'
+  /** Google 卡五态（status 接口是唯一权威；有条目但状态未读 → loading 中间态，⛔ 不假就绪）。 */
+  const googleState = googleStatus?.status ?? (googleEntry ? 'loading' : 'logged_out')
+  const googleWaiting = googleState === 'pending' || googleState === 'onboarding'
+  const googleReady = googleState === 'ready'
+  const googleStateText = googleReady ? '已就绪'
+    : googleState === 'pending' ? '等待授权'
+      : googleState === 'onboarding' ? '账号初始化'
+        : googleState === 'error' ? '失败'
+          : googleState === 'loading' ? '读取中'
+            : '未登录'
+  /** Google 详情视图激活：虚拟键 'google'（条目未创建）或真实条目 id。 */
+  const showGoogle = selectedKey === 'google' || (!!googleEntry && selectedKey === googleEntry.id)
+  const googleStat = googleReady
+    ? { cls: 'pv-stat is-ok', dot: 'pv-dot is-ok', text: `已就绪${googleStatus?.oauthProject ? ` · ${googleStatus.oauthProject}` : ''}` }
+    : googleWaiting
+      ? { cls: 'pv-stat is-wait', dot: 'pv-dot is-wait', text: googleStateText }
+      : { cls: 'pv-stat', dot: 'pv-dot', text: googleStateText }
   /** 已被某个内置品牌命中的 provider.id（自定义组据此排除；一个品牌可命中多条）。 */
   const builtinMatchedIds = new Set<string>()
   builtinStatuses.forEach((b) => {
@@ -637,10 +732,10 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
    */
   const renderBuiltinRows = (b: BuiltinProviderStatus) => {
     // 兼容旧后端（无 connections 字段）：已配置时按单条连接渲染
-    const all: BuiltinConnection[] = b.connections
+    const all: BuiltinConnection[] = (b.connections
       ?? (b.providerId
         ? [{ id: b.providerId, name: b.providerName ?? b.name, modelCount: b.modelCount, enabled: true }]
-        : [])
+        : [])).filter((c) => c.id !== googleEntry?.id)
 
     // Claude 订阅 = 内置常驻行（未登录也显示；点击直接走登录）
     if (b.key === 'claude') {
@@ -721,6 +816,96 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
       oauthPollRef.current = null
     }
   }, [])
+
+  // ---- Google 订阅轮询（独立 timer + 世代保护，⛔ 不与 ChatGPT/Claude 共享） ----
+  /** 清 Google 轮询 + 到期定时器（幂等）。 */
+  const stopGooglePoll = () => {
+    if (googlePollRef.current !== null) {
+      clearInterval(googlePollRef.current)
+      googlePollRef.current = null
+    }
+    if (googleExpiryRef.current !== null) {
+      clearTimeout(googleExpiryRef.current)
+      googleExpiryRef.current = null
+    }
+  }
+
+  /** 作废全部在途 Google 异步回包（退出 / 切走 / 卸载 / 新登录）并停轮询。 */
+  const invalidateGoogle = () => {
+    googleGenRef.current += 1
+    stopGooglePoll()
+  }
+
+  /** 本次 attempt 绝对截止收口：停 timer/poll、作废世代、清链接、落 error 终态（迟到 ready 不能复活）。 */
+  const expireGoogleAttempt = (gen: number) => {
+    if (gen !== googleGenRef.current) return
+    invalidateGoogle()
+    setGoogleAuthUrl(null)
+    setGoogleOpenWarn(null)
+    setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: '授权等待超时，请重新点击登录' })
+  }
+
+  /**
+   * 有界 status 轮询：绝对硬截止 = 初始 authorize.expiresAt（覆盖整个流程）。
+   * ⛔ 不跟随 status 更晚的 expiresAt 后滑（只取 min 收紧更早过期）；
+   * 独立到期 timer 保证单次 status 请求悬挂也能收口。ready/error/logged_out 收口；
+   * 世代不符的晚到回包直接丢弃（切走 / 卸载后不 setState、不起 timer）。
+   */
+  const startGooglePoll = (providerId: string, expiresAt: number) => {
+    stopGooglePoll()
+    if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+      setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: '授权链接有效期异常，请重新点击登录' })
+      return
+    }
+    googleDeadlineRef.current = expiresAt
+    const gen = googleGenRef.current
+    googleExpiryRef.current = setTimeout(() => { expireGoogleAttempt(gen) }, Math.max(0, expiresAt - Date.now()))
+    googlePollRef.current = setInterval(() => {
+      void (async () => {
+        if (gen !== googleGenRef.current) { stopGooglePoll(); return }
+        if (Date.now() >= googleDeadlineRef.current) { expireGoogleAttempt(gen); return }
+        try {
+          const st = await providerApi.oauthGoogleStatus(providerId)
+          if (gen !== googleGenRef.current) return
+          if ((st.status === 'pending' || st.status === 'onboarding')
+            && Number.isFinite(st.expiresAt) && (st.expiresAt as number) < googleDeadlineRef.current) {
+            googleDeadlineRef.current = st.expiresAt as number
+          }
+          setGoogleStatus(st)
+          if (st.status === 'ready') {
+            invalidateGoogle()
+            setGoogleAuthUrl(null)
+            setGoogleOpenWarn(null)
+            setGooglePaste(null)
+            showToast('Google 订阅已就绪', 'success')
+            await refresh()
+            await refreshBuiltin()
+          } else if (st.status === 'error' || st.status === 'logged_out') {
+            invalidateGoogle()
+            setGoogleAuthUrl(null)
+            setGoogleOpenWarn(null)
+          }
+        } catch {
+          // 后端可能正忙：本轮忽略，绝对截止兜底总时限
+        }
+      })()
+    }, OAUTH_POLL_INTERVAL_MS)
+  }
+
+  // 切走 Google 卡：停轮询 + 作废在途回包 + 清授权链接（晚到 ready/pending 不得污染新卡或复活轮询）
+  useEffect(() => {
+    if (!showGoogle) {
+      invalidateGoogle()
+      setGooglePending(false)
+      setGoogleBusy(false)
+      setGoogleAuthUrl(null)
+      setGoogleOpenWarn(null)
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [showGoogle])
+
+  // 卸载：停 Google 轮询并作废在途回包
+  useEffect(() => () => { invalidateGoogle() }, [])
 
   // ---- Provider CRUD 包装（带错误处理 + toast） ----
   const wrap = async (fn: () => Promise<unknown>, successMsg: string) => {
@@ -960,6 +1145,150 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
       showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
     } finally {
       setOauthPendingId(null)
+    }
+  }
+
+  // ---- Google 订阅登录（Gemini Code Assist · 动态端口回调 · 手动粘贴兜底） ----
+  /** 读一次 Google 状态（纯只读）。失败落 error 终态，⛔ 不留「读取中」悬挂；世代不符不回写。 */
+  const refreshGoogleStatus = async (id: string, gen: number): Promise<GoogleOAuthStatus | null> => {
+    try {
+      const st = await providerApi.oauthGoogleStatus(id)
+      if (gen === googleGenRef.current) setGoogleStatus(st)
+      return st
+    } catch {
+      if (gen === googleGenRef.current) {
+        setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: '读取登录状态失败，请重试' })
+      }
+      return null
+    }
+  }
+
+  /** 点「Google 订阅」卡：只选中 + 读已有状态，⛔ 不创建条目、不发起登录。 */
+  const onGoogleOpenSubscription = () => {
+    if (googleEntry) {
+      setSelectedKey(googleEntry.id)
+      void refreshGoogleStatus(googleEntry.id, googleGenRef.current)
+    } else {
+      setSelectedKey('google')
+    }
+  }
+
+  /** 「登录 Google 订阅」：只有显式点击才 ensure 条目 → authorize → 打开外部浏览器 → 有界轮询。 */
+  const onGoogleOAuthStart = async () => {
+    if (googlePending || googleBusy) return
+    setGooglePending(true)
+    const gen = ++googleGenRef.current
+    stopGooglePoll()
+    setGoogleAuthUrl(null)
+    setGoogleOpenWarn(null)
+    try {
+      const target = googleEntry ?? (await providerApi.ensureOfficialGoogle())
+      if (gen !== googleGenRef.current) return
+      setGoogleProvider(target)
+      setSelectedKey(target.id)
+      const { url, expiresAt } = await providerApi.oauthGoogleAuthorize(target.id)
+      if (gen !== googleGenRef.current) return
+      // 绝对截止前置校验：无效 / Infinity / NaN / 已过 → 拒绝，不开浏览器、不起轮询
+      if (!Number.isFinite(expiresAt) || expiresAt <= Date.now()) {
+        setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: '授权链接有效期异常，请重新点击登录' })
+        return
+      }
+      setGoogleAuthUrl({ id: target.id, url })
+      const warn = await openGoogleAuthUrl(url)
+      if (gen !== googleGenRef.current) return
+      setGoogleOpenWarn(warn)
+      if (warn) showToast(warn, 'info')
+      setGoogleStatus({ status: 'pending', oauthProject: null, expiresAt, message: null })
+      startGooglePoll(target.id, expiresAt)
+      await refresh()
+      await refreshBuiltin()
+    } catch (e) {
+      if (gen === googleGenRef.current) {
+        const msg = e instanceof ApiError ? e.userMessage() : String(e)
+        showToast(msg, 'info')
+        setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: msg })
+      }
+    } finally {
+      if (gen === googleGenRef.current) setGooglePending(false)
+    }
+  }
+
+  /** 手动完成：整条回调 URL 或裸 code。complete ok ≠ ready —— 必须再读 status 确认，⛔ 不假就绪。 */
+  const onGoogleOAuthComplete = async (p: Provider) => {
+    // 只接受 Google 条目自己的粘贴（id + 协议双校验，⛔ 不完成到 ChatGPT/Claude 端点）
+    if (p.type !== 'gemini_code_assist' && p.authMode !== 'google_oauth') return
+    const input = (googlePaste?.id === p.id ? googlePaste.value : '').trim()
+    if (!input) {
+      showToast('请先粘贴登录后浏览器地址栏里的整条 URL（或裸授权码）', 'info')
+      return
+    }
+    if (googleBusy || googlePending) return
+    setGoogleBusy(true)
+    const gen = googleGenRef.current
+    try {
+      const res = await providerApi.oauthGoogleComplete(p.id, input)
+      if (gen !== googleGenRef.current) return
+      if (!res.ok) {
+        setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: res.message ?? '登录失败' })
+        return
+      }
+      stopGooglePoll()
+      setGooglePaste(null)
+      setGoogleAuthUrl(null)
+      setGoogleOpenWarn(null)
+      const st = await refreshGoogleStatus(p.id, gen)
+      if (gen !== googleGenRef.current) return
+      if (st?.status === 'ready') {
+        showToast('Google 订阅已就绪', 'success')
+        await refresh()
+        await refreshBuiltin()
+      } else if (st && (st.status === 'pending' || st.status === 'onboarding') && Number.isFinite(st.expiresAt)) {
+        startGooglePoll(p.id, st.expiresAt as number)
+      }
+    } catch (e) {
+      if (gen === googleGenRef.current) {
+        const msg = e instanceof ApiError ? e.userMessage() : String(e)
+        showToast(msg, 'info')
+        setGoogleStatus({ status: 'error', oauthProject: null, expiresAt: null, message: msg })
+      }
+    } finally {
+      if (gen === googleGenRef.current) setGoogleBusy(false)
+    }
+  }
+
+  /** 退出 Google 订阅：保留确认；作废在途回包 + 清状态 / 粘贴 / 轮询。 */
+  const onGoogleOAuthLogout = async (p: Provider) => {
+    if (googleBusy || googlePending) return
+    if (!confirm(`退出 "${p.name}" 的 Google 订阅登录？`)) return
+    setGoogleBusy(true)
+    const gen = ++googleGenRef.current
+    stopGooglePoll()
+    try {
+      await providerApi.oauthGoogleLogout(p.id)
+      if (gen !== googleGenRef.current) return
+      setGoogleStatus({ status: 'logged_out', oauthProject: null, expiresAt: null, message: null })
+      setGooglePaste(null)
+      setGoogleAuthUrl(null)
+      setGoogleOpenWarn(null)
+      showToast('已退出 Google 订阅', 'success')
+      await refresh()
+      await refreshBuiltin()
+    } catch (e) {
+      if (gen === googleGenRef.current) showToast(e instanceof ApiError ? e.userMessage() : String(e), 'info')
+    } finally {
+      if (gen === googleGenRef.current) setGoogleBusy(false)
+    }
+  }
+
+  /** 复制授权链接：剪贴板失败必须提示，⛔ 不假成功；URL 不落日志。 */
+  const copyGoogleAuthUrl = async () => {
+    const url = googleAuthUrl?.url
+    if (!url) return
+    try {
+      await navigator.clipboard.writeText(url)
+      showToast('授权链接已复制', 'success')
+    } catch {
+      showToast('复制失败，请手动选择链接后复制', 'info')
     }
   }
 
@@ -1604,6 +1933,30 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
                     </span>
                   </button>
                 )}
+                {/* Google 订阅常驻卡（独立于 Gemini API Key 品牌；点击只选中 + 读状态，不创建 / 不登录） */}
+                {(g.label === '国际' || g.label === '内置') && (
+                  <button
+                    type="button"
+                    className="pv-rail-card"
+                    aria-selected={showGoogle}
+                    onClick={onGoogleOpenSubscription}
+                  >
+                    <span className="pv-rail-card-icon" aria-hidden="true">
+                      <img src={brandIconSrc('gemini')} alt="" />
+                    </span>
+                    <span className="pv-rail-card-body">
+                      <span className="pv-rail-card-name">
+                        Google 订阅
+                        <span className="pv-rail-card-badge">内置</span>
+                        <span className="pv-rail-card-badge is-sub">订阅</span>
+                      </span>
+                      <span className="pv-rail-card-sub">Google 订阅 · {googleStateText}</span>
+                    </span>
+                    <span className="pv-rail-card-side">
+                      {googleEntry ? `${googleEntry.models.length} 个模型` : '未配置'}
+                    </span>
+                  </button>
+                )}
                 {g.items.map(renderBuiltinRows)}
               </Fragment>
             ))}
@@ -1784,6 +2137,182 @@ export function ProvidersPanel({ providersApi, showToast, onSaveSettings }: Prov
             {regularProviders.length === 0 && !loading && !error && (
               <div className="pv-empty" style={{ marginTop: 32 }}>
                 暂无提供商 · 点击「+ 添加提供商」开始
+              </div>
+            )}
+          </div>
+
+          {/* Google 订阅（Gemini Code Assist）· 独立入口，⛔ 不冒充 Gemini API Key；不参与添加/编辑/删除 */}
+          <div className="pv-view" data-active={showGoogle}>
+            <div className="pv-sheet-head">
+              <div className="pv-head-left">
+                <div className="pv-title-row">
+                  <h2 className="pv-sheet-title">Google 订阅</h2>
+                </div>
+                <p className="pv-sheet-sub">Gemini Code Assist · 用你已有的 Google 账号订阅额度（与 Gemini API Key 是两条独立连接）</p>
+                <div className={googleStat.cls}>
+                  <span className={googleStat.dot} />
+                  <span>{googleStat.text}</span>
+                </div>
+              </div>
+            </div>
+
+            <div className="pv-connect">
+              <div className={`pv-connect-box${googleWaiting ? ' is-wait' : ''}`}>
+                <div className="pv-connect-main">
+                  <span className="pv-connect-icon">
+                    {googleReady ? (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round"><path d="M4.5 12.5l5 5 10-10" /></svg>
+                    ) : googleWaiting ? (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="8.5" /><path d="M12 7.5V12l3 1.8" /></svg>
+                    ) : (
+                      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><circle cx="12" cy="12" r="8.5" /><path d="M12 15v-4M12 8h.01" /></svg>
+                    )}
+                  </span>
+                  <div className="pv-connect-text">
+                    <div className="pv-connect-title">
+                      {googleReady ? '订阅连接正常'
+                        : googleState === 'pending' ? '等待浏览器授权'
+                          : googleState === 'onboarding' ? '账号初始化中'
+                            : googleState === 'error' ? '登录未完成'
+                              : googleState === 'loading' ? '读取登录状态…'
+                                : '还没有登录 Google 订阅'}
+                    </div>
+                    <div className="pv-connect-desc">
+                      {googleReady ? '用你已有的 Google 订阅额度调用 Gemini 模型（可用资格以账号为准）'
+                        : googleState === 'pending' ? '等待浏览器完成授权，本页会自动更新；没打开可复制下方链接手动完成'
+                          : googleState === 'onboarding' ? 'Google 正在为该账号开通订阅项目，等待更新；可点左栏卡片刷新状态'
+                            : googleState === 'error' ? (googleStatus?.message ?? '请重新点击登录')
+                              : googleState === 'loading' ? '正在向后端确认登录状态'
+                                : '浏览器里点完授权，这一页会自动接住'}
+                    </div>
+                  </div>
+                </div>
+                <div className="pv-connect-actions">
+                  {googleState === 'loading' ? null : googleReady ? (
+                    <button
+                      type="button"
+                      className="pv-btn-text"
+                      disabled={googleBusy || googlePending}
+                      onClick={() => { if (googleEntry) void onGoogleOAuthLogout(googleEntry) }}
+                    >退出登录</button>
+                  ) : (
+                    <>
+                      {googleEntry && googlePaste === null && (
+                        <button
+                          type="button"
+                          className="pv-btn-text"
+                          title="浏览器回调失败时，手动粘贴登录后的地址"
+                          onClick={() => setGooglePaste({ id: googleEntry.id, value: '' })}
+                        >登录遇到问题？</button>
+                      )}
+                      <button
+                        type="button"
+                        className={`pv-btn pv-btn-sm ${googleWaiting || googleState === 'error' ? 'pv-btn-tint' : 'pv-btn-primary'}`}
+                        disabled={googlePending || googleBusy}
+                        onClick={() => { void onGoogleOAuthStart() }}
+                      >{googleWaiting ? '重开一次' : googleState === 'error' ? '重新登录' : '登录 Google 订阅'}</button>
+                    </>
+                  )}
+                </div>
+              </div>
+              {googleWaiting && <div className="pv-waitbar"><i /></div>}
+            </div>
+
+            {/* 打开浏览器失败警告（Tauri openUrl 明确异常）：与 OAuth 状态分离，保持 pending 供手动完成 */}
+            {googleOpenWarn && <p className="pv-error" style={{ marginTop: 8 }}>{googleOpenWarn}</p>}
+
+            {/* 常驻风险提示（非模态、不阻塞）：官方条款不允许第三方 CLI OAuth 直连，知情后再登录 */}
+            <p className="pv-error" style={{ marginTop: 8 }}>
+              风险提示：Google 官方条款不允许第三方软件通过 Gemini CLI OAuth 直连 Code Assist，账号可能被暂停或终止。请确认已了解风险后再登录。
+            </p>
+
+            {/* pending 期间恒有授权 URL 兜底：可点击 / 复制 / 手动选择（⛔ 不写「已打开浏览器」假成功） */}
+            {googleEntry && googleState === 'pending' && googleAuthUrl?.id === googleEntry.id && (
+              <div className="pv-paste is-open">
+                <label>浏览器没有自动打开？复制这条授权链接，在浏览器里手动打开完成登录</label>
+                <div className="pv-actions">
+                  <a
+                    className="pv-btn pv-btn-tint pv-btn-sm"
+                    href={googleAuthUrl.url}
+                    target="_blank"
+                    rel="noopener noreferrer"
+                  >打开授权页</a>
+                  <button
+                    type="button"
+                    className="pv-btn pv-btn-tint pv-btn-sm"
+                    onClick={() => { void copyGoogleAuthUrl() }}
+                  >复制授权链接</button>
+                </div>
+                <input
+                  className="pv-textarea"
+                  readOnly
+                  aria-label="Google 授权链接"
+                  value={googleAuthUrl.url}
+                  onFocus={(e) => e.currentTarget.select()}
+                />
+              </div>
+            )}
+
+            {googleEntry && !googleReady && googlePaste?.id === googleEntry.id && (
+              <div className="pv-paste is-open">
+                <label htmlFor="google-oauth-paste">登录后浏览器会跳到 127.0.0.1 的回调地址，把整条 URL 粘到这里（裸授权码也可以）</label>
+                <textarea
+                  id="google-oauth-paste"
+                  className="pv-textarea"
+                  rows={2}
+                  placeholder="http://127.0.0.1:<端口>/oauth2callback?code=…&state=…"
+                  autoComplete="off"
+                  autoCorrect="off"
+                  spellCheck={false}
+                  value={googlePaste.value}
+                  onChange={(e) => {
+                    const value = e.target.value
+                    setGooglePaste((prev) => (prev ? { ...prev, value } : prev))
+                  }}
+                />
+                <div className="pv-actions" style={{ marginTop: 0 }}>
+                  <button
+                    type="button"
+                    className="pv-btn pv-btn-primary pv-btn-sm"
+                    disabled={googleBusy || googlePending}
+                    onClick={() => { if (googleEntry) void onGoogleOAuthComplete(googleEntry) }}
+                  >完成登录</button>
+                  <button
+                    type="button"
+                    className="pv-btn-text"
+                    onClick={() => setGooglePaste(null)}
+                  >算了</button>
+                </div>
+              </div>
+            )}
+
+            {/* 就绪后管理模型：清单由后端下发（ensure 种子模板），⛔ 前端不写死模型清单 */}
+            {googleReady && googleEntry && (
+              <div className="pv-block">
+                <div className="pv-block-head">
+                  <div className="pv-block-title">
+                    <h3>模型</h3>
+                    <span className="pv-count">{googleEntry.models.length}</span>
+                    <span className="pv-block-hint">跟随账号 · 以后端下发为准</span>
+                  </div>
+                  <div className="pv-block-actions">
+                    <button
+                      type="button"
+                      className="pv-btn pv-btn-tint pv-btn-sm"
+                      onClick={() => setAddingModelFor({ providerId: googleEntry.id, prefillName: '' })}
+                    >
+                      <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round"><path d="M12 5v14M5 12h14" /></svg>
+                      添加模型
+                    </button>
+                  </div>
+                </div>
+                {googleEntry.models.length === 0 ? (
+                  <div className="pv-empty">内置模型正在准备</div>
+                ) : (
+                  <div className="pv-list">
+                    {renderModelGroups(googleEntry)}
+                  </div>
+                )}
               </div>
             )}
           </div>

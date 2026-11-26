@@ -41,6 +41,7 @@ import { useChatSocket } from '@/hooks/useChatSocket'
 import { PERMISSION_MODE_LABELS } from '@/api/types'
 import type { AttachmentRequest, ChatMessageDto, CitationItem, PermissionMode, Provider, SessionDto } from '@/api/types'
 import type { StreamBlock } from '@/stores/chatStore'
+import { pickCitationsForTurn, STUB_ASSISTANT_ID } from '@/utils/kbCitations'
 
 /** 稳定空数组（zustand 选择器返回新数组会导致无限重渲染）。 */
 /**
@@ -684,7 +685,10 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
     }
     return ''
   })()
-  const citationsAll = lastAssistantId ? (citationMap[lastAssistantId] ?? EMPTY_CITATIONS) : EMPTY_CITATIONS
+  // ⭐ 实时 citations 事件带的是**受理时的占位 id**（`msg-stub-pending`）—— 后端在生成前就推引用，
+  //   那时 assistant 消息还没落库。落库后消息 id 变成 `msg-xxxx`，按真实 id 查恒空
+  //   （2026-11-26 用户报「知识库对话没有引用了」的根因）⇒ 统一走 pickCitationsForTurn 兜底。
+  const citationsAll = pickCitationsForTurn(citationMap, lastAssistantId)
   // 「N 个文档」按 knowledge_id 去重：一轮引用通常命中同一文档的多个块（实测 4 条引用 = 1 个文档），
   //   直接用 citations.length 会把它说成 4 个文档。knowledge_id 缺失时才退回引用条数。
   const citedDocCount = useMemo(
@@ -736,16 +740,25 @@ export function KbNewChatPane({ showToast, initialSessionId, onSessionChange, ne
   // 每条 assistant 消息自己的「引用编号 → 文档名」：同一条会话里不同消息的 [1] 指向不同文档
   const citationTitlesByMessage = useMemo(() => {
     const out: Record<string, Record<number, string>> = {}
-    for (const [mid, rows] of Object.entries(citationMap)) {
+    const titlesOf = (rows: import('@/api/types').CitationItem[]) => {
       const titles: Record<number, string> = {}
       for (const c of rows) {
         const t = (c.knowledge_title || '').trim()
         if (t) titles[c.ref_index] = t
       }
+      return titles
+    }
+    for (const [mid, rows] of Object.entries(citationMap)) {
+      const titles = titlesOf(rows)
       if (Object.keys(titles).length > 0) out[mid] = titles
     }
+    // 同上：最新一轮的实时引用挂在占位桶上，正文 [N] chip 也要能拿到文档名
+    const stubTitles = citationMap[STUB_ASSISTANT_ID] ? titlesOf(citationMap[STUB_ASSISTANT_ID]) : {}
+    if (lastAssistantId && !out[lastAssistantId] && Object.keys(stubTitles).length > 0) {
+      out[lastAssistantId] = stubTitles
+    }
     return out
-  }, [citationMap])
+  }, [citationMap, lastAssistantId])
 
   useEffect(() => {
     // 只在新对话空态拉一次候选（有消息后不再请求）
@@ -1195,7 +1208,6 @@ function PickChipIcon({ kind }: { kind: 'kb' | 'file' }) {
 }
 
 /** 空引用（zustand 选择器禁止返回新对象/数组 ⇒ 模块级常量） */
-const EMPTY_CITATIONS: import('@/api/types').CitationItem[] = []
 const EMPTY_CITATION_MAP: Record<string, import('@/api/types').CitationItem[]> = {}
 const BODY_ROW: React.CSSProperties = { flex: 1, display: 'flex', minHeight: 0 }
 const CIT_CARD_CLICKABLE: React.CSSProperties = {

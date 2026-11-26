@@ -22,6 +22,7 @@ import { marked } from 'marked'
 import type { Renderer } from 'marked'
 
 import { isExternalLinkHref, openLinkInAppWindow, openLinkInBrowser } from '@/utils/externalLink'
+import { localFilePathOf, openLocalFile } from '@/utils/localFileLink'
 
 // 代码高亮：highlight.js（照抄源站，含 highlightAuto 兜底）
 import { highlightCode } from './codeHighlight'
@@ -252,7 +253,15 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
     const target = e.target as HTMLElement | null
     if (!target) return
 
-    // ⓪ 外链：拦掉 webview 内导航（Tauri 里没有地址栏/后退键），交系统浏览器。
+    // ⓪ 本地文件链接：href 已被净化器剥掉，真实路径在 data-local-file（见 buildDefaultRenderer.link）。
+    const localAnchor = target.closest('a[data-local-file]') as HTMLAnchorElement | null
+    if (localAnchor) {
+      e.preventDefault()
+      void openLocalFile(localAnchor.getAttribute('data-local-file') ?? '')
+      return
+    }
+
+    // ① 外链：拦掉 webview 内导航（Tauri 里没有地址栏/后退键），交系统浏览器。
     const anchor = externalAnchorOf(target)
     if (anchor) {
       e.preventDefault()
@@ -260,7 +269,7 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
       return
     }
 
-    // ① 运行（HTML 代码块）
+    // ② 运行（HTML 代码块）
     const runBtn = target.closest('.chat-code-block__run') as HTMLElement | null
     if (runBtn && onRunHtml) {
       const code = runBtn.getAttribute('data-html-run')
@@ -268,7 +277,7 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
       return
     }
 
-    // ② 复制
+    // ③ 复制
     const copyBtn = target.closest('.chat-code-block__copy') as HTMLButtonElement | null
     if (!copyBtn) return
     const block = copyBtn.closest('.chat-code-block')
@@ -469,6 +478,25 @@ function buildDefaultRenderer(onRunHtml?: (code: string) => void): Renderer {
   </div>
   <pre class="chat-code-block__pre"><code class="hljs language-${safeLang}">${highlighted}</code></pre>
 </div>`
+  }
+
+  /**
+   * 本地文件链接（用户 2026-11-26 缺陷：`file:///D:/...` 链接看着可点、点不动）。
+   *
+   * <p>DOMPurify 会把 `file:` / 盘符协议当作不安全 ⇒ `href` 被整个剥掉，`<a>` 只剩
+   * 文字。这里换成 `data-local-file`（DOMPurify 放行 data-*），点击由根节点委托交给
+   * {@link openLocalFile}，不再依赖会被净化掉的 href。
+   */
+  const defaultLink = r.link.bind(r)
+  r.link = function (this: Renderer, token: unknown) {
+    const t = token as { href?: string; title?: string | null; tokens?: unknown[] }
+    const localPath = localFilePathOf(t.href ?? '')
+    if (localPath !== null) {
+      const label = this.parser.parseInline((t.tokens ?? []) as never)
+      const tip = escapeHtml(t.title || localPath)
+      return `<a class="md-local-file" data-local-file="${escapeHtml(localPath)}" title="${tip}">${label}</a>`
+    }
+    return defaultLink(token as never)
   }
   return r
 }

@@ -32,6 +32,8 @@ public class ProviderRecord {
     private Long oauthExpiresAt;
     private String oauthAccountId;
     private String oauthState;
+    /** [V338] Google 订阅的 Cloud Code project（null = 未取得；与 chatgpt 的 oauth_account_id 语义独立）。 */
+    private String oauthProject;
     /** [V299] 归属品牌 key（null = 自定义连接）。 */
     private String brandKey;
 
@@ -54,6 +56,7 @@ public class ProviderRecord {
         p.setOauthExpiresAt(oauthExpiresAt);
         p.setOauthAccountId(oauthAccountId);
         p.setOauthState(oauthState);
+        p.setOauthProject(oauthProject);
         p.setBrandKey(brandKey);
         return p;
     }
@@ -77,6 +80,7 @@ public class ProviderRecord {
         r.setOauthExpiresAt(p.getOauthExpiresAt());
         r.setOauthAccountId(p.getOauthAccountId());
         r.setOauthState(p.getOauthState());
+        r.setOauthProject(p.getOauthProject());
         r.setBrandKey(p.getBrandKey());
         return r;
     }
@@ -115,6 +119,8 @@ public class ProviderRecord {
     public void setOauthAccountId(String oauthAccountId) { this.oauthAccountId = oauthAccountId; }
     public String getOauthState() { return oauthState; }
     public void setOauthState(String oauthState) { this.oauthState = oauthState; }
+    public String getOauthProject() { return oauthProject; }
+    public void setOauthProject(String oauthProject) { this.oauthProject = oauthProject; }
     public String getBrandKey() { return brandKey; }
     public void setBrandKey(String brandKey) { this.brandKey = brandKey; }
 }

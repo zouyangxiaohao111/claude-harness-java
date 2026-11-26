@@ -77,7 +77,8 @@ class ForkedSkillToolAuthTest {
         Function<Map<String, Object>, Map<String, Object>> base = prev -> snapshotWith(emptyCommandBucketContext());
 
         Function<Map<String, Object>, Map<String, Object>> wrapped =
-                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of("Bash", "Read"));
+                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of("Bash", "Read"),
+                        PermissionMode.DEFAULT);
 
         Map<String, Object> snapshot = wrapped.apply(null);
         assertThat(snapshot)
@@ -97,7 +98,7 @@ class ForkedSkillToolAuthTest {
         Function<Map<String, Object>, Map<String, Object>> base = prev -> snapshotWith(emptyCommandBucketContext());
 
         Function<Map<String, Object>, Map<String, Object>> wrapped =
-                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of());
+                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of(), PermissionMode.DEFAULT);
 
         assertThat(wrapped)
                 .as("[P1-18] allowedTools 空 → 原样返回 base 函数 (CC forkedAgent.ts:151)")
@@ -114,7 +115,8 @@ class ForkedSkillToolAuthTest {
                 prev -> snapshotWith(existingCommandBucketContext());
 
         Function<Map<String, Object>, Map<String, Object>> wrapped =
-                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of("Bash", "Read"));
+                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of("Bash", "Read"),
+                        PermissionMode.DEFAULT);
 
         Map<String, Object> snapshot = wrapped.apply(null);
         ToolPermissionContext tpc = (ToolPermissionContext) snapshot.get("toolPermissionContext");
@@ -125,5 +127,27 @@ class ForkedSkillToolAuthTest {
         assertThat(commandRules.stream().filter(r -> r.ruleValue().toolName().equals("Bash")).count())
                 .as("[P1-18] 去重: Bash whole-tool ALLOW rule 必须唯一 (CC forkedAgent.ts:161-165 [...new Set])")
                 .isEqualTo(1);
+    }
+
+    @Test
+    @DisplayName("[coordinator-bypass-inherit] base 快照无 tpc + currentMode=BYPASS → 占位 mode 继承 BYPASS")
+    void createForkGetAppStateWithAllowedTools_noExistingTpc_placeholderModeInheritsCurrentMode() {
+        // WHY（2026-11-26 sess-908ea539 实证）: fork 包装复用 mergeAllowedToolsIntoAppState，
+        //   base 快照无 toolPermissionContext 时旧实现硬编码 DEFAULT 占位 → 子代理 per-turn merge
+        //   「appState mode 胜出」采纳 DEFAULT → 压掉父会话 bypass。占位 mode 必须继承父 TUC 有效模式。
+        Function<Map<String, Object>, Map<String, Object>> base = prev -> new LinkedHashMap<>();
+
+        Function<Map<String, Object>, Map<String, Object>> wrapped =
+                SubagentExecutor.createForkGetAppStateWithAllowedTools(base, List.of("Read"),
+                        PermissionMode.BYPASS_PERMISSIONS);
+
+        Map<String, Object> snapshot = wrapped.apply(null);
+        ToolPermissionContext tpc = (ToolPermissionContext) snapshot.get("toolPermissionContext");
+        assertThat(tpc.mode())
+                .as("[coordinator-bypass-inherit] 占位 ctx mode 必须继承父 TUC 的 BYPASS，不得硬编码 DEFAULT")
+                .isEqualTo(PermissionMode.BYPASS_PERMISSIONS);
+        assertThat(tpc.alwaysAllowRules().get(PermissionRuleSource.COMMAND))
+                .as("COMMAND 桶授权语义不变")
+                .containsExactly(wholeToolRule("Read"));
     }
 }

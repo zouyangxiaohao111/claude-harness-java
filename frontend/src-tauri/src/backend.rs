@@ -248,6 +248,20 @@ fn clear_backend_pid() {
     let _ = std::fs::remove_file(backend_pid_path());
 }
 
+/// 退出兜底：内存 `BackendState` 拿不到 pid 时（如启动期 3458 被占跳过自启、或状态已被
+/// 关窗钩子 take 走），从 pid 文件读回上次自启的后端 pid，并做**身份校验**
+/// （命令行含 `nexusai-backend.jar`）后才返回 —— 防 pid 复用误杀其它 java。
+/// 文件不存在 / 解析失败 / 身份不命中 → None（保守不杀）。
+pub fn read_verified_backend_pid() -> Option<u32> {
+    let raw = std::fs::read_to_string(backend_pid_path()).ok()?;
+    let pid: u32 = raw.trim().parse().ok()?;
+    if is_our_backend_process(pid) {
+        Some(pid)
+    } else {
+        None
+    }
+}
+
 /// 该 pid 是否“本应用自启的后端”（命令行含 `nexusai-backend.jar`）？
 /// 只有身份命中才允许跨启动 kill —— 防 pid 复用 / 误杀其它 java（IDE、其它 GUI 应用）。
 /// Windows 经 PowerShell 读 CommandLine；查询失败 → false（保守不杀）。
@@ -598,8 +612,15 @@ pub fn kill_process_tree(pid: u32) {
         let result = silent_command("taskkill")
             .args(["/PID", pid_str.as_str(), "/T", "/F"])
             .status();
-        if let Err(e) = result {
-            eprintln!("[backend] 执行 taskkill 整树杀进程失败（pid={}）：{}", pid, e);
+        // [2026-11-26 Win10 实测「右键退出杀不掉 Java」] 把 taskkill 结果落 launcher 日志：
+        //   release 无控制台，eprintln 会丢 ⇒ 以前完全看不到杀没杀成功，无法诊断。
+        match result {
+            Ok(st) => log_launcher(&format!(
+                "[backend] taskkill /T /F pid={} 退出码={}（0=成功；128=进程不存在；1=拒绝访问/需提权）",
+                pid,
+                st.code().unwrap_or(-1)
+            )),
+            Err(e) => log_launcher(&format!("[backend] taskkill 无法启动（pid={}）：{}", pid, e)),
         }
     }
 

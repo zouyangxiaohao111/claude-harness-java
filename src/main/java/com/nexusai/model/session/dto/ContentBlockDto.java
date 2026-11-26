@@ -18,6 +18,13 @@ package com.nexusai.model.session.dto;
  *       function_call_output、reasoning/summary）。</li>
  * </ul>
  *
+ * <p><b>Google 签名元数据例外（方案 A，主会话 2026-11-25 裁决）</b>：{@code gemini_code_assist}
+ * provider（{@code GoogleGeminiProvider}）读本 record 的 {@link #signature()} 作为 Gemini 原生
+ * thoughtSignature 的持久化元数据——槽内为自描述封装 {@code gca1|provider|model|base64url(raw)}，
+ * 出站解封装并核对 provider/model 身份，封装原样⛔不发 Google、不打日志。该 provider 仍自组
+ * Gemini 原生 parts，⛔ 不整份序列化 blocks 为请求体；canonical 的 content/reasoning/toolCalls
+ * 仍是内容真源，blocks 仅在与 canonical 核对等价时提供 part 边界与签名（编辑/裁剪不匹配即弃用）。
+ *
  * <p><b>字段</b>（按类型惰性有值，其余为 null）：
  * <ul>
  *   <li>{@code type}：{@code text} / {@code thinking} / {@code tool_use}（扩展类型原样透传）</li>

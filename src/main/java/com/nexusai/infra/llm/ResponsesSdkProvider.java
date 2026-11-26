@@ -323,7 +323,8 @@ public class ResponsesSdkProvider implements LlmProvider {
                     log.info("ResponsesSdkProvider: access token 已失效，刷新后重试一次 model={}", modelName);
                     // 只换 apiKey：baseUrl / extraHeaders / extraBody 必须与首次尝试完全一致。
                     ProviderConfig retried = new ProviderConfig(
-                        config.baseUrl(), refreshedAccess, config.extraHeaders(), config.extraBody());
+                        config.baseUrl(), refreshedAccess, config.extraHeaders(), config.extraBody(),
+                        config.oauthProject());
                     doStream(retried, modelName, systemPromptBlocks, history, tools,
                         maxOutputTokensOverride, effortValue, onChunk, onAssistantMessage,
                         onToolCallComplete, onReasoningChunk, aborted, onError, onComplete,
@@ -555,7 +556,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                         if (refreshed != null) {
                             log.info("[responses-ws] access token 失效，刷新后重建连接重试 model={}", modelName);
                             ProviderConfig retried = new ProviderConfig(config.baseUrl(), refreshed,
-                                config.extraHeaders(), config.extraBody());
+                                config.extraHeaders(), config.extraBody(), config.oauthProject());
                             st.closeSession();
                             return doStreamWs(retried, modelName, wsKey, sessionId, instructions, input,
                                 sdkTools, maxOutputTokens, resolvedEffort, onChunk, onAssistantMessage,
@@ -1380,7 +1381,7 @@ public class ResponsesSdkProvider implements LlmProvider {
                         log.info("ResponsesSdkProvider chat: access token 已失效，刷新后重试一次 model={}",
                             modelName);
                         attempt = new ProviderConfig(attempt.baseUrl(), refreshedAccess,
-                            attempt.extraHeaders(), attempt.extraBody());
+                            attempt.extraHeaders(), attempt.extraBody(), attempt.oauthProject());
                         continue;
                     }
                     throw withReloginHint(OpenAiSdkProvider.translateSdkError(e));

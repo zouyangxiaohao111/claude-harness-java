@@ -187,6 +187,33 @@ public class KnowledgeController {
         return java.util.Map.of("task_id", taskId);
     }
 
+    /**
+     * 重试单个后处理子任务（卡片视图上的「重试」按钮）。
+     *
+     * <p>只对 {@code kb_ingest_task} 里存在行的类型有效
+     * （{@code summary / question / wiki / auto_tag / graph}）；
+     * ⛔ 主阶段（docreader / chunking / embedding / multimodal）是顺序处理器、没有独立任务行，
+     * 失败只能走 {@code POST /knowledge/{id}/reparse} 全流程重跑。
+     */
+    @PostMapping("/api/v1/knowledge/{id}/ingest-tasks/{taskType}/retry")
+    public java.util.Map<String, Object> retrySubtask(@PathVariable String id,
+                                                      @PathVariable String taskType) {
+        if (ingestTaskMapper == null) {
+            throw new ValidationException("入库任务队列未启用");
+        }
+        Long taskId = ingestTaskMapper.selectLatestTaskId(id, taskType);
+        if (taskId == null) {
+            throw new ValidationException("没有该类型的子任务记录：" + taskType);
+        }
+        int n = ingestTaskMapper.requeueForRetry(taskId, com.nexusai.kb.repo.KbTimeFormat.now());
+        if (n == 0) {
+            throw new ValidationException("该子任务正在执行，稍后再试");
+        }
+        log.info("[知识API] POST /api/v1/knowledge/{}/ingest-tasks/{}/retry → task={}",
+            id, taskType, taskId);
+        return java.util.Map.of("task_id", taskId, "task_type", taskType);
+    }
+
     /** 取消解析 · 成功 204。 */
     @PostMapping("/api/v1/knowledge/{id}/cancel-parse")
     public ResponseEntity<Void> cancelParse(@PathVariable String id) {

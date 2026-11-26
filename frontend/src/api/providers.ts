@@ -15,6 +15,8 @@ import type {
   RemoteModelsResponse,
   OAuthAuthorizeResponse,
   OAuthCompleteResponse,
+  GoogleOAuthAuthorizeResponse,
+  GoogleOAuthStatus,
 } from './types'
 
 /**
@@ -111,6 +113,36 @@ export const providerApi = {
   /** 幂等创建 / 返回内置 Claude provider（未配置卡上点「登录 Claude 订阅」时先建条目） */
   ensureOfficialClaude: () =>
     api<Provider>('/providers/official/claude/ensure', { method: 'POST' }),
+
+  // ---- Google（Gemini Code Assist）订阅登录 · 动态端口回调 + 手动粘贴兜底 ----
+  /**
+   * 查官方 Google 订阅 provider。未创建 ⇒ 204 无 body ⇒ 归一化成 null。
+   * ⛔ 纯读：不创建条目、不发起登录。
+   */
+  officialGoogle: () =>
+    api<Provider | null>('/providers/official/google').then((p) => p ?? null),
+
+  /** 幂等创建 / 返回官方 Google 订阅 provider（仅用户显式点登录时调用） */
+  ensureOfficialGoogle: () =>
+    api<Provider>('/providers/official/google/ensure', { method: 'POST' }),
+
+  /** 取 Google 授权地址 + 在途过期时刻（epoch ms）；后端同时起动态端口回调监听，前端只负责打开浏览器 */
+  oauthGoogleAuthorize: (id: string) =>
+    api<GoogleOAuthAuthorizeResponse>(`/providers/${encodeURIComponent(id)}/oauth/google/authorize`,
+      { method: 'POST' }),
+
+  /** 提交用户粘回的整条回调 URL（或裸 code）；失败 400 ⇒ 抛 ApiError */
+  oauthGoogleComplete: (id: string, input: string) =>
+    api<OAuthCompleteResponse>(`/providers/${encodeURIComponent(id)}/oauth/google/complete`,
+      { method: 'POST', body: { input } }),
+
+  /** Google 登录状态（纯只读，无刷新/认证副作用）；project 与五态以本接口为准 */
+  oauthGoogleStatus: (id: string) =>
+    api<GoogleOAuthStatus>(`/providers/${encodeURIComponent(id)}/oauth/google/status`),
+
+  /** 退出 Google 订阅登录（204 无 body；清凭据 + project + 在途 state） */
+  oauthGoogleLogout: (id: string) =>
+    api<void>(`/providers/${encodeURIComponent(id)}/oauth/google`, { method: 'DELETE' }),
 
   // ---- 官方内置 Codex provider（方案 A：列表顶部固定卡片）----
   /**

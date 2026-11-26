@@ -864,6 +864,21 @@ export function KbDocDrawer({ knowledge, onClose, showToast, initialChunkId }: P
     }
   }, [showToast])
 
+  /**
+   * 重试单个后处理子任务（卡片视图用）。
+   *
+   * <p>只对 `kb_ingest_task` 有行的类型有效；主阶段失败仍走 `retryParse`（全流程）。
+   */
+  const retrySubtask = useCallback(async (id: string, taskType: string) => {
+    try {
+      await knowledgeApi.retrySubtask(id, taskType)
+      showToast(`已提交重试：${taskType}`, 'success')
+    } catch (e) {
+      showToast(`重试失败：${errorText(e)}`, 'info')
+      throw e
+    }
+  }, [showToast])
+
   // ── 宽度：初值从 localStorage 读（源站 :372-383）────────────────────
   useEffect(() => {
     try {
@@ -1929,6 +1944,7 @@ export function KbDocDrawer({ knowledge, onClose, showToast, initialChunkId }: P
                 onClose={() => setTraceOpen(false)}
                 fetchSpans={fetchSpans}
                 onRetryParse={retryParse}
+                onRetrySubtask={retrySubtask}
                 showToast={showToast}
                 onOpenAssistant={openAssistantWith}
               />

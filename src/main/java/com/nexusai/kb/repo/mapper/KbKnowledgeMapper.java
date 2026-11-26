@@ -3,6 +3,8 @@ package com.nexusai.kb.repo.mapper;
 import com.mybatisflex.core.BaseMapper;
 import com.nexusai.kb.repo.entity.KbKnowledgeRecord;
 import org.apache.ibatis.annotations.Param;
+import org.apache.ibatis.annotations.Result;
+import org.apache.ibatis.annotations.Results;
 import org.apache.ibatis.annotations.Select;
 import org.apache.ibatis.annotations.Update;
 
@@ -147,4 +149,34 @@ public interface KbKnowledgeMapper extends BaseMapper<KbKnowledgeRecord> {
      */
     @Select("SELECT parse_attempt FROM kb_knowledge WHERE id = #{id} AND deleted = 0")
     Integer selectParseAttempt(@Param("id") String id);
+
+    /**
+     * 库级入库进度聚合（进度条 / chip 筛选用，一次查询）。
+     *
+     * <p>⭐ {@code ready} 必须叠 {@code pending_subtasks_count = 0}：
+     * 后处理子任务在跑时状态已是 completed，只看状态会把收尾中的文档算成已完成。
+     *
+     * <p>⚠️ 显式 {@code @Results}：DTO 只有 public 字段没有 setter，
+     * 依赖驼峰自动映射时实测 {@code waiting_post / pending_subtasks} 两个字段没被写入（恒 0）。
+     */
+    @Select("SELECT COUNT(*) AS total, "
+        + "COALESCE(SUM(CASE WHEN parse_status IN ('pending', 'unprocessed') THEN 1 ELSE 0 END), 0) AS queued, "
+        + "COALESCE(SUM(CASE WHEN parse_status IN ('processing', 'finalizing') THEN 1 ELSE 0 END), 0) AS processing, "
+        + "COALESCE(SUM(CASE WHEN parse_status = 'completed' AND COALESCE(pending_subtasks_count, 0) = 0 THEN 1 ELSE 0 END), 0) AS ready, "
+        + "COALESCE(SUM(CASE WHEN parse_status = 'completed' AND COALESCE(pending_subtasks_count, 0) > 0 THEN 1 ELSE 0 END), 0) AS waiting_post, "
+        + "COALESCE(SUM(CASE WHEN parse_status = 'failed' THEN 1 ELSE 0 END), 0) AS failed, "
+        + "COALESCE(SUM(CASE WHEN parse_status = 'cancelled' THEN 1 ELSE 0 END), 0) AS cancelled, "
+        + "COALESCE(SUM(COALESCE(pending_subtasks_count, 0)), 0) AS pending_subtasks "
+        + "FROM kb_knowledge WHERE knowledge_base_id = #{kbId} AND deleted = 0")
+    @Results({
+        @Result(column = "total", property = "total"),
+        @Result(column = "queued", property = "queued"),
+        @Result(column = "processing", property = "processing"),
+        @Result(column = "ready", property = "ready"),
+        @Result(column = "waiting_post", property = "waitingPost"),
+        @Result(column = "failed", property = "failed"),
+        @Result(column = "cancelled", property = "cancelled"),
+        @Result(column = "pending_subtasks", property = "pendingSubtasks")
+    })
+    com.nexusai.kb.dto.KbIngestProgressDto selectIngestProgress(@Param("kbId") String kbId);
 }

@@ -293,6 +293,46 @@ describe('[用户消息编辑重发]', () => {
     expect(call[3]).toEqual([{ type: 'image', base64: 'AAAA', mediaType: 'image/png' }])
   })
 
+  it('⭐ 编辑态不在气泡上方重复渲染附件行（同一张图只出现一次）', async () => {
+    // WHY（用户 2026-11-26 报）：编辑框里删掉图片后，气泡上方那行原图还在 —— 同一张图出现两次，
+    //   删了也像没删。编辑态的附件由 `.user-edit-attach`（带删除、尊重 editRemoved）承载，
+    //   上方 `.user-files` 行必须整行不渲染。变异点：去掉 `!editing &&` → 本用例红。
+    const withImage: ChatMessageDto = {
+      ...userMsg('u1', '看这张图'),
+      imageData: [{ base64: 'AAAA', mediaType: 'image/png' }],
+    }
+    renderList([withImage], vi.fn(async () => {}))
+    // 非编辑态：图片走上方附件行
+    expect(container.querySelectorAll('.user-files .user-file-image').length).toBe(1)
+
+    hover()
+    act(() => { editBtn()!.click() })
+
+    expect(container.querySelector('.user-files'), '编辑态上方不应再显示附件行').toBeNull()
+    expect(container.querySelectorAll('.user-edit-thumb').length, '编辑框里仍能看到原图').toBe(1)
+  })
+
+  it('⭐ 文档附件同样只显示一次（编辑态上方附件行整行不渲染）', async () => {
+    // 用户 2026-11-26 补充：「包括文档也是一样的」—— 文档卡也走同一条 `.user-files` 行，
+    //   编辑态只保留编辑框里的可移除卡片，上方不再重复。
+    const withDoc: ChatMessageDto = {
+      ...userMsg('u1', '看这份报告'),
+      userAttachments: [
+        { type: 'pdf', filename: 'report.pdf', mediaType: 'application/pdf', contentId: '1', url: '/attachments/content/x/1', base64: null, path: null },
+      ],
+    }
+    renderList([withDoc], vi.fn(async () => {}))
+    expect(container.querySelectorAll('.user-files .attach-file-card').length, '非编辑态：文档卡在附件行').toBe(1)
+
+    hover()
+    act(() => { editBtn()!.click() })
+
+    expect(container.querySelector('.user-files'), '编辑态上方不应再显示文档卡').toBeNull()
+    const chips = container.querySelectorAll('.user-edit-file')
+    expect(chips.length, '编辑框里保留可移除的文档卡').toBe(1)
+    expect(chips[0].textContent).toContain('report.pdf')
+  })
+
   it('⭐ 编辑态粘贴图片 → 出现待发缩略图，重发时作为附件带上（纯 base64，非 dataURL）', async () => {
     // WHY（用户 2026-11-06 报「点击编辑用户消息无法粘贴图片」）：
     //   编辑态此前只有一个 textarea —— 连 onPaste 都没有 ⇒ 用户在编辑时完全无法补图。

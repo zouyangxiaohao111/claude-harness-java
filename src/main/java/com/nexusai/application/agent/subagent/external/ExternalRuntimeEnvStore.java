@@ -139,9 +139,17 @@ public final class ExternalRuntimeEnvStore {
             String value = e.getValue();
             if (name == null || value == null || value.isBlank()) continue;
             if ("__default__".equals(name)) {
-                // 旧构造：塞进该 CLI 的第一个 key 变量
-                if (!preset.apiKeyEnvs().isEmpty()) {
-                    env.put(preset.apiKeyEnvs().get(0), value.trim());
+                // 旧构造：同一个 key 写入该 CLI 认的**全部**别名变量。
+                // WHY 全部而不是第一个（2026-11-26 真机）：codex 预设是
+                // [CODEX_API_KEY, OPENAI_API_KEY]，而用户的 ~/.codex/config.toml 用
+                // env_key = "OPENAI_API_KEY"（DeepSeek provider）—— 只写第一个 ⇒ codex
+                // 报 Missing environment variable: OPENAI_API_KEY，用户配了 key 却调不通。
+                // claude 的 ANTHROPIC_API_KEY / ANTHROPIC_AUTH_TOKEN 同理。
+                // ⛔ 只 set 这几个名字，不动进程里其它环境变量；值不打印、不落库。
+                for (String envName : preset.apiKeyEnvs()) {
+                    if (envName != null && !envName.isBlank()) {
+                        env.put(envName, value.trim());
+                    }
                 }
                 continue;
             }

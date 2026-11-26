@@ -307,8 +307,23 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
             // [2026-11-25 Windows 实测] 先落一行日志：若日志里没有这行，说明**菜单事件根本没到**，
             //   问题在托盘注册而不是退出逻辑 —— 别再盲改 app.exit 一侧。
             backend::log_launcher("[托盘退出] 收到退出菜单事件");
-            let plan = quit_plan(app.state::<BackendState>().0.lock().unwrap().take());
-            // 先放行关闭钩子，再关窗 —— 顺序不能反（反了钩子会把这次关闭也当成「隐藏」）
+            let mut plan = quit_plan(app.state::<BackendState>().0.lock().unwrap().take());
+            // [2026-11-26 Win10 实测] 内存拿不到 pid（启动期 3458 被占跳过自启 / 状态已被
+            //   关窗钩子 take 走）⇒ 从 pid 文件读回 + 身份校验，否则退出根本不杀 Java。
+            if plan.backend_pid.is_none() {
+                plan.backend_pid = backend::read_verified_backend_pid();
+                if let Some(p) = plan.backend_pid {
+                    backend::log_launcher(&format!("[托盘退出] 内存无 pid，从 pid 文件兜底 pid={}", p));
+                }
+            }
+            // ⛔⛔ 先杀后端，再关窗 —— 顺序是 Win10「右键退出杀不掉 Java」的根因修复：
+            //   关主窗（唯一窗口）会触发 Tauri ExitRequested 提前退出事件循环；若先 close
+            //   再 kill，后面那行 kill 可能根本不执行 ⇒ Java 成孤儿，只能任务管理器杀。
+            if let Some(p) = plan.backend_pid {
+                backend::log_launcher(&format!("托盘退出，回收后端进程树 pid={}", p));
+                backend::kill_process_tree(p);
+            }
+            // 放行关闭钩子，再关窗（钩子放行必须在 close 之前，否则这次关闭被当成「隐藏」）
             if plan.release_close_hook {
                 app.state::<HideOnClose>()
                     .0
@@ -319,25 +334,26 @@ fn handle_menu_event(app: &tauri::AppHandle, event: tauri::menu::MenuEvent) {
                 // close() 在个别环境下会被 WebView 侧（beforeunload 等）拦下 ⇒ 再强制销毁一次
                 let _ = window.destroy();
             }
-            // 兜底回收后端：窗口已隐藏时 close 不触发钩子 ⇒ 这里补杀（take 幂等）
-            if let Some(p) = plan.backend_pid {
-                backend::log_launcher(&format!("托盘退出，回收后端进程树 pid={}", p));
-                backend::kill_process_tree(p);
-            }
             // ⛔ 必须结束进程：托盘常驻 ⇒ 关掉所有窗口不会结束进程（详见 quit_plan 的文档）
             if plan.exit_process {
                 app.exit(0);
-                // [2026-11-25 Windows 实测「右键退出后进程还在」] 兜底看门狗：
-                //   Tauri 的 exit 在个别 Windows 环境会被托盘/单实例插件挂住，事件循环不结束。
-                //   1.2s 后仍在 ⇒ 再 exit 一次；再等 800ms 还在 ⇒ 直接结束本进程。
-                //   后端进程树已在上面 kill 完，所以这里强杀不会留孤儿。
+                // 兜底看门狗：Tauri exit 在个别 Windows 环境被托盘/单实例插件挂住 ⇒ 强制退出。
+                //   [2026-11-26] 看门狗**也再杀一次后端**：万一首次 kill 因竞态/提权失败，
+                //   这里补杀，确保壳强退时不留 Java 孤儿。
                 let h = app.clone();
+                let wp = plan.backend_pid;
                 std::thread::spawn(move || {
                     std::thread::sleep(std::time::Duration::from_millis(1200));
-                    backend::log_launcher("[托盘退出] app.exit 后 1.2s 仍在运行 → 再次 exit");
+                    backend::log_launcher("[托盘退出] app.exit 后 1.2s 仍在运行 → 补杀后端 + 再次 exit");
+                    if let Some(p) = wp {
+                        backend::kill_process_tree(p);
+                    }
                     h.exit(0);
                     std::thread::sleep(std::time::Duration::from_millis(800));
-                    backend::log_launcher("[托盘退出] 仍未退出 → 强制结束本进程");
+                    backend::log_launcher("[托盘退出] 仍未退出 → 补杀后端 + 强制结束本进程");
+                    if let Some(p) = wp {
+                        backend::kill_process_tree(p);
+                    }
                     std::process::exit(0);
                 });
             }
@@ -849,6 +865,30 @@ mod tests {
         let plan = quit_plan(None);
         assert!(plan.exit_process, "无后端 pid 也必须结束进程");
         assert_eq!(plan.backend_pid, None);
+    }
+
+    /// ⭐ [2026-11-26 Win10「右键退出杀不掉 Java」根因回归] 退出段里**必须先杀后端、再关窗**。
+    /// WHY：关主窗（唯一窗口）触发 Tauri ExitRequested 提前退出事件循环；若先 close 再 kill，
+    ///   kill 那行可能根本不执行 ⇒ Java 成孤儿。此测试锁住源码顺序，防回退到错误次序。
+    #[test]
+    fn tray_quit_kills_backend_before_closing_window() {
+        let src = include_str!("main.rs");
+        let prod = src.split("#[cfg(test)]").next().unwrap_or("");
+        let quit_pos = prod.find("TRAY_MENU_QUIT =>").expect("托盘退出菜单项必须存在");
+        let after = &prod[quit_pos..];
+        let quit_end = after.find("\n        other =>").unwrap_or(after.len());
+        let seg = &after[..quit_end];
+        let kill_pos = seg.find("kill_process_tree").expect("退出段必须回收后端");
+        let close_pos = seg.find("window.close()").expect("退出段必须关窗");
+        assert!(
+            kill_pos < close_pos,
+            "必须先 kill_process_tree 再 window.close()：反了会因 ExitRequested 提前退出而漏杀 Java"
+        );
+        // pid 文件兜底必须在场（内存拿不到 pid 时仍能杀）
+        assert!(
+            seg.contains("read_verified_backend_pid"),
+            "退出必须有 pid 文件兜底，否则 3458 被占跳过自启时退出不杀 Java"
+        );
     }
 
     /// 独立预览子窗口（PDF/Word/HTML/Excel/图片）关闭 → **绝不**回收后端。

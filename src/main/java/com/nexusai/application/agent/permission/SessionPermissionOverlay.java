@@ -182,6 +182,79 @@ public final class SessionPermissionOverlay {
     }
 
     /**
+     * [coordinator-preserveMode 2026-11-26] 过滤掉 SetMode 更新 —— worker（子代理/teammate）
+     * 弹窗授权写回 leader 时不得改变 leader 的模式。
+     *
+     * <p><b>CC 真源</b>：{@code inProcessRunner.ts:283-288} worker onAllow 写回 leader 共享上下文时
+     * <b>无条件</b> {@code setToolPermissionContext(updatedContext, { preserveMode: true })}——
+     * 「Preserve the leader's mode to prevent workers' transformed 'acceptEdits' context from
+     * leaking back to the coordinator」。即使 updates 含 setMode（用户在 worker 弹窗里点了
+     * 「本次会话允许编辑」），leader 的 mode 也不变；规则/目录类更新照常生效。
+     * 用户在协调者终端主动切模式（胶囊/Shift+Tab）走的是另一条路径，不经本过滤。
+     *
+     * <p><b>本仓落点</b>：两个等价写回单点（{@code WebSocketPermissionPrompter.applyAndPersistUpdates}
+     * 用户弹窗批准 / {@code ToolPermissionGate.applyAndPersistPermissionUpdates} hook/coordinator/swarm
+     * allow）在 {@code ctx.agentId() != null}（worker 归因）时先经本方法过滤——SetMode 不进会话列、
+     * 不进 apply、不进 persist，leader 的跨 send 模式承载（V75 列）不被 worker 弹窗污染。
+     *
+     * @param updates 批准的权限更新（可 null/空）
+     * @return 仅保留非 SetMode 的新列表（原列表不变）
+     */
+    public static List<PermissionUpdate> withoutSetMode(List<PermissionUpdate> updates) {
+        if (updates == null || updates.isEmpty()) {
+            return List.of();
+        }
+        List<PermissionUpdate> filtered = new ArrayList<>(updates.size());
+        for (PermissionUpdate update : updates) {
+            if (update != null && !(update instanceof PermissionUpdate.SetMode)) {
+                filtered.add(update);
+            }
+        }
+        return filtered;
+    }
+
+    /**
+     * [coordinator-preserveMode 2026-11-26] appState 写回时保留 leader 当前 mode ——
+     * CC {@code REPL.tsx:2858} {@code mode: options?.preserveMode ? prev.toolPermissionContext.mode
+     * : context.mode} 的等价。
+     *
+     * <p>worker 路径的 applied ctx 携带 worker 自己的 mode（可能经变换，如 acceptEdits/DEFAULT），
+     * 直接 put 进 leader appState 会经 {@code AgentLoopContext.mergeAppStatePermissionRules:1776}
+     * 「appState 侧 mode 胜出」压掉 leader 的有效模式。本方法在 prev 快照已有 toolPermissionContext
+     * 时以其 mode 重建 applied（其余 10 字段原样保留，整字段重建先例 =
+     * {@code BypassPermissionsKillswitch.createDisabledBypassPermissionsContext}）；
+     * prev 无 toolPermissionContext → 原样返回（无 leader mode 可保，不凭空造）。
+     *
+     * @param applied      apply 后的上下文（规则/目录已更新）
+     * @param prevAppState setAppState 的 prev 快照（可 null）
+     * @return mode 保留 leader 值的上下文；无需变更时返回原引用
+     */
+    public static ToolPermissionContext withPreservedMode(
+            ToolPermissionContext applied, Map<String, Object> prevAppState) {
+        if (applied == null || prevAppState == null) {
+            return applied;
+        }
+        if (!(prevAppState.get("toolPermissionContext") instanceof ToolPermissionContext prevTpc)) {
+            return applied;
+        }
+        if (prevTpc.mode() == applied.mode()) {
+            return applied;
+        }
+        return new ToolPermissionContext(
+                prevTpc.mode(),
+                applied.alwaysAllowRules(),
+                applied.alwaysDenyRules(),
+                applied.alwaysAskRules(),
+                applied.additionalWorkingDirectories(),
+                applied.isBypassPermissionsModeAvailable(),
+                applied.isAutoModeAvailable(),
+                applied.strippedDangerousRules(),
+                applied.shouldAvoidPermissionPrompts(),
+                applied.awaitAutomatedChecksBeforeDialog(),
+                applied.prePlanMode());
+    }
+
+    /**
      * [权限胶囊切换] 把会话列里<b>已有</b>的 SESSION setMode 同步成用户显式选择的模式。
      *
      * <p><b>WHY</b>：V75 {@code session_permission_rules} 的 SESSION setMode 在 per-turn 合并中

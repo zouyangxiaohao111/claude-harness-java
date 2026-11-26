@@ -850,6 +850,24 @@ public class ToolPermissionGate {
         if (updates == null || updates.isEmpty()) {
             return;
         }
+        // [coordinator-preserveMode 2026-11-26] worker（子代理/teammate，agentId 非空）写回 leader：
+        //   过滤 SetMode（CC inProcessRunner.ts:283-288 无条件 preserveMode: true）——worker 的
+        //   变换 mode 不得经会话列/appState 泄漏回协调者。leader 自身路径（agentId=null，含
+        //   coordinator allow）不过滤。⛔ 与 WebSocketPermissionPrompter.applyAndPersistUpdates
+        //   是两个等价单点，两处同步挂钩（本仓上一批栽在只覆盖一侧）。
+        boolean workerPath = ctx != null && ctx.agentId() != null;
+        if (workerPath) {
+            int before = updates.size();
+            updates = SessionPermissionOverlay.withoutSetMode(updates);
+            if (before != updates.size()) {
+                log.info("PERMISSION gate worker 写回 preserveMode: 过滤 SetMode callId={} dropped={} kept={}"
+                    + "（CC inProcessRunner.ts:286 leader mode 不被 worker 改变）",
+                    toolUseId, before - updates.size(), updates.size());
+            }
+            if (updates.isEmpty()) {
+                return;
+            }
+        }
         // 0) [批 A2b] destination=SESSION 的更新写入 sessions.session_permission_rules（V75 列）——
         //    会话列是跨 send 唯一通道（LlmAgentLoop prototype 每 send 新实例 ⇒ appStateRef 恒空），
         //    由 LlmAgentLoop.doRun 回读注入 appStateRef.toolPermissionContext（A2 再并进 per-turn ctx）。
@@ -905,11 +923,15 @@ public class ToolPermissionGate {
             }
         }
         // CC setAppState 同步 (permissions.ts:448-451)
+        // [coordinator-preserveMode] worker 路径 mode 保留 leader 当前值（CC REPL.tsx:2858）。
         if (ctx != null && ctx.setAppState() != null) {
             final ToolPermissionContext finalCtx = applied;
+            final boolean preserveMode = workerPath;
             ctx.setAppState().accept(prev -> {
                 Map<String, Object> next = new java.util.LinkedHashMap<>(prev);
-                next.put("toolPermissionContext", finalCtx);
+                next.put("toolPermissionContext", preserveMode
+                    ? SessionPermissionOverlay.withPreservedMode(finalCtx, prev)
+                    : finalCtx);
                 return next;
             });
         }

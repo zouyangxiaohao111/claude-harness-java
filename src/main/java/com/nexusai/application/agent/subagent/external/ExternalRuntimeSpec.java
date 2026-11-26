@@ -145,9 +145,60 @@ public record ExternalRuntimeSpec(
         }
 
         // 连接信息唯一来源：设置页（未配置 ⇒ 空 map ⇒ CLI 用自己的默认配置/登录态）
-        Map<String, String> runtimeEnv = ExternalRuntimeEnvStore.envFor(preset);
+        Map<String, String> runtimeEnv = new LinkedHashMap<>(ExternalRuntimeEnvStore.envFor(preset));
+        // 出站代理：agy 等需要访问 Google 的 CLI 在本机直连不通（2026-11-26 实测），
+        //   必须继承应用的出站代理配置。未配置 ⇒ 什么都不加（⛔ 不注入空串 —— 部分 CLI
+        //   会把空串当成「显式直连」而覆盖自身默认）。
+        runtimeEnv.putAll(outboundProxyEnv());
         return new Resolution(new ExternalRuntimeSpec(rt, resolvedBin, List.copyOf(argv),
-                def.promptVia(), streamFormat, def.timeoutMs(), runtimeEnv, def.capabilities()), null);
+                def.promptVia(), streamFormat, def.timeoutMs(), Map.copyOf(runtimeEnv), def.capabilities()), null);
+    }
+
+    /**
+     * 子进程要继承的出站代理环境变量 · 来源 = 应用统一的出站代理配置。
+     *
+     * <p><b>为什么不读 setProperty / 硬编码</b>：{@link com.nexusai.infra.llm.OutboundProxy}
+     * 的优先级是「设置页 {@code settings.http_proxy} → 进程环境变量 → 无（直连）」，
+     * 用户在界面里改了就生效。⛔ 不在这里写死 {@code 127.0.0.1:7897}：那是本机开发环境的
+     * Clash 端口，不是产品事实。
+     *
+     * <p>大小写各写一份：Node/Go/Rust 的 HTTP 栈对 {@code HTTPS_PROXY} 与 {@code https_proxy}
+     * 的识别并不一致，只写一种会在某些 CLI 里静默不生效。
+     *
+     * @return 代理已配置 ⇒ 四个代理变量；未配置 ⇒ 空 map（不注入）
+     */
+    public static Map<String, String> outboundProxyEnv() {
+        try {
+            java.net.Proxy proxy = com.nexusai.infra.llm.OutboundProxy.httpProxy();
+            if (proxy == null || !(proxy.address() instanceof java.net.InetSocketAddress addr)) {
+                return Map.of();
+            }
+            String host = addr.getHostString();
+            if (host == null || host.isBlank() || addr.getPort() <= 0) {
+                return Map.of();
+            }
+            return proxyEnvFrom("http://" + host + ":" + addr.getPort());
+        } catch (RuntimeException e) {
+            // 代理解析失败不能拖垮外部运行时启动（宁可直连，让 CLI 自己报连接错误）
+            return Map.of();
+        }
+    }
+
+    /**
+     * 纯函数 · 代理 URL → 子进程 env（两态单测用；不读任何全局状态）。
+     *
+     * @param proxyUrl 形如 {@code http://host:port}；null/空白 ⇒ 空 map
+     */
+    static Map<String, String> proxyEnvFrom(String proxyUrl) {
+        if (proxyUrl == null || proxyUrl.isBlank()) {
+            return Map.of();
+        }
+        Map<String, String> env = new LinkedHashMap<>(4);
+        env.put("HTTP_PROXY", proxyUrl);
+        env.put("HTTPS_PROXY", proxyUrl);
+        env.put("http_proxy", proxyUrl);
+        env.put("https_proxy", proxyUrl);
+        return env;
     }
 
     /**

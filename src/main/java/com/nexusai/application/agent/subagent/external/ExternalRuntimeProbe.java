@@ -93,6 +93,25 @@ public final class ExternalRuntimeProbe {
      *
      * @return 模型列表（去重、保序，带各自的推理档位）；不支持或失败返回空列表（调用方回落内置列表）
      */
+    // 模型清单解析策略表（用户 2026-11-26 要求策略化）：dispatcher 只按 runtime 查表，
+    // 不再 switch。新增一家 = 加一个 parse 方法 + 一行注册。
+    // ⛔ 普通 interface + 静态 Map，不进 Spring / 无 SPI 扫描。
+    /** 一种 CLI 的模型输出解析策略。 */
+    interface ModelListParser {
+        List<ModelInfo> parse(String stdout);
+    }
+
+    /** key = preset.runtime()（大小写敏感，与旧 switch 字面量一致）。 */
+    private static final Map<String, ModelListParser> MODEL_LIST_PARSERS = Map.of(
+            "codex", ExternalRuntimeProbe::parseCodexModels,
+            "opencode", ExternalRuntimeProbe::parseOpenCodeModels,
+            "pi", ExternalRuntimeProbe::parsePiModels,
+            "agy", ExternalRuntimeProbe::parseAgyModels);
+
+    /** 未注册运行时的兜底：逐行取第一个像模型 id 的 token。 */
+    private static final ModelListParser DEFAULT_MODEL_LIST_PARSER =
+            ExternalRuntimeProbe::parseModelLines;
+
     public static List<ModelInfo> listModels(ExternalRuntimeCatalog.RuntimePreset preset,
                                              String binPath, Map<String, String> env) {
         if (preset == null || preset.listModelsArgs().isEmpty()) return List.of();
@@ -108,12 +127,9 @@ public final class ExternalRuntimeProbe {
                     preset.runtime(), result.error());
             return List.of();
         }
-        List<ModelInfo> parsed = switch (preset.runtime()) {
-            case "codex" -> parseCodexModels(result.stdout());
-            case "opencode" -> parseOpenCodeModels(result.stdout());
-            case "pi" -> parsePiModels(result.stdout());
-            default -> parseModelLines(result.stdout());
-        };
+        ModelListParser parser = MODEL_LIST_PARSERS.getOrDefault(
+                preset.runtime(), DEFAULT_MODEL_LIST_PARSER);
+        List<ModelInfo> parsed = parser.parse(result.stdout());
         log.info("[ExternalRuntimeProbe] {} 实时模型 {} 个", preset.runtime(), parsed.size());
         return parsed;
     }
@@ -172,14 +188,26 @@ public final class ExternalRuntimeProbe {
         Exec result = exec(argv, TEST_TIMEOUT_MS, env);
         long ms = System.currentTimeMillis() - start;
         if (!result.ok()) {
+            // [cli-error-signal 2026-11-26] 非 0 退出也要先把 CLI 自报错误挖出来：
+            //   agy 的失败是 result.status=ERROR + error 文本，只报「退出码 1」无法排障。
+            String cliError = ExternalStreamParser.parse(
+                    preset.streamFormat(), result.stdout()).error();
+            if (cliError != null && !cliError.isBlank()) {
+                return new TestResult(false, preset.displayName() + " 执行失败：" + cliError, ms, null);
+            }
             return new TestResult(false, humanizeFailure(preset, result), ms, null);
         }
         ExternalStreamParser.Parsed parsed = ExternalStreamParser.parse(
                 preset.streamFormat(), result.stdout());
         String answer = parsed.text() == null ? "" : parsed.text().trim();
         if (answer.isEmpty()) {
-            return new TestResult(false,
-                    preset.displayName() + " 没有返回任何正文（可能登录态失效或参数不匹配）", ms, null);
+            // [cli-error-signal 2026-11-26] 有 CLI 自报错误就把它给用户看：
+            //   claude 的 unrecognized_model 走 stdout 且退出码 0，只说「没有正文」查不出来。
+            String cliError = parsed.error();
+            String reason = (cliError == null || cliError.isBlank())
+                    ? "没有返回任何正文（可能登录态失效或参数不匹配）"
+                    : "执行失败：" + cliError;
+            return new TestResult(false, preset.displayName() + " " + reason, ms, null);
         }
         String sample = answer.length() > 80 ? answer.substring(0, 80) + "…" : answer;
         return new TestResult(true, null, ms, sample);
@@ -309,6 +337,30 @@ public final class ExternalRuntimeProbe {
         // pi 的 thinking 档位与会话级别无关（--thinking 是全局开关），这里留空由预设提供
         List<ModelInfo> result = new ArrayList<>(out.size());
         for (String id : out) result.add(new ModelInfo(id, List.of()));
+        return result;
+    }
+
+    /**
+     * agy {@code models}：每行 {@code modelId<TAB>Display Name}（2026-11-26 真机实测，27 条）。
+     *
+     * <p>未登录时该命令非 0 退出、stdout 里是 {@code Error: Please sign in ...} —— 本方法
+     * 会因为「整行含空格、不是单个 token」而不产出任何模型；上层 {@link #listModels} 已按
+     * 退出码判失败并返回空列表 ⇒ controller 回落预设的 {@code fallbackModels}。
+     * ⛔ 不要把错误行当成模型 id 收进来。
+     */
+    static List<ModelInfo> parseAgyModels(String stdout) {
+        LinkedHashSet<String> ids = new LinkedHashSet<>();
+        for (String line : stdout.split("\\R")) {
+            String t = line.trim();
+            if (t.isEmpty()) continue;
+            // 第一列是 id；显示名可有空格，按 TAB 切，不要按空白切
+            String id = t.split("\\t", 2)[0].trim();
+            if (id.matches("^[A-Za-z0-9][A-Za-z0-9._-]{1,63}$")) {
+                ids.add(id);
+            }
+        }
+        List<ModelInfo> result = new ArrayList<>(ids.size());
+        for (String id : ids) result.add(new ModelInfo(id, List.of()));
         return result;
     }
 

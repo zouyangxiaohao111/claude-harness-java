@@ -47,6 +47,7 @@ import com.nexusai.infra.llm.LlmProviderFactory;
 import com.nexusai.infra.llm.ModelConfigResolver;
 import com.nexusai.infra.llm.ModelNameResolver;
 import com.nexusai.infra.llm.ProviderConfig;
+import com.nexusai.infra.llm.ProviderConfigAssembler;
 import com.nexusai.infra.llm.UsageCategory;
 import com.nexusai.model.command.Command;
 import com.nexusai.model.session.dto.AttachmentRequest;
@@ -2993,6 +2994,9 @@ public class ChatService {
      *   <li>{@code codex_oauth} → baseUrl <b>强制</b> {@link #CODEX_OAUTH_BASE_URL}（用户填的
      *       baseUrl 被忽略），并注入 {@code chatgpt-account-id}（accountId 非空时才加）与
      *       {@code originator}。</li>
+     *   <li>{@code google_oauth} → 走 {@link ProviderConfigAssembler#forGoogleOAuth}：baseUrl
+     *       <b>强制</b> {@code https://cloudcode-pa.googleapis.com}，透传 {@code oauth_project}
+     *       （发请求必需），extraHeaders/extraBody 原义保留。</li>
      * </ul>
      *
      * <p><b>为什么复制成 {@code LinkedHashMap}</b>：{@code deserializeHeaders} 解析失败会返回
@@ -3005,6 +3009,12 @@ public class ChatService {
     static ProviderConfig assembleProviderConfig(ProviderRecord provider, String rawKey) {
         boolean codexOauth = ProviderService.AUTH_MODE_CODEX_OAUTH.equals(provider.getAuthMode());
         Map<String, String> baseHeaders = ProviderService.deserializeHeaders(provider.getExtraHeaders());
+        if (ProviderConfigAssembler.isGoogleOAuth(provider.getAuthMode())) {
+            // Google 订阅：baseUrl 强制 cloudcode-pa（用户填的不参与）+ project 同行透传；
+            // extraHeaders 原义保留。provider 级无 extraBody（那是 models.extra_body）。
+            return ProviderConfigAssembler.forGoogleOAuth(rawKey, provider.getOauthProject(),
+                baseHeaders, Map.of());
+        }
         if (!codexOauth) {
             return new ProviderConfig(provider.getBaseUrl(), rawKey, baseHeaders);
         }

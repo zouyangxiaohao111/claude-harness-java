@@ -68,6 +68,21 @@ public class KnowledgeBaseAdvancedController {
     @Autowired
     private KnowledgeBaseService knowledgeBaseService;
 
+    @Autowired
+    private com.nexusai.kb.repo.mapper.KbKnowledgeMapper kbKnowledgeMapper;
+
+    // ── 库级入库进度 ────────────────────────────────────────────────
+
+    /**
+     * 库级入库进度（进度条 + chip 筛选）。
+     *
+     * <p>一次聚合查询出全部计数，⛔ 不要让前端逐行拉 span 再自己累加。
+     */
+    @GetMapping("/api/v1/knowledge-bases/{id}/ingest-progress")
+    public com.nexusai.kb.dto.KbIngestProgressDto ingestProgress(@PathVariable String id) {
+        return kbKnowledgeMapper.selectIngestProgress(id);
+    }
+
     // ── 置顶 ────────────────────────────────────────────────────────
 
     @PutMapping("/api/v1/knowledge-bases/{id}/pin")

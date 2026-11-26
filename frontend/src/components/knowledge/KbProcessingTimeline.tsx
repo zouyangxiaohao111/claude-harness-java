@@ -50,6 +50,7 @@ import { shownStall, stalledMinutes, STALLED_POLL_INTERVAL_MS } from '@/utils/kn
 import { axisGridStepPct, buildAxisTicks, computeTraceAxis } from '@/utils/traceAxis'
 import { knowledgeApi } from '@/api/knowledge'
 import { AssistantActionButton } from './AssistantActionButton'
+import { KbStageFlowCards } from './KbStageFlowCards'
 
 type SpanNode = KnowledgeTraceNode
 
@@ -655,6 +656,8 @@ export interface KbProcessingTimelineProps {
   onClose?: () => void
   /** 「重新解析」。不传 ⇒ 工具栏与错误卡里的重试按钮都不渲染（避免点不动的死按钮）。 */
   onRetryParse?: (knowledgeId: string) => Promise<void> | void
+  /** 重试单个后处理子任务（`summary/question/wiki/auto_tag/graph` 才有独立任务行）。 */
+  onRetrySubtask?: (knowledgeId: string, taskType: string) => Promise<void> | void
   /** 复制到剪贴板。不传 ⇒ 走 `navigator.clipboard`。 */
   onCopy?: (text: string) => void
   /** 停止解析后的提示（本仓无 MessagePlugin，由宿主传入）。不传 ⇒ 不出提示。 */
@@ -673,6 +676,10 @@ interface FlatRow {
   isRoot: boolean
   isStage: boolean
   parentKey?: string
+  /** 同名叶子子任务合并后的条数（`postprocess.question ×38`）；undefined = 单条 */
+  count?: number
+  /** 合并行的耗时合计（单条时为 undefined，沿用 node.duration_ms） */
+  totalMs?: number
 }
 
 interface AttemptTab {
@@ -770,7 +777,40 @@ function buildFlatRows(root: SpanNode | null, expanded: Set<string>): FlatRow[] 
     })
     if (!expanded.has(stageKey)) continue
 
-    const walk = (n: SpanNode, depth: number, idxPath: string, parentKeyValue: string) => {
+    /**
+     * 同一 stage 下的**同名叶子子任务**合并成一行。
+     *
+     * <p>WHY：一篇文章的后处理会给每个 chunk 开一条 `postprocess.question`
+     * （实测 38 条），逐条列出来把整屏刷满、和卡片视图的「问句生成」一格差距太大
+     * （2026-11-26 用户问「时间轴为什么比卡片多了很多」）。
+     * 合并后行尾显示 `×N`，耗时取合计；展开后仍只有一行，点它看汇总。
+     */
+    const leafAgg = new Map<string, { node: SpanNode; count: number; totalMs: number }>()
+    const ordered: Array<{ node: SpanNode; count?: number; totalMs?: number }> = []
+    for (const c of stageChildren) {
+      if ((c.children || []).length === 0 && c.name) {
+        const hit = leafAgg.get(c.name)
+        if (hit) {
+          hit.count += 1
+          hit.totalMs += c.duration_ms ?? 0
+          continue
+        }
+        const rec = { node: c, count: 1, totalMs: c.duration_ms ?? 0 }
+        leafAgg.set(c.name, rec)
+        ordered.push({ node: c })
+        continue
+      }
+      ordered.push({ node: c })
+    }
+    for (const o of ordered) {
+      const rec = o.node.name ? leafAgg.get(o.node.name) : undefined
+      if (rec && rec.count > 1) {
+        o.count = rec.count
+        o.totalMs = rec.totalMs
+      }
+    }
+
+    const walk = (n: SpanNode, depth: number, idxPath: string, parentKeyValue: string, agg?: { count?: number; totalMs?: number }) => {
       const key = rowKey(n, `${idxPath}:${n.name}`)
       const kids = n.children || []
       rows.push({
@@ -781,11 +821,13 @@ function buildFlatRows(root: SpanNode | null, expanded: Set<string>): FlatRow[] 
         isRoot: false,
         isStage: false,
         parentKey: parentKeyValue,
+        count: agg?.count,
+        totalMs: agg?.totalMs,
       })
       if (!expanded.has(key)) return
       kids.forEach((c, i) => walk(c, depth + 1, `${idxPath}/${i}`, key))
     }
-    stageChildren.forEach((c, i) => walk(c, 2, `${stageKey}/${i}`, stageKey))
+    ordered.forEach((c, i) => walk(c.node, 2, `${stageKey}/${i}`, stageKey, { count: c.count, totalMs: c.totalMs }))
   }
 
   return rows
@@ -963,6 +1005,7 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
     showClose = false,
     fetchSpans: fetchSpansImpl,
     onRetryParse,
+    onRetrySubtask,
     onCopy,
     showToast,
     onOpenAssistant,
@@ -985,6 +1028,8 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
   const [cancelling, setCancelling] = useState(false)
   const [processOverrides, setProcessOverrides] = useState<KnowledgeProcessOverrides | null>(null)
   const [knowledgeFileType, setKnowledgeFileType] = useState('')
+  /** 视图切换：瀑布/甘特（原有）↔ 卡片流水。两种视图共用同一份 span 数据。 */
+  const [viewMode, setViewMode] = useState<'timeline' | 'cards'>('timeline')
 
   // 这几个必须有 ref 版本：fetchSpans 在 await 之后才读它们，而闭包里拿到的是发起请求
   // 那一刻的值；auto-expand / 自动选中必须读到「这次请求的结果」而不是上一次的。
@@ -1959,6 +2004,38 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
               </div>
 
               <div className="kp-head-actions">
+                {/* 视图切换（段控件）：瀑布/甘特（原有，用户自选保留）↔ 卡片流水 */}
+                <div
+                  role="group"
+                  aria-label="视图切换"
+                  style={{
+                    display: 'inline-flex', padding: 2, marginRight: 8, flexShrink: 0,
+                    borderRadius: 8, background: '#f1f3f5', border: '1px solid #e5e7eb',
+                  }}
+                >
+                  {(['timeline', 'cards'] as const).map((v) => {
+                    const on = viewMode === v
+                    return (
+                      <button
+                        key={v}
+                        type="button"
+                        aria-pressed={on}
+                        title={v === 'timeline' ? '时间轴（瀑布/甘特）' : '卡片流水（现在到哪一步）'}
+                        onClick={() => setViewMode(v)}
+                        style={{
+                          padding: '3px 12px', borderRadius: 6, border: 'none', fontSize: 12,
+                          lineHeight: '18px', whiteSpace: 'nowrap', cursor: 'pointer',
+                          background: on ? '#fff' : 'transparent',
+                          color: on ? '#1f2329' : '#646a73',
+                          fontWeight: on ? 600 : 400,
+                          boxShadow: on ? '0 1px 2px rgba(15,23,42,.08)' : 'none',
+                        }}
+                      >
+                        {v === 'timeline' ? '时间轴' : '卡片'}
+                      </button>
+                    )
+                  })}
+                </div>
                 <span
                   className="kp-proccfg-anchor"
                   onMouseEnter={() => setShowProcessConfig(true)}
@@ -2161,8 +2238,26 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
             ) : null}
           </div>
 
+          {/* ============== 卡片视图（与瀑布同源数据，切换用 display 避免重挂载）============== */}
+          <div className="kp-cards-body" style={{ display: viewMode === 'cards' ? undefined : 'none' }}>
+            <KbStageFlowCards
+              stages={stages}
+              postprocess={stages.find((s) => s.name === 'postprocess') ?? null}
+              parseStatus={parseStatus}
+              onRetrySubtask={
+                onRetrySubtask && knowledgeId
+                  ? (taskType: string) => onRetrySubtask(knowledgeId, taskType)
+                  : undefined
+              }
+              onRetryAll={onRetryParse && knowledgeId ? () => onRetryParse(knowledgeId) : undefined}
+            />
+          </div>
+
           {/* ============== 主体（瀑布图）============== */}
-          <div className={detailOpen ? 'kp-body kp-body-with-detail' : 'kp-body'}>
+          <div
+            className={detailOpen ? 'kp-body kp-body-with-detail' : 'kp-body'}
+            style={viewMode === 'cards' ? { display: 'none' } : undefined}
+          >
             {loading && !data ? (
               <div className="kp-state">
                 <span className="kp-loading" aria-label="加载中" />
@@ -2275,6 +2370,18 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
                             >
                               {rowLabel(row)}
                             </span>
+                            {row.count && row.count > 1 ? (
+                              <span
+                                className="kp-name-count"
+                                title={`${row.count} 个同名子任务已合并为一行`}
+                                style={{
+                                  marginLeft: 6, padding: '0 5px', borderRadius: 4,
+                                  background: '#eef1f4', color: '#646a73', fontSize: 11, lineHeight: '16px',
+                                }}
+                              >
+                                ×{row.count}
+                              </span>
+                            ) : null}
                             {rowKindLabel(row) ? (
                               <span className="kp-name-kind">{rowKindLabel(row)}</span>
                             ) : null}
@@ -2288,17 +2395,19 @@ export function KbProcessingTimeline(props: KbProcessingTimelineProps) {
                             <span>未执行</span>
                           ) : row.node.status === 'running' ? (
                             <span className="kp-running-time">
-                              {formatDuration(liveElapsedMs(row.node))}
+                              {formatDuration(row.totalMs ?? liveElapsedMs(row.node))}
                             </span>
                           ) : (
                             <span
                               title={
-                                postprocessElapsedMs(row.node, postprocessDisplayNow()) !== null
-                                  ? '含子任务'
-                                  : undefined
+                                row.totalMs != null
+                                  ? `${row.count} 个同名子任务合计`
+                                  : postprocessElapsedMs(row.node, postprocessDisplayNow()) !== null
+                                    ? '含子任务'
+                                    : undefined
                               }
                             >
-                              {formatSpanDuration(row.node, true)}
+                              {row.totalMs != null ? formatDuration(row.totalMs) : formatSpanDuration(row.node, true)}
                             </span>
                           )}
                         </div>

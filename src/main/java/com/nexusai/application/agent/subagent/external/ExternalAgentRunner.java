@@ -157,6 +157,15 @@ public final class ExternalAgentRunner {
 
             ExternalStreamParser.Parsed parsed = acc.freeze();
             String stderr = String.join("\n", stderrBuf);
+            // [cli-error-signal 2026-11-26] CLI 自己报的错误（claude 标签行 / codex error 事件 /
+            //   agy result.status=ERROR）。正文为空 ⇒ 这是唯一能给用户看的原因；
+            //   正文非空 ⇒ 仍算成功（codex 成功轮次会夹带 item error），只并入诊断。
+            String cliError = parsed.error();
+            if (cliError != null && !cliError.isBlank()) {
+                stderr = (stderr.isBlank() ? "" : stderr + "\n") + "[CLI error] " + cliError;
+                log.warn("[ExternalAgentRunner] {} CLI 报错（正文{}）: {}", spec.runtime(),
+                        parsed.text().isBlank() ? "为空" : "非空", abbreviate(cliError, 300));
+            }
             if (stderr.length() > STDERR_LIMIT) {
                 stderr = stderr.substring(stderr.length() - STDERR_LIMIT);
             }
@@ -166,12 +175,21 @@ public final class ExternalAgentRunner {
 
             if (exit != 0 && parsed.text().isBlank()) {
                 return fail("外部运行时 '" + spec.runtime() + "' 退出码 " + exit
+                                + (cliError == null || cliError.isBlank()
+                                        ? "" : "；CLI 报错: " + abbreviate(cliError, 800))
                                 + (stderr.isBlank() ? "" : "；stderr: " + abbreviate(stderr, 800)),
                         agentId, startMs);
             }
             // 退出码 0 但**没有任何正文** = 没答上来（2026-11-04 真机：pi 只吐 session 事件就退出）。
             // ⛔ 不能标 completed —— 上层会把空结论当成功，用户看到「已完成但没有回答」。
             if (parsed.text().isBlank()) {
+                // 优先报 CLI 自己的错误（可读原因），而不是笼统的「未返回任何正文」
+                if (cliError != null && !cliError.isBlank()) {
+                    return fail("外部运行时 '" + spec.runtime() + "' 执行失败："
+                                    + abbreviate(cliError, 800)
+                                    + (stderr.isBlank() ? "" : "；stderr: " + abbreviate(stderr, 800)),
+                            agentId, startMs);
+                }
                 return fail("外部运行时 '" + spec.runtime() + "' 未返回任何正文（exit=" + exit
                                 + (stderr.isBlank() ? "" : "；stderr: " + abbreviate(stderr, 800))
                                 + "）。可能是该 CLI 未登录/额度不足，或它只输出了元数据事件",

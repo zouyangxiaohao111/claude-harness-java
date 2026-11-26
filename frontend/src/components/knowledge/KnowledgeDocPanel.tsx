@@ -137,6 +137,11 @@ export function KnowledgeDocPanel({
   const [treeCollapsed, setTreeCollapsed] = useState(false)
   const [keyword, setKeyword] = useState('')
   const [statusFilter, setStatusFilter] = useState('')
+  /** 库级入库进度；接口 404/失败时为 null（隐藏进度条，不影响文档列表）。 */
+  const [ingest, setIngest] = useState<{
+    total: number; queued: number; processing: number; ready: number
+    waitingPost: number; failed: number; cancelled: number; pendingSubtasks: number
+  } | null>(null)
   const [typeFilter, setTypeFilter] = useState('')
   const [viewMode, setViewMode] = useState<ViewMode>(() => {
     try {
@@ -221,6 +226,18 @@ export function KnowledgeDocPanel({
     [baseId, keyword, statusFilter, typeFilter, folderPath]
   )
 
+  /**
+   * 库级进度：一次聚合查询。后端未重启时该接口 404 ⇒ 静默隐藏进度条，
+   * ⛔ 不要把错误弹到文档列表上。
+   */
+  const loadIngest = useCallback(async () => {
+    try {
+      setIngest(await knowledgeApi.getIngestProgress(baseId))
+    } catch {
+      setIngest(null)
+    }
+  }, [baseId])
+
   const loadFolders = useCallback(async () => {
     try {
       const r = await knowledgeApi.listFolders(baseId)
@@ -243,18 +260,25 @@ export function KnowledgeDocPanel({
     void loadItems()
     void loadFolders()
     void loadTags()
-  }, [loadItems, loadFolders, loadTags])
+    void loadIngest()
+  }, [loadItems, loadFolders, loadTags, loadIngest])
 
   // 只在有非终态条目时轮询（终态后停，避免无谓打接口）
   const hasInFlight = useMemo(
     () => items.some((k) => !['completed', 'failed', 'cancelled'].includes(k.parse_status)),
     [items]
   )
+  /** 进度条此刻可见吗（= 还没全部就绪）。全部就绪后整块收起，也不再轮询它。 */
+  const ingestActive = !!ingest && ingest.total > 0 && ingest.ready < ingest.total
   useEffect(() => {
-    if (!hasInFlight) return
-    const timer = window.setInterval(() => void loadItems({ silent: true }), 2000)
+    if (!hasInFlight && !ingestActive) return
+    const timer = window.setInterval(() => {
+      void loadItems({ silent: true })
+      // 进度条还在显示 ⇒ 一起刷，直到「全部就绪」自动收掉
+      if (ingestActive) void loadIngest()
+    }, 2000)
     return () => window.clearInterval(timer)
-  }, [hasInFlight, loadItems])
+  }, [hasInFlight, ingestActive, loadItems, loadIngest])
 
   // 标签筛选是**客户端**过滤：后端列表接口没有 tag 参数（见 api/knowledge.ts 的
   // listKnowledge 契约），所以只在这一层筛。⚠️ 这意味着 total 仍是未筛的数。
@@ -666,6 +690,36 @@ export function KnowledgeDocPanel({
       {/* ── 右：文档区（源侧 .tag-content > .doc-card-area）──── */}
       <div className="tag-content">
       <div className="doc-card-area">
+        {/* 库级入库进度（一次聚合查询；全部就绪或接口不可用时整块不渲染）*/}
+        {ingestActive && ingest && (
+          <div
+            style={{
+              margin: '0 0 10px', padding: '10px 12px', borderRadius: 8,
+              border: '1px solid #e5e7eb', background: '#fff',
+            }}
+            aria-label="入库进度"
+          >
+            <div style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 12, color: '#1f2329', marginBottom: 6 }}>
+              <strong style={{ fontSize: 13 }}>{ingest.ready}</strong>
+              <span style={{ color: '#646a73' }}>/ {ingest.total} 已就绪</span>
+              <span style={{ flex: 1 }} />
+              {ingest.queued > 0 && <span style={{ color: '#646a73' }}>排队 {ingest.queued}</span>}
+              {ingest.processing > 0 && <span style={{ color: '#059669' }}>处理中 {ingest.processing}</span>}
+              {ingest.waitingPost > 0 && <span style={{ color: '#d97706' }}>待后处理 {ingest.waitingPost}</span>}
+              {ingest.failed > 0 && <span style={{ color: '#e11d48' }}>失败 {ingest.failed}</span>}
+            </div>
+            <div style={{ height: 6, borderRadius: 3, background: '#eef1f4', overflow: 'hidden' }}>
+              <div
+                style={{
+                  height: '100%',
+                  width: `${Math.round((ingest.ready / ingest.total) * 100)}%`,
+                  background: '#059669',
+                  transition: 'width .3s ease',
+                }}
+              />
+            </div>
+          </div>
+        )}
         {/* 工具条 + 文件夹路径（源侧 .doc-filter-bar，KnowledgeBase.vue:2544）*/}
         <div className="doc-filter-bar">
           <nav className="doc-folder-path" aria-label="文件夹路径">

@@ -149,13 +149,62 @@ public record AcpRuntimeSpec(
                 null, effectiveCwd, DEFAULT_TIMEOUT_MS, AcpPermissionBridge.POLICY_ASK), null);
     }
 
-    /** dsh 需要显式 profile；其它适配器默认无额外参数（由 md 的 args 自述）。 */
-    static List<String> defaultArgs(String resolvedBin) {
-        String name = Path.of(resolvedBin).getFileName().toString().toLowerCase();
-        if (name.startsWith("dsh")) {
+    // ────────────────── ACP 适配器 argv 策略 ──────────────────
+    // 为什么策略化（用户 2026-11-26）：原来按 bin 名 if/else；改成有序策略表后，
+    // 新增一家适配器 = 加一个实现类 + 挂进 ARGV_STRATEGIES，dispatcher 不感知任何一家。
+    // ⛔ 普通 interface + 静态 List，不进 Spring / 无 SPI 扫描。
+
+    /** 一种适配器的「默认 argv」策略（bin 名 → 附加参数）。 */
+    interface AcpArgvStrategy {
+        /** @param binName 已转小写的可执行文件名（含扩展名） */
+        boolean matches(String binName);
+
+        List<String> args();
+    }
+
+    /** dsh：需要显式 profile。 */
+    private static final class DshAcpArgv implements AcpArgvStrategy {
+        @Override public boolean matches(String binName) {
+            return binName.startsWith("dsh");
+        }
+        @Override public List<String> args() {
             return List.of("--profile", "acp");
         }
-        return List.of();
+    }
+
+    /** agy：ACP 入口是子命令 {@code acp}（{@code agy --help} 实测）。 */
+    private static final class AgyAcpArgv implements AcpArgvStrategy {
+        @Override public boolean matches(String binName) {
+            return binName.startsWith("agy");
+        }
+        @Override public List<String> args() {
+            return List.of("acp");
+        }
+    }
+
+    /** 兜底：其它适配器默认无额外参数（由 md 的 args 自述）。 */
+    private static final class DefaultAcpArgv implements AcpArgvStrategy {
+        @Override public boolean matches(String binName) {
+            return true;
+        }
+        @Override public List<String> args() {
+            return List.of();
+        }
+    }
+
+    /** 有序策略表：首个 matches 命中即用（Default 恒命中，必须排最后）。 */
+    private static final List<AcpArgvStrategy> ARGV_STRATEGIES = List.of(
+            new DshAcpArgv(), new AgyAcpArgv(), new DefaultAcpArgv());
+
+    /** 按可执行文件名选默认 argv。 */
+    static List<String> defaultArgs(String resolvedBin) {
+        String name = Path.of(resolvedBin).getFileName().toString().toLowerCase();
+        for (AcpArgvStrategy strategy : ARGV_STRATEGIES) {
+            if (strategy.matches(name)) {
+                return strategy.args();
+            }
+        }
+        return List.of(); // 不可达（Default 恒命中）
     }
 
     /**
@@ -186,6 +235,10 @@ public record AcpRuntimeSpec(
         env.put("PI_SUBAGENT_DEPTH", "1");
         env.put("NEXUSAI_SUBAGENT_MAX_DEPTH", "0");
         env.put("PI_SUBAGENT_MAX_DEPTH", "0");
+        // 出站代理：agy（Google）在本机直连不通，必须继承应用的出站代理配置
+        //   （设置页 settings.http_proxy → 环境变量 → 无）。未配置 ⇒ 不注入。
+        // ⛔ 与 ExternalRuntimeSpec.outboundProxyEnv 同源，别在这里另写一份解析。
+        env.putAll(com.nexusai.application.agent.subagent.external.ExternalRuntimeSpec.outboundProxyEnv());
         return Map.copyOf(env);
     }
 }

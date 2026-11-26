@@ -26,16 +26,47 @@ public final class ExternalStreamParser {
 
     private static final ObjectMapper JSON = new ObjectMapper();
 
+    /** 带命名空间的 CLI 诊断行（{@code [namespace:code] ...}）；单段 {@code [warn]} 不算。 */
+    private static final java.util.regex.Pattern TAGGED_DIAGNOSTIC =
+            java.util.regex.Pattern.compile("^\\[[A-Za-z0-9_.-]+:[A-Za-z0-9_.\\-/]+\\].*$",
+                    java.util.regex.Pattern.DOTALL);
+
+    /**
+     * 错误文案脱敏 · CLI 的报错里可能带 key/token，直接回显等于把它们写进 UI/日志。
+     *
+     * <p>只处理两种常见形态（宁可少遮不可漏遮）：
+     * {@code sk-xxxx} 形式的 key；{@code api_key/token/authorization/bearer} 后跟的值。
+     */
+    static String redact(String s) {
+        if (s == null || s.isBlank()) return s;
+        String out = s.replaceAll("(?i)\\bsk-[A-Za-z0-9_-]{8,}", "sk-****");
+        out = out.replaceAll("(?i)(api[_-]?key|access[_-]?token|auth[_-]?token|authorization|bearer)"
+                + "\\s*[:=]\\s*[^\\s\"',}]+", "$1=****");
+        // OAuth 登录链接里的流程令牌（agy 的 Eligibility 报错会带一条 Google 登录 URL）
+        out = out.replaceAll("(?i)([?&](?:plt|sarp|scc|code|state|access_token|id_token)=)[^&\\s]+",
+                "$1****");
+        return out;
+    }
+
     /**
      * 累积结果。
      *
      * @param text      拼出的正文（delta 累积或最终 result 覆盖）
      * @param reasoning 思考文本（thinking / reasoning）
      * @param toolCalls 工具调用序列（name + 原始参数 JSON 串）
+     * @param error     CLI 自己报的错误（已脱敏）；无错误 = null。
+     *                  ⚠️ 与 text 的关系：text 为空且 error 非空 ⇒ 本次没有答案；
+     *                  text 非空且 error 非空 ⇒ 仍算成功，error 只作诊断（codex 会在成功的库里
+     *                  夹带 item error，不能一律判失败）。
      */
-    public record Parsed(String text, String reasoning, List<ToolCall> toolCalls) {
+    public record Parsed(String text, String reasoning, List<ToolCall> toolCalls, String error) {
+        /** 兼容旧 3 参构造（既有测试/调用点）· 等价于「没有错误信号」。 */
+        public Parsed(String text, String reasoning, List<ToolCall> toolCalls) {
+            this(text, reasoning, toolCalls, null);
+        }
+
         public static Parsed empty() {
-            return new Parsed("", "", List.of());
+            return new Parsed("", "", List.of(), null);
         }
 
         public boolean isEmpty() {
@@ -45,6 +76,72 @@ public final class ExternalStreamParser {
     }
 
     public record ToolCall(String name, String arguments) {}
+
+    // ────────────────── 输出格式策略表 ──────────────────
+    // 为什么策略化（用户 2026-11-26）：格式分派原来散在 acceptLine/freeze 的 equalsIgnoreCase
+    // 判断里；改成「格式 → 策略」静态表后，调用方只查表，未知格式仍回落到容错策略（⛔ 不抛）。
+    // ⛔ 普通 interface + 静态 Map，不进 Spring / 无 SPI 扫描。
+    //
+    // ⚠️ 行为保真：当前实现对**所有非 plain 格式走同一个容错分发器**（claude/codex/pi/opencode
+    //   的事件形状在一个 acceptNode 里按事件特征识别，而不是按声明格式裁剪）。故 jsonl /
+    //   claude-stream-json / codex-jsonl / pi-jsonl 全部注册到同一个 StructuredFormat 实现 ——
+    //   拆成「按格式只认自己事件」的实现会**改变现有解析结果**，属行为变化，不做。
+    /** 一种输出格式的解析策略。 */
+    interface StreamFormatStrategy {
+        /** 处理一条已解析的 JSON 事件（plain 不需要）。 */
+        void accept(Accumulator acc, JsonNode node);
+
+        /** 是否需要尝试解析 JSON 行（plain = false，纯整段文本）。 */
+        default boolean parsesJson() {
+            return true;
+        }
+
+        /** 一条已知事件都没解析到正文时，是否把整段原始输出当答案（只有 plain）。 */
+        default boolean rawFallback() {
+            return false;
+        }
+    }
+
+    /** plain：不解析 JSON，整段 stdout 就是答案（dsh conductor 语义）。 */
+    private static final class PlainFormat implements StreamFormatStrategy {
+        @Override public void accept(Accumulator acc, JsonNode node) {
+            // 无操作：plain 不做事件解析
+        }
+        @Override public boolean parsesJson() {
+            return false;
+        }
+        @Override public boolean rawFallback() {
+            return true;
+        }
+    }
+
+    /** 结构化 JSONL 的容错分发器（claude / codex / pi / opencode / 任意未知事件）。 */
+    private static final class StructuredFormat implements StreamFormatStrategy {
+        @Override public void accept(Accumulator acc, JsonNode node) {
+            acc.acceptNode(node);
+        }
+    }
+
+    private static final StreamFormatStrategy PLAIN_FORMAT = new PlainFormat();
+    private static final StreamFormatStrategy STRUCTURED_FORMAT = new StructuredFormat();
+
+    /** key = 小写格式名；未注册（含旧数据里的未知格式）⇒ 结构化容错策略。 */
+    private static final Map<String, StreamFormatStrategy> FORMAT_STRATEGIES = Map.of(
+            "plain", PLAIN_FORMAT,
+            "jsonl", STRUCTURED_FORMAT,
+            "claude-stream-json", STRUCTURED_FORMAT,
+            "codex-jsonl", STRUCTURED_FORMAT,
+            "pi-jsonl", STRUCTURED_FORMAT);
+
+    private static final StreamFormatStrategy DEFAULT_FORMAT = STRUCTURED_FORMAT;
+
+    private static StreamFormatStrategy strategyFor(String streamFormat) {
+        if (streamFormat == null) return DEFAULT_FORMAT;
+        // ⛔ 不 trim：旧实现是 equalsIgnoreCase("plain")，带空白的 " plain " 不会被当成 plain；
+        //   这里保持同一口径，避免「顺手规范化」改变行为。
+        return FORMAT_STRATEGIES.getOrDefault(streamFormat.toLowerCase(java.util.Locale.ROOT),
+                DEFAULT_FORMAT);
+    }
 
     /** 可变累积器（解析是逐行的，最后冻结成 {@link Parsed}）。 */
     public static final class Accumulator {
@@ -59,23 +156,29 @@ public final class ExternalStreamParser {
          * 这类错误**伴随成功答案**出现，故不能一律判失败 —— 只有最终既无正文又只有错误时才用。
          */
         private String lastItemError;
-        private final String streamFormat;
+        /** 本累积器使用的格式策略（构造时查表，逐行解析不再判断格式）。 */
+        private final StreamFormatStrategy formatStrategy;
         /** 无法解析的行原样保留（plain 回退用）。 */
         private final StringBuilder raw = new StringBuilder();
 
         Accumulator(String streamFormat) {
-            this.streamFormat = streamFormat;
+            this.formatStrategy = strategyFor(streamFormat);
         }
 
         public void acceptLine(String line) {
             if (line == null || line.isBlank()) return;
             raw.append(line).append('\n');
-            if ("plain".equalsIgnoreCase(streamFormat)) {
+            if (!formatStrategy.parsesJson()) {
                 // plain 不需要解析，最后整段取用
                 return;
             }
             String trimmed = line.trim();
-            if (!trimmed.startsWith("{")) return;
+            if (!trimmed.startsWith("{")) {
+                // 非 JSON 行：可能是 CLI 的诊断/错误行（如 claude 的
+                // "[claude-code:unrecognized_model] {...}"，真机实测退出码仍是 0）
+                captureTaggedDiagnostic(trimmed);
+                return;
+            }
             JsonNode node;
             try {
                 node = JSON.readTree(trimmed);
@@ -84,7 +187,7 @@ public final class ExternalStreamParser {
             }
             if (node == null) return;
             try {
-                acceptNode(node);
+                formatStrategy.accept(this, node);
             } catch (Exception ignore) {
                 // 单个事件结构异常不得打断整个解析
             }
@@ -92,6 +195,21 @@ public final class ExternalStreamParser {
 
         private void acceptNode(JsonNode node) {
             String type = node.path("type").asText("");
+
+            // ── agy stream-json（2026-11-26 真机实测失败分支）──
+            //   {"event":"result","result":{"status":"ERROR","error":"...","response":""}}
+            //   ⚠️ 成功分支的事件/字段形状**未实测**（账号被 Eligibility 拦截）⇒ 这里只捕获错误，
+            //      不从 result.response 猜正文；拿到真实成功输出后再补映射。
+            if (node.has("event") && "result".equals(node.path("event").asText(""))) {
+                JsonNode result = node.path("result");
+                String status = result.path("status").asText("");
+                String err = result.path("error").asText("");
+                boolean failed = "ERROR".equalsIgnoreCase(status) || "FAILED".equalsIgnoreCase(status);
+                if (failed && !err.isBlank()) {
+                    lastItemError = err;
+                }
+                return;
+            }
 
             // ── opencode-jsonl（`opencode run --format json`，2026-11-04 真机实测）──
             //   形态：{type:"text", part:{type:"text", text:"42"}}
@@ -166,6 +284,13 @@ public final class ExternalStreamParser {
             }
             if ("turn.failed".equals(type)) {
                 lastItemError = node.path("error").path("message").asText("turn failed");
+                return;
+            }
+            // codex 的另一条错误事件（2026-11-26 真机样本）：
+            //   {"type":"error","message":"Missing environment variable: OPENAI_API_KEY."}
+            if ("error".equals(type)) {
+                String msg = firstNonBlank(node, "message", "error");
+                if (!msg.isBlank()) lastItemError = msg;
                 return;
             }
 
@@ -285,6 +410,20 @@ public final class ExternalStreamParser {
         }
 
         /**
+         * 捕获「带命名空间的诊断行」· 例如 claude 的
+         * {@code [claude-code:unrecognized_model] {"model":"..."}}。
+         *
+         * <p>这类行走的是 stdout 但不是 JSON，退出码仍为 0 ⇒ 旧实现完全看不见它，
+         * 上层只能报「未返回任何正文」（2026-11-26 真机）。
+         * ⚠️ 只认 {@code [namespace:code]} 形态：单段 {@code [warn] xxx} 不算错误信号。
+         */
+        private void captureTaggedDiagnostic(String line) {
+            if (line == null || line.isEmpty()) return;
+            if (!TAGGED_DIAGNOSTIC.matcher(line).matches()) return;
+            lastItemError = line;
+        }
+
+        /**
          * 冻结解析结果。
          *
          * <p><b>「诚实的回退」只对 plain 成立</b>（用户 2026-11-04 真机踩到）：
@@ -292,24 +431,22 @@ public final class ExternalStreamParser {
          * 旧实现把整段原始 JSON 当结论并标 completed ⇒ 上层拿到一堆 JSON 当答案。
          * 结构化协议（*-jsonl / claude-stream-json）下「一条已知事件都没解析到」= **没有答案**，
          * 必须如实报空，由 runner 判失败。
+         *
+         * <p><b>[cli-error-signal 2026-11-26] 错误不再塞进正文</b>：以前把 lastItemError 直接
+         * 当 text 返回，退出码 0 时 runner 会把错误当成「已完成的答案」（用户看到错误文本却以为成功）。
+         * 现在错误走 {@link Parsed#error()}：正文为空 ⇒ runner 据此报可读失败；
+         * 正文非空 ⇒ 仍算成功，错误只作诊断（codex 成功轮次里会夹带 item error，不能一刀切失败）。
          */
         public Parsed freeze() {
             String finalText = finalResult != null ? finalResult : textBuffer.toString();
-            boolean nothingParsed = finalText.isBlank() && reasoning.toString().isBlank()
-                    && toolCalls.isEmpty();
-            if (nothingParsed) {
-                if ("plain".equalsIgnoreCase(streamFormat)) {
-                    // plain 协议：整段 stdout 就是答案（dsh conductor 语义）
-                    finalText = raw.toString().trim();
-                } else if (lastItemError != null && !lastItemError.isBlank()) {
-                    // 结构化协议且只收到错误项 ⇒ 用错误文本作结论（runner 会判 failed）
-                    finalText = lastItemError;
-                }
-                // 其余情况保持空白 = 「没有答案」，⛔ 不拿原始 JSON 冒充结论
-            } else if (finalText.isBlank() && lastItemError != null && !lastItemError.isBlank()) {
-                finalText = lastItemError;
+            if (finalText.isBlank() && formatStrategy.rawFallback()) {
+                // plain 协议：整段 stdout 就是答案（dsh conductor 语义）
+                finalText = raw.toString().trim();
             }
-            return new Parsed(finalText, reasoning.toString(), List.copyOf(toolCalls));
+            // 其余情况保持空白 = 「没有答案」，⛔ 不拿原始 JSON 冒充结论
+            String error = (lastItemError == null || lastItemError.isBlank())
+                    ? null : redact(lastItemError);
+            return new Parsed(finalText, reasoning.toString(), List.copyOf(toolCalls), error);
         }
 
         /** 是否只收到错误、没有任何正文（供 runner 判失败）。 */

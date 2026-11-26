@@ -71,7 +71,7 @@ export const subagentRuntimeApi = {
 }
 
 /** 推理强度如何落到 argv（后端 ExternalRuntimeCatalog.ReasoningStyle）。 */
-export type ReasoningStyle = 'NONE' | 'CODEX_CONFIG' | 'PI_THINKING' | 'OPENCODE_VARIANT'
+export type ReasoningStyle = 'NONE' | 'CODEX_CONFIG' | 'PI_THINKING' | 'OPENCODE_VARIANT' | 'AGY_EFFORT'
 
 /**
  * 单个外部运行时的完整配置与能力位（GET /api/v1/subagents/runtime-configs）。
