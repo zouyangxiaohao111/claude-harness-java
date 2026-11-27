@@ -48,6 +48,7 @@ import { debugLog } from '@/utils/debugLog'
 import { rememberAppName } from '@/utils/appNameCache'
 import { buildDrainedUserMessages, type DrainedQueueItem } from '@/utils/queuedUserBubble'
 import { computeTurnRunning } from '@/utils/turnRunning'
+import { dirnameOf } from '@/utils/localFileLink'
 import { FOLD_DEFAULT_TURNS, isUserTurnRow } from '@/stores/messageTurns'
 import { refreshServerRunning, useServerRunningRebuild, useServerRunningReconcile, useServerRunningSelfHeal } from '@/hooks/useServerRunning'
 import { useBackgroundRunningSessionIds, useRunningSubagentSessionIds, useSubagentRunningReconcile } from '@/hooks/useSubagentRunning'
@@ -2196,6 +2197,39 @@ function App() {
   const boundProject = activeSession?.mainProjectId
     ? (realProjects.find((p) => p.id === activeSession.mainProjectId) ?? null)
     : null
+  /**
+   * [正文链接 2026-11-27] 相对路径解析基准（用户裁定：交付物目录 → 绑定项目根）。
+   *
+   * <p>交付物目录 = `{artifactsRoot}/{sessionId}/deliverables`；前端没有 artifactsRoot 的
+   * 直接来源，用产物 localPath（会话归档目录下的绝对路径）反推：
+   * 末段已经是 `deliverables` 就用它，否则把归档目录本身和其 `deliverables/` 子目录都当候选。
+   * 会话还没有任何产物记录时只能靠项目根兜底。
+   */
+  const localLinkBaseDirs = useMemo(() => {
+    const dirs: string[] = []
+    for (const a of sessionArtifacts.deliverables) {
+      if (!a.localPath || a.directory) continue
+      const dir = dirnameOf(a.localPath)
+      if (/[\\/]deliverables$/i.test(dir)) dirs.push(dir)
+      else {
+        dirs.push(`${dir}${dir.includes('\\') ? '\\' : '/'}deliverables`)
+        dirs.push(dir)
+      }
+    }
+    if (boundProject?.path) dirs.push(boundProject.path)
+    return Array.from(new Set(dirs))
+  }, [sessionArtifacts, boundProject?.path])
+  /** [正文链接 2026-11-27] 相对路径打不开时的提示（说明原因，不假装成功）。 */
+  const onLinkUnresolved = useCallback(
+    (href: string, reason: 'not-found' | 'too-large' | 'unsupported' | 'failed') => {
+      const why = reason === 'not-found' ? '找不到对应文件'
+        : reason === 'too-large' ? '文件过大，请用右键「在浏览器中打开」'
+          : reason === 'unsupported' ? '该类型不支持在客户端内打开'
+            : '打开失败'
+      showToast(`${why}：${href}`, 'info')
+    },
+    [showToast],
+  )
   // 会话绑定项目反查真实项目；缺省回退 perSessionProjects（会话创建时记录）→ 空项目（「未绑定项目」零态）
   // 引用稳定：流式每个 chunk 都会让 App 重渲染；若这里每次新建对象，下传 RightPanel 的
   //   mainProject/flashingProject 引用恒变 ⇒ 右栏 memo 失效、每个 chunk 重渲染整棵右栏树
@@ -4226,7 +4260,7 @@ function App() {
           {centerView === 'trace' ? (
             <TraceView messages={traceMessages} snippedIds={activeSnippedIds} />
           ) : (
-            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} turnRunning={turnLive} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }}
+            <MessageList sessionId={activeSessionId} messages={storeMessages} onDelete={handleDeleteMessage} conversationId={conversationId} scrollSignal={permScrollSignal + toBottomSignal} thinking={turnRunning && !hasStream} turnRunning={turnLive} onNearBottomChange={setChatAtBottom} onOpenRefFile={openRefFile} onLoadOlder={handleLoadOlder} jumpToMessage={historyJump} onOpenRightTab={openRightTab} artifacts={sessionArtifacts} onOpenArtifact={openArtifact} onEditArtifact={editArtifact} onOpenArtifactInBrowser={openArtifactInBrowser} linkBaseDirs={localLinkBaseDirs} onLinkUnresolved={onLinkUnresolved} turnUsageFallback={turnUsageByUser} onEditResend={handleEditResend} onForkTurn={handleForkTurn} foldedTurnCount={foldedTurnCount} onExpandOlder={() => { if (activeSessionId) void handleExpandOlder(activeSessionId) }}
               pendingPlanApproval={inlinePlanApproval}
               onPlanClearContext={appSettings?.showClearContextOnPlanAccept === true ? planClearHandler : undefined}
               onPlanDecision={permissionDecisionHandler}

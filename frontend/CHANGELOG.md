@@ -2,6 +2,12 @@
 
 All notable changes to NexusAI will be documented in this file.
 
+## [0.1.92] - 2026-11-27
+
+### Added
+
+- 修复千问/SGLang 流式正文换行丢失（isNotBlank→isEmpty）；本地文件链接渲染完善
+
 ## [0.1.91] - 2026-11-26
 
 ### Added

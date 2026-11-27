@@ -3,6 +3,7 @@ import { FOLD_DEFAULT_TURNS, headAnchorKeyOf, isAgentNotificationRow, isDialogue
 import { peerAdmissionBadge, peerModeText } from '@/stores/peerInboxStore'
 import { PeerHoldCards } from './PeerHoldCards'
 import { MarkdownTextV2 } from '@/markdown/vendor/renderer'
+import { LocalLinkProvider } from '@/markdown/vendor/localLinkContext'
 import { projectPreview } from '@/markdown/plainPreview'
 import type { AttachmentRequest, ChatMessageDto, ContentBlockDto, PeerHeldItemDto, ToolCallDto } from '@/api/types'
 import type { SessionArtifacts, SessionArtifactDto } from '@/api/artifacts'
@@ -635,6 +636,15 @@ interface MessageListProps {
   onEditArtifact?: (a: SessionArtifactDto) => void
   /** [产物卡片] 点「在浏览器中打开」→ 系统浏览器打开 raw 端点（仅 html 产物有该入口） */
   onOpenArtifactInBrowser?: (a: SessionArtifactDto) => void
+  /**
+   * 正文**相对路径**链接的解析基准（用户 2026-11-27 裁定：会话交付物目录 → 绑定项目根）。
+   *
+   * <p>绝对路径（file:/// 或盘符）不受影响（仍交系统默认程序）；相对路径按此顺序探测，
+   * 命中就在客户端内预览。省略 ⇒ 相对路径只拦截导航、不打开。
+   */
+  linkBaseDirs?: string[]
+  /** 正文链接打不开时的提示（App 注入 toast；省略则只 console.warn）。 */
+  onLinkUnresolved?: (href: string, reason: 'not-found' | 'too-large' | 'unsupported' | 'failed') => void
   /** [历史轮用量] 后端按轮聚合的真实用量（键 = 发起该轮的 userMessageId · 只补消息级无 token 的轮） */
   turnUsageFallback?: Map<string, TurnUsageDto>
   /** [用户消息编辑重发] 用户气泡 hover 铅笔 → 裁剪该消息起全部对话并用新文本重发（App 注入）。
@@ -3223,7 +3233,7 @@ const EMPTY_FOLD_KEYS: ReadonlySet<string> = new Set<string>()
  */
 const COLLAPSED_TAIL_SEGMENTS = 3
 
-function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, turnRunning: turnRunningProp, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false, pendingPlanApproval, onPlanDecision, onPlanClearContext, peerHeldItems, peerHeldActing, peerHeldRowErrors, onPeerAccept, onPeerReject, onOpenPeerSession, focusPeer }: MessageListProps) {
+function MessageListInner({ messages, sessionId, onDelete, conversationId, scrollSignal, thinking, turnRunning: turnRunningProp, onNearBottomChange, onOpenRefFile, onOpenKbDoc, onLoadOlder, jumpToMessage, onOpenRightTab, artifacts, onOpenArtifact, onEditArtifact, onOpenArtifactInBrowser, linkBaseDirs, onLinkUnresolved, turnUsageFallback, onEditResend, onForkTurn, foldedTurnCount = 0, onExpandOlder, onCitationClick, citationTitlesByMessage: citationTitleMapByMsg, tailFooter, prose = false, pendingPlanApproval, onPlanDecision, onPlanClearContext, peerHeldItems, peerHeldActing, peerHeldRowErrors, onPeerAccept, onPeerReject, onOpenPeerSession, focusPeer }: MessageListProps) {
   // 知识库引用 chip 开关（渲染期赋值：Message 深处按它决定是否把 [N] 转成链接）
   citationChipEnabled = !!onCitationClick
   citationTitlesByMessage = citationTitleMapByMsg ?? {}
@@ -4718,6 +4728,12 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     }
     return out
   }, [messages])
+  // [正文链接 2026-11-27] 相对路径解析基准（交付物目录 → 绑定项目根）传给正文渲染器；
+  //   引用稳定，避免 memo 失效。⛔ 必须在下面「空态 return」之前（hooks 不得条件执行）。
+  const localLinkOptions = useMemo(
+    () => ({ baseDirs: linkBaseDirs ?? [], onUnresolved: onLinkUnresolved }),
+    [linkBaseDirs, onLinkUnresolved],
+  )
   // 空态（置于所有 hooks 之后 · React 19 hooks 规则：hooks 前不得条件 return）
   //   ⚠️ 有待确认来信时必须渲染：新会话可能一条历史都没有，但 hold 卡要在流里可见
   //   （否则「有件但看不到」= 用户认为消息丢了）。
@@ -4747,6 +4763,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
     : null
   return (
     <PlanApprovalSlot.Provider value={planSlotValue}>
+    <LocalLinkProvider value={localLinkOptions}>
     <>
     <div className="stream-inner" ref={streamWrapRef}>
       {/* [OBS2] 消息区整层边界：兜住「按 flow 组装本区域的 JSX 本身出错」这类容器级异常
@@ -6005,6 +6022,7 @@ function MessageListInner({ messages, sessionId, onDelete, conversationId, scrol
       </ErrorBoundary>
     </div>
     </>
+    </LocalLinkProvider>
     </PlanApprovalSlot.Provider>
   )
 }

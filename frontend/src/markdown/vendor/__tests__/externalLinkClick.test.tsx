@@ -2,15 +2,23 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { act, createElement } from 'react'
 import { createRoot, type Root } from 'react-dom/client'
-import { MarkdownTextV2 } from '../renderer'
+import { MarkdownTextV2, LocalLinkProvider } from '../renderer'
 import { isExternalLinkHref } from '@/utils/externalLink'
 import { localFilePathOf } from '@/utils/localFileLink'
 
 /** openLocalFile 是异步动态 import 的桌面壳通道；单测只验证「被正确调用」。 */
 const openLocalFileMock = vi.hoisted(() => vi.fn(async () => true))
+/** 相对路径解析 / 内部预览都是桌面壳通道，统一 mock。 */
+const resolveRelativeMock = vi.hoisted(() => vi.fn(async (_rel: string, _dirs: readonly string[]): Promise<string | null> => null))
+const openInternallyMock = vi.hoisted(() => vi.fn(async (_path: string): Promise<'opened' | 'too-large' | 'unsupported' | 'failed'> => 'opened'))
 vi.mock('@/utils/localFileLink', async (importOriginal) => {
   const actual = await importOriginal<typeof import('@/utils/localFileLink')>()
-  return { ...actual, openLocalFile: openLocalFileMock }
+  return {
+    ...actual,
+    openLocalFile: openLocalFileMock,
+    resolveRelativeFilePath: resolveRelativeMock,
+    openLocalFileInternally: openInternallyMock,
+  }
 })
 
 /**
@@ -36,6 +44,10 @@ let root: Root
 
 beforeEach(() => {
   openLocalFileMock.mockClear()
+  resolveRelativeMock.mockClear()
+  resolveRelativeMock.mockResolvedValue(null)
+  openInternallyMock.mockClear()
+  openInternallyMock.mockResolvedValue('opened')
   container = document.createElement('div')
   document.body.appendChild(container)
   root = createRoot(container)
@@ -53,11 +65,38 @@ async function mount(text: string): Promise<void> {
   })
 }
 
+/** 带相对路径解析上下文（baseDirs + 失败提示）挂载。 */
+async function mountWithLinks(
+  text: string,
+  baseDirs: string[],
+  onUnresolved?: (href: string, reason: string) => void,
+): Promise<void> {
+  await act(async () => {
+    root.render(
+      createElement(LocalLinkProvider, { value: { baseDirs, onUnresolved } },
+        createElement(MarkdownTextV2, { text })),
+    )
+  })
+}
+
+/** 点击后等异步链跑完（resolve → 内部打开 至少两跳微任务）。 */
+async function clickAndFlush(anchor: Element): Promise<MouseEvent> {
+  const click = new MouseEvent('click', { bubbles: true, cancelable: true })
+  await act(async () => {
+    anchor.dispatchEvent(click)
+    await Promise.resolve()
+    await Promise.resolve()
+    await Promise.resolve()
+  })
+  return click
+}
+
 describe('isExternalLinkHref', () => {
-  it('http/https/mailto 为外链', () => {
+  it('http/https/mailto/tel 为外链', () => {
     expect(isExternalLinkHref('https://example.com/a')).toBe(true)
     expect(isExternalLinkHref('http://example.com')).toBe(true)
     expect(isExternalLinkHref('mailto:a@b.com')).toBe(true)
+    expect(isExternalLinkHref('tel:+8613800000000')).toBe(true)
   })
 
   it('hash / 相对路径 / 自定义 scheme 不算外链', () => {
@@ -185,5 +224,69 @@ describe('MarkdownTextV2 本地文件链接', () => {
     const anchor = container.querySelector('a')!
     expect(anchor.getAttribute('data-local-file')).toBe('D:/apps/NexusAI/data/x-main.html')
     expect(openLocalFileMock).not.toHaveBeenCalled()
+  })
+})
+
+/**
+ * 用户 2026-11-27 追问：相对路径能不能内部打开、右键能不能二选一。
+ *
+ * 裁定：绝对路径 → 系统默认程序；相对路径 → 客户端内预览（交付物目录 → 项目根探测）；
+ * 两者右键都给「客户端内打开 / 浏览器中打开」。**任何非 http/hash 的目标都不许让 WebView 导航**
+ * —— 否则整页跳到 `tauri.localhost/...`（用户描述的「打开也是 tauri.app 啥啥啥」）。
+ */
+describe('MarkdownTextV2 相对路径分发（2026-11-27）', () => {
+  it('⭐ 相对路径命中基准目录 → 客户端内预览，且拦住 webview 导航', async () => {
+    resolveRelativeMock.mockResolvedValue('D:/repo/deliverables/ops-x.html')
+    await mountWithLinks('[打开](ops-x.html)', ['D:/repo/deliverables'])
+    const anchor = container.querySelector('a')!
+    const click = await clickAndFlush(anchor)
+
+    expect(click.defaultPrevented).toBe(true)
+    expect(resolveRelativeMock).toHaveBeenCalledWith('ops-x.html', ['D:/repo/deliverables'])
+    expect(openInternallyMock).toHaveBeenCalledWith('D:/repo/deliverables/ops-x.html')
+  })
+
+  it('相对路径找不到 → 拦下不导航 + 提示 not-found', async () => {
+    const onUnresolved = vi.fn()
+    await mountWithLinks('[打开](missing.html)', ['D:/repo/deliverables'], onUnresolved)
+    const anchor = container.querySelector('a')!
+    const click = await clickAndFlush(anchor)
+
+    expect(click.defaultPrevented).toBe(true)
+    expect(onUnresolved).toHaveBeenCalledWith('missing.html', 'not-found')
+    expect(openInternallyMock).not.toHaveBeenCalled()
+  })
+
+  it('自定义协议（sandbox:）被净化器剥掉 href ⇒ 点击绝不整页导航', async () => {
+    const onUnresolved = vi.fn()
+    await mountWithLinks('[打开](sandbox:/mnt/data/x.html)', ['D:/repo'], onUnresolved)
+    const anchor = container.querySelector('a')!
+    // DOMPurify 只放行 http/https/mailto/tel → sandbox: 的 href 整个被剥
+    expect(anchor.getAttribute('href')).toBeNull()
+    const click = await clickAndFlush(anchor)
+    // 没有 href 本来就不会导航；关键是不能把 webview 带走
+    expect(click.defaultPrevented).toBe(false)
+    expect(onUnresolved).not.toHaveBeenCalled()
+  })
+
+  it('html 过大 → 回退系统默认程序（不丢能力）', async () => {
+    resolveRelativeMock.mockResolvedValue('D:/repo/big.html')
+    openInternallyMock.mockResolvedValue('too-large')
+    await mountWithLinks('[打开](big.html)', ['D:/repo'])
+    const anchor = container.querySelector('a')!
+    await clickAndFlush(anchor)
+
+    expect(openLocalFileMock).toHaveBeenCalledWith('D:/repo/big.html')
+  })
+
+  it('右键本地链接：菜单给「客户端内打开 / 浏览器中打开」两项', async () => {
+    await mountWithLinks('[打开](ops-x.html)', ['D:/repo'])
+    const anchor = container.querySelector('a')!
+    await act(async () => {
+      anchor.dispatchEvent(new MouseEvent('contextmenu', { bubbles: true, cancelable: true }))
+    })
+    const items = Array.from(document.querySelectorAll('.external-link-menu .ctx-menu-item'))
+      .map((el) => el.textContent?.trim())
+    expect(items).toEqual(['在客户端内打开', '在浏览器中打开'])
   })
 })

@@ -15,18 +15,29 @@
  * 新实现：流式期**照常解析**，靠 `streamingGuards` 修好未闭合语法。
  * 这正是「采用源侧做法」的要求，会推翻 2026-09-18 的旧裁定。
  */
-import { memo, useCallback, useEffect, useMemo, useRef, useState } from 'react'
+import { memo, useCallback, useContext, useEffect, useMemo, useRef, useState } from 'react'
 import { createPortal } from 'react-dom'
 import DOMPurify from 'dompurify'
 import { marked } from 'marked'
 import type { Renderer } from 'marked'
 
 import { isExternalLinkHref, openLinkInAppWindow, openLinkInBrowser } from '@/utils/externalLink'
-import { localFilePathOf, openLocalFile } from '@/utils/localFileLink'
+import {
+  isRelativeFilePath,
+  localFilePathOf,
+  openLocalFile,
+  openLocalFileInternally,
+  resolveRelativeFilePath,
+} from '@/utils/localFileLink'
 
 // 代码高亮：highlight.js（照抄源站，含 highlightAuto 兜底）
 import { highlightCode } from './codeHighlight'
 import { useMermaidRender } from './mermaidRender'
+// 正文链接解析上下文（独立文件：MessageList 与渲染器共用，避免整体 mock 掉 renderer 时报缺导出）
+import { LocalLinkContext } from './localLinkContext'
+
+export { LocalLinkProvider } from './localLinkContext'
+export type { LinkOpenFailure, LocalLinkOptions } from './localLinkContext'
 // 剪贴板（本仓既有设施，V1 CodeBlock 用的就是它）
 import { writeClipboard } from '@/markdown/clipboard'
 // [rescue] 脏输入抢救：本仓独有能力（763 行），源站没有。只在**收口期**跑，见下方注释。
@@ -142,14 +153,19 @@ function blockFreezeEnabled(explicit?: boolean): boolean {
 }
 
 /**
- * 正文里的外链右键菜单状态（坐标 + 目标 href）。
+ * 正文里的链接右键菜单状态（坐标 + 目标）。
  *
- * <p>左键点外链一律交系统浏览器；右键才出这个菜单，可选「客户端内新窗口」。
+ * <p>外链：左键交系统浏览器；右键可选「客户端内新窗口」。
+ * <p>本地链接（绝对 / 相对）：左键按绝对→浏览器、相对→内部预览分发；右键两种都给。
  */
 interface LinkMenuState {
   x: number
   y: number
+  kind: 'external' | 'local'
+  /** 外链原始 href；本地链接为原始 href（相对路径此时还没解析成绝对路径） */
   href: string
+  /** 本地链接：已知的绝对路径（data-local-file）；相对路径为 null，动作时现场解析 */
+  path: string | null
 }
 
 /**
@@ -238,22 +254,33 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
     }
   }, [text, streaming, renderer, onRunHtml, blockFreeze])
   const html = rendered.html
+  /** 宿主注入的相对路径解析基准（MessageList 由 App 提供；未注入则相对路径只拦截）。 */
+  const linkOptions = useContext(LocalLinkContext)
+
+  /** 相对路径 → 绝对路径（找不到时提示；absolute 已知则直接返回）。 */
+  const resolveLocalPath = useCallback(async (href: string, absolute: string | null): Promise<string | null> => {
+    if (absolute) return absolute
+    const resolved = await resolveRelativeFilePath(href, linkOptions.baseDirs)
+    if (!resolved) linkOptions.onUnresolved?.(href, 'not-found')
+    return resolved
+  }, [linkOptions])
 
   /**
-   * 点击委托：代码块的「复制」与 HTML 块的「运行」。
+   * 点击委托：本地链接 / 外链 / 代码块按钮。
+   *
+   * <p><b>2026-11-27 用户裁定</b>：绝对路径 → 系统默认程序（.html 即默认浏览器）；
+   * 相对路径 → 客户端内预览（像产物「全屏」）；解析不到就拦截导航并提示。
+   * 其余任何非 hash 的 `href`（sandbox:/tauri:/…）**一律拦下** ——
+   * 绝不让 WebView 整页导航到 `tauri.localhost/...`（用户报的「打开也是 tauri.app 啥啥啥」）。
    *
    * <p>⚠️ 只读我们自己写的属性 / DOM 结构，不执行任何 HTML 里的脚本 ——
    * 净化后本来也不剩脚本，但这里再守一道。
-   *
-   * <p>复制逻辑照抄源站 `markdownEnhancements.ts:handleCodeCopy`：
-   * 从最近的 `.chat-code-block` 里取 `code.textContent`，
-   * 成功后加 `is-copied` 类并把文案改成「已复制」，1.6 秒后还原。
    */
   const onClick = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
     const target = e.target as HTMLElement | null
     if (!target) return
 
-    // ⓪ 本地文件链接：href 已被净化器剥掉，真实路径在 data-local-file（见 buildDefaultRenderer.link）。
+    // ⓪ 本地文件链接（绝对路径）：href 已被净化器剥掉，真实路径在 data-local-file（见 buildDefaultRenderer.link）。
     const localAnchor = target.closest('a[data-local-file]') as HTMLAnchorElement | null
     if (localAnchor) {
       e.preventDefault()
@@ -267,6 +294,34 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
       e.preventDefault()
       void openLinkInBrowser(anchor.href)
       return
+    }
+
+    // ①.5 其它 `<a href>`：相对路径内部打开；其余非 hash 目标只拦截不导航。
+    const hrefAnchor = target.closest('a[href]') as HTMLAnchorElement | null
+    if (hrefAnchor) {
+      const href = hrefAnchor.getAttribute('href') ?? ''
+      if (href && !href.startsWith('#')) {
+        e.preventDefault()
+        // 兜底：渲染器没改写成 data-local-file 的绝对本地路径（自定义 renderer 宿主）
+        const absolute = localFilePathOf(href)
+        if (absolute !== null) {
+          void openLocalFile(absolute)
+          return
+        }
+        if (isRelativeFilePath(href)) {
+          void (async () => {
+            const abs = await resolveLocalPath(href, null)
+            if (!abs) return
+            const result = await openLocalFileInternally(abs)
+            if (result === 'opened') return
+            // 无内部预览器 / html 过大：退回系统默认程序
+            if (!(await openLocalFile(abs))) linkOptions.onUnresolved?.(href, result)
+          })()
+          return
+        }
+        linkOptions.onUnresolved?.(href, 'unsupported')
+        return
+      }
     }
 
     // ② 运行（HTML 代码块）
@@ -293,14 +348,44 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
         if (textEl) textEl.textContent = '复制'
       }, 1600)
     })
-  }, [onRunHtml])
+  }, [onRunHtml, linkOptions, resolveLocalPath])
 
-  /** 右键外链：只拦外链的默认菜单，其它区域保持系统菜单（复制文字等）。 */
+  /**
+   * 右键链接菜单。
+   *
+   * <p>外链：浏览器 / 客户端内新窗口（原有两项）。
+   * <p>本地链接：客户端内预览 / 系统默认程序（用户 2026-11-27 要求的「两种」）。
+   */
   const onContextMenu = useCallback((e: React.MouseEvent<HTMLDivElement>) => {
-    const anchor = externalAnchorOf(e.target)
-    if (!anchor) return
+    const target = e.target as HTMLElement | null
+    if (!target) return
+    const localAnchor = target.closest('a[data-local-file]') as HTMLAnchorElement | null
+    if (localAnchor) {
+      e.preventDefault()
+      setLinkMenu({
+        x: e.clientX,
+        y: e.clientY,
+        kind: 'local',
+        href: localAnchor.getAttribute('data-local-file') ?? '',
+        path: localAnchor.getAttribute('data-local-file') ?? null,
+      })
+      return
+    }
+    const anchor = externalAnchorOf(target)
+    if (anchor) {
+      e.preventDefault()
+      setLinkMenu({ x: e.clientX, y: e.clientY, kind: 'external', href: anchor.href, path: null })
+      return
+    }
+    // 相对路径 / 兜底本地路径也给右键菜单（不再让它们落到 WebView 默认菜单）
+    const hrefAnchor = target.closest('a[href]') as HTMLAnchorElement | null
+    if (!hrefAnchor) return
+    const href = hrefAnchor.getAttribute('href') ?? ''
+    if (!href || href.startsWith('#')) return
+    const absolute = localFilePathOf(href)
+    if (absolute === null && !isRelativeFilePath(href)) return
     e.preventDefault()
-    setLinkMenu({ x: e.clientX, y: e.clientY, href: anchor.href })
+    setLinkMenu({ x: e.clientX, y: e.clientY, kind: 'local', href, path: absolute })
   }, [])
 
   // 菜单打开后：点别处 / 滚动 / Esc / 失焦都关掉（mousedown 用冒泡，
@@ -360,42 +445,91 @@ export const MarkdownTextV2 = memo(function MarkdownTextV2({
           className="project-context-menu external-link-menu"
           style={{
             left: Math.max(8, Math.min(linkMenu.x, window.innerWidth - 220)),
-            top: Math.max(8, Math.min(linkMenu.y, window.innerHeight - 100)),
+            top: Math.max(8, Math.min(linkMenu.y, window.innerHeight - 120)),
           }}
           onContextMenu={(e) => e.preventDefault()}
         >
-          <div
-            className="ctx-menu-item"
-            role="menuitem"
-            onMouseDown={(e) => {
-              e.stopPropagation()
-              const href = linkMenu.href
-              setLinkMenu(null)
-              void openLinkInBrowser(href)
-            }}
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
-              <circle cx="8" cy="8" r="5.5" />
-              <path d="M2.5 8h11M8 2.5c1.6 1.5 2.4 3.4 2.4 5.5S9.6 12 8 13.5C6.4 12 5.6 10.1 5.6 8S6.4 4 8 2.5z" />
-            </svg>
-            在浏览器中打开
-          </div>
-          <div
-            className="ctx-menu-item"
-            role="menuitem"
-            onMouseDown={(e) => {
-              e.stopPropagation()
-              const href = linkMenu.href
-              setLinkMenu(null)
-              void openLinkInAppWindow(href)
-            }}
-          >
-            <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
-              <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
-              <path d="M2.5 6h11" />
-            </svg>
-            在客户端内打开（新窗口）
-          </div>
+          {linkMenu.kind === 'local' ? (
+            <>
+              <div
+                className="ctx-menu-item"
+                role="menuitem"
+                onMouseDown={(e) => {
+                  e.stopPropagation()
+                  const { href, path } = linkMenu
+                  setLinkMenu(null)
+                  void (async () => {
+                    const abs = await resolveLocalPath(href, path)
+                    if (!abs) return
+                    const result = await openLocalFileInternally(abs)
+                    if (result === 'opened') return
+                    // 无内部预览器 / html 过大：退回系统默认程序
+                    if (!(await openLocalFile(abs))) linkOptions.onUnresolved?.(href, result)
+                  })()
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+                  <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+                  <path d="M2.5 6h11" />
+                </svg>
+                在客户端内打开
+              </div>
+              <div
+                className="ctx-menu-item"
+                role="menuitem"
+                onMouseDown={(e) => {
+                  e.stopPropagation()
+                  const { href, path } = linkMenu
+                  setLinkMenu(null)
+                  void (async () => {
+                    const abs = await resolveLocalPath(href, path)
+                    if (abs && !(await openLocalFile(abs))) linkOptions.onUnresolved?.(href, 'unsupported')
+                  })()
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+                  <circle cx="8" cy="8" r="5.5" />
+                  <path d="M2.5 8h11M8 2.5c1.6 1.5 2.4 3.4 2.4 5.5S9.6 12 8 13.5C6.4 12 5.6 10.1 5.6 8S6.4 4 8 2.5z" />
+                </svg>
+                在浏览器中打开
+              </div>
+            </>
+          ) : (
+            <>
+              <div
+                className="ctx-menu-item"
+                role="menuitem"
+                onMouseDown={(e) => {
+                  e.stopPropagation()
+                  const href = linkMenu.href
+                  setLinkMenu(null)
+                  void openLinkInBrowser(href)
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+                  <circle cx="8" cy="8" r="5.5" />
+                  <path d="M2.5 8h11M8 2.5c1.6 1.5 2.4 3.4 2.4 5.5S9.6 12 8 13.5C6.4 12 5.6 10.1 5.6 8S6.4 4 8 2.5z" />
+                </svg>
+                在浏览器中打开
+              </div>
+              <div
+                className="ctx-menu-item"
+                role="menuitem"
+                onMouseDown={(e) => {
+                  e.stopPropagation()
+                  const href = linkMenu.href
+                  setLinkMenu(null)
+                  void openLinkInAppWindow(href)
+                }}
+              >
+                <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" strokeWidth="1.4" aria-hidden="true">
+                  <rect x="2.5" y="3" width="11" height="10" rx="1.5" />
+                  <path d="M2.5 6h11" />
+                </svg>
+                在客户端内打开（新窗口）
+              </div>
+            </>
+          )}
         </div>,
         document.body,
       )}

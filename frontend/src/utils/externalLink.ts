@@ -11,11 +11,11 @@
  * 所以调用方要在 click / contextmenu 里先拦默认动作，再显式分发到这里。
  */
 
-/** 外链判定：只认绝对地址 http/https/mailto（hash、相对路径留给站内处理）。 */
+/** 外链判定：只认绝对地址 http/https/mailto/tel（hash、相对路径留给站内处理）。 */
 export function isExternalLinkHref(href: string): boolean {
   try {
     const protocol = new URL(href).protocol
-    return protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:'
+    return protocol === 'http:' || protocol === 'https:' || protocol === 'mailto:' || protocol === 'tel:'
   } catch {
     return false
   }

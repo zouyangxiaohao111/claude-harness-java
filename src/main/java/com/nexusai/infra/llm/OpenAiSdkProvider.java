@@ -1,6 +1,5 @@
 package com.nexusai.infra.llm;
 
-import cn.hutool.core.util.StrUtil;
 import cn.hutool.json.JSONUtil;
 import com.fasterxml.jackson.core.JsonProcessingException;
 import com.fasterxml.jackson.databind.JsonNode;
@@ -2200,7 +2199,12 @@ public class OpenAiSdkProvider implements LlmProvider {
             // content
             String content = delta.content().isEmpty()
                 ? null : delta.content().get();
-            if (StrUtil.isNotBlank(content)) {
+            // ⚠️ 只过滤真正的空串，⛔ 不能用 isNotBlank：SGLang / vLLM 等把换行当成**独立 delta**
+            //    推送（实测 SGLang `Qwen3.5-122B`：delta 序列为 "\n\n"、"-"、" "、"苹果"、"\n"…），
+            //    isNotBlank 会把所有纯空白块丢掉 ⇒ 落库正文零换行 ⇒ 前端口径再正确也只能渲染成
+            //    一整段（表格/标题/列表全部粘连）。非流式路径不受影响（整段 content 一次返回）。
+            //    [SVN r50082 WeiHaijun 2026-11-27 同步]
+            if (content != null && !content.isEmpty()) {
                 state.content.append(content);
                 if (onChunk != null) {
                     onChunk.accept(content);

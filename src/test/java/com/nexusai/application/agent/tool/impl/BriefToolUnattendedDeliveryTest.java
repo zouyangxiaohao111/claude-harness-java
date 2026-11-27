@@ -92,19 +92,37 @@ class BriefToolUnattendedDeliveryTest {
     }
 
     @Test
-    void interactiveSessionStillDoesNotSendToChannel() {
+    void interactiveSessionWithBoundChatIsDelivered() {
         ImUnattendedConfig.installChecker(sid -> false);
         ImSendService sendService = mock(ImSendService.class);
         ImChatService imChatService = mock(ImChatService.class);
         ImChatEntry bound = chat("imch-9");
         when(imChatService.listBySession("sess-i")).thenReturn(List.of(bound));
+        when(sendService.send(anyList(), anyString(), any()))
+            .thenReturn(List.of(ImSendResult.sent("m-9")));
         BriefTool tool = new BriefTool();
         ReflectionTestUtils.setField(tool, "sendService", sendService);
         ReflectionTestUtils.setField(tool, "imChatService", imChatService);
 
-        tool.execute(call("hello"), ctx("sess-i"));
+        var result = tool.execute(call("hello"), ctx("sess-i"));
+
+        verify(sendService).send(List.of("imch-9"), "hello", List.of());
+        assertThat(((Map<?, ?>) result.data()).get("delivery")).isNotNull();
+    }
+
+    @Test
+    void interactiveSessionWithoutBoundChatReportsNoTarget() {
+        ImUnattendedConfig.installChecker(sid -> false);
+        ImSendService sendService = mock(ImSendService.class);
+        ImChatService imChatService = mock(ImChatService.class);
+        when(imChatService.listBySession("sess-i2")).thenReturn(List.of());
+        BriefTool tool = new BriefTool();
+        ReflectionTestUtils.setField(tool, "sendService", sendService);
+        ReflectionTestUtils.setField(tool, "imChatService", imChatService);
+
+        var result = tool.execute(call("hello"), ctx("sess-i2"));
 
         verify(sendService, never()).send(anyList(), anyString(), any());
-        verify(imChatService, never()).listBySession(anyString());
+        assertThat(((Map<?, ?>) result.data()).get("delivery").toString()).contains("NO_TARGET");
     }
 }

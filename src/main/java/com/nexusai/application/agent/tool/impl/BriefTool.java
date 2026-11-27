@@ -527,11 +527,9 @@ public class BriefTool implements Tool {
         //    若投递失败就报错，模型会认为整条消息没发出而重发 ⇒ 用户收到重复消息。
         //    失败原因写进 data.delivery 与日志，由前端按需展示。
         // [V330] 投递目标：本轮显式 notifyChats（IM 入站 / 定时任务）优先；
-        //   否则若本会话处于无人值守，用本会话已绑定的聊天兜底 —— 否则无人值守会话的回
-        //   永远只写 UI，「验证消息真正送达渠道」无法成立。
-        //   ⛔ 交互式普通会话（未开无人值守）不改变行为。
-        boolean unattendedSession = ctx != null
-                && com.nexusai.application.agent.config.ImUnattendedConfig.isUnattended(ctx.sessionId());
+        //   否则用本会话已绑定的聊天兜底 —— 用户显式调用 SendUserMessage 即表示要把这条消息
+        //   送达渠道，不再要求会话处于无人值守。绑定是逐会话的（im_chat.bound_session_id），
+        //   只会发给该会话自己选定的聊天，不会串到别的会话。
         List<String> chatIds = List.of();
         if (ctx != null && ctx.notifyChats() != null && !ctx.notifyChats().isBlank()) {
             chatIds = ImSendService.parseChatIds(ctx.notifyChats());
@@ -539,12 +537,12 @@ public class BriefTool implements Tool {
                 log.warn("[SendUserMessage] [V306] notifyChats 解析为空，跳过投递: raw={}",
                         ctx.notifyChats());
             }
-        } else if (unattendedSession && imChatService != null) {
+        } else if (ctx != null && imChatService != null) {
             chatIds = imChatService.listBySession(ctx.sessionId()).stream()
                     .map(com.nexusai.model.im_channel.ImChatEntry::id)
                     .toList();
             if (log.isDebugEnabled()) {
-                log.debug("[SendUserMessage] [V330] 无人值守投递兜底: session={} 绑定聊天={}",
+                log.debug("[SendUserMessage] [V330] 绑定聊天兜底: session={} 绑定聊天={}",
                         ctx.sessionId(), chatIds);
             }
         }
@@ -572,11 +570,11 @@ public class BriefTool implements Tool {
                             mediaFailed);
                 }
             }
-        } else if (unattendedSession) {
-            // 无人值守却没有可用目标：不静默成功，把原因写进回执（前端/验收可见）。
+        } else if (ctx != null && imChatService != null) {
+            // 没有可用投递目标：不静默成功，把原因写进回执（前端/验收可见）。
             data.put("delivery", Map.of("status", "NO_TARGET", "reason", "no bound chat"));
-            log.warn("[SendUserMessage] [V330] 无人值守会话无可用投递目标: session={}",
-                    ctx == null ? null : ctx.sessionId());
+            log.warn("[SendUserMessage] [V330] 会话无可用投递目标: session={}",
+                    ctx.sessionId());
         }
         return ToolResult.success(call.id(), data);
     }
